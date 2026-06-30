@@ -643,7 +643,8 @@ impl Dispatcher {
 
         // 4. 普通消息。
         let base_prompt = msg.text.clone().unwrap_or_default();
-        if base_prompt.trim().is_empty() {
+        // 文本与媒体皆空才丢弃；媒体消息（无文本）仍驱动 agent。
+        if base_prompt.trim().is_empty() && msg.media.is_empty() {
             return;
         }
 
@@ -669,6 +670,18 @@ impl Dispatcher {
             }
         };
 
+        // 媒体提示：把本地媒体路径前置告知 agent（claude 可 Read 本地文件）。
+        let media_hint = if msg.media.is_empty() {
+            String::new()
+        } else {
+            let lines: Vec<String> = msg
+                .media
+                .iter()
+                .map(|m| format!("- {}：{}", m.kind, m.url))
+                .collect();
+            format!("【用户发来媒体】\n{}\n\n——\n\n", lines.join("\n"))
+        };
+
         // 新建 session（无 existing）时，一次性注入压缩摘要作为前情摘要。
         let mut prompt = base_prompt;
         if existing.is_none() {
@@ -678,6 +691,10 @@ impl Dispatcher {
                     let _ = self.store.delete_config(&compact_summary_key(&conv.0)).await;
                 }
             }
+        }
+        // 媒体提示置最前（在摘要之后、文本之前由上方顺序保证；此处统一前置）。
+        if !media_hint.is_empty() {
+            prompt = format!("{media_hint}{prompt}");
         }
 
         // 流式通道 + 后台执行。existing 移入 spawn（避免借用跨 'static）。

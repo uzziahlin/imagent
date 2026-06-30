@@ -23,8 +23,8 @@ use imagent_store::Store;
 use crate::client::ILinkClient;
 use crate::dedup::Dedup;
 use crate::proto::{
-    classify_send, extract_text, msg_to_inbound, GetConfigResp, Msg, SendMsgResp, SendOutcome,
-    UpdatesResp,
+    classify_send, extract_media_refs, extract_text, msg_to_inbound, GetConfigResp, Msg, SendMsgResp,
+    SendOutcome, UpdatesResp,
 };
 
 const PLATFORM: &str = "ilink";
@@ -118,7 +118,30 @@ impl ILinkPlatform {
                     .await;
             }
         }
-        out.push(msg_to_inbound(msg));
+
+        let mut ib = msg_to_inbound(msg);
+        // 阶段 A：下载入站媒体（图片/文件/视频），存 ~/.imagent/media/。
+        // 逐个尽力而为：单个失败仅 log，不丢整条消息（文本仍可用）。
+        for raw in extract_media_refs(msg) {
+            match crate::media::download_media(
+                self.client.http(),
+                raw.encrypt_query_param.as_deref(),
+                raw.aes_key.as_deref(),
+                raw.full_url.as_deref(),
+            )
+            .await
+            {
+                Ok(bytes) => match persist_media(raw.kind, raw.file_name.as_deref(), &bytes) {
+                    Ok(path) => ib.media.push(MediaRef {
+                        kind: raw.kind.to_string(),
+                        url: path,
+                    }),
+                    Err(e) => warn!(target: "ilink", kind = raw.kind, error = %e, "persist media 失败"),
+                },
+                Err(e) => warn!(target: "ilink", kind = raw.kind, error = %e, "download media 失败"),
+            }
+        }
+        out.push(ib);
     }
 
     /// 解析发送阶段 context_token：优先 hint，否则读 store。
@@ -174,6 +197,189 @@ impl ILinkPlatform {
             Err(e) => {
                 warn!(target: "ilink", peer, error = %e, "getconfig 失败");
                 None
+            }
+        }
+    }
+
+    /// 出站媒体发送（阶段 B）：读本地文件 → AES 加密 → getuploadurl → CDN POST →
+    /// sendmessage 媒体 item。
+    ///
+    /// hermes 协议事实：
+    /// - getuploadurl 的 `media_type`：1=img / 2=video / 3=file / 4=voice。
+    /// - 出站 `aes_key` 字段 = `base64(hex_string)`（非对称编码）。
+    /// - CDN 上传用 POST（PUT 404）。
+    /// - sendmessage item type：image=2 / file=4 / video=5 / voice=3。
+    async fn send_media_inner(
+        &self,
+        conv: &ConvId,
+        media: &MediaRef,
+        hint: &ReplyHint,
+    ) -> Result<()> {
+        let peer = Self::peer_of(conv);
+        let token = self.resolve_context_token(&peer, hint).await;
+
+        // 1. 读本地文件。
+        let plaintext = std::fs::read(&media.url).map_err(|e| {
+            CoreError::Platform(
+                "ilink",
+                format!("read media file {:?}: {e}", media.url),
+            )
+        })?;
+        let raw_size = plaintext.len() as u64;
+        let raw_md5_hex = format!("{:x}", md5::compute(&plaintext));
+
+        // 2. AES 加密。
+        let key = crate::media::random_aes_key();
+        let ciphertext = crate::media::aes_encrypt(&plaintext, &key);
+        let file_size = ciphertext.len() as u64;
+        let aeskey_hex = hex::encode(key);
+        let aes_key_out = crate::media::encode_aes_key_outbound(&key);
+
+        // 3. getuploadurl。
+        let (media_type, item_type) = match media.kind.as_str() {
+            "image" => (1i64, 2i64),
+            "file" => (3, 4),
+            "video" => (2, 5),
+            "voice" => (4, 3),
+            other => {
+                warn!(target: "ilink", kind = other, "未知媒体 kind，按 file 处理");
+                (3, 4)
+            }
+        };
+        let filekey = format!("imagent-{}", uuid::Uuid::new_v4().simple());
+        let upload = crate::media::get_upload_url(
+            self.client.as_ref(),
+            &filekey,
+            media_type,
+            &peer,
+            raw_size,
+            &raw_md5_hex,
+            file_size,
+            &aeskey_hex,
+        )
+        .await?;
+
+        // x-encrypted-param（上传 URL 凭证）来自 upload_param。
+        let upload_param = upload
+            .upload_param
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                CoreError::Platform("ilink", "getuploadurl: missing upload_param".into())
+            })?;
+
+        // 4. CDN POST 上传，响应头 x-encrypted-param = sendmessage 的 encrypt_query_param。
+        let encrypt_query_param = crate::media::upload_cdn(
+            self.client.http(),
+            upload_param,
+            &filekey,
+            &ciphertext,
+        )
+        .await?;
+
+        // 5. sendmessage 媒体 item。
+        let client_id = format!("imagent-{}", uuid::Uuid::new_v4());
+        let item_obj = match media.kind.as_str() {
+            "image" => serde_json::json!({
+                "type": item_type,
+                "image_item": {
+                    "media": {
+                        "encrypt_query_param": encrypt_query_param,
+                        "aes_key": aes_key_out,
+                        "encrypt_type": 1,
+                    },
+                    "mid_size": file_size,
+                },
+            }),
+            _ => serde_json::json!({
+                "type": item_type,
+                "file_item": {
+                    "file_name": std::path::Path::new(&media.url)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&filekey)
+                        .to_string(),
+                    "media": {
+                        "encrypt_query_param": encrypt_query_param,
+                        "aes_key": aes_key_out,
+                        "encrypt_type": 1,
+                    },
+                },
+            }),
+        };
+
+        let mut msg = serde_json::json!({
+            "from_user_id": "",
+            "to_user_id": peer,
+            "client_id": client_id,
+            "message_type": 2,
+            "message_state": 2,
+            "item_list": [item_obj],
+        });
+        if !token.is_empty() {
+            msg["context_token"] = serde_json::json!(token);
+        }
+        let body = serde_json::json!({ "msg": msg });
+
+        // 出站串行 + 服从式退避（同 send_text）。
+        let _guard = self.send_lock.lock().await;
+        const MAX_RETRIES: usize = 4;
+        const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(3);
+        let mut attempt: usize = 0;
+        loop {
+            let remain = self.breaker.cooldown_remaining().await;
+            if !remain.is_zero() {
+                tokio::time::sleep(remain).await;
+            }
+            attempt += 1;
+            match self
+                .client
+                .post_json::<SendMsgResp>("/ilink/bot/sendmessage", &body)
+                .await
+            {
+                Ok(resp) => match classify_send(&resp) {
+                    SendOutcome::Success => {
+                        self.breaker.reset().await;
+                        return Ok(());
+                    }
+                    SendOutcome::SessionExpired => {
+                        return Err(CoreError::Platform(
+                            "ilink",
+                            "session expired: re-login required".into(),
+                        ));
+                    }
+                    SendOutcome::RateLimited => {
+                        self.breaker.record_event().await;
+                        if attempt > MAX_RETRIES {
+                            return Err(CoreError::Platform(
+                                "ilink",
+                                "sendmessage(media) rate-limited after retries".into(),
+                            ));
+                        }
+                        tokio::time::sleep(RATE_LIMIT_BACKOFF).await;
+                        continue;
+                    }
+                    SendOutcome::OtherError(s) => {
+                        return Err(CoreError::Platform(
+                            "ilink",
+                            format!("sendmessage(media) failed: {s}"),
+                        ));
+                    }
+                },
+                Err(e) => {
+                    if is_session_expired(&format!("{e}")) {
+                        return Err(CoreError::Platform(
+                            "ilink",
+                            "session expired: re-login required".into(),
+                        ));
+                    }
+                    if attempt > MAX_RETRIES {
+                        return Err(e);
+                    }
+                    let backoff = Duration::from_secs(attempt as u64);
+                    warn!(target: "ilink", err = %e, attempt, "sendmessage(media) network error, backing off");
+                    tokio::time::sleep(backoff).await;
+                }
             }
         }
     }
@@ -342,12 +548,11 @@ impl Platform for ILinkPlatform {
 
     async fn send_media(
         &self,
-        _conv: &ConvId,
-        _media: &MediaRef,
-        _hint: &ReplyHint,
+        conv: &ConvId,
+        media: &MediaRef,
+        hint: &ReplyHint,
     ) -> Result<()> {
-        // P1 不实现媒体（core 不调用）。
-        Ok(())
+        self.send_media_inner(conv, media, hint).await
     }
 
     /// best-effort typing 指示（agent 处理中）。先 getconfig 取 ticket，再 POST sendtyping。
@@ -392,6 +597,55 @@ fn is_session_expired(msg: &str) -> bool {
         || msg.contains("HTTP 403")
 }
 
+/// 媒体目录：`~/.imagent/media/`（0700）。
+fn media_dir() -> Result<std::path::PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| {
+        CoreError::Platform("ilink", "cannot resolve home dir for media storage".into())
+    })?;
+    let dir = home.join(".imagent").join("media");
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            CoreError::Platform("ilink", format!("create media dir {:?}: {e}", dir))
+        })?;
+    }
+    Ok(dir)
+}
+
+/// 从文件名或 kind 推断扩展名（含点）；推不出返回空串。
+fn guess_ext(file_name: Option<&str>, kind: &str) -> String {
+    if let Some(name) = file_name {
+        if let Some(idx) = name.rfind('.') {
+            let ext = &name[idx..];
+            // 仅当看起来像扩展名（≤8 字符、含字母）时保留。
+            if ext.len() <= 8 && ext.chars().any(|c| c.is_ascii_alphabetic()) {
+                return ext.to_ascii_lowercase();
+            }
+        }
+        return String::new();
+    }
+    match kind {
+        "image" => ".jpg".to_string(),
+        _ => ".bin".to_string(),
+    }
+}
+
+/// 把媒体字节落盘到 `~/.imagent/media/<uuid>.<ext>`，返回该路径的字符串形式。
+fn persist_media(kind: &str, file_name: Option<&str>, bytes: &[u8]) -> Result<String> {
+    let dir = media_dir()?;
+    // 0700 权限（目录私有）。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let ext = guess_ext(file_name, kind);
+    let fname = format!("{}{ext}", uuid::Uuid::new_v4().simple());
+    let path = dir.join(fname);
+    std::fs::write(&path, bytes)
+        .map_err(|e| CoreError::Platform("ilink", format!("write media {:?}: {e}", path)))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,7 +683,7 @@ mod tests {
             item_list: vec![Item {
                 item_type: 1,
                 text_item: Some(TextItem { text: Some("c".into()) }),
-                voice_item: None,
+                ..Default::default()
             }],
         };
         assert_eq!(dedup_key(&msg), "fc:u:c");

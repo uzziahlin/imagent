@@ -52,6 +52,11 @@ impl ILinkClient {
         &self.base_url
     }
 
+    /// 共享的 HTTP 客户端（媒体 CDN 下载/上传复用）。
+    pub fn http(&self) -> &reqwest::Client {
+        &self.http
+    }
+
     /// 每请求随机 `X-WECHAT-UIN`（base64 随机 u32 小端字节），防重放。
     fn random_uin() -> String {
         let v: u32 = rand::thread_rng().gen();

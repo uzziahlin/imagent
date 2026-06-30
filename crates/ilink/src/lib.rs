@@ -15,6 +15,7 @@
 mod client;
 mod dedup;
 mod login;
+mod media;
 mod platform;
 mod proto;
 mod ratelimit;

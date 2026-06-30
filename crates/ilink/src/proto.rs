@@ -90,6 +90,47 @@ pub struct Item {
     pub text_item: Option<TextItem>,
     #[serde(default)]
     pub voice_item: Option<VoiceItem>,
+    /// type==2 图片。
+    #[serde(default)]
+    pub image_item: Option<ImageItem>,
+    /// type==4 文件。
+    #[serde(default)]
+    pub file_item: Option<FileItem>,
+    /// type==5 视频（媒体引用同 file，按 file 处理）。
+    #[serde(default)]
+    pub video_item: Option<FileItem>,
+}
+
+/// 媒体引用（CDN 凭证 / aes_key / 直链）。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MediaRefProto {
+    /// CDN 下载凭证（优先于 full_url）。
+    #[serde(default)]
+    pub encrypt_query_param: Option<String>,
+    /// base64 编码的 aes_key（video/file/voice 通用）。
+    #[serde(default)]
+    pub aes_key: Option<String>,
+    /// 直链（不可信，下载前必须 SSRF 白名单校验）。
+    #[serde(default)]
+    pub full_url: Option<String>,
+}
+
+/// 图片条目；image 的 aeskey 是**裸 hex**（与其它媒体 base64 不同，hermes 实测）。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ImageItem {
+    #[serde(default)]
+    pub aeskey: Option<String>,
+    #[serde(default)]
+    pub media: Option<MediaRefProto>,
+}
+
+/// 文件条目（file/video 通用）。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct FileItem {
+    #[serde(default)]
+    pub file_name: Option<String>,
+    #[serde(default)]
+    pub media: Option<MediaRefProto>,
 }
 
 /// 文本条目载荷。
@@ -142,7 +183,7 @@ pub fn extract_text(msg: &Msg) -> String {
 /// - `sender = from_user_id`
 /// - `text` 取自 `item_list`（`type==1` 的 `text_item.text`）
 /// - `reply_hint` 携带 msg 的 `context_token`（空则默认空串）
-/// - `media` 恒为空（P1 不处理媒体）
+/// - `media` 仍为空：媒体引用由 `extract_media_refs` 提取，platform 层异步下载后填充。
 pub fn msg_to_inbound(msg: &Msg) -> InboundMessage {
     let text = extract_text(msg);
     InboundMessage {
@@ -153,6 +194,73 @@ pub fn msg_to_inbound(msg: &Msg) -> InboundMessage {
         reply_hint: ReplyHint::ILink {
             context_token: msg.context_token.clone().unwrap_or_default(),
         },
+    }
+}
+
+/// 入站媒体引用（platform 层据此下载/解密/存盘，再生成 `MediaRef`）。
+#[derive(Debug, Clone)]
+pub struct RawMediaRef {
+    /// `"image"` / `"file"`（video/file/voice 一律按 file 处理，hermes 经验）。
+    pub kind: &'static str,
+    /// CDN 凭证（优先）；缺失时 fallback `full_url`。
+    pub encrypt_query_param: Option<String>,
+    /// aes_key 的原始字符串（image=裸 hex；其它=base64；可能内含 hex）。
+    pub aes_key: Option<String>,
+    /// 直链（不可信，下载前必须 SSRF 白名单校验）。
+    pub full_url: Option<String>,
+    /// 文件名（用于推断扩展名；可空）。
+    pub file_name: Option<String>,
+}
+
+/// 从 `item_list` 提取媒体引用（image=type2 / file=type4 / video=type5）。
+///
+/// aes_key 来源（hermes 实测的非对称编码）：
+/// - image：优先 `image_item.aeskey`（裸 hex），其次 `media.aes_key`。
+/// - file/video：`media.aes_key`（base64）。
+pub fn extract_media_refs(msg: &Msg) -> Vec<RawMediaRef> {
+    let mut out = Vec::new();
+    for item in &msg.item_list {
+        match item.item_type {
+            2 => {
+                if let Some(img) = &item.image_item {
+                    let (eqp, key, url) = media_triple(img.media.as_ref());
+                    out.push(RawMediaRef {
+                        kind: "image",
+                        encrypt_query_param: eqp,
+                        aes_key: key.or_else(|| img.aeskey.clone()),
+                        full_url: url,
+                        file_name: None,
+                    });
+                }
+            }
+            4 | 5 => {
+                let fi = item.file_item.as_ref().or(item.video_item.as_ref());
+                if let Some(fi) = fi {
+                    let (eqp, key, url) = media_triple(fi.media.as_ref());
+                    out.push(RawMediaRef {
+                        kind: "file",
+                        encrypt_query_param: eqp,
+                        aes_key: key,
+                        full_url: url,
+                        file_name: fi.file_name.clone(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// 从 `MediaRefProto` 取 (encrypt_query_param, aes_key, full_url) 三元组。
+fn media_triple(m: Option<&MediaRefProto>) -> (Option<String>, Option<String>, Option<String>) {
+    match m {
+        Some(m) => (
+            m.encrypt_query_param.clone(),
+            m.aes_key.clone(),
+            m.full_url.clone(),
+        ),
+        None => (None, None, None),
     }
 }
 /// sendmessage 响应（HTTP 200 body，snake_case 单层，无 `base_resp` 包裹，hermes 实测）。
@@ -442,5 +550,44 @@ mod tests {
             SendOutcome::OtherError(s) => assert!(s.contains("ret=Some(-99)") && s.contains("boom")),
             other => panic!("expected OtherError, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn extract_media_refs_image_and_file() {
+        // image(type2)：aeskey 在 image_item.aeskey（裸 hex），media 带 eqp。
+        let json = r#"{"from_user_id":"u","item_list":[
+            {"type":2,"image_item":{"aeskey":"00112233445566778899aabbccddeeff","media":{"encrypt_query_param":"IMGQ"}}},
+            {"type":4,"file_item":{"file_name":"a.pdf","media":{"encrypt_query_param":"FILEQ","aes_key":"AAAA"}}}
+        ]}"#;
+        let m: Msg = serde_json::from_str(json).unwrap();
+        let refs = extract_media_refs(&m);
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].kind, "image");
+        assert_eq!(refs[0].encrypt_query_param.as_deref(), Some("IMGQ"));
+        // image 优先 image_item.aeskey。
+        assert_eq!(refs[0].aes_key.as_deref(), Some("00112233445566778899aabbccddeeff"));
+        assert_eq!(refs[1].kind, "file");
+        assert_eq!(refs[1].encrypt_query_param.as_deref(), Some("FILEQ"));
+        assert_eq!(refs[1].aes_key.as_deref(), Some("AAAA"));
+        assert_eq!(refs[1].file_name.as_deref(), Some("a.pdf"));
+    }
+
+    #[test]
+    fn extract_media_refs_empty_when_no_media_items() {
+        let json = r#"{"from_user_id":"u","item_list":[{"type":1,"text_item":{"text":"hi"}}]}"#;
+        let m: Msg = serde_json::from_str(json).unwrap();
+        assert!(extract_media_refs(&m).is_empty());
+    }
+
+    #[test]
+    fn extract_media_refs_image_falls_back_to_media_aes_key() {
+        // image 无 image_item.aeskey，回退到 media.aes_key。
+        let json = r#"{"from_user_id":"u","item_list":[
+            {"type":2,"image_item":{"media":{"encrypt_query_param":"Q","aes_key":"FFFF"}}}
+        ]}"#;
+        let m: Msg = serde_json::from_str(json).unwrap();
+        let refs = extract_media_refs(&m);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].aes_key.as_deref(), Some("FFFF"));
     }
 }

@@ -21,3 +21,9 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
+aes = { workspace = true }
+ecb = { workspace = true }
+cipher = { workspace = true }
+hex = { workspace = true }
+md5 = "0.7"
+dirs = { workspace = true }
