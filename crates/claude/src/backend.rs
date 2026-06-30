@@ -84,7 +84,26 @@ impl Backend for ClaudeBackend {
                     if captured_session.is_none() {
                         captured_session = session_id;
                     }
-                    debug!(line = %line, "stream event (ignored in MVP)");
+                    debug!(line = %line, "stream event (ignored)");
+                }
+                ParsedEvent::ToolUse {
+                    tool,
+                    input,
+                    session_id,
+                } => {
+                    if let Some(sid) = session_id {
+                        if captured_session.is_none() {
+                            captured_session = Some(sid);
+                        }
+                    }
+                    let _ = chunks
+                        .send(AgentChunk::ToolUse { tool, input })
+                        .await;
+                }
+                ParsedEvent::ToolResult { tool, output } => {
+                    let _ = chunks
+                        .send(AgentChunk::ToolResult { tool, output })
+                        .await;
                 }
                 ParsedEvent::Result {
                     text,

@@ -28,6 +28,31 @@ fn now_secs() -> i64 {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
+/// 把字符串按字符截断到 n 个字符，超出则加省略号。
+fn truncate_str(s: &str, n: usize) -> String {
+    let count = s.chars().count();
+    let t: String = s.chars().take(n).collect();
+    if count > n {
+        format!("{t}…")
+    } else {
+        t
+    }
+}
+
+/// 格式化工具调用摘要：最多展示 5 个，超出标 `…(+N)`。
+/// 形如 `\n\n🔧 工具调用：Read({"path":"…}), Edit({"file":"…})`。
+fn format_tool_summary(tool_calls: &[(String, String)]) -> String {
+    let shown: Vec<String> = tool_calls
+        .iter()
+        .take(5)
+        .map(|(t, i)| format!("{t}({i})"))
+        .collect();
+    let mut s = format!("\n\n🔧 工具调用：{}", shown.join(", "));
+    if tool_calls.len() > 5 {
+        s.push_str(&format!(" …(+{})", tool_calls.len() - 5));
+    }
+    s
+}
 /// 当前活动命名 session 的 config 键：`active_name:<conv_id>`。
 /// 不存在/空值表示当前会话为默认未命名 session。
 fn active_name_key(conv_id: &str) -> String {
@@ -524,14 +549,19 @@ impl Dispatcher {
                 .run(&prompt_owned, existing.as_ref(), &workdir, &tools, tx)
                 .await
         });
-        // 收集 chunks：MVP 只记录 Final/Error。
+        // 收集 chunks：Final/Error 落库，ToolUse 累积用于最终工具摘要。
         let mut final_text: Option<String> = None;
         let mut error_text: Option<String> = None;
+        let mut tool_calls: Vec<(String, String)> = Vec::new();
         while let Some(chunk) = rx.recv().await {
             match chunk {
                 AgentChunk::Final(t) => final_text = Some(t),
                 AgentChunk::Error(e) => error_text = Some(e),
-                _ => {}
+                AgentChunk::ToolUse { tool, input } => {
+                    tool_calls.push((tool, truncate_str(&input, 40)));
+                }
+                AgentChunk::ToolResult { .. } => {}  // 摘要只列工具调用，结果不进 IM
+                AgentChunk::Text(_) => {}
             }
         }
 
@@ -553,17 +583,25 @@ impl Dispatcher {
         };
 
         // 回传文本优先级：收到过的 Final > outcome.final_text > session_id 提示。
-        if let Some(et) = error_text {
+        if let Some(et) = &error_text {
             // 收到 Error chunk 也算需要提示（但 backend 正常返回，故只记录）。
             warn!(target: "imagent::core", conv_id = %conv.0, error = %et, "backend 产出 Error chunk");
         }
-        let reply = if let Some(f) = final_text {
+        let final_text_is_present = final_text.is_some();
+        let outcome_has_final = !outcome.final_text.is_empty();
+        let mut reply = if let Some(f) = final_text {
             f
-        } else if !outcome.final_text.is_empty() {
+        } else if outcome_has_final {
             outcome.final_text
         } else {
             format!("(done, session={})", outcome.session_id.0)
         };
+        // 工具调用摘要：仅在正常 final 分支附加（不在 backend 错误回复上附加）。
+        if !tool_calls.is_empty()
+            && (final_text_is_present || outcome_has_final)
+        {
+            reply.push_str(&format_tool_summary(&tool_calls));
+        }
         self.reply(&conv, &reply, &hint).await;
 
         // 落库（upsert 内部保留 created_at；store 错误仅 log）。
@@ -720,6 +758,8 @@ mod tests {
         calls: Arc<TokioMutex<Vec<Option<String>>>>,
         prompts: Arc<TokioMutex<Vec<String>>>,
         order: Arc<AtomicUsize>,
+        /// 每次 run 前发这些 ToolUse chunk（用于工具摘要测试）。默认空。
+        tools_to_emit: Arc<TokioMutex<Vec<(String, String)>>>,
     }
 
     impl MockBackend {
@@ -731,7 +771,17 @@ mod tests {
                 calls: calls.clone(),
                 prompts: prompts.clone(),
                 order: order.clone(),
+                tools_to_emit: Arc::new(TokioMutex::new(Vec::new())),
             };
+            (b, calls, prompts, order)
+        }
+
+        /// 返回带可配置 ToolUse 发射的 backend，以及设置 tool 列表的句柄。
+        async fn new_with_tools(
+            tools: Vec<(String, String)>,
+        ) -> (Self, CallsHandle, PromptsHandle, CounterHandle) {
+            let (b, calls, prompts, order) = Self::new();
+            *b.tools_to_emit.lock().await = tools;
             (b, calls, prompts, order)
         }
     }
@@ -754,6 +804,13 @@ mod tests {
             // 稍微让出调度器，便于测试串行。
             tokio::task::yield_now().await;
 
+            // 先发配置好的 ToolUse chunk（若有），再发 Final。
+            let tools = self.tools_to_emit.lock().await.clone();
+            for (tool, input) in tools {
+                let _ = chunks
+                    .send(AgentChunk::ToolUse { tool, input })
+                    .await;
+            }
             // 发一个 Final chunk。
             let _ = chunks
                 .send(AgentChunk::Final(format!("reply#{my_order}")))
@@ -816,6 +873,32 @@ mod tests {
     async fn build(auth: Auth) -> Ctx {
         let (plat, inbox, send_count) = MockPlatform::new();
         let (back, calls, prompts, order) = MockBackend::new();
+        let (store, db) = tmp_store().await;
+
+        let disp = Arc::new(Dispatcher::new(
+            Arc::new(plat),
+            Arc::new(back),
+            store,
+            auth,
+            std::path::PathBuf::from("/tmp/imagent-test-ws"),
+            vec!["Read".into(), "Edit".into()],
+        ));
+
+        Ctx {
+            disp,
+            inbox,
+            send_count,
+            calls,
+            prompts,
+            order,
+            db,
+        }
+    }
+
+    /// 与 build 相同，但 MockBackend 在 Final 前会发指定的 ToolUse chunk。
+    async fn build_with_tools(auth: Auth, tools: Vec<(String, String)>) -> Ctx {
+        let (plat, inbox, send_count) = MockPlatform::new();
+        let (back, calls, prompts, order) = MockBackend::new_with_tools(tools).await;
         let (store, db) = tmp_store().await;
 
         let disp = Arc::new(Dispatcher::new(
@@ -1352,4 +1435,43 @@ mod tests {
         );
         drop_db(ctx.db).await;
     }
+
+    #[tokio::test]
+    async fn normal_message_appends_tool_summary() {
+        let _serial = SERIAL.lock().await;
+        let tools = vec![
+            ("Read".to_string(), r#"{"path":"/foo"}"#.to_string()),
+            ("Edit".to_string(), r#"{"file":"/bar"}"#.to_string()),
+        ];
+        let ctx = build_with_tools(Auth::new(vec!["alice".into()]), tools).await;
+        feed_and_wait(&ctx, vec![msg("t1", "alice", "do it")], 1).await;
+
+        // 回传文本含工具摘要与工具名。
+        let inbox = ctx.inbox.lock().await.clone();
+        let reply = inbox.iter().find(|t| t.starts_with("reply#")).expect("应有 final reply");
+        assert!(reply.contains("🔧 工具调用"), "应含工具摘要标题: {reply}");
+        assert!(reply.contains("Read("), "应含 Read 工具: {reply}");
+        assert!(reply.contains("Edit("), "应含 Edit 工具: {reply}");
+        assert!(reply.contains("/foo"), "应含工具输入: {reply}");
+        drop_db(ctx.db).await;
+    }
+
+    #[tokio::test]
+    async fn tool_summary_truncates_after_five() {
+        let _serial = SERIAL.lock().await;
+        // 6 个工具 → 截断展示 5 个并标 …(+1)。
+        let tools: Vec<(String, String)> = (0..6)
+            .map(|i| (format!("Tool{i}"), format!(r#"{{"k":"{i}"}}"#)))
+            .collect();
+        let ctx = build_with_tools(Auth::new(vec!["alice".into()]), tools).await;
+        feed_and_wait(&ctx, vec![msg("t2", "alice", "go")], 1).await;
+
+        let inbox = ctx.inbox.lock().await.clone();
+        let reply = inbox.iter().find(|t| t.starts_with("reply#")).expect("应有 final reply");
+        assert!(reply.contains("…(+1)"), "6 个工具应标 …(+1): {reply}");
+        assert!(reply.contains("Tool0"), "应含首个工具: {reply}");
+        assert!(reply.contains("Tool4"), "应含第 5 个工具: {reply}");
+        drop_db(ctx.db).await;
+    }
+
 }
