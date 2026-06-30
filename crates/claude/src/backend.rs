@@ -3,22 +3,33 @@
 use std::process::Stdio;
 
 use async_trait::async_trait;
-use imagent_core::{AgentChunk, Backend, CoreError, Result, RunOutcome, SessionId};
+use imagent_core::{
+    AgentChunk, Backend, CoreError, PermissionMode, Result, RunOutcome, SessionId,
+};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::stream::{parse_line, ParsedEvent};
 
 /// Claude Code CLI 后端。
 ///
-/// P1 保持最小：无配置字段（model / system_prompt 等 P2 再加）。
-/// 通过 spawn `claude -p` 子进程执行任务，`stream-json` 逐行解析。
-pub struct ClaudeBackend;
+/// `permission_mode` 非 Off 时，spawn claude 时附加 `--mcp-config` +
+/// `--permission-prompt-tool`，把权限决策回调到 imagent 的 MCP server 子进程
+/// （imagent mcp 子命令）。
+pub struct ClaudeBackend {
+    permission_mode: PermissionMode,
+}
 
 impl ClaudeBackend {
     pub fn new() -> Self {
-        Self
+        Self {
+            permission_mode: PermissionMode::Off,
+        }
+    }
+
+    pub fn with_permission_mode(mode: PermissionMode) -> Self {
+        Self { permission_mode: mode }
     }
 }
 
@@ -30,6 +41,37 @@ impl Default for ClaudeBackend {
 
 const NAME: &str = "claude-cli";
 
+/// 固定 socket 路径（主进程 PermissionRouter 监听、MCP server 连接）。
+fn permission_sock_path() -> String {
+    dirs::home_dir()
+        .map(|h| h.join(".imagent").join("permission.sock").to_string_lossy().into_owned())
+        .unwrap_or_else(|| "/tmp/imagent-permission.sock".into())
+}
+
+/// 写临时 mcp.json，返回路径。claude 据此 spawn MCP server 子进程。
+fn write_mcp_config(
+    conv_id: &str,
+    sock: &str,
+    mode: PermissionMode,
+) -> std::io::Result<std::path::PathBuf> {
+    let exe = std::env::current_exe()?;
+    let cfg = serde_json::json!({
+        "mcpServers": {
+            "imagent": {
+                "command": exe.to_string_lossy(),
+                "args": ["mcp", "--conv-id", conv_id, "--sock", sock, "--mode", mode.as_str()]
+            }
+        }
+    });
+    let dir = dirs::home_dir()
+        .map(|h| h.join(".imagent"))
+        .unwrap_or_else(std::env::temp_dir);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("mcp_{conv_id}.json"));
+    std::fs::write(&path, cfg.to_string())?;
+    Ok(path)
+}
+
 #[async_trait]
 impl Backend for ClaudeBackend {
     fn name(&self) -> &'static str {
@@ -38,6 +80,7 @@ impl Backend for ClaudeBackend {
 
     async fn run(
         &self,
+        conv_id: &str,
         prompt: &str,
         session: Option<&SessionId>,
         workdir: &std::path::Path,
@@ -56,6 +99,26 @@ impl Backend for ClaudeBackend {
             .arg(allowed_tools.join(","));
         if let Some(s) = session {
             cmd.arg("--resume").arg(&s.0);
+        }
+        // 权限审批：非 Off 时附加 MCP server（imagent mcp 子命令）。
+        // claude 遇需权限工具时回调 permission_request，由 MCP server 依模式
+        // allow/deny 或经 socket 转主进程 IM 询问（Ask）。
+        if self.permission_mode.is_enabled() {
+            let sock = permission_sock_path();
+            match write_mcp_config(conv_id, &sock, self.permission_mode) {
+                Ok(mcp_json) => {
+                    cmd.arg("--mcp-config").arg(&mcp_json);
+                    cmd.arg("--permission-prompt-tool")
+                        .arg(imagent_core::mcp::TOOL_NAME);
+                }
+                Err(e) => {
+                    warn!(
+                        target: "imagent::claude",
+                        conv_id, error = %e,
+                        "write mcp config failed; permission gate disabled for this run"
+                    );
+                }
+            }
         }
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -210,6 +273,7 @@ mod tests {
 
         let outcome = backend
             .run(
+                "test-conv",
                 "reply with the single word: pong",
                 None,
                 &workdir,

@@ -18,7 +18,9 @@ use tracing::{info, warn};
 
 use crate::auth::Auth;
 use crate::backend::Backend;
+use crate::config::PermissionMode;
 use crate::error::Result;
+use crate::permission::{parse_reply, PermissionReply, PermissionRouter};
 use crate::platform::Platform;
 use crate::types::{AgentChunk, ConvId, InboundMessage, ReplyHint, SessionId};
 
@@ -81,6 +83,10 @@ pub struct Dispatcher {
     allowed_tools: Vec<String>,
     /// per-conv 串行锁：同一会话的 agent 任务排队执行，避免 session 冲突。
     conv_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// IM 权限审批路由（Ask 闭环用）。
+    router: Arc<PermissionRouter>,
+    /// 权限审批模式。
+    permission_mode: PermissionMode,
 }
 
 impl Dispatcher {
@@ -92,6 +98,7 @@ impl Dispatcher {
         auth: Auth,
         default_workdir: PathBuf,
         allowed_tools: Vec<String>,
+        permission_mode: PermissionMode,
     ) -> Self {
         Self {
             platform,
@@ -101,16 +108,43 @@ impl Dispatcher {
             default_workdir,
             allowed_tools,
             conv_locks: Mutex::new(HashMap::new()),
+            router: Arc::new(PermissionRouter::new()),
+            permission_mode,
         }
+    }
+
+    /// 暴露 router（主进程 socket accept task 用）。
+    pub fn router(&self) -> Arc<PermissionRouter> {
+        self.router.clone()
     }
 
     /// 主循环。循环 `platform.recv()`，每条消息 `tokio::spawn` 处理（不阻塞 recv）。
     /// recv 返回 Err 时：session 过期 → 优雅停止（返回 Err 让 main 提示重新 login）；
     /// 其它错误 → 记录日志后继续（长轮询层自管重连/退避），不 panic。
     pub async fn run(self: Arc<Self>) -> Result<()> {
+        // Ask 模式：spawn unix socket accept task（MCP server 转发的权限请求经此进主进程）。
+        if matches!(self.permission_mode, PermissionMode::Ask) {
+            if let Some(sock) = crate::permission::default_sock_path() {
+                self.spawn_socket_accept(sock.to_string_lossy().into_owned());
+            } else {
+                warn!(target: "imagent::core", "Ask 模式但无法定位 socket 路径，权限请求将无法路由");
+            }
+        }
+
         loop {
             match self.platform.recv().await {
                 Ok(msg) => {
+                    let conv_id = msg.conv_id.0.clone();
+                    // 权限闭环优先：若该 conv 正等待 approve/deny 回复，
+                    // 把这条消息当作回复送达 oneshot，不走正常 handle。
+                    if self.router.has_pending(&conv_id).await {
+                        let reply = parse_reply(msg.text.as_deref().unwrap_or(""));
+                        let routed = self.router.route(&conv_id, reply).await;
+                        if routed {
+                            continue;
+                        }
+                        // 未命中（理论上 has_pending 为 true 时应命中）：fallthrough 处理。
+                    }
                     // 每条消息独立 spawn，不阻塞 recv。
                     let this = self.clone();
                     tokio::spawn(async move {
@@ -130,6 +164,109 @@ impl Dispatcher {
                 }
             }
         }
+    }
+
+    /// spawn socket accept task：每个连接独立 spawn，读权限请求 → send_text 询问
+    /// 用户 → register 等 receiver → 写回复回 socket。
+    fn spawn_socket_accept(self: &Arc<Self>, sock: String) {
+        // 清理可能残留的旧 socket 文件。
+        let _ = std::fs::remove_file(&sock);
+        let listener = match std::os::unix::net::UnixListener::bind(&sock) {
+            Ok(l) => l,
+            Err(e) => {
+                warn!(target: "imagent::core", sock = %sock, error = %e, "bind permission socket failed; Ask 闭环不可用");
+                return;
+            }
+        };
+        // 转为非阻塞，包进 tokio。
+        listener.set_nonblocking(true).ok();
+        let listener = match tokio::net::UnixListener::from_std(listener) {
+            Ok(l) => l,
+            Err(e) => {
+                warn!(target: "imagent::core", error = %e, "from_std permission socket failed");
+                return;
+            }
+        };
+        let platform = self.platform.clone();
+        let router = self.router.clone();
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        let platform = platform.clone();
+                        let router = router.clone();
+                        tokio::spawn(async move {
+                            Self::handle_permission_socket(stream, platform, router).await;
+                        });
+                    }
+                    Err(e) => {
+                        warn!(target: "imagent::core", error = %e, "permission socket accept 失败");
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                }
+            }
+        });
+    }
+
+    /// 处理单个 socket 连接：读请求行 → send_text 询问 → 等回复 → 写回复。
+    async fn handle_permission_socket(
+        mut stream: tokio::net::UnixStream,
+        platform: Arc<dyn Platform>,
+        router: Arc<PermissionRouter>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let mut reader = BufReader::new(&mut stream);
+        let mut line = String::new();
+        if reader.read_line(&mut line).await.is_err() {
+            return;
+        }
+        let req: serde_json::Value = match serde_json::from_str(line.trim()) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(target: "imagent::core", raw = %line, error = %e, "permission socket 非 JSON");
+                return;
+            }
+        };
+        let conv_id = req.get("conv_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let tool_name = req
+            .get("tool_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .to_string();
+        let input_str = req
+            .get("input")
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        if conv_id.is_empty() {
+            return;
+        }
+        let conv = ConvId(conv_id.clone());
+        // 询问用户。
+        let prompt_text = format!(
+            "🔐 Claude 请求执行 {tool_name}：{}\n回复 y 允许，其它拒绝。",
+            truncate_str(&input_str, 80)
+        );
+        if let Err(e) = platform.send_text(&conv, &prompt_text, &ReplyHint::None).await {
+            warn!(target: "imagent::core", conv_id = %conv_id, error = %e, "send permission ask 失败");
+        }
+        // 注册 pending，等回复（recv 循环 route 到这里）。
+        let rx = router.register(&conv_id).await;
+        let reply: PermissionReply = match rx.await {
+            Ok(r) => r,
+            Err(_) => PermissionReply {
+                allow: false,
+                message: Some("permission router dropped".into()),
+            },
+        };
+        // 写回 socket（一行 JSON）。
+        let resp = serde_json::json!({
+            "allow": reply.allow,
+            "message": reply.message,
+        });
+        let mut out = resp.to_string();
+        out.push('\n');
+        let _ = stream.write_all(out.as_bytes()).await;
+        let _ = stream.flush().await;
     }
 
     /// 处理单条消息。内部任何错误都 log 并吞掉，不影响主循环。
@@ -404,9 +541,11 @@ impl Dispatcher {
                                 let backend = self.backend.clone();
                                 let workdir = self.default_workdir.clone();
                                 let tools = self.allowed_tools.clone();
+                                let conv_id_compact = conv.0.clone();
                                 let join = tokio::spawn(async move {
                                     backend
                                         .run(
+                                            &conv_id_compact,
                                             "请用中文简洁总结当前对话的要点、已做决定与未完成事项（不超过 400 字）。",
                                             Some(&sid),
                                             &workdir,
@@ -547,9 +686,10 @@ impl Dispatcher {
         let workdir = self.default_workdir.clone();
         let tools = self.allowed_tools.clone();
         let prompt_owned = prompt.clone();
+        let conv_id_owned = conv.0.clone();
         let join = tokio::spawn(async move {
             backend
-                .run(&prompt_owned, existing.as_ref(), &workdir, &tools, tx)
+                .run(&conv_id_owned, &prompt_owned, existing.as_ref(), &workdir, &tools, tx)
                 .await
         });
         // 收集 chunks：Final/Error 落库，ToolUse 累积用于最终工具摘要。
@@ -793,6 +933,7 @@ mod tests {
     impl Backend for MockBackend {
         async fn run(
             &self,
+            _conv_id: &str,
             prompt: &str,
             session: Option<&SessionId>,
             _workdir: &std::path::Path,
@@ -885,6 +1026,7 @@ mod tests {
             auth,
             std::path::PathBuf::from("/tmp/imagent-test-ws"),
             vec!["Read".into(), "Edit".into()],
+            PermissionMode::Off,
         ));
 
         Ctx {
@@ -911,6 +1053,7 @@ mod tests {
             auth,
             std::path::PathBuf::from("/tmp/imagent-test-ws"),
             vec!["Read".into(), "Edit".into()],
+            PermissionMode::Off,
         ));
 
         Ctx {
@@ -923,6 +1066,7 @@ mod tests {
             db,
         }
     }
+
 
     /// 把消息喂给 dispatcher 的 mock platform recv，并等待处理完成。
     async fn feed_and_wait(ctx: &Ctx, msgs: Vec<InboundMessage>, want_calls: usize) {

@@ -12,13 +12,16 @@ mod backend;
 mod config;
 mod dispatch;
 mod error;
+pub mod mcp;
+mod permission;
 mod platform;
 mod types;
 
 pub use auth::Auth;
 pub use backend::Backend;
-pub use config::Config;
+pub use config::{Config, PermissionMode};
 pub use dispatch::Dispatcher;
 pub use error::{CoreError, Result};
+pub use permission::{default_sock_path, parse_reply, PermissionReply, PermissionRouter};
 pub use platform::Platform;
 pub use types::{AgentChunk, ConvId, InboundMessage, MediaRef, ReplyHint, RunOutcome, SessionId, UserId, Workdir};
