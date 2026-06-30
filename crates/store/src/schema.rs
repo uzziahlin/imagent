@@ -62,6 +62,23 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 "#;
 
+/// v3：命名 session 侧表（B1/B2）。
+///
+/// `sessions` 表保持 conv_id PK（一对一 = 当前活动 session）不变；
+/// 多命名 session 的历史/命名集合由本表承担，PK = (conv_id, name)。
+pub const SCHEMA_V3: &str = r#"
+CREATE TABLE IF NOT EXISTS named_sessions (
+  conv_id    TEXT NOT NULL,
+  name       TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  agent_kind TEXT,
+  workdir    TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (conv_id, name)
+);
+"#;
+
 /// 在已打开的连接上跑线性迁移。幂等：逐版本推进（v1→v2→…），已到目标版本则跳过。
 pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     let current: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -76,6 +93,11 @@ pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
         tracing::info!(current, "running store schema migration to v2");
         conn.execute_batch(SCHEMA_V2)?;
         conn.pragma_update(None, "user_version", 2_i64)?;
+    }
+    if current < 3 {
+        tracing::info!(current, "running store schema migration to v3");
+        conn.execute_batch(SCHEMA_V3)?;
+        conn.pragma_update(None, "user_version", 3_i64)?;
     }
     Ok(())
 }

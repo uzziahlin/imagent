@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use imagent_store::{SessionRow, Store};
+use imagent_store::{NamedSessionRow, SessionRow, Store};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
@@ -27,6 +27,11 @@ fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+/// 当前活动命名 session 的 config 键：`active_name:<conv_id>`。
+/// 不存在/空值表示当前会话为默认未命名 session。
+fn active_name_key(conv_id: &str) -> String {
+    format!("active_name:{conv_id}")
 }
 
 /// 错误是否指示 iLink session 过期（需重新 login）。
@@ -147,9 +152,13 @@ impl Dispatcher {
                         if let Err(e) = self.store.delete_session(&conv.0).await {
                             warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "delete_session 失败");
                         }
+                        // 清当前活动命名 → 回到默认未命名 session。
+                        if let Err(e) = self.store.delete_config(&active_name_key(&conv.0)).await {
+                            warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "delete_config(active_name) 失败");
+                        }
                         self.reply(
                             &conv,
-                            "已重置会话，下一条消息将开启新会话。",
+                            "已重置会话，下一条消息将开启新会话（默认未命名）。",
                             &hint,
                         )
                         .await;
@@ -245,11 +254,105 @@ impl Dispatcher {
                         self.reply(&conv, &format!("你的 sender id：`{}`", sender.0), &hint).await;
                         return;
                     }
+                    "/switch" => {
+                        let name = parts.get(1).map(|s| s.trim()).unwrap_or("");
+                        if name.is_empty() {
+                            self.reply(&conv, "用法: /switch <name>", &hint).await;
+                            return;
+                        }
+                        let key = active_name_key(&conv.0);
+                        match self.store.get_named_session(&conv.0, name).await {
+                            Ok(Some(row)) => {
+                                // 切回历史命名 session：把它写成活动 session（续接用）。
+                                let now = now_secs();
+                                let sr = SessionRow {
+                                    conv_id: conv.0.clone(),
+                                    session_id: row.session_id.clone(),
+                                    agent_kind: row
+                                        .agent_kind
+                                        .unwrap_or_else(|| self.backend.name().to_string()),
+                                    workdir: row
+                                        .workdir
+                                        .unwrap_or_else(|| self.default_workdir.to_string_lossy().to_string()),
+                                    name: Some(name.into()),
+                                    created_at: row.created_at,
+                                    updated_at: now,
+                                };
+                                if let Err(e) = self.store.upsert_session(&sr).await {
+                                    warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "upsert_session 失败");
+                                }
+                                if let Err(e) = self.store.set_config(&key, name).await {
+                                    warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "set_config(active_name) 失败");
+                                }
+                                let sid_short: String = row.session_id.chars().take(8).collect();
+                                self.reply(
+                                    &conv,
+                                    &format!("已切换到「{name}」（session {sid_short}…）"),
+                                    &hint,
+                                )
+                                .await;
+                            }
+                            Ok(None) => {
+                                // 新命名 session：清活动 session（下次新建）+ 设 active_name。
+                                if let Err(e) = self.store.delete_session(&conv.0).await {
+                                    warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "delete_session 失败");
+                                }
+                                if let Err(e) = self.store.set_config(&key, name).await {
+                                    warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "set_config(active_name) 失败");
+                                }
+                                self.reply(
+                                    &conv,
+                                    &format!("已切到新会话「{name}」，下一条消息将开启。"),
+                                    &hint,
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "get_named_session 失败");
+                                self.reply(&conv, "查询失败，请重试。", &hint).await;
+                            }
+                        }
+                        return;
+                    }
+                    "/sessions" => {
+                        match self.store.list_named_sessions(&conv.0).await {
+                            Ok(rows) if rows.is_empty() => {
+                                self.reply(
+                                    &conv,
+                                    "无命名会话（用 /switch <name> 创建）。",
+                                    &hint,
+                                )
+                                .await;
+                            }
+                            Ok(rows) => {
+                                let active = self
+                                    .store
+                                    .get_config(&active_name_key(&conv.0))
+                                    .await
+                                    .unwrap_or(None)
+                                    .unwrap_or_default();
+                                let mut lines = String::from("命名会话：");
+                                for r in &rows {
+                                    let mark = if r.name == active { " *" } else { "" };
+                                    let sid: String = r.session_id.chars().take(8).collect();
+                                    lines.push_str(&format!(
+                                        "\n  {}{} (session {}…)",
+                                        r.name, mark, sid
+                                    ));
+                                }
+                                self.reply(&conv, &lines, &hint).await;
+                            }
+                            Err(e) => {
+                                warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "list_named_sessions 失败");
+                            }
+                        }
+                        return;
+                    }
                     _ => {
                         self.reply(
                             &conv,
                             &format!(
-                                "未知命令: {cmd}（支持: /new /allow /disallow /list /whoami）"
+                                "未知命令: {cmd}（支持: /new /allow /disallow /list /whoami /switch /sessions）"
                             ),
                             &hint,
                         )
@@ -340,17 +443,39 @@ impl Dispatcher {
 
         // 落库（upsert 内部保留 created_at；store 错误仅 log）。
         let now = now_secs();
+        // 当前活动命名（不存在/空 = 默认未命名）。
+        let active_name = self
+            .store
+            .get_config(&active_name_key(&conv.0))
+            .await
+            .unwrap_or(None)
+            .filter(|s| !s.is_empty());
         let row = SessionRow {
             conv_id: conv.0.clone(),
             session_id: outcome.session_id.0.clone(),
             agent_kind: self.backend.name().to_string(),
             workdir: self.default_workdir.to_string_lossy().to_string(),
-            name: None,
+            name: active_name.clone(),
             created_at: now,
             updated_at: now,
         };
         if let Err(e) = self.store.upsert_session(&row).await {
             warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "upsert_session 失败");
+        }
+        // 有命名时，同步写命名侧表（可恢复/历史）。
+        if let Some(name) = &active_name {
+            let nrow = NamedSessionRow {
+                conv_id: conv.0.clone(),
+                name: name.clone(),
+                session_id: outcome.session_id.0.clone(),
+                agent_kind: Some(self.backend.name().to_string()),
+                workdir: Some(self.default_workdir.to_string_lossy().to_string()),
+                created_at: now,
+                updated_at: now,
+            };
+            if let Err(e) = self.store.upsert_named_session(&nrow).await {
+                warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "upsert_named_session 失败");
+            }
         }
     }
 
@@ -811,6 +936,140 @@ mod tests {
         // bob 已被移除：后续消息被丢弃，不驱动 backend。
         feed_and_wait(&ctx, vec![msg("c14", "bob", "still here?")], 0).await;
         assert_eq!(ctx.order.load(Ordering::SeqCst), 0, "bob 应已被移出白名单");
+        drop_db(ctx.db).await;
+    }
+    #[tokio::test]
+    async fn switch_new_name_clears_session_and_sets_active() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::new(vec!["alice".into()])).await;
+        // 先建立默认 session。
+        feed_and_wait(&ctx, vec![msg("s1", "alice", "hello")], 1).await;
+        assert!(ctx.check().await.get_session("s1").await.unwrap().is_some());
+
+        // /switch newtask（命名不存在）→ 活动清空 + active_name 设。
+        feed_and_wait(&ctx, vec![msg("s1", "alice", "/switch newtask")], 1).await;
+        assert!(
+            ctx.check().await.get_session("s1").await.unwrap().is_none(),
+            "switch 新命名后活动 session 应清空"
+        );
+        assert_eq!(
+            ctx.check().await.get_config("active_name:s1").await.unwrap(),
+            Some("newtask".to_string())
+        );
+
+        // 下一条普通消息：backend 收到 None（新建），并落 named_sessions(newtask)。
+        feed_and_wait(&ctx, vec![msg("s1", "alice", "do work")], 2).await;
+        let calls = ctx.calls.lock().await.clone();
+        assert_eq!(calls.last(), Some(&None), "switch 后首条消息应新建 session");
+
+        let nrow = ctx
+            .check()
+            .await
+            .get_named_session("s1", "newtask")
+            .await
+            .unwrap()
+            .expect("named row");
+        assert_eq!(nrow.name, "newtask");
+        // 活动 session 行 name 也带命名。
+        let srow = ctx.check().await.get_session("s1").await.unwrap().expect("session row");
+        assert_eq!(srow.name.as_deref(), Some("newtask"));
+        drop_db(ctx.db).await;
+    }
+
+    #[tokio::test]
+    async fn switch_existing_name_resumes_named_session() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::new(vec!["alice".into()])).await;
+        // 建立命名 session `taskA`。
+        feed_and_wait(&ctx, vec![msg("s2", "alice", "/switch taskA")], 0).await;
+        feed_and_wait(&ctx, vec![msg("s2", "alice", "first taskA work")], 1).await;
+        let nrow = ctx
+            .check()
+            .await
+            .get_named_session("s2", "taskA")
+            .await
+            .unwrap()
+            .expect("named row taskA");
+        let taskA_sid = nrow.session_id.clone();
+
+        // 切到默认（/new 清 active_name）再发消息建立另一个默认 session。
+        feed_and_wait(&ctx, vec![msg("s2", "alice", "/new")], 1).await;
+        feed_and_wait(&ctx, vec![msg("s2", "alice", "default work")], 2).await;
+
+        // /switch taskA（命名已存在）→ 活动 session 被写成 taskA 的 session_id。
+        feed_and_wait(&ctx, vec![msg("s2", "alice", "/switch taskA")], 2).await;
+        let srow = ctx.check().await.get_session("s2").await.unwrap().expect("session row");
+        assert_eq!(srow.session_id, taskA_sid, "switch 已存在命名应 resume 其 session_id");
+        assert_eq!(srow.name.as_deref(), Some("taskA"));
+        assert_eq!(
+            ctx.check().await.get_config("active_name:s2").await.unwrap(),
+            Some("taskA".to_string())
+        );
+
+        // 下一条普通消息应续接 taskA 的 session_id。
+        feed_and_wait(&ctx, vec![msg("s2", "alice", "continue")], 3).await;
+        let calls = ctx.calls.lock().await.clone();
+        assert_eq!(
+            calls.last(),
+            Some(&Some(taskA_sid)),
+            "switch 后续消息应续接命名 session"
+        );
+        drop_db(ctx.db).await;
+    }
+
+    #[tokio::test]
+    async fn sessions_command_lists_named_with_active_mark() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::new(vec!["alice".into()])).await;
+        // 空时 /sessions。
+        feed_and_wait(&ctx, vec![msg("s3", "alice", "/sessions")], 0).await;
+        assert!(
+            ctx.inbox.lock().await.last().unwrap().contains("无命名会话"),
+            "空命名时应提示无"
+        );
+
+        // 建两个命名 session。
+        feed_and_wait(&ctx, vec![msg("s3", "alice", "/switch alpha")], 0).await;
+        feed_and_wait(&ctx, vec![msg("s3", "alice", "a work")], 1).await;
+        feed_and_wait(&ctx, vec![msg("s3", "alice", "/switch beta")], 1).await;
+        feed_and_wait(&ctx, vec![msg("s3", "alice", "b work")], 2).await;
+
+        // /sessions：应列出 alpha、beta，当前活动 beta 标 *。
+        feed_and_wait(&ctx, vec![msg("s3", "alice", "/sessions")], 2).await;
+        let inbox = ctx.inbox.lock().await.clone();
+        let listing = inbox.last().unwrap();
+        assert!(listing.contains("命名会话"), "listing={listing}");
+        assert!(listing.contains("alpha"), "listing={listing}");
+        assert!(listing.contains("beta"), "listing={listing}");
+        // beta 为活动，应带 `*`；alpha 不应带。
+        assert!(listing.contains("beta *"), "活动命名应带 *，listing={listing}");
+        drop_db(ctx.db).await;
+    }
+
+    #[tokio::test]
+    async fn new_command_clears_active_name() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::new(vec!["alice".into()])).await;
+        // 建命名 session。
+        feed_and_wait(&ctx, vec![msg("s4", "alice", "/switch build")], 0).await;
+        feed_and_wait(&ctx, vec![msg("s4", "alice", "go")], 1).await;
+        assert_eq!(
+            ctx.check().await.get_config("active_name:s4").await.unwrap(),
+            Some("build".to_string())
+        );
+
+        // /new 清活动 session 与 active_name。
+        feed_and_wait(&ctx, vec![msg("s4", "alice", "/new")], 1).await;
+        assert!(
+            ctx.check().await.get_config("active_name:s4").await.unwrap().is_none(),
+            "/new 后 active_name 应被清除"
+        );
+        assert!(ctx.check().await.get_session("s4").await.unwrap().is_none());
+
+        // 下一条普通消息：name 应为 None（默认未命名）。
+        feed_and_wait(&ctx, vec![msg("s4", "alice", "fresh")], 2).await;
+        let srow = ctx.check().await.get_session("s4").await.unwrap().expect("row");
+        assert!(srow.name.is_none(), "/new 后新 session 应未命名");
         drop_db(ctx.db).await;
     }
 }
