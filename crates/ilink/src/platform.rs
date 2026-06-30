@@ -8,25 +8,31 @@
 //!
 //! 鉴权由 core 做：本层只透传 `from_user_id`，不做白名单（DESIGN §9 硬约束①）。
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::json;
 use tokio::sync::Mutex;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use imagent_core::{ConvId, CoreError, InboundMessage, MediaRef, Platform, ReplyHint, Result};
 use imagent_store::Store;
 
 use crate::client::ILinkClient;
 use crate::dedup::Dedup;
-use crate::proto::{classify_send, extract_text, msg_to_inbound, Msg, SendMsgResp, SendOutcome, UpdatesResp};
+use crate::proto::{
+    classify_send, extract_text, msg_to_inbound, GetConfigResp, Msg, SendMsgResp, SendOutcome,
+    UpdatesResp,
+};
 
 const PLATFORM: &str = "ilink";
 const ILINK_PREFIX: &str = "ilink:";
 /// 退避上限：到达后停止重试、上报 Err（由 core 决定继续/暂停）。
 const BACKOFF_CAP: Duration = Duration::from_secs(30);
+/// typing_ticket 缓存 TTL（协议侧 600s，留 100s 余量提前刷新）。
+const TYPING_TICKET_TTL: Duration = Duration::from_secs(500);
 
 pub struct ILinkPlatform {
     client: Arc<ILinkClient>,
@@ -39,6 +45,8 @@ pub struct ILinkPlatform {
     send_lock: Mutex<()>,
     /// 被动限流熔断器。
     breaker: crate::ratelimit::RateBreaker,
+    /// per-peer typing_ticket 缓存：peer → (ticket, expiry)。
+    typing_tickets: Mutex<HashMap<String, (String, Instant)>>,
 }
 
 impl ILinkPlatform {
@@ -54,6 +62,7 @@ impl ILinkPlatform {
                 1,
                 Duration::from_secs(30),
             ),
+            typing_tickets: Mutex::new(HashMap::new()),
             pending: Mutex::new(Vec::new()),
         }
     }
@@ -126,6 +135,53 @@ impl ILinkPlatform {
                 .unwrap_or_default(),
         }
     }
+
+    /// 取（或刷新）该 peer 的 typing_ticket。缓存命中且未过期则直接返回；
+    /// 否则 POST getconfig 刷新。失败返回 None（尽力而为，不阻断主流程）。
+    async fn ensure_typing_ticket(&self, peer: &str, hint: &ReplyHint) -> Option<String> {
+        // 1. 缓存命中？
+        {
+            let cache = self.typing_tickets.lock().await;
+            if let Some((t, exp)) = cache.get(peer) {
+                if ticket_valid(t, *exp, Instant::now()) {
+                    return Some(t.clone());
+                }
+            }
+        }
+        // 2. 过期/无 → getconfig 刷新。
+        let ctx = self.resolve_context_token(peer, hint).await;
+        let mut body = json!({ "ilink_user_id": peer });
+        if !ctx.is_empty() {
+            body["context_token"] = json!(ctx);
+        }
+        match self
+            .client
+            .post_json::<GetConfigResp>("/ilink/bot/getconfig", &body)
+            .await
+        {
+            Ok(resp) if resp.typing_ticket.as_deref().is_some_and(|t| !t.is_empty()) => {
+                let ticket = resp.typing_ticket.unwrap();
+                self.typing_tickets
+                    .lock()
+                    .await
+                    .insert(peer.to_string(), (ticket.clone(), Instant::now() + TYPING_TICKET_TTL));
+                Some(ticket)
+            }
+            Ok(_) => {
+                warn!(target: "ilink", peer, "getconfig 无 typing_ticket");
+                None
+            }
+            Err(e) => {
+                warn!(target: "ilink", peer, error = %e, "getconfig 失败");
+                None
+            }
+        }
+    }
+}
+
+/// 判断缓存的 typing_ticket 是否仍有效：非空 + 未过 TTL。
+fn ticket_valid(ticket: &str, expiry: Instant, now: Instant) -> bool {
+    !ticket.is_empty() && expiry > now
 }
 
 /// 去重 key：优先 `message_id`，否则 `from_user_id + 文本` 组合。
@@ -294,8 +350,33 @@ impl Platform for ILinkPlatform {
         Ok(())
     }
 
-    async fn send_typing(&self, _conv: &ConvId, _hint: &ReplyHint) -> Result<()> {
-        // P1 不实现 typing。
+    /// best-effort typing 指示（agent 处理中）。先 getconfig 取 ticket，再 POST sendtyping。
+    /// 全程尽力而为：失败仅 log 并返回 Ok，绝不阻断主流程。
+    /// 仅发 status=1（start）——typing 时长由客户端按 ticket 自管，无需 stop。
+    async fn send_typing(&self, conv: &ConvId, hint: &ReplyHint) -> Result<()> {
+        let peer = Self::peer_of(conv);
+        let ticket = match self.ensure_typing_ticket(&peer, hint).await {
+            Some(t) => t,
+            None => return Ok(()), // 无 ticket 则跳过（不阻断）。
+        };
+        let body = json!({
+            "ilink_user_id": peer,
+            "typing_ticket": ticket,
+            "status": 1u32, // start
+        });
+        // sendtyping body 无 msg 包装（与 sendmessage 不同，照 hermes）。
+        let _: serde_json::Value = match self
+            .client
+            .post_json("/ilink/bot/sendtyping", &body)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(target: "ilink", peer, error = %e, "sendtyping 失败（忽略）");
+                return Ok(());
+            }
+        };
+        debug!(target: "ilink", peer, "sendtyping ok");
         Ok(())
     }
 
@@ -359,5 +440,28 @@ mod tests {
         assert!(is_session_expired("POST x: HTTP 401"));
         assert!(is_session_expired("SESSION_EXPIRED: token invalid"));
         assert!(!is_session_expired("POST x: HTTP 500"));
+    }
+
+    #[test]
+    fn ticket_valid_fresh_nonempty() {
+        let now = Instant::now();
+        let exp = now + Duration::from_secs(400);
+        assert!(ticket_valid("tk", exp, now));
+    }
+
+    #[test]
+    fn ticket_valid_expired() {
+        // expiry 在 now 之前 → 已过期。
+        let now = Instant::now();
+        let exp = now - Duration::from_secs(1);
+        assert!(!ticket_valid("tk", exp, now));
+    }
+
+    #[test]
+    fn ticket_valid_empty_ticket() {
+        let now = Instant::now();
+        let exp = now + Duration::from_secs(400);
+        // 即使未过期，空 ticket 也判无效（需刷新）。
+        assert!(!ticket_valid("", exp, now));
     }
 }

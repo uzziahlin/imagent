@@ -517,6 +517,9 @@ impl Dispatcher {
         };
         let _guard = lock.lock().await;
 
+        // best-effort typing 指示（agent 处理中）；失败仅 log，不阻塞后续。
+        let _ = self.platform.send_typing(&conv, &hint).await;
+
         // 取续接 session；store 错误仅 log 后当 None。
         let existing: Option<SessionId> = match self.store.get_session(&conv.0).await {
             Ok(Some(row)) => Some(SessionId(row.session_id)),

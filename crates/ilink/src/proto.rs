@@ -166,6 +166,21 @@ pub struct SendMsgResp {
     pub errmsg: Option<String>,
 }
 
+/// getconfig 响应（hermes 实测：含 typing_ticket）。
+///
+/// 字段 snake_case 为主，对 camelCase 异名容错；全部 `default` 防缺字段崩溃。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GetConfigResp {
+    #[serde(default, alias = "typingTicket")]
+    pub typing_ticket: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)] // 协议字段，保留供诊断
+    pub ret: Option<i64>,
+    #[serde(default, alias = "errmsg", alias = "msg")]
+    #[allow(dead_code)] // 协议字段，保留供诊断
+    pub err_msg: Option<String>,
+}
+
 /// sendmessage 响应分类（按协议事实 §2 优先级）。
 #[derive(Debug)]
 pub enum SendOutcome {
