@@ -33,6 +33,11 @@ fn now_secs() -> i64 {
 fn active_name_key(conv_id: &str) -> String {
     format!("active_name:{conv_id}")
 }
+/// 压缩摘要的 config 键：`compact_summary:<conv_id>`。
+/// 由 /compact 写入，下次新建 session 时作为前情摘要注入后清除（一次性）。
+fn compact_summary_key(conv_id: &str) -> String {
+    format!("compact_summary:{conv_id}")
+}
 
 /// 错误是否指示 iLink session 过期（需重新 login）。
 ///
@@ -348,11 +353,120 @@ impl Dispatcher {
                         }
                         return;
                     }
+                    "/compact" => {
+                        let key = compact_summary_key(&conv.0);
+                        let existing_sid: Option<SessionId> =
+                            match self.store.get_session(&conv.0).await {
+                                Ok(Some(row)) => Some(SessionId(row.session_id)),
+                                Ok(None) => None,
+                                Err(e) => {
+                                    warn!(
+                                        target: "imagent::core",
+                                        conv_id = %conv.0,
+                                        error = %e,
+                                        "compact: get_session 失败"
+                                    );
+                                    None
+                                }
+                            };
+                        match existing_sid {
+                            None => {
+                                self.reply(&conv, "当前无活动会话可压缩。", &hint).await;
+                            }
+                            Some(sid) => {
+                                // 用 claude resume 当前 session 生成摘要；只取 Final/RunOutcome。
+                                let (tx, mut rx) = mpsc::channel::<AgentChunk>(32);
+                                let backend = self.backend.clone();
+                                let workdir = self.default_workdir.clone();
+                                let tools = self.allowed_tools.clone();
+                                let join = tokio::spawn(async move {
+                                    backend
+                                        .run(
+                                            "请用中文简洁总结当前对话的要点、已做决定与未完成事项（不超过 400 字）。",
+                                            Some(&sid),
+                                            &workdir,
+                                            &tools,
+                                            tx,
+                                        )
+                                        .await
+                                });
+                                let mut summary: Option<String> = None;
+                                while let Some(chunk) = rx.recv().await {
+                                    if let AgentChunk::Final(t) = chunk {
+                                        summary = Some(t);
+                                    }
+                                }
+                                let summary_text = match join.await {
+                                    Ok(Ok(o)) => summary.unwrap_or(o.final_text),
+                                    Ok(Err(e)) => {
+                                        warn!(
+                                            target: "imagent::core",
+                                            conv_id = %conv.0,
+                                            error = %e,
+                                            "compact 摘要生成失败"
+                                        );
+                                        self.reply(&conv, &format!("生成摘要失败：{e}"), &hint)
+                                            .await;
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            target: "imagent::core",
+                                            conv_id = %conv.0,
+                                            error = %e,
+                                            "compact 摘要任务 panic"
+                                        );
+                                        self.reply(&conv, &format!("摘要任务异常：{e}"), &hint)
+                                            .await;
+                                        return;
+                                    }
+                                };
+                                // 存摘要 + 重置活动 session + 清 active_name（释放 context）。
+                                if let Err(e) = self.store.set_config(&key, &summary_text).await {
+                                    warn!(
+                                        target: "imagent::core",
+                                        conv_id = %conv.0,
+                                        error = %e,
+                                        "set_config(compact_summary) 失败"
+                                    );
+                                }
+                                if let Err(e) = self.store.delete_session(&conv.0).await {
+                                    warn!(
+                                        target: "imagent::core",
+                                        conv_id = %conv.0,
+                                        error = %e,
+                                        "compact: delete_session 失败"
+                                    );
+                                }
+                                if let Err(e) = self
+                                    .store
+                                    .delete_config(&active_name_key(&conv.0))
+                                    .await
+                                {
+                                    warn!(
+                                        target: "imagent::core",
+                                        conv_id = %conv.0,
+                                        error = %e,
+                                        "compact: delete_config(active_name) 失败"
+                                    );
+                                }
+                                self.reply(
+                                    &conv,
+                                    &format!(
+                                        "已压缩会话。摘要：\n\n{summary_text}\n\n（新会话将保留此摘要延续上下文）"
+                                    ),
+                                    &hint,
+                                )
+                                .await;
+                            }
+                        }
+                        return;
+                    }
                     _ => {
                         self.reply(
                             &conv,
                             &format!(
-                                "未知命令: {cmd}（支持: /new /allow /disallow /list /whoami /switch /sessions）"
+                                "未知命令: {cmd}（支持: /new /allow /disallow /list /whoami /switch /sessions /compact）"
                             ),
                             &hint,
                         )
@@ -364,8 +478,8 @@ impl Dispatcher {
         }
 
         // 4. 普通消息。
-        let prompt = msg.text.clone().unwrap_or_default();
-        if prompt.trim().is_empty() {
+        let base_prompt = msg.text.clone().unwrap_or_default();
+        if base_prompt.trim().is_empty() {
             return;
         }
 
@@ -387,6 +501,17 @@ impl Dispatcher {
                 None
             }
         };
+
+        // 新建 session（无 existing）时，一次性注入压缩摘要作为前情摘要。
+        let mut prompt = base_prompt;
+        if existing.is_none() {
+            if let Ok(Some(summary)) = self.store.get_config(&compact_summary_key(&conv.0)).await {
+                if !summary.is_empty() {
+                    prompt = format!("【前情摘要】{summary}\n\n——\n\n{prompt}");
+                    let _ = self.store.delete_config(&compact_summary_key(&conv.0)).await;
+                }
+            }
+        }
 
         // 流式通道 + 后台执行。existing 移入 spawn（避免借用跨 'static）。
         let (tx, mut rx) = mpsc::channel::<AgentChunk>(32);
@@ -538,6 +663,7 @@ mod tests {
     type InboxHandle = Arc<TokioMutex<Vec<String>>>;
     type CounterHandle = Arc<AtomicUsize>;
     type CallsHandle = Arc<TokioMutex<Vec<Option<String>>>>;
+    type PromptsHandle = Arc<TokioMutex<Vec<String>>>;
 
     // ---------- mock platform ----------
 
@@ -590,21 +716,23 @@ mod tests {
 
     // ---------- mock backend ----------
 
-    /// 记录每次 run 收到的 session（None/Some）与执行序号。
     struct MockBackend {
         calls: Arc<TokioMutex<Vec<Option<String>>>>,
+        prompts: Arc<TokioMutex<Vec<String>>>,
         order: Arc<AtomicUsize>,
     }
 
     impl MockBackend {
-        fn new() -> (Self, CallsHandle, CounterHandle) {
+        fn new() -> (Self, CallsHandle, PromptsHandle, CounterHandle) {
             let calls = Arc::new(TokioMutex::new(Vec::new()));
+            let prompts = Arc::new(TokioMutex::new(Vec::new()));
             let order = Arc::new(AtomicUsize::new(0));
             let b = Self {
                 calls: calls.clone(),
+                prompts: prompts.clone(),
                 order: order.clone(),
             };
-            (b, calls, order)
+            (b, calls, prompts, order)
         }
     }
 
@@ -612,15 +740,16 @@ mod tests {
     impl Backend for MockBackend {
         async fn run(
             &self,
-            _prompt: &str,
+            prompt: &str,
             session: Option<&SessionId>,
             _workdir: &std::path::Path,
             _allowed_tools: &[String],
             chunks: mpsc::Sender<AgentChunk>,
         ) -> Result<crate::types::RunOutcome> {
-            // 记录续接情况 + 执行顺序。
+            // 记录续接情况 + 执行顺序 + 收到的 prompt。
             let my_order = self.order.fetch_add(1, Ordering::SeqCst);
             self.calls.lock().await.push(session.map(|s| s.0.clone()));
+            self.prompts.lock().await.push(prompt.to_string());
 
             // 稍微让出调度器，便于测试串行。
             tokio::task::yield_now().await;
@@ -673,6 +802,7 @@ mod tests {
         inbox: Arc<TokioMutex<Vec<String>>>,
         send_count: Arc<AtomicUsize>,
         calls: Arc<TokioMutex<Vec<Option<String>>>>,
+        prompts: Arc<TokioMutex<Vec<String>>>,
         order: Arc<AtomicUsize>,
         db: std::path::PathBuf,
     }
@@ -685,7 +815,7 @@ mod tests {
 
     async fn build(auth: Auth) -> Ctx {
         let (plat, inbox, send_count) = MockPlatform::new();
-        let (back, calls, order) = MockBackend::new();
+        let (back, calls, prompts, order) = MockBackend::new();
         let (store, db) = tmp_store().await;
 
         let disp = Arc::new(Dispatcher::new(
@@ -702,6 +832,7 @@ mod tests {
             inbox,
             send_count,
             calls,
+            prompts,
             order,
             db,
         }
@@ -1070,6 +1201,155 @@ mod tests {
         feed_and_wait(&ctx, vec![msg("s4", "alice", "fresh")], 2).await;
         let srow = ctx.check().await.get_session("s4").await.unwrap().expect("row");
         assert!(srow.name.is_none(), "/new 后新 session 应未命名");
+        drop_db(ctx.db).await;
+    }
+
+    #[tokio::test]
+    async fn compact_with_active_session_generates_summary_and_resets() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::new(vec!["alice".into()])).await;
+        // 先建立活动 session。
+        feed_and_wait(&ctx, vec![msg("k1", "alice", "hello")], 1).await;
+        assert!(ctx.check().await.get_session("k1").await.unwrap().is_some());
+
+        // /compact：应 resume 当前 session 生成摘要，order +1。
+        feed_and_wait(&ctx, vec![msg("k1", "alice", "/compact")], 2).await;
+
+        // backend 被调用，且 session 为 Some（resume）。
+        let calls = ctx.calls.lock().await.clone();
+        assert_eq!(calls.len(), 2, "calls={calls:?}");
+        assert_eq!(
+            calls[1].as_deref(),
+            Some("sess-0"),
+            "/compact 应 resume 当前 session"
+        );
+
+        // 回传含「摘要」字样。
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(
+            inbox.iter().any(|t| t.contains("摘要")),
+            "应回摘要提示，inbox={inbox:?}"
+        );
+
+        // 摘要已落库。
+        assert_eq!(
+            ctx.check()
+                .await
+                .get_config("compact_summary:k1")
+                .await
+                .unwrap(),
+            Some("reply#1".to_string()),
+            "摘要应为 Final chunk 文本"
+        );
+
+        // 活动 session 已删除。
+        assert!(
+            ctx.check().await.get_session("k1").await.unwrap().is_none(),
+            "/compact 后活动 session 应删除"
+        );
+        drop_db(ctx.db).await;
+    }
+
+    #[tokio::test]
+    async fn compact_without_active_session_replies_nothing() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::new(vec!["alice".into()])).await;
+        // 无活动 session 直接 /compact。
+        feed_and_wait(&ctx, vec![msg("k2", "alice", "/compact")], 0).await;
+
+        // backend 未被调用。
+        assert_eq!(ctx.order.load(Ordering::SeqCst), 0);
+        // 回传「无活动会话」。
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(
+            inbox.iter().any(|t| t.contains("无活动会话")),
+            "inbox={inbox:?}"
+        );
+        // 摘要未落库。
+        assert!(
+            ctx.check()
+                .await
+                .get_config("compact_summary:k2")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop_db(ctx.db).await;
+    }
+
+    #[tokio::test]
+    async fn compact_summary_injected_once_for_new_session() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::new(vec!["alice".into()])).await;
+        // 预置摘要 + 无活动 session。
+        ctx.check()
+            .await
+            .set_config("compact_summary:k3", "之前讨论了 X 与 Y")
+            .await
+            .unwrap();
+        assert!(ctx.check().await.get_session("k3").await.unwrap().is_none());
+
+        // 发普通消息（无 existing）→ 应注入摘要。
+        feed_and_wait(&ctx, vec![msg("k3", "alice", "继续")], 1).await;
+        let prompts = ctx.prompts.lock().await.clone();
+        assert_eq!(prompts.len(), 1, "prompts={prompts:?}");
+        assert!(
+            prompts[0].contains("【前情摘要】"),
+            "新建 session 应注入摘要，prompt={}",
+            prompts[0]
+        );
+        assert!(
+            prompts[0].ends_with("继续"),
+            "原始 prompt 应在末尾，prompt={}",
+            prompts[0]
+        );
+
+        // 摘要一次性注入后清除。
+        assert!(
+            ctx.check()
+                .await
+                .get_config("compact_summary:k3")
+                .await
+                .unwrap()
+                .is_none(),
+            "摘要应一次性清除"
+        );
+
+        // 再发一条（现已 existing）→ 不再注入。
+        feed_and_wait(&ctx, vec![msg("k3", "alice", "more")], 2).await;
+        let prompts = ctx.prompts.lock().await.clone();
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[1], "more", "第二条不应含摘要");
+        drop_db(ctx.db).await;
+    }
+
+    #[tokio::test]
+    async fn compact_summary_not_injected_when_session_exists() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::new(vec!["alice".into()])).await;
+        // 先建立活动 session。
+        feed_and_wait(&ctx, vec![msg("k4", "alice", "first")], 1).await;
+        assert!(ctx.check().await.get_session("k4").await.unwrap().is_some());
+
+        // 会话已存在后再预置摘要；下一条消息 existing=Some，不应注入。
+        ctx.check()
+            .await
+            .set_config("compact_summary:k4", "遗留摘要")
+            .await
+            .unwrap();
+        feed_and_wait(&ctx, vec![msg("k4", "alice", "second")], 2).await;
+
+        let prompts = ctx.prompts.lock().await.clone();
+        assert_eq!(prompts[1], "second", "existing 时不应误注入，prompts={prompts:?}");
+        // 摘要仍存在（未被消费）。
+        assert_eq!(
+            ctx.check()
+                .await
+                .get_config("compact_summary:k4")
+                .await
+                .unwrap(),
+            Some("遗留摘要".to_string())
+        );
         drop_db(ctx.db).await;
     }
 }
