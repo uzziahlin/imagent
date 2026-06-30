@@ -29,6 +29,14 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// 错误是否指示 iLink session 过期（需重新 login）。
+///
+/// `CoreError::Platform` 的 `Display` 形如 `platform(ilink): session expired: ...`，
+/// 故按子串匹配即可，无需 match 具体变体。
+fn is_session_expired_err(e: &crate::error::CoreError) -> bool {
+    e.to_string().to_lowercase().contains("session expired")
+}
+
 pub struct Dispatcher {
     platform: Arc<dyn Platform>,
     backend: Arc<dyn Backend>,
@@ -62,7 +70,8 @@ impl Dispatcher {
     }
 
     /// 主循环。循环 `platform.recv()`，每条消息 `tokio::spawn` 处理（不阻塞 recv）。
-    /// recv 返回 Err 时记录日志后继续（长轮询层自管重连）；不 panic。
+    /// recv 返回 Err 时：session 过期 → 优雅停止（返回 Err 让 main 提示重新 login）；
+    /// 其它错误 → 记录日志后继续（长轮询层自管重连/退避），不 panic。
     pub async fn run(self: Arc<Self>) -> Result<()> {
         loop {
             match self.platform.recv().await {
@@ -74,6 +83,14 @@ impl Dispatcher {
                     });
                 }
                 Err(e) => {
+                    if is_session_expired_err(&e) {
+                        tracing::error!(
+                            target: "imagent::core",
+                            error = %e,
+                            "session 过期，停止 dispatcher（需重新 login）"
+                        );
+                        return Err(e);
+                    }
                     warn!(target: "imagent::core", error = %e, "platform.recv 失败，继续重试");
                 }
             }
@@ -337,10 +354,19 @@ impl Dispatcher {
         }
     }
 
-    /// 回传文本；发送失败仅 log。
+    /// 回传文本；发送失败仅 log。session 过期升级为 error（用户侧已收不到回复）。
     async fn reply(&self, conv: &ConvId, text: &str, hint: &ReplyHint) {
         if let Err(e) = self.platform.send_text(conv, text, hint).await {
-            warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "send_text 失败");
+            if is_session_expired_err(&e) {
+                tracing::error!(
+                    target: "imagent::core",
+                    conv_id = %conv.0,
+                    error = %e,
+                    "send_text session 过期（用户侧已收不到）"
+                );
+            } else {
+                warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "send_text 失败");
+            }
         }
     }
 }
@@ -356,6 +382,33 @@ mod tests {
     /// 串行化 dispatch 集成测试：避免并行开 /tmp WAL sqlite 触发 SQLITE_IOERR(1802)。
     static SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+    #[test]
+    fn is_session_expired_err_classifies() {
+        use crate::error::CoreError;
+        assert!(is_session_expired_err(&CoreError::Platform(
+            "ilink",
+            "session expired: re-login required".into()
+        )));
+        assert!(is_session_expired_err(&CoreError::Platform(
+            "ilink",
+            "session expired, please re-login".into()
+        )));
+        assert!(!is_session_expired_err(&CoreError::Platform(
+            "ilink",
+            "getupdates exhausted retries".into()
+        )));
+        assert!(!is_session_expired_err(&CoreError::Config("bad".into())));
+        assert!(!is_session_expired_err(&CoreError::Store(
+            imagent_store::StoreError::Other("db: some failure".into())
+        )));
+        // 大小写无关
+        assert!(is_session_expired_err(&CoreError::Platform(
+            "ilink",
+            "Session Expired".into()
+        )));
+    }
+
+
 
     type InboxHandle = Arc<TokioMutex<Vec<String>>>;
     type CounterHandle = Arc<AtomicUsize>;

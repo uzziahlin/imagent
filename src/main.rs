@@ -148,11 +148,18 @@ async fn main() -> Result<()> {
                 discovery
             );
             tokio::select! {
-                res = dispatcher.clone().run() => {
-                    if let Err(e) = res {
-                        tracing::error!("dispatcher exited: {e}");
+                res = dispatcher.clone().run() => match res {
+                    Ok(()) => tracing::info!("dispatcher 正常退出"),
+                    Err(e) => {
+                        if e.to_string().to_lowercase().contains("session expired") {
+                            tracing::error!("dispatcher 退出：{e}");
+                            println!("iLink session 已过期，请重新运行 `imagent login` 扫码登录。");
+                        } else {
+                            tracing::error!("dispatcher 异常退出：{e}");
+                            println!("imagent 异常退出：{e}");
+                        }
                     }
-                }
+                },
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("received Ctrl-C, shutting down");
                 }
