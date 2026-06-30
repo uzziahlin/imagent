@@ -18,6 +18,26 @@ pub struct SessionRow {
     pub updated_at: i64,
 }
 
+/// 一行动态白名单记录（C1）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AllowedSenderRow {
+    pub sender: String,
+    pub added_at: i64,
+    pub added_by: Option<String>,
+    pub source: Option<String>,
+}
+
+/// 一行审计日志记录（C1）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AuditRow {
+    pub id: i64,
+    pub ts: i64,
+    pub action: String,
+    pub actor: Option<String>,
+    pub target: Option<String>,
+    pub detail: Option<String>,
+}
+
 struct Inner {
     conn: Mutex<rusqlite::Connection>,
 }
@@ -219,6 +239,143 @@ impl Store {
         })
         .await
     }
+
+    // —— allowed_senders（动态白名单，C1）——
+
+    /// 返回所有已授权 sender（按 id 升序）。
+    pub async fn list_allowed_senders(&self) -> Result<Vec<String>> {
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let mut stmt = conn.prepare("SELECT sender FROM allowed_senders ORDER BY sender")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r?);
+            }
+            Ok(v)
+        })
+        .await
+    }
+
+    /// 返回所有已授权 sender 的完整行（含元数据，按 sender 升序）。
+    pub async fn list_allowed_senders_detailed(&self) -> Result<Vec<AllowedSenderRow>> {
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT sender, added_at, added_by, source FROM allowed_senders ORDER BY sender",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(AllowedSenderRow {
+                    sender: r.get(0)?,
+                    added_at: r.get(1)?,
+                    added_by: r.get::<_, Option<String>>(2)?,
+                    source: r.get::<_, Option<String>>(3)?,
+                })
+            })?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r?);
+            }
+            Ok(v)
+        })
+        .await
+    }
+
+    /// 加入白名单。`INSERT OR IGNORE`：已存在不报错、不覆盖原 added_at/by/source。
+    pub async fn add_allowed_sender(
+        &self,
+        sender: &str,
+        added_by: Option<&str>,
+        source: Option<&str>,
+    ) -> Result<()> {
+        let (sender, added_by, source) = (
+            sender.to_string(),
+            added_by.map(|s| s.to_string()),
+            source.map(|s| s.to_string()),
+        );
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let now = now_secs();
+            conn.execute(
+                "INSERT OR IGNORE INTO allowed_senders (sender, added_at, added_by, source) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![sender, now, added_by, source],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// 移除白名单条目。返回是否原本存在。
+    pub async fn remove_allowed_sender(&self, sender: &str) -> Result<bool> {
+        let sender = sender.to_string();
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let n = conn.execute(
+                "DELETE FROM allowed_senders WHERE sender = ?1",
+                rusqlite::params![sender],
+            )?;
+            Ok(n > 0)
+        })
+        .await
+    }
+
+    // —— audit_log（审计日志，C1）——
+
+    /// 追加一条审计记录。
+    pub async fn append_audit(
+        &self,
+        action: &str,
+        actor: Option<&str>,
+        target: Option<&str>,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        let (action, actor, target, detail) = (
+            action.to_string(),
+            actor.map(|s| s.to_string()),
+            target.map(|s| s.to_string()),
+            detail.map(|s| s.to_string()),
+        );
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let now = now_secs();
+            conn.execute(
+                "INSERT INTO audit_log (ts, action, actor, target, detail) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![now, action, actor, target, detail],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// 返回最近 `limit` 条审计记录（按 id 倒序）。
+    pub async fn list_audit(&self, limit: usize) -> Result<Vec<AuditRow>> {
+        let limit_i = i64::try_from(limit).unwrap_or(i64::MAX);
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, ts, action, actor, target, detail FROM audit_log \
+                 ORDER BY id DESC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![limit_i], |r| {
+                Ok(AuditRow {
+                    id: r.get(0)?,
+                    ts: r.get(1)?,
+                    action: r.get(2)?,
+                    actor: r.get::<_, Option<String>>(3)?,
+                    target: r.get::<_, Option<String>>(4)?,
+                    detail: r.get::<_, Option<String>>(5)?,
+                })
+            })?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r?);
+            }
+            Ok(v)
+        })
+        .await
+    }
 }
 
 // —— spawn_blocking 调度 ——
@@ -368,7 +525,15 @@ mod tests {
         let db = TempDb::new("open").await;
         let store = Store::open(&db.path).await.expect("open");
         let tables = list_tables(&store).await;
-        for t in ["config", "context_tokens", "credentials", "sessions", "sync_buf"] {
+        for t in [
+            "allowed_senders",
+            "audit_log",
+            "config",
+            "context_tokens",
+            "credentials",
+            "sessions",
+            "sync_buf",
+        ] {
             assert!(tables.iter().any(|x| x == t), "missing table: {t}");
         }
     }
@@ -495,5 +660,99 @@ mod tests {
         // 再次 open 同一库（迁移已是 v1，应跳过建表、不报错）
         let s2 = Store::open(&db.path).await.unwrap();
         drop(s2);
+    }
+
+    #[tokio::test]
+    async fn allowed_senders_roundtrip() {
+        let db = TempDb::new("allow").await;
+        let store = Store::open(&db.path).await.unwrap();
+
+        // 空
+        assert!(store.list_allowed_senders().await.unwrap().is_empty());
+
+        // add
+        store
+            .add_allowed_sender("bob", Some("alice"), Some("im"))
+            .await
+            .unwrap();
+        store.add_allowed_sender("amy", None, None).await.unwrap();
+
+        let list = store.list_allowed_senders().await.unwrap();
+        assert_eq!(list, vec!["amy".to_string(), "bob".to_string()]);
+
+        // 重复 add：不报错、不覆盖原 added_by/source。
+        let before = store
+            .list_allowed_senders_detailed()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.sender == "bob")
+            .unwrap();
+        store
+            .add_allowed_sender("bob", Some("cli"), Some("manual"))
+            .await
+            .unwrap();
+        let after = store
+            .list_allowed_senders_detailed()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.sender == "bob")
+            .unwrap();
+        assert_eq!(after.added_at, before.added_at, "重复 add 不刷新 added_at");
+        assert_eq!(after.added_by.as_deref(), Some("alice"), "重复 add 不覆盖 added_by");
+        assert_eq!(after.source.as_deref(), Some("im"), "重复 add 不覆盖 source");
+
+        // remove
+        assert!(store.remove_allowed_sender("bob").await.unwrap());
+        assert!(!store.remove_allowed_sender("bob").await.unwrap());
+        let list = store.list_allowed_senders().await.unwrap();
+        assert_eq!(list, vec!["amy".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn audit_append_list_descending() {
+        let db = TempDb::new("audit").await;
+        let store = Store::open(&db.path).await.unwrap();
+
+        store.append_audit("allow", Some("alice"), Some("bob"), Some("added")).await.unwrap();
+        store.append_audit("disallow", Some("alice"), Some("bob"), None).await.unwrap();
+        store.append_audit("allow", Some("cli"), Some("amy"), Some("cli-bootstrap")).await.unwrap();
+
+        let list = store.list_audit(10).await.unwrap();
+        assert_eq!(list.len(), 3);
+        // 倒序：最新在最前。
+        assert_eq!(list[0].action, "allow");
+        assert_eq!(list[0].actor.as_deref(), Some("cli"));
+        assert_eq!(list[0].target.as_deref(), Some("amy"));
+        assert_eq!(list[1].action, "disallow");
+        assert_eq!(list[2].action, "allow");
+        assert_eq!(list[2].actor.as_deref(), Some("alice"));
+        // id 倒序。
+        assert!(list[0].id > list[1].id);
+        assert!(list[1].id > list[2].id);
+
+        // limit 生效。
+        let limited = store.list_audit(1).await.unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].id, list[0].id);
+    }
+
+    #[tokio::test]
+    async fn migrate_v1_to_v2_adds_tables() {
+        // 手动建一个仅 v1 的库，再 open 触发 v2 迁移，验证新表存在。
+        let db = TempDb::new("migrate_v2").await;
+        {
+            let conn = rusqlite::Connection::open(&db.path).unwrap();
+            conn.execute_batch(crate::schema::SCHEMA_V1).unwrap();
+            conn.pragma_update(None, "user_version", 1_i64).unwrap();
+        }
+        let store = Store::open(&db.path).await.unwrap();
+        let tables = list_tables(&store).await;
+        assert!(tables.iter().any(|x| x == "allowed_senders"), "v2 迁移应建 allowed_senders");
+        assert!(tables.iter().any(|x| x == "audit_log"), "v2 迁移应建 audit_log");
+        // 新表可写。
+        store.add_allowed_sender("zoe", None, None).await.unwrap();
+        assert_eq!(store.list_allowed_senders().await.unwrap(), vec!["zoe".to_string()]);
     }
 }

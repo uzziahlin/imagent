@@ -4,7 +4,7 @@
 //! `Auth` / 配置，循环 `platform.recv()` 并对每条消息 `tokio::spawn` 处理。
 //!
 //! 两条硬约束在此体现：
-//! 1. 非白名单 sender 丢弃（发现模式只打日志，不回 IM、不驱动 agent）。
+//! 1. 非白名单 sender 丢弃；发现模式（白名单为空）回引导消息但不驱动 agent。
 //! 2. backend 只用配置的 `allowed_tools`、workdir 用配置的 `default_workdir`。
 
 use std::collections::HashMap;
@@ -86,15 +86,22 @@ impl Dispatcher {
         let sender = msg.sender.clone();
         let hint = msg.reply_hint.clone();
 
-        // 1. 发现态：白名单为空 => 只打日志，不回 IM、不驱动 agent。
+        // 1. 发现态：白名单为空。不自动授权（安全），对 sender 回引导消息，
+        //    告知其 sender id 与如何联系管理员，不驱动 agent。
         if self.auth.is_discovery() {
             info!(
                 target: "imagent::discovery",
                 conv_id = %conv.0,
                 sender = %sender.0,
                 text = ?msg.text,
-                "discovery 模式：记录 sender，未驱动 agent"
+                "discovery 模式：记录 sender，回引导"
             );
+            let guide = format!(
+                "发现模式：当前白名单为空。你的 sender id 是 `{}`。\n\
+                 请管理员在本地运行 `imagent allow {}` 授权后重启 imagent。",
+                sender.0, sender.0
+            );
+            self.reply(&conv, &guide, &hint).await;
             return;
         }
 
@@ -110,32 +117,128 @@ impl Dispatcher {
         }
 
         // 3. 斜杠命令（鉴权通过后、调 backend 前）。
+        //    命令名小写比较；参数保留原样。到这里的 sender 必然已过白名单，
+        //    故 /allow 的「调用者鉴权」天然由白名单保证，无需额外校验。
         if let Some(text) = msg.text.as_ref() {
             let trimmed = text.trim();
             if trimmed.starts_with('/') {
-                // 首单词（小写比较）。
-                let first = trimmed.split_whitespace().next().unwrap_or("");
-                let cmd = first.to_ascii_lowercase();
-                if cmd == "/new" {
-                    // 删除该 conv 的 session 行（下次新建），失败仅 log。
-                    if let Err(e) = self.store.delete_session(&conv.0).await {
-                        warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "delete_session 失败");
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                let cmd = parts[0].to_ascii_lowercase();
+                match cmd.as_str() {
+                    "/new" => {
+                        // 删除该 conv 的 session 行（下次新建），失败仅 log。
+                        if let Err(e) = self.store.delete_session(&conv.0).await {
+                            warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "delete_session 失败");
+                        }
+                        self.reply(
+                            &conv,
+                            "已重置会话，下一条消息将开启新会话。",
+                            &hint,
+                        )
+                        .await;
+                        return;
                     }
-                    self.reply(
-                        &conv,
-                        "已重置会话，下一条消息将开启新会话。",
-                        &hint,
-                    )
-                    .await;
-                    return;
-                } else {
-                    self.reply(
-                        &conv,
-                        &format!("未知命令: {cmd}（P1 仅支持 /new）"),
-                        &hint,
-                    )
-                    .await;
-                    return;
+                    "/allow" => {
+                        let target = parts.get(1).map(|s| s.trim()).unwrap_or("");
+                        if target.is_empty() {
+                            self.reply(&conv, "用法: /allow <sender_id>", &hint).await;
+                        } else {
+                            let actor = sender.0.as_str();
+                            let added = self.auth.allow(target);
+                            if let Err(e) = self
+                                .store
+                                .add_allowed_sender(target, Some(actor), Some("im"))
+                                .await
+                            {
+                                warn!(target: "imagent::core", error = %e, "add_allowed_sender 失败");
+                            }
+                            if let Err(e) = self
+                                .store
+                                .append_audit(
+                                    "allow",
+                                    Some(actor),
+                                    Some(target),
+                                    Some(if added { "added" } else { "already-present" }),
+                                )
+                                .await
+                            {
+                                warn!(target: "imagent::core", error = %e, "append_audit 失败");
+                            }
+                            let text_out = if added {
+                                format!("已授权 `{target}`。")
+                            } else {
+                                format!("`{target}` 已在白名单。")
+                            };
+                            self.reply(&conv, &text_out, &hint).await;
+                        }
+                        return;
+                    }
+                    "/disallow" => {
+                        let target = parts.get(1).map(|s| s.trim()).unwrap_or("");
+                        if target.is_empty() {
+                            self.reply(&conv, "用法: /disallow <sender_id>", &hint).await;
+                        } else if target == sender.0.as_str() {
+                            // 防自锁：不允许撤销自己。
+                            self.reply(
+                                &conv,
+                                "不允许撤销自己（防止锁死）。如需操作请在本地 CLI 处理。",
+                                &hint,
+                            )
+                            .await;
+                        } else {
+                            let existed = self.auth.revoke(target);
+                            if let Err(e) = self.store.remove_allowed_sender(target).await {
+                                warn!(target: "imagent::core", error = %e, "remove_allowed_sender 失败");
+                            }
+                            if let Err(e) = self
+                                .store
+                                .append_audit(
+                                    "disallow",
+                                    Some(&sender.0),
+                                    Some(target),
+                                    Some(if existed { "removed" } else { "absent" }),
+                                )
+                                .await
+                            {
+                                warn!(target: "imagent::core", error = %e, "append_audit 失败");
+                            }
+                            self.reply(
+                                &conv,
+                                &format!(
+                                    "已移除 `{target}`（{}）",
+                                    if existed { "成功" } else { "原本不在" }
+                                ),
+                                &hint,
+                            )
+                            .await;
+                        }
+                        return;
+                    }
+                    "/list" => {
+                        let snap = self.auth.snapshot();
+                        let msg = if snap.is_empty() {
+                            "白名单为空。".to_string()
+                        } else {
+                            format!("白名单（{}）：{}", snap.len(), snap.join(", "))
+                        };
+                        self.reply(&conv, &msg, &hint).await;
+                        return;
+                    }
+                    "/whoami" => {
+                        self.reply(&conv, &format!("你的 sender id：`{}`", sender.0), &hint).await;
+                        return;
+                    }
+                    _ => {
+                        self.reply(
+                            &conv,
+                            &format!(
+                                "未知命令: {cmd}（支持: /new /allow /disallow /list /whoami）"
+                            ),
+                            &hint,
+                        )
+                        .await;
+                        return;
+                    }
                 }
             }
         }
@@ -491,15 +594,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovery_mode_skips_backend_and_reply() {
+    async fn discovery_mode_skips_backend_but_replies_guide() {
         let _serial = SERIAL.lock().await;
         let ctx = build(Auth::new(vec![])).await; // 发现模式
         feed_and_wait(&ctx, vec![msg("c3", "anyone", "hi")], 0).await;
 
-        // backend 未被调用、platform 未回传。
+        // backend 未被调用。
         assert_eq!(ctx.order.load(Ordering::SeqCst), 0);
-        assert_eq!(ctx.send_count.load(Ordering::SeqCst), 0);
-        assert!(ctx.inbox.lock().await.is_empty());
+        // 但回传了引导消息，且其中含 sender id。
+        let inbox = ctx.inbox.lock().await.clone();
+        assert_eq!(inbox.len(), 1, "应回一条引导，inbox={inbox:?}");
+        assert!(inbox[0].contains("anyone"), "引导消息应含 sender id");
+        assert!(inbox[0].contains("imagent allow"), "引导消息应含 CLI 指引");
         drop_db(ctx.db).await;
     }
 
@@ -581,6 +687,77 @@ mod tests {
         assert_eq!(calls[0], None);
         assert_eq!(calls[1].as_deref(), Some("sess-0"));
         assert_eq!(calls[2].as_deref(), Some("sess-1"));
+        drop_db(ctx.db).await;
+    }
+
+    #[tokio::test]
+    async fn allow_command_grants_then_bob_can_drive() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::new(vec!["alice".into()])).await;
+
+        // alice 发 /allow bob：应回「已授权」。
+        feed_and_wait(&ctx, vec![msg("c8", "alice", "/allow bob")], 0).await;
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(inbox.iter().any(|t| t.contains("已授权") && t.contains("bob")), "inbox={inbox:?}");
+
+        // 白名单持久化到 store。
+        let stored = ctx.check().await.list_allowed_senders().await.unwrap();
+        assert!(stored.iter().any(|s| s == "bob"), "stored={stored:?}");
+
+        // bob（刚被授权）现在能驱动 backend。
+        feed_and_wait(&ctx, vec![msg("c9", "bob", "hello")], 1).await;
+        assert_eq!(ctx.order.load(Ordering::SeqCst), 1, "bob 应能驱动 backend");
+        drop_db(ctx.db).await;
+    }
+
+    #[tokio::test]
+    async fn list_command_replies_whitelist() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::new(vec!["alice".into(), "carol".into()])).await;
+        feed_and_wait(&ctx, vec![msg("c10", "alice", "/list")], 0).await;
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(
+            inbox.iter().any(|t| t.contains("alice") && t.contains("carol") && t.contains("白名单")),
+            "inbox={inbox:?}"
+        );
+        // backend 未被调用。
+        assert_eq!(ctx.order.load(Ordering::SeqCst), 0);
+        drop_db(ctx.db).await;
+    }
+
+    #[tokio::test]
+    async fn whoami_command_replies_sender() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::new(vec!["alice".into()])).await;
+        feed_and_wait(&ctx, vec![msg("c11", "alice", "/whoami")], 0).await;
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(inbox.iter().any(|t| t.contains("alice")), "inbox={inbox:?}");
+        assert_eq!(ctx.order.load(Ordering::SeqCst), 0);
+        drop_db(ctx.db).await;
+    }
+
+    #[tokio::test]
+    async fn disallow_cannot_revoke_self() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::new(vec!["alice".into()])).await;
+        feed_and_wait(&ctx, vec![msg("c12", "alice", "/disallow alice")], 0).await;
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(inbox.iter().any(|t| t.contains("不允许撤销自己")), "inbox={inbox:?}");
+        // alice 仍在白名单。
+        assert!(ctx.disp.auth.is_allowed(&UserId("alice".into())));
+        drop_db(ctx.db).await;
+    }
+
+    #[tokio::test]
+    async fn disallow_command_removes_target() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::new(vec!["alice".into(), "bob".into()])).await;
+        feed_and_wait(&ctx, vec![msg("c13", "alice", "/disallow bob")], 0).await;
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(inbox.iter().any(|t| t.contains("已移除") && t.contains("bob")), "inbox={inbox:?}");
+        // bob 已被移除：后续消息被丢弃，不驱动 backend。
+        feed_and_wait(&ctx, vec![msg("c14", "bob", "still here?")], 0).await;
+        assert_eq!(ctx.order.load(Ordering::SeqCst), 0, "bob 应已被移出白名单");
         drop_db(ctx.db).await;
     }
 }

@@ -30,6 +30,13 @@ enum Cmd {
     },
     /// 查看登录状态与配置路径。
     Status,
+    /// 授权一个 sender（写入白名单，本地最高权限）。空白名单时的 bootstrap 途径。
+    Allow {
+        #[arg(long, default_value = "ilink")]
+        platform: String,
+        /// 要授权的 from_user_id（如 wx_xxx@im.wechat）。
+        sender: String,
+    },
     /// 停止（P1 前台运行，仅提示）。
     Stop,
 }
@@ -112,8 +119,16 @@ async fn main() -> Result<()> {
             // 6. backend
             let backend = Arc::new(imagent_claude::ClaudeBackend::new());
 
-            // 7. auth
-            let auth = imagent_core::Auth::new(config.allowed_senders.clone());
+            // 7. auth —— 白名单：config 种子 ∪ store 已有（CLI /allow 或 IM /allow 持久化）。
+            let mut initial: Vec<String> = config.allowed_senders.clone();
+            let stored = store.list_allowed_senders().await.unwrap_or_default();
+            for s in stored {
+                if !initial.contains(&s) {
+                    initial.push(s);
+                }
+            }
+            let auth = imagent_core::Auth::new(initial);
+            let discovery = auth.is_discovery();
 
             // 8. dispatcher
             let dispatcher = Arc::new(imagent_core::Dispatcher::new(
@@ -130,7 +145,7 @@ async fn main() -> Result<()> {
                 "imagent started (platform=ilink, workdir={}, tools={:?}, discovery={})",
                 config.default_workdir.display(),
                 config.allowed_tools,
-                config.allowed_senders.is_empty()
+                discovery
             );
             tokio::select! {
                 res = dispatcher.clone().run() => {
@@ -157,6 +172,18 @@ async fn main() -> Result<()> {
             }
             let config_path = imagent_core::Config::default_path();
             println!("配置路径：{}", config_path.map(|p| p.display().to_string()).unwrap_or_else(|| "<无法定位 home>".into()));
+        }
+        Cmd::Allow { platform: _, sender } => {
+            // 本地操作者（最高权限）：直接写入白名单 + 审计。空白名单时的唯一 bootstrap。
+            let store = imagent_store::Store::open(&db_path).await?;
+            store
+                .add_allowed_sender(&sender, Some("cli"), Some("manual"))
+                .await?;
+            store
+                .append_audit("allow", Some("cli"), Some(&sender), Some("cli-bootstrap"))
+                .await?;
+            let all = store.list_allowed_senders().await.unwrap_or_default();
+            println!("已授权 `{sender}`。当前白名单（{}）：{}", all.len(), all.join(", "));
         }
         Cmd::Stop => {
             println!("imagent P1 为前台运行模式，请在运行 `start` 的终端按 Ctrl-C 停止。");
