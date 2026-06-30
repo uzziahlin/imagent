@@ -155,6 +155,59 @@ pub fn msg_to_inbound(msg: &Msg) -> InboundMessage {
         },
     }
 }
+/// sendmessage 响应（HTTP 200 body，snake_case 单层，无 `base_resp` 包裹，hermes 实测）。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SendMsgResp {
+    #[serde(default)]
+    pub ret: Option<i64>,
+    #[serde(default, alias = "errCode")]
+    pub errcode: Option<i64>,
+    #[serde(default, alias = "msg", alias = "errMsg")]
+    pub errmsg: Option<String>,
+}
+
+/// sendmessage 响应分类（按协议事实 §2 优先级）。
+#[derive(Debug)]
+pub enum SendOutcome {
+    Success,
+    RateLimited,
+    SessionExpired,
+    OtherError(String),
+}
+
+/// 按 hermes 实测规则分类 sendmessage 响应。
+///
+/// 优先级：成功 → session 过期（-14 或 -2+"unknown error" 伪装）→ 限流（-2）→ 其他。
+pub fn classify_send(resp: &SendMsgResp) -> SendOutcome {
+    let ret = resp.ret.unwrap_or(0);
+    let errcode = resp.errcode.unwrap_or(0);
+    let errmsg_norm = resp
+        .errmsg
+        .as_deref()
+        .map(|s| s.trim().to_lowercase())
+        .unwrap_or_default();
+
+    // 成功：两者都 ∈ {0}（None 视为 0）。
+    if ret == 0 && errcode == 0 {
+        return SendOutcome::Success;
+    }
+    // session 过期：任一 == -14；或（任一 == -2 且 errmsg == "unknown error" 伪装）。
+    if ret == -14 || errcode == -14 {
+        return SendOutcome::SessionExpired;
+    }
+    if (ret == -2 || errcode == -2) && errmsg_norm == "unknown error" {
+        return SendOutcome::SessionExpired;
+    }
+    // 限流：任一 == -2（到这里说明不是上面的伪装）。
+    if ret == -2 || errcode == -2 {
+        return SendOutcome::RateLimited;
+    }
+    // 其他错误。
+    SendOutcome::OtherError(format!(
+        "ret={:?} errcode={:?} errmsg={:?}",
+        resp.ret, resp.errcode, resp.errmsg
+    ))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,5 +379,53 @@ mod tests {
         assert_eq!(extract_text(&m), "plain");
         // 数字 message_id 也能 decode。
         assert_eq!(m.message_id.as_ref().unwrap().to_string(), "42");
+    }
+    #[test]
+    fn classify_success_both_zero() {
+        let r = SendMsgResp { ret: Some(0), errcode: Some(0), errmsg: Some("ok".into()) };
+        assert!(matches!(classify_send(&r), SendOutcome::Success));
+    }
+
+    #[test]
+    fn classify_success_none_fields() {
+        // ret/errcode 为 None 视为 0 → 成功。
+        let r = SendMsgResp::default();
+        assert!(matches!(classify_send(&r), SendOutcome::Success));
+    }
+
+    #[test]
+    fn classify_session_expired_minus14() {
+        let r = SendMsgResp { ret: Some(-14), errcode: Some(0), errmsg: None };
+        assert!(matches!(classify_send(&r), SendOutcome::SessionExpired));
+        let r2 = SendMsgResp { ret: Some(0), errcode: Some(-14), errmsg: None };
+        assert!(matches!(classify_send(&r2), SendOutcome::SessionExpired));
+    }
+
+    #[test]
+    fn classify_session_expired_unknown_error_disguise() {
+        // ret==-2 且 errmsg=="unknown error"（伪装的 stale session）→ SessionExpired，不是 RateLimited。
+        let r = SendMsgResp { ret: Some(-2), errcode: Some(0), errmsg: Some("unknown error".into()) };
+        assert!(matches!(classify_send(&r), SendOutcome::SessionExpired));
+        // 大小写/首尾空白容错。
+        let r2 = SendMsgResp { ret: Some(0), errcode: Some(-2), errmsg: Some("  Unknown Error  ".into()) };
+        assert!(matches!(classify_send(&r2), SendOutcome::SessionExpired));
+    }
+
+    #[test]
+    fn classify_rate_limited_minus2() {
+        // -2 但 errmsg 非 "unknown error" → 限流。
+        let r = SendMsgResp { ret: Some(-2), errcode: Some(0), errmsg: Some("rate limited".into()) };
+        assert!(matches!(classify_send(&r), SendOutcome::RateLimited));
+        let r2 = SendMsgResp { ret: Some(0), errcode: Some(-2), errmsg: None };
+        assert!(matches!(classify_send(&r2), SendOutcome::RateLimited));
+    }
+
+    #[test]
+    fn classify_other_error() {
+        let r = SendMsgResp { ret: Some(-99), errcode: Some(0), errmsg: Some("boom".into()) };
+        match classify_send(&r) {
+            SendOutcome::OtherError(s) => assert!(s.contains("ret=Some(-99)") && s.contains("boom")),
+            other => panic!("expected OtherError, got {other:?}"),
+        }
     }
 }

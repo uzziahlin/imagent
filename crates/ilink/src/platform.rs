@@ -21,7 +21,7 @@ use imagent_store::Store;
 
 use crate::client::ILinkClient;
 use crate::dedup::Dedup;
-use crate::proto::{extract_text, msg_to_inbound, Msg, UpdatesResp};
+use crate::proto::{classify_send, extract_text, msg_to_inbound, Msg, SendMsgResp, SendOutcome, UpdatesResp};
 
 const PLATFORM: &str = "ilink";
 const ILINK_PREFIX: &str = "ilink:";
@@ -35,6 +35,10 @@ pub struct ILinkPlatform {
     dedup: Dedup,
     /// 上次长轮询批量取到的消息，`recv` 逐条弹出。
     pending: Mutex<Vec<InboundMessage>>,
+    /// 出站串行：同一 bot 同一时刻只有一条 sendmessage 在飞。
+    send_lock: Mutex<()>,
+    /// 被动限流熔断器。
+    breaker: crate::ratelimit::RateBreaker,
 }
 
 impl ILinkPlatform {
@@ -44,6 +48,12 @@ impl ILinkPlatform {
             store,
             account_id,
             dedup: Dedup::default(),
+            send_lock: Mutex::new(()),
+            breaker: crate::ratelimit::RateBreaker::new(
+                Duration::from_secs(30),
+                1,
+                Duration::from_secs(30),
+            ),
             pending: Mutex::new(Vec::new()),
         }
     }
@@ -198,12 +208,80 @@ impl Platform for ILinkPlatform {
             msg["context_token"] = json!(token);
         }
         let body = json!({ "msg": msg });
-        // sendmessage 响应不强制解析（P1 依赖 HTTP 状态码判成败）。
-        let _: serde_json::Value = self
-            .client
-            .post_json("/ilink/bot/sendmessage", &body)
-            .await?;
-        Ok(())
+        // 出站串行：同一 bot 同一时刻只有一条 sendmessage 在飞，
+        // 避免并发叠加触发限流。
+        let _guard = self.send_lock.lock().await;
+
+        const MAX_RETRIES: usize = 4;
+        const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(3);
+        let mut attempt: usize = 0;
+        loop {
+            // 熔断前置闸：cooldown 未过则等待（服从式退避，不发包）。
+            let remain = self.breaker.cooldown_remaining().await;
+            if !remain.is_zero() {
+                warn!(target: "ilink", cooldown_ms = remain.as_millis() as u64, "rate-limit circuit open, pausing sends");
+                tokio::time::sleep(remain).await;
+            }
+
+            attempt += 1;
+            match self
+                .client
+                .post_json::<SendMsgResp>("/ilink/bot/sendmessage", &body)
+                .await
+            {
+                Ok(resp) => match classify_send(&resp) {
+                    SendOutcome::Success => {
+                        self.breaker.reset().await;
+                        return Ok(());
+                    }
+                    SendOutcome::SessionExpired => {
+                        return Err(CoreError::Platform(
+                            "ilink",
+                            "session expired: re-login required".into(),
+                        ));
+                    }
+                    SendOutcome::RateLimited => {
+                        let tripped = self.breaker.record_event().await;
+                        if tripped {
+                            warn!(target: "ilink", "rate-limit circuit opened by sendmessage");
+                        }
+                        if attempt > MAX_RETRIES {
+                            return Err(CoreError::Platform(
+                                "ilink",
+                                "sendmessage rate-limited after retries".into(),
+                            ));
+                        }
+                        warn!(target: "ilink", attempt, "sendmessage rate-limited, backing off");
+                        tokio::time::sleep(RATE_LIMIT_BACKOFF).await;
+                        continue;
+                    }
+                    SendOutcome::OtherError(s) => {
+                        return Err(CoreError::Platform(
+                            "ilink",
+                            format!("sendmessage failed: {s}"),
+                        ));
+                    }
+                },
+                Err(e) => {
+                    // HTTP/网络层错误：先判 session_expired（401/403 字样）。
+                    let es = format!("{e}");
+                    if is_session_expired(&es) {
+                        return Err(CoreError::Platform(
+                            "ilink",
+                            "session expired: re-login required".into(),
+                        ));
+                    }
+                    if attempt > MAX_RETRIES {
+                        return Err(e);
+                    }
+                    // 网络异常线性退避：1s, 2s, 3s, 4s。
+                    let backoff = Duration::from_secs(attempt as u64);
+                    warn!(target: "ilink", err = %es, attempt, backoff_ms = backoff.as_millis() as u64, "sendmessage network error, backing off");
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+            }
+        }
     }
 
     async fn send_media(

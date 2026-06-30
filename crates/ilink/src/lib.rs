@@ -17,6 +17,7 @@ mod dedup;
 mod login;
 mod platform;
 mod proto;
+mod ratelimit;
 
 pub use client::ILinkClient;
 pub use login::{login_flow, Credentials};
