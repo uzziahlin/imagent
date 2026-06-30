@@ -1,0 +1,586 @@
+//! 消息调度核心。
+//!
+//! `Dispatcher` 持有注入的 `Arc<dyn Platform>` / `Arc<dyn Backend>` / `Store` /
+//! `Auth` / 配置，循环 `platform.recv()` 并对每条消息 `tokio::spawn` 处理。
+//!
+//! 两条硬约束在此体现：
+//! 1. 非白名单 sender 丢弃（发现模式只打日志，不回 IM、不驱动 agent）。
+//! 2. backend 只用配置的 `allowed_tools`、workdir 用配置的 `default_workdir`。
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use imagent_store::{SessionRow, Store};
+use tokio::sync::{mpsc, Mutex};
+use tracing::{info, warn};
+
+use crate::auth::Auth;
+use crate::backend::Backend;
+use crate::error::Result;
+use crate::platform::Platform;
+use crate::types::{AgentChunk, ConvId, InboundMessage, ReplyHint, SessionId};
+
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+pub struct Dispatcher {
+    platform: Arc<dyn Platform>,
+    backend: Arc<dyn Backend>,
+    store: Store,
+    auth: Auth,
+    default_workdir: PathBuf,
+    allowed_tools: Vec<String>,
+    /// per-conv 串行锁：同一会话的 agent 任务排队执行，避免 session 冲突。
+    conv_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+}
+
+impl Dispatcher {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        platform: Arc<dyn Platform>,
+        backend: Arc<dyn Backend>,
+        store: Store,
+        auth: Auth,
+        default_workdir: PathBuf,
+        allowed_tools: Vec<String>,
+    ) -> Self {
+        Self {
+            platform,
+            backend,
+            store,
+            auth,
+            default_workdir,
+            allowed_tools,
+            conv_locks: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 主循环。循环 `platform.recv()`，每条消息 `tokio::spawn` 处理（不阻塞 recv）。
+    /// recv 返回 Err 时记录日志后继续（长轮询层自管重连）；不 panic。
+    pub async fn run(self: Arc<Self>) -> Result<()> {
+        loop {
+            match self.platform.recv().await {
+                Ok(msg) => {
+                    // 每条消息独立 spawn，不阻塞 recv。
+                    let this = self.clone();
+                    tokio::spawn(async move {
+                        this.handle(msg).await;
+                    });
+                }
+                Err(e) => {
+                    warn!(target: "imagent::core", error = %e, "platform.recv 失败，继续重试");
+                }
+            }
+        }
+    }
+
+    /// 处理单条消息。内部任何错误都 log 并吞掉，不影响主循环。
+    async fn handle(&self, msg: InboundMessage) {
+        let conv = msg.conv_id.clone();
+        let sender = msg.sender.clone();
+        let hint = msg.reply_hint.clone();
+
+        // 1. 发现态：白名单为空 => 只打日志，不回 IM、不驱动 agent。
+        if self.auth.is_discovery() {
+            info!(
+                target: "imagent::discovery",
+                conv_id = %conv.0,
+                sender = %sender.0,
+                text = ?msg.text,
+                "discovery 模式：记录 sender，未驱动 agent"
+            );
+            return;
+        }
+
+        // 2. 白名单：非白名单 sender 丢弃。
+        if !self.auth.is_allowed(&sender) {
+            warn!(
+                target: "imagent::core",
+                conv_id = %conv.0,
+                sender = %sender.0,
+                "非白名单 sender，丢弃"
+            );
+            return;
+        }
+
+        // 3. 斜杠命令（鉴权通过后、调 backend 前）。
+        if let Some(text) = msg.text.as_ref() {
+            let trimmed = text.trim();
+            if trimmed.starts_with('/') {
+                // 首单词（小写比较）。
+                let first = trimmed.split_whitespace().next().unwrap_or("");
+                let cmd = first.to_ascii_lowercase();
+                if cmd == "/new" {
+                    // 删除该 conv 的 session 行（下次新建），失败仅 log。
+                    if let Err(e) = self.store.delete_session(&conv.0).await {
+                        warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "delete_session 失败");
+                    }
+                    self.reply(
+                        &conv,
+                        "已重置会话，下一条消息将开启新会话。",
+                        &hint,
+                    )
+                    .await;
+                    return;
+                } else {
+                    self.reply(
+                        &conv,
+                        &format!("未知命令: {cmd}（P1 仅支持 /new）"),
+                        &hint,
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+
+        // 4. 普通消息。
+        let prompt = msg.text.clone().unwrap_or_default();
+        if prompt.trim().is_empty() {
+            return;
+        }
+
+        // per-conv 串行锁：保证同一会话的 agent 任务串行。
+        let lock = {
+            let mut map = self.conv_locks.lock().await;
+            map.entry(conv.0.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _guard = lock.lock().await;
+
+        // 取续接 session；store 错误仅 log 后当 None。
+        let existing: Option<SessionId> = match self.store.get_session(&conv.0).await {
+            Ok(Some(row)) => Some(SessionId(row.session_id)),
+            Ok(None) => None,
+            Err(e) => {
+                warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "get_session 失败，按新建处理");
+                None
+            }
+        };
+
+        // 流式通道 + 后台执行。existing 移入 spawn（避免借用跨 'static）。
+        let (tx, mut rx) = mpsc::channel::<AgentChunk>(32);
+        let backend = self.backend.clone();
+        let workdir = self.default_workdir.clone();
+        let tools = self.allowed_tools.clone();
+        let prompt_owned = prompt.clone();
+        let join = tokio::spawn(async move {
+            backend
+                .run(&prompt_owned, existing.as_ref(), &workdir, &tools, tx)
+                .await
+        });
+        // 收集 chunks：MVP 只记录 Final/Error。
+        let mut final_text: Option<String> = None;
+        let mut error_text: Option<String> = None;
+        while let Some(chunk) = rx.recv().await {
+            match chunk {
+                AgentChunk::Final(t) => final_text = Some(t),
+                AgentChunk::Error(e) => error_text = Some(e),
+                _ => {}
+            }
+        }
+
+        // 等待 backend 返回 RunOutcome。
+        let outcome = match join.await {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                let m = format!("[error] {e}");
+                warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "backend.run 失败");
+                self.reply(&conv, &m, &hint).await;
+                return;
+            }
+            Err(e) => {
+                let m = format!("[error] backend task panicked: {e}");
+                warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "backend task panic");
+                self.reply(&conv, &m, &hint).await;
+                return;
+            }
+        };
+
+        // 回传文本优先级：收到过的 Final > outcome.final_text > session_id 提示。
+        if let Some(et) = error_text {
+            // 收到 Error chunk 也算需要提示（但 backend 正常返回，故只记录）。
+            warn!(target: "imagent::core", conv_id = %conv.0, error = %et, "backend 产出 Error chunk");
+        }
+        let reply = if let Some(f) = final_text {
+            f
+        } else if !outcome.final_text.is_empty() {
+            outcome.final_text
+        } else {
+            format!("(done, session={})", outcome.session_id.0)
+        };
+        self.reply(&conv, &reply, &hint).await;
+
+        // 落库（upsert 内部保留 created_at；store 错误仅 log）。
+        let now = now_secs();
+        let row = SessionRow {
+            conv_id: conv.0.clone(),
+            session_id: outcome.session_id.0.clone(),
+            agent_kind: self.backend.name().to_string(),
+            workdir: self.default_workdir.to_string_lossy().to_string(),
+            name: None,
+            created_at: now,
+            updated_at: now,
+        };
+        if let Err(e) = self.store.upsert_session(&row).await {
+            warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "upsert_session 失败");
+        }
+    }
+
+    /// 回传文本；发送失败仅 log。
+    async fn reply(&self, conv: &ConvId, text: &str, hint: &ReplyHint) {
+        if let Err(e) = self.platform.send_text(conv, text, hint).await {
+            warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "send_text 失败");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ConvId, ReplyHint, SessionId, UserId};
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::sync::Mutex as TokioMutex;
+    /// 串行化 dispatch 集成测试：避免并行开 /tmp WAL sqlite 触发 SQLITE_IOERR(1802)。
+    static SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    type InboxHandle = Arc<TokioMutex<Vec<String>>>;
+    type CounterHandle = Arc<AtomicUsize>;
+    type CallsHandle = Arc<TokioMutex<Vec<Option<String>>>>;
+
+    // ---------- mock platform ----------
+
+    /// mock platform：`inbox` 收到的出站文本，`recv_queue` 可编程的入站流。
+    struct MockPlatform {
+        recv_queue: Arc<TokioMutex<Option<Vec<InboundMessage>>>>,
+        inbox: Arc<TokioMutex<Vec<String>>>,
+        send_count: Arc<AtomicUsize>,
+    }
+
+    impl MockPlatform {
+        fn new() -> (Self, InboxHandle, CounterHandle) {
+            let inbox = Arc::new(TokioMutex::new(Vec::new()));
+            let send_count = Arc::new(AtomicUsize::new(0));
+            let p = Self {
+                recv_queue: Arc::new(TokioMutex::new(None)),
+                inbox: inbox.clone(),
+                send_count: send_count.clone(),
+            };
+            (p, inbox, send_count)
+        }
+    }
+
+    #[async_trait]
+    impl Platform for MockPlatform {
+        async fn recv(&self) -> Result<InboundMessage> {
+            loop {
+                let mut q = self.recv_queue.lock().await;
+                if let Some(list) = q.as_mut() {
+                    if !list.is_empty() {
+                        return Ok(list.remove(0));
+                    }
+                }
+                drop(q);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        async fn send_text(&self, _conv: &ConvId, text: &str, _hint: &ReplyHint) -> Result<()> {
+            self.inbox.lock().await.push(text.to_string());
+            self.send_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn send_media(&self, _conv: &ConvId, _media: &crate::types::MediaRef, _hint: &ReplyHint) -> Result<()> {
+            Ok(())
+        }
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    // ---------- mock backend ----------
+
+    /// 记录每次 run 收到的 session（None/Some）与执行序号。
+    struct MockBackend {
+        calls: Arc<TokioMutex<Vec<Option<String>>>>,
+        order: Arc<AtomicUsize>,
+    }
+
+    impl MockBackend {
+        fn new() -> (Self, CallsHandle, CounterHandle) {
+            let calls = Arc::new(TokioMutex::new(Vec::new()));
+            let order = Arc::new(AtomicUsize::new(0));
+            let b = Self {
+                calls: calls.clone(),
+                order: order.clone(),
+            };
+            (b, calls, order)
+        }
+    }
+
+    #[async_trait]
+    impl Backend for MockBackend {
+        async fn run(
+            &self,
+            _prompt: &str,
+            session: Option<&SessionId>,
+            _workdir: &std::path::Path,
+            _allowed_tools: &[String],
+            chunks: mpsc::Sender<AgentChunk>,
+        ) -> Result<crate::types::RunOutcome> {
+            // 记录续接情况 + 执行顺序。
+            let my_order = self.order.fetch_add(1, Ordering::SeqCst);
+            self.calls.lock().await.push(session.map(|s| s.0.clone()));
+
+            // 稍微让出调度器，便于测试串行。
+            tokio::task::yield_now().await;
+
+            // 发一个 Final chunk。
+            let _ = chunks
+                .send(AgentChunk::Final(format!("reply#{my_order}")))
+                .await;
+
+            Ok(crate::types::RunOutcome {
+                session_id: SessionId(format!("sess-{my_order}")),
+                final_text: format!("final-{my_order}"),
+            })
+        }
+        fn name(&self) -> &'static str {
+            "mock-backend"
+        }
+    }
+
+    // ---------- helpers ----------
+
+    fn msg(conv: &str, sender: &str, text: &str) -> InboundMessage {
+        InboundMessage {
+            conv_id: ConvId(conv.into()),
+            sender: UserId(sender.into()),
+            text: Some(text.into()),
+            media: Vec::new(),
+            reply_hint: ReplyHint::None,
+        }
+    }
+
+    async fn tmp_store() -> (Store, std::path::PathBuf) {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "imagent_core_dispatch_{}_{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = Store::open(&p).await.expect("open store");
+        (store, p)
+    }
+
+    /// 构造 dispatcher 并返回各观测句柄。`check()` 每次返回一个指向同一 db 文件的
+    /// 新 Store 连接（Store 未 impl Clone；rusqlite WAL 支持多连接，断言用）。
+    struct Ctx {
+        disp: Arc<Dispatcher>,
+        inbox: Arc<TokioMutex<Vec<String>>>,
+        send_count: Arc<AtomicUsize>,
+        calls: Arc<TokioMutex<Vec<Option<String>>>>,
+        order: Arc<AtomicUsize>,
+        db: std::path::PathBuf,
+    }
+
+    impl Ctx {
+        async fn check(&self) -> Store {
+            Store::open(&self.db).await.expect("reopen store")
+        }
+    }
+
+    async fn build(auth: Auth) -> Ctx {
+        let (plat, inbox, send_count) = MockPlatform::new();
+        let (back, calls, order) = MockBackend::new();
+        let (store, db) = tmp_store().await;
+
+        let disp = Arc::new(Dispatcher::new(
+            Arc::new(plat),
+            Arc::new(back),
+            store,
+            auth,
+            std::path::PathBuf::from("/tmp/imagent-test-ws"),
+            vec!["Read".into(), "Edit".into()],
+        ));
+
+        Ctx {
+            disp,
+            inbox,
+            send_count,
+            calls,
+            order,
+            db,
+        }
+    }
+
+    /// 把消息喂给 dispatcher 的 mock platform recv，并等待处理完成。
+    async fn feed_and_wait(ctx: &Ctx, msgs: Vec<InboundMessage>, want_calls: usize) {
+        // 通过 downcast 不便，这里改为直接调用 handle（绕过 run/recv）。
+        for m in msgs {
+            let disp = ctx.disp.clone();
+            // 直接 await handle，串行执行（handle 内部已有 per-conv 锁）。
+            disp.handle(m).await;
+        }
+        // 等待到 calls 计数达到预期。
+        for _ in 0..400 {
+            if ctx.order.load(Ordering::SeqCst) >= want_calls {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    async fn drop_db(p: std::path::PathBuf) {
+        let _ = std::fs::remove_file(&p);
+        let mut w = p.clone();
+        w.set_extension("sqlite-wal");
+        let _ = std::fs::remove_file(&w);
+        let mut s = p.clone();
+        s.set_extension("sqlite-shm");
+        let _ = std::fs::remove_file(&s);
+    }
+
+    // ---------- tests ----------
+
+    #[tokio::test]
+    async fn normal_message_runs_backend_and_replies_and_persists() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::new(vec!["alice".into()])).await;
+        feed_and_wait(&ctx, vec![msg("c1", "alice", "hello")], 1).await;
+
+        // 回传收到（Final 优先）。
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(inbox.iter().any(|t| t.starts_with("reply#")), "inbox={inbox:?}");
+
+        // session 落库且 id 正确。
+        let row = ctx.check().await.get_session("c1").await.unwrap().expect("session row");
+        assert_eq!(row.session_id, "sess-0");
+        assert_eq!(row.agent_kind, "mock-backend");
+        drop_db(ctx.db).await;
+    }
+
+    #[tokio::test]
+    async fn second_message_continues_previous_session() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::new(vec!["alice".into()])).await;
+        feed_and_wait(
+            &ctx,
+            vec![msg("c2", "alice", "first"), msg("c2", "alice", "second")],
+            2,
+        )
+        .await;
+
+        let calls = ctx.calls.lock().await.clone();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], None, "first should be new session");
+        assert_eq!(calls[1].as_deref(), Some("sess-0"), "second should resume");
+        drop_db(ctx.db).await;
+    }
+
+    #[tokio::test]
+    async fn discovery_mode_skips_backend_and_reply() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::new(vec![])).await; // 发现模式
+        feed_and_wait(&ctx, vec![msg("c3", "anyone", "hi")], 0).await;
+
+        // backend 未被调用、platform 未回传。
+        assert_eq!(ctx.order.load(Ordering::SeqCst), 0);
+        assert_eq!(ctx.send_count.load(Ordering::SeqCst), 0);
+        assert!(ctx.inbox.lock().await.is_empty());
+        drop_db(ctx.db).await;
+    }
+
+    #[tokio::test]
+    async fn non_allowlisted_sender_dropped() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::new(vec!["someone_else".into()])).await;
+        feed_and_wait(&ctx, vec![msg("c4", "intruder", "hi")], 0).await;
+
+        assert_eq!(ctx.order.load(Ordering::SeqCst), 0);
+        assert_eq!(ctx.send_count.load(Ordering::SeqCst), 0);
+        drop_db(ctx.db).await;
+    }
+
+    #[tokio::test]
+    async fn slash_new_resets_session() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::new(vec!["alice".into()])).await;
+        // 先发一条普通消息建立 session。
+        feed_and_wait(&ctx, vec![msg("c5", "alice", "hello")], 1).await;
+        assert!(ctx.check().await.get_session("c5").await.unwrap().is_some());
+
+        // 发 /new：应删除 session 并回 IM。
+        let before_sends = ctx.send_count.load(Ordering::SeqCst);
+        feed_and_wait(&ctx, vec![msg("c5", "alice", "/new")], 1).await;
+        // /new 不触发 backend，order 不变。
+        assert_eq!(ctx.order.load(Ordering::SeqCst), 1);
+        // session 已删除。
+        assert!(ctx.check().await.get_session("c5").await.unwrap().is_none());
+        // 回传了一条重置提示。
+        let after_sends = ctx.send_count.load(Ordering::SeqCst);
+        assert_eq!(after_sends, before_sends + 1);
+
+        // 下一条普通消息 backend 收到的 session 是 None。
+        feed_and_wait(&ctx, vec![msg("c5", "alice", "fresh start")], 2).await;
+        let calls = ctx.calls.lock().await.clone();
+        // 最后一次调用 session 应为 None（fresh start 新建）。
+        assert_eq!(calls.last(), Some(&None));
+        drop_db(ctx.db).await;
+    }
+
+    #[tokio::test]
+    async fn unknown_slash_command_replies() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::new(vec!["alice".into()])).await;
+        let before = ctx.send_count.load(Ordering::SeqCst);
+        feed_and_wait(&ctx, vec![msg("c6", "alice", "/foo bar")], 0).await;
+        let after = ctx.send_count.load(Ordering::SeqCst);
+        assert_eq!(after, before + 1);
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(
+            inbox.iter().any(|t| t.contains("未知命令") && t.contains("/foo")),
+            "inbox={inbox:?}"
+        );
+        // backend 未被调用。
+        assert_eq!(ctx.order.load(Ordering::SeqCst), 0);
+        drop_db(ctx.db).await;
+    }
+
+    #[tokio::test]
+    async fn per_conv_serial_order() {
+        // 同一 conv 连发三条；mock backend 内 fetch_add 顺序应递增。
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::new(vec!["alice".into()])).await;
+        feed_and_wait(
+            &ctx,
+            vec![
+                msg("c7", "alice", "a"),
+                msg("c7", "alice", "b"),
+                msg("c7", "alice", "c"),
+            ],
+            3,
+        )
+        .await;
+
+        let calls = ctx.calls.lock().await.clone();
+        // 三条依次执行；session 链：None -> sess-0 -> sess-1。
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0], None);
+        assert_eq!(calls[1].as_deref(), Some("sess-0"));
+        assert_eq!(calls[2].as_deref(), Some("sess-1"));
+        drop_db(ctx.db).await;
+    }
+}

@@ -1,0 +1,60 @@
+//! 核心数据类型：会话/用户/agent 标识、入站消息、媒体引用、流式分块。
+
+use std::path::PathBuf;
+
+/// 平台会话标识，形如 `ilink:<from_user_id>`、`wecom:<user>`。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ConvId(pub String);
+
+/// 发送者标识（iLink 的 from_user_id 等）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UserId(pub String);
+
+/// agent 分配的会话 id（如 Claude 的 session_id）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SessionId(pub String);
+
+/// agent 工作目录（安全边界）。
+#[derive(Debug, Clone)]
+pub struct Workdir(pub PathBuf);
+
+/// 平台回传一条消息所需的信息。iLink 需要回传最新 context_token。
+#[derive(Debug, Clone)]
+pub enum ReplyHint {
+    ILink { context_token: String },
+    None,
+}
+
+/// 媒体引用（P1 不实现媒体，占位）。
+#[derive(Debug, Clone)]
+pub struct MediaRef {
+    pub kind: String,
+    pub url: String,
+}
+
+/// 入站消息（`Platform::recv` 产出，core 消费）。
+pub struct InboundMessage {
+    pub conv_id: ConvId,
+    pub sender: UserId,
+    pub text: Option<String>,
+    /// P1 恒为空 Vec。
+    pub media: Vec<MediaRef>,
+    pub reply_hint: ReplyHint,
+}
+
+/// Backend 流式产出的分块。
+#[derive(Debug, Clone)]
+pub enum AgentChunk {
+    Text(String),
+    ToolUse { tool: String, input: String },
+    ToolResult { tool: String, output: String },
+    Final(String),
+    Error(String),
+}
+
+/// Backend 单次执行的结果。
+#[derive(Debug, Clone)]
+pub struct RunOutcome {
+    pub session_id: SessionId,
+    pub final_text: String,
+}

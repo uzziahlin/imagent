@@ -1,0 +1,82 @@
+# imagent — Instant messaging, meet your agent.
+#
+# Workspace 根配置。各 crate 的实际代码在 P1 实现阶段由 omp 创建
+# （见 docs/DESIGN.md「crate 结构」）。此处 members 暂留空，避免 cargo
+# 解析不存在的 crate 报错；实现时把下方计划列表填入 members。
+
+[workspace]
+resolver = "2"
+# 计划的 crate（实现时取消注释并创建对应 Cargo.toml + src/lib.rs）：
+# members = [
+#     "crates/core",   # 调度核心：trait Platform / trait Backend、鉴权、会话路由
+#     "crates/ilink",  # iLink Platform adapter（个人微信私聊，实验性）
+#     "crates/wecom",  # WeCom  Platform adapter（企业微信官方 API，合规主推）
+#     "crates/claude", # Claude Code Backend（CLI claude -p 优先 / ACP 留 P2）
+#     "crates/store",  # 持久化：凭据 + 会话映射 + 配置（SQLite）
+# ]
+members = ["crates/store", "crates/core", "crates/claude", "crates/ilink"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+authors = ["Uzziah"]
+repository = "https://github.com/uzziah/imagent" # TODO: 确认实际仓库地址
+publish = false
+
+[workspace.dependencies]
+# 异步运行时与并发
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+async-trait = "0.1"
+futures = "0.3"
+parking_lot = "0.12"
+
+# HTTP / TLS（用 rustls 而非 native-tls：对 iLink 证书更可控，跨平台一致）
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 加密（iLink 媒体 AES-128-ECB + PKCS7，协议强制，见 docs/RESEARCH.md）
+aes = "0.8"
+ecb = "0.1"
+cipher = "0.4"
+base64 = "0.22"
+hex = "0.4"
+
+# 存储 / 工具
+rusqlite = { version = "0.31", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+qrcode = "0.14"        # 扫码登录终端二维码
+rand = "0.8"
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "5"
+toml = "0.8"
+
+[package]
+name = "imagent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+imagent-core = { path = "crates/core" }
+imagent-ilink = { path = "crates/ilink" }
+imagent-claude = { path = "crates/claude" }
+imagent-store = { path = "crates/store" }
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+dirs = { workspace = true }
+serde_json = { workspace = true }
