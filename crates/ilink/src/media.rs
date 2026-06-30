@@ -57,22 +57,22 @@ pub fn aes_encrypt(plaintext: &[u8], key: &[u8; 16]) -> Vec<u8> {
     let cipher = Aes128::new_from_slice(key).expect("16-byte key");
     let mut out = pkcs7_pad(plaintext);
     for chunk in out.chunks_exact_mut(BLOCK) {
-        let mut block = Block::from_mut_slice(chunk);
-        cipher.encrypt_block(&mut block);
+        let block = Block::from_mut_slice(chunk);
+        cipher.encrypt_block(block);
     }
     out
 }
 
 /// AES-128-ECB + PKCS7 解密；密文长度非块倍数或填充非法时返回 `None`。
 pub fn aes_decrypt(ciphertext: &[u8], key: &[u8; 16]) -> Option<Vec<u8>> {
-    if ciphertext.is_empty() || ciphertext.len() % BLOCK != 0 {
+    if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(BLOCK) {
         return None;
     }
     let cipher = Aes128::new_from_slice(key).expect("16-byte key");
     let mut buf = ciphertext.to_vec();
     for chunk in buf.chunks_exact_mut(BLOCK) {
-        let mut block = Block::from_mut_slice(chunk);
-        cipher.decrypt_block(&mut block);
+        let block = Block::from_mut_slice(chunk);
+        cipher.decrypt_block(block);
     }
     pkcs7_unpad(&buf)
 }
@@ -158,7 +158,7 @@ pub fn assert_cdn_host(url: &str) -> Result<()> {
     if host.is_empty() {
         return Err(CoreError::Platform("ilink", format!("invalid url (no host): {url}")));
     }
-    if CDN_HOSTS.iter().any(|h| host == *h) {
+    if CDN_HOSTS.contains(&host) {
         Ok(())
     } else {
         Err(CoreError::Platform(
@@ -234,6 +234,8 @@ pub struct UploadUrlResp {
 ///
 /// body：`{filekey, media_type, to_user_id, rawsize, rawfilemd5, filesize, no_need_thumb, aeskey}`。
 /// `media_type`：1=img / 2=video / 3=file / 4=voice（注意与 item type 不同，hermes 实测）。
+// 8 个参数均为上传接口必需字段，无法进一步聚合；此 allow 为有意为之。
+#[allow(clippy::too_many_arguments)]
 pub async fn get_upload_url(
     client: &crate::client::ILinkClient,
     filekey: &str,

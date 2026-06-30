@@ -1368,7 +1368,7 @@ mod tests {
             .await
             .unwrap()
             .expect("named row taskA");
-        let taskA_sid = nrow.session_id.clone();
+        let task_a_sid = nrow.session_id.clone();
 
         // 切到默认（/new 清 active_name）再发消息建立另一个默认 session。
         feed_and_wait(&ctx, vec![msg("s2", "alice", "/new")], 1).await;
@@ -1377,7 +1377,7 @@ mod tests {
         // /switch taskA（命名已存在）→ 活动 session 被写成 taskA 的 session_id。
         feed_and_wait(&ctx, vec![msg("s2", "alice", "/switch taskA")], 2).await;
         let srow = ctx.check().await.get_session("s2").await.unwrap().expect("session row");
-        assert_eq!(srow.session_id, taskA_sid, "switch 已存在命名应 resume 其 session_id");
+        assert_eq!(srow.session_id, task_a_sid, "switch 已存在命名应 resume 其 session_id");
         assert_eq!(srow.name.as_deref(), Some("taskA"));
         assert_eq!(
             ctx.check().await.get_config("active_name:s2").await.unwrap(),
@@ -1389,7 +1389,7 @@ mod tests {
         let calls = ctx.calls.lock().await.clone();
         assert_eq!(
             calls.last(),
-            Some(&Some(taskA_sid)),
+            Some(&Some(task_a_sid)),
             "switch 后续消息应续接命名 session"
         );
         drop_db(ctx.db).await;
