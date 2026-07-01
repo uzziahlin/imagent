@@ -4,7 +4,7 @@
 
 一个用 Rust 写的、把即时通讯平台接入自主 agent 的网关。**任何 IM**（个人微信 iLink / 企业微信 WeCom）↔ **任何 agent**（Claude Code / …）。
 
-![Rust](https://img.shields.io/badge/Rust-edition%202021-orange) ![License: MIT](https://img.shields.io/badge/License-MIT-blue) ![Tests](https://img.shields.io/badge/tests-129%20passed-brightgreen) ![Status](https://img.shields.io/badge/status-P2%20done-yellow)
+![Rust](https://img.shields.io/badge/Rust-edition%202021-orange) ![License: MIT](https://img.shields.io/badge/License-MIT-blue) ![Tests](https://img.shields.io/badge/tests-131%20passed-brightgreen) ![Coverage](https://img.shields.io/badge/coverage-tarpaulin%2Bcodecov-informational) ![Status](https://img.shields.io/badge/status-P3%20dev-yellow) ![Docs](https://img.shields.io/badge/docs-mdBook-blueviolet)
 
 ---
 
