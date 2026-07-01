@@ -69,9 +69,17 @@ impl Store {
 
     // —— credentials ——
 
-    // TODO(P2): 迁移到 OS keyring 加密落盘（DESIGN §9.4）
+    /// 写凭据。优先写入 OS keyring（DESIGN §9.4）：成功则 SQLite `blob` 存
+    /// marker `"keyring:{platform}:{account_id}"`（真值在 keyring）；无
+    /// keychain（headless/CI）时 fallback 明文存 SQLite + warn。
     pub async fn put_credential(&self, platform: &str, account_id: &str, blob: &str) -> Result<()> {
-        let (platform, account_id, blob) = (platform.to_string(), account_id.to_string(), blob.to_string());
+        let (platform, account_id) = (platform.to_string(), account_id.to_string());
+        // keychain I/O 经游离线程 + 超时，失败/超时回退明文（见 credentials 模块）。
+        let stored_blob = if crate::credentials::store_in_keyring(&platform, &account_id, blob).await {
+            crate::credentials::marker_for(&platform, &account_id)
+        } else {
+            blob.to_string()
+        };
         let inner = self.inner.clone();
         blocking_with(inner, move |conn| {
             let now = now_secs();
@@ -79,38 +87,112 @@ impl Store {
                 "INSERT INTO credentials (platform, account_id, blob, updated_at) \
                  VALUES (?1, ?2, ?3, ?4) \
                  ON CONFLICT(platform, account_id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at",
-                rusqlite::params![platform, account_id, blob, now],
+                rusqlite::params![platform, account_id, stored_blob, now],
             )?;
             Ok(())
         })
         .await
     }
 
+    /// 读凭据。SQLite `blob` 为 marker 时从 keyring 取真值；为明文（旧库 /
+    /// 无 keychain）时尝试懒迁移到 keyring（成功则把 DB blob 更新为 marker，
+    /// 失败则保持明文）。返回值始终为真实 blob。
     pub async fn get_credential(&self, platform: &str, account_id: &str) -> Result<Option<String>> {
         let (platform, account_id) = (platform.to_string(), account_id.to_string());
+        let (q_platform, q_account) = (platform.clone(), account_id.clone());
         let inner = self.inner.clone();
-        blocking_with(inner, move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT blob FROM credentials WHERE platform = ?1 AND account_id = ?2",
-            )?;
-            let mut rows = stmt.query(rusqlite::params![platform, account_id])?;
+        let row = blocking_with(inner, move |conn| {
+            let mut stmt = conn
+                .prepare("SELECT blob FROM credentials WHERE platform = ?1 AND account_id = ?2")?;
+            let mut rows = stmt.query(rusqlite::params![q_platform, q_account])?;
             Ok(rows.next()?.map(|r| r.get::<_, String>(0)).transpose()?)
         })
-        .await
+        .await?;
+
+        match row {
+            None => Ok(None),
+            Some(raw_blob) => {
+                let resolved = self
+                    .resolve_credential_blob(&raw_blob, &platform, &account_id)
+                    .await?;
+                Ok(Some(resolved))
+            }
+        }
     }
 
-    /// 取该 platform 的第一条凭据 (account_id, blob)。P1 单账号。
+    /// 取该 platform 的第一条凭据 (account_id, blob)。P1 单账号。blob 经
     pub async fn first_credential(&self, platform: &str) -> Result<Option<(String, String)>> {
         let platform = platform.to_string();
+        let q_platform = platform.clone();
         let inner = self.inner.clone();
-        blocking_with(inner, move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT account_id, blob FROM credentials WHERE platform = ?1 LIMIT 1",
-            )?;
-            let mut rows = stmt.query(rusqlite::params![platform])?;
-            rows.next()?
+        let row = blocking_with(inner, move |conn| {
+            let mut stmt = conn
+                .prepare("SELECT account_id, blob FROM credentials WHERE platform = ?1 LIMIT 1")?;
+            let mut rows = stmt.query(rusqlite::params![q_platform])?;
+            rows
+                .next()?
                 .map(|r| Ok::<_, StoreError>((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
                 .transpose()
+        })
+        .await?;
+
+        match row {
+            None => Ok(None),
+            Some((account_id, raw_blob)) => {
+                let resolved = self
+                    .resolve_credential_blob(&raw_blob, &platform, &account_id)
+                    .await?;
+                Ok(Some((account_id, resolved)))
+            }
+        }
+    }
+
+    /// 把 DB 中读出的原始 blob 解析为真实凭据：
+    /// - marker → 从 keyring 取真值；marker 在但 keyring 读不到（keychain 被清）→ 报错；
+    /// - 明文（旧库 / 无 keychain）→ 尝试懒迁移到 keyring 并把 DB blob 更新为 marker，
+    ///   迁移失败则保持明文。无论是否迁移成功都返回该明文 blob（即真值）。
+    async fn resolve_credential_blob(
+        &self,
+        raw_blob: &str,
+        platform: &str,
+        account_id: &str,
+    ) -> Result<String> {
+        if crate::credentials::is_keyring_marker(raw_blob) {
+            match crate::credentials::load_from_keyring(platform, account_id).await {
+                Some(real) => Ok(real),
+                None => Err(StoreError::Other(format!(
+                    "凭据标记表明真值在 keyring，但读取失败（可能 keychain 被清）：\
+                     {platform}:{account_id}"
+                ))),
+            }
+        } else {
+            // 明文：懒迁移到 keyring。
+            if crate::credentials::store_in_keyring(platform, account_id, raw_blob).await {
+                let marker = crate::credentials::marker_for(platform, account_id);
+                self.update_credential_blob(platform, account_id, &marker)
+                    .await?;
+            }
+            Ok(raw_blob.to_string())
+        }
+    }
+
+    /// 直接更新 `credentials.blob`（迁移用，不改 account_id）。
+    async fn update_credential_blob(
+        &self,
+        platform: &str,
+        account_id: &str,
+        blob: &str,
+    ) -> Result<()> {
+        let (platform, account_id, blob) = (platform.to_string(), account_id.to_string(), blob.to_string());
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let now = now_secs();
+            conn.execute(
+                "UPDATE credentials SET blob = ?3, updated_at = ?4 \
+                 WHERE platform = ?1 AND account_id = ?2",
+                rusqlite::params![platform, account_id, blob, now],
+            )?;
+            Ok(())
         })
         .await
     }
@@ -179,7 +261,10 @@ impl Store {
         let conv_id = conv_id.to_string();
         let inner = self.inner.clone();
         blocking_with(inner, move |conn| {
-            conn.execute("DELETE FROM sessions WHERE conv_id = ?1", rusqlite::params![conv_id])?;
+            conn.execute(
+                "DELETE FROM sessions WHERE conv_id = ?1",
+                rusqlite::params![conv_id],
+            )?;
             Ok(())
         })
         .await
@@ -200,7 +285,11 @@ impl Store {
     }
 
     pub async fn set_sync_buf(&self, platform: &str, account_id: &str, buf: &str) -> Result<()> {
-        let (platform, account_id, buf) = (platform.to_string(), account_id.to_string(), buf.to_string());
+        let (platform, account_id, buf) = (
+            platform.to_string(),
+            account_id.to_string(),
+            buf.to_string(),
+        );
         let inner = self.inner.clone();
         blocking_with(inner, move |conn| {
             conn.execute(
@@ -215,9 +304,17 @@ impl Store {
 
     // —— context_tokens（ilink 出站回传）——
 
-    pub async fn get_context_token(&self, platform: &str, account_id: &str, peer: &str) -> Result<Option<String>> {
-        let (platform, account_id, peer) =
-            (platform.to_string(), account_id.to_string(), peer.to_string());
+    pub async fn get_context_token(
+        &self,
+        platform: &str,
+        account_id: &str,
+        peer: &str,
+    ) -> Result<Option<String>> {
+        let (platform, account_id, peer) = (
+            platform.to_string(),
+            account_id.to_string(),
+            peer.to_string(),
+        );
         let inner = self.inner.clone();
         blocking_with(inner, move |conn| {
             let mut stmt = conn.prepare(
@@ -229,7 +326,13 @@ impl Store {
         .await
     }
 
-    pub async fn set_context_token(&self, platform: &str, account_id: &str, peer: &str, token: &str) -> Result<()> {
+    pub async fn set_context_token(
+        &self,
+        platform: &str,
+        account_id: &str,
+        peer: &str,
+        token: &str,
+    ) -> Result<()> {
         let (platform, account_id, peer, token) = (
             platform.to_string(),
             account_id.to_string(),
@@ -457,7 +560,11 @@ impl Store {
         .await
     }
 
-    pub async fn get_named_session(&self, conv_id: &str, name: &str) -> Result<Option<NamedSessionRow>> {
+    pub async fn get_named_session(
+        &self,
+        conv_id: &str,
+        name: &str,
+    ) -> Result<Option<NamedSessionRow>> {
         let (conv_id, name) = (conv_id.to_string(), name.to_string());
         let inner = self.inner.clone();
         blocking_with(inner, move |conn| {
@@ -702,7 +809,11 @@ mod tests {
         };
         store.upsert_session(&row).await.unwrap();
 
-        let got = store.get_session("ilink:user1").await.unwrap().expect("row");
+        let got = store
+            .get_session("ilink:user1")
+            .await
+            .unwrap()
+            .expect("row");
         assert_eq!(got.session_id, "sess-A");
         assert_eq!(got.created_at, 1_000_000);
         let created = got.created_at;
@@ -716,7 +827,11 @@ mod tests {
         row2.name = Some("named".into());
         store.upsert_session(&row2).await.unwrap();
 
-        let got2 = store.get_session("ilink:user1").await.unwrap().expect("row2");
+        let got2 = store
+            .get_session("ilink:user1")
+            .await
+            .unwrap()
+            .expect("row2");
         assert_eq!(got2.session_id, "sess-B");
         assert_eq!(got2.name.as_deref(), Some("named"));
         // created_at 保留不变
@@ -732,14 +847,24 @@ mod tests {
     async fn credentials_roundtrip() {
         let db = TempDb::new("creds").await;
         let store = Store::open(&db.path).await.unwrap();
-        assert!(store.get_credential("ilink", "acc1").await.unwrap().is_none());
-        store.put_credential("ilink", "acc1", r#"{"token":"x"}"#).await.unwrap();
+        assert!(store
+            .get_credential("ilink", "acc1")
+            .await
+            .unwrap()
+            .is_none());
+        store
+            .put_credential("ilink", "acc1", r#"{"token":"x"}"#)
+            .await
+            .unwrap();
         assert_eq!(
             store.get_credential("ilink", "acc1").await.unwrap(),
             Some(r#"{"token":"x"}"#.to_string())
         );
         // 覆盖
-        store.put_credential("ilink", "acc1", r#"{"token":"y"}"#).await.unwrap();
+        store
+            .put_credential("ilink", "acc1", r#"{"token":"y"}"#)
+            .await
+            .unwrap();
         assert_eq!(
             store.get_credential("ilink", "acc1").await.unwrap(),
             Some(r#"{"token":"y"}"#.to_string())
@@ -753,12 +878,22 @@ mod tests {
         // 空库 => None
         assert!(store.first_credential("ilink").await.unwrap().is_none());
 
-        store.put_credential("ilink", "acc1", r#"{"t":"1"}"#).await.unwrap();
-        store.put_credential("ilink", "acc2", r#"{"t":"2"}"#).await.unwrap();
+        store
+            .put_credential("ilink", "acc1", r#"{"t":"1"}"#)
+            .await
+            .unwrap();
+        store
+            .put_credential("ilink", "acc2", r#"{"t":"2"}"#)
+            .await
+            .unwrap();
 
         // clone 后仍可用（验证 Store: Clone）
         let cloned = store.clone();
-        let (account_id, blob) = cloned.first_credential("ilink").await.unwrap().expect("present");
+        let (account_id, blob) = cloned
+            .first_credential("ilink")
+            .await
+            .unwrap()
+            .expect("present");
         assert_eq!(blob, r#"{"t":"1"}"#);
         assert!(account_id == "acc1" || account_id == "acc2");
 
@@ -766,17 +901,76 @@ mod tests {
         assert!(store.first_credential("wecom").await.unwrap().is_none());
     }
 
+    #[test]
+    fn keyring_marker_pure_helpers() {
+        use crate::credentials;
+        // marker_for 产出 KEYRING_MARKER_PREFIX 前缀
+        let m = credentials::marker_for("ilink", "bot-123");
+        assert_eq!(m, "keyring:ilink:bot-123");
+        // is_keyring_marker：marker → true
+        assert!(credentials::is_keyring_marker(&m));
+        assert!(credentials::is_keyring_marker("keyring:foo:bar"));
+        // 明文 JSON / 空 / 普通字符串 → false
+        assert!(!credentials::is_keyring_marker(r#"{"bot_token":"x"}"#));
+        assert!(!credentials::is_keyring_marker(""));
+        assert!(!credentials::is_keyring_marker("Keyring:foo")); // 大小写敏感
+        // account_id 含 ":" 也不影响判定（marker 仍以固定前缀起始）
+        let m2 = credentials::marker_for("ilink", "a:b");
+        assert!(credentials::is_keyring_marker(&m2));
+    }
+
+    #[tokio::test]
+    async fn credential_plaintext_migration_preserves_value() {
+        // 旧库场景：blob 是明文 JSON（无 marker）。get 时应懒迁移到 keyring，
+        // 失败（CI 无 keychain）则保持明文。无论是否迁移成功，返回值必须 == 原明文。
+        // 直接用 SQL 种入明文，绕过 put_credential 的 keyring 写入。
+        let db = TempDb::new("migrate").await;
+        let store = Store::open(&db.path).await.unwrap();
+        let plain = r#"{"bot_token":"secret","ilink_bot_id":"b1"}"#;
+        {
+            let inner = store.inner.clone();
+            blocking_with(inner, move |conn| {
+                Ok(conn.execute(
+                    "INSERT INTO credentials (platform, account_id, blob, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params!["ilink", "bot-old", plain, 1_i64],
+                )?)
+            })
+            .await
+            .unwrap();
+        }
+        // get 经过 resolve：marker? 否 → 明文路径，返回明文（并尝试迁移）。
+        assert_eq!(
+            store.get_credential("ilink", "bot-old").await.unwrap(),
+            Some(plain.to_string())
+        );
+        // first_credential 同样解析
+        let (aid, blob) = store
+            .first_credential("ilink")
+            .await
+            .unwrap()
+            .expect("present");
+        assert_eq!(aid, "bot-old");
+        assert_eq!(blob, plain);
+    }
+
     #[tokio::test]
     async fn sync_buf_roundtrip() {
         let db = TempDb::new("syncbuf").await;
         let store = Store::open(&db.path).await.unwrap();
         assert!(store.get_sync_buf("ilink", "acc1").await.unwrap().is_none());
-        store.set_sync_buf("ilink", "acc1", "cursor-1").await.unwrap();
+        store
+            .set_sync_buf("ilink", "acc1", "cursor-1")
+            .await
+            .unwrap();
         assert_eq!(
             store.get_sync_buf("ilink", "acc1").await.unwrap(),
             Some("cursor-1".into())
         );
-        store.set_sync_buf("ilink", "acc1", "cursor-2").await.unwrap();
+        store
+            .set_sync_buf("ilink", "acc1", "cursor-2")
+            .await
+            .unwrap();
         assert_eq!(
             store.get_sync_buf("ilink", "acc1").await.unwrap(),
             Some("cursor-2".into())
@@ -787,15 +981,31 @@ mod tests {
     async fn context_token_roundtrip() {
         let db = TempDb::new("ctx").await;
         let store = Store::open(&db.path).await.unwrap();
-        assert!(store.get_context_token("ilink", "acc1", "peer1").await.unwrap().is_none());
-        store.set_context_token("ilink", "acc1", "peer1", "tok-1").await.unwrap();
+        assert!(store
+            .get_context_token("ilink", "acc1", "peer1")
+            .await
+            .unwrap()
+            .is_none());
+        store
+            .set_context_token("ilink", "acc1", "peer1", "tok-1")
+            .await
+            .unwrap();
         assert_eq!(
-            store.get_context_token("ilink", "acc1", "peer1").await.unwrap(),
+            store
+                .get_context_token("ilink", "acc1", "peer1")
+                .await
+                .unwrap(),
             Some("tok-1".into())
         );
-        store.set_context_token("ilink", "acc1", "peer1", "tok-2").await.unwrap();
+        store
+            .set_context_token("ilink", "acc1", "peer1", "tok-2")
+            .await
+            .unwrap();
         assert_eq!(
-            store.get_context_token("ilink", "acc1", "peer1").await.unwrap(),
+            store
+                .get_context_token("ilink", "acc1", "peer1")
+                .await
+                .unwrap(),
             Some("tok-2".into())
         );
     }
@@ -848,8 +1058,16 @@ mod tests {
             .find(|r| r.sender == "bob")
             .unwrap();
         assert_eq!(after.added_at, before.added_at, "重复 add 不刷新 added_at");
-        assert_eq!(after.added_by.as_deref(), Some("alice"), "重复 add 不覆盖 added_by");
-        assert_eq!(after.source.as_deref(), Some("im"), "重复 add 不覆盖 source");
+        assert_eq!(
+            after.added_by.as_deref(),
+            Some("alice"),
+            "重复 add 不覆盖 added_by"
+        );
+        assert_eq!(
+            after.source.as_deref(),
+            Some("im"),
+            "重复 add 不覆盖 source"
+        );
 
         // remove
         assert!(store.remove_allowed_sender("bob").await.unwrap());
@@ -863,9 +1081,18 @@ mod tests {
         let db = TempDb::new("audit").await;
         let store = Store::open(&db.path).await.unwrap();
 
-        store.append_audit("allow", Some("alice"), Some("bob"), Some("added")).await.unwrap();
-        store.append_audit("disallow", Some("alice"), Some("bob"), None).await.unwrap();
-        store.append_audit("allow", Some("cli"), Some("amy"), Some("cli-bootstrap")).await.unwrap();
+        store
+            .append_audit("allow", Some("alice"), Some("bob"), Some("added"))
+            .await
+            .unwrap();
+        store
+            .append_audit("disallow", Some("alice"), Some("bob"), None)
+            .await
+            .unwrap();
+        store
+            .append_audit("allow", Some("cli"), Some("amy"), Some("cli-bootstrap"))
+            .await
+            .unwrap();
 
         let list = store.list_audit(10).await.unwrap();
         assert_eq!(list.len(), 3);
@@ -897,11 +1124,20 @@ mod tests {
         }
         let store = Store::open(&db.path).await.unwrap();
         let tables = list_tables(&store).await;
-        assert!(tables.iter().any(|x| x == "allowed_senders"), "v2 迁移应建 allowed_senders");
-        assert!(tables.iter().any(|x| x == "audit_log"), "v2 迁移应建 audit_log");
+        assert!(
+            tables.iter().any(|x| x == "allowed_senders"),
+            "v2 迁移应建 allowed_senders"
+        );
+        assert!(
+            tables.iter().any(|x| x == "audit_log"),
+            "v2 迁移应建 audit_log"
+        );
         // 新表可写。
         store.add_allowed_sender("zoe", None, None).await.unwrap();
-        assert_eq!(store.list_allowed_senders().await.unwrap(), vec!["zoe".to_string()]);
+        assert_eq!(
+            store.list_allowed_senders().await.unwrap(),
+            vec!["zoe".to_string()]
+        );
     }
     #[tokio::test]
     async fn config_kv_roundtrip() {
@@ -912,7 +1148,10 @@ mod tests {
         assert!(store.get_config("active_name:c1").await.unwrap().is_none());
 
         // set + get。
-        store.set_config("active_name:c1", "refactor").await.unwrap();
+        store
+            .set_config("active_name:c1", "refactor")
+            .await
+            .unwrap();
         assert_eq!(
             store.get_config("active_name:c1").await.unwrap(),
             Some("refactor".to_string())
@@ -991,9 +1230,16 @@ mod tests {
         // 倒序：docs 刚 upsert（updated_at 最新）应在前。
         assert_eq!(list[0].name, "docs");
         // 删除。
-        store.delete_named_session("ilink:u1", "docs").await.unwrap();
+        store
+            .delete_named_session("ilink:u1", "docs")
+            .await
+            .unwrap();
         assert!(
-            store.get_named_session("ilink:u1", "docs").await.unwrap().is_none(),
+            store
+                .get_named_session("ilink:u1", "docs")
+                .await
+                .unwrap()
+                .is_none(),
             "删除后应不存在"
         );
         let list2 = store.list_named_sessions("ilink:u1").await.unwrap();
@@ -1001,7 +1247,11 @@ mod tests {
 
         // 其它 conv 隔离。
         assert!(
-            store.list_named_sessions("ilink:u2").await.unwrap().is_empty(),
+            store
+                .list_named_sessions("ilink:u2")
+                .await
+                .unwrap()
+                .is_empty(),
             "其它 conv 应为空"
         );
     }

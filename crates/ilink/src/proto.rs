@@ -15,7 +15,13 @@ use imagent_core::{ConvId, InboundMessage, ReplyHint, UserId};
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct QrcodeResp {
     /// hex token（用于 get_qrcode_status 的 query）。
-    #[serde(default, alias = "qrcode_token", alias = "token", alias = "qrcodeUrl", alias = "url")]
+    #[serde(
+        default,
+        alias = "qrcode_token",
+        alias = "token",
+        alias = "qrcodeUrl",
+        alias = "url"
+    )]
     pub qrcode: Option<String>,
     /// 完整可扫码 liteapp URL（终端二维码渲染这个）。snake_case，需显式 rename。
     #[serde(default, rename = "qrcode_img_content", alias = "qrcodeImgContent")]
@@ -61,7 +67,13 @@ pub struct UpdatesResp {
     #[serde(default, alias = "messages", alias = "data", alias = "list")]
     pub msgs: Vec<Msg>,
     /// 长轮询游标（真实字段 `get_updates_buf`；alias 兼容 camelCase 与异名）。
-    #[serde(default, alias = "getUpdatesBuf", alias = "buf", alias = "cursor", alias = "next_cursor")]
+    #[serde(
+        default,
+        alias = "getUpdatesBuf",
+        alias = "buf",
+        alias = "cursor",
+        alias = "next_cursor"
+    )]
     pub get_updates_buf: Option<String>,
 }
 
@@ -70,7 +82,13 @@ pub struct UpdatesResp {
 pub struct Msg {
     #[serde(default)]
     pub from_user_id: String,
-    #[serde(default, alias = "id", alias = "messageId", alias = "msg_id", alias = "msgid")]
+    #[serde(
+        default,
+        alias = "id",
+        alias = "messageId",
+        alias = "msg_id",
+        alias = "msgid"
+    )]
     pub message_id: Option<serde_json::Value>,
     #[serde(default)]
     pub context_token: Option<String>,
@@ -381,7 +399,10 @@ mod tests {
         let r: UpdatesResp = serde_json::from_str(json).unwrap();
         assert_eq!(r.msgs.len(), 1);
         assert_eq!(r.msgs[0].from_user_id, "u1");
-        assert_eq!(r.msgs[0].message_id.as_ref().and_then(|v| v.as_str()), Some("m1"));
+        assert_eq!(
+            r.msgs[0].message_id.as_ref().and_then(|v| v.as_str()),
+            Some("m1")
+        );
         assert_eq!(r.get_updates_buf.as_deref(), Some("CgkI"));
     }
 
@@ -409,7 +430,10 @@ mod tests {
         // curl 实测样本（snake_case 字段）
         let json = r#"{"qrcode":"57677957d0077a13666d59fc00f6fb5c","qrcode_img_content":"https://liteapp.weixin.qq.com/q/7GiQu1?qrcode=57677957d0077a13666d59fc00f6fb5c&bot_type=3","ret":0}"#;
         let r: QrcodeResp = serde_json::from_str(json).unwrap();
-        assert_eq!(r.qrcode.as_deref(), Some("57677957d0077a13666d59fc00f6fb5c"));
+        assert_eq!(
+            r.qrcode.as_deref(),
+            Some("57677957d0077a13666d59fc00f6fb5c")
+        );
         assert!(r
             .qrcode_img_content
             .as_deref()
@@ -446,10 +470,14 @@ mod tests {
 
     #[test]
     fn parse_qrcode_status_scaned_but_redirect() {
-        let json = r#"{"status":"scaned_but_redirect","redirect_host":"https://ilink-bak.weixin.qq.com"}"#;
+        let json =
+            r#"{"status":"scaned_but_redirect","redirect_host":"https://ilink-bak.weixin.qq.com"}"#;
         let s: QrcodeStatus = serde_json::from_str(json).unwrap();
         assert_eq!(s.status.as_deref(), Some("scaned_but_redirect"));
-        assert_eq!(s.redirect_host.as_deref(), Some("https://ilink-bak.weixin.qq.com"));
+        assert_eq!(
+            s.redirect_host.as_deref(),
+            Some("https://ilink-bak.weixin.qq.com")
+        );
     }
 
     #[test]
@@ -472,7 +500,10 @@ mod tests {
         assert_eq!(r.msgs.len(), 1);
         let m = &r.msgs[0];
         // message_id 是数字，反序列化为 Value::Number。
-        assert_eq!(m.message_id.as_ref().unwrap().to_string(), "7477577657987792776");
+        assert_eq!(
+            m.message_id.as_ref().unwrap().to_string(),
+            "7477577657987792776"
+        );
         assert_eq!(extract_text(m), "你好，你好，测试验证");
         let ib = msg_to_inbound(m);
         assert_eq!(ib.conv_id.0, "ilink:o9cq804lZUXdvf2eN6CDMFQJeyYQ@im.wechat");
@@ -489,7 +520,8 @@ mod tests {
     #[test]
     fn extract_text_from_voice_item() {
         // 仅语音条目（type==3），文本来自 voice_item.text。
-        let json = r#"{"from_user_id":"u","item_list":[{"type":3,"voice_item":{"text":"语音转写"}}]}"#;
+        let json =
+            r#"{"from_user_id":"u","item_list":[{"type":3,"voice_item":{"text":"语音转写"}}]}"#;
         let m: Msg = serde_json::from_str(json).unwrap();
         assert_eq!(extract_text(&m), "语音转写");
     }
@@ -505,7 +537,11 @@ mod tests {
     }
     #[test]
     fn classify_success_both_zero() {
-        let r = SendMsgResp { ret: Some(0), errcode: Some(0), errmsg: Some("ok".into()) };
+        let r = SendMsgResp {
+            ret: Some(0),
+            errcode: Some(0),
+            errmsg: Some("ok".into()),
+        };
         assert!(matches!(classify_send(&r), SendOutcome::Success));
     }
 
@@ -518,36 +554,66 @@ mod tests {
 
     #[test]
     fn classify_session_expired_minus14() {
-        let r = SendMsgResp { ret: Some(-14), errcode: Some(0), errmsg: None };
+        let r = SendMsgResp {
+            ret: Some(-14),
+            errcode: Some(0),
+            errmsg: None,
+        };
         assert!(matches!(classify_send(&r), SendOutcome::SessionExpired));
-        let r2 = SendMsgResp { ret: Some(0), errcode: Some(-14), errmsg: None };
+        let r2 = SendMsgResp {
+            ret: Some(0),
+            errcode: Some(-14),
+            errmsg: None,
+        };
         assert!(matches!(classify_send(&r2), SendOutcome::SessionExpired));
     }
 
     #[test]
     fn classify_session_expired_unknown_error_disguise() {
         // ret==-2 且 errmsg=="unknown error"（伪装的 stale session）→ SessionExpired，不是 RateLimited。
-        let r = SendMsgResp { ret: Some(-2), errcode: Some(0), errmsg: Some("unknown error".into()) };
+        let r = SendMsgResp {
+            ret: Some(-2),
+            errcode: Some(0),
+            errmsg: Some("unknown error".into()),
+        };
         assert!(matches!(classify_send(&r), SendOutcome::SessionExpired));
         // 大小写/首尾空白容错。
-        let r2 = SendMsgResp { ret: Some(0), errcode: Some(-2), errmsg: Some("  Unknown Error  ".into()) };
+        let r2 = SendMsgResp {
+            ret: Some(0),
+            errcode: Some(-2),
+            errmsg: Some("  Unknown Error  ".into()),
+        };
         assert!(matches!(classify_send(&r2), SendOutcome::SessionExpired));
     }
 
     #[test]
     fn classify_rate_limited_minus2() {
         // -2 但 errmsg 非 "unknown error" → 限流。
-        let r = SendMsgResp { ret: Some(-2), errcode: Some(0), errmsg: Some("rate limited".into()) };
+        let r = SendMsgResp {
+            ret: Some(-2),
+            errcode: Some(0),
+            errmsg: Some("rate limited".into()),
+        };
         assert!(matches!(classify_send(&r), SendOutcome::RateLimited));
-        let r2 = SendMsgResp { ret: Some(0), errcode: Some(-2), errmsg: None };
+        let r2 = SendMsgResp {
+            ret: Some(0),
+            errcode: Some(-2),
+            errmsg: None,
+        };
         assert!(matches!(classify_send(&r2), SendOutcome::RateLimited));
     }
 
     #[test]
     fn classify_other_error() {
-        let r = SendMsgResp { ret: Some(-99), errcode: Some(0), errmsg: Some("boom".into()) };
+        let r = SendMsgResp {
+            ret: Some(-99),
+            errcode: Some(0),
+            errmsg: Some("boom".into()),
+        };
         match classify_send(&r) {
-            SendOutcome::OtherError(s) => assert!(s.contains("ret=Some(-99)") && s.contains("boom")),
+            SendOutcome::OtherError(s) => {
+                assert!(s.contains("ret=Some(-99)") && s.contains("boom"))
+            }
             other => panic!("expected OtherError, got {other:?}"),
         }
     }
@@ -565,7 +631,10 @@ mod tests {
         assert_eq!(refs[0].kind, "image");
         assert_eq!(refs[0].encrypt_query_param.as_deref(), Some("IMGQ"));
         // image 优先 image_item.aeskey。
-        assert_eq!(refs[0].aes_key.as_deref(), Some("00112233445566778899aabbccddeeff"));
+        assert_eq!(
+            refs[0].aes_key.as_deref(),
+            Some("00112233445566778899aabbccddeeff")
+        );
         assert_eq!(refs[1].kind, "file");
         assert_eq!(refs[1].encrypt_query_param.as_deref(), Some("FILEQ"));
         assert_eq!(refs[1].aes_key.as_deref(), Some("AAAA"));

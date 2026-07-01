@@ -115,7 +115,10 @@ pub fn handle_request(req: &Value, mode: PermissionMode) -> Option<Value> {
                     message: Some("ask/off not handled in pure handler".into()),
                 }
             };
-            let input = req.pointer("/params/arguments/input").cloned().unwrap_or(json!({}));
+            let input = req
+                .pointer("/params/arguments/input")
+                .cloned()
+                .unwrap_or(json!({}));
             build_call_response(&reply, &input)
         }
         _ => {
@@ -172,9 +175,8 @@ pub async fn ask_via_socket(
     let mut reader = BufReader::new(&mut stream);
     let mut buf = String::new();
     reader.read_line(&mut buf).await?;
-    let v: Value = serde_json::from_str(buf.trim()).map_err(|e| {
-        io::Error::new(io::ErrorKind::InvalidData, format!("parse reply: {e}"))
-    })?;
+    let v: Value = serde_json::from_str(buf.trim())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("parse reply: {e}")))?;
     let allow = v.get("allow").and_then(|a| a.as_bool()).unwrap_or(false);
     let message = v
         .get("message")
@@ -184,11 +186,7 @@ pub async fn ask_via_socket(
 }
 
 /// MCP server 主循环（stdio）。读 stdin 一行 JSON、写 stdout 一行 JSON。
-pub async fn run_mcp_server(
-    conv_id: String,
-    sock: String,
-    mode: PermissionMode,
-) -> io::Result<()> {
+pub async fn run_mcp_server(conv_id: String, sock: String, mode: PermissionMode) -> io::Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -296,10 +294,7 @@ mod tests {
     fn handle_tools_list() {
         let req = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" });
         let resp = handle_request(&req, PermissionMode::Allow).unwrap();
-        assert_eq!(
-            resp["result"]["tools"][0]["name"],
-            TOOL_NAME
-        );
+        assert_eq!(resp["result"]["tools"][0]["name"], TOOL_NAME);
     }
 
     #[test]

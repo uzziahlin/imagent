@@ -44,8 +44,13 @@ pub async fn login_flow_with_base(store: &Store, base_url: &str) -> Result<Crede
 
     // 1. 取二维码（bot_type 作为 URL query 参数，curl 实测；body 为空对象）
     let body = serde_json::json!({});
-    let qr: QrcodeResp =
-        post_noauth(&http, base_url, "/ilink/bot/get_bot_qrcode?bot_type=3", &body).await?;
+    let qr: QrcodeResp = post_noauth(
+        &http,
+        base_url,
+        "/ilink/bot/get_bot_qrcode?bot_type=3",
+        &body,
+    )
+    .await?;
     // ret 非 0 或缺 qrcode hex token 视为失败
     if qr.ret.unwrap_or(0) != 0 || qr.qrcode.is_none() {
         return Err(CoreError::Platform(
@@ -90,15 +95,15 @@ pub async fn login_flow_with_base(store: &Store, base_url: &str) -> Result<Crede
             }
             Some("confirmed") => {
                 let creds = Credentials {
-                    bot_token: st
-                        .bot_token
-                        .ok_or_else(|| CoreError::Platform("ilink", "confirmed missing bot_token".into()))?,
-                    ilink_bot_id: st
-                        .ilink_bot_id
-                        .ok_or_else(|| CoreError::Platform("ilink", "confirmed missing ilink_bot_id".into()))?,
-                    ilink_user_id: st
-                        .ilink_user_id
-                        .ok_or_else(|| CoreError::Platform("ilink", "confirmed missing ilink_user_id".into()))?,
+                    bot_token: st.bot_token.ok_or_else(|| {
+                        CoreError::Platform("ilink", "confirmed missing bot_token".into())
+                    })?,
+                    ilink_bot_id: st.ilink_bot_id.ok_or_else(|| {
+                        CoreError::Platform("ilink", "confirmed missing ilink_bot_id".into())
+                    })?,
+                    ilink_user_id: st.ilink_user_id.ok_or_else(|| {
+                        CoreError::Platform("ilink", "confirmed missing ilink_user_id".into())
+                    })?,
                     baseurl: st.baseurl.unwrap_or_else(|| base_url.to_string()),
                 };
                 // 3. 落盘
@@ -130,8 +135,8 @@ async fn post_noauth<T: serde::de::DeserializeOwned>(
     body: &serde_json::Value,
 ) -> Result<T> {
     let url = format!("{base_url}{endpoint}");
-    let uin =
-        base64::engine::general_purpose::STANDARD.encode(rand::thread_rng().gen::<u32>().to_le_bytes());
+    let uin = base64::engine::general_purpose::STANDARD
+        .encode(rand::thread_rng().gen::<u32>().to_le_bytes());
     let resp = http
         .post(&url)
         .header("AuthorizationType", "ilink_bot_token")

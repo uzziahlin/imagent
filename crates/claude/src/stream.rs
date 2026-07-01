@@ -23,15 +23,10 @@ pub enum ParsedEvent {
         session_id: Option<String>,
     },
     /// user 事件中的首个 `tool_result`：tool 名通常缺失（只有 tool_use_id），留空串。
-    ToolResult {
-        tool: String,
-        output: String,
-    },
+    ToolResult { tool: String, output: String },
     /// 其余有效 JSON 事件（纯 text / system …）。
     /// 附带该行中可能出现的 `session_id`，便于上层尽早捕获。
-    Other {
-        session_id: Option<String>,
-    },
+    Other { session_id: Option<String> },
     /// 非 JSON（空行 / 噪声），跳过。
     Skip,
 }
@@ -172,7 +167,8 @@ mod tests {
 
     #[test]
     fn parses_error_result() {
-        let line = r#"{"type":"result","result":"boom: bad prompt","is_error":true,"session_id":"s-7"}"#;
+        let line =
+            r#"{"type":"result","result":"boom: bad prompt","is_error":true,"session_id":"s-7"}"#;
         assert_eq!(
             parse_line(line),
             ParsedEvent::Result {
@@ -253,9 +249,7 @@ mod tests {
     fn tool_use_missing_input_is_empty_string() {
         let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]},"session_id":"sess-4"}"#;
         match parse_line(line) {
-            ParsedEvent::ToolUse {
-                tool, input, ..
-            } => {
+            ParsedEvent::ToolUse { tool, input, .. } => {
                 assert_eq!(tool, "Bash");
                 assert!(input.is_empty());
             }
@@ -265,7 +259,8 @@ mod tests {
 
     #[test]
     fn tool_result_event_is_parsed() {
-        let line = r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"done"}]}}"#;
+        let line =
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"done"}]}}"#;
         match parse_line(line) {
             ParsedEvent::ToolResult { tool, output } => {
                 assert!(tool.is_empty(), "tool 名通常缺失，应为空串");
