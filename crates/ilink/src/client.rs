@@ -106,7 +106,9 @@ mod tests {
     fn uin_is_base64_of_four_bytes() {
         let s = ILinkClient::random_uin();
         // base64(u32 小端 4 字节) → 恰好 4 字符无填充（4 字节 → ceil(4/3)*4=8? 修正：4 字节 base64 = 8 字符含 1 个 =）
-        let decoded = base64::engine::general_purpose::STANDARD.decode(&s).unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&s)
+            .unwrap();
         assert_eq!(decoded.len(), 4, "u32 little-endian = 4 bytes");
     }
 

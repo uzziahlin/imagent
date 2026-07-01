@@ -71,7 +71,11 @@ impl Store {
 
     // TODO(P2): 迁移到 OS keyring 加密落盘（DESIGN §9.4）
     pub async fn put_credential(&self, platform: &str, account_id: &str, blob: &str) -> Result<()> {
-        let (platform, account_id, blob) = (platform.to_string(), account_id.to_string(), blob.to_string());
+        let (platform, account_id, blob) = (
+            platform.to_string(),
+            account_id.to_string(),
+            blob.to_string(),
+        );
         let inner = self.inner.clone();
         blocking_with(inner, move |conn| {
             let now = now_secs();
@@ -90,9 +94,8 @@ impl Store {
         let (platform, account_id) = (platform.to_string(), account_id.to_string());
         let inner = self.inner.clone();
         blocking_with(inner, move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT blob FROM credentials WHERE platform = ?1 AND account_id = ?2",
-            )?;
+            let mut stmt = conn
+                .prepare("SELECT blob FROM credentials WHERE platform = ?1 AND account_id = ?2")?;
             let mut rows = stmt.query(rusqlite::params![platform, account_id])?;
             Ok(rows.next()?.map(|r| r.get::<_, String>(0)).transpose()?)
         })
@@ -104,9 +107,8 @@ impl Store {
         let platform = platform.to_string();
         let inner = self.inner.clone();
         blocking_with(inner, move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT account_id, blob FROM credentials WHERE platform = ?1 LIMIT 1",
-            )?;
+            let mut stmt = conn
+                .prepare("SELECT account_id, blob FROM credentials WHERE platform = ?1 LIMIT 1")?;
             let mut rows = stmt.query(rusqlite::params![platform])?;
             rows.next()?
                 .map(|r| Ok::<_, StoreError>((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
@@ -179,7 +181,10 @@ impl Store {
         let conv_id = conv_id.to_string();
         let inner = self.inner.clone();
         blocking_with(inner, move |conn| {
-            conn.execute("DELETE FROM sessions WHERE conv_id = ?1", rusqlite::params![conv_id])?;
+            conn.execute(
+                "DELETE FROM sessions WHERE conv_id = ?1",
+                rusqlite::params![conv_id],
+            )?;
             Ok(())
         })
         .await
@@ -200,7 +205,11 @@ impl Store {
     }
 
     pub async fn set_sync_buf(&self, platform: &str, account_id: &str, buf: &str) -> Result<()> {
-        let (platform, account_id, buf) = (platform.to_string(), account_id.to_string(), buf.to_string());
+        let (platform, account_id, buf) = (
+            platform.to_string(),
+            account_id.to_string(),
+            buf.to_string(),
+        );
         let inner = self.inner.clone();
         blocking_with(inner, move |conn| {
             conn.execute(
@@ -215,9 +224,17 @@ impl Store {
 
     // —— context_tokens（ilink 出站回传）——
 
-    pub async fn get_context_token(&self, platform: &str, account_id: &str, peer: &str) -> Result<Option<String>> {
-        let (platform, account_id, peer) =
-            (platform.to_string(), account_id.to_string(), peer.to_string());
+    pub async fn get_context_token(
+        &self,
+        platform: &str,
+        account_id: &str,
+        peer: &str,
+    ) -> Result<Option<String>> {
+        let (platform, account_id, peer) = (
+            platform.to_string(),
+            account_id.to_string(),
+            peer.to_string(),
+        );
         let inner = self.inner.clone();
         blocking_with(inner, move |conn| {
             let mut stmt = conn.prepare(
@@ -229,7 +246,13 @@ impl Store {
         .await
     }
 
-    pub async fn set_context_token(&self, platform: &str, account_id: &str, peer: &str, token: &str) -> Result<()> {
+    pub async fn set_context_token(
+        &self,
+        platform: &str,
+        account_id: &str,
+        peer: &str,
+        token: &str,
+    ) -> Result<()> {
         let (platform, account_id, peer, token) = (
             platform.to_string(),
             account_id.to_string(),
@@ -457,7 +480,11 @@ impl Store {
         .await
     }
 
-    pub async fn get_named_session(&self, conv_id: &str, name: &str) -> Result<Option<NamedSessionRow>> {
+    pub async fn get_named_session(
+        &self,
+        conv_id: &str,
+        name: &str,
+    ) -> Result<Option<NamedSessionRow>> {
         let (conv_id, name) = (conv_id.to_string(), name.to_string());
         let inner = self.inner.clone();
         blocking_with(inner, move |conn| {
@@ -702,7 +729,11 @@ mod tests {
         };
         store.upsert_session(&row).await.unwrap();
 
-        let got = store.get_session("ilink:user1").await.unwrap().expect("row");
+        let got = store
+            .get_session("ilink:user1")
+            .await
+            .unwrap()
+            .expect("row");
         assert_eq!(got.session_id, "sess-A");
         assert_eq!(got.created_at, 1_000_000);
         let created = got.created_at;
@@ -716,7 +747,11 @@ mod tests {
         row2.name = Some("named".into());
         store.upsert_session(&row2).await.unwrap();
 
-        let got2 = store.get_session("ilink:user1").await.unwrap().expect("row2");
+        let got2 = store
+            .get_session("ilink:user1")
+            .await
+            .unwrap()
+            .expect("row2");
         assert_eq!(got2.session_id, "sess-B");
         assert_eq!(got2.name.as_deref(), Some("named"));
         // created_at 保留不变
@@ -732,14 +767,24 @@ mod tests {
     async fn credentials_roundtrip() {
         let db = TempDb::new("creds").await;
         let store = Store::open(&db.path).await.unwrap();
-        assert!(store.get_credential("ilink", "acc1").await.unwrap().is_none());
-        store.put_credential("ilink", "acc1", r#"{"token":"x"}"#).await.unwrap();
+        assert!(store
+            .get_credential("ilink", "acc1")
+            .await
+            .unwrap()
+            .is_none());
+        store
+            .put_credential("ilink", "acc1", r#"{"token":"x"}"#)
+            .await
+            .unwrap();
         assert_eq!(
             store.get_credential("ilink", "acc1").await.unwrap(),
             Some(r#"{"token":"x"}"#.to_string())
         );
         // 覆盖
-        store.put_credential("ilink", "acc1", r#"{"token":"y"}"#).await.unwrap();
+        store
+            .put_credential("ilink", "acc1", r#"{"token":"y"}"#)
+            .await
+            .unwrap();
         assert_eq!(
             store.get_credential("ilink", "acc1").await.unwrap(),
             Some(r#"{"token":"y"}"#.to_string())
@@ -753,12 +798,22 @@ mod tests {
         // 空库 => None
         assert!(store.first_credential("ilink").await.unwrap().is_none());
 
-        store.put_credential("ilink", "acc1", r#"{"t":"1"}"#).await.unwrap();
-        store.put_credential("ilink", "acc2", r#"{"t":"2"}"#).await.unwrap();
+        store
+            .put_credential("ilink", "acc1", r#"{"t":"1"}"#)
+            .await
+            .unwrap();
+        store
+            .put_credential("ilink", "acc2", r#"{"t":"2"}"#)
+            .await
+            .unwrap();
 
         // clone 后仍可用（验证 Store: Clone）
         let cloned = store.clone();
-        let (account_id, blob) = cloned.first_credential("ilink").await.unwrap().expect("present");
+        let (account_id, blob) = cloned
+            .first_credential("ilink")
+            .await
+            .unwrap()
+            .expect("present");
         assert_eq!(blob, r#"{"t":"1"}"#);
         assert!(account_id == "acc1" || account_id == "acc2");
 
@@ -771,12 +826,18 @@ mod tests {
         let db = TempDb::new("syncbuf").await;
         let store = Store::open(&db.path).await.unwrap();
         assert!(store.get_sync_buf("ilink", "acc1").await.unwrap().is_none());
-        store.set_sync_buf("ilink", "acc1", "cursor-1").await.unwrap();
+        store
+            .set_sync_buf("ilink", "acc1", "cursor-1")
+            .await
+            .unwrap();
         assert_eq!(
             store.get_sync_buf("ilink", "acc1").await.unwrap(),
             Some("cursor-1".into())
         );
-        store.set_sync_buf("ilink", "acc1", "cursor-2").await.unwrap();
+        store
+            .set_sync_buf("ilink", "acc1", "cursor-2")
+            .await
+            .unwrap();
         assert_eq!(
             store.get_sync_buf("ilink", "acc1").await.unwrap(),
             Some("cursor-2".into())
@@ -787,15 +848,31 @@ mod tests {
     async fn context_token_roundtrip() {
         let db = TempDb::new("ctx").await;
         let store = Store::open(&db.path).await.unwrap();
-        assert!(store.get_context_token("ilink", "acc1", "peer1").await.unwrap().is_none());
-        store.set_context_token("ilink", "acc1", "peer1", "tok-1").await.unwrap();
+        assert!(store
+            .get_context_token("ilink", "acc1", "peer1")
+            .await
+            .unwrap()
+            .is_none());
+        store
+            .set_context_token("ilink", "acc1", "peer1", "tok-1")
+            .await
+            .unwrap();
         assert_eq!(
-            store.get_context_token("ilink", "acc1", "peer1").await.unwrap(),
+            store
+                .get_context_token("ilink", "acc1", "peer1")
+                .await
+                .unwrap(),
             Some("tok-1".into())
         );
-        store.set_context_token("ilink", "acc1", "peer1", "tok-2").await.unwrap();
+        store
+            .set_context_token("ilink", "acc1", "peer1", "tok-2")
+            .await
+            .unwrap();
         assert_eq!(
-            store.get_context_token("ilink", "acc1", "peer1").await.unwrap(),
+            store
+                .get_context_token("ilink", "acc1", "peer1")
+                .await
+                .unwrap(),
             Some("tok-2".into())
         );
     }
@@ -848,8 +925,16 @@ mod tests {
             .find(|r| r.sender == "bob")
             .unwrap();
         assert_eq!(after.added_at, before.added_at, "重复 add 不刷新 added_at");
-        assert_eq!(after.added_by.as_deref(), Some("alice"), "重复 add 不覆盖 added_by");
-        assert_eq!(after.source.as_deref(), Some("im"), "重复 add 不覆盖 source");
+        assert_eq!(
+            after.added_by.as_deref(),
+            Some("alice"),
+            "重复 add 不覆盖 added_by"
+        );
+        assert_eq!(
+            after.source.as_deref(),
+            Some("im"),
+            "重复 add 不覆盖 source"
+        );
 
         // remove
         assert!(store.remove_allowed_sender("bob").await.unwrap());
@@ -863,9 +948,18 @@ mod tests {
         let db = TempDb::new("audit").await;
         let store = Store::open(&db.path).await.unwrap();
 
-        store.append_audit("allow", Some("alice"), Some("bob"), Some("added")).await.unwrap();
-        store.append_audit("disallow", Some("alice"), Some("bob"), None).await.unwrap();
-        store.append_audit("allow", Some("cli"), Some("amy"), Some("cli-bootstrap")).await.unwrap();
+        store
+            .append_audit("allow", Some("alice"), Some("bob"), Some("added"))
+            .await
+            .unwrap();
+        store
+            .append_audit("disallow", Some("alice"), Some("bob"), None)
+            .await
+            .unwrap();
+        store
+            .append_audit("allow", Some("cli"), Some("amy"), Some("cli-bootstrap"))
+            .await
+            .unwrap();
 
         let list = store.list_audit(10).await.unwrap();
         assert_eq!(list.len(), 3);
@@ -897,11 +991,20 @@ mod tests {
         }
         let store = Store::open(&db.path).await.unwrap();
         let tables = list_tables(&store).await;
-        assert!(tables.iter().any(|x| x == "allowed_senders"), "v2 迁移应建 allowed_senders");
-        assert!(tables.iter().any(|x| x == "audit_log"), "v2 迁移应建 audit_log");
+        assert!(
+            tables.iter().any(|x| x == "allowed_senders"),
+            "v2 迁移应建 allowed_senders"
+        );
+        assert!(
+            tables.iter().any(|x| x == "audit_log"),
+            "v2 迁移应建 audit_log"
+        );
         // 新表可写。
         store.add_allowed_sender("zoe", None, None).await.unwrap();
-        assert_eq!(store.list_allowed_senders().await.unwrap(), vec!["zoe".to_string()]);
+        assert_eq!(
+            store.list_allowed_senders().await.unwrap(),
+            vec!["zoe".to_string()]
+        );
     }
     #[tokio::test]
     async fn config_kv_roundtrip() {
@@ -912,7 +1015,10 @@ mod tests {
         assert!(store.get_config("active_name:c1").await.unwrap().is_none());
 
         // set + get。
-        store.set_config("active_name:c1", "refactor").await.unwrap();
+        store
+            .set_config("active_name:c1", "refactor")
+            .await
+            .unwrap();
         assert_eq!(
             store.get_config("active_name:c1").await.unwrap(),
             Some("refactor".to_string())
@@ -991,9 +1097,16 @@ mod tests {
         // 倒序：docs 刚 upsert（updated_at 最新）应在前。
         assert_eq!(list[0].name, "docs");
         // 删除。
-        store.delete_named_session("ilink:u1", "docs").await.unwrap();
+        store
+            .delete_named_session("ilink:u1", "docs")
+            .await
+            .unwrap();
         assert!(
-            store.get_named_session("ilink:u1", "docs").await.unwrap().is_none(),
+            store
+                .get_named_session("ilink:u1", "docs")
+                .await
+                .unwrap()
+                .is_none(),
             "删除后应不存在"
         );
         let list2 = store.list_named_sessions("ilink:u1").await.unwrap();
@@ -1001,7 +1114,11 @@ mod tests {
 
         // 其它 conv 隔离。
         assert!(
-            store.list_named_sessions("ilink:u2").await.unwrap().is_empty(),
+            store
+                .list_named_sessions("ilink:u2")
+                .await
+                .unwrap()
+                .is_empty(),
             "其它 conv 应为空"
         );
     }

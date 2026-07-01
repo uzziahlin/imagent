@@ -83,7 +83,10 @@ mod tests {
     #[test]
     fn snapshot_sorted() {
         let a = Auth::new(vec!["charlie".into(), "alice".into(), "bob".into()]);
-        assert_eq!(a.snapshot(), vec!["alice".to_string(), "bob".into(), "charlie".into()]);
+        assert_eq!(
+            a.snapshot(),
+            vec!["alice".to_string(), "bob".into(), "charlie".into()]
+        );
     }
 
     #[test]

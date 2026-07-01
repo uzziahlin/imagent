@@ -3,9 +3,7 @@
 use std::process::Stdio;
 
 use async_trait::async_trait;
-use imagent_core::{
-    AgentChunk, Backend, CoreError, PermissionMode, Result, RunOutcome, SessionId,
-};
+use imagent_core::{AgentChunk, Backend, CoreError, PermissionMode, Result, RunOutcome, SessionId};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tracing::{debug, warn};
@@ -29,7 +27,9 @@ impl ClaudeBackend {
     }
 
     pub fn with_permission_mode(mode: PermissionMode) -> Self {
-        Self { permission_mode: mode }
+        Self {
+            permission_mode: mode,
+        }
     }
 }
 
@@ -44,7 +44,12 @@ const NAME: &str = "claude-cli";
 /// 固定 socket 路径（主进程 PermissionRouter 监听、MCP server 连接）。
 fn permission_sock_path() -> String {
     dirs::home_dir()
-        .map(|h| h.join(".imagent").join("permission.sock").to_string_lossy().into_owned())
+        .map(|h| {
+            h.join(".imagent")
+                .join("permission.sock")
+                .to_string_lossy()
+                .into_owned()
+        })
         .unwrap_or_else(|| "/tmp/imagent-permission.sock".into())
 }
 
@@ -122,12 +127,9 @@ impl Backend for ClaudeBackend {
         }
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-        let mut child = cmd.spawn().map_err(|e| {
-            CoreError::Backend(
-                NAME,
-                format!("failed to spawn `claude`: {e}"),
-            )
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| CoreError::Backend(NAME, format!("failed to spawn `claude`: {e}")))?;
 
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
@@ -159,14 +161,10 @@ impl Backend for ClaudeBackend {
                             captured_session = Some(sid);
                         }
                     }
-                    let _ = chunks
-                        .send(AgentChunk::ToolUse { tool, input })
-                        .await;
+                    let _ = chunks.send(AgentChunk::ToolUse { tool, input }).await;
                 }
                 ParsedEvent::ToolResult { tool, output } => {
-                    let _ = chunks
-                        .send(AgentChunk::ToolResult { tool, output })
-                        .await;
+                    let _ = chunks.send(AgentChunk::ToolResult { tool, output }).await;
                 }
                 ParsedEvent::Result {
                     text,
@@ -222,9 +220,7 @@ impl Backend for ClaudeBackend {
 }
 
 /// 把子进程 stderr 全量读到字符串（不阻断）。
-async fn read_stderr_to_string(
-    stderr: tokio::process::ChildStderr,
-) -> String {
+async fn read_stderr_to_string(stderr: tokio::process::ChildStderr) -> String {
     let mut reader = BufReader::new(stderr).lines();
     let mut buf = Vec::new();
     while let Ok(Some(line)) = reader.next_line().await {
@@ -234,10 +230,7 @@ async fn read_stderr_to_string(
 }
 
 /// 无 result 文本时的诊断信息。
-fn diagnose(
-    status: &std::io::Result<std::process::ExitStatus>,
-    stderr: &str,
-) -> String {
+fn diagnose(status: &std::io::Result<std::process::ExitStatus>, stderr: &str) -> String {
     let code_str = match status {
         Ok(s) => format!("exit {}", s),
         Err(e) => format!("wait failed: {e}"),
@@ -283,7 +276,10 @@ mod tests {
             .await
             .expect("claude run should succeed");
 
-        assert!(!outcome.session_id.0.is_empty(), "session_id must be non-empty");
+        assert!(
+            !outcome.session_id.0.is_empty(),
+            "session_id must be non-empty"
+        );
         assert!(
             !outcome.final_text.trim().is_empty(),
             "final_text must be non-empty"

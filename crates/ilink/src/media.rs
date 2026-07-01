@@ -111,9 +111,7 @@ pub fn parse_aes_key(s: &str) -> Option<[u8; 16]> {
     // 2. base64。
     let raw = base64::engine::general_purpose::STANDARD
         .decode(trimmed)
-        .or_else(|_| {
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(trimmed)
-        })
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(trimmed))
         .ok()?;
     match raw.len() {
         16 => {
@@ -149,14 +147,22 @@ fn extract_host(url: &str) -> Option<&str> {
     let after_scheme = url.split("://").nth(1).unwrap_or(url);
     let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
     // 去端口。
-    Some(authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority))
+    Some(
+        authority
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(authority),
+    )
 }
 
 /// 校验 URL 主机在 CDN 白名单内；非白名单返回 Err（SSRF 防护）。
 pub fn assert_cdn_host(url: &str) -> Result<()> {
     let host = extract_host(url).unwrap_or("");
     if host.is_empty() {
-        return Err(CoreError::Platform("ilink", format!("invalid url (no host): {url}")));
+        return Err(CoreError::Platform(
+            "ilink",
+            format!("invalid url (no host): {url}"),
+        ));
     }
     if CDN_HOSTS.contains(&host) {
         Ok(())
@@ -170,9 +176,15 @@ pub fn assert_cdn_host(url: &str) -> Result<()> {
 
 /// 构造 CDN 下载 URL：优先 `encrypt_query_param`，否则 `full_url`（SSRF 校验）。
 /// 两者皆空返回 Err。
-pub fn resolve_download_url(encrypt_query_param: Option<&str>, full_url: Option<&str>) -> Result<String> {
+pub fn resolve_download_url(
+    encrypt_query_param: Option<&str>,
+    full_url: Option<&str>,
+) -> Result<String> {
     if let Some(p) = encrypt_query_param.filter(|s| !s.is_empty()) {
-        Ok(format!("https://{}/c2c/download?encrypted_query_param={p}", CDN_HOSTS[0]))
+        Ok(format!(
+            "https://{}/c2c/download?encrypted_query_param={p}",
+            CDN_HOSTS[0]
+        ))
     } else if let Some(u) = full_url.filter(|s| !s.is_empty()) {
         assert_cdn_host(u)?;
         Ok(u.to_string())
@@ -214,7 +226,10 @@ pub async fn download_media(
     // 有 aes_key 则解密；否则直接返回（兼容明文）。
     match aes_key.and_then(parse_aes_key) {
         Some(k) => aes_decrypt(&ciphertext, &k).ok_or_else(|| {
-            CoreError::Platform("ilink", "cdn download: aes decrypt/padding failed".to_string())
+            CoreError::Platform(
+                "ilink",
+                "cdn download: aes decrypt/padding failed".to_string(),
+            )
         }),
         None => Ok(ciphertext),
     }
@@ -288,7 +303,12 @@ pub async fn upload_cdn(
         .get("x-encrypted-param")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
-        .ok_or_else(|| CoreError::Platform("ilink", "cdn upload: missing x-encrypted-param header".to_string()))
+        .ok_or_else(|| {
+            CoreError::Platform(
+                "ilink",
+                "cdn upload: missing x-encrypted-param header".to_string(),
+            )
+        })
 }
 
 /// 暴露 base url 给媒体模块（仅用于文档化，避免未用警告）。
@@ -362,7 +382,13 @@ mod tests {
         let s = base64::engine::general_purpose::STANDARD.encode(hex_str.as_bytes());
         let k = parse_aes_key(&s).expect("b64-of-hex");
         assert_eq!(k.len(), 16);
-        assert_eq!(k, [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        assert_eq!(
+            k,
+            [
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff
+            ]
+        );
     }
 
     #[test]
@@ -383,19 +409,25 @@ mod tests {
 
     #[test]
     fn ssrf_allows_cdn_host() {
-        assert_cdn_host("https://novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param=x").unwrap();
+        assert_cdn_host("https://novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param=x")
+            .unwrap();
     }
 
     #[test]
     fn resolve_url_prefers_query_param() {
-        let url = resolve_download_url(Some("PARAM"), Some("https://novac2c.cdn.weixin.qq.com/x")).unwrap();
+        let url = resolve_download_url(Some("PARAM"), Some("https://novac2c.cdn.weixin.qq.com/x"))
+            .unwrap();
         assert!(url.contains("encrypted_query_param=PARAM"));
         assert!(url.contains("novac2c.cdn.weixin.qq.com"));
     }
 
     #[test]
     fn resolve_url_falls_back_to_full_url_with_ssrf() {
-        let url = resolve_download_url(None, Some("https://novac2c.cdn.weixin.qq.com/c2c/download?x=1")).unwrap();
+        let url = resolve_download_url(
+            None,
+            Some("https://novac2c.cdn.weixin.qq.com/c2c/download?x=1"),
+        )
+        .unwrap();
         assert_eq!(url, "https://novac2c.cdn.weixin.qq.com/c2c/download?x=1");
         // 非 CDN fallback 被拒。
         assert!(resolve_download_url(None, Some("https://evil.example.com/x")).is_err());

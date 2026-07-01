@@ -227,16 +227,17 @@ impl Dispatcher {
                 return;
             }
         };
-        let conv_id = req.get("conv_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let conv_id = req
+            .get("conv_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let tool_name = req
             .get("tool_name")
             .and_then(|v| v.as_str())
             .unwrap_or("?")
             .to_string();
-        let input_str = req
-            .get("input")
-            .map(|v| v.to_string())
-            .unwrap_or_default();
+        let input_str = req.get("input").map(|v| v.to_string()).unwrap_or_default();
         if conv_id.is_empty() {
             return;
         }
@@ -246,7 +247,10 @@ impl Dispatcher {
             "🔐 Claude 请求执行 {tool_name}：{}\n回复 y 允许，其它拒绝。",
             truncate_str(&input_str, 80)
         );
-        if let Err(e) = platform.send_text(&conv, &prompt_text, &ReplyHint::None).await {
+        if let Err(e) = platform
+            .send_text(&conv, &prompt_text, &ReplyHint::None)
+            .await
+        {
             warn!(target: "imagent::core", conv_id = %conv_id, error = %e, "send permission ask 失败");
         }
         // 注册 pending，等回复（recv 循环 route 到这里）。
@@ -369,7 +373,8 @@ impl Dispatcher {
                     "/disallow" => {
                         let target = parts.get(1).map(|s| s.trim()).unwrap_or("");
                         if target.is_empty() {
-                            self.reply(&conv, "用法: /disallow <sender_id>", &hint).await;
+                            self.reply(&conv, "用法: /disallow <sender_id>", &hint)
+                                .await;
                         } else if target == sender.0.as_str() {
                             // 防自锁：不允许撤销自己。
                             self.reply(
@@ -418,7 +423,8 @@ impl Dispatcher {
                         return;
                     }
                     "/whoami" => {
-                        self.reply(&conv, &format!("你的 sender id：`{}`", sender.0), &hint).await;
+                        self.reply(&conv, &format!("你的 sender id：`{}`", sender.0), &hint)
+                            .await;
                         return;
                     }
                     "/switch" => {
@@ -438,9 +444,9 @@ impl Dispatcher {
                                     agent_kind: row
                                         .agent_kind
                                         .unwrap_or_else(|| self.backend.name().to_string()),
-                                    workdir: row
-                                        .workdir
-                                        .unwrap_or_else(|| self.default_workdir.to_string_lossy().to_string()),
+                                    workdir: row.workdir.unwrap_or_else(|| {
+                                        self.default_workdir.to_string_lossy().to_string()
+                                    }),
                                     name: Some(name.into()),
                                     created_at: row.created_at,
                                     updated_at: now,
@@ -484,12 +490,8 @@ impl Dispatcher {
                     "/sessions" => {
                         match self.store.list_named_sessions(&conv.0).await {
                             Ok(rows) if rows.is_empty() => {
-                                self.reply(
-                                    &conv,
-                                    "无命名会话（用 /switch <name> 创建）。",
-                                    &hint,
-                                )
-                                .await;
+                                self.reply(&conv, "无命名会话（用 /switch <name> 创建）。", &hint)
+                                    .await;
                             }
                             Ok(rows) => {
                                 let active = self
@@ -602,10 +604,8 @@ impl Dispatcher {
                                         "compact: delete_session 失败"
                                     );
                                 }
-                                if let Err(e) = self
-                                    .store
-                                    .delete_config(&active_name_key(&conv.0))
-                                    .await
+                                if let Err(e) =
+                                    self.store.delete_config(&active_name_key(&conv.0)).await
                                 {
                                     warn!(
                                         target: "imagent::core",
@@ -688,7 +688,10 @@ impl Dispatcher {
             if let Ok(Some(summary)) = self.store.get_config(&compact_summary_key(&conv.0)).await {
                 if !summary.is_empty() {
                     prompt = format!("【前情摘要】{summary}\n\n——\n\n{prompt}");
-                    let _ = self.store.delete_config(&compact_summary_key(&conv.0)).await;
+                    let _ = self
+                        .store
+                        .delete_config(&compact_summary_key(&conv.0))
+                        .await;
                 }
             }
         }
@@ -706,7 +709,14 @@ impl Dispatcher {
         let conv_id_owned = conv.0.clone();
         let join = tokio::spawn(async move {
             backend
-                .run(&conv_id_owned, &prompt_owned, existing.as_ref(), &workdir, &tools, tx)
+                .run(
+                    &conv_id_owned,
+                    &prompt_owned,
+                    existing.as_ref(),
+                    &workdir,
+                    &tools,
+                    tx,
+                )
                 .await
         });
         // 收集 chunks：Final/Error 落库，ToolUse 累积用于最终工具摘要。
@@ -720,7 +730,7 @@ impl Dispatcher {
                 AgentChunk::ToolUse { tool, input } => {
                     tool_calls.push((tool, truncate_str(&input, 40)));
                 }
-                AgentChunk::ToolResult { .. } => {}  // 摘要只列工具调用，结果不进 IM
+                AgentChunk::ToolResult { .. } => {} // 摘要只列工具调用，结果不进 IM
                 AgentChunk::Text(_) => {}
             }
         }
@@ -757,9 +767,7 @@ impl Dispatcher {
             format!("(done, session={})", outcome.session_id.0)
         };
         // 工具调用摘要：仅在正常 final 分支附加（不在 backend 错误回复上附加）。
-        if !tool_calls.is_empty()
-            && (final_text_is_present || outcome_has_final)
-        {
+        if !tool_calls.is_empty() && (final_text_is_present || outcome_has_final) {
             reply.push_str(&format_tool_summary(&tool_calls));
         }
         self.reply(&conv, &reply, &hint).await;
@@ -856,8 +864,6 @@ mod tests {
         )));
     }
 
-
-
     type InboxHandle = Arc<TokioMutex<Vec<String>>>;
     type CounterHandle = Arc<AtomicUsize>;
     type CallsHandle = Arc<TokioMutex<Vec<Option<String>>>>;
@@ -904,7 +910,12 @@ mod tests {
             self.send_count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
-        async fn send_media(&self, _conv: &ConvId, _media: &crate::types::MediaRef, _hint: &ReplyHint) -> Result<()> {
+        async fn send_media(
+            &self,
+            _conv: &ConvId,
+            _media: &crate::types::MediaRef,
+            _hint: &ReplyHint,
+        ) -> Result<()> {
             Ok(())
         }
         fn name(&self) -> &'static str {
@@ -968,9 +979,7 @@ mod tests {
             // 先发配置好的 ToolUse chunk（若有），再发 Final。
             let tools = self.tools_to_emit.lock().await.clone();
             for (tool, input) in tools {
-                let _ = chunks
-                    .send(AgentChunk::ToolUse { tool, input })
-                    .await;
+                let _ = chunks.send(AgentChunk::ToolUse { tool, input }).await;
             }
             // 发一个 Final chunk。
             let _ = chunks
@@ -1084,7 +1093,6 @@ mod tests {
         }
     }
 
-
     /// 把消息喂给 dispatcher 的 mock platform recv，并等待处理完成。
     async fn feed_and_wait(ctx: &Ctx, msgs: Vec<InboundMessage>, want_calls: usize) {
         // 通过 downcast 不便，这里改为直接调用 handle（绕过 run/recv）。
@@ -1122,10 +1130,19 @@ mod tests {
 
         // 回传收到（Final 优先）。
         let inbox = ctx.inbox.lock().await.clone();
-        assert!(inbox.iter().any(|t| t.starts_with("reply#")), "inbox={inbox:?}");
+        assert!(
+            inbox.iter().any(|t| t.starts_with("reply#")),
+            "inbox={inbox:?}"
+        );
 
         // session 落库且 id 正确。
-        let row = ctx.check().await.get_session("c1").await.unwrap().expect("session row");
+        let row = ctx
+            .check()
+            .await
+            .get_session("c1")
+            .await
+            .unwrap()
+            .expect("session row");
         assert_eq!(row.session_id, "sess-0");
         assert_eq!(row.agent_kind, "mock-backend");
         drop_db(ctx.db).await;
@@ -1213,7 +1230,9 @@ mod tests {
         assert_eq!(after, before + 1);
         let inbox = ctx.inbox.lock().await.clone();
         assert!(
-            inbox.iter().any(|t| t.contains("未知命令") && t.contains("/foo")),
+            inbox
+                .iter()
+                .any(|t| t.contains("未知命令") && t.contains("/foo")),
             "inbox={inbox:?}"
         );
         // backend 未被调用。
@@ -1254,7 +1273,12 @@ mod tests {
         // alice 发 /allow bob：应回「已授权」。
         feed_and_wait(&ctx, vec![msg("c8", "alice", "/allow bob")], 0).await;
         let inbox = ctx.inbox.lock().await.clone();
-        assert!(inbox.iter().any(|t| t.contains("已授权") && t.contains("bob")), "inbox={inbox:?}");
+        assert!(
+            inbox
+                .iter()
+                .any(|t| t.contains("已授权") && t.contains("bob")),
+            "inbox={inbox:?}"
+        );
 
         // 白名单持久化到 store。
         let stored = ctx.check().await.list_allowed_senders().await.unwrap();
@@ -1273,7 +1297,9 @@ mod tests {
         feed_and_wait(&ctx, vec![msg("c10", "alice", "/list")], 0).await;
         let inbox = ctx.inbox.lock().await.clone();
         assert!(
-            inbox.iter().any(|t| t.contains("alice") && t.contains("carol") && t.contains("白名单")),
+            inbox
+                .iter()
+                .any(|t| t.contains("alice") && t.contains("carol") && t.contains("白名单")),
             "inbox={inbox:?}"
         );
         // backend 未被调用。
@@ -1298,7 +1324,10 @@ mod tests {
         let ctx = build(Auth::new(vec!["alice".into()])).await;
         feed_and_wait(&ctx, vec![msg("c12", "alice", "/disallow alice")], 0).await;
         let inbox = ctx.inbox.lock().await.clone();
-        assert!(inbox.iter().any(|t| t.contains("不允许撤销自己")), "inbox={inbox:?}");
+        assert!(
+            inbox.iter().any(|t| t.contains("不允许撤销自己")),
+            "inbox={inbox:?}"
+        );
         // alice 仍在白名单。
         assert!(ctx.disp.auth.is_allowed(&UserId("alice".into())));
         drop_db(ctx.db).await;
@@ -1310,7 +1339,12 @@ mod tests {
         let ctx = build(Auth::new(vec!["alice".into(), "bob".into()])).await;
         feed_and_wait(&ctx, vec![msg("c13", "alice", "/disallow bob")], 0).await;
         let inbox = ctx.inbox.lock().await.clone();
-        assert!(inbox.iter().any(|t| t.contains("已移除") && t.contains("bob")), "inbox={inbox:?}");
+        assert!(
+            inbox
+                .iter()
+                .any(|t| t.contains("已移除") && t.contains("bob")),
+            "inbox={inbox:?}"
+        );
         // bob 已被移除：后续消息被丢弃，不驱动 backend。
         feed_and_wait(&ctx, vec![msg("c14", "bob", "still here?")], 0).await;
         assert_eq!(ctx.order.load(Ordering::SeqCst), 0, "bob 应已被移出白名单");
@@ -1331,7 +1365,11 @@ mod tests {
             "switch 新命名后活动 session 应清空"
         );
         assert_eq!(
-            ctx.check().await.get_config("active_name:s1").await.unwrap(),
+            ctx.check()
+                .await
+                .get_config("active_name:s1")
+                .await
+                .unwrap(),
             Some("newtask".to_string())
         );
 
@@ -1349,7 +1387,13 @@ mod tests {
             .expect("named row");
         assert_eq!(nrow.name, "newtask");
         // 活动 session 行 name 也带命名。
-        let srow = ctx.check().await.get_session("s1").await.unwrap().expect("session row");
+        let srow = ctx
+            .check()
+            .await
+            .get_session("s1")
+            .await
+            .unwrap()
+            .expect("session row");
         assert_eq!(srow.name.as_deref(), Some("newtask"));
         drop_db(ctx.db).await;
     }
@@ -1376,11 +1420,24 @@ mod tests {
 
         // /switch taskA（命名已存在）→ 活动 session 被写成 taskA 的 session_id。
         feed_and_wait(&ctx, vec![msg("s2", "alice", "/switch taskA")], 2).await;
-        let srow = ctx.check().await.get_session("s2").await.unwrap().expect("session row");
-        assert_eq!(srow.session_id, task_a_sid, "switch 已存在命名应 resume 其 session_id");
+        let srow = ctx
+            .check()
+            .await
+            .get_session("s2")
+            .await
+            .unwrap()
+            .expect("session row");
+        assert_eq!(
+            srow.session_id, task_a_sid,
+            "switch 已存在命名应 resume 其 session_id"
+        );
         assert_eq!(srow.name.as_deref(), Some("taskA"));
         assert_eq!(
-            ctx.check().await.get_config("active_name:s2").await.unwrap(),
+            ctx.check()
+                .await
+                .get_config("active_name:s2")
+                .await
+                .unwrap(),
             Some("taskA".to_string())
         );
 
@@ -1402,7 +1459,12 @@ mod tests {
         // 空时 /sessions。
         feed_and_wait(&ctx, vec![msg("s3", "alice", "/sessions")], 0).await;
         assert!(
-            ctx.inbox.lock().await.last().unwrap().contains("无命名会话"),
+            ctx.inbox
+                .lock()
+                .await
+                .last()
+                .unwrap()
+                .contains("无命名会话"),
             "空命名时应提示无"
         );
 
@@ -1420,7 +1482,10 @@ mod tests {
         assert!(listing.contains("alpha"), "listing={listing}");
         assert!(listing.contains("beta"), "listing={listing}");
         // beta 为活动，应带 `*`；alpha 不应带。
-        assert!(listing.contains("beta *"), "活动命名应带 *，listing={listing}");
+        assert!(
+            listing.contains("beta *"),
+            "活动命名应带 *，listing={listing}"
+        );
         drop_db(ctx.db).await;
     }
 
@@ -1432,21 +1497,36 @@ mod tests {
         feed_and_wait(&ctx, vec![msg("s4", "alice", "/switch build")], 0).await;
         feed_and_wait(&ctx, vec![msg("s4", "alice", "go")], 1).await;
         assert_eq!(
-            ctx.check().await.get_config("active_name:s4").await.unwrap(),
+            ctx.check()
+                .await
+                .get_config("active_name:s4")
+                .await
+                .unwrap(),
             Some("build".to_string())
         );
 
         // /new 清活动 session 与 active_name。
         feed_and_wait(&ctx, vec![msg("s4", "alice", "/new")], 1).await;
         assert!(
-            ctx.check().await.get_config("active_name:s4").await.unwrap().is_none(),
+            ctx.check()
+                .await
+                .get_config("active_name:s4")
+                .await
+                .unwrap()
+                .is_none(),
             "/new 后 active_name 应被清除"
         );
         assert!(ctx.check().await.get_session("s4").await.unwrap().is_none());
 
         // 下一条普通消息：name 应为 None（默认未命名）。
         feed_and_wait(&ctx, vec![msg("s4", "alice", "fresh")], 2).await;
-        let srow = ctx.check().await.get_session("s4").await.unwrap().expect("row");
+        let srow = ctx
+            .check()
+            .await
+            .get_session("s4")
+            .await
+            .unwrap()
+            .expect("row");
         assert!(srow.name.is_none(), "/new 后新 session 应未命名");
         drop_db(ctx.db).await;
     }
@@ -1513,14 +1593,13 @@ mod tests {
             "inbox={inbox:?}"
         );
         // 摘要未落库。
-        assert!(
-            ctx.check()
-                .await
-                .get_config("compact_summary:k2")
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(ctx
+            .check()
+            .await
+            .get_config("compact_summary:k2")
+            .await
+            .unwrap()
+            .is_none());
         drop_db(ctx.db).await;
     }
 
@@ -1587,7 +1666,10 @@ mod tests {
         feed_and_wait(&ctx, vec![msg("k4", "alice", "second")], 2).await;
 
         let prompts = ctx.prompts.lock().await.clone();
-        assert_eq!(prompts[1], "second", "existing 时不应误注入，prompts={prompts:?}");
+        assert_eq!(
+            prompts[1], "second",
+            "existing 时不应误注入，prompts={prompts:?}"
+        );
         // 摘要仍存在（未被消费）。
         assert_eq!(
             ctx.check()
@@ -1612,7 +1694,10 @@ mod tests {
 
         // 回传文本含工具摘要与工具名。
         let inbox = ctx.inbox.lock().await.clone();
-        let reply = inbox.iter().find(|t| t.starts_with("reply#")).expect("应有 final reply");
+        let reply = inbox
+            .iter()
+            .find(|t| t.starts_with("reply#"))
+            .expect("应有 final reply");
         assert!(reply.contains("🔧 工具调用"), "应含工具摘要标题: {reply}");
         assert!(reply.contains("Read("), "应含 Read 工具: {reply}");
         assert!(reply.contains("Edit("), "应含 Edit 工具: {reply}");
@@ -1631,11 +1716,13 @@ mod tests {
         feed_and_wait(&ctx, vec![msg("t2", "alice", "go")], 1).await;
 
         let inbox = ctx.inbox.lock().await.clone();
-        let reply = inbox.iter().find(|t| t.starts_with("reply#")).expect("应有 final reply");
+        let reply = inbox
+            .iter()
+            .find(|t| t.starts_with("reply#"))
+            .expect("应有 final reply");
         assert!(reply.contains("…(+1)"), "6 个工具应标 …(+1): {reply}");
         assert!(reply.contains("Tool0"), "应含首个工具: {reply}");
         assert!(reply.contains("Tool4"), "应含第 5 个工具: {reply}");
         drop_db(ctx.db).await;
     }
-
 }

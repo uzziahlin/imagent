@@ -23,8 +23,8 @@ use imagent_store::Store;
 use crate::client::ILinkClient;
 use crate::dedup::Dedup;
 use crate::proto::{
-    classify_send, extract_media_refs, extract_text, msg_to_inbound, GetConfigResp, Msg, SendMsgResp,
-    SendOutcome, UpdatesResp,
+    classify_send, extract_media_refs, extract_text, msg_to_inbound, GetConfigResp, Msg,
+    SendMsgResp, SendOutcome, UpdatesResp,
 };
 
 const PLATFORM: &str = "ilink";
@@ -136,9 +136,13 @@ impl ILinkPlatform {
                         kind: raw.kind.to_string(),
                         url: path,
                     }),
-                    Err(e) => warn!(target: "ilink", kind = raw.kind, error = %e, "persist media 失败"),
+                    Err(e) => {
+                        warn!(target: "ilink", kind = raw.kind, error = %e, "persist media 失败")
+                    }
                 },
-                Err(e) => warn!(target: "ilink", kind = raw.kind, error = %e, "download media 失败"),
+                Err(e) => {
+                    warn!(target: "ilink", kind = raw.kind, error = %e, "download media 失败")
+                }
             }
         }
         out.push(ib);
@@ -184,10 +188,10 @@ impl ILinkPlatform {
         {
             Ok(resp) if resp.typing_ticket.as_deref().is_some_and(|t| !t.is_empty()) => {
                 let ticket = resp.typing_ticket.unwrap();
-                self.typing_tickets
-                    .lock()
-                    .await
-                    .insert(peer.to_string(), (ticket.clone(), Instant::now() + TYPING_TICKET_TTL));
+                self.typing_tickets.lock().await.insert(
+                    peer.to_string(),
+                    (ticket.clone(), Instant::now() + TYPING_TICKET_TTL),
+                );
                 Some(ticket)
             }
             Ok(_) => {
@@ -220,10 +224,7 @@ impl ILinkPlatform {
 
         // 1. 读本地文件。
         let plaintext = std::fs::read(&media.url).map_err(|e| {
-            CoreError::Platform(
-                "ilink",
-                format!("read media file {:?}: {e}", media.url),
-            )
+            CoreError::Platform("ilink", format!("read media file {:?}: {e}", media.url))
         })?;
         let raw_size = plaintext.len() as u64;
         let raw_md5_hex = format!("{:x}", md5::compute(&plaintext));
@@ -269,13 +270,9 @@ impl ILinkPlatform {
             })?;
 
         // 4. CDN POST 上传，响应头 x-encrypted-param = sendmessage 的 encrypt_query_param。
-        let encrypt_query_param = crate::media::upload_cdn(
-            self.client.http(),
-            upload_param,
-            &filekey,
-            &ciphertext,
-        )
-        .await?;
+        let encrypt_query_param =
+            crate::media::upload_cdn(self.client.http(), upload_param, &filekey, &ciphertext)
+                .await?;
 
         // 5. sendmessage 媒体 item。
         let client_id = format!("imagent-{}", uuid::Uuid::new_v4());
@@ -546,12 +543,7 @@ impl Platform for ILinkPlatform {
         }
     }
 
-    async fn send_media(
-        &self,
-        conv: &ConvId,
-        media: &MediaRef,
-        hint: &ReplyHint,
-    ) -> Result<()> {
+    async fn send_media(&self, conv: &ConvId, media: &MediaRef, hint: &ReplyHint) -> Result<()> {
         self.send_media_inner(conv, media, hint).await
     }
 
@@ -570,10 +562,7 @@ impl Platform for ILinkPlatform {
             "status": 1u32, // start
         });
         // sendtyping body 无 msg 包装（与 sendmessage 不同，照 hermes）。
-        let _: serde_json::Value = match self
-            .client
-            .post_json("/ilink/bot/sendtyping", &body)
-            .await
+        let _: serde_json::Value = match self.client.post_json("/ilink/bot/sendtyping", &body).await
         {
             Ok(v) => v,
             Err(e) => {
@@ -592,9 +581,7 @@ impl Platform for ILinkPlatform {
 
 /// 判定错误信息是否指示 session 失效（HTTP 401/403 或文本 SESSION_EXPIRED）。
 fn is_session_expired(msg: &str) -> bool {
-    msg.contains("SESSION_EXPIRED")
-        || msg.contains("HTTP 401")
-        || msg.contains("HTTP 403")
+    msg.contains("SESSION_EXPIRED") || msg.contains("HTTP 401") || msg.contains("HTTP 403")
 }
 
 /// 媒体目录：`~/.imagent/media/`（0700）。
@@ -653,10 +640,7 @@ mod tests {
 
     #[test]
     fn peer_strips_prefix() {
-        assert_eq!(
-            ILinkPlatform::peer_of(&ConvId("ilink:abc".into())),
-            "abc"
-        );
+        assert_eq!(ILinkPlatform::peer_of(&ConvId("ilink:abc".into())), "abc");
         assert_eq!(ILinkPlatform::peer_of(&ConvId("naked".into())), "naked");
     }
 
@@ -682,7 +666,9 @@ mod tests {
             msg_type: Some(1),
             item_list: vec![Item {
                 item_type: 1,
-                text_item: Some(TextItem { text: Some("c".into()) }),
+                text_item: Some(TextItem {
+                    text: Some("c".into()),
+                }),
                 ..Default::default()
             }],
         };

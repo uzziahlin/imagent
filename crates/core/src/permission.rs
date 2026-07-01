@@ -16,7 +16,6 @@ pub fn default_sock_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".imagent").join("permission.sock"))
 }
 
-
 /// 用户的 approve/deny 回复。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionReply {
@@ -106,7 +105,9 @@ mod tests {
 
     #[test]
     fn parse_reply_allow_variants() {
-        for s in ["y", "Y", "yes", "YES", "Yes", "ok", "OK", "是", "允许", "好", "好的"] {
+        for s in [
+            "y", "Y", "yes", "YES", "Yes", "ok", "OK", "是", "允许", "好", "好的",
+        ] {
             let r = parse_reply(s);
             assert!(r.allow, "should allow: {s:?}");
             assert!(r.message.is_none(), "no message when allow: {s:?}");

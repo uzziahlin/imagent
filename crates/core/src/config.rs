@@ -42,22 +42,22 @@ impl PermissionMode {
     }
 }
 
- #[derive(Debug, Clone, serde::Deserialize)]
- pub struct Config {
-     /// agent 工作根目录（安全边界）。必填，缺失或非绝对路径 => Config 错误。
-     pub default_workdir: PathBuf,
-     #[serde(default)]
-     pub allowed_senders: Vec<String>,
-     #[serde(default = "default_tools")]
-     pub allowed_tools: Vec<String>,
-     #[serde(default = "default_agent")]
-     pub agent: String,
-     #[serde(default = "default_platform")]
-     pub platform: String,
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Config {
+    /// agent 工作根目录（安全边界）。必填，缺失或非绝对路径 => Config 错误。
+    pub default_workdir: PathBuf,
+    #[serde(default)]
+    pub allowed_senders: Vec<String>,
+    #[serde(default = "default_tools")]
+    pub allowed_tools: Vec<String>,
+    #[serde(default = "default_agent")]
+    pub agent: String,
+    #[serde(default = "default_platform")]
+    pub platform: String,
     /// IM 权限审批模式（默认 Off，向后兼容 P1 行为）。
     #[serde(default)]
     pub permission_mode: PermissionMode,
- }
+}
 
 fn default_tools() -> Vec<String> {
     vec!["Read".into(), "Edit".into()]
@@ -115,8 +115,7 @@ mod tests {
             std::process::id(),
             name
         ));
-        let _ = std::fs::File::create(&p)
-            .and_then(|mut f| f.write_all(body.as_bytes()));
+        let _ = std::fs::File::create(&p).and_then(|mut f| f.write_all(body.as_bytes()));
         p
     }
 
@@ -176,7 +175,10 @@ platform = "ilink"
         let p = tmp_path("def", r#"default_workdir = "/tmp/ws""#);
         let cfg = Config::load(&p).expect("ok");
         assert!(cfg.allowed_senders.is_empty());
-        assert_eq!(cfg.allowed_tools, vec!["Read".to_string(), "Edit".to_string()]);
+        assert_eq!(
+            cfg.allowed_tools,
+            vec!["Read".to_string(), "Edit".to_string()]
+        );
         assert_eq!(cfg.agent, "claude-cli");
         assert_eq!(cfg.platform, "ilink");
         cleanup(&p);

@@ -80,7 +80,9 @@ async fn main() -> Result<()> {
             let creds = imagent_ilink::login_flow(&store).await?;
             println!(
                 "登录成功：bot_id={}，user_id={}（凭据已落盘 {}）",
-                creds.ilink_bot_id, creds.ilink_user_id, db_path.display()
+                creds.ilink_bot_id,
+                creds.ilink_user_id,
+                db_path.display()
             );
             println!(
                 "提示：下次 `start` 前建议先用发现模式（config.toml 留空 allowed_senders）跑，\n\
@@ -187,16 +189,27 @@ async fn main() -> Result<()> {
                 Some((account_id, blob)) => {
                     let creds: imagent_ilink::Credentials = serde_json::from_str(&blob)
                         .map_err(|e| anyhow!("凭据解析失败（{account_id}）：{e}"))?;
-                    println!("已登录：bot_id={}（account_id={}）", creds.ilink_bot_id, account_id);
+                    println!(
+                        "已登录：bot_id={}（account_id={}）",
+                        creds.ilink_bot_id, account_id
+                    );
                 }
                 None => {
                     println!("未登录（无 iLink 凭据），请先 `imagent login`。");
                 }
             }
             let config_path = imagent_core::Config::default_path();
-            println!("配置路径：{}", config_path.map(|p| p.display().to_string()).unwrap_or_else(|| "<无法定位 home>".into()));
+            println!(
+                "配置路径：{}",
+                config_path
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<无法定位 home>".into())
+            );
         }
-        Cmd::Allow { platform: _, sender } => {
+        Cmd::Allow {
+            platform: _,
+            sender,
+        } => {
             // 本地操作者（最高权限）：直接写入白名单 + 审计。空白名单时的唯一 bootstrap。
             let store = imagent_store::Store::open(&db_path).await?;
             store
@@ -206,12 +219,20 @@ async fn main() -> Result<()> {
                 .append_audit("allow", Some("cli"), Some(&sender), Some("cli-bootstrap"))
                 .await?;
             let all = store.list_allowed_senders().await.unwrap_or_default();
-            println!("已授权 `{sender}`。当前白名单（{}）：{}", all.len(), all.join(", "));
+            println!(
+                "已授权 `{sender}`。当前白名单（{}）：{}",
+                all.len(),
+                all.join(", ")
+            );
         }
         Cmd::Stop => {
             println!("imagent P1 为前台运行模式，请在运行 `start` 的终端按 Ctrl-C 停止。");
         }
-        Cmd::Mcp { conv_id, sock, mode } => {
+        Cmd::Mcp {
+            conv_id,
+            sock,
+            mode,
+        } => {
             // 作为 claude 的 MCP 权限审批 server（stdio JSON-RPC）。
             let mode = imagent_core::PermissionMode::from_str_lossy(&mode);
             tracing::info!(
