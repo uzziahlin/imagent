@@ -12,4 +12,4 @@ mod schema;
 mod store;
 
 pub use error::{Result, StoreError};
-pub use store::{SessionRow, Store};
+pub use store::{AllowedSenderRow, AuditRow, NamedSessionRow, SessionRow, Store};

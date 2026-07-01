@@ -30,8 +30,28 @@ enum Cmd {
     },
     /// 查看登录状态与配置路径。
     Status,
+    /// 授权一个 sender（写入白名单，本地最高权限）。空白名单时的 bootstrap 途径。
+    Allow {
+        #[arg(long, default_value = "ilink")]
+        platform: String,
+        /// 要授权的 from_user_id（如 wx_xxx@im.wechat）。
+        sender: String,
+    },
     /// 停止（P1 前台运行，仅提示）。
     Stop,
+    /// 内部子命令：作为 claude 的 MCP 权限审批 server（stdio JSON-RPC）。
+    /// 由 claude 经 --mcp-config spawn，不直接手动调用。
+    Mcp {
+        /// 当前会话标识（路由权限回复用）。
+        #[arg(long)]
+        conv_id: String,
+        /// 主进程权限路由 socket 路径。
+        #[arg(long)]
+        sock: String,
+        /// 权限模式 off | allow | deny | ask。
+        #[arg(long, default_value = "off")]
+        mode: String,
+    },
 }
 
 #[tokio::main]
@@ -109,11 +129,21 @@ async fn main() -> Result<()> {
                 account_id,
             ));
 
-            // 6. backend
-            let backend = Arc::new(imagent_claude::ClaudeBackend::new());
+            // 6. backend（注入权限审批模式）
+            let backend = Arc::new(imagent_claude::ClaudeBackend::with_permission_mode(
+                config.permission_mode,
+            ));
 
-            // 7. auth
-            let auth = imagent_core::Auth::new(config.allowed_senders.clone());
+            // 7. auth —— 白名单：config 种子 ∪ store 已有（CLI /allow 或 IM /allow 持久化）。
+            let mut initial: Vec<String> = config.allowed_senders.clone();
+            let stored = store.list_allowed_senders().await.unwrap_or_default();
+            for s in stored {
+                if !initial.contains(&s) {
+                    initial.push(s);
+                }
+            }
+            let auth = imagent_core::Auth::new(initial);
+            let discovery = auth.is_discovery();
 
             // 8. dispatcher
             let dispatcher = Arc::new(imagent_core::Dispatcher::new(
@@ -123,6 +153,7 @@ async fn main() -> Result<()> {
                 auth,
                 config.default_workdir.clone(),
                 config.allowed_tools.clone(),
+                config.permission_mode,
             ));
 
             // 9. 前台运行 + Ctrl-C
@@ -130,14 +161,21 @@ async fn main() -> Result<()> {
                 "imagent started (platform=ilink, workdir={}, tools={:?}, discovery={})",
                 config.default_workdir.display(),
                 config.allowed_tools,
-                config.allowed_senders.is_empty()
+                discovery
             );
             tokio::select! {
-                res = dispatcher.clone().run() => {
-                    if let Err(e) = res {
-                        tracing::error!("dispatcher exited: {e}");
+                res = dispatcher.clone().run() => match res {
+                    Ok(()) => tracing::info!("dispatcher 正常退出"),
+                    Err(e) => {
+                        if e.to_string().to_lowercase().contains("session expired") {
+                            tracing::error!("dispatcher 退出：{e}");
+                            println!("iLink session 已过期，请重新运行 `imagent login` 扫码登录。");
+                        } else {
+                            tracing::error!("dispatcher 异常退出：{e}");
+                            println!("imagent 异常退出：{e}");
+                        }
                     }
-                }
+                },
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("received Ctrl-C, shutting down");
                 }
@@ -158,8 +196,32 @@ async fn main() -> Result<()> {
             let config_path = imagent_core::Config::default_path();
             println!("配置路径：{}", config_path.map(|p| p.display().to_string()).unwrap_or_else(|| "<无法定位 home>".into()));
         }
+        Cmd::Allow { platform: _, sender } => {
+            // 本地操作者（最高权限）：直接写入白名单 + 审计。空白名单时的唯一 bootstrap。
+            let store = imagent_store::Store::open(&db_path).await?;
+            store
+                .add_allowed_sender(&sender, Some("cli"), Some("manual"))
+                .await?;
+            store
+                .append_audit("allow", Some("cli"), Some(&sender), Some("cli-bootstrap"))
+                .await?;
+            let all = store.list_allowed_senders().await.unwrap_or_default();
+            println!("已授权 `{sender}`。当前白名单（{}）：{}", all.len(), all.join(", "));
+        }
         Cmd::Stop => {
             println!("imagent P1 为前台运行模式，请在运行 `start` 的终端按 Ctrl-C 停止。");
+        }
+        Cmd::Mcp { conv_id, sock, mode } => {
+            // 作为 claude 的 MCP 权限审批 server（stdio JSON-RPC）。
+            let mode = imagent_core::PermissionMode::from_str_lossy(&mode);
+            tracing::info!(
+                target: "imagent::mcp",
+                conv_id = %conv_id, sock = %sock, mode = mode.as_str(),
+                "MCP permission server starting"
+            );
+            if let Err(e) = imagent_core::mcp::run_mcp_server(conv_id, sock, mode).await {
+                tracing::error!(target: "imagent::mcp", error = %e, "MCP server 退出");
+            }
         }
     }
 

@@ -17,6 +17,8 @@ use crate::types::{AgentChunk, RunOutcome, SessionId};
 pub trait Backend: Send + Sync {
     /// 执行一次 agent 调用。
     ///
+    /// - `conv_id`：当前会话标识（backend 用它给 MCP server 子进程标注当前 conv，
+    ///   以便权限审批路由回正确的 IM 会话）；
     /// - `prompt`：用户文本；
     /// - `session`：`None` 新建，`Some(id)` 续接已存在会话；
     /// - `workdir`：agent 工作根目录（安全边界）；
@@ -24,6 +26,7 @@ pub trait Backend: Send + Sync {
     /// - `chunks`：流式分块通道，core 消费。
     async fn run(
         &self,
+        conv_id: &str,
         prompt: &str,
         session: Option<&SessionId>,
         workdir: &Path,
