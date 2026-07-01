@@ -1,0 +1,10 @@
+[book]
+title = "imagent 文档"
+src = "docs"
+language = "zh"
+description = "Instant messaging, meet your agent. — IM ↔ agent 网关"
+authors = ["Uzziah Lin"]
+
+[output.html]
+git-repository-url = "https://github.com/UzziahLin/imagent"
+edit-url-template = "https://github.com/UzziahLin/imagent/edit/main/{path}"
