@@ -8,3 +8,11 @@
 *.swp
 .vscode/
 .idea/
+
+# SQLite（imagent 运行时本地库，勿入仓库）
+*.db
+*.db-shm
+*.db-wal
+
+# 运行日志
+*.log
