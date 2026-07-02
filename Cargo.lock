@@ -1118,6 +1118,7 @@ dependencies = [
  "imagent-claude",
  "imagent-codex",
  "imagent-core",
+ "imagent-gemini",
  "imagent-ilink",
  "imagent-store",
  "parking_lot",
@@ -1170,6 +1171,18 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "toml",
+ "tracing",
+]
+
+[[package]]
+name = "imagent-gemini"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "imagent-core",
+ "serde_json",
+ "tokio",
  "tracing",
 ]
 

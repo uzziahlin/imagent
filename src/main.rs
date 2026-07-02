@@ -292,6 +292,7 @@ async fn main() -> Result<()> {
 /// 按 `config.agent` 选择 Backend。
 ///
 /// - `"codex"` → [`imagent_codex::CodexBackend`]；
+/// - `"gemini"` → [`imagent_gemini::GeminiBackend`]；
 /// - 其它（含默认 `"claude-cli"`）→ [`imagent_claude::ClaudeBackend`]，
 ///   行为与单后端时期完全一致（permission_mode 共享句柄，SIGHUP 即时生效）。
 fn build_backend(
@@ -300,6 +301,7 @@ fn build_backend(
 ) -> Arc<dyn imagent_core::Backend> {
     match agent {
         "codex" => Arc::new(imagent_codex::CodexBackend::new()),
+        "gemini" => Arc::new(imagent_gemini::GeminiBackend::new()),
         _ => Arc::new(imagent_claude::ClaudeBackend::with_permission_mode_shared(
             perm_mode,
         )),
