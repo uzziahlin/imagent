@@ -31,21 +31,12 @@ pub struct Metrics {
 impl Metrics {
     fn new() -> Self {
         Self {
-            messages_in: register_int_counter!(
-                "imagent_messages_in_total",
-                "入站消息数"
-            )
-            .expect("register messages_in"),
-            messages_out: register_int_counter!(
-                "imagent_messages_out_total",
-                "成功回传消息数"
-            )
-            .expect("register messages_out"),
-            claude_calls: register_int_counter!(
-                "imagent_claude_calls_total",
-                "backend.run 调用数"
-            )
-            .expect("register claude_calls"),
+            messages_in: register_int_counter!("imagent_messages_in_total", "入站消息数")
+                .expect("register messages_in"),
+            messages_out: register_int_counter!("imagent_messages_out_total", "成功回传消息数")
+                .expect("register messages_out"),
+            claude_calls: register_int_counter!("imagent_claude_calls_total", "backend.run 调用数")
+                .expect("register claude_calls"),
             claude_errors: register_int_counter!(
                 "imagent_claude_errors_total",
                 "backend.run 失败数"

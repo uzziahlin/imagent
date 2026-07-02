@@ -53,9 +53,15 @@ fn run_with_timeout<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -
 /// 尝试把真实 blob 写入 keyring。成功返回 `true`；失败 / 超时 / 无 backend 返回
 /// `false`，调用方应 fallback 明文。
 pub(crate) async fn store_in_keyring(platform: &str, account_id: &str, blob: &str) -> bool {
-    if cfg!(test) { return false; }
+    if cfg!(test) {
+        return false;
+    }
     let key = format!("{platform}:{account_id}");
-    let (p, a, b) = (platform.to_string(), account_id.to_string(), blob.to_string());
+    let (p, a, b) = (
+        platform.to_string(),
+        account_id.to_string(),
+        blob.to_string(),
+    );
     // Ok(true)=成功；Ok(false)=失败（有错误信息）；None=超时。
     let res = run_with_timeout(move || -> bool {
         let Some(e) = entry(&p, &a) else {
@@ -87,7 +93,9 @@ pub(crate) async fn store_in_keyring(platform: &str, account_id: &str, blob: &st
 /// - `Some(s)`：命中；
 /// - `None`：keyring 中无此条目（`NoEntry`）、超时、或 keychain 不可用。
 pub(crate) async fn load_from_keyring(platform: &str, account_id: &str) -> Option<String> {
-    if cfg!(test) { return None; }
+    if cfg!(test) {
+        return None;
+    }
     let key = format!("{platform}:{account_id}");
     let (p, a) = (platform.to_string(), account_id.to_string());
     // 三态：Some(Ok(s))=命中；Some(Err(NoEntry))=无此条目（静默）；Some(Err(other))=失败；None=超时。
