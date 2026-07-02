@@ -69,6 +69,12 @@ pub struct Config {
     /// 分片之间发送间隔（毫秒），避免多条叠加触发 IM 限流。默认 400。
     #[serde(default = "default_fragment_interval_ms")]
     pub message_fragment_interval_ms: u64,
+    /// WeCom 智能机器人凭据（可选；仅 `platform = "wecom"` 时使用）。
+    #[serde(default)]
+    pub wecom_bot_id: Option<String>,
+    /// WeCom 智能机器人 secret（可选）。
+    #[serde(default)]
+    pub wecom_secret: Option<String>,
 }
 
 fn default_tools() -> Vec<String> {
@@ -116,7 +122,7 @@ default_workdir = "/absolute/path/to/agent/workspace"   # 必填，agent 只能�
 allowed_senders = []        # 留空 = 发现模式（只打日志记录入站 sender，不驱动 agent）
 allowed_tools = ["Read", "Edit"]
 agent = "claude-cli"         # claude-cli(默认) | codex | gemini
-platform = "ilink"
+platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人,配 wecom_bot_id/wecom_secret)
 permission_mode = "off"     # off(默认,claude按allowedTools自行处理) | allow | deny | ask(IM审批闭环)
 # metrics_addr = "127.0.0.1:9100"   # 空串 "" = 关闭 /metrics + /health HTTP server
 # message_max_len = 2000              # 单条出站消息字符上限（Unicode char）；不设 = 不分片
