@@ -19,3 +19,4 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 dirs = { workspace = true }
 parking_lot = { workspace = true }
+prometheus = { workspace = true }

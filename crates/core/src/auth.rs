@@ -46,6 +46,13 @@ impl Auth {
         self.allowed.write().remove(sender)
     }
 
+    /// 用新白名单整体替换（SIGHUP 热重载用）。清空后整体写入新集合。
+    pub fn reload(&self, new_senders: Vec<String>) {
+        let mut g = self.allowed.write();
+        g.clear();
+        g.extend(new_senders);
+    }
+
     /// 当前白名单快照（按 id 升序）。
     pub fn snapshot(&self) -> Vec<String> {
         let s = self.allowed.read();
@@ -98,6 +105,21 @@ mod tests {
         // Clone 后共享（Arc）：a 的改动对 b 可见。
         assert!(b.is_allowed(&UserId("x".into())));
         assert!(!b.is_discovery());
+    }
+
+    #[test]
+    fn reload_replaces_whitelist() {
+        let a = Auth::new(vec!["alice".into(), "bob".into()]);
+        // clone 共享底层，模拟 dispatcher 持有的句柄。
+        let observer = a.clone();
+        a.reload(vec!["carol".into()]);
+        // 旧的已不在，新的生效。
+        assert!(!observer.is_allowed(&UserId("alice".into())));
+        assert!(!observer.is_allowed(&UserId("bob".into())));
+        assert!(observer.is_allowed(&UserId("carol".into())));
+        // reload 到空 = 回到发现模式。
+        a.reload(vec![]);
+        assert!(observer.is_discovery());
     }
 
     #[test]

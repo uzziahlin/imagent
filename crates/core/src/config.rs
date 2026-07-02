@@ -57,6 +57,11 @@ pub struct Config {
     /// IM 权限审批模式（默认 Off，向后兼容 P1 行为）。
     #[serde(default)]
     pub permission_mode: PermissionMode,
+    /// Prometheus 指标 / 健康检查 HTTP 监听地址（`"127.0.0.1:9100"`）。
+    /// 空串 `""` 或省略默认值外的显式空 = 关闭 HTTP server。
+    /// 默认 127.0.0.1:9100。
+    #[serde(default = "default_metrics_addr")]
+    pub metrics_addr: Option<String>,
 }
 
 fn default_tools() -> Vec<String> {
@@ -67,6 +72,9 @@ fn default_agent() -> String {
 }
 fn default_platform() -> String {
     "ilink".into()
+}
+fn default_metrics_addr() -> Option<String> {
+    Some("127.0.0.1:9100".into())
 }
 
 impl Config {
@@ -100,9 +108,9 @@ allowed_tools = ["Read", "Edit"]
 agent = "claude-cli"
 platform = "ilink"
 permission_mode = "off"     # off(默认,claude按allowedTools自行处理) | allow | deny | ask(IM审批闭环)
+# metrics_addr = "127.0.0.1:9100"   # 空串 "" = 关闭 /metrics + /health HTTP server
 "#;
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,4 +207,40 @@ platform = "ilink"
         let err = Config::load(&nope).unwrap_err();
         assert!(matches!(err, CoreError::Io(_)), "{err:?}");
     }
+
+    #[test]
+    fn metrics_addr_defaults_to_loopback_9100() {
+        let p = tmp_path("metrics_def", r#"default_workdir = "/tmp/ws""#);
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(cfg.metrics_addr.as_deref(), Some("127.0.0.1:9100"));
+        cleanup(&p);
+    }
+
+    #[test]
+    fn metrics_addr_empty_disables() {
+        let p = tmp_path(
+            "metrics_empty",
+            r#"default_workdir = "/tmp/ws"
+metrics_addr = ""
+"#,
+        );
+        let cfg = Config::load(&p).expect("parse");
+        // 解析得到空串；main 侧把 None / 空串都视为关闭。
+        assert_eq!(cfg.metrics_addr.as_deref(), Some(""));
+        cleanup(&p);
+    }
+
+    #[test]
+    fn metrics_addr_custom() {
+        let p = tmp_path(
+            "metrics_custom",
+            r#"default_workdir = "/tmp/ws"
+metrics_addr = "0.0.0.0:9999"
+"#,
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(cfg.metrics_addr.as_deref(), Some("0.0.0.0:9999"));
+        cleanup(&p);
+    }
 }
+

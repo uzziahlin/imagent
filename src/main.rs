@@ -3,10 +3,17 @@
 //! 职责：加载配置 → 扫码登录 → 前台常驻收私聊 → 鉴权 → 驱动 `claude -p` → 回传。
 //! 鉴权 / allowedTools 收敛 / 风控逻辑全部在 core（`Dispatcher`）中，main 只做组装。
 
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{anyhow, Result};
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::{routing::get, Json, Router};
 use clap::{Parser, Subcommand};
+use serde::Serialize;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -106,7 +113,7 @@ async fn main() -> Result<()> {
                 }
             };
 
-            // 2. store
+            // 2. store（多份：dispatcher / HTTP /health / SIGHUP 各持一份 Clone）
             let store = imagent_store::Store::open(&db_path).await?;
 
             // 3. 凭据
@@ -131,10 +138,11 @@ async fn main() -> Result<()> {
                 account_id,
             ));
 
-            // 6. backend（注入权限审批模式）
-            let backend = Arc::new(imagent_claude::ClaudeBackend::with_permission_mode(
-                config.permission_mode,
-            ));
+            // 6. backend —— permission_mode 用共享句柄，SIGHUP 热重载即时生效。
+            let perm_mode = std::sync::Arc::new(parking_lot::RwLock::new(config.permission_mode));
+            let backend = Arc::new(
+                imagent_claude::ClaudeBackend::with_permission_mode_shared(perm_mode.clone()),
+            );
 
             // 7. auth —— 白名单：config 种子 ∪ store 已有（CLI /allow 或 IM /allow 持久化）。
             let mut initial: Vec<String> = config.allowed_senders.clone();
@@ -147,18 +155,51 @@ async fn main() -> Result<()> {
             let auth = imagent_core::Auth::new(initial);
             let discovery = auth.is_discovery();
 
-            // 8. dispatcher
-            let dispatcher = Arc::new(imagent_core::Dispatcher::new(
+            // 8. dispatcher —— allowed_tools / permission_mode 均以共享句柄注入。
+            let tools_handle = std::sync::Arc::new(parking_lot::RwLock::new(
+                config.allowed_tools.clone(),
+            ));
+            let dispatcher = Arc::new(imagent_core::Dispatcher::new_with_handles(
                 platform,
                 backend,
-                store,
+                store.clone(),
                 auth,
                 config.default_workdir.clone(),
-                config.allowed_tools.clone(),
-                config.permission_mode,
+                tools_handle,
+                perm_mode.clone(),
             ));
 
-            // 9. 前台运行 + Ctrl-C
+            // 9. 运维 HTTP server（/metrics + /health）。metrics_addr 为 None 或空串则关闭。
+            let start_at = std::time::Instant::now();
+            let metrics_addr = config
+                .metrics_addr
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let http_store = store.clone();
+            match metrics_addr {
+                Some(addr) => match addr.parse::<SocketAddr>() {
+                    Ok(socket) => {
+                        spawn_metrics_server(socket, http_store.clone(), start_at);
+                        tracing::info!(target: "imagent::ops", addr = %socket, "metrics/health HTTP server listening");
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "imagent::ops", addr = addr, error = %e, "metrics_addr 解析失败，HTTP server 未启动");
+                    }
+                },
+                None => {
+                    tracing::info!(target: "imagent::ops", "metrics_addr 为空，HTTP server 关闭");
+                }
+            }
+
+            // 10. SIGHUP 热重载（白名单 / allowed_tools / permission_mode）。
+            spawn_sighup_handler(
+                dispatcher.clone(),
+                config_path.clone(),
+                http_store.clone(),
+            );
+
+            // 11. 前台运行 + Ctrl-C
             tracing::info!(
                 "imagent started (platform=ilink, workdir={}, tools={:?}, discovery={})",
                 config.default_workdir.display(),
@@ -247,4 +288,102 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 运维：Prometheus 指标 / 健康检查 HTTP server + SIGHUP 热重载
+// ---------------------------------------------------------------------------
+
+/// `/health` 返回的 JSON 载荷。
+#[derive(Serialize)]
+struct Health {
+    logged_in: bool,
+    uptime_secs: u64,
+    version: &'static str,
+    sessions: i64,
+}
+
+/// 共享给 axum handler 的状态。
+#[derive(Clone)]
+struct HttpState {
+    store: imagent_store::Store,
+    start_at: Instant,
+}
+
+/// 起 HTTP server（/metrics + /health），独立 tokio task。失败仅 warn。
+fn spawn_metrics_server(addr: SocketAddr, store: imagent_store::Store, start_at: Instant) {
+    let state = HttpState { store, start_at };
+    let app = Router::new()
+        .route("/metrics", get(metrics_handler))
+        .route("/health", get(health_handler))
+        .with_state(state);
+    tokio::spawn(async move {
+        let listener = match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(target: "imagent::ops", addr = %addr, error = %e, "bind metrics addr 失败");
+                return;
+            }
+        };
+        if let Err(e) = axum::serve(listener, app).await {
+            tracing::warn!(target: "imagent::ops", addr = %addr, error = %e, "metrics HTTP server 退出");
+        }
+    });
+}
+
+async fn metrics_handler() -> (StatusCode, String) {
+    (StatusCode::OK, imagent_core::metrics::render())
+}
+
+async fn health_handler(State(st): State<HttpState>) -> (StatusCode, Json<Health>) {
+    let sessions = st.store.count_sessions().await.unwrap_or(-1);
+    let body = Health {
+        logged_in: true,
+        uptime_secs: st.start_at.elapsed().as_secs(),
+        version: env!("CARGO_PKG_VERSION"),
+        sessions,
+    };
+    (StatusCode::OK, Json(body))
+}
+
+/// SIGHUP 热重载：重读 config.toml，刷新白名单 / allowed_tools / permission_mode。
+/// 解析失败只 warn 不崩，保留既有运行时配置。
+fn spawn_sighup_handler(
+    dispatcher: Arc<imagent_core::Dispatcher>,
+    config_path: PathBuf,
+    store: imagent_store::Store,
+) {
+    tokio::spawn(async move {
+        // tokio signal::unix；不可用时回退为静默（不崩主进程）。
+        let mut sig = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(target: "imagent::ops", error = %e, "无法注册 SIGHUP 处理器，热重载不可用");
+                return;
+            }
+        };
+        loop {
+            sig.recv().await;
+            tracing::info!(target: "imagent::ops", "received SIGHUP, reloading config");
+            match imagent_core::Config::load(&config_path) {
+                Ok(cfg) => {
+                    // 白名单：config 种子 ∪ store 已有，整体替换。
+                    let mut senders: Vec<String> = cfg.allowed_senders.clone();
+                    let stored = store.list_allowed_senders().await.unwrap_or_default();
+                    for s in stored {
+                        if !senders.contains(&s) {
+                            senders.push(s);
+                        }
+                    }
+                    dispatcher.auth().reload(senders);
+                    dispatcher.reload_tools(cfg.allowed_tools.clone());
+                    dispatcher.reload_permission_mode(cfg.permission_mode);
+                    tracing::info!(target: "imagent::ops", "config reloaded (SIGHUP)");
+                }
+                Err(e) => {
+                    tracing::warn!(target: "imagent::ops", error = %e, "SIGHUP 重载配置失败，保留既有运行时配置");
+                }
+            }
+        }
+    });
 }
