@@ -2,10 +2,24 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
-## [Unreleased] — P3（开源化进行中）
+## [1.0.0] — 2026-07-02 — P3 全部完成
 
-### Added（计划）
-- LICENSE（MIT）/ README 打磨 / CI / SECURITY / 凭据加密落盘
+首个稳定发布。P3（开源化 + 多平台 + 多后端 + 运维）全部交付。
+
+### Added
+- **平台（Platform）**：iLink（个人微信私聊）+ **WeCom**（企业微信智能机器人 WebSocket 长连接）双 Platform adapter。
+- **后端（Backend）**：Claude（CLI `claude -p` + **ACP** 长驻子进程，agent-client-protocol SDK）+ **Codex**（`codex exec --json`）+ **Gemini**（`gemini -p -o stream-json`）多 Backend。
+- **运维**：Prometheus 指标 + `/health` + `/metrics` + `SIGHUP` 热重载 + daemon 部署（systemd/launchd 单元）。
+- **消息**：iLink `send_text` 超长自动分片（`split_message` 纯函数，不切断 UTF-8）。
+- **安全**：发送者白名单、workdir 锁定、**凭据加密落盘**（OS keyring）、IM 权限审批闭环（claude CLI `--permission-prompt-tool`）。
+- **会话**：SQLite 持久化、`/new` `/switch` `/sessions` `/compact`、重启续接（`--resume`）。
+- **工程**：MIT/Apache-2.0 双 license、CI（test/fmt/clippy/coverage/release）、mdBook 文档站。
+
+### Changed
+- workspace 测试 214 passed（2 ignored）；clippy 0 warning。
+- 版本 0.1.0 → 1.0.0（workspace.package 一处生效，全 crate 跟随）。
+
+## [Unreleased]
 
 ## [0.2.0] — 2026-06-30 — P2
 
