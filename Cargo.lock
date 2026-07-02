@@ -1116,6 +1116,7 @@ dependencies = [
  "clap",
  "dirs",
  "imagent-claude",
+ "imagent-codex",
  "imagent-core",
  "imagent-ilink",
  "imagent-store",
@@ -1136,6 +1137,18 @@ dependencies = [
  "dirs",
  "imagent-core",
  "parking_lot",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "imagent-codex"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "imagent-core",
  "serde_json",
  "tokio",
  "tracing",

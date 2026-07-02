@@ -14,7 +14,7 @@ resolver = "2"
 #     "crates/claude", # Claude Code Backend（CLI claude -p 优先 / ACP 留 P2）
 #     "crates/store",  # 持久化：凭据 + 会话映射 + 配置（SQLite）
 # ]
-members = ["crates/store", "crates/core", "crates/claude", "crates/ilink"]
+members = ["crates/store", "crates/core", "crates/claude", "crates/codex", "crates/ilink"]
 
 [workspace.package]
 version = "0.1.0"
@@ -74,6 +74,7 @@ publish.workspace = true
 imagent-core = { path = "crates/core" }
 imagent-ilink = { path = "crates/ilink" }
 imagent-claude = { path = "crates/claude" }
+imagent-codex = { path = "crates/codex" }
 imagent-store = { path = "crates/store" }
 tokio = { workspace = true }
 clap = { workspace = true }

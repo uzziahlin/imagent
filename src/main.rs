@@ -142,9 +142,7 @@ async fn main() -> Result<()> {
 
             // 6. backend —— permission_mode 用共享句柄，SIGHUP 热重载即时生效。
             let perm_mode = std::sync::Arc::new(parking_lot::RwLock::new(config.permission_mode));
-            let backend = Arc::new(imagent_claude::ClaudeBackend::with_permission_mode_shared(
-                perm_mode.clone(),
-            ));
+            let backend = build_backend(&config.agent, perm_mode.clone());
 
             // 7. auth —— 白名单：config 种子 ∪ store 已有（CLI /allow 或 IM /allow 持久化）。
             let mut initial: Vec<String> = config.allowed_senders.clone();
@@ -285,6 +283,27 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Backend 选择：按 config.agent 选用对应 agent 后端。
+// ---------------------------------------------------------------------------
+
+/// 按 `config.agent` 选择 Backend。
+///
+/// - `"codex"` → [`imagent_codex::CodexBackend`]；
+/// - 其它（含默认 `"claude-cli"`）→ [`imagent_claude::ClaudeBackend`]，
+///   行为与单后端时期完全一致（permission_mode 共享句柄，SIGHUP 即时生效）。
+fn build_backend(
+    agent: &str,
+    perm_mode: Arc<parking_lot::RwLock<imagent_core::PermissionMode>>,
+) -> Arc<dyn imagent_core::Backend> {
+    match agent {
+        "codex" => Arc::new(imagent_codex::CodexBackend::new()),
+        _ => Arc::new(imagent_claude::ClaudeBackend::with_permission_mode_shared(
+            perm_mode,
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------

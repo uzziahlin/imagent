@@ -128,7 +128,7 @@ mod tests {
     fn does_not_break_emoji() {
         // emoji 是多字节但 1 个 Unicode scalar（部分是代理对，此处取 BMP 外单 char）。
         let text = "😀😁😂🤣😃😄😅😆😇😀😁😂🤣😃😄😅😆😇😀😁"; // 20 char
-        let parts = split_message(&text, 10);
+        let parts = split_message(text, 10);
         assert_eq!(parts.len(), 2);
         for p in &parts {
             assert!(p.chars().count() <= 10);
