@@ -10,15 +10,16 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use imagent_store::{NamedSessionRow, SessionRow, Store};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
-
+use parking_lot::RwLock;
 use crate::auth::Auth;
 use crate::backend::Backend;
 use crate::config::PermissionMode;
+use crate::metrics::METRICS;
 use crate::error::Result;
 use crate::permission::{parse_reply, PermissionReply, PermissionRouter};
 use crate::platform::Platform;
@@ -80,13 +81,13 @@ pub struct Dispatcher {
     store: Store,
     auth: Auth,
     default_workdir: PathBuf,
-    allowed_tools: Vec<String>,
+    allowed_tools: Arc<RwLock<Vec<String>>>,
     /// per-conv 串行锁：同一会话的 agent 任务排队执行，避免 session 冲突。
     conv_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// IM 权限审批路由（Ask 闭环用）。
     router: Arc<PermissionRouter>,
     /// 权限审批模式。
-    permission_mode: PermissionMode,
+    permission_mode: Arc<RwLock<PermissionMode>>,
 }
 
 impl Dispatcher {
@@ -99,6 +100,32 @@ impl Dispatcher {
         default_workdir: PathBuf,
         allowed_tools: Vec<String>,
         permission_mode: PermissionMode,
+    ) -> Self {
+        Self::new_with_handles(
+            platform,
+            backend,
+            store,
+            auth,
+            default_workdir,
+            Arc::new(RwLock::new(allowed_tools)),
+            Arc::new(RwLock::new(permission_mode)),
+        )
+    }
+
+    /// 与 [`new`](Self::new) 相同，但接受外部持有的共享句柄
+    /// （`allowed_tools` / `permission_mode` 的 `Arc<RwLock>`）。
+    ///
+    /// main 用此构造，把 `permission_mode` 句柄同时共享给 `ClaudeBackend`，
+    /// 使 SIGHUP 热重载对二者同时生效。
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_handles(
+        platform: Arc<dyn Platform>,
+        backend: Arc<dyn Backend>,
+        store: Store,
+        auth: Auth,
+        default_workdir: PathBuf,
+        allowed_tools: Arc<RwLock<Vec<String>>>,
+        permission_mode: Arc<RwLock<PermissionMode>>,
     ) -> Self {
         Self {
             platform,
@@ -113,6 +140,23 @@ impl Dispatcher {
         }
     }
 
+    /// SIGHUP 热重载：整体替换 allowed_tools。
+    pub fn reload_tools(&self, tools: Vec<String>) {
+        *self.allowed_tools.write() = tools;
+    }
+
+    /// SIGHUP 热重载：更新 permission_mode（与 ClaudeBackend 共享同一句柄时
+    /// 二者同步生效）。注意：Ask 模式的 socket accept task 仅在 `run()` 启动时
+    /// 按当时的模式 spawn 一次，热切到 Ask 不会补起 socket（重启生效）。
+    pub fn reload_permission_mode(&self, mode: PermissionMode) {
+        *self.permission_mode.write() = mode;
+    }
+
+    /// 暴露 auth（main 的 SIGHUP task 用其 reload）。
+    pub fn auth(&self) -> &Auth {
+        &self.auth
+    }
+
     /// 暴露 router（主进程 socket accept task 用）。
     pub fn router(&self) -> Arc<PermissionRouter> {
         self.router.clone()
@@ -123,7 +167,7 @@ impl Dispatcher {
     /// 其它错误 → 记录日志后继续（长轮询层自管重连/退避），不 panic。
     pub async fn run(self: Arc<Self>) -> Result<()> {
         // Ask 模式：spawn unix socket accept task（MCP server 转发的权限请求经此进主进程）。
-        if matches!(self.permission_mode, PermissionMode::Ask) {
+        if matches!(*self.permission_mode.read(), PermissionMode::Ask) {
             if let Some(sock) = crate::permission::default_sock_path() {
                 self.spawn_socket_accept(sock.to_string_lossy().into_owned());
             } else {
@@ -279,6 +323,8 @@ impl Dispatcher {
         let sender = msg.sender.clone();
         let hint = msg.reply_hint.clone();
 
+        // best-effort 指标：入站消息计数（失败只 warn 不阻断）。
+        METRICS.messages_in.inc();
         // 1. 发现态：白名单为空。不自动授权（安全），对 sender 回引导消息，
         //    告知其 sender id 与如何联系管理员，不驱动 agent。
         if self.auth.is_discovery() {
@@ -542,7 +588,7 @@ impl Dispatcher {
                                 let (tx, mut rx) = mpsc::channel::<AgentChunk>(32);
                                 let backend = self.backend.clone();
                                 let workdir = self.default_workdir.clone();
-                                let tools = self.allowed_tools.clone();
+                                let tools = self.allowed_tools.read().clone();
                                 let conv_id_compact = conv.0.clone();
                                 let join = tokio::spawn(async move {
                                     backend
@@ -701,10 +747,11 @@ impl Dispatcher {
         }
 
         // 流式通道 + 后台执行。existing 移入 spawn（避免借用跨 'static）。
+        let run_started = Instant::now();
         let (tx, mut rx) = mpsc::channel::<AgentChunk>(32);
         let backend = self.backend.clone();
         let workdir = self.default_workdir.clone();
-        let tools = self.allowed_tools.clone();
+        let tools = self.allowed_tools.read().clone();
         let prompt_owned = prompt.clone();
         let conv_id_owned = conv.0.clone();
         let join = tokio::spawn(async move {
@@ -737,14 +784,21 @@ impl Dispatcher {
 
         // 等待 backend 返回 RunOutcome。
         let outcome = match join.await {
-            Ok(Ok(o)) => o,
+            Ok(Ok(o)) => {
+                let elapsed = run_started.elapsed().as_secs_f64();
+                METRICS.claude_calls.inc();
+                METRICS.claude_duration.observe(elapsed);
+                o
+            }
             Ok(Err(e)) => {
+                METRICS.claude_errors.inc();
                 let m = format!("[error] {e}");
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "backend.run 失败");
                 self.reply(&conv, &m, &hint).await;
                 return;
             }
             Err(e) => {
+                METRICS.claude_errors.inc();
                 let m = format!("[error] backend task panicked: {e}");
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "backend task panic");
                 self.reply(&conv, &m, &hint).await;
@@ -812,16 +866,19 @@ impl Dispatcher {
 
     /// 回传文本；发送失败仅 log。session 过期升级为 error（用户侧已收不到回复）。
     async fn reply(&self, conv: &ConvId, text: &str, hint: &ReplyHint) {
-        if let Err(e) = self.platform.send_text(conv, text, hint).await {
-            if is_session_expired_err(&e) {
-                tracing::error!(
-                    target: "imagent::core",
-                    conv_id = %conv.0,
-                    error = %e,
-                    "send_text session 过期（用户侧已收不到）"
-                );
-            } else {
-                warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "send_text 失败");
+        match self.platform.send_text(conv, text, hint).await {
+            Ok(()) => METRICS.messages_out.inc(),
+            Err(e) => {
+                if is_session_expired_err(&e) {
+                    tracing::error!(
+                        target: "imagent::core",
+                        conv_id = %conv.0,
+                        error = %e,
+                        "send_text session 过期（用户侧已收不到）"
+                    );
+                } else {
+                    warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "send_text 失败");
+                }
             }
         }
     }

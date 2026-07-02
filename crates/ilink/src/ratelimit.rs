@@ -5,9 +5,21 @@
 //!
 //! 用 `std::time::Instant` 单调钟，不受系统时钟回拨影响。
 
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
+use prometheus::{register_int_counter, IntCounter};
 use tokio::sync::Mutex;
+
+/// 全局限流事件计数器（注册到 prometheus 默认 registry，由 core 的
+/// `metrics::render` 一并收集）。
+static RATE_LIMIT_EVENTS: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "imagent_rate_limit_events_total",
+        "ilink 被动限流事件数（sendmessage 被服务端限流）"
+    )
+    .expect("register rate_limit_events")
+});
 
 /// 被动限流熔断器：窗口内限流事件达阈值则熔断一段 cooldown。
 pub struct RateBreaker {
@@ -38,6 +50,8 @@ impl RateBreaker {
     /// 记录一次限流事件，返回是否因此次触发熔断（窗口内事件数 >= threshold）。
     pub async fn record_event(&self) -> bool {
         let now = Instant::now();
+        // best-effort 指标：限流事件计数。
+        RATE_LIMIT_EVENTS.inc();
         let mut events = self.events.lock().await;
         // 清窗口外旧事件。
         events.retain(|t| now.duration_since(*t) < self.window);

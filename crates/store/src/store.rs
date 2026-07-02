@@ -618,6 +618,16 @@ impl Store {
         .await
     }
 
+    /// 当前活动 session 数（`sessions` 表行数）。供 `/health` 报告。
+    pub async fn count_sessions(&self) -> Result<i64> {
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let n: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
+            Ok(n)
+        })
+        .await
+    }
+
     pub async fn delete_named_session(&self, conv_id: &str, name: &str) -> Result<()> {
         let (conv_id, name) = (conv_id.to_string(), name.to_string());
         let inner = self.inner.clone();

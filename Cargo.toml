@@ -59,6 +59,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 dirs = "5"
 toml = "0.8"
+prometheus = "0.13"
+axum = "0.7"
 
 [package]
 name = "imagent"
@@ -80,3 +82,6 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 dirs = { workspace = true }
 serde_json = { workspace = true }
+axum = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }

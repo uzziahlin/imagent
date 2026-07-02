@@ -1,0 +1,22 @@
+[Unit]
+Description=imagent — IM ↔ agent gateway
+Documentation=https://github.com/<owner>/imagent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 按实际安装路径与运行用户调整：
+ExecStart=/usr/local/bin/imagent start
+User=%i
+# Environment=RUST_LOG=info
+# Environment=IMAGENT_CONFIG=/home/%i/.imagent/config.toml
+Restart=on-failure
+RestartSec=5
+# 安全加固（可选）：
+# NoNewPrivileges=true
+# ProtectSystem=strict
+# ReadWritePaths=%h/.imagent
+
+[Install]
+WantedBy=multi-user.target

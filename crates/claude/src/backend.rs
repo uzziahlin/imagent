@@ -1,9 +1,11 @@
 //! [`ClaudeBackend`]：基于 Claude Code CLI 的无状态 agent 执行器。
 
 use std::process::Stdio;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use imagent_core::{AgentChunk, Backend, CoreError, PermissionMode, Result, RunOutcome, SessionId};
+use parking_lot::RwLock;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tracing::{debug, warn};
@@ -16,17 +18,25 @@ use crate::stream::{parse_line, ParsedEvent};
 /// `--permission-prompt-tool`，把权限决策回调到 imagent 的 MCP server 子进程
 /// （imagent mcp 子命令）。
 pub struct ClaudeBackend {
-    permission_mode: PermissionMode,
+    permission_mode: Arc<RwLock<PermissionMode>>,
 }
 
 impl ClaudeBackend {
     pub fn new() -> Self {
         Self {
-            permission_mode: PermissionMode::Off,
+            permission_mode: Arc::new(RwLock::new(PermissionMode::Off)),
         }
     }
 
     pub fn with_permission_mode(mode: PermissionMode) -> Self {
+        Self {
+            permission_mode: Arc::new(RwLock::new(mode)),
+        }
+    }
+
+    /// 用外部共享句柄构造——与 `Dispatcher` 共享同一 `Arc<RwLock<PermissionMode>>`，
+    /// 使 SIGHUP 热重载对 backend 即时生效（每次 `run` 取最新值）。
+    pub fn with_permission_mode_shared(mode: Arc<RwLock<PermissionMode>>) -> Self {
         Self {
             permission_mode: mode,
         }
@@ -108,9 +118,10 @@ impl Backend for ClaudeBackend {
         // 权限审批：非 Off 时附加 MCP server（imagent mcp 子命令）。
         // claude 遇需权限工具时回调 permission_request，由 MCP server 依模式
         // allow/deny 或经 socket 转主进程 IM 询问（Ask）。
-        if self.permission_mode.is_enabled() {
+        let mode = *self.permission_mode.read();
+        if mode.is_enabled() {
             let sock = permission_sock_path();
-            match write_mcp_config(conv_id, &sock, self.permission_mode) {
+            match write_mcp_config(conv_id, &sock, mode) {
                 Ok(mcp_json) => {
                     cmd.arg("--mcp-config").arg(&mcp_json);
                     cmd.arg("--permission-prompt-tool")
