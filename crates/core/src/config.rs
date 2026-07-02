@@ -62,6 +62,13 @@ pub struct Config {
     /// 默认 127.0.0.1:9100。
     #[serde(default = "default_metrics_addr")]
     pub metrics_addr: Option<String>,
+    /// 出站消息单条字符上限（Unicode char 计）。超长则由各 Platform 的 `send_text`
+    /// 在内部分片。`None` = 不分片（默认，保持单条发送的既有行为）。
+    #[serde(default)]
+    pub message_max_len: Option<usize>,
+    /// 分片之间发送间隔（毫秒），避免多条叠加触发 IM 限流。默认 400。
+    #[serde(default = "default_fragment_interval_ms")]
+    pub message_fragment_interval_ms: u64,
 }
 
 fn default_tools() -> Vec<String> {
@@ -75,6 +82,9 @@ fn default_platform() -> String {
 }
 fn default_metrics_addr() -> Option<String> {
     Some("127.0.0.1:9100".into())
+}
+fn default_fragment_interval_ms() -> u64 {
+    400
 }
 
 impl Config {
@@ -109,6 +119,8 @@ agent = "claude-cli"
 platform = "ilink"
 permission_mode = "off"     # off(默认,claude按allowedTools自行处理) | allow | deny | ask(IM审批闭环)
 # metrics_addr = "127.0.0.1:9100"   # 空串 "" = 关闭 /metrics + /health HTTP server
+# message_max_len = 2000              # 单条出站消息字符上限（Unicode char）；不设 = 不分片
+# message_fragment_interval_ms = 400  # 分片间发送间隔（ms）
 "#;
 }
 #[cfg(test)]
@@ -242,5 +254,46 @@ metrics_addr = "0.0.0.0:9999"
         assert_eq!(cfg.metrics_addr.as_deref(), Some("0.0.0.0:9999"));
         cleanup(&p);
     }
-}
 
+    #[test]
+    fn message_max_len_default_none() {
+        let p = tmp_path("msg_def", r#"default_workdir = "/tmp/ws""#);
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(cfg.message_max_len, None);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn message_max_len_custom() {
+        let p = tmp_path(
+            "msg_custom",
+            r#"default_workdir = "/tmp/ws"
+message_max_len = 100
+"#,
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(cfg.message_max_len, Some(100));
+        cleanup(&p);
+    }
+
+    #[test]
+    fn fragment_interval_default_400() {
+        let p = tmp_path("frag_def", r#"default_workdir = "/tmp/ws""#);
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(cfg.message_fragment_interval_ms, 400);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn fragment_interval_custom() {
+        let p = tmp_path(
+            "frag_custom",
+            r#"default_workdir = "/tmp/ws"
+message_fragment_interval_ms = 250
+"#,
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(cfg.message_fragment_interval_ms, 250);
+        cleanup(&p);
+    }
+}

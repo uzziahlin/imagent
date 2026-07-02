@@ -136,13 +136,15 @@ async fn main() -> Result<()> {
                 client,
                 store.clone(),
                 account_id,
+                config.message_max_len,
+                std::time::Duration::from_millis(config.message_fragment_interval_ms),
             ));
 
             // 6. backend —— permission_mode 用共享句柄，SIGHUP 热重载即时生效。
             let perm_mode = std::sync::Arc::new(parking_lot::RwLock::new(config.permission_mode));
-            let backend = Arc::new(
-                imagent_claude::ClaudeBackend::with_permission_mode_shared(perm_mode.clone()),
-            );
+            let backend = Arc::new(imagent_claude::ClaudeBackend::with_permission_mode_shared(
+                perm_mode.clone(),
+            ));
 
             // 7. auth —— 白名单：config 种子 ∪ store 已有（CLI /allow 或 IM /allow 持久化）。
             let mut initial: Vec<String> = config.allowed_senders.clone();
@@ -156,9 +158,8 @@ async fn main() -> Result<()> {
             let discovery = auth.is_discovery();
 
             // 8. dispatcher —— allowed_tools / permission_mode 均以共享句柄注入。
-            let tools_handle = std::sync::Arc::new(parking_lot::RwLock::new(
-                config.allowed_tools.clone(),
-            ));
+            let tools_handle =
+                std::sync::Arc::new(parking_lot::RwLock::new(config.allowed_tools.clone()));
             let dispatcher = Arc::new(imagent_core::Dispatcher::new_with_handles(
                 platform,
                 backend,
@@ -193,11 +194,7 @@ async fn main() -> Result<()> {
             }
 
             // 10. SIGHUP 热重载（白名单 / allowed_tools / permission_mode）。
-            spawn_sighup_handler(
-                dispatcher.clone(),
-                config_path.clone(),
-                http_store.clone(),
-            );
+            spawn_sighup_handler(dispatcher.clone(), config_path.clone(), http_store.clone());
 
             // 11. 前台运行 + Ctrl-C
             tracing::info!(
