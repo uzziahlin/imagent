@@ -278,6 +278,8 @@ async fn main() -> Result<()> {
 ///
 /// - `"codex"` → [`imagent_codex::CodexBackend`]；
 /// - `"gemini"` → [`imagent_gemini::GeminiBackend`]；
+/// - `"claude-acp"` → [`imagent_claude::AcpBackend`]（ACP/JSON-RPC 长驻子进程模式，
+///   与 `claude-cli` 并存；共享 permission_mode 句柄，SIGHUP 即时生效）；
 /// - 其它（含默认 `"claude-cli"`）→ [`imagent_claude::ClaudeBackend`]，
 ///   行为与单后端时期完全一致（permission_mode 共享句柄，SIGHUP 即时生效）。
 fn build_backend(
@@ -287,6 +289,9 @@ fn build_backend(
     match agent {
         "codex" => Arc::new(imagent_codex::CodexBackend::new()),
         "gemini" => Arc::new(imagent_gemini::GeminiBackend::new()),
+        "claude-acp" => Arc::new(imagent_claude::AcpBackend::with_permission_mode_shared(
+            perm_mode,
+        )),
         _ => Arc::new(imagent_claude::ClaudeBackend::with_permission_mode_shared(
             perm_mode,
         )),

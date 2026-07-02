@@ -15,3 +15,4 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 dirs = { workspace = true }
 parking_lot = { workspace = true }
+agent-client-protocol = { workspace = true }

@@ -62,6 +62,8 @@ toml = "0.8"
 prometheus = "0.13"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 axum = "0.7"
+# ACP（Agent Client Protocol）：claude-agent-acp 长驻子进程模式（agent-client-protocol SDK）
+agent-client-protocol = "1"
 
 [package]
 name = "imagent"

@@ -121,7 +121,7 @@ impl Config {
 default_workdir = "/absolute/path/to/agent/workspace"   # 必填，agent 只能在该目录 Read/Edit
 allowed_senders = []        # 留空 = 发现模式（只打日志记录入站 sender，不驱动 agent）
 allowed_tools = ["Read", "Edit"]
-agent = "claude-cli"         # claude-cli(默认) | codex | gemini
+agent = "claude-cli"         # claude-cli(默认) | claude-acp(ACP长驻子进程) | codex | gemini
 platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人,配 wecom_bot_id/wecom_secret)
 permission_mode = "off"     # off(默认,claude按allowedTools自行处理) | allow | deny | ask(IM审批闭环)
 # metrics_addr = "127.0.0.1:9100"   # 空串 "" = 关闭 /metrics + /health HTTP server
