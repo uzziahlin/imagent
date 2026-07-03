@@ -4,7 +4,7 @@
 
 一个用 Rust 写的、把即时通讯平台接入自主 agent 的网关。**任何 IM**（个人微信 iLink / 企业微信 WeCom）↔ **任何 agent**（Claude Code / …）。
 
-![Rust](https://img.shields.io/badge/Rust-edition%202021-orange) ![License: MIT](https://img.shields.io/badge/License-MIT-blue) ![Tests](https://img.shields.io/badge/tests-131%20passed-brightgreen) ![Coverage](https://img.shields.io/badge/coverage-tarpaulin%2Bcodecov-informational) ![Status](https://img.shields.io/badge/status-P3%20dev-yellow) ![Docs](https://img.shields.io/badge/docs-mdBook-blueviolet)
+![Rust](https://img.shields.io/badge/Rust-edition%202021-orange) ![License: MIT](https://img.shields.io/badge/License-MIT-blue) ![Tests](https://img.shields.io/badge/tests-214%20passed-brightgreen) ![Coverage](https://img.shields.io/badge/coverage-tarpaulin%2Bcodecov-informational) ![Status](https://img.shields.io/badge/status-v1.0-brightgreen) ![Docs](https://img.shields.io/badge/docs-mdBook-blueviolet)
 
 ---
 
@@ -38,8 +38,9 @@ imagent 是一个常驻网关进程：监听 IM 私聊消息 → 鉴权 → 驱�
 
 ```
 trait Platform                        trait Backend
-├── ilink (个人微信私聊, 实验性)        ├── claude (CLI claude -p; ACP 留 P3)
-└── wecom  (企业微信官方 API, P3)       └── (未来可换: Codex / Gemini / …)
+├── ilink (个人微信私聊, 实验性)        ├── claude (CLI + ACP 长驻子进程)
+└── wecom  (企业微信长连接)             ├── codex  (codex exec --json)
+                                       └── gemini (gemini -p -o stream-json)
         ↕                              ↕
               core: 调度 / 鉴权 / 会话路由 (store 持久化) / 权限审批闭环
 ```
@@ -138,14 +139,14 @@ imagent start            # 前台常驻，Ctrl-C 退出
 | P0 | ✅ | 调研（iLink 协议/合规、Claude CLI/ACP、竞品 feiyun） |
 | P1 | ✅ | MVP 闭环：扫码 → 私聊 → `claude -p` → 回传 → `--resume` |
 | P2 | ✅ | 限流熔断 / 动态白名单 / 多命名会话 / 软 compact / 推流 / typing / **权限审批** / 媒体 |
-| P3 | 🚧 | 开源化（license/CI/凭据加密）+ WeCom + ACP + 多 agent |
+| P3 | ✅ | 开源化（双 license/CI/凭据加密/mdBook）+ WeCom + ACP + 多 agent（Codex/Gemini）+ 运维（指标/热重载/daemon）+ 长消息分片 |
 
 详见 [`docs/`](docs/)（[DESIGN](docs/DESIGN.md) / [RESEARCH](docs/RESEARCH.md) / [P2_COMPLETE](docs/P2_COMPLETE.md) / [P3_ROADMAP](docs/P3_ROADMAP.md)）。
 
 ## 开发
 
 ```bash
-cargo test --workspace                              # 129 passed
+cargo test --workspace                              # 214 passed
 cargo clippy --workspace --all-targets -- -D warnings   # 0 warning
 cargo fmt --all --check
 ```

@@ -14,10 +14,10 @@ resolver = "2"
 #     "crates/claude", # Claude Code Backend（CLI claude -p 优先 / ACP 留 P2）
 #     "crates/store",  # 持久化：凭据 + 会话映射 + 配置（SQLite）
 # ]
-members = ["crates/store", "crates/core", "crates/claude", "crates/ilink"]
+members = ["crates/store", "crates/core", "crates/claude", "crates/codex", "crates/gemini", "crates/ilink", "crates/wecom"]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT OR Apache-2.0"
@@ -60,7 +60,10 @@ clap = { version = "4", features = ["derive"] }
 dirs = "5"
 toml = "0.8"
 prometheus = "0.13"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 axum = "0.7"
+# ACP（Agent Client Protocol）：claude-agent-acp 长驻子进程模式（agent-client-protocol SDK）
+agent-client-protocol = "1"
 
 [package]
 name = "imagent"
@@ -71,9 +74,12 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+imagent-wecom = { path = "crates/wecom" }
 imagent-core = { path = "crates/core" }
 imagent-ilink = { path = "crates/ilink" }
 imagent-claude = { path = "crates/claude" }
+imagent-codex = { path = "crates/codex" }
+imagent-gemini = { path = "crates/gemini" }
 imagent-store = { path = "crates/store" }
 tokio = { workspace = true }
 clap = { workspace = true }

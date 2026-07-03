@@ -6,7 +6,9 @@
 //!
 //! 对外只暴露 [`ClaudeBackend`]。
 
+mod acp;
 mod backend;
 mod stream;
 
+pub use acp::AcpBackend;
 pub use backend::ClaudeBackend;

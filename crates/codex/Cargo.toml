@@ -1,5 +1,5 @@
 [package]
-name = "imagent-claude"
+name = "imagent-codex"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -13,6 +13,3 @@ async-trait = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
-dirs = { workspace = true }
-parking_lot = { workspace = true }
-agent-client-protocol = { workspace = true }

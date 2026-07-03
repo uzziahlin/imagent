@@ -75,11 +75,12 @@ impl Store {
     pub async fn put_credential(&self, platform: &str, account_id: &str, blob: &str) -> Result<()> {
         let (platform, account_id) = (platform.to_string(), account_id.to_string());
         // keychain I/O 经游离线程 + 超时，失败/超时回退明文（见 credentials 模块）。
-        let stored_blob = if crate::credentials::store_in_keyring(&platform, &account_id, blob).await {
-            crate::credentials::marker_for(&platform, &account_id)
-        } else {
-            blob.to_string()
-        };
+        let stored_blob =
+            if crate::credentials::store_in_keyring(&platform, &account_id, blob).await {
+                crate::credentials::marker_for(&platform, &account_id)
+            } else {
+                blob.to_string()
+            };
         let inner = self.inner.clone();
         blocking_with(inner, move |conn| {
             let now = now_secs();
@@ -129,8 +130,7 @@ impl Store {
             let mut stmt = conn
                 .prepare("SELECT account_id, blob FROM credentials WHERE platform = ?1 LIMIT 1")?;
             let mut rows = stmt.query(rusqlite::params![q_platform])?;
-            rows
-                .next()?
+            rows.next()?
                 .map(|r| Ok::<_, StoreError>((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
                 .transpose()
         })
@@ -183,7 +183,11 @@ impl Store {
         account_id: &str,
         blob: &str,
     ) -> Result<()> {
-        let (platform, account_id, blob) = (platform.to_string(), account_id.to_string(), blob.to_string());
+        let (platform, account_id, blob) = (
+            platform.to_string(),
+            account_id.to_string(),
+            blob.to_string(),
+        );
         let inner = self.inner.clone();
         blocking_with(inner, move |conn| {
             let now = now_secs();
@@ -924,7 +928,7 @@ mod tests {
         assert!(!credentials::is_keyring_marker(r#"{"bot_token":"x"}"#));
         assert!(!credentials::is_keyring_marker(""));
         assert!(!credentials::is_keyring_marker("Keyring:foo")); // 大小写敏感
-        // account_id 含 ":" 也不影响判定（marker 仍以固定前缀起始）
+                                                                 // account_id 含 ":" 也不影响判定（marker 仍以固定前缀起始）
         let m2 = credentials::marker_for("ilink", "a:b");
         assert!(credentials::is_keyring_marker(&m2));
     }

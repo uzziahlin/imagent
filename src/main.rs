@@ -97,8 +97,8 @@ async fn main() -> Result<()> {
             );
         }
         Cmd::Start { platform } => {
-            if platform != "ilink" {
-                return Err(anyhow!("P1 仅支持 ilink 平台，收到 platform={platform}"));
+            if platform != "ilink" && platform != "wecom" {
+                return Err(anyhow!("未知 platform={platform}，支持 ilink | wecom"));
             }
 
             // 1. 配置
@@ -116,33 +116,17 @@ async fn main() -> Result<()> {
             // 2. store（多份：dispatcher / HTTP /health / SIGHUP 各持一份 Clone）
             let store = imagent_store::Store::open(&db_path).await?;
 
-            // 3. 凭据
-            let (account_id, blob) = store
-                .first_credential("ilink")
-                .await?
-                .ok_or_else(|| anyhow!("未登录，请先 `imagent login`"))?;
-            let creds: imagent_ilink::Credentials = serde_json::from_str(&blob)?;
-
-            // 4. client
-            let client = imagent_ilink::ILinkClient::new(
-                Some(creds.baseurl.clone()),
-                creds.bot_token.clone(),
-                creds.ilink_bot_id.clone(),
-                creds.ilink_user_id.clone(),
-            )?;
-
-            // 5. platform
-            let platform = Arc::new(imagent_ilink::ILinkPlatform::new(
-                client,
-                store.clone(),
-                account_id,
-            ));
+            // 3. platform —— 按 config.platform / CLI 选用 ilink 或 wecom。
+            let platform_name = if platform == "ilink" || platform == "wecom" {
+                platform.as_str()
+            } else {
+                config.platform.as_str()
+            };
+            let platform = build_platform(platform_name, &config, store.clone()).await?;
 
             // 6. backend —— permission_mode 用共享句柄，SIGHUP 热重载即时生效。
             let perm_mode = std::sync::Arc::new(parking_lot::RwLock::new(config.permission_mode));
-            let backend = Arc::new(
-                imagent_claude::ClaudeBackend::with_permission_mode_shared(perm_mode.clone()),
-            );
+            let backend = build_backend(&config.agent, perm_mode.clone());
 
             // 7. auth —— 白名单：config 种子 ∪ store 已有（CLI /allow 或 IM /allow 持久化）。
             let mut initial: Vec<String> = config.allowed_senders.clone();
@@ -156,9 +140,8 @@ async fn main() -> Result<()> {
             let discovery = auth.is_discovery();
 
             // 8. dispatcher —— allowed_tools / permission_mode 均以共享句柄注入。
-            let tools_handle = std::sync::Arc::new(parking_lot::RwLock::new(
-                config.allowed_tools.clone(),
-            ));
+            let tools_handle =
+                std::sync::Arc::new(parking_lot::RwLock::new(config.allowed_tools.clone()));
             let dispatcher = Arc::new(imagent_core::Dispatcher::new_with_handles(
                 platform,
                 backend,
@@ -193,15 +176,12 @@ async fn main() -> Result<()> {
             }
 
             // 10. SIGHUP 热重载（白名单 / allowed_tools / permission_mode）。
-            spawn_sighup_handler(
-                dispatcher.clone(),
-                config_path.clone(),
-                http_store.clone(),
-            );
+            spawn_sighup_handler(dispatcher.clone(), config_path.clone(), http_store.clone());
 
             // 11. 前台运行 + Ctrl-C
             tracing::info!(
-                "imagent started (platform=ilink, workdir={}, tools={:?}, discovery={})",
+                "imagent started (platform={}, workdir={}, tools={:?}, discovery={})",
+                platform_name,
                 config.default_workdir.display(),
                 config.allowed_tools,
                 discovery
@@ -288,6 +268,89 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Backend 选择：按 config.agent 选用对应 agent 后端。
+// ---------------------------------------------------------------------------
+
+/// 按 `config.agent` 选择 Backend。
+///
+/// - `"codex"` → [`imagent_codex::CodexBackend`]；
+/// - `"gemini"` → [`imagent_gemini::GeminiBackend`]；
+/// - `"claude-acp"` → [`imagent_claude::AcpBackend`]（ACP/JSON-RPC 长驻子进程模式，
+///   与 `claude-cli` 并存；共享 permission_mode 句柄，SIGHUP 即时生效）；
+/// - 其它（含默认 `"claude-cli"`）→ [`imagent_claude::ClaudeBackend`]，
+///   行为与单后端时期完全一致（permission_mode 共享句柄，SIGHUP 即时生效）。
+fn build_backend(
+    agent: &str,
+    perm_mode: Arc<parking_lot::RwLock<imagent_core::PermissionMode>>,
+) -> Arc<dyn imagent_core::Backend> {
+    match agent {
+        "codex" => Arc::new(imagent_codex::CodexBackend::new()),
+        "gemini" => Arc::new(imagent_gemini::GeminiBackend::new()),
+        "claude-acp" => Arc::new(imagent_claude::AcpBackend::with_permission_mode_shared(
+            perm_mode,
+        )),
+        _ => Arc::new(imagent_claude::ClaudeBackend::with_permission_mode_shared(
+            perm_mode,
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Platform 选择：按 platform 名选用 ilink 或 wecom。
+// ---------------------------------------------------------------------------
+
+/// 按 platform 名选择 Platform 实例。
+///
+/// - `"wecom"` → [`imagent_wecom::WeComPlatform`]：凭据取自 config 的
+///   `wecom_bot_id` / `wecom_secret`（企业微信智能机器人不走扫码登录）。
+/// - 其它（含默认 `"ilink"`）→ [`imagent_ilink::ILinkPlatform`]，
+///   行为与单平台时期完全一致（读 store 的 ilink 凭据 + 扫码登录的 client）。
+async fn build_platform(
+    name: &str,
+    config: &imagent_core::Config,
+    store: imagent_store::Store,
+) -> Result<Arc<dyn imagent_core::Platform>> {
+    match name {
+        "wecom" => {
+            let bot_id = config
+                .wecom_bot_id
+                .clone()
+                .ok_or_else(|| anyhow!("platform=wecom 需在 config.toml 配置 wecom_bot_id"))?;
+            let secret = config
+                .wecom_secret
+                .clone()
+                .ok_or_else(|| anyhow!("platform=wecom 需在 config.toml 配置 wecom_secret"))?;
+            // openws 默认地址。
+            let ws_url = "wss://openws.work.weixin.qq.com".to_string();
+            Ok(Arc::new(imagent_wecom::WeComPlatform::new(
+                bot_id, secret, ws_url,
+            )))
+        }
+        _ => {
+            // 默认 ilink：保持既有行为。
+            let (account_id, blob) = store
+                .first_credential("ilink")
+                .await?
+                .ok_or_else(|| anyhow!("未登录，请先 `imagent login`"))?;
+            let creds: imagent_ilink::Credentials = serde_json::from_str(&blob)?;
+            let client = imagent_ilink::ILinkClient::new(
+                Some(creds.baseurl.clone()),
+                creds.bot_token.clone(),
+                creds.ilink_bot_id.clone(),
+                creds.ilink_user_id.clone(),
+            )?;
+            Ok(Arc::new(imagent_ilink::ILinkPlatform::new(
+                client,
+                store,
+                account_id,
+                config.message_max_len,
+                std::time::Duration::from_millis(config.message_fragment_interval_ms),
+            )))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

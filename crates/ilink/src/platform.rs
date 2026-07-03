@@ -47,10 +47,20 @@ pub struct ILinkPlatform {
     breaker: crate::ratelimit::RateBreaker,
     /// per-peer typing_ticket 缓存：peer → (ticket, expiry)。
     typing_tickets: Mutex<HashMap<String, (String, Instant)>>,
+    /// 出站文本单条字符上限（Unicode char）。None = 不分片。
+    max_text_len: Option<usize>,
+    /// 分片间发送间隔。
+    fragment_interval: Duration,
 }
 
 impl ILinkPlatform {
-    pub fn new(client: ILinkClient, store: Store, account_id: String) -> Self {
+    pub fn new(
+        client: ILinkClient,
+        store: Store,
+        account_id: String,
+        max_text_len: Option<usize>,
+        fragment_interval: Duration,
+    ) -> Self {
         Self {
             client: Arc::new(client),
             store,
@@ -64,6 +74,8 @@ impl ILinkPlatform {
             ),
             typing_tickets: Mutex::new(HashMap::new()),
             pending: Mutex::new(Vec::new()),
+            max_text_len,
+            fragment_interval,
         }
     }
 
@@ -380,79 +392,9 @@ impl ILinkPlatform {
             }
         }
     }
-}
-
-/// 判断缓存的 typing_ticket 是否仍有效：非空 + 未过 TTL。
-fn ticket_valid(ticket: &str, expiry: Instant, now: Instant) -> bool {
-    !ticket.is_empty() && expiry > now
-}
-
-/// 去重 key：优先 `message_id`，否则 `from_user_id + 文本` 组合。
-fn dedup_key(msg: &Msg) -> String {
-    if let Some(v) = msg.message_id.as_ref() {
-        let s = v.to_string();
-        if !s.is_empty() {
-            return format!("id:{s}");
-        }
-    }
-    let body = extract_text(msg);
-    format!("fc:{}:{}", msg.from_user_id, body)
-}
-
-#[async_trait]
-impl Platform for ILinkPlatform {
-    async fn recv(&self) -> Result<InboundMessage> {
-        loop {
-            // 1. 先弹缓存
-            {
-                let mut pending = self.pending.lock().await;
-                if !pending.is_empty() {
-                    return Ok(pending.remove(0));
-                }
-            }
-
-            // 2. 长轮询 + 指数退避
-            let mut backoff = Duration::from_secs(1);
-            loop {
-                match self.fetch_updates().await {
-                    Ok(msgs) if !msgs.is_empty() => {
-                        let mut pending = self.pending.lock().await;
-                        pending.extend(msgs);
-                        break; // 回外层弹第一条
-                    }
-                    Ok(_) => {
-                        // 长轮询正常返回空（无消息），立即再次轮询。
-                        break;
-                    }
-                    Err(e) => {
-                        let msg_str = format!("{e}");
-                        // SESSION_EXPIRED：session 失效，需重新登录。
-                        if is_session_expired(&msg_str) {
-                            error!(target: "ilink", "session expired, re-login required");
-                            return Err(CoreError::Platform(
-                                "ilink",
-                                "session expired, please re-login".into(),
-                            ));
-                        }
-                        warn!(target: "ilink", err = %msg_str, backoff_ms = backoff.as_millis() as u64, "getupdates failed, backing off");
-                        if backoff >= BACKOFF_CAP {
-                            return Err(CoreError::Platform(
-                                "ilink",
-                                format!("getupdates exhausted retries: {msg_str}"),
-                            ));
-                        }
-                        tokio::time::sleep(backoff).await;
-                        backoff *= 2;
-                    }
-                }
-            }
-        }
-    }
-
-    async fn send_text(&self, conv: &ConvId, text: &str, hint: &ReplyHint) -> Result<()> {
-        let peer = Self::peer_of(conv);
-        let token = self.resolve_context_token(&peer, hint).await;
-
+    /// 发送单条文本（body 构造 + sendmessage 重试 + 限流熔断服从）。
+    /// 每条独立走出站串行锁（片间 sleep 时释放锁，不长时间阻塞出站）。
+    async fn send_text_one(&self, peer: &str, token: &str, text: &str) -> Result<()> {
         let client_id = format!("imagent-{}", uuid::Uuid::new_v4());
         let mut msg = json!({
             "from_user_id": "",
@@ -541,6 +483,106 @@ impl Platform for ILinkPlatform {
                 }
             }
         }
+    }
+}
+
+/// 判断缓存的 typing_ticket 是否仍有效：非空 + 未过 TTL。
+fn ticket_valid(ticket: &str, expiry: Instant, now: Instant) -> bool {
+    !ticket.is_empty() && expiry > now
+}
+
+/// 去重 key：优先 `message_id`，否则 `from_user_id + 文本` 组合。
+fn dedup_key(msg: &Msg) -> String {
+    if let Some(v) = msg.message_id.as_ref() {
+        let s = v.to_string();
+        if !s.is_empty() {
+            return format!("id:{s}");
+        }
+    }
+    let body = extract_text(msg);
+    format!("fc:{}:{}", msg.from_user_id, body)
+}
+
+#[async_trait]
+impl Platform for ILinkPlatform {
+    async fn recv(&self) -> Result<InboundMessage> {
+        loop {
+            // 1. 先弹缓存
+            {
+                let mut pending = self.pending.lock().await;
+                if !pending.is_empty() {
+                    return Ok(pending.remove(0));
+                }
+            }
+
+            // 2. 长轮询 + 指数退避
+            let mut backoff = Duration::from_secs(1);
+            loop {
+                match self.fetch_updates().await {
+                    Ok(msgs) if !msgs.is_empty() => {
+                        let mut pending = self.pending.lock().await;
+                        pending.extend(msgs);
+                        break; // 回外层弹第一条
+                    }
+                    Ok(_) => {
+                        // 长轮询正常返回空（无消息），立即再次轮询。
+                        break;
+                    }
+                    Err(e) => {
+                        let msg_str = format!("{e}");
+                        // SESSION_EXPIRED：session 失效，需重新登录。
+                        if is_session_expired(&msg_str) {
+                            error!(target: "ilink", "session expired, re-login required");
+                            return Err(CoreError::Platform(
+                                "ilink",
+                                "session expired, please re-login".into(),
+                            ));
+                        }
+                        warn!(target: "ilink", err = %msg_str, backoff_ms = backoff.as_millis() as u64, "getupdates failed, backing off");
+                        if backoff >= BACKOFF_CAP {
+                            return Err(CoreError::Platform(
+                                "ilink",
+                                format!("getupdates exhausted retries: {msg_str}"),
+                            ));
+                        }
+                        tokio::time::sleep(backoff).await;
+                        backoff *= 2;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn send_text(&self, conv: &ConvId, text: &str, hint: &ReplyHint) -> Result<()> {
+        let peer = Self::peer_of(conv);
+        let token = self.resolve_context_token(&peer, hint).await;
+
+        // 分片：配置了上限且 >0 才切；否则单片。
+        let fragments: Vec<String> = match self.max_text_len {
+            Some(n) if n > 0 => {
+                let parts = imagent_core::split_message(text, n);
+                if parts.len() > 1 {
+                    let total = parts.len();
+                    parts
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, frag)| format!("({}/{}) {}", i + 1, total, frag))
+                        .collect()
+                } else {
+                    parts
+                }
+            }
+            _ => vec![text.to_string()],
+        };
+
+        let last_idx = fragments.len() - 1;
+        for (i, frag) in fragments.into_iter().enumerate() {
+            self.send_text_one(&peer, &token, &frag).await?;
+            if i != last_idx {
+                tokio::time::sleep(self.fragment_interval).await;
+            }
+        }
+        Ok(())
     }
 
     async fn send_media(&self, conv: &ConvId, media: &MediaRef, hint: &ReplyHint) -> Result<()> {
