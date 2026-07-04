@@ -26,5 +26,5 @@
 
 ## 已知限制
 
-- `bot_token` 当前**明文存 SQLite**（DESIGN §9.4）——P3 计划用 OS keyring 加密落盘。
+- `bot_token` 优先经 **OS keyring 加密落盘**（store `credentials` 表只存 `keyring:<platform>:<account>` 指针 marker）；无 keychain 环境（headless/CI）或 keyring 写入失败时回退明文存 SQLite。旧库中的明文凭据会在读取时懒迁移到 keyring（见 `crates/store/src/credentials.rs`）。
 - iLink 是腾讯对外协议的第三方 Rust 实现，使用者自负合规责任（见 README 免责声明 + RESEARCH §2）。

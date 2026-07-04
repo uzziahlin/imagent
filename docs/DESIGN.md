@@ -2,6 +2,12 @@
 
 > 实现阶段的主要依据。重开会话写代码前必读。调研背景见 `RESEARCH.md`。
 
+> ⚠️ **文档状态（2026-07）**：本文档是 P1 阶段的初始设计快照。代码已实现至 P3（双平台
+> ilink/wecom、四后端 claude-cli/claude-acp/codex/gemini、IM 权限审批闭环、凭据 OS keyring 加密、
+> Prometheus 指标、SIGHUP 热重载、长消息分片等）。其中：`Backend::run` 实际签名已增加 `conv_id`
+> 参数（见 `crates/core/src/backend.rs`）；§13 路线表中的 P2/P3 项均已完成。本文档保留作架构
+> 参考，具体行为以代码 + `CHANGELOG.md` + `README.md` 为准。
+
 ## 1. 目标与非目标
 
 **目标**
@@ -77,6 +83,7 @@ pub struct RunOutcome { pub session_id: SessionId, pub final_text: String }
 pub trait Backend: Send + Sync {
     async fn run(
         &self,
+        conv_id: &str,                  // 当前会话标识（IM 权限审批路由用）
         prompt: &str,
         session: Option<&SessionId>,   // None=新建
         workdir: &Path,
