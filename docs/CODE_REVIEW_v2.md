@@ -25,7 +25,7 @@
 
 > ⚠️ **破例说明（P0-B + P1-A/B/C 由主会话自行 Edit）**：omp 工具链反复异常——上会话 5 次（并发 exit 1（API 限流）×2、「清理工作树到只剩本任务文件」覆盖前序成果×2、强约束下 noop×1）；本会话 P1-C 委派 omp **第 3 次「空手退出」**（exit 0、零产出、log 仅 1 行主会话口吻废话；前两次 6/30、7/04 已记 engram `cd4f3255`/`33d52163`）。依 `CODE_REVIEW.md` 顶部先例（"omp 工具链对重构类任务反复委派/挂死，用户授权破例自行 Edit"），P0-B/P1-A/B/C 破例主会话自行 Edit（方案已完整 review/设计，每项 `cargo test` 验证）。**违反 CLAUDE.md omp 委派硬规则**，请 review；P0-A/C 由 omp 完成，P1-D/E-1/E-2 为注释/配置/attribute 类主会话直接改。后续 omp 任务说明须显式禁 git 写操作 + 禁删非任务文件（教训已记 memory：`omp-worktree-protection`）。
 
-**剩余（后续 issue 跟进）**：P1-E（上线前应修）、P2 全部、E-3~E-7、D-1~D-4。
+**剩余（后续 issue 跟进）**：P1-E（方案已设计，实现 defer——见下）、P2 全部、E-3~E-7、D-1~D-4。
 
 每条 issue 带 checkbox，id 形如 `P0-A`，便于转 GitHub issue 追踪。
 
@@ -79,7 +79,7 @@
 
 ### 健壮性 / 正确性
 
-- [ ] **P1-E  ACP 超时不杀子进程**：`crates/claude/src/acp.rs:282-304`。超时 drop 只丢 oneshot，子进程继续跑。修复：run future drop 发 cancel 或杀连接。
+- [ ] **P1-E  ACP 超时不杀子进程** ⏳ **方案已设计，实现 defer**：长驻 task 的 `connection.send_request(PromptRequest).block_task().await`（`acp.rs:222`）不响应外部取消；run future（dispatch `tokio::time::timeout` 包装）超时 drop 只丢 `resp_rx`，长驻 task 继续等子进程 turn，子进程资源泄漏。**设计方案**：`PromptReq` 加 `cancel: oneshot::Receiver<()>`；run 创建 `cancel_tx` 随 run future 生命周期（drop 触发）；长驻 task `tokio::select!` prompt 执行 + cancel，cancel 分支 `return Err` 退出 `connect_with` 闭包 → connection drop → SDK `ChildGuard` kill 子进程（基于 `acp.rs:154` 注释假设）。**代价**：超时后长驻 connection 销毁，下次 run 重建（性能换正确性）。**defer 原因**：① SDK 不确定性（`connect_with` 闭包 Err 类型 + `return Err` 是否触发 connection drop / ChildGuard kill 需验证）；② 无单测保护（cancel 传播需真子进程 e2e）；③ 高风险核心异步。建议专门 PR + SDK 调研 + e2e 验证。
 - [x] **P1-F  `/compact`/`/new`/`/switch` 绕过 `conv_locks`** ✅ 已修：提取 `acquire_conv_lock` helper；`/new`/`/switch`/`/compact` 分支开头取 conv 串行锁，与普通消息 agent task 复用同一 `conv_locks` 串行化。slash 路径不显式 release（`_guard`/`_lock` RAII drop），HashMap 回收延迟到下次普通消息 release（最终回收）。`/compact` 持锁跨 agent run 与正常 agent task 串行；无死锁（agent run 不取 conv_lock）。正确性由 conv_lock 机制 + 现有 slash/serial_order 测试保证。
 - [x] **P1-G  权限 pending 无超时，agent 死后下一条消息被静默吞** ✅ 已修：`handle_permission_socket` 的 `rx.await` 改 `tokio::time::timeout(agent_timeout, rx)`；超时回 deny 并 drop receiver。agent 死后至多 agent_timeout 窗口内的消息可能被吞，之后 socket task 超时 drop rx → 后续 route miss → dispatch fallthrough 正常 handle（route miss 的 fallthrough 已存在）。`agent_timeout` 经 `spawn_socket_accept` 传入。超时由 tokio 库保证，集成测试留 e2e。
 - [x] **P1-H  媒体解密 silent failure** ✅ 已修：`download_media` 区分 None / parse 失败 / 解密失败三分支，aes_key 存在但解析失败时返回 Err（不再落入 None 当明文泄漏）。
