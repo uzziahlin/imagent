@@ -217,6 +217,11 @@ impl LongLivedAcp {
                                     .to_string(),
                             },
                         };
+                        // P2-K：sessions 缓存上限保护（conv 数 = IM 用户数有限，但极端兜底）；
+                        // 超上限清空，下次 LoadSession 重建（HashMap 无序，无法清最旧）。
+                        if sessions.len() > 1000 {
+                            sessions.clear();
+                        }
                         sessions.insert(req.conv_id.clone(), sid.clone());
                         let blocks = vec![ContentBlock::Text(TextContent::new(req.prompt.clone()))];
                         match connection

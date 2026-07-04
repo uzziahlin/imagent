@@ -69,7 +69,7 @@ impl ILinkPlatform {
             send_lock: Mutex::new(()),
             breaker: crate::ratelimit::RateBreaker::new(
                 Duration::from_secs(30),
-                1,
+                3, // P2-T：窗口内 3 次限流才熔断（threshold=1 单次即熔断，过于敏感）
                 Duration::from_secs(30),
             ),
             typing_tickets: Mutex::new(HashMap::new()),

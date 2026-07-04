@@ -23,7 +23,7 @@ use crate::types::{AgentChunk, ConvId, InboundMessage, ReplyHint, SessionId};
 use imagent_store::{NamedSessionRow, SessionRow, Store};
 use parking_lot::RwLock;
 use tokio::sync::{mpsc, Mutex};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -232,7 +232,14 @@ impl Dispatcher {
         let listener = match std::os::unix::net::UnixListener::bind(&sock) {
             Ok(l) => l,
             Err(e) => {
-                warn!(target: "imagent::core", sock = %sock, error = %e, "bind permission socket failed; Ask 闭环不可用");
+                // P2-B：bind 失败用 error 级别——Ask 权限闭环将完全不可用（降级为
+                // 无审批），是安全 posture 退化，需显著告警而非静默 warn。
+                error!(
+                    target: "imagent::core",
+                    sock = %sock,
+                    error = %e,
+                    "bind permission socket 失败：Ask 权限闭环不可用（降级为无审批，安全 posture 退化）"
+                );
                 return;
             }
         };

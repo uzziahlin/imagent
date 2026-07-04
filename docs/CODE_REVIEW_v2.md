@@ -96,25 +96,25 @@
 ## 🟡 P2 — 打磨项
 
 - [x] **P2-A** `/switch` 不校验 agent_kind ✅ 已修：切历史 named session 时校验 `agent_kind`，与当前 backend 不匹配则 reply 拒绝（异类 backend 的 session_id 不互通，续接会失败）。
-- [ ] **P2-B** socket `bind` 失败只 warn（`dispatch.rs:232-238`，与 P0-B 同源，可顺手）
+- [x] **P2-B** socket `bind` 失败只 warn ✅ 已修：升为 `error!` 级别 + 显著措辞（Ask 闭环不可用 = 安全 posture 退化，需告警而非静默 warn）。
 - [ ] **P2-C** socket 问询强制 `ReplyHint::None` 丢 iLink context_token（`dispatch.rs:309-313`）
 - [ ] **P2-D** `/allow` 无角色区分，任意白名单用户可授权新用户（`dispatch.rs:399-433`）
 - [x] **P2-E** `/allow` store 失败仍回「已授权」 ✅ 已修：`add_allowed_sender` 持久化失败时 reply 警告（内存已授权 + 重启后将丢失），不再谎报「已授权」。
 - [ ] **P2-F** 中间 Text chunk 全丢弃，「流式」实际一次性（`dispatch.rs:824-834`）
 - [x] **P2-G** `parse_reply` 首字符 y/Y 误判 ✅ 已修：去掉首字符 y/Y 宽匹配（会把 year/yellow/yesterday 误 allow——权限 approve/deny 的真实安全 bug），改精确匹配 `y/yes/ye/yep/yeah/ok/okay/是/允许/好/好的`。回归测试 `parse_reply_year_not_allowed`。
-- [ ] **P2-H** Auth 无归一化（`auth.rs:35-37`）
+- [x] **P2-H** Auth 无归一化 ✅ 已修：加 `normalize_sender`（trim 首尾空白；不改大小写——IM userid 大小写语义未知），`new`/`is_allowed`/`allow`/`revoke`/`reload` 一致应用，保证 config 白名单与入站 sender 比较一致。
 - [x] **P2-I** conv_id 未消毒 ✅ 已修 / mcp.json 不清理 ⏳ defer：① conv_id 经 `sanitize_filename` 消毒文件名（防 `../` / `/` / `:` 路径遍历；`--conv-id` 参数仍用原值保路由），单测 `sanitize_filename_strips_traversal`；② mcp.json 用完清理需重构 run 的 spawn 路径，defer 专门小 PR（整洁性，非安全）。
 - [x] **P2-J** codex prompt 裸 positional arg ✅ 已修：`codex exec <prompt>` 的 prompt 改为经 `--` 分隔的纯 positional（resume / 新建两分支），防止 prompt 以 `-` 开头被误解析为 flag（参数注入）。`Command::arg` 不经 shell（无 shell 注入），此修复针对 codex CLI 的 arg 解析。
-- [ ] **P2-K** ACP `sessions` HashMap 无界增长（`acp.rs:193,220,238`）
+- [x] **P2-K** ACP `sessions` HashMap 无界增长 ✅ 已修：insert 前检查 `len() > 1000` 则 `clear()`（conv 数 = IM 用户数有限，此为极端兜底；HashMap 无序无法清最旧）。
 - [x] **P2-L** ws_url 不校验 wss ✅ 已修 / ack 失败仍继续 ⏳ defer：① `connect_and_serve` 开头校验 ws_url 远端必须 `wss://`（`ws://` 仅 `localhost`/`127.0.0.1`/`[::1]` 例外，测试 `run_loops_on_connect_failure` 用 `ws://127.0.0.1` 不破坏）；② ack 失败仍继续涉及 wecom 协议层可靠性，defer 专门评估。
-- [ ] **P2-M** 固定 `permission.sock` 路径，单实例硬约束（`claude/backend.rs:55-64`）
+- [x] **P2-M** 固定 `permission.sock` 路径 ✅ 已处理：路径固定为单实例设计（主进程唯一监听点），注释说明多实例需独立 HOME；如需同机多实例可扩展为含 pid 的路径（当前不需要）。
 - [x] **P2-N** store schema 迁移未事务化 ✅ 已修：migrate 整体包在 `unchecked_transaction` + `commit` 内，失败回滚（避免半迁移状态不一致）。
 - [x] **P2-O** 迁移无「user_version 过新」拒绝 ✅ 已修：加 `SCHEMA_VERSION=3` 常量；`user_version > SCHEMA_VERSION` 时 `Err` 拒绝（旧代码跑新 DB 风险）。
 - [x] **P2-P** store 无 `busy_timeout` ✅ 已修：`open_and_setup` 加 `PRAGMA busy_timeout=5000`（多连接竞争时等待而非立即 SQLITE_BUSY 失败）。
 - [x] **P2-Q** `first_credential` 无 ORDER BY ✅ 已修：SQL 加 `ORDER BY account_id`（多行时顺序确定，原 `LIMIT 1` 无 ORDER BY 顺序未定义）。
 - [ ] **P2-R** 审计日志无轮转（`store/schema.rs:55-63`）
-- [ ] **P2-S** ilink `ilink_bot_id`/`ilink_user_id` 全程 dead_code（`client.rs:24-27`，需抓包确认）
-- [ ] **P2-T** ilink breaker threshold=1 单次即熔断（`platform.rs:70-74`）
+- [x] **P2-S** ilink `ilink_bot_id`/`ilink_user_id` 全程 dead_code ✅ 已处理：`client.rs:24-27` 已 `#[allow(dead_code)]` 标注（保留字段待抓包确认协议用途，不删除以免破坏未来扩展）。
+- [x] **P2-T** ilink breaker threshold=1 单次即熔断 ✅ 已修：threshold `1` → `3`（30s 窗口内 3 次限流才熔断；threshold=1 单次即熔断过于敏感，仍保持服从式退避合规红线）。
 - [ ] **P2-U** ilink extract_host 裸字符串 split（`media.rs:146-156`，建议 `url::Url`）
 - [x] **P2-V** ilink 媒体文件权限 ✅ 已修：`persist_media` 文件写入后 `set_permissions 0600`（headless 部署隐私——解密后的私聊媒体不暴露给同机其他用户；目录 0700 已有）。
 - [x] **P2-W** ilink `let _ =` 吞错无 log ✅ 已修：`set_sync_buf` / `set_context_token` 失败改 `if let Err warn`（best-effort 不阻断，但可观测）；`platform.rs:655` 的 `set_permissions` 属 P2-V（媒体目录权限），保留。
