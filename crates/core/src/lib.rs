@@ -16,6 +16,7 @@
 mod auth;
 mod backend;
 pub mod backend_common;
+pub mod dedup;
 mod config;
 mod dispatch;
 mod error;
@@ -29,6 +30,7 @@ mod types;
 pub use auth::Auth;
 pub use backend::Backend;
 pub use config::{Config, PermissionMode};
+pub use dedup::Dedup;
 pub use dispatch::Dispatcher;
 pub use error::{CoreError, Result};
 pub use message::split_message;

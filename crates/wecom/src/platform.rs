@@ -13,7 +13,9 @@ use async_trait::async_trait;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, warn};
 
-use imagent_core::{ConvId, CoreError, InboundMessage, MediaRef, Platform, ReplyHint, Result};
+use imagent_core::{
+    ConvId, CoreError, Dedup, InboundMessage, MediaRef, Platform, ReplyHint, Result,
+};
 
 use crate::client::{InboundFrame, OutboundFrame, WeComWsClient};
 use crate::proto::{build_send_markdown_frame, parse_msg_callback, userid_from_conv};
@@ -52,11 +54,17 @@ impl WeComPlatform {
         // 后台 drain task：client 推来的回调帧解析成 InboundMessage，直送入站 channel
         // （recv 直接 await，取代 50ms 轮询——无消息时零唤醒）。
         let (inbound_msg_tx, inbound_msg_rx) = mpsc::channel::<InboundMessage>(64);
+        // P1-I：msgid 滑动窗口去重（复用 core::Dedup，与 ilink 同源），重复回调丢弃。
+        let dedup = Dedup::default();
         tokio::spawn(async move {
             let mut inbound_frame_rx = inbound_frame_rx;
             while let Some(frame) = inbound_frame_rx.recv().await {
                 match parse_msg_callback(&frame) {
-                    Ok(msg) => {
+                    Ok((msgid, msg)) => {
+                        if !dedup.check(&msgid) {
+                            debug!(target: "wecom", %msgid, "重复 msgid，丢弃");
+                            continue;
+                        }
                         if inbound_msg_tx.send(msg).await.is_err() {
                             break;
                         }
@@ -137,6 +145,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn drain_drops_duplicate_msgid() {
+        // P1-I：同 msgid 的重复回调应被滑动窗口去重丢弃。
+        let (inbound_msg_tx, mut inbound_msg_rx) = mpsc::channel::<InboundMessage>(8);
+        let (inbound_frame_tx, inbound_frame_rx) = mpsc::channel::<InboundFrame>(8);
+        let dedup = Dedup::default();
+        let tx = inbound_msg_tx;
+        let _handle = tokio::spawn(async move {
+            let mut inbound_frame_rx = inbound_frame_rx;
+            let dedup = dedup;
+            while let Some(frame) = inbound_frame_rx.recv().await {
+                if let Ok((msgid, msg)) = parse_msg_callback(&frame) {
+                    if !dedup.check(&msgid) {
+                        continue;
+                    }
+                    if tx.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        // mk_callback_frame 硬编码 msgid="m1"，发两次同帧 → 第二次去重。
+        inbound_frame_tx
+            .send(mk_callback_frame("Alice", "hi"))
+            .await
+            .unwrap();
+        inbound_frame_tx
+            .send(mk_callback_frame("Alice", "hi"))
+            .await
+            .unwrap();
+        let first = inbound_msg_rx.recv().await.expect("第一条应入队");
+        assert_eq!(first.text.as_deref(), Some("hi"));
+        // 给 drain 处理第二帧的时间，再断言无第二条入队。
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            inbound_msg_rx.try_recv().is_err(),
+            "重复 msgid 应被去重，不应入队"
+        );
+    }
+
+    #[tokio::test]
     async fn drain_parses_callback_into_inbound() {
         let (inbound_msg_tx, mut inbound_msg_rx) = mpsc::channel::<InboundMessage>(8);
         let (inbound_frame_tx, mut inbound_frame_rx) = mpsc::channel::<InboundFrame>(8);
@@ -144,7 +192,7 @@ mod tests {
         let tx = inbound_msg_tx;
         let _handle = tokio::spawn(async move {
             while let Some(frame) = inbound_frame_rx.recv().await {
-                if let Ok(msg) = parse_msg_callback(&frame) {
+                if let Ok((_msgid, msg)) = parse_msg_callback(&frame) {
                     if tx.send(msg).await.is_err() {
                         break;
                     }

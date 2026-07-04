@@ -8,7 +8,7 @@
 
 ## 📋 修复进度（2026-07-04，分支 `fix/code-review-v2`）
 
-**已落地（10 commit，workspace 229 passed，clippy 0 warning）**：
+**已落地（11 commit，workspace 230 passed，clippy 0 warning）**：
 - ✅ **P0 全部（3/3）**：P0-A（ACP fail-open→fail-closed）、P0-B（权限 socket 对端 uid 鉴权 + chmod 0600）、P0-C（login baseurl 域名白名单）
 - ✅ **P1-D**：workdir「安全边界」措辞修正为「cwd（非沙箱）」
 - ✅ **E-1**：各 crate MSRV 统一继承 workspace 1.80 + 修复 ilink `media.rs` 的 `is_multiple_of`（1.87 API，CI @1.80 实际会失败）
@@ -18,10 +18,11 @@
 - ✅ **P1-C**：keyring fail-closed 选项（`require_keyring` 配置 + 明文回退/拒绝 metric counter）
 - ✅ **P1-J**：login reqwest 禁 redirect（与运行时 client 一致，堵 login 阶段 SSRF/重定向劫持）
 - ✅ **P1-H/L**：媒体簇——解密 fail-closed（aes_key 解析失败返回 Err 而非当明文泄漏）+ 流式下载防 chunked OOM（`bytes_stream()` 累计 + 超限中止）
+- ✅ **P1-I**：WeCom msgid 去重（`Dedup` 提到 core 共享，drain task 接线）
 
 > ⚠️ **破例说明（P0-B + P1-A/B/C 由主会话自行 Edit）**：omp 工具链反复异常——上会话 5 次（并发 exit 1（API 限流）×2、「清理工作树到只剩本任务文件」覆盖前序成果×2、强约束下 noop×1）；本会话 P1-C 委派 omp **第 3 次「空手退出」**（exit 0、零产出、log 仅 1 行主会话口吻废话；前两次 6/30、7/04 已记 engram `cd4f3255`/`33d52163`）。依 `CODE_REVIEW.md` 顶部先例（"omp 工具链对重构类任务反复委派/挂死，用户授权破例自行 Edit"），P0-B/P1-A/B/C 破例主会话自行 Edit（方案已完整 review/设计，每项 `cargo test` 验证）。**违反 CLAUDE.md omp 委派硬规则**，请 review；P0-A/C 由 omp 完成，P1-D/E-1/E-2 为注释/配置/attribute 类主会话直接改。后续 omp 任务说明须显式禁 git 写操作 + 禁删非任务文件（教训已记 memory：`omp-worktree-protection`）。
 
-**剩余（后续 issue 跟进）**：P1-E/F/G/I/K（上线前应修）、P2 全部、E-3~E-7、D-1~D-4。
+**剩余（后续 issue 跟进）**：P1-E/F/G/K（上线前应修）、P2 全部、E-3~E-7、D-1~D-4。
 
 每条 issue 带 checkbox，id 形如 `P0-A`，便于转 GitHub issue 追踪。
 
@@ -79,7 +80,7 @@
 - [ ] **P1-F  `/compact`/`/new`/`/switch` 绕过 `conv_locks`**：`crates/core/src/dispatch.rs:581-700`。与在飞任务并发 resume 同一 session，可能损坏状态。
 - [ ] **P1-G  权限 pending 无超时，agent 死后下一条消息被静默吞**：`crates/core/src/dispatch.rs:316-323`。修复：pending 带 `agent_timeout` 对齐的超时。
 - [x] **P1-H  媒体解密 silent failure** ✅ 已修：`download_media` 区分 None / parse 失败 / 解密失败三分支，aes_key 存在但解析失败时返回 Err（不再落入 None 当明文泄漏）。
-- [ ] **P1-I  WeCom 完全无消息去重**：`crates/wecom/src/proto.rs:53`。复用 ilink 的 `Dedup`。
+- [x] **P1-I  WeCom 完全无消息去重** ✅ 已修：`Dedup` 从 ilink 提到 `core`（平台无关共享；ilink re-export 保持 `crate::dedup::Dedup` 路径不变，platform.rs 零改动）；`parse_msg_callback` 返回 `(msgid, InboundMessage)` 暴露 msgid；wecom drain task 持 `Dedup` 对 msgid 滑动窗口去重。回归测试 `drain_drops_duplicate_msgid`。
 - [x] **P1-J  `login.rs` reqwest 未禁 redirect** ✅ 已修：login client builder 加 `.redirect(Policy::none())`，与运行时 client（`client.rs:42`）一致。
 - [ ] **P1-K  `/compact` 首条消息失败 → compact_summary 永久丢失**：`crates/core/src/dispatch.rs:773-783`。摘要删除推迟到 run 成功后。
 - [x] **P1-L  媒体下载 chunked OOM** ✅ 已修：`bytes_stream()` 流式累计 + 超 `MEDIA_MAX_BYTES` 即中止（覆盖 chunked / 无 Content-Length 的大文件）；Content-Length 预检保留作快速路径。
