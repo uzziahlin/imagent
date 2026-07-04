@@ -218,6 +218,16 @@ pub async fn download_media(
             format!("cdn download HTTP {status}"),
         ));
     }
+    // 防大文件 OOM：按 Content-Length 预检（诚实服务端会报；缺失则放行，由后续内存兜底）。
+    const MEDIA_MAX_BYTES: u64 = 50 * 1024 * 1024;
+    if let Some(len) = resp.content_length() {
+        if len > MEDIA_MAX_BYTES {
+            return Err(CoreError::Platform(
+                "ilink",
+                format!("cdn download too large: {len} > {MEDIA_MAX_BYTES} bytes"),
+            ));
+        }
+    }
     let ciphertext = resp
         .bytes()
         .await
