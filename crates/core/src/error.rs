@@ -12,6 +12,9 @@ pub enum CoreError {
     Backend(&'static str, String),
     #[error("config: {0}")]
     Config(String),
+    /// 会话过期（需重新登录）。专用 variant，避免靠 Display 子串匹配判定。
+    #[error("session expired: {0}")]
+    SessionExpired(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }

@@ -128,6 +128,18 @@ async fn main() -> Result<()> {
             let perm_mode = std::sync::Arc::new(parking_lot::RwLock::new(config.permission_mode));
             let backend = build_backend(&config.agent, perm_mode.clone());
 
+            // codex/gemini 后端不支持 IM 权限审批闭环：若用户开启了 permission_mode，
+            // 显式 warn（不静默忽略），避免预期落差。
+            if config.permission_mode.is_enabled()
+                && matches!(config.agent.as_str(), "codex" | "gemini")
+            {
+                tracing::warn!(
+                    target: "imagent::ops",
+                    agent = %config.agent,
+                    "后端不支持 IM 权限审批闭环，permission_mode 将不生效（仅靠 agent 自身 sandbox/approval-mode 兜底）；如需 IM approve/deny 请用 claude-cli"
+                );
+            }
+
             // 7. auth —— 白名单：config 种子 ∪ store 已有（CLI /allow 或 IM /allow 持久化）。
             let mut initial: Vec<String> = config.allowed_senders.clone();
             let stored = store.list_allowed_senders().await.unwrap_or_default();
@@ -150,6 +162,7 @@ async fn main() -> Result<()> {
                 config.default_workdir.clone(),
                 tools_handle,
                 perm_mode.clone(),
+                std::time::Duration::from_secs(config.agent_timeout_secs),
             ));
 
             // 9. 运维 HTTP server（/metrics + /health）。metrics_addr 为 None 或空串则关闭。
@@ -176,7 +189,13 @@ async fn main() -> Result<()> {
             }
 
             // 10. SIGHUP 热重载（白名单 / allowed_tools / permission_mode）。
+            #[cfg(unix)]
             spawn_sighup_handler(dispatcher.clone(), config_path.clone(), http_store.clone());
+            #[cfg(not(unix))]
+            tracing::info!(
+                target: "imagent::ops",
+                "SIGHUP 热重载需要 Unix 信号，当前平台不可用（配置改动需重启生效）"
+            );
 
             // 11. 前台运行 + Ctrl-C
             tracing::info!(
@@ -190,7 +209,7 @@ async fn main() -> Result<()> {
                 res = dispatcher.clone().run() => match res {
                     Ok(()) => tracing::info!("dispatcher 正常退出"),
                     Err(e) => {
-                        if e.to_string().to_lowercase().contains("session expired") {
+                        if matches!(e, imagent_core::CoreError::SessionExpired(_)) {
                             tracing::error!("dispatcher 退出：{e}");
                             println!("iLink session 已过期，请重新运行 `imagent login` 扫码登录。");
                         } else {
@@ -400,8 +419,14 @@ async fn metrics_handler() -> (StatusCode, String) {
 
 async fn health_handler(State(st): State<HttpState>) -> (StatusCode, Json<Health>) {
     let sessions = st.store.count_sessions().await.unwrap_or(-1);
+    let logged_in = st
+        .store
+        .first_credential("ilink")
+        .await
+        .map(|o| o.is_some())
+        .unwrap_or(false);
     let body = Health {
-        logged_in: true,
+        logged_in,
         uptime_secs: st.start_at.elapsed().as_secs(),
         version: env!("CARGO_PKG_VERSION"),
         sessions,
@@ -411,13 +436,13 @@ async fn health_handler(State(st): State<HttpState>) -> (StatusCode, Json<Health
 
 /// SIGHUP 热重载：重读 config.toml，刷新白名单 / allowed_tools / permission_mode。
 /// 解析失败只 warn 不崩，保留既有运行时配置。
+#[cfg(unix)]
 fn spawn_sighup_handler(
     dispatcher: Arc<imagent_core::Dispatcher>,
     config_path: PathBuf,
     store: imagent_store::Store,
 ) {
     tokio::spawn(async move {
-        // tokio signal::unix；不可用时回退为静默（不崩主进程）。
         let mut sig = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
             Ok(s) => s,
             Err(e) => {

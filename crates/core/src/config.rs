@@ -57,9 +57,8 @@ pub struct Config {
     /// IM 权限审批模式（默认 Off，向后兼容 P1 行为）。
     #[serde(default)]
     pub permission_mode: PermissionMode,
-    /// Prometheus 指标 / 健康检查 HTTP 监听地址（`"127.0.0.1:9100"`）。
-    /// 空串 `""` 或省略默认值外的显式空 = 关闭 HTTP server。
-    /// 默认 127.0.0.1:9100。
+    /// Prometheus 指标 / 健康检查 HTTP 监听地址（如 `"127.0.0.1:9100"`）。
+    /// 默认 `None`（关闭——开源分发时不默认开启监听端口）；显式设置地址即开启。
     #[serde(default = "default_metrics_addr")]
     pub metrics_addr: Option<String>,
     /// 出站消息单条字符上限（Unicode char 计）。超长则由各 Platform 的 `send_text`
@@ -69,6 +68,10 @@ pub struct Config {
     /// 分片之间发送间隔（毫秒），避免多条叠加触发 IM 限流。默认 400。
     #[serde(default = "default_fragment_interval_ms")]
     pub message_fragment_interval_ms: u64,
+    /// 单次 agent 运行超时（秒）。超时则中止该次 run（依赖 backend 的
+    /// `kill_on_drop` 杀子进程），防止挂死的 agent 永久卡住会话。默认 600（10 分钟）。
+    #[serde(default = "default_agent_timeout_secs")]
+    pub agent_timeout_secs: u64,
     /// WeCom 智能机器人凭据（可选；仅 `platform = "wecom"` 时使用）。
     #[serde(default)]
     pub wecom_bot_id: Option<String>,
@@ -87,10 +90,13 @@ fn default_platform() -> String {
     "ilink".into()
 }
 fn default_metrics_addr() -> Option<String> {
-    Some("127.0.0.1:9100".into())
+    None
 }
 fn default_fragment_interval_ms() -> u64 {
     400
+}
+fn default_agent_timeout_secs() -> u64 {
+    600
 }
 
 impl Config {
@@ -124,9 +130,10 @@ allowed_tools = ["Read", "Edit"]
 agent = "claude-cli"         # claude-cli(默认) | claude-acp(ACP长驻子进程) | codex | gemini
 platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人,配 wecom_bot_id/wecom_secret)
 permission_mode = "off"     # off(默认,claude按allowedTools自行处理) | allow | deny | ask(IM审批闭环)
-# metrics_addr = "127.0.0.1:9100"   # 空串 "" = 关闭 /metrics + /health HTTP server
+# metrics_addr = "127.0.0.1:9100"   # 默认关闭；设为 "ip:port" 开启 /metrics + /health HTTP server
 # message_max_len = 2000              # 单条出站消息字符上限（Unicode char）；不设 = 不分片
 # message_fragment_interval_ms = 400  # 分片间发送间隔（ms）
+# agent_timeout_secs = 600            # 单次 agent 运行超时（秒）；超时中止防挂死
 "#;
 }
 #[cfg(test)]
@@ -227,10 +234,10 @@ platform = "ilink"
     }
 
     #[test]
-    fn metrics_addr_defaults_to_loopback_9100() {
+    fn metrics_addr_defaults_to_none() {
         let p = tmp_path("metrics_def", r#"default_workdir = "/tmp/ws""#);
         let cfg = Config::load(&p).expect("parse");
-        assert_eq!(cfg.metrics_addr.as_deref(), Some("127.0.0.1:9100"));
+        assert_eq!(cfg.metrics_addr, None);
         cleanup(&p);
     }
 
