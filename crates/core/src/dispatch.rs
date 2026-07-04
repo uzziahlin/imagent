@@ -89,6 +89,8 @@ pub struct Dispatcher {
     permission_mode: Arc<RwLock<PermissionMode>>,
     /// 单次 agent 运行超时。超时则中止该次 run（backend 的 kill_on_drop 杀子进程）。
     agent_timeout: std::time::Duration,
+    /// 管理员 sender（可 /allow）；空 = 所有白名单用户可（向后兼容，P2-D）。
+    admin_senders: Arc<RwLock<Vec<String>>>,
 }
 
 impl Dispatcher {
@@ -102,6 +104,7 @@ impl Dispatcher {
         allowed_tools: Vec<String>,
         permission_mode: PermissionMode,
         agent_timeout: std::time::Duration,
+        admin_senders: Vec<String>,
     ) -> Self {
         Self::new_with_handles(
             platform,
@@ -112,6 +115,7 @@ impl Dispatcher {
             Arc::new(RwLock::new(allowed_tools)),
             Arc::new(RwLock::new(permission_mode)),
             agent_timeout,
+            admin_senders,
         )
     }
 
@@ -130,6 +134,7 @@ impl Dispatcher {
         allowed_tools: Arc<RwLock<Vec<String>>>,
         permission_mode: Arc<RwLock<PermissionMode>>,
         agent_timeout: std::time::Duration,
+        admin_senders: Vec<String>,
     ) -> Self {
         Self {
             platform,
@@ -142,7 +147,16 @@ impl Dispatcher {
             router: Arc::new(PermissionRouter::new()),
             permission_mode,
             agent_timeout,
+            admin_senders: Arc::new(RwLock::new(admin_senders)),
         }
+    }
+
+    /// 调用者是否为管理员（可 /allow）。admin_senders 空 = 向后兼容（所有白名单
+    /// 用户可）；非空则严格检查（P2-D）。
+    fn is_admin(&self, sender: &str) -> bool {
+        let admins = self.admin_senders.read();
+        let trimmed = sender.trim();
+        admins.is_empty() || admins.iter().any(|a| a.trim() == trimmed)
     }
 
     /// SIGHUP 热重载：整体替换 allowed_tools。
@@ -463,6 +477,17 @@ impl Dispatcher {
                             self.reply(&conv, "用法: /allow <sender_id>", &hint).await;
                         } else {
                             let actor = sender.0.as_str();
+                            // P2-D：仅管理员可授权新用户（admin_senders 非空时严格；
+                            // 空则向后兼容所有白名单用户可）。
+                            if !self.is_admin(actor) {
+                                self.reply(
+                                    &conv,
+                                    "仅管理员（admin_senders）可授权新用户。",
+                                    &hint,
+                                )
+                                .await;
+                                return;
+                            }
                             let added = self.auth.allow(target);
                             // P2-E：持久化失败不能谎报「已授权」（内存已加但重启后丢失）。
                             let persist_failed = self
@@ -1347,8 +1372,36 @@ mod tests {
             vec!["Read".into(), "Edit".into()],
             PermissionMode::Off,
             std::time::Duration::from_secs(600),
+            vec![], // admin_senders 空 = 测试用向后兼容（所有白名单用户可 /allow）
         ));
 
+        Ctx {
+            disp,
+            inbox,
+            send_count,
+            calls,
+            prompts,
+            order,
+            db,
+        }
+    }
+
+    /// P2-D：与 build 相同但允许指定 admin_senders（测试角色区分）。
+    async fn build_with_admin(auth: Auth, admin_senders: Vec<String>) -> Ctx {
+        let (plat, inbox, send_count) = MockPlatform::new();
+        let (back, calls, prompts, order) = MockBackend::new();
+        let (store, db) = tmp_store().await;
+        let disp = Arc::new(Dispatcher::new(
+            Arc::new(plat),
+            Arc::new(back),
+            store,
+            auth,
+            std::path::PathBuf::from("/tmp/imagent-test-ws"),
+            vec!["Read".into(), "Edit".into()],
+            PermissionMode::Off,
+            std::time::Duration::from_secs(600),
+            admin_senders,
+        ));
         Ctx {
             disp,
             inbox,
@@ -1375,6 +1428,7 @@ mod tests {
             vec!["Read".into(), "Edit".into()],
             PermissionMode::Off,
             std::time::Duration::from_secs(600),
+            vec![], // admin_senders 空 = 测试用向后兼容（所有白名单用户可 /allow）
         ));
 
         Ctx {
@@ -1557,6 +1611,26 @@ mod tests {
         assert_eq!(calls[0], None);
         assert_eq!(calls[1].as_deref(), Some("sess-0"));
         assert_eq!(calls[2].as_deref(), Some("sess-1"));
+        drop_db(ctx.db).await;
+    }
+
+    #[tokio::test]
+    async fn allow_rejected_for_non_admin_when_admin_senders_set() {
+        // P2-D：admin_senders 非空时，白名单内非 admin 用户 /allow 被拒绝。
+        let ctx = build_with_admin(
+            Auth::new(vec!["alice".into(), "bob".into()]),
+            vec!["alice".into()],
+        )
+        .await;
+        // bob（白名单但非 admin）尝试 /allow charlie → 应被拒绝。
+        feed_and_wait(&ctx, vec![msg("c", "bob", "/allow charlie")], 1).await;
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(
+            inbox.iter().any(|m| m.contains("仅管理员")),
+            "非 admin /allow 应被拒绝: {inbox:?}"
+        );
+        // charlie 未被授权。
+        assert!(!ctx.disp.auth().is_allowed(&UserId("charlie".into())));
         drop_db(ctx.db).await;
     }
 

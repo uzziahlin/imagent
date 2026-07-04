@@ -98,7 +98,7 @@
 - [x] **P2-A** `/switch` 不校验 agent_kind ✅ 已修：切历史 named session 时校验 `agent_kind`，与当前 backend 不匹配则 reply 拒绝（异类 backend 的 session_id 不互通，续接会失败）。
 - [x] **P2-B** socket `bind` 失败只 warn ✅ 已修：升为 `error!` 级别 + 显著措辞（Ask 闭环不可用 = 安全 posture 退化，需告警而非静默 warn）。
 - [x] **P2-C** socket 问询强制 `ReplyHint::None` 丢 iLink context_token ✅ 已澄清（非缺陷）：ilink `resolve_context_token`（`platform.rs:174-182`）对 `ReplyHint::None` 读 store `get_context_token` 兜底，权限问询 send_text 不丢 context_token。
-- [ ] **P2-D** `/allow` 无角色区分，任意白名单用户可授权新用户（`dispatch.rs:399-433`）
+- [x] **P2-D** `/allow` 无角色区分 ✅ 已修：config 加 `admin_senders`；Dispatcher 持 `Arc<RwLock<Vec>>` + `is_admin` 检查；`/allow` 在 `admin_senders` 非空时仅 admin 可授权，空则向后兼容（所有白名单用户可，生产建议显式设置）。回归测试 `allow_rejected_for_non_admin_when_admin_senders_set`。
 - [x] **P2-E** `/allow` store 失败仍回「已授权」 ✅ 已修：`add_allowed_sender` 持久化失败时 reply 警告（内存已授权 + 重启后将丢失），不再谎报「已授权」。
 - [x] **P2-F** 中间 Text chunk 全丢弃，「流式」实际一次性 ✅ 已修：`AgentChunk::Text(t)` 实时推 IM（流式体验，而非丢弃只发最终 Final）。
 - [x] **P2-G** `parse_reply` 首字符 y/Y 误判 ✅ 已修：去掉首字符 y/Y 宽匹配（会把 year/yellow/yesterday 误 allow——权限 approve/deny 的真实安全 bug），改精确匹配 `y/yes/ye/yep/yeah/ok/okay/是/允许/好/好的`。回归测试 `parse_reply_year_not_allowed`。

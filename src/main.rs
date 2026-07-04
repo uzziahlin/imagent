@@ -168,6 +168,7 @@ async fn main() -> Result<()> {
                 tools_handle,
                 perm_mode.clone(),
                 std::time::Duration::from_secs(config.agent_timeout_secs),
+                config.admin_senders.clone(),
             ));
 
             // 9. 运维 HTTP server（/metrics + /health）。metrics_addr 为 None 或空串则关闭。

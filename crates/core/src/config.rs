@@ -49,6 +49,10 @@ pub struct Config {
     pub default_workdir: PathBuf,
     #[serde(default)]
     pub allowed_senders: Vec<String>,
+    /// 管理员 sender（可执行 /allow /disallow 授权新用户）。空 = 向后兼容（所有
+    /// 白名单用户可 /allow，P2-D 建议生产环境显式设置以收敛授权面）。
+    #[serde(default)]
+    pub admin_senders: Vec<String>,
     #[serde(default = "default_tools")]
     pub allowed_tools: Vec<String>,
     #[serde(default = "default_agent")]
@@ -132,6 +136,7 @@ impl Config {
     pub const EXAMPLE: &'static str = r#"# ~/.imagent/config.toml
 default_workdir = "/absolute/path/to/agent/workspace"   # 必填，agent 的 cwd（非沙箱：不限制可读路径，靠 allowed_tools + permission_mode 兜底）
 allowed_senders = []        # 留空 = 发现模式（只打日志记录入站 sender，不驱动 agent）
+# admin_senders = []          # 可 /allow 的管理员 sender；空=所有白名单用户可(P2-D，生产建议显式设置收敛授权面)
 allowed_tools = ["Read", "Edit"]
 agent = "claude-cli"         # claude-cli(默认) | claude-acp(ACP长驻子进程) | codex | gemini
 platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人,配 wecom_bot_id/wecom_secret)
