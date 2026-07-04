@@ -6,6 +6,7 @@
 
 [workspace]
 resolver = "2"
+exclude = ["fuzz"]  # cargo-fuzz 独立 crate（需 nightly，E-7）
 # 计划的 crate（实现时取消注释并创建对应 Cargo.toml + src/lib.rs）：
 # members = [
 #     "crates/core",   # 调度核心：trait Platform / trait Backend、鉴权、会话路由

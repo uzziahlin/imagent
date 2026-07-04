@@ -130,7 +130,7 @@
 - [x] **E-4（P2）无 cargo-deny / dependabot / CODEOWNERS** ✅ 已修：新增 `deny.toml`（license 白名单 + source/ ban）、`.github/dependabot.yml`（cargo + github-actions 周更）、`.github/CODEOWNERS`（占位 `@imagent/maintainers`，TODO 待填真实 owner）；CI 加 `deny` job（`cargo deny check licenses sources bans`，与既有 `audit` job 互补）。
 - [x] **E-5（P2）无 rust-toolchain.toml** ✅ 已修：新增 `rust-toolchain.toml` pin `channel = "1.80"`（= workspace MSRV），本地 + CI 统一 MSRV 验证。
 - [x] **E-6（P2）release artifact 不含 LICENSE** ✅ 已修：`release.yml` Package 步骤 `cp LICENSE dist/`，gh-release `files` 含 `dist/LICENSE`。
-- [ ] **E-7（迭代）无 fuzz**（ilink proto / stream 解析适合 fuzz）。
+- [x] **E-7（迭代）无 fuzz** ✅ 已加：`fuzz/` cargo-fuzz crate（workspace exclude），两个 target——`ilink_proto_parse`（`proto::parse_frame` 任意字节不 panic）+ `ilink_media_cdn_host`（`media::assert_cdn_host` SSRF 校验）。需 nightly + `cargo-fuzz`，用法见 `fuzz/README.md`。
 
 ### 文档状态漂移
 
