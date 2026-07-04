@@ -12,6 +12,8 @@
 //! 鉴权由 core 做：adapter 只透传 `from_user_id`，自己**不**做白名单
 //! （DESIGN §9 硬约束①）。
 
+#![forbid(unsafe_code)]
+
 mod client;
 mod dedup;
 mod login;

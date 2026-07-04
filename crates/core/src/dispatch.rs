@@ -262,8 +262,7 @@ impl Dispatcher {
                 match listener.accept().await {
                     Ok((stream, _)) => {
                         // 鉴权：只接受与本进程同 uid 的连接（MCP 子进程由本进程 spawn，必然同 uid）。
-                        // SAFETY: getuid 无参数无副作用，永远安全。
-                        let expected_uid = unsafe { libc::getuid() };
+                        let expected_uid = current_uid();
                         match peer_uid(&stream) {
                             Some(uid) if uid == expected_uid => {
                                 let platform = platform.clone();
@@ -979,12 +978,21 @@ impl Dispatcher {
     }
 }
 
+/// 本进程的 uid（peer-uid 鉴权用）。
+#[cfg(unix)]
+#[allow(unsafe_code)] // crate 顶层 `#![deny(unsafe_code)]`，此处显式豁免
+fn current_uid() -> u32 {
+    // SAFETY: getuid 无参数、无副作用，永远安全。
+    unsafe { libc::getuid() }
+}
+
 /// 取 UnixStream 对端的 uid（用于权限 socket 鉴权）。
 ///
 /// - Linux: `SO_PEERCRED`
 /// - macOS: `LOCAL_PEERCRED`
 /// - 其它 unix: 返回 None（调用方应拒绝）。
 #[cfg(unix)]
+#[allow(unsafe_code)] // crate 顶层 `#![deny(unsafe_code)]`，此处显式豁免
 fn peer_uid(stream: &tokio::net::UnixStream) -> Option<u32> {
     use std::os::unix::io::AsRawFd;
     let fd = stream.as_raw_fd();
@@ -1947,8 +1955,7 @@ mod permission_socket_tests {
         a.set_nonblocking(true).expect("set_nonblocking");
         let ta = tokio::net::UnixStream::from_std(a).expect("from_std");
         let got = peer_uid(&ta).expect("peer_uid 对本地连接应返回 Some");
-        // SAFETY: getuid 无参数无副作用，永远安全。
-        let self_uid = unsafe { libc::getuid() };
+        let self_uid = super::current_uid();
         assert_eq!(got, self_uid);
         drop(ta);
         drop(b);

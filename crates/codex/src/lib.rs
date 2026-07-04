@@ -8,6 +8,8 @@
 //! 与 [`imagent_claude::ClaudeBackend`] 同构：spawn + 逐行 JSONL 解析 + session
 //! 捕获，差异仅在 CLI 命令与事件结构。对外只暴露 [`CodexBackend`]。
 
+#![forbid(unsafe_code)]
+
 mod backend;
 mod stream;
 

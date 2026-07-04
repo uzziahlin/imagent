@@ -8,10 +8,11 @@
 
 ## 📋 修复进度（2026-07-04，分支 `fix/code-review-v2`）
 
-**已落地（7 commit，workspace 225 passed，clippy 0 warning）**：
+**已落地（8 commit，workspace 225 passed，clippy 0 warning）**：
 - ✅ **P0 全部（3/3）**：P0-A（ACP fail-open→fail-closed）、P0-B（权限 socket 对端 uid 鉴权 + chmod 0600）、P0-C（login baseurl 域名白名单）
 - ✅ **P1-D**：workdir「安全边界」措辞修正为「cwd（非沙箱）」
 - ✅ **E-1**：各 crate MSRV 统一继承 workspace 1.80 + 修复 ilink `media.rs` 的 `is_multiple_of`（1.87 API，CI @1.80 实际会失败）
+- ✅ **E-2**：7 crate + `main.rs` 加 `#![forbid(unsafe_code)]`；core 因 P0-B peer-uid 鉴权保留必要 unsafe，改用 `#![deny(unsafe_code)]` + 抽 `current_uid()` helper、`peer_uid` 局部 `#[allow(unsafe_code)]` 隔离（开源姿态：默认禁 unsafe，必要处显式标注 + SAFETY）
 - ✅ **P1-A**：WAL/SHM 边车文件 chmod 0600（堵 headless 明文回退泄漏面）
 - ✅ **P1-B**：凭据写入审计（`credential_put` best-effort `append_audit`）
 
@@ -114,7 +115,7 @@
 ## 🛠 开源就绪度工程化（`P3_ROADMAP.md §2` 自定标准未达成）
 
 - [x] **E-1（P1）MSRV 声明混乱** ✅ 已修（5dbccc1）：workspace 写 1.80 但无 crate 继承，`store` 写死 1.75。修复：各 crate 加 `rust-version.workspace=true`。
-- [ ] **E-2（P1）无 `#![forbid(unsafe_code)]`**：0 处 unsafe 却未声明，每 crate `lib.rs` 加一行。
+- [x] **E-2（P1）无 `#![forbid(unsafe_code)]`** ✅ 已修：7 crate + `main.rs` 加 `#![forbid(unsafe_code)]`；core 用 `#![deny(unsafe_code)]` + `current_uid()`/`peer_uid` 局部 `#[allow]` 隔离 P0-B 必要 unsafe。
 - [ ] **E-3（P1）coverage 形同摆设**：`coverage.yml` 全程 `|| true`，失败被吞。去掉 `|| true`。
 - [ ] **E-4（P2）无 cargo-deny / dependabot / CODEOWNERS**（`P3_ROADMAP §2.2` 自列标配）。
 - [ ] **E-5（P2）无 rust-toolchain.toml**。

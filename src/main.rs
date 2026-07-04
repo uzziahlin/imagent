@@ -3,6 +3,8 @@
 //! 职责：加载配置 → 扫码登录 → 前台常驻收私聊 → 鉴权 → 驱动 `claude -p` → 回传。
 //! 鉴权 / allowedTools 收敛 / 风控逻辑全部在 core（`Dispatcher`）中，main 只做组装。
 
+#![forbid(unsafe_code)]
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;

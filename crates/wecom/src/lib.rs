@@ -8,6 +8,8 @@
 //! - [`client`]：`WeComWsClient` 负责 connect / 认证 / 心跳 / 重连 / 收发帧 / ack。
 //! - [`platform`]：`WeComPlatform` 实现 [`imagent_core::Platform`]，委托 client。
 
+#![forbid(unsafe_code)]
+
 mod client;
 mod platform;
 mod proto;

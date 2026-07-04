@@ -8,6 +8,8 @@
 //! 与 [`imagent_codex::CodexBackend`] 同构：spawn + 逐行 JSONL 解析 + session
 //! 捕获，差异仅在 CLI 命令与事件结构。对外只暴露 [`GeminiBackend`]。
 
+#![forbid(unsafe_code)]
+
 mod backend;
 mod stream;
 

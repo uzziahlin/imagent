@@ -6,6 +6,8 @@
 //!
 //! 对外只暴露 [`ClaudeBackend`]。
 
+#![forbid(unsafe_code)]
+
 mod acp;
 mod backend;
 mod stream;

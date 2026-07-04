@@ -7,6 +7,8 @@
 //! 每个 `async` 方法的 DB 操作用 `tokio::task::spawn_blocking` 包裹。锁 guard
 //! 只存活于 blocking 线程内，绝不跨 `.await`。
 
+#![forbid(unsafe_code)]
+
 mod credentials;
 mod error;
 mod schema;
