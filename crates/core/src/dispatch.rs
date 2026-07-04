@@ -372,6 +372,17 @@ impl Dispatcher {
         let _ = stream.flush().await;
     }
 
+    /// 取（或创建）conv 串行锁的 Arc clone。
+    /// P1-F：slash 命令复用，与普通消息 agent task 串行（避免并发改 session 损坏状态）。
+    /// 回收沿用普通消息路径的 release（strong_count==1 时 remove）；slash 路径不显式
+    /// release，其 lock clone drop 后由下次普通消息 release 清理（延迟回收，最终回收）。
+    async fn acquire_conv_lock(&self, conv: &str) -> Arc<Mutex<()>> {
+        let mut map = self.conv_locks.lock().await;
+        map.entry(conv.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
     /// 处理单条消息。内部任何错误都 log 并吞掉，不影响主循环。
     async fn handle(&self, msg: InboundMessage) {
         let conv = msg.conv_id.clone();
@@ -420,6 +431,9 @@ impl Dispatcher {
                 let cmd = parts[0].to_ascii_lowercase();
                 match cmd.as_str() {
                     "/new" => {
+                        // P1-F：取 conv 串行锁，与在飞 agent task 串行（避免并发改 session 损坏状态）。
+                        let _conv_lock = self.acquire_conv_lock(&conv.0).await;
+                        let _conv_guard = _conv_lock.lock().await;
                         // 删除该 conv 的 session 行（下次新建），失败仅 log。
                         if let Err(e) = self.store.delete_session(&conv.0).await {
                             warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "delete_session 失败");
@@ -529,6 +543,9 @@ impl Dispatcher {
                         return;
                     }
                     "/switch" => {
+                        // P1-F：取 conv 串行锁（同 /new）。
+                        let _conv_lock = self.acquire_conv_lock(&conv.0).await;
+                        let _conv_guard = _conv_lock.lock().await;
                         let name = parts.get(1).map(|s| s.trim()).unwrap_or("");
                         if name.is_empty() {
                             self.reply(&conv, "用法: /switch <name>", &hint).await;
@@ -619,6 +636,10 @@ impl Dispatcher {
                         return;
                     }
                     "/compact" => {
+                        // P1-F：取 conv 串行锁——/compact 内 resume 当前 session 生成摘要，
+                        // 须与在飞 agent task 串行（否则并发 resume 同 session 损坏状态）。
+                        let _conv_lock = self.acquire_conv_lock(&conv.0).await;
+                        let _conv_guard = _conv_lock.lock().await;
                         let key = compact_summary_key(&conv.0);
                         let existing_sid: Option<SessionId> =
                             match self.store.get_session(&conv.0).await {

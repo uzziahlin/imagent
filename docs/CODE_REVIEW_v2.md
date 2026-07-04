@@ -8,7 +8,7 @@
 
 ## 📋 修复进度（2026-07-04，分支 `fix/code-review-v2`）
 
-**已落地（13 commit，workspace 230 passed，clippy 0 warning）**：
+**已落地（14 commit，workspace 230 passed，clippy 0 warning）**：
 - ✅ **P0 全部（3/3）**：P0-A（ACP fail-open→fail-closed）、P0-B（权限 socket 对端 uid 鉴权 + chmod 0600）、P0-C（login baseurl 域名白名单）
 - ✅ **P1-D**：workdir「安全边界」措辞修正为「cwd（非沙箱）」
 - ✅ **E-1**：各 crate MSRV 统一继承 workspace 1.80 + 修复 ilink `media.rs` 的 `is_multiple_of`（1.87 API，CI @1.80 实际会失败）
@@ -21,10 +21,11 @@
 - ✅ **P1-I**：WeCom msgid 去重（`Dedup` 提到 core 共享，drain task 接线）
 - ✅ **P1-K**：compact_summary 删除推迟到 run 成功落库后（run 失败不再永久丢失摘要）
 - ✅ **P1-G**：权限 socket 回复等待加 `agent_timeout` 超时（agent 死/用户不回复不再永驻吞消息）
+- ✅ **P1-F**：`/new`/`/switch`/`/compact` 取 conv 串行锁（不再与在飞 agent task 并发损坏 session 状态）
 
 > ⚠️ **破例说明（P0-B + P1-A/B/C 由主会话自行 Edit）**：omp 工具链反复异常——上会话 5 次（并发 exit 1（API 限流）×2、「清理工作树到只剩本任务文件」覆盖前序成果×2、强约束下 noop×1）；本会话 P1-C 委派 omp **第 3 次「空手退出」**（exit 0、零产出、log 仅 1 行主会话口吻废话；前两次 6/30、7/04 已记 engram `cd4f3255`/`33d52163`）。依 `CODE_REVIEW.md` 顶部先例（"omp 工具链对重构类任务反复委派/挂死，用户授权破例自行 Edit"），P0-B/P1-A/B/C 破例主会话自行 Edit（方案已完整 review/设计，每项 `cargo test` 验证）。**违反 CLAUDE.md omp 委派硬规则**，请 review；P0-A/C 由 omp 完成，P1-D/E-1/E-2 为注释/配置/attribute 类主会话直接改。后续 omp 任务说明须显式禁 git 写操作 + 禁删非任务文件（教训已记 memory：`omp-worktree-protection`）。
 
-**剩余（后续 issue 跟进）**：P1-E/F（上线前应修）、P2 全部、E-3~E-7、D-1~D-4。
+**剩余（后续 issue 跟进）**：P1-E（上线前应修）、P2 全部、E-3~E-7、D-1~D-4。
 
 每条 issue 带 checkbox，id 形如 `P0-A`，便于转 GitHub issue 追踪。
 
@@ -79,7 +80,7 @@
 ### 健壮性 / 正确性
 
 - [ ] **P1-E  ACP 超时不杀子进程**：`crates/claude/src/acp.rs:282-304`。超时 drop 只丢 oneshot，子进程继续跑。修复：run future drop 发 cancel 或杀连接。
-- [ ] **P1-F  `/compact`/`/new`/`/switch` 绕过 `conv_locks`**：`crates/core/src/dispatch.rs:581-700`。与在飞任务并发 resume 同一 session，可能损坏状态。
+- [x] **P1-F  `/compact`/`/new`/`/switch` 绕过 `conv_locks`** ✅ 已修：提取 `acquire_conv_lock` helper；`/new`/`/switch`/`/compact` 分支开头取 conv 串行锁，与普通消息 agent task 复用同一 `conv_locks` 串行化。slash 路径不显式 release（`_guard`/`_lock` RAII drop），HashMap 回收延迟到下次普通消息 release（最终回收）。`/compact` 持锁跨 agent run 与正常 agent task 串行；无死锁（agent run 不取 conv_lock）。正确性由 conv_lock 机制 + 现有 slash/serial_order 测试保证。
 - [x] **P1-G  权限 pending 无超时，agent 死后下一条消息被静默吞** ✅ 已修：`handle_permission_socket` 的 `rx.await` 改 `tokio::time::timeout(agent_timeout, rx)`；超时回 deny 并 drop receiver。agent 死后至多 agent_timeout 窗口内的消息可能被吞，之后 socket task 超时 drop rx → 后续 route miss → dispatch fallthrough 正常 handle（route miss 的 fallthrough 已存在）。`agent_timeout` 经 `spawn_socket_accept` 传入。超时由 tokio 库保证，集成测试留 e2e。
 - [x] **P1-H  媒体解密 silent failure** ✅ 已修：`download_media` 区分 None / parse 失败 / 解密失败三分支，aes_key 存在但解析失败时返回 Err（不再落入 None 当明文泄漏）。
 - [x] **P1-I  WeCom 完全无消息去重** ✅ 已修：`Dedup` 从 ilink 提到 `core`（平台无关共享；ilink re-export 保持 `crate::dedup::Dedup` 路径不变，platform.rs 零改动）；`parse_msg_callback` 返回 `(msgid, InboundMessage)` 暴露 msgid；wecom drain task 持 `Dedup` 对 msgid 滑动窗口去重。回归测试 `drain_drops_duplicate_msgid`。
