@@ -189,7 +189,7 @@ impl Store {
         let inner = self.inner.clone();
         let row = blocking_with(inner, move |conn| {
             let mut stmt = conn
-                .prepare("SELECT account_id, blob FROM credentials WHERE platform = ?1 LIMIT 1")?;
+                .prepare("SELECT account_id, blob FROM credentials WHERE platform = ?1 ORDER BY account_id LIMIT 1")?;
             let mut rows = stmt.query(rusqlite::params![q_platform])?;
             rows.next()?
                 .map(|r| Ok::<_, StoreError>((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))

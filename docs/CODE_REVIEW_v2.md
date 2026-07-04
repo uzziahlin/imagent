@@ -111,14 +111,14 @@
 - [ ] **P2-N** store schema 迁移未事务化（`store/schema.rs:83-103`）
 - [ ] **P2-O** 迁移无「user_version 过新」拒绝（`store/schema.rs:84-101`）
 - [ ] **P2-P** store 无 `busy_timeout`（`store.rs:687-697`）
-- [ ] **P2-Q** `first_credential` 无 ORDER BY（`store.rs:129-137`）
+- [x] **P2-Q** `first_credential` 无 ORDER BY ✅ 已修：SQL 加 `ORDER BY account_id`（多行时顺序确定，原 `LIMIT 1` 无 ORDER BY 顺序未定义）。
 - [ ] **P2-R** 审计日志无轮转（`store/schema.rs:55-63`）
 - [ ] **P2-S** ilink `ilink_bot_id`/`ilink_user_id` 全程 dead_code（`client.rs:24-27`，需抓包确认）
 - [ ] **P2-T** ilink breaker threshold=1 单次即熔断（`platform.rs:70-74`）
 - [ ] **P2-U** ilink extract_host 裸字符串 split（`media.rs:146-156`，建议 `url::Url`）
 - [ ] **P2-V** ilink 媒体目录/文件权限不严谨（`platform.rs:655,660`）
 - [ ] **P2-W** ilink 多处 `let _ =` 吞错无 log（`platform.rs:103-110,127-131`）
-- [ ] **P2-X** ilink `dedup.rs:31`/`ratelimit.rs:21` 的 `expect`（mutex poison 永久 panic）
+- [x] **P2-X** ilink `dedup.rs:31`/`ratelimit.rs:21` 的 `expect`（mutex poison 永久 panic） ✅ 已修（仅 dedup 部分）：dedup check 的 `std::sync::Mutex::lock().expect` 改 `unwrap_or_else(into_inner)`（持锁 panic 的 poison 后恢复，避免永久 panic；dedup 是 best-effort 去重）。`ratelimit.rs:21` 是 `register_int_counter!().expect`（启动期注册，非 mutex poison），保留。
 
 ---
 
