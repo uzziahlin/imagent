@@ -104,7 +104,10 @@ pub async fn login_flow_with_base(store: &Store, base_url: &str) -> Result<Crede
                     ilink_user_id: st.ilink_user_id.ok_or_else(|| {
                         CoreError::Platform("ilink", "confirmed missing ilink_user_id".into())
                     })?,
-                    baseurl: st.baseurl.unwrap_or_else(|| base_url.to_string()),
+                    baseurl: {
+                        let raw = st.baseurl.unwrap_or_else(|| base_url.to_string());
+                        validate_baseurl(&raw)?
+                    },
                 };
                 // 3. 落盘
                 let blob = serde_json::to_string(&creds)
@@ -175,5 +178,62 @@ fn print_qrcode(content: &str) {
             tracing::warn!(target: "ilink", "render qrcode failed: {e}");
             println!("无法渲染终端二维码（内容过长？）：\n{content}\n");
         }
+    }
+}
+
+/// 校验服务端返回的 baseurl：必须 `https://` 且 host 为 `ilinkai.weixin.qq.com`
+/// 或以 `.weixin.qq.com` 结尾。防止 MITM/DNS 劫持把凭据与消息导向恶意域名。
+fn validate_baseurl(raw: &str) -> Result<String> {
+    let rest = raw.strip_prefix("https://").ok_or_else(|| {
+        CoreError::Platform("ilink", format!("baseurl 必须 https:// 开头: {raw:?}"))
+    })?;
+    let host = rest.split(['/', ':', '?', '#']).next().unwrap_or("");
+    if host.is_empty() {
+        return Err(CoreError::Platform(
+            "ilink",
+            format!("baseurl 缺 host: {raw:?}"),
+        ));
+    }
+    if host == "ilinkai.weixin.qq.com" || host.ends_with(".weixin.qq.com") {
+        Ok(raw.to_string())
+    } else {
+        Err(CoreError::Platform(
+            "ilink",
+            format!("baseurl host 不在白名单 (*.weixin.qq.com): {host}（原始 {raw:?}）"),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_baseurl;
+
+    #[test]
+    fn baseurl_default_ok() {
+        assert!(validate_baseurl("https://ilinkai.weixin.qq.com").is_ok());
+    }
+
+    #[test]
+    fn baseurl_subdomain_ok() {
+        assert!(validate_baseurl("https://foo.weixin.qq.com/path").is_ok());
+    }
+
+    #[test]
+    fn baseurl_evil_domain_rejected() {
+        // 关键回归：相似但恶意域名必须拒
+        assert!(validate_baseurl("https://ilinkai.weixin.qq.com.evil.com").is_err());
+        assert!(validate_baseurl("https://evil.com").is_err());
+    }
+
+    #[test]
+    fn baseurl_internal_ip_rejected() {
+        assert!(validate_baseurl("https://169.254.169.254/latest/meta-data").is_err());
+        assert!(validate_baseurl("https://10.0.0.1").is_err());
+    }
+
+    #[test]
+    fn baseurl_plain_http_rejected() {
+        assert!(validate_baseurl("http://ilinkai.weixin.qq.com").is_err());
+        assert!(validate_baseurl("ws://ilinkai.weixin.qq.com").is_err());
     }
 }
