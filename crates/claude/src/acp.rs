@@ -405,11 +405,13 @@ fn permission_outcome(
 /// 选一个 allow 类选项构造 outcome；若无 allow 选项则取首个；都没有则 Cancelled。
 fn allow_outcome(options: &[PermissionOption]) -> RequestPermissionOutcome {
     select_option(options, true)
+        .or_else(|| options.first().map(|o| o.option_id.clone()))
         .map(|id| RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(id)))
         .unwrap_or(RequestPermissionOutcome::Cancelled)
 }
 
-/// 在权限选项中挑一个：`allow=true` 时优先 Allow*，否则优先 Reject*；都找不到则取首个。
+/// 在权限选项中找一个目标 kind 的选项：`allow=true` 找 Allow*，否则找 Reject*。
+/// 找不到返回 None（调用方决定兜底语义）。
 fn select_option(options: &[PermissionOption], allow: bool) -> Option<PermissionOptionId> {
     let want = |k: PermissionOptionKind| match k {
         PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways => allow,
@@ -420,7 +422,6 @@ fn select_option(options: &[PermissionOption], allow: bool) -> Option<Permission
     options
         .iter()
         .find(|o| want(o.kind))
-        .or_else(|| options.first())
         .map(|o| o.option_id.clone())
 }
 
@@ -619,6 +620,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn permission_outcome_deny_without_reject_cancels() {
+        // 回归保护：Deny 模式下若 options 只含 Allow*（无 Reject*），
+        // 修复前会被 select_option 的无条件 fallback 击穿为 Selected(Allow)。
+        let request = dummy_perm_request(vec![
+            perm_option("allow1", PermissionOptionKind::AllowOnce),
+            perm_option("allow2", PermissionOptionKind::AllowAlways),
+        ]);
+        let mode = RwLock::new(PermissionMode::Deny);
+        assert!(matches!(
+            permission_outcome(&request, &mode),
+            RequestPermissionOutcome::Cancelled
+        ));
+    }
+
+    #[test]
+    fn permission_outcome_ask_without_reject_cancels() {
+        // 回归保护：Ask 模式 fail-closed，无 Reject* 时应 Cancelled，绝不放行。
+        let request = dummy_perm_request(vec![
+            perm_option("allow1", PermissionOptionKind::AllowOnce),
+            perm_option("allow2", PermissionOptionKind::AllowAlways),
+        ]);
+        let mode = RwLock::new(PermissionMode::Ask);
+        assert!(matches!(
+            permission_outcome(&request, &mode),
+            RequestPermissionOutcome::Cancelled
+        ));
+    }
     // ---------------------------------------------------------------------
     // 真机集成测试（需 claude-agent-acp 已安装 + Claude 已认证），默认跳过：
     //   cargo test --package imagent-claude -- --ignored acp_e2e
