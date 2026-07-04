@@ -1,14 +1,14 @@
 //! [`ClaudeBackend`]：基于 Claude Code CLI 的无状态 agent 执行器。
 
-use std::process::Stdio;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use imagent_core::{AgentChunk, Backend, CoreError, PermissionMode, Result, RunOutcome, SessionId};
+use imagent_core::{
+    backend_common::{spawn_cli_backend, CliEvent},
+    AgentChunk, Backend, CoreError, PermissionMode, Result, RunOutcome, SessionId,
+};
 use parking_lot::RwLock;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tracing::{debug, warn};
 
 use crate::stream::{parse_line, ParsedEvent};
 
@@ -64,7 +64,7 @@ fn permission_sock_path() -> String {
 }
 
 /// 写临时 mcp.json，返回路径。claude 据此 spawn MCP server 子进程。
-fn write_mcp_config(
+async fn write_mcp_config(
     conv_id: &str,
     sock: &str,
     mode: PermissionMode,
@@ -81,9 +81,9 @@ fn write_mcp_config(
     let dir = dirs::home_dir()
         .map(|h| h.join(".imagent"))
         .unwrap_or_else(std::env::temp_dir);
-    std::fs::create_dir_all(&dir)?;
+    tokio::fs::create_dir_all(&dir).await?;
     let path = dir.join(format!("mcp_{conv_id}.json"));
-    std::fs::write(&path, cfg.to_string())?;
+    tokio::fs::write(&path, cfg.to_string()).await?;
     Ok(path)
 }
 
@@ -102,155 +102,80 @@ impl Backend for ClaudeBackend {
         allowed_tools: &[String],
         chunks: tokio::sync::mpsc::Sender<AgentChunk>,
     ) -> Result<RunOutcome> {
-        // 1. 构造命令。prompt 作为单个 arg 传入（不经 shell，安全）。
+        // 构造命令（prompt 作为单个 arg，不经 shell；stdin/stdout/stderr/kill_on_drop
+        // 由 spawn_cli_backend 统一加）。
         let mut cmd = Command::new("claude");
         cmd.current_dir(workdir)
             .arg("-p")
             .arg(prompt)
             .arg("--output-format")
             .arg("stream-json")
-            .arg("--verbose")
-            .arg("--allowedTools")
-            .arg(allowed_tools.join(","));
+            .arg("--verbose");
+        // allowed_tools 非空才附加（空串语义不明，避免意外禁用全部工具）。
+        if !allowed_tools.is_empty() {
+            cmd.arg("--allowedTools").arg(allowed_tools.join(","));
+        }
         if let Some(s) = session {
             cmd.arg("--resume").arg(&s.0);
         }
-        // 权限审批：非 Off 时附加 MCP server（imagent mcp 子命令）。
-        // claude 遇需权限工具时回调 permission_request，由 MCP server 依模式
-        // allow/deny 或经 socket 转主进程 IM 询问（Ask）。
+        // 权限审批：非 Off 时附加 MCP server（imagent mcp 子命令）；claude 遇需权限工具
+        // 时回调 permission_request，由 MCP server 依模式 allow/deny 或经 socket 转 IM 询问。
         let mode = *self.permission_mode.read();
         if mode.is_enabled() {
             let sock = permission_sock_path();
-            match write_mcp_config(conv_id, &sock, mode) {
+            match write_mcp_config(conv_id, &sock, mode).await {
                 Ok(mcp_json) => {
                     cmd.arg("--mcp-config").arg(&mcp_json);
                     cmd.arg("--permission-prompt-tool")
                         .arg(imagent_core::mcp::TOOL_NAME);
                 }
                 Err(e) => {
-                    warn!(
-                        target: "imagent::claude",
-                        conv_id, error = %e,
-                        "write mcp config failed; permission gate disabled for this run"
-                    );
+                    // fail-closed：写 mcp 配置失败时拒绝运行，而非无审批放行。
+                    return Err(CoreError::Backend(
+                        NAME,
+                        format!(
+                            "permission_mode={mode:?} 要求权限审批，但写 mcp 配置失败，fail-closed 拒绝运行：{e}",
+                        ),
+                    ));
                 }
             }
         }
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        spawn_cli_backend(cmd, claude_parse, chunks, NAME).await
+    }
+}
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| CoreError::Backend(NAME, format!("failed to spawn `claude`: {e}")))?;
-
-        let stdout = child.stdout.take().expect("stdout piped");
-        let stderr = child.stderr.take().expect("stderr piped");
-
-        // 2. 逐行读 stdout，喂给 parse_line。
-        let mut reader = BufReader::new(stdout).lines();
-
-        let mut captured_session: Option<String> = None;
-        let mut final_text: Option<String> = None;
-        let mut error_text: Option<String> = None;
-
-        while let Ok(Some(line)) = reader.next_line().await {
-            match parse_line(&line) {
-                ParsedEvent::Skip => {}
-                ParsedEvent::Other { session_id } => {
-                    // 尽早捕获 session_id（但 result 事件的优先级更高）。
-                    if captured_session.is_none() {
-                        captured_session = session_id;
-                    }
-                    debug!(line = %line, "stream event (ignored)");
-                }
-                ParsedEvent::ToolUse {
-                    tool,
-                    input,
-                    session_id,
-                } => {
-                    if let Some(sid) = session_id {
-                        if captured_session.is_none() {
-                            captured_session = Some(sid);
-                        }
-                    }
-                    let _ = chunks.send(AgentChunk::ToolUse { tool, input }).await;
-                }
-                ParsedEvent::ToolResult { tool, output } => {
-                    let _ = chunks.send(AgentChunk::ToolResult { tool, output }).await;
-                }
-                ParsedEvent::Result {
+/// claude stream-json 行 → [`CliEvent`] 适配（见 [`parse_line`]）。
+fn claude_parse(line: &str) -> CliEvent {
+    match parse_line(line) {
+        ParsedEvent::Result {
+            text,
+            is_error,
+            session_id,
+        } => {
+            if is_error {
+                CliEvent::Error {
                     text,
-                    is_error,
-                    session_id,
-                } => {
-                    // result 事件的 session_id 优先。
-                    if let Some(sid) = session_id {
-                        captured_session = Some(sid);
-                    }
-                    if is_error {
-                        error_text = Some(text.clone());
-                    } else {
-                        final_text = Some(text);
-                    }
-                    // result 是终止事件，停止读取。
-                    break;
+                    session: session_id,
+                }
+            } else {
+                CliEvent::Final {
+                    text,
+                    session: session_id,
                 }
             }
         }
-
-        // 进程退出码。读取循环可能因 result 提前 break，仍需 join 拿退出码。
-        let output_status = child.wait().await;
-
-        // 把 stderr 收集出来用于诊断（仅在异常路径读取）。
-        let stderr_msg = read_stderr_to_string(stderr).await;
-
-        // 3. 错误优先级：is_error result > 非零退出码。
-        if let Some(text) = error_text {
-            // 通知下游出错，再返回 Err。
-            let _ = chunks.send(AgentChunk::Error(text.clone())).await;
-            return Err(CoreError::Backend(NAME, text));
-        }
-
-        let final_text = match final_text {
-            Some(t) if !t.is_empty() => t,
-            _ => {
-                // 没拿到 result 文本：依退出码诊断。
-                let diag = diagnose(&output_status, &stderr_msg);
-                return Err(CoreError::Backend(NAME, diag));
-            }
-        };
-
-        let session_id = captured_session.unwrap_or_default();
-        // 4. 推送 Final（与 RunOutcome.final_text 一致）。
-        let _ = chunks.send(AgentChunk::Final(final_text.clone())).await;
-
-        Ok(RunOutcome {
-            session_id: SessionId(session_id),
-            final_text,
-        })
-    }
-}
-
-/// 把子进程 stderr 全量读到字符串（不阻断）。
-async fn read_stderr_to_string(stderr: tokio::process::ChildStderr) -> String {
-    let mut reader = BufReader::new(stderr).lines();
-    let mut buf = Vec::new();
-    while let Ok(Some(line)) = reader.next_line().await {
-        buf.push(line);
-    }
-    buf.join("\n")
-}
-
-/// 无 result 文本时的诊断信息。
-fn diagnose(status: &std::io::Result<std::process::ExitStatus>, stderr: &str) -> String {
-    let code_str = match status {
-        Ok(s) => format!("exit {}", s),
-        Err(e) => format!("wait failed: {e}"),
-    };
-    let stderr_trim = stderr.trim();
-    if stderr_trim.is_empty() {
-        format!("claude produced no result event ({code_str})")
-    } else {
-        format!("claude produced no result event ({code_str}); stderr: {stderr_trim}")
+        ParsedEvent::ToolUse {
+            tool,
+            input,
+            session_id,
+        } => CliEvent::ToolUse {
+            tool,
+            input,
+            session: session_id,
+        },
+        ParsedEvent::ToolResult { tool, output } => CliEvent::ToolResult { tool, output },
+        ParsedEvent::Other { session_id } => session_id.map_or(CliEvent::Skip, CliEvent::Session),
+        ParsedEvent::Skip => CliEvent::Skip,
     }
 }
 
