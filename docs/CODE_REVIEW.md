@@ -1,6 +1,6 @@
 # imagent 深度 Review — Issue 清单
 
-## 📋 实施进度（2026-07-04，分支 `fix/code-review-p0`，未 commit）
+## 📋 实施进度（2026-07-04，分支 `fix/code-review-p0`，已合并到 main；v1 已修项的独立核实见 [`CODE_REVIEW_v2.md`](CODE_REVIEW_v2.md) 附录核实矩阵）
 
 按优先级逐条修复。验收：`cargo test --workspace` = **215 passed**、`cargo clippy -D warnings` = 0、`cargo fmt` 通过、`cargo run --example echo_backend` 通过。
 

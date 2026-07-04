@@ -147,7 +147,7 @@ imagent start            # 前台常驻，Ctrl-C 退出
 ## 开发
 
 ```bash
-cargo test --workspace                              # 214 passed
+cargo test --workspace                              # 229 passed
 cargo clippy --workspace --all-targets -- -D warnings   # 0 warning
 cargo fmt --all --check
 ```
