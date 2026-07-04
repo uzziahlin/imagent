@@ -101,7 +101,7 @@
 - [ ] **P2-D** `/allow` 无角色区分，任意白名单用户可授权新用户（`dispatch.rs:399-433`）
 - [ ] **P2-E** `/allow` store 失败仍回「已授权」（`dispatch.rs:405-431`）
 - [ ] **P2-F** 中间 Text chunk 全丢弃，「流式」实际一次性（`dispatch.rs:824-834`）
-- [ ] **P2-G** `parse_reply` 首字符 y/Y 误判（`permission.rs:42-48`）
+- [x] **P2-G** `parse_reply` 首字符 y/Y 误判 ✅ 已修：去掉首字符 y/Y 宽匹配（会把 year/yellow/yesterday 误 allow——权限 approve/deny 的真实安全 bug），改精确匹配 `y/yes/ye/yep/yeah/ok/okay/是/允许/好/好的`。回归测试 `parse_reply_year_not_allowed`。
 - [ ] **P2-H** Auth 无归一化（`auth.rs:35-37`）
 - [ ] **P2-I** `mcp_<conv_id>.json` 不清理 + conv_id 未消毒（`claude/backend.rs:67-88`）
 - [ ] **P2-J** codex prompt 裸 positional arg（`codex/backend.rs:59-70`）
