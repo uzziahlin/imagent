@@ -17,6 +17,7 @@
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use aes::{Aes128, Block};
 use base64::Engine;
+use futures::StreamExt;
 use imagent_core::{CoreError, Result};
 
 use crate::client::DEFAULT_BASE_URL;
@@ -218,7 +219,7 @@ pub async fn download_media(
             format!("cdn download HTTP {status}"),
         ));
     }
-    // 防大文件 OOM：按 Content-Length 预检（诚实服务端会报；缺失则放行，由后续内存兜底）。
+    // 防大文件 OOM：按 Content-Length 预检（诚实服务端会报；缺失则放行，由流式累计兜底）。
     const MEDIA_MAX_BYTES: u64 = 50 * 1024 * 1024;
     if let Some(len) = resp.content_length() {
         if len > MEDIA_MAX_BYTES {
@@ -228,20 +229,41 @@ pub async fn download_media(
             ));
         }
     }
-    let ciphertext = resp
-        .bytes()
-        .await
-        .map_err(|e| CoreError::Platform("ilink", format!("cdn download body: {e}")))?
-        .to_vec();
-    // 有 aes_key 则解密；否则直接返回（兼容明文）。
-    match aes_key.and_then(parse_aes_key) {
-        Some(k) => aes_decrypt(&ciphertext, &k).ok_or_else(|| {
-            CoreError::Platform(
+    // 流式累计，超限即中止（防 chunked / 无 Content-Length 的大文件 OOM，P1-L）。
+    let mut stream = resp.bytes_stream();
+    let mut ciphertext = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|e| CoreError::Platform("ilink", format!("cdn download body: {e}")))?;
+        if ciphertext
+            .len()
+            .saturating_add(chunk.len())
+            > MEDIA_MAX_BYTES as usize
+        {
+            return Err(CoreError::Platform(
                 "ilink",
-                "cdn download: aes decrypt/padding failed".to_string(),
-            )
-        }),
+                format!("cdn download too large: > {MEDIA_MAX_BYTES} bytes (streamed)"),
+            ));
+        }
+        ciphertext.extend_from_slice(&chunk);
+    }
+    // 有 aes_key 则解密；无 key 则直接返回（兼容明文）。
+    // P1-H：aes_key 存在但解析失败时 fail-closed 返回 Err——而非旧逻辑那样把密文当
+    // 明文泄漏（旧 `aes_key.and_then(parse_aes_key)` 在 parse 失败时落入 None 分支）。
+    match aes_key {
         None => Ok(ciphertext),
+        Some(key_str) => {
+            let k = parse_aes_key(key_str).ok_or_else(|| {
+                CoreError::Platform(
+                    "ilink",
+                    "cdn download: aes_key 存在但解析失败，fail-closed 拒绝返回未解密内容"
+                        .to_string(),
+                )
+            })?;
+            aes_decrypt(&ciphertext, &k).ok_or_else(|| {
+                CoreError::Platform("ilink", "cdn download: aes decrypt/padding failed".to_string())
+            })
+        }
     }
 }
 

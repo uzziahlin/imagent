@@ -39,6 +39,9 @@ pub async fn login_flow_with_base(store: &Store, base_url: &str) -> Result<Crede
         // get_qrcode_status 是长轮询，未扫码时服务端 hold ~35s 才返回，
         // 故 client 超时需覆盖该窗口（留足余量）。
         .timeout(Duration::from_secs(45))
+        // 禁 redirect：与运行时 client（client.rs）一致，防止 login 阶段被 3xx
+        // 重定向劫持到非预期域名（SSRF / 凭据泄漏面，P1-J）。
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| CoreError::Platform("ilink", format!("build http client: {e}")))?;
 
