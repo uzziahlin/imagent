@@ -45,3 +45,14 @@ jobs:
       - uses: taiki-e/install-action@cargo-audit
       - name: cargo audit
         run: cargo audit
+
+  deny:
+    # cargo-deny（E-4）：license / source / ban 检查（advisory 由上方 audit 覆盖）。
+    name: cargo-deny (licenses/sources/bans)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@cargo-deny
+      - name: cargo deny check
+        run: cargo deny check licenses sources bans
