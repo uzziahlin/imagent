@@ -706,23 +706,9 @@ fn tighten_permissions(path: &Path) -> Result<()> {
     perms.set_mode(0o600);
     std::fs::set_permissions(path, perms)?;
 
-    // 父目录 0700（defense-in-depth：仅当该目录归本进程所有时才有意义）。
-    // 对系统目录（如 /tmp）无权 chmod，属正常情况；失败时仅告警、不阻断 open。
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            if let Ok(parent_md) = std::fs::metadata(parent) {
-                let mut pperms = parent_md.permissions();
-                pperms.set_mode(0o700);
-                if let Err(e) = std::fs::set_permissions(parent, pperms) {
-                    tracing::warn!(
-                        parent = %parent.display(),
-                        error = %e,
-                        "could not tighten parent dir to 0700 (best-effort)"
-                    );
-                }
-            }
-        }
-    }
+    // 注：不再 chmod 父目录——若 db_path 位于共享/系统目录（如 /tmp 或用户自定义路径），
+    // 无条件 chmod 父目录会误伤其他内容。db 文件本身 0600 已提供保护；父目录权限由
+    // 部署者负责（建议把 db 放在专属目录如 `~/.imagent` 并自行设 0700）。
     Ok(())
 }
 
