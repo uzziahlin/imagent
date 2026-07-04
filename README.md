@@ -4,7 +4,7 @@
 
 一个用 Rust 写的、把即时通讯平台接入自主 agent 的网关。**任何 IM**（个人微信 iLink / 企业微信 WeCom）↔ **任何 agent**（Claude Code / …）。
 
-![Rust](https://img.shields.io/badge/Rust-edition%202021-orange) ![License: MIT](https://img.shields.io/badge/License-MIT-blue) ![Tests](https://img.shields.io/badge/tests-214%20passed-brightgreen) ![Coverage](https://img.shields.io/badge/coverage-tarpaulin%2Bcodecov-informational) ![Status](https://img.shields.io/badge/status-v1.0-brightgreen) ![Docs](https://img.shields.io/badge/docs-mdBook-blueviolet)
+![Rust](https://img.shields.io/badge/Rust-edition%202021-orange) ![License: MIT](https://img.shields.io/badge/License-MIT-blue) ![CI](https://github.com/uzziah/imagent/actions/workflows/ci.yml/badge.svg) ![Status](https://img.shields.io/badge/status-v1.0-brightgreen) ![Docs](https://img.shields.io/badge/docs-mdBook-blueviolet)
 
 ---
 
@@ -64,7 +64,8 @@ trait Platform                        trait Backend
 
 ### 前置
 
-- Rust（`cargo`，edition 2021）
+- **操作系统**：macOS 或 Linux。Windows 暂不支持（IM 权限审批闭环与配置热重载依赖 Unix domain socket / SIGHUP）。
+- Rust（`cargo`，edition 2021，**MSRV 1.80**）
 - Claude Code CLI：`npm i -g @anthropic-ai/claude-code`
 
 ### 构建
