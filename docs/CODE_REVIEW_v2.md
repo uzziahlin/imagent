@@ -97,10 +97,10 @@
 
 - [x] **P2-A** `/switch` 不校验 agent_kind ✅ 已修：切历史 named session 时校验 `agent_kind`，与当前 backend 不匹配则 reply 拒绝（异类 backend 的 session_id 不互通，续接会失败）。
 - [x] **P2-B** socket `bind` 失败只 warn ✅ 已修：升为 `error!` 级别 + 显著措辞（Ask 闭环不可用 = 安全 posture 退化，需告警而非静默 warn）。
-- [ ] **P2-C** socket 问询强制 `ReplyHint::None` 丢 iLink context_token（`dispatch.rs:309-313`）
+- [x] **P2-C** socket 问询强制 `ReplyHint::None` 丢 iLink context_token ✅ 已澄清（非缺陷）：ilink `resolve_context_token`（`platform.rs:174-182`）对 `ReplyHint::None` 读 store `get_context_token` 兜底，权限问询 send_text 不丢 context_token。
 - [ ] **P2-D** `/allow` 无角色区分，任意白名单用户可授权新用户（`dispatch.rs:399-433`）
 - [x] **P2-E** `/allow` store 失败仍回「已授权」 ✅ 已修：`add_allowed_sender` 持久化失败时 reply 警告（内存已授权 + 重启后将丢失），不再谎报「已授权」。
-- [ ] **P2-F** 中间 Text chunk 全丢弃，「流式」实际一次性（`dispatch.rs:824-834`）
+- [x] **P2-F** 中间 Text chunk 全丢弃，「流式」实际一次性 ✅ 已修：`AgentChunk::Text(t)` 实时推 IM（流式体验，而非丢弃只发最终 Final）。
 - [x] **P2-G** `parse_reply` 首字符 y/Y 误判 ✅ 已修：去掉首字符 y/Y 宽匹配（会把 year/yellow/yesterday 误 allow——权限 approve/deny 的真实安全 bug），改精确匹配 `y/yes/ye/yep/yeah/ok/okay/是/允许/好/好的`。回归测试 `parse_reply_year_not_allowed`。
 - [x] **P2-H** Auth 无归一化 ✅ 已修：加 `normalize_sender`（trim 首尾空白；不改大小写——IM userid 大小写语义未知），`new`/`is_allowed`/`allow`/`revoke`/`reload` 一致应用，保证 config 白名单与入站 sender 比较一致。
 - [x] **P2-I** conv_id 未消毒 ✅ 已修 / mcp.json 不清理 ⏳ defer：① conv_id 经 `sanitize_filename` 消毒文件名（防 `../` / `/` / `:` 路径遍历；`--conv-id` 参数仍用原值保路由），单测 `sanitize_filename_strips_traversal`；② mcp.json 用完清理需重构 run 的 spawn 路径，defer 专门小 PR（整洁性，非安全）。
@@ -112,7 +112,7 @@
 - [x] **P2-O** 迁移无「user_version 过新」拒绝 ✅ 已修：加 `SCHEMA_VERSION=3` 常量；`user_version > SCHEMA_VERSION` 时 `Err` 拒绝（旧代码跑新 DB 风险）。
 - [x] **P2-P** store 无 `busy_timeout` ✅ 已修：`open_and_setup` 加 `PRAGMA busy_timeout=5000`（多连接竞争时等待而非立即 SQLITE_BUSY 失败）。
 - [x] **P2-Q** `first_credential` 无 ORDER BY ✅ 已修：SQL 加 `ORDER BY account_id`（多行时顺序确定，原 `LIMIT 1` 无 ORDER BY 顺序未定义）。
-- [ ] **P2-R** 审计日志无轮转（`store/schema.rs:55-63`）
+- [x] **P2-R** 审计日志无轮转 ✅ 已修：`append_audit` INSERT 后 `DELETE` 超出最近 10000 条的旧记录（防 `audit_log` 无限增长）。
 - [x] **P2-S** ilink `ilink_bot_id`/`ilink_user_id` 全程 dead_code ✅ 已处理：`client.rs:24-27` 已 `#[allow(dead_code)]` 标注（保留字段待抓包确认协议用途，不删除以免破坏未来扩展）。
 - [x] **P2-T** ilink breaker threshold=1 单次即熔断 ✅ 已修：threshold `1` → `3`（30s 窗口内 3 次限流才熔断；threshold=1 单次即熔断过于敏感，仍保持服从式退避合规红线）。
 - [ ] **P2-U** ilink extract_host 裸字符串 split（`media.rs:146-156`，建议 `url::Url`）

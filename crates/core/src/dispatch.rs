@@ -919,7 +919,10 @@ impl Dispatcher {
                     tool_calls.push((tool, truncate_str(&input, 40)));
                 }
                 AgentChunk::ToolResult { .. } => {} // 摘要只列工具调用，结果不进 IM
-                AgentChunk::Text(_) => {}
+                AgentChunk::Text(t) => {
+                    // P2-F：中间 Text chunk 实时推 IM（流式体验，而非全部丢弃只发最终 Final）。
+                    self.reply(&conv, &t, &hint).await;
+                }
             }
         }
 

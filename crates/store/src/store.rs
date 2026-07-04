@@ -527,6 +527,12 @@ impl Store {
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 rusqlite::params![now, action, actor, target, detail],
             )?;
+            // P2-R：审计日志轮转——保留最近 10000 条，删除超出（防 audit_log 无限增长）。
+            conn.execute(
+                "DELETE FROM audit_log WHERE id NOT IN \
+                 (SELECT id FROM audit_log ORDER BY id DESC LIMIT 10000)",
+                [],
+            )?;
             Ok(())
         })
         .await
