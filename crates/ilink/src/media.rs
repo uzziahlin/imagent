@@ -144,28 +144,21 @@ pub fn encode_aes_key_outbound(key: &[u8; 16]) -> String {
 // ───────────────────────── SSRF ─────────────────────────
 
 /// 从 URL 字符串中提取域名部分（协议后的 host，去掉端口/路径/查询）。
-fn extract_host(url: &str) -> Option<&str> {
-    let after_scheme = url.split("://").nth(1).unwrap_or(url);
-    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
-    // 去端口。
-    Some(
-        authority
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(authority),
-    )
+/// P2-U：改用 `url::Url`（取代裸字符串 split，更健壮——正确处理 IPv6 / 端口 / 特殊字符）。
+fn extract_host(url: &str) -> Option<String> {
+    url::Url::parse(url).ok()?.host_str().map(|h| h.to_string())
 }
 
 /// 校验 URL 主机在 CDN 白名单内；非白名单返回 Err（SSRF 防护）。
 pub fn assert_cdn_host(url: &str) -> Result<()> {
-    let host = extract_host(url).unwrap_or("");
+    let host = extract_host(url).unwrap_or_default();
     if host.is_empty() {
         return Err(CoreError::Platform(
             "ilink",
             format!("invalid url (no host): {url}"),
         ));
     }
-    if CDN_HOSTS.contains(&host) {
+    if CDN_HOSTS.contains(&host.as_str()) {
         Ok(())
     } else {
         Err(CoreError::Platform(

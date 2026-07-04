@@ -30,3 +30,4 @@ md5 = "0.7"
 dirs = { workspace = true }
 prometheus = { workspace = true }
 futures = { workspace = true }
+url = { workspace = true }

@@ -115,7 +115,7 @@
 - [x] **P2-R** 审计日志无轮转 ✅ 已修：`append_audit` INSERT 后 `DELETE` 超出最近 10000 条的旧记录（防 `audit_log` 无限增长）。
 - [x] **P2-S** ilink `ilink_bot_id`/`ilink_user_id` 全程 dead_code ✅ 已处理：`client.rs:24-27` 已 `#[allow(dead_code)]` 标注（保留字段待抓包确认协议用途，不删除以免破坏未来扩展）。
 - [x] **P2-T** ilink breaker threshold=1 单次即熔断 ✅ 已修：threshold `1` → `3`（30s 窗口内 3 次限流才熔断；threshold=1 单次即熔断过于敏感，仍保持服从式退避合规红线）。
-- [ ] **P2-U** ilink extract_host 裸字符串 split（`media.rs:146-156`，建议 `url::Url`）
+- [x] **P2-U** ilink extract_host 裸字符串 split ✅ 已修：改 `url::Url::parse` + `host_str`（取代裸 split，正确处理 IPv6/端口/特殊字符）。SSRF 白名单测试（ssrf_allows/rejects_cdn_host）不变。
 - [x] **P2-V** ilink 媒体文件权限 ✅ 已修：`persist_media` 文件写入后 `set_permissions 0600`（headless 部署隐私——解密后的私聊媒体不暴露给同机其他用户；目录 0700 已有）。
 - [x] **P2-W** ilink `let _ =` 吞错无 log ✅ 已修：`set_sync_buf` / `set_context_token` 失败改 `if let Err warn`（best-effort 不阻断，但可观测）；`platform.rs:655` 的 `set_permissions` 属 P2-V（媒体目录权限），保留。
 - [x] **P2-X** ilink `dedup.rs:31`/`ratelimit.rs:21` 的 `expect`（mutex poison 永久 panic） ✅ 已修（仅 dedup 部分）：dedup check 的 `std::sync::Mutex::lock().expect` 改 `unwrap_or_else(into_inner)`（持锁 panic 的 poison 后恢复，避免永久 panic；dedup 是 best-effort 去重）。`ratelimit.rs:21` 是 `register_int_counter!().expect`（启动期注册，非 mutex poison），保留。
