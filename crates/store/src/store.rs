@@ -753,6 +753,9 @@ fn open_and_setup(path: &Path) -> Result<rusqlite::Connection> {
     let conn = rusqlite::Connection::open(path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    // P2-P：busy_timeout 5s——多连接（core store + ilink store + /health 查询）竞争时
+    // 等待而非立即 SQLITE_BUSY 失败。
+    conn.pragma_update(None, "busy_timeout", 5000_i64)?;
     schema::migrate(&conn).map_err(|e| {
         tracing::error!(error = %e, "store schema migration failed");
         StoreError::Sqlite(e)

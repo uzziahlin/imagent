@@ -108,9 +108,9 @@
 - [ ] **P2-K** ACP `sessions` HashMap 无界增长（`acp.rs:193,220,238`）
 - [x] **P2-L** ws_url 不校验 wss ✅ 已修 / ack 失败仍继续 ⏳ defer：① `connect_and_serve` 开头校验 ws_url 远端必须 `wss://`（`ws://` 仅 `localhost`/`127.0.0.1`/`[::1]` 例外，测试 `run_loops_on_connect_failure` 用 `ws://127.0.0.1` 不破坏）；② ack 失败仍继续涉及 wecom 协议层可靠性，defer 专门评估。
 - [ ] **P2-M** 固定 `permission.sock` 路径，单实例硬约束（`claude/backend.rs:55-64`）
-- [ ] **P2-N** store schema 迁移未事务化（`store/schema.rs:83-103`）
-- [ ] **P2-O** 迁移无「user_version 过新」拒绝（`store/schema.rs:84-101`）
-- [ ] **P2-P** store 无 `busy_timeout`（`store.rs:687-697`）
+- [x] **P2-N** store schema 迁移未事务化 ✅ 已修：migrate 整体包在 `unchecked_transaction` + `commit` 内，失败回滚（避免半迁移状态不一致）。
+- [x] **P2-O** 迁移无「user_version 过新」拒绝 ✅ 已修：加 `SCHEMA_VERSION=3` 常量；`user_version > SCHEMA_VERSION` 时 `Err` 拒绝（旧代码跑新 DB 风险）。
+- [x] **P2-P** store 无 `busy_timeout` ✅ 已修：`open_and_setup` 加 `PRAGMA busy_timeout=5000`（多连接竞争时等待而非立即 SQLITE_BUSY 失败）。
 - [x] **P2-Q** `first_credential` 无 ORDER BY ✅ 已修：SQL 加 `ORDER BY account_id`（多行时顺序确定，原 `LIMIT 1` 无 ORDER BY 顺序未定义）。
 - [ ] **P2-R** 审计日志无轮转（`store/schema.rs:55-63`）
 - [ ] **P2-S** ilink `ilink_bot_id`/`ilink_user_id` 全程 dead_code（`client.rs:24-27`，需抓包确认）
