@@ -21,7 +21,7 @@ pub trait Backend: Send + Sync {
     ///   以便权限审批路由回正确的 IM 会话）；
     /// - `prompt`：用户文本；
     /// - `session`：`None` 新建，`Some(id)` 续接已存在会话；
-    /// - `workdir`：agent 工作根目录（安全边界）；
+    /// - `workdir`：agent 工作根目录（cwd，非沙箱）；
     /// - `allowed_tools`：允许的工具白名单（如 `["Read","Edit"]`）；
     /// - `chunks`：流式分块通道，core 消费。
     async fn run(

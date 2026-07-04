@@ -44,7 +44,8 @@ impl PermissionMode {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Config {
-    /// agent 工作根目录（安全边界）。必填，缺失或非绝对路径 => Config 错误。
+    /// agent 工作根目录（agent 的 cwd，**非沙箱**：仅决定工作目录，不限制可读路径；
+    /// 危险操作用 permission_mode=ask 审批）。必填，缺失或非绝对路径 => Config 错误。
     pub default_workdir: PathBuf,
     #[serde(default)]
     pub allowed_senders: Vec<String>,
@@ -124,7 +125,7 @@ impl Config {
 
     /// 供首次使用打印的模板字符串（default_workdir 用占位，不写死任何机器路径）。
     pub const EXAMPLE: &'static str = r#"# ~/.imagent/config.toml
-default_workdir = "/absolute/path/to/agent/workspace"   # 必填，agent 只能在该目录 Read/Edit
+default_workdir = "/absolute/path/to/agent/workspace"   # 必填，agent 的 cwd（非沙箱：不限制可读路径，靠 allowed_tools + permission_mode 兜底）
 allowed_senders = []        # 留空 = 发现模式（只打日志记录入站 sender，不驱动 agent）
 allowed_tools = ["Read", "Edit"]
 agent = "claude-cli"         # claude-cli(默认) | claude-acp(ACP长驻子进程) | codex | gemini
