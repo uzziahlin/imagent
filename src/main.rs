@@ -117,6 +117,9 @@ async fn main() -> Result<()> {
 
             // 2. store（多份：dispatcher / HTTP /health / SIGHUP 各持一份 Clone）
             let store = imagent_store::Store::open(&db_path).await?;
+            // P1-C：据 config.require_keyring 切换凭据 fail-closed
+            // （true = keyring 不可用时拒绝明文落盘；默认 false 向后兼容）。
+            store.set_require_keyring(config.require_keyring);
 
             // 3. platform —— 按 config.platform / CLI 选用 ilink 或 wecom。
             let platform_name = if platform == "ilink" || platform == "wecom" {

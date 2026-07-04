@@ -1446,6 +1446,7 @@ dependencies = [
  "anyhow",
  "keyring",
  "parking_lot",
+ "prometheus",
  "rusqlite",
  "serde",
  "serde_json",

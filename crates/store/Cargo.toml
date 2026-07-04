@@ -17,3 +17,4 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 parking_lot = { workspace = true }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+prometheus = { workspace = true }

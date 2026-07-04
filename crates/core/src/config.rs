@@ -73,6 +73,11 @@ pub struct Config {
     /// `kill_on_drop` 杀子进程），防止挂死的 agent 永久卡住会话。默认 600（10 分钟）。
     #[serde(default = "default_agent_timeout_secs")]
     pub agent_timeout_secs: u64,
+    /// 若为 true，凭据必须写入 OS keyring；keyring 不可用时 **拒绝明文落盘**
+    /// （`put_credential` 返回 Err，fail-closed）。默认 false（headless/CI 无 keychain
+    /// 时明文回退 + warn，向后兼容）。安全敏感部署应设 true。
+    #[serde(default)]
+    pub require_keyring: bool,
     /// WeCom 智能机器人凭据（可选；仅 `platform = "wecom"` 时使用）。
     #[serde(default)]
     pub wecom_bot_id: Option<String>,
@@ -135,6 +140,7 @@ permission_mode = "off"     # off(默认,claude按allowedTools自行处理) | al
 # message_max_len = 2000              # 单条出站消息字符上限（Unicode char）；不设 = 不分片
 # message_fragment_interval_ms = 400  # 分片间发送间隔（ms）
 # agent_timeout_secs = 600            # 单次 agent 运行超时（秒）；超时中止防挂死
+# require_keyring = false        # 默认 false(headless 明文回退+warn); true=keyring 不可用时拒绝明文落盘(fail-closed，安全部署建议)
 "#;
 }
 #[cfg(test)]
@@ -308,6 +314,25 @@ message_fragment_interval_ms = 250
         );
         let cfg = Config::load(&p).expect("parse");
         assert_eq!(cfg.message_fragment_interval_ms, 250);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn require_keyring_default_false() {
+        let p = tmp_path("reqkr_def", r#"default_workdir = "/tmp/ws""#);
+        let cfg = Config::load(&p).expect("parse");
+        assert!(!cfg.require_keyring);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn require_keyring_parses_true() {
+        let p = tmp_path(
+            "reqkr_true",
+            "default_workdir = \"/tmp/ws\"\nrequire_keyring = true\n",
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert!(cfg.require_keyring);
         cleanup(&p);
     }
 }
