@@ -4,11 +4,11 @@
 //! 同构：spawn `gemini -p -o stream-json` 子进程，逐行解析 JSONL，捕获
 //! `session_id` 作为 session id，流式推送 `AgentChunk`，返回 `RunOutcome`。
 
-use std::process::Stdio;
-
 use async_trait::async_trait;
-use imagent_core::{AgentChunk, Backend, CoreError, Result, RunOutcome, SessionId};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use imagent_core::{
+    backend_common::{spawn_cli_backend, CliEvent, WRITE_OR_EXEC},
+    AgentChunk, Backend, Result, RunOutcome, SessionId,
+};
 use tokio::process::Command;
 use tracing::debug;
 
@@ -49,8 +49,7 @@ impl Backend for GeminiBackend {
         chunks: tokio::sync::mpsc::Sender<AgentChunk>,
     ) -> Result<RunOutcome> {
         debug!(target: "imagent::gemini", conv_id, "gemini run start");
-
-        // 1. 构造命令。workdir 锁定（安全边界）。
+        // 构造命令（workdir 锁定；stdin/stdout/stderr/kill_on_drop 由 spawn_cli_backend 统一加）。
         let (approval, sandbox) = pick_approval(allowed_tools);
         let mut cmd = Command::new("gemini");
         cmd.current_dir(workdir);
@@ -69,122 +68,37 @@ impl Backend for GeminiBackend {
         cmd.arg("--skip-trust");
         // prompt 绑定到 flag（防止 prompt 以 `-` 开头被误解析）。
         cmd.arg(format!("--prompt={prompt}"));
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| CoreError::Backend(NAME, format!("failed to spawn `gemini`: {e}")))?;
-
-        let stdout = child.stdout.take().expect("stdout piped");
-        let stderr = child.stderr.take().expect("stderr piped");
-
-        // 2. 逐行读 stdout，喂给 parse_line。
-        let mut reader = BufReader::new(stdout).lines();
-
-        let mut captured_session: Option<String> = None;
-        let mut final_text: Option<String> = None;
-        let mut error_text: Option<String> = None;
-        let mut turn_completed = false;
-
-        while let Ok(Some(line)) = reader.next_line().await {
-            match parse_line(&line) {
-                ParsedEvent::Skip => {}
-                ParsedEvent::Init { session_id, model } => {
-                    if captured_session.is_none() {
-                        captured_session = Some(session_id);
-                    }
-                    debug!(target: "imagent::gemini", ?model, "gemini init");
-                }
-                ParsedEvent::AssistantMessage { text } => {
-                    // best-effort 推中间文本；final 取最后一条非空 assistant message。
-                    let _ = chunks.send(AgentChunk::Text(text.clone())).await;
-                    if !text.is_empty() {
-                        final_text = Some(text);
-                    }
-                }
-                ParsedEvent::ToolUse { tool, input } => {
-                    let _ = chunks.send(AgentChunk::ToolUse { tool, input }).await;
-                }
-                ParsedEvent::ToolResult { tool, output } => {
-                    let _ = chunks.send(AgentChunk::ToolResult { tool, output }).await;
-                }
-                ParsedEvent::Result => {
-                    turn_completed = true;
-                    break;
-                }
-                ParsedEvent::Error { message } => {
-                    let _ = chunks.send(AgentChunk::Error(message.clone())).await;
-                    error_text = Some(message);
-                    break;
-                }
-                ParsedEvent::Other => {
-                    debug!(target: "imagent::gemini", line = %line, "stream event (ignored)");
-                }
-            }
-        }
-
-        // 3. 进程退出码。读取循环可能因终止事件提前 break，仍需 join。
-        let output_status = child.wait().await;
-        let stderr_msg = read_stderr_to_string(stderr).await;
-
-        // 4. 错误优先级：error 事件 message > 无 final 文本诊断。
-        if let Some(message) = error_text {
-            return Err(CoreError::Backend(NAME, message));
-        }
-
-        let final_text = match final_text {
-            Some(t) if !t.is_empty() => t,
-            _ => {
-                // 没拿到 assistant message 文本：依终止状态诊断。
-                let diag = diagnose(&output_status, &stderr_msg, turn_completed);
-                return Err(CoreError::Backend(NAME, diag));
-            }
-        };
-
-        let session_id = captured_session.unwrap_or_default();
-        // 5. 推送 Final（与 RunOutcome.final_text 一致）。
-        let _ = chunks.send(AgentChunk::Final(final_text.clone())).await;
-
-        Ok(RunOutcome {
-            session_id: SessionId(session_id),
-            final_text,
-        })
+        spawn_cli_backend(cmd, gemini_parse, chunks, NAME).await
     }
 }
 
-/// 把子进程 stderr 全量读到字符串（不阻断）。
-async fn read_stderr_to_string(stderr: tokio::process::ChildStderr) -> String {
-    let mut reader = BufReader::new(stderr).lines();
-    let mut buf = Vec::new();
-    while let Ok(Some(line)) = reader.next_line().await {
-        buf.push(line);
-    }
-    buf.join("\n")
-}
-
-/// 无 final 文本时的诊断信息。
-///
-/// - `turn_completed`：turn 正常结束但无 assistant message（罕见，如纯工具调用 turn）。
-/// - 否则依退出码 + stderr 诊断。
-fn diagnose(
-    status: &std::io::Result<std::process::ExitStatus>,
-    stderr: &str,
-    turn_completed: bool,
-) -> String {
-    let code_str = match status {
-        Ok(s) => format!("exit {}", s),
-        Err(e) => format!("wait failed: {e}"),
-    };
-    let stderr_trim = stderr.trim();
-    if turn_completed {
-        return format!("gemini turn completed but produced no assistant message ({code_str})");
-    }
-    if stderr_trim.is_empty() {
-        format!("gemini produced no turn result ({code_str})")
-    } else {
-        format!("gemini produced no turn result ({code_str}); stderr: {stderr_trim}")
+/// gemini stream-json 行 → [`CliEvent`] 适配（见 [`parse_line`]）。
+fn gemini_parse(line: &str) -> CliEvent {
+    match parse_line(line) {
+        ParsedEvent::Init {
+            session_id,
+            model: _,
+        } => CliEvent::Session(session_id),
+        ParsedEvent::AssistantMessage { text } => {
+            if text.is_empty() {
+                CliEvent::Skip
+            } else {
+                CliEvent::Text(text)
+            }
+        }
+        ParsedEvent::ToolUse { tool, input } => CliEvent::ToolUse {
+            tool,
+            input,
+            session: None,
+        },
+        ParsedEvent::ToolResult { tool, output } => CliEvent::ToolResult { tool, output },
+        ParsedEvent::Result => CliEvent::Terminal { session: None },
+        ParsedEvent::Error { message } => CliEvent::Error {
+            text: message,
+            session: None,
+        },
+        ParsedEvent::Other => CliEvent::Skip,
+        ParsedEvent::Skip => CliEvent::Skip,
     }
 }
 
@@ -198,16 +112,7 @@ fn diagnose(
 ///
 /// 返回 `(approval_mode, want_sandbox)`。**绝不自动选 `yolo`**（全自动=危险）。
 fn pick_approval(allowed_tools: &[String]) -> (&'static str, bool) {
-    /// 视为需要写/执行权限的工具名（大小写敏感匹配 imagent 工具命名）。
-    const WRITE_OR_EXEC: &[&str] = &[
-        "Edit",
-        "Write",
-        "Bash",
-        "MultiEdit",
-        "NotebookEdit",
-        "WriteQuery",
-        "execute_bash",
-    ];
+    // WRITE_OR_EXEC 见 imagent_core::backend_common（codex/gemini 共享）。
     let needs_write = allowed_tools
         .iter()
         .any(|t| WRITE_OR_EXEC.contains(&t.as_str()));

@@ -25,7 +25,7 @@ pub enum ReplyHint {
     None,
 }
 
-/// 媒体引用（P1 不实现媒体，占位）。
+/// 媒体引用（ilink 入站媒体已下载落盘到 `~/.imagent/media/`，url 为本地路径）。
 #[derive(Debug, Clone)]
 pub struct MediaRef {
     pub kind: String,
@@ -37,7 +37,7 @@ pub struct InboundMessage {
     pub conv_id: ConvId,
     pub sender: UserId,
     pub text: Option<String>,
-    /// P1 恒为空 Vec。
+    /// 入站媒体引用（ilink 图片/文件等已落盘；无媒体则空）。
     pub media: Vec<MediaRef>,
     pub reply_hint: ReplyHint,
 }

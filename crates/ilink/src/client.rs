@@ -35,8 +35,11 @@ impl ILinkClient {
         ilink_user_id: String,
     ) -> Result<Self> {
         // timeout ~45s，容纳 getupdates 长轮询（~35–40s）。
+        // 禁用重定向：媒体 CDN 下载初始 URL 已校验白名单，跟随重定向可被引导到
+        // 内网/元数据地址（SSRF 绕过）；iLink API 端点正常不重定向，禁之无副作用。
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(45))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| CoreError::Platform("ilink", format!("build http client: {e}")))?;
         Ok(Self {

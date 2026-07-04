@@ -25,12 +25,23 @@ jobs:
       - name: test
         run: cargo test --workspace --verbose
 
+  msrv:
+    # 守住声明的 MSRV（rust-version = "1.80"，因使用 std::sync::LazyLock）。
+    name: check @ MSRV 1.80
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.80
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check @ 1.80
+        run: cargo check --workspace --all-targets
+
   audit:
     runs-on: ubuntu-latest
     # 只在 push 到 main 时跑依赖审计（PR 不阻塞）
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: taiki-e/install-action@cargo-audit
+      - name: cargo audit
+        run: cargo audit

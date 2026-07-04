@@ -352,10 +352,7 @@ impl ILinkPlatform {
                         return Ok(());
                     }
                     SendOutcome::SessionExpired => {
-                        return Err(CoreError::Platform(
-                            "ilink",
-                            "session expired: re-login required".into(),
-                        ));
+                        return Err(CoreError::SessionExpired("re-login required".into()));
                     }
                     SendOutcome::RateLimited => {
                         self.breaker.record_event().await;
@@ -377,10 +374,7 @@ impl ILinkPlatform {
                 },
                 Err(e) => {
                     if is_session_expired(&format!("{e}")) {
-                        return Err(CoreError::Platform(
-                            "ilink",
-                            "session expired: re-login required".into(),
-                        ));
+                        return Err(CoreError::SessionExpired("re-login required".into()));
                     }
                     if attempt > MAX_RETRIES {
                         return Err(e);
@@ -436,10 +430,7 @@ impl ILinkPlatform {
                         return Ok(());
                     }
                     SendOutcome::SessionExpired => {
-                        return Err(CoreError::Platform(
-                            "ilink",
-                            "session expired: re-login required".into(),
-                        ));
+                        return Err(CoreError::SessionExpired("re-login required".into()));
                     }
                     SendOutcome::RateLimited => {
                         let tripped = self.breaker.record_event().await;
@@ -467,10 +458,7 @@ impl ILinkPlatform {
                     // HTTP/网络层错误：先判 session_expired（401/403 字样）。
                     let es = format!("{e}");
                     if is_session_expired(&es) {
-                        return Err(CoreError::Platform(
-                            "ilink",
-                            "session expired: re-login required".into(),
-                        ));
+                        return Err(CoreError::SessionExpired("re-login required".into()));
                     }
                     if attempt > MAX_RETRIES {
                         return Err(e);
@@ -525,7 +513,9 @@ impl Platform for ILinkPlatform {
                         break; // 回外层弹第一条
                     }
                     Ok(_) => {
-                        // 长轮询正常返回空（无消息），立即再次轮询。
+                        // 长轮询正常返回空（无消息）。服务端正常会 hold ~35s 才返回空；
+                        // 加最小间隔兜底，防御服务端某次立即返回空导致忙循环/触发限流。
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                         break;
                     }
                     Err(e) => {
@@ -533,10 +523,7 @@ impl Platform for ILinkPlatform {
                         // SESSION_EXPIRED：session 失效，需重新登录。
                         if is_session_expired(&msg_str) {
                             error!(target: "ilink", "session expired, re-login required");
-                            return Err(CoreError::Platform(
-                                "ilink",
-                                "session expired, please re-login".into(),
-                            ));
+                            return Err(CoreError::SessionExpired("please re-login".into()));
                         }
                         warn!(target: "ilink", err = %msg_str, backoff_ms = backoff.as_millis() as u64, "getupdates failed, backing off");
                         if backoff >= BACKOFF_CAP {

@@ -13,7 +13,7 @@
 - **消息**：iLink `send_text` 超长自动分片（`split_message` 纯函数，不切断 UTF-8）。
 - **安全**：发送者白名单、workdir 锁定、**凭据加密落盘**（OS keyring）、IM 权限审批闭环（claude CLI `--permission-prompt-tool`）。
 - **会话**：SQLite 持久化、`/new` `/switch` `/sessions` `/compact`、重启续接（`--resume`）。
-- **工程**：MIT/Apache-2.0 双 license、CI（test/fmt/clippy/coverage/release）、mdBook 文档站。
+- **工程**：MIT license、CI（test/fmt/clippy/coverage/release/MSRV）、mdBook 文档站。
 
 ### Changed
 - workspace 测试 214 passed（2 ignored）；clippy 0 warning。

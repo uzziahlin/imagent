@@ -69,10 +69,9 @@ fn compact_summary_key(conv_id: &str) -> String {
 
 /// 错误是否指示 iLink session 过期（需重新 login）。
 ///
-/// `CoreError::Platform` 的 `Display` 形如 `platform(ilink): session expired: ...`，
-/// 故按子串匹配即可，无需 match 具体变体。
+/// 专用 `CoreError::SessionExpired` variant，靠类型判定而非 Display 子串（更鲁棒）。
 fn is_session_expired_err(e: &crate::error::CoreError) -> bool {
-    e.to_string().to_lowercase().contains("session expired")
+    matches!(e, crate::error::CoreError::SessionExpired(_))
 }
 
 pub struct Dispatcher {
@@ -88,6 +87,8 @@ pub struct Dispatcher {
     router: Arc<PermissionRouter>,
     /// 权限审批模式。
     permission_mode: Arc<RwLock<PermissionMode>>,
+    /// 单次 agent 运行超时。超时则中止该次 run（backend 的 kill_on_drop 杀子进程）。
+    agent_timeout: std::time::Duration,
 }
 
 impl Dispatcher {
@@ -100,6 +101,7 @@ impl Dispatcher {
         default_workdir: PathBuf,
         allowed_tools: Vec<String>,
         permission_mode: PermissionMode,
+        agent_timeout: std::time::Duration,
     ) -> Self {
         Self::new_with_handles(
             platform,
@@ -109,6 +111,7 @@ impl Dispatcher {
             default_workdir,
             Arc::new(RwLock::new(allowed_tools)),
             Arc::new(RwLock::new(permission_mode)),
+            agent_timeout,
         )
     }
 
@@ -126,6 +129,7 @@ impl Dispatcher {
         default_workdir: PathBuf,
         allowed_tools: Arc<RwLock<Vec<String>>>,
         permission_mode: Arc<RwLock<PermissionMode>>,
+        agent_timeout: std::time::Duration,
     ) -> Self {
         Self {
             platform,
@@ -137,6 +141,7 @@ impl Dispatcher {
             conv_locks: Mutex::new(HashMap::new()),
             router: Arc::new(PermissionRouter::new()),
             permission_mode,
+            agent_timeout,
         }
     }
 
@@ -167,12 +172,20 @@ impl Dispatcher {
     /// 其它错误 → 记录日志后继续（长轮询层自管重连/退避），不 panic。
     pub async fn run(self: Arc<Self>) -> Result<()> {
         // Ask 模式：spawn unix socket accept task（MCP server 转发的权限请求经此进主进程）。
+        #[cfg(unix)]
         if matches!(*self.permission_mode.read(), PermissionMode::Ask) {
             if let Some(sock) = crate::permission::default_sock_path() {
                 self.spawn_socket_accept(sock.to_string_lossy().into_owned());
             } else {
                 warn!(target: "imagent::core", "Ask 模式但无法定位 socket 路径，权限请求将无法路由");
             }
+        }
+        #[cfg(not(unix))]
+        if matches!(*self.permission_mode.read(), PermissionMode::Ask) {
+            warn!(
+                target: "imagent::core",
+                "Ask 权限审批闭环需要 Unix domain socket，当前平台(Windows)不可用；请改用 permission_mode = allow/deny/off 或在 macOS/Linux 运行"
+            );
         }
 
         loop {
@@ -212,6 +225,7 @@ impl Dispatcher {
 
     /// spawn socket accept task：每个连接独立 spawn，读权限请求 → send_text 询问
     /// 用户 → register 等 receiver → 写回复回 socket。
+    #[cfg(unix)]
     fn spawn_socket_accept(self: &Arc<Self>, sock: String) {
         // 清理可能残留的旧 socket 文件。
         let _ = std::fs::remove_file(&sock);
@@ -253,6 +267,7 @@ impl Dispatcher {
     }
 
     /// 处理单个 socket 连接：读请求行 → send_text 询问 → 等回复 → 写回复。
+    #[cfg(unix)]
     async fn handle_permission_socket(
         mut stream: tokio::net::UnixStream,
         platform: Arc<dyn Platform>,
@@ -590,17 +605,28 @@ impl Dispatcher {
                                 let workdir = self.default_workdir.clone();
                                 let tools = self.allowed_tools.read().clone();
                                 let conv_id_compact = conv.0.clone();
+                                let agent_timeout = self.agent_timeout;
                                 let join = tokio::spawn(async move {
-                                    backend
-                                        .run(
+                                    let backend_name = backend.name();
+                                    match tokio::time::timeout(
+                                        agent_timeout,
+                                        backend.run(
                                             &conv_id_compact,
                                             "请用中文简洁总结当前对话的要点、已做决定与未完成事项（不超过 400 字）。",
                                             Some(&sid),
                                             &workdir,
                                             &tools,
                                             tx,
-                                        )
-                                        .await
+                                        ),
+                                    )
+                                    .await
+                                    {
+                                        Ok(res) => res,
+                                        Err(_elapsed) => Err(crate::error::CoreError::Backend(
+                                            backend_name,
+                                            format!("agent run timed out after {agent_timeout:?}"),
+                                        )),
+                                    }
                                 });
                                 let mut summary: Option<String> = None;
                                 while let Some(chunk) = rx.recv().await {
@@ -708,7 +734,21 @@ impl Dispatcher {
 
         // 取续接 session；store 错误仅 log 后当 None。
         let existing: Option<SessionId> = match self.store.get_session(&conv.0).await {
-            Ok(Some(row)) => Some(SessionId(row.session_id)),
+            Ok(Some(row)) => {
+                // 校验 agent_kind：跨后端切换时不复用旧 session_id（格式不兼容会错乱）。
+                if row.agent_kind == self.backend.name() {
+                    Some(SessionId(row.session_id))
+                } else {
+                    warn!(
+                        target: "imagent::core",
+                        conv_id = %conv.0,
+                        stored = %row.agent_kind,
+                        current = %self.backend.name(),
+                        "session 的 agent_kind 与当前后端不一致，按新建处理"
+                    );
+                    None
+                }
+            }
             Ok(None) => None,
             Err(e) => {
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "get_session 失败，按新建处理");
@@ -754,17 +794,28 @@ impl Dispatcher {
         let tools = self.allowed_tools.read().clone();
         let prompt_owned = prompt.clone();
         let conv_id_owned = conv.0.clone();
+        let agent_timeout = self.agent_timeout;
         let join = tokio::spawn(async move {
-            backend
-                .run(
+            let backend_name = backend.name();
+            match tokio::time::timeout(
+                agent_timeout,
+                backend.run(
                     &conv_id_owned,
                     &prompt_owned,
                     existing.as_ref(),
                     &workdir,
                     &tools,
                     tx,
-                )
-                .await
+                ),
+            )
+            .await
+            {
+                Ok(res) => res,
+                Err(_elapsed) => Err(crate::error::CoreError::Backend(
+                    backend_name,
+                    format!("agent run timed out after {agent_timeout:?}"),
+                )),
+            }
         });
         // 收集 chunks：Final/Error 落库，ToolUse 累积用于最终工具摘要。
         let mut final_text: Option<String> = None;
@@ -862,6 +913,18 @@ impl Dispatcher {
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "upsert_named_session 失败");
             }
         }
+
+        // 回收该 conv 的串行锁（已无其它 task 持有时），避免 conv_locks 无限增长。
+        // drop clone 后 strong_count==1 表示只剩 HashMap 那份；map mutex 互斥保证
+        // 检查+移除原子，竞态最坏只是漏清（下一轮再来），不会误删在用锁。
+        drop(_guard);
+        drop(lock);
+        let mut map = self.conv_locks.lock().await;
+        if let Some(arc) = map.get(&conv.0) {
+            if Arc::strong_count(arc) == 1 {
+                map.remove(&conv.0);
+            }
+        }
     }
 
     /// 回传文本；发送失败仅 log。session 过期升级为 error（用户侧已收不到回复）。
@@ -898,14 +961,14 @@ mod tests {
     #[test]
     fn is_session_expired_err_classifies() {
         use crate::error::CoreError;
-        assert!(is_session_expired_err(&CoreError::Platform(
-            "ilink",
-            "session expired: re-login required".into()
+        // SessionExpired variant 命中。
+        assert!(is_session_expired_err(&CoreError::SessionExpired(
+            "re-login required".into()
         )));
-        assert!(is_session_expired_err(&CoreError::Platform(
-            "ilink",
-            "session expired, please re-login".into()
+        assert!(is_session_expired_err(&CoreError::SessionExpired(
+            "please re-login".into()
         )));
+        // 其它 variant 不命中。
         assert!(!is_session_expired_err(&CoreError::Platform(
             "ilink",
             "getupdates exhausted retries".into()
@@ -914,8 +977,7 @@ mod tests {
         assert!(!is_session_expired_err(&CoreError::Store(
             imagent_store::StoreError::Other("db: some failure".into())
         )));
-        // 大小写无关
-        assert!(is_session_expired_err(&CoreError::Platform(
+        assert!(!is_session_expired_err(&CoreError::Platform(
             "ilink",
             "Session Expired".into()
         )));
@@ -1110,6 +1172,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/imagent-test-ws"),
             vec!["Read".into(), "Edit".into()],
             PermissionMode::Off,
+            std::time::Duration::from_secs(600),
         ));
 
         Ctx {
@@ -1137,6 +1200,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/imagent-test-ws"),
             vec!["Read".into(), "Edit".into()],
             PermissionMode::Off,
+            std::time::Duration::from_secs(600),
         ));
 
         Ctx {

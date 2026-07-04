@@ -7,7 +7,6 @@
 //!   → 出站 channel。hint 忽略（WeCom 仅靠 conv_id 解析 userid）。
 //! - `send_media()` / `send_typing()`：MVP 空实现（媒体需 upload_media 三步，留后）。
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -28,8 +27,8 @@ const PLATFORM: &str = "wecom";
 pub struct WeComPlatform {
     /// 出站帧通道（发给 client → 企微）。
     outbound_tx: mpsc::Sender<OutboundFrame>,
-    /// 已解析的入站消息缓冲，`recv` 弹队首。
-    pending: Arc<Mutex<VecDeque<InboundMessage>>>,
+    /// 已解析的入站消息 channel，`recv` 直接 await（无轮询）。
+    inbound_rx: Arc<Mutex<mpsc::Receiver<InboundMessage>>>,
 }
 
 impl WeComPlatform {
@@ -37,7 +36,7 @@ impl WeComPlatform {
     /// 1. client `run` task（建连/认证/心跳/重连/收发）；
     /// 2. drain task：把 client 推来的 `aibot_msg_callback` 帧解析入 pending 队列。
     pub fn new(bot_id: String, secret: String, ws_url: String) -> Self {
-        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundFrame>(64);
+        let (inbound_frame_tx, inbound_frame_rx) = mpsc::channel::<InboundFrame>(64);
         let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundFrame>(64);
 
         // 后台 client task：连接立即开始。
@@ -47,18 +46,20 @@ impl WeComPlatform {
             ws_url,
         };
         tokio::spawn(async move {
-            client.run(inbound_tx, outbound_rx).await;
+            client.run(inbound_frame_tx, outbound_rx).await;
         });
 
-        // 后台 drain task：inbound channel → pending 队列。
-        let pending: Arc<Mutex<VecDeque<InboundMessage>>> = Arc::new(Mutex::new(VecDeque::new()));
-        let pending_clone = Arc::clone(&pending);
+        // 后台 drain task：client 推来的回调帧解析成 InboundMessage，直送入站 channel
+        // （recv 直接 await，取代 50ms 轮询——无消息时零唤醒）。
+        let (inbound_msg_tx, inbound_msg_rx) = mpsc::channel::<InboundMessage>(64);
         tokio::spawn(async move {
-            while let Some(frame) = inbound_rx.recv().await {
+            let mut inbound_frame_rx = inbound_frame_rx;
+            while let Some(frame) = inbound_frame_rx.recv().await {
                 match parse_msg_callback(&frame) {
                     Ok(msg) => {
-                        let mut q = pending_clone.lock().await;
-                        q.push_back(msg);
+                        if inbound_msg_tx.send(msg).await.is_err() {
+                            break;
+                        }
                     }
                     Err(e) => {
                         warn!(target: "wecom", error = %e, "入站回调帧解析失败，丢弃");
@@ -70,7 +71,7 @@ impl WeComPlatform {
 
         Self {
             outbound_tx,
-            pending,
+            inbound_rx: Arc::new(Mutex::new(inbound_msg_rx)),
         }
     }
 }
@@ -78,18 +79,10 @@ impl WeComPlatform {
 #[async_trait]
 impl Platform for WeComPlatform {
     async fn recv(&self) -> Result<InboundMessage> {
-        loop {
-            // 1. 先弹已解析的缓冲。
-            {
-                let mut q = self.pending.lock().await;
-                if let Some(msg) = q.pop_front() {
-                    return Ok(msg);
-                }
-            }
-            // 2. 缓冲空：等 drain task 攒入。这里短 sleep 轮询，避免 channel 已被
-            //    drain task 独占持有（recv 端在 drain task 内）。延迟可忽略。
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+        // 直接 await 入站 channel（drain task 解析后 send 进来），无消息时零唤醒。
+        self.inbound_rx.lock().await.recv().await.ok_or_else(|| {
+            CoreError::Platform(PLATFORM, "入站 channel 已关闭（client 已退出）".into())
+        })
     }
 
     async fn send_text(&self, conv: &ConvId, text: &str, _hint: &ReplyHint) -> Result<()> {
@@ -145,28 +138,25 @@ mod tests {
 
     #[tokio::test]
     async fn drain_parses_callback_into_inbound() {
-        let pending: Arc<Mutex<VecDeque<InboundMessage>>> = Arc::new(Mutex::new(VecDeque::new()));
-        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundFrame>(8);
+        let (inbound_msg_tx, mut inbound_msg_rx) = mpsc::channel::<InboundMessage>(8);
+        let (inbound_frame_tx, mut inbound_frame_rx) = mpsc::channel::<InboundFrame>(8);
 
-        let pc = Arc::clone(&pending);
-        let handle = tokio::spawn(async move {
-            while let Some(frame) = inbound_rx.recv().await {
+        let tx = inbound_msg_tx;
+        let _handle = tokio::spawn(async move {
+            while let Some(frame) = inbound_frame_rx.recv().await {
                 if let Ok(msg) = parse_msg_callback(&frame) {
-                    pc.lock().await.push_back(msg);
+                    if tx.send(msg).await.is_err() {
+                        break;
+                    }
                 }
             }
         });
 
-        inbound_tx
+        inbound_frame_tx
             .send(mk_callback_frame("Alice", "hi"))
             .await
             .unwrap();
-        // 给 drain task 处理时间。
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        drop(inbound_tx);
-        let _ = handle.await;
-
-        let msg = pending.lock().await.pop_front().unwrap();
+        let msg = inbound_msg_rx.recv().await.unwrap();
         assert_eq!(msg.conv_id, ConvId("wecom:Alice".into()));
         assert_eq!(msg.text.as_deref(), Some("hi"));
     }
