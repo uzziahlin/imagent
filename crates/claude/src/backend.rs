@@ -63,6 +63,20 @@ fn permission_sock_path() -> String {
         .unwrap_or_else(|| "/tmp/imagent-permission.sock".into())
 }
 
+/// 把 conv_id 消毒为文件名安全片段（P2-I：防路径遍历——`/`、`..`、`:` 等替换为 `_``）。
+/// 仅用于构造 `mcp_<conv>.json` 文件名；MCP server 的 `--conv-id` 参数仍用原 conv_id（路由一致）。
+fn sanitize_filename(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// 写临时 mcp.json，返回路径。claude 据此 spawn MCP server 子进程。
 async fn write_mcp_config(
     conv_id: &str,
@@ -82,7 +96,7 @@ async fn write_mcp_config(
         .map(|h| h.join(".imagent"))
         .unwrap_or_else(std::env::temp_dir);
     tokio::fs::create_dir_all(&dir).await?;
-    let path = dir.join(format!("mcp_{conv_id}.json"));
+    let path = dir.join(format!("mcp_{}.json", sanitize_filename(conv_id)));
     tokio::fs::write(&path, cfg.to_string()).await?;
     Ok(path)
 }
@@ -187,6 +201,16 @@ mod tests {
     fn name_is_stable() {
         let b = ClaudeBackend::new();
         assert_eq!(b.name(), "claude-cli");
+    }
+
+    #[test]
+    fn sanitize_filename_strips_traversal() {
+        // P2-I：路径遍历 / 分隔符必须消毒为文件名安全片段。
+        assert_eq!(sanitize_filename("wecom:alice"), "wecom_alice");
+        assert_eq!(sanitize_filename("../etc/passwd"), "___etc_passwd");
+        assert_eq!(sanitize_filename("a/b\\c"), "a_b_c");
+        assert_eq!(sanitize_filename("ilink_wxid_123"), "ilink_wxid_123");
+        assert!(sanitize_filename("../..").chars().all(|c| c == '_'));
     }
 
     /// 真跑 `claude` CLI 的集成测试。标 `#[ignore]` 以免 CI 依赖 claude。

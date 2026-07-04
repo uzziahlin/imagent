@@ -103,7 +103,7 @@
 - [ ] **P2-F** 中间 Text chunk 全丢弃，「流式」实际一次性（`dispatch.rs:824-834`）
 - [x] **P2-G** `parse_reply` 首字符 y/Y 误判 ✅ 已修：去掉首字符 y/Y 宽匹配（会把 year/yellow/yesterday 误 allow——权限 approve/deny 的真实安全 bug），改精确匹配 `y/yes/ye/yep/yeah/ok/okay/是/允许/好/好的`。回归测试 `parse_reply_year_not_allowed`。
 - [ ] **P2-H** Auth 无归一化（`auth.rs:35-37`）
-- [ ] **P2-I** `mcp_<conv_id>.json` 不清理 + conv_id 未消毒（`claude/backend.rs:67-88`）
+- [x] **P2-I** conv_id 未消毒 ✅ 已修 / mcp.json 不清理 ⏳ defer：① conv_id 经 `sanitize_filename` 消毒文件名（防 `../` / `/` / `:` 路径遍历；`--conv-id` 参数仍用原值保路由），单测 `sanitize_filename_strips_traversal`；② mcp.json 用完清理需重构 run 的 spawn 路径，defer 专门小 PR（整洁性，非安全）。
 - [ ] **P2-J** codex prompt 裸 positional arg（`codex/backend.rs:59-70`）
 - [ ] **P2-K** ACP `sessions` HashMap 无界增长（`acp.rs:193,220,238`）
 - [ ] **P2-L** WeCom `ws_url` 不校验 wss + ack 失败仍继续（`wecom/client.rs:81,97-128`）
