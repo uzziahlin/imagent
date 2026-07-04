@@ -554,6 +554,22 @@ impl Dispatcher {
                         let key = active_name_key(&conv.0);
                         match self.store.get_named_session(&conv.0, name).await {
                             Ok(Some(row)) => {
+                                // P2-A：校验 agent_kind——不同 backend 的 session_id 不互通，
+                                // 切到异类 backend 的历史 session 会续接失败。
+                                let current_kind = self.backend.name();
+                                if let Some(k) = row.agent_kind.as_deref() {
+                                    if k != current_kind {
+                                        self.reply(
+                                            &conv,
+                                            &format!(
+                                                "「{name}」是 {k} 会话，当前后端为 {current_kind}（不互通，无法续接）"
+                                            ),
+                                            &hint,
+                                        )
+                                        .await;
+                                        return;
+                                    }
+                                }
                                 // 切回历史命名 session：把它写成活动 session（续接用）。
                                 let now = now_secs();
                                 let sr = SessionRow {

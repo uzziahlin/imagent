@@ -95,7 +95,7 @@
 
 ## 🟡 P2 — 打磨项
 
-- [ ] **P2-A** `/switch` 不校验 agent_kind（`dispatch.rs:498-528`）
+- [x] **P2-A** `/switch` 不校验 agent_kind ✅ 已修：切历史 named session 时校验 `agent_kind`，与当前 backend 不匹配则 reply 拒绝（异类 backend 的 session_id 不互通，续接会失败）。
 - [ ] **P2-B** socket `bind` 失败只 warn（`dispatch.rs:232-238`，与 P0-B 同源，可顺手）
 - [ ] **P2-C** socket 问询强制 `ReplyHint::None` 丢 iLink context_token（`dispatch.rs:309-313`）
 - [ ] **P2-D** `/allow` 无角色区分，任意白名单用户可授权新用户（`dispatch.rs:399-433`）
