@@ -670,6 +670,13 @@ fn persist_media(kind: &str, file_name: Option<&str>, bytes: &[u8]) -> Result<St
     let path = dir.join(fname);
     std::fs::write(&path, bytes)
         .map_err(|e| CoreError::Platform("ilink", format!("write media {:?}: {e}", path)))?;
+    // P2-V：媒体文件权限 0600（headless 部署隐私——解密后的私聊媒体不暴露给同机
+    // 其他用户；默认按 umask 可能 0644）。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
     Ok(path.to_string_lossy().into_owned())
 }
 
