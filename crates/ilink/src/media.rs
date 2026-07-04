@@ -65,7 +65,7 @@ pub fn aes_encrypt(plaintext: &[u8], key: &[u8; 16]) -> Vec<u8> {
 
 /// AES-128-ECB + PKCS7 解密；密文长度非块倍数或填充非法时返回 `None`。
 pub fn aes_decrypt(ciphertext: &[u8], key: &[u8; 16]) -> Option<Vec<u8>> {
-    if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(BLOCK) {
+    if ciphertext.is_empty() || ciphertext.len() % BLOCK != 0 {
         return None;
     }
     let cipher = Aes128::new_from_slice(key).expect("16-byte key");
