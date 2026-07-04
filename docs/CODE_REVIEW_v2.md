@@ -8,7 +8,7 @@
 
 ## 📋 修复进度（2026-07-04，分支 `fix/code-review-v2`）
 
-**已落地（14 commit，workspace 230 passed，clippy 0 warning）**：
+**已落地（15 commit，workspace 230 passed，clippy 0 warning）**：
 - ✅ **P0 全部（3/3）**：P0-A（ACP fail-open→fail-closed）、P0-B（权限 socket 对端 uid 鉴权 + chmod 0600）、P0-C（login baseurl 域名白名单）
 - ✅ **P1-D**：workdir「安全边界」措辞修正为「cwd（非沙箱）」
 - ✅ **E-1**：各 crate MSRV 统一继承 workspace 1.80 + 修复 ilink `media.rs` 的 `is_multiple_of`（1.87 API，CI @1.80 实际会失败）
@@ -22,6 +22,7 @@
 - ✅ **P1-K**：compact_summary 删除推迟到 run 成功落库后（run 失败不再永久丢失摘要）
 - ✅ **P1-G**：权限 socket 回复等待加 `agent_timeout` 超时（agent 死/用户不回复不再永驻吞消息）
 - ✅ **P1-F**：`/new`/`/switch`/`/compact` 取 conv 串行锁（不再与在飞 agent task 并发损坏 session 状态）
+- ✅ **D-1**：项目根 `CLAUDE.md` onboarding 更新（反映业务代码已实现 + P1 基本完成 + omp 故障教训，不再误导新会话）
 
 > ⚠️ **破例说明（P0-B + P1-A/B/C 由主会话自行 Edit）**：omp 工具链反复异常——上会话 5 次（并发 exit 1（API 限流）×2、「清理工作树到只剩本任务文件」覆盖前序成果×2、强约束下 noop×1）；本会话 P1-C 委派 omp **第 3 次「空手退出」**（exit 0、零产出、log 仅 1 行主会话口吻废话；前两次 6/30、7/04 已记 engram `cd4f3255`/`33d52163`）。依 `CODE_REVIEW.md` 顶部先例（"omp 工具链对重构类任务反复委派/挂死，用户授权破例自行 Edit"），P0-B/P1-A/B/C 破例主会话自行 Edit（方案已完整 review/设计，每项 `cargo test` 验证）。**违反 CLAUDE.md omp 委派硬规则**，请 review；P0-A/C 由 omp 完成，P1-D/E-1/E-2 为注释/配置/attribute 类主会话直接改。后续 omp 任务说明须显式禁 git 写操作 + 禁删非任务文件（教训已记 memory：`omp-worktree-protection`）。
 
@@ -131,7 +132,7 @@
 
 ### 文档状态漂移
 
-- [ ] **D-1（P0 流程）项目根 `CLAUDE.md` 严重过时**：仍写「业务代码尚未实现」。误导所有新会话，应立即更新。
+- [x] **D-1（P0 流程）项目根 `CLAUDE.md` 严重过时** ✅ 已修：onboarding 段重写——反映三层+双抽象业务代码已实现、当前 P1 基本完成的进度、新增 CODE_REVIEW_v2 为必读、omp v16.x 反复故障的破例先例。
 - [ ] **D-2（P2）`CODE_REVIEW.md` 顶部「未 commit」声明过时**。
 - [ ] **D-3（P2）`CHANGELOG.md` `[Unreleased]` 位置不规范**。
 - [ ] **D-4（P2）测试数漂移**：README/CHANGELOG/CODE_REVIEW 三处 214/214/215，实际 217（修 P0 后 223）。
