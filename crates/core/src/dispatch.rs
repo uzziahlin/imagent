@@ -245,17 +245,49 @@ impl Dispatcher {
                 return;
             }
         };
+        // chmod 0600：只允许 owner（本进程同 uid）连接。父目录 ~/.imagent 应为 0700（由 store 保证）。
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)) {
+            warn!(
+                target: "imagent::core",
+                sock = %sock,
+                error = %e,
+                "chmod permission socket 0600 失败，Ask 权限闭环鉴权减弱"
+            );
+        }
         let platform = self.platform.clone();
         let router = self.router.clone();
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
-                        let platform = platform.clone();
-                        let router = router.clone();
-                        tokio::spawn(async move {
-                            Self::handle_permission_socket(stream, platform, router).await;
-                        });
+                        // 鉴权：只接受与本进程同 uid 的连接（MCP 子进程由本进程 spawn，必然同 uid）。
+                        // SAFETY: getuid 无参数无副作用，永远安全。
+                        let expected_uid = unsafe { libc::getuid() };
+                        match peer_uid(&stream) {
+                            Some(uid) if uid == expected_uid => {
+                                let platform = platform.clone();
+                                let router = router.clone();
+                                tokio::spawn(async move {
+                                    Self::handle_permission_socket(stream, platform, router).await;
+                                });
+                            }
+                            Some(uid) => {
+                                warn!(
+                                    target: "imagent::core",
+                                    peer_uid = uid,
+                                    expected_uid = expected_uid,
+                                    "拒绝非本进程 uid 的权限 socket 连接（疑似伪造）"
+                                );
+                                // stream drop 时自动关闭。
+                            }
+                            None => {
+                                warn!(
+                                    target: "imagent::core",
+                                    "无法获取权限 socket 对端 uid（平台不支持 peer cred），拒绝连接"
+                                );
+                            }
+                        }
                     }
                     Err(e) => {
                         warn!(target: "imagent::core", error = %e, "permission socket accept 失败");
@@ -943,6 +975,61 @@ impl Dispatcher {
                     warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "send_text 失败");
                 }
             }
+        }
+    }
+}
+
+/// 取 UnixStream 对端的 uid（用于权限 socket 鉴权）。
+///
+/// - Linux: `SO_PEERCRED`
+/// - macOS: `LOCAL_PEERCRED`
+/// - 其它 unix: 返回 None（调用方应拒绝）。
+#[cfg(unix)]
+fn peer_uid(stream: &tokio::net::UnixStream) -> Option<u32> {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    // SAFETY: getsockopt 对已连接的 unix socket 按 optname 填充固定大小的输出缓冲，
+    // 传入正确的 len。MaybeUninit/zeroed 避免读取未初始化字段。
+    unsafe {
+        #[cfg(target_os = "linux")]
+        {
+            let mut cred: std::mem::MaybeUninit<libc::ucred> = std::mem::MaybeUninit::uninit();
+            let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+            let rc = libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                cred.as_mut_ptr() as *mut libc::c_void,
+                &mut len,
+            );
+            if rc == 0 {
+                Some((*cred.as_ptr()).uid)
+            } else {
+                None
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut xucred: libc::xucred = std::mem::zeroed();
+            let mut len = std::mem::size_of::<libc::xucred>() as libc::socklen_t;
+            let rc = libc::getsockopt(
+                fd,
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERCRED,
+                &mut xucred as *mut libc::xucred as *mut libc::c_void,
+                &mut len,
+            );
+            // cr_uid == u32::MAX 表示未填充/无效。
+            if rc == 0 && xucred.cr_uid != u32::MAX {
+                Some(xucred.cr_uid)
+            } else {
+                None
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = fd;
+            None
         }
     }
 }
@@ -1845,5 +1932,25 @@ mod tests {
         assert!(reply.contains("Tool0"), "应含首个工具: {reply}");
         assert!(reply.contains("Tool4"), "应含第 5 个工具: {reply}");
         drop_db(ctx.db).await;
+    }
+}
+
+#[cfg(all(test, unix))]
+mod permission_socket_tests {
+    use super::peer_uid;
+
+    #[tokio::test]
+    async fn peer_uid_returns_self_for_local_pair() {
+        // socketpair 两端同进程，peer_uid 必须返回本进程 uid。
+        let (a, b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        // from_std 要求非阻塞 socket（tokio issue #7172）。
+        a.set_nonblocking(true).expect("set_nonblocking");
+        let ta = tokio::net::UnixStream::from_std(a).expect("from_std");
+        let got = peer_uid(&ta).expect("peer_uid 对本地连接应返回 Some");
+        // SAFETY: getuid 无参数无副作用，永远安全。
+        let self_uid = unsafe { libc::getuid() };
+        assert_eq!(got, self_uid);
+        drop(ta);
+        drop(b);
     }
 }

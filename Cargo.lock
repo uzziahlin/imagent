@@ -1389,6 +1389,7 @@ dependencies = [
  "dirs",
  "futures",
  "imagent-store",
+ "libc",
  "parking_lot",
  "prometheus",
  "serde",
