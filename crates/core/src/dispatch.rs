@@ -257,6 +257,7 @@ impl Dispatcher {
         }
         let platform = self.platform.clone();
         let router = self.router.clone();
+        let agent_timeout = self.agent_timeout;
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
@@ -268,7 +269,8 @@ impl Dispatcher {
                                 let platform = platform.clone();
                                 let router = router.clone();
                                 tokio::spawn(async move {
-                                    Self::handle_permission_socket(stream, platform, router).await;
+                                    Self::handle_permission_socket(stream, platform, router, agent_timeout)
+                                        .await;
                                 });
                             }
                             Some(uid) => {
@@ -303,6 +305,7 @@ impl Dispatcher {
         mut stream: tokio::net::UnixStream,
         platform: Arc<dyn Platform>,
         router: Arc<PermissionRouter>,
+        agent_timeout: std::time::Duration,
     ) {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let mut reader = BufReader::new(&mut stream);
@@ -345,11 +348,17 @@ impl Dispatcher {
         }
         // 注册 pending，等回复（recv 循环 route 到这里）。
         let rx = router.register(&conv_id).await;
-        let reply: PermissionReply = match rx.await {
-            Ok(r) => r,
-            Err(_) => PermissionReply {
+        // P1-G：权限回复等待带 agent_timeout 对齐的超时——agent 死或用户长时间不回复时，
+        // 超时回 deny 并 drop receiver，避免 pending 永驻把后续消息误当回复吞。
+        let reply: PermissionReply = match tokio::time::timeout(agent_timeout, rx).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => PermissionReply {
                 allow: false,
                 message: Some("permission router dropped".into()),
+            },
+            Err(_elapsed) => PermissionReply {
+                allow: false,
+                message: Some(format!("permission ask timed out after {agent_timeout:?}")),
             },
         };
         // 写回 socket（一行 JSON）。
