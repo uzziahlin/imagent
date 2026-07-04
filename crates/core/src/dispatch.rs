@@ -800,15 +800,15 @@ impl Dispatcher {
         };
 
         // 新建 session（无 existing）时，一次性注入压缩摘要作为前情摘要。
+        // P1-K：摘要删除推迟到 run 成功落库后——若 run 失败（session 未建成），
+        // 保留摘要供下次新建注入，避免永久丢失。
         let mut prompt = base_prompt;
+        let mut injected_compact_summary = false;
         if existing.is_none() {
             if let Ok(Some(summary)) = self.store.get_config(&compact_summary_key(&conv.0)).await {
                 if !summary.is_empty() {
                     prompt = format!("【前情摘要】{summary}\n\n——\n\n{prompt}");
-                    let _ = self
-                        .store
-                        .delete_config(&compact_summary_key(&conv.0))
-                        .await;
+                    injected_compact_summary = true;
                 }
             }
         }
@@ -942,6 +942,23 @@ impl Dispatcher {
             };
             if let Err(e) = self.store.upsert_named_session(&nrow).await {
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "upsert_named_session 失败");
+            }
+        }
+
+        // P1-K：run 成功落库后，删除已注入的 compact_summary（一次性）。
+        // 失败路径已在上方 return，不会走到这里，故 summary 不会丢失。
+        if injected_compact_summary {
+            if let Err(e) = self
+                .store
+                .delete_config(&compact_summary_key(&conv.0))
+                .await
+            {
+                warn!(
+                    target: "imagent::core",
+                    conv_id = %conv.0,
+                    error = %e,
+                    "delete_config(compact_summary) 失败（best-effort）"
+                );
             }
         }
 
