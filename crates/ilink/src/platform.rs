@@ -102,10 +102,13 @@ impl ILinkPlatform {
 
         if let Some(new_buf) = resp.get_updates_buf.as_deref() {
             if !new_buf.is_empty() {
-                let _ = self
+                if let Err(e) = self
                     .store
                     .set_sync_buf(PLATFORM, &self.account_id, new_buf)
-                    .await;
+                    .await
+                {
+                    warn!(target: "ilink", error = %e, "set_sync_buf 失败（best-effort）");
+                }
             }
         }
 
@@ -124,10 +127,18 @@ impl ILinkPlatform {
         // 更新该 peer 最新 context_token（发消息回传）。
         if let Some(token) = msg.context_token.as_deref() {
             if !token.is_empty() {
-                let _ = self
+                if let Err(e) = self
                     .store
                     .set_context_token(PLATFORM, &self.account_id, &msg.from_user_id, token)
-                    .await;
+                    .await
+                {
+                    warn!(
+                        target: "ilink",
+                        peer = %msg.from_user_id,
+                        error = %e,
+                        "set_context_token 失败（best-effort）"
+                    );
+                }
             }
         }
 
