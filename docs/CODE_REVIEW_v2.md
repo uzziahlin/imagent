@@ -8,7 +8,7 @@
 
 ## 📋 修复进度（2026-07-04，分支 `fix/code-review-v2`）
 
-**已落地（17 commit，workspace 230 passed，clippy 0 warning）**：
+**已落地（27 commit，workspace 233 passed，clippy 0 warning）**：
 - ✅ **P0 全部（3/3）**：P0-A（ACP fail-open→fail-closed）、P0-B（权限 socket 对端 uid 鉴权 + chmod 0600）、P0-C（login baseurl 域名白名单）
 - ✅ **P1-D**：workdir「安全边界」措辞修正为「cwd（非沙箱）」
 - ✅ **E-1**：各 crate MSRV 统一继承 workspace 1.80 + 修复 ilink `media.rs` 的 `is_multiple_of`（1.87 API，CI @1.80 实际会失败）
@@ -28,7 +28,7 @@
 
 > ⚠️ **破例说明（P0-B + P1-A/B/C 由主会话自行 Edit）**：omp 工具链反复异常——上会话 5 次（并发 exit 1（API 限流）×2、「清理工作树到只剩本任务文件」覆盖前序成果×2、强约束下 noop×1）；本会话 P1-C 委派 omp **第 3 次「空手退出」**（exit 0、零产出、log 仅 1 行主会话口吻废话；前两次 6/30、7/04 已记 engram `cd4f3255`/`33d52163`）。依 `CODE_REVIEW.md` 顶部先例（"omp 工具链对重构类任务反复委派/挂死，用户授权破例自行 Edit"），P0-B/P1-A/B/C 破例主会话自行 Edit（方案已完整 review/设计，每项 `cargo test` 验证）。**违反 CLAUDE.md omp 委派硬规则**，请 review；P0-A/C 由 omp 完成，P1-D/E-1/E-2 为注释/配置/attribute 类主会话直接改。后续 omp 任务说明须显式禁 git 写操作 + 禁删非任务文件（教训已记 memory：`omp-worktree-protection`）。
 
-**剩余（后续 issue 跟进）**：P1-E（方案已设计，实现 defer——见下）、P2 全部、E-3~E-7、D-1~D-4。
+**✅ 全部完成（2026-07-05）**：P0（3/3）、P1（12/12，含 P1-E ACP 取消）、P2（24/24）、E（7/7）、D（4/4）全部修复并验证。workspace 233 passed / clippy 0 warning。
 
 每条 issue 带 checkbox，id 形如 `P0-A`，便于转 GitHub issue 追踪。
 
