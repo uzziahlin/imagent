@@ -457,12 +457,14 @@ impl Dispatcher {
                         } else {
                             let actor = sender.0.as_str();
                             let added = self.auth.allow(target);
-                            if let Err(e) = self
+                            // P2-E：持久化失败不能谎报「已授权」（内存已加但重启后丢失）。
+                            let persist_failed = self
                                 .store
                                 .add_allowed_sender(target, Some(actor), Some("im"))
                                 .await
-                            {
-                                warn!(target: "imagent::core", error = %e, "add_allowed_sender 失败");
+                                .is_err();
+                            if persist_failed {
+                                warn!(target: "imagent::core", "add_allowed_sender 持久化失败（内存已授权，重启丢失）");
                             }
                             if let Err(e) = self
                                 .store
@@ -476,7 +478,11 @@ impl Dispatcher {
                             {
                                 warn!(target: "imagent::core", error = %e, "append_audit 失败");
                             }
-                            let text_out = if added {
+                            let text_out = if persist_failed {
+                                format!(
+                                    "⚠️ `{target}` 已在内存授权，但持久化失败（重启后将丢失），请重试或本地 `imagent allow` 处理。"
+                                )
+                            } else if added {
                                 format!("已授权 `{target}`。")
                             } else {
                                 format!("`{target}` 已在白名单。")

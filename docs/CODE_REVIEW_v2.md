@@ -99,7 +99,7 @@
 - [ ] **P2-B** socket `bind` 失败只 warn（`dispatch.rs:232-238`，与 P0-B 同源，可顺手）
 - [ ] **P2-C** socket 问询强制 `ReplyHint::None` 丢 iLink context_token（`dispatch.rs:309-313`）
 - [ ] **P2-D** `/allow` 无角色区分，任意白名单用户可授权新用户（`dispatch.rs:399-433`）
-- [ ] **P2-E** `/allow` store 失败仍回「已授权」（`dispatch.rs:405-431`）
+- [x] **P2-E** `/allow` store 失败仍回「已授权」 ✅ 已修：`add_allowed_sender` 持久化失败时 reply 警告（内存已授权 + 重启后将丢失），不再谎报「已授权」。
 - [ ] **P2-F** 中间 Text chunk 全丢弃，「流式」实际一次性（`dispatch.rs:824-834`）
 - [x] **P2-G** `parse_reply` 首字符 y/Y 误判 ✅ 已修：去掉首字符 y/Y 宽匹配（会把 year/yellow/yesterday 误 allow——权限 approve/deny 的真实安全 bug），改精确匹配 `y/yes/ye/yep/yeah/ok/okay/是/允许/好/好的`。回归测试 `parse_reply_year_not_allowed`。
 - [ ] **P2-H** Auth 无归一化（`auth.rs:35-37`）
