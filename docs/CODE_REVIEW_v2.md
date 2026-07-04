@@ -106,7 +106,7 @@
 - [x] **P2-I** conv_id 未消毒 ✅ 已修 / mcp.json 不清理 ⏳ defer：① conv_id 经 `sanitize_filename` 消毒文件名（防 `../` / `/` / `:` 路径遍历；`--conv-id` 参数仍用原值保路由），单测 `sanitize_filename_strips_traversal`；② mcp.json 用完清理需重构 run 的 spawn 路径，defer 专门小 PR（整洁性，非安全）。
 - [x] **P2-J** codex prompt 裸 positional arg ✅ 已修：`codex exec <prompt>` 的 prompt 改为经 `--` 分隔的纯 positional（resume / 新建两分支），防止 prompt 以 `-` 开头被误解析为 flag（参数注入）。`Command::arg` 不经 shell（无 shell 注入），此修复针对 codex CLI 的 arg 解析。
 - [ ] **P2-K** ACP `sessions` HashMap 无界增长（`acp.rs:193,220,238`）
-- [ ] **P2-L** WeCom `ws_url` 不校验 wss + ack 失败仍继续（`wecom/client.rs:81,97-128`）
+- [x] **P2-L** ws_url 不校验 wss ✅ 已修 / ack 失败仍继续 ⏳ defer：① `connect_and_serve` 开头校验 ws_url 远端必须 `wss://`（`ws://` 仅 `localhost`/`127.0.0.1`/`[::1]` 例外，测试 `run_loops_on_connect_failure` 用 `ws://127.0.0.1` 不破坏）；② ack 失败仍继续涉及 wecom 协议层可靠性，defer 专门评估。
 - [ ] **P2-M** 固定 `permission.sock` 路径，单实例硬约束（`claude/backend.rs:55-64`）
 - [ ] **P2-N** store schema 迁移未事务化（`store/schema.rs:83-103`）
 - [ ] **P2-O** 迁移无「user_version 过新」拒绝（`store/schema.rs:84-101`）
