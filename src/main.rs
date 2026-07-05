@@ -1,7 +1,10 @@
-//! `imagent` 二进制入口：组装 store / core / ilink / claude 四个 crate。
+//! `imagent` 二进制入口：组装 7 个 crate（store / core / ilink / wecom / claude /
+//! codex / gemini），多平台（iLink 个人微信 / WeCom 企业微信）× 多后端
+//!（Claude CLI/ACP / Codex / Gemini）。
 //!
-//! 职责：加载配置 → 扫码登录 → 前台常驻收私聊 → 鉴权 → 驱动 `claude -p` → 回传。
-//! 鉴权 / allowedTools 收敛 / 风控逻辑全部在 core（`Dispatcher`）中，main 只做组装。
+//! 职责：加载配置 →（iLink 扫码登录 / WeCom 读 config 凭据）→ 前台常驻收私聊 →
+//! 鉴权 → 驱动 agent → 回传。鉴权 / allowedTools 收敛 / 权限审批 / 风控全部在
+//! core（`Dispatcher`）中，main 只做组装 + 运维（metrics/health/SIGHUP/优雅退出）。
 
 #![forbid(unsafe_code)]
 
@@ -89,7 +92,9 @@ async fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Login { platform } => {
             if platform != "ilink" {
-                return Err(anyhow!("P1 仅支持 ilink 平台，收到 platform={platform}"));
+                return Err(anyhow!(
+                    "login 仅支持 ilink 平台（WeCom 用 config 的 bot_id + secret，不走扫码登录），收到 platform={platform}"
+                ));
             }
             let store = imagent_store::Store::open(&db_path).await?;
             println!("开始 iLink 扫码登录，请用手机微信扫描终端二维码 …");
@@ -282,7 +287,10 @@ async fn main() -> Result<()> {
             );
         }
         Cmd::Stop => {
-            println!("imagent P1 为前台运行模式，请在运行 `start` 的终端按 Ctrl-C 停止。");
+            println!(
+                "imagent 为前台运行模式。停止方式：在 `start` 的终端按 Ctrl-C，或 `kill {}`。",
+                std::process::id()
+            );
         }
         Cmd::Mcp {
             conv_id,
