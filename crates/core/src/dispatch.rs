@@ -319,6 +319,10 @@ impl Dispatcher {
                 match listener.accept().await {
                     Ok((stream, _)) => {
                         // 鉴权：只接受与本进程同 uid 的连接（MCP 子进程由本进程 spawn，必然同 uid）。
+                        // P2-7 威胁模型：peer_uid 仅防「跨 uid 伪造」；同 uid 的任何进程（如被入侵的
+                        // 浏览器/CI 工具/恶意 npm 包）仍可 connect 并伪造 conv_id 推送权限请求。
+                        // 完整防护需 socket 握手 token（spawn MCP 子进程时 env 传一次性 token，
+                        // 首包校验）——留作后续加固。
                         let expected_uid = current_uid();
                         match peer_uid(&stream) {
                             Some(uid) if uid == expected_uid => {
@@ -1109,8 +1113,9 @@ impl Dispatcher {
             }
             Err(e) => {
                 METRICS.claude_errors.inc();
-                let m = format!("[error] backend task panicked: {e}");
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "backend task panic");
+                // P2-5：panic 时若已收到 Final chunk，优先回传它（而非丢弃只报 panic）。
+                let m = final_text.unwrap_or_else(|| format!("[error] backend task panicked: {e}"));
                 self.reply(&conv, &m, &hint).await;
                 // P1-7：panic 路径也回收 conv_lock。
                 drop(_guard);
@@ -1222,8 +1227,18 @@ impl Dispatcher {
 #[cfg(unix)]
 #[allow(unsafe_code)] // crate 顶层 `#![deny(unsafe_code)]`，此处显式豁免
 fn current_uid() -> u32 {
-    // SAFETY: getuid 无参数、无副作用，永远安全。
-    unsafe { libc::getuid() }
+    // SAFETY: getuid/geteuid 无参数、无副作用，永远安全。
+    // P2-8：Linux SO_PEERCRED 返回对端 real uid → 比对 getuid；
+    // macOS LOCAL_PEERCRED 返回 effective uid → 比对 geteuid（避免 setuid 部署下
+    // real != effective 导致 Ask 闭环全部误拒、可用性归零）。
+    #[cfg(target_os = "macos")]
+    {
+        unsafe { libc::geteuid() }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        unsafe { libc::getuid() }
+    }
 }
 
 /// 取 UnixStream 对端的 uid（用于权限 socket 鉴权）。

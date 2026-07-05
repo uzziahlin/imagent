@@ -27,9 +27,12 @@ pub struct PermissionReply {
 ///
 /// 规则（trim 后）：
 /// - 空串 / 无法判定 → deny；
-/// - 首字符 `y`/`Y` → allow；
-/// - 等于 `是`/`允许`/`好`/`yes`/`ok`/`Y` → allow；
-/// - 其它 → deny。
+/// - 精确匹配常见 allow 词（`y`/`yes`/`ok`/`是`/`允许`/`好`/`可以`/`行`/`没问题` 等）→ allow；
+/// - 其它 → deny（fail-closed）。
+///
+/// P2-G：不再用「首字符 y/Y」宽匹配（旧逻辑会把 year/yellow/yesterday 误判 allow，
+/// 对权限 approve/deny 是真实安全 bug）。P2-12：补中文确认词（用户回复「可以」
+/// 「行」「没问题」不再被误 deny）。
 pub fn parse_reply(text: &str) -> PermissionReply {
     let t = text.trim();
     if t.is_empty() {
@@ -41,9 +44,11 @@ pub fn parse_reply(text: &str) -> PermissionReply {
     let lower = t.to_ascii_lowercase();
     // P2-G：去掉「首字符 y/Y」宽匹配（旧逻辑会把 year/yeah/yellow/yesterday 等
     // 误判为 allow，对权限 approve/deny 是真实安全 bug）。改为精确匹配常见 allow 词。
+    // P2-12：补中文高频确认词（「可以」「行」「没问题」等），降低中文用户误 deny 率。
     let allow = matches!(
         lower.as_str(),
         "y" | "yes" | "ye" | "yep" | "yeah" | "ok" | "okay" | "是" | "允许" | "好" | "好的"
+            | "可以" | "行" | "没问题" | "好呀" | "行吧" | "可以吧" | "嗯"
     );
     PermissionReply {
         allow,
@@ -120,7 +125,8 @@ mod tests {
     #[test]
     fn parse_reply_allow_variants() {
         for s in [
-            "y", "Y", "yes", "YES", "Yes", "ok", "OK", "是", "允许", "好", "好的",
+            "y", "Y", "yes", "YES", "Yes", "ok", "OK", "是", "允许", "好", "好的", "可以", "行",
+            "没问题", "好呀", "行吧", "可以吧", "嗯",
         ] {
             let r = parse_reply(s);
             assert!(r.allow, "should allow: {s:?}");
