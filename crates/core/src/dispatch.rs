@@ -226,15 +226,13 @@ impl Dispatcher {
                 msg = self.platform.recv() => match msg {
                     Ok(msg) => {
                         let conv_id = msg.conv_id.0.clone();
-                        // 权限闭环优先：若该 conv 正等待 approve/deny 回复，
-                        // 把这条消息当作回复送达 oneshot，不走正常 handle。
-                        if self.router.has_pending(&conv_id).await {
-                            let reply = parse_reply(msg.text.as_deref().unwrap_or(""));
-                            let routed = self.router.route(&conv_id, reply).await;
-                            if routed {
-                                continue;
-                            }
-                            // 未命中（理论上 has_pending 为 true 时应命中）：fallthrough 处理。
+                        // 权限闭环优先：若该 conv 正等待 approve/deny 回复，把这条消息
+                        // 当作回复送达 oneshot。P2-2：直接 route（单次 lock 原子 check+
+                        // remove+send），避免旧 has_pending→route 两次 lock 间隙被超时
+                        // 清理（P1-8 cancel）击穿，导致 "yes" 误走 fallforward 当新 prompt。
+                        let reply = parse_reply(msg.text.as_deref().unwrap_or(""));
+                        if self.router.route(&conv_id, reply).await {
+                            continue;
                         }
                         // 每条消息独立 spawn，不阻塞 recv。P1-5：入 JoinSet 以便 drain。
                         let this = self.clone();
