@@ -26,14 +26,14 @@ jobs:
         run: cargo test --workspace --verbose
 
   msrv:
-    # 守住声明的 MSRV（rust-version = "1.80"，因使用 std::sync::LazyLock）。
-    name: check @ MSRV 1.80
+    # 守住声明的 MSRV（rust-version = "1.88"，因 agent-client-protocol-schema 等核心依赖需 rustc 1.88）。
+    name: check @ MSRV 1.88
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.80
+      - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
-      - name: cargo check @ 1.80
+      - name: cargo check @ 1.88
         run: cargo check --workspace --all-targets
 
   audit:

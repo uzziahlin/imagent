@@ -20,7 +20,7 @@ members = ["crates/store", "crates/core", "crates/claude", "crates/codex", "crat
 [workspace.package]
 version = "1.0.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.88"
 license = "MIT"
 authors = ["Uzziah"]
 repository = "https://github.com/uzziah/imagent"

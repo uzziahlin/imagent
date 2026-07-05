@@ -65,7 +65,7 @@ trait Platform                        trait Backend
 ### 前置
 
 - **操作系统**：macOS 或 Linux。Windows 暂不支持（IM 权限审批闭环与配置热重载依赖 Unix domain socket / SIGHUP）。
-- Rust（`cargo`，edition 2021，**MSRV 1.80**）
+- Rust（`cargo`，edition 2021，**MSRV 1.88**）
 - Claude Code CLI：`npm i -g @anthropic-ai/claude-code`
 
 ### 构建

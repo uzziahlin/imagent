@@ -1,4 +1,6 @@
-# imagent toolchain pin（E-5）：MSRV 1.80（= workspace.package rust-version）。
-# 本地 + CI 统一用 1.80 编译，保证 MSRV 声明真实可构建。
+# imagent toolchain pin（E-5）：MSRV 1.88（= workspace.package rust-version）。
+# 本地 + CI 统一用 1.88 编译，保证 MSRV 声明真实可构建。
+# 1.88 起因：核心依赖声明 rust-version 1.88——agent-client-protocol-schema、
+# serde_with、darling、image 等；更早的 edition2024 manifest 还需 cargo 1.85+。
 [toolchain]
-channel = "1.80"
+channel = "1.88"
