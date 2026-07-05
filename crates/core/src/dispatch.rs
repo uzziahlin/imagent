@@ -91,6 +91,11 @@ pub struct Dispatcher {
     agent_timeout: std::time::Duration,
     /// 管理员 sender（可 /allow）；空 = 所有白名单用户可（向后兼容，P2-D）。
     admin_senders: Arc<RwLock<Vec<String>>>,
+    /// 优雅退出信号（P1-5）：收到 SIGINT/SIGTERM 后 notify，run() 停止收新消息并 drain。
+    shutdown: Arc<tokio::sync::Notify>,
+    /// in-flight handle task 集合（P1-5）：drain 时等待其完成，避免 SIGKILL 正在
+    /// 写文件的 agent 子进程导致半写。task 完成自动移除。
+    tasks: Mutex<tokio::task::JoinSet<()>>,
 }
 
 impl Dispatcher {
@@ -148,6 +153,8 @@ impl Dispatcher {
             permission_mode,
             agent_timeout,
             admin_senders: Arc::new(RwLock::new(admin_senders)),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+            tasks: Mutex::new(tokio::task::JoinSet::new()),
         }
     }
 
@@ -181,6 +188,12 @@ impl Dispatcher {
         self.router.clone()
     }
 
+    /// 触发优雅退出（P1-5）：run() 收到后停止 recv 并 drain in-flight task。
+    /// 由 main 的信号处理 task 调用（SIGINT/SIGTERM）。
+    pub fn shutdown(&self) {
+        self.shutdown.notify_waiters();
+    }
+
     /// 主循环。循环 `platform.recv()`，每条消息 `tokio::spawn` 处理（不阻塞 recv）。
     /// recv 返回 Err 时：session 过期 → 优雅停止（返回 Err 让 main 提示重新 login）；
     /// 其它错误 → 记录日志后继续（长轮询层自管重连/退避），不 panic。
@@ -203,38 +216,60 @@ impl Dispatcher {
         }
 
         loop {
-            match self.platform.recv().await {
-                Ok(msg) => {
-                    let conv_id = msg.conv_id.0.clone();
-                    // 权限闭环优先：若该 conv 正等待 approve/deny 回复，
-                    // 把这条消息当作回复送达 oneshot，不走正常 handle。
-                    if self.router.has_pending(&conv_id).await {
-                        let reply = parse_reply(msg.text.as_deref().unwrap_or(""));
-                        let routed = self.router.route(&conv_id, reply).await;
-                        if routed {
-                            continue;
+            // P1-5：监听 shutdown 信号，停止接收新消息并进入 drain。
+            tokio::select! {
+                biased;
+                _ = self.shutdown.notified() => {
+                    info!(target: "imagent::core", "shutdown 信号到达，停止接收新消息，drain in-flight task");
+                    break;
+                }
+                msg = self.platform.recv() => match msg {
+                    Ok(msg) => {
+                        let conv_id = msg.conv_id.0.clone();
+                        // 权限闭环优先：若该 conv 正等待 approve/deny 回复，
+                        // 把这条消息当作回复送达 oneshot，不走正常 handle。
+                        if self.router.has_pending(&conv_id).await {
+                            let reply = parse_reply(msg.text.as_deref().unwrap_or(""));
+                            let routed = self.router.route(&conv_id, reply).await;
+                            if routed {
+                                continue;
+                            }
+                            // 未命中（理论上 has_pending 为 true 时应命中）：fallthrough 处理。
                         }
-                        // 未命中（理论上 has_pending 为 true 时应命中）：fallthrough 处理。
+                        // 每条消息独立 spawn，不阻塞 recv。P1-5：入 JoinSet 以便 drain。
+                        let this = self.clone();
+                        self.tasks.lock().await.spawn(async move {
+                            this.handle(msg).await;
+                        });
                     }
-                    // 每条消息独立 spawn，不阻塞 recv。
-                    let this = self.clone();
-                    tokio::spawn(async move {
-                        this.handle(msg).await;
-                    });
-                }
-                Err(e) => {
-                    if is_session_expired_err(&e) {
-                        tracing::error!(
-                            target: "imagent::core",
-                            error = %e,
-                            "session 过期，停止 dispatcher（需重新 login）"
-                        );
-                        return Err(e);
+                    Err(e) => {
+                        if is_session_expired_err(&e) {
+                            tracing::error!(
+                                target: "imagent::core",
+                                error = %e,
+                                "session 过期，停止 dispatcher（需重新 login）"
+                            );
+                            return Err(e);
+                        }
+                        warn!(target: "imagent::core", error = %e, "platform.recv 失败，继续重试");
                     }
-                    warn!(target: "imagent::core", error = %e, "platform.recv 失败，继续重试");
-                }
+                },
             }
         }
+        // P1-5：drain in-flight handle task（最多 30s），超时 abort 剩余。
+        // 避免 SIGKILL 正在写文件的 agent 子进程导致半写；超时兜底防无限等待。
+        let mut tasks = self.tasks.lock().await;
+        let drain = async {
+            while tasks.join_next().await.is_some() {}
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(30), drain).await {
+            Ok(_) => info!(target: "imagent::core", "drain 完成（in-flight task 已结束）"),
+            Err(_) => {
+                warn!(target: "imagent::core", "drain 超时 30s，abort 剩余 in-flight task");
+                tasks.abort_all();
+            }
+        }
+        Ok(())
     }
 
     /// spawn socket accept task：每个连接独立 spawn，读权限请求 → send_text 询问

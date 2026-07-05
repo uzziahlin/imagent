@@ -211,21 +211,24 @@ async fn main() -> Result<()> {
                 config.allowed_tools,
                 discovery
             );
-            tokio::select! {
-                res = dispatcher.clone().run() => match res {
-                    Ok(()) => tracing::info!("dispatcher 正常退出"),
-                    Err(e) => {
-                        if matches!(e, imagent_core::CoreError::SessionExpired(_)) {
-                            tracing::error!("dispatcher 退出：{e}");
-                            println!("iLink session 已过期，请重新运行 `imagent login` 扫码登录。");
-                        } else {
-                            tracing::error!("dispatcher 异常退出：{e}");
-                            println!("imagent 异常退出：{e}");
-                        }
+            // P1-4/P1-5：信号 task 监听 SIGINT + SIGTERM，触发 dispatcher 优雅退出
+            // （run() 停止 recv + drain in-flight task，避免 SIGKILL 正在写文件的
+            // agent 子进程导致半写）。run() 完成 drain 后自然返回。
+            let dispatcher_for_signal = dispatcher.clone();
+            tokio::spawn(async move {
+                shutdown_signal().await;
+                dispatcher_for_signal.shutdown();
+            });
+            match dispatcher.run().await {
+                Ok(()) => tracing::info!(target: "imagent::ops", "dispatcher 退出（drain 完成）"),
+                Err(e) => {
+                    if matches!(e, imagent_core::CoreError::SessionExpired(_)) {
+                        tracing::error!("dispatcher 退出：{e}");
+                        println!("iLink session 已过期，请重新运行 `imagent login` 扫码登录。");
+                    } else {
+                        tracing::error!("dispatcher 异常退出：{e}");
+                        println!("imagent 异常退出：{e}");
                     }
-                },
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("received Ctrl-C, shutting down");
                 }
             }
         }
@@ -480,4 +483,34 @@ fn spawn_sighup_handler(
             }
         }
     });
+}
+
+/// 等 SIGINT 或 SIGTERM（P1-4：补 SIGTERM，容器/systemd/k8s 滚动更新优雅退出）。
+/// 信号到达后返回，调用方触发 `dispatcher.shutdown()`。
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(target: "imagent::ops", error = %e, "无法注册 SIGTERM 处理器，仅监听 SIGINT");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!(target: "imagent::ops", "received SIGINT, shutting down");
+            }
+            _ = term.recv() => {
+                tracing::info!(target: "imagent::ops", "received SIGTERM, shutting down");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!(target: "imagent::ops", "received Ctrl-C, shutting down");
+    }
 }
