@@ -220,12 +220,13 @@ impl LongLivedAcp {
                                     .to_string(),
                             },
                         };
-                        // P2-K：sessions 缓存上限保护（conv 数 = IM 用户数有限，但极端兜底）；
-                        // 超上限清空，下次 LoadSession 重建（HashMap 无序，无法清最旧）。
-                        if sessions.len() > 1000 {
-                            sessions.clear();
+                        // P2-K/P2-3：sessions 缓存上限保护——达到上限不再 insert（避免
+                        // clear() 清掉活跃 conv 的 sessionId 导致用户上下文丢失；HashMap
+                        // 无序无法清最旧）。超限新 conv 下次 get None 走 NewSession。conv 数
+                        // = IM 用户数有限，超 1000 为极端兜底。
+                        if sessions.len() < 1000 {
+                            sessions.insert(req.conv_id.clone(), sid.clone());
                         }
-                        sessions.insert(req.conv_id.clone(), sid.clone());
                         let blocks = vec![ContentBlock::Text(TextContent::new(req.prompt.clone()))];
                         let prompt_fut = connection
                             .send_request(PromptRequest::new(
