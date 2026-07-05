@@ -1,10 +1,30 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 
 use parking_lot::Mutex;
+use prometheus::{register_int_counter, IntCounter};
 
 use crate::error::{Result, StoreError};
 use crate::schema;
+
+/// 凭据因 keyring 不可用而明文回退写入的次数（`require_keyring=false` 时）。
+static CREDENTIAL_PLAINTEXT_FALLBACK: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "imagent_credential_plaintext_fallback_total",
+        "凭据因 keyring 不可用而明文回退写入的次数"
+    )
+    .expect("register credential_plaintext_fallback")
+});
+
+/// `require_keyring=true` 时 keyring 失败被 fail-closed 拒绝（不落盘）的次数。
+static CREDENTIAL_KEYRING_REJECTED: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "imagent_credential_keyring_rejected_total",
+        "require_keyring=true 时 keyring 失败被拒绝（fail-closed）的次数"
+    )
+    .expect("register credential_keyring_rejected")
+});
 
 /// 一行 session 记录（core 用于会话路由）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -56,6 +76,9 @@ struct Inner {
 #[derive(Clone)]
 pub struct Store {
     inner: Arc<Inner>,
+    /// 若为 true，`put_credential` 在 keyring 不可用时拒绝明文落盘（fail-closed）。
+    /// 默认 false（headless 明文回退 + warn，向后兼容）。由 main 据 config 设置。
+    require_keyring: Arc<AtomicBool>,
 }
 
 impl Store {
@@ -64,7 +87,20 @@ impl Store {
     pub async fn open(path: &Path) -> Result<Self> {
         let path = path.to_path_buf();
         let inner = blocking_open(path).await?;
-        Ok(Store { inner })
+        Ok(Store {
+            inner,
+            require_keyring: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// 设置是否要求凭据必须入 keyring（true = keyring 不可用时拒绝明文落盘）。
+    /// 由 main 启动时据 `config.require_keyring` 设置。
+    pub fn set_require_keyring(&self, on: bool) {
+        self.require_keyring.store(on, Ordering::Relaxed);
+    }
+
+    fn require_keyring(&self) -> bool {
+        self.require_keyring.load(Ordering::Relaxed)
     }
 
     // —— credentials ——
@@ -75,24 +111,49 @@ impl Store {
     pub async fn put_credential(&self, platform: &str, account_id: &str, blob: &str) -> Result<()> {
         let (platform, account_id) = (platform.to_string(), account_id.to_string());
         // keychain I/O 经游离线程 + 超时，失败/超时回退明文（见 credentials 模块）。
-        let stored_blob =
-            if crate::credentials::store_in_keyring(&platform, &account_id, blob).await {
-                crate::credentials::marker_for(&platform, &account_id)
-            } else {
-                blob.to_string()
-            };
+        let keyring_ok = crate::credentials::store_in_keyring(&platform, &account_id, blob).await;
+        if !keyring_ok && self.require_keyring() {
+            CREDENTIAL_KEYRING_REJECTED.inc();
+            return Err(StoreError::Other(format!(
+                "require_keyring=true 但 keyring 写入失败，拒绝明文落盘：{platform}:{account_id}\
+                 （headless/CI 无 keychain 时请设 require_keyring=false 或配置 OS keyring）"
+            )));
+        }
+        let stored_blob = if keyring_ok {
+            crate::credentials::marker_for(&platform, &account_id)
+        } else {
+            CREDENTIAL_PLAINTEXT_FALLBACK.inc();
+            blob.to_string()
+        };
         let inner = self.inner.clone();
-        blocking_with(inner, move |conn| {
+        // 闭包需 'static（spawn_blocking），clone 一份供 DB 写入；account_id 本体保留给下方审计。
+        let (plat_db, acct_db, blob_db) = (platform.clone(), account_id.clone(), stored_blob);
+        let res = blocking_with(inner, move |conn| {
             let now = now_secs();
             conn.execute(
                 "INSERT INTO credentials (platform, account_id, blob, updated_at) \
                  VALUES (?1, ?2, ?3, ?4) \
                  ON CONFLICT(platform, account_id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at",
-                rusqlite::params![platform, account_id, stored_blob, now],
+                rusqlite::params![plat_db, acct_db, blob_db, now],
             )?;
             Ok(())
         })
-        .await
+        .await;
+        // P1-B：凭据写入审计（best-effort——失败只 warn，不影响凭据写入结果）。
+        if res.is_ok() {
+            let detail = if keyring_ok { "keyring" } else { "plaintext-fallback" };
+            if let Err(e) = self
+                .append_audit("credential_put", None, Some(&account_id), Some(detail))
+                .await
+            {
+                tracing::warn!(
+                    target: "store",
+                    error = %e,
+                    "凭据写入审计失败（best-effort，已忽略）"
+                );
+            }
+        }
+        res
     }
 
     /// 读凭据。SQLite `blob` 为 marker 时从 keyring 取真值；为明文（旧库 /
@@ -128,7 +189,7 @@ impl Store {
         let inner = self.inner.clone();
         let row = blocking_with(inner, move |conn| {
             let mut stmt = conn
-                .prepare("SELECT account_id, blob FROM credentials WHERE platform = ?1 LIMIT 1")?;
+                .prepare("SELECT account_id, blob FROM credentials WHERE platform = ?1 ORDER BY account_id LIMIT 1")?;
             let mut rows = stmt.query(rusqlite::params![q_platform])?;
             rows.next()?
                 .map(|r| Ok::<_, StoreError>((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
@@ -171,6 +232,10 @@ impl Store {
                 let marker = crate::credentials::marker_for(platform, account_id);
                 self.update_credential_blob(platform, account_id, &marker)
                     .await?;
+            } else {
+                // 读取路径：历史明文凭据未能迁移回 keyring，计数但不 fail-closed
+                // （否则历史明文凭据将不可读，破坏可用性；fail-closed 仅作用于写入）。
+                CREDENTIAL_PLAINTEXT_FALLBACK.inc();
             }
             Ok(raw_blob.to_string())
         }
@@ -462,6 +527,12 @@ impl Store {
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 rusqlite::params![now, action, actor, target, detail],
             )?;
+            // P2-R：审计日志轮转——保留最近 10000 条，删除超出（防 audit_log 无限增长）。
+            conn.execute(
+                "DELETE FROM audit_log WHERE id NOT IN \
+                 (SELECT id FROM audit_log ORDER BY id DESC LIMIT 10000)",
+                [],
+            )?;
             Ok(())
         })
         .await
@@ -688,6 +759,9 @@ fn open_and_setup(path: &Path) -> Result<rusqlite::Connection> {
     let conn = rusqlite::Connection::open(path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    // P2-P：busy_timeout 5s——多连接（core store + ilink store + /health 查询）竞争时
+    // 等待而非立即 SQLITE_BUSY 失败。
+    conn.pragma_update(None, "busy_timeout", 5000_i64)?;
     schema::migrate(&conn).map_err(|e| {
         tracing::error!(error = %e, "store schema migration failed");
         StoreError::Sqlite(e)
@@ -700,15 +774,28 @@ fn open_and_setup(path: &Path) -> Result<rusqlite::Connection> {
 fn tighten_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    // 库文件 0600
-    let md = std::fs::metadata(path)?;
-    let mut perms = md.permissions();
-    perms.set_mode(0o600);
-    std::fs::set_permissions(path, perms)?;
+    // 对单个文件 chmod 0600；文件不存在（如首次 open 时 WAL/SHM 尚未创建）则跳过。
+    let chmod_0600 = |p: &Path| -> Result<()> {
+        if let Ok(md) = std::fs::metadata(p) {
+            let mut perms = md.permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(p, perms)?;
+        }
+        Ok(())
+    };
+
+    // 主库文件 + WAL/SHM 边车文件都收紧到 0600。WAL 模式下 SQLite 创建的
+    // {db}-wal / {db}-shm 按 umask（常 0644 世界可读），而 WAL 持有明文凭据副本
+    // 直到 checkpoint——headless 明文回退部署下是凭据泄漏面。open_and_setup 在
+    // migrate（已触发 WAL 创建）之后调用本函数，故此时 WAL/SHM 通常已存在。
+    chmod_0600(path)?;
+    let base = path.to_string_lossy();
+    chmod_0600(&PathBuf::from(format!("{base}-wal")))?;
+    chmod_0600(&PathBuf::from(format!("{base}-shm")))?;
 
     // 注：不再 chmod 父目录——若 db_path 位于共享/系统目录（如 /tmp 或用户自定义路径），
-    // 无条件 chmod 父目录会误伤其他内容。db 文件本身 0600 已提供保护；父目录权限由
-    // 部署者负责（建议把 db 放在专属目录如 `~/.imagent` 并自行设 0700）。
+    // 无条件 chmod 父目录会误伤其它内容。父目录权限由部署者负责（建议把 db 放在专属目录
+    // 如 ~/.imagent 并自行设 0700，兜底 checkpoint 后重建的 WAL）。
     Ok(())
 }
 
@@ -790,6 +877,81 @@ mod tests {
             "sync_buf",
         ] {
             assert!(tables.iter().any(|x| x == t), "missing table: {t}");
+        }
+    }
+
+    #[tokio::test]
+    async fn put_credential_rejects_plaintext_when_require_keyring() {
+        // require_keyring=true 且 keyring 不可用（cfg!(test) 恒失败）→ fail-closed 拒绝。
+        let db = TempDb::new("reqkr_reject").await;
+        let store = Store::open(&db.path).await.unwrap();
+        store.set_require_keyring(true);
+        let err = store
+            .put_credential("ilink", "bot1", "{\"bot_token\":\"s\"}")
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("require_keyring"),
+            "应 fail-closed 拒绝明文落盘：{err}"
+        );
+        assert!(CREDENTIAL_KEYRING_REJECTED.get() >= 1);
+    }
+
+    #[tokio::test]
+    async fn put_credential_falls_back_to_plaintext_by_default() {
+        // 默认 require_keyring=false → keyring 失败时明文回退成功。
+        let db = TempDb::new("reqkr_fallback").await;
+        let store = Store::open(&db.path).await.unwrap();
+        store
+            .put_credential("ilink", "bot1", "{\"bot_token\":\"s\"}")
+            .await
+            .unwrap();
+        let (_acct, blob) = store.first_credential("ilink").await.unwrap().unwrap();
+        assert_eq!(blob, "{\"bot_token\":\"s\"}");
+        assert!(CREDENTIAL_PLAINTEXT_FALLBACK.get() >= 1);
+    }
+
+    #[tokio::test]
+    async fn credential_put_writes_audit() {
+        // P1-B：put_credential 应留下审计（测试环境 keyring 走 cfg!(test) fallback → 明文）。
+        let db = TempDb::new("cred_audit").await;
+        let store = Store::open(&db.path).await.unwrap();
+        store
+            .put_credential("ilink", "bot1", "{\"bot_token\":\"secret\"}")
+            .await
+            .unwrap();
+        let audit = store.list_audit(10).await.unwrap();
+        let cred_puts: Vec<_> = audit.iter().filter(|a| a.action == "credential_put").collect();
+        assert_eq!(cred_puts.len(), 1, "应有 1 条 credential_put 审计: {audit:?}");
+        assert_eq!(cred_puts[0].target.as_deref(), Some("bot1"));
+        assert_eq!(cred_puts[0].detail.as_deref(), Some("plaintext-fallback"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn db_and_wal_files_are_0600() {
+        // P1-A：主库 + WAL/SHM 边车文件都应收紧到 0600。
+        use std::os::unix::fs::PermissionsExt;
+        let db = TempDb::new("perm0600").await;
+        let store = Store::open(&db.path).await.unwrap();
+        // 写凭据触发 WAL 活动。
+        store
+            .put_credential("ilink", "bot1", "{\"bot_token\":\"secret\"}")
+            .await
+            .unwrap();
+        let mode_of = |suffix: &str| -> Option<u32> {
+            let p = format!("{}{suffix}", db.path.display());
+            std::fs::metadata(&p).ok().map(|md| md.permissions().mode() & 0o777)
+        };
+        // 主库文件必须 0600。
+        assert_eq!(mode_of(""), Some(0o600), "主库文件应为 0600");
+        // WAL/SHM 若存在（open 时 migrate 通常已触发 WAL 创建），必须 0600——
+        // 修复前默认按 umask 0644 世界可读，是 headless 明文回退下的凭据泄漏面。
+        if let Some(m) = mode_of("-wal") {
+            assert_eq!(m, 0o600, "WAL 应 0600，实际 {m:o}");
+        }
+        if let Some(m) = mode_of("-shm") {
+            assert_eq!(m, 0o600, "SHM 应 0600，实际 {m:o}");
         }
     }
 

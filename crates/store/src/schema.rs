@@ -2,6 +2,9 @@
 //!
 //! 用 `PRAGMA user_version` 做简单线性迁移：v1 = 建 5 张基础表，v2 = 动态白名单 + 审计日志。
 
+/// 当前代码支持的最新 schema 版本（migrate 上限 + user_version 过新拒绝阈值，P2-O）。
+pub const SCHEMA_VERSION: i64 = 3;
+
 /// v1 全部建表语句（`CREATE TABLE IF NOT EXISTS`，可重复执行）。
 pub const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS credentials (
@@ -82,22 +85,34 @@ CREATE TABLE IF NOT EXISTS named_sessions (
 /// 在已打开的连接上跑线性迁移。幂等：逐版本推进（v1→v2→…），已到目标版本则跳过。
 pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     let current: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    // P2-O：拒绝比代码更新的 user_version（旧代码跑新 DB 可能丢迁移 / 数据不一致）。
+    if current > SCHEMA_VERSION {
+        return Err(rusqlite::Error::ToSqlConversionFailure(
+            format!(
+                "store user_version={current} 比代码支持({SCHEMA_VERSION})新，拒绝（旧代码跑新 DB 风险）"
+            )
+            .into(),
+        ));
+    }
+    if current >= SCHEMA_VERSION {
+        tracing::debug!(current, "store schema already at latest version");
+        return Ok(());
+    }
+    // P2-N：整体迁移包在事务内，失败回滚（避免半迁移状态不一致）。
+    tracing::info!(target: "store", current, goal = SCHEMA_VERSION, "running store schema migration");
+    let tx = conn.unchecked_transaction()?;
     if current < 1 {
-        tracing::info!(current, "running store schema migration to v1");
-        conn.execute_batch(SCHEMA_V1)?;
-        conn.pragma_update(None, "user_version", 1_i64)?;
-    } else {
-        tracing::debug!(current, "store schema already >= v1");
+        tx.execute_batch(SCHEMA_V1)?;
+        tx.pragma_update(None, "user_version", 1_i64)?;
     }
     if current < 2 {
-        tracing::info!(current, "running store schema migration to v2");
-        conn.execute_batch(SCHEMA_V2)?;
-        conn.pragma_update(None, "user_version", 2_i64)?;
+        tx.execute_batch(SCHEMA_V2)?;
+        tx.pragma_update(None, "user_version", 2_i64)?;
     }
     if current < 3 {
-        tracing::info!(current, "running store schema migration to v3");
-        conn.execute_batch(SCHEMA_V3)?;
-        conn.pragma_update(None, "user_version", 3_i64)?;
+        tx.execute_batch(SCHEMA_V3)?;
+        tx.pragma_update(None, "user_version", 3_i64)?;
     }
+    tx.commit()?;
     Ok(())
 }

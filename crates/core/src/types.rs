@@ -14,7 +14,8 @@ pub struct UserId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SessionId(pub String);
 
-/// agent 工作目录（安全边界）。
+/// agent 工作目录（agent 子进程的 cwd，**非沙箱**：仅决定工作目录，agent 仍可读取
+/// 该目录之外的文件，需配合 allowed_tools + permission_mode 限制）。
 #[derive(Debug, Clone)]
 pub struct Workdir(pub PathBuf);
 

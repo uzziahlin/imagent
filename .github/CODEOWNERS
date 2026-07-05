@@ -1,0 +1,3 @@
+# CODEOWNERS（E-4）：PR review 自动指派。
+# TODO: 替换为真实 maintainer GitHub 用户名/团队（当前占位，review 不生效）。
+* @imagent/maintainers

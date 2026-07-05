@@ -2,6 +2,19 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [Unreleased] — 安全审查 v2 修复
+
+深度 Review v2（见 [`docs/CODE_REVIEW_v2.md`](docs/CODE_REVIEW_v2.md)）的修复，分支 `fix/code-review-v2`。
+
+### Fixed
+- **P0（阻塞）**：ACP 权限 fail-open→fail-closed（P0-A）、权限 socket 对端 uid 鉴权 + chmod 0600（P0-B）、login baseurl 域名白名单（P0-C）。
+- **P1（凭据 / 安全姿态）**：WAL/SHM chmod 0600 + 凭据写入审计（P1-A/B）、keyring fail-closed 选项 `require_keyring` + metric（P1-C）、workdir「cwd（非沙箱）」措辞（P1-D）。
+- **P1（健壮性）**：ilink 媒体解密 fail-closed + 流式下载防 OOM + login 禁 redirect（P1-H/J/L）、WeCom msgid 去重（`Dedup` 提到 core，P1-I）、compact_summary 删除推迟到 run 成功后（P1-K）、权限 socket 回复 `agent_timeout` 超时（P1-G）、`/new`/`/switch`/`/compact` 取 conv 串行锁（P1-F）。
+- **工程化**：各 crate `#![forbid/deny(unsafe_code)]`（E-2）、MSRV 统一继承 workspace 1.80（E-1）、项目根 CLAUDE.md onboarding 更新（D-1）。
+
+### Changed
+- workspace 测试 229 passed（2 ignored）；clippy 0 warning。
+
 ## [1.0.0] — 2026-07-02 — P3 全部完成
 
 首个稳定发布。P3（开源化 + 多平台 + 多后端 + 运维）全部交付。
@@ -18,8 +31,6 @@
 ### Changed
 - workspace 测试 214 passed（2 ignored）；clippy 0 warning。
 - 版本 0.1.0 → 1.0.0（workspace.package 一处生效，全 crate 跟随）。
-
-## [Unreleased]
 
 ## [0.2.0] — 2026-06-30 — P2
 

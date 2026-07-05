@@ -1,0 +1,22 @@
+[package]
+name = "imagent-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+imagent-ilink = { path = "../crates/ilink" }
+
+[[bin]]
+name = "ilink_proto_parse"
+path = "fuzz_targets/ilink_proto_parse.rs"
+test = false
+
+[[bin]]
+name = "ilink_media_cdn_host"
+path = "fuzz_targets/ilink_media_cdn_host.rs"
+test = false

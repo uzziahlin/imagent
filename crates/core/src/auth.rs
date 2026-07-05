@@ -14,6 +14,12 @@ use parking_lot::RwLock;
 
 use crate::types::UserId;
 
+/// P2-H：归一化 sender id（trim 首尾空白；不改大小写——IM userid 大小写语义
+/// 未知，保守不转换）。保证 config 白名单与入站 sender 比较一致。
+fn normalize_sender(s: &str) -> String {
+    s.trim().to_string()
+}
+
 #[derive(Debug, Clone)]
 pub struct Auth {
     allowed: Arc<RwLock<HashSet<String>>>,
@@ -23,7 +29,9 @@ impl Auth {
     /// 用配置的 `allowed_senders` 构造。空 vec = 发现模式。
     pub fn new(allowed_senders: Vec<String>) -> Self {
         Self {
-            allowed: Arc::new(RwLock::new(allowed_senders.into_iter().collect())),
+            allowed: Arc::new(RwLock::new(
+                allowed_senders.into_iter().map(|s| normalize_sender(&s)).collect(),
+            )),
         }
     }
 
@@ -33,24 +41,24 @@ impl Auth {
     }
 
     pub fn is_allowed(&self, uid: &UserId) -> bool {
-        self.allowed.read().contains(&uid.0)
+        self.allowed.read().contains(&normalize_sender(&uid.0))
     }
 
     /// 加入白名单，返回是否新增（已存在返回 false）。
     pub fn allow(&self, sender: &str) -> bool {
-        self.allowed.write().insert(sender.to_string())
+        self.allowed.write().insert(normalize_sender(sender))
     }
 
     /// 移除，返回是否原本存在。
     pub fn revoke(&self, sender: &str) -> bool {
-        self.allowed.write().remove(sender)
+        self.allowed.write().remove(&normalize_sender(sender))
     }
 
     /// 用新白名单整体替换（SIGHUP 热重载用）。清空后整体写入新集合。
     pub fn reload(&self, new_senders: Vec<String>) {
         let mut g = self.allowed.write();
         g.clear();
-        g.extend(new_senders);
+        g.extend(new_senders.into_iter().map(|s| normalize_sender(&s)));
     }
 
     /// 当前白名单快照（按 id 升序）。

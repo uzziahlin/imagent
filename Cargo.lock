@@ -1389,6 +1389,7 @@ dependencies = [
  "dirs",
  "futures",
  "imagent-store",
+ "libc",
  "parking_lot",
  "prometheus",
  "serde",
@@ -1422,6 +1423,7 @@ dependencies = [
  "cipher",
  "dirs",
  "ecb",
+ "futures",
  "hex",
  "imagent-core",
  "imagent-store",
@@ -1435,6 +1437,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "url",
  "uuid",
 ]
 
@@ -1445,6 +1448,7 @@ dependencies = [
  "anyhow",
  "keyring",
  "parking_lot",
+ "prometheus",
  "rusqlite",
  "serde",
  "serde_json",

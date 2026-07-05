@@ -17,6 +17,7 @@
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use aes::{Aes128, Block};
 use base64::Engine;
+use futures::StreamExt;
 use imagent_core::{CoreError, Result};
 
 use crate::client::DEFAULT_BASE_URL;
@@ -65,7 +66,7 @@ pub fn aes_encrypt(plaintext: &[u8], key: &[u8; 16]) -> Vec<u8> {
 
 /// AES-128-ECB + PKCS7 解密；密文长度非块倍数或填充非法时返回 `None`。
 pub fn aes_decrypt(ciphertext: &[u8], key: &[u8; 16]) -> Option<Vec<u8>> {
-    if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(BLOCK) {
+    if ciphertext.is_empty() || ciphertext.len() % BLOCK != 0 {
         return None;
     }
     let cipher = Aes128::new_from_slice(key).expect("16-byte key");
@@ -143,28 +144,21 @@ pub fn encode_aes_key_outbound(key: &[u8; 16]) -> String {
 // ───────────────────────── SSRF ─────────────────────────
 
 /// 从 URL 字符串中提取域名部分（协议后的 host，去掉端口/路径/查询）。
-fn extract_host(url: &str) -> Option<&str> {
-    let after_scheme = url.split("://").nth(1).unwrap_or(url);
-    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
-    // 去端口。
-    Some(
-        authority
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(authority),
-    )
+/// P2-U：改用 `url::Url`（取代裸字符串 split，更健壮——正确处理 IPv6 / 端口 / 特殊字符）。
+fn extract_host(url: &str) -> Option<String> {
+    url::Url::parse(url).ok()?.host_str().map(|h| h.to_string())
 }
 
 /// 校验 URL 主机在 CDN 白名单内；非白名单返回 Err（SSRF 防护）。
 pub fn assert_cdn_host(url: &str) -> Result<()> {
-    let host = extract_host(url).unwrap_or("");
+    let host = extract_host(url).unwrap_or_default();
     if host.is_empty() {
         return Err(CoreError::Platform(
             "ilink",
             format!("invalid url (no host): {url}"),
         ));
     }
-    if CDN_HOSTS.contains(&host) {
+    if CDN_HOSTS.contains(&host.as_str()) {
         Ok(())
     } else {
         Err(CoreError::Platform(
@@ -218,7 +212,7 @@ pub async fn download_media(
             format!("cdn download HTTP {status}"),
         ));
     }
-    // 防大文件 OOM：按 Content-Length 预检（诚实服务端会报；缺失则放行，由后续内存兜底）。
+    // 防大文件 OOM：按 Content-Length 预检（诚实服务端会报；缺失则放行，由流式累计兜底）。
     const MEDIA_MAX_BYTES: u64 = 50 * 1024 * 1024;
     if let Some(len) = resp.content_length() {
         if len > MEDIA_MAX_BYTES {
@@ -228,20 +222,41 @@ pub async fn download_media(
             ));
         }
     }
-    let ciphertext = resp
-        .bytes()
-        .await
-        .map_err(|e| CoreError::Platform("ilink", format!("cdn download body: {e}")))?
-        .to_vec();
-    // 有 aes_key 则解密；否则直接返回（兼容明文）。
-    match aes_key.and_then(parse_aes_key) {
-        Some(k) => aes_decrypt(&ciphertext, &k).ok_or_else(|| {
-            CoreError::Platform(
+    // 流式累计，超限即中止（防 chunked / 无 Content-Length 的大文件 OOM，P1-L）。
+    let mut stream = resp.bytes_stream();
+    let mut ciphertext = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|e| CoreError::Platform("ilink", format!("cdn download body: {e}")))?;
+        if ciphertext
+            .len()
+            .saturating_add(chunk.len())
+            > MEDIA_MAX_BYTES as usize
+        {
+            return Err(CoreError::Platform(
                 "ilink",
-                "cdn download: aes decrypt/padding failed".to_string(),
-            )
-        }),
+                format!("cdn download too large: > {MEDIA_MAX_BYTES} bytes (streamed)"),
+            ));
+        }
+        ciphertext.extend_from_slice(&chunk);
+    }
+    // 有 aes_key 则解密；无 key 则直接返回（兼容明文）。
+    // P1-H：aes_key 存在但解析失败时 fail-closed 返回 Err——而非旧逻辑那样把密文当
+    // 明文泄漏（旧 `aes_key.and_then(parse_aes_key)` 在 parse 失败时落入 None 分支）。
+    match aes_key {
         None => Ok(ciphertext),
+        Some(key_str) => {
+            let k = parse_aes_key(key_str).ok_or_else(|| {
+                CoreError::Platform(
+                    "ilink",
+                    "cdn download: aes_key 存在但解析失败，fail-closed 拒绝返回未解密内容"
+                        .to_string(),
+                )
+            })?;
+            aes_decrypt(&ciphertext, &k).ok_or_else(|| {
+                CoreError::Platform("ilink", "cdn download: aes decrypt/padding failed".to_string())
+            })
+        }
     }
 }
 

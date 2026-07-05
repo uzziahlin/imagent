@@ -44,10 +44,15 @@ impl PermissionMode {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Config {
-    /// agent 工作根目录（安全边界）。必填，缺失或非绝对路径 => Config 错误。
+    /// agent 工作根目录（agent 的 cwd，**非沙箱**：仅决定工作目录，不限制可读路径；
+    /// 危险操作用 permission_mode=ask 审批）。必填，缺失或非绝对路径 => Config 错误。
     pub default_workdir: PathBuf,
     #[serde(default)]
     pub allowed_senders: Vec<String>,
+    /// 管理员 sender（可执行 /allow /disallow 授权新用户）。空 = 向后兼容（所有
+    /// 白名单用户可 /allow，P2-D 建议生产环境显式设置以收敛授权面）。
+    #[serde(default)]
+    pub admin_senders: Vec<String>,
     #[serde(default = "default_tools")]
     pub allowed_tools: Vec<String>,
     #[serde(default = "default_agent")]
@@ -72,6 +77,11 @@ pub struct Config {
     /// `kill_on_drop` 杀子进程），防止挂死的 agent 永久卡住会话。默认 600（10 分钟）。
     #[serde(default = "default_agent_timeout_secs")]
     pub agent_timeout_secs: u64,
+    /// 若为 true，凭据必须写入 OS keyring；keyring 不可用时 **拒绝明文落盘**
+    /// （`put_credential` 返回 Err，fail-closed）。默认 false（headless/CI 无 keychain
+    /// 时明文回退 + warn，向后兼容）。安全敏感部署应设 true。
+    #[serde(default)]
+    pub require_keyring: bool,
     /// WeCom 智能机器人凭据（可选；仅 `platform = "wecom"` 时使用）。
     #[serde(default)]
     pub wecom_bot_id: Option<String>,
@@ -124,8 +134,9 @@ impl Config {
 
     /// 供首次使用打印的模板字符串（default_workdir 用占位，不写死任何机器路径）。
     pub const EXAMPLE: &'static str = r#"# ~/.imagent/config.toml
-default_workdir = "/absolute/path/to/agent/workspace"   # 必填，agent 只能在该目录 Read/Edit
+default_workdir = "/absolute/path/to/agent/workspace"   # 必填，agent 的 cwd（非沙箱：不限制可读路径，靠 allowed_tools + permission_mode 兜底）
 allowed_senders = []        # 留空 = 发现模式（只打日志记录入站 sender，不驱动 agent）
+# admin_senders = []          # 可 /allow 的管理员 sender；空=所有白名单用户可(P2-D，生产建议显式设置收敛授权面)
 allowed_tools = ["Read", "Edit"]
 agent = "claude-cli"         # claude-cli(默认) | claude-acp(ACP长驻子进程) | codex | gemini
 platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人,配 wecom_bot_id/wecom_secret)
@@ -134,6 +145,7 @@ permission_mode = "off"     # off(默认,claude按allowedTools自行处理) | al
 # message_max_len = 2000              # 单条出站消息字符上限（Unicode char）；不设 = 不分片
 # message_fragment_interval_ms = 400  # 分片间发送间隔（ms）
 # agent_timeout_secs = 600            # 单次 agent 运行超时（秒）；超时中止防挂死
+# require_keyring = false        # 默认 false(headless 明文回退+warn); true=keyring 不可用时拒绝明文落盘(fail-closed，安全部署建议)
 "#;
 }
 #[cfg(test)]
@@ -307,6 +319,25 @@ message_fragment_interval_ms = 250
         );
         let cfg = Config::load(&p).expect("parse");
         assert_eq!(cfg.message_fragment_interval_ms, 250);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn require_keyring_default_false() {
+        let p = tmp_path("reqkr_def", r#"default_workdir = "/tmp/ws""#);
+        let cfg = Config::load(&p).expect("parse");
+        assert!(!cfg.require_keyring);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn require_keyring_parses_true() {
+        let p = tmp_path(
+            "reqkr_true",
+            "default_workdir = \"/tmp/ws\"\nrequire_keyring = true\n",
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert!(cfg.require_keyring);
         cleanup(&p);
     }
 }

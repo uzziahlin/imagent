@@ -82,7 +82,7 @@ cargo build --release
 ```bash
 mkdir -p ~/.imagent
 cat > ~/.imagent/config.toml <<'EOF'
-default_workdir = "/absolute/path/to/agent/workspace"  # 必填，agent 只能在该目录 Read/Edit
+default_workdir = "/absolute/path/to/agent/workspace"  # 必填，agent 的 cwd（非沙箱：不限制可读路径，靠 allowed_tools + permission_mode 兜底）
 allowed_senders = []        # 留空 = 发现模式（先看日志拿你的 from_user_id）
 allowed_tools = ["Read", "Edit"]
 # permission_mode = "off"  # off / allow / deny / ask（放 Bash 等危险工具时用 ask）
@@ -147,7 +147,7 @@ imagent start            # 前台常驻，Ctrl-C 退出
 ## 开发
 
 ```bash
-cargo test --workspace                              # 214 passed
+cargo test --workspace                              # 229 passed
 cargo clippy --workspace --all-targets -- -D warnings   # 0 warning
 cargo fmt --all --check
 ```

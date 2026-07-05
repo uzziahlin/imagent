@@ -147,6 +147,9 @@ struct PromptReq {
     cwd: std::path::PathBuf,
     chunks: tokio::sync::mpsc::Sender<AgentChunk>,
     resp: tokio::sync::oneshot::Sender<Result<RunOutcome>>,
+    /// P1-E：cancel 信号——run future drop（dispatch 超时）时 sender drop，
+    /// 长驻 task select 检测后 break → 杀连接，防子进程资源泄漏。
+    cancel: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl LongLivedAcp {
@@ -217,29 +220,46 @@ impl LongLivedAcp {
                                     .to_string(),
                             },
                         };
+                        // P2-K：sessions 缓存上限保护（conv 数 = IM 用户数有限，但极端兜底）；
+                        // 超上限清空，下次 LoadSession 重建（HashMap 无序，无法清最旧）。
+                        if sessions.len() > 1000 {
+                            sessions.clear();
+                        }
                         sessions.insert(req.conv_id.clone(), sid.clone());
                         let blocks = vec![ContentBlock::Text(TextContent::new(req.prompt.clone()))];
-                        match connection
+                        let prompt_fut = connection
                             .send_request(PromptRequest::new(
                                 agent_client_protocol::schema::v1::SessionId::new(sid.clone()),
                                 blocks,
                             ))
-                            .block_task()
-                            .await
-                        {
-                            Ok(_) => {
-                                let final_text = st.agent_text.lock().await.clone();
-                                let _ = st.chunks.send(AgentChunk::Final(final_text.clone())).await;
-                                let _ = req.resp.send(Ok(RunOutcome {
-                                    session_id: SessionId(sid),
-                                    final_text,
-                                }));
-                            }
-                            Err(e) => {
+                            .block_task();
+                        tokio::pin!(prompt_fut);
+                        // P1-E：run future 被 cancel（dispatch agent_timeout 超时 drop）时，
+                        // cancel sender drop → select 命中 cancel 分支 → break 退出 while →
+                        // connect_with 闭包返回 → connection drop → SDK ChildGuard kill 子进程。
+                        tokio::select! {
+                            res = &mut prompt_fut => match res {
+                                Ok(_) => {
+                                    let final_text = st.agent_text.lock().await.clone();
+                                    let _ = st.chunks.send(AgentChunk::Final(final_text.clone())).await;
+                                    let _ = req.resp.send(Ok(RunOutcome {
+                                        session_id: SessionId(sid),
+                                        final_text,
+                                    }));
+                                }
+                                Err(e) => {
+                                    let _ = req.resp.send(Err(CoreError::Backend(
+                                        NAME,
+                                        format!("acp prompt 失败: {e}"),
+                                    )));
+                                }
+                            },
+                            _ = req.cancel => {
                                 let _ = req.resp.send(Err(CoreError::Backend(
                                     NAME,
-                                    format!("acp prompt 失败: {e}"),
+                                    "acp prompt 被 cancel（run 超时/drop，已杀连接）".into(),
                                 )));
+                                break;
                             }
                         }
                     }
@@ -282,6 +302,9 @@ impl Backend for AcpBackend {
         // 取（或启动）长驻 AcpAgent task，跨 run 复用子进程 + connection（P1-4）。
         let ll = self.long_lived().await?;
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        // P1-E：cancel_tx 随 run future 生命周期——run 正常完成或被 drop（超时）时
+        // drop，触发长驻 task select 的 cancel 分支（杀连接，防子进程泄漏）。
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
         ll.prompt_tx
             .send(PromptReq {
                 conv_id: conv_id.to_string(),
@@ -290,6 +313,7 @@ impl Backend for AcpBackend {
                 cwd: workdir.to_path_buf(),
                 chunks: chunks.clone(),
                 resp: resp_tx,
+                cancel: cancel_rx,
             })
             .await
             .map_err(|_| {
@@ -298,6 +322,7 @@ impl Backend for AcpBackend {
                     "长驻 ACP task 已退出（可能崩溃，下次 run 将重建）".into(),
                 )
             })?;
+        let _cancel_guard = cancel_tx;
         resp_rx
             .await
             .map_err(|_| CoreError::Backend(NAME, "长驻 ACP task 无响应".into()))?
@@ -405,11 +430,13 @@ fn permission_outcome(
 /// 选一个 allow 类选项构造 outcome；若无 allow 选项则取首个；都没有则 Cancelled。
 fn allow_outcome(options: &[PermissionOption]) -> RequestPermissionOutcome {
     select_option(options, true)
+        .or_else(|| options.first().map(|o| o.option_id.clone()))
         .map(|id| RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(id)))
         .unwrap_or(RequestPermissionOutcome::Cancelled)
 }
 
-/// 在权限选项中挑一个：`allow=true` 时优先 Allow*，否则优先 Reject*；都找不到则取首个。
+/// 在权限选项中找一个目标 kind 的选项：`allow=true` 找 Allow*，否则找 Reject*。
+/// 找不到返回 None（调用方决定兜底语义）。
 fn select_option(options: &[PermissionOption], allow: bool) -> Option<PermissionOptionId> {
     let want = |k: PermissionOptionKind| match k {
         PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways => allow,
@@ -420,7 +447,6 @@ fn select_option(options: &[PermissionOption], allow: bool) -> Option<Permission
     options
         .iter()
         .find(|o| want(o.kind))
-        .or_else(|| options.first())
         .map(|o| o.option_id.clone())
 }
 
@@ -619,6 +645,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn permission_outcome_deny_without_reject_cancels() {
+        // 回归保护：Deny 模式下若 options 只含 Allow*（无 Reject*），
+        // 修复前会被 select_option 的无条件 fallback 击穿为 Selected(Allow)。
+        let request = dummy_perm_request(vec![
+            perm_option("allow1", PermissionOptionKind::AllowOnce),
+            perm_option("allow2", PermissionOptionKind::AllowAlways),
+        ]);
+        let mode = RwLock::new(PermissionMode::Deny);
+        assert!(matches!(
+            permission_outcome(&request, &mode),
+            RequestPermissionOutcome::Cancelled
+        ));
+    }
+
+    #[test]
+    fn permission_outcome_ask_without_reject_cancels() {
+        // 回归保护：Ask 模式 fail-closed，无 Reject* 时应 Cancelled，绝不放行。
+        let request = dummy_perm_request(vec![
+            perm_option("allow1", PermissionOptionKind::AllowOnce),
+            perm_option("allow2", PermissionOptionKind::AllowAlways),
+        ]);
+        let mode = RwLock::new(PermissionMode::Ask);
+        assert!(matches!(
+            permission_outcome(&request, &mode),
+            RequestPermissionOutcome::Cancelled
+        ));
+    }
     // ---------------------------------------------------------------------
     // 真机集成测试（需 claude-agent-acp 已安装 + Claude 已认证），默认跳过：
     //   cargo test --package imagent-claude -- --ignored acp_e2e

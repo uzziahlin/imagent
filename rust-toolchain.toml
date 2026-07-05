@@ -1,0 +1,4 @@
+# imagent toolchain pin（E-5）：MSRV 1.80（= workspace.package rust-version）。
+# 本地 + CI 统一用 1.80 编译，保证 MSRV 声明真实可构建。
+[toolchain]
+channel = "1.80"

@@ -6,6 +6,7 @@
 
 [workspace]
 resolver = "2"
+exclude = ["fuzz"]  # cargo-fuzz 独立 crate（需 nightly，E-7）
 # 计划的 crate（实现时取消注释并创建对应 Cargo.toml + src/lib.rs）：
 # members = [
 #     "crates/core",   # 调度核心：trait Platform / trait Backend、鉴权、会话路由
@@ -36,6 +37,7 @@ parking_lot = "0.12"
 
 # HTTP / TLS（用 rustls 而非 native-tls：对 iLink 证书更可控，跨平台一致）
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+url = "2"
 
 # 序列化
 serde = { version = "1", features = ["derive"] }

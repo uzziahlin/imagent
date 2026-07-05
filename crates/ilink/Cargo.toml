@@ -2,6 +2,7 @@
 name = "imagent-ilink"
 edition.workspace = true
 version.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 publish.workspace = true
@@ -28,3 +29,5 @@ hex = { workspace = true }
 md5 = "0.7"
 dirs = { workspace = true }
 prometheus = { workspace = true }
+futures = { workspace = true }
+url = { workspace = true }

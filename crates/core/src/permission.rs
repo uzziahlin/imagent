@@ -39,13 +39,12 @@ pub fn parse_reply(text: &str) -> PermissionReply {
         };
     }
     let lower = t.to_ascii_lowercase();
-    let allow = matches!(t.chars().next(), Some('y') | Some('Y'))
-        || lower == "是"
-        || lower == "允许"
-        || lower == "好"
-        || lower == "好的"
-        || lower == "yes"
-        || lower == "ok";
+    // P2-G：去掉「首字符 y/Y」宽匹配（旧逻辑会把 year/yeah/yellow/yesterday 等
+    // 误判为 allow，对权限 approve/deny 是真实安全 bug）。改为精确匹配常见 allow 词。
+    let allow = matches!(
+        lower.as_str(),
+        "y" | "yes" | "ye" | "yep" | "yeah" | "ok" | "okay" | "是" | "允许" | "好" | "好的"
+    );
     PermissionReply {
         allow,
         message: if allow {
@@ -119,6 +118,16 @@ mod tests {
         for s in ["", "   ", "n", "N", "no", "不", "拒绝", "随便", "rm -rf /"] {
             let r = parse_reply(s);
             assert!(!r.allow, "should deny: {s:?}");
+        }
+    }
+
+    #[test]
+    fn parse_reply_year_not_allowed() {
+        // P2-G：首字符 y 但非 allow 词必须 deny（旧「首字符 y/Y」宽匹配会误 allow，
+        // 对权限 approve/deny 是真实安全 bug）。
+        for s in ["year", "yellow", "yesterday", "yeah no", "y?", "y3"] {
+            let r = parse_reply(s);
+            assert!(!r.allow, "应 deny（首字符 y 但非 allow 词）: {s:?}");
         }
     }
 

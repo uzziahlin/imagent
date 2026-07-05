@@ -3,6 +3,8 @@
 //! 职责：加载配置 → 扫码登录 → 前台常驻收私聊 → 鉴权 → 驱动 `claude -p` → 回传。
 //! 鉴权 / allowedTools 收敛 / 风控逻辑全部在 core（`Dispatcher`）中，main 只做组装。
 
+#![forbid(unsafe_code)]
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -115,6 +117,9 @@ async fn main() -> Result<()> {
 
             // 2. store（多份：dispatcher / HTTP /health / SIGHUP 各持一份 Clone）
             let store = imagent_store::Store::open(&db_path).await?;
+            // P1-C：据 config.require_keyring 切换凭据 fail-closed
+            // （true = keyring 不可用时拒绝明文落盘；默认 false 向后兼容）。
+            store.set_require_keyring(config.require_keyring);
 
             // 3. platform —— 按 config.platform / CLI 选用 ilink 或 wecom。
             let platform_name = if platform == "ilink" || platform == "wecom" {
@@ -163,6 +168,7 @@ async fn main() -> Result<()> {
                 tools_handle,
                 perm_mode.clone(),
                 std::time::Duration::from_secs(config.agent_timeout_secs),
+                config.admin_senders.clone(),
             ));
 
             // 9. 运维 HTTP server（/metrics + /health）。metrics_addr 为 None 或空串则关闭。

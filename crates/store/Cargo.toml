@@ -2,7 +2,7 @@
 name = "imagent-store"
 version.workspace = true
 edition.workspace = true
-rust-version = "1.75"
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 publish.workspace = true
@@ -17,3 +17,4 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 parking_lot = { workspace = true }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+prometheus = { workspace = true }

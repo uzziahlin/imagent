@@ -142,7 +142,7 @@ pub fn build_send_markdown_frame(chatid: &str, content: &str) -> WsFrame {
 /// - `conv_id = wecom:<from.userid>`（单聊）。群聊应为 `wecom:group:<chatid>`，留后。
 /// - text 类型取 `body.text.content`；非 text 类型 `text=None`（media 留后）。
 /// - body 缺失或解析失败 → `Err(CoreError::Platform("wecom", _))`。
-pub fn parse_msg_callback(frame: &WsFrame) -> imagent_core::Result<InboundMessage> {
+pub fn parse_msg_callback(frame: &WsFrame) -> imagent_core::Result<(String, InboundMessage)> {
     if frame.cmd.as_deref() != Some("aibot_msg_callback") {
         return Err(CoreError::Platform(
             "wecom",
@@ -160,16 +160,19 @@ pub fn parse_msg_callback(frame: &WsFrame) -> imagent_core::Result<InboundMessag
         CoreError::Platform("wecom", format!("aibot_msg_callback body 解析失败：{e}"))
     })?;
 
+    let msgid = msg.msgid;
     let userid = msg.from.userid;
     let conv_id = ConvId(format!("wecom:{userid}"));
     let text = msg.text.map(|t| t.content);
-    Ok(InboundMessage {
+    let inbound = InboundMessage {
         conv_id,
         sender: UserId(userid),
         text,
         media: vec![],
         reply_hint: ReplyHint::None,
-    })
+    };
+    // 返回 msgid 供上层（drain task）做滑动窗口去重（P1-I）。
+    Ok((msgid, inbound))
 }
 
 /// 从 `ConvId` 还原 userid（strip `wecom:` 前缀；无前缀原样返回）。
@@ -271,7 +274,8 @@ mod tests {
         })
         .to_string();
         let frame = parse_frame(&raw).unwrap();
-        let msg = parse_msg_callback(&frame).unwrap();
+        let (msgid, msg) = parse_msg_callback(&frame).unwrap();
+        assert_eq!(msgid, "m1");
         assert_eq!(msg.conv_id.0, "wecom:u42");
         assert_eq!(msg.sender.0, "u42");
         assert_eq!(msg.text.as_deref(), Some("你好"));
@@ -295,7 +299,8 @@ mod tests {
         })
         .to_string();
         let frame = parse_frame(&raw).unwrap();
-        let msg = parse_msg_callback(&frame).unwrap();
+        let (msgid, msg) = parse_msg_callback(&frame).unwrap();
+        assert_eq!(msgid, "m2");
         assert_eq!(msg.sender.0, "u9");
         assert!(msg.text.is_none(), "非文本帧 text 应为 None");
     }

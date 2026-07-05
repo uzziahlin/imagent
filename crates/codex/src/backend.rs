@@ -55,18 +55,22 @@ impl Backend for CodexBackend {
         let mut cmd = Command::new("codex");
         cmd.current_dir(workdir);
         if let Some(s) = session {
-            // 续接：codex exec resume <thread_id> <prompt>
+            // 续接：codex exec resume <thread_id> <prompt>。
+            // P2-J：prompt 经 `--` 分隔为纯 positional，防止 prompt 以 `-` 开头
+            // 被误解析为 flag（参数注入）。
             cmd.arg("exec")
                 .arg("resume")
                 .arg(&s.0)
                 .arg("--json")
-                .arg(prompt)
-                .arg("--skip-git-repo-check");
+                .arg("--skip-git-repo-check")
+                .arg("--")
+                .arg(prompt);
         } else {
             cmd.arg("exec")
                 .arg("--json")
-                .arg(prompt)
-                .arg("--skip-git-repo-check");
+                .arg("--skip-git-repo-check")
+                .arg("--")
+                .arg(prompt);
         }
         cmd.arg("-s").arg(sandbox_mode);
         spawn_cli_backend(cmd, codex_parse, chunks, NAME).await

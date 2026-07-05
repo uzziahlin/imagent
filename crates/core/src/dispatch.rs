@@ -23,7 +23,7 @@ use crate::types::{AgentChunk, ConvId, InboundMessage, ReplyHint, SessionId};
 use imagent_store::{NamedSessionRow, SessionRow, Store};
 use parking_lot::RwLock;
 use tokio::sync::{mpsc, Mutex};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -89,6 +89,8 @@ pub struct Dispatcher {
     permission_mode: Arc<RwLock<PermissionMode>>,
     /// 单次 agent 运行超时。超时则中止该次 run（backend 的 kill_on_drop 杀子进程）。
     agent_timeout: std::time::Duration,
+    /// 管理员 sender（可 /allow）；空 = 所有白名单用户可（向后兼容，P2-D）。
+    admin_senders: Arc<RwLock<Vec<String>>>,
 }
 
 impl Dispatcher {
@@ -102,6 +104,7 @@ impl Dispatcher {
         allowed_tools: Vec<String>,
         permission_mode: PermissionMode,
         agent_timeout: std::time::Duration,
+        admin_senders: Vec<String>,
     ) -> Self {
         Self::new_with_handles(
             platform,
@@ -112,6 +115,7 @@ impl Dispatcher {
             Arc::new(RwLock::new(allowed_tools)),
             Arc::new(RwLock::new(permission_mode)),
             agent_timeout,
+            admin_senders,
         )
     }
 
@@ -130,6 +134,7 @@ impl Dispatcher {
         allowed_tools: Arc<RwLock<Vec<String>>>,
         permission_mode: Arc<RwLock<PermissionMode>>,
         agent_timeout: std::time::Duration,
+        admin_senders: Vec<String>,
     ) -> Self {
         Self {
             platform,
@@ -142,7 +147,16 @@ impl Dispatcher {
             router: Arc::new(PermissionRouter::new()),
             permission_mode,
             agent_timeout,
+            admin_senders: Arc::new(RwLock::new(admin_senders)),
         }
+    }
+
+    /// 调用者是否为管理员（可 /allow）。admin_senders 空 = 向后兼容（所有白名单
+    /// 用户可）；非空则严格检查（P2-D）。
+    fn is_admin(&self, sender: &str) -> bool {
+        let admins = self.admin_senders.read();
+        let trimmed = sender.trim();
+        admins.is_empty() || admins.iter().any(|a| a.trim() == trimmed)
     }
 
     /// SIGHUP 热重载：整体替换 allowed_tools。
@@ -232,7 +246,14 @@ impl Dispatcher {
         let listener = match std::os::unix::net::UnixListener::bind(&sock) {
             Ok(l) => l,
             Err(e) => {
-                warn!(target: "imagent::core", sock = %sock, error = %e, "bind permission socket failed; Ask 闭环不可用");
+                // P2-B：bind 失败用 error 级别——Ask 权限闭环将完全不可用（降级为
+                // 无审批），是安全 posture 退化，需显著告警而非静默 warn。
+                error!(
+                    target: "imagent::core",
+                    sock = %sock,
+                    error = %e,
+                    "bind permission socket 失败：Ask 权限闭环不可用（降级为无审批，安全 posture 退化）"
+                );
                 return;
             }
         };
@@ -245,17 +266,50 @@ impl Dispatcher {
                 return;
             }
         };
+        // chmod 0600：只允许 owner（本进程同 uid）连接。父目录 ~/.imagent 应为 0700（由 store 保证）。
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)) {
+            warn!(
+                target: "imagent::core",
+                sock = %sock,
+                error = %e,
+                "chmod permission socket 0600 失败，Ask 权限闭环鉴权减弱"
+            );
+        }
         let platform = self.platform.clone();
         let router = self.router.clone();
+        let agent_timeout = self.agent_timeout;
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
-                        let platform = platform.clone();
-                        let router = router.clone();
-                        tokio::spawn(async move {
-                            Self::handle_permission_socket(stream, platform, router).await;
-                        });
+                        // 鉴权：只接受与本进程同 uid 的连接（MCP 子进程由本进程 spawn，必然同 uid）。
+                        let expected_uid = current_uid();
+                        match peer_uid(&stream) {
+                            Some(uid) if uid == expected_uid => {
+                                let platform = platform.clone();
+                                let router = router.clone();
+                                tokio::spawn(async move {
+                                    Self::handle_permission_socket(stream, platform, router, agent_timeout)
+                                        .await;
+                                });
+                            }
+                            Some(uid) => {
+                                warn!(
+                                    target: "imagent::core",
+                                    peer_uid = uid,
+                                    expected_uid = expected_uid,
+                                    "拒绝非本进程 uid 的权限 socket 连接（疑似伪造）"
+                                );
+                                // stream drop 时自动关闭。
+                            }
+                            None => {
+                                warn!(
+                                    target: "imagent::core",
+                                    "无法获取权限 socket 对端 uid（平台不支持 peer cred），拒绝连接"
+                                );
+                            }
+                        }
                     }
                     Err(e) => {
                         warn!(target: "imagent::core", error = %e, "permission socket accept 失败");
@@ -272,6 +326,7 @@ impl Dispatcher {
         mut stream: tokio::net::UnixStream,
         platform: Arc<dyn Platform>,
         router: Arc<PermissionRouter>,
+        agent_timeout: std::time::Duration,
     ) {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let mut reader = BufReader::new(&mut stream);
@@ -314,11 +369,17 @@ impl Dispatcher {
         }
         // 注册 pending，等回复（recv 循环 route 到这里）。
         let rx = router.register(&conv_id).await;
-        let reply: PermissionReply = match rx.await {
-            Ok(r) => r,
-            Err(_) => PermissionReply {
+        // P1-G：权限回复等待带 agent_timeout 对齐的超时——agent 死或用户长时间不回复时，
+        // 超时回 deny 并 drop receiver，避免 pending 永驻把后续消息误当回复吞。
+        let reply: PermissionReply = match tokio::time::timeout(agent_timeout, rx).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => PermissionReply {
                 allow: false,
                 message: Some("permission router dropped".into()),
+            },
+            Err(_elapsed) => PermissionReply {
+                allow: false,
+                message: Some(format!("permission ask timed out after {agent_timeout:?}")),
             },
         };
         // 写回 socket（一行 JSON）。
@@ -330,6 +391,17 @@ impl Dispatcher {
         out.push('\n');
         let _ = stream.write_all(out.as_bytes()).await;
         let _ = stream.flush().await;
+    }
+
+    /// 取（或创建）conv 串行锁的 Arc clone。
+    /// P1-F：slash 命令复用，与普通消息 agent task 串行（避免并发改 session 损坏状态）。
+    /// 回收沿用普通消息路径的 release（strong_count==1 时 remove）；slash 路径不显式
+    /// release，其 lock clone drop 后由下次普通消息 release 清理（延迟回收，最终回收）。
+    async fn acquire_conv_lock(&self, conv: &str) -> Arc<Mutex<()>> {
+        let mut map = self.conv_locks.lock().await;
+        map.entry(conv.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// 处理单条消息。内部任何错误都 log 并吞掉，不影响主循环。
@@ -380,6 +452,9 @@ impl Dispatcher {
                 let cmd = parts[0].to_ascii_lowercase();
                 match cmd.as_str() {
                     "/new" => {
+                        // P1-F：取 conv 串行锁，与在飞 agent task 串行（避免并发改 session 损坏状态）。
+                        let _conv_lock = self.acquire_conv_lock(&conv.0).await;
+                        let _conv_guard = _conv_lock.lock().await;
                         // 删除该 conv 的 session 行（下次新建），失败仅 log。
                         if let Err(e) = self.store.delete_session(&conv.0).await {
                             warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "delete_session 失败");
@@ -402,13 +477,26 @@ impl Dispatcher {
                             self.reply(&conv, "用法: /allow <sender_id>", &hint).await;
                         } else {
                             let actor = sender.0.as_str();
+                            // P2-D：仅管理员可授权新用户（admin_senders 非空时严格；
+                            // 空则向后兼容所有白名单用户可）。
+                            if !self.is_admin(actor) {
+                                self.reply(
+                                    &conv,
+                                    "仅管理员（admin_senders）可授权新用户。",
+                                    &hint,
+                                )
+                                .await;
+                                return;
+                            }
                             let added = self.auth.allow(target);
-                            if let Err(e) = self
+                            // P2-E：持久化失败不能谎报「已授权」（内存已加但重启后丢失）。
+                            let persist_failed = self
                                 .store
                                 .add_allowed_sender(target, Some(actor), Some("im"))
                                 .await
-                            {
-                                warn!(target: "imagent::core", error = %e, "add_allowed_sender 失败");
+                                .is_err();
+                            if persist_failed {
+                                warn!(target: "imagent::core", "add_allowed_sender 持久化失败（内存已授权，重启丢失）");
                             }
                             if let Err(e) = self
                                 .store
@@ -422,7 +510,11 @@ impl Dispatcher {
                             {
                                 warn!(target: "imagent::core", error = %e, "append_audit 失败");
                             }
-                            let text_out = if added {
+                            let text_out = if persist_failed {
+                                format!(
+                                    "⚠️ `{target}` 已在内存授权，但持久化失败（重启后将丢失），请重试或本地 `imagent allow` 处理。"
+                                )
+                            } else if added {
                                 format!("已授权 `{target}`。")
                             } else {
                                 format!("`{target}` 已在白名单。")
@@ -489,6 +581,9 @@ impl Dispatcher {
                         return;
                     }
                     "/switch" => {
+                        // P1-F：取 conv 串行锁（同 /new）。
+                        let _conv_lock = self.acquire_conv_lock(&conv.0).await;
+                        let _conv_guard = _conv_lock.lock().await;
                         let name = parts.get(1).map(|s| s.trim()).unwrap_or("");
                         if name.is_empty() {
                             self.reply(&conv, "用法: /switch <name>", &hint).await;
@@ -497,6 +592,22 @@ impl Dispatcher {
                         let key = active_name_key(&conv.0);
                         match self.store.get_named_session(&conv.0, name).await {
                             Ok(Some(row)) => {
+                                // P2-A：校验 agent_kind——不同 backend 的 session_id 不互通，
+                                // 切到异类 backend 的历史 session 会续接失败。
+                                let current_kind = self.backend.name();
+                                if let Some(k) = row.agent_kind.as_deref() {
+                                    if k != current_kind {
+                                        self.reply(
+                                            &conv,
+                                            &format!(
+                                                "「{name}」是 {k} 会话，当前后端为 {current_kind}（不互通，无法续接）"
+                                            ),
+                                            &hint,
+                                        )
+                                        .await;
+                                        return;
+                                    }
+                                }
                                 // 切回历史命名 session：把它写成活动 session（续接用）。
                                 let now = now_secs();
                                 let sr = SessionRow {
@@ -579,6 +690,10 @@ impl Dispatcher {
                         return;
                     }
                     "/compact" => {
+                        // P1-F：取 conv 串行锁——/compact 内 resume 当前 session 生成摘要，
+                        // 须与在飞 agent task 串行（否则并发 resume 同 session 损坏状态）。
+                        let _conv_lock = self.acquire_conv_lock(&conv.0).await;
+                        let _conv_guard = _conv_lock.lock().await;
                         let key = compact_summary_key(&conv.0);
                         let existing_sid: Option<SessionId> =
                             match self.store.get_session(&conv.0).await {
@@ -769,15 +884,15 @@ impl Dispatcher {
         };
 
         // 新建 session（无 existing）时，一次性注入压缩摘要作为前情摘要。
+        // P1-K：摘要删除推迟到 run 成功落库后——若 run 失败（session 未建成），
+        // 保留摘要供下次新建注入，避免永久丢失。
         let mut prompt = base_prompt;
+        let mut injected_compact_summary = false;
         if existing.is_none() {
             if let Ok(Some(summary)) = self.store.get_config(&compact_summary_key(&conv.0)).await {
                 if !summary.is_empty() {
                     prompt = format!("【前情摘要】{summary}\n\n——\n\n{prompt}");
-                    let _ = self
-                        .store
-                        .delete_config(&compact_summary_key(&conv.0))
-                        .await;
+                    injected_compact_summary = true;
                 }
             }
         }
@@ -829,7 +944,10 @@ impl Dispatcher {
                     tool_calls.push((tool, truncate_str(&input, 40)));
                 }
                 AgentChunk::ToolResult { .. } => {} // 摘要只列工具调用，结果不进 IM
-                AgentChunk::Text(_) => {}
+                AgentChunk::Text(t) => {
+                    // P2-F：中间 Text chunk 实时推 IM（流式体验，而非全部丢弃只发最终 Final）。
+                    self.reply(&conv, &t, &hint).await;
+                }
             }
         }
 
@@ -914,6 +1032,23 @@ impl Dispatcher {
             }
         }
 
+        // P1-K：run 成功落库后，删除已注入的 compact_summary（一次性）。
+        // 失败路径已在上方 return，不会走到这里，故 summary 不会丢失。
+        if injected_compact_summary {
+            if let Err(e) = self
+                .store
+                .delete_config(&compact_summary_key(&conv.0))
+                .await
+            {
+                warn!(
+                    target: "imagent::core",
+                    conv_id = %conv.0,
+                    error = %e,
+                    "delete_config(compact_summary) 失败（best-effort）"
+                );
+            }
+        }
+
         // 回收该 conv 的串行锁（已无其它 task 持有时），避免 conv_locks 无限增长。
         // drop clone 后 strong_count==1 表示只剩 HashMap 那份；map mutex 互斥保证
         // 检查+移除原子，竞态最坏只是漏清（下一轮再来），不会误删在用锁。
@@ -943,6 +1078,70 @@ impl Dispatcher {
                     warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "send_text 失败");
                 }
             }
+        }
+    }
+}
+
+/// 本进程的 uid（peer-uid 鉴权用）。
+#[cfg(unix)]
+#[allow(unsafe_code)] // crate 顶层 `#![deny(unsafe_code)]`，此处显式豁免
+fn current_uid() -> u32 {
+    // SAFETY: getuid 无参数、无副作用，永远安全。
+    unsafe { libc::getuid() }
+}
+
+/// 取 UnixStream 对端的 uid（用于权限 socket 鉴权）。
+///
+/// - Linux: `SO_PEERCRED`
+/// - macOS: `LOCAL_PEERCRED`
+/// - 其它 unix: 返回 None（调用方应拒绝）。
+#[cfg(unix)]
+#[allow(unsafe_code)] // crate 顶层 `#![deny(unsafe_code)]`，此处显式豁免
+fn peer_uid(stream: &tokio::net::UnixStream) -> Option<u32> {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    // SAFETY: getsockopt 对已连接的 unix socket 按 optname 填充固定大小的输出缓冲，
+    // 传入正确的 len。MaybeUninit/zeroed 避免读取未初始化字段。
+    unsafe {
+        #[cfg(target_os = "linux")]
+        {
+            let mut cred: std::mem::MaybeUninit<libc::ucred> = std::mem::MaybeUninit::uninit();
+            let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+            let rc = libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                cred.as_mut_ptr() as *mut libc::c_void,
+                &mut len,
+            );
+            if rc == 0 {
+                Some((*cred.as_ptr()).uid)
+            } else {
+                None
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut xucred: libc::xucred = std::mem::zeroed();
+            let mut len = std::mem::size_of::<libc::xucred>() as libc::socklen_t;
+            let rc = libc::getsockopt(
+                fd,
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERCRED,
+                &mut xucred as *mut libc::xucred as *mut libc::c_void,
+                &mut len,
+            );
+            // cr_uid == u32::MAX 表示未填充/无效。
+            if rc == 0 && xucred.cr_uid != u32::MAX {
+                Some(xucred.cr_uid)
+            } else {
+                None
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = fd;
+            None
         }
     }
 }
@@ -1173,8 +1372,36 @@ mod tests {
             vec!["Read".into(), "Edit".into()],
             PermissionMode::Off,
             std::time::Duration::from_secs(600),
+            vec![], // admin_senders 空 = 测试用向后兼容（所有白名单用户可 /allow）
         ));
 
+        Ctx {
+            disp,
+            inbox,
+            send_count,
+            calls,
+            prompts,
+            order,
+            db,
+        }
+    }
+
+    /// P2-D：与 build 相同但允许指定 admin_senders（测试角色区分）。
+    async fn build_with_admin(auth: Auth, admin_senders: Vec<String>) -> Ctx {
+        let (plat, inbox, send_count) = MockPlatform::new();
+        let (back, calls, prompts, order) = MockBackend::new();
+        let (store, db) = tmp_store().await;
+        let disp = Arc::new(Dispatcher::new(
+            Arc::new(plat),
+            Arc::new(back),
+            store,
+            auth,
+            std::path::PathBuf::from("/tmp/imagent-test-ws"),
+            vec!["Read".into(), "Edit".into()],
+            PermissionMode::Off,
+            std::time::Duration::from_secs(600),
+            admin_senders,
+        ));
         Ctx {
             disp,
             inbox,
@@ -1201,6 +1428,7 @@ mod tests {
             vec!["Read".into(), "Edit".into()],
             PermissionMode::Off,
             std::time::Duration::from_secs(600),
+            vec![], // admin_senders 空 = 测试用向后兼容（所有白名单用户可 /allow）
         ));
 
         Ctx {
@@ -1383,6 +1611,26 @@ mod tests {
         assert_eq!(calls[0], None);
         assert_eq!(calls[1].as_deref(), Some("sess-0"));
         assert_eq!(calls[2].as_deref(), Some("sess-1"));
+        drop_db(ctx.db).await;
+    }
+
+    #[tokio::test]
+    async fn allow_rejected_for_non_admin_when_admin_senders_set() {
+        // P2-D：admin_senders 非空时，白名单内非 admin 用户 /allow 被拒绝。
+        let ctx = build_with_admin(
+            Auth::new(vec!["alice".into(), "bob".into()]),
+            vec!["alice".into()],
+        )
+        .await;
+        // bob（白名单但非 admin）尝试 /allow charlie → 应被拒绝。
+        feed_and_wait(&ctx, vec![msg("c", "bob", "/allow charlie")], 1).await;
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(
+            inbox.iter().any(|m| m.contains("仅管理员")),
+            "非 admin /allow 应被拒绝: {inbox:?}"
+        );
+        // charlie 未被授权。
+        assert!(!ctx.disp.auth().is_allowed(&UserId("charlie".into())));
         drop_db(ctx.db).await;
     }
 
@@ -1845,5 +2093,24 @@ mod tests {
         assert!(reply.contains("Tool0"), "应含首个工具: {reply}");
         assert!(reply.contains("Tool4"), "应含第 5 个工具: {reply}");
         drop_db(ctx.db).await;
+    }
+}
+
+#[cfg(all(test, unix))]
+mod permission_socket_tests {
+    use super::peer_uid;
+
+    #[tokio::test]
+    async fn peer_uid_returns_self_for_local_pair() {
+        // socketpair 两端同进程，peer_uid 必须返回本进程 uid。
+        let (a, b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        // from_std 要求非阻塞 socket（tokio issue #7172）。
+        a.set_nonblocking(true).expect("set_nonblocking");
+        let ta = tokio::net::UnixStream::from_std(a).expect("from_std");
+        let got = peer_uid(&ta).expect("peer_uid 对本地连接应返回 Some");
+        let self_uid = super::current_uid();
+        assert_eq!(got, self_uid);
+        drop(ta);
+        drop(b);
     }
 }

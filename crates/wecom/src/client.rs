@@ -76,7 +76,21 @@ impl WeComWsClient {
         inbound_tx: &mpsc::Sender<InboundFrame>,
         outbound_rx: &mut mpsc::Receiver<OutboundFrame>,
     ) -> imagent_core::Result<()> {
-        // 1. 建连。
+        // 1. 建连。P2-L：远端必须 wss://（凭据保护），ws:// 仅允许 localhost（测试/本地）。
+        if !self.ws_url.starts_with("wss://")
+            && !(self.ws_url.starts_with("ws://")
+                && (self.ws_url.contains("127.0.0.1")
+                    || self.ws_url.contains("localhost")
+                    || self.ws_url.contains("[::1]")))
+        {
+            return Err(imagent_core::CoreError::Platform(
+                "wecom",
+                format!(
+                    "ws_url 必须为 wss://（远端明文 ws:// 拒绝，凭据保护）：{}",
+                    self.ws_url
+                ),
+            ));
+        }
         info!(target: "wecom", url = %self.ws_url, "ws 连接中");
         let (ws_stream, _resp) = connect_async(&self.ws_url)
             .await
