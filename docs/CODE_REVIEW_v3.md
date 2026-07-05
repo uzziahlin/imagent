@@ -8,16 +8,15 @@
 
 ## 📋 修复进度（2026-07-05/06，分支 `fix/code-review-v3`）
 
-**✅ 已落地（18 commit，workspace 241 passed / clippy 0 warning / fmt clean / macOS+ubuntu CI 矩阵）**：
+**✅ 已落地（13 commit，workspace 241 passed / clippy 0 warning / fmt clean / macOS+ubuntu CI 矩阵）**：
 
 - **P1 全部（9/9）**：P1-1 codex sandbox flag、P1-2 CDN scheme、P1-3 send_text 失败不挂 pending、P1-4 SIGTERM、P1-5 drain（JoinSet + shutdown Notify）、P1-6 mcp read_line 超时、P1-7 conv_locks 失败路径统一释放、P1-8 PermissionRouter cancel、P1-9 socket read_line cap + write 超时。
-- **P2 done（9/17）**：P2-3 sessions 有界 insert、P2-5 panic 保留 final、P2-7 peer_uid 威胁模型文档、P2-8 macOS effective uid、P2-9 ws_url host 精确比较、P2-11 迁移审计、P2-12 中文确认词 + doc 对齐、P2-13 upload_cdn percent-encode、P2-14 ~/.imagent 0700。
+- **P2 done（10/17）**：P2-2 route 原子化（单次 lock 防 has_pending/route 间隙 race）、P2-3 sessions 有界 insert、P2-5 panic 保留 final、P2-7 peer_uid 威胁模型文档、P2-8 macOS effective uid、P2-9 ws_url host 精确比较、P2-11 迁移审计、P2-12 中文确认词 + doc 对齐、P2-13 upload_cdn percent-encode、P2-14 ~/.imagent 0700。
 - **工程化**：E-1 CI macOS 矩阵、E-2 owner 统一、E-4 文档漂移对齐、E-5 Cmd::Stop、E-7 clippy --all-features。
 
 **⏳ defer（有理由，非阻塞开源；详见各 issue 条目）**：
 
 - **P2-1** ACP cancel break：P1-E 的 break→kill 是「超时杀子进程」的安全行为；不 break 需深入 agent-client-protocol SDK cancel 语义 + e2e，留专门 PR。
-- **P2-2** conv_lock route race：需重构 has_pending+route 为原子单次操作（`try_route_if_pending`），中等架构改动。
 - **P2-4** SIGHUP 三步非原子：v3 评估为「一般无害、最终一致」，收紧权限的混合窗口极小。
 - **P2-6** slash release conv_lock：需 RAII guard（Arc 化 conv_locks）架构改动；P1-7 已修核心泄漏，slash 依赖延迟回收（最终清理）。
 - **P2-10** delete_credential/logout：需 keyring 清理 API 设计 + 测试，凭据生命周期管理留专门 PR。
