@@ -16,8 +16,8 @@
 mod auth;
 mod backend;
 pub mod backend_common;
-pub mod dedup;
 mod config;
+pub mod dedup;
 mod dispatch;
 mod error;
 pub mod mcp;

@@ -47,8 +47,23 @@ pub fn parse_reply(text: &str) -> PermissionReply {
     // P2-12：补中文高频确认词（「可以」「行」「没问题」等），降低中文用户误 deny 率。
     let allow = matches!(
         lower.as_str(),
-        "y" | "yes" | "ye" | "yep" | "yeah" | "ok" | "okay" | "是" | "允许" | "好" | "好的"
-            | "可以" | "行" | "没问题" | "好呀" | "行吧" | "可以吧" | "嗯"
+        "y" | "yes"
+            | "ye"
+            | "yep"
+            | "yeah"
+            | "ok"
+            | "okay"
+            | "是"
+            | "允许"
+            | "好"
+            | "好的"
+            | "可以"
+            | "行"
+            | "没问题"
+            | "好呀"
+            | "行吧"
+            | "可以吧"
+            | "嗯"
     );
     PermissionReply {
         allow,
@@ -125,8 +140,24 @@ mod tests {
     #[test]
     fn parse_reply_allow_variants() {
         for s in [
-            "y", "Y", "yes", "YES", "Yes", "ok", "OK", "是", "允许", "好", "好的", "可以", "行",
-            "没问题", "好呀", "行吧", "可以吧", "嗯",
+            "y",
+            "Y",
+            "yes",
+            "YES",
+            "Yes",
+            "ok",
+            "OK",
+            "是",
+            "允许",
+            "好",
+            "好的",
+            "可以",
+            "行",
+            "没问题",
+            "好呀",
+            "行吧",
+            "可以吧",
+            "嗯",
         ] {
             let r = parse_reply(s);
             assert!(r.allow, "should allow: {s:?}");

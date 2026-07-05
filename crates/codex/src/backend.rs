@@ -163,7 +163,10 @@ mod tests {
         let args = codex_args(None, "workspace-write", "hello");
         let dashdash = args.iter().position(|a| a == "--").unwrap();
         let s_idx = args.iter().position(|a| a == "-s").unwrap();
-        assert!(s_idx < dashdash, "-s must precede -- (got -s@{s_idx}, --@{dashdash})");
+        assert!(
+            s_idx < dashdash,
+            "-s must precede -- (got -s@{s_idx}, --@{dashdash})"
+        );
         assert_eq!(args[s_idx + 1], "workspace-write");
         assert_eq!(args[dashdash + 1], "hello");
     }

@@ -30,7 +30,10 @@ impl Auth {
     pub fn new(allowed_senders: Vec<String>) -> Self {
         Self {
             allowed: Arc::new(RwLock::new(
-                allowed_senders.into_iter().map(|s| normalize_sender(&s)).collect(),
+                allowed_senders
+                    .into_iter()
+                    .map(|s| normalize_sender(&s))
+                    .collect(),
             )),
         }
     }

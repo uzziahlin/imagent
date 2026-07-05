@@ -631,9 +631,8 @@ fn media_dir() -> Result<std::path::PathBuf> {
     })?;
     let dir = home.join(".imagent").join("media");
     if !dir.exists() {
-        std::fs::create_dir_all(&dir).map_err(|e| {
-            CoreError::Platform("ilink", format!("create media dir {:?}: {e}", dir))
-        })?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| CoreError::Platform("ilink", format!("create media dir {dir:?}: {e}")))?;
     }
     Ok(dir)
 }
@@ -669,7 +668,7 @@ fn persist_media(kind: &str, file_name: Option<&str>, bytes: &[u8]) -> Result<St
     let fname = format!("{}{ext}", uuid::Uuid::new_v4().simple());
     let path = dir.join(fname);
     std::fs::write(&path, bytes)
-        .map_err(|e| CoreError::Platform("ilink", format!("write media {:?}: {e}", path)))?;
+        .map_err(|e| CoreError::Platform("ilink", format!("write media {path:?}: {e}")))?;
     // P2-V：媒体文件权限 0600（headless 部署隐私——解密后的私聊媒体不暴露给同机
     // 其他用户；默认按 umask 可能 0644）。
     #[cfg(unix)]

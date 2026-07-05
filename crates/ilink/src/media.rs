@@ -159,7 +159,10 @@ pub fn assert_cdn_host(url: &str) -> Result<()> {
     if parsed.scheme() != "https" {
         return Err(CoreError::Platform(
             "ilink",
-            format!("SSRF blocked: non-https scheme ({}) for {url}", parsed.scheme()),
+            format!(
+                "SSRF blocked: non-https scheme ({}) for {url}",
+                parsed.scheme()
+            ),
         ));
     }
     let host = extract_host(url).unwrap_or_default();
@@ -239,11 +242,7 @@ pub async fn download_media(
     while let Some(chunk) = stream.next().await {
         let chunk =
             chunk.map_err(|e| CoreError::Platform("ilink", format!("cdn download body: {e}")))?;
-        if ciphertext
-            .len()
-            .saturating_add(chunk.len())
-            > MEDIA_MAX_BYTES as usize
-        {
+        if ciphertext.len().saturating_add(chunk.len()) > MEDIA_MAX_BYTES as usize {
             return Err(CoreError::Platform(
                 "ilink",
                 format!("cdn download too large: > {MEDIA_MAX_BYTES} bytes (streamed)"),
@@ -265,7 +264,10 @@ pub async fn download_media(
                 )
             })?;
             aes_decrypt(&ciphertext, &k).ok_or_else(|| {
-                CoreError::Platform("ilink", "cdn download: aes decrypt/padding failed".to_string())
+                CoreError::Platform(
+                    "ilink",
+                    "cdn download: aes decrypt/padding failed".to_string(),
+                )
             })
         }
     }

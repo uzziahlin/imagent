@@ -168,7 +168,7 @@ pub async fn ask_via_socket(
         "tool_name": tool_name,
         "input": input,
     });
-    let line = format!("{}\n", req);
+    let line = format!("{req}\n");
     stream.write_all(line.as_bytes()).await?;
     stream.flush().await?;
 

@@ -259,9 +259,7 @@ impl Dispatcher {
         // P1-5：drain in-flight handle task（最多 30s），超时 abort 剩余。
         // 避免 SIGKILL 正在写文件的 agent 子进程导致半写；超时兜底防无限等待。
         let mut tasks = self.tasks.lock().await;
-        let drain = async {
-            while tasks.join_next().await.is_some() {}
-        };
+        let drain = async { while tasks.join_next().await.is_some() {} };
         match tokio::time::timeout(std::time::Duration::from_secs(30), drain).await {
             Ok(_) => info!(target: "imagent::core", "drain 完成（in-flight task 已结束）"),
             Err(_) => {
@@ -329,8 +327,13 @@ impl Dispatcher {
                                 let platform = platform.clone();
                                 let router = router.clone();
                                 tokio::spawn(async move {
-                                    Self::handle_permission_socket(stream, platform, router, agent_timeout)
-                                        .await;
+                                    Self::handle_permission_socket(
+                                        stream,
+                                        platform,
+                                        router,
+                                        agent_timeout,
+                                    )
+                                    .await;
                                 });
                             }
                             Some(uid) => {
@@ -397,10 +400,7 @@ impl Dispatcher {
     /// 写一行 JSON 回复到 socket，带写超时（P1-9：防对端不读导致 write_all 长时阻塞）。
     /// best-effort：超时/出错仅返回，连接由调用方 drop。
     #[cfg(unix)]
-    async fn write_permission_reply(
-        stream: &mut tokio::net::UnixStream,
-        reply: PermissionReply,
-    ) {
+    async fn write_permission_reply(stream: &mut tokio::net::UnixStream, reply: PermissionReply) {
         use tokio::io::AsyncWriteExt;
         let resp = serde_json::json!({
             "allow": reply.allow,
@@ -408,13 +408,10 @@ impl Dispatcher {
         });
         let mut out = resp.to_string();
         out.push('\n');
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            async {
-                let _ = stream.write_all(out.as_bytes()).await;
-                let _ = stream.flush().await;
-            },
-        )
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let _ = stream.write_all(out.as_bytes()).await;
+            let _ = stream.flush().await;
+        })
         .await;
     }
 
@@ -622,12 +619,8 @@ impl Dispatcher {
                             // P2-D：仅管理员可授权新用户（admin_senders 非空时严格；
                             // 空则向后兼容所有白名单用户可）。
                             if !self.is_admin(actor) {
-                                self.reply(
-                                    &conv,
-                                    "仅管理员（admin_senders）可授权新用户。",
-                                    &hint,
-                                )
-                                .await;
+                                self.reply(&conv, "仅管理员（admin_senders）可授权新用户。", &hint)
+                                    .await;
                                 return;
                             }
                             let added = self.auth.allow(target);
