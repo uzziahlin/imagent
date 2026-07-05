@@ -253,6 +253,8 @@ impl Store {
             account_id.to_string(),
             blob.to_string(),
         );
+        let platform_for_audit = platform.clone();
+        let account_for_audit = account_id.clone();
         let inner = self.inner.clone();
         blocking_with(inner, move |conn| {
             let now = now_secs();
@@ -263,7 +265,18 @@ impl Store {
             )?;
             Ok(())
         })
-        .await
+        .await?;
+        // P2-11：迁移成功审计（明文 → keyring marker 的形态变更留痕，绕过 P1-B 的
+        // put_credential 审计路径；best-effort）。
+        let _ = self
+            .append_audit(
+                "credential_migrated",
+                None,
+                Some(&account_for_audit),
+                Some(&format!("platform={platform_for_audit}")),
+            )
+            .await;
+        Ok(())
     }
 
     // —— sessions（core 用）——

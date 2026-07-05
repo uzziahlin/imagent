@@ -19,3 +19,4 @@ thiserror = { workspace = true }
 rand = { workspace = true }
 futures = { workspace = true }
 tokio-tungstenite = { workspace = true }
+url = { workspace = true }

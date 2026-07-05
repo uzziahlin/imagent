@@ -317,10 +317,14 @@ pub async fn upload_cdn(
     filekey: &str,
     ciphertext: &[u8],
 ) -> Result<String> {
-    let url = format!(
-        "https://{}/c2c/upload?encrypted_query_param={x_encrypted_param}&filekey={filekey}",
-        CDN_HOSTS[0]
-    );
+    // P2-13：用 url::Url 构造 query，自动 percent-encode 参数（x_encrypted_param
+    // 来自服务端响应头，可能含 &/=/# 等特殊字符；裸 format! 会注入额外 query 项）。
+    let mut url = url::Url::parse(&format!("https://{}/c2c/upload", CDN_HOSTS[0]))
+        .map_err(|e| CoreError::Platform("ilink", format!("cdn upload url: {e}")))?;
+    url.query_pairs_mut()
+        .append_pair("encrypted_query_param", x_encrypted_param)
+        .append_pair("filekey", filekey);
+    let url = url.to_string();
     let resp = http
         .post(&url)
         .header("Content-Type", "application/octet-stream")

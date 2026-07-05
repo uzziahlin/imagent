@@ -77,6 +77,13 @@ async fn main() -> Result<()> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("无法定位 home 目录"))?;
     let data_dir = home.join(".imagent");
     std::fs::create_dir_all(&data_dir)?;
+    // P2-14：数据目录收紧 0700（默认 umask 常 0755，同机其他用户可 ls 看到文件名；
+    // 最小权限，与 store 文件 0600 / permission.sock 0600 姿态一致）。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700));
+    }
     let db_path = data_dir.join("imagent.db");
 
     match cli.cmd {

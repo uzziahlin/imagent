@@ -76,17 +76,22 @@ impl WeComWsClient {
         inbound_tx: &mpsc::Sender<InboundFrame>,
         outbound_rx: &mut mpsc::Receiver<OutboundFrame>,
     ) -> imagent_core::Result<()> {
-        // 1. 建连。P2-L：远端必须 wss://（凭据保护），ws:// 仅允许 localhost（测试/本地）。
-        if !self.ws_url.starts_with("wss://")
-            && !(self.ws_url.starts_with("ws://")
-                && (self.ws_url.contains("127.0.0.1")
-                    || self.ws_url.contains("localhost")
-                    || self.ws_url.contains("[::1]")))
-        {
+        // 1. 建连。P2-L/P2-9：远端必须 wss://（凭据保护），ws:// 仅允许 loopback
+        // （测试/本地）。用 url::Url 解析真实 host 精确比较，避免 contains 子串匹配
+        // 被 `ws://localhost.evil.com` / `ws://evil.com/?to=127.0.0.1` 绕过。
+        let parsed = url::Url::parse(&self.ws_url).map_err(|e| {
+            imagent_core::CoreError::Platform("wecom", format!("invalid ws_url: {e}"))
+        })?;
+        let host = parsed.host_str().unwrap_or("");
+        let is_loopback = matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1");
+        let host_ok = parsed.scheme() == "wss" || (parsed.scheme() == "ws" && is_loopback);
+        if !matches!(parsed.scheme(), "wss" | "ws") || !host_ok {
             return Err(imagent_core::CoreError::Platform(
                 "wecom",
                 format!(
-                    "ws_url 必须为 wss://（远端明文 ws:// 拒绝，凭据保护）：{}",
+                    "ws_url 必须为 wss://（或 ws:// 仅 loopback）；收到 scheme={}, host={}：{}",
+                    parsed.scheme(),
+                    host,
                     self.ws_url
                 ),
             ));
