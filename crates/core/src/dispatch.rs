@@ -529,6 +529,19 @@ impl Dispatcher {
             .clone()
     }
 
+    /// 回收 conv 串行锁（P1-7：失败/正常路径统一调用，防 conv_locks HashMap 项
+    /// 在 backend 失败/panic 的 return 路径永久泄漏）。调用方需先 drop guard 再传 lock。
+    /// strong_count==1 表示只剩 HashMap 那份，安全移除；竞态最坏漏清（下轮再来）。
+    async fn release_conv_lock(&self, conv: &str, lock: Arc<Mutex<()>>) {
+        drop(lock);
+        let mut map = self.conv_locks.lock().await;
+        if let Some(arc) = map.get(conv) {
+            if Arc::strong_count(arc) == 1 {
+                map.remove(conv);
+            }
+        }
+    }
+
     /// 处理单条消息。内部任何错误都 log 并吞掉，不影响主循环。
     async fn handle(&self, msg: InboundMessage) {
         let conv = msg.conv_id.clone();
@@ -1089,6 +1102,9 @@ impl Dispatcher {
                 let m = format!("[error] {e}");
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "backend.run 失败");
                 self.reply(&conv, &m, &hint).await;
+                // P1-7：失败路径也回收 conv_lock，防 HashMap 项永久泄漏。
+                drop(_guard);
+                self.release_conv_lock(&conv.0, lock).await;
                 return;
             }
             Err(e) => {
@@ -1096,6 +1112,9 @@ impl Dispatcher {
                 let m = format!("[error] backend task panicked: {e}");
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "backend task panic");
                 self.reply(&conv, &m, &hint).await;
+                // P1-7：panic 路径也回收 conv_lock。
+                drop(_guard);
+                self.release_conv_lock(&conv.0, lock).await;
                 return;
             }
         };
@@ -1174,17 +1193,9 @@ impl Dispatcher {
             }
         }
 
-        // 回收该 conv 的串行锁（已无其它 task 持有时），避免 conv_locks 无限增长。
-        // drop clone 后 strong_count==1 表示只剩 HashMap 那份；map mutex 互斥保证
-        // 检查+移除原子，竞态最坏只是漏清（下一轮再来），不会误删在用锁。
+        // 回收该 conv 的串行锁（P1-7：统一走 release_conv_lock，与失败路径一致）。
         drop(_guard);
-        drop(lock);
-        let mut map = self.conv_locks.lock().await;
-        if let Some(arc) = map.get(&conv.0) {
-            if Arc::strong_count(arc) == 1 {
-                map.remove(&conv.0);
-            }
-        }
+        self.release_conv_lock(&conv.0, lock).await;
     }
 
     /// 回传文本；发送失败仅 log。session 过期升级为 error（用户侧已收不到回复）。
@@ -1302,6 +1313,38 @@ mod tests {
         assert_eq!(line, "{\"conv_id\":\"c1\"}\n");
     }
 
+    #[tokio::test]
+    async fn conv_lock_released_on_backend_failure() {
+        // P1-7：backend.run 失败时，handle 的失败 return 应释放 conv_lock，
+        // 不在 conv_locks 留泄漏项。
+        let _g = SERIAL.lock().await;
+        let auth = Auth::new(vec!["u1".into()]);
+        let (plat, inbox, send_count) = MockPlatform::new();
+        let (back, _calls, _prompts, _order) = MockBackend::new_failing();
+        let (store, _db) = tmp_store().await;
+        let disp = Arc::new(Dispatcher::new(
+            Arc::new(plat),
+            Arc::new(back),
+            store,
+            auth,
+            std::path::PathBuf::from("/tmp/imagent-test-ws"),
+            vec!["Read".into()],
+            PermissionMode::Off,
+            std::time::Duration::from_secs(600),
+            vec![],
+        ));
+        disp.handle(msg("c1", "u1", "hello")).await;
+        // 失败路径 release 后，conv_locks 应为空（c1 已被移除，非永久泄漏）。
+        let map = disp.conv_locks.lock().await;
+        assert!(
+            map.is_empty(),
+            "conv_locks 应在 backend 失败后为空，残留: {:?}",
+            map.keys().collect::<Vec<_>>()
+        );
+        drop(inbox);
+        drop(send_count);
+    }
+
     /// 串行化 dispatch 集成测试：避免并行开 /tmp WAL sqlite 触发 SQLITE_IOERR(1802)。
     static SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
@@ -1397,6 +1440,8 @@ mod tests {
         order: Arc<AtomicUsize>,
         /// 每次 run 前发这些 ToolUse chunk（用于工具摘要测试）。默认空。
         tools_to_emit: Arc<TokioMutex<Vec<(String, String)>>>,
+        /// run 直接返 Err（P1-7 失败路径测试用）。
+        fail: bool,
     }
 
     impl MockBackend {
@@ -1409,6 +1454,7 @@ mod tests {
                 prompts: prompts.clone(),
                 order: order.clone(),
                 tools_to_emit: Arc::new(TokioMutex::new(Vec::new())),
+                fail: false,
             };
             (b, calls, prompts, order)
         }
@@ -1419,6 +1465,13 @@ mod tests {
         ) -> (Self, CallsHandle, PromptsHandle, CounterHandle) {
             let (b, calls, prompts, order) = Self::new();
             *b.tools_to_emit.lock().await = tools;
+            (b, calls, prompts, order)
+        }
+
+        /// run 直接返 Err（P1-7 失败路径测试用）。
+        fn new_failing() -> (Self, CallsHandle, PromptsHandle, CounterHandle) {
+            let (mut b, calls, prompts, order) = Self::new();
+            b.fail = true;
             (b, calls, prompts, order)
         }
     }
@@ -1434,6 +1487,13 @@ mod tests {
             _allowed_tools: &[String],
             chunks: mpsc::Sender<AgentChunk>,
         ) -> Result<crate::types::RunOutcome> {
+            // P1-7 测试：fail 模式直接返 Err，触发 handle 失败路径。
+            if self.fail {
+                return Err(crate::error::CoreError::Backend(
+                    "mock-backend",
+                    "mock failure (fail=true)".into(),
+                ));
+            }
             // 记录续接情况 + 执行顺序 + 收到的 prompt。
             let my_order = self.order.fetch_add(1, Ordering::SeqCst);
             self.calls.lock().await.push(session.map(|s| s.0.clone()));
