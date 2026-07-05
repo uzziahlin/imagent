@@ -151,6 +151,17 @@ fn extract_host(url: &str) -> Option<String> {
 
 /// 校验 URL 主机在 CDN 白名单内；非白名单返回 Err（SSRF 防护）。
 pub fn assert_cdn_host(url: &str) -> Result<()> {
+    // P1-2：强制 https——只校验 host 不够，http:// 的 CDN URL 会让
+    // encrypted_query_param 在链路上明文传输（与 P0-C login baseurl 强制 https
+    // 姿态一致；ECB 无完整性，明文链路可被替换密文）。
+    let parsed = url::Url::parse(url)
+        .map_err(|_| CoreError::Platform("ilink", format!("invalid url: {url}")))?;
+    if parsed.scheme() != "https" {
+        return Err(CoreError::Platform(
+            "ilink",
+            format!("SSRF blocked: non-https scheme ({}) for {url}", parsed.scheme()),
+        ));
+    }
     let host = extract_host(url).unwrap_or_default();
     if host.is_empty() {
         return Err(CoreError::Platform(
@@ -436,6 +447,22 @@ mod tests {
     fn ssrf_allows_cdn_host() {
         assert_cdn_host("https://novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param=x")
             .unwrap();
+    }
+
+    #[test]
+    fn ssrf_rejects_non_https_scheme() {
+        // P1-2：http:// 的 CDN host 不应通过——encrypted_query_param 会明文泄漏。
+        let res = assert_cdn_host(
+            "http://novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param=x",
+        );
+        assert!(res.is_err(), "http CDN url must be rejected");
+        let msg = format!("{}", res.unwrap_err());
+        assert!(msg.contains("https"), "msg={msg}");
+    }
+
+    #[test]
+    fn ssrf_rejects_ws_scheme() {
+        assert!(assert_cdn_host("wss://novac2c.cdn.weixin.qq.com/x").is_err());
     }
 
     #[test]
