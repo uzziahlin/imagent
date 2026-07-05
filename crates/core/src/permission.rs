@@ -90,6 +90,11 @@ impl PermissionRouter {
             false
         }
     }
+
+    /// 清理 pending（P1-8）：超时或 sender drop 时移除残留项，避免 map 累积。
+    pub async fn cancel(&self, conv_id: &str) {
+        self.pending.lock().await.remove(conv_id);
+    }
 }
 
 impl Default for PermissionRouter {
@@ -101,6 +106,16 @@ impl Default for PermissionRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancel_removes_pending() {
+        // P1-8：cancel 清理 pending，避免超时/router-drop 残留累积。
+        let r = PermissionRouter::new();
+        let _rx = r.register("conv1").await;
+        assert!(r.has_pending("conv1").await);
+        r.cancel("conv1").await;
+        assert!(!r.has_pending("conv1").await);
+    }
 
     #[test]
     fn parse_reply_allow_variants() {

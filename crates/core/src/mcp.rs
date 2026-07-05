@@ -174,7 +174,21 @@ pub async fn ask_via_socket(
 
     let mut reader = BufReader::new(&mut stream);
     let mut buf = String::new();
-    reader.read_line(&mut buf).await?;
+    // P1-6：read_line 加超时——主进程异常（dispatcher task 被 cancel/panic 但未写回
+    // socket）时，mcp 子进程不会在 socket 上永久挂死变僵尸。1200s 覆盖默认
+    // agent_timeout（600s）；超时返 Err（上层 Ask 兜底 deny）。
+    const MCP_ASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1200);
+    match tokio::time::timeout(MCP_ASK_TIMEOUT, reader.read_line(&mut buf)).await {
+        Ok(res) => {
+            res?;
+        }
+        Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "permission reply timed out (>1200s)",
+            ));
+        }
+    }
     let v: Value = serde_json::from_str(buf.trim())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("parse reply: {e}")))?;
     let allow = v.get("allow").and_then(|a| a.as_bool()).unwrap_or(false);

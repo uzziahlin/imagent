@@ -320,7 +320,71 @@ impl Dispatcher {
         });
     }
 
+    /// 读一行（到 `\n`），上限 `max_bytes` 字节，超限返 Err（P1-9：防同 uid 进程
+    /// 发巨大行 OOM）。返回 None 表示对端 EOF（未发数据即关）。
+    #[cfg(unix)]
+    async fn read_line_capped<R: tokio::io::AsyncBufRead + Unpin>(
+        reader: &mut R,
+        max_bytes: usize,
+    ) -> std::io::Result<Option<String>> {
+        use tokio::io::AsyncBufReadExt;
+        let mut buf: Vec<u8> = Vec::with_capacity(512);
+        loop {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                return if buf.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+                };
+            }
+            if let Some(nl) = available.iter().position(|&b| b == b'\n') {
+                buf.extend_from_slice(&available[..=nl]);
+                reader.consume(nl + 1);
+                return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+            }
+            buf.extend_from_slice(available);
+            let n = available.len();
+            reader.consume(n);
+            if buf.len() > max_bytes {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("permission request line exceeds {max_bytes} bytes"),
+                ));
+            }
+        }
+    }
+
+    /// 写一行 JSON 回复到 socket，带写超时（P1-9：防对端不读导致 write_all 长时阻塞）。
+    /// best-effort：超时/出错仅返回，连接由调用方 drop。
+    #[cfg(unix)]
+    async fn write_permission_reply(
+        stream: &mut tokio::net::UnixStream,
+        reply: PermissionReply,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        let resp = serde_json::json!({
+            "allow": reply.allow,
+            "message": reply.message,
+        });
+        let mut out = resp.to_string();
+        out.push('\n');
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            async {
+                let _ = stream.write_all(out.as_bytes()).await;
+                let _ = stream.flush().await;
+            },
+        )
+        .await;
+    }
+
     /// 处理单个 socket 连接：读请求行 → send_text 询问 → 等回复 → 写回复。
+    ///
+    /// - **P1-3**：send_text 失败时回写 deny 并 return（不挂 pending——否则用户看不到
+    ///   询问，agent 会卡满 agent_timeout，期间该 conv 消息全被当回复吞）。
+    /// - **P1-8**：超时/router-drop 时 `router.cancel` 清理 pending map 残留。
+    /// - **P1-9**：读行加上限（64KiB）+ 读超时（15s）+ 写超时（10s），防 OOM / 挂死。
     #[cfg(unix)]
     async fn handle_permission_socket(
         mut stream: tokio::net::UnixStream,
@@ -328,12 +392,28 @@ impl Dispatcher {
         router: Arc<PermissionRouter>,
         agent_timeout: std::time::Duration,
     ) {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let mut reader = BufReader::new(&mut stream);
-        let mut line = String::new();
-        if reader.read_line(&mut line).await.is_err() {
-            return;
-        }
+        // 读请求行。reader 在块内 drop 以释放 stream 借用（后续写回需 &mut stream）。
+        let line = {
+            use tokio::io::BufReader;
+            let mut reader = BufReader::new(&mut stream);
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                Self::read_line_capped(&mut reader, 64 * 1024),
+            )
+            .await
+            {
+                Ok(Ok(Some(line))) => line,
+                Ok(Ok(None)) => return, // EOF，对端未发即关
+                Ok(Err(e)) => {
+                    warn!(target: "imagent::core", error = %e, "permission socket 读行失败/超长");
+                    return;
+                }
+                Err(_) => {
+                    warn!(target: "imagent::core", "permission socket 读行超时（15s）");
+                    return;
+                }
+            }
+        };
         let req: serde_json::Value = match serde_json::from_str(line.trim()) {
             Ok(v) => v,
             Err(e) => {
@@ -361,36 +441,46 @@ impl Dispatcher {
             "🔐 Claude 请求执行 {tool_name}：{}\n回复 y 允许，其它拒绝。",
             truncate_str(&input_str, 80)
         );
+        // P1-3：send_text 失败 → 回写 deny 并 return，不挂 pending。
         if let Err(e) = platform
             .send_text(&conv, &prompt_text, &ReplyHint::None)
             .await
         {
-            warn!(target: "imagent::core", conv_id = %conv_id, error = %e, "send permission ask 失败");
+            warn!(target: "imagent::core", conv_id = %conv_id, error = %e, "send permission ask 失败，回 deny 不挂 pending");
+            Self::write_permission_reply(
+                &mut stream,
+                PermissionReply {
+                    allow: false,
+                    message: Some("send_text failed: IM 不可达".into()),
+                },
+            )
+            .await;
+            return;
         }
         // 注册 pending，等回复（recv 循环 route 到这里）。
         let rx = router.register(&conv_id).await;
         // P1-G：权限回复等待带 agent_timeout 对齐的超时——agent 死或用户长时间不回复时，
         // 超时回 deny 并 drop receiver，避免 pending 永驻把后续消息误当回复吞。
+        // P1-8：超时/router-drop 分支显式 cancel，移除 pending map 残留。
         let reply: PermissionReply = match tokio::time::timeout(agent_timeout, rx).await {
             Ok(Ok(r)) => r,
-            Ok(Err(_)) => PermissionReply {
-                allow: false,
-                message: Some("permission router dropped".into()),
-            },
-            Err(_elapsed) => PermissionReply {
-                allow: false,
-                message: Some(format!("permission ask timed out after {agent_timeout:?}")),
-            },
+            Ok(Err(_)) => {
+                router.cancel(&conv_id).await;
+                PermissionReply {
+                    allow: false,
+                    message: Some("permission router dropped".into()),
+                }
+            }
+            Err(_elapsed) => {
+                router.cancel(&conv_id).await;
+                PermissionReply {
+                    allow: false,
+                    message: Some(format!("permission ask timed out after {agent_timeout:?}")),
+                }
+            }
         };
         // 写回 socket（一行 JSON）。
-        let resp = serde_json::json!({
-            "allow": reply.allow,
-            "message": reply.message,
-        });
-        let mut out = resp.to_string();
-        out.push('\n');
-        let _ = stream.write_all(out.as_bytes()).await;
-        let _ = stream.flush().await;
+        Self::write_permission_reply(&mut stream, reply).await;
     }
 
     /// 取（或创建）conv 串行锁的 Arc clone。
@@ -1154,6 +1244,29 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::Mutex as TokioMutex;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_line_capped_rejects_oversized() {
+        // P1-9：超过上限（无换行）→ Err，防同 uid 进程发巨大行 OOM。
+        let bytes: Vec<u8> = vec![b'x'; 1000];
+        let mut reader = tokio::io::BufReader::new(&bytes[..]);
+        let res = Dispatcher::read_line_capped(&mut reader, 100).await;
+        assert!(res.is_err(), "oversized line must error");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_line_capped_reads_normal_line() {
+        let bytes: &[u8] = b"{\"conv_id\":\"c1\"}\nextra";
+        let mut reader = tokio::io::BufReader::new(bytes);
+        let line = Dispatcher::read_line_capped(&mut reader, 1024)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(line, "{\"conv_id\":\"c1\"}\n");
+    }
+
     /// 串行化 dispatch 集成测试：避免并行开 /tmp WAL sqlite 触发 SQLITE_IOERR(1802)。
     static SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
