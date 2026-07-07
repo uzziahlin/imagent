@@ -4,7 +4,7 @@
 
 一个用 Rust 写的、把即时通讯平台接入自主 agent 的网关。**任何 IM**（个人微信 iLink / 企业微信 WeCom）↔ **任何 agent**（Claude Code / …）。
 
-![Rust](https://img.shields.io/badge/Rust-edition%202021-orange) ![License: MIT](https://img.shields.io/badge/License-MIT-blue) ![CI](https://github.com/uzziah/imagent/actions/workflows/ci.yml/badge.svg) ![Status](https://img.shields.io/badge/status-v1.0-brightgreen) ![Docs](https://img.shields.io/badge/docs-mdBook-blueviolet)
+![Rust](https://img.shields.io/badge/Rust-edition%202021-orange) ![License: MIT](https://img.shields.io/badge/License-MIT-blue) ![CI](https://github.com/uzziah/imagent/actions/workflows/ci.yml/badge.svg) ![Status](https://img.shields.io/badge/status-pre--release-yellow) ![Docs](https://img.shields.io/badge/docs-mdBook-blueviolet)
 
 ---
 
@@ -71,7 +71,7 @@ trait Platform                        trait Backend
 ### 构建
 
 ```bash
-git clone https://github.com/<owner>/imagent
+git clone https://github.com/uzziah/imagent
 cd imagent
 cargo build --release
 # 二进制：target/release/imagent
@@ -140,9 +140,11 @@ imagent start            # 前台常驻，Ctrl-C 退出
 | P0 | ✅ | 调研（iLink 协议/合规、Claude CLI/ACP、竞品 feiyun） |
 | P1 | ✅ | MVP 闭环：扫码 → 私聊 → `claude -p` → 回传 → `--resume` |
 | P2 | ✅ | 限流熔断 / 动态白名单 / 多命名会话 / 软 compact / 推流 / typing / **权限审批** / 媒体 |
-| P3 | ✅ | 开源化（双 license/CI/凭据加密/mdBook）+ WeCom + ACP + 多 agent（Codex/Gemini）+ 运维（指标/热重载/daemon）+ 长消息分片 |
+| P3 | ✅ | 开源化（MIT license/CI/凭据加密/mdBook）+ WeCom + ACP + 多 agent（Codex/Gemini）+ 运维（指标/热重载/daemon）+ 长消息分片 |
 
-详见 [`docs/`](docs/)（[DESIGN](docs/DESIGN.md) / [RESEARCH](docs/RESEARCH.md) / [P2_COMPLETE](docs/P2_COMPLETE.md) / [P3_ROADMAP](docs/P3_ROADMAP.md)）。
+> **当前状态**：功能完整，但仍在收尾安全审查修复（见 [`CHANGELOG`](CHANGELOG.md) `[Unreleased]` 与 [`CODE_REVIEW_v3`](docs/CODE_REVIEW_v3.md) / [`v4`](docs/CODE_REVIEW_v4.md)），故版本徽章为 pre-release。功能层面 P0–P3 均已交付。
+
+详见 [`docs/`](docs/)（[DESIGN](docs/DESIGN.md) / [RESEARCH](docs/RESEARCH.md) / [P2_COMPLETE](docs/P2_COMPLETE.md) / [CODE_REVIEW_v4](docs/CODE_REVIEW_v4.md)）。
 
 ## 开发
 

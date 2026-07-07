@@ -1,22 +1,25 @@
 [Unit]
 Description=imagent — IM ↔ agent gateway
-Documentation=https://github.com/<owner>/imagent
+Documentation=https://github.com/uzziah/imagent
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-# 按实际安装路径与运行用户调整：
+# 按实际安装路径调整：
 ExecStart=/usr/local/bin/imagent start
-User=%i
+# 必须改成实际运行用户（服务以该用户身份运行，需对其 ~/.imagent 有读写权）。
+# 取消注释并替换为你的用户名；原 `User=%i` 仅对模板单元(imagent@.service)有效，
+# 本文件为非模板单元，%i 展开为空会触发 "User may not be empty" 启动失败（B5）。
+# User=imagent
 # Environment=RUST_LOG=info
-# Environment=IMAGENT_CONFIG=/home/%i/.imagent/config.toml
+# Environment=IMAGENT_CONFIG=/home/imagent/.imagent/config.toml
 Restart=on-failure
 RestartSec=5
-# 安全加固（可选）：
-# NoNewPrivileges=true
-# ProtectSystem=strict
-# ReadWritePaths=%h/.imagent
+# 安全加固（建议放开；agent workdir 也需加入 ReadWritePaths）：
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=%h/.imagent
 
 [Install]
 WantedBy=multi-user.target
