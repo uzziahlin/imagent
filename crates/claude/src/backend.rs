@@ -156,7 +156,15 @@ impl Backend for ClaudeBackend {
                 }
             }
         }
-        spawn_cli_backend(cmd, claude_parse, chunks, NAME).await
+        spawn_cli_backend(
+            cmd,
+            claude_parse,
+            chunks,
+            NAME,
+            // S-2：仅透传 claude 所需凭据/端点（最小授权）。
+            &["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"],
+        )
+        .await
     }
 }
 

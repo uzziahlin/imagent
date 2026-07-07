@@ -51,16 +51,31 @@ pub enum CliEvent {
 ///
 /// `cmd` 由调用方构造好（cwd/args 已设；本函数统一加 stdin/stdout/stderr/kill_on_drop）。
 /// `parse` 是各 backend 的「行 → CliEvent」适配闭包。`backend_name` 用于错误信息。
+/// `passthrough_env`：S-2——本函数会先 `env_clear()`，再仅透传 [`ALWAYS_PASSTHROUGH_ENV`]
+/// 以及调用方声明的这些 key（各 backend 传自己的 API key，最小授权）。传 `&[]` 则只透传
+/// 运行时必需变量（PATH/HOME/...）。
 pub async fn spawn_cli_backend(
     mut cmd: tokio::process::Command,
     parse: impl Fn(&str) -> CliEvent,
     chunks: tokio::sync::mpsc::Sender<AgentChunk>,
     backend_name: &'static str,
+    passthrough_env: &[&str],
 ) -> Result<RunOutcome> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+
+    // S-2：env_clear 防止 agent 子进程继承父进程全部 env（部署环境的 DATABASE_URL /
+    // CI secret / 其他工具 token 等，可经 Bash env / /proc/self/environ 被读取并经
+    // tool_result 回传 IM 或写入 workdir）。仅透传白名单：运行时必需变量 + 调用方
+    // 声明的该后端 API key。未设置的 key 跳过（不向子进程注入空值）。
+    cmd.env_clear();
+    for &key in ALWAYS_PASSTHROUGH_ENV.iter().chain(passthrough_env.iter()) {
+        if let Ok(val) = std::env::var(key) {
+            cmd.env(key, val);
+        }
+    }
 
     let mut child = cmd
         .spawn()
@@ -203,4 +218,16 @@ pub const WRITE_OR_EXEC: &[&str] = &[
     "NotebookEdit",
     "WriteQuery",
     "execute_bash",
+];
+
+/// `env_clear()` 后始终透传给 agent 子进程的运行时必需变量（S-2）。
+///
+/// - `PATH`/`HOME`/`USER`/`LOGNAME`：子进程找可执行、读自身配置的最小必需；
+/// - `LANG`/`LC_ALL`/`LC_CTYPE`/`TZ`：locale 与时区，缺 `LANG` 有的 CLI 报 UTF-8 警告；
+/// - `TMPDIR`：临时目录。
+///
+/// 其余 env（含各类 `*_API_KEY`、`DATABASE_URL`、CI secret 等）一律不透传——
+/// 由各 backend 经 `spawn_cli_backend` 的 `passthrough_env` 显式声明自己所需 key。
+const ALWAYS_PASSTHROUGH_ENV: &[&str] = &[
+    "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR",
 ];

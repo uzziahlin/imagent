@@ -68,7 +68,15 @@ impl Backend for GeminiBackend {
         cmd.arg("--skip-trust");
         // prompt 绑定到 flag（防止 prompt 以 `-` 开头被误解析）。
         cmd.arg(format!("--prompt={prompt}"));
-        spawn_cli_backend(cmd, gemini_parse, chunks, NAME).await
+        spawn_cli_backend(
+            cmd,
+            gemini_parse,
+            chunks,
+            NAME,
+            // S-2：仅透传 gemini(Google) 所需凭据（最小授权）。
+            &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        )
+        .await
     }
 }
 
