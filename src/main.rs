@@ -1,7 +1,10 @@
-//! `imagent` 二进制入口：组装 store / core / ilink / claude 四个 crate。
+//! `imagent` 二进制入口：组装 7 个 crate（store / core / ilink / wecom / claude /
+//! codex / gemini），多平台（iLink 个人微信 / WeCom 企业微信）× 多后端
+//!（Claude CLI/ACP / Codex / Gemini）。
 //!
-//! 职责：加载配置 → 扫码登录 → 前台常驻收私聊 → 鉴权 → 驱动 `claude -p` → 回传。
-//! 鉴权 / allowedTools 收敛 / 风控逻辑全部在 core（`Dispatcher`）中，main 只做组装。
+//! 职责：加载配置 →（iLink 扫码登录 / WeCom 读 config 凭据）→ 前台常驻收私聊 →
+//! 鉴权 → 驱动 agent → 回传。鉴权 / allowedTools 收敛 / 权限审批 / 风控全部在
+//! core（`Dispatcher`）中，main 只做组装 + 运维（metrics/health/SIGHUP/优雅退出）。
 
 #![forbid(unsafe_code)]
 
@@ -77,12 +80,21 @@ async fn main() -> Result<()> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("无法定位 home 目录"))?;
     let data_dir = home.join(".imagent");
     std::fs::create_dir_all(&data_dir)?;
+    // P2-14：数据目录收紧 0700（默认 umask 常 0755，同机其他用户可 ls 看到文件名；
+    // 最小权限，与 store 文件 0600 / permission.sock 0600 姿态一致）。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700));
+    }
     let db_path = data_dir.join("imagent.db");
 
     match cli.cmd {
         Cmd::Login { platform } => {
             if platform != "ilink" {
-                return Err(anyhow!("P1 仅支持 ilink 平台，收到 platform={platform}"));
+                return Err(anyhow!(
+                    "login 仅支持 ilink 平台（WeCom 用 config 的 bot_id + secret，不走扫码登录），收到 platform={platform}"
+                ));
             }
             let store = imagent_store::Store::open(&db_path).await?;
             println!("开始 iLink 扫码登录，请用手机微信扫描终端二维码 …");
@@ -211,21 +223,24 @@ async fn main() -> Result<()> {
                 config.allowed_tools,
                 discovery
             );
-            tokio::select! {
-                res = dispatcher.clone().run() => match res {
-                    Ok(()) => tracing::info!("dispatcher 正常退出"),
-                    Err(e) => {
-                        if matches!(e, imagent_core::CoreError::SessionExpired(_)) {
-                            tracing::error!("dispatcher 退出：{e}");
-                            println!("iLink session 已过期，请重新运行 `imagent login` 扫码登录。");
-                        } else {
-                            tracing::error!("dispatcher 异常退出：{e}");
-                            println!("imagent 异常退出：{e}");
-                        }
+            // P1-4/P1-5：信号 task 监听 SIGINT + SIGTERM，触发 dispatcher 优雅退出
+            // （run() 停止 recv + drain in-flight task，避免 SIGKILL 正在写文件的
+            // agent 子进程导致半写）。run() 完成 drain 后自然返回。
+            let dispatcher_for_signal = dispatcher.clone();
+            tokio::spawn(async move {
+                shutdown_signal().await;
+                dispatcher_for_signal.shutdown();
+            });
+            match dispatcher.run().await {
+                Ok(()) => tracing::info!(target: "imagent::ops", "dispatcher 退出（drain 完成）"),
+                Err(e) => {
+                    if matches!(e, imagent_core::CoreError::SessionExpired(_)) {
+                        tracing::error!("dispatcher 退出：{e}");
+                        println!("iLink session 已过期，请重新运行 `imagent login` 扫码登录。");
+                    } else {
+                        tracing::error!("dispatcher 异常退出：{e}");
+                        println!("imagent 异常退出：{e}");
                     }
-                },
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("received Ctrl-C, shutting down");
                 }
             }
         }
@@ -272,7 +287,10 @@ async fn main() -> Result<()> {
             );
         }
         Cmd::Stop => {
-            println!("imagent P1 为前台运行模式，请在运行 `start` 的终端按 Ctrl-C 停止。");
+            println!(
+                "imagent 为前台运行模式。停止方式：在 `start` 的终端按 Ctrl-C，或 `kill {}`。",
+                std::process::id()
+            );
         }
         Cmd::Mcp {
             conv_id,
@@ -480,4 +498,34 @@ fn spawn_sighup_handler(
             }
         }
     });
+}
+
+/// 等 SIGINT 或 SIGTERM（P1-4：补 SIGTERM，容器/systemd/k8s 滚动更新优雅退出）。
+/// 信号到达后返回，调用方触发 `dispatcher.shutdown()`。
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(target: "imagent::ops", error = %e, "无法注册 SIGTERM 处理器，仅监听 SIGINT");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!(target: "imagent::ops", "received SIGINT, shutting down");
+            }
+            _ = term.recv() => {
+                tracing::info!(target: "imagent::ops", "received SIGTERM, shutting down");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!(target: "imagent::ops", "received Ctrl-C, shutting down");
+    }
 }

@@ -6,5 +6,5 @@ description = "Instant messaging, meet your agent. — IM ↔ agent 网关"
 authors = ["Uzziah Lin"]
 
 [output.html]
-git-repository-url = "https://github.com/UzziahLin/imagent"
-edit-url-template = "https://github.com/UzziahLin/imagent/edit/main/{path}"
+git-repository-url = "https://github.com/uzziah/imagent"
+edit-url-template = "https://github.com/uzziah/imagent/edit/main/{path}"

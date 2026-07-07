@@ -12,7 +12,7 @@
 重点关注：
 - **凭据泄露**：`bot_token` 等敏感信息。
 - **鉴权绕过**：发送者白名单、权限审批闭环（D1）。
-- **沙箱逃逸**：`workdir` 锁定、`--allowedTools` 收敛、`--permission-prompt-tool` 绕过。
+- **agent 权限收敛**：`workdir` 仅作 cwd（**非沙箱**，不限制可读路径，靠 `--allowedTools` + `permission_mode` 兜底）、`--allowedTools` 配置收敛、`--permission-prompt-tool` 绕过。
 - **SSRF**：媒体 CDN 下载。
 
 ## 已有的加固（defense-in-depth）

@@ -147,12 +147,12 @@ imagent start            # 前台常驻，Ctrl-C 退出
 ## 开发
 
 ```bash
-cargo test --workspace                              # 229 passed
+cargo test --workspace                              # 241 passed
 cargo clippy --workspace --all-targets -- -D warnings   # 0 warning
 cargo fmt --all --check
 ```
 
-crate：`core`（调度/鉴权/session/权限）+ `ilink`（iLink 协议）+ `claude`（CLI backend）+ `store`（SQLite）。
+crate：`core`（调度/鉴权/session/权限）+ `ilink`（iLink 协议）+ `wecom`（企业微信长连接）+ `claude`（CLI/ACP backend）+ `codex` + `gemini` + `store`（SQLite）。
 
 ## License
 

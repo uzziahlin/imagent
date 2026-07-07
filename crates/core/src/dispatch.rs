@@ -91,6 +91,11 @@ pub struct Dispatcher {
     agent_timeout: std::time::Duration,
     /// 管理员 sender（可 /allow）；空 = 所有白名单用户可（向后兼容，P2-D）。
     admin_senders: Arc<RwLock<Vec<String>>>,
+    /// 优雅退出信号（P1-5）：收到 SIGINT/SIGTERM 后 notify，run() 停止收新消息并 drain。
+    shutdown: Arc<tokio::sync::Notify>,
+    /// in-flight handle task 集合（P1-5）：drain 时等待其完成，避免 SIGKILL 正在
+    /// 写文件的 agent 子进程导致半写。task 完成自动移除。
+    tasks: Mutex<tokio::task::JoinSet<()>>,
 }
 
 impl Dispatcher {
@@ -148,6 +153,8 @@ impl Dispatcher {
             permission_mode,
             agent_timeout,
             admin_senders: Arc::new(RwLock::new(admin_senders)),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+            tasks: Mutex::new(tokio::task::JoinSet::new()),
         }
     }
 
@@ -181,6 +188,12 @@ impl Dispatcher {
         self.router.clone()
     }
 
+    /// 触发优雅退出（P1-5）：run() 收到后停止 recv 并 drain in-flight task。
+    /// 由 main 的信号处理 task 调用（SIGINT/SIGTERM）。
+    pub fn shutdown(&self) {
+        self.shutdown.notify_waiters();
+    }
+
     /// 主循环。循环 `platform.recv()`，每条消息 `tokio::spawn` 处理（不阻塞 recv）。
     /// recv 返回 Err 时：session 过期 → 优雅停止（返回 Err 让 main 提示重新 login）；
     /// 其它错误 → 记录日志后继续（长轮询层自管重连/退避），不 panic。
@@ -203,38 +216,56 @@ impl Dispatcher {
         }
 
         loop {
-            match self.platform.recv().await {
-                Ok(msg) => {
-                    let conv_id = msg.conv_id.0.clone();
-                    // 权限闭环优先：若该 conv 正等待 approve/deny 回复，
-                    // 把这条消息当作回复送达 oneshot，不走正常 handle。
-                    if self.router.has_pending(&conv_id).await {
+            // P1-5：监听 shutdown 信号，停止接收新消息并进入 drain。
+            tokio::select! {
+                biased;
+                _ = self.shutdown.notified() => {
+                    info!(target: "imagent::core", "shutdown 信号到达，停止接收新消息，drain in-flight task");
+                    break;
+                }
+                msg = self.platform.recv() => match msg {
+                    Ok(msg) => {
+                        let conv_id = msg.conv_id.0.clone();
+                        // 权限闭环优先：若该 conv 正等待 approve/deny 回复，把这条消息
+                        // 当作回复送达 oneshot。P2-2：直接 route（单次 lock 原子 check+
+                        // remove+send），避免旧 has_pending→route 两次 lock 间隙被超时
+                        // 清理（P1-8 cancel）击穿，导致 "yes" 误走 fallforward 当新 prompt。
                         let reply = parse_reply(msg.text.as_deref().unwrap_or(""));
-                        let routed = self.router.route(&conv_id, reply).await;
-                        if routed {
+                        if self.router.route(&conv_id, reply).await {
                             continue;
                         }
-                        // 未命中（理论上 has_pending 为 true 时应命中）：fallthrough 处理。
+                        // 每条消息独立 spawn，不阻塞 recv。P1-5：入 JoinSet 以便 drain。
+                        let this = self.clone();
+                        self.tasks.lock().await.spawn(async move {
+                            this.handle(msg).await;
+                        });
                     }
-                    // 每条消息独立 spawn，不阻塞 recv。
-                    let this = self.clone();
-                    tokio::spawn(async move {
-                        this.handle(msg).await;
-                    });
-                }
-                Err(e) => {
-                    if is_session_expired_err(&e) {
-                        tracing::error!(
-                            target: "imagent::core",
-                            error = %e,
-                            "session 过期，停止 dispatcher（需重新 login）"
-                        );
-                        return Err(e);
+                    Err(e) => {
+                        if is_session_expired_err(&e) {
+                            tracing::error!(
+                                target: "imagent::core",
+                                error = %e,
+                                "session 过期，停止 dispatcher（需重新 login）"
+                            );
+                            return Err(e);
+                        }
+                        warn!(target: "imagent::core", error = %e, "platform.recv 失败，继续重试");
                     }
-                    warn!(target: "imagent::core", error = %e, "platform.recv 失败，继续重试");
-                }
+                },
             }
         }
+        // P1-5：drain in-flight handle task（最多 30s），超时 abort 剩余。
+        // 避免 SIGKILL 正在写文件的 agent 子进程导致半写；超时兜底防无限等待。
+        let mut tasks = self.tasks.lock().await;
+        let drain = async { while tasks.join_next().await.is_some() {} };
+        match tokio::time::timeout(std::time::Duration::from_secs(30), drain).await {
+            Ok(_) => info!(target: "imagent::core", "drain 完成（in-flight task 已结束）"),
+            Err(_) => {
+                warn!(target: "imagent::core", "drain 超时 30s，abort 剩余 in-flight task");
+                tasks.abort_all();
+            }
+        }
+        Ok(())
     }
 
     /// spawn socket accept task：每个连接独立 spawn，读权限请求 → send_text 询问
@@ -284,14 +315,23 @@ impl Dispatcher {
                 match listener.accept().await {
                     Ok((stream, _)) => {
                         // 鉴权：只接受与本进程同 uid 的连接（MCP 子进程由本进程 spawn，必然同 uid）。
+                        // P2-7 威胁模型：peer_uid 仅防「跨 uid 伪造」；同 uid 的任何进程（如被入侵的
+                        // 浏览器/CI 工具/恶意 npm 包）仍可 connect 并伪造 conv_id 推送权限请求。
+                        // 完整防护需 socket 握手 token（spawn MCP 子进程时 env 传一次性 token，
+                        // 首包校验）——留作后续加固。
                         let expected_uid = current_uid();
                         match peer_uid(&stream) {
                             Some(uid) if uid == expected_uid => {
                                 let platform = platform.clone();
                                 let router = router.clone();
                                 tokio::spawn(async move {
-                                    Self::handle_permission_socket(stream, platform, router, agent_timeout)
-                                        .await;
+                                    Self::handle_permission_socket(
+                                        stream,
+                                        platform,
+                                        router,
+                                        agent_timeout,
+                                    )
+                                    .await;
                                 });
                             }
                             Some(uid) => {
@@ -320,7 +360,65 @@ impl Dispatcher {
         });
     }
 
+    /// 读一行（到 `\n`），上限 `max_bytes` 字节，超限返 Err（P1-9：防同 uid 进程
+    /// 发巨大行 OOM）。返回 None 表示对端 EOF（未发数据即关）。
+    #[cfg(unix)]
+    async fn read_line_capped<R: tokio::io::AsyncBufRead + Unpin>(
+        reader: &mut R,
+        max_bytes: usize,
+    ) -> std::io::Result<Option<String>> {
+        use tokio::io::AsyncBufReadExt;
+        let mut buf: Vec<u8> = Vec::with_capacity(512);
+        loop {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                return if buf.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+                };
+            }
+            if let Some(nl) = available.iter().position(|&b| b == b'\n') {
+                buf.extend_from_slice(&available[..=nl]);
+                reader.consume(nl + 1);
+                return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+            }
+            buf.extend_from_slice(available);
+            let n = available.len();
+            reader.consume(n);
+            if buf.len() > max_bytes {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("permission request line exceeds {max_bytes} bytes"),
+                ));
+            }
+        }
+    }
+
+    /// 写一行 JSON 回复到 socket，带写超时（P1-9：防对端不读导致 write_all 长时阻塞）。
+    /// best-effort：超时/出错仅返回，连接由调用方 drop。
+    #[cfg(unix)]
+    async fn write_permission_reply(stream: &mut tokio::net::UnixStream, reply: PermissionReply) {
+        use tokio::io::AsyncWriteExt;
+        let resp = serde_json::json!({
+            "allow": reply.allow,
+            "message": reply.message,
+        });
+        let mut out = resp.to_string();
+        out.push('\n');
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let _ = stream.write_all(out.as_bytes()).await;
+            let _ = stream.flush().await;
+        })
+        .await;
+    }
+
     /// 处理单个 socket 连接：读请求行 → send_text 询问 → 等回复 → 写回复。
+    ///
+    /// - **P1-3**：send_text 失败时回写 deny 并 return（不挂 pending——否则用户看不到
+    ///   询问，agent 会卡满 agent_timeout，期间该 conv 消息全被当回复吞）。
+    /// - **P1-8**：超时/router-drop 时 `router.cancel` 清理 pending map 残留。
+    /// - **P1-9**：读行加上限（64KiB）+ 读超时（15s）+ 写超时（10s），防 OOM / 挂死。
     #[cfg(unix)]
     async fn handle_permission_socket(
         mut stream: tokio::net::UnixStream,
@@ -328,12 +426,28 @@ impl Dispatcher {
         router: Arc<PermissionRouter>,
         agent_timeout: std::time::Duration,
     ) {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let mut reader = BufReader::new(&mut stream);
-        let mut line = String::new();
-        if reader.read_line(&mut line).await.is_err() {
-            return;
-        }
+        // 读请求行。reader 在块内 drop 以释放 stream 借用（后续写回需 &mut stream）。
+        let line = {
+            use tokio::io::BufReader;
+            let mut reader = BufReader::new(&mut stream);
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                Self::read_line_capped(&mut reader, 64 * 1024),
+            )
+            .await
+            {
+                Ok(Ok(Some(line))) => line,
+                Ok(Ok(None)) => return, // EOF，对端未发即关
+                Ok(Err(e)) => {
+                    warn!(target: "imagent::core", error = %e, "permission socket 读行失败/超长");
+                    return;
+                }
+                Err(_) => {
+                    warn!(target: "imagent::core", "permission socket 读行超时（15s）");
+                    return;
+                }
+            }
+        };
         let req: serde_json::Value = match serde_json::from_str(line.trim()) {
             Ok(v) => v,
             Err(e) => {
@@ -361,36 +475,46 @@ impl Dispatcher {
             "🔐 Claude 请求执行 {tool_name}：{}\n回复 y 允许，其它拒绝。",
             truncate_str(&input_str, 80)
         );
+        // P1-3：send_text 失败 → 回写 deny 并 return，不挂 pending。
         if let Err(e) = platform
             .send_text(&conv, &prompt_text, &ReplyHint::None)
             .await
         {
-            warn!(target: "imagent::core", conv_id = %conv_id, error = %e, "send permission ask 失败");
+            warn!(target: "imagent::core", conv_id = %conv_id, error = %e, "send permission ask 失败，回 deny 不挂 pending");
+            Self::write_permission_reply(
+                &mut stream,
+                PermissionReply {
+                    allow: false,
+                    message: Some("send_text failed: IM 不可达".into()),
+                },
+            )
+            .await;
+            return;
         }
         // 注册 pending，等回复（recv 循环 route 到这里）。
         let rx = router.register(&conv_id).await;
         // P1-G：权限回复等待带 agent_timeout 对齐的超时——agent 死或用户长时间不回复时，
         // 超时回 deny 并 drop receiver，避免 pending 永驻把后续消息误当回复吞。
+        // P1-8：超时/router-drop 分支显式 cancel，移除 pending map 残留。
         let reply: PermissionReply = match tokio::time::timeout(agent_timeout, rx).await {
             Ok(Ok(r)) => r,
-            Ok(Err(_)) => PermissionReply {
-                allow: false,
-                message: Some("permission router dropped".into()),
-            },
-            Err(_elapsed) => PermissionReply {
-                allow: false,
-                message: Some(format!("permission ask timed out after {agent_timeout:?}")),
-            },
+            Ok(Err(_)) => {
+                router.cancel(&conv_id).await;
+                PermissionReply {
+                    allow: false,
+                    message: Some("permission router dropped".into()),
+                }
+            }
+            Err(_elapsed) => {
+                router.cancel(&conv_id).await;
+                PermissionReply {
+                    allow: false,
+                    message: Some(format!("permission ask timed out after {agent_timeout:?}")),
+                }
+            }
         };
         // 写回 socket（一行 JSON）。
-        let resp = serde_json::json!({
-            "allow": reply.allow,
-            "message": reply.message,
-        });
-        let mut out = resp.to_string();
-        out.push('\n');
-        let _ = stream.write_all(out.as_bytes()).await;
-        let _ = stream.flush().await;
+        Self::write_permission_reply(&mut stream, reply).await;
     }
 
     /// 取（或创建）conv 串行锁的 Arc clone。
@@ -402,6 +526,19 @@ impl Dispatcher {
         map.entry(conv.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    /// 回收 conv 串行锁（P1-7：失败/正常路径统一调用，防 conv_locks HashMap 项
+    /// 在 backend 失败/panic 的 return 路径永久泄漏）。调用方需先 drop guard 再传 lock。
+    /// strong_count==1 表示只剩 HashMap 那份，安全移除；竞态最坏漏清（下轮再来）。
+    async fn release_conv_lock(&self, conv: &str, lock: Arc<Mutex<()>>) {
+        drop(lock);
+        let mut map = self.conv_locks.lock().await;
+        if let Some(arc) = map.get(conv) {
+            if Arc::strong_count(arc) == 1 {
+                map.remove(conv);
+            }
+        }
     }
 
     /// 处理单条消息。内部任何错误都 log 并吞掉，不影响主循环。
@@ -480,12 +617,8 @@ impl Dispatcher {
                             // P2-D：仅管理员可授权新用户（admin_senders 非空时严格；
                             // 空则向后兼容所有白名单用户可）。
                             if !self.is_admin(actor) {
-                                self.reply(
-                                    &conv,
-                                    "仅管理员（admin_senders）可授权新用户。",
-                                    &hint,
-                                )
-                                .await;
+                                self.reply(&conv, "仅管理员（admin_senders）可授权新用户。", &hint)
+                                    .await;
                                 return;
                             }
                             let added = self.auth.allow(target);
@@ -964,13 +1097,20 @@ impl Dispatcher {
                 let m = format!("[error] {e}");
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "backend.run 失败");
                 self.reply(&conv, &m, &hint).await;
+                // P1-7：失败路径也回收 conv_lock，防 HashMap 项永久泄漏。
+                drop(_guard);
+                self.release_conv_lock(&conv.0, lock).await;
                 return;
             }
             Err(e) => {
                 METRICS.claude_errors.inc();
-                let m = format!("[error] backend task panicked: {e}");
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "backend task panic");
+                // P2-5：panic 时若已收到 Final chunk，优先回传它（而非丢弃只报 panic）。
+                let m = final_text.unwrap_or_else(|| format!("[error] backend task panicked: {e}"));
                 self.reply(&conv, &m, &hint).await;
+                // P1-7：panic 路径也回收 conv_lock。
+                drop(_guard);
+                self.release_conv_lock(&conv.0, lock).await;
                 return;
             }
         };
@@ -1049,17 +1189,9 @@ impl Dispatcher {
             }
         }
 
-        // 回收该 conv 的串行锁（已无其它 task 持有时），避免 conv_locks 无限增长。
-        // drop clone 后 strong_count==1 表示只剩 HashMap 那份；map mutex 互斥保证
-        // 检查+移除原子，竞态最坏只是漏清（下一轮再来），不会误删在用锁。
+        // 回收该 conv 的串行锁（P1-7：统一走 release_conv_lock，与失败路径一致）。
         drop(_guard);
-        drop(lock);
-        let mut map = self.conv_locks.lock().await;
-        if let Some(arc) = map.get(&conv.0) {
-            if Arc::strong_count(arc) == 1 {
-                map.remove(&conv.0);
-            }
-        }
+        self.release_conv_lock(&conv.0, lock).await;
     }
 
     /// 回传文本；发送失败仅 log。session 过期升级为 error（用户侧已收不到回复）。
@@ -1086,8 +1218,18 @@ impl Dispatcher {
 #[cfg(unix)]
 #[allow(unsafe_code)] // crate 顶层 `#![deny(unsafe_code)]`，此处显式豁免
 fn current_uid() -> u32 {
-    // SAFETY: getuid 无参数、无副作用，永远安全。
-    unsafe { libc::getuid() }
+    // SAFETY: getuid/geteuid 无参数、无副作用，永远安全。
+    // P2-8：Linux SO_PEERCRED 返回对端 real uid → 比对 getuid；
+    // macOS LOCAL_PEERCRED 返回 effective uid → 比对 geteuid（避免 setuid 部署下
+    // real != effective 导致 Ask 闭环全部误拒、可用性归零）。
+    #[cfg(target_os = "macos")]
+    {
+        unsafe { libc::geteuid() }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        unsafe { libc::getuid() }
+    }
 }
 
 /// 取 UnixStream 对端的 uid（用于权限 socket 鉴权）。
@@ -1154,6 +1296,61 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::Mutex as TokioMutex;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_line_capped_rejects_oversized() {
+        // P1-9：超过上限（无换行）→ Err，防同 uid 进程发巨大行 OOM。
+        let bytes: Vec<u8> = vec![b'x'; 1000];
+        let mut reader = tokio::io::BufReader::new(&bytes[..]);
+        let res = Dispatcher::read_line_capped(&mut reader, 100).await;
+        assert!(res.is_err(), "oversized line must error");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_line_capped_reads_normal_line() {
+        let bytes: &[u8] = b"{\"conv_id\":\"c1\"}\nextra";
+        let mut reader = tokio::io::BufReader::new(bytes);
+        let line = Dispatcher::read_line_capped(&mut reader, 1024)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(line, "{\"conv_id\":\"c1\"}\n");
+    }
+
+    #[tokio::test]
+    async fn conv_lock_released_on_backend_failure() {
+        // P1-7：backend.run 失败时，handle 的失败 return 应释放 conv_lock，
+        // 不在 conv_locks 留泄漏项。
+        let _g = SERIAL.lock().await;
+        let auth = Auth::new(vec!["u1".into()]);
+        let (plat, inbox, send_count) = MockPlatform::new();
+        let (back, _calls, _prompts, _order) = MockBackend::new_failing();
+        let (store, _db) = tmp_store().await;
+        let disp = Arc::new(Dispatcher::new(
+            Arc::new(plat),
+            Arc::new(back),
+            store,
+            auth,
+            std::path::PathBuf::from("/tmp/imagent-test-ws"),
+            vec!["Read".into()],
+            PermissionMode::Off,
+            std::time::Duration::from_secs(600),
+            vec![],
+        ));
+        disp.handle(msg("c1", "u1", "hello")).await;
+        // 失败路径 release 后，conv_locks 应为空（c1 已被移除，非永久泄漏）。
+        let map = disp.conv_locks.lock().await;
+        assert!(
+            map.is_empty(),
+            "conv_locks 应在 backend 失败后为空，残留: {:?}",
+            map.keys().collect::<Vec<_>>()
+        );
+        drop(inbox);
+        drop(send_count);
+    }
+
     /// 串行化 dispatch 集成测试：避免并行开 /tmp WAL sqlite 触发 SQLITE_IOERR(1802)。
     static SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
@@ -1249,6 +1446,8 @@ mod tests {
         order: Arc<AtomicUsize>,
         /// 每次 run 前发这些 ToolUse chunk（用于工具摘要测试）。默认空。
         tools_to_emit: Arc<TokioMutex<Vec<(String, String)>>>,
+        /// run 直接返 Err（P1-7 失败路径测试用）。
+        fail: bool,
     }
 
     impl MockBackend {
@@ -1261,6 +1460,7 @@ mod tests {
                 prompts: prompts.clone(),
                 order: order.clone(),
                 tools_to_emit: Arc::new(TokioMutex::new(Vec::new())),
+                fail: false,
             };
             (b, calls, prompts, order)
         }
@@ -1271,6 +1471,13 @@ mod tests {
         ) -> (Self, CallsHandle, PromptsHandle, CounterHandle) {
             let (b, calls, prompts, order) = Self::new();
             *b.tools_to_emit.lock().await = tools;
+            (b, calls, prompts, order)
+        }
+
+        /// run 直接返 Err（P1-7 失败路径测试用）。
+        fn new_failing() -> (Self, CallsHandle, PromptsHandle, CounterHandle) {
+            let (mut b, calls, prompts, order) = Self::new();
+            b.fail = true;
             (b, calls, prompts, order)
         }
     }
@@ -1286,6 +1493,13 @@ mod tests {
             _allowed_tools: &[String],
             chunks: mpsc::Sender<AgentChunk>,
         ) -> Result<crate::types::RunOutcome> {
+            // P1-7 测试：fail 模式直接返 Err，触发 handle 失败路径。
+            if self.fail {
+                return Err(crate::error::CoreError::Backend(
+                    "mock-backend",
+                    "mock failure (fail=true)".into(),
+                ));
+            }
             // 记录续接情况 + 执行顺序 + 收到的 prompt。
             let my_order = self.order.fetch_add(1, Ordering::SeqCst);
             self.calls.lock().await.push(session.map(|s| s.0.clone()));

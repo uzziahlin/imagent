@@ -141,7 +141,11 @@ impl Store {
         .await;
         // P1-B：凭据写入审计（best-effort——失败只 warn，不影响凭据写入结果）。
         if res.is_ok() {
-            let detail = if keyring_ok { "keyring" } else { "plaintext-fallback" };
+            let detail = if keyring_ok {
+                "keyring"
+            } else {
+                "plaintext-fallback"
+            };
             if let Err(e) = self
                 .append_audit("credential_put", None, Some(&account_id), Some(detail))
                 .await
@@ -253,6 +257,8 @@ impl Store {
             account_id.to_string(),
             blob.to_string(),
         );
+        let platform_for_audit = platform.clone();
+        let account_for_audit = account_id.clone();
         let inner = self.inner.clone();
         blocking_with(inner, move |conn| {
             let now = now_secs();
@@ -263,7 +269,18 @@ impl Store {
             )?;
             Ok(())
         })
-        .await
+        .await?;
+        // P2-11：迁移成功审计（明文 → keyring marker 的形态变更留痕，绕过 P1-B 的
+        // put_credential 审计路径；best-effort）。
+        let _ = self
+            .append_audit(
+                "credential_migrated",
+                None,
+                Some(&account_for_audit),
+                Some(&format!("platform={platform_for_audit}")),
+            )
+            .await;
+        Ok(())
     }
 
     // —— sessions（core 用）——
@@ -921,8 +938,15 @@ mod tests {
             .await
             .unwrap();
         let audit = store.list_audit(10).await.unwrap();
-        let cred_puts: Vec<_> = audit.iter().filter(|a| a.action == "credential_put").collect();
-        assert_eq!(cred_puts.len(), 1, "应有 1 条 credential_put 审计: {audit:?}");
+        let cred_puts: Vec<_> = audit
+            .iter()
+            .filter(|a| a.action == "credential_put")
+            .collect();
+        assert_eq!(
+            cred_puts.len(),
+            1,
+            "应有 1 条 credential_put 审计: {audit:?}"
+        );
         assert_eq!(cred_puts[0].target.as_deref(), Some("bot1"));
         assert_eq!(cred_puts[0].detail.as_deref(), Some("plaintext-fallback"));
     }
@@ -941,7 +965,9 @@ mod tests {
             .unwrap();
         let mode_of = |suffix: &str| -> Option<u32> {
             let p = format!("{}{suffix}", db.path.display());
-            std::fs::metadata(&p).ok().map(|md| md.permissions().mode() & 0o777)
+            std::fs::metadata(&p)
+                .ok()
+                .map(|md| md.permissions().mode() & 0o777)
         };
         // 主库文件必须 0600。
         assert_eq!(mode_of(""), Some(0o600), "主库文件应为 0600");

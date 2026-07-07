@@ -11,7 +11,13 @@ env:
 
 jobs:
   lint-and-test:
-    runs-on: ubuntu-latest
+    # E-1：macOS 是一等支持平台（peer_uid LOCAL_PEERCRED / SIGHUP / OS keychain），
+    # 必须在 CI 验证——不能只跑 ubuntu 让 macOS 分支长期零覆盖。
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -21,7 +27,8 @@ jobs:
       - name: rustfmt
         run: cargo fmt --all --check
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        # E-7：--all-features 防未来 feature flag 漏检。
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: test
         run: cargo test --workspace --verbose
 

@@ -52,27 +52,13 @@ impl Backend for CodexBackend {
         // 构造命令（workdir 锁定，prompt 单 arg 不经 shell；stdin/stdout/stderr/kill_on_drop
         // 由 spawn_cli_backend 统一加）。
         let sandbox_mode = pick_sandbox(allowed_tools);
+        // P1-1：-s 必须在 `--` 之前——clap 的 `--` 之后全是 positional，codex exec
+        // 用 trailing_var_arg 收集 prompt，原实现把 -s 放在 -- 之后导致 sandbox 模式
+        // 被并入 prompt 字符串、从未生效（退到默认 read-only，用户配 Edit/Write 仍写不了）。
+        let args = codex_args(session, sandbox_mode, prompt);
         let mut cmd = Command::new("codex");
         cmd.current_dir(workdir);
-        if let Some(s) = session {
-            // 续接：codex exec resume <thread_id> <prompt>。
-            // P2-J：prompt 经 `--` 分隔为纯 positional，防止 prompt 以 `-` 开头
-            // 被误解析为 flag（参数注入）。
-            cmd.arg("exec")
-                .arg("resume")
-                .arg(&s.0)
-                .arg("--json")
-                .arg("--skip-git-repo-check")
-                .arg("--")
-                .arg(prompt);
-        } else {
-            cmd.arg("exec")
-                .arg("--json")
-                .arg("--skip-git-repo-check")
-                .arg("--")
-                .arg(prompt);
-        }
-        cmd.arg("-s").arg(sandbox_mode);
+        cmd.args(args);
         spawn_cli_backend(cmd, codex_parse, chunks, NAME).await
     }
 }
@@ -120,6 +106,28 @@ fn pick_sandbox(allowed_tools: &[String]) -> &'static str {
     }
 }
 
+/// 构造 `codex exec` 的 arg 序列（不含 program name），抽成纯函数便于单测顺序。
+///
+/// - resume 续接：`exec resume <thread_id> <opts> -- <prompt>`；
+/// - 新建：`exec <opts> -- <prompt>`。
+///
+/// **P1-1**：`-s <sandbox>` 必须在 `--` **之前**（options 区）；`--` 之后只留 prompt
+/// 作纯 positional（P2-J：防 prompt 以 `-` 开头被误解析为 flag）。
+fn codex_args(session: Option<&SessionId>, sandbox_mode: &str, prompt: &str) -> Vec<String> {
+    let mut args: Vec<String> = vec!["exec".into()];
+    if let Some(s) = session {
+        args.push("resume".into());
+        args.push(s.0.clone());
+    }
+    args.push("--json".into());
+    args.push("--skip-git-repo-check".into());
+    args.push("-s".into());
+    args.push(sandbox_mode.into());
+    args.push("--".into());
+    args.push(prompt.into());
+    args
+}
+
 // TODO(P?): Codex IM 权限审批闭环——当前仅依赖 codex 沙箱 + workdir 锁定兜底，
 // 未实现类似 ClaudeBackend 的 MCP 回调式 IM 审批。codex exec 暂无等价的
 // --permission-prompt-tool 机制。
@@ -147,5 +155,32 @@ mod tests {
     #[test]
     fn name_is_codex() {
         assert_eq!(CodexBackend::new().name(), "codex");
+    }
+
+    #[test]
+    fn sandbox_flag_precedes_dashdash_new_session() {
+        // P1-1：-s 必须在 -- 之前，否则被 codex 当 positional 并入 prompt。
+        let args = codex_args(None, "workspace-write", "hello");
+        let dashdash = args.iter().position(|a| a == "--").unwrap();
+        let s_idx = args.iter().position(|a| a == "-s").unwrap();
+        assert!(
+            s_idx < dashdash,
+            "-s must precede -- (got -s@{s_idx}, --@{dashdash})"
+        );
+        assert_eq!(args[s_idx + 1], "workspace-write");
+        assert_eq!(args[dashdash + 1], "hello");
+    }
+
+    #[test]
+    fn sandbox_flag_precedes_dashdash_resume() {
+        let sid = SessionId("thread-123".into());
+        let args = codex_args(Some(&sid), "read-only", "do thing");
+        let dashdash = args.iter().position(|a| a == "--").unwrap();
+        let s_idx = args.iter().position(|a| a == "-s").unwrap();
+        assert!(s_idx < dashdash);
+        // resume 分支：exec resume <thread_id>
+        let resume_idx = args.iter().position(|a| a == "resume").unwrap();
+        assert_eq!(args[resume_idx + 1], "thread-123");
+        assert_eq!(args[dashdash + 1], "do thing");
     }
 }
