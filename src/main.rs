@@ -157,6 +157,18 @@ async fn main() -> Result<()> {
                 );
             }
 
+            // S-1：ACP 后端不强制 allowed_tools（CLI 用 --allowedTools 收敛，ACP 无等价机制）。
+            // 用户配置 allowed_tools 期望工具白名单时需知晓：ACP 下工具收敛只能靠
+            // permission_mode=ask/deny 审批闭环兜底，否则 claude 可用其请求的任意工具。
+            if config.agent.as_str() == "claude-acp" && !config.allowed_tools.is_empty() {
+                tracing::warn!(
+                    target: "imagent::ops",
+                    agent = %config.agent,
+                    "claude-acp 后端不强制 allowed_tools（--allowedTools 在 ACP 无等价机制）；\
+                     工具收敛需依赖 permission_mode=ask/deny，否则 claude 可用其请求的任意工具"
+                );
+            }
+
             // 7. auth —— 白名单：config 种子 ∪ store 已有（CLI /allow 或 IM /allow 持久化）。
             let mut initial: Vec<String> = config.allowed_senders.clone();
             let stored = store.list_allowed_senders().await.unwrap_or_default();
