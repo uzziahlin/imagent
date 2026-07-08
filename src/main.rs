@@ -22,7 +22,7 @@ use serde::Serialize;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "imagent", about = "IM ↔ agent gateway")]
+#[command(name = "imagent", version, about = "IM ↔ agent gateway")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -49,10 +49,11 @@ enum Cmd {
         /// 要授权的 from_user_id（如 wx_xxx@im.wechat）。
         sender: String,
     },
-    /// 停止（P1 前台运行，仅提示）。
+    /// 停止（v1 前台运行模式，仅打印停止方式：前台 Ctrl-C / systemctl stop / kill <pid>）。
     Stop,
     /// 内部子命令：作为 claude 的 MCP 权限审批 server（stdio JSON-RPC）。
     /// 由 claude 经 --mcp-config spawn，不直接手动调用。
+    #[command(hide = true)]
     Mcp {
         /// 当前会话标识（路由权限回复用）。
         #[arg(long)]
