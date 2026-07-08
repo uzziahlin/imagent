@@ -165,7 +165,13 @@ impl WeComWsClient {
                 msg = ws.next() => {
                     let raw = match msg {
                         Some(Ok(Message::Text(t))) => t.to_string(),
-                        Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+                        Some(Ok(Message::Ping(p))) => {
+                            // P3-N3：显式回 Pong（tokio-tungstenite stream API 不自动回），
+                            // 否则服务端 Ping 探活失败判掉线 → 频繁重连。
+                            let _ = ws.send(Message::Pong(p)).await;
+                            continue;
+                        }
+                        Some(Ok(Message::Pong(_))) => continue,
                         Some(Ok(Message::Close(_))) => {
                             return Err(imagent_core::CoreError::Platform(
                                 "wecom", "服务端关闭连接".into(),
