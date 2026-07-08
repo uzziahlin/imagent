@@ -25,9 +25,9 @@
     <true/>
 
     <key>StandardOutPath</key>
-    <string>/tmp/imagent.log</string>
+    <string>/usr/local/var/log/imagent.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/tmp/imagent.err.log</string>
+    <string>/usr/local/var/log/imagent.err.log</string>
 </dict>
 </plist>

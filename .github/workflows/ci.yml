@@ -44,9 +44,9 @@ jobs:
         run: cargo check --workspace --all-targets
 
   audit:
+    # 依赖安全审计：PR 也跑（advisory 级别默认 deny），防 dependabot 升级 PR
+    # 带新 advisory 直接合入 main 后才暴露。
     runs-on: ubuntu-latest
-    # 只在 push 到 main 时跑依赖审计（PR 不阻塞）
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@cargo-audit

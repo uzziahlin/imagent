@@ -59,7 +59,15 @@ impl Backend for CodexBackend {
         let mut cmd = Command::new("codex");
         cmd.current_dir(workdir);
         cmd.args(args);
-        spawn_cli_backend(cmd, codex_parse, chunks, NAME).await
+        spawn_cli_backend(
+            cmd,
+            codex_parse,
+            chunks,
+            NAME,
+            // S-2：仅透传 codex(OpenAI) 所需凭据/端点（最小授权）。
+            &["OPENAI_API_KEY", "OPENAI_BASE_URL"],
+        )
+        .await
     }
 }
 

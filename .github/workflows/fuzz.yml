@@ -1,0 +1,27 @@
+name: fuzz
+
+# 周期性 fuzz（第二波 S-补充）：fuzz/ 有两个 target（ilink_proto_parse /
+# ilink_media_cdn_host），覆盖外部输入攻击面（协议解析 + CDN host SSRF）。
+# 仅靠本地手跑无法保证 corpus 增长与回归发现，故每周跑一次（各 300s）。
+# 手动触发：Actions → fuzz → Run workflow。
+
+on:
+  schedule:
+    # 每周日 ~04:07 UTC（避开整点，减轻共享 API 压力）
+    - cron: '7 4 * * 0'
+  workflow_dispatch: {}
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz ilink_proto_parse (300s)
+        run: cargo +nightly fuzz run ilink_proto_parse -- -max_total_time=300
+      - name: Fuzz ilink_media_cdn_host (300s)
+        run: cargo +nightly fuzz run ilink_media_cdn_host -- -max_total_time=300

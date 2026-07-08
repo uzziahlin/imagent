@@ -99,6 +99,19 @@ async fn write_mcp_config(
         .unwrap_or_else(std::env::temp_dir);
     tokio::fs::create_dir_all(&dir).await?;
     let path = dir.join(format!("mcp_{}.json", sanitize_filename(conv_id)));
+    // S-6：若目标已存在且是 symlink，拒绝覆写（防 ~/.imagent 被植入 symlink 指向
+    // 受害者文件如 ~/.ssh/authorized_keys，导致下次写 mcp 配置时覆写目标）。
+    if let Ok(meta) = tokio::fs::symlink_metadata(&path).await {
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "mcp config 路径是 symlink，拒绝覆写（防 symlink 攻击）: {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
     tokio::fs::write(&path, cfg.to_string()).await?;
     Ok(path)
 }
@@ -137,13 +150,14 @@ impl Backend for ClaudeBackend {
         // 权限审批：非 Off 时附加 MCP server（imagent mcp 子命令）；claude 遇需权限工具
         // 时回调 permission_request，由 MCP server 依模式 allow/deny 或经 socket 转 IM 询问。
         let mode = *self.permission_mode.read();
-        if mode.is_enabled() {
+        let mcp_json: Option<std::path::PathBuf> = if mode.is_enabled() {
             let sock = permission_sock_path();
             match write_mcp_config(conv_id, &sock, mode).await {
-                Ok(mcp_json) => {
-                    cmd.arg("--mcp-config").arg(&mcp_json);
+                Ok(p) => {
+                    cmd.arg("--mcp-config").arg(&p);
                     cmd.arg("--permission-prompt-tool")
                         .arg(imagent_core::mcp::TOOL_NAME);
+                    Some(p)
                 }
                 Err(e) => {
                     // fail-closed：写 mcp 配置失败时拒绝运行，而非无审批放行。
@@ -155,8 +169,24 @@ impl Backend for ClaudeBackend {
                     ));
                 }
             }
+        } else {
+            None
+        };
+        let result = spawn_cli_backend(
+            cmd,
+            claude_parse,
+            chunks,
+            NAME,
+            // S-2：仅透传 claude 所需凭据/端点（最小授权）。
+            &["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"],
+        )
+        .await;
+        // S-6 / P3-2：run 结束（claude 子进程已退出）清理本次 mcp 配置，避免
+        // ~/.imagent 堆积 mcp_*.json 残留 + 文件名泄漏 conv_id。
+        if let Some(p) = &mcp_json {
+            let _ = tokio::fs::remove_file(p).await;
         }
-        spawn_cli_backend(cmd, claude_parse, chunks, NAME).await
+        result
     }
 }
 

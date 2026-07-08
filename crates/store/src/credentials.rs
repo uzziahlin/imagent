@@ -130,3 +130,17 @@ pub(crate) async fn load_from_keyring(platform: &str, account_id: &str) -> Optio
         }
     }
 }
+
+/// 删除 keyring 条目（P2-10，best-effort）。无条目/不可用静默返回。
+pub(crate) async fn delete_from_keyring(platform: &str, account_id: &str) {
+    if cfg!(test) {
+        return;
+    }
+    let (p, a) = (platform.to_string(), account_id.to_string());
+    let _ = run_with_timeout(move || -> bool {
+        let Some(e) = entry(&p, &a) else {
+            return false;
+        };
+        e.delete_credential().is_ok()
+    });
+}

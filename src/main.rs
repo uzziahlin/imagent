@@ -22,7 +22,7 @@ use serde::Serialize;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "imagent", about = "IM ↔ agent gateway")]
+#[command(name = "imagent", version, about = "IM ↔ agent gateway")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -49,10 +49,11 @@ enum Cmd {
         /// 要授权的 from_user_id（如 wx_xxx@im.wechat）。
         sender: String,
     },
-    /// 停止（P1 前台运行，仅提示）。
+    /// 停止（v1 前台运行模式，仅打印停止方式：前台 Ctrl-C / systemctl stop / kill <pid>）。
     Stop,
     /// 内部子命令：作为 claude 的 MCP 权限审批 server（stdio JSON-RPC）。
     /// 由 claude 经 --mcp-config spawn，不直接手动调用。
+    #[command(hide = true)]
     Mcp {
         /// 当前会话标识（路由权限回复用）。
         #[arg(long)]
@@ -157,6 +158,18 @@ async fn main() -> Result<()> {
                 );
             }
 
+            // S-1：ACP 后端不强制 allowed_tools（CLI 用 --allowedTools 收敛，ACP 无等价机制）。
+            // 用户配置 allowed_tools 期望工具白名单时需知晓：ACP 下工具收敛只能靠
+            // permission_mode=ask/deny 审批闭环兜底，否则 claude 可用其请求的任意工具。
+            if config.agent.as_str() == "claude-acp" && !config.allowed_tools.is_empty() {
+                tracing::warn!(
+                    target: "imagent::ops",
+                    agent = %config.agent,
+                    "claude-acp 后端不强制 allowed_tools（--allowedTools 在 ACP 无等价机制）；\
+                     工具收敛需依赖 permission_mode=ask/deny，否则 claude 可用其请求的任意工具"
+                );
+            }
+
             // 7. auth —— 白名单：config 种子 ∪ store 已有（CLI /allow 或 IM /allow 持久化）。
             let mut initial: Vec<String> = config.allowed_senders.clone();
             let stored = store.list_allowed_senders().await.unwrap_or_default();
@@ -180,6 +193,8 @@ async fn main() -> Result<()> {
                 tools_handle,
                 perm_mode.clone(),
                 std::time::Duration::from_secs(config.agent_timeout_secs),
+                std::time::Duration::from_secs(config.permission_ask_timeout_secs),
+                std::time::Duration::from_secs(config.shutdown_grace_secs),
                 config.admin_senders.clone(),
             ));
 
@@ -242,6 +257,11 @@ async fn main() -> Result<()> {
                         println!("imagent 异常退出：{e}");
                     }
                 }
+            }
+            // R-3：清理 permission.sock（P1-5 计划 ③，原未落地）。
+            #[cfg(unix)]
+            if let Some(sock) = imagent_core::default_sock_path() {
+                let _ = std::fs::remove_file(&sock);
             }
         }
         Cmd::Status => {
