@@ -6,13 +6,23 @@
 > **与 v3 的关系**：先逐条核实 v3 声称已修项是否真落地（v1 当年谎报、v2 补上、v3 自查无谎报——本轮独立复核 v3），再查 v3 未覆盖的新问题。
 > **总体评分**：代码实现质量 **8/10**（架构干净、241 测试、生产代码极少 unwrap、fail-closed 倾向一致）；**开源就绪度 6.5/10**（差距不在代码，而在发布基础设施缺失 + v3 工程化项「部分修报完成」）。修完第一波 → 约 8/10 可开源；再修第二波 → 8.5/10。
 
-## 📋 修复进度（2026-07-08 起，分支 `fix/code-review-v4`）
+## 📋 修复进度（2026-07-08，分支 `fix/code-review-v4`）
 
-| 波次 | 范围 | 状态 |
-|---|---|---|
-| **第一波（开源前）** | B1–B5（开源基础设施）+ S-1/S-2（安全语义 + env 边界） | 🔧 进行中 |
-| **第二波（上线前）** | S-3/S-4/S-5 + R-1~R-6 + WeCom 协议健壮性 + CI fuzz/audit | ⬜ 待修 |
-| **第三波（打磨/重构）** | P3 清单 + 架构性建议（状态机收敛 / RAII / 退出语义 / ReplyHint 泛型 / 后端语义统一） | ⬜ 待修 |
+**✅ 已落地（13 commit，workspace 241 passed / clippy 0 warning / fmt clean）**：
+
+- **第一波（开源基础设施 + 安全边界）**：S-2 `env_clear` + per-backend 最小授权、S-1 ACP allowed_tools warn、B2 README 双license→MIT、B3 `<owner>`→uzziah、B4 徽章/路线表对齐、B5 systemd `User=%i` + 安全加固、SUMMARY 补 v2/v3/v4、launchd 日志路径。
+- **第二波 A（低风险）**：S-5 stdout/stderr cap、S-6 MCP symlink 防护 + 清理、R-5 WeCom ack 失败重连、R-6 channel 满可观测、CI fuzz cron + audit 回 PR。
+- **第二波 B（架构）**：S-3 `permission_ask_timeout` 独立预算、R-1 drain `shutdown_grace`、R-2 socket accept shutdown + JoinSet drain、R-3 main 清理 sock、S-4 WeCom secret 文档化。
+- **第三波（打磨）**：P2-10 `delete_credential`/`delete_from_keyring`、P3-N3 Ping/Pong、P2-R append_audit O(N)→O(logN)、N18 metrics 命名 `claude_*`→`backend_*`、CLI `--version`/`Cmd::Mcp hide`/`Stop` doc。
+
+**⏳ 后续（并入状态机收敛或单独 PR）**：
+
+- **B1 无 remote/tag**：需仓库 owner 操作（建 GitHub 仓库 + `git remote add` + 打 tag 触发 release.yml），非代码改动。
+- **R-4 状态机事务**：并入第三波「状态机收敛」（per-conv `ConvState` + 单 mutator），事务是其副产物；当前本地 SQLite 单连接失败极罕见 + 不一致可自愈，硬塞临时事务是治标。
+- **S-4 完整 keyring**：WeCom secret 走 keyring 需新增 bootstrap 命令（`login --platform wecom` 交互输入）。
+- **missing_docs**：各 crate 加 `#![warn(missing_docs)]` 需先补全公共 item doc（否则 `-D warnings` 失败）。
+- **架构重构**：`ReplyHint` 泛型、后端语义统一（CLI/ACP 的 `Off`/`allowed_tools`）、RAII guard。
+- **其余 P3**：出站 markdown 转义（破坏格式风险，先文档化）、ws_url host 白名单、ilink `post_json` 响应上限、`IMAGENT_ACP_COMMAND` env 白名单、store 连接池、mcp 同步 stdin。
 
 ---
 
