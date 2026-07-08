@@ -160,6 +160,36 @@ impl Store {
         res
     }
 
+    /// 删除凭据（P2-10）：同步删 SQLite 行 + keyring 条目（若有）+ 审计。
+    /// 用于凭据轮换/吊销的清理路径。返回是否删了 SQLite 行。
+    pub async fn delete_credential(&self, platform: &str, account_id: &str) -> Result<bool> {
+        let (platform, account_id) = (platform.to_string(), account_id.to_string());
+        // best-effort 删 keyring（无条目/不可用静默）。
+        crate::credentials::delete_from_keyring(&platform, &account_id).await;
+        let (p, a) = (platform.clone(), account_id.clone());
+        let inner = self.inner.clone();
+        let removed = blocking_with(inner, move |conn| {
+            let n = conn.execute(
+                "DELETE FROM credentials WHERE platform = ?1 AND account_id = ?2",
+                rusqlite::params![p, a],
+            )?;
+            Ok(n > 0)
+        })
+        .await?;
+        if let Err(e) = self
+            .append_audit(
+                "credential_delete",
+                None,
+                Some(&account_id),
+                Some(&platform),
+            )
+            .await
+        {
+            tracing::warn!(target: "store", error = %e, "凭据删除审计失败（best-effort）");
+        }
+        Ok(removed)
+    }
+
     /// 读凭据。SQLite `blob` 为 marker 时从 keyring 取真值；为明文（旧库 /
     /// 无 keychain）时尝试懒迁移到 keyring（成功则把 DB blob 更新为 marker，
     /// 失败则保持明文）。返回值始终为真实 blob。
@@ -544,10 +574,10 @@ impl Store {
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 rusqlite::params![now, action, actor, target, detail],
             )?;
-            // P2-R：审计日志轮转——保留最近 10000 条，删除超出（防 audit_log 无限增长）。
+            // P2-R：审计日志轮转——保留最近 10000 条。用 max(id) 范围删除（索引高效），
+            // 替代原 `NOT IN (SELECT ... LIMIT 10000)` 子查询（每条 O(N) 全扫）。
             conn.execute(
-                "DELETE FROM audit_log WHERE id NOT IN \
-                 (SELECT id FROM audit_log ORDER BY id DESC LIMIT 10000)",
+                "DELETE FROM audit_log WHERE id <= (SELECT MAX(id) FROM audit_log) - 10000",
                 [],
             )?;
             Ok(())
