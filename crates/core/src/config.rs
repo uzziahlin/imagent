@@ -77,6 +77,15 @@ pub struct Config {
     /// `kill_on_drop` 杀子进程），防止挂死的 agent 永久卡住会话。默认 600（10 分钟）。
     #[serde(default = "default_agent_timeout_secs")]
     pub agent_timeout_secs: u64,
+    /// 权限审批（Ask 模式）等待用户回复的超时（秒），超时则 deny。默认 300（5 分钟）。
+    /// S-3：独立预算——审批等待不再挤占 `agent_timeout` 的执行预算（`agent_timeout`
+    /// 覆盖审批 + 执行总和）。建议 < `agent_timeout_secs`，否则慢审批可能撑满 agent 超时。
+    #[serde(default = "default_permission_ask_timeout_secs")]
+    pub permission_ask_timeout_secs: u64,
+    /// 优雅退出（SIGINT/SIGTERM）drain in-flight task 的宽限期（秒）。超时则 abort
+    /// 剩余（kill_on_drop 杀 agent 子进程）。默认 60。R-1：原硬编码 30s 偏短。
+    #[serde(default = "default_shutdown_grace_secs")]
+    pub shutdown_grace_secs: u64,
     /// 若为 true，凭据必须写入 OS keyring；keyring 不可用时 **拒绝明文落盘**
     /// （`put_credential` 返回 Err，fail-closed）。默认 false（headless/CI 无 keychain
     /// 时明文回退 + warn，向后兼容）。安全敏感部署应设 true。
@@ -86,6 +95,10 @@ pub struct Config {
     #[serde(default)]
     pub wecom_bot_id: Option<String>,
     /// WeCom 智能机器人 secret（可选）。
+    ///
+    /// ⚠️ S-4：secret 当前明文存于此文件（与 iLink bot_token 走 OS keyring 不一致）。
+    /// 务必将 config.toml 收紧到 0600；完整 keyring 保护（含 bootstrap 命令）见
+    /// docs/CODE_REVIEW_v4.md S-4（后续）。
     #[serde(default)]
     pub wecom_secret: Option<String>,
 }
@@ -107,6 +120,12 @@ fn default_fragment_interval_ms() -> u64 {
 }
 fn default_agent_timeout_secs() -> u64 {
     600
+}
+fn default_permission_ask_timeout_secs() -> u64 {
+    300
+}
+fn default_shutdown_grace_secs() -> u64 {
+    60
 }
 
 impl Config {
@@ -145,6 +164,8 @@ permission_mode = "off"     # off(默认,claude按allowedTools自行处理) | al
 # message_max_len = 2000              # 单条出站消息字符上限（Unicode char）；不设 = 不分片
 # message_fragment_interval_ms = 400  # 分片间发送间隔（ms）
 # agent_timeout_secs = 600            # 单次 agent 运行超时（秒）；超时中止防挂死
+# permission_ask_timeout_secs = 300   # Ask 模式等用户回复超时(秒，独立预算，不挤占 agent 超时)
+# shutdown_grace_secs = 60            # 优雅退出 drain 宽限(秒)；超时 abort 在飞 task
 # require_keyring = false        # 默认 false(headless 明文回退+warn); true=keyring 不可用时拒绝明文落盘(fail-closed，安全部署建议)
 "#;
 }

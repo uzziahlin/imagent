@@ -192,6 +192,8 @@ async fn main() -> Result<()> {
                 tools_handle,
                 perm_mode.clone(),
                 std::time::Duration::from_secs(config.agent_timeout_secs),
+                std::time::Duration::from_secs(config.permission_ask_timeout_secs),
+                std::time::Duration::from_secs(config.shutdown_grace_secs),
                 config.admin_senders.clone(),
             ));
 
@@ -254,6 +256,11 @@ async fn main() -> Result<()> {
                         println!("imagent 异常退出：{e}");
                     }
                 }
+            }
+            // R-3：清理 permission.sock（P1-5 计划 ③，原未落地）。
+            #[cfg(unix)]
+            if let Some(sock) = imagent_core::default_sock_path() {
+                let _ = std::fs::remove_file(&sock);
             }
         }
         Cmd::Status => {

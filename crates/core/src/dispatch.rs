@@ -89,6 +89,10 @@ pub struct Dispatcher {
     permission_mode: Arc<RwLock<PermissionMode>>,
     /// 单次 agent 运行超时。超时则中止该次 run（backend 的 kill_on_drop 杀子进程）。
     agent_timeout: std::time::Duration,
+    /// 权限审批（Ask）等待用户回复的超时（S-3：独立预算，不挤占 agent_timeout）。
+    permission_ask_timeout: std::time::Duration,
+    /// 优雅退出 drain in-flight task 的宽限期（R-1：原硬编码 30s）。
+    shutdown_grace: std::time::Duration,
     /// 管理员 sender（可 /allow）；空 = 所有白名单用户可（向后兼容，P2-D）。
     admin_senders: Arc<RwLock<Vec<String>>>,
     /// 优雅退出信号（P1-5）：收到 SIGINT/SIGTERM 后 notify，run() 停止收新消息并 drain。
@@ -109,6 +113,8 @@ impl Dispatcher {
         allowed_tools: Vec<String>,
         permission_mode: PermissionMode,
         agent_timeout: std::time::Duration,
+        permission_ask_timeout: std::time::Duration,
+        shutdown_grace: std::time::Duration,
         admin_senders: Vec<String>,
     ) -> Self {
         Self::new_with_handles(
@@ -120,6 +126,8 @@ impl Dispatcher {
             Arc::new(RwLock::new(allowed_tools)),
             Arc::new(RwLock::new(permission_mode)),
             agent_timeout,
+            permission_ask_timeout,
+            shutdown_grace,
             admin_senders,
         )
     }
@@ -139,6 +147,8 @@ impl Dispatcher {
         allowed_tools: Arc<RwLock<Vec<String>>>,
         permission_mode: Arc<RwLock<PermissionMode>>,
         agent_timeout: std::time::Duration,
+        permission_ask_timeout: std::time::Duration,
+        shutdown_grace: std::time::Duration,
         admin_senders: Vec<String>,
     ) -> Self {
         Self {
@@ -152,6 +162,8 @@ impl Dispatcher {
             router: Arc::new(PermissionRouter::new()),
             permission_mode,
             agent_timeout,
+            permission_ask_timeout,
+            shutdown_grace,
             admin_senders: Arc::new(RwLock::new(admin_senders)),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             tasks: Mutex::new(tokio::task::JoinSet::new()),
@@ -254,14 +266,19 @@ impl Dispatcher {
                 },
             }
         }
-        // P1-5：drain in-flight handle task（最多 30s），超时 abort 剩余。
+        // P1-5/R-1：drain in-flight handle task（最多 shutdown_grace，默认 60s），超时 abort。
         // 避免 SIGKILL 正在写文件的 agent 子进程导致半写；超时兜底防无限等待。
+        // R-2：handle_permission_socket 也纳入 self.tasks，drain 一并等待。
         let mut tasks = self.tasks.lock().await;
         let drain = async { while tasks.join_next().await.is_some() {} };
-        match tokio::time::timeout(std::time::Duration::from_secs(30), drain).await {
+        match tokio::time::timeout(self.shutdown_grace, drain).await {
             Ok(_) => info!(target: "imagent::core", "drain 完成（in-flight task 已结束）"),
             Err(_) => {
-                warn!(target: "imagent::core", "drain 超时 30s，abort 剩余 in-flight task");
+                warn!(
+                    target: "imagent::core",
+                    grace = ?self.shutdown_grace,
+                    "drain 超时，abort 剩余 in-flight task"
+                );
                 tasks.abort_all();
             }
         }
@@ -307,53 +324,57 @@ impl Dispatcher {
                 "chmod permission socket 0600 失败，Ask 权限闭环鉴权减弱"
             );
         }
-        let platform = self.platform.clone();
-        let router = self.router.clone();
-        let agent_timeout = self.agent_timeout;
+        // R-2：accept task 监听 shutdown（SIGTERM 时停止 accept，原实现永驻）；
+        // 每个连接的 handle_permission_socket 纳入 self.tasks，drain 时一并等待。
+        let this = self.clone();
         tokio::spawn(async move {
+            // 鉴权基准：只接受与本进程同 uid 的连接（MCP 子进程由本进程 spawn，必然同 uid）。
+            // P2-7 威胁模型：peer_uid 仅防「跨 uid 伪造」；同 uid 的任何进程仍可 connect
+            // 并伪造 conv_id 推送权限请求。完整防护需 socket 握手 token，留作后续加固。
+            let expected_uid = current_uid();
             loop {
-                match listener.accept().await {
-                    Ok((stream, _)) => {
-                        // 鉴权：只接受与本进程同 uid 的连接（MCP 子进程由本进程 spawn，必然同 uid）。
-                        // P2-7 威胁模型：peer_uid 仅防「跨 uid 伪造」；同 uid 的任何进程（如被入侵的
-                        // 浏览器/CI 工具/恶意 npm 包）仍可 connect 并伪造 conv_id 推送权限请求。
-                        // 完整防护需 socket 握手 token（spawn MCP 子进程时 env 传一次性 token，
-                        // 首包校验）——留作后续加固。
-                        let expected_uid = current_uid();
-                        match peer_uid(&stream) {
-                            Some(uid) if uid == expected_uid => {
-                                let platform = platform.clone();
-                                let router = router.clone();
-                                tokio::spawn(async move {
-                                    Self::handle_permission_socket(
-                                        stream,
-                                        platform,
-                                        router,
-                                        agent_timeout,
-                                    )
-                                    .await;
-                                });
-                            }
-                            Some(uid) => {
-                                warn!(
-                                    target: "imagent::core",
-                                    peer_uid = uid,
-                                    expected_uid = expected_uid,
-                                    "拒绝非本进程 uid 的权限 socket 连接（疑似伪造）"
-                                );
-                                // stream drop 时自动关闭。
-                            }
-                            None => {
-                                warn!(
-                                    target: "imagent::core",
-                                    "无法获取权限 socket 对端 uid（平台不支持 peer cred），拒绝连接"
-                                );
+                tokio::select! {
+                    _ = this.shutdown.notified() => {
+                        info!(target: "imagent::core", "permission socket accept task 收到 shutdown，停止");
+                        break;
+                    }
+                    res = listener.accept() => match res {
+                        Ok((stream, _)) => {
+                            match peer_uid(&stream) {
+                                Some(uid) if uid == expected_uid => {
+                                    let platform = this.platform.clone();
+                                    let router = this.router.clone();
+                                    let permission_ask_timeout = this.permission_ask_timeout;
+                                    this.tasks.lock().await.spawn(async move {
+                                        Self::handle_permission_socket(
+                                            stream,
+                                            platform,
+                                            router,
+                                            permission_ask_timeout,
+                                        )
+                                        .await;
+                                    });
+                                }
+                                Some(uid) => {
+                                    warn!(
+                                        target: "imagent::core",
+                                        peer_uid = uid,
+                                        expected_uid = expected_uid,
+                                        "拒绝非本进程 uid 的权限 socket 连接（疑似伪造）"
+                                    );
+                                }
+                                None => {
+                                    warn!(
+                                        target: "imagent::core",
+                                        "无法获取权限 socket 对端 uid（平台不支持 peer cred），拒绝连接"
+                                    );
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        warn!(target: "imagent::core", error = %e, "permission socket accept 失败");
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        Err(e) => {
+                            warn!(target: "imagent::core", error = %e, "permission socket accept 失败");
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        }
                     }
                 }
             }
@@ -424,7 +445,7 @@ impl Dispatcher {
         mut stream: tokio::net::UnixStream,
         platform: Arc<dyn Platform>,
         router: Arc<PermissionRouter>,
-        agent_timeout: std::time::Duration,
+        permission_ask_timeout: std::time::Duration,
     ) {
         // 读请求行。reader 在块内 drop 以释放 stream 借用（后续写回需 &mut stream）。
         let line = {
@@ -493,10 +514,11 @@ impl Dispatcher {
         }
         // 注册 pending，等回复（recv 循环 route 到这里）。
         let rx = router.register(&conv_id).await;
-        // P1-G：权限回复等待带 agent_timeout 对齐的超时——agent 死或用户长时间不回复时，
-        // 超时回 deny 并 drop receiver，避免 pending 永驻把后续消息误当回复吞。
+        // P1-G/S-3：权限回复等待独立预算 permission_ask_timeout（默认 300s，不挤占
+        // agent_timeout 的执行预算）。agent 死或用户长时间不回复时，超时回 deny 并 drop
+        // receiver，避免 pending 永驻把后续消息误当回复吞。
         // P1-8：超时/router-drop 分支显式 cancel，移除 pending map 残留。
-        let reply: PermissionReply = match tokio::time::timeout(agent_timeout, rx).await {
+        let reply: PermissionReply = match tokio::time::timeout(permission_ask_timeout, rx).await {
             Ok(Ok(r)) => r,
             Ok(Err(_)) => {
                 router.cancel(&conv_id).await;
@@ -509,7 +531,9 @@ impl Dispatcher {
                 router.cancel(&conv_id).await;
                 PermissionReply {
                     allow: false,
-                    message: Some(format!("permission ask timed out after {agent_timeout:?}")),
+                    message: Some(format!(
+                        "permission ask timed out after {permission_ask_timeout:?}"
+                    )),
                 }
             }
         };
@@ -1337,6 +1361,8 @@ mod tests {
             vec!["Read".into()],
             PermissionMode::Off,
             std::time::Duration::from_secs(600),
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(60),
             vec![],
         ));
         disp.handle(msg("c1", "u1", "hello")).await;
@@ -1586,6 +1612,8 @@ mod tests {
             vec!["Read".into(), "Edit".into()],
             PermissionMode::Off,
             std::time::Duration::from_secs(600),
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(60),
             vec![], // admin_senders 空 = 测试用向后兼容（所有白名单用户可 /allow）
         ));
 
@@ -1614,6 +1642,8 @@ mod tests {
             vec!["Read".into(), "Edit".into()],
             PermissionMode::Off,
             std::time::Duration::from_secs(600),
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(60),
             admin_senders,
         ));
         Ctx {
@@ -1642,6 +1672,8 @@ mod tests {
             vec!["Read".into(), "Edit".into()],
             PermissionMode::Off,
             std::time::Duration::from_secs(600),
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(60),
             vec![], // admin_senders 空 = 测试用向后兼容（所有白名单用户可 /allow）
         ));
 
