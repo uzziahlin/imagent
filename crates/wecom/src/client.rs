@@ -144,6 +144,14 @@ impl WeComWsClient {
         };
         if authed {
             info!(target: "wecom", "subscribe 认证成功");
+        } else {
+            // R-5：认证失败（errcode≠0 / ack 解析失败 / 超时）必须 return Err 触发外层重连。
+            // 否则进入收发循环空转发心跳，进程存活但无 inbound、/health 不报错，用户消息
+            // 静默丢失且运维难发现（bot_id/secret 配错或被吊销/轮换时）。
+            return Err(imagent_core::CoreError::Platform(
+                "wecom",
+                "subscribe 认证失败（errcode≠0 或 ack 异常）——请检查 bot_id/secret 是否正确/被吊销/已轮换".into(),
+            ));
         }
 
         // 4. select! 收发循环：收帧 / 出站帧 / 心跳。
@@ -186,9 +194,23 @@ impl WeComWsClient {
 
                     match frame.cmd.as_deref() {
                         Some("aibot_msg_callback") => {
-                            // best-effort 推给 platform：channel 满说明消费端慢，
-                            // 丢弃该帧优于阻塞收发循环。
-                            let _ = inbound_tx.try_send(frame);
+                            // R-6：best-effort 推给 platform。不用 send().await 背压——
+                            // 会卡住 select! 其它分支（含心跳），30s 无心跳被服务端断连。
+                            // channel 满说明消费端跟不上：丢弃 + warn 让可观测（当前架构
+                            // dispatcher recv 不阻塞、spawn 即时，实际难触发；高频触发需
+                            // 增容或审视消费端）。channel 关闭则 return Err 触发重连。
+                            match inbound_tx.try_send(frame) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    warn!(target: "wecom", "入站 channel 满，丢弃回调帧");
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    return Err(imagent_core::CoreError::Platform(
+                                        "wecom",
+                                        "入站 channel 已关闭（platform 退出）".into(),
+                                    ));
+                                }
+                            }
                         }
                         Some("aibot_event_callback")
                         | Some("aibot_subscribe")
