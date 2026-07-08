@@ -93,13 +93,27 @@ pub async fn spawn_cli_backend(
     // 并发读 stderr，避免子进程 stderr 写满管道缓冲（~64KB）导致死锁。
     let stderr_handle = tokio::spawn(async move { read_stderr_to_string(stderr).await });
 
-    let mut reader = BufReader::new(stdout).lines();
+    let mut reader = BufReader::new(stdout);
     let mut session_id = String::new();
     let mut final_text = String::new();
     let mut error_text: Option<String> = None;
     let mut reached_terminal = false;
 
-    while let Ok(Some(line)) = reader.next_line().await {
+    loop {
+        let line = match read_line_capped(&mut reader, MAX_STDOUT_LINE_BYTES).await {
+            Ok(Some(l)) => l,
+            Ok(None) => break,
+            Err(e) => {
+                // S-5：单行超 MAX_STDOUT_LINE_BYTES（无 \n 的超长输出）跳过，防 OOM。
+                tracing::warn!(
+                    target: "imagent::backend",
+                    backend = backend_name,
+                    error = %e,
+                    "stdout 行超长/读失败，跳过该行"
+                );
+                continue;
+            }
+        };
         match parse(&line) {
             CliEvent::Session(id) => {
                 if session_id.is_empty() {
@@ -198,14 +212,70 @@ fn diagnose(
     }
 }
 
-/// 把子进程 stderr 全量读到字符串（非阻断）。三 CLI backend 共享。
+/// 把子进程 stderr 读到字符串（非阻断）。三 CLI backend 共享。
+///
+/// S-5：累积上限 [`MAX_STDERR_BYTES`]，超限保留前部 + 截断标记，继续 drain
+/// （不 break——否则子进程 stderr 管道写满 ~64KB 会阻塞子进程）。
 pub async fn read_stderr_to_string(stderr: tokio::process::ChildStderr) -> String {
     let mut reader = BufReader::new(stderr).lines();
+    let mut total = 0usize;
+    let mut truncated = false;
     let mut buf = Vec::new();
     while let Ok(Some(line)) = reader.next_line().await {
+        if truncated {
+            continue; // 已超上限：继续 drain 防管道阻塞，但不累积。
+        }
+        total += line.len() + 1;
+        if total > MAX_STDERR_BYTES {
+            truncated = true;
+            buf.push(format!(
+                "…[stderr 截断：超过 {MAX_STDERR_BYTES} 字节上限，丢弃后续]"
+            ));
+            continue;
+        }
         buf.push(line);
     }
     buf.join("\n")
+}
+
+/// stdout 单行字节上限（S-5）：防 agent 输出无 `\n` 的超长行（如 base64 流）
+/// 被全量分配撑爆内存。
+const MAX_STDOUT_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+/// stderr 累积字节上限（S-5）：长会话 stderr 膨胀，超限截断。
+const MAX_STDERR_BYTES: usize = 64 * 1024;
+
+/// 按字节读一行，上限 `max_bytes`（S-5）。超限返回 Err（调用方跳过该行）。
+/// 覆盖 `AsyncBufReadExt::lines()` 无上限的语义（一行无 `\n` 的超长输出会全量分配）。
+async fn read_line_capped<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> std::io::Result<Option<String>> {
+    let mut buf: Vec<u8> = Vec::with_capacity(512);
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return if buf.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+            };
+        }
+        if let Some(nl) = available.iter().position(|&b| b == b'\n') {
+            buf.extend_from_slice(&available[..=nl]);
+            reader.consume(nl + 1);
+            return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+        }
+        buf.extend_from_slice(available);
+        let n = available.len();
+        reader.consume(n);
+        if buf.len() > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("line exceeds {max_bytes} bytes"),
+            ));
+        }
+    }
 }
 
 /// 视为需要写/执行权限的工具名（codex sandbox / gemini approval 收敛用，大小写敏感）。
