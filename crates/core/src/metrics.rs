@@ -21,11 +21,11 @@ pub struct Metrics {
     /// 成功回传消息数（`Dispatcher::reply` send_text 成功）。
     pub messages_out: IntCounter,
     /// `backend.run` 调用数（正常完成）。
-    pub claude_calls: IntCounter,
+    pub backend_calls: IntCounter,
     /// `backend.run` 失败数（Err 或 task panic）。
-    pub claude_errors: IntCounter,
+    pub backend_errors: IntCounter,
     /// `backend.run` 耗时分布（秒）。
-    pub claude_duration: Histogram,
+    pub backend_duration: Histogram,
 }
 
 impl Metrics {
@@ -35,18 +35,21 @@ impl Metrics {
                 .expect("register messages_in"),
             messages_out: register_int_counter!("imagent_messages_out_total", "成功回传消息数")
                 .expect("register messages_out"),
-            claude_calls: register_int_counter!("imagent_claude_calls_total", "backend.run 调用数")
-                .expect("register claude_calls"),
-            claude_errors: register_int_counter!(
-                "imagent_claude_errors_total",
+            backend_calls: register_int_counter!(
+                "imagent_backend_calls_total",
+                "backend.run 调用数"
+            )
+            .expect("register backend_calls"),
+            backend_errors: register_int_counter!(
+                "imagent_backend_errors_total",
                 "backend.run 失败数"
             )
-            .expect("register claude_errors"),
-            claude_duration: register_histogram!(
-                "imagent_claude_duration_seconds",
+            .expect("register backend_errors"),
+            backend_duration: register_histogram!(
+                "imagent_backend_duration_seconds",
                 "backend.run 耗时（秒）"
             )
-            .expect("register claude_duration"),
+            .expect("register backend_duration"),
         }
     }
 }
@@ -74,19 +77,19 @@ mod tests {
     fn render_contains_registered_metrics() {
         // 触发惰性初始化并产生一次计数。
         METRICS.messages_in.inc();
-        METRICS.claude_calls.inc();
+        METRICS.backend_calls.inc();
         let out = render();
         assert!(
             out.contains("imagent_messages_in_total"),
             "missing messages_in: {out}"
         );
         assert!(
-            out.contains("imagent_claude_calls_total"),
-            "missing claude_calls: {out}"
+            out.contains("imagent_backend_calls_total"),
+            "missing backend_calls: {out}"
         );
         assert!(
-            out.contains("imagent_claude_duration_seconds"),
-            "missing claude_duration: {out}"
+            out.contains("imagent_backend_duration_seconds"),
+            "missing backend_duration: {out}"
         );
     }
 }

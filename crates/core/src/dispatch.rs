@@ -1112,12 +1112,12 @@ impl Dispatcher {
         let outcome = match join.await {
             Ok(Ok(o)) => {
                 let elapsed = run_started.elapsed().as_secs_f64();
-                METRICS.claude_calls.inc();
-                METRICS.claude_duration.observe(elapsed);
+                METRICS.backend_calls.inc();
+                METRICS.backend_duration.observe(elapsed);
                 o
             }
             Ok(Err(e)) => {
-                METRICS.claude_errors.inc();
+                METRICS.backend_errors.inc();
                 let m = format!("[error] {e}");
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "backend.run 失败");
                 self.reply(&conv, &m, &hint).await;
@@ -1127,7 +1127,7 @@ impl Dispatcher {
                 return;
             }
             Err(e) => {
-                METRICS.claude_errors.inc();
+                METRICS.backend_errors.inc();
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "backend task panic");
                 // P2-5：panic 时若已收到 Final chunk，优先回传它（而非丢弃只报 panic）。
                 let m = final_text.unwrap_or_else(|| format!("[error] backend task panicked: {e}"));
