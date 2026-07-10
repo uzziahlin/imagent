@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 imagent-ilink = { path = "../crates/ilink" }
+serde_json = "1"
 
 [[bin]]
 name = "ilink_proto_parse"
