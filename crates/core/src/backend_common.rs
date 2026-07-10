@@ -1,5 +1,5 @@
 //! Backend 共享工具：三 CLI backend（claude/codex/gemini）共用的脚手架与常量，
-//! 消除 `run()` 重复（见 `docs/CODE_REVIEW.md` P1-1）。
+//! 消除 `run()` 重复（见 `docs/internal/CODE_REVIEW.md` P1-1）。
 //!
 //! 设计：三 backend 的 `run()` 收缩为「构造 cmd + 适配闭包（自己的 parse_line →
 //! [`CliEvent`]）+ 调 [`spawn_cli_backend`]」。各 backend 的 `stream::parse_line`
@@ -146,6 +146,7 @@ pub async fn spawn_cli_backend(
                     session_id = s;
                 }
                 final_text = text;
+                reached_terminal = true; // N8：标记由终止事件产出（非中间 Text 后 EOF）
                 break;
             }
             CliEvent::Error { text, session } => {
@@ -181,6 +182,22 @@ pub async fn spawn_cli_backend(
         ));
     }
 
+    // N8：final_text 非空但未由终止事件产出（仅中间 Text 后 stdout EOF）且 exit 非 0 →
+    // agent 非正常终止（如 OOM / segfault）。不静默当成功：warn 标注。仍返回已收到的
+    // 部分文本（IM 场景拿到结果比报错有用；session_id 可能空，由 dispatch 判空不入库）。
+    if !reached_terminal {
+        if let Ok(s) = &status {
+            if !s.success() {
+                tracing::warn!(
+                    target: "imagent::backend",
+                    backend = backend_name,
+                    exit = %s,
+                    "agent 非正常终止（未发 Final/Terminal 事件，exit 非 0），返回已收到的部分文本"
+                );
+            }
+        }
+    }
+
     let _ = chunks.send(AgentChunk::Final(final_text.clone())).await;
     Ok(RunOutcome {
         session_id: SessionId(session_id),
@@ -214,26 +231,45 @@ fn diagnose(
 
 /// 把子进程 stderr 读到字符串（非阻断）。三 CLI backend 共享。
 ///
-/// S-5：累积上限 [`MAX_STDERR_BYTES`]，超限保留前部 + 截断标记，继续 drain
-/// （不 break——否则子进程 stderr 管道写满 ~64KB 会阻塞子进程）。
+/// S-5：双层上限防 OOM——
+/// - 单行上限 [`MAX_STDERR_LINE_BYTES`]（按字节读行，防无 `\n` 的超长流——可被 prompt
+///   injection 构造——单行全量分配撑爆内存）；
+/// - 总量上限 [`MAX_STDERR_BYTES`]（超限截断 + 截断标记）。
+///
+/// 任一超限后继续 drain（不 break），防子进程 stderr 管道写满 ~64KB 阻塞子进程。
 pub async fn read_stderr_to_string(stderr: tokio::process::ChildStderr) -> String {
-    let mut reader = BufReader::new(stderr).lines();
+    let mut reader = BufReader::new(stderr);
     let mut total = 0usize;
     let mut truncated = false;
     let mut buf = Vec::new();
-    while let Ok(Some(line)) = reader.next_line().await {
-        if truncated {
-            continue; // 已超上限：继续 drain 防管道阻塞，但不累积。
+    loop {
+        match read_line_capped(&mut reader, MAX_STDERR_LINE_BYTES).await {
+            Ok(Some(line)) => {
+                if truncated {
+                    continue; // 已超上限：继续 drain 防管道阻塞，但不累积。
+                }
+                total += line.len() + 1;
+                if total > MAX_STDERR_BYTES {
+                    truncated = true;
+                    buf.push(format!(
+                        "…[stderr 截断：超过 {MAX_STDERR_BYTES} 字节上限，丢弃后续]"
+                    ));
+                    continue;
+                }
+                buf.push(line);
+            }
+            Ok(None) => break, // EOF
+            Err(_) => {
+                // 单行超 MAX_STDERR_LINE_BYTES（无 `\n` 超长输出）：read_line_capped 已
+                // consume 到上限点。push 截断标记并继续 drain 该行剩余（不累积），防 OOM。
+                if !truncated {
+                    truncated = true;
+                    buf.push(format!(
+                        "…[stderr 单行超过 {MAX_STDERR_LINE_BYTES} 字节，截断并丢弃后续]"
+                    ));
+                }
+            }
         }
-        total += line.len() + 1;
-        if total > MAX_STDERR_BYTES {
-            truncated = true;
-            buf.push(format!(
-                "…[stderr 截断：超过 {MAX_STDERR_BYTES} 字节上限，丢弃后续]"
-            ));
-            continue;
-        }
-        buf.push(line);
     }
     buf.join("\n")
 }
@@ -244,6 +280,10 @@ const MAX_STDOUT_LINE_BYTES: usize = 8 * 1024 * 1024;
 
 /// stderr 累积字节上限（S-5）：长会话 stderr 膨胀，超限截断。
 const MAX_STDERR_BYTES: usize = 64 * 1024;
+
+/// stderr 单行字节上限（S-5）：防 agent 向 stderr 写无 `\n` 的超长流（可被 prompt
+/// injection 构造）导致单行全量分配 OOM。与 stdout 的 [`MAX_STDOUT_LINE_BYTES`] 对称。
+const MAX_STDERR_LINE_BYTES: usize = 1024 * 1024;
 
 /// 按字节读一行，上限 `max_bytes`（S-5）。超限返回 Err（调用方跳过该行）。
 /// 覆盖 `AsyncBufReadExt::lines()` 无上限的语义（一行无 `\n` 的超长输出会全量分配）。

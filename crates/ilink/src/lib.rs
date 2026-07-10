@@ -17,9 +17,9 @@
 mod client;
 mod dedup;
 mod login;
-mod media;
+pub mod media; // pub：fuzz target / 测试访问 SSRF 校验与 AES（协议数据结构，暴露无封装损失）
 mod platform;
-mod proto;
+pub mod proto; // pub：fuzz target / 测试访问响应反序列化与文本提取
 mod ratelimit;
 
 pub use client::ILinkClient;

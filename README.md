@@ -142,7 +142,7 @@ imagent start            # 前台常驻，Ctrl-C 退出
 | P2 | ✅ | 限流熔断 / 动态白名单 / 多命名会话 / 软 compact / 推流 / typing / **权限审批** / 媒体 |
 | P3 | ✅ | 开源化（MIT license/CI/凭据加密/mdBook）+ WeCom + ACP + 多 agent（Codex/Gemini）+ 运维（指标/热重载/daemon）+ 长消息分片 |
 
-> **当前状态**：功能完整，但仍在收尾安全审查修复（见 [`CHANGELOG`](CHANGELOG.md) `[Unreleased]` 与 [`CODE_REVIEW_v3`](docs/CODE_REVIEW_v3.md) / [`v4`](docs/CODE_REVIEW_v4.md)），故版本徽章为 pre-release。功能层面 P0–P3 均已交付。
+> **当前状态**：功能完整，但仍在收尾安全审查修复（见 [`CHANGELOG`](CHANGELOG.md) `[Unreleased]` 与 [`CODE_REVIEW_v4`](docs/CODE_REVIEW_v4.md) / [`v5`](docs/CODE_REVIEW_v5.md)），故版本徽章为 pre-release。功能层面 P0–P3 均已交付。
 
 详见 [`docs/`](docs/)（[DESIGN](docs/DESIGN.md) / [RESEARCH](docs/RESEARCH.md) / [P2_COMPLETE](docs/P2_COMPLETE.md) / [CODE_REVIEW_v4](docs/CODE_REVIEW_v4.md)）。
 

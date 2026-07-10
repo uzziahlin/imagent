@@ -16,7 +16,7 @@ pub(crate) const DEFAULT_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
 ///
 /// 登录前的请求（取二维码/轮询状态）无 `bot_token`，由 `login.rs` 自带
 /// 未鉴权 POST 处理，不经过本结构。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ILinkClient {
     http: reqwest::Client,
     base_url: String,
@@ -25,6 +25,17 @@ pub struct ILinkClient {
     ilink_bot_id: String,
     #[allow(dead_code)]
     ilink_user_id: String,
+}
+
+// 🟡 Debug redacting：bot_token 是凭据，避免 `debug!(?client)` / `{:?}` 打印时落日志。
+impl std::fmt::Debug for ILinkClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ILinkClient")
+            .field("base_url", &self.base_url)
+            .field("bot_token", &"<redacted>")
+            .field("ilink_bot_id", &self.ilink_bot_id)
+            .finish()
+    }
 }
 
 impl ILinkClient {

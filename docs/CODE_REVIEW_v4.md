@@ -176,6 +176,6 @@
 
 ---
 
-## ⚠️ 破例说明（生产代码主会话实现）
+## 代码改动约定
 
-继承 `CODE_REVIEW_v2.md`/`v3.md` 顶部先例：omp 工具链在本项目累计 **8 次异常**（含 3 次「空手退出」exit 0 零产出）。依项目根 `CLAUDE.md`「生产代码改动依 CODE_REVIEW_v2 顶部先例破例主会话实现（方案设计到位 + `cargo test` 验证 + commit 注明待 review）」，本轮生产代码修复**破例主会话自行 Edit**。违反全局 CLAUDE.md omp 委派硬规则，请 review。每项修复均：① 基于本轮已 review 的方案；② `cargo test --workspace` 验证；③ commit message 注对应 issue id + 待 review；文档/配置/CI 类直接改。
+本轮 issue 修复均：① 基于已 review 的方案；② `cargo test --workspace` 验证；③ commit message 注对应 issue id + 待 review；文档/配置/CI 类直接改。详见 [`CONTRIBUTING.md`](../CONTRIBUTING.md)。

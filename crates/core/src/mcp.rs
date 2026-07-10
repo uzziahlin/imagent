@@ -161,6 +161,7 @@ pub async fn ask_via_socket(
     conv_id: &str,
     tool_name: &str,
     input: &Value,
+    ask_timeout: std::time::Duration,
 ) -> io::Result<PermissionReply> {
     let mut stream = UnixStream::connect(sock).await?;
     let req = json!({
@@ -174,18 +175,18 @@ pub async fn ask_via_socket(
 
     let mut reader = BufReader::new(&mut stream);
     let mut buf = String::new();
-    // P1-6：read_line 加超时——主进程异常（dispatcher task 被 cancel/panic 但未写回
-    // socket）时，mcp 子进程不会在 socket 上永久挂死变僵尸。1200s 覆盖默认
-    // agent_timeout（600s）；超时返 Err（上层 Ask 兜底 deny）。
-    const MCP_ASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1200);
-    match tokio::time::timeout(MCP_ASK_TIMEOUT, reader.read_line(&mut buf)).await {
+    // P1-6/S-3：read_line 加超时——主进程异常（dispatcher task 被 cancel/panic 但未写回
+    // socket）时，mcp 子进程不会在 socket 上永久挂死变僵尸。ask_timeout 由主进程经
+    // --ask-timeout 传入（= config.permission_ask_timeout_secs），与 dispatcher 的审批
+    // 等待预算对齐——防 MCP 先于 dispatcher 超时返 deny 使 Ask 闭环静默失效。
+    match tokio::time::timeout(ask_timeout, reader.read_line(&mut buf)).await {
         Ok(res) => {
             res?;
         }
         Err(_) => {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "permission reply timed out (>1200s)",
+                format!("permission reply timed out (>{ask_timeout:?})"),
             ));
         }
     }
@@ -200,7 +201,12 @@ pub async fn ask_via_socket(
 }
 
 /// MCP server 主循环（stdio）。读 stdin 一行 JSON、写 stdout 一行 JSON。
-pub async fn run_mcp_server(conv_id: String, sock: String, mode: PermissionMode) -> io::Result<()> {
+pub async fn run_mcp_server(
+    conv_id: String,
+    sock: String,
+    mode: PermissionMode,
+    ask_timeout: std::time::Duration,
+) -> io::Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -228,7 +234,8 @@ pub async fn run_mcp_server(conv_id: String, sock: String, mode: PermissionMode)
         let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
         let resp = if method == "tools/call" && matches!(mode, PermissionMode::Ask) {
             let (tool_name, input) = extract_call_args(&req);
-            let reply = match ask_via_socket(&sock, &conv_id, &tool_name, &input).await {
+            let reply = match ask_via_socket(&sock, &conv_id, &tool_name, &input, ask_timeout).await
+            {
                 Ok(r) => r,
                 Err(e) => PermissionReply {
                     allow: false,

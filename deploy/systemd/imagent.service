@@ -16,9 +16,12 @@ ExecStart=/usr/local/bin/imagent start
 # Environment=IMAGENT_CONFIG=/home/imagent/.imagent/config.toml
 Restart=on-failure
 RestartSec=5
-# 安全加固（建议放开；agent workdir 也需加入 ReadWritePaths）：
+# 安全加固（建议放开）：
 NoNewPrivileges=true
 ProtectSystem=strict
+# ⚠️ 必须把 config.toml 的 default_workdir 也加进 ReadWritePaths，否则 ProtectSystem=strict
+#    会让 agent 写 workdir 被静默拒绝（首装必踩）。例如 default_workdir=/srv/agent-ws：
+# ReadWritePaths=%h/.imagent /srv/agent-ws
 ReadWritePaths=%h/.imagent
 
 [Install]

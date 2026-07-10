@@ -20,4 +20,5 @@
 # cargo-fuzz（E-7）
 fuzz/*/corpus/
 fuzz/*/artifacts/
-fuzz/coverage/
+fuzz/*/coverage/
+fuzz/target/

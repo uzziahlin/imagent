@@ -11,13 +11,13 @@
 
 开始写代码前，**必须先读**：
 1. **`docs/DESIGN.md`** —— 详细架构设计，实现的主要依据（crate 结构、trait 签名、session 机制、iLink 协议要点、安全设计、P0–P3 路线）。
-2. **`docs/CODE_REVIEW_v2.md`** —— 深度审查清单 + 修复进度。改代码前先看这里，避免重复已知问题；每条 issue 带 `file:line` + 失败场景 + 修复方向。
+2. **`docs/CODE_REVIEW_v5.md`** —— 最新深度审查清单 + 修复进度。改代码前先看这里，避免重复已知问题；每条 issue 带 `file:line` + 失败场景 + 修复方向（历史 v1–v4 归档在 `docs/internal/`）。
 3. **`docs/RESEARCH.md`** —— 调研结论归档（iLink 协议/合规、Claude CLI/ACP 接口、竞品 feiyun 对照、命名撞名）。
 4. 长期决策与教训在 **engram 记忆库**，`project_id = "imagent"`（不是 "engram"）：`search_memory` / `architectural_decisions` / `recent_failures`。
 
-当前进度：**P0 全修 + P1 基本完成**（凭据保护链 fail-closed、安全姿态、ilink 媒体收敛、WeCom 去重、dispatch 状态机收敛等，详见 CODE_REVIEW_v2「修复进度」段）。剩余：P1-E（ACP 取消，方案已设计 defer）、P2 打磨、开源工程化（E-3~E-7）、文档对齐（D-2~D-4）。
+当前进度：**P3 完成**（双平台 ilink/wecom、四后端 claude-cli/claude-acp/codex/gemini、IM 权限审批闭环、凭据 OS keyring 加密、Prometheus 指标、SIGHUP 热重载、长消息分片）。开源前安全审查见 `docs/CODE_REVIEW_v4.md` / `v5.md`（v1/v2/v3 历史 review 归档在 `docs/internal/`）。
 
-⚠️ **omp 工具链在本项目反复故障**（累计 8 次异常，含 3 次「空手退出」exit 0 零产出）——生产代码改动依 `CODE_REVIEW_v2` 顶部先例**破例主会话实现**（方案设计到位 + `cargo test` 验证 + commit 注明待 review）。任务说明再详尽也救不了 omp v16.x 的故障，不要再浪费时间委派。
+代码改动约定：`.rs` 生产代码需方案设计到位 + `cargo test --workspace` 验证 + commit 注明待 review（详见 `CONTRIBUTING.md`）。
 
 ## 核心定位
 
@@ -39,7 +39,7 @@ trait Platform                        trait Backend
 ## 开发约定
 
 - **Rust**：edition 2021，workspace 多 crate，`?` + `thiserror`/`anyhow` 错误处理，`tracing` 日志，`tokio` 异步。
-- **生产代码委派 omp**：继承全局规则——编写/修改 `.rs` 业务代码用 `omp-coder` subagent；纯配置/文档/脚手架可直接改。
+- **代码改动约定**：`.rs` 生产代码需方案设计 + `cargo test` 验证（详见 [CONTRIBUTING.md](CONTRIBUTING.md)）；纯配置/文档/脚手架可直接改。
 - **安全是硬约束，不是可选**（详见 DESIGN.md「安全设计」）：
   - IM 入口**必须**做发送者白名单鉴权（iLink bot 任何人都能加好友）。
   - Claude 后端 `--allowedTools` 严格收敛（起步只 `Read,Edit`）、workdir 锁定。
