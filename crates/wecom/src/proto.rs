@@ -13,10 +13,20 @@ use serde::{Deserialize, Serialize};
 ///
 /// - `bot_id`：智能机器人 ID（控制台分配）。
 /// - `secret`：智能机器人 secret（控制台分配）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Credentials {
     pub bot_id: String,
     pub secret: String,
+}
+
+/// 🟡 Debug redacting：secret 是凭据，避免 `{:?}` 落日志。
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("bot_id", &self.bot_id)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
 }
 
 /// 帧头。服务端帧头至少含 `req_id`，其余键按 serde 默认忽略未知。

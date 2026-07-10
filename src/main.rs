@@ -64,6 +64,9 @@ enum Cmd {
         /// 权限模式 off | allow | deny | ask。
         #[arg(long, default_value = "off")]
         mode: String,
+        /// S-3：socket 读超时（秒，= config.permission_ask_timeout_secs），与 dispatcher 审批预算对齐。
+        #[arg(long, default_value_t = 300)]
+        ask_timeout: u64,
     },
 }
 
@@ -144,7 +147,11 @@ async fn main() -> Result<()> {
 
             // 6. backend —— permission_mode 用共享句柄，SIGHUP 热重载即时生效。
             let perm_mode = std::sync::Arc::new(parking_lot::RwLock::new(config.permission_mode));
-            let backend = build_backend(&config.agent, perm_mode.clone());
+            let backend = build_backend(
+                &config.agent,
+                perm_mode.clone(),
+                std::time::Duration::from_secs(config.permission_ask_timeout_secs),
+            );
 
             // codex/gemini 后端不支持 IM 权限审批闭环：若用户开启了 permission_mode，
             // 显式 warn（不静默忽略），避免预期落差。
@@ -316,15 +323,24 @@ async fn main() -> Result<()> {
             conv_id,
             sock,
             mode,
+            ask_timeout,
         } => {
             // 作为 claude 的 MCP 权限审批 server（stdio JSON-RPC）。
             let mode = imagent_core::PermissionMode::from_str_lossy(&mode);
             tracing::info!(
                 target: "imagent::mcp",
                 conv_id = %conv_id, sock = %sock, mode = mode.as_str(),
+                ask_timeout_secs = ask_timeout,
                 "MCP permission server starting"
             );
-            if let Err(e) = imagent_core::mcp::run_mcp_server(conv_id, sock, mode).await {
+            if let Err(e) = imagent_core::mcp::run_mcp_server(
+                conv_id,
+                sock,
+                mode,
+                std::time::Duration::from_secs(ask_timeout),
+            )
+            .await
+            {
                 tracing::error!(target: "imagent::mcp", error = %e, "MCP server 退出");
             }
         }
@@ -348,6 +364,7 @@ async fn main() -> Result<()> {
 fn build_backend(
     agent: &str,
     perm_mode: Arc<parking_lot::RwLock<imagent_core::PermissionMode>>,
+    ask_timeout: std::time::Duration,
 ) -> Arc<dyn imagent_core::Backend> {
     match agent {
         "codex" => Arc::new(imagent_codex::CodexBackend::new()),
@@ -357,6 +374,7 @@ fn build_backend(
         )),
         _ => Arc::new(imagent_claude::ClaudeBackend::with_permission_mode_shared(
             perm_mode,
+            ask_timeout,
         )),
     }
 }

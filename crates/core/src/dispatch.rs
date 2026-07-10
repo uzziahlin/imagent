@@ -1168,31 +1168,41 @@ impl Dispatcher {
             .await
             .unwrap_or(None)
             .filter(|s| !s.is_empty());
-        let row = SessionRow {
-            conv_id: conv.0.clone(),
-            session_id: outcome.session_id.0.clone(),
-            agent_kind: self.backend.name().to_string(),
-            workdir: self.default_workdir.to_string_lossy().to_string(),
-            name: active_name.clone(),
-            created_at: now,
-            updated_at: now,
-        };
-        if let Err(e) = self.store.upsert_session(&row).await {
-            warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "upsert_session 失败");
-        }
-        // 有命名时，同步写命名侧表（可恢复/历史）。
-        if let Some(name) = &active_name {
-            let nrow = NamedSessionRow {
+        // N8 配套：非正常终止（崩溃等）时 session_id 可能空——agent 未及分配。空 session_id
+        // 无法 --resume，不入库（保留既有有效映射，避免写入无效值导致下次续接失败）。
+        if outcome.session_id.0.is_empty() {
+            warn!(
+                target: "imagent::core",
+                conv_id = %conv.0,
+                "backend 返回空 session_id（疑似非正常终止），不更新 session 映射"
+            );
+        } else {
+            let row = SessionRow {
                 conv_id: conv.0.clone(),
-                name: name.clone(),
                 session_id: outcome.session_id.0.clone(),
-                agent_kind: Some(self.backend.name().to_string()),
-                workdir: Some(self.default_workdir.to_string_lossy().to_string()),
+                agent_kind: self.backend.name().to_string(),
+                workdir: self.default_workdir.to_string_lossy().to_string(),
+                name: active_name.clone(),
                 created_at: now,
                 updated_at: now,
             };
-            if let Err(e) = self.store.upsert_named_session(&nrow).await {
-                warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "upsert_named_session 失败");
+            if let Err(e) = self.store.upsert_session(&row).await {
+                warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "upsert_session 失败");
+            }
+            // 有命名时，同步写命名侧表（可恢复/历史）。
+            if let Some(name) = &active_name {
+                let nrow = NamedSessionRow {
+                    conv_id: conv.0.clone(),
+                    name: name.clone(),
+                    session_id: outcome.session_id.0.clone(),
+                    agent_kind: Some(self.backend.name().to_string()),
+                    workdir: Some(self.default_workdir.to_string_lossy().to_string()),
+                    created_at: now,
+                    updated_at: now,
+                };
+                if let Err(e) = self.store.upsert_named_session(&nrow).await {
+                    warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "upsert_named_session 失败");
+                }
             }
         }
 

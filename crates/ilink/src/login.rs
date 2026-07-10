@@ -20,12 +20,24 @@ use crate::client::DEFAULT_BASE_URL;
 use crate::proto::{QrcodeResp, QrcodeStatus};
 
 /// 登录所得凭据（落盘 `credentials.blob`）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Credentials {
     pub bot_token: String,
     pub ilink_bot_id: String,
     pub ilink_user_id: String,
     pub baseurl: String,
+}
+
+/// 🟡 Debug redacting：bot_token 是凭据（落盘 credentials.blob），避免 `{:?}` 落日志。
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("bot_token", &"<redacted>")
+            .field("ilink_bot_id", &self.ilink_bot_id)
+            .field("ilink_user_id", &self.ilink_user_id)
+            .field("baseurl", &self.baseurl)
+            .finish()
+    }
 }
 
 /// 用默认 base URL（`https://ilinkai.weixin.qq.com`）执行扫码登录。

@@ -19,26 +19,36 @@ use crate::stream::{parse_line, ParsedEvent};
 /// （imagent mcp 子命令）。
 pub struct ClaudeBackend {
     permission_mode: Arc<RwLock<PermissionMode>>,
+    /// S-3：MCP server（imagent mcp）socket 读超时，与 dispatcher 的 permission_ask_timeout
+    /// 对齐——防 MCP 子进程在用户慢回复时先于 dispatcher 超时返 deny，使 Ask 闭环静默失效。
+    ask_timeout: std::time::Duration,
 }
 
 impl ClaudeBackend {
     pub fn new() -> Self {
         Self {
             permission_mode: Arc::new(RwLock::new(PermissionMode::Off)),
+            ask_timeout: std::time::Duration::from_secs(300),
         }
     }
 
     pub fn with_permission_mode(mode: PermissionMode) -> Self {
         Self {
             permission_mode: Arc::new(RwLock::new(mode)),
+            ask_timeout: std::time::Duration::from_secs(300),
         }
     }
 
     /// 用外部共享句柄构造——与 `Dispatcher` 共享同一 `Arc<RwLock<PermissionMode>>`，
-    /// 使 SIGHUP 热重载对 backend 即时生效（每次 `run` 取最新值）。
-    pub fn with_permission_mode_shared(mode: Arc<RwLock<PermissionMode>>) -> Self {
+    /// 使 SIGHUP 热重载对 backend 即时生效（每次 `run` 取最新值）。`ask_timeout` 为
+    /// MCP server 的 socket 读超时（S-3，= config.permission_ask_timeout_secs）。
+    pub fn with_permission_mode_shared(
+        mode: Arc<RwLock<PermissionMode>>,
+        ask_timeout: std::time::Duration,
+    ) -> Self {
         Self {
             permission_mode: mode,
+            ask_timeout,
         }
     }
 }
@@ -84,13 +94,20 @@ async fn write_mcp_config(
     conv_id: &str,
     sock: &str,
     mode: PermissionMode,
+    ask_timeout_secs: u64,
 ) -> std::io::Result<std::path::PathBuf> {
     let exe = std::env::current_exe()?;
     let cfg = serde_json::json!({
         "mcpServers": {
             "imagent": {
                 "command": exe.to_string_lossy(),
-                "args": ["mcp", "--conv-id", conv_id, "--sock", sock, "--mode", mode.as_str()]
+                // S-3：--ask-timeout 把 permission_ask_timeout 传给 MCP server 子进程，
+                // 与 dispatcher 审批等待预算对齐（防 MCP 先超时返 deny）。
+                "args": [
+                    "mcp", "--conv-id", conv_id, "--sock", sock,
+                    "--mode", mode.as_str(),
+                    "--ask-timeout", ask_timeout_secs.to_string(),
+                ]
             }
         }
     });
@@ -99,20 +116,27 @@ async fn write_mcp_config(
         .unwrap_or_else(std::env::temp_dir);
     tokio::fs::create_dir_all(&dir).await?;
     let path = dir.join(format!("mcp_{}.json", sanitize_filename(conv_id)));
-    // S-6：若目标已存在且是 symlink，拒绝覆写（防 ~/.imagent 被植入 symlink 指向
-    // 受害者文件如 ~/.ssh/authorized_keys，导致下次写 mcp 配置时覆写目标）。
-    if let Ok(meta) = tokio::fs::symlink_metadata(&path).await {
-        if meta.file_type().is_symlink() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "mcp config 路径是 symlink，拒绝覆写（防 symlink 攻击）: {}",
-                    path.display()
-                ),
-            ));
-        }
+    // S-6：temp + rename 原子替换（替代 check-then-write 的 TOCTOU 竞窗）。临时文件用
+    // create_new（O_CREAT|O_EXCL）原子创建——对已存在 symlink 返回 EEXIST，不跟随；
+    // rename 不跟随目标 symlink（替换目录项本身）。防 ~/.imagent 被植入 symlink 指向
+    // 受害者文件（如 ~/.ssh/authorized_keys）导致覆写。
+    let tmp = dir.join(format!(
+        ".mcp_{}.{}.tmp",
+        sanitize_filename(conv_id),
+        std::process::id()
+    ));
+    let _ = tokio::fs::remove_file(&tmp).await; // 清理上次异常残留的 tmp
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut f = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .await?;
+        f.write_all(cfg.to_string().as_bytes()).await?;
+        f.flush().await?;
     }
-    tokio::fs::write(&path, cfg.to_string()).await?;
+    tokio::fs::rename(&tmp, &path).await?;
     Ok(path)
 }
 
@@ -152,7 +176,7 @@ impl Backend for ClaudeBackend {
         let mode = *self.permission_mode.read();
         let mcp_json: Option<std::path::PathBuf> = if mode.is_enabled() {
             let sock = permission_sock_path();
-            match write_mcp_config(conv_id, &sock, mode).await {
+            match write_mcp_config(conv_id, &sock, mode, self.ask_timeout.as_secs()).await {
                 Ok(p) => {
                     cmd.arg("--mcp-config").arg(&p);
                     cmd.arg("--permission-prompt-tool")
