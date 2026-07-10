@@ -22,13 +22,13 @@ cp target/release/imagent /usr/local/bin/
 cp deploy/launchd/com.imagent.plist ~/Library/LaunchAgents/
 # 编辑 plist：ProgramArguments 路径、日志路径
 launchctl load ~/Library/LaunchAgents/com.imagent.plist
-tail -f /tmp/imagent.log
+tail -f /usr/local/var/log/imagent.log
 # 卸载：launchctl unload ~/Library/LaunchAgents/com.imagent.plist
 ```
 
 ## 指标（Prometheus）
 
-`config.toml` 默认 `metrics_addr = "127.0.0.1:9100"`（设 `null` 关闭）。
+`config.toml` 默认**不开启** metrics（`metrics_addr` 留空 / 不设）；设为 `"127.0.0.1:9100"` 即开启。
 
 ```bash
 curl http://127.0.0.1:9100/metrics     # prometheus 文本格式
