@@ -96,7 +96,7 @@ impl WeComWsClient {
                 ),
             ));
         }
-        info!(target: "wecom", url = %self.ws_url, "ws 连接中");
+        info!(target: "wecom", host = %parsed.host_str().unwrap_or("?"), "ws 连接中");
         let (ws_stream, _resp) = connect_async(&self.ws_url)
             .await
             .map_err(|e| imagent_core::CoreError::Platform("wecom", format!("ws connect: {e}")))?;
