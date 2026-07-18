@@ -216,6 +216,13 @@ async fn main() -> Result<()> {
             match metrics_addr {
                 Some(addr) => match addr.parse::<SocketAddr>() {
                     Ok(socket) => {
+                        if !socket.ip().is_loopback() {
+                            tracing::warn!(
+                                target: "imagent::ops",
+                                addr = %socket,
+                                "metrics_addr 绑定非 loopback 地址：/metrics 与 /health 无鉴权，公网可访问（仅暴露消息计数/会话数等运营指标，不含凭据）。生产环境建议绑 127.0.0.1 或置于反向代理后"
+                            );
+                        }
                         spawn_metrics_server(socket, http_store.clone(), start_at);
                         tracing::info!(target: "imagent::ops", addr = %socket, "metrics/health HTTP server listening");
                     }
