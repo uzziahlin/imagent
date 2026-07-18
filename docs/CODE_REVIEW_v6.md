@@ -22,24 +22,26 @@ v1–v4 的核心病灶是「工程诚信」（谎报/半修），v5 已治愈�
 | ID | 级别 | 标题 | 位置 | 负责人 | 状态 |
 |---|---|---|---|---|---|
 | **O1** | 🔴 阻塞 | 无 git remote + 无 tag（发布渠道不存在） | `git remote -v` 空 / `tag=0` | 仓库 owner | ⬜ |
-| **R1** | 🟠 上线前 | `RunOutcome` 缺状态字段——N8 崩溃语义无法传到 IM | `backend_common.rs` / `types.rs` / `dispatch.rs` | omp | ⬜ |
-| **R2** | 🟠 上线前 | metrics / health endpoint 无鉴权 + 无绑定校验 | `main.rs:216` | omp | ⬜ |
-| **R3** | 🟠 上线前 | `wecom_secret` 明文存 config.toml（SECURITY 未列） | `config.rs:99` / `SECURITY.md` | 文档我改 / keyring omp | 🟡 |
-| **P1** | 🟡 打磨 | ilink 游标 at-most-once（crash 丢消息） | `ilink/platform.rs:107,117` | omp | ⬜ |
-| **P2** | 🟡 打磨 | `WsFrame` subscribe body 未 redact（Debug footgun） | `wecom/proto.rs:33` | omp | ⬜ |
-| **P3** | 🟡 打磨 | wecom `ws_url` 整串进 INFO 日志 | `wecom/client.rs:99` | omp | ⬜ |
-| **P4** | 🟡 打磨 | ilink `post_json` 响应体无大小上限 | `ilink/client.rs:81` | omp | ⬜ |
-| **P5** | 🟡 打磨 | WeCom 出站 markdown 未转义 | `wecom/proto.rs:134` | omp | ⬜ |
-| **P6** | 🟡 打磨 | mcp `stdin.lock().lines()` 在 async fn 同步阻塞 | `mcp.rs:213` | omp | ⬜ |
-| **P7** | 🟡 打磨 | `IMAGENT_ACP_COMMAND` env 可换 spawn 命令无白名单 | `acp.rs:91` | omp | ⬜ |
-| **D1** | 🔵 文档 | README 写死 "241 passed"（会漂移） | `README.md:152` | 我 | ⬜ |
-| **D2** | 🔵 文档 | workspace `Cargo.toml` 顶部注释过时（P1 残留） | `Cargo.toml:1-10` | 我 | ⬜ |
-| **D3** | 🔵 文档 | `docs/P2_COMPLETE.md` 漏移（仍在根 + 进 SUMMARY） | `docs/` / `SUMMARY.md` | 我 | ⬜ |
-| **D4** | 🔵 文档 | macOS `imagent` 撞名警告仅在 deploy/README | `README.md` | 我 | ⬜ |
-| **D5** | 🔵 文档 | SECURITY.md 未标注 ACP `allowed_tools` 无效 / Off 全放行 | `SECURITY.md` | 我 | ⬜ |
+| **R1** | 🟠 上线前 | `RunOutcome` 缺状态字段——N8 崩溃语义无法传到 IM | `backend_common.rs` / `types.rs` / `dispatch.rs` | omp | ✅ |
+| **R2** | 🟠 上线前 | metrics / health endpoint 无鉴权 + 无绑定校验 | `main.rs` | omp | ✅ |
+| **R3** | 🟠 上线前 | `wecom_secret` 明文存 config.toml（SECURITY 未列） | `config.rs` / `SECURITY.md` | 文档 ✅ / keyring 后续 | 🟡 |
+| **P1** | 🟡 打磨 | ilink 游标 at-most-once（crash 丢消息） | `ilink/platform.rs` | omp | ✅ |
+| **P2** | 🟡 打磨 | `WsFrame` subscribe body 未 redact（Debug footgun） | `wecom/proto.rs` | omp | ✅ |
+| **P3** | 🟡 打磨 | wecom `ws_url` 整串进 INFO 日志 | `wecom/client.rs` | omp | ✅ |
+| **P4** | 🟡 打磨 | ilink `post_json` 响应体无大小上限 | `ilink/client.rs` | omp | ✅ |
+| **P5** | 🟡 打磨 | WeCom 出站 markdown 未转义 | `wecom/proto.rs` | 文档化 | 🟡 |
+| **P6** | 🟡 打磨 | mcp `stdin.lock().lines()` 在 async fn 同步阻塞 | `mcp.rs` | omp | ✅ |
+| **P7** | 🟡 打磨 | `IMAGENT_ACP_COMMAND` env 可换 spawn 命令无白名单 | `acp.rs` | 文档化 | 🟡 |
+| **D1** | 🔵 文档 | README 写死 "241 passed"（会漂移） | `README.md` | 我 | ✅ |
+| **D2** | 🔵 文档 | workspace `Cargo.toml` 顶部注释过时（P1 残留） | `Cargo.toml` | 我 | ✅ |
+| **D3** | 🔵 文档 | `docs/P2_COMPLETE.md` 漏移（仍在根 + 进 SUMMARY） | `docs/` / `SUMMARY.md` | 我 | ✅ |
+| **D4** | 🔵 文档 | macOS `imagent` 撞名警告仅在 deploy/README | `README.md` | 我 | ✅ |
+| **D5** | 🔵 文档 | SECURITY.md 未标注 ACP `allowed_tools` 无效 / Off 全放行 | `SECURITY.md` | 我 | ✅ |
 | **A1** | 🏛 架构 | session 状态散三表无事务（v4-R4） | `store.rs` / `dispatch.rs` | 后续 | ⬜ |
 | **A2** | 🏛 架构 | 后端安全语义统一（CLI/ACP/Off 分裂） | `backend.rs` trait | 后续 | ⬜ |
 | **A3** | 🏛 架构 | `ReplyHint::ILink` 泄漏 core 类型 | `types.rs` | 后续 | ⬜ |
+
+**✅ 落地核实（2026-07-18，分支 `fix/code-review-v6`）**：R1/R2/P1/P2/P3/P4/P6 经 omp 实现 + 主会话逐行 Review + `cargo test --workspace`（**242 passed**）/ `clippy` 0 warning / `fmt` clean 验证，按功能域分 5 个提交（`150b2f7` R1 / `a7200c9` R2 / `e494337` ilink P1+P4 / `313c548` wecom P2+P3 / `dbff92d` core P6）；D1-D5 + R3-文档随 `0d5b935`。P5/P7 评估后**文档化**（不强制转义/白名单——见对应小节）。**仅 O1（git remote + tag）待仓库 owner 操作**；架构建议 A1-A3 留 v1.1+。
 
 **分工**（按全局约定）：`.md` 文档 + 配置由主会话直接改；`.rs` 生产代码委派 omp 实现，主会话负责方案、Review、`cargo test` 验证。
 
