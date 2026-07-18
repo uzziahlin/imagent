@@ -202,6 +202,7 @@ pub async fn spawn_cli_backend(
     Ok(RunOutcome {
         session_id: SessionId(session_id),
         final_text,
+        terminal: reached_terminal,
     })
 }
 

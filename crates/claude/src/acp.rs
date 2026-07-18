@@ -246,6 +246,7 @@ impl LongLivedAcp {
                                     let _ = req.resp.send(Ok(RunOutcome {
                                         session_id: SessionId(sid),
                                         final_text,
+                                        terminal: true,
                                     }));
                                 }
                                 Err(e) => {
