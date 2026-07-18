@@ -27,4 +27,6 @@
 ## 已知限制
 
 - `bot_token` 优先经 **OS keyring 加密落盘**（store `credentials` 表只存 `keyring:<platform>:<account>` 指针 marker）；无 keychain 环境（headless/CI）或 keyring 写入失败时回退明文存 SQLite。旧库中的明文凭据会在读取时懒迁移到 keyring（见 `crates/store/src/credentials.rs`）。
+- **`wecom_secret` 明文存 config.toml**（与 iLink `bot_token` 走 OS keyring 不一致）：务必把 config.toml 收紧到 `0600`。完整 keyring 保护（含 bootstrap 命令）见 `docs/CODE_REVIEW_v6.md` R3。
+- **ACP 后端（`agent = "claude-acp"`）`allowed_tools` 不生效**：ACP 协议无 `--allowedTools` 等价机制，工具收敛只能靠 `permission_mode = ask/deny` 兜底；且 `Off` 在 ACP = **全放行**（与 CLI 的 `Off` = 不挂审批不同）。如需 `--allowedTools` 收敛 + 完整 IM 审批闭环，请用 `claude-cli` 后端。
 - iLink 是腾讯对外协议的第三方 Rust 实现，使用者自负合规责任（见 README 免责声明 + RESEARCH §2）。
