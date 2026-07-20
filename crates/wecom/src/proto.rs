@@ -40,7 +40,7 @@ pub struct WsHeaders {
 /// 收帧时 `body` 用 [`serde_json::Value`] 保留原始 JSON，由调用方按 `cmd`
 /// 再解析（`aibot_msg_callback` 的 body 形如 [`BaseMessage`]）。所有可选字段
 /// 序列化时省略 `None`，与服务端协议一致。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct WsFrame {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cmd: Option<String>,
@@ -51,6 +51,20 @@ pub struct WsFrame {
     pub errcode: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub errmsg: Option<String>,
+}
+
+/// 🟡 Debug redacting：body 可能含 subscribe 的 secret（见 build_subscribe_frame），
+/// 避免 `debug!(?frame)` / `{:?}` 把 secret 落日志，统一 redact body。
+impl std::fmt::Debug for WsFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsFrame")
+            .field("cmd", &self.cmd)
+            .field("headers", &self.headers)
+            .field("body", &"<redacted>")
+            .field("errcode", &self.errcode)
+            .field("errmsg", &self.errmsg)
+            .finish()
+    }
 }
 
 /// `aibot_msg_callback` 的 body（最小定义，未知字段忽略）。

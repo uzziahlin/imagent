@@ -87,7 +87,9 @@ impl ILinkPlatform {
             .to_string()
     }
 
-    /// 长轮询取消息：读游标 → POST → 更新游标 → 去重 + 更新 peer token → 收集。
+    /// 长轮询取消息：读游标 → POST → 处理消息（去重 + 更新 peer token + 媒体）
+    /// → 前进游标。游标在消息全部处理完后才更新：处理中 crash → 游标未动 →
+    /// 下次重拉同批，重复消息由 dedup 吸收（at-least-once，优于丢消息）。
     async fn fetch_updates(&self) -> Result<Vec<InboundMessage>> {
         let buf = self
             .store
@@ -100,6 +102,13 @@ impl ILinkPlatform {
             .post_json("/ilink/bot/getupdates", &body)
             .await?;
 
+        // 先处理所有消息（含媒体下载），再前进游标：crash 在处理中 → 游标未动 →
+        // 下次重拉同批，重复消息由 dedup 吸收（at-least-once，优于丢消息）。
+        let mut out = Vec::with_capacity(resp.msgs.len());
+        for msg in &resp.msgs {
+            self.process_msg(msg, &mut out).await;
+        }
+
         if let Some(new_buf) = resp.get_updates_buf.as_deref() {
             if !new_buf.is_empty() {
                 if let Err(e) = self
@@ -110,11 +119,6 @@ impl ILinkPlatform {
                     warn!(target: "ilink", error = %e, "set_sync_buf 失败（best-effort）");
                 }
             }
-        }
-
-        let mut out = Vec::with_capacity(resp.msgs.len());
-        for msg in &resp.msgs {
-            self.process_msg(msg, &mut out).await;
         }
         Ok(out)
     }

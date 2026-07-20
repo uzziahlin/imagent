@@ -11,6 +11,8 @@ use serde::de::DeserializeOwned;
 use imagent_core::{CoreError, Result};
 
 pub(crate) const DEFAULT_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
+/// post_json 响应体字节上限（防异常/恶意超大响应 OOM）。iLink 响应均为小 JSON，16 MiB 足够余量。
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// 鉴权后的运行时 HTTP 客户端（收/发消息用）。
 ///
@@ -106,8 +108,32 @@ impl ILinkClient {
             ));
         }
 
-        resp.json::<T>()
-            .await
+        if let Some(len) = resp
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            if len > MAX_RESPONSE_BYTES {
+                return Err(CoreError::Platform(
+                    "ilink",
+                    format!("POST {endpoint}: 响应过大 ({len} bytes > {MAX_RESPONSE_BYTES} 上限)"),
+                ));
+            }
+        }
+        let bytes = resp.bytes().await.map_err(|e| {
+            CoreError::Platform("ilink", format!("POST {endpoint}: read body: {e}"))
+        })?;
+        if bytes.len() > MAX_RESPONSE_BYTES {
+            return Err(CoreError::Platform(
+                "ilink",
+                format!(
+                    "POST {endpoint}: 响应体 {} bytes 超过 {MAX_RESPONSE_BYTES} 上限",
+                    bytes.len()
+                ),
+            ));
+        }
+        serde_json::from_slice::<T>(&bytes)
             .map_err(|e| CoreError::Platform("ilink", format!("POST {endpoint}: decode: {e}")))
     }
 }

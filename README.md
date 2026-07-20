@@ -91,6 +91,8 @@ EOF
 
 ### 登录 + 运行
 
+> ⚠️ **macOS 撞名**：`imagent` 也是 macOS 系统输入法进程（Input Method Agent）。**不要用 `pkill imagent`**——会杀掉系统输入法。停止本程序请用前台 `Ctrl-C` 或全路径 `kill $(pgrep -f /usr/local/bin/imagent)`（详见 [部署](deploy/README.md)）。
+
 ```bash
 imagent login            # 扫码登录 iLink，凭据落盘 ~/.imagent/imagent.db
 imagent start            # 前台常驻，Ctrl-C 退出
@@ -144,12 +146,12 @@ imagent start            # 前台常驻，Ctrl-C 退出
 
 > **当前状态**：功能完整，但仍在收尾安全审查修复（见 [`CHANGELOG`](CHANGELOG.md) `[Unreleased]` 与 [`CODE_REVIEW_v4`](docs/CODE_REVIEW_v4.md) / [`v5`](docs/CODE_REVIEW_v5.md)），故版本徽章为 pre-release。功能层面 P0–P3 均已交付。
 
-详见 [`docs/`](docs/)（[DESIGN](docs/DESIGN.md) / [RESEARCH](docs/RESEARCH.md) / [P2_COMPLETE](docs/P2_COMPLETE.md) / [CODE_REVIEW_v4](docs/CODE_REVIEW_v4.md)）。
+详见 [`docs/`](docs/)（[DESIGN](docs/DESIGN.md) / [RESEARCH](docs/RESEARCH.md) / [CODE_REVIEW_v4](docs/CODE_REVIEW_v4.md) / [CODE_REVIEW_v5](docs/CODE_REVIEW_v5.md)）。
 
 ## 开发
 
 ```bash
-cargo test --workspace                              # 241 passed
+cargo test --workspace                              # 全通过（详情见 CI）
 cargo clippy --workspace --all-targets -- -D warnings   # 0 warning
 cargo fmt --all --check
 ```

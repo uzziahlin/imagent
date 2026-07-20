@@ -1157,6 +1157,10 @@ impl Dispatcher {
         if !tool_calls.is_empty() && (final_text_is_present || outcome_has_final) {
             reply.push_str(&format_tool_summary(&tool_calls));
         }
+        // R1：backend 标记非正常终止（崩溃等）时，回复前置告警，让用户感知是部分输出而非正常结果。
+        if !outcome.terminal {
+            reply = format!("⚠️ agent 异常退出，以下为部分输出：\n\n{reply}");
+        }
         self.reply(&conv, &reply, &hint).await;
 
         // 落库（upsert 内部保留 created_at；store 错误仅 log）。
@@ -1484,6 +1488,8 @@ mod tests {
         tools_to_emit: Arc<TokioMutex<Vec<(String, String)>>>,
         /// run 直接返 Err（P1-7 失败路径测试用）。
         fail: bool,
+        /// 本次 run 构造的 RunOutcome.terminal 值（默认 true = 正常终止）。
+        terminal: bool,
     }
 
     impl MockBackend {
@@ -1497,6 +1503,7 @@ mod tests {
                 order: order.clone(),
                 tools_to_emit: Arc::new(TokioMutex::new(Vec::new())),
                 fail: false,
+                terminal: true,
             };
             (b, calls, prompts, order)
         }
@@ -1514,6 +1521,12 @@ mod tests {
         fn new_failing() -> (Self, CallsHandle, PromptsHandle, CounterHandle) {
             let (mut b, calls, prompts, order) = Self::new();
             b.fail = true;
+            (b, calls, prompts, order)
+        }
+        /// run 返回 terminal=false（模拟 agent 崩溃后的部分输出，R1 告警测试用）。
+        fn new_non_terminal() -> (Self, CallsHandle, PromptsHandle, CounterHandle) {
+            let (mut b, calls, prompts, order) = Self::new();
+            b.terminal = false;
             (b, calls, prompts, order)
         }
     }
@@ -1557,6 +1570,7 @@ mod tests {
             Ok(crate::types::RunOutcome {
                 session_id: SessionId(format!("sess-{my_order}")),
                 final_text: format!("final-{my_order}"),
+                terminal: self.terminal,
             })
         }
         fn name(&self) -> &'static str {
@@ -1611,6 +1625,36 @@ mod tests {
     async fn build(auth: Auth) -> Ctx {
         let (plat, inbox, send_count) = MockPlatform::new();
         let (back, calls, prompts, order) = MockBackend::new();
+        let (store, db) = tmp_store().await;
+
+        let disp = Arc::new(Dispatcher::new(
+            Arc::new(plat),
+            Arc::new(back),
+            store,
+            auth,
+            std::path::PathBuf::from("/tmp/imagent-test-ws"),
+            vec!["Read".into(), "Edit".into()],
+            PermissionMode::Off,
+            std::time::Duration::from_secs(600),
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(60),
+            vec![], // admin_senders 空 = 测试用向后兼容（所有白名单用户可 /allow）
+        ));
+
+        Ctx {
+            disp,
+            inbox,
+            send_count,
+            calls,
+            prompts,
+            order,
+            db,
+        }
+    }
+    /// 与 build 相同，但 MockBackend 返回 terminal=false（R1 非正常退出告警测试用）。
+    async fn build_non_terminal(auth: Auth) -> Ctx {
+        let (plat, inbox, send_count) = MockPlatform::new();
+        let (back, calls, prompts, order) = MockBackend::new_non_terminal();
         let (store, db) = tmp_store().await;
 
         let disp = Arc::new(Dispatcher::new(
@@ -1750,6 +1794,27 @@ mod tests {
             .expect("session row");
         assert_eq!(row.session_id, "sess-0");
         assert_eq!(row.agent_kind, "mock-backend");
+        drop_db(ctx.db).await;
+    }
+    #[tokio::test]
+    async fn non_terminal_outcome_prefixes_warning() {
+        // R1：backend 返回 terminal=false（模拟 agent 崩溃），reply 应前置告警。
+        let _serial = SERIAL.lock().await;
+        let ctx = build_non_terminal(Auth::new(vec!["alice".into()])).await;
+        feed_and_wait(&ctx, vec![msg("c9", "alice", "hello")], 1).await;
+
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(
+            inbox
+                .iter()
+                .any(|t| t.starts_with("⚠️ agent 异常退出，以下为部分输出：\n\n")),
+            "inbox={inbox:?}"
+        );
+        // 告警后仍应跟有 backend 的 Final 文本（reply#）。
+        assert!(
+            inbox.iter().any(|t| t.contains("reply#")),
+            "inbox={inbox:?}"
+        );
         drop_db(ctx.db).await;
     }
 

@@ -58,4 +58,7 @@ pub enum AgentChunk {
 pub struct RunOutcome {
     pub session_id: SessionId,
     pub final_text: String,
+    /// 本次 run 是否由终止事件正常产出（Final/Terminal/ACP prompt 正常完成）。
+    /// false = agent 非正常终止（崩溃等），final_text 为已收到的部分文本。
+    pub terminal: bool,
 }

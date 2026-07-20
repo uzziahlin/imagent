@@ -30,6 +30,7 @@ impl Backend for EchoBackend {
         Ok(RunOutcome {
             session_id: SessionId("echo-demo".to_string()),
             final_text: prompt.to_string(),
+            terminal: true,
         })
     }
 

@@ -12,7 +12,7 @@
 //! 纯函数 `build_tools_list` / `build_call_response` 便于单测；真实 socket 连接
 //! 在 `run_mcp_server` 中包。
 
-use std::io::{self, BufRead, Write};
+use std::io;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -207,12 +207,14 @@ pub async fn run_mcp_server(
     mode: PermissionMode,
     ask_timeout: std::time::Duration,
 ) -> io::Result<()> {
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
+    let stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+    let mut lines = BufReader::new(stdin).lines();
 
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(l)) => l,
+            Ok(None) => break, // EOF（claude 关闭 stdin）
             Err(e) => {
                 warn!(target: "imagent::mcp", error = %e, "stdin read error");
                 break;
@@ -254,11 +256,11 @@ pub async fn run_mcp_server(
 
         let mut out = resp.to_string();
         out.push('\n');
-        if let Err(e) = stdout.write_all(out.as_bytes()) {
+        if let Err(e) = stdout.write_all(out.as_bytes()).await {
             warn!(target: "imagent::mcp", error = %e, "stdout write error");
             break;
         }
-        let _ = stdout.flush();
+        let _ = stdout.flush().await;
     }
     Ok(())
 }
