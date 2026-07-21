@@ -4,7 +4,7 @@
 
 一个用 Rust 写的、把即时通讯平台接入自主 agent 的网关。**任何 IM**（个人微信 iLink / 企业微信 WeCom）↔ **任何 agent**（Claude Code / …）。
 
-![Rust](https://img.shields.io/badge/Rust-edition%202021-orange) ![License: MIT](https://img.shields.io/badge/License-MIT-blue) ![CI](https://github.com/uzziah/imagent/actions/workflows/ci.yml/badge.svg) ![Status](https://img.shields.io/badge/status-pre--release-yellow) ![Docs](https://img.shields.io/badge/docs-mdBook-blueviolet)
+![Rust](https://img.shields.io/badge/Rust-edition%202021-orange) ![License: MIT](https://img.shields.io/badge/License-MIT-blue) ![CI](https://github.com/uzziahlin/imagent/actions/workflows/ci.yml/badge.svg) ![Status](https://img.shields.io/badge/status-pre--release-yellow) ![Docs](https://img.shields.io/badge/docs-mdBook-blueviolet)
 
 ---
 
@@ -71,7 +71,7 @@ trait Platform                        trait Backend
 ### 构建
 
 ```bash
-git clone https://github.com/uzziah/imagent
+git clone https://github.com/uzziahlin/imagent
 cd imagent
 cargo build --release
 # 二进制：target/release/imagent

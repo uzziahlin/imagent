@@ -12,7 +12,7 @@ edition = "2021"
 rust-version = "1.88"
 license = "MIT"
 authors = ["Uzziah"]
-repository = "https://github.com/uzziah/imagent"
+repository = "https://github.com/uzziahlin/imagent"
 description = "IM ↔ agent gateway: any IM (iLink / WeCom) ↔ any agent (Claude / Codex / Gemini), in Rust."
 publish = false
 

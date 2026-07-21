@@ -1,6 +1,6 @@
 [Unit]
 Description=imagent — IM ↔ agent gateway
-Documentation=https://github.com/uzziah/imagent
+Documentation=https://github.com/uzziahlin/imagent
 After=network-online.target
 Wants=network-online.target
 
