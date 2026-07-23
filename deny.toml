@@ -24,6 +24,9 @@ allow = [
     "Zlib",
     "CC0-1.0",
     "MPL-2.0",
+    # webpki-roots（rustls 根证书 bundle，经 reqwest/tungstenite rustls-tls 引入）：
+    # 证书数据用 CDLA-Permissive-2.0（Community Data License，标准 permissive）。
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.93
 

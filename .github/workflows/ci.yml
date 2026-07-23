@@ -20,7 +20,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install libdbus-1-dev (Linux keyring backend：keyring sync-secret-service 经 libdbus-sys)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
+      # toolchain 对齐 rust-toolchain.toml pin 的 1.88（用 @stable 会致 cargo fmt 切到
+      # 1.88 但 1.88 未装 rustfmt → 'cargo-fmt is not installed for 1.88'）。
+      - uses: dtolnay/rust-toolchain@1.88
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
@@ -38,6 +43,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install libdbus-1-dev (Linux keyring backend)
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
       - name: cargo check @ 1.88
