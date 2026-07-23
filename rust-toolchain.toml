@@ -4,3 +4,8 @@
 # serde_with、darling、image 等；更早的 edition2024 manifest 还需 cargo 1.85+。
 [toolchain]
 channel = "1.88"
+# 显式声明 fmt/lint 所需 components：cargo 经本文件解析 toolchain 时默认
+# profile=minimal（不含 rustfmt），会致 `cargo fmt` 报 'cargo-fmt is not
+# installed for 1.88'（即便 CI 的 dtolnay action 装了 rustfmt，也被本文件的
+# toolchain 解析覆盖）。显式列 components，本地 + CI 的 1.88 都带 rustfmt/clippy。
+components = ["rustfmt", "clippy"]
