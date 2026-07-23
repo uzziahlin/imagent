@@ -24,7 +24,9 @@ jobs:
         # --ignore-tests：只统计非测试代码；keyring 在 headless Linux 走 fallback 路径（无 keychain）。
         # E-3：去掉 || true——coverage 失败应可见（不再被吞）。tarpaulin 在 headless Linux
         # 走 keyring fallback 路径，应正常产出；非致命的环境差异由上方 fail_ci_if_error 兜底。
-        run: cargo tarpaulin --workspace --ignore-tests --out Xml --output-dir coverage/ -- --include-ignored
+        # 不传 --include-ignored：claude 的 real_cli / acp_e2e 是 #[ignore]（需 claude CLI/ACP
+        # 真机），CI 无 claude 会 panic——ignored 测试本就不该在 CI coverage 跑。
+        run: cargo tarpaulin --workspace --ignore-tests --out Xml --output-dir coverage/
       - name: Upload to Codecov
         uses: codecov/codecov-action@v4
         with:
