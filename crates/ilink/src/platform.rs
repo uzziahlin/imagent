@@ -213,17 +213,19 @@ impl ILinkPlatform {
             .post_json::<GetConfigResp>("/ilink/bot/getconfig", &body)
             .await
         {
-            Ok(resp) if resp.typing_ticket.as_deref().is_some_and(|t| !t.is_empty()) => {
-                let ticket = resp.typing_ticket.unwrap();
+            Ok(resp) => {
+                let ticket = match resp.typing_ticket.as_deref() {
+                    Some(t) if !t.is_empty() => t.to_string(),
+                    _ => {
+                        warn!(target: "ilink", peer, "getconfig 无 typing_ticket");
+                        return None;
+                    }
+                };
                 self.typing_tickets.lock().await.insert(
                     peer.to_string(),
                     (ticket.clone(), Instant::now() + TYPING_TICKET_TTL),
                 );
                 Some(ticket)
-            }
-            Ok(_) => {
-                warn!(target: "ilink", peer, "getconfig 无 typing_ticket");
-                None
             }
             Err(e) => {
                 warn!(target: "ilink", peer, error = %e, "getconfig 失败");
