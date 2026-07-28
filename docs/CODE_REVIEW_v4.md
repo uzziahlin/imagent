@@ -1,5 +1,7 @@
 # imagent 深度 Review v4 — Issue 清单 + 修复跟踪
 
+> **📖 历史代码审查记录**：本文为迭代过程留档，所有 issue 均已落地或文档化为已知限制，**不代表当前缺陷状态**；文中保留的内部术语（开发工具代号 / 会话编号 / 审查轮次标记）属迭代记录语境，不影响当前代码。用户文档见 [SUMMARY](./SUMMARY.md)。
+
 > **评审对象**：`imagent v1.0.0` @ `4090c01`（main，已合并 `fix/code-review-v3`）。
 > **评审范围**：`crates/{core,ilink,wecom,claude,codex,gemini,store}` + `src/main.rs` + 开源工程化层（CI / Cargo metadata / 文档 / deploy）。
 > **评审方法**：主会话逐行精读核心调度链路（dispatch/permission/auth/main/config/backend_common/mcp/error/metrics/types）+ 3 个独立子审查并行精读（① ilink/wecom 平台协议安全 ② claude/codex/gemini 后端执行 + store 凭据 ③ CI/供应链/文档等开源治理），对 v3「已修」项逐条读源码复核。实测 `cargo test --workspace` = 241 passed / 0 failed / 2 ignored。

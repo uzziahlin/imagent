@@ -27,6 +27,10 @@
 
 **不要**开公开 issue 报告安全漏洞——见 [SECURITY.md](SECURITY.md)。
 
+## 贡献者协议
+
+除非你另行声明，提交到本仓库的任何贡献均按 [MIT License](LICENSE) 授权（与项目许可一致，**不要求**额外 CLA / DCO）。提交即表示你拥有该贡献的授权，并同意以此许可发布。
+
 ## 行为准则
 
 参与即表示同意遵守 [Code of Conduct](CODE_OF_CONDUCT.md)——友善、尊重、包容。

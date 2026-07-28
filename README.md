@@ -6,6 +6,10 @@
 
 ![Rust](https://img.shields.io/badge/Rust-edition%202021-orange) ![License: MIT](https://img.shields.io/badge/License-MIT-blue) ![CI](https://github.com/uzziahlin/imagent/actions/workflows/ci.yml/badge.svg) ![Status](https://img.shields.io/badge/status-pre--release-yellow) ![Docs](https://img.shields.io/badge/docs-mdBook-blueviolet)
 
+> 🌐 **English TL;DR** — `imagent` is a Rust gateway that bridges any instant-messaging platform (WeChat **iLink** / **WeCom**) with any autonomous agent (**Claude Code** / Codex / Gemini). It turns an IM private chat into an **approval-gated** agent cockpit: the agent runs real tasks (read/write files, run commands, edit code) but must ask for your `y/n` in IM before any dangerous tool. Pluggable on both sides (`Platform` / `Backend` traits), single binary, SQLite-backed sessions.
+> **Unofficial — not affiliated with Tencent or Anthropic.** iLink is a third-party Rust re-implementation of Tencent's OpenClaw Weixin protocol; compliance and account risk are solely yours.
+> The documentation below is in Chinese (the project targets the WeChat ecosystem).
+
 ---
 
 ## ⚠️ 免责声明
@@ -22,7 +26,7 @@ imagent 是**非官方**第三方开源项目，**不隶属于腾讯或 Anthropi
 
 imagent 是一个常驻网关进程：监听 IM 私聊消息 → 鉴权 → 驱动 agent（默认 Claude Code）执行真实任务（读写文件 / 跑命令 / 改代码）→ 把结果回传 IM。
 
-**杀手锉**：agent 遇危险操作（如 `Bash`）时，在 IM 里向你 approve/deny——把 agent 的执行权关进用户审批的笼子。
+**杀手锏**：agent 遇危险操作（如 `Bash`）时，在 IM 里向你 approve/deny——把 agent 的执行权关进用户审批的笼子。
 
 ## 特性
 
@@ -47,28 +51,40 @@ trait Platform                        trait Backend
 
 三层 + 双抽象：core 持有 `Platform` 与 `Backend` trait，平台与后端各自独立可换。session 生命周期提到 core（store 持久化），Backend 退化为无状态执行器——比把 session 塞进 Backend 内存更干净，支持重启续接。
 
-## 差异化
+## 设计取舍
 
-对标最接近的项目 [`feiyun0112/AgentBridge`](https://github.com/feiyun0112/AgentBridge)（.NET，同思路）：
+imagent 的几个关键取舍（解释「为什么这么设计」，而非与某个项目比高低）：
 
-| | feiyun (.NET) | imagent (Rust) |
-|---|---|---|
-| 发送者白名单鉴权 | ✗ 无 | ✓ 必须 |
-| session 持久化 | 内存 | SQLite |
-| 会话命令 | 仅 `/cc` | `/new` `/switch` `/sessions` `/compact` … |
-| IM 内权限审批 | ✗ | ✓（杀手锉） |
-| 限流熔断 | ✗ | ✓ |
-| 部署 | 需运行时 | 单二进制 |
+- **发送者白名单是硬约束，不是可选**：iLink bot 任何人都能加好友，没有白名单 = 任意人都能驱动你的 agent 执行命令。
+- **session 持久化到 SQLite**：进程重启可续（`--resume`），崩溃不丢上下文。SQLite 经 `rusqlite` 的 `bundled` feature **静态链接进二进制**，运行时无需宿主安装 SQLite。
+- **IM 内权限审批闭环**（核心特性）：危险工具（如 `Bash`）执行前，先在 IM 向你 approve/deny——把 agent 的执行权关进用户审批的笼子。
+- **限流服从式退避**：被限流就退避等待，**绝不绕过风控**（合规红线）。
+- **单二进制 + 低运行时依赖**：除 Linux 下凭据可选经 `libdbus`（Secret Service；无该环境则自动回退，见 [安全](#安全)）外，不依赖宿主环境。
 
 ## 快速开始
 
-### 前置
+### 安装
 
-- **操作系统**：macOS 或 Linux。Windows 暂不支持（IM 权限审批闭环与配置热重载依赖 Unix domain socket / SIGHUP）。
-- Rust（`cargo`，edition 2021，**MSRV 1.88**）
-- Claude Code CLI：`npm i -g @anthropic-ai/claude-code`
+**前置**：macOS 或 Linux（Windows 暂不支持——IM 权限审批闭环与配置热重载依赖 Unix domain socket / SIGHUP）；默认 agent 后端 Claude Code CLI（`npm i -g @anthropic-ai/claude-code`）。
 
-### 构建
+**方式一 · 下载预编译二进制（推荐，免装 Rust）**：从 [GitHub Releases](https://github.com/uzziahlin/imagent/releases) 取对应平台文件（每个 release 附 `sha256` 校验）：
+
+| 平台 | 文件 |
+|---|---|
+| macOS · Apple Silicon | `imagent-darwin-arm64` |
+| macOS · Intel | `imagent-darwin-x86_64` |
+| Linux · x86_64 | `imagent-linux-x86_64` |
+
+```bash
+# 示例：macOS Apple Silicon
+curl -L -o imagent https://github.com/uzziahlin/imagent/releases/latest/download/imagent-darwin-arm64
+chmod +x imagent && sudo mv imagent /usr/local/bin/
+# 可选：校验完整性
+curl -L -o /tmp/imagent.sha256 https://github.com/uzziahlin/imagent/releases/latest/download/imagent-darwin-arm64.sha256
+(cd /tmp && shasum -a 256 -c imagent.sha256)
+```
+
+**方式二 · 源码构建（需 Rust 1.88+）**：
 
 ```bash
 git clone https://github.com/uzziahlin/imagent
@@ -116,7 +132,7 @@ imagent start            # 前台常驻，Ctrl-C 退出
 | `/list` | 查白名单 |
 | `/whoami` | 查自己的 sender id |
 
-## 权限审批闭环（杀手锉）
+## 权限审批闭环（杀手锏）
 
 `permission_mode = "ask"` + `allowed_tools = ["Read","Edit","Bash"]` 时，agent 调 `Bash` 前会在 IM 询问：
 

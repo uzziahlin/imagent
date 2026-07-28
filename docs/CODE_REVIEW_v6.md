@@ -1,5 +1,7 @@
 # imagent 深度 Review v6 — 开源首发收尾（v5 核实 + 新发现 + 打磨落地）
 
+> **📖 历史代码审查记录**：本文为迭代过程留档，所有 issue 均已落地或文档化为已知限制，**不代表当前缺陷状态**；文中保留的内部术语（开发工具代号 / 会话编号 / 审查轮次标记）属迭代记录语境，不影响当前代码。用户文档见 [SUMMARY](./SUMMARY.md)。
+
 > **评审对象**：`imagent` @ `fdecc4d`（main，已合并 `fix/code-review-v5`）。
 > **评审标准**：开源首发——陌生开发者能否 clone → build → PR → 信任依赖 → 跑通 release。
 > **评审范围**：`crates/{core,ilink,wecom,claude,codex,gemini,store}` + `src/main.rs` + 开源工程化层（CI / 供应链 / Cargo metadata / 文档 / deploy / fuzz）。
