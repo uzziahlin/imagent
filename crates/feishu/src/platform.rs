@@ -16,12 +16,17 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::warn;
 
 use imagent_core::{
-    split_message, ConvId, CoreError, Dedup, InboundMessage, MediaRef, Platform, ReplyHint, Result,
+    split_message, ConvId, CoreError, Dedup, InboundMessage, MediaRef, OutboundCard, Platform,
+    ReplyHint, Result,
 };
 
 use open_lark::{Config, CoreConfig};
 
-use crate::client::{download_file, download_image, fetch_token, send_text_msg, FeishuWsClient};
+use crate::client::{
+    download_file, download_image, fetch_token, patch_card, send_card_msg, send_text_msg,
+    FeishuWsClient,
+};
+use crate::card::render_card;
 use crate::proto::{parse_message_event, receive_target_from_conv};
 
 /// 平台名常量。
@@ -252,6 +257,35 @@ impl Platform for FeishuPlatform {
     async fn send_typing(&self, _conv: &ConvId, _hint: &ReplyHint) -> Result<()> {
         // 飞书协议无 typing 语义。
         Ok(())
+    }
+    fn supports_streaming_card(&self) -> bool {
+        true
+    }
+
+    async fn send_card(
+        &self,
+        conv: &ConvId,
+        card: &OutboundCard,
+        _hint: &ReplyHint,
+    ) -> Result<Option<String>> {
+        let (receive_id, kind) = receive_target_from_conv(conv).ok_or_else(|| {
+            CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0))
+        })?;
+        let card_json = render_card(card);
+        let token = self.get_token().await?;
+        send_card_msg(&self.core_config, &token, &receive_id, kind, &card_json).await
+    }
+
+    async fn update_card(
+        &self,
+        _conv: &ConvId,
+        message_id: &str,
+        card: &OutboundCard,
+        _hint: &ReplyHint,
+    ) -> Result<()> {
+        let card_json = render_card(card);
+        let token = self.get_token().await?;
+        patch_card(&self.core_config, &token, message_id, &card_json).await
     }
 
     fn name(&self) -> &'static str {
