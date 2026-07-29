@@ -62,3 +62,28 @@ pub struct RunOutcome {
     /// false = agent 非正常终止（崩溃等），final_text 为已收到的部分文本。
     pub terminal: bool,
 }
+
+/// 流式卡片的抽象内容（平台无关）。core dispatch 累积 agent 输出成此结构，
+/// Platform::send_card / update_card 负责渲染成各自平台的卡片格式（如飞书 CardKit JSON）。
+///
+/// 不支持卡片的平台（ilink/wecom）由 trait 默认实现降级：仅把 `text` 当文本发送。
+#[derive(Debug, Clone)]
+pub struct OutboundCard {
+    /// 累积的回复文本（agent 流式 Text 拼接 + 最终 Final）。
+    pub text: String,
+    /// 工具调用摘要：(tool_name, input 摘要)，用于卡片里展示工具块。
+    pub tool_calls: Vec<(String, String)>,
+    /// 卡片终态。
+    pub terminal: CardTerminal,
+}
+
+/// 卡片终态。
+#[derive(Debug, Clone)]
+pub enum CardTerminal {
+    /// 流式输出中（agent 还在跑）。
+    Running,
+    /// 正常完成。
+    Done,
+    /// 出错（含错误信息）。
+    Error(String),
+}
