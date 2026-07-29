@@ -18,6 +18,7 @@ use tracing::{info, warn};
 
 use open_lark::auth::AuthService;
 use open_lark::communication::im::v1::message::create::{CreateMessageBody, CreateMessageRequest};
+use open_lark::communication::im::v1::message::patch::PatchMessageCardRequest;
 use open_lark::communication::im::v1::image::get::GetImageRequest;
 use open_lark::communication::im::v1::file::get::GetFileRequest;
 use open_lark::communication::im::v1::message::models::ReceiveIdType;
@@ -102,6 +103,68 @@ pub async fn send_text_msg(
         .await
         .map_err(|e| {
             imagent_core::CoreError::Platform(PLATFORM, format!("send_message: {e}"))
+        })?;
+    Ok(())
+}
+/// 发送交互卡片，返回 message_id（供后续 [`patch_card`] 增量更新）。
+///
+/// `card_json` 为 [`crate::card::render_card`] 产出的 CardKit JSON 字符串，直接作为
+/// `msg_type = "interactive"` 的 content。返回的 Value 已是信封 `data` 内容，message_id
+/// 在顶层（SDK 已拆 `{"code","msg","data"}` 信封）。
+pub async fn send_card_msg(
+    core_config: &CoreConfig,
+    token: &str,
+    receive_id: &str,
+    kind: ReceiveIdKind,
+    card_json: &str,
+) -> imagent_core::Result<Option<String>> {
+    let body = CreateMessageBody {
+        receive_id: receive_id.to_string(),
+        msg_type: "interactive".to_string(),
+        content: card_json.to_string(),
+        uuid: None,
+    };
+    let id_type = match kind {
+        ReceiveIdKind::OpenId => ReceiveIdType::OpenId,
+        ReceiveIdKind::ChatId => ReceiveIdType::ChatId,
+    };
+    let option = RequestOption::builder()
+        .tenant_access_token(token.to_string())
+        .build();
+    let resp: serde_json::Value = CreateMessageRequest::new(core_config.clone())
+        .receive_id_type(id_type)
+        .execute_with_options(body, option)
+        .await
+        .map_err(|e| {
+            imagent_core::CoreError::Platform(PLATFORM, format!("send_card: {e}"))
+        })?;
+    // resp 已是 data 内容；message_id 在顶层（非 data.message_id）。
+    let message_id = resp
+        .get("message_id")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    Ok(message_id)
+}
+
+/// 增量更新（patch）已发卡片。`card_json` 为新的 CardKit JSON 字符串。
+pub async fn patch_card(
+    core_config: &CoreConfig,
+    token: &str,
+    message_id: &str,
+    card_json: &str,
+) -> imagent_core::Result<()> {
+    let option = RequestOption::builder()
+        .tenant_access_token(token.to_string())
+        .build();
+    // patch 请求体形态（open-lark patch.rs doc 确认）：
+    //   {"content": "<卡片JSON序列化字符串>"}；card_json 已是字符串，直接作 content 值。
+    let body = serde_json::json!({ "content": card_json });
+    PatchMessageCardRequest::new(core_config.clone())
+        .message_id(message_id.to_string())
+        .execute_with_options(body, option)
+        .await
+        .map_err(|e| {
+            imagent_core::CoreError::Platform(PLATFORM, format!("patch_card: {e}"))
         })?;
     Ok(())
 }

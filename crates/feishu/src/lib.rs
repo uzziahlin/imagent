@@ -15,6 +15,7 @@
 
 #![forbid(unsafe_code)]
 
+mod card;
 mod client;
 mod platform;
 mod proto;

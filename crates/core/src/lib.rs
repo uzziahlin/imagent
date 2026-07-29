@@ -39,5 +39,6 @@ pub use metrics::Metrics;
 pub use permission::{default_sock_path, parse_reply, PermissionReply, PermissionRouter};
 pub use platform::Platform;
 pub use types::{
-    AgentChunk, ConvId, InboundMessage, MediaRef, ReplyHint, RunOutcome, SessionId, UserId, Workdir,
+    AgentChunk, CardTerminal, ConvId, InboundMessage, MediaRef, OutboundCard, ReplyHint, RunOutcome,
+    SessionId, UserId, Workdir,
 };
