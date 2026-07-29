@@ -5,6 +5,11 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# softprops/action-gh-release 创建 Release + generate_release_notes 需要 contents:write
+# （缺它 → 403 Resource not accessible by integration）
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
@@ -19,7 +24,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install libdbus-1-dev (Linux keyring backend：keyring sync-secret-service 经 libdbus-sys)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      # 对齐 rust-toolchain.toml pin 的 1.88（用 @stable 会被 rust-toolchain.toml 覆盖回 1.88，
+      # 而 @stable 装的 targets 不会落到 1.88 toolchain → E0463 can't find crate for `core`）
+      - uses: dtolnay/rust-toolchain@1.88
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
