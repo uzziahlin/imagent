@@ -1,0 +1,309 @@
+//! 飞书长连接事件 payload 的 serde 结构 + 纯函数解析。
+//!
+//! 飞书 `im.message.receive_v1` 事件经 `open-lark` 长连接以原始 payload bytes
+//! 推出（见 `client.rs`）。本模块只做**裁剪到关心字段的反序列化 + 纯函数映射**，
+//! 无网络、无副作用，是验收核心（见 `mod tests`）。未知字段一律忽略（serde 默认）。
+//!
+//! 约定：
+//! - conv_id = `feishu:<receive_id>`：p2p → `<open_id>`（`ou_` 前缀），
+//!   group → `<chat_id>`（`oc_` 前缀）。发消息时反向 strip `feishu:` 还原。
+//! - 鉴权（白名单）由 core 做，本模块只透传 sender 的 `open_id`。
+
+use serde::Deserialize;
+
+use imagent_core::{ConvId, InboundMessage, ReplyHint, UserId};
+
+/// `im.message.receive_v1` 事件顶层结构（裁剪：仅保留 header + event）。
+#[derive(Debug, Deserialize)]
+pub struct FeishuEvent {
+    pub header: EventHeader,
+    pub event: EventBody,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EventHeader {
+    pub event_type: String,
+    /// 去重 key 首选（飞书事件 id）。
+    #[serde(default)]
+    pub event_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EventBody {
+    pub sender: Sender,
+    pub message: Message,
+    /// 群消息附带；私聊可能缺省。
+    #[serde(default)]
+    pub chat: Option<Chat>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Sender {
+    pub sender_id: SenderId,
+}
+
+/// 飞书用户标识三件套（union_id / user_id / open_id），鉴权用稳定的 open_id。
+#[derive(Debug, Deserialize)]
+pub struct SenderId {
+    pub open_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Message {
+    pub message_type: String,
+    /// JSON 字符串，如 `{"text":"hi"}`（飞书把 content 序列化成字符串塞进事件）。
+    pub content: String,
+    /// `p2p`（私聊）/ `group`（群聊）。
+    pub chat_type: String,
+    #[serde(default)]
+    pub chat_id: Option<String>,
+    /// 去重 key 备选。
+    #[serde(default)]
+    pub message_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Chat {
+    pub chat_id: String,
+}
+
+/// text 类型消息的 content 结构：`{"text":"..."}`。
+#[derive(Debug, Deserialize)]
+pub struct TextContent {
+    pub text: String,
+}
+
+/// 发消息时的 receive_id 类型（决定 OpenAPI `receive_id_type` 参数）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiveIdKind {
+    /// `ou_` 前缀：用户 open_id（私聊）。
+    OpenId,
+    /// `oc_` 前缀：群 chat_id（群聊）。
+    ChatId,
+}
+
+// ---------------------------------------------------------------------------
+// 纯函数：解析 / 映射（无网络，验收核心）
+// ---------------------------------------------------------------------------
+
+/// 解析长连接 payload。仅处理 `im.message.receive_v1` 的**文本**消息。
+///
+/// 返回 `(dedup_key, InboundMessage)`；以下情况返回 `None`（上层丢弃）：
+/// 非目标事件 / 非文本 / 空文本 / content 非法 JSON / payload 非法 JSON / 缺 receive_id。
+pub fn parse_message_event(payload: &[u8]) -> Option<(String, InboundMessage)> {
+    let evt: FeishuEvent = serde_json::from_slice(payload).ok()?;
+    if evt.header.event_type != "im.message.receive_v1" {
+        return None;
+    }
+    if evt.event.message.message_type != "text" {
+        return None;
+    }
+    let text = extract_text(&evt.event.message.content)?;
+    if text.trim().is_empty() {
+        return None;
+    }
+
+    let open_id = evt.event.sender.sender_id.open_id.clone();
+    let (receive_id, _kind) = receive_target(&evt.event)?;
+    let dedup_key = evt
+        .header
+        .event_id
+        .clone()
+        .or_else(|| evt.event.message.message_id.clone())
+        .unwrap_or_else(|| format!("{}:{}", receive_id, text.len()));
+    let msg = InboundMessage {
+        conv_id: ConvId(format!("feishu:{receive_id}")),
+        sender: UserId(open_id),
+        text: Some(text),
+        media: vec![],
+        reply_hint: ReplyHint::None,
+    };
+    Some((dedup_key, msg))
+}
+
+/// 从 text 消息的 content JSON 提取文本：`{"text":"hi"}` -> `"hi"`。
+/// 非法 JSON 返回 `None`。
+pub fn extract_text(content: &str) -> Option<String> {
+    serde_json::from_str::<TextContent>(content)
+        .ok()
+        .map(|c| c.text)
+}
+
+/// 按 chat_type 决定发回的 receive_id：
+/// - p2p → sender.open_id（OpenId）
+/// - group → event.chat.chat_id，回退 message.chat_id（ChatId）
+fn receive_target(event: &EventBody) -> Option<(String, ReceiveIdKind)> {
+    if event.message.chat_type == "p2p" {
+        let oid = event.sender.sender_id.open_id.clone();
+        return if oid.is_empty() {
+            None
+        } else {
+            Some((oid, ReceiveIdKind::OpenId))
+        };
+    }
+    if let Some(c) = &event.chat {
+        return Some((c.chat_id.clone(), ReceiveIdKind::ChatId));
+    }
+    if let Some(cid) = &event.message.chat_id {
+        return Some((cid.clone(), ReceiveIdKind::ChatId));
+    }
+    None
+}
+
+/// 发消息反向解析：`feishu:<id>` → `(id, kind)`。
+/// 飞书 ID 前缀约定：`ou_` = open_id（用户，私聊），其余（`oc_` = chat_id，群聊）→ ChatId。
+/// 无 `feishu:` 前缀返回 `None`（非法 conv_id，上层报错）。
+pub fn receive_target_from_conv(conv: &ConvId) -> Option<(String, ReceiveIdKind)> {
+    let id = conv.0.strip_prefix("feishu:")?;
+    let kind = if id.starts_with("ou_") {
+        ReceiveIdKind::OpenId
+    } else {
+        ReceiveIdKind::ChatId
+    };
+    Some((id.to_string(), kind))
+}
+
+// ---------------------------------------------------------------------------
+// 单测：纯逻辑，无网络、无真机。验收核心。
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// p2p 文本：conv=feishu:<open_id>、sender=open_id、text 正确、dedup=event_id。
+    #[test]
+    fn parse_p2p_text() {
+        let payload = br#"{
+            "schema":"2.0",
+            "header":{"event_id":"evt_1","event_type":"im.message.receive_v1"},
+            "event":{
+                "sender":{"sender_id":{"open_id":"ou_user1"}},
+                "message":{"message_type":"text","content":"{\"text\":\"hi there\"}","chat_type":"p2p","chat_id":"","message_id":"om_msg1"}
+            }
+        }"#;
+        let (key, msg) = parse_message_event(payload).expect("p2p 文本应解析成功");
+        assert_eq!(key, "evt_1");
+        assert_eq!(msg.conv_id.0, "feishu:ou_user1");
+        assert_eq!(msg.sender.0, "ou_user1");
+        assert_eq!(msg.text.as_deref(), Some("hi there"));
+    }
+
+    /// group 文本：conv=feishu:<chat_id>、sender=发言者 open_id。
+    #[test]
+    fn parse_group_text() {
+        let payload = br#"{
+            "header":{"event_id":"evt_2","event_type":"im.message.receive_v1"},
+            "event":{
+                "sender":{"sender_id":{"open_id":"ou_user2"}},
+                "message":{"message_type":"text","content":"{\"text\":\"hello group\"}","chat_type":"group","chat_id":"oc_chat1","message_id":"om_msg2"},
+                "chat":{"chat_id":"oc_chat1"}
+            }
+        }"#;
+        let (key, msg) = parse_message_event(payload).expect("group 文本应解析成功");
+        assert_eq!(key, "evt_2");
+        assert_eq!(msg.conv_id.0, "feishu:oc_chat1");
+        assert_eq!(msg.sender.0, "ou_user2");
+        assert_eq!(msg.text.as_deref(), Some("hello group"));
+    }
+
+    /// 群消息缺 event.chat 时回退 message.chat_id。
+    #[test]
+    fn parse_group_fallback_message_chat_id() {
+        let payload = br#"{
+            "header":{"event_type":"im.message.receive_v1"},
+            "event":{
+                "sender":{"sender_id":{"open_id":"ou_user3"}},
+                "message":{"message_type":"text","content":"{\"text\":\"x\"}","chat_type":"group","chat_id":"oc_chat2","message_id":"om_msg3"}
+            }
+        }"#;
+        let (_key, msg) = parse_message_event(payload).expect("group 回退 chat_id 应成功");
+        assert_eq!(msg.conv_id.0, "feishu:oc_chat2");
+    }
+
+    /// 非 im.message.receive_v1 事件丢弃。
+    #[test]
+    fn ignore_other_event_type() {
+        let payload = br#"{
+            "header":{"event_id":"evt_x","event_type":"application.url.menu_v6"},
+            "event":{"sender":{"sender_id":{"open_id":"ou_x"}},"message":{"message_type":"text","content":"{\"text\":\"hi\"}","chat_type":"p2p"}}
+        }"#;
+        assert!(parse_message_event(payload).is_none());
+    }
+
+    /// 非文本消息丢弃。
+    #[test]
+    fn ignore_non_text() {
+        let payload = br#"{
+            "header":{"event_id":"evt_i","event_type":"im.message.receive_v1"},
+            "event":{"sender":{"sender_id":{"open_id":"ou_x"}},"message":{"message_type":"image","content":"{\"image_key\":\"k\"}","chat_type":"p2p"}}
+        }"#;
+        assert!(parse_message_event(payload).is_none());
+    }
+
+    /// 空文本（含纯空白）丢弃。
+    #[test]
+    fn ignore_empty_text() {
+        let empty = br#"{"header":{"event_id":"e","event_type":"im.message.receive_v1"},
+            "event":{"sender":{"sender_id":{"open_id":"ou_x"}},"message":{"message_type":"text","content":"{\"text\":\"\"}","chat_type":"p2p"}}}"#;
+        assert!(parse_message_event(empty).is_none());
+
+        let ws = br#"{"header":{"event_id":"e","event_type":"im.message.receive_v1"},
+            "event":{"sender":{"sender_id":{"open_id":"ou_x"}},"message":{"message_type":"text","content":"{\"text\":\"   \"}","chat_type":"p2p"}}}"#;
+        assert!(parse_message_event(ws).is_none());
+    }
+
+    /// 非法 JSON payload 丢弃。
+    #[test]
+    fn ignore_invalid_json() {
+        assert!(parse_message_event(b"not json at all").is_none());
+        assert!(parse_message_event(b"").is_none());
+    }
+
+    /// content 非法 JSON 丢弃。
+    #[test]
+    fn ignore_invalid_content_json() {
+        let payload = br#"{"header":{"event_id":"e","event_type":"im.message.receive_v1"},
+            "event":{"sender":{"sender_id":{"open_id":"ou_x"}},"message":{"message_type":"text","content":"not-json","chat_type":"p2p"}}}"#;
+        assert!(parse_message_event(payload).is_none());
+    }
+
+    /// dedup key 回退：缺 event_id 时用 message_id。
+    #[test]
+    fn dedup_key_falls_back_to_message_id() {
+        let payload = br#"{
+            "header":{"event_type":"im.message.receive_v1"},
+            "event":{"sender":{"sender_id":{"open_id":"ou_user9"}},"message":{"message_type":"text","content":"{\"text\":\"hi\"}","chat_type":"p2p","message_id":"om_fb"}}
+        }"#;
+        let (key, _) = parse_message_event(payload).expect("应解析成功");
+        assert_eq!(key, "om_fb");
+    }
+
+    /// receive_target_from_conv roundtrip：ou_ → OpenId，oc_ → ChatId，无前缀 → None。
+    #[test]
+    fn conv_roundtrip() {
+        let (id, kind) = receive_target_from_conv(&ConvId("feishu:ou_abc".into())).unwrap();
+        assert_eq!(id, "ou_abc");
+        assert_eq!(kind, ReceiveIdKind::OpenId);
+
+        let (id, kind) = receive_target_from_conv(&ConvId("feishu:oc_def".into())).unwrap();
+        assert_eq!(id, "oc_def");
+        assert_eq!(kind, ReceiveIdKind::ChatId);
+
+        // 非 ou_ 前缀一律按 ChatId 处理。
+        let (id, kind) = receive_target_from_conv(&ConvId("feishu:other".into())).unwrap();
+        assert_eq!(id, "other");
+        assert_eq!(kind, ReceiveIdKind::ChatId);
+
+        // 无 feishu: 前缀 → None。
+        assert!(receive_target_from_conv(&ConvId("wecom:x".into())).is_none());
+    }
+
+    /// extract_text 正常 / 非法 JSON。
+    #[test]
+    fn extract_text_works() {
+        assert_eq!(extract_text(r#"{"text":"hello"}"#), Some("hello".to_string()));
+        assert_eq!(extract_text("not json"), None);
+        assert_eq!(extract_text(""), None);
+    }
+}

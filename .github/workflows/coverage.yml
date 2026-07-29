@@ -13,6 +13,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install libdbus-1-dev (Linux keyring backend：keyring sync-secret-service 经 libdbus-sys)
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
+      - name: Install protoc (feishu/open-lark websocket 构建依赖)
+        run: sudo apt-get install -y protobuf-compiler
       - uses: dtolnay/rust-toolchain@1.88
       - name: Install tarpaulin
         # 用 prebuilt binary（taiki-e/install-action），避免 `cargo install` 源码编译

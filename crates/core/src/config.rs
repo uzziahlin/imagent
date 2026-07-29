@@ -101,6 +101,13 @@ pub struct Config {
     /// docs/CODE_REVIEW_v4.md S-4（后续）。
     #[serde(default)]
     pub wecom_secret: Option<String>,
+    /// 飞书自建应用 app_id（可选；仅 `platform = "feishu"` 时使用）。非敏感。
+    #[serde(default)]
+    pub feishu_app_id: Option<String>,
+    /// 飞书 OpenAPI base_url（可选；默认 `https://open.feishu.cn`）。
+    /// Lark 国际版用 `https://open.larksuite.com`（MVP 不覆盖）。
+    #[serde(default)]
+    pub feishu_base_url: Option<String>,
 }
 
 fn default_tools() -> Vec<String> {
@@ -158,7 +165,9 @@ allowed_senders = []        # 留空 = 发现模式（只打日志记录入站 s
 # admin_senders = []          # 可 /allow 的管理员 sender；空=所有白名单用户可(P2-D，生产建议显式设置收敛授权面)
 allowed_tools = ["Read", "Edit"]
 agent = "claude-cli"         # claude-cli(默认) | claude-acp(ACP长驻子进程) | codex | gemini
-platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人,配 wecom_bot_id/wecom_secret)
+platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人) | feishu(飞书,配 feishu_app_id + 环境变量 IMAGENT_FEISHU_APP_SECRET)
+# feishu_app_id = "cli_xxx"            # 飞书自建应用 app_id（仅 platform="feishu"；app_secret 走环境变量，keyring 为后续 P2）
+# feishu_base_url = "https://open.feishu.cn"  # 可选，默认 https://open.feishu.cn；Lark 国际版 https://open.larksuite.com（MVP 不覆盖）
 permission_mode = "off"     # off(默认,claude按allowedTools自行处理) | allow | deny | ask(IM审批闭环)
 # metrics_addr = "127.0.0.1:9100"   # 默认关闭；设为 "ip:port" 开启 /metrics + /health HTTP server
 # message_max_len = 2000              # 单条出站消息字符上限（Unicode char）；不设 = 不分片

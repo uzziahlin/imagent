@@ -84,7 +84,9 @@ curl -L -o /tmp/imagent.sha256 https://github.com/uzziahlin/imagent/releases/lat
 (cd /tmp && shasum -a 256 -c imagent.sha256)
 ```
 
-**方式二 · 源码构建（需 Rust 1.88+）**：
+**方式二 · 源码构建（需 Rust 1.88+；启用飞书平台需额外 `protoc`）**：
+
+> 飞书平台经 `open-lark` 的 websocket feature 编译，其 build script 需要系统 `protoc`（Protocol Buffers 编译器）：macOS `brew install protobuf`，Ubuntu `sudo apt-get install -y protobuf-compiler`。**仅构建时需要，运行时不需要**。
 
 ```bash
 git clone https://github.com/uzziahlin/imagent
