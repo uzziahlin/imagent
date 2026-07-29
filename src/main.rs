@@ -72,6 +72,10 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // rustls 0.23 breaking change：必须显式安装 process-level CryptoProvider，
+    // 否则飞书 open-lark 长连接首次 TLS 握手 panic（rustls 0.23 不再隐式选 provider）。
+    // 须在任何 rustls/reqwest TLS 使用前调用。ring 与 reqwest rustls-tls 一致。
+    let _ = rustls::crypto::ring::default_provider().install_default();
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
