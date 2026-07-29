@@ -115,8 +115,8 @@ async fn main() -> Result<()> {
             );
         }
         Cmd::Start { platform } => {
-            if platform != "ilink" && platform != "wecom" {
-                return Err(anyhow!("未知 platform={platform}，支持 ilink | wecom"));
+            if platform != "ilink" && platform != "wecom" && platform != "feishu" {
+                return Err(anyhow!("未知 platform={platform}，支持 ilink | wecom | feishu"));
             }
 
             // 1. 配置
@@ -138,7 +138,10 @@ async fn main() -> Result<()> {
             store.set_require_keyring(config.require_keyring);
 
             // 3. platform —— 按 config.platform / CLI 选用 ilink 或 wecom。
-            let platform_name = if platform == "ilink" || platform == "wecom" {
+            let platform_name = if platform == "ilink"
+                || platform == "wecom"
+                || platform == "feishu"
+            {
                 platform.as_str()
             } else {
                 config.platform.as_str()
@@ -394,6 +397,9 @@ fn build_backend(
 ///
 /// - `"wecom"` → [`imagent_wecom::WeComPlatform`]：凭据取自 config 的
 ///   `wecom_bot_id` / `wecom_secret`（企业微信智能机器人不走扫码登录）。
+/// - `"feishu"` → [`imagent_feishu::FeishuPlatform`]：`feishu_app_id` 取自 config，
+///   `app_secret` 取自环境变量 `IMAGENT_FEISHU_APP_SECRET`（keyring bootstrap 为后续 P2），
+///   默认 `base_url = https://open.feishu.cn`。
 /// - 其它（含默认 `"ilink"`）→ [`imagent_ilink::ILinkPlatform`]，
 ///   行为与单平台时期完全一致（读 store 的 ilink 凭据 + 扫码登录的 client）。
 async fn build_platform(
@@ -416,6 +422,26 @@ async fn build_platform(
             Ok(Arc::new(imagent_wecom::WeComPlatform::new(
                 bot_id, secret, ws_url,
             )))
+        }
+        "feishu" => {
+            let app_id = config
+                .feishu_app_id
+                .clone()
+                .ok_or_else(|| {
+                    anyhow!("platform=feishu 需在 config.toml 配置 feishu_app_id")
+                })?;
+            // MVP：app_secret 从环境变量读（keyring bootstrap 为后续 P2）。
+            let app_secret =
+                std::env::var("IMAGENT_FEISHU_APP_SECRET").map_err(|_| {
+                    anyhow!("platform=feishu 需设置环境变量 IMAGENT_FEISHU_APP_SECRET")
+                })?;
+            let base_url = config
+                .feishu_base_url
+                .clone()
+                .unwrap_or_else(|| "https://open.feishu.cn".to_string());
+            Ok(Arc::new(imagent_feishu::FeishuPlatform::new(
+                app_id, app_secret, base_url,
+            )?))
         }
         _ => {
             // 默认 ilink：保持既有行为。

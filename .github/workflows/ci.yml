@@ -23,6 +23,12 @@ jobs:
       - name: Install libdbus-1-dev (Linux keyring backend：keyring sync-secret-service 经 libdbus-sys)
         if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
+      - name: Install protoc (feishu/open-lark websocket 构建依赖；仅构建时需要)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get install -y protobuf-compiler
+      - name: Install protoc (macOS)
+        if: matrix.os == 'macos-latest'
+        run: brew install protobuf
       # toolchain 对齐 rust-toolchain.toml pin 的 1.88（用 @stable 会致 cargo fmt 切到
       # 1.88 但 1.88 未装 rustfmt → 'cargo-fmt is not installed for 1.88'）。
       - uses: dtolnay/rust-toolchain@1.88
@@ -45,6 +51,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install libdbus-1-dev (Linux keyring backend)
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
+      - name: Install protoc (feishu/open-lark websocket 构建依赖)
+        run: sudo apt-get install -y protobuf-compiler
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
       - name: cargo check @ 1.88

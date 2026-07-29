@@ -4,7 +4,7 @@
 [workspace]
 resolver = "2"
 exclude = ["fuzz"]  # cargo-fuzz 独立 crate（需 nightly，E-7）
-members = ["crates/store", "crates/core", "crates/claude", "crates/codex", "crates/gemini", "crates/ilink", "crates/wecom"]
+members = ["crates/store", "crates/core", "crates/claude", "crates/codex", "crates/gemini", "crates/ilink", "crates/wecom", "crates/feishu"]
 
 [workspace.package]
 version = "1.0.0"
@@ -56,6 +56,8 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 axum = "0.7"
 # ACP（Agent Client Protocol）：claude-agent-acp 长驻子进程模式（agent-client-protocol SDK）
 agent-client-protocol = "1"
+# 飞书 open-lark SDK（package name=openlark，lib name=open_lark，二者不同名是 SDK 设计）
+openlark = { version = "0.20", default-features = false, features = ["auth", "communication", "websocket"] }
 
 [package]
 name = "imagent"
@@ -66,6 +68,7 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+imagent-feishu = { path = "crates/feishu" }
 imagent-wecom = { path = "crates/wecom" }
 imagent-core = { path = "crates/core" }
 imagent-ilink = { path = "crates/ilink" }
