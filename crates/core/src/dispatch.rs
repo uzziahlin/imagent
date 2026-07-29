@@ -18,8 +18,9 @@ use crate::config::PermissionMode;
 use crate::error::Result;
 use crate::metrics::METRICS;
 use crate::permission::{parse_reply, PermissionReply, PermissionRouter};
+use crate::card_session::CardSession;
 use crate::platform::Platform;
-use crate::types::{AgentChunk, ConvId, InboundMessage, ReplyHint, SessionId};
+use crate::types::{AgentChunk, CardTerminal, ConvId, InboundMessage, ReplyHint, SessionId};
 use imagent_store::{NamedSessionRow, SessionRow, Store};
 use parking_lot::RwLock;
 use tokio::sync::{mpsc, Mutex};
@@ -1104,17 +1105,33 @@ impl Dispatcher {
         let mut final_text: Option<String> = None;
         let mut error_text: Option<String> = None;
         let mut tool_calls: Vec<(String, String)> = Vec::new();
+        // 流式卡片：支持卡片的平台累积输出 + 节流 patch（单卡片更新），不支持则每 Text 多发文本。
+        let mut card = if self.platform.supports_streaming_card() {
+            Some(CardSession::new())
+        } else {
+            None
+        };
         while let Some(chunk) = rx.recv().await {
             match chunk {
                 AgentChunk::Final(t) => final_text = Some(t),
                 AgentChunk::Error(e) => error_text = Some(e),
                 AgentChunk::ToolUse { tool, input } => {
-                    tool_calls.push((tool, truncate_str(&input, 40)));
+                    let summary = truncate_str(&input, 40);
+                    tool_calls.push((tool.clone(), summary.clone()));
+                    if let Some(c) = card.as_mut() {
+                        c.append_tool(&tool, &summary, &conv, &hint, self.platform.as_ref())
+                            .await;
+                    }
                 }
                 AgentChunk::ToolResult { .. } => {} // 摘要只列工具调用，结果不进 IM
                 AgentChunk::Text(t) => {
-                    // P2-F：中间 Text chunk 实时推 IM（流式体验，而非全部丢弃只发最终 Final）。
-                    self.reply(&conv, &t, &hint).await;
+                    if let Some(c) = card.as_mut() {
+                        c.append_text(&t, &conv, &hint, self.platform.as_ref())
+                            .await;
+                    } else {
+                        // P2-F：中间 Text chunk 实时推 IM（流式体验，而非全部丢弃只发最终 Final）。
+                        self.reply(&conv, &t, &hint).await;
+                    }
                 }
             }
         }
@@ -1131,7 +1148,19 @@ impl Dispatcher {
                 METRICS.backend_errors.inc();
                 let m = format!("[error] {e}");
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "backend.run 失败");
-                self.reply(&conv, &m, &hint).await;
+                if let Some(c) = card.as_mut() {
+                    c.finalize(
+                        Some(m.as_str()),
+                        &tool_calls,
+                        CardTerminal::Error(m.clone()),
+                        &conv,
+                        &hint,
+                        self.platform.as_ref(),
+                    )
+                    .await;
+                } else {
+                    self.reply(&conv, &m, &hint).await;
+                }
                 // P1-7：失败路径也回收 conv_lock，防 HashMap 项永久泄漏。
                 drop(_guard);
                 self.release_conv_lock(&conv.0, lock).await;
@@ -1142,7 +1171,19 @@ impl Dispatcher {
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "backend task panic");
                 // P2-5：panic 时若已收到 Final chunk，优先回传它（而非丢弃只报 panic）。
                 let m = final_text.unwrap_or_else(|| format!("[error] backend task panicked: {e}"));
-                self.reply(&conv, &m, &hint).await;
+                if let Some(c) = card.as_mut() {
+                    c.finalize(
+                        Some(m.as_str()),
+                        &tool_calls,
+                        CardTerminal::Error(m.clone()),
+                        &conv,
+                        &hint,
+                        self.platform.as_ref(),
+                    )
+                    .await;
+                } else {
+                    self.reply(&conv, &m, &hint).await;
+                }
                 // P1-7：panic 路径也回收 conv_lock。
                 drop(_guard);
                 self.release_conv_lock(&conv.0, lock).await;
@@ -1172,7 +1213,24 @@ impl Dispatcher {
         if !outcome.terminal {
             reply = format!("⚠️ agent 异常退出，以下为部分输出：\n\n{reply}");
         }
-        self.reply(&conv, &reply, &hint).await;
+        if let Some(c) = card.as_mut() {
+            let terminal = if outcome.terminal {
+                CardTerminal::Done
+            } else {
+                CardTerminal::Error("agent 异常退出".into())
+            };
+            c.finalize(
+                Some(reply.as_str()),
+                &tool_calls,
+                terminal,
+                &conv,
+                &hint,
+                self.platform.as_ref(),
+            )
+            .await;
+        } else {
+            self.reply(&conv, &reply, &hint).await;
+        }
 
         // 落库（upsert 内部保留 created_at；store 错误仅 log）。
         let now = now_secs();
