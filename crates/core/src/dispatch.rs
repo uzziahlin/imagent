@@ -72,6 +72,11 @@ fn workdir_key(conv_id: &str) -> String {
     format!("workdir:{conv_id}")
 }
 
+/// 命名工作空间的 config 键：`workspace:<name>`（全局别名，所有 conv 共享）。由 /ws 设置。
+fn workspace_key(name: &str) -> String {
+    format!("workspace:{name}")
+}
+
 /// 错误是否指示 iLink session 过期（需重新 login）。
 ///
 /// 专用 `CoreError::SessionExpired` variant，靠类型判定而非 Display 子串（更鲁棒）。
@@ -1032,6 +1037,127 @@ impl Dispatcher {
                         }
                         return;
                     }
+                    "/ws" => {
+                        let sub = parts.get(1).map(|s| s.trim()).unwrap_or("");
+                        let arg = parts.get(2).map(|s| s.trim()).unwrap_or("");
+                        match sub {
+                            "" | "list" => {
+                                match self.store.list_config("workspace:").await {
+                                    Ok(rows) if rows.is_empty() => {
+                                        self.reply(&conv, "（暂无命名工作空间）", &hint).await
+                                    }
+                                    Ok(rows) => {
+                                        let body = rows
+                                            .iter()
+                                            .map(|(k, v)| {
+                                                format!(
+                                                    "- {}：{v}",
+                                                    k.strip_prefix("workspace:").unwrap_or(k)
+                                                )
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join("\n");
+                                        self.reply(&conv, &format!("命名工作空间：\n{body}"), &hint)
+                                            .await
+                                    }
+                                    Err(e) => {
+                                        self.reply(&conv, &format!("列出失败：{e}"), &hint).await
+                                    }
+                                }
+                                return;
+                            }
+                            "save" => {
+                                if arg.is_empty() {
+                                    self.reply(&conv, "用法：/ws save <name>", &hint).await;
+                                    return;
+                                }
+                                let wd = self.resolve_workdir(&conv.0).await;
+                                match self
+                                    .store
+                                    .set_config(&workspace_key(arg), &wd.to_string_lossy())
+                                    .await
+                                {
+                                    Ok(_) => self
+                                        .reply(
+                                            &conv,
+                                            &format!("✅ 已保存工作空间「{arg}」= {}", wd.display()),
+                                            &hint,
+                                        )
+                                        .await,
+                                    Err(e) => self
+                                        .reply(&conv, &format!("保存失败：{e}"), &hint)
+                                        .await,
+                                }
+                                return;
+                            }
+                            "use" => {
+                                if arg.is_empty() {
+                                    self.reply(&conv, "用法：/ws use <name>", &hint).await;
+                                    return;
+                                }
+                                match self.store.get_config(&workspace_key(arg)).await {
+                                    Ok(Some(path)) => {
+                                        let p = std::path::Path::new(&path);
+                                        if !p.is_dir() {
+                                            self.reply(&conv, &format!("目录不存在：{path}"), &hint)
+                                                .await;
+                                            return;
+                                        }
+                                        // 改 per-conv workdir：取 conv 锁串行，与在飞 agent task 隔离（同 /cd）。
+                                        let _conv_lock = self.acquire_conv_lock(&conv.0).await;
+                                        let _conv_guard = _conv_lock.lock().await;
+                                        match self
+                                            .store
+                                            .set_config(&workdir_key(&conv.0), &path)
+                                            .await
+                                        {
+                                            Ok(_) => self
+                                                .reply(
+                                                    &conv,
+                                                    &format!("✅ 已切到「{arg}」（{path}）"),
+                                                    &hint,
+                                                )
+                                                .await,
+                                            Err(e) => self
+                                                .reply(&conv, &format!("切换失败：{e}"), &hint)
+                                                .await,
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        self.reply(&conv, &format!("无此工作空间：{arg}"), &hint)
+                                            .await
+                                    }
+                                    Err(e) => self
+                                        .reply(&conv, &format!("读取失败：{e}"), &hint)
+                                        .await,
+                                }
+                                return;
+                            }
+                            "remove" => {
+                                if arg.is_empty() {
+                                    self.reply(&conv, "用法：/ws remove <name>", &hint).await;
+                                    return;
+                                }
+                                match self.store.delete_config(&workspace_key(arg)).await {
+                                    Ok(_) => self
+                                        .reply(&conv, &format!("✅ 已删除工作空间「{arg}」"), &hint)
+                                        .await,
+                                    Err(e) => self
+                                        .reply(&conv, &format!("删除失败：{e}"), &hint)
+                                        .await,
+                                }
+                                return;
+                            }
+                            _ => self
+                                .reply(
+                                    &conv,
+                                    "用法：/ws [list|save <name>|use <name>|remove <name>]",
+                                    &hint,
+                                )
+                                .await,
+                        }
+                        return;
+                    }
                     "/perm" => {
                         let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
                         if arg.is_empty() {
@@ -1072,7 +1198,7 @@ impl Dispatcher {
                     "/help" => {
                         self.reply(
                             &conv,
-                            "命令：\n/new 重置会话\n/switch <name> 切命名会话\n/sessions 列会话\n/compact 压缩上下文\n/cd [path] 切工作目录\n/perm <off|allow|deny|ask> 权限模式\n/allow <id> 授权\n/disallow <id> 撤权\n/list 白名单\n/whoami 我的id\n/help 帮助",
+                            "命令：\n/new 重置会话\n/switch <name> 切命名会话\n/sessions 列会话\n/compact 压缩上下文\n/cd [path] 切工作目录\n/ws [list|save|use|remove] 命名工作空间\n/perm <off|allow|deny|ask> 权限模式\n/allow <id> 授权\n/disallow <id> 撤权\n/list 白名单\n/whoami 我的id\n/help 帮助",
                             &hint,
                         )
                         .await;
@@ -1082,7 +1208,7 @@ impl Dispatcher {
                         self.reply(
                             &conv,
                             &format!(
-                                "未知命令: {cmd}（支持: /new /switch /sessions /compact /cd /perm /allow /disallow /list /whoami /help）"
+                                "未知命令: {cmd}（支持: /new /switch /sessions /compact /cd /ws /perm /allow /disallow /list /whoami /help）"
                             ),
                             &hint,
                         )
