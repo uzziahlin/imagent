@@ -21,7 +21,7 @@ use imagent_core::{
 
 use open_lark::{Config, CoreConfig};
 
-use crate::client::{fetch_token, send_text_msg, FeishuWsClient};
+use crate::client::{download_file, download_image, fetch_token, send_text_msg, FeishuWsClient};
 use crate::proto::{parse_message_event, receive_target_from_conv};
 
 /// 平台名常量。
@@ -73,16 +73,59 @@ impl FeishuPlatform {
             ws.run(payload_tx).await;
         });
 
-        // drain task：payload → parse → Dedup → inbound channel。
+        // drain task：payload → parse → Dedup → 媒体下载落盘 → inbound channel。
         let (inbound_msg_tx, inbound_msg_rx) = mpsc::channel::<InboundMessage>(64);
         let dedup = Dedup::default();
+        // token Arc 须在 spawn 前创建：drain task 下载媒体需取 token（发送/接收共用
+        // 同一 lazy 刷新缓存，见 fetch_cached_token）。
+        let token: Arc<RwLock<Option<(String, Instant)>>> = Arc::new(RwLock::new(None));
+        let core_config_for_drain = core_config.clone();
+        let app_id_for_drain = app_id.clone();
+        let app_secret_for_drain = app_secret.clone();
+        let token_for_drain = token.clone();
         tokio::spawn(async move {
             let mut payload_rx = payload_rx;
             while let Some(payload) = payload_rx.recv().await {
                 match parse_message_event(&payload) {
-                    Some((msgid, msg)) => {
+                    Some((msgid, mut msg, pending)) => {
                         if !dedup.check(&msgid) {
                             continue;
+                        }
+                        // 下载落盘每个待处理媒体；单个失败只 warn 跳过，不丢整条消息。
+                        for p in &pending {
+                            let token = match fetch_cached_token(
+                                &token_for_drain,
+                                &core_config_for_drain,
+                                &app_id_for_drain,
+                                &app_secret_for_drain,
+                            )
+                            .await
+                            {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    warn!(target: "feishu", error = %e, "取 token 失败，跳过该媒体");
+                                    continue;
+                                }
+                            };
+                            let dl = match p.kind {
+                                "image" => {
+                                    download_image(&core_config_for_drain, &token, &p.key).await
+                                }
+                                "file" => {
+                                    download_file(&core_config_for_drain, &token, &p.key).await
+                                }
+                                _ => continue,
+                            };
+                            match dl {
+                                Ok(bytes) => match persist_media(p.kind, &p.key, &bytes) {
+                                    Ok(path) => msg.media.push(MediaRef {
+                                        kind: p.kind.to_string(),
+                                        url: path,
+                                    }),
+                                    Err(e) => warn!(target: "feishu", error = %e, "媒体落盘失败，跳过"),
+                                },
+                                Err(e) => warn!(target: "feishu", error = %e, "媒体下载失败，跳过"),
+                            }
                         }
                         if inbound_msg_tx.send(msg).await.is_err() {
                             break;
@@ -99,24 +142,75 @@ impl FeishuPlatform {
             core_config,
             app_id,
             app_secret,
-            token: Arc::new(RwLock::new(None)),
+            token,
             inbound_rx: Arc::new(Mutex::new(inbound_msg_rx)),
         })
     }
 
     /// 取当前 token：缓存命中（未过 TTL）则返回，否则 `fetch_token` 刷新并缓存。
+    ///
+    /// 逻辑实现在模块级 [`fetch_cached_token`]（drain task 与本方法共用同一缓存）。
     async fn get_token(&self) -> Result<String> {
-        let mut cache = self.token.write().await;
-        if let Some((token, fetched_at)) = cache.as_ref() {
-            if fetched_at.elapsed() < TOKEN_TTL {
-                return Ok(token.clone());
-            }
-        }
-        let token =
-            fetch_token(&self.core_config, &self.app_id, &self.app_secret).await?;
-        *cache = Some((token.clone(), Instant::now()));
-        Ok(token)
+        fetch_cached_token(&self.token, &self.core_config, &self.app_id, &self.app_secret).await
     }
+}
+
+/// 媒体目录：`~/.imagent/media/`（0700）。照 ilink `media_dir` 约定（`dirs::home_dir`）。
+fn media_dir() -> Result<std::path::PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| {
+        CoreError::Platform(PLATFORM, "cannot resolve home dir for media storage".into())
+    })?;
+    let dir = home.join(".imagent").join("media");
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            CoreError::Platform(PLATFORM, format!("create media dir {dir:?}: {e}"))
+        })?;
+    }
+    Ok(dir)
+}
+
+/// 把媒体字节落盘到 `~/.imagent/media/<key>.<ext>`，返回本地路径字符串。
+///
+/// 文件名用飞书的 `image_key`/`file_key`（全局唯一，天然去重覆盖）。照 ilink
+/// `persist_media`：目录 0700、文件 0600（解密后的私聊媒体不暴露给同机其他用户）。
+fn persist_media(kind: &str, key: &str, bytes: &[u8]) -> Result<String> {
+    let dir = media_dir()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let ext = if kind == "image" { "jpg" } else { "bin" };
+    let path = dir.join(format!("{key}.{ext}"));
+    std::fs::write(&path, bytes)
+        .map_err(|e| CoreError::Platform(PLATFORM, format!("write media {path:?}: {e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// 取当前 token：缓存命中（未过 TTL）则返回，否则 `fetch_token` 刷新并缓存。
+///
+/// 提成模块级自由函数——drain task 持有 `Arc<RwLock<…>>` 句柄而无 `&self`，无法调
+/// [`FeishuPlatform::get_token`]，故抽出共用（与发送侧共享同一 lazy 缓存）。
+async fn fetch_cached_token(
+    token_lock: &Arc<RwLock<Option<(String, Instant)>>>,
+    core_config: &CoreConfig,
+    app_id: &str,
+    app_secret: &str,
+) -> Result<String> {
+    let mut cache = token_lock.write().await;
+    if let Some((token, fetched_at)) = cache.as_ref() {
+        if fetched_at.elapsed() < TOKEN_TTL {
+            return Ok(token.clone());
+        }
+    }
+    let token = fetch_token(core_config, app_id, app_secret).await?;
+    *cache = Some((token.clone(), Instant::now()));
+    Ok(token)
 }
 
 #[async_trait]
@@ -149,7 +243,9 @@ impl Platform for FeishuPlatform {
         _media: &MediaRef,
         _hint: &ReplyHint,
     ) -> Result<()> {
-        // TODO: 飞书媒体需 im/v1/images 或 im/v1/files 上传拿 key 再发。MVP 不支持。
+        // TODO: 发媒体需 core 加 `AgentChunk::Media` variant + dispatch 调 send_media
+        // （当前 core 只发文本）；上传 API 已就绪（`image::create::CreateImageRequest`
+        // / `file::create::CreateFileRequest`），待 core 增强后实现。
         Ok(())
     }
 
@@ -196,7 +292,7 @@ mod tests {
         let _handle = tokio::spawn(async move {
             let mut payload_rx = payload_rx;
             while let Some(payload) = payload_rx.recv().await {
-                if let Some((msgid, msg)) = parse_message_event(&payload) {
+                if let Some((msgid, msg, _)) = parse_message_event(&payload) {
                     if !dedup.check(&msgid) {
                         continue;
                     }
@@ -235,7 +331,7 @@ mod tests {
         let _handle = tokio::spawn(async move {
             let mut payload_rx = payload_rx;
             while let Some(payload) = payload_rx.recv().await {
-                if let Some((_msgid, msg)) = parse_message_event(&payload) {
+                if let Some((_msgid, msg, _)) = parse_message_event(&payload) {
                     if tx.send(msg).await.is_err() {
                         break;
                     }
