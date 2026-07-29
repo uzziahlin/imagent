@@ -67,6 +67,10 @@ fn active_name_key(conv_id: &str) -> String {
 fn compact_summary_key(conv_id: &str) -> String {
     format!("compact_summary:{conv_id}")
 }
+/// per-conv 工作目录的 config 键：`workdir:<conv_id>`（由 /cd 设置，覆盖默认 workdir）。
+fn workdir_key(conv_id: &str) -> String {
+    format!("workdir:{conv_id}")
+}
 
 /// 错误是否指示 iLink session 过期（需重新 login）。
 ///
@@ -577,6 +581,14 @@ impl Dispatcher {
         }
     }
 
+    /// 解析 conv 的工作目录：per-conv KV（`/cd` 设置）覆盖，否则回退 `default_workdir`。
+    async fn resolve_workdir(&self, conv_id: &str) -> PathBuf {
+        match self.store.get_config(&workdir_key(conv_id)).await {
+            Ok(Some(p)) => PathBuf::from(p),
+            _ => self.default_workdir.clone(),
+        }
+    }
+
     /// 处理单条消息。内部任何错误都 log 并吞掉，不影响主循环。
     async fn handle(&self, msg: InboundMessage) {
         let conv = msg.conv_id.clone();
@@ -886,7 +898,7 @@ impl Dispatcher {
                                 // 用 claude resume 当前 session 生成摘要；只取 Final/RunOutcome。
                                 let (tx, mut rx) = mpsc::channel::<AgentChunk>(32);
                                 let backend = self.backend.clone();
-                                let workdir = self.default_workdir.clone();
+                                let workdir = self.resolve_workdir(&conv.0).await;
                                 let tools = self.allowed_tools.read().clone();
                                 let conv_id_compact = conv.0.clone();
                                 let agent_timeout = self.agent_timeout;
@@ -982,11 +994,95 @@ impl Dispatcher {
                         }
                         return;
                     }
+                    "/cd" => {
+                        let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+                        if arg.is_empty() {
+                            let wd = self.resolve_workdir(&conv.0).await;
+                            self.reply(
+                                &conv,
+                                &format!("当前工作目录：{}", wd.display()),
+                                &hint,
+                            )
+                            .await;
+                            return;
+                        }
+                        let p = std::path::Path::new(arg);
+                        if !p.is_absolute() {
+                            self.reply(&conv, "用法：/cd <绝对路径>（须绝对路径）", &hint)
+                                .await;
+                            return;
+                        }
+                        if !p.is_dir() {
+                            self.reply(&conv, &format!("目录不存在：{arg}"), &hint)
+                                .await;
+                            return;
+                        }
+                        // 改 per-conv workdir：取 conv 锁串行，与在飞 agent task 隔离。
+                        let _conv_lock = self.acquire_conv_lock(&conv.0).await;
+                        let _conv_guard = _conv_lock.lock().await;
+                        match self.store.set_config(&workdir_key(&conv.0), arg).await {
+                            Ok(_) => self
+                                .reply(
+                                    &conv,
+                                    &format!("✅ 工作目录已切到 {arg}（下条消息生效）"),
+                                    &hint,
+                                )
+                                .await,
+                            Err(e) => self.reply(&conv, &format!("保存失败：{e}"), &hint).await,
+                        }
+                        return;
+                    }
+                    "/perm" => {
+                        let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+                        if arg.is_empty() {
+                            let cur = *self.permission_mode.read();
+                            self.reply(
+                                &conv,
+                                &format!("当前权限模式：{cur:?}\n用法：/perm <off|allow|deny|ask>"),
+                                &hint,
+                            )
+                            .await;
+                            return;
+                        }
+                        match arg {
+                            "off" | "allow" | "deny" | "ask" => {
+                                let mode = PermissionMode::from_str_lossy(arg);
+                                self.reload_permission_mode(mode);
+                                // Ask 模式的权限审批 socket 仅在 run() 启动时按当时模式
+                                // spawn 一次，热切到 Ask 不会补起 socket（重启生效）。
+                                let note = if arg == "ask" {
+                                    "（注意：Ask 模式的权限审批 socket 需重启 imagent 才生效）"
+                                } else {
+                                    ""
+                                };
+                                self.reply(
+                                    &conv,
+                                    &format!("✅ 权限模式已切到 {arg}{note}"),
+                                    &hint,
+                                )
+                                .await;
+                            }
+                            _ => {
+                                self.reply(&conv, "用法：/perm <off|allow|deny|ask>", &hint)
+                                    .await
+                            }
+                        }
+                        return;
+                    }
+                    "/help" => {
+                        self.reply(
+                            &conv,
+                            "命令：\n/new 重置会话\n/switch <name> 切命名会话\n/sessions 列会话\n/compact 压缩上下文\n/cd [path] 切工作目录\n/perm <off|allow|deny|ask> 权限模式\n/allow <id> 授权\n/disallow <id> 撤权\n/list 白名单\n/whoami 我的id\n/help 帮助",
+                            &hint,
+                        )
+                        .await;
+                        return;
+                    }
                     _ => {
                         self.reply(
                             &conv,
                             &format!(
-                                "未知命令: {cmd}（支持: /new /allow /disallow /list /whoami /switch /sessions /compact）"
+                                "未知命令: {cmd}（支持: /new /switch /sessions /compact /cd /perm /allow /disallow /list /whoami /help）"
                             ),
                             &hint,
                         )
@@ -1074,7 +1170,7 @@ impl Dispatcher {
         let run_started = Instant::now();
         let (tx, mut rx) = mpsc::channel::<AgentChunk>(32);
         let backend = self.backend.clone();
-        let workdir = self.default_workdir.clone();
+        let workdir = self.resolve_workdir(&conv.0).await;
         let tools = self.allowed_tools.read().clone();
         let prompt_owned = prompt.clone();
         let conv_id_owned = conv.0.clone();
