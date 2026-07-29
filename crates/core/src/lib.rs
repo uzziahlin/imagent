@@ -16,6 +16,7 @@
 mod auth;
 mod backend;
 pub mod backend_common;
+mod card_session;
 mod config;
 pub mod dedup;
 mod dispatch;
