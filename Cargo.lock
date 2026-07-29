@@ -1415,6 +1415,7 @@ dependencies = [
  "imagent-store",
  "imagent-wecom",
  "parking_lot",
+ "rustls",
  "serde",
  "serde_json",
  "serial_test",

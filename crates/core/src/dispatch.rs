@@ -208,7 +208,7 @@ impl Dispatcher {
 
     /// 主循环。循环 `platform.recv()`，每条消息 `tokio::spawn` 处理（不阻塞 recv）。
     /// recv 返回 Err 时：session 过期 → 优雅停止（返回 Err 让 main 提示重新 login）；
-    /// 其它错误 → 记录日志后继续（长轮询层自管重连/退避），不 panic。
+    /// 其它错误 → 指数退避后继续重试（防 client 异常退出导致 dispatcher 忙循环刷屏；ilink 长轮询层另有退避），不 panic。
     pub async fn run(self: Arc<Self>) -> Result<()> {
         // Ask 模式：spawn unix socket accept task（MCP server 转发的权限请求经此进主进程）。
         #[cfg(unix)]
@@ -227,6 +227,9 @@ impl Dispatcher {
             );
         }
 
+        // recv 失败退避（防 client 异常退出后 dispatcher 忙循环刷屏）。
+        let mut recv_backoff = std::time::Duration::from_secs(1);
+        const RECV_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(30);
         loop {
             // P1-5：监听 shutdown 信号，停止接收新消息并进入 drain。
             tokio::select! {
@@ -237,6 +240,7 @@ impl Dispatcher {
                 }
                 msg = self.platform.recv() => match msg {
                     Ok(msg) => {
+                        recv_backoff = std::time::Duration::from_secs(1); // 成功，重置退避
                         let conv_id = msg.conv_id.0.clone();
                         // 权限闭环优先：若该 conv 正等待 approve/deny 回复，把这条消息
                         // 当作回复送达 oneshot。P2-2：直接 route（单次 lock 原子 check+
@@ -261,7 +265,14 @@ impl Dispatcher {
                             );
                             return Err(e);
                         }
-                        warn!(target: "imagent::core", error = %e, "platform.recv 失败，继续重试");
+                        warn!(
+                            target: "imagent::core",
+                            error = %e,
+                            backoff_secs = recv_backoff.as_secs(),
+                            "platform.recv 失败，退避后继续重试（防忙循环刷屏）"
+                        );
+                        tokio::time::sleep(recv_backoff).await;
+                        recv_backoff = (recv_backoff * 2).min(RECV_BACKOFF_CAP);
                     }
                 },
             }
