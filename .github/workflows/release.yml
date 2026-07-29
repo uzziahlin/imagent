@@ -32,6 +32,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88
         with:
           targets: ${{ matrix.target }}
+      # 显式确保 cross-compile target 的 rust-std 已装（@1.88 + rust-toolchain.toml
+      # 组合下 dtolnay 的 targets 偶发不生效 → E0463 can't find crate for `core`）。
+      # host target（如 arm64 runner 的 aarch64）默认自带，cross target（x86_64）须显式 add。
+      - name: Ensure target rust-std installed
+        run: rustup target add ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: Build release
         run: cargo build --release --locked --target ${{ matrix.target }}
