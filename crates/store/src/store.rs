@@ -649,6 +649,26 @@ impl Store {
         .await
     }
 
+    /// 列出所有以 `prefix` 开头的 config KV（key 升序）。/ws list 用（prefix="workspace:"）。
+    pub async fn list_config(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        let prefix = prefix.to_string();
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let mut stmt =
+                conn.prepare("SELECT key, value FROM config WHERE key LIKE ?1 ORDER BY key")?;
+            let like = format!("{prefix}%");
+            let rows = stmt.query_map(rusqlite::params![like], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r?);
+            }
+            Ok(v)
+        })
+        .await
+    }
+
     // —— named_sessions（B1/B2：命名 session 侧表）——
 
     /// 插入或更新（按 conv_id + name）。created_at 仅新建时写入；更新时保留原 created_at、刷新 updated_at。
