@@ -17,3 +17,4 @@ async-trait = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+dirs = { workspace = true }

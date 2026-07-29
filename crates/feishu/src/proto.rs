@@ -73,6 +73,27 @@ pub struct TextContent {
     pub text: String,
 }
 
+/// image 类型消息的 content 结构：`{"image_key":"..."}`。
+#[derive(Debug, Deserialize)]
+pub struct ImageContent {
+    pub image_key: String,
+}
+
+/// file 类型消息的 content 结构：`{"file_key":"..."}`。
+#[derive(Debug, Deserialize)]
+pub struct FileContent {
+    pub file_key: String,
+}
+
+/// 待下载的入站媒体（proto 只解析出 key，实际下载落盘在 platform 层）。
+#[derive(Debug, Clone)]
+pub struct PendingMedia {
+    /// `"image"` | `"file"`，直接对应 `MediaRef.kind`。
+    pub kind: &'static str,
+    /// image_key 或 file_key（飞书下载资源标识，全局唯一）。
+    pub key: String,
+}
+
 /// 发消息时的 receive_id 类型（决定 OpenAPI `receive_id_type` 参数）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReceiveIdKind {
@@ -86,39 +107,63 @@ pub enum ReceiveIdKind {
 // 纯函数：解析 / 映射（无网络，验收核心）
 // ---------------------------------------------------------------------------
 
-/// 解析长连接 payload。仅处理 `im.message.receive_v1` 的**文本**消息。
+/// 解析长连接 payload。处理 `im.message.receive_v1` 的 **text / image / file** 消息。
 ///
-/// 返回 `(dedup_key, InboundMessage)`；以下情况返回 `None`（上层丢弃）：
-/// 非目标事件 / 非文本 / 空文本 / content 非法 JSON / payload 非法 JSON / 缺 receive_id。
-pub fn parse_message_event(payload: &[u8]) -> Option<(String, InboundMessage)> {
+/// 返回 `(dedup_key, InboundMessage, pending_media)`；以下情况返回 `None`
+/// （上层丢弃）：非目标事件 / 不支持的消息类型（非 text/image/file）/ text 空文本
+/// / image 缺 image_key / file 缺 file_key / content 非法 JSON / payload 非法 JSON
+/// / 缺 receive_id。`pending_media` 为待下载的图片/文件（仅解析出 key，实际下载
+/// 落盘在 platform 层完成，回填进 `InboundMessage.media`）。
+pub fn parse_message_event(
+    payload: &[u8],
+) -> Option<(String, InboundMessage, Vec<PendingMedia>)> {
     let evt: FeishuEvent = serde_json::from_slice(payload).ok()?;
     if evt.header.event_type != "im.message.receive_v1" {
         return None;
     }
-    if evt.event.message.message_type != "text" {
-        return None;
-    }
-    let text = extract_text(&evt.event.message.content)?;
-    if text.trim().is_empty() {
-        return None;
-    }
+    let mt = evt.event.message.message_type.as_str();
+    // 解析 content：text 提取文本（空文本丢弃），image/file 提取资源 key（缺 key 丢弃）。
+    let (text, pending): (Option<String>, Vec<PendingMedia>) = match mt {
+        "text" => {
+            let t = extract_text(&evt.event.message.content)?;
+            if t.trim().is_empty() {
+                return None;
+            }
+            (Some(t), vec![])
+        }
+        "image" => {
+            let key = extract_image_key(&evt.event.message.content)?;
+            (None, vec![PendingMedia { kind: "image", key }])
+        }
+        "file" => {
+            let key = extract_file_key(&evt.event.message.content)?;
+            (None, vec![PendingMedia { kind: "file", key }])
+        }
+        _ => return None, // audio/video/voice/... 暂不支持
+    };
 
     let open_id = evt.event.sender.sender_id.open_id.clone();
     let (receive_id, _kind) = receive_target(&evt.event)?;
+    // dedup key 回退基准（缺 event_id + message_id 时）：text 用文本长度，image/file 用 key。
+    let dedup_fallback = if mt == "text" {
+        format!("{}:{}", receive_id, text.as_deref().map_or(0, str::len))
+    } else {
+        format!("{}:{}", receive_id, pending[0].key)
+    };
     let dedup_key = evt
         .header
         .event_id
         .clone()
         .or_else(|| evt.event.message.message_id.clone())
-        .unwrap_or_else(|| format!("{}:{}", receive_id, text.len()));
+        .unwrap_or(dedup_fallback);
     let msg = InboundMessage {
         conv_id: ConvId(format!("feishu:{receive_id}")),
         sender: UserId(open_id),
-        text: Some(text),
+        text,
         media: vec![],
         reply_hint: ReplyHint::None,
     };
-    Some((dedup_key, msg))
+    Some((dedup_key, msg, pending))
 }
 
 /// 从 text 消息的 content JSON 提取文本：`{"text":"hi"}` -> `"hi"`。
@@ -127,6 +172,22 @@ pub fn extract_text(content: &str) -> Option<String> {
     serde_json::from_str::<TextContent>(content)
         .ok()
         .map(|c| c.text)
+}
+
+/// 从 image 消息 content 提取 image_key：`{"image_key":"..."}`。
+/// 非法 JSON 或缺字段返回 `None`。
+pub fn extract_image_key(content: &str) -> Option<String> {
+    serde_json::from_str::<ImageContent>(content)
+        .ok()
+        .map(|c| c.image_key)
+}
+
+/// 从 file 消息 content 提取 file_key：`{"file_key":"..."}`。
+/// 非法 JSON 或缺字段返回 `None`。
+pub fn extract_file_key(content: &str) -> Option<String> {
+    serde_json::from_str::<FileContent>(content)
+        .ok()
+        .map(|c| c.file_key)
 }
 
 /// 按 chat_type 决定发回的 receive_id：
@@ -182,11 +243,12 @@ mod tests {
                 "message":{"message_type":"text","content":"{\"text\":\"hi there\"}","chat_type":"p2p","chat_id":"","message_id":"om_msg1"}
             }
         }"#;
-        let (key, msg) = parse_message_event(payload).expect("p2p 文本应解析成功");
+        let (key, msg, pending) = parse_message_event(payload).expect("p2p 文本应解析成功");
         assert_eq!(key, "evt_1");
         assert_eq!(msg.conv_id.0, "feishu:ou_user1");
         assert_eq!(msg.sender.0, "ou_user1");
         assert_eq!(msg.text.as_deref(), Some("hi there"));
+        assert!(pending.is_empty(), "文本消息不应有待下载媒体");
     }
 
     /// group 文本：conv=feishu:<chat_id>、sender=发言者 open_id。
@@ -200,7 +262,7 @@ mod tests {
                 "chat":{"chat_id":"oc_chat1"}
             }
         }"#;
-        let (key, msg) = parse_message_event(payload).expect("group 文本应解析成功");
+        let (key, msg, _) = parse_message_event(payload).expect("group 文本应解析成功");
         assert_eq!(key, "evt_2");
         assert_eq!(msg.conv_id.0, "feishu:oc_chat1");
         assert_eq!(msg.sender.0, "ou_user2");
@@ -217,7 +279,7 @@ mod tests {
                 "message":{"message_type":"text","content":"{\"text\":\"x\"}","chat_type":"group","chat_id":"oc_chat2","message_id":"om_msg3"}
             }
         }"#;
-        let (_key, msg) = parse_message_event(payload).expect("group 回退 chat_id 应成功");
+        let (_key, msg, _) = parse_message_event(payload).expect("group 回退 chat_id 应成功");
         assert_eq!(msg.conv_id.0, "feishu:oc_chat2");
     }
 
@@ -231,14 +293,83 @@ mod tests {
         assert!(parse_message_event(payload).is_none());
     }
 
-    /// 非文本消息丢弃。
+    /// 不支持的媒体类型（audio/video/voice 等）丢弃。
     #[test]
-    fn ignore_non_text() {
+    fn ignore_unsupported_media_type() {
         let payload = br#"{
             "header":{"event_id":"evt_i","event_type":"im.message.receive_v1"},
-            "event":{"sender":{"sender_id":{"open_id":"ou_x"}},"message":{"message_type":"image","content":"{\"image_key\":\"k\"}","chat_type":"p2p"}}
+            "event":{"sender":{"sender_id":{"open_id":"ou_x"}},"message":{"message_type":"audio","content":"{\"file_key\":\"k\"}","chat_type":"p2p"}}
         }"#;
         assert!(parse_message_event(payload).is_none());
+    }
+
+    /// p2p 图片：pending 含 image key，msg.text==None、media 空。
+    #[test]
+    fn parse_p2p_image() {
+        let payload = br#"{
+            "header":{"event_id":"evt_img","event_type":"im.message.receive_v1"},
+            "event":{"sender":{"sender_id":{"open_id":"ou_user1"}},"message":{"message_type":"image","content":"{\"image_key\":\"img_v3_00ab\"}","chat_type":"p2p"}}
+        }"#;
+        let (key, msg, pending) = parse_message_event(payload).expect("图片应解析成功");
+        assert_eq!(key, "evt_img");
+        assert_eq!(msg.conv_id.0, "feishu:ou_user1");
+        assert_eq!(msg.sender.0, "ou_user1");
+        assert!(msg.text.is_none(), "图片消息无文本");
+        assert!(msg.media.is_empty(), "media 由 platform 层回填，proto 阶段为空");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].kind, "image");
+        assert_eq!(pending[0].key, "img_v3_00ab");
+    }
+
+    /// p2p 文件：pending 含 file key。
+    #[test]
+    fn parse_p2p_file() {
+        let payload = br#"{
+            "header":{"event_id":"evt_file","event_type":"im.message.receive_v1"},
+            "event":{"sender":{"sender_id":{"open_id":"ou_user2"}},"message":{"message_type":"file","content":"{\"file_key\":\"file_v3_001\"}","chat_type":"p2p"}}
+        }"#;
+        let (key, msg, pending) = parse_message_event(payload).expect("文件应解析成功");
+        assert_eq!(key, "evt_file");
+        assert_eq!(msg.conv_id.0, "feishu:ou_user2");
+        assert!(msg.text.is_none());
+        assert!(msg.media.is_empty());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].kind, "file");
+        assert_eq!(pending[0].key, "file_v3_001");
+    }
+
+    /// image content 缺 image_key（字段缺失）丢弃。
+    #[test]
+    fn ignore_image_missing_key() {
+        let payload = br#"{
+            "header":{"event_id":"e","event_type":"im.message.receive_v1"},
+            "event":{"sender":{"sender_id":{"open_id":"ou_x"}},"message":{"message_type":"image","content":"{}","chat_type":"p2p"}}
+        }"#;
+        assert!(parse_message_event(payload).is_none());
+    }
+
+    /// image content 非法 JSON 丢弃。
+    #[test]
+    fn ignore_image_invalid_content_json() {
+        let payload = br#"{"header":{"event_id":"e","event_type":"im.message.receive_v1"},
+            "event":{"sender":{"sender_id":{"open_id":"ou_x"}},"message":{"message_type":"image","content":"not-json","chat_type":"p2p"}}}"#;
+        assert!(parse_message_event(payload).is_none());
+    }
+
+    /// image 消息缺 event_id 时 dedup 回退到 message_id，再缺回退到 receive_id:image_key。
+    #[test]
+    fn image_dedup_fallback() {
+        // 有 message_id → 用 message_id。
+        let p1 = br#"{"header":{"event_type":"im.message.receive_v1"},
+            "event":{"sender":{"sender_id":{"open_id":"ou_x"}},"message":{"message_type":"image","content":"{\"image_key\":\"img_k1\"}","chat_type":"p2p","message_id":"om_img1"}}}"#;
+        let (key, _, _) = parse_message_event(p1).expect("应解析成功");
+        assert_eq!(key, "om_img1");
+
+        // event_id 与 message_id 都缺 → 回退 receive_id:image_key。
+        let p2 = br#"{"header":{"event_type":"im.message.receive_v1"},
+            "event":{"sender":{"sender_id":{"open_id":"ou_x"}},"message":{"message_type":"image","content":"{\"image_key\":\"img_k2\"}","chat_type":"p2p"}}}"#;
+        let (key2, _, _) = parse_message_event(p2).expect("应解析成功");
+        assert_eq!(key2, "ou_x:img_k2");
     }
 
     /// 空文本（含纯空白）丢弃。
@@ -275,7 +406,7 @@ mod tests {
             "header":{"event_type":"im.message.receive_v1"},
             "event":{"sender":{"sender_id":{"open_id":"ou_user9"}},"message":{"message_type":"text","content":"{\"text\":\"hi\"}","chat_type":"p2p","message_id":"om_fb"}}
         }"#;
-        let (key, _) = parse_message_event(payload).expect("应解析成功");
+        let (key, _, _) = parse_message_event(payload).expect("应解析成功");
         assert_eq!(key, "om_fb");
     }
 

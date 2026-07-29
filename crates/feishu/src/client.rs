@@ -18,6 +18,8 @@ use tracing::{info, warn};
 
 use open_lark::auth::AuthService;
 use open_lark::communication::im::v1::message::create::{CreateMessageBody, CreateMessageRequest};
+use open_lark::communication::im::v1::image::get::GetImageRequest;
+use open_lark::communication::im::v1::file::get::GetFileRequest;
 use open_lark::communication::im::v1::message::models::ReceiveIdType;
 use open_lark::ws_client::{EventDispatcherHandler, LarkWsClient, WsClientError};
 use open_lark::{CoreConfig, RequestOption};
@@ -102,6 +104,42 @@ pub async fn send_text_msg(
             imagent_core::CoreError::Platform(PLATFORM, format!("send_message: {e}"))
         })?;
     Ok(())
+}
+
+/// 下载飞书消息图片，返回二进制。
+///
+/// 需应用开通 `im:resource` 权限（读取消息中的资源文件）。
+pub async fn download_image(
+    core_config: &CoreConfig,
+    token: &str,
+    image_key: &str,
+) -> imagent_core::Result<Vec<u8>> {
+    let option = RequestOption::builder()
+        .tenant_access_token(token.to_string())
+        .build();
+    GetImageRequest::new(core_config.clone())
+        .image_key(image_key.to_string())
+        .execute_with_options(option)
+        .await
+        .map_err(|e| imagent_core::CoreError::Platform(PLATFORM, format!("download_image: {e}")))
+}
+
+/// 下载飞书消息文件，返回二进制。
+///
+/// 需应用开通 `im:resource` 权限（读取消息中的资源文件）。
+pub async fn download_file(
+    core_config: &CoreConfig,
+    token: &str,
+    file_key: &str,
+) -> imagent_core::Result<Vec<u8>> {
+    let option = RequestOption::builder()
+        .tenant_access_token(token.to_string())
+        .build();
+    GetFileRequest::new(core_config.clone())
+        .file_key(file_key.to_string())
+        .execute_with_options(option)
+        .await
+        .map_err(|e| imagent_core::CoreError::Platform(PLATFORM, format!("download_file: {e}")))
 }
 
 /// 获取 `tenant_access_token`（手动，配合 [`send_text_msg`] 的低层写法）。
