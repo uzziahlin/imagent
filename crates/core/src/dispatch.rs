@@ -20,7 +20,9 @@ use crate::metrics::METRICS;
 use crate::permission::{parse_reply, PermissionReply, PermissionRouter};
 use crate::card_session::CardSession;
 use crate::platform::Platform;
-use crate::types::{AgentChunk, CardTerminal, ConvId, InboundMessage, ReplyHint, SessionId};
+use crate::types::{
+    AgentChunk, CardTerminal, ConvId, InboundMessage, MediaRef, ReplyHint, SessionId,
+};
 use imagent_store::{NamedSessionRow, SessionRow, Store};
 use parking_lot::RwLock;
 use tokio::sync::{mpsc, Mutex};
@@ -1345,6 +1347,8 @@ impl Dispatcher {
         let mut final_text: Option<String> = None;
         let mut error_text: Option<String> = None;
         let mut tool_calls: Vec<(String, String)> = Vec::new();
+        // agent 产出的媒体文件路径（Write 图片）；run 结束后回传 IM。
+        let mut media_out: Vec<String> = Vec::new();
         // 流式卡片：支持卡片的平台累积输出 + 节流 patch（单卡片更新），不支持则每 Text 多发文本。
         let mut card = if self.platform.supports_streaming_card() {
             Some(CardSession::new())
@@ -1364,6 +1368,9 @@ impl Dispatcher {
                     }
                 }
                 AgentChunk::ToolResult { .. } => {} // 摘要只列工具调用，结果不进 IM
+                AgentChunk::Media { path } => {
+                    media_out.push(path);
+                }
                 AgentChunk::Text(t) => {
                     if let Some(c) = card.as_mut() {
                         c.append_text(&t, &conv, &hint, self.platform.as_ref())
@@ -1474,6 +1481,22 @@ impl Dispatcher {
             .await;
         } else {
             self.reply(&conv, &reply, &hint).await;
+        }
+
+        // agent 产图回传：run 结束文件已写完；存在才发，单个失败仅 warn 不影响其余。
+        for mpath in &media_out {
+            let p = std::path::Path::new(mpath);
+            if !p.is_file() {
+                warn!(target: "imagent::core", conv_id = %conv.0, path = %mpath, "产出的媒体文件不存在，跳过回传");
+                continue;
+            }
+            let media = MediaRef {
+                kind: "image".to_string(),
+                url: mpath.clone(),
+            };
+            if let Err(e) = self.platform.send_media(&conv, &media, &hint).await {
+                warn!(target: "imagent::core", conv_id = %conv.0, path = %mpath, error = %e, "send_media 回传失败");
+            }
         }
 
         // 落库（upsert 内部保留 created_at；store 错误仅 log）。
