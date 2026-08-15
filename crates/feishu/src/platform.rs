@@ -384,7 +384,22 @@ impl Platform for FeishuPlatform {
                 CardTerminal::Running => {
                     let content = stream_body_md(&card.text, &card.tool_calls);
                     let seq = self.next_card_seq(card_id).await;
-                    patch_card_element(&token, card_id, "md_body", &content, seq).await
+                    match patch_card_element(&token, card_id, "md_body", &content, seq).await {
+                        // 流式超时（200850）：服务端已自动关流式，长任务 Running 期会触发。
+                        // 自愈：重开 streaming_mode 后重试一次（sequence 继续递增）。
+                        Err(e) if e.to_string().contains("code=200850") => {
+                            warn!(target: "feishu", card_id, "流式超时，重开 streaming_mode 后重试");
+                            let settings = serde_json::json!({
+                                "config": { "streaming_mode": true }
+                            })
+                            .to_string();
+                            let seq2 = self.next_card_seq(card_id).await;
+                            patch_card_settings(&token, card_id, &settings, seq2).await?;
+                            let seq3 = self.next_card_seq(card_id).await;
+                            patch_card_element(&token, card_id, "md_body", &content, seq3).await
+                        }
+                        other => other,
+                    }
                 }
                 CardTerminal::Done | CardTerminal::Error(_) => {
                     let err = match &card.terminal {
