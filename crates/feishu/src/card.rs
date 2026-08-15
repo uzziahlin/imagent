@@ -5,7 +5,8 @@ use imagent_core::{CardTerminal, OutboundCard};
 /// 渲染 [`OutboundCard`] 为飞书 interactive 卡片的 content JSON 字符串
 /// （配合 `msg_type = "interactive"` 发送 / patch）。
 ///
-/// MVP：markdown 文本块 + 工具调用摘要 + 状态 footer。折叠面板/流式动效留批2-3。
+/// markdown 文本块 + 工具调用折叠面板 + 状态 footer。
+/// 这是**降级路径**的渲染（managed 真流式路径见 [`render_stream_init_card`]）。
 pub fn render_card(card: &OutboundCard) -> String {
     let (footer, streaming) = match &card.terminal {
         CardTerminal::Running => ("🧠 思考中…", true),
@@ -40,16 +41,94 @@ pub fn render_card(card: &OutboundCard) -> String {
     // 状态 footer（note 行体现终态 / 流式中）
     elements.push(serde_json::json!({ "tag": "markdown", "content": footer }));
 
+    // Running 态带自定义 summary（卡片列表预览/通知处显示，默认「生成中」）；
+    // Done 态 streaming=false 不需要 summary。
+    let config = if streaming {
+        serde_json::json!({
+            "streaming_mode": true,
+            "summary": { "content": "🧠 正在执行任务…" }
+        })
+    } else {
+        serde_json::json!({ "streaming_mode": false })
+    };
     serde_json::json!({
         "schema": "2.0",
-        "config": { "streaming_mode": streaming },
+        "config": config,
         "body": { "elements": elements }
     })
     .to_string()
-    // 注：飞书 CardKit 2.0 结构以「能发出去 + 能 patch」为准。MVP 用最简 markdown 块
-    //    + streaming_mode；若 streaming_mode/config 字段致飞书 400，退回最简
-    //    {"schema":"2.0","body":{"elements":[{tag:markdown,content:text}]}}。但本批无真机，
-    //    单测只验含关键文本 + schema，不改结构。
+}
+
+/// managed 流式卡片的**初始**卡片 JSON（创建 CardKit 实体用）。
+///
+/// 正文 markdown 组件带固定 `element_id = md_body`（后续 element PATCH 的锚点），
+/// 初始内容为空；footer 独立组件体现执行中。`config` 开启流式模式 + 自定义摘要。
+pub fn render_stream_init_card() -> String {
+    serde_json::json!({
+        "schema": "2.0",
+        "config": {
+            "streaming_mode": true,
+            "summary": { "content": "🧠 正在执行任务…" }
+        },
+        "body": { "elements": [
+            { "tag": "markdown", "element_id": "md_body", "content": "…" },
+            { "tag": "markdown", "element_id": "md_footer", "content": "🧠 执行中" }
+        ] }
+    })
+    .to_string()
+}
+
+/// Running 期间 `md_body` 的流式内容：累积正文 + 工具调用紧凑列表。
+///
+/// 工具与正文同置一个 markdown 组件——CardKit 的 element 流式 PATCH 仅支持
+/// markdown 组件（折叠面板不可流式更新），故 managed 路径下工具以列表进正文。
+pub fn stream_body_md(text: &str, tool_calls: &[(String, String)]) -> String {
+    let mut out = String::new();
+    if !text.is_empty() {
+        out.push_str(text);
+    }
+    if !tool_calls.is_empty() {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        let tools: Vec<String> = tool_calls
+            .iter()
+            .map(|(t, inp)| format!("- 🔧 `{t}`：{}", truncate_str(inp, 40)))
+            .collect();
+        out.push_str(&tools.join("\n"));
+    }
+    if out.is_empty() {
+        out.push('…');
+    }
+    out
+}
+
+/// 终态（Done/Error）时 `md_body` 的最终内容：正文 + 工具统计行 + 完成行。
+///
+/// 终态工具用**统计**（按工具名计数）而非全列——卡片正文保持简洁，
+/// 明细在降级路径的折叠面板里（managed 路径不重复罗列）。
+pub fn stream_body_final(text: &str, tool_calls: &[(String, String)], err: Option<&str>) -> String {
+    let mut out = String::new();
+    if let Some(e) = err {
+        out.push_str(&format!("❌ 出错：{e}\n\n"));
+    }
+    if !text.is_empty() {
+        out.push_str(text);
+    }
+    if !tool_calls.is_empty() {
+        // 按工具名计数：Bash(5) Read(3)。
+        let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+        for (t, _) in tool_calls {
+            *counts.entry(t.as_str()).or_default() += 1;
+        }
+        let stats: Vec<String> = counts.iter().map(|(t, n)| format!("{t}({n})")).collect();
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&format!("🔧 工具：{}", stats.join(" ")));
+    }
+    out.push_str("\n\n✅ 完成");
+    out
 }
 
 /// 错误终态卡片。
@@ -84,6 +163,7 @@ mod tests {
         assert!(json.contains("hello"));
         assert!(json.contains("schema"));
         assert!(json.contains("思考中"));
+        assert!(json.contains("正在执行任务"), "Running 态应含自定义 summary: {json}");
     }
 
     #[test]
@@ -107,5 +187,45 @@ mod tests {
             terminal: CardTerminal::Error("boom".into()),
         };
         assert!(render_card(&card).contains("boom"));
+    }
+
+    #[test]
+    fn stream_init_card_has_element_id_and_streaming() {
+        let json = render_stream_init_card();
+        assert!(json.contains("element_id"), "初始卡应含 element_id: {json}");
+        assert!(json.contains("md_body"), "正文组件锚点: {json}");
+        assert!(json.contains("\"streaming_mode\":true"), "应开流式: {json}");
+        assert!(json.contains("正在执行任务"), "应含自定义 summary: {json}");
+    }
+
+    #[test]
+    fn stream_body_md_text_tools_and_empty() {
+        // 空入参给占位。
+        assert_eq!(stream_body_md("", &[]), "…");
+        // 文本 + 工具都有。
+        let tools = vec![("Bash".to_string(), "ls -la".to_string())];
+        let md = stream_body_md("进度", &tools);
+        assert!(md.contains("进度"));
+        assert!(md.contains("🔧 `Bash`"), "工具列表: {md}");
+        // 仅工具（无正文）。
+        let only = stream_body_md("", &tools);
+        assert!(only.starts_with("- 🔧"), "无正文时工具列表开头: {only}");
+    }
+
+    #[test]
+    fn stream_body_final_stats_and_done() {
+        let tools = vec![
+            ("Bash".to_string(), "a".to_string()),
+            ("Bash".to_string(), "b".to_string()),
+            ("Read".to_string(), "c".to_string()),
+        ];
+        let out = stream_body_final("结论", &tools, None);
+        assert!(out.contains("结论"));
+        assert!(out.contains("Bash(2)"), "工具统计: {out}");
+        assert!(out.contains("Read(1)"), "工具统计: {out}");
+        assert!(out.contains("✅ 完成"));
+        // Error 终态带 ❌ 前置。
+        let err = stream_body_final("", &[], Some("boom"));
+        assert!(err.contains("❌ 出错：boom"), "错误前置: {err}");
     }
 }

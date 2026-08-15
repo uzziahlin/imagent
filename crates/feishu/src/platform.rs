@@ -7,7 +7,10 @@
 //! - `send_text()`：`receive_target_from_conv` → `split_message` 分片 → 每片
 //!   `get_token`（lazy 刷新缓存）+ `send_text_msg`（HTTP）。
 //! - `send_media()`：agent 产图回传（上传+发 image 消息）；`send_typing()`：MVP 空实现。
+//! - `send_card()`/`update_card()`：managed 真流式（`card:` 前缀句柄，CardKit 实体 +
+//!   element PATCH 打字机）+ 降级 raw（`msg:` 前缀句柄，整卡 im patch）句柄分流。
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,18 +19,19 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::warn;
 
 use imagent_core::{
-    split_message, ConvId, CoreError, Dedup, InboundMessage, MediaRef, OutboundCard, Platform,
-    ReplyHint, Result,
+    split_message, CardTerminal, ConvId, CoreError, Dedup, InboundMessage, MediaRef, OutboundCard,
+    Platform, ReplyHint, Result,
 };
 
 use open_lark::{Config, CoreConfig};
 
+use crate::card::{render_card, render_stream_init_card, stream_body_final, stream_body_md};
 use crate::client::{
-    download_file, download_image, fetch_token, patch_card, send_card_msg, send_image_msg,
+    create_card_entity, download_file, download_image, fetch_token, patch_card,
+    patch_card_element, patch_card_settings, send_card_msg, send_card_ref_msg, send_image_msg,
     send_text_msg, upload_image, FeishuWsClient,
 };
-use crate::card::render_card;
-use crate::proto::{parse_message_event, receive_target_from_conv};
+use crate::proto::{parse_message_event, receive_target_from_conv, ReceiveIdKind};
 
 /// 平台名常量。
 const PLATFORM: &str = "feishu";
@@ -47,6 +51,8 @@ pub struct FeishuPlatform {
     app_secret: String,
     /// token 缓存：`(token, fetched_at)`，elapsed >= TOKEN_TTL 则刷新。
     token: Arc<RwLock<Option<(String, Instant)>>>,
+    /// CardKit 卡片的 sequence 计数（element/settings PATCH 共用，per card_id 严格递增）。
+    card_seqs: Arc<Mutex<HashMap<String, i64>>>,
     /// 已解析的入站消息 channel，`recv` 直接 await。
     inbound_rx: Arc<Mutex<mpsc::Receiver<InboundMessage>>>,
 }
@@ -176,6 +182,7 @@ impl FeishuPlatform {
             app_id,
             app_secret,
             token,
+            card_seqs: Arc::new(Mutex::new(HashMap::new())),
             inbound_rx: Arc::new(Mutex::new(inbound_msg_rx)),
         })
     }
@@ -185,6 +192,30 @@ impl FeishuPlatform {
     /// 逻辑实现在模块级 [`fetch_cached_token`]（drain task 与本方法共用同一缓存）。
     async fn get_token(&self) -> Result<String> {
         fetch_cached_token(&self.token, &self.core_config, &self.app_id, &self.app_secret).await
+    }
+
+    /// 取该 card_id 的下一个 sequence（严格递增；element 与 settings PATCH 共用）。
+    async fn next_card_seq(&self, card_id: &str) -> i64 {
+        let mut m = self.card_seqs.lock().await;
+        let entry = m.entry(card_id.to_string()).or_insert(0);
+        *entry += 1;
+        *entry
+    }
+
+    /// 降级路径：发 raw 卡片消息（content=卡片 JSON），句柄 `msg:<message_id>`。
+    ///
+    /// managed 路径（create entity）失败时回退到整卡 im patch——体验同旧版，
+    /// 不依赖 `cardkit:card:write` 权限。
+    async fn send_card_raw(
+        &self,
+        receive_id: &str,
+        kind: ReceiveIdKind,
+        card: &OutboundCard,
+        token: &str,
+    ) -> Result<Option<String>> {
+        let card_json = render_card(card);
+        let mid = send_card_msg(&self.core_config, token, receive_id, kind, &card_json).await?;
+        Ok(mid.map(|m| format!("msg:{m}")))
     }
 }
 
@@ -300,6 +331,10 @@ impl Platform for FeishuPlatform {
         true
     }
 
+    /// 发流式卡片。**句柄前缀分流**（core 无感，两种句柄均原样透传给 update_card）：
+    /// - managed（优先）：`create_card_entity` + 发 card_id 引用消息 → `card:<card_id>`，
+    ///   后续 element 级 PATCH 走服务端打字机渲染（需 `cardkit:card:write` 权限）
+    /// - 降级：raw 卡片消息 → `msg:<message_id>`，后续整卡 im patch（体验同旧版）
     async fn send_card(
         &self,
         conv: &ConvId,
@@ -309,21 +344,73 @@ impl Platform for FeishuPlatform {
         let (receive_id, kind) = receive_target_from_conv(conv).ok_or_else(|| {
             CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0))
         })?;
-        let card_json = render_card(card);
         let token = self.get_token().await?;
-        send_card_msg(&self.core_config, &token, &receive_id, kind, &card_json).await
+        match create_card_entity(&token, &render_stream_init_card()).await {
+            Ok(card_id) => {
+                match send_card_ref_msg(&self.core_config, &token, &receive_id, kind, &card_id)
+                    .await
+                {
+                    Ok(_) => Ok(Some(format!("card:{card_id}"))),
+                    Err(e) => {
+                        // 实体已建但消息发送失败：实体作废（14 天过期自然回收），降级 raw。
+                        warn!(target: "feishu", error = %e, "发送卡片引用消息失败，降级 raw 卡片");
+                        self.send_card_raw(&receive_id, kind, card, &token).await
+                    }
+                }
+            }
+            Err(e) => {
+                // 权限未开（cardkit:card:write）或创建失败 → 降级 raw + 整卡 im patch。
+                warn!(target: "feishu", error = %e, "创建卡片实体失败（需 cardkit:card:write 权限），降级 raw 卡片");
+                self.send_card_raw(&receive_id, kind, card, &token).await
+            }
+        }
     }
 
+    /// 更新流式卡片。按 [`send_card`](Self::send_card) 返回的句柄前缀分流：
+    /// - `card:<card_id>`：CardKit 真流式——Running 时 PATCH `md_body`（正文+工具，
+    ///   打字机渐显）；Done/Error 时 PATCH 终态正文（含工具统计+完成行）并 PATCH
+    ///   settings 关闭流式（光标消失）
+    /// - `msg:<message_id>`：降级路径——整卡 im patch（现有行为，含折叠面板）
     async fn update_card(
         &self,
         _conv: &ConvId,
-        message_id: &str,
+        handle: &str,
         card: &OutboundCard,
         _hint: &ReplyHint,
     ) -> Result<()> {
-        let card_json = render_card(card);
         let token = self.get_token().await?;
-        patch_card(&self.core_config, &token, message_id, &card_json).await
+        if let Some(card_id) = handle.strip_prefix("card:") {
+            match &card.terminal {
+                CardTerminal::Running => {
+                    let content = stream_body_md(&card.text, &card.tool_calls);
+                    let seq = self.next_card_seq(card_id).await;
+                    patch_card_element(&token, card_id, "md_body", &content, seq).await
+                }
+                CardTerminal::Done | CardTerminal::Error(_) => {
+                    let err = match &card.terminal {
+                        CardTerminal::Error(e) => Some(e.as_str()),
+                        _ => None,
+                    };
+                    let content = stream_body_final(&card.text, &card.tool_calls, err);
+                    let seq = self.next_card_seq(card_id).await;
+                    let element = patch_card_element(&token, card_id, "md_body", &content, seq).await;
+                    // 关闭流式（光标消失）；sequence 与 element PATCH 共用递增。
+                    let settings =
+                        serde_json::json!({ "config": { "streaming_mode": false } }).to_string();
+                    let seq2 = self.next_card_seq(card_id).await;
+                    patch_card_settings(&token, card_id, &settings, seq2).await?;
+                    element
+                }
+            }
+        } else if let Some(message_id) = handle.strip_prefix("msg:") {
+            let card_json = render_card(card);
+            patch_card(&self.core_config, &token, message_id, &card_json).await
+        } else {
+            Err(CoreError::Platform(
+                PLATFORM,
+                format!("非法卡片句柄: {handle}"),
+            ))
+        }
     }
 
     fn name(&self) -> &'static str {

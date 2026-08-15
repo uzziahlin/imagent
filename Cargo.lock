@@ -1481,6 +1481,7 @@ dependencies = [
  "dirs",
  "imagent-core",
  "openlark",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
