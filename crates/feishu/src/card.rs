@@ -14,7 +14,9 @@ pub fn render_card(card: &OutboundCard) -> String {
     };
     let text = if card.text.is_empty() { "…" } else { &card.text };
     let mut elements = vec![serde_json::json!({ "tag": "markdown", "content": text })];
-    // 工具调用摘要（MVP：markdown 列表；批2-3 再做 collapsible_panel）
+    // 工具调用：折叠面板（默认收起，省卡片高度让 footer 可见；对标 lcab）。
+    // 只用 tag/expanded/header.title/elements 最简字段——CardKit 2.0 对未知属性会报错
+    // （非静默忽略），故避开 background_color/background_style 等易因版本改名的字段。
     if !card.tool_calls.is_empty() {
         let tools_md = card
             .tool_calls
@@ -22,9 +24,17 @@ pub fn render_card(card: &OutboundCard) -> String {
             .map(|(t, inp)| format!("- `{t}`：{}", truncate_str(inp, 60)))
             .collect::<Vec<_>>()
             .join("\n");
+        let n = card.tool_calls.len();
         elements.push(serde_json::json!({
-            "tag": "markdown",
-            "content": format!("**工具调用**\n{tools_md}")
+            "tag": "collapsible_panel",
+            "expanded": false,
+            "header": {
+                "title": {
+                    "tag": "markdown",
+                    "content": format!("🔧 工具调用（{n}）")
+                }
+            },
+            "elements": [{ "tag": "markdown", "content": tools_md }]
         }));
     }
     // 状态 footer（note 行体现终态 / 流式中）

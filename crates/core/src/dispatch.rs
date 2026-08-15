@@ -1427,8 +1427,12 @@ impl Dispatcher {
         } else {
             format!("(done, session={})", outcome.session_id.0)
         };
-        // 工具调用摘要：仅在正常 final 分支附加（不在 backend 错误回复上附加）。
-        if !tool_calls.is_empty() && (final_text_is_present || outcome_has_final) {
+        // 工具调用摘要：仅无卡片平台（ilink/wecom）追加文本摘要；卡片平台由 render_card
+        // 的折叠面板统一渲染，避免正文与卡片块重复展示工具调用。
+        if !tool_calls.is_empty()
+            && card.is_none()
+            && (final_text_is_present || outcome_has_final)
+        {
             reply.push_str(&format_tool_summary(&tool_calls));
         }
         // R1：backend 标记非正常终止（崩溃等）时，回复前置告警，让用户感知是部分输出而非正常结果。
