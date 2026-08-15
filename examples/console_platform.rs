@@ -31,6 +31,7 @@ impl Platform for ConsolePlatform {
             sender: UserId("local-user".to_string()),
             text: Some(text),
             media: Vec::new(),
+            media_errors: Vec::new(),
             reply_hint: ReplyHint::None,
         })
     }

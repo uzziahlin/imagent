@@ -209,6 +209,7 @@ pub fn parse_message_event(
         sender: UserId(open_id),
         text,
         media: vec![],
+        media_errors: Vec::new(),
         reply_hint: ReplyHint::None,
     };
     Some((dedup_key, msg, pending))

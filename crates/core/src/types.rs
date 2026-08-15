@@ -40,6 +40,9 @@ pub struct InboundMessage {
     pub text: Option<String>,
     /// 入站媒体引用（ilink 图片/文件等已落盘；无媒体则空）。
     pub media: Vec<MediaRef>,
+    /// 媒体下载/落盘失败的原因（platform 层记录，含真实错误）。
+    /// dispatch 据此向用户报错/注入 prompt，而非静默丢弃。无失败则空。
+    pub media_errors: Vec<String>,
     pub reply_hint: ReplyHint,
 }
 

@@ -193,6 +193,7 @@ pub fn parse_msg_callback(frame: &WsFrame) -> imagent_core::Result<(String, Inbo
         sender: UserId(userid),
         text,
         media: vec![],
+        media_errors: Vec::new(),
         reply_hint: ReplyHint::None,
     };
     // 返回 msgid 供上层（drain task）做滑动窗口去重（P1-I）。
