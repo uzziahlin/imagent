@@ -114,10 +114,22 @@ impl FeishuPlatform {
                             };
                             let dl = match p.kind {
                                 "image" => {
-                                    download_image(&core_config_for_drain, &token, &p.key).await
+                                    download_image(
+                                        &core_config_for_drain,
+                                        &token,
+                                        &p.message_id,
+                                        &p.key,
+                                    )
+                                    .await
                                 }
                                 "file" => {
-                                    download_file(&core_config_for_drain, &token, &p.key).await
+                                    download_file(
+                                        &core_config_for_drain,
+                                        &token,
+                                        &p.message_id,
+                                        &p.key,
+                                    )
+                                    .await
                                 }
                                 _ => continue,
                             };
@@ -129,7 +141,13 @@ impl FeishuPlatform {
                                     }),
                                     Err(e) => warn!(target: "feishu", error = %e, "媒体落盘失败，跳过"),
                                 },
-                                Err(e) => warn!(target: "feishu", error = %e, "媒体下载失败，跳过"),
+                                Err(e) => warn!(
+                                    target: "feishu",
+                                    error = %e,
+                                    message_id = %p.message_id,
+                                    file_key = %p.key,
+                                    "媒体下载失败，跳过"
+                                ),
                             }
                         }
                         if inbound_msg_tx.send(msg).await.is_err() {

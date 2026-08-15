@@ -84,6 +84,25 @@ pub struct ImageContent {
 pub struct FileContent {
     pub file_key: String,
 }
+/// post 富文本消息的 content 结构：`{"title","content":[[节点...]]}`。
+/// content 是行×列二维数组；未知字段（content_v2 等）由 serde 默认忽略。
+#[derive(Debug, Deserialize)]
+struct PostContent {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    content: Vec<Vec<PostNode>>,
+}
+
+/// post 富文本节点（裁剪：只取关心的 tag/字段，未知字段忽略）。
+#[derive(Debug, Deserialize)]
+struct PostNode {
+    tag: String,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    image_key: Option<String>,
+}
 
 /// 待下载的入站媒体（proto 只解析出 key，实际下载落盘在 platform 层）。
 #[derive(Debug, Clone)]
@@ -92,6 +111,8 @@ pub struct PendingMedia {
     pub kind: &'static str,
     /// image_key 或 file_key（飞书下载资源标识，全局唯一）。
     pub key: String,
+    /// 所属消息 id。下载「用户发来的」资源必须走 message-resource 接口，飞书要求 message_id。
+    pub message_id: String,
 }
 
 /// 发消息时的 receive_id 类型（决定 OpenAPI `receive_id_type` 参数）。
@@ -107,13 +128,13 @@ pub enum ReceiveIdKind {
 // 纯函数：解析 / 映射（无网络，验收核心）
 // ---------------------------------------------------------------------------
 
-/// 解析长连接 payload。处理 `im.message.receive_v1` 的 **text / image / file** 消息。
+/// 解析长连接 payload。处理 `im.message.receive_v1` 的 **text / image / file / post** 消息。
 ///
 /// 返回 `(dedup_key, InboundMessage, pending_media)`；以下情况返回 `None`
-/// （上层丢弃）：非目标事件 / 不支持的消息类型（非 text/image/file）/ text 空文本
-/// / image 缺 image_key / file 缺 file_key / content 非法 JSON / payload 非法 JSON
-/// / 缺 receive_id。`pending_media` 为待下载的图片/文件（仅解析出 key，实际下载
-/// 落盘在 platform 层完成，回填进 `InboundMessage.media`）。
+/// （上层丢弃）：非目标事件 / 不支持的消息类型（非 text/image/file/post）/ text 空文本
+/// / image 缺 image_key / file 缺 file_key / post 无文字且无图片 / content 非法 JSON
+/// / payload 非法 JSON / 缺 receive_id。`pending_media` 为待下载的图片/文件（仅解析出
+/// key，实际下载落盘在 platform 层完成，回填进 `InboundMessage.media`）。
 pub fn parse_message_event(
     payload: &[u8],
 ) -> Option<(String, InboundMessage, Vec<PendingMedia>)> {
@@ -122,6 +143,7 @@ pub fn parse_message_event(
         return None;
     }
     let mt = evt.event.message.message_type.as_str();
+    let message_id = evt.event.message.message_id.clone().unwrap_or_default();
     // 解析 content：text 提取文本（空文本丢弃），image/file 提取资源 key（缺 key 丢弃）。
     let (text, pending): (Option<String>, Vec<PendingMedia>) = match mt {
         "text" => {
@@ -133,22 +155,48 @@ pub fn parse_message_event(
         }
         "image" => {
             let key = extract_image_key(&evt.event.message.content)?;
-            (None, vec![PendingMedia { kind: "image", key }])
+            (
+                None,
+                vec![PendingMedia {
+                    kind: "image",
+                    key,
+                    message_id: message_id.clone(),
+                }],
+            )
         }
         "file" => {
             let key = extract_file_key(&evt.event.message.content)?;
-            (None, vec![PendingMedia { kind: "file", key }])
+            (
+                None,
+                vec![PendingMedia {
+                    kind: "file",
+                    key,
+                    message_id,
+                }],
+            )
+        }
+        "post" => {
+            let (t, mut p) = parse_post(&evt.event.message.content)?;
+            for m in &mut p {
+                m.message_id = message_id.clone();
+            }
+            // 文本与图片皆空才视为无效丢弃（防御：空 post）。
+            if t.as_deref().is_none_or(|s| s.trim().is_empty()) && p.is_empty() {
+                return None;
+            }
+            (t, p)
         }
         _ => return None, // audio/video/voice/... 暂不支持
     };
 
     let open_id = evt.event.sender.sender_id.open_id.clone();
     let (receive_id, _kind) = receive_target(&evt.event)?;
-    // dedup key 回退基准（缺 event_id + message_id 时）：text 用文本长度，image/file 用 key。
-    let dedup_fallback = if mt == "text" {
-        format!("{}:{}", receive_id, text.as_deref().map_or(0, str::len))
-    } else {
-        format!("{}:{}", receive_id, pending[0].key)
+    // dedup 回退基准：优先正文长度，其次首个媒体 key，最后用消息类型兜底
+    // （post 可能纯文字 pending 空、或纯图片 text 空，旧逻辑 pending[0] 会 panic）。
+    let dedup_fallback = match (text.as_deref(), pending.first()) {
+        (Some(t), _) if !t.trim().is_empty() => format!("{}:{}", receive_id, t.len()),
+        (_, Some(p)) => format!("{}:{}", receive_id, p.key),
+        _ => format!("{receive_id}:{mt}"),
     };
     let dedup_key = evt
         .header
@@ -188,6 +236,40 @@ pub fn extract_file_key(content: &str) -> Option<String> {
     serde_json::from_str::<FileContent>(content)
         .ok()
         .map(|c| c.file_key)
+}
+
+/// 解析 post 富文本：提取所有 text 节点拼成正文 + 所有 img 节点的 image_key。
+/// content 非法 JSON 返回 `None`。text 全空则正文为 `None`。
+fn parse_post(content: &str) -> Option<(Option<String>, Vec<PendingMedia>)> {
+    let post: PostContent = serde_json::from_str(content).ok()?;
+    let mut texts: Vec<String> = Vec::new();
+    let mut pending: Vec<PendingMedia> = Vec::new();
+    if !post.title.trim().is_empty() {
+        texts.push(post.title);
+    }
+    for row in &post.content {
+        for node in row {
+            match node.tag.as_str() {
+                "text" => {
+                    if let Some(t) = node.text.as_ref().filter(|s| !s.is_empty()) {
+                        texts.push(t.clone());
+                    }
+                }
+                "img" => {
+                    if let Some(k) = node.image_key.as_ref().filter(|s| !s.is_empty()) {
+                        pending.push(PendingMedia {
+                            kind: "image",
+                            key: k.clone(),
+                            message_id: String::new(),
+                        });
+                    }
+                }
+                _ => {} // at/a/mention 等暂忽略
+            }
+        }
+    }
+    let text = if texts.is_empty() { None } else { Some(texts.join("\n")) };
+    Some((text, pending))
 }
 
 /// 按 chat_type 决定发回的 receive_id：
@@ -436,5 +518,56 @@ mod tests {
         assert_eq!(extract_text(r#"{"text":"hello"}"#), Some("hello".to_string()));
         assert_eq!(extract_text("not json"), None);
         assert_eq!(extract_text(""), None);
+    }
+
+    /// post 图片+文字：提取正文 + image_key。
+    #[test]
+    fn parse_p2p_post_image_text() {
+        let payload = r#"{
+            "header":{"event_id":"evt_post","event_type":"im.message.receive_v1"},
+            "event":{"sender":{"sender_id":{"open_id":"ou_user1"}},"message":{"message_type":"post","content":"{\"title\":\"\",\"content\":[[{\"tag\":\"img\",\"image_key\":\"img_v3_abc\",\"width\":539,\"height\":317}],[{\"tag\":\"text\",\"text\":\"你能给我描述一下这张图片吗？\",\"style\":[]}]]}","chat_type":"p2p"}}
+        }"#;
+        let (key, msg, pending) = parse_message_event(payload.as_bytes()).expect("post 图片+文字应解析成功");
+        assert_eq!(key, "evt_post");
+        assert_eq!(msg.text.as_deref(), Some("你能给我描述一下这张图片吗？"));
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].kind, "image");
+        assert_eq!(pending[0].key, "img_v3_abc");
+    }
+
+    /// post 纯图片（无文字）：text=None, pending=[image]。
+    #[test]
+    fn parse_p2p_post_image_only() {
+        let payload = r#"{
+            "header":{"event_type":"im.message.receive_v1"},
+            "event":{"sender":{"sender_id":{"open_id":"ou_u"}},"message":{"message_type":"post","content":"{\"content\":[[{\"tag\":\"img\",\"image_key\":\"img_only\"}]]}","chat_type":"p2p","message_id":"om_p"}}
+        }"#;
+        let (key, msg, pending) = parse_message_event(payload.as_bytes()).expect("纯图片 post 应解析");
+        assert_eq!(key, "om_p");
+        assert!(msg.text.is_none(), "纯图片 post 无正文");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].key, "img_only");
+    }
+
+    /// post 纯文字（无图）：text=..., pending=[]。
+    #[test]
+    fn parse_p2p_post_text_only() {
+        let payload = r#"{
+            "header":{"event_id":"e","event_type":"im.message.receive_v1"},
+            "event":{"sender":{"sender_id":{"open_id":"ou_u"}},"message":{"message_type":"post","content":"{\"content\":[[{\"tag\":\"text\",\"text\":\"hello post\"}]]}","chat_type":"p2p"}}
+        }"#;
+        let (_key, msg, pending) = parse_message_event(payload.as_bytes()).expect("纯文字 post 应解析");
+        assert_eq!(msg.text.as_deref(), Some("hello post"));
+        assert!(pending.is_empty(), "纯文字 post 无图片");
+    }
+
+    /// post 空内容（无文字无图）丢弃。
+    #[test]
+    fn ignore_empty_post() {
+        let payload = r#"{
+            "header":{"event_id":"e","event_type":"im.message.receive_v1"},
+            "event":{"sender":{"sender_id":{"open_id":"ou_u"}},"message":{"message_type":"post","content":"{\"content\":[]}","chat_type":"p2p"}}
+        }"#;
+        assert!(parse_message_event(payload.as_bytes()).is_none());
     }
 }
