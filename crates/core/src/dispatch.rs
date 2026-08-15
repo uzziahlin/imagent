@@ -1160,6 +1160,82 @@ impl Dispatcher {
                         }
                         return;
                     }
+                    "/img" => {
+                        let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+                        if arg.is_empty() {
+                            self.reply(
+                                &conv,
+                                "用法：/img <图片路径>（相对当前工作目录或绝对路径）",
+                                &hint,
+                            )
+                            .await;
+                            return;
+                        }
+                        let wd = self.resolve_workdir(&conv.0).await;
+                        let raw = std::path::Path::new(arg);
+                        let joined = if raw.is_absolute() {
+                            raw.to_path_buf()
+                        } else {
+                            wd.join(raw)
+                        };
+                        // 安全校验：canonicalize 后必须仍在 workdir 内——与 agent 的
+                        // Read 权限对齐（能 Read 才能发），防任意路径（~/.ssh 等）外传。
+                        let wd_real = match wd.canonicalize() {
+                            Ok(p) => p,
+                            Err(e) => {
+                                self.reply(&conv, &format!("工作目录不可用：{e}"), &hint).await;
+                                return;
+                            }
+                        };
+                        let real = match joined.canonicalize() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                self.reply(&conv, &format!("文件不存在：{arg}"), &hint).await;
+                                return;
+                            }
+                        };
+                        if !real.starts_with(&wd_real) {
+                            self.reply(
+                                &conv,
+                                &format!("拒绝：{arg} 不在当前工作目录内（/cd 可切换）"),
+                                &hint,
+                            )
+                            .await;
+                            return;
+                        }
+                        if !real.is_file() {
+                            self.reply(&conv, &format!("不是文件：{arg}"), &hint).await;
+                            return;
+                        }
+                        let ext_ok = real
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .map(|e| {
+                                matches!(
+                                    e.to_ascii_lowercase().as_str(),
+                                    "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+                                )
+                            })
+                            .unwrap_or(false);
+                        if !ext_ok {
+                            self.reply(
+                                &conv,
+                                "仅支持图片（png/jpg/jpeg/gif/webp/bmp）",
+                                &hint,
+                            )
+                            .await;
+                            return;
+                        }
+                        let media = MediaRef {
+                            kind: "image".to_string(),
+                            url: real.to_string_lossy().into_owned(),
+                        };
+                        match self.platform.send_media(&conv, &media, &hint).await {
+                            Ok(()) => self.reply(&conv, &format!("✅ 已发送：{arg}"), &hint).await,
+                            Err(e) => self.reply(&conv, &format!("发送失败：{e}"), &hint).await,
+                        }
+                        return;
+                    }
                     "/perm" => {
                         let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
                         if arg.is_empty() {
@@ -1200,7 +1276,7 @@ impl Dispatcher {
                     "/help" => {
                         self.reply(
                             &conv,
-                            "命令：\n/new 重置会话\n/switch <name> 切命名会话\n/sessions 列会话\n/compact 压缩上下文\n/cd [path] 切工作目录\n/ws [list|save|use|remove] 命名工作空间\n/perm <off|allow|deny|ask> 权限模式\n/allow <id> 授权\n/disallow <id> 撤权\n/list 白名单\n/whoami 我的id\n/help 帮助",
+                            "命令：\n/new 重置会话\n/switch <name> 切命名会话\n/sessions 列会话\n/compact 压缩上下文\n/cd [path] 切工作目录\n/ws [list|save|use|remove] 命名工作空间\n/img <path> 发图片\n/perm <off|allow|deny|ask> 权限模式\n/allow <id> 授权\n/disallow <id> 撤权\n/list 白名单\n/whoami 我的id\n/help 帮助",
                             &hint,
                         )
                         .await;
@@ -1210,7 +1286,7 @@ impl Dispatcher {
                         self.reply(
                             &conv,
                             &format!(
-                                "未知命令: {cmd}（支持: /new /switch /sessions /compact /cd /ws /perm /allow /disallow /list /whoami /help）"
+                                "未知命令: {cmd}（支持: /new /switch /sessions /compact /cd /ws /img /perm /allow /disallow /list /whoami /help）"
                             ),
                             &hint,
                         )
@@ -1804,9 +1880,12 @@ mod tests {
         async fn send_media(
             &self,
             _conv: &ConvId,
-            _media: &crate::types::MediaRef,
+            media: &crate::types::MediaRef,
             _hint: &ReplyHint,
         ) -> Result<()> {
+            // 以 [media:<url>] 记入 inbox，供 /img 等测试断言回传内容。
+            self.inbox.lock().await.push(format!("[media:{}]", media.url));
+            self.send_count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         fn name(&self) -> &'static str {
@@ -1960,6 +2039,11 @@ mod tests {
     }
 
     async fn build(auth: Auth) -> Ctx {
+        build_with_workdir(auth, std::path::PathBuf::from("/tmp/imagent-test-ws")).await
+    }
+
+    /// 与 build 相同但可指定 default_workdir（/img 等需真实文件系统的测试用）。
+    async fn build_with_workdir(auth: Auth, default_workdir: std::path::PathBuf) -> Ctx {
         let (plat, inbox, send_count) = MockPlatform::new();
         let (back, calls, prompts, order) = MockBackend::new();
         let (store, db) = tmp_store().await;
@@ -1969,7 +2053,7 @@ mod tests {
             Arc::new(back),
             store,
             auth,
-            std::path::PathBuf::from("/tmp/imagent-test-ws"),
+            default_workdir,
             vec!["Read".into(), "Edit".into()],
             PermissionMode::Off,
             std::time::Duration::from_secs(600),
@@ -2094,6 +2178,57 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    /// /img：workdir 内图片经 send_media 回传；workdir 外拒绝；缺文件提示。
+    #[tokio::test]
+    async fn img_sends_rejects_and_reports() {
+        let _serial = SERIAL.lock().await;
+        let outer = std::env::temp_dir().join(format!("imagent-img-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outer);
+        let wd = outer.join("ws");
+        std::fs::create_dir_all(&wd).unwrap();
+        let img = wd.join("a.png");
+        std::fs::write(&img, b"png").unwrap();
+        // workdir 外放一个真实文件，供逃逸拒绝分支（须存在才能过 canonicalize）。
+        std::fs::write(outer.join("b.png"), b"png").unwrap();
+
+        let ctx = build_with_workdir(Auth::new(vec!["alice".into()]), wd.clone()).await;
+        feed_and_wait(
+            &ctx,
+            vec![
+                msg("feishu:ou_t", "alice", "/img a.png"),
+                msg("feishu:ou_t", "alice", "/img ../b.png"),
+                msg("feishu:ou_t", "alice", "/img nope.png"),
+            ],
+            0,
+        )
+        .await;
+
+        let inbox = ctx.inbox.lock().await.clone();
+        // macOS 下 /var 是 /private/var 的 symlink，send_media 用 canonicalize 后的
+        // 真实路径，断言同样 canonicalize 后比较。
+        let img_real = img.canonicalize().unwrap();
+        assert!(
+            inbox
+                .iter()
+                .any(|m| *m == format!("[media:{}]", img_real.display())),
+            "workdir 内图片应回传: {inbox:?}"
+        );
+        assert!(
+            inbox.iter().any(|m| m.contains("不在当前工作目录")),
+            "workdir 外应拒绝: {inbox:?}"
+        );
+        assert!(
+            inbox.iter().any(|m| m.contains("文件不存在")),
+            "缺文件应提示: {inbox:?}"
+        );
+        assert!(
+            !inbox.iter().any(|m| m.contains("b.png]")),
+            "workdir 外文件不应回传: {inbox:?}"
+        );
+        drop_db(ctx.db.clone()).await;
+        let _ = std::fs::remove_dir_all(&outer);
     }
 
     async fn drop_db(p: std::path::PathBuf) {
