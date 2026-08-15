@@ -1222,7 +1222,19 @@ impl Dispatcher {
         // 4. 普通消息。
         let base_prompt = msg.text.clone().unwrap_or_default();
         // 文本与媒体皆空才丢弃；媒体消息（无文本）仍驱动 agent。
+        // 纯媒体但全部下载失败：向用户报真实错误，不静默。
         if base_prompt.trim().is_empty() && msg.media.is_empty() {
+            if !msg.media_errors.is_empty() {
+                let errs = msg.media_errors.join("; ");
+                self.reply(
+                    &conv,
+                    &format!(
+                        "⚠️ 收到的媒体处理失败，无法查看：{errs}\n（常见原因：应用缺少 im:message:readonly 权限或权限未发布生效；详见服务端日志）"
+                    ),
+                    &hint,
+                )
+                .await;
+            }
             return;
         }
 
@@ -1262,15 +1274,21 @@ impl Dispatcher {
             }
         };
 
-        // 媒体提示：把本地媒体路径前置告知 agent（claude 可 Read 本地文件）。
-        let media_hint = if msg.media.is_empty() {
+        // 媒体提示：把本地媒体路径前置告知 agent（claude 可 Read 本地文件）；
+        // 下载失败的媒体也一并列出，让 agent 知道用户附了图但没拿到。
+        let media_hint = if msg.media.is_empty() && msg.media_errors.is_empty() {
             String::new()
         } else {
-            let lines: Vec<String> = msg
+            let mut lines: Vec<String> = msg
                 .media
                 .iter()
                 .map(|m| format!("- {}：{}", m.kind, m.url))
                 .collect();
+            lines.extend(
+                msg.media_errors
+                    .iter()
+                    .map(|e| format!("- ⚠️ 该媒体获取失败：{e}")),
+            );
             format!("【用户发来媒体】\n{}\n\n——\n\n", lines.join("\n"))
         };
 
@@ -1881,6 +1899,7 @@ mod tests {
             sender: UserId(sender.into()),
             text: Some(text.into()),
             media: Vec::new(),
+            media_errors: Vec::new(),
             reply_hint: ReplyHint::None,
         }
     }
@@ -2089,6 +2108,31 @@ mod tests {
             .expect("session row");
         assert_eq!(row.session_id, "sess-0");
         assert_eq!(row.agent_kind, "mock-backend");
+        drop_db(ctx.db).await;
+    }
+
+    /// 纯媒体消息且全部下载失败时，应向用户回真实错误而非静默丢弃。
+    #[tokio::test]
+    async fn pure_media_all_failed_replies_error() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::new(vec!["alice".into()])).await;
+        let m = InboundMessage {
+            conv_id: ConvId("feishu:ou_t".into()),
+            sender: UserId("alice".into()),
+            text: None,
+            media: vec![],
+            media_errors: vec!["img_x: 下载失败: boom".into()],
+            reply_hint: ReplyHint::None,
+        };
+        feed_and_wait(&ctx, vec![m], 0).await;
+
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(
+            inbox
+                .iter()
+                .any(|t| t.contains("⚠️") && t.contains("img_x")),
+            "纯媒体全失败应回真实错误提示: {inbox:?}"
+        );
         drop_db(ctx.db).await;
     }
     #[tokio::test]

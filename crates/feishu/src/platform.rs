@@ -109,6 +109,8 @@ impl FeishuPlatform {
                                 Ok(t) => t,
                                 Err(e) => {
                                     warn!(target: "feishu", error = %e, "取 token 失败，跳过该媒体");
+                                    msg.media_errors
+                                        .push(format!("{}: 取 token 失败: {e}", p.key));
                                     continue;
                                 }
                             };
@@ -139,15 +141,23 @@ impl FeishuPlatform {
                                         kind: p.kind.to_string(),
                                         url: path,
                                     }),
-                                    Err(e) => warn!(target: "feishu", error = %e, "媒体落盘失败，跳过"),
+                                    Err(e) => {
+                                        warn!(target: "feishu", error = %e, "媒体落盘失败，跳过");
+                                        msg.media_errors
+                                            .push(format!("{}: 落盘失败: {e}", p.key));
+                                    }
                                 },
-                                Err(e) => warn!(
-                                    target: "feishu",
-                                    error = %e,
-                                    message_id = %p.message_id,
-                                    file_key = %p.key,
-                                    "媒体下载失败，跳过"
-                                ),
+                                Err(e) => {
+                                    warn!(
+                                        target: "feishu",
+                                        error = %e,
+                                        message_id = %p.message_id,
+                                        file_key = %p.key,
+                                        "媒体下载失败，跳过"
+                                    );
+                                    msg.media_errors
+                                        .push(format!("{}: 下载失败: {e}", p.key));
+                                }
                             }
                         }
                         if inbound_msg_tx.send(msg).await.is_err() {
