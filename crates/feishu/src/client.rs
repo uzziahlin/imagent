@@ -172,6 +172,144 @@ pub async fn patch_card(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// CardKit 真流式（managed card）：open-lark 0.20 无 cardkit 模块，以下手写 HTTP。
+// 链路：create_card_entity 拿 card_id → send_card_ref_msg 发引用消息 →
+// patch_card_element 流式更新 markdown 组件（打字机）→ patch_card_settings 关流式。
+// ---------------------------------------------------------------------------
+
+/// CardKit API 基址（手写 HTTP；与 open-lark 的 CoreConfig.base_url 默认值一致）。
+const CARDKIT_BASE: &str = "https://open.feishu.cn/open-apis/cardkit/v1";
+
+/// 解析 CardKit 响应信封：code 非 0 报错，否则取 `data` 下指定字段的字符串值。
+async fn cardkit_resp(resp: reqwest::Response, op: &str) -> imagent_core::Result<String> {
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| imagent_core::CoreError::Platform(PLATFORM, format!("{op}: {e}")))?;
+    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
+        return Err(imagent_core::CoreError::Platform(
+            PLATFORM,
+            format!("{op}: code={code} msg={msg}"),
+        ));
+    }
+    Ok(v.get("data").map(|d| d.to_string()).unwrap_or_default())
+}
+
+/// 创建 CardKit 卡片实体，返回 `card_id`（managed 流式卡片第一步）。
+///
+/// `data` 为卡片 JSON **字符串**（官方要求双重编码：外层 JSON + 内层转义字符串）。
+/// 需 `cardkit:card:write` 权限；失败时调用方降级走 raw 卡片（msg: 句柄）。
+pub async fn create_card_entity(token: &str, card_json: &str) -> imagent_core::Result<String> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{CARDKIT_BASE}/cards"))
+        .bearer_auth(token)
+        .json(&json!({ "type": "card_json", "data": card_json }))
+        .send()
+        .await
+        .map_err(|e| {
+            imagent_core::CoreError::Platform(PLATFORM, format!("create_card_entity: {e}"))
+        })?;
+    let data = cardkit_resp(resp, "create_card_entity").await?;
+    data.parse::<serde_json::Value>()
+        .ok()
+        .and_then(|v| {
+            v.get("card_id")
+                .and_then(|c| c.as_str())
+                .map(String::from)
+        })
+        .ok_or_else(|| {
+            imagent_core::CoreError::Platform(PLATFORM, "create_card_entity: 响应缺 card_id".into())
+        })
+}
+
+/// 流式更新 markdown 组件（全量文本 + 严格递增 sequence，服务端打字机渲染）。
+///
+/// 仅 markdown 组件可用（`element_id` 对应初始卡片中带 element_id 的 markdown 组件）；
+/// 服务端旧文本是新文本前缀时增量打字机输出，否则全量上屏。
+pub async fn patch_card_element(
+    token: &str,
+    card_id: &str,
+    element_id: &str,
+    content: &str,
+    sequence: i64,
+) -> imagent_core::Result<()> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .patch(format!("{CARDKIT_BASE}/cards/{card_id}/elements/{element_id}"))
+        .bearer_auth(token)
+        .json(&json!({ "content": content, "sequence": sequence }))
+        .send()
+        .await
+        .map_err(|e| {
+            imagent_core::CoreError::Platform(PLATFORM, format!("patch_card_element: {e}"))
+        })?;
+    cardkit_resp(resp, "patch_card_element").await.map(|_| ())
+}
+
+/// 更新卡片配置（结束流式：`settings_json` 传 `{"config":{"streaming_mode":false}}`）。
+///
+/// `sequence` 与 element PATCH **共用**同一 card_id 的严格递增计数（不递增报 300317）。
+pub async fn patch_card_settings(
+    token: &str,
+    card_id: &str,
+    settings_json: &str,
+    sequence: i64,
+) -> imagent_core::Result<()> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .patch(format!("{CARDKIT_BASE}/cards/{card_id}/settings"))
+        .bearer_auth(token)
+        .json(&json!({ "settings": settings_json, "sequence": sequence }))
+        .send()
+        .await
+        .map_err(|e| {
+            imagent_core::CoreError::Platform(PLATFORM, format!("patch_card_settings: {e}"))
+        })?;
+    cardkit_resp(resp, "patch_card_settings").await.map(|_| ())
+}
+
+/// 发送引用卡片实体的 interactive 消息，返回 message_id。
+///
+/// content 为 `{"type":"card_id","data":{"card_id":"..."}}`（官方「方式三」引用形式），
+/// 后续对该实体的 element/settings PATCH 即时反映到这条消息。
+pub async fn send_card_ref_msg(
+    core_config: &CoreConfig,
+    token: &str,
+    receive_id: &str,
+    kind: ReceiveIdKind,
+    card_id: &str,
+) -> imagent_core::Result<Option<String>> {
+    let body = CreateMessageBody {
+        receive_id: receive_id.to_string(),
+        msg_type: "interactive".to_string(),
+        content: json!({ "type": "card_id", "data": { "card_id": card_id } }).to_string(),
+        uuid: None,
+    };
+    let id_type = match kind {
+        ReceiveIdKind::OpenId => ReceiveIdType::OpenId,
+        ReceiveIdKind::ChatId => ReceiveIdType::ChatId,
+    };
+    let option = RequestOption::builder()
+        .tenant_access_token(token.to_string())
+        .build();
+    let resp: serde_json::Value = CreateMessageRequest::new(core_config.clone())
+        .receive_id_type(id_type)
+        .execute_with_options(body, option)
+        .await
+        .map_err(|e| {
+            imagent_core::CoreError::Platform(PLATFORM, format!("send_card_ref_msg: {e}"))
+        })?;
+    // resp 已是 data 内容；message_id 在顶层（同 send_card_msg）。
+    Ok(resp
+        .get("message_id")
+        .and_then(|v| v.as_str())
+        .map(String::from))
+}
+
 /// 下载用户发来的消息图片，返回二进制。
 ///
 /// 走「获取消息中的资源文件」接口（`/im/v1/messages/{message_id}/resources/{file_key}?type=image`）。
