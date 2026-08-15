@@ -6,7 +6,7 @@
 //! - `recv()`：drain task 已把 `InboundMessage` 推入 inbound channel，直接 await。
 //! - `send_text()`：`receive_target_from_conv` → `split_message` 分片 → 每片
 //!   `get_token`（lazy 刷新缓存）+ `send_text_msg`（HTTP）。
-//! - `send_media()` / `send_typing()`：MVP 空实现（媒体需先上传拿 key）。
+//! - `send_media()`：agent 产图回传（上传+发 image 消息）；`send_typing()`：MVP 空实现。
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,8 +23,8 @@ use imagent_core::{
 use open_lark::{Config, CoreConfig};
 
 use crate::client::{
-    download_file, download_image, fetch_token, patch_card, send_card_msg, send_text_msg,
-    FeishuWsClient,
+    download_file, download_image, fetch_token, patch_card, send_card_msg, send_image_msg,
+    send_text_msg, upload_image, FeishuWsClient,
 };
 use crate::card::render_card;
 use crate::proto::{parse_message_event, receive_target_from_conv};
@@ -272,14 +272,24 @@ impl Platform for FeishuPlatform {
 
     async fn send_media(
         &self,
-        _conv: &ConvId,
-        _media: &MediaRef,
+        conv: &ConvId,
+        media: &MediaRef,
         _hint: &ReplyHint,
     ) -> Result<()> {
-        // TODO: 发媒体需 core 加 `AgentChunk::Media` variant + dispatch 调 send_media
-        // （当前 core 只发文本）；上传 API 已就绪（`image::create::CreateImageRequest`
-        // / `file::create::CreateFileRequest`），待 core 增强后实现。
-        Ok(())
+        // agent 产出图片回传：读本地文件 → 上传拿 image_key → 发 image 消息。
+        let (receive_id, kind) = receive_target_from_conv(conv).ok_or_else(|| {
+            CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0))
+        })?;
+        let bytes = tokio::fs::read(&media.url).await.map_err(|e| {
+            CoreError::Platform(PLATFORM, format!("读媒体文件 {}: {e}", media.url))
+        })?;
+        let file_name = std::path::Path::new(&media.url)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "image.png".to_string());
+        let token = self.get_token().await?;
+        let image_key = upload_image(&self.core_config, &token, &file_name, bytes).await?;
+        send_image_msg(&self.core_config, &token, &receive_id, kind, &image_key).await
     }
 
     async fn send_typing(&self, _conv: &ConvId, _hint: &ReplyHint) -> Result<()> {

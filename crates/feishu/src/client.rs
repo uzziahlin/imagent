@@ -22,6 +22,8 @@ use open_lark::communication::im::v1::message::patch::PatchMessageCardRequest;
 use open_lark::communication::im::v1::message::resource::get::{
     GetMessageResourceRequest, MessageResourceType,
 };
+use open_lark::communication::im::v1::image::create::CreateImageRequest;
+use open_lark::communication::im::v1::image::models::ImageType;
 use open_lark::communication::im::v1::message::models::ReceiveIdType;
 use open_lark::ws_client::{EventDispatcherHandler, LarkWsClient, WsClientError};
 use open_lark::{CoreConfig, RequestOption};
@@ -212,6 +214,57 @@ pub async fn download_file(
         .execute_with_options(option)
         .await
         .map_err(|e| imagent_core::CoreError::Platform(PLATFORM, format!("download_file: {e}")))
+}
+
+/// 上传图片到飞书（用于发图片消息），返回 image_key。
+///
+/// 走「上传图片」接口（POST /im/v1/images，multipart），需 `im:resource` 权限。
+/// 上传后 image_key 即可用于 `msg_type=image` 消息。
+pub async fn upload_image(
+    core_config: &CoreConfig,
+    token: &str,
+    file_name: &str,
+    bytes: Vec<u8>,
+) -> imagent_core::Result<String> {
+    let option = RequestOption::builder()
+        .tenant_access_token(token.to_string())
+        .build();
+    let resp = CreateImageRequest::new(core_config.clone())
+        .image_type(ImageType::Message)
+        .file_name(file_name)
+        .execute_with_options(bytes, option)
+        .await
+        .map_err(|e| imagent_core::CoreError::Platform(PLATFORM, format!("upload_image: {e}")))?;
+    Ok(resp.image_key)
+}
+
+/// 发送图片消息（msg_type=image），content 为 `{"image_key":"..."}`。
+pub async fn send_image_msg(
+    core_config: &CoreConfig,
+    token: &str,
+    receive_id: &str,
+    kind: ReceiveIdKind,
+    image_key: &str,
+) -> imagent_core::Result<()> {
+    let body = CreateMessageBody {
+        receive_id: receive_id.to_string(),
+        msg_type: "image".to_string(),
+        content: json!({ "image_key": image_key }).to_string(),
+        uuid: None,
+    };
+    let id_type = match kind {
+        ReceiveIdKind::OpenId => ReceiveIdType::OpenId,
+        ReceiveIdKind::ChatId => ReceiveIdType::ChatId,
+    };
+    let option = RequestOption::builder()
+        .tenant_access_token(token.to_string())
+        .build();
+    CreateMessageRequest::new(core_config.clone())
+        .receive_id_type(id_type)
+        .execute_with_options(body, option)
+        .await
+        .map_err(|e| imagent_core::CoreError::Platform(PLATFORM, format!("send_image_msg: {e}")))?;
+    Ok(())
 }
 
 /// 获取 `tenant_access_token`（手动，配合 [`send_text_msg`] 的低层写法）。

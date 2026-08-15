@@ -44,6 +44,19 @@ pub enum CliEvent {
     /// 非 JSON / 噪声，跳过。
     Skip,
 }
+/// 检测「Write 工具写图片文件」：tool 为 Write 且 input JSON 的 file_path
+/// 扩展名是图片（png/jpg/jpeg/gif/webp/bmp），返回该路径；否则 None。
+/// input 是 stream-json 的工具入参 JSON 字符串；非法 JSON / 缺 file_path 一律 None。
+pub(crate) fn image_write_path(tool: &str, input: &str) -> Option<String> {
+    if tool != "Write" {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(input).ok()?;
+    let path = v.get("file_path")?.as_str()?;
+    let lower = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    const IMG_EXTS: [&str; 6] = ["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+    IMG_EXTS.contains(&lower.as_str()).then(|| path.to_string())
+}
 
 /// 泛型 run 脚手架：spawn cmd → kill_on_drop + stdin null → 并发 stderr →
 /// 读 stdout 循环（调 `parse` 映射到 [`CliEvent`]）→ session/final/error 收集 →
@@ -135,6 +148,9 @@ pub async fn spawn_cli_backend(
                     if session_id.is_empty() {
                         session_id = s;
                     }
+                }
+                if let Some(path) = image_write_path(&tool, &input) {
+                    let _ = chunks.send(AgentChunk::Media { path }).await;
                 }
                 let _ = chunks.send(AgentChunk::ToolUse { tool, input }).await;
             }
@@ -342,3 +358,32 @@ pub const WRITE_OR_EXEC: &[&str] = &[
 const ALWAYS_PASSTHROUGH_ENV: &[&str] = &[
     "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::image_write_path;
+
+    #[test]
+    fn image_write_path_detects_write_png() {
+        assert_eq!(
+            image_write_path("Write", r#"{"file_path":"/tmp/a.png","content":"x"}"#),
+            Some("/tmp/a.png".to_string())
+        );
+        assert_eq!(
+            image_write_path("Write", r#"{"file_path":"out.JPG"}"#),
+            Some("out.JPG".to_string())
+        );
+    }
+
+    #[test]
+    fn image_write_path_ignores_non_image_or_other_tool() {
+        assert_eq!(image_write_path("Write", r#"{"file_path":"a.txt"}"#), None);
+        assert_eq!(
+            image_write_path("Bash", r#"{"command":"cp x.png y.png"}"#),
+            None
+        );
+        assert_eq!(image_write_path("Write", "not-json"), None);
+        assert_eq!(image_write_path("Write", r#"{"content":"x"}"#), None);
+        assert_eq!(image_write_path("Write", r#"{"file_path":"noext"}"#), None);
+    }
+}
