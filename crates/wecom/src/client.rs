@@ -44,25 +44,34 @@ pub struct WeComWsClient {
 impl WeComWsClient {
     /// 主循环：重连外层 loop。正常情况下 `connect_and_serve` 永不返回（持续收发），
     /// 一旦返回（Err 或 Ok）即按指数退避 sleep 后重连。退避在每次成功建连后重置。
+    /// `reconnect`（P4-7 `/reconnect`）：notify_one 唤醒 select 丢弃 connect_and_serve
+    /// future（连接随 future drop 关闭）→ 退避后重连；退避 sleep 期间通知存 permit。
     pub async fn run(
         self,
         inbound_tx: mpsc::Sender<InboundFrame>,
         mut outbound_rx: mpsc::Receiver<OutboundFrame>,
+        reconnect: std::sync::Arc<tokio::sync::Notify>,
     ) {
         let mut backoff = Duration::from_secs(1);
         loop {
-            match self.connect_and_serve(&inbound_tx, &mut outbound_rx).await {
-                Ok(()) => {
-                    // 正常退出（通常不应发生）——重置退避。
+            tokio::select! {
+                res = self.connect_and_serve(&inbound_tx, &mut outbound_rx) => match res {
+                    Ok(()) => {
+                        // 正常退出（通常不应发生）——重置退避。
+                        backoff = Duration::from_secs(1);
+                    }
+                    Err(e) => {
+                        warn!(
+                            target: "wecom",
+                            error = %e,
+                            backoff_ms = backoff.as_millis() as u64,
+                            "ws 断开/出错，准备重连"
+                        );
+                    }
+                },
+                _ = reconnect.notified() => {
+                    info!(target: "wecom", "收到 /reconnect 指令，主动断开重连");
                     backoff = Duration::from_secs(1);
-                }
-                Err(e) => {
-                    warn!(
-                        target: "wecom",
-                        error = %e,
-                        backoff_ms = backoff.as_millis() as u64,
-                        "ws 断开/出错，准备重连"
-                    );
                 }
             }
             tokio::time::sleep(backoff).await;
@@ -297,10 +306,11 @@ mod tests {
         };
         let (inbound_tx, _inbound_rx) = mpsc::channel::<InboundFrame>(8);
         let (_outbound_tx, outbound_rx) = mpsc::channel::<OutboundFrame>(8);
+        let reconnect = std::sync::Arc::new(tokio::sync::Notify::new());
 
         let res = tokio::time::timeout(
             Duration::from_millis(200),
-            client.run(inbound_tx, outbound_rx),
+            client.run(inbound_tx, outbound_rx, reconnect),
         )
         .await;
         // run 永不返回 → timeout 触发（Err(Elapsed)）= 正常。
