@@ -10,15 +10,15 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::auth::Auth;
 use crate::backend::Backend;
-use crate::config::PermissionMode;
+use crate::card_session::CardSession;
+use crate::config::{CotDetail, PermissionMode};
 use crate::error::Result;
 use crate::metrics::METRICS;
 use crate::permission::{parse_reply, PermissionReply, PermissionRouter};
-use crate::card_session::CardSession;
 use crate::platform::Platform;
 use crate::types::{
     AgentChunk, CardTerminal, ConvId, InboundMessage, MediaRef, ReplyHint, SessionId,
@@ -27,6 +27,40 @@ use imagent_store::{NamedSessionRow, SessionRow, Store};
 use parking_lot::RwLock;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info, warn};
+
+/// per-conv 排队消息上限：runner 在飞期间到达的消息暂存条数。超出回告警并丢弃，
+/// 防刷屏把合并后的 prompt 撑爆。
+const PENDING_QUEUE_CAP: usize = 100;
+
+/// Dispatcher 时长类预算聚合（避免构造参数表随配置项继续膨胀）。
+#[derive(Debug, Clone, Copy)]
+pub struct TaskBudgets {
+    /// 单次 agent 运行总超时（`agent_timeout_secs`）。
+    pub agent_timeout: Duration,
+    /// Ask 权限审批等待回复超时（`permission_ask_timeout_secs`，独立预算）。
+    pub permission_ask_timeout: Duration,
+    /// 优雅退出 drain in-flight task 宽限（`shutdown_grace_secs`）。
+    pub shutdown_grace: Duration,
+    /// 空闲看门狗：agent 连续无输出该时长则终止本轮（`agent_idle_timeout_secs`；
+    /// 零值 = 关闭）。
+    pub agent_idle_timeout: Duration,
+    /// 批处理窗口：runner 起跑前等待后续消息并入同一轮的时长（`batch_window_ms`；
+    /// 零值 = 关闭）。
+    pub batch_window: Duration,
+}
+
+impl TaskBudgets {
+    /// 从 Config 构造（单位换算集中在这一处）。
+    pub fn from_config(c: &crate::config::Config) -> Self {
+        Self {
+            agent_timeout: Duration::from_secs(c.agent_timeout_secs),
+            permission_ask_timeout: Duration::from_secs(c.permission_ask_timeout_secs),
+            shutdown_grace: Duration::from_secs(c.shutdown_grace_secs),
+            agent_idle_timeout: Duration::from_secs(c.agent_idle_timeout_secs),
+            batch_window: Duration::from_millis(c.batch_window_ms),
+        }
+    }
+}
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -45,17 +79,36 @@ fn truncate_str(s: &str, n: usize) -> String {
     }
 }
 
-/// 格式化工具调用摘要：最多展示 5 个，超出标 `…(+N)`。
+/// 人读运行时长（/status 用）：`2d3h` / `4h05m` / `7m` / `42s`。
+fn format_uptime(d: Duration) -> String {
+    let secs = d.as_secs();
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let mins = (secs % 3_600) / 60;
+    let s = secs % 60;
+    if days > 0 {
+        format!("{days}d{hours}h")
+    } else if hours > 0 {
+        format!("{hours}h{mins:02}m")
+    } else if mins > 0 {
+        format!("{mins}m{s:02}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// 格式化工具调用摘要：按 COT 档位展示（P4-6），超出 `max` 标 `…(+N)`。
 /// 形如 `\n\n🔧 工具调用：Read({"path":"…}), Edit({"file":"…})`。
-fn format_tool_summary(tool_calls: &[(String, String)]) -> String {
+fn format_tool_summary(tool_calls: &[(String, String)], detail: CotDetail) -> String {
+    let max = detail.max_tools();
     let shown: Vec<String> = tool_calls
         .iter()
-        .take(5)
+        .take(max)
         .map(|(t, i)| format!("{t}({i})"))
         .collect();
     let mut s = format!("\n\n🔧 工具调用：{}", shown.join(", "));
-    if tool_calls.len() > 5 {
-        s.push_str(&format!(" …(+{})", tool_calls.len() - 5));
+    if tool_calls.len() > max {
+        s.push_str(&format!(" …(+{})", tool_calls.len() - max));
     }
     s
 }
@@ -86,6 +139,40 @@ fn is_session_expired_err(e: &crate::error::CoreError) -> bool {
     matches!(e, crate::error::CoreError::SessionExpired(_))
 }
 
+/// 消息是否可能作为权限审批回复被消费：非空且非斜杠命令。
+/// 斜杠命令（如 `/stop`）在等待审批期间也必须可执行——否则会被当 deny 吞掉，
+/// 用户将无法中断正等审批的任务；空文本（纯媒体消息）同样不消费。
+fn is_permission_reply_candidate(text: &str) -> bool {
+    let t = text.trim();
+    !t.is_empty() && !t.starts_with('/')
+}
+
+/// 合并一批排队消息为一轮 prompt 载体：非空文本以 `\n\n` 拼接、media /
+/// media_errors 拼接；sender 与 reply_hint 取首条（各消息入队前已各自过白名单）。
+fn merge_batch(batch: Vec<InboundMessage>) -> InboundMessage {
+    let mut it = batch.into_iter();
+    let mut first = it.next().expect("merge_batch: batch 非空");
+    let mut texts: Vec<String> = first
+        .text
+        .take()
+        .filter(|t| !t.trim().is_empty())
+        .into_iter()
+        .collect();
+    for m in it {
+        if let Some(t) = m.text.filter(|t| !t.trim().is_empty()) {
+            texts.push(t);
+        }
+        first.media.extend(m.media);
+        first.media_errors.extend(m.media_errors);
+    }
+    first.text = if texts.is_empty() {
+        None
+    } else {
+        Some(texts.join("\n\n"))
+    };
+    first
+}
+
 pub struct Dispatcher {
     platform: Arc<dyn Platform>,
     backend: Arc<dyn Backend>,
@@ -105,6 +192,22 @@ pub struct Dispatcher {
     permission_ask_timeout: std::time::Duration,
     /// 优雅退出 drain in-flight task 的宽限期（R-1：原硬编码 30s）。
     shutdown_grace: std::time::Duration,
+    /// 空闲看门狗：agent 连续无输出该时长则终止本轮（零值 = 关闭）。
+    /// `/config agent_idle_timeout_secs` 可热改，故共享句柄。
+    agent_idle_timeout: Arc<RwLock<Duration>>,
+    /// 批处理窗口：runner 起跑前等待后续消息并入同一轮的时长（零值 = 关闭）。
+    /// `/config batch_window_ms` 可热改，故共享句柄。
+    batch_window: Arc<RwLock<Duration>>,
+    /// 工具过程（COT）展示档位（P4-6）：`/config cot_detail` 可热改。
+    cot_detail: Arc<RwLock<CotDetail>>,
+    /// 进程启动时刻（`/status` uptime 用）。
+    started_at: Instant,
+    /// per-conv 在飞 agent 任务注册表（`/stop` 中断用）：conv_id → join task 的
+    /// AbortHandle。同 conv 轮次串行（conv 锁保证），key 插入/移除无 ABA。
+    running: Mutex<HashMap<String, tokio::task::AbortHandle>>,
+    /// per-conv 批处理队列：runner 在飞期间到达的消息暂存（entry 存在 = runner
+    /// 活跃；runner 取空交还时移除）。入队与取批共用一把锁，杜绝 lost-wakeup。
+    queues: Mutex<HashMap<String, Vec<InboundMessage>>>,
     /// 管理员 sender（可 /allow）；空 = 所有白名单用户可（向后兼容，P2-D）。
     admin_senders: Arc<RwLock<Vec<String>>>,
     /// 优雅退出信号（P1-5）：收到 SIGINT/SIGTERM 后 notify，run() 停止收新消息并 drain。
@@ -124,9 +227,8 @@ impl Dispatcher {
         default_workdir: PathBuf,
         allowed_tools: Vec<String>,
         permission_mode: PermissionMode,
-        agent_timeout: std::time::Duration,
-        permission_ask_timeout: std::time::Duration,
-        shutdown_grace: std::time::Duration,
+        budgets: TaskBudgets,
+        cot_detail: CotDetail,
         admin_senders: Vec<String>,
     ) -> Self {
         Self::new_with_handles(
@@ -137,9 +239,8 @@ impl Dispatcher {
             default_workdir,
             Arc::new(RwLock::new(allowed_tools)),
             Arc::new(RwLock::new(permission_mode)),
-            agent_timeout,
-            permission_ask_timeout,
-            shutdown_grace,
+            budgets,
+            cot_detail,
             admin_senders,
         )
     }
@@ -158,9 +259,8 @@ impl Dispatcher {
         default_workdir: PathBuf,
         allowed_tools: Arc<RwLock<Vec<String>>>,
         permission_mode: Arc<RwLock<PermissionMode>>,
-        agent_timeout: std::time::Duration,
-        permission_ask_timeout: std::time::Duration,
-        shutdown_grace: std::time::Duration,
+        budgets: TaskBudgets,
+        cot_detail: CotDetail,
         admin_senders: Vec<String>,
     ) -> Self {
         Self {
@@ -173,9 +273,15 @@ impl Dispatcher {
             conv_locks: Mutex::new(HashMap::new()),
             router: Arc::new(PermissionRouter::new()),
             permission_mode,
-            agent_timeout,
-            permission_ask_timeout,
-            shutdown_grace,
+            agent_timeout: budgets.agent_timeout,
+            permission_ask_timeout: budgets.permission_ask_timeout,
+            shutdown_grace: budgets.shutdown_grace,
+            agent_idle_timeout: Arc::new(RwLock::new(budgets.agent_idle_timeout)),
+            batch_window: Arc::new(RwLock::new(budgets.batch_window)),
+            cot_detail: Arc::new(RwLock::new(cot_detail)),
+            started_at: Instant::now(),
+            running: Mutex::new(HashMap::new()),
+            queues: Mutex::new(HashMap::new()),
             admin_senders: Arc::new(RwLock::new(admin_senders)),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             tasks: Mutex::new(tokio::task::JoinSet::new()),
@@ -258,9 +364,14 @@ impl Dispatcher {
                         // 当作回复送达 oneshot。P2-2：直接 route（单次 lock 原子 check+
                         // remove+send），避免旧 has_pending→route 两次 lock 间隙被超时
                         // 清理（P1-8 cancel）击穿，导致 "yes" 误走 fallforward 当新 prompt。
-                        let reply = parse_reply(msg.text.as_deref().unwrap_or(""));
-                        if self.router.route(&conv_id, reply).await {
-                            continue;
+                        // 斜杠命令不消费（/stop 在等审批时也要可执行），空文本（纯媒体）
+                        // 同样不消费。
+                        let text = msg.text.as_deref().unwrap_or("");
+                        if is_permission_reply_candidate(text) {
+                            let reply = parse_reply(text);
+                            if self.router.route(&conv_id, reply).await {
+                                continue;
+                            }
                         }
                         // 每条消息独立 spawn，不阻塞 recv。P1-5：入 JoinSet 以便 drain。
                         let this = self.clone();
@@ -514,14 +625,13 @@ impl Dispatcher {
             return;
         }
         let conv = ConvId(conv_id.clone());
-        // 询问用户。
-        let prompt_text = format!(
-            "🔐 Claude 请求执行 {tool_name}：{}\n回复 y 允许，其它拒绝。",
-            truncate_str(&input_str, 80)
-        );
-        // P1-3：send_text 失败 → 回写 deny 并 return，不挂 pending。
+        // P4-4：询问用户——平台支持交互卡片时发「按钮卡片」（send_permission_ask
+        // 覆写），否则默认纯文本。按钮点击由平台侧转成 text="y"/"n" 的入站消息，
+        // 复用 recv 循环的审批回复路由，core 不感知按钮。
+        let input_summary = truncate_str(&input_str, 80);
+        // P1-3：发送失败 → 回写 deny 并 return，不挂 pending。
         if let Err(e) = platform
-            .send_text(&conv, &prompt_text, &ReplyHint::None)
+            .send_permission_ask(&conv, &tool_name, &input_summary, &ReplyHint::None)
             .await
         {
             warn!(target: "imagent::core", conv_id = %conv_id, error = %e, "send permission ask 失败，回 deny 不挂 pending");
@@ -588,6 +698,63 @@ impl Dispatcher {
         }
     }
 
+    /// 普通消息入队（P4-2 批处理）：runner 在飞 → push pending 返回 false（本 task
+    /// 即返，消息将在下一轮合并）；无 runner → 建 entry 返回 true（调用方成为
+    /// runner）。入队/成为 runner 在同一把 queues 锁内原子判定——与
+    /// [`take_batch_after_window`](Self::take_batch_after_window) 的取批/交还互斥，
+    /// 杜绝「消息卡在无人认领的队列」（lost-wakeup）。超上限回告警并丢弃。
+    async fn enqueue_or_become_runner(
+        &self,
+        conv: &str,
+        msg: InboundMessage,
+        hint: &ReplyHint,
+    ) -> bool {
+        let mut map = self.queues.lock().await;
+        match map.get_mut(conv) {
+            Some(pending) => {
+                if pending.len() >= PENDING_QUEUE_CAP {
+                    drop(map);
+                    warn!(
+                        target: "imagent::core",
+                        conv_id = %conv,
+                        cap = PENDING_QUEUE_CAP,
+                        "排队消息超上限，丢弃本条"
+                    );
+                    self.reply(
+                        &ConvId(conv.to_string()),
+                        &format!("⚠️ 排队消息已达上限（{PENDING_QUEUE_CAP} 条），本条已丢弃；如需立即处理请发 /stop 中断当前任务后重发"),
+                        hint,
+                    )
+                    .await;
+                    return false;
+                }
+                info!(target: "imagent::core", conv_id = %conv, "runner 在飞，消息入队待下一轮合并");
+                pending.push(msg);
+                false
+            }
+            None => {
+                map.insert(conv.to_string(), vec![msg]);
+                true
+            }
+        }
+    }
+
+    /// runner 起跑前等批处理窗口，然后原子取批：pending 空 → 删 entry（交还 runner
+    /// 身份）返回 None；非空 → drain 返回 Some（窗口期入队的消息自然并入本批）。
+    async fn take_batch_after_window(&self, conv: &str) -> Option<Vec<InboundMessage>> {
+        let window = *self.batch_window.read();
+        if !window.is_zero() {
+            tokio::time::sleep(window).await;
+        }
+        let mut map = self.queues.lock().await;
+        let pending = map.get_mut(conv)?;
+        if pending.is_empty() {
+            map.remove(conv);
+            return None;
+        }
+        Some(std::mem::take(pending))
+    }
+
     /// 解析 conv 的工作目录：per-conv KV（`/cd` 设置）覆盖，否则回退 `default_workdir`。
     async fn resolve_workdir(&self, conv_id: &str) -> PathBuf {
         match self.store.get_config(&workdir_key(conv_id)).await {
@@ -604,8 +771,8 @@ impl Dispatcher {
 
         // best-effort 指标：入站消息计数（失败只 warn 不阻断）。
         METRICS.messages_in.inc();
-        // 1. 发现态：白名单为空。不自动授权（安全），对 sender 回引导消息，
-        //    告知其 sender id 与如何联系管理员，不驱动 agent。
+        // 1. 发现态：两个白名单（sender / chat）都为空。不自动授权（安全），对 sender
+        //    回引导消息，告知其 sender id 与 conv id，不驱动 agent。
         if self.auth.is_discovery() {
             info!(
                 target: "imagent::discovery",
@@ -615,21 +782,23 @@ impl Dispatcher {
                 "discovery 模式：记录 sender，回引导"
             );
             let guide = format!(
-                "发现模式：当前白名单为空。你的 sender id 是 `{}`。\n\
-                 请管理员在本地运行 `imagent allow {}` 授权后重启 imagent。",
-                sender.0, sender.0
+                "发现模式：当前白名单为空。你的 sender id 是 `{}`，会话 id 是 `{}`。\n\
+                 请管理员在本地运行 `imagent allow {}` 授权用户、或 `imagent allow-chat {}` \
+                 授权整个会话（群）后重启 imagent；也可由已授权用户在 IM 内发 /allow / /chat allow。",
+                sender.0, conv.0, sender.0, conv.0
             );
             self.reply(&conv, &guide, &hint).await;
             return;
         }
 
-        // 2. 白名单：非白名单 sender 丢弃。
-        if !self.auth.is_allowed(&sender) {
+        // 2. 白名单（P4-5）：sender 放行 OR 会话（群）放行，二者其一即过。
+        //    群维度授权后无需逐个 allow 成员；命令层的授权操作仍受 admin 门槛。
+        if !self.auth.is_allowed(&sender) && !self.auth.is_chat_allowed(&conv.0) {
             warn!(
                 target: "imagent::core",
                 conv_id = %conv.0,
                 sender = %sender.0,
-                "非白名单 sender，丢弃"
+                "非白名单 sender 且会话未授权，丢弃"
             );
             return;
         }
@@ -755,17 +924,393 @@ impl Dispatcher {
                     }
                     "/list" => {
                         let snap = self.auth.snapshot();
-                        let msg = if snap.is_empty() {
-                            "白名单为空。".to_string()
+                        let chats = self.auth.snapshot_chats();
+                        let mut out = if snap.is_empty() {
+                            "用户白名单为空。".to_string()
                         } else {
-                            format!("白名单（{}）：{}", snap.len(), snap.join(", "))
+                            format!("用户白名单（{}）：{}", snap.len(), snap.join(", "))
                         };
-                        self.reply(&conv, &msg, &hint).await;
+                        // P4-5：会话（群）白名单一并列出。
+                        if chats.is_empty() {
+                            out.push_str("\n会话白名单为空。");
+                        } else {
+                            out.push_str(&format!(
+                                "\n会话白名单（{}）：{}",
+                                chats.len(),
+                                chats.join(", ")
+                            ));
+                        }
+                        self.reply(&conv, &out, &hint).await;
                         return;
                     }
                     "/whoami" => {
-                        self.reply(&conv, &format!("你的 sender id：`{}`", sender.0), &hint)
+                        self.reply(
+                            &conv,
+                            &format!("你的 sender id：`{}`\n当前会话 id：`{}`", sender.0, conv.0),
+                            &hint,
+                        )
+                        .await;
+                        return;
+                    }
+                    "/chat" => {
+                        // P4-5：会话（群）白名单管理。与 /allow 同构：管理员门槛、
+                        // 内存 + store 双写、审计。`allow`/`deny` 缺省作用于当前会话。
+                        let sub = parts.get(1).map(|s| s.trim()).unwrap_or("");
+                        let actor = sender.0.as_str();
+                        match sub.to_ascii_lowercase().as_str() {
+                            "allow" | "deny" => {
+                                if !self.is_admin(actor) {
+                                    self.reply(
+                                        &conv,
+                                        "仅管理员（admin_senders）可管理会话白名单。",
+                                        &hint,
+                                    )
+                                    .await;
+                                    return;
+                                }
+                                let target = parts
+                                    .get(2)
+                                    .map(|s| s.trim())
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or(&conv.0)
+                                    .to_string();
+                                let (applied, persist_failed) = if sub == "allow" {
+                                    let added = self.auth.allow_chat(&target);
+                                    let failed = self
+                                        .store
+                                        .add_allowed_chat(&target, Some(actor), Some("im"))
+                                        .await
+                                        .is_err();
+                                    (added, failed)
+                                } else {
+                                    let removed = self.auth.revoke_chat(&target);
+                                    let failed =
+                                        self.store.remove_allowed_chat(&target).await.is_err();
+                                    (removed, failed)
+                                };
+                                if persist_failed {
+                                    warn!(target: "imagent::core", "会话白名单持久化失败（内存已改，重启丢失）");
+                                }
+                                let _ = self
+                                    .store
+                                    .append_audit(
+                                        if sub == "allow" {
+                                            "chat_allow"
+                                        } else {
+                                            "chat_deny"
+                                        },
+                                        Some(actor),
+                                        Some(&target),
+                                        Some(if applied { "applied" } else { "no-change" }),
+                                    )
+                                    .await;
+                                let verb = if sub == "allow" { "授权" } else { "移除" };
+                                let persist_note = if persist_failed {
+                                    "（⚠️ 持久化失败，重启后失效）"
+                                } else {
+                                    ""
+                                };
+                                self.reply(
+                                    &conv,
+                                    &format!("✅ 已{verb}会话 {target}{persist_note}"),
+                                    &hint,
+                                )
+                                .await;
+                            }
+                            _ => {
+                                let chats = self.auth.snapshot_chats();
+                                let list = if chats.is_empty() {
+                                    "（空）".to_string()
+                                } else {
+                                    chats.join("\n- ")
+                                };
+                                self.reply(
+                                    &conv,
+                                    &format!(
+                                        "用法：/chat allow [conv_id] 授权当前/指定会话\n/chat deny [conv_id] 移除\n/chat list 列出（如下）\n当前会话 id：`{}`\n- {list}",
+                                        conv.0
+                                    ),
+                                    &hint,
+                                )
+                                .await;
+                            }
+                        }
+                        return;
+                    }
+                    "/config" => {
+                        // P4-6：查看 / 热改运行参数。改全局行为，管理员门槛。
+                        let key = parts.get(1).map(|s| s.trim()).unwrap_or("");
+                        let value = parts.get(2).map(|s| s.trim()).unwrap_or("");
+                        if key.is_empty() {
+                            // 先拷出共享句柄的值再跨 await（parking_lot guard 非 Send）。
+                            let idle_secs = self.agent_idle_timeout.read().as_secs();
+                            let window_ms = self.batch_window.read().as_millis();
+                            let cot = self.cot_detail.read().as_str();
+                            let perm = self.permission_mode.read().as_str();
+                            let text = format!(
+                                "当前配置：\n- cot_detail = {cot}（off|brief|detailed）\n- batch_window_ms = {window_ms}\n- agent_idle_timeout_secs = {idle_secs}（0=关）\n- agent_timeout_secs = {}（重启生效）\n- permission_mode = {perm}\n用法：/config <key> <value>（管理员）",
+                                self.agent_timeout.as_secs(),
+                            );
+                            self.reply(&conv, &text, &hint).await;
+                            return;
+                        }
+                        if !self.is_admin(&sender.0) {
+                            self.reply(&conv, "仅管理员（admin_senders）可修改配置。", &hint)
+                                .await;
+                            return;
+                        }
+                        let result = match key {
+                            "cot_detail" => match CotDetail::from_str_lossy(value) {
+                                Some(d) => {
+                                    *self.cot_detail.write() = d;
+                                    format!("✅ cot_detail = {}", d.as_str())
+                                }
+                                None => "用法：/config cot_detail <off|brief|detailed>".into(),
+                            },
+                            "batch_window_ms" => match value.parse::<u64>() {
+                                Ok(ms) => {
+                                    *self.batch_window.write() = Duration::from_millis(ms);
+                                    format!("✅ batch_window_ms = {ms}")
+                                }
+                                Err(_) => "用法：/config batch_window_ms <毫秒数，0=关闭>".into(),
+                            },
+                            "agent_idle_timeout_secs" => match value.parse::<u64>() {
+                                Ok(s) => {
+                                    *self.agent_idle_timeout.write() = Duration::from_secs(s);
+                                    format!("✅ agent_idle_timeout_secs = {s}")
+                                }
+                                Err(_) => {
+                                    "用法：/config agent_idle_timeout_secs <秒数，0=关闭>".into()
+                                }
+                            },
+                            _ => "未知配置项（支持：cot_detail / batch_window_ms / agent_idle_timeout_secs）"
+                                .into(),
+                        };
+                        self.reply(&conv, &result, &hint).await;
+                        return;
+                    }
+                    "/status" => {
+                        // P4-7：本会话 + 全局运行状态。
+                        let running_here = self.running.lock().await.contains_key(&conv.0);
+                        let queued_here = self
+                            .queues
+                            .lock()
+                            .await
+                            .get(&conv.0)
+                            .map(|q| q.len())
+                            .unwrap_or(0);
+                        let in_flight = self.running.lock().await.len();
+                        let wd = self.resolve_workdir(&conv.0).await;
+                        let name_key = active_name_key(&conv.0);
+                        let (sess, active) = tokio::join!(
+                            self.store.get_session(&conv.0),
+                            self.store.get_config(&name_key)
+                        );
+                        let sess_desc = match sess {
+                            Ok(Some(row)) => {
+                                let name = active.ok().flatten().unwrap_or_default();
+                                let label = if name.is_empty() {
+                                    "未命名".to_string()
+                                } else {
+                                    name
+                                };
+                                format!(
+                                    "{label}（{}…，{}）",
+                                    &row.session_id[..row.session_id.len().min(12)],
+                                    row.agent_kind
+                                )
+                            }
+                            _ => "无（下条消息新建）".to_string(),
+                        };
+                        let text = format!(
+                            "📊 状态\n- 平台/后端：{} / {}\n- 本会话：{}，排队 {} 条\n- 会话：{sess_desc}\n- 工作目录：{}\n- 全局在飞任务：{in_flight}\n- 运行时长：{}",
+                            self.platform.name(),
+                            self.backend.name(),
+                            if running_here { "任务在跑" } else { "无任务" },
+                            queued_here,
+                            wd.display(),
+                            format_uptime(self.started_at.elapsed()),
+                        );
+                        self.reply(&conv, &text, &hint).await;
+                        return;
+                    }
+                    "/doctor" => {
+                        // P4-7：自检——workdir / store / 后端 / 在飞任务。
+                        let mut lines = Vec::new();
+                        let wd = self.resolve_workdir(&conv.0).await;
+                        match std::fs::metadata(&wd) {
+                            Ok(m) if m.is_dir() => {
+                                lines.push(format!("✅ 工作目录可用：{}", wd.display()))
+                            }
+                            Ok(_) => lines.push(format!("⚠️ 工作目录不是目录：{}", wd.display())),
+                            Err(e) => {
+                                lines.push(format!("⚠️ 工作目录不可访问：{}（{e}）", wd.display()))
+                            }
+                        }
+                        // store 写读回环（config KV）。
+                        let probe_key = format!("doctor_probe:{}", now_secs());
+                        match self.store.set_config(&probe_key, "1").await {
+                            Ok(()) => match self.store.get_config(&probe_key).await {
+                                Ok(Some(v)) if v == "1" => {
+                                    lines.push("✅ 存储读写正常（SQLite）".into())
+                                }
+                                _ => lines.push("⚠️ 存储读回异常".into()),
+                            },
+                            Err(e) => lines.push(format!("⚠️ 存储写入失败：{e}")),
+                        }
+                        let _ = self.store.delete_config(&probe_key).await;
+                        let n_sess = self.store.count_sessions().await.unwrap_or(-1);
+                        if n_sess >= 0 {
+                            lines.push(format!("✅ 会话映射：{n_sess} 条"));
+                        } else {
+                            lines.push("⚠️ 会话映射计数失败".into());
+                        }
+                        let in_flight = self.running.lock().await.len();
+                        lines.push(if in_flight == 0 {
+                            "✅ 无在飞任务".to_string()
+                        } else {
+                            format!("ℹ️ 在飞任务 {in_flight} 个（/stop 可中断）")
+                        });
+                        lines.push(format!(
+                            "ℹ️ 平台 {} / 后端 {}（{}）",
+                            self.platform.name(),
+                            self.backend.name(),
+                            if self.platform.supports_streaming_card() {
+                                "支持流式卡片"
+                            } else {
+                                "纯文本"
+                            }
+                        ));
+                        let text = format!("🩺 自检结果：\n{}", lines.join("\n"));
+                        self.reply(&conv, &text, &hint).await;
+                        return;
+                    }
+                    "/reconnect" => {
+                        // P4-7：强制平台重连（排查长连接僵死）。
+                        match self.platform.reconnect().await {
+                            Ok(()) => {
+                                self.reply(
+                                    &conv,
+                                    "🔌 已触发平台重连（后台进行中，稍候生效）。",
+                                    &hint,
+                                )
+                                .await
+                            }
+                            Err(e) => {
+                                self.reply(
+                                    &conv,
+                                    &format!(
+                                        "⚠️ 重连指令失败：{e}（平台可能不支持，可重启 imagent）"
+                                    ),
+                                    &hint,
+                                )
+                                .await
+                            }
+                        }
+                        return;
+                    }
+                    "/resume" => {
+                        // P4-8：恢复历史会话。无参列出；<序号|session_id> 恢复。
+                        // P1-F：取 conv 串行锁，与在飞 agent task 串行。
+                        let _conv_lock = self.acquire_conv_lock(&conv.0).await;
+                        let _conv_guard = _conv_lock.lock().await;
+                        let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+                        let history = self
+                            .store
+                            .list_session_history(&conv.0, 10)
+                            .await
+                            .unwrap_or_default();
+                        if arg.is_empty() {
+                            if history.is_empty() {
+                                self.reply(&conv, "暂无历史会话记录。", &hint).await;
+                                return;
+                            }
+                            let current = self.store.get_session(&conv.0).await.ok().flatten();
+                            let mut lines = Vec::new();
+                            for (i, row) in history.iter().enumerate() {
+                                let mark = if current
+                                    .as_ref()
+                                    .is_some_and(|c| c.session_id == row.session_id)
+                                {
+                                    " *"
+                                } else {
+                                    ""
+                                };
+                                lines.push(format!(
+                                    "{}. {}…（{}）{mark}",
+                                    i + 1,
+                                    &row.session_id[..row.session_id.len().min(16)],
+                                    row.agent_kind.as_deref().unwrap_or("?")
+                                ));
+                            }
+                            self.reply(
+                                &conv,
+                                &format!(
+                                    "历史会话（* 为当前）：\n{}\n用法：/resume <序号|session_id>",
+                                    lines.join("\n")
+                                ),
+                                &hint,
+                            )
                             .await;
+                            return;
+                        }
+                        // 解析目标：序号（1 起）或完整 session_id。
+                        let target = match arg.parse::<usize>() {
+                            Ok(n) if n >= 1 && n <= history.len() => history[n - 1].clone(),
+                            _ => match history.iter().find(|r| r.session_id == arg) {
+                                Some(r) => r.clone(),
+                                None => {
+                                    self.reply(
+                                        &conv,
+                                        "未找到该历史会话（/resume 查看列表）。",
+                                        &hint,
+                                    )
+                                    .await;
+                                    return;
+                                }
+                            },
+                        };
+                        // 跨后端校验（同 /switch P2-A）。
+                        let current_kind = self.backend.name();
+                        if let Some(k) = target.agent_kind.as_deref() {
+                            if k != current_kind {
+                                self.reply(
+                                    &conv,
+                                    &format!("该会话是 {k} 会话，当前后端为 {current_kind}（不互通，无法恢复）"),
+                                    &hint,
+                                )
+                                .await;
+                                return;
+                            }
+                        }
+                        let now = now_secs();
+                        let row = SessionRow {
+                            conv_id: conv.0.clone(),
+                            session_id: target.session_id.clone(),
+                            agent_kind: target
+                                .agent_kind
+                                .clone()
+                                .unwrap_or_else(|| current_kind.to_string()),
+                            workdir: self.default_workdir.to_string_lossy().to_string(),
+                            name: None,
+                            created_at: now,
+                            updated_at: now,
+                        };
+                        if let Err(e) = self.store.upsert_session(&row).await {
+                            self.reply(&conv, &format!("恢复失败：{e}"), &hint).await;
+                            return;
+                        }
+                        // 回到未命名（与被恢复 session 的命名绑定解耦）。
+                        let _ = self.store.delete_config(&active_name_key(&conv.0)).await;
+                        self.reply(
+                            &conv,
+                            &format!(
+                                "✅ 已恢复历史会话 {}…（下条消息续接）",
+                                &target.session_id[..target.session_id.len().min(16)]
+                            ),
+                            &hint,
+                        )
+                        .await;
                         return;
                     }
                     "/switch" => {
@@ -1005,12 +1550,8 @@ impl Dispatcher {
                         let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
                         if arg.is_empty() {
                             let wd = self.resolve_workdir(&conv.0).await;
-                            self.reply(
-                                &conv,
-                                &format!("当前工作目录：{}", wd.display()),
-                                &hint,
-                            )
-                            .await;
+                            self.reply(&conv, &format!("当前工作目录：{}", wd.display()), &hint)
+                                .await;
                             return;
                         }
                         let p = std::path::Path::new(arg);
@@ -1028,13 +1569,14 @@ impl Dispatcher {
                         let _conv_lock = self.acquire_conv_lock(&conv.0).await;
                         let _conv_guard = _conv_lock.lock().await;
                         match self.store.set_config(&workdir_key(&conv.0), arg).await {
-                            Ok(_) => self
-                                .reply(
+                            Ok(_) => {
+                                self.reply(
                                     &conv,
                                     &format!("✅ 工作目录已切到 {arg}（下条消息生效）"),
                                     &hint,
                                 )
-                                .await,
+                                .await
+                            }
                             Err(e) => self.reply(&conv, &format!("保存失败：{e}"), &hint).await,
                         }
                         return;
@@ -1079,16 +1621,20 @@ impl Dispatcher {
                                     .set_config(&workspace_key(arg), &wd.to_string_lossy())
                                     .await
                                 {
-                                    Ok(_) => self
-                                        .reply(
+                                    Ok(_) => {
+                                        self.reply(
                                             &conv,
-                                            &format!("✅ 已保存工作空间「{arg}」= {}", wd.display()),
+                                            &format!(
+                                                "✅ 已保存工作空间「{arg}」= {}",
+                                                wd.display()
+                                            ),
                                             &hint,
                                         )
-                                        .await,
-                                    Err(e) => self
-                                        .reply(&conv, &format!("保存失败：{e}"), &hint)
-                                        .await,
+                                        .await
+                                    }
+                                    Err(e) => {
+                                        self.reply(&conv, &format!("保存失败：{e}"), &hint).await
+                                    }
                                 }
                                 return;
                             }
@@ -1101,8 +1647,12 @@ impl Dispatcher {
                                     Ok(Some(path)) => {
                                         let p = std::path::Path::new(&path);
                                         if !p.is_dir() {
-                                            self.reply(&conv, &format!("目录不存在：{path}"), &hint)
-                                                .await;
+                                            self.reply(
+                                                &conv,
+                                                &format!("目录不存在：{path}"),
+                                                &hint,
+                                            )
+                                            .await;
                                             return;
                                         }
                                         // 改 per-conv workdir：取 conv 锁串行，与在飞 agent task 隔离（同 /cd）。
@@ -1113,25 +1663,27 @@ impl Dispatcher {
                                             .set_config(&workdir_key(&conv.0), &path)
                                             .await
                                         {
-                                            Ok(_) => self
-                                                .reply(
+                                            Ok(_) => {
+                                                self.reply(
                                                     &conv,
                                                     &format!("✅ 已切到「{arg}」（{path}）"),
                                                     &hint,
                                                 )
-                                                .await,
-                                            Err(e) => self
-                                                .reply(&conv, &format!("切换失败：{e}"), &hint)
-                                                .await,
+                                                .await
+                                            }
+                                            Err(e) => {
+                                                self.reply(&conv, &format!("切换失败：{e}"), &hint)
+                                                    .await
+                                            }
                                         }
                                     }
                                     Ok(None) => {
                                         self.reply(&conv, &format!("无此工作空间：{arg}"), &hint)
                                             .await
                                     }
-                                    Err(e) => self
-                                        .reply(&conv, &format!("读取失败：{e}"), &hint)
-                                        .await,
+                                    Err(e) => {
+                                        self.reply(&conv, &format!("读取失败：{e}"), &hint).await
+                                    }
                                 }
                                 return;
                             }
@@ -1141,22 +1693,28 @@ impl Dispatcher {
                                     return;
                                 }
                                 match self.store.delete_config(&workspace_key(arg)).await {
-                                    Ok(_) => self
-                                        .reply(&conv, &format!("✅ 已删除工作空间「{arg}」"), &hint)
-                                        .await,
-                                    Err(e) => self
-                                        .reply(&conv, &format!("删除失败：{e}"), &hint)
-                                        .await,
+                                    Ok(_) => {
+                                        self.reply(
+                                            &conv,
+                                            &format!("✅ 已删除工作空间「{arg}」"),
+                                            &hint,
+                                        )
+                                        .await
+                                    }
+                                    Err(e) => {
+                                        self.reply(&conv, &format!("删除失败：{e}"), &hint).await
+                                    }
                                 }
                                 return;
                             }
-                            _ => self
-                                .reply(
+                            _ => {
+                                self.reply(
                                     &conv,
                                     "用法：/ws [list|save <name>|use <name>|remove <name>]",
                                     &hint,
                                 )
-                                .await,
+                                .await
+                            }
                         }
                         return;
                     }
@@ -1183,14 +1741,16 @@ impl Dispatcher {
                         let wd_real = match wd.canonicalize() {
                             Ok(p) => p,
                             Err(e) => {
-                                self.reply(&conv, &format!("工作目录不可用：{e}"), &hint).await;
+                                self.reply(&conv, &format!("工作目录不可用：{e}"), &hint)
+                                    .await;
                                 return;
                             }
                         };
                         let real = match joined.canonicalize() {
                             Ok(p) => p,
                             Err(_) => {
-                                self.reply(&conv, &format!("文件不存在：{arg}"), &hint).await;
+                                self.reply(&conv, &format!("文件不存在：{arg}"), &hint)
+                                    .await;
                                 return;
                             }
                         };
@@ -1218,12 +1778,8 @@ impl Dispatcher {
                             })
                             .unwrap_or(false);
                         if !ext_ok {
-                            self.reply(
-                                &conv,
-                                "仅支持图片（png/jpg/jpeg/gif/webp/bmp）",
-                                &hint,
-                            )
-                            .await;
+                            self.reply(&conv, "仅支持图片（png/jpg/jpeg/gif/webp/bmp）", &hint)
+                                .await;
                             return;
                         }
                         let media = MediaRef {
@@ -1259,12 +1815,8 @@ impl Dispatcher {
                                 } else {
                                     ""
                                 };
-                                self.reply(
-                                    &conv,
-                                    &format!("✅ 权限模式已切到 {arg}{note}"),
-                                    &hint,
-                                )
-                                .await;
+                                self.reply(&conv, &format!("✅ 权限模式已切到 {arg}{note}"), &hint)
+                                    .await;
                             }
                             _ => {
                                 self.reply(&conv, "用法：/perm <off|allow|deny|ask>", &hint)
@@ -1273,10 +1825,44 @@ impl Dispatcher {
                         }
                         return;
                     }
+                    "/stop" => {
+                        // P4-1：中断该 conv 的在飞 agent 任务。**不取 conv 串行锁**——
+                        // 取了会等到任务自然结束才生效（等价于没停）。
+                        // 若正等 IM 权限审批：pending 回复通道 drop → MCP 收 deny
+                        // （fail-closed），agent 侧不悬挂。
+                        self.router.cancel(&conv.0).await;
+                        let running = self.running.lock().await.remove(&conv.0);
+                        let aborted = if let Some(h) = &running {
+                            // abort → backend.run future drop → 杀子进程：
+                            // CLI 后端 kill_on_drop；ACP 后端 cancel 分支 → 杀连接。
+                            h.abort();
+                            true
+                        } else {
+                            false
+                        };
+                        // stop = 全停：清空排队待合并的消息（P4-2 批处理队列）。
+                        let dropped = self
+                            .queues
+                            .lock()
+                            .await
+                            .remove(&conv.0)
+                            .map(|q| q.len())
+                            .unwrap_or(0);
+                        let text = match (aborted, dropped) {
+                            (true, 0) => "🛑 已中断当前任务".to_string(),
+                            (true, n) => format!("🛑 已中断当前任务（丢弃 {n} 条排队消息）"),
+                            (false, 0) => "ℹ️ 当前没有运行中的任务".to_string(),
+                            (false, n) => {
+                                format!("ℹ️ 当前没有运行中的任务（丢弃 {n} 条排队消息）")
+                            }
+                        };
+                        self.reply(&conv, &text, &hint).await;
+                        return;
+                    }
                     "/help" => {
                         self.reply(
                             &conv,
-                            "命令：\n/new 重置会话\n/switch <name> 切命名会话\n/sessions 列会话\n/compact 压缩上下文\n/cd [path] 切工作目录\n/ws [list|save|use|remove] 命名工作空间\n/img <path> 发图片\n/perm <off|allow|deny|ask> 权限模式\n/allow <id> 授权\n/disallow <id> 撤权\n/list 白名单\n/whoami 我的id\n/help 帮助",
+                            "命令：\n/new 重置会话\n/switch <name> 切命名会话\n/sessions 列会话\n/resume [n] 恢复历史会话\n/compact 压缩上下文\n/cd [path] 切工作目录\n/ws [list|save|use|remove] 命名工作空间\n/img <path> 发图片\n/perm <off|allow|deny|ask> 权限模式\n/stop 中断当前任务\n/config [k v] 查看/热改配置\n/status 状态\n/doctor 自检\n/reconnect 重连\n/allow <id> 授权\n/disallow <id> 撤权\n/chat [allow|deny|list] 会话白名单\n/list 白名单\n/whoami 我的id\n/help 帮助",
                             &hint,
                         )
                         .await;
@@ -1286,7 +1872,7 @@ impl Dispatcher {
                         self.reply(
                             &conv,
                             &format!(
-                                "未知命令: {cmd}（支持: /new /switch /sessions /compact /cd /ws /img /perm /allow /disallow /list /whoami /help）"
+                                "未知命令: {cmd}（支持: /new /switch /sessions /resume /compact /cd /ws /img /perm /stop /config /status /doctor /reconnect /allow /disallow /chat /list /whoami /help）"
                             ),
                             &hint,
                         )
@@ -1298,10 +1884,9 @@ impl Dispatcher {
         }
 
         // 4. 普通消息。
-        let base_prompt = msg.text.clone().unwrap_or_default();
         // 文本与媒体皆空才丢弃；媒体消息（无文本）仍驱动 agent。
         // 纯媒体但全部下载失败：向用户报真实错误，不静默。
-        if base_prompt.trim().is_empty() && msg.media.is_empty() {
+        if msg.text.as_deref().unwrap_or("").trim().is_empty() && msg.media.is_empty() {
             if !msg.media_errors.is_empty() {
                 let errs = msg.media_errors.join("; ");
                 self.reply(
@@ -1316,14 +1901,41 @@ impl Dispatcher {
             return;
         }
 
-        // per-conv 串行锁：保证同一会话的 agent 任务串行。
-        let lock = {
-            let mut map = self.conv_locks.lock().await;
-            map.entry(conv.0.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
+        // P4-2 批处理：runner 在飞则入队（下一轮合并）后即返；否则本 task 成为
+        // runner。runner 循环持 conv 串行锁跨轮次（slash 命令仍排队其后），每轮前
+        // 等批处理窗口吃进连发消息；队空则交还 runner 身份、释放锁退出。
+        if !self.enqueue_or_become_runner(&conv.0, msg, &hint).await {
+            return;
+        }
+        let lock = self.acquire_conv_lock(&conv.0).await;
         let _guard = lock.lock().await;
+        while let Some(batch) = self.take_batch_after_window(&conv.0).await {
+            let merged = merge_batch(batch);
+            self.run_agent_round(merged).await;
+        }
+        drop(_guard);
+        self.release_conv_lock(&conv.0, lock).await;
+    }
+
+    /// 单轮 agent 执行（P4 批处理 runner 循环的循环体）：合并后的消息 → typing →
+    /// 续接 session → 媒体提示 / 前情摘要注入 → 流式收集（含空闲看门狗）→ 回传 →
+    /// 落库。conv 串行锁由调用方（runner 循环）持有，本函数不再管理锁。
+    ///
+    /// 中止语义（P4-1/P4-3）：`/stop` 或空闲看门狗 abort join task →
+    /// `JoinError::is_cancelled` 分支——卡片 finalize 成 Error 终态（防流式卡片停在
+    /// 「生成中」），不落 session（保留上次成功映射）。
+    async fn run_agent_round(&self, msg: InboundMessage) {
+        let conv_key = msg.conv_id.0.clone();
+        self.run_round_inner(msg).await;
+        // 统一收尾：移除在飞注册（inner 未及注册时为幂等 no-op）。同 conv 轮次串行
+        // （conv 锁），key 移除无 ABA。
+        self.running.lock().await.remove(&conv_key);
+    }
+
+    async fn run_round_inner(&self, msg: InboundMessage) {
+        let conv = msg.conv_id.clone();
+        let hint = msg.reply_hint.clone();
+        let base_prompt = msg.text.clone().unwrap_or_default();
 
         // best-effort typing 指示（agent 处理中）；失败仅 log，不阻塞后续。
         let _ = self.platform.send_typing(&conv, &hint).await;
@@ -1419,6 +2031,13 @@ impl Dispatcher {
                 )),
             }
         });
+        // P4-1：注册在飞句柄（/stop 中断用）。runner 持 conv 锁跨轮，同 conv 不可能
+        // 并发两轮；轮次结束由 run_agent_round 统一移除。
+        self.running
+            .lock()
+            .await
+            .insert(conv.0.clone(), join.abort_handle());
+
         // 收集 chunks：Final/Error 落库，ToolUse 累积用于最终工具摘要。
         let mut final_text: Option<String> = None;
         let mut error_text: Option<String> = None;
@@ -1431,12 +2050,44 @@ impl Dispatcher {
         } else {
             None
         };
-        while let Some(chunk) = rx.recv().await {
+        // P4-3：空闲看门狗——连续 agent_idle_timeout 无任何 chunk 则 abort（杀子进程）。
+        // 等权限审批期间暂停（审批有独立的 permission_ask_timeout 预算兜底）。
+        let mut idle_timed_out = false;
+        loop {
+            // P4-6：COT 档位每轮读取（/config 热改对下一轮生效）。
+            let cot = *self.cot_detail.read();
+            let idle_timeout = *self.agent_idle_timeout.read();
+            let chunk = if idle_timeout.is_zero() {
+                match rx.recv().await {
+                    Some(c) => c,
+                    None => break,
+                }
+            } else {
+                match tokio::time::timeout(idle_timeout, rx.recv()).await {
+                    Ok(Some(c)) => c,
+                    Ok(None) => break,
+                    Err(_) if self.router.has_pending(&conv.0).await => continue,
+                    Err(_) => {
+                        idle_timed_out = true;
+                        warn!(
+                            target: "imagent::core",
+                            conv_id = %conv.0,
+                            idle = ?idle_timeout,
+                            "agent 空闲超时（连续无输出），终止本轮"
+                        );
+                        break;
+                    }
+                }
+            };
             match chunk {
                 AgentChunk::Final(t) => final_text = Some(t),
                 AgentChunk::Error(e) => error_text = Some(e),
                 AgentChunk::ToolUse { tool, input } => {
-                    let summary = truncate_str(&input, 40);
+                    // P4-6：off 档不收集工具过程（无摘要、无卡片工具面板）。
+                    if cot == CotDetail::Off {
+                        continue;
+                    }
+                    let summary = truncate_str(&input, cot.input_trunc());
                     tool_calls.push((tool.clone(), summary.clone()));
                     if let Some(c) = card.as_mut() {
                         c.append_tool(&tool, &summary, &conv, &hint, self.platform.as_ref())
@@ -1457,6 +2108,11 @@ impl Dispatcher {
                     }
                 }
             }
+        }
+
+        // P4-3：空闲超时 → abort join（杀子进程链路同 /stop），走下方 cancelled 分支。
+        if idle_timed_out {
+            join.abort();
         }
 
         // 等待 backend 返回 RunOutcome。
@@ -1484,9 +2140,49 @@ impl Dispatcher {
                 } else {
                     self.reply(&conv, &m, &hint).await;
                 }
-                // P1-7：失败路径也回收 conv_lock，防 HashMap 项永久泄漏。
-                drop(_guard);
-                self.release_conv_lock(&conv.0, lock).await;
+                // conv 锁由 runner 循环持有并统一释放（P1-7 防泄漏语义不变）。
+                return;
+            }
+            Err(e) if e.is_cancelled() => {
+                // P4-1/P4-3：join task 被 abort——/stop（用户中断）或空闲看门狗。
+                METRICS.backend_errors.inc();
+                if idle_timed_out {
+                    let m = format!(
+                        "⏱️ agent 已连续 {:?} 无输出，空闲超时终止本轮。本轮输出未保存，会话保持上次成功状态，可重发消息继续。",
+                        *self.agent_idle_timeout.read()
+                    );
+                    if let Some(c) = card.as_mut() {
+                        c.finalize(
+                            Some(m.as_str()),
+                            &tool_calls,
+                            CardTerminal::Error(m.clone()),
+                            &conv,
+                            &hint,
+                            self.platform.as_ref(),
+                        )
+                        .await;
+                    } else {
+                        self.reply(&conv, &m, &hint).await;
+                    }
+                } else {
+                    warn!(
+                        target: "imagent::core",
+                        conv_id = %conv.0,
+                        "agent 任务被用户 /stop 中断"
+                    );
+                    // /stop 命令侧已回确认，这里只把流式卡片收敛到终态（防停在「生成中」）。
+                    if let Some(c) = card.as_mut() {
+                        c.finalize(
+                            Some(""),
+                            &tool_calls,
+                            CardTerminal::Error("已中断".into()),
+                            &conv,
+                            &hint,
+                            self.platform.as_ref(),
+                        )
+                        .await;
+                    }
+                }
                 return;
             }
             Err(e) => {
@@ -1507,9 +2203,6 @@ impl Dispatcher {
                 } else {
                     self.reply(&conv, &m, &hint).await;
                 }
-                // P1-7：panic 路径也回收 conv_lock。
-                drop(_guard);
-                self.release_conv_lock(&conv.0, lock).await;
                 return;
             }
         };
@@ -1530,11 +2223,9 @@ impl Dispatcher {
         };
         // 工具调用摘要：仅无卡片平台（ilink/wecom）追加文本摘要；卡片平台由 render_card
         // 的折叠面板统一渲染，避免正文与卡片块重复展示工具调用。
-        if !tool_calls.is_empty()
-            && card.is_none()
-            && (final_text_is_present || outcome_has_final)
+        if !tool_calls.is_empty() && card.is_none() && (final_text_is_present || outcome_has_final)
         {
-            reply.push_str(&format_tool_summary(&tool_calls));
+            reply.push_str(&format_tool_summary(&tool_calls, *self.cot_detail.read()));
         }
         // R1：backend 标记非正常终止（崩溃等）时，回复前置告警，让用户感知是部分输出而非正常结果。
         if !outcome.terminal {
@@ -1638,10 +2329,7 @@ impl Dispatcher {
                 );
             }
         }
-
-        // 回收该 conv 的串行锁（P1-7：统一走 release_conv_lock，与失败路径一致）。
-        drop(_guard);
-        self.release_conv_lock(&conv.0, lock).await;
+        // conv 锁由 runner 循环持有并统一释放；在飞注册由 run_agent_round 统一移除。
     }
 
     /// 回传文本；发送失败仅 log。session 过期升级为 error（用户侧已收不到回复）。
@@ -1786,9 +2474,8 @@ mod tests {
             std::path::PathBuf::from("/tmp/imagent-test-ws"),
             vec!["Read".into()],
             PermissionMode::Off,
-            std::time::Duration::from_secs(600),
-            std::time::Duration::from_secs(300),
-            std::time::Duration::from_secs(60),
+            test_budgets(),
+            CotDetail::Brief,
             vec![],
         ));
         disp.handle(msg("c1", "u1", "hello")).await;
@@ -1884,7 +2571,10 @@ mod tests {
             _hint: &ReplyHint,
         ) -> Result<()> {
             // 以 [media:<url>] 记入 inbox，供 /img 等测试断言回传内容。
-            self.inbox.lock().await.push(format!("[media:{}]", media.url));
+            self.inbox
+                .lock()
+                .await
+                .push(format!("[media:{}]", media.url));
             self.send_count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -1905,6 +2595,8 @@ mod tests {
         fail: bool,
         /// 本次 run 构造的 RunOutcome.terminal 值（默认 true = 正常终止）。
         terminal: bool,
+        /// run 记录后先 sleep 该时长（P4 /stop、批处理、空闲看门狗测试用）。
+        slow_ms: u64,
     }
 
     impl MockBackend {
@@ -1919,6 +2611,7 @@ mod tests {
                 tools_to_emit: Arc::new(TokioMutex::new(Vec::new())),
                 fail: false,
                 terminal: true,
+                slow_ms: 0,
             };
             (b, calls, prompts, order)
         }
@@ -1942,6 +2635,12 @@ mod tests {
         fn new_non_terminal() -> (Self, CallsHandle, PromptsHandle, CounterHandle) {
             let (mut b, calls, prompts, order) = Self::new();
             b.terminal = false;
+            (b, calls, prompts, order)
+        }
+        /// run 记录后挂起 slow_ms（P4 /stop、批处理合并、空闲看门狗测试用）。
+        fn new_slow(slow_ms: u64) -> (Self, CallsHandle, PromptsHandle, CounterHandle) {
+            let (mut b, calls, prompts, order) = Self::new();
+            b.slow_ms = slow_ms;
             (b, calls, prompts, order)
         }
     }
@@ -1971,6 +2670,12 @@ mod tests {
 
             // 稍微让出调度器，便于测试串行。
             tokio::task::yield_now().await;
+
+            // P4：慢后端——记录后挂起（不发任何 chunk），供 /stop、批处理、空闲
+            // 看门狗测试制造「在飞任务」窗口。
+            if self.slow_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(self.slow_ms)).await;
+            }
 
             // 先发配置好的 ToolUse chunk（若有），再发 Final。
             let tools = self.tools_to_emit.lock().await.clone();
@@ -2056,9 +2761,8 @@ mod tests {
             default_workdir,
             vec!["Read".into(), "Edit".into()],
             PermissionMode::Off,
-            std::time::Duration::from_secs(600),
-            std::time::Duration::from_secs(300),
-            std::time::Duration::from_secs(60),
+            test_budgets(),
+            CotDetail::Brief,
             vec![], // admin_senders 空 = 测试用向后兼容（所有白名单用户可 /allow）
         ));
 
@@ -2086,9 +2790,8 @@ mod tests {
             std::path::PathBuf::from("/tmp/imagent-test-ws"),
             vec!["Read".into(), "Edit".into()],
             PermissionMode::Off,
-            std::time::Duration::from_secs(600),
-            std::time::Duration::from_secs(300),
-            std::time::Duration::from_secs(60),
+            test_budgets(),
+            CotDetail::Brief,
             vec![], // admin_senders 空 = 测试用向后兼容（所有白名单用户可 /allow）
         ));
 
@@ -2116,9 +2819,8 @@ mod tests {
             std::path::PathBuf::from("/tmp/imagent-test-ws"),
             vec!["Read".into(), "Edit".into()],
             PermissionMode::Off,
-            std::time::Duration::from_secs(600),
-            std::time::Duration::from_secs(300),
-            std::time::Duration::from_secs(60),
+            test_budgets(),
+            CotDetail::Brief,
             admin_senders,
         ));
         Ctx {
@@ -2146,9 +2848,8 @@ mod tests {
             std::path::PathBuf::from("/tmp/imagent-test-ws"),
             vec!["Read".into(), "Edit".into()],
             PermissionMode::Off,
-            std::time::Duration::from_secs(600),
-            std::time::Duration::from_secs(300),
-            std::time::Duration::from_secs(60),
+            test_budgets(),
+            CotDetail::Brief,
             vec![], // admin_senders 空 = 测试用向后兼容（所有白名单用户可 /allow）
         ));
 
@@ -2161,6 +2862,59 @@ mod tests {
             order,
             db,
         }
+    }
+
+    /// 测试默认预算：与线上默认一致，唯批处理窗口收窄到 1ms（不拖慢顺序喂消息的
+    /// 既有用例）。需要窗口/看门狗/慢后端的用例走 [`build_slow`]。
+    fn test_budgets() -> TaskBudgets {
+        TaskBudgets {
+            agent_timeout: Duration::from_secs(600),
+            permission_ask_timeout: Duration::from_secs(300),
+            shutdown_grace: Duration::from_secs(60),
+            agent_idle_timeout: Duration::from_secs(300),
+            batch_window: Duration::from_millis(1),
+        }
+    }
+
+    /// 慢后端 + 自定义预算（P4 /stop、批处理合并、空闲看门狗测试用）。
+    async fn build_slow(auth: Auth, slow_ms: u64, budgets: TaskBudgets) -> Ctx {
+        let (plat, inbox, send_count) = MockPlatform::new();
+        let (back, calls, prompts, order) = MockBackend::new_slow(slow_ms);
+        let (store, db) = tmp_store().await;
+
+        let disp = Arc::new(Dispatcher::new(
+            Arc::new(plat),
+            Arc::new(back),
+            store,
+            auth,
+            std::path::PathBuf::from("/tmp/imagent-test-ws"),
+            vec!["Read".into(), "Edit".into()],
+            PermissionMode::Off,
+            budgets,
+            CotDetail::Brief,
+            vec![],
+        ));
+
+        Ctx {
+            disp,
+            inbox,
+            send_count,
+            calls,
+            prompts,
+            order,
+            db,
+        }
+    }
+
+    /// 等待 conv 的在飞任务注册出现（join spawn 后写入 running map）。
+    async fn wait_registered(ctx: &Ctx, conv: &str) -> bool {
+        for _ in 0..400 {
+            if ctx.disp.running.lock().await.contains_key(conv) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        false
     }
 
     /// 把消息喂给 dispatcher 的 mock platform recv，并等待处理完成。
@@ -2910,6 +3664,525 @@ mod tests {
         assert!(reply.contains("…(+1)"), "6 个工具应标 …(+1): {reply}");
         assert!(reply.contains("Tool0"), "应含首个工具: {reply}");
         assert!(reply.contains("Tool4"), "应含第 5 个工具: {reply}");
+        drop_db(ctx.db).await;
+    }
+
+    // ---------- P4：/stop、批处理合并、空闲看门狗 ----------
+
+    #[test]
+    fn permission_reply_candidate_classification() {
+        // 非空普通文本可作审批回复；斜杠命令与空文本不消费（/stop 在等审批时
+        // 也要可执行；纯媒体消息不误吞成 deny）。
+        assert!(is_permission_reply_candidate("y"));
+        assert!(is_permission_reply_candidate(" 可以 "));
+        assert!(is_permission_reply_candidate("yes please"));
+        assert!(!is_permission_reply_candidate("/stop"));
+        assert!(!is_permission_reply_candidate("/new"));
+        assert!(!is_permission_reply_candidate(""));
+        assert!(!is_permission_reply_candidate("   "));
+    }
+
+    #[test]
+    fn merge_batch_joins_and_concats() {
+        let mut a = msg("c1", "u1", "first");
+        a.media.push(MediaRef {
+            kind: "image".into(),
+            url: "/tmp/a.png".into(),
+        });
+        let mut b = msg("c1", "u2", "second");
+        b.media.push(MediaRef {
+            kind: "image".into(),
+            url: "/tmp/b.png".into(),
+        });
+        b.media_errors.push("dl fail".into());
+        let blank = msg("c1", "u3", "   "); // 空文本跳过，media 仍并入
+        let mut m = merge_batch(vec![a, b, blank]);
+        assert_eq!(m.text.as_deref(), Some("first\n\nsecond"));
+        assert_eq!(m.sender.0, "u1", "sender 取首条");
+        assert_eq!(m.media.len(), 2, "media 拼接");
+        assert_eq!(m.media_errors, vec!["dl fail".to_string()]);
+        m.media.clear(); // silence unusedASSIGN 风格告警（显式消费）
+                         // 全空文本 + 纯媒体：text 为 None，media 保留。
+        let mut media_only = msg("c1", "u1", "   ");
+        media_only.media.push(MediaRef {
+            kind: "image".into(),
+            url: "/tmp/x.png".into(),
+        });
+        let merged = merge_batch(vec![media_only]);
+        assert_eq!(merged.text, None);
+        assert_eq!(merged.media.len(), 1);
+    }
+
+    /// P4-1：/stop 中断在飞任务——backend 被 abort（无 Final 回复）、在飞注册
+    /// 清空、/stop 回确认。
+    #[tokio::test]
+    async fn stop_aborts_running_task() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build_slow(
+            Auth::new(vec!["alice".into()]),
+            30_000,
+            TaskBudgets {
+                batch_window: Duration::from_millis(1),
+                ..test_budgets()
+            },
+        )
+        .await;
+        let disp = ctx.disp.clone();
+        let runner = tokio::spawn(async move {
+            disp.handle(msg("c1", "alice", "slow task")).await;
+        });
+        assert!(
+            wait_registered(&ctx, "c1").await,
+            "在飞任务应已注册（join spawn 后）"
+        );
+        ctx.disp.handle(msg("c1", "alice", "/stop")).await;
+        let done = tokio::time::timeout(Duration::from_secs(5), runner).await;
+        assert!(done.is_ok(), "被中断的 runner 应很快退出");
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(
+            inbox.iter().any(|t| t.contains("已中断当前任务")),
+            "应回中断确认: {inbox:?}"
+        );
+        assert!(
+            !inbox.iter().any(|t| t.starts_with("reply#")),
+            "中断后不应有 Final 回复: {inbox:?}"
+        );
+        assert!(ctx.disp.running.lock().await.is_empty(), "在飞注册应清空");
+        assert_eq!(ctx.prompts.lock().await.len(), 1, "恰一轮被中断的执行");
+        drop_db(ctx.db).await;
+    }
+
+    /// P4-1：无在飞任务时 /stop 友好回复（不报错）。
+    #[tokio::test]
+    async fn stop_without_running_task_replies() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::new(vec!["alice".into()])).await;
+        ctx.disp.handle(msg("c1", "alice", "/stop")).await;
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(
+            inbox.iter().any(|t| t.contains("没有运行中的任务")),
+            "应回无任务提示: {inbox:?}"
+        );
+        drop_db(ctx.db).await;
+    }
+
+    /// P4-1/P4-2：/stop 同时丢弃排队待合并的消息，回复含丢弃条数。
+    #[tokio::test]
+    async fn stop_drops_queued_messages() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build_slow(
+            Auth::new(vec!["alice".into()]),
+            30_000,
+            TaskBudgets {
+                batch_window: Duration::from_millis(1),
+                ..test_budgets()
+            },
+        )
+        .await;
+        let disp = ctx.disp.clone();
+        let runner = tokio::spawn(async move {
+            disp.handle(msg("c1", "alice", "first round")).await;
+        });
+        assert!(wait_registered(&ctx, "c1").await, "在飞任务应已注册");
+        ctx.disp.handle(msg("c1", "alice", "queued B")).await;
+        ctx.disp.handle(msg("c1", "alice", "queued C")).await;
+        // 等 2 条都入队。
+        for _ in 0..400 {
+            if ctx
+                .disp
+                .queues
+                .lock()
+                .await
+                .get("c1")
+                .is_some_and(|q| q.len() == 2)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        ctx.disp.handle(msg("c1", "alice", "/stop")).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), runner).await;
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(
+            inbox
+                .iter()
+                .any(|t| t.contains("已中断当前任务（丢弃 2 条排队消息）")),
+            "应回丢弃条数: {inbox:?}"
+        );
+        let prompts = ctx.prompts.lock().await.clone();
+        assert_eq!(
+            prompts,
+            vec!["first round".to_string()],
+            "排队消息不应再执行"
+        );
+        drop_db(ctx.db).await;
+    }
+
+    /// P4-2：运行中到达的消息排队到下一轮，且合并为一轮（B、C 合成 "B\n\nC"）。
+    #[tokio::test]
+    async fn messages_during_run_merge_into_next_round() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build_slow(
+            Auth::new(vec!["alice".into()]),
+            200,
+            TaskBudgets {
+                batch_window: Duration::from_millis(1),
+                ..test_budgets()
+            },
+        )
+        .await;
+        let disp = ctx.disp.clone();
+        let runner = tokio::spawn(async move {
+            disp.handle(msg("c1", "alice", "round A")).await;
+        });
+        assert!(wait_registered(&ctx, "c1").await, "在飞任务应已注册");
+        ctx.disp.handle(msg("c1", "alice", "msg B")).await;
+        ctx.disp.handle(msg("c1", "alice", "msg C")).await;
+        let done = tokio::time::timeout(Duration::from_secs(5), runner).await;
+        assert!(done.is_ok(), "runner 应在两轮后退出");
+        let prompts = ctx.prompts.lock().await.clone();
+        assert_eq!(
+            prompts,
+            vec!["round A".to_string(), "msg B\n\nmsg C".to_string()],
+            "第二轮应为 B、C 合并后的单轮: {prompts:?}"
+        );
+        // 第二轮续接第一轮 session（批处理不破坏会话连续性）。
+        let calls = ctx.calls.lock().await.clone();
+        assert_eq!(
+            calls,
+            vec![None, Some("sess-0".to_string())],
+            "第二轮应续接第一轮 session: {calls:?}"
+        );
+        drop_db(ctx.db).await;
+    }
+
+    /// P4-2：批处理窗口内连发的消息并入同一轮（而非各跑一轮）。
+    #[tokio::test]
+    async fn burst_messages_merge_within_window() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build_slow(
+            Auth::new(vec!["alice".into()]),
+            50,
+            TaskBudgets {
+                batch_window: Duration::from_millis(200),
+                ..test_budgets()
+            },
+        )
+        .await;
+        let disp = ctx.disp.clone();
+        let runner = tokio::spawn(async move {
+            disp.handle(msg("c1", "alice", "first half")).await;
+        });
+        // 窗口期内（200ms）并入第二条。
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        ctx.disp.handle(msg("c1", "alice", "second half")).await;
+        let done = tokio::time::timeout(Duration::from_secs(5), runner).await;
+        assert!(done.is_ok(), "runner 应退出");
+        let prompts = ctx.prompts.lock().await.clone();
+        assert_eq!(
+            prompts,
+            vec!["first half\n\nsecond half".to_string()],
+            "窗口内连发应合并为单轮: {prompts:?}"
+        );
+        assert_eq!(ctx.order.load(Ordering::SeqCst), 1, "backend 只跑一轮");
+        drop_db(ctx.db).await;
+    }
+
+    /// P4-3：空闲看门狗——agent 连续无输出超时终止本轮并告知用户。
+    #[tokio::test]
+    async fn idle_watchdog_terminates_silent_agent() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build_slow(
+            Auth::new(vec!["alice".into()]),
+            30_000,
+            TaskBudgets {
+                agent_idle_timeout: Duration::from_millis(100),
+                batch_window: Duration::from_millis(1),
+                ..test_budgets()
+            },
+        )
+        .await;
+        // 直接 await：runner 循环内完成（窗口 → 一轮 → 看门狗 → 退出）。
+        ctx.disp.handle(msg("c1", "alice", "hang please")).await;
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(
+            inbox
+                .iter()
+                .any(|t| t.contains("无输出") && t.contains("空闲超时")),
+            "应回空闲超时提示: {inbox:?}"
+        );
+        assert!(!inbox.iter().any(|t| t.starts_with("reply#")));
+        assert_eq!(ctx.prompts.lock().await.len(), 1);
+        assert!(ctx.disp.running.lock().await.is_empty(), "在飞注册应清空");
+        assert!(
+            ctx.disp.queues.lock().await.is_empty(),
+            "runner 退出后队列 entry 应移除"
+        );
+        drop_db(ctx.db).await;
+    }
+
+    /// P4-2：排队上限——超限消息回告警并丢弃，runner 不受影响。
+    #[tokio::test]
+    async fn pending_queue_cap_warns_and_drops() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build_slow(
+            Auth::new(vec!["alice".into()]),
+            30_000,
+            TaskBudgets {
+                batch_window: Duration::from_millis(1),
+                ..test_budgets()
+            },
+        )
+        .await;
+        let disp = ctx.disp.clone();
+        let runner = tokio::spawn(async move {
+            disp.handle(msg("c1", "alice", "long first round")).await;
+        });
+        assert!(wait_registered(&ctx, "c1").await, "在飞任务应已注册");
+        for i in 0..(PENDING_QUEUE_CAP + 5) {
+            ctx.disp
+                .handle(msg("c1", "alice", &format!("spam {i}")))
+                .await;
+        }
+        ctx.disp.handle(msg("c1", "alice", "/stop")).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), runner).await;
+        let inbox = ctx.inbox.lock().await.clone();
+        let overflow = inbox.iter().filter(|t| t.contains("已达上限")).count();
+        assert!(overflow >= 5, "超限的 5 条应各回一次告警: {inbox:?}");
+        let prompts = ctx.prompts.lock().await.clone();
+        assert_eq!(prompts.len(), 1, "只应有首轮（已 /stop）: {prompts:?}");
+        drop_db(ctx.db).await;
+    }
+
+    // ---------- P4-5：会话（群）白名单 ----------
+
+    /// P4-5：未授权群 + 未授权 sender 丢弃；/chat allow 授权当前群后成员可驱动；
+    /// /chat list 列出；/chat deny 收回。
+    #[tokio::test]
+    async fn chat_allowlist_gates_group_messages() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::new(vec!["alice".into()])).await;
+        // bob 在未授权群发言：丢弃（无回复、不跑 backend）。
+        ctx.disp.handle(msg("feishu:oc_g", "bob", "hi group")).await;
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(inbox.is_empty(), "未授权群应静默丢弃: {inbox:?}");
+        drop(inbox);
+        // alice（白名单成员）在群里授权该群。
+        ctx.disp
+            .handle(msg("feishu:oc_g", "alice", "/chat allow"))
+            .await;
+        // 授权后 bob 的群消息驱动 agent。
+        feed_and_wait(&ctx, vec![msg("feishu:oc_g", "bob", "run it")], 1).await;
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(
+            inbox.iter().any(|t| t.contains("已授权会话 feishu:oc_g")),
+            "应回授权确认: {inbox:?}"
+        );
+        assert!(
+            inbox.iter().any(|t| t.starts_with("reply#")),
+            "授权后群成员消息应驱动 agent: {inbox:?}"
+        );
+        // /chat deny 收回后 bob 再发言被丢弃。
+        ctx.disp
+            .handle(msg("feishu:oc_g", "alice", "/chat deny"))
+            .await;
+        let before = ctx.calls.lock().await.len();
+        ctx.disp.handle(msg("feishu:oc_g", "bob", "again")).await;
+        assert_eq!(
+            ctx.calls.lock().await.len(),
+            before,
+            "收回授权后群消息不应驱动 agent"
+        );
+        drop_db(ctx.db).await;
+    }
+
+    /// P4-5：/chat 非管理员（admin_senders 非空时）被拒。
+    #[tokio::test]
+    async fn chat_command_requires_admin_when_set() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build_with_admin(Auth::new(vec!["alice".into()]), vec!["root".into()]).await;
+        ctx.disp
+            .handle(msg("feishu:oc_g", "alice", "/chat allow"))
+            .await;
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(
+            inbox.iter().any(|t| t.contains("仅管理员")),
+            "非管理员应被拒: {inbox:?}"
+        );
+        drop_db(ctx.db).await;
+    }
+
+    /// P4-5：仅配置会话白名单（sender 空）不进发现模式，群成员可直接使用。
+    #[tokio::test]
+    async fn chats_only_config_not_discovery() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::with_chats(vec![], vec!["feishu:oc_g".into()])).await;
+        feed_and_wait(&ctx, vec![msg("feishu:oc_g", "bob", "hello")], 1).await;
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(
+            inbox.iter().any(|t| t.starts_with("reply#")),
+            "授权群的成员消息应驱动 agent: {inbox:?}"
+        );
+        drop_db(ctx.db).await;
+    }
+
+    // ---------- P4-6：/config 与 COT 档位 ----------
+
+    /// P4-6：/config 查看显示全部键；设置 off 后工具摘要消失。
+    #[tokio::test]
+    async fn config_views_and_sets_cot_detail() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::new(vec!["alice".into()])).await;
+        ctx.disp.handle(msg("c1", "alice", "/config")).await;
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(
+            inbox
+                .iter()
+                .any(|t| t.contains("cot_detail = brief") && t.contains("batch_window_ms")),
+            "应列出配置: {inbox:?}"
+        );
+        drop(inbox);
+        // 切 detailed → 生效确认。
+        ctx.disp
+            .handle(msg("c1", "alice", "/config cot_detail detailed"))
+            .await;
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(inbox.iter().any(|t| t.contains("✅ cot_detail = detailed")));
+        drop(inbox);
+        // 切 off + 发工具消息 → 无 🔧 摘要。
+        ctx.disp
+            .handle(msg("c1", "alice", "/config cot_detail off"))
+            .await;
+        let tools = vec![("Read".to_string(), r#"{"path":"/foo"}"#.to_string())];
+        let (back, calls, prompts, order) = MockBackend::new_with_tools(tools).await;
+        let _ = (back, calls, prompts); // 本测试复用 ctx 的 backend，仅验证 off 档行为
+        let _ = order;
+        // 用带工具的 backend 直接构造（build_with_tools 默认 brief；这里改共享句柄已 off）。
+        drop_db(ctx.db).await;
+        // 单独验证 off 档：用带工具 ctx + /config off。
+        let ctx2 = build_with_tools(
+            Auth::new(vec!["alice".into()]),
+            vec![("Read".to_string(), r#"{"path":"/foo"}"#.to_string())],
+        )
+        .await;
+        ctx2.disp
+            .handle(msg("t1", "alice", "/config cot_detail off"))
+            .await;
+        feed_and_wait(&ctx2, vec![msg("t1", "alice", "go")], 1).await;
+        let inbox2 = ctx2.inbox.lock().await.clone();
+        let reply = inbox2
+            .iter()
+            .find(|t| t.starts_with("reply#"))
+            .expect("应有 final reply");
+        assert!(
+            !reply.contains("🔧 工具调用"),
+            "off 档不应有工具摘要: {reply}"
+        );
+        drop_db(ctx2.db).await;
+    }
+
+    /// P4-6：detailed 档展示更长输入（>40 字符的输入可见）。
+    #[tokio::test]
+    async fn cot_detailed_shows_longer_input() {
+        let _serial = SERIAL.lock().await;
+        let long_input = format!(r#"{{"path":"{}"}}"#, "x".repeat(80));
+        let ctx = build_with_tools(
+            Auth::new(vec!["alice".into()]),
+            vec![("Read".to_string(), long_input.clone())],
+        )
+        .await;
+        ctx.disp
+            .handle(msg("t1", "alice", "/config cot_detail detailed"))
+            .await;
+        feed_and_wait(&ctx, vec![msg("t1", "alice", "go")], 1).await;
+        let inbox = ctx.inbox.lock().await.clone();
+        let reply = inbox
+            .iter()
+            .find(|t| t.starts_with("reply#"))
+            .expect("应有 final reply");
+        assert!(
+            reply.contains("🔧 工具调用"),
+            "detailed 档应有摘要: {reply}"
+        );
+        // brief 截断到 40 字符；detailed 到 200 → 80 个 x 应完整可见。
+        assert!(
+            reply.matches('x').count() >= 80,
+            "detailed 档不应在 40 字符截断: {reply}"
+        );
+        drop_db(ctx.db).await;
+    }
+
+    // ---------- P4-7：/status /doctor /reconnect ----------
+
+    #[tokio::test]
+    async fn status_doctor_reconnect_reply() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::new(vec!["alice".into()])).await;
+        ctx.disp.handle(msg("c1", "alice", "/status")).await;
+        ctx.disp.handle(msg("c1", "alice", "/doctor")).await;
+        ctx.disp.handle(msg("c1", "alice", "/reconnect")).await;
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(
+            inbox
+                .iter()
+                .any(|t| t.contains("📊") && t.contains("mock / mock-backend")),
+            "/status 应含平台/后端: {inbox:?}"
+        );
+        assert!(
+            inbox
+                .iter()
+                .any(|t| t.contains("🩺") && t.contains("存储读写正常")),
+            "/doctor 应含自检结果: {inbox:?}"
+        );
+        // MockPlatform 未覆写 reconnect → 默认不支持，回告警而非成功。
+        assert!(
+            inbox.iter().any(|t| t.contains("重连指令失败")),
+            "默认平台应报不支持重连: {inbox:?}"
+        );
+        drop_db(ctx.db).await;
+    }
+
+    // ---------- P4-8：/resume ----------
+
+    /// P4-8：两轮会话后 /resume 列出历史（当前带 *）；/resume <n> 恢复后下条消息
+    /// 续接被恢复的 session。
+    #[tokio::test]
+    async fn resume_lists_and_restores_history() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::new(vec!["alice".into()])).await;
+        feed_and_wait(
+            &ctx,
+            vec![msg("c1", "alice", "first"), msg("c1", "alice", "second")],
+            2,
+        )
+        .await;
+        // 历史应有两条（sess-0 / sess-1），当前是 sess-1。
+        ctx.disp.handle(msg("c1", "alice", "/resume")).await;
+        let inbox = ctx.inbox.lock().await.clone();
+        let list = inbox
+            .iter()
+            .find(|t| t.contains("历史会话"))
+            .expect("应列出历史会话");
+        assert!(list.contains("sess-0"), "应含 sess-0: {list}");
+        assert!(list.contains("sess-1"), "应含 sess-1: {list}");
+        assert!(list.contains("*"), "当前会话应带 *: {list}");
+        drop(inbox);
+        // 恢复 1 号（sess-0）→ 下条消息续接 sess-0。
+        ctx.disp.handle(msg("c1", "alice", "/resume 1")).await;
+        feed_and_wait(&ctx, vec![msg("c1", "alice", "after resume")], 3).await;
+        let calls = ctx.calls.lock().await.clone();
+        assert_eq!(
+            calls.last(),
+            Some(&Some("sess-0".to_string())),
+            "恢复后应续接 sess-0: {calls:?}"
+        );
+        // 不存在的历史 → 提示。
+        ctx.disp.handle(msg("c1", "alice", "/resume 99")).await;
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(
+            inbox.iter().any(|t| t.contains("未找到该历史会话")),
+            "越界序号应提示: {inbox:?}"
+        );
         drop_db(ctx.db).await;
     }
 }

@@ -24,6 +24,11 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(name = "imagent", version, about = "IM ↔ agent gateway")]
 struct Cli {
+    /// 状态目录 profile（P4-10）：使用 `~/.imagent/profiles/<name>`（config / db /
+    /// permission.sock / 媒体全隔离），默认 `~/.imagent`。配合 `imagent profile create`。
+    #[arg(long, global = true)]
+    profile: Option<String>,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -49,6 +54,16 @@ enum Cmd {
         /// 要授权的 from_user_id（如 wx_xxx@im.wechat）。
         sender: String,
     },
+    /// 授权一个会话/群（P4-5：写入会话白名单，conv_id 原样如 feishu:oc_xxx）。
+    AllowChat {
+        /// 要授权的 conv_id（如 feishu:oc_xxx）。
+        conv_id: String,
+    },
+    /// Profile 多实例管理（P4-10）：每个 profile 独立 config / db / sock / 媒体。
+    Profile {
+        #[command(subcommand)]
+        action: ProfileAction,
+    },
     /// 停止（v1 前台运行模式，仅打印停止方式：前台 Ctrl-C / systemctl stop / kill <pid>）。
     Stop,
     /// 内部子命令：作为 claude 的 MCP 权限审批 server（stdio JSON-RPC）。
@@ -70,6 +85,40 @@ enum Cmd {
     },
 }
 
+#[derive(Subcommand)]
+enum ProfileAction {
+    /// 列出全部 profile。
+    List,
+    /// 创建 profile（建目录 + 写 config 模板；不覆盖已有 config）。
+    Create { name: String },
+    /// 删除 profile（含其全部状态；default 不可删；需 --yes 确认）。
+    Remove {
+        name: String,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+/// profile 根目录：`~/.imagent/profiles/<name>`（不受 IMAGENT_HOME 覆盖影响，
+/// profile 管理本身始终锚定真实 home，防嵌套歧义）。
+fn profile_root(name: &str) -> anyhow::Result<std::path::PathBuf> {
+    let sanitized: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized != name || sanitized.is_empty() {
+        return Err(anyhow!("非法 profile 名 {name:?}（仅限字母数字 - _）"));
+    }
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("无法定位 home 目录"))?;
+    Ok(home.join(".imagent").join("profiles").join(&sanitized))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // rustls 0.23 breaking change：必须显式安装 process-level CryptoProvider，
@@ -84,9 +133,28 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // 数据目录 ~/.imagent
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("无法定位 home 目录"))?;
-    let data_dir = home.join(".imagent");
+    // P4-10：`--profile <name>` → 进程内把状态根目录切到 profile 目录
+    // （config / db / sock / 媒体 / MCP 子进程 env 全部随之隔离）。
+    // profile 管理子命令自身不切（始终操作真实 home 下的 profiles/）。
+    let is_profile_mgmt = matches!(cli.cmd, Cmd::Profile { .. });
+    if !is_profile_mgmt {
+        if let Some(name) = &cli.profile {
+            let root = profile_root(name)?;
+            if !root.is_dir() {
+                return Err(anyhow!(
+                    "profile {name:?} 不存在（{}）。先运行 `imagent profile create {name}`",
+                    root.display()
+                ));
+            }
+            // Safety（set_var 多线程）：进程启动早期、tokio runtime 尚未跑用户代码，
+            // 此处是唯一写点（Unix 上 glibc putenv 无 RSS；后续只读）。
+            std::env::set_var(imagent_core::paths::IMAGENT_HOME_ENV, &root);
+            println!("使用 profile：{name}（状态目录 {}）", root.display());
+        }
+    }
+
+    // 数据目录（imagent_home：默认 ~/.imagent，--profile 时为 profile 目录）
+    let data_dir = imagent_core::paths::imagent_home();
     std::fs::create_dir_all(&data_dir)?;
     // P2-14：数据目录收紧 0700（默认 umask 常 0755，同机其他用户可 ls 看到文件名；
     // 最小权限，与 store 文件 0600 / permission.sock 0600 姿态一致）。
@@ -118,9 +186,79 @@ async fn main() -> Result<()> {
                  在日志里看到你的 from_user_id，填进 allowed_senders 后重启即可驱动 agent。"
             );
         }
+        Cmd::AllowChat { conv_id } => {
+            // P4-5：会话（群）白名单 bootstrap（与 Allow 同构）。
+            let store = imagent_store::Store::open(&db_path).await?;
+            store.add_allowed_chat(&conv_id, None, Some("cli")).await?;
+            println!("已授权会话 {conv_id}（重启 imagent 生效；IM 内 /chat 可动态管理）");
+        }
+        Cmd::Profile { action } => {
+            // profile 管理不切 IMAGENT_HOME（见上方 is_profile_mgmt）。
+            match action {
+                ProfileAction::List => {
+                    let home = dirs::home_dir().ok_or_else(|| anyhow!("无法定位 home 目录"))?;
+                    let dir = home.join(".imagent").join("profiles");
+                    if !dir.is_dir() {
+                        println!("暂无 profile（{} 不存在）", dir.display());
+                        return Ok(());
+                    }
+                    let mut names: Vec<String> = std::fs::read_dir(&dir)?
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.path().is_dir())
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect();
+                    names.sort();
+                    if names.is_empty() {
+                        println!("暂无 profile（目录为空）");
+                    } else {
+                        println!("profiles（{} 个）：", names.len());
+                        for n in names {
+                            println!("  - {n}（imagent --profile {n} start）");
+                        }
+                    }
+                }
+                ProfileAction::Create { name } => {
+                    let root = profile_root(&name)?;
+                    std::fs::create_dir_all(&root)?;
+                    let cfg = root.join("config.toml");
+                    if cfg.exists() {
+                        println!(
+                            "profile {name} 已存在（config 保留不动）：{}",
+                            root.display()
+                        );
+                    } else {
+                        std::fs::write(&cfg, imagent_core::Config::EXAMPLE)?;
+                        println!(
+                            "已创建 profile {name}：{}\nconfig 模板已写入 {}（填 default_workdir 后即可运行）\n启动：imagent --profile {name} start",
+                            root.display(),
+                            cfg.display()
+                        );
+                    }
+                }
+                ProfileAction::Remove { name, yes } => {
+                    if name == "default" {
+                        return Err(anyhow!("default（默认 ~/.imagent）不可经此删除"));
+                    }
+                    let root = profile_root(&name)?;
+                    if !root.is_dir() {
+                        return Err(anyhow!("profile {name} 不存在：{}", root.display()));
+                    }
+                    if !yes {
+                        return Err(anyhow!(
+                            "将删除 {} 的全部状态（config/db/凭据/媒体），确认请加 --yes",
+                            root.display()
+                        ));
+                    }
+                    std::fs::remove_dir_all(&root)?;
+                    println!("已删除 profile {name}（{}）", root.display());
+                }
+            }
+        }
         Cmd::Start { platform } => {
             if platform != "ilink" && platform != "wecom" && platform != "feishu" {
-                return Err(anyhow!("未知 platform={platform}，支持 ilink | wecom | feishu"));
+                return Err(anyhow!(
+                    "未知 platform={platform}，支持 ilink | wecom | feishu"
+                ));
             }
 
             // 1. 配置
@@ -142,14 +280,12 @@ async fn main() -> Result<()> {
             store.set_require_keyring(config.require_keyring);
 
             // 3. platform —— 按 config.platform / CLI 选用 ilink 或 wecom。
-            let platform_name = if platform == "ilink"
-                || platform == "wecom"
-                || platform == "feishu"
-            {
-                platform.as_str()
-            } else {
-                config.platform.as_str()
-            };
+            let platform_name =
+                if platform == "ilink" || platform == "wecom" || platform == "feishu" {
+                    platform.as_str()
+                } else {
+                    config.platform.as_str()
+                };
             let platform = build_platform(platform_name, &config, store.clone()).await?;
 
             // 6. backend —— permission_mode 用共享句柄，SIGHUP 热重载即时生效。
@@ -184,7 +320,8 @@ async fn main() -> Result<()> {
                 );
             }
 
-            // 7. auth —— 白名单：config 种子 ∪ store 已有（CLI /allow 或 IM /allow 持久化）。
+            // 7. auth —— 白名单：config 种子 ∪ store 已有（CLI /allow 或 IM /allow 持久化）；
+            //    会话（群）白名单同构（P4-5）。
             let mut initial: Vec<String> = config.allowed_senders.clone();
             let stored = store.list_allowed_senders().await.unwrap_or_default();
             for s in stored {
@@ -192,7 +329,14 @@ async fn main() -> Result<()> {
                     initial.push(s);
                 }
             }
-            let auth = imagent_core::Auth::new(initial);
+            let mut initial_chats: Vec<String> = config.allowed_chats.clone();
+            let stored_chats = store.list_allowed_chats().await.unwrap_or_default();
+            for c in stored_chats {
+                if !initial_chats.contains(&c) {
+                    initial_chats.push(c);
+                }
+            }
+            let auth = imagent_core::Auth::with_chats(initial, initial_chats);
             let discovery = auth.is_discovery();
 
             // 8. dispatcher —— allowed_tools / permission_mode 均以共享句柄注入。
@@ -206,9 +350,8 @@ async fn main() -> Result<()> {
                 config.default_workdir.clone(),
                 tools_handle,
                 perm_mode.clone(),
-                std::time::Duration::from_secs(config.agent_timeout_secs),
-                std::time::Duration::from_secs(config.permission_ask_timeout_secs),
-                std::time::Duration::from_secs(config.shutdown_grace_secs),
+                imagent_core::TaskBudgets::from_config(&config),
+                config.cot_detail,
                 config.admin_senders.clone(),
             ));
 
@@ -431,14 +574,10 @@ async fn build_platform(
             let app_id = config
                 .feishu_app_id
                 .clone()
-                .ok_or_else(|| {
-                    anyhow!("platform=feishu 需在 config.toml 配置 feishu_app_id")
-                })?;
+                .ok_or_else(|| anyhow!("platform=feishu 需在 config.toml 配置 feishu_app_id"))?;
             // MVP：app_secret 从环境变量读（keyring bootstrap 为后续 P2）。
-            let app_secret =
-                std::env::var("IMAGENT_FEISHU_APP_SECRET").map_err(|_| {
-                    anyhow!("platform=feishu 需设置环境变量 IMAGENT_FEISHU_APP_SECRET")
-                })?;
+            let app_secret = std::env::var("IMAGENT_FEISHU_APP_SECRET")
+                .map_err(|_| anyhow!("platform=feishu 需设置环境变量 IMAGENT_FEISHU_APP_SECRET"))?;
             let base_url = config
                 .feishu_base_url
                 .clone()
@@ -563,6 +702,15 @@ fn spawn_sighup_handler(
                         }
                     }
                     dispatcher.auth().reload(senders);
+                    // 会话白名单：config 种子 ∪ store（P4-5）。
+                    let mut chats: Vec<String> = cfg.allowed_chats.clone();
+                    let stored_chats = store.list_allowed_chats().await.unwrap_or_default();
+                    for c in stored_chats {
+                        if !chats.contains(&c) {
+                            chats.push(c);
+                        }
+                    }
+                    dispatcher.auth().reload_chats(chats);
                     dispatcher.reload_tools(cfg.allowed_tools.clone());
                     dispatcher.reload_permission_mode(cfg.permission_mode);
                     tracing::info!(target: "imagent::ops", "config reloaded (SIGHUP)");

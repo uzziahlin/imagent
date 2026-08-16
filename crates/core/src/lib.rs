@@ -24,21 +24,22 @@ mod error;
 pub mod mcp;
 mod message;
 pub mod metrics;
+pub mod paths;
 mod permission;
 mod platform;
 mod types;
 
 pub use auth::Auth;
 pub use backend::Backend;
-pub use config::{Config, PermissionMode};
+pub use config::{Config, CotDetail, PermissionMode};
 pub use dedup::Dedup;
-pub use dispatch::Dispatcher;
+pub use dispatch::{Dispatcher, TaskBudgets};
 pub use error::{CoreError, Result};
 pub use message::split_message;
 pub use metrics::Metrics;
 pub use permission::{default_sock_path, parse_reply, PermissionReply, PermissionRouter};
 pub use platform::Platform;
 pub use types::{
-    AgentChunk, CardTerminal, ConvId, InboundMessage, MediaRef, OutboundCard, ReplyHint, RunOutcome,
-    SessionId, UserId, Workdir,
+    AgentChunk, CardTerminal, ConvId, InboundMessage, MediaRef, OutboundCard, ReplyHint,
+    RunOutcome, SessionId, UserId, Workdir,
 };

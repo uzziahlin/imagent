@@ -42,6 +42,52 @@ impl PermissionMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CotDetail {
+    /// 不展示任何工具过程（只回最终结果）。
+    Off,
+    /// 简要工具摘要（默认：工具名 + 40 字符输入截断，最多 5 个）。
+    #[default]
+    Brief,
+    /// 详细工具过程（200 字符输入截断，最多 10 个）。
+    Detailed,
+}
+
+impl CotDetail {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Brief => "brief",
+            Self::Detailed => "detailed",
+        }
+    }
+    pub fn from_str_lossy(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "brief" => Some(Self::Brief),
+            "detailed" => Some(Self::Detailed),
+            _ => None,
+        }
+    }
+    /// 工具输入摘要的字符截断上限。
+    pub fn input_trunc(self) -> usize {
+        match self {
+            Self::Off => 0,
+            Self::Brief => 40,
+            Self::Detailed => 200,
+        }
+    }
+    /// 工具摘要最多展示条数。
+    pub fn max_tools(self) -> usize {
+        match self {
+            Self::Off => 0,
+            Self::Brief => 5,
+            Self::Detailed => 10,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Config {
     /// agent 工作根目录（agent 的 cwd，**非沙箱**：仅决定工作目录，不限制可读路径；
@@ -49,6 +95,10 @@ pub struct Config {
     pub default_workdir: PathBuf,
     #[serde(default)]
     pub allowed_senders: Vec<String>,
+    /// 会话（群）白名单种子（P4-5）：存 conv_id 原样（如 `feishu:oc_xxx`）。
+    /// 群消息「chat 放行 OR sender 放行」即过鉴权。运行时经 `/chat` 动态管理。
+    #[serde(default)]
+    pub allowed_chats: Vec<String>,
     /// 管理员 sender（可执行 /allow /disallow 授权新用户）。空 = 向后兼容（所有
     /// 白名单用户可 /allow，P2-D 建议生产环境显式设置以收敛授权面）。
     #[serde(default)]
@@ -86,6 +136,19 @@ pub struct Config {
     /// 剩余（kill_on_drop 杀 agent 子进程）。默认 60。R-1：原硬编码 30s 偏短。
     #[serde(default = "default_shutdown_grace_secs")]
     pub shutdown_grace_secs: u64,
+    /// 空闲看门狗（秒）：agent 连续该时长无任何输出（chunk）则终止本轮并杀子进程，
+    /// 防 stream 僵死干等 agent_timeout 总预算。等待 IM 权限审批期间看门狗自动暂停
+    /// （审批有独立的 permission_ask_timeout_secs 预算）。默认 300；0 = 关闭。
+    #[serde(default = "default_agent_idle_timeout_secs")]
+    pub agent_idle_timeout_secs: u64,
+    /// 批处理窗口（毫秒）：runner 起跑前等待后续消息并入同一轮 prompt 的时长；
+    /// 运行中到达的消息同样排队到下一轮合并（以 \n\n 拼接）。默认 1500；0 = 关闭。
+    #[serde(default = "default_batch_window_ms")]
+    pub batch_window_ms: u64,
+    /// 工具过程（COT）展示档位（P4-6）：off / brief（默认）/ detailed。
+    /// 控制「🔧 工具调用」摘要与流式卡片工具面板的粒度；可经 `/config` 热改。
+    #[serde(default)]
+    pub cot_detail: CotDetail,
     /// 若为 true，凭据必须写入 OS keyring；keyring 不可用时 **拒绝明文落盘**
     /// （`put_credential` 返回 Err，fail-closed）。默认 false（headless/CI 无 keychain
     /// 时明文回退 + warn，向后兼容）。安全敏感部署应设 true。
@@ -134,11 +197,17 @@ fn default_permission_ask_timeout_secs() -> u64 {
 fn default_shutdown_grace_secs() -> u64 {
     60
 }
+fn default_agent_idle_timeout_secs() -> u64 {
+    300
+}
+fn default_batch_window_ms() -> u64 {
+    1500
+}
 
 impl Config {
-    /// 默认配置文件路径：`~/.imagent/config.toml`。
+    /// 默认配置文件路径：`<imagent_home>/config.toml`（P4-10：随 profile 隔离）。
     pub fn default_path() -> Option<PathBuf> {
-        dirs::home_dir().map(|h| h.join(".imagent").join("config.toml"))
+        Some(crate::paths::imagent_home().join("config.toml"))
     }
 
     /// 读取并解析。文件不存在 => `CoreError::Config`。
@@ -162,6 +231,7 @@ impl Config {
     pub const EXAMPLE: &'static str = r#"# ~/.imagent/config.toml
 default_workdir = "/absolute/path/to/agent/workspace"   # 必填，agent 的 cwd（非沙箱：不限制可读路径，靠 allowed_tools + permission_mode 兜底）
 allowed_senders = []        # 留空 = 发现模式（只打日志记录入站 sender，不驱动 agent）
+# allowed_chats = ["feishu:oc_xxx"]   # 会话(群)白名单：群消息 chat 放行 OR sender 放行即过（/chat 可动态管理）
 # admin_senders = []          # 可 /allow 的管理员 sender；空=所有白名单用户可(P2-D，生产建议显式设置收敛授权面)
 allowed_tools = ["Read", "Edit"]
 agent = "claude-cli"         # claude-cli(默认) | claude-acp(ACP长驻子进程) | codex | gemini
@@ -173,6 +243,9 @@ permission_mode = "off"     # off(默认,claude按allowedTools自行处理) | al
 # message_max_len = 2000              # 单条出站消息字符上限（Unicode char）；不设 = 不分片
 # message_fragment_interval_ms = 400  # 分片间发送间隔（ms）
 # agent_timeout_secs = 600            # 单次 agent 运行超时（秒）；超时中止防挂死
+# agent_idle_timeout_secs = 300       # 空闲看门狗(秒)：连续无输出则终止本轮；0=关闭
+# batch_window_ms = 1500              # 批处理窗口(ms)：连发消息合并为一轮 prompt；0=关闭
+# cot_detail = "brief"                # 工具过程展示：off | brief(默认) | detailed（/config 可热改）
 # permission_ask_timeout_secs = 300   # Ask 模式等用户回复超时(秒，独立预算，不挤占 agent 超时)
 # shutdown_grace_secs = 60            # 优雅退出 drain 宽限(秒)；超时 abort 在飞 task
 # require_keyring = false        # 默认 false(headless 明文回退+warn); true=keyring 不可用时拒绝明文落盘(fail-closed，安全部署建议)
@@ -368,6 +441,72 @@ message_fragment_interval_ms = 250
         );
         let cfg = Config::load(&p).expect("parse");
         assert!(cfg.require_keyring);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn cot_detail_default_brief_and_parse() {
+        // 默认 brief。
+        let p = tmp_path("cot_def", r#"default_workdir = "/tmp/ws""#);
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(cfg.cot_detail, CotDetail::Brief);
+        assert_eq!(cfg.cot_detail.input_trunc(), 40);
+        assert_eq!(cfg.cot_detail.max_tools(), 5);
+        cleanup(&p);
+        // 三档解析 + 档位参数。
+        for (raw, expect) in [
+            ("off", CotDetail::Off),
+            ("brief", CotDetail::Brief),
+            ("detailed", CotDetail::Detailed),
+        ] {
+            let p = tmp_path(
+                "cot_parse",
+                &format!("default_workdir = \"/tmp/ws\"\ncot_detail = \"{raw}\"\n"),
+            );
+            let cfg = Config::load(&p).expect("parse");
+            assert_eq!(cfg.cot_detail, expect, "raw={raw}");
+            cleanup(&p);
+        }
+        assert_eq!(CotDetail::Detailed.input_trunc(), 200);
+        assert_eq!(CotDetail::Detailed.max_tools(), 10);
+        assert_eq!(CotDetail::Off.input_trunc(), 0);
+        // 非法值 lossy 解析为 None（/config 输入校验用）。
+        assert!(CotDetail::from_str_lossy("bogus").is_none());
+    }
+
+    #[test]
+    fn allowed_chats_default_empty_and_parse() {
+        let p = tmp_path("chats_def", r#"default_workdir = "/tmp/ws""#);
+        let cfg = Config::load(&p).expect("parse");
+        assert!(cfg.allowed_chats.is_empty());
+        cleanup(&p);
+        let p = tmp_path(
+            "chats_parse",
+            "default_workdir = \"/tmp/ws\"\nallowed_chats = [\"feishu:oc_a\", \"feishu:oc_b\"]\n",
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(cfg.allowed_chats.len(), 2);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn idle_timeout_and_batch_window_default() {
+        let p = tmp_path("idle_def", r#"default_workdir = "/tmp/ws""#);
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(cfg.agent_idle_timeout_secs, 300);
+        assert_eq!(cfg.batch_window_ms, 1500);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn idle_timeout_and_batch_window_custom() {
+        let p = tmp_path(
+            "idle_custom",
+            "default_workdir = \"/tmp/ws\"\nagent_idle_timeout_secs = 90\nbatch_window_ms = 0\n",
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(cfg.agent_idle_timeout_secs, 90);
+        assert_eq!(cfg.batch_window_ms, 0);
         cleanup(&p);
     }
 }

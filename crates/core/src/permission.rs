@@ -11,9 +11,9 @@ use std::path::PathBuf;
 
 use tokio::sync::{oneshot, Mutex};
 
-/// 固定 socket 路径：`~/.imagent/permission.sock`。
+/// 固定 socket 路径：`<imagent_home>/permission.sock`（P4-10：随 profile 隔离）。
 pub fn default_sock_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".imagent").join("permission.sock"))
+    Some(crate::paths::imagent_home().join("permission.sock"))
 }
 
 /// 用户的 approve/deny 回复。

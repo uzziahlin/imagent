@@ -50,11 +50,19 @@ pub struct InboundMessage {
 #[derive(Debug, Clone)]
 pub enum AgentChunk {
     Text(String),
-    ToolUse { tool: String, input: String },
-    ToolResult { tool: String, output: String },
+    ToolUse {
+        tool: String,
+        input: String,
+    },
+    ToolResult {
+        tool: String,
+        output: String,
+    },
     /// agent 产出的媒体文件（绝对/工作目录相对路径）。目前仅 claude-cli 的 Write
     /// 工具写图片文件时产出；dispatch 在 run 结束后经 Platform::send_media 回传 IM。
-    Media { path: String },
+    Media {
+        path: String,
+    },
     Final(String),
     Error(String),
 }
