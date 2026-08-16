@@ -62,17 +62,13 @@ impl Default for ClaudeBackend {
 const NAME: &str = "claude-cli";
 
 /// 固定 socket 路径（主进程 PermissionRouter 监听、MCP server 连接）。
-/// P2-M：路径固定为单实例设计——主进程唯一监听点，MCP 子进程据此连接。多实例
-/// 部署需各自独立 HOME（`~/.imagent` 隔离）；如需同机多实例可扩展为含 pid 的路径。
+/// P4-10：锚定 `imagent_home()`（`--profile` 时随 profile 隔离，env 对被 spawn 的
+/// MCP 子进程同样生效）；home 不可解析时回退 /tmp。
 fn permission_sock_path() -> String {
-    dirs::home_dir()
-        .map(|h| {
-            h.join(".imagent")
-                .join("permission.sock")
-                .to_string_lossy()
-                .into_owned()
-        })
-        .unwrap_or_else(|| "/tmp/imagent-permission.sock".into())
+    imagent_core::paths::imagent_home()
+        .join("permission.sock")
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// 把 conv_id 消毒为文件名安全片段（P2-I：防路径遍历——`/`、`..`、`:` 等替换为 `_``）。

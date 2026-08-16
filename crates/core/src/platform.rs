@@ -46,4 +46,41 @@ pub trait Platform: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
+
+    /// 强制平台重连（P4-7 `/reconnect`）：断开当前长连接并立即重连，排查僵死连接。
+    /// 默认不支持（返回 Err 由命令层提示）。
+    async fn reconnect(&self) -> Result<()> {
+        Err(crate::error::CoreError::Platform(
+            "platform",
+            "该平台不支持强制重连".into(),
+        ))
+    }
+
+    /// 发权限审批询问（P4-4）。默认实现走纯文本；支持交互卡片的平台可覆写为
+    /// 「按钮卡片」——用户点击后平台侧产生 `text = "y"/"n"` 的 InboundMessage，
+    /// 复用既有审批回复路由（`parse_reply`）送达 MCP，core 无需感知按钮。
+    async fn send_permission_ask(
+        &self,
+        conv: &ConvId,
+        tool_name: &str,
+        input_summary: &str,
+        hint: &ReplyHint,
+    ) -> Result<()> {
+        self.send_permission_ask_text(conv, tool_name, input_summary, hint)
+            .await
+    }
+
+    /// 纯文本审批询问（独立方法而非闭在 send_permission_ask 默认实现里——覆写
+    /// send_permission_ask 的平台卡片失败时可调它降级，避免动态分发自递归）。
+    async fn send_permission_ask_text(
+        &self,
+        conv: &ConvId,
+        tool_name: &str,
+        input_summary: &str,
+        hint: &ReplyHint,
+    ) -> Result<()> {
+        let text =
+            format!("🔐 Claude 请求执行 {tool_name}：{input_summary}\n回复 y 允许，其它拒绝。");
+        self.send_text(conv, &text, hint).await
+    }
 }
