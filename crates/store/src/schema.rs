@@ -3,7 +3,7 @@
 //! 用 `PRAGMA user_version` 做简单线性迁移：v1 = 建 5 张基础表，v2 = 动态白名单 + 审计日志。
 
 /// 当前代码支持的最新 schema 版本（migrate 上限 + user_version 过新拒绝阈值，P2-O）。
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// v1 全部建表语句（`CREATE TABLE IF NOT EXISTS`，可重复执行）。
 pub const SCHEMA_V1: &str = r#"
@@ -82,6 +82,30 @@ CREATE TABLE IF NOT EXISTS named_sessions (
 );
 "#;
 
+/// v4：会话（群）白名单（P4-5）。存 conv_id 原样（平台无关，如 `feishu:oc_xxx`），
+/// 与 `allowed_senders`（人维度）互补：群消息「chat 放行 OR sender 放行」即过。
+pub const SCHEMA_V4: &str = r#"
+CREATE TABLE IF NOT EXISTS allowed_chats (
+  conv_id  TEXT PRIMARY KEY,
+  added_at INTEGER NOT NULL,
+  added_by TEXT,
+  source   TEXT
+);
+"#;
+
+/// v5：session 历史侧表（P4-8 `/resume`）。`sessions` 表只存每 conv 当前活动
+/// session（upsert 覆盖），本表记每个出现过的 session_id 供 IM 内恢复。
+pub const SCHEMA_V5: &str = r#"
+CREATE TABLE IF NOT EXISTS session_history (
+  conv_id    TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  agent_kind TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (conv_id, session_id)
+);
+"#;
+
 /// 在已打开的连接上跑线性迁移。幂等：逐版本推进（v1→v2→…），已到目标版本则跳过。
 pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     let current: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -112,6 +136,14 @@ pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     if current < 3 {
         tx.execute_batch(SCHEMA_V3)?;
         tx.pragma_update(None, "user_version", 3_i64)?;
+    }
+    if current < 4 {
+        tx.execute_batch(SCHEMA_V4)?;
+        tx.pragma_update(None, "user_version", 4_i64)?;
+    }
+    if current < 5 {
+        tx.execute_batch(SCHEMA_V5)?;
+        tx.pragma_update(None, "user_version", 5_i64)?;
     }
     tx.commit()?;
     Ok(())

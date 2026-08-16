@@ -69,6 +69,16 @@ pub struct NamedSessionRow {
     pub updated_at: i64,
 }
 
+/// 一行历史 session 记录（P4-8 `/resume`：该 conv 出现过的所有 session_id）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SessionHistoryRow {
+    pub conv_id: String,
+    pub session_id: String,
+    pub agent_kind: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 struct Inner {
     conn: Mutex<rusqlite::Connection>,
 }
@@ -342,6 +352,9 @@ impl Store {
     }
 
     /// 插入或更新（按 conv_id）。created_at 仅新建时写入；更新时保留原 created_at、刷新 updated_at。
+    ///
+    /// P4-8：session_id 发生变化时同步写 `session_history` 侧表（`/resume` 数据源）——
+    /// INSERT OR REPLACE 刷新 updated_at，同 session 重复 upsert 不产生新行。
     pub async fn upsert_session(&self, row: &SessionRow) -> Result<()> {
         let row = row.clone();
         let inner = self.inner.clone();
@@ -366,6 +379,12 @@ impl Store {
                     row.created_at,
                     now,
                 ],
+            )?;
+            conn.execute(
+                "INSERT INTO session_history (conv_id, session_id, agent_kind, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(conv_id, session_id) DO UPDATE SET updated_at = excluded.updated_at",
+                rusqlite::params![row.conv_id, row.session_id, row.agent_kind, now, now],
             )?;
             Ok(())
         })
@@ -546,6 +565,95 @@ impl Store {
                 rusqlite::params![sender],
             )?;
             Ok(n > 0)
+        })
+        .await
+    }
+
+    // —— allowed_chats（会话/群白名单，P4-5）——
+
+    /// 返回所有已授权会话 conv_id（升序）。
+    pub async fn list_allowed_chats(&self) -> Result<Vec<String>> {
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let mut stmt = conn.prepare("SELECT conv_id FROM allowed_chats ORDER BY conv_id")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r?);
+            }
+            Ok(v)
+        })
+        .await
+    }
+
+    /// 加入会话白名单。`INSERT OR IGNORE`：已存在不报错、不覆盖元数据。
+    pub async fn add_allowed_chat(
+        &self,
+        conv_id: &str,
+        added_by: Option<&str>,
+        source: Option<&str>,
+    ) -> Result<()> {
+        let (conv_id, added_by, source) = (
+            conv_id.to_string(),
+            added_by.map(|s| s.to_string()),
+            source.map(|s| s.to_string()),
+        );
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO allowed_chats (conv_id, added_at, added_by, source) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![conv_id, now_secs(), added_by, source],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// 移除会话白名单条目。返回是否原本存在。
+    pub async fn remove_allowed_chat(&self, conv_id: &str) -> Result<bool> {
+        let conv_id = conv_id.to_string();
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let n = conn.execute(
+                "DELETE FROM allowed_chats WHERE conv_id = ?1",
+                rusqlite::params![conv_id],
+            )?;
+            Ok(n > 0)
+        })
+        .await
+    }
+
+    // —— session_history（历史会话侧表，P4-8 /resume 数据源）——
+
+    /// 列出该 conv 的历史 session（按 updated_at 倒序，最多 `limit` 条）。
+    pub async fn list_session_history(
+        &self,
+        conv_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionHistoryRow>> {
+        let conv_id = conv_id.to_string();
+        let limit_i = i64::try_from(limit).unwrap_or(i64::MAX);
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT conv_id, session_id, agent_kind, created_at, updated_at \
+                 FROM session_history WHERE conv_id = ?1 ORDER BY updated_at DESC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![conv_id, limit_i], |r| {
+                Ok(SessionHistoryRow {
+                    conv_id: r.get(0)?,
+                    session_id: r.get(1)?,
+                    agent_kind: r.get::<_, Option<String>>(2)?,
+                    created_at: r.get(3)?,
+                    updated_at: r.get(4)?,
+                })
+            })?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r?);
+            }
+            Ok(v)
         })
         .await
     }
@@ -935,16 +1043,84 @@ mod tests {
         let tables = list_tables(&store).await;
         for t in [
             "allowed_senders",
+            "allowed_chats",
             "audit_log",
             "config",
             "context_tokens",
             "credentials",
             "named_sessions",
+            "session_history",
             "sessions",
             "sync_buf",
         ] {
             assert!(tables.iter().any(|x| x == t), "missing table: {t}");
         }
+    }
+
+    // ---------- P4-5：allowed_chats ----------
+
+    #[tokio::test]
+    async fn allowed_chats_add_list_remove() {
+        let db = TempDb::new("chats").await;
+        let store = Store::open(&db.path).await.unwrap();
+        assert!(store.list_allowed_chats().await.unwrap().is_empty());
+        store
+            .add_allowed_chat("feishu:oc_b", Some("admin"), Some("im"))
+            .await
+            .unwrap();
+        // 重复 add 不报错、不覆盖元数据。
+        store
+            .add_allowed_chat("feishu:oc_b", None, None)
+            .await
+            .unwrap();
+        store
+            .add_allowed_chat("feishu:oc_a", None, Some("cli"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.list_allowed_chats().await.unwrap(),
+            vec!["feishu:oc_a".to_string(), "feishu:oc_b".to_string()]
+        );
+        assert!(store.remove_allowed_chat("feishu:oc_b").await.unwrap());
+        assert!(!store.remove_allowed_chat("feishu:oc_b").await.unwrap());
+        assert_eq!(
+            store.list_allowed_chats().await.unwrap(),
+            vec!["feishu:oc_a".to_string()]
+        );
+    }
+
+    // ---------- P4-8：session_history ----------
+
+    #[tokio::test]
+    async fn session_history_records_and_orders() {
+        let db = TempDb::new("hist").await;
+        let store = Store::open(&db.path).await.unwrap();
+        let row = |sid: &str, at: i64| SessionRow {
+            conv_id: "c1".into(),
+            session_id: sid.into(),
+            agent_kind: "mock".into(),
+            workdir: "/tmp".into(),
+            name: None,
+            created_at: at,
+            updated_at: at,
+        };
+        store.upsert_session(&row("s1", 100)).await.unwrap();
+        store.upsert_session(&row("s2", 200)).await.unwrap();
+        // 同 session 重复 upsert 不产生新历史行，只刷新 updated_at。
+        store.upsert_session(&row("s1", 300)).await.unwrap();
+        let hist = store.list_session_history("c1", 10).await.unwrap();
+        assert_eq!(hist.len(), 2, "两个不同 session 各一行: {hist:?}");
+        // 最近更新的排前（s1 刚被 300 时刻刷新）。
+        assert_eq!(hist[0].session_id, "s1");
+        assert_eq!(hist[1].session_id, "s2");
+        // limit 生效。
+        assert_eq!(store.list_session_history("c1", 1).await.unwrap().len(), 1);
+        // 其它 conv 不串。
+        assert!(store
+            .list_session_history("c2", 10)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
