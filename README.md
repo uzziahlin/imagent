@@ -31,8 +31,13 @@ imagent 是一个常驻网关进程：监听 IM 私聊消息 → 鉴权 → 驱�
 ## 特性
 
 - 🌉 **平台 / 后端双抽象**：换 IM 只加 adapter，换 agent 只加 impl。
-- 🔐 **安全第一**：发送者白名单 + `--allowedTools` 收敛 + workdir 锁定 + **IM 内权限审批闭环**。
-- 💬 **会话连续**：per-chat session 持久化（SQLite），重启可续；`--resume`；`/switch` 多命名会话。
+- 🔐 **安全第一**：发送者白名单 + 会话（群）白名单 + `--allowedTools` 收敛 + workdir 锁定 + **IM 内权限审批闭环**（按钮卡片 / 文本 y/n）。
+- 💬 **会话连续**：per-chat session 持久化（SQLite），重启可续；`--resume`；`/switch` 多命名会话；`/resume` 恢复任意历史会话。
+- 🛑 **任务控制**：`/stop` 随时中断在飞任务（杀 agent 子进程）；空闲看门狗自动终止无输出的僵死任务。
+- 🔁 **消息批处理**：运行中到达的消息排队，与连发消息合并为一轮执行（不重复跑轮、不烧 token）。
+- 🛠️ **IM 内运维**：`/status` `/doctor` `/reconnect` `/config`（COT 三档展示 off/brief/detailed 等热改）。
+- 📄 **飞书生态**：CardKit 真流式卡片、审批按钮卡片、云文档评论 @bot 触发（同评论线程回复）。
+- 🧩 **Profile 多实例**：`--profile` 一部署多 bot 身份（config/db/socket/媒体全隔离）。
 - 🛡️ **限流熔断**：`sendmessage` 服从式退避（防封号，不绕风控）。
 - 🎨 **媒体收发**：图片 / 文件（AES-128-ECB + CDN，协议强制）。
 - ⚡ **流式反馈**：工具调用摘要、typing 指示、中间事件推流。
