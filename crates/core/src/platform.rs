@@ -18,9 +18,10 @@ pub trait Platform: Send + Sync {
     }
     /// 平台名，如 `"ilink"`。
     fn name(&self) -> &'static str;
-    /// 是否支持流式卡片。dispatch 据此选"卡片 patch"还是"文本多发"。
-    /// 默认 false（ilink/wecom 不支持，走原有文本路径）。
-    fn supports_streaming_card(&self) -> bool {
+    /// 该会话是否支持流式卡片。dispatch 据此选"卡片 patch"还是"文本多发"。
+    /// 默认 false（ilink/wecom 不支持，走原有文本路径）。per-conv：飞书评论线程
+    /// 只能回评论（无卡片语义），返回 false 走纯文本流（P4-9）。
+    fn supports_streaming_card(&self, _conv: &ConvId) -> bool {
         false
     }
 

@@ -13,7 +13,11 @@ pub fn render_card(card: &OutboundCard) -> String {
         CardTerminal::Done => ("✅ 完成", false),
         CardTerminal::Error(e) => return render_error_card(e),
     };
-    let text = if card.text.is_empty() { "…" } else { &card.text };
+    let text = if card.text.is_empty() {
+        "…"
+    } else {
+        &card.text
+    };
     let mut elements = vec![serde_json::json!({ "tag": "markdown", "content": text })];
     // 工具调用：折叠面板（默认收起，省卡片高度让 footer 可见；对标 lcab）。
     // 只用 tag/expanded/header.title/elements 最简字段——CardKit 2.0 对未知属性会报错
@@ -142,6 +146,39 @@ fn render_error_card(err: &str) -> String {
     .to_string()
 }
 
+/// 审批询问卡片（P4-4）：markdown 说明 + 允许/拒绝按钮。
+///
+/// 按钮 `behaviors` 走 callback：点击后飞书推 `card.action.trigger` 事件，value 原样
+/// 带回（我们编码 conv + 动作），proto 侧解析成 `text="y"/"n"` 的入站消息复用审批
+/// 回复路由。`conv` 必须编码进 value——回调事件本身不含目标会话。
+pub fn render_permission_card(tool_name: &str, input_summary: &str, conv_id: &str) -> String {
+    serde_json::json!({
+        "schema": "2.0",
+        "body": { "elements": [
+            { "tag": "markdown", "content": format!("🔐 请求执行 `{tool_name}`：{input_summary}") },
+            { "tag": "action", "actions": [
+                {
+                    "tag": "button",
+                    "text": { "tag": "plain_text", "content": "✅ 允许" },
+                    "type": "primary",
+                    "behaviors": [{ "type": "callback", "value": {
+                        "imagent_perm": "allow", "conv": conv_id
+                    } }]
+                },
+                {
+                    "tag": "button",
+                    "text": { "tag": "plain_text", "content": "⛔ 拒绝" },
+                    "type": "danger",
+                    "behaviors": [{ "type": "callback", "value": {
+                        "imagent_perm": "deny", "conv": conv_id
+                    } }]
+                }
+            ]}
+        ]}
+    })
+    .to_string()
+}
+
 /// 按 char 截断（避免半截 UTF-8）。
 fn truncate_str(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
@@ -163,7 +200,10 @@ mod tests {
         assert!(json.contains("hello"));
         assert!(json.contains("schema"));
         assert!(json.contains("思考中"));
-        assert!(json.contains("正在执行任务"), "Running 态应含自定义 summary: {json}");
+        assert!(
+            json.contains("正在执行任务"),
+            "Running 态应含自定义 summary: {json}"
+        );
     }
 
     #[test]
@@ -187,6 +227,22 @@ mod tests {
             terminal: CardTerminal::Error("boom".into()),
         };
         assert!(render_card(&card).contains("boom"));
+    }
+
+    #[test]
+    fn render_permission_card_buttons_and_conv() {
+        let json = render_permission_card("Bash", r#"{"cmd":"rm -rf …"}"#, "feishu:ou_u1");
+        // 两个按钮 + callback value 编码 conv 与动作。
+        assert!(json.contains("✅ 允许"), "允许按钮: {json}");
+        assert!(json.contains("⛔ 拒绝"), "拒绝按钮: {json}");
+        assert!(
+            json.contains("\"imagent_perm\":\"allow\"")
+                && json.contains("\"imagent_perm\":\"deny\""),
+            "两个动作都应编码: {json}"
+        );
+        assert!(json.contains("feishu:ou_u1"), "conv 应编码进 value: {json}");
+        assert!(json.contains("\"tag\":\"button\""), "按钮 tag: {json}");
+        assert!(json.contains("Bash"), "工具名: {json}");
     }
 
     #[test]
