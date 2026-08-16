@@ -29,6 +29,8 @@ const PLATFORM: &str = "wecom";
 pub struct WeComPlatform {
     /// 出站帧通道（发给 client → 企微）。
     outbound_tx: mpsc::Sender<OutboundFrame>,
+    /// `/reconnect` 强制重连信号（与 client run task 共享，P4-7）。
+    reconnect: std::sync::Arc<tokio::sync::Notify>,
     /// 已解析的入站消息 channel，`recv` 直接 await（无轮询）。
     inbound_rx: Arc<Mutex<mpsc::Receiver<InboundMessage>>>,
 }
@@ -47,8 +49,12 @@ impl WeComPlatform {
             secret,
             ws_url,
         };
+        let reconnect = std::sync::Arc::new(tokio::sync::Notify::new());
+        let reconnect_for_task = reconnect.clone();
         tokio::spawn(async move {
-            client.run(inbound_frame_tx, outbound_rx).await;
+            client
+                .run(inbound_frame_tx, outbound_rx, reconnect_for_task)
+                .await;
         });
 
         // 后台 drain task：client 推来的回调帧解析成 InboundMessage，直送入站 channel
@@ -79,6 +85,7 @@ impl WeComPlatform {
 
         Self {
             outbound_tx,
+            reconnect,
             inbound_rx: Arc::new(Mutex::new(inbound_msg_rx)),
         }
     }
@@ -110,6 +117,13 @@ impl Platform for WeComPlatform {
 
     async fn send_typing(&self, _conv: &ConvId, _hint: &ReplyHint) -> Result<()> {
         // WeCom 协议无 typing 语义。
+        Ok(())
+    }
+
+    /// P4-7：强制重连——notify_one 存 permit，client run task 的 select 消费后
+    /// 丢弃连接 future 断开重连。
+    async fn reconnect(&self) -> Result<()> {
+        self.reconnect.notify_one();
         Ok(())
     }
 
