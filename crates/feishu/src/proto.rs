@@ -125,6 +125,176 @@ pub enum ReceiveIdKind {
 }
 
 // ---------------------------------------------------------------------------
+// card.action.trigger（P4-4 审批按钮回调）
+// ---------------------------------------------------------------------------
+
+/// `card.action.trigger` 事件（CardKit 2.0 按钮点击回调，schema 2.0 信封）。
+/// 只裁剪关心的字段；`action.value` 是按钮 behaviors callback 里带的任意 JSON。
+#[derive(Debug, Deserialize)]
+pub struct CardActionEvent {
+    pub header: EventHeader,
+    pub event: CardActionBody,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CardActionBody {
+    /// 点击者（operator）。
+    pub operator: CardOperator,
+    /// 按钮 callback 带回的 value（我们编码了 conv 与动作）。
+    pub action: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CardOperator {
+    pub operator_id: CardOperatorId,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CardOperatorId {
+    #[serde(default)]
+    pub open_id: Option<String>,
+}
+
+/// 解析审批按钮回调：value 形如 `{"imagent_perm":"allow|deny","conv":"feishu:…"}`。
+///
+/// 映射为 `text = "y"/"n"` 的普通 InboundMessage——core 的 recv 循环会把 pending
+/// conv 的非斜杠消息当审批回复路由（`parse_reply`），平台无需感知权限闭环。
+/// 非 imagent 按钮 / 缺 conv / 缺 open_id 返回 None。
+pub fn parse_card_action_event(payload: &[u8]) -> Option<(String, InboundMessage)> {
+    let evt: CardActionEvent = serde_json::from_slice(payload).ok()?;
+    if evt.header.event_type != "card.action.trigger" {
+        return None;
+    }
+    let value = evt.event.action.get("value")?;
+    let act = value.get("imagent_perm")?.as_str()?;
+    let conv = value.get("conv")?.as_str()?;
+    let text = match act {
+        "allow" => "y",
+        "deny" => "n",
+        _ => return None,
+    };
+    let open_id = evt
+        .event
+        .operator
+        .operator_id
+        .open_id
+        .filter(|s| !s.is_empty())?;
+    let key = evt
+        .header
+        .event_id
+        .clone()
+        .unwrap_or_else(|| format!("card_action:{open_id}:{conv}:{act}"));
+    Some((
+        key,
+        InboundMessage {
+            conv_id: ConvId(conv.to_string()),
+            sender: UserId(open_id),
+            text: Some(text.to_string()),
+            media: vec![],
+            media_errors: Vec::new(),
+            reply_hint: ReplyHint::None,
+        },
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// drive.file.comment.created_v1（P4-9 云文档评论触发）
+// ---------------------------------------------------------------------------
+
+/// 云文档评论创建事件（schema 2.0 信封；需在飞书后台订阅该事件 + `drive:comment`
+/// 相关权限）。裁剪到关心字段；`content` 是「评论内容实体」数组（text/at/img 等）。
+#[derive(Debug, Deserialize)]
+pub struct CommentEvent {
+    pub header: EventHeader,
+    pub event: CommentBody,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CommentBody {
+    #[serde(default)]
+    pub comment_id: String,
+    #[serde(default)]
+    pub file_token: String,
+    /// 评论内容实体数组：`{"type":"text","text":"…"}` / at / img 等（未知 type 忽略）。
+    #[serde(default)]
+    pub content: Vec<CommentContentNode>,
+    #[serde(default)]
+    pub sender: Option<Sender>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CommentContentNode {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+/// 评论线程的 conv_id 前缀：`feishu:comment:<file_token>:<comment_id>`。
+/// send_text 据此走「回复评论」API；每条评论 = 独立会话线程。
+pub const COMMENT_CONV_PREFIX: &str = "feishu:comment:";
+
+/// 解析云文档评论事件 → InboundMessage（conv = 评论线程，text = text 节点拼接）。
+/// 缺 file_token/comment_id/sender 或纯 @ 无文字返回 None。
+pub fn parse_comment_event(payload: &[u8]) -> Option<(String, InboundMessage)> {
+    let evt: CommentEvent = serde_json::from_slice(payload).ok()?;
+    if evt.header.event_type != "drive.file.comment.created_v1" {
+        return None;
+    }
+    let b = &evt.event;
+    if b.file_token.is_empty() || b.comment_id.is_empty() {
+        return None;
+    }
+    let open_id = b
+        .sender
+        .as_ref()
+        .map(|s| s.sender_id.open_id.clone())
+        .filter(|s| !s.is_empty())?;
+    let text: Vec<String> = b
+        .content
+        .iter()
+        .filter_map(|n| {
+            n.text
+                .as_ref()
+                .filter(|t| !t.trim().is_empty() && n.kind == "text")
+                .cloned()
+        })
+        .collect();
+    if text.is_empty() {
+        return None; // 纯 @ / 纯图片评论：MVP 不触发
+    }
+    let key = evt
+        .header
+        .event_id
+        .clone()
+        .unwrap_or_else(|| format!("comment:{}:{}", b.comment_id, text.len()));
+    Some((
+        key,
+        InboundMessage {
+            conv_id: ConvId(format!(
+                "{COMMENT_CONV_PREFIX}{}:{}",
+                b.file_token, b.comment_id
+            )),
+            sender: UserId(open_id),
+            text: Some(text.join("\n")),
+            media: vec![],
+            media_errors: Vec::new(),
+            reply_hint: ReplyHint::None,
+        },
+    ))
+}
+
+/// 反解评论线程 conv_id → `(file_token, comment_id)`；非评论 conv 返回 None。
+pub fn comment_target_from_conv(conv: &ConvId) -> Option<(String, String)> {
+    let rest = conv.0.strip_prefix(COMMENT_CONV_PREFIX)?;
+    let (file_token, comment_id) = rest.split_once(':')?;
+    if file_token.is_empty() || comment_id.is_empty() {
+        return None;
+    }
+    Some((file_token.to_string(), comment_id.to_string()))
+}
+
+// ---------------------------------------------------------------------------
 // 纯函数：解析 / 映射（无网络，验收核心）
 // ---------------------------------------------------------------------------
 
@@ -135,9 +305,7 @@ pub enum ReceiveIdKind {
 /// / image 缺 image_key / file 缺 file_key / post 无文字且无图片 / content 非法 JSON
 /// / payload 非法 JSON / 缺 receive_id。`pending_media` 为待下载的图片/文件（仅解析出
 /// key，实际下载落盘在 platform 层完成，回填进 `InboundMessage.media`）。
-pub fn parse_message_event(
-    payload: &[u8],
-) -> Option<(String, InboundMessage, Vec<PendingMedia>)> {
+pub fn parse_message_event(payload: &[u8]) -> Option<(String, InboundMessage, Vec<PendingMedia>)> {
     let evt: FeishuEvent = serde_json::from_slice(payload).ok()?;
     if evt.header.event_type != "im.message.receive_v1" {
         return None;
@@ -269,7 +437,11 @@ fn parse_post(content: &str) -> Option<(Option<String>, Vec<PendingMedia>)> {
             }
         }
     }
-    let text = if texts.is_empty() { None } else { Some(texts.join("\n")) };
+    let text = if texts.is_empty() {
+        None
+    } else {
+        Some(texts.join("\n"))
+    };
     Some((text, pending))
 }
 
@@ -398,7 +570,10 @@ mod tests {
         assert_eq!(msg.conv_id.0, "feishu:ou_user1");
         assert_eq!(msg.sender.0, "ou_user1");
         assert!(msg.text.is_none(), "图片消息无文本");
-        assert!(msg.media.is_empty(), "media 由 platform 层回填，proto 阶段为空");
+        assert!(
+            msg.media.is_empty(),
+            "media 由 platform 层回填，proto 阶段为空"
+        );
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].kind, "image");
         assert_eq!(pending[0].key, "img_v3_00ab");
@@ -516,7 +691,10 @@ mod tests {
     /// extract_text 正常 / 非法 JSON。
     #[test]
     fn extract_text_works() {
-        assert_eq!(extract_text(r#"{"text":"hello"}"#), Some("hello".to_string()));
+        assert_eq!(
+            extract_text(r#"{"text":"hello"}"#),
+            Some("hello".to_string())
+        );
         assert_eq!(extract_text("not json"), None);
         assert_eq!(extract_text(""), None);
     }
@@ -528,7 +706,8 @@ mod tests {
             "header":{"event_id":"evt_post","event_type":"im.message.receive_v1"},
             "event":{"sender":{"sender_id":{"open_id":"ou_user1"}},"message":{"message_type":"post","content":"{\"title\":\"\",\"content\":[[{\"tag\":\"img\",\"image_key\":\"img_v3_abc\",\"width\":539,\"height\":317}],[{\"tag\":\"text\",\"text\":\"你能给我描述一下这张图片吗？\",\"style\":[]}]]}","chat_type":"p2p"}}
         }"#;
-        let (key, msg, pending) = parse_message_event(payload.as_bytes()).expect("post 图片+文字应解析成功");
+        let (key, msg, pending) =
+            parse_message_event(payload.as_bytes()).expect("post 图片+文字应解析成功");
         assert_eq!(key, "evt_post");
         assert_eq!(msg.text.as_deref(), Some("你能给我描述一下这张图片吗？"));
         assert_eq!(pending.len(), 1);
@@ -543,7 +722,8 @@ mod tests {
             "header":{"event_type":"im.message.receive_v1"},
             "event":{"sender":{"sender_id":{"open_id":"ou_u"}},"message":{"message_type":"post","content":"{\"content\":[[{\"tag\":\"img\",\"image_key\":\"img_only\"}]]}","chat_type":"p2p","message_id":"om_p"}}
         }"#;
-        let (key, msg, pending) = parse_message_event(payload.as_bytes()).expect("纯图片 post 应解析");
+        let (key, msg, pending) =
+            parse_message_event(payload.as_bytes()).expect("纯图片 post 应解析");
         assert_eq!(key, "om_p");
         assert!(msg.text.is_none(), "纯图片 post 无正文");
         assert_eq!(pending.len(), 1);
@@ -557,7 +737,8 @@ mod tests {
             "header":{"event_id":"e","event_type":"im.message.receive_v1"},
             "event":{"sender":{"sender_id":{"open_id":"ou_u"}},"message":{"message_type":"post","content":"{\"content\":[[{\"tag\":\"text\",\"text\":\"hello post\"}]]}","chat_type":"p2p"}}
         }"#;
-        let (_key, msg, pending) = parse_message_event(payload.as_bytes()).expect("纯文字 post 应解析");
+        let (_key, msg, pending) =
+            parse_message_event(payload.as_bytes()).expect("纯文字 post 应解析");
         assert_eq!(msg.text.as_deref(), Some("hello post"));
         assert!(pending.is_empty(), "纯文字 post 无图片");
     }
@@ -565,10 +746,100 @@ mod tests {
     /// post 空内容（无文字无图）丢弃。
     #[test]
     fn ignore_empty_post() {
-        let payload = r#"{
+        let payload = br#"{
             "header":{"event_id":"e","event_type":"im.message.receive_v1"},
             "event":{"sender":{"sender_id":{"open_id":"ou_u"}},"message":{"message_type":"post","content":"{\"content\":[]}","chat_type":"p2p"}}
         }"#;
-        assert!(parse_message_event(payload.as_bytes()).is_none());
+        assert!(parse_message_event(payload).is_none());
+    }
+
+    // ---------- P4-4：card.action.trigger（审批按钮回调） ----------
+
+    #[test]
+    fn parse_card_action_allow_and_deny() {
+        let mk = |act: &str| {
+            serde_json::json!({
+                "schema":"2.0",
+                "header":{"event_id":"evt_btn_1","event_type":"card.action.trigger"},
+                "event":{
+                    "operator":{"operator_id":{"open_id":"ou_op"}},
+                    "action":{"tag":"button","value":{"imagent_perm":act,"conv":"feishu:ou_op"}}
+                }
+            })
+            .to_string()
+            .into_bytes()
+        };
+        let (key, msg) = parse_card_action_event(&mk("allow")).expect("allow 应回调");
+        assert_eq!(key, "evt_btn_1");
+        assert_eq!(msg.conv_id.0, "feishu:ou_op");
+        assert_eq!(msg.sender.0, "ou_op");
+        assert_eq!(msg.text.as_deref(), Some("y"));
+        let (_, msg) = parse_card_action_event(&mk("deny")).expect("deny 应回调");
+        assert_eq!(msg.text.as_deref(), Some("n"));
+    }
+
+    #[test]
+    fn parse_card_action_ignores_foreign_and_missing() {
+        // 非 card.action.trigger。
+        let not_card = br#"{"header":{"event_type":"im.message.receive_v1"},"event":{}}"#;
+        assert!(parse_card_action_event(not_card).is_none());
+        // value 缺 conv。
+        let no_conv = br#"{"header":{"event_id":"e","event_type":"card.action.trigger"},
+            "event":{"operator":{"operator_id":{"open_id":"ou_x"}},"action":{"value":{"imagent_perm":"allow"}}}}"#;
+        assert!(parse_card_action_event(no_conv).is_none());
+        // 未知动作。
+        let unknown = br#"{"header":{"event_id":"e","event_type":"card.action.trigger"},
+            "event":{"operator":{"operator_id":{"open_id":"ou_x"}},"action":{"value":{"imagent_perm":"maybe","conv":"feishu:ou_x"}}}}"#;
+        assert!(parse_card_action_event(unknown).is_none());
+        // 缺 operator open_id。
+        let no_op = br#"{"header":{"event_id":"e","event_type":"card.action.trigger"},
+            "event":{"operator":{"operator_id":{}},"action":{"value":{"imagent_perm":"allow","conv":"feishu:ou_x"}}}}"#;
+        assert!(parse_card_action_event(no_op).is_none());
+    }
+
+    // ---------- P4-9：drive.file.comment.created_v1（云文档评论） ----------
+
+    #[test]
+    fn parse_comment_event_text_and_conv() {
+        let payload = r#"{
+            "schema":"2.0",
+            "header":{"event_id":"evt_cm_1","event_type":"drive.file.comment.created_v1"},
+            "event":{
+                "comment_id":"7034abc",
+                "file_token":"doxcnXYZ",
+                "file_type":"docx",
+                "content":[
+                    {"type":"at","user_id":"ou_bot","user_name":"agent"},
+                    {"type":"text","text":" 帮我总结这份文档"}
+                ],
+                "sender":{"sender_id":{"open_id":"ou_author"},"sender_type":"user"}
+            }
+        }"#;
+        let (key, msg) = parse_comment_event(payload.as_bytes()).expect("评论事件应解析");
+        assert_eq!(key, "evt_cm_1");
+        assert_eq!(msg.conv_id.0, "feishu:comment:doxcnXYZ:7034abc");
+        assert_eq!(msg.sender.0, "ou_author");
+        assert_eq!(msg.text.as_deref(), Some(" 帮我总结这份文档"));
+        // conv 反解 roundtrip。
+        let (ft, cid) = comment_target_from_conv(&msg.conv_id).unwrap();
+        assert_eq!(ft, "doxcnXYZ");
+        assert_eq!(cid, "7034abc");
+    }
+
+    #[test]
+    fn parse_comment_event_ignores_invalid() {
+        // 纯 @ 无文字。
+        let at_only = br#"{"header":{"event_id":"e","event_type":"drive.file.comment.created_v1"},
+            "event":{"comment_id":"c1","file_token":"f1","content":[{"type":"at","user_id":"ou_b"}],"sender":{"sender_id":{"open_id":"ou_a"}}}}"#;
+        assert!(parse_comment_event(at_only).is_none());
+        // 缺 file_token。
+        let no_token = br#"{"header":{"event_id":"e","event_type":"drive.file.comment.created_v1"},
+            "event":{"comment_id":"c1","content":[{"type":"text","text":"hi"}],"sender":{"sender_id":{"open_id":"ou_a"}}}}"#;
+        assert!(parse_comment_event(no_token).is_none());
+        // 非目标事件。
+        let other = br#"{"header":{"event_type":"im.message.receive_v1"}}"#;
+        assert!(parse_comment_event(other).is_none());
+        // 非评论 conv 反解 None。
+        assert!(comment_target_from_conv(&ConvId("feishu:ou_x".into())).is_none());
     }
 }

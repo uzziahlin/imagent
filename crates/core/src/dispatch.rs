@@ -1175,7 +1175,7 @@ impl Dispatcher {
                             "ℹ️ 平台 {} / 后端 {}（{}）",
                             self.platform.name(),
                             self.backend.name(),
-                            if self.platform.supports_streaming_card() {
+                            if self.platform.supports_streaming_card(&conv) {
                                 "支持流式卡片"
                             } else {
                                 "纯文本"
@@ -2045,7 +2045,7 @@ impl Dispatcher {
         // agent 产出的媒体文件路径（Write 图片）；run 结束后回传 IM。
         let mut media_out: Vec<String> = Vec::new();
         // 流式卡片：支持卡片的平台累积输出 + 节流 patch（单卡片更新），不支持则每 Text 多发文本。
-        let mut card = if self.platform.supports_streaming_card() {
+        let mut card = if self.platform.supports_streaming_card(&conv) {
             Some(CardSession::new())
         } else {
             None

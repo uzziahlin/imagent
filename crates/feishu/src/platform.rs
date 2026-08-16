@@ -25,13 +25,18 @@ use imagent_core::{
 
 use open_lark::{Config, CoreConfig};
 
-use crate::card::{render_card, render_stream_init_card, stream_body_final, stream_body_md};
+use crate::card::{
+    render_card, render_permission_card, render_stream_init_card, stream_body_final, stream_body_md,
+};
 use crate::client::{
-    create_card_entity, download_file, download_image, fetch_token, patch_card,
-    patch_card_element, patch_card_settings, send_card_msg, send_card_ref_msg, send_image_msg,
+    create_card_entity, download_file, download_image, fetch_token, patch_card, patch_card_element,
+    patch_card_settings, reply_comment, send_card_msg, send_card_ref_msg, send_image_msg,
     send_text_msg, upload_image, FeishuWsClient,
 };
-use crate::proto::{parse_message_event, receive_target_from_conv, ReceiveIdKind};
+use crate::proto::{
+    comment_target_from_conv, parse_card_action_event, parse_comment_event, parse_message_event,
+    receive_target_from_conv, ReceiveIdKind, COMMENT_CONV_PREFIX,
+};
 
 /// 平台名常量。
 const PLATFORM: &str = "feishu";
@@ -53,6 +58,8 @@ pub struct FeishuPlatform {
     token: Arc<RwLock<Option<(String, Instant)>>>,
     /// CardKit 卡片的 sequence 计数（element/settings PATCH 共用，per card_id 严格递增）。
     card_seqs: Arc<Mutex<HashMap<String, i64>>>,
+    /// `/reconnect` 强制重连信号（与 WS run task 共享，P4-7）。
+    reconnect: Arc<tokio::sync::Notify>,
     /// 已解析的入站消息 channel，`recv` 直接 await。
     inbound_rx: Arc<Mutex<mpsc::Receiver<InboundMessage>>>,
 }
@@ -80,11 +87,13 @@ impl FeishuPlatform {
         // WS 收事件 task：payload → channel。
         let (payload_tx, payload_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let ws = FeishuWsClient::new(ws_config);
+        let reconnect = ws.reconnect_handle();
         tokio::spawn(async move {
             ws.run(payload_tx).await;
         });
 
-        // drain task：payload → parse → Dedup → 媒体下载落盘 → inbound channel。
+        // drain task：payload → parse（消息 / 审批按钮回调 / 云文档评论）→ Dedup →
+        // （消息类）媒体下载落盘 → inbound channel。
         let (inbound_msg_tx, inbound_msg_rx) = mpsc::channel::<InboundMessage>(64);
         let dedup = Dedup::default();
         // token Arc 须在 spawn 前创建：drain task 下载媒体需取 token（发送/接收共用
@@ -97,83 +106,91 @@ impl FeishuPlatform {
         tokio::spawn(async move {
             let mut payload_rx = payload_rx;
             while let Some(payload) = payload_rx.recv().await {
-                match parse_message_event(&payload) {
-                    Some((msgid, mut msg, pending)) => {
-                        if !dedup.check(&msgid) {
-                            continue;
-                        }
-                        // 下载落盘每个待处理媒体；单个失败只 warn 跳过，不丢整条消息。
-                        for p in &pending {
-                            let token = match fetch_cached_token(
-                                &token_for_drain,
-                                &core_config_for_drain,
-                                &app_id_for_drain,
-                                &app_secret_for_drain,
-                            )
-                            .await
-                            {
-                                Ok(t) => t,
-                                Err(e) => {
-                                    warn!(target: "feishu", error = %e, "取 token 失败，跳过该媒体");
-                                    msg.media_errors
-                                        .push(format!("{}: 取 token 失败: {e}", p.key));
-                                    continue;
-                                }
-                            };
-                            let dl = match p.kind {
-                                "image" => {
-                                    download_image(
-                                        &core_config_for_drain,
-                                        &token,
-                                        &p.message_id,
-                                        &p.key,
-                                    )
+                // 三类事件：普通消息（含媒体下载）/ 审批按钮回调 / 云文档评论。
+                if let Some((msgid, mut msg, pending)) = parse_message_event(&payload) {
+                    if !dedup.check(&msgid) {
+                        continue;
+                    }
+                    // 下载落盘每个待处理媒体；单个失败只 warn 跳过，不丢整条消息。
+                    for p in &pending {
+                        let token = match fetch_cached_token(
+                            &token_for_drain,
+                            &core_config_for_drain,
+                            &app_id_for_drain,
+                            &app_secret_for_drain,
+                        )
+                        .await
+                        {
+                            Ok(t) => t,
+                            Err(e) => {
+                                warn!(target: "feishu", error = %e, "取 token 失败，跳过该媒体");
+                                msg.media_errors
+                                    .push(format!("{}: 取 token 失败: {e}", p.key));
+                                continue;
+                            }
+                        };
+                        let dl = match p.kind {
+                            "image" => {
+                                download_image(
+                                    &core_config_for_drain,
+                                    &token,
+                                    &p.message_id,
+                                    &p.key,
+                                )
+                                .await
+                            }
+                            "file" => {
+                                download_file(&core_config_for_drain, &token, &p.message_id, &p.key)
                                     .await
-                                }
-                                "file" => {
-                                    download_file(
-                                        &core_config_for_drain,
-                                        &token,
-                                        &p.message_id,
-                                        &p.key,
-                                    )
-                                    .await
-                                }
-                                _ => continue,
-                            };
-                            match dl {
-                                Ok(bytes) => match persist_media(p.kind, &p.key, &bytes) {
-                                    Ok(path) => msg.media.push(MediaRef {
-                                        kind: p.kind.to_string(),
-                                        url: path,
-                                    }),
-                                    Err(e) => {
-                                        warn!(target: "feishu", error = %e, "媒体落盘失败，跳过");
-                                        msg.media_errors
-                                            .push(format!("{}: 落盘失败: {e}", p.key));
-                                    }
-                                },
+                            }
+                            _ => continue,
+                        };
+                        match dl {
+                            Ok(bytes) => match persist_media(p.kind, &p.key, &bytes) {
+                                Ok(path) => msg.media.push(MediaRef {
+                                    kind: p.kind.to_string(),
+                                    url: path,
+                                }),
                                 Err(e) => {
-                                    warn!(
-                                        target: "feishu",
-                                        error = %e,
-                                        message_id = %p.message_id,
-                                        file_key = %p.key,
-                                        "媒体下载失败，跳过"
-                                    );
-                                    msg.media_errors
-                                        .push(format!("{}: 下载失败: {e}", p.key));
+                                    warn!(target: "feishu", error = %e, "媒体落盘失败，跳过");
+                                    msg.media_errors.push(format!("{}: 落盘失败: {e}", p.key));
                                 }
+                            },
+                            Err(e) => {
+                                warn!(
+                                    target: "feishu",
+                                    error = %e,
+                                    message_id = %p.message_id,
+                                    file_key = %p.key,
+                                    "媒体下载失败，跳过"
+                                );
+                                msg.media_errors.push(format!("{}: 下载失败: {e}", p.key));
                             }
                         }
-                        if inbound_msg_tx.send(msg).await.is_err() {
-                            break;
-                        }
                     }
-                    None => {
-                        warn!(target: "feishu", "无法解析/非目标事件，丢弃");
+                    if inbound_msg_tx.send(msg).await.is_err() {
+                        break;
                     }
+                    continue;
                 }
+                // P4-4：审批按钮回调（card.action.trigger）→ text="y"/"n" 的
+                // 入站消息，core 的审批回复路由消费（parse_reply("y")=allow）。
+                if let Some((key, reply_msg)) = parse_card_action_event(&payload) {
+                    if dedup.check(&key) && inbound_msg_tx.send(reply_msg).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                // P4-9：云文档评论 @bot（drive.file.comment.created_v1）→ 评论
+                // 线程消息（conv = feishu:comment:<file>:<comment>，回复走
+                // reply_comment；需在飞书后台订阅该事件）。
+                if let Some((key, cm)) = parse_comment_event(&payload) {
+                    if dedup.check(&key) && inbound_msg_tx.send(cm).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                warn!(target: "feishu", "无法解析/非目标事件，丢弃");
             }
         });
 
@@ -183,6 +200,7 @@ impl FeishuPlatform {
             app_secret,
             token,
             card_seqs: Arc::new(Mutex::new(HashMap::new())),
+            reconnect,
             inbound_rx: Arc::new(Mutex::new(inbound_msg_rx)),
         })
     }
@@ -191,7 +209,13 @@ impl FeishuPlatform {
     ///
     /// 逻辑实现在模块级 [`fetch_cached_token`]（drain task 与本方法共用同一缓存）。
     async fn get_token(&self) -> Result<String> {
-        fetch_cached_token(&self.token, &self.core_config, &self.app_id, &self.app_secret).await
+        fetch_cached_token(
+            &self.token,
+            &self.core_config,
+            &self.app_id,
+            &self.app_secret,
+        )
+        .await
     }
 
     /// 取该 card_id 的下一个 sequence（严格递增；element 与 settings PATCH 共用）。
@@ -219,16 +243,12 @@ impl FeishuPlatform {
     }
 }
 
-/// 媒体目录：`~/.imagent/media/`（0700）。照 ilink `media_dir` 约定（`dirs::home_dir`）。
+/// 媒体目录：`<imagent_home>/media/`（0700；P4-10：随 profile 隔离）。
 fn media_dir() -> Result<std::path::PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| {
-        CoreError::Platform(PLATFORM, "cannot resolve home dir for media storage".into())
-    })?;
-    let dir = home.join(".imagent").join("media");
+    let dir = imagent_core::paths::imagent_home().join("media");
     if !dir.exists() {
-        std::fs::create_dir_all(&dir).map_err(|e| {
-            CoreError::Platform(PLATFORM, format!("create media dir {dir:?}: {e}"))
-        })?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| CoreError::Platform(PLATFORM, format!("create media dir {dir:?}: {e}")))?;
     }
     Ok(dir)
 }
@@ -280,20 +300,22 @@ async fn fetch_cached_token(
 #[async_trait]
 impl Platform for FeishuPlatform {
     async fn recv(&self) -> Result<InboundMessage> {
-        self.inbound_rx
-            .lock()
-            .await
-            .recv()
-            .await
-            .ok_or_else(|| {
-                CoreError::Platform(PLATFORM, "入站 channel 已关闭（client 已退出）".into())
-            })
+        self.inbound_rx.lock().await.recv().await.ok_or_else(|| {
+            CoreError::Platform(PLATFORM, "入站 channel 已关闭（client 已退出）".into())
+        })
     }
 
     async fn send_text(&self, conv: &ConvId, text: &str, _hint: &ReplyHint) -> Result<()> {
-        let (receive_id, kind) = receive_target_from_conv(conv).ok_or_else(|| {
-            CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0))
-        })?;
+        // P4-9：评论线程 conv → 回复云文档评论（每分片一条回复）。
+        if let Some((file_token, comment_id)) = comment_target_from_conv(conv) {
+            let token = self.get_token().await?;
+            for chunk in split_message(text, FEISHU_TEXT_MAX) {
+                reply_comment(&self.core_config, &token, &file_token, &comment_id, &chunk).await?;
+            }
+            return Ok(());
+        }
+        let (receive_id, kind) = receive_target_from_conv(conv)
+            .ok_or_else(|| CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0)))?;
         for chunk in split_message(text, FEISHU_TEXT_MAX) {
             let token = self.get_token().await?;
             send_text_msg(&self.core_config, &token, &receive_id, kind, &chunk).await?;
@@ -301,19 +323,13 @@ impl Platform for FeishuPlatform {
         Ok(())
     }
 
-    async fn send_media(
-        &self,
-        conv: &ConvId,
-        media: &MediaRef,
-        _hint: &ReplyHint,
-    ) -> Result<()> {
+    async fn send_media(&self, conv: &ConvId, media: &MediaRef, _hint: &ReplyHint) -> Result<()> {
         // agent 产出图片回传：读本地文件 → 上传拿 image_key → 发 image 消息。
-        let (receive_id, kind) = receive_target_from_conv(conv).ok_or_else(|| {
-            CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0))
-        })?;
-        let bytes = tokio::fs::read(&media.url).await.map_err(|e| {
-            CoreError::Platform(PLATFORM, format!("读媒体文件 {}: {e}", media.url))
-        })?;
+        let (receive_id, kind) = receive_target_from_conv(conv)
+            .ok_or_else(|| CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0)))?;
+        let bytes = tokio::fs::read(&media.url)
+            .await
+            .map_err(|e| CoreError::Platform(PLATFORM, format!("读媒体文件 {}: {e}", media.url)))?;
         let file_name = std::path::Path::new(&media.url)
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
@@ -327,8 +343,46 @@ impl Platform for FeishuPlatform {
         // 飞书协议无 typing 语义。
         Ok(())
     }
-    fn supports_streaming_card(&self) -> bool {
-        true
+    fn supports_streaming_card(&self, conv: &ConvId) -> bool {
+        // P4-9：评论线程无卡片语义（回复是评论文本），走纯文本流。
+        !conv.0.starts_with(COMMENT_CONV_PREFIX)
+    }
+
+    /// P4-7：强制重连——notify_one 存 permit，WS run task 的 select 立即/稍后消费，
+    /// 丢弃 open future 断开当前连接后重连。
+    async fn reconnect(&self) -> Result<()> {
+        self.reconnect.notify_one();
+        Ok(())
+    }
+
+    /// P4-4：审批询问走「按钮卡片」——点击后飞书推 card.action.trigger，
+    /// value 带回 conv + 动作，drain 解析成 text="y"/"n" 复用审批回复路由。
+    /// 卡片发送失败（无卡片权限等）降级纯文本（文本失败才向上报错 → dispatch 回 deny）。
+    async fn send_permission_ask(
+        &self,
+        conv: &ConvId,
+        tool_name: &str,
+        input_summary: &str,
+        hint: &ReplyHint,
+    ) -> Result<()> {
+        // 评论线程无卡片语义，直接走文本（send_text 已路由 reply_comment）。
+        if comment_target_from_conv(conv).is_some() {
+            return self
+                .send_permission_ask_text(conv, tool_name, input_summary, hint)
+                .await;
+        }
+        let (receive_id, kind) = receive_target_from_conv(conv)
+            .ok_or_else(|| CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0)))?;
+        let token = self.get_token().await?;
+        let card_json = render_permission_card(tool_name, input_summary, &conv.0);
+        match send_card_msg(&self.core_config, &token, &receive_id, kind, &card_json).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                warn!(target: "feishu", error = %e, "审批卡片发送失败，降级纯文本询问");
+                self.send_permission_ask_text(conv, tool_name, input_summary, hint)
+                    .await
+            }
+        }
     }
 
     /// 发流式卡片。**句柄前缀分流**（core 无感，两种句柄均原样透传给 update_card）：
@@ -341,9 +395,8 @@ impl Platform for FeishuPlatform {
         card: &OutboundCard,
         _hint: &ReplyHint,
     ) -> Result<Option<String>> {
-        let (receive_id, kind) = receive_target_from_conv(conv).ok_or_else(|| {
-            CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0))
-        })?;
+        let (receive_id, kind) = receive_target_from_conv(conv)
+            .ok_or_else(|| CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0)))?;
         let token = self.get_token().await?;
         match create_card_entity(&token, &render_stream_init_card()).await {
             Ok(card_id) => {
@@ -408,7 +461,8 @@ impl Platform for FeishuPlatform {
                     };
                     let content = stream_body_final(&card.text, &card.tool_calls, err);
                     let seq = self.next_card_seq(card_id).await;
-                    let element = patch_card_element(&token, card_id, "md_body", &content, seq).await;
+                    let element =
+                        patch_card_element(&token, card_id, "md_body", &content, seq).await;
                     // 关闭流式（光标消失）；sequence 与 element PATCH 共用递增。
                     let settings =
                         serde_json::json!({ "config": { "streaming_mode": false } }).to_string();
@@ -524,8 +578,7 @@ mod tests {
 
     #[test]
     fn conv_roundtrip() {
-        let (id, kind) =
-            receive_target_from_conv(&ConvId("feishu:ou_abc".into())).unwrap();
+        let (id, kind) = receive_target_from_conv(&ConvId("feishu:ou_abc".into())).unwrap();
         assert_eq!(id, "ou_abc");
         assert_eq!(kind, ReceiveIdKind::OpenId);
     }

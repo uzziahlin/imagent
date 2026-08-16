@@ -17,14 +17,14 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use open_lark::auth::AuthService;
+use open_lark::communication::im::v1::image::create::CreateImageRequest;
+use open_lark::communication::im::v1::image::models::ImageType;
 use open_lark::communication::im::v1::message::create::{CreateMessageBody, CreateMessageRequest};
+use open_lark::communication::im::v1::message::models::ReceiveIdType;
 use open_lark::communication::im::v1::message::patch::PatchMessageCardRequest;
 use open_lark::communication::im::v1::message::resource::get::{
     GetMessageResourceRequest, MessageResourceType,
 };
-use open_lark::communication::im::v1::image::create::CreateImageRequest;
-use open_lark::communication::im::v1::image::models::ImageType;
-use open_lark::communication::im::v1::message::models::ReceiveIdType;
 use open_lark::ws_client::{EventDispatcherHandler, LarkWsClient, WsClientError};
 use open_lark::{CoreConfig, RequestOption};
 
@@ -39,15 +39,28 @@ const BACKOFF_CAP: Duration = Duration::from_secs(30);
 ///
 /// SDK 不内置重连（官方 example #441 明说），断开后由本 loop 指数退避重连
 /// （1s → 2s → … 封顶 30s）。事件 payload 通过 `payload_tx` 推给上层 drain task。
+/// `reconnect`（P4-7 `/reconnect`）：`notify_one` 唤醒 select 丢弃 open future
+/// （连接随 future drop 关闭）→ 退避后重连。退避 sleep 期间通知会存 permit，
+/// 下一轮 select 立即消费。
 pub struct FeishuWsClient {
     /// 长连接配置（含 app_id/app_secret，SDK 自动认证 + token cache）。
     ws_config: Arc<open_lark::Config>,
+    /// `/reconnect` 强制重连信号（与 platform 共享）。
+    reconnect: Arc<tokio::sync::Notify>,
 }
 
 impl FeishuWsClient {
     /// 构造长连接驱动。
     pub fn new(ws_config: Arc<open_lark::Config>) -> Self {
-        Self { ws_config }
+        Self {
+            ws_config,
+            reconnect: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// 强制重连信号的共享句柄（platform 的 `Platform::reconnect` 用）。
+    pub fn reconnect_handle(&self) -> Arc<tokio::sync::Notify> {
+        self.reconnect.clone()
     }
 
     /// 主循环：重连外层 loop。`LarkWsClient::open` 阻塞运行会话，结束/断开才返回，
@@ -58,16 +71,22 @@ impl FeishuWsClient {
             let handler = EventDispatcherHandler::builder()
                 .payload_sender(payload_tx.clone())
                 .build();
-            match LarkWsClient::open(self.ws_config.clone(), handler).await {
-                Ok(()) => {
-                    info!(target: "feishu", "长连接正常结束，重连");
+            tokio::select! {
+                res = LarkWsClient::open(self.ws_config.clone(), handler) => match res {
+                    Ok(()) => {
+                        info!(target: "feishu", "长连接正常结束，重连");
+                        backoff = Duration::from_secs(1);
+                    }
+                    Err(WsClientError::ConnectionClosed { reason }) => {
+                        warn!(target: "feishu", ?reason, "长连接关闭，重连");
+                    }
+                    Err(e) => {
+                        warn!(target: "feishu", error = %e, "长连接异常，重连");
+                    }
+                },
+                _ = self.reconnect.notified() => {
+                    info!(target: "feishu", "收到 /reconnect 指令，主动断开重连");
                     backoff = Duration::from_secs(1);
-                }
-                Err(WsClientError::ConnectionClosed { reason }) => {
-                    warn!(target: "feishu", ?reason, "长连接关闭，重连");
-                }
-                Err(e) => {
-                    warn!(target: "feishu", error = %e, "长连接异常，重连");
                 }
             }
             tokio::time::sleep(backoff).await;
@@ -104,9 +123,7 @@ pub async fn send_text_msg(
         .receive_id_type(id_type)
         .execute_with_options(body, option)
         .await
-        .map_err(|e| {
-            imagent_core::CoreError::Platform(PLATFORM, format!("send_message: {e}"))
-        })?;
+        .map_err(|e| imagent_core::CoreError::Platform(PLATFORM, format!("send_message: {e}")))?;
     Ok(())
 }
 /// 发送交互卡片，返回 message_id（供后续 [`patch_card`] 增量更新）。
@@ -138,9 +155,7 @@ pub async fn send_card_msg(
         .receive_id_type(id_type)
         .execute_with_options(body, option)
         .await
-        .map_err(|e| {
-            imagent_core::CoreError::Platform(PLATFORM, format!("send_card: {e}"))
-        })?;
+        .map_err(|e| imagent_core::CoreError::Platform(PLATFORM, format!("send_card: {e}")))?;
     // resp 已是 data 内容；message_id 在顶层（非 data.message_id）。
     let message_id = resp
         .get("message_id")
@@ -166,9 +181,7 @@ pub async fn patch_card(
         .message_id(message_id.to_string())
         .execute_with_options(body, option)
         .await
-        .map_err(|e| {
-            imagent_core::CoreError::Platform(PLATFORM, format!("patch_card: {e}"))
-        })?;
+        .map_err(|e| imagent_core::CoreError::Platform(PLATFORM, format!("patch_card: {e}")))?;
     Ok(())
 }
 
@@ -216,11 +229,7 @@ pub async fn create_card_entity(token: &str, card_json: &str) -> imagent_core::R
     let data = cardkit_resp(resp, "create_card_entity").await?;
     data.parse::<serde_json::Value>()
         .ok()
-        .and_then(|v| {
-            v.get("card_id")
-                .and_then(|c| c.as_str())
-                .map(String::from)
-        })
+        .and_then(|v| v.get("card_id").and_then(|c| c.as_str()).map(String::from))
         .ok_or_else(|| {
             imagent_core::CoreError::Platform(PLATFORM, "create_card_entity: 响应缺 card_id".into())
         })
@@ -239,7 +248,9 @@ pub async fn patch_card_element(
 ) -> imagent_core::Result<()> {
     let client = reqwest::Client::new();
     let resp = client
-        .patch(format!("{CARDKIT_BASE}/cards/{card_id}/elements/{element_id}"))
+        .patch(format!(
+            "{CARDKIT_BASE}/cards/{card_id}/elements/{element_id}"
+        ))
         .bearer_auth(token)
         .json(&json!({ "content": content, "sequence": sequence }))
         .send()
@@ -420,12 +431,53 @@ pub async fn fetch_token(
         .app_secret(app_secret.to_string())
         .execute()
         .await
-        .map_err(|e| {
-            imagent_core::CoreError::Platform(PLATFORM, format!("fetch token: {e}"))
-        })?
+        .map_err(|e| imagent_core::CoreError::Platform(PLATFORM, format!("fetch token: {e}")))?
         .data
         .tenant_access_token;
     Ok(token)
+}
+
+/// 回复云文档评论（P4-9）：POST `/drive/v1/files/{file_token}/comments/{comment_id}/replies`。
+///
+/// 手写 HTTP（open-lark 0.20 无 drive 评论模块，同 CardKit 做法）。需应用开通
+/// `drive:comment`（查看、创建评论）权限并在事件订阅开启
+/// `drive.file.comment.created_v1`（收侧见 proto::parse_comment_event）。
+/// body 为评论内容实体数组（与事件侧 content 同构）；`user_id_type=open_id` 与
+/// 事件侧 sender 口径一致。
+pub async fn reply_comment(
+    core_config: &CoreConfig,
+    token: &str,
+    file_token: &str,
+    comment_id: &str,
+    text: &str,
+) -> imagent_core::Result<()> {
+    let base = core_config.base_url().trim_end_matches('/').to_string();
+    let url = format!(
+        "{base}/open-apis/drive/v1/files/{file_token}/comments/{comment_id}/replies?user_id_type=open_id"
+    );
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "content": [{ "type": "text", "text": text }]
+        }))
+        .send()
+        .await
+        .map_err(|e| imagent_core::CoreError::Platform(PLATFORM, format!("reply_comment: {e}")))?;
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| imagent_core::CoreError::Platform(PLATFORM, format!("reply_comment: {e}")))?;
+    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
+        return Err(imagent_core::CoreError::Platform(
+            PLATFORM,
+            format!("reply_comment: code={code} msg={msg}"),
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -466,11 +518,7 @@ mod tests {
         let client = FeishuWsClient::new(ws_config);
         let (payload_tx, _payload_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-        let res = tokio::time::timeout(
-            Duration::from_millis(800),
-            client.run(payload_tx),
-        )
-        .await;
+        let res = tokio::time::timeout(Duration::from_millis(800), client.run(payload_tx)).await;
         // run 永不返回 → timeout 触发（Err(Elapsed)）= 正常。
         assert!(res.is_err(), "run 应持续重连而非返回");
     }
