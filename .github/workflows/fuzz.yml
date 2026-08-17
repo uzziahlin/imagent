@@ -20,7 +20,10 @@ jobs:
         with:
           components: rust-src
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        # +nightly 必须显式带：仓库 rust-toolchain.toml pin 1.88，会接管 cargo 的
+        # 工具链选择；cargo-fuzz 0.13.2 的 lock 依赖 cargo-platform 0.3.3（要求
+        # rustc ≥ 1.91），1.88 下 install 直接失败（2026-08-16 定时任务翻车原因）。
+        run: cargo +nightly install cargo-fuzz --locked
       - name: Fuzz ilink_proto_parse (300s)
         run: cargo +nightly fuzz run ilink_proto_parse -- -max_total_time=300
       - name: Fuzz ilink_media_cdn_host (300s)
