@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 use crate::error::Result;
-use crate::types::{AgentChunk, RunOutcome, SessionId};
+use crate::types::{AgentChunk, LocalSession, RunOutcome, SessionId};
 
 /// agent 后端抽象（无状态执行器）。
 ///
@@ -36,4 +36,11 @@ pub trait Backend: Send + Sync {
 
     /// agent 类型，如 `"claude-cli"`。
     fn name(&self) -> &'static str;
+
+    /// 列出与该 workdir 同项目的本机会话（P4-11 统一 `/resume`：电脑端开的
+    /// agent 会话与 IM 会话合并展示）。默认空——无本机存储概念的 backend
+    /// （codex/gemini）不参与合并，`/resume` 自动退化为纯 IM 历史。
+    async fn list_local_sessions(&self, _workdir: &Path) -> Vec<LocalSession> {
+        Vec::new()
+    }
 }

@@ -77,6 +77,20 @@ pub struct RunOutcome {
     pub terminal: bool,
 }
 
+/// 本机（电脑端）agent 会话条目——统一 `/resume` 列表用（P4-11）。
+///
+/// 由 Backend 从自己的本地存储扫描产出（如 claude 后端扫
+/// `~/.claude/projects/<workdir编码>/*.jsonl`）；core 据此与 IM 会话历史合并展示，
+/// 用户按序号接管，全程无需知道 session id。
+#[derive(Debug, Clone)]
+pub struct LocalSession {
+    pub session_id: String,
+    /// epoch 秒（按各 backend 存储的时间戳，如文件 mtime）。
+    pub updated_at: i64,
+    /// 首条用户消息摘要（帮助用户辨认会话；可为空）。
+    pub first_prompt: String,
+}
+
 /// 流式卡片的抽象内容（平台无关）。core dispatch 累积 agent 输出成此结构，
 /// Platform::send_card / update_card 负责渲染成各自平台的卡片格式（如飞书 CardKit JSON）。
 ///

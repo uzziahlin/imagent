@@ -124,6 +124,12 @@ store v5 `session_history` 表（upsert_session 在 session_id 变化时同步�
 `/resume` 列最近 10 条（当前带 *）；`/resume <序号|session_id>` 恢复（跨后端校验同
 /switch；恢复后回到未命名会话）。
 
+**增强（P4-11，统一 /resume 无感接管）**：列表合并本机同项目 agent 会话——
+`Backend::list_local_sessions`（claude 两后端扫 `~/.claude/projects/<workdir编码>/
+*.jsonl`，首条用户消息摘要 + mtime 相对时间展示，💻/📱 标来源），按序号选中 💻 即
+自动接管（sessions 表绑定 + 分叉提示）；workdir 对齐由「按 conv 当前 workdir 扫描」
+天然保证。列表 per-conv 缓存防序号错位。codex/gemini 默认空 → 纯 IM 历史。
+
 ### 9. 云文档评论触发（低，大特性）✅（MVP）
 事件 `drive.file.comment.created_v1`（需飞书后台订阅 + `drive:comment` 权限）→
 conv `feishu:comment:<file_token>:<comment_id>`（每评论一线程，会话独立续接）；

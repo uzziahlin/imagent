@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use imagent_core::{
     backend_common::{spawn_cli_backend, CliEvent},
-    AgentChunk, Backend, CoreError, PermissionMode, Result, RunOutcome, SessionId,
+    AgentChunk, Backend, CoreError, LocalSession, PermissionMode, Result, RunOutcome, SessionId,
 };
 use parking_lot::RwLock;
 use tokio::process::Command;
@@ -140,6 +140,12 @@ async fn write_mcp_config(
 impl Backend for ClaudeBackend {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    /// P4-11：扫 `~/.claude/projects/<workdir编码>/*.jsonl`（电脑端开的会话与
+    /// IM 会话同存储），供统一 /resume 列表合并展示。
+    async fn list_local_sessions(&self, workdir: &std::path::Path) -> Vec<LocalSession> {
+        crate::sessions::scan_for_backend(workdir)
     }
 
     async fn run(
