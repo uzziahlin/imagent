@@ -10,6 +10,7 @@
 
 mod acp;
 mod backend;
+mod sessions;
 mod stream;
 
 pub use acp::AcpBackend;

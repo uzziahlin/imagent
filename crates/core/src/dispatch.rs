@@ -97,6 +97,23 @@ fn format_uptime(d: Duration) -> String {
     }
 }
 
+/// epoch 秒 → 相对时间（`/resume` 列表用）：`42秒前` / `5分钟前` / `3小时前` /
+/// `2天前`；超 7 天回退原始时间戳（避免引日期库）。
+fn format_rel_ts(ts: i64) -> String {
+    let d = (now_secs() - ts).max(0);
+    if d < 60 {
+        format!("{d}秒前")
+    } else if d < 3_600 {
+        format!("{}分钟前", d / 60)
+    } else if d < 86_400 {
+        format!("{}小时前", d / 3_600)
+    } else if d < 7 * 86_400 {
+        format!("{}天前", d / 86_400)
+    } else {
+        format!("（{ts}）")
+    }
+}
+
 /// 格式化工具调用摘要：按 COT 档位展示（P4-6），超出 `max` 标 `…(+N)`。
 /// 形如 `\n\n🔧 工具调用：Read({"path":"…}), Edit({"file":"…})`。
 fn format_tool_summary(tool_calls: &[(String, String)], detail: CotDetail) -> String {
@@ -173,6 +190,20 @@ fn merge_batch(batch: Vec<InboundMessage>) -> InboundMessage {
     first
 }
 
+/// 统一 `/resume` 列表条目（P4-11）：IM 会话历史 ∪ 本机同项目 agent 会话。
+#[derive(Debug, Clone)]
+struct ResumeEntry {
+    session_id: String,
+    /// epoch 秒。
+    updated_at: i64,
+    /// 产生该会话的后端类型（历史行带原始 kind；本机会话按当前后端）。
+    agent_kind: String,
+    /// 首条用户消息摘要（本机扫描有；纯历史行可能空，展示回退 id 前缀）。
+    first_prompt: String,
+    /// 本机（电脑端）会话——不在 IM 历史表里的扫描结果；接管时附分叉提示。
+    from_local: bool,
+}
+
 pub struct Dispatcher {
     platform: Arc<dyn Platform>,
     backend: Arc<dyn Backend>,
@@ -208,6 +239,9 @@ pub struct Dispatcher {
     /// per-conv 批处理队列：runner 在飞期间到达的消息暂存（entry 存在 = runner
     /// 活跃；runner 取空交还时移除）。入队与取批共用一把锁，杜绝 lost-wakeup。
     queues: Mutex<HashMap<String, Vec<InboundMessage>>>,
+    /// per-conv 最近一次 `/resume` 渲染的列表（P4-11）：序号选择取缓存，
+    /// 防两次调用间本机会话 mtime 变化导致错位；选中即消费（移除）。
+    resume_cache: Mutex<HashMap<String, Vec<ResumeEntry>>>,
     /// 管理员 sender（可 /allow）；空 = 所有白名单用户可（向后兼容，P2-D）。
     admin_senders: Arc<RwLock<Vec<String>>>,
     /// 优雅退出信号（P1-5）：收到 SIGINT/SIGTERM 后 notify，run() 停止收新消息并 drain。
@@ -282,6 +316,7 @@ impl Dispatcher {
             started_at: Instant::now(),
             running: Mutex::new(HashMap::new()),
             queues: Mutex::new(HashMap::new()),
+            resume_cache: Mutex::new(HashMap::new()),
             admin_senders: Arc::new(RwLock::new(admin_senders)),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             tasks: Mutex::new(tokio::task::JoinSet::new()),
@@ -755,6 +790,61 @@ impl Dispatcher {
         Some(std::mem::take(pending))
     }
 
+    /// 统一 `/resume` 列表（P4-11）：IM 会话历史（store `session_history`）∪
+    /// 本机同项目 agent 会话（`Backend::list_local_sessions`，按 conv 当前
+    /// workdir 扫描——workdir 对齐由扫描天然保证；`/cd` 切换后列表随之变化）。
+    ///
+    /// 归属标注：在历史表里的 id 标 📱（IM 创建，含也被扫到的），仅本机扫描出的
+    /// 标 💻；历史里有但扫描没有的（其它 backend 会话/文件已删）仍列出（📱）。
+    /// 按时间倒序取前 10。
+    async fn merged_resume_list(&self, conv: &str) -> Vec<ResumeEntry> {
+        const MAX: usize = 10;
+        let history = self
+            .store
+            .list_session_history(conv, 50)
+            .await
+            .unwrap_or_default();
+        let hist_kinds: HashMap<String, Option<String>> = history
+            .iter()
+            .map(|r| (r.session_id.clone(), r.agent_kind.clone()))
+            .collect();
+        let wd = self.resolve_workdir(conv).await;
+        let local = self.backend.list_local_sessions(&wd).await;
+        let backend_name = self.backend.name().to_string();
+        let mut seen: std::collections::HashSet<String> = Default::default();
+        let mut entries: Vec<ResumeEntry> = local
+            .into_iter()
+            .map(|l| {
+                seen.insert(l.session_id.clone());
+                ResumeEntry {
+                    agent_kind: hist_kinds
+                        .get(&l.session_id)
+                        .cloned()
+                        .flatten()
+                        .unwrap_or_else(|| backend_name.clone()),
+                    from_local: !hist_kinds.contains_key(&l.session_id),
+                    session_id: l.session_id,
+                    updated_at: l.updated_at,
+                    first_prompt: l.first_prompt,
+                }
+            })
+            .collect();
+        for r in history {
+            if seen.insert(r.session_id.clone()) {
+                entries.push(ResumeEntry {
+                    session_id: r.session_id,
+                    updated_at: r.updated_at,
+                    agent_kind: r.agent_kind.unwrap_or_else(|| backend_name.clone()),
+                    first_prompt: String::new(),
+                    from_local: false,
+                });
+            }
+        }
+        entries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        entries.truncate(MAX);
+        entries
+    }
+
     /// 解析 conv 的工作目录：per-conv KV（`/cd` 设置）覆盖，否则回退 `default_workdir`。
     async fn resolve_workdir(&self, conv_id: &str) -> PathBuf {
         match self.store.get_config(&workdir_key(conv_id)).await {
@@ -1210,43 +1300,56 @@ impl Dispatcher {
                         return;
                     }
                     "/resume" => {
-                        // P4-8：恢复历史会话。无参列出；<序号|session_id> 恢复。
+                        // P4-8/P4-11：统一恢复列表 = IM 历史（📱）∪ 本机同项目会话
+                        // （💻，仅当前 backend 支持时合并）。用户按序号选择，无需知道
+                        // session id；选中 💻 即自动接管（写 sessions 表绑定）。
                         // P1-F：取 conv 串行锁，与在飞 agent task 串行。
                         let _conv_lock = self.acquire_conv_lock(&conv.0).await;
                         let _conv_guard = _conv_lock.lock().await;
                         let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
-                        let history = self
-                            .store
-                            .list_session_history(&conv.0, 10)
-                            .await
-                            .unwrap_or_default();
+
                         if arg.is_empty() {
-                            if history.is_empty() {
-                                self.reply(&conv, "暂无历史会话记录。", &hint).await;
+                            let list = self.merged_resume_list(&conv.0).await;
+                            if list.is_empty() {
+                                self.reply(&conv, "暂无可恢复的会话。", &hint).await;
                                 return;
                             }
                             let current = self.store.get_session(&conv.0).await.ok().flatten();
-                            let mut lines = Vec::new();
-                            for (i, row) in history.iter().enumerate() {
-                                let mark = if current
-                                    .as_ref()
-                                    .is_some_and(|c| c.session_id == row.session_id)
-                                {
-                                    " *"
-                                } else {
-                                    ""
-                                };
-                                lines.push(format!(
-                                    "{}. {}…（{}）{mark}",
-                                    i + 1,
-                                    &row.session_id[..row.session_id.len().min(16)],
-                                    row.agent_kind.as_deref().unwrap_or("?")
-                                ));
-                            }
+                            let wd = self.resolve_workdir(&conv.0).await;
+                            let lines: Vec<String> = list
+                                .iter()
+                                .enumerate()
+                                .map(|(i, e)| {
+                                    let mark = if current
+                                        .as_ref()
+                                        .is_some_and(|c| c.session_id == e.session_id)
+                                    {
+                                        " *（当前）"
+                                    } else {
+                                        ""
+                                    };
+                                    // 摘要缺省回退 id 前缀（历史行无首条消息）。
+                                    let desc = if e.first_prompt.is_empty() {
+                                        format!("{}…", &e.session_id[..e.session_id.len().min(16)])
+                                    } else {
+                                        e.first_prompt.clone()
+                                    };
+                                    let src = if e.from_local { "💻" } else { "📱" };
+                                    format!(
+                                        "{}. {src} {} {desc}{mark}",
+                                        i + 1,
+                                        format_rel_ts(e.updated_at)
+                                    )
+                                })
+                                .collect();
+                            // 缓存本列表：序号选择取缓存（防两次调用间本机会话
+                            // mtime 变化导致序号错位）。
+                            self.resume_cache.lock().await.insert(conv.0.clone(), list);
                             self.reply(
                                 &conv,
                                 &format!(
-                                    "历史会话（* 为当前）：\n{}\n用法：/resume <序号|session_id>",
+                                    "可恢复会话（当前目录 {}；💻=本机 📱=IM）：\n{}\n用法：/resume <序号|session_id>",
+                                    wd.display(),
                                     lines.join("\n")
                                 ),
                                 &hint,
@@ -1254,44 +1357,58 @@ impl Dispatcher {
                             .await;
                             return;
                         }
-                        // 解析目标：序号（1 起）或完整 session_id。
-                        let target = match arg.parse::<usize>() {
-                            Ok(n) if n >= 1 && n <= history.len() => history[n - 1].clone(),
-                            _ => match history.iter().find(|r| r.session_id == arg) {
-                                Some(r) => r.clone(),
-                                None => {
-                                    self.reply(
-                                        &conv,
-                                        "未找到该历史会话（/resume 查看列表）。",
-                                        &hint,
-                                    )
-                                    .await;
-                                    return;
+
+                        // 选择目标：序号 → 取缓存列表（选中即消费，防陈旧序号）；
+                        // 非 数字 → 按 session_id 在新鲜合并列表里找。
+                        let target: Option<ResumeEntry> = if let Ok(n) = arg.parse::<usize>() {
+                            let mut cache = self.resume_cache.lock().await;
+                            cache.get_mut(&conv.0).and_then(|l| {
+                                if n >= 1 && n <= l.len() {
+                                    Some(l.remove(n - 1))
+                                } else {
+                                    None
                                 }
-                            },
+                            })
+                        } else {
+                            self.merged_resume_list(&conv.0)
+                                .await
+                                .into_iter()
+                                .find(|e| e.session_id == arg)
+                        };
+                        let Some(target) = target else {
+                            let msg = if !arg.is_empty() && arg.chars().all(|c| c.is_ascii_digit())
+                            {
+                                "序号无效或列表已变化，请先发 /resume 查看最新列表再选。"
+                            } else {
+                                "未找到该会话（/resume 查看列表）。"
+                            };
+                            self.reply(&conv, msg, &hint).await;
+                            return;
                         };
                         // 跨后端校验（同 /switch P2-A）。
                         let current_kind = self.backend.name();
-                        if let Some(k) = target.agent_kind.as_deref() {
-                            if k != current_kind {
-                                self.reply(
-                                    &conv,
-                                    &format!("该会话是 {k} 会话，当前后端为 {current_kind}（不互通，无法恢复）"),
-                                    &hint,
-                                )
-                                .await;
-                                return;
-                            }
+                        if target.agent_kind != current_kind {
+                            self.reply(
+                                &conv,
+                                &format!(
+                                    "该会话是 {} 会话，当前后端为 {current_kind}（不互通，无法恢复）",
+                                    target.agent_kind
+                                ),
+                                &hint,
+                            )
+                            .await;
+                            return;
                         }
                         let now = now_secs();
                         let row = SessionRow {
                             conv_id: conv.0.clone(),
                             session_id: target.session_id.clone(),
-                            agent_kind: target
-                                .agent_kind
-                                .clone()
-                                .unwrap_or_else(|| current_kind.to_string()),
-                            workdir: self.default_workdir.to_string_lossy().to_string(),
+                            agent_kind: current_kind.to_string(),
+                            workdir: self
+                                .resolve_workdir(&conv.0)
+                                .await
+                                .to_string_lossy()
+                                .to_string(),
                             name: None,
                             created_at: now,
                             updated_at: now,
@@ -1300,14 +1417,17 @@ impl Dispatcher {
                             self.reply(&conv, &format!("恢复失败：{e}"), &hint).await;
                             return;
                         }
-                        // 回到未命名（与被恢复 session 的命名绑定解耦）。
+                        // 回到未命名（与命名 session 的绑定解耦，同 /switch 语义）。
                         let _ = self.store.delete_config(&active_name_key(&conv.0)).await;
+                        let sid_short = &target.session_id[..target.session_id.len().min(16)];
+                        let fork_note = if target.from_local {
+                            "\n⚠️ 该会话来自电脑端：续接将从此处分叉（不是同步）；若终端仍开着请先退出。"
+                        } else {
+                            ""
+                        };
                         self.reply(
                             &conv,
-                            &format!(
-                                "✅ 已恢复历史会话 {}…（下条消息续接）",
-                                &target.session_id[..target.session_id.len().min(16)]
-                            ),
+                            &format!("✅ 已接管会话 {sid_short}…（下条消息续接）{fork_note}"),
                             &hint,
                         )
                         .await;
@@ -1862,7 +1982,7 @@ impl Dispatcher {
                     "/help" => {
                         self.reply(
                             &conv,
-                            "命令：\n/new 重置会话\n/switch <name> 切命名会话\n/sessions 列会话\n/resume [n] 恢复历史会话\n/compact 压缩上下文\n/cd [path] 切工作目录\n/ws [list|save|use|remove] 命名工作空间\n/img <path> 发图片\n/perm <off|allow|deny|ask> 权限模式\n/stop 中断当前任务\n/config [k v] 查看/热改配置\n/status 状态\n/doctor 自检\n/reconnect 重连\n/allow <id> 授权\n/disallow <id> 撤权\n/chat [allow|deny|list] 会话白名单\n/list 白名单\n/whoami 我的id\n/help 帮助",
+                            "命令：\n/new 重置会话\n/switch <name> 切命名会话\n/sessions 列会话\n/resume [n] 恢复历史/本机会话\n/compact 压缩上下文\n/cd [path] 切工作目录\n/ws [list|save|use|remove] 命名工作空间\n/img <path> 发图片\n/perm <off|allow|deny|ask> 权限模式\n/stop 中断当前任务\n/config [k v] 查看/热改配置\n/status 状态\n/doctor 自检\n/reconnect 重连\n/allow <id> 授权\n/disallow <id> 撤权\n/chat [allow|deny|list] 会话白名单\n/list 白名单\n/whoami 我的id\n/help 帮助",
                             &hint,
                         )
                         .await;
@@ -2429,7 +2549,7 @@ fn peer_uid(stream: &tokio::net::UnixStream) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ConvId, ReplyHint, SessionId, UserId};
+    use crate::types::{ConvId, LocalSession, ReplyHint, SessionId, UserId};
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -2597,6 +2717,8 @@ mod tests {
         terminal: bool,
         /// run 记录后先 sleep 该时长（P4 /stop、批处理、空闲看门狗测试用）。
         slow_ms: u64,
+        /// `list_local_sessions` 返回的本机会话（P4-11 统一 /resume 测试用）。
+        local_sessions: Arc<TokioMutex<Vec<LocalSession>>>,
     }
 
     impl MockBackend {
@@ -2612,6 +2734,7 @@ mod tests {
                 fail: false,
                 terminal: true,
                 slow_ms: 0,
+                local_sessions: Arc::new(TokioMutex::new(Vec::new())),
             };
             (b, calls, prompts, order)
         }
@@ -2641,6 +2764,14 @@ mod tests {
         fn new_slow(slow_ms: u64) -> (Self, CallsHandle, PromptsHandle, CounterHandle) {
             let (mut b, calls, prompts, order) = Self::new();
             b.slow_ms = slow_ms;
+            (b, calls, prompts, order)
+        }
+        /// `list_local_sessions` 返回固定本机会话列表（P4-11 统一 /resume 测试用）。
+        async fn new_with_local(
+            local: Vec<LocalSession>,
+        ) -> (Self, CallsHandle, PromptsHandle, CounterHandle) {
+            let (b, calls, prompts, order) = Self::new();
+            *b.local_sessions.lock().await = local;
             (b, calls, prompts, order)
         }
     }
@@ -2695,6 +2826,9 @@ mod tests {
         }
         fn name(&self) -> &'static str {
             "mock-backend"
+        }
+        async fn list_local_sessions(&self, _workdir: &std::path::Path) -> Vec<LocalSession> {
+            self.local_sessions.lock().await.clone()
         }
     }
 
@@ -2877,6 +3011,36 @@ mod tests {
     }
 
     /// 慢后端 + 自定义预算（P4 /stop、批处理合并、空闲看门狗测试用）。
+    /// 本机会话列表可配置的 backend（P4-11 统一 /resume 测试用）。
+    async fn build_with_local(auth: Auth, local: Vec<LocalSession>) -> Ctx {
+        let (plat, inbox, send_count) = MockPlatform::new();
+        let (back, calls, prompts, order) = MockBackend::new_with_local(local).await;
+        let (store, db) = tmp_store().await;
+
+        let disp = Arc::new(Dispatcher::new(
+            Arc::new(plat),
+            Arc::new(back),
+            store,
+            auth,
+            std::path::PathBuf::from("/tmp/imagent-test-ws"),
+            vec!["Read".into(), "Edit".into()],
+            PermissionMode::Off,
+            test_budgets(),
+            CotDetail::Brief,
+            vec![],
+        ));
+
+        Ctx {
+            disp,
+            inbox,
+            send_count,
+            calls,
+            prompts,
+            order,
+            db,
+        }
+    }
+
     async fn build_slow(auth: Auth, slow_ms: u64, budgets: TaskBudgets) -> Ctx {
         let (plat, inbox, send_count) = MockPlatform::new();
         let (back, calls, prompts, order) = MockBackend::new_slow(slow_ms);
@@ -4142,10 +4306,10 @@ mod tests {
         drop_db(ctx.db).await;
     }
 
-    // ---------- P4-8：/resume ----------
+    // ---------- P4-8/P4-11：/resume 统一列表 ----------
 
     /// P4-8：两轮会话后 /resume 列出历史（当前带 *）；/resume <n> 恢复后下条消息
-    /// 续接被恢复的 session。
+    /// 续接被恢复的 session。MockBackend 默认无本机会话 → 纯 📱 历史列表。
     #[tokio::test]
     async fn resume_lists_and_restores_history() {
         let _serial = SERIAL.lock().await;
@@ -4161,11 +4325,12 @@ mod tests {
         let inbox = ctx.inbox.lock().await.clone();
         let list = inbox
             .iter()
-            .find(|t| t.contains("历史会话"))
-            .expect("应列出历史会话");
+            .find(|t| t.contains("可恢复会话"))
+            .expect("应列出可恢复会话");
         assert!(list.contains("sess-0"), "应含 sess-0: {list}");
         assert!(list.contains("sess-1"), "应含 sess-1: {list}");
         assert!(list.contains("*"), "当前会话应带 *: {list}");
+        assert!(list.contains("📱"), "历史会话标 📱: {list}");
         drop(inbox);
         // 恢复 1 号（sess-0）→ 下条消息续接 sess-0。
         ctx.disp.handle(msg("c1", "alice", "/resume 1")).await;
@@ -4176,12 +4341,94 @@ mod tests {
             Some(&Some("sess-0".to_string())),
             "恢复后应续接 sess-0: {calls:?}"
         );
-        // 不存在的历史 → 提示。
+        // 越界序号 → 提示重看列表。
         ctx.disp.handle(msg("c1", "alice", "/resume 99")).await;
         let inbox = ctx.inbox.lock().await.clone();
         assert!(
-            inbox.iter().any(|t| t.contains("未找到该历史会话")),
+            inbox.iter().any(|t| t.contains("序号无效")),
             "越界序号应提示: {inbox:?}"
+        );
+        drop_db(ctx.db).await;
+    }
+
+    /// P4-11：统一列表合并本机（💻）与 IM（📱）会话，按序号接管本机会话后
+    /// 下条消息续接之，且回复带分叉提示。
+    #[tokio::test]
+    async fn resume_merges_local_and_takes_over_pc_session() {
+        let _serial = SERIAL.lock().await;
+        let now = now_secs();
+        let ctx = build_with_local(
+            Auth::new(vec!["alice".into()]),
+            vec![LocalSession {
+                session_id: "pc-9f86d081".to_string(),
+                updated_at: now - 3_600,
+                first_prompt: "修复流式卡片超时问题".to_string(),
+            }],
+        )
+        .await;
+        // 一轮 IM 会话（历史表 sess-0，updated_at=now，排在 💻 之前）。
+        feed_and_wait(&ctx, vec![msg("c1", "alice", "im round")], 1).await;
+        ctx.disp.handle(msg("c1", "alice", "/resume")).await;
+        let inbox = ctx.inbox.lock().await.clone();
+        let list = inbox
+            .iter()
+            .find(|t| t.contains("可恢复会话"))
+            .expect("应列出可恢复会话");
+        assert!(list.contains("💻"), "本机会话标 💻: {list}");
+        assert!(list.contains("📱"), "IM 会话标 📱: {list}");
+        assert!(
+            list.contains("修复流式卡片超时问题"),
+            "本机会话摘要应展示: {list}"
+        );
+        assert!(list.contains("sess-0…"), "IM 历史行缺摘要回退 id: {list}");
+        // 列表序：sess-0（新）在前，pc-9f86d081 第 2。
+        let l1 = list.lines().find(|l| l.starts_with("1.")).unwrap();
+        let l2 = list.lines().find(|l| l.starts_with("2.")).unwrap();
+        assert!(
+            l1.contains("📱") && l1.contains("sess-0"),
+            "第 1 应为 IM 当前: {l1}"
+        );
+        assert!(
+            l2.contains("💻") && l2.contains("修复"),
+            "第 2 应为本机: {l2}"
+        );
+        drop(inbox);
+        // /resume 2 接管本机会话：确认 + 分叉提示。
+        ctx.disp.handle(msg("c1", "alice", "/resume 2")).await;
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(
+            inbox.iter().any(|t| t.contains("已接管会话 pc-9f86d081")),
+            "应回接管确认: {inbox:?}"
+        );
+        assert!(
+            inbox
+                .iter()
+                .any(|t| t.contains("来自电脑端") && t.contains("分叉")),
+            "本机会话应附分叉提示: {inbox:?}"
+        );
+        // 下条消息续接被接管的本机会话。
+        feed_and_wait(&ctx, vec![msg("c1", "alice", "continue on pc")], 2).await;
+        let calls = ctx.calls.lock().await.clone();
+        assert_eq!(
+            calls.last(),
+            Some(&Some("pc-9f86d081".to_string())),
+            "接管后续接本机会话: {calls:?}"
+        );
+        drop_db(ctx.db).await;
+    }
+
+    /// P4-11：序号选择依赖先列过表（缓存）；未列直接选序号 → 引导先看列表。
+    #[tokio::test]
+    async fn resume_numeric_without_listing_prompts_list() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::new(vec!["alice".into()])).await;
+        ctx.disp.handle(msg("c1", "alice", "/resume 1")).await;
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(
+            inbox
+                .iter()
+                .any(|t| t.contains("序号无效") && t.contains("/resume")),
+            "未列过表应引导先看列表: {inbox:?}"
         );
         drop_db(ctx.db).await;
     }

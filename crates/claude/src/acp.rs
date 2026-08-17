@@ -34,7 +34,9 @@ use agent_client_protocol::schema::v1::{
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{AcpAgent, Client, ConnectionTo};
 use async_trait::async_trait;
-use imagent_core::{AgentChunk, Backend, CoreError, PermissionMode, Result, RunOutcome, SessionId};
+use imagent_core::{
+    AgentChunk, Backend, CoreError, LocalSession, PermissionMode, Result, RunOutcome, SessionId,
+};
 use parking_lot::RwLock;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
@@ -279,6 +281,12 @@ impl LongLivedAcp {
 impl Backend for AcpBackend {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    /// P4-11：ACP 的 LoadSession 与 CLI 的 --resume 共用同一 claude 会话存储，
+    /// 扫描逻辑同 ClaudeBackend。
+    async fn list_local_sessions(&self, workdir: &std::path::Path) -> Vec<LocalSession> {
+        crate::sessions::scan_for_backend(workdir)
     }
 
     async fn run(
