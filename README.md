@@ -2,11 +2,11 @@
 
 > **Instant messaging, meet your agent.**
 
-一个用 Rust 写的、把即时通讯平台接入自主 agent 的网关。**任何 IM**（个人微信 iLink / 企业微信 WeCom）↔ **任何 agent**（Claude Code / …）。
+一个用 Rust 写的、把即时通讯平台接入自主 agent 的网关。**任何 IM**（个人微信 iLink / 企业微信 WeCom / 飞书 Feishu）↔ **任何 agent**（Claude Code / Codex / Gemini）。
 
 ![Rust](https://img.shields.io/badge/Rust-edition%202021-orange) ![License: MIT](https://img.shields.io/badge/License-MIT-blue) ![CI](https://github.com/uzziahlin/imagent/actions/workflows/ci.yml/badge.svg) ![GitHub release](https://img.shields.io/github/v/release/uzziahlin/imagent) ![Docs](https://img.shields.io/badge/docs-mdBook-blueviolet)
 
-> 🌐 **English TL;DR** — `imagent` is a Rust gateway that bridges any instant-messaging platform (WeChat **iLink** / **WeCom**) with any autonomous agent (**Claude Code** / Codex / Gemini). It turns an IM private chat into an **approval-gated** agent cockpit: the agent runs real tasks (read/write files, run commands, edit code) but must ask for your `y/n` in IM before any dangerous tool. Pluggable on both sides (`Platform` / `Backend` traits), single binary, SQLite-backed sessions.
+> 🌐 **English TL;DR** — `imagent` is a Rust gateway that bridges any instant-messaging platform (WeChat **iLink** / **WeCom** / **Feishu**) with any autonomous agent (**Claude Code** / Codex / Gemini). It turns an IM chat into an **approval-gated** agent cockpit: the agent runs real tasks (read/write files, run commands, edit code) but must ask for your `y/n` (or a tap on an approval button card) in IM before any dangerous tool. Pluggable on both sides (`Platform` / `Backend` traits), single binary, SQLite-backed sessions, batched messages, `/stop` task control and an idle watchdog.
 > **Unofficial — not affiliated with Tencent or Anthropic.** iLink is a third-party Rust re-implementation of Tencent's OpenClaw Weixin protocol; compliance and account risk are solely yours.
 > The documentation below is in Chinese (the project targets the WeChat ecosystem).
 
@@ -47,11 +47,12 @@ imagent 是一个常驻网关进程：监听 IM 私聊消息 → 鉴权 → 驱�
 
 ```
 trait Platform                        trait Backend
-├── ilink (个人微信私聊, 实验性)        ├── claude (CLI + ACP 长驻子进程)
-└── wecom  (企业微信长连接)             ├── codex  (codex exec --json)
-                                       └── gemini (gemini -p -o stream-json)
+├── ilink  (个人微信私聊, 实验性)       ├── claude (CLI + ACP 长驻子进程)
+├── wecom  (企业微信长连接)             ├── codex  (codex exec --json)
+└── feishu (飞书私聊/群/云文档评论)     └── gemini (gemini -p -o stream-json)
         ↕                              ↕
               core: 调度 / 鉴权 / 会话路由 (store 持久化) / 权限审批闭环
+                    任务控制(/stop/批处理/看门狗) / 会话白名单 / 统一 resume
 ```
 
 三层 + 双抽象：core 持有 `Platform` 与 `Backend` trait，平台与后端各自独立可换。session 生命周期提到 core（store 持久化），Backend 退化为无状态执行器——比把 session 塞进 Backend 内存更干净，支持重启续接。
@@ -108,9 +109,16 @@ cat > ~/.imagent/config.toml <<'EOF'
 default_workdir = "/absolute/path/to/agent/workspace"  # 必填，agent 的 cwd（非沙箱：不限制可读路径，靠 allowed_tools + permission_mode 兜底）
 allowed_senders = []        # 留空 = 发现模式（先看日志拿你的 from_user_id）
 allowed_tools = ["Read", "Edit"]
-# permission_mode = "off"  # off / allow / deny / ask（放 Bash 等危险工具时用 ask）
+# permission_mode = "off"   # off / allow / deny / ask（放 Bash 等危险工具时用 ask）
+# allowed_chats = ["feishu:oc_xxx"]  # 会话(群)白名单：群消息 chat 放行 OR sender 放行（/chat 可动态管理）
+# agent_idle_timeout_secs = 300      # 空闲看门狗：连续无输出 N 秒自动终止（0=关）
+# batch_window_ms = 1500             # 连发消息合并为一轮 prompt 的窗口（0=关）
+# cot_detail = "brief"               # 工具过程展示 off / brief / detailed（/config 可热改）
+# platform = "feishu"                # wecom/feishu 经 config 凭据接入（见下）
 EOF
 ```
+
+> **飞书**：`platform = "feishu"` + `feishu_app_id` + 环境变量 `IMAGENT_FEISHU_APP_SECRET`；需在飞书后台开通长连接事件订阅（消息 / `card.action.trigger` 审批回调 / 可选 `drive.file.comment.created_v1` 云文档评论）。**WeCom**：`wecom_bot_id` + `wecom_secret`。两者都免公网（长连接收，HTTP 发）。
 
 ### 登录 + 运行
 
@@ -126,18 +134,27 @@ imagent start            # 前台常驻，Ctrl-C 退出
 2. `imagent allow <from_user_id>` 授权（或填进 config 重启）。
 3. 之后发消息 → agent 执行 → 结果回传 IM。
 
-## 命令（IM 内私聊）
+**多实例（Profile）**：`imagent profile create work` → `imagent --profile work start`——config/db/socket/媒体全隔离，一机多 bot 身份。
+
+## 命令（IM 内）
 
 | 命令 | 作用 |
 |---|---|
 | `/new` | 重置会话（开新上下文） |
 | `/switch <name>` | 切到 / 新建命名会话（多任务并行上下文） |
 | `/sessions` | 列命名会话（`*` 标当前） |
+| `/resume [n]` | 统一恢复列表：📱 IM 会话 ∪ 💻 电脑端 Claude Code 会话（摘要+时间辨认，按序号接管，无需会话 id） |
 | `/compact` | 软压缩上下文（摘要 + 重置 + 延续） |
-| `/allow <id>` | 授权一个 sender（仅已授权用户可执行——管理员模型） |
-| `/disallow <id>` | 撤销（不可撤销自己，防锁死） |
-| `/list` | 查白名单 |
-| `/whoami` | 查自己的 sender id |
+| `/cd [path]` | 切工作目录（`/resume` 本机会话列表随之变化） |
+| `/ws list\|save\|use\|remove` | 命名工作空间 |
+| `/img <path>` | 发 workdir 内图片到 IM |
+| `/perm <off\|allow\|deny\|ask>` | 权限模式热切 |
+| `/stop` | 中断当前在飞任务（杀 agent 子进程，清空排队消息） |
+| `/config [k v]` | 查看 / 热改配置（cot_detail / batch_window_ms / agent_idle_timeout_secs） |
+| `/status` `/doctor` `/reconnect` | 运行状态 / 自检 / 强制平台重连 |
+| `/allow <id>` `/disallow <id>` | 授权 / 撤销 sender（管理员门槛） |
+| `/chat allow\|deny\|list` | 会话（群）白名单管理 |
+| `/list` `/whoami` | 查白名单 / 查自己的 sender 与会话 id |
 
 ## 权限审批闭环（杀手锏）
 
@@ -148,13 +165,13 @@ imagent start            # 前台常驻，Ctrl-C 退出
 回复 y 允许，其它拒绝。
 ```
 
-回复 `y` → 执行；其它 → 拒绝。基于 Claude Code 的 `--permission-prompt-tool` MCP 回调实现。
+回复 `y` → 执行；其它 → 拒绝。基于 Claude Code 的 `--permission-prompt-tool` MCP 回调实现。**飞书**下询问是「✅ 允许 / ⛔ 拒绝」按钮卡片——点一下即回，无需打字。等审批期间 `/stop` 仍可用（自动回 deny 中止）。
 
 ## 安全
 
-- **白名单鉴权**：非白名单 sender 丢弃（iLink bot 任何人可加好友，这步不可省）。
+- **白名单鉴权**：sender 白名单 + 会话（群）白名单，非授权丢弃（iLink bot 任何人可加好友，这步不可省）。
 - **工具收敛**：`allowed_tools` 配置驱动（起步 `Read,Edit`）；workdir 用 `current_dir` 锁定。
-- **权限审批**：危险操作 IM approve/deny。
+- **权限审批**：危险操作 IM approve/deny（文本 / 按钮卡片）。
 - **store 加固**：文件 0600 / 目录 0700；CDN 下载 SSRF 白名单。
 - 详见 [`SECURITY.md`](SECURITY.md)。
 
@@ -166,8 +183,9 @@ imagent start            # 前台常驻，Ctrl-C 退出
 | P1 | ✅ | MVP 闭环：扫码 → 私聊 → `claude -p` → 回传 → `--resume` |
 | P2 | ✅ | 限流熔断 / 动态白名单 / 多命名会话 / 软 compact / 推流 / typing / **权限审批** / 媒体 |
 | P3 | ✅ | 开源化（MIT license/CI/凭据加密/mdBook）+ WeCom + ACP + 多 agent（Codex/Gemini）+ 运维（指标/热重载/daemon）+ 长消息分片 |
+| P4 | ✅ | 任务控制（`/stop`/消息批处理/空闲看门狗）+ 飞书平台（CardKit 流式卡片/审批按钮/云文档评论）+ 会话白名单 + COT 三档 `/config` + IM 诊断命令 + 统一 `/resume`（接管电脑端会话）+ Profile 多实例 |
 
-> **当前状态**：**v1.0.0 已发布**（见 [Releases](https://github.com/uzziahlin/imagent/releases)）。P0–P3 全部交付；剩余为 v1.1+ 架构建议（见 [`CODE_REVIEW_v6`](docs/CODE_REVIEW_v6.md) §架构建议）。
+> **当前状态**：**v1.0.0 已发布**（见 [Releases](https://github.com/uzziahlin/imagent/releases)）。P0–P4 全部交付；P4 纪要见 [`docs/internal/P4_ROADMAP.md`](docs/internal/P4_ROADMAP.md)，剩余为 v1.1+ 架构建议（见 [`CODE_REVIEW_v6`](docs/CODE_REVIEW_v6.md) §架构建议）。
 
 详见 [`docs/`](docs/)（[DESIGN](docs/DESIGN.md) / [RESEARCH](docs/RESEARCH.md) / [CODE_REVIEW_v4](docs/CODE_REVIEW_v4.md) / [CODE_REVIEW_v5](docs/CODE_REVIEW_v5.md)）。
 
@@ -179,7 +197,7 @@ cargo clippy --workspace --all-targets -- -D warnings   # 0 warning
 cargo fmt --all --check
 ```
 
-crate：`core`（调度/鉴权/session/权限）+ `ilink`（iLink 协议）+ `wecom`（企业微信长连接）+ `claude`（CLI/ACP backend）+ `codex` + `gemini` + `store`（SQLite）。
+crate：`core`（调度/鉴权/session/权限/任务控制）+ `ilink`（iLink 协议）+ `wecom`（企业微信长连接）+ `feishu`（飞书长连接 + CardKit + 云文档评论）+ `claude`（CLI/ACP backend）+ `codex` + `gemini` + `store`（SQLite）。
 
 ## License
 
