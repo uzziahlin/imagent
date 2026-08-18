@@ -193,18 +193,26 @@ profile 跑同一平台会共享凭据条目（后续可加 profile 前缀）；
 |---|---|---|
 | P5-14 | ACP 单连接全局串行 + 排队期烧 agent_timeout（A 的长任务让 B 直接超时）。方案：per-conv 长驻连接；timeout 预算从出队起算。**需真机 claude-agent-acp 验证后实施** | 中高 |
 
-### 待排期（设计债务 / 体验）
+### 第四批（设计债务收敛 ✅，同日）
+
+| 项 | 内容 | 状态 |
+|---|---|---|
+| store | `upsert_session` 事务化（主表+历史同事务）+ `session_history` per-conv 轮转保 50 | ✅ |
+| keyring | username 按 profile 分段（`{scope}:{platform}:{account}`），读取旧键 fallback，删除双键清理 | ✅ |
+| metrics | `permission_decisions_total{allow/deny/timeout/dropped}` + `agent_timeouts_total{idle/total}`；`/health` logged_in 按实际平台判定 | ✅ |
+| 媒体治理 | `<imagent_home>/media` TTL 清理（7 天，启动 + 每日循环） | ✅ |
+| feishu | token 读锁快路径 + 双检；手写 HTTP（卡片 PATCH/评论回复/媒体下载）429/230020 退避重试；分片失败标注序号 | ✅ |
+| codex | `list_local_sessions`：扫 `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`（session_meta id+cwd），/resume 可接管本机 codex 会话 | ✅ |
+
+### 待排期（设计债务 / 体验，剩余）
 
 - dispatch.rs 已 4700+ 行（命令解析/会话状态机/批处理/权限/2400 行测试混杂），拆 `commands/` 子模块——后续所有迭代的摩擦来源。
-- keyring 凭据隔离：service 固定 `imagent`（两 profile 互删凭据）→ username 拼 profile 段（ilink 媒体目录已随本批改走 `imagent_home()`）。
-- 媒体目录 TTL/LRU 清理（磁盘只增不减；feishu 下载上限已随本批补齐）。
-- 飞书限流与 token：send/patch 无 429 识别退避（分片中断产生截断回复无标记）；token 刷新持写锁跨 30s 网络（双检锁）+ token 失效错误码不主动清缓存。
-- 存储：`session_history` 无上限增长（仿 audit_log 轮转，per-conv 保 50）；`upsert_session` 两条语句非同事务（包 `unchecked_transaction`）。
-- 可观测性：无 permission approve/deny/timeout 计数、无超时分类；`/health` logged_in 固定查 ilink（feishu/wecom 恒 false 误导）。
-- 能力一致性：codex/gemini 无 `list_local_sessions`（/resume 退化）；ACP Ask 一律 fail-closed 拒绝 + allowed_tools 忽略（接 PermissionRouter 到 session/request_permission）。
+- 飞书 token 失效错误码（99991663 类）不主动清缓存重试（SDK 路径无状态透传，需改手写或错误码管道）；SDK 路径（send_text_msg 等）的 429 重试同此。
 - 进程崩溃后的孤儿流式卡片仍停在「生成中」（P5-11 只覆盖进程活着时 patch 失败；需持久化卡片句柄 + 启动扫描关流，涉及 store schema）。
 - wecom 出站 ack 完整等待闭环（req_id 关联 oneshot；需真机验证回执语义后设计）。
-- 小项：`/resume` 选中即消费后序号移位易误选（已随本批缓解：/cd 失效缓存 + cwd 校验兜底）；飞书 card action/comment 解析器无 fuzz target；mdBook 文档站内容陈旧（README 已同步、docs/ 未同步）。
+- ACP Ask 接 PermissionRouter 到 session/request_permission + allowed_tools 映射；P5-14（per-conv 连接）需真机验证。
+- gemini 无本机存储概念，/resume 保持纯 IM 历史（不跟进）。
+- 小项：飞书 card action/comment 解析器无 fuzz target；mdBook 文档站内容陈旧（README 已同步、docs/ 未同步）。
 
 ---
 
@@ -363,3 +371,58 @@ dedup 窗口（5min）过期后同批被当新消息**重复驱动一轮 agent**
 **验证**：新增 8 测试（单实例锁 ×3 / cancel 唤醒 / 候选扫描+cwd 提取 / 接管
 cwd 拒绝 / 握手 token 端到端 / config 边界），全量 337 passed、fmt/clippy 绿。
 P5-14（ACP per-conv 连接）留待真机验证后实施。
+
+
+---
+
+## P5 第四批实现纪要（2026-08-18）
+
+### store：upsert 事务化 + session_history 轮转 ✅
+
+`upsert_session` 的主表/历史侧表两条语句包进 `unchecked_transaction`（中间崩溃
+不再漏历史行，单次 fsync）；同事务内 `DELETE ... NOT IN (SELECT ... LIMIT 50)`
+按 conv 轮转（保留最近 50 条 = 调用方查询上限；此前只增不删）。
+
+### keyring profile 隔离 ✅
+
+username 从 `{platform}:{account}` 改为 `{scope}:{platform}:{account}`（scope =
+`--profile` 名；空 = 无 profile 保持旧格式，**存量部署零迁移**）。读取 scoped 键
+miss 时回退旧键（过渡期老凭据继续可用，下次 login 写入 scoped 键）；删除时双键
+都清理。SQLite marker 不变（DB 文件本身已按 profile 隔离）。main 在 start/login
+两处 `set_keyring_scope`。
+
+### metrics + /health ✅
+
+- `imagent_permission_decisions_total{result=allow|deny|timeout|dropped}`：审批
+  决策分类（/stop 的 fail-closed deny 计入 deny）。
+- `imagent_agent_timeouts_total{kind=idle|total}`：空闲看门狗与总预算超时分开
+  计数（定位「agent 慢」是卡死还是预算不足）。
+- `/health` 的 `logged_in` 按实际平台判定（ilink/wecom 查 store 凭据，feishu 查
+  `IMAGENT_FEISHU_APP_SECRET` 环境变量）——此前固定查 ilink，feishu/wecom 下恒
+  false 有误导。
+
+### 媒体 TTL 清理 ✅
+
+`paths::sweep_media_before(dir, cutoff)`（纯函数 + 单测）；main 启动 spawn 后台
+任务：启动清一次 + 每日循环，删 `<imagent_home>/media` 下 7 天前的文件。
+
+### feishu：token 双检锁 + 限流退避 + 截断标记 ✅
+
+- `fetch_cached_token` 读锁快路径 + 写锁双检（此前每次直取写锁且跨网络调用，
+  最坏 30s 内所有发送串行阻塞）。
+- 手写 HTTP 路径（create_card_entity / patch_card_element / patch_card_settings /
+  reply_comment / download_message_resource）识别 HTTP 429 / code=230020，
+  500ms→1s→2s 退避重试（流式卡片 PATCH 是最高频路径）。SDK 路径无状态透传，
+  留待后续。
+- `send_text` 分片失败标注「第 N/M 片发送失败（回复可能被截断）」——截断可感知。
+
+### codex 本机会话扫描 ✅
+
+`crates/codex/src/sessions.rs`：扫 `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`
+（mtime 倒序检查最近 200 个，读头部 64KiB）——首行 `session_meta` 的 `id`（与
+`codex exec --json` 的 thread_id 同源）+ `cwd` 判定归属；首条可展示 user 消息做
+摘要（跳过 AGENTS.md 注入）。`/resume` 在 codex 后端不再退化为纯 IM 历史；
+`LocalSession.cwd` 接管校验同样生效。
+
+**验证**：新增 7 测试（轮转 / scoped username / TTL 清理 / metrics 注册 / codex
+扫描 ×3），全量 343 passed、fmt/clippy 绿。

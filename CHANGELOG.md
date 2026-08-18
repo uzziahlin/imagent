@@ -2,6 +2,25 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [Unreleased] — P5 第四波：设计债务收敛（store 事务/轮转、keyring 隔离、metrics、媒体 TTL、feishu 限流、codex 扫描）
+
+（发现与排期见 [P4_ROADMAP](docs/internal/P4_ROADMAP.md) 的 P5 章节。）
+
+### Fixed
+- **store**：`upsert_session` 主表 + `session_history` 两条语句包进同一事务（中间崩溃不再漏历史行）；`session_history` per-conv 轮转保留最近 50 条（此前只增不删，长生命周期部署无限增长）。
+- **keyring profile 隔离**：username 改 `{profile}:{platform}:{account}`（无 profile 时保持旧格式，存量部署零迁移）；scoped 键 miss 回退旧键（过渡期老凭据可用，下次 login 写入新键）；删除时双键清理。多 profile 同机同平台不再互删凭据。
+- **/health**：`logged_in` 按实际平台判定（ilink/wecom 查 store 凭据、feishu 查 `IMAGENT_FEISHU_APP_SECRET`）——此前固定查 ilink，feishu/wecom 下恒 false 有误导。
+- **feishu token 读取**：读锁快路径 + 写锁双检——此前每次取写锁且跨网络调用（最坏 30s），刷新期间所有发送/媒体下载被串行阻塞。
+- **feishu 限流**：手写 HTTP 路径（卡片实体/PATCH/评论回复/媒体下载）识别 HTTP 429 / code=230020，500ms→1s→2s 退避重试；`send_text` 分片失败标注「第 N/M 片发送失败（回复可能被截断）」。
+
+### Added
+- **metrics**：`imagent_permission_decisions_total{result=allow|deny|timeout|dropped}`（审批决策分类）+ `imagent_agent_timeouts_total{kind=idle|total}`（空闲看门狗与总预算超时分开计数）。
+- **媒体 TTL 清理**：`<imagent_home>/media` 下 7 天前的入站媒体文件自动删除（启动清一次 + 每日循环，best-effort）。
+- **codex 本机会话扫描**：`Backend::list_local_sessions` 的 codex 实现（扫 `~/.codex/sessions/**/rollout-*.jsonl`，session_meta 的 id + cwd 判定归属）——`/resume` 在 codex 后端不再退化为纯 IM 历史，💻 接管 + cwd 校验同样生效。
+
+### Changed
+- workspace 测试 343 passed（新增 7 用例）；clippy 0 warning；fmt clean。
+
 ## [Unreleased] — P5 第三波：单实例锁 / 握手 token / 游标致命化 / 编码校准 / /stop 收尾 + 六项快赢
 
 （发现与排期见 [P4_ROADMAP](docs/internal/P4_ROADMAP.md) 的 P5 章节。）
