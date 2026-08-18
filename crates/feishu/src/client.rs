@@ -22,9 +22,6 @@ use open_lark::communication::im::v1::image::models::ImageType;
 use open_lark::communication::im::v1::message::create::{CreateMessageBody, CreateMessageRequest};
 use open_lark::communication::im::v1::message::models::ReceiveIdType;
 use open_lark::communication::im::v1::message::patch::PatchMessageCardRequest;
-use open_lark::communication::im::v1::message::resource::get::{
-    GetMessageResourceRequest, MessageResourceType,
-};
 use open_lark::ws_client::{EventDispatcherHandler, LarkWsClient, WsClientError};
 use open_lark::{CoreConfig, RequestOption};
 
@@ -321,48 +318,81 @@ pub async fn send_card_ref_msg(
         .map(String::from))
 }
 
-/// 下载用户发来的消息图片，返回二进制。
-///
-/// 走「获取消息中的资源文件」接口（`/im/v1/messages/{message_id}/resources/{file_key}?type=image`）。
-/// 注意：`GetImage`(`/im/v1/images/{key}`) 只能下「机器人自己上传」的图，用户发来的图用它会被
-/// 飞书拒（234001 Invalid request param）。需应用开通 `im:resource` 权限。
+/// 媒体下载大小上限（与 ilink 一致：50MB；防恶意/误发大文件把内存打爆）。
+const MEDIA_MAX_BYTES: u64 = 50 * 1024 * 1024;
+
+/// 「获取消息中的资源文件」手写实现（P5 快赢：SDK 版全量缓冲无大小上限）。
+/// GET `/im/v1/messages/{message_id}/resources/{file_key}?type=<kind>`，
+/// Content-Length 预检 + 流式累计上限（同 ilink 的双重上限做法）。
+/// 注意：`GetImage`(`/im/v1/images/{key}`) 只能下「机器人自己上传」的图，用户
+/// 发来的图用它会被飞书拒（234001）。需应用开通 `im:resource` 权限。
+async fn download_message_resource(
+    core_config: &CoreConfig,
+    token: &str,
+    message_id: &str,
+    file_key: &str,
+    kind: &str,
+) -> imagent_core::Result<Vec<u8>> {
+    let base = core_config.base_url().trim_end_matches('/').to_string();
+    let url =
+        format!("{base}/open-apis/im/v1/messages/{message_id}/resources/{file_key}?type={kind}");
+    let client = reqwest::Client::new();
+    let mut resp = client
+        .get(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| {
+            imagent_core::CoreError::Platform(PLATFORM, format!("download resource: {e}"))
+        })?;
+    if !resp.status().is_success() {
+        return Err(imagent_core::CoreError::Platform(
+            PLATFORM,
+            format!("download resource: HTTP {}", resp.status()),
+        ));
+    }
+    if let Some(len) = resp.content_length() {
+        if len > MEDIA_MAX_BYTES {
+            return Err(imagent_core::CoreError::Platform(
+                PLATFORM,
+                format!("download resource too large: {len} > {MEDIA_MAX_BYTES} bytes"),
+            ));
+        }
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| {
+        imagent_core::CoreError::Platform(PLATFORM, format!("download resource: {e}"))
+    })? {
+        if buf.len() as u64 + chunk.len() as u64 > MEDIA_MAX_BYTES {
+            return Err(imagent_core::CoreError::Platform(
+                PLATFORM,
+                format!("download resource too large: > {MEDIA_MAX_BYTES} bytes (streamed)"),
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// 下载用户发来的消息图片，返回二进制（带双重大小上限，见
+/// [`download_message_resource`]）。
 pub async fn download_image(
     core_config: &CoreConfig,
     token: &str,
     message_id: &str,
     image_key: &str,
 ) -> imagent_core::Result<Vec<u8>> {
-    let option = RequestOption::builder()
-        .tenant_access_token(token.to_string())
-        .build();
-    GetMessageResourceRequest::new(core_config.clone())
-        .message_id(message_id.to_string())
-        .file_key(image_key.to_string())
-        .resource_type(MessageResourceType::Image)
-        .execute_with_options(option)
-        .await
-        .map_err(|e| imagent_core::CoreError::Platform(PLATFORM, format!("download_image: {e}")))
+    download_message_resource(core_config, token, message_id, image_key, "image").await
 }
 
-/// 下载用户发来的消息文件，返回二进制。
-///
-/// 走「获取消息中的资源文件」接口（type=file），理由同 [`download_image`]。需 `im:resource` 权限。
+/// 下载用户发来的消息文件，返回二进制（带双重大小上限，理由同 [`download_image`]）。
 pub async fn download_file(
     core_config: &CoreConfig,
     token: &str,
     message_id: &str,
     file_key: &str,
 ) -> imagent_core::Result<Vec<u8>> {
-    let option = RequestOption::builder()
-        .tenant_access_token(token.to_string())
-        .build();
-    GetMessageResourceRequest::new(core_config.clone())
-        .message_id(message_id.to_string())
-        .file_key(file_key.to_string())
-        .resource_type(MessageResourceType::File)
-        .execute_with_options(option)
-        .await
-        .map_err(|e| imagent_core::CoreError::Platform(PLATFORM, format!("download_file: {e}")))
+    download_message_resource(core_config, token, message_id, file_key, "file").await
 }
 
 /// 上传图片到飞书（用于发图片消息），返回 image_key。

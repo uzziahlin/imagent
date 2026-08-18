@@ -267,11 +267,20 @@ async fn main() -> Result<()> {
             let config = match imagent_core::Config::load(&config_path) {
                 Ok(c) => c,
                 Err(e) => {
-                    println!("加载配置失败（{}）：{e}", config_path.display());
-                    println!("请创建配置文件，模板：\n{}", imagent_core::Config::EXAMPLE);
-                    return Ok(());
+                    // P5 快赢：配置加载失败以非零退出码结束——此前 return Ok(()) 退出码
+                    // 为 0，systemd/监控视为成功不重启不告警。
+                    return Err(anyhow!(
+                        "加载配置失败（{}）：{e}\n请创建配置文件，模板：\n{}",
+                        config_path.display(),
+                        imagent_core::Config::EXAMPLE
+                    ));
                 }
             };
+
+            // P5-9a：单实例锁——同 IMAGENT_HOME 双实例会互劫持 permission.sock，
+            // 使先启动实例的 Ask 审批闭环静默失效。锁随 _instance_lock 持有到退出。
+            let _instance_lock =
+                imagent_core::instance::acquire(&imagent_core::paths::imagent_home())?;
 
             // 2. store（多份：dispatcher / HTTP /health / SIGHUP 各持一份 Clone）
             let store = imagent_store::Store::open(&db_path).await?;
@@ -435,10 +444,14 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            // R-3：清理 permission.sock（P1-5 计划 ③，原未落地）。
+            // R-3：清理 permission.sock（P1-5 计划 ③，原未落地）；P5-9b：握手
+            // token 文件一并清理。
             #[cfg(unix)]
             if let Some(sock) = imagent_core::default_sock_path() {
                 let _ = std::fs::remove_file(&sock);
+                if let Some(parent) = sock.parent() {
+                    let _ = std::fs::remove_file(parent.join("permission.token"));
+                }
             }
         }
         Cmd::Status => {
@@ -753,6 +766,15 @@ async fn shutdown_signal() {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!(target: "imagent::ops", "received SIGINT, shutting down");
+                // P5 快赢：优雅退出可能长达 shutdown_grace（默认 60s），期间后续
+                // Ctrl-C 会被已安装的 handler 吞掉，操作员只能 kill -9。二次
+                // Ctrl-C 直接强退（130 = SIGINT 惯例退出码）。
+                tracing::info!(target: "imagent::ops", "再按一次 Ctrl-C 立即强制退出");
+                tokio::spawn(async {
+                    let _ = tokio::signal::ctrl_c().await;
+                    eprintln!("收到第二次 Ctrl-C，立即强制退出");
+                    std::process::exit(130);
+                });
             }
             _ = term.recv() => {
                 tracing::info!(target: "imagent::ops", "received SIGTERM, shutting down");

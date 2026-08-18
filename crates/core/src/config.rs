@@ -224,6 +224,31 @@ impl Config {
             )));
         }
 
+        // P5 快赢：数值下界/上限校验——错误前置到启动期，而非运行期静默劣化
+        //（0 值超时 = 所有 run 瞬时失败/审批必拒；超大批窗口 = 每条回复显著延迟）。
+        if cfg.agent_timeout_secs == 0 {
+            return Err(CoreError::Config(
+                "agent_timeout_secs 必须 ≥ 1（0 会让所有 agent 运行瞬时超时）".into(),
+            ));
+        }
+        if cfg.permission_ask_timeout_secs == 0 {
+            return Err(CoreError::Config(
+                "permission_ask_timeout_secs 必须 ≥ 1（0 会让所有审批必然超时拒否）".into(),
+            ));
+        }
+        if cfg.shutdown_grace_secs == 0 {
+            return Err(CoreError::Config(
+                "shutdown_grace_secs 必须 ≥ 1（0 会让退出 drain 立即 abort 在飞任务）".into(),
+            ));
+        }
+        const BATCH_WINDOW_MAX_MS: u64 = 10_000;
+        if cfg.batch_window_ms > BATCH_WINDOW_MAX_MS {
+            return Err(CoreError::Config(format!(
+                "batch_window_ms 上限 {BATCH_WINDOW_MAX_MS}（当前 {}）——超大窗口会让每条回复都延迟一个窗口",
+                cfg.batch_window_ms
+            )));
+        }
+
         Ok(cfg)
     }
 
@@ -516,6 +541,32 @@ message_fragment_interval_ms = 250
         let cfg = Config::load(&p).expect("parse");
         assert_eq!(cfg.agent_idle_timeout_secs, 90);
         assert_eq!(cfg.batch_window_ms, 0);
+        cleanup(&p);
+    }
+
+    /// P5 快赢：数值边界校验——0 值超时/超大批窗口在启动期报错。
+    #[test]
+    fn numeric_bounds_rejected() {
+        for (tag, extra) in [
+            ("timeout0", "agent_timeout_secs = 0\n"),
+            ("ask0", "permission_ask_timeout_secs = 0\n"),
+            ("grace0", "shutdown_grace_secs = 0\n"),
+            ("window_huge", "batch_window_ms = 600000\n"),
+        ] {
+            let p = tmp_path(tag, &format!("default_workdir = \"/tmp/ws\"\n{extra}"));
+            let err = Config::load(&p).expect_err("越界配置应报错");
+            assert!(
+                format!("{err}").contains("必须") || format!("{err}").contains("上限"),
+                "应给出清晰指引: {err}"
+            );
+            cleanup(&p);
+        }
+        // 合法边界：批窗口上限值本身可用；idle 0 = 关闭（文档语义）。
+        let p = tmp_path(
+            "bounds_ok",
+            "default_workdir = \"/tmp/ws\"\nbatch_window_ms = 10000\nagent_idle_timeout_secs = 0\n",
+        );
+        assert!(Config::load(&p).is_ok());
         cleanup(&p);
     }
 

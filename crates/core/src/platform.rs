@@ -84,4 +84,12 @@ pub trait Platform: Send + Sync {
             format!("🔐 Claude 请求执行 {tool_name}：{input_summary}\n回复 y 允许，其它拒绝。");
         self.send_text(conv, &text, hint).await
     }
+
+    /// P5-16：撤回/收敛该 conv 最近一次权限询问（`/stop` 中断任务时调用，防审批
+    /// 卡片滞留可点、用户对一个已死的任务做审批）。默认 no-op：纯文本询问平台
+    /// 无句柄概念，滞留文本无害（其后的 y/n 因 pending 已清走正常处理路径）。
+    /// 支持交互卡片的平台应记录最近询问的卡片句柄并在此 patch 成「已中断」终态。
+    async fn cancel_permission_ask(&self, _conv: &ConvId) -> Result<()> {
+        Ok(())
+    }
 }

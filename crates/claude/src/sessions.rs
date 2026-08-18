@@ -27,44 +27,78 @@ pub fn default_claude_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude"))
 }
 
-/// workdir → projects 子目录名（`/` → `-`）。
-pub fn encode_project_dir(workdir: &Path) -> String {
-    workdir.to_string_lossy().replace('/', "-")
+/// workdir → projects 子目录名候选集（P5-15）。
+///
+/// 本机实测 `/` → `-`（`/Users/x/Work/imagent` → `-Users-x-Work-imagent`），但该
+/// 规则让 `/a/b-c` 与 `/a/b/c` 编码冲突；且不同 Claude Code 版本对 `.` `_` 等字符
+/// 的处理未实测（社区规则是也替换为 `-`）。联合扫描多个候选（去重），配合
+/// [`LocalSession::cwd`] 的接管校验兜底：编码猜错最多扫不到（退化为纯 IM 历史），
+/// 不会把别的项目的会话串进来。
+pub fn encode_candidates(workdir: &Path) -> Vec<String> {
+    let s = workdir.to_string_lossy();
+    let mut v = vec![s.replace('/', "-")];
+    let dots = s.replace(['/', '.', '_'], "-");
+    if !v.contains(&dots) {
+        v.push(dots);
+    }
+    let alnum: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if !v.contains(&alnum) {
+        v.push(alnum);
+    }
+    v
 }
 
 /// 列出与 workdir 同项目的本机会话，按 mtime 倒序（原始精度排序，避免同秒并列
-/// 顺序不稳定），最多 `limit` 条。
+/// 顺序不稳定），最多 `limit` 条。多个候选编码目录联合扫描，session_id 去重。
 pub fn list_local_sessions(claude_dir: &Path, workdir: &Path, limit: usize) -> Vec<LocalSession> {
-    let dir = claude_dir
-        .join("projects")
-        .join(encode_project_dir(workdir));
-    let rd = match std::fs::read_dir(&dir) {
-        Ok(r) => r,
-        Err(_) => return Vec::new(), // 目录不存在/不可读：无本机会话
-    };
-    // (mtime 原始 SystemTime, LocalSession)——mtime 到展示层才折算秒。
-    let mut out: Vec<(std::time::SystemTime, LocalSession)> = rd
-        .flatten()
-        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("jsonl"))
-        .filter_map(|e| {
-            let session_id = e.path().file_stem()?.to_str()?.to_string();
-            let mtime = e.metadata().and_then(|m| m.modified()).ok()?;
+    let mut seen: std::collections::HashSet<String> = Default::default();
+    let mut out: Vec<(std::time::SystemTime, LocalSession)> = Vec::new();
+    for enc in encode_candidates(workdir) {
+        let dir = claude_dir.join("projects").join(enc);
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue, // 候选目录不存在：正常（该编码规则下无会话）
+        };
+        for entry in rd.flatten() {
+            if entry.path().extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let session_id = match entry.path().file_stem().and_then(|s| s.to_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            if !seen.insert(session_id.clone()) {
+                continue;
+            }
+            let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
+                continue;
+            };
             let updated_at = mtime
                 .duration_since(std::time::UNIX_EPOCH)
                 .ok()
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            let first_prompt = read_first_user_prompt(&e.path()).unwrap_or_default();
-            Some((
+            let (first_prompt, cwd) = read_head_info(&entry.path());
+            out.push((
                 mtime,
                 LocalSession {
                     session_id,
                     updated_at,
                     first_prompt,
+                    cwd,
                 },
-            ))
-        })
-        .collect();
+            ));
+        }
+    }
     out.sort_by(|a, b| b.0.cmp(&a.0));
     out.truncate(limit);
     out.into_iter().map(|(_, s)| s).collect()
@@ -78,19 +112,36 @@ pub(crate) fn scan_for_backend(workdir: &Path) -> Vec<LocalSession> {
     }
 }
 
-/// 读文件头部（≤ HEAD_CAP），逐行找首条可展示的 user 消息文本。
+/// 读文件头部（≤ HEAD_CAP）：`(首条可展示的 user 消息文本, 会话记录的 cwd)`。
 ///
-/// 跳过：非 user 行、`isMeta` 行、`<` 开头的命令/系统注入文本、tool_result 块。
-fn read_first_user_prompt(path: &Path) -> Option<String> {
+/// 摘要跳过：非 user 行、`isMeta` 行、`<` 开头的命令/系统注入文本、tool_result 块。
+/// cwd 取首个带非空 `cwd` 字符串字段的行（真实 jsonl 几乎每行都有；P5-15 接管
+/// 校验用，解析不到为 None → 跳过校验不阻塞列出）。
+fn read_head_info(path: &Path) -> (String, Option<String>) {
     use std::io::Read;
-    let mut f = std::fs::File::open(path).ok()?;
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return (String::new(), None),
+    };
     let mut buf = vec![0u8; HEAD_CAP];
-    let n = f.read(&mut buf).ok()?;
+    let Ok(n) = f.read(&mut buf) else {
+        return (String::new(), None);
+    };
     buf.truncate(n);
+    let mut cwd: Option<String> = None;
     for line in buf.split(|&b| b == b'\n') {
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
             continue;
         };
+        if cwd.is_none() {
+            if let Some(c) = v
+                .get("cwd")
+                .and_then(|c| c.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                cwd = Some(c.to_string());
+            }
+        }
         if v.get("type").and_then(|t| t.as_str()) != Some("user") {
             continue;
         }
@@ -105,9 +156,9 @@ fn read_first_user_prompt(path: &Path) -> Option<String> {
         if t.is_empty() || t.starts_with('<') {
             continue;
         }
-        return Some(sanitize_summary(t));
+        return (sanitize_summary(t), cwd);
     }
-    None
+    (String::new(), cwd)
 }
 
 /// 提取 user 消息 content 文本：`"str"` 直接取；blocks 数组取 text 块拼接
@@ -161,9 +212,12 @@ mod tests {
         p
     }
 
-    /// 写一个会话 jsonl（lines 为原始 JSON 行）。
+    /// 写一个会话 jsonl（lines 为原始 JSON 行）。落到主候选（仅 `/` → `-`，
+    /// 本机实测规则）目录下。
     fn write_session(root: &Path, workdir: &Path, id: &str, lines: &[String]) {
-        let dir = root.join("projects").join(encode_project_dir(workdir));
+        let dir = root
+            .join("projects")
+            .join(workdir.to_string_lossy().replace('/', "-"));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(format!("{id}.jsonl")), lines.join("\n") + "\n").unwrap();
     }
@@ -177,12 +231,59 @@ mod tests {
         .to_string()
     }
 
+    /// 带 cwd 的 user 行（P5-15：真实 jsonl 每行带 cwd 字段）。
+    fn line_with_cwd(wd: &Path, text: &str) -> String {
+        serde_json::json!({
+            "type": "user",
+            "cwd": wd.to_string_lossy(),
+            "message": { "role": "user", "content": text }
+        })
+        .to_string()
+    }
+
+    /// P5-15：候选编码联合扫描 + cwd 提取 + 歧义去重。
+    #[test]
+    fn candidates_union_scan_and_cwd_extracted() {
+        let root = tmp_root("cand");
+        // 含 `.` 的 workdir：主候选（仅 / → -）与 dots 候选（/._ → -）目录不同。
+        let wd = Path::new("/tmp/proj.x");
+        write_session(&root, wd, "s1", &[line_with_cwd(wd, "主线会话")]);
+        let alt_dir = root.join("projects").join("-tmp-proj-x");
+        std::fs::create_dir_all(&alt_dir).unwrap();
+        std::fs::write(alt_dir.join("s2.jsonl"), line_with_cwd(wd, "候选会话")).unwrap();
+
+        let list = list_local_sessions(&root, wd, 10);
+        let ids: Vec<&str> = list.iter().map(|s| s.session_id.as_str()).collect();
+        assert!(
+            ids.contains(&"s1") && ids.contains(&"s2"),
+            "两个候选目录应联合可见: {ids:?}"
+        );
+        assert!(
+            list.iter().all(|s| s.cwd.as_deref() == Some("/tmp/proj.x")),
+            "cwd 应从 jsonl 提取: {list:?}"
+        );
+
+        // 歧义去重：同 session_id 出现在两个候选目录只列一次。
+        std::fs::write(alt_dir.join("s1.jsonl"), line_with_cwd(wd, "dup")).unwrap();
+        let list2 = list_local_sessions(&root, wd, 10);
+        assert_eq!(
+            list2.iter().filter(|s| s.session_id == "s1").count(),
+            1,
+            "跨候选目录同 id 应去重"
+        );
+    }
+
     #[test]
     fn encode_matches_claude_layout() {
-        // 本机实测：/Users/x/Work/imagent → -Users-x-Work-imagent。
-        assert_eq!(
-            encode_project_dir(Path::new("/Users/x/Work/imagent")),
-            "-Users-x-Work-imagent"
+        // 本机实测：/Users/x/Work/imagent → -Users-x-Work-imagent（候选集首元素）。
+        let cands = encode_candidates(Path::new("/Users/x/Work/imagent"));
+        assert_eq!(cands[0], "-Users-x-Work-imagent");
+        // 含 `.` 的路径产生多个不同候选（P5-15 联合扫描）。
+        let cands = encode_candidates(Path::new("/tmp/proj.x"));
+        assert_eq!(cands[0], "-tmp-proj.x");
+        assert!(
+            cands.contains(&"-tmp-proj-x".to_string()),
+            "候选应含 /._ 规则: {cands:?}"
         );
     }
 
@@ -193,7 +294,7 @@ mod tests {
         write_session(&root, wd, "old", &[user_line("old work".into())]);
         std::fs::write(
             root.join("projects")
-                .join(encode_project_dir(wd))
+                .join(wd.to_string_lossy().replace('/', "-"))
                 .join("new.jsonl"),
             user_line("new work".into()),
         )
@@ -271,7 +372,9 @@ mod tests {
         assert!(list_local_sessions(&root, Path::new("/nope"), 10).is_empty());
         // 非 jsonl 文件忽略；损坏行容忍（无摘要但不 panic）。
         let wd = Path::new("/tmp/proj-e");
-        let dir = root.join("projects").join(encode_project_dir(wd));
+        let dir = root
+            .join("projects")
+            .join(wd.to_string_lossy().replace('/', "-"));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("somedir"), b"").unwrap();
         std::fs::write(dir.join("broken.jsonl"), b"not json\n{\"type\":\"user\"").unwrap();

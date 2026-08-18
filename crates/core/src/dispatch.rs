@@ -202,6 +202,8 @@ struct ResumeEntry {
     first_prompt: String,
     /// 本机（电脑端）会话——不在 IM 历史表里的扫描结果；接管时附分叉提示。
     from_local: bool,
+    /// 本机会话记录的工作目录（jsonl cwd；P5-15 接管前校验用）。
+    cwd: Option<String>,
 }
 
 pub struct Dispatcher {
@@ -506,13 +508,36 @@ impl Dispatcher {
                 "chmod permission socket 0600 失败，Ask 权限闭环鉴权减弱"
             );
         }
+        // P5-9b：握手 token——同 uid 进程裸 connect 即可伪造 conv_id 推送审批请求
+        //（P2-7 残余）。token 随机生成并写 <sock_dir>/permission.token（0600），MCP
+        // 子进程（claude 经 --mcp-config spawn）读取后在连接首行回传，不符即丢弃。
+        // 说明：同 uid 进程仍能从文件/env/cmdline 拿到 token，属提高伪造门槛而非
+        // 绝对防护（绝对防护需继承 fd 或抽象命名空间 socket，另行迭代）。
+        let token = format!("imagent-perm:{:032x}", rand::random::<u128>());
+        let token_path = std::path::Path::new(&sock)
+            .parent()
+            .map(|d| d.join("permission.token"))
+            .unwrap_or_else(|| std::path::PathBuf::from("permission.token"));
+        if let Err(e) = std::fs::write(&token_path, &token) {
+            error!(
+                target: "imagent::core",
+                error = %e,
+                ?token_path,
+                "写 permission.token 失败：所有权限请求将因握手失败被拒（fail-closed）"
+            );
+        } else if let Err(e) =
+            std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600))
+        {
+            warn!(target: "imagent::core", error = %e, "chmod permission.token 0600 失败");
+        }
         // R-2：accept task 监听 shutdown（SIGTERM 时停止 accept，原实现永驻）；
         // 每个连接的 handle_permission_socket 纳入 self.tasks，drain 时一并等待。
         let this = self.clone();
+        let expected_token = token;
         tokio::spawn(async move {
             // 鉴权基准：只接受与本进程同 uid 的连接（MCP 子进程由本进程 spawn，必然同 uid）。
-            // P2-7 威胁模型：peer_uid 仅防「跨 uid 伪造」；同 uid 的任何进程仍可 connect
-            // 并伪造 conv_id 推送权限请求。完整防护需 socket 握手 token，留作后续加固。
+            // P2-7/P5-9b 威胁模型：peer_uid 防「跨 uid 伪造」；握手 token 把「同 uid
+            // 裸 connect 伪造 conv_id」的门槛从零提高到需读到 token（见上方注释）。
             let expected_uid = current_uid();
             loop {
                 tokio::select! {
@@ -527,12 +552,14 @@ impl Dispatcher {
                                     let platform = this.platform.clone();
                                     let router = this.router.clone();
                                     let permission_ask_timeout = this.permission_ask_timeout;
+                                    let expected_token = expected_token.clone();
                                     this.tasks.lock().await.spawn(async move {
                                         Self::handle_permission_socket(
                                             stream,
                                             platform,
                                             router,
                                             permission_ask_timeout,
+                                            expected_token,
                                         )
                                         .await;
                                     });
@@ -561,6 +588,30 @@ impl Dispatcher {
                 }
             }
         });
+    }
+
+    /// 读一行权限 socket 报文（15s 超时 + 64KiB 上限）。None = EOF/超时/超长
+    ///（后两者记日志）。
+    #[cfg(unix)]
+    async fn read_socket_line(
+        reader: &mut tokio::io::BufReader<&mut tokio::net::UnixStream>,
+    ) -> Option<String> {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            Self::read_line_capped(reader, 64 * 1024),
+        )
+        .await
+        {
+            Ok(Ok(line)) => line,
+            Ok(Err(e)) => {
+                warn!(target: "imagent::core", error = %e, "permission socket 读行失败/超长");
+                None
+            }
+            Err(_) => {
+                warn!(target: "imagent::core", "permission socket 读行超时（15s）");
+                None
+            }
+        }
     }
 
     /// 读一行（到 `\n`），上限 `max_bytes` 字节，超限返 Err（P1-9：防同 uid 进程
@@ -628,28 +679,29 @@ impl Dispatcher {
         platform: Arc<dyn Platform>,
         router: Arc<PermissionRouter>,
         permission_ask_timeout: std::time::Duration,
+        expected_token: String,
     ) {
-        // 读请求行。reader 在块内 drop 以释放 stream 借用（后续写回需 &mut stream）。
-        let line = {
+        // P5-9b：读两行——首行握手 token、次行 JSON 请求。必须共用一个 BufReader：
+        // 分开建会把第二行的数据吞进被丢弃的缓冲区。reader 在块内 drop 以释放
+        // stream 借用（后续写回需 &mut stream）。
+        let req_line = {
             use tokio::io::BufReader;
             let mut reader = BufReader::new(&mut stream);
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(15),
-                Self::read_line_capped(&mut reader, 64 * 1024),
-            )
-            .await
-            {
-                Ok(Ok(Some(line))) => line,
-                Ok(Ok(None)) => return, // EOF，对端未发即关
-                Ok(Err(e)) => {
-                    warn!(target: "imagent::core", error = %e, "permission socket 读行失败/超长");
-                    return;
-                }
-                Err(_) => {
-                    warn!(target: "imagent::core", "permission socket 读行超时（15s）");
-                    return;
-                }
+            let token_line = Self::read_socket_line(&mut reader).await;
+            let Some(token_line) = token_line else {
+                return; // EOF，对端未发即关
+            };
+            if token_line.trim() != expected_token {
+                warn!(
+                    target: "imagent::core",
+                    "权限 socket 握手 token 不符，丢弃连接（疑似同 uid 伪造）"
+                );
+                return;
             }
+            Self::read_socket_line(&mut reader).await
+        };
+        let Some(line) = req_line else {
+            return; // token 对了但没发请求（EOF/超时/超长已记日志）
         };
         let req: serde_json::Value = match serde_json::from_str(line.trim()) {
             Ok(v) => v,
@@ -839,6 +891,7 @@ impl Dispatcher {
                     session_id: l.session_id,
                     updated_at: l.updated_at,
                     first_prompt: l.first_prompt,
+                    cwd: l.cwd,
                 }
             })
             .collect();
@@ -850,6 +903,7 @@ impl Dispatcher {
                     agent_kind: r.agent_kind.unwrap_or_else(|| backend_name.clone()),
                     first_prompt: String::new(),
                     from_local: false,
+                    cwd: None,
                 });
             }
         }
@@ -1485,6 +1539,34 @@ impl Dispatcher {
                             .await;
                             return;
                         }
+                        // P5-15：本机会话接管前校验 cwd——目录编码冲突（如
+                        // `/a/b-c` 与 `/a/b/c` 同码）或候选误扫时，防止把别的
+                        // 项目的会话接到当前 workdir。cwd 缺失（旧数据/解析不到）
+                        // 不阻塞，仅记录。
+                        if target.from_local {
+                            if let Some(cwd) = target.cwd.as_deref().filter(|s| !s.is_empty()) {
+                                let wd_now = self.resolve_workdir(&conv.0).await;
+                                if std::path::Path::new(cwd) != wd_now {
+                                    warn!(
+                                        target: "imagent::core",
+                                        conv_id = %conv.0,
+                                        session_cwd = %cwd,
+                                        current_workdir = %wd_now.display(),
+                                        "本机会话 cwd 与当前 workdir 不符，拒绝接管"
+                                    );
+                                    self.reply(
+                                        &conv,
+                                        &format!(
+                                            "该会话属于其它目录（{cwd}），当前工作目录是 {}；如确要接管请先 /cd {cwd}",
+                                            wd_now.display()
+                                        ),
+                                        &hint,
+                                    )
+                                    .await;
+                                    return;
+                                }
+                            }
+                        }
                         let now = now_secs();
                         let row = SessionRow {
                             conv_id: conv.0.clone(),
@@ -1682,13 +1764,23 @@ impl Dispatcher {
                                         )),
                                     }
                                 });
+                                // P5-16：注册进 running——/stop 此前中断不了 /compact
+                                //（长摘要生成只能干等 agent_timeout）。conv 锁由本命令
+                                // 持有，注册/移除无 ABA（新轮次须先等锁）。
+                                self.running
+                                    .lock()
+                                    .await
+                                    .insert(conv.0.clone(), join.abort_handle());
                                 let mut summary: Option<String> = None;
                                 while let Some(chunk) = rx.recv().await {
                                     if let AgentChunk::Final(t) = chunk {
                                         summary = Some(t);
                                     }
                                 }
-                                let summary_text = match join.await {
+                                let join_res = join.await;
+                                // 无论成败，先摘除在飞注册（/stop 已抢先摘除时为 no-op）。
+                                self.running.lock().await.remove(&conv.0);
+                                let summary_text = match join_res {
                                     Ok(Ok(o)) => summary.unwrap_or(o.final_text),
                                     Ok(Err(e)) => {
                                         warn!(
@@ -1776,6 +1868,10 @@ impl Dispatcher {
                         let _conv_guard = _conv_lock.lock().await;
                         match self.store.set_config(&workdir_key(&conv.0), arg).await {
                             Ok(_) => {
+                                // P5 快赢：/resume 列表缓存随 workdir 失效——列表按
+                                // conv 当前目录扫描，切目录后旧序号指向的是旧目录的
+                                // 会话（且接管前有 cwd 校验兜底）。
+                                self.resume_cache.lock().await.remove(&conv.0);
                                 self.reply(
                                     &conv,
                                     &format!("✅ 工作目录已切到 {arg}（下条消息生效）"),
@@ -2041,9 +2137,14 @@ impl Dispatcher {
                     "/stop" => {
                         // P4-1：中断该 conv 的在飞 agent 任务。**不取 conv 串行锁**——
                         // 取了会等到任务自然结束才生效（等价于没停）。
-                        // 若正等 IM 权限审批：pending 回复通道 drop → MCP 收 deny
-                        // （fail-closed），agent 侧不悬挂。
+                        // 若正等 IM 权限审批：pending 回复通道被 cancel 以 deny 唤醒 →
+                        // MCP 立即收到 deny（fail-closed），agent 侧不悬挂。
                         self.router.cancel(&conv.0).await;
+                        // P5-16：收敛审批询问本身——把 IM 里滞留的询问卡片 patch 成
+                        // 「已中断」（纯文本询问平台 no-op）。best-effort：失败不阻断中断。
+                        if let Err(e) = self.platform.cancel_permission_ask(&conv).await {
+                            warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "撤回权限询问失败（不影响中断）");
+                        }
                         let running = self.running.lock().await.remove(&conv.0);
                         let aborted = if let Some(h) = &running {
                             // abort → backend.run future drop → 杀子进程：
@@ -4605,6 +4706,7 @@ mod tests {
                 session_id: "pc-9f86d081".to_string(),
                 updated_at: now - 3_600,
                 first_prompt: "修复流式卡片超时问题".to_string(),
+                cwd: None,
             }],
         )
         .await;
@@ -4846,6 +4948,119 @@ mod tests {
         // 全量文本不应作为最终回复再发一遍。
         let dup = inbox.iter().filter(|t| t.contains("答案第一段。")).count();
         assert_eq!(dup, 1, "Final 全量不应重发: {inbox:?}");
+        drop_db(ctx.db).await;
+    }
+
+    /// P5-15：本机会话 cwd 与当前 workdir 不符时拒绝接管（防目录编码冲突串项目）。
+    #[tokio::test]
+    async fn resume_rejects_local_session_cwd_mismatch() {
+        let _serial = SERIAL.lock().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let ctx = build_with_local(
+            Auth::new(vec!["alice".into()]),
+            vec![LocalSession {
+                session_id: "pc-other".to_string(),
+                updated_at: now,
+                first_prompt: "别的项目".to_string(),
+                cwd: Some("/other/project".to_string()),
+            }],
+        )
+        .await;
+        ctx.disp.handle(msg("c1", "alice", "/resume")).await;
+        ctx.disp.handle(msg("c1", "alice", "/resume 1")).await;
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(
+            inbox
+                .iter()
+                .any(|t| t.contains("属于其它目录") && t.contains("/cd")),
+            "cwd 不符应拒绝接管并引导 /cd: {inbox:?}"
+        );
+        // 未接管：session 映射不应变化。
+        assert!(ctx.disp.running.lock().await.is_empty(), "无在飞任务");
+        drop_db(ctx.db).await;
+    }
+
+    /// P5-9b：权限 socket 握手 token——错 token 连接被丢弃（无询问无回复）；
+    /// 正确 token 的请求触发 IM 询问，cancel 立即唤醒回 deny（P5-16）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn permission_socket_token_handshake() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::new(vec!["alice".into()])).await;
+        let dir = std::env::temp_dir().join(format!("imagent-sock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("permission.sock");
+        ctx.disp
+            .spawn_socket_accept(sock.to_string_lossy().into_owned());
+        // 等 socket 与 token 文件就绪。
+        let token_path = dir.join("permission.token");
+        for _ in 0..400 {
+            if sock.exists() && token_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let token = std::fs::read_to_string(&token_path)
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(!token.is_empty(), "token 应已生成");
+
+        // 错 token：连接被丢弃（不应有询问，也不应有任何回复）。
+        {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            let mut s = tokio::net::UnixStream::connect(&sock).await.unwrap();
+            s.write_all(b"wrong-token\n{\"conv_id\":\"c1\"}\n")
+                .await
+                .unwrap();
+            s.flush().await.unwrap();
+            let _ = s.shutdown().await;
+            let mut buf = String::new();
+            let mut r = tokio::io::BufReader::new(s);
+            let n = tokio::time::timeout(Duration::from_millis(300), r.read_line(&mut buf))
+                .await
+                .unwrap_or(Ok(0))
+                .unwrap_or(0);
+            assert_eq!(n, 0, "错 token 不应有任何回复: {buf}");
+        }
+
+        // 正确 token + 请求 → IM 询问送达；cancel 立即（而非 300s 后）回 deny。
+        {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            let mut s = tokio::net::UnixStream::connect(&sock).await.unwrap();
+            s.write_all(format!("{token}\n").as_bytes()).await.unwrap();
+            s.write_all(
+                b"{\"conv_id\":\"c1\",\"tool_name\":\"Bash\",\"input\":{\"cmd\":\"ls\"}}\n",
+            )
+            .await
+            .unwrap();
+            s.flush().await.unwrap();
+            let mut asked = false;
+            for _ in 0..400 {
+                if ctx
+                    .inbox
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|t| t.contains("请求执行"))
+                {
+                    asked = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(asked, "正确 token 的请求应触发 IM 询问");
+            ctx.disp.router.cancel("c1").await;
+            let mut buf = String::new();
+            let mut r = tokio::io::BufReader::new(s);
+            let _ = tokio::time::timeout(Duration::from_secs(2), r.read_line(&mut buf)).await;
+            assert!(buf.contains("\"allow\":false"), "cancel 应回 deny: {buf}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
         drop_db(ctx.db).await;
     }
 }

@@ -179,6 +179,18 @@ pub fn render_permission_card(tool_name: &str, input_summary: &str, conv_id: &st
     .to_string()
 }
 
+/// 审批询问的「已中断」终态卡（P5-16：`/stop` 中断任务时把滞留的询问卡 patch 成
+/// 此内容——移除按钮，防止用户对一个已死的任务做审批）。
+pub fn render_permission_card_cancelled(tool_name: &str) -> String {
+    serde_json::json!({
+        "schema": "2.0",
+        "body": { "elements": [
+            { "tag": "markdown", "content": format!("⏹️ `{tool_name}` 的执行询问已随任务中断，无需处理。") }
+        ]}
+    })
+    .to_string()
+}
+
 /// 按 char 截断（避免半截 UTF-8）。
 fn truncate_str(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
