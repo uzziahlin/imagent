@@ -339,6 +339,19 @@ async fn main() -> Result<()> {
             let auth = imagent_core::Auth::with_chats(initial, initial_chats);
             let discovery = auth.is_discovery();
 
+            // P5-7（安全）：群放行 + 管理员为空的组合 = 群内任何成员都具备管理
+            // 能力（/allow /chat /config /perm）。启动期硬告警（不拒启：单用户
+            // 依赖「空=全员可」的既有语义），群部署必须显式设 admin_senders。
+            if config.admin_gap_with_chat_allowlist() {
+                tracing::error!(
+                    target: "imagent",
+                    "⚠️ 安全配置告警：allowed_chats（群放行）非空但 admin_senders 为空——\
+                     被授权群里的任何成员都将具备管理能力（/allow 扩权、/chat 扩群、\
+                     /config /perm 改全局）。请在 config.toml 设置 \
+                     admin_senders = [\"<你的 sender id>\"] 收紧（/whoami 可查 id）。"
+                );
+            }
+
             // 8. dispatcher —— allowed_tools / permission_mode 均以共享句柄注入。
             let tools_handle =
                 std::sync::Arc::new(parking_lot::RwLock::new(config.allowed_tools.clone()));

@@ -209,21 +209,25 @@ impl WeComWsClient {
 
                     match frame.cmd.as_deref() {
                         Some("aibot_msg_callback") => {
-                            // R-6：best-effort 推给 platform。不用 send().await 背压——
-                            // 会卡住 select! 其它分支（含心跳），30s 无心跳被服务端断连。
-                            // channel 满说明消费端跟不上：丢弃 + warn 让可观测（当前架构
-                            // dispatcher recv 不阻塞、spawn 即时，实际难触发；高频触发需
-                            // 增容或审视消费端）。channel 关闭则 return Err 触发重连。
-                            match inbound_tx.try_send(frame) {
-                                Ok(()) => {}
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    warn!(target: "wecom", "入站 channel 满，丢弃回调帧");
-                                }
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                            // R-6：入站回调 best-effort 推给 platform。P5-12：裸
+                            // try_send 满即丢改为 1s 有界背压——消费端短暂抖动不再丢
+                            // 用户消息；但不能无限 await（会饿死 select! 其它分支含
+                            // 心跳，30s 无心跳被服务端断连），持续满 1s 才丢弃 + warn。
+                            match tokio::time::timeout(
+                                Duration::from_secs(1),
+                                inbound_tx.send(frame),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(_)) => {
                                     return Err(imagent_core::CoreError::Platform(
                                         "wecom",
                                         "入站 channel 已关闭（platform 退出）".into(),
                                     ));
+                                }
+                                Err(_) => {
+                                    warn!(target: "wecom", "入站 channel 持续满 1s，丢弃回调帧");
                                 }
                             }
                         }
@@ -233,7 +237,21 @@ impl WeComWsClient {
                             debug!(target: "wecom", cmd = ?frame.cmd, "收到 ack/event 帧");
                         }
                         _ => {
-                            debug!(target: "wecom", cmd = ?frame.cmd, "收到其它帧");
+                            // P5-12：无 cmd 的 ack 帧（如 aibot_send_msg 回执）errcode≠0
+                            // = 发送被服务端拒绝（限流/chatid 非法等）——升级 warn 让
+                            // 可观测（fire-and-forget 架构下 dispatch 无从感知，至少
+                            // 日志可查；req_id 关联重试/报错闭环需真机验证 ack 语义后做）。
+                            if frame.errcode.is_some_and(|c| c != 0) {
+                                warn!(
+                                    target: "wecom",
+                                    req_id = %frame.headers.req_id,
+                                    errcode = frame.errcode,
+                                    errmsg = frame.errmsg.as_deref().unwrap_or(""),
+                                    "出站请求被服务端拒绝（ack errcode≠0）"
+                                );
+                            } else {
+                                debug!(target: "wecom", cmd = ?frame.cmd, "收到其它帧");
+                            }
                         }
                     }
                 }

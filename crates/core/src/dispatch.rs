@@ -2275,6 +2275,8 @@ impl Dispatcher {
         // P5-5：backend 提前学到的 session id（SessionStarted chunk）——中断/失败
         // 路径拿不到 RunOutcome，靠它保住已建立的会话。
         let mut learned_sid: Option<String> = None;
+        // P5-10：非卡片平台已实时推送的 Text 前缀——最终回复只补差量，防重发。
+        let mut streamed_text = String::new();
         loop {
             // P4-6：COT 档位每轮读取（/config 热改对下一轮生效）。
             let cot = *self.cot_detail.read();
@@ -2332,6 +2334,8 @@ impl Dispatcher {
                             .await;
                     } else {
                         // P2-F：中间 Text chunk 实时推 IM（流式体验，而非全部丢弃只发最终 Final）。
+                        // P5-10：累积已推前缀，最终回复据此只补差量。
+                        streamed_text.push_str(&t);
                         self.reply(&conv, &t, &hint).await;
                     }
                 }
@@ -2461,6 +2465,14 @@ impl Dispatcher {
         } else {
             format!("(done, session={})", outcome.session_id.0)
         };
+        // P5-10：非卡片平台已实时推送过 Text 增量——最终回复只补差量，防
+        // codex/gemini/ACP（中间 Text 流式 + Final 全量）整段重发两遍。final 与
+        // 已推前缀不对齐（后端语义异常）时保留全量：宁可偶发重复，不可丢内容。
+        if card.is_none() && !streamed_text.is_empty() {
+            if let Some(rest) = reply.strip_prefix(streamed_text.as_str()) {
+                reply = rest.to_string();
+            }
+        }
         // 工具调用摘要：仅无卡片平台（ilink/wecom）追加文本摘要；卡片平台由 render_card
         // 的折叠面板统一渲染，避免正文与卡片块重复展示工具调用。
         if !tool_calls.is_empty() && card.is_none() && (final_text_is_present || outcome_has_final)
@@ -2486,7 +2498,8 @@ impl Dispatcher {
                 self.platform.as_ref(),
             )
             .await;
-        } else {
+        } else if !reply.is_empty() {
+            // P5-10：流式已推完且无差量、无工具摘要时不发空消息。
             self.reply(&conv, &reply, &hint).await;
         }
 
@@ -2840,6 +2853,9 @@ mod tests {
         /// P5-5：run 开跑即发 SessionStarted chunk（模拟 CLI 首事件带 session id），
         /// 供 /stop 中断路径的 session 持久化测试用。
         announce_session: Option<String>,
+        /// P5-10：流式模式——逐段发 Text，Final/RunOutcome 为全量拼接（模拟
+        /// codex/gemini/ACP「中间 Text + Final 全量」语义，去重测试用）。默认空。
+        stream_texts: Vec<String>,
         /// `list_local_sessions` 返回的本机会话（P4-11 统一 /resume 测试用）。
         local_sessions: Arc<TokioMutex<Vec<LocalSession>>>,
     }
@@ -2858,6 +2874,7 @@ mod tests {
                 terminal: true,
                 slow_ms: 0,
                 announce_session: None,
+                stream_texts: Vec::new(),
                 local_sessions: Arc::new(TokioMutex::new(Vec::new())),
             };
             (b, calls, prompts, order)
@@ -2898,6 +2915,12 @@ mod tests {
             let (mut b, calls, prompts, order) = Self::new();
             b.slow_ms = slow_ms;
             b.announce_session = Some(sid.into());
+            (b, calls, prompts, order)
+        }
+        /// P5-10：流式后端——逐段 Text + Final/RunOutcome 全量（去重测试用）。
+        fn new_streaming(texts: Vec<String>) -> (Self, CallsHandle, PromptsHandle, CounterHandle) {
+            let (mut b, calls, prompts, order) = Self::new();
+            b.stream_texts = texts;
             (b, calls, prompts, order)
         }
         /// `list_local_sessions` 返回固定本机会话列表（P4-11 统一 /resume 测试用）。
@@ -2952,14 +2975,28 @@ mod tests {
             for (tool, input) in tools {
                 let _ = chunks.send(AgentChunk::ToolUse { tool, input }).await;
             }
-            // 发一个 Final chunk。
-            let _ = chunks
-                .send(AgentChunk::Final(format!("reply#{my_order}")))
-                .await;
+            // P5-10：流式模式——逐段 Text，Final/RunOutcome 为全量拼接。
+            let mut full = String::new();
+            for t in &self.stream_texts {
+                full.push_str(t);
+                let _ = chunks.send(AgentChunk::Text(t.clone())).await;
+            }
+            // 发一个 Final chunk（流式模式 = 全量；否则沿用 reply#N 供既有断言）。
+            let final_chunk = if self.stream_texts.is_empty() {
+                format!("reply#{my_order}")
+            } else {
+                full.clone()
+            };
+            let _ = chunks.send(AgentChunk::Final(final_chunk)).await;
 
+            let outcome_final = if self.stream_texts.is_empty() {
+                format!("final-{my_order}")
+            } else {
+                full
+            };
             Ok(crate::types::RunOutcome {
                 session_id: SessionId(format!("sess-{my_order}")),
-                final_text: format!("final-{my_order}"),
+                final_text: outcome_final,
                 terminal: self.terminal,
             })
         }
@@ -3230,6 +3267,36 @@ mod tests {
             vec!["Read".into(), "Edit".into()],
             PermissionMode::Off,
             budgets,
+            CotDetail::Brief,
+            vec![],
+        ));
+
+        Ctx {
+            disp,
+            inbox,
+            send_count,
+            calls,
+            prompts,
+            order,
+            db,
+        }
+    }
+
+    /// P5-10：流式后端（逐段 Text + Final 全量），非卡片平台去重测试用。
+    async fn build_streaming(auth: Auth, texts: Vec<String>) -> Ctx {
+        let (plat, inbox, send_count) = MockPlatform::new();
+        let (back, calls, prompts, order) = MockBackend::new_streaming(texts);
+        let (store, db) = tmp_store().await;
+
+        let disp = Arc::new(Dispatcher::new(
+            Arc::new(plat),
+            Arc::new(back),
+            store,
+            auth,
+            std::path::PathBuf::from("/tmp/imagent-test-ws"),
+            vec!["Read".into(), "Edit".into()],
+            PermissionMode::Off,
+            test_budgets(),
             CotDetail::Brief,
             vec![],
         ));
@@ -4752,6 +4819,33 @@ mod tests {
         // 收尾：中断第二个在飞任务再关库。
         ctx.disp.handle(msg("c1", "alice", "/stop")).await;
         let _ = tokio::time::timeout(Duration::from_secs(5), runner2).await;
+        drop_db(ctx.db).await;
+    }
+
+    /// P5-10：非卡片平台流式 Text 已实时推送——最终回复只补差量，不整段重发
+    /// （codex/gemini/ACP 的「中间 Text + Final 全量」语义此前会推两遍）。
+    #[tokio::test]
+    async fn streamed_text_not_duplicated_on_plain_platform() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build_streaming(
+            Auth::new(vec!["alice".into()]),
+            vec!["答案第一段。".to_string(), "答案第二段。".to_string()],
+        )
+        .await;
+        feed_and_wait(&ctx, vec![msg("c1", "alice", "问题")], 1).await;
+        let inbox = ctx.inbox.lock().await.clone();
+        // 两段流式文本都应实时推送。
+        assert!(
+            inbox.iter().any(|t| t == "答案第一段。"),
+            "应实时推送第一段: {inbox:?}"
+        );
+        assert!(
+            inbox.iter().any(|t| t == "答案第二段。"),
+            "应实时推送第二段: {inbox:?}"
+        );
+        // 全量文本不应作为最终回复再发一遍。
+        let dup = inbox.iter().filter(|t| t.contains("答案第一段。")).count();
+        assert_eq!(dup, 1, "Final 全量不应重发: {inbox:?}");
         drop_db(ctx.db).await;
     }
 }
