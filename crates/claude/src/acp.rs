@@ -143,7 +143,6 @@ struct LongLivedAcp {
 
 /// `run()` → 长驻 task 的单次 prompt 请求。
 struct PromptReq {
-    conv_id: String,
     prompt: String,
     session: Option<String>,
     cwd: std::path::PathBuf,
@@ -195,40 +194,46 @@ impl LongLivedAcp {
                         .send_request(InitializeRequest::new(ProtocolVersion::V1))
                         .block_task()
                         .await?;
-                    let mut sessions: std::collections::HashMap<String, String> =
-                        std::collections::HashMap::new();
+                    // P5-4：会话选择以 req.session（dispatch 从 store 读出的权威值）为
+                    // 准。此前的 per-conv sessions 缓存命中即用、无视 req.session，导致
+                    // /new（store 已删映射）后仍续接旧会话、/resume /switch 接管后仍跑
+                    // 在旧上下文。这里仅跟踪**连接当前已 load 的 session**（同 sid 连续
+                    // 轮次免重复 LoadSession 的纯优化），无 per-conv 状态。
+                    let mut loaded: Option<String> = None;
                     while let Some(req) = prompt_rx.recv().await {
                         let st = StreamState::new(req.chunks.clone());
                         *current_for_main.lock().await = Some(st.clone());
                         let cwd = req.cwd.clone();
-                        let sid = match sessions.get(&req.conv_id).cloned() {
-                            Some(s) => s,
-                            None => match req.session.clone() {
-                                Some(s) => {
-                                    connection
-                                        .send_request(LoadSessionRequest::new(
-                                            s.clone(),
-                                            cwd.clone(),
-                                        ))
-                                        .block_task()
-                                        .await?;
-                                    s
-                                }
-                                None => connection
+                        let sid = match req.session.clone() {
+                            Some(s) if loaded.as_deref() == Some(s.as_str()) => s,
+                            Some(s) => {
+                                connection
+                                    .send_request(LoadSessionRequest::new(
+                                        s.clone(),
+                                        cwd.clone(),
+                                    ))
+                                    .block_task()
+                                    .await?;
+                                loaded = Some(s.clone());
+                                s
+                            }
+                            None => {
+                                let sid = connection
                                     .send_request(NewSessionRequest::new(cwd.clone()))
                                     .block_task()
                                     .await?
                                     .session_id
-                                    .to_string(),
-                            },
+                                    .to_string();
+                                loaded = Some(sid.clone());
+                                sid
+                            }
                         };
-                        // P2-K/P2-3：sessions 缓存上限保护——达到上限不再 insert（避免
-                        // clear() 清掉活跃 conv 的 sessionId 导致用户上下文丢失；HashMap
-                        // 无序无法清最旧）。超限新 conv 下次 get None 走 NewSession。conv 数
-                        // = IM 用户数有限，超 1000 为极端兜底。
-                        if sessions.len() < 1000 {
-                            sessions.insert(req.conv_id.clone(), sid.clone());
-                        }
+                        // P5-5：session 一经建立/续接即通知 dispatch——被 /stop 或超时
+                        // 中断的轮次拿不到 RunOutcome，靠它落库续接。
+                        let _ = st
+                            .chunks
+                            .send(AgentChunk::SessionStarted(sid.clone()))
+                            .await;
                         let blocks = vec![ContentBlock::Text(TextContent::new(req.prompt.clone()))];
                         let prompt_fut = connection
                             .send_request(PromptRequest::new(
@@ -266,6 +271,11 @@ impl LongLivedAcp {
                                 break;
                             }
                         }
+                        // P5-6：turn 结束即清 current。StreamState 持有 chunks sender 的
+                        // 克隆，残留会让 dispatch 的 chunk 循环等不到通道关闭，挂到空闲
+                        // 看门狗才退出——此前每轮回复被拖满 agent_idle_timeout。
+                        // （cancel 分支 break 跳过此处，但连接随之销毁，sender 一并释放。）
+                        *current_for_main.lock().await = None;
                     }
                     Ok(())
                 })
@@ -291,7 +301,7 @@ impl Backend for AcpBackend {
 
     async fn run(
         &self,
-        conv_id: &str,
+        _conv_id: &str,
         prompt: &str,
         session: Option<&SessionId>,
         workdir: &std::path::Path,
@@ -317,7 +327,6 @@ impl Backend for AcpBackend {
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
         ll.prompt_tx
             .send(PromptReq {
-                conv_id: conv_id.to_string(),
                 prompt: prompt.to_string(),
                 session: session.map(|s| s.0.clone()),
                 cwd: workdir.to_path_buf(),

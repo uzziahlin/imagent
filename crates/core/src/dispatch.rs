@@ -331,6 +331,15 @@ impl Dispatcher {
         admins.is_empty() || admins.iter().any(|a| a.trim() == trimmed)
     }
 
+    /// P5-1（安全）：审批回复的发送者须过白名单（sender OR 会话白名单——与
+    /// handle() 的鉴权门完全一致）。审批路由发生在 handle() **之前**，天然绕过
+    /// 其鉴权；不加此门，群聊里非白名单成员发一条 "y" 即可批准 Bash 等高危工具，
+    /// 发任意文本则被当 deny 吞掉。飞书审批按钮回调携带 operator open_id 作
+    /// sender，同一门槛覆盖按钮路径。
+    fn can_route_permission_reply(&self, msg: &InboundMessage) -> bool {
+        self.auth.is_allowed(&msg.sender) || self.auth.is_chat_allowed(&msg.conv_id.0)
+    }
+
     /// SIGHUP 热重载：整体替换 allowed_tools。
     pub fn reload_tools(&self, tools: Vec<String>) {
         *self.allowed_tools.write() = tools;
@@ -400,9 +409,13 @@ impl Dispatcher {
                         // remove+send），避免旧 has_pending→route 两次 lock 间隙被超时
                         // 清理（P1-8 cancel）击穿，导致 "yes" 误走 fallforward 当新 prompt。
                         // 斜杠命令不消费（/stop 在等审批时也要可执行），空文本（纯媒体）
-                        // 同样不消费。
+                        // 同样不消费。P5-1：发送者须过白名单才可被消费（防群聊陌生人
+                        // 用 "y" 批准权限请求）；未过门的消息落到 handle() 走正常鉴权
+                        // 丢弃路径。
                         let text = msg.text.as_deref().unwrap_or("");
-                        if is_permission_reply_candidate(text) {
+                        if is_permission_reply_candidate(text)
+                            && self.can_route_permission_reply(&msg)
+                        {
                             let reply = parse_reply(text);
                             if self.router.route(&conv_id, reply).await {
                                 continue;
@@ -853,6 +866,71 @@ impl Dispatcher {
         }
     }
 
+    /// P5-5：中断/失败路径保住 backend 已学到（`SessionStarted`）的 session id。
+    ///
+    /// agent 可能在被 abort 前已建立新会话（如首轮任务跑了几分钟被 /stop 打断、
+    /// 或正常完成但无最终文本被 backend 判 Err）——RunOutcome 拿不到，不落库则
+    /// 下条消息静默开新会话，用户感知为「agent 失忆」。仅当学到的 id 非空且与本轮
+    /// 传入的不同时写（相同 = 续接既有会话，映射未变）；失败仅 log 不影响回复。
+    async fn persist_learned_session(
+        &self,
+        conv: &ConvId,
+        existing: Option<&str>,
+        learned: &Option<String>,
+    ) {
+        let Some(sid) = learned.as_deref().filter(|s| !s.is_empty()) else {
+            return;
+        };
+        if Some(sid) == existing {
+            return;
+        }
+        let now = now_secs();
+        let active_name = self
+            .store
+            .get_config(&active_name_key(&conv.0))
+            .await
+            .unwrap_or(None)
+            .filter(|s| !s.is_empty());
+        let workdir = self
+            .resolve_workdir(&conv.0)
+            .await
+            .to_string_lossy()
+            .to_string();
+        let row = SessionRow {
+            conv_id: conv.0.clone(),
+            session_id: sid.to_string(),
+            agent_kind: self.backend.name().to_string(),
+            workdir: workdir.clone(),
+            name: active_name.clone(),
+            created_at: now,
+            updated_at: now,
+        };
+        if let Err(e) = self.store.upsert_session(&row).await {
+            warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "中断路径 upsert_session 失败");
+            return;
+        }
+        if let Some(name) = active_name {
+            let nrow = NamedSessionRow {
+                conv_id: conv.0.clone(),
+                name,
+                session_id: sid.to_string(),
+                agent_kind: Some(self.backend.name().to_string()),
+                workdir: Some(workdir),
+                created_at: now,
+                updated_at: now,
+            };
+            if let Err(e) = self.store.upsert_named_session(&nrow).await {
+                warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "中断路径 upsert_named_session 失败");
+            }
+        }
+        info!(
+            target: "imagent::core",
+            conv_id = %conv.0,
+            session_id = %sid,
+            "中断/失败路径已持久化 backend 学到的 session id（下条消息续接）"
+        );
+    }
+
     /// 处理单条消息。内部任何错误都 log 并吞掉，不影响主循环。
     async fn handle(&self, msg: InboundMessage) {
         let conv = msg.conv_id.clone();
@@ -971,6 +1049,14 @@ impl Dispatcher {
                         return;
                     }
                     "/disallow" => {
+                        // P5-3（安全）：撤销白名单成员影响全局授权——此前无 admin 门槛，
+                        // 任何过门用户（含群内陌生成员）可把管理员本人踢出白名单（DoS）。
+                        // 与 /allow 的门槛对称。
+                        if !self.is_admin(&sender.0) {
+                            self.reply(&conv, "仅管理员（admin_senders）可撤销授权。", &hint)
+                                .await;
+                            return;
+                        }
                         let target = parts.get(1).map(|s| s.trim()).unwrap_or("");
                         if target.is_empty() {
                             self.reply(&conv, "用法: /disallow <sender_id>", &hint)
@@ -1924,6 +2010,13 @@ impl Dispatcher {
                             .await;
                             return;
                         }
+                        // P5-2（安全）：权限模式影响全局审批策略（热切 off 即拆掉 IM
+                        // 审批闭环），与 /config 同级敏感，须管理员。
+                        if !self.is_admin(&sender.0) {
+                            self.reply(&conv, "仅管理员（admin_senders）可修改权限模式。", &hint)
+                                .await;
+                            return;
+                        }
                         match arg {
                             "off" | "allow" | "deny" | "ask" => {
                                 let mode = PermissionMode::from_str_lossy(arg);
@@ -2129,6 +2222,12 @@ impl Dispatcher {
         let prompt_owned = prompt.clone();
         let conv_id_owned = conv.0.clone();
         let agent_timeout = self.agent_timeout;
+        // P5-5：本轮传入的 session 快照（与落库用 workdir 快照）——中断/失败分支
+        // 走不到下方统一 upsert，需要它们判断「backend 是否已建立新会话」。
+        let existing_sid = existing.as_ref().map(|s| s.0.clone());
+        // 落库 workdir 记本轮实际使用的目录（resolve 后的 per-conv 值），而非
+        // default——/cd 后两才会分叉（P5 修正，与 /resume 的记法对齐）。
+        let workdir_for_row = workdir.to_string_lossy().to_string();
         let join = tokio::spawn(async move {
             let backend_name = backend.name();
             match tokio::time::timeout(
@@ -2173,6 +2272,9 @@ impl Dispatcher {
         // P4-3：空闲看门狗——连续 agent_idle_timeout 无任何 chunk 则 abort（杀子进程）。
         // 等权限审批期间暂停（审批有独立的 permission_ask_timeout 预算兜底）。
         let mut idle_timed_out = false;
+        // P5-5：backend 提前学到的 session id（SessionStarted chunk）——中断/失败
+        // 路径拿不到 RunOutcome，靠它保住已建立的会话。
+        let mut learned_sid: Option<String> = None;
         loop {
             // P4-6：COT 档位每轮读取（/config 热改对下一轮生效）。
             let cot = *self.cot_detail.read();
@@ -2200,6 +2302,12 @@ impl Dispatcher {
                 }
             };
             match chunk {
+                AgentChunk::SessionStarted(sid) => {
+                    // 仅记录，不产生 IM 输出；正常路径 RunOutcome 仍为权威值。
+                    if learned_sid.as_deref() != Some(sid.as_str()) {
+                        learned_sid = Some(sid);
+                    }
+                }
                 AgentChunk::Final(t) => final_text = Some(t),
                 AgentChunk::Error(e) => error_text = Some(e),
                 AgentChunk::ToolUse { tool, input } => {
@@ -2260,6 +2368,11 @@ impl Dispatcher {
                 } else {
                     self.reply(&conv, &m, &hint).await;
                 }
+                // P5-5：失败路径保住已学到的 session id——部分失败轮次（如正常完成
+                // 但无最终文本被 backend 判 Err）会话本身是好的，落库后下条消息
+                // 续接而非静默开新会话。
+                self.persist_learned_session(&conv, existing_sid.as_deref(), &learned_sid)
+                    .await;
                 // conv 锁由 runner 循环持有并统一释放（P1-7 防泄漏语义不变）。
                 return;
             }
@@ -2268,7 +2381,7 @@ impl Dispatcher {
                 METRICS.backend_errors.inc();
                 if idle_timed_out {
                     let m = format!(
-                        "⏱️ agent 已连续 {:?} 无输出，空闲超时终止本轮。本轮输出未保存，会话保持上次成功状态，可重发消息继续。",
+                        "⏱️ agent 已连续 {:?} 无输出，空闲超时终止本轮。已进行到的进度已保留，下条消息将续接（全新开始可 /new）。",
                         *self.agent_idle_timeout.read()
                     );
                     if let Some(c) = card.as_mut() {
@@ -2303,6 +2416,11 @@ impl Dispatcher {
                         .await;
                     }
                 }
+                // P5-5：中断路径保住已学到的 session id（与 Claude Code 自身的中断
+                // 语义一致：中断留在原会话，显式 /new 才重开）。会话进度保留后，
+                // 下条消息续接本轮已进行到的部分。
+                self.persist_learned_session(&conv, existing_sid.as_deref(), &learned_sid)
+                    .await;
                 return;
             }
             Err(e) => {
@@ -2323,6 +2441,8 @@ impl Dispatcher {
                 } else {
                     self.reply(&conv, &m, &hint).await;
                 }
+                self.persist_learned_session(&conv, existing_sid.as_deref(), &learned_sid)
+                    .await;
                 return;
             }
         };
@@ -2408,7 +2528,7 @@ impl Dispatcher {
                 conv_id: conv.0.clone(),
                 session_id: outcome.session_id.0.clone(),
                 agent_kind: self.backend.name().to_string(),
-                workdir: self.default_workdir.to_string_lossy().to_string(),
+                workdir: workdir_for_row.clone(),
                 name: active_name.clone(),
                 created_at: now,
                 updated_at: now,
@@ -2423,7 +2543,7 @@ impl Dispatcher {
                     name: name.clone(),
                     session_id: outcome.session_id.0.clone(),
                     agent_kind: Some(self.backend.name().to_string()),
-                    workdir: Some(self.default_workdir.to_string_lossy().to_string()),
+                    workdir: Some(workdir_for_row.clone()),
                     created_at: now,
                     updated_at: now,
                 };
@@ -2717,6 +2837,9 @@ mod tests {
         terminal: bool,
         /// run 记录后先 sleep 该时长（P4 /stop、批处理、空闲看门狗测试用）。
         slow_ms: u64,
+        /// P5-5：run 开跑即发 SessionStarted chunk（模拟 CLI 首事件带 session id），
+        /// 供 /stop 中断路径的 session 持久化测试用。
+        announce_session: Option<String>,
         /// `list_local_sessions` 返回的本机会话（P4-11 统一 /resume 测试用）。
         local_sessions: Arc<TokioMutex<Vec<LocalSession>>>,
     }
@@ -2734,6 +2857,7 @@ mod tests {
                 fail: false,
                 terminal: true,
                 slow_ms: 0,
+                announce_session: None,
                 local_sessions: Arc::new(TokioMutex::new(Vec::new())),
             };
             (b, calls, prompts, order)
@@ -2764,6 +2888,16 @@ mod tests {
         fn new_slow(slow_ms: u64) -> (Self, CallsHandle, PromptsHandle, CounterHandle) {
             let (mut b, calls, prompts, order) = Self::new();
             b.slow_ms = slow_ms;
+            (b, calls, prompts, order)
+        }
+        /// P5-5：慢后端 + 开跑即 announce session id（/stop 中断保 session 测试用）。
+        fn new_slow_with_session(
+            slow_ms: u64,
+            sid: &str,
+        ) -> (Self, CallsHandle, PromptsHandle, CounterHandle) {
+            let (mut b, calls, prompts, order) = Self::new();
+            b.slow_ms = slow_ms;
+            b.announce_session = Some(sid.into());
             (b, calls, prompts, order)
         }
         /// `list_local_sessions` 返回固定本机会话列表（P4-11 统一 /resume 测试用）。
@@ -2798,6 +2932,11 @@ mod tests {
             let my_order = self.order.fetch_add(1, Ordering::SeqCst);
             self.calls.lock().await.push(session.map(|s| s.0.clone()));
             self.prompts.lock().await.push(prompt.to_string());
+
+            // P5-5：开跑即 announce（模拟 CLI 首事件带 session id）。
+            if let Some(sid) = &self.announce_session {
+                let _ = chunks.send(AgentChunk::SessionStarted(sid.clone())).await;
+            }
 
             // 稍微让出调度器，便于测试串行。
             tokio::task::yield_now().await;
@@ -3044,6 +3183,42 @@ mod tests {
     async fn build_slow(auth: Auth, slow_ms: u64, budgets: TaskBudgets) -> Ctx {
         let (plat, inbox, send_count) = MockPlatform::new();
         let (back, calls, prompts, order) = MockBackend::new_slow(slow_ms);
+        let (store, db) = tmp_store().await;
+
+        let disp = Arc::new(Dispatcher::new(
+            Arc::new(plat),
+            Arc::new(back),
+            store,
+            auth,
+            std::path::PathBuf::from("/tmp/imagent-test-ws"),
+            vec!["Read".into(), "Edit".into()],
+            PermissionMode::Off,
+            budgets,
+            CotDetail::Brief,
+            vec![],
+        ));
+
+        Ctx {
+            disp,
+            inbox,
+            send_count,
+            calls,
+            prompts,
+            order,
+            db,
+        }
+    }
+
+    /// P5-5：与 build_slow 相同，但慢后端开跑即 announce session id
+    /// （/stop 中断保 session 测试用）。
+    async fn build_slow_with_session(
+        auth: Auth,
+        slow_ms: u64,
+        sid: &str,
+        budgets: TaskBudgets,
+    ) -> Ctx {
+        let (plat, inbox, send_count) = MockPlatform::new();
+        let (back, calls, prompts, order) = MockBackend::new_slow_with_session(slow_ms, sid);
         let (store, db) = tmp_store().await;
 
         let disp = Arc::new(Dispatcher::new(
@@ -4430,6 +4605,153 @@ mod tests {
                 .any(|t| t.contains("序号无效") && t.contains("/resume")),
             "未列过表应引导先看列表: {inbox:?}"
         );
+        drop_db(ctx.db).await;
+    }
+
+    // ---------- P5 第一批：安全 + 中断续接 ----------
+
+    /// P5-1：审批回复候选消息的发送者须过白名单才可被路由消费——审批路由发生在
+    /// handle() 鉴权之前，不过门则群聊里非白名单成员发 "y" 即可批准权限请求。
+    #[tokio::test]
+    async fn permission_reply_gate_checks_sender() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build(Auth::with_chats(
+            vec!["alice".into()],
+            vec!["c-group".into()],
+        ))
+        .await;
+        // 白名单 sender：可路由。
+        assert!(ctx
+            .disp
+            .can_route_permission_reply(&msg("c1", "alice", "y")));
+        // 非白名单 sender 且会话未授权：不得消费。
+        assert!(
+            !ctx.disp.can_route_permission_reply(&msg("c1", "bob", "y")),
+            "非白名单 sender 的审批回复不得被路由"
+        );
+        // 会话（群）白名单放行：群内成员可路由（与 handle() 的鉴权门一致）。
+        assert!(ctx
+            .disp
+            .can_route_permission_reply(&msg("c-group", "stranger", "y")));
+        drop_db(ctx.db).await;
+    }
+
+    /// P5-2：/perm 修改权限模式须管理员；查看（只读）不受限。
+    #[tokio::test]
+    async fn perm_switch_requires_admin() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build_with_admin(
+            Auth::new(vec!["alice".into(), "bob".into()]),
+            vec!["alice".into()],
+        )
+        .await;
+        // 非管理员切换 → 拒绝且模式不变。
+        ctx.disp.handle(msg("c1", "bob", "/perm allow")).await;
+        assert!(
+            !matches!(*ctx.disp.permission_mode.read(), PermissionMode::Allow),
+            "非管理员不得切换权限模式"
+        );
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(
+            inbox.iter().any(|t| t.contains("仅管理员")),
+            "应回拒绝提示: {inbox:?}"
+        );
+        drop(inbox);
+        // 查看（只读）不受限。
+        ctx.disp.handle(msg("c1", "bob", "/perm")).await;
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(
+            inbox.iter().any(|t| t.contains("当前权限模式")),
+            "查看模式应放行: {inbox:?}"
+        );
+        drop(inbox);
+        // 管理员切换成功。
+        ctx.disp.handle(msg("c1", "alice", "/perm allow")).await;
+        assert!(matches!(
+            *ctx.disp.permission_mode.read(),
+            PermissionMode::Allow
+        ));
+        drop_db(ctx.db).await;
+    }
+
+    /// P5-3：/disallow 须管理员——此前任何过门用户可把管理员本人踢出白名单。
+    #[tokio::test]
+    async fn disallow_requires_admin() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build_with_admin(
+            Auth::new(vec!["alice".into(), "bob".into(), "carol".into()]),
+            vec!["alice".into()],
+        )
+        .await;
+        // 非管理员 bob 踢 carol → 拒绝，carol 仍在白名单。
+        ctx.disp.handle(msg("c1", "bob", "/disallow carol")).await;
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(
+            inbox.iter().any(|t| t.contains("仅管理员")),
+            "应回拒绝提示: {inbox:?}"
+        );
+        drop(inbox);
+        assert!(
+            ctx.disp.auth.is_allowed(&UserId("carol".into())),
+            "carol 应仍在白名单"
+        );
+        // 管理员 alice 撤销成功。
+        ctx.disp.handle(msg("c1", "alice", "/disallow carol")).await;
+        assert!(
+            !ctx.disp.auth.is_allowed(&UserId("carol".into())),
+            "carol 应已被移除"
+        );
+        drop_db(ctx.db).await;
+    }
+
+    /// P5-5：首轮任务被 /stop 中断，但 backend 已 announce 的 session id 应落库——
+    /// 下条消息续接该会话，而非静默开新会话（"失忆"）。
+    #[tokio::test]
+    async fn stop_persists_learned_session() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build_slow_with_session(
+            Auth::new(vec!["alice".into()]),
+            60_000,
+            "sess-learned",
+            test_budgets(),
+        )
+        .await;
+        // 首条消息起飞（backend 记录后即挂起，但已 announce sess-learned）。
+        // handle 内联等整轮，慢后端须 spawn 驱动（同 stop_aborts_running_task）。
+        let disp = ctx.disp.clone();
+        let runner = tokio::spawn(async move {
+            disp.handle(msg("c1", "alice", "first")).await;
+        });
+        assert!(wait_registered(&ctx, "c1").await, "任务应注册在飞");
+        // /stop 中断。
+        ctx.disp.handle(msg("c1", "alice", "/stop")).await;
+        let done = tokio::time::timeout(Duration::from_secs(5), runner).await;
+        assert!(done.is_ok(), "被中断的 runner 应很快退出");
+        // persist 在轮次结束（running 移除）之前完成，此处应已观察到。
+        assert!(
+            !ctx.disp.running.lock().await.contains_key("c1"),
+            "在飞注册应清空"
+        );
+        // 下条消息：应续接学到的 sess-learned（而非 None 开新会话）。
+        let disp = ctx.disp.clone();
+        let runner2 = tokio::spawn(async move {
+            disp.handle(msg("c1", "alice", "after stop")).await;
+        });
+        for _ in 0..400 {
+            if ctx.calls.lock().await.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let calls = ctx.calls.lock().await.clone();
+        assert_eq!(
+            calls.last(),
+            Some(&Some("sess-learned".to_string())),
+            "中断后下条消息应续接学到的 session: {calls:?}"
+        );
+        // 收尾：中断第二个在飞任务再关库。
+        ctx.disp.handle(msg("c1", "alice", "/stop")).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), runner2).await;
         drop_db(ctx.db).await;
     }
 }
