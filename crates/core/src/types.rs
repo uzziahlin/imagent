@@ -93,6 +93,10 @@ pub struct LocalSession {
     pub updated_at: i64,
     /// 首条用户消息摘要（帮助用户辨认会话；可为空）。
     pub first_prompt: String,
+    /// 会话记录的工作目录（claude jsonl 行内 cwd 字段；解析不到为 None）——
+    /// `/resume` 接管前校验：目录编码冲突（如 `/a/b-c` 与 `/a/b/c` 同码）时
+    /// 防止把别的项目的会话接到当前 workdir（P5-15）。
+    pub cwd: Option<String>,
 }
 
 /// 流式卡片的抽象内容（平台无关）。core dispatch 累积 agent 输出成此结构，

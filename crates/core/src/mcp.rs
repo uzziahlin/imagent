@@ -164,6 +164,26 @@ pub async fn ask_via_socket(
     ask_timeout: std::time::Duration,
 ) -> io::Result<PermissionReply> {
     let mut stream = UnixStream::connect(sock).await?;
+    // P5-9b：握手 token——主进程 bind socket 时生成并写 <sock_dir>/permission.token
+    //（0600）。连接首行必须是 token，不符即被丢弃（把同 uid 进程裸 connect 伪造
+    // conv_id 推送审批钓鱼的门槛从零提高到需读到 token）。文件缺失（主进程写
+    // 失败/旧版）按空串发送，主进程侧 fail-closed 拒绝。
+    let token_path = std::path::Path::new(sock)
+        .parent()
+        .map(|d| d.join("permission.token"))
+        .unwrap_or_else(|| std::path::PathBuf::from("permission.token"));
+    let token = std::fs::read_to_string(&token_path)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if token.is_empty() {
+        tracing::warn!(
+            target: "imagent::mcp",
+            ?token_path,
+            "permission.token 缺失，握手将被主进程拒绝（fail-closed）"
+        );
+    }
+    stream.write_all(format!("{token}\n").as_bytes()).await?;
+    stream.flush().await?;
     let req = json!({
         "conv_id": conv_id,
         "tool_name": tool_name,

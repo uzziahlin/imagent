@@ -26,7 +26,8 @@ use imagent_core::{
 use open_lark::{Config, CoreConfig};
 
 use crate::card::{
-    render_card, render_permission_card, render_stream_init_card, stream_body_final, stream_body_md,
+    render_card, render_permission_card, render_permission_card_cancelled, render_stream_init_card,
+    stream_body_final, stream_body_md,
 };
 use crate::client::{
     create_card_entity, download_file, download_image, fetch_bot_open_id, fetch_token, patch_card,
@@ -62,6 +63,9 @@ pub struct FeishuPlatform {
     reconnect: Arc<tokio::sync::Notify>,
     /// 已解析的入站消息 channel，`recv` 直接 await。
     inbound_rx: Arc<Mutex<mpsc::Receiver<InboundMessage>>>,
+    /// P5-16：per-conv 最近一次审批询问卡的 `(message_id, tool_name)`
+    /// （`/stop` 撤回用）。仅记录卡片路径的成功发送；文本询问无句柄，撤回为 no-op。
+    pending_asks: Arc<Mutex<HashMap<String, (String, String)>>>,
 }
 
 impl FeishuPlatform {
@@ -235,6 +239,7 @@ impl FeishuPlatform {
             card_seqs: Arc::new(Mutex::new(HashMap::new())),
             reconnect,
             inbound_rx: Arc::new(Mutex::new(inbound_msg_rx)),
+            pending_asks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -391,6 +396,7 @@ impl Platform for FeishuPlatform {
     /// P4-4：审批询问走「按钮卡片」——点击后飞书推 card.action.trigger，
     /// value 带回 conv + 动作，drain 解析成 text="y"/"n" 复用审批回复路由。
     /// 卡片发送失败（无卡片权限等）降级纯文本（文本失败才向上报错 → dispatch 回 deny）。
+    /// P5-16：成功发出卡片时记录 message_id（`cancel_permission_ask` 撤回用）。
     async fn send_permission_ask(
         &self,
         conv: &ConvId,
@@ -409,13 +415,32 @@ impl Platform for FeishuPlatform {
         let token = self.get_token().await?;
         let card_json = render_permission_card(tool_name, input_summary, &conv.0);
         match send_card_msg(&self.core_config, &token, &receive_id, kind, &card_json).await {
-            Ok(_) => Ok(()),
+            Ok(mid) => {
+                if let Some(mid) = mid {
+                    self.pending_asks
+                        .lock()
+                        .await
+                        .insert(conv.0.clone(), (mid, tool_name.to_string()));
+                }
+                Ok(())
+            }
             Err(e) => {
                 warn!(target: "feishu", error = %e, "审批卡片发送失败，降级纯文本询问");
                 self.send_permission_ask_text(conv, tool_name, input_summary, hint)
                     .await
             }
         }
+    }
+
+    /// P5-16：把该 conv 最近一次审批询问卡 patch 成「已中断」终态（移除按钮，
+    /// 防用户对已中断的任务做审批）。无记录（文本询问/未发过卡）时 no-op。
+    async fn cancel_permission_ask(&self, conv: &ConvId) -> Result<()> {
+        let Some((message_id, tool_name)) = self.pending_asks.lock().await.remove(&conv.0) else {
+            return Ok(());
+        };
+        let card_json = render_permission_card_cancelled(&tool_name);
+        let token = self.get_token().await?;
+        patch_card(&self.core_config, &token, &message_id, &card_json).await
     }
 
     /// 发流式卡片。**句柄前缀分流**（core 无感，两种句柄均原样透传给 update_card）：

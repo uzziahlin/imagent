@@ -21,6 +21,7 @@ mod config;
 pub mod dedup;
 mod dispatch;
 mod error;
+pub mod instance;
 pub mod mcp;
 mod message;
 pub mod metrics;

@@ -111,9 +111,18 @@ impl PermissionRouter {
         }
     }
 
-    /// 清理 pending（P1-8）：超时或 sender drop 时移除残留项，避免 map 累积。
+    /// 清理 pending（P1-8）：移除残留项，避免 map 累积。
+    /// P5-16：移除前先投递 deny（fail-closed）**唤醒等待者**——此前只删 map 项，
+    /// `handle_permission_socket` 里的 receiver 要挂满 permission_ask_timeout
+    /// （默认 300s）才超时返 deny，/stop 的「agent 侧不悬挂」承诺名不副实。
+    /// send 失败 = receiver 已 drop（等待方先超时），无害。
     pub async fn cancel(&self, conv_id: &str) {
-        self.pending.lock().await.remove(conv_id);
+        if let Some(tx) = self.pending.lock().await.remove(conv_id) {
+            let _ = tx.send(PermissionReply {
+                allow: false,
+                message: Some("cancelled（任务被 /stop 中断或审批超时）".into()),
+            });
+        }
     }
 }
 
@@ -135,6 +144,22 @@ mod tests {
         assert!(r.has_pending("conv1").await);
         r.cancel("conv1").await;
         assert!(!r.has_pending("conv1").await);
+    }
+
+    /// P5-16：cancel 唤醒等待者并 fail-closed 回 deny——不再挂满
+    /// permission_ask_timeout 才超时。
+    #[tokio::test]
+    async fn cancel_waits_no_more_denies_waiter() {
+        let r = PermissionRouter::new();
+        let rx = r.register("conv1").await;
+        r.cancel("conv1").await;
+        // 等待者应立即（而非超时后）收到 deny。
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+            .await
+            .expect("cancel 应立即唤醒等待者")
+            .expect("sender 未 drop");
+        assert!(!reply.allow, "cancel 必须 fail-closed deny");
+        assert!(reply.message.unwrap().contains("cancelled"));
     }
 
     #[test]

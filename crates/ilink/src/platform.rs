@@ -116,7 +116,12 @@ impl ILinkPlatform {
                     .set_sync_buf(PLATFORM, &self.account_id, new_buf)
                     .await
                 {
-                    warn!(target: "ilink", error = %e, "set_sync_buf 失败（best-effort）");
+                    // P5-13：游标推进失败升级为致命——此前仅 warn 继续跑，服务端每轮
+                    // 重推同批消息，dedup 窗口（5min）过期后同批被当新消息**重复驱动
+                    // 一轮 agent**（token/成本放大 + 媒体重复落盘）。返回 Err 走 recv
+                    // 的退避重试（本批消息丢弃，下轮重拉由 dedup 吸收，at-least-once
+                    // 语义不变）。
+                    return Err(CoreError::Store(e));
                 }
             }
         }
@@ -630,12 +635,10 @@ fn is_session_expired(msg: &str) -> bool {
     msg.contains("SESSION_EXPIRED") || msg.contains("HTTP 401") || msg.contains("HTTP 403")
 }
 
-/// 媒体目录：`~/.imagent/media/`（0700）。
+/// 媒体目录：`<imagent_home>/media/`（0700；随 profile 隔离——此前写死
+/// `~/.imagent/media`，多 profile 会混存，P5 快赢修正）。
 fn media_dir() -> Result<std::path::PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| {
-        CoreError::Platform("ilink", "cannot resolve home dir for media storage".into())
-    })?;
-    let dir = home.join(".imagent").join("media");
+    let dir = imagent_core::paths::imagent_home().join("media");
     if !dir.exists() {
         std::fs::create_dir_all(&dir)
             .map_err(|e| CoreError::Platform("ilink", format!("create media dir {dir:?}: {e}")))?;
