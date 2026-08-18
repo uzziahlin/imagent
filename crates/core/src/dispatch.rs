@@ -752,9 +752,19 @@ impl Dispatcher {
         // receiver，避免 pending 永驻把后续消息误当回复吞。
         // P1-8：超时/router-drop 分支显式 cancel，移除 pending map 残留。
         let reply: PermissionReply = match tokio::time::timeout(permission_ask_timeout, rx).await {
-            Ok(Ok(r)) => r,
+            Ok(Ok(r)) => {
+                METRICS
+                    .permission_decisions
+                    .with_label_values(&[if r.allow { "allow" } else { "deny" }])
+                    .inc();
+                r
+            }
             Ok(Err(_)) => {
                 router.cancel(&conv_id).await;
+                METRICS
+                    .permission_decisions
+                    .with_label_values(&["dropped"])
+                    .inc();
                 PermissionReply {
                     allow: false,
                     message: Some("permission router dropped".into()),
@@ -762,6 +772,10 @@ impl Dispatcher {
             }
             Err(_elapsed) => {
                 router.cancel(&conv_id).await;
+                METRICS
+                    .permission_decisions
+                    .with_label_values(&["timeout"])
+                    .inc();
                 PermissionReply {
                     allow: false,
                     message: Some(format!(
@@ -1758,10 +1772,18 @@ impl Dispatcher {
                                     .await
                                     {
                                         Ok(res) => res,
-                                        Err(_elapsed) => Err(crate::error::CoreError::Backend(
-                                            backend_name,
-                                            format!("agent run timed out after {agent_timeout:?}"),
-                                        )),
+                                        Err(_elapsed) => {
+                                            METRICS
+                                                .agent_timeouts
+                                                .with_label_values(&["total"])
+                                                .inc();
+                                            Err(crate::error::CoreError::Backend(
+                                                backend_name,
+                                                format!(
+                                                    "agent run timed out after {agent_timeout:?}"
+                                                ),
+                                            ))
+                                        }
                                     }
                                 });
                                 // P5-16：注册进 running——/stop 此前中断不了 /compact
@@ -2345,10 +2367,13 @@ impl Dispatcher {
             .await
             {
                 Ok(res) => res,
-                Err(_elapsed) => Err(crate::error::CoreError::Backend(
-                    backend_name,
-                    format!("agent run timed out after {agent_timeout:?}"),
-                )),
+                Err(_elapsed) => {
+                    METRICS.agent_timeouts.with_label_values(&["total"]).inc();
+                    Err(crate::error::CoreError::Backend(
+                        backend_name,
+                        format!("agent run timed out after {agent_timeout:?}"),
+                    ))
+                }
             }
         });
         // P4-1：注册在飞句柄（/stop 中断用）。runner 持 conv 锁跨轮，同 conv 不可能
@@ -2394,6 +2419,7 @@ impl Dispatcher {
                     Err(_) if self.router.has_pending(&conv.0).await => continue,
                     Err(_) => {
                         idle_timed_out = true;
+                        METRICS.agent_timeouts.with_label_values(&["idle"]).inc();
                         warn!(
                             target: "imagent::core",
                             conv_id = %conv.0,

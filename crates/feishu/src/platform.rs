@@ -318,13 +318,21 @@ fn persist_media(kind: &str, key: &str, bytes: &[u8]) -> Result<String> {
 ///
 /// 提成模块级自由函数——drain task 持有 `Arc<RwLock<…>>` 句柄而无 `&self`，无法调
 /// [`FeishuPlatform::get_token`]，故抽出共用（与发送侧共享同一 lazy 缓存）。
+/// P5：读锁快路径 + 写锁双检——此前每次都直接取写锁且跨网络调用（最坏 30s），
+/// token 刷新期间所有发送/媒体下载被串行阻塞。
 async fn fetch_cached_token(
     token_lock: &Arc<RwLock<Option<(String, Instant)>>>,
     core_config: &CoreConfig,
     app_id: &str,
     app_secret: &str,
 ) -> Result<String> {
+    if let Some((token, fetched_at)) = token_lock.read().await.as_ref() {
+        if fetched_at.elapsed() < TOKEN_TTL {
+            return Ok(token.clone());
+        }
+    }
     let mut cache = token_lock.write().await;
+    // 双检：等写锁期间可能已被并发刷新。
     if let Some((token, fetched_at)) = cache.as_ref() {
         if fetched_at.elapsed() < TOKEN_TTL {
             return Ok(token.clone());
@@ -347,16 +355,36 @@ impl Platform for FeishuPlatform {
         // P4-9：评论线程 conv → 回复云文档评论（每分片一条回复）。
         if let Some((file_token, comment_id)) = comment_target_from_conv(conv) {
             let token = self.get_token().await?;
-            for chunk in split_message(text, FEISHU_TEXT_MAX) {
-                reply_comment(&self.core_config, &token, &file_token, &comment_id, &chunk).await?;
+            let chunks: Vec<String> = split_message(text, FEISHU_TEXT_MAX);
+            let total = chunks.len();
+            for (i, chunk) in chunks.into_iter().enumerate() {
+                // P5：中途失败标明分片序号——用户能感知回复被截断而非静默缺尾。
+                if let Err(e) =
+                    reply_comment(&self.core_config, &token, &file_token, &comment_id, &chunk).await
+                {
+                    return Err(CoreError::Platform(
+                        PLATFORM,
+                        format!("第 {}/{} 片发送失败（回复可能被截断）：{e}", i + 1, total),
+                    ));
+                }
             }
             return Ok(());
         }
         let (receive_id, kind) = receive_target_from_conv(conv)
             .ok_or_else(|| CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0)))?;
-        for chunk in split_message(text, FEISHU_TEXT_MAX) {
+        let chunks: Vec<String> = split_message(text, FEISHU_TEXT_MAX);
+        let total = chunks.len();
+        for (i, chunk) in chunks.into_iter().enumerate() {
             let token = self.get_token().await?;
-            send_text_msg(&self.core_config, &token, &receive_id, kind, &chunk).await?;
+            // P5：同上——分片失败标注序号（此前中途 ? 退出，截断无标记）。
+            if let Err(e) =
+                send_text_msg(&self.core_config, &token, &receive_id, kind, &chunk).await
+            {
+                return Err(CoreError::Platform(
+                    PLATFORM,
+                    format!("第 {}/{} 片发送失败（回复可能被截断）：{e}", i + 1, total),
+                ));
+            }
         }
         Ok(())
     }

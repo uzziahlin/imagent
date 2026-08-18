@@ -212,24 +212,62 @@ async fn cardkit_resp(resp: reqwest::Response, op: &str) -> imagent_core::Result
 ///
 /// `data` 为卡片 JSON **字符串**（官方要求双重编码：外层 JSON + 内层转义字符串）。
 /// 需 `cardkit:card:write` 权限；失败时调用方降级走 raw 卡片（msg: 句柄）。
+/// P5：识别限流类错误（HTTP 429 / 飞书频控业务码 230020）。
+fn is_rate_limited_msg(msg: &str) -> bool {
+    msg.contains("HTTP 429") || msg.contains("code=230020")
+}
+
+/// P5：限流退避重试——500ms → 1s → 2s 最多三次重试，其它错误立即失败。
+/// 仅用于手写 HTTP 路径（流式卡片 PATCH 高频 + 评论回复 + 媒体下载）；SDK 路径
+/// 无 HTTP 状态透传，留待后续。
+macro_rules! retry_on_rate_limit {
+    ($body:expr) => {{
+        let mut delay = std::time::Duration::from_millis(500);
+        loop {
+            match $body.await {
+                Ok(v) => break Ok(v),
+                Err(e) => {
+                    if is_rate_limited_msg(&format!("{e}")) && delay <= std::time::Duration::from_secs(2)
+                    {
+                        tracing::warn!(
+                            target: "feishu",
+                            backoff_ms = delay.as_millis() as u64,
+                            "限流（429/230020），退避后重试"
+                        );
+                        tokio::time::sleep(delay).await;
+                        delay *= 2;
+                        continue;
+                    }
+                    break Err(e);
+                }
+            }
+        }
+    }};
+}
+
 pub async fn create_card_entity(token: &str, card_json: &str) -> imagent_core::Result<String> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("{CARDKIT_BASE}/cards"))
-        .bearer_auth(token)
-        .json(&json!({ "type": "card_json", "data": card_json }))
-        .send()
-        .await
-        .map_err(|e| {
-            imagent_core::CoreError::Platform(PLATFORM, format!("create_card_entity: {e}"))
-        })?;
-    let data = cardkit_resp(resp, "create_card_entity").await?;
-    data.parse::<serde_json::Value>()
-        .ok()
-        .and_then(|v| v.get("card_id").and_then(|c| c.as_str()).map(String::from))
-        .ok_or_else(|| {
-            imagent_core::CoreError::Platform(PLATFORM, "create_card_entity: 响应缺 card_id".into())
-        })
+    retry_on_rate_limit!(async {
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{CARDKIT_BASE}/cards"))
+            .bearer_auth(token)
+            .json(&json!({ "type": "card_json", "data": card_json }))
+            .send()
+            .await
+            .map_err(|e| {
+                imagent_core::CoreError::Platform(PLATFORM, format!("create_card_entity: {e}"))
+            })?;
+        let data = cardkit_resp(resp, "create_card_entity").await?;
+        data.parse::<serde_json::Value>()
+            .ok()
+            .and_then(|v| v.get("card_id").and_then(|c| c.as_str()).map(String::from))
+            .ok_or_else(|| {
+                imagent_core::CoreError::Platform(
+                    PLATFORM,
+                    "create_card_entity: 响应缺 card_id".into(),
+                )
+            })
+    })
 }
 
 /// 流式更新 markdown 组件（全量文本 + 严格递增 sequence，服务端打字机渲染）。
@@ -243,19 +281,21 @@ pub async fn patch_card_element(
     content: &str,
     sequence: i64,
 ) -> imagent_core::Result<()> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .patch(format!(
-            "{CARDKIT_BASE}/cards/{card_id}/elements/{element_id}"
-        ))
-        .bearer_auth(token)
-        .json(&json!({ "content": content, "sequence": sequence }))
-        .send()
-        .await
-        .map_err(|e| {
-            imagent_core::CoreError::Platform(PLATFORM, format!("patch_card_element: {e}"))
-        })?;
-    cardkit_resp(resp, "patch_card_element").await.map(|_| ())
+    retry_on_rate_limit!(async {
+        let client = reqwest::Client::new();
+        let resp = client
+            .patch(format!(
+                "{CARDKIT_BASE}/cards/{card_id}/elements/{element_id}"
+            ))
+            .bearer_auth(token)
+            .json(&json!({ "content": content, "sequence": sequence }))
+            .send()
+            .await
+            .map_err(|e| {
+                imagent_core::CoreError::Platform(PLATFORM, format!("patch_card_element: {e}"))
+            })?;
+        cardkit_resp(resp, "patch_card_element").await.map(|_| ())
+    })
 }
 
 /// 更新卡片配置（结束流式：`settings_json` 传 `{"config":{"streaming_mode":false}}`）。
@@ -267,17 +307,19 @@ pub async fn patch_card_settings(
     settings_json: &str,
     sequence: i64,
 ) -> imagent_core::Result<()> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .patch(format!("{CARDKIT_BASE}/cards/{card_id}/settings"))
-        .bearer_auth(token)
-        .json(&json!({ "settings": settings_json, "sequence": sequence }))
-        .send()
-        .await
-        .map_err(|e| {
-            imagent_core::CoreError::Platform(PLATFORM, format!("patch_card_settings: {e}"))
-        })?;
-    cardkit_resp(resp, "patch_card_settings").await.map(|_| ())
+    retry_on_rate_limit!(async {
+        let client = reqwest::Client::new();
+        let resp = client
+            .patch(format!("{CARDKIT_BASE}/cards/{card_id}/settings"))
+            .bearer_auth(token)
+            .json(&json!({ "settings": settings_json, "sequence": sequence }))
+            .send()
+            .await
+            .map_err(|e| {
+                imagent_core::CoreError::Platform(PLATFORM, format!("patch_card_settings: {e}"))
+            })?;
+        cardkit_resp(resp, "patch_card_settings").await.map(|_| ())
+    })
 }
 
 /// 发送引用卡片实体的 interactive 消息，返回 message_id。
@@ -333,45 +375,55 @@ async fn download_message_resource(
     file_key: &str,
     kind: &str,
 ) -> imagent_core::Result<Vec<u8>> {
-    let base = core_config.base_url().trim_end_matches('/').to_string();
-    let url =
-        format!("{base}/open-apis/im/v1/messages/{message_id}/resources/{file_key}?type={kind}");
-    let client = reqwest::Client::new();
-    let mut resp = client
-        .get(&url)
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| {
+    retry_on_rate_limit!(async {
+        let base = core_config.base_url().trim_end_matches('/').to_string();
+        let url = format!(
+            "{base}/open-apis/im/v1/messages/{message_id}/resources/{file_key}?type={kind}"
+        );
+        let client = reqwest::Client::new();
+        let mut resp = client
+            .get(&url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| {
+                imagent_core::CoreError::Platform(PLATFORM, format!("download resource: {e}"))
+            })?;
+        if resp.status().as_u16() == 429 {
+            // 归一为可被 retry 宏识别的限流标记。
+            return Err(imagent_core::CoreError::Platform(
+                PLATFORM,
+                "download resource: HTTP 429".to_string(),
+            ));
+        }
+        if !resp.status().is_success() {
+            return Err(imagent_core::CoreError::Platform(
+                PLATFORM,
+                format!("download resource: HTTP {}", resp.status()),
+            ));
+        }
+        if let Some(len) = resp.content_length() {
+            if len > MEDIA_MAX_BYTES {
+                return Err(imagent_core::CoreError::Platform(
+                    PLATFORM,
+                    format!("download resource too large: {len} > {MEDIA_MAX_BYTES} bytes"),
+                ));
+            }
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|e| {
             imagent_core::CoreError::Platform(PLATFORM, format!("download resource: {e}"))
-        })?;
-    if !resp.status().is_success() {
-        return Err(imagent_core::CoreError::Platform(
-            PLATFORM,
-            format!("download resource: HTTP {}", resp.status()),
-        ));
-    }
-    if let Some(len) = resp.content_length() {
-        if len > MEDIA_MAX_BYTES {
-            return Err(imagent_core::CoreError::Platform(
-                PLATFORM,
-                format!("download resource too large: {len} > {MEDIA_MAX_BYTES} bytes"),
-            ));
+        })? {
+            if buf.len() as u64 + chunk.len() as u64 > MEDIA_MAX_BYTES {
+                return Err(imagent_core::CoreError::Platform(
+                    PLATFORM,
+                    format!("download resource too large: > {MEDIA_MAX_BYTES} bytes (streamed)"),
+                ));
+            }
+            buf.extend_from_slice(&chunk);
         }
-    }
-    let mut buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = resp.chunk().await.map_err(|e| {
-        imagent_core::CoreError::Platform(PLATFORM, format!("download resource: {e}"))
-    })? {
-        if buf.len() as u64 + chunk.len() as u64 > MEDIA_MAX_BYTES {
-            return Err(imagent_core::CoreError::Platform(
-                PLATFORM,
-                format!("download resource too large: > {MEDIA_MAX_BYTES} bytes (streamed)"),
-            ));
-        }
-        buf.extend_from_slice(&chunk);
-    }
-    Ok(buf)
+        Ok(buf)
+    })
 }
 
 /// 下载用户发来的消息图片，返回二进制（带双重大小上限，见
@@ -522,33 +574,36 @@ pub async fn reply_comment(
     comment_id: &str,
     text: &str,
 ) -> imagent_core::Result<()> {
-    let base = core_config.base_url().trim_end_matches('/').to_string();
-    let url = format!(
-        "{base}/open-apis/drive/v1/files/{file_token}/comments/{comment_id}/replies?user_id_type=open_id"
-    );
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
-        .bearer_auth(token)
-        .json(&serde_json::json!({
-            "content": [{ "type": "text", "text": text }]
-        }))
-        .send()
-        .await
-        .map_err(|e| imagent_core::CoreError::Platform(PLATFORM, format!("reply_comment: {e}")))?;
-    let v: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| imagent_core::CoreError::Platform(PLATFORM, format!("reply_comment: {e}")))?;
-    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-    if code != 0 {
-        let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
-        return Err(imagent_core::CoreError::Platform(
-            PLATFORM,
-            format!("reply_comment: code={code} msg={msg}"),
-        ));
-    }
-    Ok(())
+    retry_on_rate_limit!(async {
+        let base = core_config.base_url().trim_end_matches('/').to_string();
+        let url = format!(
+            "{base}/open-apis/drive/v1/files/{file_token}/comments/{comment_id}/replies?user_id_type=open_id"
+        );
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({
+                "content": [{ "type": "text", "text": text }]
+            }))
+            .send()
+            .await
+            .map_err(|e| {
+                imagent_core::CoreError::Platform(PLATFORM, format!("reply_comment: {e}"))
+            })?;
+        let v: serde_json::Value = resp.json().await.map_err(|e| {
+            imagent_core::CoreError::Platform(PLATFORM, format!("reply_comment: {e}"))
+        })?;
+        let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
+            return Err(imagent_core::CoreError::Platform(
+                PLATFORM,
+                format!("reply_comment: code={code} msg={msg}"),
+            ));
+        }
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------
