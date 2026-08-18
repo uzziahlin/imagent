@@ -2,6 +2,20 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [Unreleased] — P5 第三波：单实例锁 / 握手 token / 游标致命化 / 编码校准 / /stop 收尾 + 六项快赢
+
+（发现与排期见 [P4_ROADMAP](docs/internal/P4_ROADMAP.md) 的 P5 章节。）
+
+### Fixed
+- **P5-9（安全）单实例锁 + 权限 socket 握手 token**：`<imagent_home>/instance.lock`（排他创建 + PID 存活探测，陈旧自动接管；仅 `imagent start` 获取）防双实例互劫持 permission.sock 使 Ask 审批闭环静默失效；socket 连接首行须回传随机握手 token（`permission.token`，0600），同 uid 裸 connect 伪造审批请求的门槛从零提高到需读到 token。**注意：mcp 子命令与主进程须同版本部署（握手协议变为两行）。**
+- **P5-13 ilink 游标推进失败升级为致命**：此前仅 warn 继续，服务端每轮重推同批消息、dedup 窗口（5min）过期后同批消息会**重复驱动一轮 agent**；现在返回 Err 走退避重试（at-least-once 语义不变）。
+- **P5-15 本机会话扫描候选编码联合 + 接管 cwd 校验**：目录编码改为多候选（`/`、`/._`、非字母数字三种规则）联合扫描去重——不再漏扫含 `.`/`_` 的 workdir；`/resume` 接管本机会话前校验 jsonl 记录的 cwd 与当前 workdir 一致，编码冲突（`/a/b-c` vs `/a/b/c`）也不会串项目接管，不符时引导 `/cd`。
+- **P5-16 /stop 收尾三件**：① `PermissionRouter::cancel` 先投递 fail-closed deny 再移除——审批等待方立即收到结果（此前挂满 300s）；② 新增 `Platform::cancel_permission_ask`，飞书把滞留的询问卡片 patch 成「已中断」终态（移除按钮，防对已死任务审批）；③ `/compact` 注册进在飞表，可被 `/stop` 中断。
+- **快赢六项**：`Config::load` 数值边界校验（超时 ≥1、batch_window ≤10s，0 值超时启动期即报错）；配置加载失败改非零退出码（此前 0，systemd 视为成功）；二次 Ctrl-C 立即强退（130）；`/cd` 失效 `/resume` 列表缓存；ilink 媒体目录改走 `imagent_home()`（多 profile 隔离）；飞书媒体下载改手写实现带 Content-Length 预检 + 流式 50MB 上限（此前 SDK 版无上限）。
+
+### Changed
+- workspace 测试 337 passed（新增 8 用例）；clippy 0 warning；fmt clean。P5-14（ACP per-conv 连接）留待真机验证后实施。
+
 ## [Unreleased] — P5 第二波：深度 Review 安全 + 正确性修复（五项）
 
 （发现与排期见 [P4_ROADMAP](docs/internal/P4_ROADMAP.md) 的 P5 章节。）

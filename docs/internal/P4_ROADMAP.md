@@ -177,33 +177,34 @@ profile 跑同一平台会共享凭据条目（后续可加 profile 前缀）；
 | P5-11 | 流式卡片终态更新失败 → 用户永远拿不到结论 | 高 | ✅（文本降级） |
 | P5-12 | wecom 群消息错发单聊 / 入站满丢帧 / ack 错误静默 | 中高 | ✅（保守修） |
 
-### 待排期（安全）
+### 第三批（已修复 ✅，同日）
 
-| # | 问题 | 严重度 |
-|---|---|---|
-| P5-9 | 单实例保护缺失（第二实例删并重 bind permission.sock，第一实例 Ask 闭环静默失效）→ lockfile/PID 互斥；同 uid socket 伪造（已知 P2-7）→ bind 时生成 token、MCP 子进程携带校验 | 中 |
+| # | 问题 | 严重度 | 状态 |
+|---|---|---|---|
+| P5-9 | 双实例互劫持 permission.sock（Ask 闭环静默失效）+ 同 uid 裸 connect 伪造审批 | 中·安全 | ✅（单实例锁 + 握手 token） |
+| P5-13 | ilink 游标推进失败仅 warn → 5min 后同批消息重复驱动 agent | 中高 | ✅ |
+| P5-15 | 项目目录编码歧义（`/a/b-c` 与 `/a/b/c` 同码；`.` `_` 规则未实测） | 中 | ✅（候选联合扫描 + cwd 校验） |
+| P5-16 | /stop 收尾：审批等待者挂 300s、询问卡片滞留可点、/compact 不可中断 | 中 | ✅ |
+| 快赢 | config 数值零校验、加载失败退出码 0、无二次 Ctrl-C、/resume 缓存不随 /cd 失效、ilink 媒体目录写死、feishu 下载无上限 | 中低 | ✅ |
 
 ### 待排期（正确性）
 
 | # | 问题 | 严重度 |
 |---|---|---|
-| P5-13 | ilink 游标推进失败仅 warn → dedup 窗口（5min）过期后同批消息重复驱动 agent。方案：set_sync_buf 失败升级为 Err 走退避重试 | 中高 |
-| P5-14 | ACP 单连接全局串行 + 排队期烧 agent_timeout（A 的长任务让 B 直接超时）。方案：per-conv 长驻连接；timeout 预算从出队起算 | 中高 |
-| P5-15 | claude 项目目录编码歧义：`/`→`-` 使 `/a/b-c` 与 `/a/b/c` 同目录；真实 Claude 编码还处理 `.` `_` 等 → 含这些字符的 workdir 静默扫不到。方案：对照真实布局校准 + 接管前校验 jsonl 内 cwd | 中 |
-| P5-16 | /stop 收尾不完整：cancel 不唤醒已注册的审批等待者（最长挂 300s）、IM 询问卡片不撤回、/compact 未注册进 running 无法被 /stop | 中 |
+| P5-14 | ACP 单连接全局串行 + 排队期烧 agent_timeout（A 的长任务让 B 直接超时）。方案：per-conv 长驻连接；timeout 预算从出队起算。**需真机 claude-agent-acp 验证后实施** | 中高 |
 
 ### 待排期（设计债务 / 体验）
 
-- dispatch.rs 已 4500+ 行（命令解析/会话状态机/批处理/权限/2200 行测试混杂），拆 `commands/` 子模块——后续所有迭代的摩擦来源。
-- 配置零校验：`agent_timeout_secs=0` → 全部瞬时超时（无「0=禁用」语义）、`batch_window_ms` 无上限、workdir 不查存在；config 加载失败退出码 0（systemd 视为成功）。`Config::load` 加下界/上限校验 + 失败改非零退出。
-- 多 profile 隔离泄漏：keyring service 固定 `imagent`（两 profile 互删凭据）→ username 拼 profile 段；ilink 媒体目录写死 `~/.imagent/media` 不读 `IMAGENT_HOME` → 改 `imagent_home()`。
-- 媒体治理：feishu 下载无大小上限（ilink 有 50MB，照抄）+ 两平台媒体目录均无 TTL/LRU 清理（磁盘只增不减）。
+- dispatch.rs 已 4700+ 行（命令解析/会话状态机/批处理/权限/2400 行测试混杂），拆 `commands/` 子模块——后续所有迭代的摩擦来源。
+- keyring 凭据隔离：service 固定 `imagent`（两 profile 互删凭据）→ username 拼 profile 段（ilink 媒体目录已随本批改走 `imagent_home()`）。
+- 媒体目录 TTL/LRU 清理（磁盘只增不减；feishu 下载上限已随本批补齐）。
 - 飞书限流与 token：send/patch 无 429 识别退避（分片中断产生截断回复无标记）；token 刷新持写锁跨 30s 网络（双检锁）+ token 失效错误码不主动清缓存。
 - 存储：`session_history` 无上限增长（仿 audit_log 轮转，per-conv 保 50）；`upsert_session` 两条语句非同事务（包 `unchecked_transaction`）。
 - 可观测性：无 permission approve/deny/timeout 计数、无超时分类；`/health` logged_in 固定查 ilink（feishu/wecom 恒 false 误导）。
-- 优雅退出：无二次 Ctrl-C 强退（grace 大时只能 kill -9）。
 - 能力一致性：codex/gemini 无 `list_local_sessions`（/resume 退化）；ACP Ask 一律 fail-closed 拒绝 + allowed_tools 忽略（接 PermissionRouter 到 session/request_permission）。
-- 小项：`/resume` 缓存不随 `/cd` 失效（旧目录列表误导选择）；`/resume` 选中即消费后序号移位易误选；飞书 card action/comment 解析器无 fuzz target；mdBook 文档站内容陈旧（README 已同步、docs/ 未同步）。
+- 进程崩溃后的孤儿流式卡片仍停在「生成中」（P5-11 只覆盖进程活着时 patch 失败；需持久化卡片句柄 + 启动扫描关流，涉及 store schema）。
+- wecom 出站 ack 完整等待闭环（req_id 关联 oneshot；需真机验证回执语义后设计）。
+- 小项：`/resume` 选中即消费后序号移位易误选（已随本批缓解：/cd 失效缓存 + cwd 校验兜底）；飞书 card action/comment 解析器无 fuzz target；mdBook 文档站内容陈旧（README 已同步、docs/ 未同步）。
 
 ---
 
@@ -303,3 +304,62 @@ dispatch 收集循环累积 `streamed_text`（非卡片平台实时推送的 Tex
 
 **验证**：新增 5 测试（config 组合探测 / 卡片降级 / 流式去重 / 评论 @bot 过滤 /
 wecom 群拒收），全量 329 passed、fmt/clippy 绿。
+
+---
+
+## P5 第三批实现纪要（2026-08-18）
+
+### P5-9 单实例锁 + 权限 socket 握手 token ✅
+
+- **单实例锁**（`core::instance`，`<imagent_home>/instance.lock`）：排他创建 +
+  PID 存活探测（`kill(pid, 0)`：0/EPERM=存活，ESRCH=陈旧接管）。仅 `imagent start`
+  获取（`mcp` 子命令与主进程共存，不加锁）；锁随 File 句柄持有到退出。
+- **握手 token**：dispatcher bind socket 时随机生成，写
+  `<sock_dir>/permission.token`（0600）；`imagent mcp` 连接时读取并作为**首行**
+  回传，不符即丢弃连接（同 uid 裸 connect 伪造 conv_id 推送审批钓鱼的门槛从零
+  提高到需读到 token）。残余：同 uid 进程仍可从文件/env/cmdline 获取 token——
+  提高门槛而非绝对防护（绝对防护需继承 fd 或抽象命名空间 socket）。退出时
+  sock 与 token 文件一并清理。
+- 注意协议变化：mcp ↔ 主进程现在是「token 行 + JSON 行」两行握手，主进程与
+  mcp 子命令须同版本部署。
+
+### P5-13 ilink 游标推进失败升级为致命 ✅
+
+`set_sync_buf` 失败从「warn 继续」改为返回 `Err`——recv 循环退避后重试整轮
+（消息重拉由 dedup 吸收，at-least-once 不变）。此前服务端会每轮重推同批消息，
+dedup 窗口（5min）过期后同批被当新消息**重复驱动一轮 agent**。
+
+### P5-15 目录编码候选联合扫描 + 接管 cwd 校验 ✅
+
+- `encode_candidates`：三个候选（仅 `/`→`-` 本机实测规则；`/._`→`-`；非字母
+  数字→`-`）联合扫描，session_id 去重。编码规则猜错最多扫不到（退化为纯 IM
+  历史），不再漏扫含 `.`/`_` 的 workdir。
+- `LocalSession.cwd`：扫描时从 jsonl 头部提取会话记录的 cwd；`/resume` 接管
+  本机会话前校验 cwd == 当前 workdir，不符拒绝并引导 `/cd`——即使编码冲突把
+  两个项目扫进同一列表，也不会串项目接管。
+
+### P5-16 /stop 收尾三件 ✅
+
+- **cancel 唤醒等待者**：`PermissionRouter::cancel` 移除 pending 前先投递
+  fail-closed deny——审批等待方立即收到结果（此前要挂满 permission_ask_timeout
+  默认 300s）。
+- **询问卡片撤回**：`Platform::cancel_permission_ask`（默认 no-op）；feishu 记录
+  询问卡 message_id，`/stop` 时 patch 成「已中断」终态（移除按钮，防对已死任务
+  审批）；文本询问平台无句柄、滞留无害。
+- **/compact 可中断**：摘要生成任务注册进 `running`（conv 锁持有期间注册/移除
+  无 ABA），`/stop` 生效。
+
+### 快赢六项 ✅
+
+- `Config::load` 数值校验：三个超时 ≥ 1、batch_window_ms ≤ 10s（0 值超时 = 全部
+  瞬时失败，错误前置到启动期）；加载失败非零退出码（此前 0，systemd 视为成功）。
+- 二次 Ctrl-C 强退（130）：优雅退出最长 shutdown_grace，期间操作员不再只能
+  kill -9。
+- `/cd` 清 `/resume` 列表缓存（列表按当前目录扫描，切目录后旧序号指向旧目录）。
+- ilink 媒体目录改走 `imagent_home()`（多 profile 隔离；此前写死 `~/.imagent/media`）。
+- feishu 媒体下载改手写实现：Content-Length 预检 + 流式累计 50MB 上限（同 ilink
+  双重上限；此前 SDK 版全量缓冲无上限）。
+
+**验证**：新增 8 测试（单实例锁 ×3 / cancel 唤醒 / 候选扫描+cwd 提取 / 接管
+cwd 拒绝 / 握手 token 端到端 / config 边界），全量 337 passed、fmt/clippy 绿。
+P5-14（ACP per-conv 连接）留待真机验证后实施。
