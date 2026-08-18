@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use imagent_core::{
     backend_common::{spawn_cli_backend, CliEvent, WRITE_OR_EXEC},
-    AgentChunk, Backend, Result, RunOutcome, SessionId,
+    AgentChunk, Backend, LocalSession, Result, RunOutcome, SessionId,
 };
 use tokio::process::Command;
 use tracing::debug;
@@ -37,6 +37,12 @@ const NAME: &str = "codex";
 impl Backend for CodexBackend {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    /// P5：扫 `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`（session_meta 的
+    /// id + cwd 判定归属），统一 /resume 可接管本机 codex 会话。
+    async fn list_local_sessions(&self, workdir: &std::path::Path) -> Vec<LocalSession> {
+        crate::sessions::scan_for_backend(workdir)
     }
 
     async fn run(

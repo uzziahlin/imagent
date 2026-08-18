@@ -24,10 +24,25 @@ pub(crate) const KEYRING_MARKER_PREFIX: &str = "keyring:";
 /// 单次 keychain 操作的硬超时：超时即判失败、回退明文（避免沙箱/无 GUI 环境挂起）。
 const KEYRING_OP_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// 构造 keyring entry（service 固定 `"imagent"`，username = `"{platform}:{account_id}"`）。
-/// `Entry::new` 仅创建 specifier，不访问 keychain；返回 `None` 表示无可用 backend。
-fn entry(platform: &str, account_id: &str) -> Option<Entry> {
-    Entry::new(KEYRING_SERVICE, &format!("{platform}:{account_id}")).ok()
+/// 构造 keyring entry（service 固定 `"imagent"`）。
+///
+/// P5（profile 隔离）：username = `"{scope}:{platform}:{account_id}"`；`scope` 为空
+/// （无 profile）时保持旧格式 `"{platform}:{account_id}"`——存量部署零迁移。
+fn entry(scope: &str, platform: &str, account_id: &str) -> Option<Entry> {
+    Entry::new(
+        KEYRING_SERVICE,
+        &scoped_username(scope, platform, account_id),
+    )
+    .ok()
+}
+
+/// keyring 用户名：scope 非空前缀一段（空 = 旧格式）。
+fn scoped_username(scope: &str, platform: &str, account_id: &str) -> String {
+    if scope.is_empty() {
+        format!("{platform}:{account_id}")
+    } else {
+        format!("{scope}:{platform}:{account_id}")
+    }
 }
 
 /// 生成写入 SQLite `credentials.blob` 的 marker，表示真凭据在 keyring。
@@ -52,19 +67,25 @@ fn run_with_timeout<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -
 
 /// 尝试把真实 blob 写入 keyring。成功返回 `true`；失败 / 超时 / 无 backend 返回
 /// `false`，调用方应 fallback 明文。
-pub(crate) async fn store_in_keyring(platform: &str, account_id: &str, blob: &str) -> bool {
+pub(crate) async fn store_in_keyring(
+    scope: &str,
+    platform: &str,
+    account_id: &str,
+    blob: &str,
+) -> bool {
     if cfg!(test) {
         return false;
     }
-    let key = format!("{platform}:{account_id}");
-    let (p, a, b) = (
+    let key = scoped_username(scope, platform, account_id);
+    let (s, p, a, b) = (
+        scope.to_string(),
         platform.to_string(),
         account_id.to_string(),
         blob.to_string(),
     );
     // Ok(true)=成功；Ok(false)=失败（有错误信息）；None=超时。
     let res = run_with_timeout(move || -> bool {
-        let Some(e) = entry(&p, &a) else {
+        let Some(e) = entry(&s, &p, &a) else {
             return false;
         };
         e.set_password(&b).is_ok()
@@ -92,12 +113,45 @@ pub(crate) async fn store_in_keyring(platform: &str, account_id: &str, blob: &st
 /// 从 keyring 读取真实 blob。
 /// - `Some(s)`：命中；
 /// - `None`：keyring 中无此条目（`NoEntry`）、超时、或 keychain 不可用。
-pub(crate) async fn load_from_keyring(platform: &str, account_id: &str) -> Option<String> {
+///
+/// P5（profile 隔离）：scoped 键 miss 且 scope 非空时，回退尝试旧的无 profile
+/// 键（迁移过渡期：老凭据还在旧键上）。SQLite marker 不变——它只标记「真值在
+/// keyring」，落在哪个键由 Store 的 scope 决定。
+pub(crate) async fn load_from_keyring(
+    scope: &str,
+    platform: &str,
+    account_id: &str,
+) -> Option<String> {
     if cfg!(test) {
         return None;
     }
-    let key = format!("{platform}:{account_id}");
-    let (p, a) = (platform.to_string(), account_id.to_string());
+    if let Some(s) = load_key_once(scope, platform, account_id).await {
+        return Some(s);
+    }
+    // 过渡期 fallback：scoped 键没有 → 试旧的无 profile 键。
+    if !scope.is_empty() {
+        let hit = load_key_once("", platform, account_id).await;
+        if hit.is_some() {
+            tracing::info!(
+                target: "store",
+                key = %scoped_username(scope, platform, account_id),
+                "scoped keyring 键未命中，回退旧键（下次 login 时会写入 scoped 键）"
+            );
+        }
+        return hit;
+    }
+    None
+}
+
+/// 单键读取（无 fallback）。三态归一：`Some(s)`=命中；`None`=无条目/失败/超时
+///（失败与超时记日志）。
+async fn load_key_once(scope: &str, platform: &str, account_id: &str) -> Option<String> {
+    let key = scoped_username(scope, platform, account_id);
+    let (s, p, a) = (
+        scope.to_string(),
+        platform.to_string(),
+        account_id.to_string(),
+    );
     // 三态：Some(Ok(s))=命中；Some(Err(NoEntry))=无此条目（静默）；Some(Err(other))=失败；None=超时。
     enum KRes {
         Hit(String),
@@ -105,7 +159,7 @@ pub(crate) async fn load_from_keyring(platform: &str, account_id: &str) -> Optio
         Failed,
     }
     let res = run_with_timeout(move || -> KRes {
-        let Some(e) = entry(&p, &a) else {
+        let Some(e) = entry(&s, &p, &a) else {
             return KRes::NoEntry;
         };
         match e.get_password() {
@@ -132,15 +186,34 @@ pub(crate) async fn load_from_keyring(platform: &str, account_id: &str) -> Optio
 }
 
 /// 删除 keyring 条目（P2-10，best-effort）。无条目/不可用静默返回。
-pub(crate) async fn delete_from_keyring(platform: &str, account_id: &str) {
+pub(crate) async fn delete_from_keyring(scope: &str, platform: &str, account_id: &str) {
     if cfg!(test) {
         return;
     }
-    let (p, a) = (platform.to_string(), account_id.to_string());
+    let (s, p, a) = (
+        scope.to_string(),
+        platform.to_string(),
+        account_id.to_string(),
+    );
     let _ = run_with_timeout(move || -> bool {
-        let Some(e) = entry(&p, &a) else {
+        let Some(e) = entry(&s, &p, &a) else {
             return false;
         };
         e.delete_credential().is_ok()
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P5（profile 隔离）：scope 非空拼前缀段；空保持旧格式（存量零迁移）。
+    #[test]
+    fn scoped_username_formats() {
+        assert_eq!(scoped_username("", "ilink", "bot-1"), "ilink:bot-1");
+        assert_eq!(
+            scoped_username("work", "ilink", "bot-1"),
+            "work:ilink:bot-1"
+        );
+    }
 }

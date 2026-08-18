@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 mod backend;
+mod sessions;
 mod stream;
 
 pub use backend::CodexBackend;

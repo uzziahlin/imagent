@@ -173,6 +173,8 @@ async fn main() -> Result<()> {
                 ));
             }
             let store = imagent_store::Store::open(&db_path).await?;
+            // P5：login 写凭据也按 profile 分 keyring 键（与 start 一致）。
+            store.set_keyring_scope(cli.profile.as_deref().unwrap_or(""));
             println!("开始 iLink 扫码登录，请用手机微信扫描终端二维码 …");
             let creds = imagent_ilink::login_flow(&store).await?;
             println!(
@@ -287,6 +289,9 @@ async fn main() -> Result<()> {
             // P1-C：据 config.require_keyring 切换凭据 fail-closed
             // （true = keyring 不可用时拒绝明文落盘；默认 false 向后兼容）。
             store.set_require_keyring(config.require_keyring);
+            // P5：keyring 用户名按 profile 分段——多 profile 同机同平台不再互删
+            // 凭据（读取对旧的无 profile 键 fallback，存量部署零迁移）。
+            store.set_keyring_scope(cli.profile.as_deref().unwrap_or(""));
 
             // 3. platform —— 按 config.platform / CLI 选用 ilink 或 wecom。
             let platform_name =
@@ -395,7 +400,12 @@ async fn main() -> Result<()> {
                                 "metrics_addr 绑定非 loopback 地址：/metrics 与 /health 无鉴权，公网可访问（仅暴露消息计数/会话数等运营指标，不含凭据）。生产环境建议绑 127.0.0.1 或置于反向代理后"
                             );
                         }
-                        spawn_metrics_server(socket, http_store.clone(), start_at);
+                        spawn_metrics_server(
+                            socket,
+                            http_store.clone(),
+                            start_at,
+                            platform_name.to_string(),
+                        );
                         tracing::info!(target: "imagent::ops", addr = %socket, "metrics/health HTTP server listening");
                     }
                     Err(e) => {
@@ -415,6 +425,28 @@ async fn main() -> Result<()> {
                 target: "imagent::ops",
                 "SIGHUP 热重载需要 Unix 信号，当前平台不可用（配置改动需重启生效）"
             );
+
+            // P5：媒体目录 TTL 清理——入站媒体只增不减会撑爆磁盘；启动跑一次 +
+            // 每日循环，删 7 天前的文件（best-effort，失败仅跳过）。
+            tokio::spawn(async {
+                let media = imagent_core::paths::imagent_home().join("media");
+                loop {
+                    let ttl = std::time::Duration::from_secs(7 * 24 * 3600);
+                    let cutoff = std::time::SystemTime::now()
+                        .checked_sub(ttl)
+                        .unwrap_or(std::time::UNIX_EPOCH);
+                    let removed = imagent_core::paths::sweep_media_before(&media, cutoff);
+                    if removed > 0 {
+                        tracing::info!(
+                            target: "imagent::ops",
+                            removed,
+                            "媒体 TTL 清理（7 天前，共 {} 个文件目录）",
+                            media.display()
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
+                }
+            });
 
             // 11. 前台运行 + Ctrl-C
             tracing::info!(
@@ -654,11 +686,22 @@ struct Health {
 struct HttpState {
     store: imagent_store::Store,
     start_at: Instant,
+    /// 实际运行的平台名（P5：/health 的 logged_in 按平台判定）。
+    platform: String,
 }
 
 /// 起 HTTP server（/metrics + /health），独立 tokio task。失败仅 warn。
-fn spawn_metrics_server(addr: SocketAddr, store: imagent_store::Store, start_at: Instant) {
-    let state = HttpState { store, start_at };
+fn spawn_metrics_server(
+    addr: SocketAddr,
+    store: imagent_store::Store,
+    start_at: Instant,
+    platform: String,
+) {
+    let state = HttpState {
+        store,
+        start_at,
+        platform,
+    };
     let app = Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health_handler))
@@ -683,12 +726,20 @@ async fn metrics_handler() -> (StatusCode, String) {
 
 async fn health_handler(State(st): State<HttpState>) -> (StatusCode, Json<Health>) {
     let sessions = st.store.count_sessions().await.unwrap_or(-1);
-    let logged_in = st
-        .store
-        .first_credential("ilink")
-        .await
-        .map(|o| o.is_some())
-        .unwrap_or(false);
+    // P5：logged_in 按实际平台判定——此前固定查 ilink 凭据，feishu/wecom 下恒
+    // false 有误导。feishu 无 store 凭据（app_id + env secret），用环境变量存在性。
+    let logged_in = if st.platform == "feishu" {
+        std::env::var("IMAGENT_FEISHU_APP_SECRET")
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+    } else {
+        let platform = st.platform.clone();
+        st.store
+            .first_credential(&platform)
+            .await
+            .map(|o| o.is_some())
+            .unwrap_or(false)
+    };
     let body = Health {
         logged_in,
         uptime_secs: st.start_at.elapsed().as_secs(),

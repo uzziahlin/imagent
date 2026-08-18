@@ -10,7 +10,8 @@
 use std::sync::LazyLock;
 
 use prometheus::{
-    register_histogram, register_int_counter, Encoder, Histogram, IntCounter, TextEncoder,
+    register_histogram, register_int_counter, register_int_counter_vec, Encoder, Histogram,
+    IntCounter, IntCounterVec, TextEncoder,
 };
 
 /// 全局指标集合。惰性初始化（首次访问即注册到默认 registry）。
@@ -26,6 +27,11 @@ pub struct Metrics {
     pub backend_errors: IntCounter,
     /// `backend.run` 耗时分布（秒）。
     pub backend_duration: Histogram,
+    /// P5：权限审批决策数，label `result` = allow | deny | timeout | dropped。
+    /// （/stop 触发的 fail-closed deny 计入 deny。）
+    pub permission_decisions: IntCounterVec,
+    /// P5：agent 超时分类计数，label `kind` = idle（空闲看门狗）| total（总预算）。
+    pub agent_timeouts: IntCounterVec,
 }
 
 impl Metrics {
@@ -50,6 +56,18 @@ impl Metrics {
                 "backend.run 耗时（秒）"
             )
             .expect("register backend_duration"),
+            permission_decisions: register_int_counter_vec!(
+                "imagent_permission_decisions_total",
+                "权限审批决策数（allow/deny/timeout/dropped）",
+                &["result"]
+            )
+            .expect("register permission_decisions"),
+            agent_timeouts: register_int_counter_vec!(
+                "imagent_agent_timeouts_total",
+                "agent 超时分类（idle=空闲看门狗 / total=总预算）",
+                &["kind"]
+            )
+            .expect("register agent_timeouts"),
         }
     }
 }
@@ -78,6 +96,11 @@ mod tests {
         // 触发惰性初始化并产生一次计数。
         METRICS.messages_in.inc();
         METRICS.backend_calls.inc();
+        METRICS
+            .permission_decisions
+            .with_label_values(&["allow"])
+            .inc();
+        METRICS.agent_timeouts.with_label_values(&["idle"]).inc();
         let out = render();
         assert!(
             out.contains("imagent_messages_in_total"),
@@ -90,6 +113,14 @@ mod tests {
         assert!(
             out.contains("imagent_backend_duration_seconds"),
             "missing backend_duration: {out}"
+        );
+        assert!(
+            out.contains("imagent_permission_decisions_total"),
+            "missing permission_decisions: {out}"
+        );
+        assert!(
+            out.contains("imagent_agent_timeouts_total"),
+            "missing agent_timeouts: {out}"
         );
     }
 }

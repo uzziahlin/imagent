@@ -89,6 +89,10 @@ pub struct Store {
     /// 若为 true，`put_credential` 在 keyring 不可用时拒绝明文落盘（fail-closed）。
     /// 默认 false（headless 明文回退 + warn，向后兼容）。由 main 据 config 设置。
     require_keyring: Arc<AtomicBool>,
+    /// keyring 用户名前缀段（P5：profile 隔离）。空 = 无 profile（username 保持
+    /// `{platform}:{account}` 旧格式，存量部署零迁移）；非空 = `{scope}:{platform}:
+    /// {account}`，读取时对旧键 fallback。由 main 按 `--profile` 设置。
+    keyring_scope: Arc<parking_lot::RwLock<String>>,
 }
 
 impl Store {
@@ -100,7 +104,17 @@ impl Store {
         Ok(Store {
             inner,
             require_keyring: Arc::new(AtomicBool::new(false)),
+            keyring_scope: Arc::new(parking_lot::RwLock::new(String::new())),
         })
+    }
+
+    /// 设置 keyring 用户名的 profile 前缀段（见字段注释；P5 profile 隔离）。
+    pub fn set_keyring_scope(&self, scope: &str) {
+        *self.keyring_scope.write() = scope.trim().to_string();
+    }
+
+    fn scope(&self) -> String {
+        self.keyring_scope.read().clone()
     }
 
     /// 设置是否要求凭据必须入 keyring（true = keyring 不可用时拒绝明文落盘）。
@@ -121,7 +135,9 @@ impl Store {
     pub async fn put_credential(&self, platform: &str, account_id: &str, blob: &str) -> Result<()> {
         let (platform, account_id) = (platform.to_string(), account_id.to_string());
         // keychain I/O 经游离线程 + 超时，失败/超时回退明文（见 credentials 模块）。
-        let keyring_ok = crate::credentials::store_in_keyring(&platform, &account_id, blob).await;
+        let scope = self.scope();
+        let keyring_ok =
+            crate::credentials::store_in_keyring(&scope, &platform, &account_id, blob).await;
         if !keyring_ok && self.require_keyring() {
             CREDENTIAL_KEYRING_REJECTED.inc();
             return Err(StoreError::Other(format!(
@@ -174,8 +190,13 @@ impl Store {
     /// 用于凭据轮换/吊销的清理路径。返回是否删了 SQLite 行。
     pub async fn delete_credential(&self, platform: &str, account_id: &str) -> Result<bool> {
         let (platform, account_id) = (platform.to_string(), account_id.to_string());
-        // best-effort 删 keyring（无条目/不可用静默）。
-        crate::credentials::delete_from_keyring(&platform, &account_id).await;
+        // best-effort 删 keyring（无条目/不可用静默）。scoped 与旧键都尝试，
+        // 防止迁移中途的残留。
+        let scope = self.scope();
+        crate::credentials::delete_from_keyring(&scope, &platform, &account_id).await;
+        if !scope.is_empty() {
+            crate::credentials::delete_from_keyring("", &platform, &account_id).await;
+        }
         let (p, a) = (platform.clone(), account_id.clone());
         let inner = self.inner.clone();
         let removed = blocking_with(inner, move |conn| {
@@ -263,7 +284,8 @@ impl Store {
         account_id: &str,
     ) -> Result<String> {
         if crate::credentials::is_keyring_marker(raw_blob) {
-            match crate::credentials::load_from_keyring(platform, account_id).await {
+            let scope = self.scope();
+            match crate::credentials::load_from_keyring(&scope, platform, account_id).await {
                 Some(real) => Ok(real),
                 None => Err(StoreError::Other(format!(
                     "凭据标记表明真值在 keyring，但读取失败（可能 keychain 被清）：\
@@ -272,7 +294,8 @@ impl Store {
             }
         } else {
             // 明文：懒迁移到 keyring。
-            if crate::credentials::store_in_keyring(platform, account_id, raw_blob).await {
+            let scope = self.scope();
+            if crate::credentials::store_in_keyring(&scope, platform, account_id, raw_blob).await {
                 let marker = crate::credentials::marker_for(platform, account_id);
                 self.update_credential_blob(platform, account_id, &marker)
                     .await?;
@@ -360,7 +383,10 @@ impl Store {
         let inner = self.inner.clone();
         blocking_with(inner, move |conn| {
             let now = now_secs();
-            conn.execute(
+            // P5-store：主表 + 历史侧表同事务——此前两条语句各自 autocommit，中间
+            // 崩溃会漏历史行（/resume 丢会话），且每轮两次独立 fsync。
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
                 "INSERT INTO sessions (conv_id, session_id, agent_kind, workdir, name, created_at, updated_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
                  ON CONFLICT(conv_id) DO UPDATE SET \
@@ -380,12 +406,21 @@ impl Store {
                     now,
                 ],
             )?;
-            conn.execute(
+            tx.execute(
                 "INSERT INTO session_history (conv_id, session_id, agent_kind, created_at, updated_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5) \
                  ON CONFLICT(conv_id, session_id) DO UPDATE SET updated_at = excluded.updated_at",
                 rusqlite::params![row.conv_id, row.session_id, row.agent_kind, now, now],
             )?;
+            // P5-store：session_history per-conv 轮转——保留最近 50 条（调用方
+            // list_session_history 上限 50；此前只增不删，长生命周期部署无限增长）。
+            tx.execute(
+                "DELETE FROM session_history WHERE conv_id = ?1 AND session_id NOT IN \
+                 (SELECT session_id FROM session_history WHERE conv_id = ?1 \
+                  ORDER BY updated_at DESC, rowid DESC LIMIT 50)",
+                rusqlite::params![row.conv_id],
+            )?;
+            tx.commit()?;
             Ok(())
         })
         .await
@@ -1121,6 +1156,45 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// P5-store：session_history per-conv 轮转——保留最近 50 条，最老淘汰，
+    /// 其它 conv 不受影响。
+    #[tokio::test]
+    async fn session_history_rotates_per_conv() {
+        let db = TempDb::new("hist_rot").await;
+        let store = Store::open(&db.path).await.unwrap();
+        let row = |conv: &str, sid: &str| SessionRow {
+            conv_id: conv.into(),
+            session_id: sid.into(),
+            agent_kind: "mock".into(),
+            workdir: "/tmp".into(),
+            name: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        for i in 0..60 {
+            store
+                .upsert_session(&row("c1", &format!("s{i}")))
+                .await
+                .unwrap();
+        }
+        // 另一个 conv 的历史不被 c1 的轮转波及。
+        store.upsert_session(&row("c2", "x1")).await.unwrap();
+        let hist = store.list_session_history("c1", 100).await.unwrap();
+        assert_eq!(hist.len(), 50, "应轮转到 50 条: {hist:?}");
+        assert!(
+            hist.iter().any(|r| r.session_id == "s59"),
+            "最新保留: {hist:?}"
+        );
+        assert!(
+            !hist.iter().any(|r| r.session_id == "s0"),
+            "最老淘汰: {hist:?}"
+        );
+        assert_eq!(
+            store.list_session_history("c2", 100).await.unwrap().len(),
+            1
+        );
     }
 
     #[tokio::test]
