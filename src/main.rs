@@ -405,6 +405,13 @@ async fn main() -> Result<()> {
                             http_store.clone(),
                             start_at,
                             platform_name.to_string(),
+                            // P5-第五批：wecom 凭据来自 config（store 里永远没有），
+                            // /health 按存在性预判定——其余平台 None 走 store/env 动态查。
+                            if platform_name == "wecom" {
+                                Some(config.wecom_bot_id.is_some() && config.wecom_secret.is_some())
+                            } else {
+                                None
+                            },
                         );
                         tracing::info!(target: "imagent::ops", addr = %socket, "metrics/health HTTP server listening");
                     }
@@ -488,18 +495,44 @@ async fn main() -> Result<()> {
         }
         Cmd::Status => {
             let store = imagent_store::Store::open(&db_path).await?;
-            match store.first_credential("ilink").await? {
-                Some((account_id, blob)) => {
-                    let creds: imagent_ilink::Credentials = serde_json::from_str(&blob)
-                        .map_err(|e| anyhow!("凭据解析失败（{account_id}）：{e}"))?;
-                    println!(
-                        "已登录：bot_id={}（account_id={}）",
-                        creds.ilink_bot_id, account_id
-                    );
-                }
-                None => {
-                    println!("未登录（无 iLink 凭据），请先 `imagent login`。");
-                }
+            // P5-第五批：status 也按 profile 分 keyring 键（此前漏设——profile 模式
+            // 下 scoped 键读不到，报误导性错误或显示迁移前旧凭据）。
+            store.set_keyring_scope(cli.profile.as_deref().unwrap_or(""));
+            // 平台以 config 为准（读不到 config 时回退 ilink；status 允许在
+            // login 之前运行，config 可能尚不存在）。
+            let platform_name = imagent_core::Config::default_path()
+                .and_then(|p| imagent_core::Config::load(&p).ok())
+                .map(|c| c.platform)
+                .unwrap_or_else(|| "ilink".to_string());
+            match platform_name.as_str() {
+                // 非扫码平台：凭据在 config/env，不走 store。
+                "wecom" => println!(
+                    "platform=wecom：凭据来自 config 的 wecom_bot_id / wecom_secret"
+                ),
+                "feishu" => println!(
+                    "platform=feishu：凭据来自 config 的 feishu_app_id + 环境变量 IMAGENT_FEISHU_APP_SECRET（当前{}）",
+                    if std::env::var("IMAGENT_FEISHU_APP_SECRET")
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false)
+                    {
+                        "已设置"
+                    } else {
+                        "未设置"
+                    }
+                ),
+                _ => match store.first_credential("ilink").await? {
+                    Some((account_id, blob)) => {
+                        let creds: imagent_ilink::Credentials = serde_json::from_str(&blob)
+                            .map_err(|e| anyhow!("凭据解析失败（{account_id}）：{e}"))?;
+                        println!(
+                            "已登录：bot_id={}（account_id={}）",
+                            creds.ilink_bot_id, account_id
+                        );
+                    }
+                    None => {
+                        println!("未登录（无 iLink 凭据），请先 `imagent login`。");
+                    }
+                },
             }
             let config_path = imagent_core::Config::default_path();
             println!(
@@ -688,6 +721,9 @@ struct HttpState {
     start_at: Instant,
     /// 实际运行的平台名（P5：/health 的 logged_in 按平台判定）。
     platform: String,
+    /// 预计算的 logged_in（P5-第五批：wecom 凭据在 config，store 查不到）。
+    /// None = 按平台动态查（store / env）。
+    logged_in_hint: Option<bool>,
 }
 
 /// 起 HTTP server（/metrics + /health），独立 tokio task。失败仅 warn。
@@ -696,11 +732,13 @@ fn spawn_metrics_server(
     store: imagent_store::Store,
     start_at: Instant,
     platform: String,
+    logged_in_hint: Option<bool>,
 ) {
     let state = HttpState {
         store,
         start_at,
         platform,
+        logged_in_hint,
     };
     let app = Router::new()
         .route("/metrics", get(metrics_handler))
@@ -727,18 +765,21 @@ async fn metrics_handler() -> (StatusCode, String) {
 async fn health_handler(State(st): State<HttpState>) -> (StatusCode, Json<Health>) {
     let sessions = st.store.count_sessions().await.unwrap_or(-1);
     // P5：logged_in 按实际平台判定——此前固定查 ilink 凭据，feishu/wecom 下恒
-    // false 有误导。feishu 无 store 凭据（app_id + env secret），用环境变量存在性。
-    let logged_in = if st.platform == "feishu" {
-        std::env::var("IMAGENT_FEISHU_APP_SECRET")
+    // false 有误导。wecom 凭据在 config（启动时预算入 hint）；feishu 查 env；
+    // ilink 查 store。
+    let logged_in = match st.logged_in_hint {
+        Some(b) => b,
+        None if st.platform == "feishu" => std::env::var("IMAGENT_FEISHU_APP_SECRET")
             .map(|s| !s.trim().is_empty())
-            .unwrap_or(false)
-    } else {
-        let platform = st.platform.clone();
-        st.store
-            .first_credential(&platform)
-            .await
-            .map(|o| o.is_some())
-            .unwrap_or(false)
+            .unwrap_or(false),
+        None => {
+            let platform = st.platform.clone();
+            st.store
+                .first_credential(&platform)
+                .await
+                .map(|o| o.is_some())
+                .unwrap_or(false)
+        }
     };
     let body = Health {
         logged_in,
