@@ -2,6 +2,21 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [Unreleased] — P5 第一波：深度 Review 安全 + 正确性修复（六项）
+
+（全量 review 发现与后续排期见 [P4_ROADMAP](docs/internal/P4_ROADMAP.md) 的 P5 章节。）
+
+### Fixed
+- **P5-1（安全·严重）审批回复路由绕过白名单**：审批回复的消费发生在 `handle()` 鉴权之前——群聊里非白名单成员发一条 "y" 即可批准 Bash 等高危工具、发任意文本被当 deny 吞掉。route 前增加 `can_route_permission_reply` 门槛（sender OR 会话白名单，与 handle() 完全一致）；飞书审批按钮回调携带 operator open_id 作 sender，同一门槛覆盖。
+- **P5-2（安全）/perm 补管理员校验**：此前任何过门用户可把全局权限模式热切成 `off` 拆掉 IM 审批闭环；现与 `/config` 同级须管理员（查看仍开放）。
+- **P5-3（安全）/disallow 补管理员校验**：此前任何过门用户可把管理员本人踢出白名单（DoS）；现与 `/allow` 对称。
+- **P5-4 ACP 会话选择以 req.session 为权威**：删除 per-conv sessions 缓存（命中即用、无视外部传入，导致 `/new` `/resume` `/switch` 在 claude-acp 后端全部失效——以为切了会话实际跑在旧上下文），改为连接级 `loaded` 跟踪（同 sid 连续轮次免重复 LoadSession 的纯优化）。
+- **P5-5 中断/失败路径不再丢 session id（「失忆」修复）**：新增 `AgentChunk::SessionStarted`——backend 一经学到 session id 即通知（CLI 五个学习点 + ACP 建会话后）；`/stop`、空闲超时、backend Err、panic 等拿不到 RunOutcome 的路径，只要学到过非空且与传入不同的 session id 就落库，下条消息续接本轮进度而非静默开新会话（与 Claude Code 自身中断语义一致；显式 `/new` 才重开）。空闲超时文案同步改为「进度已保留，下条消息续接」。顺带修正：落库 workdir 改记 `resolve_workdir` 实际值（原写 default_workdir，`/cd` 后记错）。
+- **P5-6 ACP 每轮回复拖满空闲超时**：长驻 task turn 结束不清共享 `current`（StreamState 持 chunks sender 克隆），dispatch 的 chunk 循环等不到通道关闭、挂到空闲看门狗才退出；现在 turn 结束即清。
+
+### Changed
+- workspace 测试 324 passed（新增 4 用例：审批回复门×1、/perm 管理员×1、/disallow 管理员×1、/stop 中断保 session×1）；clippy 0 warning；fmt clean。ACP 改动需真机冒烟（`cargo test -p imagent-claude -- --ignored acp_e2e`）。
+
 ## [Unreleased] — P4 第三波：统一 /resume——无感接管电脑端 Claude Code 会话
 
 ### Added
