@@ -167,21 +167,26 @@ profile 跑同一平台会共享凭据条目（后续可加 profile 前缀）；
 | P5-5 | 中断/失败路径丢 session id（下轮静默开新会话「失忆」） | 高 | ✅ |
 | P5-6 | ACP turn 结束不清 current（每轮回复拖满 idle_timeout） | 高（连带发现） | ✅ |
 
+### 第二批（已修复 ✅，同日）
+
+| # | 问题 | 严重度 | 状态 |
+|---|---|---|---|
+| P5-7 | 群放行 + admin_senders 空 = 群内全员事实管理员，启动期无任何提示 | 高·安全 | ✅（硬告警） |
+| P5-8 | 飞书评论事件不滤 @bot、不滤 bot 自身（任何评论都驱动 agent） | 高·安全 | ✅ |
+| P5-10 | codex/gemini/ACP 在非卡片平台回复推两遍 | 高 | ✅ |
+| P5-11 | 流式卡片终态更新失败 → 用户永远拿不到结论 | 高 | ✅（文本降级） |
+| P5-12 | wecom 群消息错发单聊 / 入站满丢帧 / ack 错误静默 | 中高 | ✅（保守修） |
+
 ### 待排期（安全）
 
 | # | 问题 | 严重度 |
 |---|---|---|
-| P5-7 | `admin_senders` 默认空 = 全员 admin，与 allowed_chats 群放行组合成提权链（群内任何成员可 /allow 扩权、/config、/chat 横向扩权）。方案：配置了 allowed_chats 且 admins 为空时启动期硬告警或拒绝 | 高 |
-| P5-8 | 飞书评论事件不过滤 @bot（proto.rs parse_comment_event 不看 at 节点）、不过滤 bot 自身（自触发循环风险）→ 任何评论都驱动一轮 agent | 高 |
 | P5-9 | 单实例保护缺失（第二实例删并重 bind permission.sock，第一实例 Ask 闭环静默失效）→ lockfile/PID 互斥；同 uid socket 伪造（已知 P2-7）→ bind 时生成 token、MCP 子进程携带校验 | 中 |
 
 ### 待排期（正确性）
 
 | # | 问题 | 严重度 |
 |---|---|---|
-| P5-10 | codex/gemini/ACP 在非卡片平台（ilink/wecom/评论线程）回复推两遍：中间 Text 实时推 + 最终 final_text 全量再推。方案：非卡片平台记已推文本，最终只补差量 | 高 |
-| P5-11 | 流式卡片无崩溃兜底：进程被 kill / finalize PATCH 持续失败 → 卡片永久「生成中」且用户拿不到结果。方案：finalize 失败降级 send_text 补发 + 超时未终结卡片强制关流 | 高 |
-| P5-12 | wecom 双向静默丢消息（发送 errcode ack 落 debug 被忽略、入站满丢帧）+ 群消息一律当 `wecom:<userid>` 单聊回复错发 | 中高 |
 | P5-13 | ilink 游标推进失败仅 warn → dedup 窗口（5min）过期后同批消息重复驱动 agent。方案：set_sync_buf 失败升级为 Err 走退避重试 | 中高 |
 | P5-14 | ACP 单连接全局串行 + 排队期烧 agent_timeout（A 的长任务让 B 直接超时）。方案：per-conv 长驻连接；timeout 预算从出队起算 | 中高 |
 | P5-15 | claude 项目目录编码歧义：`/`→`-` 使 `/a/b-c` 与 `/a/b/c` 同目录；真实 Claude 编码还处理 `.` `_` 等 → 含这些字符的 workdir 静默扫不到。方案：对照真实布局校准 + 接管前校验 jsonl 内 cwd | 中 |
@@ -247,3 +252,54 @@ disallow_requires_admin / stop_persists_learned_session），全量 324 passed�
 已知限制：ACP 改动无单测覆盖（需真机 claude-agent-acp 冒烟：`cargo test -p
 imagent-claude -- --ignored acp_e2e`）；SessionStarted 与 abort 之间存在极小竞态窗口
 （chunk 未及消费则该轮仍可能丢 session，best-effort）。
+
+---
+
+## P5 第二批实现纪要（2026-08-18）
+
+### P5-7 群放行 + 空管理员组合的启动硬告警 ✅
+
+`Config::admin_gap_with_chat_allowlist()`（config.rs）：`allowed_chats` 非空且
+`admin_senders` 为空即命中。main 启动期 `error!` 级告警（含收紧指引：/whoami 查 id →
+config 设 admin_senders）。不拒启——单用户依赖「空=全员可」的既有语义，硬告警足够
+可观测且不破坏存量部署。
+
+### P5-8 飞书评论 @bot 过滤 + bot 自身过滤 ✅
+
+- `parse_comment_event(payload, bot_open_id)` 新签名：bot id 已知时要求 at 节点命中
+  bot（`user_id`/`open_id` 字段都认，前者是评论载荷的历史命名）**且** sender 非 bot
+  自身（防自回复循环）；bot id 未知时退化为「至少含一个 at 节点」的弱过滤。
+- bot open_id 经 `GET /open-apis/bot/v3/info` 懒取（`client::fetch_bot_open_id`，
+  tenant token 复用既有缓存），drain 首次遇到评论事件时取一次并缓存（open_id 随应用
+  固定）。`proto::is_comment_event` 廉价预判避免对无关事件发起 HTTP。
+- **行为变化**：此前「任何带文字的评论都触发一轮 agent」，现在必须 @bot——文档里
+  已有此约定（README/P4-9 描述），代码终于对齐。
+
+### P5-10 非卡片平台流式文本去重 ✅
+
+dispatch 收集循环累积 `streamed_text`（非卡片平台实时推送的 Text 前缀）；最终回复
+构造后 `strip_prefix` 只补差量——codex/gemini/ACP（中间 Text + Final 全量）不再整段
+重发两遍。前缀不对齐（后端语义异常）时保留全量（宁重复不丢内容）；流式已推完且无
+差量/无摘要时不发空消息。claude-cli 无中间 Text，行为不变。
+
+### P5-11 卡片终态失败降级纯文本 ✅
+
+`CardSession::dispatch_card` 返回成功与否；`finalize` 在终态 patch 失败（网络/限流/
+卡片服务异常）且文本非空时 `platform.send_text` 补发结论——**卡片可以停在「生成中」，
+结论不能丢**。流式阶段（Running）失败不降级（后续 patch 自然重试）。残余：进程崩溃
+后孤儿卡片仍会停在「生成中」（需持久化卡片句柄 + 启动扫描关流，留待排期）。
+
+### P5-12 wecom 三处保守修复 ✅
+
+- **群消息显式拒收**：`parse_msg_callback` 对 `chattype=group` 返回 Err（drain 层
+  warn 可观测）——此前群消息被当 `wecom:<userid>` 单聊处理，回复错发到与发言者的
+  私聊。群聊支持（按群 chatid 收发）留待后续。
+- **入站有界背压**：`try_send` 满即丢改为 1s 超时的 `send().await`——消费端短暂
+  抖动不再丢用户消息；仍不能无限 await（饿死心跳分支会被服务端 30s 断连）。
+- **ack 错误升告**：无 cmd 的 ack 帧 errcode≠0（出站请求被拒：限流/chatid 非法等）
+  从 debug 升级为 warn（带 req_id/errcode/errmsg）。req_id 关联的完整 ack 等待闭环
+  **未做**——需真机验证企微对 aibot_send_msg 的回执语义后再设计（盲做可能因服务端
+  不回 ack 把每次发送拖满超时）。
+
+**验证**：新增 5 测试（config 组合探测 / 卡片降级 / 流式去重 / 评论 @bot 过滤 /
+wecom 群拒收），全量 329 passed、fmt/clippy 绿。
