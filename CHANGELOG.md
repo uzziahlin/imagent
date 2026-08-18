@@ -2,6 +2,20 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [Unreleased] — P5 第二波：深度 Review 安全 + 正确性修复（五项）
+
+（发现与排期见 [P4_ROADMAP](docs/internal/P4_ROADMAP.md) 的 P5 章节。）
+
+### Fixed
+- **P5-7（安全）群放行 + 空管理员组合的启动硬告警**：`allowed_chats` 非空且 `admin_senders` 为空时，被授权群的所有成员都是事实管理员（/allow 扩权、/chat 扩群、/config /perm）。新增 `Config::admin_gap_with_chat_allowlist()` 探测 + main 启动期 error 级告警（含收紧指引）；不拒启以兼容单用户语义。
+- **P5-8（安全）飞书云文档评论须 @bot 才触发**：此前任何带文字的评论都驱动一轮 agent 并回复到别人评论下。`parse_comment_event` 增加 bot id 参数——已知时要求 at 节点命中 bot 且 sender 非 bot 自身（防自回复循环）；bot open_id 经 `GET /bot/v3/info` 懒取缓存（取不到退化为「须含 @」弱过滤）。**行为变化：文档评论现在必须 @bot**。
+- **P5-10 非卡片平台流式回复不再推两遍**：codex/gemini/ACP（中间 Text 流式 + Final 全量）此前在 ilink/wecom/飞书评论线程上整段重发；现累积已推前缀、最终只补差量，流式推完且无差量不发空消息。
+- **P5-11 流式卡片终态失败降级纯文本**：终态 patch（Done/Error）失败时以 `send_text` 补发完整结论——卡片可以停在「生成中」，结论不能丢。残余：进程崩溃后的孤儿卡片（需启动扫描，待排期）。
+- **P5-12 wecom 三处保守修复**：群消息显式拒收（此前被当单聊处理、回复错发到与发言者的私聊）；入站回调满由即丢改为 1s 有界背压（短暂消费抖动不再丢消息，仍护住心跳）；出站 ack errcode≠0 从 debug 升级为 warn（含 req_id，限流/非法 chatid 可查）。
+
+### Changed
+- workspace 测试 329 passed（新增 5 用例）；clippy 0 warning；fmt clean。wecom ack 完整等待闭环未做（需真机验证回执语义）；飞书 @bot 过滤含一次 /bot/v3/info 调用。
+
 ## [Unreleased] — P5 第一波：深度 Review 安全 + 正确性修复（六项）
 
 （全量 review 发现与后续排期见 [P4_ROADMAP](docs/internal/P4_ROADMAP.md) 的 P5 章节。）
