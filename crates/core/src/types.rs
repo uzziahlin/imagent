@@ -63,6 +63,10 @@ pub enum AgentChunk {
     Media {
         path: String,
     },
+    /// backend 已分配/续接的 session id——一经学到尽早通知（P5-5：让 dispatch 在
+    /// /stop、超时、失败等拿不到 RunOutcome 的路径也能落库，下条消息续接而非
+    /// 静默开新会话）。正常路径 RunOutcome 亦携带，此 chunk 仅供提前学习。
+    SessionStarted(String),
     Final(String),
     Error(String),
 }

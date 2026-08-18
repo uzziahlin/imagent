@@ -129,8 +129,10 @@ pub async fn spawn_cli_backend(
         };
         match parse(&line) {
             CliEvent::Session(id) => {
-                if session_id.is_empty() {
-                    session_id = id;
+                if session_id.is_empty() && !id.is_empty() {
+                    session_id.clone_from(&id);
+                    // P5-5：一经学到即通知 dispatch（中断/失败路径也能落库续接）。
+                    let _ = chunks.send(AgentChunk::SessionStarted(id)).await;
                 }
             }
             CliEvent::Text(t) => {
@@ -145,8 +147,9 @@ pub async fn spawn_cli_backend(
                 session,
             } => {
                 if let Some(s) = session {
-                    if session_id.is_empty() {
-                        session_id = s;
+                    if session_id.is_empty() && !s.is_empty() {
+                        session_id.clone_from(&s);
+                        let _ = chunks.send(AgentChunk::SessionStarted(s)).await;
                     }
                 }
                 if let Some(path) = image_write_path(&tool, &input) {
@@ -159,6 +162,9 @@ pub async fn spawn_cli_backend(
             }
             CliEvent::Final { text, session } => {
                 if let Some(s) = session {
+                    if session_id.is_empty() && !s.is_empty() {
+                        let _ = chunks.send(AgentChunk::SessionStarted(s.clone())).await;
+                    }
                     session_id = s;
                 }
                 final_text = text;
@@ -167,6 +173,9 @@ pub async fn spawn_cli_backend(
             }
             CliEvent::Error { text, session } => {
                 if let Some(s) = session {
+                    if session_id.is_empty() && !s.is_empty() {
+                        let _ = chunks.send(AgentChunk::SessionStarted(s.clone())).await;
+                    }
                     session_id = s;
                 }
                 error_text = Some(text);
@@ -174,6 +183,9 @@ pub async fn spawn_cli_backend(
             }
             CliEvent::Terminal { session } => {
                 if let Some(s) = session {
+                    if session_id.is_empty() && !s.is_empty() {
+                        let _ = chunks.send(AgentChunk::SessionStarted(s.clone())).await;
+                    }
                     session_id = s;
                 }
                 reached_terminal = true;
