@@ -183,6 +183,18 @@ pub fn parse_msg_callback(frame: &WsFrame) -> imagent_core::Result<(String, Inbo
     let msg: BaseMessage = serde_json::from_value(body.clone()).map_err(|e| {
         CoreError::Platform("wecom", format!("aibot_msg_callback body 解析失败：{e}"))
     })?;
+    // P5-12：群聊消息显式拒收——当前回复链路只认 `wecom:<userid>` 单聊，误处理
+    // 群消息会把回复错发到与发言者的私聊（对话上下文错乱）。宁可显式丢弃
+    // （drain 层 warn 可观测）；群聊支持（按群 chatid 收发）留待后续迭代。
+    if msg.chattype == "group" {
+        return Err(CoreError::Platform(
+            "wecom",
+            format!(
+                "群聊消息暂不支持（chattype=group, msgid={}），丢弃以免回复错发单聊",
+                msg.msgid
+            ),
+        ));
+    }
 
     let msgid = msg.msgid;
     let userid = msg.from.userid;
@@ -328,6 +340,32 @@ mod tests {
         assert_eq!(msgid, "m2");
         assert_eq!(msg.sender.0, "u9");
         assert!(msg.text.is_none(), "非文本帧 text 应为 None");
+    }
+
+    #[test]
+    fn parse_msg_callback_群聊帧_显式拒收() {
+        // P5-12：群消息误按单聊处理会把回复错发到与发言者的私聊——显式 Err 丢弃。
+        let raw = serde_json::json!({
+            "cmd": "aibot_msg_callback",
+            "headers": { "req_id": "x" },
+            "body": {
+                "msgid": "m3",
+                "chattype": "group",
+                "from": { "userid": "u1" },
+                "msgtype": "text",
+                "text": { "content": "@bot 你好" }
+            }
+        })
+        .to_string();
+        let frame = parse_frame(&raw).unwrap();
+        let err = match parse_msg_callback(&frame) {
+            Err(e) => e,
+            Ok((_, msg)) => panic!("群聊帧应拒收，却解析成功: {:?}", msg.text),
+        };
+        assert!(
+            format!("{err}").contains("群聊消息暂不支持"),
+            "错误信息应说明群聊拒收: {err}"
+        );
     }
 
     #[test]

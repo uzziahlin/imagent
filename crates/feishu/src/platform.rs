@@ -29,13 +29,13 @@ use crate::card::{
     render_card, render_permission_card, render_stream_init_card, stream_body_final, stream_body_md,
 };
 use crate::client::{
-    create_card_entity, download_file, download_image, fetch_token, patch_card, patch_card_element,
-    patch_card_settings, reply_comment, send_card_msg, send_card_ref_msg, send_image_msg,
-    send_text_msg, upload_image, FeishuWsClient,
+    create_card_entity, download_file, download_image, fetch_bot_open_id, fetch_token, patch_card,
+    patch_card_element, patch_card_settings, reply_comment, send_card_msg, send_card_ref_msg,
+    send_image_msg, send_text_msg, upload_image, FeishuWsClient,
 };
 use crate::proto::{
-    comment_target_from_conv, parse_card_action_event, parse_comment_event, parse_message_event,
-    receive_target_from_conv, ReceiveIdKind, COMMENT_CONV_PREFIX,
+    comment_target_from_conv, is_comment_event, parse_card_action_event, parse_comment_event,
+    parse_message_event, receive_target_from_conv, ReceiveIdKind, COMMENT_CONV_PREFIX,
 };
 
 /// 平台名常量。
@@ -103,6 +103,10 @@ impl FeishuPlatform {
         let app_id_for_drain = app_id.clone();
         let app_secret_for_drain = app_secret.clone();
         let token_for_drain = token.clone();
+        // P5-8：bot 自身 open_id 懒取缓存（@bot 过滤用；open_id 随应用固定，
+        // 进程内取一次。取不到时 parse_comment_event 退化为弱过滤）。
+        let bot_open_id: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+        let bot_open_id_for_drain = bot_open_id.clone();
         tokio::spawn(async move {
             let mut payload_rx = payload_rx;
             while let Some(payload) = payload_rx.recv().await {
@@ -184,9 +188,38 @@ impl FeishuPlatform {
                 // P4-9：云文档评论 @bot（drive.file.comment.created_v1）→ 评论
                 // 线程消息（conv = feishu:comment:<file>:<comment>，回复走
                 // reply_comment；需在飞书后台订阅该事件）。
-                if let Some((key, cm)) = parse_comment_event(&payload) {
-                    if dedup.check(&key) && inbound_msg_tx.send(cm).await.is_err() {
-                        break;
+                // P5-8：仅接受 @bot 的评论——bot open_id 首次遇到评论事件时懒取
+                // （GET /bot/v3/info）并缓存；取不到时退化为「至少含一个 @」的
+                // 弱过滤。另过滤 bot 自身的回复（防自触发循环）。
+                if is_comment_event(&payload) {
+                    if bot_open_id_for_drain.read().await.is_none() {
+                        let fetched = async {
+                            let t = fetch_cached_token(
+                                &token_for_drain,
+                                &core_config_for_drain,
+                                &app_id_for_drain,
+                                &app_secret_for_drain,
+                            )
+                            .await?;
+                            fetch_bot_open_id(&core_config_for_drain, &t).await
+                        }
+                        .await;
+                        match fetched {
+                            Ok(b) => *bot_open_id_for_drain.write().await = Some(b),
+                            Err(e) => warn!(
+                                target: "feishu",
+                                error = %e,
+                                "取 bot open_id 失败，评论 @bot 过滤退化为「须含 @」"
+                            ),
+                        }
+                    }
+                    let bot = bot_open_id_for_drain.read().await.clone();
+                    if let Some((key, cm)) = parse_comment_event(&payload, bot.as_deref()) {
+                        if dedup.check(&key) && inbound_msg_tx.send(cm).await.is_err() {
+                            break;
+                        }
+                    } else {
+                        tracing::debug!(target: "feishu", "评论未 @bot（或字段缺失/纯@），丢弃");
                     }
                     continue;
                 }

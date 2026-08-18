@@ -227,6 +227,15 @@ impl Config {
         Ok(cfg)
     }
 
+    /// P5-7（安全）：危险组合探测——`allowed_chats`（群放行）非空但
+    /// `admin_senders` 为空。群维度授权后所有成员过鉴权门，而 admins 为空时
+    /// `is_admin` 对全员返回 true（向后兼容语义），组合效果 = 群内**任何成员**
+    /// 都具备管理能力（/allow 自扩权、/chat 横向扩群、/config /perm 改全局）。
+    /// 单用户私用无感；群部署必须显式设 admin_senders 收紧。
+    pub fn admin_gap_with_chat_allowlist(&self) -> bool {
+        !self.allowed_chats.is_empty() && self.admin_senders.is_empty()
+    }
+
     /// 供首次使用打印的模板字符串（default_workdir 用占位，不写死任何机器路径）。
     pub const EXAMPLE: &'static str = r#"# ~/.imagent/config.toml
 default_workdir = "/absolute/path/to/agent/workspace"   # 必填，agent 的 cwd（非沙箱：不限制可读路径，靠 allowed_tools + permission_mode 兜底）
@@ -507,6 +516,32 @@ message_fragment_interval_ms = 250
         let cfg = Config::load(&p).expect("parse");
         assert_eq!(cfg.agent_idle_timeout_secs, 90);
         assert_eq!(cfg.batch_window_ms, 0);
+        cleanup(&p);
+    }
+
+    /// P5-7：群放行 + admin_senders 为空的组合探测（群内全员 = 事实管理员）。
+    #[test]
+    fn admin_gap_with_chat_allowlist_detects_combo() {
+        // 组合命中：有群放行、无管理员。
+        let p = tmp_path(
+            "gap_hit",
+            "default_workdir = \"/tmp/ws\"\nallowed_chats = [\"feishu:oc_a\"]\n",
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert!(cfg.admin_gap_with_chat_allowlist());
+        cleanup(&p);
+        // 设了管理员 → 不告警。
+        let p = tmp_path(
+            "gap_admin_set",
+            "default_workdir = \"/tmp/ws\"\nallowed_chats = [\"feishu:oc_a\"]\nadmin_senders = [\"me\"]\n",
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert!(!cfg.admin_gap_with_chat_allowlist());
+        cleanup(&p);
+        // 无群放行：空 admins 是单用户既有语义，不告警。
+        let p = tmp_path("gap_no_chat", r#"default_workdir = "/tmp/ws""#);
+        let cfg = Config::load(&p).expect("parse");
+        assert!(!cfg.admin_gap_with_chat_allowlist());
         cleanup(&p);
     }
 }

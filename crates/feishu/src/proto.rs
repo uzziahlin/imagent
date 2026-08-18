@@ -228,15 +228,42 @@ pub struct CommentContentNode {
     pub kind: String,
     #[serde(default)]
     pub text: Option<String>,
+    /// at 节点：被 @ 的用户 id（字段名历史遗留为 `user_id`，值为 open_id）。
+    #[serde(default)]
+    pub user_id: Option<String>,
+    /// 兼容部分载荷把被 @ 者放 `open_id` 字段。
+    #[serde(default)]
+    pub open_id: Option<String>,
 }
 
 /// 评论线程的 conv_id 前缀：`feishu:comment:<file_token>:<comment_id>`。
 /// send_text 据此走「回复评论」API；每条评论 = 独立会话线程。
 pub const COMMENT_CONV_PREFIX: &str = "feishu:comment:";
 
+/// 廉价判定 payload 是否为云文档评论事件（drain 据此懒取 bot open_id，避免对
+/// 无关事件也发起取 bot 信息的 HTTP 请求）。
+pub fn is_comment_event(payload: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|v| {
+            v.get("header")?
+                .get("event_type")?
+                .as_str()
+                .map(|t| t == "drive.file.comment.created_v1")
+        })
+        .unwrap_or(false)
+}
+
 /// 解析云文档评论事件 → InboundMessage（conv = 评论线程，text = text 节点拼接）。
-/// 缺 file_token/comment_id/sender 或纯 @ 无文字返回 None。
-pub fn parse_comment_event(payload: &[u8]) -> Option<(String, InboundMessage)> {
+///
+/// P5-8：须 @bot 才触发——`bot_open_id` 已知时要求 at 节点命中 bot、且 sender
+/// 不是 bot 自身（防 bot 回复再触发自己的自循环）；`bot_open_id` 未知（取 bot
+/// 信息失败）时退化为「至少含一个 at 节点」的弱过滤（drain 层取到 id 后自动
+/// 收紧）。缺 file_token/comment_id/sender 或纯 @ 无文字返回 None。
+pub fn parse_comment_event(
+    payload: &[u8],
+    bot_open_id: Option<&str>,
+) -> Option<(String, InboundMessage)> {
     let evt: CommentEvent = serde_json::from_slice(payload).ok()?;
     if evt.header.event_type != "drive.file.comment.created_v1" {
         return None;
@@ -250,6 +277,29 @@ pub fn parse_comment_event(payload: &[u8]) -> Option<(String, InboundMessage)> {
         .as_ref()
         .map(|s| s.sender_id.open_id.clone())
         .filter(|s| !s.is_empty())?;
+    // P5-8：@bot 过滤。
+    let at_ids: Vec<&str> = b
+        .content
+        .iter()
+        .filter(|n| n.kind == "at")
+        .filter_map(|n| n.user_id.as_deref().or(n.open_id.as_deref()))
+        .filter(|s| !s.is_empty())
+        .collect();
+    match bot_open_id {
+        Some(bot) => {
+            if !at_ids.contains(&bot) {
+                return None; // 未 @bot（@ 了别人或没 @）
+            }
+            if open_id == bot {
+                return None; // bot 自身的回复（防自触发循环）
+            }
+        }
+        None => {
+            if at_ids.is_empty() {
+                return None; // 弱过滤：至少要有一个 @
+            }
+        }
+    }
     let text: Vec<String> = b
         .content
         .iter()
@@ -815,7 +865,8 @@ mod tests {
                 "sender":{"sender_id":{"open_id":"ou_author"},"sender_type":"user"}
             }
         }"#;
-        let (key, msg) = parse_comment_event(payload.as_bytes()).expect("评论事件应解析");
+        let (key, msg) =
+            parse_comment_event(payload.as_bytes(), Some("ou_bot")).expect("评论事件应解析");
         assert_eq!(key, "evt_cm_1");
         assert_eq!(msg.conv_id.0, "feishu:comment:doxcnXYZ:7034abc");
         assert_eq!(msg.sender.0, "ou_author");
@@ -824,6 +875,7 @@ mod tests {
         let (ft, cid) = comment_target_from_conv(&msg.conv_id).unwrap();
         assert_eq!(ft, "doxcnXYZ");
         assert_eq!(cid, "7034abc");
+        assert!(is_comment_event(payload.as_bytes()));
     }
 
     #[test]
@@ -831,15 +883,43 @@ mod tests {
         // 纯 @ 无文字。
         let at_only = br#"{"header":{"event_id":"e","event_type":"drive.file.comment.created_v1"},
             "event":{"comment_id":"c1","file_token":"f1","content":[{"type":"at","user_id":"ou_b"}],"sender":{"sender_id":{"open_id":"ou_a"}}}}"#;
-        assert!(parse_comment_event(at_only).is_none());
+        assert!(parse_comment_event(at_only, Some("ou_bot")).is_none());
         // 缺 file_token。
         let no_token = br#"{"header":{"event_id":"e","event_type":"drive.file.comment.created_v1"},
             "event":{"comment_id":"c1","content":[{"type":"text","text":"hi"}],"sender":{"sender_id":{"open_id":"ou_a"}}}}"#;
-        assert!(parse_comment_event(no_token).is_none());
+        assert!(parse_comment_event(no_token, Some("ou_bot")).is_none());
         // 非目标事件。
         let other = br#"{"header":{"event_type":"im.message.receive_v1"}}"#;
-        assert!(parse_comment_event(other).is_none());
+        assert!(parse_comment_event(other, Some("ou_bot")).is_none());
+        assert!(!is_comment_event(other));
         // 非评论 conv 反解 None。
         assert!(comment_target_from_conv(&ConvId("feishu:ou_x".into())).is_none());
+    }
+
+    /// P5-8：@bot 过滤——bot id 已知时须 @bot 且 sender 非 bot 自身；未知时弱过滤。
+    #[test]
+    fn parse_comment_event_requires_at_bot() {
+        let mk = |content: &str, sender: &str| {
+            format!(
+                r#"{{"header":{{"event_id":"e","event_type":"drive.file.comment.created_v1"}},
+                "event":{{"comment_id":"c1","file_token":"f1","content":{content},
+                "sender":{{"sender_id":{{"open_id":"{sender}"}},"sender_type":"user"}}}}}}"#
+            )
+        };
+        let text_node = r#"[{"type":"text","text":"总结一下"}]"#;
+        // bot id 已知：无 at 节点 → 拒。
+        assert!(parse_comment_event(mk(text_node, "ou_a").as_bytes(), Some("ou_bot")).is_none());
+        // bot id 已知：@ 了别人 → 拒。
+        let at_other = r#"[{"type":"at","user_id":"ou_other"},{"type":"text","text":"总结"}]"#;
+        assert!(parse_comment_event(mk(at_other, "ou_a").as_bytes(), Some("ou_bot")).is_none());
+        // bot id 已知：sender 是 bot 自身（自回复）→ 拒。
+        let at_bot = r#"[{"type":"at","user_id":"ou_bot"},{"type":"text","text":"收到"}]"#;
+        assert!(parse_comment_event(mk(at_bot, "ou_bot").as_bytes(), Some("ou_bot")).is_none());
+        // 正常：@bot + 他人 sender → 过。
+        assert!(parse_comment_event(mk(at_bot, "ou_a").as_bytes(), Some("ou_bot")).is_some());
+        // bot id 未知（弱过滤）：无 at → 拒。
+        assert!(parse_comment_event(mk(text_node, "ou_a").as_bytes(), None).is_none());
+        // bot id 未知（弱过滤）：有 at（任意）→ 过。
+        assert!(parse_comment_event(mk(at_other, "ou_a").as_bytes(), None).is_some());
     }
 }
