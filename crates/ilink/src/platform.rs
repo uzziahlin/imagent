@@ -111,17 +111,39 @@ impl ILinkPlatform {
 
         if let Some(new_buf) = resp.get_updates_buf.as_deref() {
             if !new_buf.is_empty() {
-                if let Err(e) = self
-                    .store
-                    .set_sync_buf(PLATFORM, &self.account_id, new_buf)
-                    .await
-                {
-                    // P5-13：游标推进失败升级为致命——此前仅 warn 继续跑，服务端每轮
-                    // 重推同批消息，dedup 窗口（5min）过期后同批被当新消息**重复驱动
-                    // 一轮 agent**（token/成本放大 + 媒体重复落盘）。返回 Err 走 recv
-                    // 的退避重试（本批消息丢弃，下轮重拉由 dedup 吸收，at-least-once
-                    // 语义不变）。
-                    return Err(CoreError::Store(e));
+                // P5-13 修正：游标推进失败原地重试数次；仍失败则**照常投递本批消息**
+                // 并 error 告警。此前直接 return Err 丢弃本批——但 process_msg 已把
+                // dedup 键插进去，重拉同批会被去重吸收，等于**静默丢消息**（比原来的
+                // 「5min 后可能重复」更糟）。取舍：瞬态 DB 故障宁可冒重复驱动一轮的
+                // 风险（dedup 5min 窗口内多数能吸收），不可丢用户消息。
+                let mut advanced = false;
+                for attempt in 1..=3 {
+                    match self
+                        .store
+                        .set_sync_buf(PLATFORM, &self.account_id, new_buf)
+                        .await
+                    {
+                        Ok(()) => {
+                            advanced = true;
+                            break;
+                        }
+                        Err(e) => {
+                            warn!(
+                                target: "ilink",
+                                attempt,
+                                error = %e,
+                                "set_sync_buf 失败（游标未推进）"
+                            );
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                        }
+                    }
+                }
+                if !advanced {
+                    tracing::error!(
+                        target: "ilink",
+                        "游标推进连续失败（3 次）——本批消息照常投递，但服务端会重推同批；\
+                         若 DB 持续故障超过 dedup 窗口（5min），可能出现重复执行"
+                    );
                 }
             }
         }

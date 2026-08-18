@@ -1988,6 +1988,9 @@ impl Dispatcher {
                                             .await
                                         {
                                             Ok(_) => {
+                                                // P5-第五批：同 /cd——切目录后失效
+                                                // /resume 列表缓存（列表按当前目录扫描）。
+                                                self.resume_cache.lock().await.remove(&conv.0);
                                                 self.reply(
                                                     &conv,
                                                     &format!("✅ 已切到「{arg}」（{path}）"),
@@ -2161,11 +2164,16 @@ impl Dispatcher {
                         // 取了会等到任务自然结束才生效（等价于没停）。
                         // 若正等 IM 权限审批：pending 回复通道被 cancel 以 deny 唤醒 →
                         // MCP 立即收到 deny（fail-closed），agent 侧不悬挂。
+                        // P5-第五批：仅当确有 pending 审批才撤询问卡——否则会把该
+                        // conv 上一次已被正常回答的旧卡误 patch 成「已中断」。
+                        let had_pending = self.router.has_pending(&conv.0).await;
                         self.router.cancel(&conv.0).await;
-                        // P5-16：收敛审批询问本身——把 IM 里滞留的询问卡片 patch 成
-                        // 「已中断」（纯文本询问平台 no-op）。best-effort：失败不阻断中断。
-                        if let Err(e) = self.platform.cancel_permission_ask(&conv).await {
-                            warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "撤回权限询问失败（不影响中断）");
+                        if had_pending {
+                            // P5-16：收敛审批询问本身——把 IM 里滞留的询问卡片 patch 成
+                            // 「已中断」（纯文本询问平台 no-op）。best-effort。
+                            if let Err(e) = self.platform.cancel_permission_ask(&conv).await {
+                                warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "撤回权限询问失败（不影响中断）");
+                            }
                         }
                         let running = self.running.lock().await.remove(&conv.0);
                         let aborted = if let Some(h) = &running {
@@ -2461,9 +2469,11 @@ impl Dispatcher {
                             .await;
                     } else {
                         // P2-F：中间 Text chunk 实时推 IM（流式体验，而非全部丢弃只发最终 Final）。
-                        // P5-10：累积已推前缀，最终回复据此只补差量。
-                        streamed_text.push_str(&t);
-                        self.reply(&conv, &t, &hint).await;
+                        // P5-10：累积**已成功送达**的前缀，最终回复据此只补差量；
+                        // P5-第五批：失败不累积——该段留给最终全量兜底，两处皆失。
+                        if self.reply_ok(&conv, &t, &hint).await {
+                            streamed_text.push_str(&t);
+                        }
                     }
                 }
             }
@@ -2712,10 +2722,20 @@ impl Dispatcher {
         // conv 锁由 runner 循环持有并统一释放；在飞注册由 run_agent_round 统一移除。
     }
 
-    /// 回传文本；发送失败仅 log。session 过期升级为 error（用户侧已收不到回复）。
+    /// 回传文本；发送失败仅 log（见 [`Self::reply_ok`]）。
     async fn reply(&self, conv: &ConvId, text: &str, hint: &ReplyHint) {
+        let _ = self.reply_ok(conv, text, hint).await;
+    }
+
+    /// 回传文本，返回是否成功送达。P5-第五批：流式前缀累积据此只记成功送达
+    /// 的部分——失败段落留给最终全量兜底，而非两处皆失。session 过期升级为
+    /// error（用户侧已收不到回复）。
+    async fn reply_ok(&self, conv: &ConvId, text: &str, hint: &ReplyHint) -> bool {
         match self.platform.send_text(conv, text, hint).await {
-            Ok(()) => METRICS.messages_out.inc(),
+            Ok(()) => {
+                METRICS.messages_out.inc();
+                true
+            }
             Err(e) => {
                 if is_session_expired_err(&e) {
                     tracing::error!(
@@ -2727,6 +2747,7 @@ impl Dispatcher {
                 } else {
                     warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "send_text 失败");
                 }
+                false
             }
         }
     }
@@ -2983,6 +3004,8 @@ mod tests {
         /// P5-10：流式模式——逐段发 Text，Final/RunOutcome 为全量拼接（模拟
         /// codex/gemini/ACP「中间 Text + Final 全量」语义，去重测试用）。默认空。
         stream_texts: Vec<String>,
+        /// P5-第五批：announce session 后直接返 Err（Err 路径 session 持久化测试用）。
+        fail_after_announce: Option<String>,
         /// `list_local_sessions` 返回的本机会话（P4-11 统一 /resume 测试用）。
         local_sessions: Arc<TokioMutex<Vec<LocalSession>>>,
     }
@@ -3002,6 +3025,7 @@ mod tests {
                 slow_ms: 0,
                 announce_session: None,
                 stream_texts: Vec::new(),
+                fail_after_announce: None,
                 local_sessions: Arc::new(TokioMutex::new(Vec::new())),
             };
             (b, calls, prompts, order)
@@ -3042,6 +3066,13 @@ mod tests {
             let (mut b, calls, prompts, order) = Self::new();
             b.slow_ms = slow_ms;
             b.announce_session = Some(sid.into());
+            (b, calls, prompts, order)
+        }
+        /// P5-第五批：announce session 后返 Err（Err 路径持久化测试用）。
+        fn new_announce_then_fail(sid: &str) -> (Self, CallsHandle, PromptsHandle, CounterHandle) {
+            let (mut b, calls, prompts, order) = Self::new();
+            b.announce_session = Some(sid.into());
+            b.fail_after_announce = Some(sid.into());
             (b, calls, prompts, order)
         }
         /// P5-10：流式后端——逐段 Text + Final/RunOutcome 全量（去重测试用）。
@@ -3086,6 +3117,13 @@ mod tests {
             // P5-5：开跑即 announce（模拟 CLI 首事件带 session id）。
             if let Some(sid) = &self.announce_session {
                 let _ = chunks.send(AgentChunk::SessionStarted(sid.clone())).await;
+            }
+            // P5-第五批：announce 后失败模式（Err 路径持久化测试）。
+            if let Some(sid) = &self.fail_after_announce {
+                return Err(crate::error::CoreError::Backend(
+                    "mock-backend",
+                    format!("mock failure after announce (sid={sid})"),
+                ));
             }
 
             // 稍微让出调度器，便于测试串行。
@@ -3413,6 +3451,36 @@ mod tests {
     async fn build_streaming(auth: Auth, texts: Vec<String>) -> Ctx {
         let (plat, inbox, send_count) = MockPlatform::new();
         let (back, calls, prompts, order) = MockBackend::new_streaming(texts);
+        let (store, db) = tmp_store().await;
+
+        let disp = Arc::new(Dispatcher::new(
+            Arc::new(plat),
+            Arc::new(back),
+            store,
+            auth,
+            std::path::PathBuf::from("/tmp/imagent-test-ws"),
+            vec!["Read".into(), "Edit".into()],
+            PermissionMode::Off,
+            test_budgets(),
+            CotDetail::Brief,
+            vec![],
+        ));
+
+        Ctx {
+            disp,
+            inbox,
+            send_count,
+            calls,
+            prompts,
+            order,
+            db,
+        }
+    }
+
+    /// P5-第五批：announce session 后返 Err 的 backend（Err 路径持久化测试用）。
+    async fn build_announce_fail(auth: Auth, sid: &str) -> Ctx {
+        let (plat, inbox, send_count) = MockPlatform::new();
+        let (back, calls, prompts, order) = MockBackend::new_announce_then_fail(sid);
         let (store, db) = tmp_store().await;
 
         let disp = Arc::new(Dispatcher::new(
@@ -5087,6 +5155,65 @@ mod tests {
             assert!(buf.contains("\"allow\":false"), "cancel 应回 deny: {buf}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+        drop_db(ctx.db).await;
+    }
+
+    /// P5-第五批：/stop 可中断 /compact（注册进 running；被中断后回异常提示，
+    /// 在飞注册清空）。
+    #[tokio::test]
+    async fn stop_aborts_compact() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build_slow(Auth::new(vec!["alice".into()]), 60_000, test_budgets()).await;
+        // 预置活动 session（/compact 需已有会话；不经消息路径避免慢后端卡住）。
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        ctx.check()
+            .await
+            .upsert_session(&imagent_store::SessionRow {
+                conv_id: "c1".into(),
+                session_id: "sess-9".into(),
+                agent_kind: "mock-backend".into(),
+                workdir: "/tmp/imagent-test-ws".into(),
+                name: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        let disp = ctx.disp.clone();
+        let runner = tokio::spawn(async move {
+            disp.handle(msg("c1", "alice", "/compact")).await;
+        });
+        assert!(wait_registered(&ctx, "c1").await, "/compact 任务应注册在飞");
+        ctx.disp.handle(msg("c1", "alice", "/stop")).await;
+        let done = tokio::time::timeout(Duration::from_secs(5), runner).await;
+        assert!(done.is_ok(), "被中断的 /compact 应很快退出");
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(
+            inbox.iter().any(|t| t.contains("摘要任务异常")),
+            "应回中断提示: {inbox:?}"
+        );
+        assert!(ctx.disp.running.lock().await.is_empty(), "在飞注册应清空");
+        drop_db(ctx.db).await;
+    }
+
+    /// P5-第五批：backend 报错但已 announce session——Err 路径也持久化，
+    /// 下条消息续接而非静默开新会话。
+    #[tokio::test]
+    async fn backend_error_persists_learned_session() {
+        let _serial = SERIAL.lock().await;
+        let ctx = build_announce_fail(Auth::new(vec!["alice".into()]), "sess-err").await;
+        feed_and_wait(&ctx, vec![msg("c1", "alice", "boom")], 1).await;
+        // 第一轮 Err 但已 announce；若持久化生效，第二轮 existing = Some(sess-err)。
+        feed_and_wait(&ctx, vec![msg("c1", "alice", "again")], 2).await;
+        let calls = ctx.calls.lock().await.clone();
+        assert_eq!(
+            calls,
+            vec![None, Some("sess-err".to_string())],
+            "Err 后下条消息应续接学到的 session: {calls:?}"
+        );
         drop_db(ctx.db).await;
     }
 }

@@ -192,7 +192,16 @@ pub async fn patch_card(
 const CARDKIT_BASE: &str = "https://open.feishu.cn/open-apis/cardkit/v1";
 
 /// 解析 CardKit 响应信封：code 非 0 报错，否则取 `data` 下指定字段的字符串值。
+/// P5-第五批：先判 HTTP 状态——429 归一为含「HTTP 429」标记的错误（供
+/// retry_on_rate_limit 识别重试；此前直接 json() 解析非 JSON 体，错误串不含
+/// 标记导致重试不生效）。
 async fn cardkit_resp(resp: reqwest::Response, op: &str) -> imagent_core::Result<String> {
+    if resp.status().as_u16() == 429 {
+        return Err(imagent_core::CoreError::Platform(
+            PLATFORM,
+            format!("{op}: HTTP 429"),
+        ));
+    }
     let v: serde_json::Value = resp
         .json()
         .await
@@ -591,6 +600,13 @@ pub async fn reply_comment(
             .map_err(|e| {
                 imagent_core::CoreError::Platform(PLATFORM, format!("reply_comment: {e}"))
             })?;
+        // P5-第五批：429 先归一标记（否则非 JSON 体解析错误不含可识别串）。
+        if resp.status().as_u16() == 429 {
+            return Err(imagent_core::CoreError::Platform(
+                PLATFORM,
+                "reply_comment: HTTP 429".to_string(),
+            ));
+        }
         let v: serde_json::Value = resp.json().await.map_err(|e| {
             imagent_core::CoreError::Platform(PLATFORM, format!("reply_comment: {e}"))
         })?;

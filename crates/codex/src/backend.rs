@@ -42,7 +42,12 @@ impl Backend for CodexBackend {
     /// P5：扫 `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`（session_meta 的
     /// id + cwd 判定归属），统一 /resume 可接管本机 codex 会话。
     async fn list_local_sessions(&self, workdir: &std::path::Path) -> Vec<LocalSession> {
-        crate::sessions::scan_for_backend(workdir)
+        // P5-第五批：扫描是同步阻塞 IO（目录遍历 + 头部读），下放 blocking 池
+        // 防 /resume 卡 tokio worker。
+        let wd = workdir.to_path_buf();
+        tokio::task::spawn_blocking(move || crate::sessions::scan_for_backend(&wd))
+            .await
+            .unwrap_or_default()
     }
 
     async fn run(
