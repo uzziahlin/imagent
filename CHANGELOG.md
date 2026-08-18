@@ -2,6 +2,22 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [Unreleased] — P5 第五波：push 后自审——修复三处自引入回归 + 六处次级问题
+
+（对 P5 前四波 diff 的二次审查结论，见 [P4_ROADMAP](docs/internal/P4_ROADMAP.md) P5 章节。）
+
+### Fixed
+- **（回归）ilink 游标推进失败不再丢消息**：P5-13 的「致命化」版本在 set_sync_buf 失败时丢弃整批——但 dedup 键已插入，重拉同批被去重吸收 = 静默丢消息。现改为原地重试 3 次，仍失败则照常投递本批 + error 告警（宁可 5 分钟后可能重复，不可丢用户消息）。
+- **（回归）`imagent --profile <p> status` 读不到凭据**：status 漏设 keyring scope（读不到 scoped 键会报误导性错误或显示迁移前旧凭据）；同时改为按 config 平台判定——wecom/feishu 打印 config/env 配置指引而非误查 ilink。
+- **（回归）/health 的 wecom logged_in 恒 false**：wecom 凭据在 config（store 查不到），启动时按 `wecom_bot_id`/`wecom_secret` 存在性预判定。
+- **单实例锁改 flock**：内核随 fd 持锁到进程退出——消除「排他创建+事后写 PID」在两实例毫秒级并发启动时的删锁重建竞态（恰是要防的场景），也消除 PID 复用误判；锁文件内容降级为诊断信息。
+- **流式去重不再吞推送失败的段落**：只累积发送成功的前缀（`reply_ok`），失败段落留给最终全量兜底（此前中间推送失败后该段两处皆失）。
+- **feishu 429 重试在卡片/评论路径生效**：`cardkit_resp`/`reply_comment` 先判 HTTP 状态并把 429 归一为可识别标记（此前 429 的非 JSON 体解析错误不含标记，重试从不触发）。
+
+### Changed
+- `/ws use` 切目录后失效 /resume 列表缓存（同 /cd）；codex 本机会话扫描移入 `spawn_blocking`（防卡 tokio worker）；`/stop` 仅在确有 pending 审批时撤回询问卡（防误把已回答的旧卡 patch 成「已中断」）。
+- workspace 测试 345 passed（新增 5 用例：flock 三场景、/stop 中断 /compact、Err 路径 session 持久化）；clippy 0 warning；fmt clean。
+
 ## [Unreleased] — P5 第四波：设计债务收敛（store 事务/轮转、keyring 隔离、metrics、媒体 TTL、feishu 限流、codex 扫描）
 
 （发现与排期见 [P4_ROADMAP](docs/internal/P4_ROADMAP.md) 的 P5 章节。）

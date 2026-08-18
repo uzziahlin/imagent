@@ -193,6 +193,22 @@ profile 跑同一平台会共享凭据条目（后续可加 profile 前缀）；
 |---|---|---|
 | P5-14 | ACP 单连接全局串行 + 排队期烧 agent_timeout（A 的长任务让 B 直接超时）。方案：per-conv 长驻连接；timeout 预算从出队起算。**需真机 claude-agent-acp 验证后实施** | 中高 |
 
+### 第五批（push 后自审回归修复 ✅，同日）
+
+> 来源：push 后对 P5 四批 diff 的二次审查（自查 + 独立复查），发现三处自己引入的
+> 回归与若干次级问题，本批全部修复。
+
+| 项 | 内容 | 状态 |
+|---|---|---|
+| 回归 | P5-13 游标致命化实为**丢消息**（dedup 键已插，重拉被吸收）→ 改原地重试 3 次，仍失败照常投递 + error 告警（宁重复不丢） | ✅ |
+| 回归 | `--profile` 下 `status` 漏设 keyring scope（读不到 scoped 凭据/显示旧凭据）→ 补齐 + 按平台查凭据（wecom/feishu 给出 config/env 指引） | ✅ |
+| 回归 | `/health` wecom 恒 false（凭据在 config 不在 store）→ 启动时按存在性预算 hint | ✅ |
+| 缺陷 | 单实例锁「排他创建+事后写 PID」有并发启动竞态 → 改 `flock`（内核持锁，无陈旧锁/删除竞态） | ✅ |
+| 缺陷 | 流式去重会把推送失败的段落从最终回复裁掉（两处皆失）→ 只累积发送成功的前缀（`reply_ok`） | ✅ |
+| 缺陷 | feishu 429 重试在卡片/评论路径不生效（cardkit_resp 不看 HTTP 状态）→ 先判 429 归一标记 | ✅ |
+| 小项 | `/ws use` 失效 /resume 缓存；codex 扫描 spawn_blocking；/stop 仅在有 pending 时撤询问卡（防误 patch 已回答的旧卡） | ✅ |
+| 补测 | /stop 中断 /compact；Err 路径 session 持久化 | ✅ |
+
 ### 第四批（设计债务收敛 ✅，同日）
 
 | 项 | 内容 | 状态 |
@@ -426,3 +442,33 @@ miss 时回退旧键（过渡期老凭据继续可用，下次 login 写入 scop
 
 **验证**：新增 7 测试（轮转 / scoped username / TTL 清理 / metrics 注册 / codex
 扫描 ×3），全量 343 passed、fmt/clippy 绿。
+
+---
+
+## P5 第五批实现纪要（2026-08-18，push 后自审）
+
+对已 push 的 P5 四批 diff 做二次审查，修复三处自引入回归 + 六处次级问题：
+
+1. **ilink 游标（P5-13 修正）**：致命化版本在 `set_sync_buf` 失败时丢整批消息——
+   `process_msg` 已把 dedup 键插入（5min 窗口），退避后重拉同批被去重吸收 = 静默
+   丢消息。改为：失败原地重试 3 次（300ms 间隔）；仍失败则**照常投递本批** +
+   error 告警（DB 持续故障超 dedup 窗口才可能重复执行——宁可重复，不可丢）。
+2. **status 的 keyring scope**：`Cmd::Status` 补 `set_keyring_scope`（此前只有
+   Login/Start 设）；平台按 config 判定——wecom/feishu 打印 config/env 指引而非
+   误查 ilink 凭据。
+3. **/health wecom**：凭据来自 config 的 `wecom_bot_id`/`wecom_secret`，启动时按
+   存在性预算 `logged_in_hint` 传入（此前查 store 恒 false）。
+4. **单实例锁改 flock**：内核随 fd 持锁到进程退出，消除「排他创建 + 事后写 PID」
+   的并发启动竞态（败者读到空锁文件误判陈旧删锁重建）与 PID 复用误判；锁文件
+   内容（PID）降级为纯诊断信息。
+5. **流式去重失败回滚**：`reply_ok` 返回送达结果，`streamed_text` 只累积成功
+   前缀——推送失败的段落留给最终全量兜底（此前两处皆失）。`reply` 保持 `()`，
+   既有调用点零扰动。
+6. **feishu 429 归一**：`cardkit_resp`/`reply_comment` 先判 HTTP 状态，429 归一为
+   含「HTTP 429」标记的错误（此前直接 json() 解析非 JSON 体，重试识别不生效）。
+7. 小项：`/ws use` 成功后失效 `/resume` 缓存（同 /cd）；codex 扫描
+   `spawn_blocking`（防卡 tokio worker）；`/stop` 仅在 `router.has_pending` 时撤
+   询问卡（防把已被正常回答的旧卡误 patch 成「已中断」）。
+
+**验证**：新增 3 测试（flock ×3 场景合并为 3 个用例 + /stop 中断 /compact +
+Err 路径持久化），全量 345 passed、fmt/clippy 绿。
