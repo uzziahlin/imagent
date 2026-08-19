@@ -14,8 +14,8 @@
 //!
 //! SSRF 硬约束：入站 `full_url` 是不可信输入，主机必须在 CDN 白名单内。
 
-use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
-use aes::{Aes128, Block};
+use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
+use aes::Aes128;
 use base64::Engine;
 use futures::StreamExt;
 use imagent_core::{CoreError, Result};
@@ -58,8 +58,8 @@ pub fn aes_encrypt(plaintext: &[u8], key: &[u8; 16]) -> Vec<u8> {
     let cipher = Aes128::new_from_slice(key).expect("16-byte key");
     let mut out = pkcs7_pad(plaintext);
     for chunk in out.chunks_exact_mut(BLOCK) {
-        let block = Block::from_mut_slice(chunk);
-        cipher.encrypt_block(block);
+        let arr: &mut [u8; BLOCK] = chunk.try_into().expect("chunks_exact_mut 保证 16 字节");
+        cipher.encrypt_block(arr.into());
     }
     out
 }
@@ -72,8 +72,8 @@ pub fn aes_decrypt(ciphertext: &[u8], key: &[u8; 16]) -> Option<Vec<u8>> {
     let cipher = Aes128::new_from_slice(key).expect("16-byte key");
     let mut buf = ciphertext.to_vec();
     for chunk in buf.chunks_exact_mut(BLOCK) {
-        let block = Block::from_mut_slice(chunk);
-        cipher.decrypt_block(block);
+        let arr: &mut [u8; BLOCK] = chunk.try_into().expect("chunks_exact_mut 保证 16 字节");
+        cipher.decrypt_block(arr.into());
     }
     pkcs7_unpad(&buf)
 }
