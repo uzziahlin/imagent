@@ -118,7 +118,7 @@ impl WeComWsClient {
         let sub_json = frame_to_string(&sub).map_err(|e| {
             imagent_core::CoreError::Platform("wecom", format!("serialize subscribe: {e}"))
         })?;
-        ws.send(Message::Text(sub_json)).await.map_err(|e| {
+        ws.send(Message::text(sub_json)).await.map_err(|e| {
             imagent_core::CoreError::Platform("wecom", format!("send subscribe: {e}"))
         })?;
 
@@ -268,7 +268,7 @@ impl WeComWsClient {
                     let json = frame_to_string(&frame).map_err(|e| {
                         imagent_core::CoreError::Platform("wecom", format!("serialize outbound: {e}"))
                     })?;
-                    ws.send(Message::Text(json)).await.map_err(|e| {
+                    ws.send(Message::text(json)).await.map_err(|e| {
                         imagent_core::CoreError::Platform("wecom", format!("ws send: {e}"))
                     })?;
                     debug!(target: "wecom", "已发出站帧");
@@ -279,7 +279,7 @@ impl WeComWsClient {
                     let ping = frame_to_string(&build_ping_frame()).map_err(|e| {
                         imagent_core::CoreError::Platform("wecom", format!("serialize ping: {e}"))
                     })?;
-                    if let Err(e) = ws.send(Message::Text(ping)).await {
+                    if let Err(e) = ws.send(Message::text(ping)).await {
                         return Err(imagent_core::CoreError::Platform(
                             "wecom", format!("ws send ping: {e}"),
                         ));
