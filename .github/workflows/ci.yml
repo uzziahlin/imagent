@@ -22,7 +22,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install libdbus-1-dev (Linux keyring backend：keyring sync-secret-service 经 libdbus-sys)
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update && sudo apt-get install -y libdbus-1-dev
+        run: |
+          sudo systemctl stop unattended-upgrades.service || true
+          for i in $(seq 1 30); do
+            if sudo fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock >/dev/null 2>&1; then
+              echo "apt/dpkg 锁被占（unattended-upgrades 残留），等待... ($i)"; sleep 5
+            else break; fi
+          done
+          sudo apt-get -o Acquire::Retries=5 update && sudo apt-get install -y libdbus-1-dev
       - name: Install protoc (feishu/open-lark websocket 构建依赖；仅构建时需要)
         if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get install -y protobuf-compiler
@@ -50,7 +57,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install libdbus-1-dev (Linux keyring backend)
-        run: sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update && sudo apt-get install -y libdbus-1-dev
+        run: |
+          sudo systemctl stop unattended-upgrades.service || true
+          for i in $(seq 1 30); do
+            if sudo fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock >/dev/null 2>&1; then
+              echo "apt/dpkg 锁被占（unattended-upgrades 残留），等待... ($i)"; sleep 5
+            else break; fi
+          done
+          sudo apt-get -o Acquire::Retries=5 update && sudo apt-get install -y libdbus-1-dev
       - name: Install protoc (feishu/open-lark websocket 构建依赖)
         run: sudo apt-get install -y protobuf-compiler
       - uses: dtolnay/rust-toolchain@1.88
