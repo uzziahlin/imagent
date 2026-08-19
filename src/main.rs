@@ -302,6 +302,10 @@ async fn main() -> Result<()> {
                 };
             let platform = build_platform(platform_name, &config, store.clone()).await?;
 
+            // 孤儿流式卡片关流（P4_ROADMAP 第六批）：上次进程退出时滞留「生成中」的
+            // 卡片按 store 登记逐张 patch 成「已中断」，失败保留登记下次再试。
+            imagent_core::sweep_live_cards(&store, platform.as_ref()).await;
+
             // 6. backend —— permission_mode 用共享句柄，SIGHUP 热重载即时生效。
             let perm_mode = std::sync::Arc::new(parking_lot::RwLock::new(config.permission_mode));
             let backend = build_backend(

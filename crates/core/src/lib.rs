@@ -8,8 +8,8 @@
 //! 不反向依赖具体 crate（依赖倒置）。
 
 // 注：core 用 `deny`（非 `forbid`）：P0-B 的权限 socket 对端 uid 鉴权需要
-// SO_PEERCRED/LOCAL_PEERCRED（必然 unsafe），集中在 `dispatch::current_uid` /
-// `dispatch::peer_uid`，两处均 `#[allow(unsafe_code)]` + SAFETY 注释。`deny` 允许
+// SO_PEERCRED/LOCAL_PEERCRED（必然 unsafe），集中在 `dispatch::socket::current_uid` /
+// `dispatch::socket::peer_uid`，两处均 `#[allow(unsafe_code)]` + SAFETY 注释。`deny` 允许
 // 这种显式局部豁免；`forbid` 不允许，故不适用。其余全部 crate 用 `forbid`。
 #![deny(unsafe_code)]
 
@@ -32,6 +32,7 @@ mod types;
 
 pub use auth::Auth;
 pub use backend::Backend;
+pub use card_session::sweep_live_cards;
 pub use config::{Config, CotDetail, PermissionMode};
 pub use dedup::Dedup;
 pub use dispatch::{Dispatcher, TaskBudgets};

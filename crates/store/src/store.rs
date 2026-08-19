@@ -79,6 +79,15 @@ pub struct SessionHistoryRow {
     pub updated_at: i64,
 }
 
+/// 在飞流式卡片登记行（schema v6）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LiveCardRow {
+    pub conv_id: String,
+    pub platform: String,
+    pub handle: String,
+    pub updated_at: i64,
+}
+
 struct Inner {
     conn: Mutex<rusqlite::Connection>,
 }
@@ -682,6 +691,70 @@ impl Store {
                     agent_kind: r.get::<_, Option<String>>(2)?,
                     created_at: r.get(3)?,
                     updated_at: r.get(4)?,
+                })
+            })?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r?);
+            }
+            Ok(v)
+        })
+        .await
+    }
+
+    // —— live_cards（在飞流式卡片登记，P4_ROADMAP 第六批孤儿卡片关流）——
+
+    /// 登记/刷新一张在飞流式卡片（每 conv 至多一张，upsert 覆盖）。
+    pub async fn record_live_card(
+        &self,
+        conv_id: &str,
+        platform: &str,
+        handle: &str,
+    ) -> Result<()> {
+        let (conv_id, platform, handle) = (
+            conv_id.to_string(),
+            platform.to_string(),
+            handle.to_string(),
+        );
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            conn.execute(
+                "INSERT INTO live_cards (conv_id, platform, handle, updated_at) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(conv_id) DO UPDATE SET platform = ?2, handle = ?3, updated_at = ?4",
+                rusqlite::params![conv_id, platform, handle, now_secs()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// 摘除该 conv 的在飞卡片登记（终态 patch 成功后调用）。
+    pub async fn clear_live_card(&self, conv_id: &str) -> Result<()> {
+        let conv_id = conv_id.to_string();
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            conn.execute(
+                "DELETE FROM live_cards WHERE conv_id = ?1",
+                rusqlite::params![conv_id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// 列出全部在飞卡片登记（启动扫描用）。
+    pub async fn list_live_cards(&self) -> Result<Vec<LiveCardRow>> {
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT conv_id, platform, handle, updated_at FROM live_cards ORDER BY updated_at",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(LiveCardRow {
+                    conv_id: r.get(0)?,
+                    platform: r.get(1)?,
+                    handle: r.get(2)?,
+                    updated_at: r.get(3)?,
                 })
             })?;
             let mut v = Vec::new();
@@ -1774,5 +1847,47 @@ mod tests {
             .await
             .unwrap();
         assert!(store.get_named_session("c", "n").await.unwrap().is_some());
+    }
+
+    /// v6：live_cards 表迁移 + record/clear/list 回环 + per-conv upsert 覆盖。
+    #[tokio::test]
+    async fn migrate_v5_to_v6_adds_live_cards() {
+        let db = TempDb::new("migrate_v6").await;
+        {
+            let conn = rusqlite::Connection::open(&db.path).unwrap();
+            conn.execute_batch(crate::schema::SCHEMA_V1).unwrap();
+            conn.execute_batch(crate::schema::SCHEMA_V2).unwrap();
+            conn.execute_batch(crate::schema::SCHEMA_V3).unwrap();
+            conn.execute_batch(crate::schema::SCHEMA_V4).unwrap();
+            conn.execute_batch(crate::schema::SCHEMA_V5).unwrap();
+            conn.pragma_update(None, "user_version", 5_i64).unwrap();
+        }
+        let store = Store::open(&db.path).await.unwrap();
+        let tables = list_tables(&store).await;
+        assert!(
+            tables.iter().any(|x| x == "live_cards"),
+            "v6 迁移应建 live_cards"
+        );
+        store
+            .record_live_card("c1", "feishu", "card:abc")
+            .await
+            .unwrap();
+        // 同 conv 再登记 → upsert 覆盖（每 conv 至多一张）。
+        store
+            .record_live_card("c1", "feishu", "card:def")
+            .await
+            .unwrap();
+        store
+            .record_live_card("c2", "feishu", "msg:x")
+            .await
+            .unwrap();
+        let rows = store.list_live_cards().await.unwrap();
+        assert_eq!(rows.len(), 2, "per-conv upsert 后应只 2 行: {rows:?}");
+        let c1 = rows.iter().find(|r| r.conv_id == "c1").unwrap();
+        assert_eq!(c1.handle, "card:def", "覆盖后应保留新句柄");
+        store.clear_live_card("c1").await.unwrap();
+        let rows = store.list_live_cards().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].conv_id, "c2");
     }
 }

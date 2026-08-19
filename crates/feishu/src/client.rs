@@ -92,6 +92,56 @@ impl FeishuWsClient {
     }
 }
 
+/// 识别限流类错误（HTTP 429 / 飞书频控业务码 230020）。
+/// 两种错误串形态都要覆盖：手写 HTTP 路径（"HTTP 429" / "code=230020"）与
+/// SDK 路径（open-lark `ApiError` Display = "API错误 {raw_code} {endpoint}: {msg}"，
+/// raw_code 即飞书业务码或合成 HTTP status；业务变体则 Debug 打印枚举名）。
+fn is_rate_limited_msg(msg: &str) -> bool {
+    msg.contains("HTTP 429")
+        || msg.contains("code=230020")
+        || msg.contains("API错误 429")
+        || msg.contains("API错误 230020")
+        || msg.contains("业务错误 TooManyRequests")
+}
+
+/// 识别 token 失效类错误码（99991661-64/68/79：tenant/app access token 空、格式错、
+/// 无效、内部错误）。缓存 token 被服务端提前吊销（app_secret 轮换 / 后台强制失效）
+/// 时，TTL 内重用旧值永远失败——platform 层据此清缓存强制刷新重试一次。
+pub(crate) fn is_token_invalid_msg(msg: &str) -> bool {
+    const TOKEN_INVALID_CODES: [&str; 6] = [
+        "99991661", "99991662", "99991663", "99991664", "99991668", "99991679",
+    ];
+    TOKEN_INVALID_CODES.iter().any(|c| msg.contains(c))
+        || msg.to_ascii_lowercase().contains("invalid access token")
+}
+
+/// 限流退避重试——500ms → 1s → 2s 最多三次重试，其它错误立即失败。
+/// 手写 HTTP 与 SDK 路径通用（识别见 [`is_rate_limited_msg`]）。
+macro_rules! retry_on_rate_limit {
+    ($body:expr) => {{
+        let mut delay = std::time::Duration::from_millis(500);
+        loop {
+            match $body.await {
+                Ok(v) => break Ok(v),
+                Err(e) => {
+                    if is_rate_limited_msg(&format!("{e}")) && delay <= std::time::Duration::from_secs(2)
+                    {
+                        tracing::warn!(
+                            target: "feishu",
+                            backoff_ms = delay.as_millis() as u64,
+                            "限流（429/230020），退避后重试"
+                        );
+                        tokio::time::sleep(delay).await;
+                        delay *= 2;
+                        continue;
+                    }
+                    break Err(e);
+                }
+            }
+        }
+    }};
+}
+
 /// 发送一条文本消息（HTTP OpenAPI，低层写法，手动注入 token）。
 ///
 /// `core_config` 为发消息用配置；`token` 为当前 `tenant_access_token`；
@@ -103,25 +153,29 @@ pub async fn send_text_msg(
     kind: ReceiveIdKind,
     text: &str,
 ) -> imagent_core::Result<()> {
-    let body = CreateMessageBody {
-        receive_id: receive_id.to_string(),
-        msg_type: "text".to_string(),
-        content: json!({ "text": text }).to_string(),
-        uuid: None,
-    };
-    let id_type = match kind {
-        ReceiveIdKind::OpenId => ReceiveIdType::OpenId,
-        ReceiveIdKind::ChatId => ReceiveIdType::ChatId,
-    };
-    let option = RequestOption::builder()
-        .tenant_access_token(token.to_string())
-        .build();
-    CreateMessageRequest::new(core_config.clone())
-        .receive_id_type(id_type)
-        .execute_with_options(body, option)
-        .await
-        .map_err(|e| imagent_core::CoreError::Platform(PLATFORM, format!("send_message: {e}")))?;
-    Ok(())
+    retry_on_rate_limit!(async {
+        let body = CreateMessageBody {
+            receive_id: receive_id.to_string(),
+            msg_type: "text".to_string(),
+            content: json!({ "text": text }).to_string(),
+            uuid: None,
+        };
+        let id_type = match kind {
+            ReceiveIdKind::OpenId => ReceiveIdType::OpenId,
+            ReceiveIdKind::ChatId => ReceiveIdType::ChatId,
+        };
+        let option = RequestOption::builder()
+            .tenant_access_token(token.to_string())
+            .build();
+        CreateMessageRequest::new(core_config.clone())
+            .receive_id_type(id_type)
+            .execute_with_options(body, option)
+            .await
+            .map_err(|e| {
+                imagent_core::CoreError::Platform(PLATFORM, format!("send_message: {e}"))
+            })?;
+        Ok(())
+    })
 }
 /// 发送交互卡片，返回 message_id（供后续 [`patch_card`] 增量更新）。
 ///
@@ -135,30 +189,32 @@ pub async fn send_card_msg(
     kind: ReceiveIdKind,
     card_json: &str,
 ) -> imagent_core::Result<Option<String>> {
-    let body = CreateMessageBody {
-        receive_id: receive_id.to_string(),
-        msg_type: "interactive".to_string(),
-        content: card_json.to_string(),
-        uuid: None,
-    };
-    let id_type = match kind {
-        ReceiveIdKind::OpenId => ReceiveIdType::OpenId,
-        ReceiveIdKind::ChatId => ReceiveIdType::ChatId,
-    };
-    let option = RequestOption::builder()
-        .tenant_access_token(token.to_string())
-        .build();
-    let resp: serde_json::Value = CreateMessageRequest::new(core_config.clone())
-        .receive_id_type(id_type)
-        .execute_with_options(body, option)
-        .await
-        .map_err(|e| imagent_core::CoreError::Platform(PLATFORM, format!("send_card: {e}")))?;
-    // resp 已是 data 内容；message_id 在顶层（非 data.message_id）。
-    let message_id = resp
-        .get("message_id")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    Ok(message_id)
+    retry_on_rate_limit!(async {
+        let body = CreateMessageBody {
+            receive_id: receive_id.to_string(),
+            msg_type: "interactive".to_string(),
+            content: card_json.to_string(),
+            uuid: None,
+        };
+        let id_type = match kind {
+            ReceiveIdKind::OpenId => ReceiveIdType::OpenId,
+            ReceiveIdKind::ChatId => ReceiveIdType::ChatId,
+        };
+        let option = RequestOption::builder()
+            .tenant_access_token(token.to_string())
+            .build();
+        let resp: serde_json::Value = CreateMessageRequest::new(core_config.clone())
+            .receive_id_type(id_type)
+            .execute_with_options(body, option)
+            .await
+            .map_err(|e| imagent_core::CoreError::Platform(PLATFORM, format!("send_card: {e}")))?;
+        // resp 已是 data 内容；message_id 在顶层（非 data.message_id）。
+        let message_id = resp
+            .get("message_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        Ok(message_id)
+    })
 }
 
 /// 增量更新（patch）已发卡片。`card_json` 为新的 CardKit JSON 字符串。
@@ -168,18 +224,20 @@ pub async fn patch_card(
     message_id: &str,
     card_json: &str,
 ) -> imagent_core::Result<()> {
-    let option = RequestOption::builder()
-        .tenant_access_token(token.to_string())
-        .build();
-    // patch 请求体形态（open-lark patch.rs doc 确认）：
-    //   {"content": "<卡片JSON序列化字符串>"}；card_json 已是字符串，直接作 content 值。
-    let body = serde_json::json!({ "content": card_json });
-    PatchMessageCardRequest::new(core_config.clone())
-        .message_id(message_id.to_string())
-        .execute_with_options(body, option)
-        .await
-        .map_err(|e| imagent_core::CoreError::Platform(PLATFORM, format!("patch_card: {e}")))?;
-    Ok(())
+    retry_on_rate_limit!(async {
+        let option = RequestOption::builder()
+            .tenant_access_token(token.to_string())
+            .build();
+        // patch 请求体形态（open-lark patch.rs doc 确认）：
+        //   {"content": "<卡片JSON序列化字符串>"}；card_json 已是字符串，直接作 content 值。
+        let body = serde_json::json!({ "content": card_json });
+        PatchMessageCardRequest::new(core_config.clone())
+            .message_id(message_id.to_string())
+            .execute_with_options(body, option)
+            .await
+            .map_err(|e| imagent_core::CoreError::Platform(PLATFORM, format!("patch_card: {e}")))?;
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -221,39 +279,6 @@ async fn cardkit_resp(resp: reqwest::Response, op: &str) -> imagent_core::Result
 ///
 /// `data` 为卡片 JSON **字符串**（官方要求双重编码：外层 JSON + 内层转义字符串）。
 /// 需 `cardkit:card:write` 权限；失败时调用方降级走 raw 卡片（msg: 句柄）。
-/// P5：识别限流类错误（HTTP 429 / 飞书频控业务码 230020）。
-fn is_rate_limited_msg(msg: &str) -> bool {
-    msg.contains("HTTP 429") || msg.contains("code=230020")
-}
-
-/// P5：限流退避重试——500ms → 1s → 2s 最多三次重试，其它错误立即失败。
-/// 仅用于手写 HTTP 路径（流式卡片 PATCH 高频 + 评论回复 + 媒体下载）；SDK 路径
-/// 无 HTTP 状态透传，留待后续。
-macro_rules! retry_on_rate_limit {
-    ($body:expr) => {{
-        let mut delay = std::time::Duration::from_millis(500);
-        loop {
-            match $body.await {
-                Ok(v) => break Ok(v),
-                Err(e) => {
-                    if is_rate_limited_msg(&format!("{e}")) && delay <= std::time::Duration::from_secs(2)
-                    {
-                        tracing::warn!(
-                            target: "feishu",
-                            backoff_ms = delay.as_millis() as u64,
-                            "限流（429/230020），退避后重试"
-                        );
-                        tokio::time::sleep(delay).await;
-                        delay *= 2;
-                        continue;
-                    }
-                    break Err(e);
-                }
-            }
-        }
-    }};
-}
-
 pub async fn create_card_entity(token: &str, card_json: &str) -> imagent_core::Result<String> {
     retry_on_rate_limit!(async {
         let client = reqwest::Client::new();
@@ -342,31 +367,33 @@ pub async fn send_card_ref_msg(
     kind: ReceiveIdKind,
     card_id: &str,
 ) -> imagent_core::Result<Option<String>> {
-    let body = CreateMessageBody {
-        receive_id: receive_id.to_string(),
-        msg_type: "interactive".to_string(),
-        content: json!({ "type": "card_id", "data": { "card_id": card_id } }).to_string(),
-        uuid: None,
-    };
-    let id_type = match kind {
-        ReceiveIdKind::OpenId => ReceiveIdType::OpenId,
-        ReceiveIdKind::ChatId => ReceiveIdType::ChatId,
-    };
-    let option = RequestOption::builder()
-        .tenant_access_token(token.to_string())
-        .build();
-    let resp: serde_json::Value = CreateMessageRequest::new(core_config.clone())
-        .receive_id_type(id_type)
-        .execute_with_options(body, option)
-        .await
-        .map_err(|e| {
-            imagent_core::CoreError::Platform(PLATFORM, format!("send_card_ref_msg: {e}"))
-        })?;
-    // resp 已是 data 内容；message_id 在顶层（同 send_card_msg）。
-    Ok(resp
-        .get("message_id")
-        .and_then(|v| v.as_str())
-        .map(String::from))
+    retry_on_rate_limit!(async {
+        let body = CreateMessageBody {
+            receive_id: receive_id.to_string(),
+            msg_type: "interactive".to_string(),
+            content: json!({ "type": "card_id", "data": { "card_id": card_id } }).to_string(),
+            uuid: None,
+        };
+        let id_type = match kind {
+            ReceiveIdKind::OpenId => ReceiveIdType::OpenId,
+            ReceiveIdKind::ChatId => ReceiveIdType::ChatId,
+        };
+        let option = RequestOption::builder()
+            .tenant_access_token(token.to_string())
+            .build();
+        let resp: serde_json::Value = CreateMessageRequest::new(core_config.clone())
+            .receive_id_type(id_type)
+            .execute_with_options(body, option)
+            .await
+            .map_err(|e| {
+                imagent_core::CoreError::Platform(PLATFORM, format!("send_card_ref_msg: {e}"))
+            })?;
+        // resp 已是 data 内容；message_id 在顶层（同 send_card_msg）。
+        Ok(resp
+            .get("message_id")
+            .and_then(|v| v.as_str())
+            .map(String::from))
+    })
 }
 
 /// 媒体下载大小上限（与 ilink 一致：50MB；防恶意/误发大文件把内存打爆）。
@@ -466,16 +493,22 @@ pub async fn upload_image(
     file_name: &str,
     bytes: Vec<u8>,
 ) -> imagent_core::Result<String> {
-    let option = RequestOption::builder()
-        .tenant_access_token(token.to_string())
-        .build();
-    let resp = CreateImageRequest::new(core_config.clone())
-        .image_type(ImageType::Message)
-        .file_name(file_name)
-        .execute_with_options(bytes, option)
-        .await
-        .map_err(|e| imagent_core::CoreError::Platform(PLATFORM, format!("upload_image: {e}")))?;
-    Ok(resp.image_key)
+    retry_on_rate_limit!(async {
+        // bytes 被请求体消费，重试路径须重建（图片通常 <几 MB，clone 可接受）。
+        let bytes = bytes.clone();
+        let option = RequestOption::builder()
+            .tenant_access_token(token.to_string())
+            .build();
+        let resp = CreateImageRequest::new(core_config.clone())
+            .image_type(ImageType::Message)
+            .file_name(file_name)
+            .execute_with_options(bytes, option)
+            .await
+            .map_err(|e| {
+                imagent_core::CoreError::Platform(PLATFORM, format!("upload_image: {e}"))
+            })?;
+        Ok(resp.image_key)
+    })
 }
 
 /// 发送图片消息（msg_type=image），content 为 `{"image_key":"..."}`。
@@ -486,25 +519,29 @@ pub async fn send_image_msg(
     kind: ReceiveIdKind,
     image_key: &str,
 ) -> imagent_core::Result<()> {
-    let body = CreateMessageBody {
-        receive_id: receive_id.to_string(),
-        msg_type: "image".to_string(),
-        content: json!({ "image_key": image_key }).to_string(),
-        uuid: None,
-    };
-    let id_type = match kind {
-        ReceiveIdKind::OpenId => ReceiveIdType::OpenId,
-        ReceiveIdKind::ChatId => ReceiveIdType::ChatId,
-    };
-    let option = RequestOption::builder()
-        .tenant_access_token(token.to_string())
-        .build();
-    CreateMessageRequest::new(core_config.clone())
-        .receive_id_type(id_type)
-        .execute_with_options(body, option)
-        .await
-        .map_err(|e| imagent_core::CoreError::Platform(PLATFORM, format!("send_image_msg: {e}")))?;
-    Ok(())
+    retry_on_rate_limit!(async {
+        let body = CreateMessageBody {
+            receive_id: receive_id.to_string(),
+            msg_type: "image".to_string(),
+            content: json!({ "image_key": image_key }).to_string(),
+            uuid: None,
+        };
+        let id_type = match kind {
+            ReceiveIdKind::OpenId => ReceiveIdType::OpenId,
+            ReceiveIdKind::ChatId => ReceiveIdType::ChatId,
+        };
+        let option = RequestOption::builder()
+            .tenant_access_token(token.to_string())
+            .build();
+        CreateMessageRequest::new(core_config.clone())
+            .receive_id_type(id_type)
+            .execute_with_options(body, option)
+            .await
+            .map_err(|e| {
+                imagent_core::CoreError::Platform(PLATFORM, format!("send_image_msg: {e}"))
+            })?;
+        Ok(())
+    })
 }
 
 /// 获取 `tenant_access_token`（手动，配合 [`send_text_msg`] 的低层写法）。
@@ -644,6 +681,52 @@ mod tests {
     fn constants_sane() {
         assert!(BACKOFF_CAP >= Duration::from_secs(30));
         assert_eq!(PLATFORM, "feishu");
+    }
+
+    /// 第六批：token 失效错误码识别——SDK ApiError Display 形态（"API错误
+    /// 99991663 response: ..."）、手写路径形态、以及消息文案形态都要命中；
+    /// 无关错误码不能误伤。
+    #[test]
+    fn token_invalid_msg_detection() {
+        for hit in [
+            "API错误 99991663 response: Invalid access token for authorization",
+            "API错误 99991661 response: tenant access token is empty",
+            "send_message: 认证失败: invalid access token for authorization",
+            "fetch_bot_open_id: code=99991664 msg=xx",
+            "API错误 99991668 response: invalid app_access_token",
+        ] {
+            assert!(is_token_invalid_msg(hit), "应识别: {hit}");
+        }
+        for miss in [
+            "send_message: API错误 230020 too many request",
+            "download resource: HTTP 429",
+            "API错误 99991400 bad request",
+            "网络错误: connection refused",
+        ] {
+            assert!(!is_token_invalid_msg(miss), "不应识别: {miss}");
+        }
+    }
+
+    /// 第六批：限流识别扩展到 SDK 错误串形态（ApiError Display 携带 raw_code；
+    /// 业务变体 Debug 打印枚举名 TooManyRequests）。
+    #[test]
+    fn rate_limit_msg_detection_covers_sdk_forms() {
+        for hit in [
+            "download resource: HTTP 429",
+            "reply_comment: code=230020",
+            "API错误 429 response: too many request",
+            "API错误 230020 response: reach rate limit",
+            "业务错误 TooManyRequests: xx",
+        ] {
+            assert!(is_rate_limited_msg(hit), "应识别: {hit}");
+        }
+        for miss in [
+            "API错误 99991663",
+            "send_message: 网络错误",
+            "API错误 400 bad request",
+        ] {
+            assert!(!is_rate_limited_msg(miss), "不应识别: {miss}");
+        }
     }
 
     #[tokio::test]
