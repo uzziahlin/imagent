@@ -472,3 +472,62 @@ miss 时回退旧键（过渡期老凭据继续可用，下次 login 写入 scop
 
 **验证**：新增 3 测试（flock ×3 场景合并为 3 个用例 + /stop 中断 /compact +
 Err 路径持久化），全量 345 passed、fmt/clippy 绿。
+---
+
+## P5 第六批实现纪要（2026-08-19，路线图三大项）
+
+### 1. dispatch.rs 巨石拆分 ✅
+
+5238 行单文件拆为 `crates/core/src/dispatch/` 目录模块（后续所有迭代的摩擦来源
+消除）：
+
+| 文件 | 行数 | 内容 |
+|---|---|---|
+| `mod.rs` | ~730 | Dispatcher 状态与生命周期：构造 / run 主循环 / conv 锁与批处理 runner / merged_resume_list / reply 基元 / TaskBudgets |
+| `commands/mod.rs` | ~190 | `handle()`：发现态引导、白名单门、21 命令 match 分派、普通消息批处理入口 |
+| `commands/admin.rs` | ~340 | /allow /disallow /list /whoami /chat /config /perm（白名单/权限/配置） |
+| `commands/session.rs` | ~480 | /new /switch /sessions /resume /compact /stop（会话生命周期） |
+| `commands/misc.rs` | ~340 | /status /doctor /reconnect /cd /ws /img /help（状态/环境/媒体） |
+| `round.rs` | ~470 | run_agent_round/run_round_inner：单轮 agent 状态机（流式收集/看门狗/落库） |
+| `socket.rs` | ~400 | 权限审批 Unix socket（双行握手协议）+ peer_uid 鉴权 |
+| `tests.rs` | ~2400 | 全部单测原样集中 |
+
+手法：sed 行区间搬运（内容零转录）+ 子模块 `use super::*`（子模块可见父模块
+私有项，字段/方法零可见性翻动）+ 命令臂逐个提取为 `cmd_x` 方法（签名按臂捕获
+变量最小化）。跨模块方法 `pub(super)`/`pub(crate)`，`lib.rs` 的
+`dispatch::{Dispatcher, TaskBudgets}` 导出路径不变。行为等价性由 351 项测试背书。
+
+### 2. 孤儿流式卡片启动关流 ✅（store schema v6）
+
+进程崩溃/被 kill 后，飞书流式卡片永远停在「生成中」（P5-11 只覆盖进程活着时
+的终态 patch 失败）。闭环：
+
+- **schema v6**：`live_cards(conv_id PK, platform, handle, updated_at)`——每 conv
+  至多一张在飞卡片（轮次串行）。
+- **登记**：`CardSession` 首帧 `send_card` 拿到真实句柄（None=降级纯文本，无卡片
+  可滞留）即 upsert 登记；终态 patch **成功**才摘除。P5-11 降级路径（patch 失败
+  纯文本补发）登记保留——卡片本身留给扫描关流。
+- **扫描**：`imagent_core::sweep_live_cards`（Start 时调）：本平台孤儿卡片
+  `update_card` patch 成「⏸️ imagent 已重启，本次生成被中断」Error 终态；异平台
+  登记（平台已切换）无处 patch，作废删除；patch 失败保留登记下次启动再试。
+  飞书 update_card 仅凭 handle（`card:`/`msg:` 前缀）即可 patch，重启后依然可关流。
+
+### 3. feishu token 失效自愈 + SDK 路径 429 重试 ✅
+
+- **token 失效错误码清缓存重试**：缓存 tenant_access_token 被服务端提前吊销
+  （app_secret 轮换/后台强制失效）时，TTL 内重用旧值永远失败。新增
+  `is_token_invalid_msg`（99991661-64/68/79 + "invalid access token" 文案；SDK
+  ApiError Display 携带 raw_code，字符串识别两路径通用）+ 平台侧 `with_token`
+  辅助：遇失效码 → 清缓存强制刷新 → 重试一次。覆盖 send_text（双路径分片）、
+  send_media、send_card、update_card、审批卡片/撤卡、drain task 媒体下载。
+- **SDK 路径 429 重试**：`retry_on_rate_limit!` 此前只包手写 HTTP 路径；现在
+  send_text_msg / send_card_msg / patch_card / send_card_ref_msg / upload_image /
+  send_image_msg 六个 SDK 函数全部包裹，识别串扩展 SDK Display 形态
+  （"API错误 429/230020"、"业务错误 TooManyRequests"）。
+
+**验证**：新增 6 测试（live_cards 登记/摘除/保留 + sweep 两场景 + v5→v6 迁移
+回环 + 识别函数 ×2），全量 351 passed、fmt/clippy 绿。
+
+**剩余待办**：三个 dependabot 失败 PR（clap MSRV / aes cargo-deny / tokio-tungstenite
+API break）、真机冒烟（ACP e2e + 权限握手）、wecom 出站 ack 闭环、P5-14 per-conv
+连接、飞书 fuzz target、mdBook 文档站同步。

@@ -3,7 +3,7 @@
 //! 用 `PRAGMA user_version` 做简单线性迁移：v1 = 建 5 张基础表，v2 = 动态白名单 + 审计日志。
 
 /// 当前代码支持的最新 schema 版本（migrate 上限 + user_version 过新拒绝阈值，P2-O）。
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// v1 全部建表语句（`CREATE TABLE IF NOT EXISTS`，可重复执行）。
 pub const SCHEMA_V1: &str = r#"
@@ -106,6 +106,18 @@ CREATE TABLE IF NOT EXISTS session_history (
 );
 "#;
 
+/// v6：在飞流式卡片登记（P4_ROADMAP 第六批「孤儿卡片关流」）。卡片首帧发出时
+/// upsert 本表；终态 patch 成功后删除。进程崩溃/重启后启动扫描据此把滞留在
+/// 「生成中」的卡片 patch 成「已中断」终态。每 conv 至多一张在飞卡片（轮次串行）。
+pub const SCHEMA_V6: &str = r#"
+CREATE TABLE IF NOT EXISTS live_cards (
+  conv_id    TEXT PRIMARY KEY,
+  platform   TEXT NOT NULL,
+  handle     TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+"#;
+
 /// 在已打开的连接上跑线性迁移。幂等：逐版本推进（v1→v2→…），已到目标版本则跳过。
 pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     let current: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -144,6 +156,10 @@ pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     if current < 5 {
         tx.execute_batch(SCHEMA_V5)?;
         tx.pragma_update(None, "user_version", 5_i64)?;
+    }
+    if current < 6 {
+        tx.execute_batch(SCHEMA_V6)?;
+        tx.pragma_update(None, "user_version", 6_i64)?;
     }
     tx.commit()?;
     Ok(())

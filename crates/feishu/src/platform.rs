@@ -153,6 +153,52 @@ impl FeishuPlatform {
                             }
                             _ => continue,
                         };
+                        // token 失效自愈（与发送侧 with_token 同语义）：清缓存强制
+                        // 刷新后再试一次；二次仍失败如实进 media_errors。
+                        let dl = match dl {
+                            Ok(b) => Ok(b),
+                            Err(e) if crate::client::is_token_invalid_msg(&e.to_string()) => {
+                                warn!(target: "feishu", error = %e, "媒体下载遇 token 失效码，清缓存刷新后重试一次");
+                                *token_for_drain.write().await = None;
+                                let token = match fetch_cached_token(
+                                    &token_for_drain,
+                                    &core_config_for_drain,
+                                    &app_id_for_drain,
+                                    &app_secret_for_drain,
+                                )
+                                .await
+                                {
+                                    Ok(t) => t,
+                                    Err(e2) => {
+                                        msg.media_errors
+                                            .push(format!("{}: 重取 token 失败: {e2}", p.key));
+                                        continue;
+                                    }
+                                };
+                                match p.kind {
+                                    "image" => {
+                                        download_image(
+                                            &core_config_for_drain,
+                                            &token,
+                                            &p.message_id,
+                                            &p.key,
+                                        )
+                                        .await
+                                    }
+                                    "file" => {
+                                        download_file(
+                                            &core_config_for_drain,
+                                            &token,
+                                            &p.message_id,
+                                            &p.key,
+                                        )
+                                        .await
+                                    }
+                                    _ => continue,
+                                }
+                            }
+                            other => other,
+                        };
                         match dl {
                             Ok(bytes) => match persist_media(p.kind, &p.key, &bytes) {
                                 Ok(path) => msg.media.push(MediaRef {
@@ -256,6 +302,33 @@ impl FeishuPlatform {
         .await
     }
 
+    /// 清空 token 缓存（下次 `get_token` 强制刷新）。
+    async fn invalidate_token(&self) {
+        *self.token.write().await = None;
+    }
+
+    /// 取 token 执行 `f(token)`；遇 token 失效类错误码（99991663 等，识别见
+    /// [`crate::client::is_token_invalid_msg`]）→ 清缓存重取后再试一次。
+    ///
+    /// 缓存 token 被服务端提前吊销（app_secret 轮换 / 后台强制失效）时，TTL 内
+    /// 重用旧值永远失败；此前只能等 TTL 过期自愈。二次仍失败则如实返回错误。
+    async fn with_token<T, F, Fut>(&self, f: F) -> Result<T>
+    where
+        F: Fn(String) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let token = self.get_token().await?;
+        match f(token).await {
+            Err(e) if crate::client::is_token_invalid_msg(&e.to_string()) => {
+                warn!(target: "feishu", error = %e, "token 失效错误码，清缓存强制刷新后重试一次");
+                self.invalidate_token().await;
+                let fresh = self.get_token().await?;
+                f(fresh).await
+            }
+            other => other,
+        }
+    }
+
     /// 取该 card_id 的下一个 sequence（严格递增；element 与 settings PATCH 共用）。
     async fn next_card_seq(&self, card_id: &str) -> i64 {
         let mut m = self.card_seqs.lock().await;
@@ -354,13 +427,22 @@ impl Platform for FeishuPlatform {
     async fn send_text(&self, conv: &ConvId, text: &str, _hint: &ReplyHint) -> Result<()> {
         // P4-9：评论线程 conv → 回复云文档评论（每分片一条回复）。
         if let Some((file_token, comment_id)) = comment_target_from_conv(conv) {
-            let token = self.get_token().await?;
             let chunks: Vec<String> = split_message(text, FEISHU_TEXT_MAX);
             let total = chunks.len();
             for (i, chunk) in chunks.into_iter().enumerate() {
                 // P5：中途失败标明分片序号——用户能感知回复被截断而非静默缺尾。
-                if let Err(e) =
-                    reply_comment(&self.core_config, &token, &file_token, &comment_id, &chunk).await
+                // token 失效错误码由 with_token 清缓存自愈（其余错误如实上抛）。
+                if let Err(e) = self
+                    .with_token(|t| {
+                        let file_token = file_token.clone();
+                        let comment_id = comment_id.clone();
+                        let chunk = chunk.clone();
+                        async move {
+                            reply_comment(&self.core_config, &t, &file_token, &comment_id, &chunk)
+                                .await
+                        }
+                    })
+                    .await
                 {
                     return Err(CoreError::Platform(
                         PLATFORM,
@@ -375,10 +457,16 @@ impl Platform for FeishuPlatform {
         let chunks: Vec<String> = split_message(text, FEISHU_TEXT_MAX);
         let total = chunks.len();
         for (i, chunk) in chunks.into_iter().enumerate() {
-            let token = self.get_token().await?;
             // P5：同上——分片失败标注序号（此前中途 ? 退出，截断无标记）。
-            if let Err(e) =
-                send_text_msg(&self.core_config, &token, &receive_id, kind, &chunk).await
+            if let Err(e) = self
+                .with_token(|t| {
+                    let receive_id = receive_id.clone();
+                    let chunk = chunk.clone();
+                    async move {
+                        send_text_msg(&self.core_config, &t, &receive_id, kind, &chunk).await
+                    }
+                })
+                .await
             {
                 return Err(CoreError::Platform(
                     PLATFORM,
@@ -400,9 +488,18 @@ impl Platform for FeishuPlatform {
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "image.png".to_string());
-        let token = self.get_token().await?;
-        let image_key = upload_image(&self.core_config, &token, &file_name, bytes).await?;
-        send_image_msg(&self.core_config, &token, &receive_id, kind, &image_key).await
+        // 上传 + 发送共用一次 with_token：同一 token 失效只自愈重试一轮。
+        // 重试要求闭包可重入，move 型捕获（bytes/receive_id/file_name）先 clone。
+        self.with_token(|t| {
+            let bytes = bytes.clone();
+            let receive_id = receive_id.clone();
+            let file_name = file_name.clone();
+            async move {
+                let image_key = upload_image(&self.core_config, &t, &file_name, bytes).await?;
+                send_image_msg(&self.core_config, &t, &receive_id, kind, &image_key).await
+            }
+        })
+        .await
     }
 
     async fn send_typing(&self, _conv: &ConvId, _hint: &ReplyHint) -> Result<()> {
@@ -440,9 +537,17 @@ impl Platform for FeishuPlatform {
         }
         let (receive_id, kind) = receive_target_from_conv(conv)
             .ok_or_else(|| CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0)))?;
-        let token = self.get_token().await?;
         let card_json = render_permission_card(tool_name, input_summary, &conv.0);
-        match send_card_msg(&self.core_config, &token, &receive_id, kind, &card_json).await {
+        match self
+            .with_token(|t| {
+                let receive_id = receive_id.clone();
+                let card_json = card_json.clone();
+                async move {
+                    send_card_msg(&self.core_config, &t, &receive_id, kind, &card_json).await
+                }
+            })
+            .await
+        {
             Ok(mid) => {
                 if let Some(mid) = mid {
                     self.pending_asks
@@ -467,8 +572,12 @@ impl Platform for FeishuPlatform {
             return Ok(());
         };
         let card_json = render_permission_card_cancelled(&tool_name);
-        let token = self.get_token().await?;
-        patch_card(&self.core_config, &token, &message_id, &card_json).await
+        self.with_token(|t| {
+            let message_id = message_id.clone();
+            let card_json = card_json.clone();
+            async move { patch_card(&self.core_config, &t, &message_id, &card_json).await }
+        })
+        .await
     }
 
     /// 发流式卡片。**句柄前缀分流**（core 无感，两种句柄均原样透传给 update_card）：
@@ -483,26 +592,31 @@ impl Platform for FeishuPlatform {
     ) -> Result<Option<String>> {
         let (receive_id, kind) = receive_target_from_conv(conv)
             .ok_or_else(|| CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0)))?;
-        let token = self.get_token().await?;
-        match create_card_entity(&token, &render_stream_init_card()).await {
-            Ok(card_id) => {
-                match send_card_ref_msg(&self.core_config, &token, &receive_id, kind, &card_id)
-                    .await
-                {
-                    Ok(_) => Ok(Some(format!("card:{card_id}"))),
+        self.with_token(|t| {
+            let receive_id = receive_id.clone();
+            async move {
+                match create_card_entity(&t, &render_stream_init_card()).await {
+                    Ok(card_id) => {
+                        match send_card_ref_msg(&self.core_config, &t, &receive_id, kind, &card_id)
+                            .await
+                        {
+                            Ok(_) => Ok(Some(format!("card:{card_id}"))),
+                            Err(e) => {
+                                // 实体已建但消息发送失败：实体作废（14 天过期自然回收），降级 raw。
+                                warn!(target: "feishu", error = %e, "发送卡片引用消息失败，降级 raw 卡片");
+                                self.send_card_raw(&receive_id, kind, card, &t).await
+                            }
+                        }
+                    }
                     Err(e) => {
-                        // 实体已建但消息发送失败：实体作废（14 天过期自然回收），降级 raw。
-                        warn!(target: "feishu", error = %e, "发送卡片引用消息失败，降级 raw 卡片");
-                        self.send_card_raw(&receive_id, kind, card, &token).await
+                        // 权限未开（cardkit:card:write）或创建失败 → 降级 raw + 整卡 im patch。
+                        warn!(target: "feishu", error = %e, "创建卡片实体失败（需 cardkit:card:write 权限），降级 raw 卡片");
+                        self.send_card_raw(&receive_id, kind, card, &t).await
                     }
                 }
             }
-            Err(e) => {
-                // 权限未开（cardkit:card:write）或创建失败 → 降级 raw + 整卡 im patch。
-                warn!(target: "feishu", error = %e, "创建卡片实体失败（需 cardkit:card:write 权限），降级 raw 卡片");
-                self.send_card_raw(&receive_id, kind, card, &token).await
-            }
-        }
+        })
+        .await
     }
 
     /// 更新流式卡片。按 [`send_card`](Self::send_card) 返回的句柄前缀分流：
@@ -517,55 +631,57 @@ impl Platform for FeishuPlatform {
         card: &OutboundCard,
         _hint: &ReplyHint,
     ) -> Result<()> {
-        let token = self.get_token().await?;
-        if let Some(card_id) = handle.strip_prefix("card:") {
-            match &card.terminal {
-                CardTerminal::Running => {
-                    let content = stream_body_md(&card.text, &card.tool_calls);
-                    let seq = self.next_card_seq(card_id).await;
-                    match patch_card_element(&token, card_id, "md_body", &content, seq).await {
-                        // 流式超时（200850）：服务端已自动关流式，长任务 Running 期会触发。
-                        // 自愈：重开 streaming_mode 后重试一次（sequence 继续递增）。
-                        Err(e) if e.to_string().contains("code=200850") => {
-                            warn!(target: "feishu", card_id, "流式超时，重开 streaming_mode 后重试");
-                            let settings = serde_json::json!({
-                                "config": { "streaming_mode": true }
-                            })
-                            .to_string();
-                            let seq2 = self.next_card_seq(card_id).await;
-                            patch_card_settings(&token, card_id, &settings, seq2).await?;
-                            let seq3 = self.next_card_seq(card_id).await;
-                            patch_card_element(&token, card_id, "md_body", &content, seq3).await
+        self.with_token(|token| async move {
+            if let Some(card_id) = handle.strip_prefix("card:") {
+                match &card.terminal {
+                    CardTerminal::Running => {
+                        let content = stream_body_md(&card.text, &card.tool_calls);
+                        let seq = self.next_card_seq(card_id).await;
+                        match patch_card_element(&token, card_id, "md_body", &content, seq).await {
+                            // 流式超时（200850）：服务端已自动关流式，长任务 Running 期会触发。
+                            // 自愈：重开 streaming_mode 后重试一次（sequence 继续递增）。
+                            Err(e) if e.to_string().contains("code=200850") => {
+                                warn!(target: "feishu", card_id, "流式超时，重开 streaming_mode 后重试");
+                                let settings = serde_json::json!({
+                                    "config": { "streaming_mode": true }
+                                })
+                                .to_string();
+                                let seq2 = self.next_card_seq(card_id).await;
+                                patch_card_settings(&token, card_id, &settings, seq2).await?;
+                                let seq3 = self.next_card_seq(card_id).await;
+                                patch_card_element(&token, card_id, "md_body", &content, seq3).await
+                            }
+                            other => other,
                         }
-                        other => other,
+                    }
+                    CardTerminal::Done | CardTerminal::Error(_) => {
+                        let err = match &card.terminal {
+                            CardTerminal::Error(e) => Some(e.as_str()),
+                            _ => None,
+                        };
+                        let content = stream_body_final(&card.text, &card.tool_calls, err);
+                        let seq = self.next_card_seq(card_id).await;
+                        let element =
+                            patch_card_element(&token, card_id, "md_body", &content, seq).await;
+                        // 关闭流式（光标消失）；sequence 与 element PATCH 共用递增。
+                        let settings =
+                            serde_json::json!({ "config": { "streaming_mode": false } }).to_string();
+                        let seq2 = self.next_card_seq(card_id).await;
+                        patch_card_settings(&token, card_id, &settings, seq2).await?;
+                        element
                     }
                 }
-                CardTerminal::Done | CardTerminal::Error(_) => {
-                    let err = match &card.terminal {
-                        CardTerminal::Error(e) => Some(e.as_str()),
-                        _ => None,
-                    };
-                    let content = stream_body_final(&card.text, &card.tool_calls, err);
-                    let seq = self.next_card_seq(card_id).await;
-                    let element =
-                        patch_card_element(&token, card_id, "md_body", &content, seq).await;
-                    // 关闭流式（光标消失）；sequence 与 element PATCH 共用递增。
-                    let settings =
-                        serde_json::json!({ "config": { "streaming_mode": false } }).to_string();
-                    let seq2 = self.next_card_seq(card_id).await;
-                    patch_card_settings(&token, card_id, &settings, seq2).await?;
-                    element
-                }
+            } else if let Some(message_id) = handle.strip_prefix("msg:") {
+                let card_json = render_card(card);
+                patch_card(&self.core_config, &token, message_id, &card_json).await
+            } else {
+                Err(CoreError::Platform(
+                    PLATFORM,
+                    format!("非法卡片句柄: {handle}"),
+                ))
             }
-        } else if let Some(message_id) = handle.strip_prefix("msg:") {
-            let card_json = render_card(card);
-            patch_card(&self.core_config, &token, message_id, &card_json).await
-        } else {
-            Err(CoreError::Platform(
-                PLATFORM,
-                format!("非法卡片句柄: {handle}"),
-            ))
-        }
+        })
+        .await
     }
 
     fn name(&self) -> &'static str {

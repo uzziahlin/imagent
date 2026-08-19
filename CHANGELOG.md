@@ -2,6 +2,20 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [Unreleased] — P5 第六波：路线图三大项——dispatch 拆模块、孤儿卡片关流（schema v6）、feishu token 自愈
+
+（见 [P4_ROADMAP](docs/internal/P4_ROADMAP.md) P5 第六批纪要。）
+
+### Changed
+- **dispatch.rs 巨石拆分**：5238 行单文件拆为 `dispatch/` 目录模块——`mod.rs`（Dispatcher 生命周期/主循环/批处理 runner）、`commands/{mod,admin,session,misc}.rs`（21 个斜杠命令按主题分组，`handle()` 只留鉴权门 + 分派）、`round.rs`（单轮 agent 状态机）、`socket.rs`（权限审批 socket）、`tests.rs`。内容零转录搬运 + 子模块 `use super::*`，`lib.rs` 导出路径不变，行为等价由全量测试背书。
+- **store schema v6**：新增 `live_cards` 表（在飞流式卡片登记，per-conv 至多一张，含 v5→v6 迁移）。
+
+### Fixed
+- **进程重启后飞书流式卡片不再永远停在「生成中」**：卡片首帧发出即句柄落库（`live_cards`），终态 patch 成功摘除；崩溃/被 kill 后下次启动按登记扫描，把孤儿卡片 patch 成「⏸️ imagent 已重启，本次生成被中断」终态（P5-11 的纯文本降级路径登记保留，同样由扫描收尾）；平台已切换的旧登记作废删除。
+- **feishu 缓存 token 被服务端提前吊销后 2 小时内无法自愈**：识别 token 失效错误码（99991661-64/68/79 及 "invalid access token" 文案），清缓存强制刷新后重试一次——覆盖文本/评论分片、媒体上传、流式卡片创建/更新、审批卡片与撤卡、入站媒体下载。
+- **feishu SDK 路径无 429 重试**：`send_text_msg`/`send_card_msg`/`patch_card`/`send_card_ref_msg`/`upload_image`/`send_image_msg` 六个 SDK 函数补齐 500ms→1s→2s 退避重试（识别串扩展到 SDK ApiError Display 形态）。
+- workspace 测试 351 passed（新增 6：live_cards 生命周期 ×3、v5→v6 迁移回环、token/限流识别 ×2）；clippy 0 warning；fmt clean。
+
 ## [Unreleased] — P5 第五波：push 后自审——修复三处自引入回归 + 六处次级问题
 
 （对 P5 前四波 diff 的二次审查结论，见 [P4_ROADMAP](docs/internal/P4_ROADMAP.md) P5 章节。）
