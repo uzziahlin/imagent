@@ -2,8 +2,10 @@
 
 > 面向用户的文档。
 
-- [架构设计](./DESIGN.md)
+- [现状架构（as-built）](./ARCHITECTURE.md)
 - [调研归档（iLink 协议/合规/竞品）](./RESEARCH.md)
+- [平台扩展设计：飞书接入](./FEISHU_DESIGN.md)
+- [初始设计快照（P1，历史）](./DESIGN.md)
 
 ---
 

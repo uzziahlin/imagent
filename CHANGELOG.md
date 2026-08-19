@@ -2,6 +2,15 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [Unreleased] — P5 第七波（维护）：dependabot 八连清零、feishu fuzz、文档站同步
+
+（见 [P4_ROADMAP](docs/internal/P4_ROADMAP.md) P5 第七批纪要。）
+
+### Changed
+- **依赖升级**（dependabot 积压 8 个 PR 全部落地）：GitHub Actions（deploy-pages v5 / upload-pages-artifact v5 / codecov-action v7 / upload-artifact v7 / action-gh-release v3）；tokio-tungstenite 0.24→0.29（`Message::Text` 载荷改 Utf8Bytes，wecom 客户端适配 `Message::text()`；与 openlark SDK 统一在 0.29 避免双版本栈）；aes 0.8→0.9（cipher 0.5 trait 改名 + `from_mut_slice` 弃用迁移）；clap →4.6.6。三个 cargo PR 的 CI 失败根因是过期分支（fmt 漂移 + lock 漂移），当前 main 重放全绿。
+- **飞书事件解析 fuzz target**：消息/审批按钮/云文档评论三类 payload 全解析路径（`feishu_event_parse`），并入每周 fuzz 任务；本地冒烟 162 万次执行零崩溃。
+- **mdBook 文档站同步**：新增 `ARCHITECTURE.md` 现状架构（文档站首页内容）；`SUMMARY.md` 补上此前遗漏的 FEISHU_DESIGN；DESIGN/FEISHU_DESIGN 状态头改为历史快照指向新文档；`.gitignore` 补 book/ 与 fuzz 本地产物。
+
 ## [Unreleased] — P5 第六波：路线图三大项——dispatch 拆模块、孤儿卡片关流（schema v6）、feishu token 自愈
 
 （见 [P4_ROADMAP](docs/internal/P4_ROADMAP.md) P5 第六批纪要。）

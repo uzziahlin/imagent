@@ -1,6 +1,8 @@
 # 飞书（Feishu / Lark）平台接入设计
 
-> 状态：**方案设计**，待 review；实现时委派 omp。
+> 状态：**已实现并上线**（P4 落地，后续迭代含 CardKit 真流式卡片、审批按钮卡片、
+> 云文档评论 @bot、429/token 失效自愈）。本文保留**设计决策与权衡**原貌；
+> 当前真实结构见 [ARCHITECTURE.md](./ARCHITECTURE.md)。
 > 关联：本文件是 [`DESIGN.md`](./DESIGN.md) 三层 + 双抽象的「Platform 扩展」补充，聚焦新增 `feishu` 平台。
 > 模板：实现高度参照现有 [`crates/wecom`](../crates/wecom)（企业微信官方 API），飞书与它同属「官方 API + 事件订阅 + 独立 bot 身份」一类。
 

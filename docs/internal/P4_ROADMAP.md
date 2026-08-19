@@ -531,3 +531,45 @@ Err 路径持久化），全量 345 passed、fmt/clippy 绿。
 **剩余待办**：三个 dependabot 失败 PR（clap MSRV / aes cargo-deny / tokio-tungstenite
 API break）、真机冒烟（ACP e2e + 权限握手）、wecom 出站 ack 闭环、P5-14 per-conv
 连接、飞书 fuzz target、mdBook 文档站同步。
+
+---
+
+## P5 第七批实现纪要（2026-08-19，维护波：dependabot 清零 + fuzz + 文档站）
+
+### 1. dependabot 积压 8 个 PR 全部清零 ✅
+
+- **#1-#5（GitHub Actions 升级）**：deploy-pages v5、upload-pages-artifact v5、
+  codecov-action v7、upload-artifact v7、action-gh-release v3。gh 的 OAuth token
+  无 workflow scope 无法 API 合并 → 本地应用等价变更（`66a8d26`），commit message
+  自动关闭（#1 恰好已被仓库主在远端合并，rebase 去重）。
+- **#6 tokio-tungstenite 0.24→0.29**：API break 是 `Message::Text` 载荷
+  String→Utf8Bytes（0.26 起），wecom 客户端三处改 `Message::text()` 构造器；版本
+  统一在 0.29 与 openlark SDK 对齐（0.30 会双版本栈）。
+- **#7 clap →4.6.6**：lock 重解即可（PR 失败根因是过期分支的 fmt 漂移 + 旧 lock
+  把 keyring dbus 后端拉进 MSRV job）。
+- **#8 aes 0.8→0.9**：cipher 0.5 trait 改名（BlockEncrypt→BlockCipherEncrypt）+
+  `from_mut_slice` 弃用改 TryFrom 定长数组两步走；webpki-roots 的
+  CDLA-Permissive-2.0 此前已入 deny 清单。
+
+三个 cargo PR 的 CI 失败共同根因：**分支基于 7 月旧 main**（新 rustfmt 对旧代码
+的 fmt 差异 + Cargo.lock 漂移），非依赖本身问题——当前 main 重放全绿。
+
+### 2. feishu 事件解析 fuzz target ✅
+
+`fuzz_targets/feishu_event_parse.rs`：三类事件 payload（消息/审批按钮/云文档评论）
+过 parse_message_event / parse_card_action_event / is_comment_event +
+parse_comment_event（bot_open_id 有无两态），drain task 同路径。`proto` 模块转
+pub 供 fuzz 直打。本地 60s 冒烟 162 万次执行零崩溃；周任务 fuzz.yml 加 300s 档。
+
+### 3. mdBook 文档站同步 ✅
+
+- 新增 `docs/ARCHITECTURE.md`（现状架构 as-built：crate 全景 / dispatch 拆分后
+  结构 / 消息流水线 / schema v6 / 权限闭环 / 可靠性机制 / 安全模型），列为文档站
+  首页。
+- `SUMMARY.md` 修复：FEISHU_DESIGN.md 此前根本不在目录里。
+- DESIGN.md / FEISHU_DESIGN.md 状态头修正为「历史快照/已实现」，指向
+  ARCHITECTURE.md。本地 mdbook build 验证通过。
+- `.gitignore` 补 `/book`、`/fuzz/corpus`、`/fuzz/artifacts`。
+
+**剩余待办**：真机冒烟（ACP e2e + 权限握手 + 孤儿卡片 kill -9 验证）→ P5-14
+per-conv 连接 + ACP Ask 接线；wecom ack 闭环；gemini /resume 不跟进。

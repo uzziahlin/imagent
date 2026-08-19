@@ -22,3 +22,10 @@ fuzz/*/corpus/
 fuzz/*/artifacts/
 fuzz/*/coverage/
 fuzz/target/
+
+# mdBook 本地构建产物（Pages 在 CI 构建）
+/book
+
+# cargo-fuzz 本地产物（corpus/artifacts 只留在本机）
+/fuzz/corpus
+/fuzz/artifacts

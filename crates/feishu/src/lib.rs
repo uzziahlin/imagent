@@ -18,6 +18,8 @@
 mod card;
 mod client;
 mod platform;
-mod proto;
+/// 纯函数解析层（事件 payload → InboundMessage）。pub 供 fuzz target 直接
+/// 打外部输入攻击面（fuzz/fuzz_targets/feishu_event_parse.rs）。
+pub mod proto;
 
 pub use platform::FeishuPlatform;
