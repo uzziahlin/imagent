@@ -2,11 +2,12 @@
 
 > 实现阶段的主要依据。重开会话写代码前必读。调研背景见 `RESEARCH.md`。
 
-> ⚠️ **文档状态（2026-07）**：本文档是 P1 阶段的初始设计快照。代码已实现至 P3（双平台
-> ilink/wecom、四后端 claude-cli/claude-acp/codex/gemini、IM 权限审批闭环、凭据 OS keyring 加密、
-> Prometheus 指标、SIGHUP 热重载、长消息分片等）。其中：`Backend::run` 实际签名已增加 `conv_id`
-> 参数（见 `crates/core/src/backend.rs`）；§13 路线表中的 P2/P3 项均已完成。本文档保留作架构
-> 参考，具体行为以代码 + `CHANGELOG.md` + `README.md` 为准。
+> ⚠️ **文档状态（2026-07）**：本文档是 P1 阶段的初始设计快照，**保留作历史参考**。
+> 当前代码的真实结构见 [ARCHITECTURE.md](./ARCHITECTURE.md)（随迭代维护）。代码已实现至
+> P3 之后（三平台 ilink/wecom/feishu、四后端、IM 权限审批闭环、keyring 凭据、流式卡片、
+> 批处理、孤儿卡片关流等）。其中：`Backend::run` 实际签名已增加 `conv_id`
+> 参数（见 `crates/core/src/backend.rs`）。具体行为以代码 + `CHANGELOG.md` +
+> `README.md` 为准。
 
 ## 1. 目标与非目标
 
