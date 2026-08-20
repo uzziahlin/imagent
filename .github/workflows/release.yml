@@ -42,7 +42,7 @@ jobs:
         run: brew install protobuf
       # 对齐 rust-toolchain.toml pin 的 1.88（用 @stable 会被 rust-toolchain.toml 覆盖回 1.88，
       # 而 @stable 装的 targets 不会落到 1.88 toolchain → E0463 can't find crate for `core`）
-      - uses: dtolnay/rust-toolchain@1.88
+      - uses: dtolnay/rust-toolchain@1.100
         with:
           targets: ${{ matrix.target }}
       # 显式确保 cross-compile target 的 rust-std 已装（@1.88 + rust-toolchain.toml
