@@ -19,7 +19,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install libdbus-1-dev (Linux keyring backend：keyring sync-secret-service 经 libdbus-sys)
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -55,7 +55,7 @@ jobs:
     name: check @ MSRV 1.88
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install libdbus-1-dev (Linux keyring backend)
         run: |
           sudo systemctl stop unattended-upgrades.service || true
@@ -77,7 +77,7 @@ jobs:
     # 带新 advisory 直接合入 main 后才暴露。
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: taiki-e/install-action@cargo-audit
       - name: cargo audit
         # RUSTSEC-2024-0437（protobuf uncontrolled recursion，经 prometheus 0.13.4
@@ -93,7 +93,7 @@ jobs:
     name: cargo-deny (licenses/sources/bans)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: taiki-e/install-action@cargo-deny
       - name: cargo deny check
         run: cargo deny check licenses sources bans
