@@ -36,7 +36,7 @@ serde_json = "1"
 aes = "0.9"
 ecb = "0.1"
 cipher = "0.4"
-base64 = "0.22"
+base64 = "0.23"
 hex = "0.4"
 
 # 存储 / 工具
