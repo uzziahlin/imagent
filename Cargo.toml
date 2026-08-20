@@ -34,7 +34,7 @@ serde_json = "1"
 
 # 加密（iLink 媒体 AES-128-ECB + PKCS7，协议强制，见 docs/RESEARCH.md）
 aes = "0.9"
-ecb = "0.1"
+ecb = "0.2"
 cipher = "0.4"
 base64 = "0.22"
 hex = "0.4"
