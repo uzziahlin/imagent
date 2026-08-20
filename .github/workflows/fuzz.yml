@@ -15,7 +15,7 @@ jobs:
   fuzz:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install libdbus dev
         # keyring 在 Linux 走 dbus Secret Service（libdbus-sys 构建需要系统头文件），
         # ubuntu runner 只带运行时库不带 -dev；缺它 build.rs 直接 panic。
