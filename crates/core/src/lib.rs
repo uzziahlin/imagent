@@ -33,15 +33,15 @@ mod types;
 pub use auth::Auth;
 pub use backend::Backend;
 pub use card_session::sweep_live_cards;
-pub use config::{Config, CotDetail, PermissionMode};
+pub use config::{validate_workdir, Config, CotDetail, PermissionMode};
 pub use dedup::Dedup;
 pub use dispatch::{Dispatcher, TaskBudgets};
 pub use error::{CoreError, Result};
 pub use message::split_message;
 pub use metrics::Metrics;
 pub use permission::{default_sock_path, parse_reply, PermissionReply, PermissionRouter};
-pub use platform::Platform;
+pub use platform::{command_card_fallback_text, Platform};
 pub use types::{
-    AgentChunk, CardTerminal, ConvId, InboundMessage, LocalSession, MediaRef, OutboundCard,
-    ReplyHint, RunOutcome, SessionId, UserId, Workdir,
+    AgentChunk, CardButton, CardTerminal, ConvId, InboundMessage, LocalSession, MediaRef, Mention,
+    OutboundCard, ReplyHint, RunOutcome, SessionId, UserId, Workdir,
 };

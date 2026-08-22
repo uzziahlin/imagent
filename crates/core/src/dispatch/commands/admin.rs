@@ -1,20 +1,59 @@
 //! 白名单 / 权限 / 配置类命令（管理操作，多数有 admin 门槛）。
 
 use super::*;
-use crate::types::UserId;
+use crate::types::{Mention, UserId};
+
+/// P6-2：`/allow @名字` 的提及反解——从**本条消息**的 mentions 元数据取 open_id
+/// （平台层已把 @占位 换成 `@名字`，此处只做名字 → id 匹配）。
+/// - @名精确命中 → 该用户 id；
+/// - 名字未命中但 mentions 恰好一条 → 唯一性兜底（显示名可能被客户端截断/改写）；
+/// - 其余（无提及 / 名字歧义）→ None，调用方回用法提示。
+fn resolve_mention_target<'a>(arg: &str, mentions: &'a [Mention]) -> Option<&'a str> {
+    let name = arg.strip_prefix('@')?.trim();
+    if name.is_empty() || mentions.is_empty() {
+        return None;
+    }
+    if let Some(m) = mentions.iter().find(|m| m.name == name) {
+        return Some(&m.user_id);
+    }
+    if mentions.len() == 1 {
+        return Some(&mentions[0].user_id);
+    }
+    None
+}
 
 impl Dispatcher {
-    /// /allow <id> —— 授权新用户（admin 门槛 + 审计 + 持久化失败告警）。
+    /// /allow <id|@名字> —— 授权新用户（admin 门槛 + 审计 + 持久化失败告警）。
+    /// P6-2：@提及形态由 [`resolve_mention_target`] 从消息元数据反解 open_id。
     pub(super) async fn cmd_allow(
         &self,
         conv: &ConvId,
         sender: &UserId,
         hint: &ReplyHint,
         parts: &[&str],
+        mentions: &[Mention],
     ) {
-        let target = parts.get(1).map(|s| s.trim()).unwrap_or("");
+        let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+        // P6-2：@提及形态先反解 open_id；反解不出则提示（不误把手打的 @字串 当 id）。
+        let target: String = if arg.starts_with('@') {
+            match resolve_mention_target(arg, mentions) {
+                Some(id) => id.to_string(),
+                None => {
+                    self.reply(
+                        conv,
+                        "无法从本条消息解析该 @提及。请在同一条命令里 @ 该用户（如 `/allow @张三`），或直接用其 open_id（`ou_` 开头，`/whoami` 可查自己的）。",
+                        hint,
+                    )
+                    .await;
+                    return;
+                }
+            }
+        } else {
+            arg.to_string()
+        };
         if target.is_empty() {
-            self.reply(conv, "用法: /allow <sender_id>", hint).await;
+            self.reply(conv, "用法: /allow <sender_id|@名字>", hint)
+                .await;
         } else {
             let actor = sender.0.as_str();
             // P2-D：仅管理员可授权新用户（admin_senders 非空时严格；
@@ -24,11 +63,11 @@ impl Dispatcher {
                     .await;
                 return;
             }
-            let added = self.auth.allow(target);
+            let added = self.auth.allow(&target);
             // P2-E：持久化失败不能谎报「已授权」（内存已加但重启后丢失）。
             let persist_failed = self
                 .store
-                .add_allowed_sender(target, Some(actor), Some("im"))
+                .add_allowed_sender(&target, Some(actor), Some("im"))
                 .await
                 .is_err();
             if persist_failed {
@@ -39,7 +78,7 @@ impl Dispatcher {
                 .append_audit(
                     "allow",
                     Some(actor),
-                    Some(target),
+                    Some(&target),
                     Some(if added { "added" } else { "already-present" }),
                 )
                 .await
@@ -59,13 +98,14 @@ impl Dispatcher {
         }
     }
 
-    /// /disallow <id> —— 撤销授权（admin 门槛，防自锁）。
+    /// /disallow <id|@名字> —— 撤销授权（admin 门槛，防自锁）。P6-2：支持 @提及。
     pub(super) async fn cmd_disallow(
         &self,
         conv: &ConvId,
         sender: &UserId,
         hint: &ReplyHint,
         parts: &[&str],
+        mentions: &[Mention],
     ) {
         // P5-3（安全）：撤销白名单成员影响全局授权——此前无 admin 门槛，
         // 任何过门用户（含群内陌生成员）可把管理员本人踢出白名单（DoS）。
@@ -75,9 +115,27 @@ impl Dispatcher {
                 .await;
             return;
         }
-        let target = parts.get(1).map(|s| s.trim()).unwrap_or("");
+        let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+        // P6-2：与 /allow 同款 @提及反解。
+        let target: String = if arg.starts_with('@') {
+            match resolve_mention_target(arg, mentions) {
+                Some(id) => id.to_string(),
+                None => {
+                    self.reply(
+                        conv,
+                        "无法从本条消息解析该 @提及。请在同一条命令里 @ 该用户，或直接用其 open_id。",
+                        hint,
+                    )
+                    .await;
+                    return;
+                }
+            }
+        } else {
+            arg.to_string()
+        };
         if target.is_empty() {
-            self.reply(conv, "用法: /disallow <sender_id>", hint).await;
+            self.reply(conv, "用法: /disallow <sender_id|@名字>", hint)
+                .await;
         } else if target == sender.0.as_str() {
             // 防自锁：不允许撤销自己。
             self.reply(
@@ -87,8 +145,8 @@ impl Dispatcher {
             )
             .await;
         } else {
-            let existed = self.auth.revoke(target);
-            if let Err(e) = self.store.remove_allowed_sender(target).await {
+            let existed = self.auth.revoke(&target);
+            if let Err(e) = self.store.remove_allowed_sender(&target).await {
                 warn!(target: "imagent::core", error = %e, "remove_allowed_sender 失败");
             }
             if let Err(e) = self
@@ -96,7 +154,7 @@ impl Dispatcher {
                 .append_audit(
                     "disallow",
                     Some(&sender.0),
-                    Some(target),
+                    Some(&target),
                     Some(if existed { "removed" } else { "absent" }),
                 )
                 .await
@@ -251,8 +309,14 @@ impl Dispatcher {
             let window_ms = self.batch_window.read().as_millis();
             let cot = self.cot_detail.read().as_str();
             let perm = self.permission_mode.read().as_str();
+            // P6 遗留补齐：require_mention 平台侧查询（None = 平台无群聊 @ 语义）。
+            let require_mention = match self.platform.require_mention_in_group().await {
+                Some(true) => "on（群消息须 @bot）".to_string(),
+                Some(false) => "off（群消息全收）".to_string(),
+                None => "（本平台不支持）".to_string(),
+            };
             let text = format!(
-                                "当前配置：\n- cot_detail = {cot}（off|brief|detailed）\n- batch_window_ms = {window_ms}\n- agent_idle_timeout_secs = {idle_secs}（0=关）\n- agent_timeout_secs = {}（重启生效）\n- permission_mode = {perm}\n用法：/config <key> <value>（管理员）",
+                                "当前配置：\n- cot_detail = {cot}（off|brief|detailed）\n- batch_window_ms = {window_ms}\n- agent_idle_timeout_secs = {idle_secs}（0=关）\n- agent_timeout_secs = {}（重启生效）\n- permission_mode = {perm}\n- require_mention = {require_mention}（热切换，重启回 config 值）\n用法：/config <key> <value>（管理员）",
                                 self.agent_timeout.as_secs(),
                             );
             self.reply(conv, &text, hint).await;
@@ -285,8 +349,20 @@ impl Dispatcher {
                 }
                 Err(_) => "用法：/config agent_idle_timeout_secs <秒数，0=关闭>".into(),
             },
+            // P6 遗留补齐：群消息须 @bot 热切换（平台侧策略，对下一消息生效）。
+            "require_mention" => match value.to_ascii_lowercase().as_str() {
+                "on" | "true" => match self.platform.set_require_mention_in_group(true).await {
+                    Ok(()) => "✅ require_mention = on（群消息须 @bot；重启回 config 值）".into(),
+                    Err(e) => format!("设置失败：{e}"),
+                },
+                "off" | "false" => match self.platform.set_require_mention_in_group(false).await {
+                    Ok(()) => "✅ require_mention = off（群消息全收；重启回 config 值）".into(),
+                    Err(e) => format!("设置失败：{e}"),
+                },
+                _ => "用法：/config require_mention <on|off>".into(),
+            },
             _ => {
-                "未知配置项（支持：cot_detail / batch_window_ms / agent_idle_timeout_secs）".into()
+                "未知配置项（支持：cot_detail / batch_window_ms / agent_idle_timeout_secs / require_mention）".into()
             }
         };
         self.reply(conv, &result, hint).await;

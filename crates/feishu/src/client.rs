@@ -316,13 +316,17 @@ pub async fn patch_card_element(
     sequence: i64,
 ) -> imagent_core::Result<()> {
     retry_on_rate_limit!(async {
+        // 真机校准（2026-08）：请求体须为 `partial_element`——组件新配置的 **JSON
+        // 字符串**（双重编码，同 create 实体的 card_json）；此前直传 `content` 字段
+        // 被 99992402 "field validation failed" 拒绝。
+        let partial = json!({ "content": content }).to_string();
         let client = reqwest::Client::new();
         let resp = client
             .patch(format!(
                 "{CARDKIT_BASE}/cards/{card_id}/elements/{element_id}"
             ))
             .bearer_auth(token)
-            .json(&json!({ "content": content, "sequence": sequence }))
+            .json(&json!({ "partial_element": partial, "sequence": sequence }))
             .send()
             .await
             .map_err(|e| {
@@ -358,8 +362,10 @@ pub async fn patch_card_settings(
 
 /// 发送引用卡片实体的 interactive 消息，返回 message_id。
 ///
-/// content 为 `{"type":"card_id","data":{"card_id":"..."}}`（官方「方式三」引用形式），
-/// 后续对该实体的 element/settings PATCH 即时反映到这条消息。
+/// content 为 `{"type":"card","data":{"card_id":"..."}}`（官方 im message create
+/// 文档「方式一」；真机校准 2026-08：`type` 必须是 **"card"**——此前写 "card_id"
+/// 被 230099/200621 "parse card json err" 拒绝），后续对该实体的 element/settings
+/// PATCH 即时反映到这条消息。
 pub async fn send_card_ref_msg(
     core_config: &CoreConfig,
     token: &str,
@@ -371,7 +377,7 @@ pub async fn send_card_ref_msg(
         let body = CreateMessageBody {
             receive_id: receive_id.to_string(),
             msg_type: "interactive".to_string(),
-            content: json!({ "type": "card_id", "data": { "card_id": card_id } }).to_string(),
+            content: json!({ "type": "card", "data": { "card_id": card_id } }).to_string(),
             uuid: None,
         };
         let id_type = match kind {
@@ -508,6 +514,94 @@ pub async fn upload_image(
                 imagent_core::CoreError::Platform(PLATFORM, format!("upload_image: {e}"))
             })?;
         Ok(resp.image_key)
+    })
+}
+
+/// 上传文件拿 file_key（P6-7 出站文件）：POST /open-apis/im/v1/files（multipart）。
+/// SDK 无此 API，raw reqwest（同 reply_message 模式）。bytes 被请求体消费，
+/// 重试路径 clone 重建（与 upload_image 同姿态）。
+pub async fn upload_file(
+    core_config: &CoreConfig,
+    token: &str,
+    file_name: &str,
+    bytes: Vec<u8>,
+) -> imagent_core::Result<String> {
+    retry_on_rate_limit!(async {
+        let bytes = bytes.clone();
+        let base = core_config.base_url().trim_end_matches('/').to_string();
+        let url = format!("{base}/open-apis/im/v1/files");
+        let part = reqwest::multipart::Part::bytes(bytes).file_name(file_name.to_string());
+        let form = reqwest::multipart::Form::new()
+            .text("file_type", "file")
+            .text("file_name", file_name.to_string())
+            .part("file", part);
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&url)
+            .bearer_auth(token)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| {
+                imagent_core::CoreError::Platform(PLATFORM, format!("upload_file: {e}"))
+            })?;
+        if resp.status().as_u16() == 429 {
+            return Err(imagent_core::CoreError::Platform(
+                PLATFORM,
+                "upload_file: HTTP 429".to_string(),
+            ));
+        }
+        let v: serde_json::Value = resp.json().await.map_err(|e| {
+            imagent_core::CoreError::Platform(PLATFORM, format!("upload_file: {e}"))
+        })?;
+        let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
+            return Err(imagent_core::CoreError::Platform(
+                PLATFORM,
+                format!("upload_file: code={code} msg={msg}"),
+            ));
+        }
+        v.get("data")
+            .and_then(|d| d.get("file_key"))
+            .and_then(|k| k.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                imagent_core::CoreError::Platform(PLATFORM, "upload_file: 响应缺 file_key".into())
+            })
+    })
+}
+
+/// 发送文件消息（P6-7，msg_type=file），content 为 `{"file_key":"..."}`。
+pub async fn send_file_msg(
+    core_config: &CoreConfig,
+    token: &str,
+    receive_id: &str,
+    kind: ReceiveIdKind,
+    file_key: &str,
+) -> imagent_core::Result<()> {
+    retry_on_rate_limit!(async {
+        let body = CreateMessageBody {
+            receive_id: receive_id.to_string(),
+            msg_type: "file".to_string(),
+            content: json!({ "file_key": file_key }).to_string(),
+            uuid: None,
+        };
+        let id_type = match kind {
+            ReceiveIdKind::OpenId => ReceiveIdType::OpenId,
+            ReceiveIdKind::ChatId => ReceiveIdType::ChatId,
+        };
+        let option = RequestOption::builder()
+            .tenant_access_token(token.to_string())
+            .build();
+        CreateMessageRequest::new(core_config.clone())
+            .receive_id_type(id_type)
+            .execute_with_options(body, option)
+            .await
+            .map_err(|e| {
+                imagent_core::CoreError::Platform(PLATFORM, format!("send_file_msg: {e}"))
+            })?;
+        Ok(())
     })
 }
 
@@ -656,6 +750,57 @@ pub async fn reply_comment(
             ));
         }
         Ok(())
+    })
+}
+
+/// 话题群内回复（P6-4）：POST /im/v1/messages/{message_id}/reply。
+/// `message_id` 为话题根消息；`content` 为对应 msg_type 的 JSON 字符串
+/// （与 create 一致，如 `{"text":"…"}` / `{"image_key":"…"}`）。
+/// SDK（openlark 0.20）无此 API，raw reqwest（同 reply_comment 模式）。
+pub async fn reply_message(
+    core_config: &CoreConfig,
+    token: &str,
+    message_id: &str,
+    msg_type: &str,
+    content: &str,
+) -> imagent_core::Result<Option<String>> {
+    retry_on_rate_limit!(async {
+        let base = core_config.base_url().trim_end_matches('/').to_string();
+        let url = format!("{base}/open-apis/im/v1/messages/{message_id}/reply");
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({
+                "msg_type": msg_type,
+                "content": content,
+            }))
+            .send()
+            .await
+            .map_err(|e| {
+                imagent_core::CoreError::Platform(PLATFORM, format!("reply_message: {e}"))
+            })?;
+        if resp.status().as_u16() == 429 {
+            return Err(imagent_core::CoreError::Platform(
+                PLATFORM,
+                "reply_message: HTTP 429".to_string(),
+            ));
+        }
+        let v: serde_json::Value = resp.json().await.map_err(|e| {
+            imagent_core::CoreError::Platform(PLATFORM, format!("reply_message: {e}"))
+        })?;
+        let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
+            return Err(imagent_core::CoreError::Platform(
+                PLATFORM,
+                format!("reply_message: code={code} msg={msg}"),
+            ));
+        }
+        // P6 遗留补齐：返回回执消息 id（话题内 interactive 卡需要它作 patch 句柄）。
+        Ok(v.pointer("/data/message_id")
+            .and_then(|m| m.as_str())
+            .map(String::from))
     })
 }
 

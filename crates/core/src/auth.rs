@@ -62,10 +62,20 @@ impl Auth {
     }
 
     /// 会话是否在白名单（P4-5：群维度放行）。
+    /// P6-4：话题群 conv 带 `:<root_id>` 后缀（如 `feishu:<oc_x>:<om_root>`）——
+    /// 精确未命中时去掉最后一段再试（话题继承所属群的授权）。
     pub fn is_chat_allowed(&self, conv_id: &str) -> bool {
-        self.allowed_chats
-            .read()
-            .contains(&normalize_sender(conv_id))
+        let id = normalize_sender(conv_id);
+        let chats = self.allowed_chats.read();
+        if chats.contains(&id) {
+            return true;
+        }
+        match id.rfind(':') {
+            // 仅 `feishu:<chat>:<root>`（完整 id 含 ≥2 个冒号）才剥末段再试；
+            // `feishu:<chat>`（1 个冒号）精确匹配已试过，不再剥成 `feishu`。
+            Some(pos) if id.matches(':').count() >= 2 => chats.contains(&id[..pos]),
+            _ => false,
+        }
     }
 
     /// 加入白名单，返回是否新增（已存在返回 false）。
@@ -201,6 +211,14 @@ mod tests {
         assert!(a.is_chat_allowed("feishu:oc_g1"));
         // 未授权群 + 未授权 sender → 双双拒绝。
         assert!(!a.is_chat_allowed("feishu:oc_g2"));
+        // P6-4：话题群 conv（feishu:<oc>:<root>）继承所属群授权；
+        // 两段式 conv（feishu:<oc>）不剥前缀误匹配。
+        assert!(a.is_chat_allowed("feishu:oc_g1:om_root1"));
+        assert!(!a.is_chat_allowed("feishu:oc_g2:om_root1"));
+        assert!(
+            !a.is_chat_allowed("feishu:oc_g11"),
+            "前缀相似但不同的群不得误放"
+        );
     }
 
     #[test]

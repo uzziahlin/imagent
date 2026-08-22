@@ -32,6 +32,7 @@ impl Platform for ConsolePlatform {
             text: Some(text),
             media: Vec::new(),
             media_errors: Vec::new(),
+            mentions: Vec::new(),
             reply_hint: ReplyHint::None,
         })
     }

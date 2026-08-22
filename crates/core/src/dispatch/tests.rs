@@ -1,5 +1,5 @@
 use super::*;
-use crate::types::{ConvId, LocalSession, ReplyHint, SessionId, UserId};
+use crate::types::{ConvId, LocalSession, Mention, ReplyHint, SessionId, UserId};
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -351,6 +351,7 @@ fn msg(conv: &str, sender: &str, text: &str) -> InboundMessage {
         text: Some(text.into()),
         media: Vec::new(),
         media_errors: Vec::new(),
+        mentions: Vec::new(),
         reply_hint: ReplyHint::None,
     }
 }
@@ -799,6 +800,7 @@ async fn pure_media_all_failed_replies_error() {
         text: None,
         media: vec![],
         media_errors: vec!["img_x: 下载失败: boom".into()],
+        mentions: Vec::new(),
         reply_hint: ReplyHint::None,
     };
     feed_and_wait(&ctx, vec![m], 0).await;
@@ -968,6 +970,72 @@ async fn allow_rejected_for_non_admin_when_admin_senders_set() {
     );
     // charlie 未被授权。
     assert!(!ctx.disp.auth().is_allowed(&UserId("charlie".into())));
+    drop_db(ctx.db).await;
+}
+
+/// P6-2：/allow @名字 从本条消息的 mentions 元数据反解 open_id 授权。
+#[tokio::test]
+async fn allow_command_resolves_mention() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    let mut m = msg("c", "alice", "/allow @张三");
+    m.mentions = vec![Mention {
+        user_id: "ou_zhangsan".into(),
+        name: "张三".into(),
+    }];
+    feed_and_wait(&ctx, vec![m], 1).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.iter().any(|s| s.contains("ou_zhangsan")),
+        "@提及应反解 open_id 并回执: {inbox:?}"
+    );
+    assert!(ctx.disp.auth().is_allowed(&UserId("ou_zhangsan".into())));
+    drop_db(ctx.db).await;
+}
+
+/// P6-2：/allow @提及 无元数据可反解 → 回用法提示，不误授字符串本体。
+#[tokio::test]
+async fn allow_command_mention_unresolvable_hints() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    // mentions 为空（如手打 @张三 文本、或平台未解析出元数据）。
+    feed_and_wait(&ctx, vec![msg("c", "alice", "/allow @张三")], 1).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.iter().any(|s| s.contains("无法从本条消息解析")),
+        "无元数据应回反解失败提示: {inbox:?}"
+    );
+    assert!(
+        !ctx.disp.auth().is_allowed(&UserId("@张三".into())),
+        "不得把 @字串 本身当 id 授权"
+    );
+    drop_db(ctx.db).await;
+}
+
+/// P6 遗留补齐：/config require_mention on|off——平台 trait 默认实现
+/// （MockPlatform 无群聊 @ 语义）应回「设置失败」；/config 展示含该项。
+#[tokio::test]
+async fn config_require_mention_unsupported_platform() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    feed_and_wait(
+        &ctx,
+        vec![msg("c", "alice", "/config require_mention on")],
+        1,
+    )
+    .await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.iter().any(|s| s.contains("设置失败")),
+        "不支持的平台应回设置失败: {inbox:?}"
+    );
+    // 展示态也含 require_mention 行。
+    feed_and_wait(&ctx, vec![msg("c", "alice", "/config")], 1).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.iter().any(|s| s.contains("require_mention")),
+        "/config 展示应含 require_mention: {inbox:?}"
+    );
     drop_db(ctx.db).await;
 }
 

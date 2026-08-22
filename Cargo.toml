@@ -25,7 +25,8 @@ futures = "0.3"
 parking_lot = "0.12"
 
 # HTTP / TLS（用 rustls 而非 native-tls：对 iLink 证书更可控，跨平台一致）
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# multipart：飞书 im/v1/files 文件上传（P6-7 出站文件）
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "multipart"] }
 url = "2"
 
 # 序列化
@@ -86,6 +87,7 @@ serde_json = { workspace = true }
 axum = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
+reqwest = { workspace = true }
 # rustls 0.23 需显式安装 CryptoProvider（process-level）；飞书 open-lark 走 rustls TLS。
 # ring 是纯 Rust 实现（无 nasm/cmake），与 reqwest 的 rustls-tls(ring) 一致。
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }

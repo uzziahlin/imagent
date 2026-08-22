@@ -33,7 +33,7 @@ use crate::metrics::METRICS;
 use crate::permission::{parse_reply, PermissionReply, PermissionRouter};
 use crate::platform::Platform;
 use crate::types::{
-    AgentChunk, CardTerminal, ConvId, InboundMessage, MediaRef, ReplyHint, SessionId,
+    AgentChunk, CardButton, CardTerminal, ConvId, InboundMessage, MediaRef, ReplyHint, SessionId,
 };
 use imagent_store::{NamedSessionRow, SessionRow, Store};
 use parking_lot::RwLock;
@@ -256,6 +256,9 @@ pub struct Dispatcher {
     /// per-conv 最近一次 `/resume` 渲染的列表（P4-11）：序号选择取缓存，
     /// 防两次调用间本机会话 mtime 变化导致错位；选中即消费（移除）。
     resume_cache: Mutex<HashMap<String, Vec<ResumeEntry>>>,
+    /// P6-9：per-conv 空闲看门狗覆盖（`/timeout`）——`Some(ZERO)` = 本会话关闭；
+    /// 无条目 = 跟随全局 `agent_idle_timeout`。进程内（会话级旋钮，不落盘）。
+    idle_overrides: Mutex<HashMap<String, Duration>>,
     /// 管理员 sender（可 /allow）；空 = 所有白名单用户可（向后兼容，P2-D）。
     admin_senders: Arc<RwLock<Vec<String>>>,
     /// 优雅退出信号（P1-5）：收到 SIGINT/SIGTERM 后 notify，run() 停止收新消息并 drain。
@@ -331,10 +334,19 @@ impl Dispatcher {
             running: Mutex::new(HashMap::new()),
             queues: Mutex::new(HashMap::new()),
             resume_cache: Mutex::new(HashMap::new()),
+            idle_overrides: Mutex::new(HashMap::new()),
             admin_senders: Arc::new(RwLock::new(admin_senders)),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             tasks: Mutex::new(tokio::task::JoinSet::new()),
         }
+    }
+
+    /// P6-9：该会话的空闲看门狗——`/timeout` 覆盖优先（ZERO=关），否则全局值。
+    async fn idle_timeout_for(&self, conv: &str) -> Duration {
+        if let Some(d) = self.idle_overrides.lock().await.get(conv) {
+            return *d;
+        }
+        *self.agent_idle_timeout.read()
     }
 
     /// 调用者是否为管理员（可 /allow）。admin_senders 空 = 向后兼容（所有白名单
@@ -431,7 +443,22 @@ impl Dispatcher {
                             && self.can_route_permission_reply(&msg)
                         {
                             let reply = parse_reply(text);
+                            let allowed = reply.allow;
                             if self.router.route(&conv_id, reply).await {
+                                // 真机校准 UX：决策已达 MCP，立即把询问卡收敛成
+                                // 「已批准/已拒绝」终态（best-effort，无卡 no-op）——
+                                // 用户点击后秒级有反馈，不必等任务结束。
+                                if let Err(e) = self
+                                    .platform
+                                    .resolve_permission_ask(&msg.conv_id, allowed)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        target: "imagent::core",
+                                        error = %e,
+                                        "询问卡收敛失败（不影响审批结果）"
+                                    );
+                                }
                                 continue;
                             }
                         }
@@ -695,6 +722,32 @@ impl Dispatcher {
     /// 回传文本；发送失败仅 log（见 [`Self::reply_ok`]）。
     async fn reply(&self, conv: &ConvId, text: &str, hint: &ReplyHint) {
         let _ = self.reply_ok(conv, text, hint).await;
+    }
+
+    /// P6-3：回命令交互卡片；平台无卡片能力时默认实现已降级纯文本，卡片发送
+    /// 失败（权限/网络）在此再兜一层纯文本——命令永远有回执。
+    async fn reply_card(
+        &self,
+        conv: &ConvId,
+        title: &str,
+        body_md: &str,
+        buttons: Vec<CardButton>,
+        hint: &ReplyHint,
+    ) {
+        if let Err(e) = self
+            .platform
+            .send_command_card(conv, title, body_md, &buttons, hint)
+            .await
+        {
+            warn!(
+                target: "imagent::core",
+                conv_id = %conv.0,
+                error = %e,
+                "命令卡片发送失败，降级纯文本"
+            );
+            let text = crate::platform::command_card_fallback_text(title, body_md, &buttons);
+            self.reply(conv, &text, hint).await;
+        }
     }
 
     /// 回传文本，返回是否成功送达。P5-第五批：流式前缀累积据此只记成功送达
