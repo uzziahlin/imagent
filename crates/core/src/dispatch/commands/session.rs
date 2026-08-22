@@ -450,11 +450,12 @@ impl Dispatcher {
         // P5-第五批：仅当确有 pending 审批才撤询问卡——否则会把该
         // conv 上一次已被正常回答的旧卡误 patch 成「已中断」。
         let had_pending = self.router.has_pending(&conv.0).await;
-        self.router.cancel(&conv.0).await;
+        self.router.cancel_all(&conv.0).await;
         if had_pending {
             // P5-16：收敛审批询问本身——把 IM 里滞留的询问卡片 patch 成
-            // 「已中断」（纯文本询问平台 no-op）。best-effort。
-            if let Err(e) = self.platform.cancel_permission_ask(conv).await {
+            // 「已中断」（纯文本询问平台 no-op）。best-effort。多 pending 并存
+            // 后按 conv 全量收敛（终端 ask 与 IM 审批都可能挂着）。
+            if let Err(e) = self.platform.cancel_all_permission_asks(conv).await {
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "撤回权限询问失败（不影响中断）");
             }
         }

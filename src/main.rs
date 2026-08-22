@@ -95,6 +95,15 @@ enum Cmd {
         #[arg(long, default_value_t = 300)]
         ask_timeout: u64,
     },
+    /// 内部子命令：面向终端 agent 的「问人」MCP server（stdio JSON-RPC），暴露
+    /// `ask_via_im` 工具。挂在任意终端 agent 的 MCP 配置里（command=imagent，
+    /// args=["mcp-ask"]）；需 config 配置 `ask_via_im_conv` 且主进程已运行。
+    #[command(hide = true)]
+    McpAsk {
+        /// 主进程权限路由 socket 路径（缺省 `<imagent_home>/permission.sock`）。
+        #[arg(long)]
+        sock: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -627,6 +636,48 @@ async fn main() -> Result<()> {
             .await
             {
                 tracing::error!(target: "imagent::mcp", error = %e, "MCP server 退出");
+            }
+        }
+        Cmd::McpAsk { sock } => {
+            // 终端 agent 的 ask_via_im MCP server。conv/超时来自 config——
+            // 未配置 ask_via_im_conv 时退出码 2 + stderr 提示（tools/list 无从
+            // 兜底，让终端 agent 的报错可见）。
+            let config_path = imagent_core::Config::default_path()
+                .ok_or_else(|| anyhow!("无法定位 home 目录"))?;
+            let config = imagent_core::Config::load(&config_path)
+                .map_err(|e| anyhow!("加载配置失败（{}）：{e}", config_path.display()))?;
+            let Some(conv) = config
+                .ask_via_im_conv
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+            else {
+                eprintln!(
+                    "config.toml 未配置 ask_via_im_conv（如 \"feishu:ou_xxx\"）——ask_via_im 未启用。"
+                );
+                std::process::exit(2);
+            };
+            let sock = sock.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).or_else(
+                || imagent_core::default_sock_path().map(|p| p.to_string_lossy().into_owned()),
+            );
+            let Some(sock) = sock else {
+                eprintln!("无法定位 permission.sock 路径（home 目录缺失？）");
+                std::process::exit(2);
+            };
+            tracing::info!(
+                target: "imagent::mcp",
+                conv_id = %conv, sock = %sock,
+                ask_timeout_secs = config.ask_via_im_timeout_secs,
+                "MCP ask server starting (ask_via_im)"
+            );
+            if let Err(e) = imagent_core::mcp::run_ask_mcp_server(
+                conv.to_string(),
+                sock,
+                std::time::Duration::from_secs(config.ask_via_im_timeout_secs),
+            )
+            .await
+            {
+                tracing::error!(target: "imagent::mcp", error = %e, "MCP ask server 退出");
             }
         }
     }

@@ -155,7 +155,12 @@ fn render_error_card(err: &str) -> String {
 /// 真机校准（2026-08）：schema V2 卡片已**废弃 `action` 元素**（200861 "cards of
 /// schema V2 no longer support this capability; unsupported tag action"）。按钮迁到
 /// `column_set` → `column` → `button`（button 组件本身 + behaviors 保留），两列等宽。
-pub fn render_permission_card(tool_name: &str, input_summary: &str, conv_id: &str) -> String {
+pub fn render_permission_card(
+    tool_name: &str,
+    input_summary: &str,
+    conv_id: &str,
+    request_id: &str,
+) -> String {
     serde_json::json!({
         "schema": "2.0",
         "body": { "elements": [
@@ -166,7 +171,7 @@ pub fn render_permission_card(tool_name: &str, input_summary: &str, conv_id: &st
                     { "tag": "button", "text": { "tag": "plain_text", "content": "✅ 允许" },
                       "type": "primary",
                       "behaviors": [{ "type": "callback", "value": {
-                        "imagent_perm": "allow", "conv": conv_id
+                        "imagent_perm": "allow", "conv": conv_id, "req": request_id
                       } }] }
                   ] },
                 { "tag": "column", "width": "weighted", "weight": 1,
@@ -174,7 +179,7 @@ pub fn render_permission_card(tool_name: &str, input_summary: &str, conv_id: &st
                     { "tag": "button", "text": { "tag": "plain_text", "content": "⛔ 拒绝" },
                       "type": "danger",
                       "behaviors": [{ "type": "callback", "value": {
-                        "imagent_perm": "deny", "conv": conv_id
+                        "imagent_perm": "deny", "conv": conv_id, "req": request_id
                       } }] }
                   ] }
             ]}
@@ -211,7 +216,7 @@ pub fn render_permission_card_superseded(tool_name: &str) -> String {
 /// 输入是 AskUserQuestion 工具的 input JSON（`questions[0].question/options`），
 /// 解析失败返回 None（调用方降级普通审批卡）。选项按钮 value 编码
 /// `imagent_ask`（选项文本）+ conv，回调转成 `ask:<选项>` 走审批回复路由。
-pub fn render_question_card(tool_input: &str, conv_id: &str) -> Option<String> {
+pub fn render_question_card(tool_input: &str, conv_id: &str, request_id: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(tool_input).ok()?;
     let q = v.pointer("/questions/0")?;
     let question = q.get("question")?.as_str()?.trim().to_string();
@@ -251,7 +256,7 @@ pub fn render_question_card(tool_input: &str, conv_id: &str) -> Option<String> {
                 "text": { "tag": "plain_text", "content": format!("{}. {}", i + 1, label) },
                 "type": "primary",
                 "behaviors": [{ "type": "callback", "value": {
-                    "imagent_ask": label, "conv": conv_id
+                    "imagent_ask": label, "conv": conv_id, "req": request_id
                 } }]
             }]
         }));
@@ -410,7 +415,7 @@ mod tests {
             }]
         })
         .to_string();
-        let json = render_question_card(&input, "feishu:ou_q").expect("应可渲染");
+        let json = render_question_card(&input, "feishu:ou_q", "req1").expect("应可渲染");
         assert!(json.contains("先做哪一步？"), "问题正文: {json}");
         assert!(json.contains("数据库迁移"), "选项文本: {json}");
         assert!(
@@ -420,8 +425,8 @@ mod tests {
         assert!(json.contains("feishu:ou_q"), "conv 编码: {json}");
         assert!(!json.contains("\"tag\":\"action\""), "V2 无 action: {json}");
         // 非法 JSON / 缺 options → None（降级审批卡）。
-        assert!(render_question_card("not json", "c").is_none());
-        assert!(render_question_card("{}", "c").is_none());
+        assert!(render_question_card("not json", "c", "req1").is_none());
+        assert!(render_question_card("{}", "c", "req1").is_none());
     }
 
     /// P6-3：命令卡片——标题/正文 + 按钮（column_set 挂载、value 编码命令与 conv、
@@ -479,7 +484,7 @@ mod tests {
 
     #[test]
     fn render_permission_card_buttons_and_conv() {
-        let json = render_permission_card("Bash", r#"{"cmd":"rm -rf …"}"#, "feishu:ou_u1");
+        let json = render_permission_card("Bash", r#"{"cmd":"rm -rf …"}"#, "feishu:ou_u1", "req1");
         // 两个按钮 + callback value 编码 conv 与动作。
         assert!(json.contains("✅ 允许"), "允许按钮: {json}");
         assert!(json.contains("⛔ 拒绝"), "拒绝按钮: {json}");

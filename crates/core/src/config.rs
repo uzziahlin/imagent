@@ -132,6 +132,14 @@ pub struct Config {
     /// 覆盖审批 + 执行总和）。建议 < `agent_timeout_secs`，否则慢审批可能撑满 agent 超时。
     #[serde(default = "default_permission_ask_timeout_secs")]
     pub permission_ask_timeout_secs: u64,
+    /// 终端 agent 的 `ask_via_im` MCP 工具：询问默认投递的目标会话
+    /// （如 `feishu:ou_xxx`）。None（默认）= 未启用，`imagent mcp-ask` 不暴露工具。
+    #[serde(default)]
+    pub ask_via_im_conv: Option<String>,
+    /// `ask_via_im` 等待用户回复的超时（秒），可被工具调用的 timeout_secs 覆盖。
+    /// 远程场景用户可能长时间不在，默认 1800（30 分钟），远大于审批的 300。
+    #[serde(default = "default_ask_via_im_timeout_secs")]
+    pub ask_via_im_timeout_secs: u64,
     /// 优雅退出（SIGINT/SIGTERM）drain in-flight task 的宽限期（秒）。超时则 abort
     /// 剩余（kill_on_drop 杀 agent 子进程）。默认 60。R-1：原硬编码 30s 偏短。
     #[serde(default = "default_shutdown_grace_secs")]
@@ -244,6 +252,9 @@ fn default_agent_timeout_secs() -> u64 {
 fn default_permission_ask_timeout_secs() -> u64 {
     300
 }
+fn default_ask_via_im_timeout_secs() -> u64 {
+    1800
+}
 fn default_shutdown_grace_secs() -> u64 {
     60
 }
@@ -285,6 +296,22 @@ impl Config {
             return Err(CoreError::Config(
                 "permission_ask_timeout_secs 必须 ≥ 1（0 会让所有审批必然超时拒否）".into(),
             ));
+        }
+        const ASK_VIA_IM_TIMEOUT_MAX_SECS: u64 = 86_400;
+        if cfg.ask_via_im_timeout_secs == 0 || cfg.ask_via_im_timeout_secs > ASK_VIA_IM_TIMEOUT_MAX_SECS
+        {
+            return Err(CoreError::Config(format!(
+                "ask_via_im_timeout_secs 须在 1..={ASK_VIA_IM_TIMEOUT_MAX_SECS}（当前 {}）",
+                cfg.ask_via_im_timeout_secs
+            )));
+        }
+        if let Some(conv) = cfg.ask_via_im_conv.as_deref() {
+            let c = conv.trim();
+            if !c.starts_with("feishu:ou_") && !c.starts_with("feishu:oc_") {
+                return Err(CoreError::Config(format!(
+                    "ask_via_im_conv 须为飞书会话 id（feishu:ou_xxx 私聊 / feishu:oc_xxx 群），当前 {c:?}"
+                )));
+            }
         }
         if cfg.shutdown_grace_secs == 0 {
             return Err(CoreError::Config(
@@ -332,6 +359,8 @@ permission_mode = "off"     # off(默认,claude按allowedTools自行处理) | al
 # batch_window_ms = 1500              # 批处理窗口(ms)：连发消息合并为一轮 prompt；0=关闭
 # cot_detail = "brief"                # 工具过程展示：off | brief(默认) | detailed（/config 可热改）
 # permission_ask_timeout_secs = 300   # Ask 模式等用户回复超时(秒，独立预算，不挤占 agent 超时)
+# ask_via_im_conv = "feishu:ou_xxx"   # 终端 agent 的 ask_via_im 工具投递目标会话（设了才启用；配合 `imagent mcp-ask` 挂到任意终端 agent 的 MCP 配置）
+# ask_via_im_timeout_secs = 1800      # ask_via_im 等待回复超时(秒，默认 30 分钟，可被调用覆盖)
 # shutdown_grace_secs = 60            # 优雅退出 drain 宽限(秒)；超时 abort 在飞 task
 # require_keyring = false        # 默认 false(headless 明文回退+warn); true=keyring 不可用时拒绝明文落盘(fail-closed，安全部署建议)
 "#;
@@ -619,6 +648,33 @@ message_fragment_interval_ms = 250
         );
         assert!(Config::load(&p).is_ok());
         cleanup(&p);
+    }
+
+    /// ask_via_im 配置：默认未启用；conv 前缀与超时边界校验。
+    #[test]
+    fn ask_via_im_config_default_and_validation() {
+        let p = tmp_path("askvi_def", r#"default_workdir = "/tmp/ws""#);
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(cfg.ask_via_im_conv, None);
+        assert_eq!(cfg.ask_via_im_timeout_secs, 1800);
+        cleanup(&p);
+        // 合法：飞书 conv + 自定义超时。
+        let p = tmp_path(
+            "askvi_ok",
+            "default_workdir = \"/tmp/ws\"\nask_via_im_conv = \"feishu:ou_x\"\nask_via_im_timeout_secs = 60\n",
+        );
+        assert!(Config::load(&p).is_ok());
+        cleanup(&p);
+        // 非法 conv / 超时越界。
+        for (tag, extra) in [
+            ("askvi_conv_bad", "ask_via_im_conv = \"wecom:x\"\n"),
+            ("askvi_t0", "ask_via_im_timeout_secs = 0\n"),
+            ("askvi_huge", "ask_via_im_timeout_secs = 100000\n"),
+        ] {
+            let p = tmp_path(tag, &format!("default_workdir = \"/tmp/ws\"\n{extra}"));
+            assert!(Config::load(&p).is_err(), "{tag} 应报错");
+            cleanup(&p);
+        }
     }
 
     /// P5-7：群放行 + admin_senders 为空的组合探测（群内全员 = 事实管理员）。

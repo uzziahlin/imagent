@@ -65,6 +65,10 @@ pub struct InboundMessage {
     pub media_errors: Vec<String>,
     /// 本条消息中 @ 提及的用户（不含 bot 自身；无提及为空）。
     pub mentions: Vec<Mention>,
+    /// 询问卡按钮回调携带的 request_id（多 pending 精确路由用；普通消息为 None）。
+    pub ask_req: Option<String>,
+    /// 引用回复的目标消息 id（自由文本路由到被引用的询问卡；无引用为 None）。
+    pub reply_to: Option<String>,
     pub reply_hint: ReplyHint,
 }
 

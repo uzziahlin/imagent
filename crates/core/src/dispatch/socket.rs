@@ -86,6 +86,7 @@ impl Dispatcher {
                                     let platform = this.platform.clone();
                                     let router = this.router.clone();
                                     let permission_ask_timeout = this.permission_ask_timeout;
+                                    let ask_via_im_timeout = this.ask_via_im_timeout;
                                     let expected_token = expected_token.clone();
                                     this.tasks.lock().await.spawn(async move {
                                         Self::handle_permission_socket(
@@ -93,6 +94,7 @@ impl Dispatcher {
                                             platform,
                                             router,
                                             permission_ask_timeout,
+                                            ask_via_im_timeout,
                                             expected_token,
                                         )
                                         .await;
@@ -213,6 +215,7 @@ impl Dispatcher {
         platform: Arc<dyn Platform>,
         router: Arc<PermissionRouter>,
         permission_ask_timeout: std::time::Duration,
+        ask_via_im_timeout: std::time::Duration,
         expected_token: String,
     ) {
         // P5-9b：读两行——首行握手 token、次行 JSON 请求。必须共用一个 BufReader：
@@ -249,40 +252,224 @@ impl Dispatcher {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        // 多 pending 协议：request_id 缺省 "legacy"（旧版 MCP 子进程兼容，单条顶替）。
+        let request_id = req
+            .get("request_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("legacy")
+            .trim()
+            .chars()
+            .take(64)
+            .collect::<String>();
+        let kind = req.get("kind").and_then(|v| v.as_str()).unwrap_or("permission");
+        if conv_id.is_empty() {
+            return;
+        }
+        let conv = ConvId(conv_id.clone());
+        match kind {
+            "ask" => {
+                Self::handle_ask_socket(
+                    stream, platform, router, conv, request_id, ask_via_im_timeout, &req,
+                )
+                .await;
+            }
+            _ => {
+                Self::handle_permission_kind_socket(
+                    stream,
+                    platform,
+                    router,
+                    conv,
+                    request_id,
+                    permission_ask_timeout,
+                    &req,
+                )
+                .await;
+            }
+        }
+    }
+
+    /// `kind = "ask"`：终端 agent 的 `ask_via_im` 提问。合成 AskUserQuestion 输入
+    /// 复用问题卡渲染，回复以**原文**（raw_text）回传（非 allow/deny 语义）。
+    /// 超时回 error（调用方自行决定重试），不 fail-closed deny。
+    #[cfg(unix)]
+    async fn handle_ask_socket(
+        mut stream: tokio::net::UnixStream,
+        platform: Arc<dyn Platform>,
+        router: Arc<PermissionRouter>,
+        conv: ConvId,
+        request_id: String,
+        default_timeout: std::time::Duration,
+        req: &serde_json::Value,
+    ) {
+        let question = req
+            .get("question")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if question.is_empty() {
+            Self::write_ask_reply(&mut stream, &request_id, Err("empty question")).await;
+            return;
+        }
+        let options: Vec<String> = req
+            .get("options")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|o| o.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.trim().to_string())
+                    .take(8)
+                    .collect()
+            })
+            .unwrap_or_default();
+        // 超时：请求覆盖（上限 86400），否则 config 默认。
+        const ASK_TIMEOUT_MAX_SECS: u64 = 86_400;
+        let timeout_secs = req
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .filter(|s| (1..=ASK_TIMEOUT_MAX_SECS).contains(s))
+            .unwrap_or(default_timeout.as_secs().max(1));
+        let timeout = std::time::Duration::from_secs(timeout_secs);
+        // 合成 AskUserQuestion 工具输入——复用 feishu 的问题卡渲染与 ask:<选项> 回调链路。
+        // 前缀标记来源，让用户一眼分清终端提问与 IM 会话内提问。
+        let input = serde_json::json!({
+            "questions": [{
+                "question": format!("💻（终端 agent 提问）{question}"),
+                "options": options.iter().map(|o| serde_json::json!({"label": o})).collect::<Vec<_>>(),
+            }]
+        });
+        let input_summary = truncate_str(&input.to_string(), 2000);
+        let card_msg_id = match platform
+            .send_permission_ask(&conv, &request_id, "AskUserQuestion", &input_summary, &ReplyHint::None)
+            .await
+        {
+            Ok(mid) => mid,
+            Err(e) => {
+                warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "send ask 失败，回 error 不挂 pending");
+                METRICS
+                    .permission_decisions
+                    .with_label_values(&["dropped"])
+                    .inc();
+                Self::write_ask_reply(
+                    &mut stream,
+                    &request_id,
+                    Err("send failed: IM 不可达（主进程与 IM 连接异常？）"),
+                )
+                .await;
+                return;
+            }
+        };
+        let rx = router.register(&conv.0, &request_id, card_msg_id).await;
+        let reply = match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => {
+                router.cancel(&conv.0, &request_id).await;
+                Self::write_ask_reply(&mut stream, &request_id, Err("router dropped")).await;
+                return;
+            }
+            Err(_) => {
+                router.cancel(&conv.0, &request_id).await;
+                if let Err(e) = platform.cancel_permission_ask(&conv, &request_id).await {
+                    warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "超时询问卡收敛失败（不影响回传）");
+                }
+                METRICS
+                    .permission_decisions
+                    .with_label_values(&["timeout"])
+                    .inc();
+                let msg = format!("timeout: 用户未在 {timeout_secs}s 内回复");
+                Self::write_ask_reply(&mut stream, &request_id, Err(msg.as_str())).await;
+                return;
+            }
+        };
+        METRICS
+            .permission_decisions
+            .with_label_values(&["allow"])
+            .inc();
+        let text = reply
+            .raw_text
+            .or(reply.message)
+            .unwrap_or_else(|| "（用户已回复，但内容为空）".into());
+        Self::write_ask_reply(&mut stream, &request_id, Ok(&text)).await;
+    }
+
+    /// 写 ask 分支的一行 JSON 回复。
+    #[cfg(unix)]
+    async fn write_ask_reply(
+        stream: &mut tokio::net::UnixStream,
+        request_id: &str,
+        result: std::result::Result<&str, &str>,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        let resp = match result {
+            Ok(text) => serde_json::json!({
+                "kind": "ask", "request_id": request_id, "text": text
+            }),
+            Err(err) => serde_json::json!({
+                "kind": "ask", "request_id": request_id, "text": null, "error": err
+            }),
+        };
+        let mut out = resp.to_string();
+        out.push('\n');
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let _ = stream.write_all(out.as_bytes()).await;
+            let _ = stream.flush().await;
+        })
+        .await;
+    }
+
+    /// `kind = "permission"`（缺省）：原有审批语义，带 request_id。
+    ///
+    /// - **P1-3**：send_text 失败时回写 deny 并 return（不挂 pending——否则用户看不到
+    ///   询问，agent 会卡满 agent_timeout，期间该 conv 消息全被当回复吞）。
+    /// - **P1-8**：超时/router-drop 时 `router.cancel` 清理 pending map 残留。
+    /// - **P1-9**：读行加上限（64KiB）+ 读超时（15s）+ 写超时（10s），防 OOM / 挂死。
+    #[cfg(unix)]
+    async fn handle_permission_kind_socket(
+        mut stream: tokio::net::UnixStream,
+        platform: Arc<dyn Platform>,
+        router: Arc<PermissionRouter>,
+        conv: ConvId,
+        request_id: String,
+        permission_ask_timeout: std::time::Duration,
+        req: &serde_json::Value,
+    ) {
         let tool_name = req
             .get("tool_name")
             .and_then(|v| v.as_str())
             .unwrap_or("?")
             .to_string();
         let input_str = req.get("input").map(|v| v.to_string()).unwrap_or_default();
-        if conv_id.is_empty() {
-            return;
-        }
-        let conv = ConvId(conv_id.clone());
+        let conv_id = conv.0.clone();
         // P4-4：询问用户——平台支持交互卡片时发「按钮卡片」（send_permission_ask
-        // 覆写），否则默认纯文本。按钮点击由平台侧转成 text="y"/"n" 的入站消息，
+        // 覆写），否则默认纯文本。按钮点击由平台侧转成携带 ask_req 的入站消息，
         // 复用 recv 循环的审批回复路由，core 不感知按钮。
         // P6：80 截断装不下 AskUserQuestion 的问题+选项 JSON；放到 2000（卡片
         // 30KB 上限内安全，仍防超长轰炸）。
         let input_summary = truncate_str(&input_str, 2000);
         // P1-3：发送失败 → 回写 deny 并 return，不挂 pending。
-        if let Err(e) = platform
-            .send_permission_ask(&conv, &tool_name, &input_summary, &ReplyHint::None)
+        let card_msg_id = match platform
+            .send_permission_ask(&conv, &request_id, &tool_name, &input_summary, &ReplyHint::None)
             .await
         {
-            warn!(target: "imagent::core", conv_id = %conv_id, error = %e, "send permission ask 失败，回 deny 不挂 pending");
-            Self::write_permission_reply(
-                &mut stream,
-                PermissionReply {
-                    allow: false,
-                    message: Some("send_text failed: IM 不可达".into()),
-                },
-            )
-            .await;
-            return;
-        }
+            Ok(mid) => mid,
+            Err(e) => {
+                warn!(target: "imagent::core", conv_id = %conv_id, error = %e, "send permission ask 失败，回 deny 不挂 pending");
+                Self::write_permission_reply(
+                    &mut stream,
+                    PermissionReply {
+                        allow: false,
+                        message: Some("send_text failed: IM 不可达".into()),
+                        raw_text: None,
+                    },
+                )
+                .await;
+                return;
+            }
+        };
         // 注册 pending，等回复（recv 循环 route 到这里）。
-        let rx = router.register(&conv_id).await;
+        let rx = router.register(&conv_id, &request_id, card_msg_id).await;
         // P1-G/S-3：权限回复等待独立预算 permission_ask_timeout（默认 300s，不挤占
         // agent_timeout 的执行预算）。agent 死或用户长时间不回复时，超时回 deny 并 drop
         // receiver，避免 pending 永驻把后续消息误当回复吞。
@@ -296,7 +483,7 @@ impl Dispatcher {
                 r
             }
             Ok(Err(_)) => {
-                router.cancel(&conv_id).await;
+                router.cancel(&conv_id, &request_id).await;
                 METRICS
                     .permission_decisions
                     .with_label_values(&["dropped"])
@@ -304,13 +491,14 @@ impl Dispatcher {
                 PermissionReply {
                     allow: false,
                     message: Some("permission router dropped".into()),
+                    raw_text: None,
                 }
             }
             Err(_elapsed) => {
-                router.cancel(&conv_id).await;
+                router.cancel(&conv_id, &request_id).await;
                 // 真机校准 UX：超时自动拒绝后把滞留的询问卡收敛成终态（否则
                 // 卡片保持可点，用户点了只会得到「已超时」的空转）。best-effort。
-                if let Err(e) = platform.cancel_permission_ask(&conv).await {
+                if let Err(e) = platform.cancel_permission_ask(&conv, &request_id).await {
                     warn!(target: "imagent::core", conv_id = %conv_id, error = %e, "超时询问卡收敛失败（不影响 deny）");
                 }
                 METRICS
@@ -322,6 +510,7 @@ impl Dispatcher {
                     message: Some(format!(
                         "permission ask timed out after {permission_ask_timeout:?}"
                     )),
+                    raw_text: None,
                 }
             }
         };

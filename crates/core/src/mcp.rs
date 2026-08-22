@@ -78,15 +78,18 @@ pub fn fixed_reply(mode: PermissionMode) -> PermissionReply {
         PermissionMode::Allow => PermissionReply {
             allow: true,
             message: None,
+            raw_text: None,
         },
         PermissionMode::Deny => PermissionReply {
             allow: false,
             message: Some("denied by imagent permission_mode=deny".into()),
+            raw_text: None,
         },
         // Off / Ask 不应走固定策略；兜底 deny。
         _ => PermissionReply {
             allow: false,
             message: Some("imagent permission mode does not allow".into()),
+            raw_text: None,
         },
     }
 }
@@ -125,6 +128,7 @@ pub fn handle_request(req: &Value, mode: PermissionMode) -> Option<Value> {
                 PermissionReply {
                     allow: false,
                     message: Some("ask/off not handled in pure handler".into()),
+                    raw_text: None,
                 }
             };
             let input = req
@@ -166,11 +170,12 @@ pub fn extract_call_args(req: &Value) -> (String, Value) {
 /// Ask 模式：经 unix socket 请求主进程路由，阻塞等待回复。
 ///
 /// 协议（一行 JSON 请求 / 一行 JSON 回复）：
-/// - 请求：`{ "conv_id": "...", "tool_name": "...", "input": {...} }`
+/// - 请求：`{ "conv_id": "...", "request_id": "...", "tool_name": "...", "input": {...} }`
 /// - 回复：`{ "allow": bool, "message": null|string }`
 pub async fn ask_via_socket(
     sock: &str,
     conv_id: &str,
+    request_id: &str,
     tool_name: &str,
     input: &Value,
     ask_timeout: std::time::Duration,
@@ -198,6 +203,7 @@ pub async fn ask_via_socket(
     stream.flush().await?;
     let req = json!({
         "conv_id": conv_id,
+        "request_id": request_id,
         "tool_name": tool_name,
         "input": input,
     });
@@ -229,7 +235,20 @@ pub async fn ask_via_socket(
         .get("message")
         .and_then(|m| m.as_str())
         .map(|s| s.to_string());
-    Ok(PermissionReply { allow, message })
+    Ok(PermissionReply {
+        allow,
+        message,
+        raw_text: None,
+    })
+}
+
+/// 生成 request_id（多 pending 路由 key）：`<prefix>-<hex>`。
+fn new_request_id(prefix: &str) -> String {
+    format!(
+        "{prefix}-{:08x}{:08x}",
+        rand::random::<u32>(),
+        rand::random::<u32>()
+    )
 }
 
 /// MCP server 主循环（stdio）。读 stdin 一行 JSON、写 stdout 一行 JSON。
@@ -268,14 +287,19 @@ pub async fn run_mcp_server(
         let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
         let resp = if method == "tools/call" && matches!(mode, PermissionMode::Ask) {
             let (tool_name, input) = extract_call_args(&req);
-            let reply = match ask_via_socket(&sock, &conv_id, &tool_name, &input, ask_timeout).await
-            {
-                Ok(r) => r,
-                Err(e) => PermissionReply {
-                    allow: false,
-                    message: Some(format!("imagent socket error: {e}")),
-                },
-            };
+            // 多 pending：每次调用独立 request_id（同 conv 与其它询问并存互不顶替）。
+            let request_id = new_request_id("p");
+            let reply =
+                match ask_via_socket(&sock, &conv_id, &request_id, &tool_name, &input, ask_timeout)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => PermissionReply {
+                        allow: false,
+                        message: Some(format!("imagent socket error: {e}")),
+                        raw_text: None,
+                    },
+                };
             let result = build_call_response(&reply, &input);
             let id = req.get("id").cloned().unwrap_or(Value::Null);
             json!({ "jsonrpc": "2.0", "id": id, "result": result })
@@ -286,6 +310,221 @@ pub async fn run_mcp_server(
             }
         };
 
+        let mut out = resp.to_string();
+        out.push('\n');
+        if let Err(e) = stdout.write_all(out.as_bytes()).await {
+            warn!(target: "imagent::mcp", error = %e, "stdout write error");
+            break;
+        }
+        let _ = stdout.flush().await;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ask_via_im：面向终端 agent 的通用「问人」MCP server（`imagent mcp-ask`）。
+// ---------------------------------------------------------------------------
+
+/// 工具名（终端 agent 调用）。
+pub const ASK_TOOL_NAME: &str = "ask_via_im";
+
+/// `tools/list`（纯函数，便于单测）。
+pub fn build_ask_tools_list() -> Value {
+    json!({
+        "tools": [{
+            "name": ASK_TOOL_NAME,
+            "description": "向用户的 IM（飞书）发送问题并阻塞等待回复。适合需要用户决策/确认而用户可能不在终端前的场景；用户在 IM 点选项按钮或回复文字，答案作为工具结果返回。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "question": { "type": "string", "description": "问题正文（可含决策所需的上下文摘要）" },
+                    "options": {
+                        "type": "array", "items": { "type": "string" }, "maxItems": 8,
+                        "description": "可选的选项按钮（用户也可直接回复自由文本）"
+                    },
+                    "timeout_secs": { "type": "integer", "description": "等待超时（秒），缺省用服务端默认" }
+                },
+                "required": ["question"]
+            }
+        }]
+    })
+}
+
+/// `kind = "ask"` 的 socket roundtrip：发问题 → 阻塞等回复。
+///
+/// 返回 `Ok(Ok(text))` = 用户回复原文；`Ok(Err(err))` = 主进程侧错误
+/// （超时/发送失败等，文案可直读）；`Err(io)` = socket 层失败（主进程未运行等）。
+pub async fn ask_user_via_socket(
+    sock: &str,
+    conv_id: &str,
+    request_id: &str,
+    question: &str,
+    options: &[String],
+    timeout_secs: u64,
+) -> io::Result<std::result::Result<String, String>> {
+    let mut stream = UnixStream::connect(sock).await?;
+    let token_path = std::path::Path::new(sock)
+        .parent()
+        .map(|d| d.join("permission.token"))
+        .unwrap_or_else(|| std::path::PathBuf::from("permission.token"));
+    let token = std::fs::read_to_string(&token_path)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    stream.write_all(format!("{token}\n").as_bytes()).await?;
+    stream.flush().await?;
+    let req = json!({
+        "kind": "ask",
+        "conv_id": conv_id,
+        "request_id": request_id,
+        "question": question,
+        "options": options,
+        "timeout_secs": timeout_secs,
+    });
+    stream.write_all(format!("{req}\n").as_bytes()).await?;
+    stream.flush().await?;
+
+    let mut reader = BufReader::new(&mut stream);
+    let mut buf = String::new();
+    // 读超时 = 等待超时 + 60s 余量（主进程回写前还有卡片发送等开销）。
+    let budget = std::time::Duration::from_secs(timeout_secs.saturating_add(60));
+    match tokio::time::timeout(budget, reader.read_line(&mut buf)).await {
+        Ok(res) => {
+            res?;
+        }
+        Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("ask reply timed out (>{budget:?})"),
+            ))
+        }
+    }
+    let v: Value = serde_json::from_str(buf.trim())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("parse reply: {e}")))?;
+    if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+        return Ok(Err(err.to_string()));
+    }
+    let text = v
+        .get("text")
+        .and_then(|t| t.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Ok(Ok(text))
+}
+
+/// ask server 主循环（stdio）。`imagent mcp-ask` 子命令入口——供任意终端 agent
+/// 作为 MCP server 挂载；tools/call 走 `kind:"ask"` socket 协议到主进程。
+pub async fn run_ask_mcp_server(
+    conv_id: String,
+    sock: String,
+    default_timeout: std::time::Duration,
+) -> io::Result<()> {
+    let stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+    let mut lines = BufReader::new(stdin).lines();
+
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(l)) => l,
+            Ok(None) => break,
+            Err(e) => {
+                warn!(target: "imagent::mcp", error = %e, "stdin read error");
+                break;
+            }
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let req: Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(e) => {
+                debug!(target: "imagent::mcp", raw = trimmed, error = %e, "ignore non-json line");
+                continue;
+            }
+        };
+        let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+        let resp: Value = match method {
+            "initialize" => json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": { "tools": {} },
+                "serverInfo": { "name": "imagent-ask", "version": env!("CARGO_PKG_VERSION") }
+            }),
+            "tools/list" => build_ask_tools_list(),
+            "tools/call" => {
+                let name = req.pointer("/params/name").and_then(|v| v.as_str()).unwrap_or("");
+                if name != ASK_TOOL_NAME {
+                    json!({
+                        "jsonrpc": "2.0", "id": req.get("id").cloned().unwrap_or(Value::Null),
+                        "error": { "code": -32602, "message": format!("unknown tool: {name}") }
+                    })
+                } else {
+                    let args = req.pointer("/params/arguments").cloned().unwrap_or(json!({}));
+                    let question = args
+                        .get("question")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    let options: Vec<String> = args
+                        .get("options")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|o| o.as_str()).map(String::from).collect())
+                        .unwrap_or_default();
+                    let timeout_secs = args
+                        .get("timeout_secs")
+                        .and_then(|v| v.as_u64())
+                        .filter(|s| (1..=86_400).contains(s))
+                        .unwrap_or(default_timeout.as_secs());
+                    let request_id = new_request_id("t");
+                    let id = req.get("id").cloned().unwrap_or(Value::Null);
+                    if question.is_empty() {
+                        json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": {
+                                "content": [ { "type": "text", "text": "question 不能为空" } ],
+                                "isError": true
+                            }
+                        })
+                    } else {
+                        let text: String = match ask_user_via_socket(
+                            &sock,
+                            &conv_id,
+                            &request_id,
+                            &question,
+                            &options,
+                            timeout_secs,
+                        )
+                        .await
+                        {
+                            Ok(Ok(text)) => text,
+                            Ok(Err(err)) => format!("ask_via_im 失败：{err}"),
+                            // 主进程未运行（connect refused / token 缺失）给出可操作提示。
+                            Err(e) => format!(
+                                "imagent 主进程不可达（{e}）——请确认 `imagent start feishu` 已在运行"
+                            ),
+                        };
+                        let is_error =
+                            text.starts_with("ask_via_im 失败") || text.starts_with("imagent 主进程不可达");
+                        json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": {
+                                "content": [ { "type": "text", "text": text } ],
+                                "isError": is_error
+                            }
+                        })
+                    }
+                }
+            }
+            _ => {
+                if req.get("id").is_none() {
+                    continue; // 通知，不回
+                }
+                json!({
+                    "jsonrpc": "2.0", "id": req.get("id").cloned().unwrap_or(Value::Null),
+                    "error": { "code": -32601, "message": format!("method not found: {method}") }
+                })
+            }
+        };
         let mut out = resp.to_string();
         out.push('\n');
         if let Err(e) = stdout.write_all(out.as_bytes()).await {
@@ -309,6 +548,19 @@ mod tests {
         assert_eq!(tools[0]["name"], TOOL_NAME);
     }
 
+    /// ask server 的 tools/list 只暴露 ask_via_im。
+    #[test]
+    fn ask_tools_list_has_ask_via_im() {
+        let list = build_ask_tools_list();
+        let tools = list.get("tools").and_then(|t| t.as_array()).unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], ASK_TOOL_NAME);
+        assert_eq!(
+            tools[0]["inputSchema"]["required"][0], "question",
+            "question 必填"
+        );
+    }
+
     /// 真机校准（claude CLI 2.1.156）：--permission-prompt-tool 只认 server 限定
     /// 全名。回归防线：全名格式与 backend 写入 mcp-config 的 server 名联动。
     #[test]
@@ -321,6 +573,7 @@ mod tests {
         let reply = PermissionReply {
             allow: true,
             message: None,
+            raw_text: None,
         };
         let resp = build_call_response(&reply, &json!({"command": "ls"}));
         let text = resp["content"][0]["text"].as_str().unwrap();
@@ -335,6 +588,7 @@ mod tests {
         let reply = PermissionReply {
             allow: false,
             message: Some("nope".into()),
+            raw_text: None,
         };
         let resp = build_call_response(&reply, &json!({}));
         let text = resp["content"][0]["text"].as_str().unwrap();
