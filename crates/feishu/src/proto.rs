@@ -60,6 +60,71 @@ pub struct Message {
     /// 去重 key 备选。
     #[serde(default)]
     pub message_id: Option<String>,
+    /// 消息内 @ 提及列表（P6-1：正文占位 `@_user_N` 的元数据）。
+    #[serde(default)]
+    pub mentions: Vec<MessageMention>,
+    /// 话题群（thread）消息所属话题的根消息 id（P6-4：仅话题群返回；普通群回复
+    /// 只有 parent_id 不设 root_id）。
+    #[serde(default)]
+    pub root_id: Option<String>,
+}
+
+/// 群/私聊消息里的 @ 提及（`im.message.receive_v1` 的 message.mentions 元素）。
+/// 兼容平铺形态：部分载荷把 open_id 直接放提及对象上（同评论事件的宽容姿态）。
+#[derive(Debug, Deserialize)]
+pub struct MessageMention {
+    /// 正文占位 key，如 `@_user_1`（与 content.text 中的占位一一对应）。
+    #[serde(default)]
+    pub key: Option<String>,
+    /// 被 @ 者标识（嵌套形态）。
+    #[serde(default)]
+    pub id: Option<MentionId>,
+    /// 显示名（客户端渲染的 @ 名字）。
+    #[serde(default)]
+    pub name: Option<String>,
+    /// 平铺形态的 open_id。
+    #[serde(default)]
+    pub open_id: Option<String>,
+    /// 平铺形态的 user_id（历史字段名，评论事件同款宽容）。
+    #[serde(default)]
+    pub user_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MentionId {
+    #[serde(default)]
+    pub open_id: Option<String>,
+}
+
+impl MessageMention {
+    /// 被 @ 者的 open_id（嵌套优先，平铺回退）。
+    pub fn open_id(&self) -> Option<&str> {
+        self.id
+            .as_ref()
+            .and_then(|i| i.open_id.as_deref())
+            .or(self.open_id.as_deref())
+            .or(self.user_id.as_deref())
+            .filter(|s| !s.is_empty())
+    }
+}
+
+/// mention 处理策略（P6-1）：由 platform 层注入 config，纯函数可测。
+#[derive(Debug, Clone, Copy)]
+pub struct MentionPolicy {
+    /// 群消息必须 @bot 才处理（`feishu_require_mention_in_group`，默认 true）。
+    /// p2p 不受限。bot id 未知时退化为「mentions 非空」弱过滤（同评论 P5-8）。
+    pub require_mention_in_group: bool,
+}
+
+impl MentionPolicy {
+    /// 全收（历史行为：过滤完全依赖事件订阅 scope）。
+    pub const PERMISSIVE: Self = Self {
+        require_mention_in_group: false,
+    };
+    /// 群消息须 @bot（config 默认）。
+    pub const REQUIRE_BOT: Self = Self {
+        require_mention_in_group: true,
+    };
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +167,11 @@ struct PostNode {
     text: Option<String>,
     #[serde(default)]
     image_key: Option<String>,
+    /// at 节点：被 @ 者 open_id（字段名历史遗留 user_id，同评论事件）。
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    user_name: Option<String>,
 }
 
 /// 待下载的入站媒体（proto 只解析出 key，实际下载落盘在 platform 层）。
@@ -161,11 +231,14 @@ pub struct CardOperatorId {
     pub open_id: Option<String>,
 }
 
-/// 解析审批按钮回调：value 形如 `{"imagent_perm":"allow|deny","conv":"feishu:…"}`。
+/// 解析按钮卡片回调（card.action.trigger），两类 value（P6-3 扩展）：
+/// - 审批按钮：`{"imagent_perm":"allow|deny","conv":"feishu:…"}` → `text = "y"/"n"`，
+///   core 的 recv 循环把 pending conv 的非斜杠消息当审批回复路由（`parse_reply`）；
+/// - 命令按钮：`{"imagent_cmd":"/ws use main","conv":"feishu:…"}` → `text = <command>`，
+///   走与手打命令完全相同的鉴权/分派路径（admin 门槛等不豁免）。
 ///
-/// 映射为 `text = "y"/"n"` 的普通 InboundMessage——core 的 recv 循环会把 pending
-/// conv 的非斜杠消息当审批回复路由（`parse_reply`），平台无需感知权限闭环。
-/// 非 imagent 按钮 / 缺 conv / 缺 open_id 返回 None。
+/// 非 imagent 按钮 / 缺 conv / 缺 open_id / 命令非 `/` 开头（防伪造非命令文本）
+/// 返回 None。
 pub fn parse_card_action_event(payload: &[u8]) -> Option<(String, InboundMessage)> {
     let evt: CardActionEvent = serde_json::from_slice(payload).ok()?;
     if evt.header.event_type != "card.action.trigger" {
@@ -177,13 +250,17 @@ pub fn parse_card_action_event(payload: &[u8]) -> Option<(String, InboundMessage
     let conv = value.get("conv")?.as_str()?;
     // P6：问题卡选项按钮（imagent_ask）→ "ask:<选项>" 文本，走审批回复路由由
     // parse_reply 转成 deny+message（用户选择经 message 回给 agent）。
+    // P6-3：命令按钮（imagent_cmd）→ 命令本体，走与手打命令相同的鉴权/分派
+    //（admin 门槛等不豁免；只接受 / 开头，防伪造普通聊天文本）。
+    let act = value.get("imagent_perm").and_then(|v| v.as_str());
+    let cmd = value.get("imagent_cmd").and_then(|v| v.as_str());
     let text: String = if let Some(choice) = value.get("imagent_ask").and_then(|c| c.as_str()) {
         format!("ask:{choice}")
     } else {
-        let act = value.get("imagent_perm")?.as_str()?;
-        match act {
-            "allow" => "y".to_string(),
-            "deny" => "n".to_string(),
+        match (act, cmd) {
+            (Some("allow"), _) => "y".to_string(),
+            (Some("deny"), _) => "n".to_string(),
+            (_, Some(c)) if c.starts_with('/') => c.to_string(),
             _ => return None,
         }
     };
@@ -200,19 +277,21 @@ pub fn parse_card_action_event(payload: &[u8]) -> Option<(String, InboundMessage
                 .and_then(|o| o.open_id.clone())
         })
         .filter(|s| !s.is_empty())?;
-    let key = evt
-        .header
-        .event_id
-        .clone()
-        .unwrap_or_else(|| format!("card_action:{open_id}:{}", &text[..text.len().min(32)]));
+    let key = evt.header.event_id.clone().unwrap_or_else(|| {
+        format!(
+            "card_action:{open_id}:{conv}:{}",
+            text.chars().take(40).collect::<String>()
+        )
+    });
     Some((
         key,
         InboundMessage {
             conv_id: ConvId(conv.to_string()),
             sender: UserId(open_id),
-            text: Some(text.to_string()),
+            text: Some(text),
             media: vec![],
             media_errors: Vec::new(),
+            mentions: Vec::new(),
             reply_hint: ReplyHint::None,
         },
     ))
@@ -271,6 +350,19 @@ pub fn is_comment_event(payload: &[u8]) -> bool {
                 .get("event_type")?
                 .as_str()
                 .map(|t| t == "drive.file.comment.created_v1")
+        })
+        .unwrap_or(false)
+}
+
+/// 廉价判定 payload 是否为**群聊**消息事件（P6-1：drain 据此懒取 bot open_id——
+/// 群消息的 @bot 过滤与 @bot 文本剥离需要；p2p 无 @bot 语义，无需 bot id）。
+pub fn is_group_message_event(payload: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|v| {
+            let et = v.get("header")?.get("event_type")?.as_str()?;
+            let ct = v.get("event")?.get("message")?.get("chat_type")?.as_str()?;
+            Some(et == "im.message.receive_v1" && ct == "group")
         })
         .unwrap_or(false)
 }
@@ -350,6 +442,7 @@ pub fn parse_comment_event(
             text: Some(text.join("\n")),
             media: vec![],
             media_errors: Vec::new(),
+            mentions: Vec::new(),
             reply_hint: ReplyHint::None,
         },
     ))
@@ -371,26 +464,50 @@ pub fn comment_target_from_conv(conv: &ConvId) -> Option<(String, String)> {
 
 /// 解析长连接 payload。处理 `im.message.receive_v1` 的 **text / image / file / post** 消息。
 ///
+/// P6-1：mention 处理——正文占位 `@_user_N` 替换为可读文本（@bot 剥离、@他人转
+/// `@名字`），非Bot提及进 `InboundMessage.mentions`（`/allow @名字` 反解用）；
+/// `policy.require_mention_in_group` 时群消息须 @bot（bot id 未知退化为弱过滤）。
+///
 /// 返回 `(dedup_key, InboundMessage, pending_media)`；以下情况返回 `None`
 /// （上层丢弃）：非目标事件 / 不支持的消息类型（非 text/image/file/post）/ text 空文本
 /// / image 缺 image_key / file 缺 file_key / post 无文字且无图片 / content 非法 JSON
-/// / payload 非法 JSON / 缺 receive_id。`pending_media` 为待下载的图片/文件（仅解析出
-/// key，实际下载落盘在 platform 层完成，回填进 `InboundMessage.media`）。
-pub fn parse_message_event(payload: &[u8]) -> Option<(String, InboundMessage, Vec<PendingMedia>)> {
+/// / payload 非法 JSON / 缺 receive_id / 群消息未 @bot（按 policy）。
+/// `pending_media` 为待下载的图片/文件（仅解析出 key，实际下载落盘在 platform 层
+/// 完成，回填进 `InboundMessage.media`）。
+pub fn parse_message_event(
+    payload: &[u8],
+    policy: &MentionPolicy,
+    bot_open_id: Option<&str>,
+) -> Option<(String, InboundMessage, Vec<PendingMedia>)> {
     let evt: FeishuEvent = serde_json::from_slice(payload).ok()?;
     if evt.header.event_type != "im.message.receive_v1" {
         return None;
     }
     let mt = evt.event.message.message_type.as_str();
     let message_id = evt.event.message.message_id.clone().unwrap_or_default();
+    // 群消息 @bot 过滤（P6-1）：在正文清洗前判定，未 @bot 直接丢弃。
+    if !group_mention_ok(
+        &evt.event.message.chat_type,
+        &evt.event.message.mentions,
+        policy,
+        bot_open_id,
+    ) {
+        return None;
+    }
     // 解析 content：text 提取文本（空文本丢弃），image/file 提取资源 key（缺 key 丢弃）。
-    let (text, pending): (Option<String>, Vec<PendingMedia>) = match mt {
+    let (text, pending, mentions): (
+        Option<String>,
+        Vec<PendingMedia>,
+        Vec<imagent_core::Mention>,
+    ) = match mt {
         "text" => {
-            let t = extract_text(&evt.event.message.content)?;
-            if t.trim().is_empty() {
+            let raw = extract_text(&evt.event.message.content)?;
+            let (clean, mentions) =
+                apply_text_mentions(&raw, &evt.event.message.mentions, bot_open_id);
+            if clean.trim().is_empty() {
                 return None;
             }
-            (Some(t), vec![])
+            (Some(clean), vec![], mentions)
         }
         "image" => {
             let key = extract_image_key(&evt.event.message.content)?;
@@ -401,6 +518,7 @@ pub fn parse_message_event(payload: &[u8]) -> Option<(String, InboundMessage, Ve
                     key,
                     message_id: message_id.clone(),
                 }],
+                Vec::new(),
             )
         }
         "file" => {
@@ -412,10 +530,13 @@ pub fn parse_message_event(payload: &[u8]) -> Option<(String, InboundMessage, Ve
                     key,
                     message_id,
                 }],
+                Vec::new(),
             )
         }
         "post" => {
-            let (t, mut p) = parse_post(&evt.event.message.content)?;
+            // P6-1：post 的 @ 是独立 at 节点（正文无占位 key），mentions 由
+            // parse_post 从节点提取（@bot 剔除、@他人渲染 `@名字`）。
+            let (t, mut p, mentions) = parse_post(&evt.event.message.content, bot_open_id)?;
             for m in &mut p {
                 m.message_id = message_id.clone();
             }
@@ -423,7 +544,7 @@ pub fn parse_message_event(payload: &[u8]) -> Option<(String, InboundMessage, Ve
             if t.as_deref().is_none_or(|s| s.trim().is_empty()) && p.is_empty() {
                 return None;
             }
-            (t, p)
+            (t, p, mentions)
         }
         _ => return None, // audio/video/voice/... 暂不支持
     };
@@ -443,15 +564,88 @@ pub fn parse_message_event(payload: &[u8]) -> Option<(String, InboundMessage, Ve
         .clone()
         .or_else(|| evt.event.message.message_id.clone())
         .unwrap_or(dedup_fallback);
+    // P6-4：话题群（thread）隔离——群消息带 root_id（话题根，om_ 前缀）时
+    // conv 升级为 `feishu:<chat_id>:<root_id>`，每个话题独立 session/批处理；
+    // 普通群回复只有 parent_id（root_id 空），不受影响。回复走 reply API 落回话题。
+    let conv = match evt
+        .event
+        .message
+        .root_id
+        .as_deref()
+        .filter(|r| r.starts_with("om_") && evt.event.message.chat_type == "group")
+    {
+        Some(root) => format!("feishu:{receive_id}:{root}"),
+        None => format!("feishu:{receive_id}"),
+    };
     let msg = InboundMessage {
-        conv_id: ConvId(format!("feishu:{receive_id}")),
+        conv_id: ConvId(conv),
         sender: UserId(open_id),
         text,
         media: vec![],
         media_errors: Vec::new(),
+        mentions,
         reply_hint: ReplyHint::None,
     };
     Some((dedup_key, msg, pending))
+}
+
+/// 群消息 @bot 过滤（P6-1）。
+/// - p2p：一律放行（私聊无 @ 语义）；
+/// - `require_mention_in_group=false`：放行（历史行为，过滤交给事件订阅 scope）；
+/// - bot id 已知：mentions 含 bot 才放行；
+/// - bot id 未知：弱过滤——mentions 非空即放行（与评论事件 P5-8 同语义，
+///   drain 层取到 bot id 后自动收紧）。
+fn group_mention_ok(
+    chat_type: &str,
+    mentions: &[MessageMention],
+    policy: &MentionPolicy,
+    bot_open_id: Option<&str>,
+) -> bool {
+    if chat_type != "group" || !policy.require_mention_in_group {
+        return true;
+    }
+    match bot_open_id {
+        Some(bot) => mentions.iter().any(|m| m.open_id() == Some(bot)),
+        None => !mentions.is_empty(),
+    }
+}
+
+/// 正文占位清洗（P6-1）：`@_user_N` → 可读文本。
+/// - @bot（open_id 命中）：占位连同尾随一个空格整体剥离，不进 mentions；
+/// - @他人：替换为 `@名字`（无名字时退化为剥掉占位，保留语义不炸格式）；
+/// - mentions 数组外的孤儿占位原样保留（防御：飞书缺元数据时不丢字）。
+///
+/// 返回 (清洗后正文, 非Bot提及列表)。
+fn apply_text_mentions(
+    text: &str,
+    mentions: &[MessageMention],
+    bot_open_id: Option<&str>,
+) -> (String, Vec<imagent_core::Mention>) {
+    let mut out = text.to_string();
+    let mut resolved: Vec<imagent_core::Mention> = Vec::new();
+    for m in mentions {
+        let Some(key) = m.key.as_deref().filter(|k| !k.is_empty()) else {
+            continue;
+        };
+        let Some(open_id) = m.open_id() else {
+            continue;
+        };
+        if bot_open_id == Some(open_id) {
+            // @bot：占位 + 尾随空格一起剥（飞书渲染形态为「@bot 内容」）。
+            out = out.replace(&format!("{key} "), "").replace(key, "");
+            continue;
+        }
+        let name = m.name.as_deref().filter(|n| !n.trim().is_empty());
+        out = match name {
+            Some(n) => out.replace(key, &format!("@{n}")),
+            None => out.replace(key, ""),
+        };
+        resolved.push(imagent_core::Mention {
+            user_id: open_id.to_string(),
+            name: name.unwrap_or_default().to_string(),
+        });
+    }
+    (out, resolved)
 }
 
 /// 从 text 消息的 content JSON 提取文本：`{"text":"hi"}` -> `"hi"`。
@@ -479,11 +673,20 @@ pub fn extract_file_key(content: &str) -> Option<String> {
 }
 
 /// 解析 post 富文本：提取所有 text 节点拼成正文 + 所有 img 节点的 image_key。
+/// P6-1：at 节点——@bot 跳过（剥离），@他人渲染为 `@名字` 并进 mentions。
 /// content 非法 JSON 返回 `None`。text 全空则正文为 `None`。
-fn parse_post(content: &str) -> Option<(Option<String>, Vec<PendingMedia>)> {
+fn parse_post(
+    content: &str,
+    bot_open_id: Option<&str>,
+) -> Option<(
+    Option<String>,
+    Vec<PendingMedia>,
+    Vec<imagent_core::Mention>,
+)> {
     let post: PostContent = serde_json::from_str(content).ok()?;
     let mut texts: Vec<String> = Vec::new();
     let mut pending: Vec<PendingMedia> = Vec::new();
+    let mut mentions: Vec<imagent_core::Mention> = Vec::new();
     if !post.title.trim().is_empty() {
         texts.push(post.title);
     }
@@ -504,7 +707,28 @@ fn parse_post(content: &str) -> Option<(Option<String>, Vec<PendingMedia>)> {
                         });
                     }
                 }
-                _ => {} // at/a/mention 等暂忽略
+                "at" => {
+                    // post 的 at 节点无占位 key，按节点剔除：@bot 跳过，
+                    // @他人渲染 `@名字`（无名字只进 mentions 不占正文）。
+                    let uid = node.user_id.as_deref().filter(|s| !s.is_empty());
+                    if uid.is_none_or(|u| bot_open_id != Some(u)) {
+                        if let Some(u) = uid {
+                            let name = node
+                                .user_name
+                                .as_deref()
+                                .filter(|n| !n.trim().is_empty())
+                                .unwrap_or_default();
+                            if !name.is_empty() {
+                                texts.push(format!("@{name}"));
+                            }
+                            mentions.push(imagent_core::Mention {
+                                user_id: u.to_string(),
+                                name: name.to_string(),
+                            });
+                        }
+                    }
+                }
+                _ => {} // a/mention 等其余忽略
             }
         }
     }
@@ -513,7 +737,7 @@ fn parse_post(content: &str) -> Option<(Option<String>, Vec<PendingMedia>)> {
     } else {
         Some(texts.join("\n"))
     };
-    Some((text, pending))
+    Some((text, pending, mentions))
 }
 
 /// 按 chat_type 决定发回的 receive_id：
@@ -537,17 +761,32 @@ fn receive_target(event: &EventBody) -> Option<(String, ReceiveIdKind)> {
     None
 }
 
-/// 发消息反向解析：`feishu:<id>` → `(id, kind)`。
+/// 发消息反向解析：`feishu:<id>[:<root_id>]` → `(id, kind)`。
 /// 飞书 ID 前缀约定：`ou_` = open_id（用户，私聊），其余（`oc_` = chat_id，群聊）→ ChatId。
+/// P6-4：话题群 conv 带 `:<root_id>` 后缀——发送目标取首段（话题内回复由
+/// [`thread_target_from_conv`] 分流到 reply API）。
 /// 无 `feishu:` 前缀返回 `None`（非法 conv_id，上层报错）。
 pub fn receive_target_from_conv(conv: &ConvId) -> Option<(String, ReceiveIdKind)> {
-    let id = conv.0.strip_prefix("feishu:")?;
+    let rest = conv.0.strip_prefix("feishu:")?;
+    let id = rest.split(':').next().unwrap_or(rest);
     let kind = if id.starts_with("ou_") {
         ReceiveIdKind::OpenId
     } else {
         ReceiveIdKind::ChatId
     };
     Some((id.to_string(), kind))
+}
+
+/// 话题群 conv 反解（P6-4）：`feishu:<chat_id>:<root_id>`（root 为 `om_` 前缀的
+/// 话题根消息 id）→ `(chat_id, root_id)`。非话题 conv 返回 None。
+/// 评论 conv（`feishu:comment:…`）第二段非 om_ 前缀，天然不命中。
+pub fn thread_target_from_conv(conv: &ConvId) -> Option<(String, String)> {
+    let rest = conv.0.strip_prefix("feishu:")?;
+    let (chat_id, root_id) = rest.split_once(':')?;
+    if chat_id.is_empty() || root_id.is_empty() || !root_id.starts_with("om_") {
+        return None;
+    }
+    Some((chat_id.to_string(), root_id.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -557,6 +796,11 @@ pub fn receive_target_from_conv(conv: &ConvId) -> Option<(String, ReceiveIdKind)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 旧语义（宽松策略、bot id 未知）的解析入口——历史用例断言不变。
+    fn parse_permissive(payload: &[u8]) -> Option<(String, InboundMessage, Vec<PendingMedia>)> {
+        parse_message_event(payload, &MentionPolicy::PERMISSIVE, None)
+    }
 
     /// p2p 文本：conv=feishu:<open_id>、sender=open_id、text 正确、dedup=event_id。
     #[test]
@@ -569,7 +813,7 @@ mod tests {
                 "message":{"message_type":"text","content":"{\"text\":\"hi there\"}","chat_type":"p2p","chat_id":"","message_id":"om_msg1"}
             }
         }"#;
-        let (key, msg, pending) = parse_message_event(payload).expect("p2p 文本应解析成功");
+        let (key, msg, pending) = parse_permissive(payload).expect("p2p 文本应解析成功");
         assert_eq!(key, "evt_1");
         assert_eq!(msg.conv_id.0, "feishu:ou_user1");
         assert_eq!(msg.sender.0, "ou_user1");
@@ -588,7 +832,7 @@ mod tests {
                 "chat":{"chat_id":"oc_chat1"}
             }
         }"#;
-        let (key, msg, _) = parse_message_event(payload).expect("group 文本应解析成功");
+        let (key, msg, _) = parse_permissive(payload).expect("group 文本应解析成功");
         assert_eq!(key, "evt_2");
         assert_eq!(msg.conv_id.0, "feishu:oc_chat1");
         assert_eq!(msg.sender.0, "ou_user2");
@@ -605,7 +849,7 @@ mod tests {
                 "message":{"message_type":"text","content":"{\"text\":\"x\"}","chat_type":"group","chat_id":"oc_chat2","message_id":"om_msg3"}
             }
         }"#;
-        let (_key, msg, _) = parse_message_event(payload).expect("group 回退 chat_id 应成功");
+        let (_key, msg, _) = parse_permissive(payload).expect("group 回退 chat_id 应成功");
         assert_eq!(msg.conv_id.0, "feishu:oc_chat2");
     }
 
@@ -616,7 +860,7 @@ mod tests {
             "header":{"event_id":"evt_x","event_type":"application.url.menu_v6"},
             "event":{"sender":{"sender_id":{"open_id":"ou_x"}},"message":{"message_type":"text","content":"{\"text\":\"hi\"}","chat_type":"p2p"}}
         }"#;
-        assert!(parse_message_event(payload).is_none());
+        assert!(parse_permissive(payload).is_none());
     }
 
     /// 不支持的媒体类型（audio/video/voice 等）丢弃。
@@ -626,7 +870,7 @@ mod tests {
             "header":{"event_id":"evt_i","event_type":"im.message.receive_v1"},
             "event":{"sender":{"sender_id":{"open_id":"ou_x"}},"message":{"message_type":"audio","content":"{\"file_key\":\"k\"}","chat_type":"p2p"}}
         }"#;
-        assert!(parse_message_event(payload).is_none());
+        assert!(parse_permissive(payload).is_none());
     }
 
     /// p2p 图片：pending 含 image key，msg.text==None、media 空。
@@ -636,7 +880,7 @@ mod tests {
             "header":{"event_id":"evt_img","event_type":"im.message.receive_v1"},
             "event":{"sender":{"sender_id":{"open_id":"ou_user1"}},"message":{"message_type":"image","content":"{\"image_key\":\"img_v3_00ab\"}","chat_type":"p2p"}}
         }"#;
-        let (key, msg, pending) = parse_message_event(payload).expect("图片应解析成功");
+        let (key, msg, pending) = parse_permissive(payload).expect("图片应解析成功");
         assert_eq!(key, "evt_img");
         assert_eq!(msg.conv_id.0, "feishu:ou_user1");
         assert_eq!(msg.sender.0, "ou_user1");
@@ -657,7 +901,7 @@ mod tests {
             "header":{"event_id":"evt_file","event_type":"im.message.receive_v1"},
             "event":{"sender":{"sender_id":{"open_id":"ou_user2"}},"message":{"message_type":"file","content":"{\"file_key\":\"file_v3_001\"}","chat_type":"p2p"}}
         }"#;
-        let (key, msg, pending) = parse_message_event(payload).expect("文件应解析成功");
+        let (key, msg, pending) = parse_permissive(payload).expect("文件应解析成功");
         assert_eq!(key, "evt_file");
         assert_eq!(msg.conv_id.0, "feishu:ou_user2");
         assert!(msg.text.is_none());
@@ -674,7 +918,7 @@ mod tests {
             "header":{"event_id":"e","event_type":"im.message.receive_v1"},
             "event":{"sender":{"sender_id":{"open_id":"ou_x"}},"message":{"message_type":"image","content":"{}","chat_type":"p2p"}}
         }"#;
-        assert!(parse_message_event(payload).is_none());
+        assert!(parse_permissive(payload).is_none());
     }
 
     /// image content 非法 JSON 丢弃。
@@ -682,7 +926,7 @@ mod tests {
     fn ignore_image_invalid_content_json() {
         let payload = br#"{"header":{"event_id":"e","event_type":"im.message.receive_v1"},
             "event":{"sender":{"sender_id":{"open_id":"ou_x"}},"message":{"message_type":"image","content":"not-json","chat_type":"p2p"}}}"#;
-        assert!(parse_message_event(payload).is_none());
+        assert!(parse_permissive(payload).is_none());
     }
 
     /// image 消息缺 event_id 时 dedup 回退到 message_id，再缺回退到 receive_id:image_key。
@@ -691,13 +935,13 @@ mod tests {
         // 有 message_id → 用 message_id。
         let p1 = br#"{"header":{"event_type":"im.message.receive_v1"},
             "event":{"sender":{"sender_id":{"open_id":"ou_x"}},"message":{"message_type":"image","content":"{\"image_key\":\"img_k1\"}","chat_type":"p2p","message_id":"om_img1"}}}"#;
-        let (key, _, _) = parse_message_event(p1).expect("应解析成功");
+        let (key, _, _) = parse_permissive(p1).expect("应解析成功");
         assert_eq!(key, "om_img1");
 
         // event_id 与 message_id 都缺 → 回退 receive_id:image_key。
         let p2 = br#"{"header":{"event_type":"im.message.receive_v1"},
             "event":{"sender":{"sender_id":{"open_id":"ou_x"}},"message":{"message_type":"image","content":"{\"image_key\":\"img_k2\"}","chat_type":"p2p"}}}"#;
-        let (key2, _, _) = parse_message_event(p2).expect("应解析成功");
+        let (key2, _, _) = parse_permissive(p2).expect("应解析成功");
         assert_eq!(key2, "ou_x:img_k2");
     }
 
@@ -706,18 +950,18 @@ mod tests {
     fn ignore_empty_text() {
         let empty = br#"{"header":{"event_id":"e","event_type":"im.message.receive_v1"},
             "event":{"sender":{"sender_id":{"open_id":"ou_x"}},"message":{"message_type":"text","content":"{\"text\":\"\"}","chat_type":"p2p"}}}"#;
-        assert!(parse_message_event(empty).is_none());
+        assert!(parse_permissive(empty).is_none());
 
         let ws = br#"{"header":{"event_id":"e","event_type":"im.message.receive_v1"},
             "event":{"sender":{"sender_id":{"open_id":"ou_x"}},"message":{"message_type":"text","content":"{\"text\":\"   \"}","chat_type":"p2p"}}}"#;
-        assert!(parse_message_event(ws).is_none());
+        assert!(parse_permissive(ws).is_none());
     }
 
     /// 非法 JSON payload 丢弃。
     #[test]
     fn ignore_invalid_json() {
-        assert!(parse_message_event(b"not json at all").is_none());
-        assert!(parse_message_event(b"").is_none());
+        assert!(parse_permissive(b"not json at all").is_none());
+        assert!(parse_permissive(b"").is_none());
     }
 
     /// content 非法 JSON 丢弃。
@@ -725,7 +969,7 @@ mod tests {
     fn ignore_invalid_content_json() {
         let payload = br#"{"header":{"event_id":"e","event_type":"im.message.receive_v1"},
             "event":{"sender":{"sender_id":{"open_id":"ou_x"}},"message":{"message_type":"text","content":"not-json","chat_type":"p2p"}}}"#;
-        assert!(parse_message_event(payload).is_none());
+        assert!(parse_permissive(payload).is_none());
     }
 
     /// dedup key 回退：缺 event_id 时用 message_id。
@@ -735,7 +979,7 @@ mod tests {
             "header":{"event_type":"im.message.receive_v1"},
             "event":{"sender":{"sender_id":{"open_id":"ou_user9"}},"message":{"message_type":"text","content":"{\"text\":\"hi\"}","chat_type":"p2p","message_id":"om_fb"}}
         }"#;
-        let (key, _, _) = parse_message_event(payload).expect("应解析成功");
+        let (key, _, _) = parse_permissive(payload).expect("应解析成功");
         assert_eq!(key, "om_fb");
     }
 
@@ -778,7 +1022,7 @@ mod tests {
             "event":{"sender":{"sender_id":{"open_id":"ou_user1"}},"message":{"message_type":"post","content":"{\"title\":\"\",\"content\":[[{\"tag\":\"img\",\"image_key\":\"img_v3_abc\",\"width\":539,\"height\":317}],[{\"tag\":\"text\",\"text\":\"你能给我描述一下这张图片吗？\",\"style\":[]}]]}","chat_type":"p2p"}}
         }"#;
         let (key, msg, pending) =
-            parse_message_event(payload.as_bytes()).expect("post 图片+文字应解析成功");
+            parse_permissive(payload.as_bytes()).expect("post 图片+文字应解析成功");
         assert_eq!(key, "evt_post");
         assert_eq!(msg.text.as_deref(), Some("你能给我描述一下这张图片吗？"));
         assert_eq!(pending.len(), 1);
@@ -793,8 +1037,7 @@ mod tests {
             "header":{"event_type":"im.message.receive_v1"},
             "event":{"sender":{"sender_id":{"open_id":"ou_u"}},"message":{"message_type":"post","content":"{\"content\":[[{\"tag\":\"img\",\"image_key\":\"img_only\"}]]}","chat_type":"p2p","message_id":"om_p"}}
         }"#;
-        let (key, msg, pending) =
-            parse_message_event(payload.as_bytes()).expect("纯图片 post 应解析");
+        let (key, msg, pending) = parse_permissive(payload.as_bytes()).expect("纯图片 post 应解析");
         assert_eq!(key, "om_p");
         assert!(msg.text.is_none(), "纯图片 post 无正文");
         assert_eq!(pending.len(), 1);
@@ -809,7 +1052,7 @@ mod tests {
             "event":{"sender":{"sender_id":{"open_id":"ou_u"}},"message":{"message_type":"post","content":"{\"content\":[[{\"tag\":\"text\",\"text\":\"hello post\"}]]}","chat_type":"p2p"}}
         }"#;
         let (_key, msg, pending) =
-            parse_message_event(payload.as_bytes()).expect("纯文字 post 应解析");
+            parse_permissive(payload.as_bytes()).expect("纯文字 post 应解析");
         assert_eq!(msg.text.as_deref(), Some("hello post"));
         assert!(pending.is_empty(), "纯文字 post 无图片");
     }
@@ -821,7 +1064,7 @@ mod tests {
             "header":{"event_id":"e","event_type":"im.message.receive_v1"},
             "event":{"sender":{"sender_id":{"open_id":"ou_u"}},"message":{"message_type":"post","content":"{\"content\":[]}","chat_type":"p2p"}}
         }"#;
-        assert!(parse_message_event(payload).is_none());
+        assert!(parse_permissive(payload).is_none());
     }
 
     // ---------- P4-4：card.action.trigger（审批按钮回调） ----------
@@ -850,7 +1093,7 @@ mod tests {
     }
 
     /// 真机校准（2026-08）：新版回调信封 operator.open_id 平铺（不再嵌套
-    /// operator_id）。按线上真实 payload 形态构造。
+    /// operator_id），action.value 保持嵌套。按线上真实 payload 形态构造。
     #[test]
     fn parse_card_action_flat_operator_envelope() {
         let payload = serde_json::json!({
@@ -908,6 +1151,35 @@ mod tests {
         let no_op = br#"{"header":{"event_id":"e","event_type":"card.action.trigger"},
             "event":{"operator":{"operator_id":{}},"action":{"value":{"imagent_perm":"allow","conv":"feishu:ou_x"}}}}"#;
         assert!(parse_card_action_event(no_op).is_none());
+    }
+
+    /// P6-3：命令按钮回调——value 带 imagent_cmd（/ 开头）→ text = 命令本体；
+    /// 非 / 开头（防伪造普通文本）→ None。
+    #[test]
+    fn parse_card_action_command_button() {
+        let mk = |cmd: &str| {
+            serde_json::json!({
+                "header":{"event_id":"evt_cmd_1","event_type":"card.action.trigger"},
+                "event":{
+                    "operator":{"open_id":"ou_op"},
+                    "action":{"tag":"button","value":{"imagent_cmd":cmd,"conv":"feishu:oc_g"}}
+                }
+            })
+            .to_string()
+            .into_bytes()
+        };
+        let (key, msg) = parse_card_action_event(&mk("/ws use main")).expect("命令按钮应回调");
+        assert_eq!(key, "evt_cmd_1");
+        assert_eq!(msg.conv_id.0, "feishu:oc_g");
+        assert_eq!(msg.sender.0, "ou_op");
+        assert_eq!(msg.text.as_deref(), Some("/ws use main"));
+        // 非 / 开头 → 拒（回调不应产生普通聊天文本）。
+        assert!(parse_card_action_event(&mk("rm -rf /")).is_none());
+        // 旧信封（operator_id 嵌套 + action.value）同样支持命令按钮。
+        let legacy = br#"{"header":{"event_id":"evt_cmd_2","event_type":"card.action.trigger"},
+            "event":{"operator":{"operator_id":{"open_id":"ou_o2"}},"action":{"value":{"imagent_cmd":"/resume 3","conv":"feishu:ou_o2"}}}}"#;
+        let (_, msg) = parse_card_action_event(legacy).expect("旧信封命令按钮应回调");
+        assert_eq!(msg.text.as_deref(), Some("/resume 3"));
     }
 
     // ---------- P4-9：drive.file.comment.created_v1（云文档评论） ----------
@@ -984,5 +1256,190 @@ mod tests {
         assert!(parse_comment_event(mk(text_node, "ou_a").as_bytes(), None).is_none());
         // bot id 未知（弱过滤）：有 at（任意）→ 过。
         assert!(parse_comment_event(mk(at_other, "ou_a").as_bytes(), None).is_some());
+    }
+
+    // ---------- P6-1：mention 基础设施（@bot 过滤 / 占位剥离 / mentions 元数据） ----------
+
+    /// 构造带 mentions 元数据的群 text 消息 payload（content 须为 JSON 字符串，
+    /// 与飞书真实事件形态一致）。
+    fn mk_group_mention_payload(event_id: &str, text: &str, mentions: &str) -> Vec<u8> {
+        serde_json::json!({
+            "header":{"event_id":event_id,"event_type":"im.message.receive_v1"},
+            "event":{
+                "sender":{"sender_id":{"open_id":"ou_sender"}},
+                "message":{
+                    "message_type":"text",
+                    "content":serde_json::to_string(&serde_json::json!({"text": text})).unwrap(),
+                    "chat_type":"group","chat_id":"oc_g1",
+                    "mentions":serde_json::from_str::<serde_json::Value>(mentions).unwrap()
+                },
+                "chat":{"chat_id":"oc_g1"}
+            }
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    const BOT_AND_USER_MENTIONS: &str = r#"[
+        {"key":"@_user_1","id":{"open_id":"ou_bot"},"name":"agent"},
+        {"key":"@_user_2","id":{"open_id":"ou_alice"},"name":"Alice"}
+    ]"#;
+
+    /// @bot 剥离 + @他人替换 + mentions 元数据（bot id 已知）。
+    #[test]
+    fn mention_strip_and_metadata() {
+        let p = mk_group_mention_payload(
+            "evt_m1",
+            "@_user_1 帮我看看 @_user_2 写的代码",
+            BOT_AND_USER_MENTIONS,
+        );
+        let (_k, msg, _) = parse_message_event(&p, &MentionPolicy::REQUIRE_BOT, Some("ou_bot"))
+            .expect("@bot 群消息应通过过滤");
+        // @bot 占位连同尾随空格剥离；@他人替换为可读 @Alice。
+        assert_eq!(msg.text.as_deref(), Some("帮我看看 @Alice 写的代码"));
+        // mentions 只含非Bot提及（/allow @Alice 反解用）。
+        assert_eq!(msg.mentions.len(), 1);
+        assert_eq!(msg.mentions[0].user_id, "ou_alice");
+        assert_eq!(msg.mentions[0].name, "Alice");
+    }
+
+    /// REQUIRE_BOT 策略：群消息未 @bot → 丢弃；@bot → 通过；p2p 不受限。
+    #[test]
+    fn group_require_mention_filter() {
+        // 无 mentions 的群消息 → 丢。
+        let no_at = mk_group_mention_payload("evt_m2", "普通群消息", "[]");
+        assert!(parse_message_event(&no_at, &MentionPolicy::REQUIRE_BOT, Some("ou_bot")).is_none());
+        // @了别人（非 bot）→ 丢。
+        let at_other = mk_group_mention_payload(
+            "evt_m3",
+            "@_user_2 在吗",
+            r#"[{"key":"@_user_2","id":{"open_id":"ou_alice"},"name":"Alice"}]"#,
+        );
+        assert!(
+            parse_message_event(&at_other, &MentionPolicy::REQUIRE_BOT, Some("ou_bot")).is_none()
+        );
+        // 宽松策略（历史行为）：无 @ 群消息照常通过。
+        assert!(parse_permissive(&no_at).is_some());
+        // bot id 未知（弱过滤）：@ 了任意人 → 通过（正文占位照常替换）。
+        assert!(parse_message_event(&at_other, &MentionPolicy::REQUIRE_BOT, None).is_some());
+        // bot id 未知 + 无任何 mention → 丢（弱过滤）。
+        assert!(parse_message_event(&no_at, &MentionPolicy::REQUIRE_BOT, None).is_none());
+        // p2p 带 @bot 占位：不受过滤，且 bot id 已知时同样剥离。
+        let p2p = br#"{
+            "header":{"event_id":"evt_m4","event_type":"im.message.receive_v1"},
+            "event":{"sender":{"sender_id":{"open_id":"ou_u"}},
+                "message":{"message_type":"text","content":"{\"text\":\"@_user_1 hi\"}","chat_type":"p2p",
+                "mentions":[{"key":"@_user_1","id":{"open_id":"ou_bot"},"name":"agent"}]}}
+        }"#;
+        let (_k, msg, _) = parse_message_event(p2p, &MentionPolicy::REQUIRE_BOT, Some("ou_bot"))
+            .expect("p2p 不受 @bot 过滤");
+        assert_eq!(msg.text.as_deref(), Some("hi"));
+    }
+
+    /// 纯 @bot 无文字：剥离后空文本 → 丢弃（与空文本语义一致）。
+    #[test]
+    fn mention_only_bot_dropped_as_empty() {
+        let p = mk_group_mention_payload(
+            "evt_m5",
+            "@_user_1",
+            r#"[{"key":"@_user_1","id":{"open_id":"ou_bot"},"name":"agent"}]"#,
+        );
+        assert!(parse_message_event(&p, &MentionPolicy::REQUIRE_BOT, Some("ou_bot")).is_none());
+    }
+
+    /// post 的 at 节点：@bot 剔除、@他人渲染 @名字 并进 mentions。
+    #[test]
+    fn post_at_nodes() {
+        // content 是 JSON 字符串，值内不得跨真实换行（非法控制字符），单行构造。
+        let content = serde_json::to_string(&serde_json::json!({
+            "content": [[
+                {"tag":"at","user_id":"ou_bot","user_name":"agent"},
+                {"tag":"at","user_id":"ou_alice","user_name":"Alice"},
+                {"tag":"text","text":"看看这段"}
+            ]]
+        }))
+        .unwrap();
+        let payload = serde_json::json!({
+            "header":{"event_id":"evt_m6","event_type":"im.message.receive_v1"},
+            "event":{
+                "sender":{"sender_id":{"open_id":"ou_u"}},
+                "message":{"message_type":"post","chat_type":"p2p","content":content}
+            }
+        })
+        .to_string()
+        .into_bytes();
+        let (_k, msg, pending) =
+            parse_message_event(&payload, &MentionPolicy::PERMISSIVE, Some("ou_bot"))
+                .expect("post at 节点应解析");
+        // @bot 剔除、@Alice 渲染为文本、正文节点保留。
+        assert_eq!(msg.text.as_deref(), Some("@Alice\n看看这段"));
+        assert!(pending.is_empty());
+        assert_eq!(msg.mentions.len(), 1);
+        assert_eq!(msg.mentions[0].user_id, "ou_alice");
+    }
+
+    /// is_group_message_event 谓词：群消息 true，p2p / 评论 / 非法 JSON false。
+    #[test]
+    fn group_message_event_predicate() {
+        let group = mk_group_mention_payload("e", "x", "[]");
+        assert!(is_group_message_event(&group));
+        let p2p = br#"{"header":{"event_type":"im.message.receive_v1"},
+            "event":{"sender":{"sender_id":{"open_id":"ou_u"}},"message":{"message_type":"text","content":"{\"text\":\"x\"}","chat_type":"p2p"}}}"#;
+        assert!(!is_group_message_event(p2p));
+        assert!(!is_group_message_event(b"not json"));
+        let comment = br#"{"header":{"event_type":"drive.file.comment.created_v1"}}"#;
+        assert!(!is_group_message_event(comment));
+    }
+
+    // ---------- P6-4：话题群（thread）会话隔离 ----------
+
+    /// 话题群消息（group + root_id）→ conv 升级为 `feishu:<chat>:<root>`；
+    /// 普通群（无 root_id）conv 不变；send 反解取首段。
+    #[test]
+    fn thread_conv_isolation() {
+        let mk = |root: Option<&str>| {
+            let mut message = serde_json::json!({
+                "message_type":"text",
+                "content":"{\"text\":\"话题消息\"}",
+                "chat_type":"group","chat_id":"oc_g1",
+                "message_id":"om_child"
+            });
+            if let Some(r) = root {
+                message["root_id"] = serde_json::json!(r);
+            }
+            serde_json::json!({
+                "header":{"event_id":"evt_t","event_type":"im.message.receive_v1"},
+                "event":{
+                    "sender":{"sender_id":{"open_id":"ou_s"}},
+                    "message":message,
+                    "chat":{"chat_id":"oc_g1"}
+                }
+            })
+            .to_string()
+            .into_bytes()
+        };
+        // 话题群：conv = feishu:oc_g1:om_root1（独立 session 锚点）。
+        let (_k, msg, _) =
+            parse_message_event(&mk(Some("om_root1")), &MentionPolicy::PERMISSIVE, None)
+                .expect("话题消息应解析");
+        assert_eq!(msg.conv_id.0, "feishu:oc_g1:om_root1");
+        // 普通群：无 root_id → conv 不变。
+        let (_k, msg, _) =
+            parse_message_event(&mk(None), &MentionPolicy::PERMISSIVE, None).expect("普通群应解析");
+        assert_eq!(msg.conv_id.0, "feishu:oc_g1");
+        // 反解 roundtrip：话题 conv → 发送目标取首段 chat_id。
+        let (id, kind) = receive_target_from_conv(&ConvId("feishu:oc_g1:om_root1".into())).unwrap();
+        assert_eq!(id, "oc_g1");
+        assert_eq!(kind, ReceiveIdKind::ChatId);
+        // 话题反解：命中 / 非 om_ 前缀不命中（评论 conv 天然排除）。
+        assert_eq!(
+            thread_target_from_conv(&ConvId("feishu:oc_g1:om_root1".into())),
+            Some(("oc_g1".into(), "om_root1".into()))
+        );
+        assert!(thread_target_from_conv(&ConvId("feishu:oc_g1".into())).is_none());
+        assert!(
+            thread_target_from_conv(&ConvId("feishu:comment:dox:c1".into())).is_none(),
+            "评论 conv 第二段非 om_ 前缀，不应误判为话题"
+        );
     }
 }

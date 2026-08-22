@@ -71,16 +71,25 @@ impl Dispatcher {
             // 缓存本列表：序号选择取缓存（防两次调用间本机会话
             // mtime 变化导致序号错位）。
             self.resume_cache.lock().await.insert(conv.0.clone(), list);
-            self.reply(
-                                conv,
-                                &format!(
-                                    "可恢复会话（当前目录 {}；💻=本机 📱=IM）：\n{}\n用法：/resume <序号|session_id>",
-                                    wd.display(),
-                                    lines.join("\n")
-                                ),
-                                hint,
-                            )
-                            .await;
+            // P6-3：前 9 条各带「接管」按钮（点击 = /resume <n>；卡片按钮数克制，
+            // 长列表仍以文本序号为准）。
+            let buttons: Vec<CardButton> = lines
+                .iter()
+                .take(9)
+                .enumerate()
+                .map(|(i, _)| CardButton {
+                    label: format!("接管 {}", i + 1),
+                    command: format!("/resume {}", i + 1),
+                })
+                .collect();
+            self.reply_card(
+                conv,
+                &format!("⏪ 可恢复会话（当前目录 {}；💻=本机 📱=IM）", wd.display()),
+                &lines.join("\n"),
+                buttons,
+                hint,
+            )
+            .await;
             return;
         }
 

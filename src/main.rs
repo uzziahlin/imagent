@@ -21,6 +21,9 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 use tracing_subscriber::EnvFilter;
 
+mod service;
+mod setup;
+
 #[derive(Parser)]
 #[command(name = "imagent", version, about = "IM ↔ agent gateway")]
 struct Cli {
@@ -66,6 +69,15 @@ enum Cmd {
     },
     /// 停止（v1 前台运行模式，仅打印停止方式：前台 Ctrl-C / systemctl stop / kill <pid>）。
     Stop,
+    /// 首次运行交互式向导（P6-5）：平台选择 → 飞书权限/事件清单引导 → 凭据
+    /// 连通性校验 → 工作目录（过宽拒绝）→ 写 config.toml。
+    Setup,
+    /// 服务自管理（P6-6）：安装/卸载/查询 OS 级后台服务（macOS launchd /
+    /// Linux systemd 用户单元），注册当前二进制与 --profile。
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
     /// 内部子命令：作为 claude 的 MCP 权限审批 server（stdio JSON-RPC）。
     /// 由 claude 经 --mcp-config spawn，不直接手动调用。
     #[command(hide = true)]
@@ -97,6 +109,16 @@ enum ProfileAction {
         #[arg(long)]
         yes: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// 安装并启动后台服务（注册当前二进制 + 当前 --profile）。
+    Install,
+    /// 停止并卸载后台服务。
+    Uninstall,
+    /// 查询服务安装/运行状态。
+    Status,
 }
 
 /// profile 根目录：`~/.imagent/profiles/<name>`（不受 IMAGENT_HOME 覆盖影响，
@@ -571,6 +593,17 @@ async fn main() -> Result<()> {
                 std::process::id()
             );
         }
+        Cmd::Setup => {
+            setup::run().await?;
+        }
+        Cmd::Service { action } => {
+            // service 定义随 --profile 隔离（com.imagent[.<profile>]）。
+            match action {
+                ServiceAction::Install => service::install(cli.profile.as_deref())?,
+                ServiceAction::Uninstall => service::uninstall(cli.profile.as_deref())?,
+                ServiceAction::Status => service::status(cli.profile.as_deref())?,
+            }
+        }
         Cmd::Mcp {
             conv_id,
             sock,
@@ -677,8 +710,12 @@ async fn build_platform(
                 .feishu_base_url
                 .clone()
                 .unwrap_or_else(|| "https://open.feishu.cn".to_string());
+            // P6-1：群消息 @bot 过滤策略（feishu_require_mention_in_group，默认 true）。
             Ok(Arc::new(imagent_feishu::FeishuPlatform::new(
-                app_id, app_secret, base_url,
+                app_id,
+                app_secret,
+                base_url,
+                config.feishu_require_mention_in_group,
             )?))
         }
         _ => {

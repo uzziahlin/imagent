@@ -19,24 +19,26 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::warn;
 
 use imagent_core::{
-    split_message, CardTerminal, ConvId, CoreError, Dedup, InboundMessage, MediaRef, OutboundCard,
-    Platform, ReplyHint, Result,
+    command_card_fallback_text, split_message, CardButton, CardTerminal, ConvId, CoreError, Dedup,
+    InboundMessage, MediaRef, OutboundCard, Platform, ReplyHint, Result,
 };
 
 use open_lark::{Config, CoreConfig};
 
 use crate::card::{
-    render_card, render_permission_card, render_permission_card_cancelled, render_stream_init_card,
-    stream_body_final, stream_body_md,
+    render_card, render_command_card, render_permission_card, render_permission_card_cancelled,
+    render_stream_init_card, stream_body_final, stream_body_md,
 };
 use crate::client::{
     create_card_entity, download_file, download_image, fetch_bot_open_id, fetch_token, patch_card,
-    patch_card_element, patch_card_settings, reply_comment, send_card_msg, send_card_ref_msg,
-    send_image_msg, send_text_msg, upload_image, FeishuWsClient,
+    patch_card_element, patch_card_settings, reply_comment, reply_message, send_card_msg,
+    send_card_ref_msg, send_file_msg, send_image_msg, send_text_msg, upload_file, upload_image,
+    FeishuWsClient,
 };
 use crate::proto::{
-    comment_target_from_conv, is_comment_event, parse_card_action_event, parse_comment_event,
-    parse_message_event, receive_target_from_conv, ReceiveIdKind, COMMENT_CONV_PREFIX,
+    comment_target_from_conv, is_comment_event, is_group_message_event, parse_card_action_event,
+    parse_comment_event, parse_message_event, receive_target_from_conv, thread_target_from_conv,
+    ReceiveIdKind, COMMENT_CONV_PREFIX,
 };
 
 /// 平台名常量。
@@ -66,12 +68,22 @@ pub struct FeishuPlatform {
     /// P5-16：per-conv 最近一次审批询问卡的 `(message_id, tool_name)`
     /// （`/stop` 撤回用）。仅记录卡片路径的成功发送；文本询问无句柄，撤回为 no-op。
     pending_asks: Arc<Mutex<HashMap<String, (String, String)>>>,
+    /// P6-1：群消息 @bot 过滤策略（与 drain task 共享，`/config` 热切换）。
+    mention_policy: Arc<RwLock<crate::proto::MentionPolicy>>,
 }
 
 impl FeishuPlatform {
     /// 构造并后台 spawn：① WS client run task（收事件 + 重连）；
     /// ② drain task（payload → `parse_message_event` → Dedup → inbound channel）。
-    pub fn new(app_id: String, app_secret: String, base_url: String) -> Result<Self> {
+    ///
+    /// P6-1：`require_mention_in_group` = config `feishu_require_mention_in_group`
+    /// （默认 true）——群消息须 @bot 才处理；p2p 不受限。
+    pub fn new(
+        app_id: String,
+        app_secret: String,
+        base_url: String,
+        require_mention_in_group: bool,
+    ) -> Result<Self> {
         let ws_config = Arc::new(
             Config::builder()
                 .app_id(app_id.clone())
@@ -111,11 +123,34 @@ impl FeishuPlatform {
         // 进程内取一次。取不到时 parse_comment_event 退化为弱过滤）。
         let bot_open_id: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
         let bot_open_id_for_drain = bot_open_id.clone();
+        // P6-1：群消息 @bot 过滤策略——共享句柄（`/config require_mention`
+        // 热切换对下一消息生效；重启回 config 值）。
+        let mention_policy: Arc<RwLock<crate::proto::MentionPolicy>> =
+            Arc::new(RwLock::new(crate::proto::MentionPolicy {
+                require_mention_in_group,
+            }));
+        let policy_for_drain = mention_policy.clone();
         tokio::spawn(async move {
             let mut payload_rx = payload_rx;
             while let Some(payload) = payload_rx.recv().await {
                 // 三类事件：普通消息（含媒体下载）/ 审批按钮回调 / 云文档评论。
-                if let Some((msgid, mut msg, pending)) = parse_message_event(&payload) {
+                // P6-1：群消息的 @bot 过滤与 @bot 文本剥离需要 bot open_id——
+                // 首个群消息事件懒取（与评论事件共用缓存），失败退化为弱过滤。
+                if is_group_message_event(&payload) {
+                    ensure_bot_open_id(
+                        &bot_open_id_for_drain,
+                        &token_for_drain,
+                        &core_config_for_drain,
+                        &app_id_for_drain,
+                        &app_secret_for_drain,
+                    )
+                    .await;
+                }
+                let bot = bot_open_id_for_drain.read().await.clone();
+                let policy = *policy_for_drain.read().await;
+                if let Some((msgid, mut msg, pending)) =
+                    parse_message_event(&payload, &policy, bot.as_deref())
+                {
                     if !dedup.check(&msgid) {
                         continue;
                     }
@@ -242,27 +277,14 @@ impl FeishuPlatform {
                 // （GET /bot/v3/info）并缓存；取不到时退化为「至少含一个 @」的
                 // 弱过滤。另过滤 bot 自身的回复（防自触发循环）。
                 if is_comment_event(&payload) {
-                    if bot_open_id_for_drain.read().await.is_none() {
-                        let fetched = async {
-                            let t = fetch_cached_token(
-                                &token_for_drain,
-                                &core_config_for_drain,
-                                &app_id_for_drain,
-                                &app_secret_for_drain,
-                            )
-                            .await?;
-                            fetch_bot_open_id(&core_config_for_drain, &t).await
-                        }
-                        .await;
-                        match fetched {
-                            Ok(b) => *bot_open_id_for_drain.write().await = Some(b),
-                            Err(e) => warn!(
-                                target: "feishu",
-                                error = %e,
-                                "取 bot open_id 失败，评论 @bot 过滤退化为「须含 @」"
-                            ),
-                        }
-                    }
+                    ensure_bot_open_id(
+                        &bot_open_id_for_drain,
+                        &token_for_drain,
+                        &core_config_for_drain,
+                        &app_id_for_drain,
+                        &app_secret_for_drain,
+                    )
+                    .await;
                     let bot = bot_open_id_for_drain.read().await.clone();
                     if let Some((key, cm)) = parse_comment_event(&payload, bot.as_deref()) {
                         if dedup.check(&key) && inbound_msg_tx.send(cm).await.is_err() {
@@ -273,7 +295,7 @@ impl FeishuPlatform {
                     }
                     continue;
                 }
-                // 真机排障：无法解析的 payload 头部（截断）记 debug，定位事件结构差异。
+                // 真机排障：无法解析的 payload 头部（截断）记 warn，定位事件结构差异。
                 let head: String = String::from_utf8_lossy(&payload)
                     .chars()
                     .take(400)
@@ -291,6 +313,7 @@ impl FeishuPlatform {
             reconnect,
             inbound_rx: Arc::new(Mutex::new(inbound_msg_rx)),
             pending_asks: Arc::new(Mutex::new(HashMap::new())),
+            mention_policy,
         })
     }
 
@@ -451,6 +474,33 @@ fn persist_media(kind: &str, key: &str, bytes: &[u8]) -> Result<String> {
     Ok(path.to_string_lossy().into_owned())
 }
 
+/// P6-1：确保 bot open_id 已取到（懒取 + 缓存；群消息 @bot 过滤与评论 @bot 过滤
+/// 共用）。已有缓存直接返回；取失败只 warn 不缓存失败——下次相关事件再试。
+async fn ensure_bot_open_id(
+    bot_open_id: &Arc<RwLock<Option<String>>>,
+    token_lock: &Arc<RwLock<Option<(String, Instant)>>>,
+    core_config: &CoreConfig,
+    app_id: &str,
+    app_secret: &str,
+) {
+    if bot_open_id.read().await.is_some() {
+        return;
+    }
+    let fetched = async {
+        let t = fetch_cached_token(token_lock, core_config, app_id, app_secret).await?;
+        fetch_bot_open_id(core_config, &t).await
+    }
+    .await;
+    match fetched {
+        Ok(b) => *bot_open_id.write().await = Some(b),
+        Err(e) => warn!(
+            target: "feishu",
+            error = %e,
+            "取 bot open_id 失败，@bot 过滤退化为弱过滤（须含 @）"
+        ),
+    }
+}
+
 /// 取当前 token：缓存命中（未过 TTL）则返回，否则 `fetch_token` 刷新并缓存。
 ///
 /// 提成模块级自由函数——drain task 持有 `Arc<RwLock<…>>` 句柄而无 `&self`，无法调
@@ -516,6 +566,30 @@ impl Platform for FeishuPlatform {
             }
             return Ok(());
         }
+        // P6-4：话题群 conv → 回复话题根消息（reply API 落回原话题，而非发新话题）。
+        if let Some((_chat_id, root_id)) = thread_target_from_conv(conv) {
+            let chunks: Vec<String> = split_message(text, FEISHU_TEXT_MAX);
+            let total = chunks.len();
+            for (i, chunk) in chunks.into_iter().enumerate() {
+                let content = serde_json::json!({ "text": chunk }).to_string();
+                if let Err(e) = self
+                    .with_token(|t| {
+                        let root_id = root_id.clone();
+                        let content = content.clone();
+                        async move {
+                            reply_message(&self.core_config, &t, &root_id, "text", &content).await
+                        }
+                    })
+                    .await
+                {
+                    return Err(CoreError::Platform(
+                        PLATFORM,
+                        format!("第 {}/{} 片发送失败（回复可能被截断）：{e}", i + 1, total),
+                    ));
+                }
+            }
+            return Ok(());
+        }
         let (receive_id, kind) = receive_target_from_conv(conv)
             .ok_or_else(|| CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0)))?;
         let chunks: Vec<String> = split_message(text, FEISHU_TEXT_MAX);
@@ -542,7 +616,9 @@ impl Platform for FeishuPlatform {
     }
 
     async fn send_media(&self, conv: &ConvId, media: &MediaRef, _hint: &ReplyHint) -> Result<()> {
-        // agent 产出图片回传：读本地文件 → 上传拿 image_key → 发 image 消息。
+        // agent 产出媒体回传（P6-7：按 kind 分流——image 走图片消息，其余走文件
+        // 消息）：读本地文件 → 上传拿 key → 发消息。话题群 conv → reply API 落回话题。
+        let thread = thread_target_from_conv(conv);
         let (receive_id, kind) = receive_target_from_conv(conv)
             .ok_or_else(|| CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0)))?;
         let bytes = tokio::fs::read(&media.url)
@@ -551,16 +627,53 @@ impl Platform for FeishuPlatform {
         let file_name = std::path::Path::new(&media.url)
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "image.png".to_string());
+            .unwrap_or_else(|| "file.bin".to_string());
+        let is_image = media.kind == "image";
         // 上传 + 发送共用一次 with_token：同一 token 失效只自愈重试一轮。
         // 重试要求闭包可重入，move 型捕获（bytes/receive_id/file_name）先 clone。
         self.with_token(|t| {
             let bytes = bytes.clone();
             let receive_id = receive_id.clone();
             let file_name = file_name.clone();
+            let root_id = thread.as_ref().map(|(_, r)| r.clone());
             async move {
-                let image_key = upload_image(&self.core_config, &t, &file_name, bytes).await?;
-                send_image_msg(&self.core_config, &t, &receive_id, kind, &image_key).await
+                let content = if is_image {
+                    let image_key = upload_image(&self.core_config, &t, &file_name, bytes).await?;
+                    serde_json::json!({ "image_key": image_key })
+                } else {
+                    let file_key = upload_file(&self.core_config, &t, &file_name, bytes).await?;
+                    serde_json::json!({ "file_key": file_key })
+                };
+                match root_id {
+                    // 话题群：与文本同路——reply API 落回原话题。
+                    Some(root) => {
+                        let mt = if is_image { "image" } else { "file" };
+                        reply_message(&self.core_config, &t, &root, mt, &content.to_string())
+                            .await
+                            .map(|_| ())
+                    }
+                    None => {
+                        if is_image {
+                            send_image_msg(
+                                &self.core_config,
+                                &t,
+                                &receive_id,
+                                kind,
+                                content["image_key"].as_str().unwrap_or_default(),
+                            )
+                            .await
+                        } else {
+                            send_file_msg(
+                                &self.core_config,
+                                &t,
+                                &receive_id,
+                                kind,
+                                content["file_key"].as_str().unwrap_or_default(),
+                            )
+                            .await
+                        }
+                    }
+                }
             }
         })
         .await
@@ -572,6 +685,7 @@ impl Platform for FeishuPlatform {
     }
     fn supports_streaming_card(&self, conv: &ConvId) -> bool {
         // P4-9：评论线程无卡片语义（回复是评论文本），走纯文本流。
+        // P6 遗留补齐：话题群已支持「reply raw 卡 + 整卡 patch」流式（见 send_card）。
         !conv.0.starts_with(COMMENT_CONV_PREFIX)
     }
 
@@ -593,11 +707,42 @@ impl Platform for FeishuPlatform {
         input_summary: &str,
         hint: &ReplyHint,
     ) -> Result<()> {
-        // 评论线程无卡片语义，直接走文本（send_text 已路由 reply_comment）。
+        // 评论线程无卡片语义，直接走文本（send_text 已路由 reply API）。
         if comment_target_from_conv(conv).is_some() {
             return self
                 .send_permission_ask_text(conv, tool_name, input_summary, hint)
                 .await;
+        }
+        // P6 遗留补齐：话题群——reply API 把审批卡发进原话题（与流式卡同路），
+        // 失败降级文本（文本经 send_text 的线程分支也落回话题）。
+        if let Some((_chat, root_id)) = thread_target_from_conv(conv) {
+            let card_json = render_permission_card(tool_name, input_summary, &conv.0);
+            return match self
+                .with_token(|t| {
+                    let root_id = root_id.clone();
+                    let card_json = card_json.clone();
+                    async move {
+                        reply_message(&self.core_config, &t, &root_id, "interactive", &card_json)
+                            .await
+                    }
+                })
+                .await
+            {
+                Ok(mid) => {
+                    if let Some(mid) = mid {
+                        self.pending_asks
+                            .lock()
+                            .await
+                            .insert(conv.0.clone(), (mid, tool_name.to_string()));
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    warn!(target: "feishu", error = %e, "话题内审批卡发送失败，降级纯文本询问");
+                    self.send_permission_ask_text(conv, tool_name, input_summary, hint)
+                        .await
+                }
+            };
         }
         let (receive_id, kind) = receive_target_from_conv(conv)
             .ok_or_else(|| CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0)))?;
@@ -699,16 +844,93 @@ impl Platform for FeishuPlatform {
         .await
     }
 
+    /// P6-3：命令交互卡片（markdown 正文 + 按钮组）。按钮点击回调由 proto 解析成
+    /// `text = <command>` 走手打命令同路径。评论线程无卡片语义 → 纯文本降级；
+    /// 话题群 → reply API 把卡发进原话题；卡片发送失败向上返回 Err，由 dispatch
+    /// 层统一降级纯文本（与审批卡策略不同：命令卡失败无紧急性，不急于平台内自救）。
+    async fn send_command_card(
+        &self,
+        conv: &ConvId,
+        title: &str,
+        body_md: &str,
+        buttons: &[CardButton],
+        hint: &ReplyHint,
+    ) -> Result<()> {
+        if comment_target_from_conv(conv).is_some() {
+            return self
+                .send_text(
+                    conv,
+                    &command_card_fallback_text(title, body_md, buttons),
+                    hint,
+                )
+                .await;
+        }
+        let card_json = render_command_card(title, body_md, buttons, &conv.0);
+        // P6 遗留补齐：话题群用 reply API 落卡进原话题（create 到 chat 会开新话题）。
+        if let Some((_chat, root_id)) = thread_target_from_conv(conv) {
+            return self
+                .with_token(|t| {
+                    let root_id = root_id.clone();
+                    let card_json = card_json.clone();
+                    async move {
+                        reply_message(&self.core_config, &t, &root_id, "interactive", &card_json)
+                            .await
+                    }
+                })
+                .await
+                .map(|_| ());
+        }
+        let (receive_id, kind) = receive_target_from_conv(conv)
+            .ok_or_else(|| CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0)))?;
+        self.with_token(|t| {
+            let receive_id = receive_id.clone();
+            let card_json = card_json.clone();
+            async move { send_card_msg(&self.core_config, &t, &receive_id, kind, &card_json).await }
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// P6 遗留补齐：`/config require_mention` 热切换——drain task 每消息现读，
+    /// 对下一消息生效；进程内不落盘（重启回 config 值，与 cot_detail 同姿态）。
+    async fn require_mention_in_group(&self) -> Option<bool> {
+        Some(self.mention_policy.read().await.require_mention_in_group)
+    }
+
+    /// P6 遗留补齐：set 侧（见 [`Self::require_mention_in_group`]）。
+    async fn set_require_mention_in_group(&self, on: bool) -> Result<()> {
+        self.mention_policy.write().await.require_mention_in_group = on;
+        Ok(())
+    }
+
     /// 发流式卡片。**句柄前缀分流**（core 无感，两种句柄均原样透传给 update_card）：
     /// - managed（优先）：`create_card_entity` + 发 card_id 引用消息 → `card:<card_id>`，
     ///   后续 element 级 PATCH 走服务端打字机渲染（需 `cardkit:card:write` 权限）
     /// - 降级：raw 卡片消息 → `msg:<message_id>`，后续整卡 im patch（体验同旧版）
+    ///
+    /// P6 遗留补齐：话题群走「reply API 发 raw 卡」——managed 卡片实体无法在话题内
+    /// 引用（send_card_ref_msg 到 chat 会开新话题），但 reply 的 interactive 回执是
+    /// 普通消息，msg: 句柄照常整卡 patch（体验同降级路径，卡片不再缺席话题）。
     async fn send_card(
         &self,
         conv: &ConvId,
         card: &OutboundCard,
         _hint: &ReplyHint,
     ) -> Result<Option<String>> {
+        if let Some((_chat, root_id)) = thread_target_from_conv(conv) {
+            let card_json = render_card(card);
+            return self
+                .with_token(|t| {
+                    let root_id = root_id.clone();
+                    let card_json = card_json.clone();
+                    async move {
+                        reply_message(&self.core_config, &t, &root_id, "interactive", &card_json)
+                            .await
+                    }
+                })
+                .await
+                .map(|mid| mid.map(|m| format!("msg:{m}")));
+        }
         let (receive_id, kind) = receive_target_from_conv(conv)
             .ok_or_else(|| CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0)))?;
         self.with_token(|t| {
@@ -821,7 +1043,9 @@ mod tests {
         let _handle = tokio::spawn(async move {
             let mut payload_rx = payload_rx;
             while let Some(payload) = payload_rx.recv().await {
-                if let Some((msgid, msg, _)) = parse_message_event(&payload) {
+                if let Some((msgid, msg, _)) =
+                    parse_message_event(&payload, &crate::proto::MentionPolicy::PERMISSIVE, None)
+                {
                     if !dedup.check(&msgid) {
                         continue;
                     }
@@ -860,7 +1084,9 @@ mod tests {
         let _handle = tokio::spawn(async move {
             let mut payload_rx = payload_rx;
             while let Some(payload) = payload_rx.recv().await {
-                if let Some((_msgid, msg, _)) = parse_message_event(&payload) {
+                if let Some((_msgid, msg, _)) =
+                    parse_message_event(&payload, &crate::proto::MentionPolicy::PERMISSIVE, None)
+                {
                     if tx.send(msg).await.is_err() {
                         break;
                     }
@@ -895,5 +1121,25 @@ mod tests {
     fn unused_import_guard() {
         // 保持导入被使用，防止编译告警。
         let _ = ConvId("x".into());
+    }
+
+    /// P6 遗留补齐：require_mention 热切换——共享句柄 get/set 往返（drain task
+    /// 每消息现读同一句柄）。占位凭据，WS/drain 后台任务自然失败重试不干扰断言。
+    #[tokio::test]
+    async fn require_mention_hot_toggle_roundtrip() {
+        let p = FeishuPlatform::new(
+            "cli_test".into(),
+            "secret_test".into(),
+            "https://open.feishu.cn".into(),
+            true,
+        )
+        .expect("构造");
+        assert_eq!(p.require_mention_in_group().await, Some(true));
+        p.set_require_mention_in_group(false).await.expect("set");
+        assert_eq!(p.require_mention_in_group().await, Some(false));
+        p.set_require_mention_in_group(true)
+            .await
+            .expect("set back");
+        assert_eq!(p.require_mention_in_group().await, Some(true));
     }
 }

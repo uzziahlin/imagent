@@ -171,6 +171,11 @@ pub struct Config {
     /// Lark 国际版用 `https://open.larksuite.com`（MVP 不覆盖）。
     #[serde(default)]
     pub feishu_base_url: Option<String>,
+    /// 飞书群消息是否必须 @bot 才处理（P6-1；默认 true）。p2p 不受限。
+    /// true 时客户端过滤未 @bot 的群消息（静默丢弃），并剥离正文里的 @bot 占位；
+    /// bot id 取不到时退化为「消息内含任意 @」弱过滤。改此项需重启。
+    #[serde(default = "default_feishu_require_mention_in_group")]
+    pub feishu_require_mention_in_group: bool,
 }
 
 fn default_tools() -> Vec<String> {
@@ -184,6 +189,51 @@ fn default_platform() -> String {
 }
 fn default_metrics_addr() -> Option<String> {
     None
+}
+fn default_feishu_require_mention_in_group() -> bool {
+    true
+}
+
+/// P6-8：工作目录安全校验——拒绝过宽位置（agent 以 cwd 定位工作区，`/`、home 根、
+/// 系统目录、temp 根等于放权全盘）。`/cd`、`/ws use`、`setup` 向导共用。
+/// 返回 `Err(人话原因)`。
+pub fn validate_workdir(p: &Path) -> std::result::Result<(), String> {
+    if !p.is_absolute() {
+        return Err(format!("工作目录必须是绝对路径：{}", p.display()));
+    }
+    if !p.is_dir() {
+        return Err(format!("目录不存在或不是目录：{}", p.display()));
+    }
+    // 过宽位置黑名单——条目与输入**都**走 canonicalize 归一比较（macOS 的
+    // /tmp→/private/tmp、/etc→/private/etc 等 symlink 形态两侧一致消解；
+    // Linux 上不存在的条目 canonicalize 失败则保留原样，不影响命中）。
+    const BROAD: &[&str] = &[
+        "/tmp", "/var", "/etc", "/usr", "/bin", "/sbin", "/System", "/Library", "/Users", "/home",
+        "/opt", "/srv", "/mnt", "/Volumes", "/proc", "/sys", "/dev", "/run",
+    ];
+    let canon = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let s = canon.to_string_lossy();
+    if s == "/" {
+        return Err("不允许用文件系统根 / 作为工作区（agent 将获得全盘上下文）".into());
+    }
+    let hit = BROAD.iter().any(|b| {
+        let bc = std::path::Path::new(b)
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::Path::new(b).to_path_buf());
+        bc == canon
+    });
+    if hit {
+        return Err(format!(
+            "目录过于宽泛（{s}）：请指定具体项目子目录，而非系统/用户根级目录"
+        ));
+    }
+    if let Some(home) = dirs::home_dir() {
+        let home_canon = home.canonicalize().unwrap_or(home);
+        if canon == home_canon {
+            return Err("不允许用 home 根目录作为工作区，请指定项目子目录".into());
+        }
+    }
+    Ok(())
 }
 fn default_fragment_interval_ms() -> u64 {
     400
@@ -272,6 +322,7 @@ agent = "claude-cli"         # claude-cli(默认) | claude-acp(ACP长驻子进�
 platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人) | feishu(飞书,配 feishu_app_id + 环境变量 IMAGENT_FEISHU_APP_SECRET)
 # feishu_app_id = "cli_xxx"            # 飞书自建应用 app_id（仅 platform="feishu"；app_secret 走环境变量，keyring 为后续 P2）
 # feishu_base_url = "https://open.feishu.cn"  # 可选，默认 https://open.feishu.cn；Lark 国际版 https://open.larksuite.com（MVP 不覆盖）
+# feishu_require_mention_in_group = true       # 群消息须 @bot 才处理（默认 true：客户端过滤 + 剥离 @bot 占位；false=全收，过滤交给事件订阅 scope）
 permission_mode = "off"     # off(默认,claude按allowedTools自行处理) | allow | deny | ask(IM审批闭环)
 # metrics_addr = "127.0.0.1:9100"   # 默认关闭；设为 "ip:port" 开启 /metrics + /health HTTP server
 # message_max_len = 2000              # 单条出站消息字符上限（Unicode char）；不设 = 不分片
@@ -594,5 +645,28 @@ message_fragment_interval_ms = 250
         let cfg = Config::load(&p).expect("parse");
         assert!(!cfg.admin_gap_with_chat_allowlist());
         cleanup(&p);
+    }
+
+    /// P6-8：工作目录安全校验——过宽位置拒绝、正常项目目录放行。
+    #[test]
+    fn validate_workdir_rejects_broad() {
+        // 相对路径 / 不存在。
+        assert!(validate_workdir(Path::new("relative/x")).is_err());
+        assert!(validate_workdir(Path::new("/definitely/not/exist")).is_err());
+        // 系统根级目录（canonicalize 归一后命中黑名单；/tmp 在 macOS 归一为
+        // /private/tmp，仍应被拒——用真实存在的系统目录探测）。
+        for broad in ["/usr", "/etc", "/Library", "/System"] {
+            assert!(
+                validate_workdir(Path::new(broad)).is_err(),
+                "{broad} 应被拒绝"
+            );
+        }
+        // home 根拒绝；home 下的项目子目录放行。
+        let home = dirs::home_dir().expect("home");
+        assert!(validate_workdir(&home).is_err(), "home 根应被拒绝");
+        let proj = home.join("Work"); // 测试机环境存在；不存在则跳过该断言
+        if proj.is_dir() {
+            assert!(validate_workdir(&proj).is_ok(), "{proj:?} 应放行");
+        }
     }
 }
