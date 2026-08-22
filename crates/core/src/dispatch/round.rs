@@ -167,7 +167,7 @@ impl Dispatcher {
         loop {
             // P4-6：COT 档位每轮读取（/config 热改对下一轮生效）。
             let cot = *self.cot_detail.read();
-            let idle_timeout = *self.agent_idle_timeout.read();
+            let idle_timeout = self.idle_timeout_for(&conv.0).await;
             let chunk = if idle_timeout.is_zero() {
                 match rx.recv().await {
                     Some(c) => c,
@@ -276,7 +276,7 @@ impl Dispatcher {
                 if idle_timed_out {
                     let m = format!(
                         "⏱️ agent 已连续 {:?} 无输出，空闲超时终止本轮。已进行到的进度已保留，下条消息将续接（全新开始可 /new）。",
-                        *self.agent_idle_timeout.read()
+                        self.idle_timeout_for(&conv.0).await
                     );
                     if let Some(c) = card.as_mut() {
                         c.finalize(

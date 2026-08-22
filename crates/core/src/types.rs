@@ -33,6 +33,26 @@ pub struct MediaRef {
     pub url: String,
 }
 
+/// 消息中 @ 提及的用户（P6-1：平台层从消息元数据解析，正文已替换为 `@名字` 可读
+/// 文本）。命令据此把 `/allow @名字` 解析回平台用户 id，免手打 open_id。
+#[derive(Debug, Clone)]
+pub struct Mention {
+    /// 平台用户 id（飞书 open_id / wecom userid / ilink from_user_id）。
+    pub user_id: String,
+    /// @ 提及的显示名（正文替换用；平台缺名时可为空）。
+    pub name: String,
+}
+
+/// 命令卡片按钮（P6-3）：点击等价于发送者手打 `command` 文本——回调经平台侧
+/// 转成 `text = <command>` 的 InboundMessage，走与手打命令完全相同的鉴权/分派。
+#[derive(Debug, Clone)]
+pub struct CardButton {
+    /// 按钮展示文本（如「使用 main」）。
+    pub label: String,
+    /// 点击后注入的命令（如 `/ws use main`）。
+    pub command: String,
+}
+
 /// 入站消息（`Platform::recv` 产出，core 消费）。
 pub struct InboundMessage {
     pub conv_id: ConvId,
@@ -43,6 +63,8 @@ pub struct InboundMessage {
     /// 媒体下载/落盘失败的原因（platform 层记录，含真实错误）。
     /// dispatch 据此向用户报错/注入 prompt，而非静默丢弃。无失败则空。
     pub media_errors: Vec<String>,
+    /// 本条消息中 @ 提及的用户（不含 bot 自身；无提及为空）。
+    pub mentions: Vec<Mention>,
     pub reply_hint: ReplyHint,
 }
 

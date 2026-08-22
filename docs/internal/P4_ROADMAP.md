@@ -573,3 +573,161 @@ pub 供 fuzz 直打。本地 60s 冒烟 162 万次执行零崩溃；周任务 fu
 
 **剩余待办**：真机冒烟（ACP e2e + 权限握手 + 孤儿卡片 kill -9 验证）→ P5-14
 per-conv 连接 + ACP Ask 接线；wecom ack 闭环；gemini /resume 不跟进。
+
+---
+
+# P6 迭代路线 —— 第二轮对标 lark-coding-agent-bridge：mention 基础设施与开箱体验
+
+> 来源：2026-08-22 与 [lark-coding-agent-bridge](https://github.com/zarazhangrui/lark-coding-agent-bridge)
+> 二次逐特性对比。P4 对标补齐了任务控制 / 批处理 / 交互深化；本轮缺口集中在
+> **mention 基础设施、命令交互卡片、话题群、开箱体验（向导 / 服务自管理）、媒体出站**。
+> 明确不跟：Lark 国际版（FEISHU_DESIGN §16 维持预留，无海外需求）。
+
+## 总览
+
+| # | 功能 | 优先级 | 状态 |
+|---|---|---|---|
+| 1 | mention 基础设施：群消息 @bot 客户端过滤 + @文本剥离 + require-@ 开关 | 高 | ✅ |
+| 2 | `/allow @提及`：mention 解析换 open_id，免手打 ID | 高 | ✅ |
+| 3 | 命令交互卡片：`/help` `/ws list` `/resume` 按钮卡（复用 card.action.trigger 回调） | 高 | ✅ |
+| 4 | 话题群（thread）会话隔离：每个话题独立 conv/session | 高 | ✅ |
+| 5 | `imagent setup` 首次运行向导（权限清单引导 + 凭据连通性校验 + 写配置） | 中 | ✅ |
+| 6 | 服务自管理：`imagent service install/uninstall/status`（程序化装 launchd/systemd） | 中 | ✅ |
+| 7 | 出站文件发送：`im/v1/files` 上传 + file 消息 + `/file <path>` 命令 | 中 | ✅ |
+| 8 | `/cd` 目录安全校验：拒绝 `/`、home 根、系统目录、temp 根等过宽位置 | 低 | ✅ |
+| 9 | 会话级 `/timeout [N|off|default]`（看门狗 per-conv 覆盖） | 低 | ✅ |
+
+**实现顺序**：1+2（mention 基础设施，同一波）→ 3（复用按钮卡回调）→ 4（话题群）
+→ 5、6（开箱体验）→ 7、8、9 按需收尾。
+
+## 设计要点
+
+### P6-1+2 mention 基础设施（本轮首波）
+
+**问题**：群消息是否只收 @消息完全依赖飞书后台事件订阅 scope
+（`im:message.group_at_msg` vs `im:message.group_msg`）；消息正文中的
+`@_user_1` 占位不清理（proto.rs 对 at 元素「暂忽略」），agent 收到的 prompt
+混有噪音；`/allow` 需要手打 open_id，用户体验差。
+
+**方案**：
+- proto 层解析 text 消息 content 中的 `@_user_N` 占位与 mentions 数组的对应关系，
+  剥离 @bot 文本（bot open_id 匹配），其余 @提及转可读 `@名字` 文本；
+- `InboundMessage` 增加 mentions 元数据（id → 名字），群聊 @bot 检测在客户端做；
+- 新增 config `feishu.require_mention_in_group`（默认 true）：群消息未 @bot 时
+  静默忽略（不回「权限拒绝」，与陌生人静默策略一致）；
+- `/allow @名字`、`/disallow @名字`：从最近一条消息的 mentions 缓存解析 open_id，
+  替代手打 ID（管理员门槛不变）。
+
+### P6-3 命令交互卡片
+
+**方案**：`/help` `/ws list` `/resume`（列表）返回按钮卡（V2 column_set→button，
+与审批卡同构）；`card.action.trigger` 回调的 action.value 直接映射为命令文本
+（如 `{"cmd":"/ws use main"}`），复用既有审批按钮回调解析路径。`/resume`
+每项「接管」按钮 → `/resume <n>`。
+
+### P6-4 话题群隔离
+
+**方案**：消息事件带 root_id（话题根）时，conv key 从 `feishu:<oc_chat_id>`
+升级为 `feishu:<oc_chat_id>:<root_id>`，session/批处理/白名单语义自动继承；
+回复仍走原 chat_id（回复消息自动落回话题，无需 parent_id）。
+
+### P6-5 setup 向导 / P6-6 服务自管理
+
+**方案**：`imagent setup` 交互式 TUI：检查必配权限清单（CardKit 流式卡片 /
+按钮回调 / 云文档评论所需 scope）→ 引导填 AppID/AppSecret → 调 tenant_token
+校验连通性 → 引导事件订阅配置说明 → 写 config。QR 扫码建应用不适用飞书自建
+应用（P4 已明确），向导止步于凭据校验。
+`imagent service install` 程序化生成 launchd plist / systemd unit（模板已在
+deploy/），注册当前二进制路径与 --profile；`uninstall`/`status` 对应管理。
+
+---
+
+## P6 实现纪要（2026-08-22，worktree 分支 `p6`）
+
+九项全部交付；`cargo test --workspace` 全绿、clippy `-D warnings` 零告警、fmt 干净。
+
+### 第一波：P6-1+2 mention 基础设施
+
+- **类型层**：`InboundMessage` 新增 `mentions: Vec<Mention>`（user_id + name），
+  全平台构造点补齐（feishu/ilink/wecom/测试/example）。
+- **proto**（feishu）：`Message.mentions` 元数据解析（嵌套 `id.open_id` 与平铺
+  `open_id/user_id` 双形态）；`apply_text_mentions` 纯函数——@bot 占位连同尾随
+  空格剥离、@他人替换为 `@名字`、孤儿占位原样保留；`parse_post` 处理 at 节点
+  （@bot 剔除、@他人渲染并进 mentions）；`group_mention_ok` 群过滤——bot id
+  已知须 @bot、未知弱过滤（mentions 非空，同评论 P5-8 语义）。
+- **platform**：`MentionPolicy`（config `feishu_require_mention_in_group`，默认
+  true，重启生效）注入 `parse_message_event`；群消息懒取 bot open_id 与评论事件
+  共用缓存（`ensure_bot_open_id` 重构去重）。
+- **命令**：`/allow @名字` / `/disallow @名字`——`resolve_mention_target` 从
+  **本条消息** mentions 反解（名字精确命中 → 唯一性兜底 → 歧义提示）；反解不出
+  不误把 @字串当 id。
+- fuzz target 同步：策略 × bot id 四组合全打。
+
+### 第二波：P6-3 命令交互卡片
+
+- **类型层**：`CardButton { label, command }`；`Platform::send_command_card`
+  默认降级纯文本（`command_card_fallback_text`：标题 + 正文 + 可手打命令清单）。
+- **飞书**：`render_command_card`（V2 column_set→button，每行 3 列自动换行），
+  value 编码 `{"imagent_cmd": <command>, "conv": <conv>}`；`parse_card_action_event`
+  扩展识别 `imagent_cmd`——只接受 `/` 开头（防伪造普通文本），映射为
+  `text = <command>` 走**手打命令同路径**（鉴权/admin 门槛不豁免）。
+- **接线**：`Dispatcher::reply_card`（平台失败再兜一层纯文本）；`/help` 六按钮、
+  `/ws list` 每空间「使用」按钮、`/resume` 前 9 条「接管」按钮。
+
+### 第三波：P6-4 话题群隔离
+
+- conv 升级 `feishu:<chat_id>:<root_id>`（仅 group + root_id 为 `om_` 前缀——
+  普通群回复只有 parent_id 不受影响）；session/批处理/conv 锁/审批路由自动
+  per-topic 隔离。
+- 发送分流：`thread_target_from_conv` 命中 → 文本/图片/文件全走
+  `POST /im/v1/messages/{root_id}/reply`（SDK 无此 API，raw reqwest，同
+  reply_comment 模式）落回原话题；话题群无流式卡片语义（`supports_streaming_card`
+  false），审批/命令卡降级文本。
+- `receive_target_from_conv` 取首段（chat/open id）；`Auth::is_chat_allowed`
+  前缀规则——话题 conv（≥2 冒号）剥末段继承所属群授权，评论 conv 天然不命中。
+
+### 第四波：P6-5 setup 向导 + P6-6 服务自管理
+
+- `imagent setup`（src/setup.rs）：非 tty 直接拒绝；平台选择 → 飞书六步清单
+  （建应用/开机器人/长连接订阅/三类事件/权限发布）→ 凭据录入 →
+  tenant_access_token 连通性校验（真实 HTTP）→ 工作目录（过宽拒绝）→ 写
+  config 0600。app_secret 不落盘，打印 export / service 注入指引。
+- `imagent service install|uninstall|status`（src/service.rs）：macOS launchd
+  用户代理（`~/Library/LaunchAgents/com.imagent[.<profile>].plist`，日志
+  `~/.imagent/logs/daemon.log`）/ Linux systemd 用户单元（enable --now，journal）；
+  注册 current_exe + `--profile`；安装时快照 `IMAGENT_FEISHU_APP_SECRET` 等
+  凭据环境变量进服务定义（不快照则守护进程取不到）。
+
+### 第五波：P6-7/8/9 收尾
+
+- **出站文件**：`upload_file`（im/v1/files multipart）+ `send_file_msg`；
+  `send_media` 按 `MediaRef.kind` 分流 image/file（话题群走 reply API）；
+  `/file <path>` 命令（workdir 限定，同 /img）。
+- **/cd 安全校验**：`imagent_core::validate_workdir`（黑名单条目与输入**双侧**
+  canonicalize——macOS /etc→/private/etc 等 symlink 形态一致消解；拒 `/`、
+  home 根、系统目录）接入 `/cd`、`/ws use`（存量宽泛目录也拦）与 setup 向导。
+- **/timeout**：`idle_overrides` per-conv 覆盖（`/timeout <分钟>` / `off` /
+  `default`），round.rs 两处消费点改 `idle_timeout_for`；纯进程内（会话级旋钮）。
+
+### 遗留补齐（2026-08-22 第二批，三项全部交付）
+
+- **require_mention IM 内热切换**：`Platform` trait 新增
+  `require_mention_in_group()` / `set_require_mention_in_group()`（默认
+  None/Err——平台无群聊 @ 语义时如实报告）；飞书侧策略从构造期定值改为
+  `Arc<RwLock<MentionPolicy>>` 共享句柄，drain task 每消息现读。`/config
+  require_mention on|off` 热切换对下一消息生效；进程内不落盘（重启回 config
+  值，与 cot_detail 同姿态）。`/config` 展示含当前值（不支持的平台显示「本平台
+  不支持」）。
+- **话题群流式卡片**：managed 卡片实体无法在话题内引用（send_card_ref_msg 到
+  chat 会开新话题），但 reply API 的 interactive 回执是普通消息——`send_card`
+  话题分支走「reply 发 raw 卡 + `msg:<message_id>` 句柄」，后续整卡 im patch
+  （体验同无 cardkit 权限的降级路径，打字机 managed 流式仍限普通会话）。
+  `supports_streaming_card` 对话题放开；审批卡与命令卡在话题内同路发卡
+  （`reply_message` 补返回 message_id 供句柄与 pending_asks 登记）。
+- **setup WeCom 连通性探针**：企微无独立 HTTP token 接口，但 WS subscribe ack
+  是真凭据校验面——`imagent_wecom::probe_credentials`（pub 导出）建连 → 发
+  `aibot_subscribe` → 等 ack（errcode≠0 报 errmsg）→ 断开；setup 向导 WeCom
+  分支接线，bot_id/secret 配错/吊销在安装期即暴露。
+
+真机验证清单（合入前建议跑一遍）：话题群内发卡/流式 patch/审批按钮回调；
+`/config require_mention off` 后未 @bot 群消息放行；setup 两个平台的校验步骤。

@@ -210,6 +210,7 @@ pub fn msg_to_inbound(msg: &Msg) -> InboundMessage {
         text: if text.is_empty() { None } else { Some(text) },
         media: Vec::new(),
         media_errors: Vec::new(),
+        mentions: Vec::new(),
         reply_hint: ReplyHint::ILink {
             context_token: msg.context_token.clone().unwrap_or_default(),
         },
