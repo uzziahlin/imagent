@@ -683,6 +683,20 @@ impl Platform for FeishuPlatform {
                         let seq = self.next_card_seq(card_id).await;
                         let element =
                             patch_card_element(&token, card_id, "md_body", &content, seq).await;
+                        // footer 收敛（真机校准 UX）：初始卡的「🧠 执行中」在终态
+                        // 换成 完成/出错——否则任务结束后标识永远停在执行中。
+                        // best-effort：失败只 warn，不影响终态主流程。
+                        let footer = if err.is_some() { "❌ 出错" } else { "✅ 完成" };
+                        let seq_f = self.next_card_seq(card_id).await;
+                        if let Err(e) =
+                            patch_card_element(&token, card_id, "md_footer", footer, seq_f).await
+                        {
+                            tracing::warn!(
+                                target: "feishu",
+                                error = %e,
+                                "footer 收敛失败（不影响终态内容）"
+                            );
+                        }
                         // 关闭流式（光标消失）；sequence 与 element PATCH 共用递增。
                         let settings =
                             serde_json::json!({ "config": { "streaming_mode": false } }).to_string();
