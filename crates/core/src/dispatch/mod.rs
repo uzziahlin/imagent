@@ -431,7 +431,21 @@ impl Dispatcher {
                             && self.can_route_permission_reply(&msg)
                         {
                             let reply = parse_reply(text);
+                            let allowed = reply.allow;
                             if self.router.route(&conv_id, reply).await {
+                                // 真机校准 UX：决策已达 MCP，立即把询问卡收敛成
+                                // 「已批准/已拒绝」终态（best-effort，无卡 no-op）。
+                                if let Err(e) = self
+                                    .platform
+                                    .resolve_permission_ask(&msg.conv_id, allowed)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        target: "imagent::core",
+                                        error = %e,
+                                        "询问卡收敛失败（不影响审批结果）"
+                                    );
+                                }
                                 continue;
                             }
                         }

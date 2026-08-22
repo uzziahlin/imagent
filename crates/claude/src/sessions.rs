@@ -112,6 +112,27 @@ pub(crate) fn scan_for_backend(workdir: &Path) -> Vec<LocalSession> {
     }
 }
 
+/// 该 session id 在 `~/.claude/projects/<workdir 编码>/` 是否真实存在
+/// （文件名 `<session_id>.jsonl`，跨全部编码候选查）。
+///
+/// 真机校准（2026-08）：失败轮次（如 CLI 参数被拒即退）的 stream 事件仍可能携带
+/// session_id，imagent 落库后成为「幽灵会话」——下次 `--resume` 得到
+/// `No conversation found` 的 is_error 空文本 result，且每轮失败再产新幽灵 id
+/// （毒化循环）。run 前用本函数预检，幽灵即弃用续接、开新会话。
+pub(crate) fn session_exists(workdir: &Path, session_id: &str) -> bool {
+    // default_claude_dir 返回 ~/.claude，会话文件在 projects/ 子层——少拼这一段
+    // 会把所有会话误判为幽灵（每轮开新会话、上下文全丢，真机踩过）。
+    default_claude_dir()
+        .is_some_and(|base| session_exists_in(&base.join("projects"), workdir, session_id))
+}
+
+/// [`session_exists`] 的可注入版本（测试用自定义根目录）。
+fn session_exists_in(base: &Path, workdir: &Path, session_id: &str) -> bool {
+    encode_candidates(workdir)
+        .iter()
+        .any(|enc| base.join(enc).join(format!("{session_id}.jsonl")).is_file())
+}
+
 /// 读文件头部（≤ HEAD_CAP）：`(首条可展示的 user 消息文本, 会话记录的 cwd)`。
 ///
 /// 摘要跳过：非 user 行、`isMeta` 行、`<` 开头的命令/系统注入文本、tool_result 块。
@@ -271,6 +292,21 @@ mod tests {
             1,
             "跨候选目录同 id 应去重"
         );
+    }
+
+    /// 真机校准（幽灵会话）：session_exists 只认本地存储真实存在的 <id>.jsonl
+    /// （跨编码候选），幽灵 id（失败轮次泄漏的）必须判 false——backend 据此弃用续接。
+    #[test]
+    fn session_exists_across_candidates() {
+        let root = tmp_root("exists");
+        let wd = Path::new("/tmp/proj.x");
+        write_session(&root, wd, "real-1", &[line_with_cwd(wd, "真实会话")]);
+        assert!(session_exists_in(&root.join("projects"), wd, "real-1"));
+        assert!(!session_exists_in(&root.join("projects"), wd, "ghost-9"));
+        let alt = root.join("projects").join("-tmp-proj-x");
+        std::fs::create_dir_all(&alt).unwrap();
+        std::fs::write(alt.join("alt-2.jsonl"), "{}").unwrap();
+        assert!(session_exists_in(&root.join("projects"), wd, "alt-2"));
     }
 
     #[test]

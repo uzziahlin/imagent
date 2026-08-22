@@ -199,6 +199,14 @@ pub async fn spawn_cli_backend(
     let stderr_msg = stderr_handle.await.unwrap_or_default();
 
     if let Some(t) = error_text {
+        // 真机校准：claude resume 幽灵会话等场景产出 is_error 且 result 文本缺失
+        // 的终止事件（空字符串）——空文本对用户零信息量，回落到 diagnose（exit
+        // code + stderr 至少可排障）。
+        let t = if t.trim().is_empty() {
+            diagnose(&status, &stderr_msg, backend_name, reached_terminal)
+        } else {
+            t
+        };
         let _ = chunks.send(AgentChunk::Error(t.clone())).await;
         return Err(CoreError::Backend(backend_name, t));
     }

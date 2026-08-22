@@ -95,7 +95,7 @@ async fn write_mcp_config(
     let exe = std::env::current_exe()?;
     let cfg = serde_json::json!({
         "mcpServers": {
-            "imagent": {
+            imagent_core::mcp::SERVER_NAME: {
                 "command": exe.to_string_lossy(),
                 // S-3：--ask-timeout 把 permission_ask_timeout 传给 MCP server 子进程，
                 // 与 dispatcher 审批等待预算对齐（防 MCP 先超时返 deny）。
@@ -170,6 +170,20 @@ impl Backend for ClaudeBackend {
         if !allowed_tools.is_empty() {
             cmd.arg("--allowedTools").arg(allowed_tools.join(","));
         }
+        // 幽灵会话预检（真机校准）：失败轮次泄漏并落库的 session id 在 ~/.claude
+        // 本地存储并无对应 jsonl——resume 它只会得到 is_error 空文本 result 且每轮
+        // 再产新幽灵 id（毒化循环）。不存在即弃用续接、开新会话。
+        let session = session.filter(|s| {
+            let ok = crate::sessions::session_exists(workdir, &s.0);
+            if !ok {
+                tracing::warn!(
+                    target: "imagent::backend",
+                    session_id = %s.0,
+                    "续接的 session 在 ~/.claude 本地存储不存在（幽灵会话），弃用续接开新会话"
+                );
+            }
+            ok
+        });
         if let Some(s) = session {
             cmd.arg("--resume").arg(&s.0);
         }
@@ -181,8 +195,10 @@ impl Backend for ClaudeBackend {
             match write_mcp_config(conv_id, &sock, mode, self.ask_timeout.as_secs()).await {
                 Ok(p) => {
                     cmd.arg("--mcp-config").arg(&p);
+                    // claude 要求 server 限定全名（mcp__<server>__<tool>）——真机
+                    // 校准发现裸工具名被 CLI 2.1.x 拒绝（"MCP tool not found"）。
                     cmd.arg("--permission-prompt-tool")
-                        .arg(imagent_core::mcp::TOOL_NAME);
+                        .arg(imagent_core::mcp::qualified_tool_name());
                     Some(p)
                 }
                 Err(e) => {
