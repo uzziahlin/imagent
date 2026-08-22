@@ -357,6 +357,65 @@ impl FeishuPlatform {
         let mid = send_card_msg(&self.core_config, token, receive_id, kind, &card_json).await?;
         Ok(mid.map(|m| format!("msg:{m}")))
     }
+
+    /// managed（`card:` 句柄）卡片的 patch 主体，供 [`Self::update_card`] 与
+    /// 300317 自愈重试共用。
+    async fn patch_managed(&self, token: &str, card_id: &str, card: &OutboundCard) -> Result<()> {
+        match &card.terminal {
+            CardTerminal::Running => {
+                let content = stream_body_md(&card.text, &card.tool_calls);
+                let seq = self.next_card_seq(card_id).await;
+                match patch_card_element(token, card_id, "md_body", &content, seq).await {
+                    // 流式超时（200850）：服务端已自动关流式，长任务 Running 期会触发。
+                    // 自愈：重开 streaming_mode 后重试一次（sequence 继续递增）。
+                    Err(e) if e.to_string().contains("code=200850") => {
+                        warn!(target: "feishu", card_id, "流式超时，重开 streaming_mode 后重试");
+                        let settings = serde_json::json!({
+                            "config": { "streaming_mode": true }
+                        })
+                        .to_string();
+                        let seq2 = self.next_card_seq(card_id).await;
+                        patch_card_settings(token, card_id, &settings, seq2).await?;
+                        let seq3 = self.next_card_seq(card_id).await;
+                        patch_card_element(token, card_id, "md_body", &content, seq3).await
+                    }
+                    other => other,
+                }
+            }
+            CardTerminal::Done | CardTerminal::Error(_) => {
+                let err = match &card.terminal {
+                    CardTerminal::Error(e) => Some(e.as_str()),
+                    _ => None,
+                };
+                let content = stream_body_final(&card.text, &card.tool_calls, err);
+                let seq = self.next_card_seq(card_id).await;
+                let element = patch_card_element(token, card_id, "md_body", &content, seq).await;
+                // footer 收敛（真机校准 UX）：初始卡的「🧠 执行中」在终态
+                // 换成 完成/出错——否则任务结束后标识永远停在执行中。
+                // best-effort：失败只 warn，不影响终态主流程。
+                let footer = if err.is_some() {
+                    "❌ 出错"
+                } else {
+                    "✅ 完成"
+                };
+                let seq_f = self.next_card_seq(card_id).await;
+                if let Err(e) = patch_card_element(token, card_id, "md_footer", footer, seq_f).await
+                {
+                    tracing::warn!(
+                        target: "feishu",
+                        error = %e,
+                        "footer 收敛失败（不影响终态内容）"
+                    );
+                }
+                // 关闭流式（光标消失）；sequence 与 element PATCH 共用递增。
+                let settings =
+                    serde_json::json!({ "config": { "streaming_mode": false } }).to_string();
+                let seq2 = self.next_card_seq(card_id).await;
+                patch_card_settings(token, card_id, &settings, seq2).await?;
+                element
+            }
+        }
+    }
 }
 
 /// 媒体目录：`<imagent_home>/media/`（0700；P4-10：随 profile 隔离）。
@@ -653,57 +712,23 @@ impl Platform for FeishuPlatform {
     ) -> Result<()> {
         self.with_token(|token| async move {
             if let Some(card_id) = handle.strip_prefix("card:") {
-                match &card.terminal {
-                    CardTerminal::Running => {
-                        let content = stream_body_md(&card.text, &card.tool_calls);
-                        let seq = self.next_card_seq(card_id).await;
-                        match patch_card_element(&token, card_id, "md_body", &content, seq).await {
-                            // 流式超时（200850）：服务端已自动关流式，长任务 Running 期会触发。
-                            // 自愈：重开 streaming_mode 后重试一次（sequence 继续递增）。
-                            Err(e) if e.to_string().contains("code=200850") => {
-                                warn!(target: "feishu", card_id, "流式超时，重开 streaming_mode 后重试");
-                                let settings = serde_json::json!({
-                                    "config": { "streaming_mode": true }
-                                })
-                                .to_string();
-                                let seq2 = self.next_card_seq(card_id).await;
-                                patch_card_settings(&token, card_id, &settings, seq2).await?;
-                                let seq3 = self.next_card_seq(card_id).await;
-                                patch_card_element(&token, card_id, "md_body", &content, seq3).await
-                            }
-                            other => other,
-                        }
+                match self.patch_managed(&token, card_id, card).await {
+                    // 300317（sequence 落后）自愈（真机校准）：重启后内存计数器归零，
+                    // 但旧卡片的 server 序号已推进（孤儿扫描接管、同进程异常路径）
+                    // ——把该卡计数器重置为时间戳级（必然大于 server 序号）整段重试。
+                    Err(e) if e.to_string().contains("300317") => {
+                        warn!(target: "feishu", card_id, "sequence 落后（300317），重置计数器后重试");
+                        // sequence 是 int32：用**秒级**时间戳（~1.8e9 < 2^31，
+                        // 2038 年前安全）；毫秒会溢出被 9499 拒（真机踩过）。
+                        // 秒级值必然大于服务端已用的小序号，满足严格递增。
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(1_000_000_000);
+                        *self.card_seqs.lock().await.entry(card_id.to_string()).or_insert(now) = now;
+                        self.patch_managed(&token, card_id, card).await
                     }
-                    CardTerminal::Done | CardTerminal::Error(_) => {
-                        let err = match &card.terminal {
-                            CardTerminal::Error(e) => Some(e.as_str()),
-                            _ => None,
-                        };
-                        let content = stream_body_final(&card.text, &card.tool_calls, err);
-                        let seq = self.next_card_seq(card_id).await;
-                        let element =
-                            patch_card_element(&token, card_id, "md_body", &content, seq).await;
-                        // footer 收敛（真机校准 UX）：初始卡的「🧠 执行中」在终态
-                        // 换成 完成/出错——否则任务结束后标识永远停在执行中。
-                        // best-effort：失败只 warn，不影响终态主流程。
-                        let footer = if err.is_some() { "❌ 出错" } else { "✅ 完成" };
-                        let seq_f = self.next_card_seq(card_id).await;
-                        if let Err(e) =
-                            patch_card_element(&token, card_id, "md_footer", footer, seq_f).await
-                        {
-                            tracing::warn!(
-                                target: "feishu",
-                                error = %e,
-                                "footer 收敛失败（不影响终态内容）"
-                            );
-                        }
-                        // 关闭流式（光标消失）；sequence 与 element PATCH 共用递增。
-                        let settings =
-                            serde_json::json!({ "config": { "streaming_mode": false } }).to_string();
-                        let seq2 = self.next_card_seq(card_id).await;
-                        patch_card_settings(&token, card_id, &settings, seq2).await?;
-                        element
-                    }
+                    other => other,
                 }
             } else if let Some(message_id) = handle.strip_prefix("msg:") {
                 let card_json = render_card(card);
