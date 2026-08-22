@@ -2,6 +2,26 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [Unreleased] — P6：第二轮对标 lark-coding-agent-bridge——mention 基础设施、命令按钮卡、话题群、开箱体验
+
+（见 [P4_ROADMAP](docs/internal/P4_ROADMAP.md) P6 实现纪要。）
+
+### Added
+- **mention 基础设施**：群消息客户端 @bot 过滤（config `feishu_require_mention_in_group`，默认 true；bot id 未知退化弱过滤）；正文 `@_user_N` 占位清洗（@bot 剥离、@他人转 `@名字`，text/post 双路径）；`InboundMessage.mentions` 元数据；`/allow @名字` `/disallow @名字` 直接 @ 对方授权（名字精确匹配 + 唯一性兜底 + 歧义提示），免手打 open_id。
+- **命令交互卡片**：`Platform::send_command_card`（默认纯文本降级）；`/help`（六个常用命令按钮）、`/ws list`（每空间「使用」）、`/resume`（前 9 条「接管」）返回按钮卡（V2 column_set→button，每行 3 列）；按钮回调 `imagent_cmd` 映射为命令文本，走与手打命令完全相同的鉴权/admin 门槛（仅接受 `/` 开头，防伪造普通文本）。
+- **话题群（thread）会话隔离**：群消息带 root_id 时 conv 升级 `feishu:<chat>:<root>`，每个话题独立 session/批处理；文本/图片/文件回复走 `im/v1/messages/{root}/reply` 落回原话题；话题 conv 继承所属群白名单授权。
+- **`imagent setup` 首次运行向导**：飞书应用配置六步清单引导 → 凭据录入 + tenant_access_token 连通性校验 → 工作目录安全校验 → 写 config（0600）；WeCom 分支同构；iLink 指引 login。
+- **`imagent service install|uninstall|status`**：程序化安装 launchd（macOS）/ systemd 用户单元（Linux），注册当前二进制与 `--profile`，凭据环境变量快照进服务定义。
+- **出站文件发送**：`upload_file`（im/v1/files）+ file 消息；`send_media` 按 kind 分流 image/file；`/file <path>` 命令（workdir 限定）。
+- **`/timeout [N|off|default]`**：会话级空闲看门狗覆盖（分钟粒度），`round.rs` 消费点接入 per-conv 值。
+- **require_mention IM 内热切换**（遗留补齐）：`Platform` trait 新增查询/设置；`/config require_mention on|off` 对下一消息生效（重启回 config 值）；`/config` 展示当前值。
+- **话题群流式卡片**（遗留补齐）：话题内走「reply 发 raw 卡 + `msg:` 句柄整卡 patch」，审批卡与命令卡在话题内同样发卡；managed 打字机流式仍限普通会话（卡片实体无法在话题内引用）。
+- **setup WeCom 连通性探针**（遗留补齐）：`imagent_wecom::probe_credentials` 用 WS subscribe ack 真校验 bot_id/secret，向导安装期即暴露配错/吊销。
+
+### Changed
+- **`/cd` 与 `/ws use` 安全校验**：拒绝 `/`、home 根、系统目录等过宽工作目录（黑名单与输入双侧 canonicalize，macOS symlink 归一），存量宽泛目录同样拦截。
+- fuzz target `feishu_event_parse` 扩展：MentionPolicy × bot_open_id 四组合 + `is_group_message_event`。
+
 ## [Unreleased] — P5 第七波（维护）：dependabot 八连清零、feishu fuzz、文档站同步
 
 （见 [P4_ROADMAP](docs/internal/P4_ROADMAP.md) P5 第七批纪要。）
