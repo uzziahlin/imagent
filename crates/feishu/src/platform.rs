@@ -601,7 +601,14 @@ impl Platform for FeishuPlatform {
         }
         let (receive_id, kind) = receive_target_from_conv(conv)
             .ok_or_else(|| CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0)))?;
-        let card_json = render_permission_card(tool_name, input_summary, &conv.0);
+        // P6（AskUserQuestion 透传）：agent 的问题渲染成「问题 + 选项按钮」卡，
+        // 而非降级的 允许/拒绝 审批卡；解析失败降级普通审批卡。
+        let card_json = if tool_name == "AskUserQuestion" {
+            crate::card::render_question_card(input_summary, &conv.0)
+                .unwrap_or_else(|| render_permission_card(tool_name, input_summary, &conv.0))
+        } else {
+            render_permission_card(tool_name, input_summary, &conv.0)
+        };
         match self
             .with_token(|t| {
                 let receive_id = receive_id.clone();
@@ -646,11 +653,25 @@ impl Platform for FeishuPlatform {
 
     /// 真机校准 UX：决策已回（approve/deny）后把询问卡 patch 成「已批准/已拒绝」
     /// 终态——用户点击后立即有反馈，卡片不再保持可点。best-effort。
-    async fn resolve_permission_ask(&self, conv: &ConvId, allowed: bool) -> Result<()> {
+    /// P6：AskUserQuestion 的问题卡显示「已记录你的选择」（message 携带选项）。
+    async fn resolve_permission_ask(
+        &self,
+        conv: &ConvId,
+        reply: &imagent_core::PermissionReply,
+    ) -> Result<()> {
         let Some((message_id, tool_name)) = self.pending_asks.lock().await.remove(&conv.0) else {
             return Ok(());
         };
-        let card_json = crate::card::render_permission_card_resolved(&tool_name, allowed);
+        let card_json = if tool_name == "AskUserQuestion" {
+            let choice = reply
+                .message
+                .as_deref()
+                .unwrap_or("已收到")
+                .trim_start_matches("用户选择：");
+            crate::card::render_question_card_resolved(choice)
+        } else {
+            crate::card::render_permission_card_resolved(&tool_name, reply.allow)
+        };
         self.with_token(|t| {
             let message_id = message_id.clone();
             let card_json = card_json.clone();

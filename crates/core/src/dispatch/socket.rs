@@ -262,7 +262,9 @@ impl Dispatcher {
         // P4-4：询问用户——平台支持交互卡片时发「按钮卡片」（send_permission_ask
         // 覆写），否则默认纯文本。按钮点击由平台侧转成 text="y"/"n" 的入站消息，
         // 复用 recv 循环的审批回复路由，core 不感知按钮。
-        let input_summary = truncate_str(&input_str, 80);
+        // P6：80 截断装不下 AskUserQuestion 的问题+选项 JSON；放到 2000（卡片
+        // 30KB 上限内安全，仍防超长轰炸）。
+        let input_summary = truncate_str(&input_str, 2000);
         // P1-3：发送失败 → 回写 deny 并 return，不挂 pending。
         if let Err(e) = platform
             .send_permission_ask(&conv, &tool_name, &input_summary, &ReplyHint::None)

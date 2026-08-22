@@ -174,12 +174,18 @@ pub fn parse_card_action_event(payload: &[u8]) -> Option<(String, InboundMessage
     // 真机校准：新信封 action 平铺（value 直接是 action 的字段），旧信封嵌套在
     // action.value 下——两形态都认。
     let value = evt.event.action.get("value").unwrap_or(&evt.event.action);
-    let act = value.get("imagent_perm")?.as_str()?;
     let conv = value.get("conv")?.as_str()?;
-    let text = match act {
-        "allow" => "y",
-        "deny" => "n",
-        _ => return None,
+    // P6：问题卡选项按钮（imagent_ask）→ "ask:<选项>" 文本，走审批回复路由由
+    // parse_reply 转成 deny+message（用户选择经 message 回给 agent）。
+    let text: String = if let Some(choice) = value.get("imagent_ask").and_then(|c| c.as_str()) {
+        format!("ask:{choice}")
+    } else {
+        let act = value.get("imagent_perm")?.as_str()?;
+        match act {
+            "allow" => "y".to_string(),
+            "deny" => "n".to_string(),
+            _ => return None,
+        }
     };
     let open_id = evt
         .event
@@ -198,7 +204,7 @@ pub fn parse_card_action_event(payload: &[u8]) -> Option<(String, InboundMessage
         .header
         .event_id
         .clone()
-        .unwrap_or_else(|| format!("card_action:{open_id}:{conv}:{act}"));
+        .unwrap_or_else(|| format!("card_action:{open_id}:{}", &text[..text.len().min(32)]));
     Some((
         key,
         InboundMessage {
@@ -864,6 +870,26 @@ mod tests {
         assert_eq!(msg.sender.0, "ou_real");
         assert_eq!(msg.conv_id.0, "feishu:ou_real");
         assert_eq!(msg.text.as_deref(), Some("y"));
+    }
+
+    #[test]
+    #[test]
+    /// P6：问题卡选项按钮（imagent_ask）→ ask:<选项> 文本（经 parse_reply 转
+    /// deny+message 回给 agent）。
+    fn parse_card_action_question_option_to_ask_text() {
+        let payload = serde_json::json!({
+            "header": {"event_id": "evt_ask_1", "event_type": "card.action.trigger"},
+            "event": {
+                "operator": {"open_id": "ou_q"},
+                "action": {"tag": "button", "value": {"imagent_ask": "数据库迁移", "conv": "feishu:ou_q"}}
+            }
+        })
+        .to_string()
+        .into_bytes();
+        let (key, msg) = parse_card_action_event(&payload).expect("选项回调应可解析");
+        assert_eq!(key, "evt_ask_1");
+        assert_eq!(msg.text.as_deref(), Some("ask:数据库迁移"));
+        assert_eq!(msg.conv_id.0, "feishu:ou_q");
     }
 
     #[test]
