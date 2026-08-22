@@ -2,7 +2,15 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
-## [Unreleased] — P5 第七波（维护）：dependabot 八连清零、feishu fuzz、文档站同步
+## [Unreleased]
+
+（空——下一段变更从这里开始。）
+
+## [1.1.0] — 2026-08-22
+
+> v1.0.0（2026-07-29）以来的全部变更：P4/P5 六波迭代 + 依赖治理 + 文档站 + 真机校准七修 + AskUserQuestion 透传。store schema v1→v6（线性迁移，旧库自动升级）。
+
+## [1.1.0] 波次 — P5 第七波（维护）：dependabot 八连清零、feishu fuzz、文档站同步
 
 （见 [P4_ROADMAP](docs/internal/P4_ROADMAP.md) P5 第七批纪要。）
 
@@ -11,7 +19,7 @@
 - **飞书事件解析 fuzz target**：消息/审批按钮/云文档评论三类 payload 全解析路径（`feishu_event_parse`），并入每周 fuzz 任务；本地冒烟 162 万次执行零崩溃。
 - **mdBook 文档站同步**：新增 `ARCHITECTURE.md` 现状架构（文档站首页内容）；`SUMMARY.md` 补上此前遗漏的 FEISHU_DESIGN；DESIGN/FEISHU_DESIGN 状态头改为历史快照指向新文档；`.gitignore` 补 book/ 与 fuzz 本地产物。
 
-## [Unreleased] — P5 第六波：路线图三大项——dispatch 拆模块、孤儿卡片关流（schema v6）、feishu token 自愈
+## [1.1.0] 波次 — P5 第六波：路线图三大项——dispatch 拆模块、孤儿卡片关流（schema v6）、feishu token 自愈
 
 （见 [P4_ROADMAP](docs/internal/P4_ROADMAP.md) P5 第六批纪要。）
 
@@ -25,7 +33,7 @@
 - **feishu SDK 路径无 429 重试**：`send_text_msg`/`send_card_msg`/`patch_card`/`send_card_ref_msg`/`upload_image`/`send_image_msg` 六个 SDK 函数补齐 500ms→1s→2s 退避重试（识别串扩展到 SDK ApiError Display 形态）。
 - workspace 测试 351 passed（新增 6：live_cards 生命周期 ×3、v5→v6 迁移回环、token/限流识别 ×2）；clippy 0 warning；fmt clean。
 
-## [Unreleased] — P5 第五波：push 后自审——修复三处自引入回归 + 六处次级问题
+## [1.1.0] 波次 — P5 第五波：push 后自审——修复三处自引入回归 + 六处次级问题
 
 （对 P5 前四波 diff 的二次审查结论，见 [P4_ROADMAP](docs/internal/P4_ROADMAP.md) P5 章节。）
 
@@ -41,7 +49,7 @@
 - `/ws use` 切目录后失效 /resume 列表缓存（同 /cd）；codex 本机会话扫描移入 `spawn_blocking`（防卡 tokio worker）；`/stop` 仅在确有 pending 审批时撤回询问卡（防误把已回答的旧卡 patch 成「已中断」）。
 - workspace 测试 345 passed（新增 5 用例：flock 三场景、/stop 中断 /compact、Err 路径 session 持久化）；clippy 0 warning；fmt clean。
 
-## [Unreleased] — P5 第四波：设计债务收敛（store 事务/轮转、keyring 隔离、metrics、媒体 TTL、feishu 限流、codex 扫描）
+## [1.1.0] 波次 — P5 第四波：设计债务收敛（store 事务/轮转、keyring 隔离、metrics、媒体 TTL、feishu 限流、codex 扫描）
 
 （发现与排期见 [P4_ROADMAP](docs/internal/P4_ROADMAP.md) 的 P5 章节。）
 
@@ -60,7 +68,7 @@
 ### Changed
 - workspace 测试 343 passed（新增 7 用例）；clippy 0 warning；fmt clean。
 
-## [Unreleased] — P5 第三波：单实例锁 / 握手 token / 游标致命化 / 编码校准 / /stop 收尾 + 六项快赢
+## [1.1.0] 波次 — P5 第三波：单实例锁 / 握手 token / 游标致命化 / 编码校准 / /stop 收尾 + 六项快赢
 
 （发现与排期见 [P4_ROADMAP](docs/internal/P4_ROADMAP.md) 的 P5 章节。）
 
@@ -74,7 +82,7 @@
 ### Changed
 - workspace 测试 337 passed（新增 8 用例）；clippy 0 warning；fmt clean。P5-14（ACP per-conv 连接）留待真机验证后实施。
 
-## [Unreleased] — P5 第二波：深度 Review 安全 + 正确性修复（五项）
+## [1.1.0] 波次 — P5 第二波：深度 Review 安全 + 正确性修复（五项）
 
 （发现与排期见 [P4_ROADMAP](docs/internal/P4_ROADMAP.md) 的 P5 章节。）
 
@@ -88,7 +96,7 @@
 ### Changed
 - workspace 测试 329 passed（新增 5 用例）；clippy 0 warning；fmt clean。wecom ack 完整等待闭环未做（需真机验证回执语义）；飞书 @bot 过滤含一次 /bot/v3/info 调用。
 
-## [Unreleased] — P5 第一波：深度 Review 安全 + 正确性修复（六项）
+## [1.1.0] 波次 — P5 第一波：深度 Review 安全 + 正确性修复（六项）
 
 （全量 review 发现与后续排期见 [P4_ROADMAP](docs/internal/P4_ROADMAP.md) 的 P5 章节。）
 
@@ -103,7 +111,7 @@
 ### Changed
 - workspace 测试 324 passed（新增 4 用例：审批回复门×1、/perm 管理员×1、/disallow 管理员×1、/stop 中断保 session×1）；clippy 0 warning；fmt clean。ACP 改动需真机冒烟（`cargo test -p imagent-claude -- --ignored acp_e2e`）。
 
-## [Unreleased] — P4 第三波：统一 /resume——无感接管电脑端 Claude Code 会话
+## [1.1.0] 波次 — P4 第三波：统一 /resume——无感接管电脑端 Claude Code 会话
 
 ### Added
 - **统一恢复列表（P4-11）**：`/resume` 列表 = IM 会话历史（📱）∪ 本机同项目 agent 会话（💻）——用户按序号选择即接管，全程无需知道 session id。本机会话按 conv 当前 workdir 扫描（`/cd` 切换列表随之变化，workdir 对齐由扫描天然保证），首条用户消息摘要 + 相对时间展示。
@@ -114,7 +122,7 @@
 - workspace 测试 320 passed（新增：扫描器 7 用例 + 统一列表/接管/序号引导 3 用例 + 既有 resume 用例适配新文案）；clippy 0 warning；fmt clean；真机冒烟（imagent 项目 9 个本机会话列出、摘要/排序/截断正确）。
 - 含默认 ignore 的真机冒烟测试（`IMAGENT_RESUME_SMOKE_WD=<proj> cargo test -p imagent-claude --lib smoke_real_dir -- --ignored`）。
 
-## [Unreleased] — P4 第二波：对标差距 7 项全落地
+## [1.1.0] 波次 — P4 第二波：对标差距 7 项全落地
 
 （第一波见下方「P4 功能迭代」；路线与实现纪要见 [P4_ROADMAP](docs/internal/P4_ROADMAP.md)。）
 
@@ -132,7 +140,7 @@
 - schema v3 → v5（`allowed_chats` + `session_history`，线性迁移幂等）。
 - workspace 测试 311 passed（新增：会话白名单×3、cot/config×2、诊断命令、/resume、store chats/history、proto 按钮/评论解析×4、paths/config 单测）；clippy 0 warning；fmt clean；profile CLI 冒烟通过。
 
-## [Unreleased] — P4 功能迭代（任务控制 / 批处理 / 看门狗）
+## [1.1.0] 波次 — P4 功能迭代（任务控制 / 批处理 / 看门狗）
 
 对标 [lark-coding-agent-bridge](https://github.com/zarazhangrui/lark-coding-agent-bridge) 的差距分析（见 [P4_ROADMAP](docs/internal/P4_ROADMAP.md)）落地高优先级三项；其余 7 项待排期已记入路线。
 
@@ -148,7 +156,7 @@
 - workspace 测试全绿（新增 9 个用例：/stop 三态、排队丢弃、运行中合并、窗口合并、空闲看门狗、队列上限、合并纯函数、路由守卫分类）；clippy 0 warning；fmt clean。
 - `cargo fmt` 顺带修复了此前提交未格式化的 `types.rs` / `crates/feishu/*`（纯重排，无逻辑变更）。
 
-## [Unreleased] — 安全审查 v2/v3/v4/v5 修复
+## [1.1.0] 波次 — 安全审查 v2/v3/v4/v5 修复
 
 深度 Review v2/v3/v4/v5（见 [v2](docs/internal/CODE_REVIEW_v2.md) / [v3](docs/internal/CODE_REVIEW_v3.md) / [v4](docs/CODE_REVIEW_v4.md) / [v5](docs/CODE_REVIEW_v5.md)）的修复。
 
