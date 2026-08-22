@@ -23,6 +23,18 @@ use crate::config::PermissionMode;
 use crate::permission::PermissionReply;
 
 pub const TOOL_NAME: &str = "permission_request";
+
+/// `--mcp-config` 里注册的 server 名（backend 写配置时用）。与 [`TOOL_NAME`] 一起
+/// 决定 claude 眼中的工具全名。
+pub const SERVER_NAME: &str = "imagent";
+
+/// claude `--permission-prompt-tool` 需要的 **server 限定全名**
+/// （`mcp__<server>__<tool>`，真机校准：claude CLI 2.1.x 只认全名，裸工具名报
+/// "MCP tool not found. Available MCP tools: mcp__imagent__permission_request"）。
+pub fn qualified_tool_name() -> String {
+    format!("mcp__{SERVER_NAME}__{TOOL_NAME}")
+}
+
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// `tools/list` 的工具描述（纯函数，便于单测）。
@@ -295,6 +307,13 @@ mod tests {
         let tools = list.get("tools").and_then(|t| t.as_array()).unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], TOOL_NAME);
+    }
+
+    /// 真机校准（claude CLI 2.1.156）：--permission-prompt-tool 只认 server 限定
+    /// 全名。回归防线：全名格式必须与 backend 写入 mcp-config 的 server 名联动。
+    #[test]
+    fn qualified_tool_name_matches_claude_mcp_naming() {
+        assert_eq!(qualified_tool_name(), "mcp__imagent__permission_request");
     }
 
     #[test]

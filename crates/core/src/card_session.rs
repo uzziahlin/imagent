@@ -59,6 +59,22 @@ impl CardSession {
             .await;
     }
 
+    /// 立即发出初始卡片（若尚未发）。真机校准 UX：agent 首个 chunk 前有数秒到
+    /// 十几秒静默期（CLI 冷启动 + 模型首 token），轮次开始即发「执行中」卡，
+    /// 用户才确知消息已被接收处理。飞书 send_card 用固定初始模板（打字机基座），
+    /// 与本方法的无内容 dispatch 天然契合。
+    pub(crate) async fn ensure_started(
+        &mut self,
+        conv: &ConvId,
+        hint: &ReplyHint,
+        platform: &dyn Platform,
+    ) {
+        if self.msg_id.is_none() {
+            self.dispatch_card(CardTerminal::Running, conv, hint, platform)
+                .await;
+        }
+    }
+
     /// 累积工具调用摘要，节流 patch（Running 态；工具块需展示）。
     pub(crate) async fn append_tool(
         &mut self,
