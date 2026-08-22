@@ -51,6 +51,9 @@ pub struct TaskBudgets {
     pub agent_timeout: Duration,
     /// Ask 权限审批等待回复超时（`permission_ask_timeout_secs`，独立预算）。
     pub permission_ask_timeout: Duration,
+    /// 终端 agent `ask_via_im` 等待回复的默认超时（`ask_via_im_timeout_secs`；
+    /// 可被请求的 timeout_secs 覆盖，上限 86400）。
+    pub ask_via_im_timeout: Duration,
     /// 优雅退出 drain in-flight task 宽限（`shutdown_grace_secs`）。
     pub shutdown_grace: Duration,
     /// 空闲看门狗：agent 连续无输出该时长则终止本轮（`agent_idle_timeout_secs`；
@@ -67,6 +70,7 @@ impl TaskBudgets {
         Self {
             agent_timeout: Duration::from_secs(c.agent_timeout_secs),
             permission_ask_timeout: Duration::from_secs(c.permission_ask_timeout_secs),
+            ask_via_im_timeout: Duration::from_secs(c.ask_via_im_timeout_secs),
             shutdown_grace: Duration::from_secs(c.shutdown_grace_secs),
             agent_idle_timeout: Duration::from_secs(c.agent_idle_timeout_secs),
             batch_window: Duration::from_millis(c.batch_window_ms),
@@ -235,6 +239,8 @@ pub struct Dispatcher {
     agent_timeout: std::time::Duration,
     /// 权限审批（Ask）等待用户回复的超时（S-3：独立预算，不挤占 agent_timeout）。
     permission_ask_timeout: std::time::Duration,
+    /// 终端 agent `ask_via_im` 等待回复的默认超时（socket ask 分支用）。
+    ask_via_im_timeout: std::time::Duration,
     /// 优雅退出 drain in-flight task 的宽限期（R-1：原硬编码 30s）。
     shutdown_grace: std::time::Duration,
     /// 空闲看门狗：agent 连续无输出该时长则终止本轮（零值 = 关闭）。
@@ -326,6 +332,7 @@ impl Dispatcher {
             permission_mode,
             agent_timeout: budgets.agent_timeout,
             permission_ask_timeout: budgets.permission_ask_timeout,
+            ask_via_im_timeout: budgets.ask_via_im_timeout,
             shutdown_grace: budgets.shutdown_grace,
             agent_idle_timeout: Arc::new(RwLock::new(budgets.agent_idle_timeout)),
             batch_window: Arc::new(RwLock::new(budgets.batch_window)),
@@ -444,13 +451,24 @@ impl Dispatcher {
                         {
                             let reply = parse_reply(text);
                             let reply_for_card = reply.clone();
-                            if self.router.route(&conv_id, reply).await {
+                            // 多 pending 三级路由：按钮回调带 ask_req 精确 → 引用
+                            // 回复（reply_to）命中询问卡 → 最新 pending 兜底。
+                            if let Some(req) = self
+                                .router
+                                .route(
+                                    &conv_id,
+                                    msg.ask_req.as_deref(),
+                                    msg.reply_to.as_deref(),
+                                    reply,
+                                )
+                                .await
+                            {
                                 // 真机校准 UX：决策已达 MCP，立即把询问卡收敛成
                                 // 「已批准/已拒绝」终态（best-effort，无卡 no-op）；
                                 // 问题卡（P6）显示「已记录你的选择：<选项>」。
                                 if let Err(e) = self
                                     .platform
-                                    .resolve_permission_ask(&msg.conv_id, &reply_for_card)
+                                    .resolve_permission_ask(&msg.conv_id, &req, &reply_for_card)
                                     .await
                                 {
                                     tracing::warn!(

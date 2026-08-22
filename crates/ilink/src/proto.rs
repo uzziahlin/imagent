@@ -211,6 +211,8 @@ pub fn msg_to_inbound(msg: &Msg) -> InboundMessage {
         media: Vec::new(),
         media_errors: Vec::new(),
         mentions: Vec::new(),
+        ask_req: None,
+        reply_to: None,
         reply_hint: ReplyHint::ILink {
             context_token: msg.context_token.clone().unwrap_or_default(),
         },

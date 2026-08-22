@@ -67,6 +67,10 @@ pub struct Message {
     /// 只有 parent_id 不设 root_id）。
     #[serde(default)]
     pub root_id: Option<String>,
+    /// 引用回复的目标消息 id（多 pending 路由锚点：命中询问卡消息 id 时，回复
+    /// 路由到该询问的 request_id）。普通消息为 None。
+    #[serde(default)]
+    pub parent_id: Option<String>,
 }
 
 /// 群/私聊消息里的 @ 提及（`im.message.receive_v1` 的 message.mentions 元素）。
@@ -248,6 +252,12 @@ pub fn parse_card_action_event(payload: &[u8]) -> Option<(String, InboundMessage
     // action.value 下——两形态都认。
     let value = evt.event.action.get("value").unwrap_or(&evt.event.action);
     let conv = value.get("conv")?.as_str()?;
+    // 多 pending：value 可携带 req（request_id）——按钮回调精确路由到发起方。
+    let ask_req = value
+        .get("req")
+        .and_then(|r| r.as_str())
+        .filter(|r| !r.is_empty())
+        .map(String::from);
     // P6：问题卡选项按钮（imagent_ask）→ "ask:<选项>" 文本，走审批回复路由由
     // parse_reply 转成 deny+message（用户选择经 message 回给 agent）。
     // P6-3：命令按钮（imagent_cmd）→ 命令本体，走与手打命令相同的鉴权/分派
@@ -292,6 +302,8 @@ pub fn parse_card_action_event(payload: &[u8]) -> Option<(String, InboundMessage
             media: vec![],
             media_errors: Vec::new(),
             mentions: Vec::new(),
+            ask_req,
+            reply_to: None,
             reply_hint: ReplyHint::None,
         },
     ))
@@ -443,6 +455,8 @@ pub fn parse_comment_event(
             media: vec![],
             media_errors: Vec::new(),
             mentions: Vec::new(),
+            ask_req: None,
+            reply_to: None,
             reply_hint: ReplyHint::None,
         },
     ))
@@ -584,6 +598,8 @@ pub fn parse_message_event(
         media: vec![],
         media_errors: Vec::new(),
         mentions,
+        ask_req: None,
+        reply_to: evt.event.message.parent_id.filter(|p| !p.is_empty()),
         reply_hint: ReplyHint::None,
     };
     Some((dedup_key, msg, pending))
@@ -1132,6 +1148,37 @@ mod tests {
         assert_eq!(key, "evt_ask_1");
         assert_eq!(msg.text.as_deref(), Some("ask:数据库迁移"));
         assert_eq!(msg.conv_id.0, "feishu:ou_q");
+    }
+
+    /// 多 pending：value 携带 req（request_id）→ ask_req 透传（无 req 时为 None，
+    /// 兼容旧卡/手拼 payload）。
+    #[test]
+    fn parse_card_action_carries_request_id() {
+        let with_req = serde_json::json!({
+            "header": {"event_id": "evt_req_1", "event_type": "card.action.trigger"},
+            "event": {
+                "operator": {"open_id": "ou_r"},
+                "action": {"tag": "button", "value": {
+                    "imagent_ask": "选项A", "conv": "feishu:ou_r", "req": "t-abc123"
+                }}
+            }
+        })
+        .to_string()
+        .into_bytes();
+        let (_, msg) = parse_card_action_event(&with_req).expect("应可解析");
+        assert_eq!(msg.ask_req.as_deref(), Some("t-abc123"));
+        // 无 req：ask_req None（路由回落 parent/最新兜底）。
+        let no_req = serde_json::json!({
+            "header": {"event_id": "evt_req_2", "event_type": "card.action.trigger"},
+            "event": {
+                "operator": {"open_id": "ou_r"},
+                "action": {"tag": "button", "value": {"imagent_perm": "allow", "conv": "feishu:ou_r"}}
+            }
+        })
+        .to_string()
+        .into_bytes();
+        let (_, msg) = parse_card_action_event(&no_req).expect("应可解析");
+        assert_eq!(msg.ask_req, None);
     }
 
     #[test]

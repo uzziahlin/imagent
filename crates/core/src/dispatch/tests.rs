@@ -352,6 +352,8 @@ fn msg(conv: &str, sender: &str, text: &str) -> InboundMessage {
         media: Vec::new(),
         media_errors: Vec::new(),
         mentions: Vec::new(),
+        ask_req: None,
+        reply_to: None,
         reply_hint: ReplyHint::None,
     }
 }
@@ -515,6 +517,7 @@ fn test_budgets() -> TaskBudgets {
     TaskBudgets {
         agent_timeout: Duration::from_secs(600),
         permission_ask_timeout: Duration::from_secs(300),
+        ask_via_im_timeout: Duration::from_secs(1800),
         shutdown_grace: Duration::from_secs(60),
         agent_idle_timeout: Duration::from_secs(300),
         batch_window: Duration::from_millis(1),
@@ -801,6 +804,8 @@ async fn pure_media_all_failed_replies_error() {
         media: vec![],
         media_errors: vec!["img_x: 下载失败: boom".into()],
         mentions: Vec::new(),
+        ask_req: None,
+        reply_to: None,
         reply_hint: ReplyHint::None,
     };
     feed_and_wait(&ctx, vec![m], 0).await;
@@ -1555,6 +1560,7 @@ async fn stop_aborts_running_task() {
         Auth::new(vec!["alice".into()]),
         30_000,
         TaskBudgets {
+            ask_via_im_timeout: std::time::Duration::from_secs(1800),
             batch_window: Duration::from_millis(1),
             ..test_budgets()
         },
@@ -2378,7 +2384,7 @@ async fn permission_socket_token_handshake() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert!(asked, "正确 token 的请求应触发 IM 询问");
-        ctx.disp.router.cancel("c1").await;
+        ctx.disp.router.cancel("c1", "legacy").await;
         let mut buf = String::new();
         let mut r = tokio::io::BufReader::new(s);
         let _ = tokio::time::timeout(Duration::from_secs(2), r.read_line(&mut buf)).await;

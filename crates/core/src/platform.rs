@@ -58,17 +58,22 @@ pub trait Platform: Send + Sync {
     }
 
     /// 发权限审批询问（P4-4）。默认实现走纯文本；支持交互卡片的平台可覆写为
-    /// 「按钮卡片」——用户点击后平台侧产生 `text = "y"/"n"` 的 InboundMessage，
-    /// 复用既有审批回复路由（`parse_reply`）送达 MCP，core 无需感知按钮。
+    /// 「按钮卡片」——用户点击后平台侧产生携带 `ask_req`（request_id）的
+    /// InboundMessage，复用既有审批回复路由送达 MCP，core 无需感知按钮形态。
+    ///
+    /// 返回询问卡的 IM 侧消息 id（无卡片句柄的平台/路径返回 None）——作为
+    /// `PermissionRouter` 的 `card_msg_id` 锚点，供自由文本「引用回复」精确路由。
     async fn send_permission_ask(
         &self,
         conv: &ConvId,
+        _request_id: &str,
         tool_name: &str,
         input_summary: &str,
         hint: &ReplyHint,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         self.send_permission_ask_text(conv, tool_name, input_summary, hint)
-            .await
+            .await?;
+        Ok(None)
     }
 
     /// 纯文本审批询问（独立方法而非闭在 send_permission_ask 默认实现里——覆写
@@ -85,11 +90,16 @@ pub trait Platform: Send + Sync {
         self.send_text(conv, &text, hint).await
     }
 
-    /// P5-16：撤回/收敛该 conv 最近一次权限询问（`/stop` 中断任务时调用，防审批
-    /// 卡片滞留可点、用户对一个已死的任务做审批）。默认 no-op：纯文本询问平台
-    /// 无句柄概念，滞留文本无害（其后的 y/n 因 pending 已清走正常处理路径）。
-    /// 支持交互卡片的平台应记录最近询问的卡片句柄并在此 patch 成「已中断」终态。
-    async fn cancel_permission_ask(&self, _conv: &ConvId) -> Result<()> {
+    /// P5-16：撤回/收敛单个权限询问（超时/顶替时调用，防审批卡滞留可点）。默认
+    /// no-op：纯文本询问平台无句柄概念，滞留文本无害。支持交互卡片的平台按
+    /// request_id 记录卡片句柄并 patch 成「已中断」终态。
+    async fn cancel_permission_ask(&self, _conv: &ConvId, _request_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// 收敛该 conv 的**全部** pending 询问卡（/stop 中断任务时调用）。默认 no-op；
+    /// 多卡并存的平台（飞书）覆写为逐卡收敛。
+    async fn cancel_all_permission_asks(&self, _conv: &ConvId) -> Result<()> {
         Ok(())
     }
 
@@ -100,6 +110,7 @@ pub trait Platform: Send + Sync {
     async fn resolve_permission_ask(
         &self,
         _conv: &ConvId,
+        _request_id: &str,
         _reply: &crate::permission::PermissionReply,
     ) -> Result<()> {
         Ok(())

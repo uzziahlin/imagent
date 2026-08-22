@@ -2,14 +2,20 @@
 //!
 //! 主进程侧：`PermissionRouter` 维护每个 conv 的 pending 权限请求（oneshot）。
 //! - socket accept task 收到 MCP server 转发的权限请求 → `send_text` 询问用户 →
-//!   `register(conv)` 等待回复；
+//!   `register(conv, request_id)` 等待回复；
 //! - dispatch recv 循环发现某 conv 有 pending 请求时，把该 conv 的下一条入站消息
-//!   当作 approve/deny 回复，`route(conv, reply)` 送达 oneshot，**不**走正常 handle。
+//!   当作 approve/deny 回复，`route(conv, …)` 送达 oneshot，**不**走正常 handle。
+//!
+//! 多 pending 并存（终端 ask_via_im 改造）：key 为 `conv + request_id`，同 conv
+//! 下终端 agent 的提问与 IM 会话的审批互不顶替；回复路由三级——按钮回调带
+//! request_id 精确匹配 → 引用回复（parent 消息 id 命中询问卡）→ 最新 pending 兜底。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-
 use tokio::sync::{oneshot, Mutex};
+
+/// 单 conv 允许的 pending 上限：防泄漏（异常路径漏 cancel 时兜底收敛最旧的）。
+const PENDING_PER_CONV_CAP: usize = 8;
 
 /// 固定 socket 路径：`<imagent_home>/permission.sock`（P4-10：随 profile 隔离）。
 pub fn default_sock_path() -> Option<PathBuf> {
@@ -21,6 +27,9 @@ pub fn default_sock_path() -> Option<PathBuf> {
 pub struct PermissionReply {
     pub allow: bool,
     pub message: Option<String>,
+    /// 用户回复的**原文**（按钮回调为 `ask:<选项>` 展开、自由文本为原文）。
+    /// 权限路径不读它（allow/deny 语义不变）；ask_via_im 路径以它作为用户答案回传。
+    pub raw_text: Option<String>,
 }
 
 /// 解析用户回复文本为 approve/deny。
@@ -39,6 +48,7 @@ pub fn parse_reply(text: &str) -> PermissionReply {
         return PermissionReply {
             allow: false,
             message: Some("empty reply".into()),
+            raw_text: None,
         };
     }
     // P6（AskUserQuestion 答案路由）：问题卡的选项按钮回调转成 "ask:<选项>"。
@@ -50,6 +60,7 @@ pub fn parse_reply(text: &str) -> PermissionReply {
             return PermissionReply {
                 allow: false,
                 message: Some(format!("用户选择：{choice}")),
+                raw_text: Some(format!("用户选择：{choice}")),
             };
         }
     }
@@ -84,12 +95,21 @@ pub fn parse_reply(text: &str) -> PermissionReply {
         } else {
             Some(format!("denied by user reply: {t}"))
         },
+        raw_text: Some(t.to_string()),
     }
 }
 
-/// per-conv 权限请求路由表。
+/// 单条 pending 询问。
+struct PendingAsk {
+    request_id: String,
+    /// 询问卡的 IM 侧消息 id（自由文本引用回复的路由锚点；文本询问为 None）。
+    card_msg_id: Option<String>,
+    tx: oneshot::Sender<PermissionReply>,
+}
+
+/// per-conv × request_id 权限请求路由表（多 pending 并存）。
 pub struct PermissionRouter {
-    pending: Mutex<HashMap<String, oneshot::Sender<PermissionReply>>>,
+    pending: Mutex<HashMap<String, Vec<PendingAsk>>>,
 }
 
 impl PermissionRouter {
@@ -101,40 +121,119 @@ impl PermissionRouter {
 
     /// 是否有 conv 处于等待回复状态。
     pub async fn has_pending(&self, conv_id: &str) -> bool {
-        self.pending.lock().await.contains_key(conv_id)
+        self.pending
+            .lock()
+            .await
+            .get(conv_id)
+            .is_some_and(|v| !v.is_empty())
     }
 
     /// 注册一个 pending 请求，返回 receiver 用于等待回复。
-    /// 若该 conv 已有 pending，旧的 sender 被替换（旧 receiver 收到 drop 即返回错误）。
-    pub async fn register(&self, conv_id: &str) -> oneshot::Receiver<PermissionReply> {
+    ///
+    /// 同 request_id 重复注册会顶替旧条目（旧等待者立即收到 superseded deny）；
+    /// 不同 request_id 并存（终端 ask 与 IM 审批互不干扰）。per-conv 超过上限时
+    /// 最旧的按超时收敛（异常路径漏 cancel 的兜底）。
+    pub async fn register(
+        &self,
+        conv_id: &str,
+        request_id: &str,
+        card_msg_id: Option<String>,
+    ) -> oneshot::Receiver<PermissionReply> {
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(conv_id.to_string(), tx);
+        let entry = PendingAsk {
+            request_id: request_id.to_string(),
+            card_msg_id,
+            tx,
+        };
+        let mut map = self.pending.lock().await;
+        let list = map.entry(conv_id.to_string()).or_default();
+        if let Some(i) = list.iter().position(|p| p.request_id == request_id) {
+            let old = list.remove(i);
+            let _ = old.tx.send(PermissionReply {
+                allow: false,
+                message: Some("superseded（同一请求被重新发起）".into()),
+                raw_text: None,
+            });
+        }
+        list.push(entry);
+        while list.len() > PENDING_PER_CONV_CAP {
+            let oldest = list.remove(0);
+            let _ = oldest.tx.send(PermissionReply {
+                allow: false,
+                message: Some("cancelled（pending 超上限，最旧询问被收敛）".into()),
+                raw_text: None,
+            });
+        }
         rx
     }
 
-    /// 投递回复给 pending 的 conv。返回 true 表示命中（该消息已被权限闭环消费）。
-    pub async fn route(&self, conv_id: &str, reply: PermissionReply) -> bool {
+    /// 投递回复给 pending 请求，三级路由：
+    /// 1. `req_hint`（按钮回调携带的 request_id）精确匹配；
+    /// 2. `parent_msg_id`（自由文本引用回复的目标消息 id）命中询问卡；
+    /// 3. 两者皆缺时最新 pending 兜底。
+    ///
+    /// req/parent **给了但未命中**视为未命中（陈旧回调/无关引用不得劫持别的
+    /// pending，消息回落正常处理路径）。
+    pub async fn route(
+        &self,
+        conv_id: &str,
+        req_hint: Option<&str>,
+        parent_msg_id: Option<&str>,
+        reply: PermissionReply,
+    ) -> Option<String> {
         let mut map = self.pending.lock().await;
-        if let Some(tx) = map.remove(conv_id) {
-            // send 失败说明 receiver 已 drop（register 方未在等），视为未命中。
-            tx.send(reply).is_ok()
-        } else {
-            false
+        let list = map.get_mut(conv_id)?;
+        let idx = match (req_hint, parent_msg_id) {
+            (Some(req), _) => list.iter().position(|p| p.request_id == req)?,
+            (None, Some(mid)) => list
+                .iter()
+                .position(|p| p.card_msg_id.as_deref() == Some(mid))?,
+            (None, None) => list.len().checked_sub(1)?,
+        };
+        let hit = list.remove(idx);
+        if list.is_empty() {
+            map.remove(conv_id);
+        }
+        // send 失败说明 receiver 已 drop（register 方未在等），视为未命中。
+        hit.tx.send(reply).ok().map(|_| hit.request_id)
+    }
+
+    /// 清理单个 pending（超时 / router-drop 路径）：投递 deny（fail-closed）唤醒
+    /// 等待者。send 失败 = receiver 已 drop（等待方先超时），无害。
+    pub async fn cancel(&self, conv_id: &str, request_id: &str) {
+        let mut map = self.pending.lock().await;
+        let Some(list) = map.get_mut(conv_id) else {
+            return;
+        };
+        if let Some(i) = list.iter().position(|p| p.request_id == request_id) {
+            let old = list.remove(i);
+            if list.is_empty() {
+                map.remove(conv_id);
+            }
+            drop(map);
+            let _ = old.tx.send(PermissionReply {
+                allow: false,
+                message: Some("cancelled（任务被 /stop 中断或审批超时）".into()),
+                raw_text: None,
+            });
         }
     }
 
-    /// 清理 pending（P1-8）：移除残留项，避免 map 累积。
-    /// P5-16：移除前先投递 deny（fail-closed）**唤醒等待者**——此前只删 map 项，
-    /// `handle_permission_socket` 里的 receiver 要挂满 permission_ask_timeout
-    /// （默认 300s）才超时返 deny，/stop 的「agent 侧不悬挂」承诺名不副实。
-    /// send 失败 = receiver 已 drop（等待方先超时），无害。
-    pub async fn cancel(&self, conv_id: &str) {
-        if let Some(tx) = self.pending.lock().await.remove(conv_id) {
-            let _ = tx.send(PermissionReply {
-                allow: false,
-                message: Some("cancelled（任务被 /stop 中断或审批超时）".into()),
-            });
-        }
+    /// 清理该 conv 的**全部** pending（/stop 路径）：逐个投递 deny 唤醒等待者，
+    /// 返回被清理的 request_id 列表（调用方据此收敛询问卡）。
+    pub async fn cancel_all(&self, conv_id: &str) -> Vec<String> {
+        let removed = self.pending.lock().await.remove(conv_id).unwrap_or_default();
+        removed
+            .into_iter()
+            .map(|p| {
+                let _ = p.tx.send(PermissionReply {
+                    allow: false,
+                    message: Some("cancelled（任务被 /stop 中断或审批超时）".into()),
+                    raw_text: None,
+                });
+                p.request_id
+            })
+            .collect()
     }
 }
 
@@ -152,9 +251,9 @@ mod tests {
     async fn cancel_removes_pending() {
         // P1-8：cancel 清理 pending，避免超时/router-drop 残留累积。
         let r = PermissionRouter::new();
-        let _rx = r.register("conv1").await;
+        let _rx = r.register("conv1", "req1", None).await;
         assert!(r.has_pending("conv1").await);
-        r.cancel("conv1").await;
+        r.cancel("conv1", "req1").await;
         assert!(!r.has_pending("conv1").await);
     }
 
@@ -163,8 +262,8 @@ mod tests {
     #[tokio::test]
     async fn cancel_waits_no_more_denies_waiter() {
         let r = PermissionRouter::new();
-        let rx = r.register("conv1").await;
-        r.cancel("conv1").await;
+        let rx = r.register("conv1", "req1", None).await;
+        r.cancel("conv1", "req1").await;
         // 等待者应立即（而非超时后）收到 deny。
         let reply = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
             .await
@@ -172,6 +271,106 @@ mod tests {
             .expect("sender 未 drop");
         assert!(!reply.allow, "cancel 必须 fail-closed deny");
         assert!(reply.message.unwrap().contains("cancelled"));
+    }
+
+    /// 多 pending 并存：同 conv 不同 request_id 互不顶替，按 req 精确路由。
+    #[tokio::test]
+    async fn multi_pending_routes_by_request_id() {
+        let r = PermissionRouter::new();
+        let rx_im = r.register("c", "im-1", None).await;
+        let rx_term = r.register("c", "t-1", None).await;
+        // 按钮/回调带 req=t-1 → 只唤醒终端一路。
+        let hit = r
+            .route(
+                "c",
+                Some("t-1"),
+                None,
+                PermissionReply {
+                    allow: false,
+                    message: None,
+                    raw_text: Some("用户选择：B".into()),
+                },
+            )
+            .await;
+        assert_eq!(hit.as_deref(), Some("t-1"));
+        let term = tokio::time::timeout(std::time::Duration::from_secs(1), rx_term)
+            .await
+            .expect("t-1 应被唤醒")
+            .unwrap();
+        assert_eq!(term.raw_text.as_deref(), Some("用户选择：B"));
+        // IM 那路仍在等待，且成为唯一 pending（后续兜底路由命中它）。
+        assert!(r.has_pending("c").await);
+        let hit2 = r
+            .route(
+                "c",
+                None,
+                None,
+                PermissionReply {
+                    allow: true,
+                    message: None,
+                    raw_text: Some("y".into()),
+                },
+            )
+            .await;
+        assert_eq!(hit2.as_deref(), Some("im-1"));
+        assert!(rx_im.await.unwrap().allow);
+        assert!(!r.has_pending("c").await);
+    }
+
+    /// 引用回复：parent 消息 id 命中对应询问卡（card_msg_id 锚点）。
+    #[tokio::test]
+    async fn parent_msg_id_routes_to_matching_card() {
+        let r = PermissionRouter::new();
+        let _old = r.register("c", "im-1", Some("om_old".to_string())).await;
+        let _rx_new = r.register("c", "t-1", Some("om_new".to_string())).await;
+        let hit = r
+            .route(
+                "c",
+                None,
+                Some("om_old"),
+                PermissionReply {
+                    allow: true,
+                    message: None,
+                    raw_text: Some("y".into()),
+                },
+            )
+            .await;
+        assert_eq!(hit.as_deref(), Some("im-1"), "引用旧卡应路由 im-1 而非最新");
+        assert!(r.has_pending("c").await, "t-1 不应被消费");
+    }
+
+    /// 同 request_id 重复注册：旧的被顶替（superseded deny），不占两个槽位。
+    #[tokio::test]
+    async fn reregister_same_request_id_supersedes() {
+        let r = PermissionRouter::new();
+        let rx_old = r.register("c", "req1", None).await;
+        let _rx_new = r.register("c", "req1", None).await;
+        let old = tokio::time::timeout(std::time::Duration::from_secs(1), rx_old)
+            .await
+            .expect("旧等待者应立即被唤醒")
+            .unwrap();
+        assert!(!old.allow);
+        assert!(old.message.unwrap().contains("superseded"));
+        // 只剩一个 pending（t-1 未被顶掉）。
+        assert!(r.has_pending("c").await);
+    }
+
+    /// /stop：cancel_all 清理全部并唤醒所有等待者。
+    #[tokio::test]
+    async fn cancel_all_wakes_every_waiter() {
+        let r = PermissionRouter::new();
+        let rx1 = r.register("c", "a", None).await;
+        let rx2 = r.register("c", "b", None).await;
+        let ids = r.cancel_all("c").await;
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+        for rx in [rx1, rx2] {
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+                .await
+                .expect("应立即唤醒")
+                .unwrap();
+            assert!(!reply.allow);
+        }
+        assert!(!r.has_pending("c").await);
     }
 
     #[test]
@@ -242,18 +441,21 @@ mod tests {
     async fn router_register_route_hit() {
         let r = PermissionRouter::new();
         assert!(!r.has_pending("c1").await);
-        let rx = r.register("c1").await;
+        let rx = r.register("c1", "req1", None).await;
         assert!(r.has_pending("c1").await);
         let hit = r
             .route(
                 "c1",
+                Some("req1"),
+                None,
                 PermissionReply {
                     allow: true,
                     message: None,
+                    raw_text: None,
                 },
             )
             .await;
-        assert!(hit);
+        assert!(hit.is_some());
         assert!(!r.has_pending("c1").await);
         let reply = rx.await.unwrap();
         assert!(reply.allow);
@@ -265,12 +467,15 @@ mod tests {
         let hit = r
             .route(
                 "c2",
+                None,
+                None,
                 PermissionReply {
                     allow: false,
                     message: None,
+                    raw_text: None,
                 },
             )
             .await;
-        assert!(!hit);
+        assert!(hit.is_none());
     }
 }

@@ -48,6 +48,13 @@ const FEISHU_TEXT_MAX: usize = 28_000;
 /// `tenant_access_token` 有效期 2h（7200s），距过期 < 10min（即 elapsed >= 110min）则刷新。
 const TOKEN_TTL: Duration = Duration::from_secs(110 * 60);
 
+/// 一张 pending 询问卡的登记项：conv + 消息 id + 工具名。
+struct PendingAskCard {
+    conv_id: String,
+    msg_id: String,
+    tool_name: String,
+}
+
 /// 飞书 Platform 适配器。
 ///
 /// 持有发消息所需的 core 配置 + 凭据 + token 缓存；收消息由后台 WS task 推入
@@ -65,9 +72,9 @@ pub struct FeishuPlatform {
     reconnect: Arc<tokio::sync::Notify>,
     /// 已解析的入站消息 channel，`recv` 直接 await。
     inbound_rx: Arc<Mutex<mpsc::Receiver<InboundMessage>>>,
-    /// P5-16：per-conv 最近一次审批询问卡的 `(message_id, tool_name)`
-    /// （`/stop` 撤回用）。仅记录卡片路径的成功发送；文本询问无句柄，撤回为 no-op。
-    pending_asks: Arc<Mutex<HashMap<String, (String, String)>>>,
+    /// pending 询问卡登记（多卡并存）：request_id → 卡片信息。
+    /// cancel/resolve 按 request_id 精确收敛；`cancel_all_permission_asks` 按 conv 遍历。
+    pending_asks: Arc<Mutex<HashMap<String, PendingAskCard>>>,
     /// P6-1：群消息 @bot 过滤策略（与 drain task 共享，`/config` 热切换）。
     mention_policy: Arc<RwLock<crate::proto::MentionPolicy>>,
 }
@@ -439,6 +446,41 @@ impl FeishuPlatform {
             }
         }
     }
+    /// 登记一张 pending 询问卡；同 request_id 的旧卡 patch 成 superseded
+    ///（异常重发场景，正常路径 request_id 唯一）。best-effort。
+    async fn record_pending_ask(
+        &self,
+        request_id: &str,
+        conv_id: &str,
+        msg_id: &str,
+        tool_name: &str,
+    ) {
+        let superseded = self
+            .pending_asks
+            .lock()
+            .await
+            .insert(
+                request_id.to_string(),
+                PendingAskCard {
+                    conv_id: conv_id.to_string(),
+                    msg_id: msg_id.to_string(),
+                    tool_name: tool_name.to_string(),
+                },
+            );
+        if let Some(old) = superseded {
+            let card_json = crate::card::render_permission_card_superseded(&old.tool_name);
+            if let Err(e) = self
+                .with_token(|t| {
+                    let old_mid = old.msg_id.clone();
+                    let card_json = card_json.clone();
+                    async move { patch_card(&self.core_config, &t, &old_mid, &card_json).await }
+                })
+                .await
+            {
+                warn!(target: "feishu", error = %e, "旧询问卡取代收敛失败（无害）");
+            }
+        }
+    }
 }
 
 /// 媒体目录：`<imagent_home>/media/`（0700；P4-10：随 profile 隔离）。
@@ -697,26 +739,31 @@ impl Platform for FeishuPlatform {
     }
 
     /// P4-4：审批询问走「按钮卡片」——点击后飞书推 card.action.trigger，
-    /// value 带回 conv + 动作，drain 解析成 text="y"/"n" 复用审批回复路由。
-    /// 卡片发送失败（无卡片权限等）降级纯文本（文本失败才向上报错 → dispatch 回 deny）。
-    /// P5-16：成功发出卡片时记录 message_id（`cancel_permission_ask` 撤回用）。
+    /// value 带回 conv + req（request_id）+ 动作，drain 解析成携带 ask_req 的
+    /// 入站消息复用审批回复路由。卡片发送失败（无卡片权限等）降级纯文本
+    /// （文本失败才向上报错 → dispatch 回 deny）。
+    /// 多 pending 并存：不同 request_id 的卡片互不顶替（终端 ask 与 IM 审批共存）；
+    /// 同 request_id 重复发送时旧卡 patch 成 superseded。
+    /// 返回卡片 message_id（core 作为引用回复路由锚点；文本路径 None）。
     async fn send_permission_ask(
         &self,
         conv: &ConvId,
+        request_id: &str,
         tool_name: &str,
         input_summary: &str,
         hint: &ReplyHint,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         // 评论线程无卡片语义，直接走文本（send_text 已路由 reply API）。
         if comment_target_from_conv(conv).is_some() {
             return self
                 .send_permission_ask_text(conv, tool_name, input_summary, hint)
-                .await;
+                .await
+                .map(|_| None);
         }
         // P6 遗留补齐：话题群——reply API 把审批卡发进原话题（与流式卡同路），
         // 失败降级文本（文本经 send_text 的线程分支也落回话题）。
         if let Some((_chat, root_id)) = thread_target_from_conv(conv) {
-            let card_json = render_permission_card(tool_name, input_summary, &conv.0);
+            let card_json = render_permission_card(tool_name, input_summary, &conv.0, request_id);
             return match self
                 .with_token(|t| {
                     let root_id = root_id.clone();
@@ -729,18 +776,17 @@ impl Platform for FeishuPlatform {
                 .await
             {
                 Ok(mid) => {
-                    if let Some(mid) = mid {
-                        self.pending_asks
-                            .lock()
-                            .await
-                            .insert(conv.0.clone(), (mid, tool_name.to_string()));
+                    if let Some(mid) = &mid {
+                        self.record_pending_ask(request_id, &conv.0, mid, tool_name)
+                            .await;
                     }
-                    Ok(())
+                    Ok(mid)
                 }
                 Err(e) => {
                     warn!(target: "feishu", error = %e, "话题内审批卡发送失败，降级纯文本询问");
                     self.send_permission_ask_text(conv, tool_name, input_summary, hint)
                         .await
+                        .map(|_| None)
                 }
             };
         }
@@ -749,10 +795,12 @@ impl Platform for FeishuPlatform {
         // P6（AskUserQuestion 透传）：agent 的问题渲染成「问题 + 选项按钮」卡，
         // 而非降级的 允许/拒绝 审批卡；解析失败降级普通审批卡。
         let card_json = if tool_name == "AskUserQuestion" {
-            crate::card::render_question_card(input_summary, &conv.0)
-                .unwrap_or_else(|| render_permission_card(tool_name, input_summary, &conv.0))
+            crate::card::render_question_card(input_summary, &conv.0, request_id)
+                .unwrap_or_else(|| {
+                    render_permission_card(tool_name, input_summary, &conv.0, request_id)
+                })
         } else {
-            render_permission_card(tool_name, input_summary, &conv.0)
+            render_permission_card(tool_name, input_summary, &conv.0, request_id)
         };
         match self
             .with_token(|t| {
@@ -765,47 +813,32 @@ impl Platform for FeishuPlatform {
             .await
         {
             Ok(mid) => {
-                if let Some(mid) = mid {
-                    // 真机校准：agent 并发多个 permission_request 时 register 会顶掉
-                    // 旧 pending（旧请求立即 deny）——旧卡同步 patch 成「已被取代」，
-                    // 不再滞留可点（用户看到一叠都能点但只有最新的有效）。
-                    let superseded = self
-                        .pending_asks
-                        .lock()
-                        .await
-                        .insert(conv.0.clone(), (mid, tool_name.to_string()));
-                    if let Some((old_mid, old_tool)) = superseded {
-                        let card_json = crate::card::render_permission_card_superseded(&old_tool);
-                        if let Err(e) = self
-                            .with_token(|t| {
-                                let old_mid = old_mid.clone();
-                                let card_json = card_json.clone();
-                                async move {
-                                    patch_card(&self.core_config, &t, &old_mid, &card_json).await
-                                }
-                            })
-                            .await
-                        {
-                            warn!(target: "feishu", error = %e, "旧询问卡取代收敛失败（无害）");
-                        }
-                    }
+                if let Some(mid) = &mid {
+                    self.record_pending_ask(request_id, &conv.0, mid, tool_name)
+                        .await;
                 }
-                Ok(())
+                Ok(mid)
             }
             Err(e) => {
                 warn!(target: "feishu", error = %e, "审批卡片发送失败，降级纯文本询问");
                 self.send_permission_ask_text(conv, tool_name, input_summary, hint)
                     .await
+                    .map(|_| None)
             }
         }
     }
 
-    /// P5-16：把该 conv 最近一次审批询问卡 patch 成「已中断」终态（移除按钮，
-    /// 防用户对已中断的任务做审批）。无记录（文本询问/未发过卡）时 no-op。
-    async fn cancel_permission_ask(&self, conv: &ConvId) -> Result<()> {
-        let Some((message_id, tool_name)) = self.pending_asks.lock().await.remove(&conv.0) else {
+    /// P5-16：把指定 request_id 的询问卡 patch 成「已中断」终态（移除按钮，
+    /// 防用户对已结束的询问继续操作）。无记录（文本询问/未发过卡）时 no-op。
+    async fn cancel_permission_ask(&self, _conv: &ConvId, request_id: &str) -> Result<()> {
+        let Some(card) = self.pending_asks.lock().await.remove(request_id) else {
             return Ok(());
         };
+        let PendingAskCard {
+            msg_id: message_id,
+            tool_name,
+            ..
+        } = card;
         let card_json = render_permission_card_cancelled(&tool_name);
         self.with_token(|t| {
             let message_id = message_id.clone();
@@ -815,21 +848,57 @@ impl Platform for FeishuPlatform {
         .await
     }
 
+    /// /stop：收敛该 conv 的**全部** pending 询问卡（多卡并存后按 conv 遍历）。
+    async fn cancel_all_permission_asks(&self, conv: &ConvId) -> Result<()> {
+        let mut all = self.pending_asks.lock().await;
+        let mut hits: Vec<(String, String)> = Vec::new();
+        all.retain(|_, card| {
+            if card.conv_id == conv.0 {
+                hits.push((card.msg_id.clone(), card.tool_name.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        drop(all);
+        for (message_id, tool_name) in hits {
+            let card_json = render_permission_card_cancelled(&tool_name);
+            if let Err(e) = self
+                .with_token(|t| {
+                    let message_id = message_id.clone();
+                    let card_json = card_json.clone();
+                    async move { patch_card(&self.core_config, &t, &message_id, &card_json).await }
+                })
+                .await
+            {
+                warn!(target: "feishu", error = %e, "询问卡收敛失败（不影响中断）");
+            }
+        }
+        Ok(())
+    }
+
     /// 真机校准 UX：决策已回（approve/deny）后把询问卡 patch 成「已批准/已拒绝」
     /// 终态——用户点击后立即有反馈，卡片不再保持可点。best-effort。
     /// P6：AskUserQuestion 的问题卡显示「已记录你的选择」（message 携带选项）。
     async fn resolve_permission_ask(
         &self,
-        conv: &ConvId,
+        _conv: &ConvId,
+        request_id: &str,
         reply: &imagent_core::PermissionReply,
     ) -> Result<()> {
-        let Some((message_id, tool_name)) = self.pending_asks.lock().await.remove(&conv.0) else {
+        let Some(card) = self.pending_asks.lock().await.remove(request_id) else {
             return Ok(());
         };
+        let PendingAskCard {
+            msg_id: message_id,
+            tool_name,
+            ..
+        } = card;
         let card_json = if tool_name == "AskUserQuestion" {
             let choice = reply
-                .message
+                .raw_text
                 .as_deref()
+                .or(reply.message.as_deref())
                 .unwrap_or("已收到")
                 .trim_start_matches("用户选择：");
             crate::card::render_question_card_resolved(choice)
