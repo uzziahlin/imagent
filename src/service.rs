@@ -46,6 +46,7 @@ fn unit_path(profile: Option<&str>) -> Result<PathBuf> {
 
 /// launchd plist 模板：注册当前二进制 + start + 可选 --profile；把安装进程持有的
 /// 凭据环境变量快照进服务（KeepAlive 崩溃自动拉起）。
+#[cfg(target_os = "macos")]
 fn render_plist(exe: &str, profile: Option<&str>, envs: &[(String, String)], log: &str) -> String {
     let mut args = format!("        <string>{exe}</string>\n        <string>start</string>");
     if let Some(p) = profile.filter(|p| !p.is_empty()) {
@@ -79,7 +80,7 @@ fn render_plist(exe: &str, profile: Option<&str>, envs: &[(String, String)], log
 }
 
 /// systemd 用户单元模板（ExecStart 同参数；日志 journalctl）。
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn render_unit(exe: &str, profile: Option<&str>, envs: &[(String, String)]) -> String {
     let mut exec = format!("{exe} start");
     if let Some(p) = profile.filter(|p| !p.is_empty()) {
@@ -136,10 +137,13 @@ pub fn install(profile: Option<&str>) -> Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     let envs = capture_envs();
-    let state_root = imagent_core::paths::imagent_home();
-    let log_dir = state_root.join("logs");
-    std::fs::create_dir_all(&log_dir)?;
-    let log = log_dir.join("daemon.log").to_string_lossy().into_owned();
+    // 日志路径仅 launchd 用（systemd 走 journal）——随平台门控，防 Linux 下未用告警。
+    #[cfg(target_os = "macos")]
+    let log = {
+        let log_dir = imagent_core::paths::imagent_home().join("logs");
+        std::fs::create_dir_all(&log_dir)?;
+        log_dir.join("daemon.log").to_string_lossy().into_owned()
+    };
 
     #[cfg(target_os = "macos")]
     {
@@ -170,7 +174,7 @@ pub fn install(profile: Option<&str>) -> Result<()> {
     }
     #[cfg(not(unix))]
     {
-        let _ = (exe, envs, log);
+        let _ = (exe, envs);
         return Err(anyhow!("仅支持 macOS / Linux"));
     }
     Ok(())
