@@ -621,10 +621,29 @@ impl Platform for FeishuPlatform {
         {
             Ok(mid) => {
                 if let Some(mid) = mid {
-                    self.pending_asks
+                    // 真机校准：agent 并发多个 permission_request 时 register 会顶掉
+                    // 旧 pending（旧请求立即 deny）——旧卡同步 patch 成「已被取代」，
+                    // 不再滞留可点（用户看到一叠都能点但只有最新的有效）。
+                    let superseded = self
+                        .pending_asks
                         .lock()
                         .await
                         .insert(conv.0.clone(), (mid, tool_name.to_string()));
+                    if let Some((old_mid, old_tool)) = superseded {
+                        let card_json = crate::card::render_permission_card_superseded(&old_tool);
+                        if let Err(e) = self
+                            .with_token(|t| {
+                                let old_mid = old_mid.clone();
+                                let card_json = card_json.clone();
+                                async move {
+                                    patch_card(&self.core_config, &t, &old_mid, &card_json).await
+                                }
+                            })
+                            .await
+                        {
+                            warn!(target: "feishu", error = %e, "旧询问卡取代收敛失败（无害）");
+                        }
+                    }
                 }
                 Ok(())
             }
