@@ -146,7 +146,13 @@ pub struct CardActionBody {
 
 #[derive(Debug, Deserialize)]
 pub struct CardOperator {
-    pub operator_id: CardOperatorId,
+    /// 旧信封：operator_id 嵌套。
+    #[serde(default)]
+    pub operator_id: Option<CardOperatorId>,
+    /// 真机校准（2026-08）：新回调信封把 open_id 平铺在 operator 上
+    /// （`operator.open_id`），不再经 operator_id 嵌套。两形态兼容。
+    #[serde(default)]
+    pub open_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,7 +171,9 @@ pub fn parse_card_action_event(payload: &[u8]) -> Option<(String, InboundMessage
     if evt.header.event_type != "card.action.trigger" {
         return None;
     }
-    let value = evt.event.action.get("value")?;
+    // 真机校准：新信封 action 平铺（value 直接是 action 的字段），旧信封嵌套在
+    // action.value 下——两形态都认。
+    let value = evt.event.action.get("value").unwrap_or(&evt.event.action);
     let act = value.get("imagent_perm")?.as_str()?;
     let conv = value.get("conv")?.as_str()?;
     let text = match act {
@@ -176,8 +184,15 @@ pub fn parse_card_action_event(payload: &[u8]) -> Option<(String, InboundMessage
     let open_id = evt
         .event
         .operator
-        .operator_id
         .open_id
+        .clone()
+        .or_else(|| {
+            evt.event
+                .operator
+                .operator_id
+                .as_ref()
+                .and_then(|o| o.open_id.clone())
+        })
         .filter(|s| !s.is_empty())?;
     let key = evt
         .header
@@ -826,6 +841,29 @@ mod tests {
         assert_eq!(msg.text.as_deref(), Some("y"));
         let (_, msg) = parse_card_action_event(&mk("deny")).expect("deny 应回调");
         assert_eq!(msg.text.as_deref(), Some("n"));
+    }
+
+    /// 真机校准（2026-08）：新版回调信封 operator.open_id 平铺（不再嵌套
+    /// operator_id）。按线上真实 payload 形态构造。
+    #[test]
+    fn parse_card_action_flat_operator_envelope() {
+        let payload = serde_json::json!({
+            "schema": "2.0",
+            "header": {"event_id": "evt_flat_1", "event_type": "card.action.trigger",
+                        "token": "t", "create_time": "1787363803096225",
+                        "tenant_key": "tk", "app_id": "cli_x"},
+            "event": {
+                "operator": {"tenant_key": "tk", "open_id": "ou_real", "union_id": "on_x"},
+                "action": {"tag": "button", "value": {"imagent_perm": "allow", "conv": "feishu:ou_real"}}
+            }
+        })
+        .to_string()
+        .into_bytes();
+        let (key, msg) = parse_card_action_event(&payload).expect("平铺 operator 应可解析");
+        assert_eq!(key, "evt_flat_1");
+        assert_eq!(msg.sender.0, "ou_real");
+        assert_eq!(msg.conv_id.0, "feishu:ou_real");
+        assert_eq!(msg.text.as_deref(), Some("y"));
     }
 
     #[test]

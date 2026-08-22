@@ -156,23 +156,23 @@ pub fn render_permission_card(tool_name: &str, input_summary: &str, conv_id: &st
         "schema": "2.0",
         "body": { "elements": [
             { "tag": "markdown", "content": format!("🔐 请求执行 `{tool_name}`：{input_summary}") },
-            { "tag": "action", "actions": [
-                {
-                    "tag": "button",
-                    "text": { "tag": "plain_text", "content": "✅ 允许" },
-                    "type": "primary",
-                    "behaviors": [{ "type": "callback", "value": {
+            { "tag": "column_set", "columns": [
+                { "tag": "column", "width": "weighted", "weight": 1,
+                  "elements": [
+                    { "tag": "button", "text": { "tag": "plain_text", "content": "✅ 允许" },
+                      "type": "primary",
+                      "behaviors": [{ "type": "callback", "value": {
                         "imagent_perm": "allow", "conv": conv_id
-                    } }]
-                },
-                {
-                    "tag": "button",
-                    "text": { "tag": "plain_text", "content": "⛔ 拒绝" },
-                    "type": "danger",
-                    "behaviors": [{ "type": "callback", "value": {
+                      } }] }
+                  ] },
+                { "tag": "column", "width": "weighted", "weight": 1,
+                  "elements": [
+                    { "tag": "button", "text": { "tag": "plain_text", "content": "⛔ 拒绝" },
+                      "type": "danger",
+                      "behaviors": [{ "type": "callback", "value": {
                         "imagent_perm": "deny", "conv": conv_id
-                    } }]
-                }
+                      } }] }
+                  ] }
             ]}
         ]}
     })
@@ -186,6 +186,20 @@ pub fn render_permission_card_cancelled(tool_name: &str) -> String {
         "schema": "2.0",
         "body": { "elements": [
             { "tag": "markdown", "content": format!("⏹️ `{tool_name}` 的执行询问已随任务中断，无需处理。") }
+        ]}
+    })
+    .to_string()
+}
+
+/// 审批询问的「已处理」终态卡（真机校准 2026-08 UX：用户点按钮后卡片立即收敛，
+/// 而非保持可点的询问态直到任务结束才见反馈）。
+pub fn render_permission_card_resolved(tool_name: &str, allowed: bool) -> String {
+    let mark = if allowed { "✅" } else { "⛔" };
+    let verb = if allowed { "已批准" } else { "已拒绝" };
+    serde_json::json!({
+        "schema": "2.0",
+        "body": { "elements": [
+            { "tag": "markdown", "content": format!("{mark} `{tool_name}` 的执行询问{verb}，任务继续处理中。") }
         ]}
     })
     .to_string()
@@ -254,6 +268,15 @@ mod tests {
         );
         assert!(json.contains("feishu:ou_u1"), "conv 应编码进 value: {json}");
         assert!(json.contains("\"tag\":\"button\""), "按钮 tag: {json}");
+        // 真机校准（2026-08）：V2 已废弃 action 元素——按钮必须在 column_set 内。
+        assert!(
+            json.contains("\"tag\":\"column_set\""),
+            "V2 按钮须挂 column_set: {json}"
+        );
+        assert!(
+            !json.contains("\"tag\":\"action\""),
+            "V2 卡片不应再含 action 元素: {json}"
+        );
         assert!(json.contains("Bash"), "工具名: {json}");
     }
 

@@ -322,7 +322,13 @@ pub async fn patch_card_element(
                 "{CARDKIT_BASE}/cards/{card_id}/elements/{element_id}"
             ))
             .bearer_auth(token)
-            .json(&json!({ "content": content, "sequence": sequence }))
+            // 真机校准（2026-08）：请求体须为 `partial_element`——组件新配置的
+            // JSON 字符串（双重编码，同 create 实体的 card_json）；直传 `content`
+            // 字段被 99992402 "field validation failed" 拒绝。
+            .json(&json!({
+                "partial_element": json!({ "content": content }).to_string(),
+                "sequence": sequence
+            }))
             .send()
             .await
             .map_err(|e| {
@@ -371,7 +377,7 @@ pub async fn send_card_ref_msg(
         let body = CreateMessageBody {
             receive_id: receive_id.to_string(),
             msg_type: "interactive".to_string(),
-            content: json!({ "type": "card_id", "data": { "card_id": card_id } }).to_string(),
+            content: json!({ "type": "card", "data": { "card_id": card_id } }).to_string(),
             uuid: None,
         };
         let id_type = match kind {

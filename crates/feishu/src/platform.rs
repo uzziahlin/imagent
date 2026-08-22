@@ -273,7 +273,12 @@ impl FeishuPlatform {
                     }
                     continue;
                 }
-                warn!(target: "feishu", "无法解析/非目标事件，丢弃");
+                // 真机排障：无法解析的 payload 头部（截断）记 debug，定位事件结构差异。
+                let head: String = String::from_utf8_lossy(&payload)
+                    .chars()
+                    .take(400)
+                    .collect();
+                warn!(target: "feishu", payload_head = %head, "无法解析/非目标事件，丢弃");
             }
         });
 
@@ -572,6 +577,21 @@ impl Platform for FeishuPlatform {
             return Ok(());
         };
         let card_json = render_permission_card_cancelled(&tool_name);
+        self.with_token(|t| {
+            let message_id = message_id.clone();
+            let card_json = card_json.clone();
+            async move { patch_card(&self.core_config, &t, &message_id, &card_json).await }
+        })
+        .await
+    }
+
+    /// 真机校准 UX：决策已回（approve/deny）后把询问卡 patch 成「已批准/已拒绝」
+    /// 终态——用户点击后立即有反馈，卡片不再保持可点。best-effort。
+    async fn resolve_permission_ask(&self, conv: &ConvId, allowed: bool) -> Result<()> {
+        let Some((message_id, tool_name)) = self.pending_asks.lock().await.remove(&conv.0) else {
+            return Ok(());
+        };
+        let card_json = crate::card::render_permission_card_resolved(&tool_name, allowed);
         self.with_token(|t| {
             let message_id = message_id.clone();
             let card_json = card_json.clone();
