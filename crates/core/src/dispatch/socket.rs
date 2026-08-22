@@ -361,6 +361,14 @@ impl Dispatcher {
                 return;
             }
         };
+        info!(
+            target: "imagent::core",
+            conv_id = %conv.0,
+            request_id = %request_id,
+            timeout_secs,
+            card_msg_id = card_msg_id.as_deref().unwrap_or("<text>"),
+            "ask_via_im 询问已送达，等待回复"
+        );
         let rx = router.register(&conv.0, &request_id, card_msg_id).await;
         let reply = match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(r)) => r,
