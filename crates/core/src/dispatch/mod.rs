@@ -431,13 +431,14 @@ impl Dispatcher {
                             && self.can_route_permission_reply(&msg)
                         {
                             let reply = parse_reply(text);
-                            let allowed = reply.allow;
+                            let reply_for_card = reply.clone();
                             if self.router.route(&conv_id, reply).await {
                                 // 真机校准 UX：决策已达 MCP，立即把询问卡收敛成
-                                // 「已批准/已拒绝」终态（best-effort，无卡 no-op）。
+                                // 「已批准/已拒绝」终态（best-effort，无卡 no-op）；
+                                // 问题卡（P6）显示「已记录你的选择：<选项>」。
                                 if let Err(e) = self
                                     .platform
-                                    .resolve_permission_ask(&msg.conv_id, allowed)
+                                    .resolve_permission_ask(&msg.conv_id, &reply_for_card)
                                     .await
                                 {
                                     tracing::warn!(

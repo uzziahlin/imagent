@@ -41,6 +41,18 @@ pub fn parse_reply(text: &str) -> PermissionReply {
             message: Some("empty reply".into()),
         };
     }
+    // P6（AskUserQuestion 答案路由）：问题卡的选项按钮回调转成 "ask:<选项>"。
+    // 语义 = 不执行内建工具（headless 下它没有交互面），选择经 message 回给
+    // agent —— deny + message 是权限协议里 agent 能读到用户输入的唯一通道。
+    if let Some(choice) = t.strip_prefix("ask:") {
+        let choice = choice.trim();
+        if !choice.is_empty() {
+            return PermissionReply {
+                allow: false,
+                message: Some(format!("用户选择：{choice}")),
+            };
+        }
+    }
     let lower = t.to_ascii_lowercase();
     // P2-G：去掉「首字符 y/Y」宽匹配（旧逻辑会把 year/yeah/yellow/yesterday 等
     // 误判为 allow，对权限 approve/deny 是真实安全 bug）。改为精确匹配常见 allow 词。
@@ -191,6 +203,17 @@ mod tests {
     }
 
     #[test]
+    /// P6：ask: 前缀 = 问题卡选项答案 → deny + message（agent 经 message 读到选择）。
+    #[test]
+    fn parse_reply_ask_prefix_carries_choice() {
+        let r = parse_reply("ask:先做数据库迁移");
+        assert!(!r.allow);
+        assert_eq!(r.message.as_deref(), Some("用户选择：先做数据库迁移"));
+        // 空 ask: 不当答案（回落正常 deny 路径）。
+        let r2 = parse_reply("ask:");
+        assert!(r2.message.is_none() || r2.message.as_deref() != Some("用户选择："));
+    }
+
     fn parse_reply_deny_variants() {
         for s in ["", "   ", "n", "N", "no", "不", "拒绝", "随便", "rm -rf /"] {
             let r = parse_reply(s);

@@ -95,8 +95,13 @@ pub trait Platform: Send + Sync {
 
     /// 真机校准（2026-08 UX）：用户已对询问做出 approve/deny 决策后，把询问卡
     /// patch 成「已批准/已拒绝」终态——否则卡片保持可点、且用户在任务完成前
-    /// 得不到任何点击反馈。默认 no-op（无卡片句柄的平台）。
-    async fn resolve_permission_ask(&self, _conv: &ConvId, _allowed: bool) -> Result<()> {
+    /// 得不到任何点击反馈。reply 携带 message（P6：AskUserQuestion 的用户选择），
+    /// 问题卡据此显示「已记录你的选择」。默认 no-op（无卡片句柄的平台）。
+    async fn resolve_permission_ask(
+        &self,
+        _conv: &ConvId,
+        _reply: &crate::permission::PermissionReply,
+    ) -> Result<()> {
         Ok(())
     }
 }

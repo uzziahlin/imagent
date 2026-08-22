@@ -191,6 +191,87 @@ pub fn render_permission_card_cancelled(tool_name: &str) -> String {
     .to_string()
 }
 
+/// agent 问题卡（P6：AskUserQuestion 透传）：问题正文 + 选项按钮。
+///
+/// 输入是 AskUserQuestion 工具的 input JSON（`questions[0].question/options`），
+/// 解析失败返回 None（调用方降级普通审批卡）。选项按钮 value 编码
+/// `imagent_ask`（选项文本）+ conv，回调转成 `ask:<选项>` 走审批回复路由。
+pub fn render_question_card(tool_input: &str, conv_id: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(tool_input).ok()?;
+    let q = v.pointer("/questions/0")?;
+    let question = q.get("question")?.as_str()?.trim().to_string();
+    let opts = q
+        .get("options")?
+        .as_array()?
+        .iter()
+        .filter_map(|o| o.get("label")?.as_str().map(String::from))
+        .collect::<Vec<_>>();
+    if question.is_empty() || opts.is_empty() {
+        return None;
+    }
+    let multi = v
+        .pointer("/questions/0/multiSelect")
+        .and_then(|m| m.as_bool())
+        .unwrap_or(false);
+    let n_questions = v
+        .pointer("/questions")
+        .and_then(|q| q.as_array())
+        .map(|a| a.len())
+        .unwrap_or(1);
+    let mut extra = String::new();
+    if n_questions > 1 {
+        extra.push_str(&format!("\n（本次共 {n_questions} 个问题，先答第一个）"));
+    }
+    if multi {
+        extra.push_str("\n（多选：依次点击多个选项）");
+    }
+    // 每选项一列；超 4 个截断（卡片宽度），剩余以文字列出。
+    let shown: Vec<&String> = opts.iter().take(4).collect();
+    let mut columns = Vec::new();
+    for (i, label) in shown.iter().enumerate() {
+        columns.push(serde_json::json!({
+            "tag": "column", "width": "weighted", "weight": 1,
+            "elements": [{
+                "tag": "button",
+                "text": { "tag": "plain_text", "content": format!("{}. {}", i + 1, label) },
+                "type": "primary",
+                "behaviors": [{ "type": "callback", "value": {
+                    "imagent_ask": label, "conv": conv_id
+                } }]
+            }]
+        }));
+    }
+    let mut content = format!("❓ {question}{extra}");
+    if opts.len() > 4 {
+        let rest: Vec<&str> = opts.iter().skip(4).map(|s| s.as_str()).collect();
+        content.push_str(&format!(
+            "\n其余选项（回复 `ask:选项`）：{}",
+            rest.join(" / ")
+        ));
+    }
+    Some(
+        serde_json::json!({
+            "schema": "2.0",
+            "body": { "elements": [
+                { "tag": "markdown", "content": content },
+                { "tag": "column_set", "columns": columns }
+            ]}
+        })
+        .to_string(),
+    )
+}
+
+/// 问题卡的「已记录选择」终态（区别于审批卡的已批准/已拒绝）。
+pub fn render_question_card_resolved(choice: &str) -> String {
+    serde_json::json!({
+        "schema": "2.0",
+        "body": { "elements": [
+            { "tag": "markdown", "content": format!("✅ 已记录你的选择：{choice}。任务继续处理中。") }
+        ]}
+    })
+    .to_string()
+}
+
 /// 审批询问的「已处理」终态卡（真机校准 2026-08 UX：用户点按钮后卡片立即收敛，
 /// 而非保持可点的询问态直到任务结束才见反馈）。
 pub fn render_permission_card_resolved(tool_name: &str, allowed: bool) -> String {
@@ -253,6 +334,35 @@ mod tests {
             terminal: CardTerminal::Error("boom".into()),
         };
         assert!(render_card(&card).contains("boom"));
+    }
+
+    #[test]
+    /// P6：AskUserQuestion 输入 → 问题卡（选项按钮 + imagent_ask value）。
+    #[test]
+    fn render_question_card_options_and_fallback() {
+        let input = serde_json::json!({
+            "questions": [{
+                "question": "先做哪一步？",
+                "options": [
+                    {"label": "数据库迁移"},
+                    {"label": "接口改造"},
+                    {"label": "直接上线"}
+                ]
+            }]
+        })
+        .to_string();
+        let json = render_question_card(&input, "feishu:ou_q").expect("应可渲染");
+        assert!(json.contains("先做哪一步？"), "问题正文: {json}");
+        assert!(json.contains("数据库迁移"), "选项文本: {json}");
+        assert!(
+            json.contains("\"imagent_ask\":\"数据库迁移\""),
+            "选项 value: {json}"
+        );
+        assert!(json.contains("feishu:ou_q"), "conv 编码: {json}");
+        assert!(!json.contains("\"tag\":\"action\""), "V2 无 action: {json}");
+        // 非法 JSON / 缺 options → None（降级审批卡）。
+        assert!(render_question_card("not json", "c").is_none());
+        assert!(render_question_card("{}", "c").is_none());
     }
 
     #[test]
