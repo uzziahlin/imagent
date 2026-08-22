@@ -291,6 +291,53 @@ impl WeComWsClient {
     }
 }
 
+/// 凭据连通性探针（P6 遗留补齐，`imagent setup` 用）：建连 → 发 `aibot_subscribe`
+/// → 等 ack（errcode==0 即凭据有效）→ 直接返回，连接随 drop 关闭。
+/// 企微无独立 HTTP token 探针接口，WS subscribe ack 是唯一的凭据校验面——
+/// bot_id/secret 配错或被吊销时 errcode≠0，超时/断开按失败处理。
+pub async fn probe_credentials(
+    bot_id: &str,
+    secret: &str,
+    ws_url: &str,
+) -> imagent_core::Result<()> {
+    let sub = build_subscribe_frame(bot_id, secret);
+    let sub_json = frame_to_string(&sub).map_err(|e| {
+        imagent_core::CoreError::Platform("wecom", format!("serialize subscribe: {e}"))
+    })?;
+    let (mut ws, _resp) = connect_async(ws_url)
+        .await
+        .map_err(|e| imagent_core::CoreError::Platform("wecom", format!("ws connect: {e}")))?;
+    ws.send(Message::text(sub_json))
+        .await
+        .map_err(|e| imagent_core::CoreError::Platform("wecom", format!("send subscribe: {e}")))?;
+    match tokio::time::timeout(SUBSCRIBE_ACK_TIMEOUT, ws.next()).await {
+        Ok(Some(Ok(msg))) => {
+            let text = msg
+                .into_text()
+                .map_err(|e| imagent_core::CoreError::Platform("wecom", format!("ack 帧: {e}")))?;
+            let frame = parse_frame(&text).map_err(|e| {
+                imagent_core::CoreError::Platform("wecom", format!("ack 解析: {e}"))
+            })?;
+            if frame.errcode.unwrap_or(-1) == 0 {
+                Ok(())
+            } else {
+                Err(imagent_core::CoreError::Platform(
+                    "wecom",
+                    format!(
+                        "凭据校验失败 errcode={} errmsg={:?}——请检查 bot_id/secret 是否正确/被吊销/已轮换",
+                        frame.errcode.unwrap_or(-1),
+                        frame.errmsg.unwrap_or_default()
+                    ),
+                ))
+            }
+        }
+        _ => Err(imagent_core::CoreError::Platform(
+            "wecom",
+            "未收到 subscribe ack（超时/连接断开）".into(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! 纯逻辑/退避计算测试。真实 WS 连接需真机 bot_id/secret，不进默认 cargo test。
@@ -333,5 +380,12 @@ mod tests {
         .await;
         // run 永不返回 → timeout 触发（Err(Elapsed)）= 正常。
         assert!(res.is_err(), "run 应持续重连而非返回");
+    }
+
+    /// P6 遗留补齐：凭据探针——连不上的地址应返回 Err（而非挂起/panic）。
+    #[tokio::test]
+    async fn probe_credentials_fails_fast_on_unreachable() {
+        let res = probe_credentials("b", "s", "ws://127.0.0.1:1").await;
+        assert!(res.is_err(), "不可达地址应 Err：{res:?}");
     }
 }

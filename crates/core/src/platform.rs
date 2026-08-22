@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 
 use crate::error::Result;
-use crate::types::{ConvId, InboundMessage, MediaRef, OutboundCard, ReplyHint};
+use crate::types::{CardButton, ConvId, InboundMessage, MediaRef, OutboundCard, ReplyHint};
 
 /// IM 平台抽象。由 `ilink` / `wecom` 等适配器实现，注入到 `Dispatcher`。
 #[async_trait]
@@ -92,4 +92,63 @@ pub trait Platform: Send + Sync {
     async fn cancel_permission_ask(&self, _conv: &ConvId) -> Result<()> {
         Ok(())
     }
+
+    /// 真机校准（2026-08 UX）：用户已对询问做出 approve/deny 决策后，把询问卡
+    /// patch 成「已批准/已拒绝」终态——否则卡片保持可点、且用户在任务完成前
+    /// 得不到任何点击反馈。默认 no-op（无卡片句柄的平台）。
+    async fn resolve_permission_ask(&self, _conv: &ConvId, _allowed: bool) -> Result<()> {
+        Ok(())
+    }
+
+    /// 发命令交互卡片（P6-3）：markdown 正文 + 按钮组。按钮点击由平台侧转成
+    /// `text = <command>` 的 InboundMessage（走与手打命令相同的鉴权/分派）。
+    /// 默认降级纯文本：title + body + 可手打的命令清单（无按钮能力的平台无需感知）。
+    async fn send_command_card(
+        &self,
+        conv: &ConvId,
+        title: &str,
+        body_md: &str,
+        buttons: &[CardButton],
+        hint: &ReplyHint,
+    ) -> Result<()> {
+        self.send_text(
+            conv,
+            &command_card_fallback_text(title, body_md, buttons),
+            hint,
+        )
+        .await
+    }
+
+    /// P6 遗留补齐：查询「群消息须 @bot」当前策略（`/config` 展示用）。
+    /// 默认 None（平台无群聊 @ 概念或未实现——ilink 无群、wecom 群消息不收）。
+    async fn require_mention_in_group(&self) -> Option<bool> {
+        None
+    }
+
+    /// P6 遗留补齐：热切换「群消息须 @bot」（`/config require_mention on|off`，
+    /// 对下一消息生效；进程内不落盘，重启回 config 值）。默认 Err（不支持）。
+    async fn set_require_mention_in_group(&self, _on: bool) -> Result<()> {
+        Err(crate::error::CoreError::Platform(
+            self.name(),
+            "该平台不支持 require_mention（无群聊 @ 语义）".into(),
+        ))
+    }
+}
+
+/// 命令卡片的纯文本降级形态（默认 trait 实现与 dispatch 层失败降级共用）：
+/// 标题 + 正文 + 「可手打命令」提示（按钮不可用时保底可用性）。
+pub fn command_card_fallback_text(title: &str, body_md: &str, buttons: &[CardButton]) -> String {
+    let mut text = if title.trim().is_empty() {
+        body_md.to_string()
+    } else {
+        format!("{title}\n{body_md}")
+    };
+    if !buttons.is_empty() {
+        let cmds: Vec<&str> = buttons.iter().map(|b| b.command.as_str()).collect();
+        text.push_str(&format!(
+            "\n（本会话不支持按钮，可直接发送：{}）",
+            cmds.join("、")
+        ));
+    }
+    text
 }

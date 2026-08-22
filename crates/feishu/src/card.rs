@@ -1,6 +1,6 @@
 //! 飞书交互卡片渲染：把平台无关的 [`OutboundCard`] 渲染成飞书 CardKit 2.0 JSON。
 
-use imagent_core::{CardTerminal, OutboundCard};
+use imagent_core::{CardButton, CardTerminal, OutboundCard};
 
 /// 渲染 [`OutboundCard`] 为飞书 interactive 卡片的 content JSON 字符串
 /// （配合 `msg_type = "interactive"` 发送 / patch）。
@@ -151,28 +151,32 @@ fn render_error_card(err: &str) -> String {
 /// 按钮 `behaviors` 走 callback：点击后飞书推 `card.action.trigger` 事件，value 原样
 /// 带回（我们编码 conv + 动作），proto 侧解析成 `text="y"/"n"` 的入站消息复用审批
 /// 回复路由。`conv` 必须编码进 value——回调事件本身不含目标会话。
+///
+/// 真机校准（2026-08）：schema V2 卡片已**废弃 `action` 元素**（200861 "cards of
+/// schema V2 no longer support this capability; unsupported tag action"）。按钮迁到
+/// `column_set` → `column` → `button`（button 组件本身 + behaviors 保留），两列等宽。
 pub fn render_permission_card(tool_name: &str, input_summary: &str, conv_id: &str) -> String {
     serde_json::json!({
         "schema": "2.0",
         "body": { "elements": [
             { "tag": "markdown", "content": format!("🔐 请求执行 `{tool_name}`：{input_summary}") },
-            { "tag": "action", "actions": [
-                {
-                    "tag": "button",
-                    "text": { "tag": "plain_text", "content": "✅ 允许" },
-                    "type": "primary",
-                    "behaviors": [{ "type": "callback", "value": {
+            { "tag": "column_set", "columns": [
+                { "tag": "column", "width": "weighted", "weight": 1,
+                  "elements": [
+                    { "tag": "button", "text": { "tag": "plain_text", "content": "✅ 允许" },
+                      "type": "primary",
+                      "behaviors": [{ "type": "callback", "value": {
                         "imagent_perm": "allow", "conv": conv_id
-                    } }]
-                },
-                {
-                    "tag": "button",
-                    "text": { "tag": "plain_text", "content": "⛔ 拒绝" },
-                    "type": "danger",
-                    "behaviors": [{ "type": "callback", "value": {
+                      } }] }
+                  ] },
+                { "tag": "column", "width": "weighted", "weight": 1,
+                  "elements": [
+                    { "tag": "button", "text": { "tag": "plain_text", "content": "⛔ 拒绝" },
+                      "type": "danger",
+                      "behaviors": [{ "type": "callback", "value": {
                         "imagent_perm": "deny", "conv": conv_id
-                    } }]
-                }
+                      } }] }
+                  ] }
             ]}
         ]}
     })
@@ -187,6 +191,65 @@ pub fn render_permission_card_cancelled(tool_name: &str) -> String {
         "body": { "elements": [
             { "tag": "markdown", "content": format!("⏹️ `{tool_name}` 的执行询问已随任务中断，无需处理。") }
         ]}
+    })
+    .to_string()
+}
+
+/// 审批询问的「已处理」终态卡（真机校准 2026-08 UX：用户点按钮后卡片立即收敛，
+/// 而非保持可点的询问态直到任务结束才见反馈）。
+pub fn render_permission_card_resolved(tool_name: &str, allowed: bool) -> String {
+    let mark = if allowed { "✅" } else { "⛔" };
+    let verb = if allowed { "已批准" } else { "已拒绝" };
+    serde_json::json!({
+        "schema": "2.0",
+        "body": { "elements": [
+            { "tag": "markdown", "content": format!("{mark} `{tool_name}` 的执行询问{verb}，任务继续处理中。") }
+        ]}
+    })
+    .to_string()
+}
+
+/// 命令交互卡片（P6-3）：markdown 正文 + 按钮组（点击 = 注入 `imagent_cmd` 命令，
+/// 走与手打命令相同的鉴权/分派路径）。
+///
+/// 按钮挂 `column_set`（V2 已废弃 `action` 元素，同审批卡），每行至多 3 列防挤压；
+/// 超出换行。`conv` 编码进 value——`card.action.trigger` 回调不含目标会话。
+pub fn render_command_card(
+    title: &str,
+    body_md: &str,
+    buttons: &[CardButton],
+    conv_id: &str,
+) -> String {
+    let mut content = String::new();
+    if !title.trim().is_empty() {
+        content.push_str(&format!("**{title}**\n\n"));
+    }
+    content.push_str(body_md);
+    let mut elements = vec![serde_json::json!({ "tag": "markdown", "content": content })];
+    // 每行 3 个按钮，多余换行（列等宽 weighted）。
+    for chunk in buttons.chunks(3) {
+        let columns: Vec<serde_json::Value> = chunk
+            .iter()
+            .map(|b| {
+                serde_json::json!({
+                    "tag": "column", "width": "weighted", "weight": 1,
+                    "elements": [{
+                        "tag": "button",
+                        "text": { "tag": "plain_text", "content": b.label },
+                        "behaviors": [{ "type": "callback", "value": {
+                            "imagent_cmd": b.command, "conv": conv_id
+                        } }]
+                    }]
+                })
+            })
+            .collect();
+        elements.push(serde_json::json!({
+            "tag": "column_set", "columns": columns
+        }));
+    }
+    serde_json::json!({
+        "schema": "2.0",
+        "body": { "elements": elements }
     })
     .to_string()
 }
@@ -241,6 +304,59 @@ mod tests {
         assert!(render_card(&card).contains("boom"));
     }
 
+    /// P6-3：命令卡片——标题/正文 + 按钮（column_set 挂载、value 编码命令与 conv、
+    /// 超过 3 个换行）。
+    #[test]
+    fn render_command_card_buttons_and_layout() {
+        let buttons = vec![
+            CardButton {
+                label: "使用 main".into(),
+                command: "/ws use main".into(),
+            },
+            CardButton {
+                label: "使用 web".into(),
+                command: "/ws use web".into(),
+            },
+            CardButton {
+                label: "使用 cli".into(),
+                command: "/ws use cli".into(),
+            },
+            CardButton {
+                label: "接管 1".into(),
+                command: "/resume 1".into(),
+            },
+        ];
+        let json = render_command_card("📁 工作空间", "- main：/a/b", &buttons, "feishu:oc_g");
+        assert!(json.contains("📁 工作空间"), "标题: {json}");
+        assert!(json.contains("- main：/a/b"), "正文: {json}");
+        assert!(
+            json.contains("\"imagent_cmd\":\"/ws use main\""),
+            "命令编码: {json}"
+        );
+        assert!(
+            json.contains("\"conv\":\"feishu:oc_g\""),
+            "conv 编码: {json}"
+        );
+        assert!(
+            json.contains("\"tag\":\"column_set\""),
+            "V2 按钮须挂 column_set: {json}"
+        );
+        assert!(
+            !json.contains("\"tag\":\"action\""),
+            "V2 已废弃 action 元素: {json}"
+        );
+        // 4 个按钮 → 2 个 column_set（每行 3 个）。
+        assert_eq!(
+            json.matches("\"tag\":\"column_set\"").count(),
+            2,
+            "超过 3 个按钮应换行: {json}"
+        );
+        // 空按钮：纯 markdown 卡，无 column_set。
+        let no_btn = render_command_card("t", "body", &[], "feishu:oc_g");
+        assert!(!no_btn.contains("column_set"));
+        assert!(no_btn.contains("body"));
+    }
+
     #[test]
     fn render_permission_card_buttons_and_conv() {
         let json = render_permission_card("Bash", r#"{"cmd":"rm -rf …"}"#, "feishu:ou_u1");
@@ -254,6 +370,16 @@ mod tests {
         );
         assert!(json.contains("feishu:ou_u1"), "conv 应编码进 value: {json}");
         assert!(json.contains("\"tag\":\"button\""), "按钮 tag: {json}");
+        // 真机校准（2026-08）：V2 已废弃 action 元素——按钮必须在 column_set 内，
+        // 且不再出现 "tag":"action"（200861 会被拒）。
+        assert!(
+            json.contains("\"tag\":\"column_set\""),
+            "V2 按钮须挂 column_set: {json}"
+        );
+        assert!(
+            !json.contains("\"tag\":\"action\""),
+            "V2 卡片不应再含 action 元素: {json}"
+        );
         assert!(json.contains("Bash"), "工具名: {json}");
     }
 

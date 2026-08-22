@@ -14,5 +14,6 @@ mod client;
 mod platform;
 mod proto;
 
+pub use client::probe_credentials;
 pub use platform::WeComPlatform;
 pub use proto::Credentials;

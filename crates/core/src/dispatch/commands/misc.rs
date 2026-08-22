@@ -133,6 +133,11 @@ impl Dispatcher {
             self.reply(conv, &format!("目录不存在：{arg}"), hint).await;
             return;
         }
+        // P6-8：过宽目录拒绝（/、home 根、系统目录等——agent 以 cwd 定位工作区）。
+        if let Err(e) = crate::config::validate_workdir(p) {
+            self.reply(conv, &format!("❌ {e}"), hint).await;
+            return;
+        }
         // 改 per-conv workdir：取 conv 锁串行，与在飞 agent task 隔离。
         let _conv_lock = self.acquire_conv_lock(&conv.0).await;
         let _conv_guard = _conv_lock.lock().await;
@@ -168,7 +173,18 @@ impl Dispatcher {
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
-                    self.reply(conv, &format!("命名工作空间：\n{body}"), hint)
+                    // P6-3：每个空间一个「使用」按钮（点击 = /ws use <name>）。
+                    let buttons: Vec<CardButton> = rows
+                        .iter()
+                        .map(|(k, _)| {
+                            let name = k.strip_prefix("workspace:").unwrap_or(k).to_string();
+                            CardButton {
+                                label: format!("使用 {name}"),
+                                command: format!("/ws use {name}"),
+                            }
+                        })
+                        .collect();
+                    self.reply_card(conv, "📁 命名工作空间", &body, buttons, hint)
                         .await
                 }
                 Err(e) => self.reply(conv, &format!("列出失败：{e}"), hint).await,
@@ -205,6 +221,16 @@ impl Dispatcher {
                         let p = std::path::Path::new(&path);
                         if !p.is_dir() {
                             self.reply(conv, &format!("目录不存在：{path}"), hint).await;
+                            return;
+                        }
+                        // P6-8：同 /cd——存储的目录也过安全校验（历史数据可能宽泛）。
+                        if let Err(e) = crate::config::validate_workdir(p) {
+                            self.reply(
+                                conv,
+                                &format!("❌ 工作空间「{arg}」目录过宽，拒绝切换：{e}"),
+                                hint,
+                            )
+                            .await;
                             return;
                         }
                         // 改 per-conv workdir：取 conv 锁串行，与在飞 agent task 隔离（同 /cd）。
@@ -326,13 +352,153 @@ impl Dispatcher {
         }
     }
 
-    /// /help —— 命令总表。
+    /// /file <path> —— 发送 workdir 内任意文件（P6-7：路径越界拒绝，同 /img）。
+    pub(super) async fn cmd_file(&self, conv: &ConvId, hint: &ReplyHint, parts: &[&str]) {
+        let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+        if arg.is_empty() {
+            self.reply(
+                conv,
+                "用法：/file <文件路径>（相对当前工作目录或绝对路径）",
+                hint,
+            )
+            .await;
+            return;
+        }
+        let wd = self.resolve_workdir(&conv.0).await;
+        let raw = std::path::Path::new(arg);
+        let joined = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            wd.join(raw)
+        };
+        // 安全校验：同 /img——canonicalize 后必须仍在 workdir 内（能 Read 才能发）。
+        let Ok(wd_real) = wd.canonicalize() else {
+            self.reply(conv, "工作目录不可用", hint).await;
+            return;
+        };
+        let Ok(real) = joined.canonicalize() else {
+            self.reply(conv, &format!("文件不存在：{arg}"), hint).await;
+            return;
+        };
+        if !real.starts_with(&wd_real) {
+            self.reply(
+                conv,
+                &format!("拒绝：{arg} 不在当前工作目录内（/cd 可切换）"),
+                hint,
+            )
+            .await;
+            return;
+        }
+        if !real.is_file() {
+            self.reply(conv, &format!("不是文件：{arg}"), hint).await;
+            return;
+        }
+        let media = MediaRef {
+            kind: "file".to_string(),
+            url: real.to_string_lossy().into_owned(),
+        };
+        match self.platform.send_media(conv, &media, hint).await {
+            Ok(()) => self.reply(conv, &format!("✅ 已发送：{arg}"), hint).await,
+            Err(e) => self.reply(conv, &format!("发送失败：{e}"), hint).await,
+        }
+    }
+
+    /// /timeout [N|off|default] —— 会话级空闲看门狗（P6-9：分钟粒度覆盖全局
+    /// agent_idle_timeout_secs；off=本会话关闭；default=清除覆盖回到全局）。
+    pub(super) async fn cmd_timeout(&self, conv: &ConvId, hint: &ReplyHint, parts: &[&str]) {
+        let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+        let global = self.agent_idle_timeout.read().as_secs();
+        if arg.is_empty() {
+            let cur = match self.idle_overrides.lock().await.get(&conv.0) {
+                Some(d) if d.is_zero() => "已关闭（本会话覆盖）".to_string(),
+                Some(d) => format!("{} 分钟（本会话覆盖）", d.as_secs() / 60),
+                None => format!("跟随全局 {global} 秒（0=关）"),
+            };
+            self.reply(
+                conv,
+                &format!(
+                    "当前空闲看门狗：{cur}\n用法：/timeout <分钟> | /timeout off | /timeout default"
+                ),
+                hint,
+            )
+            .await;
+            return;
+        }
+        match arg.to_ascii_lowercase().as_str() {
+            "off" => {
+                self.idle_overrides
+                    .lock()
+                    .await
+                    .insert(conv.0.clone(), Duration::ZERO);
+                self.reply(conv, "✅ 本会话空闲看门狗已关闭（仅本会话）", hint)
+                    .await;
+            }
+            "default" => {
+                self.idle_overrides.lock().await.remove(&conv.0);
+                self.reply(
+                    conv,
+                    &format!("✅ 已清除本会话覆盖，回到全局 {global} 秒"),
+                    hint,
+                )
+                .await;
+            }
+            _ => match arg.parse::<u64>() {
+                Ok(n) if n > 0 => {
+                    let d = Duration::from_secs(n * 60);
+                    self.idle_overrides.lock().await.insert(conv.0.clone(), d);
+                    self.reply(
+                        conv,
+                        &format!("✅ 本会话空闲看门狗 = {n} 分钟（agent 连续无输出即终止）"),
+                        hint,
+                    )
+                    .await;
+                }
+                Ok(_) => {
+                    self.reply(conv, "分钟数须 ≥ 1（关闭请用 /timeout off）", hint)
+                        .await
+                }
+                Err(_) => {
+                    self.reply(
+                        conv,
+                        "用法：/timeout <分钟> | /timeout off | /timeout default",
+                        hint,
+                    )
+                    .await
+                }
+            },
+        }
+    }
+
+    /// /help —— 命令总表（P6-3：飞书等卡片平台带常用命令按钮）。
     pub(super) async fn cmd_help(&self, conv: &ConvId, hint: &ReplyHint) {
-        self.reply(
-                            conv,
-                            "命令：\n/new 重置会话\n/switch <name> 切命名会话\n/sessions 列会话\n/resume [n] 恢复历史/本机会话\n/compact 压缩上下文\n/cd [path] 切工作目录\n/ws [list|save|use|remove] 命名工作空间\n/img <path> 发图片\n/perm <off|allow|deny|ask> 权限模式\n/stop 中断当前任务\n/config [k v] 查看/热改配置\n/status 状态\n/doctor 自检\n/reconnect 重连\n/allow <id> 授权\n/disallow <id> 撤权\n/chat [allow|deny|list] 会话白名单\n/list 白名单\n/whoami 我的id\n/help 帮助",
-                            hint,
-                        )
-                        .await;
+        let body = "/new 重置会话\n/switch <name> 切命名会话\n/sessions 列会话\n/resume [n] 恢复历史/本机会话\n/compact 压缩上下文\n/cd [path] 切工作目录\n/ws [list|save|use|remove] 命名工作空间\n/img <path> 发图片\n/file <path> 发文件\n/timeout [N|off|default] 会话级空闲看门狗（分钟）\n/perm <off|allow|deny|ask> 权限模式\n/stop 中断当前任务\n/config [k v] 查看/热改配置\n/status 状态\n/doctor 自检\n/reconnect 重连\n/allow <id|@名字> 授权（飞书群内可 @ 对方）\n/disallow <id|@名字> 撤权\n/chat [allow|deny|list] 会话白名单\n/list 白名单\n/whoami 我的id";
+        let buttons = vec![
+            CardButton {
+                label: "📊 状态".into(),
+                command: "/status".into(),
+            },
+            CardButton {
+                label: "🗂 会话".into(),
+                command: "/sessions".into(),
+            },
+            CardButton {
+                label: "⏪ 恢复".into(),
+                command: "/resume".into(),
+            },
+            CardButton {
+                label: "📁 空间".into(),
+                command: "/ws list".into(),
+            },
+            CardButton {
+                label: "🩺 诊断".into(),
+                command: "/doctor".into(),
+            },
+            CardButton {
+                label: "⏹ 中断".into(),
+                command: "/stop".into(),
+            },
+        ];
+        self.reply_card(conv, "🤖 imagent 命令", body, buttons, hint)
+            .await;
     }
 }

@@ -64,11 +64,13 @@ impl Dispatcher {
                         return;
                     }
                     "/allow" => {
-                        self.cmd_allow(&conv, &sender, &hint, &parts).await;
+                        self.cmd_allow(&conv, &sender, &hint, &parts, &msg.mentions)
+                            .await;
                         return;
                     }
                     "/disallow" => {
-                        self.cmd_disallow(&conv, &sender, &hint, &parts).await;
+                        self.cmd_disallow(&conv, &sender, &hint, &parts, &msg.mentions)
+                            .await;
                         return;
                     }
                     "/list" => {
@@ -127,6 +129,14 @@ impl Dispatcher {
                         self.cmd_img(&conv, &hint, &parts).await;
                         return;
                     }
+                    "/file" => {
+                        self.cmd_file(&conv, &hint, &parts).await;
+                        return;
+                    }
+                    "/timeout" => {
+                        self.cmd_timeout(&conv, &hint, &parts).await;
+                        return;
+                    }
                     "/perm" => {
                         self.cmd_perm(&conv, &sender, &hint, &parts).await;
                         return;
@@ -143,7 +153,7 @@ impl Dispatcher {
                         self.reply(
                             &conv,
                             &format!(
-                                "未知命令: {cmd}（支持: /new /switch /sessions /resume /compact /cd /ws /img /perm /stop /config /status /doctor /reconnect /allow /disallow /chat /list /whoami /help）"
+                                "未知命令: {cmd}（支持: /new /switch /sessions /resume /compact /cd /ws /img /file /timeout /perm /stop /config /status /doctor /reconnect /allow /disallow /chat /list /whoami /help）"
                             ),
                             &hint,
                         )

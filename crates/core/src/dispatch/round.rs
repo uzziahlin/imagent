@@ -149,6 +149,13 @@ impl Dispatcher {
         } else {
             None
         };
+        // 真机校准 UX：轮次开始立即发「执行中」初始卡——agent 首 chunk 前的
+        // 静默期（CLI 冷启动 + 模型首 token，数秒到十几秒）用户无从得知消息
+        // 已被接收。非卡片平台已有 typing / 流式文本路径，不加纯文本 ack
+        //（避免与后续流式分片重复）。
+        if let Some(c) = card.as_mut() {
+            c.ensure_started(&conv, &hint, self.platform.as_ref()).await;
+        }
         // P4-3：空闲看门狗——连续 agent_idle_timeout 无任何 chunk 则 abort（杀子进程）。
         // 等权限审批期间暂停（审批有独立的 permission_ask_timeout 预算兜底）。
         let mut idle_timed_out = false;
@@ -160,7 +167,7 @@ impl Dispatcher {
         loop {
             // P4-6：COT 档位每轮读取（/config 热改对下一轮生效）。
             let cot = *self.cot_detail.read();
-            let idle_timeout = *self.agent_idle_timeout.read();
+            let idle_timeout = self.idle_timeout_for(&conv.0).await;
             let chunk = if idle_timeout.is_zero() {
                 match rx.recv().await {
                     Some(c) => c,
@@ -269,7 +276,7 @@ impl Dispatcher {
                 if idle_timed_out {
                     let m = format!(
                         "⏱️ agent 已连续 {:?} 无输出，空闲超时终止本轮。已进行到的进度已保留，下条消息将续接（全新开始可 /new）。",
-                        *self.agent_idle_timeout.read()
+                        self.idle_timeout_for(&conv.0).await
                     );
                     if let Some(c) = card.as_mut() {
                         c.finalize(
