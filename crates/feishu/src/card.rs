@@ -185,7 +185,18 @@ pub fn render_permission_card_cancelled(tool_name: &str) -> String {
     serde_json::json!({
         "schema": "2.0",
         "body": { "elements": [
-            { "tag": "markdown", "content": format!("⏹️ `{tool_name}` 的执行询问已随任务中断，无需处理。") }
+            { "tag": "markdown", "content": format!("⏹️ `{tool_name}` 的本次询问已结束（任务中断/审批超时/被后续询问取代），无需处理。") }
+        ]}
+    })
+    .to_string()
+}
+
+/// 询问被**新询问取代**的终态（并发 permission_request 顶掉了旧的）。
+pub fn render_permission_card_superseded(tool_name: &str) -> String {
+    serde_json::json!({
+        "schema": "2.0",
+        "body": { "elements": [
+            { "tag": "markdown", "content": format!("⏭️ `{tool_name}` 的询问已被更新的询问取代（agent 并发请求时旧请求自动拒绝），请处理最新一张。") }
         ]}
     })
     .to_string()

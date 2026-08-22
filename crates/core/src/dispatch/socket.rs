@@ -308,6 +308,11 @@ impl Dispatcher {
             }
             Err(_elapsed) => {
                 router.cancel(&conv_id).await;
+                // 真机校准 UX：超时自动拒绝后把滞留的询问卡收敛成终态（否则
+                // 卡片保持可点，用户点了只会得到「已超时」的空转）。best-effort。
+                if let Err(e) = platform.cancel_permission_ask(&conv).await {
+                    warn!(target: "imagent::core", conv_id = %conv_id, error = %e, "超时询问卡收敛失败（不影响 deny）");
+                }
                 METRICS
                     .permission_decisions
                     .with_label_values(&["timeout"])
