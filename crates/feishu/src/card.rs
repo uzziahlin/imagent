@@ -336,7 +336,6 @@ mod tests {
         assert!(render_card(&card).contains("boom"));
     }
 
-    #[test]
     /// P6：AskUserQuestion 输入 → 问题卡（选项按钮 + imagent_ask value）。
     #[test]
     fn render_question_card_options_and_fallback() {

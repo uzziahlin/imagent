@@ -202,7 +202,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// P6：ask: 前缀 = 问题卡选项答案 → deny + message（agent 经 message 读到选择）。
     #[test]
     fn parse_reply_ask_prefix_carries_choice() {
@@ -214,6 +213,7 @@ mod tests {
         assert!(r2.message.is_none() || r2.message.as_deref() != Some("用户选择："));
     }
 
+    #[test]
     fn parse_reply_deny_variants() {
         for s in ["", "   ", "n", "N", "no", "不", "拒绝", "随便", "rm -rf /"] {
             let r = parse_reply(s);

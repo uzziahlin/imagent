@@ -873,7 +873,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     /// P6：问题卡选项按钮（imagent_ask）→ ask:<选项> 文本（经 parse_reply 转
     /// deny+message 回给 agent）。
     fn parse_card_action_question_option_to_ask_text() {
