@@ -45,8 +45,9 @@ enum Cmd {
     },
     /// 前台常驻：收消息 → 鉴权 → 驱动 agent → 回传（Ctrl-C 退出）。
     Start {
-        #[arg(long, default_value = "ilink")]
-        platform: String,
+        /// 平台（缺省读 config.platform，config 未写则 ilink）。
+        #[arg(long)]
+        platform: Option<String>,
     },
     /// 查看登录状态与配置路径。
     Status,
@@ -473,12 +474,6 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Start { platform } => {
-            if platform != "ilink" && platform != "wecom" && platform != "feishu" {
-                return Err(anyhow!(
-                    "未知 platform={platform}，支持 ilink | wecom | feishu"
-                ));
-            }
-
             // 1. 配置
             let config_path = imagent_core::Config::default_path()
                 .ok_or_else(|| anyhow!("无法定位 home 目录"))?;
@@ -509,13 +504,18 @@ async fn main() -> Result<()> {
             // 凭据（读取对旧的无 profile 键 fallback，存量部署零迁移）。
             store.set_keyring_scope(cli.profile.as_deref().unwrap_or(""));
 
-            // 3. platform —— 按 config.platform / CLI 选用 ilink 或 wecom。
-            let platform_name =
-                if platform == "ilink" || platform == "wecom" || platform == "feishu" {
-                    platform.as_str()
-                } else {
-                    config.platform.as_str()
-                };
+            // 3. platform —— CLI 显式优先，否则 config.platform（未写 = ilink 默认）。
+            // 修复（2026-08-24）：此前 CLI 硬默认 ilink——config 写了 feishu/wecom 的
+            // 用户不带 --platform 启动会误走 ilink（service install 的守护进程即中招）。
+            let platform_name = platform
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .unwrap_or(&config.platform);
+            if platform_name != "ilink" && platform_name != "wecom" && platform_name != "feishu" {
+                return Err(anyhow!(
+                    "未知 platform={platform_name}，支持 ilink | wecom | feishu"
+                ));
+            }
             let platform = build_platform(platform_name, &config, store.clone()).await?;
 
             // 孤儿流式卡片关流（P4_ROADMAP 第六批）：上次进程退出时滞留「生成中」的

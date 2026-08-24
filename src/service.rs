@@ -47,8 +47,16 @@ fn unit_path(profile: Option<&str>) -> Result<PathBuf> {
 /// launchd plist 模板：注册当前二进制 + start + 可选 --profile；把安装进程持有的
 /// 凭据环境变量快照进服务（KeepAlive 崩溃自动拉起）。
 #[cfg(target_os = "macos")]
-fn render_plist(exe: &str, profile: Option<&str>, envs: &[(String, String)], log: &str) -> String {
-    let mut args = format!("        <string>{exe}</string>\n        <string>start</string>");
+fn render_plist(
+    exe: &str,
+    profile: Option<&str>,
+    platform: &str,
+    envs: &[(String, String)],
+    log: &str,
+) -> String {
+    let mut args = format!(
+        "        <string>{exe}</string>\n        <string>start</string>\n        <string>--platform</string>\n        <string>{platform}</string>"
+    );
     if let Some(p) = profile.filter(|p| !p.is_empty()) {
         args.push_str(&format!(
             "\n        <string>--profile</string>\n        <string>{p}</string>"
@@ -81,8 +89,13 @@ fn render_plist(exe: &str, profile: Option<&str>, envs: &[(String, String)], log
 
 /// systemd 用户单元模板（ExecStart 同参数；日志 journalctl）。
 #[cfg(all(unix, not(target_os = "macos")))]
-fn render_unit(exe: &str, profile: Option<&str>, envs: &[(String, String)]) -> String {
-    let mut exec = format!("{exe} start");
+fn render_unit(
+    exe: &str,
+    profile: Option<&str>,
+    platform: &str,
+    envs: &[(String, String)],
+) -> String {
+    let mut exec = format!("{exe} start --platform {platform}");
     if let Some(p) = profile.filter(|p| !p.is_empty()) {
         exec.push_str(&format!(" --profile {p}"));
     }
@@ -137,6 +150,28 @@ pub fn install(profile: Option<&str>) -> Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     let envs = capture_envs();
+    // 平台来自 config（feishu/wecom 显式写进服务定义，自文档化且不依赖 start 的
+    // 缺省解析）；config 读不到时提示先 setup（不猜默认值静默装错平台）。
+    let cfg_path =
+        imagent_core::Config::default_path().ok_or_else(|| anyhow!("无法定位 config 路径"))?;
+    let config = imagent_core::Config::load(&cfg_path).map_err(|e| {
+        anyhow!(
+            "读取 {} 失败：{e}\n先跑 `imagent setup` 完成配置再装服务",
+            cfg_path.display()
+        )
+    })?;
+    let platform_name = config.platform.clone();
+    println!(
+        "平台：{platform_name}（凭据环境变量快照 {} 项）",
+        envs.len()
+    );
+    if platform_name == "feishu" && !envs.iter().any(|(k, _)| k == "IMAGENT_FEISHU_APP_SECRET") {
+        return Err(anyhow!(
+            "platform=feishu 但当前 shell 未设置 IMAGENT_FEISHU_APP_SECRET——\n\
+             守护进程取不到交互 shell 的环境变量，安装时会快照进服务定义。\n\
+             请先 `export IMAGENT_FEISHU_APP_SECRET=…` 再执行本命令。"
+        ));
+    }
     // 日志路径仅 launchd 用（systemd 走 journal）——随平台门控，防 Linux 下未用告警。
     #[cfg(target_os = "macos")]
     let log = {
@@ -147,7 +182,7 @@ pub fn install(profile: Option<&str>) -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        let plist = render_plist(&exe, profile, &envs, &log);
+        let plist = render_plist(&exe, profile, &platform_name, &envs, &log);
         std::fs::write(&path, plist)?;
         let lbl = label(profile);
         // 先卸旧（不存在时报错可忽略）再加载。
@@ -163,7 +198,7 @@ pub fn install(profile: Option<&str>) -> Result<()> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let unit = render_unit(&exe, profile, &envs);
+        let unit = render_unit(&exe, profile, &platform_name, &envs);
         std::fs::write(&path, unit)?;
         let name = label(profile).replace("com.imagent", "imagent");
         run("systemctl", &["--user", "daemon-reload"])?;
@@ -265,6 +300,7 @@ mod tests {
         let p = render_plist(
             "/usr/local/bin/imagent",
             Some("codex"),
+            "feishu",
             &[("IMAGENT_FEISHU_APP_SECRET".into(), "s3cr3t".into())],
             "/tmp/daemon.log",
         );
@@ -272,11 +308,15 @@ mod tests {
         assert!(p.contains("<string>/usr/local/bin/imagent</string>"));
         assert!(p.contains("<string>--profile</string>"));
         assert!(p.contains("<string>codex</string>"));
+        assert!(
+            p.contains("<string>--platform</string>") && p.contains("<string>feishu</string>"),
+            "平台应显式入参: {p}"
+        );
         assert!(p.contains("IMAGENT_FEISHU_APP_SECRET"));
         assert!(p.contains("<string>s3cr3t</string>"));
         assert!(p.contains("KeepAlive"));
-        // 无 profile 时不带 --profile 参数。
-        let p2 = render_plist("/x/imagent", None, &[], "/tmp/l");
+        // 无 profile 时不带 --profile 参数（平台仍显式）。
+        let p2 = render_plist("/x/imagent", None, "ilink", &[], "/tmp/l");
         assert!(!p2.contains("--profile"));
         assert!(p2.contains("<string>com.imagent</string>"));
     }
@@ -287,16 +327,17 @@ mod tests {
         let u = render_unit(
             "/usr/local/bin/imagent",
             Some("codex"),
+            "feishu",
             &[("IMAGENT_FEISHU_APP_SECRET".into(), "s3cr3t".into())],
         );
         assert!(
-            u.contains("ExecStart=/usr/local/bin/imagent start --profile codex"),
+            u.contains("ExecStart=/usr/local/bin/imagent start --platform feishu --profile codex"),
             "{u}"
         );
         assert!(u.contains("Environment=\"IMAGENT_FEISHU_APP_SECRET=s3cr3t\""));
         assert!(u.contains("Restart=on-failure"));
-        let u2 = render_unit("/x/imagent", None, &[]);
-        assert!(u2.contains("ExecStart=/x/imagent start"));
+        let u2 = render_unit("/x/imagent", None, "ilink", &[]);
+        assert!(u2.contains("ExecStart=/x/imagent start --platform ilink"));
         assert!(!u2.contains("--profile"));
     }
 }
