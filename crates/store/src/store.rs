@@ -613,6 +613,62 @@ impl Store {
         .await
     }
 
+    // —— admin_senders（管理员动态白名单，P7-A1 `/admin add|remove`）——
+
+    /// 返回全部动态管理员（升序；与 config `admin_senders` 种子取并集用）。
+    pub async fn list_admin_senders(&self) -> Result<Vec<String>> {
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let mut stmt = conn.prepare("SELECT sender FROM admin_senders ORDER BY sender")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r?);
+            }
+            Ok(v)
+        })
+        .await
+    }
+
+    /// 加入管理员。`INSERT OR IGNORE`：已存在不报错、不覆盖原元数据。
+    pub async fn add_admin_sender(
+        &self,
+        sender: &str,
+        added_by: Option<&str>,
+        source: Option<&str>,
+    ) -> Result<()> {
+        let (sender, added_by, source) = (
+            sender.to_string(),
+            added_by.map(|s| s.to_string()),
+            source.map(|s| s.to_string()),
+        );
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let now = now_secs();
+            conn.execute(
+                "INSERT OR IGNORE INTO admin_senders (sender, added_at, added_by, source) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![sender, now, added_by, source],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// 移除管理员条目。返回是否原本存在。
+    pub async fn remove_admin_sender(&self, sender: &str) -> Result<bool> {
+        let sender = sender.to_string();
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let n = conn.execute(
+                "DELETE FROM admin_senders WHERE sender = ?1",
+                rusqlite::params![sender],
+            )?;
+            Ok(n > 0)
+        })
+        .await
+    }
+
     // —— allowed_chats（会话/群白名单，P4-5）——
 
     /// 返回所有已授权会话 conv_id（升序）。
@@ -1889,5 +1945,35 @@ mod tests {
         let rows = store.list_live_cards().await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].conv_id, "c2");
+    }
+
+    /// P7-A1：admin_senders 表 CRUD 往返 + 幂等（INSERT OR IGNORE 不覆盖元数据）。
+    #[tokio::test]
+    async fn admin_senders_roundtrip() {
+        let db = TempDb::new("admin_rt").await;
+        let store = Store::open(&db.path).await.unwrap();
+        assert!(store.list_admin_senders().await.unwrap().is_empty());
+        store
+            .add_admin_sender("ou_a", Some("ou_root"), Some("im"))
+            .await
+            .unwrap();
+        // 重复 add 幂等：仍一条。
+        store.add_admin_sender("ou_a", None, None).await.unwrap();
+        store.add_admin_sender("ou_b", None, None).await.unwrap();
+        assert_eq!(
+            store.list_admin_senders().await.unwrap(),
+            vec!["ou_a".to_string(), "ou_b".to_string()]
+        );
+        assert!(store.remove_admin_sender("ou_a").await.unwrap());
+        assert!(
+            !store.remove_admin_sender("ou_a").await.unwrap(),
+            "再删应返回 false"
+        );
+        assert_eq!(
+            store.list_admin_senders().await.unwrap(),
+            vec!["ou_b".to_string()]
+        );
+        drop(store);
+        TempDb::cleanup(&db.path);
     }
 }

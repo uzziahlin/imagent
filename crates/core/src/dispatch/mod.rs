@@ -27,7 +27,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::auth::Auth;
 use crate::backend::Backend;
 use crate::card_session::CardSession;
-use crate::config::{CotDetail, PermissionMode};
+use crate::config::{CotDetail, PermissionMode, ReplyMode};
 use crate::error::Result;
 use crate::metrics::METRICS;
 use crate::permission::{parse_reply, PermissionReply, PermissionRouter};
@@ -265,6 +265,10 @@ pub struct Dispatcher {
     /// P6-9：per-conv 空闲看门狗覆盖（`/timeout`）——`Some(ZERO)` = 本会话关闭；
     /// 无条目 = 跟随全局 `agent_idle_timeout`。进程内（会话级旋钮，不落盘）。
     idle_overrides: Mutex<HashMap<String, Duration>>,
+    /// P7-A3：陌生人被 @ 提示开关（config 注入，set_prefs 热设；共享句柄）。
+    stranger_mention_hint: RwLock<bool>,
+    /// P7-A4：回复形态偏好（card/text，/config 可热改）。
+    reply_mode: Arc<RwLock<ReplyMode>>,
     /// 管理员 sender（可 /allow）；空 = 所有白名单用户可（向后兼容，P2-D）。
     admin_senders: Arc<RwLock<Vec<String>>>,
     /// 优雅退出信号（P1-5）：收到 SIGINT/SIGTERM 后 notify，run() 停止收新消息并 drain。
@@ -342,10 +346,18 @@ impl Dispatcher {
             queues: Mutex::new(HashMap::new()),
             resume_cache: Mutex::new(HashMap::new()),
             idle_overrides: Mutex::new(HashMap::new()),
+            stranger_mention_hint: RwLock::new(false),
+            reply_mode: Arc::new(RwLock::new(ReplyMode::Card)),
             admin_senders: Arc::new(RwLock::new(admin_senders)),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             tasks: Mutex::new(tokio::task::JoinSet::new()),
         }
+    }
+
+    /// P7：启动偏好注入（main 在 run 前调一次；构造器保持零新参，测试无感）。
+    pub fn set_prefs(&self, stranger_mention_hint: bool, reply_mode: ReplyMode) {
+        *self.stranger_mention_hint.write() = stranger_mention_hint;
+        *self.reply_mode.write() = reply_mode;
     }
 
     /// P6-9：该会话的空闲看门狗——`/timeout` 覆盖优先（ZERO=关），否则全局值。

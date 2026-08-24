@@ -471,7 +471,7 @@ impl Dispatcher {
 
     /// /help —— 命令总表（P6-3：飞书等卡片平台带常用命令按钮）。
     pub(super) async fn cmd_help(&self, conv: &ConvId, hint: &ReplyHint) {
-        let body = "/new 重置会话\n/switch <name> 切命名会话\n/sessions 列会话\n/resume [n] 恢复历史/本机会话\n/compact 压缩上下文\n/cd [path] 切工作目录\n/ws [list|save|use|remove] 命名工作空间\n/img <path> 发图片\n/file <path> 发文件\n/timeout [N|off|default] 会话级空闲看门狗（分钟）\n/perm <off|allow|deny|ask> 权限模式\n/stop 中断当前任务\n/config [k v] 查看/热改配置\n/status 状态\n/doctor 自检\n/reconnect 重连\n/allow <id|@名字> 授权（飞书群内可 @ 对方）\n/disallow <id|@名字> 撤权\n/chat [allow|deny|list] 会话白名单\n/list 白名单\n/whoami 我的id";
+        let body = "/new 重置会话\n/switch <name> 切命名会话\n/sessions 列会话\n/resume [n] 恢复历史/本机会话\n/compact 压缩上下文\n/cd [path] 切工作目录\n/ws [list|save|use|remove] 命名工作空间\n/img <path> 发图片\n/file <path> 发文件\n/timeout [N|off|default] 会话级空闲看门狗（分钟）\n/perm <off|allow|deny|ask> 权限模式\n/stop 中断当前任务\n/config [k v] 查看/热改配置\n/status 状态\n/doctor 自检\n/reconnect 重连\n/allow <id|@名字> 授权（飞书群内可 @ 对方）\n/disallow <id|@名字> 撤权\n/chat [allow|deny|allow-all|list] 会话白名单\n/admin [list|add|remove] 管理员\n/list 白名单\n/whoami 我的id";
         let buttons = vec![
             CardButton {
                 label: "📊 状态".into(),

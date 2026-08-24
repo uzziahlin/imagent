@@ -289,17 +289,23 @@ pub async fn run_mcp_server(
             let (tool_name, input) = extract_call_args(&req);
             // 多 pending：每次调用独立 request_id（同 conv 与其它询问并存互不顶替）。
             let request_id = new_request_id("p");
-            let reply =
-                match ask_via_socket(&sock, &conv_id, &request_id, &tool_name, &input, ask_timeout)
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(e) => PermissionReply {
-                        allow: false,
-                        message: Some(format!("imagent socket error: {e}")),
-                        raw_text: None,
-                    },
-                };
+            let reply = match ask_via_socket(
+                &sock,
+                &conv_id,
+                &request_id,
+                &tool_name,
+                &input,
+                ask_timeout,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => PermissionReply {
+                    allow: false,
+                    message: Some(format!("imagent socket error: {e}")),
+                    raw_text: None,
+                },
+            };
             let result = build_call_response(&reply, &input);
             let id = req.get("id").cloned().unwrap_or(Value::Null);
             json!({ "jsonrpc": "2.0", "id": id, "result": result })
@@ -485,14 +491,20 @@ pub async fn run_ask_mcp_server(
             }),
             "tools/list" => build_ask_tools_list(),
             "tools/call" => {
-                let name = req.pointer("/params/name").and_then(|v| v.as_str()).unwrap_or("");
+                let name = req
+                    .pointer("/params/name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 if name != ASK_TOOL_NAME {
                     json!({
                         "jsonrpc": "2.0", "id": req.get("id").cloned().unwrap_or(Value::Null),
                         "error": { "code": -32602, "message": format!("unknown tool: {name}") }
                     })
                 } else {
-                    let args = req.pointer("/params/arguments").cloned().unwrap_or(json!({}));
+                    let args = req
+                        .pointer("/params/arguments")
+                        .cloned()
+                        .unwrap_or(json!({}));
                     let question = args
                         .get("question")
                         .and_then(|v| v.as_str())
@@ -502,7 +514,12 @@ pub async fn run_ask_mcp_server(
                     let options: Vec<String> = args
                         .get("options")
                         .and_then(|v| v.as_array())
-                        .map(|a| a.iter().filter_map(|o| o.as_str()).map(String::from).collect())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|o| o.as_str())
+                                .map(String::from)
+                                .collect()
+                        })
                         .unwrap_or_default();
                     let source = args
                         .get("source")
@@ -543,8 +560,8 @@ pub async fn run_ask_mcp_server(
                                 "imagent 主进程不可达（{e}）——请确认 `imagent start feishu` 已在运行"
                             ),
                         };
-                        let is_error =
-                            text.starts_with("ask_via_im 失败") || text.starts_with("imagent 主进程不可达");
+                        let is_error = text.starts_with("ask_via_im 失败")
+                            || text.starts_with("imagent 主进程不可达");
                         json!({
                             "jsonrpc": "2.0", "id": id,
                             "result": {
@@ -625,7 +642,10 @@ mod tests {
     fn mcp_servers_config_shape() {
         let raw = mcp_servers_config("/usr/local/bin/imagent");
         let v: Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(v["mcpServers"]["imagent"]["command"], "/usr/local/bin/imagent");
+        assert_eq!(
+            v["mcpServers"]["imagent"]["command"],
+            "/usr/local/bin/imagent"
+        );
         assert_eq!(v["mcpServers"]["imagent"]["args"][0], "mcp-ask");
     }
 

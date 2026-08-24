@@ -352,6 +352,7 @@ fn msg(conv: &str, sender: &str, text: &str) -> InboundMessage {
         media: Vec::new(),
         media_errors: Vec::new(),
         mentions: Vec::new(),
+        mentioned_bot: false,
         ask_req: None,
         reply_to: None,
         reply_hint: ReplyHint::None,
@@ -804,6 +805,7 @@ async fn pure_media_all_failed_replies_error() {
         media: vec![],
         media_errors: vec!["img_x: 下载失败: boom".into()],
         mentions: Vec::new(),
+        mentioned_bot: false,
         ask_req: None,
         reply_to: None,
         reply_hint: ReplyHint::None,
@@ -1013,6 +1015,142 @@ async fn allow_command_mention_unresolvable_hints() {
     assert!(
         !ctx.disp.auth().is_allowed(&UserId("@张三".into())),
         "不得把 @字串 本身当 id 授权"
+    );
+    drop_db(ctx.db).await;
+}
+
+/// P7-A1：/admin add|remove|list——管理员动态管理（默认 admin 空白名单用户可管，
+/// 即向后兼容语义；添加即时生效并持久化；不可移除自己）。
+#[tokio::test]
+async fn admin_command_add_remove_list() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    // 列表（空 = 向后兼容语义提示）。
+    feed_and_wait(&ctx, vec![msg("c", "alice", "/admin")], 1).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.iter().any(|t| t.contains("管理员列表为空")),
+        "空列表应说明语义: {inbox:?}"
+    );
+    // add bob → 回执 + 列表出现；首位管理员设立时操作者一并加入（防自锁）。
+    feed_and_wait(&ctx, vec![msg("c", "alice", "/admin add bob")], 1).await;
+    feed_and_wait(&ctx, vec![msg("c", "alice", "/admin list")], 1).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    let list_line = inbox
+        .iter()
+        .rev()
+        .find(|t| t.starts_with("管理员（"))
+        .cloned();
+    let list_line = list_line.expect("应有管理员列表");
+    assert!(list_line.contains("bob"), "列表应含 bob: {list_line}");
+    assert!(
+        list_line.contains("alice"),
+        "首位设立应含操作者 alice（防自锁）: {list_line}"
+    );
+    // 移除自己 → 拒绝。
+    feed_and_wait(&ctx, vec![msg("c", "alice", "/admin remove alice")], 1).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.iter().any(|t| t.contains("不允许移除自己")),
+        "自移除应被拒: {inbox:?}"
+    );
+    // remove bob → 成功回执。
+    feed_and_wait(&ctx, vec![msg("c", "alice", "/admin remove bob")], 1).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.iter().any(|t| t.contains("已移除管理员 `bob`")),
+        "移除回执: {inbox:?}"
+    );
+    drop_db(ctx.db).await;
+}
+
+/// P7-A1：admin_senders 非空时，白名单内非 admin 用户 /admin add 被拒。
+#[tokio::test]
+async fn admin_command_rejected_for_non_admin() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build_with_admin(
+        Auth::new(vec!["alice".into(), "bob".into()]),
+        vec!["alice".into()],
+    )
+    .await;
+    feed_and_wait(&ctx, vec![msg("c", "bob", "/admin add charlie")], 1).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.iter().any(|t| t.contains("仅管理员")),
+        "非 admin /admin 应被拒: {inbox:?}"
+    );
+    drop_db(ctx.db).await;
+}
+
+/// P7-A3：stranger_mention_hint 开启时，未过白名单的群 @bot 消息回引导；
+/// 关闭（默认）保持完全静默；私聊（mentioned_bot=false）不提示。
+#[tokio::test]
+async fn stranger_mention_hint_on_off() {
+    let _serial = SERIAL.lock().await;
+    // 默认关：静默。
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    let mut m = msg("feishu:oc_g", "stranger", "hi bot");
+    m.mentioned_bot = true;
+    feed_and_wait(&ctx, vec![m], 0).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(inbox.is_empty(), "默认应完全静默: {inbox:?}");
+    drop_db(ctx.db).await;
+
+    // 开启 + @bot → 引导；开启但未 @bot → 仍静默。
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    ctx.disp.set_prefs(true, crate::config::ReplyMode::Card);
+    let mut m = msg("feishu:oc_g", "stranger", "hi bot");
+    m.mentioned_bot = true;
+    feed_and_wait(&ctx, vec![m], 1).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.iter().any(|t| t.contains("/chat allow")),
+        "被 @ 应回引导: {inbox:?}"
+    );
+    let m2 = msg("feishu:oc_g", "stranger", "no mention");
+    feed_and_wait(&ctx, vec![m2], 0).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert_eq!(inbox.len(), 1, "未 @bot 不应追加提示: {inbox:?}");
+    drop_db(ctx.db).await;
+}
+
+/// P7-A4：/config reply_mode text 热切换 + 展示。
+#[tokio::test]
+async fn config_reply_mode_toggle() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    feed_and_wait(&ctx, vec![msg("c", "alice", "/config reply_mode text")], 1).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.iter().any(|t| t.contains("reply_mode = text")),
+        "应回执切换: {inbox:?}"
+    );
+    feed_and_wait(&ctx, vec![msg("c", "alice", "/config")], 1).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.iter().any(|t| t.contains("reply_mode = text")),
+        "/config 展示应含当前值: {inbox:?}"
+    );
+    // 非法值 → 用法提示。
+    feed_and_wait(&ctx, vec![msg("c", "alice", "/config reply_mode yaml")], 1).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.iter().any(|t| t.contains("用法：/config reply_mode")),
+        "非法值应回用法: {inbox:?}"
+    );
+    drop_db(ctx.db).await;
+}
+
+/// P7-A2：/chat allow-all——MockPlatform 无群列表（trait 默认 Err）应如实报错。
+#[tokio::test]
+async fn chat_allow_all_unsupported_platform() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    feed_and_wait(&ctx, vec![msg("c", "alice", "/chat allow-all")], 1).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.iter().any(|t| t.contains("列出群失败")),
+        "不支持平台应回失败: {inbox:?}"
     );
     drop_db(ctx.db).await;
 }
