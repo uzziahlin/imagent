@@ -130,7 +130,9 @@ allowed_tools = ["Read", "Edit"]
 EOF
 ```
 
-> **飞书**：`platform = "feishu"` + `feishu_app_id` + 环境变量 `IMAGENT_FEISHU_APP_SECRET`；需在飞书后台开通长连接事件订阅（消息 / `card.action.trigger` 审批回调 / 可选 `drive.file.comment.created_v1` 云文档评论）。**WeCom**：`wecom_bot_id` + `wecom_secret`。两者都免公网（长连接收，HTTP 发）。
+> **`allowed_tools` 要不要写？** 不必填——缺省即 `["Read", "Edit"]`。它是 agent 的**能力边界**（透传 claude 的 `--allowedTools`）：清单外的工具 agent 根本用不了。想让 agent 跑命令就把 `"Bash"` 加进去；配合 `permission_mode = "ask"`，清单内的危险操作（如每条 Bash 命令）执行前仍会在 IM 向你审批——加清单≠免审。设为 `[]` 则不附加该参数，claude 按自身默认规则。
+
+> **飞书**：`platform = "feishu"` + `feishu_app_id` + 环境变量 `IMAGENT_FEISHU_APP_SECRET`——完整开通步骤见[接入飞书](#接入飞书完整流程)。**WeCom**：`wecom_bot_id` + `wecom_secret`。两者都免公网（长连接收，HTTP 发）。
 
 ### 登录 + 运行
 
@@ -147,6 +149,55 @@ imagent start            # 前台常驻，Ctrl-C 退出
 3. 之后发消息 → agent 执行 → 结果回传 IM。
 
 **多实例（Profile）**：`imagent profile create work` → `imagent --profile work start`——config/db/socket/媒体全隔离，一机多 bot 身份。
+
+## 接入飞书（完整流程）
+
+飞书走**企业自建应用 + 长连接**：不需要公网 IP / 域名 / 证书，imagent 主动连飞书 WS 收事件、走 OpenAPI 发消息，适合家宽 / NAS 部署。全程约 10 分钟（`imagent setup` 向导可交互走一遍同样流程并校验凭据连通性）：
+
+**① 创建应用**：打开 [open.feishu.cn/app](https://open.feishu.cn/app) →「创建企业自建应用」→「添加应用能力」→ 启用**机器人**。
+
+**② 事件订阅（长连接）**：「开发配置」→「事件与回调」→ 订阅方式选**使用长连接接收事件**，然后添加事件：
+
+| 事件 | 用途 | 必须 |
+|---|---|---|
+| `im.message.receive_v1` | 收私聊 / 群 @ 消息 | ✅ |
+| `card.action.trigger` | 卡片按钮回调（审批 / 问题 / 命令按钮卡） | ✅ |
+| `drive.file.comment.created_v1` | 云文档评论 @bot 触发 | 可选 |
+
+**③ 开通权限**：「权限管理」开通并**发布**：
+
+- `im:message`（读取与发送单聊、群聊消息）——必须；
+- `im:message.group_at_msg`（仅收 @机器人 的群消息；要全收群消息改用 `group_msg` 并把 config 的 `feishu_require_mention_in_group` 设为 `false`）；
+- `cardkit:card:write`（CardKit 流式卡片）——可选，缺省自动降级整卡刷新；
+- `drive:comment`（云文档评论）——可选，配合上表评论事件。
+
+**④ 发布生效**：「版本管理与发布」→ 创建版本并发布——**权限与事件订阅都要发布后才生效**，新手最常漏这步。
+
+**⑤ 配置凭据**：开放平台「凭证与基础信息」页拿 App ID / App Secret：
+
+```toml
+# ~/.imagent/config.toml
+platform = "feishu"
+feishu_app_id = "cli_xxx"
+```
+```bash
+export IMAGENT_FEISHU_APP_SECRET="你的 App Secret"   # 建议写进 ~/.zshrc；secret 不落 config
+```
+
+**⑥ 启动 + 授权自己**：
+
+```bash
+imagent start feishu        # 日志看到 connected to wss://msg-frontier.feishu.cn 即接入成功
+```
+
+在飞书里搜到机器人，给它发一条消息（此时白名单为空，日志会打出你的 `ou_xxx` open_id）→ 授权：
+
+```bash
+imagent allow ou_xxx        # 或 config 里填 allowed_senders = ["ou_xxx"]
+```
+
+之后发消息 agent 即执行并回传；要启用终端 agent 提问转发（ask_via_im），再在 config 设 `ask_via_im_conv = "feishu:ou_xxx"`（见[终端 agent 接入](#终端-agent-接入ask_via-im人不在电脑前也能问你)）。
+
 
 ## 命令（IM 内）
 
