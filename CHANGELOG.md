@@ -2,6 +2,29 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [Unreleased]
+
+（空——下一段变更从这里开始。）
+
+## [1.5.1] — 2026-08-24
+
+### Fixed
+- **飞书/企微用户 `service install` 后守护进程误走 ilink**：`start` 的 `--platform` 由硬默认 ilink 改为缺省读 `config.platform`（CLI 显式优先）；`service install` 把平台显式写进 launchd plist / systemd unit 的启动参数；platform=feishu 且未 `export IMAGENT_FEISHU_APP_SECRET` 时安装期即报错（守护进程取不到交互 shell 环境变量，安装时快照是唯一注入点）。
+
+### Docs
+- README 新增「后台常驻（imagent service）」章节：安装 / 状态 / 卸载、macOS 与 Linux 差异表（日志位置 / enable-linger）、secret 快照与二进制路径注意点、多 profile 用法。
+- README 命令表同步 P6/P7 新命令（`/file`、`/timeout`、`/admin`、`/chat allow-all`、`/config` 新键 require_mention / reply_mode、`/allow @名字`）；修正飞书启动示例为 `imagent start`（缺省读 config.platform）。
+
+## [1.5.0] — 2026-08-24
+
+> allowed_tools 缺省放宽 + 飞书接入文档（本次发版未及记录，回填）。
+
+### Changed
+- **allowed_tools 缺省放宽**：未配置时默认放开读 / 检索 / 联网 / 编辑类全套工具，执行类（Bash 等）仍需显式 opt-in；README 补能力边界与「ask 仍走审批」语义说明。
+
+### Docs
+- README 新增「接入飞书（完整流程）」章节（自建应用 / 长连接事件订阅 / 权限清单 / 凭据配置 / 首条消息授权，约 10 分钟）；install.sh 升级为一键安装 + 配置 + MCP 挂载。
+
 ## [1.4.0] — 2026-08-24
 
 > P7：对标收尾（A1-A5）——管理员管理、批量放行、陌生人提示、回复偏好、profile 迁移。
@@ -14,8 +37,6 @@
 - **陌生人被 @ 提示**（config `stranger_mention_hint`，默认关 = 完全静默防探测）：未放行群里 @bot 回一句 `/chat allow` 引导；`InboundMessage.mentioned_bot` 据群消息 mentions 元数据判定（弱过滤不误发）。
 - **`/config reply_mode card|text`**：回复形态偏好热切换（text = 不建卡走纯文本流；config `reply_mode` 种子）。
 - **`imagent profile export|import`**：JSON 导出/导入（config 行级脱敏 `wecom_secret`，`--include-secrets --yes` 才带明文；白名单/管理员/命名空间随迁；keyring/环境变量凭据不随导出并明示）。
-
-（空——下一段变更从这里开始。）
 
 ## [1.3.0] — 2026-08-24
 
