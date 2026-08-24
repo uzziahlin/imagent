@@ -187,7 +187,8 @@ export IMAGENT_FEISHU_APP_SECRET="你的 App Secret"   # 建议写进 ~/.zshrc�
 **⑥ 启动 + 授权自己**：
 
 ```bash
-imagent start feishu        # 日志看到 connected to wss://msg-frontier.feishu.cn 即接入成功
+imagent start               # 缺省读 config 的 platform（feishu）；显式可 --platform feishu
+                            # 日志看到 connected to wss://msg-frontier.feishu.cn 即接入成功
 ```
 
 在飞书里搜到机器人，给它发一条消息（此时白名单为空，日志会打出你的 `ou_xxx` open_id）→ 授权：
@@ -198,6 +199,37 @@ imagent allow ou_xxx        # 或 config 里填 allowed_senders = ["ou_xxx"]
 
 之后发消息 agent 即执行并回传；要启用终端 agent 提问转发（ask_via_im），再在 config 设 `ask_via_im_conv = "feishu:ou_xxx"`（见[终端 agent 接入](#终端-agent-接入ask_via-im人不在电脑前也能问你)）。
 
+
+## 后台常驻（imagent service）
+
+前台 `start` 验证可用后，装成 OS 级后台服务（需 ≥ v1.5.1：早前版本生成的服务定义
+缺 `--platform`，飞书用户守护进程会误走 ilink）：
+
+```bash
+# ① secret 必须在当前 shell 里 export——install 会把它「快照」进服务定义
+#    （守护进程起不来交互 shell，这是唯一注入点；缺失会直接报错提示）
+export IMAGENT_FEISHU_APP_SECRET="你的 App Secret"
+
+# ② 安装并启动（注册当前二进制路径 + config 里的 platform；崩溃自动拉起、开机自启）
+imagent service install
+```
+
+> 二进制先放到稳定路径（如 `/usr/local/bin/imagent`）再 install——注册的是
+> `current_exe`，别用下载目录 / 临时构建产物。
+
+```bash
+imagent service status     # 运行状态
+imagent service uninstall  # 停止并卸载
+```
+
+| | macOS（launchd 用户代理） | Linux（systemd 用户单元） |
+|---|---|---|
+| 服务名 | `com.imagent[.<profile>]` | `imagent[-<profile>]` |
+| 定义 | `~/Library/LaunchAgents/*.plist` | `~/.config/systemd/user/*.service` |
+| 日志 | `~/.imagent/logs/daemon.log` | `journalctl --user -u imagent -f` |
+| 无人登录也运行 | 天然支持（登录即启） | 需一次 `loginctl enable-linger $USER`（服务器场景） |
+
+secret 轮换 / 环境变量变化后：重新 `export` + `imagent service install`（先卸旧再装新，等效更新）。多实例：`imagent --profile work service install` → 独立服务与状态目录。
 
 ## 命令（IM 内）
 
@@ -210,14 +242,18 @@ imagent allow ou_xxx        # 或 config 里填 allowed_senders = ["ou_xxx"]
 | `/compact` | 软压缩上下文（摘要 + 重置 + 延续） |
 | `/cd [path]` | 切工作目录（`/resume` 本机会话列表随之变化） |
 | `/ws list\|save\|use\|remove` | 命名工作空间 |
-| `/img <path>` | 发 workdir 内图片到 IM |
+| `/img <path>` `/file <path>` | 发 workdir 内图片 / 任意文件到 IM |
+| `/timeout [N\|off\|default]` | 会话级空闲看门狗（分钟） |
 | `/perm <off\|allow\|deny\|ask>` | 权限模式热切 |
 | `/stop` | 中断当前在飞任务（杀 agent 子进程，清空排队消息） |
-| `/config [k v]` | 查看 / 热改配置（cot_detail / batch_window_ms / agent_idle_timeout_secs） |
+| `/config [k v]` | 查看 / 热改配置（cot_detail / batch_window_ms / agent_idle_timeout_secs / require_mention / reply_mode） |
 | `/status` `/doctor` `/reconnect` | 运行状态 / 自检 / 强制平台重连 |
-| `/allow <id>` `/disallow <id>` | 授权 / 撤销 sender（管理员门槛） |
-| `/chat allow\|deny\|list` | 会话（群）白名单管理 |
+| `/allow <id\|@名字>` `/disallow` | 授权 / 撤销 sender（飞书群内可直接 @ 对方，管理员门槛） |
+| `/admin [list\|add\|remove]` | 管理员动态管理（首位设立自动带操作者，防自锁） |
+| `/chat allow\|deny\|allow-all\|list` | 会话（群）白名单；`allow-all` 批量放行 bot 已加入的全部群 |
 | `/list` `/whoami` | 查白名单 / 查自己的 sender 与会话 id |
+
+群消息默认须 `@机器人`（`feishu_require_mention_in_group`，正文 @ 占位自动清洗）；`/config reply_mode text` 可切纯文本回复（无卡片权限或偏好简洁时）。
 
 ## 权限审批闭环（杀手锏）
 
