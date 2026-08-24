@@ -6,6 +6,23 @@
 
 （空——下一段变更从这里开始。）
 
+## [1.3.0] — 2026-08-24
+
+> ask_via_im：终端 agent 反向接入——电脑终端上的任意 agent 需要用户决策时，把问题转发到飞书，用户在手机点按钮/回文字作答，答案按 request_id 精确分发回发起方。多 agent 并发与 IM 会话审批共存。
+
+### Added
+- **`ask_via_im` MCP 工具 + `imagent mcp-ask` 子命令**：供任意终端 agent（Claude Code / ZCode / Codex…）挂载的 stdio MCP server；工具参数 `question`（多行 markdown 补充说明）/ `options`（≤8 选项按钮）/ `source`（提问方标记，多 agent 并发区分「谁在问」，卡片标题渲染「💻（终端 agent · \<source\>）」）/ `timeout_secs`。config `ask_via_im_conv`（设了才启用）+ `ask_via_im_timeout_secs`（默认 1800，可被调用覆盖）。
+- **`imagent mcp-ask --print-config`**：输出 mcpServers JSON（command 自动填当前二进制绝对路径），一键贴进任意 MCP client。
+- **install.sh 一键脚本**：二进制（sha256 强校验；release 缺 mcp-ask 时 cargo 源码构建兜底）→ 首次生成 config（交互填 workdir/飞书凭据，secret 写 shell rc 防重复，已有 config 绝不覆盖）→ MCP 自动挂载（有 `claude` CLI 直接 `claude mcp add`，否则打印 JSON）。支持 `--workdir/--app-id/--secret/--yes/--mcp-only/--version/--bin`。
+- README「终端 agent 接入」章节 + 一键脚本「方式零」。
+
+### Changed
+- **`PermissionRouter` 多 pending（conv × request_id）**：同 conv 下终端提问与 IM 会话审批并存互不顶替（per-conv 上限 8，超限最旧收敛）；回复路由三级——按钮回调带 `req` 精确匹配 → 自由文本引用回复（`parent_id` 命中询问卡）→ 最新 pending 兜底；hint 未命中不劫持别的 pending。`PermissionReply` 新增 `raw_text`（ask 路径以原文回传）。
+- **socket 协议加 `kind`/`request_id`**（缺省 `permission`/`legacy`，向后兼容旧 MCP 子进程）；ask 分支独立超时预算，超时回 error（非 fail-closed deny），agent 可自行重试。
+- **`Platform` trait 询问三方法带 `request_id`**，`send_permission_ask` 返回卡片消息 id（引用回复路由锚点）；新增 `cancel_all_permission_asks`（/stop 按 conv 全量收敛）。
+- 飞书：审批/问题卡按钮 value 带 `req`；`parse_message_event` 解析 `parent_id`；`pending_asks` 多卡登记、cancel/resolve 精确到单卡；同 request_id 异常重发时旧卡 patch superseded。
+- MCP 审批路径（claude headless）每次调用生成 `p-` 前缀 request_id。
+
 ## [1.2.0] — 2026-08-22
 
 > P6：第二轮对标 lark-coding-agent-bridge——mention 基础设施、命令按钮卡、话题群、开箱体验。（见 [P4_ROADMAP](docs/internal/P4_ROADMAP.md) P6 实现纪要。）
