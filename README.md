@@ -74,7 +74,17 @@ imagent 的几个关键取舍（解释「为什么这么设计」，而非与某
 
 **前置**：macOS 或 Linux（Windows 暂不支持——IM 权限审批闭环与配置热重载依赖 Unix domain socket / SIGHUP）；默认 agent 后端 Claude Code CLI（`npm i -g @anthropic-ai/claude-code`）。
 
-**方式一 · 下载预编译二进制（推荐，免装 Rust）**：从 [GitHub Releases](https://github.com/uzziahlin/imagent/releases) 取对应平台文件（每个 release 附 `sha256` 校验）：
+**方式零 · 一键脚本（推荐）**：安装二进制（含 sha256 校验）→ 首次生成 `~/.imagent/config.toml`（可交互填飞书凭据）→ 自动挂载 MCP（有 `claude` CLI 直接 `claude mcp add`，否则打印可贴的 JSON）。已有 config 绝不覆盖，可重复运行：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/uzziahlin/imagent/main/install.sh)
+# 等价参数式：--workdir <path> --app-id <cli_xxx> --secret <s> --yes --mcp-only
+#            （--version <tag> / --bin <dir> 指定版本与安装目录；详见脚本头注释）
+```
+
+> 最新 release 尚未包含 `mcp-ask` 子命令（ask_via_im 需 v1.3.0+）时，脚本检测到后会用本机 cargo 自动源码构建兜底。
+
+**方式一 · 下载预编译二进制（免装 Rust）**：从 [GitHub Releases](https://github.com/uzziahlin/imagent/releases) 取对应平台文件（每个 release 附 `sha256` 校验）：
 
 | 平台 | 文件 |
 |---|---|
@@ -199,6 +209,7 @@ imagent mcp-ask --print-config
 
 - **Claude Code**：`claude mcp add imagent -- /usr/local/bin/imagent mcp-ask`
 - **其它 MCP client（ZCode / Cursor 等）**：把上面 `--print-config` 的 JSON 并入 MCP 配置即可。
+- **懒人路径**：`bash <(curl -fsSL .../install.sh)` 的安装脚本最后一步会自动完成上述挂载（见[安装](#安装)）。
 
 再在 agent 的指令文件（`CLAUDE.md` / `AGENTS.md`）里加一句：
 
