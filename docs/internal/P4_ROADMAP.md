@@ -731,3 +731,46 @@ deploy/），注册当前二进制路径与 --profile；`uninstall`/`status` 对
 
 真机验证清单（合入前建议跑一遍）：话题群内发卡/流式 patch/审批按钮回调；
 `/config require_mention off` 后未 @bot 群消息放行；setup 两个平台的校验步骤。
+
+---
+
+# P7 迭代路线 —— 对标收尾（A1-A5）：管理员管理 / 批量放行 / 陌生人提示 / 回复偏好 / profile 迁移
+
+> 来源：2026-08-24 对 lark-coding-agent-bridge 的存量复核——P6 之后真正剩余的
+> 五个「参考项目有、我们没有」的体验项。核心功能面已追平/反超，本轮全部为补齐。
+
+## 总览
+
+| # | 功能 | 状态 |
+|---|---|---|
+| A1 | `/admin [list\|add\|remove]`：管理员 IM 内动态管理（store schema v7） | ✅ |
+| A2 | `/chat allow-all`：批量放行 bot 已加入的全部群（`Platform::list_joined_chats`） | ✅ |
+| A3 | 陌生人被 @ 提示（config `stranger_mention_hint`，默认关；`InboundMessage.mentioned_bot`） | ✅ |
+| A4 | 回复形态偏好 `/config reply_mode card\|text`（text = 不建卡走纯文本流） | ✅ |
+| A5 | `imagent profile export\|import`（JSON；secret 默认脱敏，`--include-secrets --yes` 才带明文） | ✅ |
+
+## 实现纪要（2026-08-24，worktree 分支 `p7`）
+
+- **A1**：store schema **v7**（`admin_senders` 表，结构对齐 allowed_senders；线性迁移）；
+  启动合并 config 种子 ∪ store 动态条目；`/admin add|remove` 内存 + store 双写 + 审计，
+  即时生效。**防自锁**（测试暴露的真实缺陷）：向后兼容模式（列表空 = 全员可管）下
+  设立首位管理员会立即收回操作者权限——空 → 非空转换时把操作者一并加入；
+  `/admin remove` 不可移除自己；清空列表时显式警示语义回退。@提及形态复用
+  P6 的 `resolve_mention_target`。
+- **A2**：`Platform::list_joined_chats`（默认 Err，返回 JoinedChat{chat_id 为 conv
+  形态, name}）；飞书走 SDK `ListChatsRequest` 分页聚合（每页 50 × 至多 10 页，
+  200 群截断）；`/chat allow-all` 逐群双写 + 汇总回执 + 审计。
+- **A3**：`InboundMessage.mentioned_bot`（飞书 proto：群消息 + bot id 已知 + mentions
+  命中 bot 才为 true；p2p/弱过滤恒 false——提示宁可漏发不可误发）；config
+  `stranger_mention_hint`（默认 false 完全静默防探测）；handle() 未过白名单分支
+  据此回一句「管理员可 /chat allow」引导。
+- **A4**：`ReplyMode`（Card 默认 / Text）config + `/config reply_mode` 热切换；
+  round.rs 建卡闸门 `supports_streaming_card && reply_mode==Card`——text 模式
+  下一轮起走纯文本流（含命令卡降级同路）。
+- **A5**：`profile export`（config_toml 行级脱敏 wecom_secret + allowed_senders/
+  chats/admins/命名空间表 → JSON；keyring 凭据与环境变量 secret 不随导出，回执
+  明示）；`profile import`（导入为新 profile，写 config 0600 + 种子表；不允许
+  导入为 default）。default profile 的导出经 `profile_state_dir` 映射到 ~/.imagent。
+
+真机验证清单：`/chat allow-all` 真实翻页；`/admin add @名字` 群内流程；
+reply_mode=text 一轮完整对话的纯文本流形态。

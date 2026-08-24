@@ -2,7 +2,16 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
-## [Unreleased]
+## [Unreleased] — P7：对标收尾（A1-A5）——管理员管理、批量放行、陌生人提示、回复偏好、profile 迁移
+
+（见 [P4_ROADMAP](docs/internal/P4_ROADMAP.md) P7 实现纪要。）
+
+### Added
+- **`/admin [list|add|remove]`**：管理员 IM 内动态管理（store schema v7 `admin_senders` 表，config 种子 ∪ 动态条目，即时生效 + 审计）；首位管理员设立时操作者自动一并加入（防自锁）；不可移除自己。
+- **`/chat allow-all`**：批量放行 bot 已加入的全部群（`Platform::list_joined_chats`，飞书分页聚合，200 群上限）。
+- **陌生人被 @ 提示**（config `stranger_mention_hint`，默认关 = 完全静默防探测）：未放行群里 @bot 回一句 `/chat allow` 引导；`InboundMessage.mentioned_bot` 据群消息 mentions 元数据判定（弱过滤不误发）。
+- **`/config reply_mode card|text`**：回复形态偏好热切换（text = 不建卡走纯文本流；config `reply_mode` 种子）。
+- **`imagent profile export|import`**：JSON 导出/导入（config 行级脱敏 `wecom_secret`，`--include-secrets --yes` 才带明文；白名单/管理员/命名空间随迁；keyring/环境变量凭据不随导出并明示）。
 
 （空——下一段变更从这里开始。）
 

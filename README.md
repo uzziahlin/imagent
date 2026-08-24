@@ -227,7 +227,8 @@ imagent mcp-ask --print-config
 | P2 | ✅ | 限流熔断 / 动态白名单 / 多命名会话 / 软 compact / 推流 / typing / **权限审批** / 媒体 |
 | P3 | ✅ | 开源化（MIT license/CI/凭据加密/mdBook）+ WeCom + ACP + 多 agent（Codex/Gemini）+ 运维（指标/热重载/daemon）+ 长消息分片 |
 | P4 | ✅ | 任务控制（`/stop`/消息批处理/空闲看门狗）+ 飞书平台（CardKit 流式卡片/审批按钮/云文档评论）+ 会话白名单 + COT 三档 `/config` + IM 诊断命令 + 统一 `/resume`（接管电脑端会话）+ Profile 多实例 |
-| P6 | 🔜 | 第二轮对标：mention 基础设施（@过滤/@剥离/`/allow @提及`）+ 命令交互卡片 + 话题群隔离 + `setup` 向导 / `service` 自管理 + 出站文件 + `/cd` 安全校验 + 会话级 `/timeout`（纪要见 [`docs/internal/P4_ROADMAP.md`](docs/internal/P4_ROADMAP.md) §P6） |
+| P6 | ✅ | 第二轮对标：mention 基础设施（@过滤/@剥离/`/allow @提及`）+ 命令交互卡片 + 话题群隔离 + `setup` 向导 / `service` 自管理 + 出站文件 + `/cd` 安全校验 + 会话级 `/timeout` |
+| P7 | ✅ | 对标收尾：`/admin` 管理员动态管理（防自锁）+ `/chat allow-all` 批量放行 + 陌生人 @ 提示开关 + `/config reply_mode` 回复偏好 + `profile export/import`（纪要见 [`docs/internal/P4_ROADMAP.md`](docs/internal/P4_ROADMAP.md) §P7） |
 
 > **当前状态**：**v1.0.0 已发布**（见 [Releases](https://github.com/uzziahlin/imagent/releases)）。P0–P4 全部交付；P4 纪要见 [`docs/internal/P4_ROADMAP.md`](docs/internal/P4_ROADMAP.md)，P5（安全与正确性）七波已收官；剩余为 v1.1+ 架构建议（见 [`CODE_REVIEW_v6`](docs/CODE_REVIEW_v6.md) §架构建议）。
 
