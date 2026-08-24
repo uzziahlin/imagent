@@ -100,7 +100,7 @@ async fn setup_feishu(cfg_path: PathBuf) -> Result<()> {
         "# 由 imagent setup 生成\n\
          default_workdir = \"{workdir}\"\n\
          allowed_senders = []        # 留空 = 发现模式：先跑起来，日志里看你的 open_id 再填\n\
-         allowed_tools = [\"Read\", \"Edit\"]\n\
+         allowed_tools = [\"Read\",\"Write\",\"Edit\",\"Grep\",\"Glob\",\"WebFetch\",\"WebSearch\"]  # 执行类(Bash)显式加+ask 过审\n\
          agent = \"claude-cli\"\n\
          platform = \"feishu\"\n\
          feishu_app_id = \"{app_id}\"\n\
@@ -141,7 +141,7 @@ async fn setup_wecom(cfg_path: PathBuf) -> Result<()> {
         "# 由 imagent setup 生成\n\
          default_workdir = \"{workdir}\"\n\
          allowed_senders = []\n\
-         allowed_tools = [\"Read\", \"Edit\"]\n\
+         allowed_tools = [\"Read\",\"Write\",\"Edit\",\"Grep\",\"Glob\",\"WebFetch\",\"WebSearch\"]  # 执行类(Bash)显式加+ask 过审\n\
          agent = \"claude-cli\"\n\
          platform = \"wecom\"\n\
          wecom_bot_id = \"{bot_id}\"\n\
