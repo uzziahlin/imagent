@@ -37,6 +37,7 @@ imagent 是一个常驻网关进程：监听 IM 私聊消息 → 鉴权 → 驱�
 - 🔁 **消息批处理**：运行中到达的消息排队，与连发消息合并为一轮执行（不重复跑轮、不烧 token）。
 - 🛠️ **IM 内运维**：`/status` `/doctor` `/reconnect` `/config`（COT 三档展示 off/brief/detailed 等热改）。
 - 📄 **飞书生态**：CardKit 真流式卡片、审批按钮卡片、云文档评论 @bot 触发（同评论线程回复）。
+- 💻 **终端 agent 反向接入（ask_via_im）**：电脑终端上任意 agent 需要你决策时，把问题转发到飞书——人不在电脑前也能在手机上点按钮作答；多 agent 并发按 request_id 精确分发（见[终端 agent 接入](#终端-agent-接入ask_via-im人不在电脑前也能问你)）。
 - 🧩 **Profile 多实例**：`--profile` 一部署多 bot 身份（config/db/socket/媒体全隔离）。
 - 🛡️ **限流熔断**：`sendmessage` 服从式退避（防封号，不绕风控）。
 - 🎨 **媒体收发**：图片 / 文件（AES-128-ECB + CDN，协议强制）。
@@ -111,6 +112,7 @@ allowed_senders = []        # 留空 = 发现模式（先看日志拿你的 from
 allowed_tools = ["Read", "Edit"]
 # permission_mode = "off"   # off / allow / deny / ask（放 Bash 等危险工具时用 ask）
 # allowed_chats = ["feishu:oc_xxx"]  # 会话(群)白名单：群消息 chat 放行 OR sender 放行（/chat 可动态管理）
+# ask_via_im_conv = "feishu:ou_xxx"  # 终端 agent 的 ask_via_im 提问投递会话（配了才启用，见「终端 agent 接入」）
 # agent_idle_timeout_secs = 300      # 空闲看门狗：连续无输出 N 秒自动终止（0=关）
 # batch_window_ms = 1500             # 连发消息合并为一轮 prompt 的窗口（0=关）
 # cot_detail = "brief"               # 工具过程展示 off / brief / detailed（/config 可热改）
@@ -166,6 +168,47 @@ imagent start            # 前台常驻，Ctrl-C 退出
 ```
 
 回复 `y` → 执行；其它 → 拒绝。基于 Claude Code 的 `--permission-prompt-tool` MCP 回调实现。**飞书**下询问是「✅ 允许 / ⛔ 拒绝」按钮卡片——点一下即回，无需打字。等审批期间 `/stop` 仍可用（自动回 deny 中止）。
+
+## 终端 agent 接入：ask_via_im（人不在电脑前也能问你）
+
+反向场景：你电脑终端上跑的 **任意 agent**（Claude Code / ZCode / Codex…）需要你决策时，把问题转发到你的飞书——你在手机上点选项或回文字，答案直接回到终端的 agent。适合挂个长任务离开工位。
+
+```
+终端 agent ──MCP(stdio)──► imagent mcp-ask ──unix socket──► imagent 主进程
+                                                                │ 飞书问题卡（选项按钮）
+终端 agent ◄──用户回复原文────────────────────────────────────────┘
+```
+
+### 1. 主进程配置（一次）
+
+```toml
+# ~/.imagent/config.toml（platform = "feishu" 时）
+ask_via_im_conv = "feishu:ou_xxx"     # 你和 bot 的私聊（/whoami 可查）
+# ask_via_im_timeout_secs = 1800      # 等待超时，默认 30 分钟
+```
+
+`imagent start feishu` 保持运行即可（socket/token 鉴权与审批闭环共用）。
+
+### 2. 挂到终端 agent（一键）
+
+```bash
+# 生成 mcpServers 配置（command 自动填当前二进制的绝对路径）：
+imagent mcp-ask --print-config
+# {"mcpServers":{"imagent":{"command":"/usr/local/bin/imagent","args":["mcp-ask"]}}}
+```
+
+- **Claude Code**：`claude mcp add imagent -- /usr/local/bin/imagent mcp-ask`
+- **其它 MCP client（ZCode / Cursor 等）**：把上面 `--print-config` 的 JSON 并入 MCP 配置即可。
+
+再在 agent 的指令文件（`CLAUDE.md` / `AGENTS.md`）里加一句：
+
+> 需要我决策/确认且我可能不在终端前时，调用 `ask_via_im` 工具提问（`source` 传项目名），不要只在本地等待。
+
+### 3. 使用语义
+
+- 工具参数：`question`（多行 markdown 可写补充说明）、`options`（≤8 个选项按钮）、`source`（提问方标记，多 agent 并发时区分「谁在问」）、`timeout_secs`。
+- 多 agent 并发提问互不干扰（`conv + request_id` 多 pending 路由）：**点按钮=精确回答那张卡**；直接打字=回答**最新**一张；引用回复=回答被引用的卡。
+- 超时返回错误（非 deny），agent 可自行决定重试。
 
 ## 安全
 
