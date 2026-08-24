@@ -140,7 +140,10 @@ impl Dispatcher {
         // agent 产出的媒体文件路径（Write 图片）；run 结束后回传 IM。
         let mut media_out: Vec<String> = Vec::new();
         // 流式卡片：支持卡片的平台累积输出 + 节流 patch（单卡片更新），不支持则每 Text 多发文本。
-        let mut card = if self.platform.supports_streaming_card(&conv) {
+        // P7-A4：reply_mode=text 用户偏好强制纯文本（不建卡，/config 可热改）。
+        let card_allowed = self.platform.supports_streaming_card(&conv)
+            && *self.reply_mode.read() == ReplyMode::Card;
+        let mut card = if card_allowed {
             Some(CardSession::new(
                 self.store.clone(),
                 conv.clone(),

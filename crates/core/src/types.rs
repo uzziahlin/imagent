@@ -65,11 +65,23 @@ pub struct InboundMessage {
     pub media_errors: Vec<String>,
     /// 本条消息中 @ 提及的用户（不含 bot 自身；无提及为空）。
     pub mentions: Vec<Mention>,
+    /// 本条群消息是否 @ 了 bot（P7-A3：陌生人提示的触发条件；p2p 恒 false——
+    /// 平台层据 mentions 元数据与 bot open_id 判定，弱过滤未知时为 false）。
+    pub mentioned_bot: bool,
     /// 询问卡按钮回调携带的 request_id（多 pending 精确路由用；普通消息为 None）。
     pub ask_req: Option<String>,
     /// 引用回复的目标消息 id（自由文本路由到被引用的询问卡；无引用为 None）。
     pub reply_to: Option<String>,
     pub reply_hint: ReplyHint,
+}
+
+/// bot 已加入的群（P7-A2：`/chat allow-all` 批量放行用）。
+#[derive(Debug, Clone)]
+pub struct JoinedChat {
+    /// 平台侧群标识（如飞书 `oc_xxx`）。
+    pub chat_id: String,
+    /// 群显示名（缺名为空串）。
+    pub name: String,
 }
 
 /// Backend 流式产出的分块。

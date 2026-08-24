@@ -222,7 +222,12 @@ impl PermissionRouter {
     /// 清理该 conv 的**全部** pending（/stop 路径）：逐个投递 deny 唤醒等待者，
     /// 返回被清理的 request_id 列表（调用方据此收敛询问卡）。
     pub async fn cancel_all(&self, conv_id: &str) -> Vec<String> {
-        let removed = self.pending.lock().await.remove(conv_id).unwrap_or_default();
+        let removed = self
+            .pending
+            .lock()
+            .await
+            .remove(conv_id)
+            .unwrap_or_default();
         removed
             .into_iter()
             .map(|p| {
