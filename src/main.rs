@@ -103,6 +103,10 @@ enum Cmd {
         /// 主进程权限路由 socket 路径（缺省 `<imagent_home>/permission.sock`）。
         #[arg(long)]
         sock: Option<String>,
+        /// 打印挂到终端 agent 的 mcpServers 配置 JSON（command 用当前二进制绝对
+        /// 路径），然后退出。一键配置用。
+        #[arg(long)]
+        print_config: bool,
     },
 }
 
@@ -638,7 +642,17 @@ async fn main() -> Result<()> {
                 tracing::error!(target: "imagent::mcp", error = %e, "MCP server 退出");
             }
         }
-        Cmd::McpAsk { sock } => {
+        Cmd::McpAsk { sock, print_config } => {
+            // --print-config：输出 mcpServers JSON（current_exe 解析为绝对路径），
+            // 供一键贴进任意 MCP client 配置。不依赖 config/主进程。
+            if print_config {
+                let exe = std::env::current_exe()
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "imagent".to_string());
+                println!("{}", imagent_core::mcp::mcp_servers_config(&exe));
+                return Ok(());
+            }
             // 终端 agent 的 ask_via_im MCP server。conv/超时来自 config——
             // 未配置 ask_via_im_conv 时退出码 2 + stderr 提示（tools/list 无从
             // 兜底，让终端 agent 的报错可见）。

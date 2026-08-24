@@ -328,6 +328,34 @@ pub async fn run_mcp_server(
 /// 工具名（终端 agent 调用）。
 pub const ASK_TOOL_NAME: &str = "ask_via_im";
 
+/// `source` 参数的字符上限（卡片标题空间有限）。
+const ASK_SOURCE_MAX_CHARS: usize = 48;
+
+/// 清洗 source 标签：去首尾/内部多余空白（折成单空格，卡片单行展示）+ 截断。
+fn sanitize_source(raw: &str) -> String {
+    let collapsed: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.chars().take(ASK_SOURCE_MAX_CHARS).collect()
+}
+
+/// 问题正文的来源前缀：有 source 标出「哪个 agent」，无则通用标记。
+/// 多 agent 共用同一 conv 时用户靠它区分提问方。
+pub fn ask_source_prefix(source: Option<&str>) -> String {
+    match source.map(sanitize_source).filter(|s| !s.is_empty()) {
+        Some(s) => format!("💻（终端 agent · {s}）"),
+        None => "💻（终端 agent 提问）".to_string(),
+    }
+}
+
+/// `--print-config` 输出的 mcpServers 配置 JSON（一键挂到任意 MCP client）。
+pub fn mcp_servers_config(exe: &str) -> String {
+    json!({
+        "mcpServers": {
+            "imagent": { "command": exe, "args": ["mcp-ask"] }
+        }
+    })
+    .to_string()
+}
+
 /// `tools/list`（纯函数，便于单测）。
 pub fn build_ask_tools_list() -> Value {
     json!({
@@ -337,10 +365,14 @@ pub fn build_ask_tools_list() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "question": { "type": "string", "description": "问题正文（可含决策所需的上下文摘要）" },
+                    "question": { "type": "string", "description": "问题正文（可含决策所需的上下文摘要，支持多行 markdown）" },
                     "options": {
                         "type": "array", "items": { "type": "string" }, "maxItems": 8,
                         "description": "可选的选项按钮（用户也可直接回复自由文本）"
+                    },
+                    "source": {
+                        "type": "string", "maxLength": 48,
+                        "description": "提问方标记（如项目名/机器名），显示在问题卡标题——多 agent 并发时用于区分"
                     },
                     "timeout_secs": { "type": "integer", "description": "等待超时（秒），缺省用服务端默认" }
                 },
@@ -360,6 +392,7 @@ pub async fn ask_user_via_socket(
     request_id: &str,
     question: &str,
     options: &[String],
+    source: Option<&str>,
     timeout_secs: u64,
 ) -> io::Result<std::result::Result<String, String>> {
     let mut stream = UnixStream::connect(sock).await?;
@@ -378,6 +411,7 @@ pub async fn ask_user_via_socket(
         "request_id": request_id,
         "question": question,
         "options": options,
+        "source": source,
         "timeout_secs": timeout_secs,
     });
     stream.write_all(format!("{req}\n").as_bytes()).await?;
@@ -470,6 +504,11 @@ pub async fn run_ask_mcp_server(
                         .and_then(|v| v.as_array())
                         .map(|a| a.iter().filter_map(|o| o.as_str()).map(String::from).collect())
                         .unwrap_or_default();
+                    let source = args
+                        .get("source")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
                     let timeout_secs = args
                         .get("timeout_secs")
                         .and_then(|v| v.as_u64())
@@ -492,6 +531,7 @@ pub async fn run_ask_mcp_server(
                             &request_id,
                             &question,
                             &options,
+                            source.as_deref(),
                             timeout_secs,
                         )
                         .await
@@ -559,6 +599,34 @@ mod tests {
             tools[0]["inputSchema"]["required"][0], "question",
             "question 必填"
         );
+        assert!(
+            tools[0]["inputSchema"]["properties"]["source"].is_object(),
+            "source 可选参数应在 schema 中"
+        );
+    }
+
+    /// source 前缀：清洗空白、截断；无 source 用通用标记。
+    #[test]
+    fn ask_source_prefix_sanitizes_and_falls_back() {
+        assert_eq!(
+            ask_source_prefix(Some(" imagent  项目 ")),
+            "💻（终端 agent · imagent 项目）",
+            "内部多余空白折成单空格"
+        );
+        let long = "很".repeat(200);
+        let p = ask_source_prefix(Some(&long));
+        assert!(p.chars().count() < long.chars().count(), "超长应截断");
+        assert_eq!(ask_source_prefix(Some("   ")), "💻（终端 agent 提问）");
+        assert_eq!(ask_source_prefix(None), "💻（终端 agent 提问）");
+    }
+
+    /// --print-config 的 mcpServers JSON：command 是实际二进制、args 带子命令。
+    #[test]
+    fn mcp_servers_config_shape() {
+        let raw = mcp_servers_config("/usr/local/bin/imagent");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["mcpServers"]["imagent"]["command"], "/usr/local/bin/imagent");
+        assert_eq!(v["mcpServers"]["imagent"]["args"][0], "mcp-ask");
     }
 
     /// 真机校准（claude CLI 2.1.156）：--permission-prompt-tool 只认 server 限定

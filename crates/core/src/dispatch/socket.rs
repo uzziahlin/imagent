@@ -333,10 +333,15 @@ impl Dispatcher {
             .unwrap_or(default_timeout.as_secs().max(1));
         let timeout = std::time::Duration::from_secs(timeout_secs);
         // 合成 AskUserQuestion 工具输入——复用 feishu 的问题卡渲染与 ask:<选项> 回调链路。
-        // 前缀标记来源，让用户一眼分清终端提问与 IM 会话内提问。
+        // 前缀标记来源（可带 source 标签），让用户一眼分清终端提问与 IM 会话内提问。
+        let source = req
+            .get("source")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         let input = serde_json::json!({
             "questions": [{
-                "question": format!("💻（终端 agent 提问）{question}"),
+                "question": format!("{}{question}", crate::mcp::ask_source_prefix(source.as_deref())),
                 "options": options.iter().map(|o| serde_json::json!({"label": o})).collect::<Vec<_>>(),
             }]
         });
