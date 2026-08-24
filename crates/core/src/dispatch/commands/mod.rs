@@ -47,6 +47,17 @@ impl Dispatcher {
                 sender = %sender.0,
                 "非白名单 sender 且会话未授权，丢弃"
             );
+            // P7-A3：可选的「陌生人被 @ 提示」——仅在开启且确实 @ 了 bot 时回
+            // 一句引导（私聊/弱过滤未知为 false，保持完全静默；防探测默认关）。
+            if *self.stranger_mention_hint.read() && msg.mentioned_bot {
+                self.reply(
+                    &conv,
+                    "👋 你好！我还未在此群启用。群管理员可发送 `/chat allow` 放行本群\
+                     （或私聊管理员处理）；启用前我不会响应其他消息。",
+                    &hint,
+                )
+                .await;
+            }
             return;
         }
 
@@ -83,6 +94,11 @@ impl Dispatcher {
                     }
                     "/chat" => {
                         self.cmd_chat(&conv, &sender, &hint, &parts).await;
+                        return;
+                    }
+                    "/admin" => {
+                        self.cmd_admin(&conv, &sender, &hint, &parts, &msg.mentions)
+                            .await;
                         return;
                     }
                     "/config" => {
@@ -153,7 +169,7 @@ impl Dispatcher {
                         self.reply(
                             &conv,
                             &format!(
-                                "未知命令: {cmd}（支持: /new /switch /sessions /resume /compact /cd /ws /img /file /timeout /perm /stop /config /status /doctor /reconnect /allow /disallow /chat /list /whoami /help）"
+                                "未知命令: {cmd}（支持: /new /switch /sessions /resume /compact /cd /ws /img /file /timeout /perm /stop /config /status /doctor /reconnect /allow /disallow /chat /admin /list /whoami /help）"
                             ),
                             &hint,
                         )

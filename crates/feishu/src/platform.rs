@@ -20,7 +20,7 @@ use tracing::warn;
 
 use imagent_core::{
     command_card_fallback_text, split_message, CardButton, CardTerminal, ConvId, CoreError, Dedup,
-    InboundMessage, MediaRef, OutboundCard, Platform, ReplyHint, Result,
+    InboundMessage, JoinedChat, MediaRef, OutboundCard, Platform, ReplyHint, Result,
 };
 
 use open_lark::{Config, CoreConfig};
@@ -30,10 +30,10 @@ use crate::card::{
     render_stream_init_card, stream_body_final, stream_body_md,
 };
 use crate::client::{
-    create_card_entity, download_file, download_image, fetch_bot_open_id, fetch_token, patch_card,
-    patch_card_element, patch_card_settings, reply_comment, reply_message, send_card_msg,
-    send_card_ref_msg, send_file_msg, send_image_msg, send_text_msg, upload_file, upload_image,
-    FeishuWsClient,
+    create_card_entity, download_file, download_image, fetch_bot_open_id, fetch_token,
+    list_joined_chats, patch_card, patch_card_element, patch_card_settings, reply_comment,
+    reply_message, send_card_msg, send_card_ref_msg, send_file_msg, send_image_msg, send_text_msg,
+    upload_file, upload_image, FeishuWsClient,
 };
 use crate::proto::{
     comment_target_from_conv, is_comment_event, is_group_message_event, parse_card_action_event,
@@ -455,18 +455,14 @@ impl FeishuPlatform {
         msg_id: &str,
         tool_name: &str,
     ) {
-        let superseded = self
-            .pending_asks
-            .lock()
-            .await
-            .insert(
-                request_id.to_string(),
-                PendingAskCard {
-                    conv_id: conv_id.to_string(),
-                    msg_id: msg_id.to_string(),
-                    tool_name: tool_name.to_string(),
-                },
-            );
+        let superseded = self.pending_asks.lock().await.insert(
+            request_id.to_string(),
+            PendingAskCard {
+                conv_id: conv_id.to_string(),
+                msg_id: msg_id.to_string(),
+                tool_name: tool_name.to_string(),
+            },
+        );
         if let Some(old) = superseded {
             let card_json = crate::card::render_permission_card_superseded(&old.tool_name);
             if let Err(e) = self
@@ -795,10 +791,9 @@ impl Platform for FeishuPlatform {
         // P6（AskUserQuestion 透传）：agent 的问题渲染成「问题 + 选项按钮」卡，
         // 而非降级的 允许/拒绝 审批卡；解析失败降级普通审批卡。
         let card_json = if tool_name == "AskUserQuestion" {
-            crate::card::render_question_card(input_summary, &conv.0, request_id)
-                .unwrap_or_else(|| {
-                    render_permission_card(tool_name, input_summary, &conv.0, request_id)
-                })
+            crate::card::render_question_card(input_summary, &conv.0, request_id).unwrap_or_else(
+                || render_permission_card(tool_name, input_summary, &conv.0, request_id),
+            )
         } else {
             render_permission_card(tool_name, input_summary, &conv.0, request_id)
         };
@@ -970,6 +965,16 @@ impl Platform for FeishuPlatform {
     async fn set_require_mention_in_group(&self, on: bool) -> Result<()> {
         self.mention_policy.write().await.require_mention_in_group = on;
         Ok(())
+    }
+
+    /// P7-A2：bot 已加入的群（conv 形态 id + 群名），`/chat allow-all` 批量放行。
+    async fn list_joined_chats(&self) -> Result<Vec<JoinedChat>> {
+        let token = self.get_token().await?;
+        let chats = list_joined_chats(&self.core_config, &token).await?;
+        Ok(chats
+            .into_iter()
+            .map(|(chat_id, name)| JoinedChat { chat_id, name })
+            .collect())
     }
 
     /// 发流式卡片。**句柄前缀分流**（core 无感，两种句柄均原样透传给 update_card）：

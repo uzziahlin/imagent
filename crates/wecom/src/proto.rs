@@ -207,6 +207,7 @@ pub fn parse_msg_callback(frame: &WsFrame) -> imagent_core::Result<(String, Inbo
         media: vec![],
         media_errors: Vec::new(),
         mentions: Vec::new(),
+        mentioned_bot: false,
         ask_req: None,
         reply_to: None,
         reply_hint: ReplyHint::None,

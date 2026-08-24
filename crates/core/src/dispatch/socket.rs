@@ -262,7 +262,10 @@ impl Dispatcher {
             .chars()
             .take(64)
             .collect::<String>();
-        let kind = req.get("kind").and_then(|v| v.as_str()).unwrap_or("permission");
+        let kind = req
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("permission");
         if conv_id.is_empty() {
             return;
         }
@@ -270,7 +273,13 @@ impl Dispatcher {
         match kind {
             "ask" => {
                 Self::handle_ask_socket(
-                    stream, platform, router, conv, request_id, ask_via_im_timeout, &req,
+                    stream,
+                    platform,
+                    router,
+                    conv,
+                    request_id,
+                    ask_via_im_timeout,
+                    &req,
                 )
                 .await;
             }
@@ -347,7 +356,13 @@ impl Dispatcher {
         });
         let input_summary = truncate_str(&input.to_string(), 2000);
         let card_msg_id = match platform
-            .send_permission_ask(&conv, &request_id, "AskUserQuestion", &input_summary, &ReplyHint::None)
+            .send_permission_ask(
+                &conv,
+                &request_id,
+                "AskUserQuestion",
+                &input_summary,
+                &ReplyHint::None,
+            )
             .await
         {
             Ok(mid) => mid,
@@ -463,7 +478,13 @@ impl Dispatcher {
         let input_summary = truncate_str(&input_str, 2000);
         // P1-3：发送失败 → 回写 deny 并 return，不挂 pending。
         let card_msg_id = match platform
-            .send_permission_ask(&conv, &request_id, &tool_name, &input_summary, &ReplyHint::None)
+            .send_permission_ask(
+                &conv,
+                &request_id,
+                &tool_name,
+                &input_summary,
+                &ReplyHint::None,
+            )
             .await
         {
             Ok(mid) => mid,
