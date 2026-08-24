@@ -2,7 +2,9 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
-## [Unreleased] — P7：对标收尾（A1-A5）——管理员管理、批量放行、陌生人提示、回复偏好、profile 迁移
+## [1.4.0] — 2026-08-24
+
+> P7：对标收尾（A1-A5）——管理员管理、批量放行、陌生人提示、回复偏好、profile 迁移。
 
 （见 [P4_ROADMAP](docs/internal/P4_ROADMAP.md) P7 实现纪要。）
 
