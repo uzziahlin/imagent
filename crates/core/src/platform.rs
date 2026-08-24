@@ -3,7 +3,9 @@
 use async_trait::async_trait;
 
 use crate::error::Result;
-use crate::types::{CardButton, ConvId, InboundMessage, MediaRef, OutboundCard, ReplyHint};
+use crate::types::{
+    CardButton, ConvId, InboundMessage, JoinedChat, MediaRef, OutboundCard, ReplyHint,
+};
 
 /// IM 平台抽象。由 `ilink` / `wecom` 等适配器实现，注入到 `Dispatcher`。
 #[async_trait]
@@ -147,6 +149,16 @@ pub trait Platform: Send + Sync {
         Err(crate::error::CoreError::Platform(
             self.name(),
             "该平台不支持 require_mention（无群聊 @ 语义）".into(),
+        ))
+    }
+
+    /// P7-A2：bot 已加入的群列表（`/chat allow-all` 批量放行）。`chat_id` 为
+    /// **conv 形态**（含平台前缀，如 `feishu:oc_xxx`），可直接入 allowed_chats。
+    /// 默认 Err（平台无群概念——ilink / wecom 现状）。
+    async fn list_joined_chats(&self) -> Result<Vec<JoinedChat>> {
+        Err(crate::error::CoreError::Platform(
+            self.name(),
+            "该平台不支持列出已加入的群".into(),
         ))
     }
 }

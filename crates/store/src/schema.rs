@@ -3,7 +3,7 @@
 //! 用 `PRAGMA user_version` 做简单线性迁移：v1 = 建 5 张基础表，v2 = 动态白名单 + 审计日志。
 
 /// 当前代码支持的最新 schema 版本（migrate 上限 + user_version 过新拒绝阈值，P2-O）。
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// v1 全部建表语句（`CREATE TABLE IF NOT EXISTS`，可重复执行）。
 pub const SCHEMA_V1: &str = r#"
@@ -118,6 +118,17 @@ CREATE TABLE IF NOT EXISTS live_cards (
 );
 "#;
 
+/// v7：管理员动态白名单（P7-A1，`/admin add|remove`）。与 config 的
+/// `admin_senders` 种子取并集；结构对齐 allowed_senders（人维度）。
+pub const SCHEMA_V7: &str = r#"
+CREATE TABLE IF NOT EXISTS admin_senders (
+  sender    TEXT PRIMARY KEY,
+  added_at  INTEGER NOT NULL,
+  added_by  TEXT,
+  source    TEXT
+);
+"#;
+
 /// 在已打开的连接上跑线性迁移。幂等：逐版本推进（v1→v2→…），已到目标版本则跳过。
 pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     let current: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -160,6 +171,10 @@ pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     if current < 6 {
         tx.execute_batch(SCHEMA_V6)?;
         tx.pragma_update(None, "user_version", 6_i64)?;
+    }
+    if current < 7 {
+        tx.execute_batch(SCHEMA_V7)?;
+        tx.pragma_update(None, "user_version", 7_i64)?;
     }
     tx.commit()?;
     Ok(())

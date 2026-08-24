@@ -302,6 +302,7 @@ pub fn parse_card_action_event(payload: &[u8]) -> Option<(String, InboundMessage
             media: vec![],
             media_errors: Vec::new(),
             mentions: Vec::new(),
+            mentioned_bot: false,
             ask_req,
             reply_to: None,
             reply_hint: ReplyHint::None,
@@ -455,6 +456,7 @@ pub fn parse_comment_event(
             media: vec![],
             media_errors: Vec::new(),
             mentions: Vec::new(),
+            mentioned_bot: false,
             ask_req: None,
             reply_to: None,
             reply_hint: ReplyHint::None,
@@ -591,6 +593,16 @@ pub fn parse_message_event(
         Some(root) => format!("feishu:{receive_id}:{root}"),
         None => format!("feishu:{receive_id}"),
     };
+    // P7-A3：群消息是否 @ 了 bot（bot id 已知时据 mentions 元数据判定；
+    // 弱过滤/无元数据为 false——陌生人提示宁可漏发不可误发）。
+    let mentioned_bot = evt.event.message.chat_type == "group"
+        && bot_open_id.is_some_and(|b| {
+            evt.event
+                .message
+                .mentions
+                .iter()
+                .any(|m| m.open_id() == Some(b))
+        });
     let msg = InboundMessage {
         conv_id: ConvId(conv),
         sender: UserId(open_id),
@@ -598,6 +610,7 @@ pub fn parse_message_event(
         media: vec![],
         media_errors: Vec::new(),
         mentions,
+        mentioned_bot,
         ask_req: None,
         reply_to: evt.event.message.parent_id.filter(|p| !p.is_empty()),
         reply_hint: ReplyHint::None,
@@ -1488,5 +1501,58 @@ mod tests {
             thread_target_from_conv(&ConvId("feishu:comment:dox:c1".into())).is_none(),
             "评论 conv 第二段非 om_ 前缀，不应误判为话题"
         );
+    }
+
+    /// P7-A3：mentioned_bot——群消息 @bot（bot id 已知）为 true；@ 他人 / p2p /
+    /// bot id 未知为 false。
+    #[test]
+    fn mentioned_bot_flag_semantics() {
+        let mk = |chat_type: &str, mentions: &str| {
+            serde_json::json!({
+                "header":{"event_id":"e","event_type":"im.message.receive_v1"},
+                "event":{
+                    "sender":{"sender_id":{"open_id":"ou_s"}},
+                    "message":{
+                        "message_type":"text",
+                        "content":"{\"text\":\"x\"}",
+                        "chat_type":chat_type,"chat_id":"oc_g1",
+                        "mentions":serde_json::from_str::<serde_json::Value>(mentions).unwrap()
+                    },
+                    "chat":{"chat_id":"oc_g1"}
+                }
+            })
+            .to_string()
+            .into_bytes()
+        };
+        let at_bot = r#"[{"key":"@_user_1","id":{"open_id":"ou_bot"},"name":"agent"}]"#;
+        let at_other = r#"[{"key":"@_user_1","id":{"open_id":"ou_x"},"name":"x"}]"#;
+        // 群 + @bot → true。
+        let (_, m, _) = parse_message_event(
+            &mk("group", at_bot),
+            &MentionPolicy::PERMISSIVE,
+            Some("ou_bot"),
+        )
+        .expect("应解析");
+        assert!(m.mentioned_bot, "群 @bot 应为 true");
+        // 群 + @他人 → false。
+        let (_, m, _) = parse_message_event(
+            &mk("group", at_other),
+            &MentionPolicy::PERMISSIVE,
+            Some("ou_bot"),
+        )
+        .expect("应解析");
+        assert!(!m.mentioned_bot, "群 @他人应为 false");
+        // p2p（即使提及里有 bot 形态）→ false：陌生人提示仅限群。
+        let (_, m, _) = parse_message_event(
+            &mk("p2p", at_bot),
+            &MentionPolicy::PERMISSIVE,
+            Some("ou_bot"),
+        )
+        .expect("应解析");
+        assert!(!m.mentioned_bot, "p2p 恒 false");
+        // bot id 未知 → false（宁可漏发不可误发）。
+        let (_, m, _) = parse_message_event(&mk("group", at_bot), &MentionPolicy::PERMISSIVE, None)
+            .expect("应解析");
+        assert!(!m.mentioned_bot, "bot id 未知应为 false");
     }
 }

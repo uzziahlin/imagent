@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use open_lark::auth::AuthService;
+use open_lark::communication::im::v1::chat::list::ListChatsRequest;
 use open_lark::communication::im::v1::image::create::CreateImageRequest;
 use open_lark::communication::im::v1::image::models::ImageType;
 use open_lark::communication::im::v1::message::create::{CreateMessageBody, CreateMessageRequest};
@@ -698,6 +699,53 @@ pub async fn fetch_bot_open_id(
                 "fetch_bot_open_id: 响应缺 data.open_id".into(),
             )
         })
+}
+
+/// 列出 bot 已加入的群（P7-A2 `/chat allow-all`）：GET /im/v1/chats 分页聚合。
+/// 返回 `(conv 形态 chat_id, 群名)`——conv 形态 = `feishu:<oc_xxx>`，可直接入
+/// allowed_chats。上限 200 群（防异常翻页 runaway）。
+pub async fn list_joined_chats(
+    core_config: &CoreConfig,
+    token: &str,
+) -> imagent_core::Result<Vec<(String, String)>> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut page_token: Option<String> = None;
+    for _ in 0..10 {
+        // 每页 50 × 至多 10 页 = 500 上限内再按 200 截断。
+        let mut req = ListChatsRequest::new(core_config.clone()).page_size(50);
+        if let Some(t) = page_token.clone() {
+            req = req.page_token(t);
+        }
+        let option = RequestOption::builder()
+            .tenant_access_token(token.to_string())
+            .build();
+        let resp: serde_json::Value = req.execute_with_options(option).await.map_err(|e| {
+            imagent_core::CoreError::Platform(PLATFORM, format!("list_joined_chats: {e}"))
+        })?;
+        if let Some(items) = resp.get("items").and_then(|v| v.as_array()) {
+            for it in items {
+                let chat_id = it.get("chat_id").and_then(|v| v.as_str()).unwrap_or("");
+                let name = it.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                if !chat_id.is_empty() {
+                    out.push((format!("feishu:{chat_id}"), name.to_string()));
+                }
+            }
+        }
+        let has_more = resp
+            .get("has_more")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        page_token = resp
+            .get("page_token")
+            .and_then(|v| v.as_str())
+            .filter(|t| !t.is_empty())
+            .map(String::from);
+        if !has_more || page_token.is_none() || out.len() >= 200 {
+            break;
+        }
+    }
+    out.truncate(200);
+    Ok(out)
 }
 
 /// 回复云文档评论（P4-9）：POST `/drive/v1/files/{file_token}/comments/{comment_id}/replies`。

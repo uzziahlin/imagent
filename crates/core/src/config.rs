@@ -88,6 +88,32 @@ impl CotDetail {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReplyMode {
+    /// 流式卡片（默认）：支持卡片的会话走 CardKit/整卡流式，无权限自动降级文本。
+    #[default]
+    Card,
+    /// 纯文本：不建卡，流式走文本多发（偏好简单/无卡片权限的用户，P7-A4）。
+    Text,
+}
+
+impl ReplyMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Card => "card",
+            Self::Text => "text",
+        }
+    }
+    pub fn from_str_lossy(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "card" => Some(Self::Card),
+            "text" => Some(Self::Text),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Config {
     /// agent 工作根目录（agent 的 cwd，**非沙箱**：仅决定工作目录，不限制可读路径；
@@ -184,6 +210,13 @@ pub struct Config {
     /// bot id 取不到时退化为「消息内含任意 @」弱过滤。改此项需重启。
     #[serde(default = "default_feishu_require_mention_in_group")]
     pub feishu_require_mention_in_group: bool,
+    /// 陌生人被 @ 提示（P7-A3；默认 false = 完全静默，防探测）。开启后：未过白名单
+    /// 的群消息若 @ 了 bot，回一句「管理员可 /chat allow」引导（私聊始终静默）。
+    #[serde(default)]
+    pub stranger_mention_hint: bool,
+    /// 回复形态偏好（P7-A4；默认 card）。text = 不建卡走纯文本流（/config 可热改）。
+    #[serde(default)]
+    pub reply_mode: ReplyMode,
 }
 
 fn default_tools() -> Vec<String> {
@@ -298,7 +331,8 @@ impl Config {
             ));
         }
         const ASK_VIA_IM_TIMEOUT_MAX_SECS: u64 = 86_400;
-        if cfg.ask_via_im_timeout_secs == 0 || cfg.ask_via_im_timeout_secs > ASK_VIA_IM_TIMEOUT_MAX_SECS
+        if cfg.ask_via_im_timeout_secs == 0
+            || cfg.ask_via_im_timeout_secs > ASK_VIA_IM_TIMEOUT_MAX_SECS
         {
             return Err(CoreError::Config(format!(
                 "ask_via_im_timeout_secs 须在 1..={ASK_VIA_IM_TIMEOUT_MAX_SECS}（当前 {}）",
@@ -350,6 +384,8 @@ platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人)
 # feishu_app_id = "cli_xxx"            # 飞书自建应用 app_id（仅 platform="feishu"；app_secret 走环境变量，keyring 为后续 P2）
 # feishu_base_url = "https://open.feishu.cn"  # 可选，默认 https://open.feishu.cn；Lark 国际版 https://open.larksuite.com（MVP 不覆盖）
 # feishu_require_mention_in_group = true       # 群消息须 @bot 才处理（默认 true：客户端过滤 + 剥离 @bot 占位；false=全收，过滤交给事件订阅 scope）
+# stranger_mention_hint = false                # 未放行群里被 @ 时回一句引导（默认 false 完全静默防探测；私聊始终静默）
+# reply_mode = "card"                          # 回复形态：card(默认,流式卡片) | text(纯文本)；/config 可热改
 permission_mode = "off"     # off(默认,claude按allowedTools自行处理) | allow | deny | ask(IM审批闭环)
 # metrics_addr = "127.0.0.1:9100"   # 默认关闭；设为 "ip:port" 开启 /metrics + /health HTTP server
 # message_max_len = 2000              # 单条出站消息字符上限（Unicode char）；不设 = 不分片

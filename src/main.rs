@@ -122,6 +122,28 @@ enum ProfileAction {
         #[arg(long)]
         yes: bool,
     },
+    /// 导出 profile 为 JSON（跨机器迁移；P7-A5）。config 里 secret 默认脱敏，
+    /// `--include-secrets --yes` 才带明文。keyring 凭据不随导出（机器绑定）。
+    Export {
+        name: String,
+        /// 输出文件（默认 ./<name>-profile.json）。
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        include_secrets: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// 从 export 产物导入为新 profile（P7-A5）。目标已存在需 --yes 覆盖 config。
+    Import {
+        /// export 产物 JSON 路径。
+        path: PathBuf,
+        /// 目标 profile 名（缺省用导出时的名字；不允许 default）。
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -152,6 +174,16 @@ fn profile_root(name: &str) -> anyhow::Result<std::path::PathBuf> {
     }
     let home = dirs::home_dir().ok_or_else(|| anyhow!("无法定位 home 目录"))?;
     Ok(home.join(".imagent").join("profiles").join(&sanitized))
+}
+
+/// profile 状态目录（P7-A5）：default → `~/.imagent`；其余 → profiles/<name>。
+fn profile_state_dir(name: &str) -> anyhow::Result<PathBuf> {
+    if name == "default" {
+        return Ok(dirs::home_dir()
+            .ok_or_else(|| anyhow!("无法定位 home 目录"))?
+            .join(".imagent"));
+    }
+    profile_root(name)
 }
 
 #[tokio::main]
@@ -289,6 +321,155 @@ async fn main() -> Result<()> {
                     std::fs::remove_dir_all(&root)?;
                     println!("已删除 profile {name}（{}）", root.display());
                 }
+                // P7-A5：导出 profile（config 脱敏 + 白名单/管理员/命名空间表）。
+                ProfileAction::Export {
+                    name,
+                    output,
+                    include_secrets,
+                    yes,
+                } => {
+                    let dir = profile_state_dir(&name)?;
+                    let cfg_path = dir.join("config.toml");
+                    if !cfg_path.is_file() {
+                        return Err(anyhow!(
+                            "profile {name} 无 config.toml（{}），无可导出内容",
+                            cfg_path.display()
+                        ));
+                    }
+                    let mut config_toml = std::fs::read_to_string(&cfg_path)?;
+                    if include_secrets {
+                        if !yes {
+                            return Err(anyhow!(
+                                "--include-secrets 会把 wecom_secret 明文写入导出文件，确认请加 --yes"
+                            ));
+                        }
+                    } else {
+                        // 行级脱敏：wecom_secret = "..." → "***"，其余原样。
+                        config_toml = config_toml
+                            .lines()
+                            .map(|l| {
+                                let t = l.trim_start();
+                                if t.starts_with("wecom_secret") {
+                                    "wecom_secret = \"***REDACTED***\" # 由 profile export 脱敏"
+                                } else {
+                                    l
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                    }
+                    let store = imagent_store::Store::open(&dir.join("imagent.db")).await?;
+                    let allowed_senders = store.list_allowed_senders().await.unwrap_or_default();
+                    let allowed_chats = store.list_allowed_chats().await.unwrap_or_default();
+                    let admin_senders = store.list_admin_senders().await.unwrap_or_default();
+                    let workspaces = store
+                        .list_config("workspace:")
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect::<std::collections::BTreeMap<_, _>>();
+                    let payload = serde_json::json!({
+                        "schema": 1,
+                        "exported_at": std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0),
+                        "name": name,
+                        "config_toml": config_toml,
+                        "allowed_senders": allowed_senders,
+                        "allowed_chats": allowed_chats,
+                        "admin_senders": admin_senders,
+                        "workspaces": workspaces,
+                    });
+                    let out_path =
+                        output.unwrap_or_else(|| PathBuf::from(format!("{name}-profile.json")));
+                    std::fs::write(&out_path, serde_json::to_string_pretty(&payload)?)?;
+                    println!(
+                        "✅ 已导出 profile {name} → {}（白名单 {}/群 {}/管理员 {}；config {}）\n                         ⚠️ keyring 凭据（iLink）与飞书 app_secret（环境变量）不随导出，需在目标机器重配。",
+                        out_path.display(),
+                        payload["allowed_senders"].as_array().map(|a| a.len()).unwrap_or(0),
+                        payload["allowed_chats"].as_array().map(|a| a.len()).unwrap_or(0),
+                        payload["admin_senders"].as_array().map(|a| a.len()).unwrap_or(0),
+                        if include_secrets { "含明文 secret" } else { "secret 已脱敏" },
+                    );
+                }
+                // P7-A5：导入为新 profile（写 config + 种子白名单/管理员/空间）。
+                ProfileAction::Import { path, name, yes } => {
+                    let raw = std::fs::read_to_string(&path)
+                        .map_err(|e| anyhow!("读取 {} 失败：{e}", path.display()))?;
+                    let v: serde_json::Value =
+                        serde_json::from_str(&raw).map_err(|e| anyhow!("JSON 解析失败：{e}"))?;
+                    if v.get("schema").and_then(|s| s.as_i64()) != Some(1) {
+                        return Err(anyhow!("未知的导出格式（schema != 1）"));
+                    }
+                    let target = name.clone().unwrap_or_else(|| {
+                        v.get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("imported")
+                            .to_string()
+                    });
+                    if target == "default" {
+                        return Err(anyhow!("不允许导入为 default（会覆盖运行中的 ~/.imagent）"));
+                    }
+                    let root = profile_root(&target)?;
+                    let cfg_path = root.join("config.toml");
+                    if root.is_dir() && cfg_path.is_file() && !yes {
+                        return Err(anyhow!(
+                            "profile {target} 已有 config（{}），覆盖请加 --yes",
+                            cfg_path.display()
+                        ));
+                    }
+                    std::fs::create_dir_all(&root)?;
+                    let config_toml = v
+                        .get("config_toml")
+                        .and_then(|c| c.as_str())
+                        .ok_or_else(|| anyhow!("导出文件缺 config_toml"))?;
+                    std::fs::write(&cfg_path, config_toml)?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(
+                            &cfg_path,
+                            std::fs::Permissions::from_mode(0o600),
+                        );
+                    }
+                    let store = imagent_store::Store::open(&root.join("imagent.db")).await?;
+                    for s in v
+                        .get("allowed_senders")
+                        .and_then(|a| a.as_array())
+                        .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>())
+                        .unwrap_or_default()
+                    {
+                        store.add_allowed_sender(s, None, Some("import")).await?;
+                    }
+                    for c in v
+                        .get("allowed_chats")
+                        .and_then(|a| a.as_array())
+                        .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>())
+                        .unwrap_or_default()
+                    {
+                        store.add_allowed_chat(c, None, Some("import")).await?;
+                    }
+                    for a in v
+                        .get("admin_senders")
+                        .and_then(|a| a.as_array())
+                        .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>())
+                        .unwrap_or_default()
+                    {
+                        store.add_admin_sender(a, None, Some("import")).await?;
+                    }
+                    if let Some(ws) = v.get("workspaces").and_then(|w| w.as_object()) {
+                        for (k, val) in ws {
+                            if let Some(p) = val.as_str() {
+                                store.set_config(&format!("workspace:{k}"), p).await?;
+                            }
+                        }
+                    }
+                    println!(
+                        "✅ 已导入 profile {target}（{}）\n启动：imagent --profile {target} start",
+                        root.display()
+                    );
+                }
             }
         }
         Cmd::Start { platform } => {
@@ -392,6 +573,14 @@ async fn main() -> Result<()> {
             let auth = imagent_core::Auth::with_chats(initial, initial_chats);
             let discovery = auth.is_discovery();
 
+            // P7-A1：管理员 = config 种子 ∪ store 动态条目（/admin add 持久化）。
+            let mut initial_admins = config.admin_senders.clone();
+            for a in store.list_admin_senders().await.unwrap_or_default() {
+                if !initial_admins.contains(&a) {
+                    initial_admins.push(a);
+                }
+            }
+
             // P5-7（安全）：群放行 + 管理员为空的组合 = 群内任何成员都具备管理
             // 能力（/allow /chat /config /perm）。启动期硬告警（不拒启：单用户
             // 依赖「空=全员可」的既有语义），群部署必须显式设 admin_senders。
@@ -418,8 +607,10 @@ async fn main() -> Result<()> {
                 perm_mode.clone(),
                 imagent_core::TaskBudgets::from_config(&config),
                 config.cot_detail,
-                config.admin_senders.clone(),
+                initial_admins,
             ));
+            // P7-A3/A4：启动偏好（陌生人 @ 提示开关 + 回复形态），构造后注入。
+            dispatcher.set_prefs(config.stranger_mention_hint, config.reply_mode);
 
             // 9. 运维 HTTP server（/metrics + /health）。metrics_addr 为 None 或空串则关闭。
             let start_at = std::time::Instant::now();
@@ -671,9 +862,12 @@ async fn main() -> Result<()> {
                 );
                 std::process::exit(2);
             };
-            let sock = sock.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).or_else(
-                || imagent_core::default_sock_path().map(|p| p.to_string_lossy().into_owned()),
-            );
+            let sock = sock
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    imagent_core::default_sock_path().map(|p| p.to_string_lossy().into_owned())
+                });
             let Some(sock) = sock else {
                 eprintln!("无法定位 permission.sock 路径（home 目录缺失？）");
                 std::process::exit(2);

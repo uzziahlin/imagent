@@ -1,6 +1,7 @@
 //! 白名单 / 权限 / 配置类命令（管理操作，多数有 admin 门槛）。
 
 use super::*;
+use crate::config::ReplyMode;
 use crate::types::{Mention, UserId};
 
 /// P6-2：`/allow @名字` 的提及反解——从**本条消息**的 mentions 元数据取 open_id
@@ -218,6 +219,68 @@ impl Dispatcher {
         let sub = parts.get(1).map(|s| s.trim()).unwrap_or("");
         let actor = sender.0.as_str();
         match sub.to_ascii_lowercase().as_str() {
+            // P7-A2：批量放行 bot 已加入的全部群（首次部署 onboard；平台不支持
+            // 群列表时如实报错）。逐群内存 + store 双写，汇总回执。
+            "allow-all" | "allow-all-groups" => {
+                if !self.is_admin(actor) {
+                    self.reply(conv, "仅管理员（admin_senders）可批量放行群。", hint)
+                        .await;
+                    return;
+                }
+                match self.platform.list_joined_chats().await {
+                    Ok(chats) if chats.is_empty() => {
+                        self.reply(conv, "bot 尚未加入任何群（先拉 bot 进群再试）。", hint)
+                            .await;
+                    }
+                    Ok(chats) => {
+                        let total = chats.len();
+                        let mut applied = 0usize;
+                        for c in &chats {
+                            if self.auth.allow_chat(&c.chat_id) {
+                                applied += 1;
+                            }
+                            if let Err(e) = self
+                                .store
+                                .add_allowed_chat(&c.chat_id, Some(actor), Some("im"))
+                                .await
+                            {
+                                warn!(target: "imagent::core", error = %e, "批量放行持久化失败（内存已加）");
+                            }
+                        }
+                        let _ = self
+                            .store
+                            .append_audit(
+                                "chat_allow_all",
+                                Some(actor),
+                                None,
+                                Some(&format!("applied={applied}/{total}")),
+                            )
+                            .await;
+                        let names: Vec<String> = chats
+                            .iter()
+                            .map(|c| {
+                                if c.name.is_empty() {
+                                    c.chat_id.clone()
+                                } else {
+                                    c.name.clone()
+                                }
+                            })
+                            .collect();
+                        self.reply(
+                            conv,
+                            &format!(
+                                "✅ 已放行 bot 加入的全部 {total} 个群（新增 {applied}）：\n- {}",
+                                names.join("\n- ")
+                            ),
+                            hint,
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        self.reply(conv, &format!("列出群失败：{e}"), hint).await;
+                    }
+                }
+            }
             "allow" | "deny" => {
                 if !self.is_admin(actor) {
                     self.reply(conv, "仅管理员（admin_senders）可管理会话白名单。", hint)
@@ -292,6 +355,189 @@ impl Dispatcher {
         }
     }
 
+    /// /admin [list|add <id|@名字>|remove <id|@名字>] —— 管理员动态管理（P7-A1）。
+    /// 与 config `admin_senders` 种子取并集；`/admin add` 即时生效 + 持久化。
+    /// 防自锁：不可移除自己；清空列表时显式警示「空 = 所有白名单用户具备管理权」。
+    pub(super) async fn cmd_admin(
+        &self,
+        conv: &ConvId,
+        sender: &UserId,
+        hint: &ReplyHint,
+        parts: &[&str],
+        mentions: &[Mention],
+    ) {
+        let sub = parts
+            .get(1)
+            .map(|s| s.trim())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let actor = sender.0.as_str();
+        match sub.as_str() {
+            "" | "list" => {
+                let admins = self.admin_senders.read().clone();
+                let text = if admins.is_empty() {
+                    "管理员列表为空（= 所有白名单用户都具备管理权，P2-D 向后兼容语义）。\
+                     /admin add <id|@名字> 可收紧。"
+                        .to_string()
+                } else {
+                    format!("管理员（{}）：{}", admins.len(), admins.join(", "))
+                };
+                self.reply(conv, &text, hint).await;
+            }
+            "add" | "remove" => {
+                if !self.is_admin(actor) {
+                    self.reply(conv, "仅管理员可管理管理员列表。", hint).await;
+                    return;
+                }
+                let arg = parts.get(2).map(|s| s.trim()).unwrap_or("");
+                if arg.is_empty() {
+                    self.reply(
+                        conv,
+                        "用法：/admin add <id|@名字> | /admin remove <id|@名字>",
+                        hint,
+                    )
+                    .await;
+                    return;
+                }
+                let target: String = if arg.starts_with('@') {
+                    match resolve_mention_target(arg, mentions) {
+                        Some(id) => id.to_string(),
+                        None => {
+                            self.reply(
+                                conv,
+                                "无法从本条消息解析该 @提及。请在同一条命令里 @ 该用户，或直接用其 open_id。",
+                                hint,
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                } else {
+                    arg.to_string()
+                };
+                if sub == "add" {
+                    // 防自锁：向后兼容模式下（列表空 = 全员可管）设立首位管理员会
+                    // 立即收回操作者权限——空 → 非空转换时把操作者一并加入
+                    //（对齐参考项目「创建者不可自锁」语义）。
+                    let (added, auto_self) = {
+                        let mut list = self.admin_senders.write();
+                        let was_empty = list.is_empty();
+                        let auto_self = was_empty && !list.iter().any(|a| a == actor);
+                        if auto_self {
+                            list.push(actor.to_string());
+                        }
+                        let added = if list.contains(&target) {
+                            false
+                        } else {
+                            list.push(target.clone());
+                            true
+                        };
+                        (added, auto_self)
+                    };
+                    if auto_self {
+                        if let Err(e) = self
+                            .store
+                            .add_admin_sender(actor, Some(actor), Some("im-auto"))
+                            .await
+                        {
+                            warn!(target: "imagent::core", error = %e, "操作者自动入管理列表持久化失败");
+                        }
+                    }
+                    let persist_failed = self
+                        .store
+                        .add_admin_sender(&target, Some(actor), Some("im"))
+                        .await
+                        .is_err();
+                    if persist_failed {
+                        warn!(target: "imagent::core", "add_admin_sender 持久化失败（内存已加，重启丢失）");
+                    }
+                    let _ = self
+                        .store
+                        .append_audit(
+                            "admin_add",
+                            Some(actor),
+                            Some(&target),
+                            Some(if added { "added" } else { "already-present" }),
+                        )
+                        .await;
+                    // 管理员不在 sender 白名单时命令门都过不了——附引导而非自动放权。
+                    let note = if self.auth.is_allowed(&UserId(target.clone())) {
+                        String::new()
+                    } else {
+                        "\n⚠️ 该用户不在 sender 白名单，先 `/allow` 才能实际使用管理命令。"
+                            .to_string()
+                    };
+                    let persist_note = if persist_failed {
+                        "（⚠️ 持久化失败，重启后失效）"
+                    } else {
+                        ""
+                    };
+                    let lock_note = if auto_self {
+                        format!("\n🔒 首位管理员已设立，操作者 `{actor}` 已一并加入（防自锁）。")
+                    } else {
+                        String::new()
+                    };
+                    self.reply(
+                        conv,
+                        &format!("✅ 已添加管理员 `{target}`{persist_note}。{lock_note}{note}"),
+                        hint,
+                    )
+                    .await;
+                } else {
+                    if target == actor {
+                        self.reply(
+                            conv,
+                            "不允许移除自己（防止锁死）。如需操作请在本地改 config 或其他管理员操作。",
+                            hint,
+                        )
+                        .await;
+                        return;
+                    }
+                    let existed = {
+                        let mut list = self.admin_senders.write();
+                        let before = list.len();
+                        list.retain(|a| a != &target);
+                        before != list.len()
+                    };
+                    if let Err(e) = self.store.remove_admin_sender(&target).await {
+                        warn!(target: "imagent::core", error = %e, "remove_admin_sender 失败");
+                    }
+                    let _ = self
+                        .store
+                        .append_audit(
+                            "admin_remove",
+                            Some(actor),
+                            Some(&target),
+                            Some(if existed { "removed" } else { "absent" }),
+                        )
+                        .await;
+                    let empty_warn = if self.admin_senders.read().is_empty() {
+                        "\n⚠️ 管理员列表已清空 = 所有白名单用户都具备管理权（含 /allow /config /admin）。"
+                    } else {
+                        ""
+                    };
+                    self.reply(
+                        conv,
+                        &format!(
+                            "已移除管理员 `{target}`（{}）。{empty_warn}",
+                            if existed { "成功" } else { "原本不在" }
+                        ),
+                        hint,
+                    )
+                    .await;
+                }
+            }
+            _ => {
+                self.reply(
+                    conv,
+                    "用法：/admin [list] | /admin add <id|@名字> | /admin remove <id|@名字>",
+                    hint,
+                )
+                .await;
+            }
+        }
+    }
+
     /// /config [k v] —— 查看/热改运行参数（admin 门槛）。
     pub(super) async fn cmd_config(
         &self,
@@ -316,8 +562,9 @@ impl Dispatcher {
                 None => "（本平台不支持）".to_string(),
             };
             let text = format!(
-                                "当前配置：\n- cot_detail = {cot}（off|brief|detailed）\n- batch_window_ms = {window_ms}\n- agent_idle_timeout_secs = {idle_secs}（0=关）\n- agent_timeout_secs = {}（重启生效）\n- permission_mode = {perm}\n- require_mention = {require_mention}（热切换，重启回 config 值）\n用法：/config <key> <value>（管理员）",
+                                "当前配置：\n- cot_detail = {cot}（off|brief|detailed）\n- batch_window_ms = {window_ms}\n- agent_idle_timeout_secs = {idle_secs}（0=关）\n- agent_timeout_secs = {}（重启生效）\n- permission_mode = {perm}\n- require_mention = {require_mention}（热切换，重启回 config 值）\n- reply_mode = {}（card|text，热切换，重启回 config 值）\n用法：/config <key> <value>（管理员）",
                                 self.agent_timeout.as_secs(),
+                                self.reply_mode.read().as_str(),
                             );
             self.reply(conv, &text, hint).await;
             return;
@@ -361,8 +608,17 @@ impl Dispatcher {
                 },
                 _ => "用法：/config require_mention <on|off>".into(),
             },
+            // P7-A4：回复形态偏好（card=流式卡片 / text=纯文本），热切换即时生效
+            //（下一轮起不建卡），重启回 config 值。
+            "reply_mode" => match ReplyMode::from_str_lossy(value) {
+                Some(m) => {
+                    *self.reply_mode.write() = m;
+                    format!("✅ reply_mode = {}（下一轮生效；重启回 config 值）", m.as_str())
+                }
+                None => "用法：/config reply_mode <card|text>".into(),
+            },
             _ => {
-                "未知配置项（支持：cot_detail / batch_window_ms / agent_idle_timeout_secs / require_mention）".into()
+                "未知配置项（支持：cot_detail / batch_window_ms / agent_idle_timeout_secs / require_mention / reply_mode）".into()
             }
         };
         self.reply(conv, &result, hint).await;
