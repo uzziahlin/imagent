@@ -152,7 +152,7 @@ imagent start            # 前台常驻，Ctrl-C 退出
 
 ## 接入飞书（完整流程）
 
-飞书走**企业自建应用 + 长连接**：不需要公网 IP / 域名 / 证书，imagent 主动连飞书 WS 收事件、走 OpenAPI 发消息，适合家宽 / NAS 部署。全程约 10 分钟（`imagent setup` 向导可交互走一遍同样流程并校验凭据连通性）：
+飞书走**企业自建应用 + 长连接**：不需要公网 IP / 域名 / 证书，imagent 主动连飞书 WS 收事件、走 OpenAPI 发消息，适合家宽 / NAS 部署。全程约 10 分钟（`imagent setup` 向导可交互走一遍同样流程并校验凭据连通性；`--platform feishu|wecom|ilink` 直达对应平台引导）：
 
 **① 创建应用**：打开 [open.feishu.cn/app](https://open.feishu.cn/app) →「创建企业自建应用」→「添加应用能力」→ 启用**机器人**。
 

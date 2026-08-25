@@ -14,47 +14,104 @@ use anyhow::{anyhow, Result};
 use imagent_core::validate_workdir;
 
 /// 向导入口。非交互终端（管道/CI）直接报错——每步都要人确认，无默认狂奔模式。
-pub async fn run() -> Result<()> {
-    if !std::io::stdin().is_terminal() {
+pub async fn run(platform: Option<String>) -> Result<()> {
+    // 参数校验最先（非法平台名无论 tty 与否都该得到明确报错）。
+    if let Some(p) = platform.as_deref() {
+        match p {
+            "feishu" | "wecom" | "ilink" => {}
+            other => {
+                return Err(anyhow!(
+                    "未知平台 {other:?}，支持 --platform feishu | wecom | ilink"
+                ))
+            }
+        }
+    }
+    // ilink 分支只打印指引（无提问），允许非 tty；feishu/wecom 要逐项录入
+    // 凭据，非交互直接给出路指引而非卡在提问上。
+    let has_tty = std::io::stdin().is_terminal();
+    let need_tty = !matches!(platform.as_deref(), Some("ilink"));
+    if need_tty && !has_tty {
         return Err(anyhow!(
-            "setup 向导需要交互式终端（检测到 stdin 非 tty）。请手动编辑 config.toml（模板：imagent status 可查路径，或参考 Config::EXAMPLE）"
+            "setup 向导需要交互式终端（检测到 stdin 非 tty）。\n\
+             可用 `imagent setup --platform <feishu|wecom|ilink>` 直达对应平台引导；\n\
+             或手动编辑 config.toml（模板：imagent status 可查路径，或参考 Config::EXAMPLE）"
         ));
     }
     println!("=== imagent setup 向导 ===");
     let cfg_path: PathBuf = imagent_core::Config::default_path()
         .ok_or_else(|| anyhow!("无法定位 config 路径（home 目录缺失）"))?;
-    if cfg_path.exists() {
-        println!(
-            "⚠️  已存在配置 {}——向导产出的新配置将覆盖它（数据库/凭据不受影响）。",
-            cfg_path.display()
-        );
-        if !confirm("继续覆盖？", false)? {
-            println!("已取消。");
-            return Ok(());
-        }
-    }
 
-    println!("\n选择 IM 平台：");
-    println!("  1) feishu  飞书自建应用（推荐，本向导全流程引导）");
-    println!("  2) wecom   企业微信智能机器人（填 bot_id + secret）");
-    println!("  3) ilink   个人微信 iLink（扫码登录，向导外跑 `imagent login`）");
-    let choice = prompt("平台 [1-3]", "1")?;
-    match choice.as_str() {
-        "1" => setup_feishu(cfg_path).await,
-        "2" => setup_wecom(cfg_path).await,
-        "3" => {
+    // --platform 直达（脚本/惯用场景免菜单）；菜单默认值取现有 config 的平台
+    //（升级/重配场景直达自己在用的平台）。
+    let pick = |name: &str| -> Result<&str> {
+        match name {
+            "feishu" => Ok("feishu"),
+            "wecom" => Ok("wecom"),
+            "ilink" => Ok("ilink"),
+            other => Err(anyhow!(
+                "未知平台 {other:?}，支持 --platform feishu | wecom | ilink"
+            )),
+        }
+    };
+    let selected = match platform.as_deref() {
+        Some(p) => pick(p)?.to_string(),
+        None => {
+            let existing = imagent_core::Config::load(&cfg_path)
+                .ok()
+                .map(|c| c.platform);
+            let default_no = match existing.as_deref() {
+                Some("wecom") => "2",
+                Some("ilink") => "3",
+                _ => "1",
+            };
+            println!("\n选择 IM 平台：");
+            println!("  1) feishu  飞书自建应用（推荐，本向导全流程引导）");
+            println!("  2) wecom   企业微信智能机器人（填 bot_id + secret）");
+            println!("  3) ilink   个人微信 iLink（扫码登录，向导外跑 `imagent login`）");
+            let choice = prompt("平台 [1-3]", default_no)?;
+            match choice.as_str() {
+                "1" => "feishu".to_string(),
+                "2" => "wecom".to_string(),
+                "3" => "ilink".to_string(),
+                other => return Err(anyhow!("无效选择：{other}")),
+            }
+        }
+    };
+    match selected.as_str() {
+        "feishu" => setup_feishu(cfg_path).await,
+        "wecom" => setup_wecom(cfg_path).await,
+        "ilink" => {
             println!(
                 "\niLink 平台无需本向导：\n  1. 编辑 {} 填 default_workdir\n  2. `imagent login` 扫码\n  3. `imagent start`（发现模式，日志里看 from_user_id）\n  4. `imagent allow <from_user_id>` 后重启",
                 cfg_path.display()
             );
             Ok(())
         }
-        other => Err(anyhow!("无效选择：{other}")),
+        _ => unreachable!("pick/match 已限 feishu|wecom|ilink"),
     }
+}
+
+/// 已有 config 时的覆盖确认（仅写 config 的分支需要；ilink 纯指引不问）。
+fn confirm_overwrite(cfg_path: &std::path::Path) -> Result<bool> {
+    if !cfg_path.exists() {
+        return Ok(true);
+    }
+    println!(
+        "⚠️  已存在配置 {}——向导产出的新配置将覆盖它（数据库/凭据不受影响）。",
+        cfg_path.display()
+    );
+    if !confirm("继续覆盖？", false)? {
+        println!("已取消。");
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 /// 飞书全流程：清单引导 → 凭据校验 → 工作目录 → 写配置。
 async fn setup_feishu(cfg_path: PathBuf) -> Result<()> {
+    if !confirm_overwrite(&cfg_path)? {
+        return Ok(());
+    }
     println!(
         "\n--- 第 1 步：创建飞书自建应用 ---\n\
          1. 打开 https://open.feishu.cn/app →「创建企业自建应用」\n\
@@ -120,6 +177,9 @@ async fn setup_feishu(cfg_path: PathBuf) -> Result<()> {
 /// WeCom：bot_id + secret 录入 + WS subscribe ack 连通性校验（P6 遗留补齐——
 /// 企微无独立 HTTP 探针接口，subscribe ack 是唯一凭据校验面）。
 async fn setup_wecom(cfg_path: PathBuf) -> Result<()> {
+    if !confirm_overwrite(&cfg_path)? {
+        return Ok(());
+    }
     println!("\n--- 录入企业微信智能机器人凭据 ---");
     let bot_id = prompt("bot_id", "")?;
     if bot_id.is_empty() {

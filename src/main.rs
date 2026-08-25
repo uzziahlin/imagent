@@ -72,7 +72,13 @@ enum Cmd {
     Stop,
     /// 首次运行交互式向导（P6-5）：平台选择 → 飞书权限/事件清单引导 → 凭据
     /// 连通性校验 → 工作目录（过宽拒绝）→ 写 config.toml。
-    Setup,
+    /// `--platform feishu|wecom|ilink` 直达对应平台引导（免菜单；ilink 纯指引
+    /// 可非交互），菜单默认值取现有 config 的平台。
+    Setup {
+        /// 直达平台引导：feishu | wecom | ilink（缺省出菜单）。
+        #[arg(long)]
+        platform: Option<String>,
+    },
     /// 服务自管理（P6-6）：安装/卸载/查询 OS 级后台服务（macOS launchd /
     /// Linux systemd 用户单元），注册当前二进制与 --profile。
     Service {
@@ -797,8 +803,8 @@ async fn main() -> Result<()> {
                 std::process::id()
             );
         }
-        Cmd::Setup => {
-            setup::run().await?;
+        Cmd::Setup { platform } => {
+            setup::run(platform).await?;
         }
         Cmd::Service { action } => {
             // service 定义随 --profile 隔离（com.imagent[.<profile>]）。
