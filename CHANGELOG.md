@@ -5,7 +5,7 @@
 ## [Unreleased]
 
 ### Added
-- ****：直达对应平台引导（免菜单）；菜单默认值自动取现有 config 的平台（重配场景直达在用平台）；ilink 纯指引分支支持非交互运行；非法平台名无论 tty 与否先报明确错误；「覆盖已有 config」确认移入真正写 config 的 feishu/wecom 分支。
+- **`imagent setup --platform feishu|wecom|ilink`**：直达对应平台引导（免菜单）；菜单默认值自动取现有 config 的平台（重配场景直达在用平台）；ilink 纯指引分支支持非交互运行；非法平台名无论 tty 与否先报明确错误；「覆盖已有 config」确认移入真正写 config 的 feishu/wecom 分支。
 
 ## [1.5.1] — 2026-08-24
 
