@@ -17,6 +17,11 @@
 
 ## [Unreleased]
 
+### Changed
+- **`permission_mode` 缺省改为 `auto`（按后端自动选档）**：claude-cli（支持 IM 审批闭环）→ 自动按 `ask` 起 `--permission-prompt-tool` 全闭环；claude-acp / codex / gemini（闭环未接）→ `off`（靠各自 sandbox / approval-mode 兜底）。启动 / SIGHUP 热重载 / `/perm auto` 均先 `resolve` 成具体档再入运行时（未解析的 `Auto` 按未接线处理，防半接状态）。与「缺省全量工具」组合成默认安全姿态：能力全开 + 危险操作过审。install.sh 不再显式写 `ask`（继承缺省）。
+
+## [Unreleased]
+
 （空——下一段变更从这里开始。）
 
 ## [1.5.1] — 2026-08-24
