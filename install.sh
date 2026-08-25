@@ -103,6 +103,7 @@ else
       die "cannot create ${INSTALL_DIR}; pass --bin <writable-dir> (e.g. \$HOME/.local/bin)"
   fi
   BIN="${INSTALL_DIR}/imagent"
+  had_old=0; [ -x "${BIN}" ] && had_old=1
 
   say "下载 ${asset}（${VERSION}）..."
   need_build=0
@@ -126,7 +127,12 @@ else
       echo "-> ${INSTALL_DIR} needs elevated rights, using sudo ..."
       sudo mv "${tmpdir}/${asset}" "${BIN}"
     fi
-    say "已安装 ${BIN}"
+    if [ "${had_old}" -eq 1 ]; then
+      say "已升级 ${BIN}（覆盖旧版本；config 与凭据不受影响）"
+      warn "在跑的进程仍用旧二进制，需重启生效：前台 Ctrl-C 重跑；后台服务 imagent service install（重装即重启）"
+    else
+      say "已安装 ${BIN}"
+    fi
     # release 早于 ask_via_im 合入（缺 mcp-ask）→ 源码构建兜底。
     if ! "${BIN}" mcp-ask --print-config >/dev/null 2>&1; then
       warn "该 release 不含 mcp-ask 子命令（ask_via_im 需 v1.3.0+）"
@@ -211,6 +217,6 @@ fi
 echo
 say "完成。后续步骤："
 echo "  1. 检查 config（${IMAGENT_HOME_DIR}/config.toml）：feishu_app_id / secret / 工作目录"
-echo "  2. 启动：${BIN} start feishu（前台常驻；imagent service install 可装后台服务）"
+echo "  2. 启动：${BIN} start（缺省读 config 的 platform；imagent service install 可装后台服务）"
 echo "  3. 给 bot 发条消息拿你的 sender id，授权：${BIN} allow <ou_xxx>"
 echo "  4. config 里设 ask_via_im_conv = \"feishu:ou_xxx\" 启用终端 agent 提问转发"
