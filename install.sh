@@ -175,7 +175,7 @@ if [ "${MCP_ONLY}" -eq 0 ] && [ ! -f "${IMAGENT_HOME_DIR}/config.toml" ]; then
     echo "# imagent 配置（install.sh 生成；完整说明见项目 README）"
     echo "default_workdir = \"${WORKDIR}\""
     echo "allowed_senders = []        # 留空 = 发现模式：给 bot 发条消息，日志拿你的 id 后 imagent allow <id>"
-    echo "allowed_tools = [\"Read\", \"Edit\"]"
+    echo "# allowed_tools 不写 = 全部工具；要收敛白名单就显式列（如 [\"Read\",\"Edit\"]）"
     echo "agent = \"claude-cli\""
     echo "platform = \"feishu\""
     echo "permission_mode = \"ask\""

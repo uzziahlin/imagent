@@ -12,6 +12,11 @@
 
 ## [Unreleased]
 
+### Changed
+- **`allowed_tools` 缺省改为全部工具**（不指定 = 不收敛）：缺省值由「读/检索/联网/编辑类白名单」改为 `["*"]`——claude 不附加 `--allowedTools`（CLI 默认全量）、codex 收敛 `workspace-write`、gemini 收敛 `auto_edit`（均不进各自最高危档）；`[]` 与 `["*"]` 同义。要收敛能力边界仍可显式列白名单。危险操作建议配合 `permission_mode = "ask"` 走 IM 审批（全量≠免审）。install.sh 不再写入限制性缺省列表。
+
+## [Unreleased]
+
 （空——下一段变更从这里开始。）
 
 ## [1.5.1] — 2026-08-24

@@ -109,15 +109,16 @@ fn codex_parse(line: &str) -> CliEvent {
 /// imagent 的 `allowed_tools`（如 `["Read","Edit"]`）与 codex 的沙箱模型
 /// 非一一对应：codex 沙箱只有 `read-only` / `workspace-write` /
 /// `danger-full-access` 三档。此处 best-effort 收敛：
-/// - 含写/执行类工具 → `workspace-write`；
-/// - 否则 → `read-only`（最安全默认）。
+/// - 不限制（空/`["*"]`，缺省即全量）或含写/执行类工具 → `workspace-write`；
+/// - 否则 → `read-only`。
 ///
 /// **绝不**自动选 `danger-full-access`。
 fn pick_sandbox(allowed_tools: &[String]) -> &'static str {
-    // WRITE_OR_EXEC 见 imagent_core::backend_common（codex/gemini 共享）。
-    let needs_write = allowed_tools
-        .iter()
-        .any(|t| WRITE_OR_EXEC.contains(&t.as_str()));
+    // tools_unrestricted / WRITE_OR_EXEC 见 imagent_core::backend_common。
+    let needs_write = imagent_core::backend_common::tools_unrestricted(allowed_tools)
+        || allowed_tools
+            .iter()
+            .any(|t| WRITE_OR_EXEC.contains(&t.as_str()));
     if needs_write {
         "workspace-write"
     } else {
@@ -157,7 +158,9 @@ mod tests {
 
     #[test]
     fn sandbox_read_only_by_default() {
-        assert_eq!(pick_sandbox(&[]), "read-only");
+        // 2026-08 缺省语义：空/["*"] = 不限制 → workspace-write（仍绝不 danger-full-access）。
+        assert_eq!(pick_sandbox(&[]), "workspace-write");
+        assert_eq!(pick_sandbox(&["*".into()]), "workspace-write");
         assert_eq!(pick_sandbox(&["Read".into(), "Grep".into()]), "read-only");
     }
 
