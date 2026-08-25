@@ -551,7 +551,9 @@ async fn main() -> Result<()> {
             // S-1：ACP 后端不强制 allowed_tools（CLI 用 --allowedTools 收敛，ACP 无等价机制）。
             // 用户配置 allowed_tools 期望工具白名单时需知晓：ACP 下工具收敛只能靠
             // permission_mode=ask/deny 审批闭环兜底，否则 claude 可用其请求的任意工具。
-            if config.agent.as_str() == "claude-acp" && !config.allowed_tools.is_empty() {
+            let tools_expect_allowlist = !config.allowed_tools.is_empty()
+                && !imagent_core::backend_common::tools_unrestricted(&config.allowed_tools);
+            if config.agent.as_str() == "claude-acp" && tools_expect_allowlist {
                 tracing::warn!(
                     target: "imagent::ops",
                     agent = %config.agent,

@@ -119,7 +119,7 @@ mkdir -p ~/.imagent
 cat > ~/.imagent/config.toml <<'EOF'
 default_workdir = "/absolute/path/to/agent/workspace"  # 必填，agent 的 cwd（非沙箱：不限制可读路径，靠 allowed_tools + permission_mode 兜底）
 allowed_senders = []        # 留空 = 发现模式（先看日志拿你的 from_user_id）
-allowed_tools = ["Read","Write","Edit","Grep","Glob","WebFetch","WebSearch"]  # 缺省值；执行类(Bash 等)显式加 + permission_mode="ask" 过审
+# allowed_tools 不写 = 全部工具（不收敛）；要白名单就显式列，如 ["Read","Edit"]；执行类建议配 permission_mode="ask" 过审
 # permission_mode = "off"   # off / allow / deny / ask（放 Bash 等危险工具时用 ask）
 # allowed_chats = ["feishu:oc_xxx"]  # 会话(群)白名单：群消息 chat 放行 OR sender 放行（/chat 可动态管理）
 # ask_via_im_conv = "feishu:ou_xxx"  # 终端 agent 的 ask_via_im 提问投递会话（配了才启用，见「终端 agent 接入」）
@@ -130,7 +130,7 @@ allowed_tools = ["Read","Write","Edit","Grep","Glob","WebFetch","WebSearch"]  # 
 EOF
 ```
 
-> **`allowed_tools` 要不要写？** 不必填——缺省即读/检索/联网/文件编辑类全套（`Read` `Write` `Edit` `Grep` `Glob` `WebFetch` `WebSearch`）。它是 agent 的**能力边界**（透传 claude 的 `--allowedTools`）：清单外的工具 agent 根本用不了。想让 agent 跑命令就把 `"Bash"` 加进去；配合 `permission_mode = "ask"`，清单内的危险操作（如每条 Bash 命令）执行前仍会在 IM 向你审批——加清单≠免审。设为 `[]` 则不附加该参数，claude 按自身默认规则。
+> **`allowed_tools` 要不要写？** 不必填——**缺省即全部工具**（`["*"]` 语义：不附加 claude 的 `--allowedTools`，CLI 自身默认全量；codex 收敛到 `workspace-write`、gemini 收敛到 `auto_edit`，均不进各自最高危档）。要收敛 agent 的能力边界就显式列白名单：清单外的工具 agent 根本用不了。注意**全量/清单内 ≠ 免审**——配合 `permission_mode = "ask"`，危险操作（如每条 Bash 命令）执行前仍会在 IM 向你审批；显式写 `[]` 与 `["*"]` 同义（不限制）。
 
 > **飞书**：`platform = "feishu"` + `feishu_app_id` + 环境变量 `IMAGENT_FEISHU_APP_SECRET`——完整开通步骤见[接入飞书](#接入飞书完整流程)。**WeCom**：`wecom_bot_id` + `wecom_secret`。两者都免公网（长连接收，HTTP 发）。
 
@@ -311,7 +311,7 @@ imagent mcp-ask --print-config
 ## 安全
 
 - **白名单鉴权**：sender 白名单 + 会话（群）白名单，非授权丢弃（iLink bot 任何人可加好友，这步不可省）。
-- **工具收敛**：`allowed_tools` 配置驱动（起步 `Read,Edit`）；workdir 用 `current_dir` 锁定。
+- **工具收敛**：`allowed_tools` 可选（缺省 = 全部工具，`[]`/`["*"]` 同义不限制；显式清单 = 白名单）；workdir 用 `current_dir` 锁定，危险操作靠 `permission_mode = "ask"` IM 审批兜底。
 - **权限审批**：危险操作 IM approve/deny（文本 / 按钮卡片）。
 - **store 加固**：文件 0600 / 目录 0700；CDN 下载 SSRF 白名单。
 - 详见 [`SECURITY.md`](SECURITY.md)。

@@ -221,16 +221,11 @@ pub struct Config {
 
 /// 缺省工具集：读/检索/联网/文件编辑类（与 Edit 同风险级：workdir 内写或只读），
 /// **不含执行类**——Bash 等显式 opt-in，配 permission_mode=ask 过 IM 审批。
+/// 2026-08 起：**缺省 = 全部工具**（`["*"]` 语义——不指定即不收敛，各 backend
+/// 取自身最宽档）。要收敛就显式列白名单（如 `["Read","Edit"]`）。执行类工具
+/// 建议始终配合 `permission_mode = "ask"` 走 IM 审批。
 fn default_tools() -> Vec<String> {
-    vec![
-        "Read".into(),
-        "Write".into(),
-        "Edit".into(),
-        "Grep".into(),
-        "Glob".into(),
-        "WebFetch".into(),
-        "WebSearch".into(),
-    ]
+    vec!["*".into()]
 }
 fn default_agent() -> String {
     "claude-cli".into()
@@ -388,7 +383,7 @@ default_workdir = "/absolute/path/to/agent/workspace"   # 必填，agent 的 cwd
 allowed_senders = []        # 留空 = 发现模式（只打日志记录入站 sender，不驱动 agent）
 # allowed_chats = ["feishu:oc_xxx"]   # 会话(群)白名单：群消息 chat 放行 OR sender 放行即过（/chat 可动态管理）
 # admin_senders = []          # 可 /allow 的管理员 sender；空=所有白名单用户可(P2-D，生产建议显式设置收敛授权面)
-allowed_tools = ["Read","Write","Edit","Grep","Glob","WebFetch","WebSearch"]  # 缺省值；执行类(Bash 等)显式加 + permission_mode="ask" 过审
+# allowed_tools = ["*"]                      # 缺省=全部工具（不收敛）；要白名单显式列（如 ["Read","Edit"]）；执行类建议配 permission_mode="ask"
 agent = "claude-cli"         # claude-cli(默认) | claude-acp(ACP长驻子进程) | codex | gemini
 platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人) | feishu(飞书,配 feishu_app_id + 环境变量 IMAGENT_FEISHU_APP_SECRET)
 # feishu_app_id = "cli_xxx"            # 飞书自建应用 app_id（仅 platform="feishu"；app_secret 走环境变量，keyring 为后续 P2）
@@ -483,18 +478,9 @@ platform = "ilink"
         let p = tmp_path("def", r#"default_workdir = "/tmp/ws""#);
         let cfg = Config::load(&p).expect("ok");
         assert!(cfg.allowed_senders.is_empty());
-        assert_eq!(
-            cfg.allowed_tools,
-            vec![
-                "Read".to_string(),
-                "Write".to_string(),
-                "Edit".to_string(),
-                "Grep".to_string(),
-                "Glob".to_string(),
-                "WebFetch".to_string(),
-                "WebSearch".to_string(),
-            ]
-        );
+        // 2026-08 缺省语义：不写 allowed_tools = 全部工具（["*"]）。
+        assert_eq!(cfg.allowed_tools, vec!["*".to_string()]);
+        assert_eq!(cfg.platform, "ilink");
         assert_eq!(cfg.agent, "claude-cli");
         assert_eq!(cfg.platform, "ilink");
         cleanup(&p);

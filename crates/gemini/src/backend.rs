@@ -120,10 +120,12 @@ fn gemini_parse(line: &str) -> CliEvent {
 ///
 /// 返回 `(approval_mode, want_sandbox)`。**绝不自动选 `yolo`**（全自动=危险）。
 fn pick_approval(allowed_tools: &[String]) -> (&'static str, bool) {
-    // WRITE_OR_EXEC 见 imagent_core::backend_common（codex/gemini 共享）。
-    let needs_write = allowed_tools
-        .iter()
-        .any(|t| WRITE_OR_EXEC.contains(&t.as_str()));
+    // tools_unrestricted / WRITE_OR_EXEC 见 imagent_core::backend_common；
+    // 不限制（空/["*"]，缺省即全量）按含写执行类处理（auto_edit）。
+    let needs_write = imagent_core::backend_common::tools_unrestricted(allowed_tools)
+        || allowed_tools
+            .iter()
+            .any(|t| WRITE_OR_EXEC.contains(&t.as_str()));
     if needs_write {
         ("auto_edit", false)
     } else {
@@ -140,7 +142,9 @@ mod tests {
 
     #[test]
     fn approval_plan_read_only_by_default() {
-        assert_eq!(pick_approval(&[]), ("plan", true));
+        // 2026-08 缺省语义：空/["*"] = 不限制 → auto_edit。
+        assert_eq!(pick_approval(&[]), ("auto_edit", false));
+        assert_eq!(pick_approval(&["*".into()]), ("auto_edit", false));
         assert_eq!(
             pick_approval(&["Read".into(), "Grep".into()]),
             ("plan", true)

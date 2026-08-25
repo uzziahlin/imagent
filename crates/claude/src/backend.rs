@@ -166,8 +166,9 @@ impl Backend for ClaudeBackend {
             .arg("--output-format")
             .arg("stream-json")
             .arg("--verbose");
-        // allowed_tools 非空才附加（空串语义不明，避免意外禁用全部工具）。
-        if !allowed_tools.is_empty() {
+        // 「不限制」（空/["*"]，缺省即全量）不附加 flag——claude 自身默认 = 全量工具
+        //（危险操作仍受 permission_mode 审批闭环约束）；显式列表才收敛。
+        if !imagent_core::backend_common::tools_unrestricted(allowed_tools) {
             cmd.arg("--allowedTools").arg(allowed_tools.join(","));
         }
         // 幽灵会话预检（真机校准）：失败轮次泄漏并落库的 session id 在 ~/.claude

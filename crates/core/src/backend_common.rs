@@ -367,6 +367,14 @@ pub const WRITE_OR_EXEC: &[&str] = &[
     "execute_bash",
 ];
 
+/// `allowed_tools` 是否为「不限制」（全量工具）语义：空列表（未收敛/不指定）
+/// 或显式 `["*"]`。各 backend 对此统一取自己的最宽档：claude 不附加
+/// `--allowedTools`（CLI 自身默认 = 全量）；codex `workspace-write`（按设计
+/// 绝不自动 danger-full-access）；gemini `auto_edit`。
+pub fn tools_unrestricted(tools: &[String]) -> bool {
+    tools.is_empty() || tools.iter().any(|t| t == "*")
+}
+
 /// `env_clear()` 后始终透传给 agent 子进程的运行时必需变量（S-2）。
 ///
 /// - `PATH`/`HOME`/`USER`/`LOGNAME`：子进程找可执行、读自身配置的最小必需；
