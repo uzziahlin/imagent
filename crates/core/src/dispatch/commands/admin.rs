@@ -637,7 +637,7 @@ impl Dispatcher {
             let cur = *self.permission_mode.read();
             self.reply(
                 conv,
-                &format!("当前权限模式：{cur:?}\n用法：/perm <off|allow|deny|ask>"),
+                &format!("当前权限模式：{cur:?}\n用法：/perm <auto|off|allow|deny|ask>"),
                 hint,
             )
             .await;
@@ -651,6 +651,27 @@ impl Dispatcher {
             return;
         }
         match arg {
+            "auto" => {
+                // auto 按当前后端解析成具体档再入运行时（claude-cli → ask，
+                // 其余 → off）；回执带解析结果。
+                let resolved = PermissionMode::Auto.resolve(self.backend.name());
+                self.reload_permission_mode(resolved);
+                let note = if resolved == PermissionMode::Ask {
+                    "（注意：Ask 模式的权限审批 socket 需重启 imagent 才生效）"
+                } else {
+                    ""
+                };
+                self.reply(
+                    conv,
+                    &format!(
+                        "✅ 权限模式 auto → {}（按后端 {}）{note}",
+                        resolved.as_str(),
+                        self.backend.name()
+                    ),
+                    hint,
+                )
+                .await;
+            }
             "off" | "allow" | "deny" | "ask" => {
                 let mode = PermissionMode::from_str_lossy(arg);
                 self.reload_permission_mode(mode);
@@ -665,7 +686,7 @@ impl Dispatcher {
                     .await;
             }
             _ => {
-                self.reply(conv, "用法：/perm <off|allow|deny|ask>", hint)
+                self.reply(conv, "用法：/perm <auto|off|allow|deny|ask>", hint)
                     .await
             }
         }

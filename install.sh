@@ -178,7 +178,7 @@ if [ "${MCP_ONLY}" -eq 0 ] && [ ! -f "${IMAGENT_HOME_DIR}/config.toml" ]; then
     echo "# allowed_tools 不写 = 全部工具；要收敛白名单就显式列（如 [\"Read\",\"Edit\"]）"
     echo "agent = \"claude-cli\""
     echo "platform = \"feishu\""
-    echo "permission_mode = \"ask\""
+    echo "# permission_mode 不写 = auto（claude-cli 起 IM 审批闭环；见 README）"
     echo "# ask_via_im_conv = \"feishu:ou_xxx\"   # 终端 agent 的 ask_via_im 提问投递会话（/whoami 可查）"
     if [ -n "${APP_ID}" ]; then
       echo "feishu_app_id = \"${APP_ID}\""

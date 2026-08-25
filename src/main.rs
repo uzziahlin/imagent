@@ -529,7 +529,18 @@ async fn main() -> Result<()> {
             imagent_core::sweep_live_cards(&store, platform.as_ref()).await;
 
             // 6. backend —— permission_mode 用共享句柄，SIGHUP 热重载即时生效。
-            let perm_mode = std::sync::Arc::new(parking_lot::RwLock::new(config.permission_mode));
+            // auto（缺省）先按后端解析成具体档：claude-cli → ask（IM 审批闭环），
+            // 其余 → off（闭环未接，靠各自 sandbox 兜底）。
+            let perm_resolved = config.permission_mode.resolve(&config.agent);
+            if config.permission_mode == imagent_core::PermissionMode::Auto {
+                tracing::info!(
+                    target: "imagent::ops",
+                    agent = %config.agent,
+                    resolved = perm_resolved.as_str(),
+                    "permission_mode=auto → 按后端解析"
+                );
+            }
+            let perm_mode = std::sync::Arc::new(parking_lot::RwLock::new(perm_resolved));
             let backend = build_backend(
                 &config.agent,
                 perm_mode.clone(),
@@ -538,9 +549,7 @@ async fn main() -> Result<()> {
 
             // codex/gemini 后端不支持 IM 权限审批闭环：若用户开启了 permission_mode，
             // 显式 warn（不静默忽略），避免预期落差。
-            if config.permission_mode.is_enabled()
-                && matches!(config.agent.as_str(), "codex" | "gemini")
-            {
+            if perm_resolved.is_enabled() && matches!(config.agent.as_str(), "codex" | "gemini") {
                 tracing::warn!(
                     target: "imagent::ops",
                     agent = %config.agent,
@@ -1138,7 +1147,8 @@ fn spawn_sighup_handler(
                     }
                     dispatcher.auth().reload_chats(chats);
                     dispatcher.reload_tools(cfg.allowed_tools.clone());
-                    dispatcher.reload_permission_mode(cfg.permission_mode);
+                    let perm = cfg.permission_mode.resolve(&cfg.agent);
+                    dispatcher.reload_permission_mode(perm);
                     tracing::info!(target: "imagent::ops", "config reloaded (SIGHUP)");
                 }
                 Err(e) => {

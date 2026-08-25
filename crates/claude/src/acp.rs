@@ -429,7 +429,11 @@ fn permission_outcome(
         PermissionMode::Deny => select_option(&request.options, false)
             .map(|id| RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(id)))
             .unwrap_or(RequestPermissionOutcome::Cancelled),
-        PermissionMode::Allow | PermissionMode::Off => allow_outcome(&request.options),
+        // Auto 不会出现在运行时句柄里（main/SIGHUP//perm 均先 resolve）；
+        // 防御性按未接线=放行 Off 同路处理（resolve 后 ACP 本就映射 Off）。
+        PermissionMode::Allow | PermissionMode::Off | PermissionMode::Auto => {
+            allow_outcome(&request.options)
+        }
         PermissionMode::Ask => {
             // ACP 后端尚未接入 IM 审批闭环（需把 core 的 PermissionRouter 接到 ACP 的
             // session/request_permission 通知通道，复杂度高）。为安全（fail-closed），

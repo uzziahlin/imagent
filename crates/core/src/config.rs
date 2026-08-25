@@ -7,8 +7,13 @@ use crate::error::{CoreError, Result};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PermissionMode {
-    /// 不启用权限审批：claude 按 --allowedTools 自行处理（P1 既有行为）。
+    /// 按后端自动选档（2026-08 起为**缺省**）：claude-cli（支持 IM 审批闭环）→
+    /// [`PermissionMode::Ask`] 全闭环；claude-acp / codex / gemini（闭环未接）→
+    /// [`PermissionMode::Off`]（靠各自 sandbox / approval-mode 兜底）。启动 /
+    /// SIGHUP / `/perm auto` 均先 [`PermissionMode::resolve`] 成具体档再入运行时。
     #[default]
+    Auto,
+    /// 不启用权限审批：claude 按 --allowedTools 自行处理（P1 既有行为）。
     Off,
     /// MCP server 永远 allow（不发 IM、不阻塞；快速放行模式）。
     Allow,
@@ -20,12 +25,24 @@ pub enum PermissionMode {
 
 impl PermissionMode {
     /// 是否需要附加 --mcp-config / --permission-prompt-tool。
+    /// 注意 `Auto` 须先 [`PermissionMode::resolve`]——未解析的 Auto 按未接线
+    /// 处理（false），防半接状态。
     pub fn is_enabled(self) -> bool {
-        !matches!(self, Self::Off)
+        matches!(self, Self::Allow | Self::Deny | Self::Ask)
+    }
+
+    /// `Auto` 按后端解析成具体档（具体档原样返回）。
+    pub fn resolve(self, agent: &str) -> Self {
+        match self {
+            Self::Auto if agent == "claude-cli" => Self::Ask,
+            Self::Auto => Self::Off,
+            other => other,
+        }
     }
     /// 小写标签，用于 MCP 子命令 --mode 参数与日志。
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::Off => "off",
             Self::Allow => "allow",
             Self::Deny => "deny",
@@ -34,6 +51,7 @@ impl PermissionMode {
     }
     pub fn from_str_lossy(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
+            "auto" => Self::Auto,
             "allow" => Self::Allow,
             "deny" => Self::Deny,
             "ask" => Self::Ask,
@@ -135,7 +153,7 @@ pub struct Config {
     pub agent: String,
     #[serde(default = "default_platform")]
     pub platform: String,
-    /// IM 权限审批模式（默认 Off，向后兼容 P1 行为）。
+    /// IM 权限审批模式（默认 Auto：按后端自动选档，见 [`PermissionMode::Auto`]）。
     #[serde(default)]
     pub permission_mode: PermissionMode,
     /// Prometheus 指标 / 健康检查 HTTP 监听地址（如 `"127.0.0.1:9100"`）。
@@ -391,7 +409,7 @@ platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人)
 # feishu_require_mention_in_group = true       # 群消息须 @bot 才处理（默认 true：客户端过滤 + 剥离 @bot 占位；false=全收，过滤交给事件订阅 scope）
 # stranger_mention_hint = false                # 未放行群里被 @ 时回一句引导（默认 false 完全静默防探测；私聊始终静默）
 # reply_mode = "card"                          # 回复形态：card(默认,流式卡片) | text(纯文本)；/config 可热改
-permission_mode = "off"     # off(默认,claude按allowedTools自行处理) | allow | deny | ask(IM审批闭环)
+permission_mode = "auto"    # 缺省=auto：claude-cli 起 IM 审批闭环(同 ask)，其余后端=off；也可显式 off/allow/deny/ask
 # metrics_addr = "127.0.0.1:9100"   # 默认关闭；设为 "ip:port" 开启 /metrics + /health HTTP server
 # message_max_len = 2000              # 单条出站消息字符上限（Unicode char）；不设 = 不分片
 # message_fragment_interval_ms = 400  # 分片间发送间隔（ms）
@@ -427,13 +445,28 @@ mod tests {
     }
 
     #[test]
-    fn permission_mode_default_off() {
+    fn permission_mode_default_auto_and_resolve() {
         let p = tmp_path(
             "cfg_perm_default",
             "default_workdir = \"/tmp/ws\"\nallowed_tools = [\"Read\"]\n",
         );
         let cfg = Config::load(&p).expect("parse");
-        assert_eq!(cfg.permission_mode, PermissionMode::Off);
+        // 2026-08 起缺省 auto；resolve 按 backend 选档。
+        assert_eq!(cfg.permission_mode, PermissionMode::Auto);
+        assert_eq!(
+            PermissionMode::Auto.resolve("claude-cli"),
+            PermissionMode::Ask
+        );
+        assert_eq!(PermissionMode::Auto.resolve("codex"), PermissionMode::Off);
+        assert_eq!(PermissionMode::Auto.resolve("gemini"), PermissionMode::Off);
+        assert_eq!(
+            PermissionMode::Auto.resolve("claude-acp"),
+            PermissionMode::Off
+        );
+        // 具体档原样透传；未解析的 Auto 按未接线（is_enabled=false）。
+        assert_eq!(PermissionMode::Ask.resolve("codex"), PermissionMode::Ask);
+        assert!(!PermissionMode::Auto.is_enabled());
+        assert!(PermissionMode::Ask.is_enabled());
         cleanup(&p);
     }
 
@@ -444,6 +477,7 @@ mod tests {
             ("allow", PermissionMode::Allow),
             ("deny", PermissionMode::Deny),
             ("off", PermissionMode::Off),
+            ("auto", PermissionMode::Auto),
         ] {
             let p = tmp_path(
                 "cfg_perm",
