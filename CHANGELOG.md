@@ -2,10 +2,17 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
-## [Unreleased]
+## [1.5.2] — 2026-08-25
 
 ### Added
 - **`imagent setup --platform feishu|wecom|ilink`**：直达对应平台引导（免菜单）；菜单默认值自动取现有 config 的平台（重配场景直达在用平台）；ilink 纯指引分支支持非交互运行；非法平台名无论 tty 与否先报明确错误；「覆盖已有 config」确认移入真正写 config 的 feishu/wecom 分支。
+
+### Docs
+- install.sh：升级场景提示（覆盖旧版本后需重启在跑实例：前台 Ctrl-C 重跑 / 后台 `imagent service install` 重装即重启）；启动提示修正为 `imagent start`。
+
+## [Unreleased]
+
+（空——下一段变更从这里开始。）
 
 ## [1.5.1] — 2026-08-24
 
