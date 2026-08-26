@@ -2,6 +2,19 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [Unreleased]
+
+（空——下一段变更从这里开始。）
+
+## [1.5.3] — 2026-08-25
+
+> 缺省安全姿态重构：不写 `allowed_tools` = 全部工具；不写 `permission_mode` = `auto`（claude-cli 自动起 IM 审批闭环）——零配置即「能力全开 + 危险操作过审」。**两项均为缺省值语义变更，需重启进程生效（SIGHUP 不足以重算缺省）。**
+
+### Changed
+- **`allowed_tools` 缺省改为全部工具**（不指定 = 不收敛）：缺省值由「读/检索/联网/编辑类白名单」改为 `["*"]`——claude 不附加 `--allowedTools`（CLI 默认全量）、codex 收敛 `workspace-write`、gemini 收敛 `auto_edit`（均不进各自最高危档）；`[]` 与 `["*"]` 同义。要收敛能力边界仍可显式列白名单。危险操作建议配合 `permission_mode = "ask"` 走 IM 审批（全量≠免审）。install.sh 不再写入限制性缺省列表。
+
+- **`permission_mode` 缺省改为 `auto`（按后端自动选档）**：claude-cli（支持 IM 审批闭环）→ 自动按 `ask` 起 `--permission-prompt-tool` 全闭环；claude-acp / codex / gemini（闭环未接）→ `off`（靠各自 sandbox / approval-mode 兜底）。启动 / SIGHUP 热重载 / `/perm auto` 均先 `resolve` 成具体档再入运行时（未解析的 `Auto` 按未接线处理，防半接状态）。与「缺省全量工具」组合成默认安全姿态：能力全开 + 危险操作过审。install.sh 不再显式写 `ask`（继承缺省）。
+
 ## [1.5.2] — 2026-08-25
 
 ### Added
@@ -9,20 +22,6 @@
 
 ### Docs
 - install.sh：升级场景提示（覆盖旧版本后需重启在跑实例：前台 Ctrl-C 重跑 / 后台 `imagent service install` 重装即重启）；启动提示修正为 `imagent start`。
-
-## [Unreleased]
-
-### Changed
-- **`allowed_tools` 缺省改为全部工具**（不指定 = 不收敛）：缺省值由「读/检索/联网/编辑类白名单」改为 `["*"]`——claude 不附加 `--allowedTools`（CLI 默认全量）、codex 收敛 `workspace-write`、gemini 收敛 `auto_edit`（均不进各自最高危档）；`[]` 与 `["*"]` 同义。要收敛能力边界仍可显式列白名单。危险操作建议配合 `permission_mode = "ask"` 走 IM 审批（全量≠免审）。install.sh 不再写入限制性缺省列表。
-
-## [Unreleased]
-
-### Changed
-- **`permission_mode` 缺省改为 `auto`（按后端自动选档）**：claude-cli（支持 IM 审批闭环）→ 自动按 `ask` 起 `--permission-prompt-tool` 全闭环；claude-acp / codex / gemini（闭环未接）→ `off`（靠各自 sandbox / approval-mode 兜底）。启动 / SIGHUP 热重载 / `/perm auto` 均先 `resolve` 成具体档再入运行时（未解析的 `Auto` 按未接线处理，防半接状态）。与「缺省全量工具」组合成默认安全姿态：能力全开 + 危险操作过审。install.sh 不再显式写 `ask`（继承缺省）。
-
-## [Unreleased]
-
-（空——下一段变更从这里开始。）
 
 ## [1.5.1] — 2026-08-24
 
