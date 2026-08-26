@@ -4,7 +4,7 @@
 
 ## [Unreleased]
 
-> 卡片交互改版两连：**P8-1 视觉**（对标 lark-coding-agent-bridge）——工具行「裸 JSON 截断」→「状态图标 + 人可读摘要」、流式卡分阶段 footer、审批/问题/命令卡标题栏、命令文案分组；**P8-2 交互**——审批卡复用（顺序询问不再刷屏顶卡）+ 终态结果下沉（多轮审批后结论落在会话最下面，不再埋在第一张卡）。视觉层为对方项目生产验证过的 CardKit 2.0 字段集，无配置变更。
+> 卡片交互改版两连：**P8-1 视觉**（对标 lark-coding-agent-bridge）——工具行「裸 JSON 截断」→「状态图标 + 人可读摘要」、流式卡分阶段 footer、审批/问题/命令卡标题栏、命令文案分组；**P8-2 交互**——审批卡复用（顺序询问不再刷屏顶卡）+ 终态结果下沉（多轮审批后结论落在会话最下面，不再埋在第一张卡）；**P8-4 权限**——auto 档映射 Claude 原生 auto 权限模式（分类器自动放行 + 高危走 IM），新增 `backend_permission_mode` 通用透传配置。视觉层为对方项目生产验证过的 CardKit 2.0 字段集。
 
 ### Changed
 - **工具调用智能摘要**：`tool_summary 把工具 input JSON 压成人可读单行（Bash 取 command、Read/Write/Edit 取 file_path、Grep 取 pattern in path、WebFetch 取 url、TodoWrite 计数；覆盖 codex 的 shell/read_file/apply_patch 命名；截断 JSON 解析失败回退压平原文）。所有展示面共用：流式卡片工具行、审批卡签名行、纯文本工具摘要（`🔧 工具调用：Bash — git status）。COT 截断档随之 Brief 40→80 / Detailed 200→240 字符。
@@ -16,18 +16,21 @@
 - **命令文案重排**：/help 按 会话/目录与文件/权限与运行/状态与诊断/白名单与管理 五组 bullets（此前 26 条命令挤一段无分隔）；/status 字段行加图标（🤖 后端/💬 本会话/🔗 会话/📁 工作目录/🏃 全局在飞/⏱️ 运行时长）；/sessions 列表 bullets + 活动项「（当前）」标记（原 `*）。
 - **流式终态工具统计**：`🔧 工具 N 次：Bash×2 · Read×3（含总次数，× 计数分隔）。
 
+- **`permission_mode = "auto"` 映射 Claude 原生 auto 模式（P8-4）**：claude-cli 下 auto 不再解析为 `ask`（每个提示都进 IM），而是新运行时档 **auto-claude**——照挂 IM 审批闭环（高危提示进 IM），另透传 claude 2026 新出的 `--permission-mode auto`（独立分类器逐动作审查：安全操作自动放行，`curl|bash`/外发敏感数据/强推等高危动作才拦下）。零配置默认姿态 =「分类器自动放行 + 高危过审」，与 Claude Code 官方 auto 模式一致；显式 `ask` 仍全量进 IM。旧版 claude CLI（<2.1.228）不认 auto 静默回退 default（≈ask 档，降级安全）。
+- **运行时适配（P8-4）**：auto-claude 为运行时专属档（配置面 serde 拒绝直写，仅由 auto 在 claude-cli 解析产生）；`needs_socket()` 统一 Ask 闭环类判定（dispatcher socket spawn / mcp 子进程 roundtrip / `/perm` 热切提示）；`/perm` 查看显示档位与说明；ACP 防御臂 fail-closed。
+
 ### Added
 - **审批卡复用（P8-2）**：同一会话内**顺序到达**的询问（审批/AskUserQuestion）不再每条新发一张卡把流式卡顶离视口——收敛后的询问卡（已批准/已拒绝/已中断）保留为该会话的复用槽，下一个询问**原地 patch 成新询问**（按钮换绑新 request_id）。挂着未决询问时（并发审批）不认领槽、照旧另发新卡，多 pending 语义不变；复用 patch 失败自动降级发新卡；同卡重登记不再误判为「被新询问取代」。
 - **终态结果下沉（P8-2）**：本轮发过询问卡（流式卡已被顶离阅读位置）时，终态把流式卡正文收成一行指针（`✅ 已完成 · 🔧 工具 N 次\n⬇️ 完整结果见下方消息），**完整结果另发一张新卡**落在会话最下面——多轮审批后结论不再埋在第一张卡里。managed/降级/话题群三路径均支持；重发失败上抛，由 core 的 P5-11 纯文本兜底补发全文（结论不丢）。未触发询问的普通轮次行为不变（结果仍在原流式卡）。
 
-### Changed
-- **`permission_mode = "auto"` 映射为 Claude 原生 auto 模式（P8-4）**：claude-cli 下 auto 不再解析为 `ask（每个提示都进 IM），而是新运行时档 **auto-edits**——照挂 IM 审批闭环（Bash 等真危险的提示进 IM），另透传 claude 原生 `--permission-mode acceptEdits（Claude Code 的 auto-accept：文件编辑类 claude 自己放行）。零配置默认姿态变为「编辑自动放行 + 危险操作过审」，与 Claude Code 交互端的 auto 模式语义一致；嫌吵再叠 `approval_tools（清单外提示直接放行），要全量把关用显式 `ask。auto-edits 为运行时专属档（配置面不可直写，serde 拒绝）；MCP 子进程 `--mode auto-edits 往返、dispatcher socket spawn 条件、`/perm` 显示与热切提示、ACP 防御臂同步适配。
+- **新配置 `backend_permission_mode`（后端原生权限模式透传，P8-4）**：claude-cli 映射 `--permission-mode`（default/manual | acceptEdits | plan | auto | dontAsk | bypassPermissions；manual 归一 default；未知值启动期报错）。缺省不写 = auto 档透传 `auto`、ask 档不透传；显式设置则两档都遵从。**通用键设计**：codex/gemini 后续接各自原生档（approval-policy / approval-mode）复用本键；暂不支持的后端启动 warn 并忽略（`Backend::supports_native_permission_mode`）。SIGHUP 热重载支持。
 
 ### Fixed
 - **终态「完成」双行**（真机反馈）：managed 流式卡终态正文末尾与 md_footer 各渲染一次 `✅ 完成（v1.5.4 起即存在）。修正为**状态行统一由 footer 承载**：正文只保留内容（文本 + 工具统计 / 错误详情 / 中断说明），不再拼终态行；结果下沉的 stub 正文同样只留统计 + 指针。中断的错误前缀单列（`⏹ 已中断，不再套「❌ 出错：」）；降级路径 stub 卡补 footer 元素（与 managed 路径的 footer patch 等价）。
 
 ### 迁移与注意
-- 无配置变更；纯升级重启即生效（worktree 外用户走 install.sh 覆盖 + `imagent service install` 重启）。
+- **auto 档语义变更（需重启进程）**：claude-cli 下 `permission_mode = "auto"` 从「同 ask（每个提示进 IM）」变为「透传 Claude 原生 auto 模式（分类器自动放行，高危进 IM）」——升级后审批卡会明显变少，属预期；要回到全量过审显式配 `permission_mode = "ask"`。需 claude CLI ≥ 2.1.228（旧版静默回退 default ≈ ask 档）。
+- 卡片改版为纯展示层，无配置变更；重启即生效（install.sh 覆盖 + `imagent service install` 重启）。
 - 真机待验证项：header/title 模板色、折叠面板 border/padding 字段、notation 字号在自建应用上的渲染（字段集与 lcab 生产一致，理论无风险；若审批卡发送失败会自动降级纯文本，不影响审批闭环）。
 
 ## [1.5.4] — 2026-08-26

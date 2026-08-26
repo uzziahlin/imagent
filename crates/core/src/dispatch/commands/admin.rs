@@ -635,10 +635,10 @@ impl Dispatcher {
         let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
         if arg.is_empty() {
             let cur = *self.permission_mode.read();
-            // auto-edits 是 auto 在 claude-cli 下的解析产物，附说明防「设置了
+            // auto-claude 是 auto 在 claude-cli 下的解析产物，附说明防「设置了
             // auto 怎么显示别的档」的困惑。
-            let note = if cur == PermissionMode::AutoEdits {
-                "（由 auto 按后端解析：claude 原生 acceptEdits，编辑类自动放行，Bash 等危险工具走 IM）"
+            let note = if cur == PermissionMode::AutoClaude {
+                "（由 auto 按后端解析：claude 原生 auto 模式，分类器自动放行安全操作，高危操作走 IM；可用 claude_permission_mode 配置覆盖）"
             } else {
                 ""
             };

@@ -19,6 +19,10 @@ use crate::stream::{parse_line, ParsedEvent};
 /// （imagent mcp 子命令）。
 pub struct ClaudeBackend {
     permission_mode: Arc<RwLock<PermissionMode>>,
+    /// P8-4：`claude_permission_mode` 配置透传（`--permission-mode` 原生值）。
+    /// None = 按档缺省（auto-claude → "auto"，其余不透传）；Some = 显式覆盖
+    ///（两档都遵从）。SIGHUP 经 [`Backend::set_native_permission_mode`] 热更新。
+    native_perm_mode: RwLock<Option<String>>,
     /// S-3：MCP server（imagent mcp）socket 读超时，与 dispatcher 的 permission_ask_timeout
     /// 对齐——防 MCP 子进程在用户慢回复时先于 dispatcher 超时返 deny，使 Ask 闭环静默失效。
     ask_timeout: std::time::Duration,
@@ -28,6 +32,7 @@ impl ClaudeBackend {
     pub fn new() -> Self {
         Self {
             permission_mode: Arc::new(RwLock::new(PermissionMode::Off)),
+            native_perm_mode: RwLock::new(None),
             ask_timeout: std::time::Duration::from_secs(300),
         }
     }
@@ -35,6 +40,7 @@ impl ClaudeBackend {
     pub fn with_permission_mode(mode: PermissionMode) -> Self {
         Self {
             permission_mode: Arc::new(RwLock::new(mode)),
+            native_perm_mode: RwLock::new(None),
             ask_timeout: std::time::Duration::from_secs(300),
         }
     }
@@ -48,8 +54,17 @@ impl ClaudeBackend {
     ) -> Self {
         Self {
             permission_mode: mode,
+            native_perm_mode: RwLock::new(None),
             ask_timeout,
         }
+    }
+}
+
+impl ClaudeBackend {
+    /// P8-4：设置 `claude_permission_mode` 透传覆盖（SIGHUP 热更新；见
+    /// [`claude_native_perm_args`]）。值须已经过 config 校验归一。
+    pub fn set_native_permission_mode(&self, mode: Option<String>) {
+        *self.native_perm_mode.write() = mode;
     }
 }
 
@@ -64,15 +79,24 @@ const NAME: &str = "claude-cli";
 /// 固定 socket 路径（主进程 PermissionRouter 监听、MCP server 连接）。
 /// P4-10：锚定 `imagent_home()`（`--profile` 时随 profile 隔离，env 对被 spawn 的
 /// MCP 子进程同样生效）；home 不可解析时回退 /tmp。
-/// P8-4：模式 → claude 原生权限 flag。auto-edits（auto 在 claude-cli 的解析
-/// 产物）透传 `--permission-mode acceptEdits`——Claude Code 的「auto 模式」：
-/// 文件编辑类 claude 自己放行，只有 Bash 等真危险的提示回调进 IM。比 Ask
-/// （每个提示都进 IM）少打扰；与 approval_tools 可叠加（剩余提示再按清单过滤）。
-/// 其余档不附加（Ask 由闭环全量把关；Off/Allow/Deny 语义已由闭环承载）。
-fn claude_native_perm_args(mode: PermissionMode) -> Vec<&'static str> {
-    match mode {
-        PermissionMode::AutoEdits => vec!["--permission-mode", "acceptEdits"],
-        _ => Vec::new(),
+/// P8-4：档位 + 透传覆盖 → claude 原生 `--permission-mode` flag。
+///
+/// - 显式覆盖（`claude_permission_mode` 配置）：两档（auto-claude / ask）都遵从。
+/// - 缺省：auto-claude（auto 在 claude-cli 的解析产物）透传 **auto**——Claude Code
+///   2026 新档：独立分类器逐动作审查，安全操作自动放行，只有高危动作（curl|bash、
+///   外发敏感数据、强推等）拦下提示 → 经审批闭环进 IM。ask 档不透传（claude
+///   default 手动把关 = 每个提示都进 IM，全量交给用户）。与 approval_tools 可
+///   叠加（剩余提示再按清单过滤）。旧版 CLI（<2.1.228）不认 auto 会静默回退
+///   default（≈ask 档行为，降级安全）。
+fn claude_native_perm_args(mode: PermissionMode, native_override: Option<&str>) -> Vec<String> {
+    let native: Option<String> = match native_override {
+        Some(m) => Some(m.to_string()),
+        None if mode == PermissionMode::AutoClaude => Some("auto".to_string()),
+        None => None,
+    };
+    match native {
+        Some(m) => vec!["--permission-mode".to_string(), m],
+        None => Vec::new(),
     }
 }
 
@@ -150,6 +174,13 @@ async fn write_mcp_config(
 
 #[async_trait]
 impl Backend for ClaudeBackend {
+    fn set_native_permission_mode(&self, mode: Option<String>) {
+        self.set_native_permission_mode(mode);
+    }
+    fn supports_native_permission_mode(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         NAME
     }
@@ -212,9 +243,10 @@ impl Backend for ClaudeBackend {
                     // 校准发现裸工具名被 CLI 2.1.x 拒绝（"MCP tool not found"）。
                     cmd.arg("--permission-prompt-tool")
                         .arg(imagent_core::mcp::qualified_tool_name());
-                    // P8-4：auto 档透传 claude 原生权限模式（acceptEdits），
+                    // P8-4：原生权限模式透传（auto 档缺省 auto / 显式配置覆盖），
                     // 见 [`claude_native_perm_args`]。
-                    for a in claude_native_perm_args(mode) {
+                    for a in claude_native_perm_args(mode, self.native_perm_mode.read().as_deref())
+                    {
                         cmd.arg(a);
                     }
                     Some(p)
@@ -295,12 +327,14 @@ mod tests {
         assert_eq!(b.name(), "claude-cli");
     }
 
-    /// P8-4：auto-edits 档透传 claude 原生 acceptEdits；其余档不附加。
+    /// P8-4：auto-claude 档缺省透传新 auto 模式；显式覆盖两档都遵从；其余档
+    ///（含未解析的 Auto）不附加。
     #[test]
-    fn native_perm_args_only_for_auto_edits() {
+    fn native_perm_args_default_and_override() {
+        // 缺省：auto-claude → auto；ask / 其它 → 不附加。
         assert_eq!(
-            claude_native_perm_args(PermissionMode::AutoEdits),
-            vec!["--permission-mode", "acceptEdits"]
+            claude_native_perm_args(PermissionMode::AutoClaude, None),
+            vec!["--permission-mode".to_string(), "auto".to_string()]
         );
         for m in [
             PermissionMode::Off,
@@ -310,10 +344,22 @@ mod tests {
             PermissionMode::Auto,
         ] {
             assert!(
-                claude_native_perm_args(m).is_empty(),
-                "{m:?} 不应附加原生权限 flag"
+                claude_native_perm_args(m, None).is_empty(),
+                "{m:?} 缺省不应附加原生权限 flag"
             );
         }
+        // 显式覆盖：任意档都遵从（含 ask）。
+        assert_eq!(
+            claude_native_perm_args(PermissionMode::Ask, Some("acceptEdits")),
+            vec!["--permission-mode".to_string(), "acceptEdits".to_string()]
+        );
+        assert_eq!(
+            claude_native_perm_args(PermissionMode::AutoClaude, Some("bypassPermissions")),
+            vec![
+                "--permission-mode".to_string(),
+                "bypassPermissions".to_string()
+            ]
+        );
     }
 
     #[test]

@@ -8,18 +8,19 @@ use crate::error::{CoreError, Result};
 #[serde(rename_all = "lowercase")]
 pub enum PermissionMode {
     /// 按后端自动选档（2026-08 起为**缺省**）：claude-cli（支持 IM 审批闭环）→
-    /// [`PermissionMode::AutoEdits`]（claude 原生 acceptEdits + 危险工具走 IM，
+    /// [`PermissionMode::AutoClaude`]（claude 原生 acceptEdits + 危险工具走 IM，
     /// 即 Claude Code 的「auto 模式」）；claude-acp / codex / gemini（闭环未接）→
     /// [`PermissionMode::Off`]（靠各自 sandbox / approval-mode 兜底）。启动 /
     /// SIGHUP / `/perm auto` 均先 [`PermissionMode::resolve`] 成具体档再入运行时。
     #[default]
     Auto,
     /// **运行时专属档**（配置面不可直接写，仅由 `auto` 在 claude-cli 下解析产生）：
-    /// 审批闭环照挂（Bash 等真危险的提示进 IM），另透传 claude 原生
-    /// `--permission-mode acceptEdits`——文件编辑类 claude 自己放行（Claude Code
-    /// 的 auto-accept）。比 [`PermissionMode::Ask`]（每个提示都进 IM）少打扰。
+    /// 审批闭环照挂（分类器拦下的高危提示进 IM），另透传 claude 原生
+    /// `--permission-mode auto`（2026 新档：独立分类器逐动作审查，安全操作自动
+    /// 放行，高危动作才提示——比 [`PermissionMode::Ask`]（每个提示都进 IM）少
+    /// 打扰）。透传值可由 `claude_permission_mode` 配置覆盖。
     #[serde(skip)]
-    AutoEdits,
+    AutoClaude,
     /// 不启用权限审批：claude 按 --allowedTools 自行处理（P1 既有行为）。
     Off,
     /// MCP server 永远 allow（不发 IM、不阻塞；快速放行模式）。
@@ -35,19 +36,22 @@ impl PermissionMode {
     /// 注意 `Auto` 须先 [`PermissionMode::resolve`]——未解析的 Auto 按未接线
     /// 处理（false），防半接状态。
     pub fn is_enabled(self) -> bool {
-        matches!(self, Self::Allow | Self::Deny | Self::Ask | Self::AutoEdits)
+        matches!(
+            self,
+            Self::Allow | Self::Deny | Self::Ask | Self::AutoClaude
+        )
     }
 
-    /// 是否需要主进程的权限审批 socket（Ask 闭环类：Ask / AutoEdits）——
+    /// 是否需要主进程的权限审批 socket（Ask 闭环类：Ask / AutoClaude）——
     /// dispatcher 启动 socket accept task 与 `/perm` 热切的「须重启」提示共用。
     pub fn needs_socket(self) -> bool {
-        matches!(self, Self::Ask | Self::AutoEdits)
+        matches!(self, Self::Ask | Self::AutoClaude)
     }
 
     /// `Auto` 按后端解析成具体档（具体档原样返回）。
     pub fn resolve(self, agent: &str) -> Self {
         match self {
-            Self::Auto if agent == "claude-cli" => Self::AutoEdits,
+            Self::Auto if agent == "claude-cli" => Self::AutoClaude,
             Self::Auto => Self::Off,
             other => other,
         }
@@ -56,7 +60,7 @@ impl PermissionMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
-            Self::AutoEdits => "auto-edits",
+            Self::AutoClaude => "auto-claude",
             Self::Off => "off",
             Self::Allow => "allow",
             Self::Deny => "deny",
@@ -67,7 +71,7 @@ impl PermissionMode {
         match s.to_ascii_lowercase().as_str() {
             "auto" => Self::Auto,
             // MCP 子进程 --mode 往返（backend 经 as_str 写入 mcp 配置）。
-            "auto-edits" => Self::AutoEdits,
+            "auto-claude" => Self::AutoClaude,
             "allow" => Self::Allow,
             "deny" => Self::Deny,
             "ask" => Self::Ask,
@@ -179,6 +183,19 @@ pub struct Config {
     ///（其余后端无闭环；且 claude 自身默认放行的工具如 Read 不会发起请求，不受此影响）。
     #[serde(default)]
     pub approval_tools: Vec<String>,
+    /// **后端原生权限模式透传**（各后端映射到自己的原生 flag）：
+    /// - claude-cli → `--permission-mode`：default/manual | acceptEdits | plan |
+    ///   **auto**（2026 新档：分类器自动放行安全操作，高危提示经 IM 审批闭环）|
+    ///   dontAsk | bypassPermissions
+    /// - codex / gemini / claude-acp → 暂不支持（启动时 warn 并忽略；后续接入
+    ///   approval-policy / approval-mode 时复用本键，不再加新配置）
+    ///
+    /// **缺省 None**：permission_mode="auto" 在 claude-cli 下透传 `auto`，ask 档
+    /// 不透传（全量进 IM）；显式设置则两档都遵从。值域按后端校验（claude 系白
+    /// 名单；其余后端先存值、后端侧忽略）。旧版 claude CLI（<2.1.228）不认 auto
+    /// 会静默回退 default（≈ask 档行为，降级安全）。
+    #[serde(default)]
+    pub backend_permission_mode: Option<String>,
     /// Prometheus 指标 / 健康检查 HTTP 监听地址（如 `"127.0.0.1:9100"`）。
     /// 默认 `None`（关闭——开源分发时不默认开启监听端口）；显式设置地址即开启。
     #[serde(default = "default_metrics_addr")]
@@ -354,7 +371,7 @@ impl Config {
     /// `default_workdir` 缺失或非绝对路径 => `CoreError::Config`（给出清晰提示）。
     pub fn load(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path).map_err(CoreError::Io)?;
-        let cfg: Self = toml::from_str(&raw)
+        let mut cfg: Self = toml::from_str(&raw)
             .map_err(|e| CoreError::Config(format!("parse {}: {e}", path.display())))?;
 
         if cfg.default_workdir.as_os_str().is_empty() || !cfg.default_workdir.is_absolute() {
@@ -362,6 +379,19 @@ impl Config {
                 "default_workdir 必须是绝对路径，当前为 {:?}。请参考 EXAMPLE 模板。",
                 cfg.default_workdir
             )));
+        }
+
+        // P8-4：后端原生权限模式透传值归一（trim + 小写）；值域按后端校验——
+        // claude 系白名单（manual 是 default 的 CLI 别名；未知值启动期报错防拼出
+        // 非法 flag），其余后端先存值（backend 侧忽略并 warn，接入时再收紧）。
+        if let Some(m) = cfg.backend_permission_mode.as_mut() {
+            let raw = std::mem::take(m);
+            let normalized = raw.trim().to_ascii_lowercase();
+            if cfg.agent.starts_with("claude") {
+                *m = normalize_claude_permission_mode(&normalized)?;
+            } else {
+                *m = normalized;
+            }
         }
 
         // P5 快赢：数值下界/上限校验——错误前置到启动期，而非运行期静默劣化
@@ -432,7 +462,8 @@ platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人)
 # feishu_require_mention_in_group = true       # 群消息须 @bot 才处理（默认 true：客户端过滤 + 剥离 @bot 占位；false=全收，过滤交给事件订阅 scope）
 # stranger_mention_hint = false                # 未放行群里被 @ 时回一句引导（默认 false 完全静默防探测；私聊始终静默）
 # reply_mode = "card"                          # 回复形态：card(默认,流式卡片) | text(纯文本)；/config 可热改
-permission_mode = "auto"    # 缺省=auto：claude-cli=claude 原生 acceptEdits(编辑自动放行)+Bash 等走 IM；其余后端=off；显式 ask=每个提示都进 IM
+permission_mode = "auto"    # 缺省=auto：claude-cli=透传 claude 原生 auto 模式(分类器自动放行安全操作,高危进 IM)+审批闭环；其余后端=off；显式 ask=每个提示都进 IM
+# backend_permission_mode = "auto" # 后端原生权限模式透传(claude→--permission-mode；可覆盖 auto 档缺省)：default|acceptEdits|plan|auto|dontAsk|bypassPermissions；codex/gemini 暂不支持(warn 忽略)
 # approval_tools = ["Bash", "WebFetch", "mcp__*"]  # 审批集：ask 模式下只有这些工具过 IM 审批，其余直接放行；空=全部过审
 # metrics_addr = "127.0.0.1:9100"   # 默认关闭；设为 "ip:port" 开启 /metrics + /health HTTP server
 # message_max_len = 2000              # 单条出站消息字符上限（Unicode char）；不设 = 不分片
@@ -448,6 +479,24 @@ permission_mode = "auto"    # 缺省=auto：claude-cli=claude 原生 acceptEdits
 # require_keyring = false        # 默认 false(headless 明文回退+warn); true=keyring 不可用时拒绝明文落盘(fail-closed，安全部署建议)
 "#;
 }
+/// claude `--permission-mode` 合法值归一（入参已小写化）：manual→default
+///（CLI 别名）；未知值 Err（启动期失败，防拼出非法 flag）。
+fn normalize_claude_permission_mode(raw: &str) -> Result<String> {
+    let m = if raw == "manual" {
+        "default".to_string()
+    } else {
+        raw.to_string()
+    };
+    match m.as_str() {
+        "default" | "acceptedits" | "plan" | "auto" | "dontask" | "bypasspermissions" => {
+            Ok(m)
+        }
+        _ => Err(CoreError::Config(format!(
+            "claude_permission_mode 非法值 {raw:?}：可用 default(manual) | acceptEdits | plan | auto | dontAsk | bypassPermissions"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,12 +524,12 @@ mod tests {
             "default_workdir = \"/tmp/ws\"\nallowed_tools = [\"Read\"]\n",
         );
         let cfg = Config::load(&p).expect("parse");
-        // 2026-08 起缺省 auto；resolve 按 backend 选档（claude-cli → AutoEdits：
+        // 2026-08 起缺省 auto；resolve 按 backend 选档（claude-cli → AutoClaude：
         // 原生 acceptEdits + IM 闭环；其余 → Off）。
         assert_eq!(cfg.permission_mode, PermissionMode::Auto);
         assert_eq!(
             PermissionMode::Auto.resolve("claude-cli"),
-            PermissionMode::AutoEdits
+            PermissionMode::AutoClaude
         );
         assert_eq!(PermissionMode::Auto.resolve("codex"), PermissionMode::Off);
         assert_eq!(PermissionMode::Auto.resolve("gemini"), PermissionMode::Off);
@@ -492,23 +541,23 @@ mod tests {
         assert_eq!(PermissionMode::Ask.resolve("codex"), PermissionMode::Ask);
         assert!(!PermissionMode::Auto.is_enabled());
         assert!(PermissionMode::Ask.is_enabled());
-        // P8-4：AutoEdits 是运行时档——enabled/needs_socket/as_str/from_str 往返；
+        // P8-4：AutoClaude 是运行时档——enabled/needs_socket/as_str/from_str 往返；
         // 配置面 serde 拒绝直写。
-        assert!(PermissionMode::AutoEdits.is_enabled());
-        assert!(PermissionMode::AutoEdits.needs_socket());
+        assert!(PermissionMode::AutoClaude.is_enabled());
+        assert!(PermissionMode::AutoClaude.needs_socket());
         assert!(!PermissionMode::Auto.needs_socket());
-        assert_eq!(PermissionMode::AutoEdits.as_str(), "auto-edits");
+        assert_eq!(PermissionMode::AutoClaude.as_str(), "auto-claude");
         assert_eq!(
-            PermissionMode::from_str_lossy("auto-edits"),
-            PermissionMode::AutoEdits
+            PermissionMode::from_str_lossy("auto-claude"),
+            PermissionMode::AutoClaude
         );
         let p2 = tmp_path(
             "cfg_perm_auto_edits_reject",
-            "default_workdir = \"/tmp/ws\"\npermission_mode = \"auto-edits\"\n",
+            "default_workdir = \"/tmp/ws\"\npermission_mode = \"auto-claude\"\n",
         );
         assert!(
             Config::load(&p2).is_err(),
-            "auto-edits 是运行时档，配置面不可直写"
+            "auto-claude 是运行时档，配置面不可直写"
         );
         cleanup(&p2);
         cleanup(&p);
@@ -819,6 +868,49 @@ message_fragment_interval_ms = 250
         let cfg = Config::load(&p).expect("parse");
         assert!(!cfg.admin_gap_with_chat_allowlist());
         cleanup(&p);
+    }
+
+    /// P8-4：backend_permission_mode 校验与归一（manual→default；未知值启动期报错）。
+    #[test]
+    fn backend_permission_mode_validate_and_normalize() {
+        let p_ok = tmp_path(
+            "cfg_claude_perm_ok",
+            "default_workdir = \"/tmp/ws\"\nbackend_permission_mode = \"Manual\"\n",
+        );
+        let cfg = Config::load(&p_ok).expect("parse");
+        assert_eq!(cfg.backend_permission_mode.as_deref(), Some("default"));
+        cleanup(&p_ok);
+
+        for v in [
+            "acceptEdits",
+            "plan",
+            "auto",
+            "dontAsk",
+            "bypassPermissions",
+        ] {
+            let p = tmp_path(
+                &format!("cfg_claude_perm_{v}"),
+                &format!("default_workdir = \"/tmp/ws\"\nbackend_permission_mode = \"{v}\"\n"),
+            );
+            let cfg = Config::load(&p).unwrap_or_else(|_| panic!("{v} 应合法"));
+            assert_eq!(
+                cfg.backend_permission_mode.as_deref(),
+                Some(v.to_ascii_lowercase().as_str())
+            );
+            cleanup(&p);
+        }
+
+        let p_bad = tmp_path(
+            "cfg_claude_perm_bad",
+            "default_workdir = \"/tmp/ws\"\nbackend_permission_mode = \"yolo\"\n",
+        );
+        assert!(Config::load(&p_bad).is_err(), "未知值应启动期报错");
+        cleanup(&p_bad);
+
+        // 缺省 None。
+        let p_def = tmp_path("cfg_claude_perm_def", "default_workdir = \"/tmp/ws\"\n");
+        assert_eq!(Config::load(&p_def).unwrap().backend_permission_mode, None);
+        cleanup(&p_def);
     }
 
     #[test]

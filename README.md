@@ -120,7 +120,8 @@ cat > ~/.imagent/config.toml <<'EOF'
 default_workdir = "/absolute/path/to/agent/workspace"  # 必填，agent 的 cwd（非沙箱：不限制可读路径，靠 allowed_tools + permission_mode 兜底）
 allowed_senders = []        # 留空 = 发现模式（先看日志拿你的 from_user_id）
 # allowed_tools 不写 = 全部工具（不收敛）；要白名单就显式列，如 ["Read","Edit"]；执行类建议配 permission_mode="ask" 过审
-# permission_mode = "auto"  # 缺省=auto：claude-cli=原生 acceptEdits（编辑自动放行）+Bash 等走 IM；其余后端=off；也可显式 off/allow/deny/ask（ask=每个提示都进 IM）
+# permission_mode = "auto"  # 缺省=auto：claude-cli=透传 claude 原生 auto 模式(分类器自动放行安全操作,高危进 IM)+审批闭环；其余后端=off；显式 ask=每个提示都进 IM
+# backend_permission_mode = "auto"  # 后端原生权限模式透传(claude→--permission-mode，覆盖 auto 档缺省)：default|acceptEdits|plan|auto|dontAsk|bypassPermissions；codex/gemini 暂不支持(warn 忽略)
 # approval_tools = ["Bash", "WebFetch", "mcp__*"]  # 审批集：ask 模式下只有这些工具过 IM 审批，其余直接放行；空=全部过审
 # allowed_chats = ["feishu:oc_xxx"]  # 会话(群)白名单：群消息 chat 放行 OR sender 放行（/chat 可动态管理）
 # ask_via_im_conv = "feishu:ou_xxx"  # 终端 agent 的 ask_via_im 提问投递会话（配了才启用，见「终端 agent 接入」）
@@ -131,7 +132,7 @@ allowed_senders = []        # 留空 = 发现模式（先看日志拿你的 from
 EOF
 ```
 
-> **`allowed_tools` 要不要写？** 不必填——**缺省即全部工具**（`["*"]` 语义：不附加 claude 的 `--allowedTools`，CLI 自身默认全量；codex 收敛到 `workspace-write`、gemini 收敛到 `auto_edit`，均不进各自最高危档）。要收敛 agent 的能力边界就显式列白名单：清单外的工具 agent 根本用不了。注意**全量 ≠ 免审**——缺省 `permission_mode = "auto"`（claude-cli 即 Claude Code 的 auto 模式：透传原生 `acceptEdits`，文件编辑 claude 自己放行，Bash 等真危险的操作进 IM 审批）下，危险操作执行前仍会在 IM 向你审批；显式写 `[]` 与 `["*"]` 同义（不限制）。嫌全审太吵？配 **`approval_tools` 审批集**（如 `["Bash", "mcp__*"]`）：只有清单内工具过 IM 审批，其余权限请求直接放行（支持尾部 `*` 前缀匹配；空 = 全部过审）。
+> **`allowed_tools` 要不要写？** 不必填——**缺省即全部工具**（`["*"]` 语义：不附加 claude 的 `--allowedTools`，CLI 自身默认全量；codex 收敛到 `workspace-write`、gemini 收敛到 `auto_edit`，均不进各自最高危档）。要收敛 agent 的能力边界就显式列白名单：清单外的工具 agent 根本用不了。注意**全量 ≠ 免审**——缺省 `permission_mode = "auto"`（claude-cli 即透传 Claude Code 2026 新出的 **auto 权限模式**：独立分类器逐动作审查，安全操作自动放行，只有高危动作——`curl|bash`、外发敏感数据、强推、`git reset --hard` 等——拦下经 IM 审批）下，危险操作执行前仍会在 IM 向你审批；显式写 `[]` 与 `["*"]` 同义（不限制）。嫌全审太吵？配 **`approval_tools` 审批集**（如 `["Bash", "mcp__*"]`）：只有清单内工具过 IM 审批，其余权限请求直接放行（支持尾部 `*` 前缀匹配；空 = 全部过审）。
 
 > **飞书**：`platform = "feishu"` + `feishu_app_id` + 环境变量 `IMAGENT_FEISHU_APP_SECRET`——完整开通步骤见[接入飞书](#接入飞书完整流程)。**WeCom**：`wecom_bot_id` + `wecom_secret`。两者都免公网（长连接收，HTTP 发）。
 
@@ -267,7 +268,7 @@ secret 轮换 / 环境变量变化后：重新 `export` + `imagent service insta
 
 回复 `y` → 执行；其它 → 拒绝。基于 Claude Code 的 `--permission-prompt-tool` MCP 回调实现。**飞书**下询问是「✅ 允许 / ⛔ 拒绝」按钮卡片——点一下即回，无需打字。等审批期间 `/stop` 仍可用（自动回 deny 中止）。
 
-三档审批粒度（claude-cli）：`auto`（缺省，= Claude Code 的 auto 模式：透传 `--permission-mode acceptEdits`，文件编辑类 claude 自动放行，只有 Bash 等真危险的提示进 IM）< `ask`（claude 的每个权限提示都进 IM）< 叠加 `approval_tools` 审批集（清单外提示直接放行）。`/perm` 可热切（Ask 闭环类需重启生效）。
+审批粒度（claude-cli，由松到紧叠加）：`permission_mode = "auto"`（缺省：透传 Claude Code 原生 **auto 模式** `--permission-mode auto`——分类器自动放行安全操作，高危提示进 IM）→ `backend_permission_mode` 改透传值（`default`/`acceptEdits`/`plan`/`auto`/`dontAsk`/`bypassPermissions`）→ `ask`（claude 的每个权限提示都进 IM）→ `approval_tools` 审批集（清单外提示直接放行，可与任意档叠加）。`/perm` 可热切（Ask 闭环类需重启生效）；`backend_permission_mode` 支持 SIGHUP 热重载。旧版 claude CLI（<2.1.228）不认 auto 会静默回退 default（≈全量进 IM，降级安全）。
 
 ## 终端 agent 接入：ask_via_im（人不在电脑前也能问你）
 
