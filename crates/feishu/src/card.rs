@@ -180,8 +180,13 @@ pub fn stream_body_md(text: &str, tool_calls: &[ToolCall]) -> String {
 /// 明细在降级路径的折叠面板里（managed 路径不重复罗列）。
 pub fn stream_body_final(text: &str, tool_calls: &[ToolCall], err: Option<&str>) -> String {
     let mut out = String::new();
+    // 错误/中断说明进正文（footer 只有一句状态，装不下具体原因）；中断单列措辞。
     if let Some(e) = err {
-        out.push_str(&format!("❌ 出错：{e}\n\n"));
+        if e == "已中断" {
+            out.push_str("⏹ 已中断\n\n");
+        } else {
+            out.push_str(&format!("❌ 出错：{e}\n\n"));
+        }
     }
     if !text.is_empty() {
         out.push_str(text);
@@ -202,8 +207,8 @@ pub fn stream_body_final(text: &str, tool_calls: &[ToolCall], err: Option<&str>)
             stats.join(" · ")
         ));
     }
-    out.push_str("\n\n");
-    out.push_str(terminal_footer(err));
+    // 终态状态行（✅ 已完成等）由 md_footer 承载——正文不再拼一份，
+    // 否则同卡出现两行「完成」（真机反馈）。
     out
 }
 
@@ -211,12 +216,13 @@ pub fn stream_body_final(text: &str, tool_calls: &[ToolCall], err: Option<&str>)
 /// 流式卡正文收成一行状态 + 指针，完整结果以**新卡**重发在下方——用户读完
 /// 审批卡往下看即是结论，无需回滚翻找第一张卡。
 pub fn stub_body(tool_count: usize, err: Option<&str>) -> String {
-    let status = match err {
-        Some("已中断") => "⏹ 已中断".to_string(),
-        Some(_) => "❌ 执行出错".to_string(),
-        None => format!("✅ 已完成 · 🔧 工具 {tool_count} 次"),
-    };
-    format!("{status}\n\n⬇️ 完整结果见下方消息")
+    // 状态行（✅ 已完成 / ❌ 出错 / ⏹ 已中断）由 md_footer 承载，stub 正文
+    // 只留统计 + 指针——不再拼状态词，防同卡双「完成」。
+    match err {
+        None if tool_count > 0 => format!("🔧 工具 {tool_count} 次\n\n⬇️ 完整结果见下方消息"),
+        None => "⬇️ 完整结果见下方消息".to_string(),
+        Some(_) => "⬇️ 详情见下方消息".to_string(),
+    }
 }
 
 /// 降级/话题路径（`msg:` 句柄）整卡 patch 用的 stub 卡（managed 路径用
@@ -230,7 +236,9 @@ pub fn render_stub_card(card: &OutboundCard) -> String {
         "schema": "2.0",
         "config": { "streaming_mode": false },
         "body": { "elements": [
-            { "tag": "markdown", "content": stub_body(card.tool_calls.len(), err) }
+            { "tag": "markdown", "content": stub_body(card.tool_calls.len(), err) },
+            // 状态行在此卡的 footer 元素承载（managed 路径由 patch_footer 等价提供）。
+            { "tag": "markdown", "content": terminal_footer(err), "text_size": "notation" }
         ] }
     })
     .to_string()
@@ -798,12 +806,10 @@ mod tests {
     /// P8-2：结果下沉 stub——状态 + 指针；错误/中断各有文案。
     #[test]
     fn stub_body_and_card() {
-        assert_eq!(
-            stub_body(3, None),
-            "✅ 已完成 · 🔧 工具 3 次\n\n⬇️ 完整结果见下方消息"
-        );
-        assert!(stub_body(0, Some("已中断")).contains("⏹ 已中断"));
-        assert!(stub_body(0, Some("boom")).contains("❌ 执行出错"));
+        // 状态词（完成/出错/中断）归 footer——stub 正文只有统计 + 指针。
+        assert_eq!(stub_body(3, None), "🔧 工具 3 次\n\n⬇️ 完整结果见下方消息");
+        assert_eq!(stub_body(0, None), "⬇️ 完整结果见下方消息");
+        assert_eq!(stub_body(0, Some("boom")), "⬇️ 详情见下方消息");
         let card = OutboundCard {
             text: "结论".into(),
             tool_calls: vec![tool("Bash", "ls", true)],
@@ -816,7 +822,13 @@ mod tests {
             !json.contains("结论"),
             "stub 不含正文（正文在重发的新卡）: {json}"
         );
-        assert!(json.contains("工具 1 次"), "状态行: {json}");
+        assert!(json.contains("工具 1 次"), "统计行: {json}");
+        // 状态词恰好出现一次（footer 元素）——正文不拼第二份。
+        assert_eq!(
+            json.matches("已完成").count(),
+            1,
+            "状态词只应出现一次（footer）: {json}"
+        );
     }
 
     #[test]
@@ -831,12 +843,16 @@ mod tests {
         assert!(out.contains("工具 3 次"), "总数: {out}");
         assert!(out.contains("Bash×2"), "工具统计: {out}");
         assert!(out.contains("Read×1"), "工具统计: {out}");
-        assert!(out.contains("✅ 已完成"));
-        // Error 终态带 ❌ 前置。
+        // 状态行归 md_footer——正文不得再拼「完成」（真机反馈过双行）。
+        assert!(!out.contains("完成"), "正文不应含状态词: {out}");
+        // Error 终态带 ❌ 前置（具体原因正文承载）。
         let err = stream_body_final("", &[], Some("boom"));
         assert!(err.contains("❌ 出错：boom"), "错误前置: {err}");
         // 中断单列（非出错）。
         let stop = stream_body_final("", &[], Some("已中断"));
-        assert!(stop.contains("⏹ 已中断"), "中断终态: {stop}");
+        assert!(
+            stop.contains("⏹ 已中断") && !stop.contains("出错"),
+            "中断终态: {stop}"
+        );
     }
 }
