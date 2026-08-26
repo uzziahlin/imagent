@@ -49,10 +49,20 @@ const FEISHU_TEXT_MAX: usize = 28_000;
 const TOKEN_TTL: Duration = Duration::from_secs(110 * 60);
 
 /// 一张 pending 询问卡的登记项：conv + 消息 id + 工具名。
+#[derive(Debug, Clone)]
 struct PendingAskCard {
     conv_id: String,
     msg_id: String,
     tool_name: String,
+}
+
+/// P8-2：审批卡复用槽（per conv）。`pending_req = None` 表示卡已收敛
+/// （已批准/已拒绝/已中断）可被下一个询问**原地 patch 复用**——顺序询问
+/// 不再每条刷一张新卡把流式卡顶上去；`Some(req)` = 挂着未决询问
+/// （并发询问须另发新卡，防顶掉别人还没答的请求）。
+struct AskSlot {
+    msg_id: String,
+    pending_req: Option<String>,
 }
 
 /// 飞书 Platform 适配器。
@@ -78,6 +88,11 @@ pub struct FeishuPlatform {
     /// pending 询问卡登记（多卡并存）：request_id → 卡片信息。
     /// cancel/resolve 按 request_id 精确收敛；`cancel_all_permission_asks` 按 conv 遍历。
     pending_asks: Arc<Mutex<HashMap<String, PendingAskCard>>>,
+    /// P8-2：审批卡复用槽（per conv，见 [`AskSlot`]）。
+    ask_slots: Arc<Mutex<HashMap<String, AskSlot>>>,
+    /// P8-2：本轮流式卡发送之后是否发过询问卡——终态时判定流式卡已被顶离
+    /// 视口，触发「结果下沉」（流式卡收成指针 + 完整结果另发新卡落底）。
+    asks_since_card: Arc<Mutex<HashMap<String, bool>>>,
     /// P6-1：群消息 @bot 过滤策略（与 drain task 共享，`/config` 热切换）。
     mention_policy: Arc<RwLock<crate::proto::MentionPolicy>>,
 }
@@ -324,6 +339,8 @@ impl FeishuPlatform {
             reconnect,
             inbound_rx: Arc::new(Mutex::new(inbound_msg_rx)),
             pending_asks: Arc::new(Mutex::new(HashMap::new())),
+            ask_slots: Arc::new(Mutex::new(HashMap::new())),
+            asks_since_card: Arc::new(Mutex::new(HashMap::new())),
             mention_policy,
         })
     }
@@ -397,7 +414,15 @@ impl FeishuPlatform {
     ///
     /// P8-1：Running 期 footer 按阶段（思考中/调用工具/输出中）patch，经
     /// `card_footers` 缓存去重——内容不变不发；终态收敛成 完成/出错/已中断。
-    async fn patch_managed(&self, token: &str, card_id: &str, card: &OutboundCard) -> Result<()> {
+    /// P8-2：`stub = true`（终态结果下沉）时终态正文用指针 stub 替代全文——
+    /// 全文由调用方以新卡重发在下方。
+    async fn patch_managed(
+        &self,
+        token: &str,
+        card_id: &str,
+        card: &OutboundCard,
+        stub: bool,
+    ) -> Result<()> {
         match &card.terminal {
             CardTerminal::Running => {
                 let content = stream_body_md(&card.text, &card.tool_calls);
@@ -428,7 +453,11 @@ impl FeishuPlatform {
                     CardTerminal::Error(e) => Some(e.as_str()),
                     _ => None,
                 };
-                let content = stream_body_final(&card.text, &card.tool_calls, err);
+                let content = if stub {
+                    crate::card::stub_body(card.tool_calls.len(), err)
+                } else {
+                    stream_body_final(&card.text, &card.tool_calls, err)
+                };
                 let seq = self.next_card_seq(card_id).await;
                 let element = patch_card_element(token, card_id, "md_body", &content, seq).await;
                 // footer 收敛（真机校准 UX）：初始卡的「🧠 思考中…」在终态
@@ -487,6 +516,11 @@ impl FeishuPlatform {
             },
         );
         if let Some(old) = superseded {
+            // P8-2：同卡复用重登记（复用槽换 request_id）不是「取代」——同一张卡
+            // 不能 patch 成 superseded 顶掉自己刚挂上的新询问。
+            if old.msg_id == msg_id {
+                return;
+            }
             let card_json = crate::card::render_permission_card_superseded(&old.tool_name);
             if let Err(e) = self
                 .with_token(|t| {
@@ -500,6 +534,132 @@ impl FeishuPlatform {
             }
         }
     }
+
+    /// P8-2：登记一张**新发**的询问卡：pending 登记（request_id 路由）+ 复用槽
+    /// （收敛后供下一个询问原地复用）+ 顶起标记（终态结果下沉判定）。
+    async fn register_ask_card(
+        &self,
+        conv_id: &str,
+        msg_id: &str,
+        request_id: &str,
+        tool_name: &str,
+    ) {
+        self.record_pending_ask(request_id, conv_id, msg_id, tool_name)
+            .await;
+        self.ask_slots.lock().await.insert(
+            conv_id.to_string(),
+            AskSlot {
+                msg_id: msg_id.to_string(),
+                pending_req: Some(request_id.to_string()),
+            },
+        );
+        self.mark_ask_sent(conv_id).await;
+    }
+
+    /// P8-2：标记本轮流式卡之后发过询问卡（终态「结果下沉」判定）。
+    async fn mark_ask_sent(&self, conv_id: &str) {
+        self.asks_since_card
+            .lock()
+            .await
+            .insert(conv_id.to_string(), true);
+    }
+
+    /// P8-2：取出并清除「发过询问卡」标记（终态消费一次）。
+    async fn take_asks_flag(&self, conv_id: &str) -> bool {
+        self.asks_since_card
+            .lock()
+            .await
+            .remove(conv_id)
+            .unwrap_or(false)
+    }
+
+    /// P8-2：释放该 conv 的复用槽（询问收敛后调用——卡保留在 IM 里，下一个
+    /// 询问原地 patch 复用，不另发新卡）。
+    async fn free_ask_slot(&self, conv_id: &str, request_id: &str) {
+        if let Some(slot) = self.ask_slots.lock().await.get_mut(conv_id) {
+            if slot.pending_req.as_deref() == Some(request_id) {
+                slot.pending_req = None;
+            }
+        }
+    }
+
+    /// P8-2：尝试复用本 conv 的空闲询问卡——patch 成新询问（省一条新消息）。
+    /// 槽不存在 / 挂着未决询问（并发）→ None（调用方走发新卡路径）；patch 失败
+    /// 也回 None 降级发新卡（旧卡标记回收失败仅记日志，不影响正确性）。
+    async fn try_reuse_ask_slot(
+        &self,
+        conv_id: &str,
+        card_json: &str,
+        request_id: &str,
+        tool_name: &str,
+    ) -> Option<String> {
+        let msg_id = claim_free_slot(&mut *self.ask_slots.lock().await, conv_id, request_id)?;
+        let patch = self
+            .with_token(|t| {
+                let msg_id = msg_id.clone();
+                let card_json = card_json.to_string();
+                async move { patch_card(&self.core_config, &t, &msg_id, &card_json).await }
+            })
+            .await;
+        match patch {
+            Ok(()) => {
+                self.record_pending_ask(request_id, conv_id, &msg_id, tool_name)
+                    .await;
+                self.mark_ask_sent(conv_id).await;
+                Some(msg_id)
+            }
+            Err(e) => {
+                warn!(target: "feishu", error = %e, "复用询问卡 patch 失败，另发新卡");
+                if let Some(slot) = self.ask_slots.lock().await.get_mut(conv_id) {
+                    slot.pending_req = None;
+                }
+                None
+            }
+        }
+    }
+
+    /// P8-2：发送静态卡片（终态结果下沉用）：普通 conv 直接发，话题群 reply 进
+    /// 原话题。发送失败如实上抛（调用方 warn——结果已在流式卡里兜底过一次）。
+    async fn send_static_card(&self, conv: &ConvId, card_json: &str) -> Result<()> {
+        if let Some((_chat, root_id)) = thread_target_from_conv(conv) {
+            return self
+                .with_token(|t| {
+                    let root_id = root_id.clone();
+                    let card_json = card_json.to_string();
+                    async move {
+                        reply_message(&self.core_config, &t, &root_id, "interactive", &card_json)
+                            .await
+                    }
+                })
+                .await
+                .map(|_| ());
+        }
+        let (receive_id, kind) = receive_target_from_conv(conv)
+            .ok_or_else(|| CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0)))?;
+        self.with_token(|t| {
+            let receive_id = receive_id.clone();
+            let card_json = card_json.to_string();
+            async move { send_card_msg(&self.core_config, &t, &receive_id, kind, &card_json).await }
+        })
+        .await
+        .map(|_| ())
+    }
+}
+
+/// P8-2：认领空闲复用槽（纯逻辑，便于单测）：槽空闲 → 绑定新 request_id 并
+/// 返回卡 msg_id（调用方 patch 该卡成新询问）；槽不存在 / 已挂未决询问
+/// （并发中，不能顶掉别人还没答的）→ None。
+fn claim_free_slot(
+    slots: &mut HashMap<String, AskSlot>,
+    conv_id: &str,
+    request_id: &str,
+) -> Option<String> {
+    let slot = slots.get_mut(conv_id)?;
+    if slot.pending_req.is_some() {
+        return None;
+    }
+    slot.pending_req = Some(request_id.to_string());
+    Some(slot.msg_id.clone())
 }
 
 /// 媒体目录：`<imagent_home>/media/`（0700；P4-10：随 profile 隔离）。
@@ -781,8 +941,15 @@ impl Platform for FeishuPlatform {
         }
         // P6 遗留补齐：话题群——reply API 把审批卡发进原话题（与流式卡同路），
         // 失败降级文本（文本经 send_text 的线程分支也落回话题）。
+        // P8-2：话题群的复用槽与普通 conv 同一套（patch 话题内旧卡同样有效）。
         if let Some((_chat, root_id)) = thread_target_from_conv(conv) {
             let card_json = render_permission_card(tool_name, input_summary, &conv.0, request_id);
+            if let Some(mid) = self
+                .try_reuse_ask_slot(&conv.0, &card_json, request_id, tool_name)
+                .await
+            {
+                return Ok(Some(mid));
+            }
             return match self
                 .with_token(|t| {
                     let root_id = root_id.clone();
@@ -796,13 +963,14 @@ impl Platform for FeishuPlatform {
             {
                 Ok(mid) => {
                     if let Some(mid) = &mid {
-                        self.record_pending_ask(request_id, &conv.0, mid, tool_name)
+                        self.register_ask_card(&conv.0, mid, request_id, tool_name)
                             .await;
                     }
                     Ok(mid)
                 }
                 Err(e) => {
                     warn!(target: "feishu", error = %e, "话题内审批卡发送失败，降级纯文本询问");
+                    self.mark_ask_sent(&conv.0).await;
                     self.send_permission_ask_text(conv, tool_name, input_summary, hint)
                         .await
                         .map(|_| None)
@@ -820,6 +988,14 @@ impl Platform for FeishuPlatform {
         } else {
             render_permission_card(tool_name, input_summary, &conv.0, request_id)
         };
+        // P8-2：优先复用本 conv 已收敛的询问卡（原地 patch 成新询问）——顺序
+        // 审批不再每条刷一张新卡把流式卡顶离视口。
+        if let Some(mid) = self
+            .try_reuse_ask_slot(&conv.0, &card_json, request_id, tool_name)
+            .await
+        {
+            return Ok(Some(mid));
+        }
         match self
             .with_token(|t| {
                 let receive_id = receive_id.clone();
@@ -832,13 +1008,14 @@ impl Platform for FeishuPlatform {
         {
             Ok(mid) => {
                 if let Some(mid) = &mid {
-                    self.record_pending_ask(request_id, &conv.0, mid, tool_name)
+                    self.register_ask_card(&conv.0, mid, request_id, tool_name)
                         .await;
                 }
                 Ok(mid)
             }
             Err(e) => {
                 warn!(target: "feishu", error = %e, "审批卡片发送失败，降级纯文本询问");
+                self.mark_ask_sent(&conv.0).await;
                 self.send_permission_ask_text(conv, tool_name, input_summary, hint)
                     .await
                     .map(|_| None)
@@ -853,10 +1030,12 @@ impl Platform for FeishuPlatform {
             return Ok(());
         };
         let PendingAskCard {
+            conv_id,
             msg_id: message_id,
             tool_name,
-            ..
         } = card;
+        // P8-2：释放复用槽（卡保留，下一个询问可原地复用）。
+        self.free_ask_slot(&conv_id, request_id).await;
         let card_json = render_permission_card_cancelled(&tool_name);
         self.with_token(|t| {
             let message_id = message_id.clone();
@@ -879,6 +1058,10 @@ impl Platform for FeishuPlatform {
             }
         });
         drop(all);
+        // P8-2：conv 级复用槽一并释放（/stop 后下一个询问可复用末张卡）。
+        if let Some(slot) = self.ask_slots.lock().await.get_mut(&conv.0) {
+            slot.pending_req = None;
+        }
         for (message_id, tool_name) in hits {
             let card_json = render_permission_card_cancelled(&tool_name);
             if let Err(e) = self
@@ -908,10 +1091,12 @@ impl Platform for FeishuPlatform {
             return Ok(());
         };
         let PendingAskCard {
+            conv_id,
             msg_id: message_id,
             tool_name,
-            ..
         } = card;
+        // P8-2：释放复用槽——卡保留（显示已批准/已拒绝），下一个询问原地复用。
+        self.free_ask_slot(&conv_id, request_id).await;
         let card_json = if tool_name == "AskUserQuestion" {
             let choice = reply
                 .raw_text
@@ -1014,6 +1199,12 @@ impl Platform for FeishuPlatform {
         card: &OutboundCard,
         _hint: &ReplyHint,
     ) -> Result<Option<String>> {
+        // P8-2：新一轮流式卡——「之后发过询问卡」标记清零（conv 轮次串行，
+        // 无并发覆盖问题）。
+        self.asks_since_card
+            .lock()
+            .await
+            .insert(conv.0.clone(), false);
         if let Some((_chat, root_id)) = thread_target_from_conv(conv) {
             let card_json = render_card(card);
             return self
@@ -1064,14 +1255,20 @@ impl Platform for FeishuPlatform {
     /// - `msg:<message_id>`：降级路径——整卡 im patch（现有行为，含折叠面板）
     async fn update_card(
         &self,
-        _conv: &ConvId,
+        conv: &ConvId,
         handle: &str,
         card: &OutboundCard,
         _hint: &ReplyHint,
     ) -> Result<()> {
-        self.with_token(|token| async move {
-            if let Some(card_id) = handle.strip_prefix("card:") {
-                match self.patch_managed(&token, card_id, card).await {
+        // P8-2：终态「结果下沉」——本轮发过询问卡（流式卡被审批卡顶离视口）时，
+        // 流式卡收成指针 stub，完整结果另发新卡落在会话最下面。标记取走即清
+        // （300317 重试 / 重复终态不会二次重发）。
+        let buried =
+            !matches!(card.terminal, CardTerminal::Running) && self.take_asks_flag(&conv.0).await;
+        let res = self
+            .with_token(|token| async move {
+                if let Some(card_id) = handle.strip_prefix("card:") {
+                    match self.patch_managed(&token, card_id, card, buried).await {
                     // 300317（sequence 落后）自愈（真机校准）：重启后内存计数器归零，
                     // 但旧卡片的 server 序号已推进（孤儿扫描接管、同进程异常路径）
                     // ——把该卡计数器重置为时间戳级（必然大于 server 序号）整段重试。
@@ -1085,12 +1282,16 @@ impl Platform for FeishuPlatform {
                             .map(|d| d.as_secs() as i64)
                             .unwrap_or(1_000_000_000);
                         *self.card_seqs.lock().await.entry(card_id.to_string()).or_insert(now) = now;
-                        self.patch_managed(&token, card_id, card).await
+                        self.patch_managed(&token, card_id, card, buried).await
                     }
                     other => other,
                 }
             } else if let Some(message_id) = handle.strip_prefix("msg:") {
-                let card_json = render_card(card);
+                let card_json = if buried {
+                    crate::card::render_stub_card(card)
+                } else {
+                    render_card(card)
+                };
                 patch_card(&self.core_config, &token, message_id, &card_json).await
             } else {
                 Err(CoreError::Platform(
@@ -1098,8 +1299,18 @@ impl Platform for FeishuPlatform {
                     format!("非法卡片句柄: {handle}"),
                 ))
             }
-        })
-        .await
+            })
+            .await;
+        // 结果下沉重发：流式卡已收敛成指针 → 完整结果另发新卡。重发失败上抛 Err
+        // ——core 的 P5-11 兜底会以纯文本补发全文（结论不能因重发失败而丢）。
+        if res.is_ok() && buried {
+            let full = render_card(card);
+            if let Err(e) = self.send_static_card(conv, &full).await {
+                warn!(target: "feishu", error = %e, "结果下沉重发失败，交由 core 纯文本兜底");
+                return Err(e);
+            }
+        }
+        res
     }
 
     fn name(&self) -> &'static str {
@@ -1218,6 +1429,100 @@ mod tests {
     fn unused_import_guard() {
         // 保持导入被使用，防止编译告警。
         let _ = ConvId("x".into());
+    }
+
+    /// P8-2：复用槽认领——空闲可认领、pending 拒绝、释放后可再认领。
+    #[test]
+    fn ask_slot_claim_and_free() {
+        let mut slots = HashMap::new();
+        assert!(
+            claim_free_slot(&mut slots, "c1", "r1").is_none(),
+            "无槽不认领"
+        );
+        slots.insert(
+            "c1".into(),
+            AskSlot {
+                msg_id: "m1".into(),
+                pending_req: None,
+            },
+        );
+        assert_eq!(
+            claim_free_slot(&mut slots, "c1", "r1").as_deref(),
+            Some("m1"),
+            "空闲槽认领返回卡 id"
+        );
+        assert!(
+            claim_free_slot(&mut slots, "c1", "r2").is_none(),
+            "未决询问挂着时不认领（并发另发新卡）"
+        );
+        // 释放（匹配 request_id 才释放）。
+        if let Some(slot) = slots.get_mut("c1") {
+            if slot.pending_req.as_deref() == Some("r2") {
+                slot.pending_req = None;
+            }
+        }
+        assert!(
+            claim_free_slot(&mut slots, "c1", "r3").is_none(),
+            "request_id 不匹配不释放"
+        );
+        if let Some(slot) = slots.get_mut("c1") {
+            if slot.pending_req.as_deref() == Some("r1") {
+                slot.pending_req = None;
+            }
+        }
+        assert_eq!(
+            claim_free_slot(&mut slots, "c1", "r3").as_deref(),
+            Some("m1"),
+            "释放后可再认领"
+        );
+    }
+
+    /// P8-2：顶起标记——send_card 清零、发询问卡置位、终态取走即清。
+    #[tokio::test]
+    async fn asks_flag_roundtrip() {
+        let p = FeishuPlatform::new(
+            "cli_test".into(),
+            "secret_test".into(),
+            "https://open.feishu.cn".into(),
+            true,
+        )
+        .expect("构造");
+        let conv = ConvId("feishu:ou_x".into());
+        // send_card 的清零等价于直接写 false（方法本身需 HTTP，此处测标记语义）。
+        p.asks_since_card.lock().await.insert(conv.0.clone(), false);
+        assert!(!p.take_asks_flag(&conv.0).await, "未发询问 → 不下沉");
+        p.mark_ask_sent(&conv.0).await;
+        assert!(p.take_asks_flag(&conv.0).await, "发过询问 → 下沉");
+        assert!(!p.take_asks_flag(&conv.0).await, "取走即清（不重复下沉）");
+    }
+
+    /// P8-2：同卡重登记（复用槽换 request_id）不是「取代」——同 msg_id 不走
+    /// superseded patch（否则会把刚挂上的新询问顶掉）。guard 提前返回，无 HTTP。
+    #[tokio::test]
+    async fn record_pending_ask_same_card_not_superseded() {
+        let p = FeishuPlatform::new(
+            "cli_test".into(),
+            "secret_test".into(),
+            "https://open.feishu.cn".into(),
+            true,
+        )
+        .expect("构造");
+        p.pending_asks.lock().await.insert(
+            "r1".into(),
+            PendingAskCard {
+                conv_id: "feishu:ou_x".into(),
+                msg_id: "m1".into(),
+                tool_name: "Bash".into(),
+            },
+        );
+        // 同 request_id + 同卡重登记：不应触发 superseded（否则会真实发 HTTP）。
+        p.record_pending_ask("r1", "feishu:ou_x", "m1", "Bash")
+            .await;
+        let entry = p.pending_asks.lock().await.get("r1").cloned();
+        assert!(
+            entry.as_ref().is_some_and(|c| c.msg_id == "m1"),
+            "登记保留: {entry:?}"
+        );
     }
 
     /// P6 遗留补齐：require_mention 热切换——共享句柄 get/set 往返（drain task

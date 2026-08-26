@@ -4,7 +4,7 @@
 
 ## [Unreleased]
 
-> 卡片视觉改版（P8-1，对标 lark-coding-agent-bridge）：工具行从「裸 JSON 截断」升级为「状态图标 + 人可读摘要」，流式卡分阶段 footer，审批/问题/命令卡加标题栏，命令文案分组重排。纯展示层变更（协议字段集均为对方项目生产验证过的 CardKit 2.0 字段），无配置/行为变更。
+> 卡片交互改版两连：**P8-1 视觉**（对标 lark-coding-agent-bridge）——工具行「裸 JSON 截断」→「状态图标 + 人可读摘要」、流式卡分阶段 footer、审批/问题/命令卡标题栏、命令文案分组；**P8-2 交互**——审批卡复用（顺序询问不再刷屏顶卡）+ 终态结果下沉（多轮审批后结论落在会话最下面，不再埋在第一张卡）。视觉层为对方项目生产验证过的 CardKit 2.0 字段集，无配置变更。
 
 ### Changed
 - **工具调用智能摘要**：`tool_summary 把工具 input JSON 压成人可读单行（Bash 取 command、Read/Write/Edit 取 file_path、Grep 取 pattern in path、WebFetch 取 url、TodoWrite 计数；覆盖 codex 的 shell/read_file/apply_patch 命名；截断 JSON 解析失败回退压平原文）。所有展示面共用：流式卡片工具行、审批卡签名行、纯文本工具摘要（`🔧 工具调用：Bash — git status）。COT 截断档随之 Brief 40→80 / Detailed 200→240 字符。
@@ -15,6 +15,10 @@
 - **问题卡/命令卡加标题栏**：❓ 需要你的输入（蓝）/ 命令卡标题进 header（蓝）；命令按钮支持 primary/danger 分层（`CardButton.style：/help 的 状态=primary、中断=danger，/ws 使用=primary，/resume 首个接管=primary，问题卡首选项=primary）。
 - **命令文案重排**：/help 按 会话/目录与文件/权限与运行/状态与诊断/白名单与管理 五组 bullets（此前 26 条命令挤一段无分隔）；/status 字段行加图标（🤖 后端/💬 本会话/🔗 会话/📁 工作目录/🏃 全局在飞/⏱️ 运行时长）；/sessions 列表 bullets + 活动项「（当前）」标记（原 `*）。
 - **流式终态工具统计**：`🔧 工具 N 次：Bash×2 · Read×3（含总次数，× 计数分隔）。
+
+### Added
+- **审批卡复用（P8-2）**：同一会话内**顺序到达**的询问（审批/AskUserQuestion）不再每条新发一张卡把流式卡顶离视口——收敛后的询问卡（已批准/已拒绝/已中断）保留为该会话的复用槽，下一个询问**原地 patch 成新询问**（按钮换绑新 request_id）。挂着未决询问时（并发审批）不认领槽、照旧另发新卡，多 pending 语义不变；复用 patch 失败自动降级发新卡；同卡重登记不再误判为「被新询问取代」。
+- **终态结果下沉（P8-2）**：本轮发过询问卡（流式卡已被顶离阅读位置）时，终态把流式卡正文收成一行指针（`✅ 已完成 · 🔧 工具 N 次\n⬇️ 完整结果见下方消息），**完整结果另发一张新卡**落在会话最下面——多轮审批后结论不再埋在第一张卡里。managed/降级/话题群三路径均支持；重发失败上抛，由 core 的 P5-11 纯文本兜底补发全文（结论不丢）。未触发询问的普通轮次行为不变（结果仍在原流式卡）。
 
 ### 迁移与注意
 - 无配置变更；纯升级重启即生效（worktree 外用户走 install.sh 覆盖 + `imagent service install` 重启）。

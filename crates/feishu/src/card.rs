@@ -207,6 +207,35 @@ pub fn stream_body_final(text: &str, tool_calls: &[ToolCall], err: Option<&str>)
     out
 }
 
+/// 终态「结果下沉」指针正文（P8-2）：本轮发过询问卡（流式卡已被顶离视口）时，
+/// 流式卡正文收成一行状态 + 指针，完整结果以**新卡**重发在下方——用户读完
+/// 审批卡往下看即是结论，无需回滚翻找第一张卡。
+pub fn stub_body(tool_count: usize, err: Option<&str>) -> String {
+    let status = match err {
+        Some("已中断") => "⏹ 已中断".to_string(),
+        Some(_) => "❌ 执行出错".to_string(),
+        None => format!("✅ 已完成 · 🔧 工具 {tool_count} 次"),
+    };
+    format!("{status}\n\n⬇️ 完整结果见下方消息")
+}
+
+/// 降级/话题路径（`msg:` 句柄）整卡 patch 用的 stub 卡（managed 路径用
+/// [`stub_body`] patch `md_body`，语义相同）。
+pub fn render_stub_card(card: &OutboundCard) -> String {
+    let err = match &card.terminal {
+        CardTerminal::Error(e) => Some(e.as_str()),
+        _ => None,
+    };
+    serde_json::json!({
+        "schema": "2.0",
+        "config": { "streaming_mode": false },
+        "body": { "elements": [
+            { "tag": "markdown", "content": stub_body(card.tool_calls.len(), err) }
+        ] }
+    })
+    .to_string()
+}
+
 /// 审批卡详情：工具签名行 + 参数代码块。
 ///
 /// - Bash/shell → ```bash 命令
@@ -764,6 +793,30 @@ mod tests {
         assert!(md2.contains("前面还有 3 个工具"), "折叠计数: {md2}");
         assert!(!md2.contains("f0"), "最早不展示: {md2}");
         assert!(md2.contains("f7"), "最新可见: {md2}");
+    }
+
+    /// P8-2：结果下沉 stub——状态 + 指针；错误/中断各有文案。
+    #[test]
+    fn stub_body_and_card() {
+        assert_eq!(
+            stub_body(3, None),
+            "✅ 已完成 · 🔧 工具 3 次\n\n⬇️ 完整结果见下方消息"
+        );
+        assert!(stub_body(0, Some("已中断")).contains("⏹ 已中断"));
+        assert!(stub_body(0, Some("boom")).contains("❌ 执行出错"));
+        let card = OutboundCard {
+            text: "结论".into(),
+            tool_calls: vec![tool("Bash", "ls", true)],
+            phase: CardPhase::Outputting,
+            terminal: CardTerminal::Done,
+        };
+        let json = render_stub_card(&card);
+        assert!(json.contains("⬇️ 完整结果见下方消息"), "指针: {json}");
+        assert!(
+            !json.contains("结论"),
+            "stub 不含正文（正文在重发的新卡）: {json}"
+        );
+        assert!(json.contains("工具 1 次"), "状态行: {json}");
     }
 
     #[test]
