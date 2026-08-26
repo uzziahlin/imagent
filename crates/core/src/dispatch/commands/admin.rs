@@ -635,9 +635,19 @@ impl Dispatcher {
         let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
         if arg.is_empty() {
             let cur = *self.permission_mode.read();
+            // auto-edits 是 auto 在 claude-cli 下的解析产物，附说明防「设置了
+            // auto 怎么显示别的档」的困惑。
+            let note = if cur == PermissionMode::AutoEdits {
+                "（由 auto 按后端解析：claude 原生 acceptEdits，编辑类自动放行，Bash 等危险工具走 IM）"
+            } else {
+                ""
+            };
             self.reply(
                 conv,
-                &format!("当前权限模式：{cur:?}\n用法：/perm <auto|off|allow|deny|ask>"),
+                &format!(
+                    "当前权限模式：{}{note}\n用法：/perm <auto|off|allow|deny|ask>",
+                    cur.as_str()
+                ),
                 hint,
             )
             .await;
@@ -656,8 +666,8 @@ impl Dispatcher {
                 // 其余 → off）；回执带解析结果。
                 let resolved = PermissionMode::Auto.resolve(self.backend.name());
                 self.reload_permission_mode(resolved);
-                let note = if resolved == PermissionMode::Ask {
-                    "（注意：Ask 模式的权限审批 socket 需重启 imagent 才生效）"
+                let note = if resolved.needs_socket() {
+                    "（注意：审批闭环 socket 需重启 imagent 才生效）"
                 } else {
                     ""
                 };

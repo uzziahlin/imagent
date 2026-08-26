@@ -283,9 +283,10 @@ pub async fn run_mcp_server(
             }
         };
 
-        // tools/call 在 Ask 模式需要 socket roundtrip；其它走纯 handler。
+        // tools/call 在 Ask 闭环类模式（Ask / AutoEdits）需要 socket roundtrip；
+        // 其它走纯 handler。
         let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
-        let resp = if method == "tools/call" && matches!(mode, PermissionMode::Ask) {
+        let resp = if method == "tools/call" && mode.needs_socket() {
             let (tool_name, input) = extract_call_args(&req);
             // 多 pending：每次调用独立 request_id（同 conv 与其它询问并存互不顶替）。
             let request_id = new_request_id("p");

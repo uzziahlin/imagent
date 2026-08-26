@@ -434,7 +434,8 @@ fn permission_outcome(
         PermissionMode::Allow | PermissionMode::Off | PermissionMode::Auto => {
             allow_outcome(&request.options)
         }
-        PermissionMode::Ask => {
+        // AutoEdits 也进不来（resolve 只在 claude-cli 产生；防御性同 Ask fail-closed）。
+        PermissionMode::Ask | PermissionMode::AutoEdits => {
             // ACP 后端尚未接入 IM 审批闭环（需把 core 的 PermissionRouter 接到 ACP 的
             // session/request_permission 通知通道，复杂度高）。为安全（fail-closed），
             // Ask 模式下拒绝每次权限请求，而非静默放行。如需 IM 审批闭环，请用

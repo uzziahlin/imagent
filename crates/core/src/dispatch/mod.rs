@@ -430,7 +430,7 @@ impl Dispatcher {
     pub async fn run(self: Arc<Self>) -> Result<()> {
         // Ask 模式：spawn unix socket accept task（MCP server 转发的权限请求经此进主进程）。
         #[cfg(unix)]
-        if matches!(*self.permission_mode.read(), PermissionMode::Ask) {
+        if self.permission_mode.read().needs_socket() {
             if let Some(sock) = crate::permission::default_sock_path() {
                 self.spawn_socket_accept(sock.to_string_lossy().into_owned());
             } else {
@@ -438,7 +438,7 @@ impl Dispatcher {
             }
         }
         #[cfg(not(unix))]
-        if matches!(*self.permission_mode.read(), PermissionMode::Ask) {
+        if self.permission_mode.read().needs_socket() {
             warn!(
                 target: "imagent::core",
                 "Ask 权限审批闭环需要 Unix domain socket，当前平台(Windows)不可用；请改用 permission_mode = allow/deny/off 或在 macOS/Linux 运行"
