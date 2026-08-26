@@ -546,6 +546,19 @@ async fn main() -> Result<()> {
                 perm_mode.clone(),
                 std::time::Duration::from_secs(config.permission_ask_timeout_secs),
             );
+            // P8-4：后端原生权限模式透传（claude → --permission-mode）——缺省
+            // None = auto 档透传新 auto 模式；显式配置则覆盖（已过 config 校验归一）。
+            // 后端暂不支持时 warn（不静默——防预期落差），值保留待后续接入。
+            backend.set_native_permission_mode(config.backend_permission_mode.clone());
+            if config.backend_permission_mode.is_some()
+                && !backend.supports_native_permission_mode()
+            {
+                tracing::warn!(
+                    target: "imagent::ops",
+                    agent = %config.agent,
+                    "backend_permission_mode 已配置但该后端暂不支持原生权限模式透传（忽略；claude-cli 映射 --permission-mode，其余后端后续接入）"
+                );
+            }
 
             // codex/gemini 后端不支持 IM 权限审批闭环：若用户开启了 permission_mode，
             // 显式 warn（不静默忽略），避免预期落差。
@@ -612,11 +625,12 @@ async fn main() -> Result<()> {
             }
 
             // 8. dispatcher —— allowed_tools / permission_mode 均以共享句柄注入。
+            // backend 先 clone 给 SIGHUP 热重载用（透传覆盖），再 move 进 dispatcher。
             let tools_handle =
                 std::sync::Arc::new(parking_lot::RwLock::new(config.allowed_tools.clone()));
             let dispatcher = Arc::new(imagent_core::Dispatcher::new_with_handles(
                 platform,
-                backend,
+                backend.clone(),
                 store.clone(),
                 auth,
                 config.default_workdir.clone(),
@@ -682,7 +696,12 @@ async fn main() -> Result<()> {
 
             // 10. SIGHUP 热重载（白名单 / allowed_tools / permission_mode）。
             #[cfg(unix)]
-            spawn_sighup_handler(dispatcher.clone(), config_path.clone(), http_store.clone());
+            spawn_sighup_handler(
+                dispatcher.clone(),
+                backend.clone(),
+                config_path.clone(),
+                http_store.clone(),
+            );
             #[cfg(not(unix))]
             tracing::info!(
                 target: "imagent::ops",
@@ -1121,6 +1140,7 @@ async fn health_handler(State(st): State<HttpState>) -> (StatusCode, Json<Health
 #[cfg(unix)]
 fn spawn_sighup_handler(
     dispatcher: Arc<imagent_core::Dispatcher>,
+    backend: Arc<dyn imagent_core::Backend>,
     config_path: PathBuf,
     store: imagent_store::Store,
 ) {
@@ -1157,6 +1177,7 @@ fn spawn_sighup_handler(
                     dispatcher.auth().reload_chats(chats);
                     dispatcher.reload_tools(cfg.allowed_tools.clone());
                     dispatcher.set_approval_tools(cfg.approval_tools.clone());
+                    backend.set_native_permission_mode(cfg.backend_permission_mode.clone());
                     let perm = cfg.permission_mode.resolve(&cfg.agent);
                     dispatcher.reload_permission_mode(perm);
                     tracing::info!(target: "imagent::ops", "config reloaded (SIGHUP)");

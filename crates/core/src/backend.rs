@@ -37,6 +37,17 @@ pub trait Backend: Send + Sync {
     /// agent 类型，如 `"claude-cli"`。
     fn name(&self) -> &'static str;
 
+    /// P8-4：backend 原生权限模式透传覆盖（如 claude 的 `--permission-mode`）。
+    /// None = 按档缺省（见各 backend）；Some = 显式值。默认 no-op（不支持原生
+    /// 透传的后端忽略）；SIGHUP 热重载调用。
+    fn set_native_permission_mode(&self, _mode: Option<String>) {}
+
+    /// P8-4：是否支持原生权限模式透传（main 据此对「已配置但不支持」warn，
+    /// 不静默忽略）。默认 false；claude-cli 覆写 true。
+    fn supports_native_permission_mode(&self) -> bool {
+        false
+    }
+
     /// 列出与该 workdir 同项目的本机会话（P4-11 统一 `/resume`：电脑端开的
     /// agent 会话与 IM 会话合并展示）。默认空——无本机存储概念的 backend
     /// （codex/gemini）不参与合并，`/resume` 自动退化为纯 IM 历史。

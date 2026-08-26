@@ -283,7 +283,7 @@ pub async fn run_mcp_server(
             }
         };
 
-        // tools/call 在 Ask 闭环类模式（Ask / AutoEdits）需要 socket roundtrip；
+        // tools/call 在 Ask 闭环类模式（Ask / AutoClaude）需要 socket roundtrip；
         // 其它走纯 handler。
         let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
         let resp = if method == "tools/call" && mode.needs_socket() {
