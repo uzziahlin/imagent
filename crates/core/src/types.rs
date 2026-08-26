@@ -43,6 +43,16 @@ pub struct Mention {
     pub name: String,
 }
 
+/// 命令卡片按钮的视觉样式（P8-1：对标 lcab 的 primary/danger 按钮分层——
+/// 推荐动作用 primary 高亮，破坏性动作用 danger 示警；Default 为普通灰按钮）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CardButtonStyle {
+    #[default]
+    Default,
+    Primary,
+    Danger,
+}
+
 /// 命令卡片按钮（P6-3）：点击等价于发送者手打 `command` 文本——回调经平台侧
 /// 转成 `text = <command>` 的 InboundMessage，走与手打命令完全相同的鉴权/分派。
 #[derive(Debug, Clone)]
@@ -51,6 +61,8 @@ pub struct CardButton {
     pub label: String,
     /// 点击后注入的命令（如 `/ws use main`）。
     pub command: String,
+    /// 视觉样式（缺省普通按钮）。
+    pub style: CardButtonStyle,
 }
 
 /// 入站消息（`Platform::recv` 产出，core 消费）。
@@ -137,6 +149,32 @@ pub struct LocalSession {
     pub cwd: Option<String>,
 }
 
+/// 一次工具调用的展示记录（P8-1：摘要由 [`crate::render::tool_summary`] 从
+/// input JSON 压成人可读单行，替代此前的裸 JSON 截断；`done` 由 ToolResult
+/// 翻转——⏳ 执行中 → ✅ 已完成）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCall {
+    /// 工具名（Bash / Read / codex 的 shell 等）。
+    pub name: String,
+    /// 人可读的单行摘要（如 `git status`、`src/main.rs`）。
+    pub summary: String,
+    /// 是否已收到 ToolResult（false = 执行中）。
+    pub done: bool,
+}
+
+/// 流式卡片的执行阶段（P8-1：分状态 footer——思考中/调用工具/输出中，
+/// 由 CardSession 按最近一次 chunk 类型翻转，平台渲染成各自 footer 文案）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CardPhase {
+    /// 等待首 chunk（CLI 冷启动 + 模型首 token 的静默期）。
+    #[default]
+    Thinking,
+    /// 最近事件是工具调用（ToolUse 之后、ToolResult/Text 之前）。
+    ToolRunning,
+    /// 正在流式输出正文。
+    Outputting,
+}
+
 /// 流式卡片的抽象内容（平台无关）。core dispatch 累积 agent 输出成此结构，
 /// Platform::send_card / update_card 负责渲染成各自平台的卡片格式（如飞书 CardKit JSON）。
 ///
@@ -145,8 +183,10 @@ pub struct LocalSession {
 pub struct OutboundCard {
     /// 累积的回复文本（agent 流式 Text 拼接 + 最终 Final）。
     pub text: String,
-    /// 工具调用摘要：(tool_name, input 摘要)，用于卡片里展示工具块。
-    pub tool_calls: Vec<(String, String)>,
+    /// 工具调用记录（含状态），用于卡片里展示工具块。
+    pub tool_calls: Vec<ToolCall>,
+    /// 执行阶段（Running 态 footer 文案依据；终态忽略）。
+    pub phase: CardPhase,
     /// 卡片终态。
     pub terminal: CardTerminal,
 }

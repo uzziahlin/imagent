@@ -4,7 +4,21 @@
 
 ## [Unreleased]
 
-（空——下一段变更从这里开始。）
+> 卡片视觉改版（P8-1，对标 lark-coding-agent-bridge）：工具行从「裸 JSON 截断」升级为「状态图标 + 人可读摘要」，流式卡分阶段 footer，审批/问题/命令卡加标题栏，命令文案分组重排。纯展示层变更（协议字段集均为对方项目生产验证过的 CardKit 2.0 字段），无配置/行为变更。
+
+### Changed
+- **工具调用智能摘要**：`tool_summary 把工具 input JSON 压成人可读单行（Bash 取 command、Read/Write/Edit 取 file_path、Grep 取 pattern in path、WebFetch 取 url、TodoWrite 计数；覆盖 codex 的 shell/read_file/apply_patch 命名；截断 JSON 解析失败回退压平原文）。所有展示面共用：流式卡片工具行、审批卡签名行、纯文本工具摘要（`🔧 工具调用：Bash — git status）。COT 截断档随之 Brief 40→80 / Detailed 200→240 字符。
+- **工具状态跟踪（⏳/✅）**：`ToolResult` 不再被丢弃——同名最早未完成的调用翻成 ✅，卡片工具行实时反馈执行进度（工具结果内容仍不进 IM，防大段输出刷屏）。
+- **流式卡分阶段 footer**：🧠 思考中… / 🧰 正在调用工具… / ✍️ 输出中…（按最近一次 chunk 类型翻转，patch 经 per-card 缓存去重，内容不变不发）；终态收敛 ✅ 已完成 / ❌ 出错 / ⏹ 已中断（/stop 单列，不再显示为出错）。
+- **降级路径工具面板**（managed 创建失败/话题群）：lcab 同款折叠面板——蓝边框 + 圆角 + 内边距 + notation 小字号 + 展开箭头图标，正文为状态图标工具行列表；超 7 条只保留最近 5 行 + 「☕ … 前面还有 N 个」计数。
+- **审批卡改版**：卡片级标题栏（🔐 权限审批，橙色主题）；正文 = 工具签名行（`**Bash** — git status）+ 参数代码块（Bash 用 bash 语言高亮，其余 pretty JSON）+ 超时提示 note 行；不再裸贴 JSON。文本降级路径同步用智能摘要。
+- **问题卡/命令卡加标题栏**：❓ 需要你的输入（蓝）/ 命令卡标题进 header（蓝）；命令按钮支持 primary/danger 分层（`CardButton.style：/help 的 状态=primary、中断=danger，/ws 使用=primary，/resume 首个接管=primary，问题卡首选项=primary）。
+- **命令文案重排**：/help 按 会话/目录与文件/权限与运行/状态与诊断/白名单与管理 五组 bullets（此前 26 条命令挤一段无分隔）；/status 字段行加图标（🤖 后端/💬 本会话/🔗 会话/📁 工作目录/🏃 全局在飞/⏱️ 运行时长）；/sessions 列表 bullets + 活动项「（当前）」标记（原 `*）。
+- **流式终态工具统计**：`🔧 工具 N 次：Bash×2 · Read×3（含总次数，× 计数分隔）。
+
+### 迁移与注意
+- 无配置变更；纯升级重启即生效（worktree 外用户走 install.sh 覆盖 + `imagent service install` 重启）。
+- 真机待验证项：header/title 模板色、折叠面板 border/padding 字段、notation 字号在自建应用上的渲染（字段集与 lcab 生产一致，理论无风险；若审批卡发送失败会自动降级纯文本，不影响审批闭环）。
 
 ## [1.5.4] — 2026-08-26
 

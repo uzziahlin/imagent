@@ -80,6 +80,11 @@ impl Dispatcher {
                 .map(|(i, _)| CardButton {
                     label: format!("接管 {}", i + 1),
                     command: format!("/resume {}", i + 1),
+                    style: if i == 0 {
+                        CardButtonStyle::Primary
+                    } else {
+                        CardButtonStyle::Default
+                    },
                 })
                 .collect();
             self.reply_card(
@@ -289,11 +294,11 @@ impl Dispatcher {
                     .await
                     .unwrap_or(None)
                     .unwrap_or_default();
-                let mut lines = String::from("命名会话：");
+                let mut lines = String::from("🗂 命名会话：");
                 for r in &rows {
-                    let mark = if r.name == active { " *" } else { "" };
+                    let mark = if r.name == active { "（当前）" } else { "" };
                     let sid: String = r.session_id.chars().take(8).collect();
-                    lines.push_str(&format!("\n  {}{} (session {}…)", r.name, mark, sid));
+                    lines.push_str(&format!("\n- {}{}（{}…）", r.name, mark, sid));
                 }
                 self.reply(conv, &lines, hint).await;
             }

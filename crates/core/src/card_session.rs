@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::platform::Platform;
-use crate::types::{CardTerminal, ConvId, OutboundCard, ReplyHint};
+use crate::types::{CardPhase, CardTerminal, ConvId, OutboundCard, ReplyHint, ToolCall};
 use imagent_store::Store;
 
 /// 卡片 patch 节流间隔。飞书交互卡片更新有频率限制，500ms 平衡流畅与限流。
@@ -23,7 +23,10 @@ const CARD_THROTTLE: Duration = Duration::from_millis(500);
 /// 流式卡片会话。
 pub(crate) struct CardSession {
     text: String,
-    tools: Vec<(String, String)>,
+    tools: Vec<ToolCall>,
+    /// P8-1：执行阶段（思考中/调用工具/输出中）——按最近一次 chunk 类型翻转，
+    /// 平台渲染成分状态 footer。
+    phase: CardPhase,
     msg_id: Option<String>,
     last_patch: Instant,
     /// 在飞卡片登记（P4_ROADMAP 第六批）：首帧句柄落库、终态成功摘除——进程崩溃
@@ -38,6 +41,7 @@ impl CardSession {
         Self {
             text: String::new(),
             tools: Vec::new(),
+            phase: CardPhase::Thinking,
             msg_id: None,
             last_patch: Instant::now(),
             store,
@@ -62,7 +66,7 @@ impl CardSession {
         }
     }
 
-    /// 累积文本增量，节流 patch（Running 态）。
+    /// 累积文本增量，节流 patch（Running 态）；阶段翻到「输出中」。
     pub(crate) async fn append_text(
         &mut self,
         text: &str,
@@ -71,11 +75,12 @@ impl CardSession {
         platform: &dyn Platform,
     ) {
         self.text.push_str(text);
+        self.phase = CardPhase::Outputting;
         self.patch_if_due(CardTerminal::Running, conv, hint, platform)
             .await;
     }
 
-    /// 累积工具调用摘要，节流 patch（Running 态；工具块需展示）。
+    /// 累积工具调用（⏳ 执行中），节流 patch；阶段翻到「调用工具」。
     pub(crate) async fn append_tool(
         &mut self,
         tool: &str,
@@ -84,8 +89,28 @@ impl CardSession {
         hint: &ReplyHint,
         platform: &dyn Platform,
     ) {
-        self.tools
-            .push((tool.to_string(), input_summary.to_string()));
+        self.tools.push(ToolCall {
+            name: tool.to_string(),
+            summary: input_summary.to_string(),
+            done: false,
+        });
+        self.phase = CardPhase::ToolRunning;
+        self.patch_if_due(CardTerminal::Running, conv, hint, platform)
+            .await;
+    }
+
+    /// P8-1：工具结果到达——把同名工具里最早未完成的一条翻成 ✅（工具结果
+    /// 不带调用 id，按序配对；同名并发极少见，错配只影响图标不影响内容）。
+    pub(crate) async fn finish_tool(
+        &mut self,
+        tool: &str,
+        conv: &ConvId,
+        hint: &ReplyHint,
+        platform: &dyn Platform,
+    ) {
+        if let Some(t) = self.tools.iter_mut().find(|t| !t.done && t.name == tool) {
+            t.done = true;
+        }
         self.patch_if_due(CardTerminal::Running, conv, hint, platform)
             .await;
     }
@@ -98,7 +123,7 @@ impl CardSession {
     pub(crate) async fn finalize(
         &mut self,
         final_text: Option<&str>,
-        extra_tools: &[(String, String)],
+        extra_tools: &[ToolCall],
         terminal: CardTerminal,
         conv: &ConvId,
         hint: &ReplyHint,
@@ -109,7 +134,12 @@ impl CardSession {
             self.text.push_str(f);
         }
         for t in extra_tools {
-            if !self.tools.contains(t) {
+            // 按 (name, summary) 去重合并（done 标志可能不同步——以已存在的记录为准）。
+            if !self
+                .tools
+                .iter()
+                .any(|e| e.name == t.name && e.summary == t.summary)
+            {
                 self.tools.push(t.clone());
             }
         }
@@ -153,6 +183,7 @@ impl CardSession {
         let card = OutboundCard {
             text: self.text.clone(),
             tool_calls: self.tools.clone(),
+            phase: self.phase,
             terminal: terminal.clone(),
         };
         let res: crate::error::Result<()> = match &self.msg_id {
@@ -232,6 +263,7 @@ pub async fn sweep_live_cards(store: &Store, platform: &dyn Platform) {
         let card = OutboundCard {
             text: "⏸️ imagent 已重启，本次生成被中断（未产出结论）。请重新发送指令。".to_string(),
             tool_calls: Vec::new(),
+            phase: CardPhase::Thinking,
             terminal: CardTerminal::Error("进程重启中断".into()),
         };
         let conv = ConvId(row.conv_id.clone());

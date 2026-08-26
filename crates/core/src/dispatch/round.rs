@@ -136,7 +136,7 @@ impl Dispatcher {
         // 收集 chunks：Final/Error 落库，ToolUse 累积用于最终工具摘要。
         let mut final_text: Option<String> = None;
         let mut error_text: Option<String> = None;
-        let mut tool_calls: Vec<(String, String)> = Vec::new();
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
         // agent 产出的媒体文件路径（Write 图片）；run 结束后回传 IM。
         let mut media_out: Vec<String> = Vec::new();
         // 流式卡片：支持卡片的平台累积输出 + 节流 patch（单卡片更新），不支持则每 Text 多发文本。
@@ -208,14 +208,35 @@ impl Dispatcher {
                     if cot == CotDetail::Off {
                         continue;
                     }
-                    let summary = truncate_str(&input, cot.input_trunc());
-                    tool_calls.push((tool.clone(), summary.clone()));
+                    // P8-1：input JSON → 人可读单行摘要（Bash 取 command、Read 取
+                    // file_path…），再按 COT 档截断——替代此前的裸 JSON 截断。
+                    let summary = truncate_str(
+                        &crate::render::tool_summary(&tool, &input),
+                        cot.input_trunc(),
+                    );
+                    tool_calls.push(ToolCall {
+                        name: tool.clone(),
+                        summary: summary.clone(),
+                        done: false,
+                    });
                     if let Some(c) = card.as_mut() {
                         c.append_tool(&tool, &summary, &conv, &hint, self.platform.as_ref())
                             .await;
                     }
                 }
-                AgentChunk::ToolResult { .. } => {} // 摘要只列工具调用，结果不进 IM
+                AgentChunk::ToolResult { tool, .. } => {
+                    // P8-1：结果到达 → 同名最早未完成的调用翻 ✅（卡片工具行的
+                    // ⏳→✅ 反馈）；结果内容仍不进 IM（防止把大段输出刷进卡片）。
+                    if cot != CotDetail::Off {
+                        if let Some(t) = tool_calls.iter_mut().find(|t| !t.done && t.name == tool) {
+                            t.done = true;
+                        }
+                        if let Some(c) = card.as_mut() {
+                            c.finish_tool(&tool, &conv, &hint, self.platform.as_ref())
+                                .await;
+                        }
+                    }
+                }
                 AgentChunk::Media { path } => {
                     media_out.push(path);
                 }

@@ -1398,10 +1398,10 @@ async fn sessions_command_lists_named_with_active_mark() {
     assert!(listing.contains("命名会话"), "listing={listing}");
     assert!(listing.contains("alpha"), "listing={listing}");
     assert!(listing.contains("beta"), "listing={listing}");
-    // beta 为活动，应带 `*`；alpha 不应带。
+    // beta 为活动，应带（当前）；alpha 不应带。
     assert!(
-        listing.contains("beta *"),
-        "活动命名应带 *，listing={listing}"
+        listing.contains("beta（当前）"),
+        "活动命名应带（当前），listing={listing}"
     );
     drop_db(ctx.db).await;
 }
@@ -1616,8 +1616,8 @@ async fn normal_message_appends_tool_summary() {
         .find(|t| t.starts_with("reply#"))
         .expect("应有 final reply");
     assert!(reply.contains("🔧 工具调用"), "应含工具摘要标题: {reply}");
-    assert!(reply.contains("Read("), "应含 Read 工具: {reply}");
-    assert!(reply.contains("Edit("), "应含 Edit 工具: {reply}");
+    assert!(reply.contains("Read — /foo"), "应含 Read 摘要: {reply}");
+    assert!(reply.contains("Edit"), "应含 Edit 工具: {reply}");
     assert!(reply.contains("/foo"), "应含工具输入: {reply}");
     drop_db(ctx.db).await;
 }
@@ -2102,8 +2102,8 @@ async fn status_doctor_reconnect_reply() {
     assert!(
         inbox
             .iter()
-            .any(|t| t.contains("📊") && t.contains("mock / mock-backend")),
-        "/status 应含平台/后端: {inbox:?}"
+            .any(|t| t.contains("📊") && t.contains("mock-backend（mock）")),
+        "/status 应含后端/平台: {inbox:?}"
     );
     assert!(
         inbox
