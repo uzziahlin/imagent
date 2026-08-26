@@ -628,6 +628,15 @@ async fn main() -> Result<()> {
             ));
             // P7-A3/A4：启动偏好（陌生人 @ 提示开关 + 回复形态），构造后注入。
             dispatcher.set_prefs(config.stranger_mention_hint, config.reply_mode);
+            // 审批集：ask 模式下仅清单内工具过 IM 审批（空 = 全部过审）。
+            if !config.approval_tools.is_empty() {
+                tracing::info!(
+                    target: "imagent::ops",
+                    tools = ?config.approval_tools,
+                    "approval_tools 生效：清单外权限请求将直接放行"
+                );
+            }
+            dispatcher.set_approval_tools(config.approval_tools.clone());
 
             // 9. 运维 HTTP server（/metrics + /health）。metrics_addr 为 None 或空串则关闭。
             let start_at = std::time::Instant::now();
@@ -1147,6 +1156,7 @@ fn spawn_sighup_handler(
                     }
                     dispatcher.auth().reload_chats(chats);
                     dispatcher.reload_tools(cfg.allowed_tools.clone());
+                    dispatcher.set_approval_tools(cfg.approval_tools.clone());
                     let perm = cfg.permission_mode.resolve(&cfg.agent);
                     dispatcher.reload_permission_mode(perm);
                     tracing::info!(target: "imagent::ops", "config reloaded (SIGHUP)");

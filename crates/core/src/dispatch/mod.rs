@@ -269,6 +269,9 @@ pub struct Dispatcher {
     stranger_mention_hint: RwLock<bool>,
     /// P7-A4：回复形态偏好（card/text，/config 可热改）。
     reply_mode: Arc<RwLock<ReplyMode>>,
+    /// 审批集（ask 模式下仅清单内工具过 IM 审批，其余放行；空 = 全部过审）。
+    /// main 启动注入 + SIGHUP 热重载（见 [`Self::set_approval_tools`]）。
+    approval_tools: Arc<RwLock<Vec<String>>>,
     /// 管理员 sender（可 /allow）；空 = 所有白名单用户可（向后兼容，P2-D）。
     admin_senders: Arc<RwLock<Vec<String>>>,
     /// 优雅退出信号（P1-5）：收到 SIGINT/SIGTERM 后 notify，run() 停止收新消息并 drain。
@@ -348,10 +351,16 @@ impl Dispatcher {
             idle_overrides: Mutex::new(HashMap::new()),
             stranger_mention_hint: RwLock::new(false),
             reply_mode: Arc::new(RwLock::new(ReplyMode::Card)),
+            approval_tools: Arc::new(RwLock::new(Vec::new())),
             admin_senders: Arc::new(RwLock::new(admin_senders)),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             tasks: Mutex::new(tokio::task::JoinSet::new()),
         }
+    }
+
+    /// 审批集注入/热重载（main 启动与 SIGHUP 调用；空 = 全部权限请求过审）。
+    pub fn set_approval_tools(&self, tools: Vec<String>) {
+        *self.approval_tools.write() = tools;
     }
 
     /// P7：启动偏好注入（main 在 run 前调一次；构造器保持零新参，测试无感）。

@@ -85,6 +85,7 @@ impl Dispatcher {
                                 Some(uid) if uid == expected_uid => {
                                     let platform = this.platform.clone();
                                     let router = this.router.clone();
+                                    let approval_tools = this.approval_tools.clone();
                                     let permission_ask_timeout = this.permission_ask_timeout;
                                     let ask_via_im_timeout = this.ask_via_im_timeout;
                                     let expected_token = expected_token.clone();
@@ -93,6 +94,7 @@ impl Dispatcher {
                                             stream,
                                             platform,
                                             router,
+                                            approval_tools,
                                             permission_ask_timeout,
                                             ask_via_im_timeout,
                                             expected_token,
@@ -214,6 +216,7 @@ impl Dispatcher {
         mut stream: tokio::net::UnixStream,
         platform: Arc<dyn Platform>,
         router: Arc<PermissionRouter>,
+        approval_tools: Arc<parking_lot::RwLock<Vec<String>>>,
         permission_ask_timeout: std::time::Duration,
         ask_via_im_timeout: std::time::Duration,
         expected_token: String,
@@ -288,6 +291,7 @@ impl Dispatcher {
                     stream,
                     platform,
                     router,
+                    approval_tools,
                     conv,
                     request_id,
                     permission_ask_timeout,
@@ -454,10 +458,12 @@ impl Dispatcher {
     /// - **P1-8**：超时/router-drop 时 `router.cancel` 清理 pending map 残留。
     /// - **P1-9**：读行加上限（64KiB）+ 读超时（15s）+ 写超时（10s），防 OOM / 挂死。
     #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
     async fn handle_permission_kind_socket(
         mut stream: tokio::net::UnixStream,
         platform: Arc<dyn Platform>,
         router: Arc<PermissionRouter>,
+        approval_tools: Arc<parking_lot::RwLock<Vec<String>>>,
         conv: ConvId,
         request_id: String,
         permission_ask_timeout: std::time::Duration,
@@ -468,6 +474,31 @@ impl Dispatcher {
             .and_then(|v| v.as_str())
             .unwrap_or("?")
             .to_string();
+        // 审批集外直接放行（空集 = 语义回退为全部过审，见 needs_approval）：
+        // 不发 IM 询问、不挂 pending，记日志 + 指标（decision=allow, auto=1 口径
+        // 复用 allow 标签，message 说明放行原因）。
+        if !crate::permission::needs_approval(&approval_tools.read(), &tool_name) {
+            info!(
+                target: "imagent::core",
+                conv_id = %conv.0,
+                tool = %tool_name,
+                "审批集外工具，直接放行（approval_tools 未命中）"
+            );
+            crate::metrics::METRICS
+                .permission_decisions
+                .with_label_values(&["allow"])
+                .inc();
+            Self::write_permission_reply(
+                &mut stream,
+                PermissionReply {
+                    allow: true,
+                    message: Some("auto-allowed: tool not in approval_tools".into()),
+                    raw_text: None,
+                },
+            )
+            .await;
+            return;
+        }
         let input_str = req.get("input").map(|v| v.to_string()).unwrap_or_default();
         let conv_id = conv.0.clone();
         // P4-4：询问用户——平台支持交互卡片时发「按钮卡片」（send_permission_ask
