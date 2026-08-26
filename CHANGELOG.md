@@ -20,6 +20,9 @@
 - **审批卡复用（P8-2）**：同一会话内**顺序到达**的询问（审批/AskUserQuestion）不再每条新发一张卡把流式卡顶离视口——收敛后的询问卡（已批准/已拒绝/已中断）保留为该会话的复用槽，下一个询问**原地 patch 成新询问**（按钮换绑新 request_id）。挂着未决询问时（并发审批）不认领槽、照旧另发新卡，多 pending 语义不变；复用 patch 失败自动降级发新卡；同卡重登记不再误判为「被新询问取代」。
 - **终态结果下沉（P8-2）**：本轮发过询问卡（流式卡已被顶离阅读位置）时，终态把流式卡正文收成一行指针（`✅ 已完成 · 🔧 工具 N 次\n⬇️ 完整结果见下方消息），**完整结果另发一张新卡**落在会话最下面——多轮审批后结论不再埋在第一张卡里。managed/降级/话题群三路径均支持；重发失败上抛，由 core 的 P5-11 纯文本兜底补发全文（结论不丢）。未触发询问的普通轮次行为不变（结果仍在原流式卡）。
 
+### Changed
+- **`permission_mode = "auto"` 映射为 Claude 原生 auto 模式（P8-4）**：claude-cli 下 auto 不再解析为 `ask（每个提示都进 IM），而是新运行时档 **auto-edits**——照挂 IM 审批闭环（Bash 等真危险的提示进 IM），另透传 claude 原生 `--permission-mode acceptEdits（Claude Code 的 auto-accept：文件编辑类 claude 自己放行）。零配置默认姿态变为「编辑自动放行 + 危险操作过审」，与 Claude Code 交互端的 auto 模式语义一致；嫌吵再叠 `approval_tools（清单外提示直接放行），要全量把关用显式 `ask。auto-edits 为运行时专属档（配置面不可直写，serde 拒绝）；MCP 子进程 `--mode auto-edits 往返、dispatcher socket spawn 条件、`/perm` 显示与热切提示、ACP 防御臂同步适配。
+
 ### Fixed
 - **终态「完成」双行**（真机反馈）：managed 流式卡终态正文末尾与 md_footer 各渲染一次 `✅ 完成（v1.5.4 起即存在）。修正为**状态行统一由 footer 承载**：正文只保留内容（文本 + 工具统计 / 错误详情 / 中断说明），不再拼终态行；结果下沉的 stub 正文同样只留统计 + 指针。中断的错误前缀单列（`⏹ 已中断，不再套「❌ 出错：」）；降级路径 stub 卡补 footer 元素（与 managed 路径的 footer patch 等价）。
 

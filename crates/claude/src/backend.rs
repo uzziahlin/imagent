@@ -64,6 +64,18 @@ const NAME: &str = "claude-cli";
 /// 固定 socket 路径（主进程 PermissionRouter 监听、MCP server 连接）。
 /// P4-10：锚定 `imagent_home()`（`--profile` 时随 profile 隔离，env 对被 spawn 的
 /// MCP 子进程同样生效）；home 不可解析时回退 /tmp。
+/// P8-4：模式 → claude 原生权限 flag。auto-edits（auto 在 claude-cli 的解析
+/// 产物）透传 `--permission-mode acceptEdits`——Claude Code 的「auto 模式」：
+/// 文件编辑类 claude 自己放行，只有 Bash 等真危险的提示回调进 IM。比 Ask
+/// （每个提示都进 IM）少打扰；与 approval_tools 可叠加（剩余提示再按清单过滤）。
+/// 其余档不附加（Ask 由闭环全量把关；Off/Allow/Deny 语义已由闭环承载）。
+fn claude_native_perm_args(mode: PermissionMode) -> Vec<&'static str> {
+    match mode {
+        PermissionMode::AutoEdits => vec!["--permission-mode", "acceptEdits"],
+        _ => Vec::new(),
+    }
+}
+
 fn permission_sock_path() -> String {
     imagent_core::paths::imagent_home()
         .join("permission.sock")
@@ -200,6 +212,11 @@ impl Backend for ClaudeBackend {
                     // 校准发现裸工具名被 CLI 2.1.x 拒绝（"MCP tool not found"）。
                     cmd.arg("--permission-prompt-tool")
                         .arg(imagent_core::mcp::qualified_tool_name());
+                    // P8-4：auto 档透传 claude 原生权限模式（acceptEdits），
+                    // 见 [`claude_native_perm_args`]。
+                    for a in claude_native_perm_args(mode) {
+                        cmd.arg(a);
+                    }
                     Some(p)
                 }
                 Err(e) => {
@@ -276,6 +293,27 @@ mod tests {
     fn name_is_stable() {
         let b = ClaudeBackend::new();
         assert_eq!(b.name(), "claude-cli");
+    }
+
+    /// P8-4：auto-edits 档透传 claude 原生 acceptEdits；其余档不附加。
+    #[test]
+    fn native_perm_args_only_for_auto_edits() {
+        assert_eq!(
+            claude_native_perm_args(PermissionMode::AutoEdits),
+            vec!["--permission-mode", "acceptEdits"]
+        );
+        for m in [
+            PermissionMode::Off,
+            PermissionMode::Allow,
+            PermissionMode::Deny,
+            PermissionMode::Ask,
+            PermissionMode::Auto,
+        ] {
+            assert!(
+                claude_native_perm_args(m).is_empty(),
+                "{m:?} 不应附加原生权限 flag"
+            );
+        }
     }
 
     #[test]

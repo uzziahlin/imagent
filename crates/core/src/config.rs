@@ -8,11 +8,18 @@ use crate::error::{CoreError, Result};
 #[serde(rename_all = "lowercase")]
 pub enum PermissionMode {
     /// 按后端自动选档（2026-08 起为**缺省**）：claude-cli（支持 IM 审批闭环）→
-    /// [`PermissionMode::Ask`] 全闭环；claude-acp / codex / gemini（闭环未接）→
+    /// [`PermissionMode::AutoEdits`]（claude 原生 acceptEdits + 危险工具走 IM，
+    /// 即 Claude Code 的「auto 模式」）；claude-acp / codex / gemini（闭环未接）→
     /// [`PermissionMode::Off`]（靠各自 sandbox / approval-mode 兜底）。启动 /
     /// SIGHUP / `/perm auto` 均先 [`PermissionMode::resolve`] 成具体档再入运行时。
     #[default]
     Auto,
+    /// **运行时专属档**（配置面不可直接写，仅由 `auto` 在 claude-cli 下解析产生）：
+    /// 审批闭环照挂（Bash 等真危险的提示进 IM），另透传 claude 原生
+    /// `--permission-mode acceptEdits`——文件编辑类 claude 自己放行（Claude Code
+    /// 的 auto-accept）。比 [`PermissionMode::Ask`]（每个提示都进 IM）少打扰。
+    #[serde(skip)]
+    AutoEdits,
     /// 不启用权限审批：claude 按 --allowedTools 自行处理（P1 既有行为）。
     Off,
     /// MCP server 永远 allow（不发 IM、不阻塞；快速放行模式）。
@@ -28,13 +35,19 @@ impl PermissionMode {
     /// 注意 `Auto` 须先 [`PermissionMode::resolve`]——未解析的 Auto 按未接线
     /// 处理（false），防半接状态。
     pub fn is_enabled(self) -> bool {
-        matches!(self, Self::Allow | Self::Deny | Self::Ask)
+        matches!(self, Self::Allow | Self::Deny | Self::Ask | Self::AutoEdits)
+    }
+
+    /// 是否需要主进程的权限审批 socket（Ask 闭环类：Ask / AutoEdits）——
+    /// dispatcher 启动 socket accept task 与 `/perm` 热切的「须重启」提示共用。
+    pub fn needs_socket(self) -> bool {
+        matches!(self, Self::Ask | Self::AutoEdits)
     }
 
     /// `Auto` 按后端解析成具体档（具体档原样返回）。
     pub fn resolve(self, agent: &str) -> Self {
         match self {
-            Self::Auto if agent == "claude-cli" => Self::Ask,
+            Self::Auto if agent == "claude-cli" => Self::AutoEdits,
             Self::Auto => Self::Off,
             other => other,
         }
@@ -43,6 +56,7 @@ impl PermissionMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
+            Self::AutoEdits => "auto-edits",
             Self::Off => "off",
             Self::Allow => "allow",
             Self::Deny => "deny",
@@ -52,6 +66,8 @@ impl PermissionMode {
     pub fn from_str_lossy(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "auto" => Self::Auto,
+            // MCP 子进程 --mode 往返（backend 经 as_str 写入 mcp 配置）。
+            "auto-edits" => Self::AutoEdits,
             "allow" => Self::Allow,
             "deny" => Self::Deny,
             "ask" => Self::Ask,
@@ -416,7 +432,7 @@ platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人)
 # feishu_require_mention_in_group = true       # 群消息须 @bot 才处理（默认 true：客户端过滤 + 剥离 @bot 占位；false=全收，过滤交给事件订阅 scope）
 # stranger_mention_hint = false                # 未放行群里被 @ 时回一句引导（默认 false 完全静默防探测；私聊始终静默）
 # reply_mode = "card"                          # 回复形态：card(默认,流式卡片) | text(纯文本)；/config 可热改
-permission_mode = "auto"    # 缺省=auto：claude-cli 起 IM 审批闭环(同 ask)，其余后端=off；也可显式 off/allow/deny/ask
+permission_mode = "auto"    # 缺省=auto：claude-cli=claude 原生 acceptEdits(编辑自动放行)+Bash 等走 IM；其余后端=off；显式 ask=每个提示都进 IM
 # approval_tools = ["Bash", "WebFetch", "mcp__*"]  # 审批集：ask 模式下只有这些工具过 IM 审批，其余直接放行；空=全部过审
 # metrics_addr = "127.0.0.1:9100"   # 默认关闭；设为 "ip:port" 开启 /metrics + /health HTTP server
 # message_max_len = 2000              # 单条出站消息字符上限（Unicode char）；不设 = 不分片
@@ -459,11 +475,12 @@ mod tests {
             "default_workdir = \"/tmp/ws\"\nallowed_tools = [\"Read\"]\n",
         );
         let cfg = Config::load(&p).expect("parse");
-        // 2026-08 起缺省 auto；resolve 按 backend 选档。
+        // 2026-08 起缺省 auto；resolve 按 backend 选档（claude-cli → AutoEdits：
+        // 原生 acceptEdits + IM 闭环；其余 → Off）。
         assert_eq!(cfg.permission_mode, PermissionMode::Auto);
         assert_eq!(
             PermissionMode::Auto.resolve("claude-cli"),
-            PermissionMode::Ask
+            PermissionMode::AutoEdits
         );
         assert_eq!(PermissionMode::Auto.resolve("codex"), PermissionMode::Off);
         assert_eq!(PermissionMode::Auto.resolve("gemini"), PermissionMode::Off);
@@ -475,6 +492,25 @@ mod tests {
         assert_eq!(PermissionMode::Ask.resolve("codex"), PermissionMode::Ask);
         assert!(!PermissionMode::Auto.is_enabled());
         assert!(PermissionMode::Ask.is_enabled());
+        // P8-4：AutoEdits 是运行时档——enabled/needs_socket/as_str/from_str 往返；
+        // 配置面 serde 拒绝直写。
+        assert!(PermissionMode::AutoEdits.is_enabled());
+        assert!(PermissionMode::AutoEdits.needs_socket());
+        assert!(!PermissionMode::Auto.needs_socket());
+        assert_eq!(PermissionMode::AutoEdits.as_str(), "auto-edits");
+        assert_eq!(
+            PermissionMode::from_str_lossy("auto-edits"),
+            PermissionMode::AutoEdits
+        );
+        let p2 = tmp_path(
+            "cfg_perm_auto_edits_reject",
+            "default_workdir = \"/tmp/ws\"\npermission_mode = \"auto-edits\"\n",
+        );
+        assert!(
+            Config::load(&p2).is_err(),
+            "auto-edits 是运行时档，配置面不可直写"
+        );
+        cleanup(&p2);
         cleanup(&p);
     }
 
