@@ -156,6 +156,12 @@ pub struct Config {
     /// IM 权限审批模式（默认 Auto：按后端自动选档，见 [`PermissionMode::Auto`]）。
     #[serde(default)]
     pub permission_mode: PermissionMode,
+    /// 审批集：ask/auto→ask 模式下**只有**清单内的工具走 IM 审批，其余权限
+    /// 请求直接放行（记日志 + 指标）。空 = 现状（所有权限请求都过审）。
+    /// 条目为工具名，支持尾部 `*` 前缀匹配（如 `mcp__*`）。仅 claude-cli 生效
+    ///（其余后端无闭环；且 claude 自身默认放行的工具如 Read 不会发起请求，不受此影响）。
+    #[serde(default)]
+    pub approval_tools: Vec<String>,
     /// Prometheus 指标 / 健康检查 HTTP 监听地址（如 `"127.0.0.1:9100"`）。
     /// 默认 `None`（关闭——开源分发时不默认开启监听端口）；显式设置地址即开启。
     #[serde(default = "default_metrics_addr")]
@@ -410,6 +416,7 @@ platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人)
 # stranger_mention_hint = false                # 未放行群里被 @ 时回一句引导（默认 false 完全静默防探测；私聊始终静默）
 # reply_mode = "card"                          # 回复形态：card(默认,流式卡片) | text(纯文本)；/config 可热改
 permission_mode = "auto"    # 缺省=auto：claude-cli 起 IM 审批闭环(同 ask)，其余后端=off；也可显式 off/allow/deny/ask
+# approval_tools = ["Bash", "WebFetch", "mcp__*"]  # 审批集：ask 模式下只有这些工具过 IM 审批，其余直接放行；空=全部过审
 # metrics_addr = "127.0.0.1:9100"   # 默认关闭；设为 "ip:port" 开启 /metrics + /health HTTP server
 # message_max_len = 2000              # 单条出站消息字符上限（Unicode char）；不设 = 不分片
 # message_fragment_interval_ms = 400  # 分片间发送间隔（ms）
@@ -774,6 +781,21 @@ message_fragment_interval_ms = 250
         let p = tmp_path("gap_no_chat", r#"default_workdir = "/tmp/ws""#);
         let cfg = Config::load(&p).expect("parse");
         assert!(!cfg.admin_gap_with_chat_allowlist());
+        cleanup(&p);
+    }
+
+    #[test]
+    fn approval_tools_default_empty_and_parse() {
+        let p = tmp_path("appr_def", r#"default_workdir = "/tmp/ws""#);
+        let cfg = Config::load(&p).expect("parse");
+        assert!(cfg.approval_tools.is_empty(), "缺省空 = 全部过审");
+        cleanup(&p);
+        let p = tmp_path(
+            "appr_parse",
+            "default_workdir = \"/tmp/ws\"\napproval_tools = [\"Bash\", \"mcp__*\"]\n",
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(cfg.approval_tools.len(), 2);
         cleanup(&p);
     }
 

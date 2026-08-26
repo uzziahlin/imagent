@@ -22,6 +22,24 @@ pub fn default_sock_path() -> Option<PathBuf> {
     Some(crate::paths::imagent_home().join("permission.sock"))
 }
 
+/// 审批集条目匹配工具名：精确相等，或条目以 `*` 结尾时按前缀匹配
+/// （`mcp__*` 命中所有 MCP 工具）。空格/大小写敏感（工具名本就如此）。
+pub fn tool_matches_pattern(pattern: &str, tool_name: &str) -> bool {
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        !prefix.is_empty() && tool_name.starts_with(prefix)
+    } else {
+        pattern == tool_name
+    }
+}
+
+/// 该工具是否需要 IM 审批：审批集为空 = 全部过审（既有语义）；非空 = 仅清单内过审。
+pub fn needs_approval(approval_tools: &[String], tool_name: &str) -> bool {
+    approval_tools.is_empty()
+        || approval_tools
+            .iter()
+            .any(|p| tool_matches_pattern(p, tool_name))
+}
+
 /// 用户的 approve/deny 回复。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionReply {
@@ -482,5 +500,36 @@ mod tests {
             )
             .await;
         assert!(hit.is_none());
+    }
+}
+
+#[cfg(test)]
+mod approval_set_tests {
+    use super::*;
+
+    #[test]
+    fn pattern_matching() {
+        assert!(tool_matches_pattern("Bash", "Bash"));
+        assert!(!tool_matches_pattern("Bash", "BashOutput"));
+        assert!(tool_matches_pattern(
+            "mcp__*",
+            "mcp__imagent__permission_request"
+        ));
+        assert!(!tool_matches_pattern("mcp__*", "Bash"));
+        // 裸 "*" 不视为全匹配（防误配成「什么都不审」）；空条目同理。
+        assert!(!tool_matches_pattern("*", "Bash"));
+        assert!(!tool_matches_pattern("", "Bash"));
+    }
+
+    #[test]
+    fn needs_approval_semantics() {
+        // 空集 = 全部过审（既有语义）。
+        assert!(needs_approval(&[], "Bash"));
+        let set = vec!["Bash".to_string(), "mcp__*".to_string()];
+        assert!(needs_approval(&set, "Bash"));
+        assert!(needs_approval(&set, "mcp__x__y"));
+        // 集外 = 放行。
+        assert!(!needs_approval(&set, "Write"));
+        assert!(!needs_approval(&set, "WebFetch"));
     }
 }
