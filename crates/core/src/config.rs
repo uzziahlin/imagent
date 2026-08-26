@@ -65,10 +65,10 @@ impl PermissionMode {
 pub enum CotDetail {
     /// 不展示任何工具过程（只回最终结果）。
     Off,
-    /// 简要工具摘要（默认：工具名 + 40 字符输入截断，最多 5 个）。
+    /// 简要工具摘要（默认：工具行 80 字符截断，最多 5 个）。
     #[default]
     Brief,
-    /// 详细工具过程（200 字符输入截断，最多 10 个）。
+    /// 详细工具过程（240 字符截断，最多 10 个）。
     Detailed,
 }
 
@@ -88,12 +88,13 @@ impl CotDetail {
             _ => None,
         }
     }
-    /// 工具输入摘要的字符截断上限。
+    /// 工具摘要单行的字符截断上限（P8-1：截的是人可读摘要而非裸 JSON，
+    /// 80 与 lcab 的 HEADER_SUMMARY_MAX 对齐）。
     pub fn input_trunc(self) -> usize {
         match self {
             Self::Off => 0,
-            Self::Brief => 40,
-            Self::Detailed => 200,
+            Self::Brief => 80,
+            Self::Detailed => 240,
         }
     }
     /// 工具摘要最多展示条数。
@@ -645,7 +646,7 @@ message_fragment_interval_ms = 250
         let p = tmp_path("cot_def", r#"default_workdir = "/tmp/ws""#);
         let cfg = Config::load(&p).expect("parse");
         assert_eq!(cfg.cot_detail, CotDetail::Brief);
-        assert_eq!(cfg.cot_detail.input_trunc(), 40);
+        assert_eq!(cfg.cot_detail.input_trunc(), 80);
         assert_eq!(cfg.cot_detail.max_tools(), 5);
         cleanup(&p);
         // 三档解析 + 档位参数。
@@ -662,7 +663,7 @@ message_fragment_interval_ms = 250
             assert_eq!(cfg.cot_detail, expect, "raw={raw}");
             cleanup(&p);
         }
-        assert_eq!(CotDetail::Detailed.input_trunc(), 200);
+        assert_eq!(CotDetail::Detailed.input_trunc(), 240);
         assert_eq!(CotDetail::Detailed.max_tools(), 10);
         assert_eq!(CotDetail::Off.input_trunc(), 0);
         // 非法值 lossy 解析为 None（/config 输入校验用）。

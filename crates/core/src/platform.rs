@@ -80,6 +80,7 @@ pub trait Platform: Send + Sync {
 
     /// 纯文本审批询问（独立方法而非闭在 send_permission_ask 默认实现里——覆写
     /// send_permission_ask 的平台卡片失败时可调它降级，避免动态分发自递归）。
+    /// P8-1：input JSON 压成人可读摘要（同卡片路径），不再裸贴 JSON。
     async fn send_permission_ask_text(
         &self,
         conv: &ConvId,
@@ -87,8 +88,8 @@ pub trait Platform: Send + Sync {
         input_summary: &str,
         hint: &ReplyHint,
     ) -> Result<()> {
-        let text =
-            format!("🔐 Claude 请求执行 {tool_name}：{input_summary}\n回复 y 允许，其它拒绝。");
+        let summary = crate::render::tool_summary(tool_name, input_summary);
+        let text = format!("🔐 请求执行 {tool_name}：{summary}\n\n回复 y 允许，其它拒绝。");
         self.send_text(conv, &text, hint).await
     }
 

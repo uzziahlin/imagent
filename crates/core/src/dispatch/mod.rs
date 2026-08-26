@@ -33,7 +33,8 @@ use crate::metrics::METRICS;
 use crate::permission::{parse_reply, PermissionReply, PermissionRouter};
 use crate::platform::Platform;
 use crate::types::{
-    AgentChunk, CardButton, CardTerminal, ConvId, InboundMessage, MediaRef, ReplyHint, SessionId,
+    AgentChunk, CardButton, CardButtonStyle, CardTerminal, ConvId, InboundMessage, MediaRef,
+    ReplyHint, SessionId, ToolCall,
 };
 use imagent_store::{NamedSessionRow, SessionRow, Store};
 use parking_lot::RwLock;
@@ -131,15 +132,16 @@ fn format_rel_ts(ts: i64) -> String {
 }
 
 /// 格式化工具调用摘要：按 COT 档位展示（P4-6），超出 `max` 标 `…(+N)`。
-/// 形如 `\n\n🔧 工具调用：Read({"path":"…}), Edit({"file":"…})`。
-fn format_tool_summary(tool_calls: &[(String, String)], detail: CotDetail) -> String {
+/// P8-1：摘要是人可读单行（`Bash — git status`），形如
+/// `\n\n🔧 工具调用：Bash — git status，Read — src/main.rs …(+3)`。
+fn format_tool_summary(tool_calls: &[ToolCall], detail: CotDetail) -> String {
     let max = detail.max_tools();
     let shown: Vec<String> = tool_calls
         .iter()
         .take(max)
-        .map(|(t, i)| format!("{t}({i})"))
+        .map(crate::render::tool_text_line)
         .collect();
-    let mut s = format!("\n\n🔧 工具调用：{}", shown.join(", "));
+    let mut s = format!("\n\n🔧 工具调用：{}", shown.join("，"));
     if tool_calls.len() > max {
         s.push_str(&format!(" …(+{})", tool_calls.len() - max));
     }

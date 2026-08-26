@@ -28,6 +28,7 @@ pub mod metrics;
 pub mod paths;
 mod permission;
 mod platform;
+pub mod render;
 mod types;
 
 pub use auth::Auth;
@@ -42,6 +43,7 @@ pub use metrics::Metrics;
 pub use permission::{default_sock_path, parse_reply, PermissionReply, PermissionRouter};
 pub use platform::{command_card_fallback_text, Platform};
 pub use types::{
-    AgentChunk, CardButton, CardTerminal, ConvId, InboundMessage, JoinedChat, LocalSession,
-    MediaRef, Mention, OutboundCard, ReplyHint, RunOutcome, SessionId, UserId, Workdir,
+    AgentChunk, CardButton, CardButtonStyle, CardPhase, CardTerminal, ConvId, InboundMessage,
+    JoinedChat, LocalSession, MediaRef, Mention, OutboundCard, ReplyHint, RunOutcome, SessionId,
+    ToolCall, UserId, Workdir,
 };

@@ -68,6 +68,9 @@ pub struct FeishuPlatform {
     token: Arc<RwLock<Option<(String, Instant)>>>,
     /// CardKit 卡片的 sequence 计数（element/settings PATCH 共用，per card_id 严格递增）。
     card_seqs: Arc<Mutex<HashMap<String, i64>>>,
+    /// P8-1：已上屏的 footer 文案缓存（per card_id）——分阶段 footer 只在**变化时**
+    /// patch（思考中→调用工具→输出中），节流 tick 间内容相同则跳过，不浪费调用。
+    card_footers: Arc<Mutex<HashMap<String, String>>>,
     /// `/reconnect` 强制重连信号（与 WS run task 共享，P4-7）。
     reconnect: Arc<tokio::sync::Notify>,
     /// 已解析的入站消息 channel，`recv` 直接 await。
@@ -317,6 +320,7 @@ impl FeishuPlatform {
             app_secret,
             token,
             card_seqs: Arc::new(Mutex::new(HashMap::new())),
+            card_footers: Arc::new(Mutex::new(HashMap::new())),
             reconnect,
             inbound_rx: Arc::new(Mutex::new(inbound_msg_rx)),
             pending_asks: Arc::new(Mutex::new(HashMap::new())),
@@ -390,6 +394,9 @@ impl FeishuPlatform {
 
     /// managed（`card:` 句柄）卡片的 patch 主体，供 [`Self::update_card`] 与
     /// 300317 自愈重试共用。
+    ///
+    /// P8-1：Running 期 footer 按阶段（思考中/调用工具/输出中）patch，经
+    /// `card_footers` 缓存去重——内容不变不发；终态收敛成 完成/出错/已中断。
     async fn patch_managed(&self, token: &str, card_id: &str, card: &OutboundCard) -> Result<()> {
         match &card.terminal {
             CardTerminal::Running => {
@@ -410,7 +417,11 @@ impl FeishuPlatform {
                         patch_card_element(token, card_id, "md_body", &content, seq3).await
                     }
                     other => other,
-                }
+                }?;
+                // 分阶段 footer（best-effort，失败不影响正文流）。
+                self.patch_footer_if_changed(token, card_id, crate::card::phase_footer(card.phase))
+                    .await;
+                Ok(())
             }
             CardTerminal::Done | CardTerminal::Error(_) => {
                 let err = match &card.terminal {
@@ -420,23 +431,14 @@ impl FeishuPlatform {
                 let content = stream_body_final(&card.text, &card.tool_calls, err);
                 let seq = self.next_card_seq(card_id).await;
                 let element = patch_card_element(token, card_id, "md_body", &content, seq).await;
-                // footer 收敛（真机校准 UX）：初始卡的「🧠 执行中」在终态
-                // 换成 完成/出错——否则任务结束后标识永远停在执行中。
-                // best-effort：失败只 warn，不影响终态主流程。
-                let footer = if err.is_some() {
-                    "❌ 出错"
-                } else {
-                    "✅ 完成"
+                // footer 收敛（真机校准 UX）：初始卡的「🧠 思考中…」在终态
+                // 换成 完成/出错/已中断——否则任务结束后标识永远停在执行中。
+                let footer = match err {
+                    Some("已中断") => "⏹ 已中断",
+                    Some(_) => "❌ 出错",
+                    None => "✅ 已完成",
                 };
-                let seq_f = self.next_card_seq(card_id).await;
-                if let Err(e) = patch_card_element(token, card_id, "md_footer", footer, seq_f).await
-                {
-                    tracing::warn!(
-                        target: "feishu",
-                        error = %e,
-                        "footer 收敛失败（不影响终态内容）"
-                    );
-                }
+                self.patch_footer_if_changed(token, card_id, footer).await;
                 // 关闭流式（光标消失）；sequence 与 element PATCH 共用递增。
                 let settings =
                     serde_json::json!({ "config": { "streaming_mode": false } }).to_string();
@@ -444,6 +446,27 @@ impl FeishuPlatform {
                 patch_card_settings(token, card_id, &settings, seq2).await?;
                 element
             }
+        }
+    }
+
+    /// footer 变化才 patch（缓存命中跳过）；失败仅 warn（footer 是点缀，正文/终态
+    /// 才是主流程）。同时管理 `card_footers` 缓存的写入与终态清理。
+    async fn patch_footer_if_changed(&self, token: &str, card_id: &str, footer: &str) {
+        let changed = {
+            let mut m = self.card_footers.lock().await;
+            if m.get(card_id).map(String::as_str) == Some(footer) {
+                false
+            } else {
+                m.insert(card_id.to_string(), footer.to_string());
+                true
+            }
+        };
+        if !changed {
+            return;
+        }
+        let seq = self.next_card_seq(card_id).await;
+        if let Err(e) = patch_card_element(token, card_id, "md_footer", footer, seq).await {
+            tracing::warn!(target: "feishu", error = %e, "footer patch 失败（不影响主流程）");
         }
     }
     /// 登记一张 pending 询问卡；同 request_id 的旧卡 patch 成 superseded
