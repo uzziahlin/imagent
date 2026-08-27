@@ -82,12 +82,9 @@ pub(crate) fn encrypt(passphrase: &str, plaintext: &str, aad: &str) -> Result<St
 pub(crate) fn decrypt(passphrase: &str, blob: &str, aad: &str) -> Result<String, String> {
     let v2 = blob.starts_with(ENC_PREFIX);
     if !v2 && !blob.starts_with(ENC_PREFIX_V1) {
-        if blob.starts_with(ENC_FAMILY_PREFIX) {
+        if let Some(rest) = blob.strip_prefix(ENC_FAMILY_PREFIX) {
             // 版本化前缀：识别出「加密 blob 但非 v1/v2」，避免误当明文或 base64 噪声。
-            let ver = blob[ENC_FAMILY_PREFIX.len()..]
-                .split(':')
-                .next()
-                .unwrap_or("");
+            let ver = rest.split(':').next().unwrap_or("");
             return Err(format!(
                 "凭据为加密形态但格式版本未知（enc:{ver}:），当前二进制仅支持 enc:v1:/enc:v2:\
                  （可能由更新版本写入，请升级 imagent）"

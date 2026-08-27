@@ -540,7 +540,7 @@ pub fn render_question_card(tool_input: &str, conv_id: &str, request_id: &str) -
 ///   提交一次回传选择；
 /// - 多选（multiSelect）：form + `checkbox`，勾选多项后一次提交全部——proto 侧
 ///   把 `form_value.ask_opt`（数组）按多选语义拼接（「、」连接）回 `ask:` 通道。
-/// 多问题场景（questions.len() > 1）当前只答第一问：卡片上明确标注。
+///   多问题场景（questions.len() > 1）当前只答第一问：卡片上明确标注。
 pub(crate) fn render_question_card_note(
     tool_input: &str,
     conv_id: &str,
