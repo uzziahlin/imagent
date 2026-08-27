@@ -6,6 +6,14 @@
 
 （空——下一段变更从这里开始。）
 
+## [1.9.1] — 2026-08-27
+
+> agent 总超时语义修正：默认关闭墙钟总预算，防挂死完全由空闲看门狗承担——持续流式输出的长任务不再在 600s 被硬杀。
+
+### Changed
+- **`agent_timeout_secs` 默认 0（关闭）**：原默认 600s 的总超时是墙钟预算，与 agent 是否活跃无关，长任务（重构、大量工具调用、慢模型）即使持续输出也会被误杀终止。防挂死职责已由空闲看门狗（`agent_idle_timeout_secs`，默认 300s 连续无输出才杀）更准确地覆盖，总超时降级为可选硬上限（设正数即启用）。涉及主轮 runner 与 `/compact` 两条路径；`/config` 展示文案同步。存量部署若 config.toml 显式写了 `agent_timeout_secs = 600` 仍按原值生效（重启后生效）。
+- **D8 校验条件化**：`permission_ask_timeout_secs < agent_timeout_secs` 约束仅在总超时非 0 时生效；`agent_timeout_secs = 0` 由非法值变为合法的「关闭」语义。
+
 ## [1.9.0] — 2026-08-27
 
 > **CODE_REVIEW v7 迭代批**（详见 `docs/CODE_REVIEW_v7.md` 第四节）：权限审批闭环跨后端统一、ACP per-conv 连接（P5-14）、凭据应用层加密等 12 项，新增约 25 个单测。
