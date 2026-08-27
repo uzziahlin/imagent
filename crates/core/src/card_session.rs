@@ -218,7 +218,11 @@ impl CardSession {
                 false
             }
         };
-        self.last_patch = Instant::now();
+        // D9：仅成功才推进节流时钟——失败也推进会让紧随其后的重试被节流跳过，
+        // 瞬时抖动演变成「整个流式期间不再更新卡片」。
+        if ok {
+            self.last_patch = Instant::now();
+        }
         // 终态 patch 成功即摘除登记（卡片已闭环，无需启动扫描兜底）。失败保留——
         // 结论已降级纯文本补发（P5-11），卡片本身留给下次启动扫描关流。
         if ok && !matches!(terminal, CardTerminal::Running) {

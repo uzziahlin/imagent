@@ -180,7 +180,16 @@ impl Dispatcher {
                 match tokio::time::timeout(idle_timeout, rx.recv()).await {
                     Ok(Some(c)) => c,
                     Ok(None) => break,
-                    Err(_) if self.router.has_pending(&conv.0).await => continue,
+                    // D3：仅**权限审批**的 pending 豁免看门狗（审批预算
+                    // permission_ask_timeout 独立兜底）；终端 ask_via_im 的 pending
+                    // 超时可到 86400s，不得无限豁免 IM 会话空闲看门狗。
+                    Err(_) if self
+                        .router
+                        .has_pending_of_kind(&conv.0, PendingKind::Permission)
+                        .await =>
+                    {
+                        continue
+                    }
                     Err(_) => {
                         idle_timed_out = true;
                         METRICS.agent_timeouts.with_label_values(&["idle"]).inc();
@@ -291,6 +300,9 @@ impl Dispatcher {
                 // 续接而非静默开新会话。
                 self.persist_learned_session(&conv, existing_sid.as_deref(), &learned_sid)
                     .await;
+                // D1：失败返回路径清理本 conv 的权限 pending（fail-closed deny +
+                // 收敛询问卡），防残留 pending 把后续消息误当审批回复吞掉。
+                self.cancel_pending_on_exit(&conv).await;
                 // conv 锁由 runner 循环持有并统一释放（P1-7 防泄漏语义不变）。
                 return;
             }
@@ -339,6 +351,9 @@ impl Dispatcher {
                 // 下条消息续接本轮已进行到的部分。
                 self.persist_learned_session(&conv, existing_sid.as_deref(), &learned_sid)
                     .await;
+                // D1：中断返回路径同样清理 pending（空闲超时 abort 不经 /stop 的
+                // cancel_all；/stop 已清过则此处为幂等 no-op）。
+                self.cancel_pending_on_exit(&conv).await;
                 return;
             }
             Err(e) => {
@@ -361,6 +376,7 @@ impl Dispatcher {
                 }
                 self.persist_learned_session(&conv, existing_sid.as_deref(), &learned_sid)
                     .await;
+                self.cancel_pending_on_exit(&conv).await;
                 return;
             }
         };
@@ -497,5 +513,22 @@ impl Dispatcher {
             }
         }
         // conv 锁由 runner 循环持有并统一释放；在飞注册由 run_agent_round 统一移除。
+    }
+
+    /// D1：轮次失败/超时/中断返回路径的权限 pending 清理——cancel_all 全部
+    /// fail-closed deny，并按被清列表收敛 IM 侧询问卡（best-effort；无 pending
+    /// 时为 no-op）。参照 `cmd_stop` 的用法。
+    async fn cancel_pending_on_exit(&self, conv: &ConvId) {
+        let cleared = self.router.cancel_all(&conv.0).await;
+        if !cleared.is_empty() {
+            if let Err(e) = self.platform.cancel_all_permission_asks(conv).await {
+                warn!(
+                    target: "imagent::core",
+                    conv_id = %conv.0,
+                    error = %e,
+                    "轮次失败路径收敛权限询问卡失败（不影响 deny 结果）"
+                );
+            }
+        }
     }
 }

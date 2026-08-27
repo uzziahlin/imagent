@@ -174,7 +174,7 @@ impl LongLivedAcp {
                 .on_receive_notification(
                     async move |notification: SessionNotification, _cx: ConnectionTo<_>| {
                         if let Some(st) = current_for_notif.lock().await.as_ref() {
-                            forward_update(st, notification.update);
+                            forward_update(st, notification.update).await;
                         }
                         Ok(())
                     },
@@ -356,7 +356,13 @@ impl Backend for AcpBackend {
 /// - `ToolCall` → `AgentChunk::ToolUse`（title 作 tool 名，raw_input 作输入）。
 /// - `ToolCallUpdate`（带输出）→ `AgentChunk::ToolResult`。
 /// - 其它（Plan/UsageUpdate/...）→ 忽略。
-fn forward_update(state: &StreamState, update: SessionUpdate) {
+///
+/// B4：异步 send().await + 超时（替代原 `try_send` 通道满即静默丢事件）。发送点在
+/// notification handler（async 闭包）里，await 不会死锁 run 主体——chunks 消费方
+/// （dispatch 的 chunk 循环）独立并发收；超时兜底防 dispatch 长期不收时把 agent
+/// 连接卡死。agent_text 累计仍为同步 try_lock（在 send 之前），即使推送超时，
+/// final_text 也不丢。
+async fn forward_update(state: &StreamState, update: SessionUpdate) {
     let chunk = match update {
         SessionUpdate::AgentMessageChunk(chunk) => {
             if let Some(text) = text_of(&chunk.content) {
@@ -400,8 +406,21 @@ fn forward_update(state: &StreamState, update: SessionUpdate) {
     };
 
     if let Some(chunk) = chunk {
-        // try_send 避免在 dispatch loop 上跨 await 阻塞；通道满则丢弃该 chunk（best-effort）。
-        let _ = state.chunks.try_send(chunk);
+        // B4：await send（通道满时挂起等待而非丢弃）；30s 超时兜底防消费方长期
+        // 不收时卡死 notification handler。超时丢弃时 warn（agent_text 已同步
+        // 累计，final_text 不受影响）。
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            state.chunks.send(chunk),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => debug!(target: "claude-acp", "chunks 通道已关闭，停止推送"),
+            Err(_) => {
+                warn!(target: "claude-acp", "chunks 推送超时（消费方未收），丢弃该 chunk");
+            }
+        }
     }
 }
 
@@ -528,8 +547,8 @@ mod tests {
         PermissionOption::new(PermissionOptionId::new(id), id.to_string(), kind)
     }
 
-    #[test]
-    fn forward_update_agent_message_accumulates_text() {
+    #[tokio::test]
+    async fn forward_update_agent_message_accumulates_text() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentChunk>(16);
         let state = StreamState::new(tx);
 
@@ -538,13 +557,15 @@ mod tests {
             SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
                 TextContent::new("hi "),
             ))),
-        );
+        )
+        .await;
         forward_update(
             &state,
             SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
                 TextContent::new("there"),
             ))),
-        );
+        )
+        .await;
 
         // 累计文本（同步 try_lock，立即生效）。
         let acc = state.agent_text.try_lock().unwrap().clone();
@@ -560,19 +581,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn forward_update_tool_call_emits_tool_use() {
+    #[tokio::test]
+    async fn forward_update_tool_call_emits_tool_use() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<AgentChunk>(16);
         let state = StreamState::new(tx);
 
         let mut call = ToolCall::new(ToolCallId::new("tc-1"), "Read".to_string());
         call.raw_input = Some(serde_json::json!({"path": "/tmp/a"}));
-        forward_update(&state, SessionUpdate::ToolCall(call));
-        // ToolUse 已 try_send（通道容量足够，不 panic 即通过）。
+        forward_update(&state, SessionUpdate::ToolCall(call)).await;
+        // ToolUse 已 send（通道容量足够，不 panic 即通过）。
     }
 
-    #[test]
-    fn forward_update_tool_call_update_with_output_emits_result() {
+    #[tokio::test]
+    async fn forward_update_tool_call_update_with_output_emits_result() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentChunk>(16);
         let state = StreamState::new(tx);
 
@@ -580,7 +601,7 @@ mod tests {
             "tc-2",
             ToolCallUpdateFields::default().raw_output(serde_json::json!({"lines": 3})),
         );
-        forward_update(&state, SessionUpdate::ToolCallUpdate(upd));
+        forward_update(&state, SessionUpdate::ToolCallUpdate(upd)).await;
 
         match rx.try_recv().unwrap() {
             AgentChunk::ToolResult { tool, output } => {

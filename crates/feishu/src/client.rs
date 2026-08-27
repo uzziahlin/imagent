@@ -154,12 +154,15 @@ pub async fn send_text_msg(
     kind: ReceiveIdKind,
     text: &str,
 ) -> imagent_core::Result<()> {
+    // 幂等键：每次逻辑发送生成一次，所有限流重试共用（飞书 message create 的
+    // uuid 幂等键）——首次请求可能已达服务端，重试换新 uuid 会让用户收到重复消息。
+    let idempotency_key = uuid::Uuid::new_v4().to_string();
     retry_on_rate_limit!(async {
         let body = CreateMessageBody {
             receive_id: receive_id.to_string(),
             msg_type: "text".to_string(),
             content: json!({ "text": text }).to_string(),
-            uuid: None,
+            uuid: Some(idempotency_key.clone()),
         };
         let id_type = match kind {
             ReceiveIdKind::OpenId => ReceiveIdType::OpenId,
@@ -190,12 +193,14 @@ pub async fn send_card_msg(
     kind: ReceiveIdKind,
     card_json: &str,
 ) -> imagent_core::Result<Option<String>> {
+    // 幂等键：同一次逻辑发送的所有重试共用（见 send_text_msg）。
+    let idempotency_key = uuid::Uuid::new_v4().to_string();
     retry_on_rate_limit!(async {
         let body = CreateMessageBody {
             receive_id: receive_id.to_string(),
             msg_type: "interactive".to_string(),
             content: card_json.to_string(),
-            uuid: None,
+            uuid: Some(idempotency_key.clone()),
         };
         let id_type = match kind {
             ReceiveIdKind::OpenId => ReceiveIdType::OpenId,
@@ -374,12 +379,14 @@ pub async fn send_card_ref_msg(
     kind: ReceiveIdKind,
     card_id: &str,
 ) -> imagent_core::Result<Option<String>> {
+    // 幂等键：同一次逻辑发送的所有重试共用（见 send_text_msg）。
+    let idempotency_key = uuid::Uuid::new_v4().to_string();
     retry_on_rate_limit!(async {
         let body = CreateMessageBody {
             receive_id: receive_id.to_string(),
             msg_type: "interactive".to_string(),
             content: json!({ "type": "card", "data": { "card_id": card_id } }).to_string(),
-            uuid: None,
+            uuid: Some(idempotency_key.clone()),
         };
         let id_type = match kind {
             ReceiveIdKind::OpenId => ReceiveIdType::OpenId,
@@ -581,12 +588,14 @@ pub async fn send_file_msg(
     kind: ReceiveIdKind,
     file_key: &str,
 ) -> imagent_core::Result<()> {
+    // 幂等键：同一次逻辑发送的所有重试共用（见 send_text_msg）。
+    let idempotency_key = uuid::Uuid::new_v4().to_string();
     retry_on_rate_limit!(async {
         let body = CreateMessageBody {
             receive_id: receive_id.to_string(),
             msg_type: "file".to_string(),
             content: json!({ "file_key": file_key }).to_string(),
-            uuid: None,
+            uuid: Some(idempotency_key.clone()),
         };
         let id_type = match kind {
             ReceiveIdKind::OpenId => ReceiveIdType::OpenId,
@@ -614,12 +623,14 @@ pub async fn send_image_msg(
     kind: ReceiveIdKind,
     image_key: &str,
 ) -> imagent_core::Result<()> {
+    // 幂等键：同一次逻辑发送的所有重试共用（见 send_text_msg）。
+    let idempotency_key = uuid::Uuid::new_v4().to_string();
     retry_on_rate_limit!(async {
         let body = CreateMessageBody {
             receive_id: receive_id.to_string(),
             msg_type: "image".to_string(),
             content: json!({ "image_key": image_key }).to_string(),
-            uuid: None,
+            uuid: Some(idempotency_key.clone()),
         };
         let id_type = match kind {
             ReceiveIdKind::OpenId => ReceiveIdType::OpenId,

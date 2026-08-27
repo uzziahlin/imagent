@@ -18,6 +18,19 @@ use crate::error::{CoreError, Result};
 /// 获取单实例锁。返回的 File 须持有到进程结束（drop / 进程退出即释放锁）。
 /// 已有实例持锁 → `Err`（附诊断指引）。
 pub fn acquire(home: &Path) -> Result<std::fs::File> {
+    // D11：非 unix（Windows）显式不支持——此前 try_flock 恒 false 会让**首次
+    // 启动**也被当成「已有实例持锁」拒绝，与注释语义矛盾。项目明确不做
+    // Windows（permission.sock 本就 unix-only），直接给出可读错误。
+    #[cfg(not(unix))]
+    {
+        let _ = home;
+        return Err(CoreError::Config(
+            "Windows 不受支持：单实例锁依赖 flock（unix），且权限审批闭环的 \
+             Unix domain socket 也仅在 macOS/Linux 可用。请在 macOS/Linux 运行。"
+                .into(),
+        ));
+    }
+    #[cfg(unix)]
     let lock = home.join("instance.lock");
     // O_CREAT（非 create_new）：锁文件可以复用，互斥由 flock 保证而非文件存在性。
     let mut f = std::fs::OpenOptions::new()
@@ -57,12 +70,7 @@ fn try_flock_exclusive(f: &std::fs::File) -> bool {
     rc == 0
 }
 
-#[cfg(not(unix))]
-fn try_flock_exclusive(_f: &std::fs::File) -> bool {
-    // 非 unix 无 flock：退化为「文件存在即拒绝」（无自动恢复，由错误信息引导
-    // 手动清锁）。Windows 非支持平台（permission.sock 本就 unix-only）。
-    false
-}
+
 
 #[cfg(all(test, unix))]
 mod tests {

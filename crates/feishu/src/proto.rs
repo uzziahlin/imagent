@@ -13,6 +13,15 @@ use serde::Deserialize;
 
 use imagent_core::{ConvId, InboundMessage, ReplyHint, UserId};
 
+/// dedup 回退 key 用的内容稳定哈希（DefaultHasher，非加密强度——仅去重用途）：
+/// 相同内容恒同值（跨重投可去重），不同内容不同值（等长内容不碰撞）。
+fn content_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
 /// `im.message.receive_v1` 事件顶层结构（裁剪：仅保留 header + event）。
 #[derive(Debug, Deserialize)]
 pub struct FeishuEvent {
@@ -460,11 +469,11 @@ pub fn parse_comment_event(
     if text.is_empty() {
         return None; // 纯 @ / 纯图片评论：MVP 不触发
     }
-    let key = evt
-        .header
-        .event_id
-        .clone()
-        .unwrap_or_else(|| format!("comment:{}:{}", b.comment_id, text.len()));
+    let key = evt.header.event_id.clone().unwrap_or_else(|| {
+        // 回退 key 用内容稳定哈希（非长度）：不同内容不同 key、相同内容同 key
+        // （长度会把等长不同评论误判重复）。
+        format!("comment:{}:{:x}", b.comment_id, content_hash(&text.join("\n")))
+    });
     Some((
         key,
         InboundMessage {
@@ -588,10 +597,14 @@ pub fn parse_message_event(
 
     let open_id = evt.event.sender.sender_id.open_id.clone();
     let (receive_id, _kind) = receive_target(&evt.event)?;
-    // dedup 回退基准：优先正文长度，其次首个媒体 key，最后用消息类型兜底
+    // dedup 回退基准：优先正文内容哈希，其次首个媒体 key，最后用消息类型兜底
     // （post 可能纯文字 pending 空、或纯图片 text 空，旧逻辑 pending[0] 会 panic）。
+    // 内容哈希而非长度：等长不同内容不同 key（长度会把同会话等长两条不同消息
+    // 误判重复），相同内容跨重投同 key（5 分钟窗口外重投仍能去重）。
     let dedup_fallback = match (text.as_deref(), pending.first()) {
-        (Some(t), _) if !t.trim().is_empty() => format!("{}:{}", receive_id, t.len()),
+        (Some(t), _) if !t.trim().is_empty() => {
+            format!("{}:{:x}", receive_id, content_hash(t))
+        }
         (_, Some(p)) => format!("{}:{}", receive_id, p.key),
         _ => format!("{receive_id}:{mt}"),
     };
@@ -901,6 +914,34 @@ mod tests {
         }"#;
         let (_key, msg, _) = parse_permissive(payload).expect("group 回退 chat_id 应成功");
         assert_eq!(msg.conv_id.0, "feishu:oc_chat2");
+    }
+
+    /// dedup 回退 key 用内容哈希：缺 event_id/message_id 时，同会话**等长不同**
+    /// 文本必须得到不同 key（旧按长度的回退会误判重复丢第二条）。
+    #[test]
+    fn dedup_fallback_equal_length_distinct_texts_differ() {
+        let mk = |text: &str| {
+            let payload = format!(
+                r#"{{"header":{{"event_type":"im.message.receive_v1"}},
+                "event":{{"sender":{{"sender_id":{{"open_id":"ou_u"}}}},
+                "message":{{"message_type":"text","content":"{{\"text\":\"{text}\"}}","chat_type":"p2p","chat_id":""}}}}}}"#
+            );
+            let (key, msg, _) = parse_permissive(payload.as_bytes()).expect("应解析成功");
+            assert_eq!(msg.text.as_deref(), Some(text));
+            key
+        };
+        let k1 = mk("hello");
+        let k2 = mk("world");
+        assert_ne!(k1, k2, "等长不同文本的回退 dedup key 必须不同");
+        // 相同内容（模拟重投）→ 同 key。
+        assert_eq!(k1, mk("hello"));
+    }
+
+    /// dedup 回退 key 稳定性：同一内容多次哈希值一致；不同内容哈希值不同。
+    #[test]
+    fn content_hash_stable_and_distinct() {
+        assert_eq!(content_hash("abc"), content_hash("abc"));
+        assert_ne!(content_hash("abc"), content_hash("abd"));
     }
 
     /// 非 im.message.receive_v1 事件丢弃。

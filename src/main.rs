@@ -611,16 +611,15 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // P5-7（安全）：群放行 + 管理员为空的组合 = 群内任何成员都具备管理
-            // 能力（/allow /chat /config /perm）。启动期硬告警（不拒启：单用户
-            // 依赖「空=全员可」的既有语义），群部署必须显式设 admin_senders。
-            if config.admin_gap_with_chat_allowlist() {
-                tracing::error!(
+            // S2（v7 review）：admin_senders 为空 = 无人可 admin（IM 内管理命令
+            // 一律拒绝，提示走 CLI/setup 配置）。群放行时空管理员不再有扩权风险，
+            // 但补一条提示方便单用户发现「管理命令不可用」的原因。
+            if initial_admins.is_empty() && !config.allowed_chats.is_empty() {
+                tracing::warn!(
                     target: "imagent",
-                    "⚠️ 安全配置告警：allowed_chats（群放行）非空但 admin_senders 为空——\
-                     被授权群里的任何成员都将具备管理能力（/allow 扩权、/chat 扩群、\
-                     /config /perm 改全局）。请在 config.toml 设置 \
-                     admin_senders = [\"<你的 sender id>\"] 收紧（/whoami 可查 id）。"
+                    "admin_senders 为空：IM 内管理命令（/allow /chat /config /perm /admin）\
+                     不可用。如需使用，请在 config.toml 设置 \
+                     admin_senders = [\"<你的 sender id>\"]（/whoami 可查 id）。"
                 );
             }
 

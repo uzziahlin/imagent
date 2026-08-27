@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 imagent-store = { path = "../store" }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }

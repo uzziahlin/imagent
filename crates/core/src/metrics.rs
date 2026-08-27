@@ -32,6 +32,9 @@ pub struct Metrics {
     pub permission_decisions: IntCounterVec,
     /// P5：agent 超时分类计数，label `kind` = idle（空闲看门狗）| total（总预算）。
     pub agent_timeouts: IntCounterVec,
+    /// D10：终端 `ask_via_im` 的回复计数，label `result` = ok | timeout | dropped。
+    /// 与审批指标分离——ask 无 allow/deny 语义，混入会污染审批口径。
+    pub ask_via_im_replies: IntCounterVec,
 }
 
 impl Metrics {
@@ -68,6 +71,12 @@ impl Metrics {
                 &["kind"]
             )
             .expect("register agent_timeouts"),
+            ask_via_im_replies: register_int_counter_vec!(
+                "imagent_ask_via_im_replies_total",
+                "终端 ask_via_im 回复数（ok/timeout/dropped）",
+                &["result"]
+            )
+            .expect("register ask_via_im_replies"),
         }
     }
 }
@@ -101,6 +110,7 @@ mod tests {
             .with_label_values(&["allow"])
             .inc();
         METRICS.agent_timeouts.with_label_values(&["idle"]).inc();
+        METRICS.ask_via_im_replies.with_label_values(&["ok"]).inc();
         let out = render();
         assert!(
             out.contains("imagent_messages_in_total"),
@@ -121,6 +131,10 @@ mod tests {
         assert!(
             out.contains("imagent_agent_timeouts_total"),
             "missing agent_timeouts: {out}"
+        );
+        assert!(
+            out.contains("imagent_ask_via_im_replies_total"),
+            "missing ask_via_im_replies: {out}"
         );
     }
 }

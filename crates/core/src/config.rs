@@ -164,8 +164,9 @@ pub struct Config {
     /// 群消息「chat 放行 OR sender 放行」即过鉴权。运行时经 `/chat` 动态管理。
     #[serde(default)]
     pub allowed_chats: Vec<String>,
-    /// 管理员 sender（可执行 /allow /disallow 授权新用户）。空 = 向后兼容（所有
-    /// 白名单用户可 /allow，P2-D 建议生产环境显式设置以收敛授权面）。
+    /// 管理员 sender（可执行 /allow /disallow /config /perm /admin）。S2：空 =
+    /// **无人**是管理员（IM 内管理命令不可用，须 CLI / setup 配置）；显式设置
+    /// 以收敛授权面。
     #[serde(default)]
     pub admin_senders: Vec<String>,
     #[serde(default = "default_tools")]
@@ -213,7 +214,8 @@ pub struct Config {
     pub agent_timeout_secs: u64,
     /// 权限审批（Ask 模式）等待用户回复的超时（秒），超时则 deny。默认 300（5 分钟）。
     /// S-3：独立预算——审批等待不再挤占 `agent_timeout` 的执行预算（`agent_timeout`
-    /// 覆盖审批 + 执行总和）。建议 < `agent_timeout_secs`，否则慢审批可能撑满 agent 超时。
+    /// 覆盖审批 + 执行总和）。D8：必须 < `agent_timeout_secs`（否则慢审批撑满
+    /// agent 总预算、看门狗语义错乱），加载期强制校验、违反拒绝启动。
     #[serde(default = "default_permission_ask_timeout_secs")]
     pub permission_ask_timeout_secs: u64,
     /// 终端 agent 的 `ask_via_im` MCP 工具：询问默认投递的目标会话
@@ -311,9 +313,12 @@ pub fn validate_workdir(p: &Path) -> std::result::Result<(), String> {
     // 过宽位置黑名单——条目与输入**都**走 canonicalize 归一比较（macOS 的
     // /tmp→/private/tmp、/etc→/private/etc 等 symlink 形态两侧一致消解；
     // Linux 上不存在的条目 canonicalize 失败则保留原样，不影响命中）。
+    // S6（v7 review）：补齐 canonicalize 后不再与任何条目相等的等价敏感根——
+    // /private 本体，以及 /var/tmp（归一为 /private/var/tmp，不等于 /var）。
     const BROAD: &[&str] = &[
-        "/tmp", "/var", "/etc", "/usr", "/bin", "/sbin", "/System", "/Library", "/Users", "/home",
-        "/opt", "/srv", "/mnt", "/Volumes", "/proc", "/sys", "/dev", "/run",
+        "/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp", "/private", "/var", "/etc",
+        "/usr", "/bin", "/sbin", "/System", "/Library", "/Users", "/home", "/opt", "/srv",
+        "/mnt", "/Volumes", "/proc", "/sys", "/dev", "/run",
     ];
     let canon = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     let s = canon.to_string_lossy();
@@ -406,6 +411,15 @@ impl Config {
                 "permission_ask_timeout_secs 必须 ≥ 1（0 会让所有审批必然超时拒否）".into(),
             ));
         }
+        // D8：审批等待预算必须小于 agent 总预算——慢审批不再挤占执行时间的前提；
+        // 违反（≥）直接拒绝启动（此前仅注释建议，运行期才以超时形式暴露）。
+        if cfg.permission_ask_timeout_secs >= cfg.agent_timeout_secs {
+            return Err(CoreError::Config(format!(
+                "permission_ask_timeout_secs（{}）必须小于 agent_timeout_secs（{}）：\
+                 审批等待有独立预算，≥ 总预算会让慢审批撑满 agent 超时",
+                cfg.permission_ask_timeout_secs, cfg.agent_timeout_secs
+            )));
+        }
         const ASK_VIA_IM_TIMEOUT_MAX_SECS: u64 = 86_400;
         if cfg.ask_via_im_timeout_secs == 0
             || cfg.ask_via_im_timeout_secs > ASK_VIA_IM_TIMEOUT_MAX_SECS
@@ -439,11 +453,10 @@ impl Config {
         Ok(cfg)
     }
 
-    /// P5-7（安全）：危险组合探测——`allowed_chats`（群放行）非空但
-    /// `admin_senders` 为空。群维度授权后所有成员过鉴权门，而 admins 为空时
-    /// `is_admin` 对全员返回 true（向后兼容语义），组合效果 = 群内**任何成员**
-    /// 都具备管理能力（/allow 自扩权、/chat 横向扩群、/config /perm 改全局）。
-    /// 单用户私用无感；群部署必须显式设 admin_senders 收紧。
+    /// P5-7（安全）：组合探测——`allowed_chats`（群放行）非空但 `admin_senders`
+    /// 为空。S2 收紧后 admins 为空 = **无人**是管理员（不再「全员可管」），组合
+    /// 的危害已从「群内任意成员具备管理能力」降为「群部署下管理命令完全不可用
+    /// （含 /chat deny 收回群授权）」——保留探测供启动告警提醒补配 admin_senders。
     pub fn admin_gap_with_chat_allowlist(&self) -> bool {
         !self.allowed_chats.is_empty() && self.admin_senders.is_empty()
     }
@@ -453,7 +466,7 @@ impl Config {
 default_workdir = "/absolute/path/to/agent/workspace"   # 必填，agent 的 cwd（非沙箱：不限制可读路径，靠 allowed_tools + permission_mode 兜底）
 allowed_senders = []        # 留空 = 发现模式（只打日志记录入站 sender，不驱动 agent）
 # allowed_chats = ["feishu:oc_xxx"]   # 会话(群)白名单：群消息 chat 放行 OR sender 放行即过（/chat 可动态管理）
-# admin_senders = []          # 可 /allow 的管理员 sender；空=所有白名单用户可(P2-D，生产建议显式设置收敛授权面)
+# admin_senders = []          # 可 /allow 等管理命令的管理员 sender；空=无人是管理员(IM 内管理命令不可用，须 CLI/setup 配置)
 # allowed_tools = ["*"]                      # 缺省=全部工具（不收敛）；要白名单显式列（如 ["Read","Edit"]）；执行类建议配 permission_mode="ask"
 agent = "claude-cli"         # claude-cli(默认) | claude-acp(ACP长驻子进程) | codex | gemini
 platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人) | feishu(飞书,配 feishu_app_id + 环境变量 IMAGENT_FEISHU_APP_SECRET)
@@ -813,6 +826,28 @@ message_fragment_interval_ms = 250
             "bounds_ok",
             "default_workdir = \"/tmp/ws\"\nbatch_window_ms = 10000\nagent_idle_timeout_secs = 0\n",
         );
+        assert!(Config::load(&p).is_ok());
+        cleanup(&p);
+    }
+
+    /// D8：permission_ask_timeout_secs 必须 < agent_timeout_secs，违反拒绝启动。
+    #[test]
+    fn permission_ask_timeout_must_be_less_than_agent_timeout() {
+        // 违反：等于 / 大于都拒绝。
+        for (tag, extra) in [
+            ("eq", "agent_timeout_secs = 300\npermission_ask_timeout_secs = 300\n"),
+            ("gt", "agent_timeout_secs = 60\npermission_ask_timeout_secs = 300\n"),
+        ] {
+            let p = tmp_path(tag, &format!("default_workdir = \"/tmp/ws\"\n{extra}"));
+            let err = Config::load(&p).expect_err("违反预算关系应拒绝启动");
+            assert!(
+                format!("{err}").contains("必须小于"),
+                "应说明预算关系: {err}"
+            );
+            cleanup(&p);
+        }
+        // 合法：默认（300 < 600）与显式小于均通过。
+        let p = tmp_path("lt_ok", "default_workdir = \"/tmp/ws\"\nagent_timeout_secs = 301\npermission_ask_timeout_secs = 300\n");
         assert!(Config::load(&p).is_ok());
         cleanup(&p);
     }

@@ -75,7 +75,7 @@ impl Dispatcher {
             let expected_uid = current_uid();
             loop {
                 tokio::select! {
-                    _ = this.shutdown.notified() => {
+                    _ = this.shutdown.cancelled() => {
                         info!(target: "imagent::core", "permission socket accept task 收到 shutdown，停止");
                         break;
                     }
@@ -359,6 +359,11 @@ impl Dispatcher {
             }]
         });
         let input_summary = truncate_str(&input.to_string(), 2000);
+        // D5：先 register 占位（card_msg_id 后补）再发卡——否则用户极快点按钮时
+        // 回调在 register 前到达，route 未命中回落 handle 被当普通 prompt 吞掉。
+        let rx = router
+            .register(&conv.0, &request_id, None, PendingKind::Ask)
+            .await;
         let card_msg_id = match platform
             .send_permission_ask(
                 &conv,
@@ -371,9 +376,10 @@ impl Dispatcher {
         {
             Ok(mid) => mid,
             Err(e) => {
-                warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "send ask 失败，回 error 不挂 pending");
+                warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "send ask 失败，回 error 并撤占位 pending");
+                router.cancel(&conv.0, &request_id).await;
                 METRICS
-                    .permission_decisions
+                    .ask_via_im_replies
                     .with_label_values(&["dropped"])
                     .inc();
                 Self::write_ask_reply(
@@ -385,6 +391,10 @@ impl Dispatcher {
                 return;
             }
         };
+        // D5：发卡成功后回填卡片锚点（引用回复路由用）。
+        router
+            .set_card_msg_id(&conv.0, &request_id, card_msg_id.clone())
+            .await;
         info!(
             target: "imagent::core",
             conv_id = %conv.0,
@@ -393,7 +403,6 @@ impl Dispatcher {
             card_msg_id = card_msg_id.as_deref().unwrap_or("<text>"),
             "ask_via_im 询问已送达，等待回复"
         );
-        let rx = router.register(&conv.0, &request_id, card_msg_id).await;
         let reply = match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(r)) => r,
             Ok(Err(_)) => {
@@ -407,7 +416,7 @@ impl Dispatcher {
                     warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "超时询问卡收敛失败（不影响回传）");
                 }
                 METRICS
-                    .permission_decisions
+                    .ask_via_im_replies
                     .with_label_values(&["timeout"])
                     .inc();
                 let msg = format!("timeout: 用户未在 {timeout_secs}s 内回复");
@@ -415,10 +424,8 @@ impl Dispatcher {
                 return;
             }
         };
-        METRICS
-            .permission_decisions
-            .with_label_values(&["allow"])
-            .inc();
+        // D10：ask 的成功回复不计入审批指标（allow 口径会被污染），用独立计数。
+        METRICS.ask_via_im_replies.with_label_values(&["ok"]).inc();
         let text = reply
             .raw_text
             .or(reply.message)
@@ -507,7 +514,12 @@ impl Dispatcher {
         // P6：80 截断装不下 AskUserQuestion 的问题+选项 JSON；放到 2000（卡片
         // 30KB 上限内安全，仍防超长轰炸）。
         let input_summary = truncate_str(&input_str, 2000);
-        // P1-3：发送失败 → 回写 deny 并 return，不挂 pending。
+        // D5：先 register 占位再发卡——防用户极速点按钮时回调先于 register 到达，
+        // route 未命中回落 handle 被当普通 prompt。P1-3：发送失败 → 撤占位、
+        // 回写 deny 并 return，不留 pending。
+        let rx = router
+            .register(&conv_id, &request_id, None, PendingKind::Permission)
+            .await;
         let card_msg_id = match platform
             .send_permission_ask(
                 &conv,
@@ -520,7 +532,8 @@ impl Dispatcher {
         {
             Ok(mid) => mid,
             Err(e) => {
-                warn!(target: "imagent::core", conv_id = %conv_id, error = %e, "send permission ask 失败，回 deny 不挂 pending");
+                warn!(target: "imagent::core", conv_id = %conv_id, error = %e, "send permission ask 失败，回 deny 并撤占位 pending");
+                router.cancel(&conv_id, &request_id).await;
                 Self::write_permission_reply(
                     &mut stream,
                     PermissionReply {
@@ -533,8 +546,10 @@ impl Dispatcher {
                 return;
             }
         };
-        // 注册 pending，等回复（recv 循环 route 到这里）。
-        let rx = router.register(&conv_id, &request_id, card_msg_id).await;
+        // D5：发卡成功后回填卡片锚点（引用回复路由用）。
+        router
+            .set_card_msg_id(&conv_id, &request_id, card_msg_id)
+            .await;
         // P1-G/S-3：权限回复等待独立预算 permission_ask_timeout（默认 300s，不挤占
         // agent_timeout 的执行预算）。agent 死或用户长时间不回复时，超时回 deny 并 drop
         // receiver，避免 pending 永驻把后续消息误当回复吞。
