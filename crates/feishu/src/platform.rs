@@ -26,8 +26,8 @@ use imagent_core::{
 use open_lark::{Config, CoreConfig};
 
 use crate::card::{
-    render_card, render_command_card, render_permission_card, render_permission_card_cancelled,
-    render_stream_init_card, stream_body_final, stream_body_md,
+    mask_emails, render_card, render_command_card, render_config_form_card, render_permission_card,
+    render_permission_card_cancelled, render_stream_init_card, stream_body_final, stream_body_md,
 };
 use crate::client::{
     create_card_entity, download_file, download_image, fetch_bot_open_id, fetch_token,
@@ -399,12 +399,13 @@ impl FeishuPlatform {
     /// 不依赖 `cardkit:card:write` 权限。
     async fn send_card_raw(
         &self,
+        conv_id: &str,
         receive_id: &str,
         kind: ReceiveIdKind,
         card: &OutboundCard,
         token: &str,
     ) -> Result<Option<String>> {
-        let card_json = render_card(card);
+        let card_json = render_card(card, conv_id);
         let mid = send_card_msg(&self.core_config, token, receive_id, kind, &card_json).await?;
         Ok(mid.map(|m| format!("msg:{m}")))
     }
@@ -760,6 +761,9 @@ impl Platform for FeishuPlatform {
     }
 
     async fn send_text(&self, conv: &ConvId, text: &str, _hint: &ReplyHint) -> Result<()> {
+        // P9-1：出站文本统一邮箱掩码——租户消息审计对裸邮箱回 400（含纯文本
+        // 消息），流式/最终回复都会过这里。
+        let text = &mask_emails(text);
         // P4-9：评论线程 conv → 回复云文档评论（每分片一条回复）。
         if let Some((file_token, comment_id)) = comment_target_from_conv(conv) {
             let chunks: Vec<String> = split_message(text, FEISHU_TEXT_MAX);
@@ -1116,6 +1120,44 @@ impl Platform for FeishuPlatform {
         .await
     }
 
+    /// P9-2：`/config` 表单卡（form + select_static 下拉 + 提交）。评论线程无
+    /// 卡片语义 → 文本降级；话题群 → reply 进原话题；发送失败上抛由 dispatch
+    /// 层统一降级（与命令卡同策略）。
+    async fn send_config_form(
+        &self,
+        conv: &ConvId,
+        entries: &[imagent_core::ConfigFormField],
+        fallback: &str,
+        hint: &ReplyHint,
+    ) -> Result<()> {
+        if comment_target_from_conv(conv).is_some() {
+            return self.send_text(conv, fallback, hint).await;
+        }
+        let card_json = render_config_form_card(entries, &conv.0);
+        if let Some((_chat, root_id)) = thread_target_from_conv(conv) {
+            return self
+                .with_token(|t| {
+                    let root_id = root_id.clone();
+                    let card_json = card_json.clone();
+                    async move {
+                        reply_message(&self.core_config, &t, &root_id, "interactive", &card_json)
+                            .await
+                    }
+                })
+                .await
+                .map(|_| ());
+        }
+        let (receive_id, kind) = receive_target_from_conv(conv)
+            .ok_or_else(|| CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0)))?;
+        self.with_token(|t| {
+            let receive_id = receive_id.clone();
+            let card_json = card_json.clone();
+            async move { send_card_msg(&self.core_config, &t, &receive_id, kind, &card_json).await }
+        })
+        .await
+        .map(|_| ())
+    }
+
     /// P6-3：命令交互卡片（markdown 正文 + 按钮组）。按钮点击回调由 proto 解析成
     /// `text = <command>` 走手打命令同路径。评论线程无卡片语义 → 纯文本降级；
     /// 话题群 → reply API 把卡发进原话题；卡片发送失败向上返回 Err，由 dispatch
@@ -1206,7 +1248,7 @@ impl Platform for FeishuPlatform {
             .await
             .insert(conv.0.clone(), false);
         if let Some((_chat, root_id)) = thread_target_from_conv(conv) {
-            let card_json = render_card(card);
+            let card_json = render_card(card, &conv.0);
             return self
                 .with_token(|t| {
                     let root_id = root_id.clone();
@@ -1223,8 +1265,9 @@ impl Platform for FeishuPlatform {
             .ok_or_else(|| CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0)))?;
         self.with_token(|t| {
             let receive_id = receive_id.clone();
+            let conv_for_init = conv.0.clone();
             async move {
-                match create_card_entity(&t, &render_stream_init_card()).await {
+                match create_card_entity(&t, &render_stream_init_card(&conv_for_init)).await {
                     Ok(card_id) => {
                         match send_card_ref_msg(&self.core_config, &t, &receive_id, kind, &card_id)
                             .await
@@ -1233,14 +1276,14 @@ impl Platform for FeishuPlatform {
                             Err(e) => {
                                 // 实体已建但消息发送失败：实体作废（14 天过期自然回收），降级 raw。
                                 warn!(target: "feishu", error = %e, "发送卡片引用消息失败，降级 raw 卡片");
-                                self.send_card_raw(&receive_id, kind, card, &t).await
+                                self.send_card_raw(&conv.0, &receive_id, kind, card, &t).await
                             }
                         }
                     }
                     Err(e) => {
                         // 权限未开（cardkit:card:write）或创建失败 → 降级 raw + 整卡 im patch。
                         warn!(target: "feishu", error = %e, "创建卡片实体失败（需 cardkit:card:write 权限），降级 raw 卡片");
-                        self.send_card_raw(&receive_id, kind, card, &t).await
+                        self.send_card_raw(&conv.0, &receive_id, kind, card, &t).await
                     }
                 }
             }
@@ -1290,7 +1333,7 @@ impl Platform for FeishuPlatform {
                 let card_json = if buried {
                     crate::card::render_stub_card(card)
                 } else {
-                    render_card(card)
+                    render_card(card, &conv.0)
                 };
                 patch_card(&self.core_config, &token, message_id, &card_json).await
             } else {
@@ -1304,7 +1347,7 @@ impl Platform for FeishuPlatform {
         // 结果下沉重发：流式卡已收敛成指针 → 完整结果另发新卡。重发失败上抛 Err
         // ——core 的 P5-11 兜底会以纯文本补发全文（结论不能因重发失败而丢）。
         if res.is_ok() && buried {
-            let full = render_card(card);
+            let full = render_card(card, &conv.0);
             if let Err(e) = self.send_static_card(conv, &full).await {
                 warn!(target: "feishu", error = %e, "结果下沉重发失败，交由 core 纯文本兜底");
                 return Err(e);

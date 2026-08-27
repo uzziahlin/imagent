@@ -7,7 +7,25 @@
 //! - 折叠面板带边框/圆角/内边距/小字号（notation），lcab 生产验证过的字段集
 
 use imagent_core::render::{tool_card_line, tool_summary};
-use imagent_core::{CardButton, CardButtonStyle, CardPhase, CardTerminal, OutboundCard, ToolCall};
+use imagent_core::{
+    CardButton, CardButtonStyle, CardPhase, CardTerminal, ConfigFormField, OutboundCard, ToolCall,
+};
+
+/// 邮箱掩码（lcab mask-email 同款）：飞书租户消息审计对含裸邮箱的出站内容回
+/// 400（"contain sensitive data: EMAIL_ADDRESS"），流式卡会**静默失败**——典型
+/// 触发是 git commit 的 Co-Authored-By 尾注。改写 `@` 为 `[at]`（刻意不用全角＠
+/// 或零宽字符：中文审计会归一化还原后再次触发拦截；`[at]` 无法还原为合法地址）。
+/// 点分 TLD 要求避开 npm scope（`@larksuite/x`）、版本号（`pkg@1.2.3`）与裸句柄；
+/// SSH remote（`git@host.tld`）会被掩码——审计同样拦它，掩了才能发出去。
+pub(crate) fn mask_emails(s: &str) -> String {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r"([A-Za-z0-9._%+-]+)@((?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})").unwrap()
+    })
+    .replace_all(s, "$1[at]$2")
+    .into_owned()
+}
 
 /// 流式中工具行的展示上限：超出折叠成 `… 前面还有 N 个`（防长任务把卡片正文刷爆）。
 const STREAM_TOOL_LINES: usize = 5;
@@ -38,7 +56,7 @@ fn terminal_footer(err: Option<&str>) -> &'static str {
 ///
 /// markdown 文本块 + 工具调用折叠面板 + 状态 footer。
 /// 这是**降级路径**的渲染（managed 真流式路径见 [`render_stream_init_card`]）。
-pub fn render_card(card: &OutboundCard) -> String {
+pub fn render_card(card: &OutboundCard, conv_id: &str) -> String {
     let (footer, streaming, err) = match &card.terminal {
         CardTerminal::Running => (phase_footer(card.phase), true, None),
         CardTerminal::Done => ("✅ 已完成", false, None),
@@ -54,7 +72,8 @@ pub fn render_card(card: &OutboundCard) -> String {
         Some(e) => format!("❌ 出错：{e}\n\n{text}").into(),
         None => text.into(),
     };
-    let mut elements = vec![serde_json::json!({ "tag": "markdown", "content": text })];
+    let mut elements =
+        vec![serde_json::json!({ "tag": "markdown", "content": mask_emails(&text) })];
     if !card.tool_calls.is_empty() {
         elements.push(render_tool_panel(&card.tool_calls));
     }
@@ -62,6 +81,10 @@ pub fn render_card(card: &OutboundCard) -> String {
     elements.push(serde_json::json!({
         "tag": "markdown", "content": footer, "text_size": "notation"
     }));
+    // Running 态带终止按钮（终态移除——整卡 patch 每次重渲染，自然消失）。
+    if streaming {
+        elements.push(stop_button(conv_id));
+    }
 
     // Running 态带自定义 summary（卡片列表预览/通知处显示，默认「生成中」）；
     // Done 态 streaming=false 不需要 summary。
@@ -96,7 +119,7 @@ fn render_tool_panel(tools: &[ToolCall]) -> serde_json::Value {
         lines.push_str(&format!("- ☕ … 前面还有 {skipped} 个\n"));
     }
     for t in shown {
-        lines.push_str(&format!("- {}\n", tool_card_line(t)));
+        lines.push_str(&format!("- {}\n", mask_emails(&tool_card_line(t))));
     }
     serde_json::json!({
         "tag": "collapsible_panel",
@@ -106,6 +129,50 @@ fn render_tool_panel(tools: &[ToolCall]) -> serde_json::Value {
         "vertical_spacing": "8px",
         "padding": "8px 8px 8px 8px",
         "elements": [{ "tag": "markdown", "content": lines, "text_size": "notation" }]
+    })
+}
+
+/// ⏹ 终止按钮（lcab stopButton 同款）：Running 态挂在卡片底部，点击回调注入
+/// `/stop`（imagent_cmd 机制，走与手打命令相同的鉴权/分派）。managed 卡终态后
+/// 按钮无法移除（element PATCH 只能动 markdown）——点击回「当前没有运行中的
+/// 任务」，无害。
+fn stop_button(conv_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "tag": "column_set", "flex_mode": "flow", "horizontal_spacing": "default",
+        "columns": [{
+            "tag": "column", "width": "auto",
+            "elements": [{
+                "tag": "button",
+                "text": { "tag": "plain_text", "content": "⏹ 终止" },
+                "type": "danger",
+                "behaviors": [{ "type": "callback", "value": {
+                    "imagent_cmd": "/stop", "conv": conv_id
+                } }]
+            }]
+        }]
+    })
+}
+
+/// 按钮组 → flow 自适应 column_set（lcab 同款 `flex_mode: "flow"` + `width: auto`）：
+/// 按内容宽度排列、自动换行，替代此前每行 3 个等宽的固定布局。
+fn flow_button_row(buttons: &[serde_json::Value]) -> serde_json::Value {
+    let columns: Vec<serde_json::Value> = buttons
+        .iter()
+        .map(|b| serde_json::json!({ "tag": "column", "width": "auto", "elements": [b] }))
+        .collect();
+    serde_json::json!({
+        "tag": "column_set", "flex_mode": "flow", "horizontal_spacing": "default",
+        "columns": columns
+    })
+}
+
+/// 单个 callback 按钮的 JSON。
+fn cb_button(label: &str, btn_type: &str, value: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "tag": "button",
+        "text": { "tag": "plain_text", "content": label },
+        "type": btn_type,
+        "behaviors": [{ "type": "callback", "value": value }]
     })
 }
 
@@ -124,7 +191,7 @@ fn panel_header(title_md: &str) -> serde_json::Value {
 ///
 /// 正文 markdown 组件带固定 `element_id = md_body`（后续 element PATCH 的锚点），
 /// 初始内容为空；footer 独立组件体现执行中。`config` 开启流式模式 + 自定义摘要。
-pub fn render_stream_init_card() -> String {
+pub fn render_stream_init_card(conv_id: &str) -> String {
     serde_json::json!({
         "schema": "2.0",
         "config": {
@@ -133,7 +200,10 @@ pub fn render_stream_init_card() -> String {
         },
         "body": { "elements": [
             { "tag": "markdown", "element_id": "md_body", "content": "…" },
-            { "tag": "markdown", "element_id": "md_footer", "content": "🧠 思考中…", "text_size": "notation" }
+            { "tag": "markdown", "element_id": "md_footer", "content": "🧠 思考中…", "text_size": "notation" },
+            // P9-1：⏹ 终止按钮常驻（element PATCH 只更新 markdown，按钮不受流式
+            // 影响；终态后仍在，点击回「当前没有运行中的任务」，无害）。
+            stop_button(conv_id)
         ] }
     })
     .to_string()
@@ -171,7 +241,7 @@ pub fn stream_body_md(text: &str, tool_calls: &[ToolCall]) -> String {
     if out.is_empty() {
         out.push('…');
     }
-    out
+    mask_emails(&out)
 }
 
 /// 终态（Done/Error）时 `md_body` 的最终内容：正文 + 工具统计行 + 完成行。
@@ -209,7 +279,11 @@ pub fn stream_body_final(text: &str, tool_calls: &[ToolCall], err: Option<&str>)
     }
     // 终态状态行（✅ 已完成等）由 md_footer 承载——正文不再拼一份，
     // 否则同卡出现两行「完成」（真机反馈）。
-    out
+    // P9-1：空正文 + 无工具的空产出给占位（空串 patch 组件可能被拒/显示空白）。
+    if out.is_empty() {
+        out.push_str("（未返回内容）");
+    }
+    mask_emails(&out)
 }
 
 /// 终态「结果下沉」指针正文（P8-2）：本轮发过询问卡（流式卡已被顶离视口）时，
@@ -268,7 +342,17 @@ fn perm_detail_md(tool_name: &str, input_summary: &str) -> String {
         // 截断的 JSON（超长输入）：解析失败原样展示。
         Err(_) => truncate_str(input_summary, PERM_DETAIL_MAX),
     };
-    format!("{head}\n```{lang}\n{body}\n```")
+    format!("{head}\n```{lang}\n{body}\n```").pipe(mask_emails)
+}
+
+/// 小工具：String 管道（掩码用）。
+trait PipeString {
+    fn pipe(self, f: impl Fn(&str) -> String) -> String;
+}
+impl PipeString for String {
+    fn pipe(self, f: impl Fn(&str) -> String) -> String {
+        f(&self)
+    }
 }
 
 /// 审批询问卡片（P4-4）：标题栏 + 工具签名/参数详情 + 允许/拒绝按钮。
@@ -295,24 +379,16 @@ pub fn render_permission_card(
         "body": { "elements": [
             { "tag": "markdown", "content": perm_detail_md(tool_name, input_summary) },
             { "tag": "markdown", "content": "⏱️ 长时间未处理将自动拒绝", "text_size": "notation" },
-            { "tag": "column_set", "columns": [
-                { "tag": "column", "width": "weighted", "weight": 1,
-                  "elements": [
-                    { "tag": "button", "text": { "tag": "plain_text", "content": "✅ 允许" },
-                      "type": "primary",
-                      "behaviors": [{ "type": "callback", "value": {
-                        "imagent_perm": "allow", "conv": conv_id, "req": request_id
-                      } }] }
-                  ] },
-                { "tag": "column", "width": "weighted", "weight": 1,
-                  "elements": [
-                    { "tag": "button", "text": { "tag": "plain_text", "content": "⛔ 拒绝" },
-                      "type": "danger",
-                      "behaviors": [{ "type": "callback", "value": {
-                        "imagent_perm": "deny", "conv": conv_id, "req": request_id
-                      } }] }
-                  ] }
-            ]}
+            // P9-1：hr 分割线（V2 支持，lcab 生产验证）+ flow 自适应按钮布局。
+            { "tag": "hr" },
+            flow_button_row(&[
+                cb_button("✅ 允许", "primary", serde_json::json!({
+                    "imagent_perm": "allow", "conv": conv_id, "req": request_id
+                })),
+                cb_button("⛔ 拒绝", "danger", serde_json::json!({
+                    "imagent_perm": "deny", "conv": conv_id, "req": request_id
+                })),
+            ])
         ]}
     })
     .to_string()
@@ -377,23 +453,23 @@ pub fn render_question_card(tool_input: &str, conv_id: &str, request_id: &str) -
     if multi {
         extra.push_str("\n（多选：依次点击多个选项）");
     }
-    // 每选项一列；超 4 个截断（卡片宽度），剩余以文字列出。首选项 primary 高亮。
+    // 每选项一钮（flow 自适应）；超 4 个截断（卡片宽度），剩余以文字列出。
+    // 首选项 primary 高亮。
     let shown: Vec<&String> = opts.iter().take(4).collect();
-    let mut columns = Vec::new();
-    for (i, label) in shown.iter().enumerate() {
-        let btn_type = if i == 0 { "primary" } else { "default" };
-        columns.push(serde_json::json!({
-            "tag": "column", "width": "weighted", "weight": 1,
-            "elements": [{
-                "tag": "button",
-                "text": { "tag": "plain_text", "content": format!("{}. {}", i + 1, label) },
-                "type": btn_type,
-                "behaviors": [{ "type": "callback", "value": {
+    let opt_buttons: Vec<serde_json::Value> = shown
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            let btn_type = if i == 0 { "primary" } else { "default" };
+            cb_button(
+                &format!("{}. {}", i + 1, label),
+                btn_type,
+                serde_json::json!({
                     "imagent_ask": label, "conv": conv_id, "req": request_id
-                } }]
-            }]
-        }));
-    }
+                }),
+            )
+        })
+        .collect();
     let mut content = format!("❓ {question}{extra}");
     if opts.len() > 4 {
         let rest: Vec<&str> = opts.iter().skip(4).map(|s| s.as_str()).collect();
@@ -410,8 +486,9 @@ pub fn render_question_card(tool_input: &str, conv_id: &str, request_id: &str) -
                 "template": "blue"
             },
             "body": { "elements": [
-                { "tag": "markdown", "content": content },
-                { "tag": "column_set", "columns": columns }
+                { "tag": "markdown", "content": mask_emails(&content) },
+                { "tag": "hr" },
+                flow_button_row(&opt_buttons)
             ]}
         })
         .to_string(),
@@ -474,40 +551,87 @@ pub fn render_command_card(
             "template": "blue"
         },
         "body": { "elements": [
-            { "tag": "markdown", "content": body_md }
+            { "tag": "markdown", "content": mask_emails(body_md) }
         ] }
     });
     if buttons.is_empty() {
         return card.to_string();
     }
-    // 每行 3 个按钮，多余换行（列等宽 weighted）。
-    let mut rows = Vec::new();
-    for chunk in buttons.chunks(3) {
-        let columns: Vec<serde_json::Value> = chunk
-            .iter()
-            .map(|b| {
-                serde_json::json!({
-                    "tag": "column", "width": "weighted", "weight": 1,
-                    "elements": [{
-                        "tag": "button",
-                        "text": { "tag": "plain_text", "content": b.label },
-                        "type": button_type(b.style),
-                        "behaviors": [{ "type": "callback", "value": {
-                            "imagent_cmd": b.command, "conv": conv_id
-                        } }]
-                    }]
-                })
-            })
-            .collect();
-        rows.push(serde_json::json!({ "tag": "column_set", "columns": columns }));
-    }
+    // P9-1：hr 分隔正文与按钮；flow 自适应单行布局（按内容宽度自动换行，
+    // 替代此前每行 3 个等宽）。
+    let btns: Vec<serde_json::Value> = buttons
+        .iter()
+        .map(|b| {
+            cb_button(
+                &b.label,
+                button_type(b.style),
+                serde_json::json!({ "imagent_cmd": b.command, "conv": conv_id }),
+            )
+        })
+        .collect();
     if let Some(elements) = card
         .pointer_mut("/body/elements")
         .and_then(|e| e.as_array_mut())
     {
-        elements.extend(rows);
+        elements.push(serde_json::json!({ "tag": "hr" }));
+        elements.push(flow_button_row(&btns));
     }
     card.to_string()
+}
+
+/// P9-2：`/config` 偏好设置表单卡（CardKit 2.0 `form` + `select_static` 下拉 +
+/// 提交按钮——lcab configFormCard 同款交互）。提交回调经 card.action.trigger 的
+/// `form_value` 回传，proto 侧合成 `/config form k=v …` 命令文本（走与手打命令
+/// 相同的鉴权/分派）。
+pub fn render_config_form_card(entries: &[ConfigFormField], conv_id: &str) -> String {
+    let mut form_elements: Vec<serde_json::Value> = Vec::new();
+    for f in entries {
+        let options: Vec<serde_json::Value> = f
+            .options
+            .iter()
+            .map(|(value, label)| {
+                serde_json::json!({
+                    "text": { "tag": "plain_text", "content": label },
+                    "value": value
+                })
+            })
+            .collect();
+        form_elements.push(serde_json::json!({
+            "tag": "markdown",
+            "content": format!("**{}**", f.label)
+        }));
+        form_elements.push(serde_json::json!({
+            "tag": "select_static",
+            "name": f.key,
+            "initial_option": f.current,
+            "options": options
+        }));
+    }
+    form_elements.push(serde_json::json!({ "tag": "hr" }));
+    form_elements.push(flow_button_row(&[serde_json::json!({
+        "tag": "button",
+        "name": "submit_btn",
+        "text": { "tag": "plain_text", "content": "提交" },
+        "type": "primary",
+        "form_action_type": "submit",
+        "behaviors": [{ "type": "callback", "value": {
+            "imagent_form": "config", "conv": conv_id
+        } }]
+    })]));
+    serde_json::json!({
+        "schema": "2.0",
+        "config": { "summary": { "content": "⚙️ 偏好设置" } },
+        "header": {
+            "title": { "tag": "plain_text", "content": "⚙️ 偏好设置" },
+            "template": "blue"
+        },
+        "body": { "elements": [
+            { "tag": "markdown", "content": "下拉选择后点「提交」，立即生效（重启回 config.toml 值；也可继续用 `/config <key> <value>` 文本命令）。" },
+            { "tag": "hr" },
+            { "tag": "form", "name": "imagent_config", "elements": form_elements }
+        ] }
+    })
+    .to_string()
 }
 
 /// 按 char 截断（避免半截 UTF-8）。
@@ -536,7 +660,7 @@ mod tests {
             phase: CardPhase::Thinking,
             terminal: CardTerminal::Running,
         };
-        let json = render_card(&card);
+        let json = render_card(&card, "feishu:ou_t");
         assert!(json.contains("hello"));
         assert!(json.contains("schema"));
         assert!(json.contains("思考中"), "分阶段 footer: {json}");
@@ -560,7 +684,10 @@ mod tests {
                 phase,
                 terminal: CardTerminal::Running,
             };
-            assert!(render_card(&card).contains(mark), "{phase:?} → {mark}");
+            assert!(
+                render_card(&card, "feishu:ou_t").contains(mark),
+                "{phase:?} → {mark}"
+            );
         }
     }
 
@@ -572,7 +699,7 @@ mod tests {
             phase: CardPhase::Outputting,
             terminal: CardTerminal::Done,
         };
-        let json = render_card(&card);
+        let json = render_card(&card, "feishu:ou_t");
         assert!(json.contains("done"));
         assert!(json.contains("Read"));
         assert!(json.contains("✅ 已完成"));
@@ -595,7 +722,7 @@ mod tests {
             phase: CardPhase::ToolRunning,
             terminal: CardTerminal::Running,
         };
-        let json = render_card(&card);
+        let json = render_card(&card, "feishu:ou_t");
         assert!(json.contains("前面还有 5"), "折叠计数行: {json}");
         assert!(!json.contains("cmd-0"), "最早的不展示: {json}");
         assert!(json.contains("cmd-9"), "最新的一直可见: {json}");
@@ -609,7 +736,7 @@ mod tests {
             phase: CardPhase::Thinking,
             terminal: CardTerminal::Error("boom".into()),
         };
-        let json = render_card(&card);
+        let json = render_card(&card, "feishu:ou_t");
         assert!(json.contains("boom"));
         assert!(json.contains("❌ 出错"), "终态 footer: {json}");
     }
@@ -698,11 +825,18 @@ mod tests {
             !json.contains("\"tag\":\"action\""),
             "V2 已废弃 action 元素: {json}"
         );
-        // 4 个按钮 → 2 个 column_set（每行 3 个）。
+        // P9-1：flow 自适应——所有按钮进单个 column_set（自动换行），并有 hr 分隔。
         assert_eq!(
             json.matches("\"tag\":\"column_set\"").count(),
-            2,
-            "超过 3 个按钮应换行: {json}"
+            1,
+            "flow 布局单 column_set: {json}"
+        );
+        assert!(json.contains("\"flex_mode\":\"flow\""), "flow 模式: {json}");
+        assert!(json.contains("\"tag\":\"hr\""), "hr 分隔线: {json}");
+        assert_eq!(
+            json.matches("\"tag\":\"button\"").count(),
+            4,
+            "按钮数: {json}"
         );
         // 空按钮：纯 markdown 卡，无 column_set。
         let no_btn = render_command_card("t", "body", &[], "feishu:oc_g");
@@ -771,9 +905,95 @@ mod tests {
         );
     }
 
+    /// P9-1：邮箱掩码——本地部分保留、@ 改 [at]；npm scope / 版本号 / 裸句柄不误伤。
+    #[test]
+    fn mask_emails_rewrites_only_real_addresses() {
+        assert_eq!(
+            mask_emails("联系 someone@example.com 谢谢"),
+            "联系 someone[at]example.com 谢谢"
+        );
+        assert_eq!(
+            mask_emails("Co-Authored-By: Uzziah <u@foo.dev>"),
+            "Co-Authored-By: Uzziah <u[at]foo.dev>"
+        );
+        // 非邮箱形态不动。
+        for keep in ["@larksuite/x", "pkg@1.2.3", "user@localhost", "@所有人"] {
+            assert_eq!(mask_emails(keep), keep, "不应误伤: {keep}");
+        }
+    }
+
+    /// P9-1：流式卡终止按钮——init 卡与降级 Running 卡都带 ⏹ 终止（danger，
+    /// 回调注入 /stop + conv 编码）；终态不带。
+    #[test]
+    fn stop_button_on_running_cards_only() {
+        let init = render_stream_init_card("feishu:ou_t");
+        assert!(init.contains("⏹ 终止"), "init 卡终止按钮: {init}");
+        assert!(
+            init.contains("\"imagent_cmd\":\"/stop\""),
+            "命令编码: {init}"
+        );
+        assert!(
+            init.contains("\"conv\":\"feishu:ou_t\""),
+            "conv 编码: {init}"
+        );
+
+        let running = OutboundCard {
+            text: "x".into(),
+            tool_calls: vec![],
+            phase: CardPhase::Outputting,
+            terminal: CardTerminal::Running,
+        };
+        let json = render_card(&running, "feishu:ou_t");
+        assert!(json.contains("⏹ 终止"), "Running 降级卡带终止按钮: {json}");
+        let done = OutboundCard {
+            text: "ok".into(),
+            tool_calls: vec![],
+            phase: CardPhase::Outputting,
+            terminal: CardTerminal::Done,
+        };
+        let json2 = render_card(&done, "feishu:ou_t");
+        assert!(!json2.contains("⏹ 终止"), "终态不带终止按钮: {json2}");
+    }
+
+    /// P9-1：空产出占位（空串 patch 可能被拒/显示空白）。
+    #[test]
+    fn stream_body_final_empty_placeholder() {
+        assert_eq!(stream_body_final("", &[], None), "（未返回内容）");
+    }
+
+    /// P9-2：/config 表单卡——form + select_static 下拉 + 提交按钮（form_action_type）。
+    #[test]
+    fn config_form_card_shape() {
+        let entries = vec![ConfigFormField {
+            key: "reply_mode".into(),
+            label: "回复形态".into(),
+            current: "card".into(),
+            options: vec![
+                ("card".into(), "卡片（流式，默认）".into()),
+                ("text".into(), "纯文本".into()),
+            ],
+        }];
+        let json = render_config_form_card(&entries, "feishu:ou_t");
+        assert!(json.contains("\"tag\":\"form\""), "form 元素: {json}");
+        assert!(json.contains("select_static"), "下拉: {json}");
+        assert!(json.contains("\"name\":\"reply_mode\""), "字段名: {json}");
+        assert!(
+            json.contains("\"form_action_type\":\"submit\""),
+            "提交按钮: {json}"
+        );
+        assert!(
+            json.contains("\"imagent_form\":\"config\""),
+            "回调标记: {json}"
+        );
+        assert!(
+            json.contains("\"conv\":\"feishu:ou_t\""),
+            "conv 编码: {json}"
+        );
+    }
+
     #[test]
     fn stream_init_card_has_element_id_and_streaming() {
-        let json = render_stream_init_card();
+        let json = render_stream_init_card("feishu:ou_t");
         assert!(json.contains("element_id"), "初始卡应含 element_id: {json}");
         assert!(json.contains("md_body"), "正文组件锚点: {json}");
         assert!(json.contains("\"streaming_mode\":true"), "应开流式: {json}");

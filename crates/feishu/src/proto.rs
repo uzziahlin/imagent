@@ -264,7 +264,28 @@ pub fn parse_card_action_event(payload: &[u8]) -> Option<(String, InboundMessage
     //（admin 门槛等不豁免；只接受 / 开头，防伪造普通聊天文本）。
     let act = value.get("imagent_perm").and_then(|v| v.as_str());
     let cmd = value.get("imagent_cmd").and_then(|v| v.as_str());
-    let text: String = if let Some(choice) = value.get("imagent_ask").and_then(|c| c.as_str()) {
+    // P9-2：表单提交按钮（imagent_form）——CardKit form 的用户输入值**不在**
+    // action.value 里，在 action.form_value（lcab dispatcher 同款校准）。把
+    // (key, string value) 拼成 `/config form k=v k=v` 命令文本，走与手打命令
+    // 相同的鉴权（admin 门槛）/分派。
+    let text: String = if value.get("imagent_form").and_then(|v| v.as_str()).is_some() {
+        let fv = evt
+            .event
+            .action
+            .get("form_value")
+            .and_then(|v| v.as_object())?;
+        let mut pairs: Vec<String> = Vec::new();
+        // 键白名单校验（防伪造任意配置键——cmd_config 侧还会再验一次值）。
+        for k in ["reply_mode", "cot_detail", "require_mention"] {
+            if let Some(v) = fv.get(k).and_then(|v| v.as_str()) {
+                pairs.push(format!("{k}={v}"));
+            }
+        }
+        if pairs.is_empty() {
+            return None;
+        }
+        format!("/config form {}", pairs.join(" "))
+    } else if let Some(choice) = value.get("imagent_ask").and_then(|c| c.as_str()) {
         format!("ask:{choice}")
     } else {
         match (act, cmd) {
@@ -1119,6 +1140,53 @@ mod tests {
         assert_eq!(msg.text.as_deref(), Some("y"));
         let (_, msg) = parse_card_action_event(&mk("deny")).expect("deny 应回调");
         assert_eq!(msg.text.as_deref(), Some("n"));
+    }
+
+    /// P9-2：表单提交回调——用户输入在 action.form_value（不在 value），合成
+    /// `/config form k=v …`；键白名单外的键被丢弃；无 form_value 整体丢弃。
+    #[test]
+    fn parse_card_action_form_submit() {
+        let mk = |form_value: serde_json::Value| {
+            serde_json::json!({
+                "schema":"2.0",
+                "header":{"event_id":"evt_form_1","event_type":"card.action.trigger"},
+                "event":{
+                    "operator":{"open_id":"ou_op"},
+                    "action":{
+                        "tag":"button",
+                        "value":{"imagent_form":"config","conv":"feishu:ou_op"},
+                        "form_value": form_value
+                    }
+                }
+            })
+            .to_string()
+            .into_bytes()
+        };
+        let (_, msg) = parse_card_action_event(&mk(serde_json::json!({
+            "reply_mode": "text", "cot_detail": "detailed", "extra_key": "evil"
+        })))
+        .expect("表单提交应回调");
+        assert_eq!(
+            msg.text.as_deref(),
+            Some("/config form reply_mode=text cot_detail=detailed"),
+            "白名单键按序拼接、白名单外丢弃: {:?}",
+            msg.text
+        );
+        assert_eq!(msg.sender.0, "ou_op");
+        // 空 form_value → 丢弃。
+        assert!(parse_card_action_event(&mk(serde_json::json!({}))).is_none());
+        // 无 form_value 字段 → 丢弃。
+        let no_fv = serde_json::json!({
+            "schema":"2.0",
+            "header":{"event_id":"evt_form_2","event_type":"card.action.trigger"},
+            "event":{
+                "operator":{"open_id":"ou_op"},
+                "action":{"tag":"button","value":{"imagent_form":"config","conv":"feishu:ou_op"}}
+            }
+        })
+        .to_string()
+        .into_bytes();
+        assert!(parse_card_action_event(&no_fv).is_none());
     }
 
     /// 真机校准（2026-08）：新版回调信封 operator.open_id 平铺（不再嵌套

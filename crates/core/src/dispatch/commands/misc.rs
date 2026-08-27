@@ -174,15 +174,24 @@ impl Dispatcher {
                         .collect::<Vec<_>>()
                         .join("\n");
                     // P6-3：每个空间一个「使用」按钮（点击 = /ws use <name>）。
+                    // P9-1：每个空间「使用」（primary）+「删除」（danger）两钮，
+                    // 对标 lcab workspacesCard 的 切换/删除。
                     let buttons: Vec<CardButton> = rows
                         .iter()
-                        .map(|(k, _)| {
+                        .flat_map(|(k, _)| {
                             let name = k.strip_prefix("workspace:").unwrap_or(k).to_string();
-                            CardButton {
-                                label: format!("使用 {name}"),
-                                command: format!("/ws use {name}"),
-                                style: CardButtonStyle::Primary,
-                            }
+                            vec![
+                                CardButton {
+                                    label: format!("使用 {name}"),
+                                    command: format!("/ws use {name}"),
+                                    style: CardButtonStyle::Primary,
+                                },
+                                CardButton {
+                                    label: format!("删除 {name}"),
+                                    command: format!("/ws remove {name}"),
+                                    style: CardButtonStyle::Danger,
+                                },
+                            ]
                         })
                         .collect();
                     self.reply_card(conv, "📁 命名工作空间", &body, buttons, hint)

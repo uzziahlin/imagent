@@ -162,6 +162,20 @@ pub struct ToolCall {
     pub done: bool,
 }
 
+/// `/config` 表单卡的一个字段（P9-2：平台无关描述，飞书侧渲染成 CardKit
+/// `select_static` 下拉；不支持表单的平台走 trait 默认的文本降级）。
+#[derive(Debug, Clone)]
+pub struct ConfigFormField {
+    /// 配置键（提交时合成 `/config form k=v …`）。
+    pub key: String,
+    /// 展示名（如「回复形态」）。
+    pub label: String,
+    /// 当前值（下拉 initial_option）。
+    pub current: String,
+    /// 可选项：(value, 展示文案)。
+    pub options: Vec<(String, String)>,
+}
+
 /// 流式卡片的执行阶段（P8-1：分状态 footer——思考中/调用工具/输出中，
 /// 由 CardSession 按最近一次 chunk 类型翻转，平台渲染成各自 footer 文案）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

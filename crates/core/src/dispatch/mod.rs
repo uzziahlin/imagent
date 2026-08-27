@@ -33,8 +33,8 @@ use crate::metrics::METRICS;
 use crate::permission::{parse_reply, PermissionReply, PermissionRouter};
 use crate::platform::Platform;
 use crate::types::{
-    AgentChunk, CardButton, CardButtonStyle, CardTerminal, ConvId, InboundMessage, MediaRef,
-    ReplyHint, SessionId, ToolCall,
+    AgentChunk, CardButton, CardButtonStyle, CardTerminal, ConfigFormField, ConvId, InboundMessage,
+    MediaRef, ReplyHint, SessionId, ToolCall,
 };
 use imagent_store::{NamedSessionRow, SessionRow, Store};
 use parking_lot::RwLock;
