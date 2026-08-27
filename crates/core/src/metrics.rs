@@ -133,7 +133,10 @@ mod tests {
             .token_usage
             .with_label_values(&["claude-cli", "input"])
             .inc();
-        METRICS.cost_usd.with_label_values(&["claude-cli"]).inc_by(0.5);
+        METRICS
+            .cost_usd
+            .with_label_values(&["claude-cli"])
+            .inc_by(0.5);
         let out = render();
         assert!(
             out.contains("imagent_messages_in_total"),

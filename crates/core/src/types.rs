@@ -154,7 +154,10 @@ impl UsageStats {
     pub fn display(&self) -> String {
         match self.total_cost_usd {
             Some(c) => format!("${c:.4}"),
-            None => format!("in {} / out {} tokens", self.input_tokens, self.output_tokens),
+            None => format!(
+                "in {} / out {} tokens",
+                self.input_tokens, self.output_tokens
+            ),
         }
     }
 }

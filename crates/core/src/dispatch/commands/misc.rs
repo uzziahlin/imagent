@@ -487,7 +487,6 @@ impl Dispatcher {
         }
     }
 
-
     /// /stats [today|7d|all] —— token 用量/成本统计（默认 7d）。全局 + 本会话
     /// 两组维度；无成本数据的 backend（codex/gemini）按 tokens 汇总展示。
     pub(super) async fn cmd_stats(&self, conv: &ConvId, hint: &ReplyHint, parts: &[&str]) {
@@ -509,12 +508,14 @@ impl Dispatcher {
         let rows = match self.store.list_run_stats_since(since).await {
             Ok(r) => r,
             Err(e) => {
-                self.reply(conv, &format!("读取用量统计失败：{e}"), hint).await;
+                self.reply(conv, &format!("读取用量统计失败：{e}"), hint)
+                    .await;
                 return;
             }
         };
         if rows.is_empty() {
-            self.reply(conv, &format!("📈 {label}暂无运行记录。"), hint).await;
+            self.reply(conv, &format!("📈 {label}暂无运行记录。"), hint)
+                .await;
             return;
         }
         // 聚合：全局与本会话两组（tokens 求和；cost 仅累加有值的行——无成本
@@ -527,7 +528,8 @@ impl Dispatcher {
             (runs, input, output, cost)
         };
         let (g_runs, g_in, g_out, g_cost) = agg(&rows);
-        let mine: Vec<imagent_store::RunStatRow> = rows.into_iter().filter(|r| r.conv_id == conv.0).collect();
+        let mine: Vec<imagent_store::RunStatRow> =
+            rows.into_iter().filter(|r| r.conv_id == conv.0).collect();
         let (m_runs, m_in, m_out, m_cost) = agg(&mine);
         let cost_line = |c: f64| {
             if c > 0.0 {
@@ -546,7 +548,13 @@ impl Dispatcher {
 
     /// /audit [n] —— 审计日志（admin 门槛同 /config 等管理命令；默认最近 10 条，
     /// 上限 50）。格式：时间 · 动作 · 操作者 · 摘要。
-    pub(super) async fn cmd_audit(&self, conv: &ConvId, sender: &str, hint: &ReplyHint, parts: &[&str]) {
+    pub(super) async fn cmd_audit(
+        &self,
+        conv: &ConvId,
+        sender: &str,
+        hint: &ReplyHint,
+        parts: &[&str],
+    ) {
         // admin 门槛：与 /allow、/config 等管理命令一致。
         if !self.is_admin(sender) {
             let msg = if self.admin_senders.read().is_empty() {
@@ -566,7 +574,8 @@ impl Dispatcher {
             match arg.parse() {
                 Ok(n) if (1..=50).contains(&n) => n,
                 _ => {
-                    self.reply(conv, "用法：/audit [条数]（1-50，默认 10）", hint).await;
+                    self.reply(conv, "用法：/audit [条数]（1-50，默认 10）", hint)
+                        .await;
                     return;
                 }
             }
@@ -574,7 +583,8 @@ impl Dispatcher {
         let rows = match self.store.list_audit(n).await {
             Ok(r) => r,
             Err(e) => {
-                self.reply(conv, &format!("读取审计日志失败：{e}"), hint).await;
+                self.reply(conv, &format!("读取审计日志失败：{e}"), hint)
+                    .await;
                 return;
             }
         };
@@ -599,10 +609,20 @@ impl Dispatcher {
                 } else {
                     format!("（{}）", truncate_str(&detail, 60))
                 };
-                format!("- {} · {} · {}{}", format_rel_ts(r.ts), r.action, actor, detail)
+                format!(
+                    "- {} · {} · {}{}",
+                    format_rel_ts(r.ts),
+                    r.action,
+                    actor,
+                    detail
+                )
             })
             .collect();
-        let text = format!("📋 审计日志（最近 {} 条）：\n{}", lines.len(), lines.join("\n"));
+        let text = format!(
+            "📋 审计日志（最近 {} 条）：\n{}",
+            lines.len(),
+            lines.join("\n")
+        );
         self.reply(conv, &text, hint).await;
     }
 

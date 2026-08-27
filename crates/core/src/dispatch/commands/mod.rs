@@ -11,10 +11,16 @@ use super::*;
 
 /// S-12：全部支持的斜杠命令，按 /help 分组同构（未知命令提示竖排分组展示）。
 pub(super) const COMMAND_GROUPS: &[(&str, &[&str])] = &[
-    ("🗂 会话", &["/new", "/switch", "/sessions", "/resume", "/compact"]),
+    (
+        "🗂 会话",
+        &["/new", "/switch", "/sessions", "/resume", "/compact"],
+    ),
     ("📁 目录与文件", &["/cd", "/ws", "/img", "/file"]),
     ("🛡️ 权限与运行", &["/perm", "/stop", "/timeout"]),
-    ("🧪 状态与诊断", &["/status", "/stats", "/doctor", "/reconnect", "/config"]),
+    (
+        "🧪 状态与诊断",
+        &["/status", "/stats", "/doctor", "/reconnect", "/config"],
+    ),
     (
         "👥 白名单与管理",
         &["/allow", "/disallow", "/chat", "/admin", "/list", "/whoami"],

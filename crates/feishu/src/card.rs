@@ -361,7 +361,11 @@ pub fn stub_body(tool_count: usize, err: Option<&str>) -> String {
     }
     out.push_str(&format!(
         "\n\n⬇️ {}见下方消息",
-        if err.is_none() { "完整结果" } else { "详情" }
+        if err.is_none() {
+            "完整结果"
+        } else {
+            "详情"
+        }
     ));
     out
 }
@@ -440,9 +444,7 @@ fn perm_detail_md(tool_name: &str, input_summary: &str) -> String {
 /// [`ASK_AUTO_DENY_MINS`]，即 core `permission_ask_timeout_secs` 缺省值）——
 /// 静态「长时间未处理」让用户无从判断还剩多久。
 pub(crate) fn perm_note_default() -> String {
-    format!(
-        "⏱️ 将在 {ASK_AUTO_DENY_MINS} 分钟后自动拒绝 · 回复 always = 本次会话内此工具不再询问"
-    )
+    format!("⏱️ 将在 {ASK_AUTO_DENY_MINS} 分钟后自动拒绝 · 回复 always = 本次会话内此工具不再询问")
 }
 
 pub fn render_permission_card(
@@ -451,7 +453,13 @@ pub fn render_permission_card(
     conv_id: &str,
     request_id: &str,
 ) -> String {
-    render_permission_card_note(tool_name, input_summary, conv_id, request_id, &perm_note_default())
+    render_permission_card_note(
+        tool_name,
+        input_summary,
+        conv_id,
+        request_id,
+        &perm_note_default(),
+    )
 }
 
 /// P10-③：note 行可参数化（排队联动重渲染用，见 platform 的 note_queued_on_ask）。
@@ -590,7 +598,11 @@ pub(crate) fn render_question_card_note(
                 "options": options
             })
         };
-        let submit_tip = if multi { "勾选后点「提交」，一次回传全部选择" } else { "下拉选择后点「提交」" };
+        let submit_tip = if multi {
+            "勾选后点「提交」，一次回传全部选择"
+        } else {
+            "下拉选择后点「提交」"
+        };
         vec![
             serde_json::json!({ "tag": "markdown", "content": mask_emails(&content) }),
             serde_json::json!({ "tag": "markdown", "content": note, "text_size": "notation" }),
@@ -846,8 +858,8 @@ mod tests {
                 phase,
                 queued_hint: None,
                 terminal: CardTerminal::Running,
-            usage_display: None,
-            run_secs: 0,
+                usage_display: None,
+                run_secs: 0,
             };
             assert!(
                 render_card(&card, "feishu:ou_t").contains(mark),
@@ -1122,7 +1134,11 @@ mod tests {
             "🧰 正在调用工具…"
         );
         assert_eq!(
-            running_footer(CardPhase::ToolRunning, Some("📥 排队 2 条，最新：「快一点」"), 30),
+            running_footer(
+                CardPhase::ToolRunning,
+                Some("📥 排队 2 条，最新：「快一点」"),
+                30
+            ),
             "🧰 正在调用工具… · 30s · 📥 排队 2 条，最新：「快一点」"
         );
         // 时长 0（刚起步）不带秒数，防「0s」噪音。
@@ -1158,14 +1174,20 @@ mod tests {
             json.contains("⏳ 等待你审批 · 后面还排着 3 条消息"),
             "note 替换: {json}"
         );
-        assert!(!json.contains("分钟后自动拒绝"), "默认 note 不再出现: {json}");
+        assert!(
+            !json.contains("分钟后自动拒绝"),
+            "默认 note 不再出现: {json}"
+        );
         assert!(
             json.contains("\"imagent_perm\":\"allow\"") && json.contains("\"req\":\"req9\""),
             "按钮 value 编码不变: {json}"
         );
         // 缺省包装函数仍用默认 note（含具体分钟数值）。
         let plain = render_permission_card("Bash", r#"{"command":"ls"}"#, "c", "r");
-        assert!(plain.contains("将在 5 分钟后自动拒绝"), "默认倒计时: {plain}");
+        assert!(
+            plain.contains("将在 5 分钟后自动拒绝"),
+            "默认倒计时: {plain}"
+        );
     }
 
     /// P9-1：流式卡终止按钮——init 卡与降级 Running 卡都带 ⏹ 终止（danger，
@@ -1283,8 +1305,14 @@ mod tests {
             "✅ 任务完成\n\n🔧 工具 3 次\n\n⬇️ 完整结果见下方消息"
         );
         assert_eq!(stub_body(0, None), "✅ 任务完成\n\n⬇️ 完整结果见下方消息");
-        assert_eq!(stub_body(0, Some("boom")), "❌ 执行出错\n\n⬇️ 详情见下方消息");
-        assert_eq!(stub_body(0, Some("已中断")), "⏹ 已中断\n\n⬇️ 详情见下方消息");
+        assert_eq!(
+            stub_body(0, Some("boom")),
+            "❌ 执行出错\n\n⬇️ 详情见下方消息"
+        );
+        assert_eq!(
+            stub_body(0, Some("已中断")),
+            "⏹ 已中断\n\n⬇️ 详情见下方消息"
+        );
         let card = OutboundCard {
             text: "结论".into(),
             tool_calls: vec![tool("Bash", "ls", true)],
@@ -1367,10 +1395,7 @@ mod tests {
             "req1",
         );
         assert!(json.contains("[at]"), "掩码仍生效（审计强制）: {json}");
-        assert!(
-            json.contains("邮箱已掩码显示"),
-            "掩码提示: {json}"
-        );
+        assert!(json.contains("邮箱已掩码显示"), "掩码提示: {json}");
         assert!(
             json.contains("原命令可直接执行"),
             "告知原命令语义不变: {json}"
@@ -1412,16 +1437,16 @@ mod tests {
         );
         assert!(!json.contains("回复 `ask:选项`"), "不再要求手打: {json}");
         // 全部选项都在下拉里（无「其余选项」截断）。
-        assert!(json.contains("方案1") && json.contains("方案6"), "全选项: {json}");
+        assert!(
+            json.contains("方案1") && json.contains("方案6"),
+            "全选项: {json}"
+        );
         // 多选：checkbox 表单。
-        let multi = render_question_card(&mk_input(true), "feishu:ou_q", "reqM")
-            .expect("多选应渲染");
+        let multi =
+            render_question_card(&mk_input(true), "feishu:ou_q", "reqM").expect("多选应渲染");
         assert!(multi.contains("\"tag\":\"checkbox\""), "checkbox: {multi}");
         assert!(!multi.contains("select_static"), "多选不用下拉: {multi}");
-        assert!(
-            multi.contains("一次回传全部选择"),
-            "多选提交提示: {multi}"
-        );
+        assert!(multi.contains("一次回传全部选择"), "多选提交提示: {multi}");
         // ≤4 选项单选仍是按钮形态（最快路径）。
         let few = serde_json::json!({
             "questions": [{

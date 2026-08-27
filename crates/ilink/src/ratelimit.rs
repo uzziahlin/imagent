@@ -104,9 +104,7 @@ impl RateBreaker {
 
 /// [`RateBreaker::cooldown_remaining`] 的纯函数核心（测试复用）。
 fn breaker_remaining(st: &BreakerState, now: Instant) -> Duration {
-    st.open_until
-        .unwrap_or(now)
-        .saturating_duration_since(now)
+    st.open_until.unwrap_or(now).saturating_duration_since(now)
 }
 
 #[cfg(test)]

@@ -1084,7 +1084,8 @@ mod tests {
                     "Ask 无 hook 必须 fail-closed 选 reject"
                 )
             }
-            RequestPermissionOutcome::Cancelled => { /* 无 reject 时 cancel 也算 fail-closed */ }
+            RequestPermissionOutcome::Cancelled => { /* 无 reject 时 cancel 也算 fail-closed */
+            }
             _ => panic!("Ask 应 fail-closed：Selected(reject) 或 Cancelled"),
         }
     }
@@ -1226,7 +1227,11 @@ mod tests {
     fn backend_with_mocks(a: Channel, b: Channel) -> AcpBackend {
         let which = std::sync::Mutex::new(std::collections::VecDeque::from(vec![a, b]));
         AcpBackend::new().with_mock_factory(Arc::new(move || {
-            which.lock().unwrap().pop_front().expect("mock 通道按 conv 建连顺序注入")
+            which
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("mock 通道按 conv 建连顺序注入")
         }))
     }
 
@@ -1293,7 +1298,7 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(300)).await;
         run_a.abort(); // 等 A 进入 prompt 后 cancel
-        // 等 A 的连接自摘除（cancel → break → task 退出 → map 自摘除）。
+                       // 等 A 的连接自摘除（cancel → break → task 退出 → map 自摘除）。
         for _ in 0..200 {
             if !backend_for_a.conns.lock().await.contains_key("conv-a") {
                 break;
@@ -1346,7 +1351,10 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("超限的新 conv 应被拒绝"),
         };
-        assert!(err.to_string().contains("上限"), "错误应说明并发上限: {err}");
+        assert!(
+            err.to_string().contains("上限"),
+            "错误应说明并发上限: {err}"
+        );
         assert!(
             backend.long_lived("conv-0").await.is_ok(),
             "已有 conv 应复用连接"
@@ -1383,10 +1391,9 @@ mod tests {
                 .await;
         });
         let chan = std::sync::Mutex::new(std::collections::VecDeque::from(vec![client_side]));
-        let backend =
-            AcpBackend::new().with_mock_factory(Arc::new(move || {
-                chan.lock().unwrap().pop_front().expect("mock 通道")
-            }));
+        let backend = AcpBackend::new().with_mock_factory(Arc::new(move || {
+            chan.lock().unwrap().pop_front().expect("mock 通道")
+        }));
         let workdir = std::env::temp_dir();
         let (tx, _rx) = tokio::sync::mpsc::channel::<AgentChunk>(64);
 

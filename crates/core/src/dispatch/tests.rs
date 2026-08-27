@@ -2728,7 +2728,8 @@ async fn permission_socket_token_handshake() {
     // 不重复建 accept task（第二个 socket 路径不会被 bind，token 不变）。
     let sock2 = dir.join("permission2.sock");
     assert!(
-        ctx.disp.spawn_socket_accept(sock2.to_string_lossy().into_owned()),
+        ctx.disp
+            .spawn_socket_accept(sock2.to_string_lossy().into_owned()),
         "重复 spawn 应幂等返回 true"
     );
     assert!(!sock2.exists(), "幂等：不应 bind 第二个 socket 文件");
@@ -2962,7 +2963,10 @@ async fn reload_permission_mode_rejects_non_fullloop() {
         "拒绝时模式句柄不得被写入"
     );
     // 非闭环档不受影响。
-    assert!(ctx.disp.reload_permission_mode(PermissionMode::Deny).is_ok());
+    assert!(ctx
+        .disp
+        .reload_permission_mode(PermissionMode::Deny)
+        .is_ok());
     drop_db(ctx.db).await;
 }
 
@@ -2973,10 +2977,7 @@ async fn reload_permission_mode_rejects_non_fullloop() {
 async fn run_fails_closed_when_socket_bind_fails() {
     let _serial = SERIAL.lock().await;
     // 隔离 IMAGENT_HOME（先设 env 再取路径），并在 socket 路径上放一个目录使 bind 必败。
-    let home = std::env::temp_dir().join(format!(
-        "imagent_core_sockfail_{}",
-        std::process::id()
-    ));
+    let home = std::env::temp_dir().join(format!("imagent_core_sockfail_{}", std::process::id()));
     std::fs::create_dir_all(&home).unwrap();
     std::env::set_var(crate::paths::IMAGENT_HOME_ENV, &home);
     let sock = crate::permission::default_sock_path().unwrap();
@@ -3021,8 +3022,14 @@ async fn discovery_guide_without_admins_omits_allow_command() {
     feed_and_wait(&ctx, vec![msg("c3", "anyone", "hi")], 0).await;
     let inbox = ctx.inbox.lock().await.clone();
     assert_eq!(inbox.len(), 1, "应回一条引导: {inbox:?}");
-    assert!(inbox[0].contains("imagent allow"), "保留 CLI 指引: {inbox:?}");
-    assert!(!inbox[0].contains("/allow"), "空 admin 下不得提示 /allow: {inbox:?}");
+    assert!(
+        inbox[0].contains("imagent allow"),
+        "保留 CLI 指引: {inbox:?}"
+    );
+    assert!(
+        !inbox[0].contains("/allow"),
+        "空 admin 下不得提示 /allow: {inbox:?}"
+    );
     drop_db(ctx.db).await;
 }
 
@@ -3064,11 +3071,15 @@ async fn switch_without_name_lists_sessions() {
     ctx.disp.handle(msg("c1", "alice", "/switch")).await;
     let inbox = ctx.inbox.lock().await.clone();
     assert!(
-        inbox.iter().any(|t| t.contains("用法") && t.contains("/switch <name>")),
+        inbox
+            .iter()
+            .any(|t| t.contains("用法") && t.contains("/switch <name>")),
         "应有用法提示: {inbox:?}"
     );
     assert!(
-        inbox.iter().any(|t| t.contains("命名会话") && t.contains("work")),
+        inbox
+            .iter()
+            .any(|t| t.contains("命名会话") && t.contains("work")),
         "应列出命名会话 work: {inbox:?}"
     );
     drop_db(ctx.db).await;

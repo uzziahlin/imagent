@@ -11,7 +11,10 @@ impl Dispatcher {
     /// task 是否已就绪。
     #[cfg(unix)]
     pub(super) fn spawn_socket_accept(&self, sock: String) -> bool {
-        if self.socket_spawned.load(std::sync::atomic::Ordering::Acquire) {
+        if self
+            .socket_spawned
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             return true; // 已在运行（R-2：accept task 监听 shutdown，进程内只 spawn 一次）
         }
         // 清理可能残留的旧 socket 文件。
@@ -364,7 +367,11 @@ impl Dispatcher {
                 "notify_via_im 通知已送达"
             );
         }
-        let err = if ok { None } else { Some("send failed: IM 不可达") };
+        let err = if ok {
+            None
+        } else {
+            Some("send failed: IM 不可达")
+        };
         Self::write_notify_reply(&mut stream, ok, err).await;
     }
 
@@ -612,7 +619,9 @@ impl Dispatcher {
                 PermissionReply {
                     allow: true,
                     always: false,
-                    message: Some("auto-allowed: tool in session allow-set（本会话已始终允许）".into()),
+                    message: Some(
+                        "auto-allowed: tool in session allow-set（本会话已始终允许）".into(),
+                    ),
                     raw_text: None,
                 },
             )
@@ -740,9 +749,7 @@ pub(crate) fn classify_socket_kind(kind: &str) -> SocketKind {
 
 /// notify 请求解析（纯函数，便于单测）：`message` 必填非空，`source` 可选。
 /// 返回 `None` = message 缺失/为空（调用方按协议回 error）。
-pub(crate) fn parse_notify_request(
-    req: &serde_json::Value,
-) -> Option<(String, Option<String>)> {
+pub(crate) fn parse_notify_request(req: &serde_json::Value) -> Option<(String, Option<String>)> {
     let message = req
         .get("message")
         .and_then(|v| v.as_str())

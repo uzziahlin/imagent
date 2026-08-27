@@ -514,7 +514,8 @@ impl Dispatcher {
     ) -> std::result::Result<(), crate::error::CoreError> {
         // 校验先于写句柄：拒绝热切时保持既有模式不变。
         if mode.needs_socket()
-            && self.backend.permission_capability() != crate::backend::PermissionCapability::FullLoop
+            && self.backend.permission_capability()
+                != crate::backend::PermissionCapability::FullLoop
         {
             error!(
                 target: "imagent::core",
@@ -698,8 +699,7 @@ impl Dispatcher {
                     Err(_) => {
                         router.cancel(&ask.conv_id, &ask.request_id).await;
                         // 超时自动拒绝后收敛滞留询问卡（best-effort）。
-                        if let Err(e) =
-                            platform.cancel_permission_ask(&conv, &ask.request_id).await
+                        if let Err(e) = platform.cancel_permission_ask(&conv, &ask.request_id).await
                         {
                             warn!(target: "imagent::core", error = %e, "超时询问卡收敛失败（不影响 deny）");
                         }

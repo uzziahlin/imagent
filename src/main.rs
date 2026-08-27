@@ -1351,9 +1351,18 @@ mod metrics_auth_tests {
         assert!(bearer_authorized(&ok, Some("s3cret")));
         // 无头 / 错 token / 非 Bearer scheme / 多余前缀 → 拒。
         assert!(!bearer_authorized(&headers_with(None), Some("s3cret")));
-        assert!(!bearer_authorized(&headers_with(Some("Bearer wrong")), Some("s3cret")));
-        assert!(!bearer_authorized(&headers_with(Some("Basic s3cret")), Some("s3cret")));
-        assert!(!bearer_authorized(&headers_with(Some("Bearer  s3cret")), Some("s3cret")));
+        assert!(!bearer_authorized(
+            &headers_with(Some("Bearer wrong")),
+            Some("s3cret")
+        ));
+        assert!(!bearer_authorized(
+            &headers_with(Some("Basic s3cret")),
+            Some("s3cret")
+        ));
+        assert!(!bearer_authorized(
+            &headers_with(Some("Bearer  s3cret")),
+            Some("s3cret")
+        ));
     }
 
     /// S7 fail-closed：非 loopback 且未配 token 拒绝；loopback 或已配 token 放行。
