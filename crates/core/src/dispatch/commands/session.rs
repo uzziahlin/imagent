@@ -53,32 +53,34 @@ impl Dispatcher {
             }
             let current = self.store.get_session(&conv.0).await.ok().flatten();
             let wd = self.resolve_workdir(&conv.0).await;
-            let lines: Vec<String> = list
-                .iter()
-                .enumerate()
-                .map(|(i, e)| {
-                    let mark = if current
-                        .as_ref()
-                        .is_some_and(|c| c.session_id == e.session_id)
-                    {
-                        " *（当前）"
-                    } else {
-                        ""
-                    };
-                    // 摘要缺省回退 id 前缀（历史行无首条消息）。
-                    let desc = if e.first_prompt.is_empty() {
-                        format!("{}…", &e.session_id[..e.session_id.len().min(16)])
-                    } else {
-                        e.first_prompt.clone()
-                    };
-                    let src = if e.from_local { "💻" } else { "📱" };
-                    format!(
-                        "{}. {src} {} {desc}{mark}",
-                        i + 1,
-                        format_rel_ts(e.updated_at)
-                    )
-                })
-                .collect();
+            // CardKit 视觉改版：/resume 列表改 markdown 表格（| # | 来源 | 时间 | 内容 |）；
+            // 飞书卡渲染层按行配对双列 + 来源 tag 胶囊，纯文本降级保留表格文本
+            // （列语义仍可读）。单元格内的 `|` 转义防破表。
+            let mut table = String::from("| # | 来源 | 时间 | 内容 |\n|---|---|---|---|\n");
+            for (i, e) in list.iter().enumerate() {
+                let mark = if current
+                    .as_ref()
+                    .is_some_and(|c| c.session_id == e.session_id)
+                {
+                    " *（当前）*"
+                } else {
+                    ""
+                };
+                // 摘要缺省回退 id 前缀（历史行无首条消息）。
+                let desc = if e.first_prompt.is_empty() {
+                    format!("{}…", &e.session_id[..e.session_id.len().min(16)])
+                } else {
+                    e.first_prompt.clone()
+                };
+                let desc = desc.replace('|', "\\|");
+                let src = if e.from_local { "💻" } else { "📱" };
+                table.push_str(&format!(
+                    "| {} | {src} | {} | {desc}{mark} |\n",
+                    i + 1,
+                    format_rel_ts(e.updated_at)
+                ));
+            }
+            let n_rows = list.len();
             // 缓存本列表：序号选择取缓存（防两次调用间本机会话
             // mtime 变化导致序号错位）。D7：key 按 (conv, sender) 隔离 + 带时间戳。
             self.resume_cache
@@ -87,14 +89,11 @@ impl Dispatcher {
                 .insert((conv.0.clone(), sender.0.clone()), (Instant::now(), list));
             // P6-3：前 9 条各带「接管」按钮（点击 = /resume <n>；卡片按钮数克制，
             // 长列表仍以文本序号为准）。
-            let buttons: Vec<CardButton> = lines
-                .iter()
-                .take(9)
-                .enumerate()
-                .map(|(i, _)| CardButton {
-                    label: format!("接管 {}", i + 1),
-                    command: format!("/resume {}", i + 1),
-                    style: if i == 0 {
+            let buttons: Vec<CardButton> = (1..=n_rows.min(9))
+                .map(|i| CardButton {
+                    label: format!("接管 {i}"),
+                    command: format!("/resume {i}"),
+                    style: if i == 1 {
                         CardButtonStyle::Primary
                     } else {
                         CardButtonStyle::Default
@@ -104,7 +103,7 @@ impl Dispatcher {
             self.reply_card(
                 conv,
                 &format!("⏪ 可恢复会话（当前目录 {}；💻=本机 📱=IM）", wd.display()),
-                &lines.join("\n"),
+                &table,
                 buttons,
                 hint,
             )

@@ -170,13 +170,13 @@ impl Dispatcher {
             "" | "list" => match self.store.list_config("workspace:").await {
                 Ok(rows) if rows.is_empty() => self.reply(conv, "（暂无命名工作空间）", hint).await,
                 Ok(rows) => {
-                    let body = rows
-                        .iter()
-                        .map(|(k, v)| {
-                            format!("- {}：{v}", k.strip_prefix("workspace:").unwrap_or(k))
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                    // CardKit 视觉改版：/ws 列表改 markdown 表格（| 名称 | 路径 |）；
+                    // 飞书卡渲染层按名称配对「使用/删除」双列按钮。
+                    let mut table = String::from("| 名称 | 路径 |\n|---|---|\n");
+                    for (k, v) in &rows {
+                        let name = k.strip_prefix("workspace:").unwrap_or(k);
+                        table.push_str(&format!("| {} | {} |\n", name, v.replace('|', "\\|")));
+                    }
                     // P6-3：每个空间一个「使用」按钮（点击 = /ws use <name>）。
                     // P9-1：每个空间「使用」（primary）+「删除」（danger）两钮，
                     // 对标 lcab workspacesCard 的 切换/删除。
@@ -198,7 +198,7 @@ impl Dispatcher {
                             ]
                         })
                         .collect();
-                    self.reply_card(conv, "📁 命名工作空间", &body, buttons, hint)
+                    self.reply_card(conv, "📁 命名工作空间", &table, buttons, hint)
                         .await
                 }
                 Err(e) => self.reply(conv, &format!("列出失败：{e}"), hint).await,
@@ -543,7 +543,25 @@ impl Dispatcher {
             cost_line(g_cost),
             cost_line(m_cost),
         );
-        self.reply(conv, &text, hint).await;
+        // CardKit 视觉改版：卡片平台回命令卡（markdown 表格）；纯文本平台保持
+        // 现有列表文本（表格只发生在卡渲染层）。
+        if self.platform.supports_streaming_card(conv) {
+            let table = format!(
+                "| 维度 | 轮数 | 输入 tokens | 输出 tokens | 成本 |\n|---|---|---|---|---|\n| 🌍 全局 | {g_runs} | {g_in} | {g_out} | {} |\n| 💬 本会话 | {m_runs} | {m_in} | {m_out} | {} |\n\n- 用法：/stats [today|7d|all]",
+                cost_line(g_cost),
+                cost_line(m_cost),
+            );
+            self.reply_card(
+                conv,
+                &format!("📈 用量统计（{label}）"),
+                &table,
+                vec![],
+                hint,
+            )
+            .await;
+        } else {
+            self.reply(conv, &text, hint).await;
+        }
     }
 
     /// /audit [n] —— 审计日志（admin 门槛同 /config 等管理命令；默认最近 10 条，
@@ -623,7 +641,32 @@ impl Dispatcher {
             lines.len(),
             lines.join("\n")
         );
-        self.reply(conv, &text, hint).await;
+        // CardKit 视觉改版：卡片平台回命令卡（markdown 表格）；纯文本平台保持
+        // 现有列表文本。
+        if self.platform.supports_streaming_card(conv) {
+            let mut table = String::from("| 时间 | 动作 | 操作者 | 摘要 |\n|---|---|---|---|\n");
+            for r in &rows {
+                let actor = r.actor.as_deref().unwrap_or("-");
+                let mut detail = r.target.clone().unwrap_or_default();
+                if let Some(d) = &r.detail {
+                    if !detail.is_empty() {
+                        detail.push(' ');
+                    }
+                    detail.push_str(d);
+                }
+                table.push_str(&format!(
+                    "| {} | {} | {} | {} |\n",
+                    format_rel_ts(r.ts),
+                    r.action.replace('|', "\\|"),
+                    actor.replace('|', "\\|"),
+                    truncate_str(&detail, 60).replace('|', "\\|")
+                ));
+            }
+            self.reply_card(conv, "📋 审计日志", &table, vec![], hint)
+                .await;
+        } else {
+            self.reply(conv, &text, hint).await;
+        }
     }
 
     /// /help —— 命令总表（P6-3：飞书等卡片平台带常用命令按钮）。
