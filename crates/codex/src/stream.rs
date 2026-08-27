@@ -233,7 +233,9 @@ mod tests {
     #[test]
     fn turn_completed() {
         assert_eq!(
-            parse_line(r#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2,"cached_input_tokens":7}}"#),
+            parse_line(
+                r#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2,"cached_input_tokens":7}}"#
+            ),
             ParsedEvent::TurnCompleted {
                 usage: Some(UsageStats {
                     input_tokens: 1,

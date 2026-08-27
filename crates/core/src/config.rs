@@ -430,7 +430,8 @@ impl Config {
         }
         // D8：审批等待预算必须小于 agent 总预算——慢审批不再挤占执行时间的前提；
         // 违反（≥）直接拒绝启动（此前仅注释建议，运行期才以超时形式暴露）。
-        if cfg.agent_timeout_secs != 0 && cfg.permission_ask_timeout_secs >= cfg.agent_timeout_secs {
+        if cfg.agent_timeout_secs != 0 && cfg.permission_ask_timeout_secs >= cfg.agent_timeout_secs
+        {
             return Err(CoreError::Config(format!(
                 "permission_ask_timeout_secs（{}）必须小于 agent_timeout_secs（{}）：\
                  审批等待有独立预算，≥ 总预算会让慢审批撑满 agent 超时",

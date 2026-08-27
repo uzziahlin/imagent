@@ -192,7 +192,10 @@ mod tests {
     fn wrong_passphrase_fails() {
         let enc = encrypt("right", "blob", "p:a").unwrap();
         let err = decrypt("wrong", &enc, "p:a").unwrap_err();
-        assert!(err.contains("IMAGENT_PASSPHRASE"), "错误应提示 passphrase: {err}");
+        assert!(
+            err.contains("IMAGENT_PASSPHRASE"),
+            "错误应提示 passphrase: {err}"
+        );
     }
 
     /// AAD 绑定：同一密文用不同归属（platform:account）解密必须失败。
@@ -200,7 +203,10 @@ mod tests {
     fn aad_mismatch_fails() {
         let enc = encrypt("p", "secret-blob", "ilink:bot1").unwrap();
         let err = decrypt("p", &enc, "ilink:bot2").unwrap_err();
-        assert!(err.contains("不匹配") || err.contains("IMAGENT_PASSPHRASE"), "{err}");
+        assert!(
+            err.contains("不匹配") || err.contains("IMAGENT_PASSPHRASE"),
+            "{err}"
+        );
         // 正确归属仍可解。
         assert_eq!(decrypt("p", &enc, "ilink:bot1").unwrap(), "secret-blob");
     }

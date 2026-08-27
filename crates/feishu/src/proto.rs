@@ -343,9 +343,11 @@ pub fn parse_card_action_event(payload: &[u8]) -> Option<(String, InboundMessage
     // P3：缺 event_id 的回退 key 用 content_hash 对完整内容取哈希——与消息/
     // 评论回退同语义（S4 口径）。此前用 text 前 40 字符：>40 字符的不同文本
     // 前缀相同会被互相去重（按钮回调/长命令文本可超 40 字符）。
-    let key = evt.header.event_id.clone().unwrap_or_else(|| {
-        format!("card_action:{open_id}:{conv}:{:x}", content_hash(&text))
-    });
+    let key = evt
+        .header
+        .event_id
+        .clone()
+        .unwrap_or_else(|| format!("card_action:{open_id}:{conv}:{:x}", content_hash(&text)));
     Some((
         key,
         InboundMessage {

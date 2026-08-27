@@ -408,13 +408,10 @@ impl PermissionRouter {
             }
         }
         // send 失败说明 receiver 已 drop（register 方未在等），视为未命中。
-        hit.tx
-            .send(reply)
-            .ok()
-            .map(|_| RoutedDecision {
-                request_id: hit.request_id,
-                tool_name: hit.tool_name,
-            })
+        hit.tx.send(reply).ok().map(|_| RoutedDecision {
+            request_id: hit.request_id,
+            tool_name: hit.tool_name,
+        })
     }
 
     /// 清理单个 pending（超时 / router-drop 路径）：投递 deny（fail-closed）唤醒
@@ -507,8 +504,12 @@ mod tests {
     #[tokio::test]
     async fn multi_pending_routes_by_request_id() {
         let r = PermissionRouter::new();
-        let rx_im = r.register("c", "im-1", None, PendingKind::Permission, None).await;
-        let rx_term = r.register("c", "t-1", None, PendingKind::Permission, None).await;
+        let rx_im = r
+            .register("c", "im-1", None, PendingKind::Permission, None)
+            .await;
+        let rx_term = r
+            .register("c", "t-1", None, PendingKind::Permission, None)
+            .await;
         // 按钮/回调带 req=t-1 → 只唤醒终端一路。
         let hit = r
             .route(
@@ -584,7 +585,11 @@ mod tests {
                 },
             )
             .await;
-        assert_eq!(hit.as_ref().map(|d| d.request_id.as_str()), Some("im-1"), "引用旧卡应路由 im-1 而非最新");
+        assert_eq!(
+            hit.as_ref().map(|d| d.request_id.as_str()),
+            Some("im-1"),
+            "引用旧卡应路由 im-1 而非最新"
+        );
         assert!(r.has_pending("c").await, "t-1 不应被消费");
     }
 
@@ -592,8 +597,12 @@ mod tests {
     #[tokio::test]
     async fn reregister_same_request_id_supersedes() {
         let r = PermissionRouter::new();
-        let rx_old = r.register("c", "req1", None, PendingKind::Permission, None).await;
-        let _rx_new = r.register("c", "req1", None, PendingKind::Permission, None).await;
+        let rx_old = r
+            .register("c", "req1", None, PendingKind::Permission, None)
+            .await;
+        let _rx_new = r
+            .register("c", "req1", None, PendingKind::Permission, None)
+            .await;
         let old = tokio::time::timeout(std::time::Duration::from_secs(1), rx_old)
             .await
             .expect("旧等待者应立即被唤醒")
@@ -608,8 +617,12 @@ mod tests {
     #[tokio::test]
     async fn cancel_all_wakes_every_waiter() {
         let r = PermissionRouter::new();
-        let rx1 = r.register("c", "a", None, PendingKind::Permission, None).await;
-        let rx2 = r.register("c", "b", None, PendingKind::Permission, None).await;
+        let rx1 = r
+            .register("c", "a", None, PendingKind::Permission, None)
+            .await;
+        let rx2 = r
+            .register("c", "b", None, PendingKind::Permission, None)
+            .await;
         let ids = r.cancel_all("c").await;
         assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
         for rx in [rx1, rx2] {
@@ -723,9 +736,18 @@ mod tests {
             .await
             .expect("应命中 p-1");
         assert_eq!(hit.tool_name.as_deref(), Some("Bash"));
-        assert!(r.is_session_allowed("c", "Bash").await, "Bash 应进入 allow-set");
-        assert!(!r.is_session_allowed("c", "Write").await, "其它工具不受影响");
-        assert!(!r.is_session_allowed("other", "Bash").await, "其它 conv 不受影响");
+        assert!(
+            r.is_session_allowed("c", "Bash").await,
+            "Bash 应进入 allow-set"
+        );
+        assert!(
+            !r.is_session_allowed("c", "Write").await,
+            "其它工具不受影响"
+        );
+        assert!(
+            !r.is_session_allowed("other", "Bash").await,
+            "其它 conv 不受影响"
+        );
         // Ask 来源的 always 不落 allow-set（提问无工具语义）。
         let _rx_ask = r
             .register("c", "a-1", None, PendingKind::Ask, Some("Bash"))
@@ -845,7 +867,9 @@ mod tests {
     #[tokio::test]
     async fn pending_kind_distinguishes_permission_and_ask() {
         let r = PermissionRouter::new();
-        let _rx_perm = r.register("c", "p-1", None, PendingKind::Permission, None).await;
+        let _rx_perm = r
+            .register("c", "p-1", None, PendingKind::Permission, None)
+            .await;
         assert!(r.has_pending_of_kind("c", PendingKind::Permission).await);
         assert!(!r.has_pending_of_kind("c", PendingKind::Ask).await);
         let _rx_ask = r.register("c", "a-1", None, PendingKind::Ask, None).await;
@@ -862,7 +886,9 @@ mod tests {
     #[tokio::test]
     async fn set_card_msg_id_backfills_placeholder() {
         let r = PermissionRouter::new();
-        let _rx = r.register("c", "req1", None, PendingKind::Permission, None).await;
+        let _rx = r
+            .register("c", "req1", None, PendingKind::Permission, None)
+            .await;
         assert!(
             r.set_card_msg_id("c", "req1", Some("om_1".to_string()))
                 .await
@@ -880,7 +906,11 @@ mod tests {
                 },
             )
             .await;
-        assert_eq!(hit.as_ref().map(|d| d.request_id.as_str()), Some("req1"), "回填后应按卡片锚点路由");
+        assert_eq!(
+            hit.as_ref().map(|d| d.request_id.as_str()),
+            Some("req1"),
+            "回填后应按卡片锚点路由"
+        );
         // 已被消费后再回填 → 不命中（无害）。
         assert!(
             !r.set_card_msg_id("c", "req1", Some("om_2".to_string()))

@@ -176,7 +176,9 @@ impl Store {
         if cfg!(test) {
             return None;
         }
-        std::env::var("IMAGENT_PASSPHRASE").ok().filter(|s| !s.is_empty())
+        std::env::var("IMAGENT_PASSPHRASE")
+            .ok()
+            .filter(|s| !s.is_empty())
     }
 
     // —— credentials ——
@@ -1466,8 +1468,7 @@ fn is_busy(e: &StoreError) -> bool {
         e,
         StoreError::Sqlite(rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error {
-                code:
-                    rusqlite::ffi::ErrorCode::DatabaseBusy
+                code: rusqlite::ffi::ErrorCode::DatabaseBusy
                     | rusqlite::ffi::ErrorCode::DatabaseLocked,
                 ..
             },
@@ -1634,7 +1635,14 @@ mod tests {
         let db = TempDb::new("run_stats").await;
         let store = Store::open(&db.path).await.unwrap();
         store
-            .append_run_stat("feishu:u1", Some("claude-cli"), 100, 50, Some(30), Some(0.012))
+            .append_run_stat(
+                "feishu:u1",
+                Some("claude-cli"),
+                100,
+                50,
+                Some(30),
+                Some(0.012),
+            )
             .await
             .unwrap();
         // 失败轮次：无 usage 也记一行（tokens 0）。
@@ -2697,21 +2705,23 @@ mod tests {
             .unwrap();
         }
         // CAS 生效：旧值匹配 → 更新。
-        assert!(
-            store
-                .try_migrate_credential_blob("ilink", "bot1", plain, "keyring:ilink:bot1")
-                .await
-                .unwrap()
+        assert!(store
+            .try_migrate_credential_blob("ilink", "bot1", plain, "keyring:ilink:bot1")
+            .await
+            .unwrap());
+        assert_eq!(
+            raw_blob(&store, "ilink", "bot1").await,
+            "keyring:ilink:bot1"
         );
-        assert_eq!(raw_blob(&store, "ilink", "bot1").await, "keyring:ilink:bot1");
         // 模拟并发写新凭据后，再用过期旧值迁移 → CAS 失败，不覆盖新值。
-        assert!(
-            !store
-                .try_migrate_credential_blob("ilink", "bot1", plain, "enc:v2:whatever")
-                .await
-                .unwrap()
+        assert!(!store
+            .try_migrate_credential_blob("ilink", "bot1", plain, "enc:v2:whatever")
+            .await
+            .unwrap());
+        assert_eq!(
+            raw_blob(&store, "ilink", "bot1").await,
+            "keyring:ilink:bot1"
         );
-        assert_eq!(raw_blob(&store, "ilink", "bot1").await, "keyring:ilink:bot1");
         // 审计只在 CAS 生效时留痕（一次）。
         let audit = store.list_audit(20).await.unwrap();
         assert_eq!(
@@ -2856,7 +2866,10 @@ mod tests {
             })
             .await
             .unwrap();
-        store.set_config("compact_summary:c1", "旧摘要").await.unwrap();
+        store
+            .set_config("compact_summary:c1", "旧摘要")
+            .await
+            .unwrap();
         let sr = SessionRow {
             conv_id: "c1".into(),
             session_id: "sess-named".into(),
@@ -2878,7 +2891,11 @@ mod tests {
             store.get_config("active_name:c1").await.unwrap().as_deref(),
             Some("refactor")
         );
-        assert!(store.get_config("compact_summary:c1").await.unwrap().is_none());
+        assert!(store
+            .get_config("compact_summary:c1")
+            .await
+            .unwrap()
+            .is_none());
         // session_history 同步（与 upsert_session 同构）。
         let hist = store.list_session_history("c1", 10).await.unwrap();
         assert!(hist.iter().any(|h| h.session_id == "sess-named"));
@@ -2901,7 +2918,10 @@ mod tests {
             })
             .await
             .unwrap();
-        store.set_config("compact_summary:c2", "旧摘要").await.unwrap();
+        store
+            .set_config("compact_summary:c2", "旧摘要")
+            .await
+            .unwrap();
         store
             .switch_named_session("c2", "newtask", None)
             .await
@@ -2911,6 +2931,10 @@ mod tests {
             store.get_config("active_name:c2").await.unwrap().as_deref(),
             Some("newtask")
         );
-        assert!(store.get_config("compact_summary:c2").await.unwrap().is_none());
+        assert!(store
+            .get_config("compact_summary:c2")
+            .await
+            .unwrap()
+            .is_none());
     }
 }

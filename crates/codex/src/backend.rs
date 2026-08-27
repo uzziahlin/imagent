@@ -128,7 +128,10 @@ fn codex_parse(line: &str) -> CliEvent {
         ParsedEvent::TurnCompleted { usage } => {
             // usage 须在 Terminal 之前——读取循环在 Terminal 处 break。
             match usage {
-                Some(u) => CliEvent::Multi(vec![CliEvent::Usage(u), CliEvent::Terminal { session: None }]),
+                Some(u) => CliEvent::Multi(vec![
+                    CliEvent::Usage(u),
+                    CliEvent::Terminal { session: None },
+                ]),
                 None => CliEvent::Terminal { session: None },
             }
         }

@@ -107,7 +107,14 @@ impl Dispatcher {
             // 长任务，防挂死由空闲看门狗（idle_timeout）承担。
             if agent_timeout.is_zero() {
                 return backend
-                    .run(&conv_id_owned, &prompt_owned, existing.as_ref(), &workdir, &tools, tx)
+                    .run(
+                        &conv_id_owned,
+                        &prompt_owned,
+                        existing.as_ref(),
+                        &workdir,
+                        &tools,
+                        tx,
+                    )
                     .await;
             }
             match tokio::time::timeout(
@@ -381,8 +388,7 @@ impl Dispatcher {
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "backend task panic");
                 // P2-5：panic 时若已收到 Final chunk，优先回传它（而非丢弃只报 panic）。
                 // S-7：无 Final 时用统一失败模板（技术细节进日志）。
-                let m = final_text
-                    .unwrap_or_else(|| backend_failure_reply(self.backend.name()));
+                let m = final_text.unwrap_or_else(|| backend_failure_reply(self.backend.name()));
                 if let Some(c) = card.as_mut() {
                     c.finalize(
                         Some(m.as_str()),

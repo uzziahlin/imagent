@@ -127,15 +127,13 @@ impl Dispatcher {
             // S-16：选中**不再移除**缓存条目——移除会让后续序号整体前移错位
             //（选中 1 后原 2 号变 1 号，连选即错会话）。缓存本就有 TTL（10 分钟）
             // 惰性过期防陈旧；失败路径也无需恢复缓存（条目未动）。
-            cache
-                .get(&key)
-                .and_then(|(_, l)| {
-                    if n >= 1 && n <= l.len() {
-                        Some(l[n - 1].clone())
-                    } else {
-                        None
-                    }
-                })
+            cache.get(&key).and_then(|(_, l)| {
+                if n >= 1 && n <= l.len() {
+                    Some(l[n - 1].clone())
+                } else {
+                    None
+                }
+            })
         } else {
             self.merged_resume_list(&conv.0)
                 .await
@@ -235,12 +233,8 @@ impl Dispatcher {
         let name = parts.get(1).map(|s| s.trim()).unwrap_or("");
         if name.is_empty() {
             // S-15：空参给可行动信息——用法 + 现有命名会话列表（可直接照名字切）。
-            self.reply(
-                conv,
-                "用法: /switch <name>（列出 / 新建命名会话）",
-                hint,
-            )
-            .await;
+            self.reply(conv, "用法: /switch <name>（列出 / 新建命名会话）", hint)
+                .await;
             self.cmd_sessions(conv, hint).await;
             return;
         }
@@ -280,7 +274,11 @@ impl Dispatcher {
                     created_at: row.created_at,
                     updated_at: now,
                 };
-                if let Err(e) = self.store.switch_named_session(&conv.0, name, Some(&sr)).await {
+                if let Err(e) = self
+                    .store
+                    .switch_named_session(&conv.0, name, Some(&sr))
+                    .await
+                {
                     warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "switch_named_session 失败");
                 }
                 let sid_short: String = row.session_id.chars().take(8).collect();

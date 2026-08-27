@@ -308,9 +308,21 @@ mod tests {
     #[test]
     fn session_exists_matches_id_only() {
         let root = tmp_root("exists");
-        write_rollout(&root, "2026/08/15", "uuid-live", "/tmp/proj-a", &[user_msg("hi")]);
+        write_rollout(
+            &root,
+            "2026/08/15",
+            "uuid-live",
+            "/tmp/proj-a",
+            &[user_msg("hi")],
+        );
         // cwd 不同也不影响：thread id 是全局唯一 uuid，只按 id 匹配。
-        write_rollout(&root, "2026/08/14", "uuid-other", "/tmp/other", &[user_msg("x")]);
+        write_rollout(
+            &root,
+            "2026/08/14",
+            "uuid-other",
+            "/tmp/other",
+            &[user_msg("x")],
+        );
 
         assert!(session_exists(&root, "uuid-live"));
         assert!(session_exists(&root, "uuid-other"));
