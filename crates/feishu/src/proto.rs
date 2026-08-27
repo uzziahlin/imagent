@@ -274,10 +274,29 @@ pub fn parse_card_action_event(payload: &[u8]) -> Option<(String, InboundMessage
     let act = value.get("imagent_perm").and_then(|v| v.as_str());
     let cmd = value.get("imagent_cmd").and_then(|v| v.as_str());
     // P9-2：表单提交按钮（imagent_form）——CardKit form 的用户输入值**不在**
-    // action.value 里，在 action.form_value（lcab dispatcher 同款校准）。把
-    // (key, string value) 拼成 `/config form k=v k=v` 命令文本，走与手打命令
-    // 相同的鉴权（admin 门槛）/分派。
-    let text: String = if value.get("imagent_form").and_then(|v| v.as_str()).is_some() {
+    // action.value 里，在 action.form_value（lcab dispatcher 同款校准）。两类表单：
+    // - "config"：把 (key, string value) 拼成 `/config form k=v k=v` 命令文本，
+    //   走与手打命令相同的鉴权（admin 门槛）/分派；
+    // - "ask"：问题卡表单（>4 选项下拉 / 多选 checkbox）——form_value.ask_opt
+    //   为单值（select_static）或数组（checkbox，多选语义「、」拼接），回成
+    //   `ask:<选择>` 走与选项按钮相同的审批回复路由（req 编码在 value，精确路由）。
+    let form_kind = value.get("imagent_form").and_then(|v| v.as_str());
+    let text: String = if form_kind == Some("ask") {
+        let fv = evt.event.action.get("form_value")?;
+        let joined = match fv.get("ask_opt") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Array(a)) => a
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join("、"),
+            _ => return None,
+        };
+        if joined.is_empty() {
+            return None;
+        }
+        format!("ask:{joined}")
+    } else if form_kind.is_some() {
         let fv = evt
             .event
             .action
@@ -1266,6 +1285,49 @@ mod tests {
         .to_string()
         .into_bytes();
         assert!(parse_card_action_event(&no_fv).is_none());
+    }
+
+    /// 问题卡表单提交（imagent_form=ask）：form_value.ask_opt 单值（下拉）直通
+    /// `ask:<选项>`；数组（checkbox 多选）按「、」拼接（多选语义）；ask_req 从
+    /// value.req 精确路由；空选择丢弃。
+    #[test]
+    fn parse_card_action_ask_form_submit() {
+        let mk = |form_value: serde_json::Value| {
+            serde_json::json!({
+                "schema":"2.0",
+                "header":{"event_id":"evt_ask_form","event_type":"card.action.trigger"},
+                "event":{
+                    "operator":{"open_id":"ou_op"},
+                    "action":{
+                        "tag":"button",
+                        "value":{"imagent_form":"ask","conv":"feishu:ou_op","req":"reqQ"},
+                        "form_value": form_value
+                    }
+                }
+            })
+            .to_string()
+            .into_bytes()
+        };
+        // 下拉单选：字符串直通。
+        let (_, msg) = parse_card_action_event(&mk(serde_json::json!({"ask_opt": "方案2"})))
+            .expect("单选表单应回调");
+        assert_eq!(msg.text.as_deref(), Some("ask:方案2"));
+        assert_eq!(msg.ask_req.as_deref(), Some("reqQ"), "req 精确路由");
+        assert_eq!(msg.conv_id.0, "feishu:ou_op");
+        // checkbox 多选：数组拼接。
+        let (_, multi) = parse_card_action_event(&mk(serde_json::json!({
+            "ask_opt": ["数据库迁移", "接口改造"]
+        })))
+        .expect("多选表单应回调");
+        assert_eq!(
+            multi.text.as_deref(),
+            Some("ask:数据库迁移、接口改造"),
+            "多选语义拼接: {:?}",
+            multi.text
+        );
+        // 空数组 / 缺字段 → 丢弃。
+        assert!(parse_card_action_event(&mk(serde_json::json!({"ask_opt": []}))).is_none());
+        assert!(parse_card_action_event(&mk(serde_json::json!({}))).is_none());
     }
 
     /// 真机校准（2026-08）：新版回调信封 operator.open_id 平铺（不再嵌套

@@ -33,6 +33,11 @@ const STREAM_TOOL_LINES: usize = 5;
 /// 审批卡详情代码块上限（卡片单元素 ~30KB，留足余量）。
 const PERM_DETAIL_MAX: usize = 1000;
 
+/// 审批/问题卡的自动拒绝时长（分钟）。取 core `permission_ask_timeout_secs` 的
+/// 缺省值（300s）；平台构造 API（`FeishuPlatform::new`）不接收该配置，无法逐
+/// 实例感知——自定义了该配置的部署以配置为准（此文案为缺省提示）。
+const ASK_AUTO_DENY_MINS: u64 = 5;
+
 /// Running 阶段 → footer 文案（也用于 config.summary 预览）。
 pub fn phase_footer(phase: CardPhase) -> &'static str {
     match phase {
@@ -42,13 +47,20 @@ pub fn phase_footer(phase: CardPhase) -> &'static str {
     }
 }
 
-/// P10：Running footer 组合——阶段文案 + 排队提示（`🧰 正在调用工具… · 📥 排队 2 条`）。
+/// P10：Running footer 组合——阶段文案 + 运行时长 + 排队提示
+/// （`🧰 正在调用工具… · 30s · 📥 排队 2 条`）。
 /// 排队状态"上卡不上消息流"：入队即被看见，不往会话里发任何确认消息。
-pub fn running_footer(phase: CardPhase, queued_hint: Option<&str>) -> String {
-    match queued_hint {
-        Some(h) => format!("{} · {}", phase_footer(phase), h),
-        None => phase_footer(phase).to_string(),
+/// 运行时长（`run_secs`，10s 粒度量化）区分「思考中」与「卡死」——长静默期
+/// 用户可看到秒数仍在走；量化保证 footer 去重缓存命中（窗口内不重复 patch）。
+pub fn running_footer(phase: CardPhase, queued_hint: Option<&str>, run_secs: u64) -> String {
+    let mut out = phase_footer(phase).to_string();
+    if run_secs > 0 {
+        out.push_str(&format!(" · {run_secs}s"));
     }
+    if let Some(h) = queued_hint {
+        out.push_str(&format!(" · {h}"));
+    }
+    out
 }
 
 /// 终态 footer 文案（`已中断` 单列——/stop 与卡片扫描的收敛语义，非出错）。
@@ -68,7 +80,7 @@ fn terminal_footer(err: Option<&str>) -> &'static str {
 pub fn render_card(card: &OutboundCard, conv_id: &str) -> String {
     let (footer, streaming, err) = match &card.terminal {
         CardTerminal::Running => (
-            running_footer(card.phase, card.queued_hint.as_deref()),
+            running_footer(card.phase, card.queued_hint.as_deref(), card.run_secs),
             true,
             None,
         ),
@@ -80,7 +92,9 @@ pub fn render_card(card: &OutboundCard, conv_id: &str) -> String {
         ),
     };
     let text = if card.text.is_empty() {
-        "…"
+        // 明确状态语而非模糊的「…」：首 chunk 前的静默期（CLI 冷启动 + 模型
+        // 首 token 可达十几秒）让用户确知任务已被接收处理。
+        "🧠 已接收任务，正在处理…"
     } else {
         &card.text
     };
@@ -123,19 +137,13 @@ pub fn render_card(card: &OutboundCard, conv_id: &str) -> String {
 
 /// 工具调用折叠面板（lcab collapsedToolSummary 同款）：蓝边框 + 圆角 + 内边距，
 /// 收起态；正文为小字号（notation）的工具行列表，行首状态图标。
+///
+/// 终态卡**全量罗列**（不截最近 5 条）——面板默认收起不占版面，展开即完整
+/// 工具轨迹，终态后可回看明细（流式期只显最近 5 条，见 [`stream_body_md`]）。
 fn render_tool_panel(tools: &[ToolCall]) -> serde_json::Value {
     let n = tools.len();
-    // 超长任务只保留最近 STREAM_TOOL_LINES 行（完整过程在最终统计里）。
-    let (skipped, shown) = if n > STREAM_TOOL_LINES + 2 {
-        (n - STREAM_TOOL_LINES, &tools[n - STREAM_TOOL_LINES..])
-    } else {
-        (0, tools)
-    };
     let mut lines = String::new();
-    if skipped > 0 {
-        lines.push_str(&format!("- ☕ … 前面还有 {skipped} 个\n"));
-    }
-    for t in shown {
+    for t in tools {
         lines.push_str(&format!("- {}\n", mask_emails(&tool_card_line(t))));
     }
     serde_json::json!({
@@ -193,6 +201,23 @@ fn cb_button(label: &str, btn_type: &str, value: serde_json::Value) -> serde_jso
     })
 }
 
+/// 带二次确认弹窗的 callback 按钮（CardKit button `confirm` 字段）：danger 类
+/// 破坏性命令（/ws 删除等）点击先弹「确认执行」——按钮组件原生字段，无额外
+/// 交互成本。
+fn cb_button_confirm(
+    label: &str,
+    btn_type: &str,
+    value: serde_json::Value,
+    confirm_text: &str,
+) -> serde_json::Value {
+    let mut b = cb_button(label, btn_type, value);
+    b["confirm"] = serde_json::json!({
+        "title": { "tag": "plain_text", "content": "确认执行" },
+        "text": { "tag": "plain_text", "content": confirm_text }
+    });
+    b
+}
+
 /// 折叠面板头（lcab panelHeader 同款）：markdown 标题 + 展开箭头图标。
 fn panel_header(title_md: &str) -> serde_json::Value {
     serde_json::json!({
@@ -216,7 +241,7 @@ pub fn render_stream_init_card(conv_id: &str) -> String {
             "summary": { "content": "🧠 正在执行任务…" }
         },
         "body": { "elements": [
-            { "tag": "markdown", "element_id": "md_body", "content": "…" },
+            { "tag": "markdown", "element_id": "md_body", "content": "🧠 已接收任务，正在处理…" },
             { "tag": "markdown", "element_id": "md_footer", "content": "🧠 思考中…", "text_size": "notation" },
             // P9-1：⏹ 终止按钮常驻（element PATCH 只更新 markdown，按钮不受流式
             // 影响；终态后仍在，点击回「当前没有运行中的任务」，无害）。
@@ -256,15 +281,17 @@ pub fn stream_body_md(text: &str, tool_calls: &[ToolCall]) -> String {
         out.push_str(&lines.join("\n"));
     }
     if out.is_empty() {
-        out.push('…');
+        out.push_str("🧠 已接收任务，正在处理…");
     }
     mask_emails(&out)
 }
 
-/// 终态（Done/Error）时 `md_body` 的最终内容：正文 + 工具统计行 + 完成行。
+/// 终态（Done/Error）时 `md_body` 的最终内容：正文 + 工具统计行 + 全量工具明细。
 ///
-/// 终态工具用**统计**（按工具名计数）而非全列——卡片正文保持简洁，
-/// 明细在降级路径的折叠面板里（managed 路径不重复罗列）。
+/// 统计行给一眼结论（按工具名计数：Bash×2 Read×3）；其后附**全量**工具引用行
+/// ——managed 流式期正文只显最近 5 条（element PATCH 限制下的防刷屏），终态
+/// 在同组件里补全明细，用户终态后可回看完整工具轨迹（降级/下沉路径另有折叠
+/// 面板承载，见 [`render_tool_panel`]）。
 pub fn stream_body_final(text: &str, tool_calls: &[ToolCall], err: Option<&str>) -> String {
     let mut out = String::new();
     // 错误/中断说明进正文（footer 只有一句状态，装不下具体原因）；中断单列措辞。
@@ -289,10 +316,16 @@ pub fn stream_body_final(text: &str, tool_calls: &[ToolCall], err: Option<&str>)
             out.push_str("\n\n");
         }
         out.push_str(&format!(
-            "🔧 工具 {} 次：{}",
+            "🔧 工具 {} 次：{}\n",
             tool_calls.len(),
             stats.join(" · ")
         ));
+        // 全量明细（引用行形态，与流式期一致）——终态回看用。
+        let lines: Vec<String> = tool_calls
+            .iter()
+            .map(|t| format!("> {}", tool_card_line(t)))
+            .collect();
+        out.push_str(&lines.join("\n"));
     }
     // 终态状态行（✅ 已完成等）由 md_footer 承载——正文不再拼一份，
     // 否则同卡出现两行「完成」（真机反馈）。
@@ -307,13 +340,23 @@ pub fn stream_body_final(text: &str, tool_calls: &[ToolCall], err: Option<&str>)
 /// 流式卡正文收成一行状态 + 指针，完整结果以**新卡**重发在下方——用户读完
 /// 审批卡往下看即是结论，无需回滚翻找第一张卡。
 pub fn stub_body(tool_count: usize, err: Option<&str>) -> String {
-    // 状态行（✅ 已完成 / ❌ 出错 / ⏹ 已中断）由 md_footer 承载，stub 正文
-    // 只留统计 + 指针——不再拼状态词，防同卡双「完成」。
-    match err {
-        None if tool_count > 0 => format!("🔧 工具 {tool_count} 次\n\n⬇️ 完整结果见下方消息"),
-        None => "⬇️ 完整结果见下方消息".to_string(),
-        Some(_) => "⬇️ 详情见下方消息".to_string(),
+    // stub 正文自带终态状态词（✅ 任务完成 / ❌ 执行出错 / ⏹ 已中断）——stub
+    // 卡常被审批卡顶到视口外、footer 小字易被忽略，正文状态词让回滚一眼辨成败；
+    // 措辞刻意区别于 footer 的「✅ 已完成」（正文「任务完成」），避免同词双行。
+    let status = match err {
+        Some("已中断") => "⏹ 已中断",
+        Some(_) => "❌ 执行出错",
+        None => "✅ 任务完成",
+    };
+    let mut out = status.to_string();
+    if err.is_none() && tool_count > 0 {
+        out.push_str(&format!("\n\n🔧 工具 {tool_count} 次"));
     }
+    out.push_str(&format!(
+        "\n\n⬇️ {}见下方消息",
+        if err.is_none() { "完整结果" } else { "详情" }
+    ));
+    out
 }
 
 /// 降级/话题路径（`msg:` 句柄）整卡 patch 用的 stub 卡（managed 路径用
@@ -351,25 +394,30 @@ fn perm_detail_md(tool_name: &str, input_summary: &str) -> String {
     } else {
         ""
     };
-    let body: String = match serde_json::from_str::<serde_json::Value>(input_summary) {
-        Ok(v) => {
-            let pretty = serde_json::to_string_pretty(&v).unwrap_or_else(|_| input_summary.into());
-            truncate_str(&pretty, PERM_DETAIL_MAX)
-        }
+    let raw: String = match serde_json::from_str::<serde_json::Value>(input_summary) {
+        Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|_| input_summary.into()),
         // 截断的 JSON（超长输入）：解析失败原样展示。
-        Err(_) => truncate_str(input_summary, PERM_DETAIL_MAX),
+        Err(_) => input_summary.to_string(),
     };
-    format!("{head}\n```{lang}\n{body}\n```").pipe(mask_emails)
-}
-
-/// 小工具：String 管道（掩码用）。
-trait PipeString {
-    fn pipe(self, f: impl Fn(&str) -> String) -> String;
-}
-impl PipeString for String {
-    fn pipe(self, f: impl Fn(&str) -> String) -> String {
-        f(&self)
+    // 截断提示：静默截断会让用户误以为参数就这么多——末尾明示。
+    let (body, truncated) = if raw.chars().count() > PERM_DETAIL_MAX {
+        (truncate_str(&raw, PERM_DETAIL_MAX), true)
+    } else {
+        (raw, false)
+    };
+    // 邮箱掩码是平台合规强制（租户审计对含裸邮箱的卡片内容回 400，代码块
+    // 同样被审计，无法豁免——见 [`mask_emails`]）。掩码处加提示，防用户复制
+    // 掩码后的命令执行坏命令。
+    let masked = mask_emails(&body);
+    let email_masked = masked != body;
+    let mut md = format!("{head}\n```{lang}\n{masked}\n```");
+    if truncated {
+        md.push_str(&format!("\n\n…（已截断，仅显示前 {PERM_DETAIL_MAX} 字符）"));
     }
+    if email_masked {
+        md.push_str("\n\n⚠️ 邮箱已掩码显示（`[at]`），原命令可直接执行，请勿复制此代码块。");
+    }
+    md
 }
 
 /// 审批询问卡片（P4-4）：标题栏 + 工具签名/参数详情 + 允许/拒绝按钮。
@@ -381,8 +429,12 @@ impl PipeString for String {
 /// 真机校准（2026-08）：schema V2 卡片已**废弃 `action` 元素**（200861 "cards of
 /// schema V2 no longer support this capability; unsupported tag action"）。按钮迁到
 /// `column_set` → `column` → `button`（button 组件本身 + behaviors 保留），两列等宽。
-/// 审批卡 note 行缺省文案。
-pub(crate) const PERM_NOTE_DEFAULT: &str = "⏱️ 长时间未处理将自动拒绝";
+/// 审批卡 note 行缺省文案：自动拒绝的具体倒计时（分钟数值来自
+/// [`ASK_AUTO_DENY_MINS`]，即 core `permission_ask_timeout_secs` 缺省值）——
+/// 静态「长时间未处理」让用户无从判断还剩多久。
+pub(crate) fn perm_note_default() -> String {
+    format!("⏱️ 将在 {ASK_AUTO_DENY_MINS} 分钟后自动拒绝")
+}
 
 pub fn render_permission_card(
     tool_name: &str,
@@ -390,13 +442,7 @@ pub fn render_permission_card(
     conv_id: &str,
     request_id: &str,
 ) -> String {
-    render_permission_card_note(
-        tool_name,
-        input_summary,
-        conv_id,
-        request_id,
-        PERM_NOTE_DEFAULT,
-    )
+    render_permission_card_note(tool_name, input_summary, conv_id, request_id, &perm_note_default())
 }
 
 /// P10-③：note 行可参数化（排队联动重渲染用，见 platform 的 note_queued_on_ask）。
@@ -462,10 +508,19 @@ pub fn render_permission_card_superseded(tool_name: &str) -> String {
 /// 解析失败返回 None（调用方降级普通审批卡）。选项按钮 value 编码
 /// `imagent_ask`（选项文本）+ conv，回调转成 `ask:<选项>` 走审批回复路由。
 pub fn render_question_card(tool_input: &str, conv_id: &str, request_id: &str) -> Option<String> {
-    render_question_card_note(tool_input, conv_id, request_id, PERM_NOTE_DEFAULT)
+    render_question_card_note(tool_input, conv_id, request_id, &perm_note_default())
 }
 
 /// P10-③：note 行可参数化（同审批卡）。
+///
+/// 交互形态按选项数/多选分流（替代此前「>4 选项要求手打 `ask:选项`、多选第一
+/// 次点击即收敛」的残缺交互）：
+/// - 单选 ≤4 选项：选项按钮（首选项 primary）——原交互，最快路径；
+/// - 单选 >4 选项：CardKit form + `select_static` 下拉（参照 /config 表单卡），
+///   提交一次回传选择；
+/// - 多选（multiSelect）：form + `checkbox`，勾选多项后一次提交全部——proto 侧
+///   把 `form_value.ask_opt`（数组）按多选语义拼接（「、」连接）回 `ask:` 通道。
+/// 多问题场景（questions.len() > 1）当前只答第一问：卡片上明确标注。
 pub(crate) fn render_question_card_note(
     tool_input: &str,
     conv_id: &str,
@@ -495,36 +550,78 @@ pub(crate) fn render_question_card_note(
         .unwrap_or(1);
     let mut extra = String::new();
     if n_questions > 1 {
-        extra.push_str(&format!("\n（本次共 {n_questions} 个问题，先答第一个）"));
-    }
-    if multi {
-        extra.push_str("\n（多选：依次点击多个选项）");
-    }
-    // 每选项一钮（flow 自适应）；超 4 个截断（卡片宽度），剩余以文字列出。
-    // 首选项 primary 高亮。
-    let shown: Vec<&String> = opts.iter().take(4).collect();
-    let opt_buttons: Vec<serde_json::Value> = shown
-        .iter()
-        .enumerate()
-        .map(|(i, label)| {
-            let btn_type = if i == 0 { "primary" } else { "default" };
-            cb_button(
-                &format!("{}. {}", i + 1, label),
-                btn_type,
-                serde_json::json!({
-                    "imagent_ask": label, "conv": conv_id, "req": request_id
-                }),
-            )
-        })
-        .collect();
-    let mut content = format!("❓ {question}{extra}");
-    if opts.len() > 4 {
-        let rest: Vec<&str> = opts.iter().skip(4).map(|s| s.as_str()).collect();
-        content.push_str(&format!(
-            "\n其余选项（回复 `ask:选项`）：{}",
-            rest.join(" / ")
+        extra.push_str(&format!(
+            "\n（本次共 {n_questions} 个问题，将依次询问——此卡只答第一问）"
         ));
     }
+    let use_form = multi || opts.len() > 4;
+    let content = format!("❓ {question}{extra}");
+    let body_elements: Vec<serde_json::Value> = if use_form {
+        // 表单形态：选项 value 即 label（回传直接走 ask 通道语义，与按钮一致）。
+        let options: Vec<serde_json::Value> = opts
+            .iter()
+            .map(|l| {
+                serde_json::json!({
+                    "text": { "tag": "plain_text", "content": l },
+                    "value": l
+                })
+            })
+            .collect();
+        let field = if multi {
+            serde_json::json!({
+                "tag": "checkbox", "name": "ask_opt",
+                "options": options
+            })
+        } else {
+            serde_json::json!({
+                "tag": "select_static", "name": "ask_opt",
+                "options": options
+            })
+        };
+        let submit_tip = if multi { "勾选后点「提交」，一次回传全部选择" } else { "下拉选择后点「提交」" };
+        vec![
+            serde_json::json!({ "tag": "markdown", "content": mask_emails(&content) }),
+            serde_json::json!({ "tag": "markdown", "content": note, "text_size": "notation" }),
+            serde_json::json!({ "tag": "hr" }),
+            serde_json::json!({ "tag": "form", "name": "imagent_ask", "elements": [
+                serde_json::json!({ "tag": "markdown", "content": submit_tip }),
+                field,
+                serde_json::json!({ "tag": "hr" }),
+                flow_button_row(&[serde_json::json!({
+                    "tag": "button",
+                    "name": "submit_btn",
+                    "text": { "tag": "plain_text", "content": "提交" },
+                    "type": "primary",
+                    "form_action_type": "submit",
+                    "behaviors": [{ "type": "callback", "value": {
+                        "imagent_form": "ask", "conv": conv_id, "req": request_id
+                    } }]
+                })])
+            ]}),
+        ]
+    } else {
+        // 按钮形态：每选项一钮（flow 自适应）；首选项 primary 高亮。
+        let opt_buttons: Vec<serde_json::Value> = opts
+            .iter()
+            .enumerate()
+            .map(|(i, label)| {
+                let btn_type = if i == 0 { "primary" } else { "default" };
+                cb_button(
+                    &format!("{}. {}", i + 1, label),
+                    btn_type,
+                    serde_json::json!({
+                        "imagent_ask": label, "conv": conv_id, "req": request_id
+                    }),
+                )
+            })
+            .collect();
+        vec![
+            serde_json::json!({ "tag": "markdown", "content": mask_emails(&content) }),
+            serde_json::json!({ "tag": "markdown", "content": note, "text_size": "notation" }),
+            serde_json::json!({ "tag": "hr" }),
+            flow_button_row(&opt_buttons),
+        ]
+    };
     Some(
         serde_json::json!({
             "schema": "2.0",
@@ -532,12 +629,7 @@ pub(crate) fn render_question_card_note(
                 "title": { "tag": "plain_text", "content": "❓ 需要你的输入" },
                 "template": "blue"
             },
-            "body": { "elements": [
-                { "tag": "markdown", "content": mask_emails(&content) },
-                { "tag": "markdown", "content": note, "text_size": "notation" },
-                { "tag": "hr" },
-                flow_button_row(&opt_buttons)
-            ]}
+            "body": { "elements": body_elements }
         })
         .to_string(),
     )
@@ -610,11 +702,18 @@ pub fn render_command_card(
     let btns: Vec<serde_json::Value> = buttons
         .iter()
         .map(|b| {
-            cb_button(
-                &b.label,
-                button_type(b.style),
-                serde_json::json!({ "imagent_cmd": b.command, "conv": conv_id }),
-            )
+            let value = serde_json::json!({ "imagent_cmd": b.command, "conv": conv_id });
+            // danger 按钮带二次确认弹窗（误触破坏性命令的最后一道闸）。
+            if matches!(b.style, CardButtonStyle::Danger) {
+                cb_button_confirm(
+                    &b.label,
+                    button_type(b.style),
+                    value,
+                    &format!("将执行「{}」，该操作可能删除/覆盖数据，确认吗？", b.command),
+                )
+            } else {
+                cb_button(&b.label, button_type(b.style), value)
+            }
         })
         .collect();
     if let Some(elements) = card
@@ -708,6 +807,7 @@ mod tests {
             phase: CardPhase::Thinking,
             queued_hint: None,
             terminal: CardTerminal::Running,
+            run_secs: 0,
         };
         let json = render_card(&card, "feishu:ou_t");
         assert!(json.contains("hello"));
@@ -733,6 +833,7 @@ mod tests {
                 phase,
                 queued_hint: None,
                 terminal: CardTerminal::Running,
+            run_secs: 0,
             };
             assert!(
                 render_card(&card, "feishu:ou_t").contains(mark),
@@ -749,6 +850,7 @@ mod tests {
             phase: CardPhase::Outputting,
             queued_hint: None,
             terminal: CardTerminal::Done,
+            run_secs: 0,
         };
         let json = render_card(&card, "feishu:ou_t");
         assert!(json.contains("done"));
@@ -761,9 +863,10 @@ mod tests {
         assert!(json.contains("✅ **Read**"), "工具状态行: {json}");
     }
 
-    /// 长任务工具列表折叠：仅保留最近 N 行 + 计数行。
+    /// 终态卡折叠面板全量罗列：不丢最早工具（终态后可回看完整轨迹）；
+    /// 流式期 stream_body_md 仍只显最近 5 条（防刷屏）。
     #[test]
-    fn render_card_tool_panel_collapses_long_list() {
+    fn render_card_tool_panel_full_list_on_terminal() {
         let tools: Vec<ToolCall> = (0..10)
             .map(|i| tool("Bash", &format!("cmd-{i}"), true))
             .collect();
@@ -772,12 +875,27 @@ mod tests {
             tool_calls: tools,
             phase: CardPhase::ToolRunning,
             queued_hint: None,
-            terminal: CardTerminal::Running,
+            terminal: CardTerminal::Done,
+            run_secs: 0,
         };
         let json = render_card(&card, "feishu:ou_t");
-        assert!(json.contains("前面还有 5"), "折叠计数行: {json}");
-        assert!(!json.contains("cmd-0"), "最早的不展示: {json}");
-        assert!(json.contains("cmd-9"), "最新的一直可见: {json}");
+        assert!(json.contains("cmd-0"), "终态面板含最早工具: {json}");
+        assert!(json.contains("cmd-9"), "终态面板含最新工具: {json}");
+        assert!(!json.contains("前面还有"), "面板不截断: {json}");
+        // 流式 md 仍折叠（最近 5 条）。
+        let running = OutboundCard {
+            text: "out".into(),
+            tool_calls: (0..10)
+                .map(|i| tool("Bash", &format!("cmd-{i}"), true))
+                .collect(),
+            phase: CardPhase::ToolRunning,
+            queued_hint: None,
+            terminal: CardTerminal::Running,
+            run_secs: 0,
+        };
+        let md = stream_body_md(&running.text, &running.tool_calls);
+        assert!(md.contains("前面还有 5 个工具"), "流式折叠计数: {md}");
+        assert!(!md.contains("cmd-0"), "流式不显最早: {md}");
     }
 
     #[test]
@@ -788,6 +906,7 @@ mod tests {
             phase: CardPhase::Thinking,
             queued_hint: None,
             terminal: CardTerminal::Error("boom".into()),
+            run_secs: 0,
         };
         let json = render_card(&card, "feishu:ou_t");
         assert!(json.contains("boom"));
@@ -975,20 +1094,19 @@ mod tests {
         }
     }
 
-    /// P10：Running footer 组合——阶段 + 排队提示；无排队纯阶段文案。
+    /// P10：Running footer 组合——阶段 + 运行时长 + 排队提示；无附加纯阶段文案。
     #[test]
     fn running_footer_composes_queued_hint() {
         assert_eq!(
-            running_footer(CardPhase::ToolRunning, None),
+            running_footer(CardPhase::ToolRunning, None, 0),
             "🧰 正在调用工具…"
         );
         assert_eq!(
-            running_footer(
-                CardPhase::ToolRunning,
-                Some("📥 排队 2 条，最新：「快一点」")
-            ),
-            "🧰 正在调用工具… · 📥 排队 2 条，最新：「快一点」"
+            running_footer(CardPhase::ToolRunning, Some("📥 排队 2 条，最新：「快一点」"), 30),
+            "🧰 正在调用工具… · 30s · 📥 排队 2 条，最新：「快一点」"
         );
+        // 时长 0（刚起步）不带秒数，防「0s」噪音。
+        assert_eq!(running_footer(CardPhase::Thinking, None, 0), "🧠 思考中…");
         // 降级卡 footer 同样组合。
         let card = OutboundCard {
             text: "x".into(),
@@ -996,6 +1114,7 @@ mod tests {
             phase: CardPhase::Outputting,
             queued_hint: Some("📥 排队 1 条".into()),
             terminal: CardTerminal::Running,
+            run_secs: 0,
         };
         let json = render_card(&card, "feishu:ou_t");
         assert!(
@@ -1018,14 +1137,14 @@ mod tests {
             json.contains("⏳ 等待你审批 · 后面还排着 3 条消息"),
             "note 替换: {json}"
         );
-        assert!(!json.contains("长时间未处理"), "默认 note 不再出现: {json}");
+        assert!(!json.contains("分钟后自动拒绝"), "默认 note 不再出现: {json}");
         assert!(
             json.contains("\"imagent_perm\":\"allow\"") && json.contains("\"req\":\"req9\""),
             "按钮 value 编码不变: {json}"
         );
-        // 缺省包装函数仍用默认 note。
+        // 缺省包装函数仍用默认 note（含具体分钟数值）。
         let plain = render_permission_card("Bash", r#"{"command":"ls"}"#, "c", "r");
-        assert!(plain.contains("长时间未处理"));
+        assert!(plain.contains("将在 5 分钟后自动拒绝"), "默认倒计时: {plain}");
     }
 
     /// P9-1：流式卡终止按钮——init 卡与降级 Running 卡都带 ⏹ 终止（danger，
@@ -1049,6 +1168,7 @@ mod tests {
             phase: CardPhase::Outputting,
             queued_hint: None,
             terminal: CardTerminal::Running,
+            run_secs: 0,
         };
         let json = render_card(&running, "feishu:ou_t");
         assert!(json.contains("⏹ 终止"), "Running 降级卡带终止按钮: {json}");
@@ -1058,6 +1178,7 @@ mod tests {
             phase: CardPhase::Outputting,
             queued_hint: None,
             terminal: CardTerminal::Done,
+            run_secs: 0,
         };
         let json2 = render_card(&done, "feishu:ou_t");
         assert!(!json2.contains("⏹ 终止"), "终态不带终止按钮: {json2}");
@@ -1111,8 +1232,8 @@ mod tests {
 
     #[test]
     fn stream_body_md_text_tools_and_empty() {
-        // 空入参给占位。
-        assert_eq!(stream_body_md("", &[]), "…");
+        // 空入参给明确状态语（首 chunk 前的静默期）。
+        assert_eq!(stream_body_md("", &[]), "🧠 已接收任务，正在处理…");
         // 文本 + 工具都有：引用行 + 状态图标 + 加粗工具名。
         let tools = vec![tool("Bash", "ls -la", false)];
         let md = stream_body_md("进度", &tools);
@@ -1131,19 +1252,23 @@ mod tests {
         assert!(md2.contains("f7"), "最新可见: {md2}");
     }
 
-    /// P8-2：结果下沉 stub——状态 + 指针；错误/中断各有文案。
+    /// P8-2：结果下沉 stub——正文自带终态状态词（回滚一眼辨成败）+ 指针。
     #[test]
     fn stub_body_and_card() {
-        // 状态词（完成/出错/中断）归 footer——stub 正文只有统计 + 指针。
-        assert_eq!(stub_body(3, None), "🔧 工具 3 次\n\n⬇️ 完整结果见下方消息");
-        assert_eq!(stub_body(0, None), "⬇️ 完整结果见下方消息");
-        assert_eq!(stub_body(0, Some("boom")), "⬇️ 详情见下方消息");
+        assert_eq!(
+            stub_body(3, None),
+            "✅ 任务完成\n\n🔧 工具 3 次\n\n⬇️ 完整结果见下方消息"
+        );
+        assert_eq!(stub_body(0, None), "✅ 任务完成\n\n⬇️ 完整结果见下方消息");
+        assert_eq!(stub_body(0, Some("boom")), "❌ 执行出错\n\n⬇️ 详情见下方消息");
+        assert_eq!(stub_body(0, Some("已中断")), "⏹ 已中断\n\n⬇️ 详情见下方消息");
         let card = OutboundCard {
             text: "结论".into(),
             tool_calls: vec![tool("Bash", "ls", true)],
             phase: CardPhase::Outputting,
             queued_hint: None,
             terminal: CardTerminal::Done,
+            run_secs: 0,
         };
         let json = render_stub_card(&card);
         assert!(json.contains("⬇️ 完整结果见下方消息"), "指针: {json}");
@@ -1152,11 +1277,12 @@ mod tests {
             "stub 不含正文（正文在重发的新卡）: {json}"
         );
         assert!(json.contains("工具 1 次"), "统计行: {json}");
-        // 状态词恰好出现一次（footer 元素）——正文不拼第二份。
+        assert!(json.contains("✅ 任务完成"), "正文状态词: {json}");
+        // footer 的「已完成」与正文的「任务完成」措辞互异——footer 状态词仍只一次。
         assert_eq!(
             json.matches("已完成").count(),
             1,
-            "状态词只应出现一次（footer）: {json}"
+            "footer 状态词只应出现一次: {json}"
         );
     }
 
@@ -1174,6 +1300,9 @@ mod tests {
         assert!(out.contains("Read×1"), "工具统计: {out}");
         // 状态行归 md_footer——正文不得再拼「完成」（真机反馈过双行）。
         assert!(!out.contains("完成"), "正文不应含状态词: {out}");
+        // 终态附全量工具明细（引用行）——managed 路径终态后可回看轨迹。
+        assert!(out.contains("> ✅ **Bash** — a"), "全量明细: {out}");
+        assert!(out.contains("> ✅ **Read** — c"), "全量明细: {out}");
         // Error 终态带 ❌ 前置（具体原因正文承载）。
         let err = stream_body_final("", &[], Some("boom"));
         assert!(err.contains("❌ 出错：boom"), "错误前置: {err}");
@@ -1182,6 +1311,169 @@ mod tests {
         assert!(
             stop.contains("⏹ 已中断") && !stop.contains("出错"),
             "中断终态: {stop}"
+        );
+    }
+
+    /// 审批详情超长截断提示：末尾明示「已截断，仅显示前 1000 字符」。
+    #[test]
+    fn perm_detail_truncation_notice() {
+        let long = "x".repeat(1500);
+        let json = render_permission_card(
+            "Bash",
+            &format!(r#"{{"command":"echo {long}"}}"#),
+            "feishu:ou_t",
+            "req1",
+        );
+        assert!(
+            json.contains("已截断，仅显示前 1000 字符"),
+            "截断提示: {json}"
+        );
+        // 短输入无提示。
+        let short = render_permission_card("Bash", r#"{"command":"ls"}"#, "c", "r");
+        assert!(!short.contains("已截断"), "短输入不提示: {short}");
+    }
+
+    /// 邮箱掩码破坏复制的缓解：掩码仍强制（审计合规），但加提示文案。
+    #[test]
+    fn perm_detail_email_mask_notice() {
+        let json = render_permission_card(
+            "Bash",
+            r#"{"command":"git clone git@github.com:org/repo.git"}"#,
+            "feishu:ou_t",
+            "req1",
+        );
+        assert!(json.contains("[at]"), "掩码仍生效（审计强制）: {json}");
+        assert!(
+            json.contains("邮箱已掩码显示"),
+            "掩码提示: {json}"
+        );
+        assert!(
+            json.contains("原命令可直接执行"),
+            "告知原命令语义不变: {json}"
+        );
+        // 无邮箱的命令不出现提示。
+        let plain = render_permission_card("Bash", r#"{"command":"ls -la"}"#, "c", "r");
+        assert!(!plain.contains("邮箱已掩码"), "无掩码不提示: {plain}");
+    }
+
+    /// 问题卡表单化：>4 选项单选 → select_static 下拉；多选 → checkbox。
+    /// 提交按钮一次回传（imagent_form=ask + req 精确路由）。
+    #[test]
+    fn question_card_form_for_many_options_and_multi() {
+        let labels: Vec<String> = (1..=6).map(|i| format!("方案{i}")).collect();
+        let mk_input = |multi: bool| {
+            serde_json::json!({
+                "questions": [{
+                    "question": "选哪个方案？",
+                    "multiSelect": multi,
+                    "options": labels.iter().map(|l| serde_json::json!({"label": l})).collect::<Vec<_>>()
+                }]
+            })
+            .to_string()
+        };
+        // >4 选项单选：select_static 表单，不再要求手打 ask:选项。
+        let json = render_question_card(&mk_input(false), "feishu:ou_q", "reqF")
+            .expect("单选多选项应渲染");
+        assert!(json.contains("\"tag\":\"form\""), "form 元素: {json}");
+        assert!(json.contains("select_static"), "下拉: {json}");
+        assert!(json.contains("\"name\":\"ask_opt\""), "字段名: {json}");
+        assert!(
+            json.contains("\"imagent_form\":\"ask\""),
+            "ask 表单标记: {json}"
+        );
+        assert!(json.contains("\"req\":\"reqF\""), "req 精确路由: {json}");
+        assert!(
+            json.contains("\"form_action_type\":\"submit\""),
+            "提交按钮: {json}"
+        );
+        assert!(!json.contains("回复 `ask:选项`"), "不再要求手打: {json}");
+        // 全部选项都在下拉里（无「其余选项」截断）。
+        assert!(json.contains("方案1") && json.contains("方案6"), "全选项: {json}");
+        // 多选：checkbox 表单。
+        let multi = render_question_card(&mk_input(true), "feishu:ou_q", "reqM")
+            .expect("多选应渲染");
+        assert!(multi.contains("\"tag\":\"checkbox\""), "checkbox: {multi}");
+        assert!(!multi.contains("select_static"), "多选不用下拉: {multi}");
+        assert!(
+            multi.contains("一次回传全部选择"),
+            "多选提交提示: {multi}"
+        );
+        // ≤4 选项单选仍是按钮形态（最快路径）。
+        let few = serde_json::json!({
+            "questions": [{
+                "question": "选哪个？",
+                "options": [{"label":"A"},{"label":"B"}]
+            }]
+        })
+        .to_string();
+        let btn = render_question_card(&few, "c", "r").expect("少选项应渲染");
+        assert!(btn.contains("\"imagent_ask\":\"A\""), "按钮形态保留: {btn}");
+        assert!(!btn.contains("\"tag\":\"form\""), "少选项不用表单: {btn}");
+        // 多问题标注：只答第一问。
+        let multi_q = serde_json::json!({
+            "questions": [
+                {"question": "第一问？", "options": [{"label":"A"}]},
+                {"question": "第二问？", "options": [{"label":"B"}]}
+            ]
+        })
+        .to_string();
+        let mq = render_question_card(&multi_q, "c", "r").expect("应渲染");
+        assert!(
+            mq.contains("将依次询问") && mq.contains("只答第一问"),
+            "多问题标注: {mq}"
+        );
+    }
+
+    /// danger 按钮二次确认弹窗（confirm 字段）；非 danger 按钮不带。
+    #[test]
+    fn command_card_danger_button_has_confirm() {
+        let buttons = vec![
+            CardButton {
+                label: "使用 main".into(),
+                command: "/ws use main".into(),
+                style: CardButtonStyle::Primary,
+            },
+            CardButton {
+                label: "删除".into(),
+                command: "/ws remove tmp".into(),
+                style: CardButtonStyle::Danger,
+            },
+        ];
+        let json = render_command_card("📁 工作空间", "- main", &buttons, "feishu:oc_g");
+        assert!(json.contains("\"confirm\""), "danger 按钮带确认: {json}");
+        assert!(json.contains("确认执行"), "确认弹窗标题: {json}");
+        assert!(
+            json.contains("/ws remove tmp"),
+            "确认文案含具体命令: {json}"
+        );
+        // confirm 只挂在 danger 按钮上（出现一次）。
+        assert_eq!(
+            json.matches("\"confirm\"").count(),
+            1,
+            "仅 danger 按钮确认: {json}"
+        );
+    }
+
+    /// 空正文占位：init 卡与流式 md 均为明确状态语（非「…」）。
+    #[test]
+    fn empty_body_placeholder_is_explicit() {
+        let init = render_stream_init_card("feishu:ou_t");
+        assert!(
+            init.contains("🧠 已接收任务，正在处理"),
+            "init 卡状态语: {init}"
+        );
+        let card = OutboundCard {
+            text: "".into(),
+            tool_calls: vec![],
+            phase: CardPhase::Thinking,
+            queued_hint: None,
+            terminal: CardTerminal::Running,
+            run_secs: 0,
+        };
+        let json = render_card(&card, "feishu:ou_t");
+        assert!(
+            json.contains("🧠 已接收任务，正在处理"),
+            "降级卡空正文状态语: {json}"
         );
     }
 }
