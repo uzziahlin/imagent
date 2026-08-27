@@ -2648,38 +2648,45 @@ mod tests {
         assert_eq!(store.get_config("k2").await.unwrap().as_deref(), Some("v2"));
     }
 
-    /// #3：退避 sleep 期间不持连接锁——BUSY 闭包重试期间，另一写操作可插队
-    /// 完成（若持锁 sleep，后者会被饿死到重试结束）。
+    /// #3：退避 sleep 期间不持连接锁——用**顺序断言**而非绝对时长（CI runner
+    /// 调度抖动会让时长断言误报）：闭包首次调用持锁 sleep 后返回 BUSY，退避
+    /// 50ms（锁外）后重试。插队写入若在重试开始前完成，即证明退避期间锁
+    /// 已释放（若持锁 sleep，插队必然排到重试之后）。10ms 为唤醒调度容差。
     #[tokio::test]
     async fn busy_backoff_does_not_hold_lock() {
         let db = TempDb::new("busy_lock").await;
         let store = Store::open(&db.path).await.unwrap();
         let inner = store.inner.clone();
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let retry2_start = std::sync::Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
         let c = calls.clone();
+        let r2 = retry2_start.clone();
         let slow = tokio::spawn(async move {
             blocking_with_retry(inner, move |_conn| {
                 if c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 1 {
-                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    std::thread::sleep(std::time::Duration::from_millis(300));
                     return Err(busy_error());
                 }
+                *r2.lock().unwrap() = Some(std::time::Instant::now());
                 Ok(())
             })
             .await
         });
-        // 等待慢闭包进入持锁执行段（ BUSY 分支的 sleep 退避在锁外）。
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let started = std::time::Instant::now();
+        // 等闭包确认进入首次持锁执行段，再等到持锁中段（远离窗口边界）。
+        while calls.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         store.set_config("k3", "v3").await.unwrap();
-        // 慢闭包此刻应处于「BUSY 后、锁外退避 sleep」阶段：插队写入应在
-        // 远小于退避时长（50ms+）加闭包执行时长（200ms）内完成。断言放宽到
-        // 150ms 以避免 CI 抖动误报，同时仍能区分「持锁 sleep 整段退避」。
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(150),
-            "退避期间锁应被释放，实际等了 {:?}",
-            started.elapsed()
-        );
+        let done_instant = std::time::Instant::now();
         slow.await.unwrap().unwrap();
+        let retry_at = *retry2_start.lock().unwrap();
+        let retry_at = retry_at.expect("重试应已发生");
+        assert!(
+            done_instant <= retry_at + std::time::Duration::from_millis(10),
+            "插队写入（完成于 {done_instant:?}）应先于退避重试（{retry_at:?}）——\
+             退避期间锁应已释放"
+        );
     }
 
     // ---------- 缺陷修复：迁移 CAS / 降级 ----------
