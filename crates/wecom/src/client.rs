@@ -74,11 +74,28 @@ impl WeComWsClient {
                     backoff = Duration::from_secs(1);
                 }
             }
-            tokio::time::sleep(backoff).await;
+            // P1：退避加 ±20% 随机 jitter（防多实例同步重连风暴），基础值仍按
+            // 指数增长（jitter 不参与翻倍，避免抖动累积漂移）。
+            tokio::time::sleep(jittered_backoff(backoff, rand_jitter())).await;
             backoff = (backoff * 2).min(BACKOFF_CAP);
         }
     }
+}
 
+/// P1：`[-0.2, 0.2]` 均匀随机 jitter 因子。
+fn rand_jitter() -> f64 {
+    use rand::Rng;
+    rand::thread_rng().gen_range(-0.2f64..=0.2f64)
+}
+
+/// P1：退避时长加 ±20% jitter（纯函数，便于单测）。固定退避序列会让多实例
+/// 在同一时刻断连后同步重连（重连风暴）。与 feishu client 的实现保持一致。
+fn jittered_backoff(base: Duration, factor: f64) -> Duration {
+    debug_assert!((-0.2..=0.2).contains(&factor));
+    Duration::from_secs_f64((base.as_secs_f64() * (1.0 + factor)).max(0.001))
+}
+
+impl WeComWsClient {
     /// 一次完整的「建连 → 认证 → 收发」循环。返回 `Err` 触发外层重连。
     async fn connect_and_serve(
         &self,
@@ -375,6 +392,18 @@ mod tests {
         assert!(HEARTBEAT_INTERVAL.as_secs() > 0);
         assert!(SUBSCRIBE_ACK_TIMEOUT.as_secs() > 0);
         assert!(BACKOFF_CAP >= Duration::from_secs(30));
+    }
+
+    /// P1：jitter 后退避始终落在 ±20% 区间内（防同步重连风暴但不漂移）。
+    #[test]
+    fn jitter_keeps_backoff_within_20pct() {
+        let base = Duration::from_secs(10);
+        assert_eq!(jittered_backoff(base, 0.2), Duration::from_secs(12));
+        assert_eq!(jittered_backoff(base, -0.2), Duration::from_secs(8));
+        for _ in 0..200 {
+            let j = jittered_backoff(base, rand_jitter());
+            assert!(j >= Duration::from_secs(8) && j <= Duration::from_secs(12), "j={j:?}");
+        }
     }
 
     #[tokio::test]

@@ -12,16 +12,22 @@
 //! - `session/prompt` → 触发一个 turn，期间 Agent 通过 `session/update` 通知流式推送
 //!   文本/工具调用/工具结果，本 backend 转成 [`AgentChunk`] 推入 chunks 通道。
 //! - `session/request_permission` → Agent 反向调用 Client 请求工具权限，本 backend 按
-//!   [`PermissionMode`] 自动响应（MVP，Ask 模式留 TODO）。
+//!   [`PermissionMode`] 自动响应；Ask 档经注入的 [`ImPermissionHook`]（B3）把审批卡
+//!   发进 IM 等用户 y/n，超时 deny（与 claude-cli 的 MCP 闭环同一 PermissionRouter
+//!   通道）。
 //!
-//! ## MVP 策略
+//! ## 连接模型（B2 / roadmap P5-14：per-conv 长驻连接）
 //!
-//! 当前每次 `run` spawn 一个新的 `claude-agent-acp` 子进程并在 turn 结束后随连接退出
-//! （功能正确优先）。**跨 run 复用进程与 session 缓存**（性能优化的核心收益）作为后续
-//! TODO：需要 `AcpBackend` 持有长驻子进程句柄 + session 缓存，复杂度高，单独迭代。
+//! 每个 conv（IM 会话）一条独立长驻连接（spawn 一个 `claude-agent-acp` 子进程），
+//! 惰性建立（首次 run 时）、空闲 [`CONN_IDLE_RECYCLE`] 回收、并发上限
+//! [`MAX_CONCURRENT_CONNS`]（超限拒绝并回可读错误）。单会话的超时 cancel /
+//! LoadSession 失败只杀**该会话的**连接（旧实现全局单连接 + 串行主循环，A 的长任务
+//! 让 B 排队烧 agent_timeout，A 的 cancel 殃及所有会话——P5-14）。子进程由 SDK 的
+//! ChildGuard 在 connection drop 时 kill（无泄漏）。
 //!
 //! [`AgentChunk`]: imagent_core::AgentChunk
 
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -35,11 +41,12 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{AcpAgent, Client, ConnectionTo};
 use async_trait::async_trait;
 use imagent_core::{
-    AgentChunk, Backend, CoreError, LocalSession, PermissionMode, Result, RunOutcome, SessionId,
+    AgentChunk, Backend, CoreError, ImPermissionAsk, ImPermissionHook, LocalSession,
+    PermissionCapability, PermissionMode, Result, RunOutcome, SessionId,
 };
 use parking_lot::RwLock;
 use tokio::sync::Mutex;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// ACP backend 的固定名称。
 const NAME: &str = "claude-acp";
@@ -47,16 +54,30 @@ const NAME: &str = "claude-acp";
 /// 默认 spawn 的 agent 命令（PATH 可见的 `claude-agent-acp`）。
 const DEFAULT_AGENT_CMD: &str = "claude-agent-acp";
 
+/// B2/P5-14：per-conv 连接的并发上限（= 同时存活的 claude-agent-acp 子进程数）。
+/// 超限直接拒绝（回可读错误）而非排队——排队会把排队时长烧进 agent_timeout
+/// （正是 P5-14 要修的问题），拒绝让用户侧显式重试/减少并发。
+const MAX_CONCURRENT_CONNS: usize = 8;
+
+/// B2/P5-14：连接空闲回收时长：该 conv 的连接在此窗口内没有任何新 prompt，则断开
+/// 连接（子进程由 ChildGuard kill）、从 map 移除。防低频会话长期占用子进程名额
+/// （泄漏回收保底；shutdown 时 [`AcpBackend::shutdown`] 全量清理）。
+const CONN_IDLE_RECYCLE: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// `claude-agent-acp` 长驻子进程 Backend（ACP/JSON-RPC）。
 ///
 /// 持有共享的 [`PermissionMode`] 句柄（与 [`crate::ClaudeBackend`] 一致，支持 SIGHUP
-/// 热重载）。每次 `run` 用 [`AcpAgent`] spawn 一个子进程，跑完一个 turn 后退出。
+/// 热重载）。连接按 conv 惰性建立、长驻复用（见模块级「连接模型」）。
 pub struct AcpBackend {
     permission_mode: Arc<RwLock<PermissionMode>>,
-    /// 长驻 AcpAgent/connection（跨 run 复用 claude-agent-acp 子进程，P1-4）。
-    /// None=未启动或上次崩溃；run 时 lazy get_or_init。子进程由 SDK 的 ChildGuard 在
-    /// connection drop 时 kill（无泄漏）。
-    long_lived: Arc<Mutex<Option<Arc<LongLivedAcp>>>>,
+    /// B3：dispatcher 注入的 IM 审批闭环回调（run() 启动时注入一次；None =
+    /// 未注入（独立使用/测试），Ask 档 fail-closed）。
+    hook: RwLock<Option<ImPermissionHook>>,
+    /// B2/P5-14：conv_id → 长驻连接 map（惰性建立；task 退出时自摘除）。
+    conns: Arc<Mutex<HashMap<String, Arc<LongLivedAcp>>>>,
+    /// 测试专用：mock transport 工厂（in-process 假 agent，替代 spawn 子进程）。
+    #[cfg(test)]
+    mock_factory: Option<Arc<dyn Fn() -> agent_client_protocol::Channel + Send + Sync>>,
 }
 
 impl AcpBackend {
@@ -64,7 +85,10 @@ impl AcpBackend {
     pub fn new() -> Self {
         Self {
             permission_mode: Arc::new(RwLock::new(PermissionMode::Off)),
-            long_lived: Arc::new(Mutex::new(None)),
+            hook: RwLock::new(None),
+            conns: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            mock_factory: None,
         }
     }
 
@@ -72,7 +96,10 @@ impl AcpBackend {
     pub fn with_permission_mode(mode: PermissionMode) -> Self {
         Self {
             permission_mode: Arc::new(RwLock::new(mode)),
-            long_lived: Arc::new(Mutex::new(None)),
+            hook: RwLock::new(None),
+            conns: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            mock_factory: None,
         }
     }
 
@@ -81,8 +108,21 @@ impl AcpBackend {
     pub fn with_permission_mode_shared(mode: Arc<RwLock<PermissionMode>>) -> Self {
         Self {
             permission_mode: mode,
-            long_lived: Arc::new(Mutex::new(None)),
+            hook: RwLock::new(None),
+            conns: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            mock_factory: None,
         }
+    }
+
+    /// 测试专用：注入 mock transport 工厂（每个新建连接调用一次）。
+    #[cfg(test)]
+    fn with_mock_factory(
+        mut self,
+        f: Arc<dyn Fn() -> agent_client_protocol::Channel + Send + Sync>,
+    ) -> Self {
+        self.mock_factory = Some(f);
+        self
     }
 
     /// 解析要 spawn 的 agent 命令字符串。
@@ -94,19 +134,76 @@ impl AcpBackend {
         std::env::var("IMAGENT_ACP_COMMAND").unwrap_or_else(|_| DEFAULT_AGENT_CMD.into())
     }
 
-    /// 取（或启动）长驻 AcpAgent task。已存活（prompt_tx 未关闭）则复用；否则重建。
-    /// 子进程复用 = 性能收益（不再每次 run spawn claude-agent-acp）。
-    async fn long_lived(&self) -> Result<Arc<LongLivedAcp>> {
-        let mut g = self.long_lived.lock().await;
-        if let Some(ll) = g.as_ref() {
-            if !ll.prompt_tx.is_closed() {
-                return Ok(ll.clone());
-            }
+    /// B2/P5-14：取（或启动）该 conv 的长驻连接。存活（prompt_tx 未关闭）则复用；
+    /// 僵尸条目顺手清理；新建受 [`MAX_CONCURRENT_CONNS`] 上限约束（超限拒绝）。
+    async fn long_lived(&self, conv: &str) -> Result<Arc<LongLivedAcp>> {
+        let mut g = self.conns.lock().await;
+        // 顺手清理僵尸条目（task 已退出的连接），让上限计数只算活连接。
+        g.retain(|_, v| !v.prompt_tx.is_closed());
+        if let Some(ll) = g.get(conv) {
+            return Ok(ll.clone());
         }
-        let ll = LongLivedAcp::spawn(Self::agent_command(), Arc::clone(&self.permission_mode))?;
-        *g = Some(ll.clone());
+        if g.len() >= MAX_CONCURRENT_CONNS {
+            return Err(CoreError::Backend(
+                NAME,
+                format!(
+                    "ACP 并发连接已达上限 {MAX_CONCURRENT_CONNS}（每会话一条长驻子进程连接），\
+                     本会话请求被拒绝；请减少并发会话，或等待空闲连接回收（{} 分钟）后重试",
+                    CONN_IDLE_RECYCLE.as_secs() / 60
+                ),
+            ));
+        }
+        let hook = self.hook.read().clone();
+        let ll = match self.spawn_transport().await? {
+            Transport::Real(agent) => LongLivedAcp::spawn(
+                agent,
+                Arc::clone(&self.permission_mode),
+                hook,
+                conv.to_string(),
+                Arc::clone(&self.conns),
+            )?,
+            #[cfg(test)]
+            Transport::Mock(ch) => LongLivedAcp::spawn(
+                ch,
+                Arc::clone(&self.permission_mode),
+                hook,
+                conv.to_string(),
+                Arc::clone(&self.conns),
+            )?,
+        };
+        g.insert(conv.to_string(), ll.clone());
         Ok(ll)
     }
+
+    /// 建立 transport：真机走 `AcpAgent`（spawn claude-agent-acp 子进程），测试可注入
+    /// in-process mock（见 [`Self::with_mock_factory`]）。
+    async fn spawn_transport(&self) -> Result<Transport> {
+        #[cfg(test)]
+        if let Some(f) = &self.mock_factory {
+            return Ok(Transport::Mock(f()));
+        }
+        let agent = AcpAgent::from_str(&Self::agent_command())
+            .map_err(|e| CoreError::Backend(NAME, format!("解析 agent 命令失败: {e}")))?;
+        Ok(Transport::Real(agent))
+    }
+
+    /// B2：shutdown 全量清理——断开全部 per-conv 连接（map 清空后最后一个 sender
+    /// drop → 长驻 task 的 recv 返回 None → connect_with 闭包返回 → connection
+    /// drop → SDK ChildGuard kill 子进程）。独立部署（非 dispatcher 注入）时由
+    /// 持有方调用；进程退出路径由空闲回收 + OS 清理兜底。
+    pub async fn shutdown(&self) {
+        let conns: Vec<Arc<LongLivedAcp>> =
+            self.conns.lock().await.drain().map(|(_, v)| v).collect();
+        drop(conns); // 释放 map 内的 sender 克隆（task 侧 rx 随之关闭）
+        info!(target: "claude-acp", "ACP 连接已全量清理（shutdown）");
+    }
+}
+
+/// 长驻连接的 transport 来源（真机子进程 / 测试 in-process mock）。
+enum Transport {
+    Real(AcpAgent),
+    #[cfg(test)]
+    Mock(agent_client_protocol::Channel),
 }
 
 impl Default for AcpBackend {
@@ -135,7 +232,7 @@ impl StreamState {
     }
 }
 
-/// 长驻 AcpAgent/connection：跨 run 复用 claude-agent-acp 子进程（P1-4）。
+/// 长驻 AcpAgent/connection：单 conv 的跨 run 复用（B2/P5-14）。
 struct LongLivedAcp {
     prompt_tx: tokio::sync::mpsc::Sender<PromptReq>,
     _task: tokio::task::JoinHandle<()>,
@@ -149,25 +246,36 @@ struct PromptReq {
     chunks: tokio::sync::mpsc::Sender<AgentChunk>,
     resp: tokio::sync::oneshot::Sender<Result<RunOutcome>>,
     /// P1-E：cancel 信号——run future drop（dispatch 超时）时 sender drop，
-    /// 长驻 task select 检测后 break → 杀连接，防子进程资源泄漏。
+    /// 长驻 task select 检测后 break → 杀**本 conv 的**连接（B2：不再殃及他 conv）。
     cancel: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl LongLivedAcp {
-    /// spawn 长驻 task：`connect_with` 建连接（spawn claude-agent-acp 子进程；SDK
-    /// `ChildGuard` 在 connection drop 时 kill，无泄漏），main_fn 内 loop 接收 prompt
-    /// 跨 run 复用同一子进程 + connection。
-    fn spawn(
-        agent_cmd: String,
+    /// spawn 单 conv 的长驻 task：`connect_with` 建连接（spawn claude-agent-acp 子
+    /// 进程；SDK `ChildGuard` 在 connection drop 时 kill，无泄漏），main_fn 内 loop
+    /// 接收 prompt 跨 run 复用同一子进程 + connection。
+    ///
+    /// 泛型 `T`：真机为 `AcpAgent`（子进程 stdio）；测试为 in-process `Channel`
+    /// （假 agent，见 tests）。
+    fn spawn<T>(
+        transport: T,
         perm_mode: Arc<RwLock<PermissionMode>>,
-    ) -> Result<Arc<LongLivedAcp>> {
-        let agent = AcpAgent::from_str(&agent_cmd)
-            .map_err(|e| CoreError::Backend(NAME, format!("解析 agent 命令失败: {e}")))?;
+        hook: Option<ImPermissionHook>,
+        conv: String,
+        conns: Arc<Mutex<HashMap<String, Arc<LongLivedAcp>>>>,
+    ) -> Result<Arc<LongLivedAcp>>
+    where
+        T: agent_client_protocol::ConnectTo<Client> + 'static,
+    {
         let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::channel::<PromptReq>(8);
+        // 自摘除用：与返回的 LongLivedAcp.prompt_tx 同一 channel（same_channel 比对，
+        // 防误删已被重建替代的新条目）。
+        let tx_for_cleanup = prompt_tx.clone();
         let current: Arc<Mutex<Option<StreamState>>> = Arc::new(Mutex::new(None));
         let current_for_notif = current.clone();
         let current_for_main = current.clone();
         let perm_for_handler = perm_mode;
+        let conv_for_handler = conv.clone();
         let _task = tokio::spawn(async move {
             let _ = Client
                 .builder()
@@ -184,12 +292,21 @@ impl LongLivedAcp {
                     async move |request: RequestPermissionRequest,
                                 responder,
                                 _cx: ConnectionTo<_>| {
-                        let outcome = permission_outcome(&request, &perm_for_handler);
+                        // B3：Ask/AutoClaude 档经注入的 IM 审批闭环回调（与
+                        // claude-cli 的 MCP → socket → PermissionRouter 同一通道）；
+                        // 超时 deny 由 hook 内部（permission_ask_timeout）兜底。
+                        let outcome = permission_outcome(
+                            &request,
+                            &conv_for_handler,
+                            &perm_for_handler,
+                            hook.as_ref(),
+                        )
+                        .await;
                         responder.respond(RequestPermissionResponse::new(outcome))
                     },
                     agent_client_protocol::on_receive_request!(),
                 )
-                .connect_with(agent, |connection: ConnectionTo<_>| async move {
+                .connect_with(transport, |connection: ConnectionTo<_>| async move {
                     connection
                         .send_request(InitializeRequest::new(ProtocolVersion::V1))
                         .block_task()
@@ -200,7 +317,25 @@ impl LongLivedAcp {
                     // 在旧上下文。这里仅跟踪**连接当前已 load 的 session**（同 sid 连续
                     // 轮次免重复 LoadSession 的纯优化），无 per-conv 状态。
                     let mut loaded: Option<String> = None;
-                    while let Some(req) = prompt_rx.recv().await {
+                    // B2/P5-14：每轮用 sleep_until 实现空闲回收——完成一个 turn 后
+                    // 重新起算 CONN_IDLE_RECYCLE 窗口，窗口内无新 prompt 则退出
+                    //（connection drop → ChildGuard kill 子进程，名额让出）。
+                    loop {
+                        let deadline = tokio::time::Instant::now() + CONN_IDLE_RECYCLE;
+                        let req = tokio::select! {
+                            _ = tokio::time::sleep_until(deadline) => {
+                                info!(
+                                    target: "claude-acp",
+                                    idle_secs = CONN_IDLE_RECYCLE.as_secs(),
+                                    "连接空闲回收：断开本 conv 的 ACP 连接"
+                                );
+                                break;
+                            }
+                            r = prompt_rx.recv() => match r {
+                                Some(r) => r,
+                                None => break, // 所有 sender drop（shutdown 清理）
+                            },
+                        };
                         let st = StreamState::new(req.chunks.clone());
                         *current_for_main.lock().await = Some(st.clone());
                         let cwd = req.cwd.clone();
@@ -208,10 +343,7 @@ impl LongLivedAcp {
                             Some(s) if loaded.as_deref() == Some(s.as_str()) => s,
                             Some(s) => {
                                 connection
-                                    .send_request(LoadSessionRequest::new(
-                                        s.clone(),
-                                        cwd.clone(),
-                                    ))
+                                    .send_request(LoadSessionRequest::new(s.clone(), cwd.clone()))
                                     .block_task()
                                     .await?;
                                 loaded = Some(s.clone());
@@ -243,8 +375,9 @@ impl LongLivedAcp {
                             .block_task();
                         tokio::pin!(prompt_fut);
                         // P1-E：run future 被 cancel（dispatch agent_timeout 超时 drop）时，
-                        // cancel sender drop → select 命中 cancel 分支 → break 退出 while →
-                        // connect_with 闭包返回 → connection drop → SDK ChildGuard kill 子进程。
+                        // cancel sender drop → select 命中 cancel 分支 → break 退出
+                        // loop → connect_with 闭包返回 → connection drop → SDK
+                        // ChildGuard kill 子进程。B2：per-conv 连接，只杀本会话。
                         tokio::select! {
                             res = &mut prompt_fut => match res {
                                 Ok(_) => {
@@ -266,7 +399,7 @@ impl LongLivedAcp {
                             _ = req.cancel => {
                                 let _ = req.resp.send(Err(CoreError::Backend(
                                     NAME,
-                                    "acp prompt 被 cancel（run 超时/drop，已杀连接）".into(),
+                                    "acp prompt 被 cancel（run 超时/drop，已杀本会话连接）".into(),
                                 )));
                                 break;
                             }
@@ -280,8 +413,16 @@ impl LongLivedAcp {
                     Ok(())
                 })
                 .await;
-            // 连接断开（子进程退出/崩溃）：长驻 task 结束，prompt_tx drop。
-            // 下次 run() 检测 is_closed → 重建（SDK ChildGuard 已 kill 子进程，无泄漏）。
+            // 连接断开（子进程退出/崩溃/空闲回收/cancel）：长驻 task 结束。B2：从
+            // map 自摘除（same_channel 防误删已被重建替代的新条目）；prompt_tx 随之
+            // 关闭，下次 run() 检测后重建。
+            let mut g = conns.lock().await;
+            let is_mine = g
+                .get(&conv)
+                .is_some_and(|cur| cur.prompt_tx.same_channel(&tx_for_cleanup));
+            if is_mine {
+                g.remove(&conv);
+            }
         });
         Ok(Arc::new(LongLivedAcp { prompt_tx, _task }))
     }
@@ -293,6 +434,17 @@ impl Backend for AcpBackend {
         NAME
     }
 
+    /// B3：Ask/AutoClaude 档经注入的 ImPermissionHook 走 IM 审批闭环
+    /// （session/request_permission → 审批卡 → y/n / 超时 deny）。
+    fn permission_capability(&self) -> PermissionCapability {
+        PermissionCapability::FullLoop
+    }
+
+    /// B3：dispatcher `run()` 启动时注入 IM 审批闭环回调（新连接 spawn 时读取）。
+    fn set_im_permission_hook(&self, hook: Option<ImPermissionHook>) {
+        *self.hook.write() = hook;
+    }
+
     /// P4-11：ACP 的 LoadSession 与 CLI 的 --resume 共用同一 claude 会话存储，
     /// 扫描逻辑同 ClaudeBackend。
     async fn list_local_sessions(&self, workdir: &std::path::Path) -> Vec<LocalSession> {
@@ -301,7 +453,7 @@ impl Backend for AcpBackend {
 
     async fn run(
         &self,
-        _conv_id: &str,
+        conv_id: &str,
         prompt: &str,
         session: Option<&SessionId>,
         workdir: &std::path::Path,
@@ -319,32 +471,46 @@ impl Backend for AcpBackend {
             );
         }
 
-        // 取（或启动）长驻 AcpAgent task，跨 run 复用子进程 + connection（P1-4）。
-        let ll = self.long_lived().await?;
-        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        // P1-E：cancel_tx 随 run future 生命周期——run 正常完成或被 drop（超时）时
-        // drop，触发长驻 task select 的 cancel 分支（杀连接，防子进程泄漏）。
-        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
-        ll.prompt_tx
-            .send(PromptReq {
+        // B2/P5-14：取（或启动）本 conv 的长驻连接（惰性建立、并发上限）。
+        let mut ll = self.long_lived(conv_id).await?;
+        for attempt in 0..2 {
+            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+            // P1-E：cancel_tx 随 run future 生命周期——run 正常完成或被 drop（超时）时
+            // drop，触发长驻 task select 的 cancel 分支（杀本会话连接，防子进程泄漏）。
+            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+            let send = ll.prompt_tx.send(PromptReq {
                 prompt: prompt.to_string(),
                 session: session.map(|s| s.0.clone()),
                 cwd: workdir.to_path_buf(),
                 chunks: chunks.clone(),
                 resp: resp_tx,
                 cancel: cancel_rx,
-            })
-            .await
-            .map_err(|_| {
-                CoreError::Backend(
-                    NAME,
-                    "长驻 ACP task 已退出（可能崩溃，下次 run 将重建）".into(),
-                )
-            })?;
-        let _cancel_guard = cancel_tx;
-        resp_rx
-            .await
-            .map_err(|_| CoreError::Backend(NAME, "长驻 ACP task 无响应".into()))?
+            });
+            match send.await {
+                Ok(()) => {
+                    let _cancel_guard = cancel_tx;
+                    return resp_rx
+                        .await
+                        .map_err(|_| CoreError::Backend(NAME, "长驻 ACP task 无响应".into()))?;
+                }
+                Err(_) if attempt == 0 => {
+                    // 发送失败 = 连接刚好退出（空闲回收/崩溃竞态）：重建一次。
+                    warn!(
+                        target: "claude-acp",
+                        conv_id,
+                        "长驻 ACP task 已退出（竞态），重建连接重试一次"
+                    );
+                    ll = self.long_lived(conv_id).await?;
+                }
+                Err(_) => {
+                    return Err(CoreError::Backend(
+                        NAME,
+                        "长驻 ACP task 已退出（重建后仍失败，下次 run 将再重建）".into(),
+                    ));
+                }
+            }
+        }
+        unreachable!("重试循环最多两轮")
     }
 }
 
@@ -429,42 +595,91 @@ fn text_of(block: &ContentBlock) -> Option<String> {
     }
 }
 
-/// 按 [`PermissionMode`] 计算 `session/request_permission` 的响应 outcome（MVP 自动策略）。
+/// 按字符截断到 n（审批卡 input 摘要用），超出加省略号。
+fn truncate_chars(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let t: String = s.chars().take(n).collect();
+        format!("{t}…")
+    }
+}
+
+/// 按 [`PermissionMode`] 计算 `session/request_permission` 的响应 outcome。
 ///
 /// - `Allow` / `Off`（默认）→ 选一个 allow 类选项（让 claude 按 allowed_tools 自理，
 ///   等同 CLI 的 Off 行为）。
 /// - `Deny` → 选一个 reject 类选项；若无则 Cancelled。
-/// - `Ask`（IM 审批闭环）→ ACP 后端尚未接 PermissionRouter，**fail-closed**：选 reject
-///   类选项（若无则 Cancelled），绝不静默放行。如需 IM 审批闭环请用 claude-cli 后端。
-fn permission_outcome(
+/// - `Ask` / `AutoClaude`（IM 审批闭环）→ B3：经注入的 [`ImPermissionHook`] 把审批
+///   卡发进 IM、等待 y/n（超时 deny，由 hook 内部的 permission_ask_timeout 兜底），
+///   按结果选 allow/reject 类选项；hook 未注入（独立使用）时 fail-closed 拒绝。
+async fn permission_outcome(
     request: &RequestPermissionRequest,
+    conv: &str,
     mode: &RwLock<PermissionMode>,
+    hook: Option<&ImPermissionHook>,
 ) -> RequestPermissionOutcome {
     let mode = *mode.read();
     match mode {
-        PermissionMode::Deny => select_option(&request.options, false)
-            .map(|id| RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(id)))
-            .unwrap_or(RequestPermissionOutcome::Cancelled),
+        PermissionMode::Deny => reject_outcome(&request.options),
         // Auto 不会出现在运行时句柄里（main/SIGHUP//perm 均先 resolve）；
         // 防御性按未接线=放行 Off 同路处理（resolve 后 ACP 本就映射 Off）。
         PermissionMode::Allow | PermissionMode::Off | PermissionMode::Auto => {
             allow_outcome(&request.options)
         }
-        // AutoClaude 也进不来（resolve 只在 claude-cli 产生；防御性同 Ask fail-closed）。
         PermissionMode::Ask | PermissionMode::AutoClaude => {
-            // ACP 后端尚未接入 IM 审批闭环（需把 core 的 PermissionRouter 接到 ACP 的
-            // session/request_permission 通知通道，复杂度高）。为安全（fail-closed），
-            // Ask 模式下拒绝每次权限请求，而非静默放行。如需 IM 审批闭环，请用
-            // claude-cli 后端（config: agent = "claude-cli"）。
-            warn!(
-                target: "claude-acp",
-                "Ask 权限模式在 ACP 后端不可用（未接 IM 审批闭环），按 fail-closed 拒绝该次权限请求"
+            let Some(hook) = hook else {
+                // B3：hook 未注入（backend 被独立使用、未经 Dispatcher::run 注入）时
+                // 无 IM 闭环可用，fail-closed 拒绝（绝不静默放行）。
+                warn!(
+                    target: "claude-acp",
+                    "Ask 权限模式但 IM 审批回调未注入（backend 未挂到 Dispatcher？），fail-closed 拒绝该次权限请求"
+                );
+                return reject_outcome(&request.options);
+            };
+            // 映射到现有审批卡渲染：tool_name 用工具调用 title（人读，如
+            // "Read src/main.rs"；无 title 时回退 tool_call_id），input 摘要取
+            // raw_input JSON（截断 2000，与 socket 闭环同口径）。注意 ACP 请求无
+            // 精确工具名，approval_tools 匹配为 best-effort（title 首词通常即工具名）。
+            let tool_name = request
+                .tool_call
+                .fields
+                .title
+                .clone()
+                .unwrap_or_else(|| request.tool_call.tool_call_id.to_string());
+            let input_summary = truncate_chars(
+                &request
+                    .tool_call
+                    .fields
+                    .raw_input
+                    .as_ref()
+                    .map(|v| serde_json::to_string(v).unwrap_or_else(|_| v.to_string()))
+                    .unwrap_or_default(),
+                2000,
             );
-            select_option(&request.options, false)
-                .map(|id| RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(id)))
-                .unwrap_or(RequestPermissionOutcome::Cancelled)
+            let request_id = format!("acp-{}", request.tool_call.tool_call_id);
+            let allow = hook(ImPermissionAsk {
+                conv_id: conv.to_string(),
+                request_id,
+                tool_name,
+                input_summary,
+            })
+            .await;
+            if allow {
+                allow_outcome(&request.options)
+            } else {
+                // 用户拒绝 / 超时 deny（hook 内部已收敛 pending 与询问卡）。
+                reject_outcome(&request.options)
+            }
         }
     }
+}
+
+/// 选一个 reject 类选项构造 outcome；无 reject 选项则 Cancelled（fail-closed）。
+fn reject_outcome(options: &[PermissionOption]) -> RequestPermissionOutcome {
+    select_option(options, false)
+        .map(|id| RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(id)))
+        .unwrap_or(RequestPermissionOutcome::Cancelled)
 }
 
 /// 选一个 allow 类选项构造 outcome；若无 allow 选项则取首个；都没有则 Cancelled。
@@ -494,13 +709,27 @@ fn select_option(options: &[PermissionOption], allow: bool) -> Option<Permission
 mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{
-        ContentChunk, ToolCall, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
+        AgentCapabilities, ContentChunk, InitializeResponse, LoadSessionRequest,
+        LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptResponse, StopReason,
+        ToolCall, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
     };
+    use agent_client_protocol::{Agent, Channel};
+    use std::time::Duration;
 
     #[test]
     fn name_is_claude_acp() {
         assert_eq!(AcpBackend::new().name(), "claude-acp");
         assert_eq!(AcpBackend::default().name(), "claude-acp");
+    }
+
+    #[test]
+    fn capability_is_full_loop() {
+        // B3：ACP 接入 PermissionRouter（ImPermissionHook）后声明 FullLoop
+        //（启动期 ask/auto-claude 档放行）。
+        assert_eq!(
+            AcpBackend::new().permission_capability(),
+            PermissionCapability::FullLoop
+        );
     }
 
     #[test]
@@ -533,11 +762,9 @@ mod tests {
     }
 
     fn dummy_perm_request(options: Vec<PermissionOption>) -> RequestPermissionRequest {
-        RequestPermissionRequest::new(
-            "s",
-            ToolCallUpdate::new("tc-1", ToolCallUpdateFields::default()),
-            options,
-        )
+        let mut tc = ToolCallUpdate::new("tc-1", ToolCallUpdateFields::default());
+        tc.fields.title = Some("Read src/main.rs".into());
+        RequestPermissionRequest::new("s", tc, options)
     }
 
     fn perm_option(id: &str, kind: PermissionOptionKind) -> PermissionOption {
@@ -609,14 +836,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn permission_outcome_deny_picks_reject() {
+    #[tokio::test]
+    async fn permission_outcome_deny_picks_reject() {
         let request = dummy_perm_request(vec![
             perm_option("allow", PermissionOptionKind::AllowOnce),
             perm_option("reject", PermissionOptionKind::RejectOnce),
         ]);
         let mode = RwLock::new(PermissionMode::Deny);
-        match permission_outcome(&request, &mode) {
+        match permission_outcome(&request, "c", &mode, None).await {
             RequestPermissionOutcome::Selected(sel) => {
                 assert_eq!(sel.option_id.0.as_ref(), "reject")
             }
@@ -624,14 +851,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn permission_outcome_allow_picks_allow() {
+    #[tokio::test]
+    async fn permission_outcome_allow_picks_allow() {
         let request = dummy_perm_request(vec![
             perm_option("reject", PermissionOptionKind::RejectOnce),
             perm_option("allow", PermissionOptionKind::AllowAlways),
         ]);
         let mode = RwLock::new(PermissionMode::Allow);
-        match permission_outcome(&request, &mode) {
+        match permission_outcome(&request, "c", &mode, None).await {
             RequestPermissionOutcome::Selected(sel) => {
                 assert_eq!(sel.option_id.0.as_ref(), "allow")
             }
@@ -639,15 +866,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn permission_outcome_off_falls_back_to_first() {
+    #[tokio::test]
+    async fn permission_outcome_off_falls_back_to_first() {
         // 无 allow 选项时，Off 走 allow_outcome → 取首个兜底。
         let request = dummy_perm_request(vec![perm_option(
             "reject",
             PermissionOptionKind::RejectOnce,
         )]);
         let mode = RwLock::new(PermissionMode::Off);
-        match permission_outcome(&request, &mode) {
+        match permission_outcome(&request, "c", &mode, None).await {
             RequestPermissionOutcome::Selected(sel) => {
                 assert_eq!(sel.option_id.0.as_ref(), "reject")
             }
@@ -655,40 +882,53 @@ mod tests {
         }
     }
 
-    #[test]
-    fn permission_outcome_empty_options_cancels() {
+    #[tokio::test]
+    async fn permission_outcome_empty_options_cancels() {
         let request = dummy_perm_request(vec![]);
         let mode = RwLock::new(PermissionMode::Allow);
         assert!(matches!(
-            permission_outcome(&request, &mode),
+            permission_outcome(&request, "c", &mode, None).await,
             RequestPermissionOutcome::Cancelled
         ));
     }
 
-    #[test]
-    fn permission_outcome_ask_fails_closed() {
-        // Ask 在 ACP 后端 fail-closed：有 reject 选项时必选 reject，绝不放行。
+    #[tokio::test]
+    async fn permission_outcome_ask_without_hook_fails_closed() {
+        // Ask + hook 未注入：fail-closed——有 reject 选项时必选 reject，绝不放行。
         let request = dummy_perm_request(vec![
             perm_option("allow", PermissionOptionKind::AllowOnce),
             perm_option("reject", PermissionOptionKind::RejectOnce),
         ]);
         let mode = RwLock::new(PermissionMode::Ask);
-        match permission_outcome(&request, &mode) {
+        match permission_outcome(&request, "c", &mode, None).await {
             RequestPermissionOutcome::Selected(sel) => {
                 assert_eq!(
                     sel.option_id.0.as_ref(),
                     "reject",
-                    "Ask 必须 fail-closed 选 reject"
+                    "Ask 无 hook 必须 fail-closed 选 reject"
                 )
             }
-            RequestPermissionOutcome::Cancelled => { /* 无 reject 时 cancel 也算 fail-closed */
-            }
+            RequestPermissionOutcome::Cancelled => { /* 无 reject 时 cancel 也算 fail-closed */ }
             _ => panic!("Ask 应 fail-closed：Selected(reject) 或 Cancelled"),
         }
     }
 
-    #[test]
-    fn permission_outcome_deny_without_reject_cancels() {
+    #[tokio::test]
+    async fn permission_outcome_ask_without_reject_cancels() {
+        // 回归保护：Ask 模式 fail-closed，无 Reject* 时应 Cancelled，绝不放行。
+        let request = dummy_perm_request(vec![
+            perm_option("allow1", PermissionOptionKind::AllowOnce),
+            perm_option("allow2", PermissionOptionKind::AllowAlways),
+        ]);
+        let mode = RwLock::new(PermissionMode::Ask);
+        assert!(matches!(
+            permission_outcome(&request, "c", &mode, None).await,
+            RequestPermissionOutcome::Cancelled
+        ));
+    }
+
+    #[tokio::test]
+    async fn permission_outcome_deny_without_reject_cancels() {
         // 回归保护：Deny 模式下若 options 只含 Allow*（无 Reject*），
         // 修复前会被 select_option 的无条件 fallback 击穿为 Selected(Allow)。
         let request = dummy_perm_request(vec![
@@ -697,24 +937,246 @@ mod tests {
         ]);
         let mode = RwLock::new(PermissionMode::Deny);
         assert!(matches!(
-            permission_outcome(&request, &mode),
+            permission_outcome(&request, "c", &mode, None).await,
             RequestPermissionOutcome::Cancelled
         ));
     }
 
-    #[test]
-    fn permission_outcome_ask_without_reject_cancels() {
-        // 回归保护：Ask 模式 fail-closed，无 Reject* 时应 Cancelled，绝不放行。
+    /// B3：Ask + hook 注入——hook 放行 → allow 类选项；hook 拒绝/超时 → reject 类。
+    #[tokio::test]
+    async fn permission_outcome_ask_via_hook_allow_and_deny() {
         let request = dummy_perm_request(vec![
-            perm_option("allow1", PermissionOptionKind::AllowOnce),
-            perm_option("allow2", PermissionOptionKind::AllowAlways),
+            perm_option("allow", PermissionOptionKind::AllowOnce),
+            perm_option("reject", PermissionOptionKind::RejectOnce),
         ]);
         let mode = RwLock::new(PermissionMode::Ask);
-        assert!(matches!(
-            permission_outcome(&request, &mode),
-            RequestPermissionOutcome::Cancelled
-        ));
+
+        let allow_hook: ImPermissionHook = Arc::new(|ask| {
+            Box::pin(async move {
+                // 映射检查：title → tool_name，request_id 带 acp- 前缀。
+                assert_eq!(ask.tool_name, "Read src/main.rs");
+                assert!(ask.request_id.starts_with("acp-"));
+                true
+            })
+        });
+        match permission_outcome(&request, "c", &mode, Some(&allow_hook)).await {
+            RequestPermissionOutcome::Selected(sel) => {
+                assert_eq!(sel.option_id.0.as_ref(), "allow", "hook 放行应选 allow")
+            }
+            _ => panic!("hook allow 应选中 allow 选项"),
+        }
+
+        let deny_hook: ImPermissionHook = Arc::new(|_| Box::pin(async move { false }));
+        match permission_outcome(&request, "c", &mode, Some(&deny_hook)).await {
+            RequestPermissionOutcome::Selected(sel) => {
+                assert_eq!(sel.option_id.0.as_ref(), "reject", "hook 拒绝应选 reject")
+            }
+            _ => panic!("hook deny 应选中 reject 选项"),
+        }
     }
+
+    // ------------------------------------------------------------------
+    // B2/P5-14：per-conv 连接行为测试（in-process 假 agent，无子进程）。
+    //
+    // 假 agent = SDK `Agent` role 挂在 `Channel::duplex()` 一端：处理
+    // initialize/session/new/session/load/session/prompt，prompt 到达后先推一条
+    // AgentMessageChunk 通知，再等 release 闸门放行才回 PromptResponse——用闸门
+    // 模拟「长任务」，验证两 conv 不互相阻塞、单 conv cancel 不杀另一 conv。
+    // ------------------------------------------------------------------
+
+    /// 起一个假 agent，返回 client 侧 Channel 端点 + prompt 完成闸门
+    /// （watch：send(true) 放行本轮 turn）。
+    fn spawn_mock_agent(
+        session_prefix: &'static str,
+    ) -> (Channel, tokio::sync::watch::Sender<bool>) {
+        let (agent_side, client_side) = Channel::duplex();
+        let (release_tx, mut release_rx) = tokio::sync::watch::channel(false);
+        let sid = format!("{session_prefix}-s1");
+        let sid_for_prompt = sid.clone();
+        tokio::spawn(async move {
+            let _ = Agent
+                .builder()
+                .name(format!("mock-{session_prefix}"))
+                .on_receive_request(
+                    async move |req: InitializeRequest, responder, _cx: ConnectionTo<_>| {
+                        responder.respond(
+                            InitializeResponse::new(req.protocol_version)
+                                .agent_capabilities(AgentCapabilities::new()),
+                        )
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |_req: NewSessionRequest, responder, _cx: ConnectionTo<_>| {
+                        responder.respond(NewSessionResponse::new(sid.clone()))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |_req: LoadSessionRequest, responder, _cx: ConnectionTo<_>| {
+                        responder.respond(LoadSessionResponse::new())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |req: PromptRequest, responder, cx: ConnectionTo<_>| {
+                        // 先推一条流式文本（走 session/update 通知路径）。
+                        cx.send_notification(SessionNotification::new(
+                            sid_for_prompt.clone(),
+                            SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                ContentBlock::Text(TextContent::new(format!(
+                                    "echo:{}",
+                                    req.prompt.first().and_then(text_of).unwrap_or_default()
+                                ))),
+                            )),
+                        ))?;
+                        // 等闸门放行（模拟长任务）。
+                        while !*release_rx.borrow_and_update() {
+                            if release_rx.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                        responder.respond(PromptResponse::new(StopReason::EndTurn))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_to(agent_side)
+                .await;
+        });
+        (client_side, release_tx)
+    }
+
+    /// 按注入顺序给每个新 conv 分发一条 mock 通道。
+    fn backend_with_mocks(a: Channel, b: Channel) -> AcpBackend {
+        let which = std::sync::Mutex::new(std::collections::VecDeque::from(vec![a, b]));
+        AcpBackend::new().with_mock_factory(Arc::new(move || {
+            which.lock().unwrap().pop_front().expect("mock 通道按 conv 建连顺序注入")
+        }))
+    }
+
+    /// P5-14：conv A 挂长任务期间，conv B 不被 head-of-line 阻塞、独立完成；
+    /// 两 conv 各持一条独立连接。
+    #[tokio::test]
+    async fn conv_b_completes_while_conv_a_hangs() {
+        let (chan_a, release_a) = spawn_mock_agent("a");
+        let (chan_b, release_b) = spawn_mock_agent("b");
+        let backend = std::sync::Arc::new(backend_with_mocks(chan_a, chan_b));
+        let workdir = std::env::temp_dir();
+
+        // A 先跑且挂起（闸门不放行）。注意 future 是惰性的：必须 tokio::spawn
+        // 驱动，连接才会真正建立、消费工厂里的第一条 mock 通道。
+        let (tx_a, _rx_a) = tokio::sync::mpsc::channel::<AgentChunk>(64);
+        let a = backend.clone();
+        let wd = workdir.clone();
+        let run_a = tokio::spawn(async move {
+            let _ = a.run("conv-a", "slow", None, &wd, &[], tx_a).await;
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // B 起跑并立即放行其闸门——旧全局单连接串行模型下 B 的 prompt 排在 A
+        // 之后，即便闸门开了也拿不到响应；per-conv 模型下 B 应立即完成。
+        let (tx_b, _rx_b) = tokio::sync::mpsc::channel::<AgentChunk>(64);
+        let run_b = backend.run("conv-b", "fast", None, &workdir, &[], tx_b);
+        let mut run_b = std::pin::pin!(run_b);
+        let _ = release_b.send(true);
+        let out_b = tokio::time::timeout(Duration::from_secs(5), run_b.as_mut())
+            .await
+            .expect("B 不应被 A 的长任务阻塞（head-of-line）")
+            .expect("B run 应成功");
+        assert_eq!(out_b.final_text, "echo:fast");
+
+        // 两条连接独立存在（A 挂着、B 仍存活）。
+        {
+            let conns = backend.conns.lock().await;
+            let a = conns.get("conv-a").expect("A 连接应存在");
+            let b = conns.get("conv-b").expect("B 连接应存在");
+            assert_ne!(Arc::as_ptr(a), Arc::as_ptr(b), "两 conv 应各持独立连接");
+        }
+
+        // 清理：放行 A 让其完成，防 task 泄漏。
+        let _ = release_a.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), run_a).await;
+    }
+
+    /// P5-14：单 conv cancel（run future drop，模拟 dispatch agent_timeout）只杀
+    /// 该会话连接；另一 conv 照常完成。
+    #[tokio::test]
+    async fn cancel_conv_a_does_not_kill_conv_b() {
+        let (chan_a, _release_a) = spawn_mock_agent("a"); // A 永不放行
+        let (chan_b, release_b) = spawn_mock_agent("b");
+        let backend_for_a = std::sync::Arc::new(backend_with_mocks(chan_a, chan_b));
+        let workdir = std::env::temp_dir();
+
+        // A 挂起后被 cancel（abort run task = cancel_tx drop，模拟 dispatch
+        // agent_timeout drop run future）。future 惰性，须 spawn 驱动建立连接。
+        let (tx_a, _rx_a) = tokio::sync::mpsc::channel::<AgentChunk>(64);
+        let a = backend_for_a.clone();
+        let wd = workdir.clone();
+        let run_a = tokio::spawn(async move {
+            let _ = a.run("conv-a", "slow", None, &wd, &[], tx_a).await;
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        run_a.abort(); // 等 A 进入 prompt 后 cancel
+        // 等 A 的连接自摘除（cancel → break → task 退出 → map 自摘除）。
+        for _ in 0..200 {
+            if !backend_for_a.conns.lock().await.contains_key("conv-a") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !backend_for_a.conns.lock().await.contains_key("conv-a"),
+            "cancel 后 A 的连接应被回收"
+        );
+
+        // B 不受影响：照常完成。
+        let (tx_b, _rx_b) = tokio::sync::mpsc::channel::<AgentChunk>(64);
+        let run_b = backend_for_a.run("conv-b", "fast", None, &workdir, &[], tx_b);
+        let mut run_b = std::pin::pin!(run_b);
+        let _ = release_b.send(true);
+        let out_b = tokio::time::timeout(Duration::from_secs(5), run_b.as_mut())
+            .await
+            .expect("B 不应受 A cancel 影响")
+            .expect("B run 应成功");
+        assert_eq!(out_b.final_text, "echo:fast");
+    }
+
+    /// B2：并发上限——超 [`MAX_CONCURRENT_CONNS`] 的新 conv 直接拒绝（可读错误），
+    /// 已有 conv 不受影响。
+    #[tokio::test]
+    async fn concurrent_conn_cap_rejects() {
+        let backend = AcpBackend::new().with_mock_factory(Arc::new(|| {
+            // 此测试只验证 map 上限逻辑，不需要能说话的通道。
+            let (client_side, _agent_side) = Channel::duplex();
+            client_side
+        }));
+        // 预填 map 到上限：轻量连接（prompt_tx 存活的空 task，模拟活连接）。
+        {
+            let mut conns = backend.conns.lock().await;
+            for i in 0..MAX_CONCURRENT_CONNS {
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<PromptReq>(8);
+                tokio::spawn(async move { while rx.recv().await.is_some() {} });
+                conns.insert(
+                    format!("conv-{i}"),
+                    Arc::new(LongLivedAcp {
+                        prompt_tx: tx,
+                        _task: tokio::spawn(async {}),
+                    }),
+                );
+            }
+        }
+        // 超限：新 conv 被拒绝；已有 conv 复用不受影响。
+        let err = match backend.long_lived("conv-extra").await {
+            Err(e) => e,
+            Ok(_) => panic!("超限的新 conv 应被拒绝"),
+        };
+        assert!(err.to_string().contains("上限"), "错误应说明并发上限: {err}");
+        assert!(
+            backend.long_lived("conv-0").await.is_ok(),
+            "已有 conv 应复用连接"
+        );
+    }
+
     // ---------------------------------------------------------------------
     // 真机集成测试（需 claude-agent-acp 已安装 + Claude 已认证），默认跳过：
     //   cargo test --package imagent-claude -- --ignored acp_e2e

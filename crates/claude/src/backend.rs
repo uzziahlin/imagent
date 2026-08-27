@@ -5,7 +5,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use imagent_core::{
     backend_common::{spawn_cli_backend, CliEvent},
-    AgentChunk, Backend, CoreError, LocalSession, PermissionMode, Result, RunOutcome, SessionId,
+    AgentChunk, Backend, CoreError, LocalSession, PermissionCapability, PermissionMode, Result,
+    RunOutcome, SessionId,
 };
 use parking_lot::RwLock;
 use tokio::process::Command;
@@ -183,6 +184,12 @@ impl Backend for ClaudeBackend {
         true
     }
 
+    /// B3：claude-cli 经 `--permission-prompt-tool`（MCP 子进程 → permission
+    /// socket → PermissionRouter → IM）实现完整审批闭环。
+    fn permission_capability(&self) -> PermissionCapability {
+        PermissionCapability::FullLoop
+    }
+
     fn name(&self) -> &'static str {
         NAME
     }
@@ -358,6 +365,16 @@ fn claude_parse(line: &str) -> CliEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B3：能力协商——claude-cli 经 MCP → socket → PermissionRouter 走完整
+    /// IM 审批闭环，声明 FullLoop（ask/auto-claude 档启动放行）。
+    #[test]
+    fn permission_capability_is_full_loop() {
+        assert_eq!(
+            ClaudeBackend::new().permission_capability(),
+            PermissionCapability::FullLoop
+        );
+    }
 
     #[test]
     fn name_is_stable() {

@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 mod credentials;
+mod crypto;
 mod error;
 mod schema;
 mod store;

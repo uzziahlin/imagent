@@ -6,6 +6,30 @@
 
 （空——下一段变更从这里开始。）
 
+## [1.9.0] — 2026-08-27
+
+> **CODE_REVIEW v7 迭代批**（详见 `docs/CODE_REVIEW_v7.md` 第四节）：权限审批闭环跨后端统一、ACP per-conv 连接（P5-14）、凭据应用层加密等 12 项，新增约 25 个单测。
+
+### Added
+- **权限能力协商（B3）**：`Backend` trait 新增 `PermissionCapability`（FullLoop/NativeOnly/Unsupported）；闭环类档位（ask/auto-claude）× 非 FullLoop 后端**启动 fail-closed 拒绝**（不再静默忽略权限模式）；`/perm` 热切同口径校验；codex=Unsupported（exec 模式无原生 approval，注释附依据）、gemini=NativeOnly，日志输出能力矩阵。
+- **ACP 完整 IM 审批闭环（B3）**：`session/request_permission` 接入 PermissionRouter——审批卡进 IM、y/n/超时 deny，与 claude-cli 同体验；`allowed_tools` 以能力矩阵显式呈现。
+- **Ask 档热切补起 socket（D12）**：`/perm ask`/auto 热切换后惰性 spawn 审批 socket（幂等，bind 失败可重试），不再要求重启。
+- **ACP per-conv 连接（B2，P5-14）**：单条全局连接重构为按会话连接 map——多会话并发不再互相阻塞（head-of-line blocking 消除），单会话取消/超时不再殃及其他会话；并发上限 8、空闲 10 分钟回收、shutdown 全量清理；含 in-process 假 agent 的并发/隔离测试。
+- **凭据应用层加密（S3）**：设置 `IMAGENT_PASSPHRASE` 后，keyring 不可用时凭据以 AES-256-GCM + PBKDF2-SHA256(100k 迭代) 加密落盘（`enc:v1:` 版本化格式，随机 salt+nonce）；读取兼容 keyring/加密/明文三形态，存量明文惰性迁移为加密形态；未设 passphrase 的明文回退日志升级为 error（headless 不阻断）。
+
+### Security
+- **`/metrics` `/health` 鉴权（S7）**：新增 `IMAGENT_HTTP_TOKEN` Bearer 鉴权（不匹配 401）；**非 loopback 绑定且未配 token 时拒绝启动**（fail-closed）。
+
+### Changed
+- **ilink 熔断器修复（P1）**：双锁合单锁；reset 语义改为衰减（连续 threshold 次成功才清窗）——「限流一次→成功一次」的锯齿模式下熔断可正常触发。
+- **WS 重连退避加 jitter（P1）**：feishu/wecom 重连退避 ±20% 随机抖动，防多实例同步重连风暴。
+- **SQLite 写路径 busy 重试（P4）**：20 个写路径统一 `blocking_with_retry` 指数退避（50ms×2 至 2s、最多 5 次），高并发写不再直接 SQLITE_BUSY 报错。
+
+### Fixed
+- **codex 幽灵会话预检（B11）**：resume 前校验 `~/.codex/sessions` 存在性，失效 thread id 弃用续接、按新会话处理，不再反复 resume 失败毒化循环（gemini 无本机存储，维持纯 IM 历史）。
+- **gemini 超长 prompt fail-fast（B13）**：>64KB prompt 启动前即拒绝并给可读错误（此前撞 ARG_MAX 得到不可理解的 spawn 失败）。
+- **飞书 card_action 去重回退 key 改内容哈希（P3）**：与 v1.7.1 消息/评论回退同语义，前缀相同的不同按钮不再误判/漏判。
+
 ## [1.8.0] — 2026-08-27
 
 > P10 排队可见性：设计原则「状态上卡，不上消息流」——运行中入队的消息不再静默，排队状态实时显示在流式卡 footer 与审批卡上，会话消息流保持干净（只有用户消息与 agent 产出）。

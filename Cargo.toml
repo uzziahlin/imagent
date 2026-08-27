@@ -7,7 +7,7 @@ exclude = ["fuzz"]  # cargo-fuzz 独立 crate（需 nightly，E-7）
 members = ["crates/store", "crates/core", "crates/claude", "crates/codex", "crates/gemini", "crates/ilink", "crates/wecom", "crates/feishu"]
 
 [workspace.package]
-version = "1.8.0"
+version = "1.9.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -40,6 +40,10 @@ ecb = "0.1"
 cipher = "0.4"
 base64 = "0.22"
 hex = "0.4"
+# S3 凭据应用层加密（store：keyring 不可用时的加密回退）
+aes-gcm = "0.10"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+sha2 = "0.10"
 
 # 存储 / 工具
 rusqlite = { version = "0.31", features = ["bundled"] }

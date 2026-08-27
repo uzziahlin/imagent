@@ -5,8 +5,15 @@ use super::*;
 impl Dispatcher {
     /// spawn socket accept task：每个连接独立 spawn，读权限请求 → send_text 询问
     /// 用户 → register 等 receiver → 写回复回 socket。
+    ///
+    /// D12：幂等——`socket_spawned` 防重复 spawn（run() 启动与 /perm ask 热切
+    /// 共用同一路径；bind/token 失败不置位，下次热切可重试）。返回 accept
+    /// task 是否已就绪。
     #[cfg(unix)]
-    pub(super) fn spawn_socket_accept(self: &Arc<Self>, sock: String) {
+    pub(super) fn spawn_socket_accept(&self, sock: String) -> bool {
+        if self.socket_spawned.load(std::sync::atomic::Ordering::Acquire) {
+            return true; // 已在运行（R-2：accept task 监听 shutdown，进程内只 spawn 一次）
+        }
         // 清理可能残留的旧 socket 文件。
         let _ = std::fs::remove_file(&sock);
         let listener = match std::os::unix::net::UnixListener::bind(&sock) {
@@ -20,7 +27,7 @@ impl Dispatcher {
                     error = %e,
                     "bind permission socket 失败：Ask 权限闭环不可用（降级为无审批，安全 posture 退化）"
                 );
-                return;
+                return false;
             }
         };
         // 转为非阻塞，包进 tokio。
@@ -29,7 +36,7 @@ impl Dispatcher {
             Ok(l) => l,
             Err(e) => {
                 warn!(target: "imagent::core", error = %e, "from_std permission socket failed");
-                return;
+                return false;
             }
         };
         // chmod 0600：只允许 owner（本进程同 uid）连接。父目录 ~/.imagent 应为 0700（由 store 保证）。
@@ -65,8 +72,15 @@ impl Dispatcher {
             warn!(target: "imagent::core", error = %e, "chmod permission.token 0600 失败");
         }
         // R-2：accept task 监听 shutdown（SIGTERM 时停止 accept，原实现永驻）；
-        // 每个连接的 handle_permission_socket 纳入 self.tasks，drain 时一并等待。
-        let this = self.clone();
+        // 每个连接的 handle_permission_socket 纳入 tasks（drain 时一并等待）。
+        // D12：本方法改为 &self（热切路径无 Arc），共享句柄以 clone 捕获。
+        let shutdown = self.shutdown.clone();
+        let tasks = self.tasks.clone();
+        let platform = self.platform.clone();
+        let router = self.router.clone();
+        let approval_tools = self.approval_tools.clone();
+        let permission_ask_timeout = self.permission_ask_timeout;
+        let ask_via_im_timeout = self.ask_via_im_timeout;
         let expected_token = token;
         tokio::spawn(async move {
             // 鉴权基准：只接受与本进程同 uid 的连接（MCP 子进程由本进程 spawn，必然同 uid）。
@@ -75,7 +89,7 @@ impl Dispatcher {
             let expected_uid = current_uid();
             loop {
                 tokio::select! {
-                    _ = this.shutdown.cancelled() => {
+                    _ = shutdown.cancelled() => {
                         info!(target: "imagent::core", "permission socket accept task 收到 shutdown，停止");
                         break;
                     }
@@ -83,13 +97,13 @@ impl Dispatcher {
                         Ok((stream, _)) => {
                             match peer_uid(&stream) {
                                 Some(uid) if uid == expected_uid => {
-                                    let platform = this.platform.clone();
-                                    let router = this.router.clone();
-                                    let approval_tools = this.approval_tools.clone();
-                                    let permission_ask_timeout = this.permission_ask_timeout;
-                                    let ask_via_im_timeout = this.ask_via_im_timeout;
+                                    let platform = platform.clone();
+                                    let router = router.clone();
+                                    let approval_tools = approval_tools.clone();
+                                    let permission_ask_timeout = permission_ask_timeout;
+                                    let ask_via_im_timeout = ask_via_im_timeout;
                                     let expected_token = expected_token.clone();
-                                    this.tasks.lock().await.spawn(async move {
+                                    tasks.lock().await.spawn(async move {
                                         Self::handle_permission_socket(
                                             stream,
                                             platform,
@@ -126,6 +140,10 @@ impl Dispatcher {
                 }
             }
         });
+        // D12：accept task 已起（监听 shutdown，进程内常驻），置幂等位。
+        self.socket_spawned
+            .store(true, std::sync::atomic::Ordering::Release);
+        true
     }
 
     /// 读一行权限 socket 报文（15s 超时 + 64KiB 上限）。None = EOF/超时/超长

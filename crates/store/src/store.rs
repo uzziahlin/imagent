@@ -102,6 +102,11 @@ pub struct Store {
     /// `{platform}:{account}` 旧格式，存量部署零迁移）；非空 = `{scope}:{platform}:
     /// {account}`，读取时对旧键 fallback。由 main 按 `--profile` 设置。
     keyring_scope: Arc<parking_lot::RwLock<String>>,
+    /// S3：应用层加密 passphrase（keyring 不可用时的加密回退）。`None` = 未设置。
+    /// 优先取 `set_passphrase` 的显式值（main 从 config/env 注入），否则读
+    /// 环境变量 `IMAGENT_PASSPHRASE`。测试环境忽略 env（并行测试共享进程 env，
+    /// 避免互相污染），测试用 `set_passphrase` 显式注入。
+    passphrase: Arc<parking_lot::RwLock<Option<String>>>,
 }
 
 impl Store {
@@ -114,6 +119,7 @@ impl Store {
             inner,
             require_keyring: Arc::new(AtomicBool::new(false)),
             keyring_scope: Arc::new(parking_lot::RwLock::new(String::new())),
+            passphrase: Arc::new(parking_lot::RwLock::new(None)),
         })
     }
 
@@ -134,6 +140,24 @@ impl Store {
 
     fn require_keyring(&self) -> bool {
         self.require_keyring.load(Ordering::Relaxed)
+    }
+
+    /// S3：设置应用层加密 passphrase（keyring 不可用时的加密回退）。
+    /// 传入 `None` 清除（回退到读环境变量）。由 main 启动时注入。
+    pub fn set_passphrase(&self, pass: Option<&str>) {
+        *self.passphrase.write() = pass.map(|s| s.to_string());
+    }
+
+    /// 当前生效的 passphrase：显式 set 值优先，其次环境变量 `IMAGENT_PASSPHRASE`。
+    /// 测试环境跳过 env（见字段注释）。
+    fn effective_passphrase(&self) -> Option<String> {
+        if let Some(p) = self.passphrase.read().clone() {
+            return Some(p);
+        }
+        if cfg!(test) {
+            return None;
+        }
+        std::env::var("IMAGENT_PASSPHRASE").ok().filter(|s| !s.is_empty())
     }
 
     // —— credentials ——
@@ -157,13 +181,41 @@ impl Store {
         let stored_blob = if keyring_ok {
             crate::credentials::marker_for(&platform, &account_id)
         } else {
-            CREDENTIAL_PLAINTEXT_FALLBACK.inc();
-            blob.to_string()
+            // S3：keyring 不可用的回退形态——有 passphrase 则加密落盘，否则明文。
+            match self.effective_passphrase() {
+                Some(pass) => {
+                    CREDENTIAL_PLAINTEXT_FALLBACK.inc();
+                    let enc = encrypt_blocking(pass, blob.to_string()).await?;
+                    tracing::info!(
+                        target: "store",
+                        platform = %platform, account_id = %account_id,
+                        "keyring 不可用，凭据已用 passphrase 加密落盘（enc:v1）"
+                    );
+                    enc
+                }
+                None => {
+                    CREDENTIAL_PLAINTEXT_FALLBACK.inc();
+                    // S3：明文落盘从 warn 升级为 error——headless 下 bot_token/secret
+                    // 明文进 SQLite（及 WAL 副本）是真实泄漏面。仍不阻断（headless
+                    // 兼容取舍：宁可带噪运行也不让登录路径直接失败），但必须把
+                    // 风险与补救手段（IMAGENT_PASSPHRASE）喊到位。
+                    tracing::error!(
+                        target: "store",
+                        platform = %platform, account_id = %account_id,
+                        "keyring 不可用且未配置 passphrase，凭据将以明文写入 SQLite（含 WAL 副本）！\
+                         任何能读该数据库文件的主体都能直接取得 bot_token/secret。\
+                         补救：设置环境变量 IMAGENT_PASSPHRASE（应用层 AES-256-GCM 加密），\
+                         或配置可用 OS keyring / 设 require_keyring=true 强制 fail-closed"
+                    );
+                    blob.to_string()
+                }
+            }
         };
         let inner = self.inner.clone();
         // 闭包需 'static（spawn_blocking），clone 一份供 DB 写入；account_id 本体保留给下方审计。
+        let stored_encrypted = crate::crypto::is_encrypted(&stored_blob);
         let (plat_db, acct_db, blob_db) = (platform.clone(), account_id.clone(), stored_blob);
-        let res = blocking_with(inner, move |conn| {
+        let res = blocking_with_retry(inner, move |conn| {
             let now = now_secs();
             conn.execute(
                 "INSERT INTO credentials (platform, account_id, blob, updated_at) \
@@ -178,6 +230,9 @@ impl Store {
         if res.is_ok() {
             let detail = if keyring_ok {
                 "keyring"
+            } else if stored_encrypted {
+                // S3：加密回退形态留痕（与明文回退区分）。
+                "encrypted-fallback"
             } else {
                 "plaintext-fallback"
             };
@@ -208,7 +263,7 @@ impl Store {
         }
         let (p, a) = (platform.clone(), account_id.clone());
         let inner = self.inner.clone();
-        let removed = blocking_with(inner, move |conn| {
+        let removed = blocking_with_retry(inner, move |conn| {
             let n = conn.execute(
                 "DELETE FROM credentials WHERE platform = ?1 AND account_id = ?2",
                 rusqlite::params![p, a],
@@ -282,10 +337,12 @@ impl Store {
         }
     }
 
-    /// 把 DB 中读出的原始 blob 解析为真实凭据：
-    /// - marker → 从 keyring 取真值；marker 在但 keyring 读不到（keychain 被清）→ 报错；
-    /// - 明文（旧库 / 无 keychain）→ 尝试懒迁移到 keyring 并把 DB blob 更新为 marker，
-    ///   迁移失败则保持明文。无论是否迁移成功都返回该明文 blob（即真值）。
+    /// 把 DB 中读出的原始 blob 解析为真实凭据（S3：三种形态）：
+    /// - `keyring:` marker → 从 keyring 取真值；marker 在但 keyring 读不到（keychain 被清）→ 报错；
+    /// - `enc:v1:`（passphrase 加密）→ 解密返回；passphrase 缺失 / 解密失败 → 可读错误
+    ///   （提示设置 IMAGENT_PASSPHRASE）；
+    /// - 裸明文（旧库 / 无 keychain）→ 尝试懒迁移：先 keyring，其次（配置了 passphrase 且
+    ///   keyring 不可用时）重写为加密形态；都失败则保持明文。无论迁移结果都返回该明文。
     async fn resolve_credential_blob(
         &self,
         raw_blob: &str,
@@ -301,16 +358,36 @@ impl Store {
                      {platform}:{account_id}"
                 ))),
             }
+        } else if crate::crypto::is_encrypted(raw_blob) {
+            // S3：加密形态。passphrase 是解密前提，缺失/错误都给出面向运维的提示。
+            let pass = self.effective_passphrase().ok_or_else(|| {
+                StoreError::Other(format!(
+                    "凭据以加密形态（enc:v1）存储，但未配置 passphrase：{platform}:{account_id}\
+                     （请设置环境变量 IMAGENT_PASSPHRASE 为写入时使用的口令）"
+                ))
+            })?;
+            decrypt_blocking(pass, raw_blob.to_string()).await
         } else {
-            // 明文：懒迁移到 keyring。
+            // 明文：懒迁移——优先 keyring。
             let scope = self.scope();
             if crate::credentials::store_in_keyring(&scope, platform, account_id, raw_blob).await {
                 let marker = crate::credentials::marker_for(platform, account_id);
                 self.update_credential_blob(platform, account_id, &marker)
                     .await?;
+            } else if let Some(pass) = self.effective_passphrase() {
+                // keyring 不可用但配置了 passphrase → 惰性重写为加密形态（S3 迁移路径）。
+                let enc = encrypt_blocking(pass, raw_blob.to_string()).await?;
+                self.update_credential_blob(platform, account_id, &enc)
+                    .await?;
+                tracing::info!(
+                    target: "store",
+                    platform = %platform, account_id = %account_id,
+                    "历史明文凭据已惰性迁移为加密形态（enc:v1）"
+                );
             } else {
-                // 读取路径：历史明文凭据未能迁移回 keyring，计数但不 fail-closed
-                // （否则历史明文凭据将不可读，破坏可用性；fail-closed 仅作用于写入）。
+                // 读取路径：历史明文凭据未能迁移（无 keyring 也无 passphrase），计数但不
+                // fail-closed（否则历史明文凭据将不可读，破坏可用性；fail-closed 仅作用
+                // 于写入）。
                 CREDENTIAL_PLAINTEXT_FALLBACK.inc();
             }
             Ok(raw_blob.to_string())
@@ -332,7 +409,7 @@ impl Store {
         let platform_for_audit = platform.clone();
         let account_for_audit = account_id.clone();
         let inner = self.inner.clone();
-        blocking_with(inner, move |conn| {
+        blocking_with_retry(inner, move |conn| {
             let now = now_secs();
             conn.execute(
                 "UPDATE credentials SET blob = ?3, updated_at = ?4 \
@@ -390,7 +467,7 @@ impl Store {
     pub async fn upsert_session(&self, row: &SessionRow) -> Result<()> {
         let row = row.clone();
         let inner = self.inner.clone();
-        blocking_with(inner, move |conn| {
+        blocking_with_retry(inner, move |conn| {
             let now = now_secs();
             // P5-store：主表 + 历史侧表同事务——此前两条语句各自 autocommit，中间
             // 崩溃会漏历史行（/resume 丢会话），且每轮两次独立 fsync。
@@ -439,7 +516,7 @@ impl Store {
     pub async fn delete_session(&self, conv_id: &str) -> Result<()> {
         let conv_id = conv_id.to_string();
         let inner = self.inner.clone();
-        blocking_with(inner, move |conn| {
+        blocking_with_retry(inner, move |conn| {
             conn.execute(
                 "DELETE FROM sessions WHERE conv_id = ?1",
                 rusqlite::params![conv_id],
@@ -470,7 +547,7 @@ impl Store {
             buf.to_string(),
         );
         let inner = self.inner.clone();
-        blocking_with(inner, move |conn| {
+        blocking_with_retry(inner, move |conn| {
             conn.execute(
                 "INSERT INTO sync_buf (platform, account_id, buf) VALUES (?1, ?2, ?3) \
                  ON CONFLICT(platform, account_id) DO UPDATE SET buf = excluded.buf",
@@ -519,7 +596,7 @@ impl Store {
             token.to_string(),
         );
         let inner = self.inner.clone();
-        blocking_with(inner, move |conn| {
+        blocking_with_retry(inner, move |conn| {
             let now = now_secs();
             conn.execute(
                 "INSERT INTO context_tokens (platform, account_id, peer, token, updated_at) \
@@ -587,7 +664,7 @@ impl Store {
             source.map(|s| s.to_string()),
         );
         let inner = self.inner.clone();
-        blocking_with(inner, move |conn| {
+        blocking_with_retry(inner, move |conn| {
             let now = now_secs();
             conn.execute(
                 "INSERT OR IGNORE INTO allowed_senders (sender, added_at, added_by, source) \
@@ -603,7 +680,7 @@ impl Store {
     pub async fn remove_allowed_sender(&self, sender: &str) -> Result<bool> {
         let sender = sender.to_string();
         let inner = self.inner.clone();
-        blocking_with(inner, move |conn| {
+        blocking_with_retry(inner, move |conn| {
             let n = conn.execute(
                 "DELETE FROM allowed_senders WHERE sender = ?1",
                 rusqlite::params![sender],
@@ -643,7 +720,7 @@ impl Store {
             source.map(|s| s.to_string()),
         );
         let inner = self.inner.clone();
-        blocking_with(inner, move |conn| {
+        blocking_with_retry(inner, move |conn| {
             let now = now_secs();
             conn.execute(
                 "INSERT OR IGNORE INTO admin_senders (sender, added_at, added_by, source) \
@@ -659,7 +736,7 @@ impl Store {
     pub async fn remove_admin_sender(&self, sender: &str) -> Result<bool> {
         let sender = sender.to_string();
         let inner = self.inner.clone();
-        blocking_with(inner, move |conn| {
+        blocking_with_retry(inner, move |conn| {
             let n = conn.execute(
                 "DELETE FROM admin_senders WHERE sender = ?1",
                 rusqlite::params![sender],
@@ -699,7 +776,7 @@ impl Store {
             source.map(|s| s.to_string()),
         );
         let inner = self.inner.clone();
-        blocking_with(inner, move |conn| {
+        blocking_with_retry(inner, move |conn| {
             conn.execute(
                 "INSERT OR IGNORE INTO allowed_chats (conv_id, added_at, added_by, source) \
                  VALUES (?1, ?2, ?3, ?4)",
@@ -714,7 +791,7 @@ impl Store {
     pub async fn remove_allowed_chat(&self, conv_id: &str) -> Result<bool> {
         let conv_id = conv_id.to_string();
         let inner = self.inner.clone();
-        blocking_with(inner, move |conn| {
+        blocking_with_retry(inner, move |conn| {
             let n = conn.execute(
                 "DELETE FROM allowed_chats WHERE conv_id = ?1",
                 rusqlite::params![conv_id],
@@ -773,7 +850,7 @@ impl Store {
             handle.to_string(),
         );
         let inner = self.inner.clone();
-        blocking_with(inner, move |conn| {
+        blocking_with_retry(inner, move |conn| {
             conn.execute(
                 "INSERT INTO live_cards (conv_id, platform, handle, updated_at) VALUES (?1, ?2, ?3, ?4) \
                  ON CONFLICT(conv_id) DO UPDATE SET platform = ?2, handle = ?3, updated_at = ?4",
@@ -788,7 +865,7 @@ impl Store {
     pub async fn clear_live_card(&self, conv_id: &str) -> Result<()> {
         let conv_id = conv_id.to_string();
         let inner = self.inner.clone();
-        blocking_with(inner, move |conn| {
+        blocking_with_retry(inner, move |conn| {
             conn.execute(
                 "DELETE FROM live_cards WHERE conv_id = ?1",
                 rusqlite::params![conv_id],
@@ -839,7 +916,7 @@ impl Store {
             detail.map(|s| s.to_string()),
         );
         let inner = self.inner.clone();
-        blocking_with(inner, move |conn| {
+        blocking_with_retry(inner, move |conn| {
             let now = now_secs();
             conn.execute(
                 "INSERT INTO audit_log (ts, action, actor, target, detail) \
@@ -900,7 +977,7 @@ impl Store {
     pub async fn set_config(&self, key: &str, value: &str) -> Result<()> {
         let (key, value) = (key.to_string(), value.to_string());
         let inner = self.inner.clone();
-        blocking_with(inner, move |conn| {
+        blocking_with_retry(inner, move |conn| {
             conn.execute(
                 "INSERT INTO config (key, value) VALUES (?1, ?2) \
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -914,7 +991,7 @@ impl Store {
     pub async fn delete_config(&self, key: &str) -> Result<()> {
         let key = key.to_string();
         let inner = self.inner.clone();
-        blocking_with(inner, move |conn| {
+        blocking_with_retry(inner, move |conn| {
             conn.execute("DELETE FROM config WHERE key = ?1", rusqlite::params![key])?;
             Ok(())
         })
@@ -947,7 +1024,7 @@ impl Store {
     pub async fn upsert_named_session(&self, row: &NamedSessionRow) -> Result<()> {
         let row = row.clone();
         let inner = self.inner.clone();
-        blocking_with(inner, move |conn| {
+        blocking_with_retry(inner, move |conn| {
             let now = now_secs();
             conn.execute(
                 "INSERT INTO named_sessions \
@@ -1045,7 +1122,7 @@ impl Store {
     pub async fn delete_named_session(&self, conv_id: &str, name: &str) -> Result<()> {
         let (conv_id, name) = (conv_id.to_string(), name.to_string());
         let inner = self.inner.clone();
-        blocking_with(inner, move |conn| {
+        blocking_with_retry(inner, move |conn| {
             conn.execute(
                 "DELETE FROM named_sessions WHERE conv_id = ?1 AND name = ?2",
                 rusqlite::params![conv_id, name],
@@ -1091,6 +1168,87 @@ where
     .await
     .map_err(|e| StoreError::Other(format!("spawn_blocking join: {e}")))?;
     join
+}
+
+/// 同 `blocking_with`，但闭包要求 `Fn`（可重放）：执行中遇到 SQLITE_BUSY /
+/// SQLITE_LOCKED 时指数退避重试（50ms 起、×2、上限 2s、最多 5 次尝试），
+/// 重试耗尽仍失败才把错误返回。读路径不重试（WAL 下读不阻塞），仅写路径用。
+///
+/// P4（v7 review）：多连接（core store + ilink store + /health 各自 open）高并发
+/// 写时 busy_timeout=5s 之后仍可能 BUSY；退避重试让瞬时竞争自愈，而非把
+/// SQLITE_BUSY 冒泡成登录/会话写入失败。
+async fn blocking_with_retry<F, T>(inner: Arc<Inner>, f: F) -> Result<T>
+where
+    F: Fn(&rusqlite::Connection) -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    const MAX_ATTEMPTS: u32 = 5;
+    let join = tokio::task::spawn_blocking(move || {
+        let conn = inner.conn.lock();
+        let mut delay = std::time::Duration::from_millis(50);
+        let mut attempt = 1u32;
+        loop {
+            match f(&conn) {
+                Ok(v) => return Ok(v),
+                Err(e) if is_busy(&e) && attempt < MAX_ATTEMPTS => {
+                    tracing::warn!(
+                        target: "store",
+                        attempt, max = MAX_ATTEMPTS,
+                        delay_ms = delay.as_millis() as u64,
+                        "sqlite busy/locked，指数退避重试写操作"
+                    );
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(std::time::Duration::from_millis(2000));
+                    attempt += 1;
+                }
+                Err(e) => {
+                    if is_busy(&e) {
+                        tracing::error!(
+                            target: "store",
+                            attempts = attempt,
+                            "sqlite busy/locked，重试耗尽，写操作失败"
+                        );
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|e| StoreError::Other(format!("spawn_blocking join: {e}")))?;
+    join
+}
+
+/// 是否为 SQLITE_BUSY / SQLITE_LOCKED（含其扩展码——rusqlite 归一为主错误码）。
+fn is_busy(e: &StoreError) -> bool {
+    matches!(
+        e,
+        StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code:
+                    rusqlite::ffi::ErrorCode::DatabaseBusy
+                    | rusqlite::ffi::ErrorCode::DatabaseLocked,
+                ..
+            },
+            _,
+        ))
+    )
+}
+
+/// S3：在 blocking 线程做 passphrase 加密（PBKDF2 100k 迭代 ~几十 ms，不占运行时线程）。
+async fn encrypt_blocking(pass: String, plaintext: String) -> Result<String> {
+    tokio::task::spawn_blocking(move || crate::crypto::encrypt(&pass, &plaintext))
+        .await
+        .map_err(|e| StoreError::Other(format!("spawn_blocking join: {e}")))?
+        .map_err(StoreError::Other)
+}
+
+/// S3：在 blocking 线程解密（同上，KDF 计算不占运行时线程）。
+async fn decrypt_blocking(pass: String, blob: String) -> Result<String> {
+    tokio::task::spawn_blocking(move || crate::crypto::decrypt(&pass, &blob))
+        .await
+        .map_err(|e| StoreError::Other(format!("spawn_blocking join: {e}")))?
+        .map_err(StoreError::Other)
 }
 
 /// 打开连接、设 PRAGMA、跑迁移、收紧文件/目录权限。
@@ -1569,6 +1727,156 @@ mod tests {
             .expect("present");
         assert_eq!(aid, "bot-old");
         assert_eq!(blob, plain);
+    }
+
+    // ---------- S3：凭据应用层加密 ----------
+
+    /// 读出 credentials.blob 原始值（不经 resolve），断言落盘形态用。
+    async fn raw_blob(store: &Store, platform: &str, account: &str) -> String {
+        let inner = store.inner.clone();
+        let (p, a) = (platform.to_string(), account.to_string());
+        blocking_with(inner, move |conn| {
+            Ok(conn.query_row(
+                "SELECT blob FROM credentials WHERE platform = ?1 AND account_id = ?2",
+                rusqlite::params![p, a],
+                |r| r.get::<_, String>(0),
+            )?)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// keyring 不可用（cfg!(test) 恒失败）+ passphrase 已配置 → 落盘为 enc:v1 而非明文，
+    /// 读取（解密）还原明文；审计 detail 为 encrypted-fallback。
+    #[tokio::test]
+    async fn credential_encrypted_fallback_roundtrip() {
+        let db = TempDb::new("enc_rt").await;
+        let store = Store::open(&db.path).await.unwrap();
+        store.set_passphrase(Some("s3-pass"));
+        let plain = r#"{"bot_token":"secret-token"}"#;
+        store.put_credential("ilink", "bot1", plain).await.unwrap();
+        let raw = raw_blob(&store, "ilink", "bot1").await;
+        assert!(raw.starts_with("enc:v1:"), "应加密落盘: {raw}");
+        assert!(!raw.contains("secret-token"), "落盘不得含明文");
+        // get / first_credential 都解密还原。
+        assert_eq!(
+            store.get_credential("ilink", "bot1").await.unwrap(),
+            Some(plain.to_string())
+        );
+        assert_eq!(
+            store.first_credential("ilink").await.unwrap().unwrap().1,
+            plain
+        );
+        let audit = store.list_audit(10).await.unwrap();
+        let put = audit.iter().find(|a| a.action == "credential_put").unwrap();
+        assert_eq!(put.detail.as_deref(), Some("encrypted-fallback"));
+    }
+
+    /// enc blob + 未配置 passphrase → 可读错误（提示 IMAGENT_PASSPHRASE）；
+    /// 错误 passphrase → 解密失败错误。
+    #[tokio::test]
+    async fn credential_encrypted_missing_or_wrong_passphrase_errors() {
+        let db = TempDb::new("enc_err").await;
+        let store = Store::open(&db.path).await.unwrap();
+        store.set_passphrase(Some("right"));
+        store.put_credential("ilink", "bot1", "s").await.unwrap();
+        // 换口令模拟「重启后未配置 / 配错」。
+        store.set_passphrase(Some("wrong"));
+        let err = store.get_credential("ilink", "bot1").await.unwrap_err();
+        assert!(format!("{err}").contains("IMAGENT_PASSPHRASE"), "{err}");
+        store.set_passphrase(None);
+        // cfg!(test) 下 env 回退被跳过（见 effective_passphrase 注释）→ 视为未配置。
+        let err = store.get_credential("ilink", "bot1").await.unwrap_err();
+        assert!(format!("{err}").contains("IMAGENT_PASSPHRASE"), "{err}");
+    }
+
+    /// 惰性迁移：存量明文 blob + 配置 passphrase + keyring 不可用 → get 返回明文，
+    /// 且 DB 中 blob 被重写为 enc:v1。
+    #[tokio::test]
+    async fn credential_plaintext_lazily_migrates_to_encrypted() {
+        let db = TempDb::new("enc_migrate").await;
+        let store = Store::open(&db.path).await.unwrap();
+        let plain = r#"{"bot_token":"legacy"}"#;
+        {
+            let inner = store.inner.clone();
+            let p = plain.to_string();
+            blocking_with(inner, move |conn| {
+                Ok(conn.execute(
+                    "INSERT INTO credentials (platform, account_id, blob, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params!["ilink", "bot-old", p, 1_i64],
+                )?)
+            })
+            .await
+            .unwrap();
+        }
+        store.set_passphrase(Some("migrate-pass"));
+        // 第一次 get：返回明文，并把 blob 重写为 enc:v1。
+        assert_eq!(
+            store.get_credential("ilink", "bot-old").await.unwrap(),
+            Some(plain.to_string())
+        );
+        assert!(raw_blob(&store, "ilink", "bot-old")
+            .await
+            .starts_with("enc:v1:"));
+        // 第二次 get：走解密路径，仍还原明文。
+        assert_eq!(
+            store.get_credential("ilink", "bot-old").await.unwrap(),
+            Some(plain.to_string())
+        );
+    }
+
+    // ---------- P4：SQLite busy 重试 ----------
+
+    /// 并发写压力：两个 Store 实例（各自独立连接，模拟 core/ilink 多连接）+
+    /// 多 task 并发 upsert，busy 重试下应全部成功、最终状态正确。
+    ///
+    /// 强度说明：真实 BUSY 需要跨连接的长事务竞争，单测难以稳定触发，此处
+    /// 用「双连接 × 4 task × 25 次 upsert + 同 key 竞争」制造锁竞争面；CI 环境若
+    /// 偶发不稳，可把 TASKS/TIMES 减半（重试路径本身由 busy_timeout+退避保证）。
+    #[tokio::test]
+    async fn concurrent_upserts_with_busy_retry_all_succeed() {
+        let db = TempDb::new("busy").await;
+        let store_a = Store::open(&db.path).await.unwrap();
+        let store_b = Store::open(&db.path).await.unwrap();
+        const TASKS: usize = 4;
+        const TIMES: usize = 25;
+        let mut handles = Vec::new();
+        for t in 0..TASKS {
+            // 交替用两个连接（不同 Connection，形成真实的跨连接写竞争）。
+            let store = if t % 2 == 0 {
+                store_a.clone()
+            } else {
+                store_b.clone()
+            };
+            handles.push(tokio::spawn(async move {
+                for i in 0..TIMES {
+                    store
+                        .upsert_session(&SessionRow {
+                            conv_id: format!("conv-{t}"),
+                            session_id: format!("sess-{t}-{i}"),
+                            agent_kind: "mock".into(),
+                            workdir: "/tmp".into(),
+                            name: None,
+                            created_at: 1,
+                            updated_at: 1,
+                        })
+                        .await
+                        .expect("并发 upsert 不应因 BUSY 失败");
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        for t in 0..TASKS {
+            let got = store_a.get_session(&format!("conv-{t}")).await.unwrap();
+            assert_eq!(
+                got.expect("row").session_id,
+                format!("sess-{t}-{}", TIMES - 1),
+                "最终状态应为最后一次 upsert"
+            );
+        }
     }
 
     #[tokio::test]

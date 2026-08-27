@@ -332,7 +332,10 @@ pub struct Dispatcher {
     shutdown: Arc<tokio_util::sync::CancellationToken>,
     /// in-flight handle task 集合（P1-5）：drain 时等待其完成，避免 SIGKILL 正在
     /// 写文件的 agent 子进程导致半写。task 完成自动移除。
-    tasks: Mutex<tokio::task::JoinSet<()>>,
+    tasks: Arc<Mutex<tokio::task::JoinSet<()>>>,
+    /// D12：permission socket accept task 是否已 spawn（幂等防重复 spawn；
+    /// run() 启动与 /perm ask 热切共用同一路径）。
+    socket_spawned: std::sync::atomic::AtomicBool,
 }
 
 impl Dispatcher {
@@ -410,7 +413,8 @@ impl Dispatcher {
             approval_tools: Arc::new(RwLock::new(Vec::new())),
             admin_senders: Arc::new(RwLock::new(admin_senders)),
             shutdown: Arc::new(tokio_util::sync::CancellationToken::new()),
-            tasks: Mutex::new(tokio::task::JoinSet::new()),
+            tasks: Arc::new(Mutex::new(tokio::task::JoinSet::new())),
+            socket_spawned: std::sync::atomic::AtomicBool::new(false),
         };
         // S2：admin_senders 为空 = 无人是管理员，IM 内管理命令全部不可用——
         // 构造即显著提示（防用户以为白名单用户仍可 /allow）。
@@ -467,10 +471,43 @@ impl Dispatcher {
     }
 
     /// SIGHUP 热重载：更新 permission_mode（与 ClaudeBackend 共享同一句柄时
-    /// 二者同步生效）。注意：Ask 模式的 socket accept task 仅在 `run()` 启动时
-    /// 按当时的模式 spawn 一次，热切到 Ask 不会补起 socket（重启生效）。
-    pub fn reload_permission_mode(&self, mode: PermissionMode) {
+    /// 二者同步生效）。D12：热切到 Ask/auto-claude 闭环类档位时惰性补起
+    /// socket accept task（幂等，见 [`Self::ensure_permission_socket`]），
+    /// 不再要求重启。返回闭环档位下 socket 是否就绪（非闭环档恒 true）。
+    pub fn reload_permission_mode(&self, mode: PermissionMode) -> bool {
         *self.permission_mode.write() = mode;
+        if mode.needs_socket() {
+            self.ensure_permission_socket()
+        } else {
+            true
+        }
+    }
+
+    /// D12：needs_socket 且 socket accept task 未启动时惰性 spawn（复用
+    /// [`Self::spawn_socket_accept`]，其内部幂等防重复 spawn；socket 文件与
+    /// token 残留由 spawn 时统一清理重建）。非 unix 平台恒 false。
+    fn ensure_permission_socket(&self) -> bool {
+        #[cfg(unix)]
+        {
+            match crate::permission::default_sock_path() {
+                Some(sock) => self.spawn_socket_accept(sock.to_string_lossy().into_owned()),
+                None => {
+                    error!(
+                        target: "imagent::core",
+                        "Ask 模式但无法定位 socket 路径，权限请求将无法路由"
+                    );
+                    false
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            warn!(
+                target: "imagent::core",
+                "Ask 权限审批闭环需要 Unix domain socket，当前平台(Windows)不可用；请改用 permission_mode = allow/deny/off 或在 macOS/Linux 运行"
+            );
+            false
+        }
     }
 
     /// 暴露 auth（main 的 SIGHUP task 用其 reload）。
@@ -481,6 +518,106 @@ impl Dispatcher {
     /// 暴露 router（主进程 socket accept task 用）。
     pub fn router(&self) -> Arc<PermissionRouter> {
         self.router.clone()
+    }
+
+    /// B3：构造注入 backend 的 IM 审批闭环回调（ACP 的
+    /// `session/request_permission` 经此进 IM）。与 socket.rs 的
+    /// `handle_permission_kind_socket` 同一套语义（审批集过滤 → register →
+    /// send_permission_ask → permission_ask_timeout 等待 → 超时/失败 deny），
+    /// 只是回复走内存回调而非 socket 写回。
+    fn build_im_permission_hook(&self) -> crate::backend::ImPermissionHook {
+        let platform = self.platform.clone();
+        let router = self.router.clone();
+        let approval_tools = self.approval_tools.clone();
+        let timeout = self.permission_ask_timeout;
+        Arc::new(move |ask: crate::backend::ImPermissionAsk| {
+            let platform = platform.clone();
+            let router = router.clone();
+            let approval_tools = approval_tools.clone();
+            Box::pin(async move {
+                // 审批集外直接放行（空集 = 全部过审），与 socket 路径口径一致。
+                if !crate::permission::needs_approval(&approval_tools.read(), &ask.tool_name) {
+                    info!(
+                        target: "imagent::core",
+                        conv_id = %ask.conv_id,
+                        tool = %ask.tool_name,
+                        "审批集外工具，直接放行（approval_tools 未命中）"
+                    );
+                    METRICS
+                        .permission_decisions
+                        .with_label_values(&["allow"])
+                        .inc();
+                    return true;
+                }
+                let conv = ConvId(ask.conv_id.clone());
+                // D5：先 register 占位再发卡（防极速按钮回调先于 register 到达）。
+                let rx = router
+                    .register(&ask.conv_id, &ask.request_id, None, PendingKind::Permission)
+                    .await;
+                let card_msg_id = match platform
+                    .send_permission_ask(
+                        &conv,
+                        &ask.request_id,
+                        &ask.tool_name,
+                        &ask.input_summary,
+                        &ReplyHint::None,
+                    )
+                    .await
+                {
+                    Ok(mid) => mid,
+                    Err(e) => {
+                        // P1-3：发卡失败 → 撤占位、deny，不留 pending。
+                        warn!(
+                            target: "imagent::core",
+                            conv_id = %ask.conv_id,
+                            error = %e,
+                            "send permission ask 失败，回 deny 并撤占位 pending"
+                        );
+                        router.cancel(&ask.conv_id, &ask.request_id).await;
+                        METRICS
+                            .permission_decisions
+                            .with_label_values(&["dropped"])
+                            .inc();
+                        return false;
+                    }
+                };
+                router
+                    .set_card_msg_id(&ask.conv_id, &ask.request_id, card_msg_id)
+                    .await;
+                // S-3：独立预算 permission_ask_timeout；超时 deny（fail-closed）。
+                match tokio::time::timeout(timeout, rx).await {
+                    Ok(Ok(r)) => {
+                        METRICS
+                            .permission_decisions
+                            .with_label_values(&[if r.allow { "allow" } else { "deny" }])
+                            .inc();
+                        r.allow
+                    }
+                    Ok(Err(_)) => {
+                        router.cancel(&ask.conv_id, &ask.request_id).await;
+                        METRICS
+                            .permission_decisions
+                            .with_label_values(&["dropped"])
+                            .inc();
+                        false
+                    }
+                    Err(_) => {
+                        router.cancel(&ask.conv_id, &ask.request_id).await;
+                        // 超时自动拒绝后收敛滞留询问卡（best-effort）。
+                        if let Err(e) =
+                            platform.cancel_permission_ask(&conv, &ask.request_id).await
+                        {
+                            warn!(target: "imagent::core", error = %e, "超时询问卡收敛失败（不影响 deny）");
+                        }
+                        METRICS
+                            .permission_decisions
+                            .with_label_values(&["timeout"])
+                            .inc();
+                        false
+                    }
+                }
+            })
+        })
     }
 
     /// 触发优雅退出（P1-5）：run() 收到后停止 recv 并 drain in-flight task。
@@ -494,21 +631,37 @@ impl Dispatcher {
     /// recv 返回 Err 时：session 过期 → 优雅停止（返回 Err 让 main 提示重新 login）；
     /// 其它错误 → 指数退避后继续重试（防 client 异常退出导致 dispatcher 忙循环刷屏；ilink 长轮询层另有退避），不 panic。
     pub async fn run(self: Arc<Self>) -> Result<()> {
-        // Ask 模式：spawn unix socket accept task（MCP server 转发的权限请求经此进主进程）。
-        #[cfg(unix)]
-        if self.permission_mode.read().needs_socket() {
-            if let Some(sock) = crate::permission::default_sock_path() {
-                self.spawn_socket_accept(sock.to_string_lossy().into_owned());
-            } else {
-                warn!(target: "imagent::core", "Ask 模式但无法定位 socket 路径，权限请求将无法路由");
-            }
+        // B3：能力矩阵一行（启动日志，审计/排障用）。
+        let cap = self.backend.permission_capability();
+        let mode = *self.permission_mode.read();
+        info!(
+            target: "imagent::core",
+            backend = self.backend.name(),
+            permission_mode = mode.as_str(),
+            capability = cap.as_str(),
+            native_passthrough = self.backend.supports_native_permission_mode(),
+            "权限能力矩阵"
+        );
+        // B3（fail-closed）：闭环类档位（Ask / auto-claude）要求 backend 支持
+        // IM 审批闭环。此前 codex/gemini 在 ask 档下静默忽略审批（等于全放行），
+        // ACP fail-closed 拒绝——现统一为启动即拒绝，错误信息给可行动建议。
+        if mode.needs_socket() && cap != crate::backend::PermissionCapability::FullLoop {
+            return Err(crate::error::CoreError::Config(format!(
+                "permission_mode = \"{}\" 需要后端支持 IM 审批闭环，但当前后端 {} 的权限能力为 {}。\
+                 请将 permission_mode 改为 auto/off/allow/deny，或改用支持闭环的 claude 系后端（claude-cli / claude-acp）",
+                mode.as_str(),
+                self.backend.name(),
+                cap.as_str()
+            )));
         }
-        #[cfg(not(unix))]
+        // B3：把 IM 审批闭环回调注入 backend（与 claude-cli 的 MCP→socket 闭环
+        // 同一条 PermissionRouter 通道；ACP 的 session/request_permission 走此）。
+        let hook = self.build_im_permission_hook();
+        self.backend.set_im_permission_hook(Some(hook));
+        // Ask 模式：spawn unix socket accept task（MCP server 转发的权限请求经此进主进程）。
+        // D12：抽到 ensure_permission_socket（热切 /perm ask 复用同一路径）。
         if self.permission_mode.read().needs_socket() {
-            warn!(
-                target: "imagent::core",
-                "Ask 权限审批闭环需要 Unix domain socket，当前平台(Windows)不可用；请改用 permission_mode = allow/deny/off 或在 macOS/Linux 运行"
-            );
+            self.ensure_permission_socket();
         }
 
         // recv 失败退避（防 client 异常退出后 dispatcher 忙循环刷屏）。

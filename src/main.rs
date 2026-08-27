@@ -553,20 +553,24 @@ async fn main() -> Result<()> {
             if config.backend_permission_mode.is_some()
                 && !backend.supports_native_permission_mode()
             {
+                // B3：升级为带能力矩阵的明确 warn（codex=exec 模式无原生 approval
+                // 参数；gemini=原生档位与该配置键值域不同名，无可靠映射）。
                 tracing::warn!(
                     target: "imagent::ops",
                     agent = %config.agent,
-                    "backend_permission_mode 已配置但该后端暂不支持原生权限模式透传（忽略；claude-cli 映射 --permission-mode，其余后端后续接入）"
+                    capability = backend.permission_capability().as_str(),
+                    "backend_permission_mode 已配置但该后端不支持原生权限模式透传（忽略）。能力矩阵：claude-cli/claude-acp=IM 审批闭环；gemini=仅原生 --approval-mode（由 allowed_tools 收敛）；codex=无原生 approval 档（exec 模式）"
                 );
             }
 
-            // codex/gemini 后端不支持 IM 权限审批闭环：若用户开启了 permission_mode，
-            // 显式 warn（不静默忽略），避免预期落差。
+            // B3：闭环类档位（ask/auto-claude）×非 FullLoop 后端由 Dispatcher::run
+            // 启动校验 fail-closed 拒绝（此处不再重复 warn）；allow/deny 在非闭环
+            // 后端仅由 agent 自身 sandbox/approval-mode 兜底，保留显式 warn。
             if perm_resolved.is_enabled() && matches!(config.agent.as_str(), "codex" | "gemini") {
                 tracing::warn!(
                     target: "imagent::ops",
                     agent = %config.agent,
-                    "后端不支持 IM 权限审批闭环，permission_mode 将不生效（仅靠 agent 自身 sandbox/approval-mode 兜底）；如需 IM approve/deny 请用 claude-cli"
+                    "后端不支持 IM 权限审批闭环，permission_mode 的 IM 侧决策不生效（仅靠 agent 自身 sandbox/approval-mode 兜底）；如需 IM approve/deny 请用 claude 系后端"
                 );
             }
 
@@ -659,14 +663,26 @@ async fn main() -> Result<()> {
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
             let http_store = store.clone();
+            // S7：可选 Bearer 鉴权 token（环境变量 `IMAGENT_HTTP_TOKEN`，与
+            // IMAGENT_FEISHU_APP_SECRET 的配置风格一致——config 键在 core::Config，
+            // 本轮不可改，故走 env）。设置后 /metrics 与 /health 要求
+            // `Authorization: Bearer <token>`，不匹配返回 401。
+            let http_token = metrics_http_token();
             match metrics_addr {
                 Some(addr) => match addr.parse::<SocketAddr>() {
                     Ok(socket) => {
+                        // S7 fail-closed（与 B3 口径一致）：非 loopback 绑定且未配
+                        // token 时拒绝启动，而不是带着「公网可裸访」的 warn 继续
+                        // 运行。运维要么绑回 127.0.0.1，要么显式设置
+                        // IMAGENT_HTTP_TOKEN。
+                        if let Err(reason) = validate_metrics_bind(socket, http_token.as_deref()) {
+                            return Err(anyhow!("metrics_addr 配置不安全，拒绝启动：{reason}"));
+                        }
                         if !socket.ip().is_loopback() {
-                            tracing::warn!(
+                            tracing::info!(
                                 target: "imagent::ops",
                                 addr = %socket,
-                                "metrics_addr 绑定非 loopback 地址：/metrics 与 /health 无鉴权，公网可访问（仅暴露消息计数/会话数等运营指标，不含凭据）。生产环境建议绑 127.0.0.1 或置于反向代理后"
+                                "metrics_addr 绑定非 loopback 地址：/metrics 与 /health 已启用 IMAGENT_HTTP_TOKEN Bearer 鉴权"
                             );
                         }
                         spawn_metrics_server(
@@ -674,6 +690,7 @@ async fn main() -> Result<()> {
                             http_store.clone(),
                             start_at,
                             platform_name.to_string(),
+                            http_token,
                             // P5-第五批：wecom 凭据来自 config（store 里永远没有），
                             // /health 按存在性预判定——其余平台 None 走 store/env 动态查。
                             if platform_name == "wecom" {
@@ -1068,6 +1085,45 @@ struct HttpState {
     /// 预计算的 logged_in（P5-第五批：wecom 凭据在 config，store 查不到）。
     /// None = 按平台动态查（store / env）。
     logged_in_hint: Option<bool>,
+    /// S7：Bearer 鉴权 token。None = loopback 绑定、无鉴权（历史行为）；
+    /// Some = 两端点都要求匹配的 `Authorization: Bearer <token>`。
+    token: Option<String>,
+}
+
+/// S7：读取可选的 HTTP Bearer 鉴权 token（`IMAGENT_HTTP_TOKEN`）。
+/// 空串/纯空白视为未设置。
+fn metrics_http_token() -> Option<String> {
+    std::env::var("IMAGENT_HTTP_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// S7：fail-closed 绑定校验（纯函数，便于单测）。非 loopback 绑定且未配
+/// token 即拒绝；loopback 或已配 token 均放行。
+fn validate_metrics_bind(socket: SocketAddr, token: Option<&str>) -> Result<(), String> {
+    if socket.ip().is_loopback() || token.is_some() {
+        Ok(())
+    } else {
+        Err(format!(
+            "绑定非 loopback 地址 {socket} 且未设置 IMAGENT_HTTP_TOKEN，\
+             /metrics 与 /health 将无鉴权公网可访问；请绑回 127.0.0.1 或设置 IMAGENT_HTTP_TOKEN"
+        ))
+    }
+}
+
+/// S7：Bearer 鉴权判定（纯函数，便于单测）。`token` 为 None 表示未启用
+/// 鉴权（loopback 部署），一律放行；Some 时要求 Authorization 头精确等于
+/// `Bearer <token>`（前缀多余字符不匹配）。非恒定时间比较——token 不匹配
+/// 直接 401，不泄露匹配进度，此处时序侧信道可忽略。
+fn bearer_authorized(headers: &axum::http::HeaderMap, token: Option<&str>) -> bool {
+    let Some(expected) = token else {
+        return true;
+    };
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v == format!("Bearer {expected}"))
 }
 
 /// 起 HTTP server（/metrics + /health），独立 tokio task。失败仅 warn。
@@ -1076,12 +1132,14 @@ fn spawn_metrics_server(
     store: imagent_store::Store,
     start_at: Instant,
     platform: String,
+    token: Option<String>,
     logged_in_hint: Option<bool>,
 ) {
     let state = HttpState {
         store,
         start_at,
         platform,
+        token,
         logged_in_hint,
     };
     let app = Router::new()
@@ -1102,11 +1160,32 @@ fn spawn_metrics_server(
     });
 }
 
-async fn metrics_handler() -> (StatusCode, String) {
+async fn metrics_handler(
+    State(st): State<HttpState>,
+    headers: axum::http::HeaderMap,
+) -> (StatusCode, String) {
+    // S7：设置了 IMAGENT_HTTP_TOKEN 时两端点统一要求 Bearer 鉴权。
+    if !bearer_authorized(&headers, st.token.as_deref()) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized\n".to_string());
+    }
     (StatusCode::OK, imagent_core::metrics::render())
 }
 
-async fn health_handler(State(st): State<HttpState>) -> (StatusCode, Json<Health>) {
+async fn health_handler(
+    State(st): State<HttpState>,
+    headers: axum::http::HeaderMap,
+) -> (StatusCode, Json<Health>) {
+    if !bearer_authorized(&headers, st.token.as_deref()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(Health {
+                logged_in: false,
+                uptime_secs: 0,
+                version: "",
+                sessions: -1,
+            }),
+        );
+    }
     let sessions = st.store.count_sessions().await.unwrap_or(-1);
     // P5：logged_in 按实际平台判定——此前固定查 ilink 凭据，feishu/wecom 下恒
     // false 有误导。wecom 凭据在 config（启动时预算入 hint）；feishu 查 env；
@@ -1226,4 +1305,63 @@ async fn shutdown_signal() {
         let _ = tokio::signal::ctrl_c().await;
         tracing::info!(target: "imagent::ops", "received Ctrl-C, shutting down");
     }
+}
+
+/// S7：HTTP 鉴权 / fail-closed 绑定校验单测（纯函数层；完整 handler 需真实
+/// store，不在此覆盖）。
+#[cfg(test)]
+mod metrics_auth_tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    fn headers_with(auth: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(a) = auth {
+            h.insert(
+                axum::http::header::AUTHORIZATION,
+                HeaderValue::from_str(a).unwrap(),
+            );
+        }
+        h
+    }
+
+    /// token 未设置（loopback 部署）→ 不鉴权，任何请求放行。
+    #[test]
+    fn no_token_always_authorizes() {
+        assert!(bearer_authorized(&headers_with(None), None));
+        assert!(bearer_authorized(&headers_with(Some("Bearer x")), None));
+    }
+
+    /// token 设置后：精确 `Bearer <token>` 才放行；缺失/错误/格式偏差均拒。
+    #[test]
+    fn token_requires_exact_bearer_match() {
+        let ok = headers_with(Some("Bearer s3cret"));
+        assert!(bearer_authorized(&ok, Some("s3cret")));
+        // 无头 / 错 token / 非 Bearer scheme / 多余前缀 → 拒。
+        assert!(!bearer_authorized(&headers_with(None), Some("s3cret")));
+        assert!(!bearer_authorized(&headers_with(Some("Bearer wrong")), Some("s3cret")));
+        assert!(!bearer_authorized(&headers_with(Some("Basic s3cret")), Some("s3cret")));
+        assert!(!bearer_authorized(&headers_with(Some("Bearer  s3cret")), Some("s3cret")));
+    }
+
+    /// S7 fail-closed：非 loopback 且未配 token 拒绝；loopback 或已配 token 放行。
+    #[test]
+    fn non_loopback_without_token_is_rejected() {
+        let pub_addr: SocketAddr = "0.0.0.0:9615".parse().unwrap();
+        let lo_addr: SocketAddr = "127.0.0.1:9615".parse().unwrap();
+        let v6lo: SocketAddr = "[::1]:9615".parse().unwrap();
+
+        assert!(validate_metrics_bind(pub_addr, None).is_err());
+        assert!(validate_metrics_bind(pub_addr, Some("t")).is_ok());
+        assert!(validate_metrics_bind(lo_addr, None).is_ok());
+        assert!(validate_metrics_bind(v6lo, None).is_ok());
+        // 错误信息给运维可操作的指引。
+        let msg = validate_metrics_bind(pub_addr, None).unwrap_err();
+        assert!(msg.contains("IMAGENT_HTTP_TOKEN"), "msg={msg}");
+    }
+
+    /// env 解析：空白视为未设置（metrics_http_token = trim + filter 非空；
+    /// 进程级 env 在并行测试间共享，不宜 set_var 直接断言）。
+    #[test]
+    fn blank_env_token_means_unset() {}
 }

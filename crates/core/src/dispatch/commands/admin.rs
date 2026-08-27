@@ -744,9 +744,29 @@ impl Dispatcher {
                 // auto 按当前后端解析成具体档再入运行时（claude-cli → ask，
                 // 其余 → off）；回执带解析结果。
                 let resolved = PermissionMode::Auto.resolve(self.backend.name());
-                self.reload_permission_mode(resolved);
-                let note = if resolved.needs_socket() {
-                    "（注意：审批闭环 socket 需重启 imagent 才生效）"
+                // B3：解析结果若为闭环类档位（claude 系 → ask/auto-claude），须
+                // 后端能力为 FullLoop 才放行热切（与启动期 fail-closed 同口径）。
+                if resolved.needs_socket()
+                    && self.backend.permission_capability()
+                        != crate::backend::PermissionCapability::FullLoop
+                {
+                    self.reply(
+                        conv,
+                        &format!(
+                            "⚠️ auto 在后端 {} 解析为 {}（IM 审批闭环），但该后端不支持闭环（{}）；未切换。请改用 off/allow/deny 或换 claude 系后端",
+                            self.backend.name(),
+                            resolved.as_str(),
+                            self.backend.permission_capability().as_str()
+                        ),
+                        hint,
+                    )
+                    .await;
+                    return;
+                }
+                // D12：闭环类档位热切时惰性补起 socket（幂等），不再要求重启。
+                let socket_ok = self.reload_permission_mode(resolved);
+                let note = if resolved.needs_socket() && !socket_ok {
+                    "（⚠️ 审批 socket 启动失败，闭环不可用；检查日志或重启 imagent）"
                 } else {
                     ""
                 };
@@ -763,11 +783,29 @@ impl Dispatcher {
             }
             "off" | "allow" | "deny" | "ask" => {
                 let mode = PermissionMode::from_str_lossy(arg);
-                self.reload_permission_mode(mode);
-                // Ask 模式的权限审批 socket 仅在 run() 启动时按当时模式
-                // spawn 一次，热切到 Ask 不会补起 socket（重启生效）。
-                let note = if arg == "ask" {
-                    "（注意：Ask 模式的权限审批 socket 需重启 imagent 才生效）"
+                // B3：ask 是闭环类档位，非 FullLoop 后端拒绝热切（fail-closed，
+                // 与启动期校验同口径）。
+                if mode.needs_socket()
+                    && self.backend.permission_capability()
+                        != crate::backend::PermissionCapability::FullLoop
+                {
+                    self.reply(
+                        conv,
+                        &format!(
+                            "⚠️ 后端 {} 不支持 IM 审批闭环（{}），无法切到 {arg}；请改用 off/allow/deny 或换 claude 系后端",
+                            self.backend.name(),
+                            self.backend.permission_capability().as_str()
+                        ),
+                        hint,
+                    )
+                    .await;
+                    return;
+                }
+                // D12：热切 ask 时惰性补起 socket accept task（幂等防重复），
+                // 回执不再要求重启。
+                let socket_ok = self.reload_permission_mode(mode);
+                let note = if mode.needs_socket() && !socket_ok {
+                    "（⚠️ 审批 socket 启动失败，闭环不可用；检查日志或重启 imagent）"
                 } else {
                     ""
                 };

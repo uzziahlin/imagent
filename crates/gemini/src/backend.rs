@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use imagent_core::{
     backend_common::{spawn_cli_backend, CliEvent, WRITE_OR_EXEC},
-    AgentChunk, Backend, Result, RunOutcome, SessionId,
+    AgentChunk, Backend, PermissionCapability, Result, RunOutcome, SessionId,
 };
 use tokio::process::Command;
 use tracing::debug;
@@ -33,10 +33,26 @@ impl Default for GeminiBackend {
 
 const NAME: &str = "gemini";
 
+/// prompt 作为单 argv 传入的字节上限（B13a，见 run 注释）。
+const MAX_PROMPT_BYTES: usize = 64 * 1024;
+
 #[async_trait]
 impl Backend for GeminiBackend {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    /// B3：NativeOnly——gemini 有原生审批档位 `--approval-mode`
+    /// （default/auto_edit/yolo/plan，本 backend 从 allowed_tools 收敛映射，
+    /// 见 [`pick_approval`]），但 headless（`-p`）模式无审批回调机制，无法接
+    /// IM 审批闭环。`backend_permission_mode` 透传键在 gemini 下**无可靠映射**：
+    /// 其值域是 claude 的 `--permission-mode` 白名单
+    /// （default/acceptEdits/plan/auto/dontAsk/bypassPermissions），与 gemini
+    /// 的四档不同名（acceptEdits≈auto_edit 勉强可对，但 bypassPermissions→yolo
+    /// 是危险放开、auto/dontAsk 无对应），部分可映射=整体不可靠，保持
+    /// warn 忽略（main 侧带能力矩阵的明确 warn）。
+    fn permission_capability(&self) -> PermissionCapability {
+        PermissionCapability::NativeOnly
     }
 
     async fn run(
@@ -49,6 +65,26 @@ impl Backend for GeminiBackend {
         chunks: tokio::sync::mpsc::Sender<AgentChunk>,
     ) -> Result<RunOutcome> {
         debug!(target: "imagent::gemini", conv_id, "gemini run start");
+        // B13a：ARG_MAX 防护——gemini 的 prompt 只能整条作 `--prompt=<prompt>` 单
+        // argv 传入。gemini CLI headless（-p）模式没有从 stdin 读 prompt 的机制
+        // （`-p` 后必须跟 prompt，无 `-` / stdin 约定；2026-08 `gemini --help`
+        // 核实），且本 workspace 的 spawn_cli_backend（core，backend_common.rs）
+        // 统一以 `Stdio::null()` 封死子进程 stdin（防 CLI 交互挂起），stdin 回退
+        // 通道不可用。故超长时 fail-fast：拒绝 spawn、给用户可读错误，而不是
+        // 撞 E2BIG 得到裸 "Argument list too long"。阈值取 64KB：Linux ARG_MAX
+        // 约 2MB 但单 argv 实际上限常为 MAX_ARG_STRLEN=128KB，64KB 留足余量且
+        // 远超正常单条 IM 消息长度。
+        if prompt.len() > MAX_PROMPT_BYTES {
+            return Err(imagent_core::CoreError::Backend(
+                NAME,
+                format!(
+                    "prompt 过长（{} 字节 > 上限 {}）：gemini CLI 不支持从 stdin 传参，\
+                     请缩短内容或拆分多轮发送",
+                    prompt.len(),
+                    MAX_PROMPT_BYTES
+                ),
+            ));
+        }
         // 构造命令（workdir 锁定；stdin/stdout/stderr/kill_on_drop 由 spawn_cli_backend 统一加）。
         let (approval, sandbox) = pick_approval(allowed_tools);
         let mut cmd = Command::new("gemini");
@@ -134,7 +170,7 @@ fn pick_approval(allowed_tools: &[String]) -> (&'static str, bool) {
 }
 
 // TODO(P?): Gemini IM 权限审批闭环——MVP 不做，依赖 approval_mode + workdir 锁定兜底；
-// gemini headless 无等价的 IM 审批回调机制。
+// gemini headless 无等价的 IM 审批回调机制（能力声明见 permission_capability 注释）。
 
 #[cfg(test)]
 mod tests {
@@ -161,6 +197,16 @@ mod tests {
         assert_eq!(pick_approval(&["MultiEdit".into()]), ("auto_edit", false));
     }
 
+    /// B3：能力协商——gemini 有原生 --approval-mode 档位但无 IM 审批回调，
+    /// 如实声明 NativeOnly（ask 档启动期被拒，allow/deny 靠原生档兜底）。
+    #[test]
+    fn permission_capability_is_native_only() {
+        assert_eq!(
+            GeminiBackend::new().permission_capability(),
+            PermissionCapability::NativeOnly
+        );
+    }
+
     #[test]
     fn never_yolo() {
         // 即使有全部写工具，也不选 yolo。
@@ -171,5 +217,25 @@ mod tests {
     #[test]
     fn name_is_gemini() {
         assert_eq!(GeminiBackend::new().name(), "gemini");
+    }
+
+    /// B13a：超长 prompt 在 spawn 前拒绝，错误信息可读（不撞 E2BIG）。
+    #[tokio::test]
+    async fn oversized_prompt_rejected_before_spawn() {
+        let long = "x".repeat(MAX_PROMPT_BYTES + 1);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let err = GeminiBackend::new()
+            .run("c1", &long, None, std::path::Path::new("/tmp"), &[], tx)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("prompt 过长"), "msg={msg}");
+        assert!(msg.contains("stdin"), "msg={msg}");
+    }
+
+    /// B13a：恰在上限内的 prompt 不在预检层拒绝（后续由真实 spawn 决定成败）。
+    #[test]
+    fn threshold_is_max_prompt_bytes() {
+        assert_eq!(MAX_PROMPT_BYTES, 64 * 1024);
     }
 }

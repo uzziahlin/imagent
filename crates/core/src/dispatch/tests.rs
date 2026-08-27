@@ -428,6 +428,35 @@ async fn build_with_workdir(auth: Auth, default_workdir: std::path::PathBuf) -> 
         db,
     }
 }
+/// 与 build 相同，但可指定 permission_mode（B3 启动 fail-closed 校验测试用）。
+async fn build_with_mode(auth: Auth, mode: PermissionMode) -> Ctx {
+    let (plat, inbox, send_count) = MockPlatform::new();
+    let (back, calls, prompts, order) = MockBackend::new();
+    let (store, db) = tmp_store().await;
+    let admins = auth.snapshot();
+    let disp = Arc::new(Dispatcher::new(
+        Arc::new(plat),
+        Arc::new(back),
+        store,
+        auth,
+        std::path::PathBuf::from("/tmp/imagent-test-ws"),
+        vec!["Read".into(), "Edit".into()],
+        mode,
+        test_budgets(),
+        CotDetail::Brief,
+        admins,
+    ));
+    Ctx {
+        disp,
+        inbox,
+        send_count,
+        calls,
+        prompts,
+        order,
+        db,
+    }
+}
+
 /// 与 build 相同，但 MockBackend 返回 terminal=false（R1 非正常退出告警测试用）。
 async fn build_non_terminal(auth: Auth) -> Ctx {
     let (plat, inbox, send_count) = MockPlatform::new();
@@ -2450,6 +2479,77 @@ async fn perm_switch_requires_admin() {
     drop_db(ctx.db).await;
 }
 
+/// B3（fail-closed）：闭环类档位（ask / auto-claude）× 非 FullLoop 后端，
+/// Dispatcher::run() 启动即拒绝（MockBackend 用 trait 默认 Unsupported）。
+/// 此前 codex/gemini 在 ask 档下静默忽略审批（等于全放行）——现须启动报错。
+#[tokio::test]
+async fn run_fails_closed_ask_mode_with_non_fullloop_backend() {
+    let _serial = SERIAL.lock().await;
+    for mode in [PermissionMode::Ask, PermissionMode::AutoClaude] {
+        let ctx = build_with_mode(Auth::new(vec!["alice".into()]), mode).await;
+        let run = ctx.disp.clone().run();
+        let res = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("run 应立即返回（fail-closed），不进主循环");
+        let err = res.expect_err("ask/auto-claude × 非 FullLoop 后端应启动失败");
+        assert!(
+            err.to_string().contains("IM 审批闭环"),
+            "错误信息应指向闭环能力缺失: {err}"
+        );
+        drop_db(ctx.db).await;
+    }
+}
+
+/// B3：非闭环档位（off/allow/deny）× 非 FullLoop 后端不拦截——run() 正常进入
+/// 主循环（收到 shutdown 后优雅退出 Ok）。
+#[tokio::test]
+async fn run_allows_non_socket_mode_with_non_fullloop_backend() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build_with_mode(Auth::new(vec!["alice".into()]), PermissionMode::Deny).await;
+    let disp = ctx.disp.clone();
+    let run = disp.clone().run();
+    // 给 run 一点时间进入主循环，再触发优雅退出。
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        disp.shutdown();
+    });
+    let res = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("run 应在 shutdown 后退出");
+    assert!(res.is_ok(), "非闭环档位不应被启动校验拦截: {res:?}");
+    drop_db(ctx.db).await;
+}
+
+/// B3：/perm ask（闭环档）× 非 FullLoop 后端（MockBackend 默认 Unsupported）——
+/// 管理员也拒绝热切，模式不变；/perm auto 按后端解析为非闭环档（mock → off），
+/// 可正常切换。
+#[tokio::test]
+async fn perm_ask_rejected_for_non_fullloop_backend() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build_with_admin(Auth::new(vec!["alice".into()]), vec!["alice".into()]).await;
+    // 管理员切 ask → 拒绝且模式不变。
+    ctx.disp.handle(msg("c1", "alice", "/perm ask")).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.iter().any(|t| t.contains("不支持 IM 审批闭环")),
+        "应拒绝闭环档热切并说明能力: {inbox:?}"
+    );
+    drop(inbox);
+    assert!(
+        !matches!(*ctx.disp.permission_mode.read(), PermissionMode::Ask),
+        "模式不得被切换到 ask"
+    );
+    // /perm auto：mock 后端解析为非闭环档，可切换成功。
+    ctx.disp.handle(msg("c1", "alice", "/perm auto")).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.iter().any(|t| t.contains("✅ 权限模式")),
+        "auto 解析为非闭环档应可热切: {inbox:?}"
+    );
+    drop(inbox);
+    drop_db(ctx.db).await;
+}
+
 /// P5-3：/disallow 须管理员——此前任何过门用户可把管理员本人踢出白名单。
 #[tokio::test]
 async fn disallow_requires_admin() {
@@ -2616,6 +2716,20 @@ async fn permission_socket_token_handshake() {
         .trim()
         .to_string();
     assert!(!token.is_empty(), "token 应已生成");
+
+    // D12：幂等——再次 spawn（模拟 /perm ask 热切复用同一路径）返回 true 且
+    // 不重复建 accept task（第二个 socket 路径不会被 bind，token 不变）。
+    let sock2 = dir.join("permission2.sock");
+    assert!(
+        ctx.disp.spawn_socket_accept(sock2.to_string_lossy().into_owned()),
+        "重复 spawn 应幂等返回 true"
+    );
+    assert!(!sock2.exists(), "幂等：不应 bind 第二个 socket 文件");
+    let token_again = std::fs::read_to_string(&token_path)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(token_again, token, "幂等：token 不应被重写");
 
     // 错 token：连接被丢弃（不应有询问，也不应有任何回复）。
     {

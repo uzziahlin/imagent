@@ -32,7 +32,7 @@ pub mod render;
 mod types;
 
 pub use auth::Auth;
-pub use backend::Backend;
+pub use backend::{Backend, ImPermissionAsk, ImPermissionHook, PermissionCapability};
 pub use card_session::sweep_live_cards;
 pub use config::{validate_workdir, Config, CotDetail, PermissionMode, ReplyMode};
 pub use dedup::Dedup;
