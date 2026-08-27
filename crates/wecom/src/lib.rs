@@ -12,7 +12,9 @@
 
 mod client;
 mod platform;
-mod proto;
+/// proto 公开：fuzz target（`fuzz/fuzz_targets/wecom_frame_parse.rs`）需直接
+/// fuzz 入站帧解析纯函数（`parse_frame` / `parse_msg_callback`），与 feishu 同例。
+pub mod proto;
 
 pub use client::probe_credentials;
 pub use platform::WeComPlatform;

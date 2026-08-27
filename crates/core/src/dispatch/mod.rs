@@ -124,8 +124,37 @@ fn format_uptime(d: Duration) -> String {
     }
 }
 
+/// 人读 Duration（S-10：超时/失败文案用，替代 `{:?}` 的 `180s` 裸 Debug 输出）：
+/// `45 秒` / `3 分钟` / `2 小时 5 分钟` / `1 天 3 小时`。
+fn format_duration_human(d: Duration) -> String {
+    let secs = d.as_secs();
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let mins = (secs % 3_600) / 60;
+    let s = secs % 60;
+    if days > 0 {
+        format!("{days} 天 {hours} 小时")
+    } else if hours > 0 {
+        format!("{hours} 小时 {mins} 分钟")
+    } else if mins > 0 {
+        format!("{mins} 分钟")
+    } else {
+        format!("{s} 秒")
+    }
+}
+
+/// S-7：backend 失败统一文案模板——人可读摘要 + 是否可续接 + 建议动作；
+/// 技术细节（原始错误串）只进服务端日志，不再裸发给用户。
+fn backend_failure_reply(backend_name: &str) -> String {
+    format!(
+        "❌ {backend_name} 本轮执行失败，任务未完成。\n\
+         已完成的进度已保留：直接重发消息即可续接（想全新开始可发 /new）。\n\
+         若持续失败，可发 /doctor 自检；技术细节见服务端日志。"
+    )
+}
+
 /// epoch 秒 → 相对时间（`/resume` 列表用）：`42秒前` / `5分钟前` / `3小时前` /
-/// `2天前`；超 7 天回退原始时间戳（避免引日期库）。
+/// `2天前`；超 7 天仍用「N天前」（S-11：不再回退裸 epoch 时间戳——对用户无意义）。
 fn format_rel_ts(ts: i64) -> String {
     let d = (now_secs() - ts).max(0);
     if d < 60 {
@@ -134,10 +163,8 @@ fn format_rel_ts(ts: i64) -> String {
         format!("{}分钟前", d / 60)
     } else if d < 86_400 {
         format!("{}小时前", d / 3_600)
-    } else if d < 7 * 86_400 {
-        format!("{}天前", d / 86_400)
     } else {
-        format!("（{ts}）")
+        format!("{}天前", d / 86_400)
     }
 }
 
@@ -177,8 +204,7 @@ fn workspace_key(name: &str) -> String {
     format!("workspace:{name}")
 }
 
-/// 错误是否指示 iLink session 过期（需重新 login）。
-///
+/// 错误是否指示 iLink session 过期（需重新 login）。///
 /// 专用 `CoreError::SessionExpired` variant，靠类型判定而非 Display 子串（更鲁棒）。
 fn is_session_expired_err(e: &crate::error::CoreError) -> bool {
     matches!(e, crate::error::CoreError::SessionExpired(_))
@@ -238,10 +264,11 @@ fn merge_batch(batch: Vec<InboundMessage>) -> InboundMessage {
     first
 }
 
-/// P10：排队消息 → 展示摘要（最新一条）：文本取前 40 字符；纯媒体给占位。
+/// P10：排队消息 → 展示摘要（最新一条）：文本取前 40 字符（S-6：按注释口径
+/// 截断，防长消息把卡片 footer 撑爆）；纯媒体给占位。
 fn latest_snippet(msg: &InboundMessage) -> String {
     match msg.text.as_deref() {
-        Some(t) if !t.trim().is_empty() => t.trim().to_string(),
+        Some(t) if !t.trim().is_empty() => truncate_str(t.trim(), 40),
         _ if !msg.media.is_empty() => "（图片/文件）".to_string(),
         _ => String::new(),
     }
@@ -307,7 +334,8 @@ pub struct Dispatcher {
     /// CardSession 每次 patch 拉取渲染进 Running footer（状态上卡，不发消息）。
     queued_hints: Arc<Mutex<HashMap<String, crate::card_session::QueuedHint>>>,
     /// per-conv 最近一次 `/resume` 渲染的列表（P4-11）：序号选择取缓存，
-    /// 防两次调用间本机会话 mtime 变化导致错位；选中即消费（移除）。
+    /// 防两次调用间本机会话 mtime 变化导致错位；S-16：选中不移除条目（防序号
+    /// 前移错位），陈旧由 D7 的 TTL 惰性过期兜底。
     /// D7：key 为 (conv, sender)——群聊多用户共用 conv，仅按 conv 缓存会互相
     /// 覆盖错位；值带写入时刻，超过 [`RESUME_CACHE_TTL`] 惰性过期。
     resume_cache: Mutex<ResumeCache>,
@@ -473,14 +501,47 @@ impl Dispatcher {
     /// SIGHUP 热重载：更新 permission_mode（与 ClaudeBackend 共享同一句柄时
     /// 二者同步生效）。D12：热切到 Ask/auto-claude 闭环类档位时惰性补起
     /// socket accept task（幂等，见 [`Self::ensure_permission_socket`]），
-    /// 不再要求重启。返回闭环档位下 socket 是否就绪（非闭环档恒 true）。
-    pub fn reload_permission_mode(&self, mode: PermissionMode) -> bool {
-        *self.permission_mode.write() = mode;
-        if mode.needs_socket() {
-            self.ensure_permission_socket()
-        } else {
-            true
+    /// 不再要求重启。
+    ///
+    /// S-1（安全）：闭环档位 × 非 FullLoop 后端在热切路径同样校验（与 run()
+    /// 启动期 fail-closed 同口径）——此前热重载只写句柄不校验，SIGHUP 重载
+    /// 即可绕过启动期能力矩阵；校验不过返回 Err 且**不**写句柄（拒绝热切）。
+    /// 闭环档位下 socket bind 失败同样返回 Err（模式已写入，但闭环不可用，
+    /// 由调用方决定回滚/告警）。
+    pub fn reload_permission_mode(
+        &self,
+        mode: PermissionMode,
+    ) -> std::result::Result<(), crate::error::CoreError> {
+        // 校验先于写句柄：拒绝热切时保持既有模式不变。
+        if mode.needs_socket()
+            && self.backend.permission_capability() != crate::backend::PermissionCapability::FullLoop
+        {
+            error!(
+                target: "imagent::core",
+                mode = mode.as_str(),
+                backend = self.backend.name(),
+                capability = self.backend.permission_capability().as_str(),
+                "热切权限模式被拒绝：闭环档位需要 FullLoop 后端"
+            );
+            return Err(crate::error::CoreError::Config(format!(
+                "permission_mode = \"{}\" 需要后端支持 IM 审批闭环，但当前后端 {} 的权限能力为 {}。\
+                 请将 permission_mode 改为 auto/off/allow/deny，或改用支持闭环的 claude 系后端（claude-cli / claude-acp）",
+                mode.as_str(),
+                self.backend.name(),
+                self.backend.permission_capability().as_str()
+            )));
         }
+        // 闭环档位先确保 socket 就绪再写句柄——socket 失败时同样保持原模式
+        // （拒绝热切即完全拒绝，不留「模式已切但闭环不可用」的半切状态）。
+        if mode.needs_socket() && !self.ensure_permission_socket() {
+            return Err(crate::error::CoreError::Config(format!(
+                "permission_mode = \"{}\" 需要权限审批 socket，但 socket 启动失败（路径/平台不支持）；\
+                 Ask 审批闭环不可用，请检查日志或改用 off/allow/deny 档位",
+                mode.as_str()
+            )));
+        }
+        *self.permission_mode.write() = mode;
+        Ok(())
     }
 
     /// D12：needs_socket 且 socket accept task 未启动时惰性 spawn（复用
@@ -554,6 +615,15 @@ impl Dispatcher {
                 let rx = router
                     .register(&ask.conv_id, &ask.request_id, None, PendingKind::Permission)
                     .await;
+                // S-5（泄漏防护）：本 hook future 被 drop（run 被 /stop abort、总超时
+                // 或空闲看门狗打断）时不会走任何 await 之后的 cancel 分支——挂上
+                // Drop guard 兜底 cancel，防 pending 残留吞掉后续消息。正常完成 /
+                // 显式 cancel 后 cancel 幂等（pending 已移除则 no-op）。
+                let _leak_guard = PendingCancelGuard {
+                    router: router.clone(),
+                    conv: ask.conv_id.clone(),
+                    request_id: ask.request_id.clone(),
+                };
                 let card_msg_id = match platform
                     .send_permission_ask(
                         &conv,
@@ -609,6 +679,19 @@ impl Dispatcher {
                         {
                             warn!(target: "imagent::core", error = %e, "超时询问卡收敛失败（不影响 deny）");
                         }
+                        // S-18：超时 deny 不能对用户无声——回一条可读消息，说明
+                        // 已自动拒绝及后果（否则用户以为点了稍后再说还有效）。
+                        let _ = platform
+                            .send_text(
+                                &conv,
+                                &format!(
+                                    "⏳ 审批超时（等待 {}），已自动拒绝该操作，任务将被中断。\
+                                     如仍需执行请重新发起任务并在时限内回复。",
+                                    format_duration_human(timeout)
+                                ),
+                                &ReplyHint::None,
+                            )
+                            .await;
                         METRICS
                             .permission_decisions
                             .with_label_values(&["timeout"])
@@ -660,8 +743,15 @@ impl Dispatcher {
         self.backend.set_im_permission_hook(Some(hook));
         // Ask 模式：spawn unix socket accept task（MCP server 转发的权限请求经此进主进程）。
         // D12：抽到 ensure_permission_socket（热切 /perm ask 复用同一路径）。
-        if self.permission_mode.read().needs_socket() {
-            self.ensure_permission_socket();
+        // S-2（fail-closed）：bind 失败（路径不可写 / 平台不支持）时**拒绝启动**——
+        // 此前返回值被丢弃会静默降级为「无审批」，是安全 posture 退化。
+        if self.permission_mode.read().needs_socket() && !self.ensure_permission_socket() {
+            return Err(crate::error::CoreError::Config(
+                "permission_mode 为 Ask/auto-claude（IM 审批闭环）档位，但权限审批 socket 启动失败\
+                 （Unix domain socket 不可用或路径无法绑定）。Ask 闭环完全不可用，拒绝启动；\
+                 请改用 permission_mode = auto/off/allow/deny，或在 macOS/Linux 修复 socket 路径后重启"
+                    .to_string(),
+            ));
         }
 
         // recv 失败退避（防 client 异常退出后 dispatcher 忙循环刷屏）。
@@ -865,11 +955,15 @@ impl Dispatcher {
                 }
                 info!(target: "imagent::core", conv_id = %conv, "runner 在飞，消息入队待下一轮合并");
                 pending.push(msg);
+                // S-3（P10）：锁内只做入队与快照，hint 写入 / note 推送（网络 IO）
+                // 移到 drop(map) 之后——与上方上限分支同款纪律，不在 queues 锁
+                // 持有期间 await。
+                let count = pending.len();
+                let latest = latest_snippet(&pending[pending.len() - 1]);
+                drop(map);
                 // P10：排队状态上卡——①②流式卡 footer 由 CardSession 下次 patch 拉取；
                 // ③审批等待是最静默的窗口（无 chunk，footer 不动），推送重渲染审批卡
                 // note 行（best-effort）。两者都是状态更新，不往消息流发任何东西。
-                let count = pending.len();
-                let latest = latest_snippet(&pending[pending.len() - 1]);
                 let note = format!("⏳ 等待你审批 · 后面还排着 {count} 条消息");
                 self.queued_hints.lock().await.insert(
                     conv.to_string(),
@@ -881,6 +975,11 @@ impl Dispatcher {
                     .await
                 {
                     tracing::debug!(target: "imagent::core", error = %e, "审批卡排队 note 更新失败（不影响排队）");
+                }
+                // S-3/S-4 竞态兜底：锁外写 hint 期间本批可能已被 runner 取走（queues
+                // entry 已移除、hint 已清）——复查一次，entry 不在则撤回 stale hint。
+                if self.queues.lock().await.get(conv).is_none() {
+                    self.queued_hints.lock().await.remove(conv);
                 }
                 false
             }
@@ -904,6 +1003,8 @@ impl Dispatcher {
             map.remove(conv);
             return None;
         }
+        // S-4（原子）：取批与清 hint 在**同一** queues 临界区内完成——先清后取
+        // 分离会有间隙：/stop 或新入队消息在两步之间落地导致 hint 与实际队列错位。
         // P10：本批转入处理——排队提示清零（本轮运行中新入队的会重新累积，
         // 展示在下一张卡 / 下一轮）。
         self.queued_hints.lock().await.remove(conv);
@@ -1074,24 +1175,80 @@ impl Dispatcher {
     /// 回传文本，返回是否成功送达。P5-第五批：流式前缀累积据此只记成功送达
     /// 的部分——失败段落留给最终全量兜底，而非两处皆失。session 过期升级为
     /// error（用户侧已收不到回复）。
+    ///
+    /// S-9：失败至少重试一次（短暂退避，瞬时网络抖动可自愈）；仍失败时记
+    /// error 日志并附目标文本前 200 字符（排障定位「哪条消息没送出去」）。
     async fn reply_ok(&self, conv: &ConvId, text: &str, hint: &ReplyHint) -> bool {
-        match self.platform.send_text(conv, text, hint).await {
-            Ok(()) => {
-                METRICS.messages_out.inc();
-                true
-            }
-            Err(e) => {
-                if is_session_expired_err(&e) {
+        let mut attempt = 0;
+        loop {
+            match self.platform.send_text(conv, text, hint).await {
+                Ok(()) => {
+                    METRICS.messages_out.inc();
+                    return true;
+                }
+                Err(e) => {
+                    if is_session_expired_err(&e) {
+                        // session 过期重试无意义，直接升级 error。
+                        tracing::error!(
+                            target: "imagent::core",
+                            conv_id = %conv.0,
+                            error = %e,
+                            "send_text session 过期（用户侧已收不到）"
+                        );
+                        return false;
+                    }
+                    if attempt == 0 {
+                        attempt += 1;
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        continue; // 首次失败：退避后重试一次
+                    }
                     tracing::error!(
                         target: "imagent::core",
                         conv_id = %conv.0,
                         error = %e,
-                        "send_text session 过期（用户侧已收不到）"
+                        retries = attempt,
+                        text_head = %truncate_str(text, 200),
+                        "send_text 重试后仍失败（附目标文本前 200 字符）"
                     );
-                } else {
-                    warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "send_text 失败");
+                    return false;
                 }
-                false
+            }
+        }
+    }
+}
+
+/// S-5：权限审批 pending 的 Drop 兜底 guard。
+///
+/// `build_im_permission_hook` 的 future 在任一 await 点被 drop（run 被 /stop
+/// abort、agent_timeout / 空闲看门狗超时）时不会走 cancel 分支，pending 会在
+/// router 里残留（后续自由文本被误当审批回复吞掉）。guard 在 drop 时向运行时
+/// 提交一次 cancel（幂等：pending 已被正常消费/显式清理则 no-op）。
+struct PendingCancelGuard {
+    router: Arc<PermissionRouter>,
+    conv: String,
+    request_id: String,
+}
+
+impl Drop for PendingCancelGuard {
+    fn drop(&mut self) {
+        let router = self.router.clone();
+        let conv = self.conv.clone();
+        let request_id = self.request_id.clone();
+        // drop 发生在 runtime 线程（task abort / timeout）时可直接 spawn；脱离
+        // runtime（如测试手工 drop）则只能放弃兜底（记日志）。
+        match tokio::runtime::Handle::try_current() {
+            Ok(h) => {
+                h.spawn(async move {
+                    router.cancel(&conv, &request_id).await;
+                });
+            }
+            Err(_) => {
+                warn!(
+                    target: "imagent::core",
+                    conv_id = %self.conv,
+                    request_id = %self.request_id,
+                    "PendingCancelGuard drop 时无 runtime，无法兜底 cancel pending"
+                );
             }
         }
     }

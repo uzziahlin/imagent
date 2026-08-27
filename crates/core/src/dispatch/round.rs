@@ -289,7 +289,8 @@ impl Dispatcher {
             }
             Ok(Err(e)) => {
                 METRICS.backend_errors.inc();
-                let m = format!("[error] {e}");
+                // S-7：统一失败文案模板（摘要 + 可续接 + 建议动作），技术细节进日志。
+                let m = backend_failure_reply(self.backend.name());
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "backend.run 失败");
                 if let Some(c) = card.as_mut() {
                     c.finalize(
@@ -319,9 +320,11 @@ impl Dispatcher {
                 // P4-1/P4-3：join task 被 abort——/stop（用户中断）或空闲看门狗。
                 METRICS.backend_errors.inc();
                 if idle_timed_out {
+                    // S-10：时长用人读格式（「3 分钟」），不再输出 `{:?}` 的 `180s`。
+                    let idle = self.idle_timeout_for(&conv.0).await;
                     let m = format!(
-                        "⏱️ agent 已连续 {:?} 无输出，空闲超时终止本轮。已进行到的进度已保留，下条消息将续接（全新开始可 /new）。",
-                        self.idle_timeout_for(&conv.0).await
+                        "⏱️ agent 已连续 {} 无输出，空闲超时终止本轮。已进行到的进度已保留，下条消息将续接（全新开始可 /new）。",
+                        format_duration_human(idle)
                     );
                     if let Some(c) = card.as_mut() {
                         c.finalize(
@@ -353,6 +356,10 @@ impl Dispatcher {
                             self.platform.as_ref(),
                         )
                         .await;
+                    } else {
+                        // S-17：纯文本平台此前中断后静默——半截流式文本后无任何标记，
+                        // 用户分不清「说完了」还是「被打断」。补一条短中断标记。
+                        self.reply(&conv, "⏹ 本轮已被中断", &hint).await;
                     }
                 }
                 // P5-5：中断路径保住已学到的 session id（与 Claude Code 自身的中断
@@ -369,7 +376,9 @@ impl Dispatcher {
                 METRICS.backend_errors.inc();
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "backend task panic");
                 // P2-5：panic 时若已收到 Final chunk，优先回传它（而非丢弃只报 panic）。
-                let m = final_text.unwrap_or_else(|| format!("[error] backend task panicked: {e}"));
+                // S-7：无 Final 时用统一失败模板（技术细节进日志）。
+                let m = final_text
+                    .unwrap_or_else(|| backend_failure_reply(self.backend.name()));
                 if let Some(c) = card.as_mut() {
                     c.finalize(
                         Some(m.as_str()),
@@ -402,7 +411,15 @@ impl Dispatcher {
         } else if outcome_has_final {
             outcome.final_text
         } else {
-            format!("(done, session={})", outcome.session_id.0)
+            // S-8：裸 session id 对用户无意义——只回人可读提示；session id 进日志
+            //（排障仍可查到本轮会话映射）。
+            info!(
+                target: "imagent::core",
+                conv_id = %conv.0,
+                session_id = %outcome.session_id.0,
+                "本轮完成但无最终文本"
+            );
+            "（任务已完成，未返回文本）".to_string()
         };
         // P5-10：非卡片平台已实时推送过 Text 增量——最终回复只补差量，防
         // codex/gemini/ACP（中间 Text 流式 + Final 全量）整段重发两遍。final 与

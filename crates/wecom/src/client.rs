@@ -402,7 +402,10 @@ mod tests {
         assert_eq!(jittered_backoff(base, -0.2), Duration::from_secs(8));
         for _ in 0..200 {
             let j = jittered_backoff(base, rand_jitter());
-            assert!(j >= Duration::from_secs(8) && j <= Duration::from_secs(12), "j={j:?}");
+            assert!(
+                j >= Duration::from_secs(8) && j <= Duration::from_secs(12),
+                "j={j:?}"
+            );
         }
     }
 

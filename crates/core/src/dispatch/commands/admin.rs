@@ -764,22 +764,29 @@ impl Dispatcher {
                     return;
                 }
                 // D12：闭环类档位热切时惰性补起 socket（幂等），不再要求重启。
-                let socket_ok = self.reload_permission_mode(resolved);
-                let note = if resolved.needs_socket() && !socket_ok {
-                    "（⚠️ 审批 socket 启动失败，闭环不可用；检查日志或重启 imagent）"
-                } else {
-                    ""
-                };
-                self.reply(
-                    conv,
-                    &format!(
-                        "✅ 权限模式 auto → {}（按后端 {}）{note}",
-                        resolved.as_str(),
-                        self.backend.name()
-                    ),
-                    hint,
-                )
-                .await;
+                // S-1：reload Result 化——能力/socket 失败统一走 Err 回执（模式保持不变）。
+                match self.reload_permission_mode(resolved) {
+                    Ok(()) => {
+                        self.reply(
+                            conv,
+                            &format!(
+                                "✅ 权限模式 auto → {}（按后端 {}）",
+                                resolved.as_str(),
+                                self.backend.name()
+                            ),
+                            hint,
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        self.reply(
+                            conv,
+                            &format!("⚠️ 权限模式热切失败：{e}（保持原模式不变）"),
+                            hint,
+                        )
+                        .await;
+                    }
+                }
             }
             "off" | "allow" | "deny" | "ask" => {
                 let mode = PermissionMode::from_str_lossy(arg);
@@ -802,15 +809,21 @@ impl Dispatcher {
                     return;
                 }
                 // D12：热切 ask 时惰性补起 socket accept task（幂等防重复），
-                // 回执不再要求重启。
-                let socket_ok = self.reload_permission_mode(mode);
-                let note = if mode.needs_socket() && !socket_ok {
-                    "（⚠️ 审批 socket 启动失败，闭环不可用；检查日志或重启 imagent）"
-                } else {
-                    ""
-                };
-                self.reply(conv, &format!("✅ 权限模式已切到 {arg}{note}"), hint)
-                    .await;
+                // 回执不再要求重启。S-1：reload Result 化（能力/socket 失败回执）。
+                match self.reload_permission_mode(mode) {
+                    Ok(()) => {
+                        self.reply(conv, &format!("✅ 权限模式已切到 {arg}"), hint)
+                            .await;
+                    }
+                    Err(e) => {
+                        self.reply(
+                            conv,
+                            &format!("⚠️ 权限模式热切失败：{e}（保持原模式不变）"),
+                            hint,
+                        )
+                        .await;
+                    }
+                }
             }
             _ => {
                 self.reply(conv, "用法：/perm <auto|off|allow|deny|ask>", hint)
