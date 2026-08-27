@@ -1497,7 +1497,7 @@ dependencies = [
 
 [[package]]
 name = "imagent"
-version = "1.11.0"
+version = "1.11.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1525,7 +1525,7 @@ dependencies = [
 
 [[package]]
 name = "imagent-claude"
-version = "1.11.0"
+version = "1.11.1"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -1541,7 +1541,7 @@ dependencies = [
 
 [[package]]
 name = "imagent-codex"
-version = "1.11.0"
+version = "1.11.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1554,7 +1554,7 @@ dependencies = [
 
 [[package]]
 name = "imagent-core"
-version = "1.11.0"
+version = "1.11.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1576,7 +1576,7 @@ dependencies = [
 
 [[package]]
 name = "imagent-feishu"
-version = "1.11.0"
+version = "1.11.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1596,7 +1596,7 @@ dependencies = [
 
 [[package]]
 name = "imagent-gemini"
-version = "1.11.0"
+version = "1.11.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1608,7 +1608,7 @@ dependencies = [
 
 [[package]]
 name = "imagent-ilink"
-version = "1.11.0"
+version = "1.11.1"
 dependencies = [
  "aes 0.9.2",
  "anyhow",
@@ -1637,7 +1637,7 @@ dependencies = [
 
 [[package]]
 name = "imagent-store"
-version = "1.11.0"
+version = "1.11.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1657,7 +1657,7 @@ dependencies = [
 
 [[package]]
 name = "imagent-wecom"
-version = "1.11.0"
+version = "1.11.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2438,7 +2438,6 @@ dependencies = [
  "lazy_static",
  "memchr",
  "parking_lot",
- "protobuf",
  "thiserror 1.0.69",
 ]
 
@@ -2517,12 +2516,6 @@ checksum = "9091c90b0a32608e984ff2fa4091273cbdd755d54935c51d520887f4a1dbd5b0"
 dependencies = [
  "prost 0.12.6",
 ]
-
-[[package]]
-name = "protobuf"
-version = "2.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "106dd99e98437432fed6519dedecfade6a06a73bb7b2a1e019fdd2bee5778d94"
 
 [[package]]
 name = "pxfm"

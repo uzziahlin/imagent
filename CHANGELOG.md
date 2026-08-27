@@ -6,6 +6,11 @@
 
 （空——下一段变更从这里开始。）
 
+## [1.11.1] — 2026-08-28
+
+### Security
+- **移除传递依赖 protobuf 2.28（RUSTSEC-2024-0437，递归崩溃漏洞）**：`prometheus` 关闭默认 protobuf 导出器特性（我们只用文本格式指标），漏洞依赖整体移出依赖树；`cargo audit` 漏洞清零（剩余 1 条为配置中已放行的 event-listener unsound 告警，与本次无关）。
+
 ## [1.11.0] — 2026-08-28
 
 > **飞书专项两波**：Wave A 功能 bug 修复 + 群聊安全隔离 + 交互流 13 项；Wave B 卡片视觉美化 10 项（CardKit 2.0 组件升级）。544 tests / 0 failed。
