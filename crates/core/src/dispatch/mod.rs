@@ -58,7 +58,7 @@ const RESUME_CACHE_TTL: Duration = Duration::from_secs(600);
 /// Dispatcher 时长类预算聚合（避免构造参数表随配置项继续膨胀）。
 #[derive(Debug, Clone, Copy)]
 pub struct TaskBudgets {
-    /// 单次 agent 运行总超时（`agent_timeout_secs`）。
+    /// 单次 agent 运行总超时（`agent_timeout_secs`；0 = 关闭，默认）。
     pub agent_timeout: Duration,
     /// Ask 权限审批等待回复超时（`permission_ask_timeout_secs`，独立预算）。
     pub permission_ask_timeout: Duration,

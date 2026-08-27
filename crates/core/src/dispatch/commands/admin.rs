@@ -583,7 +583,7 @@ impl Dispatcher {
                 None => "on",
             };
             let text = format!(
-                                "当前配置：\n- cot_detail = {cot}（off|brief|detailed）\n- batch_window_ms = {window_ms}\n- agent_idle_timeout_secs = {idle_secs}（0=关）\n- agent_timeout_secs = {}（重启生效）\n- permission_mode = {perm}\n- require_mention = {require_mention}（热切换，重启回 config 值）\n- reply_mode = {reply_mode}（card|text，热切换，重启回 config 值）\n用法：/config <key> <value>（管理员）",
+                                "当前配置：\n- cot_detail = {cot}（off|brief|detailed）\n- batch_window_ms = {window_ms}\n- agent_idle_timeout_secs = {idle_secs}（0=关）\n- agent_timeout_secs = {}（0=关，默认；重启生效）\n- permission_mode = {perm}\n- require_mention = {require_mention}（热切换，重启回 config 值）\n- reply_mode = {reply_mode}（card|text，热切换，重启回 config 值）\n用法：/config <key> <value>（管理员）",
                                 self.agent_timeout.as_secs(),
                             );
             // P9-2：表单卡（飞书等支持 form 的平台渲染下拉 + 提交；其余平台降级

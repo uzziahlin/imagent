@@ -208,14 +208,17 @@ pub struct Config {
     /// 分片之间发送间隔（毫秒），避免多条叠加触发 IM 限流。默认 400。
     #[serde(default = "default_fragment_interval_ms")]
     pub message_fragment_interval_ms: u64,
-    /// 单次 agent 运行超时（秒）。超时则中止该次 run（依赖 backend 的
-    /// `kill_on_drop` 杀子进程），防止挂死的 agent 永久卡住会话。默认 600（10 分钟）。
+    /// 单次 agent 运行总超时（秒）。超时则中止该次 run（依赖 backend 的
+    /// `kill_on_drop` 杀子进程）。**默认 0 = 关闭**：这是墙钟总预算，与 agent
+    /// 是否活跃无关，长任务会被误杀；防挂死由空闲看门狗
+    /// （`agent_idle_timeout_secs`，连续无输出才杀）承担。仅在需要硬上限时设置。
     #[serde(default = "default_agent_timeout_secs")]
     pub agent_timeout_secs: u64,
     /// 权限审批（Ask 模式）等待用户回复的超时（秒），超时则 deny。默认 300（5 分钟）。
     /// S-3：独立预算——审批等待不再挤占 `agent_timeout` 的执行预算（`agent_timeout`
-    /// 覆盖审批 + 执行总和）。D8：必须 < `agent_timeout_secs`（否则慢审批撑满
-    /// agent 总预算、看门狗语义错乱），加载期强制校验、违反拒绝启动。
+    /// 覆盖审批 + 执行总和）。D8：`agent_timeout_secs` 非 0（启用总超时）时必须
+    /// 小于它（否则慢审批撑满 agent 总预算、看门狗语义错乱），加载期强制校验、
+    /// 违反拒绝启动；0（总超时关闭）时无此约束。
     #[serde(default = "default_permission_ask_timeout_secs")]
     pub permission_ask_timeout_secs: u64,
     /// 终端 agent 的 `ask_via_im` MCP 工具：询问默认投递的目标会话
@@ -367,7 +370,7 @@ fn default_fragment_interval_ms() -> u64 {
     400
 }
 fn default_agent_timeout_secs() -> u64 {
-    600
+    0
 }
 fn default_permission_ask_timeout_secs() -> u64 {
     300
@@ -420,11 +423,6 @@ impl Config {
 
         // P5 快赢：数值下界/上限校验——错误前置到启动期，而非运行期静默劣化
         //（0 值超时 = 所有 run 瞬时失败/审批必拒；超大批窗口 = 每条回复显著延迟）。
-        if cfg.agent_timeout_secs == 0 {
-            return Err(CoreError::Config(
-                "agent_timeout_secs 必须 ≥ 1（0 会让所有 agent 运行瞬时超时）".into(),
-            ));
-        }
         if cfg.permission_ask_timeout_secs == 0 {
             return Err(CoreError::Config(
                 "permission_ask_timeout_secs 必须 ≥ 1（0 会让所有审批必然超时拒否）".into(),
@@ -432,7 +430,7 @@ impl Config {
         }
         // D8：审批等待预算必须小于 agent 总预算——慢审批不再挤占执行时间的前提；
         // 违反（≥）直接拒绝启动（此前仅注释建议，运行期才以超时形式暴露）。
-        if cfg.permission_ask_timeout_secs >= cfg.agent_timeout_secs {
+        if cfg.agent_timeout_secs != 0 && cfg.permission_ask_timeout_secs >= cfg.agent_timeout_secs {
             return Err(CoreError::Config(format!(
                 "permission_ask_timeout_secs（{}）必须小于 agent_timeout_secs（{}）：\
                  审批等待有独立预算，≥ 总预算会让慢审批撑满 agent 超时",
@@ -500,7 +498,7 @@ permission_mode = "auto"    # 缺省=auto：claude-cli=透传 claude 原生 auto
 # metrics_addr = "127.0.0.1:9100"   # 默认关闭；设为 "ip:port" 开启 /metrics + /health HTTP server
 # message_max_len = 2000              # 单条出站消息字符上限（Unicode char）；不设 = 不分片
 # message_fragment_interval_ms = 400  # 分片间发送间隔（ms）
-# agent_timeout_secs = 600            # 单次 agent 运行超时（秒）；超时中止防挂死
+# agent_timeout_secs = 0              # 单次运行总超时(秒)；0=关闭(默认，防挂死靠 idle 看门狗)；设为正数即硬上限
 # agent_idle_timeout_secs = 300       # 空闲看门狗(秒)：连续无输出则终止本轮；0=关闭
 # batch_window_ms = 1500              # 批处理窗口(ms)：连发消息合并为一轮 prompt；0=关闭
 # cot_detail = "brief"                # 工具过程展示：off | brief(默认) | detailed（/config 可热改）
@@ -827,7 +825,6 @@ message_fragment_interval_ms = 250
     #[test]
     fn numeric_bounds_rejected() {
         for (tag, extra) in [
-            ("timeout0", "agent_timeout_secs = 0\n"),
             ("ask0", "permission_ask_timeout_secs = 0\n"),
             ("grace0", "shutdown_grace_secs = 0\n"),
             ("window_huge", "batch_window_ms = 600000\n"),
@@ -844,6 +841,13 @@ message_fragment_interval_ms = 250
         let p = tmp_path(
             "bounds_ok",
             "default_workdir = \"/tmp/ws\"\nbatch_window_ms = 10000\nagent_idle_timeout_secs = 0\n",
+        );
+        assert!(Config::load(&p).is_ok());
+        cleanup(&p);
+        // agent_timeout_secs = 0 = 关闭总超时（默认；防挂死靠 idle 看门狗）。
+        let p = tmp_path(
+            "bounds_timeout_off",
+            "default_workdir = \"/tmp/ws\"\nagent_timeout_secs = 0\npermission_ask_timeout_secs = 300\n",
         );
         assert!(Config::load(&p).is_ok());
         cleanup(&p);
@@ -871,9 +875,12 @@ message_fragment_interval_ms = 250
             );
             cleanup(&p);
         }
-        // 合法：默认（300 < 600）与显式小于均通过。
+        // 合法：显式小于通过；默认（agent_timeout=0 关闭）不适用该约束。
         let p = tmp_path("lt_ok", "default_workdir = \"/tmp/ws\"\nagent_timeout_secs = 301\npermission_ask_timeout_secs = 300\n");
         assert!(Config::load(&p).is_ok());
+        let p = tmp_path("off_ok", "default_workdir = \"/tmp/ws\"\n");
+        assert!(Config::load(&p).is_ok());
+        assert_eq!(default_agent_timeout_secs(), 0);
         cleanup(&p);
     }
 

@@ -103,6 +103,13 @@ impl Dispatcher {
         let workdir_for_row = workdir.to_string_lossy().to_string();
         let join = tokio::spawn(async move {
             let backend_name = backend.name();
+            // agent_timeout = 0（默认）= 关闭总超时：墙钟总预算会误杀持续输出的
+            // 长任务，防挂死由空闲看门狗（idle_timeout）承担。
+            if agent_timeout.is_zero() {
+                return backend
+                    .run(&conv_id_owned, &prompt_owned, existing.as_ref(), &workdir, &tools, tx)
+                    .await;
+            }
             match tokio::time::timeout(
                 agent_timeout,
                 backend.run(

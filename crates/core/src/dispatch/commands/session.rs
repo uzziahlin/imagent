@@ -362,6 +362,19 @@ impl Dispatcher {
                 let agent_timeout = self.agent_timeout;
                 let join = tokio::spawn(async move {
                     let backend_name = backend.name();
+                    // agent_timeout = 0（默认）= 关闭总超时；/stop 仍可中断本任务。
+                    if agent_timeout.is_zero() {
+                        return backend
+                            .run(
+                                &conv_id_compact,
+                                "请用中文简洁总结当前对话的要点、已做决定与未完成事项（不超过 400 字）。",
+                                Some(&sid),
+                                &workdir,
+                                &tools,
+                                tx,
+                            )
+                            .await;
+                    }
                     match tokio::time::timeout(
                                         agent_timeout,
                                         backend.run(
