@@ -114,7 +114,11 @@ fn extract_session_id(value: &Value) -> Option<String> {
 /// 从 assistant 事件的 `message.content[]` 收集全部 text 块文本，按序拼接（`\n` 分隔）。
 fn extract_text_blocks(value: &Value) -> String {
     let mut texts = Vec::new();
-    if let Some(content) = value.get("message").and_then(|m| m.get("content")).and_then(Value::as_array) {
+    if let Some(content) = value
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_array)
+    {
         for item in content {
             if item.get("type").and_then(Value::as_str) == Some("text") {
                 if let Some(t) = item.get("text").and_then(Value::as_str) {
@@ -272,10 +276,7 @@ mod tests {
                 assert!(text.is_empty());
                 assert_eq!(tool_uses.len(), 1);
                 assert_eq!(tool_uses[0].tool, "Read");
-                assert!(
-                    tool_uses[0].input.contains("path"),
-                    "input 应含 path 字段"
-                );
+                assert!(tool_uses[0].input.contains("path"), "input 应含 path 字段");
                 assert_eq!(session_id, Some("sess-2".to_string()));
             }
             other => panic!("expected Assistant, got {other:?}"),
@@ -314,7 +315,9 @@ mod tests {
         // content 含 text + 单个 tool_use：两者都保留。
         let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"thinking..."},{"type":"tool_use","name":"Edit","input":{"file":"/bar"}}]},"session_id":"sess-3"}"#;
         match parse_line(line) {
-            ParsedEvent::Assistant { text, tool_uses, .. } => {
+            ParsedEvent::Assistant {
+                text, tool_uses, ..
+            } => {
                 assert_eq!(text, "thinking...");
                 assert_eq!(tool_uses.len(), 1);
                 assert_eq!(tool_uses[0].tool, "Edit");

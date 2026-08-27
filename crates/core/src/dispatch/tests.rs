@@ -2352,8 +2352,7 @@ async fn permission_reply_gate_checks_sender() {
     // S1 收紧：仅会话（群）白名单不再足够——群被加白后任意成员发 "y" 即可批准
     // 高危工具；群成员的回复不得被路由，须显式加入 sender 白名单（或为 admin）。
     assert!(
-        !ctx
-            .disp
+        !ctx.disp
             .can_route_permission_reply(&msg("c-group", "stranger", "y")),
         "仅群白名单（sender 未加白）不得路由审批回复"
     );

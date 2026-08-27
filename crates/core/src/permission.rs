@@ -53,15 +53,42 @@ pub struct PermissionReply {
 /// 精确 allow 词表（trim + 小写后全字匹配）。P2-G/P2-12：不用「首字符 y/Y」
 /// 宽匹配（旧逻辑会把 year/yellow/yesterday 误判 allow，是真实安全 bug）。
 const ALLOW_WORDS: &[&str] = &[
-    "y", "yes", "ye", "yep", "yeah", "ok", "okay", "是", "允许", "好", "好的", "可以", "行",
-    "没问题", "好呀", "行吧", "可以吧", "嗯",
+    "y",
+    "yes",
+    "ye",
+    "yep",
+    "yeah",
+    "ok",
+    "okay",
+    "是",
+    "允许",
+    "好",
+    "好的",
+    "可以",
+    "行",
+    "没问题",
+    "好呀",
+    "行吧",
+    "可以吧",
+    "嗯",
 ];
 
 /// 精确 deny 词表（trim + 小写后全字匹配）。D2：自由文本只有**明确命中**
 /// allow/deny 词表（或按钮回调带 ask_req / 引用回复锚定询问卡）才会被消费为
 /// 审批决定；其它自由文本回落正常消息路径，不再被兜底当 deny 吞掉。
 const DENY_WORDS: &[&str] = &[
-    "n", "no", "nope", "nah", "不", "否", "不要", "不行", "不可以", "不许", "拒绝", "不批",
+    "n",
+    "no",
+    "nope",
+    "nah",
+    "不",
+    "否",
+    "不要",
+    "不行",
+    "不可以",
+    "不许",
+    "拒绝",
+    "不批",
 ];
 
 /// 自由文本是否**明确命中**审批词表（allow 或 deny 词，全字匹配）。
@@ -179,7 +206,11 @@ impl PermissionRouter {
 
     /// D2：该 conv 的 pending 条数（多 pending 且无 reply 锚定时拒绝兜底消费）。
     pub async fn pending_count(&self, conv_id: &str) -> usize {
-        self.pending.lock().await.get(conv_id).map_or(0, |v| v.len())
+        self.pending
+            .lock()
+            .await
+            .get(conv_id)
+            .map_or(0, |v| v.len())
     }
 
     /// D5：回填询问卡消息 id（register 先占位、发卡成功后锚定引用回复路由）。
@@ -336,7 +367,9 @@ mod tests {
     async fn cancel_removes_pending() {
         // P1-8：cancel 清理 pending，避免超时/router-drop 残留累积。
         let r = PermissionRouter::new();
-        let _rx = r.register("conv1", "req1", None, PendingKind::Permission).await;
+        let _rx = r
+            .register("conv1", "req1", None, PendingKind::Permission)
+            .await;
         assert!(r.has_pending("conv1").await);
         r.cancel("conv1", "req1").await;
         assert!(!r.has_pending("conv1").await);
@@ -347,7 +380,9 @@ mod tests {
     #[tokio::test]
     async fn cancel_waits_no_more_denies_waiter() {
         let r = PermissionRouter::new();
-        let rx = r.register("conv1", "req1", None, PendingKind::Permission).await;
+        let rx = r
+            .register("conv1", "req1", None, PendingKind::Permission)
+            .await;
         r.cancel("conv1", "req1").await;
         // 等待者应立即（而非超时后）收到 deny。
         let reply = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
@@ -406,8 +441,22 @@ mod tests {
     #[tokio::test]
     async fn parent_msg_id_routes_to_matching_card() {
         let r = PermissionRouter::new();
-        let _old = r.register("c", "im-1", Some("om_old".to_string()), PendingKind::Permission).await;
-        let _rx_new = r.register("c", "t-1", Some("om_new".to_string()), PendingKind::Permission).await;
+        let _old = r
+            .register(
+                "c",
+                "im-1",
+                Some("om_old".to_string()),
+                PendingKind::Permission,
+            )
+            .await;
+        let _rx_new = r
+            .register(
+                "c",
+                "t-1",
+                Some("om_new".to_string()),
+                PendingKind::Permission,
+            )
+            .await;
         let hit = r
             .route(
                 "c",
@@ -526,7 +575,9 @@ mod tests {
     async fn router_register_route_hit() {
         let r = PermissionRouter::new();
         assert!(!r.has_pending("c1").await);
-        let rx = r.register("c1", "req1", None, PendingKind::Permission).await;
+        let rx = r
+            .register("c1", "req1", None, PendingKind::Permission)
+            .await;
         assert!(r.has_pending("c1").await);
         let hit = r
             .route(
@@ -586,7 +637,10 @@ mod tests {
     async fn set_card_msg_id_backfills_placeholder() {
         let r = PermissionRouter::new();
         let _rx = r.register("c", "req1", None, PendingKind::Permission).await;
-        assert!(r.set_card_msg_id("c", "req1", Some("om_1".to_string())).await);
+        assert!(
+            r.set_card_msg_id("c", "req1", Some("om_1".to_string()))
+                .await
+        );
         let hit = r
             .route(
                 "c",
@@ -601,7 +655,10 @@ mod tests {
             .await;
         assert_eq!(hit.as_deref(), Some("req1"), "回填后应按卡片锚点路由");
         // 已被消费后再回填 → 不命中（无害）。
-        assert!(!r.set_card_msg_id("c", "req1", Some("om_2".to_string())).await);
+        assert!(
+            !r.set_card_msg_id("c", "req1", Some("om_2".to_string()))
+                .await
+        );
     }
 
     /// D2：is_explicit_reply_word 只认精确 allow/deny 词，自由文本不命中。

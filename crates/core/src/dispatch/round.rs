@@ -184,10 +184,11 @@ impl Dispatcher {
                     // D3：仅**权限审批**的 pending 豁免看门狗（审批预算
                     // permission_ask_timeout 独立兜底）；终端 ask_via_im 的 pending
                     // 超时可到 86400s，不得无限豁免 IM 会话空闲看门狗。
-                    Err(_) if self
-                        .router
-                        .has_pending_of_kind(&conv.0, PendingKind::Permission)
-                        .await =>
+                    Err(_)
+                        if self
+                            .router
+                            .has_pending_of_kind(&conv.0, PendingKind::Permission)
+                            .await =>
                     {
                         continue
                     }

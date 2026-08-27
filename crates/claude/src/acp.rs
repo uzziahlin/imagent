@@ -409,11 +409,8 @@ async fn forward_update(state: &StreamState, update: SessionUpdate) {
         // B4：await send（通道满时挂起等待而非丢弃）；30s 超时兜底防消费方长期
         // 不收时卡死 notification handler。超时丢弃时 warn（agent_text 已同步
         // 累计，final_text 不受影响）。
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            state.chunks.send(chunk),
-        )
-        .await
+        match tokio::time::timeout(std::time::Duration::from_secs(30), state.chunks.send(chunk))
+            .await
         {
             Ok(Ok(())) => {}
             Ok(Err(_)) => debug!(target: "claude-acp", "chunks 通道已关闭，停止推送"),

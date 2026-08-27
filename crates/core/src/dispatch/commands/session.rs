@@ -79,10 +79,10 @@ impl Dispatcher {
                 .collect();
             // 缓存本列表：序号选择取缓存（防两次调用间本机会话
             // mtime 变化导致序号错位）。D7：key 按 (conv, sender) 隔离 + 带时间戳。
-            self.resume_cache.lock().await.insert(
-                (conv.0.clone(), sender.0.clone()),
-                (Instant::now(), list),
-            );
+            self.resume_cache
+                .lock()
+                .await
+                .insert((conv.0.clone(), sender.0.clone()), (Instant::now(), list));
             // P6-3：前 9 条各带「接管」按钮（点击 = /resume <n>；卡片按钮数克制，
             // 长列表仍以文本序号为准）。
             let buttons: Vec<CardButton> = lines

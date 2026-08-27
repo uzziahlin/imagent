@@ -30,7 +30,9 @@ use crate::card_session::CardSession;
 use crate::config::{CotDetail, PermissionMode, ReplyMode};
 use crate::error::Result;
 use crate::metrics::METRICS;
-use crate::permission::{is_explicit_reply_word, parse_reply, PendingKind, PermissionReply, PermissionRouter};
+use crate::permission::{
+    is_explicit_reply_word, parse_reply, PendingKind, PermissionReply, PermissionRouter,
+};
 use crate::platform::Platform;
 use crate::types::{
     AgentChunk, CardButton, CardButtonStyle, CardTerminal, ConfigFormField, ConvId, InboundMessage,
@@ -261,6 +263,9 @@ struct ResumeEntry {
     cwd: Option<String>,
 }
 
+/// /resume 列表缓存（D7）：key = (conv, sender)，值带写入时刻（TTL 惰性过期）。
+type ResumeCache = HashMap<(String, String), (Instant, Vec<ResumeEntry>)>;
+
 pub struct Dispatcher {
     platform: Arc<dyn Platform>,
     backend: Arc<dyn Backend>,
@@ -305,7 +310,7 @@ pub struct Dispatcher {
     /// 防两次调用间本机会话 mtime 变化导致错位；选中即消费（移除）。
     /// D7：key 为 (conv, sender)——群聊多用户共用 conv，仅按 conv 缓存会互相
     /// 覆盖错位；值带写入时刻，超过 [`RESUME_CACHE_TTL`] 惰性过期。
-    resume_cache: Mutex<HashMap<(String, String), (Instant, Vec<ResumeEntry>)>>,
+    resume_cache: Mutex<ResumeCache>,
     /// P6-9：per-conv 空闲看门狗覆盖（`/timeout`）——`Some(ZERO)` = 本会话关闭；
     /// 无条目 = 跟随全局 `agent_idle_timeout`。进程内（会话级旋钮，不落盘）。
     idle_overrides: Mutex<HashMap<String, Duration>>,
