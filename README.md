@@ -36,7 +36,7 @@ imagent 是一个常驻网关进程：监听 IM 私聊消息 → 鉴权 → 驱�
 - 🛑 **任务控制**：`/stop` 随时中断在飞任务（杀 agent 子进程）；空闲看门狗自动终止无输出的僵死任务。
 - 🔁 **消息批处理**：运行中到达的消息排队，与连发消息合并为一轮执行（不重复跑轮、不烧 token）。
 - 🛠️ **IM 内运维**：`/status` `/doctor` `/reconnect` `/config`（COT 三档展示 off/brief/detailed 等热改）。
-- 📄 **飞书生态**：CardKit 真流式卡片（分阶段状态 footer + 工具 ⏳/✅ 实时行）、审批/问题/命令标题卡（按钮 primary/danger 分层）、云文档评论 @bot 触发（同评论线程回复）。
+- 📄 **飞书生态**：CardKit 真流式卡片（分阶段 footer + 工具 ⏳/✅ 实时行 + ⏹ 终止按钮）、审批/问题/命令标题卡（按钮 primary/danger + flow 自适应布局）、`/config` 下拉表单卡、邮箱掩码防租户审计拦截、云文档评论 @bot 触发（同评论线程回复）。
 - 💻 **终端 agent 反向接入（ask_via_im）**：电脑终端上任意 agent 需要你决策时，把问题转发到飞书——人不在电脑前也能在手机上点按钮作答；多 agent 并发按 request_id 精确分发（见[终端 agent 接入](#终端-agent-接入ask_via-im人不在电脑前也能问你)）。
 - 🧩 **Profile 多实例**：`--profile` 一部署多 bot 身份（config/db/socket/媒体全隔离）。
 - 🛡️ **限流熔断**：`sendmessage` 服从式退避（防封号，不绕风控）。

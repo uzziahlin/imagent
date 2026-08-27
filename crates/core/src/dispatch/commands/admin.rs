@@ -555,17 +555,76 @@ impl Dispatcher {
             let window_ms = self.batch_window.read().as_millis();
             let cot = self.cot_detail.read().as_str();
             let perm = self.permission_mode.read().as_str();
+            let reply_mode = self.reply_mode.read().as_str();
             // P6 遗留补齐：require_mention 平台侧查询（None = 平台无群聊 @ 语义）。
             let require_mention = match self.platform.require_mention_in_group().await {
                 Some(true) => "on（群消息须 @bot）".to_string(),
                 Some(false) => "off（群消息全收）".to_string(),
                 None => "（本平台不支持）".to_string(),
             };
+            let rm_current = match self.platform.require_mention_in_group().await {
+                Some(true) => "on",
+                Some(false) => "off",
+                None => "on",
+            };
             let text = format!(
-                                "当前配置：\n- cot_detail = {cot}（off|brief|detailed）\n- batch_window_ms = {window_ms}\n- agent_idle_timeout_secs = {idle_secs}（0=关）\n- agent_timeout_secs = {}（重启生效）\n- permission_mode = {perm}\n- require_mention = {require_mention}（热切换，重启回 config 值）\n- reply_mode = {}（card|text，热切换，重启回 config 值）\n用法：/config <key> <value>（管理员）",
+                                "当前配置：\n- cot_detail = {cot}（off|brief|detailed）\n- batch_window_ms = {window_ms}\n- agent_idle_timeout_secs = {idle_secs}（0=关）\n- agent_timeout_secs = {}（重启生效）\n- permission_mode = {perm}\n- require_mention = {require_mention}（热切换，重启回 config 值）\n- reply_mode = {reply_mode}（card|text，热切换，重启回 config 值）\n用法：/config <key> <value>（管理员）",
                                 self.agent_timeout.as_secs(),
-                                self.reply_mode.read().as_str(),
                             );
+            // P9-2：表单卡（飞书等支持 form 的平台渲染下拉 + 提交；其余平台降级
+            // 上面的纯文本）。只放已有热改键；batch/timeout 类数值键继续文本命令。
+            let entries = vec![
+                ConfigFormField {
+                    key: "reply_mode".into(),
+                    label: "回复形态".into(),
+                    current: reply_mode.into(),
+                    options: vec![
+                        ("card".into(), "卡片（流式，默认）".into()),
+                        ("text".into(), "纯文本".into()),
+                    ],
+                },
+                ConfigFormField {
+                    key: "cot_detail".into(),
+                    label: "工具过程展示".into(),
+                    current: cot.into(),
+                    options: vec![
+                        ("brief".into(), "简略（默认）".into()),
+                        ("detailed".into(), "详细".into()),
+                        ("off".into(), "关闭".into()),
+                    ],
+                },
+                ConfigFormField {
+                    key: "require_mention".into(),
+                    label: "群消息须 @bot".into(),
+                    current: rm_current.into(),
+                    options: vec![
+                        ("on".into(), "是（默认）".into()),
+                        ("off".into(), "否（群消息全收）".into()),
+                    ],
+                },
+            ];
+            let _ = self
+                .platform
+                .send_config_form(conv, &entries, &text, hint)
+                .await;
+            return;
+        }
+        // P9-2：表单提交回传（/config form k=v k=v …）——逐对应用（键白名单在
+        // feishu proto 侧已过滤，这里再走一遍完整校验）。
+        if key == "form" {
+            let pairs: Vec<&str> = parts.iter().skip(2).copied().collect();
+            let mut results = Vec::new();
+            for pair in pairs {
+                let Some((k, v)) = pair.split_once('=') else {
+                    continue;
+                };
+                results.push(self.apply_config_kv(k.trim(), v.trim()).await);
+            }
+            let text = if results.is_empty() {
+                "表单未包含可识别的配置项。".to_string()
+            } else {
+                results.join("\n")
+            };
             self.reply(conv, &text, hint).await;
             return;
         }
@@ -574,27 +633,34 @@ impl Dispatcher {
                 .await;
             return;
         }
-        let result = match key {
+        let result = self.apply_config_kv(key, value).await;
+        self.reply(conv, &result, hint).await;
+    }
+
+    /// 单个配置键的热改应用（`/config k v` 与表单提交 `/config form k=v` 共用；
+    /// 返回面向用户的结果文案）。
+    async fn apply_config_kv(&self, key: &str, value: &str) -> String {
+        match key {
             "cot_detail" => match CotDetail::from_str_lossy(value) {
                 Some(d) => {
                     *self.cot_detail.write() = d;
                     format!("✅ cot_detail = {}", d.as_str())
                 }
-                None => "用法：/config cot_detail <off|brief|detailed>".into(),
+                None => "用法：cot_detail <off|brief|detailed>".into(),
             },
             "batch_window_ms" => match value.parse::<u64>() {
                 Ok(ms) => {
                     *self.batch_window.write() = Duration::from_millis(ms);
                     format!("✅ batch_window_ms = {ms}")
                 }
-                Err(_) => "用法：/config batch_window_ms <毫秒数，0=关闭>".into(),
+                Err(_) => "用法：batch_window_ms <毫秒数，0=关闭>".into(),
             },
             "agent_idle_timeout_secs" => match value.parse::<u64>() {
                 Ok(s) => {
                     *self.agent_idle_timeout.write() = Duration::from_secs(s);
                     format!("✅ agent_idle_timeout_secs = {s}")
                 }
-                Err(_) => "用法：/config agent_idle_timeout_secs <秒数，0=关闭>".into(),
+                Err(_) => "用法：agent_idle_timeout_secs <秒数，0=关闭>".into(),
             },
             // P6 遗留补齐：群消息须 @bot 热切换（平台侧策略，对下一消息生效）。
             "require_mention" => match value.to_ascii_lowercase().as_str() {
@@ -606,7 +672,7 @@ impl Dispatcher {
                     Ok(()) => "✅ require_mention = off（群消息全收；重启回 config 值）".into(),
                     Err(e) => format!("设置失败：{e}"),
                 },
-                _ => "用法：/config require_mention <on|off>".into(),
+                _ => "用法：require_mention <on|off>".into(),
             },
             // P7-A4：回复形态偏好（card=流式卡片 / text=纯文本），热切换即时生效
             //（下一轮起不建卡），重启回 config 值。
@@ -615,13 +681,11 @@ impl Dispatcher {
                     *self.reply_mode.write() = m;
                     format!("✅ reply_mode = {}（下一轮生效；重启回 config 值）", m.as_str())
                 }
-                None => "用法：/config reply_mode <card|text>".into(),
+                None => "用法：reply_mode <card|text>".into(),
             },
-            _ => {
-                "未知配置项（支持：cot_detail / batch_window_ms / agent_idle_timeout_secs / require_mention / reply_mode）".into()
-            }
-        };
-        self.reply(conv, &result, hint).await;
+            _ => "未知配置项（支持：cot_detail / batch_window_ms / agent_idle_timeout_secs / require_mention / reply_mode）"
+                .into(),
+        }
     }
 
     /// /perm <off|allow|deny|ask> —— 权限模式切换（admin 门槛）。

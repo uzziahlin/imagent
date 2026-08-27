@@ -4,7 +4,18 @@
 
 ## [Unreleased]
 
-（空——下一段变更从这里开始。）
+> P9 交互第二批（一二档快赢 + /config 表单卡）：流式卡终止按钮、邮箱掩码防租户审计 400、hr/flow 视觉细化、/ws 删除钮、空产出占位、`/config` 下拉表单卡。
+
+### Added
+- **流式卡 ⏹ 终止按钮**：Running 卡底部常驻 danger「⏹ 终止」，点击回调注入 `/stop`（imagent_cmd 机制，与手打命令同鉴权/分派）。managed 卡按钮不随终态移除（element PATCH 只能动 markdown，点击回「当前没有运行中的任务」，无害）；降级/话题路径整卡重渲染，终态自然消失。
+- **`/config` 表单卡（P9-2）**：飞书 `/config` 无参时渲染 CardKit 表单——`form` + `select_static` 下拉（回复形态 / 工具过程展示 / 群消息须 @bot）+ 提交按钮；提交值经 `card.action.trigger` 的 `action.form_value` 回传（不在 `value`，lcab 同款校准），proto 侧按**键白名单**合成 `/config form k=v …` 走既有分派（admin 门槛不豁免）。不支持表单的平台 trait 默认降级纯文本（原当前值 + 用法）。`/config form k=v k=v` 文本命令也可直接用（多键一次应用、逐键回报）。
+- **/ws 删除按钮**：每个命名工作空间「使用」（primary）+「删除」（danger）两钮（对标 lcab workspacesCard）。
+
+### Changed
+- **邮箱掩码防租户审计 400（P9-1）**：飞书租户开消息审计后，含裸邮箱的出站内容回 400（"contain sensitive data: EMAIL_ADDRESS"），流式卡**静默失败**（典型触发：git commit 的 Co-Authored-By 尾注）。渲染边界统一把 `@` 改写为 `[at]`（lcab mask-email 同款；刻意不用全角＠/零宽字符——中文审计归一化还原后会再次触发；点分 TLD 要求避开 npm scope/版本号/裸句柄）。覆盖：流式 body/终态、降级卡正文与工具面板、审批卡详情、问题卡、命令卡、全部出站文本（send_text）。
+- **hr 分割线 + flow 按钮布局**：V2 卡片的 `hr`（lcab 生产验证）用于审批卡/问题卡/命令卡正文与按钮分隔；按钮组改 `flex_mode: "flow"` + `width: auto` 自适应布局（按内容宽度自动换行），替代此前每行 3 个等宽列。
+- **空产出占位**：agent 零文本零工具时终态正文给「（未返回内容）」（空串 patch 组件可能被拒/显示空白）。
+
 
 ## [1.6.0] — 2026-08-27
 

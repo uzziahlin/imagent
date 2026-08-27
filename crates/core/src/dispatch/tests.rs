@@ -1114,6 +1114,50 @@ async fn stranger_mention_hint_on_off() {
     drop_db(ctx.db).await;
 }
 
+/// P9-2：表单提交回传（/config form k=v k=v）——多键一次应用；非法值逐键回报。
+#[tokio::test]
+async fn config_form_applies_multiple_pairs() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    feed_and_wait(
+        &ctx,
+        vec![msg(
+            "c",
+            "alice",
+            "/config form reply_mode=text cot_detail=detailed",
+        )],
+        1,
+    )
+    .await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox
+            .last()
+            .is_some_and(|t| t.contains("reply_mode = text") && t.contains("cot_detail = detailed")),
+        "表单多键应用: {inbox:?}"
+    );
+    assert_eq!(*ctx.disp.reply_mode.read(), ReplyMode::Text);
+    // 非法值：该键回用法，不影响其它键。
+    feed_and_wait(
+        &ctx,
+        vec![msg(
+            "c",
+            "alice",
+            "/config form cot_detail=yaml reply_mode=card",
+        )],
+        1,
+    )
+    .await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox
+            .last()
+            .is_some_and(|t| t.contains("用法") && t.contains("reply_mode = card")),
+        "逐键结果: {inbox:?}"
+    );
+    drop_db(ctx.db).await;
+}
+
 /// P7-A4：/config reply_mode text 热切换 + 展示。
 #[tokio::test]
 async fn config_reply_mode_toggle() {
@@ -1135,7 +1179,7 @@ async fn config_reply_mode_toggle() {
     feed_and_wait(&ctx, vec![msg("c", "alice", "/config reply_mode yaml")], 1).await;
     let inbox = ctx.inbox.lock().await.clone();
     assert!(
-        inbox.iter().any(|t| t.contains("用法：/config reply_mode")),
+        inbox.iter().any(|t| t.contains("用法：reply_mode")),
         "非法值应回用法: {inbox:?}"
     );
     drop_db(ctx.db).await;

@@ -119,6 +119,20 @@ pub trait Platform: Send + Sync {
         Ok(())
     }
 
+    /// P9-2：`/config` 偏好设置**表单卡**（下拉 + 提交）。支持表单组件的平台
+    /// （飞书 CardKit form）覆写渲染；默认实现降级纯文本（`fallback` 为各平台
+    /// 通用的当前值 + 用法说明）。提交回调由平台侧合成 `/config form k=v …`
+    /// 命令文本，走与手打命令相同的鉴权/分派。
+    async fn send_config_form(
+        &self,
+        conv: &ConvId,
+        _entries: &[crate::types::ConfigFormField],
+        fallback: &str,
+        hint: &ReplyHint,
+    ) -> Result<()> {
+        self.send_text(conv, fallback, hint).await
+    }
+
     /// 发命令交互卡片（P6-3）：markdown 正文 + 按钮组。按钮点击由平台侧转成
     /// `text = <command>` 的 InboundMessage（走与手打命令相同的鉴权/分派）。
     /// 默认降级纯文本：title + body + 可手打的命令清单（无按钮能力的平台无需感知）。

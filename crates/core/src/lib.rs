@@ -43,7 +43,7 @@ pub use metrics::Metrics;
 pub use permission::{default_sock_path, parse_reply, PermissionReply, PermissionRouter};
 pub use platform::{command_card_fallback_text, Platform};
 pub use types::{
-    AgentChunk, CardButton, CardButtonStyle, CardPhase, CardTerminal, ConvId, InboundMessage,
-    JoinedChat, LocalSession, MediaRef, Mention, OutboundCard, ReplyHint, RunOutcome, SessionId,
-    ToolCall, UserId, Workdir,
+    AgentChunk, CardButton, CardButtonStyle, CardPhase, CardTerminal, ConfigFormField, ConvId,
+    InboundMessage, JoinedChat, LocalSession, MediaRef, Mention, OutboundCard, ReplyHint,
+    RunOutcome, SessionId, ToolCall, UserId, Workdir,
 };
