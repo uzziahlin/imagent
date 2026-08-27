@@ -473,7 +473,7 @@ impl Dispatcher {
         } else {
             false
         };
-        // stop = 全停：清空排队待合并的消息（P4-2 批处理队列）。
+        // stop = 全停：清空排队待合并的消息（P4-2 批处理队列）+ 排队状态（P10）。
         let dropped = self
             .queues
             .lock()
@@ -481,6 +481,7 @@ impl Dispatcher {
             .remove(&conv.0)
             .map(|q| q.len())
             .unwrap_or(0);
+        self.queued_hints.lock().await.remove(&conv.0);
         let text = match (aborted, dropped) {
             (true, 0) => "🛑 已中断当前任务".to_string(),
             (true, n) => format!("🛑 已中断当前任务（丢弃 {n} 条排队消息）"),

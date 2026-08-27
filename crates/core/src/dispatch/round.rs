@@ -148,6 +148,7 @@ impl Dispatcher {
                 self.store.clone(),
                 conv.clone(),
                 self.platform.name(),
+                self.queued_hints.clone(),
             ))
         } else {
             None

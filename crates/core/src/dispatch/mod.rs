@@ -182,20 +182,40 @@ fn is_permission_reply_candidate(text: &str) -> bool {
     !t.is_empty() && !t.starts_with('/')
 }
 
-/// 合并一批排队消息为一轮 prompt 载体：非空文本以 `\n\n` 拼接、media /
-/// media_errors 拼接；sender 与 reply_hint 取首条（各消息入队前已各自过白名单）。
+/// 合并一批排队消息为一轮 prompt 载体：非空文本拼接、media / media_errors
+/// 拼接；sender 与 reply_hint 取首条（各消息入队前已各自过白名单）。
+/// P10-④：批内出现**多个不同发送者**（群聊多人）时给各段加说话人标注——
+/// 合并不再丢失归属，agent 能区分谁说了哪句；单人连发保持原样（不加噪音）。
 fn merge_batch(batch: Vec<InboundMessage>) -> InboundMessage {
+    let multi_sender = batch
+        .iter()
+        .map(|m| m.sender.0.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        > 1;
     let mut it = batch.into_iter();
     let mut first = it.next().expect("merge_batch: batch 非空");
+    let first_sender = first.sender.0.clone();
     let mut texts: Vec<String> = first
         .text
         .take()
         .filter(|t| !t.trim().is_empty())
+        .map(|t| {
+            if multi_sender {
+                format!("【{first_sender}】{t}")
+            } else {
+                t
+            }
+        })
         .into_iter()
         .collect();
     for m in it {
         if let Some(t) = m.text.filter(|t| !t.trim().is_empty()) {
-            texts.push(t);
+            texts.push(if multi_sender {
+                format!("【{}】{t}", m.sender.0)
+            } else {
+                t
+            });
         }
         first.media.extend(m.media);
         first.media_errors.extend(m.media_errors);
@@ -206,6 +226,15 @@ fn merge_batch(batch: Vec<InboundMessage>) -> InboundMessage {
         Some(texts.join("\n\n"))
     };
     first
+}
+
+/// P10：排队消息 → 展示摘要（最新一条）：文本取前 40 字符；纯媒体给占位。
+fn latest_snippet(msg: &InboundMessage) -> String {
+    match msg.text.as_deref() {
+        Some(t) if !t.trim().is_empty() => t.trim().to_string(),
+        _ if !msg.media.is_empty() => "（图片/文件）".to_string(),
+        _ => String::new(),
+    }
 }
 
 /// 统一 `/resume` 列表条目（P4-11）：IM 会话历史 ∪ 本机同项目 agent 会话。
@@ -261,6 +290,9 @@ pub struct Dispatcher {
     /// per-conv 批处理队列：runner 在飞期间到达的消息暂存（entry 存在 = runner
     /// 活跃；runner 取空交还时移除）。入队与取批共用一把锁，杜绝 lost-wakeup。
     queues: Mutex<HashMap<String, Vec<InboundMessage>>>,
+    /// P10：per-conv 排队状态（count + 最新摘要）——入队路径写、取批//stop 清、
+    /// CardSession 每次 patch 拉取渲染进 Running footer（状态上卡，不发消息）。
+    queued_hints: Arc<Mutex<HashMap<String, crate::card_session::QueuedHint>>>,
     /// per-conv 最近一次 `/resume` 渲染的列表（P4-11）：序号选择取缓存，
     /// 防两次调用间本机会话 mtime 变化导致错位；选中即消费（移除）。
     resume_cache: Mutex<HashMap<String, Vec<ResumeEntry>>>,
@@ -349,6 +381,7 @@ impl Dispatcher {
             started_at: Instant::now(),
             running: Mutex::new(HashMap::new()),
             queues: Mutex::new(HashMap::new()),
+            queued_hints: Arc::new(Mutex::new(HashMap::new())),
             resume_cache: Mutex::new(HashMap::new()),
             idle_overrides: Mutex::new(HashMap::new()),
             stranger_mention_hint: RwLock::new(false),
@@ -605,6 +638,23 @@ impl Dispatcher {
                 }
                 info!(target: "imagent::core", conv_id = %conv, "runner 在飞，消息入队待下一轮合并");
                 pending.push(msg);
+                // P10：排队状态上卡——①②流式卡 footer 由 CardSession 下次 patch 拉取；
+                // ③审批等待是最静默的窗口（无 chunk，footer 不动），推送重渲染审批卡
+                // note 行（best-effort）。两者都是状态更新，不往消息流发任何东西。
+                let count = pending.len();
+                let latest = latest_snippet(&pending[pending.len() - 1]);
+                let note = format!("⏳ 等待你审批 · 后面还排着 {count} 条消息");
+                self.queued_hints.lock().await.insert(
+                    conv.to_string(),
+                    crate::card_session::QueuedHint { count, latest },
+                );
+                if let Err(e) = self
+                    .platform
+                    .note_queued_on_ask(&ConvId(conv.to_string()), &note, hint)
+                    .await
+                {
+                    tracing::debug!(target: "imagent::core", error = %e, "审批卡排队 note 更新失败（不影响排队）");
+                }
                 false
             }
             None => {
@@ -627,6 +677,9 @@ impl Dispatcher {
             map.remove(conv);
             return None;
         }
+        // P10：本批转入处理——排队提示清零（本轮运行中新入队的会重新累积，
+        // 展示在下一张卡 / 下一轮）。
+        self.queued_hints.lock().await.remove(conv);
         Some(std::mem::take(pending))
     }
 

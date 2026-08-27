@@ -20,6 +20,29 @@ use imagent_store::Store;
 /// 卡片 patch 节流间隔。飞书交互卡片更新有频率限制，500ms 平衡流畅与限流。
 const CARD_THROTTLE: Duration = Duration::from_millis(500);
 
+/// P10：本会话的排队状态（运行中入队的消息摘要）。入队路径写、取批/中断清、
+/// CardSession 每次 patch 拉取（活动期随 chunk 刷新 footer 的排队提示）。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct QueuedHint {
+    /// 排队消息条数。
+    pub count: usize,
+    /// 最新一条的摘要（≤40 字符；纯媒体消息给「（图片/文件）」占位）。
+    pub latest: String,
+}
+
+/// 排队状态 → 展示文案（None = 无需展示）。`📥 排队 N 条，最新：「…」`。
+pub(crate) fn queued_hint_display(h: &QueuedHint) -> Option<String> {
+    if h.count == 0 {
+        return None;
+    }
+    let mut out = format!("📥 排队 {} 条", h.count);
+    if !h.latest.is_empty() {
+        let latest: String = h.latest.chars().take(40).collect();
+        out.push_str(&format!("，最新：「{latest}」"));
+    }
+    Some(out)
+}
+
 /// 流式卡片会话。
 pub(crate) struct CardSession {
     text: String,
@@ -34,10 +57,19 @@ pub(crate) struct CardSession {
     store: Store,
     conv: ConvId,
     platform_name: &'static str,
+    /// P10：dispatcher 的排队状态句柄（每次 patch 拉取，见 [`queued_hint_display`]）。
+    queued_hints: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, QueuedHint>>>,
 }
 
 impl CardSession {
-    pub(crate) fn new(store: Store, conv: ConvId, platform_name: &'static str) -> Self {
+    pub(crate) fn new(
+        store: Store,
+        conv: ConvId,
+        platform_name: &'static str,
+        queued_hints: std::sync::Arc<
+            tokio::sync::Mutex<std::collections::HashMap<String, QueuedHint>>,
+        >,
+    ) -> Self {
         Self {
             text: String::new(),
             tools: Vec::new(),
@@ -47,6 +79,7 @@ impl CardSession {
             store,
             conv,
             platform_name,
+            queued_hints,
         }
     }
 
@@ -180,10 +213,17 @@ impl CardSession {
         hint: &ReplyHint,
         platform: &dyn Platform,
     ) -> bool {
+        let queued = self
+            .queued_hints
+            .lock()
+            .await
+            .get(&self.conv.0)
+            .and_then(queued_hint_display);
         let card = OutboundCard {
             text: self.text.clone(),
             tool_calls: self.tools.clone(),
             phase: self.phase,
+            queued_hint: queued,
             terminal: terminal.clone(),
         };
         let res: crate::error::Result<()> = match &self.msg_id {
@@ -264,6 +304,7 @@ pub async fn sweep_live_cards(store: &Store, platform: &dyn Platform) {
             text: "⏸️ imagent 已重启，本次生成被中断（未产出结论）。请重新发送指令。".to_string(),
             tool_calls: Vec::new(),
             phase: CardPhase::Thinking,
+            queued_hint: None,
             terminal: CardTerminal::Error("进程重启中断".into()),
         };
         let conv = ConvId(row.conv_id.clone());
@@ -368,7 +409,7 @@ mod tests {
         let (store, db) = tmp_store("fallback").await;
         let conv = ConvId("c1".into());
         let hint = ReplyHint::None;
-        let mut s = CardSession::new(store, conv.clone(), plat.name());
+        let mut s = CardSession::new(store, conv.clone(), plat.name(), Default::default());
         // 流式阶段 send_card 即失败（msg_id 保持 None，仅 warn）。
         s.append_text("部分输出", &conv, &hint, &plat).await;
         s.finalize(
@@ -466,7 +507,7 @@ mod tests {
         };
         let conv = ConvId("c1".into());
         let hint = ReplyHint::None;
-        let mut s = CardSession::new(store.clone(), conv.clone(), plat.name());
+        let mut s = CardSession::new(store.clone(), conv.clone(), plat.name(), Default::default());
         s.append_text("流式片段", &conv, &hint, &plat).await;
         let rows = store.list_live_cards().await.expect("list");
         assert_eq!(rows.len(), 1, "首帧成功后应登记: {rows:?}");
@@ -490,7 +531,7 @@ mod tests {
         };
         let conv = ConvId("c1".into());
         let hint = ReplyHint::None;
-        let mut s = CardSession::new(store.clone(), conv.clone(), plat.name());
+        let mut s = CardSession::new(store.clone(), conv.clone(), plat.name(), Default::default());
         s.append_text("流式片段", &conv, &hint, &plat).await;
         s.finalize(Some("结论"), &[], CardTerminal::Done, &conv, &hint, &plat)
             .await;
