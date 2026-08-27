@@ -42,6 +42,15 @@ pub fn phase_footer(phase: CardPhase) -> &'static str {
     }
 }
 
+/// P10：Running footer 组合——阶段文案 + 排队提示（`🧰 正在调用工具… · 📥 排队 2 条`）。
+/// 排队状态"上卡不上消息流"：入队即被看见，不往会话里发任何确认消息。
+pub fn running_footer(phase: CardPhase, queued_hint: Option<&str>) -> String {
+    match queued_hint {
+        Some(h) => format!("{} · {}", phase_footer(phase), h),
+        None => phase_footer(phase).to_string(),
+    }
+}
+
 /// 终态 footer 文案（`已中断` 单列——/stop 与卡片扫描的收敛语义，非出错）。
 fn terminal_footer(err: Option<&str>) -> &'static str {
     match err {
@@ -58,9 +67,17 @@ fn terminal_footer(err: Option<&str>) -> &'static str {
 /// 这是**降级路径**的渲染（managed 真流式路径见 [`render_stream_init_card`]）。
 pub fn render_card(card: &OutboundCard, conv_id: &str) -> String {
     let (footer, streaming, err) = match &card.terminal {
-        CardTerminal::Running => (phase_footer(card.phase), true, None),
-        CardTerminal::Done => ("✅ 已完成", false, None),
-        CardTerminal::Error(e) => (terminal_footer(Some(e)), false, Some(e.as_str())),
+        CardTerminal::Running => (
+            running_footer(card.phase, card.queued_hint.as_deref()),
+            true,
+            None,
+        ),
+        CardTerminal::Done => ("✅ 已完成".to_string(), false, None),
+        CardTerminal::Error(e) => (
+            terminal_footer(Some(e)).to_string(),
+            false,
+            Some(e.as_str()),
+        ),
     };
     let text = if card.text.is_empty() {
         "…"
@@ -364,11 +381,31 @@ impl PipeString for String {
 /// 真机校准（2026-08）：schema V2 卡片已**废弃 `action` 元素**（200861 "cards of
 /// schema V2 no longer support this capability; unsupported tag action"）。按钮迁到
 /// `column_set` → `column` → `button`（button 组件本身 + behaviors 保留），两列等宽。
+/// 审批卡 note 行缺省文案。
+pub(crate) const PERM_NOTE_DEFAULT: &str = "⏱️ 长时间未处理将自动拒绝";
+
 pub fn render_permission_card(
     tool_name: &str,
     input_summary: &str,
     conv_id: &str,
     request_id: &str,
+) -> String {
+    render_permission_card_note(
+        tool_name,
+        input_summary,
+        conv_id,
+        request_id,
+        PERM_NOTE_DEFAULT,
+    )
+}
+
+/// P10-③：note 行可参数化（排队联动重渲染用，见 platform 的 note_queued_on_ask）。
+pub(crate) fn render_permission_card_note(
+    tool_name: &str,
+    input_summary: &str,
+    conv_id: &str,
+    request_id: &str,
+    note: &str,
 ) -> String {
     serde_json::json!({
         "schema": "2.0",
@@ -378,7 +415,7 @@ pub fn render_permission_card(
         },
         "body": { "elements": [
             { "tag": "markdown", "content": perm_detail_md(tool_name, input_summary) },
-            { "tag": "markdown", "content": "⏱️ 长时间未处理将自动拒绝", "text_size": "notation" },
+            { "tag": "markdown", "content": note, "text_size": "notation" },
             // P9-1：hr 分割线（V2 支持，lcab 生产验证）+ flow 自适应按钮布局。
             { "tag": "hr" },
             flow_button_row(&[
@@ -425,6 +462,16 @@ pub fn render_permission_card_superseded(tool_name: &str) -> String {
 /// 解析失败返回 None（调用方降级普通审批卡）。选项按钮 value 编码
 /// `imagent_ask`（选项文本）+ conv，回调转成 `ask:<选项>` 走审批回复路由。
 pub fn render_question_card(tool_input: &str, conv_id: &str, request_id: &str) -> Option<String> {
+    render_question_card_note(tool_input, conv_id, request_id, PERM_NOTE_DEFAULT)
+}
+
+/// P10-③：note 行可参数化（同审批卡）。
+pub(crate) fn render_question_card_note(
+    tool_input: &str,
+    conv_id: &str,
+    request_id: &str,
+    note: &str,
+) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(tool_input).ok()?;
     let q = v.pointer("/questions/0")?;
     let question = q.get("question")?.as_str()?.trim().to_string();
@@ -487,6 +534,7 @@ pub fn render_question_card(tool_input: &str, conv_id: &str, request_id: &str) -
             },
             "body": { "elements": [
                 { "tag": "markdown", "content": mask_emails(&content) },
+                { "tag": "markdown", "content": note, "text_size": "notation" },
                 { "tag": "hr" },
                 flow_button_row(&opt_buttons)
             ]}
@@ -658,6 +706,7 @@ mod tests {
             text: "hello".into(),
             tool_calls: vec![],
             phase: CardPhase::Thinking,
+            queued_hint: None,
             terminal: CardTerminal::Running,
         };
         let json = render_card(&card, "feishu:ou_t");
@@ -682,6 +731,7 @@ mod tests {
                 text: "x".into(),
                 tool_calls: vec![],
                 phase,
+                queued_hint: None,
                 terminal: CardTerminal::Running,
             };
             assert!(
@@ -697,6 +747,7 @@ mod tests {
             text: "done".into(),
             tool_calls: vec![tool("Read", "src/main.rs", true)],
             phase: CardPhase::Outputting,
+            queued_hint: None,
             terminal: CardTerminal::Done,
         };
         let json = render_card(&card, "feishu:ou_t");
@@ -720,6 +771,7 @@ mod tests {
             text: "out".into(),
             tool_calls: tools,
             phase: CardPhase::ToolRunning,
+            queued_hint: None,
             terminal: CardTerminal::Running,
         };
         let json = render_card(&card, "feishu:ou_t");
@@ -734,6 +786,7 @@ mod tests {
             text: "".into(),
             tool_calls: vec![],
             phase: CardPhase::Thinking,
+            queued_hint: None,
             terminal: CardTerminal::Error("boom".into()),
         };
         let json = render_card(&card, "feishu:ou_t");
@@ -922,6 +975,59 @@ mod tests {
         }
     }
 
+    /// P10：Running footer 组合——阶段 + 排队提示；无排队纯阶段文案。
+    #[test]
+    fn running_footer_composes_queued_hint() {
+        assert_eq!(
+            running_footer(CardPhase::ToolRunning, None),
+            "🧰 正在调用工具…"
+        );
+        assert_eq!(
+            running_footer(
+                CardPhase::ToolRunning,
+                Some("📥 排队 2 条，最新：「快一点」")
+            ),
+            "🧰 正在调用工具… · 📥 排队 2 条，最新：「快一点」"
+        );
+        // 降级卡 footer 同样组合。
+        let card = OutboundCard {
+            text: "x".into(),
+            tool_calls: vec![],
+            phase: CardPhase::Outputting,
+            queued_hint: Some("📥 排队 1 条".into()),
+            terminal: CardTerminal::Running,
+        };
+        let json = render_card(&card, "feishu:ou_t");
+        assert!(
+            json.contains("✍️ 输出中… · 📥 排队 1 条"),
+            "降级卡组合: {json}"
+        );
+    }
+
+    /// P10-③：审批卡 note 行可替换（排队联动重渲染），按钮 value 编码不变。
+    #[test]
+    fn permission_card_note_override() {
+        let json = render_permission_card_note(
+            "Bash",
+            r#"{"command":"ls"}"#,
+            "feishu:ou_t",
+            "req9",
+            "⏳ 等待你审批 · 后面还排着 3 条消息",
+        );
+        assert!(
+            json.contains("⏳ 等待你审批 · 后面还排着 3 条消息"),
+            "note 替换: {json}"
+        );
+        assert!(!json.contains("长时间未处理"), "默认 note 不再出现: {json}");
+        assert!(
+            json.contains("\"imagent_perm\":\"allow\"") && json.contains("\"req\":\"req9\""),
+            "按钮 value 编码不变: {json}"
+        );
+        // 缺省包装函数仍用默认 note。
+        let plain = render_permission_card("Bash", r#"{"command":"ls"}"#, "c", "r");
+        assert!(plain.contains("长时间未处理"));
+    }
+
     /// P9-1：流式卡终止按钮——init 卡与降级 Running 卡都带 ⏹ 终止（danger，
     /// 回调注入 /stop + conv 编码）；终态不带。
     #[test]
@@ -941,6 +1047,7 @@ mod tests {
             text: "x".into(),
             tool_calls: vec![],
             phase: CardPhase::Outputting,
+            queued_hint: None,
             terminal: CardTerminal::Running,
         };
         let json = render_card(&running, "feishu:ou_t");
@@ -949,6 +1056,7 @@ mod tests {
             text: "ok".into(),
             tool_calls: vec![],
             phase: CardPhase::Outputting,
+            queued_hint: None,
             terminal: CardTerminal::Done,
         };
         let json2 = render_card(&done, "feishu:ou_t");
@@ -1034,6 +1142,7 @@ mod tests {
             text: "结论".into(),
             tool_calls: vec![tool("Bash", "ls", true)],
             phase: CardPhase::Outputting,
+            queued_hint: None,
             terminal: CardTerminal::Done,
         };
         let json = render_stub_card(&card);

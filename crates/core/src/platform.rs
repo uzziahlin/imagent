@@ -93,6 +93,19 @@ pub trait Platform: Send + Sync {
         self.send_text(conv, &text, hint).await
     }
 
+    /// P10-③：运行中入队消息时，若该会话挂着**未决审批卡**则更新其 note 行
+    /// （如 `⏳ 等待你审批 · 后面还排着 N 条消息`）——审批等待是流式卡最静默
+    /// 的窗口（无 chunk），排队状态需要推送而不是等拉取。默认 no-op（无审批卡
+    /// 概念/不支持的平台）。best-effort：失败不影响排队本身。
+    async fn note_queued_on_ask(
+        &self,
+        _conv: &ConvId,
+        _note: &str,
+        _hint: &ReplyHint,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// P5-16：撤回/收敛单个权限询问（超时/顶替时调用，防审批卡滞留可点）。默认
     /// no-op：纯文本询问平台无句柄概念，滞留文本无害。支持交互卡片的平台按
     /// request_id 记录卡片句柄并 patch 成「已中断」终态。

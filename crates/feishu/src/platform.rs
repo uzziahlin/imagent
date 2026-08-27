@@ -63,6 +63,18 @@ struct PendingAskCard {
 struct AskSlot {
     msg_id: String,
     pending_req: Option<String>,
+    /// P10-③：重渲染输入（note 联动更新时按原参数重画整卡，按钮 value 不变）。
+    render: AskRender,
+}
+
+/// 询问卡的渲染输入（复用槽与新卡登记时记录）。
+#[derive(Clone)]
+struct AskRender {
+    /// 是否 AskUserQuestion 问题卡（否则审批卡）。
+    question: bool,
+    tool_name: String,
+    /// 审批卡=input 摘要 JSON；问题卡=AskUserQuestion 原始 input JSON。
+    input: String,
 }
 
 /// 飞书 Platform 适配器。
@@ -81,6 +93,8 @@ pub struct FeishuPlatform {
     /// P8-1：已上屏的 footer 文案缓存（per card_id）——分阶段 footer 只在**变化时**
     /// patch（思考中→调用工具→输出中），节流 tick 间内容相同则跳过，不浪费调用。
     card_footers: Arc<Mutex<HashMap<String, String>>>,
+    /// P10-③：审批卡 note 行缓存（per conv）——排队计数不变不重画。
+    ask_notes: Arc<Mutex<HashMap<String, String>>>,
     /// `/reconnect` 强制重连信号（与 WS run task 共享，P4-7）。
     reconnect: Arc<tokio::sync::Notify>,
     /// 已解析的入站消息 channel，`recv` 直接 await。
@@ -336,6 +350,7 @@ impl FeishuPlatform {
             token,
             card_seqs: Arc::new(Mutex::new(HashMap::new())),
             card_footers: Arc::new(Mutex::new(HashMap::new())),
+            ask_notes: Arc::new(Mutex::new(HashMap::new())),
             reconnect,
             inbound_rx: Arc::new(Mutex::new(inbound_msg_rx)),
             pending_asks: Arc::new(Mutex::new(HashMap::new())),
@@ -444,9 +459,10 @@ impl FeishuPlatform {
                     }
                     other => other,
                 }?;
-                // 分阶段 footer（best-effort，失败不影响正文流）。
-                self.patch_footer_if_changed(token, card_id, crate::card::phase_footer(card.phase))
-                    .await;
+                // 分阶段 footer（best-effort，失败不影响正文流）+ P10 排队提示
+                //（入队状态由 CardSession 每次 patch 拉取，随 chunk 刷新）。
+                let footer = crate::card::running_footer(card.phase, card.queued_hint.as_deref());
+                self.patch_footer_if_changed(token, card_id, &footer).await;
                 Ok(())
             }
             CardTerminal::Done | CardTerminal::Error(_) => {
@@ -544,6 +560,7 @@ impl FeishuPlatform {
         msg_id: &str,
         request_id: &str,
         tool_name: &str,
+        render: AskRender,
     ) {
         self.record_pending_ask(request_id, conv_id, msg_id, tool_name)
             .await;
@@ -552,6 +569,7 @@ impl FeishuPlatform {
             AskSlot {
                 msg_id: msg_id.to_string(),
                 pending_req: Some(request_id.to_string()),
+                render,
             },
         );
         self.mark_ask_sent(conv_id).await;
@@ -593,6 +611,7 @@ impl FeishuPlatform {
         card_json: &str,
         request_id: &str,
         tool_name: &str,
+        render: AskRender,
     ) -> Option<String> {
         let msg_id = claim_free_slot(&mut *self.ask_slots.lock().await, conv_id, request_id)?;
         let patch = self
@@ -606,6 +625,10 @@ impl FeishuPlatform {
             Ok(()) => {
                 self.record_pending_ask(request_id, conv_id, &msg_id, tool_name)
                     .await;
+                // 复用成功：槽的渲染输入换成新询问（note 联动按新参数重画）。
+                if let Some(slot) = self.ask_slots.lock().await.get_mut(conv_id) {
+                    slot.render = render;
+                }
                 self.mark_ask_sent(conv_id).await;
                 Some(msg_id)
             }
@@ -948,8 +971,13 @@ impl Platform for FeishuPlatform {
         // P8-2：话题群的复用槽与普通 conv 同一套（patch 话题内旧卡同样有效）。
         if let Some((_chat, root_id)) = thread_target_from_conv(conv) {
             let card_json = render_permission_card(tool_name, input_summary, &conv.0, request_id);
+            let render = AskRender {
+                question: false,
+                tool_name: tool_name.to_string(),
+                input: input_summary.to_string(),
+            };
             if let Some(mid) = self
-                .try_reuse_ask_slot(&conv.0, &card_json, request_id, tool_name)
+                .try_reuse_ask_slot(&conv.0, &card_json, request_id, tool_name, render)
                 .await
             {
                 return Ok(Some(mid));
@@ -967,7 +995,12 @@ impl Platform for FeishuPlatform {
             {
                 Ok(mid) => {
                     if let Some(mid) = &mid {
-                        self.register_ask_card(&conv.0, mid, request_id, tool_name)
+                        let render = AskRender {
+                            question: false,
+                            tool_name: tool_name.to_string(),
+                            input: input_summary.to_string(),
+                        };
+                        self.register_ask_card(&conv.0, mid, request_id, tool_name, render)
                             .await;
                     }
                     Ok(mid)
@@ -985,17 +1018,26 @@ impl Platform for FeishuPlatform {
             .ok_or_else(|| CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0)))?;
         // P6（AskUserQuestion 透传）：agent 的问题渲染成「问题 + 选项按钮」卡，
         // 而非降级的 允许/拒绝 审批卡；解析失败降级普通审批卡。
-        let card_json = if tool_name == "AskUserQuestion" {
+        let is_question = tool_name == "AskUserQuestion";
+        let card_json = if is_question {
             crate::card::render_question_card(input_summary, &conv.0, request_id).unwrap_or_else(
                 || render_permission_card(tool_name, input_summary, &conv.0, request_id),
             )
         } else {
             render_permission_card(tool_name, input_summary, &conv.0, request_id)
         };
+        let render = AskRender {
+            // 问题卡解析失败降级审批卡——AskRender 按实际渲染形态记（question
+            // 为 false 时 input 走审批路径）。
+            question: is_question
+                && crate::card::render_question_card(input_summary, &conv.0, request_id).is_some(),
+            tool_name: tool_name.to_string(),
+            input: input_summary.to_string(),
+        };
         // P8-2：优先复用本 conv 已收敛的询问卡（原地 patch 成新询问）——顺序
         // 审批不再每条刷一张新卡把流式卡顶离视口。
         if let Some(mid) = self
-            .try_reuse_ask_slot(&conv.0, &card_json, request_id, tool_name)
+            .try_reuse_ask_slot(&conv.0, &card_json, request_id, tool_name, render.clone())
             .await
         {
             return Ok(Some(mid));
@@ -1012,8 +1054,7 @@ impl Platform for FeishuPlatform {
         {
             Ok(mid) => {
                 if let Some(mid) = &mid {
-                    self.register_ask_card(&conv.0, mid, request_id, tool_name)
-                        .await;
+                    self.register_ask_card(&conv.0, mid, request_id, tool_name, render).await;
                 }
                 Ok(mid)
             }
@@ -1118,6 +1159,61 @@ impl Platform for FeishuPlatform {
             async move { patch_card(&self.core_config, &t, &message_id, &card_json).await }
         })
         .await
+    }
+
+    /// P10-③：排队联动——该会话挂着未决审批卡时，按原渲染输入重画整卡并把
+    /// note 行换成「⏳ 等待你审批 · 后面还排着 N 条消息」（审批等待是流式卡最
+    /// 静默的窗口，排队状态需要推送）。note 内容经 ask_notes 缓存去重（计数
+    /// 不变不重画）；无未决槽 no-op。best-effort。
+    async fn note_queued_on_ask(&self, conv: &ConvId, note: &str, _hint: &ReplyHint) -> Result<()> {
+        let (msg_id, render, request_id) = {
+            let slots = self.ask_slots.lock().await;
+            let Some(slot) = slots.get(&conv.0) else {
+                return Ok(());
+            };
+            let Some(req) = slot.pending_req.clone() else {
+                return Ok(()); // 槽空闲（已收敛）——无未决审批可联动
+            };
+            (slot.msg_id.clone(), slot.render.clone(), req)
+        };
+        // 去重：note 不变不重画。
+        {
+            let mut notes = self.ask_notes.lock().await;
+            if notes.get(&conv.0).map(String::as_str) == Some(note) {
+                return Ok(());
+            }
+            notes.insert(conv.0.clone(), note.to_string());
+        }
+        let card_json = if render.question {
+            crate::card::render_question_card_note(&render.input, &conv.0, &request_id, note)
+                .unwrap_or_else(|| {
+                    crate::card::render_permission_card_note(
+                        &render.tool_name,
+                        &render.input,
+                        &conv.0,
+                        &request_id,
+                        note,
+                    )
+                })
+        } else {
+            crate::card::render_permission_card_note(
+                &render.tool_name,
+                &render.input,
+                &conv.0,
+                &request_id,
+                note,
+            )
+        };
+        self.with_token(|t| {
+            let msg_id = msg_id.clone();
+            let card_json = card_json.clone();
+            async move { patch_card(&self.core_config, &t, &msg_id, &card_json).await }
+        })
+        .await
+        .map_err(|e| {
+            tracing::debug!(target: "feishu", error = %e, "审批卡排队 note 重画失败（不影响排队）");
+            e
+        })
     }
 
     /// P9-2：`/config` 表单卡（form + select_static 下拉 + 提交）。评论线程无
@@ -1487,6 +1583,11 @@ mod tests {
             AskSlot {
                 msg_id: "m1".into(),
                 pending_req: None,
+                render: AskRender {
+                    question: false,
+                    tool_name: "Bash".into(),
+                    input: "{}".into(),
+                },
             },
         );
         assert_eq!(
