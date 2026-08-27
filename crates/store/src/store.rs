@@ -145,7 +145,13 @@ impl Store {
     /// S3：设置应用层加密 passphrase（keyring 不可用时的加密回退）。
     /// 传入 `None` 清除（回退到读环境变量）。由 main 启动时注入。
     pub fn set_passphrase(&self, pass: Option<&str>) {
-        *self.passphrase.write() = pass.map(|s| s.to_string());
+        // 空串与 None 等同处理（与 effective_passphrase 的 env 路径一致——
+        // 环境变量为空串时也视为未配置）：防止把「显式设了空口令」误当成
+        // 有效 passphrase 走加密回退（空口令派生的密钥无安全性）。
+        *self.passphrase.write() = pass
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
     }
 
     /// 当前生效的 passphrase：显式 set 值优先，其次环境变量 `IMAGENT_PASSPHRASE`。
@@ -185,11 +191,12 @@ impl Store {
             match self.effective_passphrase() {
                 Some(pass) => {
                     CREDENTIAL_PLAINTEXT_FALLBACK.inc();
-                    let enc = encrypt_blocking(pass, blob.to_string()).await?;
+                    let aad = credential_aad(&platform, &account_id);
+                    let enc = encrypt_blocking(pass, blob.to_string(), aad).await?;
                     tracing::info!(
                         target: "store",
                         platform = %platform, account_id = %account_id,
-                        "keyring 不可用，凭据已用 passphrase 加密落盘（enc:v1）"
+                        "keyring 不可用，凭据已用 passphrase 加密落盘（enc:v2）"
                     );
                     enc
                 }
@@ -339,10 +346,15 @@ impl Store {
 
     /// 把 DB 中读出的原始 blob 解析为真实凭据（S3：三种形态）：
     /// - `keyring:` marker → 从 keyring 取真值；marker 在但 keyring 读不到（keychain 被清）→ 报错；
-    /// - `enc:v1:`（passphrase 加密）→ 解密返回；passphrase 缺失 / 解密失败 → 可读错误
-    ///   （提示设置 IMAGENT_PASSPHRASE）；
+    /// - `enc:v1:` / `enc:v2:`（passphrase 加密）→ 解密返回（AAD 绑定
+    ///   `platform:account_id`，v1 旧格式无 AAD 兼容读取）；passphrase 缺失 /
+    ///   解密失败 → 可读错误（提示设置 IMAGENT_PASSPHRASE）；
     /// - 裸明文（旧库 / 无 keychain）→ 尝试懒迁移：先 keyring，其次（配置了 passphrase 且
     ///   keyring 不可用时）重写为加密形态；都失败则保持明文。无论迁移结果都返回该明文。
+    ///
+    /// 迁移为 compare-and-swap（`WHERE blob = 读到的明文`）：并发写新凭据时
+    /// CAS 失败即放弃迁移（DB 已是新值，不覆盖）；迁移回写失败也不让读路径
+    /// 报错——降级返回手上的明文（warn），与「迁移是 best-effort 优化」语义一致。
     async fn resolve_credential_blob(
         &self,
         raw_blob: &str,
@@ -362,28 +374,71 @@ impl Store {
             // S3：加密形态。passphrase 是解密前提，缺失/错误都给出面向运维的提示。
             let pass = self.effective_passphrase().ok_or_else(|| {
                 StoreError::Other(format!(
-                    "凭据以加密形态（enc:v1）存储，但未配置 passphrase：{platform}:{account_id}\
+                    "凭据以加密形态（enc:v1/v2）存储，但未配置 passphrase：{platform}:{account_id}\
                      （请设置环境变量 IMAGENT_PASSPHRASE 为写入时使用的口令）"
                 ))
             })?;
-            decrypt_blocking(pass, raw_blob.to_string()).await
+            let aad = credential_aad(platform, account_id);
+            decrypt_blocking(pass, raw_blob.to_string(), aad).await
         } else {
-            // 明文：懒迁移——优先 keyring。
+            // 明文：懒迁移——优先 keyring。迁移回写一律 CAS（见函数注释）。
             let scope = self.scope();
             if crate::credentials::store_in_keyring(&scope, platform, account_id, raw_blob).await {
                 let marker = crate::credentials::marker_for(platform, account_id);
-                self.update_credential_blob(platform, account_id, &marker)
-                    .await?;
+                match self
+                    .try_migrate_credential_blob(platform, account_id, raw_blob, &marker)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        // CAS 失败：另一写者已更新 DB（如并发 put 新凭据），放弃迁移。
+                        tracing::info!(
+                            target: "store",
+                            platform = %platform, account_id = %account_id,
+                            "明文凭据懒迁移 CAS 失败（另一写者已更新 blob），放弃迁移"
+                        );
+                    }
+                    Err(e) => {
+                        // keyring 迁移成功但 marker 回写失败：降级返回明文（而非报错）——
+                        // 手上的明文仍有效，下次读取会重试迁移。
+                        tracing::warn!(
+                            target: "store",
+                            platform = %platform, account_id = %account_id, error = %e,
+                            "keyring 迁移成功但 marker 回写失败，降级返回明文（下次读取重试）"
+                        );
+                    }
+                }
             } else if let Some(pass) = self.effective_passphrase() {
                 // keyring 不可用但配置了 passphrase → 惰性重写为加密形态（S3 迁移路径）。
-                let enc = encrypt_blocking(pass, raw_blob.to_string()).await?;
-                self.update_credential_blob(platform, account_id, &enc)
-                    .await?;
-                tracing::info!(
-                    target: "store",
-                    platform = %platform, account_id = %account_id,
-                    "历史明文凭据已惰性迁移为加密形态（enc:v1）"
-                );
+                let aad = credential_aad(platform, account_id);
+                let enc = encrypt_blocking(pass, raw_blob.to_string(), aad).await?;
+                match self
+                    .try_migrate_credential_blob(platform, account_id, raw_blob, &enc)
+                    .await
+                {
+                    Ok(true) => {
+                        tracing::info!(
+                            target: "store",
+                            platform = %platform, account_id = %account_id,
+                            "历史明文凭据已惰性迁移为加密形态（enc:v2）"
+                        );
+                    }
+                    Ok(false) => {
+                        tracing::info!(
+                            target: "store",
+                            platform = %platform, account_id = %account_id,
+                            "明文凭据惰性加密迁移 CAS 失败（另一写者已更新 blob），放弃迁移"
+                        );
+                    }
+                    Err(e) => {
+                        // 与 keyring 路径同语义：回写失败降级返回明文，不阻断读。
+                        tracing::warn!(
+                            target: "store",
+                            platform = %platform, account_id = %account_id, error = %e,
+                            "惰性加密迁移回写失败，降级返回明文（下次读取重试）"
+                        );
+                    }
+                }
             } else {
                 // 读取路径：历史明文凭据未能迁移（无 keyring 也无 passphrase），计数但不
                 // fail-closed（否则历史明文凭据将不可读，破坏可用性；fail-closed 仅作用
@@ -394,42 +449,52 @@ impl Store {
         }
     }
 
-    /// 直接更新 `credentials.blob`（迁移用，不改 account_id）。
-    async fn update_credential_blob(
+    /// CAS 式迁移回写：仅当 DB 中 blob 仍等于读到的旧明文（`expected_old`）时
+    /// 才更新为 `new_blob`，返回是否生效。
+    ///
+    /// 背景（lost-update）：读明文与回写之间无并发保护，另一写者（如并发
+    /// put_credential）写入的新凭据会被旧值覆盖。`WHERE blob = ?old` 使回写
+    /// 成为 compare-and-swap：影响行数为 0 = 另一写者已更新 → 放弃迁移。
+    async fn try_migrate_credential_blob(
         &self,
         platform: &str,
         account_id: &str,
-        blob: &str,
-    ) -> Result<()> {
-        let (platform, account_id, blob) = (
+        expected_old: &str,
+        new_blob: &str,
+    ) -> Result<bool> {
+        let (platform, account_id, expected_old, new_blob) = (
             platform.to_string(),
             account_id.to_string(),
-            blob.to_string(),
+            expected_old.to_string(),
+            new_blob.to_string(),
         );
         let platform_for_audit = platform.clone();
         let account_for_audit = account_id.clone();
         let inner = self.inner.clone();
-        blocking_with_retry(inner, move |conn| {
+        let applied = blocking_with_retry(inner, move |conn| {
             let now = now_secs();
-            conn.execute(
+            // CAS：blob 仍为读到的旧值才更新，防并发写新凭据被旧值覆盖。
+            let n = conn.execute(
                 "UPDATE credentials SET blob = ?3, updated_at = ?4 \
-                 WHERE platform = ?1 AND account_id = ?2",
-                rusqlite::params![platform, account_id, blob, now],
+                 WHERE platform = ?1 AND account_id = ?2 AND blob = ?5",
+                rusqlite::params![platform, account_id, new_blob, now, expected_old],
             )?;
-            Ok(())
+            Ok(n > 0)
         })
         .await?;
-        // P2-11：迁移成功审计（明文 → keyring marker 的形态变更留痕，绕过 P1-B 的
-        // put_credential 审计路径；best-effort）。
-        let _ = self
-            .append_audit(
-                "credential_migrated",
-                None,
-                Some(&account_for_audit),
-                Some(&format!("platform={platform_for_audit}")),
-            )
-            .await;
-        Ok(())
+        // P2-11：迁移成功审计（明文 → keyring marker / enc 的形态变更留痕，绕过
+        // P1-B 的 put_credential 审计路径；best-effort，仅在实际生效时记录）。
+        if applied {
+            let _ = self
+                .append_audit(
+                    "credential_migrated",
+                    None,
+                    Some(&account_for_audit),
+                    Some(&format!("platform={platform_for_audit}")),
+                )
+                .await;
+        }
+        Ok(applied)
     }
 
     // —— sessions（core 用）——
@@ -1131,6 +1196,84 @@ impl Store {
         })
         .await
     }
+
+    /// 【A1】原子化 `/switch`：单事务完成命名切换的全部 DB 写入，替代
+    /// dispatch/commands/session.rs 中「upsert/delete_session + set_config」
+    /// 的多次独立 autocommit（中间崩溃会留下 active_name 指向旧 session 等
+    /// 不一致状态）。
+    ///
+    /// 单事务内容：
+    /// 1. `activate = Some(row)`：把该命名 session 写成活动 session（续接用，
+    ///    同时刷新 session_history，与 upsert_session 同构）；`None`：删除当前
+    ///    活动 session 行（新命名 session，下一条消息再新建）；
+    /// 2. `config[active_name:<conv>] = name`；
+    /// 3. 删除 `config[compact_summary:<conv>]`（切换后旧会话的压缩摘要
+    ///    不应再注入新会话）。
+    ///
+    /// 注：core（dispatch/commands/session.rs 的 `/switch`）尚未接线——本 API
+    /// 在 store 层就绪，core 侧接入点为 cmd_switch 的两个分支（Some 分支用
+    /// `activate=Some(&sr)`；None 分支用 `activate=None`），待 Wave3/后续接线。
+    pub async fn switch_named_session(
+        &self,
+        conv_id: &str,
+        name: &str,
+        activate: Option<&SessionRow>,
+    ) -> Result<()> {
+        let conv_id = conv_id.to_string();
+        let name = name.to_string();
+        let activate = activate.cloned();
+        let inner = self.inner.clone();
+        blocking_with_retry(inner, move |conn| {
+            let now = now_secs();
+            let tx = conn.unchecked_transaction()?;
+            match &activate {
+                Some(row) => {
+                    tx.execute(
+                        "INSERT INTO sessions (conv_id, session_id, agent_kind, workdir, name, created_at, updated_at) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                         ON CONFLICT(conv_id) DO UPDATE SET \
+                           session_id = excluded.session_id, \
+                           agent_kind = excluded.agent_kind, \
+                           workdir    = excluded.workdir, \
+                           name       = excluded.name, \
+                           updated_at = excluded.updated_at",
+                        rusqlite::params![
+                            row.conv_id,
+                            row.session_id,
+                            row.agent_kind,
+                            row.workdir,
+                            row.name,
+                            row.created_at,
+                            now,
+                        ],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO session_history (conv_id, session_id, agent_kind, created_at, updated_at) \
+                         VALUES (?1, ?2, ?3, ?4, ?5) \
+                         ON CONFLICT(conv_id, session_id) DO UPDATE SET updated_at = excluded.updated_at",
+                        rusqlite::params![row.conv_id, row.session_id, row.agent_kind, now, now],
+                    )?;
+                }
+                None => {
+                    // 新命名 session：清活动 session（下次新建）。
+                    tx.execute("DELETE FROM sessions WHERE conv_id = ?1", rusqlite::params![conv_id])?;
+                }
+            }
+            tx.execute(
+                "INSERT INTO config (key, value) VALUES (?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rusqlite::params![format!("active_name:{conv_id}"), name],
+            )?;
+            // 切换后旧摘要不再注入新会话。
+            tx.execute(
+                "DELETE FROM config WHERE key = ?1",
+                rusqlite::params![format!("compact_summary:{conv_id}")],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
 }
 
 // —— spawn_blocking 调度 ——
@@ -1177,6 +1320,17 @@ where
 /// P4（v7 review）：多连接（core store + ilink store + /health 各自 open）高并发
 /// 写时 busy_timeout=5s 之后仍可能 BUSY；退避重试让瞬时竞争自愈，而非把
 /// SQLITE_BUSY 冒泡成登录/会话写入失败。
+///
+/// 实现要点（两项修复）：
+/// 1. 防御性 rollback：每次尝试前先 `ROLLBACK` 清掉连接上可能残留的打开事务
+///    （如上一轮 `tx.commit()` 返回 BUSY 后事务仍打开）——否则重放闭包再
+///    `unchecked_transaction()` 会报 "cannot start a transaction within a
+///    transaction" 且毒化连接（此后该连接所有写路径都失败）。无残留事务时
+///    ROLLBACK 报 "no transaction is active"，忽略其错误即可。
+/// 2. 退避不持锁：连接 Mutex guard 在每次尝试结束即释放，sleep 期间不持有
+///    锁——否则持锁 sleep 会饿死所有共享该连接的 DB 操作。事务重放需要同一
+///    连接，因此锁在每次重试时重新获取（Inner.conn 是共享单连接，语义不变；
+///    代价是重试间隙其他操作可能插队，对可重放的幂等写闭包无害）。
 async fn blocking_with_retry<F, T>(inner: Arc<Inner>, f: F) -> Result<T>
 where
     F: Fn(&rusqlite::Connection) -> Result<T> + Send + 'static,
@@ -1184,11 +1338,18 @@ where
 {
     const MAX_ATTEMPTS: u32 = 5;
     let join = tokio::task::spawn_blocking(move || {
-        let conn = inner.conn.lock();
         let mut delay = std::time::Duration::from_millis(50);
         let mut attempt = 1u32;
         loop {
-            match f(&conn) {
+            // 锁作用域限于单次尝试：BUSY 退避 sleep 前必须 drop guard（见注释 2）。
+            let res = {
+                let conn = inner.conn.lock();
+                // 防御性 rollback（见注释 1）：清掉上一轮 BUSY 后残留的打开事务。
+                // 无事务时该语句报错，忽略。
+                let _ = conn.execute_batch("ROLLBACK");
+                f(&conn)
+            }; // guard 在此 drop，sleep 不持锁。
+            match res {
                 Ok(v) => return Ok(v),
                 Err(e) if is_busy(&e) && attempt < MAX_ATTEMPTS => {
                     tracing::warn!(
@@ -1235,20 +1396,26 @@ fn is_busy(e: &StoreError) -> bool {
     )
 }
 
-/// S3：在 blocking 线程做 passphrase 加密（PBKDF2 100k 迭代 ~几十 ms，不占运行时线程）。
-async fn encrypt_blocking(pass: String, plaintext: String) -> Result<String> {
-    tokio::task::spawn_blocking(move || crate::crypto::encrypt(&pass, &plaintext))
+/// S3：在 blocking 线程做 passphrase 加密（PBKDF2 600k 迭代 ~几百 ms，不占运行时线程）。
+/// `aad` 绑定凭据归属（`platform:account_id`），防密文挪行错配（见 crypto 模块）。
+async fn encrypt_blocking(pass: String, plaintext: String, aad: String) -> Result<String> {
+    tokio::task::spawn_blocking(move || crate::crypto::encrypt(&pass, &plaintext, &aad))
         .await
         .map_err(|e| StoreError::Other(format!("spawn_blocking join: {e}")))?
         .map_err(StoreError::Other)
 }
 
 /// S3：在 blocking 线程解密（同上，KDF 计算不占运行时线程）。
-async fn decrypt_blocking(pass: String, blob: String) -> Result<String> {
-    tokio::task::spawn_blocking(move || crate::crypto::decrypt(&pass, &blob))
+async fn decrypt_blocking(pass: String, blob: String, aad: String) -> Result<String> {
+    tokio::task::spawn_blocking(move || crate::crypto::decrypt(&pass, &blob, &aad))
         .await
         .map_err(|e| StoreError::Other(format!("spawn_blocking join: {e}")))?
         .map_err(StoreError::Other)
+}
+
+/// 凭据归属 AAD（GCM 附加认证数据）：`platform:account_id`。
+fn credential_aad(platform: &str, account_id: &str) -> String {
+    format!("{platform}:{account_id}")
 }
 
 /// 打开连接、设 PRAGMA、跑迁移、收紧文件/目录权限。
@@ -1756,7 +1923,7 @@ mod tests {
         let plain = r#"{"bot_token":"secret-token"}"#;
         store.put_credential("ilink", "bot1", plain).await.unwrap();
         let raw = raw_blob(&store, "ilink", "bot1").await;
-        assert!(raw.starts_with("enc:v1:"), "应加密落盘: {raw}");
+        assert!(raw.starts_with("enc:v2:"), "应加密落盘: {raw}");
         assert!(!raw.contains("secret-token"), "落盘不得含明文");
         // get / first_credential 都解密还原。
         assert_eq!(
@@ -1818,7 +1985,7 @@ mod tests {
         );
         assert!(raw_blob(&store, "ilink", "bot-old")
             .await
-            .starts_with("enc:v1:"));
+            .starts_with("enc:v2:"));
         // 第二次 get：走解密路径，仍还原明文。
         assert_eq!(
             store.get_credential("ilink", "bot-old").await.unwrap(),
@@ -2283,5 +2450,341 @@ mod tests {
         );
         drop(store);
         TempDb::cleanup(&db.path);
+    }
+
+    // ---------- 缺陷修复：busy 重试 / 持锁 sleep / 残留事务 ----------
+
+    /// 枙造 SQLITE_BUSY 形态的 StoreError（与 is_busy 匹配的主错误码）。
+    fn busy_error() -> StoreError {
+        StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ffi::ErrorCode::DatabaseBusy,
+                extended_code: 5,
+            },
+            Some("database is locked".into()),
+        ))
+    }
+
+    /// #1+#3：BUSY 后重试成功——重试前防御性 ROLLBACK 清掉残留事务，且闭包
+    /// 可重放（Fn）；成功后连接仍可用（未毒化）。
+    #[tokio::test]
+    async fn busy_retry_recovers_and_keeps_connection_usable() {
+        let db = TempDb::new("busy_replay").await;
+        let store = Store::open(&db.path).await.unwrap();
+        let inner = store.inner.clone();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let v = blocking_with_retry(inner, move |conn| {
+            if c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                // 模拟「commit 返回 BUSY 后事务仍打开」：开一个事务不提交，
+                // guard drop 时 rusqlite 会尝试回滚——但即便残留（或回滚也被
+                // BUSY 拒绝），下一轮开头的防御性 ROLLBACK 也应兜住。
+                let _ = conn.unchecked_transaction();
+                return Err(busy_error());
+            }
+            Ok(42_i32)
+        })
+        .await
+        .unwrap();
+        assert_eq!(v, 42);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        // 连接未毒化：正常写路径仍可用。
+        store.set_config("k", "v").await.unwrap();
+        assert_eq!(store.get_config("k").await.unwrap().as_deref(), Some("v"));
+    }
+
+    /// #1：连接上有残留打开事务（模拟 commit BUSY 后毒化）时，重试路径的
+    /// 防御性 ROLLBACK 应清掉它，写操作照常成功。
+    #[tokio::test]
+    async fn retry_path_rolls_back_residual_open_transaction() {
+        let db = TempDb::new("busy_residual").await;
+        let store = Store::open(&db.path).await.unwrap();
+        {
+            // 人为留下一个打开的事务（BEGIN 后不提交不回滚）。
+            let inner = store.inner.clone();
+            blocking_with(inner, move |conn| {
+                conn.execute_batch("BEGIN IMMEDIATE")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+        // blocking_with_retry 的防御性 ROLLBACK 清掉残留事务后写入成功。
+        store.set_config("k2", "v2").await.unwrap();
+        assert_eq!(store.get_config("k2").await.unwrap().as_deref(), Some("v2"));
+    }
+
+    /// #3：退避 sleep 期间不持连接锁——BUSY 闭包重试期间，另一写操作可插队
+    /// 完成（若持锁 sleep，后者会被饿死到重试结束）。
+    #[tokio::test]
+    async fn busy_backoff_does_not_hold_lock() {
+        let db = TempDb::new("busy_lock").await;
+        let store = Store::open(&db.path).await.unwrap();
+        let inner = store.inner.clone();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let slow = tokio::spawn(async move {
+            blocking_with_retry(inner, move |_conn| {
+                if c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 1 {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    return Err(busy_error());
+                }
+                Ok(())
+            })
+            .await
+        });
+        // 等待慢闭包进入持锁执行段（ BUSY 分支的 sleep 退避在锁外）。
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let started = std::time::Instant::now();
+        store.set_config("k3", "v3").await.unwrap();
+        // 慢闭包此刻应处于「BUSY 后、锁外退避 sleep」阶段：插队写入应在
+        // 远小于退避时长（50ms+）加闭包执行时长（200ms）内完成。断言放宽到
+        // 150ms 以避免 CI 抖动误报，同时仍能区分「持锁 sleep 整段退避」。
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(150),
+            "退避期间锁应被释放，实际等了 {:?}",
+            started.elapsed()
+        );
+        slow.await.unwrap().unwrap();
+    }
+
+    // ---------- 缺陷修复：迁移 CAS / 降级 ----------
+
+    /// #2：CAS 迁移——expected_old 不匹配（另一写者已更新）时放弃，返回
+    /// false 且不覆盖新值；匹配时生效并留审计。
+    #[tokio::test]
+    async fn credential_migration_is_compare_and_swap() {
+        let db = TempDb::new("mig_cas").await;
+        let store = Store::open(&db.path).await.unwrap();
+        let plain = r#"{"bot_token":"old"}"#;
+        {
+            let inner = store.inner.clone();
+            let p = plain.to_string();
+            blocking_with(inner, move |conn| {
+                Ok(conn.execute(
+                    "INSERT INTO credentials (platform, account_id, blob, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params!["ilink", "bot1", p, 1_i64],
+                )?)
+            })
+            .await
+            .unwrap();
+        }
+        // CAS 生效：旧值匹配 → 更新。
+        assert!(
+            store
+                .try_migrate_credential_blob("ilink", "bot1", plain, "keyring:ilink:bot1")
+                .await
+                .unwrap()
+        );
+        assert_eq!(raw_blob(&store, "ilink", "bot1").await, "keyring:ilink:bot1");
+        // 模拟并发写新凭据后，再用过期旧值迁移 → CAS 失败，不覆盖新值。
+        assert!(
+            !store
+                .try_migrate_credential_blob("ilink", "bot1", plain, "enc:v2:whatever")
+                .await
+                .unwrap()
+        );
+        assert_eq!(raw_blob(&store, "ilink", "bot1").await, "keyring:ilink:bot1");
+        // 审计只在 CAS 生效时留痕（一次）。
+        let audit = store.list_audit(20).await.unwrap();
+        assert_eq!(
+            audit
+                .iter()
+                .filter(|a| a.action == "credential_migrated")
+                .count(),
+            1
+        );
+    }
+
+    /// #7：迁移回写失败（如 DB 写错误）时 get 降级返回手上的明文，而非整条报错。
+    /// 用 BEFORE UPDATE 触发器 RAISE 模拟回写失败。
+    #[tokio::test]
+    async fn credential_migration_write_failure_degrades_to_plaintext() {
+        let db = TempDb::new("mig_degrade").await;
+        let store = Store::open(&db.path).await.unwrap();
+        let plain = r#"{"bot_token":"legacy"}"#;
+        {
+            let inner = store.inner.clone();
+            let p = plain.to_string();
+            blocking_with(inner, move |conn| {
+                conn.execute(
+                    "INSERT INTO credentials (platform, account_id, blob, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params!["ilink", "bot1", p, 1_i64],
+                )?;
+                // 迁移回写（UPDATE credentials）一律失败。
+                conn.execute_batch(
+                    "CREATE TRIGGER fail_cred_update BEFORE UPDATE ON credentials \
+                     BEGIN SELECT RAISE(ABORT, 'simulated write failure'); END",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+        store.set_passphrase(Some("p"));
+        // keyring 在 cfg!(test) 下恒失败 → 走加密惰性迁移；回写触发器失败 →
+        // 降级返回明文而不是报错。
+        assert_eq!(
+            store.get_credential("ilink", "bot1").await.unwrap(),
+            Some(plain.to_string())
+        );
+    }
+
+    // ---------- 缺陷修复：passphrase 空串过滤 ----------
+
+    /// #5：set_passphrase(Some("")) 与 None 等同（过滤空串）——不进入加密回退。
+    #[tokio::test]
+    async fn empty_passphrase_is_treated_as_unset() {
+        let db = TempDb::new("empty_pass").await;
+        let store = Store::open(&db.path).await.unwrap();
+        store.set_passphrase(Some(""));
+        store.set_passphrase(Some("   ")); // 纯空白同样过滤
+        store
+            .put_credential("ilink", "bot1", "{\"t\":\"x\"}")
+            .await
+            .unwrap();
+        // 未生效 passphrase → 明文回退（而非用空口令加密）。
+        let raw = raw_blob(&store, "ilink", "bot1").await;
+        assert_eq!(raw, "{\"t\":\"x\"}");
+        // 显式清除回 None 后 env/加密路径同样不误触发。
+        store.set_passphrase(None);
+        assert_eq!(
+            store.get_credential("ilink", "bot1").await.unwrap(),
+            Some("{\"t\":\"x\"}".to_string())
+        );
+    }
+
+    // ---------- 缺陷修复：AAD 绑定 ----------
+
+    /// #6：加密 blob 绑定 `platform:account_id`——密文挪到另一行（不同归属）
+    /// 读取必须失败（防错配注入），正确归属照常解密。
+    #[tokio::test]
+    async fn encrypted_blob_is_bound_to_owner_via_aad() {
+        let db = TempDb::new("aad").await;
+        let store = Store::open(&db.path).await.unwrap();
+        store.set_passphrase(Some("aad-pass"));
+        store
+            .put_credential("ilink", "bot1", "{\"t\":\"secret\"}")
+            .await
+            .unwrap();
+        let raw = raw_blob(&store, "ilink", "bot1").await;
+        assert!(raw.starts_with("enc:v2:"));
+        // 正确归属可解。
+        assert_eq!(
+            store.get_credential("ilink", "bot1").await.unwrap(),
+            Some("{\"t\":\"secret\"}".to_string())
+        );
+        // 把密文挪到另一账号（模拟错配/挪行）→ 读取失败。
+        {
+            let inner = store.inner.clone();
+            let r = raw.clone();
+            blocking_with(inner, move |conn| {
+                Ok(conn.execute(
+                    "INSERT INTO credentials (platform, account_id, blob, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params!["ilink", "bot2", r, 1_i64],
+                )?)
+            })
+            .await
+            .unwrap();
+        }
+        let err = store.get_credential("ilink", "bot2").await.unwrap_err();
+        assert!(
+            format!("{err}").contains("解密失败"),
+            "挪行密文应解密失败: {err}"
+        );
+    }
+
+    // ---------- A1：switch_named_session 原子 API ----------
+
+    /// #8：`activate = Some`（切回历史命名）：单事务完成 sessions upsert +
+    /// active_name 设置 + compact_summary 清理。
+    #[tokio::test]
+    async fn switch_named_session_activates_atomically() {
+        let db = TempDb::new("sw_act").await;
+        let store = Store::open(&db.path).await.unwrap();
+        // 预置：历史命名 session + 旧活动 session + 旧摘要。
+        store
+            .upsert_named_session(&NamedSessionRow {
+                conv_id: "c1".into(),
+                name: "refactor".into(),
+                session_id: "sess-named".into(),
+                agent_kind: Some("mock".into()),
+                workdir: Some("/tmp".into()),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_session(&SessionRow {
+                conv_id: "c1".into(),
+                session_id: "sess-old".into(),
+                agent_kind: "mock".into(),
+                workdir: "/tmp".into(),
+                name: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .await
+            .unwrap();
+        store.set_config("compact_summary:c1", "旧摘要").await.unwrap();
+        let sr = SessionRow {
+            conv_id: "c1".into(),
+            session_id: "sess-named".into(),
+            agent_kind: "mock".into(),
+            workdir: "/tmp".into(),
+            name: Some("refactor".into()),
+            created_at: 1,
+            updated_at: 1,
+        };
+        store
+            .switch_named_session("c1", "refactor", Some(&sr))
+            .await
+            .unwrap();
+        // 三项效果同时成立。
+        let got = store.get_session("c1").await.unwrap().unwrap();
+        assert_eq!(got.session_id, "sess-named");
+        assert_eq!(got.name.as_deref(), Some("refactor"));
+        assert_eq!(
+            store.get_config("active_name:c1").await.unwrap().as_deref(),
+            Some("refactor")
+        );
+        assert!(store.get_config("compact_summary:c1").await.unwrap().is_none());
+        // session_history 同步（与 upsert_session 同构）。
+        let hist = store.list_session_history("c1", 10).await.unwrap();
+        assert!(hist.iter().any(|h| h.session_id == "sess-named"));
+    }
+
+    /// #8：`activate = None`（新命名）：删活动 session + 设 active_name + 清摘要。
+    #[tokio::test]
+    async fn switch_named_session_new_name_clears_active_session() {
+        let db = TempDb::new("sw_new").await;
+        let store = Store::open(&db.path).await.unwrap();
+        store
+            .upsert_session(&SessionRow {
+                conv_id: "c2".into(),
+                session_id: "sess-old".into(),
+                agent_kind: "mock".into(),
+                workdir: "/tmp".into(),
+                name: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .await
+            .unwrap();
+        store.set_config("compact_summary:c2", "旧摘要").await.unwrap();
+        store
+            .switch_named_session("c2", "newtask", None)
+            .await
+            .unwrap();
+        assert!(store.get_session("c2").await.unwrap().is_none());
+        assert_eq!(
+            store.get_config("active_name:c2").await.unwrap().as_deref(),
+            Some("newtask")
+        );
+        assert!(store.get_config("compact_summary:c2").await.unwrap().is_none());
     }
 }

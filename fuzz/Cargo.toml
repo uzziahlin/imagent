@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 imagent-feishu = { path = "../crates/feishu" }
 imagent-ilink = { path = "../crates/ilink" }
+imagent-wecom = { path = "../crates/wecom" }
 serde_json = "1"
 
 [[bin]]
@@ -27,3 +28,9 @@ test = false
 name = "feishu_event_parse"
 path = "fuzz_targets/feishu_event_parse.rs"
 test = false
+
+[[bin]]
+name = "wecom_frame_parse"
+path = "fuzz_targets/wecom_frame_parse.rs"
+test = false
+doc = false

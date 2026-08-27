@@ -9,6 +9,65 @@ mod session;
 
 use super::*;
 
+/// S-12：全部支持的斜杠命令，按 /help 分组同构（未知命令提示竖排分组展示）。
+pub(super) const COMMAND_GROUPS: &[(&str, &[&str])] = &[
+    ("🗂 会话", &["/new", "/switch", "/sessions", "/resume", "/compact"]),
+    ("📁 目录与文件", &["/cd", "/ws", "/img", "/file"]),
+    ("🛡️ 权限与运行", &["/perm", "/stop", "/timeout"]),
+    ("🧪 状态与诊断", &["/status", "/doctor", "/reconnect", "/config"]),
+    (
+        "👥 白名单与管理",
+        &["/allow", "/disallow", "/chat", "/admin", "/list", "/whoami"],
+    ),
+    ("❓ 帮助", &["/help"]),
+];
+
+/// 编辑距离（Levenshtein；命令名都很短，朴素 DP 足够）。
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (n, m) = (a.len(), b.len());
+    let mut prev: Vec<usize> = (0..=m).collect();
+    let mut cur = vec![0usize; m + 1];
+    for i in 1..=n {
+        cur[0] = i;
+        for j in 1..=m {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[m]
+}
+
+/// S-12：未知命令 → 编辑距离 ≤2 的最相近已知命令（无则 None）。
+pub(super) fn suggest_command(cmd: &str) -> Option<&'static str> {
+    COMMAND_GROUPS
+        .iter()
+        .flat_map(|(_, cs)| cs.iter())
+        .filter(|c| **c != cmd)
+        .min_by_key(|c| edit_distance(cmd, c))
+        .filter(|c| edit_distance(cmd, c) <= 2)
+        .copied()
+}
+
+/// S-12：未知命令回复文案——模糊建议（有近邻时）+ 分组竖排命令表。
+pub(super) fn unknown_command_reply(cmd: &str) -> String {
+    let mut out = match suggest_command(cmd) {
+        Some(s) => format!("未知命令 {cmd}，你是想找 {s} 吗？"),
+        None => format!("未知命令 {cmd}"),
+    };
+    out.push_str("\n支持的命令：");
+    for (group, cmds) in COMMAND_GROUPS {
+        out.push_str(&format!("\n{group}"));
+        for c in *cmds {
+            out.push_str(&format!("\n- {c}"));
+        }
+    }
+    out.push_str("\n完整说明见 /help");
+    out
+}
+
 impl Dispatcher {
     /// 处理单条消息。内部任何错误都 log 并吞掉，不影响主循环。
     pub(super) async fn handle(&self, msg: InboundMessage) {
@@ -28,10 +87,18 @@ impl Dispatcher {
                 text = ?msg.text,
                 "discovery 模式：记录 sender，回引导"
             );
+            // S-13：引导按实际 admin 状态给——admin_senders 为空（S2：无人是
+            // 管理员，IM 内管理命令全部不可用）时**不得**提示「/allow」，否则
+            // 用户照做只会得到权限拒绝，与 S2 语义矛盾。
+            let admin_note = if self.admin_senders.read().is_empty() {
+                "目前未配置管理员（admin_senders 为空），IM 内管理类命令不可用；请先在本地运行 `imagent setup` 或编辑 config.toml 配置 admin_senders。".to_string()
+            } else {
+                "已配置管理员：管理员也可在 IM 内发授权命令直接放行。".to_string()
+            };
             let guide = format!(
                 "发现模式：当前白名单为空。你的 sender id 是 `{}`，会话 id 是 `{}`。\n\
                  请管理员在本地运行 `imagent allow {}` 授权用户、或 `imagent allow-chat {}` \
-                 授权整个会话（群）后重启 imagent；管理员也可在 IM 内发 /allow / /chat allow。",
+                 授权整个会话（群）后重启 imagent。\n{admin_note}",
                 sender.0, conv.0, sender.0, conv.0
             );
             self.reply(&conv, &guide, &hint).await;
@@ -166,14 +233,9 @@ impl Dispatcher {
                         return;
                     }
                     _ => {
-                        self.reply(
-                            &conv,
-                            &format!(
-                                "未知命令: {cmd}（支持: /new /switch /sessions /resume /compact /cd /ws /img /file /timeout /perm /stop /config /status /doctor /reconnect /allow /disallow /chat /admin /list /whoami /help）"
-                            ),
-                            &hint,
-                        )
-                        .await;
+                        // S-12：模糊匹配建议 + 分组竖排命令表（与 /help 分组同构）。
+                        let text = unknown_command_reply(&cmd);
+                        self.reply(&conv, &text, &hint).await;
                         return;
                     }
                 }

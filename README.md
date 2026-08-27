@@ -31,7 +31,7 @@ imagent 是一个常驻网关进程：监听 IM 私聊消息 → 鉴权 → 驱�
 ## 特性
 
 - 🌉 **平台 / 后端双抽象**：换 IM 只加 adapter，换 agent 只加 impl。
-- 🔐 **安全第一**：发送者白名单 + 会话（群）白名单 + `--allowedTools` 收敛 + workdir 锁定 + **IM 内权限审批闭环**（按钮卡片 / 文本 y/n）。
+- 🔐 **安全第一**：发送者白名单 + 会话（群）白名单 + `--allowedTools` 收敛 + workdir 锁定 + **IM 内权限审批闭环**（按钮卡片 / 文本 y/n——按钮卡片仅飞书）。
 - 💬 **会话连续**：per-chat session 持久化（SQLite），重启可续；`--resume`；`/switch` 多命名会话；`/resume` 统一列表无感接管历史/电脑端 Claude Code 会话。
 - 🛑 **任务控制**：`/stop` 随时中断在飞任务（杀 agent 子进程）；空闲看门狗自动终止无输出的僵死任务。
 - 🔁 **消息批处理**：运行中到达的消息排队，与连发消息合并为一轮执行（不重复跑轮、不烧 token）。
@@ -40,7 +40,7 @@ imagent 是一个常驻网关进程：监听 IM 私聊消息 → 鉴权 → 驱�
 - 💻 **终端 agent 反向接入（ask_via_im）**：电脑终端上任意 agent 需要你决策时，把问题转发到飞书——人不在电脑前也能在手机上点按钮作答；多 agent 并发按 request_id 精确分发（见[终端 agent 接入](#终端-agent-接入ask_via-im人不在电脑前也能问你)）。
 - 🧩 **Profile 多实例**：`--profile` 一部署多 bot 身份（config/db/socket/媒体全隔离）。
 - 🛡️ **限流熔断**：`sendmessage` 服从式退避（防封号，不绕风控）。
-- 🎨 **媒体收发**：图片 / 文件（AES-128-ECB + CDN，协议强制）。
+- 🎨 **媒体收发**：图片 / 文件（AES-128-ECB + CDN，协议强制；仅 iLink——飞书走 OpenAPI 上传，wecom 暂不支持媒体发送）。
 - ⚡ **流式反馈**：工具调用摘要（`Bash — git status` 人可读单行 + 执行状态图标）、typing 指示、中间事件推流。
 - 📦 **单二进制**、低占用，适合常驻 NAS / 小服务器 / 笔记本。
 
@@ -49,12 +49,14 @@ imagent 是一个常驻网关进程：监听 IM 私聊消息 → 鉴权 → 驱�
 ```
 trait Platform                        trait Backend
 ├── ilink  (个人微信私聊, 实验性)       ├── claude (CLI + ACP 长驻子进程)
-├── wecom  (企业微信长连接)             ├── codex  (codex exec --json)
+├── wecom  (企业微信长连接, 单聊文本)   ├── codex  (codex exec --json)
 └── feishu (飞书私聊/群/云文档评论)     └── gemini (gemini -p -o stream-json)
         ↕                              ↕
               core: 调度 / 鉴权 / 会话路由 (store 持久化) / 权限审批闭环
                     任务控制(/stop/批处理/看门狗) / 会话白名单 / 统一 resume
 ```
+
+**平台能力边界**：三平台体验并不对等——卡片交互（流式卡/审批按钮卡/命令卡/表单卡）**仅飞书**支持，wecom 与 ilink 自动降级为纯文本 + y/n 审批；**wecom** 为单聊文本通道，暂不支持群聊与媒体发送（`/img` `/file` 会明确报错而非谎报成功）；**ilink** 仅私聊可靠工作（普通微信群基本不可用，见 RESEARCH.md），整体标记为实验性。
 
 三层 + 双抽象：core 持有 `Platform` 与 `Backend` trait，平台与后端各自独立可换。session 生命周期提到 core（store 持久化），Backend 退化为无状态执行器——比把 session 塞进 Backend 内存更干净，支持重启续接。
 

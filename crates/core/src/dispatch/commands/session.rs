@@ -122,13 +122,18 @@ impl Dispatcher {
                 cache.remove(&key);
             }
             // D7：过期视同未列过表（列表可能已变化，引导重看）。
-            cache.get_mut(&key).and_then(|(_, l)| {
-                if n >= 1 && n <= l.len() {
-                    Some(l.remove(n - 1))
-                } else {
-                    None
-                }
-            })
+            // S-16：选中**不再移除**缓存条目——移除会让后续序号整体前移错位
+            //（选中 1 后原 2 号变 1 号，连选即错会话）。缓存本就有 TTL（10 分钟）
+            // 惰性过期防陈旧；失败路径也无需恢复缓存（条目未动）。
+            cache
+                .get(&key)
+                .and_then(|(_, l)| {
+                    if n >= 1 && n <= l.len() {
+                        Some(l[n - 1].clone())
+                    } else {
+                        None
+                    }
+                })
         } else {
             self.merged_resume_list(&conv.0)
                 .await
@@ -227,7 +232,14 @@ impl Dispatcher {
         let _conv_guard = _conv_lock.lock().await;
         let name = parts.get(1).map(|s| s.trim()).unwrap_or("");
         if name.is_empty() {
-            self.reply(conv, "用法: /switch <name>", hint).await;
+            // S-15：空参给可行动信息——用法 + 现有命名会话列表（可直接照名字切）。
+            self.reply(
+                conv,
+                "用法: /switch <name>（列出 / 新建命名会话）",
+                hint,
+            )
+            .await;
+            self.cmd_sessions(conv, hint).await;
             return;
         }
         let key = active_name_key(&conv.0);
@@ -324,6 +336,13 @@ impl Dispatcher {
             }
             Err(e) => {
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "list_named_sessions 失败");
+                // S-14：错误分支也要有回执——静默会让用户以为命令没送达。
+                self.reply(
+                    conv,
+                    &format!("⚠️ 查询命名会话失败：{e}（请重试，持续失败可 /doctor 自检）"),
+                    hint,
+                )
+                .await;
             }
         }
     }
@@ -508,14 +527,14 @@ impl Dispatcher {
             false
         };
         // stop = 全停：清空排队待合并的消息（P4-2 批处理队列）+ 排队状态（P10）。
-        let dropped = self
-            .queues
-            .lock()
-            .await
-            .remove(&conv.0)
-            .map(|q| q.len())
-            .unwrap_or(0);
-        self.queued_hints.lock().await.remove(&conv.0);
+        // S-4（原子）：hint 清理移进 queues 同一临界区——分两步会有间隙，期间
+        // 新消息入队（写 hint）又被下一步清掉，hint 与实际队列错位。
+        let dropped = {
+            let mut map = self.queues.lock().await;
+            let n = map.remove(&conv.0).map(|q| q.len()).unwrap_or(0);
+            self.queued_hints.lock().await.remove(&conv.0);
+            n
+        };
         let text = match (aborted, dropped) {
             (true, 0) => "🛑 已中断当前任务".to_string(),
             (true, n) => format!("🛑 已中断当前任务（丢弃 {n} 条排队消息）"),

@@ -178,6 +178,8 @@ struct MockBackend {
     fail_after_announce: Option<String>,
     /// `list_local_sessions` 返回的本机会话（P4-11 统一 /resume 测试用）。
     local_sessions: Arc<TokioMutex<Vec<LocalSession>>>,
+    /// S-1/S-2：权限能力档位（默认 Unsupported；FullLoop 供闭环类测试覆写）。
+    capability: crate::backend::PermissionCapability,
 }
 
 impl MockBackend {
@@ -197,6 +199,7 @@ impl MockBackend {
             stream_texts: Vec::new(),
             fail_after_announce: None,
             local_sessions: Arc::new(TokioMutex::new(Vec::new())),
+            capability: crate::backend::PermissionCapability::Unsupported,
         };
         (b, calls, prompts, order)
     }
@@ -340,6 +343,9 @@ impl Backend for MockBackend {
     }
     async fn list_local_sessions(&self, _workdir: &std::path::Path) -> Vec<LocalSession> {
         self.local_sessions.lock().await.clone()
+    }
+    fn permission_capability(&self) -> crate::backend::PermissionCapability {
+        self.capability
     }
 }
 
@@ -2858,4 +2864,245 @@ mod permission_socket_tests {
         drop(ta);
         drop(b);
     }
+}
+
+// ---------- S 批：调度层安全/正确性 + 消息流 UX ----------
+
+/// S-10：人读 Duration——秒/分钟/小时+分钟/天+小时四档。
+#[test]
+fn format_duration_human_shapes() {
+    assert_eq!(format_duration_human(Duration::from_secs(45)), "45 秒");
+    assert_eq!(format_duration_human(Duration::from_secs(180)), "3 分钟");
+    assert_eq!(
+        format_duration_human(Duration::from_secs(7_500)), // 2h5m
+        "2 小时 5 分钟"
+    );
+    assert_eq!(
+        format_duration_human(Duration::from_secs(27 * 3_600)), // 27h
+        "1 天 3 小时"
+    );
+}
+
+/// S-11：超 7 天不再回退裸 epoch，仍给人读相对时间。
+#[test]
+fn format_rel_ts_beyond_week_stays_human() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let out = format_rel_ts(now - 30 * 86_400);
+    assert!(out.contains("30天前"), "超 7 天应仍为人读: {out}");
+    assert!(!out.contains(&format!("{now}")), "不得回退裸时间戳: {out}");
+}
+
+/// S-6：latest_snippet 按注释口径截断前 40 字符。
+#[test]
+fn latest_snippet_truncates_to_40() {
+    let m = msg("c1", "u1", &"x".repeat(100));
+    let s = latest_snippet(&m);
+    assert!(s.chars().count() <= 41, "40 字符 + 省略号: {s}"); // 40 + 「…」
+    assert!(s.ends_with('…'));
+    let short = latest_snippet(&msg("c1", "u1", "短消息"));
+    assert_eq!(short, "短消息");
+    let mut media_only = msg("c1", "u1", "");
+    media_only.media.push(MediaRef {
+        kind: "image".into(),
+        url: "/tmp/a.png".into(),
+    });
+    assert_eq!(latest_snippet(&media_only), "（图片/文件）");
+}
+
+/// S-7：backend 失败文案模板——含可续接说明与建议动作，不含裸技术串占位。
+#[test]
+fn backend_failure_reply_template() {
+    let m = backend_failure_reply("mock-backend");
+    assert!(m.contains("mock-backend"), "应含后端名: {m}");
+    assert!(m.contains("续接"), "应说明可续接: {m}");
+    assert!(m.contains("/new"), "应给全新开始建议: {m}");
+    assert!(m.contains("/doctor"), "应给自检建议: {m}");
+    assert!(m.contains("日志"), "技术细节应指向日志: {m}");
+}
+
+/// S-12：未知命令模糊匹配（编辑距离 ≤2）与不匹配回退。
+#[test]
+fn suggest_command_fuzzy() {
+    use super::commands::{suggest_command, unknown_command_reply, COMMAND_GROUPS};
+    assert_eq!(suggest_command("/halp"), Some("/help"));
+    assert_eq!(suggest_command("/sto"), Some("/stop"));
+    assert_eq!(suggest_command("/rezume"), Some("/resume"));
+    assert_eq!(suggest_command("/zzzzzz"), None, "距离 >2 不建议");
+    let r = unknown_command_reply("/halp");
+    assert!(r.contains("未知命令 /halp"), "{r}");
+    assert!(r.contains("你是想找 /help 吗"), "{r}");
+    // 分组竖排：每个分组头与其命令各占一行。
+    for (group, cmds) in COMMAND_GROUPS {
+        assert!(r.contains(group), "缺分组 {group}: {r}");
+        for c in *cmds {
+            assert!(r.contains(&format!("\n- {c}")), "缺命令行 {c}: {r}");
+        }
+    }
+    // 完全未知：无建议句但仍有命令表。
+    let r2 = unknown_command_reply("/zzzzzz");
+    assert!(!r2.contains("你是想找"), "{r2}");
+    assert!(r2.contains("🗂 会话"), "{r2}");
+}
+
+/// S-1：热切权限模式走与启动期同口径的能力校验——闭环档 × 非 FullLoop
+/// 后端被拒且句柄不写（模式保持不变）。
+#[tokio::test]
+async fn reload_permission_mode_rejects_non_fullloop() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await; // MockBackend = Unsupported
+    let res = ctx.disp.reload_permission_mode(PermissionMode::Ask);
+    let err = res.expect_err("非 FullLoop 后端热切 ask 应被拒绝");
+    assert!(err.to_string().contains("IM 审批闭环"), "{err}");
+    assert!(
+        !ctx.disp.permission_mode.read().needs_socket(),
+        "拒绝时模式句柄不得被写入"
+    );
+    // 非闭环档不受影响。
+    assert!(ctx.disp.reload_permission_mode(PermissionMode::Deny).is_ok());
+    drop_db(ctx.db).await;
+}
+
+/// S-2：FullLoop 后端 + 闭环档位，但 socket 路径无法绑定（被目录占位）——
+/// run() fail-closed 拒绝启动，而非静默降级为「无审批」。
+#[cfg(unix)]
+#[tokio::test]
+async fn run_fails_closed_when_socket_bind_fails() {
+    let _serial = SERIAL.lock().await;
+    // 隔离 IMAGENT_HOME（先设 env 再取路径），并在 socket 路径上放一个目录使 bind 必败。
+    let home = std::env::temp_dir().join(format!(
+        "imagent_core_sockfail_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    std::env::set_var(crate::paths::IMAGENT_HOME_ENV, &home);
+    let sock = crate::permission::default_sock_path().unwrap();
+    let _ = std::fs::remove_file(&sock);
+    std::fs::create_dir_all(&sock).unwrap(); // 目录占位 → bind Err
+
+    let (plat, _inbox, _send_count) = MockPlatform::new();
+    let (mut back, _calls, _prompts, _order) = MockBackend::new();
+    back.capability = crate::backend::PermissionCapability::FullLoop;
+    let (store, db) = tmp_store().await;
+    let disp = Arc::new(Dispatcher::new(
+        Arc::new(plat),
+        Arc::new(back),
+        store,
+        Auth::new(vec!["alice".into()]),
+        std::path::PathBuf::from("/tmp/imagent-test-ws"),
+        vec!["Read".into()],
+        PermissionMode::Ask,
+        test_budgets(),
+        CotDetail::Brief,
+        vec!["alice".into()],
+    ));
+    let res = tokio::time::timeout(Duration::from_secs(5), disp.run())
+        .await
+        .expect("run 应立即返回（bind 失败 fail-closed）");
+    let err = res.expect_err("socket bind 失败应拒绝启动");
+    assert!(err.to_string().contains("拒绝启动"), "{err}");
+
+    // 清理：恢复 env、撤掉占位目录与临时 home。
+    std::env::remove_var(crate::paths::IMAGENT_HOME_ENV);
+    let _ = std::fs::remove_dir(&sock);
+    let _ = std::fs::remove_dir(&home);
+    drop_db(db).await;
+}
+
+/// S-13：发现模式 + admin_senders 为空——引导不得提示 IM 内 /allow（S2 下
+/// 无人可用管理命令，提示即误导）；仍保留 CLI 指引。
+#[tokio::test]
+async fn discovery_guide_without_admins_omits_allow_command() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec![])).await; // 发现模式；admins = snapshot = 空
+    feed_and_wait(&ctx, vec![msg("c3", "anyone", "hi")], 0).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert_eq!(inbox.len(), 1, "应回一条引导: {inbox:?}");
+    assert!(inbox[0].contains("imagent allow"), "保留 CLI 指引: {inbox:?}");
+    assert!(!inbox[0].contains("/allow"), "空 admin 下不得提示 /allow: {inbox:?}");
+    drop_db(ctx.db).await;
+}
+
+/// S-16：/resume 选中序号不再消费缓存条目——连续选择序号不错位。
+#[tokio::test]
+async fn resume_numbering_stable_after_selection() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    feed_and_wait(
+        &ctx,
+        vec![msg("c1", "alice", "first"), msg("c1", "alice", "second")],
+        2,
+    )
+    .await;
+    ctx.disp.handle(msg("c1", "alice", "/resume")).await;
+    // 选中 1（sess-0）后，2 仍指向 sess-1（而非移除后前移的 sess-0 复用）。
+    ctx.disp.handle(msg("c1", "alice", "/resume 1")).await;
+    ctx.disp.handle(msg("c1", "alice", "/resume 2")).await;
+    feed_and_wait(&ctx, vec![msg("c1", "alice", "after")], 3).await;
+    let calls = ctx.calls.lock().await.clone();
+    assert_eq!(
+        calls.last(),
+        Some(&Some("sess-1".to_string())),
+        "选中 2 应续接 sess-1（序号未被消费重排）: {calls:?}"
+    );
+    drop_db(ctx.db).await;
+}
+
+/// S-15：/switch 空参回用法 + 列出已有命名会话。
+#[tokio::test]
+async fn switch_without_name_lists_sessions() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    // 先跑一轮 + 命名，/sessions 才有实体条目可列。
+    feed_and_wait(&ctx, vec![msg("c1", "alice", "hello")], 1).await;
+    ctx.disp.handle(msg("c1", "alice", "/switch work")).await;
+    // 命名 session 行在下一轮 run 落库——再跑一轮后 /sessions 才有实体条目。
+    feed_and_wait(&ctx, vec![msg("c1", "alice", "in work")], 2).await;
+    ctx.disp.handle(msg("c1", "alice", "/switch")).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.iter().any(|t| t.contains("用法") && t.contains("/switch <name>")),
+        "应有用法提示: {inbox:?}"
+    );
+    assert!(
+        inbox.iter().any(|t| t.contains("命名会话") && t.contains("work")),
+        "应列出命名会话 work: {inbox:?}"
+    );
+    drop_db(ctx.db).await;
+}
+
+/// S-17：/stop 打断后纯文本平台补「本轮已被中断」标记（半截流式文本不再
+/// 无声终止）。
+#[tokio::test]
+async fn stop_on_text_platform_marks_interrupted() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build_slow(
+        Auth::new(vec!["alice".into()]),
+        30_000,
+        TaskBudgets {
+            agent_timeout: Duration::ZERO,
+            permission_ask_timeout: Duration::from_secs(5),
+            ask_via_im_timeout: Duration::from_secs(5),
+            shutdown_grace: Duration::from_secs(5),
+            agent_idle_timeout: Duration::ZERO,
+            batch_window: Duration::ZERO,
+        },
+    )
+    .await;
+    let disp = ctx.disp.clone();
+    let runner = tokio::spawn(async move {
+        disp.handle(msg("c1", "alice", "long job")).await;
+    });
+    assert!(wait_registered(&ctx, "c1").await, "任务应在飞");
+    ctx.disp.handle(msg("c1", "alice", "/stop")).await;
+    let done = tokio::time::timeout(Duration::from_secs(5), runner).await;
+    assert!(done.is_ok(), "被中断的 runner 应很快退出");
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.iter().any(|t| t.contains("本轮已被中断")),
+        "文本平台应补中断标记: {inbox:?}"
+    );
+    drop_db(ctx.db).await;
 }

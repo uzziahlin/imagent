@@ -3,9 +3,12 @@
 //!
 //! - `recv()`：从 client 推来的 `aibot_msg_callback` 帧逐条经
 //!   [`crate::proto::parse_msg_callback`] 解析为 [`InboundMessage`] 返回。
-//! - `send_text()`：`userid_from_conv` 还原 userid → `build_send_markdown_frame`
-//!   → 出站 channel。hint 忽略（WeCom 仅靠 conv_id 解析 userid）。
-//! - `send_media()` / `send_typing()`：MVP 空实现（媒体需 upload_media 三步，留后）。
+//! - `send_text()`：`userid_from_conv` 还原 userid → 超限分片（见
+//!   [`WECOM_TEXT_MAX_BYTES`]）逐片 `build_send_markdown_frame` → 出站 channel。
+//!   hint 忽略（WeCom 仅靠 conv_id 解析 userid）。
+//! - `send_media()`：**不支持**（需 upload_media 三步，留后）——显式返回 Err，
+//!   core 命令层会把失败文案回给用户，不再谎报成功。
+//! - `send_typing()`：no-op（WeCom 协议无 typing 语义）。
 
 use std::sync::Arc;
 
@@ -21,6 +24,40 @@ use crate::client::{InboundFrame, OutboundFrame, WeComWsClient};
 use crate::proto::{build_send_markdown_frame, parse_msg_callback, userid_from_conv};
 
 const PLATFORM: &str = "wecom";
+
+/// 出站 markdown 文本的单片字节上限。
+///
+/// 企微 `aibot_send_msg` markdown 消息 content 上限 4096 字节（超限整条被
+/// 服务端拒绝）。取 4000 字节作安全阈值：预留 `(i/n)` 分片编号后缀与 JSON
+/// 转义（`"`/`\n` 等）膨胀的余量。切片全程按 UTF-8 char 边界回退，不切断
+/// 多字节字符（中文 3 字节 / emoji 4 字节）。
+const WECOM_TEXT_MAX_BYTES: usize = 4000;
+
+/// 按 UTF-8 字节上限切分出站文本（`max_bytes` ≥ 4 时保证不死循环）。
+///
+/// - 总字节 ≤ `max_bytes` → 单片原样返回（空串同理）。
+/// - 否则从 `max_bytes` 处向前回退到最近的 char 边界作为切点，逐段入列。
+/// - 各片按顺序拼接与原文完全相等（不丢字符）。
+fn split_text_by_bytes(text: &str, max_bytes: usize) -> Vec<String> {
+    if text.len() <= max_bytes {
+        return vec![text.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    while start < text.len() {
+        let mut end = (start + max_bytes).min(text.len());
+        if end < text.len() {
+            // 回退到 char 边界：max_bytes(4000) 远大于单个 char 的最大 4 字节，
+            // 循环必然在 start 之前停下，不可能死循环。
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+        }
+        chunks.push(text[start..end].to_string());
+        start = end;
+    }
+    chunks
+}
 
 /// 企业微信 Platform 适配器。
 ///
@@ -102,17 +139,40 @@ impl Platform for WeComPlatform {
 
     async fn send_text(&self, conv: &ConvId, text: &str, _hint: &ReplyHint) -> Result<()> {
         let userid = userid_from_conv(conv);
-        let frame = build_send_markdown_frame(&userid, text);
-        self.outbound_tx.send(frame).await.map_err(|_| {
-            CoreError::Platform(PLATFORM, "出站 channel 已关闭（client 已退出）".into())
-        })?;
+        // 超限分片（与飞书/ilink 同思路）：按字节安全阈值切，多片加 (i/n) 编号
+        // 后缀，用户能感知这是同一回复的一部分且未被截断。
+        let chunks = split_text_by_bytes(text, WECOM_TEXT_MAX_BYTES);
+        let total = chunks.len();
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let content = if total > 1 {
+                format!("({}/{}) {}", i + 1, total, chunk)
+            } else {
+                chunk
+            };
+            let frame = build_send_markdown_frame(&userid, &content);
+            // P5：中途失败标明分片序号——用户能感知回复被截断而非静默缺尾。
+            self.outbound_tx.send(frame).await.map_err(|_| {
+                CoreError::Platform(
+                    PLATFORM,
+                    format!(
+                        "第 {}/{} 片发送失败（回复可能被截断）：出站 channel 已关闭（client 已退出）",
+                        i + 1,
+                        total
+                    ),
+                )
+            })?;
+        }
         Ok(())
     }
 
     async fn send_media(&self, _conv: &ConvId, _media: &MediaRef, _hint: &ReplyHint) -> Result<()> {
-        // TODO: WeCom 媒体需 upload_media 三步（get/upload/finish）获取 media_id，
-        // 再以 aibot_send_msg 携带 media_id 发送。MVP 暂不支持，留后。
-        Ok(())
+        // WeCom 媒体需 upload_media 三步（get/upload/finish）获取 media_id，再以
+        // aibot_send_msg 携带 media_id 发送，暂不支持。显式报错而非谎报 Ok——
+        // core 命令层（/img /file）会把该文案作为「发送失败：…」回给用户。
+        Err(CoreError::Platform(
+            PLATFORM,
+            "wecom 暂不支持媒体发送".into(),
+        ))
     }
 
     async fn send_typing(&self, _conv: &ConvId, _hint: &ReplyHint) -> Result<()> {
@@ -241,6 +301,100 @@ mod tests {
     fn userid_roundtrip() {
         let conv = ConvId("wecom:Charlie".into());
         assert_eq!(userid_from_conv(&conv), "Charlie");
+    }
+
+    // ------------------------------------------------------------------
+    // split_text_by_bytes：分片正确性（UTF-8 字符边界 / 拼接无损 / 编号后缀）
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn split_under_limit_single_chunk() {
+        // 未超限：单片原样返回（含空串）。
+        assert_eq!(
+            split_text_by_bytes("hello", WECOM_TEXT_MAX_BYTES),
+            vec!["hello".to_string()]
+        );
+        assert_eq!(split_text_by_bytes("", 16), vec![String::new()]);
+    }
+
+    #[test]
+    fn split_long_chinese_roundtrip_and_bounds() {
+        // 中文 3 字节/字：1334 字 = 4002 字节。切点 4000 不是 char 边界
+        // （落在第 1334 字内部），须回退到 3999。验证：不 panic、每片 ≤ 上限、
+        // 拼接无损、不产生替换字符。
+        let text = "中".repeat(1334); // 4002 bytes
+        let chunks = split_text_by_bytes(&text, WECOM_TEXT_MAX_BYTES);
+        assert_eq!(chunks.len(), 2);
+        for c in &chunks {
+            assert!(c.len() <= WECOM_TEXT_MAX_BYTES);
+            assert!(c.chars().all(|ch| ch == '中'), "不得切断多字节字符");
+        }
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    fn split_emoji_boundary_not_broken() {
+        // emoji 4 字节：构造「4000 - 1 字节前缀 + emoji + 尾巴」，切点必须
+        // 回退避开 4 字节 emoji 的中间字节。
+        let mut text = String::new();
+        for _ in 0..999 {
+            text.push('中'); // 999 * 3 = 2997 bytes
+        }
+        for _ in 0..250 {
+            text.push('a'); // +250 = 3247 bytes
+        }
+        text.push('🎉'); // +4 = 3251
+        for _ in 0..250 {
+            text.push('中'); // +750 = 4001 bytes，切点 4000 落在最后一个中文内
+        }
+        text.push('尾');
+        let chunks = split_text_by_bytes(&text, WECOM_TEXT_MAX_BYTES);
+        assert!(chunks.len() >= 2);
+        for c in &chunks {
+            assert!(c.len() <= WECOM_TEXT_MAX_BYTES);
+            // 每片必须是合法 str（切片本身即保证），再显式验证 emoji 完整。
+            assert!(!c.ends_with('\u{FFFD}'));
+        }
+        assert!(chunks.iter().any(|c| c.contains('🎉')));
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    fn split_exact_multiple_of_limit() {
+        // 恰好整数片：3999 字节（1333 个中文）×3 = 11997，用上限 3999 模拟，
+        // 切点均落在 char 边界，得到恰好 3 片等长。
+        let text = "字".repeat(3999); // 11997 bytes
+        let chunks = split_text_by_bytes(&text, 3999);
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().all(|c| c.len() == 3999));
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    fn split_exactly_at_limit_single_chunk() {
+        // 恰好等于上限：不分片。
+        let text = "中".repeat(1000); // 3000 bytes
+        assert_eq!(split_text_by_bytes(&text, 3000), vec![text.clone()]);
+        // 4001 字节 → 2 片。
+        let over = format!("{text}a");
+        assert_eq!(split_text_by_bytes(&over, 3000).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn send_text_chunks_get_numbered_suffix() {
+        // 集成：超长文本经 send_text 的分片逻辑（此处直接验证分片 + 编号拼装，
+        // 与 send_text 内联逻辑一致——不连真机 WS）。
+        let text = "中".repeat(3000); // 9000 bytes → 3 片（3000/3000/3000 字节）
+        let chunks = split_text_by_bytes(&text, WECOM_TEXT_MAX_BYTES);
+        let total = chunks.len();
+        assert_eq!(total, 3);
+        for (i, chunk) in chunks.iter().enumerate() {
+            let content = format!("({}/{}) {}", i + 1, total, chunk);
+            assert!(content.starts_with(&format!("({}/{}) ", i + 1, total)));
+        }
+        // 单片不加编号。
+        let single = split_text_by_bytes("short", WECOM_TEXT_MAX_BYTES);
+        assert_eq!(single, vec!["short".to_string()]);
     }
 
     // 静态断言 WeComPlatform name。

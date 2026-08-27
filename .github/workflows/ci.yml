@@ -3,6 +3,8 @@ name: CI
 on:
   push:
     branches: [main, "feat/**"]
+    # tag 发布（v*）同样跑 lint/test——此前 tag push 不触发 CI，发布产物未经测试。
+    tags: ["v*"]
   pull_request:
     branches: [main]
 
