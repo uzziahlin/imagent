@@ -2312,9 +2312,9 @@ async fn resume_merges_local_and_takes_over_pc_session() {
         "本机会话摘要应展示: {list}"
     );
     assert!(list.contains("sess-0…"), "IM 历史行缺摘要回退 id: {list}");
-    // 列表序：sess-0（新）在前，pc-9f86d081 第 2。
-    let l1 = list.lines().find(|l| l.starts_with("1.")).unwrap();
-    let l2 = list.lines().find(|l| l.starts_with("2.")).unwrap();
+    // 列表序：sess-0（新）在前，pc-9f86d081 第 2（表格行 | # | 来源 | 时间 | 内容 |）。
+    let l1 = list.lines().find(|l| l.starts_with("| 1 |")).unwrap();
+    let l2 = list.lines().find(|l| l.starts_with("| 2 |")).unwrap();
     assert!(
         l1.contains("📱") && l1.contains("sess-0"),
         "第 1 应为 IM 当前: {l1}"
