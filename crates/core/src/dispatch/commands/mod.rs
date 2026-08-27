@@ -31,7 +31,7 @@ impl Dispatcher {
             let guide = format!(
                 "发现模式：当前白名单为空。你的 sender id 是 `{}`，会话 id 是 `{}`。\n\
                  请管理员在本地运行 `imagent allow {}` 授权用户、或 `imagent allow-chat {}` \
-                 授权整个会话（群）后重启 imagent；也可由已授权用户在 IM 内发 /allow / /chat allow。",
+                 授权整个会话（群）后重启 imagent；管理员也可在 IM 内发 /allow / /chat allow。",
                 sender.0, conv.0, sender.0, conv.0
             );
             self.reply(&conv, &guide, &hint).await;
@@ -118,7 +118,7 @@ impl Dispatcher {
                         return;
                     }
                     "/resume" => {
-                        self.cmd_resume(&conv, &hint, &parts).await;
+                        self.cmd_resume(&conv, &sender, &hint, &parts).await;
                         return;
                     }
                     "/switch" => {

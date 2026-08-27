@@ -143,9 +143,11 @@ async fn write_mcp_config(
             }
         }
     });
-    let dir = dirs::home_dir()
-        .map(|h| h.join(".imagent"))
-        .unwrap_or_else(std::env::temp_dir);
+    // B6：mcp json 目录与 permission.sock 一致锚定 `imagent_home()`——`--profile`
+    // 时随 profile 隔离（此前写死 `~/.imagent`，多实例共用会互相覆盖 mcp_*.json）。
+    // 旧路径 `~/.imagent/mcp_*.json` 残留文件不迁移（run 结束会删本次文件；全局
+    // grep 确认无其他代码引用旧路径）。
+    let dir = imagent_core::paths::imagent_home();
     tokio::fs::create_dir_all(&dir).await?;
     let path = dir.join(format!("mcp_{}.json", sanitize_filename(conv_id)));
     // S-6：temp + rename 原子替换（替代 check-then-write 的 TOCTOU 竞窗）。临时文件用
@@ -302,21 +304,57 @@ fn claude_parse(line: &str) -> CliEvent {
                 }
             }
         }
-        ParsedEvent::ToolUse {
-            tool,
-            input,
+        ParsedEvent::Assistant {
+            text,
+            tool_uses,
             session_id,
-        } => CliEvent::ToolUse {
-            tool,
-            input,
-            session: session_id,
-        },
-        ParsedEvent::ToolResult { tool, output } => CliEvent::ToolResult { tool, output },
+        } => {
+            // B7/B8：一条 assistant 消息可产出多个事件——session 捕获 + 中间文本
+            // 推流（codex/gemini 均推 Text，claude 此前归 Skip）+ 全部并行 tool_use。
+            // final_text 语义不变：中间 Text 只参与拼接候选，终止 result 事件仍
+            // 整体覆盖（见 backend_common B9 注释）。
+            let mut evs = Vec::new();
+            if let Some(s) = session_id {
+                if !s.is_empty() {
+                    evs.push(CliEvent::Session(s));
+                }
+            }
+            if !text.is_empty() {
+                evs.push(CliEvent::Text(text));
+            }
+            for u in tool_uses {
+                evs.push(CliEvent::ToolUse {
+                    tool: u.tool,
+                    input: u.input,
+                    session: None,
+                });
+            }
+            if evs.is_empty() {
+                CliEvent::Skip
+            } else {
+                CliEvent::Multi(evs)
+            }
+        }
+        ParsedEvent::ToolResults { results } => {
+            // B7：一条 user 消息的全部并行 tool_result 都产出。
+            if results.is_empty() {
+                CliEvent::Skip
+            } else {
+                CliEvent::Multi(
+                    results
+                        .into_iter()
+                        .map(|r| CliEvent::ToolResult {
+                            tool: r.tool,
+                            output: r.output,
+                        })
+                        .collect(),
+                )
+            }
+        }
         ParsedEvent::Other { session_id } => session_id.map_or(CliEvent::Skip, CliEvent::Session),
         ParsedEvent::Skip => CliEvent::Skip,
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

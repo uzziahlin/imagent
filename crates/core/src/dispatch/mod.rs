@@ -30,7 +30,7 @@ use crate::card_session::CardSession;
 use crate::config::{CotDetail, PermissionMode, ReplyMode};
 use crate::error::Result;
 use crate::metrics::METRICS;
-use crate::permission::{parse_reply, PermissionReply, PermissionRouter};
+use crate::permission::{is_explicit_reply_word, parse_reply, PendingKind, PermissionReply, PermissionRouter};
 use crate::platform::Platform;
 use crate::types::{
     AgentChunk, CardButton, CardButtonStyle, CardTerminal, ConfigFormField, ConvId, InboundMessage,
@@ -44,6 +44,14 @@ use tracing::{error, info, warn};
 /// per-conv 排队消息上限：runner 在飞期间到达的消息暂存条数。超出回告警并丢弃，
 /// 防刷屏把合并后的 prompt 撑爆。
 const PENDING_QUEUE_CAP: usize = 100;
+
+/// D2：存在待审批 pending 时，对「未被消费的自由文本」的提示去重间隔——
+/// 同一 conv 在该窗口内只提示一次，避免每条消息都刷屏。
+const PENDING_HINT_DEDUPE: Duration = Duration::from_secs(60);
+
+/// D7：`/resume` 序号缓存的有效期——缓存按 (conv, sender) 隔离，过期防止
+/// 陈旧序号在列表变化后错位。
+const RESUME_CACHE_TTL: Duration = Duration::from_secs(600);
 
 /// Dispatcher 时长类预算聚合（避免构造参数表随配置项继续膨胀）。
 #[derive(Debug, Clone, Copy)]
@@ -263,7 +271,9 @@ pub struct Dispatcher {
     queues: Mutex<HashMap<String, Vec<InboundMessage>>>,
     /// per-conv 最近一次 `/resume` 渲染的列表（P4-11）：序号选择取缓存，
     /// 防两次调用间本机会话 mtime 变化导致错位；选中即消费（移除）。
-    resume_cache: Mutex<HashMap<String, Vec<ResumeEntry>>>,
+    /// D7：key 为 (conv, sender)——群聊多用户共用 conv，仅按 conv 缓存会互相
+    /// 覆盖错位；值带写入时刻，超过 [`RESUME_CACHE_TTL`] 惰性过期。
+    resume_cache: Mutex<HashMap<(String, String), (Instant, Vec<ResumeEntry>)>>,
     /// P6-9：per-conv 空闲看门狗覆盖（`/timeout`）——`Some(ZERO)` = 本会话关闭；
     /// 无条目 = 跟随全局 `agent_idle_timeout`。进程内（会话级旋钮，不落盘）。
     idle_overrides: Mutex<HashMap<String, Duration>>,
@@ -274,10 +284,15 @@ pub struct Dispatcher {
     /// 审批集（ask 模式下仅清单内工具过 IM 审批，其余放行；空 = 全部过审）。
     /// main 启动注入 + SIGHUP 热重载（见 [`Self::set_approval_tools`]）。
     approval_tools: Arc<RwLock<Vec<String>>>,
-    /// 管理员 sender（可 /allow）；空 = 所有白名单用户可（向后兼容，P2-D）。
+    /// 管理员 sender（可 /allow /config /perm /admin）。S2：空 = **无人**是
+    /// 管理员（IM 内管理命令全部不可用，须通过 CLI / setup 配置 admin_senders）。
     admin_senders: Arc<RwLock<Vec<String>>>,
-    /// 优雅退出信号（P1-5）：收到 SIGINT/SIGTERM 后 notify，run() 停止收新消息并 drain。
-    shutdown: Arc<tokio::sync::Notify>,
+    /// D2：per-conv 最近一次「存在待审批项」提示的时刻（PENDING_HINT_DEDUPE 去重）。
+    pending_hint_last: Mutex<HashMap<String, Instant>>,
+    /// 优雅退出信号（P1-5）：收到 SIGINT/SIGTERM 后 cancel，run() 停止收新消息并
+    /// drain。D4：改用 CancellationToken（持久信号）——`Notify::notify_waiters` 只
+    /// 唤醒**已注册**的等待者，信号先于监听者 await 到达时存在丢失窗口。
+    shutdown: Arc<tokio_util::sync::CancellationToken>,
     /// in-flight handle task 集合（P1-5）：drain 时等待其完成，避免 SIGKILL 正在
     /// 写文件的 agent 子进程导致半写。task 完成自动移除。
     tasks: Mutex<tokio::task::JoinSet<()>>,
@@ -329,7 +344,7 @@ impl Dispatcher {
         cot_detail: CotDetail,
         admin_senders: Vec<String>,
     ) -> Self {
-        Self {
+        let disp = Self {
             platform,
             backend,
             store,
@@ -350,14 +365,24 @@ impl Dispatcher {
             running: Mutex::new(HashMap::new()),
             queues: Mutex::new(HashMap::new()),
             resume_cache: Mutex::new(HashMap::new()),
+            pending_hint_last: Mutex::new(HashMap::new()),
             idle_overrides: Mutex::new(HashMap::new()),
             stranger_mention_hint: RwLock::new(false),
             reply_mode: Arc::new(RwLock::new(ReplyMode::Card)),
             approval_tools: Arc::new(RwLock::new(Vec::new())),
             admin_senders: Arc::new(RwLock::new(admin_senders)),
-            shutdown: Arc::new(tokio::sync::Notify::new()),
+            shutdown: Arc::new(tokio_util::sync::CancellationToken::new()),
             tasks: Mutex::new(tokio::task::JoinSet::new()),
+        };
+        // S2：admin_senders 为空 = 无人是管理员，IM 内管理命令全部不可用——
+        // 构造即显著提示（防用户以为白名单用户仍可 /allow）。
+        if disp.admin_senders.read().is_empty() {
+            warn!(
+                target: "imagent::core",
+                "admin_senders 为空，IM 内管理命令不可用；请通过 CLI（imagent setup / config.toml admin_senders）配置管理员"
+            );
         }
+        disp
     }
 
     /// 审批集注入/热重载（main 启动与 SIGHUP 调用；空 = 全部权限请求过审）。
@@ -379,21 +404,23 @@ impl Dispatcher {
         *self.agent_idle_timeout.read()
     }
 
-    /// 调用者是否为管理员（可 /allow）。admin_senders 空 = 向后兼容（所有白名单
-    /// 用户可）；非空则严格检查（P2-D）。
+    /// 调用者是否为管理员（可 /allow /config /perm /admin）。S2：admin_senders
+    /// 空 = **无人**是管理员（旧「空 = 全员可」语义使群部署下任意白名单成员可
+    /// 自扩权，已收紧）；非空则严格匹配（P2-D）。
     fn is_admin(&self, sender: &str) -> bool {
         let admins = self.admin_senders.read();
         let trimmed = sender.trim();
-        admins.is_empty() || admins.iter().any(|a| a.trim() == trimmed)
+        admins.iter().any(|a| a.trim() == trimmed)
     }
 
-    /// P5-1（安全）：审批回复的发送者须过白名单（sender OR 会话白名单——与
-    /// handle() 的鉴权门完全一致）。审批路由发生在 handle() **之前**，天然绕过
-    /// 其鉴权；不加此门，群聊里非白名单成员发一条 "y" 即可批准 Bash 等高危工具，
-    /// 发任意文本则被当 deny 吞掉。飞书审批按钮回调携带 operator open_id 作
-    /// sender，同一门槛覆盖按钮路径。
+    /// P5-1/S1（安全）：审批回复的发送者须过 **sender 白名单**（或为管理员）。
+    /// 审批路由发生在 handle() **之前**，天然绕过其鉴权；旧「sender OR 会话白
+    /// 名单」门在群被 `/chat allow` 加白后，任意群成员发 "y" 即可批准 Bash 等
+    /// 高危工具——群白名单只代表「可对话」，不代表「可批高危操作」，故收紧为
+    /// 仅 sender 白名单（管理员兜底）。飞书审批按钮回调携带 operator open_id
+    /// 作 sender，同一门槛覆盖按钮路径。
     fn can_route_permission_reply(&self, msg: &InboundMessage) -> bool {
-        self.auth.is_allowed(&msg.sender) || self.auth.is_chat_allowed(&msg.conv_id.0)
+        self.auth.is_allowed(&msg.sender) || self.is_admin(&msg.sender.0)
     }
 
     /// SIGHUP 热重载：整体替换 allowed_tools。
@@ -421,7 +448,8 @@ impl Dispatcher {
     /// 触发优雅退出（P1-5）：run() 收到后停止 recv 并 drain in-flight task。
     /// 由 main 的信号处理 task 调用（SIGINT/SIGTERM）。
     pub fn shutdown(&self) {
-        self.shutdown.notify_waiters();
+        // D4：CancellationToken 持久——先 cancel 后监听也不会丢信号。
+        self.shutdown.cancel();
     }
 
     /// 主循环。循环 `platform.recv()`，每条消息 `tokio::spawn` 处理（不阻塞 recv）。
@@ -452,7 +480,7 @@ impl Dispatcher {
             // P1-5：监听 shutdown 信号，停止接收新消息并进入 drain。
             tokio::select! {
                 biased;
-                _ = self.shutdown.notified() => {
+                _ = self.shutdown.cancelled() => {
                     info!(target: "imagent::core", "shutdown 信号到达，停止接收新消息，drain in-flight task");
                     break;
                 }
@@ -472,20 +500,38 @@ impl Dispatcher {
                         if is_permission_reply_candidate(text)
                             && self.can_route_permission_reply(&msg)
                         {
+                            // D2：自由文本（无按钮回调 ask_req / 无引用回复
+                            // reply_to 锚定询问卡）只有在**明确命中审批词表**
+                            // （y/n 全字匹配，见 is_explicit_reply_word）时才可被
+                            // 消费；否则回落正常 handle/批处理路径，不再被当
+                            // deny 兜底吞掉。多 pending 并存且无锚定时无法消解
+                            // 歧义，同样不消费，回一条去重提示引导回复卡片。
+                            let anchored = msg.ask_req.is_some() || msg.reply_to.is_some();
+                            let explicit_word = is_explicit_reply_word(text);
+                            let consumable = if anchored {
+                                true
+                            } else if !explicit_word {
+                                false
+                            } else {
+                                matches!(self.router.pending_count(&conv_id).await, 0 | 1)
+                            };
                             let reply = parse_reply(text);
                             let reply_for_card = reply.clone();
                             // 多 pending 三级路由：按钮回调带 ask_req 精确 → 引用
                             // 回复（reply_to）命中询问卡 → 最新 pending 兜底。
-                            if let Some(req) = self
-                                .router
-                                .route(
-                                    &conv_id,
-                                    msg.ask_req.as_deref(),
-                                    msg.reply_to.as_deref(),
-                                    reply,
-                                )
-                                .await
-                            {
+                            let routed = if consumable {
+                                self.router
+                                    .route(
+                                        &conv_id,
+                                        msg.ask_req.as_deref(),
+                                        msg.reply_to.as_deref(),
+                                        reply,
+                                    )
+                                    .await
+                            } else {
+                                None
+                            };
+                            if let Some(req) = routed {
                                 // 真机校准 UX：决策已达 MCP，立即把询问卡收敛成
                                 // 「已批准/已拒绝」终态（best-effort，无卡 no-op）；
                                 // 问题卡（P6）显示「已记录你的选择：<选项>」。
@@ -501,6 +547,29 @@ impl Dispatcher {
                                     );
                                 }
                                 continue;
+                            }
+                            // D2：未被消费但确有 pending——回一条去重提示，引导
+                            // 用户回复询问卡（或 y/n），避免静默落进 agent 批处理
+                            // 造成「发了没人理」的困惑；60s 窗口去重防刷屏。
+                            if self.router.has_pending(&conv_id).await {
+                                let now = Instant::now();
+                                let mut last = self.pending_hint_last.lock().await;
+                                let due = last
+                                    .get(&conv_id)
+                                    .is_none_or(|t| now.duration_since(*t) >= PENDING_HINT_DEDUPE);
+                                if due {
+                                    last.insert(conv_id.clone(), now);
+                                    drop(last);
+                                    let n = self.router.pending_count(&conv_id).await;
+                                    self.reply(
+                                        &msg.conv_id,
+                                        &format!(
+                                            "⚠️ 当前有 {n} 项待审批/待回答的询问，请回复对应询问卡（多待决时需引用对应卡片），或直接回复 y / n 表态。"
+                                        ),
+                                        &msg.reply_hint,
+                                    )
+                                    .await;
+                                }
                             }
                         }
                         // 每条消息独立 spawn，不阻塞 recv。P1-5：入 JoinSet 以便 drain。

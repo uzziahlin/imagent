@@ -6,6 +6,31 @@
 
 （空——下一段变更从这里开始。）
 
+## [1.7.1] — 2026-08-27
+
+> **CODE_REVIEW v7 缺陷修复批**（详见 `docs/CODE_REVIEW_v7.md`）：安全收紧 6 项 + 调度正确性 11 项 + backend 正确性 8 项，含新增约 12 个针对性单测。
+
+### Security
+- **审批回复鉴权收紧（S1）**：`can_route_permission_reply` 由「sender 白名单 OR 会话白名单」收紧为「sender 白名单 OR admin」——群被 `/chat` 放行后，普通群成员不再能以 "y" 批准高危工具请求。
+- **空管理员不再放权（S2，行为变更）**：`admin_senders` 为空时不再「全员管理员」，IM 内管理命令一律拒绝并附配置引导；启动期 warn 提示。**依赖旧「空=全员可」语义的部署需显式配置 `admin_senders`。**
+- **飞书去重回退 key 改内容哈希（S4）**：事件缺 id 时不再用 `receive_id + 文本长度`——等长不同消息不再被误判重复吞掉，重放窗口同步消除；评论事件同理。
+- **飞书发送幂等（S5）**：所有出站消息在重试循环外生成 uuid 作飞书幂等键，429/超时重试不再产生重复消息。
+- **workdir 黑名单补齐（S6）**：新增 `/private`、`/var/tmp`、`/private/tmp`、`/private/var/tmp` 等 canonicalize 等价敏感根，堵住 `/cd /private` 类绕过。
+- **wecom 探针 URL 校验（S8）**：`probe_credentials` 复用 `validate_ws_url`（wss 任意 host、ws 仅 loopback），secret 不再可能发往明文非预期地址。
+
+### Fixed
+- **backend 失败路径清理权限 pending（D1）**：backend 出错 / 取消 / 空闲超时 / panic 均会 cancel 本会话全部 pending 并收敛卡片——「agent 已死但 pending 挂满、期间消息持续被吞成 deny」消除。
+- **审批等待期不再吞自由文本（D2）**：自由文本仅明确命中 y/n 词表且无多 pending 歧义时才作为审批决定消费；否则走正常消息路径，并 60s 去重提示「存在待审批项」。
+- **看门狗豁免收窄（D3）**：pending 区分 Permission/Ask 来源，终端 ask_via_im（超时可至 24h）不再无限豁免 IM 会话空闲看门狗。
+- **shutdown 改 `CancellationToken`（D4）**：消除 `notify_waiters` 非持久信号的丢失窗口。
+- **审批卡竞态（D5）**：先 register 占位、发卡后回填 card_msg_id，极早点按钮不再把按钮消息当 prompt 跑 agent。
+- **`/stop` 原子 cancel（D6）/ `/resume` 缓存按 (conv, sender) 隔离 + 600s TTL（D7）/ `permission_ask_timeout < agent_timeout` 启动强制校验（D8）** 及卡片节流、指标污染、非 unix 锁报错四个小项（D9-D11）。
+- **读行忙循环（B1）**：区分「单行超长跳行」与真实 IO 错误（后者终止读取），ACP/各 backend 不再可能无限空转。
+- **ACP 不丢事件（B4）**：`try_send` 改 `timeout(30s, send().await)`，通道满不再静默丢文本/工具事件。
+- **进程组清理（B5）**：unix 下 `process_group(0)` + killpg，孙进程（MCP server / 长跑 shell）不再泄漏。
+- **mcp json 随 profile 隔离（B6）**：目录改用 `imagent_home()`，多 profile 不再互删配置。
+- **并行工具调用全量收集（B7）/ claude 中间文本推流（B8）/ final_text 多消息拼接（B9）/ codex 顶层 error 透出（B10）**。
+
 ## [1.7.0] — 2026-08-27
 
 > P9 交互第二批（一二档快赢 + /config 表单卡）：流式卡终止按钮、邮箱掩码防租户审计 400、hr/flow 视觉细化、/ws 删除钮、空产出占位、`/config` 下拉表单卡。

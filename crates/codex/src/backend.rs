@@ -99,7 +99,10 @@ fn codex_parse(line: &str) -> CliEvent {
             text: message,
             session: None,
         },
-        ParsedEvent::Error { message: _ } => CliEvent::Skip, // 顶层 error 可能瞬时重连，忽略（原 warn）
+        // B10：顶层 error 不再吞成 Skip——转 TransientError：不中断流（保留「可能
+        // 瞬时重连」的原考量），但内容会被记录；若最终无任何 final 文本（如
+        // 「API key invalid」这类致命错误），作为失败原因在 IM 可见。
+        ParsedEvent::Error { message } => CliEvent::TransientError(message),
         ParsedEvent::Skip => CliEvent::Skip,
     }
 }
@@ -177,6 +180,15 @@ mod tests {
     #[test]
     fn name_is_codex() {
         assert_eq!(CodexBackend::new().name(), "codex");
+    }
+
+    /// B10：顶层 error 事件映射为 TransientError（可观测），不再吞成 Skip。
+    #[test]
+    fn top_level_error_maps_to_transient_error() {
+        match codex_parse(r#"{"type":"error","message":"API key invalid"}"#) {
+            CliEvent::TransientError(t) => assert_eq!(t, "API key invalid"),
+            other => panic!("期望 TransientError，得到 {other:?}"),
+        }
     }
 
     #[test]

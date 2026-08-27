@@ -1,6 +1,7 @@
 //! 会话生命周期命令（重置/切换/恢复/压缩/中断）。
 
 use super::*;
+use crate::types::UserId;
 
 impl Dispatcher {
     /// /new —— 重置会话（删活动 session + active_name）。
@@ -25,7 +26,15 @@ impl Dispatcher {
     }
 
     /// /resume [n|id] —— 统一恢复列表（IM 历史 ∪ 本机同项目）+ 接管。
-    pub(super) async fn cmd_resume(&self, conv: &ConvId, hint: &ReplyHint, parts: &[&str]) {
+    /// D7：序号缓存按 (conv, sender) 隔离——群聊多用户共用 conv，仅按 conv
+    /// 缓存会互相覆盖导致错选；并带 10 分钟过期（RESUME_CACHE_TTL）。
+    pub(super) async fn cmd_resume(
+        &self,
+        conv: &ConvId,
+        sender: &UserId,
+        hint: &ReplyHint,
+        parts: &[&str],
+    ) {
         // P4-8/P4-11：统一恢复列表 = IM 历史（📱）∪ 本机同项目会话
         // （💻，仅当前 backend 支持时合并）。用户按序号选择，无需知道
         // session id；选中 💻 即自动接管（写 sessions 表绑定）。
@@ -69,8 +78,11 @@ impl Dispatcher {
                 })
                 .collect();
             // 缓存本列表：序号选择取缓存（防两次调用间本机会话
-            // mtime 变化导致序号错位）。
-            self.resume_cache.lock().await.insert(conv.0.clone(), list);
+            // mtime 变化导致序号错位）。D7：key 按 (conv, sender) 隔离 + 带时间戳。
+            self.resume_cache.lock().await.insert(
+                (conv.0.clone(), sender.0.clone()),
+                (Instant::now(), list),
+            );
             // P6-3：前 9 条各带「接管」按钮（点击 = /resume <n>；卡片按钮数克制，
             // 长列表仍以文本序号为准）。
             let buttons: Vec<CardButton> = lines
@@ -102,7 +114,15 @@ impl Dispatcher {
         // 非 数字 → 按 session_id 在新鲜合并列表里找。
         let target: Option<ResumeEntry> = if let Ok(n) = arg.parse::<usize>() {
             let mut cache = self.resume_cache.lock().await;
-            cache.get_mut(&conv.0).and_then(|l| {
+            let key = (conv.0.clone(), sender.0.clone());
+            let expired = cache
+                .get(&key)
+                .is_some_and(|(ts, _)| ts.elapsed() >= RESUME_CACHE_TTL);
+            if expired {
+                cache.remove(&key);
+            }
+            // D7：过期视同未列过表（列表可能已变化，引导重看）。
+            cache.get_mut(&key).and_then(|(_, l)| {
                 if n >= 1 && n <= l.len() {
                     Some(l.remove(n - 1))
                 } else {
@@ -454,9 +474,10 @@ impl Dispatcher {
         // MCP 立即收到 deny（fail-closed），agent 侧不悬挂。
         // P5-第五批：仅当确有 pending 审批才撤询问卡——否则会把该
         // conv 上一次已被正常回答的旧卡误 patch 成「已中断」。
-        let had_pending = self.router.has_pending(&conv.0).await;
-        self.router.cancel_all(&conv.0).await;
-        if had_pending {
+        // D6：去掉前置 has_pending（与 cancel_all 两步锁间隙可能被 route 击穿），
+        // 直接 cancel_all 并按其返回的被清列表判断是否需要收敛询问卡。
+        let cleared = self.router.cancel_all(&conv.0).await;
+        if !cleared.is_empty() {
             // P5-16：收敛审批询问本身——把 IM 里滞留的询问卡片 patch 成
             // 「已中断」（纯文本询问平台 no-op）。best-effort。多 pending 并存
             // 后按 conv 全量收敛（终端 ask 与 IM 审批都可能挂着）。

@@ -86,26 +86,14 @@ impl WeComWsClient {
         outbound_rx: &mut mpsc::Receiver<OutboundFrame>,
     ) -> imagent_core::Result<()> {
         // 1. 建连。P2-L/P2-9：远端必须 wss://（凭据保护），ws:// 仅允许 loopback
-        // （测试/本地）。用 url::Url 解析真实 host 精确比较，避免 contains 子串匹配
-        // 被 `ws://localhost.evil.com` / `ws://evil.com/?to=127.0.0.1` 绕过。
-        let parsed = url::Url::parse(&self.ws_url).map_err(|e| {
-            imagent_core::CoreError::Platform("wecom", format!("invalid ws_url: {e}"))
-        })?;
-        let host = parsed.host_str().unwrap_or("");
-        let is_loopback = matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1");
-        let host_ok = parsed.scheme() == "wss" || (parsed.scheme() == "ws" && is_loopback);
-        if !matches!(parsed.scheme(), "wss" | "ws") || !host_ok {
-            return Err(imagent_core::CoreError::Platform(
-                "wecom",
-                format!(
-                    "ws_url 必须为 wss://（或 ws:// 仅 loopback）；收到 scheme={}, host={}：{}",
-                    parsed.scheme(),
-                    host,
-                    self.ws_url
-                ),
-            ));
-        }
-        info!(target: "wecom", host = %parsed.host_str().unwrap_or("?"), "ws 连接中");
+        // （测试/本地）。校验抽到 validate_ws_url，probe_credentials 复用同一条规则
+        // （setup 探针同样会把 secret 发往该地址，不能漏校验）。
+        validate_ws_url(&self.ws_url)?;
+        info!(
+            target: "wecom",
+            host = %url::Url::parse(&self.ws_url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_else(|| "?".into()),
+            "ws 连接中"
+        );
         let (ws_stream, _resp) = connect_async(&self.ws_url)
             .await
             .map_err(|e| imagent_core::CoreError::Platform("wecom", format!("ws connect: {e}")))?;
@@ -291,6 +279,31 @@ impl WeComWsClient {
     }
 }
 
+/// ws_url 安全校验（P2-L/P2-9）：远端必须 wss://（凭据保护），ws:// 仅允许
+/// loopback（测试/本地）。用 url::Url 解析真实 host 精确比较，避免 contains
+/// 子串匹配被 `ws://localhost.evil.com` / `ws://evil.com/?to=127.0.0.1` 绕过。
+/// `connect_and_serve` 与 `probe_credentials` 共用——探针同样携带 secret，
+/// 不校验会把凭据发往 `ws://evil.com` 之类明文非预期地址。
+fn validate_ws_url(ws_url: &str) -> imagent_core::Result<()> {
+    let parsed = url::Url::parse(ws_url)
+        .map_err(|e| imagent_core::CoreError::Platform("wecom", format!("invalid ws_url: {e}")))?;
+    let host = parsed.host_str().unwrap_or("");
+    let is_loopback = matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1");
+    let host_ok = parsed.scheme() == "wss" || (parsed.scheme() == "ws" && is_loopback);
+    if !matches!(parsed.scheme(), "wss" | "ws") || !host_ok {
+        return Err(imagent_core::CoreError::Platform(
+            "wecom",
+            format!(
+                "ws_url 必须为 wss://（或 ws:// 仅 loopback）；收到 scheme={}, host={}：{}",
+                parsed.scheme(),
+                host,
+                ws_url
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// 凭据连通性探针（P6 遗留补齐，`imagent setup` 用）：建连 → 发 `aibot_subscribe`
 /// → 等 ack（errcode==0 即凭据有效）→ 直接返回，连接随 drop 关闭。
 /// 企微无独立 HTTP token 探针接口，WS subscribe ack 是唯一的凭据校验面——
@@ -300,6 +313,9 @@ pub async fn probe_credentials(
     secret: &str,
     ws_url: &str,
 ) -> imagent_core::Result<()> {
+    // 探针携带 secret 建连，与 connect_and_serve 复用同一 wss/loopback 校验，
+    // 防止 setup 阶段把凭据发往明文非预期地址。
+    validate_ws_url(ws_url)?;
     let sub = build_subscribe_frame(bot_id, secret);
     let sub_json = frame_to_string(&sub).map_err(|e| {
         imagent_core::CoreError::Platform("wecom", format!("serialize subscribe: {e}"))
@@ -387,5 +403,35 @@ mod tests {
     async fn probe_credentials_fails_fast_on_unreachable() {
         let res = probe_credentials("b", "s", "ws://127.0.0.1:1").await;
         assert!(res.is_err(), "不可达地址应 Err：{res:?}");
+    }
+
+    /// ws_url 安全校验（connect_and_serve 与 probe_credentials 共用规则）：
+    /// wss 任意 host 放行；ws 仅 loopback 放行；其它 scheme / 明文远端拒绝。
+    #[test]
+    fn validate_ws_url_rules() {
+        assert!(validate_ws_url("wss://example.com/path").is_ok());
+        assert!(validate_ws_url("ws://127.0.0.1:8080").is_ok());
+        assert!(validate_ws_url("ws://localhost:9000").is_ok());
+        assert!(validate_ws_url("ws://[::1]:8080").is_ok());
+        // 明文非 loopback（探针/长连接都会把 secret 发往该地址）必须拒绝。
+        assert!(validate_ws_url("ws://evil.com").is_err());
+        // 子串绕过：host 精确比较，`localhost.evil.com` / query 带 127.0.0.1 不放行。
+        assert!(validate_ws_url("ws://localhost.evil.com").is_err());
+        assert!(validate_ws_url("ws://evil.com/?to=127.0.0.1").is_err());
+        // 非 ws/wss scheme 拒绝。
+        assert!(validate_ws_url("http://127.0.0.1").is_err());
+        assert!(validate_ws_url("https://example.com").is_err());
+        // 非法 URL 拒绝。
+        assert!(validate_ws_url("not a url").is_err());
+    }
+
+    /// S8：凭据探针在建连前先过 wss/loopback 校验——明文非预期地址直接 Err，
+    /// 不会把 secret 发出去（也不会走到 TCP 连接）。
+    #[tokio::test]
+    async fn probe_credentials_rejects_non_wss_remote() {
+        let res = probe_credentials("b", "s", "ws://evil.com").await;
+        assert!(res.is_err(), "明文远端应在校验层被拒：{res:?}");
+        let msg = format!("{}", res.unwrap_err());
+        assert!(msg.contains("wss"), "错误信息应说明 wss 要求：{msg}");
     }
 }

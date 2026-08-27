@@ -24,6 +24,19 @@ fn resolve_mention_target<'a>(arg: &str, mentions: &'a [Mention]) -> Option<&'a 
 }
 
 impl Dispatcher {
+    /// S2：管理命令被拒时的提示文案——admin_senders 为空（= 无人是管理员）时
+    /// 附配置引导，避免用户误以为白名单用户仍可操作。
+    fn admin_denied_reply(&self, action: &str) -> String {
+        if self.admin_senders.read().is_empty() {
+            format!(
+                "仅管理员（admin_senders）可{action}。当前 admin_senders 为空（无人是管理员），\
+                 请在本地通过 CLI（`imagent setup` 或 config.toml 的 admin_senders）配置后再使用管理命令。"
+            )
+        } else {
+            format!("仅管理员（admin_senders）可{action}。")
+        }
+    }
+
     /// /allow <id|@名字> —— 授权新用户（admin 门槛 + 审计 + 持久化失败告警）。
     /// P6-2：@提及形态由 [`resolve_mention_target`] 从消息元数据反解 open_id。
     pub(super) async fn cmd_allow(
@@ -57,11 +70,10 @@ impl Dispatcher {
                 .await;
         } else {
             let actor = sender.0.as_str();
-            // P2-D：仅管理员可授权新用户（admin_senders 非空时严格；
-            // 空则向后兼容所有白名单用户可）。
+            // P2-D/S2：仅管理员可授权新用户（admin_senders 空 = 无人是管理员）。
             if !self.is_admin(actor) {
-                self.reply(conv, "仅管理员（admin_senders）可授权新用户。", hint)
-                    .await;
+                let msg = self.admin_denied_reply("授权新用户");
+                self.reply(conv, &msg, hint).await;
                 return;
             }
             let added = self.auth.allow(&target);
@@ -112,8 +124,8 @@ impl Dispatcher {
         // 任何过门用户（含群内陌生成员）可把管理员本人踢出白名单（DoS）。
         // 与 /allow 的门槛对称。
         if !self.is_admin(&sender.0) {
-            self.reply(conv, "仅管理员（admin_senders）可撤销授权。", hint)
-                .await;
+            let msg = self.admin_denied_reply("撤销授权");
+            self.reply(conv, &msg, hint).await;
             return;
         }
         let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
@@ -223,8 +235,8 @@ impl Dispatcher {
             // 群列表时如实报错）。逐群内存 + store 双写，汇总回执。
             "allow-all" | "allow-all-groups" => {
                 if !self.is_admin(actor) {
-                    self.reply(conv, "仅管理员（admin_senders）可批量放行群。", hint)
-                        .await;
+                    let msg = self.admin_denied_reply("批量放行群");
+                    self.reply(conv, &msg, hint).await;
                     return;
                 }
                 match self.platform.list_joined_chats().await {
@@ -283,8 +295,8 @@ impl Dispatcher {
             }
             "allow" | "deny" => {
                 if !self.is_admin(actor) {
-                    self.reply(conv, "仅管理员（admin_senders）可管理会话白名单。", hint)
-                        .await;
+                    let msg = self.admin_denied_reply("管理会话白名单");
+                    self.reply(conv, &msg, hint).await;
                     return;
                 }
                 let target = parts
@@ -376,8 +388,10 @@ impl Dispatcher {
             "" | "list" => {
                 let admins = self.admin_senders.read().clone();
                 let text = if admins.is_empty() {
-                    "管理员列表为空（= 所有白名单用户都具备管理权，P2-D 向后兼容语义）。\
-                     /admin add <id|@名字> 可收紧。"
+                    // S2：空列表 = 无人是管理员（收紧后 IM 内无法自助设立首位
+                    // 管理员——防任意白名单成员自扩权）。
+                    "管理员列表为空（= 无人是管理员，IM 内管理命令不可用）。\
+                     请在本地通过 CLI（`imagent setup` 或 config.toml 的 admin_senders）配置。"
                         .to_string()
                 } else {
                     format!("管理员（{}）：{}", admins.len(), admins.join(", "))
@@ -386,7 +400,8 @@ impl Dispatcher {
             }
             "add" | "remove" => {
                 if !self.is_admin(actor) {
-                    self.reply(conv, "仅管理员可管理管理员列表。", hint).await;
+                    let msg = self.admin_denied_reply("管理管理员列表");
+                    self.reply(conv, &msg, hint).await;
                     return;
                 }
                 let arg = parts.get(2).map(|s| s.trim()).unwrap_or("");
@@ -416,9 +431,8 @@ impl Dispatcher {
                     arg.to_string()
                 };
                 if sub == "add" {
-                    // 防自锁：向后兼容模式下（列表空 = 全员可管）设立首位管理员会
-                    // 立即收回操作者权限——空 → 非空转换时把操作者一并加入
-                    //（对齐参考项目「创建者不可自锁」语义）。
+                    // 防自锁（历史路径，S2 收紧后列表非空才会走到这里，保留
+                    // 兜底）：设立首位管理员时把操作者一并加入（防自锁）。
                     let (added, auto_self) = {
                         let mut list = self.admin_senders.write();
                         let was_empty = list.is_empty();
@@ -512,7 +526,8 @@ impl Dispatcher {
                         )
                         .await;
                     let empty_warn = if self.admin_senders.read().is_empty() {
-                        "\n⚠️ 管理员列表已清空 = 所有白名单用户都具备管理权（含 /allow /config /admin）。"
+                        // S2：清空 = 无人是管理员（IM 内管理命令将不可用）。
+                        "\n⚠️ 管理员列表已清空 = 无人是管理员，IM 内管理命令将不可用（含 /allow /config /admin）；需在本地 CLI 重新配置。"
                     } else {
                         ""
                     };
@@ -629,8 +644,8 @@ impl Dispatcher {
             return;
         }
         if !self.is_admin(&sender.0) {
-            self.reply(conv, "仅管理员（admin_senders）可修改配置。", hint)
-                .await;
+            let msg = self.admin_denied_reply("修改配置");
+            self.reply(conv, &msg, hint).await;
             return;
         }
         let result = self.apply_config_kv(key, value).await;
@@ -720,8 +735,8 @@ impl Dispatcher {
         // P5-2（安全）：权限模式影响全局审批策略（热切 off 即拆掉 IM
         // 审批闭环），与 /config 同级敏感，须管理员。
         if !self.is_admin(&sender.0) {
-            self.reply(conv, "仅管理员（admin_senders）可修改权限模式。", hint)
-                .await;
+            let msg = self.admin_denied_reply("修改权限模式");
+            self.reply(conv, &msg, hint).await;
             return;
         }
         match arg {

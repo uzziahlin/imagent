@@ -36,6 +36,7 @@ async fn conv_lock_released_on_backend_failure() {
     let (plat, inbox, send_count) = MockPlatform::new();
     let (back, _calls, _prompts, _order) = MockBackend::new_failing();
     let (store, _db) = tmp_store().await;
+    let admins = auth.snapshot();
     let disp = Arc::new(Dispatcher::new(
         Arc::new(plat),
         Arc::new(back),
@@ -46,7 +47,7 @@ async fn conv_lock_released_on_backend_failure() {
         PermissionMode::Off,
         test_budgets(),
         CotDetail::Brief,
-        vec![],
+        admins,
     ));
     disp.handle(msg("c1", "u1", "hello")).await;
     // 失败路径 release 后，conv_locks 应为空（c1 已被移除，非永久泄漏）。
@@ -401,6 +402,9 @@ async fn build_with_workdir(auth: Auth, default_workdir: std::path::PathBuf) -> 
     let (back, calls, prompts, order) = MockBackend::new();
     let (store, db) = tmp_store().await;
 
+    // S2：admin_senders 空 = 无人是管理员——测试默认把白名单 sender 全设为
+    // admin，保持既有用例（alice /allow 等）语义不变。
+    let admins = auth.snapshot();
     let disp = Arc::new(Dispatcher::new(
         Arc::new(plat),
         Arc::new(back),
@@ -411,7 +415,7 @@ async fn build_with_workdir(auth: Auth, default_workdir: std::path::PathBuf) -> 
         PermissionMode::Off,
         test_budgets(),
         CotDetail::Brief,
-        vec![], // admin_senders 空 = 测试用向后兼容（所有白名单用户可 /allow）
+        admins,
     ));
 
     Ctx {
@@ -430,6 +434,7 @@ async fn build_non_terminal(auth: Auth) -> Ctx {
     let (back, calls, prompts, order) = MockBackend::new_non_terminal();
     let (store, db) = tmp_store().await;
 
+    let admins = auth.snapshot();
     let disp = Arc::new(Dispatcher::new(
         Arc::new(plat),
         Arc::new(back),
@@ -440,7 +445,7 @@ async fn build_non_terminal(auth: Auth) -> Ctx {
         PermissionMode::Off,
         test_budgets(),
         CotDetail::Brief,
-        vec![], // admin_senders 空 = 测试用向后兼容（所有白名单用户可 /allow）
+        admins,
     ));
 
     Ctx {
@@ -488,6 +493,7 @@ async fn build_with_tools(auth: Auth, tools: Vec<(String, String)>) -> Ctx {
     let (back, calls, prompts, order) = MockBackend::new_with_tools(tools).await;
     let (store, db) = tmp_store().await;
 
+    let admins = auth.snapshot();
     let disp = Arc::new(Dispatcher::new(
         Arc::new(plat),
         Arc::new(back),
@@ -498,7 +504,7 @@ async fn build_with_tools(auth: Auth, tools: Vec<(String, String)>) -> Ctx {
         PermissionMode::Off,
         test_budgets(),
         CotDetail::Brief,
-        vec![], // admin_senders 空 = 测试用向后兼容（所有白名单用户可 /allow）
+        admins, // S2：测试默认白名单全员 = admin
     ));
 
     Ctx {
@@ -532,6 +538,7 @@ async fn build_with_local(auth: Auth, local: Vec<LocalSession>) -> Ctx {
     let (back, calls, prompts, order) = MockBackend::new_with_local(local).await;
     let (store, db) = tmp_store().await;
 
+    let admins = auth.snapshot();
     let disp = Arc::new(Dispatcher::new(
         Arc::new(plat),
         Arc::new(back),
@@ -542,7 +549,7 @@ async fn build_with_local(auth: Auth, local: Vec<LocalSession>) -> Ctx {
         PermissionMode::Off,
         test_budgets(),
         CotDetail::Brief,
-        vec![],
+        admins,
     ));
 
     Ctx {
@@ -561,6 +568,7 @@ async fn build_slow(auth: Auth, slow_ms: u64, budgets: TaskBudgets) -> Ctx {
     let (back, calls, prompts, order) = MockBackend::new_slow(slow_ms);
     let (store, db) = tmp_store().await;
 
+    let admins = auth.snapshot();
     let disp = Arc::new(Dispatcher::new(
         Arc::new(plat),
         Arc::new(back),
@@ -571,7 +579,7 @@ async fn build_slow(auth: Auth, slow_ms: u64, budgets: TaskBudgets) -> Ctx {
         PermissionMode::Off,
         budgets,
         CotDetail::Brief,
-        vec![],
+        admins,
     ));
 
     Ctx {
@@ -592,6 +600,7 @@ async fn build_slow_with_session(auth: Auth, slow_ms: u64, sid: &str, budgets: T
     let (back, calls, prompts, order) = MockBackend::new_slow_with_session(slow_ms, sid);
     let (store, db) = tmp_store().await;
 
+    let admins = auth.snapshot();
     let disp = Arc::new(Dispatcher::new(
         Arc::new(plat),
         Arc::new(back),
@@ -602,7 +611,7 @@ async fn build_slow_with_session(auth: Auth, slow_ms: u64, sid: &str, budgets: T
         PermissionMode::Off,
         budgets,
         CotDetail::Brief,
-        vec![],
+        admins,
     ));
 
     Ctx {
@@ -622,6 +631,7 @@ async fn build_streaming(auth: Auth, texts: Vec<String>) -> Ctx {
     let (back, calls, prompts, order) = MockBackend::new_streaming(texts);
     let (store, db) = tmp_store().await;
 
+    let admins = auth.snapshot();
     let disp = Arc::new(Dispatcher::new(
         Arc::new(plat),
         Arc::new(back),
@@ -632,7 +642,7 @@ async fn build_streaming(auth: Auth, texts: Vec<String>) -> Ctx {
         PermissionMode::Off,
         test_budgets(),
         CotDetail::Brief,
-        vec![],
+        admins,
     ));
 
     Ctx {
@@ -652,6 +662,7 @@ async fn build_announce_fail(auth: Auth, sid: &str) -> Ctx {
     let (back, calls, prompts, order) = MockBackend::new_announce_then_fail(sid);
     let (store, db) = tmp_store().await;
 
+    let admins = auth.snapshot();
     let disp = Arc::new(Dispatcher::new(
         Arc::new(plat),
         Arc::new(back),
@@ -662,7 +673,7 @@ async fn build_announce_fail(auth: Auth, sid: &str) -> Ctx {
         PermissionMode::Off,
         test_budgets(),
         CotDetail::Brief,
-        vec![],
+        admins,
     ));
 
     Ctx {
@@ -1025,12 +1036,12 @@ async fn allow_command_mention_unresolvable_hints() {
 async fn admin_command_add_remove_list() {
     let _serial = SERIAL.lock().await;
     let ctx = build(Auth::new(vec!["alice".into()])).await;
-    // 列表（空 = 向后兼容语义提示）。
+    // 列表（build 默认 admins = 白名单快照 = [alice]）。
     feed_and_wait(&ctx, vec![msg("c", "alice", "/admin")], 1).await;
     let inbox = ctx.inbox.lock().await.clone();
     assert!(
-        inbox.iter().any(|t| t.contains("管理员列表为空")),
-        "空列表应说明语义: {inbox:?}"
+        inbox.iter().any(|t| t.contains("管理员（1）：alice")),
+        "应列出当前管理员: {inbox:?}"
     );
     // add bob → 回执 + 列表出现；首位管理员设立时操作者一并加入（防自锁）。
     feed_and_wait(&ctx, vec![msg("c", "alice", "/admin add bob")], 1).await;
@@ -2312,10 +2323,67 @@ async fn permission_reply_gate_checks_sender() {
         !ctx.disp.can_route_permission_reply(&msg("c1", "bob", "y")),
         "非白名单 sender 的审批回复不得被路由"
     );
-    // 会话（群）白名单放行：群内成员可路由（与 handle() 的鉴权门一致）。
+    // S1 收紧：仅会话（群）白名单不再足够——群被加白后任意成员发 "y" 即可批准
+    // 高危工具；群成员的回复不得被路由，须显式加入 sender 白名单（或为 admin）。
+    assert!(
+        !ctx
+            .disp
+            .can_route_permission_reply(&msg("c-group", "stranger", "y")),
+        "仅群白名单（sender 未加白）不得路由审批回复"
+    );
+    // 白名单 sender 在群里：可路由。
     assert!(ctx
         .disp
-        .can_route_permission_reply(&msg("c-group", "stranger", "y")));
+        .can_route_permission_reply(&msg("c-group", "alice", "y")));
+    drop_db(ctx.db).await;
+}
+
+/// S2：admin_senders 为空 = 无人是管理员——白名单用户 /allow、/admin 均被拒，
+/// 并给出 CLI 配置引导；is_admin 对任何人（含白名单）返回 false。
+#[tokio::test]
+async fn empty_admin_senders_means_no_admin() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build_with_admin(Auth::new(vec!["alice".into()]), vec![]).await;
+    assert!(
+        !ctx.disp.is_admin("alice"),
+        "空 admin_senders：白名单用户也不是管理员"
+    );
+    ctx.disp.handle(msg("c", "alice", "/allow bob")).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox
+            .iter()
+            .any(|t| t.contains("无人是管理员") && t.contains("admin_senders")),
+        "应说明空列表语义与配置途径: {inbox:?}"
+    );
+    assert!(!ctx.disp.auth().is_allowed(&UserId("bob".into())));
+    drop_db(ctx.db).await;
+}
+
+/// D7：/resume 序号缓存按 (conv, sender) 隔离——alice 列过表后，未列过表的
+/// bob 不能用序号选中（旧按 conv 共享缓存会互相消费/覆盖）。
+#[tokio::test]
+async fn resume_cache_isolated_per_sender() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into(), "bob".into()])).await;
+    feed_and_wait(&ctx, vec![msg("c1", "alice", "first")], 1).await;
+    // alice 列表（缓存写入 alice 名下）。
+    ctx.disp.handle(msg("c1", "alice", "/resume")).await;
+    // bob 未列过表：序号选择应无效（不得吃到 alice 的缓存）。
+    ctx.disp.handle(msg("c1", "bob", "/resume 1")).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.iter().any(|t| t.contains("序号无效")),
+        "bob 不应消费 alice 的序号缓存: {inbox:?}"
+    );
+    drop(inbox);
+    // alice 自己仍可用序号选中。
+    ctx.disp.handle(msg("c1", "alice", "/resume 1")).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.iter().any(|t| t.contains("已接管会话")),
+        "alice 应能消费自己的缓存: {inbox:?}"
+    );
     drop_db(ctx.db).await;
 }
 
