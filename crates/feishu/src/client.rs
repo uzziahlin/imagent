@@ -112,12 +112,28 @@ fn jittered_backoff(base: Duration, factor: f64) -> Duration {
 /// 两种错误串形态都要覆盖：手写 HTTP 路径（"HTTP 429" / "code=230020"）与
 /// SDK 路径（open-lark `ApiError` Display = "API错误 {raw_code} {endpoint}: {msg}"，
 /// raw_code 即飞书业务码或合成 HTTP status；业务变体则 Debug 打印枚举名）。
-fn is_rate_limited_msg(msg: &str) -> bool {
+pub(crate) fn is_rate_limited_msg(msg: &str) -> bool {
     msg.contains("HTTP 429")
         || msg.contains("code=230020")
         || msg.contains("API错误 429")
         || msg.contains("API错误 230020")
         || msg.contains("业务错误 TooManyRequests")
+}
+
+/// 识别「卡片不存在/已删除」类错误（流式卡自愈用，platform 层据此清缓存 +
+/// 回报 CARD_HANDLE_LOST 让 core 重发新卡）。
+///
+/// 覆盖形态（离线按飞书错误码知识取「不存在」类，**待真机校准**补全清单）：
+/// - im 消息 patch：`code=230002`（消息/卡片不存在）、msg 含 "not exist"；
+/// - CardKit element/settings patch：卡片实体被删后同样回 230002 形态信封；
+/// - SDK ApiError Display 形态（"API错误 230002 …"）。
+///
+/// 刻意不含 300317（sequence 落后，另有自愈路径）与 300318 等。
+pub(crate) fn is_card_not_exist_msg(msg: &str) -> bool {
+    msg.contains("code=230002")
+        || msg.contains("API错误 230002")
+        || msg.to_ascii_lowercase().contains("card not exist")
+        || msg.contains("卡片不存在")
 }
 
 /// 识别 token 失效类错误码（99991661-64/68/79：tenant/app access token 空、格式错、
@@ -329,6 +345,10 @@ pub async fn create_card_entity(token: &str, card_json: &str) -> imagent_core::R
 ///
 /// 仅 markdown 组件可用（`element_id` 对应初始卡片中带 element_id 的 markdown 组件）；
 /// 服务端旧文本是新文本前缀时增量打字机输出，否则全量上屏。
+/// **不重试**（限流丢帧策略，安全批次）：429/230020 立即返回错误（含可被
+/// [`is_rate_limited_msg`] 识别的标记），由调用方丢弃本帧——流式主循环不能被
+/// 退避 sleep 阻塞（会卡住 agent chunk 消费），下个节流窗自然再发新帧。普通
+/// 发送消息类调用仍走 retry_on_rate_limit（用户可见消息不能丢）。
 pub async fn patch_card_element(
     token: &str,
     card_id: &str,
@@ -336,49 +356,46 @@ pub async fn patch_card_element(
     content: &str,
     sequence: i64,
 ) -> imagent_core::Result<()> {
-    retry_on_rate_limit!(async {
-        // 真机校准（2026-08）：请求体须为 `partial_element`——组件新配置的 **JSON
-        // 字符串**（双重编码，同 create 实体的 card_json）；此前直传 `content` 字段
-        // 被 99992402 "field validation failed" 拒绝。
-        let partial = json!({ "content": content }).to_string();
-        let client = reqwest::Client::new();
-        let resp = client
-            .patch(format!(
-                "{CARDKIT_BASE}/cards/{card_id}/elements/{element_id}"
-            ))
-            .bearer_auth(token)
-            .json(&json!({ "partial_element": partial, "sequence": sequence }))
-            .send()
-            .await
-            .map_err(|e| {
-                imagent_core::CoreError::Platform(PLATFORM, format!("patch_card_element: {e}"))
-            })?;
-        cardkit_resp(resp, "patch_card_element").await.map(|_| ())
-    })
+    // 真机校准（2026-08）：请求体须为 `partial_element`——组件新配置的 **JSON
+    // 字符串**（双重编码，同 create 实体的 card_json）；此前直传 `content` 字段
+    // 被 99992402 "field validation failed" 拒绝。
+    let partial = json!({ "content": content }).to_string();
+    let client = reqwest::Client::new();
+    let resp = client
+        .patch(format!(
+            "{CARDKIT_BASE}/cards/{card_id}/elements/{element_id}"
+        ))
+        .bearer_auth(token)
+        .json(&json!({ "partial_element": partial, "sequence": sequence }))
+        .send()
+        .await
+        .map_err(|e| {
+            imagent_core::CoreError::Platform(PLATFORM, format!("patch_card_element: {e}"))
+        })?;
+    cardkit_resp(resp, "patch_card_element").await.map(|_| ())
 }
 
 /// 更新卡片配置（结束流式：`settings_json` 传 `{"config":{"streaming_mode":false}}`）。
 ///
 /// `sequence` 与 element PATCH **共用**同一 card_id 的严格递增计数（不递增报 300317）。
+/// **不重试**（限流丢帧策略，语义同 [`patch_card_element`] 的说明）。
 pub async fn patch_card_settings(
     token: &str,
     card_id: &str,
     settings_json: &str,
     sequence: i64,
 ) -> imagent_core::Result<()> {
-    retry_on_rate_limit!(async {
-        let client = reqwest::Client::new();
-        let resp = client
-            .patch(format!("{CARDKIT_BASE}/cards/{card_id}/settings"))
-            .bearer_auth(token)
-            .json(&json!({ "settings": settings_json, "sequence": sequence }))
-            .send()
-            .await
-            .map_err(|e| {
-                imagent_core::CoreError::Platform(PLATFORM, format!("patch_card_settings: {e}"))
-            })?;
-        cardkit_resp(resp, "patch_card_settings").await.map(|_| ())
-    })
+    let client = reqwest::Client::new();
+    let resp = client
+        .patch(format!("{CARDKIT_BASE}/cards/{card_id}/settings"))
+        .bearer_auth(token)
+        .json(&json!({ "settings": settings_json, "sequence": sequence }))
+        .send()
+        .await
+        .map_err(|e| {
+            imagent_core::CoreError::Platform(PLATFORM, format!("patch_card_settings: {e}"))
+        })?;
+    cardkit_resp(resp, "patch_card_settings").await.map(|_| ())
 }
 
 /// 发送引用卡片实体的 interactive 消息，返回 message_id。
@@ -788,6 +805,27 @@ pub async fn reply_comment(
     comment_id: &str,
     text: &str,
 ) -> imagent_core::Result<()> {
+    reply_comment_nodes(
+        core_config,
+        token,
+        file_token,
+        comment_id,
+        serde_json::json!([{ "type": "text", "text": text }]),
+    )
+    .await
+}
+
+/// [`reply_comment`] 的内容实体数组版：`content_nodes` 为与事件侧 content 同构的
+/// JSON 数组（text / at / img 等节点）。评论线程发图用——img 实体带上传产出的
+/// image_key（**待真机校准**：离线无法确认评论 img 实体的资源字段名，先按
+/// `{"type":"img","file_key":<image_key>}` 最合理形态实现，真机如被拒再校准）。
+pub async fn reply_comment_nodes(
+    core_config: &CoreConfig,
+    token: &str,
+    file_token: &str,
+    comment_id: &str,
+    content_nodes: serde_json::Value,
+) -> imagent_core::Result<()> {
     retry_on_rate_limit!(async {
         let base = core_config.base_url().trim_end_matches('/').to_string();
         let url = format!(
@@ -797,9 +835,7 @@ pub async fn reply_comment(
         let resp = client
             .post(&url)
             .bearer_auth(token)
-            .json(&serde_json::json!({
-                "content": [{ "type": "text", "text": text }]
-            }))
+            .json(&serde_json::json!({ "content": content_nodes }))
             .send()
             .await
             .map_err(|e| {
@@ -938,6 +974,28 @@ mod tests {
             "网络错误: connection refused",
         ] {
             assert!(!is_token_invalid_msg(miss), "不应识别: {miss}");
+        }
+    }
+
+    /// 卡片不存在类错误识别（流式卡自愈触发条件）：im patch 的 230002 各错误串
+    /// 形态都要命中；300317（sequence 落后，另有自愈）与普通错误不误伤。
+    #[test]
+    fn card_not_exist_msg_detection() {
+        for hit in [
+            "patch_card: code=230002 msg=card not exist",
+            "patch_card_element: code=230002 msg=...",
+            "API错误 230002 response: message not found",
+            "patch_card: Card not exist",
+            "patch_card: 卡片不存在",
+        ] {
+            assert!(is_card_not_exist_msg(hit), "应识别: {hit}");
+        }
+        for miss in [
+            "patch_card_element: code=300317 msg=sequence error",
+            "send_card: code=230020 too many request",
+            "网络错误: connection refused",
+        ] {
+            assert!(!is_card_not_exist_msg(miss), "不应识别: {miss}");
         }
     }
 

@@ -28,6 +28,13 @@ pub enum ReplyHint {
     None,
 }
 
+/// 流式卡片句柄丢失标记（错误串哨兵）：平台侧 patch 遇「卡片不存在/已删除」类
+/// 错误时，清自身缓存后返回**错误串含本标记**的错误——core 的 CardSession 据此
+/// 摘除 live_cards 登记并把 msg_id 置空（下帧重发新卡），启动扫描据此作废登记
+/// （终止无限重试）。用字符串哨兵而非新错误变体：错误跨 `Platform` trait 边界
+/// 统一为 `CoreError`，变体拆分需动全部平台。
+pub const CARD_HANDLE_LOST: &str = "imagent:card-handle-lost";
+
 /// 媒体引用（ilink 入站媒体已下载落盘到 `~/.imagent/media/`，url 为本地路径）。
 #[derive(Debug, Clone)]
 pub struct MediaRef {

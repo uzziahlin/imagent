@@ -121,7 +121,7 @@ pub fn render_card(card: &OutboundCard, conv_id: &str) -> String {
     }));
     // Running 态带终止按钮（终态移除——整卡 patch 每次重渲染，自然消失）。
     if streaming {
-        elements.push(stop_button(conv_id));
+        elements.push(stop_button(conv_id, None));
     }
 
     // Running 态带自定义 summary（卡片列表预览/通知处显示，默认「生成中」）；
@@ -164,11 +164,31 @@ fn render_tool_panel(tools: &[ToolCall]) -> serde_json::Value {
     })
 }
 
+/// 命令按钮 value 公共字段：命令 + conv + `ts`（epoch 秒，proto 回调侧超 24h 拒
+/// 绝——卡片长期滞留 IM，过期上下文的命令点击应明确提示而非照旧执行）。
+/// `sender`（发起轮次用户 open_id，群 conv 下校验点击者）仅终止按钮携带——命令
+/// 卡按钮无「发起者」语义（命令卡由命令回执触发，非轮次锚定）。
+fn cmd_value(conv_id: &str, command: &str, sender: Option<&str>) -> serde_json::Value {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut v = serde_json::json!({
+        "imagent_cmd": command, "conv": conv_id, "ts": ts
+    });
+    if let Some(s) = sender.filter(|s| !s.is_empty()) {
+        v["sender"] = serde_json::json!(s);
+    }
+    v
+}
+
 /// ⏹ 终止按钮（lcab stopButton 同款）：Running 态挂在卡片底部，点击回调注入
-/// `/stop`（imagent_cmd 机制，走与手打命令相同的鉴权/分派）。managed 卡终态后
-/// 按钮无法移除（element PATCH 只能动 markdown）——点击回「当前没有运行中的
-/// 任务」，无害。
-fn stop_button(conv_id: &str) -> serde_json::Value {
+/// `/stop`（imagent_cmd 机制，走与手打命令相同的鉴权/分派）。`sender` 为发起
+/// 轮次的用户 open_id——群 conv 下 proto 回调校验点击者须为发起者本人（他人
+/// 点击回「仅发起者可操作」）；私聊不校验（单人）。
+/// managed 卡终态后按钮无法移除（element PATCH 只能动 markdown）——点击回
+/// 「当前没有运行中的任务」，无害。
+fn stop_button(conv_id: &str, sender: Option<&str>) -> serde_json::Value {
     serde_json::json!({
         "tag": "column_set", "flex_mode": "flow", "horizontal_spacing": "default",
         "columns": [{
@@ -177,9 +197,7 @@ fn stop_button(conv_id: &str) -> serde_json::Value {
                 "tag": "button",
                 "text": { "tag": "plain_text", "content": "⏹ 终止" },
                 "type": "danger",
-                "behaviors": [{ "type": "callback", "value": {
-                    "imagent_cmd": "/stop", "conv": conv_id
-                } }]
+                "behaviors": [{ "type": "callback", "value": cmd_value(conv_id, "/stop", sender) }]
             }]
         }]
     })
@@ -240,7 +258,7 @@ fn panel_header(title_md: &str) -> serde_json::Value {
 ///
 /// 正文 markdown 组件带固定 `element_id = md_body`（后续 element PATCH 的锚点），
 /// 初始内容为空；footer 独立组件体现执行中。`config` 开启流式模式 + 自定义摘要。
-pub fn render_stream_init_card(conv_id: &str) -> String {
+pub fn render_stream_init_card(conv_id: &str, sender: Option<&str>) -> String {
     serde_json::json!({
         "schema": "2.0",
         "config": {
@@ -252,7 +270,7 @@ pub fn render_stream_init_card(conv_id: &str) -> String {
             { "tag": "markdown", "element_id": "md_footer", "content": "🧠 思考中…", "text_size": "notation" },
             // P9-1：⏹ 终止按钮常驻（element PATCH 只更新 markdown，按钮不受流式
             // 影响；终态后仍在，点击回「当前没有运行中的任务」，无害）。
-            stop_button(conv_id)
+            stop_button(conv_id, sender)
         ] }
     })
     .to_string()
@@ -726,7 +744,7 @@ pub fn render_command_card(
     let btns: Vec<serde_json::Value> = buttons
         .iter()
         .map(|b| {
-            let value = serde_json::json!({ "imagent_cmd": b.command, "conv": conv_id });
+            let value = cmd_value(conv_id, &b.command, None);
             // danger 按钮带二次确认弹窗（误触破坏性命令的最后一道闸）。
             if matches!(b.style, CardButtonStyle::Danger) {
                 cb_button_confirm(
@@ -1190,11 +1208,41 @@ mod tests {
         );
     }
 
+    /// 命令按钮 value 带 ts（过期拒绝）与终止按钮的 sender（发起者校验）。
+    #[test]
+    fn cmd_button_value_carries_ts_and_sender() {
+        let init = render_stream_init_card("feishu:oc_g", Some("ou_owner"));
+        assert!(
+            init.contains("\"sender\":\"ou_owner\""),
+            "终止按钮带发起者: {init}"
+        );
+
+        assert!(
+            init.contains("\"imagent_cmd\":\"/stop\""),
+            "命令编码: {init}"
+        );
+        // 无发起者（私聊/未知）不编码 sender。
+        let init2 = render_stream_init_card("feishu:ou_t", None);
+        assert!(!init2.contains("\"sender\":"), "无 sender 不编码: {init2}");
+        // 命令卡按钮带 ts。
+        let json = render_command_card(
+            "t",
+            "b",
+            &[CardButton {
+                label: "x".into(),
+                command: "/stop".into(),
+                style: CardButtonStyle::Default,
+            }],
+            "feishu:oc_g",
+        );
+        assert!(json.contains("\"ts\":"), "命令卡 ts: {json}");
+    }
+
     /// P9-1：流式卡终止按钮——init 卡与降级 Running 卡都带 ⏹ 终止（danger，
     /// 回调注入 /stop + conv 编码）；终态不带。
     #[test]
     fn stop_button_on_running_cards_only() {
-        let init = render_stream_init_card("feishu:ou_t");
+        let init = render_stream_init_card("feishu:ou_t", None);
         assert!(init.contains("⏹ 终止"), "init 卡终止按钮: {init}");
         assert!(
             init.contains("\"imagent_cmd\":\"/stop\""),
@@ -1267,7 +1315,7 @@ mod tests {
 
     #[test]
     fn stream_init_card_has_element_id_and_streaming() {
-        let json = render_stream_init_card("feishu:ou_t");
+        let json = render_stream_init_card("feishu:ou_t", None);
         assert!(json.contains("element_id"), "初始卡应含 element_id: {json}");
         assert!(json.contains("md_body"), "正文组件锚点: {json}");
         assert!(json.contains("\"streaming_mode\":true"), "应开流式: {json}");
@@ -1506,7 +1554,7 @@ mod tests {
     /// 空正文占位：init 卡与流式 md 均为明确状态语（非「…」）。
     #[test]
     fn empty_body_placeholder_is_explicit() {
-        let init = render_stream_init_card("feishu:ou_t");
+        let init = render_stream_init_card("feishu:ou_t", None);
         assert!(
             init.contains("🧠 已接收任务，正在处理"),
             "init 卡状态语: {init}"

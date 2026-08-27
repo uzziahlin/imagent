@@ -273,7 +273,55 @@ impl CardSession {
                 }
                 Err(e) => Err(e),
             },
-            Some(mid) => platform.update_card(conv, mid, &card, hint).await,
+            Some(mid) => match platform.update_card(conv, mid, &card, hint).await {
+                // 句柄丢失自愈：平台回报「卡片不存在/已删除」（错误串含
+                // CARD_HANDLE_LOST 哨兵，见 types.rs）——原卡片被用户删除/撤回后
+                // patch 永远失败。摘除 live_cards 登记（终止启动扫描的无限重试）、
+                // 句柄置空，Running 期立即重发一张新卡（句柄换新，继续流式）；
+                // 终态不重发（轮次已结束，结论由 P5-11 纯文本兜底）。
+                Err(e) if e.to_string().contains(crate::types::CARD_HANDLE_LOST) => {
+                    warn!(
+                        target: "imagent::core",
+                        conv_id = %self.conv.0,
+                        "流式卡片已被删除/撤回（句柄丢失），重发新卡"
+                    );
+                    if let Err(clear_err) = self.store.clear_live_card(&self.conv.0).await {
+                        warn!(
+                            target: "imagent::core",
+                            error = %clear_err,
+                            "live_cards 摘除失败（句柄丢失自愈路径）"
+                        );
+                    }
+                    self.msg_id = None;
+                    if !matches!(terminal, CardTerminal::Running) {
+                        Err(e)
+                    } else {
+                        // 重发新卡（send_card 分支逻辑的等价重放——async fn 不能递归，
+                        // 此处内联）：失败如实返回由调用方兜底（warn + 下帧再试）。
+                        match platform.send_card(conv, &card, hint).await {
+                            Ok(id) => {
+                                self.msg_id = id;
+                                if let Some(h) = &self.msg_id {
+                                    if let Err(rec_err) = self
+                                        .store
+                                        .record_live_card(&self.conv.0, self.platform_name, h)
+                                        .await
+                                    {
+                                        warn!(
+                                            target: "imagent::core",
+                                            error = %rec_err,
+                                            "live_cards 重新登记失败（句柄丢失自愈路径）"
+                                        );
+                                    }
+                                }
+                                Ok(())
+                            }
+                            Err(send_err) => Err(send_err),
+                        }
+                    }
+                }
+                other => other,
+            },
         };
         let ok = match res {
             Ok(()) => true,
@@ -345,6 +393,12 @@ pub async fn sweep_live_cards(store: &Store, platform: &dyn Platform) {
             Ok(()) => {
                 let _ = store.clear_live_card(&row.conv_id).await;
                 info!(target: "imagent::core", conv_id = %row.conv_id, "孤儿卡片已关流");
+            }
+            // 句柄丢失（卡片已被用户删除/撤回）：patch 永远不可能成功——作废登记
+            // 而非保留（保留会让每次启动都重试一次注定失败的 patch，无限重试）。
+            Err(e) if e.to_string().contains(crate::types::CARD_HANDLE_LOST) => {
+                let _ = store.clear_live_card(&row.conv_id).await;
+                info!(target: "imagent::core", conv_id = %row.conv_id, "孤儿卡片已不存在（被删除/撤回），作废登记");
             }
             Err(e) => warn!(
                 target: "imagent::core",
@@ -600,6 +654,118 @@ mod tests {
         );
         let rows = store.list_live_cards().await.expect("list");
         assert!(rows.is_empty(), "两条登记都应清理: {rows:?}");
+        rm_db(&db);
+    }
+
+    /// 句柄丢失自愈（安全批次）：update_card 回报「卡片不存在」（错误串含
+    /// CARD_HANDLE_LOST 哨兵）→ 摘 live_cards + 句柄换新（Running 期立即重发新卡，
+    /// send_card 再次登记新句柄）；终态不重发（错误如实返回走 P5-11 文本兜底）。
+    /// 句柄丢失型平台 mock：首次 send_card 成功；update_card 一律回句柄丢失错误；
+    /// resend（第二次 send_card）成功返回新句柄并记录。
+    struct HandleLostPlatform {
+        sends: StdMutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Platform for HandleLostPlatform {
+        async fn recv(&self) -> Result<crate::types::InboundMessage> {
+            Err(CoreError::Platform("mock-hl", "无入站".into()))
+        }
+        async fn send_text(&self, _conv: &ConvId, _text: &str, _hint: &ReplyHint) -> Result<()> {
+            Ok(())
+        }
+        async fn send_media(
+            &self,
+            _conv: &ConvId,
+            _media: &crate::types::MediaRef,
+            _hint: &ReplyHint,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn name(&self) -> &'static str {
+            "mock-hl"
+        }
+        fn supports_streaming_card(&self, _conv: &ConvId) -> bool {
+            true
+        }
+        async fn send_card(
+            &self,
+            _conv: &ConvId,
+            _card: &OutboundCard,
+            _hint: &ReplyHint,
+        ) -> Result<Option<String>> {
+            let n = self.sends.lock().unwrap().len();
+            let h = format!("card:new{n}");
+            self.sends.lock().unwrap().push(h.clone());
+            Ok(Some(h))
+        }
+        async fn update_card(
+            &self,
+            _conv: &ConvId,
+            _handle: &str,
+            _card: &OutboundCard,
+            _hint: &ReplyHint,
+        ) -> Result<()> {
+            Err(CoreError::Platform(
+                "mock-hl",
+                format!(
+                    "patch_card: code=230002 msg=card not exist（{}）",
+                    crate::types::CARD_HANDLE_LOST
+                ),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_lost_resends_new_card_when_running() {
+        let (store, db) = tmp_store("handle-lost").await;
+        let plat = HandleLostPlatform {
+            sends: StdMutex::new(Vec::new()),
+        };
+        let conv = ConvId("c1".into());
+        let hint = ReplyHint::None;
+        let mut s = CardSession::new(store.clone(), conv.clone(), plat.name(), Default::default());
+        // 首帧：send_card 成功（句柄 card:new0），登记 live_cards。
+        s.append_text("第一段", &conv, &hint, &plat).await;
+        assert_eq!(
+            store.list_live_cards().await.unwrap()[0].handle,
+            "card:new0"
+        );
+        // 第二帧：update_card 回句柄丢失 → 摘登记 + 重发新卡（句柄换新再登记）。
+        s.append_text("第二段", &conv, &hint, &plat).await;
+        let sends = plat.sends.lock().unwrap().clone();
+        assert_eq!(
+            sends,
+            vec!["card:new0", "card:new1"],
+            "应重发新卡: {sends:?}"
+        );
+        let rows = store.list_live_cards().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].handle, "card:new1", "登记应更新为新句柄");
+        // 终态遇句柄丢失：不重发（send 次数不变），错误走 P5-11 文本兜底。
+        s.finalize(Some("结论"), &[], CardTerminal::Done, &conv, &hint, &plat)
+            .await;
+        let sends = plat.sends.lock().unwrap().clone();
+        assert_eq!(sends.len(), 2, "终态不重发新卡: {sends:?}");
+        rm_db(&db);
+    }
+
+    /// 启动扫描遇句柄丢失：登记作废删除（不再无限重试注定失败的 patch）。
+    #[tokio::test]
+    async fn sweep_drops_gone_card_registration() {
+        let (store, db) = tmp_store("sweep-gone").await;
+        store
+            .record_live_card("c1", "mock-hl", "card:gone")
+            .await
+            .unwrap();
+        let plat = HandleLostPlatform {
+            sends: StdMutex::new(Vec::new()),
+        };
+        sweep_live_cards(&store, &plat).await;
+        assert!(
+            store.list_live_cards().await.unwrap().is_empty(),
+            "句柄丢失登记应作废删除"
+        );
         rm_db(&db);
     }
 

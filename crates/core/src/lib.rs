@@ -45,5 +45,5 @@ pub use platform::{command_card_fallback_text, Platform};
 pub use types::{
     AgentChunk, CardButton, CardButtonStyle, CardPhase, CardTerminal, ConfigFormField, ConvId,
     InboundMessage, JoinedChat, LocalSession, MediaRef, Mention, OutboundCard, ReplyHint,
-    RunOutcome, SessionId, ToolCall, UsageStats, UserId, Workdir,
+    RunOutcome, SessionId, ToolCall, UsageStats, UserId, Workdir, CARD_HANDLE_LOST,
 };

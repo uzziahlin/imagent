@@ -21,6 +21,7 @@ use tracing::warn;
 use imagent_core::{
     command_card_fallback_text, split_message, CardButton, CardTerminal, ConvId, CoreError, Dedup,
     InboundMessage, JoinedChat, MediaRef, OutboundCard, Platform, ReplyHint, Result,
+    CARD_HANDLE_LOST,
 };
 
 use open_lark::{Config, CoreConfig};
@@ -31,29 +32,40 @@ use crate::card::{
 };
 use crate::client::{
     create_card_entity, download_file, download_image, fetch_bot_open_id, fetch_token,
-    list_joined_chats, patch_card, patch_card_element, patch_card_settings, reply_comment,
-    reply_message, send_card_msg, send_card_ref_msg, send_file_msg, send_image_msg, send_text_msg,
-    upload_file, upload_image, FeishuWsClient,
+    is_card_not_exist_msg, is_rate_limited_msg, list_joined_chats, patch_card, patch_card_element,
+    patch_card_settings, reply_comment, reply_comment_nodes, reply_message, send_card_msg,
+    send_card_ref_msg, send_file_msg, send_image_msg, send_text_msg, upload_file, upload_image,
+    FeishuWsClient,
 };
 use crate::proto::{
-    comment_target_from_conv, is_comment_event, is_group_message_event, parse_card_action_event,
-    parse_comment_event, parse_message_event, receive_target_from_conv, thread_target_from_conv,
-    ReceiveIdKind, COMMENT_CONV_PREFIX,
+    comment_target_from_conv, is_comment_event, is_group_message_event, is_private_conv,
+    parse_card_action_event, parse_comment_event, parse_message_event, receive_target_from_conv,
+    thread_key_of_payload, thread_target_from_conv, unsupported_message_notice, ReceiveIdKind,
+    COMMENT_CONV_PREFIX,
 };
 
 /// 平台名常量。
 const PLATFORM: &str = "feishu";
 /// 飞书单条文本消息 content 上限（保守值，留余量；精确阈值查官方文档）。
 const FEISHU_TEXT_MAX: usize = 28_000;
+/// 评论线程回复的分片阈值（字符）。评论回复 API 的内容上限与 im 消息不同（更小，
+/// 离线无法精确确认——按评论场景普遍几千字符的量级取 3000 字符保守值，**待真机
+/// 校准**：超限报错时再下调）。
+const FEISHU_COMMENT_TEXT_MAX: usize = 3_000;
+/// 话题群「近期活跃」免 @ 窗口：该话题 30 分钟内有过消息即视为活跃追问中，
+/// 豁免 require_mention（普通群不豁免，见 drain task）。
+const THREAD_ACTIVE_WINDOW: Duration = Duration::from_secs(30 * 60);
 /// `tenant_access_token` 有效期 2h（7200s），距过期 < 10min（即 elapsed >= 110min）则刷新。
 const TOKEN_TTL: Duration = Duration::from_secs(110 * 60);
 
-/// 一张 pending 询问卡的登记项：conv + 消息 id + 工具名。
+/// 一张 pending 询问卡的登记项：conv + 消息 id + 工具名 + **发起者**（群 conv 下
+/// 按钮点击者校验用——询问由谁发起，只有其本人可答复；私聊不校验，单人）。
 #[derive(Debug, Clone)]
 struct PendingAskCard {
     conv_id: String,
     msg_id: String,
     tool_name: String,
+    sender: String,
 }
 
 /// P8-2：审批卡复用槽（per conv）。`pending_req = None` 表示卡已收敛
@@ -109,6 +121,13 @@ pub struct FeishuPlatform {
     asks_since_card: Arc<Mutex<HashMap<String, bool>>>,
     /// P6-1：群消息 @bot 过滤策略（与 drain task 共享，`/config` 热切换）。
     mention_policy: Arc<RwLock<crate::proto::MentionPolicy>>,
+    /// conv → 最近一次入站消息 sender（轮次发起者近似——每 conv 轮次串行，
+    /// 审批询问/流式卡发起时取最近 sender 编码进卡片 value 与 pending 登记）。
+    conv_senders: Arc<Mutex<HashMap<String, String>>>,
+    /// 评论 conv（`feishu:comment:<file_token>`）→ 最近评论 comment_id（回复目标
+    /// 锚点表——会话锚放宽后 conv 不再内嵌 comment_id，drain 收到评论事件时登记，
+    /// 发送侧据此路由回复；存量内嵌形态 conv 兜底）。
+    comment_anchors: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl FeishuPlatform {
@@ -174,6 +193,17 @@ impl FeishuPlatform {
         let pending_asks: Arc<Mutex<HashMap<String, PendingAskCard>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let pending_asks_for_drain = pending_asks.clone();
+        // conv 发起者 / 话题活跃窗口（drain task 与发送侧共享）。
+        let conv_senders: Arc<Mutex<HashMap<String, String>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let conv_senders_for_drain = conv_senders.clone();
+        // 评论回复目标锚点表（drain 登记、发送侧消费）。
+        let comment_anchors: Arc<Mutex<HashMap<String, String>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let comment_anchors_for_drain = comment_anchors.clone();
+        let thread_active: Arc<Mutex<HashMap<String, Instant>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let thread_active_for_drain = thread_active.clone();
         tokio::spawn(async move {
             let mut payload_rx = payload_rx;
             while let Some(payload) = payload_rx.recv().await {
@@ -191,12 +221,39 @@ impl FeishuPlatform {
                     .await;
                 }
                 let bot = bot_open_id_for_drain.read().await.clone();
-                let policy = *policy_for_drain.read().await;
+                let mut policy = *policy_for_drain.read().await;
+                // 话题群近期活跃免 @：该话题 THREAD_ACTIVE_WINDOW 内有过消息则
+                // 本条豁免 require_mention（追问场景免于每条 @）。普通群
+                // thread_key 不命中，不豁免。
+                let thread_key = thread_key_of_payload(&payload);
+                if let Some(tk) = &thread_key {
+                    if thread_active_for_drain
+                        .lock()
+                        .await
+                        .get(tk)
+                        .is_some_and(|t| t.elapsed() < THREAD_ACTIVE_WINDOW)
+                    {
+                        policy.require_mention_in_group = false;
+                    }
+                }
                 if let Some((msgid, mut msg, pending)) =
                     parse_message_event(&payload, &policy, bot.as_deref())
                 {
                     if !dedup.check(&msgid) {
                         continue;
+                    }
+                    // 记录 conv 发起者（审批卡/终止按钮的发起者校验锚）与话题
+                    // 活跃时刻（免 @ 窗口续期；有界防泄漏）。
+                    conv_senders_for_drain
+                        .lock()
+                        .await
+                        .insert(msg.conv_id.0.clone(), msg.sender.0.clone());
+                    if let Some(tk) = &thread_key {
+                        let mut m = thread_active_for_drain.lock().await;
+                        if m.len() > 512 {
+                            m.clear(); // 粗上限：超量整体重置（窗口语义无损）。
+                        }
+                        m.insert(tk.clone(), Instant::now());
                     }
                     // 下载落盘每个待处理媒体；单个失败只 warn 跳过，不丢整条消息。
                     for p in &pending {
@@ -279,16 +336,19 @@ impl FeishuPlatform {
                             other => other,
                         };
                         match dl {
-                            Ok(bytes) => match persist_media(p.kind, &p.key, &bytes) {
-                                Ok(path) => msg.media.push(MediaRef {
-                                    kind: p.kind.to_string(),
-                                    url: path,
-                                }),
-                                Err(e) => {
-                                    warn!(target: "feishu", error = %e, "媒体落盘失败，跳过");
-                                    msg.media_errors.push(format!("{}: 落盘失败: {e}", p.key));
+                            Ok(bytes) => {
+                                match persist_media(p.kind, &p.key, p.file_name.as_deref(), &bytes)
+                                {
+                                    Ok(path) => msg.media.push(MediaRef {
+                                        kind: p.kind.to_string(),
+                                        url: path,
+                                    }),
+                                    Err(e) => {
+                                        warn!(target: "feishu", error = %e, "媒体落盘失败，跳过");
+                                        msg.media_errors.push(format!("{}: 落盘失败: {e}", p.key));
+                                    }
                                 }
-                            },
+                            }
                             Err(e) => {
                                 warn!(
                                     target: "feishu",
@@ -308,25 +368,76 @@ impl FeishuPlatform {
                 }
                 // P4-4：审批按钮回调（card.action.trigger）→ text="y"/"n" 的
                 // 入站消息，core 的审批回复路由消费（parse_reply("y")=allow）。
-                if let Some((key, reply_msg)) = parse_card_action_event(&payload) {
+                // 安全批次扩展：回调解析带第三元素 deny（命令按钮过期 / 群内他人
+                // 点终止——proto 侧已判，此处回提示后丢弃，不进 core 分派）；
+                // 审批按钮另做**发起者校验**（群 conv 下点击者须为登记的发起者，
+                // 私聊单人免检）。
+                if let Some((key, reply_msg, deny)) = parse_card_action_event(&payload) {
+                    if let Some(deny_text) = deny {
+                        if !dedup.check(&key) {
+                            continue;
+                        }
+                        send_drain_text(
+                            &core_config_for_drain,
+                            &token_for_drain,
+                            &app_id_for_drain,
+                            &app_secret_for_drain,
+                            &reply_msg.conv_id,
+                            &deny_text,
+                        )
+                        .await;
+                        continue;
+                    }
                     if !dedup.check(&key) {
                         continue;
+                    }
+                    // conv 发起者更新（按钮触发的轮次由点击者发起）。
+                    if !reply_msg.sender.0.is_empty() {
+                        conv_senders_for_drain
+                            .lock()
+                            .await
+                            .insert(reply_msg.conv_id.0.clone(), reply_msg.sender.0.clone());
                     }
                     // 过期反馈：req 已不在 pending_asks（询问已批准/拒绝/中断/
                     // 超时收敛，或复用槽换了新请求）→ 回一条「已过期」提示而非
                     // 静默丢进 core 的 miss 分支。无 req 的回调（命令按钮等）
                     // 不受影响。
                     if let Some(req) = reply_msg.ask_req.clone() {
-                        if !pending_asks_for_drain.lock().await.contains_key(&req) {
-                            notify_expired_ask(
-                                &core_config_for_drain,
-                                &token_for_drain,
-                                &app_id_for_drain,
-                                &app_secret_for_drain,
-                                &reply_msg.conv_id,
-                            )
-                            .await;
-                            continue;
+                        let pending = pending_asks_for_drain.lock().await.get(&req).cloned();
+                        match pending {
+                            None => {
+                                notify_expired_ask(
+                                    &core_config_for_drain,
+                                    &token_for_drain,
+                                    &app_id_for_drain,
+                                    &app_secret_for_drain,
+                                    &reply_msg.conv_id,
+                                )
+                                .await;
+                                continue;
+                            }
+                            // 发起者校验（群 conv）：询问由发起者登记，他人点击
+                            // 回明确提示（防群里任何人替批高危操作）。
+                            Some(card) => {
+                                if !card.sender.is_empty()
+                                    && !is_private_conv(&card.conv_id)
+                                    && card.sender != reply_msg.sender.0
+                                {
+                                    send_drain_text(
+                                        &core_config_for_drain,
+                                        &token_for_drain,
+                                        &app_id_for_drain,
+                                        &app_secret_for_drain,
+                                        &reply_msg.conv_id,
+                                        &format!(
+                                            "⛔ 该询问由 {} 发起，仅其本人可答复。",
+                                            card.sender
+                                        ),
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                            }
                         }
                     }
                     if inbound_msg_tx.send(reply_msg).await.is_err() {
@@ -350,13 +461,38 @@ impl FeishuPlatform {
                     )
                     .await;
                     let bot = bot_open_id_for_drain.read().await.clone();
-                    if let Some((key, cm)) = parse_comment_event(&payload, bot.as_deref()) {
-                        if dedup.check(&key) && inbound_msg_tx.send(cm).await.is_err() {
-                            break;
+                    if let Some((key, comment_id, cm)) =
+                        parse_comment_event(&payload, bot.as_deref())
+                    {
+                        // 会话锚放宽：登记回复目标锚点（conv → comment_id）——发送
+                        // 侧（send_text/send_media 评论分支）据此路由回复。
+                        if dedup.check(&key) {
+                            comment_anchors_for_drain
+                                .lock()
+                                .await
+                                .insert(cm.conv_id.0.clone(), comment_id);
+                            if inbound_msg_tx.send(cm).await.is_err() {
+                                break;
+                            }
                         }
                     } else {
                         tracing::debug!(target: "feishu", "评论未 @bot（或字段缺失/纯@），丢弃");
                     }
+                    continue;
+                }
+                // 不支持类型提示：语音/分享卡片等此前静默丢弃，用户无感知——回一条
+                // 可读提示（p2p 直回；群消息近似按「带 @」门槛发——白名单校验在
+                // core 侧，drain 无白名单状态，见 proto 注释）。
+                if let Some((notice, Some(conv))) = unsupported_message_notice(&payload) {
+                    send_drain_text(
+                        &core_config_for_drain,
+                        &token_for_drain,
+                        &app_id_for_drain,
+                        &app_secret_for_drain,
+                        &conv,
+                        notice,
+                    )
+                    .await;
                     continue;
                 }
                 // 真机排障：无法解析的 payload 头部（截断）记 warn，定位事件结构差异。
@@ -382,6 +518,8 @@ impl FeishuPlatform {
             ask_slots: Arc::new(Mutex::new(HashMap::new())),
             asks_since_card: Arc::new(Mutex::new(HashMap::new())),
             mention_policy,
+            conv_senders,
+            comment_anchors,
         })
     }
 
@@ -468,22 +606,53 @@ impl FeishuPlatform {
             CardTerminal::Running => {
                 let content = stream_body_md(&card.text, &card.tool_calls);
                 let seq = self.next_card_seq(card_id).await;
-                match patch_card_element(token, card_id, "md_body", &content, seq).await {
+                // 限流丢帧策略（安全批次）：element PATCH 用**不重试**变体——429 重试
+                // 会 sleep 阻塞流式主循环（agent chunk 消费被卡最多 3.5s/次）；改为
+                // 丢弃本帧返回 Ok（内容在累积文本里，下个节流窗整帧重发），只有非
+                // 限流错误才走自愈/上抛。
+                let patched = match patch_card_element(token, card_id, "md_body", &content, seq)
+                    .await
+                {
+                    Err(e) if is_rate_limited_msg(&e.to_string()) => {
+                        tracing::warn!(target: "feishu", card_id, "element patch 限流，丢弃本帧（下个节流窗再发）");
+                        return Ok(());
+                    }
                     // 流式超时（200850）：服务端已自动关流式，长任务 Running 期会触发。
-                    // 自愈：重开 streaming_mode 后重试一次（sequence 继续递增）。
+                    // 自愈一级：重开 streaming_mode 后重试一次（sequence 继续递增）。
                     Err(e) if e.to_string().contains("code=200850") => {
                         warn!(target: "feishu", card_id, "流式超时，重开 streaming_mode 后重试");
-                        let settings = serde_json::json!({
-                            "config": { "streaming_mode": true }
-                        })
-                        .to_string();
+                        let settings =
+                            serde_json::json!({ "config": { "streaming_mode": true } }).to_string();
                         let seq2 = self.next_card_seq(card_id).await;
-                        patch_card_settings(token, card_id, &settings, seq2).await?;
+                        let reopen = patch_card_settings(token, card_id, &settings, seq2).await;
+                        if let Err(e) = reopen {
+                            if is_rate_limited_msg(&e.to_string()) {
+                                return Ok(()); // 限流：同丢帧策略。
+                            }
+                            return Err(e);
+                        }
                         let seq3 = self.next_card_seq(card_id).await;
-                        patch_card_element(token, card_id, "md_body", &content, seq3).await
+                        match patch_card_element(token, card_id, "md_body", &content, seq3).await {
+                            // 自愈二级（升级兜底）：重开流式后仍 200850——CardKit 无
+                            // 「重建实体」API（离线确认，**待真机校准**），退化为
+                            // 关流式 + 全量 raw patch 一次（无打字机但内容不丢帧）。
+                            Err(e2) if e2.to_string().contains("code=200850") => {
+                                warn!(target: "feishu", card_id, "重开流式仍超时，退化关闭流式后 raw patch");
+                                let off = serde_json::json!({
+                                    "config": { "streaming_mode": false }
+                                })
+                                .to_string();
+                                let seq4 = self.next_card_seq(card_id).await;
+                                let _ = patch_card_settings(token, card_id, &off, seq4).await;
+                                let seq5 = self.next_card_seq(card_id).await;
+                                patch_card_element(token, card_id, "md_body", &content, seq5).await
+                            }
+                            other => other,
+                        }
                     }
                     other => other,
-                }?;
+                };
+                patched?;
                 // 分阶段 footer（best-effort，失败不影响正文流）+ P10 排队提示
                 //（入队状态由 CardSession 每次 patch 拉取，随 chunk 刷新）。
                 let footer = crate::card::running_footer(
@@ -505,6 +674,8 @@ impl FeishuPlatform {
                     stream_body_final(&card.text, &card.tool_calls, err)
                 };
                 let seq = self.next_card_seq(card_id).await;
+                // 终态用不重试变体：429 不睡（上抛 Err 由 core P5-11 降级纯文本补
+                // 结论——终态内容不能等下个节流窗，丢帧语义只属 Running 流式帧）。
                 let element = patch_card_element(token, card_id, "md_body", &content, seq).await;
                 // footer 收敛（真机校准 UX）：初始卡的「🧠 思考中…」在终态
                 // 换成 完成/出错/已中断——否则任务结束后标识永远停在执行中。
@@ -544,8 +715,15 @@ impl FeishuPlatform {
             return;
         }
         let seq = self.next_card_seq(card_id).await;
+        // 限流丢帧：footer 是点缀，不重试不阻塞；缓存条目回滚（否则本窗口内后续
+        // 相同 footer 会被误判「已上屏」而跳过，内容永久丢失直到 footer 再变化）。
         if let Err(e) = patch_card_element(token, card_id, "md_footer", footer, seq).await {
-            tracing::warn!(target: "feishu", error = %e, "footer patch 失败（不影响主流程）");
+            if is_rate_limited_msg(&e.to_string()) {
+                tracing::warn!(target: "feishu", card_id, "footer patch 限流，丢帧并回滚缓存");
+                self.card_footers.lock().await.remove(card_id);
+            } else {
+                tracing::warn!(target: "feishu", error = %e, "footer patch 失败（不影响主流程）");
+            }
         }
     }
     /// 登记一张 pending 询问卡；同 request_id 的旧卡 patch 成 superseded
@@ -556,6 +734,7 @@ impl FeishuPlatform {
         conv_id: &str,
         msg_id: &str,
         tool_name: &str,
+        sender: &str,
     ) {
         let superseded = self.pending_asks.lock().await.insert(
             request_id.to_string(),
@@ -563,6 +742,7 @@ impl FeishuPlatform {
                 conv_id: conv_id.to_string(),
                 msg_id: msg_id.to_string(),
                 tool_name: tool_name.to_string(),
+                sender: sender.to_string(),
             },
         );
         if let Some(old) = superseded {
@@ -585,8 +765,20 @@ impl FeishuPlatform {
         }
     }
 
+    /// conv 最近一次入站消息的 sender（轮次发起者近似——每 conv 轮次串行，询问
+    /// 登记时取之，作群 conv 下的按钮点击者校验锚；无记录为空串=不校验）。
+    async fn last_sender(&self, conv_id: &str) -> String {
+        self.conv_senders
+            .lock()
+            .await
+            .get(conv_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// P8-2：登记一张**新发**的询问卡：pending 登记（request_id 路由）+ 复用槽
     /// （收敛后供下一个询问原地复用）+ 顶起标记（终态结果下沉判定）。
+    /// 安全批次：发起者（最近 sender）一并登记（群 conv 点击者校验）。
     async fn register_ask_card(
         &self,
         conv_id: &str,
@@ -595,7 +787,8 @@ impl FeishuPlatform {
         tool_name: &str,
         render: AskRender,
     ) {
-        self.record_pending_ask(request_id, conv_id, msg_id, tool_name)
+        let sender = self.last_sender(conv_id).await;
+        self.record_pending_ask(request_id, conv_id, msg_id, tool_name, &sender)
             .await;
         self.ask_slots.lock().await.insert(
             conv_id.to_string(),
@@ -656,7 +849,8 @@ impl FeishuPlatform {
             .await;
         match patch {
             Ok(()) => {
-                self.record_pending_ask(request_id, conv_id, &msg_id, tool_name)
+                let sender = self.last_sender(conv_id).await;
+                self.record_pending_ask(request_id, conv_id, &msg_id, tool_name, &sender)
                     .await;
                 // 复用成功：槽的渲染输入换成新询问（note 联动按新参数重画）。
                 if let Some(slot) = self.ask_slots.lock().await.get_mut(conv_id) {
@@ -729,19 +923,54 @@ fn media_dir() -> Result<std::path::PathBuf> {
     Ok(dir)
 }
 
-/// 把媒体字节落盘到 `~/.imagent/media/<key>.<ext>`，返回本地路径字符串。
+/// 把媒体字节落盘到 `~/.imagent/media/`，返回本地路径字符串。
 ///
-/// 文件名用飞书的 `image_key`/`file_key`（全局唯一，天然去重覆盖）。照 ilink
-/// `persist_media`：目录 0700、文件 0600（解密后的私聊媒体不暴露给同机其他用户）。
-fn persist_media(kind: &str, key: &str, bytes: &[u8]) -> Result<String> {
+/// 原名透传（安全批次）：file 消息带原始 `file_name`（含扩展名）——按原名落盘，
+/// agent 侧拿到的文件名/扩展名与用户发送的一致（此前统一 `<key>.bin`，下游按
+/// 扩展名识别格式会失效）。文件名做净化（剥路径分隔符，防 `../` 逃逸）；缺原名的
+/// file 与图片回退 `<key>.<默认扩展名>`。图片消息 content 无原始文件名，真实格式
+/// 只有飞书侧知道（image_key 不带扩展信息）——默认 **png**（无损通用形态，jpg
+/// 有损假设会二次压缩误导；下载字节原样落盘，仅扩展名标注取舍）。
+/// 照 ilink `persist_media`：目录 0700、文件 0600（解密后的私聊媒体不暴露给同机其他用户）。
+/// 取舍：原名不再天然全局唯一（同名文件后到覆盖先到）——换「agent 拿到真实文件
+/// 名/扩展名」的收益，覆盖窗口极窄（同会话同名连发），可接受。
+fn persist_media(kind: &str, key: &str, file_name: Option<&str>, bytes: &[u8]) -> Result<String> {
     let dir = media_dir()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     }
-    let ext = if kind == "image" { "jpg" } else { "bin" };
-    let path = dir.join(format!("{key}.{ext}"));
+    // 净化：剥路径分隔符与目录段，仅留文件名本体；空/全非法回退资源 key。
+    let safe_name = file_name
+        .map(|n| {
+            n.rsplit(['/', '\\'])
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        })
+        .filter(|n| !n.is_empty());
+    let name = match (kind, safe_name) {
+        // file：原名原名扩展名整体保留（无扩展名也照旧——原样最忠实）。
+        ("file", Some(n)) => n,
+        // image：content 无原名；若 post/file 路径带名则用其扩展名，否则默认 png。
+        ("image", Some(n)) => {
+            let ext = n.rsplit('.').next().unwrap_or("");
+            let base = n.rsplit_once('.').map(|(b, _)| b).unwrap_or(n.as_str());
+            let ext = if ext.is_empty() || ext == n {
+                "png"
+            } else {
+                ext
+            };
+            format!("{base}.{ext}")
+        }
+        _ => {
+            let ext = if kind == "image" { "png" } else { "bin" };
+            format!("{key}.{ext}")
+        }
+    };
+    let path = dir.join(name);
     std::fs::write(&path, bytes)
         .map_err(|e| CoreError::Platform(PLATFORM, format!("write media {path:?}: {e}")))?;
     #[cfg(unix)]
@@ -779,8 +1008,53 @@ async fn ensure_bot_open_id(
     }
 }
 
+/// drain 侧 best-effort 文本发送（评论/话题/普通 conv 三路）：按钮 deny 提示、
+/// 过期询问提示、不支持类型提示共用。发送失败仅 warn（提示丢失无害）。
+/// 评论 conv：新形态（无内嵌 comment_id）在 drain 侧无回复锚点（锚点在消息元数据
+/// 里，drain 只剩 conv）——跳过不回，仅记日志；存量内嵌形态照常回复评论。
+async fn send_drain_text(
+    core_config: &CoreConfig,
+    token_lock: &Arc<RwLock<Option<(String, Instant)>>>,
+    app_id: &str,
+    app_secret: &str,
+    conv: &ConvId,
+    text: &str,
+) {
+    let send = async {
+        let t = fetch_cached_token(token_lock, core_config, app_id, app_secret).await?;
+        if let Some((file_token, comment_id)) = comment_target_from_conv(conv) {
+            return match comment_id {
+                Some(cid) => reply_comment(core_config, &t, &file_token, &cid, text)
+                    .await
+                    .map(|_| ()),
+                // 新形态评论 conv 无锚点：无处可回，跳过（无害——提示性文案）。
+                None => Ok(()),
+            };
+        }
+        if let Some((_chat, root_id)) = thread_target_from_conv(conv) {
+            reply_message(
+                core_config,
+                &t,
+                &root_id,
+                "text",
+                &serde_json::json!({ "text": text }).to_string(),
+            )
+            .await
+            .map(|_| ())
+        } else if let Some((receive_id, kind)) = receive_target_from_conv(conv) {
+            send_text_msg(core_config, &t, &receive_id, kind, text).await
+        } else {
+            Ok(())
+        }
+    };
+    if let Err(e) = send.await {
+        warn!(target: "feishu", error = %e, "drain 提示发送失败（无害）");
+    }
+}
+
 /// 过期询问的点击反馈（drain task 用）：向该 conv 回一条「已过期」文本——
 /// 询问卡收敛（批准/拒绝/中断/超时）后按钮仍在卡上，用户迟点不应静默无响应。
+/// 评论 conv 的过期文案与聊天场景同句（回评论线程）。
 /// best-effort：发送失败仅 warn（提示丢失无害，core 的 miss 分支照旧兜底丢弃）。
 async fn notify_expired_ask(
     core_config: &CoreConfig,
@@ -789,28 +1063,15 @@ async fn notify_expired_ask(
     app_secret: &str,
     conv: &ConvId,
 ) {
-    const TEXT: &str = "⏳ 该询问已过期或已被处理，无需再次点击。";
-    let send = async {
-        let t = fetch_cached_token(token_lock, core_config, app_id, app_secret).await?;
-        if let Some((_chat, root_id)) = thread_target_from_conv(conv) {
-            reply_message(
-                core_config,
-                &t,
-                &root_id,
-                "text",
-                &serde_json::json!({ "text": TEXT }).to_string(),
-            )
-            .await
-            .map(|_| ())
-        } else if let Some((receive_id, kind)) = receive_target_from_conv(conv) {
-            send_text_msg(core_config, &t, &receive_id, kind, TEXT).await
-        } else {
-            Ok(())
-        }
-    };
-    if let Err(e) = send.await {
-        warn!(target: "feishu", error = %e, "过期询问提示发送失败（无害）");
-    }
+    send_drain_text(
+        core_config,
+        token_lock,
+        app_id,
+        app_secret,
+        conv,
+        "⏳ 该询问已过期或已被处理，无需再次点击。",
+    )
+    .await;
 }
 
 /// 取当前 token：缓存命中（未过 TTL）则返回，否则 `fetch_token` 刷新并缓存。
@@ -855,10 +1116,33 @@ impl Platform for FeishuPlatform {
         // 消息），流式/最终回复都会过这里。
         let text = &mask_emails(text);
         // P4-9：评论线程 conv → 回复云文档评论（每分片一条回复）。
-        if let Some((file_token, comment_id)) = comment_target_from_conv(conv) {
-            let chunks: Vec<String> = split_message(text, FEISHU_TEXT_MAX);
+        // 会话锚放宽批次：conv 只锚 file_token，回复目标 comment_id 优先取 drain
+        // 登记的锚点表（最近一条评论）；存量 conv 的内嵌形态兜底。两者皆无（进程
+        // 刚重启、锚点表为空）无法定位评论线程，如实报错。
+        if let Some((file_token, legacy_cid)) = comment_target_from_conv(conv) {
+            let comment_id = self
+                .comment_anchors
+                .lock()
+                .await
+                .get(&conv.0)
+                .cloned()
+                .or(legacy_cid);
+            let Some(comment_id) = comment_id else {
+                return Err(CoreError::Platform(
+                    PLATFORM,
+                    "评论线程缺少回复目标（comment_id），无法回复".to_string(),
+                ));
+            };
+            // 评论回复用独立更小阈值（FEISHU_COMMENT_TEXT_MAX，见其注释）；首片
+            // 带「（共 N 段）」序标，长回复被拆分时用户可感知。
+            let chunks: Vec<String> = split_message(text, FEISHU_COMMENT_TEXT_MAX);
             let total = chunks.len();
             for (i, chunk) in chunks.into_iter().enumerate() {
+                let chunk = if i == 0 && total > 1 {
+                    format!("（共 {total} 段）\n{chunk}")
+                } else {
+                    chunk
+                };
                 // P5：中途失败标明分片序号——用户能感知回复被截断而非静默缺尾。
                 // token 失效错误码由 with_token 清缓存自愈（其余错误如实上抛）。
                 if let Err(e) = self
@@ -931,6 +1215,61 @@ impl Platform for FeishuPlatform {
     }
 
     async fn send_media(&self, conv: &ConvId, media: &MediaRef, _hint: &ReplyHint) -> Result<()> {
+        // 评论线程分支（安全批次修复：此前评论 conv 错走普通 conv 路径，comment
+        // 形 conv 被当 chat_id 发送必失败）：图片上传后以评论回复带 img 实体；
+        // 文件实体评论回复不支持（drive 评论内容实体只有 text/at/img——离线确认，
+        // **待真机校准**），给用户可读错误而非静默失败。
+        if let Some((file_token, legacy_cid)) = comment_target_from_conv(conv) {
+            let comment_id = self
+                .comment_anchors
+                .lock()
+                .await
+                .get(&conv.0)
+                .cloned()
+                .or(legacy_cid);
+            let Some(comment_id) = comment_id else {
+                return Err(CoreError::Platform(
+                    PLATFORM,
+                    "评论线程缺少回复目标（comment_id），无法发送媒体".to_string(),
+                ));
+            };
+            if media.kind != "image" {
+                return Err(CoreError::Platform(
+                    PLATFORM,
+                    "评论线程暂不支持发送文件，请在聊天会话中获取文件。".to_string(),
+                ));
+            }
+            let bytes = tokio::fs::read(&media.url).await.map_err(|e| {
+                CoreError::Platform(PLATFORM, format!("读媒体文件 {}: {e}", media.url))
+            })?;
+            let file_name = std::path::Path::new(&media.url)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "image.png".to_string());
+            return self
+                .with_token(|t| {
+                    let bytes = bytes.clone();
+                    let file_name = file_name.clone();
+                    let file_token = file_token.clone();
+                    let comment_id = comment_id.clone();
+                    async move {
+                        let image_key =
+                            upload_image(&self.core_config, &t, &file_name, bytes).await?;
+                        // img 实体字段名（file_key vs file_token）离线无法确认，
+                        // 按评论事件 content 同构的最合理形态实现——待真机校准。
+                        reply_comment_nodes(
+                            &self.core_config,
+                            &t,
+                            &file_token,
+                            &comment_id,
+                            serde_json::json!([{ "type": "img", "file_key": image_key }]),
+                        )
+                        .await
+                        .map(|_| ())
+                    }
+                })
+                .await;
+        }
         // agent 产出媒体回传（P6-7：按 kind 分流——image 走图片消息，其余走文件
         // 消息）：读本地文件 → 上传拿 key → 发消息。话题群 conv → reply API 落回话题。
         let thread = thread_target_from_conv(conv);
@@ -1135,6 +1474,26 @@ impl Platform for FeishuPlatform {
         }
     }
 
+    /// 纯文本审批询问覆写（评论场景文案批次）：评论线程无按钮卡（卡片降级文本），
+    /// 「回复 y 允许」在评论里会变成对文档的新评论而非审批回复——改为指引
+    /// 「回复 @bot y / @bot n」（@bot 的评论才会被当审批回复路由回 bot）。其余
+    /// 场景文案与 core 默认一致。
+    async fn send_permission_ask_text(
+        &self,
+        conv: &ConvId,
+        tool_name: &str,
+        input_summary: &str,
+        hint: &ReplyHint,
+    ) -> Result<()> {
+        let summary = imagent_core::render::tool_summary(tool_name, input_summary);
+        let text = if comment_target_from_conv(conv).is_some() {
+            format!("🔐 请求执行 {tool_name}：{summary}\n\n请回复 @bot y 允许 / @bot n 拒绝。")
+        } else {
+            format!("🔐 请求执行 {tool_name}：{summary}\n\n回复 y 允许，其它拒绝。")
+        };
+        self.send_text(conv, &text, hint).await
+    }
+
     /// P5-16：把指定 request_id 的询问卡 patch 成「已中断」终态（移除按钮，
     /// 防用户对已结束的询问继续操作）。无记录（文本询问/未发过卡）时 no-op。
     async fn cancel_permission_ask(&self, _conv: &ConvId, request_id: &str) -> Result<()> {
@@ -1145,6 +1504,7 @@ impl Platform for FeishuPlatform {
             conv_id,
             msg_id: message_id,
             tool_name,
+            sender: _,
         } = card;
         // P8-2：释放复用槽（卡保留，下一个询问可原地复用）。
         self.free_ask_slot(&conv_id, request_id).await;
@@ -1206,6 +1566,7 @@ impl Platform for FeishuPlatform {
             conv_id,
             msg_id: message_id,
             tool_name,
+            sender: _,
         } = card;
         // P8-2：释放复用槽——卡保留（显示已批准/已拒绝），下一个询问原地复用。
         self.free_ask_slot(&conv_id, request_id).await;
@@ -1426,32 +1787,59 @@ impl Platform for FeishuPlatform {
         }
         let (receive_id, kind) = receive_target_from_conv(conv)
             .ok_or_else(|| CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0)))?;
-        self.with_token(|t| {
-            let receive_id = receive_id.clone();
-            let conv_for_init = conv.0.clone();
-            async move {
-                match create_card_entity(&t, &render_stream_init_card(&conv_for_init)).await {
-                    Ok(card_id) => {
-                        match send_card_ref_msg(&self.core_config, &t, &receive_id, kind, &card_id)
-                            .await
-                        {
-                            Ok(_) => Ok(Some(format!("card:{card_id}"))),
-                            Err(e) => {
-                                // 实体已建但消息发送失败：实体作废（14 天过期自然回收），降级 raw。
-                                warn!(target: "feishu", error = %e, "发送卡片引用消息失败，降级 raw 卡片");
-                                self.send_card_raw(&conv.0, &receive_id, kind, card, &t).await
+        // 发起者（最近 sender）：编码进初始卡的 ⏹ 终止按钮 value（群 conv 下点击者
+        // 校验）。占位/未知为 None（旧语义，不校验）。
+        let sender = self.last_sender(&conv.0).await;
+        let sender_opt = if sender.is_empty() {
+            None
+        } else {
+            Some(sender)
+        };
+        let res = self
+            .with_token(|t| {
+                let receive_id = receive_id.clone();
+                let conv_for_init = conv.0.clone();
+                let sender_opt = sender_opt.clone();
+                async move {
+                    match create_card_entity(
+                        &t,
+                        &render_stream_init_card(&conv_for_init, sender_opt.as_deref()),
+                    )
+                    .await
+                    {
+                        Ok(card_id) => {
+                            match send_card_ref_msg(&self.core_config, &t, &receive_id, kind, &card_id)
+                                .await
+                            {
+                                Ok(_) => Ok(Some(format!("card:{card_id}"))),
+                                Err(e) => {
+                                    // 实体已建但消息发送失败：实体作废（14 天过期自然回收），降级 raw。
+                                    warn!(target: "feishu", error = %e, "发送卡片引用消息失败，降级 raw 卡片");
+                                    self.send_card_raw(&conv.0, &receive_id, kind, card, &t).await
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        // 权限未开（cardkit:card:write）或创建失败 → 降级 raw + 整卡 im patch。
-                        warn!(target: "feishu", error = %e, "创建卡片实体失败（需 cardkit:card:write 权限），降级 raw 卡片");
-                        self.send_card_raw(&conv.0, &receive_id, kind, card, &t).await
+                        Err(e) => {
+                            // 权限未开（cardkit:card:write）或创建失败 → 降级 raw + 整卡 im patch。
+                            warn!(target: "feishu", error = %e, "创建卡片实体失败（需 cardkit:card:write 权限），降级 raw 卡片");
+                            self.send_card_raw(&conv.0, &receive_id, kind, card, &t).await
+                        }
                     }
                 }
+            })
+            .await;
+        // 初始 footer 预填缓存（footer 预填批次）：初始模板的 md_footer 就是
+        // 「🧠 思考中…」——预填 card_footers 后首次 Running patch 若 footer 仍是
+        // 思考中（未带秒数/排队）会被去重跳过，不再重复 patch 同内容。
+        if let Ok(Some(handle)) = &res {
+            if let Some(card_id) = handle.strip_prefix("card:") {
+                self.card_footers
+                    .lock()
+                    .await
+                    .insert(card_id.to_string(), "🧠 思考中…".to_string());
             }
-        })
-        .await
+        }
+        res
     }
 
     /// 更新流式卡片。按 [`send_card`](Self::send_card) 返回的句柄前缀分流：
@@ -1507,6 +1895,24 @@ impl Platform for FeishuPlatform {
             }
             })
             .await;
+        // 卡片不存在/已删除自愈（安全批次）：原卡片被用户删除/撤回后 patch 永远
+        // 失败。清本平台 per-card 缓存（序列号/footer），错误附加 CARD_HANDLE_LOST
+        // 哨兵——core CardSession 据此摘 live_cards 登记并把句柄置空（Running 期
+        // 下帧重发新卡），启动扫描据此作废登记（终止无限重试）。
+        let res = match res {
+            Err(e) if is_card_not_exist_msg(&e.to_string()) => {
+                warn!(target: "feishu", handle, "卡片不存在/已删除，清缓存并上报句柄丢失");
+                if let Some(card_id) = handle.strip_prefix("card:") {
+                    self.card_seqs.lock().await.remove(card_id);
+                    self.card_footers.lock().await.remove(card_id);
+                }
+                Err(CoreError::Platform(
+                    PLATFORM,
+                    format!("{e}（{CARD_HANDLE_LOST}）"),
+                ))
+            }
+            other => other,
+        };
         // 结果下沉重发：流式卡已收敛成指针 → 完整结果另发新卡。重发失败上抛 Err
         // ——core 的 P5-11 兜底会以纯文本补发全文（结论不能因重发失败而丢）。
         if res.is_ok() && buried {
@@ -1637,6 +2043,40 @@ mod tests {
         let _ = ConvId("x".into());
     }
 
+    /// 原名透传落盘：file 用原始文件名（含扩展名）；图片无原名默认 png；带名图片
+    /// 用其扩展名；路径穿越（../、分隔符）被净化；无名 file 回退 key.bin。
+    #[test]
+    fn persist_media_original_name() {
+        let dir = std::env::temp_dir().join(format!("imagent_persist_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // media_dir 固定 ~/.imagent/media，直接测同目录语义（写入该目录并清理）。
+        let base = media_dir().unwrap();
+        let p1 = persist_media("file", "k1", Some("报告 v2.pdf"), b"x").unwrap();
+        assert!(p1.ends_with("报告 v2.pdf"), "{p1}");
+        // 净化：路径分隔符段被剥。
+        let p2 = persist_media("file", "k2", Some("../../evil.sh"), b"x").unwrap();
+        assert!(p2.ends_with("evil.sh") && !p2.contains(".."), "{p2}");
+        // 图片无原名：key.png（默认 png，取舍见函数注释）。
+        let p3 = persist_media("image", "img_k3", None, b"x").unwrap();
+        assert!(p3.ends_with("img_k3.png"), "{p3}");
+        // 图片带名（未来路径）：用其扩展名。
+        let p4 = persist_media("image", "img_k4", Some("photo.jpg"), b"x").unwrap();
+        assert!(p4.ends_with("photo.jpg"), "{p4}");
+        // 无名 file：key.bin。
+        let p5 = persist_media("file", "k5", None, b"x").unwrap();
+        assert!(p5.ends_with("k5.bin"), "{p5}");
+        for f in [
+            "报告 v2.pdf",
+            "evil.sh",
+            "img_k3.png",
+            "photo.jpg",
+            "k5.bin",
+        ] {
+            let _ = std::fs::remove_file(base.join(f));
+        }
+        let _ = dir;
+    }
+
     /// P8-2：复用槽认领——空闲可认领、pending 拒绝、释放后可再认领。
     #[test]
     fn ask_slot_claim_and_free() {
@@ -1724,10 +2164,11 @@ mod tests {
                 conv_id: "feishu:ou_x".into(),
                 msg_id: "m1".into(),
                 tool_name: "Bash".into(),
+                sender: "ou_owner".into(),
             },
         );
         // 同 request_id + 同卡重登记：不应触发 superseded（否则会真实发 HTTP）。
-        p.record_pending_ask("r1", "feishu:ou_x", "m1", "Bash")
+        p.record_pending_ask("r1", "feishu:ou_x", "m1", "Bash", "ou_owner")
             .await;
         let entry = p.pending_asks.lock().await.get("r1").cloned();
         assert!(
