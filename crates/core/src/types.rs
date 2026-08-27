@@ -201,6 +201,10 @@ pub struct OutboundCard {
     pub tool_calls: Vec<ToolCall>,
     /// 执行阶段（Running 态 footer 文案依据；终态忽略）。
     pub phase: CardPhase,
+    /// 排队提示（P10：本轮运行中入队的消息摘要，如 `📥 排队 2 条，最新：「…」`；
+    /// None = 无排队）。由 CardSession 每次 patch 从 dispatcher 的排队状态拉取
+    /// （活动期随 chunk 刷新）；平台在 Running footer 追加展示，终态忽略。
+    pub queued_hint: Option<String>,
     /// 卡片终态。
     pub terminal: CardTerminal,
 }

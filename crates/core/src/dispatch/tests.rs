@@ -1728,7 +1728,8 @@ fn merge_batch_joins_and_concats() {
     b.media_errors.push("dl fail".into());
     let blank = msg("c1", "u3", "   "); // 空文本跳过，media 仍并入
     let mut m = merge_batch(vec![a, b, blank]);
-    assert_eq!(m.text.as_deref(), Some("first\n\nsecond"));
+    // P10-④：多说话人（u1/u2）标注归属；空文本段（u3）跳过不标注。
+    assert_eq!(m.text.as_deref(), Some("【u1】first\n\n【u2】second"));
     assert_eq!(m.sender.0, "u1", "sender 取首条");
     assert_eq!(m.media.len(), 2, "media 拼接");
     assert_eq!(m.media_errors, vec!["dl fail".to_string()]);
@@ -1742,6 +1743,31 @@ fn merge_batch_joins_and_concats() {
     let merged = merge_batch(vec![media_only]);
     assert_eq!(merged.text, None);
     assert_eq!(merged.media.len(), 1);
+
+    // P10-④：同一发送者连发——不加说话人标注（避免噪音）。
+    let same = merge_batch(vec![msg("c1", "u1", "aaa"), msg("c1", "u1", "bbb")]);
+    assert_eq!(same.text.as_deref(), Some("aaa\n\nbbb"));
+}
+
+/// P10：排队状态展示文案——计数 + 最新摘要（40 字符截断）；零计数不展示。
+#[test]
+fn queued_hint_display_shapes() {
+    use crate::card_session::{queued_hint_display, QueuedHint};
+    assert!(queued_hint_display(&QueuedHint::default()).is_none());
+    let h = QueuedHint {
+        count: 2,
+        latest: "别用 npm，改用 pnpm".into(),
+    };
+    assert_eq!(
+        queued_hint_display(&h).as_deref(),
+        Some("📥 排队 2 条，最新：「别用 npm，改用 pnpm」")
+    );
+    let long = QueuedHint {
+        count: 1,
+        latest: "x".repeat(100),
+    };
+    let out = queued_hint_display(&long).unwrap();
+    assert!(out.chars().count() <= "📥 排队 1 条，最新：「」".chars().count() + 40);
 }
 
 /// P4-1：/stop 中断在飞任务——backend 被 abort（无 Final 回复）、在飞注册
