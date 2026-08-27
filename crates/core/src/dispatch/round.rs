@@ -308,6 +308,8 @@ impl Dispatcher {
                 // P5-5：失败路径保住已学到的 session id——部分失败轮次（如正常完成
                 // 但无最终文本被 backend 判 Err）会话本身是好的，落库后下条消息
                 // 续接而非静默开新会话。
+                // 失败/中断路径也记 usage 事件（无 RunOutcome，tokens 记 0）。
+                self.record_run_usage(&conv, None).await;
                 self.persist_learned_session(&conv, existing_sid.as_deref(), &learned_sid)
                     .await;
                 // D1：失败返回路径清理本 conv 的权限 pending（fail-closed deny +
@@ -365,6 +367,8 @@ impl Dispatcher {
                 // P5-5：中断路径保住已学到的 session id（与 Claude Code 自身的中断
                 // 语义一致：中断留在原会话，显式 /new 才重开）。会话进度保留后，
                 // 下条消息续接本轮已进行到的部分。
+                // 失败/中断路径也记 usage 事件（无 RunOutcome，tokens 记 0）。
+                self.record_run_usage(&conv, None).await;
                 self.persist_learned_session(&conv, existing_sid.as_deref(), &learned_sid)
                     .await;
                 // D1：中断返回路径同样清理 pending（空闲超时 abort 不经 /stop 的
@@ -392,12 +396,17 @@ impl Dispatcher {
                 } else {
                     self.reply(&conv, &m, &hint).await;
                 }
+                // 失败/中断路径也记 usage 事件（无 RunOutcome，tokens 记 0）。
+                self.record_run_usage(&conv, None).await;
                 self.persist_learned_session(&conv, existing_sid.as_deref(), &learned_sid)
                     .await;
                 self.cancel_pending_on_exit(&conv).await;
                 return;
             }
         };
+
+        // 成功路径：usage 落库 + 指标（backend 未产出 usage 时记零用量事件行）。
+        self.record_run_usage(&conv, outcome.usage.as_ref()).await;
 
         // 回传文本优先级：收到过的 Final > outcome.final_text > session_id 提示。
         if let Some(et) = &error_text {
@@ -445,6 +454,8 @@ impl Dispatcher {
             } else {
                 CardTerminal::Error("agent 异常退出".into())
             };
+            // 成本摘要（成功终态 footer 展示 `✅ 已完成 · $0.012`）。
+            c.usage_display = outcome.usage.as_ref().map(|u| u.display());
             c.finalize(
                 Some(reply.as_str()),
                 &tool_calls,
@@ -539,6 +550,45 @@ impl Dispatcher {
             }
         }
         // conv 锁由 runner 循环持有并统一释放；在飞注册由 run_agent_round 统一移除。
+    }
+
+    /// 每轮 usage 落库 + 指标：成功路径传 RunOutcome.usage；失败/中断路径拿不到
+    /// RunOutcome，传 None（仍记一行零用量事件，保证 /stats 轮次数完整）。
+    async fn record_run_usage(&self, conv: &ConvId, usage: Option<&crate::types::UsageStats>) {
+        let backend = self.backend.name();
+        if let Some(u) = usage {
+            METRICS
+                .token_usage
+                .with_label_values(&[backend, "input"])
+                .inc_by(u.input_tokens);
+            METRICS
+                .token_usage
+                .with_label_values(&[backend, "output"])
+                .inc_by(u.output_tokens);
+            if let Some(c) = u.cached_tokens {
+                METRICS
+                    .token_usage
+                    .with_label_values(&[backend, "cached"])
+                    .inc_by(c);
+            }
+            if let Some(cost) = u.total_cost_usd {
+                METRICS.cost_usd.with_label_values(&[backend]).inc_by(cost);
+            }
+        }
+        if let Err(e) = self
+            .store
+            .append_run_stat(
+                &conv.0,
+                Some(backend),
+                usage.map(|u| u.input_tokens as i64).unwrap_or(0),
+                usage.map(|u| u.output_tokens as i64).unwrap_or(0),
+                usage.and_then(|u| u.cached_tokens).map(|c| c as i64),
+                usage.and_then(|u| u.total_cost_usd),
+            )
+            .await
+        {
+            warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "append_run_stat 失败（best-effort）");
+        }
     }
 
     /// D1：轮次失败/超时/中断返回路径的权限 pending 清理——cancel_all 全部

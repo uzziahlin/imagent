@@ -17,5 +17,6 @@ mod store;
 
 pub use error::{Result, StoreError};
 pub use store::{
-    AllowedSenderRow, AuditRow, LiveCardRow, NamedSessionRow, SessionHistoryRow, SessionRow, Store,
+    AllowedSenderRow, AuditRow, LiveCardRow, NamedSessionRow, RunStatRow, SessionHistoryRow,
+    SessionRow, Store,
 };

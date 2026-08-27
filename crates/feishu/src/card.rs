@@ -84,7 +84,14 @@ pub fn render_card(card: &OutboundCard, conv_id: &str) -> String {
             true,
             None,
         ),
-        CardTerminal::Done => ("✅ 已完成".to_string(), false, None),
+        CardTerminal::Done => (
+            match &card.usage_display {
+                Some(u) => format!("✅ 已完成 · {u}"),
+                None => "✅ 已完成".to_string(),
+            },
+            false,
+            None,
+        ),
         CardTerminal::Error(e) => (
             terminal_footer(Some(e)).to_string(),
             false,
@@ -433,7 +440,9 @@ fn perm_detail_md(tool_name: &str, input_summary: &str) -> String {
 /// [`ASK_AUTO_DENY_MINS`]，即 core `permission_ask_timeout_secs` 缺省值）——
 /// 静态「长时间未处理」让用户无从判断还剩多久。
 pub(crate) fn perm_note_default() -> String {
-    format!("⏱️ 将在 {ASK_AUTO_DENY_MINS} 分钟后自动拒绝")
+    format!(
+        "⏱️ 将在 {ASK_AUTO_DENY_MINS} 分钟后自动拒绝 · 回复 always = 本次会话内此工具不再询问"
+    )
 }
 
 pub fn render_permission_card(
@@ -467,6 +476,9 @@ pub(crate) fn render_permission_card_note(
             flow_button_row(&[
                 cb_button("✅ 允许", "primary", serde_json::json!({
                     "imagent_perm": "allow", "conv": conv_id, "req": request_id
+                })),
+                cb_button("🔓 本次会话始终允许", "default", serde_json::json!({
+                    "imagent_perm": "always", "conv": conv_id, "req": request_id
                 })),
                 cb_button("⛔ 拒绝", "danger", serde_json::json!({
                     "imagent_perm": "deny", "conv": conv_id, "req": request_id
@@ -807,6 +819,7 @@ mod tests {
             phase: CardPhase::Thinking,
             queued_hint: None,
             terminal: CardTerminal::Running,
+            usage_display: None,
             run_secs: 0,
         };
         let json = render_card(&card, "feishu:ou_t");
@@ -833,6 +846,7 @@ mod tests {
                 phase,
                 queued_hint: None,
                 terminal: CardTerminal::Running,
+            usage_display: None,
             run_secs: 0,
             };
             assert!(
@@ -850,6 +864,7 @@ mod tests {
             phase: CardPhase::Outputting,
             queued_hint: None,
             terminal: CardTerminal::Done,
+            usage_display: None,
             run_secs: 0,
         };
         let json = render_card(&card, "feishu:ou_t");
@@ -876,6 +891,7 @@ mod tests {
             phase: CardPhase::ToolRunning,
             queued_hint: None,
             terminal: CardTerminal::Done,
+            usage_display: None,
             run_secs: 0,
         };
         let json = render_card(&card, "feishu:ou_t");
@@ -891,6 +907,7 @@ mod tests {
             phase: CardPhase::ToolRunning,
             queued_hint: None,
             terminal: CardTerminal::Running,
+            usage_display: None,
             run_secs: 0,
         };
         let md = stream_body_md(&running.text, &running.tool_calls);
@@ -906,6 +923,7 @@ mod tests {
             phase: CardPhase::Thinking,
             queued_hint: None,
             terminal: CardTerminal::Error("boom".into()),
+            usage_display: None,
             run_secs: 0,
         };
         let json = render_card(&card, "feishu:ou_t");
@@ -1041,9 +1059,11 @@ mod tests {
         assert!(json.contains("⛔ 拒绝"), "拒绝按钮: {json}");
         assert!(
             json.contains("\"imagent_perm\":\"allow\"")
-                && json.contains("\"imagent_perm\":\"deny\""),
-            "两个动作都应编码: {json}"
+                && json.contains("\"imagent_perm\":\"deny\"")
+                && json.contains("\"imagent_perm\":\"always\""),
+            "三个动作都应编码: {json}"
         );
+        assert!(json.contains("🔓 本次会话始终允许"), "始终允许按钮: {json}");
         assert!(json.contains("feishu:ou_u1"), "conv 应编码进 value: {json}");
         assert!(json.contains("\"tag\":\"button\""), "按钮 tag: {json}");
         // 真机校准（2026-08）：V2 已废弃 action 元素——按钮必须在 column_set 内，
@@ -1114,6 +1134,7 @@ mod tests {
             phase: CardPhase::Outputting,
             queued_hint: Some("📥 排队 1 条".into()),
             terminal: CardTerminal::Running,
+            usage_display: None,
             run_secs: 0,
         };
         let json = render_card(&card, "feishu:ou_t");
@@ -1168,6 +1189,7 @@ mod tests {
             phase: CardPhase::Outputting,
             queued_hint: None,
             terminal: CardTerminal::Running,
+            usage_display: None,
             run_secs: 0,
         };
         let json = render_card(&running, "feishu:ou_t");
@@ -1178,6 +1200,7 @@ mod tests {
             phase: CardPhase::Outputting,
             queued_hint: None,
             terminal: CardTerminal::Done,
+            usage_display: None,
             run_secs: 0,
         };
         let json2 = render_card(&done, "feishu:ou_t");
@@ -1268,6 +1291,7 @@ mod tests {
             phase: CardPhase::Outputting,
             queued_hint: None,
             terminal: CardTerminal::Done,
+            usage_display: None,
             run_secs: 0,
         };
         let json = render_stub_card(&card);
@@ -1468,6 +1492,7 @@ mod tests {
             phase: CardPhase::Thinking,
             queued_hint: None,
             terminal: CardTerminal::Running,
+            usage_display: None,
             run_secs: 0,
         };
         let json = render_card(&card, "feishu:ou_t");

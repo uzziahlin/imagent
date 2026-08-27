@@ -6,6 +6,43 @@
 
 （空——下一段变更从这里开始。）
 
+## [1.10.0] — 2026-08-27
+
+> **三波合批**：安全/正确性修复（SIGHUP 绕过、ACP fail-open、P10 锁内 await 等）+ 交互体验全面优化（错误文案、命令容错、卡片信息架构）+ 产品功能（token 成本统计、notify_via_im、审批记忆、/stats /audit）。523 tests / 0 failed。
+
+### Security
+- **SIGHUP 热重载补能力校验**：`reload_permission_mode` 与启动期 /perm 同口径——闭环档 × 非 FullLoop 后端拒绝热切，堵住 v1.9.0 启动 fail-closed 的旁路。
+- **ACP 审批集 fail-open 修复**：tool_name 改取 ACP title 首词（`"Bash git status"` → `"Bash"`），`approval_tools` 在 ACP 后端恢复命中，不再全部自动放行。
+- **启动期 socket bind 失败 fail-closed**：闭环档位下审批 socket bind 失败拒绝启动（原为静默继续、闭环死亡）。
+- **凭据加密升级 `enc:v2:`**：PBKDF2 100k→600k 且迭代数嵌入 payload（后续调参无需换格式）；GCM 加 AAD 绑定 `platform:account_id`（防密文挪行错配）；v1 兼容读取；惰性迁移 CAS 化（防并发 lost-update）。
+- **ACP hook pending 泄漏**：Drop guard 自动 cancel，run 被 cancel/超时不再残留误导性 pending。
+
+### Added
+- **token 成本统计**：三 backend 的 usage/cost 数据不再丢弃——`CliEvent::Usage` 事件层 + `RunOutcome.usage` + store `run_stats` 表（轮转 10000 条）+ `/stats [today|7d|all]` 命令（轮次/tokens/成本，全局+本会话）+ 成功终态 footer 附成本（`✅ 已完成 · $0.012`）+ Prometheus token/cost 指标。
+- **notify_via_im MCP 工具**：单向通知（不占 pending、不等回复）——终端 agent「跑完了叫一声」场景补全；socket 协议新增 `kind:"notify"`。
+- **审批记忆（会话级始终允许）**：审批卡新增「🔓 本次会话始终允许」按钮 / 文本回复 `always`——同会话同工具不再重复询问；/new /stop 清空；审批决定（allow/deny/always）落 audit_log。
+- **`/audit [n]` 命令**：消费既有 audit_log，默认最近 10 条（admin 门槛）。
+- **ACP 连接上限可配**：`with_conn_limits(max, idle)` builder（默认 8/10min 不变，待接 config）。
+
+### Changed
+- **失败文案人可读化**：backend 失败统一模板（摘要 + 可否续接 + 建议），`(done, session=xxx)` 改「（任务已完成，未返回文本）」，空闲超时时长人可读（「3 分钟」），审批超时明确告知「已自动拒绝，任务将被中断」。
+- **未知命令模糊匹配**：编辑距离 ≤2 建议（「未知命令 /halp，你是想找 /help 吗」）+ 分组竖排命令表。
+- **飞书卡片信息架构**：终态附完整工具明细（managed 正文全量引用行 + 降级/下沉卡折叠面板全量罗列）；审批卡 note 显示具体超时（「将在 5 分钟后自动拒绝」）、过期按钮点击回「已过期」反馈、详情截断加提示；问题卡 >4 选项走表单下拉、多选走 checkbox 表单；流式节流尾帧 flush（末个 ⏳ 必翻 ✅）；Running footer 附运行时长；下沉 stub 正文加终态状态词；danger 命令按钮二次确认弹窗；邮箱掩码处加「原命令可直接执行」提示。
+- **wecom 交互诚实化**：媒体发送明确报错（原「✅ 已发送」实为 no-op）；长文本 4000 字节分片（`(i/n)` 编号，UTF-8 边界安全）。
+- **store 加固**：事务 BUSY 重试前防御性 rollback（修复重试失效与连接毒化）；退避 sleep 不再持锁；`set_passphrase` 过滤空口令；keyring 迁移回写失败降级返回明文。
+- **杂项 UX**：`/resume` 序号选中不再错位、`/switch` 空参列已有会话、`/sessions` 出错有回复、/stop 后纯文本平台补「⏹ 本轮已被中断」、发现模式引导按 admin 实际状态、排队摘要按 40 字符截断、超 7 天相对时间不再回退裸时间戳。
+- **架构债清理**：A1 `/switch` 接 store 原子事务 API；A3 `ReplyHint::ILink` 泛化为 `ContextToken`；`Backend` trait 增默认 `shutdown()`，main 退出时显式调用（ACP 子进程即时回收）。
+
+### Fixed
+- **P10 锁内 await 网络 IO**：`enqueue_or_become_runner` 在 queues 锁内调飞书 API 造成跨会话队头阻塞——hint 推送移出临界区；取批/停止的 hint 清理移进同一临界区（防提示丢失）。
+- **ACP LoadSession/NewSession 错误不再被吞**：真实原因写回 run 响应；持锁跨 30s await 修复；僵尸连接防御性即时清理。
+- **send_text 最终失败重试一次**（原完全静默、消息石沉大海）。
+
+### Engineering
+- **CI 补 tag 触发 + release 前置 test job**（原 tag 发布全程不跑测试）。
+- **fuzz 新增 wecom_frame_parse target**（入站帧解析攻击面）。
+- **CLAUDE.md 重写**（修正 P3 时代漂移）、README 披露平台能力边界（wecom 无群聊/媒体、卡片仅飞书）、SECURITY.md 补加密与鉴权机制说明。
+
 ## [1.9.1] — 2026-08-27
 
 > agent 总超时语义修正：默认关闭墙钟总预算，防挂死完全由空闲看门狗承担——持续流式输出的长任务不再在 600s 被硬杀。

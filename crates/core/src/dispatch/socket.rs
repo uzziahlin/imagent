@@ -291,8 +291,8 @@ impl Dispatcher {
             return;
         }
         let conv = ConvId(conv_id.clone());
-        match kind {
-            "ask" => {
+        match classify_socket_kind(kind) {
+            SocketKind::Ask => {
                 Self::handle_ask_socket(
                     stream,
                     platform,
@@ -304,7 +304,12 @@ impl Dispatcher {
                 )
                 .await;
             }
-            _ => {
+            SocketKind::Notify => {
+                // notify_via_im：单向通知——直接 send_text 到目标 conv，不进
+                // router（不占 pending 槽、不等回复），结果一行 JSON 回写 socket。
+                Self::handle_notify_socket(stream, platform, conv, &req).await;
+            }
+            SocketKind::Permission => {
                 Self::handle_permission_kind_socket(
                     stream,
                     platform,
@@ -318,6 +323,70 @@ impl Dispatcher {
                 .await;
             }
         }
+    }
+
+    /// `kind = "notify"`：终端 agent 的 `notify_via_im` 单向通知。
+    ///
+    /// 请求字段：`message`（必填）、`source`（可选标记）；解析与文案的纯函数是
+    /// [`parse_notify_request`] / [`notify_text`]（便于单测）。投递 = 一条
+    /// `send_text`（不 register、不等回复），结果一行 JSON 回写：
+    /// `{"kind":"notify","ok":bool[, "error":"…"]}`。
+    #[cfg(unix)]
+    async fn handle_notify_socket(
+        mut stream: tokio::net::UnixStream,
+        platform: Arc<dyn Platform>,
+        conv: ConvId,
+        req: &serde_json::Value,
+    ) {
+        let (message, source) = match parse_notify_request(req) {
+            Some(v) => v,
+            None => {
+                Self::write_notify_reply(&mut stream, false, Some("empty message")).await;
+                return;
+            }
+        };
+        let text = notify_text(&message, source.as_deref());
+        let ok = platform
+            .send_text(&conv, &text, &ReplyHint::None)
+            .await
+            .is_ok();
+        if !ok {
+            warn!(
+                target: "imagent::core",
+                conv_id = %conv.0,
+                "notify_via_im 投递失败（IM 不可达）"
+            );
+        } else {
+            info!(
+                target: "imagent::core",
+                conv_id = %conv.0,
+                source = source.as_deref().unwrap_or("<none>"),
+                "notify_via_im 通知已送达"
+            );
+        }
+        let err = if ok { None } else { Some("send failed: IM 不可达") };
+        Self::write_notify_reply(&mut stream, ok, err).await;
+    }
+
+    /// 写 notify 分支的一行 JSON 回复。
+    #[cfg(unix)]
+    async fn write_notify_reply(
+        stream: &mut tokio::net::UnixStream,
+        ok: bool,
+        error: Option<&str>,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        let mut resp = serde_json::json!({ "kind": "notify", "ok": ok });
+        if let Some(e) = error {
+            resp["error"] = serde_json::json!(e);
+        }
+        let mut out = resp.to_string();
+        out.push('\n');
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let _ = stream.write_all(out.as_bytes()).await;
+            let _ = stream.flush().await;
+        })
+        .await;
     }
 
     /// `kind = "ask"`：终端 agent 的 `ask_via_im` 提问。合成 AskUserQuestion 输入
@@ -380,7 +449,7 @@ impl Dispatcher {
         // D5：先 register 占位（card_msg_id 后补）再发卡——否则用户极快点按钮时
         // 回调在 register 前到达，route 未命中回落 handle 被当普通 prompt 吞掉。
         let rx = router
-            .register(&conv.0, &request_id, None, PendingKind::Ask)
+            .register(&conv.0, &request_id, None, PendingKind::Ask, None)
             .await;
         let card_msg_id = match platform
             .send_permission_ask(
@@ -517,7 +586,33 @@ impl Dispatcher {
                 &mut stream,
                 PermissionReply {
                     allow: true,
+                    always: false,
                     message: Some("auto-allowed: tool not in approval_tools".into()),
+                    raw_text: None,
+                },
+            )
+            .await;
+            return;
+        }
+        // D-记忆：该 conv 已「始终允许」此工具 → 跳过 IM 审批直接放行（与
+        // mod.rs 的 ACP hook 同一口径）。
+        if router.is_session_allowed(&conv.0, &tool_name).await {
+            info!(
+                target: "imagent::core",
+                conv_id = %conv.0,
+                tool = %tool_name,
+                "会话级始终允许命中，跳过审批（session allow-set）"
+            );
+            crate::metrics::METRICS
+                .permission_decisions
+                .with_label_values(&["allow"])
+                .inc();
+            Self::write_permission_reply(
+                &mut stream,
+                PermissionReply {
+                    allow: true,
+                    always: false,
+                    message: Some("auto-allowed: tool in session allow-set（本会话已始终允许）".into()),
                     raw_text: None,
                 },
             )
@@ -536,7 +631,13 @@ impl Dispatcher {
         // route 未命中回落 handle 被当普通 prompt。P1-3：发送失败 → 撤占位、
         // 回写 deny 并 return，不留 pending。
         let rx = router
-            .register(&conv_id, &request_id, None, PendingKind::Permission)
+            .register(
+                &conv_id,
+                &request_id,
+                None,
+                PendingKind::Permission,
+                Some(&tool_name),
+            )
             .await;
         let card_msg_id = match platform
             .send_permission_ask(
@@ -556,6 +657,7 @@ impl Dispatcher {
                     &mut stream,
                     PermissionReply {
                         allow: false,
+                        always: false,
                         message: Some("send_text failed: IM 不可达".into()),
                         raw_text: None,
                     },
@@ -588,6 +690,7 @@ impl Dispatcher {
                     .inc();
                 PermissionReply {
                     allow: false,
+                    always: false,
                     message: Some("permission router dropped".into()),
                     raw_text: None,
                 }
@@ -605,6 +708,7 @@ impl Dispatcher {
                     .inc();
                 PermissionReply {
                     allow: false,
+                    always: false,
                     message: Some(format!(
                         "permission ask timed out after {permission_ask_timeout:?}"
                     )),
@@ -615,6 +719,46 @@ impl Dispatcher {
         // 写回 socket（一行 JSON）。
         Self::write_permission_reply(&mut stream, reply).await;
     }
+}
+
+/// socket 请求的 kind 分类（纯函数，便于单测）：ask=终端问答、notify=单向通知、
+/// 其余（含缺省 "permission"）=IM 权限审批。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SocketKind {
+    Permission,
+    Ask,
+    Notify,
+}
+
+pub(crate) fn classify_socket_kind(kind: &str) -> SocketKind {
+    match kind {
+        "ask" => SocketKind::Ask,
+        "notify" => SocketKind::Notify,
+        _ => SocketKind::Permission,
+    }
+}
+
+/// notify 请求解析（纯函数，便于单测）：`message` 必填非空，`source` 可选。
+/// 返回 `None` = message 缺失/为空（调用方按协议回 error）。
+pub(crate) fn parse_notify_request(
+    req: &serde_json::Value,
+) -> Option<(String, Option<String>)> {
+    let message = req
+        .get("message")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    let source = req
+        .get("source")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    Some((message, source))
+}
+
+/// notify 投递文案：来源前缀（与 ask_via_im 同款清洗/截断）+ 消息正文。
+pub(crate) fn notify_text(message: &str, source: Option<&str>) -> String {
+    format!("{}{message}", crate::mcp::notify_source_prefix(source))
 }
 
 /// 本进程的 uid（peer-uid 鉴权用）。
@@ -688,5 +832,57 @@ pub(crate) fn peer_uid(stream: &tokio::net::UnixStream) -> Option<u32> {
             let _ = fd;
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod notify_tests {
+    use super::*;
+
+    /// notify 请求解析：message 必填非空；source 可选（空白视为缺省）。
+    #[test]
+    fn parse_notify_request_valid_and_invalid() {
+        let ok = serde_json::json!({
+            "kind": "notify", "conv_id": "feishu:ou_x",
+            "message": "  构建完成  ", "source": "  imagent 项目 "
+        });
+        let (msg, src) = parse_notify_request(&ok).expect("合法请求应解析");
+        assert_eq!(msg, "构建完成");
+        assert_eq!(src.as_deref(), Some("imagent 项目"));
+
+        // message 缺失 / 空 → None（协议侧按 empty message 回 error）。
+        for bad in [
+            serde_json::json!({"kind": "notify", "conv_id": "c"}),
+            serde_json::json!({"kind": "notify", "conv_id": "c", "message": "   "}),
+            serde_json::json!({"kind": "notify", "conv_id": "c", "message": 42}),
+        ] {
+            assert!(parse_notify_request(&bad).is_none(), "应拒绝: {bad}");
+        }
+        // source 空白 → None（不进前缀）。
+        let no_src = serde_json::json!({"message": "hi", "source": "  "});
+        assert_eq!(parse_notify_request(&no_src).unwrap().1, None);
+    }
+
+    /// notify 文案：来源前缀 + 正文（与 ask 前缀措辞区隔）。
+    #[test]
+    fn notify_text_carries_source_prefix() {
+        let t = notify_text("构建完成", Some("imagent"));
+        assert!(t.contains("🔔"), "通知前缀: {t}");
+        assert!(t.contains("imagent"));
+        assert!(t.ends_with("构建完成"));
+        let t2 = notify_text("done", None);
+        assert!(t2.contains("通知") && t2.ends_with("done"), "{t2}");
+    }
+
+    /// dispatch 分支：kind 值映射——"notify" 走单向通知，"ask" 走问答，其余
+    /// （含缺省 "permission"）走审批。
+    #[test]
+    fn socket_kind_routing_words() {
+        assert_eq!(classify_socket_kind("notify"), SocketKind::Notify);
+        assert_eq!(classify_socket_kind("ask"), SocketKind::Ask);
+        assert_eq!(classify_socket_kind("permission"), SocketKind::Permission);
+        // 未知/缺省 kind 回落审批语义（与旧协议兼容）。
+        assert_eq!(classify_socket_kind("unknown"), SocketKind::Permission);
+        assert_eq!(classify_socket_kind(""), SocketKind::Permission);
     }
 }

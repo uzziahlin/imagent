@@ -245,7 +245,7 @@ pub struct CardOperatorId {
 }
 
 /// 解析按钮卡片回调（card.action.trigger），两类 value（P6-3 扩展）：
-/// - 审批按钮：`{"imagent_perm":"allow|deny","conv":"feishu:…"}` → `text = "y"/"n"`，
+/// - 审批按钮：`{"imagent_perm":"allow|always|deny","conv":"feishu:…"}` → `text = "y"/"always"/"n"`，
 ///   core 的 recv 循环把 pending conv 的非斜杠消息当审批回复路由（`parse_reply`）；
 /// - 命令按钮：`{"imagent_cmd":"/ws use main","conv":"feishu:…"}` → `text = <command>`，
 ///   走与手打命令完全相同的鉴权/分派路径（admin 门槛等不豁免）。
@@ -318,6 +318,10 @@ pub fn parse_card_action_event(payload: &[u8]) -> Option<(String, InboundMessage
     } else {
         match (act, cmd) {
             (Some("allow"), _) => "y".to_string(),
+            // D-记忆：始终允许（本会话内此工具后续审批直接放行）——core 的
+            // parse_reply 命中 ALWAYS_WORDS，router 把 pending 的工具加入
+            // 该 conv 的会话级 allow-set。
+            (Some("always"), _) => "always".to_string(),
             (Some("deny"), _) => "n".to_string(),
             (_, Some(c)) if c.starts_with('/') => c.to_string(),
             _ => return None,
@@ -1370,6 +1374,24 @@ mod tests {
         assert_eq!(key, "evt_ask_1");
         assert_eq!(msg.text.as_deref(), Some("ask:数据库迁移"));
         assert_eq!(msg.conv_id.0, "feishu:ou_q");
+    }
+
+    /// D-记忆：审批卡「🔓 本次会话始终允许」按钮 → text = "always"（core 的
+    /// parse_reply 命中 ALWAYS_WORDS，route 把 pending 工具加入会话级 allow-set）。
+    #[test]
+    fn card_action_always_button_maps_to_always_word() {
+        let payload = br#"{
+            "header": {"event_type": "card.action.trigger", "event_id": "e-always"},
+            "event": {
+                "action": {"tag": "button", "value": {
+                    "imagent_perm": "always", "conv": "feishu:ou_a", "req": "p-1"
+                }},
+                "operator": {"open_id": "ou_op"}
+            }
+        }"#;
+        let (_, msg) = parse_card_action_event(payload).expect("always 回调应解析");
+        assert_eq!(msg.text.as_deref(), Some("always"));
+        assert_eq!(msg.ask_req.as_deref(), Some("p-1"), "req 精确路由");
     }
 
     /// 多 pending：value 携带 req（request_id）→ ask_req 透传（无 req 时为 None，

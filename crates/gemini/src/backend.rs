@@ -136,7 +136,13 @@ fn gemini_parse(line: &str) -> CliEvent {
             session: None,
         },
         ParsedEvent::ToolResult { tool, output } => CliEvent::ToolResult { tool, output },
-        ParsedEvent::Result => CliEvent::Terminal { session: None },
+        ParsedEvent::Result { usage } => {
+            // usage 须在 Terminal 之前——读取循环在 Terminal 处 break。
+            match usage {
+                Some(u) => CliEvent::Multi(vec![CliEvent::Usage(u), CliEvent::Terminal { session: None }]),
+                None => CliEvent::Terminal { session: None },
+            }
+        }
         ParsedEvent::Error { message } => CliEvent::Error {
             text: message,
             session: None,

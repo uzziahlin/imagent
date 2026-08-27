@@ -13,6 +13,8 @@ impl Dispatcher {
         if let Err(e) = self.store.delete_session(&conv.0).await {
             warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "delete_session 失败");
         }
+        // D-记忆：新会话不继承旧的「始终允许」授权。
+        self.router.clear_session_allows(&conv.0).await;
         // 清当前活动命名 → 回到默认未命名 session。
         if let Err(e) = self.store.delete_config(&active_name_key(&conv.0)).await {
             warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "delete_config(active_name) 失败");
@@ -242,7 +244,6 @@ impl Dispatcher {
             self.cmd_sessions(conv, hint).await;
             return;
         }
-        let key = active_name_key(&conv.0);
         match self.store.get_named_session(&conv.0, name).await {
             Ok(Some(row)) => {
                 // P2-A：校验 agent_kind——不同 backend 的 session_id 不互通，
@@ -262,6 +263,9 @@ impl Dispatcher {
                     }
                 }
                 // 切回历史命名 session：把它写成活动 session（续接用）。
+                // A1 接线：store 的 switch_named_session 单事务完成「活动 session
+                // 写入 + active_name + 清 compact_summary」，替代此前多次独立
+                // autocommit（中间崩溃会留下 active_name 指向旧 session 的不一致）。
                 let now = now_secs();
                 let sr = SessionRow {
                     conv_id: conv.0.clone(),
@@ -276,11 +280,8 @@ impl Dispatcher {
                     created_at: row.created_at,
                     updated_at: now,
                 };
-                if let Err(e) = self.store.upsert_session(&sr).await {
-                    warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "upsert_session 失败");
-                }
-                if let Err(e) = self.store.set_config(&key, name).await {
-                    warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "set_config(active_name) 失败");
+                if let Err(e) = self.store.switch_named_session(&conv.0, name, Some(&sr)).await {
+                    warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "switch_named_session 失败");
                 }
                 let sid_short: String = row.session_id.chars().take(8).collect();
                 self.reply(
@@ -292,11 +293,9 @@ impl Dispatcher {
             }
             Ok(None) => {
                 // 新命名 session：清活动 session（下次新建）+ 设 active_name。
-                if let Err(e) = self.store.delete_session(&conv.0).await {
-                    warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "delete_session 失败");
-                }
-                if let Err(e) = self.store.set_config(&key, name).await {
-                    warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "set_config(active_name) 失败");
+                // A1 接线：同一原子 API（activate=None 分支）。
+                if let Err(e) = self.store.switch_named_session(&conv.0, name, None).await {
+                    warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "switch_named_session 失败");
                 }
                 self.reply(
                     conv,
@@ -509,6 +508,9 @@ impl Dispatcher {
         // D6：去掉前置 has_pending（与 cancel_all 两步锁间隙可能被 route 击穿），
         // 直接 cancel_all 并按其返回的被清列表判断是否需要收敛询问卡。
         let cleared = self.router.cancel_all(&conv.0).await;
+        // D-记忆：中断即收回「始终允许」授权——/stop 语义是全停，旧授权不应
+        // 在下一次任务继续生效。
+        self.router.clear_session_allows(&conv.0).await;
         if !cleared.is_empty() {
             // P5-16：收敛审批询问本身——把 IM 里滞留的询问卡片 patch 成
             // 「已中断」（纯文本询问平台 no-op）。best-effort。多 pending 并存

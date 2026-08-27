@@ -486,6 +486,8 @@ impl LongLivedAcp {
                                         session_id: SessionId(sid),
                                         final_text,
                                         terminal: true,
+                                        // ACP 协议无 usage 事件，保持 None。
+                                        usage: None,
                                     }));
                                 }
                                 Err(e) => {
@@ -548,6 +550,14 @@ impl Backend for AcpBackend {
     /// 扫描逻辑同 ClaudeBackend。
     async fn list_local_sessions(&self, workdir: &std::path::Path) -> Vec<LocalSession> {
         crate::sessions::scan_for_backend(workdir)
+    }
+
+    /// 进程退出接线（main 在 dispatcher.run() 返回后统一调用）：断开全部
+    /// per-conv 连接，长驻 task 退出 → connection drop → ChildGuard kill 子
+    /// 进程。语义与固有 [`AcpBackend::shutdown`] 相同，经 trait 暴露给
+    /// `Arc<dyn Backend>` 调用方。
+    async fn shutdown(&self) {
+        AcpBackend::shutdown(self).await
     }
 
     async fn run(

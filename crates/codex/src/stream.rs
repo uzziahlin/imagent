@@ -9,10 +9,11 @@
 //!
 //! 详见任务文档 §2 的 codex JSONL schema。
 
+use imagent_core::UsageStats;
 use serde_json::Value;
 
 /// codex JSONL 单行解析结果。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ParsedEvent {
     /// `thread.started`：session id（字段 `thread_id`）。
     ThreadStarted { thread_id: String },
@@ -22,8 +23,9 @@ pub enum ParsedEvent {
     ToolUse { tool: String, input: String },
     /// 工具结果（command_execution completed / mcp_tool_call completed）。
     ToolResult { tool: String, output: String },
-    /// `turn.completed`（成功终止）。
-    TurnCompleted,
+    /// `turn.completed`（成功终止）。附带 usage（`usage.input_tokens` /
+    /// `output_tokens` / `cached_input_tokens` / `total_cost_usd`，缺失为 None/0）。
+    TurnCompleted { usage: Option<UsageStats> },
     /// `turn.failed`（失败终止）。
     TurnFailed { message: String },
     /// 顶层 `error` 事件（可能瞬时重连，上层 best-effort，不致命）。
@@ -79,7 +81,9 @@ pub fn parse_line(line: &str) -> ParsedEvent {
                 .to_string();
             ParsedEvent::ThreadStarted { thread_id: tid }
         }
-        Some("turn.completed") => ParsedEvent::TurnCompleted,
+        Some("turn.completed") => ParsedEvent::TurnCompleted {
+            usage: extract_usage(&value),
+        },
         Some("turn.failed") => ParsedEvent::TurnFailed {
             message: value
                 .get("error")
@@ -164,6 +168,24 @@ fn parse_item(event_type: &str, value: &Value, thread_id: Option<String>) -> Par
     }
 }
 
+/// 从 turn.completed 事件抽取 usage 对象（input/output/cached tokens，
+/// 部分版本还带 total_cost_usd）。全部缺失 → None。
+fn extract_usage(value: &Value) -> Option<UsageStats> {
+    let u = value.get("usage")?;
+    let num = |k: &str| u.get(k).and_then(Value::as_u64);
+    let input = num("input_tokens");
+    let output = num("output_tokens");
+    if input.is_none() && output.is_none() {
+        return None;
+    }
+    Some(UsageStats {
+        input_tokens: input.unwrap_or(0),
+        output_tokens: output.unwrap_or(0),
+        cached_tokens: num("cached_input_tokens"),
+        total_cost_usd: u.get("total_cost_usd").and_then(Value::as_f64),
+    })
+}
+
 /// 从 JSON 对象抽取非空顶层 `thread_id`。
 fn extract_thread_id(value: &Value) -> Option<String> {
     value
@@ -211,8 +233,24 @@ mod tests {
     #[test]
     fn turn_completed() {
         assert_eq!(
-            parse_line(r#"{"type":"turn.completed","usage":{"input_tokens":1}}"#),
-            ParsedEvent::TurnCompleted
+            parse_line(r#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2,"cached_input_tokens":7}}"#),
+            ParsedEvent::TurnCompleted {
+                usage: Some(UsageStats {
+                    input_tokens: 1,
+                    output_tokens: 2,
+                    cached_tokens: Some(7),
+                    total_cost_usd: None,
+                }),
+            }
+        );
+    }
+
+    /// turn.completed 无 usage 对象 → usage 为 None。
+    #[test]
+    fn turn_completed_without_usage() {
+        assert_eq!(
+            parse_line(r#"{"type":"turn.completed"}"#),
+            ParsedEvent::TurnCompleted { usage: None }
         );
     }
 

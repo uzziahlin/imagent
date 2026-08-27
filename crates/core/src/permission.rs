@@ -10,7 +10,7 @@
 //! 下终端 agent 的提问与 IM 会话的审批互不顶替；回复路由三级——按钮回调带
 //! request_id 精确匹配 → 引用回复（parent 消息 id 命中询问卡）→ 最新 pending 兜底。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tokio::sync::{oneshot, Mutex};
 
@@ -40,10 +40,35 @@ pub fn needs_approval(approval_tools: &[String], tool_name: &str) -> bool {
             .any(|p| tool_matches_pattern(p, tool_name))
 }
 
+/// 审批决定（词表解析结果；tool 名由 pending 条目在 route 时补齐）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    Allow,
+    Deny,
+    /// 「always / 始终允许」：本次会话内该工具后续调用跳过审批。
+    AllowAlways,
+}
+
+/// 文本 → 三态决定（allow/deny/always）。与 [`parse_reply`] 同词表，供需要
+/// 区分「始终允许」的调用方使用（parse_reply 以 `always` 标志承载同一信息）。
+pub fn parse_decision(text: &str) -> Decision {
+    let r = parse_reply(text);
+    if r.always {
+        Decision::AllowAlways
+    } else if r.allow {
+        Decision::Allow
+    } else {
+        Decision::Deny
+    }
+}
+
 /// 用户的 approve/deny 回复。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionReply {
     pub allow: bool,
+    /// 审批记忆（D-记忆）：用户回复「always/始终允许」时为 true——route 侧据此
+    /// 把 pending 条目的 tool 加入该 conv 的会话级 allow-set。
+    pub always: bool,
     pub message: Option<String>,
     /// 用户回复的**原文**（按钮回调为 `ask:<选项>` 展开、自由文本为原文）。
     /// 权限路径不读它（allow/deny 语义不变）；ask_via_im 路径以它作为用户答案回传。
@@ -91,6 +116,16 @@ const DENY_WORDS: &[&str] = &[
     "不批",
 ];
 
+/// 「始终允许」词表（D-记忆：本次会话内该工具后续调用跳过审批）。
+/// 全字匹配（trim + 小写），与 allow/deny 词表同口径。
+const ALWAYS_WORDS: &[&str] = &["always", "始终允许", "会话内允许"];
+
+/// 文本是否命中「始终允许」词表（parse_reply 据此置 `always` 标志）。
+pub fn is_always_word(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    ALWAYS_WORDS.contains(&lower.as_str())
+}
+
 /// 自由文本是否**明确命中**审批词表（allow 或 deny 词，全字匹配）。
 /// D2：无 reply_to/ask_req 锚定的自由文本，只有命中此词表才可被当审批决定消费。
 pub fn is_explicit_reply_word(text: &str) -> bool {
@@ -99,7 +134,9 @@ pub fn is_explicit_reply_word(text: &str) -> bool {
         return false;
     }
     let lower = t.to_ascii_lowercase();
-    ALLOW_WORDS.contains(&lower.as_str()) || DENY_WORDS.contains(&lower.as_str())
+    ALLOW_WORDS.contains(&lower.as_str())
+        || DENY_WORDS.contains(&lower.as_str())
+        || ALWAYS_WORDS.contains(&lower.as_str())
 }
 
 /// 解析用户回复文本为 approve/deny。
@@ -118,6 +155,7 @@ pub fn parse_reply(text: &str) -> PermissionReply {
     if t.is_empty() {
         return PermissionReply {
             allow: false,
+            always: false,
             message: Some("empty reply".into()),
             raw_text: None,
         };
@@ -130,6 +168,7 @@ pub fn parse_reply(text: &str) -> PermissionReply {
         if !choice.is_empty() {
             return PermissionReply {
                 allow: false,
+                always: false,
                 message: Some(format!("用户选择：{choice}")),
                 raw_text: Some(format!("用户选择：{choice}")),
             };
@@ -140,9 +179,13 @@ pub fn parse_reply(text: &str) -> PermissionReply {
     // 误判为 allow，对权限 approve/deny 是真实安全 bug）。改为精确匹配词表。
     // P2-12：补中文高频确认词（「可以」「行」「没问题」等），降低中文用户误 deny 率。
     let allow = ALLOW_WORDS.contains(&lower.as_str());
+    // D-记忆：「always / 始终允许」= 本次允许 + 会话级 allow（tool 名由 route 侧
+    // 从 pending 条目补齐——parse_reply 无从得知请求的工具）。
+    let always = is_always_word(t);
     PermissionReply {
-        allow,
-        message: if allow {
+        allow: allow || always,
+        always,
+        message: if allow || always {
             None
         } else {
             Some(format!("denied by user reply: {t}"))
@@ -168,21 +211,63 @@ struct PendingAsk {
     /// 询问卡的 IM 侧消息 id（自由文本引用回复的路由锚点；文本询问为 None）。
     /// D5：register 时可先为 None 占位，发卡成功后 `set_card_msg_id` 回填。
     card_msg_id: Option<String>,
+    /// 请求审批的工具名（Permission 来源必带；Ask 来源为 None）——「始终允许」
+    /// 回复据此把工具加入该 conv 的会话级 allow-set（D-记忆）。
+    tool_name: Option<String>,
     /// 来源（D3 看门狗豁免只认 Permission）。
     kind: PendingKind,
     tx: oneshot::Sender<PermissionReply>,
 }
 
+/// route() 成功投递的决定（request_id + 该次审批的工具名）。
+/// D-记忆/审计用：调用方据此落 `permission_decision` 审计（tool/decision/sender）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutedDecision {
+    pub request_id: String,
+    /// 被审批的工具名（Ask 来源 / 未带工具名的 pending 为 None）。
+    pub tool_name: Option<String>,
+}
+
 /// per-conv × request_id 权限请求路由表（多 pending 并存）。
 pub struct PermissionRouter {
     pending: Mutex<HashMap<String, Vec<PendingAsk>>>,
+    /// D-记忆：per-conv 会话级 allow-set（用户回复「always/始终允许」后，该
+    /// conv 上此工具的后续审批请求直接放行）。进程内状态——`/stop`、`/new`
+    /// 时清空（换任务/新会话不应继承旧授权）。
+    session_allows: Mutex<HashMap<String, HashSet<String>>>,
 }
 
 impl PermissionRouter {
     pub fn new() -> Self {
         Self {
             pending: Mutex::new(HashMap::new()),
+            session_allows: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// D-记忆：把工具加入该 conv 的会话级 allow-set（「始终允许」回复落地）。
+    pub async fn allow_always(&self, conv_id: &str, tool_name: &str) {
+        self.session_allows
+            .lock()
+            .await
+            .entry(conv_id.to_string())
+            .or_default()
+            .insert(tool_name.to_string());
+    }
+
+    /// D-记忆：该 conv 上此工具是否已被「始终允许」（审批前置检查——命中即
+    /// 跳过 IM 审批，直接放行）。
+    pub async fn is_session_allowed(&self, conv_id: &str, tool_name: &str) -> bool {
+        self.session_allows
+            .lock()
+            .await
+            .get(conv_id)
+            .is_some_and(|s| s.contains(tool_name))
+    }
+
+    /// D-记忆：清空该 conv 的会话级 allow-set（/stop、/new）。
+    pub async fn clear_session_allows(&self, conv_id: &str) {
+        self.session_allows.lock().await.remove(conv_id);
     }
 
     /// 是否有 conv 处于等待回复状态。
@@ -248,11 +333,13 @@ impl PermissionRouter {
         request_id: &str,
         card_msg_id: Option<String>,
         kind: PendingKind,
+        tool_name: Option<&str>,
     ) -> oneshot::Receiver<PermissionReply> {
         let (tx, rx) = oneshot::channel();
         let entry = PendingAsk {
             request_id: request_id.to_string(),
             card_msg_id,
+            tool_name: tool_name.filter(|s| !s.is_empty()).map(|s| s.to_string()),
             kind,
             tx,
         };
@@ -262,6 +349,7 @@ impl PermissionRouter {
             let old = list.remove(i);
             let _ = old.tx.send(PermissionReply {
                 allow: false,
+                always: false,
                 message: Some("superseded（同一请求被重新发起）".into()),
                 raw_text: None,
             });
@@ -271,6 +359,7 @@ impl PermissionRouter {
             let oldest = list.remove(0);
             let _ = oldest.tx.send(PermissionReply {
                 allow: false,
+                always: false,
                 message: Some("cancelled（pending 超上限，最旧询问被收敛）".into()),
                 raw_text: None,
             });
@@ -291,7 +380,7 @@ impl PermissionRouter {
         req_hint: Option<&str>,
         parent_msg_id: Option<&str>,
         reply: PermissionReply,
-    ) -> Option<String> {
+    ) -> Option<RoutedDecision> {
         let mut map = self.pending.lock().await;
         let list = map.get_mut(conv_id)?;
         let idx = match (req_hint, parent_msg_id) {
@@ -305,8 +394,27 @@ impl PermissionRouter {
         if list.is_empty() {
             map.remove(conv_id);
         }
+        // D-记忆：「始终允许」+ Permission 来源且带工具名 → 落入该 conv 的会话级
+        // allow-set（后续同工具审批直接放行）。锁 pending 期间再锁 session_allows
+        //（两锁无反向获取顺序，无死锁面）。
+        if reply.always && hit.kind == PendingKind::Permission {
+            if let Some(tool) = hit.tool_name.clone() {
+                self.session_allows
+                    .lock()
+                    .await
+                    .entry(conv_id.to_string())
+                    .or_default()
+                    .insert(tool);
+            }
+        }
         // send 失败说明 receiver 已 drop（register 方未在等），视为未命中。
-        hit.tx.send(reply).ok().map(|_| hit.request_id)
+        hit.tx
+            .send(reply)
+            .ok()
+            .map(|_| RoutedDecision {
+                request_id: hit.request_id,
+                tool_name: hit.tool_name,
+            })
     }
 
     /// 清理单个 pending（超时 / router-drop 路径）：投递 deny（fail-closed）唤醒
@@ -324,6 +432,7 @@ impl PermissionRouter {
             drop(map);
             let _ = old.tx.send(PermissionReply {
                 allow: false,
+                always: false,
                 message: Some("cancelled（任务被 /stop 中断或审批超时）".into()),
                 raw_text: None,
             });
@@ -344,6 +453,7 @@ impl PermissionRouter {
             .map(|p| {
                 let _ = p.tx.send(PermissionReply {
                     allow: false,
+                    always: false,
                     message: Some("cancelled（任务被 /stop 中断或审批超时）".into()),
                     raw_text: None,
                 });
@@ -368,7 +478,7 @@ mod tests {
         // P1-8：cancel 清理 pending，避免超时/router-drop 残留累积。
         let r = PermissionRouter::new();
         let _rx = r
-            .register("conv1", "req1", None, PendingKind::Permission)
+            .register("conv1", "req1", None, PendingKind::Permission, None)
             .await;
         assert!(r.has_pending("conv1").await);
         r.cancel("conv1", "req1").await;
@@ -381,7 +491,7 @@ mod tests {
     async fn cancel_waits_no_more_denies_waiter() {
         let r = PermissionRouter::new();
         let rx = r
-            .register("conv1", "req1", None, PendingKind::Permission)
+            .register("conv1", "req1", None, PendingKind::Permission, None)
             .await;
         r.cancel("conv1", "req1").await;
         // 等待者应立即（而非超时后）收到 deny。
@@ -397,8 +507,8 @@ mod tests {
     #[tokio::test]
     async fn multi_pending_routes_by_request_id() {
         let r = PermissionRouter::new();
-        let rx_im = r.register("c", "im-1", None, PendingKind::Permission).await;
-        let rx_term = r.register("c", "t-1", None, PendingKind::Permission).await;
+        let rx_im = r.register("c", "im-1", None, PendingKind::Permission, None).await;
+        let rx_term = r.register("c", "t-1", None, PendingKind::Permission, None).await;
         // 按钮/回调带 req=t-1 → 只唤醒终端一路。
         let hit = r
             .route(
@@ -407,12 +517,13 @@ mod tests {
                 None,
                 PermissionReply {
                     allow: false,
+                    always: false,
                     message: None,
                     raw_text: Some("用户选择：B".into()),
                 },
             )
             .await;
-        assert_eq!(hit.as_deref(), Some("t-1"));
+        assert_eq!(hit.as_ref().map(|d| d.request_id.as_str()), Some("t-1"));
         let term = tokio::time::timeout(std::time::Duration::from_secs(1), rx_term)
             .await
             .expect("t-1 应被唤醒")
@@ -427,12 +538,13 @@ mod tests {
                 None,
                 PermissionReply {
                     allow: true,
+                    always: false,
                     message: None,
                     raw_text: Some("y".into()),
                 },
             )
             .await;
-        assert_eq!(hit2.as_deref(), Some("im-1"));
+        assert_eq!(hit2.as_ref().map(|d| d.request_id.as_str()), Some("im-1"));
         assert!(rx_im.await.unwrap().allow);
         assert!(!r.has_pending("c").await);
     }
@@ -447,6 +559,7 @@ mod tests {
                 "im-1",
                 Some("om_old".to_string()),
                 PendingKind::Permission,
+                None,
             )
             .await;
         let _rx_new = r
@@ -455,6 +568,7 @@ mod tests {
                 "t-1",
                 Some("om_new".to_string()),
                 PendingKind::Permission,
+                None,
             )
             .await;
         let hit = r
@@ -464,12 +578,13 @@ mod tests {
                 Some("om_old"),
                 PermissionReply {
                     allow: true,
+                    always: false,
                     message: None,
                     raw_text: Some("y".into()),
                 },
             )
             .await;
-        assert_eq!(hit.as_deref(), Some("im-1"), "引用旧卡应路由 im-1 而非最新");
+        assert_eq!(hit.as_ref().map(|d| d.request_id.as_str()), Some("im-1"), "引用旧卡应路由 im-1 而非最新");
         assert!(r.has_pending("c").await, "t-1 不应被消费");
     }
 
@@ -477,8 +592,8 @@ mod tests {
     #[tokio::test]
     async fn reregister_same_request_id_supersedes() {
         let r = PermissionRouter::new();
-        let rx_old = r.register("c", "req1", None, PendingKind::Permission).await;
-        let _rx_new = r.register("c", "req1", None, PendingKind::Permission).await;
+        let rx_old = r.register("c", "req1", None, PendingKind::Permission, None).await;
+        let _rx_new = r.register("c", "req1", None, PendingKind::Permission, None).await;
         let old = tokio::time::timeout(std::time::Duration::from_secs(1), rx_old)
             .await
             .expect("旧等待者应立即被唤醒")
@@ -493,8 +608,8 @@ mod tests {
     #[tokio::test]
     async fn cancel_all_wakes_every_waiter() {
         let r = PermissionRouter::new();
-        let rx1 = r.register("c", "a", None, PendingKind::Permission).await;
-        let rx2 = r.register("c", "b", None, PendingKind::Permission).await;
+        let rx1 = r.register("c", "a", None, PendingKind::Permission, None).await;
+        let rx2 = r.register("c", "b", None, PendingKind::Permission, None).await;
         let ids = r.cancel_all("c").await;
         assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
         for rx in [rx1, rx2] {
@@ -554,6 +669,115 @@ mod tests {
         }
     }
 
+    /// D-记忆：「always / 始终允许」词表——allow + always 双标志。
+    #[test]
+    fn parse_reply_always_variants() {
+        for s in ["always", "ALWAYS", "Always", "始终允许", "会话内允许"] {
+            let r = parse_reply(s);
+            assert!(r.allow, "always 应同时 allow: {s:?}");
+            assert!(r.always, "应带 always 标志: {s:?}");
+            assert!(r.message.is_none(), "allow 类回复不带 message: {s:?}");
+            assert_eq!(parse_decision(s), Decision::AllowAlways, "{s:?}");
+        }
+        // 近似词不得误命中（fail-closed：落到 deny）。
+        for s in ["alway", "always?", "始终", "允许 always"] {
+            let r = parse_reply(s);
+            assert!(!r.always, "近似词不应命中 always: {s:?}");
+        }
+        // 普通 allow 词不带 always 标志。
+        let r = parse_reply("y");
+        assert!(r.allow && !r.always);
+        assert_eq!(parse_decision("y"), Decision::Allow);
+        assert_eq!(parse_decision("n"), Decision::Deny);
+    }
+
+    /// D-记忆：always 词命中 is_explicit_reply_word（自由文本可被消费为审批决定）。
+    #[test]
+    fn explicit_reply_word_includes_always() {
+        assert!(is_explicit_reply_word("always"));
+        assert!(is_explicit_reply_word("始终允许"));
+        assert!(!is_explicit_reply_word("alway"));
+    }
+
+    /// D-记忆：AllowAlways 回复命中带工具名的 Permission pending → 工具进入该
+    /// conv 的会话级 allow-set；Ask 来源不进。
+    #[tokio::test]
+    async fn route_always_populates_session_allow_set() {
+        let r = PermissionRouter::new();
+        let _rx = r
+            .register("c", "p-1", None, PendingKind::Permission, Some("Bash"))
+            .await;
+        assert!(!r.is_session_allowed("c", "Bash").await);
+        let hit = r
+            .route(
+                "c",
+                Some("p-1"),
+                None,
+                PermissionReply {
+                    allow: true,
+                    always: true,
+                    message: None,
+                    raw_text: Some("always".into()),
+                },
+            )
+            .await
+            .expect("应命中 p-1");
+        assert_eq!(hit.tool_name.as_deref(), Some("Bash"));
+        assert!(r.is_session_allowed("c", "Bash").await, "Bash 应进入 allow-set");
+        assert!(!r.is_session_allowed("c", "Write").await, "其它工具不受影响");
+        assert!(!r.is_session_allowed("other", "Bash").await, "其它 conv 不受影响");
+        // Ask 来源的 always 不落 allow-set（提问无工具语义）。
+        let _rx_ask = r
+            .register("c", "a-1", None, PendingKind::Ask, Some("Bash"))
+            .await;
+        let _ = r
+            .route(
+                "c",
+                Some("a-1"),
+                None,
+                PermissionReply {
+                    allow: true,
+                    always: true,
+                    message: None,
+                    raw_text: None,
+                },
+            )
+            .await;
+        // Bash 已在（来自 p-1），验证 Ask 不新增：换一个工具名观察。
+        let _rx_ask2 = r
+            .register("c", "a-2", None, PendingKind::Ask, Some("WebFetch"))
+            .await;
+        let _ = r
+            .route(
+                "c",
+                Some("a-2"),
+                None,
+                PermissionReply {
+                    allow: true,
+                    always: true,
+                    message: None,
+                    raw_text: None,
+                },
+            )
+            .await;
+        assert!(
+            !r.is_session_allowed("c", "WebFetch").await,
+            "Ask 来源的 always 不落 allow-set"
+        );
+    }
+
+    /// D-记忆：clear_session_allows 清空（/stop、/new 清理点语义）。
+    #[tokio::test]
+    async fn clear_session_allows_drops_entries() {
+        let r = PermissionRouter::new();
+        r.allow_always("c", "Bash").await;
+        r.allow_always("c", "Write").await;
+        assert!(r.is_session_allowed("c", "Bash").await);
+        r.clear_session_allows("c").await;
+        assert!(!r.is_session_allowed("c", "Bash").await);
+        assert!(!r.is_session_allowed("c", "Write").await);
+    }
+
     #[test]
     fn parse_reply_year_not_allowed() {
         // P2-G：首字符 y 但非 allow 词必须 deny（旧「首字符 y/Y」宽匹配会误 allow，
@@ -576,7 +800,7 @@ mod tests {
         let r = PermissionRouter::new();
         assert!(!r.has_pending("c1").await);
         let rx = r
-            .register("c1", "req1", None, PendingKind::Permission)
+            .register("c1", "req1", None, PendingKind::Permission, None)
             .await;
         assert!(r.has_pending("c1").await);
         let hit = r
@@ -586,6 +810,7 @@ mod tests {
                 None,
                 PermissionReply {
                     allow: true,
+                    always: false,
                     message: None,
                     raw_text: None,
                 },
@@ -607,6 +832,7 @@ mod tests {
                 None,
                 PermissionReply {
                     allow: false,
+                    always: false,
                     message: None,
                     raw_text: None,
                 },
@@ -619,10 +845,10 @@ mod tests {
     #[tokio::test]
     async fn pending_kind_distinguishes_permission_and_ask() {
         let r = PermissionRouter::new();
-        let _rx_perm = r.register("c", "p-1", None, PendingKind::Permission).await;
+        let _rx_perm = r.register("c", "p-1", None, PendingKind::Permission, None).await;
         assert!(r.has_pending_of_kind("c", PendingKind::Permission).await);
         assert!(!r.has_pending_of_kind("c", PendingKind::Ask).await);
-        let _rx_ask = r.register("c", "a-1", None, PendingKind::Ask).await;
+        let _rx_ask = r.register("c", "a-1", None, PendingKind::Ask, None).await;
         assert!(r.has_pending_of_kind("c", PendingKind::Ask).await);
         // pending_count 反映并存条数（D2 歧义判定用）。
         assert_eq!(r.pending_count("c").await, 2);
@@ -636,7 +862,7 @@ mod tests {
     #[tokio::test]
     async fn set_card_msg_id_backfills_placeholder() {
         let r = PermissionRouter::new();
-        let _rx = r.register("c", "req1", None, PendingKind::Permission).await;
+        let _rx = r.register("c", "req1", None, PendingKind::Permission, None).await;
         assert!(
             r.set_card_msg_id("c", "req1", Some("om_1".to_string()))
                 .await
@@ -648,12 +874,13 @@ mod tests {
                 Some("om_1"),
                 PermissionReply {
                     allow: true,
+                    always: false,
                     message: None,
                     raw_text: None,
                 },
             )
             .await;
-        assert_eq!(hit.as_deref(), Some("req1"), "回填后应按卡片锚点路由");
+        assert_eq!(hit.as_ref().map(|d| d.request_id.as_str()), Some("req1"), "回填后应按卡片锚点路由");
         // 已被消费后再回填 → 不命中（无害）。
         assert!(
             !r.set_card_msg_id("c", "req1", Some("om_2".to_string()))

@@ -336,6 +336,7 @@ impl Backend for MockBackend {
             session_id: SessionId(format!("sess-{my_order}")),
             final_text: outcome_final,
             terminal: self.terminal,
+            usage: None,
         })
     }
     fn name(&self) -> &'static str {

@@ -487,6 +487,125 @@ impl Dispatcher {
         }
     }
 
+
+    /// /stats [today|7d|all] —— token 用量/成本统计（默认 7d）。全局 + 本会话
+    /// 两组维度；无成本数据的 backend（codex/gemini）按 tokens 汇总展示。
+    pub(super) async fn cmd_stats(&self, conv: &ConvId, hint: &ReplyHint, parts: &[&str]) {
+        let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+        let (label, since) = match arg.to_ascii_lowercase().as_str() {
+            "" | "7d" => ("近 7 天".to_string(), now_secs() - 7 * 86_400),
+            "today" => ("今日".to_string(), now_secs() - 86_400),
+            "all" => ("累计".to_string(), 0),
+            other => {
+                self.reply(
+                    conv,
+                    &format!("未知时间范围：{other}（可用：today / 7d / all）"),
+                    hint,
+                )
+                .await;
+                return;
+            }
+        };
+        let rows = match self.store.list_run_stats_since(since).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.reply(conv, &format!("读取用量统计失败：{e}"), hint).await;
+                return;
+            }
+        };
+        if rows.is_empty() {
+            self.reply(conv, &format!("📈 {label}暂无运行记录。"), hint).await;
+            return;
+        }
+        // 聚合：全局与本会话两组（tokens 求和；cost 仅累加有值的行——无成本
+        // 数据的 backend 只体现在 tokens 维度）。
+        let agg = |subset: &[imagent_store::RunStatRow]| {
+            let runs = subset.len();
+            let input: i64 = subset.iter().map(|r| r.input_tokens).sum();
+            let output: i64 = subset.iter().map(|r| r.output_tokens).sum();
+            let cost: f64 = subset.iter().filter_map(|r| r.cost_usd).sum();
+            (runs, input, output, cost)
+        };
+        let (g_runs, g_in, g_out, g_cost) = agg(&rows);
+        let mine: Vec<imagent_store::RunStatRow> = rows.into_iter().filter(|r| r.conv_id == conv.0).collect();
+        let (m_runs, m_in, m_out, m_cost) = agg(&mine);
+        let cost_line = |c: f64| {
+            if c > 0.0 {
+                format!("${c:.4}")
+            } else {
+                "（无成本数据，按 tokens 汇总）".to_string()
+            }
+        };
+        let text = format!(
+            "📈 用量统计（{label}）\n- 🌍 全局：{g_runs} 轮 · 输入 {g_in} · 输出 {g_out} tokens\n- 💰 全局成本：{}\n- 💬 本会话：{m_runs} 轮 · 输入 {m_in} · 输出 {m_out} tokens\n- 💸 本会话成本：{}\n- 用法：/stats [today|7d|all]",
+            cost_line(g_cost),
+            cost_line(m_cost),
+        );
+        self.reply(conv, &text, hint).await;
+    }
+
+    /// /audit [n] —— 审计日志（admin 门槛同 /config 等管理命令；默认最近 10 条，
+    /// 上限 50）。格式：时间 · 动作 · 操作者 · 摘要。
+    pub(super) async fn cmd_audit(&self, conv: &ConvId, sender: &str, hint: &ReplyHint, parts: &[&str]) {
+        // admin 门槛：与 /allow、/config 等管理命令一致。
+        if !self.is_admin(sender) {
+            let msg = if self.admin_senders.read().is_empty() {
+                "仅管理员（admin_senders）可查看审计日志。当前 admin_senders 为空（无人是管理员），\
+                 请在本地通过 CLI（`imagent setup` 或 config.toml 的 admin_senders）配置后再使用管理命令。"
+                    .to_string()
+            } else {
+                "仅管理员（admin_senders）可查看审计日志。".to_string()
+            };
+            self.reply(conv, &msg, hint).await;
+            return;
+        }
+        let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+        let n: usize = if arg.is_empty() {
+            10
+        } else {
+            match arg.parse() {
+                Ok(n) if (1..=50).contains(&n) => n,
+                _ => {
+                    self.reply(conv, "用法：/audit [条数]（1-50，默认 10）", hint).await;
+                    return;
+                }
+            }
+        };
+        let rows = match self.store.list_audit(n).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.reply(conv, &format!("读取审计日志失败：{e}"), hint).await;
+                return;
+            }
+        };
+        if rows.is_empty() {
+            self.reply(conv, "📋 审计日志为空。", hint).await;
+            return;
+        }
+        let lines: Vec<String> = rows
+            .iter()
+            .map(|r| {
+                let actor = r.actor.as_deref().unwrap_or("-");
+                // 摘要 = 目标 + 详情（有则拼），截断防刷屏。
+                let mut detail = r.target.clone().unwrap_or_default();
+                if let Some(d) = &r.detail {
+                    if !detail.is_empty() {
+                        detail.push(' ');
+                    }
+                    detail.push_str(d);
+                }
+                let detail = if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!("（{}）", truncate_str(&detail, 60))
+                };
+                format!("- {} · {} · {}{}", format_rel_ts(r.ts), r.action, actor, detail)
+            })
+            .collect();
+        let text = format!("📋 审计日志（最近 {} 条）：\n{}", lines.len(), lines.join("\n"));
+        self.reply(conv, &text, hint).await;
+    }
+
     /// /help —— 命令总表（P6-3：飞书等卡片平台带常用命令按钮）。
     pub(super) async fn cmd_help(&self, conv: &ConvId, hint: &ReplyHint) {
         let body = "🗂 会话\n- /new 重置会话\n- /switch <name> 切换/新建命名会话\n- /sessions 列出命名会话\n- /resume [n] 恢复历史/本机会话\n- /compact 压缩上下文\n\n📁 目录与文件\n- /cd <path> 切工作目录\n- /ws save|use|remove <name> 命名工作空间\n- /img <path> 发图片 · /file <path> 发文件\n\n🛡️ 权限与运行\n- /perm <off|allow|deny|ask> 权限模式\n- /stop 中断当前任务\n- /timeout <分钟|off|default> 会话级空闲看门狗\n\n🧪 状态与诊断\n- /status 状态 · /doctor 自检 · /reconnect 重连\n- /config [k v] 查看/热改配置\n\n👥 白名单与管理（管理员）\n- /allow、/disallow 授权/撤权（飞书群内可 @ 对方）\n- /chat allow|deny|allow-all|list 会话白名单\n- /admin list|add|remove 管理员\n- /list 白名单 · /whoami 我的 id\n\n其他内容直接发给 agent 即可。";

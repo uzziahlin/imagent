@@ -298,8 +298,11 @@ fn claude_parse(line: &str) -> CliEvent {
             text,
             is_error,
             session_id,
+            usage,
         } => {
-            if is_error {
+            // usage 事件须排在终止事件之前——spawn_cli_backend 的读取循环在
+            // Final/Error 处 break，排在后的同批事件会被丢弃。
+            let term = if is_error {
                 CliEvent::Error {
                     text,
                     session: session_id,
@@ -309,6 +312,10 @@ fn claude_parse(line: &str) -> CliEvent {
                     text,
                     session: session_id,
                 }
+            };
+            match usage {
+                Some(u) => CliEvent::Multi(vec![CliEvent::Usage(u), term]),
+                None => term,
             }
         }
         ParsedEvent::Assistant {

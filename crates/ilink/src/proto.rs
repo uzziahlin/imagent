@@ -214,7 +214,7 @@ pub fn msg_to_inbound(msg: &Msg) -> InboundMessage {
         mentioned_bot: false,
         ask_req: None,
         reply_to: None,
-        reply_hint: ReplyHint::ILink {
+        reply_hint: ReplyHint::ContextToken {
             context_token: msg.context_token.clone().unwrap_or_default(),
         },
     }
@@ -370,7 +370,7 @@ mod tests {
         assert_eq!(ib.text.as_deref(), Some("hello"));
         assert!(ib.media.is_empty());
         match ib.reply_hint {
-            ReplyHint::ILink { context_token } => assert_eq!(context_token, "tok"),
+            ReplyHint::ContextToken { context_token } => assert_eq!(context_token, "tok"),
             ReplyHint::None => panic!("expected ILink hint"),
         }
     }
@@ -384,7 +384,7 @@ mod tests {
         let ib = msg_to_inbound(&m);
         assert_eq!(ib.text, None);
         match ib.reply_hint {
-            ReplyHint::ILink { context_token } => assert_eq!(context_token, ""),
+            ReplyHint::ContextToken { context_token } => assert_eq!(context_token, ""),
             ReplyHint::None => panic!("expected ILink hint"),
         }
     }
@@ -515,7 +515,7 @@ mod tests {
         assert_eq!(ib.sender.0, "o9cq804lZUXdvf2eN6CDMFQJeyYQ@im.wechat");
         assert_eq!(ib.text.as_deref(), Some("你好，你好，测试验证"));
         match &ib.reply_hint {
-            ReplyHint::ILink { context_token } => {
+            ReplyHint::ContextToken { context_token } => {
                 assert!(context_token.starts_with("AARzJWAFAA"));
             }
             ReplyHint::None => panic!("expected ILink hint"),

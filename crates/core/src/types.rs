@@ -19,10 +19,12 @@ pub struct SessionId(pub String);
 #[derive(Debug, Clone)]
 pub struct Workdir(pub PathBuf);
 
-/// 平台回传一条消息所需的信息。iLink 需要回传最新 context_token。
+/// 平台回传一条消息所需的信息。A3（架构债）：原 `ILink` 变体泛化为
+/// `ContextToken`——「回传需携带会话上下文 token」是平台无关概念（iLink 的
+/// context_token 是首个实例，命名不再绑定具体平台）。
 #[derive(Debug, Clone)]
 pub enum ReplyHint {
-    ILink { context_token: String },
+    ContextToken { context_token: String },
     None,
 }
 
@@ -121,6 +123,42 @@ pub enum AgentChunk {
     Error(String),
 }
 
+/// 一次 run 的 token 用量与成本（按三 CLI backend 实际可得字段设计，缺失为 None）：
+/// - claude `result` 事件：usage.input_tokens/output_tokens/cache_read_input_tokens +
+///   顶层 total_cost_usd；
+/// - codex `turn.completed`：usage.input_tokens/output_tokens（无 cost）；
+/// - gemini `result`：stats.input_tokens/output_tokens（无 cost）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UsageStats {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// 缓存命中 token（claude cache_read_input_tokens；codex/gemini 缺失为 None）。
+    pub cached_tokens: Option<u64>,
+    /// 本次 run 的美元成本（仅 claude 提供；缺失为 None）。
+    pub total_cost_usd: Option<f64>,
+}
+
+impl UsageStats {
+    /// 合并多个 usage 事件（一个 run 可能产出多条）：input/output 累加求和，
+    /// cost 取最后一个非 None 值（后到的终态事件权威），cached 同理取最后非 None。
+    pub fn merge(self, later: UsageStats) -> UsageStats {
+        UsageStats {
+            input_tokens: self.input_tokens + later.input_tokens,
+            output_tokens: self.output_tokens + later.output_tokens,
+            cached_tokens: later.cached_tokens.or(self.cached_tokens),
+            total_cost_usd: later.total_cost_usd.or(self.total_cost_usd),
+        }
+    }
+
+    /// 人可读单行摘要（footer / 日志用）：cost 优先，缺失退化为 tokens 维度。
+    pub fn display(&self) -> String {
+        match self.total_cost_usd {
+            Some(c) => format!("${c:.4}"),
+            None => format!("in {} / out {} tokens", self.input_tokens, self.output_tokens),
+        }
+    }
+}
+
 /// Backend 单次执行的结果。
 #[derive(Debug, Clone)]
 pub struct RunOutcome {
@@ -129,6 +167,8 @@ pub struct RunOutcome {
     /// 本次 run 是否由终止事件正常产出（Final/Terminal/ACP prompt 正常完成）。
     /// false = agent 非正常终止（崩溃等），final_text 为已收到的部分文本。
     pub terminal: bool,
+    /// 本次 run 的 token 用量与成本（backend 未产出 usage 事件时为 None）。
+    pub usage: Option<UsageStats>,
 }
 
 /// 本机（电脑端）agent 会话条目——统一 `/resume` 列表用（P4-11）。
@@ -209,6 +249,9 @@ pub struct OutboundCard {
     /// 计算，终态为 0）。平台在 Running footer 追加展示（`🧠 思考中… · 30s`），
     /// 量化保证 footer 去重缓存命中（10s 内内容不变不 patch）。
     pub run_secs: u64,
+    /// 本轮成本摘要（UsageStats.display()，如 `$0.012` 或 `in 1.2k · out 3.4k tokens`）；
+    /// None = backend 未产出 usage。终态 footer 追加展示（`✅ 已完成 · $0.012`）。
+    pub usage_display: Option<String>,
     /// 卡片终态。
     pub terminal: CardTerminal,
 }
@@ -222,4 +265,42 @@ pub enum CardTerminal {
     Done,
     /// 出错（含错误信息）。
     Error(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UsageStats;
+
+    fn u(input: u64, output: u64, cached: Option<u64>, cost: Option<f64>) -> UsageStats {
+        UsageStats {
+            input_tokens: input,
+            output_tokens: output,
+            cached_tokens: cached,
+            total_cost_usd: cost,
+        }
+    }
+
+    /// 合并语义：input/output 求和；cost/cached 取最后非 None（后到权威）。
+    #[test]
+    fn usage_merge_sums_tokens_and_takes_last_cost() {
+        let a = u(10, 5, Some(2), None);
+        let b = u(1, 2, None, Some(0.012));
+        let m = a.merge(b);
+        assert_eq!(m.input_tokens, 11);
+        assert_eq!(m.output_tokens, 7);
+        assert_eq!(m.cached_tokens, Some(2));
+        assert_eq!(m.total_cost_usd, Some(0.012));
+
+        // cost 先有后有：后到的 None 不覆盖已有值。
+        let c = u(0, 0, Some(9), Some(0.5)).merge(u(0, 0, None, None));
+        assert_eq!(c.total_cost_usd, Some(0.5));
+        assert_eq!(c.cached_tokens, Some(9));
+    }
+
+    /// display：有 cost 显示美元，无 cost 退化 tokens 维度。
+    #[test]
+    fn usage_display_prefers_cost() {
+        assert_eq!(u(3, 4, None, Some(0.0123)).display(), "$0.0123");
+        assert_eq!(u(3, 4, None, None).display(), "in 3 / out 4 tokens");
+    }
 }
