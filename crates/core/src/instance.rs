@@ -70,8 +70,6 @@ fn try_flock_exclusive(f: &std::fs::File) -> bool {
     rc == 0
 }
 
-
-
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

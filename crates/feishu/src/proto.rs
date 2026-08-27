@@ -472,7 +472,11 @@ pub fn parse_comment_event(
     let key = evt.header.event_id.clone().unwrap_or_else(|| {
         // 回退 key 用内容稳定哈希（非长度）：不同内容不同 key、相同内容同 key
         // （长度会把等长不同评论误判重复）。
-        format!("comment:{}:{:x}", b.comment_id, content_hash(&text.join("\n")))
+        format!(
+            "comment:{}:{:x}",
+            b.comment_id,
+            content_hash(&text.join("\n"))
+        )
     });
     Some((
         key,

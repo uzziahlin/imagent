@@ -255,10 +255,10 @@ impl Dispatcher {
                                 // P5-第五批：同 /cd——切目录后失效
                                 // /resume 列表缓存（列表按当前目录扫描）。
                                 // D7：缓存 key 已改为 (conv, sender)，按 conv 前缀全量失效。
-                self.resume_cache
-                    .lock()
-                    .await
-                    .retain(|(c, _), _| c != &conv.0);
+                                self.resume_cache
+                                    .lock()
+                                    .await
+                                    .retain(|(c, _), _| c != &conv.0);
                                 self.reply(conv, &format!("✅ 已切到「{arg}」（{path}）"), hint)
                                     .await
                             }

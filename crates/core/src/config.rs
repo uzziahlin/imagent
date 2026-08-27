@@ -316,9 +316,28 @@ pub fn validate_workdir(p: &Path) -> std::result::Result<(), String> {
     // S6（v7 review）：补齐 canonicalize 后不再与任何条目相等的等价敏感根——
     // /private 本体，以及 /var/tmp（归一为 /private/var/tmp，不等于 /var）。
     const BROAD: &[&str] = &[
-        "/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp", "/private", "/var", "/etc",
-        "/usr", "/bin", "/sbin", "/System", "/Library", "/Users", "/home", "/opt", "/srv",
-        "/mnt", "/Volumes", "/proc", "/sys", "/dev", "/run",
+        "/tmp",
+        "/private/tmp",
+        "/var/tmp",
+        "/private/var/tmp",
+        "/private",
+        "/var",
+        "/etc",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/System",
+        "/Library",
+        "/Users",
+        "/home",
+        "/opt",
+        "/srv",
+        "/mnt",
+        "/Volumes",
+        "/proc",
+        "/sys",
+        "/dev",
+        "/run",
     ];
     let canon = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     let s = canon.to_string_lossy();
@@ -835,8 +854,14 @@ message_fragment_interval_ms = 250
     fn permission_ask_timeout_must_be_less_than_agent_timeout() {
         // 违反：等于 / 大于都拒绝。
         for (tag, extra) in [
-            ("eq", "agent_timeout_secs = 300\npermission_ask_timeout_secs = 300\n"),
-            ("gt", "agent_timeout_secs = 60\npermission_ask_timeout_secs = 300\n"),
+            (
+                "eq",
+                "agent_timeout_secs = 300\npermission_ask_timeout_secs = 300\n",
+            ),
+            (
+                "gt",
+                "agent_timeout_secs = 60\npermission_ask_timeout_secs = 300\n",
+            ),
         ] {
             let p = tmp_path(tag, &format!("default_workdir = \"/tmp/ws\"\n{extra}"));
             let err = Config::load(&p).expect_err("违反预算关系应拒绝启动");
