@@ -18,3 +18,8 @@ anyhow = { workspace = true }
 parking_lot = { workspace = true }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 prometheus = { workspace = true }
+# S3：凭据应用层加密（keyring 不可用 + 配置 passphrase 时的回退形态）
+aes-gcm = { workspace = true }
+pbkdf2 = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }

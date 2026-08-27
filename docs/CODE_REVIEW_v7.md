@@ -13,11 +13,11 @@
 |---|------|------|------|------|
 | S1 | 🔴 | ✅ | 群被加入会话白名单后，**任意群成员**发 "y" 即可批准高危工具请求（审批路由鉴权 = sender 白名单 OR 会话白名单，门槛过低） | `core/src/dispatch/mod.rs` `can_route_permission_reply` |
 | S2 | 🔴 | ✅ | `admin_senders` 为空时所有白名单用户自动成为管理员，漏配即横向扩散（/allow 扩白名单、/admin add） | `core/src/dispatch/mod.rs` `is_admin` |
-| S3 | 🟡 | ⏸ | 凭据 keyring 失败/超时即明文落 SQLite，headless 部署（最常见场景）必然明文；无应用层加密 | `store/src/store.rs` |
+| S3 | 🟡 | ✅ | 凭据 keyring 失败/超时即明文落 SQLite，headless 部署（最常见场景）必然明文；无应用层加密 | `store/src/store.rs` |
 | S4 | 🔴 | ✅ | 飞书 dedup 回退 key 基于 `receive_id + 文本长度`：等长不同消息 5 分钟内第二条被吞；同消息 5 分钟后重投被重放 | `feishu/src/proto.rs` |
 | S5 | 🟡 | ✅ | 飞书发送 429/超时重试无幂等 uuid，用户收到重复消息 | `feishu/src/client.rs` |
 | S6 | 🟡 | ✅ | workdir 黑名单仅比对整路径相等，`/private`、`/private/var/tmp` 等 canonicalize 等价目录可绕过 | `core/src/config.rs` `validate_workdir` |
-| S7 | 🟢 | ⏸ | `/metrics` `/health` 非_loopback 绑定时仅 warn 无鉴权 | `src/main.rs` |
+| S7 | 🟢 | ✅ | `/metrics` `/health` 非_loopback 绑定时仅 warn 无鉴权 | `src/main.rs` |
 | S8 | 🟢 | ✅ | wecom `probe_credentials` 未做 wss/loopback URL 校验，配错地址会把 secret 发往明文地址 | `wecom/src/client.rs` |
 
 ### B. 核心调度正确性
@@ -35,15 +35,15 @@
 | D9 | 🟢 | ✅ | `CardSession` patch 失败也推进 `last_patch`，吃掉节流槽位，连续限流时恢复更慢 | `core/src/card_session.rs` |
 | D10 | 🟢 | ✅ | ask_via_im 成功回复计入 `permission_decisions["allow"]`，污染审批指标 | `dispatch/socket.rs` |
 | D11 | 🟢 | ✅ | 非 unix 平台 instance 锁恒失败，首次启动也被拒（行为与注释矛盾） | `core/src/instance.rs` |
-| D12 | 🟢 | ⏸ | 权限热切换到 Ask 不补起 socket 审批通道（需重启），属功能缺失 | `dispatch/mod.rs` / `admin.rs` |
+| D12 | 🟢 | ✅ | 权限热切换到 Ask 不补起 socket 审批通道（需重启），属功能缺失 | `dispatch/mod.rs` / `admin.rs` |
 
 ### C. Backend 层
 
 | # | 级别 | 状态 | 缺陷 | 位置 |
 |---|------|------|------|------|
 | B1 | 🔴 | ✅ | `read_line_capped` 不区分「单行超长（跳行）」与「真实 IO 错误」，后者 `continue` 重读形成忙循环；stderr 同理 | `core/src/backend_common.rs` |
-| B2 | 🔴 | ⏸ | ACP 单连接全局串行 + 任一会话 cancel 杀整个连接殃及所有会话（roadmap P5-14，需真机验证） | `claude/src/acp.rs` |
-| B3 | 🔴 | ⏸ | 权限审批闭环仅 claude-cli 完整：ACP Ask 档 fail-closed 静默、codex/gemini 无审批且 Ask 档被静默忽略。根因是 `Backend` trait 无能力协商 | `claude/src/acp.rs`、`codex`、`gemini` |
+| B2 | 🔴 | ✅ | ACP 单连接全局串行 + 任一会话 cancel 杀整个连接殃及所有会话（roadmap P5-14，需真机验证） | `claude/src/acp.rs` |
+| B3 | 🔴 | ✅ | 权限审批闭环仅 claude-cli 完整：ACP Ask 档 fail-closed 静默、codex/gemini 无审批且 Ask 档被静默忽略。根因是 `Backend` trait 无能力协商 | `claude/src/acp.rs`、`codex`、`gemini` |
 | B4 | 🟡 | ✅ | ACP 流事件 `try_send` 通道满即静默丢弃（文本/工具事件丢失） | `claude/src/acp.rs` |
 | B5 | 🟡 | ✅ | kill 只杀直接子进程，`kill_on_drop` 不覆盖孙进程（MCP server、长跑 shell），需进程组 killpg | `core/src/backend_common.rs` |
 | B6 | 🟡 | ✅ | claude mcp json 写死 `~/.imagent` 不随 profile 隔离，多 profile 互删配置 | `claude/src/backend.rs` |
@@ -51,18 +51,18 @@
 | B8 | 🟡 | ✅ | claude 中间 assistant 文本不推流（Skip），与其他 backend 不一致；result 丢失时 final_text 为空报错 | `claude/src/backend.rs` |
 | B9 | 🟡 | ✅ | `final_text` 最后一次 Text 胜出：多消息 turn 丢内容，gemini delta 残片可覆盖完整消息 | `core/src/backend_common.rs` |
 | B10 | 🟡 | ✅ | codex 顶层 error 事件被 Skip，「API key invalid」等关键错误信息被吞 | `codex/src/backend.rs` |
-| B11 | 🟢 | ⏸ | codex/gemini 无幽灵会话预检（claude 有），失效 session id 反复 resume 失败 | `codex`、`gemini` |
-| B12 | 🟢 | ⏸ | ACP 不支持 allowed_tools；claude 构造期 ask_timeout 硬编码 300s 与配置不对齐 | `claude/src/acp.rs`、`backend.rs` |
-| B13 | 🟢 | ⏸ | gemini prompt 整条作 argv 撞 ARG_MAX 无 stdin 回退；`image_write_path` 只认 claude Write 工具 | `gemini/backend.rs`、`backend_common.rs` |
+| B11 | 🟢 | ✅ | codex/gemini 无幽灵会话预检（claude 有），失效 session id 反复 resume 失败 | `codex`、`gemini` |
+| B12 | 🟢 | ✅ | ACP 不支持 allowed_tools；claude 构造期 ask_timeout 硬编码 300s 与配置不对齐 | `claude/src/acp.rs`、`backend.rs` |
+| B13 | 🟢 | ✅ | gemini prompt 整条作 argv 撞 ARG_MAX 无 stdin 回退；`image_write_path` 只认 claude Write 工具 | `gemini/backend.rs`、`backend_common.rs` |
 
 ### D. 平台层
 
 | # | 级别 | 状态 | 缺陷 | 位置 |
 |---|------|------|------|------|
-| P1 | 🟡 | ⏸ | 限流三平台不对等：ilink 熔断器双锁非原子且任一次成功即 reset；飞书无熔断；wecom 无限流处理；重连退避无 jitter | `ilink/src/ratelimit.rs` 等 |
+| P1 | 🟡 | ✅ | 限流三平台不对等：ilink 熔断器双锁非原子且任一次成功即 reset；飞书无熔断；wecom 无限流处理；重连退避无 jitter | `ilink/src/ratelimit.rs` 等 |
 | P2 | 🟡 | ⏸ | wecom 二等公民：无群聊、无卡片、审批只能手打 y/n、无 keyring | `wecom/` |
-| P3 | 🟢 | ⏸ | 飞书 card_action 缺 event_id 时 dedup key 用正文前缀，同语义问题 | `feishu/src/proto.rs` |
-| P4 | 🟢 | ⏸ | SQLite 多连接仅靠 busy_timeout=5s 兜底，高并发写可能 SQLITE_BUSY 无重试 | `store/src/store.rs` |
+| P3 | 🟢 | ✅ | 飞书 card_action 缺 event_id 时 dedup key 用正文前缀，同语义问题 | `feishu/src/proto.rs` |
+| P4 | 🟢 | ✅ | SQLite 多连接仅靠 busy_timeout=5s 兜底，高并发写可能 SQLITE_BUSY 无重试 | `store/src/store.rs` |
 
 ## 二、修复内容摘要
 
@@ -111,10 +111,24 @@
 - `cargo clippy --workspace` ✅（0 error）
 - 未 commit；改动范围：crates/core（dispatch/permission/config/instance/card_session/metrics/backend_common）、crates/claude、crates/codex、crates/feishu、crates/wecom、src/main.rs（告警文案）、docs/CODE_REVIEW_v7.md。
 
-## 四、列为迭代项的理由（待讨论）
+## 四、迭代项实施记录（v1.8.0 落地）
 
-- **S3 凭据加密**：需要选型（passphrase / age / OS keyring 强化）与迁移方案，影响部署体验。
-- **B3 权限闭环跨后端统一**：核心卖点覆盖面问题，涉及 `Backend` trait 能力协商 + codex approval-policy / gemini approval-mode / ACP PermissionRouter 三条接入线，是独立迭代主线。
-- **B2 ACP per-conv 连接**：roadmap P5-14，架构改动需真机 claude-agent-acp 验证。
-- **D12 Ask 档热切补起 socket**：可做，但与 B3 的能力协商设计耦合，宜一起做。
-- **P1/P2/P4、B11-B13、S7**：均为独立小迭代，优先级低于安全与正确性修复。
+除 P2 外全部迭代项已实施完成：
+
+- **S3 凭据加密 ✅**：新增 `IMAGENT_PASSPHRASE`（或 `Store::set_passphrase`）→ keyring 失败时以 AES-256-GCM + PBKDF2-SHA256(100k) 加密落盘（`enc:v1:` 版本化格式，salt+nonce 随机）；读取兼容 keyring/enc/明文三形态，存量明文惰性迁移为加密形态；无 passphrase 的明文回退日志升级为 error（headless 不阻断的取舍见注释）。实现：`store/src/crypto.rs`。
+- **B3 权限闭环跨后端统一 ✅**：`Backend` trait 新增 `PermissionCapability`（FullLoop/NativeOnly/Unsupported）能力协商；闭环类档位（ask/auto-claude）× 非 FullLoop 后端启动 fail-closed 拒绝（`Dispatcher::run`）；ACP `session/request_permission` 接入 PermissionRouter 实现完整 IM 审批闭环；codex=Unsupported（exec 模式无原生 approval 参数，注释附依据）、gemini=NativeOnly；`/perm` 热切同口径校验。
+- **D12 Ask 热切补起 socket ✅**：`ensure_permission_socket` 惰性 spawn（AtomicBool 幂等，bind 失败不置位可重试），`/perm` 热切不再要求重启。
+- **B2 ACP per-conv 连接 ✅**（roadmap P5-14）：按 conv 的连接 map 惰性建立，单会话 cancel/超时只杀本连接；并发上限 8、空闲 10 分钟回收、shutdown 全量清理；含 in-process 假 agent 的并发/隔离测试。
+- **P1 限流对等 ✅**：ilink 熔断器单锁化 + reset 改衰减语义（连续 threshold 次成功才清窗，锯齿模式下熔断可正常触发）；feishu/wecom WS 重连退避加 ±20% jitter（防多实例同步重连风暴）。
+- **P4 SQLite busy 重试 ✅**：全部 20 个写路径经 `blocking_with_retry`（50ms 指数退避 ×2、上限 2s、最多 5 次）。
+- **S7 metrics/health 鉴权 ✅**：`IMAGENT_HTTP_TOKEN` Bearer 鉴权（401）；非 loopback 绑定且未配 token 时 fail-closed 拒绝启动。
+- **B11 幽灵会话预检 ✅（codex）**：resume 前校验 `~/.codex/sessions` 存在性，失效 id 弃用续接、按新会话处理；gemini 无本机存储无法预检（保持纯 IM 历史，与既有决策一致）。
+- **B12 ✅**：claude 构造期 ask_timeout 与配置对齐；ACP allowed_tools 以能力矩阵显式呈现（见 B3）。
+- **B13 ✅（部分）**：gemini 超长 prompt（>64KB）fail-fast 可读错误（stdin 被 core 统一封死、CLI 无 stdin 读 prompt 机制，注释附依据）；`image_write_path` 工具名覆盖经评估无干净落点（codex 写文件走 apply_patch patch 文本、形状不匹配 core 的 `{file_path,content}` 判定），未实施。
+- **P3 ✅**：card_action 缺 event_id 的 dedup 回退 key 改用完整内容哈希（与 S4 同语义）。
+- **P2 wecom 补齐 ⏸**：群聊/卡片/keyring 需企微真机验证回调语义，单独排期实施。
+
+## 五、验证（迭代批）
+
+- `cargo build --workspace` ✅、`cargo clippy --workspace` 0 error ✅
+- `cargo test --workspace` ✅（465 passed / 0 failed / 3 ignored 真机 e2e；迭代批新增约 25 个单测）

@@ -91,6 +91,39 @@ pub(crate) fn scan_for_backend(workdir: &Path) -> Vec<LocalSession> {
     }
 }
 
+/// 该 thread id 是否在本机 rollout 存储中真实存在（B11 幽灵会话预检）。
+///
+/// 与 claude 的 `session_exists` 同语义：失败轮次的 stream 事件仍可能携带
+/// thread_id，落库后成为「幽灵会话」——下次 `codex exec resume <id>` 必然
+/// 失败且每轮再产新幽灵 id（毒化循环）。run 前用本函数预检，幽灵即弃用
+/// 续接、开新会话。
+///
+/// codex 的 rollout 不按 workdir 编码分目录（只按日期），thread id 是 uuid
+/// 全局唯一，故只按 id 匹配、不做 cwd 过滤（误判为幽灵会丢上下文，代价
+/// 高于多扫几个文件）。逐个读文件头（≤ HEAD_CAP）比对 session_meta.id，
+/// 读失败/目录不存在按「不存在」处理——此时 resume 也必然失败，弃用续接
+/// 与 claude 预检的行为口径一致。
+pub(crate) fn session_exists(codex_dir: &Path, thread_id: &str) -> bool {
+    let root = codex_dir.join("sessions");
+    for y in dir_entries(&root) {
+        for m in dir_entries(&y) {
+            for d in dir_entries(&m) {
+                for f in dir_entries(&d) {
+                    if f.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                        continue;
+                    }
+                    if let Some(h) = read_head(&f) {
+                        if h.id == thread_id {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// 目录条目列表（读取失败返回空）。
 fn dir_entries(dir: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(dir)
@@ -269,6 +302,21 @@ mod tests {
     #[test]
     fn missing_dir_returns_empty() {
         assert!(list_local_sessions(&tmp_root("missing"), Path::new("/x"), 10).is_empty());
+    }
+
+    /// B11：幽灵会话预检——thread id 存在于 rollout 存储才允许 resume。
+    #[test]
+    fn session_exists_matches_id_only() {
+        let root = tmp_root("exists");
+        write_rollout(&root, "2026/08/15", "uuid-live", "/tmp/proj-a", &[user_msg("hi")]);
+        // cwd 不同也不影响：thread id 是全局唯一 uuid，只按 id 匹配。
+        write_rollout(&root, "2026/08/14", "uuid-other", "/tmp/other", &[user_msg("x")]);
+
+        assert!(session_exists(&root, "uuid-live"));
+        assert!(session_exists(&root, "uuid-other"));
+        // 幽灵 id（存储里没有）与目录不存在都返回 false。
+        assert!(!session_exists(&root, "uuid-ghost"));
+        assert!(!session_exists(&tmp_root("exists-none"), "uuid-live"));
     }
 
     #[test]

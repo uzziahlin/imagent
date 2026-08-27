@@ -317,11 +317,11 @@ pub fn parse_card_action_event(payload: &[u8]) -> Option<(String, InboundMessage
                 .and_then(|o| o.open_id.clone())
         })
         .filter(|s| !s.is_empty())?;
+    // P3：缺 event_id 的回退 key 用 content_hash 对完整内容取哈希——与消息/
+    // 评论回退同语义（S4 口径）。此前用 text 前 40 字符：>40 字符的不同文本
+    // 前缀相同会被互相去重（按钮回调/长命令文本可超 40 字符）。
     let key = evt.header.event_id.clone().unwrap_or_else(|| {
-        format!(
-            "card_action:{open_id}:{conv}:{}",
-            text.chars().take(40).collect::<String>()
-        )
+        format!("card_action:{open_id}:{conv}:{:x}", content_hash(&text))
     });
     Some((
         key,
@@ -1185,6 +1185,40 @@ mod tests {
         assert_eq!(msg.text.as_deref(), Some("y"));
         let (_, msg) = parse_card_action_event(&mk("deny")).expect("deny 应回调");
         assert_eq!(msg.text.as_deref(), Some("n"));
+    }
+
+    /// P3：缺 event_id 的 card_action 回退 key 用 content_hash——前 40 字符相同
+    /// 的不同长文本不再被互相去重，相同内容仍稳定同 key。
+    #[test]
+    fn card_action_dedup_fallback_uses_content_hash() {
+        let mk = |cmd: &str, event_id: Option<&str>| {
+            let mut header = serde_json::json!({"event_type":"card.action.trigger"});
+            if let Some(id) = event_id {
+                header["event_id"] = serde_json::json!(id);
+            }
+            serde_json::json!({
+                "schema":"2.0",
+                "header":header,
+                "event":{
+                    "operator":{"operator_id":{"open_id":"ou_op"}},
+                    "action":{"tag":"button","value":{"imagent_cmd":cmd,"conv":"feishu:ou_op"}}
+                }
+            })
+            .to_string()
+            .into_bytes()
+        };
+        let long_a = format!("/do {} aaa", "x".repeat(60));
+        let long_b = format!("/do {} bbb", "x".repeat(60));
+        let (ka, _) = parse_card_action_event(&mk(&long_a, None)).expect("解析成功");
+        let (kb, _) = parse_card_action_event(&mk(&long_b, None)).expect("解析成功");
+        // 前 40 字符相同（"/do " + 60 个 x 覆盖前缀窗口）但内容不同 → 不同 key。
+        assert_ne!(ka, kb, "前缀相同的不同长命令不应同 key: {ka} vs {kb}");
+        // 相同内容（重投）→ 稳定同 key。
+        let (ka2, _) = parse_card_action_event(&mk(&long_a, None)).expect("解析成功");
+        assert_eq!(ka, ka2);
+        // 有 event_id 时仍优先用 event_id。
+        let (kid, _) = parse_card_action_event(&mk(&long_a, Some("evt_x"))).expect("解析成功");
+        assert_eq!(kid, "evt_x");
     }
 
     /// P9-2：表单提交回调——用户输入在 action.form_value（不在 value），合成

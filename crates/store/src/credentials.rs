@@ -51,8 +51,13 @@ pub(crate) fn marker_for(platform: &str, account_id: &str) -> String {
 }
 
 /// 判断 SQLite blob 是否为 keyring marker（真值在 keyring，非明文）。
+/// S3：顺带做格式校验——前缀后必须非空（裸 `"keyring:"` 视为损坏，不当作 marker，
+/// 避免把无意义的空 marker 当作 keyring 命中路径去读 keychain）。
 pub(crate) fn is_keyring_marker(blob: &str) -> bool {
-    blob.starts_with(KEYRING_MARKER_PREFIX)
+    match blob.strip_prefix(KEYRING_MARKER_PREFIX) {
+        Some(rest) => !rest.is_empty(),
+        None => false,
+    }
 }
 
 /// 在游离线程执行 `f`，最多等待 `KEYRING_OP_TIMEOUT`。超时 / 失败返回 `None`。
@@ -215,5 +220,16 @@ mod tests {
             scoped_username("work", "ilink", "bot-1"),
             "work:ilink:bot-1"
         );
+    }
+
+    /// S3：is_keyring_marker 格式校验——前缀后非空才算 marker；且不误判 enc 前缀。
+    #[test]
+    fn is_keyring_marker_validates_format() {
+        assert!(is_keyring_marker("keyring:ilink:bot-1"));
+        assert!(!is_keyring_marker("keyring:"), "空 payload 不算 marker");
+        assert!(!is_keyring_marker("keyring"), "无冒号前缀不匹配");
+        // S3 enc 前缀不得被误判为 keyring marker（反之见 crypto::tests）。
+        assert!(!is_keyring_marker("enc:v1:AAAA"));
+        assert!(!crate::crypto::is_encrypted("keyring:ilink:bot-1"));
     }
 }
