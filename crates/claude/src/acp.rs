@@ -75,6 +75,11 @@ pub struct AcpBackend {
     hook: RwLock<Option<ImPermissionHook>>,
     /// B2/P5-14：conv_id → 长驻连接 map（惰性建立；task 退出时自摘除）。
     conns: Arc<Mutex<HashMap<String, Arc<LongLivedAcp>>>>,
+    /// 并发连接上限（默认 [`MAX_CONCURRENT_CONNS`]；`with_conn_limits` 可配）。
+    /// TODO(config)：后续接 core 配置体系后从 config 读取。
+    max_conns: usize,
+    /// 连接空闲回收时长（默认 [`CONN_IDLE_RECYCLE`]；`with_conn_limits` 可配）。
+    conn_idle_recycle: std::time::Duration,
     /// 测试专用：mock transport 工厂（in-process 假 agent，替代 spawn 子进程）。
     #[cfg(test)]
     mock_factory: Option<Arc<dyn Fn() -> agent_client_protocol::Channel + Send + Sync>>,
@@ -87,9 +92,23 @@ impl AcpBackend {
             permission_mode: Arc::new(RwLock::new(PermissionMode::Off)),
             hook: RwLock::new(None),
             conns: Arc::new(Mutex::new(HashMap::new())),
+            max_conns: MAX_CONCURRENT_CONNS,
+            conn_idle_recycle: CONN_IDLE_RECYCLE,
             #[cfg(test)]
             mock_factory: None,
         }
+    }
+
+    /// builder 风格配置连接上限/空闲回收时长（默认 [`MAX_CONCURRENT_CONNS`] /
+    /// [`CONN_IDLE_RECYCLE`]）。core 构造方不动，后续接 config 后由此注入。
+    pub fn with_conn_limits(
+        mut self,
+        max_conns: usize,
+        conn_idle_recycle: std::time::Duration,
+    ) -> Self {
+        self.max_conns = max_conns;
+        self.conn_idle_recycle = conn_idle_recycle;
+        self
     }
 
     /// 用指定权限模式构造。
@@ -98,6 +117,8 @@ impl AcpBackend {
             permission_mode: Arc::new(RwLock::new(mode)),
             hook: RwLock::new(None),
             conns: Arc::new(Mutex::new(HashMap::new())),
+            max_conns: MAX_CONCURRENT_CONNS,
+            conn_idle_recycle: CONN_IDLE_RECYCLE,
             #[cfg(test)]
             mock_factory: None,
         }
@@ -110,6 +131,8 @@ impl AcpBackend {
             permission_mode: mode,
             hook: RwLock::new(None),
             conns: Arc::new(Mutex::new(HashMap::new())),
+            max_conns: MAX_CONCURRENT_CONNS,
+            conn_idle_recycle: CONN_IDLE_RECYCLE,
             #[cfg(test)]
             mock_factory: None,
         }
@@ -143,17 +166,20 @@ impl AcpBackend {
         if let Some(ll) = g.get(conv) {
             return Ok(ll.clone());
         }
-        if g.len() >= MAX_CONCURRENT_CONNS {
+        if g.len() >= self.max_conns {
             return Err(CoreError::Backend(
                 NAME,
                 format!(
-                    "ACP 并发连接已达上限 {MAX_CONCURRENT_CONNS}（每会话一条长驻子进程连接），\
-                     本会话请求被拒绝；请减少并发会话，或等待空闲连接回收（{} 分钟）后重试",
-                    CONN_IDLE_RECYCLE.as_secs() / 60
+                    "ACP 并发连接已达上限 {}（每会话一条长驻子进程连接），\
+                     本会话请求被拒绝；请减少并发会话，或等待空闲连接回收（约 {} 分钟）\
+                     后重试",
+                    self.max_conns,
+                    self.conn_idle_recycle.as_secs() / 60
                 ),
             ));
         }
         let hook = self.hook.read().clone();
+        let idle = self.conn_idle_recycle;
         let ll = match self.spawn_transport().await? {
             Transport::Real(agent) => LongLivedAcp::spawn(
                 agent,
@@ -161,6 +187,7 @@ impl AcpBackend {
                 hook,
                 conv.to_string(),
                 Arc::clone(&self.conns),
+                idle,
             )?,
             #[cfg(test)]
             Transport::Mock(ch) => LongLivedAcp::spawn(
@@ -169,10 +196,26 @@ impl AcpBackend {
                 hook,
                 conv.to_string(),
                 Arc::clone(&self.conns),
+                idle,
             )?,
         };
         g.insert(conv.to_string(), ll.clone());
         Ok(ll)
+    }
+
+    /// 防御性清理：若 map 中该 conv 的条目与 `ll` 是**同一连接**（same_channel），
+    /// 则显式移除。正常情况下 task 退出时会自摘除，且 insert 与 task spawn 同在
+    /// `long_lived` 的锁临界区内（自摘除必然发生在 insert 之后），「task 先退出、
+    /// insert 后到」的窗口理论上不存在——但自摘除依赖 task 侧逻辑跑到收尾，此方法
+    /// 供 run 的 send-Err 重试路径兜底：确证旧连接已死时立刻让出名额，不等下一轮
+    /// `long_lived` 的 retain。
+    async fn remove_conn_if_same(&self, conv: &str, ll: &Arc<LongLivedAcp>) {
+        let mut g = self.conns.lock().await;
+        if g.get(conv)
+            .is_some_and(|cur| cur.prompt_tx.same_channel(&ll.prompt_tx))
+        {
+            g.remove(conv);
+        }
     }
 
     /// 建立 transport：真机走 `AcpAgent`（spawn claude-agent-acp 子进程），测试可注入
@@ -196,6 +239,34 @@ impl AcpBackend {
             self.conns.lock().await.drain().map(|(_, v)| v).collect();
         drop(conns); // 释放 map 内的 sender 克隆（task 侧 rx 随之关闭）
         info!(target: "claude-acp", "ACP 连接已全量清理（shutdown）");
+    }
+}
+
+/// Drop 时兜底清理：[`AcpBackend::shutdown`] 尚未被 main/core 侧接线调用（不能改
+/// 其他 crate），最后持有方 drop backend 时在此释放全部连接条目——map 内的
+/// sender 克隆 drop 后，长驻 task 的 recv 返回 None / 空闲回收超时退出 →
+/// connection drop → SDK ChildGuard kill 子进程。
+///
+/// Drop 不是 async：用 `try_lock` 非阻塞拿 map（拿不到说明并发 run 正持锁，
+/// 记 warn 放弃——空闲回收 + OS 清理兜底；绝不阻塞/嵌套 runtime）。
+impl Drop for AcpBackend {
+    fn drop(&mut self) {
+        match self.conns.try_lock() {
+            Ok(mut g) => {
+                let n = g.len();
+                g.clear();
+                if n > 0 {
+                    info!(target: "claude-acp", n, "AcpBackend drop：释放 {n} 条 ACP 连接（shutdown 未被显式调用的兜底）");
+                }
+            }
+            Err(_) => {
+                warn!(
+                    target: "claude-acp",
+                    "AcpBackend drop 时 conns map 被并发持有，跳过兜底清理（空闲回收/OS 清理兜底）；\
+                     建议 main 侧显式接线 AcpBackend::shutdown"
+                );
+            }
+        }
     }
 }
 
@@ -263,6 +334,7 @@ impl LongLivedAcp {
         hook: Option<ImPermissionHook>,
         conv: String,
         conns: Arc<Mutex<HashMap<String, Arc<LongLivedAcp>>>>,
+        idle_recycle: std::time::Duration,
     ) -> Result<Arc<LongLivedAcp>>
     where
         T: agent_client_protocol::ConnectTo<Client> + 'static,
@@ -281,8 +353,13 @@ impl LongLivedAcp {
                 .builder()
                 .on_receive_notification(
                     async move |notification: SessionNotification, _cx: ConnectionTo<_>| {
-                        if let Some(st) = current_for_notif.lock().await.as_ref() {
-                            forward_update(st, notification.update).await;
+                        // 先 clone StreamState 并立即 drop guard，再跨 await 转发：
+                        // forward_update 内部 send 带最长 30s 超时，若持锁跨 await，
+                        // 期间主循环（session 建立 / turn 收尾清 current）会在同一
+                        // Mutex 上阻塞，极端时互相等。
+                        let st = current_for_notif.lock().await.clone();
+                        if let Some(st) = st {
+                            forward_update(&st, notification.update).await;
                         }
                         Ok(())
                     },
@@ -321,12 +398,12 @@ impl LongLivedAcp {
                     // 重新起算 CONN_IDLE_RECYCLE 窗口，窗口内无新 prompt 则退出
                     //（connection drop → ChildGuard kill 子进程，名额让出）。
                     loop {
-                        let deadline = tokio::time::Instant::now() + CONN_IDLE_RECYCLE;
+                        let deadline = tokio::time::Instant::now() + idle_recycle;
                         let req = tokio::select! {
                             _ = tokio::time::sleep_until(deadline) => {
                                 info!(
                                     target: "claude-acp",
-                                    idle_secs = CONN_IDLE_RECYCLE.as_secs(),
+                                    idle_secs = idle_recycle.as_secs(),
                                     "连接空闲回收：断开本 conv 的 ACP 连接"
                                 );
                                 break;
@@ -341,24 +418,46 @@ impl LongLivedAcp {
                         let cwd = req.cwd.clone();
                         let sid = match req.session.clone() {
                             Some(s) if loaded.as_deref() == Some(s.as_str()) => s,
-                            Some(s) => {
-                                connection
-                                    .send_request(LoadSessionRequest::new(s.clone(), cwd.clone()))
-                                    .block_task()
-                                    .await?;
-                                loaded = Some(s.clone());
-                                s
-                            }
-                            None => {
-                                let sid = connection
-                                    .send_request(NewSessionRequest::new(cwd.clone()))
-                                    .block_task()
-                                    .await?
-                                    .session_id
-                                    .to_string();
-                                loaded = Some(sid.clone());
-                                sid
-                            }
+                            Some(s) => match connection
+                                .send_request(LoadSessionRequest::new(s.clone(), cwd.clone()))
+                                .block_task()
+                                .await
+                            {
+                                Ok(_) => {
+                                    loaded = Some(s.clone());
+                                    s
+                                }
+                                Err(e) => {
+                                    // 会话续接失败必须把真实原因写回 req.resp——
+                                    // 此前 `?` 直接上抛闭包错误，而外层 `let _ =` 丢弃
+                                    // Err 且 resp 从不 send，run 侧只拿到笼统的
+                                    // 「长驻 ACP task 无响应」。杀掉本连接（会话状态
+                                    // 已不可信）但让调用方看到真实错误。
+                                    let _ = req.resp.send(Err(CoreError::Backend(
+                                        NAME,
+                                        format!("acp load session 失败: {e}"),
+                                    )));
+                                    break;
+                                }
+                            },
+                            None => match connection
+                                .send_request(NewSessionRequest::new(cwd.clone()))
+                                .block_task()
+                                .await
+                            {
+                                Ok(resp) => {
+                                    let sid = resp.session_id.to_string();
+                                    loaded = Some(sid.clone());
+                                    sid
+                                }
+                                Err(e) => {
+                                    let _ = req.resp.send(Err(CoreError::Backend(
+                                        NAME,
+                                        format!("acp new session 失败: {e}"),
+                                    )));
+                                    break;
+                                }
+                            },
                         };
                         // P5-5：session 一经建立/续接即通知 dispatch——被 /stop 或超时
                         // 中断的轮次拿不到 RunOutcome，靠它落库续接。
@@ -494,12 +593,15 @@ impl Backend for AcpBackend {
                         .map_err(|_| CoreError::Backend(NAME, "长驻 ACP task 无响应".into()))?;
                 }
                 Err(_) if attempt == 0 => {
-                    // 发送失败 = 连接刚好退出（空闲回收/崩溃竞态）：重建一次。
+                    // 发送失败 = 连接刚好退出（空闲回收/崩溃竞态）：先显式移除 map 中
+                    // 该 conv 的旧条目（防御性：正常自摘除/retain 已清，此处确证旧连接
+                    // 已死，立即让出名额，不等下一轮 long_lived 的 retain），再重建一次。
                     warn!(
                         target: "claude-acp",
                         conv_id,
                         "长驻 ACP task 已退出（竞态），重建连接重试一次"
                     );
+                    self.remove_conn_if_same(conv_id, &ll).await;
                     ll = self.long_lived(conv_id).await?;
                 }
                 Err(_) => {
@@ -595,6 +697,20 @@ fn text_of(block: &ContentBlock) -> Option<String> {
     }
 }
 
+/// 从权限请求的 tool_call 提取与 core `needs_approval`（工具名精确/前缀匹配）语义
+/// 对齐的工具名：title 首个 token（如 "Bash git status" → "Bash"）；无 title 回退
+/// tool_call_id。**安全关键**：若取 title 全串，approval_tools=["Bash"] 之类永不
+/// 命中，高危工具会被自动放行。
+fn tool_name_of(tool_call: &agent_client_protocol::schema::v1::ToolCallUpdate) -> String {
+    tool_call
+        .fields
+        .title
+        .as_deref()
+        .and_then(|t| t.split_whitespace().next())
+        .map(str::to_string)
+        .unwrap_or_else(|| tool_call.tool_call_id.to_string())
+}
+
 /// 按字符截断到 n（审批卡 input 摘要用），超出加省略号。
 fn truncate_chars(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
@@ -637,16 +753,13 @@ async fn permission_outcome(
                 );
                 return reject_outcome(&request.options);
             };
-            // 映射到现有审批卡渲染：tool_name 用工具调用 title（人读，如
-            // "Read src/main.rs"；无 title 时回退 tool_call_id），input 摘要取
-            // raw_input JSON（截断 2000，与 socket 闭环同口径）。注意 ACP 请求无
-            // 精确工具名，approval_tools 匹配为 best-effort（title 首词通常即工具名）。
-            let tool_name = request
-                .tool_call
-                .fields
-                .title
-                .clone()
-                .unwrap_or_else(|| request.tool_call.tool_call_id.to_string());
+            // 映射到现有审批卡渲染：tool_name 用工具调用 title 的**首个 token**
+            // （title 是人读全串如 "Bash git status"，取首词才与 core
+            // needs_approval 的工具名精确/前缀匹配语义对齐，否则 approval_tools
+            // = ["Bash"] 永不命中、高危工具被自动放行）；无 title 回退
+            // tool_call_id。input 摘要取 raw_input JSON（截断 2000，与 socket
+            // 闭环同口径）。
+            let tool_name = tool_name_of(&request.tool_call);
             let input_summary = truncate_chars(
                 &request
                     .tool_call
@@ -759,6 +872,59 @@ mod tests {
     fn text_of_extracts_text_block() {
         let t = ContentBlock::Text(TextContent::new("hello"));
         assert_eq!(text_of(&t).as_deref(), Some("hello"));
+    }
+
+    /// 【安全回归】tool_name 必须取 title 首个 token：core needs_approval 对
+    /// approval_tools 做工具名精确/前缀匹配，取 title 全串（"Bash git status"）会让
+    /// approval_tools=["Bash"] 永不命中、高危工具全部自动放行。
+    #[test]
+    fn tool_name_takes_first_token_of_title() {
+        let mut tc = ToolCallUpdate::new("tc-1", ToolCallUpdateFields::default());
+        tc.fields.title = Some("Bash git status".into());
+        assert_eq!(tool_name_of(&tc), "Bash");
+
+        let mut tc = ToolCallUpdate::new("tc-1", ToolCallUpdateFields::default());
+        tc.fields.title = Some("Read".into());
+        assert_eq!(tool_name_of(&tc), "Read");
+
+        // 无 title：回退 tool_call_id。
+        let tc = ToolCallUpdate::new("tc-9", ToolCallUpdateFields::default());
+        assert_eq!(tool_name_of(&tc), "tc-9");
+    }
+
+    /// 【可配置连接上限】with_conn_limits 覆盖默认上限。
+    #[tokio::test]
+    async fn conn_limits_are_configurable() {
+        let backend = AcpBackend::new().with_conn_limits(1, Duration::from_secs(60));
+        let (chan_a, release_a) = spawn_mock_agent("lim-a");
+        let (chan_b, _release_b) = spawn_mock_agent("lim-b");
+        let which = std::sync::Mutex::new(std::collections::VecDeque::from(vec![chan_a, chan_b]));
+        let backend = backend.with_mock_factory(Arc::new(move || {
+            which.lock().unwrap().pop_front().expect("mock 通道")
+        }));
+        let backend = std::sync::Arc::new(backend);
+        let workdir = std::env::temp_dir();
+
+        // conv-a 占用唯一名额（挂起，闸门不放行）。
+        let (tx_a, _rx_a) = tokio::sync::mpsc::channel::<AgentChunk>(64);
+        let a = backend.clone();
+        let wd = workdir.clone();
+        let run_a = tokio::spawn(async move {
+            let _ = a.run("lim-a", "slow", None, &wd, &[], tx_a).await;
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // 上限 1：第二个 conv 被拒，且错误提示可读。
+        let (tx_b, _rx_b) = tokio::sync::mpsc::channel::<AgentChunk>(64);
+        let err = backend
+            .run("lim-b", "fast", None, &workdir, &[], tx_b)
+            .await
+            .expect_err("上限 1 时第二个 conv 应被拒绝");
+        assert!(err.to_string().contains("上限"), "错误应说明上限: {err}");
+
+        // 清理。
+        let _ = release_a.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), run_a).await;
     }
 
     fn dummy_perm_request(options: Vec<PermissionOption>) -> RequestPermissionRequest {
@@ -953,8 +1119,8 @@ mod tests {
 
         let allow_hook: ImPermissionHook = Arc::new(|ask| {
             Box::pin(async move {
-                // 映射检查：title → tool_name，request_id 带 acp- 前缀。
-                assert_eq!(ask.tool_name, "Read src/main.rs");
+                // 映射检查：title 首 token → tool_name，request_id 带 acp- 前缀。
+                assert_eq!(ask.tool_name, "Read");
                 assert!(ask.request_id.starts_with("acp-"));
                 true
             })
@@ -1174,6 +1340,124 @@ mod tests {
         assert!(
             backend.long_lived("conv-0").await.is_ok(),
             "已有 conv 应复用连接"
+        );
+    }
+
+    /// 【错误不被吞】LoadSession 失败时，真实错误必须经 resp 写回 run 调用方
+    /// （而非笼统的「长驻 ACP task 无响应」）。
+    #[tokio::test]
+    async fn load_session_failure_reports_real_error() {
+        // 假 agent 只处理 initialize / session/new——session/load 未注册，
+        // 客户端 LoadSession 请求会收到错误响应。
+        let (agent_side, client_side) = Channel::duplex();
+        tokio::spawn(async move {
+            let _ = Agent
+                .builder()
+                .name("mock-no-load")
+                .on_receive_request(
+                    async move |req: InitializeRequest, responder, _cx: ConnectionTo<_>| {
+                        responder.respond(
+                            InitializeResponse::new(req.protocol_version)
+                                .agent_capabilities(AgentCapabilities::new()),
+                        )
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |_req: NewSessionRequest, responder, _cx: ConnectionTo<_>| {
+                        responder.respond(NewSessionResponse::new("never-s1".to_string()))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_to(agent_side)
+                .await;
+        });
+        let chan = std::sync::Mutex::new(std::collections::VecDeque::from(vec![client_side]));
+        let backend =
+            AcpBackend::new().with_mock_factory(Arc::new(move || {
+                chan.lock().unwrap().pop_front().expect("mock 通道")
+            }));
+        let workdir = std::env::temp_dir();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<AgentChunk>(64);
+
+        let err = backend
+            .run(
+                "conv-load-fail",
+                "hi",
+                Some(&SessionId("old-sid".into())),
+                &workdir,
+                &[],
+                tx,
+            )
+            .await
+            .expect_err("LoadSession 失败应返回错误");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("load session"),
+            "错误应携带真实原因（load session 失败）: {msg}"
+        );
+    }
+
+    /// 【僵尸连接防御清理】remove_conn_if_same：仅当 map 条目与给定连接同 channel
+    /// 时移除（不误删已被重建替代的新条目）。
+    #[tokio::test]
+    async fn remove_conn_if_same_only_removes_matching_entry() {
+        let backend = AcpBackend::new();
+        let (old_tx, _old_rx) = tokio::sync::mpsc::channel::<PromptReq>(8);
+        let (new_tx, _new_rx) = tokio::sync::mpsc::channel::<PromptReq>(8);
+        let old_ll = Arc::new(LongLivedAcp {
+            prompt_tx: old_tx,
+            _task: tokio::spawn(async {}),
+        });
+
+        // map 中是 old_ll：同 channel → 移除。
+        backend
+            .conns
+            .lock()
+            .await
+            .insert("conv-x".into(), old_ll.clone());
+        backend.remove_conn_if_same("conv-x", &old_ll).await;
+        assert!(
+            !backend.conns.lock().await.contains_key("conv-x"),
+            "同 channel 的旧条目应被移除"
+        );
+
+        // map 中已被重建的新条目：不同 channel → 不动。
+        let rebuilt = Arc::new(LongLivedAcp {
+            prompt_tx: new_tx,
+            _task: tokio::spawn(async {}),
+        });
+        backend
+            .conns
+            .lock()
+            .await
+            .insert("conv-x".into(), rebuilt.clone());
+        backend.remove_conn_if_same("conv-x", &old_ll).await;
+        assert!(
+            backend.conns.lock().await.contains_key("conv-x"),
+            "不同 channel（重建后的新条目）不应被误删"
+        );
+    }
+
+    /// 【shutdown 无人调用的兜底】Drop for AcpBackend 释放 map 内全部连接条目
+    /// （shutdown 未被 main 接线前的最小本 crate 方案）。
+    #[tokio::test]
+    async fn drop_releases_conn_entries() {
+        let backend = AcpBackend::new();
+        let conns = backend.conns.clone();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<PromptReq>(8);
+        conns.lock().await.insert(
+            "conv-z".into(),
+            Arc::new(LongLivedAcp {
+                prompt_tx: tx,
+                _task: tokio::spawn(async {}),
+            }),
+        );
+        assert!(conns.lock().await.contains_key("conv-z"));
+        drop(backend);
+        assert!(
+            conns.lock().await.is_empty(),
+            "drop backend 后连接条目应被清空"
         );
     }
 

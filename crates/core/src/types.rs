@@ -205,6 +205,10 @@ pub struct OutboundCard {
     /// None = 无排队）。由 CardSession 每次 patch 从 dispatcher 的排队状态拉取
     /// （活动期随 chunk 刷新）；平台在 Running footer 追加展示，终态忽略。
     pub queued_hint: Option<String>,
+    /// 本轮运行的时长（秒，10s 粒度量化；Running 态由 CardSession 从轮次起点
+    /// 计算，终态为 0）。平台在 Running footer 追加展示（`🧠 思考中… · 30s`），
+    /// 量化保证 footer 去重缓存命中（10s 内内容不变不 patch）。
+    pub run_secs: u64,
     /// 卡片终态。
     pub terminal: CardTerminal,
 }

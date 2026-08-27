@@ -52,6 +52,8 @@ pub(crate) struct CardSession {
     phase: CardPhase,
     msg_id: Option<String>,
     last_patch: Instant,
+    /// 轮次起点（Running footer 运行时长的基准，见 [`OutboundCard::run_secs`]）。
+    started: Instant,
     /// 在飞卡片登记（P4_ROADMAP 第六批）：首帧句柄落库、终态成功摘除——进程崩溃
     /// 后由 [`sweep_live_cards`] 启动扫描把滞留「生成中」的卡片 patch 成已中断。
     store: Store,
@@ -76,6 +78,7 @@ impl CardSession {
             phase: CardPhase::Thinking,
             msg_id: None,
             last_patch: Instant::now(),
+            started: Instant::now(),
             store,
             conv,
             platform_name,
@@ -189,7 +192,14 @@ impl CardSession {
         }
     }
 
-    /// 节流 patch：首次（无 msg_id）或距上次 patch ≥ THROTTLE 才发；否则跳过。
+    /// 节流 patch：首次（无 msg_id）或距上次 patch ≥ THROTTLE 才发；未到期则
+    /// **睡到到期再发**（尾帧 flush 保证）。
+    ///
+    /// 此前未到期直接跳过——若跳过后再无后续事件（如最后一个 ToolResult 后
+    /// 模型直接收尾），卡片会永远停在过期状态（⏳ 不翻 ✅，直到 finalize 的
+    /// 终态 patch）。改成睡到节流窗口到期再 patch：调用方（dispatch 的 chunk
+    /// 消费循环）最多被阻塞到窗口边界（≤500ms），换来「每个事件最终都会上卡」；
+    /// 连续高频 chunk 自然被合并成 2 次/秒的节奏，与节流初衷一致。
     async fn patch_if_due(
         &mut self,
         terminal: CardTerminal,
@@ -197,9 +207,11 @@ impl CardSession {
         hint: &ReplyHint,
         platform: &dyn Platform,
     ) {
-        let due = self.msg_id.is_none() || self.last_patch.elapsed() >= CARD_THROTTLE;
-        if !due {
-            return;
+        if self.msg_id.is_some() {
+            let since = self.last_patch.elapsed();
+            if since < CARD_THROTTLE {
+                tokio::time::sleep(CARD_THROTTLE - since).await;
+            }
         }
         self.dispatch_card(terminal, conv, hint, platform).await;
     }
@@ -224,6 +236,13 @@ impl CardSession {
             tool_calls: self.tools.clone(),
             phase: self.phase,
             queued_hint: queued,
+            // 运行时长（10s 量化）：仅 Running 态有意义——footer 去重缓存按内容
+            // 比对，量化后 10s 内 footer 不变、不触发 patch（防高频更新）。
+            run_secs: if matches!(terminal, CardTerminal::Running) {
+                (self.started.elapsed().as_secs() / 10) * 10
+            } else {
+                0
+            },
             terminal: terminal.clone(),
         };
         let res: crate::error::Result<()> = match &self.msg_id {
@@ -309,6 +328,7 @@ pub async fn sweep_live_cards(store: &Store, platform: &dyn Platform) {
             tool_calls: Vec::new(),
             phase: CardPhase::Thinking,
             queued_hint: None,
+            run_secs: 0,
             terminal: CardTerminal::Error("进程重启中断".into()),
         };
         let conv = ConvId(row.conv_id.clone());
@@ -574,6 +594,33 @@ mod tests {
         );
         let rows = store.list_live_cards().await.expect("list");
         assert!(rows.is_empty(), "两条登记都应清理: {rows:?}");
+        rm_db(&db);
+    }
+
+    /// 尾帧 flush：节流窗口内被跳过的 patch 会**睡到窗口到期补发**——最后一个
+    /// 事件（如末个 ToolResult 的 ✅）不再被静默丢弃。真实时钟跑（窗口 500ms，
+    /// 测试耗时约半秒）。
+    #[tokio::test]
+    async fn throttled_patch_flushes_tail_frame() {
+        let (store, db) = tmp_store("tail-flush").await;
+        let plat = RecordingCardPlatform {
+            name: "mock-rec",
+            update_fails: false,
+            updates: StdMutex::new(Vec::new()),
+        };
+        let conv = ConvId("c1".into());
+        let hint = ReplyHint::None;
+        let mut s = CardSession::new(store, conv.clone(), plat.name(), Default::default());
+        // 首帧：无 msg_id，立即发卡（send_card 成功拿句柄）。
+        s.append_text("第一段", &conv, &hint, &plat).await;
+        // 紧接第二帧：节流窗口内——必须睡到到期补发，而不是丢弃。
+        s.append_text("第二段", &conv, &hint, &plat).await;
+        let updates = plat.updates.lock().unwrap().clone();
+        assert_eq!(
+            updates,
+            vec![("card:abc123".to_string(), "第一段第二段".to_string())],
+            "窗口内的尾帧应 flush 上卡（累积文本）: {updates:?}"
+        );
         rm_db(&db);
     }
 }

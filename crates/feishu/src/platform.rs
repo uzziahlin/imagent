@@ -169,6 +169,11 @@ impl FeishuPlatform {
                 require_mention_in_group,
             }));
         let policy_for_drain = mention_policy.clone();
+        // pending 询问卡登记：drain task 也要查（过期询问的按钮点击反馈，见
+        // drain 内 card.action 分支）——先建后共享给 Self。
+        let pending_asks: Arc<Mutex<HashMap<String, PendingAskCard>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let pending_asks_for_drain = pending_asks.clone();
         tokio::spawn(async move {
             let mut payload_rx = payload_rx;
             while let Some(payload) = payload_rx.recv().await {
@@ -304,7 +309,27 @@ impl FeishuPlatform {
                 // P4-4：审批按钮回调（card.action.trigger）→ text="y"/"n" 的
                 // 入站消息，core 的审批回复路由消费（parse_reply("y")=allow）。
                 if let Some((key, reply_msg)) = parse_card_action_event(&payload) {
-                    if dedup.check(&key) && inbound_msg_tx.send(reply_msg).await.is_err() {
+                    if !dedup.check(&key) {
+                        continue;
+                    }
+                    // 过期反馈：req 已不在 pending_asks（询问已批准/拒绝/中断/
+                    // 超时收敛，或复用槽换了新请求）→ 回一条「已过期」提示而非
+                    // 静默丢进 core 的 miss 分支。无 req 的回调（命令按钮等）
+                    // 不受影响。
+                    if let Some(req) = reply_msg.ask_req.clone() {
+                        if !pending_asks_for_drain.lock().await.contains_key(&req) {
+                            notify_expired_ask(
+                                &core_config_for_drain,
+                                &token_for_drain,
+                                &app_id_for_drain,
+                                &app_secret_for_drain,
+                                &reply_msg.conv_id,
+                            )
+                            .await;
+                            continue;
+                        }
+                    }
+                    if inbound_msg_tx.send(reply_msg).await.is_err() {
                         break;
                     }
                     continue;
@@ -353,7 +378,7 @@ impl FeishuPlatform {
             ask_notes: Arc::new(Mutex::new(HashMap::new())),
             reconnect,
             inbound_rx: Arc::new(Mutex::new(inbound_msg_rx)),
-            pending_asks: Arc::new(Mutex::new(HashMap::new())),
+            pending_asks,
             ask_slots: Arc::new(Mutex::new(HashMap::new())),
             asks_since_card: Arc::new(Mutex::new(HashMap::new())),
             mention_policy,
@@ -461,7 +486,11 @@ impl FeishuPlatform {
                 }?;
                 // 分阶段 footer（best-effort，失败不影响正文流）+ P10 排队提示
                 //（入队状态由 CardSession 每次 patch 拉取，随 chunk 刷新）。
-                let footer = crate::card::running_footer(card.phase, card.queued_hint.as_deref());
+                let footer = crate::card::running_footer(
+                    card.phase,
+                    card.queued_hint.as_deref(),
+                    card.run_secs,
+                );
                 self.patch_footer_if_changed(token, card_id, &footer).await;
                 Ok(())
             }
@@ -743,6 +772,40 @@ async fn ensure_bot_open_id(
             error = %e,
             "取 bot open_id 失败，@bot 过滤退化为弱过滤（须含 @）"
         ),
+    }
+}
+
+/// 过期询问的点击反馈（drain task 用）：向该 conv 回一条「已过期」文本——
+/// 询问卡收敛（批准/拒绝/中断/超时）后按钮仍在卡上，用户迟点不应静默无响应。
+/// best-effort：发送失败仅 warn（提示丢失无害，core 的 miss 分支照旧兜底丢弃）。
+async fn notify_expired_ask(
+    core_config: &CoreConfig,
+    token_lock: &Arc<RwLock<Option<(String, Instant)>>>,
+    app_id: &str,
+    app_secret: &str,
+    conv: &ConvId,
+) {
+    const TEXT: &str = "⏳ 该询问已过期或已被处理，无需再次点击。";
+    let send = async {
+        let t = fetch_cached_token(token_lock, core_config, app_id, app_secret).await?;
+        if let Some((_chat, root_id)) = thread_target_from_conv(conv) {
+            reply_message(
+                core_config,
+                &t,
+                &root_id,
+                "text",
+                &serde_json::json!({ "text": TEXT }).to_string(),
+            )
+            .await
+            .map(|_| ())
+        } else if let Some((receive_id, kind)) = receive_target_from_conv(conv) {
+            send_text_msg(core_config, &t, &receive_id, kind, TEXT).await
+        } else {
+            Ok(())
+        }
+    };
+    if let Err(e) = send.await {
+        warn!(target: "feishu", error = %e, "过期询问提示发送失败（无害）");
     }
 }
 
