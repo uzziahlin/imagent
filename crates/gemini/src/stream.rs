@@ -9,10 +9,11 @@
 //!
 //! 详见任务文档 §2 的 gemini stream-json schema。
 
+use imagent_core::UsageStats;
 use serde_json::Value;
 
 /// gemini stream-json 单行解析结果。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ParsedEvent {
     /// `init`：session id（字段 `session_id`，可能带 `model`）。
     Init {
@@ -25,8 +26,9 @@ pub enum ParsedEvent {
     ToolUse { tool: String, input: String },
     /// `tool_result`：工具结果。
     ToolResult { tool: String, output: String },
-    /// `result`（成功终止）。
-    Result,
+    /// `result`（成功终止）。附带 stats（`stats.input_tokens` / `output_tokens` /
+    /// 可选 `cached_tokens` / `total_cost_usd`，缺失为 None/0）。
+    Result { usage: Option<UsageStats> },
     /// `error`（失败终止）。
     Error { message: String },
     /// 其余有效 JSON 事件（未识别的 type），debug 记录，不 panic。
@@ -113,7 +115,9 @@ pub fn parse_line(line: &str) -> ParsedEvent {
             }
             ParsedEvent::ToolResult { tool, output }
         }
-        Some("result") => ParsedEvent::Result,
+        Some("result") => ParsedEvent::Result {
+            usage: extract_usage(&value),
+        },
         Some("error") => ParsedEvent::Error {
             message: value
                 .get("message")
@@ -123,6 +127,23 @@ pub fn parse_line(line: &str) -> ParsedEvent {
         },
         _ => ParsedEvent::Other,
     }
+}
+
+/// 从 result 事件抽取 stats 对象（gemini 的 usage 载荷）。全部缺失 → None。
+fn extract_usage(value: &Value) -> Option<UsageStats> {
+    let st = value.get("stats")?;
+    let num = |k: &str| st.get(k).and_then(Value::as_u64);
+    let input = num("input_tokens");
+    let output = num("output_tokens");
+    if input.is_none() && output.is_none() {
+        return None;
+    }
+    Some(UsageStats {
+        input_tokens: input.unwrap_or(0),
+        output_tokens: output.unwrap_or(0),
+        cached_tokens: num("cached_tokens"),
+        total_cost_usd: st.get("total_cost_usd").and_then(Value::as_f64),
+    })
 }
 
 /// 把 JSON 值规范化为文本：字符串取原值，其它序列化。
@@ -302,8 +323,27 @@ mod tests {
 
     #[test]
     fn result_success() {
-        let line = r#"{"type":"result","status":"success","stats":{"input_tokens":100,"output_tokens":50},"timestamp":"..."}"#;
-        assert_eq!(parse_line(line), ParsedEvent::Result);
+        let line = r#"{"type":"result","status":"success","stats":{"input_tokens":100,"output_tokens":50,"cached_tokens":30},"timestamp":"..."}"#;
+        assert_eq!(
+            parse_line(line),
+            ParsedEvent::Result {
+                usage: Some(UsageStats {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    cached_tokens: Some(30),
+                    total_cost_usd: None,
+                }),
+            }
+        );
+    }
+
+    /// result 无 stats → usage 为 None。
+    #[test]
+    fn result_without_stats() {
+        assert_eq!(
+            parse_line(r#"{"type":"result","status":"success"}"#),
+            ParsedEvent::Result { usage: None }
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@ pub(super) const COMMAND_GROUPS: &[(&str, &[&str])] = &[
     ("🗂 会话", &["/new", "/switch", "/sessions", "/resume", "/compact"]),
     ("📁 目录与文件", &["/cd", "/ws", "/img", "/file"]),
     ("🛡️ 权限与运行", &["/perm", "/stop", "/timeout"]),
-    ("🧪 状态与诊断", &["/status", "/doctor", "/reconnect", "/config"]),
+    ("🧪 状态与诊断", &["/status", "/stats", "/doctor", "/reconnect", "/config"]),
     (
         "👥 白名单与管理",
         &["/allow", "/disallow", "/chat", "/admin", "/list", "/whoami"],
@@ -174,6 +174,14 @@ impl Dispatcher {
                     }
                     "/status" => {
                         self.cmd_status(&conv, &hint).await;
+                        return;
+                    }
+                    "/stats" => {
+                        self.cmd_stats(&conv, &hint, &parts).await;
+                        return;
+                    }
+                    "/audit" => {
+                        self.cmd_audit(&conv, &sender.0, &hint, &parts).await;
                         return;
                     }
                     "/doctor" => {

@@ -508,12 +508,16 @@ impl FeishuPlatform {
                 let element = patch_card_element(token, card_id, "md_body", &content, seq).await;
                 // footer 收敛（真机校准 UX）：初始卡的「🧠 思考中…」在终态
                 // 换成 完成/出错/已中断——否则任务结束后标识永远停在执行中。
+                // 成功终态附本轮成本摘要（`✅ 已完成 · $0.012`）。
                 let footer = match err {
-                    Some("已中断") => "⏹ 已中断",
-                    Some(_) => "❌ 出错",
-                    None => "✅ 已完成",
+                    Some("已中断") => "⏹ 已中断".to_string(),
+                    Some(_) => "❌ 出错".to_string(),
+                    None => match &card.usage_display {
+                        Some(u) => format!("✅ 已完成 · {u}"),
+                        None => "✅ 已完成".to_string(),
+                    },
                 };
-                self.patch_footer_if_changed(token, card_id, footer).await;
+                self.patch_footer_if_changed(token, card_id, &footer).await;
                 // 关闭流式（光标消失）；sequence 与 element PATCH 共用递增。
                 let settings =
                     serde_json::json!({ "config": { "streaming_mode": false } }).to_string();

@@ -774,6 +774,10 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            // 退出接线：显式调用 backend 的 shutdown（claude-acp 断开全部
+            // per-conv 连接并 kill ACP 子进程；其余后端默认 no-op）——此前只靠
+            // Drop 兜底，Arc 泄漏/延迟 drop 场景下子进程会活到 OS 清理。
+            backend.shutdown().await;
             // R-3：清理 permission.sock（P1-5 计划 ③，原未落地）；P5-9b：握手
             // token 文件一并清理。
             #[cfg(unix)]

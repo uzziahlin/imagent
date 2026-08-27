@@ -61,6 +61,9 @@ pub(crate) struct CardSession {
     platform_name: &'static str,
     /// P10：dispatcher 的排队状态句柄（每次 patch 拉取，见 [`queued_hint_display`]）。
     queued_hints: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, QueuedHint>>>,
+    /// 本轮成本摘要（`UsageStats.display()`）——run 结束时由 round 写入，终态
+    /// footer 追加展示（`✅ 已完成 · $0.012`）；None = backend 未产出 usage。
+    pub(crate) usage_display: Option<String>,
 }
 
 impl CardSession {
@@ -83,6 +86,7 @@ impl CardSession {
             conv,
             platform_name,
             queued_hints,
+            usage_display: None,
         }
     }
 
@@ -243,6 +247,7 @@ impl CardSession {
             } else {
                 0
             },
+            usage_display: self.usage_display.clone(),
             terminal: terminal.clone(),
         };
         let res: crate::error::Result<()> = match &self.msg_id {
@@ -329,6 +334,7 @@ pub async fn sweep_live_cards(store: &Store, platform: &dyn Platform) {
             phase: CardPhase::Thinking,
             queued_hint: None,
             run_secs: 0,
+            usage_display: None,
             terminal: CardTerminal::Error("进程重启中断".into()),
         };
         let conv = ConvId(row.conv_id.clone());

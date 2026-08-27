@@ -79,6 +79,19 @@ pub struct SessionHistoryRow {
     pub updated_at: i64,
 }
 
+/// 一行 per-run 用量记录（schema v8，`/stats` 数据源）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RunStatRow {
+    pub id: i64,
+    pub conv_id: String,
+    pub agent_kind: Option<String>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cached_tokens: Option<i64>,
+    pub cost_usd: Option<f64>,
+    pub ts: i64,
+}
+
 /// 在飞流式卡片登记行（schema v6）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LiveCardRow {
@@ -1026,6 +1039,73 @@ impl Store {
         })
         .await
     }
+    // —— run_stats（per-run 用量记录，schema v8 /stats 数据源）——
+
+    /// 追加一条 per-run 用量记录（append-only；轮转保留最近 10000 条，参照
+    /// audit_log 的 max(id) 范围删除）。`usage` 各字段由调用方从 RunOutcome 展平；
+    /// 失败轮次（无 usage）也记一行（tokens 为 0），保证轮次数统计完整。
+    pub async fn append_run_stat(
+        &self,
+        conv_id: &str,
+        agent_kind: Option<&str>,
+        input_tokens: i64,
+        output_tokens: i64,
+        cached_tokens: Option<i64>,
+        cost_usd: Option<f64>,
+    ) -> Result<()> {
+        let (conv_id, agent_kind) = (conv_id.to_string(), agent_kind.map(|s| s.to_string()));
+        let inner = self.inner.clone();
+        blocking_with_retry(inner, move |conn| {
+            conn.execute(
+                "INSERT INTO run_stats                    (conv_id, agent_kind, input_tokens, output_tokens, cached_tokens, cost_usd, ts)                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    conv_id,
+                    agent_kind,
+                    input_tokens,
+                    output_tokens,
+                    cached_tokens,
+                    cost_usd,
+                    now_secs(),
+                ],
+            )?;
+            // 轮转：保留最近 10000 条（同 audit_log 的 P2-R 手法）。
+            conn.execute(
+                "DELETE FROM run_stats WHERE id <= (SELECT MAX(id) FROM run_stats) - 10000",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// 列出 `since`（epoch 秒）之后的全部用量记录（按 id 升序）。/stats 聚合用。
+    pub async fn list_run_stats_since(&self, since: i64) -> Result<Vec<RunStatRow>> {
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, conv_id, agent_kind, input_tokens, output_tokens, cached_tokens, cost_usd, ts                  FROM run_stats WHERE ts >= ?1 ORDER BY id",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![since], |r| {
+                Ok(RunStatRow {
+                    id: r.get(0)?,
+                    conv_id: r.get(1)?,
+                    agent_kind: r.get::<_, Option<String>>(2)?,
+                    input_tokens: r.get(3)?,
+                    output_tokens: r.get(4)?,
+                    cached_tokens: r.get::<_, Option<i64>>(5)?,
+                    cost_usd: r.get::<_, Option<f64>>(6)?,
+                    ts: r.get(7)?,
+                })
+            })?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r?);
+            }
+            Ok(v)
+        })
+        .await
+    }
+
     // —— config KV（B1：active_name:<conv_id> 等通用键值）——
 
     pub async fn get_config(&self, key: &str) -> Result<Option<String>> {
@@ -1538,12 +1618,58 @@ mod tests {
             "context_tokens",
             "credentials",
             "named_sessions",
+            "run_stats",
             "session_history",
             "sessions",
             "sync_buf",
         ] {
             assert!(tables.iter().any(|x| x == t), "missing table: {t}");
         }
+    }
+
+    // ---------- run_stats（schema v8）----------
+
+    #[tokio::test]
+    async fn run_stats_append_and_list_since() {
+        let db = TempDb::new("run_stats").await;
+        let store = Store::open(&db.path).await.unwrap();
+        store
+            .append_run_stat("feishu:u1", Some("claude-cli"), 100, 50, Some(30), Some(0.012))
+            .await
+            .unwrap();
+        // 失败轮次：无 usage 也记一行（tokens 0）。
+        store
+            .append_run_stat("feishu:u1", Some("codex"), 0, 0, None, None)
+            .await
+            .unwrap();
+        let rows = store.list_run_stats_since(0).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].conv_id, "feishu:u1");
+        assert_eq!(rows[0].input_tokens, 100);
+        assert_eq!(rows[0].output_tokens, 50);
+        assert_eq!(rows[0].cached_tokens, Some(30));
+        assert_eq!(rows[0].cost_usd, Some(0.012));
+        assert_eq!(rows[0].agent_kind.as_deref(), Some("claude-cli"));
+        assert_eq!(rows[1].input_tokens, 0);
+
+        // since 过滤：未来的时间窗排除全部。
+        let future = now_secs() + 1000;
+        assert!(store.list_run_stats_since(future).await.unwrap().is_empty());
+    }
+
+    /// 轮转：保留最近 10000 条，最老淘汰（同 audit_log 手法）。
+    #[tokio::test]
+    async fn run_stats_rotates_to_10000() {
+        let db = TempDb::new("run_stats_rot").await;
+        let store = Store::open(&db.path).await.unwrap();
+        for _ in 0..10_010 {
+            store
+                .append_run_stat("c", None, 1, 1, None, None)
+                .await
+                .unwrap();
+        }
+        let rows = store.list_run_stats_since(0).await.unwrap();
+        assert_eq!(rows.len(), 10_000, "应轮转到 10000 条");
     }
 
     // ---------- P4-5：allowed_chats ----------

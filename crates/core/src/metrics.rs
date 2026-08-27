@@ -10,8 +10,8 @@
 use std::sync::LazyLock;
 
 use prometheus::{
-    register_histogram, register_int_counter, register_int_counter_vec, Encoder, Histogram,
-    IntCounter, IntCounterVec, TextEncoder,
+    register_counter_vec, register_histogram, register_int_counter, register_int_counter_vec,
+    Encoder, Histogram, IntCounter, IntCounterVec, TextEncoder,
 };
 
 /// 全局指标集合。惰性初始化（首次访问即注册到默认 registry）。
@@ -35,6 +35,12 @@ pub struct Metrics {
     /// D10：终端 `ask_via_im` 的回复计数，label `result` = ok | timeout | dropped。
     /// 与审批指标分离——ask 无 allow/deny 语义，混入会污染审批口径。
     pub ask_via_im_replies: IntCounterVec,
+    /// token 用量计数，label `backend` + `kind` = input | output | cached。
+    /// （backend 未产出 usage 的轮次不计。）
+    pub token_usage: IntCounterVec,
+    /// 成本（美元）累计，label `backend`。仅 claude 提供成本数据；f64 计数器
+    /// （Prometheus 的 Counter 即 float64）。
+    pub cost_usd: prometheus::CounterVec,
 }
 
 impl Metrics {
@@ -77,6 +83,18 @@ impl Metrics {
                 &["result"]
             )
             .expect("register ask_via_im_replies"),
+            token_usage: register_int_counter_vec!(
+                "imagent_token_usage_total",
+                "token 用量计数（backend/kind=input|output|cached）",
+                &["backend", "kind"]
+            )
+            .expect("register token_usage"),
+            cost_usd: register_counter_vec!(
+                "imagent_cost_usd_total",
+                "成本（美元）累计（backend 维度；仅提供成本的 backend 计数）",
+                &["backend"]
+            )
+            .expect("register cost_usd"),
         }
     }
 }
@@ -111,6 +129,11 @@ mod tests {
             .inc();
         METRICS.agent_timeouts.with_label_values(&["idle"]).inc();
         METRICS.ask_via_im_replies.with_label_values(&["ok"]).inc();
+        METRICS
+            .token_usage
+            .with_label_values(&["claude-cli", "input"])
+            .inc();
+        METRICS.cost_usd.with_label_values(&["claude-cli"]).inc_by(0.5);
         let out = render();
         assert!(
             out.contains("imagent_messages_in_total"),
@@ -135,6 +158,14 @@ mod tests {
         assert!(
             out.contains("imagent_ask_via_im_replies_total"),
             "missing ask_via_im_replies: {out}"
+        );
+        assert!(
+            out.contains("imagent_token_usage_total"),
+            "missing token_usage: {out}"
+        );
+        assert!(
+            out.contains("imagent_cost_usd_total"),
+            "missing cost_usd: {out}"
         );
     }
 }

@@ -77,17 +77,20 @@ pub fn fixed_reply(mode: PermissionMode) -> PermissionReply {
     match mode {
         PermissionMode::Allow => PermissionReply {
             allow: true,
+            always: false,
             message: None,
             raw_text: None,
         },
         PermissionMode::Deny => PermissionReply {
             allow: false,
+            always: false,
             message: Some("denied by imagent permission_mode=deny".into()),
             raw_text: None,
         },
         // Off / Ask 不应走固定策略；兜底 deny。
         _ => PermissionReply {
             allow: false,
+            always: false,
             message: Some("imagent permission mode does not allow".into()),
             raw_text: None,
         },
@@ -127,6 +130,7 @@ pub fn handle_request(req: &Value, mode: PermissionMode) -> Option<Value> {
             } else {
                 PermissionReply {
                     allow: false,
+                    always: false,
                     message: Some("ask/off not handled in pure handler".into()),
                     raw_text: None,
                 }
@@ -237,6 +241,7 @@ pub async fn ask_via_socket(
         .map(|s| s.to_string());
     Ok(PermissionReply {
         allow,
+        always: false,
         message,
         raw_text: None,
     })
@@ -303,6 +308,7 @@ pub async fn run_mcp_server(
                 Ok(r) => r,
                 Err(e) => PermissionReply {
                     allow: false,
+                    always: false,
                     message: Some(format!("imagent socket error: {e}")),
                     raw_text: None,
                 },
@@ -335,6 +341,9 @@ pub async fn run_mcp_server(
 /// 工具名（终端 agent 调用）。
 pub const ASK_TOOL_NAME: &str = "ask_via_im";
 
+/// notify 工具名（终端 agent 调用）：单向通知，不等回复。
+pub const NOTIFY_TOOL_NAME: &str = "notify_via_im";
+
 /// `source` 参数的字符上限（卡片标题空间有限）。
 const ASK_SOURCE_MAX_CHARS: usize = 48;
 
@@ -350,6 +359,14 @@ pub fn ask_source_prefix(source: Option<&str>) -> String {
     match source.map(sanitize_source).filter(|s| !s.is_empty()) {
         Some(s) => format!("💻（终端 agent · {s}）"),
         None => "💻（终端 agent 提问）".to_string(),
+    }
+}
+
+/// notify_via_im 的来源前缀：与 ask 同款清洗/截断，措辞区隔（通知 vs 提问）。
+pub fn notify_source_prefix(source: Option<&str>) -> String {
+    match source.map(sanitize_source).filter(|s| !s.is_empty()) {
+        Some(s) => format!("🔔（终端 agent · {s}）\n"),
+        None => "🔔（终端 agent 通知）\n".to_string(),
     }
 }
 
@@ -384,6 +401,20 @@ pub fn build_ask_tools_list() -> Value {
                     "timeout_secs": { "type": "integer", "description": "等待超时（秒），缺省用服务端默认" }
                 },
                 "required": ["question"]
+            }
+        }, {
+            "name": NOTIFY_TOOL_NAME,
+            "description": "向用户的 IM（飞书）发送一条单向通知后立即返回（不等回复、不占审批槽）。适合长任务跑完「叫一声」、阶段性进度汇报等场景；需要用户回答/决策时改用 ask_via_im。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "message": { "type": "string", "description": "通知正文（支持多行 markdown）" },
+                    "source": {
+                        "type": "string", "maxLength": 48,
+                        "description": "通知方标记（如项目名/机器名），显示在通知前缀——多 agent 并发时用于区分"
+                    }
+                },
+                "required": ["message"]
             }
         }]
     })
@@ -452,6 +483,63 @@ pub async fn ask_user_via_socket(
     Ok(Ok(text))
 }
 
+/// `kind = "notify"` 的 socket roundtrip：发一条通知 → 读一行结果即返回。
+///
+/// 返回 `Ok(Ok(()))` = 主进程已投递到 IM；`Ok(Err(err))` = 主进程侧失败
+/// （message 为空/IM 不可达）；`Err(io)` = socket 层失败（主进程未运行等）。
+pub async fn notify_user_via_socket(
+    sock: &str,
+    conv_id: &str,
+    message: &str,
+    source: Option<&str>,
+) -> io::Result<std::result::Result<(), String>> {
+    let mut stream = UnixStream::connect(sock).await?;
+    let token_path = std::path::Path::new(sock)
+        .parent()
+        .map(|d| d.join("permission.token"))
+        .unwrap_or_else(|| std::path::PathBuf::from("permission.token"));
+    let token = std::fs::read_to_string(&token_path)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    stream.write_all(format!("{token}\n").as_bytes()).await?;
+    stream.flush().await?;
+    let req = json!({
+        "kind": "notify",
+        "conv_id": conv_id,
+        "message": message,
+        "source": source,
+    });
+    stream.write_all(format!("{req}\n").as_bytes()).await?;
+    stream.flush().await?;
+
+    let mut reader = BufReader::new(&mut stream);
+    let mut buf = String::new();
+    // notify 不等待用户：读超时只覆盖主进程投递 + 回写的短窗口。
+    let budget = std::time::Duration::from_secs(30);
+    match tokio::time::timeout(budget, reader.read_line(&mut buf)).await {
+        Ok(res) => {
+            res?;
+        }
+        Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("notify reply timed out (>{budget:?})"),
+            ))
+        }
+    }
+    let v: Value = serde_json::from_str(buf.trim())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("parse reply: {e}")))?;
+    if v.get("ok").and_then(|o| o.as_bool()) == Some(true) {
+        return Ok(Ok(()));
+    }
+    let err = v
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap_or("unknown error")
+        .to_string();
+    Ok(Err(err))
+}
+
 /// ask server 主循环（stdio）。`imagent mcp-ask` 子命令入口——供任意终端 agent
 /// 作为 MCP server 挂载；tools/call 走 `kind:"ask"` socket 协议到主进程。
 pub async fn run_ask_mcp_server(
@@ -496,11 +584,62 @@ pub async fn run_ask_mcp_server(
                     .pointer("/params/name")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                if name != ASK_TOOL_NAME {
+                if name != ASK_TOOL_NAME && name != NOTIFY_TOOL_NAME {
                     json!({
                         "jsonrpc": "2.0", "id": req.get("id").cloned().unwrap_or(Value::Null),
                         "error": { "code": -32602, "message": format!("unknown tool: {name}") }
                     })
+                } else if name == NOTIFY_TOOL_NAME {
+                    // notify_via_im：单向通知——发送即返回，不等用户回复。
+                    let args = req
+                        .pointer("/params/arguments")
+                        .cloned()
+                        .unwrap_or(json!({}));
+                    let message = args
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    let source = args
+                        .get("source")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    let id = req.get("id").cloned().unwrap_or(Value::Null);
+                    if message.is_empty() {
+                        json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": {
+                                "content": [ { "type": "text", "text": "message 不能为空" } ],
+                                "isError": true
+                            }
+                        })
+                    } else {
+                        let text: String = match notify_user_via_socket(
+                            &sock,
+                            &conv_id,
+                            &message,
+                            source.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => "已送达 IM".to_string(),
+                            Ok(Err(err)) => format!("notify_via_im 失败：{err}"),
+                            Err(e) => format!(
+                                "imagent 主进程不可达（{e}）——请确认 `imagent start feishu` 已在运行"
+                            ),
+                        };
+                        let is_error = text.starts_with("notify_via_im 失败")
+                            || text.starts_with("imagent 主进程不可达");
+                        json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": {
+                                "content": [ { "type": "text", "text": text } ],
+                                "isError": is_error
+                            }
+                        })
+                    }
                 } else {
                     let args = req
                         .pointer("/params/arguments")
@@ -606,13 +745,18 @@ mod tests {
         assert_eq!(tools[0]["name"], TOOL_NAME);
     }
 
-    /// ask server 的 tools/list 只暴露 ask_via_im。
+    /// ask server 的 tools/list 暴露 ask_via_im + notify_via_im 两个工具。
     #[test]
     fn ask_tools_list_has_ask_via_im() {
         let list = build_ask_tools_list();
         let tools = list.get("tools").and_then(|t| t.as_array()).unwrap();
-        assert_eq!(tools.len(), 1);
+        assert_eq!(tools.len(), 2);
         assert_eq!(tools[0]["name"], ASK_TOOL_NAME);
+        assert_eq!(tools[1]["name"], NOTIFY_TOOL_NAME);
+        assert_eq!(
+            tools[1]["inputSchema"]["required"][0], "message",
+            "notify 的 message 必填"
+        );
         assert_eq!(
             tools[0]["inputSchema"]["required"][0], "question",
             "question 必填"
@@ -661,6 +805,7 @@ mod tests {
     fn call_response_allow() {
         let reply = PermissionReply {
             allow: true,
+            always: false,
             message: None,
             raw_text: None,
         };
@@ -676,6 +821,7 @@ mod tests {
     fn call_response_deny_with_message() {
         let reply = PermissionReply {
             allow: false,
+            always: false,
             message: Some("nope".into()),
             raw_text: None,
         };

@@ -313,6 +313,7 @@ imagent mcp-ask --print-config
 - 工具参数：`question`（多行 markdown 可写补充说明）、`options`（≤8 个选项按钮）、`source`（提问方标记，多 agent 并发时区分「谁在问」）、`timeout_secs`。
 - 多 agent 并发提问互不干扰（`conv + request_id` 多 pending 路由）：**点按钮=精确回答那张卡**；直接打字=回答**最新**一张；引用回复=回答被引用的卡。
 - 超时返回错误（非 deny），agent 可自行决定重试。
+- 同一 MCP server 还暴露 `notify_via_im(message, source?)`：向该会话发一条**单向通知**后立即返回（不等回复、不占审批槽）——适合长任务跑完「叫一声」、阶段性进度汇报；需要用户回答/决策时仍用 `ask_via_im`。
 
 ## 安全
 

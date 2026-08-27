@@ -205,7 +205,7 @@ impl ILinkPlatform {
     /// 解析发送阶段 context_token：优先 hint，否则读 store。
     async fn resolve_context_token(&self, peer: &str, hint: &ReplyHint) -> String {
         match hint {
-            ReplyHint::ILink { context_token } if !context_token.is_empty() => {
+            ReplyHint::ContextToken { context_token } if !context_token.is_empty() => {
                 context_token.clone()
             }
             _ => self

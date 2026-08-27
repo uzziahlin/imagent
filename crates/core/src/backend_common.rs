@@ -10,7 +10,7 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::error::{CoreError, Result};
-use crate::types::{AgentChunk, RunOutcome, SessionId};
+use crate::types::{AgentChunk, RunOutcome, SessionId, UsageStats};
 
 /// 三 CLI backend 的 stdout 行解析统一事件。各 backend 的适配闭包把自己的
 /// `ParsedEvent` 映射到它。
@@ -41,6 +41,12 @@ pub enum CliEvent {
     },
     /// 终止信号无文本（codex TurnCompleted / gemini Result）；final 取最后 Text。
     Terminal { session: Option<String> },
+    /// token 用量/成本（claude result / codex turn.completed / gemini result 附带）。
+    /// 由 spawn_cli_backend 累积合并进 RunOutcome.usage；多事件合并语义见
+    /// [`UsageStats::merge`]（input/output 求和、cost 取最后非 None）。
+    /// 注意：与终止事件同批（Multi）时应排在终止事件**之前**——终止事件会
+    /// break 读取循环，排在后的 Usage 会被丢弃。
+    Usage(UsageStats),
     /// 非致命 error 事件（codex 顶层 `error`，可能瞬时重连；B10）。不中断流，
     /// 仅记录内容——若最终无任何 final 文本，作为失败原因呈现。
     TransientError(String),
@@ -180,6 +186,8 @@ pub async fn spawn_cli_backend(
     // B10：非致命 error 事件累积（codex 顶层 `error`，可能瞬时重连）。不中断流；
     // 若最终无 final 文本，作为失败原因呈现。
     let mut transient_errors: Vec<String> = Vec::new();
+    // usage 事件累积（合并语义：input/output 求和、cost 取最后非 None）。
+    let mut usage_acc: Option<UsageStats> = None;
     // B1：真实 stdout IO 错误（管道 EIO 等，持续性）记录，最终无文本时并入诊断。
     let mut read_err: Option<String> = None;
 
@@ -299,6 +307,14 @@ pub async fn spawn_cli_backend(
                     );
                     transient_errors.push(text);
                 }
+                // token 用量累积——不中断流，不推 chunk（usage 只进 RunOutcome/
+                // metrics，不是 IM 可读内容）。
+                CliEvent::Usage(u) => {
+                    usage_acc = Some(match usage_acc {
+                        Some(acc) => acc.merge(u),
+                        None => u,
+                    });
+                }
                 // 展平阶段已处理，运行期不应到达。
                 CliEvent::Multi(_) => {}
                 CliEvent::Skip => {}
@@ -364,6 +380,7 @@ pub async fn spawn_cli_backend(
         session_id: SessionId(session_id),
         final_text,
         terminal: reached_terminal,
+        usage: usage_acc,
     })
 }
 
@@ -599,5 +616,51 @@ mod tests {
         assert_eq!(image_write_path("Write", "not-json"), None);
         assert_eq!(image_write_path("Write", r#"{"content":"x"}"#), None);
         assert_eq!(image_write_path("Write", r#"{"file_path":"noext"}"#), None);
+    }
+
+    /// Usage 事件累积进 RunOutcome.usage（合并：input/output 求和、cost 取最后）；
+    /// 与 Final 同批（Multi）时 Usage 须在前（Final break 循环）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn usage_events_accumulate_into_outcome() {
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg("printf 'U1\\nU2\\nEND\\n'");
+        let (tx, _rx) = tokio::sync::mpsc::channel::<crate::types::AgentChunk>(64);
+        let parse = |line: &str| match line.trim() {
+            "U1" => CliEvent::Usage(crate::types::UsageStats {
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_tokens: Some(2),
+                total_cost_usd: None,
+            }),
+            "U2" => CliEvent::Usage(crate::types::UsageStats {
+                input_tokens: 1,
+                output_tokens: 2,
+                cached_tokens: None,
+                total_cost_usd: Some(0.012),
+            }),
+            "END" => CliEvent::Multi(vec![
+                CliEvent::Usage(crate::types::UsageStats {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cached_tokens: None,
+                    total_cost_usd: Some(0.05),
+                }),
+                CliEvent::Final {
+                    text: "done".into(),
+                    session: None,
+                },
+            ]),
+            _ => CliEvent::Skip,
+        };
+        let outcome = spawn_cli_backend(cmd, parse, tx, "test-backend", &[])
+            .await
+            .expect("run 应成功");
+        let u = outcome.usage.expect("应累积出 usage");
+        assert_eq!(u.input_tokens, 11);
+        assert_eq!(u.output_tokens, 7);
+        assert_eq!(u.cached_tokens, Some(2));
+        assert_eq!(u.total_cost_usd, Some(0.05)); // 最后非 None 胜出
+        assert_eq!(outcome.final_text, "done");
     }
 }

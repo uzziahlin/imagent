@@ -5,6 +5,7 @@
 //! `session_id`；中间事件里的 `tool_use` / `tool_result` 解析为
 //! [`ParsedEvent::ToolUse`] / [`ParsedEvent::ToolResult`]，由上层决定是否处理。
 
+use imagent_core::UsageStats;
 use serde_json::Value;
 
 /// 单个 `tool_use` 项（B7：一条 assistant 消息可含多个并行 tool_use，全部收集）。
@@ -22,13 +23,15 @@ pub struct ToolResultItem {
 }
 
 /// 单行解析后的归类。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ParsedEvent {
-    /// `type == "result"` 的终止事件。
+    /// `type == "result"` 的终止事件。附带 usage（顶层 `total_cost_usd` +
+    /// `usage` 对象的 input/output/cache_read tokens；缺失字段为 None/0）。
     Result {
         text: String,
         is_error: bool,
         session_id: Option<String>,
+        usage: Option<UsageStats>,
     },
     /// assistant 事件（B7/B8）：content[] 中的全部 text 块按序拼接（无则空串）+
     /// 全部 `tool_use`（并行工具调用不再只取首个）。
@@ -82,6 +85,7 @@ pub fn parse_line(line: &str) -> ParsedEvent {
                 text,
                 is_error,
                 session_id,
+                usage: extract_usage(&value),
             }
         }
         Some("assistant") => ParsedEvent::Assistant {
@@ -99,6 +103,29 @@ pub fn parse_line(line: &str) -> ParsedEvent {
         }
         _ => ParsedEvent::Other { session_id },
     }
+}
+
+/// 从 result 事件抽取 usage：顶层 `total_cost_usd`（Option<f64>）+ `usage`
+/// 对象（input_tokens / output_tokens / cache_read_input_tokens）。
+/// 三者全缺 → None；部分缺 → 缺的字段为 None / 0。
+fn extract_usage(value: &Value) -> Option<UsageStats> {
+    let cost = value.get("total_cost_usd").and_then(Value::as_f64);
+    let u = value.get("usage");
+    let num = |k: &str| u.and_then(|u| u.get(k)).and_then(Value::as_u64);
+    let input = num("input_tokens");
+    let output = num("output_tokens");
+    let cached = u
+        .and_then(|u| u.get("cache_read_input_tokens"))
+        .and_then(Value::as_u64);
+    if input.is_none() && output.is_none() && cost.is_none() {
+        return None;
+    }
+    Some(UsageStats {
+        input_tokens: input.unwrap_or(0),
+        output_tokens: output.unwrap_or(0),
+        cached_tokens: cached,
+        total_cost_usd: cost,
+    })
 }
 
 /// 从 JSON 对象抽取非空 `session_id`（顶层或常见嵌套位置）。
@@ -200,15 +227,45 @@ mod tests {
 
     #[test]
     fn parses_ok_result_with_session() {
-        let line = r#"{"type":"result","result":"pong","is_error":false,"session_id":"abc-123","total_cost_usd":0.001}"#;
+        let line = r#"{"type":"result","result":"pong","is_error":false,"session_id":"abc-123","total_cost_usd":0.001,"usage":{"input_tokens":26,"output_tokens":4,"cache_read_input_tokens":120}}"#;
         assert_eq!(
             parse_line(line),
             ParsedEvent::Result {
                 text: "pong".to_string(),
                 is_error: false,
                 session_id: Some("abc-123".to_string()),
+                usage: Some(UsageStats {
+                    input_tokens: 26,
+                    output_tokens: 4,
+                    cached_tokens: Some(120),
+                    total_cost_usd: Some(0.001),
+                }),
             }
         );
+    }
+
+    /// result 无 usage/total_cost_usd → usage 为 None。
+    #[test]
+    fn result_without_usage_fields_is_none() {
+        let line = r#"{"type":"result","result":"x","is_error":false}"#;
+        match parse_line(line) {
+            ParsedEvent::Result { usage, .. } => assert_eq!(usage, None),
+            other => panic!("expected Result, got {other:?}"),
+        }
+    }
+
+    /// result 仅有 total_cost_usd（usage 对象缺失）→ usage 仍产出（tokens 为 0）。
+    #[test]
+    fn result_cost_only_usage() {
+        let line = r#"{"type":"result","result":"x","total_cost_usd":0.02}"#;
+        match parse_line(line) {
+            ParsedEvent::Result { usage, .. } => {
+                let u = usage.expect("cost-only 也应产出 usage");
+                assert_eq!(u.total_cost_usd, Some(0.02));
+                assert_eq!((u.input_tokens, u.output_tokens), (0, 0));
+            }
+            other => panic!("expected Result, got {other:?}"),
+        }
     }
 
     #[test]
@@ -221,6 +278,7 @@ mod tests {
                 text: "boom: bad prompt".to_string(),
                 is_error: true,
                 session_id: Some("s-7".to_string()),
+                usage: None,
             }
         );
     }
@@ -234,6 +292,7 @@ mod tests {
                 text: "ok".to_string(),
                 is_error: false,
                 session_id: None,
+                usage: None,
             }
         );
     }

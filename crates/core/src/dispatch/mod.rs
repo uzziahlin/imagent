@@ -610,10 +610,34 @@ impl Dispatcher {
                         .inc();
                     return true;
                 }
+                // D-记忆：该 conv 已「始终允许」此工具 → 跳过 IM 审批直接放行
+                //（连续 N 次同工具不再每条进 IM）。
+                if router
+                    .is_session_allowed(&ask.conv_id, &ask.tool_name)
+                    .await
+                {
+                    info!(
+                        target: "imagent::core",
+                        conv_id = %ask.conv_id,
+                        tool = %ask.tool_name,
+                        "会话级始终允许命中，跳过审批（session allow-set）"
+                    );
+                    METRICS
+                        .permission_decisions
+                        .with_label_values(&["allow"])
+                        .inc();
+                    return true;
+                }
                 let conv = ConvId(ask.conv_id.clone());
                 // D5：先 register 占位再发卡（防极速按钮回调先于 register 到达）。
                 let rx = router
-                    .register(&ask.conv_id, &ask.request_id, None, PendingKind::Permission)
+                    .register(
+                        &ask.conv_id,
+                        &ask.request_id,
+                        None,
+                        PendingKind::Permission,
+                        Some(&ask.tool_name),
+                    )
                     .await;
                 // S-5（泄漏防护）：本 hook future 被 drop（run 被 /stop abort、总超时
                 // 或空闲看门狗打断）时不会走任何 await 之后的 cancel 分支——挂上
@@ -812,7 +836,40 @@ impl Dispatcher {
                             } else {
                                 None
                             };
-                            if let Some(req) = routed {
+                            if let Some(decision) = routed {
+                                let req = decision.request_id.clone();
+                                // D-记忆/审计：审批决定（含「始终允许」）落一条
+                                // permission_decision 审计——action/tool/decision/sender。
+                                // 「始终允许」的 allow-set 写入在 router.route 内完成
+                                //（pending 条目携带 tool_name）。
+                                let decision_word = match crate::permission::parse_decision(text)
+                                {
+                                    crate::permission::Decision::AllowAlways => "allow_always",
+                                    crate::permission::Decision::Allow => "allow",
+                                    crate::permission::Decision::Deny => "deny",
+                                };
+                                let audit_detail = format!(
+                                    "tool={} decision={} sender={}",
+                                    decision.tool_name.as_deref().unwrap_or("<unknown>"),
+                                    decision_word,
+                                    msg.sender.0
+                                );
+                                if let Err(e) = self
+                                    .store
+                                    .append_audit(
+                                        "permission_decision",
+                                        Some(&msg.sender.0),
+                                        Some(&conv_id),
+                                        Some(&audit_detail),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        target: "imagent::core",
+                                        error = %e,
+                                        "append_audit(permission_decision) 失败"
+                                    );
+                                }
                                 // 真机校准 UX：决策已达 MCP，立即把询问卡收敛成
                                 // 「已批准/已拒绝」终态（best-effort，无卡 no-op）；
                                 // 问题卡（P6）显示「已记录你的选择：<选项>」。
@@ -845,7 +902,7 @@ impl Dispatcher {
                                     self.reply(
                                         &msg.conv_id,
                                         &format!(
-                                            "⚠️ 当前有 {n} 项待审批/待回答的询问，请回复对应询问卡（多待决时需引用对应卡片），或直接回复 y / n 表态。"
+                                            "⚠️ 当前有 {n} 项待审批/待回答的询问，请回复对应询问卡（多待决时需引用对应卡片），或直接回复 y / n 表态（始终允许可回复 always）。"
                                         ),
                                         &msg.reply_hint,
                                     )
