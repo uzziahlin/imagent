@@ -397,6 +397,11 @@ pub struct Config {
     /// 默认 600；仅 `agent = "claude-acp"` 生效。改动需重启。
     #[serde(default = "default_acp_idle_recycle_secs")]
     pub acp_idle_recycle_secs: u64,
+    /// W3-1：飞书语音转文字（speech_to_text/v1/file_recognize，60s 内语音条）。
+    /// 默认 true；需在飞书后台申请语音识别权限——无权限/识别失败时回退为
+    /// 媒体错误提示（fail-soft，不影响其余消息）。仅 feishu 平台生效。
+    #[serde(default = "default_feishu_asr_enabled")]
+    pub feishu_asr_enabled: bool,
 }
 
 /// 缺省工具集：读/检索/联网/文件编辑类（与 Edit 同风险级：workdir 内写或只读），
@@ -518,6 +523,9 @@ fn default_acp_max_connections() -> usize {
 }
 fn default_acp_idle_recycle_secs() -> u64 {
     600
+}
+fn default_feishu_asr_enabled() -> bool {
+    true
 }
 
 impl Config {
@@ -751,6 +759,7 @@ permission_mode = "auto"    # 缺省=auto：claude-cli=透传 claude 原生 auto
 # auto_compact_threshold_tokens = 120000  # 自动 compact：上下文水位超阈值自动压缩（对齐 Claude Code auto-compact；0=关闭）
 # acp_max_connections = 8      # claude-acp 并发连接上限（仅 agent="claude-acp"）
 # acp_idle_recycle_secs = 600  # claude-acp 连接空闲回收（秒；仅 agent="claude-acp"）
+# feishu_asr_enabled = true     # 飞书语音转文字（需后台申请语音识别权限；失败回退提示，仅 feishu）
 "#;
 }
 /// claude `--permission-mode` 合法值归一（入参已小写化）：manual→default

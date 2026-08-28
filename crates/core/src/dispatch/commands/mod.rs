@@ -13,7 +13,14 @@ use super::*;
 pub(super) const COMMAND_GROUPS: &[(&str, &[&str])] = &[
     (
         "🗂 会话",
-        &["/new", "/switch", "/sessions", "/resume", "/compact"],
+        &[
+            "/new",
+            "/switch",
+            "/sessions",
+            "/resume",
+            "/compact",
+            "/retry",
+        ],
     ),
     ("📁 目录与文件", &["/cd", "/ws", "/img", "/file"]),
     ("🛡️ 权限与运行", &["/perm", "/stop", "/timeout", "/model"]),
@@ -253,6 +260,10 @@ impl Dispatcher {
                         self.cmd_compact(&conv, &hint).await;
                         return;
                     }
+                    "/retry" => {
+                        self.cmd_retry(&conv, &sender, &hint).await;
+                        return;
+                    }
                     "/cd" => {
                         self.cmd_cd(&conv, &hint, &parts).await;
                         return;
@@ -320,6 +331,15 @@ impl Dispatcher {
         // P4-2 批处理：runner 在飞则入队（下一轮合并）后即返；否则本 task 成为
         // runner。runner 循环持 conv 串行锁跨轮次（slash 命令仍排队其后），每轮前
         // 等批处理窗口吃进连发消息；队空则交还 runner 身份、释放锁退出。
+        self.dispatch_agent_message(msg).await;
+    }
+
+    /// 普通消息的批处理入口（handle 尾部与 /retry 共用）：入队/成为 runner →
+    /// 轮次循环（含 W2-5 自动 compact）。抽独立方法避免 /retry → handle 的
+    /// async 递归（handle 的命令分派对 /retry 重放的 prompt 并无意义）。
+    pub(super) async fn dispatch_agent_message(&self, msg: InboundMessage) {
+        let conv = msg.conv_id.clone();
+        let hint = msg.reply_hint.clone();
         if !self.enqueue_or_become_runner(&conv.0, msg, &hint).await {
             return;
         }

@@ -475,6 +475,9 @@ pub struct Dispatcher {
     admin_senders: Arc<RwLock<Vec<String>>>,
     /// D2：per-conv 最近一次「存在待审批项」提示的时刻（PENDING_HINT_DEDUPE 去重）。
     pending_hint_last: Mutex<HashMap<String, Instant>>,
+    /// W3-3：per-conv 最近一轮的用户 prompt（/retry 与失败快捷操作卡用）。
+    /// 上限 500 条（超量整体清空——粗防泄漏，语义无损）。
+    last_prompts: Mutex<HashMap<String, String>>,
     /// 优雅退出信号（P1-5）：收到 SIGINT/SIGTERM 后 cancel，run() 停止收新消息并
     /// drain。D4：改用 CancellationToken（持久信号）——`Notify::notify_waiters` 只
     /// 唤醒**已注册**的等待者，信号先于监听者 await 到达时存在丢失窗口。
@@ -557,6 +560,7 @@ impl Dispatcher {
             queued_hints: Arc::new(Mutex::new(HashMap::new())),
             resume_cache: Mutex::new(HashMap::new()),
             pending_hint_last: Mutex::new(HashMap::new()),
+            last_prompts: Mutex::new(HashMap::new()),
             idle_overrides: Mutex::new(HashMap::new()),
             cot_overrides: Mutex::new(HashMap::new()),
             quiet_hours_raw: RwLock::new(None),

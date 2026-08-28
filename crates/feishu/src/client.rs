@@ -584,6 +584,62 @@ pub async fn upload_file(
     })
 }
 
+/// W3-1：语音转文字——POST /open-apis/speech_to_text/v1/file_recognize
+/// （multipart：`file` + `config`），整文件识别（官方支持 60 秒内音频，正好
+/// 覆盖 IM 语音条场景）。需在飞书后台申请「语音识别」权限。
+///
+/// `config.format` 取 "ogg"（飞书 IM 语音消息下载产物为 ogg/opus 容器）——
+/// **待真机校准**：若租户语音资源为其它编码，识别失败由调用方回退为提示
+/// （fail-soft）。响应 `{"code":0,"data":{"text":"…"}}`。单次不重试（调用方
+/// 失败回退，非用户可见关键路径）。
+pub async fn transcribe_audio(
+    core_config: &CoreConfig,
+    token: &str,
+    bytes: Vec<u8>,
+) -> imagent_core::Result<String> {
+    let base = core_config.base_url().trim_end_matches('/').to_string();
+    let url = format!("{base}/open-apis/speech_to_text/v1/file_recognize");
+    let part = reqwest::multipart::Part::bytes(bytes).file_name("audio.ogg");
+    let form = reqwest::multipart::Form::new()
+        .text("config", r#"{"format":"ogg"}"#)
+        .part("file", part);
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .bearer_auth(token)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| {
+            imagent_core::CoreError::Platform(PLATFORM, format!("transcribe_audio: {e}"))
+        })?;
+    if resp.status().as_u16() == 429 {
+        return Err(imagent_core::CoreError::Platform(
+            PLATFORM,
+            "transcribe_audio: HTTP 429".to_string(),
+        ));
+    }
+    let v: serde_json::Value = resp.json().await.map_err(|e| {
+        imagent_core::CoreError::Platform(PLATFORM, format!("transcribe_audio: {e}"))
+    })?;
+    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
+        return Err(imagent_core::CoreError::Platform(
+            PLATFORM,
+            format!("transcribe_audio: code={code} msg={msg}"),
+        ));
+    }
+    v.get("data")
+        .and_then(|d| d.get("text"))
+        .and_then(|t| t.as_str())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| {
+            imagent_core::CoreError::Platform(PLATFORM, "transcribe_audio: 响应缺文本".into())
+        })
+}
+
 /// 发送文件消息（P6-7，msg_type=file），content 为 `{"file_key":"..."}`。
 pub async fn send_file_msg(
     core_config: &CoreConfig,
