@@ -4,7 +4,76 @@
 
 ## [Unreleased]
 
-（空——下一段变更从这里开始。）
+> **飞书 × Claude 交互通道深度迭代（v3）**：对照业界实现（Claude Code 原生
+> steering/Slack 集成/OpenClaw/claude-code-telegram）review 后的四波 18 项。
+> 600 tests / 0 failed。
+
+### Added（W1 快赢）
+- **steering（对齐 Claude Code Esc 语义）**：`/stop` 缺省**保留排队消息**并自动
+  转入下一轮——运行中发的补充/纠正消息不再被丢弃；`/stop all` 保持旧硬停语义。
+- **`/model` 命令**：查看（白名单可用）/ 热切模型（admin 门槛，落审计）；
+  claude-cli 附加 `--model`/`--fallback-model`，claude-acp 经 `ANTHROPIC_MODEL`
+  env 注入；config `claude_model`/`claude_fallback_model`（SIGHUP 重载回基准）。
+- **`--disallowedTools` 黑名单**（config `disallowed_tools`，与 allowed 独立）与
+  **`--append-system-prompt` 人设注入**（config `append_system_prompt`）。
+- **用户 MCP servers 合并**：config `mcp_config_path`（标准 .mcp.json）——生成
+  的 mcp 配置并入用户 servers（给 agent 挂飞书工具等）；保留名 `imagent` 跳过；
+  Off 档纯用户工具路径（无审批条目）。
+- **batch_window 静默判停自适应**：连发未停继续等（3× 窗口、封顶 10s），单人
+  单条消息路径与旧语义等价；`/audit` 收进命令分组与 /help。
+
+### Added（W2 协议扩展）
+- **thinking 透出**：`AgentChunk::Thought`（与正文分离）——CLI 解析 thinking 块、
+  ACP `AgentThoughtChunk` 不再混正文；飞书卡片 Running 态底显最近 1 条、终态
+  「💭 思考过程」段（最近 5 条）、整卡路径折叠面板；cot off 档不显。
+- **任务清单（todo）**：`AgentChunk::TodoList`——CLI 特判 TodoWrite 工具入参、
+  ACP `Plan` 通知映射；飞书卡片 checklist（`- [x]`/`- [ ]`/⏳ + 进度计数）置
+  正文上方；纯文本平台最终回复附「📋 计划进度 n/m」。
+- **tool_use_id 精确配对**：`AgentChunk` 的 ToolUse/ToolResult 带 id；并行同名
+  调用不错配（无 id 后端回退按名配对）；ACP 的 ToolResult 工具名改回 title 首
+  token（此前用 id 冒充，CLI/ACP 语义不一致）。
+- **ACP 补齐**：`UsageUpdate`（会话累计水位/成本）并入 RunOutcome——ACP 恢复
+  成本统计；`stopReason` → `stop_reason`（max_tokens/refusal 等给用户可读提示）；
+  连接上限/空闲回收接 config（`acp_max_connections`/`acp_idle_recycle_secs`，
+  清掉 acp.rs 遗留 TODO）。
+- **自动 compact**：config `auto_compact_threshold_tokens`（默认 120k，0=关）——
+  成功轮次水位超阈值自动走 /compact 管道（对齐 Claude Code auto-compact）；
+  80k 文字提示在自动区间内不再重复。
+
+### Added（W3 飞书特色）
+- **语音输入（ASR）**：audio 消息经 message-resource 下载后走
+  `speech_to_text/v1/file_recognize` 转写（60s 内语音条），文本以【语音】前缀
+  进 prompt；config `feishu_asr_enabled`（默认 true；失败回退提示 fail-soft）。
+  需后台申请语音识别权限；ogg 编码参数待真机校准。
+- **表情回应快速审批**：订阅 `im.message.reaction.created_v1`——审批卡上回
+  👍=允许 / 👎=拒绝；反查 pending 卡片锚定询问，群内校验操作者为发起者（防
+  代批）；非审批卡 emoji 静默忽略。
+- **失败快捷操作卡 + `/retry`**：失败/中断终态后（卡片平台）补发操作卡
+  （🔁 重试本轮 / 🩺 自检 / 🆕 新会话）；`/retry` 重发最近一轮 prompt。
+- **bot 进群欢迎**：`im.chat.member.bot.added_v1` → 欢迎语（含 /chat allow
+  放行指引与 @ 用法）。
+- **回复锚点精确化**：`send_typing`（core 每轮开始调用）作「轮次锚定」信号——
+  本轮流式卡/回复锚定轮次发起消息，运行中他人新消息不再抢走 reply 锚。
+
+### Added（W4 运营）
+- **per-sender 成本上限**：store schema **v9**（run_stats 加 sender 列）；config
+  `sender_daily_cost_limit_usd`（滚动 24h 窗口）——超限新轮次直接回执拒绝。
+- **`/export` 会话导出**：当前会话 → 人读 Markdown 转录（claude 系；
+  user/assistant 文本块成段）经文件消息回传。
+- **媒体同名防覆盖**：同名文件落盘加序号后缀（-1、-2…）。
+
+### Changed
+- `/stop` 语义变更（见 steering）；`stream_body_md`/`stream_body_final` 改收
+  `OutboundCard`（含 thoughts/todos 渲染）。
+- `enqueue` 队列满回执经核对本就存在（上限分支回复丢弃说明），无行为变更。
+
+### 事件订阅增量（飞书后台，均可选）
+`im.message.reaction.created_v1`（表情审批）、`im.chat.member.bot.added_v1`
+（进群欢迎）。
+
+### 待真机校准
+ASR 的 ogg 编码参数；reaction/bot.added 两事件的 payload 形态（离线按文档
+猜，弱解析缺字段即忽略）。
 
 ## [1.13.0] — 2026-08-28
 
