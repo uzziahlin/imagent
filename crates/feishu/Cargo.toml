@@ -24,4 +24,5 @@ dirs = { workspace = true }
 reqwest = { workspace = true }
 regex = { workspace = true }
 uuid = { workspace = true }
+base64 = { workspace = true }
 rand = { workspace = true }
