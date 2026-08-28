@@ -3643,6 +3643,36 @@ async fn build_with_usage(auth: Auth, usage: crate::types::UsageStats) -> Ctx {
     ctx
 }
 
+/// W3-3：/retry 重发本会话最近一轮的用户 prompt（走完整 runner 路径）；
+/// 无历史时回可行动提示。
+#[tokio::test]
+async fn retry_reruns_last_prompt() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    // 先跑一轮真实任务（prompt 落 last_prompts）。
+    ctx.disp.handle(msg("c1", "alice", "第一轮任务")).await;
+    assert_eq!(ctx.prompts.lock().await.len(), 1);
+    // /retry → 同一 prompt 再跑一轮。
+    ctx.disp.handle(msg("c1", "alice", "/retry")).await;
+    let prompts = ctx.prompts.lock().await.clone();
+    assert_eq!(
+        prompts,
+        vec!["第一轮任务".to_string(), "第一轮任务".to_string()],
+        "/retry 应重发最近 prompt: {prompts:?}"
+    );
+    drop_db(ctx.db).await;
+
+    // 无历史（新会话直接 /retry）→ 提示而非静默。
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    ctx.disp.handle(msg("c2", "alice", "/retry")).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.iter().any(|t| t.contains("没有可重试")),
+        "无历史应提示: {inbox:?}"
+    );
+    drop_db(ctx.db).await;
+}
+
 /// W2-5：自动 compact——成功轮次水位（usage.input_tokens）超阈值，runner 循环
 /// 自动走压缩管道：第二条 prompt 为压缩指令、会话重置（sessions 表清空）、
 /// 摘要落 KV、用户收到「已自动压缩」回执。阈值 0（默认）不触发。

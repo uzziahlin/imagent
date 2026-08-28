@@ -30,6 +30,14 @@ impl Dispatcher {
         // 最终回复前置断档提示（见下方 reply 组装处）。
         let continuation_orphan = is_continuation_prompt(base_prompt.trim());
 
+        // W3-3：记录本轮用户 prompt（/retry 数据源；空文本/纯媒体不记）。
+        if !base_prompt.trim().is_empty() {
+            let mut lp = self.last_prompts.lock().await;
+            if lp.len() > 500 {
+                lp.clear(); // 粗上限：超量整体重置（防泄漏；丢失仅影响 /retry）。
+            }
+            lp.insert(conv.0.clone(), base_prompt.trim().to_string());
+        }
         // best-effort typing 指示（agent 处理中）；失败仅 log，不阻塞后续。
         let _ = self.platform.send_typing(&conv, &hint).await;
 
@@ -403,6 +411,8 @@ impl Dispatcher {
                 // D1：失败返回路径清理本 conv 的权限 pending（fail-closed deny +
                 // 收敛询问卡），防残留 pending 把后续消息误当审批回复吞掉。
                 self.cancel_pending_on_exit(&conv).await;
+                // W3-3：失败后的快捷操作卡（重试/自检/新会话，仅卡片平台）。
+                self.send_failure_quick_actions(&conv, &hint).await;
                 // conv 锁由 runner 循环持有并统一释放（P1-7 防泄漏语义不变）。
                 return None;
             }
@@ -462,6 +472,8 @@ impl Dispatcher {
                 // D1：中断返回路径同样清理 pending（空闲超时 abort 不经 /stop 的
                 // cancel_all；/stop 已清过则此处为幂等 no-op）。
                 self.cancel_pending_on_exit(&conv).await;
+                // W3-3：中断后的快捷操作卡（同失败路径）。
+                self.send_failure_quick_actions(&conv, &hint).await;
                 return None;
             }
             Err(e) => {
@@ -488,6 +500,7 @@ impl Dispatcher {
                 self.persist_learned_session(&conv, existing_sid.as_deref(), &learned_sid)
                     .await;
                 self.cancel_pending_on_exit(&conv).await;
+                self.send_failure_quick_actions(&conv, &hint).await;
                 return None;
             }
         };
@@ -719,6 +732,47 @@ impl Dispatcher {
         // conv 锁由 runner 循环持有并统一释放；在飞注册由 run_agent_round 统一移除。
         // W2-5：成功轮次返回上下文水位（runner 循环据此触发自动 compact）。
         outcome.usage.as_ref().map(|u| u.input_tokens)
+    }
+
+    /// W3-3：失败/中断终态后的快捷操作卡（仅卡片平台）：🔁 重试本轮（有最近
+    /// prompt 时）/ 🩺 自检 / 🆕 新会话——失败后最常用的下一步动作一键可达。
+    /// 纯文本平台不发（失败文案已含 /doctor 指引；按钮卡降级为文字列表是噪音）。
+    async fn send_failure_quick_actions(&self, conv: &ConvId, hint: &ReplyHint) {
+        if !self.platform.supports_streaming_card(conv) {
+            return;
+        }
+        let has_retry = self
+            .last_prompts
+            .lock()
+            .await
+            .get(&conv.0)
+            .is_some_and(|p| !p.trim().is_empty());
+        let mut buttons = Vec::new();
+        if has_retry {
+            buttons.push(CardButton {
+                label: "🔁 重试本轮".into(),
+                command: "/retry".into(),
+                style: CardButtonStyle::Primary,
+            });
+        }
+        buttons.push(CardButton {
+            label: "🩺 自检".into(),
+            command: "/doctor".into(),
+            style: CardButtonStyle::Default,
+        });
+        buttons.push(CardButton {
+            label: "🆕 新会话".into(),
+            command: "/new".into(),
+            style: CardButtonStyle::Default,
+        });
+        self.reply_card(
+            conv,
+            "🔧 下一步",
+            "本轮未正常完成。可一键重试（续接会话）、自检或另起会话：",
+            buttons,
+            hint,
+        )
+        .await;
     }
 
     /// 每轮 usage 落库 + 指标：成功路径传 RunOutcome.usage；失败/中断路径拿不到

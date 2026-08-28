@@ -145,6 +145,8 @@ pub struct FeishuPlatform {
     /// reply API 把回复锚回发起消息。取舍：conv 级近似（与 conv_senders 同姿态
     /// ——每 conv 轮次串行，运行中他人新消息会更新锚点，误差窗口极窄）。
     reply_anchors: Arc<Mutex<HashMap<String, String>>>,
+    /// W3-5：最近一条入站消息 id（锚点候选；send_typing 轮次锚定时提升）。
+    last_inbound: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl FeishuPlatform {
@@ -161,6 +163,8 @@ impl FeishuPlatform {
     /// - `quiet_hours`（Wave B-4）：config `quiet_hours` 解析产物——buzz 加急
     ///   提醒的免打扰降级窗口。
     /// - `thread_active_window_secs`（Wave B-8）：话题免 @ 窗口（0 = 关闭）。
+    /// - `asr_enabled`（W3-1）：语音转文字开关（config `feishu_asr_enabled`。
+    ///   关闭时语音消息回退为提示，不调 speech_to_text）。
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         app_id: String,
@@ -171,6 +175,7 @@ impl FeishuPlatform {
         ask_timeout_secs: u64,
         quiet_hours: Option<imagent_core::QuietHours>,
         thread_active_window_secs: u64,
+        asr_enabled: bool,
     ) -> Result<Self> {
         let ws_config = Arc::new(
             Config::builder()
@@ -234,12 +239,18 @@ impl FeishuPlatform {
         let thread_active: Arc<Mutex<HashMap<String, Instant>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let thread_active_for_drain = thread_active.clone();
-        // Wave B-6：群 conv 回复锚点表（drain 登记、发送侧消费）。
+        // Wave B-6：群 conv 回复锚点表（send_typing 轮次锚定时提升、发送侧消费）。
         let reply_anchors: Arc<Mutex<HashMap<String, String>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let reply_anchors_for_drain = reply_anchors.clone();
+        // W3-5：最近一条入站消息（锚点候选）——drain 登记；send_typing（core 每轮
+        // 开始调用）提升为回复锚点，运行中他人新消息不再抢走本轮 reply 锚。
+        let last_inbound: Arc<Mutex<HashMap<String, String>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let last_inbound_for_drain = last_inbound.clone();
         // Wave B-8：话题免 @ 窗口（config 注入；0 = 关闭）。
         let thread_active_window = thread_window_of(thread_active_window_secs);
+        // W3-1：语音转文字开关（drain 侧消费）。
+        let asr_enabled_for_drain = asr_enabled;
         tokio::spawn(async move {
             let mut payload_rx = payload_rx;
             while let Some(payload) = payload_rx.recv().await {
@@ -287,13 +298,14 @@ impl FeishuPlatform {
                         .lock()
                         .await
                         .insert(msg.conv_id.0.clone(), msg.sender.0.clone());
-                    // Wave B-6：普通群消息登记回复锚点（发起消息 id）——发送侧
-                    // 据此用 reply API 把回复/卡片锚回该消息（私聊/话题/评论不
-                    // 登记：私聊无引用需求，话题已锚 root，评论走评论回复）。
+                    // Wave B-6/W3-5：普通群消息登记**锚点候选**（最近一条入站消息
+                    // id）——send_typing（core 每轮开始调用）提升为回复锚点后，
+                    // 发送侧据此用 reply API 把回复/卡片锚回该消息（私聊/话题/
+                    // 评论不登记：私聊无引用需求，话题已锚 root，评论走评论回复）。
                     if let Some((conv, anchor)) =
                         group_reply_anchor(&msg.conv_id.0, msg.source_msg_id.as_deref())
                     {
-                        reply_anchors_for_drain.lock().await.insert(conv, anchor);
+                        last_inbound_for_drain.lock().await.insert(conv, anchor);
                     }
                     if let Some(tk) = &thread_key {
                         let mut m = thread_active_for_drain.lock().await;
@@ -330,7 +342,8 @@ impl FeishuPlatform {
                                 )
                                 .await
                             }
-                            "file" => {
+                            // W3-1：语音资源同 file 走 message-resource 接口。
+                            "file" | "audio" => {
                                 download_file(&core_config_for_drain, &token, &p.message_id, &p.key)
                                     .await
                             }
@@ -368,7 +381,7 @@ impl FeishuPlatform {
                                         )
                                         .await
                                     }
-                                    "file" => {
+                                    "file" | "audio" => {
                                         download_file(
                                             &core_config_for_drain,
                                             &token,
@@ -384,6 +397,42 @@ impl FeishuPlatform {
                         };
                         match dl {
                             Ok(bytes) => {
+                                // W3-1：语音 → speech_to_text 转写（不落盘），
+                                // 文本以【语音】前缀进 prompt；失败回退媒体错误
+                                // 提示（fail-soft——用户收到可行动反馈而非静默）。
+                                if p.kind == "audio" {
+                                    if asr_enabled_for_drain {
+                                        match crate::client::transcribe_audio(
+                                            &core_config_for_drain,
+                                            &token,
+                                            bytes,
+                                        )
+                                        .await
+                                        {
+                                            Ok(t) => {
+                                                let text = format!("【语音】{t}");
+                                                msg.text = match msg.text.take() {
+                                                    Some(prev) if !prev.trim().is_empty() => {
+                                                        Some(format!("{prev}\n\n{text}"))
+                                                    }
+                                                    _ => Some(text),
+                                                };
+                                            }
+                                            Err(e) => {
+                                                warn!(target: "feishu", error = %e, "语音转写失败");
+                                                msg.media_errors.push(format!(
+                                                    "语音转写失败: {e}（可改发文字）"
+                                                ));
+                                            }
+                                        }
+                                    } else {
+                                        msg.media_errors.push(
+                                            "语音转写已关闭（feishu_asr_enabled=false），请改发文字"
+                                                .to_string(),
+                                        );
+                                    }
+                                    continue;
+                                }
                                 match persist_media(p.kind, &p.key, p.file_name.as_deref(), &bytes)
                                 {
                                     Ok(path) => msg.media.push(MediaRef {
@@ -619,6 +668,60 @@ impl FeishuPlatform {
                     }
                     continue;
                 }
+                // W3-2：表情回应快速审批（im.message.reaction.created_v1）——用户在
+                // 审批卡上回应 👍/👎 等价点允许/拒绝按钮（比点开卡片更轻的交互）。
+                // 反查 pending_asks 按被回应消息 id 定位询问；群 conv 下操作者须为
+                // 发起者（与按钮同门槛，防代批）；非审批卡上的 emoji 静默忽略。
+                // 合成 text="y"/"n" + reply_to 锚定的入站消息，core 三级路由精确
+                // 消费（与引用回复同路径）。需在飞书后台订阅该事件（可选）。
+                if let Some((key, operator, reacted_msg, reply)) =
+                    crate::proto::parse_reaction_event(&payload)
+                {
+                    if !dedup.check(&key) {
+                        continue;
+                    }
+                    let hit = pending_asks_for_drain
+                        .lock()
+                        .await
+                        .iter()
+                        .find(|(_, c)| c.msg_id == reacted_msg)
+                        .map(|(_, c)| c.clone());
+                    if let Some(card) = hit {
+                        if !card.sender.is_empty()
+                            && !is_private_conv(&card.conv_id)
+                            && card.sender != operator
+                        {
+                            send_drain_text(
+                                &core_config_for_drain,
+                                &token_for_drain,
+                                &app_id_for_drain,
+                                &app_secret_for_drain,
+                                &ConvId(card.conv_id.clone()),
+                                &format!("⛔ 该询问由 {} 发起，仅其本人可答复。", card.sender),
+                            )
+                            .await;
+                            continue;
+                        }
+                        let reaction_msg = InboundMessage {
+                            conv_id: ConvId(card.conv_id.clone()),
+                            sender: imagent_core::UserId(operator),
+                            text: Some(reply.to_string()),
+                            media: Vec::new(),
+                            media_errors: Vec::new(),
+                            mentions: Vec::new(),
+                            mentioned_bot: false,
+                            ask_req: None,
+                            reply_to: Some(reacted_msg),
+                            source_msg_id: None,
+                            control: None,
+                            reply_hint: ReplyHint::None,
+                        };
+                        if inbound_msg_tx.send(reaction_msg).await.is_err() {
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 // 自定义菜单跳转（application.url.menu_v6）→ 合成 text="/help" 的
                 // 入站消息（复用 card action 的合成模式）：走与手打 /help 完全相同
                 // 的鉴权/分派路径。需在飞书后台订阅该事件（可选，见 README）。
@@ -642,6 +745,24 @@ impl FeishuPlatform {
                 if let Some((key, removed_msg)) = parse_bot_removed_event(&payload) {
                     if dedup.check(&key) && inbound_msg_tx.send(removed_msg).await.is_err() {
                         break;
+                    }
+                    continue;
+                }
+                // W3-4：bot 被加入群（im.chat.member.bot.added_v1）→ 欢迎引导
+                //（含 /chat allow 放行指引——放行前 core 白名单不会放行群消息）。
+                // 需订阅该事件（可选）。欢迎语平台层直发（与移出群通知管理员同
+                // 模式），无敏感信息。
+                if let Some((key, chat_id)) = crate::proto::parse_bot_added_event(&payload) {
+                    if dedup.check(&key) {
+                        send_drain_text(
+                            &core_config_for_drain,
+                            &token_for_drain,
+                            &app_id_for_drain,
+                            &app_secret_for_drain,
+                            &ConvId(format!("feishu:{chat_id}")),
+                            "👋 我已加入本群！群内 @我 发消息即可驱动 agent。\n管理员可发送 /chat allow 放行本群（放行前我不会响应消息）；/help 查看全部命令。",
+                        )
+                        .await;
                     }
                     continue;
                 }
@@ -688,6 +809,7 @@ impl FeishuPlatform {
             ask_timeout_secs,
             quiet_hours,
             reply_anchors,
+            last_inbound,
             text_split_max: message_max_len
                 .unwrap_or(FEISHU_TEXT_MAX)
                 .min(FEISHU_TEXT_MAX),
@@ -1702,8 +1824,18 @@ impl Platform for FeishuPlatform {
         .await
     }
 
-    async fn send_typing(&self, _conv: &ConvId, _hint: &ReplyHint) -> Result<()> {
-        // 飞书协议无 typing 语义。
+    async fn send_typing(&self, conv: &ConvId, _hint: &ReplyHint) -> Result<()> {
+        // 飞书协议无 typing 语义，但 core 在**每轮开始**调用本方法（round.rs）——
+        // W3-5 借此作「轮次锚定」信号：把该 conv 最近一条入站消息提升为回复
+        // 锚点。此后本轮运行中他人新消息只更新 last_inbound（下轮才生效），
+        // 本轮的流式卡/回复不再被无关新消息抢走 reply 锚（修复 conv 级「最近
+        // 一条」近似在群协作下的锚点漂移）。
+        if let Some(anchor) = self.last_inbound.lock().await.get(&conv.0).cloned() {
+            self.reply_anchors
+                .lock()
+                .await
+                .insert(conv.0.clone(), anchor);
+        }
         Ok(())
     }
     fn supports_streaming_card(&self, conv: &ConvId) -> bool {
@@ -2597,6 +2729,7 @@ mod tests {
             300,
             None,
             1800,
+            true,
         )
         .expect("构造");
         let conv = ConvId("feishu:ou_x".into());
@@ -2621,6 +2754,7 @@ mod tests {
             300,
             None,
             1800,
+            true,
         )
         .expect("构造");
         p.pending_asks.lock().await.insert(
@@ -2655,6 +2789,7 @@ mod tests {
             300,
             None,
             1800,
+            true,
         )
         .expect("构造");
         assert_eq!(p.require_mention_in_group().await, Some(true));
@@ -2755,6 +2890,7 @@ mod tests {
             300,
             None,
             1800,
+            true,
         )
         .expect("构造");
         assert!(p.quiet_hours.is_none(), "未配置 → None");
@@ -2787,6 +2923,7 @@ mod tests {
                 300,
                 None,
                 1800,
+                true,
             )
             .expect("构造")
         };

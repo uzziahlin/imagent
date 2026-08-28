@@ -656,6 +656,48 @@ impl Dispatcher {
         .await;
     }
 
+    /// /retry —— 重发本会话最近一轮的用户 prompt（W3-3：失败/中断后一键续接
+    /// 会话再试）。走与普通消息**完全相同**的 handle 路径（鉴权/批处理/轮次
+    /// 语义一致），无需独立执行逻辑。
+    pub(super) async fn cmd_retry(
+        &self,
+        conv: &ConvId,
+        sender: &crate::types::UserId,
+        hint: &ReplyHint,
+    ) {
+        let prompt = self
+            .last_prompts
+            .lock()
+            .await
+            .get(&conv.0)
+            .cloned()
+            .filter(|p| !p.trim().is_empty());
+        let Some(prompt) = prompt else {
+            self.reply(
+                conv,
+                "本会话没有可重试的历史指令（直接重发消息即可开始）。",
+                hint,
+            )
+            .await;
+            return;
+        };
+        let msg = InboundMessage {
+            conv_id: conv.clone(),
+            sender: sender.clone(),
+            text: Some(prompt),
+            media: Vec::new(),
+            media_errors: Vec::new(),
+            mentions: Vec::new(),
+            mentioned_bot: false,
+            ask_req: None,
+            reply_to: None,
+            source_msg_id: None,
+            control: None,
+            reply_hint: hint.clone(),
+        };
+        self.dispatch_agent_message(msg).await;
+    }
+
     /// /stats [today|7d|all] —— token 用量/成本统计（默认 7d）。全局 + 本会话
     /// 两组维度；无成本数据的 backend（codex/gemini）按 tokens 汇总展示。
     pub(super) async fn cmd_stats(&self, conv: &ConvId, hint: &ReplyHint, parts: &[&str]) {
@@ -850,7 +892,7 @@ impl Dispatcher {
 
     /// /help —— 命令总表（P6-3：飞书等卡片平台带常用命令按钮）。
     pub(super) async fn cmd_help(&self, conv: &ConvId, hint: &ReplyHint) {
-        let body = "🗂 会话\n- /new 重置会话\n- /switch <name> 切换/新建命名会话\n- /sessions 列出命名会话\n- /resume [n] 恢复历史/本机会话\n- /compact 压缩上下文\n\n📁 目录与文件\n- /cd <path> 切工作目录\n- /ws save|use|remove <name> 命名工作空间\n- /img <path> 发图片 · /file <path> 发文件\n\n🛡️ 权限与运行\n- /perm <off|allow|deny|ask> 权限模式\n- /stop 中断任务（排队消息保留并自动续跑；/stop all 全部丢弃）\n- /timeout <分钟|off|default> 会话级空闲看门狗\n- /model [名称|default] 查看/切换模型（切换需管理员）\n\n🧪 状态与诊断\n- /status 状态 · /doctor 自检 · /reconnect 重连\n- /config [k v] 查看/热改配置 · /audit [n] 审计日志\n\n👥 白名单与管理（管理员）\n- /allow、/disallow 授权/撤权（飞书群内可 @ 对方）\n- /chat allow|deny|allow-all|list 会话白名单\n- /admin list|add|remove 管理员\n- /list 白名单 · /whoami 我的 id\n\n其他内容直接发给 agent 即可（任务运行中发送的消息会排队合并进下一轮）。";
+        let body = "🗂 会话\n- /new 重置会话\n- /switch <name> 切换/新建命名会话\n- /sessions 列出命名会话\n- /resume [n] 恢复历史/本机会话\n- /compact 压缩上下文\n- /retry 重试最近一轮（失败后一键续接）\n\n📁 目录与文件\n- /cd <path> 切工作目录\n- /ws save|use|remove <name> 命名工作空间\n- /img <path> 发图片 · /file <path> 发文件\n\n🛡️ 权限与运行\n- /perm <off|allow|deny|ask> 权限模式\n- /stop 中断任务（排队消息保留并自动续跑；/stop all 全部丢弃）\n- /timeout <分钟|off|default> 会话级空闲看门狗\n- /model [名称|default] 查看/切换模型（切换需管理员）\n\n🧪 状态与诊断\n- /status 状态 · /doctor 自检 · /reconnect 重连\n- /config [k v] 查看/热改配置 · /audit [n] 审计日志\n\n👥 白名单与管理（管理员）\n- /allow、/disallow 授权/撤权（飞书群内可 @ 对方）\n- /chat allow|deny|allow-all|list 会话白名单\n- /admin list|add|remove 管理员\n- /list 白名单 · /whoami 我的 id\n\n其他内容直接发给 agent 即可（任务运行中发送的消息会排队合并进下一轮）。";
         let buttons = vec![
             CardButton {
                 label: "📊 状态".into(),

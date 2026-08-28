@@ -1094,6 +1094,7 @@ async fn build_platform(
                 config.permission_ask_timeout_secs,
                 config.quiet_hours_parsed,
                 config.feishu_thread_active_window_secs,
+                config.feishu_asr_enabled,
             )?))
         }
         _ => {

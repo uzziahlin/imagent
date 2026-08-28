@@ -598,7 +598,6 @@ pub fn unsupported_message_notice(payload: &[u8]) -> Option<(&'static str, Optio
         return None;
     }
     let notice = match evt.event.message.message_type.as_str() {
-        "audio" => "🎤 暂不支持语音消息，请输入文字。",
         "share_chat" => "🗂 暂不支持群聊分享卡片，请直接发送文字。",
         "share_user" => "👤 暂不支持用户名片分享，请直接发送文字。",
         // 合并转发（仅回退兜底，正常路径见 parse_merged_forward_event）/
@@ -628,6 +627,90 @@ pub fn unsupported_message_notice(payload: &[u8]) -> Option<(&'static str, Optio
         .map(|c| c.chat_id.clone())
         .or_else(|| evt.event.message.chat_id.clone())?;
     Some((notice, Some(ConvId(format!("feishu:{chat}")))))
+}
+
+/// W3-1：audio 消息 content `{"file_key":"…","duration":…}` → file_key。
+pub fn extract_audio_key(content: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(content).ok()?;
+    v.get("file_key")
+        .and_then(|k| k.as_str())
+        .filter(|k| !k.is_empty())
+        .map(str::to_string)
+}
+
+/// W3-2：表情回应事件（`im.message.reaction.created_v1`）→ 快速审批回复。
+///
+/// 用户在**审批卡**上回应 👍（y）/ 👎（n）≈ 点允许/拒绝按钮——比点开卡片按
+/// 按钮快得多的轻交互。payload 形态**离线按文档猜**（`event.operator_id.open_id`
+/// + `event.reaction.emoji_key` / `message_id`），缺任一字段返回 None（普通消息上的 emoji 回应不产生任何副作用）。
+///
+/// 仅映射两个保守 emoji；返回 `(dedup_key, 操作者 open_id, 被回应的消息 id, "y"/"n")`。
+pub fn parse_reaction_event(payload: &[u8]) -> Option<(String, String, String, &'static str)> {
+    // 弱解析（不依赖完整事件结构）：顶层 header 取 event_type/event_id，event
+    // 子树里按字段名定位（reaction 可能内嵌 operator 之外的字段名差异）。
+    let v: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    if v.get("header")
+        .and_then(|h| h.get("event_type"))
+        .and_then(|t| t.as_str())
+        != Some("im.message.reaction.created_v1")
+    {
+        return None;
+    }
+    let event = v.get("event")?;
+    let operator = event
+        .get("operator_id")
+        .and_then(|o| o.get("open_id"))
+        .and_then(|o| o.as_str())
+        .filter(|o| !o.is_empty())?;
+    let reaction = event.get("reaction")?;
+    let emoji = reaction.get("emoji_key").and_then(|e| e.as_str())?;
+    let reply = match emoji {
+        "THUMBSUP" => "y",
+        "THUMBSDOWN" => "n",
+        _ => return None,
+    };
+    let message_id = reaction
+        .get("message_id")
+        .and_then(|m| m.as_str())
+        .filter(|m| m.starts_with("om_"))?;
+    let dedup = v
+        .get("header")
+        .and_then(|h| h.get("event_id"))
+        .and_then(|e| e.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("reaction:{operator}:{message_id}:{emoji}"));
+    Some((dedup, operator.to_string(), message_id.to_string(), reply))
+}
+
+/// W3-4：bot 被加入群（`im.chat.member.bot.added_v1`）→ `(dedup_key, 群 chat_id)`。
+/// payload 形态**离线按文档猜**（`event.chat_id` 或内嵌 chat 节点），缺字段 None。
+pub fn parse_bot_added_event(payload: &[u8]) -> Option<(String, String)> {
+    let v: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    if v.get("header")
+        .and_then(|h| h.get("event_type"))
+        .and_then(|t| t.as_str())
+        != Some("im.chat.member.bot.added_v1")
+    {
+        return None;
+    }
+    let event = v.get("event")?;
+    let chat_id = event
+        .get("chat_id")
+        .and_then(|c| c.as_str())
+        .or_else(|| {
+            event
+                .get("chat")
+                .and_then(|c| c.get("chat_id"))
+                .and_then(|c| c.as_str())
+        })
+        .filter(|c| c.starts_with("oc_"))?;
+    let dedup = v
+        .get("header")
+        .and_then(|h| h.get("event_id"))
+        .and_then(|e| e.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("bot-added:{chat_id}"));
+    Some((dedup, chat_id.to_string()))
 }
 
 /// 解析云文档评论事件 → `(dedup_key, comment_id, InboundMessage)`
@@ -1031,6 +1114,21 @@ pub fn parse_message_event(
                     key,
                     message_id: message_id.clone(),
                     file_name,
+                }],
+                Vec::new(),
+            )
+        }
+        // W3-1：语音消息——下载后走 speech_to_text 转写（drain 侧），文本以
+        // 【语音】前缀注入 prompt。转写失败回退媒体错误提示（fail-soft）。
+        "audio" => {
+            let key = extract_audio_key(&evt.event.message.content)?;
+            (
+                None,
+                vec![PendingMedia {
+                    kind: "audio",
+                    key,
+                    message_id: message_id.clone(),
+                    file_name: None,
                 }],
                 Vec::new(),
             )
@@ -1713,6 +1811,72 @@ mod tests {
         assert_ne!(content_hash("abc"), content_hash("abd"));
     }
 
+    /// W3-2：表情回应事件——👍/👎 映射 y/n；其它 emoji / 缺字段 / 非目标事件
+    /// 均返回 None（fail-soft）。
+    #[test]
+    fn parse_reaction_event_maps_thumbs() {
+        let mk = |emoji: &str| {
+            serde_json::json!({
+                "header":{"event_id":"evt_r1","event_type":"im.message.reaction.created_v1"},
+                "event":{
+                    "operator_id":{"open_id":"ou_op"},
+                    "reaction":{"emoji_key":emoji,"message_id":"om_card1"}
+                }
+            })
+            .to_string()
+            .into_bytes()
+        };
+        let (key, operator, msg_id, reply) =
+            parse_reaction_event(&mk("THUMBSUP")).expect("👍 应映射 y");
+        assert_eq!(key, "evt_r1");
+        assert_eq!(operator, "ou_op");
+        assert_eq!(msg_id, "om_card1");
+        assert_eq!(reply, "y");
+        let (_, _, _, reply) = parse_reaction_event(&mk("THUMBSDOWN")).expect("👎 应映射 n");
+        assert_eq!(reply, "n");
+        // 其它 emoji / 非 om_ 消息 id / 非目标事件 → None。
+        assert!(parse_reaction_event(&mk("SMILE")).is_none());
+        let bad_msg = serde_json::json!({
+            "header":{"event_type":"im.message.reaction.created_v1"},
+            "event":{"operator_id":{"open_id":"ou_op"},"reaction":{"emoji_key":"THUMBSUP","message_id":"not-om"}}
+        })
+        .to_string()
+        .into_bytes();
+        assert!(parse_reaction_event(&bad_msg).is_none());
+        let other_evt = serde_json::json!({
+            "header":{"event_type":"im.message.receive_v1"},
+            "event":{"operator_id":{"open_id":"ou_op"},"reaction":{"emoji_key":"THUMBSUP","message_id":"om_1"}}
+        })
+        .to_string()
+        .into_bytes();
+        assert!(parse_reaction_event(&other_evt).is_none());
+    }
+
+    /// W3-4：bot 进群事件——chat_id（oc_ 前缀）解析；p2p 形态/缺字段 None。
+    #[test]
+    fn parse_bot_added_event_extracts_chat() {
+        let payload = br#"{
+            "header":{"event_id":"evt_add1","event_type":"im.chat.member.bot.added_v1"},
+            "event":{"chat_id":"oc_group1"}
+        }"#;
+        let (key, chat) = parse_bot_added_event(payload).expect("进群事件应解析");
+        assert_eq!(key, "evt_add1");
+        assert_eq!(chat, "oc_group1");
+        // 内嵌 chat 节点形态。
+        let nested = br#"{
+            "header":{"event_type":"im.chat.member.bot.added_v1"},
+            "event":{"chat":{"chat_id":"oc_g2"}}
+        }"#;
+        let (_, chat) = parse_bot_added_event(nested).expect("内嵌形态应解析");
+        assert_eq!(chat, "oc_g2");
+        // 非 oc_ 前缀 / 非目标事件 → None。
+        let bad = br#"{"header":{"event_type":"im.chat.member.bot.added_v1"},"event":{"chat_id":"ou_x"}}"#;
+        assert!(parse_bot_added_event(bad).is_none());
+        let other =
+            br#"{"header":{"event_type":"im.message.receive_v1"},"event":{"chat_id":"oc_x"}}"#;
+        assert!(parse_bot_added_event(other).is_none());
+    }
+
     /// 非 im.message.receive_v1 事件丢弃。
     #[test]
     fn ignore_other_event_type() {
@@ -1723,14 +1887,24 @@ mod tests {
         assert!(parse_permissive(payload).is_none());
     }
 
-    /// 不支持的媒体类型（audio/video/voice 等）丢弃。
+    /// W3-1：audio 现已支持（pending 含 audio key）；真正不支持的类型
+    /// （video/voice）仍丢弃。
     #[test]
-    fn ignore_unsupported_media_type() {
+    fn audio_parses_and_video_drops() {
         let payload = br#"{
-            "header":{"event_id":"evt_i","event_type":"im.message.receive_v1"},
-            "event":{"sender":{"sender_id":{"open_id":"ou_x"}},"message":{"message_type":"audio","content":"{\"file_key\":\"k\"}","chat_type":"p2p"}}
+            "header":{"event_id":"evt_a","event_type":"im.message.receive_v1"},
+            "event":{"sender":{"sender_id":{"open_id":"ou_x"}},"message":{"message_type":"audio","content":"{\"file_key\":\"aud_k1\"}","chat_type":"p2p"}}
         }"#;
-        assert!(parse_permissive(payload).is_none());
+        let (_key, msg, pending) = parse_permissive(payload).expect("语音应解析（转写在 drain）");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].kind, "audio");
+        assert_eq!(pending[0].key, "aud_k1");
+        assert!(msg.text.is_none(), "proto 阶段无文本（转写后回填）");
+        let video = br#"{
+            "header":{"event_id":"evt_v","event_type":"im.message.receive_v1"},
+            "event":{"sender":{"sender_id":{"open_id":"ou_x"}},"message":{"message_type":"video","content":"{}","chat_type":"p2p"}}
+        }"#;
+        assert!(parse_permissive(video).is_none(), "video 仍不支持");
     }
 
     /// p2p 图片：pending 含 image key，msg.text==None、media 空。
@@ -2690,26 +2864,25 @@ mod tests {
             .to_string()
             .into_bytes()
         };
+        // W3-1：audio 已支持（走转写路径），不再出现在提示清单。
+        assert!(unsupported_message_notice(&mk("audio", "p2p", "[]")).is_none());
         let (notice, conv) =
-            unsupported_message_notice(&mk("audio", "p2p", "[]")).expect("语音应提示");
-        assert!(notice.contains("语音"), "{notice}");
-        assert_eq!(conv.unwrap().0, "feishu:ou_u");
-        let (notice, _) =
             unsupported_message_notice(&mk("share_chat", "p2p", "[]")).expect("群名片应提示");
         assert!(notice.contains("分享卡片"), "{notice}");
+        assert_eq!(conv.unwrap().0, "feishu:ou_u");
         let (notice, _) =
             unsupported_message_notice(&mk("share_user", "p2p", "[]")).expect("用户名片应提示");
         assert!(notice.contains("名片"), "{notice}");
         // 群 + 带 @ → 提示（回群）。
         let (_, conv) = unsupported_message_notice(&mk(
-            "audio",
+            "share_chat",
             "group",
             r#"[{"key":"@_user_1","id":{"open_id":"ou_bot"}}]"#,
         ))
-        .expect("群 @ 语音应提示");
+        .expect("群 @ 分享应提示");
         assert_eq!(conv.unwrap().0, "feishu:oc_g");
         // 群 + 无 @ → 不提示（消息本不会送达处理）。
-        assert!(unsupported_message_notice(&mk("audio", "group", "[]")).is_none());
+        assert!(unsupported_message_notice(&mk("share_chat", "group", "[]")).is_none());
         // 支持的类型 → None。
         assert!(unsupported_message_notice(&mk("text", "p2p", "[]")).is_none());
         // image 消息也不提示（有专门处理路径）。
