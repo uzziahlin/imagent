@@ -214,6 +214,8 @@ pub fn msg_to_inbound(msg: &Msg) -> InboundMessage {
         mentioned_bot: false,
         ask_req: None,
         reply_to: None,
+        source_msg_id: None,
+        control: None,
         reply_hint: ReplyHint::ContextToken {
             context_token: msg.context_token.clone().unwrap_or_default(),
         },

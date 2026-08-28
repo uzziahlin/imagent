@@ -59,6 +59,15 @@ fn split_text_by_bytes(text: &str, max_bytes: usize) -> Vec<String> {
     chunks
 }
 
+/// 出站分片字节上限：`min(config.message_max_len, WECOM_TEXT_MAX_BYTES)`
+/// （config 未设 = 仅协议上限）。纯函数便于单测；跨单位（config 按字符、企微
+/// 按字节）取 min 偏保守——多切不少切，配置上限不会被平台放大。
+fn wecom_split_cap(message_max_len: Option<usize>) -> usize {
+    message_max_len
+        .unwrap_or(WECOM_TEXT_MAX_BYTES)
+        .min(WECOM_TEXT_MAX_BYTES)
+}
+
 /// 企业微信 Platform 适配器。
 ///
 /// 持有两条 channel 与后台 client task 通信：出站帧（发给企微）、入站帧（企微
@@ -70,13 +79,24 @@ pub struct WeComPlatform {
     reconnect: std::sync::Arc<tokio::sync::Notify>,
     /// 已解析的入站消息 channel，`recv` 直接 await（无轮询）。
     inbound_rx: Arc<Mutex<mpsc::Receiver<InboundMessage>>>,
+    /// 出站文本分片上限：`min(config.message_max_len, WECOM_TEXT_MAX_BYTES)`
+    /// （config 未设 = 仅协议上限）。注：config 按字符计、企微按字节计，跨单位
+    /// 取 min 偏保守（多切不少切），满足「配置上限不被平台放大」的语义。
+    text_split_max_bytes: usize,
 }
 
 impl WeComPlatform {
     /// 构造并后台 spawn：
     /// 1. client `run` task（建连/认证/心跳/重连/收发）；
     /// 2. drain task：把 client 推来的 `aibot_msg_callback` 帧解析入 pending 队列。
-    pub fn new(bot_id: String, secret: String, ws_url: String) -> Self {
+    ///
+    /// `message_max_len`：core config `message_max_len`（None = 不按配置分片）。
+    pub fn new(
+        bot_id: String,
+        secret: String,
+        ws_url: String,
+        message_max_len: Option<usize>,
+    ) -> Self {
         let (inbound_frame_tx, inbound_frame_rx) = mpsc::channel::<InboundFrame>(64);
         let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundFrame>(64);
 
@@ -124,6 +144,7 @@ impl WeComPlatform {
             outbound_tx,
             reconnect,
             inbound_rx: Arc::new(Mutex::new(inbound_msg_rx)),
+            text_split_max_bytes: wecom_split_cap(message_max_len),
         }
     }
 }
@@ -139,9 +160,10 @@ impl Platform for WeComPlatform {
 
     async fn send_text(&self, conv: &ConvId, text: &str, _hint: &ReplyHint) -> Result<()> {
         let userid = userid_from_conv(conv);
-        // 超限分片（与飞书/ilink 同思路）：按字节安全阈值切，多片加 (i/n) 编号
-        // 后缀，用户能感知这是同一回复的一部分且未被截断。
-        let chunks = split_text_by_bytes(text, WECOM_TEXT_MAX_BYTES);
+        // 超限分片（与飞书/ilink 同思路）：按字节安全阈值切（config
+        // message_max_len 与协议上限取 min，见 text_split_max_bytes），多片加
+        // (i/n) 编号后缀，用户能感知这是同一回复的一部分且未被截断。
+        let chunks = split_text_by_bytes(text, self.text_split_max_bytes);
         let total = chunks.len();
         for (i, chunk) in chunks.into_iter().enumerate() {
             let content = if total > 1 {
@@ -408,5 +430,24 @@ mod tests {
     fn unused_import_guard() {
         // 保持 UserId 等导入被使用，防止编译告警。
         let _ = UserId("x".into());
+    }
+
+    /// Bug：message_max_len 三平台生效——企微分片上限 =
+    /// min(config, WECOM_TEXT_MAX_BYTES)；未配置回落协议上限，超配钳到上限。
+    #[test]
+    fn split_cap_respects_message_max_len() {
+        assert_eq!(wecom_split_cap(None), WECOM_TEXT_MAX_BYTES);
+        assert_eq!(wecom_split_cap(Some(1_000)), 1_000, "配置小于上限应生效");
+        assert_eq!(
+            wecom_split_cap(Some(1_000_000)),
+            WECOM_TEXT_MAX_BYTES,
+            "配置大于上限钳到协议上限"
+        );
+        // 生效路径：2000 字节上限下 6000 字节 ASCII 文本切成 3 片、每片 ≤2000 字节。
+        let text = "x".repeat(6_000);
+        let chunks = split_text_by_bytes(&text, wecom_split_cap(Some(2_000)));
+        assert_eq!(chunks.len(), 3, "{:?}", chunks.len());
+        assert!(chunks.iter().all(|c| c.len() <= 2_000));
+        assert_eq!(chunks.concat(), text, "分片不丢字符");
     }
 }

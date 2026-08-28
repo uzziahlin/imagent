@@ -36,6 +36,8 @@ impl Platform for ConsolePlatform {
             mentioned_bot: false,
             ask_req: None,
             reply_to: None,
+            source_msg_id: None,
+            control: None,
             reply_hint: ReplyHint::None,
         })
     }

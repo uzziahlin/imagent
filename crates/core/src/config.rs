@@ -202,7 +202,9 @@ pub struct Config {
     #[serde(default = "default_metrics_addr")]
     pub metrics_addr: Option<String>,
     /// 出站消息单条字符上限（Unicode char 计）。超长则由各 Platform 的 `send_text`
-    /// 在内部分片。`None` = 不分片（默认，保持单条发送的既有行为）。
+    /// 在内部分片——**三平台生效**（ilink / feishu / wecom，各平台再与自身协议
+    /// 硬上限取 min：飞书 28000、企微 4000 字节）。`None` = 不按此配置分片
+    /// （默认，仅用各平台协议上限）。
     #[serde(default)]
     pub message_max_len: Option<usize>,
     /// 分片之间发送间隔（毫秒），避免多条叠加触发 IM 限流。默认 400。
@@ -277,6 +279,13 @@ pub struct Config {
     /// 的群消息若 @ 了 bot，回一句「管理员可 /chat allow」引导（私聊始终静默）。
     #[serde(default)]
     pub stranger_mention_hint: bool,
+    /// 私聊陌生人引导（默认 true）：未过白名单的**私聊**消息回一句引导（含 sender
+    /// id 与「联系管理员 /allow <id>」）。与 `stranger_mention_hint` 的区别：群内
+    /// 默认静默是防探测（群成员构成敏感面）；私聊是用户**主动**找 bot，消息本就
+    /// 一对一到达，无探测面可言——默认引导，帮首次使用者拿到自己的 id 完成授权。
+    /// 关闭后私聊同样完全静默。
+    #[serde(default = "default_stranger_p2p_hint")]
+    pub stranger_p2p_hint: bool,
     /// 回复形态偏好（P7-A4；默认 card）。text = 不建卡走纯文本流（/config 可热改）。
     #[serde(default)]
     pub reply_mode: ReplyMode,
@@ -300,6 +309,9 @@ fn default_metrics_addr() -> Option<String> {
     None
 }
 fn default_feishu_require_mention_in_group() -> bool {
+    true
+}
+fn default_stranger_p2p_hint() -> bool {
     true
 }
 
@@ -492,12 +504,13 @@ platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人)
 # feishu_base_url = "https://open.feishu.cn"  # 可选，默认 https://open.feishu.cn；Lark 国际版 https://open.larksuite.com（MVP 不覆盖）
 # feishu_require_mention_in_group = true       # 群消息须 @bot 才处理（默认 true：客户端过滤 + 剥离 @bot 占位；false=全收，过滤交给事件订阅 scope）
 # stranger_mention_hint = false                # 未放行群里被 @ 时回一句引导（默认 false 完全静默防探测；私聊始终静默）
+# stranger_p2p_hint = true                     # 未放行用户的私聊回引导（默认 true：私聊是主动来找 bot 的，无探测面；含 sender id 与 /allow 指引）
 # reply_mode = "card"                          # 回复形态：card(默认,流式卡片) | text(纯文本)；/config 可热改
 permission_mode = "auto"    # 缺省=auto：claude-cli=透传 claude 原生 auto 模式(分类器自动放行安全操作,高危进 IM)+审批闭环；其余后端=off；显式 ask=每个提示都进 IM
 # backend_permission_mode = "auto" # 后端原生权限模式透传(claude→--permission-mode；可覆盖 auto 档缺省)：default|acceptEdits|plan|auto|dontAsk|bypassPermissions；codex/gemini 暂不支持(warn 忽略)
 # approval_tools = ["Bash", "WebFetch", "mcp__*"]  # 审批集：ask 模式下只有这些工具过 IM 审批，其余直接放行；空=全部过审
 # metrics_addr = "127.0.0.1:9100"   # 默认关闭；设为 "ip:port" 开启 /metrics + /health HTTP server
-# message_max_len = 2000              # 单条出站消息字符上限（Unicode char）；不设 = 不分片
+# message_max_len = 2000              # 单条出站消息字符上限（Unicode char，三平台生效：ilink/feishu/wecom 各与自身协议上限取 min）；不设 = 仅用平台协议上限
 # message_fragment_interval_ms = 400  # 分片间发送间隔（ms）
 # agent_timeout_secs = 0              # 单次运行总超时(秒)；0=关闭(默认，防挂死靠 idle 看门狗)；设为正数即硬上限
 # agent_idle_timeout_secs = 300       # 空闲看门狗(秒)：连续无输出则终止本轮；0=关闭
@@ -700,6 +713,26 @@ metrics_addr = "0.0.0.0:9999"
         let p = tmp_path("msg_def", r#"default_workdir = "/tmp/ws""#);
         let cfg = Config::load(&p).expect("parse");
         assert_eq!(cfg.message_max_len, None);
+        cleanup(&p);
+    }
+
+    /// 私聊陌生人引导：默认 true（与群内 stranger_mention_hint 默认 false 相反——
+    /// 私聊无探测面）；显式 false 可关闭。
+    #[test]
+    fn stranger_p2p_hint_default_true_and_custom() {
+        let p = tmp_path("p2p_def", r#"default_workdir = "/tmp/ws""#);
+        let cfg = Config::load(&p).expect("parse");
+        assert!(cfg.stranger_p2p_hint, "私聊引导默认开启");
+        assert!(!cfg.stranger_mention_hint, "群内提示默认静默");
+        cleanup(&p);
+        let p = tmp_path(
+            "p2p_off",
+            r#"default_workdir = "/tmp/ws"
+stranger_p2p_hint = false
+"#,
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert!(!cfg.stranger_p2p_hint);
         cleanup(&p);
     }
 

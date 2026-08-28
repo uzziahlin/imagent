@@ -74,6 +74,26 @@ pub struct CardButton {
     pub style: CardButtonStyle,
 }
 
+/// 平台控制信号（非用户消息）：平台侧把系统事件（消息撤回 / bot 被移出群等）
+/// 合成 `InboundMessage` 投递进 recv 通道，dispatch 在白名单校验**之前**消费
+/// （见 `handle` 的 control 分支）——控制信号不是对话输入，不应被鉴权丢弃。
+/// 普通消息为 `None`。
+#[derive(Debug, Clone)]
+pub enum InboundControl {
+    /// 用户撤回了消息（飞书 `im.message.recalled_v1`）：被撤回消息的平台侧 id 在
+    /// [`InboundMessage::source_msg_id`]，dispatch 据此把同 id 的**排队**消息移出。
+    /// `notify_conv` 为可回执的会话（事件携带 chat_id / sender 时给，撤回提示的
+    /// 发送对象）；`probe_convs` 为可能承载该消息的会话 key 集合（群 conv 与
+    /// 发送者私聊 conv 两种形态都可能——在飞判定用）。
+    MessageRecalled {
+        notify_conv: Option<ConvId>,
+        probe_convs: Vec<ConvId>,
+    },
+    /// bot 被移出群（飞书 `im.chat.member.bot.deleted_v1`）：`conv_id` 即群 conv，
+    /// dispatch 据此从会话白名单移除并通知管理员。
+    BotRemovedFromChat,
+}
+
 /// 入站消息（`Platform::recv` 产出，core 消费）。
 pub struct InboundMessage {
     pub conv_id: ConvId,
@@ -93,6 +113,13 @@ pub struct InboundMessage {
     pub ask_req: Option<String>,
     /// 引用回复的目标消息 id（自由文本路由到被引用的询问卡；无引用为 None）。
     pub reply_to: Option<String>,
+    /// 消息来源的平台侧消息 id（飞书 message_id 等；撤回事件按此匹配排队消息，
+    /// 见 [`InboundControl::MessageRecalled`]）。平台无消息 id 概念 / 按钮回调
+    /// 等合成消息为 None。
+    pub source_msg_id: Option<String>,
+    /// 平台控制信号（消息撤回 / bot 被移出群等系统事件的合成载体）。普通用户
+    /// 消息为 None。
+    pub control: Option<InboundControl>,
     pub reply_hint: ReplyHint,
 }
 

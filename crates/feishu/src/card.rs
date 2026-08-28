@@ -33,10 +33,18 @@ const STREAM_TOOL_LINES: usize = 5;
 /// 审批卡详情代码块上限（卡片单元素 ~30KB，留足余量）。
 const PERM_DETAIL_MAX: usize = 1000;
 
-/// 审批/问题卡的自动拒绝时长（分钟）。取 core `permission_ask_timeout_secs` 的
-/// 缺省值（300s）；平台构造 API（`FeishuPlatform::new`）不接收该配置，无法逐
-/// 实例感知——自定义了该配置的部署以配置为准（此文案为缺省提示）。
-const ASK_AUTO_DENY_MINS: u64 = 5;
+/// 审批/问题卡的自动拒绝倒计时文案（真实值透传）：`permission_ask_timeout_secs`
+/// 由 `FeishuPlatform` 构造时注入（见 platform 的 `ask_timeout_secs` 字段），
+/// 不再硬编码 5 分钟——自定义了超时的部署文案与实际行为一致。
+/// 换算口径：≥90s 显示分钟（四舍五入），否则显示秒（避免「1 分钟」掩盖实际
+/// 只有几十秒的紧迫感）。
+pub(crate) fn humanize_ask_timeout(secs: u64) -> String {
+    if secs >= 90 {
+        format!("{} 分钟", (secs + 30) / 60)
+    } else {
+        format!("{secs} 秒")
+    }
+}
 
 /// Running 阶段 → footer 文案（也用于 config.summary 预览）。
 pub fn phase_footer(phase: CardPhase) -> &'static str {
@@ -575,11 +583,37 @@ fn perm_detail_md(tool_name: &str, input_summary: &str) -> (String, Vec<String>)
 /// 真机校准（2026-08）：schema V2 卡片已**废弃 `action` 元素**（200861 "cards of
 /// schema V2 no longer support this capability; unsupported tag action"）。按钮迁到
 /// `column_set` → `column` → `button`（button 组件本身 + behaviors 保留），两列等宽。
-/// 审批卡 note 行缺省文案：自动拒绝的具体倒计时（分钟数值来自
-/// [`ASK_AUTO_DENY_MINS`]，即 core `permission_ask_timeout_secs` 缺省值）——
-/// 静态「长时间未处理」让用户无从判断还剩多久。
-pub(crate) fn perm_note_default() -> String {
-    format!("⏱️ 将在 {ASK_AUTO_DENY_MINS} 分钟后自动拒绝 · 回复 always = 本次会话内此工具不再询问")
+/// 审批卡 note 行缺省文案：自动拒绝的具体倒计时（`permission_ask_timeout_secs`
+/// 真实值经构造注入，见 [`humanize_ask_timeout`]）——静态「长时间未处理」让用户
+/// 无从判断还剩多久。
+pub(crate) fn perm_note_default(ask_timeout_secs: u64) -> String {
+    format!(
+        "⏱️ 将在 {}后自动拒绝 · 回复 always = 本次会话内此工具不再询问",
+        humanize_ask_timeout(ask_timeout_secs)
+    )
+}
+
+/// 询问类按钮（`imagent_perm` / `imagent_ask` / `imagent_form`）value 公共字段：
+/// 在动作键之外补 conv + req + `ts`（epoch 秒，回调侧超 24h 拒绝——与命令按钮
+/// 同窗口）+ `sender`（发起者 open_id，回调侧**全形态**校验点击者——防卡片被
+/// 转发到其它会话后代批）。
+fn ask_value_wrap(
+    mut v: serde_json::Value,
+    conv_id: &str,
+    request_id: &str,
+    sender: Option<&str>,
+) -> serde_json::Value {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    v["conv"] = serde_json::json!(conv_id);
+    v["req"] = serde_json::json!(request_id);
+    v["ts"] = serde_json::json!(ts);
+    if let Some(s) = sender.filter(|s| !s.is_empty()) {
+        v["sender"] = serde_json::json!(s);
+    }
+    v
 }
 
 pub fn render_permission_card(
@@ -587,22 +621,28 @@ pub fn render_permission_card(
     input_summary: &str,
     conv_id: &str,
     request_id: &str,
+    sender: Option<&str>,
+    ask_timeout_secs: u64,
 ) -> String {
     render_permission_card_note(
         tool_name,
         input_summary,
         conv_id,
         request_id,
-        &perm_note_default(),
+        sender,
+        &perm_note_default(ask_timeout_secs),
     )
 }
 
 /// P10-③：note 行可参数化（排队联动重渲染用，见 platform 的 note_queued_on_ask）。
+/// `sender` 参与按钮 value 编码——重渲染时保持原卡的发起者/时效字段不丢
+/// （复用槽换询问后发起者可能变化，按当前值编码）。
 pub(crate) fn render_permission_card_note(
     tool_name: &str,
     input_summary: &str,
     conv_id: &str,
     request_id: &str,
+    sender: Option<&str>,
     note: &str,
 ) -> String {
     let (detail, detail_notes) = perm_detail_md(tool_name, input_summary);
@@ -621,23 +661,32 @@ pub(crate) fn render_permission_card_note(
         cb_button(
             "允许",
             "primary",
-            serde_json::json!({
-                "imagent_perm": "allow", "conv": conv_id, "req": request_id
-            }),
+            ask_value_wrap(
+                serde_json::json!({ "imagent_perm": "allow" }),
+                conv_id,
+                request_id,
+                sender,
+            ),
         ),
         cb_button(
             "♾️ 本次会话始终允许",
             "default",
-            serde_json::json!({
-                "imagent_perm": "always", "conv": conv_id, "req": request_id
-            }),
+            ask_value_wrap(
+                serde_json::json!({ "imagent_perm": "always" }),
+                conv_id,
+                request_id,
+                sender,
+            ),
         ),
         cb_button(
             "⛔ 拒绝",
             "danger",
-            serde_json::json!({
-                "imagent_perm": "deny", "conv": conv_id, "req": request_id
-            }),
+            ask_value_wrap(
+                serde_json::json!({ "imagent_perm": "deny" }),
+                conv_id,
+                request_id,
+                sender,
+            ),
         ),
     ]));
     serde_json::json!({
@@ -683,11 +732,24 @@ pub fn render_permission_card_superseded(tool_name: &str) -> String {
 /// 输入是 AskUserQuestion 工具的 input JSON（`questions[0].question/options`），
 /// 解析失败返回 None（调用方降级普通审批卡）。选项按钮 value 编码
 /// `imagent_ask`（选项文本）+ conv，回调转成 `ask:<选项>` 走审批回复路由。
-pub fn render_question_card(tool_input: &str, conv_id: &str, request_id: &str) -> Option<String> {
-    render_question_card_note(tool_input, conv_id, request_id, &perm_note_default())
+pub fn render_question_card(
+    tool_input: &str,
+    conv_id: &str,
+    request_id: &str,
+    sender: Option<&str>,
+    ask_timeout_secs: u64,
+) -> Option<String> {
+    render_question_card_note(
+        tool_input,
+        conv_id,
+        request_id,
+        sender,
+        &perm_note_default(ask_timeout_secs),
+    )
 }
 
-/// P10-③：note 行可参数化（同审批卡）。
+/// P10-③：note 行可参数化（同审批卡；`sender` 参与按钮 value 编码，语义同
+/// [`render_permission_card_note`]）。
 ///
 /// 交互形态按选项数/多选分流（替代此前「>4 选项要求手打 `ask:选项`、多选第一
 /// 次点击即收敛」的残缺交互）：
@@ -701,6 +763,7 @@ pub(crate) fn render_question_card_note(
     tool_input: &str,
     conv_id: &str,
     request_id: &str,
+    sender: Option<&str>,
     note: &str,
 ) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(tool_input).ok()?;
@@ -773,9 +836,10 @@ pub(crate) fn render_question_card_note(
                     "text": { "tag": "plain_text", "content": "提交" },
                     "type": "primary",
                     "form_action_type": "submit",
-                    "behaviors": [{ "type": "callback", "value": {
-                        "imagent_form": "ask", "conv": conv_id, "req": request_id
-                    } }]
+                    "behaviors": [{ "type": "callback", "value": ask_value_wrap(
+                        serde_json::json!({ "imagent_form": "ask" }),
+                        conv_id, request_id, sender,
+                    ) }]
                 })])
             ]}),
         ]
@@ -789,9 +853,12 @@ pub(crate) fn render_question_card_note(
                 cb_button(
                     &format!("{}. {}", i + 1, label),
                     btn_type,
-                    serde_json::json!({
-                        "imagent_ask": label, "conv": conv_id, "req": request_id
-                    }),
+                    ask_value_wrap(
+                        serde_json::json!({ "imagent_ask": label }),
+                        conv_id,
+                        request_id,
+                        sender,
+                    ),
                 )
             })
             .collect();
@@ -1324,7 +1391,8 @@ mod tests {
             }]
         })
         .to_string();
-        let json = render_question_card(&input, "feishu:ou_q", "req1").expect("应可渲染");
+        let json = render_question_card(&input, "feishu:ou_q", "req1", Some("ou_q"), 300)
+            .expect("应可渲染");
         assert!(json.contains("先做哪一步？"), "问题正文: {json}");
         assert!(json.contains("数据库迁移"), "选项文本: {json}");
         assert!(json.contains("需要你的输入"), "标题栏: {json}");
@@ -1340,8 +1408,8 @@ mod tests {
         assert!(json.contains("feishu:ou_q"), "conv 编码: {json}");
         assert!(!json.contains("\"tag\":\"action\""), "V2 无 action: {json}");
         // 非法 JSON / 缺 options → None（降级审批卡）。
-        assert!(render_question_card("not json", "c", "req1").is_none());
-        assert!(render_question_card("{}", "c", "req1").is_none());
+        assert!(render_question_card("not json", "c", "req1", None, 300).is_none());
+        assert!(render_question_card("{}", "c", "req1", None, 300).is_none());
     }
 
     /// P6-3：命令卡片——标题栏 + 正文 + 按钮样式分层（primary/danger）、
@@ -1420,6 +1488,8 @@ mod tests {
             r#"{"command":"cargo test --all"}"#,
             "feishu:ou_u1",
             "req1",
+            Some("ou_u1"),
+            300,
         );
         // 标题栏 + 主题色。
         assert!(json.contains("权限审批"), "标题栏: {json}");
@@ -1467,6 +1537,8 @@ mod tests {
             r##"{"file_path":"/a/b.md","content":"# hi"}"##,
             "feishu:ou_u1",
             "req1",
+            None,
+            300,
         );
         assert!(json.contains("**Write** — /a/b.md"), "签名行: {json}");
         // 序列化后内嵌引号成转义形态，断言裸字段名即可。
@@ -1536,6 +1608,7 @@ mod tests {
             r#"{"command":"ls"}"#,
             "feishu:ou_t",
             "req9",
+            Some("ou_t"),
             "⏳ 等待你审批 · 后面还排着 3 条消息",
         );
         assert!(
@@ -1551,10 +1624,79 @@ mod tests {
             "按钮 value 编码不变: {json}"
         );
         // 缺省包装函数仍用默认 note（含具体分钟数值）。
-        let plain = render_permission_card("Bash", r#"{"command":"ls"}"#, "c", "r");
+        let plain = render_permission_card("Bash", r#"{"command":"ls"}"#, "c", "r", None, 300);
         assert!(
             plain.contains("将在 5 分钟后自动拒绝"),
             "默认倒计时: {plain}"
+        );
+    }
+
+    /// Bug：审批卡倒计时真实值透传——`permission_ask_timeout_secs` 换算显示
+    /// （≥90s 显示分钟、否则秒），不再硬编码 5 分钟。
+    #[test]
+    fn ask_timeout_humanize_and_note_passthrough() {
+        assert_eq!(humanize_ask_timeout(300), "5 分钟");
+        assert_eq!(humanize_ask_timeout(60 * 30), "30 分钟");
+        assert_eq!(humanize_ask_timeout(90), "2 分钟", "90s 四舍五入到分钟");
+        assert_eq!(humanize_ask_timeout(89), "89 秒", "<90s 显示秒");
+        assert_eq!(humanize_ask_timeout(45), "45 秒");
+        // 自定义超时（60s）的卡片 note 按实际值显示。
+        let json = render_permission_card("Bash", r#"{"command":"ls"}"#, "c", "r", None, 60);
+        assert!(
+            json.contains("将在 60 秒后自动拒绝"),
+            "短超时显示秒: {json}"
+        );
+        assert!(!json.contains("5 分钟"), "不得再出现硬编码 5 分钟: {json}");
+        // 长超时（1800s）显示分钟。
+        let json = render_permission_card("Bash", r#"{"command":"ls"}"#, "c", "r", None, 1800);
+        assert!(
+            json.contains("将在 30 分钟后自动拒绝"),
+            "长超时显示分钟: {json}"
+        );
+    }
+
+    /// 安全（转发代批）：审批/问题卡按钮 value 补 sender（发起者）与 ts（时效），
+    /// 与命令按钮同款编码；无 sender（未知发起者）不编码该字段。
+    #[test]
+    fn ask_button_value_carries_sender_and_ts() {
+        let json = render_permission_card(
+            "Bash",
+            r#"{"command":"ls"}"#,
+            "feishu:oc_g",
+            "req_s",
+            Some("ou_owner"),
+            300,
+        );
+        assert!(
+            json.contains("\"sender\":\"ou_owner\""),
+            "审批按钮带发起者: {json}"
+        );
+        assert!(json.contains("\"ts\":"), "审批按钮带时效戳: {json}");
+        // 无 sender：不编码（私聊/未知发起者）。
+        let plain = render_permission_card("Bash", r#"{"command":"ls"}"#, "c", "r", None, 300);
+        assert!(!plain.contains("\"sender\":"), "无发起者不编码: {plain}");
+        assert!(plain.contains("\"ts\":"), "时效戳恒编码: {plain}");
+        // 问题卡（按钮形态与表单形态）同样编码。
+        let input = serde_json::json!({
+            "questions": [{"question": "选？", "options": [{"label":"A"},{"label":"B"}]}]
+        })
+        .to_string();
+        let q = render_question_card(&input, "feishu:oc_g", "rq", Some("ou_owner"), 300).unwrap();
+        assert!(
+            q.contains("\"sender\":\"ou_owner\"") && q.contains("\"ts\":"),
+            "问题卡按钮带 sender+ts: {q}"
+        );
+        let many = serde_json::json!({
+            "questions": [{
+                "question": "选哪个方案？",
+                "options": (1..=6).map(|i| serde_json::json!({"label": format!("方案{i}")})).collect::<Vec<_>>()
+            }]
+        })
+        .to_string();
+        let form = render_question_card(&many, "feishu:oc_g", "rq", Some("ou_owner"), 300).unwrap();
+        assert!(
+            form.contains("\"imagent_form\":\"ask\"") && form.contains("\"sender\":\"ou_owner\""),
+            "表单提交按钮同样带 sender: {form}"
         );
     }
 
@@ -1773,13 +1915,15 @@ mod tests {
             &format!(r#"{{"command":"echo {long}"}}"#),
             "feishu:ou_t",
             "req1",
+            None,
+            300,
         );
         assert!(
             json.contains("已截断，仅显示前 1000 字符"),
             "截断提示: {json}"
         );
         // 短输入无提示。
-        let short = render_permission_card("Bash", r#"{"command":"ls"}"#, "c", "r");
+        let short = render_permission_card("Bash", r#"{"command":"ls"}"#, "c", "r", None, 300);
         assert!(!short.contains("已截断"), "短输入不提示: {short}");
     }
 
@@ -1791,6 +1935,8 @@ mod tests {
             r#"{"command":"git clone git@github.com:org/repo.git"}"#,
             "feishu:ou_t",
             "req1",
+            None,
+            300,
         );
         assert!(json.contains("[at]"), "掩码仍生效（审计强制）: {json}");
         assert!(json.contains("邮箱已掩码显示"), "掩码提示: {json}");
@@ -1799,7 +1945,7 @@ mod tests {
             "告知原命令语义不变: {json}"
         );
         // 无邮箱的命令不出现提示。
-        let plain = render_permission_card("Bash", r#"{"command":"ls -la"}"#, "c", "r");
+        let plain = render_permission_card("Bash", r#"{"command":"ls -la"}"#, "c", "r", None, 300);
         assert!(!plain.contains("邮箱已掩码"), "无掩码不提示: {plain}");
     }
 
@@ -1819,7 +1965,7 @@ mod tests {
             .to_string()
         };
         // >4 选项单选：select_static 表单，不再要求手打 ask:选项。
-        let json = render_question_card(&mk_input(false), "feishu:ou_q", "reqF")
+        let json = render_question_card(&mk_input(false), "feishu:ou_q", "reqF", None, 300)
             .expect("单选多选项应渲染");
         assert!(json.contains("\"tag\":\"form\""), "form 元素: {json}");
         assert!(json.contains("select_static"), "下拉: {json}");
@@ -1840,8 +1986,8 @@ mod tests {
             "全选项: {json}"
         );
         // 多选：checkbox 表单。
-        let multi =
-            render_question_card(&mk_input(true), "feishu:ou_q", "reqM").expect("多选应渲染");
+        let multi = render_question_card(&mk_input(true), "feishu:ou_q", "reqM", None, 300)
+            .expect("多选应渲染");
         assert!(multi.contains("\"tag\":\"checkbox\""), "checkbox: {multi}");
         assert!(!multi.contains("select_static"), "多选不用下拉: {multi}");
         assert!(multi.contains("一次回传全部选择"), "多选提交提示: {multi}");
@@ -1853,7 +1999,7 @@ mod tests {
             }]
         })
         .to_string();
-        let btn = render_question_card(&few, "c", "r").expect("少选项应渲染");
+        let btn = render_question_card(&few, "c", "r", None, 300).expect("少选项应渲染");
         assert!(btn.contains("\"imagent_ask\":\"A\""), "按钮形态保留: {btn}");
         assert!(!btn.contains("\"tag\":\"form\""), "少选项不用表单: {btn}");
         // 多问题标注：只答第一问。
@@ -1864,7 +2010,7 @@ mod tests {
             ]
         })
         .to_string();
-        let mq = render_question_card(&multi_q, "c", "r").expect("应渲染");
+        let mq = render_question_card(&multi_q, "c", "r", None, 300).expect("应渲染");
         assert!(
             mq.contains("将依次询问") && mq.contains("只答第一问"),
             "多问题标注: {mq}"
@@ -1990,7 +2136,8 @@ mod tests {
     /// （形态待真机校准；降级＝markdown+notation）。
     #[test]
     fn note_elements_for_meta_lines() {
-        let json = render_permission_card("Bash", r#"{"command":"ls"}"#, "feishu:ou_t", "r");
+        let json =
+            render_permission_card("Bash", r#"{"command":"ls"}"#, "feishu:ou_t", "r", None, 300);
         assert!(
             json.contains("\"tag\":\"note\"") && json.contains("分钟后自动拒绝"),
             "倒计时 note: {json}"
@@ -2000,6 +2147,7 @@ mod tests {
             r#"{"command":"ls"}"#,
             "feishu:ou_t",
             "r",
+            None,
             "⏳ 等待你审批 · 后面还排着 3 条消息",
         );
         assert!(
@@ -2011,6 +2159,8 @@ mod tests {
             r#"{"command":"git clone git@github.com:org/repo.git"}"#,
             "feishu:ou_t",
             "r",
+            None,
+            300,
         );
         assert!(
             masked.matches("\"tag\":\"note\"").count() >= 2,
@@ -2030,7 +2180,7 @@ mod tests {
             "questions": [{"question": "选？", "options": [{"label":"A"},{"label":"B"}]}]
         })
         .to_string();
-        let q = render_question_card(&input, "feishu:ou_t", "r").unwrap();
+        let q = render_question_card(&input, "feishu:ou_t", "r", None, 300).unwrap();
         assert!(q.contains("\"tag\":\"note\""), "问题卡 note: {q}");
     }
 
@@ -2180,7 +2330,7 @@ mod tests {
         let sup = render_permission_card_superseded("Bash");
         assert!(sup.contains("🔁 已被新询问取代"), "superseded 图标: {sup}");
         assert!(!sup.contains("⏭️"), "不再用跳过图标: {sup}");
-        let perm = render_permission_card("Bash", r#"{"command":"ls"}"#, "c", "r");
+        let perm = render_permission_card("Bash", r#"{"command":"ls"}"#, "c", "r", None, 300);
         assert!(perm.contains("♾️ 本次会话始终允许"), "♾️ 徽章: {perm}");
         assert!(!perm.contains("🔓"), "不再用开锁: {perm}");
     }
@@ -2189,7 +2339,7 @@ mod tests {
     /// ⛔ 拒绝（danger）保留。
     #[test]
     fn primary_buttons_no_green_emoji() {
-        let json = render_permission_card("Bash", r#"{"command":"ls"}"#, "c", "r");
+        let json = render_permission_card("Bash", r#"{"command":"ls"}"#, "c", "r", None, 300);
         assert!(
             json.contains("\"content\":\"允许\"") && !json.contains("✅ 允许"),
             "primary 允许无 ✅: {json}"
