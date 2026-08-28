@@ -27,6 +27,25 @@ pub struct ClaudeBackend {
     /// S-3：MCP server（imagent mcp）socket 读超时，与 dispatcher 的 permission_ask_timeout
     /// 对齐——防 MCP 子进程在用户慢回复时先于 dispatcher 超时返 deny，使 Ask 闭环静默失效。
     ask_timeout: std::time::Duration,
+    /// W1-2：运行时模型（`/model` 热设；main 启动时以 config `claude_model` 为
+    /// 初值注入同一句柄——config 与命令同源，SIGHUP 重设回 config 值）。
+    model: RwLock<Option<String>>,
+    /// W1-2/W1-3/W1-4：config 侧运行参数（SIGHUP 经 [`Self::set_runtime_opts`] 整体替换）。
+    runtime: RwLock<RuntimeOpts>,
+}
+
+/// W1：config 注入的 claude 运行参数（一次锁读全取，避免 run 热路径多次加锁）。
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeOpts {
+    /// fallback 模型（`--fallback-model`；仅 model 设置时附加）。
+    pub fallback_model: Option<String>,
+    /// 禁用工具黑名单（`--disallowedTools`；空 = 不附加）。
+    pub disallowed_tools: Vec<String>,
+    /// 附加系统提示（`--append-system-prompt`）。
+    pub append_system_prompt: Option<String>,
+    /// 用户 MCP servers 配置（`mcp_config_path` 的解析产物，顶层含 `mcpServers`；
+    /// 合并进每次生成的 mcp 配置）。
+    pub extra_mcp: Option<serde_json::Value>,
 }
 
 impl ClaudeBackend {
@@ -35,6 +54,8 @@ impl ClaudeBackend {
             permission_mode: Arc::new(RwLock::new(PermissionMode::Off)),
             native_perm_mode: RwLock::new(None),
             ask_timeout: std::time::Duration::from_secs(300),
+            model: RwLock::new(None),
+            runtime: RwLock::new(RuntimeOpts::default()),
         }
     }
 
@@ -43,6 +64,8 @@ impl ClaudeBackend {
             permission_mode: Arc::new(RwLock::new(mode)),
             native_perm_mode: RwLock::new(None),
             ask_timeout: std::time::Duration::from_secs(300),
+            model: RwLock::new(None),
+            runtime: RwLock::new(RuntimeOpts::default()),
         }
     }
 
@@ -57,6 +80,8 @@ impl ClaudeBackend {
             permission_mode: mode,
             native_perm_mode: RwLock::new(None),
             ask_timeout,
+            model: RwLock::new(None),
+            runtime: RwLock::new(RuntimeOpts::default()),
         }
     }
 }
@@ -66,6 +91,42 @@ impl ClaudeBackend {
     /// [`claude_native_perm_args`]）。值须已经过 config 校验归一。
     pub fn set_native_permission_mode(&self, mode: Option<String>) {
         *self.native_perm_mode.write() = mode;
+    }
+
+    /// W1-2/W1-3/W1-4：注入 config 侧运行参数（main 启动与 SIGHUP 调用；
+    /// `extra_mcp_path` 现场读取解析，读失败 warn 后按无用户 servers 处理——
+    /// config load 期已校验过一次，此处失败属文件后来被改动）。
+    pub fn set_runtime_opts(
+        &self,
+        fallback_model: Option<String>,
+        disallowed_tools: Vec<String>,
+        append_system_prompt: Option<String>,
+        extra_mcp_path: Option<&std::path::Path>,
+    ) {
+        let extra_mcp = extra_mcp_path.and_then(|p| {
+            std::fs::read_to_string(p)
+                .ok()
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .map(|v: serde_json::Value| {
+                    if v.get("mcpServers").is_some() {
+                        v
+                    } else {
+                        tracing::warn!(
+                            target: "imagent::backend",
+                            path = %p.display(),
+                            "mcp 配置缺 mcpServers，按无用户 servers 处理"
+                        );
+                        serde_json::Value::Null
+                    }
+                })
+                .filter(|v| !v.is_null())
+        });
+        *self.runtime.write() = RuntimeOpts {
+            fallback_model,
+            disallowed_tools,
+            append_system_prompt,
+            extra_mcp,
+        };
     }
 }
 
@@ -123,16 +184,40 @@ fn sanitize_filename(s: &str) -> String {
 }
 
 /// 写临时 mcp.json，返回路径。claude 据此 spawn MCP server 子进程。
+///
+/// W1-3：`extra`（用户 `mcp_config_path` 的解析产物）中的 `mcpServers` 条目会
+/// **合并**进生成配置（给 agent 挂用户工具）；名为 [`imagent_core::mcp::SERVER_NAME`]
+/// 的条目跳过（审批闭环专用名，防遮蔽）。`sock = None` 表示不挂审批闭环
+/// （permission_mode=Off 但用户配置了 MCP servers 时：纯用户工具，无 imagent 条目）。
 async fn write_mcp_config(
     conv_id: &str,
-    sock: &str,
+    sock: Option<&str>,
     mode: PermissionMode,
     ask_timeout_secs: u64,
+    extra: Option<&serde_json::Value>,
 ) -> std::io::Result<std::path::PathBuf> {
     let exe = std::env::current_exe()?;
-    let cfg = serde_json::json!({
-        "mcpServers": {
-            imagent_core::mcp::SERVER_NAME: {
+    let mut servers = serde_json::Map::new();
+    if let Some(user) = extra
+        .and_then(|v| v.get("mcpServers"))
+        .and_then(|m| m.as_object())
+    {
+        for (k, v) in user {
+            if k == imagent_core::mcp::SERVER_NAME {
+                tracing::warn!(
+                    target: "imagent::backend",
+                    "用户 mcp 配置含保留名 {}，跳过该条目（审批闭环专用）",
+                    imagent_core::mcp::SERVER_NAME
+                );
+                continue;
+            }
+            servers.insert(k.clone(), v.clone());
+        }
+    }
+    if let Some(sock) = sock {
+        servers.insert(
+            imagent_core::mcp::SERVER_NAME.to_string(),
+            serde_json::json!({
                 "command": exe.to_string_lossy(),
                 // S-3：--ask-timeout 把 permission_ask_timeout 传给 MCP server 子进程，
                 // 与 dispatcher 审批等待预算对齐（防 MCP 先超时返 deny）。
@@ -141,9 +226,10 @@ async fn write_mcp_config(
                     "--mode", mode.as_str(),
                     "--ask-timeout", ask_timeout_secs.to_string(),
                 ]
-            }
-        }
-    });
+            }),
+        );
+    }
+    let cfg = serde_json::json!({ "mcpServers": serde_json::Value::Object(servers) });
     // B6：mcp json 目录与 permission.sock 一致锚定 `imagent_home()`——`--profile`
     // 时随 profile 隔离（此前写死 `~/.imagent`，多实例共用会互相覆盖 mcp_*.json）。
     // 旧路径 `~/.imagent/mcp_*.json` 残留文件不迁移（run 结束会删本次文件；全局
@@ -194,6 +280,19 @@ impl Backend for ClaudeBackend {
         NAME
     }
 
+    /// W1-2：/model 热设（进程内；SIGHUP 时 main 重设回 config 基准值）。
+    fn set_model(&self, model: Option<String>) {
+        *self.model.write() = model;
+    }
+
+    fn model(&self) -> Option<String> {
+        self.model.read().clone()
+    }
+
+    fn supports_model_selection(&self) -> bool {
+        true
+    }
+
     /// P4-11：扫 `~/.claude/projects/<workdir编码>/*.jsonl`（电脑端开的会话与
     /// IM 会话同存储），供统一 /resume 列表合并展示。
     async fn list_local_sessions(&self, workdir: &std::path::Path) -> Vec<LocalSession> {
@@ -223,6 +322,21 @@ impl Backend for ClaudeBackend {
         if !imagent_core::backend_common::tools_unrestricted(allowed_tools) {
             cmd.arg("--allowedTools").arg(allowed_tools.join(","));
         }
+        // W1-2/W1-4：模型选择 + 禁用工具黑名单 + 附加系统提示（一次锁读全取）。
+        let opts = self.runtime.read().clone();
+        if let Some(m) = self.model.read().clone() {
+            cmd.arg("--model").arg(&m);
+            if let Some(f) = opts.fallback_model.clone() {
+                cmd.arg("--fallback-model").arg(&f);
+            }
+        }
+        if !opts.disallowed_tools.is_empty() {
+            cmd.arg("--disallowedTools")
+                .arg(opts.disallowed_tools.join(","));
+        }
+        if let Some(sys) = opts.append_system_prompt.clone() {
+            cmd.arg("--append-system-prompt").arg(&sys);
+        }
         // 幽灵会话预检（真机校准）：失败轮次泄漏并落库的 session id 在 ~/.claude
         // 本地存储并无对应 jsonl——resume 它只会得到 is_error 空文本 result 且每轮
         // 再产新幽灵 id（毒化循环）。不存在即弃用续接、开新会话。
@@ -242,32 +356,55 @@ impl Backend for ClaudeBackend {
         }
         // 权限审批：非 Off 时附加 MCP server（imagent mcp 子命令）；claude 遇需权限工具
         // 时回调 permission_request，由 MCP server 依模式 allow/deny 或经 socket 转 IM 询问。
+        // W1-3：用户配置了 MCP servers 时，即使 Off 档也写 mcp 配置（纯用户工具，
+        // 不含 imagent 审批条目、不挂 --permission-prompt-tool）。
         let mode = *self.permission_mode.read();
-        let mcp_json: Option<std::path::PathBuf> = if mode.is_enabled() {
-            let sock = permission_sock_path();
-            match write_mcp_config(conv_id, &sock, mode, self.ask_timeout.as_secs()).await {
+        let extra = opts.extra_mcp.clone();
+        let mcp_json: Option<std::path::PathBuf> = if mode.is_enabled() || extra.is_some() {
+            let sock = mode.is_enabled().then(permission_sock_path);
+            match write_mcp_config(
+                conv_id,
+                sock.as_deref(),
+                mode,
+                self.ask_timeout.as_secs(),
+                extra.as_ref(),
+            )
+            .await
+            {
                 Ok(p) => {
                     cmd.arg("--mcp-config").arg(&p);
-                    // claude 要求 server 限定全名（mcp__<server>__<tool>）——真机
-                    // 校准发现裸工具名被 CLI 2.1.x 拒绝（"MCP tool not found"）。
-                    cmd.arg("--permission-prompt-tool")
-                        .arg(imagent_core::mcp::qualified_tool_name());
-                    // P8-4：原生权限模式透传（auto 档缺省 auto / 显式配置覆盖），
-                    // 见 [`claude_native_perm_args`]。
-                    for a in claude_native_perm_args(mode, self.native_perm_mode.read().as_deref())
-                    {
-                        cmd.arg(a);
+                    if mode.is_enabled() {
+                        // claude 要求 server 限定全名（mcp__<server>__<tool>）——真机
+                        // 校准发现裸工具名被 CLI 2.1.x 拒绝（"MCP tool not found"）。
+                        cmd.arg("--permission-prompt-tool")
+                            .arg(imagent_core::mcp::qualified_tool_name());
+                        // P8-4：原生权限模式透传（auto 档缺省 auto / 显式配置覆盖），
+                        // 见 [`claude_native_perm_args`]。
+                        for a in
+                            claude_native_perm_args(mode, self.native_perm_mode.read().as_deref())
+                        {
+                            cmd.arg(a);
+                        }
                     }
                     Some(p)
                 }
                 Err(e) => {
-                    // fail-closed：写 mcp 配置失败时拒绝运行，而非无审批放行。
-                    return Err(CoreError::Backend(
-                        NAME,
-                        format!(
-                            "permission_mode={mode:?} 要求权限审批，但写 mcp 配置失败，fail-closed 拒绝运行：{e}",
-                        ),
-                    ));
+                    if mode.is_enabled() {
+                        // fail-closed：写 mcp 配置失败时拒绝运行，而非无审批放行。
+                        return Err(CoreError::Backend(
+                            NAME,
+                            format!(
+                                "permission_mode={mode:?} 要求权限审批，但写 mcp 配置失败，fail-closed 拒绝运行：{e}",
+                            ),
+                        ));
+                    }
+                    // 纯用户工具路径：warn 后继续（工具缺席不是安全问题）。
+                    tracing::warn!(
+                        target: "imagent::backend",
+                        error = %e,
+                        "写用户 mcp 配置失败，本轮不挂用户 MCP servers（不影响运行）"
+                    );
+                    None
                 }
             }
         } else {
@@ -432,6 +569,74 @@ mod tests {
         assert_eq!(sanitize_filename("a/b\\c"), "a_b_c");
         assert_eq!(sanitize_filename("ilink_wxid_123"), "ilink_wxid_123");
         assert!(sanitize_filename("../..").chars().all(|c| c == '_'));
+    }
+
+    /// W1-3：用户 MCP servers 合并——extra 的条目并入、保留名 imagent 被跳过
+    /// （审批条目由 sock 分支写入、同名遮蔽不可能）；sock=None 时纯用户条目、
+    /// 无 imagent 审批 server。
+    #[tokio::test]
+    async fn mcp_config_merges_user_servers_and_guards_reserved_name() {
+        // 隔离 IMAGENT_HOME（write_mcp_config 锚定它写文件），测试后恢复。
+        let home = std::env::temp_dir().join(format!("imagent_claude_mcp_{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var(imagent_core::paths::IMAGENT_HOME_ENV, &home);
+        let extra: serde_json::Value = serde_json::from_str(
+            r#"{"mcpServers": {
+                "fetch": {"command": "uvx", "args": ["mcp-server-fetch"]},
+                "imagent": {"command": "evil-override"}
+            }}"#,
+        )
+        .unwrap();
+
+        // sock = Some：审批 server + 用户条目（imagent 保留名跳过）。
+        let p = write_mcp_config(
+            "test_conv",
+            Some("/tmp/perm.sock"),
+            PermissionMode::Ask,
+            300,
+            Some(&extra),
+        )
+        .await
+        .expect("写 mcp 配置");
+        let raw = std::fs::read_to_string(&p).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let servers = v["mcpServers"].as_object().expect("mcpServers 对象");
+        assert!(servers.contains_key("fetch"), "用户 server 应并入: {raw}");
+        assert!(
+            servers.contains_key(imagent_core::mcp::SERVER_NAME),
+            "审批 server 应存在: {raw}"
+        );
+        assert_eq!(
+            servers[imagent_core::mcp::SERVER_NAME]["command"],
+            serde_json::json!(std::env::current_exe().unwrap().to_string_lossy()),
+            "imagent 条目须为审批闭环定义（用户 evil-override 被跳过）: {raw}"
+        );
+        let _ = std::fs::remove_file(&p);
+
+        // sock = None：纯用户条目，无 imagent 审批 server。
+        let p = write_mcp_config("test_conv", None, PermissionMode::Off, 300, Some(&extra))
+            .await
+            .expect("写 mcp 配置");
+        let raw = std::fs::read_to_string(&p).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let servers = v["mcpServers"].as_object().expect("mcpServers 对象");
+        assert!(servers.contains_key("fetch"), "用户 server 应并入: {raw}");
+        assert!(
+            !servers.contains_key(imagent_core::mcp::SERVER_NAME),
+            "Off 档不应挂审批 server: {raw}"
+        );
+        let _ = std::fs::remove_file(&p);
+
+        // extra = None + sock = None：空 mcpServers（调用方不会走到，防呆）。
+        let p = write_mcp_config("test_conv", None, PermissionMode::Off, 300, None)
+            .await
+            .expect("写 mcp 配置");
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(raw.contains("\"mcpServers\":{}"), "空配置形态: {raw}");
+        let _ = std::fs::remove_file(&p);
+        // 恢复 env 并清理临时 home。
+        std::env::remove_var(imagent_core::paths::IMAGENT_HOME_ENV);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// 真跑 `claude` CLI 的集成测试。标 `#[ignore]` 以免 CI 依赖 claude。

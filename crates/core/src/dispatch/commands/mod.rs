@@ -16,10 +16,17 @@ pub(super) const COMMAND_GROUPS: &[(&str, &[&str])] = &[
         &["/new", "/switch", "/sessions", "/resume", "/compact"],
     ),
     ("📁 目录与文件", &["/cd", "/ws", "/img", "/file"]),
-    ("🛡️ 权限与运行", &["/perm", "/stop", "/timeout"]),
+    ("🛡️ 权限与运行", &["/perm", "/stop", "/timeout", "/model"]),
     (
         "🧪 状态与诊断",
-        &["/status", "/stats", "/doctor", "/reconnect", "/config"],
+        &[
+            "/status",
+            "/stats",
+            "/doctor",
+            "/reconnect",
+            "/config",
+            "/audit",
+        ],
     ),
     (
         "👥 白名单与管理",
@@ -271,7 +278,11 @@ impl Dispatcher {
                         return;
                     }
                     "/stop" => {
-                        self.cmd_stop(&conv, &hint).await;
+                        self.cmd_stop(&conv, &hint, &parts).await;
+                        return;
+                    }
+                    "/model" => {
+                        self.cmd_model(&conv, &sender.0, &hint, &parts).await;
                         return;
                     }
                     "/help" => {
