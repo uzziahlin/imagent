@@ -24,6 +24,7 @@ impl Dispatcher {
     async fn run_round_inner(&self, msg: InboundMessage) -> Option<u64> {
         let conv = msg.conv_id.clone();
         let hint = msg.reply_hint.clone();
+        let sender_id = msg.sender.0.clone();
         let base_prompt = msg.text.clone().unwrap_or_default();
         // Wave B-9：断档续接判定（base_prompt 被 move 进 prompt 载体前先算好）：
         // 无可续接会话且 prompt 命中续接词表（继续/接着/然后…，≤4 字）时，
@@ -129,6 +130,35 @@ impl Dispatcher {
             )
             .await;
             return None;
+        }
+        // W4-1：per-sender 成本上限（滚动 24h 窗口；None = 不限）。超限直接回执
+        // 不启动 agent——多用户群部署的运营护栏（上限内的轮次正常执行）。
+        if let Some(limit) = self.sender_cost_limit {
+            let since = now_secs() - 86_400;
+            let spent = self
+                .store
+                .sender_cost_since(&sender_id, since)
+                .await
+                .unwrap_or(0.0);
+            if spent >= limit {
+                warn!(
+                    target: "imagent::core",
+                    conv_id = %conv.0,
+                    sender = %sender_id,
+                    spent,
+                    limit,
+                    "sender 成本上限命中，拒绝本轮"
+                );
+                self.reply(
+                    &conv,
+                    &format!(
+                        "💰 你近 24 小时的用量已达上限（${spent:.2} / 上限 ${limit:.2}），本轮未执行。\n窗口按时间滚动恢复，或请联系管理员调整 sender_daily_cost_limit_usd。"
+                    ),
+                    &hint,
+                )
+                .await;
+                return None;
+            }
         }
         let tools = self.allowed_tools.read().clone();
         let prompt_owned = prompt.clone();
@@ -405,7 +435,7 @@ impl Dispatcher {
                 // 但无最终文本被 backend 判 Err）会话本身是好的，落库后下条消息
                 // 续接而非静默开新会话。
                 // 失败/中断路径也记 usage 事件（无 RunOutcome，tokens 记 0）。
-                self.record_run_usage(&conv, None).await;
+                self.record_run_usage(&conv, None, &sender_id).await;
                 self.persist_learned_session(&conv, existing_sid.as_deref(), &learned_sid)
                     .await;
                 // D1：失败返回路径清理本 conv 的权限 pending（fail-closed deny +
@@ -466,7 +496,7 @@ impl Dispatcher {
                 // 语义一致：中断留在原会话，显式 /new 才重开）。会话进度保留后，
                 // 下条消息续接本轮已进行到的部分。
                 // 失败/中断路径也记 usage 事件（无 RunOutcome，tokens 记 0）。
-                self.record_run_usage(&conv, None).await;
+                self.record_run_usage(&conv, None, &sender_id).await;
                 self.persist_learned_session(&conv, existing_sid.as_deref(), &learned_sid)
                     .await;
                 // D1：中断返回路径同样清理 pending（空闲超时 abort 不经 /stop 的
@@ -496,7 +526,7 @@ impl Dispatcher {
                     self.reply(&conv, &m, &hint).await;
                 }
                 // 失败/中断路径也记 usage 事件（无 RunOutcome，tokens 记 0）。
-                self.record_run_usage(&conv, None).await;
+                self.record_run_usage(&conv, None, &sender_id).await;
                 self.persist_learned_session(&conv, existing_sid.as_deref(), &learned_sid)
                     .await;
                 self.cancel_pending_on_exit(&conv).await;
@@ -506,7 +536,8 @@ impl Dispatcher {
         };
 
         // 成功路径：usage 落库 + 指标（backend 未产出 usage 时记零用量事件行）。
-        self.record_run_usage(&conv, outcome.usage.as_ref()).await;
+        self.record_run_usage(&conv, outcome.usage.as_ref(), &sender_id)
+            .await;
 
         // 回传文本优先级：收到过的 Final > outcome.final_text > session_id 提示。
         if let Some(et) = &error_text {
@@ -777,7 +808,12 @@ impl Dispatcher {
 
     /// 每轮 usage 落库 + 指标：成功路径传 RunOutcome.usage；失败/中断路径拿不到
     /// RunOutcome，传 None（仍记一行零用量事件，保证 /stats 轮次数完整）。
-    async fn record_run_usage(&self, conv: &ConvId, usage: Option<&crate::types::UsageStats>) {
+    async fn record_run_usage(
+        &self,
+        conv: &ConvId,
+        usage: Option<&crate::types::UsageStats>,
+        sender: &str,
+    ) {
         let backend = self.backend.name();
         if let Some(u) = usage {
             METRICS
@@ -807,6 +843,7 @@ impl Dispatcher {
                 usage.map(|u| u.output_tokens as i64).unwrap_or(0),
                 usage.and_then(|u| u.cached_tokens).map(|c| c as i64),
                 usage.and_then(|u| u.total_cost_usd),
+                Some(sender),
             )
             .await
         {

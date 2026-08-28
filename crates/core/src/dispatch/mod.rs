@@ -76,6 +76,8 @@ pub struct TaskBudgets {
     /// W2-5：自动 compact 阈值（`auto_compact_threshold_tokens`；0 = 关闭）——
     /// 成功轮次的上下文水位（usage.input_tokens）达到阈值即自动走 /compact 管道。
     pub auto_compact_threshold_tokens: u64,
+    /// W4-1：per-sender 成本上限（美元，滚动 24h；None = 不限）。
+    pub sender_daily_cost_limit_usd: Option<f64>,
 }
 
 impl TaskBudgets {
@@ -89,6 +91,7 @@ impl TaskBudgets {
             agent_idle_timeout: Duration::from_secs(c.agent_idle_timeout_secs),
             batch_window: Duration::from_millis(c.batch_window_ms),
             auto_compact_threshold_tokens: c.auto_compact_threshold_tokens,
+            sender_daily_cost_limit_usd: c.sender_daily_cost_limit_usd,
         }
     }
 }
@@ -431,6 +434,8 @@ pub struct Dispatcher {
     batch_window: Arc<RwLock<Duration>>,
     /// W2-5：自动 compact 阈值（tokens；0 = 关闭）。config 注入。
     auto_compact_threshold: u64,
+    /// W4-1：per-sender 成本上限（美元，滚动 24h；None = 不限）。config 注入。
+    sender_cost_limit: Option<f64>,
     /// 工具过程（COT）展示档位（P4-6）：`/config cot_detail` 可热改。
     cot_detail: Arc<RwLock<CotDetail>>,
     /// 进程启动时刻（`/status` uptime 用）。
@@ -553,6 +558,7 @@ impl Dispatcher {
             agent_idle_timeout: Arc::new(RwLock::new(budgets.agent_idle_timeout)),
             batch_window: Arc::new(RwLock::new(budgets.batch_window)),
             auto_compact_threshold: budgets.auto_compact_threshold_tokens,
+            sender_cost_limit: budgets.sender_daily_cost_limit_usd,
             cot_detail: Arc::new(RwLock::new(cot_detail)),
             started_at: Instant::now(),
             running: Mutex::new(HashMap::new()),

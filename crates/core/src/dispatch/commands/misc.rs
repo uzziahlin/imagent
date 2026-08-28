@@ -698,6 +698,79 @@ impl Dispatcher {
         self.dispatch_agent_message(msg).await;
     }
 
+    /// /export —— 当前会话导出为 Markdown 文件回传（W4-2）。走 backend 的本机
+    /// 会话存储转录（claude 系支持；codex/gemini 回不支持提示）。导出文件经
+    /// send_media 发送后即删（media 目录，0600）。
+    pub(super) async fn cmd_export(&self, conv: &ConvId, hint: &ReplyHint) {
+        let Some(row) = self.store.get_session(&conv.0).await.ok().flatten() else {
+            self.reply(
+                conv,
+                "当前无活动会话可导出（先发一条消息开启会话；/resume 可恢复历史）。",
+                hint,
+            )
+            .await;
+            return;
+        };
+        let wd = self.resolve_workdir(&conv.0).await;
+        let Some(md) = self
+            .backend
+            .export_session_markdown(&wd, &row.session_id)
+            .await
+        else {
+            self.reply(
+                conv,
+                &format!(
+                    "当前后端 {} 暂不支持会话导出（仅 claude 系后端有本机会话转录）。",
+                    self.backend.name()
+                ),
+                hint,
+            )
+            .await;
+            return;
+        };
+        // 写临时导出文件（media 目录 0700 / 文件 0600，与入站媒体同纪律）→
+        // send_media 回传 → 删除。
+        let dir = crate::paths::imagent_home().join("media");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.reply(conv, &format!("导出目录创建失败：{e}"), hint)
+                .await;
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+        let sid8: String = row.session_id.chars().take(8).collect();
+        let fname = format!("session-{sid8}-{}.md", now_secs());
+        let path = dir.join(&fname);
+        if let Err(e) = std::fs::write(&path, md) {
+            self.reply(conv, &format!("导出文件写入失败：{e}"), hint)
+                .await;
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        let media = MediaRef {
+            kind: "file".to_string(),
+            url: path.to_string_lossy().into_owned(),
+        };
+        match self.platform.send_media(conv, &media, hint).await {
+            Ok(()) => {
+                self.reply(conv, &format!("✅ 已导出会话 {sid8}…（{fname}）"), hint)
+                    .await
+            }
+            Err(e) => {
+                self.reply(conv, &format!("导出文件发送失败：{e}"), hint)
+                    .await;
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// /stats [today|7d|all] —— token 用量/成本统计（默认 7d）。全局 + 本会话
     /// 两组维度；无成本数据的 backend（codex/gemini）按 tokens 汇总展示。
     pub(super) async fn cmd_stats(&self, conv: &ConvId, hint: &ReplyHint, parts: &[&str]) {
@@ -892,7 +965,7 @@ impl Dispatcher {
 
     /// /help —— 命令总表（P6-3：飞书等卡片平台带常用命令按钮）。
     pub(super) async fn cmd_help(&self, conv: &ConvId, hint: &ReplyHint) {
-        let body = "🗂 会话\n- /new 重置会话\n- /switch <name> 切换/新建命名会话\n- /sessions 列出命名会话\n- /resume [n] 恢复历史/本机会话\n- /compact 压缩上下文\n- /retry 重试最近一轮（失败后一键续接）\n\n📁 目录与文件\n- /cd <path> 切工作目录\n- /ws save|use|remove <name> 命名工作空间\n- /img <path> 发图片 · /file <path> 发文件\n\n🛡️ 权限与运行\n- /perm <off|allow|deny|ask> 权限模式\n- /stop 中断任务（排队消息保留并自动续跑；/stop all 全部丢弃）\n- /timeout <分钟|off|default> 会话级空闲看门狗\n- /model [名称|default] 查看/切换模型（切换需管理员）\n\n🧪 状态与诊断\n- /status 状态 · /doctor 自检 · /reconnect 重连\n- /config [k v] 查看/热改配置 · /audit [n] 审计日志\n\n👥 白名单与管理（管理员）\n- /allow、/disallow 授权/撤权（飞书群内可 @ 对方）\n- /chat allow|deny|allow-all|list 会话白名单\n- /admin list|add|remove 管理员\n- /list 白名单 · /whoami 我的 id\n\n其他内容直接发给 agent 即可（任务运行中发送的消息会排队合并进下一轮）。";
+        let body = "🗂 会话\n- /new 重置会话\n- /switch <name> 切换/新建命名会话\n- /sessions 列出命名会话\n- /resume [n] 恢复历史/本机会话\n- /compact 压缩上下文\n- /retry 重试最近一轮（失败后一键续接）\n- /export 导出当前会话为 Markdown\n\n📁 目录与文件\n- /cd <path> 切工作目录\n- /ws save|use|remove <name> 命名工作空间\n- /img <path> 发图片 · /file <path> 发文件\n\n🛡️ 权限与运行\n- /perm <off|allow|deny|ask> 权限模式\n- /stop 中断任务（排队消息保留并自动续跑；/stop all 全部丢弃）\n- /timeout <分钟|off|default> 会话级空闲看门狗\n- /model [名称|default] 查看/切换模型（切换需管理员）\n\n🧪 状态与诊断\n- /status 状态 · /doctor 自检 · /reconnect 重连\n- /config [k v] 查看/热改配置 · /audit [n] 审计日志\n\n👥 白名单与管理（管理员）\n- /allow、/disallow 授权/撤权（飞书群内可 @ 对方）\n- /chat allow|deny|allow-all|list 会话白名单\n- /admin list|add|remove 管理员\n- /list 白名单 · /whoami 我的 id\n\n其他内容直接发给 agent 即可（任务运行中发送的消息会排队合并进下一轮）。";
         let buttons = vec![
             CardButton {
                 label: "📊 状态".into(),

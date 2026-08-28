@@ -126,7 +126,56 @@ pub(crate) fn session_exists(workdir: &Path, session_id: &str) -> bool {
         .is_some_and(|base| session_exists_in(&base.join("projects"), workdir, session_id))
 }
 
-/// [`session_exists`] 的可注入版本（测试用自定义根目录）。
+/// W4-2：会话 jsonl → Markdown 转录（/export 数据源）。逐行解析 user/assistant
+/// 消息的 text 块（tool_use/tool_result/meta 行跳过——转录面向人读对话，非完整
+/// 调试转储）；行级解析失败跳过不中断。找不到文件或无对话内容返回 None。
+pub fn export_session_md(workdir: &Path, session_id: &str) -> Option<String> {
+    export_session_md_at(&default_claude_dir()?.join("projects"), workdir, session_id)
+}
+
+/// [`export_session_md`] 的可注入版本（测试用自定义根目录）。
+pub fn export_session_md_at(base: &Path, workdir: &Path, session_id: &str) -> Option<String> {
+    use std::io::BufRead;
+    for enc in encode_candidates(workdir) {
+        let path = base.join(enc).join(format!("{session_id}.jsonl"));
+        let Ok(f) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let mut out = format!("# imagent 会话导出（{session_id}）\n\n");
+        for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let role = match v.get("type").and_then(|t| t.as_str()) {
+                Some("user") => "🧑 用户",
+                Some("assistant") => "🤖 Claude",
+                _ => continue,
+            };
+            let Some(blocks) = v
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array())
+            else {
+                continue;
+            };
+            let texts: Vec<&str> = blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .filter(|t| !t.trim().is_empty())
+                .collect();
+            if texts.is_empty() {
+                continue;
+            }
+            out.push_str(&format!("## {role}\n\n{}\n\n", texts.join("\n\n")));
+        }
+        if out.lines().count() > 2 {
+            return Some(out);
+        }
+    }
+    None
+}
+
 fn session_exists_in(base: &Path, workdir: &Path, session_id: &str) -> bool {
     encode_candidates(workdir)
         .iter()
@@ -216,6 +265,37 @@ fn sanitize_summary(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// W4-2：jsonl → Markdown 转录——user/assistant 文本块成段、tool/meta 行
+    /// 跳过；找不到文件 None。
+    #[test]
+    fn export_session_md_transcripts_dialog() {
+        let dir = std::env::temp_dir().join(format!("imagent_export_{}", std::process::id()));
+        let proj = dir.join("-tmp-ws");
+        std::fs::create_dir_all(&proj).unwrap();
+        let sid = "sess-exp1";
+        let jsonl = proj.join(format!("{sid}.jsonl"));
+        let lines = [
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"帮我看看"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"内部推理"},{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"结论 A"},{"type":"text","text":"补充 B"}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+            r#"{"type":"summary","summary":"meta 行"}"#,
+        ]
+        .join("\n");
+        std::fs::write(&jsonl, lines).unwrap();
+        let md = export_session_md_at(&dir, std::path::Path::new("/tmp/ws"), sid).expect("应导出");
+        assert!(md.contains("## 🧑 用户"), "{md}");
+        assert!(md.contains("帮我看看"), "{md}");
+        assert!(md.contains("## 🤖 Claude"), "{md}");
+        assert!(md.contains("结论 A") && md.contains("补充 B"), "{md}");
+        assert!(!md.contains("内部推理"), "thinking 不进转录: {md}");
+        assert!(!md.contains("tool_result"), "工具行不进转录: {md}");
+        assert!(!md.contains("meta 行"), "非对话行跳过: {md}");
+        // 不存在的会话 → None。
+        assert!(export_session_md_at(&dir, std::path::Path::new("/tmp/ws"), "nope").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     fn tmp_root(tag: &str) -> PathBuf {

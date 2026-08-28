@@ -90,6 +90,8 @@ pub struct RunStatRow {
     pub cached_tokens: Option<i64>,
     pub cost_usd: Option<f64>,
     pub ts: i64,
+    /// W4-1：触发本轮的发送者（v9 起；存量行为 NULL）。
+    pub sender: Option<String>,
 }
 
 /// 在飞流式卡片登记行（schema v6）。
@@ -1076,6 +1078,7 @@ impl Store {
     /// 追加一条 per-run 用量记录（append-only；轮转保留最近 10000 条，参照
     /// audit_log 的 max(id) 范围删除）。`usage` 各字段由调用方从 RunOutcome 展平；
     /// 失败轮次（无 usage）也记一行（tokens 为 0），保证轮次数统计完整。
+    #[allow(clippy::too_many_arguments)]
     pub async fn append_run_stat(
         &self,
         conv_id: &str,
@@ -1084,12 +1087,17 @@ impl Store {
         output_tokens: i64,
         cached_tokens: Option<i64>,
         cost_usd: Option<f64>,
+        sender: Option<&str>,
     ) -> Result<()> {
-        let (conv_id, agent_kind) = (conv_id.to_string(), agent_kind.map(|s| s.to_string()));
+        let (conv_id, agent_kind, sender) = (
+            conv_id.to_string(),
+            agent_kind.map(|s| s.to_string()),
+            sender.map(|s| s.to_string()),
+        );
         let inner = self.inner.clone();
         blocking_with_retry(inner, move |conn| {
             conn.execute(
-                "INSERT INTO run_stats                    (conv_id, agent_kind, input_tokens, output_tokens, cached_tokens, cost_usd, ts)                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO run_stats                    (conv_id, agent_kind, input_tokens, output_tokens, cached_tokens, cost_usd, ts, sender)                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 rusqlite::params![
                     conv_id,
                     agent_kind,
@@ -1098,6 +1106,7 @@ impl Store {
                     cached_tokens,
                     cost_usd,
                     now_secs(),
+                    sender,
                 ],
             )?;
             // 轮转：保留最近 10000 条（同 audit_log 的 P2-R 手法）。
@@ -1110,12 +1119,28 @@ impl Store {
         .await
     }
 
+    /// W4-1：某 sender 自 `since`（epoch 秒）以来的累计成本（美元；无成本行
+    /// 记 0）。per-sender 成本上限的判定数据源（滚动 24h 窗口由调用方计算）。
+    pub async fn sender_cost_since(&self, sender: &str, since: i64) -> Result<f64> {
+        let sender = sender.to_string();
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let spent: f64 = conn.query_row(
+                "SELECT COALESCE(SUM(cost_usd), 0) FROM run_stats WHERE sender = ?1 AND ts >= ?2",
+                rusqlite::params![sender, since],
+                |r| r.get(0),
+            )?;
+            Ok(spent)
+        })
+        .await
+    }
+
     /// 列出 `since`（epoch 秒）之后的全部用量记录（按 id 升序）。/stats 聚合用。
     pub async fn list_run_stats_since(&self, since: i64) -> Result<Vec<RunStatRow>> {
         let inner = self.inner.clone();
         blocking_with(inner, move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, conv_id, agent_kind, input_tokens, output_tokens, cached_tokens, cost_usd, ts                  FROM run_stats WHERE ts >= ?1 ORDER BY id",
+                "SELECT id, conv_id, agent_kind, input_tokens, output_tokens, cached_tokens, cost_usd, ts, sender                  FROM run_stats WHERE ts >= ?1 ORDER BY id",
             )?;
             let rows = stmt.query_map(rusqlite::params![since], |r| {
                 Ok(RunStatRow {
@@ -1127,6 +1152,7 @@ impl Store {
                     cached_tokens: r.get::<_, Option<i64>>(5)?,
                     cost_usd: r.get::<_, Option<f64>>(6)?,
                     ts: r.get(7)?,
+                    sender: r.get::<_, Option<String>>(8)?,
                 })
             })?;
             let mut v = Vec::new();
@@ -1672,17 +1698,23 @@ mod tests {
                 50,
                 Some(30),
                 Some(0.012),
+                Some("ou_alice"),
             )
             .await
             .unwrap();
         // 失败轮次：无 usage 也记一行（tokens 0）。
         store
-            .append_run_stat("feishu:u1", Some("codex"), 0, 0, None, None)
+            .append_run_stat("feishu:u1", Some("codex"), 0, 0, None, None, None)
             .await
             .unwrap();
+        // W4-1：per-sender 成本聚合（sender=NULL 的行不计入任何 sender）。
+        let spent = store.sender_cost_since("ou_alice", 0).await.unwrap();
+        assert!((spent - 0.012).abs() < 1e-9, "ou_alice 应聚合计入: {spent}");
+        assert_eq!(store.sender_cost_since("unknown", 0).await.unwrap(), 0.0);
         let rows = store.list_run_stats_since(0).await.unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].conv_id, "feishu:u1");
+        assert_eq!(rows[0].sender.as_deref(), Some("ou_alice"), "sender 落列");
         assert_eq!(rows[0].input_tokens, 100);
         assert_eq!(rows[0].output_tokens, 50);
         assert_eq!(rows[0].cached_tokens, Some(30));
@@ -1702,7 +1734,7 @@ mod tests {
         let store = Store::open(&db.path).await.unwrap();
         for _ in 0..10_010 {
             store
-                .append_run_stat("c", None, 1, 1, None, None)
+                .append_run_stat("c", None, 1, 1, None, None, None)
                 .await
                 .unwrap();
         }

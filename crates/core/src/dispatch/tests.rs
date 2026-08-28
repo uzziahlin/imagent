@@ -608,8 +608,9 @@ fn test_budgets() -> TaskBudgets {
         shutdown_grace: Duration::from_secs(60),
         agent_idle_timeout: Duration::from_secs(300),
         batch_window: Duration::from_millis(1),
-        // W2-5：测试默认关闭自动 compact（个别用例显式开启）。
+        // W2-5：测试默认关闭自动 compact（个别用例显式开启）；W4-1 成本上限默认不限。
         auto_compact_threshold_tokens: 0,
+        sender_daily_cost_limit_usd: None,
     }
 }
 
@@ -3247,6 +3248,7 @@ async fn stop_on_text_platform_marks_interrupted() {
         30_000,
         TaskBudgets {
             auto_compact_threshold_tokens: 0,
+            sender_daily_cost_limit_usd: None,
             agent_timeout: Duration::ZERO,
             permission_ask_timeout: Duration::from_secs(5),
             ask_via_im_timeout: Duration::from_secs(5),
@@ -3641,6 +3643,62 @@ async fn build_with_usage(auth: Auth, usage: crate::types::UsageStats) -> Ctx {
     ctx.prompts = prompts;
     ctx.order = order;
     ctx
+}
+
+/// W4-1：per-sender 成本上限——近 24h 累计达上限的新轮次直接拒绝（不启动
+/// agent），回执说明；未达上限正常执行。
+#[tokio::test]
+async fn sender_cost_limit_rejects_when_exceeded() {
+    let _serial = SERIAL.lock().await;
+    let (plat, inbox, send_count) = MockPlatform::new();
+    let (back, calls, prompts, order) = MockBackend::new();
+    let _ = std::fs::create_dir_all("/tmp/imagent-test-ws");
+    let (store, db) = tmp_store().await;
+    // 预置 alice 近 24h 已花 $2（上限 $1）。
+    store
+        .append_run_stat(
+            "feishu:ou_other",
+            Some("claude-cli"),
+            0,
+            0,
+            None,
+            Some(2.0),
+            Some("alice"),
+        )
+        .await
+        .unwrap();
+    let disp = Arc::new(Dispatcher::new(
+        Arc::new(plat),
+        Arc::new(back),
+        store,
+        Auth::new(vec!["alice".into()]),
+        std::path::PathBuf::from("/tmp/imagent-test-ws"),
+        vec!["Read".into()],
+        PermissionMode::Off,
+        TaskBudgets {
+            sender_daily_cost_limit_usd: Some(1.0),
+            ..test_budgets()
+        },
+        CotDetail::Brief,
+        vec![],
+    ));
+    let ctx = Ctx {
+        disp: disp.clone(),
+        inbox,
+        send_count,
+        calls,
+        prompts,
+        order,
+        db: db.clone(),
+    };
+    ctx.disp.handle(msg("c1", "alice", "新任务")).await;
+    assert!(ctx.prompts.lock().await.is_empty(), "超限不应启动 agent");
+    let inbox_seen = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox_seen.iter().any(|t| t.contains("用量已达上限")),
+        "应回上限说明: {inbox_seen:?}"
+    );
+    drop_db(ctx.db).await;
 }
 
 /// W3-3：/retry 重发本会话最近一轮的用户 prompt（走完整 runner 路径）；

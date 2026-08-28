@@ -1496,7 +1496,33 @@ fn persist_media(kind: &str, key: &str, file_name: Option<&str>, bytes: &[u8]) -
             format!("{key}.{ext}")
         }
     };
-    let path = dir.join(name);
+    // W4-3：同名媒体不覆盖——后到的文件加序号后缀（此前后到覆盖先到，用户
+    // 连发同名文件时前一份丢失、agent 读到错文件）。
+    let path = {
+        let p = dir.join(&name);
+        if !p.exists() {
+            p
+        } else {
+            let stem = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("media")
+                .to_string();
+            let ext = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| format!(".{e}"))
+                .unwrap_or_default();
+            let mut i = 1u32;
+            loop {
+                let cand = dir.join(format!("{stem}-{i}{ext}"));
+                if !cand.exists() {
+                    break cand;
+                }
+                i += 1;
+            }
+        }
+    };
     std::fs::write(&path, bytes)
         .map_err(|e| CoreError::Platform(PLATFORM, format!("write media {path:?}: {e}")))?;
     #[cfg(unix)]
@@ -2633,6 +2659,25 @@ mod tests {
 
     /// 原名透传落盘：file 用原始文件名（含扩展名）；图片无原名默认 png；带名图片
     /// 用其扩展名；路径穿越（../、分隔符）被净化；无名 file 回退 key.bin。
+    /// W4-3：同名媒体不覆盖——第二次落盘加序号后缀。名字带进程 id + 纳秒防
+    /// 历史残留（media 目录是真实 ~/.imagent/media，同机器多次跑测试会累积）。
+    #[test]
+    fn persist_media_same_name_gets_suffix() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let name = format!("同名{}-{nanos}.txt", std::process::id());
+        let p1 = persist_media("file", "k9", Some(&name), b"first").unwrap();
+        let p2 = persist_media("file", "k10", Some(&name), b"second").unwrap();
+        assert_ne!(p1, p2, "同名不应覆盖: {p1} vs {p2}");
+        let stem = name.strip_suffix(".txt").unwrap_or(&name);
+        assert!(p2.ends_with(&format!("{stem}-1.txt")), "后缀序号: {p2}");
+        assert_eq!(std::fs::read(&p1).unwrap(), b"first", "先到的文件内容保留");
+        let _ = std::fs::remove_file(&p1);
+        let _ = std::fs::remove_file(&p2);
+    }
+
     #[test]
     fn persist_media_original_name() {
         let dir = std::env::temp_dir().join(format!("imagent_persist_test_{}", std::process::id()));
