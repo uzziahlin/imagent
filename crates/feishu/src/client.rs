@@ -26,7 +26,7 @@ use open_lark::communication::im::v1::message::patch::PatchMessageCardRequest;
 use open_lark::ws_client::{EventDispatcherHandler, LarkWsClient, WsClientError};
 use open_lark::{CoreConfig, RequestOption};
 
-use crate::proto::ReceiveIdKind;
+use crate::proto::{MergedForwardItem, ReceiveIdKind};
 
 /// 平台名常量（错误构造用）。
 const PLATFORM: &str = "feishu";
@@ -763,6 +763,165 @@ pub async fn list_joined_chats(
     Ok(out)
 }
 
+/// 「查询合并转发消息列表」一页响应的解析产物（纯函数，mock JSON 可测）。
+#[derive(Debug)]
+struct MergeForwardPage {
+    items: Vec<MergedForwardItem>,
+    has_more: bool,
+    page_token: Option<String>,
+}
+
+/// 解析一页「查询合并转发消息列表」响应（信封 code != 0 报错）。
+///
+/// 响应字段形态**待真机校准**——离线按飞书文档公开形态建模（`data.items[]` 带
+/// message_id / message_type / content / sender{id,id_type,name} / create_time，
+/// 分页 has_more + page_token），提取取**宽容姿态**（真机字段名有出入时尽量不炸）：
+/// - 类型名兼容 `message_type` / `msg_type`；
+/// - 时间戳兼容字符串 / 数字，秒级值（量级 < 1e11）自动 ×1000 归一毫秒；
+/// - sender.id 兼容 `id` / `open_id`；字段缺失给默认值不丢整条（转录对残缺
+///   条目有占位语义，见 proto::merge_forward_body）。
+fn parse_merge_forward_page(v: &serde_json::Value) -> imagent_core::Result<MergeForwardPage> {
+    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
+        return Err(imagent_core::CoreError::Platform(
+            PLATFORM,
+            format!("list_merge_forward: code={code} msg={msg}"),
+        ));
+    }
+    let data = v.get("data").cloned().unwrap_or(serde_json::Value::Null);
+    let items = data
+        .get("items")
+        .and_then(|i| i.as_array())
+        .map(|arr| arr.iter().filter_map(merge_forward_item_of).collect())
+        .unwrap_or_default();
+    let has_more = data
+        .get("has_more")
+        .and_then(|h| h.as_bool())
+        .unwrap_or(false);
+    let page_token = data
+        .get("page_token")
+        .and_then(|t| t.as_str())
+        .filter(|t| !t.is_empty())
+        .map(String::from);
+    Ok(MergeForwardPage {
+        items,
+        has_more,
+        page_token,
+    })
+}
+
+/// 单个 item 的宽容提取（非对象跳过；字段缺失给默认值，见
+/// [`parse_merge_forward_page`] 的形态说明）。
+fn merge_forward_item_of(v: &serde_json::Value) -> Option<MergedForwardItem> {
+    let obj = v.as_object()?;
+    let str_of = |k: &str| {
+        obj.get(k)
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let (sender_id, sender_name) = match obj.get("sender").and_then(|s| s.as_object()) {
+        Some(s) => (
+            s.get("id")
+                .and_then(|x| x.as_str())
+                .or_else(|| s.get("open_id").and_then(|x| x.as_str()))
+                .unwrap_or("")
+                .to_string(),
+            s.get("name")
+                .and_then(|x| x.as_str())
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .map(String::from),
+        ),
+        None => (String::new(), None),
+    };
+    Some(MergedForwardItem {
+        message_id: str_of("message_id"),
+        message_type: obj
+            .get("message_type")
+            .and_then(|x| x.as_str())
+            .or_else(|| obj.get("msg_type").and_then(|x| x.as_str()))
+            .unwrap_or("")
+            .to_string(),
+        content: str_of("content"),
+        sender_id,
+        sender_name,
+        create_time_ms: merge_forward_create_time(obj.get("create_time")),
+    })
+}
+
+/// create_time 宽容解析：字符串 / 数字皆可；秒级值（0 < ts < 1e11，毫秒形态最早
+/// 1973 年）自动 ×1000 归一毫秒——飞书各 API 时间戳单位不统一，按量级判别。
+/// **待真机校准**：真机确认恒为毫秒后可去掉归一。
+fn merge_forward_create_time(v: Option<&serde_json::Value>) -> i64 {
+    let raw = v
+        .and_then(|x| {
+            x.as_i64()
+                .or_else(|| x.as_str().and_then(|s| s.parse::<i64>().ok()))
+        })
+        .unwrap_or(0);
+    if raw > 0 && raw < 100_000_000_000 {
+        raw * 1000
+    } else {
+        raw
+    }
+}
+
+/// 查询合并转发消息的子消息列表（合并转发完整支持）：GET
+/// `/im/v1/messages/{message_id}/merge_forward`，分页拉全（page_size=50，
+/// page_token 翻页，上限 10 页 / 500 条防异常翻页 runaway——同 list_joined_chats
+/// 取舍；转录侧另有 8000 字符截断兜底，见 proto::MERGE_FORWARD_TRANSCRIPT_MAX）。
+///
+/// SDK（open-lark 0.20）无此 API，raw reqwest（同 reply_message 模式）。**每页
+/// 单独**走限流重试（整循环重试会重复拉已得页，浪费配额）。需 `im:message`
+/// 读权限（真机确认：事件侧已有读权限通常即覆盖，若拉取报权限错误需在后台
+/// 补开对应读权限并发布版本）。响应字段形态**待真机校准**（宽容提取见
+/// [`parse_merge_forward_page`]）。
+pub async fn list_merge_forward(
+    core_config: &CoreConfig,
+    token: &str,
+    message_id: &str,
+) -> imagent_core::Result<Vec<MergedForwardItem>> {
+    let base = core_config.base_url().trim_end_matches('/').to_string();
+    let mut out: Vec<MergedForwardItem> = Vec::new();
+    let mut page_token: Option<String> = None;
+    for _ in 0..10 {
+        let page = retry_on_rate_limit!(async {
+            let mut req = reqwest::Client::new()
+                .get(format!(
+                    "{base}/open-apis/im/v1/messages/{message_id}/merge_forward"
+                ))
+                .bearer_auth(token)
+                .query(&[("page_size", "50")]);
+            if let Some(t) = page_token.as_deref() {
+                req = req.query(&[("page_token", t)]);
+            }
+            let resp = req.send().await.map_err(|e| {
+                imagent_core::CoreError::Platform(PLATFORM, format!("list_merge_forward: {e}"))
+            })?;
+            // 429 先归一标记（否则非 JSON 体解析错误不含可识别串，重试不生效）。
+            if resp.status().as_u16() == 429 {
+                return Err(imagent_core::CoreError::Platform(
+                    PLATFORM,
+                    "list_merge_forward: HTTP 429".to_string(),
+                ));
+            }
+            let v: serde_json::Value = resp.json().await.map_err(|e| {
+                imagent_core::CoreError::Platform(PLATFORM, format!("list_merge_forward: {e}"))
+            })?;
+            parse_merge_forward_page(&v)
+        })?;
+        out.extend(page.items);
+        if !page.has_more || page.page_token.is_none() || out.len() >= 500 {
+            break;
+        }
+        page_token = page.page_token;
+    }
+    out.truncate(500);
+    Ok(out)
+}
+
 /// 回复云文档评论（P4-9）：POST `/drive/v1/files/{file_token}/comments/{comment_id}/replies`。
 ///
 /// 手写 HTTP（open-lark 0.20 无 drive 评论模块，同 CardKit 做法）。需应用开通
@@ -991,6 +1150,103 @@ mod tests {
         ] {
             assert!(!is_rate_limited_msg(miss), "不应识别: {miss}");
         }
+    }
+
+    /// 合并转发列表响应解析（mock JSON）：信封 code!=0 报错；字段宽容提取
+    /// （msg_type 别名、字符串/数字/秒级时间戳、sender.id/open_id、name 缺省）。
+    #[test]
+    fn merge_forward_page_parsing() {
+        let ok = serde_json::json!({
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "items": [
+                    {
+                        "message_id": "om_sub1",
+                        "message_type": "text",
+                        "content": "{\"text\":\"你好\"}",
+                        "create_time": "1787912345678",
+                        "sender": { "id": "ou_alice", "id_type": "open_id", "name": "Alice" }
+                    },
+                    {
+                        "message_id": "om_sub2",
+                        "msg_type": "image",
+                        "content": "{\"image_key\":\"img_v3_x\"}",
+                        "create_time": 1787912340,
+                        "sender": { "open_id": "ou_bobxxxxxxxxxxxx" }
+                    }
+                ],
+                "has_more": true,
+                "page_token": "tok_2"
+            }
+        });
+        let page = parse_merge_forward_page(&ok).expect("code=0 应解析成功");
+        assert_eq!(page.items.len(), 2);
+        assert!(page.has_more);
+        assert_eq!(page.page_token.as_deref(), Some("tok_2"));
+        // 文本条目：字符串毫秒时间戳原样。
+        assert_eq!(page.items[0].message_type, "text");
+        assert_eq!(page.items[0].content, "{\"text\":\"你好\"}");
+        assert_eq!(page.items[0].sender_name.as_deref(), Some("Alice"));
+        assert_eq!(page.items[0].sender_id, "ou_alice");
+        assert_eq!(page.items[0].create_time_ms, 1_787_912_345_678);
+        // 图片条目：msg_type 别名、数字秒级时间戳 ×1000 归一、name 缺省 None。
+        assert_eq!(page.items[1].message_type, "image");
+        assert_eq!(page.items[1].sender_name, None);
+        assert_eq!(page.items[1].sender_id, "ou_bobxxxxxxxxxxxx");
+        assert_eq!(page.items[1].create_time_ms, 1_787_912_340_000);
+
+        // 业务错误（消息不存在/权限不足等）：code != 0 → Err，错误串可读。
+        let err = serde_json::json!({
+            "code": 230002, "msg": "message not exist", "data": null
+        });
+        let e = parse_merge_forward_page(&err).expect_err("code!=0 应报错");
+        let msg = format!("{e}");
+        assert!(
+            msg.contains("code=230002") && msg.contains("message not exist"),
+            "{msg}"
+        );
+
+        // 空数据 / 残缺条目：items 缺省空、非对象条目跳过、字段缺失给默认值。
+        let empty = serde_json::json!({ "code": 0, "data": {} });
+        let page = parse_merge_forward_page(&empty).expect("空数据应成功");
+        assert!(page.items.is_empty());
+        assert!(!page.has_more);
+        assert!(page.page_token.is_none());
+        let ragged = serde_json::json!({
+            "code": 0,
+            "data": { "items": [ "not-an-object", { "message_id": "om_x" } ] }
+        });
+        let page = parse_merge_forward_page(&ragged).expect("残缺条目不应整页报错");
+        assert_eq!(page.items.len(), 1, "非对象跳过，残缺对象保留");
+        assert_eq!(page.items[0].message_type, "");
+        assert_eq!(page.items[0].create_time_ms, 0);
+    }
+
+    /// create_time 量级归一：秒级 ×1000，毫秒原样，非法/缺省 0。
+    #[test]
+    fn merge_forward_create_time_normalization() {
+        assert_eq!(
+            merge_forward_create_time(Some(&serde_json::json!(1787912340))),
+            1_787_912_340_000,
+            "秒级归一毫秒"
+        );
+        assert_eq!(
+            merge_forward_create_time(Some(&serde_json::json!("1787912345678"))),
+            1_787_912_345_678,
+            "毫秒字符串原样"
+        );
+        assert_eq!(
+            merge_forward_create_time(Some(&serde_json::json!(0))),
+            0,
+            "0 保持（缺失语义）"
+        );
+        assert_eq!(
+            merge_forward_create_time(Some(&serde_json::json!("abc"))),
+            0,
+            "非法字符串 → 0"
+        );
+        assert_eq!(merge_forward_create_time(None), 0, "缺省 → 0");
     }
 
     #[tokio::test]
