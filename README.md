@@ -33,8 +33,11 @@ imagent 是一个常驻网关进程：监听 IM 私聊消息 → 鉴权 → 驱�
 - 🌉 **平台 / 后端双抽象**：换 IM 只加 adapter，换 agent 只加 impl。
 - 🔐 **安全第一**：发送者白名单 + 会话（群）白名单 + `--allowedTools` 收敛 + workdir 锁定 + **IM 内权限审批闭环**（按钮卡片 / 文本 y/n——按钮卡片仅飞书）。
 - 💬 **会话连续**：per-chat session 持久化（SQLite），重启可续；`--resume`；`/switch` 多命名会话；`/resume` 统一列表无感接管历史/电脑端 Claude Code 会话。
-- 🛑 **任务控制**：`/stop` 随时中断在飞任务（杀 agent 子进程）；空闲看门狗自动终止无输出的僵死任务。
-- 🔁 **消息批处理**：运行中到达的消息排队，与连发消息合并为一轮执行（不重复跑轮、不烧 token）。
+- 🛑 **任务控制（steering）**：`/stop` 随时中断在飞任务（杀 agent 子进程），**排队消息保留并自动转入下一轮**（对齐 Claude Code 的 Esc + 队列注入语义——运行中发补充/纠正不再丢）；空闲看门狗自动终止无输出的僵死任务；失败后一键 `/retry` 续接。
+- 🔁 **消息批处理**：运行中到达的消息排队，与连发消息合并为一轮执行（不重复跑轮、不烧 token；批窗口静默判停自适应）。
+- 💭 **thinking / 任务清单**：思考过程与正文分离透出（卡片折叠区展示，cot 档位控制）；Claude Code 的 TodoWrite / ACP Plan 渲染成卡片 checklist 进度。
+- 🎤 **语音输入（飞书）**：语音条自动转文字进 prompt（speech_to_text，需后台申请语音识别权限）。
+- 📊 **用量护栏**：`/stats` 成本统计 + 自动 compact（水位超阈值）+ per-sender 成本上限（滚动 24h）。
 - 🛠️ **IM 内运维**：`/status` `/doctor` `/reconnect` `/config`（COT 三档展示 off/brief/detailed 等热改）。
 - 📄 **飞书生态**：CardKit 真流式卡片（分阶段 footer + 工具 ⏳/✅ 实时行 + ⏹ 终止按钮）、审批/问题/命令标题卡（按钮 primary/danger + flow 自适应布局）、`/config` 下拉表单卡、邮箱掩码防租户审计拦截、云文档评论 @bot 触发（同评论线程回复）、合并转发聊天记录自动转录为文本供 agent 阅读。
 - 💻 **终端 agent 反向接入（ask_via_im）**：电脑终端上任意 agent 需要你决策时，把问题转发到飞书——人不在电脑前也能在手机上点按钮作答；多 agent 并发按 request_id 精确分发（见[终端 agent 接入](#终端-agent-接入ask_via-im人不在电脑前也能问你)）。
@@ -171,6 +174,8 @@ imagent start            # 前台常驻，Ctrl-C 退出
 | `drive.file.comment.created_v1` | 云文档评论 @bot 触发 | 可选 |
 | `im.message.recalled_v1` | 消息撤回：移出未处理的排队消息（任务已开始则提示可 /stop，不自动中断） | 可选 |
 | `im.chat.member.bot.deleted_v1` | bot 被移出群：自动从会话白名单移除并私聊通知管理员 | 可选 |
+| `im.chat.member.bot.added_v1` | bot 被加入群：回欢迎语（含 /chat allow 放行指引） | 可选 |
+| `im.message.reaction.created_v1` | 表情回应快速审批：审批卡上回 👍=允许 / 👎=拒绝 | 可选 |
 | `application.url.menu_v6` | 自定义菜单跳转：点击菜单即回 /help 使用说明（后台可配自定义菜单） | 可选 |
 
 > **自定义菜单（可选）**：订阅 `application.url.menu_v6` 后，可在飞书后台「应用能力 → 机器人 → 自定义菜单」配置菜单项——点击菜单 bot 会直接回 `/help` 使用说明（新手引导入口）。
@@ -250,13 +255,16 @@ secret 轮换 / 环境变量变化后：重新 `export` + `imagent service insta
 | `/switch <name>` | 切到 / 新建命名会话（多任务并行上下文） |
 | `/sessions` | 列命名会话（`*` 标当前） |
 | `/resume [n]` | 统一恢复列表：📱 IM 会话 ∪ 💻 电脑端 Claude Code 会话（摘要+时间辨认，按序号接管，无需会话 id） |
-| `/compact` | 软压缩上下文（摘要 + 重置 + 延续） |
+| `/compact` | 软压缩上下文（摘要 + 重置 + 延续）；水位超 `auto_compact_threshold_tokens`（默认 120k，0=关）自动触发 |
+| `/retry` | 重发最近一轮指令（失败/中断后一键续接） |
+| `/export` | 当前会话导出为 Markdown 文件回传（claude 系后端） |
+| `/model [名称\|default]` | 查看/热切模型（切换需管理员；claude 系后端） |
 | `/cd [path]` | 切工作目录（`/resume` 本机会话列表随之变化） |
 | `/ws list\|save\|use\|remove` | 命名工作空间 |
 | `/img <path>` `/file <path>` | 发 workdir 内图片 / 任意文件到 IM |
 | `/timeout [N\|off\|default]` | 会话级空闲看门狗（分钟） |
 | `/perm <auto\|off\|allow\|deny\|ask>` | 权限模式热切（auto=按后端自动选档） |
-| `/stop` | 中断当前在飞任务（杀 agent 子进程，清空排队消息） |
+| `/stop [all]` | 中断在飞任务（**排队消息保留并自动转入下一轮**——对齐 Claude Code 的 Esc+队列注入语义；`/stop all` 硬停清空排队） |
 | `/config [k v]` | 查看 / 热改配置（cot_detail / batch_window_ms / agent_idle_timeout_secs / require_mention / reply_mode，管理员）；`/config cot <off\|brief\|detailed\|default>` 为**本会话** COT 偏好（白名单可用，免 admin） |
 | `/status` `/doctor` `/reconnect` | 运行状态 / 自检 / 强制平台重连 |
 | `/allow <id\|@名字>` `/disallow` | 授权 / 撤销 sender（飞书群内可直接 @ 对方，管理员门槛） |

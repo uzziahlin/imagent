@@ -35,11 +35,11 @@ crates/
 ├── core/    调度核心（见 §3）
 ├── ilink/   iLink 协议：登录扫码 / 长轮询 / AES-128-ECB 媒体 / 服从式限流退避
 ├── wecom/   企微 OpenWS 长连接：subscribe 认证 / 心跳 / markdown 回复
-├── feishu/  open-lark WS 长连接 + 手写 CardKit/评论/媒体 HTTP；429/230020 退避
+├── feishu/  open-lark WS 长连接 + 手写 CardKit/评论/媒体/ASR HTTP；429/230020 退避
 ├── claude/  CLI（stream-json 解析）+ ACP（JSON-RPC 长驻）；~/.claude 会话扫描
 ├── codex/   codex exec；~/.codex/sessions rollout 扫描（/resume 接管）
 ├── gemini/  gemini CLI（无本机存储概念，/resume 仅 IM 历史）
-└── store/   SQLite（bundled 静态链接）schema v1→v6 线性迁移（见 §5）
+└── store/   SQLite（bundled 静态链接）schema v1→v9 线性迁移（见 §5）
 fuzz/        cargo-fuzz targets：ilink 协议解析 / CDN host SSRF / 飞书事件解析
 src/main.rs  组装：CLI（clap）、单实例锁、信号、/health + /metrics、孤儿卡片扫描
 ```
@@ -50,7 +50,7 @@ src/main.rs  组装：CLI（clap）、单实例锁、信号、/health + /metrics
 crates/core/src/
 ├── dispatch/
 │   ├── mod.rs       Dispatcher 状态 + run() 主循环 + conv 锁/批处理 runner + reply 基元
-│   ├── commands/    handle()：发现态引导 → 白名单门 → 21 命令分派 → 普通消息入口
+│   ├── commands/    handle()：发现态引导 → 白名单门 → 28 命令分派 → 普通消息入口
 │   │   ├── admin.rs   /allow /disallow /list /whoami /chat /config /perm（多数 admin 门槛）
 │   │   ├── session.rs /new /switch /sessions /resume /compact /stop
 │   │   └── misc.rs    /status /doctor /reconnect /cd /ws /img /help
@@ -72,7 +72,9 @@ crates/core/src/
 Platform::recv ─→ 鉴权门（sender ∪ 会话白名单；空白名单=发现模式回引导）
    ├→ 斜杠命令：admin 门槛 → cmd_x（多数取 conv 锁与在飞任务串行）
    └→ 普通消息：enqueue_or_become_runner（PENDING_QUEUE_CAP=100）
-        runner 循环〔持 conv 锁〕→ batch_window 合并连发消息 → run_agent_round
+        runner 循环〔持 conv 锁〕→ batch_window 静默判停合并连发（连发未停继续
+        等，3× 窗口封顶 10s）→ run_agent_round〔成功轮水位超
+        auto_compact_threshold_tokens 自动走 /compact 管道〕
              ├ 续接：store.get_session → Some(id) ?
              ├ 注入：/compact 摘要（新会话时）+ 媒体路径提示
              ├ 执行：Backend::run（tokio::spawn 注册 running 表，/stop 可 abort）
@@ -81,16 +83,18 @@ Platform::recv ─→ 鉴权门（sender ∪ 会话白名单；空白名单=发�
              └ 落库：upsert_session（事务）+ session_history（per-conv 保 50）
 ```
 
-关键不变量：**同 conv 串行**（锁跨轮次）；**/stop 不取锁**（取了等价于没停）；
-**审批等待暂停看门狗**（审批有独立超时预算）。
+关键不变量：**同 conv 串行**（锁跨轮次）；**/stop 不取锁**（取了等价于没停；
+中断后**排队消息保留**、runner 自动取批续跑 = steering 语义，`/stop all` 才硬停
+清队列）；**审批等待暂停看门狗**（审批有独立超时预算）。
 
-## 5. 存储（schema v6）
+## 5. 存储（schema v9）
 
 | 表 | 用途 |
 |---|---|
 | `credentials` | 平台凭据（keyring 优先，明文回退可关 fail-closed） |
 | `sessions` / `named_sessions` / `session_history` | 每 conv 活动 session / 命名会话 / 历史侧表（/resume 数据源，保 50） |
 | `sync_buf` / `context_tokens` | iLink 长轮询游标 / 出站 context_token |
+| `run_stats` | per-run 用量/成本（v8；v9 加 `sender` 列——per-sender 成本上限数据源；轮转 10000 条） |
 | `config` | KV：workdir、active_name、compact 摘要、命名工作空间 |
 | `allowed_senders` / `allowed_chats` / `audit_log` | 双白名单 + 审计 |
 | `live_cards` | 在飞流式卡片登记（孤儿卡片启动关流，见 §7） |
@@ -107,7 +111,8 @@ claude（--permission-prompt-tool）─MCP─→ imagent mcp 子进程
      · 双行握手：token 行（读 <sock_dir>/permission.token，0600）+ JSON 请求行
    └ core PermissionRouter.register（oneshot 等待，permission_ask_timeout 预算）
         └ Platform::send_permission_ask（飞书=按钮卡片，其它=文本 y/n）
-             └ 用户回复 / 按钮回调 → can_route_permission_reply（同一白名单门）
+             └ 用户回复 / 按钮回调 / 卡片上表情回应（飞书 👍/👎，v3）
+                → can_route_permission_reply（同一白名单门）
                   → parse_reply（仅精确 y/allow 词过，fail-closed）→ 写回 socket
 ```
 
