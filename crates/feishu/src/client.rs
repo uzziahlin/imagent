@@ -584,30 +584,32 @@ pub async fn upload_file(
     })
 }
 
-/// W3-1：语音转文字——POST /open-apis/speech_to_text/v1/file_recognize
-/// （multipart：`file` + `config`），整文件识别（官方支持 60 秒内音频，正好
-/// 覆盖 IM 语音条场景）。需在飞书后台申请「语音识别」权限。
+/// W3-1：语音转文字（真机校准修订）——POST
+/// `/open-apis/speech_to_text/v1/speech/file_recognize`，**JSON body**（非
+/// multipart）：`speech.speech` = base64(pcm)，`config` = `{file_id(16 位),
+/// format:"pcm", engine_type:"16k_auto"}`。官方支持 60 秒内音频，覆盖 IM
+/// 语音条场景；需在飞书后台申请「语音识别(speech_to_text:speech)」权限。
 ///
-/// `config.format` 取 "ogg"（飞书 IM 语音消息下载产物为 ogg/opus 容器）——
-/// **待真机校准**：若租户语音资源为其它编码，识别失败由调用方回退为提示
-/// （fail-soft）。响应 `{"code":0,"data":{"text":"…"}}`。单次不重试（调用方
-/// 失败回退，非用户可见关键路径）。
+/// 飞书语音条下载产物为 ogg/opus，接口仅收 16k s16le mono pcm——先经 ffmpeg
+/// 子进程转码（缺 ffmpeg / 转码失败由调用方 fail-soft 回退）。响应
+/// `{"code":0,"data":{"recognition_text":"…"}}`。单次不重试：99991400 实测为
+/// HTTP 400 形态（标准频控是 429），属「特殊频控」——租户未开通语音服务/
+/// 免费版门禁，立即重试无意义，报可行动原因。
 pub async fn transcribe_audio(
     core_config: &CoreConfig,
     token: &str,
     bytes: Vec<u8>,
 ) -> imagent_core::Result<String> {
+    let pcm = ogg_to_pcm(bytes).await?;
+    let body = asr_request_body(&pcm);
     let base = core_config.base_url().trim_end_matches('/').to_string();
-    let url = format!("{base}/open-apis/speech_to_text/v1/file_recognize");
-    let part = reqwest::multipart::Part::bytes(bytes).file_name("audio.ogg");
-    let form = reqwest::multipart::Form::new()
-        .text("config", r#"{"format":"ogg"}"#)
-        .part("file", part);
+    let url = format!("{base}/open-apis/speech_to_text/v1/speech/file_recognize");
     let client = reqwest::Client::new();
     let resp = client
         .post(&url)
         .bearer_auth(token)
-        .multipart(form)
+        .header("Content-Type", "application/json; charset=utf-8")
+        .body(body)
         .send()
         .await
         .map_err(|e| {
@@ -619,25 +621,139 @@ pub async fn transcribe_audio(
             "transcribe_audio: HTTP 429".to_string(),
         ));
     }
-    let v: serde_json::Value = resp.json().await.map_err(|e| {
+    // 先取原始文本再解析：非 JSON 响应（如网关 404 页）时报出状态码与原文
+    // 片段，而非无信息量的 "error decoding response body"（本次校准的实际教训）。
+    let status = resp.status().as_u16();
+    let text = resp.text().await.map_err(|e| {
         imagent_core::CoreError::Platform(PLATFORM, format!("transcribe_audio: {e}"))
+    })?;
+    parse_asr_response(status, &text)
+}
+
+/// 解析 ASR 响应（纯函数，供单测）：非 JSON 报状态码+原文截断；code!=0 报
+/// 错误码（99991400 附开通指引）；成功取 `data.recognition_text`。
+fn parse_asr_response(status: u16, body: &str) -> imagent_core::Result<String> {
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|_| {
+        imagent_core::CoreError::Platform(
+            PLATFORM,
+            format!(
+                "transcribe_audio: HTTP {status} 非 JSON 响应: {}",
+                truncate_for_error(body, 120)
+            ),
+        )
     })?;
     let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
     if code != 0 {
         let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
+        // 99991400（HTTP 400 形态）：特殊频控门禁——语音识别权限未开通/未发布，
+        // 或企业为免费版（官方文档：免费版不支持本接口）。
+        let hint = if code == 99991400 {
+            "（检查飞书后台已开通「语音识别」权限并发布版本；免费版企业不支持本接口）"
+        } else {
+            ""
+        };
         return Err(imagent_core::CoreError::Platform(
             PLATFORM,
-            format!("transcribe_audio: code={code} msg={msg}"),
+            format!("transcribe_audio: code={code} msg={msg}{hint}"),
         ));
     }
     v.get("data")
-        .and_then(|d| d.get("text"))
+        .and_then(|d| d.get("recognition_text"))
         .and_then(|t| t.as_str())
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .ok_or_else(|| {
             imagent_core::CoreError::Platform(PLATFORM, "transcribe_audio: 响应缺文本".into())
         })
+}
+
+/// 构造 file_recognize 的 JSON 请求体：pcm base64 + 16 位随机 file_id
+///（官方要求：仅字母数字和下划线的 16 位字符串，用户生成）。
+fn asr_request_body(pcm: &[u8]) -> String {
+    use base64::Engine;
+    use rand::Rng;
+    let speech = base64::engine::general_purpose::STANDARD.encode(pcm);
+    let file_id: String = rand::thread_rng()
+        .sample_iter(rand::distributions::Alphanumeric)
+        .take(16)
+        .map(char::from)
+        .collect();
+    serde_json::json!({
+        "speech": { "speech": speech },
+        "config": {
+            "file_id": file_id,
+            "format": "pcm",
+            "engine_type": "16k_auto",
+        }
+    })
+    .to_string()
+}
+
+/// ogg/opus → 16k s16le mono pcm（ffmpeg 子进程，stdin/stdout 管道）。
+/// ffmpeg 写 stdout 与主进程写 stdin 需并发，否则管道缓冲区写满会死锁。
+async fn ogg_to_pcm(bytes: Vec<u8>) -> imagent_core::Result<Vec<u8>> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+    let mut child = tokio::process::Command::new("ffmpeg")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-i")
+        .arg("pipe:0")
+        .arg("-f")
+        .arg("s16le")
+        .arg("-acodec")
+        .arg("pcm_s16le")
+        .arg("-ac")
+        .arg("1")
+        .arg("-ar")
+        .arg("16000")
+        .arg("pipe:1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                imagent_core::CoreError::Platform(
+                    PLATFORM,
+                    "语音转写需要 ffmpeg（未安装）：brew install ffmpeg".into(),
+                )
+            } else {
+                imagent_core::CoreError::Platform(PLATFORM, format!("启动 ffmpeg 失败: {e}"))
+            }
+        })?;
+    let mut stdin = child.stdin.take().expect("ffmpeg stdin piped");
+    let feed = tokio::spawn(async move {
+        // 写完即随 task 结束 drop stdin → EOF，ffmpeg 正常收尾。
+        let _ = stdin.write_all(&bytes).await;
+    });
+    let out = child.wait_with_output().await.map_err(|e| {
+        imagent_core::CoreError::Platform(PLATFORM, format!("等待 ffmpeg 失败: {e}"))
+    })?;
+    let _ = feed.await;
+    if !out.status.success() {
+        return Err(imagent_core::CoreError::Platform(
+            PLATFORM,
+            format!(
+                "ffmpeg 转码失败: {}",
+                truncate_for_error(&String::from_utf8_lossy(&out.stderr), 120)
+            ),
+        ));
+    }
+    if out.stdout.is_empty() {
+        return Err(imagent_core::CoreError::Platform(
+            PLATFORM,
+            "ffmpeg 转码产物为空".into(),
+        ));
+    }
+    Ok(out.stdout)
+}
+
+/// 错误信息内嵌的原文片段截断（多字节字符安全）。
+fn truncate_for_error(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect::<String>()
+        + if s.chars().count() > max_chars { "…" } else { "" }
 }
 
 /// 发送文件消息（P6-7，msg_type=file），content 为 `{"file_key":"..."}`。
@@ -1322,5 +1438,91 @@ mod tests {
         let res = tokio::time::timeout(Duration::from_millis(800), client.run(payload_tx)).await;
         // run 永不返回 → timeout 触发（Err(Elapsed)）= 正常。
         assert!(res.is_err(), "run 应持续重连而非返回");
+    }
+
+    /// W3-1 校准回归：ASR 请求体为 JSON（非 multipart），speech 为 base64(pcm)，
+    /// file_id 恰 16 位字母数字（官方约束），engine/format 固定值。
+    #[test]
+    fn asr_request_body_shape() {
+        use base64::Engine;
+        let pcm = vec![0x01u8, 0x02, 0x03, 0x04];
+        let body = asr_request_body(&pcm);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("合法 JSON");
+        let speech = v["speech"]["speech"].as_str().expect("speech.speech");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD.decode(speech).unwrap(),
+            pcm,
+            "speech 字段为 pcm 的 base64"
+        );
+        let cfg = &v["config"];
+        assert_eq!(cfg["format"], "pcm");
+        assert_eq!(cfg["engine_type"], "16k_auto");
+        let fid = cfg["file_id"].as_str().expect("file_id");
+        assert_eq!(fid.len(), 16, "file_id 恰 16 位");
+        assert!(
+            fid.chars().all(|c| c.is_ascii_alphanumeric()),
+            "file_id 仅字母数字"
+        );
+        // 两次生成的 file_id 不同（用户生成语义，非固定值）。
+        assert_ne!(asr_request_body(&pcm), body);
+    }
+
+    /// W3-1 校准回归：成功响应取 `data.recognition_text`（**非** `data.text`——
+    /// 真机校准前的旧代码按 text 解析会漏取）。空文本视为失败（fail-soft 提示）。
+    #[test]
+    fn asr_response_parses_recognition_text() {
+        let ok = r#"{"code":0,"msg":"success","data":{"recognition_text":" 帮我看看现在几点了 "}}"#;
+        assert_eq!(parse_asr_response(200, ok).unwrap(), "帮我看看现在几点了");
+        // 旧字段形态（text）不属于本接口——不误读，按缺文本报错。
+        let legacy = r#"{"code":0,"data":{"text":"x"}}"#;
+        assert!(parse_asr_response(200, legacy).is_err());
+    }
+
+    /// W3-1 校准回归：非 JSON 响应（旧路径 404 网关页——本次真机故障的实测
+    /// 形态）必须报出状态码与原文片段，而非 "error decoding response body"。
+    #[test]
+    fn asr_response_surfaces_non_json_body() {
+        let err = parse_asr_response(404, "404 page not found").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("HTTP 404"), "msg={msg}");
+        assert!(msg.contains("404 page not found"), "msg={msg}");
+    }
+
+    /// W3-1 校准回归：99991400（特殊频控门禁——权限未开通/免费版）附开通指引；
+    /// 其它错误码原样报出。
+    #[test]
+    fn asr_response_rate_gate_hint() {
+        let gated = r#"{"code":99991400,"msg":"request trigger frequency limit"}"#;
+        let msg = format!("{}", parse_asr_response(400, gated).unwrap_err());
+        assert!(msg.contains("99991400"), "msg={msg}");
+        assert!(msg.contains("语音识别"), "msg={msg}");
+        let other = r#"{"code":1040101,"msg":"invalid param"}"#;
+        let msg = format!("{}", parse_asr_response(400, other).unwrap_err());
+        assert!(msg.contains("1040101") && !msg.contains("语音识别"), "msg={msg}");
+    }
+
+    /// W3-1 校准回归：ogg → 16k s16le mono pcm 转码（本机装了 ffmpeg 才跑；
+    /// CI 无 ffmpeg 时跳过——转码正确性由真机校准背书）。
+    #[tokio::test]
+    async fn ogg_to_pcm_converts_via_ffmpeg() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            return; // 环境无 ffmpeg：跳过（缺依赖路径由 fail-soft 覆盖）。
+        }
+        // 1 秒 440Hz 正弦 ogg（手搓最小 OggS 页不现实，借 ffmpeg 生成）。
+        let gen = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-c:a", "libopus", "-f", "ogg", "pipe:1"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("生成测试 ogg");
+        assert!(gen.status.success(), "gen stderr={}", String::from_utf8_lossy(&gen.stderr));
+        let pcm = ogg_to_pcm(gen.stdout).await.expect("转码成功");
+        // 16k Hz × 1 秒 × 2 字节（s16le）× 单声道 ≈ 32000 字节（容器开销致略少）。
+        assert!(pcm.len() > 30_000 && pcm.len() < 33_000, "pcm_len={}", pcm.len());
+        assert!(pcm.len() % 2 == 0, "s16le 应为 2 字节对齐");
     }
 }
