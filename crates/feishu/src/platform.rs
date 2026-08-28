@@ -476,7 +476,8 @@ impl FeishuPlatform {
                         continue;
                     }
                     // 与普通消息一致的登记（转录消息同样发起一轮 agent）：conv 发起
-                    // 者（审批卡点击者校验锚）/ 普通群回复锚点 / 话题活跃免 @ 续期。
+                    // 者（审批卡点击者校验锚）/ 锚点候选（W3-5：send_typing 轮次
+                    // 锚定时提升为回复锚点）/ 话题活跃免 @ 续期。
                     conv_senders_for_drain
                         .lock()
                         .await
@@ -484,7 +485,7 @@ impl FeishuPlatform {
                     if let Some((conv, anchor)) =
                         group_reply_anchor(&mf_msg.conv_id.0, mf_msg.source_msg_id.as_deref())
                     {
-                        reply_anchors_for_drain.lock().await.insert(conv, anchor);
+                        last_inbound_for_drain.lock().await.insert(conv, anchor);
                     }
                     if let Some(tk) = &thread_key {
                         let mut m = thread_active_for_drain.lock().await;
