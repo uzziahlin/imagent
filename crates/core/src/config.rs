@@ -397,6 +397,12 @@ pub struct Config {
     /// 默认 600；仅 `agent = "claude-acp"` 生效。改动需重启。
     #[serde(default = "default_acp_idle_recycle_secs")]
     pub acp_idle_recycle_secs: u64,
+    /// W4-1：per-sender 成本上限（美元，**滚动 24h 窗口**）——该发送者近 24h
+    /// 累计成本达到上限后新轮次直接拒绝（回执说明）。多用户群部署的运营护栏。
+    /// None（默认）= 不限制。统计依赖 run_stats.sender（v9 起记录；升级前的
+    /// 历史行无 sender，不计入）。
+    #[serde(default)]
+    pub sender_daily_cost_limit_usd: Option<f64>,
     /// W3-1：飞书语音转文字（speech_to_text/v1/file_recognize，60s 内语音条）。
     /// 默认 true；需在飞书后台申请语音识别权限——无权限/识别失败时回退为
     /// 媒体错误提示（fail-soft，不影响其余消息）。仅 feishu 平台生效。
@@ -694,6 +700,14 @@ impl Config {
                 cfg.auto_compact_threshold_tokens
             )));
         }
+        // W4-1：成本上限须为正数（0 / 负数视为配置错误而非「立即全拒」）。
+        if let Some(l) = cfg.sender_daily_cost_limit_usd {
+            if l <= 0.0 {
+                return Err(CoreError::Config(
+                    "sender_daily_cost_limit_usd 须为正数（当前非正；不限制请删除该配置项）".into(),
+                ));
+            }
+        }
         // W2-4：ACP 连接参数边界。
         if cfg.acp_max_connections == 0 {
             return Err(CoreError::Config(
@@ -760,6 +774,7 @@ permission_mode = "auto"    # 缺省=auto：claude-cli=透传 claude 原生 auto
 # acp_max_connections = 8      # claude-acp 并发连接上限（仅 agent="claude-acp"）
 # acp_idle_recycle_secs = 600  # claude-acp 连接空闲回收（秒；仅 agent="claude-acp"）
 # feishu_asr_enabled = true     # 飞书语音转文字（需后台申请语音识别权限；失败回退提示，仅 feishu）
+# sender_daily_cost_limit_usd = 5.0  # per-sender 成本上限（美元，滚动 24h 窗口；不设 = 不限）
 "#;
 }
 /// claude `--permission-mode` 合法值归一（入参已小写化）：manual→default

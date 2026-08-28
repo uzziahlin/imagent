@@ -264,6 +264,10 @@ impl Dispatcher {
                         self.cmd_retry(&conv, &sender, &hint).await;
                         return;
                     }
+                    "/export" => {
+                        self.cmd_export(&conv, &hint).await;
+                        return;
+                    }
                     "/cd" => {
                         self.cmd_cd(&conv, &hint, &parts).await;
                         return;

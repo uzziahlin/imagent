@@ -588,6 +588,15 @@ impl Backend for AcpBackend {
         crate::sessions::scan_for_backend(workdir)
     }
 
+    /// W4-2：会话转录导出（与 CLI 同一 ~/.claude 存储）。
+    async fn export_session_markdown(
+        &self,
+        workdir: &std::path::Path,
+        session_id: &str,
+    ) -> Option<String> {
+        crate::sessions::export_session_md(workdir, session_id)
+    }
+
     /// 进程退出接线（main 在 dispatcher.run() 返回后统一调用）：断开全部
     /// per-conv 连接，长驻 task 退出 → connection drop → ChildGuard kill 子
     /// 进程。语义与固有 [`AcpBackend::shutdown`] 相同，经 trait 暴露给

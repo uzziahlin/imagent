@@ -299,6 +299,15 @@ impl Backend for ClaudeBackend {
         crate::sessions::scan_for_backend(workdir)
     }
 
+    /// W4-2：会话转录导出（与 /resume 同一 ~/.claude 存储）。
+    async fn export_session_markdown(
+        &self,
+        workdir: &std::path::Path,
+        session_id: &str,
+    ) -> Option<String> {
+        crate::sessions::export_session_md(workdir, session_id)
+    }
+
     async fn run(
         &self,
         conv_id: &str,

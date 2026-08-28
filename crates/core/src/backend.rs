@@ -134,6 +134,13 @@ pub trait Backend: Send + Sync {
         Vec::new()
     }
 
+    /// W4-2：会话转录导出为 Markdown（`/export` 数据源）。返回 None = 该后端
+    /// 不支持（codex/gemini 无本机可读存储或未接）。默认 None；claude 系覆写
+    /// （`~/.claude/projects/<编码>/<id>.jsonl` → 人读对话转录）。
+    async fn export_session_markdown(&self, _workdir: &Path, _session_id: &str) -> Option<String> {
+        None
+    }
+
     /// 进程退出前的显式清理（dispatcher.run() 返回后由 main 调用一次）。
     /// 默认 no-op；持有长驻资源的后端覆写（如 claude-acp 断开全部 per-conv
     /// 连接、kill ACP 子进程）。此前仅靠 Drop 兜底——Arc 泄漏/静态持有场景
