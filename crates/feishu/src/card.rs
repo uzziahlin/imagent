@@ -95,12 +95,62 @@ fn terminal_footer(err: Option<&str>) -> &'static str {
     }
 }
 
+/// Wave B-3：运行时长的人读短格式：`42s` / `30m` / `2h05m` / `1d3h`
+///（与 Running footer 的纯秒数区分——终态展示累计耗时）。
+pub(crate) fn format_run_len(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    } else {
+        format!("{}d{}h", secs / 86_400, (secs % 86_400) / 3600)
+    }
+}
+
+/// Wave B-3：成功终态 footer：`✅ 已完成 · 30m · $0.012`（无 usage 省成本段）。
+/// `run_secs` 为 CardSession 终态写入的**全量**秒数（非 Running 期的 10s 量化）。
+pub(crate) fn terminal_done_footer(run_secs: u64, usage_display: Option<&str>) -> String {
+    let mut out = format!("✅ 已完成 · {}", format_run_len(run_secs));
+    if let Some(u) = usage_display {
+        out.push_str(&format!(" · {u}"));
+    }
+    out
+}
+
+/// Wave B-5：群 conv 卡片的「发起者」标注行（markdown 元素形态）。
+///
+/// 形态取舍：CardKit markdown 组件支持 `<at id=…></at>` 标签（**待真机校准**：
+/// 若该租户卡片 markdown 不支持 at，标签原文会显示为文本——届时退化为
+/// 「→ 发起者 <open_id>」纯文本行，只改本函数一处）。私聊不加（单人无歧义）。
+pub(crate) fn sender_anchor_line(
+    sender: Option<&str>,
+    is_group: bool,
+) -> Option<serde_json::Value> {
+    let s = sender.filter(|s| !s.is_empty())?;
+    if !is_group {
+        return None;
+    }
+    Some(serde_json::json!({
+        "tag": "markdown",
+        "content": format!("<at id=\"{s}\"></at> 发起的任务"),
+        "text_size": "notation"
+    }))
+}
+
 /// 渲染 [`OutboundCard`] 为飞书 interactive 卡片的 content JSON 字符串
 /// （配合 `msg_type = "interactive"` 发送 / patch）。
 ///
 /// markdown 文本块 + 工具调用折叠面板 + 状态 footer。
 /// 这是**降级路径**的渲染（managed 真流式路径见 [`render_stream_init_card`]）。
-pub fn render_card(card: &OutboundCard, conv_id: &str) -> String {
+///
+/// Wave B-3：成功终态 footer 带总耗时（`✅ 已完成 · 30m · $0.012`，run_secs 为
+/// CardSession 终态写入的全量秒数）。Wave B-5：群 conv（conv_id 非 `ou_` 私聊
+/// 形态）顶部加「发起者」标注行（sender 为最近 sender 近似，见 platform 注释）。
+/// Wave B-11：失败终态卡补「🩺 /doctor」按钮（点击注入 /doctor 命令，走与手打
+/// 相同的鉴权/分派）。
+pub fn render_card(card: &OutboundCard, conv_id: &str, sender: Option<&str>) -> String {
     let (footer, streaming, err) = match &card.terminal {
         CardTerminal::Running => (
             running_footer(card.phase, card.queued_hint.as_deref(), card.run_secs),
@@ -108,10 +158,7 @@ pub fn render_card(card: &OutboundCard, conv_id: &str) -> String {
             None,
         ),
         CardTerminal::Done => (
-            match &card.usage_display {
-                Some(u) => format!("✅ 已完成 · {u}"),
-                None => "✅ 已完成".to_string(),
-            },
+            terminal_done_footer(card.run_secs, card.usage_display.as_deref()),
             false,
             None,
         ),
@@ -133,8 +180,12 @@ pub fn render_card(card: &OutboundCard, conv_id: &str) -> String {
         Some(e) => format!("❌ 出错：{e}\n\n{text}").into(),
         None => text.into(),
     };
-    let mut elements =
-        vec![serde_json::json!({ "tag": "markdown", "content": mask_emails(&text) })];
+    let mut elements = Vec::new();
+    // Wave B-5：群 conv 顶部「发起者」标注行（私聊/缺 sender 不加）。
+    if let Some(line) = sender_anchor_line(sender, !crate::proto::is_private_conv(conv_id)) {
+        elements.push(line);
+    }
+    elements.push(serde_json::json!({ "tag": "markdown", "content": mask_emails(&text) }));
     if !card.tool_calls.is_empty() {
         // 长正文分段：正文与工具面板间用真 hr 组件分隔（降级路径专属——
         // managed 路径的 md_body 是单 markdown 组件，用 `---` 文本分割线，
@@ -161,6 +212,16 @@ pub fn render_card(card: &OutboundCard, conv_id: &str) -> String {
     // Running 态带终止按钮（终态移除——整卡 patch 每次重渲染，自然消失）。
     if streaming {
         elements.push(stop_button(conv_id, None));
+    } else if err.is_some() {
+        // Wave B-11：失败终态卡补「🩺 自检」按钮——一键 /doctor 排障（失败后
+        // 用户最需要的下一步动作）。managed（card: 句柄）路径 element PATCH 只能
+        // 更新 markdown 组件、无法追加按钮，该路径以 footer 文案指引兜底（见
+        // platform::patch_managed）。非卡片平台 send_command_card 默认降级纯文本。
+        elements.push(flow_button_row(&[cb_button(
+            "🩺 自检 /doctor",
+            "default",
+            cmd_value(conv_id, "/doctor", None),
+        )]));
     }
 
     // Running 态带自定义 summary（卡片列表预览/通知处显示，默认「生成中」）；
@@ -369,20 +430,30 @@ fn panel_header(title_md: &str) -> serde_json::Value {
 ///
 /// 正文 markdown 组件带固定 `element_id = md_body`（后续 element PATCH 的锚点），
 /// 初始内容为空；footer 独立组件体现执行中。`config` 开启流式模式 + 自定义摘要。
+///
+/// Wave B-5：群 conv 顶部加「发起者」标注行——**独立元素**（md_body 会被流式
+/// PATCH 整体覆盖，发起者行不能放进 md_body）；element PATCH 只动带 element_id
+/// 的组件，本行在整个流式期持续可见。发起者 = 最近 sender 近似（见 platform
+/// conv_senders 注释）。
 pub fn render_stream_init_card(conv_id: &str, sender: Option<&str>) -> String {
+    let mut elements = Vec::new();
+    if let Some(line) = sender_anchor_line(sender, !crate::proto::is_private_conv(conv_id)) {
+        elements.push(line);
+    }
+    elements.extend(vec![
+        serde_json::json!({ "tag": "markdown", "element_id": "md_body", "content": "🧠 已接收任务，正在处理…" }),
+        serde_json::json!({ "tag": "markdown", "element_id": "md_footer", "content": "🧠 思考中…", "text_size": "notation" }),
+        // P9-1：⏹ 终止按钮常驻（element PATCH 只更新 markdown，按钮不受流式
+        // 影响；终态后仍在，点击回「当前没有运行中的任务」，无害）。
+        stop_button(conv_id, sender)
+    ]);
     serde_json::json!({
         "schema": "2.0",
         "config": {
             "streaming_mode": true,
             "summary": { "content": "🧠 正在执行任务…" }
         },
-        "body": { "elements": [
-            { "tag": "markdown", "element_id": "md_body", "content": "🧠 已接收任务，正在处理…" },
-            { "tag": "markdown", "element_id": "md_footer", "content": "🧠 思考中…", "text_size": "notation" },
-            // P9-1：⏹ 终止按钮常驻（element PATCH 只更新 markdown，按钮不受流式
-            // 影响；终态后仍在，点击回「当前没有运行中的任务」，无害）。
-            stop_button(conv_id, sender)
-        ] }
+        "body": { "elements": elements }
     })
     .to_string()
 }
@@ -1268,7 +1339,7 @@ mod tests {
             usage_display: None,
             run_secs: 0,
         };
-        let json = render_card(&card, "feishu:ou_t");
+        let json = render_card(&card, "feishu:ou_t", None);
         assert!(json.contains("hello"));
         assert!(json.contains("schema"));
         assert!(json.contains("思考中"), "分阶段 footer: {json}");
@@ -1296,7 +1367,7 @@ mod tests {
                 run_secs: 0,
             };
             assert!(
-                render_card(&card, "feishu:ou_t").contains(mark),
+                render_card(&card, "feishu:ou_t", None).contains(mark),
                 "{phase:?} → {mark}"
             );
         }
@@ -1313,7 +1384,7 @@ mod tests {
             usage_display: None,
             run_secs: 0,
         };
-        let json = render_card(&card, "feishu:ou_t");
+        let json = render_card(&card, "feishu:ou_t", None);
         assert!(json.contains("done"));
         assert!(json.contains("Read"));
         assert!(json.contains("✅ 已完成"));
@@ -1340,7 +1411,7 @@ mod tests {
             usage_display: None,
             run_secs: 0,
         };
-        let json = render_card(&card, "feishu:ou_t");
+        let json = render_card(&card, "feishu:ou_t", None);
         assert!(json.contains("cmd-0"), "终态面板含最早工具: {json}");
         assert!(json.contains("cmd-9"), "终态面板含最新工具: {json}");
         assert!(!json.contains("前面还有"), "面板不截断: {json}");
@@ -1372,7 +1443,7 @@ mod tests {
             usage_display: None,
             run_secs: 0,
         };
-        let json = render_card(&card, "feishu:ou_t");
+        let json = render_card(&card, "feishu:ou_t", None);
         assert!(json.contains("boom"));
         assert!(json.contains("❌ 出错"), "终态 footer: {json}");
     }
@@ -1593,7 +1664,7 @@ mod tests {
             usage_display: None,
             run_secs: 0,
         };
-        let json = render_card(&card, "feishu:ou_t");
+        let json = render_card(&card, "feishu:ou_t", None);
         assert!(
             json.contains("✍️ 输出中… · 📥 排队 1 条"),
             "降级卡组合: {json}"
@@ -1754,7 +1825,7 @@ mod tests {
             usage_display: None,
             run_secs: 0,
         };
-        let json = render_card(&running, "feishu:ou_t");
+        let json = render_card(&running, "feishu:ou_t", None);
         assert!(json.contains("⏹ 终止"), "Running 降级卡带终止按钮: {json}");
         let done = OutboundCard {
             text: "ok".into(),
@@ -1765,7 +1836,7 @@ mod tests {
             usage_display: None,
             run_secs: 0,
         };
-        let json2 = render_card(&done, "feishu:ou_t");
+        let json2 = render_card(&done, "feishu:ou_t", None);
         assert!(!json2.contains("⏹ 终止"), "终态不带终止按钮: {json2}");
     }
 
@@ -2064,7 +2135,7 @@ mod tests {
             usage_display: None,
             run_secs: 0,
         };
-        let json = render_card(&card, "feishu:ou_t");
+        let json = render_card(&card, "feishu:ou_t", None);
         assert!(
             json.contains("🧠 已接收任务，正在处理"),
             "降级卡空正文状态语: {json}"
@@ -2091,7 +2162,7 @@ mod tests {
     /// 流式初始卡不加 header（首帧后无法改）。
     #[test]
     fn terminal_header_template_colors() {
-        let done = render_card(&card_of(CardTerminal::Done, vec![]), "feishu:ou_t");
+        let done = render_card(&card_of(CardTerminal::Done, vec![]), "feishu:ou_t", None);
         assert!(
             done.contains("\"template\":\"green\"") && done.contains("✅ 已完成"),
             "Done header: {done}"
@@ -2099,6 +2170,7 @@ mod tests {
         let err = render_card(
             &card_of(CardTerminal::Error("boom".into()), vec![]),
             "feishu:ou_t",
+            None,
         );
         assert!(
             err.contains("\"template\":\"red\"") && err.contains("❌ 出错"),
@@ -2107,12 +2179,13 @@ mod tests {
         let stop = render_card(
             &card_of(CardTerminal::Error("已中断".into()), vec![]),
             "feishu:ou_t",
+            None,
         );
         assert!(
             stop.contains("\"template\":\"grey\"") && stop.contains("⏹ 已中断"),
             "中断 header: {stop}"
         );
-        let running = render_card(&card_of(CardTerminal::Running, vec![]), "feishu:ou_t");
+        let running = render_card(&card_of(CardTerminal::Running, vec![]), "feishu:ou_t", None);
         assert!(
             !running.contains("\"header\""),
             "Running 不加 header: {running}"
@@ -2193,7 +2266,7 @@ mod tests {
             tool("Bash", "b", true),
             tool("Read", "c", true),
         ];
-        let json = render_card(&card_of(CardTerminal::Done, tools), "feishu:ou_t");
+        let json = render_card(&card_of(CardTerminal::Done, tools), "feishu:ou_t", None);
         assert!(json.contains("\"tag\":\"tag\""), "tag 组件: {json}");
         assert!(
             json.contains("Bash×2") && json.contains("Read×1"),
@@ -2203,6 +2276,7 @@ mod tests {
         let running = render_card(
             &card_of(CardTerminal::Running, vec![tool("Bash", "a", false)]),
             "feishu:ou_t",
+            None,
         );
         assert!(
             !running.contains("\"tag\":\"tag\""),
@@ -2357,6 +2431,7 @@ mod tests {
         let json = render_card(
             &card_of(CardTerminal::Done, vec![tool("Bash", "a", true)]),
             "feishu:ou_t",
+            None,
         );
         assert!(json.contains("\"tag\":\"hr\""), "真 hr 组件: {json}");
         assert!(json.contains("🔧 工具轨迹（1）"), "面板标题: {json}");
@@ -2368,6 +2443,7 @@ mod tests {
         let done = render_card(
             &card_of(CardTerminal::Done, vec![tool("B", "a", true)]),
             "c",
+            None,
         );
         assert!(done.contains("\"color\":\"grey\""), "Done grey: {done}");
         let err = render_card(
@@ -2376,16 +2452,115 @@ mod tests {
                 vec![tool("B", "a", true)],
             ),
             "c",
+            None,
         );
         assert!(err.contains("\"color\":\"red\""), "Error red: {err}");
         let running = render_card(
             &card_of(CardTerminal::Running, vec![tool("B", "a", false)]),
             "c",
+            None,
         );
         assert!(
             running.contains("\"color\":\"blue\""),
             "Running blue: {running}"
         );
+    }
+
+    /// Wave B-5：群 conv 卡片的「发起者」标注行——群形态输出 <at> 标签行，
+    /// 私聊/缺 sender 不加；初始卡（managed）与整卡（render_card）同款。
+    #[test]
+    fn sender_anchor_line_group_only() {
+        // 群 + sender：at 标签行。
+        let line = sender_anchor_line(Some("ou_owner"), true).expect("群应有标注行");
+        let s = line.to_string();
+        // JSON 序列化后引号被转义，断言拆开查（<at id= 与 open_id 值）。
+        assert!(
+            s.contains("<at id=") && s.contains("ou_owner"),
+            "at 标签: {s}"
+        );
+        assert!(s.contains("发起的任务"), "文案: {s}");
+        // 私聊 / 无 sender：不加。
+        assert!(
+            sender_anchor_line(Some("ou_owner"), false).is_none(),
+            "私聊不加"
+        );
+        assert!(sender_anchor_line(None, true).is_none(), "缺 sender 不加");
+        assert!(
+            sender_anchor_line(Some(""), true).is_none(),
+            "空 sender 不加"
+        );
+        // 初始卡（群）含标注行且在 md_body 之前；（私聊）不含。
+        let init_group = render_stream_init_card("feishu:oc_g", Some("ou_owner"));
+        assert!(
+            init_group.contains("<at id=") && init_group.contains("ou_owner"),
+            "{init_group}"
+        );
+        assert!(
+            init_group.find("<at").unwrap() < init_group.find("md_body").unwrap(),
+            "发起者行在正文组件之前"
+        );
+        let init_p2p = render_stream_init_card("feishu:ou_t", Some("ou_t"));
+        assert!(!init_p2p.contains("<at"), "私聊初始卡不加: {init_p2p}");
+        // 整卡路径（render_card）同款：群含、私聊不含。
+        let card = OutboundCard {
+            text: "x".into(),
+            tool_calls: vec![],
+            phase: CardPhase::Thinking,
+            queued_hint: None,
+            terminal: CardTerminal::Done,
+            usage_display: None,
+            run_secs: 10,
+        };
+        let g = render_card(&card, "feishu:oc_g", Some("ou_owner"));
+        assert!(g.contains("<at id=") && g.contains("ou_owner"), "{g}");
+        assert!(!render_card(&card, "feishu:ou_t", Some("ou_t")).contains("<at"));
+    }
+
+    /// Wave B-3：成功终态 footer 带总耗时——`✅ 已完成 · 30m · $0.012`；
+    /// 无 usage 省成本段；时长格式化分档。
+    #[test]
+    fn terminal_done_footer_carries_run_len() {
+        assert_eq!(
+            terminal_done_footer(1800, Some("$0.012")),
+            "✅ 已完成 · 30m · $0.012"
+        );
+        assert_eq!(terminal_done_footer(42, None), "✅ 已完成 · 42s");
+        assert_eq!(terminal_done_footer(0, None), "✅ 已完成 · 0s");
+        assert_eq!(format_run_len(750), "12m");
+        assert_eq!(format_run_len(3661), "1h01m");
+        assert_eq!(format_run_len(90000), "1d1h");
+        // 整卡渲染带出该 footer。
+        let card = OutboundCard {
+            text: "x".into(),
+            tool_calls: vec![],
+            phase: CardPhase::Thinking,
+            queued_hint: None,
+            terminal: CardTerminal::Done,
+            usage_display: Some("$0.5".into()),
+            run_secs: 1800,
+        };
+        let json = render_card(&card, "feishu:ou_t", None);
+        assert!(json.contains("✅ 已完成 · 30m · $0.5"), "footer: {json}");
+    }
+
+    /// Wave B-11：失败终态卡补「🩺 自检」按钮——value 编码 /doctor 命令（回调
+    /// 走与手打相同的鉴权/分派）；成功/Running 终态不加。
+    #[test]
+    fn error_terminal_card_has_doctor_button() {
+        let err = render_card(
+            &card_of(CardTerminal::Error("boom".into()), vec![]),
+            "feishu:ou_t",
+            None,
+        );
+        assert!(err.contains("/doctor"), "失败卡带 /doctor 按钮: {err}");
+        assert!(
+            err.contains("\"imagent_cmd\":\"/doctor\"") || err.contains("imagent_cmd"),
+            "命令按钮 value: {err}"
+        );
+        let done = render_card(&card_of(CardTerminal::Done, vec![]), "feishu:ou_t", None);
+        assert!(!done.contains("/doctor"), "成功卡不带: {done}");
+        let running = render_card(&card_of(CardTerminal::Running, vec![]), "feishu:ou_t", None);
+        assert!(!running.contains("/doctor"), "Running 卡不带: {running}");
     }
 
     /// ⑩ /help 分组元素化：组标题独立成 markdown 元素（heading-large，支持性

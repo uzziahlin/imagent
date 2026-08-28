@@ -650,6 +650,8 @@ async fn main() -> Result<()> {
                 config.stranger_p2p_hint,
                 config.reply_mode,
             );
+            // Wave B-4：quiet_hours 原文注入（/config 展示用；降级判定在平台侧）。
+            dispatcher.set_quiet_hours(config.quiet_hours.clone());
             // 审批集：ask 模式下仅清单内工具过 IM 审批（空 = 全部过审）。
             if !config.approval_tools.is_empty() {
                 tracing::info!(
@@ -1047,6 +1049,7 @@ async fn build_platform(
             // P6-1：群消息 @bot 过滤策略（feishu_require_mention_in_group，默认 true）；
             // message_max_len 三平台生效（飞书侧与 28000 协议上限取 min）；
             // permission_ask_timeout_secs 透传（审批卡倒计时文案与实际超时一致）。
+            // Wave B-4/B-8：quiet_hours（buzz 免打扰降级窗口）与话题免 @ 窗口透传。
             Ok(Arc::new(imagent_feishu::FeishuPlatform::new(
                 app_id,
                 app_secret,
@@ -1054,6 +1057,8 @@ async fn build_platform(
                 config.feishu_require_mention_in_group,
                 config.message_max_len,
                 config.permission_ask_timeout_secs,
+                config.quiet_hours_parsed,
+                config.feishu_thread_active_window_secs,
             )?))
         }
         _ => {

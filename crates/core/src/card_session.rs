@@ -240,12 +240,15 @@ impl CardSession {
             tool_calls: self.tools.clone(),
             phase: self.phase,
             queued_hint: queued,
-            // 运行时长（10s 量化）：仅 Running 态有意义——footer 去重缓存按内容
-            // 比对，量化后 10s 内 footer 不变、不触发 patch（防高频更新）。
+            // 运行时长：Running 态 10s 量化（footer 去重缓存按内容比对，量化后
+            // 10s 内 footer 不变、不触发 patch，防高频更新）；**终态写全量秒数**
+            // （Wave B-3：`✅ 已完成 · 30m · $0.012` 的总耗时来源——量化/清零都会
+            // 让用户看到的完成时长失真）。终态 footer 不走去重缓存（每次终态只
+            // patch 一次），全量值无刷屏风险。
             run_secs: if matches!(terminal, CardTerminal::Running) {
                 (self.started.elapsed().as_secs() / 10) * 10
             } else {
-                0
+                self.started.elapsed().as_secs()
             },
             usage_display: self.usage_display.clone(),
             terminal: terminal.clone(),
@@ -521,6 +524,8 @@ mod tests {
         name: &'static str,
         update_fails: bool,
         updates: StdMutex<Vec<(String, String)>>, // (handle, text)
+        /// Wave B-3：每次 update 的 run_secs 快照（终态总耗时断言用）。
+        run_secs_seen: StdMutex<Vec<(String, u64)>>, // (terminal 名, run_secs)
     }
 
     #[async_trait::async_trait]
@@ -566,6 +571,15 @@ mod tests {
                     "update_card 失败（模拟）".into(),
                 ));
             }
+            let terminal = match card.terminal {
+                CardTerminal::Running => "running",
+                CardTerminal::Done => "done",
+                CardTerminal::Error(_) => "error",
+            };
+            self.run_secs_seen
+                .lock()
+                .unwrap()
+                .push((terminal.to_string(), card.run_secs));
             self.updates
                 .lock()
                 .unwrap()
@@ -588,6 +602,7 @@ mod tests {
             name: "mock-rec",
             update_fails: false,
             updates: StdMutex::new(Vec::new()),
+            run_secs_seen: StdMutex::new(Vec::new()),
         };
         let conv = ConvId("c1".into());
         let hint = ReplyHint::None;
@@ -612,6 +627,7 @@ mod tests {
             name: "mock-rec",
             update_fails: true,
             updates: StdMutex::new(Vec::new()),
+            run_secs_seen: StdMutex::new(Vec::new()),
         };
         let conv = ConvId("c1".into());
         let hint = ReplyHint::None;
@@ -641,6 +657,7 @@ mod tests {
             name: "mock-rec",
             update_fails: false,
             updates: StdMutex::new(Vec::new()),
+            run_secs_seen: StdMutex::new(Vec::new()),
         };
         sweep_live_cards(&store, &plat).await;
         let updates = plat.updates.lock().unwrap().clone();
@@ -769,6 +786,42 @@ mod tests {
         rm_db(&db);
     }
 
+    /// Wave B-3：终态卡 run_secs 写全量（非 10s 量化、非清零）——把 started 回拨
+    /// 75 秒后 finalize，断言终态帧携带 75（Running 帧仍走量化路径）。
+    #[tokio::test]
+    async fn terminal_card_carries_full_run_secs() {
+        let (store, db) = tmp_store("terminal-secs").await;
+        let plat = RecordingCardPlatform {
+            name: "mock-rec",
+            update_fails: false,
+            updates: StdMutex::new(Vec::new()),
+            run_secs_seen: StdMutex::new(Vec::new()),
+        };
+        let conv = ConvId("c1".into());
+        let hint = ReplyHint::None;
+        let mut s = CardSession::new(store.clone(), conv.clone(), plat.name(), Default::default());
+        // 首帧（Running）：立即发卡拿句柄。
+        s.append_text("流式片段", &conv, &hint, &plat).await;
+        // 回拨 75 秒（同文件测试可访问私有字段；无需真实等待）。
+        s.started = Instant::now() - Duration::from_secs(75);
+        s.finalize(Some("完成"), &[], CardTerminal::Done, &conv, &hint, &plat)
+            .await;
+        let seen = plat.run_secs_seen.lock().unwrap().clone();
+        assert!(
+            seen.contains(&("done".to_string(), 75)),
+            "终态帧应携带全量 75s: {seen:?}"
+        );
+        assert!(
+            !seen.contains(&("done".to_string(), 70)),
+            "终态不应是 10s 量化值: {seen:?}"
+        );
+        assert!(
+            !seen.contains(&("done".to_string(), 0)),
+            "终态不应清零: {seen:?}"
+        );
+        rm_db(&db);
+    }
+
     /// 尾帧 flush：节流窗口内被跳过的 patch 会**睡到窗口到期补发**——最后一个
     /// 事件（如末个 ToolResult 的 ✅）不再被静默丢弃。真实时钟跑（窗口 500ms，
     /// 测试耗时约半秒）。
@@ -779,6 +832,7 @@ mod tests {
             name: "mock-rec",
             update_fails: false,
             updates: StdMutex::new(Vec::new()),
+            run_secs_seen: StdMutex::new(Vec::new()),
         };
         let conv = ConvId("c1".into());
         let hint = ReplyHint::None;

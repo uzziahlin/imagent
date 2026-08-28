@@ -165,6 +165,22 @@ pub trait Platform: Send + Sync {
         .await
     }
 
+    /// 发送**加急（buzz）**文本：用于需要用户及时处理的提醒（审批过半催办、
+    /// 长任务完成强提醒）。支持的平台（飞书 text 消息体 `buzz` 字段）以加急
+    /// 形态送达；默认实现回退普通 `send_text`——不支持 buzz 的平台提醒内容
+    /// 仍然送达，只是不振铃。免打扰时段（`quiet_hours`）的降级由实现侧处理
+    /// （只影响加急形态，不影响内容）。
+    async fn send_urgent_text(&self, conv: &ConvId, text: &str, hint: &ReplyHint) -> Result<()> {
+        self.send_text(conv, text, hint).await
+    }
+
+    /// 平台是否支持加急（buzz）文本。core 据此决定「长任务完成强提醒」是否
+    /// 发送——普通回复已含全部信息的场景，不支持 buzz 的平台再发一条普通文本
+    /// 只是重复噪音，故此类强提醒对不支持的平台整体 no-op（默认 false）。
+    fn supports_urgent_text(&self) -> bool {
+        false
+    }
+
     /// P6 遗留补齐：查询「群消息须 @bot」当前策略（`/config` 展示用）。
     /// 默认 None（平台无群聊 @ 概念或未实现——ilink 无群、wecom 群消息不收）。
     async fn require_mention_in_group(&self) -> Option<bool> {

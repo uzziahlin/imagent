@@ -282,9 +282,10 @@ pub struct OutboundCard {
     /// None = 无排队）。由 CardSession 每次 patch 从 dispatcher 的排队状态拉取
     /// （活动期随 chunk 刷新）；平台在 Running footer 追加展示，终态忽略。
     pub queued_hint: Option<String>,
-    /// 本轮运行的时长（秒，10s 粒度量化；Running 态由 CardSession 从轮次起点
-    /// 计算，终态为 0）。平台在 Running footer 追加展示（`🧠 思考中… · 30s`），
-    /// 量化保证 footer 去重缓存命中（10s 内内容不变不 patch）。
+    /// 本轮运行的时长（秒；Running 态 10s 粒度量化，终态为**全量秒数**——
+    /// Wave B-3：终态 footer 展示总耗时）。Running 态由 CardSession 从轮次起点
+    /// 计算；量化保证 footer 去重缓存命中（10s 内内容不变不 patch）。终态不做
+    /// 量化（每次终态只 patch 一次，无刷屏风险），平台据此拼「✅ 已完成 · 30m」。
     pub run_secs: u64,
     /// 本轮成本摘要（UsageStats.display()，如 `$0.012` 或 `in 1.2k · out 3.4k tokens`）；
     /// None = backend 未产出 usage。终态 footer 追加展示（`✅ 已完成 · $0.012`）。

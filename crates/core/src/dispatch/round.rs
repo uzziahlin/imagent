@@ -22,6 +22,10 @@ impl Dispatcher {
         let conv = msg.conv_id.clone();
         let hint = msg.reply_hint.clone();
         let base_prompt = msg.text.clone().unwrap_or_default();
+        // Wave B-9：断档续接判定（base_prompt 被 move 进 prompt 载体前先算好）：
+        // 无可续接会话且 prompt 命中续接词表（继续/接着/然后…，≤4 字）时，
+        // 最终回复前置断档提示（见下方 reply 组装处）。
+        let continuation_orphan = is_continuation_prompt(base_prompt.trim());
 
         // best-effort typing 指示（agent 处理中）；失败仅 log，不阻塞后续。
         let _ = self.platform.send_typing(&conv, &hint).await;
@@ -88,9 +92,33 @@ impl Dispatcher {
 
         // 流式通道 + 后台执行。existing 移入 spawn（避免借用跨 'static）。
         let run_started = Instant::now();
+        // Wave B-2：本轮起点的询问登记计数快照——结束时对比，判定「本轮是否
+        // 发生过审批/询问」（完成强提醒触发条件）。
+        let asks_at_start = self.router.ask_count(&conv.0).await;
         let (tx, mut rx) = mpsc::channel::<AgentChunk>(32);
         let backend = self.backend.clone();
         let workdir = self.resolve_workdir(&conv.0).await;
+        // Wave B-10：workdir 失效前置检查——目录不存在（被删/移动/挂载未就绪）
+        // 直接回可读错误、不启动 agent：backend 在坏 cwd 上只会产出难解的
+        // spawn 失败（且部分 CLI 会静默落到别的目录）。
+        if !workdir.is_dir() {
+            warn!(
+                target: "imagent::core",
+                conv_id = %conv.0,
+                workdir = %workdir.display(),
+                "工作目录不存在，本轮不启动 agent"
+            );
+            self.reply(
+                &conv,
+                &format!(
+                    "⚠️ 工作目录 {} 不存在，本轮未执行。请 /cd 切换到有效目录，或联系管理员检查配置。",
+                    workdir.display()
+                ),
+                &hint,
+            )
+            .await;
+            return;
+        }
         let tools = self.allowed_tools.read().clone();
         let prompt_owned = prompt.clone();
         let conv_id_owned = conv.0.clone();
@@ -183,8 +211,9 @@ impl Dispatcher {
         // P5-10：非卡片平台已实时推送的 Text 前缀——最终回复只补差量，防重发。
         let mut streamed_text = String::new();
         loop {
-            // P4-6：COT 档位每轮读取（/config 热改对下一轮生效）。
-            let cot = *self.cot_detail.read();
+            // P4-6：COT 档位每轮读取（/config 热改对下一轮生效；Wave B-7：
+            // per-conv 覆盖优先，/config cot 白名单用户可改自己会话）。
+            let cot = self.cot_for(&conv.0).await;
             let idle_timeout = self.idle_timeout_for(&conv.0).await;
             let chunk = if idle_timeout.is_zero() {
                 match rx.recv().await {
@@ -437,22 +466,46 @@ impl Dispatcher {
             "（任务已完成，未返回文本）".to_string()
         };
         // P5-10：非卡片平台已实时推送过 Text 增量——最终回复只补差量，防
-        // codex/gemini/ACP（中间 Text 流式 + Final 全量）整段重发两遍。final 与
+        // 重发两遍（codex/gemini/ACP 中间 Text 流式 + Final 全量）。final 与
         // 已推前缀不对齐（后端语义异常）时保留全量：宁可偶发重复，不可丢内容。
         if card.is_none() && !streamed_text.is_empty() {
             if let Some(rest) = reply.strip_prefix(streamed_text.as_str()) {
                 reply = rest.to_string();
             }
         }
+        // Wave B-9：断档续接提示——无可续接会话但 prompt 是「继续」类词时前置
+        // 说明（可能已被 /new 重置或切换后端；/resume 可找回历史）。existing
+        // 已 move 进 spawn，用传入快照 existing_sid 判定。
+        if continuation_orphan && existing_sid.is_none() {
+            reply = format!(
+                "（当前无可续接会话，可能已重置或切换后端；/resume 可恢复历史）\n\n{reply}"
+            );
+        }
         // 工具调用摘要：仅无卡片平台（ilink/wecom）追加文本摘要；卡片平台由 render_card
         // 的折叠面板统一渲染，避免正文与卡片块重复展示工具调用。
         if !tool_calls.is_empty() && card.is_none() && (final_text_is_present || outcome_has_final)
         {
-            reply.push_str(&format_tool_summary(&tool_calls, *self.cot_detail.read()));
+            reply.push_str(&format_tool_summary(
+                &tool_calls,
+                self.cot_for(&conv.0).await,
+            ));
         }
         // R1：backend 标记非正常终止（崩溃等）时，回复前置告警，让用户感知是部分输出而非正常结果。
         if !outcome.terminal {
             reply = format!("⚠️ agent 异常退出，以下为部分输出：\n\n{reply}");
+        }
+        // Wave B-9：上下文水位提示——本轮输入 token 超过 80k 时提醒压缩。
+        // 取舍：OutboundCard 的 footer 无自由文本通道，提示追加在回复正文末尾
+        //（卡片/纯文本两条路径都可见，语义同为「完成后给用户的建议」）。
+        if outcome
+            .usage
+            .as_ref()
+            .is_some_and(|u| u.input_tokens > 80_000)
+        {
+            let n = outcome.usage.as_ref().map(|u| u.input_tokens).unwrap_or(0);
+            reply.push_str(&format!(
+                "\n\n📊 本轮输入约 {n} tokens，上下文较大，建议 /compact。"
+            ));
         }
         if let Some(c) = card.as_mut() {
             let terminal = if outcome.terminal {
@@ -474,6 +527,29 @@ impl Dispatcher {
         } else if !reply.is_empty() {
             // P5-10：流式已推完且无差量、无工具摘要时不发空消息。
             self.reply(&conv, &reply, &hint).await;
+        }
+
+        // Wave B-2：长任务/含询问轮次的完成强提醒——运行超 5 分钟或本轮发生过
+        // 审批/询问时，终态额外发一条 buzz 短文本（移动端推送只露首行，短文本让
+        // 「完成了」一眼可见）。仅支持 buzz 的平台发送（supports_urgent_text）——
+        // 其余平台普通回复已含全部信息，再发一条只是重复噪音。best-effort。
+        let elapsed = run_started.elapsed();
+        let asks_delta = self
+            .router
+            .ask_count(&conv.0)
+            .await
+            .saturating_sub(asks_at_start);
+        if outcome.terminal
+            && should_buzz_done(elapsed, asks_delta)
+            && self.platform.supports_urgent_text()
+        {
+            let text = task_done_buzz_text(
+                elapsed,
+                outcome.usage.as_ref().map(|u| u.display()).as_deref(),
+            );
+            if let Err(e) = self.platform.send_urgent_text(&conv, &text, &hint).await {
+                warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "任务完成强提醒发送失败（不影响主流程）");
+            }
         }
 
         // agent 产图回传：run 结束文件已写完；存在才发，单个失败仅 warn 不影响其余。

@@ -153,6 +153,103 @@ fn backend_failure_reply(backend_name: &str) -> String {
     )
 }
 
+/// Wave B-1：审批等待过半的加急催办文案（纯函数，便于单测）。
+/// 剩余分钟向上取整（剩 30 秒显示「剩 1 分钟」，宁多勿少）。
+fn approval_buzz_text(tool_name: &str, remaining: Duration) -> String {
+    let mins = remaining.as_secs().div_ceil(60).max(1);
+    format!("⏰ 审批即将超时（剩 {mins} 分钟）：{tool_name}——回复 y/n 即可")
+}
+
+/// Wave B-1：审批等待出口（`wait_reply_with_buzz` 的结果，与原 timeout 包裹的
+/// 三分支一一对应）。
+#[derive(Debug)]
+enum AskWaitOutcome {
+    /// 用户已回复（allow/deny/always）。
+    Replied(crate::permission::PermissionReply),
+    /// receiver 被 drop（等待方已离开）。
+    Dropped,
+    /// 等满预算超时（fail-closed deny 由调用方落地）。
+    TimedOut,
+}
+
+/// Wave B-1：等待审批回复——等待过半（elapsed ≥ timeout/2）仍未决时，向询问
+/// 所在会话发一条 buzz 加急催办（**只发一次**），随后继续等剩余时间。
+///
+/// 取舍：催办发到询问所在 conv（群 conv 即发群里，询问卡本就贴在那）；
+/// 分两段 `timeout` 而非 select 环路，结构上保证「最多提醒一次」。
+async fn wait_reply_with_buzz(
+    rx: tokio::sync::oneshot::Receiver<crate::permission::PermissionReply>,
+    conv: &ConvId,
+    tool_name: &str,
+    timeout: Duration,
+    platform: &dyn Platform,
+) -> AskWaitOutcome {
+    let mut rx = rx;
+    let started = Instant::now();
+    let half = timeout / 2;
+    // 前半程：oneshot Receiver 是 Unpin，按引用等待（未决时 rx 仍可继续用）。
+    match tokio::time::timeout(half, &mut rx).await {
+        Ok(Ok(r)) => AskWaitOutcome::Replied(r),
+        Ok(Err(_)) => AskWaitOutcome::Dropped,
+        Err(_) => {
+            // 过半未决：发一次加急催办（best-effort，失败仅 log 不影响等待）。
+            let remaining = timeout.saturating_sub(started.elapsed());
+            let text = approval_buzz_text(tool_name, remaining);
+            if let Err(e) = platform
+                .send_urgent_text(conv, &text, &ReplyHint::None)
+                .await
+            {
+                tracing::warn!(
+                    target: "imagent::core",
+                    conv_id = %conv.0,
+                    error = %e,
+                    "审批过半催办发送失败（不影响等待）"
+                );
+            }
+            // 继续等剩余时间（从轮次起点算，催办耗时不再挤占用户预算）。
+            match tokio::time::timeout(timeout.saturating_sub(started.elapsed()), rx).await {
+                Ok(Ok(r)) => AskWaitOutcome::Replied(r),
+                Ok(Err(_)) => AskWaitOutcome::Dropped,
+                Err(_) => AskWaitOutcome::TimedOut,
+            }
+        }
+    }
+}
+
+/// Wave B-9：断档续接词表——「继续」类极短 prompt 命中且当前无可续接会话时，
+/// 回复前置断档提示（用户预期续接旧会话、实际开了新会话，明确告知优于装正常）。
+/// 词条精确全字匹配（trim + 小写）——中文条目 ≤4 字、英文 go on/continue 略长，
+/// 全字匹配本身即白名单，无误伤面（长句不会命中）。
+fn is_continuation_prompt(text: &str) -> bool {
+    const WORDS: &[&str] = &["继续", "接着", "然后", "go on", "continue"];
+    let t = text.trim();
+    WORDS.contains(&t.to_ascii_lowercase().as_str())
+}
+
+/// Wave B-2：长任务完成强提醒文案（纯函数，便于单测）：
+/// `✅ 任务完成 · 12m30s · $0.012`（usage 缺失时省略成本段）。
+fn task_done_buzz_text(elapsed: Duration, usage_display: Option<&str>) -> String {
+    let secs = elapsed.as_secs();
+    let run = if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    };
+    match usage_display {
+        Some(u) => format!("✅ 任务完成 · {run} · {u}"),
+        None => format!("✅ 任务完成 · {run}"),
+    }
+}
+
+/// Wave B-2：完成强提醒触发条件（纯函数，便于单测）：运行超 5 分钟，或本轮
+/// 发生过审批/询问（ask 计数有增量）——两者都意味着用户等过一段不确定的
+/// 静默期，值得一条加急通知。
+fn should_buzz_done(elapsed: Duration, asks_delta: u64) -> bool {
+    elapsed > Duration::from_secs(300) || asks_delta > 0
+}
+
 /// epoch 秒 → 相对时间（`/resume` 列表用）：`42秒前` / `5分钟前` / `3小时前` /
 /// `2天前`；超 7 天仍用「N天前」（S-11：不再回退裸 epoch 时间戳——对用户无意义）。
 fn format_rel_ts(ts: i64) -> String {
@@ -350,6 +447,13 @@ pub struct Dispatcher {
     /// P6-9：per-conv 空闲看门狗覆盖（`/timeout`）——`Some(ZERO)` = 本会话关闭；
     /// 无条目 = 跟随全局 `agent_idle_timeout`。进程内（会话级旋钮，不落盘）。
     idle_overrides: Mutex<HashMap<String, Duration>>,
+    /// Wave B-7：per-conv COT 档位覆盖（`/config cot`，白名单用户可改自己会话）。
+    /// 无条目 = 跟随全局 `cot_detail`（`/config cot_detail`，admin）。进程内
+    /// （会话级偏好，不落盘——与 idle_overrides 同姿态）。
+    cot_overrides: Mutex<HashMap<String, CotDetail>>,
+    /// Wave B-4：quiet_hours 原文（config 注入，仅 /config 展示用——降级判定在
+    /// 各平台实现侧，core 不重复实现时区逻辑）。
+    quiet_hours_raw: RwLock<Option<String>>,
     /// P7-A3：陌生人被 @ 提示开关（config 注入，set_prefs 热设；共享句柄）。
     stranger_mention_hint: RwLock<bool>,
     /// 私聊陌生人引导开关（config 注入，默认 true——私聊是主动来找 bot 的，
@@ -447,6 +551,8 @@ impl Dispatcher {
             resume_cache: Mutex::new(HashMap::new()),
             pending_hint_last: Mutex::new(HashMap::new()),
             idle_overrides: Mutex::new(HashMap::new()),
+            cot_overrides: Mutex::new(HashMap::new()),
+            quiet_hours_raw: RwLock::new(None),
             stranger_mention_hint: RwLock::new(false),
             stranger_p2p_hint: RwLock::new(true),
             reply_mode: Arc::new(RwLock::new(ReplyMode::Card)),
@@ -485,12 +591,27 @@ impl Dispatcher {
         *self.reply_mode.write() = reply_mode;
     }
 
+    /// Wave B-4：quiet_hours 原文注入（main 启动时调一次；仅 /config 展示用，
+    /// 降级判定在平台实现侧——core 不做时区换算）。
+    pub fn set_quiet_hours(&self, raw: Option<String>) {
+        *self.quiet_hours_raw.write() = raw;
+    }
+
     /// P6-9：该会话的空闲看门狗——`/timeout` 覆盖优先（ZERO=关），否则全局值。
     async fn idle_timeout_for(&self, conv: &str) -> Duration {
         if let Some(d) = self.idle_overrides.lock().await.get(conv) {
             return *d;
         }
         *self.agent_idle_timeout.read()
+    }
+
+    /// Wave B-7：该会话的 COT 档位——`/config cot` 覆盖优先，否则全局值
+    /// （`/config cot_detail`，admin）。每轮读取，热改对下一轮生效。
+    async fn cot_for(&self, conv: &str) -> CotDetail {
+        if let Some(d) = self.cot_overrides.lock().await.get(conv) {
+            return *d;
+        }
+        *self.cot_detail.read()
     }
 
     /// 调用者是否为管理员（可 /allow /config /perm /admin）。S2：admin_senders
@@ -611,10 +732,13 @@ impl Dispatcher {
         let router = self.router.clone();
         let approval_tools = self.approval_tools.clone();
         let timeout = self.permission_ask_timeout;
+        // Wave B-11：超时分支落 timeout 审计（审批统计聚合数据源）。
+        let store = self.store.clone();
         Arc::new(move |ask: crate::backend::ImPermissionAsk| {
             let platform = platform.clone();
             let router = router.clone();
             let approval_tools = approval_tools.clone();
+            let store = store.clone();
             Box::pin(async move {
                 // 审批集外直接放行（空集 = 全部过审），与 socket 路径口径一致。
                 if !crate::permission::needs_approval(&approval_tools.read(), &ask.tool_name) {
@@ -699,15 +823,19 @@ impl Dispatcher {
                     .set_card_msg_id(&ask.conv_id, &ask.request_id, card_msg_id)
                     .await;
                 // S-3：独立预算 permission_ask_timeout；超时 deny（fail-closed）。
-                match tokio::time::timeout(timeout, rx).await {
-                    Ok(Ok(r)) => {
+                // Wave B-1：等待过半仍未决时先发一条 buzz 加急催办（只一次），
+                // 再继续等剩余时间（见 wait_reply_with_buzz）。
+                match wait_reply_with_buzz(rx, &conv, &ask.tool_name, timeout, platform.as_ref())
+                    .await
+                {
+                    AskWaitOutcome::Replied(r) => {
                         METRICS
                             .permission_decisions
                             .with_label_values(&[if r.allow { "allow" } else { "deny" }])
                             .inc();
                         r.allow
                     }
-                    Ok(Err(_)) => {
+                    AskWaitOutcome::Dropped => {
                         router.cancel(&ask.conv_id, &ask.request_id).await;
                         METRICS
                             .permission_decisions
@@ -715,7 +843,7 @@ impl Dispatcher {
                             .inc();
                         false
                     }
-                    Err(_) => {
+                    AskWaitOutcome::TimedOut => {
                         router.cancel(&ask.conv_id, &ask.request_id).await;
                         // 超时自动拒绝后收敛滞留询问卡（best-effort）。
                         if let Err(e) = platform.cancel_permission_ask(&conv, &ask.request_id).await
@@ -739,6 +867,27 @@ impl Dispatcher {
                             .permission_decisions
                             .with_label_values(&["timeout"])
                             .inc();
+                        // Wave B-11：timeout 也是一次审批结果——落审计（/stats 审批
+                        // 分组的数据源；用户侧无 decision 词可 parse，这里显式记）。
+                        if let Err(e) = store
+                            .append_audit(
+                                "permission_decision",
+                                None,
+                                Some(&ask.conv_id),
+                                Some(&format!(
+                                    "tool={} decision=timeout waited_secs={}",
+                                    ask.tool_name,
+                                    timeout.as_secs()
+                                )),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                target: "imagent::core",
+                                error = %e,
+                                "append_audit(permission_decision timeout) 失败"
+                            );
+                        }
                         false
                     }
                 }
@@ -868,10 +1017,11 @@ impl Dispatcher {
                                     crate::permission::Decision::Deny => "deny",
                                 };
                                 let audit_detail = format!(
-                                    "tool={} decision={} sender={}",
+                                    "tool={} decision={} sender={} waited_secs={}",
                                     decision.tool_name.as_deref().unwrap_or("<unknown>"),
                                     decision_word,
-                                    msg.sender.0
+                                    msg.sender.0,
+                                    decision.waited_secs
                                 );
                                 if let Err(e) = self
                                     .store

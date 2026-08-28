@@ -12,6 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::Instant;
 use tokio::sync::{oneshot, Mutex};
 
 /// 单 conv 允许的 pending 上限：防泄漏（异常路径漏 cancel 时兜底收敛最旧的）。
@@ -216,6 +217,8 @@ struct PendingAsk {
     tool_name: Option<String>,
     /// 来源（D3 看门狗豁免只认 Permission）。
     kind: PendingKind,
+    /// Wave B-11：登记时刻——route 时算 waited_secs（审批响应时长，审计/统计）。
+    created_at: Instant,
     tx: oneshot::Sender<PermissionReply>,
 }
 
@@ -226,6 +229,8 @@ pub struct RoutedDecision {
     pub request_id: String,
     /// 被审批的工具名（Ask 来源 / 未带工具名的 pending 为 None）。
     pub tool_name: Option<String>,
+    /// Wave B-11：从 register 到用户回复的等待秒数（审批响应时长）。
+    pub waited_secs: u64,
 }
 
 /// per-conv × request_id 权限请求路由表（多 pending 并存）。
@@ -235,6 +240,10 @@ pub struct PermissionRouter {
     /// conv 上此工具的后续审批请求直接放行）。进程内状态——`/stop`、`/new`
     /// 时清空（换任务/新会话不应继承旧授权）。
     session_allows: Mutex<HashMap<String, HashSet<String>>>,
+    /// Wave B-2：per-conv 询问登记计数（单调递增，不随 pending 清理回退）。
+    /// 轮次起止各取一次快照对比，即可判定「本轮是否发生过审批/询问」——
+    /// 完成强提醒的触发条件之一。
+    ask_counters: Mutex<HashMap<String, u64>>,
 }
 
 impl PermissionRouter {
@@ -242,7 +251,19 @@ impl PermissionRouter {
         Self {
             pending: Mutex::new(HashMap::new()),
             session_allows: Mutex::new(HashMap::new()),
+            ask_counters: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Wave B-2：该 conv 的累计询问登记数（审批 + ask_via_im 提问；单调递增）。
+    /// 轮次起止快照对比判定「本轮发生过询问」。
+    pub async fn ask_count(&self, conv_id: &str) -> u64 {
+        self.ask_counters
+            .lock()
+            .await
+            .get(conv_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// D-记忆：把工具加入该 conv 的会话级 allow-set（「始终允许」回复落地）。
@@ -341,9 +362,17 @@ impl PermissionRouter {
             card_msg_id,
             tool_name: tool_name.filter(|s| !s.is_empty()).map(|s| s.to_string()),
             kind,
+            created_at: Instant::now(),
             tx,
         };
         let mut map = self.pending.lock().await;
+        // Wave B-2：询问计数（轮次 delta 判定用；与 pending 生命周期解耦，单调）。
+        *self
+            .ask_counters
+            .lock()
+            .await
+            .entry(conv_id.to_string())
+            .or_insert(0) += 1;
         let list = map.entry(conv_id.to_string()).or_default();
         if let Some(i) = list.iter().position(|p| p.request_id == request_id) {
             let old = list.remove(i);
@@ -408,9 +437,12 @@ impl PermissionRouter {
             }
         }
         // send 失败说明 receiver 已 drop（register 方未在等），视为未命中。
+        // Wave B-11：created_at 差值即审批响应时长（waited_secs，审计/统计用）。
+        let waited_secs = hit.created_at.elapsed().as_secs();
         hit.tx.send(reply).ok().map(|_| RoutedDecision {
             request_id: hit.request_id,
             tool_name: hit.tool_name,
+            waited_secs,
         })
     }
 
@@ -931,6 +963,98 @@ mod tests {
         for s in ["year", "帮我看下这个报错", "y?", "嗯看一下", "", "  "] {
             assert!(!is_explicit_reply_word(s), "自由文本不应命中: {s:?}");
         }
+    }
+
+    /// Wave B-11：route 返回 waited_secs（register → 回复的等待时长）。
+    #[tokio::test]
+    async fn route_reports_waited_secs() {
+        let r = PermissionRouter::new();
+        let rx = r
+            .register("c", "req1", None, PendingKind::Permission, Some("Bash"))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let hit = r
+            .route(
+                "c",
+                Some("req1"),
+                None,
+                PermissionReply {
+                    allow: true,
+                    always: false,
+                    message: None,
+                    raw_text: Some("y".into()),
+                },
+            )
+            .await
+            .expect("应命中");
+        assert_eq!(hit.tool_name.as_deref(), Some("Bash"));
+        assert!(
+            hit.waited_secs <= 1,
+            "30ms 等待应折算为 0..=1 秒: {}",
+            hit.waited_secs
+        );
+        // 稍等后再 route 第二条，waited_secs 至少 1 秒（秒粒度）。
+        let rx2 = r
+            .register("c", "req2", None, PendingKind::Permission, None)
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let hit2 = r
+            .route(
+                "c",
+                Some("req2"),
+                None,
+                PermissionReply {
+                    allow: false,
+                    always: false,
+                    message: None,
+                    raw_text: None,
+                },
+            )
+            .await
+            .expect("应命中");
+        assert!(
+            hit2.waited_secs >= 1,
+            "1.1s 等待应 ≥1 秒: {}",
+            hit2.waited_secs
+        );
+        drop(rx);
+        drop(rx2);
+    }
+
+    /// Wave B-2：ask_count 随 register 单调递增（route/cancel 不回退）——轮次
+    /// 起止快照对比即可判定「本轮发生过询问」。
+    #[tokio::test]
+    async fn ask_count_monotonic_per_conv() {
+        let r = PermissionRouter::new();
+        assert_eq!(r.ask_count("c").await, 0);
+        let _rx1 = r
+            .register("c", "a", None, PendingKind::Permission, None)
+            .await;
+        assert_eq!(r.ask_count("c").await, 1);
+        r.cancel("c", "a").await;
+        assert_eq!(
+            r.ask_count("c").await,
+            1,
+            "cancel 清 pending 但计数不回退（单调）"
+        );
+        let _rx2 = r.register("c", "b", None, PendingKind::Ask, None).await;
+        assert_eq!(r.ask_count("c").await, 2);
+        // 其它 conv 不受影响。
+        assert_eq!(r.ask_count("other").await, 0);
+        let _ = r
+            .route(
+                "c",
+                Some("b"),
+                None,
+                PermissionReply {
+                    allow: false,
+                    always: false,
+                    message: None,
+                    raw_text: None,
+                },
+            )
+            .await;
+        assert_eq!(r.ask_count("c").await, 2, "route 不回退计数");
     }
 }
 

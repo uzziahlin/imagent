@@ -34,7 +34,7 @@ mod types;
 pub use auth::Auth;
 pub use backend::{Backend, ImPermissionAsk, ImPermissionHook, PermissionCapability};
 pub use card_session::sweep_live_cards;
-pub use config::{validate_workdir, Config, CotDetail, PermissionMode, ReplyMode};
+pub use config::{validate_workdir, Config, CotDetail, PermissionMode, QuietHours, ReplyMode};
 pub use dedup::Dedup;
 pub use dispatch::{Dispatcher, TaskBudgets};
 pub use error::{CoreError, Result};
