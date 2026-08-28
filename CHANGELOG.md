@@ -6,6 +6,31 @@
 
 （空——下一段变更从这里开始。）
 
+## [1.12.0] — 2026-08-28
+
+> **飞书交互两波（v2）**：Wave A bug/代批安全/快赢/事件接入 12 项；Wave B 触达/群协作身份/恢复引导/运营数据 11 项 + 1 个表单 admin 门槛安全修复。585 tests / 0 failed。
+
+### Fixed
+- **post 富文本链接丢失**：`a` 节点渲染为 `[text](href)`、media/emotion 给占位——「帮我总结这个链接」不再答非所问。
+- **审批卡倒计时硬编码**：接真实 `permission_ask_timeout_secs`（≥90s 显示分钟、否则秒），改配置后提示不再错误。
+- **`message_max_len` 死配置**：飞书/企微分片上限与该配置取 min，三平台生效。
+
+### Security
+- **卡片转发代批封堵**：审批/问题按钮 value 补发起者 sender + ts，发起者校验**全形态生效**（原私聊 conv 跳过——私聊审批卡转发到任意群后，白名单成员可代批高危工具）；过期拒绝（24h）；deny/过期提示同时私聊回点击者（转发群内点击不再无反馈）。存量卡兼容放行。
+- **`/config form` 表单绕过 admin 门槛**：表单提交路径原在 admin 校验之前，白名单用户可热改全局配置（reply_mode/cot_detail/require_mention）——移入门槛之后，非 admin 提交被拒且配置不变。
+
+### Added
+- **触达**：审批等待过半 buzz 加急提醒（只提醒一次，文案带剩余时间与工具名）；长任务（>5min 或发生过询问）完成 buzz 短通知（`✅ 任务完成 · 12m30s · $0.012`）；`quiet_hours` 免打扰时段（时段内加急降级普通消息）；终态 footer 带总时长。
+- **事件接入**：消息撤回 `recalled_v1`（排队消息按 id 移除，在飞任务提示可 /stop）；bot 被移出群 `bot.deleted_v1`（自动摘会话白名单 + 通知管理员）；机器人菜单 `menu_v6` → /help（后台可配「使用说明」菜单）。
+- **群协作身份**：群回复 @ 发起者（初始卡/下沉卡锚点行）；群最终回复引用发起消息（reply API，失败回退新消息）；`/config cot <off|brief|detailed|default>` per-conv COT 档位（白名单可用，无需 admin）；话题免 @ 窗口可配（`feishu_thread_active_window_secs`）。
+- **恢复引导**：「继续」类短指令在无可续接会话时前置提示（/resume 引导）；input>80k 完成回复追加 /compact 建议；workdir 失效启动 warn + 轮次前预检（不存在直接回指引，不启动 agent）；失败终态卡附 /doctor 自检引导。
+- **运营数据**：审批决定审计带等待时长（waited_secs）与超时事件；`/stats` 新增审批分组（近 7 天 N 次 · allow/deny/timeout/always 占比 · 平均响应时长）。
+- **onboarding**：`stranger_p2p_hint`（默认开）——私聊未授权回引导（含 sender id 与 /allow 用法），不再纯静默。
+
+### Changed
+- 合并转发/表情包/视频消息回「暂不支持」提示（原静默丢弃）。
+- 全角斜杠命令容错（`／help` 归一为 `/help`，中文输入法高频误输入不再白烧一轮 agent 调用）。
+
 ## [1.11.1] — 2026-08-28
 
 ### Security
