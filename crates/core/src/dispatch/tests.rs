@@ -363,6 +363,8 @@ fn msg(conv: &str, sender: &str, text: &str) -> InboundMessage {
         mentioned_bot: false,
         ask_req: None,
         reply_to: None,
+        source_msg_id: None,
+        control: None,
         reply_hint: ReplyHint::None,
     }
 }
@@ -855,6 +857,8 @@ async fn pure_media_all_failed_replies_error() {
         mentioned_bot: false,
         ask_req: None,
         reply_to: None,
+        source_msg_id: None,
+        control: None,
         reply_hint: ReplyHint::None,
     };
     feed_and_wait(&ctx, vec![m], 0).await;
@@ -1145,7 +1149,8 @@ async fn stranger_mention_hint_on_off() {
 
     // 开启 + @bot → 引导；开启但未 @bot → 仍静默。
     let ctx = build(Auth::new(vec!["alice".into()])).await;
-    ctx.disp.set_prefs(true, crate::config::ReplyMode::Card);
+    ctx.disp
+        .set_prefs(true, false, crate::config::ReplyMode::Card);
     let mut m = msg("feishu:oc_g", "stranger", "hi bot");
     m.mentioned_bot = true;
     feed_and_wait(&ctx, vec![m], 1).await;
@@ -3116,5 +3121,308 @@ async fn stop_on_text_platform_marks_interrupted() {
         inbox.iter().any(|t| t.contains("本轮已被中断")),
         "文本平台应补中断标记: {inbox:?}"
     );
+    drop_db(ctx.db).await;
+}
+
+// ---------- Wave A：全角斜杠 / 私聊陌生人引导 / 撤回 / bot 移出群 ----------
+
+/// 快赢：全角斜杠（U+FF0F）容错——`／help` 与 `／STATUS`（命令名大写）归一后
+/// 按对应命令处理（handle 入口一处归一，覆盖所有命令）。
+#[tokio::test]
+async fn fullwidth_slash_commands_normalized() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    feed_and_wait(
+        &ctx,
+        vec![
+            msg("feishu:ou_t", "alice", "／help"),
+            msg("feishu:ou_t", "alice", "／STATUS"),
+            msg("feishu:ou_t", "alice", "／nosuchcmd"),
+        ],
+        0,
+    )
+    .await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox
+            .iter()
+            .any(|t| t.contains("/new") && t.contains("/help")),
+        "／help 应出命令帮助: {inbox:?}"
+    );
+    assert!(
+        inbox
+            .iter()
+            .any(|t| t.contains("uptime") || t.contains("运行")),
+        "／STATUS 应按 /status 处理: {inbox:?}"
+    );
+    assert!(
+        inbox.iter().any(|t| t.contains("未知命令")),
+        "未知全角命令应回未知提示: {inbox:?}"
+    );
+    // 全角斜杠消息不应驱动 agent（命令路径 return）。
+    assert_eq!(ctx.order.load(Ordering::SeqCst), 0, "命令不驱动 agent");
+    drop_db(ctx.db).await;
+}
+
+/// 快赢：私聊陌生人引导（stranger_p2p_hint 默认 true）——未放行用户的私聊回
+/// 引导（含 sender id 与 /allow 指引）；关闭后完全静默；群内行为不变（默认仍
+/// 静默——群提示走 stranger_mention_hint，两者独立）。
+#[tokio::test]
+async fn stranger_p2p_hint_on_off_and_group_unchanged() {
+    let _serial = SERIAL.lock().await;
+    // 默认开：私聊陌生人回引导。
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    feed_and_wait(&ctx, vec![msg("feishu:ou_stranger", "stranger", "hi")], 0).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox
+            .iter()
+            .any(|t| t.contains("stranger") && t.contains("/allow stranger")),
+        "私聊陌生人应回含 id 与 /allow 的引导: {inbox:?}"
+    );
+    assert!(
+        inbox.iter().all(|t| !t.contains("发现模式")),
+        "非发现模式（白名单非空）不给发现引导: {inbox:?}"
+    );
+    drop_db(ctx.db).await;
+
+    // 默认开但群内陌生人（未 @bot）仍静默（群行为不变，群提示独立开关）。
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    feed_and_wait(&ctx, vec![msg("feishu:oc_g", "stranger", "hi")], 0).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(inbox.is_empty(), "群内默认静默: {inbox:?}");
+    drop_db(ctx.db).await;
+
+    // 关闭：私聊同样完全静默。
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    ctx.disp
+        .set_prefs(false, false, crate::config::ReplyMode::Card);
+    feed_and_wait(&ctx, vec![msg("feishu:ou_stranger", "stranger", "hi")], 0).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(inbox.is_empty(), "关闭后私聊静默: {inbox:?}");
+    drop_db(ctx.db).await;
+}
+
+/// 构造撤回控制消息（feishu drain 合成形态的最小化模拟）。
+fn recall_msg(conv: &str, msg_id: &str, notify: Option<&str>, probes: &[&str]) -> InboundMessage {
+    InboundMessage {
+        conv_id: ConvId(conv.into()),
+        sender: UserId(String::new()),
+        text: None,
+        media: Vec::new(),
+        media_errors: Vec::new(),
+        mentions: Vec::new(),
+        mentioned_bot: false,
+        ask_req: None,
+        reply_to: None,
+        source_msg_id: Some(msg_id.into()),
+        control: Some(crate::types::InboundControl::MessageRecalled {
+            notify_conv: notify.map(|c| ConvId(c.into())),
+            probe_convs: probes.iter().map(|c| ConvId((*c).into())).collect(),
+        }),
+        reply_hint: ReplyHint::None,
+    }
+}
+
+/// 事件接入（一期）：撤回把同 id 的**排队**消息移出（下一轮不再合并）；另一条
+/// 不同 id 的排队消息不受影响。
+#[tokio::test]
+async fn recall_removes_matching_queued_message() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build_slow(
+        Auth::new(vec!["alice".into()]),
+        30_000,
+        TaskBudgets {
+            batch_window: Duration::from_millis(1),
+            ..test_budgets()
+        },
+    )
+    .await;
+    let disp = ctx.disp.clone();
+    let runner = tokio::spawn(async move {
+        disp.handle(msg("feishu:ou_t", "alice", "round A")).await;
+    });
+    assert!(
+        wait_registered(&ctx, "feishu:ou_t").await,
+        "在飞任务应已注册"
+    );
+    // 两条带平台消息 id 的排队消息。
+    let mut m1 = msg("feishu:ou_t", "alice", "queued to recall");
+    m1.source_msg_id = Some("om_rec_1".into());
+    let mut m2 = msg("feishu:ou_t", "alice", "queued keep");
+    m2.source_msg_id = Some("om_keep".into());
+    ctx.disp.handle(m1).await;
+    ctx.disp.handle(m2).await;
+    for _ in 0..400 {
+        if ctx
+            .disp
+            .queues
+            .lock()
+            .await
+            .get("feishu:ou_t")
+            .is_some_and(|q| q.len() == 2)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // 撤回 om_rec_1（notify/probe 均给到可回执 conv）。
+    ctx.disp
+        .handle(recall_msg(
+            "feishu:oc_chat",
+            "om_rec_1",
+            Some("feishu:oc_chat"),
+            &["feishu:oc_chat", "feishu:ou_t"],
+        ))
+        .await;
+    // 队列只剩 om_keep。
+    let queued_ids: Vec<String> = {
+        let map = ctx.disp.queues.lock().await;
+        map.get("feishu:ou_t")
+            .map(|q| {
+                q.iter()
+                    .filter_map(|m| m.source_msg_id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        queued_ids,
+        vec!["om_keep".to_string()],
+        "撤回后队列应只剩 om_keep"
+    );
+    // 排队提示同步收缩。
+    assert!(
+        ctx.disp
+            .queued_hints
+            .lock()
+            .await
+            .get("feishu:ou_t")
+            .is_some_and(|h| h.count == 1),
+        "排队提示应收缩为 1"
+    );
+    // 撤回排队消息不回任何提示（静默移除）。
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.iter().all(|t| !t.contains("已撤回")),
+        "排队移除不发提示: {inbox:?}"
+    );
+    drop_db(ctx.db).await;
+    runner.abort();
+}
+
+/// 事件接入（一期）：撤回未命中队列但该会话有在飞任务 → 回「已开始，可 /stop」
+/// 提示（不自动停）；无在飞任务（已执行完/从未入队）→ 静默忽略。
+#[tokio::test]
+async fn recall_running_gets_hint_and_idle_silent() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build_slow(
+        Auth::new(vec!["alice".into()]),
+        30_000,
+        TaskBudgets {
+            batch_window: Duration::from_millis(1),
+            ..test_budgets()
+        },
+    )
+    .await;
+    let disp = ctx.disp.clone();
+    let runner = tokio::spawn(async move {
+        disp.handle(msg("feishu:ou_t", "alice", "long job")).await;
+    });
+    assert!(
+        wait_registered(&ctx, "feishu:ou_t").await,
+        "在飞任务应已注册"
+    );
+    // 撤回一条不在队列的消息（probe 覆盖在飞 conv）。
+    ctx.disp
+        .handle(recall_msg(
+            "feishu:ou_t",
+            "om_gone",
+            Some("feishu:ou_t"),
+            &["feishu:ou_t"],
+        ))
+        .await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox
+            .iter()
+            .any(|t| t.contains("已撤回") && t.contains("/stop")),
+        "在飞会话的撤回应回提示: {inbox:?}"
+    );
+    drop_db(ctx.db).await;
+    runner.abort();
+
+    // 无在飞任务：静默忽略（不回提示）。
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    ctx.disp
+        .handle(recall_msg(
+            "feishu:ou_t",
+            "om_never",
+            Some("feishu:ou_t"),
+            &["feishu:ou_t"],
+        ))
+        .await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(inbox.is_empty(), "无任务时撤回应静默: {inbox:?}");
+    drop_db(ctx.db).await;
+}
+
+/// 事件接入：bot 被移出群——白名单群被收回（内存 + store 双写）+ 首位管理员
+/// 收私聊通知；不在白名单的群移出只记日志（不打扰管理员）。
+#[tokio::test]
+async fn bot_removed_from_chat_revokes_and_notifies_admin() {
+    let _serial = SERIAL.lock().await;
+    let auth = Auth::with_chats(vec!["ou_admin".into()], vec!["feishu:oc_dead".into()]);
+    let ctx = build(auth).await;
+    let removed = InboundMessage {
+        conv_id: ConvId("feishu:oc_dead".into()),
+        sender: UserId(String::new()),
+        text: None,
+        media: Vec::new(),
+        media_errors: Vec::new(),
+        mentions: Vec::new(),
+        mentioned_bot: false,
+        ask_req: None,
+        reply_to: None,
+        source_msg_id: None,
+        control: Some(crate::types::InboundControl::BotRemovedFromChat),
+        reply_hint: ReplyHint::None,
+    };
+    ctx.disp.handle(removed).await;
+    // 内存：群白名单已收回。
+    assert!(
+        !ctx.disp.auth.is_chat_allowed("feishu:oc_dead"),
+        "移出后群应不再放行"
+    );
+    // 管理员收到私聊通知（mock platform 收到的 send_text）。
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox
+            .iter()
+            .any(|t| t.contains("已被移出群 feishu:oc_dead") && t.contains("会话白名单移除")),
+        "管理员应收到移出通知: {inbox:?}"
+    );
+    drop_db(ctx.db).await;
+
+    // 不在白名单的群移出：不通知（避免噪音）。
+    let auth = Auth::with_chats(vec!["ou_admin".into()], vec!["feishu:oc_other".into()]);
+    let ctx = build(auth).await;
+    let removed = InboundMessage {
+        conv_id: ConvId("feishu:oc_unknown".into()),
+        sender: UserId(String::new()),
+        text: None,
+        media: Vec::new(),
+        media_errors: Vec::new(),
+        mentions: Vec::new(),
+        mentioned_bot: false,
+        ask_req: None,
+        reply_to: None,
+        source_msg_id: None,
+        control: Some(crate::types::InboundControl::BotRemovedFromChat),
+        reply_hint: ReplyHint::None,
+    };
+    ctx.disp.handle(removed).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(inbox.is_empty(), "非白名单群移出不通知: {inbox:?}");
     drop_db(ctx.db).await;
 }

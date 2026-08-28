@@ -83,6 +83,13 @@ impl Dispatcher {
 
         // best-effort 指标：入站消息计数（失败只 warn 不阻断）。
         METRICS.messages_in.inc();
+
+        // 0. 平台控制信号（消息撤回 / bot 被移出群等系统事件）：不是用户对话
+        //    输入，在白名单校验之前消费——鉴权丢弃语义不适用于系统信号。
+        if msg.control.is_some() {
+            self.handle_control(msg).await;
+            return;
+        }
         // 1. 发现态：两个白名单（sender / chat）都为空。不自动授权（安全），对 sender
         //    回引导消息，告知其 sender id 与 conv id，不驱动 agent。
         if self.auth.is_discovery() {
@@ -120,6 +127,24 @@ impl Dispatcher {
                 sender = %sender.0,
                 "非白名单 sender 且会话未授权，丢弃"
             );
+            // 私聊陌生人引导（默认开）：未放行用户的私聊回一句引导——私聊是
+            // 用户主动找 bot，无探测面（与群内默认静默的 stranger_mention_hint
+            // 相反，见 config 注释）；含 sender id 与 /allow 指引，首次使用者
+            // 可据此完成授权。
+            if *self.stranger_p2p_hint.read() && is_p2p_conv(&conv.0) {
+                self.reply(
+                    &conv,
+                    &format!(
+                        "👋 你好！我尚未对你开放使用权限。你的用户 id 是 `{}`。\n\
+                         请联系管理员在 IM 内发送 `/allow {}` 放行（或在本地运行 `imagent allow {}` 后重启）。\
+                         授权前我不会处理你的消息。",
+                        sender.0, sender.0, sender.0
+                    ),
+                    &hint,
+                )
+                .await;
+                return;
+            }
             // P7-A3：可选的「陌生人被 @ 提示」——仅在开启且确实 @ 了 bot 时回
             // 一句引导（私聊/弱过滤未知为 false，保持完全静默；防探测默认关）。
             if *self.stranger_mention_hint.read() && msg.mentioned_bot {
@@ -137,10 +162,17 @@ impl Dispatcher {
         // 3. 斜杠命令（鉴权通过后、调 backend 前）。
         //    命令名小写比较；参数保留原样。到这里的 sender 必然已过白名单，
         //    故 /allow 的「调用者鉴权」天然由白名单保证，无需额外校验。
+        //    全角斜杠容错：中文输入法易打出 ／（U+FF0F）——把**前导**全角斜杠
+        //    归一成半角再判定（／help → /help、／STATUS → /STATUS 后经命令名
+        //    小写比较命中 /status），一处归一覆盖所有命令与未知命令提示。
         if let Some(text) = msg.text.as_ref() {
             let trimmed = text.trim();
-            if trimmed.starts_with('/') {
-                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            let normalized: std::borrow::Cow<str> = match trimmed.strip_prefix('／') {
+                Some(rest) => std::borrow::Cow::Owned(format!("/{rest}")),
+                None => std::borrow::Cow::Borrowed(trimmed),
+            };
+            if normalized.starts_with('/') {
+                let parts: Vec<&str> = normalized.split_whitespace().collect();
                 let cmd = parts[0].to_ascii_lowercase();
                 match cmd.as_str() {
                     "/new" => {

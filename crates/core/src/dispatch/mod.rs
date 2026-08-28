@@ -218,6 +218,14 @@ fn is_permission_reply_candidate(text: &str) -> bool {
     !t.is_empty() && !t.starts_with('/')
 }
 
+/// 私聊 conv 判定（陌生人提示分流用）：按「明确的单人会话前缀」白名单识别——
+/// 飞书私聊 `feishu:ou_*`、ilink / wecom 均为单人会话。识别不了的多方形态
+/// （飞书群 `feishu:oc_*`、话题群、评论线程 `feishu:comment:*`）一律按非私聊
+/// 处理（保持既有静默行为，宁可漏发引导不误发）。
+fn is_p2p_conv(conv: &str) -> bool {
+    conv.starts_with("feishu:ou_") || conv.starts_with("ilink:") || conv.starts_with("wecom:")
+}
+
 /// 合并一批排队消息为一轮 prompt 载体：非空文本拼接、media / media_errors
 /// 拼接；sender 与 reply_hint 取首条（各消息入队前已各自过白名单）。
 /// P10-④：批内出现**多个不同发送者**（群聊多人）时给各段加说话人标注——
@@ -344,6 +352,9 @@ pub struct Dispatcher {
     idle_overrides: Mutex<HashMap<String, Duration>>,
     /// P7-A3：陌生人被 @ 提示开关（config 注入，set_prefs 热设；共享句柄）。
     stranger_mention_hint: RwLock<bool>,
+    /// 私聊陌生人引导开关（config 注入，默认 true——私聊是主动来找 bot 的，
+    /// 无探测面；与群内 stranger_mention_hint 的静默默认相反，见 config 注释）。
+    stranger_p2p_hint: RwLock<bool>,
     /// P7-A4：回复形态偏好（card/text，/config 可热改）。
     reply_mode: Arc<RwLock<ReplyMode>>,
     /// 审批集（ask 模式下仅清单内工具过 IM 审批，其余放行；空 = 全部过审）。
@@ -437,6 +448,7 @@ impl Dispatcher {
             pending_hint_last: Mutex::new(HashMap::new()),
             idle_overrides: Mutex::new(HashMap::new()),
             stranger_mention_hint: RwLock::new(false),
+            stranger_p2p_hint: RwLock::new(true),
             reply_mode: Arc::new(RwLock::new(ReplyMode::Card)),
             approval_tools: Arc::new(RwLock::new(Vec::new())),
             admin_senders: Arc::new(RwLock::new(admin_senders)),
@@ -461,8 +473,15 @@ impl Dispatcher {
     }
 
     /// P7：启动偏好注入（main 在 run 前调一次；构造器保持零新参，测试无感）。
-    pub fn set_prefs(&self, stranger_mention_hint: bool, reply_mode: ReplyMode) {
+    /// 私聊引导默认 true（构造器初值），未显式传前保持构造默认。
+    pub fn set_prefs(
+        &self,
+        stranger_mention_hint: bool,
+        stranger_p2p_hint: bool,
+        reply_mode: ReplyMode,
+    ) {
         *self.stranger_mention_hint.write() = stranger_mention_hint;
+        *self.stranger_p2p_hint.write() = stranger_p2p_hint;
         *self.reply_mode.write() = reply_mode;
     }
 
@@ -1066,6 +1085,120 @@ impl Dispatcher {
         // 展示在下一张卡 / 下一轮）。
         self.queued_hints.lock().await.remove(conv);
         Some(std::mem::take(pending))
+    }
+
+    /// 消息撤回（一期）：按平台消息 id 把同 id 的**排队**消息移出。全队列扫描——
+    /// 撤回事件携带的会话 key（chat_id 形态）与排队 key（私聊为发送者 conv）可能
+    /// 不同形，按 id 匹配最稳。命中则同步收缩排队提示（count/latest，空队列清
+    /// hint；锁序 queues→queued_hints 与入队/取批路径一致）。返回命中条数。
+    async fn remove_queued_by_msg_id(&self, msg_id: &str) -> usize {
+        let mut map = self.queues.lock().await;
+        let mut removed = 0usize;
+        for (conv, pending) in map.iter_mut() {
+            let before = pending.len();
+            pending.retain(|m| m.source_msg_id.as_deref() != Some(msg_id));
+            if pending.len() == before {
+                continue;
+            }
+            removed += before - pending.len();
+            let count = pending.len();
+            let latest = pending.last().map(latest_snippet).unwrap_or_default();
+            let mut hints = self.queued_hints.lock().await;
+            if count == 0 {
+                hints.remove(conv);
+            } else {
+                hints.insert(
+                    conv.clone(),
+                    crate::card_session::QueuedHint { count, latest },
+                );
+            }
+        }
+        removed
+    }
+
+    /// 平台控制信号分发（撤回 / bot 被移出群等系统事件的合成载体；handle 顶部、
+    /// 白名单校验**之前**调用——控制信号不是用户对话输入，不应被鉴权丢弃）。
+    async fn handle_control(&self, msg: InboundMessage) {
+        let Some(control) = msg.control else {
+            return;
+        };
+        match control {
+            crate::types::InboundControl::MessageRecalled {
+                notify_conv,
+                probe_convs,
+            } => {
+                // 一期语义：只移出**排队**消息；已被 runner 取走（在飞/已执行）的
+                // 不追杀——执行中仅回提示（不自动停，半途结果可能仍有价值），
+                // 未入队/已执行完的静默忽略。
+                let Some(msg_id) = msg.source_msg_id.clone().filter(|s| !s.is_empty()) else {
+                    return;
+                };
+                let removed = self.remove_queued_by_msg_id(&msg_id).await;
+                if removed > 0 {
+                    info!(
+                        target: "imagent::core",
+                        message_id = %msg_id,
+                        count = removed,
+                        "消息撤回：已移出排队消息（下一轮不再合并）"
+                    );
+                    return;
+                }
+                let running_here = {
+                    let running = self.running.lock().await;
+                    probe_convs.iter().any(|c| running.contains_key(&c.0))
+                };
+                if running_here {
+                    if let Some(conv) = notify_conv {
+                        self.reply(
+                            &conv,
+                            "ℹ️ 消息已撤回，但对应任务已开始执行；如需中断可发送 /stop。",
+                            &msg.reply_hint,
+                        )
+                        .await;
+                    }
+                }
+            }
+            crate::types::InboundControl::BotRemovedFromChat => {
+                // bot 被移出群（飞书 im.chat.member.bot.deleted_v1）：收回群授权，
+                // 防「群已失联但白名单仍在」的僵尸条目。内存 + store 双写 + 审计
+                // （与 /chat deny 同族；auth.revoke_chat 即 remove_chat 语义）。
+                warn!(
+                    target: "imagent::core",
+                    conv_id = %msg.conv_id.0,
+                    "bot 已被移出群，收回会话白名单授权"
+                );
+                if !self.auth.revoke_chat(&msg.conv_id.0) {
+                    return; // 本就不在白名单：无需清理，也不打扰管理员。
+                }
+                if let Err(e) = self.store.remove_allowed_chat(&msg.conv_id.0).await {
+                    warn!(
+                        target: "imagent::core",
+                        error = %e,
+                        "移出群的白名单持久化失败（内存已移除，重启后需重新 /chat deny）"
+                    );
+                }
+                let _ = self
+                    .store
+                    .append_audit(
+                        "chat_bot_removed",
+                        None,
+                        Some(&msg.conv_id.0),
+                        Some("auto: bot removed from chat"),
+                    )
+                    .await;
+                // 通知首位管理员（私聊）。该事件目前仅飞书产生，admin sender 即
+                // open_id，直接拼私聊 conv。
+                let admin = self.admin_senders.read().first().cloned();
+                if let Some(admin) = admin {
+                    self.reply(
+                        &ConvId(format!("feishu:{admin}")),
+                        &format!("🤖 bot 已被移出群 {}，已从会话白名单移除。", msg.conv_id.0),
+                        &msg.reply_hint,
+                    )
+                    .await;
+                }
+            }
+        }
     }
 
     /// 统一 `/resume` 列表（P4-11）：IM 会话历史（store `session_history`）∪

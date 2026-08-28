@@ -39,9 +39,9 @@ use crate::client::{
 };
 use crate::proto::{
     comment_target_from_conv, is_comment_event, is_group_message_event, is_private_conv,
-    parse_card_action_event, parse_comment_event, parse_message_event, receive_target_from_conv,
-    thread_key_of_payload, thread_target_from_conv, unsupported_message_notice, ReceiveIdKind,
-    COMMENT_CONV_PREFIX,
+    parse_bot_removed_event, parse_card_action_event, parse_comment_event, parse_menu_event,
+    parse_message_event, parse_recall_event, receive_target_from_conv, thread_key_of_payload,
+    thread_target_from_conv, unsupported_message_notice, ReceiveIdKind, COMMENT_CONV_PREFIX,
 };
 
 /// 平台名常量。
@@ -87,6 +87,8 @@ struct AskRender {
     tool_name: String,
     /// 审批卡=input 摘要 JSON；问题卡=AskUserQuestion 原始 input JSON。
     input: String,
+    /// 询问发起者 open_id（note 联动重渲染时保持按钮 value 的 sender 编码不丢）。
+    sender: String,
 }
 
 /// 飞书 Platform 适配器。
@@ -128,6 +130,14 @@ pub struct FeishuPlatform {
     /// 锚点表——会话锚放宽后 conv 不再内嵌 comment_id，drain 收到评论事件时登记，
     /// 发送侧据此路由回复；存量内嵌形态 conv 兜底）。
     comment_anchors: Arc<Mutex<HashMap<String, String>>>,
+    /// 审批/问题卡自动拒绝倒计时的真实值（core `permission_ask_timeout_secs`，
+    /// 构造注入——卡片 note 文案与实际超时行为一致，不再硬编码 5 分钟）。
+    ask_timeout_secs: u64,
+    /// 出站 im 文本分片上限：`min(config.message_max_len, FEISHU_TEXT_MAX)`
+    /// （config 未设 = 仅协议上限）。
+    text_split_max: usize,
+    /// 评论回复分片上限：`min(config.message_max_len, FEISHU_COMMENT_TEXT_MAX)`。
+    comment_split_max: usize,
 }
 
 impl FeishuPlatform {
@@ -136,11 +146,18 @@ impl FeishuPlatform {
     ///
     /// P6-1：`require_mention_in_group` = config `feishu_require_mention_in_group`
     /// （默认 true）——群消息须 @bot 才处理；p2p 不受限。
+    ///
+    /// - `message_max_len`：config `message_max_len`（None = 不按配置分片，仅用
+    ///   平台协议上限）；send_text 各分片阈值与它取 min（见 `text_split_max`）。
+    /// - `ask_timeout_secs`：config `permission_ask_timeout_secs`——审批/问题卡
+    ///   倒计时 note 的真实值（与 core 的实际超时预算同源）。
     pub fn new(
         app_id: String,
         app_secret: String,
         base_url: String,
         require_mention_in_group: bool,
+        message_max_len: Option<usize>,
+        ask_timeout_secs: u64,
     ) -> Result<Self> {
         let ws_config = Arc::new(
             Config::builder()
@@ -386,6 +403,23 @@ impl FeishuPlatform {
                             &deny_text,
                         )
                         .await;
+                        // 安全批次（转发代批）：deny 文案回原 conv 之外，给点击者
+                        // （operator）私聊补一条同文案——转发场景下原 conv 里没人
+                        // 知道有人替点了按钮，第二触达让点击者明确知道被拒。
+                        // 占位消息的 sender 即 operator open_id（见 dummy_card_action_msg）。
+                        if !reply_msg.sender.0.is_empty()
+                            && reply_msg.conv_id.0 != format!("feishu:{}", reply_msg.sender.0)
+                        {
+                            send_drain_text(
+                                &core_config_for_drain,
+                                &token_for_drain,
+                                &app_id_for_drain,
+                                &app_secret_for_drain,
+                                &ConvId(format!("feishu:{}", reply_msg.sender.0)),
+                                &deny_text,
+                            )
+                            .await;
+                        }
                         continue;
                     }
                     if !dedup.check(&key) {
@@ -480,6 +514,32 @@ impl FeishuPlatform {
                     }
                     continue;
                 }
+                // 自定义菜单跳转（application.url.menu_v6）→ 合成 text="/help" 的
+                // 入站消息（复用 card action 的合成模式）：走与手打 /help 完全相同
+                // 的鉴权/分派路径。需在飞书后台订阅该事件（可选，见 README）。
+                if let Some((key, menu_msg)) = parse_menu_event(&payload) {
+                    if dedup.check(&key) && inbound_msg_tx.send(menu_msg).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                // 消息撤回（im.message.recalled_v1，一期）→ 控制消息：core 据此
+                // 把同 id 的排队消息移出（在飞任务不自动停，只回提示）。需订阅
+                // 该事件（可选，见 README）。
+                if let Some((key, recall_msg)) = parse_recall_event(&payload) {
+                    if dedup.check(&key) && inbound_msg_tx.send(recall_msg).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                // bot 被移出群（im.chat.member.bot.deleted_v1）→ 控制消息：core
+                // 据此收回会话白名单并通知管理员。需订阅该事件（可选，见 README）。
+                if let Some((key, removed_msg)) = parse_bot_removed_event(&payload) {
+                    if dedup.check(&key) && inbound_msg_tx.send(removed_msg).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
                 // 不支持类型提示：语音/分享卡片等此前静默丢弃，用户无感知——回一条
                 // 可读提示（p2p 直回；群消息近似按「带 @」门槛发——白名单校验在
                 // core 侧，drain 无白名单状态，见 proto 注释）。
@@ -520,6 +580,13 @@ impl FeishuPlatform {
             mention_policy,
             conv_senders,
             comment_anchors,
+            ask_timeout_secs,
+            text_split_max: message_max_len
+                .unwrap_or(FEISHU_TEXT_MAX)
+                .min(FEISHU_TEXT_MAX),
+            comment_split_max: message_max_len
+                .unwrap_or(FEISHU_COMMENT_TEXT_MAX)
+                .min(FEISHU_COMMENT_TEXT_MAX),
         })
     }
 
@@ -913,6 +980,11 @@ fn claim_free_slot(
     Some(slot.msg_id.clone())
 }
 
+/// 空串 sender → None（AskRender.sender 的 Option 形态适配渲染入参）。
+fn sender_opt_of(sender: &str) -> Option<&str> {
+    (!sender.is_empty()).then_some(sender)
+}
+
 /// 媒体目录：`<imagent_home>/media/`（0700；P4-10：随 profile 隔离）。
 fn media_dir() -> Result<std::path::PathBuf> {
     let dir = imagent_core::paths::imagent_home().join("media");
@@ -1133,9 +1205,10 @@ impl Platform for FeishuPlatform {
                     "评论线程缺少回复目标（comment_id），无法回复".to_string(),
                 ));
             };
-            // 评论回复用独立更小阈值（FEISHU_COMMENT_TEXT_MAX，见其注释）；首片
-            // 带「（共 N 段）」序标，长回复被拆分时用户可感知。
-            let chunks: Vec<String> = split_message(text, FEISHU_COMMENT_TEXT_MAX);
+            // 评论回复用独立更小阈值（FEISHU_COMMENT_TEXT_MAX 与 config
+            // message_max_len 取 min，见 comment_split_max）；首片带「（共 N 段）」
+            // 序标，长回复被拆分时用户可感知。
+            let chunks: Vec<String> = split_message(text, self.comment_split_max);
             let total = chunks.len();
             for (i, chunk) in chunks.into_iter().enumerate() {
                 let chunk = if i == 0 && total > 1 {
@@ -1167,7 +1240,7 @@ impl Platform for FeishuPlatform {
         }
         // P6-4：话题群 conv → 回复话题根消息（reply API 落回原话题，而非发新话题）。
         if let Some((_chat_id, root_id)) = thread_target_from_conv(conv) {
-            let chunks: Vec<String> = split_message(text, FEISHU_TEXT_MAX);
+            let chunks: Vec<String> = split_message(text, self.text_split_max);
             let total = chunks.len();
             for (i, chunk) in chunks.into_iter().enumerate() {
                 let content = serde_json::json!({ "text": chunk }).to_string();
@@ -1191,7 +1264,7 @@ impl Platform for FeishuPlatform {
         }
         let (receive_id, kind) = receive_target_from_conv(conv)
             .ok_or_else(|| CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0)))?;
-        let chunks: Vec<String> = split_message(text, FEISHU_TEXT_MAX);
+        let chunks: Vec<String> = split_message(text, self.text_split_max);
         let total = chunks.len();
         for (i, chunk) in chunks.into_iter().enumerate() {
             // P5：同上——分片失败标注序号（此前中途 ? 退出，截断无标记）。
@@ -1372,15 +1445,28 @@ impl Platform for FeishuPlatform {
                 .await
                 .map(|_| None);
         }
+        // 询问发起者（最近 sender）与真实超时值：编码进按钮 value（回调侧全形态
+        // 校验点击者 + 24h 时效）与 note 倒计时文案。
+        let sender = self.last_sender(&conv.0).await;
+        let sender_opt = (!sender.is_empty()).then_some(sender.as_str());
+        let timeout = self.ask_timeout_secs;
         // P6 遗留补齐：话题群——reply API 把审批卡发进原话题（与流式卡同路），
         // 失败降级文本（文本经 send_text 的线程分支也落回话题）。
         // P8-2：话题群的复用槽与普通 conv 同一套（patch 话题内旧卡同样有效）。
         if let Some((_chat, root_id)) = thread_target_from_conv(conv) {
-            let card_json = render_permission_card(tool_name, input_summary, &conv.0, request_id);
+            let card_json = render_permission_card(
+                tool_name,
+                input_summary,
+                &conv.0,
+                request_id,
+                sender_opt,
+                timeout,
+            );
             let render = AskRender {
                 question: false,
                 tool_name: tool_name.to_string(),
                 input: input_summary.to_string(),
+                sender: sender.clone(),
             };
             if let Some(mid) = self
                 .try_reuse_ask_slot(&conv.0, &card_json, request_id, tool_name, render)
@@ -1405,6 +1491,7 @@ impl Platform for FeishuPlatform {
                             question: false,
                             tool_name: tool_name.to_string(),
                             input: input_summary.to_string(),
+                            sender,
                         };
                         self.register_ask_card(&conv.0, mid, request_id, tool_name, render)
                             .await;
@@ -1424,21 +1511,50 @@ impl Platform for FeishuPlatform {
             .ok_or_else(|| CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0)))?;
         // P6（AskUserQuestion 透传）：agent 的问题渲染成「问题 + 选项按钮」卡，
         // 而非降级的 允许/拒绝 审批卡；解析失败降级普通审批卡。
-        let is_question = tool_name == "AskUserQuestion";
-        let card_json = if is_question {
-            crate::card::render_question_card(input_summary, &conv.0, request_id).unwrap_or_else(
-                || render_permission_card(tool_name, input_summary, &conv.0, request_id),
+        let is_question = tool_name == "AskUserQuestion"
+            && crate::card::render_question_card(
+                input_summary,
+                &conv.0,
+                request_id,
+                sender_opt,
+                timeout,
             )
+            .is_some();
+        let card_json = if is_question {
+            crate::card::render_question_card(
+                input_summary,
+                &conv.0,
+                request_id,
+                sender_opt,
+                timeout,
+            )
+            .unwrap_or_else(|| {
+                render_permission_card(
+                    tool_name,
+                    input_summary,
+                    &conv.0,
+                    request_id,
+                    sender_opt,
+                    timeout,
+                )
+            })
         } else {
-            render_permission_card(tool_name, input_summary, &conv.0, request_id)
+            render_permission_card(
+                tool_name,
+                input_summary,
+                &conv.0,
+                request_id,
+                sender_opt,
+                timeout,
+            )
         };
         let render = AskRender {
             // 问题卡解析失败降级审批卡——AskRender 按实际渲染形态记（question
             // 为 false 时 input 走审批路径）。
-            question: is_question
-                && crate::card::render_question_card(input_summary, &conv.0, request_id).is_some(),
+            question: is_question,
             tool_name: tool_name.to_string(),
             input: input_summary.to_string(),
+            sender,
         };
         // P8-2：优先复用本 conv 已收敛的询问卡（原地 patch 成新询问）——顺序
         // 审批不再每条刷一张新卡把流式卡顶离视口。
@@ -1613,22 +1729,30 @@ impl Platform for FeishuPlatform {
             notes.insert(conv.0.clone(), note.to_string());
         }
         let card_json = if render.question {
-            crate::card::render_question_card_note(&render.input, &conv.0, &request_id, note)
-                .unwrap_or_else(|| {
-                    crate::card::render_permission_card_note(
-                        &render.tool_name,
-                        &render.input,
-                        &conv.0,
-                        &request_id,
-                        note,
-                    )
-                })
+            crate::card::render_question_card_note(
+                &render.input,
+                &conv.0,
+                &request_id,
+                sender_opt_of(&render.sender),
+                note,
+            )
+            .unwrap_or_else(|| {
+                crate::card::render_permission_card_note(
+                    &render.tool_name,
+                    &render.input,
+                    &conv.0,
+                    &request_id,
+                    sender_opt_of(&render.sender),
+                    note,
+                )
+            })
         } else {
             crate::card::render_permission_card_note(
                 &render.tool_name,
                 &render.input,
                 &conv.0,
                 &request_id,
+                sender_opt_of(&render.sender),
                 note,
             )
         };
@@ -2094,6 +2218,7 @@ mod tests {
                     question: false,
                     tool_name: "Bash".into(),
                     input: "{}".into(),
+                    sender: String::new(),
                 },
             },
         );
@@ -2136,6 +2261,8 @@ mod tests {
             "secret_test".into(),
             "https://open.feishu.cn".into(),
             true,
+            None,
+            300,
         )
         .expect("构造");
         let conv = ConvId("feishu:ou_x".into());
@@ -2156,6 +2283,8 @@ mod tests {
             "secret_test".into(),
             "https://open.feishu.cn".into(),
             true,
+            None,
+            300,
         )
         .expect("构造");
         p.pending_asks.lock().await.insert(
@@ -2186,6 +2315,8 @@ mod tests {
             "secret_test".into(),
             "https://open.feishu.cn".into(),
             true,
+            None,
+            300,
         )
         .expect("构造");
         assert_eq!(p.require_mention_in_group().await, Some(true));
@@ -2195,5 +2326,35 @@ mod tests {
             .await
             .expect("set back");
         assert_eq!(p.require_mention_in_group().await, Some(true));
+    }
+
+    /// Bug：message_max_len 三平台生效——飞书分片上限 = min(config, FEISHU_TEXT_MAX)；
+    /// 评论路径与 FEISHU_COMMENT_TEXT_MAX 取 min；未配置回落协议上限。
+    /// 占位凭据构造（WS 后台任务自然失败重试，不干扰断言）。
+    #[tokio::test]
+    async fn text_split_caps_respect_message_max_len() {
+        let mk = |max: Option<usize>| {
+            FeishuPlatform::new(
+                "cli_test".into(),
+                "secret_test".into(),
+                "https://open.feishu.cn".into(),
+                true,
+                max,
+                300,
+            )
+            .expect("构造")
+        };
+        // 未配置：协议上限。
+        let p = mk(None);
+        assert_eq!(p.text_split_max, FEISHU_TEXT_MAX);
+        assert_eq!(p.comment_split_max, FEISHU_COMMENT_TEXT_MAX);
+        // 配置小于协议上限：生效。
+        let p = mk(Some(2_000));
+        assert_eq!(p.text_split_max, 2_000);
+        assert_eq!(p.comment_split_max, 2_000);
+        // 配置大于协议上限：钳到协议上限（不放大）。
+        let p = mk(Some(1_000_000));
+        assert_eq!(p.text_split_max, FEISHU_TEXT_MAX);
+        assert_eq!(p.comment_split_max, FEISHU_COMMENT_TEXT_MAX);
     }
 }

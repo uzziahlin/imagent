@@ -643,8 +643,13 @@ async fn main() -> Result<()> {
                 config.cot_detail,
                 initial_admins,
             ));
-            // P7-A3/A4：启动偏好（陌生人 @ 提示开关 + 回复形态），构造后注入。
-            dispatcher.set_prefs(config.stranger_mention_hint, config.reply_mode);
+            // P7-A3/A4：启动偏好（陌生人 @ 提示开关 + 私聊引导开关 + 回复形态），
+            // 构造后注入。
+            dispatcher.set_prefs(
+                config.stranger_mention_hint,
+                config.stranger_p2p_hint,
+                config.reply_mode,
+            );
             // 审批集：ask 模式下仅清单内工具过 IM 审批（空 = 全部过审）。
             if !config.approval_tools.is_empty() {
                 tracing::info!(
@@ -1018,8 +1023,13 @@ async fn build_platform(
                 .ok_or_else(|| anyhow!("platform=wecom 需在 config.toml 配置 wecom_secret"))?;
             // openws 默认地址。
             let ws_url = "wss://openws.work.weixin.qq.com".to_string();
+            // message_max_len 三平台生效（安全/一致批次）：企微侧与 4000 字节协议
+            // 上限取 min。
             Ok(Arc::new(imagent_wecom::WeComPlatform::new(
-                bot_id, secret, ws_url,
+                bot_id,
+                secret,
+                ws_url,
+                config.message_max_len,
             )))
         }
         "feishu" => {
@@ -1034,12 +1044,16 @@ async fn build_platform(
                 .feishu_base_url
                 .clone()
                 .unwrap_or_else(|| "https://open.feishu.cn".to_string());
-            // P6-1：群消息 @bot 过滤策略（feishu_require_mention_in_group，默认 true）。
+            // P6-1：群消息 @bot 过滤策略（feishu_require_mention_in_group，默认 true）；
+            // message_max_len 三平台生效（飞书侧与 28000 协议上限取 min）；
+            // permission_ask_timeout_secs 透传（审批卡倒计时文案与实际超时一致）。
             Ok(Arc::new(imagent_feishu::FeishuPlatform::new(
                 app_id,
                 app_secret,
                 base_url,
                 config.feishu_require_mention_in_group,
+                config.message_max_len,
+                config.permission_ask_timeout_secs,
             )?))
         }
         _ => {

@@ -210,6 +210,8 @@ pub fn parse_msg_callback(frame: &WsFrame) -> imagent_core::Result<(String, Inbo
         mentioned_bot: false,
         ask_req: None,
         reply_to: None,
+        source_msg_id: None,
+        control: None,
         reply_hint: ReplyHint::None,
     };
     // 返回 msgid 供上层（drain task）做滑动窗口去重（P1-I）。

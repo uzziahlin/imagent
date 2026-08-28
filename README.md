@@ -167,6 +167,11 @@ imagent start            # 前台常驻，Ctrl-C 退出
 | `im.message.receive_v1` | 收私聊 / 群 @ 消息 | ✅ |
 | `card.action.trigger` | 卡片按钮回调（审批 / 问题 / 命令按钮卡） | ✅ |
 | `drive.file.comment.created_v1` | 云文档评论 @bot 触发 | 可选 |
+| `im.message.recalled_v1` | 消息撤回：移出未处理的排队消息（任务已开始则提示可 /stop，不自动中断） | 可选 |
+| `im.chat.member.bot.deleted_v1` | bot 被移出群：自动从会话白名单移除并私聊通知管理员 | 可选 |
+| `application.url.menu_v6` | 自定义菜单跳转：点击菜单即回 /help 使用说明（后台可配自定义菜单） | 可选 |
+
+> **自定义菜单（可选）**：订阅 `application.url.menu_v6` 后，可在飞书后台「应用能力 → 机器人 → 自定义菜单」配置菜单项——点击菜单 bot 会直接回 `/help` 使用说明（新手引导入口）。
 
 **③ 开通权限**：「权限管理」开通并**发布**：
 
