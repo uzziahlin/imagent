@@ -9,17 +9,21 @@ use imagent_core::UsageStats;
 use serde_json::Value;
 
 /// 单个 `tool_use` 项（B7：一条 assistant 消息可含多个并行 tool_use，全部收集）。
+/// W2-3：携带调用 id（与 tool_result 的 tool_use_id 精确配对）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolUseItem {
     pub tool: String,
     pub input: String,
+    pub id: Option<String>,
 }
 
 /// 单个 `tool_result` 项（B7：一条 user 消息可含多个并行 tool_result，全部收集）。
+/// W2-3：携带 tool_use_id（配对用）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolResultItem {
     pub tool: String,
     pub output: String,
+    pub id: Option<String>,
 }
 
 /// 单行解析后的归类。
@@ -34,9 +38,11 @@ pub enum ParsedEvent {
         usage: Option<UsageStats>,
     },
     /// assistant 事件（B7/B8）：content[] 中的全部 text 块按序拼接（无则空串）+
-    /// 全部 `tool_use`（并行工具调用不再只取首个）。
+    /// 全部 `tool_use`（并行工具调用不再只取首个）。W2-1：thinking 块单独拼接
+    /// 为 `thoughts`（与正文分离透出）。
     Assistant {
         text: String,
+        thoughts: String,
         tool_uses: Vec<ToolUseItem>,
         session_id: Option<String>,
     },
@@ -90,6 +96,7 @@ pub fn parse_line(line: &str) -> ParsedEvent {
         }
         Some("assistant") => ParsedEvent::Assistant {
             text: extract_text_blocks(&value),
+            thoughts: extract_thinking_blocks(&value),
             tool_uses: extract_tool_uses(&value),
             session_id,
         },
@@ -157,6 +164,28 @@ fn extract_text_blocks(value: &Value) -> String {
     texts.join("\n")
 }
 
+/// W2-1：从 assistant 事件的 `message.content[]` 收集 thinking 块（扩展思考），
+/// 按序拼接（`\n` 分隔；无则空串）。redacted_thinking 无文本可透出，跳过。
+fn extract_thinking_blocks(value: &Value) -> String {
+    let mut thoughts = Vec::new();
+    if let Some(content) = value
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_array)
+    {
+        for item in content {
+            if item.get("type").and_then(Value::as_str) == Some("thinking") {
+                if let Some(t) = item.get("thinking").and_then(Value::as_str) {
+                    if !t.trim().is_empty() {
+                        thoughts.push(t.to_string());
+                    }
+                }
+            }
+        }
+    }
+    thoughts.join("\n")
+}
+
 /// 从 assistant 事件的 `message.content[]` 收集**全部** `tool_use`（B7：并行工具
 /// 调用不再只取首个）。input 是对象，用 `Value::to_string()` 序列化；缺 input 为空串。
 fn extract_tool_uses(value: &Value) -> Vec<ToolUseItem> {
@@ -179,7 +208,17 @@ fn extract_tool_uses(value: &Value) -> Vec<ToolUseItem> {
                 Some(v) => v.to_string(),
                 None => String::new(),
             };
-            uses.push(ToolUseItem { tool: name, input });
+            // W2-3：调用 id（`tool_use.id`）——与 tool_result 的 tool_use_id 配对。
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            uses.push(ToolUseItem {
+                tool: name,
+                input,
+                id,
+            });
         }
     }
     uses
@@ -204,9 +243,16 @@ fn extract_tool_results(value: &Value) -> Vec<ToolResultItem> {
                 Some(other) => other.to_string(),
                 None => String::new(),
             };
+            // W2-3：tool_use_id（配对锚点；与 tool_use.id 同源）。
+            let id = item
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             results.push(ToolResultItem {
                 tool: String::new(),
                 output,
+                id,
             });
         }
     }
@@ -317,6 +363,7 @@ mod tests {
             parse_line(line),
             ParsedEvent::Assistant {
                 text: "hello".to_string(),
+                thoughts: String::new(),
                 tool_uses: vec![],
                 session_id: Some("sess-1".to_string()),
             }
@@ -329,6 +376,7 @@ mod tests {
         match parse_line(line) {
             ParsedEvent::Assistant {
                 text,
+                thoughts: _,
                 tool_uses,
                 session_id,
             } => {
@@ -354,6 +402,7 @@ mod tests {
         match parse_line(line) {
             ParsedEvent::Assistant {
                 text,
+                thoughts: _,
                 tool_uses,
                 session_id,
             } => {
@@ -375,7 +424,10 @@ mod tests {
         let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"thinking..."},{"type":"tool_use","name":"Edit","input":{"file":"/bar"}}]},"session_id":"sess-3"}"#;
         match parse_line(line) {
             ParsedEvent::Assistant {
-                text, tool_uses, ..
+                text,
+                thoughts: _,
+                tool_uses,
+                ..
             } => {
                 assert_eq!(text, "thinking...");
                 assert_eq!(tool_uses.len(), 1);
@@ -450,6 +502,49 @@ mod tests {
                 session_id: Some("sess-5".to_string()),
             }
         );
+    }
+
+    /// W2-1：thinking 块单独透出（thoughts 字段），不混进 text。
+    #[test]
+    fn thinking_blocks_parsed_separately() {
+        let line = r#"{"type":"assistant","message":{"content":[
+            {"type":"thinking","thinking":"先分析问题"},
+            {"type":"text","text":"结论如下"},
+            {"type":"thinking","thinking":"再验证一遍"}
+        ]},"session_id":"sess-t"}"#;
+        match parse_line(line) {
+            ParsedEvent::Assistant {
+                text,
+                thoughts,
+                tool_uses,
+                ..
+            } => {
+                assert_eq!(text, "结论如下");
+                assert_eq!(thoughts, "先分析问题\n再验证一遍");
+                assert!(tool_uses.is_empty());
+            }
+            other => panic!("expected Assistant, got {other:?}"),
+        }
+    }
+
+    /// W2-3：tool_use 带 id、tool_result 带 tool_use_id（精确配对锚点）。
+    #[test]
+    fn tool_use_and_result_carry_ids() {
+        let use_line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_01","name":"Bash","input":{"command":"ls"}}]},"session_id":"s"}"#;
+        match parse_line(use_line) {
+            ParsedEvent::Assistant { tool_uses, .. } => {
+                assert_eq!(tool_uses[0].id.as_deref(), Some("toolu_01"));
+            }
+            other => panic!("expected Assistant, got {other:?}"),
+        }
+        let res_line = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"ok"}]}}"#;
+        match parse_line(res_line) {
+            ParsedEvent::ToolResults { results } => {
+                assert_eq!(results[0].id.as_deref(), Some("toolu_01"));
+                assert_eq!(results[0].output, "ok");
+            }
+            other => panic!("expected ToolResults, got {other:?}"),
+        }
     }
 
     #[test]

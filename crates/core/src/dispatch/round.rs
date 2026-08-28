@@ -10,15 +10,18 @@ impl Dispatcher {
     /// 中止语义（P4-1/P4-3）：`/stop` 或空闲看门狗 abort join task →
     /// `JoinError::is_cancelled` 分支——卡片 finalize 成 Error 终态（防流式卡片停在
     /// 「生成中」），不落 session（保留上次成功映射）。
-    pub(super) async fn run_agent_round(&self, msg: InboundMessage) {
+    pub(super) async fn run_agent_round(&self, msg: InboundMessage) -> Option<u64> {
         let conv_key = msg.conv_id.0.clone();
-        self.run_round_inner(msg).await;
+        let tokens = self.run_round_inner(msg).await;
         // 统一收尾：移除在飞注册（inner 未及注册时为幂等 no-op）。同 conv 轮次串行
         // （conv 锁），key 移除无 ABA。
         self.running.lock().await.remove(&conv_key);
+        tokens
     }
 
-    async fn run_round_inner(&self, msg: InboundMessage) {
+    /// 返回成功轮次的上下文水位（`usage.input_tokens`；失败/无 usage 为 None）——
+    /// W2-5 自动 compact 的触发依据。
+    async fn run_round_inner(&self, msg: InboundMessage) -> Option<u64> {
         let conv = msg.conv_id.clone();
         let hint = msg.reply_hint.clone();
         let base_prompt = msg.text.clone().unwrap_or_default();
@@ -117,7 +120,7 @@ impl Dispatcher {
                 &hint,
             )
             .await;
-            return;
+            return None;
         }
         let tools = self.allowed_tools.read().clone();
         let prompt_owned = prompt.clone();
@@ -210,6 +213,8 @@ impl Dispatcher {
         let mut learned_sid: Option<String> = None;
         // P5-10：非卡片平台已实时推送的 Text 前缀——最终回复只补差量，防重发。
         let mut streamed_text = String::new();
+        // W2-2：最新任务清单状态（纯文本平台最终回复的进度行来源）。
+        let mut latest_todos: Option<Vec<crate::types::TodoItem>> = None;
         loop {
             // P4-6：COT 档位每轮读取（/config 热改对下一轮生效；Wave B-7：
             // per-conv 覆盖优先，/config cot 白名单用户可改自己会话）。
@@ -257,7 +262,27 @@ impl Dispatcher {
                 }
                 AgentChunk::Final(t) => final_text = Some(t),
                 AgentChunk::Error(e) => error_text = Some(e),
-                AgentChunk::ToolUse { tool, input } => {
+                AgentChunk::Thought(t) => {
+                    // W2-1：思考过程仅卡片平台展示（折叠区，渲染层按 cot 档位过滤）；
+                    // 纯文本平台忽略——正文流式已体现活跃，逐条思考反而刷屏。
+                    if cot == CotDetail::Off {
+                        continue;
+                    }
+                    if let Some(c) = card.as_mut() {
+                        c.append_thought(&t, &conv, &hint, self.platform.as_ref())
+                            .await;
+                    }
+                }
+                AgentChunk::TodoList { items } => {
+                    // W2-2：任务清单（全量替换）——卡片平台实时 checklist；
+                    // 纯文本平台保留最新状态，最终回复追加进度行。
+                    if let Some(c) = card.as_mut() {
+                        c.set_todos(&items, &conv, &hint, self.platform.as_ref())
+                            .await;
+                    }
+                    latest_todos = Some(items);
+                }
+                AgentChunk::ToolUse { tool, input, id } => {
                     // P4-6：off 档不收集工具过程（无摘要、无卡片工具面板）。
                     if cot == CotDetail::Off {
                         continue;
@@ -272,22 +297,49 @@ impl Dispatcher {
                         name: tool.clone(),
                         summary: summary.clone(),
                         done: false,
+                        id: id.clone(),
                     });
                     if let Some(c) = card.as_mut() {
-                        c.append_tool(&tool, &summary, &conv, &hint, self.platform.as_ref())
-                            .await;
+                        c.append_tool(
+                            &tool,
+                            &summary,
+                            id.as_deref(),
+                            &conv,
+                            &hint,
+                            self.platform.as_ref(),
+                        )
+                        .await;
                     }
                 }
-                AgentChunk::ToolResult { tool, .. } => {
-                    // P8-1：结果到达 → 同名最早未完成的调用翻 ✅（卡片工具行的
-                    // ⏳→✅ 反馈）；结果内容仍不进 IM（防止把大段输出刷进卡片）。
+                AgentChunk::ToolResult { tool, id, .. } => {
+                    // P8-1：结果到达 → 翻 ✅（W2-3：优先按 id 精确配对，无 id 回退
+                    // 同名最早未完成——并行同名调用不再错配）；结果内容仍不进 IM
+                    //（防止把大段输出刷进卡片）。
                     if cot != CotDetail::Off {
-                        if let Some(t) = tool_calls.iter_mut().find(|t| !t.done && t.name == tool) {
+                        // W2-3：优先按 id 精确配对（首个借用先落地结束，再做名字
+                        // 兜底——避免链式 or_else 的双重可变借用）。
+                        let by_id = match id.as_deref() {
+                            Some(i) => tool_calls
+                                .iter_mut()
+                                .find(|t| !t.done && t.id.as_deref() == Some(i)),
+                            None => None,
+                        };
+                        let target = match by_id {
+                            Some(t) => Some(t),
+                            None => tool_calls.iter_mut().find(|t| !t.done && t.name == tool),
+                        };
+                        if let Some(t) = target {
                             t.done = true;
                         }
                         if let Some(c) = card.as_mut() {
-                            c.finish_tool(&tool, &conv, &hint, self.platform.as_ref())
-                                .await;
+                            c.finish_tool(
+                                &tool,
+                                id.as_deref(),
+                                &conv,
+                                &hint,
+                                self.platform.as_ref(),
+                            )
+                            .await;
                         }
                     }
                 }
@@ -352,7 +404,7 @@ impl Dispatcher {
                 // 收敛询问卡），防残留 pending 把后续消息误当审批回复吞掉。
                 self.cancel_pending_on_exit(&conv).await;
                 // conv 锁由 runner 循环持有并统一释放（P1-7 防泄漏语义不变）。
-                return;
+                return None;
             }
             Err(e) if e.is_cancelled() => {
                 // P4-1/P4-3：join task 被 abort——/stop（用户中断）或空闲看门狗。
@@ -410,7 +462,7 @@ impl Dispatcher {
                 // D1：中断返回路径同样清理 pending（空闲超时 abort 不经 /stop 的
                 // cancel_all；/stop 已清过则此处为幂等 no-op）。
                 self.cancel_pending_on_exit(&conv).await;
-                return;
+                return None;
             }
             Err(e) => {
                 METRICS.backend_errors.inc();
@@ -436,7 +488,7 @@ impl Dispatcher {
                 self.persist_learned_session(&conv, existing_sid.as_deref(), &learned_sid)
                     .await;
                 self.cancel_pending_on_exit(&conv).await;
-                return;
+                return None;
             }
         };
 
@@ -494,13 +546,46 @@ impl Dispatcher {
         if !outcome.terminal {
             reply = format!("⚠️ agent 异常退出，以下为部分输出：\n\n{reply}");
         }
+        // W2-4：终止原因（ACP 的 stop_reason）——非正常结束给可读提示 + 下一步。
+        if let Some(sr) = outcome.stop_reason.as_deref() {
+            let human = match sr {
+                "max_tokens" => {
+                    Some("已达到单轮输出 token 上限，回复可能被截断（可发「继续」让它接着写）")
+                }
+                "max_turn_requests" => {
+                    Some("已达到单轮最大请求数上限，任务未完全结束（可重发消息继续）")
+                }
+                "refusal" => Some("agent 拒绝继续执行该请求"),
+                "cancelled" => Some("本轮被取消"),
+                _ => None,
+            };
+            if let Some(h) = human {
+                reply = format!("⚠️ {h}：\n\n{reply}");
+            }
+        }
+        // W2-2：纯文本平台追加任务清单进度（卡片平台由卡片 checklist 渲染）。
+        if let Some(todos) = latest_todos.filter(|t| !t.is_empty() && card.is_none()) {
+            let done = todos
+                .iter()
+                .filter(|t| t.status == crate::types::TodoStatus::Completed)
+                .count();
+            reply.push_str(&format!("\n\n📋 计划进度：{}/{} 完成", done, todos.len()));
+        }
         // Wave B-9：上下文水位提示——本轮输入 token 超过 80k 时提醒压缩。
+        // W2-5：自动压缩开启时不重复提醒（超阈值将自动 /compact，用户无需动作）；
+        // 仅在自动压缩关闭（阈值 0）或水位在 80k~阈值之间时提示。
         // 取舍：OutboundCard 的 footer 无自由文本通道，提示追加在回复正文末尾
         //（卡片/纯文本两条路径都可见，语义同为「完成后给用户的建议」）。
+        let auto_threshold = self.auto_compact_threshold;
         if outcome
             .usage
             .as_ref()
             .is_some_and(|u| u.input_tokens > 80_000)
+            && (auto_threshold == 0
+                || outcome
+                    .usage
+                    .as_ref()
+                    .is_some_and(|u| u.input_tokens < auto_threshold))
         {
             let n = outcome.usage.as_ref().map(|u| u.input_tokens).unwrap_or(0);
             reply.push_str(&format!(
@@ -632,6 +717,8 @@ impl Dispatcher {
             }
         }
         // conv 锁由 runner 循环持有并统一释放；在飞注册由 run_agent_round 统一移除。
+        // W2-5：成功轮次返回上下文水位（runner 循环据此触发自动 compact）。
+        outcome.usage.as_ref().map(|u| u.input_tokens)
     }
 
     /// 每轮 usage 落库 + 指标：成功路径传 RunOutcome.usage；失败/中断路径拿不到

@@ -28,6 +28,7 @@ impl Backend for EchoBackend {
         // 流式推一个 Final chunk（core 收到后回传 IM）。
         let _ = chunks.send(AgentChunk::Final(prompt.to_string())).await;
         Ok(RunOutcome {
+            stop_reason: None,
             session_id: SessionId("echo-demo".to_string()),
             final_text: prompt.to_string(),
             terminal: true,

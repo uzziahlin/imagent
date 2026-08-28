@@ -10,7 +10,7 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::error::{CoreError, Result};
-use crate::types::{AgentChunk, RunOutcome, SessionId, UsageStats};
+use crate::types::{AgentChunk, RunOutcome, SessionId, TodoItem, TodoStatus, UsageStats};
 
 /// 三 CLI backend 的 stdout 行解析统一事件。各 backend 的适配闭包把自己的
 /// `ParsedEvent` 映射到它。
@@ -21,14 +21,26 @@ pub enum CliEvent {
     /// 中间文本（best-effort 推 IM；codex AgentMessage / gemini AssistantMessage /
     /// claude assistant 文本 B8）。同时作为 final_text 候选（按序拼接，见 B9）。
     Text(String),
+    /// W2-1：思考过程（claude assistant 的 thinking 块）——与 Text 分离，
+    /// 不进 final_text、不进正文流，仅推 Thought chunk（卡片折叠展示）。
+    Thought(String),
     /// 工具调用。`session` 供尽早捕获 session_id（如 claude ToolUse 带 session）。
     ToolUse {
         tool: String,
         input: String,
         session: Option<String>,
+        /// W2-3：调用 id（与 ToolResult 精确配对）；后端拿不到为 None。
+        id: Option<String>,
     },
     /// 工具结果。
-    ToolResult { tool: String, output: String },
+    ToolResult {
+        tool: String,
+        output: String,
+        /// W2-3：对应调用的 id（claude `tool_result.tool_use_id`）。
+        id: Option<String>,
+    },
+    /// W2-2：任务清单（Claude Code TodoWrite 的结构化解析产物；全量替换语义）。
+    TodoList { items: Vec<TodoItem> },
     /// 终止 + 最终文本（claude `result` 非 error）。
     Final {
         text: String,
@@ -78,6 +90,36 @@ pub(crate) fn image_write_path(tool: &str, input: &str) -> Option<String> {
     let lower = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     const IMG_EXTS: [&str; 6] = ["png", "jpg", "jpeg", "gif", "webp", "bmp"];
     IMG_EXTS.contains(&lower.as_str()).then(|| path.to_string())
+}
+
+/// W2-2：解析 Claude Code 的 TodoWrite 工具入参为任务清单。input 形如
+/// `{"todos":[{"content":"…","status":"pending|in_progress|completed", …}]}`。
+/// 非 TodoWrite / 非法 JSON / 空 todos 返回 None（调用方按普通 ToolUse 处理）。
+pub fn todo_write_items(tool: &str, input: &str) -> Option<Vec<TodoItem>> {
+    if tool != "TodoWrite" {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(input).ok()?;
+    let todos = v.get("todos")?.as_array()?;
+    if todos.is_empty() {
+        return None;
+    }
+    let items = todos
+        .iter()
+        .filter_map(|t| {
+            let text = t.get("content")?.as_str()?.trim().to_string();
+            if text.is_empty() {
+                return None;
+            }
+            let status = match t.get("status").and_then(|s| s.as_str()) {
+                Some("completed") => TodoStatus::Completed,
+                Some("in_progress") => TodoStatus::InProgress,
+                _ => TodoStatus::Pending,
+            };
+            Some(TodoItem { text, status })
+        })
+        .collect::<Vec<_>>();
+    (!items.is_empty()).then_some(items)
 }
 
 /// unix 进程组 kill 守卫（B5）：spawn 时 `process_group(0)` 把 CLI 子进程放进
@@ -246,10 +288,22 @@ pub async fn spawn_cli_backend(
                         final_text.push_str(&t);
                     }
                 }
+                // W2-1：思考过程——仅推 chunk（卡片折叠展示），不进 final_text
+                //（正文语义保持纯净，cot 档位控制展示）。
+                CliEvent::Thought(t) => {
+                    if !t.is_empty() {
+                        let _ = chunks.send(AgentChunk::Thought(t)).await;
+                    }
+                }
+                // W2-2：任务清单——全量替换语义，仅推 chunk。
+                CliEvent::TodoList { items } => {
+                    let _ = chunks.send(AgentChunk::TodoList { items }).await;
+                }
                 CliEvent::ToolUse {
                     tool,
                     input,
                     session,
+                    id,
                 } => {
                     if let Some(s) = session {
                         if session_id.is_empty() && !s.is_empty() {
@@ -260,10 +314,12 @@ pub async fn spawn_cli_backend(
                     if let Some(path) = image_write_path(&tool, &input) {
                         let _ = chunks.send(AgentChunk::Media { path }).await;
                     }
-                    let _ = chunks.send(AgentChunk::ToolUse { tool, input }).await;
+                    let _ = chunks.send(AgentChunk::ToolUse { tool, input, id }).await;
                 }
-                CliEvent::ToolResult { tool, output } => {
-                    let _ = chunks.send(AgentChunk::ToolResult { tool, output }).await;
+                CliEvent::ToolResult { tool, output, id } => {
+                    let _ = chunks
+                        .send(AgentChunk::ToolResult { tool, output, id })
+                        .await;
                 }
                 CliEvent::Final { text, session } => {
                     if let Some(s) = session {
@@ -381,6 +437,9 @@ pub async fn spawn_cli_backend(
         final_text,
         terminal: reached_terminal,
         usage: usage_acc,
+        // CLI 后端的终止原因在 result 事件里无对应字段（is_error 走 Err 路径），
+        // 恒 None；ACP 后端由 PromptResponse.stopReason 填充。
+        stop_reason: None,
     })
 }
 
@@ -616,6 +675,30 @@ mod tests {
         assert_eq!(image_write_path("Write", "not-json"), None);
         assert_eq!(image_write_path("Write", r#"{"content":"x"}"#), None);
         assert_eq!(image_write_path("Write", r#"{"file_path":"noext"}"#), None);
+    }
+
+    /// W2-2：TodoWrite 入参解析为任务清单；非 TodoWrite / 坏 JSON / 空 todos 回 None。
+    #[test]
+    fn todo_write_items_parses_and_rejects() {
+        let items = super::todo_write_items(
+            "TodoWrite",
+            r#"{"todos":[
+                {"content":"分析需求","status":"completed"},
+                {"content":"写代码","status":"in_progress"},
+                {"content":"测试","status":"pending"}
+            ]}"#,
+        )
+        .expect("合法 TodoWrite 应解析");
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].status, crate::types::TodoStatus::Completed);
+        assert_eq!(items[1].status, crate::types::TodoStatus::InProgress);
+        assert_eq!(items[2].status, crate::types::TodoStatus::Pending);
+        assert_eq!(items[0].text, "分析需求");
+
+        assert!(super::todo_write_items("Bash", r#"{"todos":[]}"#).is_none());
+        assert!(super::todo_write_items("TodoWrite", "not-json").is_none());
+        assert!(super::todo_write_items("TodoWrite", r#"{"todos":[]}"#).is_none());
+        assert!(super::todo_write_items("TodoWrite", r#"{}"#).is_none());
     }
 
     /// Usage 事件累积进 RunOutcome.usage（合并：input/output 求和、cost 取最后）；

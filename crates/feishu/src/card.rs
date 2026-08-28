@@ -185,7 +185,13 @@ pub fn render_card(card: &OutboundCard, conv_id: &str, sender: Option<&str>) -> 
     if let Some(line) = sender_anchor_line(sender, !crate::proto::is_private_conv(conv_id)) {
         elements.push(line);
     }
-    elements.push(serde_json::json!({ "tag": "markdown", "content": mask_emails(&text) }));
+    // W2-2：任务清单（checklist）置正文上方——进度条语义（render_card 是整卡
+    // 路径，清单为独立 markdown 组件；managed 单组件路径在 stream_body_md 内拼）。
+    let body_md: String = match todo_list_md(&card.todos) {
+        Some(t) => format!("{t}\n\n{text}"),
+        None => text.into_owned(),
+    };
+    elements.push(serde_json::json!({ "tag": "markdown", "content": mask_emails(&body_md) }));
     if !card.tool_calls.is_empty() {
         // 长正文分段：正文与工具面板间用真 hr 组件分隔（降级路径专属——
         // managed 路径的 md_body 是单 markdown 组件，用 `---` 文本分割线，
@@ -204,6 +210,15 @@ pub fn render_card(card: &OutboundCard, conv_id: &str, sender: Option<&str>) -> 
             border_color_of(err)
         };
         elements.push(render_tool_panel(&card.tool_calls, border));
+    }
+    // W2-1：思考过程折叠面板（最近 5 条，默认收起——不占正文版面，展开回看）。
+    if !card.thoughts.is_empty() {
+        let border = if streaming {
+            "blue"
+        } else {
+            border_color_of(err)
+        };
+        elements.push(render_thought_panel(&card.thoughts, border));
     }
     // 状态 footer：note 行（notation 小字号）体现终态 / 流式阶段。
     elements.push(serde_json::json!({
@@ -275,6 +290,31 @@ fn render_tool_panel(tools: &[ToolCall], border_color: &str) -> serde_json::Valu
         "tag": "collapsible_panel",
         "expanded": false,
         "header": panel_header(&format!("🔧 工具轨迹（{n}）")),
+        "border": { "color": border_color, "corner_radius": "5px" },
+        "vertical_spacing": "8px",
+        "padding": "8px 8px 8px 8px",
+        "elements": [{ "tag": "markdown", "content": lines, "text_size": "notation" }]
+    })
+}
+
+/// W2-1：思考过程折叠面板（与 [`render_tool_panel`] 同款形态）：最近
+/// THOUGHT_PANEL_LINES 条、单条截 400 字符，默认收起。`thoughts` 由 core
+/// CardSession 累积（上限 10 条），此处再截显防超长推理占满面板。
+const THOUGHT_PANEL_LINES: usize = 5;
+fn render_thought_panel(thoughts: &[String], border_color: &str) -> serde_json::Value {
+    let n = thoughts.len();
+    let start = n.saturating_sub(THOUGHT_PANEL_LINES);
+    let mut lines = String::new();
+    for t in &thoughts[start..] {
+        lines.push_str(&format!(
+            "> {}\n",
+            mask_emails(&truncate_chars(t.trim(), 400))
+        ));
+    }
+    serde_json::json!({
+        "tag": "collapsible_panel",
+        "expanded": false,
+        "header": panel_header(&format!("💭 思考过程（{n}）")),
         "border": { "color": border_color, "corner_radius": "5px" },
         "vertical_spacing": "8px",
         "padding": "8px 8px 8px 8px",
@@ -463,20 +503,31 @@ pub fn render_stream_init_card(conv_id: &str, sender: Option<&str>) -> String {
 /// 工具与正文同置一个 markdown 组件——CardKit 的 element 流式 PATCH 仅支持
 /// markdown 组件（折叠面板不可流式更新），故 managed 路径下工具以引用行进正文
 /// （lcab 文本模式的 `> ⏳ **Bash** — cmd` 同款）。
-pub fn stream_body_md(text: &str, tool_calls: &[ToolCall]) -> String {
+///
+/// W2-1/W2-2：任务清单（checklist）置于正文**上方**（进度条语义，用户优先看
+/// 到进行到哪一步）；思考过程取最近 1 条置底（实时「在想什么」，历史思考终态
+/// 回看）。off 档的 Thought 在 core 侧已被过滤（不进卡）。
+pub fn stream_body_md(card: &OutboundCard) -> String {
     let mut out = String::new();
-    if !text.is_empty() {
-        out.push_str(text);
+    if let Some(todos) = todo_list_md(&card.todos) {
+        out.push_str(&todos);
     }
-    if !tool_calls.is_empty() {
+    if !card.text.is_empty() {
         if !out.is_empty() {
             out.push_str("\n\n");
         }
+        out.push_str(&card.text);
+    }
+    if !card.tool_calls.is_empty() {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        let tool_calls = &card.tool_calls;
         let n = tool_calls.len();
         let (skipped, shown) = if n > STREAM_TOOL_LINES {
             (n - STREAM_TOOL_LINES, &tool_calls[n - STREAM_TOOL_LINES..])
         } else {
-            (0, tool_calls)
+            (0, tool_calls.as_slice())
         };
         if skipped > 0 {
             // 图标统一（CardKit 视觉改版）：☕ → ⋯（省略号语义中性，与咖啡混淆无关）。
@@ -488,10 +539,59 @@ pub fn stream_body_md(text: &str, tool_calls: &[ToolCall]) -> String {
             .collect();
         out.push_str(&lines.join("\n"));
     }
+    if let Some(thought) = card.thoughts.last() {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&format!("> 💭 {}", truncate_chars(thought, 120)));
+    }
     if out.is_empty() {
         out.push_str("🧠 已接收任务，正在处理…");
     }
     mask_emails(&out)
+}
+
+/// W2-2：任务清单 → markdown checklist 段（`- [x]`/`- [ ]`；进行中行尾 ⏳），
+/// 标题带进度（`📋 计划（2/5）`）。空清单返回 None。
+fn todo_list_md(todos: &[imagent_core::TodoItem]) -> Option<String> {
+    if todos.is_empty() {
+        return None;
+    }
+    let done = todos
+        .iter()
+        .filter(|t| t.status == imagent_core::TodoStatus::Completed)
+        .count();
+    let lines: Vec<String> = todos
+        .iter()
+        .map(|t| {
+            let mark = match t.status {
+                imagent_core::TodoStatus::Completed => "[x]",
+                _ => "[ ]",
+            };
+            let icon = if t.status == imagent_core::TodoStatus::InProgress {
+                " ⏳"
+            } else {
+                ""
+            };
+            format!("- {mark} {}{icon}", t.text)
+        })
+        .collect();
+    Some(format!(
+        "**📋 计划**（{}/{}）\n{}",
+        done,
+        todos.len(),
+        lines.join("\n")
+    ))
+}
+
+/// 按字符截断（卡片防溢出用）。
+fn truncate_chars(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let t: String = s.chars().take(n).collect();
+        format!("{t}…")
+    }
 }
 
 /// 终态（Done/Error）时 `md_body` 的最终内容：正文 + 工具统计行 + 全量工具明细。
@@ -500,7 +600,12 @@ pub fn stream_body_md(text: &str, tool_calls: &[ToolCall]) -> String {
 /// ——managed 流式期正文只显最近 5 条（element PATCH 限制下的防刷屏），终态
 /// 在同组件里补全明细，用户终态后可回看完整工具轨迹（降级/下沉路径另有折叠
 /// 面板承载，见 [`render_tool_panel`]）。
-pub fn stream_body_final(text: &str, tool_calls: &[ToolCall], err: Option<&str>) -> String {
+///
+/// W2-1/W2-2：任务清单终态置于正文上方（完成态 checklist）；思考过程取最近
+/// 5 条以「💭 思考过程」段落收尾（流式期只显 1 条，终态补足回看）。
+pub fn stream_body_final(card: &OutboundCard, err: Option<&str>) -> String {
+    let text = &card.text;
+    let tool_calls = &card.tool_calls;
     let mut out = String::new();
     // 错误/中断说明进正文（footer 只有一句状态，装不下具体原因）；中断单列措辞。
     if let Some(e) = err {
@@ -509,6 +614,10 @@ pub fn stream_body_final(text: &str, tool_calls: &[ToolCall], err: Option<&str>)
         } else {
             out.push_str(&format!("❌ 出错：{e}\n\n"));
         }
+    }
+    if let Some(todos) = todo_list_md(&card.todos) {
+        out.push_str(&todos);
+        out.push_str("\n\n");
     }
     if !text.is_empty() {
         out.push_str(text);
@@ -537,6 +646,15 @@ pub fn stream_body_final(text: &str, tool_calls: &[ToolCall], err: Option<&str>)
             .map(|t| format!("> {}", tool_card_line(t)))
             .collect();
         out.push_str(&lines.join("\n"));
+    }
+    // W2-1：思考过程（最近 5 条，单条截 400 字符）——引用行形态段落于最末。
+    if !card.thoughts.is_empty() {
+        let start = card.thoughts.len().saturating_sub(5);
+        let lines: Vec<String> = card.thoughts[start..]
+            .iter()
+            .map(|t| format!("> {}", truncate_chars(t.trim(), 400)))
+            .collect();
+        out.push_str(&format!("\n\n---\n\n**💭 思考过程**\n{}", lines.join("\n")));
     }
     // 终态状态行（✅ 已完成等）由 md_footer 承载——正文不再拼一份，
     // 否则同卡出现两行「完成」（真机反馈）。
@@ -1325,6 +1443,23 @@ mod tests {
             name: name.into(),
             summary: summary.into(),
             done,
+            id: None,
+        }
+    }
+
+    /// W2 测试辅助：最小 Running 态 OutboundCard（text + tools + thoughts）。
+    /// 与既有 `card_of`（terminal 维度）区分命名。
+    fn body_card_of(text: &str, tools: &[ToolCall], thoughts: &[&str]) -> OutboundCard {
+        OutboundCard {
+            text: text.into(),
+            tool_calls: tools.to_vec(),
+            thoughts: thoughts.iter().map(|s| s.to_string()).collect(),
+            todos: Vec::new(),
+            phase: CardPhase::Thinking,
+            queued_hint: None,
+            run_secs: 0,
+            usage_display: None,
+            terminal: CardTerminal::Running,
         }
     }
 
@@ -1334,6 +1469,8 @@ mod tests {
             text: "hello".into(),
             tool_calls: vec![],
             phase: CardPhase::Thinking,
+            thoughts: Vec::new(),
+            todos: Vec::new(),
             queued_hint: None,
             terminal: CardTerminal::Running,
             usage_display: None,
@@ -1361,6 +1498,8 @@ mod tests {
                 text: "x".into(),
                 tool_calls: vec![],
                 phase,
+                thoughts: Vec::new(),
+                todos: Vec::new(),
                 queued_hint: None,
                 terminal: CardTerminal::Running,
                 usage_display: None,
@@ -1379,6 +1518,8 @@ mod tests {
             text: "done".into(),
             tool_calls: vec![tool("Read", "src/main.rs", true)],
             phase: CardPhase::Outputting,
+            thoughts: Vec::new(),
+            todos: Vec::new(),
             queued_hint: None,
             terminal: CardTerminal::Done,
             usage_display: None,
@@ -1406,6 +1547,8 @@ mod tests {
             text: "out".into(),
             tool_calls: tools,
             phase: CardPhase::ToolRunning,
+            thoughts: Vec::new(),
+            todos: Vec::new(),
             queued_hint: None,
             terminal: CardTerminal::Done,
             usage_display: None,
@@ -1422,12 +1565,14 @@ mod tests {
                 .map(|i| tool("Bash", &format!("cmd-{i}"), true))
                 .collect(),
             phase: CardPhase::ToolRunning,
+            thoughts: Vec::new(),
+            todos: Vec::new(),
             queued_hint: None,
             terminal: CardTerminal::Running,
             usage_display: None,
             run_secs: 0,
         };
-        let md = stream_body_md(&running.text, &running.tool_calls);
+        let md = stream_body_md(&running);
         assert!(md.contains("前面还有 5 个工具"), "流式折叠计数: {md}");
         assert!(!md.contains("cmd-0"), "流式不显最早: {md}");
     }
@@ -1438,6 +1583,8 @@ mod tests {
             text: "".into(),
             tool_calls: vec![],
             phase: CardPhase::Thinking,
+            thoughts: Vec::new(),
+            todos: Vec::new(),
             queued_hint: None,
             terminal: CardTerminal::Error("boom".into()),
             usage_display: None,
@@ -1659,6 +1806,8 @@ mod tests {
             text: "x".into(),
             tool_calls: vec![],
             phase: CardPhase::Outputting,
+            thoughts: Vec::new(),
+            todos: Vec::new(),
             queued_hint: Some("📥 排队 1 条".into()),
             terminal: CardTerminal::Running,
             usage_display: None,
@@ -1820,6 +1969,8 @@ mod tests {
             text: "x".into(),
             tool_calls: vec![],
             phase: CardPhase::Outputting,
+            thoughts: Vec::new(),
+            todos: Vec::new(),
             queued_hint: None,
             terminal: CardTerminal::Running,
             usage_display: None,
@@ -1831,6 +1982,8 @@ mod tests {
             text: "ok".into(),
             tool_calls: vec![],
             phase: CardPhase::Outputting,
+            thoughts: Vec::new(),
+            todos: Vec::new(),
             queued_hint: None,
             terminal: CardTerminal::Done,
             usage_display: None,
@@ -1843,7 +1996,10 @@ mod tests {
     /// P9-1：空产出占位（空串 patch 可能被拒/显示空白）。
     #[test]
     fn stream_body_final_empty_placeholder() {
-        assert_eq!(stream_body_final("", &[], None), "（未返回内容）");
+        assert_eq!(
+            stream_body_final(&body_card_of("", &[], &[]), None),
+            "（未返回内容）"
+        );
     }
 
     /// P9-2：/config 表单卡——form + select_static 下拉 + 提交按钮（form_action_type）。
@@ -1876,6 +2032,54 @@ mod tests {
         );
     }
 
+    /// W2-2：任务清单渲染——checklist 置正文上方，进度计数 + 进行中 ⏳；
+    /// W2-1：思考片段置底（Running 只显最近 1 条）。
+    #[test]
+    fn stream_body_renders_todos_and_thoughts() {
+        let todos = vec![
+            imagent_core::TodoItem {
+                text: "分析需求".into(),
+                status: imagent_core::TodoStatus::Completed,
+            },
+            imagent_core::TodoItem {
+                text: "写代码".into(),
+                status: imagent_core::TodoStatus::InProgress,
+            },
+            imagent_core::TodoItem {
+                text: "测试".into(),
+                status: imagent_core::TodoStatus::Pending,
+            },
+        ];
+        let mut card = body_card_of("正文内容", &[], &["旧思考", "最新思考"]);
+        card.todos = todos;
+        let md = stream_body_md(&card);
+        assert!(md.contains("**📋 计划**（1/3）"), "进度计数: {md}");
+        assert!(md.contains("- [x] 分析需求"), "完成项: {md}");
+        assert!(md.contains("- [ ] 写代码 ⏳"), "进行中项: {md}");
+        assert!(md.contains("- [ ] 测试"), "待办项: {md}");
+        assert!(md.starts_with("**📋 计划**"), "清单置正文上方: {md}");
+        assert!(md.contains("正文内容"), "正文仍在: {md}");
+        assert!(md.contains("> 💭 最新思考"), "最新思考置底: {md}");
+        assert!(!md.contains("旧思考"), "Running 只显最近 1 条思考: {md}");
+    }
+
+    /// W2-1：终态思考段落（最近 5 条）与整卡折叠面板。
+    #[test]
+    fn final_and_full_card_render_thoughts() {
+        let thoughts: Vec<String> = (0..7).map(|i| format!("思考{i}")).collect();
+        let mut card = body_card_of("结论", &[], &[]);
+        card.thoughts = thoughts.clone();
+        card.terminal = CardTerminal::Done;
+        let out = stream_body_final(&card, None);
+        assert!(out.contains("**💭 思考过程**"), "终态段落标题: {out}");
+        assert!(!out.contains("思考0"), "只保留最近 5 条: {out}");
+        assert!(out.contains("思考6"), "最新思考在: {out}");
+        // 整卡路径：折叠面板（默认收起）承载。
+        let json = render_card(&card, "feishu:ou_t", None);
+        assert!(json.contains("💭 思考过程（7）"), "面板标题带计数: {json}");
+        assert!(json.contains("collapsible_panel"), "面板形态: {json}");
+    }
+
     #[test]
     fn stream_init_card_has_element_id_and_streaming() {
         let json = render_stream_init_card("feishu:ou_t", None);
@@ -1889,20 +2093,23 @@ mod tests {
     #[test]
     fn stream_body_md_text_tools_and_empty() {
         // 空入参给明确状态语（首 chunk 前的静默期）。
-        assert_eq!(stream_body_md("", &[]), "🧠 已接收任务，正在处理…");
+        assert_eq!(
+            stream_body_md(&body_card_of("", &[], &[])),
+            "🧠 已接收任务，正在处理…"
+        );
         // 文本 + 工具都有：引用行 + 状态图标 + 加粗工具名。
         let tools = vec![tool("Bash", "ls -la", false)];
-        let md = stream_body_md("进度", &tools);
+        let md = stream_body_md(&body_card_of("进度", &tools, &[]));
         assert!(md.contains("进度"));
         assert!(md.contains("⏳ **Bash** — ls -la"), "工具引用行: {md}");
         // 仅工具（无正文）。
-        let only = stream_body_md("", &tools);
+        let only = stream_body_md(&body_card_of("", &tools, &[]));
         assert!(only.starts_with("> ⏳"), "无正文时工具行开头: {only}");
         // 超出 5 个折叠 + 计数。
         let many: Vec<ToolCall> = (0..8)
             .map(|i| tool("Read", &format!("f{i}"), true))
             .collect();
-        let md2 = stream_body_md("", &many);
+        let md2 = stream_body_md(&body_card_of("", &many, &[]));
         assert!(md2.contains("前面还有 3 个工具"), "折叠计数: {md2}");
         assert!(!md2.contains("f0"), "最早不展示: {md2}");
         assert!(md2.contains("f7"), "最新可见: {md2}");
@@ -1928,6 +2135,8 @@ mod tests {
             text: "结论".into(),
             tool_calls: vec![tool("Bash", "ls", true)],
             phase: CardPhase::Outputting,
+            thoughts: Vec::new(),
+            todos: Vec::new(),
             queued_hint: None,
             terminal: CardTerminal::Done,
             usage_display: None,
@@ -1956,7 +2165,7 @@ mod tests {
             tool("Bash", "b", true),
             tool("Read", "c", true),
         ];
-        let out = stream_body_final("结论", &tools, None);
+        let out = stream_body_final(&body_card_of("结论", &tools, &[]), None);
         assert!(out.contains("结论"));
         assert!(out.contains("工具 3 次"), "总数: {out}");
         assert!(out.contains("Bash×2"), "工具统计: {out}");
@@ -1967,10 +2176,10 @@ mod tests {
         assert!(out.contains("> ✅ **Bash** — a"), "全量明细: {out}");
         assert!(out.contains("> ✅ **Read** — c"), "全量明细: {out}");
         // Error 终态带 ❌ 前置（具体原因正文承载）。
-        let err = stream_body_final("", &[], Some("boom"));
+        let err = stream_body_final(&body_card_of("", &[], &[]), Some("boom"));
         assert!(err.contains("❌ 出错：boom"), "错误前置: {err}");
         // 中断单列（非出错）。
-        let stop = stream_body_final("", &[], Some("已中断"));
+        let stop = stream_body_final(&body_card_of("", &[], &[]), Some("已中断"));
         assert!(
             stop.contains("⏹ 已中断") && !stop.contains("出错"),
             "中断终态: {stop}"
@@ -2130,6 +2339,8 @@ mod tests {
             text: "".into(),
             tool_calls: vec![],
             phase: CardPhase::Thinking,
+            thoughts: Vec::new(),
+            todos: Vec::new(),
             queued_hint: None,
             terminal: CardTerminal::Running,
             usage_display: None,
@@ -2151,6 +2362,8 @@ mod tests {
             text: "结论".into(),
             tool_calls: tools,
             phase: CardPhase::Outputting,
+            thoughts: Vec::new(),
+            todos: Vec::new(),
             queued_hint: None,
             terminal,
             usage_display: None,
@@ -2283,7 +2496,7 @@ mod tests {
             "Running 无胶囊: {running}"
         );
         // markdown 统计行兜底仍在（managed 终态正文）。
-        let md = stream_body_final("结论", &[tool("Bash", "a", true)], None);
+        let md = stream_body_final(&body_card_of("结论", &[tool("Bash", "a", true)], &[]), None);
         assert!(
             md.contains("工具 1 次") && md.contains("Bash×1"),
             "统计行兜底: {md}"
@@ -2398,7 +2611,7 @@ mod tests {
         let many: Vec<ToolCall> = (0..8)
             .map(|i| tool("Read", &format!("f{i}"), true))
             .collect();
-        let md = stream_body_md("", &many);
+        let md = stream_body_md(&body_card_of("", &many, &[]));
         assert!(md.contains("⋯ 前面还有 3 个工具"), "省略号图标: {md}");
         assert!(!md.contains("☕"), "不再用咖啡杯: {md}");
         let sup = render_permission_card_superseded("Bash");
@@ -2425,7 +2638,7 @@ mod tests {
     /// 降级整卡路径用真 hr 组件 + 面板标题（🔧 工具轨迹）。
     #[test]
     fn long_body_sectioning() {
-        let out = stream_body_final("结论", &[tool("Bash", "a", true)], None);
+        let out = stream_body_final(&body_card_of("结论", &[tool("Bash", "a", true)], &[]), None);
         assert!(out.contains("\n---\n"), "正文与统计间分割线: {out}");
         assert!(out.contains("**工具轨迹**"), "明细块小标题: {out}");
         let json = render_card(
@@ -2506,6 +2719,8 @@ mod tests {
             text: "x".into(),
             tool_calls: vec![],
             phase: CardPhase::Thinking,
+            thoughts: Vec::new(),
+            todos: Vec::new(),
             queued_hint: None,
             terminal: CardTerminal::Done,
             usage_display: None,
@@ -2534,6 +2749,8 @@ mod tests {
             text: "x".into(),
             tool_calls: vec![],
             phase: CardPhase::Thinking,
+            thoughts: Vec::new(),
+            todos: Vec::new(),
             queued_hint: None,
             terminal: CardTerminal::Done,
             usage_display: Some("$0.5".into()),

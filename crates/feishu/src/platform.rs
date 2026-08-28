@@ -788,7 +788,7 @@ impl FeishuPlatform {
     ) -> Result<()> {
         match &card.terminal {
             CardTerminal::Running => {
-                let content = stream_body_md(&card.text, &card.tool_calls);
+                let content = stream_body_md(card);
                 let seq = self.next_card_seq(card_id).await;
                 // 限流丢帧策略（安全批次）：element PATCH 用**不重试**变体——429 重试
                 // 会 sleep 阻塞流式主循环（agent chunk 消费被卡最多 3.5s/次）；改为
@@ -855,7 +855,7 @@ impl FeishuPlatform {
                 let content = if stub {
                     crate::card::stub_body(card.tool_calls.len(), err)
                 } else {
-                    stream_body_final(&card.text, &card.tool_calls, err)
+                    stream_body_final(card, err)
                 };
                 let seq = self.next_card_seq(card_id).await;
                 // 终态用不重试变体：429 不睡（上抛 Err 由 core P5-11 降级纯文本补

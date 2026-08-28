@@ -73,6 +73,9 @@ pub struct TaskBudgets {
     /// 批处理窗口：runner 起跑前等待后续消息并入同一轮的时长（`batch_window_ms`；
     /// 零值 = 关闭）。
     pub batch_window: Duration,
+    /// W2-5：自动 compact 阈值（`auto_compact_threshold_tokens`；0 = 关闭）——
+    /// 成功轮次的上下文水位（usage.input_tokens）达到阈值即自动走 /compact 管道。
+    pub auto_compact_threshold_tokens: u64,
 }
 
 impl TaskBudgets {
@@ -85,6 +88,7 @@ impl TaskBudgets {
             shutdown_grace: Duration::from_secs(c.shutdown_grace_secs),
             agent_idle_timeout: Duration::from_secs(c.agent_idle_timeout_secs),
             batch_window: Duration::from_millis(c.batch_window_ms),
+            auto_compact_threshold_tokens: c.auto_compact_threshold_tokens,
         }
     }
 }
@@ -425,6 +429,8 @@ pub struct Dispatcher {
     /// 批处理窗口：runner 起跑前等待后续消息并入同一轮的时长（零值 = 关闭）。
     /// `/config batch_window_ms` 可热改，故共享句柄。
     batch_window: Arc<RwLock<Duration>>,
+    /// W2-5：自动 compact 阈值（tokens；0 = 关闭）。config 注入。
+    auto_compact_threshold: u64,
     /// 工具过程（COT）展示档位（P4-6）：`/config cot_detail` 可热改。
     cot_detail: Arc<RwLock<CotDetail>>,
     /// 进程启动时刻（`/status` uptime 用）。
@@ -543,6 +549,7 @@ impl Dispatcher {
             shutdown_grace: budgets.shutdown_grace,
             agent_idle_timeout: Arc::new(RwLock::new(budgets.agent_idle_timeout)),
             batch_window: Arc::new(RwLock::new(budgets.batch_window)),
+            auto_compact_threshold: budgets.auto_compact_threshold_tokens,
             cot_detail: Arc::new(RwLock::new(cot_detail)),
             started_at: Instant::now(),
             running: Mutex::new(HashMap::new()),

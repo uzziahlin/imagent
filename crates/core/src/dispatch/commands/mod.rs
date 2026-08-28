@@ -327,7 +327,12 @@ impl Dispatcher {
         let _guard = lock.lock().await;
         while let Some(batch) = self.take_batch_after_window(&conv.0).await {
             let merged = merge_batch(batch);
-            self.run_agent_round(merged).await;
+            let round_input = self.run_agent_round(merged).await;
+            // W2-5：自动 compact——成功轮次的上下文水位超阈值时走既有压缩管道
+            //（conv 锁仍在手，与 /compact 同串行域；无活动会话时内部跳过）。
+            if let Some(in_tokens) = round_input {
+                self.maybe_auto_compact(&conv, &hint, in_tokens).await;
+            }
         }
         drop(_guard);
         self.release_conv_lock(&conv.0, lock).await;
