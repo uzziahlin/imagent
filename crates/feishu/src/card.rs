@@ -330,16 +330,16 @@ fn border_color_of(err: Option<&str>) -> &'static str {
     }
 }
 
-/// CardKit note 组件（提示条）：元信息/警示类注释行（审批倒计时、排队提示、
-/// 掩码警告等）的小字提示形态。
+/// 提示条（元信息/警示类注释行：审批倒计时、排队提示、掩码警告等）的小字形态。
 ///
-/// 字段形态**待真机校准**（本项目未真机验证过 note 组件）；markdown 降级思路＝
-/// 此前形态 `{ "tag": "markdown", "content": …, "text_size": "notation" }`
-/// （note 不被租户卡片接受时回退该写法即可）。
+/// 真机校准结论：schema 2.0 **不支持** `note` 组件（API 230099 / 200861
+/// "unsupported tag note"——审批卡整卡被拒、降级纯文本）。V2 的小字提示用
+/// markdown + `text_size: "notation"`（流式卡 footer 同款，已真机验证可发）。
 fn note_element(text: &str) -> serde_json::Value {
     serde_json::json!({
-        "tag": "note",
-        "elements": [{ "tag": "plain_text", "content": mask_emails(text) }]
+        "tag": "markdown",
+        "content": mask_emails(text),
+        "text_size": "notation"
     })
 }
 
@@ -837,8 +837,8 @@ pub(crate) fn render_permission_card_note(
     let (detail, detail_notes) = perm_detail_md(tool_name, input_summary);
     let mut elements = vec![
         serde_json::json!({ "tag": "markdown", "content": detail }),
-        // 倒计时 / 排队提示 note（CardKit note 组件；此前为 markdown+notation，
-        // 降级回退该形态即可）。md_footer 锚点不受影响（managed 卡约束）。
+        // 倒计时 / 排队提示 note（markdown+notation 小字；note 组件 V2 已移除，
+        // 真机校准 2026-08）。md_footer 锚点不受影响（managed 卡约束）。
         note_element(note),
     ];
     // 截断 / 掩码警告同样 note 化（元信息类注释行）。
@@ -2418,14 +2418,14 @@ mod tests {
         assert_eq!(stub.matches("已完成").count(), 1, "状态词单次: {stub}");
     }
 
-    /// ② note 提示条：审批倒计时 / 排队 note / 掩码警告 / 超时原因均为 note 元素
-    /// （形态待真机校准；降级＝markdown+notation）。
+    /// ② 提示条：审批倒计时 / 排队提示 / 掩码警告 / 超时原因均为 markdown+notation
+    /// 小字（真机校准：note 组件 schema 2.0 已移除，230099/200861）。
     #[test]
     fn note_elements_for_meta_lines() {
         let json =
             render_permission_card("Bash", r#"{"command":"ls"}"#, "feishu:ou_t", "r", None, 300);
         assert!(
-            json.contains("\"tag\":\"note\"") && json.contains("分钟后自动拒绝"),
+            json.contains("\"text_size\":\"notation\"") && json.contains("分钟后自动拒绝"),
             "倒计时 note: {json}"
         );
         let queued = render_permission_card_note(
@@ -2437,7 +2437,7 @@ mod tests {
             "⏳ 等待你审批 · 后面还排着 3 条消息",
         );
         assert!(
-            queued.contains("\"tag\":\"note\"") && queued.contains("等待你审批"),
+            queued.contains("\"text_size\":\"notation\"") && queued.contains("等待你审批"),
             "排队 note: {queued}"
         );
         let masked = render_permission_card(
@@ -2449,16 +2449,16 @@ mod tests {
             300,
         );
         assert!(
-            masked.matches("\"tag\":\"note\"").count() >= 2,
+            masked.matches("\"text_size\":\"notation\"").count() >= 2,
             "倒计时 + 掩码警告两条 note: {masked}"
         );
         assert!(
-            masked.contains("邮箱已掩码显示") && masked.contains("\"tag\":\"note\""),
+            masked.contains("邮箱已掩码显示") && masked.contains("\"text_size\":\"notation\""),
             "掩码警告 note 化: {masked}"
         );
         let cancelled = render_permission_card_cancelled("Bash");
         assert!(
-            cancelled.contains("\"tag\":\"note\"") && cancelled.contains("审批超时"),
+            cancelled.contains("\"text_size\":\"notation\"") && cancelled.contains("审批超时"),
             "超时原因 note: {cancelled}"
         );
         // 问题卡 note 同步。
@@ -2467,7 +2467,7 @@ mod tests {
         })
         .to_string();
         let q = render_question_card(&input, "feishu:ou_t", "r", None, 300).unwrap();
-        assert!(q.contains("\"tag\":\"note\""), "问题卡 note: {q}");
+        assert!(q.contains("\"text_size\":\"notation\""), "问题卡 note: {q}");
     }
 
     /// ③ tag 胶囊墙：终态整卡 elements 带 tag 组件（`Bash×2` 按名计数）；
