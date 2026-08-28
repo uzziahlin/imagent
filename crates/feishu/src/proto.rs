@@ -587,6 +587,11 @@ pub fn thread_key_of_payload(payload: &[u8]) -> Option<String> {
 /// conv 仅在能确定回执目标且**近似通过可见性门槛**（p2p，或群消息带 @）时给出
 /// ——白名单校验在 core 侧（平台 drain 无白名单状态），群内不带 @ 的消息本就
 /// 不会送达 bot，提示也不应发（近似「只对可达用户提示」）。
+///
+/// merged_forward（合并转发）已完整支持（drain 层拉子消息转录，见
+/// [`parse_merged_forward_event`]），此处保留仅作**回退兜底**：事件缺 message_id
+/// （无法拉子消息）时 parse_merged_forward_event 返回 None，走到这里给可行动
+/// 提示（「解析失败回退现状提示」）。
 pub fn unsupported_message_notice(payload: &[u8]) -> Option<(&'static str, Option<ConvId>)> {
     let evt: FeishuEvent = serde_json::from_slice(payload).ok()?;
     if evt.header.event_type != "im.message.receive_v1" {
@@ -596,7 +601,8 @@ pub fn unsupported_message_notice(payload: &[u8]) -> Option<(&'static str, Optio
         "audio" => "🎤 暂不支持语音消息，请输入文字。",
         "share_chat" => "🗂 暂不支持群聊分享卡片，请直接发送文字。",
         "share_user" => "👤 暂不支持用户名片分享，请直接发送文字。",
-        // 合并转发 / 表情包 / 视频（media=视频流、video=旧字段）：parse 侧静默丢弃，
+        // 合并转发（仅回退兜底，正常路径见 parse_merged_forward_event）/
+        // 表情包 / 视频（media=视频流、video=旧字段）：parse 侧静默丢弃，
         // 给可行动提示——用户改发文字或截图即可继续（截图走 image 路径可处理）。
         "merged_forward" | "sticker" | "media" | "video" => {
             "📦 暂不支持合并转发/表情包/视频消息，请直接发文字或截图。"
@@ -976,8 +982,7 @@ pub fn parse_message_event(
     }
     let mt = evt.event.message.message_type.as_str();
     let message_id = evt.event.message.message_id.clone().unwrap_or_default();
-    // 平台消息 id 透传（撤回按此匹配 core 排队消息，见 InboundControl::MessageRecalled）。
-    let source_msg_id = (!message_id.is_empty()).then(|| message_id.clone());
+    // 平台消息 id 透传在组装侧统一做（assemble_event_message 的 source_msg_id）。
     // 群消息 @bot 过滤（P6-1）：在正文清洗前判定，未 @bot 直接丢弃。
     if !group_mention_ok(
         &evt.event.message.chat_type,
@@ -1048,6 +1053,25 @@ pub fn parse_message_event(
         _ => return None, // audio/video/voice/... 暂不支持
     };
 
+    let (dedup_key, msg) = assemble_event_message(&evt, text, &pending, mentions, mt, bot_open_id)?;
+    Some((dedup_key, msg, pending))
+}
+
+/// 消息事件公共组装（`parse_message_event` 与 `parse_merged_forward_event` 共用）：
+/// dedup key（event_id → message_id → 内容哈希回退）、conv（话题群升级）、
+/// `mentioned_bot`、`InboundMessage` 装配。`text`/`pending`/`mentions` 为类型分支
+/// 已提取的产物；`mt` 仅作 dedup 回退兜底（text 与 pending 皆空的极端形态）。
+fn assemble_event_message(
+    evt: &FeishuEvent,
+    text: Option<String>,
+    pending: &[PendingMedia],
+    mentions: Vec<imagent_core::Mention>,
+    mt: &str,
+    bot_open_id: Option<&str>,
+) -> Option<(String, InboundMessage)> {
+    let message_id = evt.event.message.message_id.clone().unwrap_or_default();
+    // 平台消息 id 透传（撤回按此匹配 core 排队消息，见 InboundControl::MessageRecalled）。
+    let source_msg_id = (!message_id.is_empty()).then(|| message_id.clone());
     let open_id = evt.event.sender.sender_id.open_id.clone();
     let (receive_id, _kind) = receive_target(&evt.event)?;
     // dedup 回退基准：优先正文内容哈希，其次首个媒体 key，最后用消息类型兜底
@@ -1099,12 +1123,17 @@ pub fn parse_message_event(
         mentions,
         mentioned_bot,
         ask_req: None,
-        reply_to: evt.event.message.parent_id.filter(|p| !p.is_empty()),
+        reply_to: evt
+            .event
+            .message
+            .parent_id
+            .clone()
+            .filter(|p| !p.is_empty()),
         source_msg_id,
         control: None,
         reply_hint: ReplyHint::None,
     };
-    Some((dedup_key, msg, pending))
+    Some((dedup_key, msg))
 }
 
 /// 群消息 @bot 过滤（P6-1）。
@@ -1278,6 +1307,269 @@ fn parse_post(
         Some(texts.join("\n"))
     };
     Some((text, pending, mentions))
+}
+
+// ---------------------------------------------------------------------------
+// im.message.receive_v1 · merged_forward（合并转发消息完整支持）
+// ---------------------------------------------------------------------------
+
+/// 「查询合并转发消息列表」（GET `/im/v1/messages/{message_id}/merge_forward`）
+/// 返回的子消息条目（`client::list_merge_forward` 分页聚齐后交本模块转录）。
+/// 字段按飞书文档公开形态建模，**待真机校准**（宽容提取见 client 侧注释：
+/// message_type/msg_type 两名、时间戳字符串/数字/秒级归一等都兼容）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergedForwardItem {
+    /// 子消息 id（转录不直接用；保留排障与后续嵌套展开用）。
+    pub message_id: String,
+    /// 子消息类型（text/post/image/file/...；子消息里可能再次出现 merged_forward）。
+    pub message_type: String,
+    /// 子消息 content（JSON 字符串，形态同普通消息：`{"text":"…"}` 等）。
+    pub content: String,
+    /// 发送者标识（open_id / user_id 等，随 API 的 sender.id_type）。
+    pub sender_id: String,
+    /// 发送者显示名（可缺省——缺失时转录用 id 后 8 位，见 sender_label）。
+    pub sender_name: Option<String>,
+    /// 创建时间（毫秒 epoch；0 = 缺失/非法，转录行省略时间段）。
+    pub create_time_ms: i64,
+}
+
+/// drain 层转录一条合并转发消息所需的元数据（见 [`parse_merged_forward_event`]）。
+#[derive(Debug)]
+pub struct MergedForwardMeta {
+    /// 合并转发消息自身的 message_id（「查询合并转发消息列表」API 入参）。
+    pub message_id: String,
+    /// 转录头标题（事件 content JSON 可解析时给出；缺省头回退「共 N 条」）。
+    pub title: Option<String>,
+    /// 转录头摘要（同上，可缺省——有则作头部的第二行）。
+    pub summary: Option<String>,
+}
+
+/// merged_forward 消息 content 的头元数据结构。事件侧 content 常为占位文本
+/// （"Merged and Forwarded Message"），title/summary 仅在 content 恰为可解析
+/// JSON 时可用——**待真机校准**（离线按飞书文档公开形态建模：title + summary，
+/// 均可缺省；占位/非法 JSON 走 [`Option::unwrap_or_default`] 全空，头回退条数）。
+#[derive(Debug, Default, Deserialize)]
+struct MergedForwardContent {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    summary: Option<String>,
+}
+
+/// 合并转发转录的长度上限（**字符**而非字节——CJK 安全）。超限截断并在尾部
+/// 标注「（已截断，共 N 条中前 M 条）」，防 agent prompt 被超大转发记录撑爆。
+pub const MERGE_FORWARD_TRANSCRIPT_MAX: usize = 8_000;
+
+/// 合并转发入站消息的占位正文：parse 阶段先占位，drain 拉到子消息后替换为
+/// 转录文本（拉取失败不进 agent——占位不外泄，仅防御 drain 异常路径）。
+pub(crate) const MERGE_FORWARD_PLACEHOLDER: &str = "[合并转发消息]";
+
+/// 解析合并转发消息事件（message_type = `merged_forward`）→
+/// `(dedup_key, 入站消息（占位正文）, 拉取元数据)`。完整支持（替换 v1.12.0 的
+/// 「暂不支持」快赢）：事件只带占位 content，真实子消息由 drain 层按
+/// `meta.message_id` 调 `client::list_merge_forward` 分页拉取，转录回填
+/// `msg.text`（转录见 [`render_merge_forward_transcript`]，drain 见 platform）。
+///
+/// - 群内仍要求 @bot（`group_mention_ok` 与普通消息同门槛，无特判）；
+/// - content JSON 的 title/summary **尽力解析**（占位文本/非法 JSON → None，
+///   头回退「共 N 条」——占位 content 是常态，不能因此拒收）；
+/// - 缺 message_id → None（无法拉子消息），走 `unsupported_message_notice`
+///   的兜底提示（「解析失败回退现状提示」）；
+/// - 不产生 PendingMedia（子消息的图片/文件一期只占位不下载，与媒体下载
+///   管线无冲突）；dedup 走既有管线（drain 侧 `dedup.check`）。
+///
+/// 非 merged_forward 消息 / 非目标事件 / 非法 JSON / 群消息未 @bot（按 policy）
+/// 返回 None。
+pub fn parse_merged_forward_event(
+    payload: &[u8],
+    policy: &MentionPolicy,
+    bot_open_id: Option<&str>,
+) -> Option<(String, InboundMessage, MergedForwardMeta)> {
+    let evt: FeishuEvent = serde_json::from_slice(payload).ok()?;
+    if evt.header.event_type != "im.message.receive_v1" {
+        return None;
+    }
+    if evt.event.message.message_type != "merged_forward" {
+        return None;
+    }
+    let message_id = evt
+        .event
+        .message
+        .message_id
+        .clone()
+        .filter(|m| !m.is_empty())?;
+    if !group_mention_ok(
+        &evt.event.message.chat_type,
+        &evt.event.message.mentions,
+        policy,
+        bot_open_id,
+    ) {
+        return None;
+    }
+    // 头元数据尽力解析：占位文本/非法 JSON → 全空（头回退「共 N 条」）。
+    let head: MergedForwardContent =
+        serde_json::from_str(&evt.event.message.content).unwrap_or_default();
+    // 占位正文：drain 拉到子消息后替换为转录文本（见 platform drain）。
+    let (key, msg) = assemble_event_message(
+        &evt,
+        Some(MERGE_FORWARD_PLACEHOLDER.to_string()),
+        &[],
+        Vec::new(),
+        "merged_forward",
+        bot_open_id,
+    )?;
+    Some((
+        key,
+        msg,
+        MergedForwardMeta {
+            message_id,
+            title: head.title,
+            summary: head.summary,
+        },
+    ))
+}
+
+/// 把子消息列表转录为人可读且 agent 友好的文本块（纯函数，验收核心）：
+///
+/// ```text
+/// 【合并转发聊天记录】{title 或 "共 N 条"}
+/// {summary（可缺省，有则单独一行）}
+/// [发送者标识 12:34] 文本内容
+/// [发送者标识 12:35] [图片]
+/// [发送者标识 12:36] [合并转发消息（嵌套）]
+/// ```
+///
+/// - 发送者标识：name 优先（非空），否则 id 后 8 位（不足取全部；全缺 → 「未知」）；
+/// - 时间 HH:MM：create_time 毫秒 → 本地时区（chrono Local）；缺/非法省略时间段；
+/// - 子消息类型映射见 [`merge_forward_body`]（媒体一期不下载，占位示意）；
+/// - 超过 [`MERGE_FORWARD_TRANSCRIPT_MAX`] 按字符边界截断，尾部标注条数。
+pub fn render_merge_forward_transcript(
+    items: &[MergedForwardItem],
+    title: Option<&str>,
+    summary: Option<&str>,
+) -> String {
+    let n = items.len();
+    let title = title.map(str::trim).filter(|t| !t.is_empty());
+    let mut out = match title {
+        Some(t) => format!("【合并转发聊天记录】{t}"),
+        None => format!("【合并转发聊天记录】共 {n} 条"),
+    };
+    let mut used = out.chars().count();
+    if let Some(s) = summary.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push('\n');
+        out.push_str(s);
+        used += 1 + s.chars().count();
+    }
+    let mut included = 0usize;
+    let mut truncated = false;
+    for item in items {
+        let line = format!("\n{}", merge_forward_line(item));
+        let ll = line.chars().count();
+        if used + ll > MERGE_FORWARD_TRANSCRIPT_MAX {
+            // 首条就超限也硬截保留一条（空转录对 agent 无信息量）；按字符边界截。
+            if included == 0 {
+                let room = MERGE_FORWARD_TRANSCRIPT_MAX.saturating_sub(used);
+                out.push_str(&line.chars().take(room).collect::<String>());
+                included = 1;
+            }
+            truncated = true;
+            break;
+        }
+        out.push_str(&line);
+        used += ll;
+        included += 1;
+    }
+    if truncated {
+        out.push_str(&format!("\n（已截断，共 {n} 条中前 {included} 条）"));
+    }
+    out
+}
+
+/// 单条子消息 → `[发送者标识 HH:MM] 正文` 行（时间缺省 → `[发送者标识] 正文`）。
+fn merge_forward_line(item: &MergedForwardItem) -> String {
+    let sender = merge_forward_sender_label(&item.sender_name, &item.sender_id);
+    let body = merge_forward_body(item);
+    match merge_forward_time_label(item.create_time_ms) {
+        Some(t) => format!("[{sender} {t}] {body}"),
+        None => format!("[{sender}] {body}"),
+    }
+}
+
+/// 发送者标识：name 优先（非空），否则 id 后 8 位（不足 8 位取全部；全缺 → 未知）。
+/// 后 8 位是「无名字时仍可区分不同发言人」的最短稳定形态（ou_/oc_ 前缀对人不
+/// 可读，整串太长刷屏）。
+fn merge_forward_sender_label(name: &Option<String>, id: &str) -> String {
+    if let Some(n) = name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        return n.to_string();
+    }
+    if id.is_empty() {
+        return "未知".to_string();
+    }
+    let tail: String = id
+        .chars()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    tail
+}
+
+/// create_time 毫秒 → 本地时区 HH:MM（缺/非法/超范围 → None，行内省略时间）。
+fn merge_forward_time_label(ms: i64) -> Option<String> {
+    use chrono::TimeZone;
+    if ms <= 0 {
+        return None;
+    }
+    chrono::Local
+        .timestamp_millis_opt(ms)
+        .single()
+        .map(|dt| dt.format("%H:%M").to_string())
+}
+
+/// 子消息类型 → 转录正文。媒体类（图片/表情/视频/文件）一期**不下载**，只占位
+/// 让 agent 知道「这里有个媒体」（用户需要细节可截图/单发）；text/post 取文字。
+fn merge_forward_body(item: &MergedForwardItem) -> String {
+    match item.message_type.as_str() {
+        // text：取 content JSON 的 text；@_user_N 占位**保留原样**——子消息无
+        // mentions 元数据（API 不回该字段），正则清掉会丢「此处有 @」的语义、
+        // 名字又无从还原，保留原样是最简单且不撒谎的选择（真机确认子消息
+        // content 确实带占位后再考虑清洗）。
+        "text" => extract_text(&item.content).unwrap_or_else(|| "[文本消息]".to_string()),
+        // post：复用既有 post→文本逻辑（parse_post）。图片节点一期不下载：有文字
+        // 只取文字（agent 拿不到图，占位反而误导）；纯图 post 以 [图片] 示意。
+        "post" => match parse_post(&item.content, None) {
+            Some((Some(t), _, _)) if !t.trim().is_empty() => t,
+            Some((_, pending, _)) if !pending.is_empty() => "[图片]".to_string(),
+            _ => "[富文本消息]".to_string(),
+        },
+        "image" => "[图片]".to_string(),
+        "sticker" | "emotion" => "[表情]".to_string(),
+        // file：content JSON 有 file_name 则带上（agent 至少知道是什么文件）。
+        "file" => {
+            let name = serde_json::from_str::<serde_json::Value>(&item.content)
+                .ok()
+                .and_then(|v| {
+                    v.get("file_name")
+                        .and_then(|f| f.as_str())
+                        .map(str::trim)
+                        .filter(|f| !f.is_empty())
+                        .map(String::from)
+                });
+            match name {
+                Some(n) => format!("[文件: {n}]"),
+                None => "[文件]".to_string(),
+            }
+        }
+        "media" | "video" => "[视频]".to_string(),
+        "interactive" => "[卡片消息]".to_string(),
+        // 嵌套合并转发：**不递归**调 list_merge_forward——嵌套层数无界，每层一次
+        // 分页拉取，深度 × API 配额易失控（用户「转发套转发」是常态），一期只
+        // 标注占位让 agent 知道结构，用户需要细节可展开后单发。
+        "merged_forward" => "[合并转发消息（嵌套）]".to_string(),
+        _ => "[未知类型消息]".to_string(),
+    }
 }
 
 /// 按 chat_type 决定发回的 receive_id：
@@ -2425,7 +2717,10 @@ mod tests {
     }
 
     /// 快赢：合并转发 / 表情包 / 视频（merged_forward / sticker / media / video）
-    /// 给统一提示「暂不支持……请直接发文字或截图」（此前静默丢弃，用户无感知）。
+    /// 给统一提示「暂不支持……请直接发文字或截图」。合并转发已完整支持，本提示
+    /// 仅作**回退兜底**（事件缺 message_id 时，见
+    /// parse_merged_forward_event_missing_id_falls_to_notice）；表情包/视频仍是
+    /// 主路径提示。
     #[test]
     fn unsupported_message_notice_rich_media_kinds() {
         let mk = |mt: &str| {
@@ -2495,6 +2790,301 @@ mod tests {
         assert!(text.contains("[视频]"), "media 占位: {text}");
         assert!(text.contains("[表情]"), "emotion 占位: {text}");
         assert!(pending.is_empty(), "media/emotion 不进待下载图片列表");
+    }
+
+    // ---------- 合并转发消息（merged_forward）完整支持 ----------
+
+    /// 构造 merged_forward 消息事件 payload bytes（content 为「JSON 字符串」字段，
+    /// 与飞书真实事件形态一致——可能是合法 JSON，也可能是占位文本；mentions 仅
+    /// 群消息需要）。
+    fn mk_merged_forward_payload(
+        event_id: &str,
+        message_id: Option<&str>,
+        content: &str,
+        chat_type: &str,
+        mentions: &str,
+    ) -> Vec<u8> {
+        let mut message = serde_json::json!({
+            "message_type": "merged_forward",
+            "content": content,
+            "chat_type": chat_type,
+            "chat_id": "oc_g1"
+        });
+        if let Some(m) = message_id {
+            message["message_id"] = serde_json::json!(m);
+        }
+        if !mentions.is_empty() {
+            message["mentions"] = serde_json::from_str::<serde_json::Value>(mentions).unwrap();
+        }
+        serde_json::json!({
+            "header": {"event_id": event_id, "event_type": "im.message.receive_v1"},
+            "event": {
+                "sender": {"sender_id": {"open_id": "ou_fwd"}},
+                "message": message,
+                "chat": {"chat_id": "oc_g1"}
+            }
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// 构造子消息条目（转录测试用）。
+    fn mf_item(
+        mt: &str,
+        content: &str,
+        name: Option<&str>,
+        id: &str,
+        ms: i64,
+    ) -> MergedForwardItem {
+        MergedForwardItem {
+            message_id: format!("om_sub_{mt}"),
+            message_type: mt.to_string(),
+            content: content.to_string(),
+            sender_id: id.to_string(),
+            sender_name: name.map(String::from),
+            create_time_ms: ms,
+        }
+    }
+
+    /// p2p merged_forward：正常产出（占位正文 + meta 带 content JSON 的
+    /// title/summary）；content 为占位文本（非法 JSON）时 meta 头字段回退 None。
+    #[test]
+    fn parse_merged_forward_event_p2p_with_head_meta() {
+        let content = r#"{"title":"周五排期讨论","summary":"3 条"}"#;
+        let p = mk_merged_forward_payload("evt_mf1", Some("om_mf1"), content, "p2p", "");
+        // 普通消息分支不收 merged_forward（完整支持在专用解析）。
+        assert!(parse_message_event(&p, &MentionPolicy::PERMISSIVE, None).is_none());
+        let (key, msg, meta) = parse_merged_forward_event(&p, &MentionPolicy::REQUIRE_BOT, None)
+            .expect("p2p merged_forward 应产出");
+        assert_eq!(key, "evt_mf1");
+        assert_eq!(meta.message_id, "om_mf1");
+        assert_eq!(meta.title.as_deref(), Some("周五排期讨论"));
+        assert_eq!(meta.summary.as_deref(), Some("3 条"));
+        assert_eq!(msg.conv_id.0, "feishu:ou_fwd");
+        assert_eq!(msg.sender.0, "ou_fwd");
+        assert_eq!(msg.text.as_deref(), Some(MERGE_FORWARD_PLACEHOLDER));
+        assert_eq!(msg.source_msg_id.as_deref(), Some("om_mf1"));
+        assert!(!msg.mentioned_bot, "p2p 恒 false");
+
+        // 占位文本 content（v1.12.0 观察到的形态）：meta 头字段 None，仍正常产出。
+        let p2 = mk_merged_forward_payload(
+            "evt_mf2",
+            Some("om_mf2"),
+            "Merged and Forwarded Message",
+            "p2p",
+            "",
+        );
+        let (_, msg2, meta2) = parse_merged_forward_event(&p2, &MentionPolicy::PERMISSIVE, None)
+            .expect("占位 content 应产出");
+        assert_eq!(meta2.message_id, "om_mf2");
+        assert_eq!(meta2.title, None);
+        assert_eq!(meta2.summary, None);
+        assert_eq!(msg2.text.as_deref(), Some(MERGE_FORWARD_PLACEHOLDER));
+    }
+
+    /// 群内仍要求 @bot：REQUIRE_BOT 下未 @bot → None；@bot → 通过。
+    #[test]
+    fn parse_merged_forward_event_group_mention_gate() {
+        let content = r#"{"title":"t"}"#;
+        let no_at = mk_merged_forward_payload("evt_mf3", Some("om_mf3"), content, "group", "[]");
+        assert!(
+            parse_merged_forward_event(&no_at, &MentionPolicy::REQUIRE_BOT, Some("ou_bot"))
+                .is_none(),
+            "群消息未 @bot 应丢弃"
+        );
+        let at_bot = mk_merged_forward_payload(
+            "evt_mf3",
+            Some("om_mf3"),
+            content,
+            "group",
+            r#"[{"key":"@_user_1","id":{"open_id":"ou_bot"},"name":"agent"}]"#,
+        );
+        let (key, msg, meta) =
+            parse_merged_forward_event(&at_bot, &MentionPolicy::REQUIRE_BOT, Some("ou_bot"))
+                .expect("群 @bot 应通过");
+        assert_eq!(key, "evt_mf3");
+        assert_eq!(msg.conv_id.0, "feishu:oc_g1");
+        assert_eq!(meta.message_id, "om_mf3");
+        assert!(msg.mentioned_bot, "@bot 元数据应置位");
+    }
+
+    /// 缺 message_id（无法拉子消息）→ None，走 unsupported_message_notice 的兜底
+    /// 提示（「解析失败回退现状提示」）；非 merged_forward 类型不误收。
+    #[test]
+    fn parse_merged_forward_event_missing_id_falls_to_notice() {
+        let p = mk_merged_forward_payload("evt_mf4", None, "{}", "p2p", "");
+        assert!(parse_merged_forward_event(&p, &MentionPolicy::PERMISSIVE, None).is_none());
+        let (notice, conv) = unsupported_message_notice(&p).expect("缺 message_id 应回退提示");
+        assert!(notice.contains("暂不支持合并转发"), "{notice}");
+        assert_eq!(conv.unwrap().0, "feishu:ou_fwd");
+        // 非目标事件 / 非 merged_forward 消息类型 → None。
+        let text_payload = br#"{"header":{"event_type":"im.message.receive_v1"},
+            "event":{"sender":{"sender_id":{"open_id":"ou_x"}},"message":{"message_type":"text","content":"{\"text\":\"hi\"}","chat_type":"p2p","message_id":"om_t"}}}"#;
+        assert!(
+            parse_merged_forward_event(text_payload, &MentionPolicy::PERMISSIVE, None).is_none()
+        );
+    }
+
+    /// 转录：类型映射（text 原文/图片/表情/文件带名与缺名/视频/卡片/嵌套合并
+    /// 转发/未知）、发送者标识（name / id 后 8 位 / 未知）、时间 HH:MM 与缺省。
+    #[test]
+    fn render_transcript_type_and_sender_mapping() {
+        use chrono::TimeZone;
+        // 本地时区构造 09:05 → 格式化必为 "09:05"（构造与渲染同为 Local，确定性）。
+        let ms = chrono::Local
+            .with_ymd_and_hms(2026, 8, 28, 9, 5, 0)
+            .unwrap()
+            .timestamp_millis();
+        let items = vec![
+            mf_item("text", r#"{"text":"文本内容"}"#, Some("Alice"), "ou_a", ms),
+            mf_item(
+                "image",
+                r#"{"image_key":"img_v3_x"}"#,
+                None,
+                "ou_bbbbbbbb9999",
+                ms + 60_000,
+            ),
+            mf_item("sticker", "{}", None, "ou_c", 0),
+            mf_item("emotion", "{}", None, "ou_c", 0),
+            mf_item(
+                "file",
+                r#"{"file_key":"file_v3_1","file_name":"报告.pdf"}"#,
+                Some("Bob"),
+                "ou_d",
+                0,
+            ),
+            mf_item(
+                "file",
+                r#"{"file_key":"file_v3_2"}"#,
+                Some("Bob"),
+                "ou_d",
+                0,
+            ),
+            mf_item("media", "{}", Some("Bob"), "ou_d", 0),
+            mf_item("video", "{}", Some("Bob"), "ou_d", 0),
+            mf_item("interactive", "{}", Some("Bob"), "ou_d", 0),
+            mf_item("merged_forward", "{}", Some("Bob"), "ou_d", 0),
+            mf_item("audio", "{}", Some("Bob"), "ou_d", 0),
+            mf_item("unknown_kind", "{}", None, "", 0),
+        ];
+        let t = render_merge_forward_transcript(&items, None, None);
+        assert!(t.starts_with("【合并转发聊天记录】共 12 条"), "{t}");
+        assert!(t.contains("[Alice 09:05] 文本内容"), "{t}");
+        // 无 name → id 后 8 位；时间正常（ms+60s → 09:06）。
+        assert!(t.contains("[bbbb9999 09:06] [图片]"), "{t}");
+        // create_time 缺失（0）→ 省略时间段。
+        assert!(t.contains("[ou_c] [表情]"), "{t}");
+        assert!(t.contains("[Bob] [文件: 报告.pdf]"), "{t}");
+        assert!(t.contains("[Bob] [文件]"), "{t}");
+        assert!(t.contains("[Bob] [视频]"), "{t}");
+        assert!(t.contains("[Bob] [卡片消息]"), "{t}");
+        assert!(t.contains("[Bob] [合并转发消息（嵌套）]"), "{t}");
+        assert!(t.contains("[Bob] [未知类型消息]"), "{t}");
+        assert!(t.contains("[未知] [未知类型消息]"), "id 全缺 → 未知: {t}");
+        assert!(!t.contains("已截断"), "未超限不应有截断标注: {t}");
+
+        // title/summary 头：title 优先于条数；summary 单独一行。
+        let t2 = render_merge_forward_transcript(&items[..1], Some("周五排期"), Some("3 条"));
+        assert!(
+            t2.starts_with("【合并转发聊天记录】周五排期\n3 条\n"),
+            "{t2}"
+        );
+
+        // 空列表：仅头。
+        let t3 = render_merge_forward_transcript(&[], None, None);
+        assert_eq!(t3, "【合并转发聊天记录】共 0 条");
+    }
+
+    /// 转录：post 子消息复用 post→文本逻辑（文字优先、纯图占位、空 post 占位）；
+    /// text 子消息的 @_user_N 占位保留原样（无 mentions 元数据，见取舍注释）。
+    #[test]
+    fn render_transcript_post_and_at_placeholder() {
+        let post_text = serde_json::to_string(&serde_json::json!({
+            "title": "周报",
+            "content": [[{"tag": "text", "text": "本周进展"}]]
+        }))
+        .unwrap();
+        let post_img_only = serde_json::to_string(&serde_json::json!({
+            "content": [[{"tag": "img", "image_key": "img_only"}]]
+        }))
+        .unwrap();
+        let post_empty = serde_json::to_string(&serde_json::json!({ "content": [] })).unwrap();
+        let items = vec![
+            mf_item("post", &post_text, Some("Alice"), "ou_a", 0),
+            mf_item("post", &post_img_only, Some("Alice"), "ou_a", 0),
+            mf_item("post", &post_empty, Some("Alice"), "ou_a", 0),
+            mf_item(
+                "text",
+                r#"{"text":"@_user_1 看这个"}"#,
+                Some("Bob"),
+                "ou_b",
+                0,
+            ),
+        ];
+        let t = render_merge_forward_transcript(&items, None, None);
+        assert!(
+            t.contains("[Alice] 周报\n[Alice] 本周进展") || t.contains("[Alice] 周报"),
+            "{t}"
+        );
+        assert!(t.contains("本周进展"), "post 文字进转录: {t}");
+        assert!(t.contains("[Alice] [图片]"), "纯图 post 占位: {t}");
+        assert!(t.contains("[Alice] [富文本消息]"), "空 post 占位: {t}");
+        assert!(t.contains("[Bob] @_user_1 看这个"), "占位保留原样: {t}");
+    }
+
+    /// 转录截断保护：超 8000 字符按字符边界截断，尾部标注「（已截断，共 N 条中
+    /// 前 M 条）」；未超限无标注；首条超长也硬截保留一条。
+    #[test]
+    fn render_transcript_truncation() {
+        let long = "很".repeat(4_000);
+        let items = vec![
+            mf_item(
+                "text",
+                &format!(r#"{{"text":"{long}"}}"#),
+                Some("A"),
+                "ou_a",
+                0,
+            ),
+            mf_item(
+                "text",
+                &format!(r#"{{"text":"{long}"}}"#),
+                Some("B"),
+                "ou_b",
+                0,
+            ),
+        ];
+        let t = render_merge_forward_transcript(&items, None, None);
+        assert!(t.contains("（已截断，共 2 条中前 1 条）"), "{t}");
+        // 截断后主体（去标注行）不超过上限；标注行本身是元信息不计入。
+        let body = t.split("\n（已截断").next().unwrap();
+        assert!(
+            body.chars().count() <= MERGE_FORWARD_TRANSCRIPT_MAX,
+            "{}",
+            body.chars().count()
+        );
+
+        // 未超限：无标注。
+        let short = vec![mf_item("text", r#"{"text":"短"}"#, Some("A"), "ou_a", 0)];
+        let t2 = render_merge_forward_transcript(&short, None, None);
+        assert!(!t2.contains("已截断"), "{t2}");
+
+        // 单条超长（首条即超限）：硬截保留 1 条 + 标注。
+        let huge = "长".repeat(20_000);
+        let one = vec![mf_item(
+            "text",
+            &format!(r#"{{"text":"{huge}"}}"#),
+            None,
+            "ou_x",
+            0,
+        )];
+        let t3 = render_merge_forward_transcript(&one, None, None);
+        assert!(t3.contains("（已截断，共 1 条中前 1 条）"), "{t3}");
+        let body3 = t3.split("\n（已截断").next().unwrap();
+        assert!(
+            body3.chars().count() <= MERGE_FORWARD_TRANSCRIPT_MAX,
+            "{}",
+            body3.chars().count()
+        );
     }
 
     /// 安全（转发代批）：带 sender 的审批/问题/表单按钮 value，**全形态**（含私聊

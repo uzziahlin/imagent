@@ -32,15 +32,17 @@ use crate::card::{
 };
 use crate::client::{
     create_card_entity, download_file, download_image, fetch_bot_open_id, fetch_token,
-    is_card_not_exist_msg, is_rate_limited_msg, list_joined_chats, patch_card, patch_card_element,
-    patch_card_settings, reply_comment, reply_comment_nodes, reply_message, send_card_msg,
-    send_file_msg, send_image_msg, send_text_msg, upload_file, upload_image, FeishuWsClient,
+    is_card_not_exist_msg, is_rate_limited_msg, list_joined_chats, list_merge_forward, patch_card,
+    patch_card_element, patch_card_settings, reply_comment, reply_comment_nodes, reply_message,
+    send_card_msg, send_file_msg, send_image_msg, send_text_msg, upload_file, upload_image,
+    FeishuWsClient,
 };
 use crate::proto::{
     comment_target_from_conv, is_comment_event, is_group_message_event, is_private_conv,
     parse_bot_removed_event, parse_card_action_event, parse_comment_event, parse_menu_event,
-    parse_message_event, parse_recall_event, receive_target_from_conv, thread_key_of_payload,
-    thread_target_from_conv, unsupported_message_notice, ReceiveIdKind, COMMENT_CONV_PREFIX,
+    parse_merged_forward_event, parse_message_event, parse_recall_event, receive_target_from_conv,
+    render_merge_forward_transcript, thread_key_of_payload, thread_target_from_conv,
+    unsupported_message_notice, MergedForwardItem, ReceiveIdKind, COMMENT_CONV_PREFIX,
 };
 
 /// 平台名常量。
@@ -408,6 +410,81 @@ impl FeishuPlatform {
                     }
                     if inbound_msg_tx.send(msg).await.is_err() {
                         break;
+                    }
+                    continue;
+                }
+                // 合并转发消息（merged_forward，完整支持——替换 v1.12.0 的「暂不
+                // 支持」快赢）：按 meta.message_id 调「查询合并转发消息列表」API
+                // 分页拉全子消息 → 转录为文本注入 agent（转录见
+                // proto::render_merge_forward_transcript，拉取见 client::list_merge_forward）。
+                // 走既有 dedup 管线；不产生 PendingMedia（子消息图片/文件一期只
+                // 占位不下载，与媒体下载管线无冲突）；群内仍要求 @bot（parse 内
+                // 沿用 group_mention_ok，无特判）。
+                if let Some((key, mut mf_msg, meta)) =
+                    parse_merged_forward_event(&payload, &policy, bot.as_deref())
+                {
+                    if !dedup.check(&key) {
+                        continue;
+                    }
+                    // 与普通消息一致的登记（转录消息同样发起一轮 agent）：conv 发起
+                    // 者（审批卡点击者校验锚）/ 普通群回复锚点 / 话题活跃免 @ 续期。
+                    conv_senders_for_drain
+                        .lock()
+                        .await
+                        .insert(mf_msg.conv_id.0.clone(), mf_msg.sender.0.clone());
+                    if let Some((conv, anchor)) =
+                        group_reply_anchor(&mf_msg.conv_id.0, mf_msg.source_msg_id.as_deref())
+                    {
+                        reply_anchors_for_drain.lock().await.insert(conv, anchor);
+                    }
+                    if let Some(tk) = &thread_key {
+                        let mut m = thread_active_for_drain.lock().await;
+                        if m.len() > 512 {
+                            m.clear(); // 粗上限：超量整体重置（窗口语义无损）。
+                        }
+                        m.insert(tk.clone(), Instant::now());
+                    }
+                    // 拉子消息（token lazy 缓存 + 失效码清缓存自愈一次，与媒体
+                    // 下载路径同姿态，见 fetch_merge_forward_items）。
+                    let fetched = fetch_merge_forward_items(
+                        &core_config_for_drain,
+                        &token_for_drain,
+                        &app_id_for_drain,
+                        &app_secret_for_drain,
+                        &meta.message_id,
+                    )
+                    .await;
+                    match merge_forward_outcome(
+                        &fetched,
+                        meta.title.as_deref(),
+                        meta.summary.as_deref(),
+                    ) {
+                        MergeForwardOutcome::Agent(text) => {
+                            // 转录块作为消息文本送入 agent（占位正文在此替换）。
+                            mf_msg.text = Some(text);
+                            if inbound_msg_tx.send(mf_msg).await.is_err() {
+                                break;
+                            }
+                        }
+                        MergeForwardOutcome::Fallback(notice) => {
+                            // 拉取失败（权限/网络/消息过期）：回可行动提示，不进
+                            // agent——占位正文不外泄；dedup 已消费，事件重投不会
+                            // 反复打提示。
+                            warn!(
+                                target: "feishu",
+                                message_id = %meta.message_id,
+                                "拉取合并转发子消息失败，回退提示"
+                            );
+                            send_drain_text(
+                                &core_config_for_drain,
+                                &token_for_drain,
+                                &app_id_for_drain,
+                                &app_secret_for_drain,
+                                &mf_msg.conv_id,
+                                &notice,
+                            )
+                            .await;
+                        }
                     }
                     continue;
                 }
@@ -1332,6 +1409,57 @@ async fn ensure_bot_open_id(
             error = %e,
             "取 bot open_id 失败，@bot 过滤退化为弱过滤（须含 @）"
         ),
+    }
+}
+
+/// 拉取合并转发子消息（drain task 用）：token lazy 缓存取用，遇 token 失效类
+/// 错误码清缓存强制刷新后重试一次（与媒体下载路径同姿态），其余错误如实上抛
+/// 由调用方走回退提示。
+async fn fetch_merge_forward_items(
+    core_config: &CoreConfig,
+    token_lock: &Arc<RwLock<Option<(String, Instant)>>>,
+    app_id: &str,
+    app_secret: &str,
+    message_id: &str,
+) -> Result<Vec<MergedForwardItem>> {
+    let t = fetch_cached_token(token_lock, core_config, app_id, app_secret).await?;
+    match list_merge_forward(core_config, &t, message_id).await {
+        Err(e) if crate::client::is_token_invalid_msg(&e.to_string()) => {
+            warn!(target: "feishu", error = %e, "合并转发拉取遇 token 失效码，清缓存刷新后重试一次");
+            *token_lock.write().await = None;
+            let fresh = fetch_cached_token(token_lock, core_config, app_id, app_secret).await?;
+            list_merge_forward(core_config, &fresh, message_id).await
+        }
+        other => other,
+    }
+}
+
+/// 合并转发消息的 drain 产出（纯函数，便于单测）：
+/// - `Agent`：拉取成功 → 消息正文（「（以下为用户转发的聊天记录）」前缀 + 转录
+///   块），drain 回填 `msg.text` 后进 agent；
+/// - `Fallback`：拉取失败（权限/网络/消息过期）→ 用户可读提示文案，**不进
+///   agent**——drain 回提示后丢弃消息（占位正文不外泄，见 drain 分支注释）。
+#[derive(Debug)]
+enum MergeForwardOutcome {
+    Agent(String),
+    Fallback(String),
+}
+
+/// [`MergeForwardOutcome`] 的决策函数：把 `client::list_merge_forward` 的结果映射
+/// 为入站正文或回退提示（转录头元数据来自事件 content 的尽力解析）。
+fn merge_forward_outcome(
+    fetched: &Result<Vec<MergedForwardItem>>,
+    title: Option<&str>,
+    summary: Option<&str>,
+) -> MergeForwardOutcome {
+    match fetched {
+        Ok(items) => MergeForwardOutcome::Agent(format!(
+            "（以下为用户转发的聊天记录）\n\n{}",
+            render_merge_forward_transcript(items, title, summary)
+        )),
+        Err(e) => MergeForwardOutcome::Fallback(format!(
+            "⚠️ 无法读取合并转发内容（{e}），请直接复制文字发送"
+        )),
     }
 }
 
@@ -2572,6 +2700,46 @@ mod tests {
         assert_eq!(thread_window_of(0), Duration::ZERO);
         assert_eq!(thread_window_of(600), Duration::from_secs(600));
         assert_eq!(thread_window_of(1800), Duration::from_secs(30 * 60));
+    }
+
+    /// 合并转发 drain 产出：拉取成功 → 「（以下为用户转发的聊天记录）」前缀 +
+    /// 转录正文（进 agent，占位正文被替换）；拉取失败 → 「⚠️ 无法读取合并转发
+    /// 内容（原因），请直接复制文字发送」回退提示（不进 agent）。
+    #[test]
+    fn merge_forward_outcome_success_and_fallback() {
+        let items = vec![MergedForwardItem {
+            message_id: "om_sub1".into(),
+            message_type: "text".into(),
+            content: r#"{"text":"文本内容"}"#.into(),
+            sender_id: "ou_a".into(),
+            sender_name: Some("Alice".into()),
+            create_time_ms: 0,
+        }];
+        let ok = Ok(items);
+        match merge_forward_outcome(&ok, Some("群聊记录"), None) {
+            MergeForwardOutcome::Agent(text) => {
+                assert!(
+                    text.starts_with("（以下为用户转发的聊天记录）\n\n"),
+                    "正文前缀: {text}"
+                );
+                assert!(text.contains("【合并转发聊天记录】群聊记录"), "{text}");
+                assert!(text.contains("[Alice] 文本内容"), "{text}");
+            }
+            other => panic!("成功路径应为 Agent: {other:?}"),
+        }
+        // 拉取失败（消息过期/权限/网络）：回退提示带原因，不产出 agent 正文。
+        let err = Err(CoreError::Platform(
+            PLATFORM,
+            "list_merge_forward: code=230002 msg=message not exist".into(),
+        ));
+        match merge_forward_outcome(&err, None, None) {
+            MergeForwardOutcome::Fallback(notice) => {
+                assert!(notice.starts_with("⚠️ 无法读取合并转发内容（"), "{notice}");
+                assert!(notice.contains("请直接复制文字发送"), "{notice}");
+                assert!(notice.contains("code=230002"), "原因透传: {notice}");
+            }
+            other => panic!("失败路径应为 Fallback: {other:?}"),
+        }
     }
 
     /// Wave B-4/B-6：构造注入落位——quiet_hours 存解析产物（None 恒不在免打扰）；
