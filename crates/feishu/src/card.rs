@@ -722,20 +722,37 @@ pub fn render_stub_card(card: &OutboundCard) -> String {
 /// 走 CardKit note 组件（见 [`note_element`]），markdown 正文保留同文案作降级。
 fn perm_detail_md(tool_name: &str, input_summary: &str) -> (String, Vec<String>) {
     let summary = tool_summary(tool_name, input_summary);
-    let head = if summary.is_empty() {
-        format!("**{tool_name}**")
-    } else {
-        format!("**{tool_name}** — {summary}")
-    };
     let lang = if tool_name == "Bash" || tool_name == "shell" {
         "bash"
     } else {
         ""
     };
-    let raw: String = match serde_json::from_str::<serde_json::Value>(input_summary) {
-        Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|_| input_summary.into()),
-        // 截断的 JSON（超长输入）：解析失败原样展示。
-        Err(_) => input_summary.to_string(),
+    // Bash 的命令由下方代码块承载（解码后原文），head 不再重复命令摘要；
+    // 其余工具 head 保留单行摘要。
+    let head = if summary.is_empty() || lang == "bash" {
+        format!("**{tool_name}**")
+    } else {
+        format!("**{tool_name}** — {summary}")
+    };
+    // 真机校准（2026-08）：Bash 审批的代码块直接展示**命令本身**，不再裹 JSON
+    // 信封——pretty JSON 会把命令里的引号转义（\"）原样暴露，且 command 在
+    // 信封里重复出现（head 摘要行已解码）。用户审批的对象是命令，不是它的
+    // JSON 序列化形态。其它工具保留 pretty JSON（参数即内容，P8-1）。
+    let raw: String = if lang == "bash" {
+        match serde_json::from_str::<serde_json::Value>(input_summary) {
+            Ok(v) => v
+                .get("command")
+                .and_then(|c| c.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| input_summary.to_string()),
+            Err(_) => input_summary.to_string(),
+        }
+    } else {
+        match serde_json::from_str::<serde_json::Value>(input_summary) {
+            Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|_| input_summary.into()),
+            // 截断的 JSON（超长输入）：解析失败原样展示。
+            Err(_) => input_summary.to_string(),
+        }
     };
     // 截断提示：静默截断会让用户误以为参数就这么多——末尾明示。
     let (body, truncated) = if raw.chars().count() > PERM_DETAIL_MAX {
@@ -847,9 +864,12 @@ pub(crate) fn render_permission_card_note(
     }
     elements.push(serde_json::json!({ "tag": "hr" }));
     elements.push(flow_button_row(&[
+        // 真机校准（2026-08）：CardKit type=primary 是**蓝字描边**而非填充主按钮
+        //（官方文档枚举：primary 蓝字边框 / primary_filled 蓝底白字）——允许作为
+        // 推荐动作用填充，拒绝对应用 danger_filled 红底。
         cb_button(
             "允许",
-            "primary",
+            "primary_filled",
             ask_value_wrap(
                 serde_json::json!({ "imagent_perm": "allow" }),
                 conv_id,
@@ -869,7 +889,7 @@ pub(crate) fn render_permission_card_note(
         ),
         cb_button(
             "⛔ 拒绝",
-            "danger",
+            "danger_filled",
             ask_value_wrap(
                 serde_json::json!({ "imagent_perm": "deny" }),
                 conv_id,
@@ -1715,12 +1735,17 @@ mod tests {
             json.contains("\"template\":\"orange\""),
             "审批主题色: {json}"
         );
-        // 签名行 + bash 代码块。
+        // 签名行 + bash 代码块。真机校准（2026-08）：Bash 代码块为**命令本身**
+        // （解码原文，无 JSON 信封、无 \" 转义噪声）；head 不再重复命令摘要。
+        assert!(json.contains("**Bash**\\n```bash"), "签名行: {json}");
         assert!(
-            json.contains("**Bash** — cargo test --all"),
-            "签名行: {json}"
+            json.contains("```bash\\ncargo test --all\\n```"),
+            "命令原文直出: {json}"
         );
-        assert!(json.contains("```bash"), "bash 代码块: {json}");
+        assert!(
+            !json.contains("\\\"command\\\""),
+            "Bash 不应再裹 JSON 信封: {json}"
+        );
         // 两个按钮 + callback value 编码 conv 与动作。允许按钮不带 ✅（primary
         // 蓝底已高亮，绿色系 emoji 冲突）；⛔ 拒绝（danger）保留。
         assert!(json.contains("\"content\":\"允许\""), "允许按钮: {json}");
