@@ -123,8 +123,13 @@ fn codex_parse(line: &str) -> CliEvent {
             tool,
             input,
             session: None,
+            id: None,
         },
-        ParsedEvent::ToolResult { tool, output } => CliEvent::ToolResult { tool, output },
+        ParsedEvent::ToolResult { tool, output } => CliEvent::ToolResult {
+            tool,
+            output,
+            id: None,
+        },
         ParsedEvent::TurnCompleted { usage } => {
             // usage 须在 Terminal 之前——读取循环在 Terminal 处 break。
             match usage {

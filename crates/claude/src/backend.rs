@@ -457,6 +457,7 @@ fn claude_parse(line: &str) -> CliEvent {
         }
         ParsedEvent::Assistant {
             text,
+            thoughts,
             tool_uses,
             session_id,
         } => {
@@ -464,20 +465,33 @@ fn claude_parse(line: &str) -> CliEvent {
             // 推流（codex/gemini 均推 Text，claude 此前归 Skip）+ 全部并行 tool_use。
             // final_text 语义不变：中间 Text 只参与拼接候选，终止 result 事件仍
             // 整体覆盖（见 backend_common B9 注释）。
+            // W2-1：thinking 块透出为 Thought（卡片折叠区，与正文分离）。
             let mut evs = Vec::new();
             if let Some(s) = session_id {
                 if !s.is_empty() {
                     evs.push(CliEvent::Session(s));
                 }
             }
+            if !thoughts.is_empty() {
+                evs.push(CliEvent::Thought(thoughts));
+            }
             if !text.is_empty() {
                 evs.push(CliEvent::Text(text));
             }
             for u in tool_uses {
+                // W2-2：TodoWrite 结构化为任务清单（卡片 checklist 进度组件），
+                // 不再按普通工具行展示（信息重复且无进度语义）。
+                if let Some(items) =
+                    imagent_core::backend_common::todo_write_items(&u.tool, &u.input)
+                {
+                    evs.push(CliEvent::TodoList { items });
+                    continue;
+                }
                 evs.push(CliEvent::ToolUse {
                     tool: u.tool,
                     input: u.input,
                     session: None,
+                    id: u.id,
                 });
             }
             if evs.is_empty() {
@@ -487,7 +501,8 @@ fn claude_parse(line: &str) -> CliEvent {
             }
         }
         ParsedEvent::ToolResults { results } => {
-            // B7：一条 user 消息的全部并行 tool_result 都产出。
+            // B7：一条 user 消息的全部并行 tool_result 都产出（W2-3：带
+            // tool_use_id 供精确配对）。
             if results.is_empty() {
                 CliEvent::Skip
             } else {
@@ -497,6 +512,7 @@ fn claude_parse(line: &str) -> CliEvent {
                         .map(|r| CliEvent::ToolResult {
                             tool: r.tool,
                             output: r.output,
+                            id: r.id,
                         })
                         .collect(),
                 )

@@ -33,16 +33,17 @@ use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
     ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest, PermissionOption,
-    PermissionOptionId, PermissionOptionKind, PromptRequest, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionNotification, SessionUpdate, TextContent,
+    PermissionOptionId, PermissionOptionKind, PlanEntryStatus, PromptRequest,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionNotification, SessionUpdate, StopReason, TextContent,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{AcpAgent, Client, ConnectionTo};
 use async_trait::async_trait;
 use imagent_core::{
     AgentChunk, Backend, CoreError, ImPermissionAsk, ImPermissionHook, LocalSession,
-    PermissionCapability, PermissionMode, Result, RunOutcome, SessionId,
+    PermissionCapability, PermissionMode, Result, RunOutcome, SessionId, TodoItem, TodoStatus,
+    UsageStats,
 };
 use parking_lot::RwLock;
 use tokio::sync::Mutex;
@@ -73,12 +74,16 @@ pub struct AcpBackend {
     /// B3：dispatcher 注入的 IM 审批闭环回调（run() 启动时注入一次；None =
     /// 未注入（独立使用/测试），Ask 档 fail-closed）。
     hook: RwLock<Option<ImPermissionHook>>,
+    /// W2-4：运行时模型（`/model` 热设）——spawn 子进程时以 `ANTHROPIC_MODEL`
+    /// 前导 env 注入（`AcpAgent::from_str` 支持 NAME=value 前导语法）。
+    model: RwLock<Option<String>>,
     /// B2/P5-14：conv_id → 长驻连接 map（惰性建立；task 退出时自摘除）。
     conns: Arc<Mutex<HashMap<String, Arc<LongLivedAcp>>>>,
     /// 并发连接上限（默认 [`MAX_CONCURRENT_CONNS`]；`with_conn_limits` 可配）。
-    /// TODO(config)：后续接 core 配置体系后从 config 读取。
+    /// W2-4：经 main 从 config（`acp_max_connections`）注入。
     max_conns: usize,
     /// 连接空闲回收时长（默认 [`CONN_IDLE_RECYCLE`]；`with_conn_limits` 可配）。
+    /// W2-4：经 main 从 config（`acp_idle_recycle_secs`）注入。
     conn_idle_recycle: std::time::Duration,
     /// 测试专用：mock transport 工厂（in-process 假 agent，替代 spawn 子进程）。
     #[cfg(test)]
@@ -91,6 +96,7 @@ impl AcpBackend {
         Self {
             permission_mode: Arc::new(RwLock::new(PermissionMode::Off)),
             hook: RwLock::new(None),
+            model: RwLock::new(None),
             conns: Arc::new(Mutex::new(HashMap::new())),
             max_conns: MAX_CONCURRENT_CONNS,
             conn_idle_recycle: CONN_IDLE_RECYCLE,
@@ -116,6 +122,7 @@ impl AcpBackend {
         Self {
             permission_mode: Arc::new(RwLock::new(mode)),
             hook: RwLock::new(None),
+            model: RwLock::new(None),
             conns: Arc::new(Mutex::new(HashMap::new())),
             max_conns: MAX_CONCURRENT_CONNS,
             conn_idle_recycle: CONN_IDLE_RECYCLE,
@@ -130,6 +137,7 @@ impl AcpBackend {
         Self {
             permission_mode: mode,
             hook: RwLock::new(None),
+            model: RwLock::new(None),
             conns: Arc::new(Mutex::new(HashMap::new())),
             max_conns: MAX_CONCURRENT_CONNS,
             conn_idle_recycle: CONN_IDLE_RECYCLE,
@@ -219,13 +227,19 @@ impl AcpBackend {
     }
 
     /// 建立 transport：真机走 `AcpAgent`（spawn claude-agent-acp 子进程），测试可注入
-    /// in-process mock（见 [`Self::with_mock_factory`]）。
+    /// in-process mock（见 [`Self::with_mock_factory`]）。W2-4：设置了运行时模型时，
+    /// 命令串前导注入 `ANTHROPIC_MODEL=<model>` env（`AcpAgent::from_str` 的
+    /// NAME=value 前导语法；子进程内 claude CLI 读取该 env）。
     async fn spawn_transport(&self) -> Result<Transport> {
         #[cfg(test)]
         if let Some(f) = &self.mock_factory {
             return Ok(Transport::Mock(f()));
         }
-        let agent = AcpAgent::from_str(&Self::agent_command())
+        let mut cmd = Self::agent_command();
+        if let Some(m) = self.model.read().clone() {
+            cmd = format!("ANTHROPIC_MODEL={m} {cmd}");
+        }
+        let agent = AcpAgent::from_str(&cmd)
             .map_err(|e| CoreError::Backend(NAME, format!("解析 agent 命令失败: {e}")))?;
         Ok(Transport::Real(agent))
     }
@@ -288,10 +302,13 @@ impl Default for AcpBackend {
 /// - `chunks`：core 传入的通道（克隆一份给 handler，handler 直接推 `AgentChunk`）。
 /// - `agent_text`：累计 `AgentMessageChunk` 文本——ACP 的 `session/prompt` 响应只带
 ///   `stop_reason`，最终回复文本必须从流式 `AgentMessageChunk` 累积。
+/// - `usage`：W2-4——`UsageUpdate` 通知的**最新**会话水位（ACP 语义是会话累计值，
+///   替换而非求和），turn 结束时并入 RunOutcome.usage。
 #[derive(Clone)]
 struct StreamState {
     chunks: tokio::sync::mpsc::Sender<AgentChunk>,
     agent_text: Arc<Mutex<String>>,
+    usage: Arc<Mutex<Option<UsageStats>>>,
 }
 
 impl StreamState {
@@ -299,6 +316,7 @@ impl StreamState {
         Self {
             chunks,
             agent_text: Arc::new(Mutex::new(String::new())),
+            usage: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -479,15 +497,19 @@ impl LongLivedAcp {
                         // ChildGuard kill 子进程。B2：per-conv 连接，只杀本会话。
                         tokio::select! {
                             res = &mut prompt_fut => match res {
-                                Ok(_) => {
+                                Ok(resp) => {
                                     let final_text = st.agent_text.lock().await.clone();
+                                    // W2-4：stop_reason（MaxTokens/Refusal 等）
+                                    // + 会话累计 usage（UsageUpdate 最新值）。
+                                    let stop_reason = stop_reason_str(&resp.stop_reason);
+                                    let usage = *st.usage.lock().await;
                                     let _ = st.chunks.send(AgentChunk::Final(final_text.clone())).await;
                                     let _ = req.resp.send(Ok(RunOutcome {
                                         session_id: SessionId(sid),
                                         final_text,
                                         terminal: true,
-                                        // ACP 协议无 usage 事件，保持 None。
-                                        usage: None,
+                                        usage,
+                                        stop_reason,
                                     }));
                                 }
                                 Err(e) => {
@@ -533,6 +555,20 @@ impl LongLivedAcp {
 impl Backend for AcpBackend {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    /// W2-4：/model 热设——本会话已有连接不追改（子进程 env 已定），下一次建连
+    /// （新 conv / 空闲回收后）以 `ANTHROPIC_MODEL` 前导 env 生效。
+    fn set_model(&self, model: Option<String>) {
+        *self.model.write() = model;
+    }
+
+    fn model(&self) -> Option<String> {
+        self.model.read().clone()
+    }
+
+    fn supports_model_selection(&self) -> bool {
+        true
     }
 
     /// B3：Ask/AutoClaude 档经注入的 ImPermissionHook 走 IM 审批闭环
@@ -631,9 +667,12 @@ impl Backend for AcpBackend {
 ///
 /// 映射策略（best-effort，未知变体忽略并 debug 记录）：
 /// - `AgentMessageChunk`/`UserMessageChunk`（文本）→ `AgentChunk::Text`（仅 Agent 文本累计）。
-/// - `ToolCall` → `AgentChunk::ToolUse`（title 作 tool 名，raw_input 作输入）。
-/// - `ToolCallUpdate`（带输出）→ `AgentChunk::ToolResult`。
-/// - 其它（Plan/UsageUpdate/...）→ 忽略。
+/// - `AgentThoughtChunk`（W2-1）→ `AgentChunk::Thought`（与正文分离，卡片折叠展示）。
+/// - `ToolCall` → `AgentChunk::ToolUse`（title 首 token 作 tool 名，raw_input 作输入，
+///   tool_call_id 作配对 id——W2-3）。
+/// - `ToolCallUpdate`（带输出）→ `AgentChunk::ToolResult`（带 tool_call_id）。
+/// - `Plan`（W2-2）→ `AgentChunk::TodoList`（任务清单，全量替换语义）。
+/// - `UsageUpdate`（W2-4）→ 累计进共享 usage（不推 chunk；turn 结束并入 RunOutcome）。
 ///
 /// B4：异步 send().await + 超时（替代原 `try_send` 通道满即静默丢事件）。发送点在
 /// notification handler（async 闭包）里，await 不会死锁 run 主体——chunks 消费方
@@ -655,8 +694,9 @@ async fn forward_update(state: &StreamState, update: SessionUpdate) {
         }
         SessionUpdate::UserMessageChunk(chunk) => text_of(&chunk.content).map(AgentChunk::Text),
         SessionUpdate::AgentThoughtChunk(chunk) => {
-            // 推理文本：best-effort 也走 Text，保持可见。
-            text_of(&chunk.content).map(AgentChunk::Text)
+            // W2-1：推理文本独立透出（Thought）——不进 agent_text / 正文流，
+            // 由卡片侧折叠展示（cot 档位控制）。
+            text_of(&chunk.content).map(AgentChunk::Thought)
         }
         SessionUpdate::ToolCall(call) => {
             let input = call
@@ -664,18 +704,79 @@ async fn forward_update(state: &StreamState, update: SessionUpdate) {
                 .as_ref()
                 .map(|v| serde_json::to_string(v).unwrap_or_else(|_| v.to_string()))
                 .unwrap_or_default();
+            // W2-3：tool 名取 title 首 token（与 CLI 工具名口径一致，卡片工具行
+            // 「Bash — git status」由 input 摘要补全）；id = tool_call_id。
+            let tool = call
+                .title
+                .split_whitespace()
+                .next()
+                .unwrap_or(&call.title)
+                .to_string();
+            let id = call.tool_call_id.to_string();
             Some(AgentChunk::ToolUse {
-                tool: call.title,
+                tool,
                 input,
+                id: Some(id),
             })
         }
         SessionUpdate::ToolCallUpdate(update) => {
             // 优先用 raw_output；无输出时忽略（仅状态/标题更新无信息量）。
-            let tool = update.tool_call_id.to_string();
+            // W2-3：id = tool_call_id（与 ToolUse 精确配对）；tool 名取 title 首
+            // token（此前用 id 冒充 tool 名，CLI/ACP 两边语义不一致）。
+            let tool = tool_name_of(&update);
+            let id = update.tool_call_id.to_string();
             update.fields.raw_output.as_ref().map(|output| {
                 let out = serde_json::to_string(output).unwrap_or_else(|_| output.to_string());
-                AgentChunk::ToolResult { tool, output: out }
+                AgentChunk::ToolResult {
+                    tool,
+                    output: out,
+                    id: Some(id),
+                }
             })
+        }
+        SessionUpdate::Plan(plan) => {
+            // W2-2：任务清单——协议为全量替换语义，直接映射最新状态。
+            let items: Vec<TodoItem> = plan
+                .entries
+                .iter()
+                .filter_map(|e| {
+                    let text = e.content.trim();
+                    if text.is_empty() {
+                        return None;
+                    }
+                    let status = match e.status {
+                        PlanEntryStatus::Completed => TodoStatus::Completed,
+                        PlanEntryStatus::InProgress => TodoStatus::InProgress,
+                        PlanEntryStatus::Pending => TodoStatus::Pending,
+                        // non_exhaustive：未知状态按未开始。
+                        _ => TodoStatus::Pending,
+                    };
+                    Some(TodoItem {
+                        text: text.to_string(),
+                        status,
+                    })
+                })
+                .collect();
+            (!items.is_empty()).then_some(AgentChunk::TodoList { items })
+        }
+        SessionUpdate::UsageUpdate(u) => {
+            // W2-4：上下文水位 + 累计成本。ACP 的 used 是**会话累计**上下文 token
+            //（非本轮增量）、cost 是会话累计成本——替换而非求和。仅记入共享状态，
+            // turn 结束并入 RunOutcome（不推 chunk，不是 IM 可读内容）。
+            let cost = u
+                .cost
+                .as_ref()
+                .filter(|c| c.currency.eq_ignore_ascii_case("USD"))
+                .map(|c| c.amount);
+            if let Ok(mut g) = state.usage.try_lock() {
+                *g = Some(UsageStats {
+                    input_tokens: u.used,
+                    output_tokens: 0,
+                    cached_tokens: None,
+                    total_cost_usd: cost,
+                });
+            }
+            None
         }
         other => {
             debug!(target: "claude-acp", ?other, "忽略 SessionUpdate 变体");
@@ -703,6 +804,20 @@ async fn forward_update(state: &StreamState, update: SessionUpdate) {
 fn text_of(block: &ContentBlock) -> Option<String> {
     match block {
         ContentBlock::Text(t) => Some(t.text.clone()),
+        _ => None,
+    }
+}
+
+/// W2-4：`PromptResponse.stop_reason` → 人读终止原因（None = 正常结束）。
+/// dispatch 据此给「输出被截断 / 被拒绝」类提示。
+fn stop_reason_str(reason: &StopReason) -> Option<String> {
+    match reason {
+        StopReason::EndTurn => None,
+        StopReason::MaxTokens => Some("max_tokens".into()),
+        StopReason::MaxTurnRequests => Some("max_turn_requests".into()),
+        StopReason::Refusal => Some("refusal".into()),
+        StopReason::Cancelled => Some("cancelled".into()),
+        // non_exhaustive：未知变体按正常处理。
         _ => None,
     }
 }
@@ -1004,7 +1119,7 @@ mod tests {
         forward_update(&state, SessionUpdate::ToolCallUpdate(upd)).await;
 
         match rx.try_recv().unwrap() {
-            AgentChunk::ToolResult { tool, output } => {
+            AgentChunk::ToolResult { tool, output, .. } => {
                 assert_eq!(tool, "tc-2");
                 assert!(output.contains("lines"));
             }

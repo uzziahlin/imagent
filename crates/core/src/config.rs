@@ -384,6 +384,19 @@ pub struct Config {
     /// 格式约束等，追加在 agent 自身 system prompt 之后。改动需重启/SIGHUP。
     #[serde(default)]
     pub append_system_prompt: Option<String>,
+    /// W2-5：自动 compact 阈值（tokens）——成功轮次的上下文水位
+    /// （usage.input_tokens）达到阈值即自动走 /compact 管道（生成摘要 + 重置，
+    /// 对齐 Claude Code 原生 auto-compact）。默认 120_000；0 = 关闭。
+    #[serde(default = "default_auto_compact_threshold_tokens")]
+    pub auto_compact_threshold_tokens: u64,
+    /// W2-4：claude-acp 并发连接上限（每会话一条长驻子进程连接；超限拒绝）。
+    /// 默认 8；仅 `agent = "claude-acp"` 生效。改动需重启。
+    #[serde(default = "default_acp_max_connections")]
+    pub acp_max_connections: usize,
+    /// W2-4：claude-acp 连接空闲回收时长（秒；窗口内无新 prompt 则断开子进程）。
+    /// 默认 600；仅 `agent = "claude-acp"` 生效。改动需重启。
+    #[serde(default = "default_acp_idle_recycle_secs")]
+    pub acp_idle_recycle_secs: u64,
 }
 
 /// 缺省工具集：读/检索/联网/文件编辑类（与 Edit 同风险级：workdir 内写或只读），
@@ -496,6 +509,15 @@ fn default_agent_idle_timeout_secs() -> u64 {
 }
 fn default_batch_window_ms() -> u64 {
     1500
+}
+fn default_auto_compact_threshold_tokens() -> u64 {
+    120_000
+}
+fn default_acp_max_connections() -> usize {
+    8
+}
+fn default_acp_idle_recycle_secs() -> u64 {
+    600
 }
 
 impl Config {
@@ -653,6 +675,30 @@ impl Config {
                 cfg.batch_window_ms
             )));
         }
+        // W2-5：自动 compact 阈值边界（0 = 关闭；非 0 须 ≥ 10k，防把阈值配成
+        // 每轮必压的极小值）。
+        const AUTO_COMPACT_MIN: u64 = 10_000;
+        if cfg.auto_compact_threshold_tokens != 0
+            && cfg.auto_compact_threshold_tokens < AUTO_COMPACT_MIN
+        {
+            return Err(CoreError::Config(format!(
+                "auto_compact_threshold_tokens 须为 0（关闭）或 ≥ {AUTO_COMPACT_MIN}（当前 {}）",
+                cfg.auto_compact_threshold_tokens
+            )));
+        }
+        // W2-4：ACP 连接参数边界。
+        if cfg.acp_max_connections == 0 {
+            return Err(CoreError::Config(
+                "acp_max_connections 必须 ≥ 1（0 会让所有 claude-acp 会话被拒绝）".into(),
+            ));
+        }
+        const ACP_IDLE_MIN_SECS: u64 = 60;
+        if cfg.acp_idle_recycle_secs < ACP_IDLE_MIN_SECS {
+            return Err(CoreError::Config(format!(
+                "acp_idle_recycle_secs 须 ≥ {ACP_IDLE_MIN_SECS}（当前 {}；过短会让连接频繁重建，失去长驻意义）",
+                cfg.acp_idle_recycle_secs
+            )));
+        }
 
         Ok(cfg)
     }
@@ -702,6 +748,9 @@ permission_mode = "auto"    # 缺省=auto：claude-cli=透传 claude 原生 auto
 # disallowed_tools = ["WebSearch"]  # 禁用工具黑名单（--disallowedTools；与 allowed_tools 独立，黑名单优先）
 # mcp_config_path = "~/.claude/mcp.json"  # 用户 MCP servers 合并进每次 run（给 agent 挂工具；imagent 条目名保留）
 # append_system_prompt = "你在飞书里服务团队，回复保持简洁中文"  # 附加系统提示（--append-system-prompt）
+# auto_compact_threshold_tokens = 120000  # 自动 compact：上下文水位超阈值自动压缩（对齐 Claude Code auto-compact；0=关闭）
+# acp_max_connections = 8      # claude-acp 并发连接上限（仅 agent="claude-acp"）
+# acp_idle_recycle_secs = 600  # claude-acp 连接空闲回收（秒；仅 agent="claude-acp"）
 "#;
 }
 /// claude `--permission-mode` 合法值归一（入参已小写化）：manual→default

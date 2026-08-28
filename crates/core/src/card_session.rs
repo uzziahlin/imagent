@@ -14,11 +14,18 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::platform::Platform;
-use crate::types::{CardPhase, CardTerminal, ConvId, OutboundCard, ReplyHint, ToolCall};
+use crate::types::{CardPhase, CardTerminal, ConvId, OutboundCard, ReplyHint, TodoItem, ToolCall};
 use imagent_store::Store;
 
 /// 卡片 patch 节流间隔。飞书交互卡片更新有频率限制，500ms 平衡流畅与限流。
 const CARD_THROTTLE: Duration = Duration::from_millis(500);
+
+/// W2-1：思考片段累积上限（条数）——只保留最近的思考（旧思考对用户无回看价值，
+/// 无上限会把卡片 payload 撑爆）。
+const MAX_THOUGHTS: usize = 10;
+
+/// W2-1：单条思考片段的字符截断上限（防超长推理占满卡片）。
+const THOUGHT_TRUNC_CHARS: usize = 400;
 
 /// P10：本会话的排队状态（运行中入队的消息摘要）。入队路径写、取批/中断清、
 /// CardSession 每次 patch 拉取（活动期随 chunk 刷新 footer 的排队提示）。
@@ -47,6 +54,10 @@ pub(crate) fn queued_hint_display(h: &QueuedHint) -> Option<String> {
 pub(crate) struct CardSession {
     text: String,
     tools: Vec<ToolCall>,
+    /// W2-1：思考片段（最近 MAX_THOUGHTS 条，单条截断 THOUGHT_TRUNC_CHARS）。
+    thoughts: Vec<String>,
+    /// W2-2：任务清单（全量替换语义——最新一次 TodoList chunk 为准）。
+    todos: Vec<TodoItem>,
     /// P8-1：执行阶段（思考中/调用工具/输出中）——按最近一次 chunk 类型翻转，
     /// 平台渲染成分状态 footer。
     phase: CardPhase,
@@ -78,6 +89,8 @@ impl CardSession {
         Self {
             text: String::new(),
             tools: Vec::new(),
+            thoughts: Vec::new(),
+            todos: Vec::new(),
             phase: CardPhase::Thinking,
             msg_id: None,
             last_patch: Instant::now(),
@@ -121,10 +134,12 @@ impl CardSession {
     }
 
     /// 累积工具调用（⏳ 执行中），节流 patch；阶段翻到「调用工具」。
+    /// W2-3：`id` 供结果精确配对（None = 后端未提供）。
     pub(crate) async fn append_tool(
         &mut self,
         tool: &str,
         input_summary: &str,
+        id: Option<&str>,
         conv: &ConvId,
         hint: &ReplyHint,
         platform: &dyn Platform,
@@ -133,24 +148,72 @@ impl CardSession {
             name: tool.to_string(),
             summary: input_summary.to_string(),
             done: false,
+            id: id.map(str::to_string),
         });
         self.phase = CardPhase::ToolRunning;
         self.patch_if_due(CardTerminal::Running, conv, hint, platform)
             .await;
     }
 
-    /// P8-1：工具结果到达——把同名工具里最早未完成的一条翻成 ✅（工具结果
-    /// 不带调用 id，按序配对；同名并发极少见，错配只影响图标不影响内容）。
+    /// P8-1：工具结果到达——翻 ✅（W2-3：优先按 id 精确配对，无 id 回退同名
+    /// 最早未完成；同名并发极少见，错配只影响图标不影响内容）。
     pub(crate) async fn finish_tool(
         &mut self,
         tool: &str,
+        id: Option<&str>,
         conv: &ConvId,
         hint: &ReplyHint,
         platform: &dyn Platform,
     ) {
-        if let Some(t) = self.tools.iter_mut().find(|t| !t.done && t.name == tool) {
+        // W2-3：优先按 id 精确配对（首个借用先落地结束，再做名字兜底——避免
+        // 链式 or_else 的双重可变借用）。
+        let by_id = match id {
+            Some(i) => self
+                .tools
+                .iter_mut()
+                .find(|t| !t.done && t.id.as_deref() == Some(i)),
+            None => None,
+        };
+        let target = match by_id {
+            Some(t) => Some(t),
+            None => self.tools.iter_mut().find(|t| !t.done && t.name == tool),
+        };
+        if let Some(t) = target {
             t.done = true;
         }
+        self.patch_if_due(CardTerminal::Running, conv, hint, platform)
+            .await;
+    }
+
+    /// W2-1：累积思考片段（最近 N 条、单条截断），节流 patch；阶段保持 Thinking。
+    pub(crate) async fn append_thought(
+        &mut self,
+        thought: &str,
+        conv: &ConvId,
+        hint: &ReplyHint,
+        platform: &dyn Platform,
+    ) {
+        let t: String = thought.chars().take(THOUGHT_TRUNC_CHARS).collect();
+        if t.trim().is_empty() {
+            return;
+        }
+        self.thoughts.push(t);
+        if self.thoughts.len() > MAX_THOUGHTS {
+            self.thoughts.remove(0);
+        }
+        self.patch_if_due(CardTerminal::Running, conv, hint, platform)
+            .await;
+    }
+
+    /// W2-2：任务清单（全量替换），节流 patch。
+    pub(crate) async fn set_todos(
+        &mut self,
+        items: &[TodoItem],
+        conv: &ConvId,
+        hint: &ReplyHint,
+        platform: &dyn Platform,
+    ) {
+        self.todos = items.to_vec();
         self.patch_if_due(CardTerminal::Running, conv, hint, platform)
             .await;
     }
@@ -238,6 +301,8 @@ impl CardSession {
         let card = OutboundCard {
             text: self.text.clone(),
             tool_calls: self.tools.clone(),
+            thoughts: self.thoughts.clone(),
+            todos: self.todos.clone(),
             phase: self.phase,
             queued_hint: queued,
             // 运行时长：Running 态 10s 量化（footer 去重缓存按内容比对，量化后
@@ -382,6 +447,8 @@ pub async fn sweep_live_cards(store: &Store, platform: &dyn Platform) {
         let card = OutboundCard {
             text: "⏸️ imagent 已重启，本次生成被中断（未产出结论）。请重新发送指令。".to_string(),
             tool_calls: Vec::new(),
+            thoughts: Vec::new(),
+            todos: Vec::new(),
             phase: CardPhase::Thinking,
             queued_hint: None,
             run_secs: 0,

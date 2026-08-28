@@ -178,6 +178,7 @@ mod tests {
             name: "Bash".into(),
             summary: "git status".into(),
             done: true,
+            id: None,
         };
         assert_eq!(tool_card_line(&t), "✅ **Bash** — git status");
         assert_eq!(tool_text_line(&t), "✅ Bash — git status");
@@ -185,6 +186,7 @@ mod tests {
             name: "Read".into(),
             summary: String::new(),
             done: false,
+            id: None,
         };
         assert_eq!(tool_card_line(&running), "⏳ **Read**");
     }

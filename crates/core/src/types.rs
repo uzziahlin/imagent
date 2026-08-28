@@ -132,17 +132,47 @@ pub struct JoinedChat {
     pub name: String,
 }
 
+/// W2-2：任务清单项状态（Claude Code 的 TodoWrite / ACP Plan）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+/// W2-2：任务清单项。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TodoItem {
+    pub text: String,
+    pub status: TodoStatus,
+}
+
 /// Backend 流式产出的分块。
 #[derive(Debug, Clone)]
 pub enum AgentChunk {
     Text(String),
+    /// W2-1：思考过程（与正文分离）——CLI 的 thinking 块 / ACP 的
+    /// AgentThoughtChunk。不混入 Text（正文流式/最终回复保持纯净），卡片侧
+    /// 折叠展示、cot 档位控制；纯文本平台忽略（正文流已够）。
+    Thought(String),
     ToolUse {
         tool: String,
         input: String,
+        /// W2-3：工具调用 id（CLI `tool_use.id` / ACP `tool_call_id`）——与
+        /// ToolResult 精确配对（并行同名调用不错配）；后端拿不到为 None，
+        /// 消费方回退按名配对。
+        id: Option<String>,
     },
     ToolResult {
         tool: String,
         output: String,
+        /// W2-3：对应 ToolUse 的 id（CLI `tool_result.tool_use_id`）。
+        id: Option<String>,
+    },
+    /// W2-2：任务清单（Claude Code TodoWrite 工具调用 / ACP Plan 通知）。
+    /// 每次携带**全量**清单状态（两个来源都是全量替换语义），消费方直接覆盖。
+    TodoList {
+        items: Vec<TodoItem>,
     },
     /// agent 产出的媒体文件（绝对/工作目录相对路径）。目前仅 claude-cli 的 Write
     /// 工具写图片文件时产出；dispatch 在 run 结束后经 Platform::send_media 回传 IM。
@@ -206,6 +236,10 @@ pub struct RunOutcome {
     pub terminal: bool,
     /// 本次 run 的 token 用量与成本（backend 未产出 usage 事件时为 None）。
     pub usage: Option<UsageStats>,
+    /// W2-4：终止原因（`stop_reason`；None = 正常结束或后端未提供）——
+    /// max_tokens / max_turn_requests / refusal / cancelled。dispatch 据此给
+    /// 用户「输出被截断」类提示。
+    pub stop_reason: Option<String>,
 }
 
 /// 本机（电脑端）agent 会话条目——统一 `/resume` 列表用（P4-11）。
@@ -237,6 +271,9 @@ pub struct ToolCall {
     pub summary: String,
     /// 是否已收到 ToolResult（false = 执行中）。
     pub done: bool,
+    /// W2-3：工具调用 id（有则与 ToolResult 精确配对；None = 后端未提供，
+    /// 按名配对兜底）。
+    pub id: Option<String>,
 }
 
 /// `/config` 表单卡的一个字段（P9-2：平台无关描述，飞书侧渲染成 CardKit
@@ -276,6 +313,12 @@ pub struct OutboundCard {
     pub text: String,
     /// 工具调用记录（含状态），用于卡片里展示工具块。
     pub tool_calls: Vec<ToolCall>,
+    /// W2-1：思考过程片段（与正文分离；平台按 cot 档位折叠展示，off 档不显）。
+    /// 累积上限见 CardSession（防超长思考撑爆卡片 payload）。
+    pub thoughts: Vec<String>,
+    /// W2-2：任务清单（Claude Code todo / ACP Plan；全量替换语义，最新一次
+    /// TodoList chunk 为准）。空 = 无清单。
+    pub todos: Vec<TodoItem>,
     /// 执行阶段（Running 态 footer 文案依据；终态忽略）。
     pub phase: CardPhase,
     /// 排队提示（P10：本轮运行中入队的消息摘要，如 `📥 排队 2 条，最新：「…」`；

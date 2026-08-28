@@ -343,7 +343,13 @@ impl Backend for MockBackend {
         // 先发配置好的 ToolUse chunk（若有），再发 Final。
         let tools = self.tools_to_emit.lock().await.clone();
         for (tool, input) in tools {
-            let _ = chunks.send(AgentChunk::ToolUse { tool, input }).await;
+            let _ = chunks
+                .send(AgentChunk::ToolUse {
+                    tool,
+                    input,
+                    id: None,
+                })
+                .await;
         }
         // P5-10：流式模式——逐段 Text，Final/RunOutcome 为全量拼接。
         let mut full = String::new();
@@ -369,6 +375,7 @@ impl Backend for MockBackend {
             final_text: outcome_final,
             terminal: self.terminal,
             usage: self.usage,
+            stop_reason: None,
         })
     }
     fn name(&self) -> &'static str {
@@ -601,6 +608,8 @@ fn test_budgets() -> TaskBudgets {
         shutdown_grace: Duration::from_secs(60),
         agent_idle_timeout: Duration::from_secs(300),
         batch_window: Duration::from_millis(1),
+        // W2-5：测试默认关闭自动 compact（个别用例显式开启）。
+        auto_compact_threshold_tokens: 0,
     }
 }
 
@@ -3237,6 +3246,7 @@ async fn stop_on_text_platform_marks_interrupted() {
         Auth::new(vec!["alice".into()]),
         30_000,
         TaskBudgets {
+            auto_compact_threshold_tokens: 0,
             agent_timeout: Duration::ZERO,
             permission_ask_timeout: Duration::from_secs(5),
             ask_via_im_timeout: Duration::from_secs(5),
@@ -3631,6 +3641,105 @@ async fn build_with_usage(auth: Auth, usage: crate::types::UsageStats) -> Ctx {
     ctx.prompts = prompts;
     ctx.order = order;
     ctx
+}
+
+/// W2-5：自动 compact——成功轮次水位（usage.input_tokens）超阈值，runner 循环
+/// 自动走压缩管道：第二条 prompt 为压缩指令、会话重置（sessions 表清空）、
+/// 摘要落 KV、用户收到「已自动压缩」回执。阈值 0（默认）不触发。
+#[tokio::test]
+async fn auto_compact_triggers_after_threshold() {
+    let _serial = SERIAL.lock().await;
+    let (plat, inbox, send_count) = MockPlatform::new();
+    let usage = crate::types::UsageStats {
+        input_tokens: 150_000,
+        output_tokens: 100,
+        cached_tokens: None,
+        total_cost_usd: Some(0.1),
+    };
+    let (back, calls, prompts, order) = MockBackend::new_with_usage(usage);
+    let _ = std::fs::create_dir_all("/tmp/imagent-test-ws");
+    let (store, db) = tmp_store().await;
+    let disp = Arc::new(Dispatcher::new(
+        Arc::new(plat),
+        Arc::new(back),
+        store.clone(),
+        Auth::new(vec!["alice".into()]),
+        std::path::PathBuf::from("/tmp/imagent-test-ws"),
+        vec!["Read".into()],
+        PermissionMode::Off,
+        TaskBudgets {
+            auto_compact_threshold_tokens: 100_000,
+            ..test_budgets()
+        },
+        CotDetail::Brief,
+        vec![],
+    ));
+    let ctx = Ctx {
+        disp: disp.clone(),
+        inbox,
+        send_count,
+        calls,
+        prompts,
+        order,
+        db: db.clone(),
+    };
+    ctx.disp
+        .handle(msg("c1", "alice", "long context task"))
+        .await;
+    let prompts_seen = ctx.prompts.lock().await.clone();
+    assert_eq!(
+        prompts_seen.len(),
+        2,
+        "应跑两轮（原任务 + 压缩）: {prompts_seen:?}"
+    );
+    assert_eq!(prompts_seen[0], "long context task");
+    assert!(
+        prompts_seen[1].contains("总结"),
+        "第二轮应为压缩指令: {prompts_seen:?}"
+    );
+    let inbox_seen = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox_seen.iter().any(|t| t.contains("已自动压缩")),
+        "应回自动压缩完成: {inbox_seen:?}"
+    );
+    // 压缩后活动会话被重置（下次消息新建）。
+    assert!(
+        ctx.check().await.get_session("c1").await.unwrap().is_none(),
+        "压缩后活动 session 应被删除"
+    );
+    drop_db(ctx.db).await;
+
+    // 阈值 0（默认关闭）：同样水位不触发压缩，只有一轮。
+    let (plat, inbox, send_count) = MockPlatform::new();
+    let (back, calls, prompts, order) = MockBackend::new_with_usage(usage);
+    let _ = std::fs::create_dir_all("/tmp/imagent-test-ws");
+    let (store, db) = tmp_store().await;
+    let disp = Arc::new(Dispatcher::new(
+        Arc::new(plat),
+        Arc::new(back),
+        store,
+        Auth::new(vec!["alice".into()]),
+        std::path::PathBuf::from("/tmp/imagent-test-ws"),
+        vec!["Read".into()],
+        PermissionMode::Off,
+        test_budgets(),
+        CotDetail::Brief,
+        vec![],
+    ));
+    let ctx = Ctx {
+        disp,
+        inbox,
+        send_count,
+        calls,
+        prompts,
+        order,
+        db,
+    };
+    ctx.disp
+        .handle(msg("c1", "alice", "long context task"))
+        .await;
+    assert_eq!(ctx.prompts.lock().await.len(), 1, "阈值 0 不触发自动压缩");
+    drop_db(ctx.db).await;
 }
 
 /// Wave B-1：审批过半催办文案——剩余分钟向上取整（30s → 1 分钟）、工具名与

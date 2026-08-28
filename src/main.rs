@@ -996,9 +996,14 @@ fn build_backend(
         "codex" => (Arc::new(imagent_codex::CodexBackend::new()), None),
         "gemini" => (Arc::new(imagent_gemini::GeminiBackend::new()), None),
         "claude-acp" => (
-            Arc::new(imagent_claude::AcpBackend::with_permission_mode_shared(
-                perm_mode,
-            )),
+            Arc::new(
+                imagent_claude::AcpBackend::with_permission_mode_shared(perm_mode)
+                    // W2-4：连接参数接 config（并发上限 / 空闲回收）。
+                    .with_conn_limits(
+                        config.acp_max_connections,
+                        std::time::Duration::from_secs(config.acp_idle_recycle_secs),
+                    ),
+            ),
             None,
         ),
         _ => {

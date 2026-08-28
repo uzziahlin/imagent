@@ -349,7 +349,6 @@ impl Dispatcher {
         // 须与在飞 agent task 串行（否则并发 resume 同 session 损坏状态）。
         let _conv_lock = self.acquire_conv_lock(&conv.0).await;
         let _conv_guard = _conv_lock.lock().await;
-        let key = compact_summary_key(&conv.0);
         let existing_sid: Option<SessionId> = match self.store.get_session(&conv.0).await {
             Ok(Some(row)) => Some(SessionId(row.session_id)),
             Ok(None) => None,
@@ -367,131 +366,205 @@ impl Dispatcher {
             None => {
                 self.reply(conv, "当前无活动会话可压缩。", hint).await;
             }
-            Some(sid) => {
-                // 用 claude resume 当前 session 生成摘要；只取 Final/RunOutcome。
-                let (tx, mut rx) = mpsc::channel::<AgentChunk>(32);
-                let backend = self.backend.clone();
-                let workdir = self.resolve_workdir(&conv.0).await;
-                let tools = self.allowed_tools.read().clone();
-                let conv_id_compact = conv.0.clone();
-                let agent_timeout = self.agent_timeout;
-                let join = tokio::spawn(async move {
-                    let backend_name = backend.name();
-                    // agent_timeout = 0（默认）= 关闭总超时；/stop 仍可中断本任务。
-                    if agent_timeout.is_zero() {
-                        return backend
-                            .run(
-                                &conv_id_compact,
-                                "请用中文简洁总结当前对话的要点、已做决定与未完成事项（不超过 400 字）。",
-                                Some(&sid),
-                                &workdir,
-                                &tools,
-                                tx,
-                            )
-                            .await;
-                    }
-                    match tokio::time::timeout(
-                                        agent_timeout,
-                                        backend.run(
-                                            &conv_id_compact,
-                                            "请用中文简洁总结当前对话的要点、已做决定与未完成事项（不超过 400 字）。",
-                                            Some(&sid),
-                                            &workdir,
-                                            &tools,
-                                            tx,
-                                        ),
-                                    )
-                                    .await
-                                    {
-                                        Ok(res) => res,
-                                        Err(_elapsed) => {
-                                            METRICS
-                                                .agent_timeouts
-                                                .with_label_values(&["total"])
-                                                .inc();
-                                            Err(crate::error::CoreError::Backend(
-                                                backend_name,
-                                                format!(
-                                                    "agent run timed out after {agent_timeout:?}"
-                                                ),
-                                            ))
-                                        }
-                                    }
-                });
-                // P5-16：注册进 running——/stop 此前中断不了 /compact
-                //（长摘要生成只能干等 agent_timeout）。conv 锁由本命令
-                // 持有，注册/移除无 ABA（新轮次须先等锁）。
-                self.running
-                    .lock()
-                    .await
-                    .insert(conv.0.clone(), join.abort_handle());
-                let mut summary: Option<String> = None;
-                while let Some(chunk) = rx.recv().await {
-                    if let AgentChunk::Final(t) = chunk {
-                        summary = Some(t);
-                    }
+            Some(sid) => match self.compact_session_locked(conv, &sid).await {
+                Ok(summary_text) => {
+                    self.reply(
+                        conv,
+                        &format!(
+                            "已压缩会话。摘要：\n\n{summary_text}\n\n（新会话将保留此摘要延续上下文）"
+                        ),
+                        hint,
+                    )
+                    .await;
                 }
-                let join_res = join.await;
-                // 无论成败，先摘除在飞注册（/stop 已抢先摘除时为 no-op）。
-                self.running.lock().await.remove(&conv.0);
-                let summary_text = match join_res {
-                    Ok(Ok(o)) => summary.unwrap_or(o.final_text),
-                    Ok(Err(e)) => {
-                        warn!(
-                            target: "imagent::core",
-                            conv_id = %conv.0,
-                            error = %e,
-                            "compact 摘要生成失败"
-                        );
-                        self.reply(conv, &format!("生成摘要失败：{e}"), hint).await;
-                        return;
-                    }
-                    Err(e) => {
-                        warn!(
-                            target: "imagent::core",
-                            conv_id = %conv.0,
-                            error = %e,
-                            "compact 摘要任务 panic"
-                        );
-                        self.reply(conv, &format!("摘要任务异常：{e}"), hint).await;
-                        return;
-                    }
-                };
-                // 存摘要 + 重置活动 session + 清 active_name（释放 context）。
-                if let Err(e) = self.store.set_config(&key, &summary_text).await {
-                    warn!(
-                        target: "imagent::core",
-                        conv_id = %conv.0,
-                        error = %e,
-                        "set_config(compact_summary) 失败"
-                    );
+                Err(e) => {
+                    self.reply(conv, &e, hint).await;
                 }
-                if let Err(e) = self.store.delete_session(&conv.0).await {
-                    warn!(
-                        target: "imagent::core",
-                        conv_id = %conv.0,
-                        error = %e,
-                        "compact: delete_session 失败"
-                    );
-                }
-                if let Err(e) = self.store.delete_config(&active_name_key(&conv.0)).await {
-                    warn!(
-                        target: "imagent::core",
-                        conv_id = %conv.0,
-                        error = %e,
-                        "compact: delete_config(active_name) 失败"
-                    );
-                }
+            },
+        }
+    }
+
+    /// W2-5：自动 compact——成功轮次的上下文水位（`usage.input_tokens`）达到
+    /// `auto_compact_threshold_tokens`（0 = 关闭）且仍有活动会话时，自动走
+    /// [`Self::compact_session_locked`]。调用点在 runner 循环（conv 锁已持有，
+    /// 与 /compact 同串行域）。压缩轮注册进 running，/stop 可中断。
+    pub(super) async fn maybe_auto_compact(&self, conv: &ConvId, hint: &ReplyHint, in_tokens: u64) {
+        let threshold = self.auto_compact_threshold;
+        if threshold == 0 || in_tokens < threshold {
+            return;
+        }
+        // 无活动会话（本轮未落库/失败）不压缩。
+        let Ok(Some(row)) = self.store.get_session(&conv.0).await else {
+            return;
+        };
+        let sid = SessionId(row.session_id);
+        info!(
+            target: "imagent::core",
+            conv_id = %conv.0,
+            in_tokens,
+            threshold,
+            "上下文水位超阈值，自动压缩（auto_compact）"
+        );
+        self.reply(
+            conv,
+            &format!(
+                "🧠 本轮输入约 {in_tokens} tokens（超过阈值 {threshold}），正在自动压缩上下文……"
+            ),
+            hint,
+        )
+        .await;
+        match self.compact_session_locked(conv, &sid).await {
+            Ok(summary) => {
                 self.reply(
                     conv,
                     &format!(
-                        "已压缩会话。摘要：\n\n{summary_text}\n\n（新会话将保留此摘要延续上下文）"
+                        "✅ 已自动压缩。摘要：\n\n{summary}\n\n（新会话将保留此摘要延续上下文）"
                     ),
                     hint,
                 )
                 .await;
             }
+            Err(e) => {
+                warn!(
+                    target: "imagent::core",
+                    conv_id = %conv.0,
+                    error = %e,
+                    "自动压缩失败（下轮水位仍高会再次尝试）"
+                );
+                self.reply(
+                    conv,
+                    "⚠️ 自动压缩失败（不影响既有会话；可稍后手动 /compact）。",
+                    hint,
+                )
+                .await;
+            }
         }
+    }
+
+    /// 压缩管道（/compact 与自动压缩共用）：resume `sid` 生成 ≤400 字摘要 →
+    /// 存 `compact_summary:<conv>` → 删活动 session + active_name。
+    /// **调用方须已持有 conv 串行锁**；摘要生成注册进 running（/stop 可中断，
+    /// 中断时 session 保留、摘要不落——下轮可再来）。Err 为用户可读文案。
+    async fn compact_session_locked(
+        &self,
+        conv: &ConvId,
+        sid: &SessionId,
+    ) -> std::result::Result<String, String> {
+        const COMPACT_PROMPT: &str =
+            "请用中文简洁总结当前对话的要点、已做决定与未完成事项（不超过 400 字）。";
+        // 用 claude resume 当前 session 生成摘要；只取 Final/RunOutcome。
+        let (tx, mut rx) = mpsc::channel::<AgentChunk>(32);
+        let backend = self.backend.clone();
+        let workdir = self.resolve_workdir(&conv.0).await;
+        let tools = self.allowed_tools.read().clone();
+        let conv_id_compact = conv.0.clone();
+        let agent_timeout = self.agent_timeout;
+        let sid = sid.clone();
+        let join = tokio::spawn(async move {
+            let backend_name = backend.name();
+            // agent_timeout = 0（默认）= 关闭总超时；/stop 仍可中断本任务。
+            if agent_timeout.is_zero() {
+                return backend
+                    .run(
+                        &conv_id_compact,
+                        COMPACT_PROMPT,
+                        Some(&sid),
+                        &workdir,
+                        &tools,
+                        tx,
+                    )
+                    .await;
+            }
+            match tokio::time::timeout(
+                agent_timeout,
+                backend.run(
+                    &conv_id_compact,
+                    COMPACT_PROMPT,
+                    Some(&sid),
+                    &workdir,
+                    &tools,
+                    tx,
+                ),
+            )
+            .await
+            {
+                Ok(res) => res,
+                Err(_elapsed) => {
+                    METRICS.agent_timeouts.with_label_values(&["total"]).inc();
+                    Err(crate::error::CoreError::Backend(
+                        backend_name,
+                        format!("agent run timed out after {agent_timeout:?}"),
+                    ))
+                }
+            }
+        });
+        // P5-16：注册进 running——/stop 此前中断不了 /compact
+        //（长摘要生成只能干等 agent_timeout）。conv 锁由调用方
+        // 持有，注册/移除无 ABA（新轮次须先等锁）。
+        self.running
+            .lock()
+            .await
+            .insert(conv.0.clone(), join.abort_handle());
+        let mut summary: Option<String> = None;
+        while let Some(chunk) = rx.recv().await {
+            if let AgentChunk::Final(t) = chunk {
+                summary = Some(t);
+            }
+        }
+        let join_res = join.await;
+        // 无论成败，先摘除在飞注册（/stop 已抢先摘除时为 no-op）。
+        self.running.lock().await.remove(&conv.0);
+        let summary_text = match join_res {
+            Ok(Ok(o)) => summary.unwrap_or(o.final_text),
+            Ok(Err(e)) => {
+                warn!(
+                    target: "imagent::core",
+                    conv_id = %conv.0,
+                    error = %e,
+                    "compact 摘要生成失败"
+                );
+                return Err(format!("生成摘要失败：{e}"));
+            }
+            Err(e) => {
+                warn!(
+                    target: "imagent::core",
+                    conv_id = %conv.0,
+                    error = %e,
+                    "compact 摘要任务 panic"
+                );
+                return Err(format!("摘要任务异常：{e}"));
+            }
+        };
+        // 存摘要 + 重置活动 session + 清 active_name（释放 context）。
+        if let Err(e) = self
+            .store
+            .set_config(&compact_summary_key(&conv.0), &summary_text)
+            .await
+        {
+            warn!(
+                target: "imagent::core",
+                conv_id = %conv.0,
+                error = %e,
+                "set_config(compact_summary) 失败"
+            );
+        }
+        if let Err(e) = self.store.delete_session(&conv.0).await {
+            warn!(
+                target: "imagent::core",
+                conv_id = %conv.0,
+                error = %e,
+                "compact: delete_session 失败"
+            );
+        }
+        if let Err(e) = self.store.delete_config(&active_name_key(&conv.0)).await {
+            warn!(
+                target: "imagent::core",
+                conv_id = %conv.0,
+                error = %e,
+                "compact: delete_config(active_name) 失败"
+            );
+        }
+        Ok(summary_text)
     }
 
     /// /stop [all] —— 中断在飞任务（撤 pending 审批）。
