@@ -99,6 +99,22 @@ pub trait Backend: Send + Sync {
         false
     }
 
+    /// W1-2：运行时模型选择（`/model` 命令热设；None = backend/CLI 自身默认）。
+    /// 进程内生效，重启/SIGHUP 恢复为 config 基准值（main 注入）。默认 no-op
+    /// （不支持的后端忽略）；claude-cli（`--model`）与 claude-acp
+    /// （ANTHROPIC_MODEL env）覆写。
+    fn set_model(&self, _model: Option<String>) {}
+
+    /// W1-2：当前生效的运行时模型（`/model` 展示用；None = 默认模型）。
+    fn model(&self) -> Option<String> {
+        None
+    }
+
+    /// W1-2：是否支持模型选择（不支持的后端 `/model` 回明确提示而非静默无效）。
+    fn supports_model_selection(&self) -> bool {
+        false
+    }
+
     /// B3：权限审批能力声明（能力协商）。dispatcher 启动时校验：
     /// `permission_mode = ask/auto-claude`（needs_socket 闭环类档）而本能力非
     /// `FullLoop` 时 fail-closed 拒绝启动。默认 `Unsupported`，各 backend

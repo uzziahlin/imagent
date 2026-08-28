@@ -1218,10 +1218,28 @@ impl Dispatcher {
 
     /// runner 起跑前等批处理窗口，然后原子取批：pending 空 → 删 entry（交还 runner
     /// 身份）返回 None；非空 → drain 返回 Some（窗口期入队的消息自然并入本批）。
+    ///
+    /// W1-5（自适应窗口）：出批条件从「固定睡一个窗口」改为「**静默一个窗口**」
+    /// ——连发未停（每窗口内仍有新消息入队）则继续等，硬上限（3× 窗口、封顶
+    /// 10s）防持续输入把一轮无限推迟。单人单条消息路径与旧语义等价（睡一个
+    /// 窗口、无新消息即出批）；用户长连发时不再被窗口边界切成多轮。
     async fn take_batch_after_window(&self, conv: &str) -> Option<Vec<InboundMessage>> {
         let window = *self.batch_window.read();
         if !window.is_zero() {
-            tokio::time::sleep(window).await;
+            const TOTAL_CAP_MS: u64 = 10_000;
+            let cap = window
+                .saturating_mul(3)
+                .min(Duration::from_millis(TOTAL_CAP_MS));
+            let started = Instant::now();
+            let mut last_len = self.queues.lock().await.get(conv).map_or(0, |q| q.len());
+            loop {
+                tokio::time::sleep(window).await;
+                let now_len = self.queues.lock().await.get(conv).map_or(0, |q| q.len());
+                if now_len == last_len || started.elapsed() >= cap {
+                    break;
+                }
+                last_len = now_len;
+            }
         }
         let mut map = self.queues.lock().await;
         let pending = map.get_mut(conv)?;

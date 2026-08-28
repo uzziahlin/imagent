@@ -494,8 +494,13 @@ impl Dispatcher {
         }
     }
 
-    /// /stop —— 中断在飞任务（撤 pending 审批 + 清批处理队列）。
-    pub(super) async fn cmd_stop(&self, conv: &ConvId, hint: &ReplyHint) {
+    /// /stop [all] —— 中断在飞任务（撤 pending 审批）。
+    ///
+    /// W1-1（steering，对齐 Claude Code 原生 Esc 语义）：缺省**保留排队消息**——
+    /// runner 循环在本轮返回后自动取批续跑，即「中断 + 插话转新输入」；运行中
+    /// 发的补充/纠正消息不再被丢弃。`/stop all` 为硬停：清空排队与提示（旧语义，
+    /// 全停场景）。
+    pub(super) async fn cmd_stop(&self, conv: &ConvId, hint: &ReplyHint, parts: &[&str]) {
         // P4-1：中断该 conv 的在飞 agent 任务。**不取 conv 串行锁**——
         // 取了会等到任务自然结束才生效（等价于没停）。
         // 若正等 IM 权限审批：pending 回复通道被 cancel 以 deny 唤醒 →
@@ -525,22 +530,34 @@ impl Dispatcher {
         } else {
             false
         };
-        // stop = 全停：清空排队待合并的消息（P4-2 批处理队列）+ 排队状态（P10）。
-        // S-4（原子）：hint 清理移进 queues 同一临界区——分两步会有间隙，期间
-        // 新消息入队（写 hint）又被下一步清掉，hint 与实际队列错位。
-        let dropped = {
+        // W1-1：缺省保留排队（runner 自动续跑 = steering）；`/stop all` 清空排队
+        // + 排队状态（P10 hint）——硬停语义。S-4（原子）：清空与 hint 清理在
+        // 同一 queues 临界区。
+        let hard = matches!(parts.get(1).map(|s| s.trim()), Some("all") | Some("全部"));
+        let queued = if hard {
             let mut map = self.queues.lock().await;
             let n = map.remove(&conv.0).map(|q| q.len()).unwrap_or(0);
             self.queued_hints.lock().await.remove(&conv.0);
             n
+        } else {
+            self.queues
+                .lock()
+                .await
+                .get(&conv.0)
+                .map(|q| q.len())
+                .unwrap_or(0)
         };
-        let text = match (aborted, dropped) {
-            (true, 0) => "🛑 已中断当前任务".to_string(),
-            (true, n) => format!("🛑 已中断当前任务（丢弃 {n} 条排队消息）"),
-            (false, 0) => "ℹ️ 当前没有运行中的任务".to_string(),
-            (false, n) => {
-                format!("ℹ️ 当前没有运行中的任务（丢弃 {n} 条排队消息）")
+        let text = match (aborted, hard, queued) {
+            (true, _, 0) => "🛑 已中断当前任务".to_string(),
+            (true, false, n) => format!(
+                "🛑 已中断当前任务（{n} 条排队消息已保留，将自动转入新一轮；要全部丢弃可发 /stop all）"
+            ),
+            (true, true, n) => format!("🛑 已中断当前任务（丢弃 {n} 条排队消息）"),
+            (false, _, 0) => "ℹ️ 当前没有运行中的任务".to_string(),
+            (false, false, n) => {
+                format!("ℹ️ 当前没有运行中的任务（{n} 条消息排队中，将在下一轮处理）")
             }
+            (false, true, n) => format!("ℹ️ 当前没有运行中的任务（丢弃 {n} 条排队消息）"),
         };
         self.reply(conv, &text, hint).await;
     }

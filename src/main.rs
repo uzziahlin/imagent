@@ -541,11 +541,14 @@ async fn main() -> Result<()> {
                 );
             }
             let perm_mode = std::sync::Arc::new(parking_lot::RwLock::new(perm_resolved));
-            let backend = build_backend(
-                &config.agent,
+            let (backend, claude_cli_handle) = build_backend(
+                &config,
                 perm_mode.clone(),
                 std::time::Duration::from_secs(config.permission_ask_timeout_secs),
             );
+            // W1-2：模型基准值（config `claude_model`）——/model 的运行时热设以
+            // 此为初值，SIGHUP 重载时重设回 config 值。
+            backend.set_model(config.claude_model.clone());
             // P8-4：后端原生权限模式透传（claude → --permission-mode）——缺省
             // None = auto 档透传新 auto 模式；显式配置则覆盖（已过 config 校验归一）。
             // 后端暂不支持时 warn（不静默——防预期落差），值保留待后续接入。
@@ -717,19 +720,23 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // 10. SIGHUP 热重载（白名单 / allowed_tools / permission_mode）。
+            // 10. SIGHUP 热重载（白名单 / allowed_tools / permission_mode / 模型与运行参数）。
             #[cfg(unix)]
             spawn_sighup_handler(
                 dispatcher.clone(),
                 backend.clone(),
+                claude_cli_handle,
                 config_path.clone(),
                 http_store.clone(),
             );
             #[cfg(not(unix))]
-            tracing::info!(
-                target: "imagent::ops",
-                "SIGHUP 热重载需要 Unix 信号，当前平台不可用（配置改动需重启生效）"
-            );
+            {
+                let _ = claude_cli_handle;
+                tracing::info!(
+                    target: "imagent::ops",
+                    "SIGHUP 热重载需要 Unix 信号，当前平台不可用（配置改动需重启生效）"
+                )
+            }
 
             // P5：媒体目录 TTL 清理——入站媒体只增不减会撑爆磁盘；启动跑一次 +
             // 每日循环，删 7 天前的文件（best-effort，失败仅跳过）。
@@ -978,21 +985,44 @@ async fn main() -> Result<()> {
 /// - 其它（含默认 `"claude-cli"`）→ [`imagent_claude::ClaudeBackend`]，
 ///   行为与单后端时期完全一致（permission_mode 共享句柄，SIGHUP 即时生效）。
 fn build_backend(
-    agent: &str,
+    config: &imagent_core::Config,
     perm_mode: Arc<parking_lot::RwLock<imagent_core::PermissionMode>>,
     ask_timeout: std::time::Duration,
-) -> Arc<dyn imagent_core::Backend> {
-    match agent {
-        "codex" => Arc::new(imagent_codex::CodexBackend::new()),
-        "gemini" => Arc::new(imagent_gemini::GeminiBackend::new()),
-        "claude-acp" => Arc::new(imagent_claude::AcpBackend::with_permission_mode_shared(
-            perm_mode,
-        )),
-        _ => Arc::new(imagent_claude::ClaudeBackend::with_permission_mode_shared(
-            perm_mode,
-            ask_timeout,
-        )),
+) -> (
+    Arc<dyn imagent_core::Backend>,
+    Option<Arc<imagent_claude::ClaudeBackend>>,
+) {
+    match config.agent.as_str() {
+        "codex" => (Arc::new(imagent_codex::CodexBackend::new()), None),
+        "gemini" => (Arc::new(imagent_gemini::GeminiBackend::new()), None),
+        "claude-acp" => (
+            Arc::new(imagent_claude::AcpBackend::with_permission_mode_shared(
+                perm_mode,
+            )),
+            None,
+        ),
+        _ => {
+            let b = Arc::new(imagent_claude::ClaudeBackend::with_permission_mode_shared(
+                perm_mode,
+                ask_timeout,
+            ));
+            // W1-2/W1-3/W1-4：claude-cli 运行参数（fallback 模型 / 禁用工具 /
+            // 系统提示 / 用户 MCP servers）。具体类型上调用（trait 不暴露
+            // claude 专有参数）；句柄额外返回给 SIGHUP 重载用。
+            apply_claude_runtime_opts(&b, config);
+            (b.clone(), Some(b))
+        }
     }
+}
+
+/// W1-2/W1-3/W1-4：claude-cli 运行参数注入（启动与 SIGHUP 共用同一接线）。
+fn apply_claude_runtime_opts(b: &imagent_claude::ClaudeBackend, config: &imagent_core::Config) {
+    b.set_runtime_opts(
+        config.claude_fallback_model.clone(),
+        config.disallowed_tools.clone(),
+        config.append_system_prompt.clone(),
+        config.mcp_config_path.as_deref(),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1242,6 +1272,7 @@ async fn health_handler(
 fn spawn_sighup_handler(
     dispatcher: Arc<imagent_core::Dispatcher>,
     backend: Arc<dyn imagent_core::Backend>,
+    claude_cli: Option<Arc<imagent_claude::ClaudeBackend>>,
     config_path: PathBuf,
     store: imagent_store::Store,
 ) {
@@ -1279,6 +1310,14 @@ fn spawn_sighup_handler(
                     dispatcher.reload_tools(cfg.allowed_tools.clone());
                     dispatcher.set_approval_tools(cfg.approval_tools.clone());
                     backend.set_native_permission_mode(cfg.backend_permission_mode.clone());
+                    // W1-2：模型基准值重设（/model 的运行时热设被 config 值覆盖——
+                    // SIGHUP 语义即「回到配置面」）。
+                    backend.set_model(cfg.claude_model.clone());
+                    // W1-2/W1-3/W1-4：claude-cli 运行参数整体替换（含用户 MCP
+                    // 配置文件的现场重读）。
+                    if let Some(b) = &claude_cli {
+                        apply_claude_runtime_opts(b, &cfg);
+                    }
                     let perm = cfg.permission_mode.resolve(&cfg.agent);
                     // S-1：热切校验失败（闭环档 × 非 FullLoop 后端 / socket 失败）
                     // 拒绝并保留既有模式——error 级日志便于发现「改了配置没生效」。

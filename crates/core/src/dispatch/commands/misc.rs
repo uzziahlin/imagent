@@ -568,6 +568,94 @@ impl Dispatcher {
         }
     }
 
+    /// /model [name|default] —— 查看/热切运行时模型（W1-2）。
+    ///
+    /// 仅支持模型选择的后端可用（claude-cli `--model` / claude-acp env）；
+    /// 查看对所有白名单用户开放，**切换需 admin**——模型影响成本与行为，多人
+    /// 共用网关时不宜任意成员切换。进程内生效，重启/SIGHUP 恢复 config 的
+    /// `claude_model` 基准值；切换落审计。
+    pub(super) async fn cmd_model(
+        &self,
+        conv: &ConvId,
+        sender: &str,
+        hint: &ReplyHint,
+        parts: &[&str],
+    ) {
+        if !self.backend.supports_model_selection() {
+            self.reply(
+                conv,
+                &format!(
+                    "当前后端 {} 暂不支持模型选择（保持其默认模型）。",
+                    self.backend.name()
+                ),
+                hint,
+            )
+            .await;
+            return;
+        }
+        let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+        if arg.is_empty() {
+            let cur = self
+                .backend
+                .model()
+                .unwrap_or_else(|| "（默认，跟随 CLI/本机配置）".to_string());
+            self.reply(
+                conv,
+                &format!(
+                    "当前模型：{cur}\n用法：/model <名称>（切换，需管理员） · /model default（恢复默认）"
+                ),
+                hint,
+            )
+            .await;
+            return;
+        }
+        if !self.is_admin(sender) {
+            let msg = if self.admin_senders.read().is_empty() {
+                "切换模型需要管理员（admin_senders 为空，IM 内不可用；请在 config.toml 配置 admin_senders 或运行 imagent setup）。".to_string()
+            } else {
+                "切换模型需要管理员（查看用 /model）。".to_string()
+            };
+            self.reply(conv, &msg, hint).await;
+            return;
+        }
+        if arg.eq_ignore_ascii_case("default") {
+            self.backend.set_model(None);
+            self.reply(conv, "✅ 已恢复默认模型（CLI/本机配置）。", hint)
+                .await;
+            return;
+        }
+        // 模型名合理性：单个词 + 长度上限（防把整段文本当模型名传给 CLI）。
+        if arg.chars().count() > 64 || arg.split_whitespace().count() != 1 {
+            self.reply(
+                conv,
+                "模型名须为单个词且不超过 64 字符（如 sonnet / opus / haiku 或完整模型 id）。",
+                hint,
+            )
+            .await;
+            return;
+        }
+        let model = arg.to_string();
+        self.backend.set_model(Some(model.clone()));
+        if let Err(e) = self
+            .store
+            .append_audit(
+                "model_switch",
+                Some(sender),
+                Some(&conv.0),
+                Some(&format!("model={model}")),
+            )
+            .await
+        {
+            tracing::warn!(target: "imagent::core", error = %e, "append_audit(model_switch) 失败");
+        }
+        self.reply(
+            conv,
+            &format!("✅ 模型已切换为 {model}（下一轮生效；重启后恢复 config 配置）。"),
+            hint,
+        )
+        .await;
+    }
+
     /// /stats [today|7d|all] —— token 用量/成本统计（默认 7d）。全局 + 本会话
     /// 两组维度；无成本数据的 backend（codex/gemini）按 tokens 汇总展示。
     pub(super) async fn cmd_stats(&self, conv: &ConvId, hint: &ReplyHint, parts: &[&str]) {
@@ -762,7 +850,7 @@ impl Dispatcher {
 
     /// /help —— 命令总表（P6-3：飞书等卡片平台带常用命令按钮）。
     pub(super) async fn cmd_help(&self, conv: &ConvId, hint: &ReplyHint) {
-        let body = "🗂 会话\n- /new 重置会话\n- /switch <name> 切换/新建命名会话\n- /sessions 列出命名会话\n- /resume [n] 恢复历史/本机会话\n- /compact 压缩上下文\n\n📁 目录与文件\n- /cd <path> 切工作目录\n- /ws save|use|remove <name> 命名工作空间\n- /img <path> 发图片 · /file <path> 发文件\n\n🛡️ 权限与运行\n- /perm <off|allow|deny|ask> 权限模式\n- /stop 中断当前任务\n- /timeout <分钟|off|default> 会话级空闲看门狗\n\n🧪 状态与诊断\n- /status 状态 · /doctor 自检 · /reconnect 重连\n- /config [k v] 查看/热改配置\n\n👥 白名单与管理（管理员）\n- /allow、/disallow 授权/撤权（飞书群内可 @ 对方）\n- /chat allow|deny|allow-all|list 会话白名单\n- /admin list|add|remove 管理员\n- /list 白名单 · /whoami 我的 id\n\n其他内容直接发给 agent 即可。";
+        let body = "🗂 会话\n- /new 重置会话\n- /switch <name> 切换/新建命名会话\n- /sessions 列出命名会话\n- /resume [n] 恢复历史/本机会话\n- /compact 压缩上下文\n\n📁 目录与文件\n- /cd <path> 切工作目录\n- /ws save|use|remove <name> 命名工作空间\n- /img <path> 发图片 · /file <path> 发文件\n\n🛡️ 权限与运行\n- /perm <off|allow|deny|ask> 权限模式\n- /stop 中断任务（排队消息保留并自动续跑；/stop all 全部丢弃）\n- /timeout <分钟|off|default> 会话级空闲看门狗\n- /model [名称|default] 查看/切换模型（切换需管理员）\n\n🧪 状态与诊断\n- /status 状态 · /doctor 自检 · /reconnect 重连\n- /config [k v] 查看/热改配置 · /audit [n] 审计日志\n\n👥 白名单与管理（管理员）\n- /allow、/disallow 授权/撤权（飞书群内可 @ 对方）\n- /chat allow|deny|allow-all|list 会话白名单\n- /admin list|add|remove 管理员\n- /list 白名单 · /whoami 我的 id\n\n其他内容直接发给 agent 即可（任务运行中发送的消息会排队合并进下一轮）。";
         let buttons = vec![
             CardButton {
                 label: "📊 状态".into(),

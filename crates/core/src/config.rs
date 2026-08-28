@@ -362,6 +362,28 @@ pub struct Config {
     /// （30 分钟）；0 = 关闭豁免。改动需重启。
     #[serde(default = "default_feishu_thread_active_window_secs")]
     pub feishu_thread_active_window_secs: u64,
+    /// W1-2：claude 模型选择（claude 系后端 `--model`；None = CLI 自身默认/本机
+    /// 配置）。`/model` 命令可运行时热改（进程内），重启/SIGHUP 恢复为本值。
+    #[serde(default)]
+    pub claude_model: Option<String>,
+    /// W1-2：claude fallback 模型（`--fallback-model`，主模型不可用时自动回退）。
+    /// 仅在 `claude_model` 同时设置时附加。
+    #[serde(default)]
+    pub claude_fallback_model: Option<String>,
+    /// W1-2：禁用工具清单（claude `--disallowedTools`；与 allowed_tools 独立：
+    /// allowed 先收敛、disallowed 再剔除，黑名单优先）。空 = 不附加。
+    #[serde(default)]
+    pub disallowed_tools: Vec<String>,
+    /// W1-3：用户 MCP servers 配置文件路径（标准 `.mcp.json` 形态，顶层
+    /// `mcpServers` 表）。设置后每次 run 生成的审批用 mcp 配置会**合并**其中的
+    /// servers（给 agent 挂用户工具，如飞书文档/消息读写）；名为 `imagent` 的
+    /// 条目被跳过（审批闭环专用名，防覆盖）。load 期校验存在 + 可解析。
+    #[serde(default)]
+    pub mcp_config_path: Option<PathBuf>,
+    /// W1-4：附加系统提示（claude `--append-system-prompt`）：网关人设 / 回复
+    /// 格式约束等，追加在 agent 自身 system prompt 之后。改动需重启/SIGHUP。
+    #[serde(default)]
+    pub append_system_prompt: Option<String>,
 }
 
 /// 缺省工具集：读/检索/联网/文件编辑类（与 Edit 同风险级：workdir 内写或只读），
@@ -527,6 +549,51 @@ impl Config {
             )));
         }
 
+        // W1-2：模型串 trim，空白视为未设置（防 `claude_model = ""` 附加空 flag）。
+        cfg.claude_model = cfg
+            .claude_model
+            .take()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty());
+        cfg.claude_fallback_model = cfg
+            .claude_fallback_model
+            .take()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty());
+        if cfg.claude_fallback_model.is_some() && cfg.claude_model.is_none() {
+            return Err(CoreError::Config(
+                "claude_fallback_model 需要 claude_model 同时设置（fallback 仅在主模型指定时有意义）".into(),
+            ));
+        }
+        // W1-4：系统提示 trim，空白视为未设置。
+        cfg.append_system_prompt = cfg
+            .append_system_prompt
+            .take()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        // W1-3：mcp_config_path 启动期校验——存在 + 顶层 mcpServers 是对象。
+        // 显式配置的文件坏了应当立即报错，而不是每轮 run 静默丢工具。
+        if let Some(p) = cfg.mcp_config_path.take() {
+            let raw = std::fs::read_to_string(&p).map_err(|e| {
+                CoreError::Config(format!("mcp_config_path 无法读取（{}）：{e}", p.display()))
+            })?;
+            let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+                CoreError::Config(format!(
+                    "mcp_config_path（{}）不是合法 JSON：{e}",
+                    p.display()
+                ))
+            })?;
+            match v.get("mcpServers").and_then(|m| m.as_object()) {
+                Some(_) => cfg.mcp_config_path = Some(p),
+                None => {
+                    return Err(CoreError::Config(format!(
+                        "mcp_config_path（{}）缺少顶层 mcpServers 对象（标准 .mcp.json 形态：{{\"mcpServers\": {{…}}}}）",
+                        p.display()
+                    )))
+                }
+            }
+        }
+
         // P8-4：后端原生权限模式透传值归一（trim + 小写）；值域按后端校验——
         // claude 系白名单（manual 是 default 的 CLI 别名；未知值启动期报错防拼出
         // 非法 flag），其余后端先存值（backend 侧忽略并 warn，接入时再收紧）。
@@ -630,6 +697,11 @@ permission_mode = "auto"    # 缺省=auto：claude-cli=透传 claude 原生 auto
 # ask_via_im_timeout_secs = 1800      # ask_via_im 等待回复超时(秒，默认 30 分钟，可被调用覆盖)
 # shutdown_grace_secs = 60            # 优雅退出 drain 宽限(秒)；超时 abort 在飞 task
 # require_keyring = false        # 默认 false(headless 明文回退+warn); true=keyring 不可用时拒绝明文落盘(fail-closed，安全部署建议)
+# claude_model = "sonnet"        # claude 模型（--model；不设 = CLI 默认）；/model 命令可运行时热改（重启恢复本值）
+# claude_fallback_model = "haiku"  # fallback 模型（--fallback-model；须与 claude_model 同时设置）
+# disallowed_tools = ["WebSearch"]  # 禁用工具黑名单（--disallowedTools；与 allowed_tools 独立，黑名单优先）
+# mcp_config_path = "~/.claude/mcp.json"  # 用户 MCP servers 合并进每次 run（给 agent 挂工具；imagent 条目名保留）
+# append_system_prompt = "你在飞书里服务团队，回复保持简洁中文"  # 附加系统提示（--append-system-prompt）
 "#;
 }
 /// claude `--permission-mode` 合法值归一（入参已小写化）：manual→default
@@ -1251,6 +1323,102 @@ message_fragment_interval_ms = 250
             PathBuf::from("/definitely/not/exist/ws")
         );
         cleanup(&p);
+    }
+
+    /// W1-2/W1-3/W1-4：claude 运行参数配置——默认值、trim、fallback 约束与
+    /// mcp_config_path 校验。
+    #[test]
+    fn claude_runtime_opts_defaults_validation_and_mcp_path() {
+        // 默认：全部未设置。
+        let p = tmp_path("w1_def", r#"default_workdir = "/tmp/ws""#);
+        let cfg = Config::load(&p).expect("ok");
+        assert_eq!(cfg.claude_model, None);
+        assert_eq!(cfg.claude_fallback_model, None);
+        assert!(cfg.disallowed_tools.is_empty());
+        assert_eq!(cfg.mcp_config_path, None);
+        assert_eq!(cfg.append_system_prompt, None);
+        cleanup(&p);
+
+        // 模型/fallback/黑名单/系统提示正常解析 + 空白 trim 为 None。
+        let p = tmp_path(
+            "w1_parse",
+            r#"default_workdir = "/tmp/ws"
+claude_model = " sonnet "
+claude_fallback_model = "haiku"
+disallowed_tools = ["WebSearch", "Bash"]
+append_system_prompt = " 你在飞书里服务团队 "
+"#,
+        );
+        let cfg = Config::load(&p).expect("ok");
+        assert_eq!(cfg.claude_model.as_deref(), Some("sonnet"));
+        assert_eq!(cfg.claude_fallback_model.as_deref(), Some("haiku"));
+        assert_eq!(cfg.disallowed_tools.len(), 2);
+        assert_eq!(
+            cfg.append_system_prompt.as_deref(),
+            Some("你在飞书里服务团队")
+        );
+        cleanup(&p);
+
+        let p = tmp_path(
+            "w1_blank",
+            r#"default_workdir = "/tmp/ws"
+claude_model = "   "
+append_system_prompt = ""
+"#,
+        );
+        let cfg = Config::load(&p).expect("空白视同未设置");
+        assert_eq!(cfg.claude_model, None);
+        assert_eq!(cfg.append_system_prompt, None);
+        cleanup(&p);
+
+        // fallback 单独设置 → 启动期报错。
+        let p = tmp_path(
+            "w1_fb_only",
+            "default_workdir = \"/tmp/ws\"\nclaude_fallback_model = \"haiku\"\n",
+        );
+        assert!(Config::load(&p).is_err(), "fallback 须与主模型同时设置");
+        cleanup(&p);
+
+        // mcp_config_path：合法文件（顶层 mcpServers 对象）通过；缺失/坏 JSON/
+        // 缺 mcpServers 启动期报错。
+        let dir = std::env::temp_dir();
+        let good = dir.join(format!("imagent_mcp_good_{}.json", std::process::id()));
+        std::fs::write(&good, r#"{"mcpServers":{"fetch":{"command":"uvx"}}}"#).unwrap();
+        let p = tmp_path(
+            "w1_mcp_ok",
+            &format!(
+                "default_workdir = \"/tmp/ws\"\nmcp_config_path = {:?}\n",
+                good.display()
+            ),
+        );
+        let cfg = Config::load(&p).expect("合法 mcp 配置应通过");
+        assert_eq!(cfg.mcp_config_path.as_deref(), Some(good.as_path()));
+        cleanup(&p);
+        let _ = std::fs::remove_file(&good);
+
+        let missing = dir.join("imagent_mcp_definitely_missing.json");
+        let p = tmp_path(
+            "w1_mcp_missing",
+            &format!(
+                "default_workdir = \"/tmp/ws\"\nmcp_config_path = {:?}\n",
+                missing.display()
+            ),
+        );
+        assert!(Config::load(&p).is_err(), "文件不存在应报错");
+        cleanup(&p);
+
+        let bad = dir.join(format!("imagent_mcp_bad_{}.json", std::process::id()));
+        std::fs::write(&bad, r#"{"mcpServers": "not-an-object"}"#).unwrap();
+        let p = tmp_path(
+            "w1_mcp_bad",
+            &format!(
+                "default_workdir = \"/tmp/ws\"\nmcp_config_path = {:?}\n",
+                bad.display()
+            ),
+        );
+        assert!(Config::load(&p).is_err(), "mcpServers 非对象应报错");
+        cleanup(&p);
+        let _ = std::fs::remove_file(&bad);
     }
 
     /// P6-8：工作目录安全校验——过宽位置拒绝、正常项目目录放行。

@@ -1930,7 +1930,8 @@ async fn stop_without_running_task_replies() {
     drop_db(ctx.db).await;
 }
 
-/// P4-1/P4-2：/stop 同时丢弃排队待合并的消息，回复含丢弃条数。
+/// P4-1/P4-2 → W1-1：`/stop all` 硬停——丢弃排队消息，回复含丢弃条数。
+/// （缺省 `/stop` 已改为保留排队并自动续跑，见下方 steering 测试。）
 #[tokio::test]
 async fn stop_drops_queued_messages() {
     let _serial = SERIAL.lock().await;
@@ -1964,7 +1965,7 @@ async fn stop_drops_queued_messages() {
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    ctx.disp.handle(msg("c1", "alice", "/stop")).await;
+    ctx.disp.handle(msg("c1", "alice", "/stop all")).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), runner).await;
     let inbox = ctx.inbox.lock().await.clone();
     assert!(
@@ -1978,6 +1979,59 @@ async fn stop_drops_queued_messages() {
         prompts,
         vec!["first round".to_string()],
         "排队消息不应再执行"
+    );
+    drop_db(ctx.db).await;
+}
+
+/// W1-1（steering）：缺省 `/stop` 保留排队消息——runner 在中断后自动取批续跑
+/// （对齐 Claude Code Esc + 队列注入语义）；回复说明保留条数与 /stop all 逃生口。
+#[tokio::test]
+async fn stop_preserves_queued_messages_and_continues() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build_slow(
+        Auth::new(vec!["alice".into()]),
+        200,
+        TaskBudgets {
+            batch_window: Duration::from_millis(1),
+            ..test_budgets()
+        },
+    )
+    .await;
+    let disp = ctx.disp.clone();
+    let runner = tokio::spawn(async move {
+        disp.handle(msg("c1", "alice", "round A")).await;
+    });
+    assert!(wait_registered(&ctx, "c1").await, "在飞任务应已注册");
+    ctx.disp.handle(msg("c1", "alice", "queued B")).await;
+    ctx.disp.handle(msg("c1", "alice", "queued C")).await;
+    for _ in 0..400 {
+        if ctx
+            .disp
+            .queues
+            .lock()
+            .await
+            .get("c1")
+            .is_some_and(|q| q.len() == 2)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    ctx.disp.handle(msg("c1", "alice", "/stop")).await;
+    let done = tokio::time::timeout(Duration::from_secs(5), runner).await;
+    assert!(done.is_ok(), "runner 应在续跑第二轮后退出");
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox
+            .iter()
+            .any(|t| t.contains("2 条排队消息已保留，将自动转入新一轮")),
+        "回复应说明保留条数与续跑: {inbox:?}"
+    );
+    let prompts = ctx.prompts.lock().await.clone();
+    assert_eq!(
+        prompts,
+        vec!["round A".to_string(), "queued B\n\nqueued C".to_string()],
+        "排队消息应自动转入第二轮（合并）"
     );
     drop_db(ctx.db).await;
 }
@@ -2108,13 +2162,17 @@ async fn pending_queue_cap_warns_and_drops() {
             .handle(msg("c1", "alice", &format!("spam {i}")))
             .await;
     }
-    ctx.disp.handle(msg("c1", "alice", "/stop")).await;
+    ctx.disp.handle(msg("c1", "alice", "/stop all")).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), runner).await;
     let inbox = ctx.inbox.lock().await.clone();
     let overflow = inbox.iter().filter(|t| t.contains("已达上限")).count();
     assert!(overflow >= 5, "超限的 5 条应各回一次告警: {inbox:?}");
     let prompts = ctx.prompts.lock().await.clone();
-    assert_eq!(prompts.len(), 1, "只应有首轮（已 /stop）: {prompts:?}");
+    assert_eq!(
+        prompts.len(),
+        1,
+        "只应有首轮（已 /stop all 硬停）: {prompts:?}"
+    );
     drop_db(ctx.db).await;
 }
 
