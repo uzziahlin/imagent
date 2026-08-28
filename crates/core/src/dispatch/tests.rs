@@ -3114,7 +3114,22 @@ async fn resume_numbering_stable_after_selection() {
         2,
     )
     .await;
-    ctx.disp.handle(msg("c1", "alice", "/resume")).await;
+    // feed_and_wait 只等 backend 调用计数，第二轮的 session 落库在其之后
+    // （慢 runner 上可能滞后）——轮询重发 /resume 直到列表出现两行，消除
+    // 「列表仅 1 行 → /resume 2 无效」的竞态（单用户场景重发即刷新缓存）。
+    for _ in 0..200 {
+        ctx.disp.handle(msg("c1", "alice", "/resume")).await;
+        let ok = ctx
+            .inbox
+            .lock()
+            .await
+            .last()
+            .is_some_and(|t| t.contains("| 2 |"));
+        if ok {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     // 选中 1（sess-0）后，2 仍指向 sess-1（而非移除后前移的 sess-0 复用）。
     ctx.disp.handle(msg("c1", "alice", "/resume 1")).await;
     ctx.disp.handle(msg("c1", "alice", "/resume 2")).await;
