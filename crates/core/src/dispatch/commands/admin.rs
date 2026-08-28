@@ -571,6 +571,18 @@ impl Dispatcher {
             let cot = self.cot_detail.read().as_str();
             let perm = self.permission_mode.read().as_str();
             let reply_mode = self.reply_mode.read().as_str();
+            // Wave B-7：本会话 COT 覆盖（有则标注，无则跟随全局）。
+            let cot_conv = match self.cot_overrides.lock().await.get(&conv.0) {
+                Some(d) => format!("{}（本会话覆盖）", d.as_str()),
+                None => format!("{cot}（跟随全局）"),
+            };
+            // Wave B-4：quiet_hours（config 注入原文；只可查不可热改——降级判定
+            // 在平台实现侧，无热改句柄，重启生效）。
+            let quiet = self
+                .quiet_hours_raw
+                .read()
+                .clone()
+                .unwrap_or_else(|| "（未设置）".to_string());
             // P6 遗留补齐：require_mention 平台侧查询（None = 平台无群聊 @ 语义）。
             let require_mention = match self.platform.require_mention_in_group().await {
                 Some(true) => "on（群消息须 @bot）".to_string(),
@@ -583,7 +595,7 @@ impl Dispatcher {
                 None => "on",
             };
             let text = format!(
-                                "当前配置：\n- cot_detail = {cot}（off|brief|detailed）\n- batch_window_ms = {window_ms}\n- agent_idle_timeout_secs = {idle_secs}（0=关）\n- agent_timeout_secs = {}（0=关，默认；重启生效）\n- permission_mode = {perm}\n- require_mention = {require_mention}（热切换，重启回 config 值）\n- reply_mode = {reply_mode}（card|text，热切换，重启回 config 值）\n用法：/config <key> <value>（管理员）",
+                                "当前配置：\n- cot_detail = {cot}（off|brief|detailed）\n- cot（本会话）= {cot_conv}（/config cot <off|brief|detailed|default>，白名单可用）\n- batch_window_ms = {window_ms}\n- agent_idle_timeout_secs = {idle_secs}（0=关）\n- agent_timeout_secs = {}（0=关，默认；重启生效）\n- permission_mode = {perm}\n- require_mention = {require_mention}（热切换，重启回 config 值）\n- reply_mode = {reply_mode}（card|text，热切换，重启回 config 值）\n- quiet_hours = {quiet}（免打扰：时段内加急提醒降级普通消息；重启生效）\n用法：/config <key> <value>（管理员；cot 为本会话偏好，白名单可用）",
                                 self.agent_timeout.as_secs(),
                             );
             // P9-2：表单卡（飞书等支持 form 的平台渲染下拉 + 提交；其余平台降级
@@ -625,8 +637,16 @@ impl Dispatcher {
             return;
         }
         // P9-2：表单提交回传（/config form k=v k=v …）——逐对应用（键白名单在
-        // feishu proto 侧已过滤，这里再走一遍完整校验）。
+        // feishu proto 侧已过滤，这里再走一遍完整校验）。表单字段全部是**全局**
+        // 热改键（reply_mode/cot_detail/require_mention），与 `/config k v` 同级，
+        // 必须过 admin 门槛——此前该分支在门槛之前，任意白名单用户可用表单绕过
+        // admin 校验热改全局配置（安全修复）。
         if key == "form" {
+            if !self.is_admin(&sender.0) {
+                let msg = self.admin_denied_reply("修改配置");
+                self.reply(conv, &msg, hint).await;
+                return;
+            }
             let pairs: Vec<&str> = parts.iter().skip(2).copied().collect();
             let mut results = Vec::new();
             for pair in pairs {
@@ -643,6 +663,15 @@ impl Dispatcher {
             self.reply(conv, &text, hint).await;
             return;
         }
+        // Wave B-7：/config cot <off|brief|detailed|default> —— **per-conv** COT
+        // 档位（白名单用户即可改自己所在会话的展示粒度——会话级偏好与 /timeout
+        // 同语义，不属全局配置，无需 admin；admin 改全局仍走 /config cot_detail）。
+        // 须在下方 admin 门槛之前分流。
+        if key == "cot" {
+            let result = self.apply_conv_cot(&conv.0, value).await;
+            self.reply(conv, &result, hint).await;
+            return;
+        }
         if !self.is_admin(&sender.0) {
             let msg = self.admin_denied_reply("修改配置");
             self.reply(conv, &msg, hint).await;
@@ -650,6 +679,28 @@ impl Dispatcher {
         }
         let result = self.apply_config_kv(key, value).await;
         self.reply(conv, &result, hint).await;
+    }
+
+    /// Wave B-7：per-conv COT 覆盖应用（`/config cot`，白名单可用；default 清除
+    /// 覆盖回全局）。返回面向用户的结果文案。
+    async fn apply_conv_cot(&self, conv: &str, value: &str) -> String {
+        if value.eq_ignore_ascii_case("default") {
+            self.cot_overrides.lock().await.remove(conv);
+            let global = self.cot_detail.read().as_str();
+            return format!("✅ 已清除本会话覆盖，回到全局 cot_detail = {global}");
+        }
+        match CotDetail::from_str_lossy(value) {
+            Some(d) => {
+                self.cot_overrides.lock().await.insert(conv.to_string(), d);
+                format!(
+                    "✅ 本会话 cot = {}（仅本会话生效；/config cot default 恢复全局）",
+                    d.as_str()
+                )
+            }
+            None => {
+                "用法：/config cot <off|brief|detailed|default>（本会话偏好，无需管理员）".into()
+            }
+        }
     }
 
     /// 单个配置键的热改应用（`/config k v` 与表单提交 `/config form k=v` 共用；

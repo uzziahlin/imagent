@@ -10,6 +10,9 @@ publish.workspace = true
 [dependencies]
 imagent-core = { path = "../core" }
 openlark = { workspace = true }
+# Wave B-4：quiet_hours 免打扰时段的本地时区判定（Local::now；已是 lock 内传递
+# 依赖，无新增包）。
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

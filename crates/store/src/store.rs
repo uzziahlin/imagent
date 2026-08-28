@@ -1041,6 +1041,36 @@ impl Store {
         })
         .await
     }
+
+    /// Wave B-11：按 action 列出 `since`（epoch 秒）之后的审计记录（按 id 升序，
+    /// 不限量——受审计轮转 10000 条天然有界）。/stats 审批分组聚合用（按
+    /// action 过滤避免全表拉取后再筛）。不动 schema：走既有 audit_log 索引列。
+    pub async fn list_audit_since(&self, action: &str, since: i64) -> Result<Vec<AuditRow>> {
+        let action = action.to_string();
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, ts, action, actor, target, detail FROM audit_log \
+                 WHERE action = ?1 AND ts >= ?2 ORDER BY id",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![action, since], |r| {
+                Ok(AuditRow {
+                    id: r.get(0)?,
+                    ts: r.get(1)?,
+                    action: r.get(2)?,
+                    actor: r.get::<_, Option<String>>(3)?,
+                    target: r.get::<_, Option<String>>(4)?,
+                    detail: r.get::<_, Option<String>>(5)?,
+                })
+            })?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r?);
+            }
+            Ok(v)
+        })
+        .await
+    }
     // —— run_stats（per-run 用量记录，schema v8 /stats 数据源）——
 
     /// 追加一条 per-run 用量记录（append-only；轮转保留最近 10000 条，参照
@@ -2337,6 +2367,68 @@ mod tests {
         let limited = store.list_audit(1).await.unwrap();
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].id, list[0].id);
+    }
+
+    /// Wave B-11：list_audit_since——按 action 过滤 + since 时间窗，升序返回
+    ///（/stats 审批分组的数据源）。
+    #[tokio::test]
+    async fn audit_list_since_filters_action_and_time() {
+        let db = TempDb::new("audit_since").await;
+        let store = Store::open(&db.path).await.unwrap();
+        store
+            .append_audit(
+                "permission_decision",
+                Some("u1"),
+                Some("c1"),
+                Some("tool=Bash decision=allow waited_secs=3"),
+            )
+            .await
+            .unwrap();
+        store
+            .append_audit(
+                "permission_decision",
+                Some("u1"),
+                Some("c1"),
+                Some("tool=Bash decision=timeout waited_secs=300"),
+            )
+            .await
+            .unwrap();
+        store
+            .append_audit("allow", Some("a"), Some("b"), None)
+            .await
+            .unwrap();
+
+        // 全量（since=0）：只有 permission_decision 两行，升序。
+        let rows = store
+            .list_audit_since("permission_decision", 0)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "其它 action 不混入: {rows:?}");
+        assert!(rows[0].id < rows[1].id, "升序");
+        assert!(rows[0]
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("decision=allow"));
+        assert!(rows[1]
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("decision=timeout"));
+
+        // since 在两行之间：append 的 ts 均为 now（秒粒度），用未来时刻验证
+        // 时间窗过滤生效（全被排除）。
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!(store
+            .list_audit_since("permission_decision", now + 100)
+            .await
+            .unwrap()
+            .is_empty());
+        // 不存在的 action。
+        assert!(store.list_audit_since("nope", 0).await.unwrap().is_empty());
     }
 
     #[tokio::test]

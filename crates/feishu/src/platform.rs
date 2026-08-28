@@ -34,8 +34,7 @@ use crate::client::{
     create_card_entity, download_file, download_image, fetch_bot_open_id, fetch_token,
     is_card_not_exist_msg, is_rate_limited_msg, list_joined_chats, patch_card, patch_card_element,
     patch_card_settings, reply_comment, reply_comment_nodes, reply_message, send_card_msg,
-    send_card_ref_msg, send_file_msg, send_image_msg, send_text_msg, upload_file, upload_image,
-    FeishuWsClient,
+    send_file_msg, send_image_msg, send_text_msg, upload_file, upload_image, FeishuWsClient,
 };
 use crate::proto::{
     comment_target_from_conv, is_comment_event, is_group_message_event, is_private_conv,
@@ -52,9 +51,6 @@ const FEISHU_TEXT_MAX: usize = 28_000;
 /// 离线无法精确确认——按评论场景普遍几千字符的量级取 3000 字符保守值，**待真机
 /// 校准**：超限报错时再下调）。
 const FEISHU_COMMENT_TEXT_MAX: usize = 3_000;
-/// 话题群「近期活跃」免 @ 窗口：该话题 30 分钟内有过消息即视为活跃追问中，
-/// 豁免 require_mention（普通群不豁免，见 drain task）。
-const THREAD_ACTIVE_WINDOW: Duration = Duration::from_secs(30 * 60);
 /// `tenant_access_token` 有效期 2h（7200s），距过期 < 10min（即 elapsed >= 110min）则刷新。
 const TOKEN_TTL: Duration = Duration::from_secs(110 * 60);
 
@@ -138,6 +134,15 @@ pub struct FeishuPlatform {
     text_split_max: usize,
     /// 评论回复分片上限：`min(config.message_max_len, FEISHU_COMMENT_TEXT_MAX)`。
     comment_split_max: usize,
+    /// Wave B-4：免打扰时段（config `quiet_hours` 解析产物；None = 不启用）——
+    /// buzz 类加急提醒（send_urgent_text）在窗口内降级为普通消息（不加 buzz
+    /// 字段），只影响加急不影响内容。本地时区判定（chrono Local）。
+    quiet_hours: Option<imagent_core::QuietHours>,
+    /// Wave B-6：群 conv → 本轮发起消息 id（回复锚点表）。drain 收到普通群消息
+    /// 时登记（见 [`group_reply_anchor`]），发送侧（send_text / 卡片）据此用
+    /// reply API 把回复锚回发起消息。取舍：conv 级近似（与 conv_senders 同姿态
+    /// ——每 conv 轮次串行，运行中他人新消息会更新锚点，误差窗口极窄）。
+    reply_anchors: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl FeishuPlatform {
@@ -151,6 +156,10 @@ impl FeishuPlatform {
     ///   平台协议上限）；send_text 各分片阈值与它取 min（见 `text_split_max`）。
     /// - `ask_timeout_secs`：config `permission_ask_timeout_secs`——审批/问题卡
     ///   倒计时 note 的真实值（与 core 的实际超时预算同源）。
+    /// - `quiet_hours`（Wave B-4）：config `quiet_hours` 解析产物——buzz 加急
+    ///   提醒的免打扰降级窗口。
+    /// - `thread_active_window_secs`（Wave B-8）：话题免 @ 窗口（0 = 关闭）。
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         app_id: String,
         app_secret: String,
@@ -158,6 +167,8 @@ impl FeishuPlatform {
         require_mention_in_group: bool,
         message_max_len: Option<usize>,
         ask_timeout_secs: u64,
+        quiet_hours: Option<imagent_core::QuietHours>,
+        thread_active_window_secs: u64,
     ) -> Result<Self> {
         let ws_config = Arc::new(
             Config::builder()
@@ -221,6 +232,12 @@ impl FeishuPlatform {
         let thread_active: Arc<Mutex<HashMap<String, Instant>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let thread_active_for_drain = thread_active.clone();
+        // Wave B-6：群 conv 回复锚点表（drain 登记、发送侧消费）。
+        let reply_anchors: Arc<Mutex<HashMap<String, String>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let reply_anchors_for_drain = reply_anchors.clone();
+        // Wave B-8：话题免 @ 窗口（config 注入；0 = 关闭）。
+        let thread_active_window = thread_window_of(thread_active_window_secs);
         tokio::spawn(async move {
             let mut payload_rx = payload_rx;
             while let Some(payload) = payload_rx.recv().await {
@@ -241,16 +258,19 @@ impl FeishuPlatform {
                 let mut policy = *policy_for_drain.read().await;
                 // 话题群近期活跃免 @：该话题 THREAD_ACTIVE_WINDOW 内有过消息则
                 // 本条豁免 require_mention（追问场景免于每条 @）。普通群
-                // thread_key 不命中，不豁免。
+                // thread_key 不命中，不豁免。Wave B-8：窗口时长改 config 注入
+                //（thread_active_window，0 = 关闭豁免）。
                 let thread_key = thread_key_of_payload(&payload);
-                if let Some(tk) = &thread_key {
-                    if thread_active_for_drain
-                        .lock()
-                        .await
-                        .get(tk)
-                        .is_some_and(|t| t.elapsed() < THREAD_ACTIVE_WINDOW)
-                    {
-                        policy.require_mention_in_group = false;
+                if !thread_active_window.is_zero() {
+                    if let Some(tk) = &thread_key {
+                        if thread_active_for_drain
+                            .lock()
+                            .await
+                            .get(tk)
+                            .is_some_and(|t| t.elapsed() < thread_active_window)
+                        {
+                            policy.require_mention_in_group = false;
+                        }
                     }
                 }
                 if let Some((msgid, mut msg, pending)) =
@@ -265,6 +285,14 @@ impl FeishuPlatform {
                         .lock()
                         .await
                         .insert(msg.conv_id.0.clone(), msg.sender.0.clone());
+                    // Wave B-6：普通群消息登记回复锚点（发起消息 id）——发送侧
+                    // 据此用 reply API 把回复/卡片锚回该消息（私聊/话题/评论不
+                    // 登记：私聊无引用需求，话题已锚 root，评论走评论回复）。
+                    if let Some((conv, anchor)) =
+                        group_reply_anchor(&msg.conv_id.0, msg.source_msg_id.as_deref())
+                    {
+                        reply_anchors_for_drain.lock().await.insert(conv, anchor);
+                    }
                     if let Some(tk) = &thread_key {
                         let mut m = thread_active_for_drain.lock().await;
                         if m.len() > 512 {
@@ -581,6 +609,8 @@ impl FeishuPlatform {
             conv_senders,
             comment_anchors,
             ask_timeout_secs,
+            quiet_hours,
+            reply_anchors,
             text_split_max: message_max_len
                 .unwrap_or(FEISHU_TEXT_MAX)
                 .min(FEISHU_TEXT_MAX),
@@ -641,7 +671,8 @@ impl FeishuPlatform {
     /// 降级路径：发 raw 卡片消息（content=卡片 JSON），句柄 `msg:<message_id>`。
     ///
     /// managed 路径（create entity）失败时回退到整卡 im patch——体验同旧版，
-    /// 不依赖 `cardkit:card:write` 权限。
+    /// 不依赖 `cardkit:card:write` 权限。Wave B-5：群 conv 带发起者标注行；
+    /// Wave B-6：有锚点时 reply 引用发起消息（见 [`Self::send_interactive_anchored`]）。
     async fn send_card_raw(
         &self,
         conv_id: &str,
@@ -649,9 +680,18 @@ impl FeishuPlatform {
         kind: ReceiveIdKind,
         card: &OutboundCard,
         token: &str,
+        sender: Option<&str>,
     ) -> Result<Option<String>> {
-        let card_json = render_card(card, conv_id);
-        let mid = send_card_msg(&self.core_config, token, receive_id, kind, &card_json).await?;
+        let card_json = render_card(card, conv_id, sender);
+        let mid = self
+            .send_interactive_anchored(
+                token,
+                &ConvId(conv_id.to_string()),
+                receive_id,
+                kind,
+                &card_json,
+            )
+            .await?;
         Ok(mid.map(|m| format!("msg:{m}")))
     }
 
@@ -746,14 +786,17 @@ impl FeishuPlatform {
                 let element = patch_card_element(token, card_id, "md_body", &content, seq).await;
                 // footer 收敛（真机校准 UX）：初始卡的「🧠 思考中…」在终态
                 // 换成 完成/出错/已中断——否则任务结束后标识永远停在执行中。
-                // 成功终态附本轮成本摘要（`✅ 已完成 · $0.012`）。
+                // 成功终态附本轮成本摘要 + 总耗时（Wave B-3：`✅ 已完成 · 30m ·
+                // $0.012`，run_secs 为终态全量秒数）。失败终态：managed 路径
+                // element PATCH 无法追加按钮组件（/doctor 按钮只在整卡渲染路径，
+                // 见 render_card），以 footer 文案指引兜底（Wave B-11）。
                 let footer = match err {
                     Some("已中断") => "⏹ 已中断".to_string(),
-                    Some(_) => "❌ 出错".to_string(),
-                    None => match &card.usage_display {
-                        Some(u) => format!("✅ 已完成 · {u}"),
-                        None => "✅ 已完成".to_string(),
-                    },
+                    Some(_) => "❌ 出错 · 可发 /doctor 自检".to_string(),
+                    None => crate::card::terminal_done_footer(
+                        card.run_secs,
+                        card.usage_display.as_deref(),
+                    ),
                 };
                 self.patch_footer_if_changed(token, card_id, &footer).await;
                 // 关闭流式（光标消失）；sequence 与 element PATCH 共用递增。
@@ -841,6 +884,56 @@ impl FeishuPlatform {
             .get(conv_id)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Wave B-6：该 conv 的回复锚点（最近一条普通群消息的 message_id；无则 None）。
+    async fn reply_anchor(&self, conv_id: &str) -> Option<String> {
+        self.reply_anchors
+            .lock()
+            .await
+            .get(conv_id)
+            .cloned()
+            .filter(|a| !a.is_empty())
+    }
+
+    /// Wave B-4：当前是否处于免打扰时段（本地时区；未配置 = false）。
+    fn in_quiet_hours(&self) -> bool {
+        let Some(q) = self.quiet_hours else {
+            return false;
+        };
+        use chrono::Timelike;
+        let now = chrono::Local::now();
+        let minute_of_day = now.hour() * 60 + now.minute();
+        q.contains(minute_of_day)
+    }
+
+    /// Wave B-6：发 interactive 卡消息——有回复锚点（群 conv）优先 reply API
+    /// 引用发起消息，失败/无锚点回退 create 到会话。返回 message_id。
+    /// 两个用途：raw 卡片 JSON（降级/话题外的整卡）与 CardKit 实体引用
+    /// （`{"type":"card","data":{"card_id":…}}`——reply 的 content 与 create 同构）。
+    async fn send_interactive_anchored(
+        &self,
+        token: &str,
+        conv: &ConvId,
+        receive_id: &str,
+        kind: ReceiveIdKind,
+        content: &str,
+    ) -> Result<Option<String>> {
+        if let Some(anchor) = self.reply_anchor(&conv.0).await {
+            match reply_message(&self.core_config, token, &anchor, "interactive", content).await {
+                Ok(mid) => return Ok(mid),
+                Err(e) => {
+                    // 锚点消息可能已被撤回/删除：回退 create（卡片不能因此不发）。
+                    warn!(
+                        target: "feishu",
+                        conv_id = %conv.0,
+                        error = %e,
+                        "reply 引用发起消息失败，回退普通发送"
+                    );
+                }
+            }
+        }
+        send_card_msg(&self.core_config, token, receive_id, kind, content).await
     }
 
     /// P8-2：登记一张**新发**的询问卡：pending 登记（request_id 路由）+ 复用槽
@@ -937,7 +1030,8 @@ impl FeishuPlatform {
     }
 
     /// P8-2：发送静态卡片（终态结果下沉用）：普通 conv 直接发，话题群 reply 进
-    /// 原话题。发送失败如实上抛（调用方 warn——结果已在流式卡里兜底过一次）。
+    /// 原话题。Wave B-6：普通群优先 reply 引用发起消息（锚点）；Wave B-5：带
+    /// 发起者标注行。发送失败如实上抛（调用方 warn——结果已在流式卡里兜底过一次）。
     async fn send_static_card(&self, conv: &ConvId, card_json: &str) -> Result<()> {
         if let Some((_chat, root_id)) = thread_target_from_conv(conv) {
             return self
@@ -957,10 +1051,145 @@ impl FeishuPlatform {
         self.with_token(|t| {
             let receive_id = receive_id.clone();
             let card_json = card_json.to_string();
-            async move { send_card_msg(&self.core_config, &t, &receive_id, kind, &card_json).await }
+            let conv_clone = conv.clone();
+            async move {
+                self.send_interactive_anchored(&t, &conv_clone, &receive_id, kind, &card_json)
+                    .await
+            }
         })
         .await
         .map(|_| ())
+    }
+
+    /// send_text 实现（`buzz = true` 附加急字段；普通路径 false 与历史形态一致）。
+    async fn send_text_opts(
+        &self,
+        conv: &ConvId,
+        text: &str,
+        _hint: &ReplyHint,
+        buzz: bool,
+    ) -> Result<()> {
+        // P9-1：出站文本统一邮箱掩码——租户消息审计对裸邮箱回 400（含纯文本
+        // 消息），流式/最终回复都会过这里。
+        let text = &mask_emails(text);
+        // P4-9：评论线程 conv → 回复云文档评论（每分片一条回复）。
+        // 会话锚放宽批次：conv 只锚 file_token，回复目标 comment_id 优先取 drain
+        // 登记的锚点表（最近一条评论）；存量 conv 的内嵌形态兜底。两者皆无（进程
+        // 刚重启、锚点表为空）无法定位评论线程，如实报错。
+        if let Some((file_token, legacy_cid)) = comment_target_from_conv(conv) {
+            let comment_id = self
+                .comment_anchors
+                .lock()
+                .await
+                .get(&conv.0)
+                .cloned()
+                .or(legacy_cid);
+            let Some(comment_id) = comment_id else {
+                return Err(CoreError::Platform(
+                    PLATFORM,
+                    "评论线程缺少回复目标（comment_id），无法回复".to_string(),
+                ));
+            };
+            // 评论回复用独立更小阈值（FEISHU_COMMENT_TEXT_MAX 与 config
+            // message_max_len 取 min，见 comment_split_max）；首片带「（共 N 段）」
+            // 序标，长回复被拆分时用户可感知。
+            let chunks: Vec<String> = split_message(text, self.comment_split_max);
+            let total = chunks.len();
+            for (i, chunk) in chunks.into_iter().enumerate() {
+                let chunk = if i == 0 && total > 1 {
+                    format!("（共 {total} 段）\n{chunk}")
+                } else {
+                    chunk
+                };
+                // P5：中途失败标明分片序号——用户能感知回复被截断而非静默缺尾。
+                // token 失效错误码由 with_token 清缓存自愈（其余错误如实上抛）。
+                if let Err(e) = self
+                    .with_token(|t| {
+                        let file_token = file_token.clone();
+                        let comment_id = comment_id.clone();
+                        let chunk = chunk.clone();
+                        async move {
+                            reply_comment(&self.core_config, &t, &file_token, &comment_id, &chunk)
+                                .await
+                        }
+                    })
+                    .await
+                {
+                    return Err(CoreError::Platform(
+                        PLATFORM,
+                        format!("第 {}/{} 片发送失败（回复可能被截断）：{e}", i + 1, total),
+                    ));
+                }
+            }
+            return Ok(());
+        }
+        // P6-4：话题群 conv → 回复话题根消息（reply API 落回原话题，而非发新话题）。
+        if let Some((_chat_id, root_id)) = thread_target_from_conv(conv) {
+            let chunks: Vec<String> = split_message(text, self.text_split_max);
+            let total = chunks.len();
+            for (i, chunk) in chunks.into_iter().enumerate() {
+                let content = serde_json::json!({ "text": chunk }).to_string();
+                if let Err(e) = self
+                    .with_token(|t| {
+                        let root_id = root_id.clone();
+                        let content = content.clone();
+                        async move {
+                            reply_message(&self.core_config, &t, &root_id, "text", &content).await
+                        }
+                    })
+                    .await
+                {
+                    return Err(CoreError::Platform(
+                        PLATFORM,
+                        format!("第 {}/{} 片发送失败（回复可能被截断）：{e}", i + 1, total),
+                    ));
+                }
+            }
+            return Ok(());
+        }
+        let (receive_id, kind) = receive_target_from_conv(conv)
+            .ok_or_else(|| CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0)))?;
+        let chunks: Vec<String> = split_message(text, self.text_split_max);
+        let total = chunks.len();
+        // Wave B-6：普通群 conv 有回复锚点时整段用 reply API 引用发起消息（最终
+        // 回复锚回问题，多轮群聊里不再错位）；锚点失效（被撤回/删除）回退普通
+        // 发送——内容不能因引用失败而丢。私聊无锚点，走原路径。
+        // Wave B-4：buzz（加急）消息不走锚点——reply API 的 text content 加急
+        // 字段未验证（**待真机校准**），加急走 create 路径保 buzz 字段生效。
+        let anchor = if buzz {
+            None
+        } else {
+            self.reply_anchor(&conv.0).await
+        };
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            // P5：同上——分片失败标注序号（此前中途 ? 退出，截断无标记）。
+            if let Err(e) = self
+                .with_token(|t| {
+                    let receive_id = receive_id.clone();
+                    let chunk = chunk.clone();
+                    let anchor = anchor.clone();
+                    async move {
+                        if let Some(a) = anchor.as_deref() {
+                            let content = serde_json::json!({ "text": chunk }).to_string();
+                            if reply_message(&self.core_config, &t, a, "text", &content)
+                                .await
+                                .is_ok()
+                            {
+                                return Ok(());
+                            }
+                        }
+                        send_text_msg(&self.core_config, &t, &receive_id, kind, &chunk, buzz).await
+                    }
+                })
+                .await
+            {
+                return Err(CoreError::Platform(
+                    PLATFORM,
+                    format!("第 {}/{} 片发送失败（回复可能被截断）：{e}", i + 1, total),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -978,6 +1207,32 @@ fn claim_free_slot(
     }
     slot.pending_req = Some(request_id.to_string());
     Some(slot.msg_id.clone())
+}
+
+/// Wave B-8：config 秒数 → 话题免 @ 窗口时长（0 = 关闭豁免；纯函数便于单测）。
+/// 默认值（30 分钟）在 core config 的 `default_feishu_thread_active_window_secs`。
+fn thread_window_of(secs: u64) -> Duration {
+    if secs == 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(secs)
+    }
+}
+
+/// Wave B-6：群 conv 回复锚点判定（纯函数，便于单测）——**普通群**消息（conv
+/// `feishu:oc_…` 且无话题 root 后缀、非评论线程、非私聊 `ou_`）带平台消息 id
+/// 才登记；话题群已有 root 锚（回复天然落回话题），私聊无引用需求，评论走
+/// 评论回复 API。返回 `(conv, message_id)`。
+fn group_reply_anchor(conv: &str, source_msg_id: Option<&str>) -> Option<(String, String)> {
+    let mid = source_msg_id.filter(|m| m.starts_with("om_"))?;
+    if is_private_conv(conv) || comment_target_from_conv(&ConvId(conv.to_string())).is_some() {
+        return None;
+    }
+    // 话题群 conv 形态 `feishu:<chat>:<root>`（两个冒号段）——不登记。
+    if thread_target_from_conv(&ConvId(conv.to_string())).is_some() {
+        return None;
+    }
+    Some((conv.to_string(), mid.to_string()))
 }
 
 /// 空串 sender → None（AskRender.sender 的 Option 形态适配渲染入参）。
@@ -1114,7 +1369,7 @@ async fn send_drain_text(
             .await
             .map(|_| ())
         } else if let Some((receive_id, kind)) = receive_target_from_conv(conv) {
-            send_text_msg(core_config, &t, &receive_id, kind, text).await
+            send_text_msg(core_config, &t, &receive_id, kind, text, false).await
         } else {
             Ok(())
         }
@@ -1183,108 +1438,21 @@ impl Platform for FeishuPlatform {
         })
     }
 
-    async fn send_text(&self, conv: &ConvId, text: &str, _hint: &ReplyHint) -> Result<()> {
-        // P9-1：出站文本统一邮箱掩码——租户消息审计对裸邮箱回 400（含纯文本
-        // 消息），流式/最终回复都会过这里。
-        let text = &mask_emails(text);
-        // P4-9：评论线程 conv → 回复云文档评论（每分片一条回复）。
-        // 会话锚放宽批次：conv 只锚 file_token，回复目标 comment_id 优先取 drain
-        // 登记的锚点表（最近一条评论）；存量 conv 的内嵌形态兜底。两者皆无（进程
-        // 刚重启、锚点表为空）无法定位评论线程，如实报错。
-        if let Some((file_token, legacy_cid)) = comment_target_from_conv(conv) {
-            let comment_id = self
-                .comment_anchors
-                .lock()
-                .await
-                .get(&conv.0)
-                .cloned()
-                .or(legacy_cid);
-            let Some(comment_id) = comment_id else {
-                return Err(CoreError::Platform(
-                    PLATFORM,
-                    "评论线程缺少回复目标（comment_id），无法回复".to_string(),
-                ));
-            };
-            // 评论回复用独立更小阈值（FEISHU_COMMENT_TEXT_MAX 与 config
-            // message_max_len 取 min，见 comment_split_max）；首片带「（共 N 段）」
-            // 序标，长回复被拆分时用户可感知。
-            let chunks: Vec<String> = split_message(text, self.comment_split_max);
-            let total = chunks.len();
-            for (i, chunk) in chunks.into_iter().enumerate() {
-                let chunk = if i == 0 && total > 1 {
-                    format!("（共 {total} 段）\n{chunk}")
-                } else {
-                    chunk
-                };
-                // P5：中途失败标明分片序号——用户能感知回复被截断而非静默缺尾。
-                // token 失效错误码由 with_token 清缓存自愈（其余错误如实上抛）。
-                if let Err(e) = self
-                    .with_token(|t| {
-                        let file_token = file_token.clone();
-                        let comment_id = comment_id.clone();
-                        let chunk = chunk.clone();
-                        async move {
-                            reply_comment(&self.core_config, &t, &file_token, &comment_id, &chunk)
-                                .await
-                        }
-                    })
-                    .await
-                {
-                    return Err(CoreError::Platform(
-                        PLATFORM,
-                        format!("第 {}/{} 片发送失败（回复可能被截断）：{e}", i + 1, total),
-                    ));
-                }
-            }
-            return Ok(());
-        }
-        // P6-4：话题群 conv → 回复话题根消息（reply API 落回原话题，而非发新话题）。
-        if let Some((_chat_id, root_id)) = thread_target_from_conv(conv) {
-            let chunks: Vec<String> = split_message(text, self.text_split_max);
-            let total = chunks.len();
-            for (i, chunk) in chunks.into_iter().enumerate() {
-                let content = serde_json::json!({ "text": chunk }).to_string();
-                if let Err(e) = self
-                    .with_token(|t| {
-                        let root_id = root_id.clone();
-                        let content = content.clone();
-                        async move {
-                            reply_message(&self.core_config, &t, &root_id, "text", &content).await
-                        }
-                    })
-                    .await
-                {
-                    return Err(CoreError::Platform(
-                        PLATFORM,
-                        format!("第 {}/{} 片发送失败（回复可能被截断）：{e}", i + 1, total),
-                    ));
-                }
-            }
-            return Ok(());
-        }
-        let (receive_id, kind) = receive_target_from_conv(conv)
-            .ok_or_else(|| CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0)))?;
-        let chunks: Vec<String> = split_message(text, self.text_split_max);
-        let total = chunks.len();
-        for (i, chunk) in chunks.into_iter().enumerate() {
-            // P5：同上——分片失败标注序号（此前中途 ? 退出，截断无标记）。
-            if let Err(e) = self
-                .with_token(|t| {
-                    let receive_id = receive_id.clone();
-                    let chunk = chunk.clone();
-                    async move {
-                        send_text_msg(&self.core_config, &t, &receive_id, kind, &chunk).await
-                    }
-                })
-                .await
-            {
-                return Err(CoreError::Platform(
-                    PLATFORM,
-                    format!("第 {}/{} 片发送失败（回复可能被截断）：{e}", i + 1, total),
-                ));
-            }
-        }
-        Ok(())
+    async fn send_text(&self, conv: &ConvId, text: &str, hint: &ReplyHint) -> Result<()> {
+        self.send_text_opts(conv, text, hint, false).await
+    }
+
+    /// Wave B：加急（buzz）文本覆写——免打扰时段（quiet_hours，本地时区）降级
+    /// 为普通消息（只去掉 buzz 字段，内容与投递不变，见 config 注释）。
+    async fn send_urgent_text(&self, conv: &ConvId, text: &str, hint: &ReplyHint) -> Result<()> {
+        let buzz = !self.in_quiet_hours();
+        self.send_text_opts(conv, text, hint, buzz).await
+    }
+
+    /// Wave B：平台支持加急文本（text 消息体 buzz 字段）——core 据此决定长任务
+    /// 完成强提醒是否发送。
+    fn supports_urgent_text(&self) -> bool {
+        true
     }
 
     async fn send_media(&self, conv: &ConvId, media: &MediaRef, _hint: &ReplyHint) -> Result<()> {
@@ -1895,8 +2063,13 @@ impl Platform for FeishuPlatform {
             .lock()
             .await
             .insert(conv.0.clone(), false);
+        // 发起者（最近 sender）：编码进初始卡的 ⏹ 终止按钮 value（群 conv 下点击者
+        // 校验）；Wave B-5：群 conv 初始卡顶部加「发起者」标注行。占位/未知为
+        // None（旧语义，不校验）。
+        let sender = self.last_sender(&conv.0).await;
+        let sender_opt = (!sender.is_empty()).then_some(sender);
         if let Some((_chat, root_id)) = thread_target_from_conv(conv) {
-            let card_json = render_card(card, &conv.0);
+            let card_json = render_card(card, &conv.0, sender_opt.as_deref());
             return self
                 .with_token(|t| {
                     let root_id = root_id.clone();
@@ -1911,19 +2084,12 @@ impl Platform for FeishuPlatform {
         }
         let (receive_id, kind) = receive_target_from_conv(conv)
             .ok_or_else(|| CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0)))?;
-        // 发起者（最近 sender）：编码进初始卡的 ⏹ 终止按钮 value（群 conv 下点击者
-        // 校验）。占位/未知为 None（旧语义，不校验）。
-        let sender = self.last_sender(&conv.0).await;
-        let sender_opt = if sender.is_empty() {
-            None
-        } else {
-            Some(sender)
-        };
         let res = self
             .with_token(|t| {
                 let receive_id = receive_id.clone();
                 let conv_for_init = conv.0.clone();
                 let sender_opt = sender_opt.clone();
+                let conv_for_anchor = conv.clone();
                 async move {
                     match create_card_entity(
                         &t,
@@ -1932,21 +2098,51 @@ impl Platform for FeishuPlatform {
                     .await
                     {
                         Ok(card_id) => {
-                            match send_card_ref_msg(&self.core_config, &t, &receive_id, kind, &card_id)
+                            // Wave B-6：普通群优先 reply 引用发起消息（content 与
+                            // create 同构：card 实体引用 JSON）；失败/无锚点回退
+                            // create 到会话。
+                            let content = serde_json::json!({
+                                "type": "card", "data": { "card_id": card_id }
+                            })
+                            .to_string();
+                            match self
+                                .send_interactive_anchored(
+                                    &t,
+                                    &conv_for_anchor,
+                                    &receive_id,
+                                    kind,
+                                    &content,
+                                )
                                 .await
                             {
                                 Ok(_) => Ok(Some(format!("card:{card_id}"))),
                                 Err(e) => {
                                     // 实体已建但消息发送失败：实体作废（14 天过期自然回收），降级 raw。
                                     warn!(target: "feishu", error = %e, "发送卡片引用消息失败，降级 raw 卡片");
-                                    self.send_card_raw(&conv.0, &receive_id, kind, card, &t).await
+                                    self.send_card_raw(
+                                        &conv_for_anchor.0,
+                                        &receive_id,
+                                        kind,
+                                        card,
+                                        &t,
+                                        sender_opt.as_deref(),
+                                    )
+                                    .await
                                 }
                             }
                         }
                         Err(e) => {
                             // 权限未开（cardkit:card:write）或创建失败 → 降级 raw + 整卡 im patch。
                             warn!(target: "feishu", error = %e, "创建卡片实体失败（需 cardkit:card:write 权限），降级 raw 卡片");
-                            self.send_card_raw(&conv.0, &receive_id, kind, card, &t).await
+                            self.send_card_raw(
+                                &conv_for_anchor.0,
+                                &receive_id,
+                                kind,
+                                card,
+                                &t,
+                                sender_opt.as_deref(),
+                            )
+                            .await
                         }
                     }
                 }
@@ -2005,10 +2201,12 @@ impl Platform for FeishuPlatform {
                     other => other,
                 }
             } else if let Some(message_id) = handle.strip_prefix("msg:") {
+                // Wave B-5：整卡重渲染带发起者标注行（群 conv）。
+                let sender = self.last_sender(&conv.0).await;
                 let card_json = if buried {
                     crate::card::render_stub_card(card)
                 } else {
-                    render_card(card, &conv.0)
+                    render_card(card, &conv.0, (!sender.is_empty()).then_some(sender).as_deref())
                 };
                 patch_card(&self.core_config, &token, message_id, &card_json).await
             } else {
@@ -2037,10 +2235,16 @@ impl Platform for FeishuPlatform {
             }
             other => other,
         };
-        // 结果下沉重发：流式卡已收敛成指针 → 完整结果另发新卡。重发失败上抛 Err
-        // ——core 的 P5-11 兜底会以纯文本补发全文（结论不能因重发失败而丢）。
+        // 结果下沉重发：流式卡已收敛成指针 → 完整结果另发新卡。Wave B-5：带
+        // 发起者标注行。重发失败上抛 Err——core 的 P5-11 兜底会以纯文本补发全文
+        //（结论不能因重发失败而丢）。
         if res.is_ok() && buried {
-            let full = render_card(card, &conv.0);
+            let sender = self.last_sender(&conv.0).await;
+            let full = render_card(
+                card,
+                &conv.0,
+                (!sender.is_empty()).then_some(sender).as_deref(),
+            );
             if let Err(e) = self.send_static_card(conv, &full).await {
                 warn!(target: "feishu", error = %e, "结果下沉重发失败，交由 core 纯文本兜底");
                 return Err(e);
@@ -2263,6 +2467,8 @@ mod tests {
             true,
             None,
             300,
+            None,
+            1800,
         )
         .expect("构造");
         let conv = ConvId("feishu:ou_x".into());
@@ -2285,6 +2491,8 @@ mod tests {
             true,
             None,
             300,
+            None,
+            1800,
         )
         .expect("构造");
         p.pending_asks.lock().await.insert(
@@ -2317,6 +2525,8 @@ mod tests {
             true,
             None,
             300,
+            None,
+            1800,
         )
         .expect("构造");
         assert_eq!(p.require_mention_in_group().await, Some(true));
@@ -2326,6 +2536,72 @@ mod tests {
             .await
             .expect("set back");
         assert_eq!(p.require_mention_in_group().await, Some(true));
+    }
+
+    /// Wave B-6：群回复锚点判定——普通群消息（om_ 前缀）登记；私聊/话题群/
+    /// 评论线程/非 om_ id 不登记。
+    #[test]
+    fn group_reply_anchor_only_plain_group() {
+        // 普通群 + 平台消息 id：登记。
+        assert_eq!(
+            group_reply_anchor("feishu:oc_g", Some("om_123")),
+            Some(("feishu:oc_g".to_string(), "om_123".to_string()))
+        );
+        // 私聊 / 话题群（带 root 后缀）/ 评论线程：不登记。
+        assert!(
+            group_reply_anchor("feishu:ou_u", Some("om_123")).is_none(),
+            "私聊不登记"
+        );
+        assert!(
+            group_reply_anchor("feishu:oc_g:om_root", Some("om_123")).is_none(),
+            "话题群已锚 root，不登记"
+        );
+        assert!(
+            group_reply_anchor("feishu:comment:ft", Some("om_123")).is_none(),
+            "评论线程走评论回复，不登记"
+        );
+        // 无消息 id / 非 om_ 形态（防御）：不登记。
+        assert!(group_reply_anchor("feishu:oc_g", None).is_none());
+        assert!(group_reply_anchor("feishu:oc_g", Some("")).is_none());
+        assert!(group_reply_anchor("feishu:oc_g", Some("xxx")).is_none());
+    }
+
+    /// Wave B-8：话题免 @ 窗口换算——0 = 关闭（ZERO），正值 = 秒。
+    #[test]
+    fn thread_window_of_maps_config() {
+        assert_eq!(thread_window_of(0), Duration::ZERO);
+        assert_eq!(thread_window_of(600), Duration::from_secs(600));
+        assert_eq!(thread_window_of(1800), Duration::from_secs(30 * 60));
+    }
+
+    /// Wave B-4/B-6：构造注入落位——quiet_hours 存解析产物（None 恒不在免打扰）；
+    /// 回复锚点表写入后可查。占位凭据（后台 WS 自然失败重试，不干扰断言）。
+    #[tokio::test]
+    async fn quiet_hours_and_reply_anchor_wiring() {
+        let p = FeishuPlatform::new(
+            "cli_test".into(),
+            "secret_test".into(),
+            "https://open.feishu.cn".into(),
+            true,
+            None,
+            300,
+            None,
+            1800,
+        )
+        .expect("构造");
+        assert!(p.quiet_hours.is_none(), "未配置 → None");
+        assert!(!p.in_quiet_hours(), "未配置恒不在免打扰");
+        // 锚点表 roundtrip。
+        assert!(p.reply_anchor("feishu:oc_g").await.is_none(), "空表 → None");
+        p.reply_anchors
+            .lock()
+            .await
+            .insert("feishu:oc_g".to_string(), "om_1".to_string());
+        assert_eq!(
+            p.reply_anchor("feishu:oc_g").await.as_deref(),
+            Some("om_1"),
+            "登记后可查"
+        );
     }
 
     /// Bug：message_max_len 三平台生效——飞书分片上限 = min(config, FEISHU_TEXT_MAX)；
@@ -2341,6 +2617,8 @@ mod tests {
                 true,
                 max,
                 300,
+                None,
+                1800,
             )
             .expect("构造")
         };

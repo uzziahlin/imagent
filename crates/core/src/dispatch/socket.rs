@@ -82,6 +82,8 @@ impl Dispatcher {
         let platform = self.platform.clone();
         let router = self.router.clone();
         let approval_tools = self.approval_tools.clone();
+        // Wave B-11：超时审计的落库句柄（permission_decision timeout 行）。
+        let store = self.store.clone();
         let permission_ask_timeout = self.permission_ask_timeout;
         let ask_via_im_timeout = self.ask_via_im_timeout;
         let expected_token = token;
@@ -103,6 +105,7 @@ impl Dispatcher {
                                     let platform = platform.clone();
                                     let router = router.clone();
                                     let approval_tools = approval_tools.clone();
+                                    let store = store.clone();
                                     let permission_ask_timeout = permission_ask_timeout;
                                     let ask_via_im_timeout = ask_via_im_timeout;
                                     let expected_token = expected_token.clone();
@@ -112,6 +115,7 @@ impl Dispatcher {
                                             platform,
                                             router,
                                             approval_tools,
+                                            store,
                                             permission_ask_timeout,
                                             ask_via_im_timeout,
                                             expected_token,
@@ -233,11 +237,13 @@ impl Dispatcher {
     /// - **P1-8**：超时/router-drop 时 `router.cancel` 清理 pending map 残留。
     /// - **P1-9**：读行加上限（64KiB）+ 读超时（15s）+ 写超时（10s），防 OOM / 挂死。
     #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
     async fn handle_permission_socket(
         mut stream: tokio::net::UnixStream,
         platform: Arc<dyn Platform>,
         router: Arc<PermissionRouter>,
         approval_tools: Arc<parking_lot::RwLock<Vec<String>>>,
+        store: Store,
         permission_ask_timeout: std::time::Duration,
         ask_via_im_timeout: std::time::Duration,
         expected_token: String,
@@ -318,6 +324,7 @@ impl Dispatcher {
                     platform,
                     router,
                     approval_tools,
+                    store,
                     conv,
                     request_id,
                     permission_ask_timeout,
@@ -565,6 +572,7 @@ impl Dispatcher {
         platform: Arc<dyn Platform>,
         router: Arc<PermissionRouter>,
         approval_tools: Arc<parking_lot::RwLock<Vec<String>>>,
+        store: Store,
         conv: ConvId,
         request_id: String,
         permission_ask_timeout: std::time::Duration,
@@ -683,15 +691,25 @@ impl Dispatcher {
         // agent_timeout 的执行预算）。agent 死或用户长时间不回复时，超时回 deny 并 drop
         // receiver，避免 pending 永驻把后续消息误当回复吞。
         // P1-8：超时/router-drop 分支显式 cancel，移除 pending map 残留。
-        let reply: PermissionReply = match tokio::time::timeout(permission_ask_timeout, rx).await {
-            Ok(Ok(r)) => {
+        // Wave B-1：等待过半仍未决时先发一条 buzz 加急催办（只一次），再继续等
+        // 剩余时间（见 super::wait_reply_with_buzz）。
+        let reply: PermissionReply = match super::wait_reply_with_buzz(
+            rx,
+            &conv,
+            &tool_name,
+            permission_ask_timeout,
+            platform.as_ref(),
+        )
+        .await
+        {
+            super::AskWaitOutcome::Replied(r) => {
                 METRICS
                     .permission_decisions
                     .with_label_values(&[if r.allow { "allow" } else { "deny" }])
                     .inc();
                 r
             }
-            Ok(Err(_)) => {
+            super::AskWaitOutcome::Dropped => {
                 router.cancel(&conv_id, &request_id).await;
                 METRICS
                     .permission_decisions
@@ -704,7 +722,7 @@ impl Dispatcher {
                     raw_text: None,
                 }
             }
-            Err(_elapsed) => {
+            super::AskWaitOutcome::TimedOut => {
                 router.cancel(&conv_id, &request_id).await;
                 // 真机校准 UX：超时自动拒绝后把滞留的询问卡收敛成终态（否则
                 // 卡片保持可点，用户点了只会得到「已超时」的空转）。best-effort。
@@ -715,6 +733,27 @@ impl Dispatcher {
                     .permission_decisions
                     .with_label_values(&["timeout"])
                     .inc();
+                // Wave B-11：timeout 也是一次审批结果——落审计（/stats 审批
+                // 分组数据源；ACP hook 路径同款）。
+                if let Err(e) = store
+                    .append_audit(
+                        "permission_decision",
+                        None,
+                        Some(&conv_id),
+                        Some(&format!(
+                            "tool={} decision=timeout waited_secs={}",
+                            tool_name,
+                            permission_ask_timeout.as_secs()
+                        )),
+                    )
+                    .await
+                {
+                    warn!(
+                        target: "imagent::core",
+                        error = %e,
+                        "append_audit(permission_decision timeout) 失败"
+                    );
+                }
                 PermissionReply {
                     allow: false,
                     always: false,

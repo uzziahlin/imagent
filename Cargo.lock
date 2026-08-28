@@ -1580,6 +1580,7 @@ version = "1.11.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "dirs",
  "imagent-core",
  "openlark",

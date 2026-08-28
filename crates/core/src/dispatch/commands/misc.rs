@@ -2,6 +2,87 @@
 
 use super::*;
 
+/// Wave B-11：审批分组聚合结果（/stats 展示用）。
+struct ApprovalStats {
+    total: usize,
+    allow: usize,
+    deny: usize,
+    timeout: usize,
+    always: usize,
+    /// 有 waited_secs 的行数与总和（平均响应时长 = sum / n）。
+    waited_n: usize,
+    waited_sum: u64,
+}
+
+impl ApprovalStats {
+    /// 从 permission_decision 审计行聚合（decision 词 + waited_secs 从 detail 解析）。
+    fn from_audit(rows: &[imagent_store::AuditRow]) -> Self {
+        let mut s = Self {
+            total: 0,
+            allow: 0,
+            deny: 0,
+            timeout: 0,
+            always: 0,
+            waited_n: 0,
+            waited_sum: 0,
+        };
+        for r in rows {
+            let Some(d) = r.detail.as_deref() else {
+                continue;
+            };
+            s.total += 1;
+            match audit_detail_field(d, "decision") {
+                Some("allow_always") => s.always += 1,
+                Some("allow") => s.allow += 1,
+                Some("deny") => s.deny += 1,
+                Some("timeout") => s.timeout += 1,
+                _ => {}
+            }
+            if let Some(w) =
+                audit_detail_field(d, "waited_secs").and_then(|v| v.parse::<u64>().ok())
+            {
+                s.waited_n += 1;
+                s.waited_sum += w;
+            }
+        }
+        s
+    }
+
+    /// 展示行：`N 次 · allow 60% · deny 30% · timeout 10% · always 5% · 平均响应 3 分钟`。
+    fn summary_line(&self) -> String {
+        if self.total == 0 {
+            return "0 次".to_string();
+        }
+        let pct = |n: usize| n * 100 / self.total;
+        let mut out = format!(
+            "{} 次 · allow {}% · deny {}% · timeout {}% · always {}%",
+            self.total,
+            pct(self.allow),
+            pct(self.deny),
+            pct(self.timeout),
+            pct(self.always)
+        );
+        if self.waited_n > 0 {
+            let avg = self.waited_sum / self.waited_n as u64;
+            out.push_str(&format!(
+                " · 平均响应 {}",
+                format_duration_human(Duration::from_secs(avg))
+            ));
+        }
+        out
+    }
+}
+
+/// Wave B-11：审计 detail 的空格分隔 k=v 字段提取（`decision=allow waited_secs=3`）。
+fn audit_detail_field<'a>(detail: &'a str, key: &str) -> Option<&'a str> {
+    detail.split_whitespace().find_map(|kv| {
+        kv.split_once('=')
+            .filter(|(k, _)| *k == key)
+            .map(|(_, v)| v.trim())
+            .filter(|v| !v.is_empty())
+    })
+}
+
 impl Dispatcher {
     /// /status —— 本会话 + 全局运行状态。
     pub(super) async fn cmd_status(&self, conv: &ConvId, hint: &ReplyHint) {
@@ -538,8 +619,18 @@ impl Dispatcher {
                 "（无成本数据，按 tokens 汇总）".to_string()
             }
         };
+        // Wave B-11：审批分组——从 permission_decision 审计聚合（固定近 7 天，
+        // 不随 /stats 的时间范围参数变化：审批统计看趋势，7 天是稳定样本窗口）。
+        let appr_line = match self
+            .store
+            .list_audit_since("permission_decision", now_secs() - 7 * 86_400)
+            .await
+        {
+            Ok(rows) => ApprovalStats::from_audit(&rows).summary_line(),
+            Err(e) => format!("读取失败：{e}"),
+        };
         let text = format!(
-            "📈 用量统计（{label}）\n- 🌍 全局：{g_runs} 轮 · 输入 {g_in} · 输出 {g_out} tokens\n- 💰 全局成本：{}\n- 💬 本会话：{m_runs} 轮 · 输入 {m_in} · 输出 {m_out} tokens\n- 💸 本会话成本：{}\n- 用法：/stats [today|7d|all]",
+            "📈 用量统计（{label}）\n- 🌍 全局：{g_runs} 轮 · 输入 {g_in} · 输出 {g_out} tokens\n- 💰 全局成本：{}\n- 💬 本会话：{m_runs} 轮 · 输入 {m_in} · 输出 {m_out} tokens\n- 💸 本会话成本：{}\n- 🛡️ 审批（近 7 天）：{appr_line}\n- 用法：/stats [today|7d|all]",
             cost_line(g_cost),
             cost_line(m_cost),
         );
@@ -547,7 +638,7 @@ impl Dispatcher {
         // 现有列表文本（表格只发生在卡渲染层）。
         if self.platform.supports_streaming_card(conv) {
             let table = format!(
-                "| 维度 | 轮数 | 输入 tokens | 输出 tokens | 成本 |\n|---|---|---|---|---|\n| 🌍 全局 | {g_runs} | {g_in} | {g_out} | {} |\n| 💬 本会话 | {m_runs} | {m_in} | {m_out} | {} |\n\n- 用法：/stats [today|7d|all]",
+                "| 维度 | 轮数 | 输入 tokens | 输出 tokens | 成本 |\n|---|---|---|---|---|\n| 🌍 全局 | {g_runs} | {g_in} | {g_out} | {} |\n| 💬 本会话 | {m_runs} | {m_in} | {m_out} | {} |\n\n- 🛡️ 审批（近 7 天）：{appr_line}\n- 用法：/stats [today|7d|all]",
                 cost_line(g_cost),
                 cost_line(m_cost),
             );

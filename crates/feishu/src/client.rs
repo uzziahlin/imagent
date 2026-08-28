@@ -178,21 +178,32 @@ macro_rules! retry_on_rate_limit {
 ///
 /// `core_config` 为发消息用配置；`token` 为当前 `tenant_access_token`；
 /// `receive_id`/`kind` 决定 `receive_id_type`（OpenId/ChatId）。
+///
+/// Wave B：`buzz = true` 时 text 消息体附 `buzz` 字段（飞书加急：客户端强提醒
+/// 振铃）。**待真机校准**：buzz 字段在部分租户/旧客户端不生效时按未知字段忽略，
+/// 退化为普通消息（内容不受影响）。false 时完全不写字段（与既有形态一致）。
 pub async fn send_text_msg(
     core_config: &CoreConfig,
     token: &str,
     receive_id: &str,
     kind: ReceiveIdKind,
     text: &str,
+    buzz: bool,
 ) -> imagent_core::Result<()> {
     // 幂等键：每次逻辑发送生成一次，所有限流重试共用（飞书 message create 的
     // uuid 幂等键）——首次请求可能已达服务端，重试换新 uuid 会让用户收到重复消息。
     let idempotency_key = uuid::Uuid::new_v4().to_string();
     retry_on_rate_limit!(async {
+        // buzz 仅在 true 时写入（缺省形态与历史一致，防旧端点拒绝未知字段）。
+        let content = if buzz {
+            json!({ "text": text, "buzz": true }).to_string()
+        } else {
+            json!({ "text": text }).to_string()
+        };
         let body = CreateMessageBody {
             receive_id: receive_id.to_string(),
             msg_type: "text".to_string(),
-            content: json!({ "text": text }).to_string(),
+            content,
             uuid: Some(idempotency_key.clone()),
         };
         let id_type = match kind {
@@ -398,49 +409,10 @@ pub async fn patch_card_settings(
     cardkit_resp(resp, "patch_card_settings").await.map(|_| ())
 }
 
-/// 发送引用卡片实体的 interactive 消息，返回 message_id。
-///
-/// content 为 `{"type":"card","data":{"card_id":"..."}}`（官方 im message create
-/// 文档「方式一」；真机校准 2026-08：`type` 必须是 **"card"**——此前写 "card_id"
-/// 被 230099/200621 "parse card json err" 拒绝），后续对该实体的 element/settings
-/// PATCH 即时反映到这条消息。
-pub async fn send_card_ref_msg(
-    core_config: &CoreConfig,
-    token: &str,
-    receive_id: &str,
-    kind: ReceiveIdKind,
-    card_id: &str,
-) -> imagent_core::Result<Option<String>> {
-    // 幂等键：同一次逻辑发送的所有重试共用（见 send_text_msg）。
-    let idempotency_key = uuid::Uuid::new_v4().to_string();
-    retry_on_rate_limit!(async {
-        let body = CreateMessageBody {
-            receive_id: receive_id.to_string(),
-            msg_type: "interactive".to_string(),
-            content: json!({ "type": "card", "data": { "card_id": card_id } }).to_string(),
-            uuid: Some(idempotency_key.clone()),
-        };
-        let id_type = match kind {
-            ReceiveIdKind::OpenId => ReceiveIdType::OpenId,
-            ReceiveIdKind::ChatId => ReceiveIdType::ChatId,
-        };
-        let option = RequestOption::builder()
-            .tenant_access_token(token.to_string())
-            .build();
-        let resp: serde_json::Value = CreateMessageRequest::new(core_config.clone())
-            .receive_id_type(id_type)
-            .execute_with_options(body, option)
-            .await
-            .map_err(|e| {
-                imagent_core::CoreError::Platform(PLATFORM, format!("send_card_ref_msg: {e}"))
-            })?;
-        // resp 已是 data 内容；message_id 在顶层（同 send_card_msg）。
-        Ok(resp
-            .get("message_id")
-            .and_then(|v| v.as_str())
-            .map(String::from))
-    })
-}
+// Wave B-6：独立的 send_card_ref_msg 已删除——CardKit 实体引用消息统一走
+// platform 的 send_interactive_anchored（有回复锚点时 reply API 引用发起消息，
+// 否则 send_card_msg create；content 形态 {"type":"card","data":{"card_id":…}}
+// 两路同构，见 platform.rs）。
 
 /// 媒体下载大小上限（与 ilink 一致：50MB；防恶意/误发大文件把内存打爆）。
 const MEDIA_MAX_BYTES: u64 = 50 * 1024 * 1024;

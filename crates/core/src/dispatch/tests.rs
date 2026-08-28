@@ -97,10 +97,13 @@ type PromptsHandle = Arc<TokioMutex<Vec<String>>>;
 // ---------- mock platform ----------
 
 /// mock platform：`inbox` 收到的出站文本，`recv_queue` 可编程的入站流。
+/// Wave B：`urgent` 变体支持加急文本（supports_urgent_text = true，加急消息以
+/// `[buzz] ` 前缀记入 inbox——完成强提醒/催办测试断言用）。
 struct MockPlatform {
     recv_queue: Arc<TokioMutex<Option<Vec<InboundMessage>>>>,
     inbox: Arc<TokioMutex<Vec<String>>>,
     send_count: Arc<AtomicUsize>,
+    urgent: bool,
 }
 
 impl MockPlatform {
@@ -111,8 +114,16 @@ impl MockPlatform {
             recv_queue: Arc::new(TokioMutex::new(None)),
             inbox: inbox.clone(),
             send_count: send_count.clone(),
+            urgent: false,
         };
         (p, inbox, send_count)
+    }
+
+    /// Wave B-2：支持加急的变体（supports_urgent_text = true）。
+    fn new_urgent() -> (Self, InboxHandle, CounterHandle) {
+        let (mut p, inbox, count) = Self::new();
+        p.urgent = true;
+        (p, inbox, count)
     }
 }
 
@@ -134,6 +145,15 @@ impl Platform for MockPlatform {
         self.inbox.lock().await.push(text.to_string());
         self.send_count.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+    /// Wave B：加急文本以 `[buzz] ` 前缀记录（与普通消息区分断言）。
+    async fn send_urgent_text(&self, _conv: &ConvId, text: &str, _hint: &ReplyHint) -> Result<()> {
+        self.inbox.lock().await.push(format!("[buzz] {text}"));
+        self.send_count.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    fn supports_urgent_text(&self) -> bool {
+        self.urgent
     }
     async fn send_media(
         &self,
@@ -180,6 +200,8 @@ struct MockBackend {
     local_sessions: Arc<TokioMutex<Vec<LocalSession>>>,
     /// S-1/S-2：权限能力档位（默认 Unsupported；FullLoop 供闭环类测试覆写）。
     capability: crate::backend::PermissionCapability,
+    /// Wave B-9：RunOutcome 携带的 usage（上下文水位提示测试用；默认 None）。
+    usage: Option<crate::types::UsageStats>,
 }
 
 impl MockBackend {
@@ -200,7 +222,17 @@ impl MockBackend {
             fail_after_announce: None,
             local_sessions: Arc::new(TokioMutex::new(Vec::new())),
             capability: crate::backend::PermissionCapability::Unsupported,
+            usage: None,
         };
+        (b, calls, prompts, order)
+    }
+
+    /// Wave B-9：带 usage 的变体（RunOutcome.usage 透传，上下文水位测试用）。
+    fn new_with_usage(
+        usage: crate::types::UsageStats,
+    ) -> (Self, CallsHandle, PromptsHandle, CounterHandle) {
+        let (mut b, calls, prompts, order) = Self::new();
+        b.usage = Some(usage);
         (b, calls, prompts, order)
     }
 
@@ -336,7 +368,7 @@ impl Backend for MockBackend {
             session_id: SessionId(format!("sess-{my_order}")),
             final_text: outcome_final,
             terminal: self.terminal,
-            usage: None,
+            usage: self.usage,
         })
     }
     fn name(&self) -> &'static str {
@@ -406,7 +438,10 @@ async fn build(auth: Auth) -> Ctx {
 }
 
 /// 与 build 相同但可指定 default_workdir（/img 等需真实文件系统的测试用）。
+/// Wave B-10：目录不存在则创建——run_round_inner 现对 workdir 做 is_dir 预检，
+/// mock 后端虽不读目录，预检仍会拦下本轮（保持与生产行为一致的测试语义）。
 async fn build_with_workdir(auth: Auth, default_workdir: std::path::PathBuf) -> Ctx {
+    let _ = std::fs::create_dir_all(&default_workdir);
     let (plat, inbox, send_count) = MockPlatform::new();
     let (back, calls, prompts, order) = MockBackend::new();
     let (store, db) = tmp_store().await;
@@ -1170,7 +1205,8 @@ async fn stranger_mention_hint_on_off() {
 #[tokio::test]
 async fn config_form_applies_multiple_pairs() {
     let _serial = SERIAL.lock().await;
-    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    // 表单键全部为全局热改键：admin 门槛之后才应用（安全修复）。
+    let ctx = build_with_admin(Auth::new(vec!["alice".into()]), vec!["alice".into()]).await;
     feed_and_wait(
         &ctx,
         vec![msg(
@@ -1206,6 +1242,35 @@ async fn config_form_applies_multiple_pairs() {
             .last()
             .is_some_and(|t| t.contains("用法") && t.contains("reply_mode = card")),
         "逐键结果: {inbox:?}"
+    );
+    drop_db(ctx.db).await;
+}
+
+/// 表单提交的 admin 门槛：admin_senders 非空时，白名单内非 admin 用户提交
+/// `/config form` 被拒且配置不变（防表单绕过——表单键全部为全局热改键）。
+#[tokio::test]
+async fn config_form_rejected_for_non_admin() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build_with_admin(Auth::new(vec!["alice".into()]), vec!["boss".into()]).await;
+    feed_and_wait(
+        &ctx,
+        vec![msg(
+            "c",
+            "alice",
+            "/config form reply_mode=text cot_detail=detailed",
+        )],
+        1,
+    )
+    .await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.last().is_some_and(|t| t.contains("管理员")),
+        "非 admin 表单提交应被拒: {inbox:?}"
+    );
+    assert_eq!(
+        *ctx.disp.reply_mode.read(),
+        ReplyMode::Card,
+        "配置不应被改动"
     );
     drop_db(ctx.db).await;
 }
@@ -3424,5 +3489,474 @@ async fn bot_removed_from_chat_revokes_and_notifies_admin() {
     ctx.disp.handle(removed).await;
     let inbox = ctx.inbox.lock().await.clone();
     assert!(inbox.is_empty(), "非白名单群移出不通知: {inbox:?}");
+    drop_db(ctx.db).await;
+}
+
+// ===========================================================================
+// Wave B：飞书交互专项测试（触达 / 群协作身份 / 恢复引导 / 运营数据）
+// ===========================================================================
+
+/// Wave B-2/B-9：自定义平台与后端的组装底座（新测试用，避免再复制 8 参构造）。
+async fn build_with_parts(
+    auth: Auth,
+    plat: MockPlatform,
+    back: MockBackend,
+    default_workdir: std::path::PathBuf,
+) -> Ctx {
+    let _ = std::fs::create_dir_all(&default_workdir);
+    let (inbox, send_count) = (plat_inbox_of(&plat), plat_count_of(&plat));
+    let (store, db) = tmp_store().await;
+    let admins = auth.snapshot();
+    let disp = Arc::new(Dispatcher::new(
+        Arc::new(plat),
+        Arc::new(back),
+        store,
+        auth,
+        default_workdir,
+        vec!["Read".into(), "Edit".into()],
+        PermissionMode::Off,
+        test_budgets(),
+        CotDetail::Brief,
+        admins,
+    ));
+    Ctx {
+        disp,
+        inbox,
+        send_count,
+        calls: Default::default(),
+        prompts: Default::default(),
+        order: Default::default(),
+        db,
+    }
+}
+
+/// 取 MockPlatform 的观测句柄（组装底座用；句柄本就 clone 共享）。
+fn plat_inbox_of(p: &MockPlatform) -> InboxHandle {
+    p.inbox.clone()
+}
+fn plat_count_of(p: &MockPlatform) -> CounterHandle {
+    p.send_count.clone()
+}
+
+/// Wave B-2：加急平台 + 慢后端（进行中登记询问 → 完成强提醒测试用）。
+async fn build_urgent_slow(auth: Auth, slow_ms: u64) -> Ctx {
+    let (plat, _i, _c) = MockPlatform::new_urgent();
+    let (back, calls, prompts, order) = MockBackend::new_slow(slow_ms);
+    let mut ctx = build_with_parts(auth, plat, back, "/tmp/imagent-test-ws".into()).await;
+    ctx.calls = calls;
+    ctx.prompts = prompts;
+    ctx.order = order;
+    ctx
+}
+
+/// Wave B-9：usage 变体（RunOutcome.usage 透传，上下文水位测试用）。
+async fn build_with_usage(auth: Auth, usage: crate::types::UsageStats) -> Ctx {
+    let (plat, _i, _c) = MockPlatform::new();
+    let (back, calls, prompts, order) = MockBackend::new_with_usage(usage);
+    let mut ctx = build_with_parts(auth, plat, back, "/tmp/imagent-test-ws".into()).await;
+    ctx.calls = calls;
+    ctx.prompts = prompts;
+    ctx.order = order;
+    ctx
+}
+
+/// Wave B-1：审批过半催办文案——剩余分钟向上取整（30s → 1 分钟）、工具名与
+/// y/n 指引齐备。
+#[test]
+fn approval_buzz_text_formats() {
+    let t = super::approval_buzz_text("Bash", Duration::from_secs(150));
+    assert!(t.contains("⏰"), "{t}");
+    assert!(t.contains("剩 3 分钟"), "150s → 3 分钟: {t}");
+    assert!(t.contains("Bash"), "{t}");
+    assert!(t.contains("回复 y/n 即可"), "{t}");
+    // 30 秒 → 1 分钟（向上取整，宁多勿少）。
+    assert!(super::approval_buzz_text("WebFetch", Duration::from_secs(30)).contains("剩 1 分钟"),);
+}
+
+/// Wave B-1：等待过半催办——过半未决发**一次** buzz、随后超时出口；半程内回复
+/// 则完全不催办。真实时钟（总量 ~300ms）。
+#[tokio::test]
+async fn wait_reply_buzz_once_then_timeout() {
+    let (plat, inbox, _c) = MockPlatform::new_urgent();
+    let router = crate::permission::PermissionRouter::new();
+    let rx = router
+        .register(
+            "c1",
+            "r1",
+            None,
+            crate::permission::PendingKind::Permission,
+            Some("Bash"),
+        )
+        .await;
+    let out = super::wait_reply_with_buzz(
+        rx,
+        &ConvId("c1".into()),
+        "Bash",
+        Duration::from_millis(200),
+        &plat,
+    )
+    .await;
+    assert!(
+        matches!(out, super::AskWaitOutcome::TimedOut),
+        "无回复应超时"
+    );
+    let snap = inbox.lock().await.clone();
+    let buzzes: Vec<_> = snap.iter().filter(|t| t.starts_with("[buzz]")).collect();
+    assert_eq!(buzzes.len(), 1, "只催办一次: {snap:?}");
+    assert!(buzzes[0].contains("Bash"), "文案带工具名: {snap:?}");
+
+    // 半程内回复：无催办、正常拿到回复。
+    let rx2 = router
+        .register(
+            "c1",
+            "r2",
+            None,
+            crate::permission::PendingKind::Permission,
+            Some("Read"),
+        )
+        .await;
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let _ = router
+            .route(
+                "c1",
+                Some("r2"),
+                None,
+                crate::permission::PermissionReply {
+                    allow: true,
+                    always: false,
+                    message: None,
+                    raw_text: Some("y".into()),
+                },
+            )
+            .await;
+    });
+    let out2 = super::wait_reply_with_buzz(
+        rx2,
+        &ConvId("c1".into()),
+        "Read",
+        Duration::from_millis(200),
+        &plat,
+    )
+    .await;
+    match out2 {
+        super::AskWaitOutcome::Replied(r) => assert!(r.allow),
+        other => panic!("应正常回复: {other:?}"),
+    }
+    let final_inbox = inbox.lock().await.clone();
+    assert_eq!(
+        final_inbox
+            .iter()
+            .filter(|t| t.starts_with("[buzz]"))
+            .count(),
+        1,
+        "快速回复不追加催办: {final_inbox:?}"
+    );
+}
+
+/// Wave B-2：完成强提醒文案与触发条件（纯函数）。
+#[test]
+fn task_done_buzz_text_and_threshold() {
+    assert_eq!(
+        super::task_done_buzz_text(Duration::from_secs(750), Some("$0.012")),
+        "✅ 任务完成 · 12m30s · $0.012"
+    );
+    assert_eq!(
+        super::task_done_buzz_text(Duration::from_secs(42), None),
+        "✅ 任务完成 · 42s"
+    );
+    assert_eq!(
+        super::task_done_buzz_text(Duration::from_secs(3600), None),
+        "✅ 任务完成 · 1h00m"
+    );
+    // 触发条件：>5 分钟，或本轮发生过询问（asks delta > 0）。
+    assert!(
+        !super::should_buzz_done(Duration::from_secs(300), 0),
+        "恰好 300s 不触发"
+    );
+    assert!(
+        super::should_buzz_done(Duration::from_secs(301), 0),
+        "超 300s 触发"
+    );
+    assert!(
+        super::should_buzz_done(Duration::from_secs(1), 1),
+        "有询问即触发"
+    );
+    assert!(!super::should_buzz_done(Duration::from_secs(1), 0));
+}
+
+/// Wave B-2：本轮发生过询问 → 终态额外发一条 buzz 完成短文本；普通短轮次（无
+/// 询问、<5 分钟）不发；不支持 buzz 的平台（默认 mock）整体 no-op。
+#[tokio::test]
+async fn round_buzzes_done_when_ask_happened() {
+    let _serial = SERIAL.lock().await;
+    let auth = Auth::new(vec!["alice".into()]);
+    // ① 支持 buzz 的平台：慢后端 300ms，轮次进行中登记一次询问（ask 计数 +1）。
+    let ctx = build_urgent_slow(auth.clone(), 300).await;
+    let disp = ctx.disp.clone();
+    let handle = tokio::spawn(async move {
+        disp.handle(msg("c1", "alice", "跑个任务")).await;
+    });
+    assert!(wait_registered(&ctx, "c1").await, "轮次应注册在飞");
+    ctx.disp
+        .router()
+        .register(
+            "c1",
+            "r-1",
+            None,
+            crate::permission::PendingKind::Permission,
+            Some("Bash"),
+        )
+        .await;
+    handle.await.expect("round");
+    let inbox = ctx.inbox.lock().await.clone();
+    let buzzes: Vec<_> = inbox
+        .iter()
+        .filter(|t| t.starts_with("[buzz]") && t.contains("✅ 任务完成"))
+        .collect();
+    assert_eq!(buzzes.len(), 1, "完成强提醒一条: {inbox:?}");
+    assert!(buzzes[0].contains("·"), "带耗时/成本段: {buzzes:?}");
+    drop_db(ctx.db).await;
+
+    // ② 普通短轮次（无询问）：不发。
+    let ctx = build_urgent_slow(auth.clone(), 0).await;
+    feed_and_wait(&ctx, vec![msg("c2", "alice", "hi")], 1).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        !inbox.iter().any(|t| t.contains("✅ 任务完成")),
+        "短轮次无询问不发: {inbox:?}"
+    );
+    drop_db(ctx.db).await;
+
+    // ③ 不支持 buzz 的平台（默认 mock，慢后端保证轮次可观测）：即便有询问也
+    // 不发（no-op）。
+    let (plat, _pi, _pc) = MockPlatform::new();
+    let (back, calls, prompts, order) = MockBackend::new_slow(300);
+    let mut ctx = build_with_parts(auth, plat, back, "/tmp/imagent-test-ws".into()).await;
+    ctx.calls = calls;
+    ctx.prompts = prompts;
+    ctx.order = order;
+    let disp = ctx.disp.clone();
+    let handle = tokio::spawn(async move {
+        disp.handle(msg("c3", "alice", "跑个任务")).await;
+    });
+    assert!(wait_registered(&ctx, "c3").await, "轮次应注册在飞");
+    ctx.disp
+        .router()
+        .register(
+            "c3",
+            "r-2",
+            None,
+            crate::permission::PendingKind::Permission,
+            Some("Bash"),
+        )
+        .await;
+    handle.await.expect("round");
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        !inbox.iter().any(|t| t.contains("✅ 任务完成")),
+        "不支持 buzz 的平台 no-op: {inbox:?}"
+    );
+    drop_db(ctx.db).await;
+}
+
+/// Wave B-7：/config cot——白名单非 admin 可改**本会话**档位；cot_detail（全局）
+/// 仍 admin 门槛；default 清除；非法值给用法。档位对下一轮生效（cot_for）。
+#[tokio::test]
+async fn config_cot_per_conv_for_whitelisted_non_admin() {
+    let _serial = SERIAL.lock().await;
+    // admin 为空：alice 只是白名单用户（非 admin）。
+    let auth = Auth::new(vec!["alice".into()]);
+    let ctx = build_with_admin(auth, vec![]).await;
+
+    // 全局键仍被拒（admin 门槛）。
+    feed_and_wait(&ctx, vec![msg("c1", "alice", "/config cot_detail off")], 0).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.iter().any(|t| t.contains("仅管理员")),
+        "cot_detail 全局键非 admin 被拒: {inbox:?}"
+    );
+
+    // per-conv 键白名单可用。
+    feed_and_wait(&ctx, vec![msg("c1", "alice", "/config cot off")], 0).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox
+            .iter()
+            .any(|t| t.contains("本会话 cot = off") && t.contains("仅本会话")),
+        "per-conv 键成功: {inbox:?}"
+    );
+    // 档位生效：cot_for 返回覆盖值；其它 conv 跟随全局。
+    assert_eq!(ctx.disp.cot_for("c1").await, CotDetail::Off);
+    assert_eq!(ctx.disp.cot_for("c2").await, CotDetail::Brief);
+
+    // 非法值 → 用法提示。
+    feed_and_wait(&ctx, vec![msg("c1", "alice", "/config cot bogus")], 0).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.iter().any(|t| t.contains("用法：/config cot")),
+        "非法值给用法: {inbox:?}"
+    );
+
+    // default 清除 → 回全局。
+    feed_and_wait(&ctx, vec![msg("c1", "alice", "/config cot default")], 0).await;
+    assert_eq!(ctx.disp.cot_for("c1").await, CotDetail::Brief);
+    drop_db(ctx.db).await;
+}
+
+/// Wave B-9：「继续」类断档提示——无可续接会话且 prompt ≤4 字命中续接词表时
+/// 回复前置提示；普通（长）prompt 与已有会话时不提示。
+#[tokio::test]
+async fn continuation_orphan_hint_on_fresh_conv() {
+    let _serial = SERIAL.lock().await;
+    let auth = Auth::new(vec!["alice".into()]);
+    let ctx = build(auth).await;
+    // 断档：新 conv + 续接词。
+    for (conv, text) in [("c1", "继续"), ("c2", "go on"), ("c3", "然后")] {
+        feed_and_wait(&ctx, vec![msg(conv, "alice", text)], 1).await;
+    }
+    let inbox = ctx.inbox.lock().await.clone();
+    let hinted: Vec<_> = inbox
+        .iter()
+        .filter(|t| t.contains("当前无可续接会话"))
+        .collect();
+    assert_eq!(hinted.len(), 3, "三个续接词都提示: {inbox:?}");
+    for h in &hinted {
+        assert!(h.contains("/resume"), "指引 /resume: {h}");
+    }
+    // 普通 prompt 不提示。
+    feed_and_wait(
+        &ctx,
+        vec![msg(
+            "c4",
+            "alice",
+            "帮我继续把重构做完，重点是 dispatch 模块",
+        )],
+        1,
+    )
+    .await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert_eq!(
+        inbox
+            .iter()
+            .filter(|t| t.contains("当前无可续接会话"))
+            .count(),
+        3,
+        "长 prompt 不提示: {inbox:?}"
+    );
+    // 已有会话的「继续」不提示（真实续接）。
+    feed_and_wait(&ctx, vec![msg("c1", "alice", "继续")], 2).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert_eq!(
+        inbox
+            .iter()
+            .filter(|t| t.contains("当前无可续接会话"))
+            .count(),
+        3,
+        "有会话续接不提示: {inbox:?}"
+    );
+    drop_db(ctx.db).await;
+}
+
+/// Wave B-9：上下文水位——本轮输入 > 80k tokens 时完成回复追加 /compact 建议。
+#[tokio::test]
+async fn context_watermark_hint_on_large_input() {
+    let _serial = SERIAL.lock().await;
+    let auth = Auth::new(vec!["alice".into()]);
+    let usage = crate::types::UsageStats {
+        input_tokens: 90_000,
+        output_tokens: 500,
+        cached_tokens: None,
+        total_cost_usd: None,
+    };
+    let ctx = build_with_usage(auth.clone(), usage).await;
+    feed_and_wait(&ctx, vec![msg("c1", "alice", "分析一下")], 1).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox
+            .iter()
+            .any(|t| t.contains("上下文较大") && t.contains("/compact")),
+        "超水位提示 /compact: {inbox:?}"
+    );
+    drop_db(ctx.db).await;
+
+    // 低于水位：不提示。
+    let usage = crate::types::UsageStats {
+        input_tokens: 80_000,
+        output_tokens: 100,
+        cached_tokens: None,
+        total_cost_usd: None,
+    };
+    let ctx = build_with_usage(auth, usage).await;
+    feed_and_wait(&ctx, vec![msg("c1", "alice", "分析一下")], 1).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        !inbox.iter().any(|t| t.contains("/compact")),
+        "80k（≤阈值）不提示: {inbox:?}"
+    );
+    drop_db(ctx.db).await;
+}
+
+/// Wave B-10：workdir 失效前置检查——目录不存在时不启动 agent，回可读错误。
+#[tokio::test]
+async fn round_preflights_missing_workdir() {
+    let _serial = SERIAL.lock().await;
+    let auth = Auth::new(vec!["alice".into()]);
+    let missing = std::path::PathBuf::from("/tmp/imagent-definitely-missing-ws");
+    let ctx = build_with_workdir(auth, missing.clone()).await;
+    // 组装底座会把 workdir 建出来（与生产语义一致）；本测试模拟「启动后目录被
+    // 删/失效」——建完再删，验证轮次预检拦截。
+    std::fs::remove_dir_all(&missing).expect("删除测试目录");
+    feed_and_wait(&ctx, vec![msg("c1", "alice", "hi")], 0).await;
+    // backend 未被调用（未启动 agent）。
+    assert_eq!(ctx.calls.lock().await.len(), 0, "agent 不应启动");
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox
+            .iter()
+            .any(|t| t.contains("不存在") && t.contains("/cd") && t.contains("工作目录")),
+        "回可读错误与指引: {inbox:?}"
+    );
+    drop_db(ctx.db).await;
+}
+
+/// Wave B-11：/stats 审批分组——从 permission_decision 审计聚合近 7 天的
+/// 次数/占比/平均响应。
+#[tokio::test]
+async fn stats_includes_approval_group() {
+    let _serial = SERIAL.lock().await;
+    let auth = Auth::new(vec!["alice".into()]);
+    let ctx = build(auth).await;
+    // 先跑一轮（run_stats 非空，跳过「暂无运行记录」早退）。
+    feed_and_wait(&ctx, vec![msg("c1", "alice", "hi")], 1).await;
+    // 手工落 4 条审批审计（3 决策 + 1 超时）。
+    let store = ctx.check().await;
+    for detail in [
+        "tool=Bash decision=allow sender=u1 waited_secs=60",
+        "tool=Bash decision=deny sender=u1 waited_secs=120",
+        "tool=WebFetch decision=allow_always sender=u2 waited_secs=180",
+        "tool=Bash decision=timeout waited_secs=300",
+    ] {
+        store
+            .append_audit("permission_decision", None, Some("c1"), Some(detail))
+            .await
+            .unwrap();
+    }
+    feed_and_wait(&ctx, vec![msg("c1", "alice", "/stats")], 2).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    let stats_msg = inbox
+        .iter()
+        .rev()
+        .find(|t| t.contains("审批（近 7 天）"))
+        .expect("应有审批分组");
+    assert!(stats_msg.contains("4 次"), "总次数: {stats_msg}");
+    // 1 allow + 1 deny + 1 timeout + 1 allow_always = 各 25%。
+    for word in ["allow 25%", "deny 25%", "timeout 25%", "always 25%"] {
+        assert!(stats_msg.contains(word), "{word}: {stats_msg}");
+    }
+    assert!(
+        stats_msg.contains("平均响应 2 分钟"),
+        "(60+120+180+300)/4 = 165s ≈ 2 分钟: {stats_msg}"
+    );
     drop_db(ctx.db).await;
 }

@@ -127,6 +127,65 @@ impl CotDetail {
     }
 }
 
+/// Wave B-4：免打扰时段（`quiet_hours = "22:00-08:00"`，**本地时区**）。
+///
+/// 窗口可跨天（22:00 → 次日 08:00）。只影响 **buzz 类加急提醒**（审批过半催办、
+/// 长任务完成强提醒）：时段内降级为普通消息（不加 buzz 字段）——**不影响消息
+/// 内容、不影响普通消息的发送**，仅去掉加急振铃。`None`（缺省）= 不启用。
+/// start == end 表示空窗口（无任何效果）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuietHours {
+    /// 起始时刻（当天 0:00 起的分钟数，0..=1439）。
+    start: u32,
+    /// 结束时刻（分钟数；start > end 表示跨天窗口）。
+    end: u32,
+}
+
+impl QuietHours {
+    /// 解析 `"HH:MM-HH:MM"`（含两端；结束时刻不含在窗口内——`22:00-08:00` 在
+    /// 08:00 整点已结束）。非法格式（缺段 / 越界 / 非数字）返回 None。
+    pub fn parse(raw: &str) -> Option<Self> {
+        let (a, b) = raw.trim().split_once('-')?;
+        let start = parse_hhmm(a)?;
+        let end = parse_hhmm(b)?;
+        Some(Self { start, end })
+    }
+
+    /// 时刻（当天 0:00 起的分钟数）是否落在窗口内：`start ≤ end` 常规窗口；
+    /// `start > end` 跨天窗口（t ≥ start **或** t < end）。
+    pub fn contains(&self, minute_of_day: u32) -> bool {
+        if self.start == self.end {
+            false
+        } else if self.start < self.end {
+            minute_of_day >= self.start && minute_of_day < self.end
+        } else {
+            minute_of_day >= self.start || minute_of_day < self.end
+        }
+    }
+
+    /// 原文展示（/config 查看用）：`22:00-08:00`。
+    pub fn display(&self) -> String {
+        format!("{}-{}", fmt_hhmm(self.start), fmt_hhmm(self.end))
+    }
+}
+
+/// `"HH:MM"` → 当天分钟数。
+fn parse_hhmm(s: &str) -> Option<u32> {
+    let (h, m) = s.trim().split_once(':')?;
+    let h: u32 = h.parse().ok()?;
+    let m: u32 = m.parse().ok()?;
+    if h < 24 && m < 60 {
+        Some(h * 60 + m)
+    } else {
+        None
+    }
+}
+
+/// 分钟数 → `"HH:MM"`。
+fn fmt_hhmm(mins: u32) -> String {
+    format!("{:02}:{:02}", mins / 60, mins % 60)
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReplyMode {
@@ -289,6 +348,20 @@ pub struct Config {
     /// 回复形态偏好（P7-A4；默认 card）。text = 不建卡走纯文本流（/config 可热改）。
     #[serde(default)]
     pub reply_mode: ReplyMode,
+    /// Wave B-4：免打扰时段（`"22:00-08:00"`，本地时区，可跨天；None = 不启用）。
+    /// 只影响 buzz 类加急提醒：时段内降级为普通消息（不加 buzz 字段），内容不变。
+    /// 改动需重启（提醒发送在各平台实现侧，无热改句柄）。
+    #[serde(default)]
+    pub quiet_hours: Option<String>,
+    /// Wave B-4：`quiet_hours` 的解析产物（load 期填充；serde 跳过——原始串才是
+    /// 配置面，解析失败的串在 load 期直接报错，不会残留到该字段）。
+    #[serde(skip)]
+    pub quiet_hours_parsed: Option<QuietHours>,
+    /// Wave B-8：话题群「近期活跃」免 @ 窗口（秒，仅 feishu 平台）：该话题在此
+    /// 窗口内有过消息即豁免 require_mention（追问场景免于每条 @）。默认 1800
+    /// （30 分钟）；0 = 关闭豁免。改动需重启。
+    #[serde(default = "default_feishu_thread_active_window_secs")]
+    pub feishu_thread_active_window_secs: u64,
 }
 
 /// 缺省工具集：读/检索/联网/文件编辑类（与 Edit 同风险级：workdir 内写或只读），
@@ -313,6 +386,9 @@ fn default_feishu_require_mention_in_group() -> bool {
 }
 fn default_stranger_p2p_hint() -> bool {
     true
+}
+fn default_feishu_thread_active_window_secs() -> u64 {
+    30 * 60
 }
 
 /// P6-8：工作目录安全校验——拒绝过宽位置（agent 以 cwd 定位工作区，`/`、home 根、
@@ -420,6 +496,37 @@ impl Config {
             )));
         }
 
+        // Wave B-10：default_workdir 失效探测（validate_workdir 含 is_dir 与过宽
+        // 位置检查）——启动 **warn 不拒启**。取舍：目录可能由远程挂载/容器卷在
+        // 启动后延迟就绪，拒启会把「暂时不可用」放大成「服务起不来」；运行期
+        // run_round_inner 有同款 is_dir 预检兜底（目录恢复后下一轮自动可用）。
+        if let Err(e) = validate_workdir(&cfg.default_workdir) {
+            tracing::warn!(
+                target: "imagent::core",
+                workdir = %cfg.default_workdir.display(),
+                reason = %e,
+                "default_workdir 校验未通过（不拒启；每轮运行前有 is_dir 预检兜底）"
+            );
+        }
+
+        // Wave B-4：quiet_hours 解析（格式错误启动期报错，防拼错静默失效）。
+        cfg.quiet_hours_parsed = match cfg.quiet_hours.as_deref() {
+            None => None,
+            Some(raw) => Some(QuietHours::parse(raw).ok_or_else(|| {
+                CoreError::Config(format!(
+                    "quiet_hours 格式须为 \"HH:MM-HH:MM\"（如 \"22:00-08:00\"，可跨天），当前 {raw:?}"
+                ))
+            })?),
+        };
+        // Wave B-8：话题免 @ 窗口边界（0 = 关闭豁免；上限 24h 防拼错单位）。
+        const THREAD_WINDOW_MAX_SECS: u64 = 86_400;
+        if cfg.feishu_thread_active_window_secs > THREAD_WINDOW_MAX_SECS {
+            return Err(CoreError::Config(format!(
+                "feishu_thread_active_window_secs 上限 {THREAD_WINDOW_MAX_SECS}（当前 {}）；0 = 关闭话题免 @ 豁免",
+                cfg.feishu_thread_active_window_secs
+            )));
+        }
+
         // P8-4：后端原生权限模式透传值归一（trim + 小写）；值域按后端校验——
         // claude 系白名单（manual 是 default 的 CLI 别名；未知值启动期报错防拼出
         // 非法 flag），其余后端先存值（backend 侧忽略并 warn，接入时再收紧）。
@@ -506,6 +613,8 @@ platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人)
 # stranger_mention_hint = false                # 未放行群里被 @ 时回一句引导（默认 false 完全静默防探测；私聊始终静默）
 # stranger_p2p_hint = true                     # 未放行用户的私聊回引导（默认 true：私聊是主动来找 bot 的，无探测面；含 sender id 与 /allow 指引）
 # reply_mode = "card"                          # 回复形态：card(默认,流式卡片) | text(纯文本)；/config 可热改
+# quiet_hours = "22:00-08:00"                  # 免打扰时段(本地时区,可跨天)：时段内加急(buzz)提醒降级为普通消息，内容不变；不设=不启用，改动需重启
+# feishu_thread_active_window_secs = 1800      # 话题群免@窗口(秒,仅feishu)：话题内近期有消息则豁免群消息须@bot；默认30分钟，0=关闭，改动需重启
 permission_mode = "auto"    # 缺省=auto：claude-cli=透传 claude 原生 auto 模式(分类器自动放行安全操作,高危进 IM)+审批闭环；其余后端=off；显式 ask=每个提示都进 IM
 # backend_permission_mode = "auto" # 后端原生权限模式透传(claude→--permission-mode；可覆盖 auto 档缺省)：default|acceptEdits|plan|auto|dontAsk|bypassPermissions；codex/gemini 暂不支持(warn 忽略)
 # approval_tools = ["Bash", "WebFetch", "mcp__*"]  # 审批集：ask 模式下只有这些工具过 IM 审批，其余直接放行；空=全部过审
@@ -1026,6 +1135,121 @@ message_fragment_interval_ms = 250
         );
         let cfg = Config::load(&p).expect("parse");
         assert_eq!(cfg.approval_tools.len(), 2);
+        cleanup(&p);
+    }
+
+    /// Wave B-4：quiet_hours 解析与跨天窗口判定（纯函数）。
+    #[test]
+    fn quiet_hours_parse_and_contains() {
+        // 跨天窗口：22:00-08:00 → 22:00 起到次日 08:00 前。
+        let q = QuietHours::parse("22:00-08:00").expect("合法格式");
+        assert!(q.contains(22 * 60)); // 起点含
+        assert!(q.contains(23 * 60 + 59));
+        assert!(q.contains(0)); // 次日 00:00 在窗口内
+        assert!(q.contains(7 * 60 + 59));
+        assert!(!q.contains(8 * 60)); // 终点不含
+        assert!(!q.contains(12 * 60));
+        assert!(!q.contains(21 * 60 + 59));
+        assert_eq!(q.display(), "22:00-08:00");
+        // 常规窗口：09:00-18:00。
+        let q = QuietHours::parse("09:00-18:00").expect("合法格式");
+        assert!(q.contains(9 * 60));
+        assert!(q.contains(17 * 60 + 59));
+        assert!(!q.contains(18 * 60));
+        assert!(!q.contains(8 * 60 + 59));
+        // start == end：空窗口（无效果）。
+        assert!(!QuietHours::parse("22:00-22:00").unwrap().contains(22 * 60));
+        // 非法格式。
+        for bad in [
+            "22:00",
+            "22:00-",
+            "-08:00",
+            "25:00-08:00",
+            "22:60-08:00",
+            "a:b-c:d",
+            "",
+            " ",
+            "22:00-08:00-06:00",
+        ] {
+            assert!(QuietHours::parse(bad).is_none(), "应拒绝: {bad:?}");
+        }
+        // 首尾空白容忍。
+        assert!(QuietHours::parse(" 22:00-08:00 ").is_some());
+    }
+
+    /// Wave B-4：config 面——quiet_hours 缺省 None；合法解析进 quiet_hours_parsed；
+    /// 非法格式启动期报错。
+    #[test]
+    fn quiet_hours_config_default_parse_and_reject() {
+        let p = tmp_path("quiet_def", r#"default_workdir = "/tmp/ws""#);
+        let cfg = Config::load(&p).expect("ok");
+        assert_eq!(cfg.quiet_hours, None);
+        assert_eq!(cfg.quiet_hours_parsed, None);
+        cleanup(&p);
+        let p = tmp_path(
+            "quiet_ok",
+            "default_workdir = \"/tmp/ws\"\nquiet_hours = \"22:00-08:00\"\n",
+        );
+        let cfg = Config::load(&p).expect("ok");
+        assert_eq!(cfg.quiet_hours.as_deref(), Some("22:00-08:00"));
+        assert_eq!(
+            cfg.quiet_hours_parsed.map(|q| q.display()),
+            Some("22:00-08:00".to_string())
+        );
+        assert!(cfg.quiet_hours_parsed.unwrap().contains(23 * 60));
+        cleanup(&p);
+        for (tag, raw) in [
+            ("bad_fmt", "quiet_hours = \"22-08\"\n"),
+            ("bad_hour", "quiet_hours = \"24:00-08:00\"\n"),
+        ] {
+            let p = tmp_path(tag, &format!("default_workdir = \"/tmp/ws\"\n{raw}"));
+            assert!(Config::load(&p).is_err(), "{tag} 应报错");
+            cleanup(&p);
+        }
+    }
+
+    /// Wave B-8：话题免 @ 窗口——默认 1800；可自定义（0 = 关闭）；超 24h 拒绝。
+    #[test]
+    fn thread_active_window_default_custom_and_bounds() {
+        let p = tmp_path("tw_def", r#"default_workdir = "/tmp/ws""#);
+        let cfg = Config::load(&p).expect("ok");
+        assert_eq!(cfg.feishu_thread_active_window_secs, 1800);
+        cleanup(&p);
+        let p = tmp_path(
+            "tw_custom",
+            "default_workdir = \"/tmp/ws\"\nfeishu_thread_active_window_secs = 600\n",
+        );
+        let cfg = Config::load(&p).expect("ok");
+        assert_eq!(cfg.feishu_thread_active_window_secs, 600);
+        cleanup(&p);
+        // 0 = 关闭豁免；上限 86400 本身合法。
+        let p = tmp_path(
+            "tw_zero",
+            "default_workdir = \"/tmp/ws\"\nfeishu_thread_active_window_secs = 0\n",
+        );
+        assert!(Config::load(&p).is_ok());
+        cleanup(&p);
+        let p = tmp_path(
+            "tw_huge",
+            "default_workdir = \"/tmp/ws\"\nfeishu_thread_active_window_secs = 90000\n",
+        );
+        assert!(Config::load(&p).is_err(), "超 24h 应报错");
+        cleanup(&p);
+    }
+
+    /// Wave B-10：default_workdir 失效（不存在）只 warn 不拒启——load 仍 Ok，
+    /// 运行期预检兜底（取舍见 load 内注释）。
+    #[test]
+    fn invalid_workdir_warns_but_loads() {
+        let p = tmp_path(
+            "wd_gone",
+            "default_workdir = \"/definitely/not/exist/ws\"\n",
+        );
+        let cfg = Config::load(&p).expect("目录失效应 warn 而非拒启");
+        assert_eq!(
+            cfg.default_workdir,
+            PathBuf::from("/definitely/not/exist/ws")
+        );
         cleanup(&p);
     }
 

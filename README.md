@@ -129,7 +129,9 @@ allowed_senders = []        # 留空 = 发现模式（先看日志拿你的 from
 # ask_via_im_conv = "feishu:ou_xxx"  # 终端 agent 的 ask_via_im 提问投递会话（配了才启用，见「终端 agent 接入」）
 # agent_idle_timeout_secs = 300      # 空闲看门狗：连续无输出 N 秒自动终止（0=关）
 # batch_window_ms = 1500             # 连发消息合并为一轮 prompt 的窗口（0=关）
-# cot_detail = "brief"               # 工具过程展示 off / brief / detailed（/config 可热改）
+# cot_detail = "brief"               # 工具过程展示 off / brief / detailed（/config 可热改；/config cot 为 per-conv 覆盖）
+# quiet_hours = "22:00-08:00"        # 免打扰时段(本地时区,可跨天)：时段内加急(buzz)提醒降级普通消息，内容不变；不设=不启用
+# feishu_thread_active_window_secs = 1800  # 话题群免@窗口(秒)：话题内近期有消息则豁免群消息须@bot；默认30分钟，0=关闭
 # platform = "feishu"                # wecom/feishu 经 config 凭据接入（见下）
 EOF
 ```
@@ -255,14 +257,14 @@ secret 轮换 / 环境变量变化后：重新 `export` + `imagent service insta
 | `/timeout [N\|off\|default]` | 会话级空闲看门狗（分钟） |
 | `/perm <auto\|off\|allow\|deny\|ask>` | 权限模式热切（auto=按后端自动选档） |
 | `/stop` | 中断当前在飞任务（杀 agent 子进程，清空排队消息） |
-| `/config [k v]` | 查看 / 热改配置（cot_detail / batch_window_ms / agent_idle_timeout_secs / require_mention / reply_mode） |
+| `/config [k v]` | 查看 / 热改配置（cot_detail / batch_window_ms / agent_idle_timeout_secs / require_mention / reply_mode，管理员）；`/config cot <off\|brief\|detailed\|default>` 为**本会话** COT 偏好（白名单可用，免 admin） |
 | `/status` `/doctor` `/reconnect` | 运行状态 / 自检 / 强制平台重连 |
 | `/allow <id\|@名字>` `/disallow` | 授权 / 撤销 sender（飞书群内可直接 @ 对方，管理员门槛） |
 | `/admin [list\|add\|remove]` | 管理员动态管理（首位设立自动带操作者，防自锁） |
 | `/chat allow\|deny\|allow-all\|list` | 会话（群）白名单；`allow-all` 批量放行 bot 已加入的全部群 |
 | `/list` `/whoami` | 查白名单 / 查自己的 sender 与会话 id |
 
-群消息默认须 `@机器人`（`feishu_require_mention_in_group`，正文 @ 占位自动清洗）；`/config reply_mode text` 可切纯文本回复（无卡片权限或偏好简洁时）。
+群消息默认须 `@机器人`（`feishu_require_mention_in_group`，正文 @ 占位自动清洗）；话题群内近期（`feishu_thread_active_window_secs`，默认 30 分钟，0=关闭）有过消息则免 @ 追问。`/config reply_mode text` 可切纯文本回复（无卡片权限或偏好简洁时）。群 conv 的回复与流式卡会**引用发起消息**（reply API）并标注发起者；加急提醒（审批过半催办、长任务完成通知）受 `quiet_hours = "22:00-08:00"`（本地时区，可跨天）约束——时段内降级为普通消息（内容不变）。
 
 ## 权限审批闭环（杀手锏）
 
