@@ -1803,10 +1803,15 @@ impl Platform for FeishuPlatform {
                 crate::client::create_reaction(&self.core_config, &t, source_msg_id, emoji).await
             })
             .await?;
-        self.msg_reactions
-            .lock()
-            .await
-            .insert(source_msg_id.to_string(), rid);
+        {
+            let mut mr = self.msg_reactions.lock().await;
+            if mr.len() > 1024 {
+                // 粗上限（超量整体重置）：清后旧表情的 reaction_id 丢失，翻转时
+                // 旧表情滞留 + 新表情叠加（视觉小瑕疵，可接受）。
+                mr.clear();
+            }
+            mr.insert(source_msg_id.to_string(), rid);
+        }
         let _ = conv; // conv 仅日志语义，保留签名对齐 trait。
         Ok(())
     }
@@ -2535,10 +2540,13 @@ impl Platform for FeishuPlatform {
                             {
                                 Ok(mid) => {
                                     if let Some(m) = mid {
-                                        self.managed_card_msgs
-                                            .lock()
-                                            .await
-                                            .insert(card_id.clone(), m);
+                                        let mut mm = self.managed_card_msgs.lock().await;
+                                        if mm.len() > 1024 {
+                                            // 粗上限（超量整体重置，同 thread_active
+                                            // 惯例）：清后旧卡终态退回内联形态（可接受）。
+                                            mm.clear();
+                                        }
+                                        mm.insert(card_id.clone(), m);
                                     }
                                     Ok(Some(format!("card:{card_id}")))
                                 }
@@ -2626,8 +2634,16 @@ impl Platform for FeishuPlatform {
                                 &conv.0,
                                 (!sender.is_empty()).then_some(sender).as_deref(),
                             );
-                            return patch_card(&self.core_config, &token, &message_id, &card_json)
-                                .await;
+                            let res =
+                                patch_card(&self.core_config, &token, &message_id, &card_json)
+                                    .await;
+                            if res.is_ok() {
+                                // 终态清理（与 patch_managed 终态分支同语义——本分支
+                                // 提前 return 会绕过那边的清理，防 per-card 状态泄漏）。
+                                self.card_seqs.lock().await.remove(card_id);
+                                self.card_footers.lock().await.remove(card_id);
+                            }
+                            return res;
                         }
                     }
                     match self.patch_managed(&token, card_id, card, buried).await {

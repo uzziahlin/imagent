@@ -3124,7 +3124,10 @@ async fn run_fails_closed_when_socket_bind_fails() {
     std::env::set_var(crate::paths::IMAGENT_HOME_ENV, &home);
     let sock = crate::permission::default_sock_path().unwrap();
     let _ = std::fs::remove_file(&sock);
-    std::fs::create_dir_all(&sock).unwrap(); // 目录占位 → bind Err
+    // 非空目录占位 → bind Err。真机校准（2026-08）：空目录残留已被启动逻辑
+    // 自愈（remove_dir），此处用「目录内有文件」构造不可自愈的失败形态。
+    std::fs::create_dir_all(&sock).unwrap();
+    std::fs::write(sock.join("keep"), b"x").unwrap();
 
     let (plat, _inbox, _send_count) = MockPlatform::new();
     let (mut back, _calls, _prompts, _order) = MockBackend::new();

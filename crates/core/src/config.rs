@@ -17,8 +17,8 @@ pub enum PermissionMode {
     /// **运行时专属档**（配置面不可直接写，仅由 `auto` 在 claude-cli 下解析产生）：
     /// 审批闭环照挂（分类器拦下的高危提示进 IM），另透传 claude 原生
     /// `--permission-mode auto`（2026 新档：独立分类器逐动作审查，安全操作自动
-    /// 放行，高危动作才提示——比 [`PermissionMode::Ask`]（每个提示都进 IM）少
-    /// 打扰）。透传值可由 `claude_permission_mode` 配置覆盖。
+    /// 放行，高危动作才提示——比 [`PermissionMode::Ask`]（claude 判定需要审批
+    /// 的动作都进 IM）少打扰）。透传值可由 `claude_permission_mode` 配置覆盖。
     #[serde(skip)]
     AutoClaude,
     /// 不启用权限审批：claude 按 --allowedTools 自行处理（P1 既有行为）。
@@ -750,7 +750,7 @@ platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人)
 # reply_mode = "card"                          # 回复形态：card(默认,流式卡片) | text(纯文本)；/config 可热改
 # quiet_hours = "22:00-08:00"                  # 免打扰时段(本地时区,可跨天)：时段内加急(buzz)提醒降级为普通消息，内容不变；不设=不启用，改动需重启
 # feishu_thread_active_window_secs = 1800      # 话题群免@窗口(秒,仅feishu)：话题内近期有消息则豁免群消息须@bot；默认30分钟，0=关闭，改动需重启
-permission_mode = "auto"    # 缺省=auto：claude-cli=透传 claude 原生 auto 模式(分类器自动放行安全操作,高危进 IM)+审批闭环；其余后端=off；显式 ask=每个提示都进 IM
+permission_mode = "auto"    # 缺省=auto：claude-cli=透传 claude 原生 auto 模式(分类器自动放行安全操作,高危进 IM)+审批闭环；其余后端=off；显式 ask=claude 需审批的动作都进 IM(只读工具内建免批,真机校准 2026-08)
 # backend_permission_mode = "auto" # 后端原生权限模式透传(claude→--permission-mode；可覆盖 auto 档缺省)：default|acceptEdits|plan|auto|dontAsk|bypassPermissions；codex/gemini 暂不支持(warn 忽略)
 # approval_tools = ["Bash", "WebFetch", "mcp__*"]  # 审批集：ask 模式下只有这些工具过 IM 审批，其余直接放行；空=全部过审
 # metrics_addr = "127.0.0.1:9100"   # 默认关闭；设为 "ip:port" 开启 /metrics + /health HTTP server
