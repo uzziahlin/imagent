@@ -270,10 +270,12 @@ fn task_done_buzz_text(elapsed: Duration, usage_display: Option<&str>) -> String
 }
 
 /// Wave B-2：完成强提醒触发条件（纯函数，便于单测）：运行超 5 分钟，或本轮
-/// 发生过审批/询问（ask 计数有增量）——两者都意味着用户等过一段不确定的
-/// 静默期，值得一条加急通知。
+/// 发生过审批/询问（ask 计数有增量）**且运行超 1 分钟**——两者都意味着用户
+/// 等过一段不确定的静默期，值得一条加急通知。含审批的短轮次（真机校准
+/// 2026-08：24s 含审批也弹）不触发——刚点完审批的用户显然还在看着会话，
+/// 终态卡 footer 已含时长/成本，再推一条纯噪音。
 fn should_buzz_done(elapsed: Duration, asks_delta: u64) -> bool {
-    elapsed > Duration::from_secs(300) || asks_delta > 0
+    elapsed > Duration::from_secs(300) || (asks_delta > 0 && elapsed > Duration::from_secs(60))
 }
 
 /// epoch 秒 → 相对时间（`/resume` 列表用）：`42秒前` / `5分钟前` / `3小时前` /

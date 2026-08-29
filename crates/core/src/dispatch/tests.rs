@@ -3943,7 +3943,8 @@ fn task_done_buzz_text_and_threshold() {
         super::task_done_buzz_text(Duration::from_secs(3600), None),
         "✅ 任务完成 · 1h00m"
     );
-    // 触发条件：>5 分钟，或本轮发生过询问（asks delta > 0）。
+    // 触发条件（真机校准 2026-08 收紧）：>5 分钟，或本轮发生过询问且 >1 分钟
+    //（刚点完审批的短轮次用户还在看会话，终态卡 footer 已含信息，不推）。
     assert!(
         !super::should_buzz_done(Duration::from_secs(300), 0),
         "恰好 300s 不触发"
@@ -3953,14 +3954,21 @@ fn task_done_buzz_text_and_threshold() {
         "超 300s 触发"
     );
     assert!(
-        super::should_buzz_done(Duration::from_secs(1), 1),
-        "有询问即触发"
+        !super::should_buzz_done(Duration::from_secs(24), 1),
+        "含询问的短轮次（24s）不触发——真机校准案例"
+    );
+    assert!(
+        super::should_buzz_done(Duration::from_secs(61), 1),
+        "含询问且超 1 分钟触发"
     );
     assert!(!super::should_buzz_done(Duration::from_secs(1), 0));
 }
 
-/// Wave B-2：本轮发生过询问 → 终态额外发一条 buzz 完成短文本；普通短轮次（无
-/// 询问、<5 分钟）不发；不支持 buzz 的平台（默认 mock）整体 no-op。
+/// Wave B-2：本轮发生过询问**且轮次 >1 分钟**才发 buzz 完成短文本（真机校准
+/// 2026-08 收紧：短轮次终态卡 footer 已含信息，刚审批完的用户还在看会话）；
+/// 本测试的快轮次（<1s 含询问）不再发；普通短轮次（无询问、<5 分钟）不发；
+/// 不支持 buzz 的平台（默认 mock）整体 no-op。>60s 含询问的触发由
+/// should_buzz_done 纯函数测试覆盖。
 #[tokio::test]
 async fn round_buzzes_done_when_ask_happened() {
     let _serial = SERIAL.lock().await;
@@ -3988,8 +3996,10 @@ async fn round_buzzes_done_when_ask_happened() {
         .iter()
         .filter(|t| t.starts_with("[buzz]") && t.contains("✅ 任务完成"))
         .collect();
-    assert_eq!(buzzes.len(), 1, "完成强提醒一条: {inbox:?}");
-    assert!(buzzes[0].contains("·"), "带耗时/成本段: {buzzes:?}");
+    assert!(
+        buzzes.is_empty(),
+        "短轮次（<1s）含询问不弹完成强提醒（真机校准 2026-08）: {inbox:?}"
+    );
     drop_db(ctx.db).await;
 
     // ② 普通短轮次（无询问）：不发。
