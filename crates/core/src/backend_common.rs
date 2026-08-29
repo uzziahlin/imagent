@@ -143,6 +143,7 @@ struct GroupKillGuard {
 }
 
 #[cfg(unix)]
+#[allow(unsafe_code)] // 同上 Drop impl：libc::kill 局部豁免
 impl GroupKillGuard {
     fn new(pgid: u32) -> Self {
         Self {
@@ -165,6 +166,21 @@ impl Drop for GroupKillGuard {
             // SAFETY：libc::kill 是 POSIX 简单系统调用，负 pid = 整个进程组，
             // best-effort（组已消散时 ESRCH，忽略返回值）。
             unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
+        }
+    }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)] // 同 Drop impl：libc::kill 局部豁免
+impl GroupKillGuard {
+    /// 主动组杀 + disarm（不等 drop）：终态收尾路径用——孙进程可能持有
+    /// stderr/stdout 管道，只杀直接子进程会让 `stderr_handle.await` 等一个
+    /// 永不到来的 EOF（真机校准 2026-08-29：control 通道 kill 后 3 分钟挂起）。
+    fn kill_now(&mut self) {
+        if self.armed {
+            // SAFETY：同 Drop——负 pid = 整组 SIGKILL，best-effort。
+            unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
+            self.armed = false;
         }
     }
 }
@@ -269,8 +285,16 @@ pub async fn spawn_cli_backend(
     // 句柄供 control_response 回写。写入失败不致命（claude 侧报 EOF 可见错误）。
     let mut stdin_w = child.stdin.take();
     if let (Some(w), Some(io)) = (&mut stdin_w, &control) {
-        let _ = w.write_all(io.initial_stdin_message.as_bytes()).await;
-        let _ = w.flush().await;
+        // 诊断（control 通道真机校准）：初始写入失败必须显式可见——静默吞错
+        // 会让 claude 等 stdin 空转（实测卡「输出中」排查用）。
+        if let Err(e) = w.write_all(io.initial_stdin_message.as_bytes()).await {
+            tracing::error!(target: "imagent::backend", error = %e, "control 通道初始 stdin 写入失败");
+        }
+        if let Err(e) = w.flush().await {
+            tracing::error!(target: "imagent::backend", error = %e, "control 通道 stdin flush 失败");
+        }
+        tracing::debug!(target: "imagent::backend", bytes = io.initial_stdin_message.len(),
+            "control 通道初始 stdin 消息已写入");
     }
 
     // B5：进程组 kill 守卫——run future 被 drop（dispatch 超时 / /stop）时对整个
@@ -294,6 +318,11 @@ pub async fn spawn_cli_backend(
     let mut usage_acc: Option<UsageStats> = None;
     // B1：真实 stdout IO 错误（管道 EIO 等，持续性）记录，最终无文本时并入诊断。
     let mut read_err: Option<String> = None;
+    // canUseTool 控制通道（真机校准 2026-08-29 定位）：终态事件的 break 只跳出
+    // 内层 for——mcp 模式靠子进程退出（EOF）收尾外层读循环，而 control 模式下
+    // claude 跑完一轮**不退出**（stream-input 等 stdin 下一条），外层会永远等
+    // 下一行 stdout。终态置位后跳出外层。
+    let mut terminal_seen = false;
 
     loop {
         let line = match read_line_capped(&mut reader, MAX_STDOUT_LINE_BYTES).await {
@@ -324,6 +353,20 @@ pub async fn spawn_cli_backend(
                 break;
             }
         };
+        // 诊断（control 通道真机校准）：前 3 行与之后每 50 行记录一次收流进度。
+        {
+            thread_local! { static N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+            N.with(|n| {
+                let i = n.get() + 1;
+                n.set(i);
+                {
+                    let _ = i;
+                    tracing::debug!(target: "imagent::backend", line_no = i,
+                        head = %line.chars().take(160).collect::<String>(),
+                        "stdout 行");
+                }
+            });
+        }
         // B7：一行可产出多个事件（Multi 展平后逐个处理）。
         let mut events = Vec::new();
         flatten_event(parse(&line), &mut events);
@@ -345,6 +388,9 @@ pub async fn spawn_cli_backend(
                     input,
                 } => match &control {
                     Some(io) => {
+                        tracing::debug!(target: "imagent::backend",
+                            request_id = %request_id, subtype = %subtype, tool = %tool_name,
+                            "收到 control_request，经 permission.sock 询问");
                         let line = if subtype == "can_use_tool" {
                             let parsed_input: serde_json::Value =
                                 serde_json::from_str(&input).unwrap_or(serde_json::json!({}));
@@ -451,6 +497,7 @@ pub async fn spawn_cli_backend(
                     }
                     final_text = text;
                     reached_terminal = true; // N8：标记由终止事件产出（非中间 Text 后 EOF）
+                    terminal_seen = true;
                     break;
                 }
                 CliEvent::Error { text, session } => {
@@ -461,6 +508,7 @@ pub async fn spawn_cli_backend(
                         session_id = s;
                     }
                     error_text = Some(text);
+                    terminal_seen = true;
                     break;
                 }
                 CliEvent::Terminal { session } => {
@@ -471,6 +519,7 @@ pub async fn spawn_cli_backend(
                         session_id = s;
                     }
                     reached_terminal = true;
+                    terminal_seen = true;
                     break;
                 }
                 // B10：非致命 error 事件——不中断流（保留「可能瞬时重连」考量），
@@ -497,8 +546,37 @@ pub async fn spawn_cli_backend(
                 CliEvent::Skip => {}
             }
         }
+        if terminal_seen {
+            break;
+        }
     }
 
+    // canUseTool 控制通道（真机校准 2026-08-29 实测）：`--input-format stream-json`
+    // 下 stdin 保持打开时，claude 跑完一轮**不退出**（流式会话等下一条消息）——
+    // 终态事件已收到即无需再等它：先关 stdin（EOF 后 claude 自行退出），再带
+    // 超时 wait，超时则 kill（kill_on_drop/进程组守卫兜底收尾孙进程）。
+    tracing::debug!(target: "imagent::backend",
+        final_len = final_text.len(), terminal = reached_terminal,
+        err = error_text.is_some(), read_err = read_err.is_some(),
+        "stdout 读取循环退出（进入 wait 阶段）");
+    if control.is_some() {
+        drop(stdin_w.take());
+        tracing::debug!(target: "imagent::backend", "control 通道已关 stdin，等 claude 退出（5s 超时）");
+        match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
+            Ok(res) => {
+                tracing::debug!(target: "imagent::backend", status = ?res, "control 通道 claude 已退出");
+            }
+            Err(_) => {
+                tracing::warn!(target: "imagent::backend",
+                    "control 通道 claude 终态后未随 stdin EOF 退出，kill 整组收尾");
+                #[cfg(unix)]
+                if let Some(g) = group_guard.as_mut() {
+                    g.kill_now();
+                }
+                let _ = child.kill().await;
+            }
+        }
+    }
     let status = child.wait().await;
     // B5：正常 wait 返回 → 进程组主进程已退出，disarm 防 pid 复用误杀无关进程组。
     #[cfg(unix)]
@@ -725,7 +803,7 @@ const ALWAYS_PASSTHROUGH_ENV: &[&str] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::{image_write_path, spawn_cli_backend, CliEvent};
+    use super::{image_write_path, spawn_cli_backend, CliEvent, ControlIo};
 
     /// B9：多条 agent_message（Text 事件）应按序拼接（\n\n 分隔）进 final_text，
     /// 而非最后一条覆盖（会丢多消息 turn 的前几条内容）。
@@ -867,4 +945,46 @@ mod tests {
         assert_eq!(u.total_cost_usd, Some(0.05)); // 最后非 None 胜出
         assert_eq!(outcome.final_text, "done");
     }
+    /// control 通道真机校准回归：终态事件（result）后子进程不退出（stream-input
+    /// 语义：stdin 开着等下一条消息）——spawn_cli_backend 必须收尾返回（关 stdin
+    /// → 5s 超时 kill），不得永久挂起。假 claude 脚本复现真机事件序列。
+    #[tokio::test]
+    async fn control_channel_terminal_with_alive_child_returns() {
+        let script = "/tmp/fake_claude.sh";
+        if !std::path::Path::new(script).exists() {
+            return; // 环境无脚本（CI）：跳过——形态由真机校准背书。
+        }
+        let cmd = tokio::process::Command::new(script);
+        let parse = |line: &str| -> CliEvent {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if v.get("type").and_then(|t| t.as_str()) == Some("result") {
+                    return CliEvent::Final {
+                        text: v.get("result").and_then(|r| r.as_str()).unwrap_or("").into(),
+                        session: v
+                            .get("session_id")
+                            .and_then(|s| s.as_str())
+                            .map(String::from),
+                    };
+                }
+            }
+            CliEvent::Skip
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(32);
+        let io = ControlIo {
+            sock: "/nonexistent/permission.sock".into(),
+            conv_id: "test-conv".into(),
+            ask_timeout: std::time::Duration::from_secs(2),
+            initial_stdin_message: "{\"type\":\"user\"}\n".into(),
+        };
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            spawn_cli_backend(cmd, parse, tx, "test-ctrl", &[], Some(io)),
+        )
+        .await;
+        assert!(res.is_ok(), "spawn_cli_backend 应在终态后收尾返回（不挂起）");
+        let outcome = res.unwrap().expect("run ok");
+        assert!(outcome.terminal, "终态事件应被识别");
+        assert!(outcome.final_text.contains("2026-08-29"), "final 文本: {}", outcome.final_text);
+    }
+
 }
