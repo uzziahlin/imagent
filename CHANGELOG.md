@@ -103,6 +103,21 @@
 报 99991400 HTTP 400 形态）；`im.message.reaction.created_v1` 事件订阅已验
 证生效；bot.added 事件 payload 待群场景校准。
 
+## [Unreleased]
+
+> canUseTool 控制通道（审批传输机制迁移，config 可切）。
+
+### Added
+- **`claude_permission_channel = "control" | "mcp"`（缺省 control）**：claude 审批
+  传输通道切换。control = canUseTool 双工协议（Agent SDK 现行标准——prompt 经
+  stdin user 消息投递、审批经 stdout `control_request` / stdin `control_response`，
+  免 MCP 子进程/permission.sock 监听/每轮临时 mcp 配置三层机械件；决策经既有
+  permission.sock 路由复用 IM 审批卡/👍/always/超时全套语义）；mcp = 旧
+  `--permission-prompt-tool` legacy 机制（回退通道）。SIGHUP 热切，下一轮 agent
+  即走新通道。未知 control_request subtype 回 error 响应防挂起；denial 带
+  message 回传模型。注：stdin user 消息与 control_request 字段形态按 SDK 公开
+  协议建模，待真机校准（有问题 config 切回 mcp 即可，零风险回退）。
+
 ## [1.14.1] — 2026-08-29
 
 > 真机校准第二轮：bot 消息表情 + 流式卡终态折叠统一 + 修复。

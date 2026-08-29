@@ -111,6 +111,7 @@ impl Backend for GeminiBackend {
             NAME,
             // S-2：仅透传 gemini(Google) 所需凭据（最小授权）。
             &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+            None,
         )
         .await
     }
