@@ -103,6 +103,23 @@
 报 99991400 HTTP 400 形态）；`im.message.reaction.created_v1` 事件订阅已验
 证生效；bot.added 事件 payload 待群场景校准。
 
+## [1.14.1] — 2026-08-29
+
+> 真机校准第二轮：bot 消息表情 + 流式卡终态折叠统一 + 修复。
+
+### Added
+- **bot 对用户消息发表情**：轮次开始打 OnIt（在做了）→ 终态翻 DONE（搞定）/
+  CrossMark（失败/中断）——反馈直接落在用户的消息上，零新增消息（业界标配
+  轻反馈闭环）。命令消息不打；emoji key 真机校准（OnIt/DONE/CrossMark，大小
+  写敏感），现有 im:message 权限即可调用。
+
+### Fixed
+- **流式卡终态统一折叠布局**：此前 managed 流式卡终态把工具轨迹/思考过程
+  内联展开（长卡），而结果下沉新卡是折叠面板——「有审批折叠、无审批长展开」
+  的随机观感。终态统一整卡 patch 成折叠面板布局。
+- **react_to_message 误落 inherent impl**：经 trait 对象调用到默认 no-op，
+  表情全程静默不生效（no-op 无告警）。移入 Platform trait impl。
+
 ## [1.13.0] — 2026-08-28
 
 ### Added
