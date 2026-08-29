@@ -485,6 +485,9 @@ impl Backend for ClaudeBackend {
         } else {
             None
         };
+        // 诊断（control 通道真机校准）：完整 spawn 参数。
+        tracing::debug!(target: "imagent::backend", args = ?cmd,
+            "claude spawn 参数（get_all）");
         let result = spawn_cli_backend(
             cmd,
             claude_parse,

@@ -1292,8 +1292,7 @@ message_fragment_interval_ms = 250
         cleanup(&p_def);
     }
 
-    #[test]
-    /// canUseTool 通道：缺省 control、归一校验、非法值拒启。
+    /// canUseTool 通道：缺省 control、归一校准、非法值拒启。
     #[test]
     fn claude_permission_channel_validation() {
         let p = tmp_path(
@@ -1323,6 +1322,7 @@ message_fragment_interval_ms = 250
         cleanup(&p3);
     }
 
+    #[test]
     fn approval_tools_default_empty_and_parse() {
         let p = tmp_path("appr_def", r#"default_workdir = "/tmp/ws""#);
         let cfg = Config::load(&p).expect("parse");
