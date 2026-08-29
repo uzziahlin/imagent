@@ -213,21 +213,20 @@ pub struct ControlIo {
 /// （**待真机校准**：字段名/大小写以实测为准，错则 claude 视为未答复挂起——
 /// 兜底见 spawn 循环的 error 响应）。
 fn control_response_line(request_id: &str, reply: &crate::permission::PermissionReply) -> String {
+    // 真机校准（2026-08-30 实测 2.1.250）：request_id/subtype 嵌在 response 内、
+    // 决定再嵌一层（顶层形态 claude 不认，表现为审批后无 tool_result）。
     let behavior = if reply.allow { "allow" } else { "deny" };
-    let mut resp = serde_json::json!({
+    let resp = serde_json::json!({
         "type": "control_response",
-        "request_id": request_id,
-        "subtype": "success",
         "response": {
-            "behavior": behavior,
-            "message": reply.message.clone().unwrap_or_default(),
+            "subtype": "success",
+            "request_id": request_id,
+            "response": {
+                "behavior": behavior,
+                "message": reply.message.clone().unwrap_or_default(),
+            }
         }
     });
-    if reply.allow && reply.always {
-        // 会话级放行提示（SDK updatedPermissions 的轻量近似——always 语义由
-        // 网关侧 session_allows 兜底，这里只回显）。
-        resp["response"]["updatedPermissions"] = serde_json::json!({"mode": "acceptEdits"});
-    }
     format!("{resp}\n")
 }
 
@@ -422,9 +421,11 @@ pub async fn spawn_cli_backend(
                                 "{}\n",
                                 serde_json::json!({
                                     "type": "control_response",
-                                    "request_id": request_id,
-                                    "subtype": "error",
-                                    "error": { "message": format!("unsupported subtype: {subtype}") },
+                                    "response": {
+                                        "subtype": "error",
+                                        "request_id": request_id,
+                                        "error": format!("unsupported subtype: {subtype}"),
+                                    }
                                 })
                             )
                         };
