@@ -414,9 +414,17 @@ impl PermissionRouter {
         let list = map.get_mut(conv_id)?;
         let idx = match (req_hint, parent_msg_id) {
             (Some(req), _) => list.iter().position(|p| p.request_id == req)?,
-            (None, Some(mid)) => list
+            // 真机校准（2026-08）：引用的若不是询问卡（如对 ⏰ 催办文本回 OK），
+            // 锚点不匹配不能让回复直接失效——**单 pending 无歧义**时兜底该条；
+            // 多 pending 并存仍返回 None（锚定失败无法消解歧义，走提示引导）。
+            (None, Some(mid)) => match list
                 .iter()
-                .position(|p| p.card_msg_id.as_deref() == Some(mid))?,
+                .position(|p| p.card_msg_id.as_deref() == Some(mid))
+            {
+                Some(i) => i,
+                None if list.len() == 1 => 0,
+                None => return None,
+            },
             (None, None) => list.len().checked_sub(1)?,
         };
         let hit = list.remove(idx);
@@ -530,6 +538,61 @@ mod tests {
             .expect("sender 未 drop");
         assert!(!reply.allow, "cancel 必须 fail-closed deny");
         assert!(reply.message.unwrap().contains("cancelled"));
+    }
+
+    /// 真机校准（2026-08）：引用回复锚点不匹配（用户对 ⏰ 催办**文本**回 OK，
+    /// 而非对询问卡回复）——单 pending 无歧义时兜底命中，不再让回复失效；
+    /// 多 pending 时仍 None（无法消解歧义）。
+    #[tokio::test]
+    async fn route_unmatched_anchor_falls_back_when_single_pending() {
+        let r = PermissionRouter::new();
+        let rx = r
+            .register("c", "r-1", None, PendingKind::Permission, Some("Bash"))
+            .await;
+        // 锚定一个非询问卡的消息 id。
+        let hit = r
+            .route(
+                "c",
+                None,
+                Some("om_not_a_card"),
+                PermissionReply {
+                    allow: true,
+                    always: false,
+                    message: None,
+                    raw_text: Some("OK".into()),
+                },
+            )
+            .await;
+        assert_eq!(
+            hit.as_ref().map(|d| d.request_id.as_str()),
+            Some("r-1"),
+            "单 pending 锚不匹配兜底命中"
+        );
+        assert!(rx.await.unwrap().allow);
+
+        // 多 pending + 锚不匹配 → None（歧义不消费）。
+        let _rx2 = r
+            .register("c", "r-2", None, PendingKind::Permission, Some("Bash"))
+            .await;
+        let _rx3 = r
+            .register("c", "r-3", None, PendingKind::Permission, Some("Read"))
+            .await;
+        assert!(
+            r.route(
+                "c",
+                None,
+                Some("om_not_a_card"),
+                PermissionReply {
+                    allow: true,
+                    always: false,
+                    message: None,
+                    raw_text: None
+                }
+            )
+            .await
+            .is_none(),
+            "多 pending 锚不匹配不消费"
+        );
     }
 
     /// 多 pending 并存：同 conv 不同 request_id 互不顶替，按 req 精确路由。
