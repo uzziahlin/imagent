@@ -188,8 +188,10 @@ pub async fn urgent_app_buzz(
     user_open_id: &str,
 ) -> imagent_core::Result<()> {
     let base = core_config.base_url().trim_end_matches('/').to_string();
+    // 真机校准（2026-08）：query 参数为 snake_case `user_id_type`——驼峰
+    // userIdType 报 99992402 field validation failed（实测）。
     let url = format!(
-        "{base}/open-apis/im/v1/messages/{message_id}/urgent_app?userIdType=open_id"
+        "{base}/open-apis/im/v1/messages/{message_id}/urgent_app?user_id_type=open_id"
     );
     let client = reqwest::Client::new();
     let resp = client
