@@ -119,6 +119,9 @@ pub struct FeishuPlatform {
     /// bot 对用户消息的表情标注状态：om_ 消息 id → 当前 reaction_id（终态翻转
     /// 时先删旧表情再打新表情；仅内存态，重启后旧表情滞留无害——新一轮会重打）。
     msg_reactions: Arc<Mutex<HashMap<String, String>>>,
+    /// managed 流式卡的 card_id → 平台消息 id（om_）：终态整卡 patch 用
+    /// （CardKit 句柄只有实体 id，im PATCH 需要消息 id；send 时记录）。
+    managed_card_msgs: Arc<Mutex<HashMap<String, String>>>,
     /// `/reconnect` 强制重连信号（与 WS run task 共享，P4-7）。
     reconnect: Arc<tokio::sync::Notify>,
     /// 已解析的入站消息 channel，`recv` 直接 await。
@@ -813,6 +816,7 @@ impl FeishuPlatform {
             ask_notes: Arc::new(Mutex::new(HashMap::new())),
             card_tail: Arc::new(Mutex::new(HashMap::new())),
             msg_reactions: Arc::new(Mutex::new(HashMap::new())),
+            managed_card_msgs: Arc::new(Mutex::new(HashMap::new())),
             reconnect,
             inbound_rx: Arc::new(Mutex::new(inbound_msg_rx)),
             pending_asks,
@@ -2529,7 +2533,15 @@ impl Platform for FeishuPlatform {
                                 )
                                 .await
                             {
-                                Ok(_) => Ok(Some(format!("card:{card_id}"))),
+                                Ok(mid) => {
+                                    if let Some(m) = mid {
+                                        self.managed_card_msgs
+                                            .lock()
+                                            .await
+                                            .insert(card_id.clone(), m);
+                                    }
+                                    Ok(Some(format!("card:{card_id}")))
+                                }
                                 Err(e) => {
                                     // 实体已建但消息发送失败：实体作废（14 天过期自然回收），降级 raw。
                                     warn!(target: "feishu", error = %e, "发送卡片引用消息失败，降级 raw 卡片");
@@ -2596,6 +2608,28 @@ impl Platform for FeishuPlatform {
         let res = self
             .with_token(|token| async move {
                 if let Some(card_id) = handle.strip_prefix("card:") {
+                    // 真机校准（2026-08）：终态且未下沉时改**整卡 im patch**
+                    // （render_card 折叠面板布局）——统一视觉：此前 managed 终态把
+                    // 工具轨迹/思考过程内联进 md_body（长卡），而结果下沉新卡是折叠
+                    // 面板，两形态不一致（用户反馈折叠更好）。Running 仍走 managed
+                    // element 流式（打字机/节流/300317 自愈语义不变）。无映射
+                    // （重启后）退回 managed 终态 patch（内联形态，可接受降级）。
+                    if !buried
+                        && !matches!(card.terminal, CardTerminal::Running)
+                    {
+                        if let Some(message_id) =
+                            self.managed_card_msgs.lock().await.get(card_id).cloned()
+                        {
+                            let sender = self.last_sender(&conv.0).await;
+                            let card_json = render_card(
+                                card,
+                                &conv.0,
+                                (!sender.is_empty()).then_some(sender).as_deref(),
+                            );
+                            return patch_card(&self.core_config, &token, &message_id, &card_json)
+                                .await;
+                        }
+                    }
                     match self.patch_managed(&token, card_id, card, buried).await {
                     // 300317（sequence 落后）自愈（真机校准）：重启后内存计数器归零，
                     // 但旧卡片的 server 序号已推进（孤儿扫描接管、同进程异常路径）
