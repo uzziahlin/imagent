@@ -244,6 +244,10 @@ pub struct PermissionRouter {
     /// 轮次起止各取一次快照对比，即可判定「本轮是否发生过审批/询问」——
     /// 完成强提醒的触发条件之一。
     ask_counters: Mutex<HashMap<String, u64>>,
+    /// 真机校准（2026-08）：per-conv 最近一次**用户审批决定**（route 命中）的
+    /// 时刻——完成强提醒的抑制条件：刚批准过 = 用户显然在线，紧接着的完成
+    /// 推送是打扰（实测：3m11s 轮次批准后数十秒完成仍推送）。
+    last_decision_at: Mutex<HashMap<String, std::time::Instant>>,
 }
 
 impl PermissionRouter {
@@ -252,11 +256,22 @@ impl PermissionRouter {
             pending: Mutex::new(HashMap::new()),
             session_allows: Mutex::new(HashMap::new()),
             ask_counters: Mutex::new(HashMap::new()),
+            last_decision_at: Mutex::new(HashMap::new()),
         }
     }
 
     /// Wave B-2：该 conv 的累计询问登记数（审批 + ask_via_im 提问；单调递增）。
     /// 轮次起止快照对比判定「本轮发生过询问」。
+    /// 距最近一次用户审批决定的秒数（无记录 = None）。完成强提醒抑制条件：
+    /// 60s 内有过决定 → 用户在线，跳过推送。
+    pub async fn secs_since_decision(&self, conv_id: &str) -> Option<u64> {
+        self.last_decision_at
+            .lock()
+            .await
+            .get(conv_id)
+            .map(|t| t.elapsed().as_secs())
+    }
+
     pub async fn ask_count(&self, conv_id: &str) -> u64 {
         self.ask_counters
             .lock()
@@ -447,6 +462,12 @@ impl PermissionRouter {
         // send 失败说明 receiver 已 drop（register 方未在等），视为未命中。
         // Wave B-11：created_at 差值即审批响应时长（waited_secs，审计/统计用）。
         let waited_secs = hit.created_at.elapsed().as_secs();
+        // 真机校准（2026-08）：用户真实决定时刻——完成强提醒抑制用。
+        drop(map);
+        self.last_decision_at
+            .lock()
+            .await
+            .insert(conv_id.to_string(), std::time::Instant::now());
         hit.tx.send(reply).ok().map(|_| RoutedDecision {
             request_id: hit.request_id,
             tool_name: hit.tool_name,
