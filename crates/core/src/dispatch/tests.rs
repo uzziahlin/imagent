@@ -864,7 +864,7 @@ async fn drop_db(p: std::path::PathBuf) {
 #[tokio::test]
 async fn normal_message_runs_backend_and_replies_and_persists() {
     let _serial = SERIAL.lock().await;
-    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    let ctx = build_with_mode(Auth::new(vec!["alice".into()]), PermissionMode::Ask).await;
     feed_and_wait(&ctx, vec![msg("c1", "alice", "hello")], 1).await;
 
     // 回传收到（Final 优先）。
@@ -891,7 +891,7 @@ async fn normal_message_runs_backend_and_replies_and_persists() {
 #[tokio::test]
 async fn pure_media_all_failed_replies_error() {
     let _serial = SERIAL.lock().await;
-    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    let ctx = build_with_mode(Auth::new(vec!["alice".into()]), PermissionMode::Ask).await;
     let m = InboundMessage {
         conv_id: ConvId("feishu:ou_t".into()),
         sender: UserId("alice".into()),
@@ -2845,7 +2845,7 @@ async fn resume_rejects_local_session_cwd_mismatch() {
 #[tokio::test]
 async fn permission_socket_token_handshake() {
     let _serial = SERIAL.lock().await;
-    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    let ctx = build_with_mode(Auth::new(vec!["alice".into()]), PermissionMode::Ask).await;
     let dir = std::env::temp_dir().join(format!("imagent-sock-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
