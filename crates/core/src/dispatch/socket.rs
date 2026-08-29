@@ -17,8 +17,21 @@ impl Dispatcher {
         {
             return true; // 已在运行（R-2：accept task 监听 shutdown，进程内只 spawn 一次）
         }
-        // 清理可能残留的旧 socket 文件。
+        // 清理可能残留的旧 socket 文件。目录形态（真机校准 2026-08 实测残留过：
+        // remove_file 对目录报 EISDIR 被忽略，bind 随后 EADDRINUSE 报错无从指
+        // 引）用 remove_dir 收敛，失败给可行动指引。
         let _ = std::fs::remove_file(&sock);
+        if std::fs::metadata(&sock).map(|m| m.is_dir()).unwrap_or(false) {
+            if let Err(e) = std::fs::remove_dir(&sock) {
+                error!(
+                    target: "imagent::core",
+                    sock = %sock,
+                    error = %e,
+                    "permission socket 路径是目录且无法删除：请手动移除后重启（Ask 权限闭环依赖该 socket）"
+                );
+                return false;
+            }
+        }
         let listener = match std::os::unix::net::UnixListener::bind(&sock) {
             Ok(l) => l,
             Err(e) => {
