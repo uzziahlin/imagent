@@ -197,11 +197,20 @@ pub fn render_card(card: &OutboundCard, conv_id: &str, sender: Option<&str>) -> 
         // managed 路径的 md_body 是单 markdown 组件，用 `---` 文本分割线，
         // 见 [`stream_body_final`]）。
         elements.push(serde_json::json!({ "tag": "hr" }));
-        // tag 胶囊墙（CardKit tag 组件）：终态工具统计的胶囊化展示；markdown
-        // 统计行（stream_body_final）仍是表格以外的兜底。Running 态不加
-        // （统计未收敛）。
+        // 工具统计行（markdown+notation 小字）：终态整卡与流式终态同一形态。
+        // 真机校准（2026-08）：原 CardKit tag 胶囊墙（裸 "tag" 组件）被整卡
+        // 拒收——200621 "not support tag: tag"，结果下沉降级纯文本；V2 无等价
+        // 胶囊组件，统计信息以文本行承载。Running 态不加（统计未收敛）。
         if !streaming {
-            elements.push(tool_tag_wall(&card.tool_calls));
+            elements.push(serde_json::json!({
+                "tag": "markdown",
+                "content": format!(
+                    "🔧 工具 {} 次：{}",
+                    card.tool_calls.len(),
+                    tool_stats_summary(&card.tool_calls)
+                ),
+                "text_size": "notation"
+            }));
         }
         // 面板边框随终态：Running=blue / Done=grey / Error=red。
         let border = if streaming {
@@ -343,37 +352,19 @@ fn note_element(text: &str) -> serde_json::Value {
     })
 }
 
-/// CardKit tag 组件胶囊。
-///
-/// 字段形态**待真机校准**（本项目未真机验证过 tag 组件）；markdown 降级思路＝
-/// 正文文本行（统计行 `Bash×5 · Read×3` / 列表行内 emoji 徽章）。
-fn tag_pill(text: &str, color: &str) -> serde_json::Value {
-    serde_json::json!({
-        "tag": "tag",
-        "text": { "tag": "plain_text", "content": text },
-        "color": color
-    })
-}
-
-/// 终态工具统计的 tag 胶囊墙（CardKit 视觉改版）：column_set flow + tag 胶囊
-/// （`Bash×5` · `Read×3`，按名计数）。整卡路径（render_card / 结果下沉重发）
-/// 的 elements 追加；markdown 统计行（stream_body_final / 表格以外场景）保留
-/// 作兜底。
-fn tool_tag_wall(tools: &[ToolCall]) -> serde_json::Value {
+/// 按工具名计数的统计行（`Bash×2 · Read×1`）——终态整卡与流式终态（结果下沉）
+/// 共用。真机校准（2026-08）后为工具统计的**唯一**形态：CardKit 无可用胶囊
+/// 组件（裸 "tag" 被 200621 拒收，见 [`render_card`] 的统计行注释）。
+fn tool_stats_summary(tools: &[ToolCall]) -> String {
     let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
     for t in tools {
         *counts.entry(t.name.as_str()).or_default() += 1;
     }
-    let pills: Vec<serde_json::Value> = counts
+    counts
         .iter()
-        .map(|(t, n)| tag_pill(&format!("{t}×{n}"), "turquoise"))
-        .collect();
-    serde_json::json!({
-        "tag": "column_set", "flex_mode": "flow", "horizontal_spacing": "default",
-        "columns": pills.into_iter()
-            .map(|p| serde_json::json!({ "tag": "column", "width": "auto", "elements": [p] }))
-            .collect::<Vec<_>>()
-    })
+        .map(|(t, n)| format!("{t}×{n}"))
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 /// 命令按钮 value 公共字段：命令 + conv + `ts`（epoch 秒，proto 回调侧超 24h 拒
@@ -623,12 +614,8 @@ pub fn stream_body_final(card: &OutboundCard, err: Option<&str>) -> String {
         out.push_str(text);
     }
     if !tool_calls.is_empty() {
-        // 按工具名计数：Bash×2 Read×3。
-        let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
-        for t in tool_calls {
-            *counts.entry(t.name.as_str()).or_default() += 1;
-        }
-        let stats: Vec<String> = counts.iter().map(|(t, n)| format!("{t}×{n}")).collect();
+        // 按工具名计数：Bash×2 Read×3（tool_stats_summary，与终态整卡共用）。
+        let stats = tool_stats_summary(tool_calls);
         // 长正文分段（CardKit 视觉改版）：正文与工具统计间 `---` 分割线 +
         // 工具明细块前小标题「工具轨迹」——managed 单 markdown 组件内用文本
         // 分割线（降级/整卡路径用真 hr 组件 + 面板标题，见 [`render_card`]）。
@@ -638,7 +625,7 @@ pub fn stream_body_final(card: &OutboundCard, err: Option<&str>) -> String {
         out.push_str(&format!(
             "🔧 工具 {} 次：{}\n\n**工具轨迹**\n",
             tool_calls.len(),
-            stats.join(" · ")
+            stats
         ));
         // 全量明细（引用行形态，与流式期一致）——终态回看用。
         let lines: Vec<String> = tool_calls
@@ -863,25 +850,17 @@ pub(crate) fn render_permission_card_note(
         elements.push(note_element(n));
     }
     elements.push(serde_json::json!({ "tag": "hr" }));
+    // 按钮布局（真机校准 2026-08）：三按钮 flow 布局因「♾️ 本次会话始终允许」
+    // 长标签挤成错落两行——收敛为**两枚短标签按钮**（flow 容器已真机验证可
+    // 发，两短标签稳定同行）：✅ 允许 primary_filled（CardKit 的 primary 实为
+    // 蓝字描边，填充档是 primary_filled）/ ⛔ 拒绝 danger_filled。「始终允许」
+    // 由 note 行的「回复 always」承载（原第三按钮与该文案语义重复）。
     elements.push(flow_button_row(&[
-        // 真机校准（2026-08）：CardKit type=primary 是**蓝字描边**而非填充主按钮
-        //（官方文档枚举：primary 蓝字边框 / primary_filled 蓝底白字）——允许作为
-        // 推荐动作用填充，拒绝对应用 danger_filled 红底。
         cb_button(
             "允许",
             "primary_filled",
             ask_value_wrap(
                 serde_json::json!({ "imagent_perm": "allow" }),
-                conv_id,
-                request_id,
-                sender,
-            ),
-        ),
-        cb_button(
-            "♾️ 本次会话始终允许",
-            "default",
-            ask_value_wrap(
-                serde_json::json!({ "imagent_perm": "always" }),
                 conv_id,
                 request_id,
                 sender,
@@ -1206,22 +1185,24 @@ fn table_rows(body_md: &str) -> Option<Vec<Vec<String>>> {
     Some(rows)
 }
 
-/// /resume 行的左列元素：来源徽章 tag 胶囊（列表行兜底文本里的 💻/📱 同步
-/// tag 化——徽章用 tag，行内容保持 markdown 文本）+ 时间 · 内容。
+/// /resume 行的左列元素：来源标记（💻 本机 / 📱 IM）+ 时间 · 内容。
 ///
-/// tag 字段形态**待真机校准**；降级兜底＝表格行内 emoji 文本。
+/// 真机校准（2026-08）：裸 "tag" 组件被 200621 拒收（整卡降级），V2 无等价
+/// 胶囊——来源并入 markdown 行首（emoji 文本承载，无组件风险）。
 fn resume_row_left(cells: &[String]) -> Vec<serde_json::Value> {
-    let mut els = Vec::new();
-    if cells.len() > 1 {
-        match cells[1].as_str() {
-            "💻" => els.push(tag_pill("💻 本机", "blue")),
-            "📱" => els.push(tag_pill("📱 IM", "green")),
-            other if !other.is_empty() => els.push(tag_pill(other, "grey")),
-            _ => {}
-        }
-    }
     let mut md = String::new();
+    if cells.len() > 1 && !cells[1].is_empty() {
+        let source = match cells[1].as_str() {
+            "💻" => "💻 本机",
+            "📱" => "📱 IM",
+            other => other,
+        };
+        md.push_str(source);
+    }
     if cells.len() > 2 && !cells[2].is_empty() {
+        if !md.is_empty() {
+            md.push_str(" · ");
+        }
         md.push_str(&cells[2]);
     }
     if cells.len() > 3 && !cells[3].is_empty() {
@@ -1230,10 +1211,11 @@ fn resume_row_left(cells: &[String]) -> Vec<serde_json::Value> {
         }
         md.push_str(&cells[3]);
     }
-    if !md.is_empty() {
-        els.push(serde_json::json!({ "tag": "markdown", "content": md }));
+    if md.is_empty() {
+        Vec::new()
+    } else {
+        vec![serde_json::json!({ "tag": "markdown", "content": md })]
     }
-    els
 }
 
 /// 按钮 label 约定配对的双列行布局（CardKit 视觉改版）：
@@ -1750,13 +1732,18 @@ mod tests {
         // 蓝底已高亮，绿色系 emoji 冲突）；⛔ 拒绝（danger）保留。
         assert!(json.contains("\"content\":\"允许\""), "允许按钮: {json}");
         assert!(json.contains("⛔ 拒绝"), "拒绝按钮: {json}");
+        // 真机校准（2026-08）：三按钮收敛为两枚（长标签按钮挤布局），always
+        // 动作由 note 行「回复 always」承载，不再有按钮编码。
         assert!(
             json.contains("\"imagent_perm\":\"allow\"")
                 && json.contains("\"imagent_perm\":\"deny\"")
-                && json.contains("\"imagent_perm\":\"always\""),
-            "三个动作都应编码: {json}"
+                && !json.contains("\"imagent_perm\":\"always\""),
+            "两动作编码且 always 不再是按钮: {json}"
         );
-        assert!(json.contains("♾️ 本次会话始终允许"), "始终允许按钮: {json}");
+        assert!(
+            json.contains("回复 always") && json.contains("\"primary_filled\""),
+            "always 走 note 文案 + 允许为填充主按钮: {json}"
+        );
         assert!(json.contains("feishu:ou_u1"), "conv 应编码进 value: {json}");
         assert!(json.contains("\"tag\":\"button\""), "按钮 tag: {json}");
         // 真机校准（2026-08）：V2 已废弃 action 元素——按钮必须在 column_set 内，
@@ -2505,20 +2492,25 @@ mod tests {
             tool("Read", "c", true),
         ];
         let json = render_card(&card_of(CardTerminal::Done, tools), "feishu:ou_t", None);
-        assert!(json.contains("\"tag\":\"tag\""), "tag 组件: {json}");
+        // 真机校准（2026-08）：裸 tag 组件 200621 拒收（整卡降级纯文本）——
+        // 统计改为 markdown+notation 小字行，且**整卡不得再出现** tag 组件。
         assert!(
-            json.contains("Bash×2") && json.contains("Read×1"),
-            "计数胶囊: {json}"
+            !json.contains("\"tag\":\"tag\""),
+            "不得含 tag 组件（200621）: {json}"
         );
-        // Running 不加胶囊墙（统计未收敛）。
+        assert!(
+            json.contains("🔧 工具 3 次：Bash×2 · Read×1"),
+            "统计行: {json}"
+        );
+        // Running 不加统计行（统计未收敛）。
         let running = render_card(
             &card_of(CardTerminal::Running, vec![tool("Bash", "a", false)]),
             "feishu:ou_t",
             None,
         );
         assert!(
-            !running.contains("\"tag\":\"tag\""),
-            "Running 无胶囊: {running}"
+            !running.contains("工具 1 次"),
+            "Running 无统计: {running}"
         );
         // markdown 统计行兜底仍在（managed 终态正文）。
         let md = stream_body_final(&body_card_of("结论", &[tool("Bash", "a", true)], &[]), None);
@@ -2555,10 +2547,11 @@ mod tests {
             "左列 weighted 4: {json}"
         );
         assert!(json.contains("\"weight\":1"), "右列 weighted 1: {json}");
-        // 来源徽章 tag 化（行文本兜底保留在降级表格）。
+        // 真机校准（2026-08）：来源并入行首 markdown（💻 本机 / 📱 IM 文本），
+        // 裸 tag 组件 200621 拒收已移除。
         assert!(
-            json.contains("\"tag\":\"tag\"") && json.contains("💻 本机") && json.contains("📱 IM"),
-            "来源 tag 胶囊: {json}"
+            !json.contains("\"tag\":\"tag\"") && json.contains("💻 本机") && json.contains("📱 IM"),
+            "来源文本化且无 tag 组件: {json}"
         );
         // 按钮配对进各行（value 编码不变）。
         assert!(
@@ -2643,7 +2636,10 @@ mod tests {
         assert!(sup.contains("🔁 已被新询问取代"), "superseded 图标: {sup}");
         assert!(!sup.contains("⏭️"), "不再用跳过图标: {sup}");
         let perm = render_permission_card("Bash", r#"{"command":"ls"}"#, "c", "r", None, 300);
-        assert!(perm.contains("♾️ 本次会话始终允许"), "♾️ 徽章: {perm}");
+        // 真机校准（2026-08）：三按钮收敛为两枚——「始终允许」由 note 行文案
+        // 承载（长标签按钮挤布局），按钮不再出现 ♾️。
+        assert!(perm.contains("回复 always"), "always 走 note 文案: {perm}");
+        assert!(!perm.contains("♾️ 本次会话始终允许"), "按钮不再有 ♾️ 长标签: {perm}");
         assert!(!perm.contains("🔓"), "不再用开锁: {perm}");
     }
 
