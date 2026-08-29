@@ -35,11 +35,20 @@ pub fn tool_matches_pattern(pattern: &str, tool_name: &str) -> bool {
 
 /// 该工具是否需要 IM 审批：审批集为空 = 全部过审（既有语义）；非空 = 仅清单内过审。
 pub fn needs_approval(approval_tools: &[String], tool_name: &str) -> bool {
+    // M4（code-review v8）：无法确定工具名的请求（ACP 无 title 权限请求的
+    // 哨兵形态）恒过审——fail-closed，防「清单外放行」语义误放行未知工具。
+    if tool_name.starts_with(crate::permission::UNTITLED_TOOL_PREFIX) {
+        return true;
+    }
     approval_tools.is_empty()
         || approval_tools
             .iter()
             .any(|p| tool_matches_pattern(p, tool_name))
 }
+
+/// M4：与 claude 后端的 [`crate::permission::UNTITLED_TOOL_SENTINEL`] 前缀对应
+///（core 不依赖 claude crate，前缀字面量双写——两处测试互相锚定）。
+pub const UNTITLED_TOOL_PREFIX: &str = "imagent:untitled-tool";
 
 /// 审批决定（词表解析结果；tool 名由 pending 条目在 route 时补齐）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

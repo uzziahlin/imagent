@@ -378,7 +378,13 @@ pub async fn spawn_cli_backend(
                         let _ = chunks.send(AgentChunk::SessionStarted(id)).await;
                     }
                 }
-                // canUseTool 控制请求：经 permission.sock 复用既有审批闭环
+                // canUseTool 控制请求：经 permission.sock 复用既有审批闭环。
+                // M3（code-review v8）：本臂在读循环内联 await（审批预算内）——
+                // claude 同一轮的多个 canUseTool 因此**串行化**为串行 IM 审批，
+                // 期间子进程其它输出滞留管道（~64KB 缓冲，极端时子进程写阻塞）。
+                // 取舍：并发 responder 需拆 task + 真机校准多询问并发场景，
+                // 当前接受串行语义（claude 单轮并行工具罕见）；stdin 生命周期
+                // 已在终态路径闭环（drop → 5s wait → 组杀，见下方 wait 阶段）。
                 //（IM 卡/👍/always/超时 fail-closed），决策回写子进程 stdin。
                 CliEvent::ControlRequest {
                     request_id,

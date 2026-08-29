@@ -40,7 +40,7 @@ pub use dispatch::{Dispatcher, TaskBudgets};
 pub use error::{CoreError, Result};
 pub use message::split_message;
 pub use metrics::Metrics;
-pub use permission::{default_sock_path, parse_reply, PermissionReply, PermissionRouter};
+pub use permission::{default_sock_path, needs_approval, parse_reply, PermissionReply, PermissionRouter};
 pub use platform::{command_card_fallback_text, Platform};
 pub use types::{
     AgentChunk, CardButton, CardButtonStyle, CardPhase, CardTerminal, ConfigFormField, ConvId,
