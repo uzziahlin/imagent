@@ -391,6 +391,16 @@ async fn main() -> Result<()> {
                     let out_path =
                         output.unwrap_or_else(|| PathBuf::from(format!("{name}-profile.json")));
                     std::fs::write(&out_path, serde_json::to_string_pretty(&payload)?)?;
+                    // L11（code-review v8）：导出产物 chmod 0600——明文 secret 按
+                    // umask（典型 0644）落盘世界可读；与 Import 分支同姿态。
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(
+                            &out_path,
+                            std::fs::Permissions::from_mode(0o600),
+                        )?;
+                    }
                     println!(
                         "✅ 已导出 profile {name} → {}（白名单 {}/群 {}/管理员 {}；config {}）\n                         ⚠️ keyring 凭据（iLink）与飞书 app_secret（环境变量）不随导出，需在目标机器重配。",
                         out_path.display(),
@@ -1181,10 +1191,23 @@ fn bearer_authorized(headers: &axum::http::HeaderMap, token: Option<&str>) -> bo
     let Some(expected) = token else {
         return true;
     };
-    headers
+    let provided = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v == format!("Bearer {expected}"))
+        .unwrap_or("");
+    // L14（code-review v8）：恒定时间比较（逐字节 XOR 累加）——短路 == 的
+    // 时序差在公网链路可测；长度差先补齐到同长再比。
+    let want = format!("Bearer {expected}");
+    let a: Vec<u8> = provided.as_bytes().to_vec();
+    let b: Vec<u8> = want.as_bytes().to_vec();
+    let n = a.len().max(b.len());
+    let mut diff: u8 = (a.len() != b.len()) as u8;
+    for i in 0..n {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// 起 HTTP server（/metrics + /health），独立 tokio task。失败仅 warn。

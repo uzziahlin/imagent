@@ -543,6 +543,18 @@ impl Dispatcher {
             }
             _ => match arg.parse::<u64>() {
                 Ok(n) if n > 0 => {
+                    // L5（code-review v8）：checked_mul 防整型溢出（debug panic /
+                    // release 回绕自 DoS）+ 30 天上限（43200 分钟）防误设永关。
+                    const TIMEOUT_MAX_MINUTES: u64 = 30 * 24 * 60;
+                    let Some(n) = n.checked_mul(1).filter(|n| *n <= TIMEOUT_MAX_MINUTES) else {
+                        self.reply(
+                            conv,
+                            &format!("❌ 分钟数需 ≤ {TIMEOUT_MAX_MINUTES}（30 天）"),
+                            hint,
+                        )
+                        .await;
+                        return;
+                    };
                     let d = Duration::from_secs(n * 60);
                     self.idle_overrides.lock().await.insert(conv.0.clone(), d);
                     self.reply(
@@ -625,7 +637,15 @@ impl Dispatcher {
             return;
         }
         // 模型名合理性：单个词 + 长度上限（防把整段文本当模型名传给 CLI）。
-        if arg.chars().count() > 64 || arg.split_whitespace().count() != 1 {
+        // L13（code-review v8）：字符白名单——ACP 路径模型名会拼进命令串过
+        // shell_words::split，空格/引号/`=` 前缀可拆出多余 argv 改变 spawn 行为。
+        if arg.chars().count() > 64
+            || arg.split_whitespace().count() != 1
+            || !arg
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._-[]:".contains(c))
+            || arg.starts_with('=')
+        {
             self.reply(
                 conv,
                 "模型名须为单个词且不超过 64 字符（如 sonnet / opus / haiku 或完整模型 id）。",

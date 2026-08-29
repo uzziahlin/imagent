@@ -189,10 +189,14 @@ pub fn resolve_download_url(
     full_url: Option<&str>,
 ) -> Result<String> {
     if let Some(p) = encrypt_query_param.filter(|s| !s.is_empty()) {
-        Ok(format!(
-            "https://{}/c2c/download?encrypted_query_param={p}",
-            CDN_HOSTS[0]
-        ))
+        // L12（code-review v8）：加密参数 percent-encode 后再拼 URL——含 &
+        // 等保留字符时裸拼会截断参数（与 upload 路径 P2-13 同法）。
+        let base = format!("https://{}/c2c/download", CDN_HOSTS[0]);
+        let mut url = url::Url::parse(&base)
+            .map_err(|e| CoreError::Platform("ilink", format!("下载 URL 构造失败: {e}")))?;
+        url.query_pairs_mut()
+            .append_pair("encrypted_query_param", p);
+        Ok(url.into())
     } else if let Some(u) = full_url.filter(|s| !s.is_empty()) {
         assert_cdn_host(u)?;
         Ok(u.to_string())

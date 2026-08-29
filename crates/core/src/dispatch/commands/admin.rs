@@ -716,8 +716,15 @@ impl Dispatcher {
             },
             "batch_window_ms" => match value.parse::<u64>() {
                 Ok(ms) => {
-                    *self.batch_window.write() = Duration::from_millis(ms);
-                    format!("✅ batch_window_ms = {ms}")
+                    // L5（code-review v8）：热改复用启动侧上限（10s）——巨值会让
+                    // runner 永睡且不在 running 注册表、/stop 救不回。
+                    const BATCH_WINDOW_MAX_MS: u64 = 10_000;
+                    if ms > BATCH_WINDOW_MAX_MS {
+                        format!("❌ batch_window_ms 上限 {BATCH_WINDOW_MAX_MS}（当前 {ms}）")
+                    } else {
+                        *self.batch_window.write() = Duration::from_millis(ms);
+                        format!("✅ batch_window_ms = {ms}")
+                    }
                 }
                 Err(_) => "用法：batch_window_ms <毫秒数，0=关闭>".into(),
             },
