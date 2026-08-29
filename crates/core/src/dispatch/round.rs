@@ -668,8 +668,16 @@ impl Dispatcher {
             .ask_count(&conv.0)
             .await
             .saturating_sub(asks_at_start);
+        // 真机校准（2026-08）：60s 内有过审批决定 → 用户显然在线（刚批准完），
+        // 跳过完成推送（实测 3m11s 轮次批准后数十秒完成仍推送，纯打扰）。
+        let user_present = self
+            .router
+            .secs_since_decision(&conv.0)
+            .await
+            .map_or(false, |s| s < 60);
         if outcome.terminal
             && should_buzz_done(elapsed, asks_delta)
+            && !user_present
             && self.platform.supports_urgent_text()
         {
             let text = task_done_buzz_text(
