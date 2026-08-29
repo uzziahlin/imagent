@@ -205,6 +205,9 @@ impl FeishuPlatform {
                 .app_id(app_id.clone())
                 .app_secret(app_secret.clone())
                 .base_url(base_url)
+                // M1（code-review v8）：SDK HTTP 请求超时——缺省 None 时连接黑洞
+                // 会把 token 刷新（持写锁）乃至全进程发送永久挂起。
+                .req_timeout(Duration::from_secs(30))
                 .build(),
         );
 

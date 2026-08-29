@@ -226,7 +226,14 @@ impl AcpBackend {
         }
     }
 
-    /// 建立 transport：真机走 `AcpAgent`（spawn claude-agent-acp 子进程），测试可注入
+    /// 建立 transport：真机走 `AcpAgent`（spawn claude-agent-acp 子进程），测试可注入。
+    ///
+    /// M2（code-review v8，已评估未修）：SDK 内部读子进程 stdout 用无上限
+    /// `lines()`、stderr 连接生命周期内无上限累积——CLI 路径的单行 8MB/stderr
+    /// 64KB 双层上限在 ACP 不生效（「cat 大文件」类超长流 OOM 面）。SDK 无
+    /// 传输层注入点（`SchemaMcpServer` 是命令 spec），修复需 (a) 中继进程封装
+    /// 或 (b) 上游 PR——记 follow-up（docs/CODE_REVIEW_v8 §M2），当前接受该
+    /// 限制（ACP 非主链路，claude-cli 已有完整上限）。
     /// in-process mock（见 [`Self::with_mock_factory`]）。W2-4：设置了运行时模型时，
     /// 命令串前导注入 `ANTHROPIC_MODEL=<model>` env（`AcpAgent::from_str` 的
     /// NAME=value 前导语法；子进程内 claude CLI 读取该 env）。
@@ -714,7 +721,8 @@ impl Backend for AcpBackend {
 /// 累积到共享状态（供 final_text）。
 ///
 /// 映射策略（best-effort，未知变体忽略并 debug 记录）：
-/// - `AgentMessageChunk`/`UserMessageChunk`（文本）→ `AgentChunk::Text`（仅 Agent 文本累计）。
+/// - `AgentMessageChunk`（文本）→ `AgentChunk::Text`（仅 Agent 文本累计）；
+///   `UserMessageChunk` 是用户消息回放，忽略（M7）。
 /// - `AgentThoughtChunk`（W2-1）→ `AgentChunk::Thought`（与正文分离，卡片折叠展示）。
 /// - `ToolCall` → `AgentChunk::ToolUse`（title 首 token 作 tool 名，raw_input 作输入，
 ///   tool_call_id 作配对 id——W2-3）。
@@ -740,7 +748,10 @@ async fn forward_update(state: &StreamState, update: SessionUpdate) {
                 None
             }
         }
-        SessionUpdate::UserMessageChunk(chunk) => text_of(&chunk.content).map(AgentChunk::Text),
+        // M7（code-review v8）：UserMessageChunk 是 agent 对用户消息的**回放**，
+        // 不是 agent 产出——此前映射 AgentChunk::Text 使每轮流式卡以用户原话
+        // 开头（展示层污染）。忽略（final_text 只累计 AgentMessageChunk，不受影响）。
+        SessionUpdate::UserMessageChunk(_) => None,
         SessionUpdate::AgentThoughtChunk(chunk) => {
             // W2-1：推理文本独立透出（Thought）——不进 agent_text / 正文流，
             // 由卡片侧折叠展示（cot 档位控制）。
@@ -874,6 +885,11 @@ fn stop_reason_str(reason: &StopReason) -> Option<String> {
 /// 对齐的工具名：title 首个 token（如 "Bash git status" → "Bash"）；无 title 回退
 /// tool_call_id。**安全关键**：若取 title 全串，approval_tools=["Bash"] 之类永不
 /// 命中，高危工具会被自动放行。
+/// M4（code-review v8）：title 缺失时不再裸回退 tool_call_id——那种形态在
+/// 审批集语义下「清单外放行」= 无询问自动放行（fail-open）。哨兵前缀使
+/// [`crate::permission::needs_approval`] 恒命中（fail-closed：必过 IM 审批）。
+pub const UNTITLED_TOOL_SENTINEL: &str = "imagent:untitled-tool";
+
 fn tool_name_of(tool_call: &agent_client_protocol::schema::v1::ToolCallUpdate) -> String {
     tool_call
         .fields
@@ -881,7 +897,7 @@ fn tool_name_of(tool_call: &agent_client_protocol::schema::v1::ToolCallUpdate) -
         .as_deref()
         .and_then(|t| t.split_whitespace().next())
         .map(str::to_string)
-        .unwrap_or_else(|| tool_call.tool_call_id.to_string())
+        .unwrap_or_else(|| format!("{UNTITLED_TOOL_SENTINEL}:{}", tool_call.tool_call_id))
 }
 
 /// 按字符截断到 n（审批卡 input 摘要用），超出加省略号。
@@ -1052,17 +1068,19 @@ mod tests {
     /// approval_tools=["Bash"] 永不命中、高危工具全部自动放行。
     #[test]
     fn tool_name_takes_first_token_of_title() {
+        // M4（code-review v8）：title 缺失改为哨兵前缀（fail-closed），不再裸
+        // 回退 tool_call_id（清单外放行 = 无询问自动放行）。
         let mut tc = ToolCallUpdate::new("tc-1", ToolCallUpdateFields::default());
         tc.fields.title = Some("Bash git status".into());
         assert_eq!(tool_name_of(&tc), "Bash");
-
-        let mut tc = ToolCallUpdate::new("tc-1", ToolCallUpdateFields::default());
-        tc.fields.title = Some("Read".into());
-        assert_eq!(tool_name_of(&tc), "Read");
-
-        // 无 title：回退 tool_call_id。
+        // 无 title：哨兵前缀 + 恒过审。
         let tc = ToolCallUpdate::new("tc-9", ToolCallUpdateFields::default());
-        assert_eq!(tool_name_of(&tc), "tc-9");
+        let name = tool_name_of(&tc);
+        assert!(name.starts_with(UNTITLED_TOOL_SENTINEL), "哨兵前缀: {name}");
+        assert!(
+            imagent_core::needs_approval(&["Bash".to_string()], &name),
+            "哨兵形态必过审（fail-closed）"
+        );
     }
 
     /// 【可配置连接上限】with_conn_limits 覆盖默认上限。
@@ -1168,7 +1186,7 @@ mod tests {
 
         match rx.try_recv().unwrap() {
             AgentChunk::ToolResult { tool, output, .. } => {
-                assert_eq!(tool, "tc-2");
+                assert!(tool.starts_with(UNTITLED_TOOL_SENTINEL), "M4 哨兵: {tool}");
                 assert!(output.contains("lines"));
             }
             other => panic!("期望 ToolResult，得到 {other:?}"),

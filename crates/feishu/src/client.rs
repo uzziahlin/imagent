@@ -30,8 +30,38 @@ use crate::proto::{MergedForwardItem, ReceiveIdKind};
 
 /// 平台名常量（错误构造用）。
 const PLATFORM: &str = "feishu";
+
+/// M1/M6（code-review v8）：模块级共享 reqwest client——此前 13 处裸
+/// `Client::new()` 每请求新建（流式卡 patch 每帧完整 TCP+TLS 握手、TIME_WAIT
+/// 堆积），且全部无超时（连接黑洞 → 调用永久挂起）。
+/// - [`api_client`]：JSON API（发消息/卡片/token）——总超时 30s；
+/// - [`dl_client`]：媒体上传/下载（50MB 流式）——仅连接超时 10s，总时长不设
+///   （流式大文件合法长传输）。
+fn api_client() -> &'static reqwest::Client {
+    static C: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("reqwest client 构建")
+    })
+}
+
+fn dl_client() -> &'static reqwest::Client {
+    static C: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("reqwest client 构建")
+    })
+}
 /// 重连退避上限（照 wecom）。
 const BACKOFF_CAP: Duration = Duration::from_secs(30);
+
+/// M5（code-review v8）：连接存活 ≥ 该时长后的断开视为「健康断连」，重置退避。
+const HEALTHY_CONN_MIN_LIFETIME: Duration = Duration::from_secs(60);
 
 /// 飞书长连接驱动：外层重连 loop 包住 SDK 的 `LarkWsClient::open`。
 ///
@@ -69,6 +99,7 @@ impl FeishuWsClient {
             let handler = EventDispatcherHandler::builder()
                 .payload_sender(payload_tx.clone())
                 .build();
+            let opened_at = std::time::Instant::now();
             tokio::select! {
                 res = LarkWsClient::open(self.ws_config.clone(), handler) => match res {
                     Ok(()) => {
@@ -76,7 +107,17 @@ impl FeishuWsClient {
                         backoff = Duration::from_secs(1);
                     }
                     Err(WsClientError::ConnectionClosed { reason }) => {
-                        warn!(target: "feishu", ?reason, "长连接关闭，重连");
+                        // M5（code-review v8）：服务端按 PingInterval 例行踢空闲
+                        // 连接也走本分支——存活 ≥60s 视为健康断连，重置退避（否则
+                        // 例行踢连累计翻倍到 30s 封顶且永不回落，长跑进程偶发
+                        // 30s 无响应越来越频繁）。
+                        if opened_at.elapsed() >= HEALTHY_CONN_MIN_LIFETIME {
+                            info!(target: "feishu", ?reason, uptime_secs = opened_at.elapsed().as_secs(),
+                                "长连接健康期后被服务端关闭，重置退避重连");
+                            backoff = Duration::from_secs(1);
+                        } else {
+                            warn!(target: "feishu", ?reason, "长连接关闭，重连");
+                        }
                     }
                     Err(e) => {
                         warn!(target: "feishu", error = %e, "长连接异常，重连");
@@ -186,7 +227,7 @@ pub async fn create_reaction(
 ) -> imagent_core::Result<String> {
     let base = core_config.base_url().trim_end_matches('/').to_string();
     let url = format!("{base}/open-apis/im/v1/messages/{message_id}/reactions");
-    let client = reqwest::Client::new();
+    let client = api_client().clone();
     let resp = client
         .post(&url)
         .bearer_auth(token)
@@ -228,7 +269,7 @@ pub async fn delete_reaction(
     let url = format!(
         "{base}/open-apis/im/v1/messages/{message_id}/reactions/{reaction_id}"
     );
-    let client = reqwest::Client::new();
+    let client = api_client().clone();
     let resp = client
         .delete(&url)
         .bearer_auth(token)
@@ -270,7 +311,7 @@ pub async fn urgent_app_buzz(
     let url = format!(
         "{base}/open-apis/im/v1/messages/{message_id}/urgent_app?user_id_type=open_id"
     );
-    let client = reqwest::Client::new();
+    let client = api_client().clone();
     let resp = client
         .patch(&url)
         .bearer_auth(token)
@@ -456,7 +497,7 @@ async fn cardkit_resp(resp: reqwest::Response, op: &str) -> imagent_core::Result
 /// 需 `cardkit:card:write` 权限；失败时调用方降级走 raw 卡片（msg: 句柄）。
 pub async fn create_card_entity(token: &str, card_json: &str) -> imagent_core::Result<String> {
     retry_on_rate_limit!(async {
-        let client = reqwest::Client::new();
+        let client = api_client().clone();
         let resp = client
             .post(format!("{CARDKIT_BASE}/cards"))
             .bearer_auth(token)
@@ -498,7 +539,7 @@ pub async fn patch_card_element(
     // 字符串**（双重编码，同 create 实体的 card_json）；此前直传 `content` 字段
     // 被 99992402 "field validation failed" 拒绝。
     let partial = json!({ "content": content }).to_string();
-    let client = reqwest::Client::new();
+    let client = api_client().clone();
     let resp = client
         .patch(format!(
             "{CARDKIT_BASE}/cards/{card_id}/elements/{element_id}"
@@ -523,7 +564,7 @@ pub async fn patch_card_settings(
     settings_json: &str,
     sequence: i64,
 ) -> imagent_core::Result<()> {
-    let client = reqwest::Client::new();
+    let client = api_client().clone();
     let resp = client
         .patch(format!("{CARDKIT_BASE}/cards/{card_id}/settings"))
         .bearer_auth(token)
@@ -561,7 +602,7 @@ async fn download_message_resource(
         let url = format!(
             "{base}/open-apis/im/v1/messages/{message_id}/resources/{file_key}?type={kind}"
         );
-        let client = reqwest::Client::new();
+        let client = dl_client().clone();
         let mut resp = client
             .get(&url)
             .bearer_auth(token)
@@ -674,7 +715,7 @@ pub async fn upload_file(
             .text("file_type", "file")
             .text("file_name", file_name.to_string())
             .part("file", part);
-        let client = reqwest::Client::new();
+        let client = dl_client().clone();
         let resp = client
             .post(&url)
             .bearer_auth(token)
@@ -731,7 +772,7 @@ pub async fn transcribe_audio(
     let body = asr_request_body(&pcm);
     let base = core_config.base_url().trim_end_matches('/').to_string();
     let url = format!("{base}/open-apis/speech_to_text/v1/speech/file_recognize");
-    let client = reqwest::Client::new();
+    let client = api_client().clone();
     let resp = client
         .post(&url)
         .bearer_auth(token)
@@ -983,7 +1024,7 @@ pub async fn fetch_bot_open_id(
 ) -> imagent_core::Result<String> {
     let base = core_config.base_url().trim_end_matches('/').to_string();
     let url = format!("{base}/open-apis/bot/v3/info");
-    let client = reqwest::Client::new();
+    let client = api_client().clone();
     let resp = client
         .get(&url)
         .bearer_auth(token)
@@ -1187,7 +1228,7 @@ pub async fn list_merge_forward(
     let mut page_token: Option<String> = None;
     for _ in 0..10 {
         let page = retry_on_rate_limit!(async {
-            let mut req = reqwest::Client::new()
+            let mut req = api_client().clone()
                 .get(format!(
                     "{base}/open-apis/im/v1/messages/{message_id}/merge_forward"
                 ))
@@ -1261,7 +1302,7 @@ pub async fn reply_comment_nodes(
         let url = format!(
             "{base}/open-apis/drive/v1/files/{file_token}/comments/{comment_id}/replies?user_id_type=open_id"
         );
-        let client = reqwest::Client::new();
+        let client = api_client().clone();
         let resp = client
             .post(&url)
             .bearer_auth(token)
@@ -1307,7 +1348,7 @@ pub async fn reply_message(
     retry_on_rate_limit!(async {
         let base = core_config.base_url().trim_end_matches('/').to_string();
         let url = format!("{base}/open-apis/im/v1/messages/{message_id}/reply");
-        let client = reqwest::Client::new();
+        let client = api_client().clone();
         let resp = client
             .post(&url)
             .bearer_auth(token)
