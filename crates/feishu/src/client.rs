@@ -174,6 +174,54 @@ macro_rules! retry_on_rate_limit {
     }};
 }
 
+/// 应用内加急（buzz）已有消息（真机校准 2026-08）：PATCH
+/// `/im/v1/messages/{message_id}/urgent_app`，body `user_id_list`——目标用户
+/// 收到应用内强提醒弹窗，**不产生新消息**（强提醒迁移到卡上的关键：审批催办
+/// 对审批卡、完成提醒对流式终态卡，替代此前另发一条 buzz 文本）。
+///
+/// 仅可加急机器人自己发的消息（本网关的卡片均满足）；`im:message` 系权限
+/// 缺失 / 未读加急超 200 条等场景接口报错——调用方回退 buzz 文本（fail-soft）。
+pub async fn urgent_app_buzz(
+    core_config: &CoreConfig,
+    token: &str,
+    message_id: &str,
+    user_open_id: &str,
+) -> imagent_core::Result<()> {
+    let base = core_config.base_url().trim_end_matches('/').to_string();
+    let url = format!(
+        "{base}/open-apis/im/v1/messages/{message_id}/urgent_app?userIdType=open_id"
+    );
+    let client = reqwest::Client::new();
+    let resp = client
+        .patch(&url)
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "user_id_list": [user_open_id] }))
+        .send()
+        .await
+        .map_err(|e| {
+            imagent_core::CoreError::Platform(PLATFORM, format!("urgent_app_buzz: {e}"))
+        })?;
+    let status = resp.status().as_u16();
+    let body = resp.text().await.map_err(|e| {
+        imagent_core::CoreError::Platform(PLATFORM, format!("urgent_app_buzz: {e}"))
+    })?;
+    let v: serde_json::Value = serde_json::from_str(&body).map_err(|_| {
+        imagent_core::CoreError::Platform(
+            PLATFORM,
+            format!("urgent_app_buzz: HTTP {status} 非 JSON 响应: {body:?}"),
+        )
+    })?;
+    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
+        return Err(imagent_core::CoreError::Platform(
+            PLATFORM,
+            format!("urgent_app_buzz: code={code} msg={msg}"),
+        ));
+    }
+    Ok(())
+}
+
 /// 发送一条文本消息（HTTP OpenAPI，低层写法，手动注入 token）。
 ///
 /// `core_config` 为发消息用配置；`token` 为当前 `tenant_access_token`；
