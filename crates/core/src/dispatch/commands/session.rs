@@ -620,18 +620,42 @@ impl Dispatcher {
                 .map(|q| q.len())
                 .unwrap_or(0)
         };
-        let text = match (aborted, hard, queued) {
-            (true, _, 0) => "🛑 已中断当前任务".to_string(),
-            (true, false, n) => format!(
-                "🛑 已中断当前任务（{n} 条排队消息已保留，将自动转入新一轮；要全部丢弃可发 /stop all）"
+        // 真机校准（2026-08）：回执走命令卡（卡片平台渲染卡片，纯文本平台由
+        // trait 默认降级文本）——中断时刻本就伴随 ⏹ 终态卡 + 快捷操作卡，夹
+        // 一条纯文本 ack 视觉割裂。标题承载结论，正文承载排队语义。
+        let (title, body): (&str, String) = match (aborted, hard, queued) {
+            (true, _, 0) => (
+                "🛑 已中断当前任务",
+                "本轮已停止，进行到的进度已保留，下条消息可续接（全新开始可 /new）。".into(),
             ),
-            (true, true, n) => format!("🛑 已中断当前任务（丢弃 {n} 条排队消息）"),
-            (false, _, 0) => "ℹ️ 当前没有运行中的任务".to_string(),
-            (false, false, n) => {
-                format!("ℹ️ 当前没有运行中的任务（{n} 条消息排队中，将在下一轮处理）")
-            }
-            (false, true, n) => format!("ℹ️ 当前没有运行中的任务（丢弃 {n} 条排队消息）"),
+            (true, false, n) => (
+                "🛑 已中断当前任务",
+                format!("{n} 条排队消息已保留，将自动转入新一轮；要全部丢弃可发 /stop all。"),
+            ),
+            (true, true, n) => ("🛑 已中断当前任务", format!("已丢弃 {n} 条排队消息。")),
+            (false, _, 0) => ("ℹ️ 当前没有运行中的任务", String::new()),
+            (false, false, n) => (
+                "ℹ️ 当前没有运行中的任务",
+                format!("{n} 条消息排队中，将在下一轮处理。"),
+            ),
+            (false, true, n) => (
+                "ℹ️ 当前没有运行中的任务",
+                format!("已丢弃 {n} 条排队消息。"),
+            ),
         };
-        self.reply(conv, &text, hint).await;
+        if let Err(e) = self
+            .platform
+            .send_command_card(conv, title, &body, &[], hint)
+            .await
+        {
+            // 卡片失败退回文本（best-effort 回执，不让中断本身报错）。
+            warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "中断回执卡片失败，退回文本");
+            let text = if body.is_empty() {
+                title.to_string()
+            } else {
+                format!("{title}\n{body}")
+            };
+            self.reply(conv, &text, hint).await;
+        }
     }
 }

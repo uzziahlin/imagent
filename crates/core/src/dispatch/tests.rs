@@ -1978,10 +1978,14 @@ async fn stop_drops_queued_messages() {
     ctx.disp.handle(msg("c1", "alice", "/stop all")).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), runner).await;
     let inbox = ctx.inbox.lock().await.clone();
+    // 真机校准（2026-08）：回执改命令卡——mock 走 trait 默认文本降级
+    //（title + body 两行），标题与丢弃条数分别断言。
     assert!(
-        inbox
-            .iter()
-            .any(|t| t.contains("已中断当前任务（丢弃 2 条排队消息）")),
+        inbox.iter().any(|t| t.contains("已中断当前任务")),
+        "应回中断标题: {inbox:?}"
+    );
+    assert!(
+        inbox.iter().any(|t| t.contains("已丢弃 2 条排队消息")),
         "应回丢弃条数: {inbox:?}"
     );
     let prompts = ctx.prompts.lock().await.clone();
