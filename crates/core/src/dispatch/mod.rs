@@ -171,6 +171,13 @@ fn approval_buzz_text(tool_name: &str, remaining: Duration) -> String {
     )
 }
 
+/// 审批卡 note 行的倒计时警示（真机校准 2026-08：催办双通道之一——patch 卡
+/// 片 note 行，上下文内可见；与 buzz 文本同分钟数）。
+fn approval_buzz_note(remaining: Duration) -> String {
+    let mins = remaining.as_secs().div_ceil(60).max(1);
+    format!("⏰ 剩 {mins} 分钟将自动拒绝——点按钮或 👍 均可")
+}
+
 /// Wave B-1：审批等待出口（`wait_reply_with_buzz` 的结果，与原 timeout 包裹的
 /// 三分支一一对应）。
 #[derive(Debug)]
@@ -203,9 +210,17 @@ async fn wait_reply_with_buzz(
         Ok(Ok(r)) => AskWaitOutcome::Replied(r),
         Ok(Err(_)) => AskWaitOutcome::Dropped,
         Err(_) => {
-            // 过半未决：发一次加急催办（best-effort，失败仅 log 不影响等待）。
+            // 过半未决：双通道催办（均 best-effort，失败仅 log 不影响等待）——
+            // ① patch 审批卡的 note 行为倒计时警示（卡片平台上下文内可见；
+            //    复用 P10-③ note 联动，纯文本平台 no-op）；
+            // ② 加急文本推送（buzz 弹窗——用户可能没开聊天窗口，note patch
+            //    无法主动触达；真机校准 2026-08 保留文本的根本原因）。
             let remaining = timeout.saturating_sub(started.elapsed());
             let text = approval_buzz_text(tool_name, remaining);
+            let note = approval_buzz_note(remaining);
+            let _ = platform
+                .note_queued_on_ask(conv, &note, &ReplyHint::None)
+                .await;
             if let Err(e) = platform
                 .send_urgent_text(conv, &text, &ReplyHint::None)
                 .await
