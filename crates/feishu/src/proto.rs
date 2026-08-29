@@ -641,8 +641,10 @@ pub fn extract_audio_key(content: &str) -> Option<String> {
 /// W3-2：表情回应事件（`im.message.reaction.created_v1`）→ 快速审批回复。
 ///
 /// 用户在**审批卡**上回应 👍（y）/ 👎（n）≈ 点允许/拒绝按钮——比点开卡片按
-/// 按钮快得多的轻交互。payload 形态**离线按文档猜**（`event.operator_id.open_id`
-/// + `event.reaction.emoji_key` / `message_id`），缺任一字段返回 None（普通消息上的 emoji 回应不产生任何副作用）。
+/// 按钮快得多的轻交互。payload 形态按**真机实测**（2026-08 校准：
+/// `event.user_id.open_id` + `event.reaction_type.emoji_type` +
+/// `event.message_id` 顶层；旧文档形态作回退），缺任一字段返回 None
+/// （普通消息上的 emoji 回应不产生任何副作用）。
 ///
 /// 仅映射两个保守 emoji；返回 `(dedup_key, 操作者 open_id, 被回应的消息 id, "y"/"n")`。
 pub fn parse_reaction_event(payload: &[u8]) -> Option<(String, String, String, &'static str)> {
@@ -657,22 +659,52 @@ pub fn parse_reaction_event(payload: &[u8]) -> Option<(String, String, String, &
         return None;
     }
     let event = v.get("event")?;
-    let operator = event
-        .get("operator_id")
-        .and_then(|o| o.get("open_id"))
-        .and_then(|o| o.as_str())
-        .filter(|o| !o.is_empty())?;
-    let reaction = event.get("reaction")?;
-    let emoji = reaction.get("emoji_key").and_then(|e| e.as_str())?;
+    // 真机校准（2026-08）：真实 payload 为 event.user_id.open_id /
+    // event.reaction_type.emoji_type / event.message_id（顶层）。文档旧形态
+    //（operator_id / reaction.emoji_key）作回退兼容。
+    let operator = ["user_id", "operator_id"]
+        .iter()
+        .find_map(|k| {
+            event
+                .get(k)
+                .and_then(|o| o.get("open_id"))
+                .and_then(|o| o.as_str())
+                .filter(|o| !o.is_empty())
+        })
+        .or_else(|| {
+            event
+                .get("operator")
+                .and_then(|o| o.get("operator_id"))
+                .and_then(|o| o.get("open_id"))
+                .and_then(|o| o.as_str())
+                .filter(|o| !o.is_empty())
+        })?;
+    let emoji = event
+        .get("reaction_type")
+        .and_then(|r| r.get("emoji_type"))
+        .and_then(|e| e.as_str())
+        .or_else(|| {
+            event
+                .get("reaction")
+                .and_then(|r| r.get("emoji_key"))
+                .and_then(|e| e.as_str())
+        })?;
     let reply = match emoji {
         "THUMBSUP" => "y",
         "THUMBSDOWN" => "n",
         _ => return None,
     };
-    let message_id = reaction
+    let message_id = event
         .get("message_id")
         .and_then(|m| m.as_str())
-        .filter(|m| m.starts_with("om_"))?;
+        .filter(|m| m.starts_with("om_"))
+        .or_else(|| {
+            event
+                .get("reaction")
+                .and_then(|r| r.get("message_id"))
+                .and_then(|m| m.as_str())
+                .filter(|m| m.starts_with("om_"))
+        })?;
     let dedup = v
         .get("header")
         .and_then(|h| h.get("event_id"))
@@ -1813,6 +1845,30 @@ mod tests {
 
     /// W3-2：表情回应事件——👍/👎 映射 y/n；其它 emoji / 缺字段 / 非目标事件
     /// 均返回 None（fail-soft）。
+    /// W3-2 真机校准回归：2026-08-29 实测 payload 原样（user_id / reaction_type
+    /// 嵌套 / message_id 顶层）——旧解析器按文档猜字段路径，实测全部落空、
+    /// 事件被当非目标丢弃（用户点 👍 无反应）。
+    #[test]
+    fn parse_reaction_event_real_device_payload() {
+        let payload = br#"{"schema":"2.0","header":{"event_id":"evt_real1","event_type":"im.message.reaction.created_v1","token":"","create_time":"1787969732208","tenant_key":"t","app_id":"cli_x"},"event":{"action_time":"1787969732208","message_id":"om_x100b6610454b0ca4b1fa2d9aaef7004","operator_type":"user","reaction_type":{"emoji_type":"THUMBSUP"},"user_id":{"open_id":"ou_a0c072f42e7c1b0995b7fd4841b4671b"}}}"#;
+        let (dedup, operator, mid, reply) = parse_reaction_event(payload).expect("真机形态应解析成功");
+        assert_eq!(operator, "ou_a0c072f42e7c1b0995b7fd4841b4671b");
+        assert_eq!(mid, "om_x100b6610454b0ca4b1fa2d9aaef7004");
+        assert_eq!(reply, "y");
+        assert_eq!(dedup, "evt_real1");
+        // 👎 → n；非 👍/👎 emoji → None（无副作用）。（payload 为纯 ASCII JSON，
+        // 经 String 替换安全。）
+        let as_str = |b: &[u8]| String::from_utf8(b.to_vec()).unwrap();
+        let dn = as_str(payload).replace("THUMBSUP", "THUMBSDOWN");
+        assert!(
+            parse_reaction_event(dn.as_bytes())
+                .map(|(_, _, _, r)| r == "n")
+                .unwrap_or(false)
+        );
+        let wave = as_str(payload).replace("THUMBSUP", "WAVE");
+        assert!(parse_reaction_event(wave.as_bytes()).is_none());
+    }
+
     #[test]
     fn parse_reaction_event_maps_thumbs() {
         let mk = |emoji: &str| {
