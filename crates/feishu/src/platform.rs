@@ -1225,48 +1225,6 @@ impl FeishuPlatform {
         }
     }
 
-    /// P8-2：尝试复用本 conv 的空闲询问卡——patch 成新询问（省一条新消息）。
-    /// 槽不存在 / 挂着未决询问（并发）→ None（调用方走发新卡路径）；patch 失败
-    /// 也回 None 降级发新卡（旧卡标记回收失败仅记日志，不影响正确性）。
-    async fn try_reuse_ask_slot(
-        &self,
-        conv_id: &str,
-        card_json: &str,
-        request_id: &str,
-        tool_name: &str,
-        render: AskRender,
-    ) -> Option<String> {
-        let msg_id = claim_free_slot(&mut *self.ask_slots.lock().await, conv_id, request_id)?;
-        let patch = self
-            .with_token(|t| {
-                let msg_id = msg_id.clone();
-                let card_json = card_json.to_string();
-                async move { patch_card(&self.core_config, &t, &msg_id, &card_json).await }
-            })
-            .await;
-        match patch {
-            Ok(()) => {
-                let sender = self.last_sender(conv_id).await;
-                self.note_card_tail(conv_id, &msg_id).await;
-                self.record_pending_ask(request_id, conv_id, &msg_id, tool_name, &sender)
-                    .await;
-                // 复用成功：槽的渲染输入换成新询问（note 联动按新参数重画）。
-                if let Some(slot) = self.ask_slots.lock().await.get_mut(conv_id) {
-                    slot.render = render;
-                }
-                self.mark_ask_sent(conv_id).await;
-                Some(msg_id)
-            }
-            Err(e) => {
-                warn!(target: "feishu", error = %e, "复用询问卡 patch 失败，另发新卡");
-                if let Some(slot) = self.ask_slots.lock().await.get_mut(conv_id) {
-                    slot.pending_req = None;
-                }
-                None
-            }
-        }
-    }
-
     /// P8-2：发送静态卡片（终态结果下沉用）：普通 conv 直接发，话题群 reply 进
     /// 原话题。Wave B-6：普通群优先 reply 引用发起消息（锚点）；Wave B-5：带
     /// 发起者标注行。发送失败如实上抛（调用方 warn——结果已在流式卡里兜底过一次）。
@@ -1429,36 +1387,6 @@ impl FeishuPlatform {
         }
         Ok(())
     }
-}
-
-/// 复用窗口：询问卡收敛后多久内可被原地 patch 复用。窗口内 = 卡大概率仍是
-/// 会话尾部（同轮顺序审批，秒级间隔）；跨轮次（分钟级）结果卡/新消息早已把
-/// 旧卡顶离视口——原地 patch 等于隐形询问（真机校准 2026-08 实测）。宁可多
-/// 一张新卡，不可让询问不可见。
-const ASK_SLOT_REUSE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// P8-2：认领空闲复用槽（纯逻辑，便于单测）：槽空闲**且收敛未超窗** → 绑定新
-/// request_id 并返回卡 msg_id（调用方 patch 该卡成新询问）；槽不存在 / 已挂
-/// 未决询问（并发中，不能顶掉别人还没答的）/ 收敛超窗（卡已被顶离视口）→
-/// None（调用方走发新卡路径）。
-fn claim_free_slot(
-    slots: &mut HashMap<String, AskSlot>,
-    conv_id: &str,
-    request_id: &str,
-) -> Option<String> {
-    let slot = slots.get_mut(conv_id)?;
-    if slot.pending_req.is_some() {
-        return None;
-    }
-    if slot
-        .resolved_at
-        .map_or(true, |t| t.elapsed() > ASK_SLOT_REUSE_WINDOW)
-    {
-        return None;
-    }
-    slot.pending_req = Some(request_id.to_string());
-    slot.resolved_at = None;
-    Some(slot.msg_id.clone())
 }
 
 /// Wave B-8：config 秒数 → 话题免 @ 窗口时长（0 = 关闭豁免；纯函数便于单测）。
@@ -2054,12 +1982,6 @@ impl Platform for FeishuPlatform {
                 input: input_summary.to_string(),
                 sender: sender.clone(),
             };
-            if let Some(mid) = self
-                .try_reuse_ask_slot(&conv.0, &card_json, request_id, tool_name, render)
-                .await
-            {
-                return Ok(Some(mid));
-            }
             return match self
                 .with_token(|t| {
                     let root_id = root_id.clone();
@@ -2142,14 +2064,10 @@ impl Platform for FeishuPlatform {
             input: input_summary.to_string(),
             sender,
         };
-        // P8-2：优先复用本 conv 已收敛的询问卡（原地 patch 成新询问）——顺序
-        // 审批不再每条刷一张新卡把流式卡顶离视口。
-        if let Some(mid) = self
-            .try_reuse_ask_slot(&conv.0, &card_json, request_id, tool_name, render.clone())
-            .await
-        {
-            return Ok(Some(mid));
-        }
+        // 真机校准（2026-08-30）：不再复用旧询问卡——跨轮复用曾致「隐形审批」，
+        // 残留旧卡又让用户点错（实测两次）。每次询问都发**新卡**；顺序审批多卡
+        // 的代价（顶走流式卡）远小于复用的认知负担。ask_slots 仍作「当前未决
+        // 询问卡」登记（note 联动 / reaction 路由用），仅不再回收复用。
         match self
             .with_token(|t| {
                 let receive_id = receive_id.clone();
@@ -2887,72 +2805,6 @@ mod tests {
             let _ = std::fs::remove_file(base.join(f));
         }
         let _ = dir;
-    }
-
-    /// P8-2：复用槽认领——空闲可认领、pending 拒绝、释放后可再认领。
-    #[test]
-    fn ask_slot_claim_and_free() {
-        let mut slots = HashMap::new();
-        assert!(
-            claim_free_slot(&mut slots, "c1", "r1").is_none(),
-            "无槽不认领"
-        );
-        slots.insert(
-            "c1".into(),
-            AskSlot {
-                msg_id: "m1".into(),
-                pending_req: None,
-                resolved_at: Some(std::time::Instant::now()),
-                render: AskRender {
-                    question: false,
-                    tool_name: "Bash".into(),
-                    input: "{}".into(),
-                    sender: String::new(),
-                },
-            },
-        );
-        assert_eq!(
-            claim_free_slot(&mut slots, "c1", "r1").as_deref(),
-            Some("m1"),
-            "空闲槽认领返回卡 id"
-        );
-        assert!(
-            claim_free_slot(&mut slots, "c1", "r2").is_none(),
-            "未决询问挂着时不认领（并发另发新卡）"
-        );
-        // 释放（匹配 request_id 才释放）。
-        if let Some(slot) = slots.get_mut("c1") {
-            if slot.pending_req.as_deref() == Some("r2") {
-                slot.pending_req = None;
-                slot.resolved_at = Some(std::time::Instant::now());
-            }
-        }
-        assert!(
-            claim_free_slot(&mut slots, "c1", "r3").is_none(),
-            "request_id 不匹配不释放"
-        );
-        if let Some(slot) = slots.get_mut("c1") {
-            if slot.pending_req.as_deref() == Some("r1") {
-                slot.pending_req = None;
-                slot.resolved_at = Some(std::time::Instant::now());
-            }
-        }
-        assert_eq!(
-            claim_free_slot(&mut slots, "c1", "r3").as_deref(),
-            Some("m1"),
-            "释放后可再认领"
-        );
-        // 真机校准（2026-08）：收敛超窗的槽不再认领——卡已被结果卡/新消息顶
-        // 离视口，原地 patch 等于隐形询问（实测用户「卡住」直到超时催办）。
-        if let Some(slot) = slots.get_mut("c1") {
-            slot.pending_req = None;
-            slot.resolved_at = std::time::Instant::now()
-                .checked_sub(ASK_SLOT_REUSE_WINDOW + std::time::Duration::from_secs(60));
-        }
-        assert!(
-            claim_free_slot(&mut slots, "c1", "r4").is_none(),
-            "收敛超窗不认领（另发新卡保证可见）"
-        );
     }
 
     /// P8-2：顶起标记——send_card 清零、发询问卡置位、终态取走即清。

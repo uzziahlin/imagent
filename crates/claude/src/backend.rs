@@ -376,6 +376,10 @@ impl Backend for ClaudeBackend {
             cmd.arg("-p")
                 .arg("--input-format")
                 .arg("stream-json");
+            // 真机校准（2026-08-30）：`stdio` 特殊值把审批接到 stdio 控制通道
+            //（SDK 同款接线）——不传则 claude 对未批工具**直接拒绝**不发
+            // control_request（实测）。
+            cmd.arg("--permission-prompt-tool").arg("stdio");
             Some(imagent_core::backend_common::ControlIo {
                 sock: permission_sock_path(),
                 conv_id: conv_id.to_string(),
@@ -515,25 +519,32 @@ fn claude_parse(line: &str) -> CliEvent {
     // 响应防挂起）。字段形态**待真机校准**（SDK 公开协议按文档建模）。
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
         if v.get("type").and_then(|t| t.as_str()) == Some("control_request") {
+            // 真机校准（2026-08-30 实测 2.1.250）：payload 嵌套在 `request` 键下
+            //（subtype/tool_name/input 全在内层）；顶层形态作回退。
+            let req = v.get("request");
+            let pick = |top: &str, inner: &str| -> Option<String> {
+                v.get(top)
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        req.and_then(|r| r.get(inner))
+                            .and_then(|x| x.as_str())
+                            .map(str::to_string)
+                    })
+            };
             let request_id = v
                 .get("request_id")
                 .and_then(|r| r.as_str())
                 .unwrap_or("")
                 .to_string();
-            let subtype = v
-                .get("subtype")
-                .and_then(|r| r.as_str())
-                .unwrap_or("")
-                .to_string();
-            let tool_name = v
-                .get("tool_name")
-                .or_else(|| v.get("tool"))
-                .and_then(|r| r.as_str())
-                .unwrap_or("")
-                .to_string();
+            let subtype = pick("subtype", "subtype").unwrap_or_default();
+            let tool_name = pick("tool_name", "tool_name")
+                .or_else(|| pick("tool", "tool_name"))
+                .unwrap_or_default();
             let input = v
                 .get("input")
-                .or_else(|| v.get("arguments"))
+                .cloned()
+                .or_else(|| req.and_then(|r| r.get("input")).cloned())
                 .map(|i| i.to_string())
                 .unwrap_or_else(|| "{}".into());
             return CliEvent::ControlRequest {
@@ -853,6 +864,24 @@ mod tests {
             claude_parse(r#"{"type":"system","subtype":"init","session_id":"s1"}"#),
             CliEvent::Session(ref s) if s == "s1"
         ));
+    }
+
+    /// 真机校准（2026-08-30 实测 2.1.250）：control_request payload 嵌套在
+    /// `request` 键下（subtype/tool_name/input 全在内层）。
+    #[test]
+    fn claude_parse_control_request_nested_shape() {
+        let ev = claude_parse(
+            r#"{"type":"control_request","request_id":"rid-1","request":{"subtype":"can_use_tool","tool_name":"Bash","display_name":"Bash","input":{"command":"ls","description":"x"},"tool_use_id":"call_1"}}"#,
+        );
+        match ev {
+            CliEvent::ControlRequest { request_id, subtype, tool_name, input } => {
+                assert_eq!(request_id, "rid-1");
+                assert_eq!(subtype, "can_use_tool");
+                assert_eq!(tool_name, "Bash");
+                assert!(input.contains("command"));
+            }
+            other => panic!("应为 ControlRequest: {other:?}"),
+        }
     }
 
     /// SDK 式 stdin user 消息形态（--input-format stream-json 的 prompt 投递）。
