@@ -112,6 +112,10 @@ pub struct FeishuPlatform {
     card_footers: Arc<Mutex<HashMap<String, String>>>,
     /// P10-③：审批卡 note 行缓存（per conv）——排队计数不变不重画。
     ask_notes: Arc<Mutex<HashMap<String, String>>>,
+    /// 每会话最新卡片的平台消息 id（真机校准 2026-08）：强提醒（urgent_app）
+    /// 的加急对象——审批催办对审批卡、完成提醒对流式终态卡，卡直接弹通知而
+    /// 非另发 buzz 文本。send_card / update_card / 审批卡登记时刷新。
+    card_tail: Arc<Mutex<HashMap<String, String>>>,
     /// `/reconnect` 强制重连信号（与 WS run task 共享，P4-7）。
     reconnect: Arc<tokio::sync::Notify>,
     /// 已解析的入站消息 channel，`recv` 直接 await。
@@ -804,6 +808,7 @@ impl FeishuPlatform {
             card_seqs: Arc::new(Mutex::new(HashMap::new())),
             card_footers: Arc::new(Mutex::new(HashMap::new())),
             ask_notes: Arc::new(Mutex::new(HashMap::new())),
+            card_tail: Arc::new(Mutex::new(HashMap::new())),
             reconnect,
             inbound_rx: Arc::new(Mutex::new(inbound_msg_rx)),
             pending_asks,
@@ -1082,6 +1087,13 @@ impl FeishuPlatform {
 
     /// conv 最近一次入站消息的 sender（轮次发起者近似——每 conv 轮次串行，询问
     /// 登记时取之，作群 conv 下的按钮点击者校验锚；无记录为空串=不校验）。
+    /// 刷新会话最新卡片记录（card_tail，强提醒加急对象）。
+    async fn note_card_tail(&self, conv_id: &str, msg_id: &str) {
+        if msg_id.starts_with("om_") {
+            self.card_tail.lock().await.insert(conv_id.to_string(), msg_id.to_string());
+        }
+    }
+
     async fn last_sender(&self, conv_id: &str) -> String {
         self.conv_senders
             .lock()
@@ -1126,7 +1138,12 @@ impl FeishuPlatform {
     ) -> Result<Option<String>> {
         if let Some(anchor) = self.reply_anchor(&conv.0).await {
             match reply_message(&self.core_config, token, &anchor, "interactive", content).await {
-                Ok(mid) => return Ok(mid),
+                Ok(mid) => {
+                    if let Some(m) = &mid {
+                        self.note_card_tail(&conv.0, m).await;
+                    }
+                    return Ok(mid);
+                }
                 Err(e) => {
                     // 锚点消息可能已被撤回/删除：回退 create（卡片不能因此不发）。
                     warn!(
@@ -1138,7 +1155,11 @@ impl FeishuPlatform {
                 }
             }
         }
-        send_card_msg(&self.core_config, token, receive_id, kind, content).await
+        let mid = send_card_msg(&self.core_config, token, receive_id, kind, content).await;
+        if let Ok(Some(m)) = &mid {
+            self.note_card_tail(&conv.0, m).await;
+        }
+        mid
     }
 
     /// P8-2：登记一张**新发**的询问卡：pending 登记（request_id 路由）+ 复用槽
@@ -1153,6 +1174,7 @@ impl FeishuPlatform {
         render: AskRender,
     ) {
         let sender = self.last_sender(conv_id).await;
+        self.note_card_tail(conv_id, msg_id).await;
         self.record_pending_ask(request_id, conv_id, msg_id, tool_name, &sender)
             .await;
         self.ask_slots.lock().await.insert(
@@ -1217,6 +1239,7 @@ impl FeishuPlatform {
         match patch {
             Ok(()) => {
                 let sender = self.last_sender(conv_id).await;
+                self.note_card_tail(conv_id, &msg_id).await;
                 self.record_pending_ask(request_id, conv_id, &msg_id, tool_name, &sender)
                     .await;
                 // 复用成功：槽的渲染输入换成新询问（note 联动按新参数重画）。
@@ -1743,8 +1766,31 @@ impl Platform for FeishuPlatform {
     /// Wave B：加急（buzz）文本覆写——免打扰时段（quiet_hours，本地时区）降级
     /// 为普通消息（只去掉 buzz 字段，内容与投递不变，见 config 注释）。
     async fn send_urgent_text(&self, conv: &ConvId, text: &str, hint: &ReplyHint) -> Result<()> {
-        let buzz = !self.in_quiet_hours();
-        self.send_text_opts(conv, text, hint, buzz).await
+        if self.in_quiet_hours() {
+            return self.send_text_opts(conv, text, hint, false).await;
+        }
+        // 真机校准（2026-08）：强提醒优先对**会话最新卡片**发应用内加急
+        //（urgent_app）——卡直接弹通知、不产生额外文本消息（此前 buzz 文本
+        // 与卡片流视觉割裂）。审批催办时最新卡即审批卡、完成提醒时即终态卡。
+        // 无卡 / 无接收人 / 接口失败（权限缺失等）回退 buzz 文本（fail-soft）。
+        let tail = self.card_tail.lock().await.get(&conv.0).cloned();
+        let sender = self.last_sender(&conv.0).await;
+        if let (Some(mid), false) = (tail, sender.is_empty()) {
+            match self
+                .with_token(|t| {
+                    let mid = mid.clone();
+                    let sender = sender.clone();
+                    async move { crate::client::urgent_app_buzz(&self.core_config, &t, &mid, &sender).await }
+                })
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    warn!(target: "feishu", error = %e, "应用内加急失败，回退 buzz 文本");
+                }
+            }
+        }
+        self.send_text_opts(conv, text, hint, true).await
     }
 
     /// Wave B：平台支持加急文本（text 消息体 buzz 字段）——core 据此决定长任务
@@ -2274,13 +2320,18 @@ impl Platform for FeishuPlatform {
         }
         let (receive_id, kind) = receive_target_from_conv(conv)
             .ok_or_else(|| CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0)))?;
-        self.with_token(|t| {
-            let receive_id = receive_id.clone();
-            let card_json = card_json.clone();
-            async move { send_card_msg(&self.core_config, &t, &receive_id, kind, &card_json).await }
-        })
-        .await
-        .map(|_| ())
+        let mid = self
+            .with_token(|t| {
+                let receive_id = receive_id.clone();
+                let card_json = card_json.clone();
+                async move { send_card_msg(&self.core_config, &t, &receive_id, kind, &card_json).await }
+            })
+            .await?;
+        // 结果下沉的新卡是会话最新可见卡——完成强提醒的加急对象。
+        if let Some(m) = mid {
+            self.note_card_tail(&conv.0, &m).await;
+        }
+        Ok(())
     }
 
     /// P6-3：命令交互卡片（markdown 正文 + 按钮组）。按钮点击回调由 proto 解析成
