@@ -229,7 +229,7 @@ impl Dispatcher {
                         return;
                     }
                     "/stats" => {
-                        self.cmd_stats(&conv, &hint, &parts).await;
+                        self.cmd_stats(&conv, &sender.0, &hint, &parts).await;
                         return;
                     }
                     "/audit" => {
@@ -350,8 +350,18 @@ impl Dispatcher {
         let lock = self.acquire_conv_lock(&conv.0).await;
         let _guard = lock.lock().await;
         while let Some(batch) = self.take_batch_after_window(&conv.0).await {
+            // 表情锚（全部批次消息的平台 id，首条=轮次触发）：排队⏳的消息随批
+            // 翻 OnIt→终态；非 om_（合成消息）过滤。
+            let react_mids: Vec<String> = batch
+                .iter()
+                .filter_map(|m| {
+                    m.source_msg_id
+                        .clone()
+                        .filter(|s| s.starts_with("om_"))
+                })
+                .collect();
             let merged = merge_batch(batch);
-            let round_input = self.run_agent_round(merged).await;
+            let round_input = self.run_agent_round(merged, react_mids).await;
             // W2-5：自动 compact——成功轮次的上下文水位超阈值时走既有压缩管道
             //（conv 锁仍在手，与 /compact 同串行域；无活动会话时内部跳过）。
             if let Some(in_tokens) = round_input {
