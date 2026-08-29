@@ -108,6 +108,7 @@ impl Backend for CodexBackend {
             NAME,
             // S-2：仅透传 codex(OpenAI) 所需凭据/端点（最小授权）。
             &["OPENAI_API_KEY", "OPENAI_BASE_URL"],
+            None,
         )
         .await
     }

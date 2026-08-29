@@ -32,6 +32,22 @@ pub struct ClaudeBackend {
     model: RwLock<Option<String>>,
     /// W1-2/W1-3/W1-4：config 侧运行参数（SIGHUP 经 [`Self::set_runtime_opts`] 整体替换）。
     runtime: RwLock<RuntimeOpts>,
+    /// 审批传输通道（config `claude_permission_channel`，SIGHUP 热切）：
+    /// Control = canUseTool 双工协议（SDK 现行标准，缺省）；Mcp = 旧
+    /// `--permission-prompt-tool` 机制（legacy 回退）。
+    permission_channel: RwLock<PermissionChannel>,
+}
+
+/// claude 审批传输通道（见 [`ClaudeBackend::permission_channel`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PermissionChannel {
+    /// canUseTool：`--input-format stream-json` 双工，审批经 control_request/
+    /// control_response 走 stdin/stdout，复用 permission.sock 路由到 IM。
+    #[default]
+    Control,
+    /// MCP `--permission-prompt-tool`（legacy）：MCP 子进程 + UDS + 每轮临时
+    /// mcp_*.json——保留为回退通道（真机校准有问题时 config 切回）。
+    Mcp,
 }
 
 /// W1：config 注入的 claude 运行参数（一次锁读全取，避免 run 热路径多次加锁）。
@@ -56,6 +72,7 @@ impl ClaudeBackend {
             ask_timeout: std::time::Duration::from_secs(300),
             model: RwLock::new(None),
             runtime: RwLock::new(RuntimeOpts::default()),
+            permission_channel: RwLock::new(PermissionChannel::default()),
         }
     }
 
@@ -66,6 +83,7 @@ impl ClaudeBackend {
             ask_timeout: std::time::Duration::from_secs(300),
             model: RwLock::new(None),
             runtime: RwLock::new(RuntimeOpts::default()),
+            permission_channel: RwLock::new(PermissionChannel::default()),
         }
     }
 
@@ -82,11 +100,22 @@ impl ClaudeBackend {
             ask_timeout,
             model: RwLock::new(None),
             runtime: RwLock::new(RuntimeOpts::default()),
+            permission_channel: RwLock::new(PermissionChannel::default()),
         }
     }
 }
 
 impl ClaudeBackend {
+    /// 设置审批传输通道（config `claude_permission_channel`，main 启动 +
+    /// SIGHUP 调用；值已过 config 校验，lossy 兜底 control）。
+    pub fn set_permission_channel(&self, channel: &str) {
+        let ch = match channel.trim().to_ascii_lowercase().as_str() {
+            "mcp" => PermissionChannel::Mcp,
+            _ => PermissionChannel::Control,
+        };
+        *self.permission_channel.write() = ch;
+    }
+
     /// P8-4：设置 `claude_permission_mode` 透传覆盖（SIGHUP 热更新；见
     /// [`claude_native_perm_args`]）。值须已经过 config 校验归一。
     pub fn set_native_permission_mode(&self, mode: Option<String>) {
@@ -150,6 +179,20 @@ const NAME: &str = "claude-cli";
 ///   default 手动把关 = 每个提示都进 IM，全量交给用户）。与 approval_tools 可
 ///   叠加（剩余提示再按清单过滤）。旧版 CLI（<2.1.228）不认 auto 会静默回退
 ///   default（≈ask 档行为，降级安全）。
+/// Control 通道首条 stdin 消息（SDK 式 user 投递，`--input-format stream-json`）：
+/// `{"type":"user","message":{"role":"user","content":[{"type":"text","text":…}]}}`。
+/// 形态**待真机校准**（SDK 公开协议建模；resume 仍走 `--resume` flag）。
+fn sdk_user_message(prompt: &str) -> String {
+    let msg = serde_json::json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [ { "type": "text", "text": prompt } ],
+        }
+    });
+    format!("{msg}\n")
+}
+
 fn claude_native_perm_args(mode: PermissionMode, native_override: Option<&str>) -> Vec<String> {
     let native: Option<String> = match native_override {
         Some(m) => Some(m.to_string()),
@@ -321,11 +364,28 @@ impl Backend for ClaudeBackend {
         // 由 spawn_cli_backend 统一加）。
         let mut cmd = Command::new("claude");
         cmd.current_dir(workdir)
-            .arg("-p")
-            .arg(prompt)
             .arg("--output-format")
             .arg("stream-json")
             .arg("--verbose");
+        // 审批通道分流（config `claude_permission_channel`，SIGHUP 热切）：
+        // - Control（缺省）：SDK 式双工——`--input-format stream-json`，prompt 经
+        //   stdin user 消息投递，stdin 保持打开供 control_response 回写；
+        // - Mcp（legacy 回退）：`-p <prompt>` + MCP prompt-tool + 子进程/临时配置。
+        let channel = *self.permission_channel.read();
+        let control_io = if channel == PermissionChannel::Control {
+            cmd.arg("-p")
+                .arg("--input-format")
+                .arg("stream-json");
+            Some(imagent_core::backend_common::ControlIo {
+                sock: permission_sock_path(),
+                conv_id: conv_id.to_string(),
+                ask_timeout: self.ask_timeout,
+                initial_stdin_message: sdk_user_message(prompt),
+            })
+        } else {
+            cmd.arg("-p").arg(prompt);
+            None
+        };
         // 「不限制」（空/["*"]，缺省即全量）不附加 flag——claude 自身默认 = 全量工具
         //（危险操作仍受 permission_mode 审批闭环约束）；显式列表才收敛。
         if !imagent_core::backend_common::tools_unrestricted(allowed_tools) {
@@ -369,8 +429,11 @@ impl Backend for ClaudeBackend {
         // 不含 imagent 审批条目、不挂 --permission-prompt-tool）。
         let mode = *self.permission_mode.read();
         let extra = opts.extra_mcp.clone();
+        let use_control = control_io.is_some();
         let mcp_json: Option<std::path::PathBuf> = if mode.is_enabled() || extra.is_some() {
-            let sock = mode.is_enabled().then(permission_sock_path);
+            // Control 通道：审批不经 MCP（sock=None——mcp 配置只承载用户 servers，
+            // 无 imagent 条目、不挂 --permission-prompt-tool）。
+            let sock = (mode.is_enabled() && !use_control).then(permission_sock_path);
             match write_mcp_config(
                 conv_id,
                 sock.as_deref(),
@@ -382,13 +445,16 @@ impl Backend for ClaudeBackend {
             {
                 Ok(p) => {
                     cmd.arg("--mcp-config").arg(&p);
-                    if mode.is_enabled() {
+                    if mode.is_enabled() && !use_control {
                         // claude 要求 server 限定全名（mcp__<server>__<tool>）——真机
                         // 校准发现裸工具名被 CLI 2.1.x 拒绝（"MCP tool not found"）。
                         cmd.arg("--permission-prompt-tool")
                             .arg(imagent_core::mcp::qualified_tool_name());
-                        // P8-4：原生权限模式透传（auto 档缺省 auto / 显式配置覆盖），
-                        // 见 [`claude_native_perm_args`]。
+                    }
+                    if mode.is_enabled() {
+                        // P8-4：原生权限模式透传（auto 档缺省 auto / 显式配置覆盖；
+                        // 与通道正交——分类器层，两通道都在 canUseTool/prompt-tool
+                        // 之前先放行安全操作），见 [`claude_native_perm_args`]。
                         for a in
                             claude_native_perm_args(mode, self.native_perm_mode.read().as_deref())
                         {
@@ -426,6 +492,7 @@ impl Backend for ClaudeBackend {
             NAME,
             // S-2：仅透传 claude 所需凭据/端点（最小授权）。
             &["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"],
+            control_io,
         )
         .await;
         // S-6 / P3-2：run 结束（claude 子进程已退出）清理本次 mcp 配置，避免
@@ -439,6 +506,41 @@ impl Backend for ClaudeBackend {
 
 /// claude stream-json 行 → [`CliEvent`] 适配（见 [`parse_line`]）。
 fn claude_parse(line: &str) -> CliEvent {
+    // canUseTool 控制请求（--input-format stream-json 双工协议）：弱解析——
+    // type==control_request 即认，字段名容错（tool_name|tool、input|arguments），
+    // 提取失败也产生事件（subtype 透传；responder 对非 can_use_tool 回 error
+    // 响应防挂起）。字段形态**待真机校准**（SDK 公开协议按文档建模）。
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+        if v.get("type").and_then(|t| t.as_str()) == Some("control_request") {
+            let request_id = v
+                .get("request_id")
+                .and_then(|r| r.as_str())
+                .unwrap_or("")
+                .to_string();
+            let subtype = v
+                .get("subtype")
+                .and_then(|r| r.as_str())
+                .unwrap_or("")
+                .to_string();
+            let tool_name = v
+                .get("tool_name")
+                .or_else(|| v.get("tool"))
+                .and_then(|r| r.as_str())
+                .unwrap_or("")
+                .to_string();
+            let input = v
+                .get("input")
+                .or_else(|| v.get("arguments"))
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "{}".into());
+            return CliEvent::ControlRequest {
+                request_id,
+                subtype,
+                tool_name,
+                input,
+            };
+        }
+    }
     match parse_line(line) {
         ParsedEvent::Result {
             text,
@@ -705,5 +807,76 @@ mod tests {
             }
         }
         assert!(got_final, "expected a Final chunk");
+    }
+
+    /// canUseTool 控制请求解析（真机校准轮次新增）：type==control_request 弱
+    /// 解析，字段名容错（tool_name|tool、input|arguments）；未知 subtype 也透传
+    /// （responder 回 error 防挂起）；非 control_request 行不受影响。
+    #[test]
+    fn claude_parse_control_request() {
+        let ev = claude_parse(
+            r#"{"type":"control_request","request_id":"req_1","subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}"#,
+        );
+        match ev {
+            CliEvent::ControlRequest {
+                request_id,
+                subtype,
+                tool_name,
+                input,
+            } => {
+                assert_eq!(request_id, "req_1");
+                assert_eq!(subtype, "can_use_tool");
+                assert_eq!(tool_name, "Bash");
+                assert!(input.contains("command"));
+            }
+            other => panic!("应为 ControlRequest: {other:?}"),
+        }
+        // 字段容错形态（arguments / tool）。
+        let ev2 = claude_parse(
+            r#"{"type":"control_request","request_id":"r2","subtype":"can_use_tool","tool":"Read","arguments":{"file_path":"/a"}}"#,
+        );
+        assert!(matches!(
+            ev2,
+            CliEvent::ControlRequest { ref tool_name, ref subtype, .. }
+                if tool_name == "Read" && subtype == "can_use_tool"
+        ));
+        // 未知 subtype 透传（防挂起路径）。
+        assert!(matches!(
+            claude_parse(r#"{"type":"control_request","request_id":"r3","subtype":"mcp_server_op"}"#),
+            CliEvent::ControlRequest { ref subtype, .. } if subtype == "mcp_server_op"
+        ));
+        // 普通事件不受影响。
+        assert!(matches!(
+            claude_parse(r#"{"type":"system","subtype":"init","session_id":"s1"}"#),
+            CliEvent::Session(ref s) if s == "s1"
+        ));
+    }
+
+    /// SDK 式 stdin user 消息形态（--input-format stream-json 的 prompt 投递）。
+    #[test]
+    fn sdk_user_message_shape() {
+        let m = sdk_user_message("你好");
+        let v: serde_json::Value = serde_json::from_str(m.trim()).unwrap();
+        assert_eq!(v["type"], "user");
+        assert_eq!(v["message"]["role"], "user");
+        assert_eq!(v["message"]["content"][0]["type"], "text");
+        assert_eq!(v["message"]["content"][0]["text"], "你好");
+        assert!(m.ends_with('\n'), "行分隔");
+    }
+
+    /// 通道选择：Control 时 spawn 参数走 --input-format stream-json（不挂
+    /// --permission-prompt-tool）；Mcp 时走 -p <prompt> 旧路。以 flags 构造逻辑
+    /// 间接验证——run() 全链路需子进程，见真机校准。
+    #[test]
+    fn permission_channel_default_control() {
+        let b = ClaudeBackend::new();
+        assert_eq!(*b.permission_channel.read(), PermissionChannel::Control);
+        b.set_permission_channel("Mcp");
+        assert_eq!(*b.permission_channel.read(), PermissionChannel::Mcp);
+        b.set_permission_channel("control");
+        assert_eq!(*b.permission_channel.read(), PermissionChannel::Control);
+        // lossy：未知值兜底 control。
+        b.set_permission_channel("nope");
+        assert_eq!(*b.permission_channel.read(), PermissionChannel::Control);
     }
 }

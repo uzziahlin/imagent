@@ -237,6 +237,12 @@ pub struct Config {
     /// IM 权限审批模式（默认 Auto：按后端自动选档，见 [`PermissionMode::Auto`]）。
     #[serde(default)]
     pub permission_mode: PermissionMode,
+    /// claude 审批传输通道（真机校准轮次新增）："control"（缺省）= canUseTool
+    /// 双工协议（SDK 现行标准——prompt 经 stdin 投递、审批经 control_request/
+    /// control_response，免 MCP 子进程/permission.sock 监听/每轮临时配置）；
+    /// "mcp" = 旧 `--permission-prompt-tool` legacy 机制（回退通道）。SIGHUP 热切。
+    #[serde(default = "default_claude_permission_channel")]
+    pub claude_permission_channel: String,
     /// 审批集：ask/auto→ask 模式下**只有**清单内的工具走 IM 审批，其余权限
     /// 请求直接放行（记日志 + 指标）。空 = 现状（所有权限请求都过审）。
     /// 条目为工具名，支持尾部 `*` 前缀匹配（如 `mcp__*`）。仅 claude-cli 生效
@@ -415,6 +421,10 @@ pub struct Config {
 /// 2026-08 起：**缺省 = 全部工具**（`["*"]` 语义——不指定即不收敛，各 backend
 /// 取自身最宽档）。要收敛就显式列白名单（如 `["Read","Edit"]`）。执行类工具
 /// 建议始终配合 `permission_mode = "ask"` 走 IM 审批。
+fn default_claude_permission_channel() -> String {
+    "control".to_string()
+}
+
 fn default_tools() -> Vec<String> {
     vec!["*".into()]
 }
@@ -633,6 +643,19 @@ impl Config {
         // P8-4：后端原生权限模式透传值归一（trim + 小写）；值域按后端校验——
         // claude 系白名单（manual 是 default 的 CLI 别名；未知值启动期报错防拼出
         // 非法 flag），其余后端先存值（backend 侧忽略并 warn，接入时再收紧）。
+        // canUseTool 通道取值校验（小写归一；SIGHUP/启动侧 set_permission_channel
+        // 同词表）。
+        let ch = cfg
+            .claude_permission_channel
+            .trim()
+            .to_ascii_lowercase();
+        if ch != "control" && ch != "mcp" {
+            return Err(CoreError::Config(format!(
+                "claude_permission_channel 只支持 control / mcp（当前：{}）",
+                cfg.claude_permission_channel
+            )));
+        }
+        cfg.claude_permission_channel = ch;
         if let Some(m) = cfg.backend_permission_mode.as_mut() {
             let raw = std::mem::take(m);
             let normalized = raw.trim().to_ascii_lowercase();
@@ -751,6 +774,7 @@ platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人)
 # quiet_hours = "22:00-08:00"                  # 免打扰时段(本地时区,可跨天)：时段内加急(buzz)提醒降级为普通消息，内容不变；不设=不启用，改动需重启
 # feishu_thread_active_window_secs = 1800      # 话题群免@窗口(秒,仅feishu)：话题内近期有消息则豁免群消息须@bot；默认30分钟，0=关闭，改动需重启
 permission_mode = "auto"    # 缺省=auto：claude-cli=透传 claude 原生 auto 模式(分类器自动放行安全操作,高危进 IM)+审批闭环；其余后端=off；显式 ask=claude 需审批的动作都进 IM(只读工具内建免批,真机校准 2026-08)
+# claude_permission_channel = "control"  # 审批通道：control(缺省)=canUseTool 双工(SDK 现行标准)；mcp=旧 --permission-prompt-tool(回退,真机有问题时切回)；SIGHUP 热切
 # backend_permission_mode = "auto" # 后端原生权限模式透传(claude→--permission-mode；可覆盖 auto 档缺省)：default|acceptEdits|plan|auto|dontAsk|bypassPermissions；codex/gemini 暂不支持(warn 忽略)
 # approval_tools = ["Bash", "WebFetch", "mcp__*"]  # 审批集：ask 模式下只有这些工具过 IM 审批，其余直接放行；空=全部过审
 # metrics_addr = "127.0.0.1:9100"   # 默认关闭；设为 "ip:port" 开启 /metrics + /health HTTP server
@@ -1269,6 +1293,36 @@ message_fragment_interval_ms = 250
     }
 
     #[test]
+    /// canUseTool 通道：缺省 control、归一校验、非法值拒启。
+    #[test]
+    fn claude_permission_channel_validation() {
+        let p = tmp_path(
+            "cfg_perm_channel_default",
+            "default_workdir = \"/tmp/ws\"\nallowed_tools = [\"Read\"]\n",
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(cfg.claude_permission_channel, "control", "缺省 control");
+        cleanup(&p);
+
+        let p2 = tmp_path(
+            "cfg_perm_channel_norm",
+            "default_workdir = \"/tmp/ws\"\nclaude_permission_channel = \"MCP\"\n",
+        );
+        assert_eq!(
+            Config::load(&p2).unwrap().claude_permission_channel,
+            "mcp",
+            "小写归一"
+        );
+        cleanup(&p2);
+
+        let p3 = tmp_path(
+            "cfg_perm_channel_bad",
+            "default_workdir = \"/tmp/ws\"\nclaude_permission_channel = \"carrier_pigeon\"\n",
+        );
+        assert!(Config::load(&p3).is_err(), "非法通道值拒启");
+        cleanup(&p3);
+    }
+
     fn approval_tools_default_empty_and_parse() {
         let p = tmp_path("appr_def", r#"default_workdir = "/tmp/ws""#);
         let cfg = Config::load(&p).expect("parse");

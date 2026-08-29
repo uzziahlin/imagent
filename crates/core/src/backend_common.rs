@@ -7,7 +7,7 @@
 
 use std::process::Stdio;
 
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::error::{CoreError, Result};
 use crate::types::{AgentChunk, RunOutcome, SessionId, TodoItem, TodoStatus, UsageStats};
@@ -53,6 +53,16 @@ pub enum CliEvent {
     },
     /// 终止信号无文本（codex TurnCompleted / gemini Result）；final 取最后 Text。
     Terminal { session: Option<String> },
+    /// canUseTool 控制请求（claude `--input-format stream-json` 双工协议）：claude
+    /// 需要工具审批时经 stdout 发出，宿主须回写 `control_response` 到 stdin（见
+    /// [`ControlIo`]）。`input` 为工具入参原始 JSON；`subtype` 未知形态也透传
+    /// （ responder 对非 can_use_tool 回 error，防 claude 挂起）。
+    ControlRequest {
+        request_id: String,
+        subtype: String,
+        tool_name: String,
+        input: String,
+    },
     /// token 用量/成本（claude result / codex turn.completed / gemini result 附带）。
     /// 由 spawn_cli_backend 累积合并进 RunOutcome.usage；多事件合并语义见
     /// [`UsageStats::merge`]（input/output 求和、cost 取最后非 None）。
@@ -168,15 +178,59 @@ impl Drop for GroupKillGuard {
 /// `passthrough_env`：S-2——本函数会先 `env_clear()`，再仅透传 [`ALWAYS_PASSTHROUGH_ENV`]
 /// 以及调用方声明的这些 key（各 backend 传自己的 API key，最小授权）。传 `&[]` 则只透传
 /// 运行时必需变量（PATH/HOME/...）。
+/// canUseTool 控制通道上下文（claude 独有；其余 CLI 传 None）。审批决策经
+/// [`crate::mcp::ask_via_socket`] 复用既有 permission.sock 路由（含 token 握手、
+/// IM 审批卡、👍、always、超时 fail-closed——core 侧零改动）。
+pub struct ControlIo {
+    /// permission.sock 路径。
+    pub sock: String,
+    /// 会话 id（审批卡路由用）。
+    pub conv_id: String,
+    /// 审批预算（= config permission_ask_timeout_secs）。
+    pub ask_timeout: std::time::Duration,
+    /// 启动即写入子进程 stdin 的首条消息（SDK 式 user 消息 JSON 行——
+    /// `--input-format stream-json` 模式下 prompt 经 stdin 投递）。
+    pub initial_stdin_message: String,
+}
+
+/// 组装 control_response 响应行（写回子进程 stdin）。形态按 Agent SDK 双工协议
+/// （**待真机校准**：字段名/大小写以实测为准，错则 claude 视为未答复挂起——
+/// 兜底见 spawn 循环的 error 响应）。
+fn control_response_line(request_id: &str, reply: &crate::permission::PermissionReply) -> String {
+    let behavior = if reply.allow { "allow" } else { "deny" };
+    let mut resp = serde_json::json!({
+        "type": "control_response",
+        "request_id": request_id,
+        "subtype": "success",
+        "response": {
+            "behavior": behavior,
+            "message": reply.message.clone().unwrap_or_default(),
+        }
+    });
+    if reply.allow && reply.always {
+        // 会话级放行提示（SDK updatedPermissions 的轻量近似——always 语义由
+        // 网关侧 session_allows 兜底，这里只回显）。
+        resp["response"]["updatedPermissions"] = serde_json::json!({"mode": "acceptEdits"});
+    }
+    format!("{resp}\n")
+}
+
 pub async fn spawn_cli_backend(
     mut cmd: tokio::process::Command,
     parse: impl Fn(&str) -> CliEvent,
     chunks: tokio::sync::mpsc::Sender<AgentChunk>,
     backend_name: &'static str,
     passthrough_env: &[&str],
+    control: Option<ControlIo>,
 ) -> Result<RunOutcome> {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
+    if control.is_some() {
+        // 控制通道：stdin 必须保持打开（control_response 回写 + SDK 式 prompt
+        // 投递）。EOF 会让 claude 的 control_request 永远无人应答（已知挂死形态）。
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+    cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
@@ -210,6 +264,14 @@ pub async fn spawn_cli_backend(
         .stderr
         .take()
         .ok_or_else(|| CoreError::Backend(backend_name, "stderr not piped".into()))?;
+
+    // 控制通道：取 stdin 写入首条 user 消息（SDK 式 prompt 投递），并保持写
+    // 句柄供 control_response 回写。写入失败不致命（claude 侧报 EOF 可见错误）。
+    let mut stdin_w = child.stdin.take();
+    if let (Some(w), Some(io)) = (&mut stdin_w, &control) {
+        let _ = w.write_all(io.initial_stdin_message.as_bytes()).await;
+        let _ = w.flush().await;
+    }
 
     // B5：进程组 kill 守卫——run future 被 drop（dispatch 超时 / /stop）时对整个
     // 进程组 killpg(SIGKILL)，连孙进程（MCP server、Bash 工具）一并收割。正常
@@ -274,6 +336,65 @@ pub async fn spawn_cli_backend(
                         let _ = chunks.send(AgentChunk::SessionStarted(id)).await;
                     }
                 }
+                // canUseTool 控制请求：经 permission.sock 复用既有审批闭环
+                //（IM 卡/👍/always/超时 fail-closed），决策回写子进程 stdin。
+                CliEvent::ControlRequest {
+                    request_id,
+                    subtype,
+                    tool_name,
+                    input,
+                } => match &control {
+                    Some(io) => {
+                        let line = if subtype == "can_use_tool" {
+                            let parsed_input: serde_json::Value =
+                                serde_json::from_str(&input).unwrap_or(serde_json::json!({}));
+                            let reply = match crate::mcp::ask_via_socket(
+                                &io.sock,
+                                &io.conv_id,
+                                &request_id,
+                                &tool_name,
+                                &parsed_input,
+                                io.ask_timeout,
+                            )
+                            .await
+                            {
+                                Ok(r) => r,
+                                Err(e) => crate::permission::PermissionReply {
+                                    allow: false,
+                                    always: false,
+                                    message: Some(format!("control 通道询问失败: {e}")),
+                                    raw_text: None,
+                                },
+                            };
+                            control_response_line(&request_id, &reply)
+                        } else {
+                            // 未知 subtype：回 error 控制响应防挂起（清单外形态，
+                            // 真机校准补充）。
+                            tracing::warn!(target: "imagent::backend", subtype = %subtype,
+                                "未知 control_request subtype，回 error 响应");
+                            format!(
+                                "{}\n",
+                                serde_json::json!({
+                                    "type": "control_response",
+                                    "request_id": request_id,
+                                    "subtype": "error",
+                                    "error": { "message": format!("unsupported subtype: {subtype}") },
+                                })
+                            )
+                        };
+                        if let Some(w) = stdin_w.as_mut() {
+                            if let Err(e) = w.write_all(line.as_bytes()).await {
+                                tracing::warn!(target: "imagent::backend", error = %e,
+                                    "control_response 回写失败（claude 可能挂起或自行 deny）");
+                            }
+                            let _ = w.flush().await;
+                        }
+                    }
+                    None => {
+                        tracing::warn!(target: "imagent::backend", backend = backend_name,
+                            "收到 control_request 但未启用控制通道（claude_permission_channel=control 才应答）");
+                    }
+                },
                 CliEvent::Text(t) => {
                     if !t.is_empty() {
                         let _ = chunks.send(AgentChunk::Text(t.clone())).await;
@@ -615,7 +736,7 @@ mod tests {
         cmd.arg("-c").arg("printf 'one\\ntwo\\n'");
         let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::types::AgentChunk>(64);
         let parse = |line: &str| CliEvent::Text(line.trim_end().to_string());
-        let outcome = spawn_cli_backend(cmd, parse, tx, "test-backend", &[])
+        let outcome = spawn_cli_backend(cmd, parse, tx, "test-backend", &[], None)
             .await
             .expect("echo run 应成功");
         assert_eq!(outcome.final_text, "one\n\ntwo");
@@ -644,7 +765,7 @@ mod tests {
                 CliEvent::Skip
             }
         };
-        let err = spawn_cli_backend(cmd, parse, tx, "test-backend", &[])
+        let err = spawn_cli_backend(cmd, parse, tx, "test-backend", &[], None)
             .await
             .expect_err("无 final 文本应失败");
         assert!(
@@ -736,7 +857,7 @@ mod tests {
             ]),
             _ => CliEvent::Skip,
         };
-        let outcome = spawn_cli_backend(cmd, parse, tx, "test-backend", &[])
+        let outcome = spawn_cli_backend(cmd, parse, tx, "test-backend", &[], None)
             .await
             .expect("run 应成功");
         let u = outcome.usage.expect("应累积出 usage");

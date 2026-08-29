@@ -1011,6 +1011,8 @@ fn build_backend(
                 perm_mode,
                 ask_timeout,
             ));
+            // 审批传输通道（缺省 control=canUseTool 双工；mcp=legacy 回退）。
+            b.set_permission_channel(&config.claude_permission_channel);
             // W1-2/W1-3/W1-4：claude-cli 运行参数（fallback 模型 / 禁用工具 /
             // 系统提示 / 用户 MCP servers）。具体类型上调用（trait 不暴露
             // claude 专有参数）；句柄额外返回给 SIGHUP 重载用。
@@ -1316,6 +1318,10 @@ fn spawn_sighup_handler(
                     dispatcher.reload_tools(cfg.allowed_tools.clone());
                     dispatcher.set_approval_tools(cfg.approval_tools.clone());
                     backend.set_native_permission_mode(cfg.backend_permission_mode.clone());
+                    // 审批通道热切（control ↔ mcp 即时生效，下一轮 agent 起走新通道）。
+                    if let Some(b) = &claude_cli {
+                        b.set_permission_channel(&cfg.claude_permission_channel);
+                    }
                     // W1-2：模型基准值重设（/model 的运行时热设被 config 值覆盖——
                     // SIGHUP 语义即「回到配置面」）。
                     backend.set_model(cfg.claude_model.clone());
