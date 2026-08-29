@@ -174,6 +174,83 @@ macro_rules! retry_on_rate_limit {
     }};
 }
 
+/// 对消息添加表情回复（真机校准 2026-08 验证）：POST
+/// `/im/v1/messages/{message_id}/reactions`，返回 reaction_id（终态翻转时先删
+/// 旧表情）。emoji key **大小写敏感**：OnIt（在做了）/ DONE / CrossMark——
+/// 全大写 ONIT 报 231001（实测）。现有 im:message 权限即可调用。
+pub async fn create_reaction(
+    core_config: &CoreConfig,
+    token: &str,
+    message_id: &str,
+    emoji_type: &str,
+) -> imagent_core::Result<String> {
+    let base = core_config.base_url().trim_end_matches('/').to_string();
+    let url = format!("{base}/open-apis/im/v1/messages/{message_id}/reactions");
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "reaction_type": { "emoji_type": emoji_type } }))
+        .send()
+        .await
+        .map_err(|e| {
+            imagent_core::CoreError::Platform(PLATFORM, format!("create_reaction: {e}"))
+        })?;
+    let v: serde_json::Value = resp.json().await.map_err(|e| {
+        imagent_core::CoreError::Platform(PLATFORM, format!("create_reaction: {e}"))
+    })?;
+    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
+        return Err(imagent_core::CoreError::Platform(
+            PLATFORM,
+            format!("create_reaction: code={code} msg={msg} emoji={emoji_type}"),
+        ));
+    }
+    v.get("data")
+        .and_then(|d| d.get("reaction_id"))
+        .and_then(|r| r.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            imagent_core::CoreError::Platform(PLATFORM, "create_reaction: 响应缺 reaction_id".into())
+        })
+}
+
+/// 删除表情回复（终态翻转前移除旧表情；best-effort——失败仅让旧表情滞留，
+/// 不阻塞新表情）。
+pub async fn delete_reaction(
+    core_config: &CoreConfig,
+    token: &str,
+    message_id: &str,
+    reaction_id: &str,
+) -> imagent_core::Result<()> {
+    let base = core_config.base_url().trim_end_matches('/').to_string();
+    let url = format!(
+        "{base}/open-apis/im/v1/messages/{message_id}/reactions/{reaction_id}"
+    );
+    let client = reqwest::Client::new();
+    let resp = client
+        .delete(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| {
+            imagent_core::CoreError::Platform(PLATFORM, format!("delete_reaction: {e}"))
+        })?;
+    let v: serde_json::Value = resp.json().await.map_err(|e| {
+        imagent_core::CoreError::Platform(PLATFORM, format!("delete_reaction: {e}"))
+    })?;
+    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
+        return Err(imagent_core::CoreError::Platform(
+            PLATFORM,
+            format!("delete_reaction: code={code} msg={msg}"),
+        ));
+    }
+    Ok(())
+}
+
 /// 应用内加急（buzz）已有消息（真机校准 2026-08）：PATCH
 /// `/im/v1/messages/{message_id}/urgent_app`，body `user_id_list`——目标用户
 /// 收到应用内强提醒弹窗，**不产生新消息**（强提醒迁移到卡上的关键：审批催办

@@ -52,6 +52,19 @@ pub struct Mention {
     pub name: String,
 }
 
+/// bot 对用户消息的表情标注语义（平台映射各自的 emoji key；见
+/// `Platform::react_to_message`）。真机校准轮次新增：轮次开始 Processing、
+/// 终态翻 Done/Failed——反馈落在用户的消息上，零新增消息。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsgReaction {
+    /// 处理中（👀「在做了」类）。
+    Processing,
+    /// 正常完成（✅ 类）。
+    Done,
+    /// 失败 / 被中断（❌ 类）。
+    Failed,
+}
+
 /// 命令卡片按钮的视觉样式（P8-1：对标 lcab 的 primary/danger 按钮分层——
 /// 推荐动作用 primary 高亮，破坏性动作用 danger 示警；Default 为普通灰按钮）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

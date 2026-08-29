@@ -44,7 +44,8 @@ pub use permission::{default_sock_path, parse_reply, PermissionReply, Permission
 pub use platform::{command_card_fallback_text, Platform};
 pub use types::{
     AgentChunk, CardButton, CardButtonStyle, CardPhase, CardTerminal, ConfigFormField, ConvId,
-    InboundControl, InboundMessage, JoinedChat, LocalSession, MediaRef, Mention, OutboundCard,
+    InboundControl, InboundMessage, JoinedChat, LocalSession, MediaRef, Mention, MsgReaction,
+    OutboundCard,
     ReplyHint, RunOutcome, SessionId, TodoItem, TodoStatus, ToolCall, UsageStats, UserId, Workdir,
     CARD_HANDLE_LOST,
 };
