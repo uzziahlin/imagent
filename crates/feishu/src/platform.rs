@@ -73,6 +73,11 @@ struct PendingAskCard {
 struct AskSlot {
     msg_id: String,
     pending_req: Option<String>,
+    /// 最近一次询问收敛的时刻。真机校准（2026-08）：跨轮次复用会把新询问
+    /// patch 到早已被结果卡/后续消息顶离视口的历史卡上——用户看不到询问，
+    /// 表现为「卡住」直到超时催办。复用仅在新鲜窗口（见 [`ASK_SLOT_REUSE_WINDOW`]）
+    /// 内成立；None = 挂着未决询问或刚登记的新卡（不可复用）。
+    resolved_at: Option<std::time::Instant>,
     /// P10-③：重渲染输入（note 联动更新时按原参数重画整卡，按钮 value 不变）。
     render: AskRender,
 }
@@ -1155,6 +1160,7 @@ impl FeishuPlatform {
             AskSlot {
                 msg_id: msg_id.to_string(),
                 pending_req: Some(request_id.to_string()),
+                resolved_at: None,
                 render,
             },
         );
@@ -1184,6 +1190,7 @@ impl FeishuPlatform {
         if let Some(slot) = self.ask_slots.lock().await.get_mut(conv_id) {
             if slot.pending_req.as_deref() == Some(request_id) {
                 slot.pending_req = None;
+                slot.resolved_at = Some(std::time::Instant::now());
             }
         }
     }
@@ -1393,9 +1400,16 @@ impl FeishuPlatform {
     }
 }
 
-/// P8-2：认领空闲复用槽（纯逻辑，便于单测）：槽空闲 → 绑定新 request_id 并
-/// 返回卡 msg_id（调用方 patch 该卡成新询问）；槽不存在 / 已挂未决询问
-/// （并发中，不能顶掉别人还没答的）→ None。
+/// 复用窗口：询问卡收敛后多久内可被原地 patch 复用。窗口内 = 卡大概率仍是
+/// 会话尾部（同轮顺序审批，秒级间隔）；跨轮次（分钟级）结果卡/新消息早已把
+/// 旧卡顶离视口——原地 patch 等于隐形询问（真机校准 2026-08 实测）。宁可多
+/// 一张新卡，不可让询问不可见。
+const ASK_SLOT_REUSE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// P8-2：认领空闲复用槽（纯逻辑，便于单测）：槽空闲**且收敛未超窗** → 绑定新
+/// request_id 并返回卡 msg_id（调用方 patch 该卡成新询问）；槽不存在 / 已挂
+/// 未决询问（并发中，不能顶掉别人还没答的）/ 收敛超窗（卡已被顶离视口）→
+/// None（调用方走发新卡路径）。
 fn claim_free_slot(
     slots: &mut HashMap<String, AskSlot>,
     conv_id: &str,
@@ -1405,7 +1419,14 @@ fn claim_free_slot(
     if slot.pending_req.is_some() {
         return None;
     }
+    if slot
+        .resolved_at
+        .map_or(true, |t| t.elapsed() > ASK_SLOT_REUSE_WINDOW)
+    {
+        return None;
+    }
     slot.pending_req = Some(request_id.to_string());
+    slot.resolved_at = None;
     Some(slot.msg_id.clone())
 }
 
@@ -2101,9 +2122,10 @@ impl Platform for FeishuPlatform {
             }
         });
         drop(all);
-        // P8-2：conv 级复用槽一并释放（/stop 后下一个询问可复用末张卡）。
+        // P8-2：conv 级复用槽一并释放（/stop 后短窗口内的下一个询问可复用末张卡）。
         if let Some(slot) = self.ask_slots.lock().await.get_mut(&conv.0) {
             slot.pending_req = None;
+            slot.resolved_at = Some(std::time::Instant::now());
         }
         for (message_id, tool_name) in hits {
             let card_json = render_permission_card_cancelled(&tool_name);
@@ -2724,6 +2746,7 @@ mod tests {
             AskSlot {
                 msg_id: "m1".into(),
                 pending_req: None,
+                resolved_at: Some(std::time::Instant::now()),
                 render: AskRender {
                     question: false,
                     tool_name: "Bash".into(),
@@ -2745,6 +2768,7 @@ mod tests {
         if let Some(slot) = slots.get_mut("c1") {
             if slot.pending_req.as_deref() == Some("r2") {
                 slot.pending_req = None;
+                slot.resolved_at = Some(std::time::Instant::now());
             }
         }
         assert!(
@@ -2754,12 +2778,24 @@ mod tests {
         if let Some(slot) = slots.get_mut("c1") {
             if slot.pending_req.as_deref() == Some("r1") {
                 slot.pending_req = None;
+                slot.resolved_at = Some(std::time::Instant::now());
             }
         }
         assert_eq!(
             claim_free_slot(&mut slots, "c1", "r3").as_deref(),
             Some("m1"),
             "释放后可再认领"
+        );
+        // 真机校准（2026-08）：收敛超窗的槽不再认领——卡已被结果卡/新消息顶
+        // 离视口，原地 patch 等于隐形询问（实测用户「卡住」直到超时催办）。
+        if let Some(slot) = slots.get_mut("c1") {
+            slot.pending_req = None;
+            slot.resolved_at = std::time::Instant::now()
+                .checked_sub(ASK_SLOT_REUSE_WINDOW + std::time::Duration::from_secs(60));
+        }
+        assert!(
+            claim_free_slot(&mut slots, "c1", "r4").is_none(),
+            "收敛超窗不认领（另发新卡保证可见）"
         );
     }
 
