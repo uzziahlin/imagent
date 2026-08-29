@@ -975,7 +975,13 @@ impl Dispatcher {
         // D12：抽到 ensure_permission_socket（热切 /perm ask 复用同一路径）。
         // S-2（fail-closed）：bind 失败（路径不可写 / 平台不支持）时**拒绝启动**——
         // 此前返回值被丢弃会静默降级为「无审批」，是安全 posture 退化。
-        if self.permission_mode.read().needs_socket() && !self.ensure_permission_socket() {
+        // H1（code-review v8）：FullLoop 后端（claude 系）无论档位都 bind——
+        // control 通道下 claude 自身门禁仍可能发 canUseTool（allow 档也有询问，
+        // 由 socket 侧 mode 闸门固定放行），不 bind 则 allow 退化 deny。
+        let mode_needs_sock = self.permission_mode.read().needs_socket()
+            || self.backend.permission_capability()
+                == crate::backend::PermissionCapability::FullLoop;
+        if mode_needs_sock && !self.ensure_permission_socket() {
             return Err(crate::error::CoreError::Config(
                 "permission_mode 为 Ask/auto-claude（IM 审批闭环）档位，但权限审批 socket 启动失败\
                  （Unix domain socket 不可用或路径无法绑定）。Ask 闭环完全不可用，拒绝启动；\

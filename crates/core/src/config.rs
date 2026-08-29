@@ -645,6 +645,15 @@ impl Config {
         // 非法 flag），其余后端先存值（backend 侧忽略并 warn，接入时再收紧）。
         // canUseTool 通道取值校验（小写归一；SIGHUP/启动侧 set_permission_channel
         // 同词表）。
+        // H3（code-review v8）：message_max_len 下界——wecom 分片对 ≤3 有零
+        // 前进死循环风险（运行期另有 clamp 兜底），启动期直接拒绝把问题前置。
+        if let Some(n) = cfg.message_max_len {
+            if n < 4 {
+                return Err(CoreError::Config(format!(
+                    "message_max_len 至少为 4（当前 {n}；不设 = 仅用平台协议上限）"
+                )));
+            }
+        }
         let ch = cfg
             .claude_permission_channel
             .trim()
@@ -1570,4 +1579,21 @@ append_system_prompt = ""
             assert!(validate_workdir(&proj).is_ok(), "{proj:?} 应放行");
         }
     }
+    /// H3（code-review v8）：message_max_len < 4 启动期拒绝。
+    #[test]
+    fn message_max_len_min_bound() {
+        let p = tmp_path(
+            "cfg_msglen_bad",
+            "default_workdir = \"/tmp/ws\"\nmessage_max_len = 3\n",
+        );
+        assert!(Config::load(&p).is_err(), "<4 应拒启");
+        cleanup(&p);
+        let p2 = tmp_path(
+            "cfg_msglen_ok",
+            "default_workdir = \"/tmp/ws\"\nmessage_max_len = 4\n",
+        );
+        assert!(Config::load(&p2).is_ok(), "4 应通过");
+        cleanup(&p2);
+    }
+
 }
