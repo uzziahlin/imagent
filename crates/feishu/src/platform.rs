@@ -1775,6 +1775,7 @@ impl Platform for FeishuPlatform {
             return Ok(()); // 合成消息（按钮回调等）无平台消息锚——no-op。
         }
         let emoji = match reaction {
+            imagent_core::MsgReaction::Queued => "OneSecond",
             imagent_core::MsgReaction::Processing => "OnIt",
             imagent_core::MsgReaction::Done => "DONE",
             imagent_core::MsgReaction::Failed => "CrossMark",

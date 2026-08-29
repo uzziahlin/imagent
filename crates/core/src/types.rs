@@ -57,6 +57,8 @@ pub struct Mention {
 /// 终态翻 Done/Failed——反馈落在用户的消息上，零新增消息。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MsgReaction {
+    /// 排队中（⏳「稍等」类）——runner 在飞时入队的消息先打此标记。
+    Queued,
     /// 处理中（👀「在做了」类）。
     Processing,
     /// 正常完成（✅ 类）。

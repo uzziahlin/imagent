@@ -1218,6 +1218,12 @@ impl Dispatcher {
                     return false;
                 }
                 info!(target: "imagent::core", conv_id = %conv, "runner 在飞，消息入队待下一轮合并");
+                // ⏳「稍等」打在入队消息上（runner 空闲后随批翻 OnIt→终态）；
+                // push 前 capture（msg 被 move 进队列）。
+                let queued_mid = msg
+                    .source_msg_id
+                    .clone()
+                    .filter(|m| m.starts_with("om_"));
                 pending.push(msg);
                 // S-3（P10）：锁内只做入队与快照，hint 写入 / note 推送（网络 IO）
                 // 移到 drop(map) 之后——与上方上限分支同款纪律，不在 queues 锁
@@ -1239,6 +1245,19 @@ impl Dispatcher {
                     .await
                 {
                     tracing::debug!(target: "imagent::core", error = %e, "审批卡排队 note 更新失败（不影响排队）");
+                }
+                if let Some(mid) = &queued_mid {
+                    if let Err(e) = self
+                        .platform
+                        .react_to_message(
+                            &ConvId(conv.to_string()),
+                            mid,
+                            crate::MsgReaction::Queued,
+                        )
+                        .await
+                    {
+                        tracing::debug!(target: "imagent::core", error = %e, "排队消息表情标注失败（不影响排队）");
+                    }
                 }
                 // S-3/S-4 竞态兜底：锁外写 hint 期间本批可能已被 runner 取走（queues
                 // entry 已移除、hint 已清）——复查一次，entry 不在则撤回 stale hint。

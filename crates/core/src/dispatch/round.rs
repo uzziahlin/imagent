@@ -10,9 +10,13 @@ impl Dispatcher {
     /// 中止语义（P4-1/P4-3）：`/stop` 或空闲看门狗 abort join task →
     /// `JoinError::is_cancelled` 分支——卡片 finalize 成 Error 终态（防流式卡片停在
     /// 「生成中」），不落 session（保留上次成功映射）。
-    pub(super) async fn run_agent_round(&self, msg: InboundMessage) -> Option<u64> {
+    pub(super) async fn run_agent_round(
+        &self,
+        msg: InboundMessage,
+        react_mids: Vec<String>,
+    ) -> Option<u64> {
         let conv_key = msg.conv_id.0.clone();
-        let tokens = self.run_round_inner(msg).await;
+        let tokens = self.run_round_inner(msg, react_mids).await;
         // 统一收尾：移除在飞注册（inner 未及注册时为幂等 no-op）。同 conv 轮次串行
         // （conv 锁），key 移除无 ABA。
         self.running.lock().await.remove(&conv_key);
@@ -23,20 +27,20 @@ impl Dispatcher {
     /// W2-5 自动 compact 的触发依据。
     /// 表情终态标注（best-effort）：落在轮次触发的用户消息上（merge_batch 保留
     /// 首条消息的 source_msg_id）。None 锚（合成消息/无平台 id）no-op。
-    async fn react_msg(&self, conv: &ConvId, anchor: &Option<String>, done: bool) {
-        if let Some(mid) = anchor {
-            let r = if done {
-                crate::MsgReaction::Done
-            } else {
-                crate::MsgReaction::Failed
-            };
+    async fn react_msg(&self, conv: &ConvId, mids: &[String], done: bool) {
+        let r = if done {
+            crate::MsgReaction::Done
+        } else {
+            crate::MsgReaction::Failed
+        };
+        for mid in mids {
             if let Err(e) = self.platform.react_to_message(conv, mid, r).await {
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "消息表情终态标注失败（不影响主流程）");
             }
         }
     }
 
-    async fn run_round_inner(&self, msg: InboundMessage) -> Option<u64> {
+    async fn run_round_inner(&self, msg: InboundMessage, react_mids: Vec<String>) -> Option<u64> {
         let conv = msg.conv_id.clone();
         let hint = msg.reply_hint.clone();
         let sender_id = msg.sender.0.clone();
@@ -119,11 +123,8 @@ impl Dispatcher {
 
         // 流式通道 + 后台执行。existing 移入 spawn（避免借用跨 'static）。
         let run_started = Instant::now();
-        // 表情锚：轮次触发消息的平台 id（合成消息/命令无）。
-        let react_anchor = msg
-            .source_msg_id
-            .clone()
-            .filter(|m| m.starts_with("om_"));
+        // 表情锚：本批全部消息的平台 id（dispatch_agent_message 收集；排队过
+        // 的消息此刻从 ⏳ 翻 👀）。空 = 合成消息/命令，全程 no-op。
         // Wave B-2：本轮起点的询问登记计数快照——结束时对比，判定「本轮是否
         // 发生过审批/询问」（完成强提醒触发条件）。
         let asks_at_start = self.router.ask_count(&conv.0).await;
@@ -190,8 +191,8 @@ impl Dispatcher {
         // 落库 workdir 记本轮实际使用的目录（resolve 后的 per-conv 值），而非
         // default——/cd 后两才会分叉（P5 修正，与 /resume 的记法对齐）。
         let workdir_for_row = workdir.to_string_lossy().to_string();
-        // 👀「在做了」打在轮次触发消息上（真机校准轮次新增；失败仅 warn）。
-        if let Some(mid) = &react_anchor {
+        // 👀「在做了」打在本批全部消息上（含排队⏳ 翻转；失败仅 warn）。
+        for mid in &react_mids {
             if let Err(e) = self
                 .platform
                 .react_to_message(&conv, mid, crate::MsgReaction::Processing)
@@ -473,7 +474,7 @@ impl Dispatcher {
                 self.cancel_pending_on_exit(&conv).await;
                 // W3-3：失败后的快捷操作卡（重试/自检/新会话，仅卡片平台）。
                 self.send_failure_quick_actions(&conv, &hint).await;
-                self.react_msg(&conv, &react_anchor, false).await;
+                self.react_msg(&conv, &react_mids, false).await;
                 // conv 锁由 runner 循环持有并统一释放（P1-7 防泄漏语义不变）。
                 return None;
             }
@@ -535,7 +536,7 @@ impl Dispatcher {
                 self.cancel_pending_on_exit(&conv).await;
                 // W3-3：中断后的快捷操作卡（同失败路径）。
                 self.send_failure_quick_actions(&conv, &hint).await;
-                self.react_msg(&conv, &react_anchor, false).await;
+                self.react_msg(&conv, &react_mids, false).await;
                 return None;
             }
             Err(e) => {
@@ -563,13 +564,13 @@ impl Dispatcher {
                     .await;
                 self.cancel_pending_on_exit(&conv).await;
                 self.send_failure_quick_actions(&conv, &hint).await;
-                self.react_msg(&conv, &react_anchor, false).await;
+                self.react_msg(&conv, &react_mids, false).await;
                 return None;
             }
         };
 
         // 正常出口的表情终态：terminal=Done，非正常终止（崩溃等）=Failed。
-        self.react_msg(&conv, &react_anchor, outcome.terminal).await;
+        self.react_msg(&conv, &react_mids, outcome.terminal).await;
 
         // 成功路径：usage 落库 + 指标（backend 未产出 usage 时记零用量事件行）。
         self.record_run_usage(&conv, outcome.usage.as_ref(), &sender_id)

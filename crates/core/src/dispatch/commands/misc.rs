@@ -773,7 +773,13 @@ impl Dispatcher {
 
     /// /stats [today|7d|all] —— token 用量/成本统计（默认 7d）。全局 + 本会话
     /// 两组维度；无成本数据的 backend（codex/gemini）按 tokens 汇总展示。
-    pub(super) async fn cmd_stats(&self, conv: &ConvId, hint: &ReplyHint, parts: &[&str]) {
+    pub(super) async fn cmd_stats(
+        &self,
+        conv: &ConvId,
+        sender: &str,
+        hint: &ReplyHint,
+        parts: &[&str],
+    ) {
         let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
         let (label, since) = match arg.to_ascii_lowercase().as_str() {
             "" | "7d" => ("近 7 天".to_string(), now_secs() - 7 * 86_400),
@@ -812,6 +818,35 @@ impl Dispatcher {
             (runs, input, output, cost)
         };
         let (g_runs, g_in, g_out, g_cost) = agg(&rows);
+        // per-sender 成本 Top5（admin 可见——多人网关下「谁花了多少」；sender 非
+        // 个人隐私但跨用户成本数据按最小披露原则收敛到管理员）。
+        let per_sender_line = if self.is_admin(sender) {
+            let mut by_sender: std::collections::HashMap<&str, (usize, f64)> =
+                std::collections::HashMap::new();
+            for r in &rows {
+                if let Some(sp) = &r.sender {
+                    let e = by_sender.entry(sp.as_str()).or_default();
+                    e.0 += 1;
+                    e.1 += r.cost_usd.unwrap_or(0.0);
+                }
+            }
+            let mut top: Vec<(&str, usize, f64)> = by_sender
+                .into_iter()
+                .map(|(s, (runs, cost))| (s, runs, cost))
+                .collect();
+            top.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            top.iter()
+                .take(5)
+                .map(|(s, runs, cost)| {
+                    let sid = s.rsplit_once('_').map(|(_, t)| t).unwrap_or(s);
+                    let short: String = sid.chars().take(8).collect();
+                    format!("- `{short}…`：{runs} 轮 · ${cost:.4}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            String::new()
+        };
         let mine: Vec<imagent_store::RunStatRow> =
             rows.into_iter().filter(|r| r.conv_id == conv.0).collect();
         let (m_runs, m_in, m_out, m_cost) = agg(&mine);
@@ -832,16 +867,26 @@ impl Dispatcher {
             Ok(rows) => ApprovalStats::from_audit(&rows).summary_line(),
             Err(e) => format!("读取失败：{e}"),
         };
+        let sender_section = if per_sender_line.is_empty() {
+            String::new()
+        } else {
+            format!("\n- 👥 发起者 Top：\n{per_sender_line}")
+        };
         let text = format!(
-            "📈 用量统计（{label}）\n- 🌍 全局：{g_runs} 轮 · 输入 {g_in} · 输出 {g_out} tokens\n- 💰 全局成本：{}\n- 💬 本会话：{m_runs} 轮 · 输入 {m_in} · 输出 {m_out} tokens\n- 💸 本会话成本：{}\n- 🛡️ 审批（近 7 天）：{appr_line}\n- 用法：/stats [today|7d|all]",
+            "📈 用量统计（{label}）\n- 🌍 全局：{g_runs} 轮 · 输入 {g_in} · 输出 {g_out} tokens\n- 💰 全局成本：{}\n- 💬 本会话：{m_runs} 轮 · 输入 {m_in} · 输出 {m_out} tokens\n- 💸 本会话成本：{}{sender_section}\n- 🛡️ 审批（近 7 天）：{appr_line}\n- 用法：/stats [today|7d|all]",
             cost_line(g_cost),
             cost_line(m_cost),
         );
         // CardKit 视觉改版：卡片平台回命令卡（markdown 表格）；纯文本平台保持
         // 现有列表文本（表格只发生在卡渲染层）。
         if self.platform.supports_streaming_card(conv) {
+            let sender_md = if per_sender_line.is_empty() {
+                String::new()
+            } else {
+                format!("\n**👥 发起者 Top**\n{per_sender_line}\n")
+            };
             let table = format!(
-                "| 维度 | 轮数 | 输入 tokens | 输出 tokens | 成本 |\n|---|---|---|---|---|\n| 🌍 全局 | {g_runs} | {g_in} | {g_out} | {} |\n| 💬 本会话 | {m_runs} | {m_in} | {m_out} | {} |\n\n- 🛡️ 审批（近 7 天）：{appr_line}\n- 用法：/stats [today|7d|all]",
+                "| 维度 | 轮数 | 输入 tokens | 输出 tokens | 成本 |\n|---|---|---|---|---|\n| 🌍 全局 | {g_runs} | {g_in} | {g_out} | {} |\n| 💬 本会话 | {m_runs} | {m_in} | {m_out} | {} |\n{sender_md}\n- 🛡️ 审批（近 7 天）：{appr_line}\n- 用法：/stats [today|7d|all]",
                 cost_line(g_cost),
                 cost_line(m_cost),
             );
