@@ -146,6 +146,19 @@ pub trait Platform: Send + Sync {
         self.send_text(conv, fallback, hint).await
     }
 
+    /// bot 对用户入站消息的表情标注：轮次开始 [`MsgReaction::Processing`]
+    ///（👀 类「在做了」），终态翻 [`MsgReaction::Done`] / [`MsgReaction::Failed`]
+    /// ——反馈直接落在用户的消息上，零新增消息。默认 no-op（不支持/未配置的
+    /// 平台）；best-effort：失败由调用方 warn，不影响轮次。
+    async fn react_to_message(
+        &self,
+        _conv: &ConvId,
+        _source_msg_id: &str,
+        _reaction: crate::types::MsgReaction,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// 发命令交互卡片（P6-3）：markdown 正文 + 按钮组。按钮点击由平台侧转成
     /// `text = <command>` 的 InboundMessage（走与手打命令相同的鉴权/分派）。
     /// 默认降级纯文本：title + body + 可手打的命令清单（无按钮能力的平台无需感知）。

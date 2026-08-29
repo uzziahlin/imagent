@@ -116,6 +116,9 @@ pub struct FeishuPlatform {
     /// 的加急对象——审批催办对审批卡、完成提醒对流式终态卡，卡直接弹通知而
     /// 非另发 buzz 文本。send_card / update_card / 审批卡登记时刷新。
     card_tail: Arc<Mutex<HashMap<String, String>>>,
+    /// bot 对用户消息的表情标注状态：om_ 消息 id → 当前 reaction_id（终态翻转
+    /// 时先删旧表情再打新表情；仅内存态，重启后旧表情滞留无害——新一轮会重打）。
+    msg_reactions: Arc<Mutex<HashMap<String, String>>>,
     /// `/reconnect` 强制重连信号（与 WS run task 共享，P4-7）。
     reconnect: Arc<tokio::sync::Notify>,
     /// 已解析的入站消息 channel，`recv` 直接 await。
@@ -809,6 +812,7 @@ impl FeishuPlatform {
             card_footers: Arc::new(Mutex::new(HashMap::new())),
             ask_notes: Arc::new(Mutex::new(HashMap::new())),
             card_tail: Arc::new(Mutex::new(HashMap::new())),
+            msg_reactions: Arc::new(Mutex::new(HashMap::new())),
             reconnect,
             inbound_rx: Arc::new(Mutex::new(inbound_msg_rx)),
             pending_asks,
@@ -1087,6 +1091,55 @@ impl FeishuPlatform {
 
     /// conv 最近一次入站消息的 sender（轮次发起者近似——每 conv 轮次串行，询问
     /// 登记时取之，作群 conv 下的按钮点击者校验锚；无记录为空串=不校验）。
+    /// bot 对用户消息的表情标注：OnIt（在做了）→ DONE / CrossMark。
+    /// emoji key 真机校准（2026-08）验证可用且**大小写敏感**（全大写报 231001）。
+    /// 翻转 = 删旧表情 + 打新表情；删失败（过期/已撤回）仅 log，新表情照打。
+    async fn react_to_message(
+        &self,
+        conv: &ConvId,
+        source_msg_id: &str,
+        reaction: imagent_core::MsgReaction,
+    ) -> Result<()> {
+        if !source_msg_id.starts_with("om_") {
+            return Ok(()); // 合成消息（按钮回调等）无平台消息锚——no-op。
+        }
+        let emoji = match reaction {
+            imagent_core::MsgReaction::Processing => "OnIt",
+            imagent_core::MsgReaction::Done => "DONE",
+            imagent_core::MsgReaction::Failed => "CrossMark",
+        };
+        // 旧表情先删（翻转语义）：reaction_id 在则删，删失败不阻塞。
+        let old = self
+            .msg_reactions
+            .lock()
+            .await
+            .remove(source_msg_id);
+        let old_del = old.map(|rid| {
+            self.with_token(move |t| {
+                let rid = rid.clone();
+                async move {
+                    crate::client::delete_reaction(&self.core_config, &t, source_msg_id, &rid).await
+                }
+            })
+        });
+        if let Some(fut) = old_del {
+            if let Err(e) = fut.await {
+                warn!(target: "feishu", error = %e, "旧表情删除失败（不阻塞新表情）");
+            }
+        }
+        let rid = self
+            .with_token(|t| async move {
+                crate::client::create_reaction(&self.core_config, &t, source_msg_id, emoji).await
+            })
+            .await?;
+        self.msg_reactions
+            .lock()
+            .await
+            .insert(source_msg_id.to_string(), rid);
+        let _ = conv; // conv 仅日志语义，保留签名对齐 trait。
+        Ok(())
+    }
+
     /// 刷新会话最新卡片记录（card_tail，强提醒加急对象）。
     async fn note_card_tail(&self, conv_id: &str, msg_id: &str) {
         if msg_id.starts_with("om_") {

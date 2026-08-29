@@ -21,6 +21,21 @@ impl Dispatcher {
 
     /// 返回成功轮次的上下文水位（`usage.input_tokens`；失败/无 usage 为 None）——
     /// W2-5 自动 compact 的触发依据。
+    /// 表情终态标注（best-effort）：落在轮次触发的用户消息上（merge_batch 保留
+    /// 首条消息的 source_msg_id）。None 锚（合成消息/无平台 id）no-op。
+    async fn react_msg(&self, conv: &ConvId, anchor: &Option<String>, done: bool) {
+        if let Some(mid) = anchor {
+            let r = if done {
+                crate::MsgReaction::Done
+            } else {
+                crate::MsgReaction::Failed
+            };
+            if let Err(e) = self.platform.react_to_message(conv, mid, r).await {
+                warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "消息表情终态标注失败（不影响主流程）");
+            }
+        }
+    }
+
     async fn run_round_inner(&self, msg: InboundMessage) -> Option<u64> {
         let conv = msg.conv_id.clone();
         let hint = msg.reply_hint.clone();
@@ -104,6 +119,11 @@ impl Dispatcher {
 
         // 流式通道 + 后台执行。existing 移入 spawn（避免借用跨 'static）。
         let run_started = Instant::now();
+        // 表情锚：轮次触发消息的平台 id（合成消息/命令无）。
+        let react_anchor = msg
+            .source_msg_id
+            .clone()
+            .filter(|m| m.starts_with("om_"));
         // Wave B-2：本轮起点的询问登记计数快照——结束时对比，判定「本轮是否
         // 发生过审批/询问」（完成强提醒触发条件）。
         let asks_at_start = self.router.ask_count(&conv.0).await;
@@ -170,6 +190,16 @@ impl Dispatcher {
         // 落库 workdir 记本轮实际使用的目录（resolve 后的 per-conv 值），而非
         // default——/cd 后两才会分叉（P5 修正，与 /resume 的记法对齐）。
         let workdir_for_row = workdir.to_string_lossy().to_string();
+        // 👀「在做了」打在轮次触发消息上（真机校准轮次新增；失败仅 warn）。
+        if let Some(mid) = &react_anchor {
+            if let Err(e) = self
+                .platform
+                .react_to_message(&conv, mid, crate::MsgReaction::Processing)
+                .await
+            {
+                warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "消息表情处理中标注失败（不影响主流程）");
+            }
+        }
         let join = tokio::spawn(async move {
             let backend_name = backend.name();
             // agent_timeout = 0（默认）= 关闭总超时：墙钟总预算会误杀持续输出的
@@ -443,6 +473,7 @@ impl Dispatcher {
                 self.cancel_pending_on_exit(&conv).await;
                 // W3-3：失败后的快捷操作卡（重试/自检/新会话，仅卡片平台）。
                 self.send_failure_quick_actions(&conv, &hint).await;
+                self.react_msg(&conv, &react_anchor, false).await;
                 // conv 锁由 runner 循环持有并统一释放（P1-7 防泄漏语义不变）。
                 return None;
             }
@@ -504,6 +535,7 @@ impl Dispatcher {
                 self.cancel_pending_on_exit(&conv).await;
                 // W3-3：中断后的快捷操作卡（同失败路径）。
                 self.send_failure_quick_actions(&conv, &hint).await;
+                self.react_msg(&conv, &react_anchor, false).await;
                 return None;
             }
             Err(e) => {
@@ -531,9 +563,13 @@ impl Dispatcher {
                     .await;
                 self.cancel_pending_on_exit(&conv).await;
                 self.send_failure_quick_actions(&conv, &hint).await;
+                self.react_msg(&conv, &react_anchor, false).await;
                 return None;
             }
         };
+
+        // 正常出口的表情终态：terminal=Done，非正常终止（崩溃等）=Failed。
+        self.react_msg(&conv, &react_anchor, outcome.terminal).await;
 
         // 成功路径：usage 落库 + 指标（backend 未产出 usage 时记零用量事件行）。
         self.record_run_usage(&conv, outcome.usage.as_ref(), &sender_id)
