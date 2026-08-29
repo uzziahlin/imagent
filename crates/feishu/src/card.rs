@@ -850,33 +850,52 @@ pub(crate) fn render_permission_card_note(
         elements.push(note_element(n));
     }
     elements.push(serde_json::json!({ "tag": "hr" }));
-    // 按钮布局（真机校准 2026-08）：三按钮 flow 布局因「♾️ 本次会话始终允许」
-    // 长标签挤成错落两行——收敛为**两枚短标签按钮**（flow 容器已真机验证可
-    // 发，两短标签稳定同行）：✅ 允许 primary_filled（CardKit 的 primary 实为
-    // 蓝字描边，填充档是 primary_filled）/ ⛔ 拒绝 danger_filled。「始终允许」
-    // 由 note 行的「回复 always」承载（原第三按钮与该文案语义重复）。
-    elements.push(flow_button_row(&[
-        cb_button(
-            "允许",
-            "primary_filled",
-            ask_value_wrap(
-                serde_json::json!({ "imagent_perm": "allow" }),
-                conv_id,
-                request_id,
-                sender,
-            ),
+    // 按钮布局（真机校准 2026-08 第三轮）：主操作一行两枚**等宽**填充按钮
+    //（weighted 1:1 列 + 按钮 width=fill 拉满列宽——flow+auto 形态按钮随内容
+    // 宽度参差，emoji 差一个字符宽都显不齐）；次级动作「♾️ 本次会话始终允许」
+    // 独占下一行整宽描边按钮（V2 支持按钮直接入 elements）。允许 primary_filled
+    //（CardKit 的 primary 实为蓝字描边，填充档是 primary_filled）。
+    let mut allow_btn = cb_button(
+        "允许",
+        "primary_filled",
+        ask_value_wrap(
+            serde_json::json!({ "imagent_perm": "allow" }),
+            conv_id,
+            request_id,
+            sender,
         ),
-        cb_button(
-            "⛔ 拒绝",
-            "danger_filled",
-            ask_value_wrap(
-                serde_json::json!({ "imagent_perm": "deny" }),
-                conv_id,
-                request_id,
-                sender,
-            ),
+    );
+    allow_btn["width"] = serde_json::json!("fill");
+    let mut deny_btn = cb_button(
+        "⛔ 拒绝",
+        "danger_filled",
+        ask_value_wrap(
+            serde_json::json!({ "imagent_perm": "deny" }),
+            conv_id,
+            request_id,
+            sender,
         ),
-    ]));
+    );
+    deny_btn["width"] = serde_json::json!("fill");
+    let mut always_btn = cb_button(
+        "♾️ 本次会话始终允许",
+        "default",
+        ask_value_wrap(
+            serde_json::json!({ "imagent_perm": "always" }),
+            conv_id,
+            request_id,
+            sender,
+        ),
+    );
+    always_btn["width"] = serde_json::json!("fill");
+    elements.push(serde_json::json!({
+        "tag": "column_set", "flex_mode": "bisect", "horizontal_spacing": "default",
+        "columns": [
+            { "tag": "column", "width": "weighted", "weight": 1, "elements": [allow_btn] },
+            { "tag": "column", "width": "weighted", "weight": 1, "elements": [deny_btn] }
+        ]
+    }));
+    elements.push(always_btn);
     serde_json::json!({
         "schema": "2.0",
         "header": {
@@ -1732,17 +1751,23 @@ mod tests {
         // 蓝底已高亮，绿色系 emoji 冲突）；⛔ 拒绝（danger）保留。
         assert!(json.contains("\"content\":\"允许\""), "允许按钮: {json}");
         assert!(json.contains("⛔ 拒绝"), "拒绝按钮: {json}");
-        // 真机校准（2026-08）：三按钮收敛为两枚（长标签按钮挤布局），always
-        // 动作由 note 行「回复 always」承载，不再有按钮编码。
+        // 真机校准（2026-08 第三轮）：三动作齐备——允许/拒绝等宽填充主行
+        //（weighted 1:1 + 按钮 width=fill），始终允许独立整宽次级行。
         assert!(
             json.contains("\"imagent_perm\":\"allow\"")
                 && json.contains("\"imagent_perm\":\"deny\"")
-                && !json.contains("\"imagent_perm\":\"always\""),
-            "两动作编码且 always 不再是按钮: {json}"
+                && json.contains("\"imagent_perm\":\"always\""),
+            "三个动作都应编码: {json}"
+        );
+        assert!(json.contains("\"primary_filled\"") && json.contains("\"danger_filled\""),
+            "主行填充双按钮: {json}");
+        assert!(
+            json.contains("\"width\":\"weighted\"") && json.contains("\"weight\":1"),
+            "主行等宽列: {json}"
         );
         assert!(
-            json.contains("回复 always") && json.contains("\"primary_filled\""),
-            "always 走 note 文案 + 允许为填充主按钮: {json}"
+            json.matches("\"width\":\"fill\"").count() >= 3,
+            "三按钮均拉满列宽: {json}"
         );
         assert!(json.contains("feishu:ou_u1"), "conv 应编码进 value: {json}");
         assert!(json.contains("\"tag\":\"button\""), "按钮 tag: {json}");
@@ -2636,10 +2661,9 @@ mod tests {
         assert!(sup.contains("🔁 已被新询问取代"), "superseded 图标: {sup}");
         assert!(!sup.contains("⏭️"), "不再用跳过图标: {sup}");
         let perm = render_permission_card("Bash", r#"{"command":"ls"}"#, "c", "r", None, 300);
-        // 真机校准（2026-08）：三按钮收敛为两枚——「始终允许」由 note 行文案
-        // 承载（长标签按钮挤布局），按钮不再出现 ♾️。
-        assert!(perm.contains("回复 always"), "always 走 note 文案: {perm}");
-        assert!(!perm.contains("♾️ 本次会话始终允许"), "按钮不再有 ♾️ 长标签: {perm}");
+        // 真机校准（2026-08 第三轮）：♾️ 始终允许回归为独立整宽次级按钮
+        //（用户反馈移除后功能入口消失）。
+        assert!(perm.contains("♾️ 本次会话始终允许"), "♾️ 次级按钮: {perm}");
         assert!(!perm.contains("🔓"), "不再用开锁: {perm}");
     }
 
