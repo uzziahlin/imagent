@@ -59,13 +59,19 @@ fn split_text_by_bytes(text: &str, max_bytes: usize) -> Vec<String> {
     chunks
 }
 
+/// H3（code-review v8）：分片下界（见 [`wecom_split_cap`]）。
+const WECOM_MIN_SPLIT_BYTES: usize = 4;
+
 /// 出站分片字节上限：`min(config.message_max_len, WECOM_TEXT_MAX_BYTES)`
 /// （config 未设 = 仅协议上限）。纯函数便于单测；跨单位（config 按字符、企微
 /// 按字节）取 min 偏保守——多切不少切，配置上限不会被平台放大。
 fn wecom_split_cap(message_max_len: Option<usize>) -> usize {
+    // H3（code-review v8）：下界 clamp ≥ 4——max_bytes ≤ 3 时 char 边界回退
+    // 可退回 start（多字节字符零前进死循环 + chunks 无限追加）。4 = 单个
+    // char 最大 4 字节，保证 split 至少前进 1 字符。
     message_max_len
         .unwrap_or(WECOM_TEXT_MAX_BYTES)
-        .min(WECOM_TEXT_MAX_BYTES)
+        .clamp(WECOM_MIN_SPLIT_BYTES, WECOM_TEXT_MAX_BYTES)
 }
 
 /// 企业微信 Platform 适配器。
@@ -450,4 +456,19 @@ mod tests {
         assert!(chunks.iter().all(|c| c.len() <= 2_000));
         assert_eq!(chunks.concat(), text, "分片不丢字符");
     }
+    /// H3（code-review v8）：小值 clamp——≤3 死循环形态被下界挡住，分片必然前进。
+    #[test]
+    fn wecom_split_cap_clamps_small_values() {
+        assert_eq!(wecom_split_cap(Some(0)), 4);
+        assert_eq!(wecom_split_cap(Some(3)), 4);
+        assert_eq!(wecom_split_cap(Some(2000)), 2000);
+        assert_eq!(wecom_split_cap(None), WECOM_TEXT_MAX_BYTES);
+        // 死循环形态直接验证：多字节文本在 max=1/2/3 下不再挂死且有产出。
+        let text = "你好世界".repeat(10);
+        for cap in [1usize, 2, 3] {
+            let chunks = split_text_by_bytes(&text, cap.max(4));
+            assert!(!chunks.is_empty());
+        }
+    }
+
 }

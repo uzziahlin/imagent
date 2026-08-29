@@ -235,13 +235,52 @@ impl AcpBackend {
         if let Some(f) = &self.mock_factory {
             return Ok(Transport::Mock(f()));
         }
-        let mut cmd = Self::agent_command();
-        if let Some(m) = self.model.read().clone() {
-            cmd = format!("ANTHROPIC_MODEL={m} {cmd}");
-        }
+        let cmd = Self::sanitized_agent_command(self.model.read().clone());
         let agent = AcpAgent::from_str(&cmd)
             .map_err(|e| CoreError::Backend(NAME, format!("解析 agent 命令失败: {e}")))?;
         Ok(Transport::Real(agent))
+    }
+
+    /// H2（code-review v8）：S-2 env 消毒对齐——SDK 的 `spawn_process` 只做
+    /// `cmd.env()` 增量、**无 env_clear**，ACP 子进程（及它内部再 spawn 的
+    /// claude CLI）会继承部署环境全部变量（DATABASE_URL / CI secret / 其它
+    /// token），可经 `Bash env` 或 `/proc/self/environ` 读走回传 IM。
+    ///
+    /// 修法：命令前导 `/usr/bin/env -i NAME=value …`——`env` 作为被 exec 程序
+    /// （SDK `from_str` 走 shell_words::split 后直接 exec argv），`-i` 清空环境
+    /// 后仅注入白名单（对齐 CLI 路径 [`imagent_core::backend_common::ALWAYS_PASSTHROUGH_ENV`]
+    /// + claude 凭据两键）。值含空白/引号/元字符时跳过该键（赋值经 shell_words
+    /// 再切分会破形；白名单键的常规值——路径/键/locale——均无此类字符）。
+    /// 自定义 `IMAGENT_ACP_COMMAND` 同样经此消毒（需要额外 env 的场景可在命令
+    /// 里自带 `env NAME=value` 前缀）。
+    fn sanitized_agent_command(model: Option<String>) -> String {
+        let base = Self::agent_command();
+        let mut assignments: Vec<String> = Vec::new();
+        let safe = |v: &str| {
+            !v.is_empty()
+                && v.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._/:=+-@[]".contains(c))
+        };
+        for key in [
+            "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+            "TMPDIR", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL",
+        ] {
+            match std::env::var(key) {
+                Ok(v) if safe(&v) => assignments.push(format!("{key}={v}")),
+                Ok(v) => tracing::warn!(
+                    target: "claude-acp",
+                    key,
+                    "ACP env 白名单值含非常规字符，跳过注入"
+                ),
+                Err(_) => {}
+            }
+        }
+        if let Some(m) = model {
+            if safe(&m) {
+                assignments.push(format!("ANTHROPIC_MODEL={m}"));
+            }
+        }
+        format!("/usr/bin/env -i {} {base}", assignments.join(" "))
     }
 
     /// B2：shutdown 全量清理——断开全部 per-conv 连接（map 清空后最后一个 sender
@@ -1628,4 +1667,30 @@ mod tests {
         }
         assert!(got_final, "应推送 Final chunk");
     }
+    /// H2（code-review v8）：ACP 命令消毒——env -i + 白名单前导；model 注入；
+    /// 白名单之外的继承被物理切断。
+    #[test]
+    fn sanitized_agent_command_env_isolation() {
+        // 无 model：env -i 前导 + 基础命令殿后。
+        let cmd = AcpBackend::sanitized_agent_command(None);
+        assert!(cmd.starts_with("/usr/bin/env -i "), "{cmd}");
+        assert!(cmd.ends_with("claude-agent-acp"), "{cmd}");
+        // PATH 在真实环境中必然存在且安全 → 一定被注入。
+        assert!(cmd.contains("PATH="), "{cmd}");
+        // 有 model：ANTHROPIC_MODEL 注入。
+        let cmd2 = AcpBackend::sanitized_agent_command(Some("glm-5.3[1M]".into()));
+        assert!(cmd2.contains("ANTHROPIC_MODEL=glm-5.3[1M]"), "{cmd2}");
+        // 值含空格的键在真实环境难保证存在——形态由 safe 闭包保证（间接）：
+        // 命令不含未加引号的空白赋值段。
+        for seg in cmd2.split_whitespace() {
+            if seg.contains('=') {
+                assert!(
+                    seg.starts_with("/usr/bin/env") || seg.starts_with("claude") ||
+                    seg.chars().all(|c| c.is_ascii_alphanumeric() || "._/:=+-@[]".contains(c)),
+                    "异常赋值段: {seg}"
+                );
+            }
+        }
+    }
+
 }

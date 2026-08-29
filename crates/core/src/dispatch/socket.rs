@@ -100,6 +100,8 @@ impl Dispatcher {
         let permission_ask_timeout = self.permission_ask_timeout;
         let ask_via_im_timeout = self.ask_via_im_timeout;
         let expected_token = token;
+        // H1（code-review v8）：permission_mode 共享句柄——连接处理侧实时读档。
+        let permission_mode = self.permission_mode.clone();
         tokio::spawn(async move {
             // 鉴权基准：只接受与本进程同 uid 的连接（MCP 子进程由本进程 spawn，必然同 uid）。
             // P2-7/P5-9b 威胁模型：peer_uid 防「跨 uid 伪造」；握手 token 把「同 uid
@@ -122,6 +124,7 @@ impl Dispatcher {
                                     let permission_ask_timeout = permission_ask_timeout;
                                     let ask_via_im_timeout = ask_via_im_timeout;
                                     let expected_token = expected_token.clone();
+                                    let permission_mode = permission_mode.clone();
                                     tasks.lock().await.spawn(async move {
                                         Self::handle_permission_socket(
                                             stream,
@@ -132,6 +135,7 @@ impl Dispatcher {
                                             permission_ask_timeout,
                                             ask_via_im_timeout,
                                             expected_token,
+                                            permission_mode,
                                         )
                                         .await;
                                     });
@@ -260,6 +264,7 @@ impl Dispatcher {
         permission_ask_timeout: std::time::Duration,
         ask_via_im_timeout: std::time::Duration,
         expected_token: String,
+        permission_mode: std::sync::Arc<parking_lot::RwLock<PermissionMode>>,
     ) {
         // P5-9b：读两行——首行握手 token、次行 JSON 请求。必须共用一个 BufReader：
         // 分开建会把第二行的数据吞进被丢弃的缓冲区。reader 在块内 drop 以释放
@@ -342,6 +347,7 @@ impl Dispatcher {
                     request_id,
                     permission_ask_timeout,
                     &req,
+                    permission_mode,
                 )
                 .await;
             }
@@ -590,12 +596,31 @@ impl Dispatcher {
         request_id: String,
         permission_ask_timeout: std::time::Duration,
         req: &serde_json::Value,
+        permission_mode: std::sync::Arc<parking_lot::RwLock<PermissionMode>>,
     ) {
         let tool_name = req
             .get("tool_name")
             .and_then(|v| v.as_str())
             .unwrap_or("?")
             .to_string();
+        // H1（code-review v8）：mode 闸门——Allow/Deny/Off 在 socket 侧固定
+        // 答复（对齐 MCP 通道 fixed_reply 分流），实时读档使 /perm 与 SIGHUP
+        // 热切即时生效；Ask/auto-claude 才进入 approval_tools/IM 询问链路。
+        {
+            let mode = *permission_mode.read();
+            if !mode.needs_socket() {
+                let reply = crate::mcp::fixed_reply(mode);
+                info!(
+                    target: "imagent::core",
+                    conv_id = %conv.0,
+                    tool = %tool_name,
+                    mode = mode.as_str(),
+                    "权限请求按当前 permission_mode 固定答复（无 IM 询问）"
+                );
+                Self::write_permission_reply(&mut stream, reply).await;
+                return;
+            }
+        }
         // 审批集外直接放行（空集 = 语义回退为全部过审，见 needs_approval）：
         // 不发 IM 询问、不挂 pending，记日志 + 指标（decision=allow, auto=1 口径
         // 复用 allow 标签，message 说明放行原因）。
@@ -943,5 +968,31 @@ mod notify_tests {
         // 未知/缺省 kind 回落审批语义（与旧协议兼容）。
         assert_eq!(classify_socket_kind("unknown"), SocketKind::Permission);
         assert_eq!(classify_socket_kind(""), SocketKind::Permission);
+    }
+}
+
+#[cfg(test)]
+mod v8_tests {
+    /// H1（code-review v8）：mode 闸门纯逻辑——needs_socket() 为假的档位
+    /// （Allow/Deny/Off）必须映射到 fixed_reply 的固定答复，Ask/auto-claude
+    /// 进入询问链路。连接侧闸门行为由真机校准背书。
+    #[test]
+    fn mode_gate_matches_fixed_reply() {
+        for mode in [
+            crate::PermissionMode::Allow,
+            crate::PermissionMode::Deny,
+            crate::PermissionMode::Off,
+        ] {
+            assert!(!mode.needs_socket(), "{mode:?} 不应走询问链路");
+            let r = crate::mcp::fixed_reply(mode);
+            assert_eq!(
+                r.allow,
+                mode == crate::PermissionMode::Allow,
+                "{mode:?} 固定答复方向"
+            );
+        }
+        for mode in [crate::PermissionMode::Ask, crate::PermissionMode::AutoClaude] {
+            assert!(mode.needs_socket(), "{mode:?} 应走询问链路");
+        }
     }
 }
