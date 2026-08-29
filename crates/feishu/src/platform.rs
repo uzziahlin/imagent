@@ -1091,55 +1091,6 @@ impl FeishuPlatform {
 
     /// conv 最近一次入站消息的 sender（轮次发起者近似——每 conv 轮次串行，询问
     /// 登记时取之，作群 conv 下的按钮点击者校验锚；无记录为空串=不校验）。
-    /// bot 对用户消息的表情标注：OnIt（在做了）→ DONE / CrossMark。
-    /// emoji key 真机校准（2026-08）验证可用且**大小写敏感**（全大写报 231001）。
-    /// 翻转 = 删旧表情 + 打新表情；删失败（过期/已撤回）仅 log，新表情照打。
-    async fn react_to_message(
-        &self,
-        conv: &ConvId,
-        source_msg_id: &str,
-        reaction: imagent_core::MsgReaction,
-    ) -> Result<()> {
-        if !source_msg_id.starts_with("om_") {
-            return Ok(()); // 合成消息（按钮回调等）无平台消息锚——no-op。
-        }
-        let emoji = match reaction {
-            imagent_core::MsgReaction::Processing => "OnIt",
-            imagent_core::MsgReaction::Done => "DONE",
-            imagent_core::MsgReaction::Failed => "CrossMark",
-        };
-        // 旧表情先删（翻转语义）：reaction_id 在则删，删失败不阻塞。
-        let old = self
-            .msg_reactions
-            .lock()
-            .await
-            .remove(source_msg_id);
-        let old_del = old.map(|rid| {
-            self.with_token(move |t| {
-                let rid = rid.clone();
-                async move {
-                    crate::client::delete_reaction(&self.core_config, &t, source_msg_id, &rid).await
-                }
-            })
-        });
-        if let Some(fut) = old_del {
-            if let Err(e) = fut.await {
-                warn!(target: "feishu", error = %e, "旧表情删除失败（不阻塞新表情）");
-            }
-        }
-        let rid = self
-            .with_token(|t| async move {
-                crate::client::create_reaction(&self.core_config, &t, source_msg_id, emoji).await
-            })
-            .await?;
-        self.msg_reactions
-            .lock()
-            .await
-            .insert(source_msg_id.to_string(), rid);
-        let _ = conv; // conv 仅日志语义，保留签名对齐 trait。
-        Ok(())
-    }
-
     /// 刷新会话最新卡片记录（card_tail，强提醒加急对象）。
     async fn note_card_tail(&self, conv_id: &str, msg_id: &str) {
         if msg_id.starts_with("om_") {
@@ -1806,6 +1757,56 @@ async fn fetch_cached_token(
 
 #[async_trait]
 impl Platform for FeishuPlatform {
+
+    /// bot 对用户消息的表情标注：OnIt（在做了）→ DONE / CrossMark。
+    /// emoji key 真机校准（2026-08）验证可用且**大小写敏感**（全大写报 231001）。
+    /// 翻转 = 删旧表情 + 打新表情；删失败（过期/已撤回）仅 log，新表情照打。
+    async fn react_to_message(
+        &self,
+        conv: &ConvId,
+        source_msg_id: &str,
+        reaction: imagent_core::MsgReaction,
+    ) -> Result<()> {
+        if !source_msg_id.starts_with("om_") {
+            return Ok(()); // 合成消息（按钮回调等）无平台消息锚——no-op。
+        }
+        let emoji = match reaction {
+            imagent_core::MsgReaction::Processing => "OnIt",
+            imagent_core::MsgReaction::Done => "DONE",
+            imagent_core::MsgReaction::Failed => "CrossMark",
+        };
+        // 旧表情先删（翻转语义）：reaction_id 在则删，删失败不阻塞。
+        let old = self
+            .msg_reactions
+            .lock()
+            .await
+            .remove(source_msg_id);
+        let old_del = old.map(|rid| {
+            self.with_token(move |t| {
+                let rid = rid.clone();
+                async move {
+                    crate::client::delete_reaction(&self.core_config, &t, source_msg_id, &rid).await
+                }
+            })
+        });
+        if let Some(fut) = old_del {
+            if let Err(e) = fut.await {
+                warn!(target: "feishu", error = %e, "旧表情删除失败（不阻塞新表情）");
+            }
+        }
+        let rid = self
+            .with_token(|t| async move {
+                crate::client::create_reaction(&self.core_config, &t, source_msg_id, emoji).await
+            })
+            .await?;
+        self.msg_reactions
+            .lock()
+            .await
+            .insert(source_msg_id.to_string(), rid);
+        let _ = conv; // conv 仅日志语义，保留签名对齐 trait。
+        Ok(())
+    }
+
     async fn recv(&self) -> Result<InboundMessage> {
         self.inbound_rx.lock().await.recv().await.ok_or_else(|| {
             CoreError::Platform(PLATFORM, "入站 channel 已关闭（client 已退出）".into())
