@@ -2,11 +2,12 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
-## [Unreleased]
+## [1.14.0] — 2026-08-29
 
-> **飞书 × Claude 交互通道深度迭代（v3）**：对照业界实现（Claude Code 原生
-> steering/Slack 集成/OpenClaw/claude-code-telegram）review 后的四波 18 项。
-> 600 tests / 0 failed。
+> **飞书 × Claude 交互通道深度迭代（v3）+ 真机校准第一轮**：对照业界实现
+> （Claude Code 原生 steering/Slack 集成/OpenClaw/claude-code-telegram）review
+> 后的四波 18 项，随后真机冒烟校准 9 项修复（下「Fixed（真机校准）」）。
+> 616 tests / 0 failed。
 
 ### Added（W1 快赢）
 - **steering（对齐 Claude Code Esc 语义）**：`/stop` 缺省**保留排队消息**并自动
@@ -71,9 +72,36 @@
 `im.message.reaction.created_v1`（表情审批）、`im.chat.member.bot.added_v1`
 （进群欢迎）。
 
-### 待真机校准
-ASR 的 ogg 编码参数；reaction/bot.added 两事件的 payload 形态（离线按文档
-猜，弱解析缺字段即忽略）。
+### Fixed（真机校准 2026-08-29）
+- **语音转写三处错**：file_recognize 实为 JSON body（非 multipart）+ 路径少
+  `/speech/` 段（旧路径 404 网关纯文本，resp.json 报无信息错误——改为先取
+  原文再解析）+ format 仅收 pcm（语音条 ogg 经 ffmpeg 转 16k s16le；缺
+  ffmpeg 报安装指引）；非 JSON 响应报状态码+片段。
+- **审批卡 note 组件**：schema 2.0 已移除（230099/200861 整卡拒收降级纯文
+  本）——改 markdown+notation 小字。
+- **审批卡视觉**：Bash 代码块直出命令原文（去 pretty JSON 信封的转义噪声）；
+  按钮三轮校准——允许 `primary_filled`/拒绝 `danger_filled` 等宽主行 + 始终
+  允许独立整宽次级行（CardKit `primary` 实为蓝字描边）。
+- **终态卡 tag 组件**：裸 `tag` 被 200621 拒收（结果下沉降级纯文本）——工具
+  统计改 markdown 文本行；/resume 来源徽章同修。
+- **审批卡跨轮复用隐形**：复用槽无时效，新询问 patch 到被顶离视口的历史卡
+  （用户「卡住」直到催办）——收敛 60s 内才可复用。
+- **表情回应事件字段全错**：离线按文档猜的 `operator_id`/`reaction.emoji_key`
+  与实测 payload（`user_id.open_id`/`reaction_type.emoji_type` 顶层
+  `message_id`）不符——点 👍 无反应。按实测重写 + 回归测试。
+- **强提醒迁移卡片加急**：⏰ 催办/✅ 完成不再发 buzz 文本——`urgent_app`
+  对会话最新卡发应用内加急（query 参数 snake_case `user_id_type`，实测），
+  失败回退文本；催办同步 patch 审批卡倒计时行。
+- **完成推送降噪**：含审批短轮次（<1min）不推；刚批准过（60s 内有决定）
+  不推——用户显然在线，终态卡已含信息。
+- **引用回复锚点兜底**：对非询问卡消息（如催办文本）引用回 OK 此前失效——
+  单 pending 无歧义时兜底命中。
+- **/stop 回执命令卡**：中断时「卡+文本+卡」三连割裂——回执改命令卡。
+
+### 真机校准确认的租户侧前置（非代码）
+语音识别 `speech_to_text:speech` 需后台开通并发版（免费版企业不支持，未开通
+报 99991400 HTTP 400 形态）；`im.message.reaction.created_v1` 事件订阅已验
+证生效；bot.added 事件 payload 待群场景校准。
 
 ## [1.13.0] — 2026-08-28
 
