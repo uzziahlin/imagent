@@ -11,9 +11,13 @@ impl Dispatcher {
     /// task 是否已就绪。
     #[cfg(unix)]
     pub(super) fn spawn_socket_accept(&self, sock: String) -> bool {
+        // L15（code-review v8）：compare_exchange 防并发双 bind——原 check-then-act
+        // 在 run() 启动路径与 SIGHUP reload 并发时可双双通过检查（后到者
+        // EADDRINUSE 误报 / 交错留孤儿 listener）。
         if self
             .socket_spawned
-            .load(std::sync::atomic::Ordering::Acquire)
+            .compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire)
+            .is_err()
         {
             return true; // 已在运行（R-2：accept task 监听 shutdown，进程内只 spawn 一次）
         }
@@ -164,9 +168,6 @@ impl Dispatcher {
                 }
             }
         });
-        // D12：accept task 已起（监听 shutdown，进程内常驻），置幂等位。
-        self.socket_spawned
-            .store(true, std::sync::atomic::Ordering::Release);
         true
     }
 
@@ -741,6 +742,16 @@ impl Dispatcher {
         .await
         {
             super::AskWaitOutcome::Replied(r) => {
+                // L2（code-review v8）：淘汰哨兵 → 与 TimedOut 同款平台收敛
+                //（撤卡防过期点击），再原样回 deny。
+                if r.raw_text.as_deref() == Some(crate::permission::EVICTED_SENTINEL) {
+                    if let Err(e) = platform
+                        .cancel_permission_ask(&conv, &request_id)
+                        .await
+                    {
+                        warn!(target: "imagent::core", error = %e, "淘汰询问收敛失败");
+                    }
+                }
                 METRICS
                     .permission_decisions
                     .with_label_values(&[if r.allow { "allow" } else { "deny" }])

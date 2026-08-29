@@ -1024,7 +1024,13 @@ impl FeishuPlatform {
                 let settings =
                     serde_json::json!({ "config": { "streaming_mode": false } }).to_string();
                 let seq2 = self.next_card_seq(card_id).await;
-                patch_card_settings(token, card_id, &settings, seq2).await?;
+                let res = patch_card_settings(token, card_id, &settings, seq2).await;
+                // L1（code-review v8）：终态清理（与 im-patch 终态分支同语义）——
+                // card_seqs/card_footers 每卡 2 条泄漏、无 cap 无过期；清理放在
+                // settings patch 之后（失败也不致命：条目泄漏 ≠ 功能受损）。
+                self.card_seqs.lock().await.remove(card_id);
+                self.card_footers.lock().await.remove(card_id);
+                res?;
                 element
             }
         }
@@ -1705,6 +1711,14 @@ impl Platform for FeishuPlatform {
         if !source_msg_id.starts_with("om_") {
             return Ok(()); // 合成消息（按钮回调等）无平台消息锚——no-op。
         }
+        // L3（code-review v8）：排队 ⏳ 与 runner 👀 并发交错竞态兜底——打 ⏳
+        // 前若该消息已有表情登记（runner 侧已接管），跳过（防同消息双表情、
+        // ⏳ 在已完成消息上永久残留）。
+        if matches!(reaction, imagent_core::MsgReaction::Queued)
+            && self.msg_reactions.lock().await.contains_key(source_msg_id)
+        {
+            return Ok(());
+        }
         let emoji = match reaction {
             imagent_core::MsgReaction::Queued => "OneSecond",
             imagent_core::MsgReaction::Processing => "OnIt",
@@ -1979,12 +1993,6 @@ impl Platform for FeishuPlatform {
                 sender_opt,
                 timeout,
             );
-            let render = AskRender {
-                question: false,
-                tool_name: tool_name.to_string(),
-                input: input_summary.to_string(),
-                sender: sender.clone(),
-            };
             return match self
                 .with_token(|t| {
                     let root_id = root_id.clone();
@@ -2235,6 +2243,19 @@ impl Platform for FeishuPlatform {
                 return Ok(());
             }
             notes.insert(conv.0.clone(), note.to_string());
+        }
+        // L17（code-review v8）：快照→网络→patch 期间终态可能已落——重渲染前
+        // 复查 pending 仍是快照的 request_id，否则放弃（防终态卡被翻回带按钮
+        // 的 pending 态误导点击；过期点击本有时效兜底，此处消歧义）。
+        {
+            let slots = self.ask_slots.lock().await;
+            let still_pending = slots
+                .get(&conv.0)
+                .map(|sl| sl.pending_req.as_deref() == Some(request_id.as_str()))
+                .unwrap_or(false);
+            if !still_pending {
+                return Ok(());
+            }
         }
         let card_json = if render.question {
             crate::card::render_question_card_note(

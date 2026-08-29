@@ -128,6 +128,10 @@ const DENY_WORDS: &[&str] = &[
 
 /// 「始终允许」词表（D-记忆：本次会话内该工具后续调用跳过审批）。
 /// 全字匹配（trim + 小写），与 allow/deny 词表同口径。
+/// L2：pending 淘汰（超上限挤最旧）哨兵——dispatch 的 Replied 分支据此触发
+/// 平台侧收敛（等同 TimedOut 路径）。
+pub const EVICTED_SENTINEL: &str = "imagent:evicted";
+
 const ALWAYS_WORDS: &[&str] = &["always", "始终允许", "会话内允许"];
 
 /// 文本是否命中「始终允许」词表（parse_reply 据此置 `always` 标志）。
@@ -240,6 +244,9 @@ pub struct RoutedDecision {
     pub tool_name: Option<String>,
     /// Wave B-11：从 register 到用户回复的等待秒数（审批响应时长）。
     pub waited_secs: u64,
+    /// L6（code-review v8）：pending 类别——Ask（终端问答）命中不落审批审计
+    ///（防 /stats 的 allow/deny/timeout 占比失真）。
+    pub kind: PendingKind,
 }
 
 /// per-conv × request_id 权限请求路由表（多 pending 并存）。
@@ -410,11 +417,14 @@ impl PermissionRouter {
         list.push(entry);
         while list.len() > PENDING_PER_CONV_CAP {
             let oldest = list.remove(0);
+            // L2（code-review v8）：淘汰携带哨兵 raw_text——Replied 分支据此走与
+            // TimedOut 同款的平台收敛（撤卡），防残留 pending 卡点「允许」→
+            // route miss → 字面 "y" 被当 prompt 跑一轮 agent。
             let _ = oldest.tx.send(PermissionReply {
                 allow: false,
                 always: false,
                 message: Some("cancelled（pending 超上限，最旧询问被收敛）".into()),
-                raw_text: None,
+                raw_text: Some(EVICTED_SENTINEL.to_string()),
             });
         }
         rx
@@ -481,6 +491,7 @@ impl PermissionRouter {
             request_id: hit.request_id,
             tool_name: hit.tool_name,
             waited_secs,
+            kind: hit.kind,
         })
     }
 

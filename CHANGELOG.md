@@ -105,7 +105,18 @@
 
 ## [Unreleased]
 
-> canUseTool 控制通道（审批传输机制迁移，config 可切）。
+> canUseTool 控制通道（审批传输机制迁移，config 可切）+ code-review v8 全量修复（27 项：H1-H3 / M1-M7 / L1-L17，详见 docs/CODE_REVIEW_v8.md）。
+
+### Fixed（code-review v8）
+- **H1** control 通道不感知 permission_mode（deny 可被审批卡绕过 / allow 退化 deny）——socket 侧 mode 闸门 + FullLoop 后端恒 bind。
+- **H2** ACP 子进程全量继承环境（S-2 缺口）——`env -i` + 白名单前导。
+- **H3** wecom 分片 `message_max_len≤3` 零前进死循环——clamp ≥4 + 启动校验。
+- **M1/M6** 飞书 13 处裸 HTTP client（无超时、每请求新建）——共享 client（API 30s / 流式仅连接超时）+ SDK req_timeout。
+- **M4** ACP 无 title 权限请求 fail-open——哨兵恒过审。
+- **M5** WS 退避不因健康断连重置（例行踢连累计 30s 封顶）——存活 ≥60s 重置 1s。
+- **M7** ACP 用户消息回显污染流式卡——忽略 UserMessageChunk。
+- **L1-L17**（择要）：patch_managed 终态 map 泄漏 / pending 淘汰不收敛平台侧 / 排队⏳竞态残留 / 排队提示守卫写反 / /timeout 溢出与 batch_window 热改无上限 / ask 污染审批审计 / /cd 在 ACP 空闲窗不生效 / 卡片 `<at>` 注入 / md_body 无截断 O(n²) / instance.lock truncate 顺序 / export 无 0600 / ilink 下载 URL 未编码 / /model 注入 ACP 命令串 / metrics 非恒定时间比较 / socket_spawned CAS / always 死代码 / 询问卡 note 竞态。
+- **M2**（评估未修）：ACP IO 无上限——SDK 无注入点，文档化 + follow-up。
 
 ### Added
 - **`claude_permission_channel = "control" | "mcp"`（缺省 control）**：claude 审批

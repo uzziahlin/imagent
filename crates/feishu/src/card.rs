@@ -16,6 +16,14 @@ use imagent_core::{
 /// 触发是 git commit 的 Co-Authored-By 尾注。改写 `@` 为 `[at]`（刻意不用全角＠
 /// 或零宽字符：中文审计会归一化还原后再次触发拦截；`[at]` 无法还原为合法地址）。
 /// 点分 TLD 要求避开 npm scope（`@larksuite/x`）、版本号（`pkg@1.2.3`）与裸句柄；
+
+/// L8（code-review v8）：markdown 语义层 `<` 转义——用户可控文本经 bot 卡片
+/// 渲染时 `<at id=…></at>` 可以 bot 名义 @ 任意租户用户。只转 `<`（JSON 层
+/// serde 已封死结构注入；`[` 链接伪装的格式损失大于收益，v4 评估结论维持）。
+fn escape_lt(text: &str) -> String {
+    text.replace('<', "\\<")
+}
+
 /// SSH remote（`git@host.tld`）会被掩码——审计同样拦它，掩了才能发出去。
 pub(crate) fn mask_emails(s: &str) -> String {
     use std::sync::OnceLock;
@@ -191,7 +199,7 @@ pub fn render_card(card: &OutboundCard, conv_id: &str, sender: Option<&str>) -> 
         Some(t) => format!("{t}\n\n{text}"),
         None => text.into_owned(),
     };
-    elements.push(serde_json::json!({ "tag": "markdown", "content": mask_emails(&body_md) }));
+    elements.push(serde_json::json!({ "tag": "markdown", "content": escape_lt(&mask_emails(&body_md)) }));
     if !card.tool_calls.is_empty() {
         // 长正文分段：正文与工具面板间用真 hr 组件分隔（降级路径专属——
         // managed 路径的 md_body 是单 markdown 组件，用 `---` 文本分割线，
@@ -498,7 +506,24 @@ pub fn render_stream_init_card(conv_id: &str, sender: Option<&str>) -> String {
 /// W2-1/W2-2：任务清单（checklist）置于正文**上方**（进度条语义，用户优先看
 /// 到进行到哪一步）；思考过程取最近 1 条置底（实时「在想什么」，历史思考终态
 /// 回看）。off 档的 Thought 在 core 侧已被过滤（不进卡）。
-pub fn stream_body_md(card: &OutboundCard) -> String {
+fn stream_body_md_inner(card: &OutboundCard) -> String {
+    // L9（code-review v8）：managed md_body 全量重传是 O(n²) 上传流量，且超
+    // ~30KB 元素上限后 Running 帧持续失败——Running 态保留头/尾窗口（各
+    // 12KB，中间截断标注）；终态全量走 stream_body_final（纯文本兜底不丢内容）。
+    let full = stream_body_md_inner_full(card);
+    const HEAD: usize = 12_000;
+    const TAIL: usize = 12_000;
+    if full.chars().count() <= HEAD + TAIL + 100 {
+        return full;
+    }
+    let chars: Vec<char> = full.chars().collect();
+    let head: String = chars[..HEAD].iter().collect();
+    let tail: String = chars[chars.len() - TAIL..].iter().collect();
+    let omitted = chars.len() - HEAD - TAIL;
+    format!("{head}\n\n…（流式中段已截断 {omitted} 字符，完整内容见终态）…\n\n{tail}")
+}
+
+fn stream_body_md_inner_full(card: &OutboundCard) -> String {
     let mut out = String::new();
     if let Some(todos) = todo_list_md(&card.todos) {
         out.push_str(&todos);
@@ -540,6 +565,10 @@ pub fn stream_body_md(card: &OutboundCard) -> String {
         out.push_str("🧠 已接收任务，正在处理…");
     }
     mask_emails(&out)
+}
+
+pub fn stream_body_md(card: &OutboundCard) -> String {
+    escape_lt(&stream_body_md_inner(card))
 }
 
 /// W2-2：任务清单 → markdown checklist 段（`- [x]`/`- [ ]`；进行中行尾 ⏳），
@@ -594,7 +623,7 @@ fn truncate_chars(s: &str, n: usize) -> String {
 ///
 /// W2-1/W2-2：任务清单终态置于正文上方（完成态 checklist）；思考过程取最近
 /// 5 条以「💭 思考过程」段落收尾（流式期只显 1 条，终态补足回看）。
-pub fn stream_body_final(card: &OutboundCard, err: Option<&str>) -> String {
+fn stream_body_final_inner(card: &OutboundCard, err: Option<&str>) -> String {
     let text = &card.text;
     let tool_calls = &card.tool_calls;
     let mut out = String::new();
@@ -650,6 +679,10 @@ pub fn stream_body_final(card: &OutboundCard, err: Option<&str>) -> String {
         out.push_str("（未返回内容）");
     }
     mask_emails(&out)
+}
+
+pub fn stream_body_final(card: &OutboundCard, err: Option<&str>) -> String {
+    escape_lt(&stream_body_final_inner(card, err))
 }
 
 /// 终态「结果下沉」指针正文（P8-2）：本轮发过询问卡（流式卡已被顶离视口）时，

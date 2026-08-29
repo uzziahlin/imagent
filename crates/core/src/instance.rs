@@ -33,10 +33,11 @@ pub fn acquire(home: &Path) -> Result<std::fs::File> {
     #[cfg(unix)]
     let lock = home.join("instance.lock");
     // O_CREAT（非 create_new）：锁文件可以复用，互斥由 flock 保证而非文件存在性。
+    // L10（code-review v8）：open 不带 truncate——先 truncate 会把第一实例写入
+    // 的 PID 清空，flock 失败的诊断恒为「pid 未知」；拿到锁之后再清写 PID。
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(true)
         .open(&lock)
         .map_err(CoreError::Io)?;
     if !try_flock_exclusive(&f) {
@@ -53,7 +54,9 @@ pub fn acquire(home: &Path) -> Result<std::fs::File> {
             lock.display()
         )));
     }
-    // 写 PID 供诊断（失败不致命——互斥不依赖文件内容）。
+    // 写 PID 供诊断（失败不致命——互斥不依赖文件内容）。L10：锁到手后先清旧
+    // 内容（复用锁文件时上一持有者的 PID 不应残留）。
+    let _ = f.set_len(0);
     let _ = writeln!(f, "{}", std::process::id());
     Ok(f)
 }

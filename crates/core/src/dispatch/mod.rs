@@ -1067,10 +1067,19 @@ impl Dispatcher {
                                     msg.sender.0,
                                     decision.waited_secs
                                 );
+                                // L6（code-review v8）：终端问答（Ask）命中不落审批
+                                // 审计——/stats 的审批占比口径只统计真权限决策。
+                                let audit_action = if decision.kind
+                                    == crate::permission::PendingKind::Ask
+                                {
+                                    "ask_answer"
+                                } else {
+                                    "permission_decision"
+                                };
                                 if let Err(e) = self
                                     .store
                                     .append_audit(
-                                        "permission_decision",
+                                        audit_action,
                                         Some(&msg.sender.0),
                                         Some(&conv_id),
                                         Some(&audit_detail),
@@ -1267,7 +1276,15 @@ impl Dispatcher {
                 }
                 // S-3/S-4 竞态兜底：锁外写 hint 期间本批可能已被 runner 取走（queues
                 // entry 已移除、hint 已清）——复查一次，entry 不在则撤回 stale hint。
-                if self.queues.lock().await.get(conv).is_none() {
+                if self
+                    .queues
+                    .lock()
+                    .await
+                    .get(conv)
+                    .is_none_or(|q| q.is_empty())
+                {
+                    // L4（code-review v8）：取批留空 Vec 不删 entry——原 is_none()
+                    // 守卫漏过「entry 在但已空」形态，stale hint 永不撤回。
                     self.queued_hints.lock().await.remove(conv);
                 }
                 false

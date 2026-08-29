@@ -215,6 +215,8 @@ pub struct ControlIo {
 fn control_response_line(request_id: &str, reply: &crate::permission::PermissionReply) -> String {
     // 真机校准（2026-08-30 实测 2.1.250）：request_id/subtype 嵌在 response 内、
     // 决定再嵌一层（顶层形态 claude 不认，表现为审批后无 tool_result）。
+    // L16（code-review v8）：always 语义不回传 updatedPermissions——网关侧
+    // session_allows 已短路后续同工具询问（route 路径），回传属死代码。
     let behavior = if reply.allow { "allow" } else { "deny" };
     let resp = serde_json::json!({
         "type": "control_response",

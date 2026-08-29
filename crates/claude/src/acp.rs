@@ -274,7 +274,7 @@ impl AcpBackend {
         ] {
             match std::env::var(key) {
                 Ok(v) if safe(&v) => assignments.push(format!("{key}={v}")),
-                Ok(v) => tracing::warn!(
+                Ok(_v) => tracing::warn!(
                     target: "claude-acp",
                     key,
                     "ACP env 白名单值含非常规字符，跳过注入"
@@ -458,6 +458,10 @@ impl LongLivedAcp {
                     // 在旧上下文。这里仅跟踪**连接当前已 load 的 session**（同 sid 连续
                     // 轮次免重复 LoadSession 的纯优化），无 per-conv 状态。
                     let mut loaded: Option<String> = None;
+                    // L7（code-review v8）：连接已 load 的 cwd——/cd 切目录后同
+                    // session 的下一轮须重发 LoadSession（缓存只比 sid 不比 cwd
+                    // 会让新 cwd 不传递，与「已切到 X，下条消息生效」承诺相悖）。
+                    let mut loaded_cwd: Option<std::path::PathBuf> = None;;
                     // B2/P5-14：每轮用 sleep_until 实现空闲回收——完成一个 turn 后
                     // 重新起算 CONN_IDLE_RECYCLE 窗口，窗口内无新 prompt 则退出
                     //（connection drop → ChildGuard kill 子进程，名额让出）。
@@ -481,7 +485,12 @@ impl LongLivedAcp {
                         *current_for_main.lock().await = Some(st.clone());
                         let cwd = req.cwd.clone();
                         let sid = match req.session.clone() {
-                            Some(s) if loaded.as_deref() == Some(s.as_str()) => s,
+                            Some(s)
+                                if loaded.as_deref() == Some(s.as_str())
+                                    && loaded_cwd.as_deref() == Some(cwd.as_path()) =>
+                            {
+                                s
+                            }
                             Some(s) => match connection
                                 .send_request(LoadSessionRequest::new(s.clone(), cwd.clone()))
                                 .block_task()
@@ -489,6 +498,7 @@ impl LongLivedAcp {
                             {
                                 Ok(_) => {
                                     loaded = Some(s.clone());
+                                    loaded_cwd = Some(cwd.clone());
                                     s
                                 }
                                 Err(e) => {
