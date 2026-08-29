@@ -162,9 +162,13 @@ fn backend_failure_reply(backend_name: &str) -> String {
 
 /// Wave B-1：审批等待过半的加急催办文案（纯函数，便于单测）。
 /// 剩余分钟向上取整（剩 30 秒显示「剩 1 分钟」，宁多勿少）。
+/// 真机校准（2026-08）：措辞平台中立——卡片平台按钮/👍 可用，纯文本平台
+/// 回复 y/n；审批卡可能已被后续消息顶到上方，指明位置。
 fn approval_buzz_text(tool_name: &str, remaining: Duration) -> String {
     let mins = remaining.as_secs().div_ceil(60).max(1);
-    format!("⏰ 审批即将超时（剩 {mins} 分钟）：{tool_name}——回复 y/n 即可")
+    format!(
+        "⏰ 审批即将超时（剩 {mins} 分钟）：{tool_name}——点上方审批卡的按钮或 👍，回复 y/n 亦可"
+    )
 }
 
 /// Wave B-1：审批等待出口（`wait_reply_with_buzz` 的结果，与原 timeout 包裹的

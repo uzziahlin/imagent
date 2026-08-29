@@ -3838,7 +3838,7 @@ fn approval_buzz_text_formats() {
     assert!(t.contains("⏰"), "{t}");
     assert!(t.contains("剩 3 分钟"), "150s → 3 分钟: {t}");
     assert!(t.contains("Bash"), "{t}");
-    assert!(t.contains("回复 y/n 即可"), "{t}");
+    assert!(t.contains("回复 y/n 亦可"), "{t}");
     // 30 秒 → 1 分钟（向上取整，宁多勿少）。
     assert!(super::approval_buzz_text("WebFetch", Duration::from_secs(30)).contains("剩 1 分钟"),);
 }
