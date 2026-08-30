@@ -94,7 +94,7 @@ pub fn parse_line(line: &str) -> ParsedEvent {
             // 该形态跳过，继续等真实轮次输出（或自然 EOF）。
             if text.is_empty()
                 && !is_error
-                && value.get("stop_reason").map_or(true, |v| v.is_null())
+                && value.get("stop_reason").is_none_or(|v| v.is_null())
                 && value.get("num_turns").and_then(Value::as_u64) == Some(0)
             {
                 return ParsedEvent::Skip;
