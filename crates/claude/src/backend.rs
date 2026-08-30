@@ -179,6 +179,18 @@ const NAME: &str = "claude-cli";
 ///   default 手动把关 = 每个提示都进 IM，全量交给用户）。与 approval_tools 可
 ///   叠加（剩余提示再按清单过滤）。旧版 CLI（<2.1.228）不认 auto 会静默回退
 ///   default（≈ask 档行为，降级安全）。
+fn claude_native_perm_args(mode: PermissionMode, native_override: Option<&str>) -> Vec<String> {
+    let native: Option<String> = match native_override {
+        Some(m) => Some(m.to_string()),
+        None if mode == PermissionMode::AutoClaude => Some("auto".to_string()),
+        None => None,
+    };
+    match native {
+        Some(m) => vec!["--permission-mode".to_string(), m],
+        None => Vec::new(),
+    }
+}
+
 /// Control 通道首条 stdin 消息（SDK 式 user 投递，`--input-format stream-json`）：
 /// `{"type":"user","message":{"role":"user","content":[{"type":"text","text":…}]}}`。
 /// 形态**待真机校准**（SDK 公开协议建模；resume 仍走 `--resume` flag）。
@@ -191,18 +203,6 @@ fn sdk_user_message(prompt: &str) -> String {
         }
     });
     format!("{msg}\n")
-}
-
-fn claude_native_perm_args(mode: PermissionMode, native_override: Option<&str>) -> Vec<String> {
-    let native: Option<String> = match native_override {
-        Some(m) => Some(m.to_string()),
-        None if mode == PermissionMode::AutoClaude => Some("auto".to_string()),
-        None => None,
-    };
-    match native {
-        Some(m) => vec!["--permission-mode".to_string(), m],
-        None => Vec::new(),
-    }
 }
 
 fn permission_sock_path() -> String {
