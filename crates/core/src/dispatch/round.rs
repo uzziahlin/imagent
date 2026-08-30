@@ -711,7 +711,7 @@ impl Dispatcher {
             .router
             .secs_since_decision(&conv.0)
             .await
-            .map_or(false, |s| s < 60);
+            .is_some_and(|s| s < 60);
         if outcome.terminal
             && should_buzz_done(elapsed, asks_delta)
             && !user_present
