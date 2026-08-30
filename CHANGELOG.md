@@ -103,9 +103,9 @@
 报 99991400 HTTP 400 形态）；`im.message.reaction.created_v1` 事件订阅已验
 证生效；bot.added 事件 payload 待群场景校准。
 
-## [Unreleased]
+## [1.15.0] — 2026-08-30
 
-> canUseTool 控制通道（审批传输机制迁移，config 可切）+ code-review v8 全量修复（27 项：H1-H3 / M1-M7 / L1-L17，详见 docs/CODE_REVIEW_v8.md）。
+> canUseTool 控制通道（审批传输机制迁移，config 可切）+ code-review v8 全量修复（27 项）+ 真机校准第三轮。626 tests / 0 failed。
 
 ### Fixed（code-review v8）
 - **H1** control 通道不感知 permission_mode（deny 可被审批卡绕过 / allow 退化 deny）——socket 侧 mode 闸门 + FullLoop 后端恒 bind。
@@ -117,6 +117,18 @@
 - **M7** ACP 用户消息回显污染流式卡——忽略 UserMessageChunk。
 - **L1-L17**（择要）：patch_managed 终态 map 泄漏 / pending 淘汰不收敛平台侧 / 排队⏳竞态残留 / 排队提示守卫写反 / /timeout 溢出与 batch_window 热改无上限 / ask 污染审批审计 / /cd 在 ACP 空闲窗不生效 / 卡片 `<at>` 注入 / md_body 无截断 O(n²) / instance.lock truncate 顺序 / export 无 0600 / ilink 下载 URL 未编码 / /model 注入 ACP 命令串 / metrics 非恒定时间比较 / socket_spawned CAS / always 死代码 / 询问卡 note 竞态。
 - **M2**（评估未修）：ACP IO 无上限——SDK 无注入点，文档化 + follow-up。
+
+### Fixed（真机校准第三轮 2026-08-30）
+- **canUseTool 协议三处实测修正**：`--permission-prompt-tool stdio` 接线（缺省
+  不传则 claude 直接拒绝未批工具、不发 control_request）；请求 payload 嵌套在
+  `request` 键下；响应 request_id/决定嵌套在 `response` 内层。真机闭环验证通过。
+- **control 通道终态悬挂两连修**：终态事件 break 只跳内层 for（外层读循环等
+  EOF 而 stream-input 模式 claude 不退出）+ 超时 kill 只杀直接子进程（孙进程
+  持 stderr 管道使收尾悬挂 3 分钟看门狗兜底）——假 claude 脚本本地复现定位。
+- **取消审批卡复用**（每次询问发新卡）：跨轮复用曾致隐形审批、残留旧卡致点错。
+- **卡片字节上限三连修**：卡片限制按字节计（字符截断形同虚设，24K 字符被
+  200860 拒）——字节制头尾窗口（4KB+4KB）三渲染路径统一；终态 patch 超限
+  失败时最小化终态卡兜底收敛（不再停「思考中」孤儿卡）。
 
 ### Added
 - **`claude_permission_channel = "control" | "mcp"`（缺省 control）**：claude 审批
