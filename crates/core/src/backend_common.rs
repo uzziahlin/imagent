@@ -265,6 +265,51 @@ fn ev_id_of(ev: &CliEvent) -> Option<String> {
     }
 }
 
+/// TaskList 工具结果 → 全量待办快照（真机校准 2026-08-30 实测形态：每行
+/// `#N [status] subject`）。桌面端（Claude Code 终端）创建的任务也在此权威
+/// 视图中——模型 resume 后调 TaskList 即可让面板补全历史任务。无任何可解析
+/// 行返回 None（不动既有清单）。
+fn parse_task_list_snapshot(output: &str) -> Option<Vec<(String, TodoItem)>> {
+    let mut out = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix('#') else {
+            continue;
+        };
+        let Some(sp) = rest.find(' ') else { continue };
+        let (id, rest2) = rest.split_at(sp);
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let Some(open) = rest2.find('[') else {
+            continue;
+        };
+        let Some(close) = rest2.find(']') else {
+            continue;
+        };
+        if open >= close {
+            continue;
+        }
+        let status = match &rest2[open + 1..close] {
+            "completed" => TodoStatus::Completed,
+            "in_progress" => TodoStatus::InProgress,
+            _ => TodoStatus::Pending,
+        };
+        let text = rest2[close + 1..].trim();
+        if text.is_empty() {
+            continue;
+        }
+        out.push((
+            id.to_string(),
+            TodoItem {
+                text: text.to_string(),
+                status,
+            },
+        ));
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 /// TaskCreate 工具结果回填：解析 `Task #N created successfully`（实测形态），
 /// 回填占位条目的真实 id；无该形态（失败）则移除占位行（防幽灵清单项）。
 /// 返回是否变化（变化即重发快照）。
@@ -437,6 +482,9 @@ pub async fn spawn_cli_backend(
     // TaskCreate 的 tool_use id → 占位行 index（结果到达后回填真实任务 id）。
     let mut pending_task_creates: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
+    // TaskList 调用的 tool_use id（结果到达即整表替换快照）。
+    let mut pending_task_lists: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     loop {
         let line = match read_line_capped(&mut reader, MAX_STDOUT_LINE_BYTES).await {
@@ -592,12 +640,18 @@ pub async fn spawn_cli_backend(
                     ref tool,
                     ref input,
                     ..
-                } if tool == "TaskCreate" || tool == "TaskUpdate" => {
+                } if tool == "TaskCreate" || tool == "TaskUpdate" || tool == "TaskList" => {
                     // Task* 工具族 → 待办清单（全量快照语义，与 TodoWrite 路径
                     // 同一 chunk 类型）。仍落入下方通用 ToolUse 处理（工具轨迹
                     // 面板同样展示）——此处只追加清单 chunk。
                     let before = task_todos.len();
                     if apply_task_tool(&mut task_todos, tool, input) {
+                        if tool == "TaskList" {
+                            // 结果即全量权威快照（含桌面端创建的历史任务）。
+                            if let Some(tuid) = ev_id_of(&ev) {
+                                pending_task_lists.insert(tuid);
+                            }
+                        }
                         if tool == "TaskCreate" && before < task_todos.len() {
                             // 占位行 index 记账，等结果回填真实 id（会话级编号，
                             // --resume 后非 1 起）。
@@ -662,6 +716,26 @@ pub async fn spawn_cli_backend(
                             let items = task_todos.iter().map(|(_, it)| it.clone()).collect();
                             let _ = chunks.send(AgentChunk::TodoList { items }).await;
                         }
+                    }
+                    let CliEvent::ToolResult { tool, output, id } = ev else {
+                        unreachable!("已按 ToolResult 分派")
+                    };
+                    let _ = chunks
+                        .send(AgentChunk::ToolResult { tool, output, id })
+                        .await;
+                }
+                CliEvent::ToolResult {
+                    ref tool,
+                    ref output,
+                    ref id,
+                } if tool == "TaskList"
+                    && id.as_deref().is_some_and(|t| pending_task_lists.remove(t)) =>
+                {
+                    // TaskList 结果 = 全量权威快照：整表替换（含桌面端历史任务）。
+                    if let Some(snapshot) = parse_task_list_snapshot(output) {
+                        task_todos = snapshot;
+                        let items = task_todos.iter().map(|(_, it)| it.clone()).collect();
+                        let _ = chunks.send(AgentChunk::TodoList { items }).await;
                     }
                     let CliEvent::ToolResult { tool, output, id } = ev else {
                         unreachable!("已按 ToolResult 分派")
@@ -991,8 +1065,8 @@ const ALWAYS_PASSTHROUGH_ENV: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_task_tool, image_write_path, resolve_task_create_result, spawn_cli_backend, CliEvent,
-        ControlIo,
+        apply_task_tool, image_write_path, parse_task_list_snapshot, resolve_task_create_result,
+        spawn_cli_backend, CliEvent, ControlIo,
     };
     use crate::types::{TodoItem, TodoStatus};
 
@@ -1259,5 +1333,24 @@ mod tests {
             "Error: task tool disabled"
         ));
         assert!(fail.is_empty(), "失败创建移除占位行");
+    }
+    /// 真机校准（2026-08-30）：TaskList 结果快照（`#N [status] subject`）——
+    /// 含桌面端历史任务；杂行跳过；无可解析行返回 None（不动既有清单）。
+    #[test]
+    fn task_list_snapshot_parses_authoritative_view() {
+        let snap = parse_task_list_snapshot(
+            "#1 [completed] 盘点 Makefile\n#2 [in_progress] 编写 justfile\n#7 [pending] 桌面端遗留任务\n杂行\n#x [bad]",
+        )
+        .expect("应解析出 3 行");
+        assert_eq!(snap.len(), 3);
+        assert_eq!(snap[0].0, "1");
+        assert_eq!(snap[0].1.status, TodoStatus::Completed);
+        assert_eq!(snap[1].1.text, "编写 justfile");
+        assert_eq!(snap[1].1.status, TodoStatus::InProgress);
+        assert_eq!(snap[2].0, "7", "桌面端遗留任务按真实 id 进入面板");
+        assert_eq!(snap[2].1.status, TodoStatus::Pending);
+        // 空/全杂行 → None。
+        assert!(parse_task_list_snapshot("no tasks here").is_none());
+        assert!(parse_task_list_snapshot("").is_none());
     }
 }
