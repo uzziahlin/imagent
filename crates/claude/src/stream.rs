@@ -87,6 +87,18 @@ pub fn parse_line(line: &str) -> ParsedEvent {
                 .get("is_error")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            // 真机校准（2026-08-30）：resume 带后台子任务的会话时，CLI 在 init
+            // 后立刻发退化 result（stop_reason:null + num_turns:0 + 无文本，伴随
+            // task_notification stopped）——控制面事件而非本轮终态。若当 Final
+            // 处理会 break 读循环 → 无文本 → kill → 误报「SIGKILL 无文本」失败。
+            // 该形态跳过，继续等真实轮次输出（或自然 EOF）。
+            if text.is_empty()
+                && !is_error
+                && value.get("stop_reason").map_or(true, |v| v.is_null())
+                && value.get("num_turns").and_then(Value::as_u64) == Some(0)
+            {
+                return ParsedEvent::Skip;
+            }
             ParsedEvent::Result {
                 text,
                 is_error,

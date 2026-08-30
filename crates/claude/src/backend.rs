@@ -914,4 +914,23 @@ mod tests {
         b.set_permission_channel("nope");
         assert_eq!(*b.permission_channel.read(), PermissionChannel::Control);
     }
+    /// 真机校准（2026-08-30）：resume 带后台子任务会话时 init 后立刻出现的
+    /// 退化 result（stop_reason:null + num_turns:0 + 无文本）是控制面事件，
+    /// 不当终态（否则 break 读循环 → kill → 误报失败）。正常 result 不受影响。
+    #[test]
+    fn degenerate_result_is_skipped() {
+        let degenerate = r#"{"type":"result","is_error":false,"duration_api_ms":0,"num_turns":0,"stop_reason":null,"session_id":"s1"}"#;
+        assert!(
+            matches!(claude_parse(degenerate), CliEvent::Skip),
+            "退化 result 应跳过"
+        );
+        // 正常空文本 result（有 stop_reason）仍是终态。
+        let normal_empty = r#"{"type":"result","is_error":false,"num_turns":2,"stop_reason":"end_turn","session_id":"s1"}"#;
+        assert!(
+            matches!(claude_parse(normal_empty), CliEvent::Final { .. }),
+            "正常 result 保持终态语义"
+        );
+        let normal = r#"{"type":"result","is_error":false,"num_turns":1,"stop_reason":"end_turn","result":"ok","session_id":"s1"}"#;
+        assert!(matches!(claude_parse(normal), CliEvent::Final { .. }));
+    }
 }
