@@ -210,9 +210,13 @@ fn apply_task_tool(list: &mut Vec<(String, TodoItem)>, tool: &str, input_json: &
             let Some(subject) = v.get("subject").and_then(|s| s.as_str()) else {
                 return false;
             };
-            let id = (list.len() + 1).to_string();
+            // 真实任务 id 是**会话级连续编号**（真机校准 2026-08-30：--resume 后
+            // 新任务 #3 而非 #1），创建时未知——先占位（空 id），由创建调用的
+            // 工具结果（"Task #N created"）经 tool_use id 配对回填（见
+            // [`resolve_task_create_result`]）。占位期间 TaskUpdate 匹配不到
+            // 是安全的：模型引用 id 必然晚于创建结果返回。
             list.push((
-                id,
+                String::new(),
                 TodoItem {
                     text: subject.to_string(),
                     status: TodoStatus::Pending,
@@ -250,6 +254,54 @@ fn apply_task_tool(list: &mut Vec<(String, TodoItem)>, tool: &str, input_json: &
             changed
         }
         _ => false,
+    }
+}
+
+/// 从 CliEvent::ToolUse 取工具调用 id（W2-3 配对键）。
+fn ev_id_of(ev: &CliEvent) -> Option<String> {
+    match ev {
+        CliEvent::ToolUse { id, .. } => id.clone(),
+        _ => None,
+    }
+}
+
+/// TaskCreate 工具结果回填：解析 `Task #N created successfully`（实测形态），
+/// 回填占位条目的真实 id；无该形态（失败）则移除占位行（防幽灵清单项）。
+/// 返回是否变化（变化即重发快照）。
+fn resolve_task_create_result(
+    list: &mut Vec<(String, TodoItem)>,
+    index: usize,
+    output: &str,
+) -> bool {
+    let real_id = output
+        .find("Task #")
+        .and_then(|i| {
+            output[i + 6..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse::<u32>()
+                .ok()
+        })
+        .map(|n| n.to_string());
+    match real_id {
+        Some(id) => {
+            if list.get(index).is_some_and(|(cur, _)| cur.is_empty()) {
+                list[index].0 = id;
+                true
+            } else {
+                false
+            }
+        }
+        None => {
+            // 创建失败：移除占位行（保持 display 顺序）。
+            if index < list.len() {
+                list.remove(index);
+                true
+            } else {
+                false
+            }
+        }
     }
 }
 
@@ -382,6 +434,9 @@ pub async fn spawn_cli_backend(
     let mut terminal_seen = false;
     // Task* 工具族的待办累积（claude 2.x 的 TodoWrite 后继，见 apply_task_tool）。
     let mut task_todos: Vec<(String, TodoItem)> = Vec::new();
+    // TaskCreate 的 tool_use id → 占位行 index（结果到达后回填真实任务 id）。
+    let mut pending_task_creates: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
 
     loop {
         let line = match read_line_capped(&mut reader, MAX_STDOUT_LINE_BYTES).await {
@@ -541,7 +596,15 @@ pub async fn spawn_cli_backend(
                     // Task* 工具族 → 待办清单（全量快照语义，与 TodoWrite 路径
                     // 同一 chunk 类型）。仍落入下方通用 ToolUse 处理（工具轨迹
                     // 面板同样展示）——此处只追加清单 chunk。
+                    let before = task_todos.len();
                     if apply_task_tool(&mut task_todos, tool, input) {
+                        if tool == "TaskCreate" && before < task_todos.len() {
+                            // 占位行 index 记账，等结果回填真实 id（会话级编号，
+                            // --resume 后非 1 起）。
+                            if let Some(tuid) = ev_id_of(&ev) {
+                                pending_task_creates.insert(tuid, before);
+                            }
+                        }
                         let items = task_todos.iter().map(|(_, it)| it.clone()).collect();
                         let _ = chunks.send(AgentChunk::TodoList { items }).await;
                     }
@@ -582,6 +645,30 @@ pub async fn spawn_cli_backend(
                         let _ = chunks.send(AgentChunk::Media { path }).await;
                     }
                     let _ = chunks.send(AgentChunk::ToolUse { tool, input, id }).await;
+                }
+                CliEvent::ToolResult {
+                    ref tool,
+                    ref output,
+                    ref id,
+                } if tool == "TaskCreate"
+                    && id
+                        .as_deref()
+                        .is_some_and(|t| pending_task_creates.contains_key(t)) =>
+                {
+                    // TaskCreate 结果回填真实任务 id（或失败移除占位行）。
+                    let tuid = id.clone().unwrap();
+                    if let Some(index) = pending_task_creates.remove(&tuid) {
+                        if resolve_task_create_result(&mut task_todos, index, output) {
+                            let items = task_todos.iter().map(|(_, it)| it.clone()).collect();
+                            let _ = chunks.send(AgentChunk::TodoList { items }).await;
+                        }
+                    }
+                    let CliEvent::ToolResult { tool, output, id } = ev else {
+                        unreachable!("已按 ToolResult 分派")
+                    };
+                    let _ = chunks
+                        .send(AgentChunk::ToolResult { tool, output, id })
+                        .await;
                 }
                 CliEvent::ToolResult { tool, output, id } => {
                     let _ = chunks
@@ -903,7 +990,10 @@ const ALWAYS_PASSTHROUGH_ENV: &[&str] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_task_tool, image_write_path, spawn_cli_backend, CliEvent, ControlIo};
+    use super::{
+        apply_task_tool, image_write_path, resolve_task_create_result, spawn_cli_backend, CliEvent,
+        ControlIo,
+    };
     use crate::types::{TodoItem, TodoStatus};
 
     /// B9：多条 agent_message（Text 事件）应按序拼接（\n\n 分隔）进 final_text，
@@ -1099,56 +1189,75 @@ mod tests {
         );
     }
     /// 真机校准（2026-08-30）：Task* 工具族（claude 2.x 的 TodoWrite 后继）
-    /// → 待办快照。实测形态：Create 无 id（序号=创建顺序）、Update 带 taskId。
+    /// → 待办快照。Create 无 id（占位）→ 结果 "Task #N created" 回填真实 id
+    ///（会话级连续编号：--resume 后新任务 #3 而非 #1）；Update 按 true id 翻状态。
     #[test]
     fn task_tools_build_todo_snapshot() {
         let mut list: Vec<(String, TodoItem)> = Vec::new();
+        // 创建两行（占位空 id）。
         assert!(apply_task_tool(
             &mut list,
             "TaskCreate",
-            r#"{"subject":"查时间","description":"date","activeForm":"正在查"}"#
+            r#"{"subject":"foo"}"#
         ));
         assert!(apply_task_tool(
             &mut list,
             "TaskCreate",
-            r#"{"subject":"查主机名"}"#
+            r#"{"subject":"bar"}"#
         ));
-        assert!(apply_task_tool(
+        assert_eq!(list.len(), 2);
+        assert!(list.iter().all(|(id, _)| id.is_empty()), "创建时占位空 id");
+        // 结果回填：真实 id #7/#8（跨轮续编形态）。
+        assert!(resolve_task_create_result(
             &mut list,
-            "TaskCreate",
-            r#"{"subject":"汇总"}"#
+            0,
+            "Task #7 created successfully: foo"
         ));
-        assert_eq!(list.len(), 3);
-        assert_eq!(list[0].1.text, "查时间");
-        assert_eq!(list[0].1.status, TodoStatus::Pending);
-        // 状态翻转（in_progress / completed）。
+        assert!(resolve_task_create_result(
+            &mut list,
+            1,
+            "Task #8 created successfully: bar"
+        ));
+        assert_eq!(list[0].0, "7");
+        assert_eq!(list[1].0, "8");
+        // Update 按 true id 翻状态（旧按创建序 1..N 的错位不复存在）。
         assert!(apply_task_tool(
             &mut list,
             "TaskUpdate",
-            r#"{"taskId":"1","status":"in_progress"}"#
+            r#"{"taskId":"7","status":"in_progress"}"#
         ));
         assert_eq!(list[0].1.status, TodoStatus::InProgress);
         assert!(apply_task_tool(
             &mut list,
             "TaskUpdate",
-            r#"{"status":"completed","taskId":"1"}"#
+            r#"{"status":"completed","taskId":"7"}"#
         ));
         assert_eq!(list[0].1.status, TodoStatus::Completed);
-        // 无 status 的结构更新（addBlockedBy）：不产生快照变化。
+        // 无 status 的结构更新 / 未知 id / 非法输入：no-op。
         assert!(!apply_task_tool(
             &mut list,
             "TaskUpdate",
-            r#"{"taskId":"3","addBlockedBy":["1","2"]}"#
+            r#"{"taskId":"8","addBlockedBy":["7"]}"#
         ));
-        // 未知 taskId / 非法输入：no-op。
         assert!(!apply_task_tool(
             &mut list,
             "TaskUpdate",
             r#"{"taskId":"9","status":"completed"}"#
         ));
         assert!(!apply_task_tool(&mut list, "TaskCreate", "not json"));
-        // 其它工具名不动清单。
-        assert!(!apply_task_tool(&mut list, "Bash", r#"{"command":"ls"}"#));
-        assert_eq!(list.len(), 3);
+        // 创建失败（结果无 Task #N）：占位行移除。
+        let mut fail = vec![(
+            String::new(),
+            TodoItem {
+                text: "x".into(),
+                status: TodoStatus::Pending,
+            },
+        )];
+        assert!(resolve_task_create_result(
+            &mut fail,
+            0,
+            "Error: task tool disabled"
+        ));
+        assert!(fail.is_empty(), "失败创建移除占位行");
     }
 }
