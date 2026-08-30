@@ -38,6 +38,8 @@ pub fn acquire(home: &Path) -> Result<std::fs::File> {
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
+        // 显式不截断（L10：先 truncate 会清掉第一实例的 PID；拿到锁后 set_len(0)）
+        .truncate(false)
         .open(&lock)
         .map_err(CoreError::Io)?;
     if !try_flock_exclusive(&f) {
