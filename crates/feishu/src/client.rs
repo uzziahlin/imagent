@@ -253,7 +253,10 @@ pub async fn create_reaction(
         .and_then(|r| r.as_str())
         .map(str::to_string)
         .ok_or_else(|| {
-            imagent_core::CoreError::Platform(PLATFORM, "create_reaction: 响应缺 reaction_id".into())
+            imagent_core::CoreError::Platform(
+                PLATFORM,
+                "create_reaction: 响应缺 reaction_id".into(),
+            )
         })
 }
 
@@ -266,9 +269,7 @@ pub async fn delete_reaction(
     reaction_id: &str,
 ) -> imagent_core::Result<()> {
     let base = core_config.base_url().trim_end_matches('/').to_string();
-    let url = format!(
-        "{base}/open-apis/im/v1/messages/{message_id}/reactions/{reaction_id}"
-    );
+    let url = format!("{base}/open-apis/im/v1/messages/{message_id}/reactions/{reaction_id}");
     let client = api_client().clone();
     let resp = client
         .delete(&url)
@@ -308,9 +309,8 @@ pub async fn urgent_app_buzz(
     let base = core_config.base_url().trim_end_matches('/').to_string();
     // 真机校准（2026-08）：query 参数为 snake_case `user_id_type`——驼峰
     // userIdType 报 99992402 field validation failed（实测）。
-    let url = format!(
-        "{base}/open-apis/im/v1/messages/{message_id}/urgent_app?user_id_type=open_id"
-    );
+    let url =
+        format!("{base}/open-apis/im/v1/messages/{message_id}/urgent_app?user_id_type=open_id");
     let client = api_client().clone();
     let resp = client
         .patch(&url)
@@ -921,7 +921,11 @@ async fn ogg_to_pcm(bytes: Vec<u8>) -> imagent_core::Result<Vec<u8>> {
 /// 错误信息内嵌的原文片段截断（多字节字符安全）。
 fn truncate_for_error(s: &str, max_chars: usize) -> String {
     s.chars().take(max_chars).collect::<String>()
-        + if s.chars().count() > max_chars { "…" } else { "" }
+        + if s.chars().count() > max_chars {
+            "…"
+        } else {
+            ""
+        }
 }
 
 /// 发送文件消息（P6-7，msg_type=file），content 为 `{"file_key":"..."}`。
@@ -1228,7 +1232,8 @@ pub async fn list_merge_forward(
     let mut page_token: Option<String> = None;
     for _ in 0..10 {
         let page = retry_on_rate_limit!(async {
-            let mut req = api_client().clone()
+            let mut req = api_client()
+                .clone()
                 .get(format!(
                     "{base}/open-apis/im/v1/messages/{message_id}/merge_forward"
                 ))
@@ -1618,7 +1623,9 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&body).expect("合法 JSON");
         let speech = v["speech"]["speech"].as_str().expect("speech.speech");
         assert_eq!(
-            base64::engine::general_purpose::STANDARD.decode(speech).unwrap(),
+            base64::engine::general_purpose::STANDARD
+                .decode(speech)
+                .unwrap(),
             pcm,
             "speech 字段为 pcm 的 base64"
         );
@@ -1666,7 +1673,10 @@ mod tests {
         assert!(msg.contains("语音识别"), "msg={msg}");
         let other = r#"{"code":1040101,"msg":"invalid param"}"#;
         let msg = format!("{}", parse_asr_response(400, other).unwrap_err());
-        assert!(msg.contains("1040101") && !msg.contains("语音识别"), "msg={msg}");
+        assert!(
+            msg.contains("1040101") && !msg.contains("语音识别"),
+            "msg={msg}"
+        );
     }
 
     /// W3-1 校准回归：ogg → 16k s16le mono pcm 转码（本机装了 ffmpeg 才跑；
@@ -1682,15 +1692,36 @@ mod tests {
         }
         // 1 秒 440Hz 正弦 ogg（手搓最小 OggS 页不现实，借 ffmpeg 生成）。
         let gen = std::process::Command::new("ffmpeg")
-            .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-c:a", "libopus", "-f", "ogg", "pipe:1"])
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-c:a",
+                "libopus",
+                "-f",
+                "ogg",
+                "pipe:1",
+            ])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output()
             .expect("生成测试 ogg");
-        assert!(gen.status.success(), "gen stderr={}", String::from_utf8_lossy(&gen.stderr));
+        assert!(
+            gen.status.success(),
+            "gen stderr={}",
+            String::from_utf8_lossy(&gen.stderr)
+        );
         let pcm = ogg_to_pcm(gen.stdout).await.expect("转码成功");
         // 16k Hz × 1 秒 × 2 字节（s16le）× 单声道 ≈ 32000 字节（容器开销致略少）。
-        assert!(pcm.len() > 30_000 && pcm.len() < 33_000, "pcm_len={}", pcm.len());
+        assert!(
+            pcm.len() > 30_000 && pcm.len() < 33_000,
+            "pcm_len={}",
+            pcm.len()
+        );
         assert!(pcm.len() % 2 == 0, "s16le 应为 2 字节对齐");
     }
 }

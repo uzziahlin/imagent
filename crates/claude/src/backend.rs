@@ -373,9 +373,7 @@ impl Backend for ClaudeBackend {
         // - Mcp（legacy 回退）：`-p <prompt>` + MCP prompt-tool + 子进程/临时配置。
         let channel = *self.permission_channel.read();
         let control_io = if channel == PermissionChannel::Control {
-            cmd.arg("-p")
-                .arg("--input-format")
-                .arg("stream-json");
+            cmd.arg("-p").arg("--input-format").arg("stream-json");
             // 真机校准（2026-08-30）：`stdio` 特殊值把审批接到 stdio 控制通道
             //（SDK 同款接线）——不传则 claude 对未批工具**直接拒绝**不发
             // control_request（实测）。
@@ -874,7 +872,12 @@ mod tests {
             r#"{"type":"control_request","request_id":"rid-1","request":{"subtype":"can_use_tool","tool_name":"Bash","display_name":"Bash","input":{"command":"ls","description":"x"},"tool_use_id":"call_1"}}"#,
         );
         match ev {
-            CliEvent::ControlRequest { request_id, subtype, tool_name, input } => {
+            CliEvent::ControlRequest {
+                request_id,
+                subtype,
+                tool_name,
+                input,
+            } => {
                 assert_eq!(request_id, "rid-1");
                 assert_eq!(subtype, "can_use_tool");
                 assert_eq!(tool_name, "Bash");

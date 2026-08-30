@@ -199,7 +199,9 @@ pub fn render_card(card: &OutboundCard, conv_id: &str, sender: Option<&str>) -> 
         Some(t) => format!("{t}\n\n{text}"),
         None => text.into_owned(),
     };
-    elements.push(serde_json::json!({ "tag": "markdown", "content": escape_lt(&mask_emails(&body_md)) }));
+    elements.push(
+        serde_json::json!({ "tag": "markdown", "content": escape_lt(&mask_emails(&body_md)) }),
+    );
     if !card.tool_calls.is_empty() {
         // 长正文分段：正文与工具面板间用真 hr 组件分隔（降级路径专属——
         // managed 路径的 md_body 是单 markdown 组件，用 `---` 文本分割线，
@@ -1792,8 +1794,10 @@ mod tests {
                 && json.contains("\"imagent_perm\":\"always\""),
             "三个动作都应编码: {json}"
         );
-        assert!(json.contains("\"primary_filled\"") && json.contains("\"danger_filled\""),
-            "主行填充双按钮: {json}");
+        assert!(
+            json.contains("\"primary_filled\"") && json.contains("\"danger_filled\""),
+            "主行填充双按钮: {json}"
+        );
         assert!(
             json.contains("\"width\":\"weighted\"") && json.contains("\"weight\":1"),
             "主行等宽列: {json}"
@@ -2566,10 +2570,7 @@ mod tests {
             "feishu:ou_t",
             None,
         );
-        assert!(
-            !running.contains("工具 1 次"),
-            "Running 无统计: {running}"
-        );
+        assert!(!running.contains("工具 1 次"), "Running 无统计: {running}");
         // markdown 统计行兜底仍在（managed 终态正文）。
         let md = stream_body_final(&body_card_of("结论", &[tool("Bash", "a", true)], &[]), None);
         assert!(

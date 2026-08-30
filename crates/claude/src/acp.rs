@@ -269,8 +269,17 @@ impl AcpBackend {
                     .all(|c| c.is_ascii_alphanumeric() || "._/:=+-@[]".contains(c))
         };
         for key in [
-            "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
-            "TMPDIR", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL",
+            "PATH",
+            "HOME",
+            "USER",
+            "LOGNAME",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "TZ",
+            "TMPDIR",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_BASE_URL",
         ] {
             match std::env::var(key) {
                 Ok(v) if safe(&v) => assignments.push(format!("{key}={v}")),
@@ -1713,12 +1722,14 @@ mod tests {
         for seg in cmd2.split_whitespace() {
             if seg.contains('=') {
                 assert!(
-                    seg.starts_with("/usr/bin/env") || seg.starts_with("claude") ||
-                    seg.chars().all(|c| c.is_ascii_alphanumeric() || "._/:=+-@[]".contains(c)),
+                    seg.starts_with("/usr/bin/env")
+                        || seg.starts_with("claude")
+                        || seg
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || "._/:=+-@[]".contains(c)),
                     "异常赋值段: {seg}"
                 );
             }
         }
     }
-
 }

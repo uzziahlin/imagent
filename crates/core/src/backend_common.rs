@@ -968,7 +968,11 @@ mod tests {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
                 if v.get("type").and_then(|t| t.as_str()) == Some("result") {
                     return CliEvent::Final {
-                        text: v.get("result").and_then(|r| r.as_str()).unwrap_or("").into(),
+                        text: v
+                            .get("result")
+                            .and_then(|r| r.as_str())
+                            .unwrap_or("")
+                            .into(),
                         session: v
                             .get("session_id")
                             .and_then(|s| s.as_str())
@@ -990,10 +994,16 @@ mod tests {
             spawn_cli_backend(cmd, parse, tx, "test-ctrl", &[], Some(io)),
         )
         .await;
-        assert!(res.is_ok(), "spawn_cli_backend 应在终态后收尾返回（不挂起）");
+        assert!(
+            res.is_ok(),
+            "spawn_cli_backend 应在终态后收尾返回（不挂起）"
+        );
         let outcome = res.unwrap().expect("run ok");
         assert!(outcome.terminal, "终态事件应被识别");
-        assert!(outcome.final_text.contains("2026-08-29"), "final 文本: {}", outcome.final_text);
+        assert!(
+            outcome.final_text.contains("2026-08-29"),
+            "final 文本: {}",
+            outcome.final_text
+        );
     }
-
 }

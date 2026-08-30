@@ -16,7 +16,12 @@ impl Dispatcher {
         // EADDRINUSE 误报 / 交错留孤儿 listener）。
         if self
             .socket_spawned
-            .compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire)
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
             .is_err()
         {
             return true; // 已在运行（R-2：accept task 监听 shutdown，进程内只 spawn 一次）
@@ -25,7 +30,10 @@ impl Dispatcher {
         // remove_file 对目录报 EISDIR 被忽略，bind 随后 EADDRINUSE 报错无从指
         // 引）用 remove_dir 收敛，失败给可行动指引。
         let _ = std::fs::remove_file(&sock);
-        if std::fs::metadata(&sock).map(|m| m.is_dir()).unwrap_or(false) {
+        if std::fs::metadata(&sock)
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
             if let Err(e) = std::fs::remove_dir(&sock) {
                 error!(
                     target: "imagent::core",
@@ -745,10 +753,7 @@ impl Dispatcher {
                 // L2（code-review v8）：淘汰哨兵 → 与 TimedOut 同款平台收敛
                 //（撤卡防过期点击），再原样回 deny。
                 if r.raw_text.as_deref() == Some(crate::permission::EVICTED_SENTINEL) {
-                    if let Err(e) = platform
-                        .cancel_permission_ask(&conv, &request_id)
-                        .await
-                    {
+                    if let Err(e) = platform.cancel_permission_ask(&conv, &request_id).await {
                         warn!(target: "imagent::core", error = %e, "淘汰询问收敛失败");
                     }
                 }
@@ -1002,7 +1007,10 @@ mod v8_tests {
                 "{mode:?} 固定答复方向"
             );
         }
-        for mode in [crate::PermissionMode::Ask, crate::PermissionMode::AutoClaude] {
+        for mode in [
+            crate::PermissionMode::Ask,
+            crate::PermissionMode::AutoClaude,
+        ] {
             assert!(mode.needs_socket(), "{mode:?} 应走询问链路");
         }
     }
