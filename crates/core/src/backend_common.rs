@@ -197,6 +197,62 @@ impl GroupKillGuard {
 /// canUseTool 控制通道上下文（claude 独有；其余 CLI 传 None）。审批决策经
 /// [`crate::mcp::ask_via_socket`] 复用既有 permission.sock 路由（含 token 握手、
 /// IM 审批卡、👍、always、超时 fail-closed——core 侧零改动）。
+/// W2-2 扩展（真机校准 2026-08-30）：claude 2.x 用 Task* 工具族替代 TodoWrite
+/// （实测形态：TaskCreate `{subject, description?, activeForm?}` 无 id——序号即
+/// 创建顺序；TaskUpdate `{taskId, status?}`，status 语义与 [`TodoStatus`] 同构）。
+/// 增量维护 (id, TodoItem) 列表，返回是否变化（变化即发全量 TodoList chunk）。
+fn apply_task_tool(list: &mut Vec<(String, TodoItem)>, tool: &str, input_json: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(input_json) else {
+        return false;
+    };
+    match tool {
+        "TaskCreate" => {
+            let Some(subject) = v.get("subject").and_then(|s| s.as_str()) else {
+                return false;
+            };
+            let id = (list.len() + 1).to_string();
+            list.push((
+                id,
+                TodoItem {
+                    text: subject.to_string(),
+                    status: TodoStatus::Pending,
+                },
+            ));
+            true
+        }
+        "TaskUpdate" => {
+            let Some(task_id) = v.get("taskId").and_then(|t| t.as_str()) else {
+                return false;
+            };
+            let status = v.get("status").and_then(|s| s.as_str());
+            let subject = v.get("subject").and_then(|s| s.as_str());
+            let Some(entry) = list.iter_mut().find(|(id, _)| id == task_id) else {
+                return false;
+            };
+            let mut changed = false;
+            if let Some(s) = status {
+                let mapped = match s {
+                    "completed" => TodoStatus::Completed,
+                    "in_progress" => TodoStatus::InProgress,
+                    _ => TodoStatus::Pending,
+                };
+                if entry.1.status != mapped {
+                    entry.1.status = mapped;
+                    changed = true;
+                }
+            }
+            if let Some(sub) = subject {
+                if entry.1.text != sub {
+                    entry.1.text = sub.to_string();
+                    changed = true;
+                }
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
 pub struct ControlIo {
     /// permission.sock 路径。
     pub sock: String,
@@ -324,6 +380,8 @@ pub async fn spawn_cli_backend(
     // claude 跑完一轮**不退出**（stream-input 等 stdin 下一条），外层会永远等
     // 下一行 stdout。终态置位后跳出外层。
     let mut terminal_seen = false;
+    // Task* 工具族的待办累积（claude 2.x 的 TodoWrite 后继，见 apply_task_tool）。
+    let mut task_todos: Vec<(String, TodoItem)> = Vec::new();
 
     loop {
         let line = match read_line_capped(&mut reader, MAX_STDOUT_LINE_BYTES).await {
@@ -474,6 +532,39 @@ pub async fn spawn_cli_backend(
                 // W2-2：任务清单——全量替换语义，仅推 chunk。
                 CliEvent::TodoList { items } => {
                     let _ = chunks.send(AgentChunk::TodoList { items }).await;
+                }
+                CliEvent::ToolUse {
+                    ref tool,
+                    ref input,
+                    ..
+                } if tool == "TaskCreate" || tool == "TaskUpdate" => {
+                    // Task* 工具族 → 待办清单（全量快照语义，与 TodoWrite 路径
+                    // 同一 chunk 类型）。仍落入下方通用 ToolUse 处理（工具轨迹
+                    // 面板同样展示）——此处只追加清单 chunk。
+                    if apply_task_tool(&mut task_todos, tool, input) {
+                        let items = task_todos.iter().map(|(_, it)| it.clone()).collect();
+                        let _ = chunks.send(AgentChunk::TodoList { items }).await;
+                    }
+                    // 重新匹配进通用臂：构造值消费。
+                    let CliEvent::ToolUse {
+                        tool,
+                        input,
+                        session,
+                        id,
+                    } = ev
+                    else {
+                        unreachable!("已按 ToolUse 分派")
+                    };
+                    if let Some(s) = session {
+                        if session_id.is_empty() && !s.is_empty() {
+                            session_id.clone_from(&s);
+                            let _ = chunks.send(AgentChunk::SessionStarted(s)).await;
+                        }
+                    }
+                    if let Some(path) = image_write_path(&tool, &input) {
+                        let _ = chunks.send(AgentChunk::Media { path }).await;
+                    }
+                    let _ = chunks.send(AgentChunk::ToolUse { tool, input, id }).await;
                 }
                 CliEvent::ToolUse {
                     tool,
@@ -812,7 +903,8 @@ const ALWAYS_PASSTHROUGH_ENV: &[&str] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::{image_write_path, spawn_cli_backend, CliEvent, ControlIo};
+    use super::{apply_task_tool, image_write_path, spawn_cli_backend, CliEvent, ControlIo};
+    use crate::types::{TodoItem, TodoStatus};
 
     /// B9：多条 agent_message（Text 事件）应按序拼接（\n\n 分隔）进 final_text，
     /// 而非最后一条覆盖（会丢多消息 turn 的前几条内容）。
@@ -1005,5 +1097,58 @@ mod tests {
             "final 文本: {}",
             outcome.final_text
         );
+    }
+    /// 真机校准（2026-08-30）：Task* 工具族（claude 2.x 的 TodoWrite 后继）
+    /// → 待办快照。实测形态：Create 无 id（序号=创建顺序）、Update 带 taskId。
+    #[test]
+    fn task_tools_build_todo_snapshot() {
+        let mut list: Vec<(String, TodoItem)> = Vec::new();
+        assert!(apply_task_tool(
+            &mut list,
+            "TaskCreate",
+            r#"{"subject":"查时间","description":"date","activeForm":"正在查"}"#
+        ));
+        assert!(apply_task_tool(
+            &mut list,
+            "TaskCreate",
+            r#"{"subject":"查主机名"}"#
+        ));
+        assert!(apply_task_tool(
+            &mut list,
+            "TaskCreate",
+            r#"{"subject":"汇总"}"#
+        ));
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].1.text, "查时间");
+        assert_eq!(list[0].1.status, TodoStatus::Pending);
+        // 状态翻转（in_progress / completed）。
+        assert!(apply_task_tool(
+            &mut list,
+            "TaskUpdate",
+            r#"{"taskId":"1","status":"in_progress"}"#
+        ));
+        assert_eq!(list[0].1.status, TodoStatus::InProgress);
+        assert!(apply_task_tool(
+            &mut list,
+            "TaskUpdate",
+            r#"{"status":"completed","taskId":"1"}"#
+        ));
+        assert_eq!(list[0].1.status, TodoStatus::Completed);
+        // 无 status 的结构更新（addBlockedBy）：不产生快照变化。
+        assert!(!apply_task_tool(
+            &mut list,
+            "TaskUpdate",
+            r#"{"taskId":"3","addBlockedBy":["1","2"]}"#
+        ));
+        // 未知 taskId / 非法输入：no-op。
+        assert!(!apply_task_tool(
+            &mut list,
+            "TaskUpdate",
+            r#"{"taskId":"9","status":"completed"}"#
+        ));
+        assert!(!apply_task_tool(&mut list, "TaskCreate", "not json"));
+        // 其它工具名不动清单。
+        assert!(!apply_task_tool(&mut list, "Bash", r#"{"command":"ls"}"#));
+        assert_eq!(list.len(), 3);
     }
 }
