@@ -1048,14 +1048,17 @@ pub async fn fetch_bot_open_id(
             format!("fetch_bot_open_id: code={code} msg={msg}"),
         ));
     }
-    v.pointer("/data/open_id")
+    // 真机校准（2026-08-30）：bot/v3/info 响应为顶层 {"bot":{"open_id":…}}，
+    // 无 data 包装（离线按 data.open_id 建模落空 → @ 过滤长期弱化运行）。
+    v.pointer("/bot/open_id")
+        .or_else(|| v.pointer("/data/open_id"))
         .and_then(|o| o.as_str())
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
             imagent_core::CoreError::Platform(
                 PLATFORM,
-                "fetch_bot_open_id: 响应缺 data.open_id".into(),
+                "fetch_bot_open_id: 响应缺 bot.open_id".into(),
             )
         })
 }

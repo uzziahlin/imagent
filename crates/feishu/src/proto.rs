@@ -1099,12 +1099,24 @@ pub fn parse_message_event(
     let message_id = evt.event.message.message_id.clone().unwrap_or_default();
     // 平台消息 id 透传在组装侧统一做（assemble_event_message 的 source_msg_id）。
     // 群消息 @bot 过滤（P6-1）：在正文清洗前判定，未 @bot 直接丢弃。
-    if !group_mention_ok(
-        &evt.event.message.chat_type,
-        &evt.event.message.mentions,
-        policy,
-        bot_open_id,
-    ) {
+    // 真机校准（2026-08-30）：**斜杠命令豁免**——`/chat allow` 是群放行的
+    // 引导命令（先有鸡还是先有蛋：不带 @ 的它被这里拦掉，群永远无法自助放行），
+    // 命令自身的 admin/白名单门禁在 dispatch 层独立生效，豁免不放大权限面。
+    let is_command = mt == "text"
+        && serde_json::from_str::<serde_json::Value>(&evt.event.message.content)
+            .ok()
+            .as_ref()
+            .and_then(|v| v.get("text").and_then(|t| t.as_str()))
+            .map(|t| t.trim_start().starts_with('/'))
+            .unwrap_or(false);
+    if !is_command
+        && !group_mention_ok(
+            &evt.event.message.chat_type,
+            &evt.event.message.mentions,
+            policy,
+            bot_open_id,
+        )
+    {
         return None;
     }
     // 解析 content：text 提取文本（空文本丢弃），image/file 提取资源 key（缺 key 丢弃）。
@@ -3588,5 +3600,22 @@ mod tests {
         .to_string()
         .into_bytes();
         assert!(parse_bot_removed_event(&no_chat).is_none());
+    }
+    /// 真机校准（2026-08-30）：群内不带 @ 的 `/chat allow` 此前在 @ 过滤层被
+    /// 丢弃（引导命令死锁——群无法自助放行）。斜杠命令豁免；非命令仍拦。
+    #[test]
+    fn group_slash_command_bypasses_mention_filter() {
+        let cmd = mk_group_mention_payload("e-cmd-1", "/chat allow", "[]");
+        let policy = MentionPolicy::REQUIRE_BOT;
+        assert!(
+            parse_message_event(&cmd, &policy, None).is_some(),
+            "群内斜杠命令不应被 @ 过滤拦截"
+        );
+        // 对照：不带 @ 的普通文本仍被拦。
+        let txt = mk_group_mention_payload("e-txt-1", "你好", "[]");
+        assert!(
+            parse_message_event(&txt, &policy, None).is_none(),
+            "非命令群消息仍须 @"
+        );
     }
 }
