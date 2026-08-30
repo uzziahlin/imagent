@@ -170,21 +170,6 @@ impl Drop for GroupKillGuard {
     }
 }
 
-#[cfg(unix)]
-#[allow(unsafe_code)] // 同 Drop impl：libc::kill 局部豁免
-impl GroupKillGuard {
-    /// 主动组杀 + disarm（不等 drop）：终态收尾路径用——孙进程可能持有
-    /// stderr/stdout 管道，只杀直接子进程会让 `stderr_handle.await` 等一个
-    /// 永不到来的 EOF（真机校准 2026-08-29：control 通道 kill 后 3 分钟挂起）。
-    fn kill_now(&mut self) {
-        if self.armed {
-            // SAFETY：同 Drop——负 pid = 整组 SIGKILL，best-effort。
-            unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
-            self.armed = false;
-        }
-    }
-}
-
 /// 泛型 run 脚手架：spawn cmd → kill_on_drop + stdin null → 并发 stderr →
 /// 读 stdout 循环（调 `parse` 映射到 [`CliEvent`]）→ session/final/error 收集 →
 /// RunOutcome。三 CLI backend 共用，零行为差异（仅去重）。
@@ -820,31 +805,66 @@ pub async fn spawn_cli_backend(
         final_len = final_text.len(), terminal = reached_terminal,
         err = error_text.is_some(), read_err = read_err.is_some(),
         "stdout 读取循环退出（进入 wait 阶段）");
-    if control.is_some() {
+    // 控制通道收尾（真机校准 2026-08-30）：EOF 后 5s 内退出 → 正常收尸；
+    // 仍存活 = 会话还有**后台子任务**在跑（task_started/background_tasks_changed
+    // 实证；此前整组 kill 会把委派的后台工作杀掉——群会话批次 A/B/C 实测丢失，
+    // 下一轮只剩 task_notification stopped）。托管放行：解除进程组守卫 + 看护
+    // 任务等其自然退出（后台结果写入会话存储，后续 resume 可见），10 分钟硬上
+    // 限防僵尸。/stop 等运行中中断不走此路径（guard drop 整组收割）。
+    // 托管放行标记：进程仍活着持有 stderr 管道——后续 stderr await 必须有界。
+    let mut detached = false;
+    let status: std::result::Result<std::process::ExitStatus, std::io::Error> = if control.is_some()
+    {
         drop(stdin_w.take());
         tracing::debug!(target: "imagent::backend", "control 通道已关 stdin，等 claude 退出（5s 超时）");
         match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
             Ok(res) => {
                 tracing::debug!(target: "imagent::backend", status = ?res, "control 通道 claude 已退出");
+                res
             }
             Err(_) => {
-                tracing::warn!(target: "imagent::backend",
-                    "control 通道 claude 终态后未随 stdin EOF 退出，kill 整组收尾");
+                detached = true;
+                tracing::info!(target: "imagent::backend",
+                        "control 通道 claude 终态后仍存活（会话有后台任务），托管放行等其完成");
                 #[cfg(unix)]
                 if let Some(g) = group_guard.as_mut() {
-                    g.kill_now();
+                    g.disarm();
                 }
-                let _ = child.kill().await;
+                tokio::spawn(async move {
+                    match tokio::time::timeout(std::time::Duration::from_secs(600), child.wait())
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(_) => {
+                            tracing::warn!(target: "imagent::backend",
+                                    "托管 claude 进程 10 分钟未退出，硬上限 kill");
+                            let _ = child.kill().await;
+                        }
+                    }
+                });
+                // 托管路径无本地退出状态：伪造成功占位（后续 diagnose 只在
+                // !reached_terminal 时用 status——终态轮次不依赖真实值）。
+                Ok(std::process::ExitStatus::default())
             }
         }
-    }
-    let status = child.wait().await;
+    } else {
+        child.wait().await
+    };
     // B5：正常 wait 返回 → 进程组主进程已退出，disarm 防 pid 复用误杀无关进程组。
     #[cfg(unix)]
     if let Some(g) = group_guard.as_mut() {
         g.disarm();
     }
-    let stderr_msg = stderr_handle.await.unwrap_or_default();
+    // 托管路径进程仍持有 stderr：await 到 EOF 会挂到其退出（同族坑——管道
+    // 持有者存活即无 EOF）。有界 2s 取已产出部分，超时按空诊断。
+    let stderr_msg = if detached {
+        tokio::time::timeout(std::time::Duration::from_secs(2), stderr_handle)
+            .await
+            .map(|r| r.unwrap_or_default())
+            .unwrap_or_default()
+    } else {
+        stderr_handle.await.unwrap_or_default()
+    };
 
     if let Some(t) = error_text {
         // 真机校准：claude resume 幽灵会话等场景产出 is_error 且 result 文本缺失
