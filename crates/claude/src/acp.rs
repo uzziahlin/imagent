@@ -256,7 +256,7 @@ impl AcpBackend {
     /// 修法：命令前导 `/usr/bin/env -i NAME=value …`——`env` 作为被 exec 程序
     /// （SDK `from_str` 走 shell_words::split 后直接 exec argv），`-i` 清空环境
     /// 后仅注入白名单（对齐 CLI 路径 [`imagent_core::backend_common::ALWAYS_PASSTHROUGH_ENV`]
-    /// + claude 凭据两键）。值含空白/引号/元字符时跳过该键（赋值经 shell_words
+    /// 以及 claude 凭据两键）。值含空白/引号/元字符时跳过该键（赋值经 shell_words
     /// 再切分会破形；白名单键的常规值——路径/键/locale——均无此类字符）。
     /// 自定义 `IMAGENT_ACP_COMMAND` 同样经此消毒（需要额外 env 的场景可在命令
     /// 里自带 `env NAME=value` 前缀）。
@@ -470,7 +470,7 @@ impl LongLivedAcp {
                     // L7（code-review v8）：连接已 load 的 cwd——/cd 切目录后同
                     // session 的下一轮须重发 LoadSession（缓存只比 sid 不比 cwd
                     // 会让新 cwd 不传递，与「已切到 X，下条消息生效」承诺相悖）。
-                    let mut loaded_cwd: Option<std::path::PathBuf> = None;;
+                    let mut loaded_cwd: Option<std::path::PathBuf> = None;
                     // B2/P5-14：每轮用 sleep_until 实现空闲回收——完成一个 turn 后
                     // 重新起算 CONN_IDLE_RECYCLE 窗口，窗口内无新 prompt 则退出
                     //（connection drop → ChildGuard kill 子进程，名额让出）。

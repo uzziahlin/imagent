@@ -15,8 +15,6 @@ use imagent_core::{
 /// 400（"contain sensitive data: EMAIL_ADDRESS"），流式卡会**静默失败**——典型
 /// 触发是 git commit 的 Co-Authored-By 尾注。改写 `@` 为 `[at]`（刻意不用全角＠
 /// 或零宽字符：中文审计会归一化还原后再次触发拦截；`[at]` 无法还原为合法地址）。
-/// 点分 TLD 要求避开 npm scope（`@larksuite/x`）、版本号（`pkg@1.2.3`）与裸句柄；
-
 /// L8（code-review v8）：markdown 语义层 `<` 转义——用户可控文本经 bot 卡片
 /// 渲染时 `<at id=…></at>` 可以 bot 名义 @ 任意租户用户。只转 `<`（JSON 层
 /// serde 已封死结构注入；`[` 链接伪装的格式损失大于收益，v4 评估结论维持）。
@@ -24,6 +22,7 @@ fn escape_lt(text: &str) -> String {
     text.replace('<', "\\<")
 }
 
+/// 点分 TLD 要求避开 npm scope（`@larksuite/x`）、版本号（`pkg@1.2.3`）与裸句柄；
 /// SSH remote（`git@host.tld`）会被掩码——审计同样拦它，掩了才能发出去。
 pub(crate) fn mask_emails(s: &str) -> String {
     use std::sync::OnceLock;
