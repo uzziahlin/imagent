@@ -2642,6 +2642,49 @@ impl Platform for FeishuPlatform {
             }
             other => other,
         };
+        // 真机校准（2026-08-30）：终态 patch 失败（超限 200860/230099 等）时原卡
+        // 停在「思考中」——最小化终态卡重试一次，保证卡片必然收敛（完整内容由
+        // core P5-11 纯文本兜底）。best-effort，再失败维持原错误上抛。
+        let res = match res {
+            Err(e)
+                if !matches!(card.terminal, CardTerminal::Running)
+                    && !e.to_string().contains(CARD_HANDLE_LOST) =>
+            {
+                let err_text = e.to_string();
+                let done = matches!(card.terminal, CardTerminal::Done);
+                let minimal = crate::card::render_overflow_terminal_card(done);
+                // 重试目标：msg: 句柄直用；card: 句柄经映射表换消息 id。
+                let target_mid: Option<String> = match handle.strip_prefix("msg:") {
+                    Some(m) => Some(m.to_string()),
+                    None => match handle.strip_prefix("card:") {
+                        Some(cid) => self.managed_card_msgs.lock().await.get(cid).cloned(),
+                        None => None,
+                    },
+                };
+                let retry = match target_mid {
+                    Some(mid) => {
+                        self.with_token(move |t| {
+                            let minimal = minimal.clone();
+                            let mid = mid.clone();
+                            async move { patch_card(&self.core_config, &t, &mid, &minimal).await }
+                        })
+                        .await
+                    }
+                    None => Err(CoreError::Platform(
+                        PLATFORM,
+                        "终态重试无目标消息 id".into(),
+                    )),
+                };
+                match retry {
+                    Ok(()) => {
+                        warn!(target: "feishu", error = %err_text, "终态 patch 失败，已用最小终态卡收敛");
+                        Ok(())
+                    }
+                    Err(_) => Err(e),
+                }
+            }
+            other => other,
+        };
         // 结果下沉重发：流式卡已收敛成指针 → 完整结果另发新卡。Wave B-5：带
         // 发起者标注行。重发失败上抛 Err——core 的 P5-11 兜底会以纯文本补发全文
         //（结论不能因重发失败而丢）。

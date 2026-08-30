@@ -18,6 +18,35 @@ use imagent_core::{
 /// L8（code-review v8）：markdown 语义层 `<` 转义——用户可控文本经 bot 卡片
 /// 渲染时 `<at id=…></at>` 可以 bot 名义 @ 任意租户用户。只转 `<`（JSON 层
 /// serde 已封死结构注入；`[` 链接伪装的格式损失大于收益，v4 评估结论维持）。
+/// v8-L9 校准修正（2026-08-30 真机）：卡片大小限制按**字节**计（200860
+/// card over max size 实测 24K 字符 ≈ 30KB 被拒）——此前按字符截断形同虚设。
+/// 字节安全地在 char 边界截取头/尾窗口，中间以省略标注连接。
+fn cap_md_bytes(md: &str, head_b: usize, tail_b: usize) -> String {
+    if md.len() <= head_b + tail_b {
+        return md.to_string();
+    }
+    let head_end = {
+        let mut i = head_b.min(md.len());
+        while i > 0 && !md.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    };
+    let tail_start = {
+        let mut j = md.len().saturating_sub(tail_b);
+        while j < md.len() && !md.is_char_boundary(j) {
+            j += 1;
+        }
+        j
+    };
+    let omitted = md.len() - head_end - (md.len() - tail_start);
+    format!(
+        "{}\n\n…（已截断中段 {omitted} 字节，完整内容见文本消息）…\n\n{}",
+        &md[..head_end],
+        &md[tail_start..]
+    )
+}
+
 fn escape_lt(text: &str) -> String {
     text.replace('<', "\\<")
 }
@@ -199,7 +228,7 @@ pub fn render_card(card: &OutboundCard, conv_id: &str, sender: Option<&str>) -> 
         None => text.into_owned(),
     };
     elements.push(
-        serde_json::json!({ "tag": "markdown", "content": escape_lt(&mask_emails(&body_md)) }),
+        serde_json::json!({ "tag": "markdown", "content": escape_lt(&cap_md_bytes(&mask_emails(&body_md), 4_096, 4_096)) }),
     );
     if !card.tool_calls.is_empty() {
         // 长正文分段：正文与工具面板间用真 hr 组件分隔（降级路径专属——
@@ -508,20 +537,10 @@ pub fn render_stream_init_card(conv_id: &str, sender: Option<&str>) -> String {
 /// 到进行到哪一步）；思考过程取最近 1 条置底（实时「在想什么」，历史思考终态
 /// 回看）。off 档的 Thought 在 core 侧已被过滤（不进卡）。
 fn stream_body_md_inner(card: &OutboundCard) -> String {
-    // L9（code-review v8）：managed md_body 全量重传是 O(n²) 上传流量，且超
-    // ~30KB 元素上限后 Running 帧持续失败——Running 态保留头/尾窗口（各
-    // 12KB，中间截断标注）；终态全量走 stream_body_final（纯文本兜底不丢内容）。
-    let full = stream_body_md_inner_full(card);
-    const HEAD: usize = 12_000;
-    const TAIL: usize = 12_000;
-    if full.chars().count() <= HEAD + TAIL + 100 {
-        return full;
-    }
-    let chars: Vec<char> = full.chars().collect();
-    let head: String = chars[..HEAD].iter().collect();
-    let tail: String = chars[chars.len() - TAIL..].iter().collect();
-    let omitted = chars.len() - HEAD - TAIL;
-    format!("{head}\n\n…（流式中段已截断 {omitted} 字符，完整内容见终态）…\n\n{tail}")
+    // L9（code-review v8 + 真机校准 2026-08-30）：md_body 全量重传 O(n²) 流量，
+    // 且卡片上限按字节计（字符截断实测被 200860 拒）——Running 态字节制
+    // 头尾窗口（各 4KB），中段截断标注；完整内容由终态/文本兜底承载。
+    cap_md_bytes(&stream_body_md_inner_full(card), 4_096, 4_096)
 }
 
 fn stream_body_md_inner_full(card: &OutboundCard) -> String {
@@ -1137,6 +1156,25 @@ pub fn render_question_card_resolved(choice: &str) -> String {
 
 /// 审批询问的「已处理」终态卡（真机校准 2026-08 UX：用户点按钮后卡片立即收敛，
 /// 而非保持可点的询问态直到任务结束才见反馈）。
+/// 真机校准（2026-08-30）：终态 patch 因卡片超限（200860/230099）失败时，
+/// 原流式卡会永远停在「思考中」——最小化终态卡兜底重试（完整内容已由
+/// core P5-11 纯文本补发，卡片只需表达终态）。
+pub fn render_overflow_terminal_card(done: bool) -> String {
+    let (title, template) = if done {
+        ("✅ 已完成", "green")
+    } else {
+        ("⚠️ 出错", "red")
+    };
+    serde_json::json!({
+        "schema": "2.0",
+        "header": { "title": { "tag": "plain_text", "content": title }, "template": template },
+        "body": { "elements": [
+            { "tag": "markdown", "content": "输出超出卡片大小上限，完整内容已转为**文本消息**发送（见下方/相邻消息）。" }
+        ]}
+    })
+    .to_string()
+}
+
 pub fn render_permission_card_resolved(tool_name: &str, allowed: bool) -> String {
     let mark = if allowed { "✅" } else { "⛔" };
     let verb = if allowed { "已批准" } else { "已拒绝" };
@@ -2881,5 +2919,24 @@ mod tests {
             json.contains("🗂 会话") && json.contains("/new 重置会话"),
             "内容不丢: {json}"
         );
+    }
+    /// 真机校准（2026-08-30）：卡片上限按**字节**计——24K 字符（~30KB）实测被
+    /// 200860 拒。cap_md_bytes 字节制头尾窗口 + char 边界安全。
+    #[test]
+    fn cap_md_bytes_truncates_by_bytes() {
+        let short = "你好".repeat(100); // 600 字节
+        assert_eq!(cap_md_bytes(&short, 4_096, 4_096), short, "未超限原样返回");
+        let long = "https://example.com/很长的路径".repeat(2000); // 远超 8KB
+        let capped = cap_md_bytes(&long, 4_096, 4_096);
+        assert!(capped.len() < long.len(), "必须截断");
+        assert!(capped.contains("已截断中段"), "带截断标注");
+        assert!(
+            capped.len() < 9_500,
+            "截后总长受字节预算约束: {}",
+            capped.len()
+        );
+        // 头尾仍是原文的前缀/后缀（char 边界安全，无乱码）。
+        let head_ok = long.starts_with(&capped[..capped.find('\n').unwrap_or(0)]);
+        assert!(head_ok, "头部为原文前缀");
     }
 }
