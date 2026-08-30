@@ -51,6 +51,11 @@ pub(crate) fn queued_hint_display(h: &QueuedHint) -> Option<String> {
 }
 
 /// 流式卡片会话。
+/// 卡片成功终态下需要补发全文文本的字节阈值（真机校准 2026-08-30）：略高于
+/// 平台侧 4KB+4KB 头尾窗预算——只有被截断的正文才补发，避免短内容卡+文本
+/// 双发噪音。
+const CARD_TEXT_FULL_THRESHOLD: usize = 8_500;
+
 pub(crate) struct CardSession {
     text: String,
     tools: Vec<ToolCall>,
@@ -247,7 +252,8 @@ impl CardSession {
             }
         }
         // 终态强制 patch（绕过节流），确保用户看到 Done/Error；失败降级纯文本。
-        if !self.dispatch_card(terminal, conv, hint, platform).await && !self.text.is_empty() {
+        let card_ok = self.dispatch_card(terminal, conv, hint, platform).await;
+        if !card_ok && !self.text.is_empty() {
             match platform.send_text(conv, &self.text, hint).await {
                 Ok(()) => warn!(target: "imagent::core", "卡片终态更新失败，已降级纯文本补发结论"),
                 Err(e) => warn!(
@@ -255,6 +261,13 @@ impl CardSession {
                     error = %e,
                     "卡片终态更新失败，纯文本补发也失败（结论丢失）"
                 ),
+            }
+        } else if card_ok && self.text.len() > CARD_TEXT_FULL_THRESHOLD {
+            // 真机校准（2026-08-30）：卡片正文受字节上限截断（飞书侧 4KB+4KB
+            // 头尾窗）但 patch **成功**时，此前不补发全文——卡片标注「完整内容
+            // 见文本消息」却没有那条文本。超阈值的成功终态主动补发全文文本。
+            if let Err(e) = platform.send_text(conv, &self.text, hint).await {
+                warn!(target: "imagent::core", error = %e, "截断卡全文补发失败（卡片内仍有头尾窗口）");
             }
         }
     }
