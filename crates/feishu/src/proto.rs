@@ -1851,7 +1851,8 @@ mod tests {
     #[test]
     fn parse_reaction_event_real_device_payload() {
         let payload = br#"{"schema":"2.0","header":{"event_id":"evt_real1","event_type":"im.message.reaction.created_v1","token":"","create_time":"1787969732208","tenant_key":"t","app_id":"cli_x"},"event":{"action_time":"1787969732208","message_id":"om_x100b6610454b0ca4b1fa2d9aaef7004","operator_type":"user","reaction_type":{"emoji_type":"THUMBSUP"},"user_id":{"open_id":"ou_a0c072f42e7c1b0995b7fd4841b4671b"}}}"#;
-        let (dedup, operator, mid, reply) = parse_reaction_event(payload).expect("真机形态应解析成功");
+        let (dedup, operator, mid, reply) =
+            parse_reaction_event(payload).expect("真机形态应解析成功");
         assert_eq!(operator, "ou_a0c072f42e7c1b0995b7fd4841b4671b");
         assert_eq!(mid, "om_x100b6610454b0ca4b1fa2d9aaef7004");
         assert_eq!(reply, "y");
@@ -1860,11 +1861,9 @@ mod tests {
         // 经 String 替换安全。）
         let as_str = |b: &[u8]| String::from_utf8(b.to_vec()).unwrap();
         let dn = as_str(payload).replace("THUMBSUP", "THUMBSDOWN");
-        assert!(
-            parse_reaction_event(dn.as_bytes())
-                .map(|(_, _, _, r)| r == "n")
-                .unwrap_or(false)
-        );
+        assert!(parse_reaction_event(dn.as_bytes())
+            .map(|(_, _, _, r)| r == "n")
+            .unwrap_or(false));
         let wave = as_str(payload).replace("THUMBSUP", "WAVE");
         assert!(parse_reaction_event(wave.as_bytes()).is_none());
     }

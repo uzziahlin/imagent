@@ -654,10 +654,7 @@ impl Config {
                 )));
             }
         }
-        let ch = cfg
-            .claude_permission_channel
-            .trim()
-            .to_ascii_lowercase();
+        let ch = cfg.claude_permission_channel.trim().to_ascii_lowercase();
         if ch != "control" && ch != "mcp" {
             return Err(CoreError::Config(format!(
                 "claude_permission_channel 只支持 control / mcp（当前：{}）",
@@ -1595,5 +1592,4 @@ append_system_prompt = ""
         assert!(Config::load(&p2).is_ok(), "4 应通过");
         cleanup(&p2);
     }
-
 }

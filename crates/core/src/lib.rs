@@ -40,12 +40,13 @@ pub use dispatch::{Dispatcher, TaskBudgets};
 pub use error::{CoreError, Result};
 pub use message::split_message;
 pub use metrics::Metrics;
-pub use permission::{default_sock_path, needs_approval, parse_reply, PermissionReply, PermissionRouter};
+pub use permission::{
+    default_sock_path, needs_approval, parse_reply, PermissionReply, PermissionRouter,
+};
 pub use platform::{command_card_fallback_text, Platform};
 pub use types::{
     AgentChunk, CardButton, CardButtonStyle, CardPhase, CardTerminal, ConfigFormField, ConvId,
     InboundControl, InboundMessage, JoinedChat, LocalSession, MediaRef, Mention, MsgReaction,
-    OutboundCard,
-    ReplyHint, RunOutcome, SessionId, TodoItem, TodoStatus, ToolCall, UsageStats, UserId, Workdir,
-    CARD_HANDLE_LOST,
+    OutboundCard, ReplyHint, RunOutcome, SessionId, TodoItem, TodoStatus, ToolCall, UsageStats,
+    UserId, Workdir, CARD_HANDLE_LOST,
 };

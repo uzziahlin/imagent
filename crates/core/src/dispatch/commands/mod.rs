@@ -354,11 +354,7 @@ impl Dispatcher {
             // 翻 OnIt→终态；非 om_（合成消息）过滤。
             let react_mids: Vec<String> = batch
                 .iter()
-                .filter_map(|m| {
-                    m.source_msg_id
-                        .clone()
-                        .filter(|s| s.starts_with("om_"))
-                })
+                .filter_map(|m| m.source_msg_id.clone().filter(|s| s.starts_with("om_")))
                 .collect();
             let merged = merge_batch(batch);
             let round_input = self.run_agent_round(merged, react_mids).await;
