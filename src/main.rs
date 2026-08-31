@@ -658,20 +658,6 @@ async fn main() -> Result<()> {
             ));
             // P7-A3/A4：启动偏好（陌生人 @ 提示开关 + 私聊引导开关 + 回复形态），
             // 构造后注入。
-            // 后台任务唤醒通道（真机校准 2026-08-31）：tx → backend（ControlIo
-            // 携带，托管进程退出时发送）；rx → dispatcher（run 循环注入汇总轮次）。
-            // 后台任务唤醒通道（真机校准 2026-08-31）：tx → backend（ControlIo
-            // 携带，托管进程退出时发送）；rx → dispatcher（run 循环注入汇总轮次）。
-            // 非 claude 后端无托管语义，tx 侧丢弃（rx 永不触发）。
-            {
-                let (bg_tx, bg_rx) = tokio::sync::mpsc::unbounded_channel();
-                if let Some(b) = &claude_cli_handle {
-                    b.set_bg_wake(bg_tx);
-                } else {
-                    drop(bg_tx);
-                }
-                dispatcher.set_bg_wake_rx(bg_rx).await;
-            }
             dispatcher.set_prefs(
                 config.stranger_mention_hint,
                 config.stranger_p2p_hint,

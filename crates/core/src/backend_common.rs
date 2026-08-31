@@ -41,11 +41,16 @@ pub enum CliEvent {
     },
     /// W2-2：任务清单（Claude Code TodoWrite 的结构化解析产物；全量替换语义）。
     TodoList { items: Vec<TodoItem> },
-    /// 终止 + 最终文本（claude `result` 非 error）。
+    /// 终止 + 最终文本（claude `result` 非 error）。`origin_kind` =
+    /// Some("task-notification") 标识后台子任务完成通知轮（真机校准
+    /// 2026-08-31）——读循环在活跃后台任务未清零时不因 Final 提前终止。
     Final {
         text: String,
         session: Option<String>,
+        origin_kind: Option<String>,
     },
+    /// background_tasks_changed：当前活跃后台任务数（真机校准 2026-08-31）。
+    BgTasksChanged { active: usize },
     /// 终止 + 错误（claude `result` is_error / codex TurnFailed / gemini Error）。
     Error {
         text: String,
@@ -149,6 +154,17 @@ impl GroupKillGuard {
         Self {
             pgid: pgid as i32,
             armed: true,
+        }
+    }
+
+    /// 主动组杀 + disarm：终态超时路径用（孙进程持有 stderr 管道）。
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    fn killpg(&mut self) {
+        if self.armed {
+            // SAFETY：负 pid = 整组 SIGKILL，best-effort。
+            unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
+            self.armed = false;
         }
     }
 
@@ -335,15 +351,6 @@ fn resolve_task_create_result(
     }
 }
 
-/// 后台任务全部完成的唤醒信号（真机校准 2026-08-31）：CLI 的完成通知在
-/// 流模式下排队等下一条输入（上游 #88378/#1030），网关以「托管进程自然
-/// 退出 = 后台工作收尾」为完成信号，唤醒对应会话注入汇总轮次（OpenClaw
-/// 同构：完成 → 唤醒请求者会话 → 父 agent 写总结推回渠道）。
-#[derive(Debug, Clone)]
-pub struct BgWake {
-    pub conv_id: String,
-}
-
 pub struct ControlIo {
     /// permission.sock 路径。
     pub sock: String,
@@ -354,8 +361,6 @@ pub struct ControlIo {
     /// 启动即写入子进程 stdin 的首条消息（SDK 式 user 消息 JSON 行——
     /// `--input-format stream-json` 模式下 prompt 经 stdin 投递）。
     pub initial_stdin_message: String,
-    /// 托管进程自然退出（后台任务收尾）时的唤醒通道（None = 不唤醒）。
-    pub bg_wake: Option<tokio::sync::mpsc::UnboundedSender<BgWake>>,
 }
 
 /// 组装 control_response 响应行（写回子进程 stdin）。形态按 Agent SDK 双工协议
@@ -473,6 +478,8 @@ pub async fn spawn_cli_backend(
     // claude 跑完一轮**不退出**（stream-input 等 stdin 下一条），外层会永远等
     // 下一行 stdout。终态置位后跳出外层。
     let mut terminal_seen = false;
+    // 活跃后台任务计数（background_tasks_changed 权威快照）。
+    let mut bg_active: usize = 0;
     // Task* 工具族的待办累积（claude 2.x 的 TodoWrite 后继，见 apply_task_tool）。
     let mut task_todos: Vec<(String, TodoItem)> = Vec::new();
     // TaskCreate 的 tool_use id → 占位行 index（结果到达后回填真实任务 id）。
@@ -745,7 +752,14 @@ pub async fn spawn_cli_backend(
                         .send(AgentChunk::ToolResult { tool, output, id })
                         .await;
                 }
-                CliEvent::Final { text, session } => {
+                CliEvent::BgTasksChanged { active } => {
+                    bg_active = active;
+                }
+                CliEvent::Final {
+                    text,
+                    session,
+                    origin_kind: _,
+                } => {
                     if let Some(s) = session {
                         if session_id.is_empty() && !s.is_empty() {
                             let _ = chunks.send(AgentChunk::SessionStarted(s.clone())).await;
@@ -754,8 +768,16 @@ pub async fn spawn_cli_backend(
                     }
                     final_text = text;
                     reached_terminal = true; // N8：标记由终止事件产出（非中间 Text 后 EOF）
-                    terminal_seen = true;
-                    break;
+                                             // 真机校准（2026-08-31）：活跃后台任务未清零时不终止——
+                                             // CLI 会在同一 stdout 推送每个任务的完成通知轮。
+                    if bg_active > 0 {
+                        tracing::info!(target: "imagent::backend",
+                            active = bg_active,
+                            "Final 到达但有活跃后台任务，继续等完成通知");
+                    } else {
+                        terminal_seen = true;
+                        break;
+                    }
                 }
                 CliEvent::Error { text, session } => {
                     if let Some(s) = session {
@@ -816,56 +838,28 @@ pub async fn spawn_cli_backend(
         final_len = final_text.len(), terminal = reached_terminal,
         err = error_text.is_some(), read_err = read_err.is_some(),
         "stdout 读取循环退出（进入 wait 阶段）");
-    // 控制通道收尾（真机校准 2026-08-30）：EOF 后 5s 内退出 → 正常收尸；
-    // 仍存活 = 会话还有**后台子任务**在跑（task_started/background_tasks_changed
-    // 实证；此前整组 kill 会把委派的后台工作杀掉——群会话批次 A/B/C 实测丢失，
-    // 下一轮只剩 task_notification stopped）。托管放行：解除进程组守卫 + 看护
-    // 任务等其自然退出（后台结果写入会话存储，后续 resume 可见），10 分钟硬上
-    // 限防僵尸。/stop 等运行中中断不走此路径（guard drop 整组收割）。
-    // 托管放行标记：进程仍活着持有 stderr 管道——后续 stderr await 必须有界。
-    let mut detached = false;
+    // 真机校准（2026-08-31 简化）：读循环在活跃后台任务清零后才 break——
+    // 后台期间读循环活着（stdin 未关、stdout 在读），CLI 原生推送每个任务的
+    // 完成通知轮（origin: task-notification 的 result，实测）。break 后关
+    // stdin、进程应自然退出；5s 兜底后 kill。
     let status: std::result::Result<std::process::ExitStatus, std::io::Error> = if control.is_some()
     {
         drop(stdin_w.take());
-        tracing::debug!(target: "imagent::backend", "control 通道已关 stdin，等 claude 退出（5s 超时）");
         match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
-            Ok(res) => {
-                tracing::debug!(target: "imagent::backend", status = ?res, "control 通道 claude 已退出");
-                res
-            }
+            Ok(res) => res,
             Err(_) => {
-                detached = true;
-                tracing::info!(target: "imagent::backend",
-                        "control 通道 claude 终态后仍存活（会话有后台任务），托管放行等其完成");
+                tracing::warn!(target: "imagent::backend",
+                    "control 通道 claude 终态后 5s 未退出，kill 兜底");
                 #[cfg(unix)]
-                if let Some(g) = group_guard.as_mut() {
-                    g.disarm();
-                }
-                let bg_wake = control.as_ref().and_then(|io| io.bg_wake.clone());
-                let wake_conv = control.as_ref().map(|io| io.conv_id.clone());
-                tokio::spawn(async move {
-                    match tokio::time::timeout(std::time::Duration::from_secs(600), child.wait())
-                        .await
-                    {
-                        Ok(_) => {
-                            // 自然退出 = 后台任务收尾（stdin 已 EOF、无待办工作才会
-                            // 退）→ 唤醒会话注入汇总轮次。
-                            if let (Some(tx), Some(conv)) = (bg_wake, wake_conv) {
-                                tracing::info!(target: "imagent::backend", conv_id = %conv,
-                                    "托管进程自然退出（后台任务收尾），唤醒会话汇总");
-                                let _ = tx.send(BgWake { conv_id: conv });
-                            }
-                        }
-                        Err(_) => {
-                            tracing::warn!(target: "imagent::backend",
-                                    "托管 claude 进程 10 分钟未退出，硬上限 kill（不唤醒——工作未收尾）");
-                            let _ = child.kill().await;
-                        }
+                {
+                    // 组杀（孙进程持 stderr 管道会使 stderr await 挂起——只杀直接
+                    // 子进程不够，bash 的 sleep 子进程会继承 stderr）。
+                    if let Some(g) = group_guard.as_mut() {
+                        g.killpg();
                     }
-                });
-                // 托管路径无本地退出状态：伪造成功占位（后续 diagnose 只在
-                // !reached_terminal 时用 status——终态轮次不依赖真实值）。
-                Ok(std::process::ExitStatus::default())
+                }
+                let _ = child.kill().await;
+                child.wait().await
             }
         }
     } else {
@@ -876,16 +870,7 @@ pub async fn spawn_cli_backend(
     if let Some(g) = group_guard.as_mut() {
         g.disarm();
     }
-    // 托管路径进程仍持有 stderr：await 到 EOF 会挂到其退出（同族坑——管道
-    // 持有者存活即无 EOF）。有界 2s 取已产出部分，超时按空诊断。
-    let stderr_msg = if detached {
-        tokio::time::timeout(std::time::Duration::from_secs(2), stderr_handle)
-            .await
-            .map(|r| r.unwrap_or_default())
-            .unwrap_or_default()
-    } else {
-        stderr_handle.await.unwrap_or_default()
-    };
+    let stderr_msg = stderr_handle.await.unwrap_or_default();
 
     if let Some(t) = error_text {
         // 真机校准：claude resume 幽灵会话等场景产出 is_error 且 result 文本缺失
@@ -1237,6 +1222,7 @@ mod tests {
                 CliEvent::Final {
                     text: "done".into(),
                     session: None,
+                    origin_kind: None,
                 },
             ]),
             _ => CliEvent::Skip,
@@ -1274,6 +1260,7 @@ mod tests {
                             .get("session_id")
                             .and_then(|s| s.as_str())
                             .map(String::from),
+                        origin_kind: None,
                     };
                 }
             }
@@ -1285,7 +1272,6 @@ mod tests {
             conv_id: "test-conv".into(),
             ask_timeout: std::time::Duration::from_secs(2),
             initial_stdin_message: "{\"type\":\"user\"}\n".into(),
-            bg_wake: None,
         };
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(15),
