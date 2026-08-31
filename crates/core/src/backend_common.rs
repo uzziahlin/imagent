@@ -335,6 +335,15 @@ fn resolve_task_create_result(
     }
 }
 
+/// 后台任务全部完成的唤醒信号（真机校准 2026-08-31）：CLI 的完成通知在
+/// 流模式下排队等下一条输入（上游 #88378/#1030），网关以「托管进程自然
+/// 退出 = 后台工作收尾」为完成信号，唤醒对应会话注入汇总轮次（OpenClaw
+/// 同构：完成 → 唤醒请求者会话 → 父 agent 写总结推回渠道）。
+#[derive(Debug, Clone)]
+pub struct BgWake {
+    pub conv_id: String,
+}
+
 pub struct ControlIo {
     /// permission.sock 路径。
     pub sock: String,
@@ -345,6 +354,8 @@ pub struct ControlIo {
     /// 启动即写入子进程 stdin 的首条消息（SDK 式 user 消息 JSON 行——
     /// `--input-format stream-json` 模式下 prompt 经 stdin 投递）。
     pub initial_stdin_message: String,
+    /// 托管进程自然退出（后台任务收尾）时的唤醒通道（None = 不唤醒）。
+    pub bg_wake: Option<tokio::sync::mpsc::UnboundedSender<BgWake>>,
 }
 
 /// 组装 control_response 响应行（写回子进程 stdin）。形态按 Agent SDK 双工协议
@@ -830,14 +841,24 @@ pub async fn spawn_cli_backend(
                 if let Some(g) = group_guard.as_mut() {
                     g.disarm();
                 }
+                let bg_wake = control.as_ref().and_then(|io| io.bg_wake.clone());
+                let wake_conv = control.as_ref().map(|io| io.conv_id.clone());
                 tokio::spawn(async move {
                     match tokio::time::timeout(std::time::Duration::from_secs(600), child.wait())
                         .await
                     {
-                        Ok(_) => {}
+                        Ok(_) => {
+                            // 自然退出 = 后台任务收尾（stdin 已 EOF、无待办工作才会
+                            // 退）→ 唤醒会话注入汇总轮次。
+                            if let (Some(tx), Some(conv)) = (bg_wake, wake_conv) {
+                                tracing::info!(target: "imagent::backend", conv_id = %conv,
+                                    "托管进程自然退出（后台任务收尾），唤醒会话汇总");
+                                let _ = tx.send(BgWake { conv_id: conv });
+                            }
+                        }
                         Err(_) => {
                             tracing::warn!(target: "imagent::backend",
-                                    "托管 claude 进程 10 分钟未退出，硬上限 kill");
+                                    "托管 claude 进程 10 分钟未退出，硬上限 kill（不唤醒——工作未收尾）");
                             let _ = child.kill().await;
                         }
                     }
@@ -1264,6 +1285,7 @@ mod tests {
             conv_id: "test-conv".into(),
             ask_timeout: std::time::Duration::from_secs(2),
             initial_stdin_message: "{\"type\":\"user\"}\n".into(),
+            bg_wake: None,
         };
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(15),
