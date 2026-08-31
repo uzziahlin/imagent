@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Task\* 待办面板状态永不翻转（V3 真机发现，双重死路）**：① claude 流式
+  tool_result 事件**不带工具名**（解析层恒产出空串），而读循环的 TaskCreate
+  结果回填臂 / TaskList 权威快照臂按 `tool == "..."` 匹配——永不命中，真实
+  任务 id 永不回填，TaskUpdate 按 id 匹配不到（面板 0/N 卡死）；②
+  `pending_task_lists` 记账写在 `apply_task_tool(...)` 返回真值的分支内，而
+  该函数对 TaskList 恒返回假——记账不可达，整表替换也永不触发。修复：两臂
+  改按 tool_use id 配对（map 键本就源自对应 ToolUse，无歧义）；TaskList
+  记账独立于 applied。新增走真实读循环的回归测试（结果事件空工具名形态，
+  旧代码下必红——此前单测直接构造带工具名的事件绕过了解析层，漏检根因）。
+
 ### Changed
 - **默认超时预算放宽（适配长程任务）**：`agent_timeout_secs` 默认 0（关闭）→
   **3600（1 小时）**——单轮硬上限；`agent_idle_timeout_secs` 默认 300 →
