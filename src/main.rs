@@ -670,7 +670,7 @@ async fn main() -> Result<()> {
                 } else {
                     drop(bg_tx);
                 }
-                dispatcher.set_bg_wake_rx(bg_rx);
+                dispatcher.set_bg_wake_rx(bg_rx).await;
             }
             dispatcher.set_prefs(
                 config.stranger_mention_hint,
