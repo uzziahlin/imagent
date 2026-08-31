@@ -626,11 +626,11 @@ impl Dispatcher {
 
     /// 审批集注入/热重载（main 启动与 SIGHUP 调用；空 = 全部权限请求过审）。
     /// 接线后台任务唤醒通道（main 启动调用：rx 归 dispatcher，tx 注入 backend）。
-    pub fn set_bg_wake_rx(
+    pub async fn set_bg_wake_rx(
         &self,
         rx: tokio::sync::mpsc::UnboundedReceiver<crate::backend_common::BgWake>,
     ) {
-        *self.bg_wake_rx.blocking_lock() = Some(rx);
+        *self.bg_wake_rx.lock().await = Some(rx);
     }
 
     pub fn set_approval_tools(&self, tools: Vec<String>) {
