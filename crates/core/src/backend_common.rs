@@ -648,13 +648,17 @@ pub async fn spawn_cli_backend(
                     // 同一 chunk 类型）。仍落入下方通用 ToolUse 处理（工具轨迹
                     // 面板同样展示）——此处只追加清单 chunk。
                     let before = task_todos.len();
-                    if apply_task_tool(&mut task_todos, tool, input) {
-                        if tool == "TaskList" {
-                            // 结果即全量权威快照（含桌面端创建的历史任务）。
-                            if let Some(tuid) = ev_id_of(&ev) {
-                                pending_task_lists.insert(tuid);
-                            }
+                    let applied = apply_task_tool(&mut task_todos, tool, input);
+                    // TaskList 的 USE 本身不改清单（apply_task_tool 对其恒
+                    // false——真机校准 2026-08-31 V3 自查：原先 insert 写在
+                    // applied 分支内不可达），但它的**结果**要做整表替换——
+                    // 记账必须独立于 applied。
+                    if tool == "TaskList" {
+                        if let Some(tuid) = ev_id_of(&ev) {
+                            pending_task_lists.insert(tuid);
                         }
+                    }
+                    if applied {
                         if tool == "TaskCreate" && before < task_todos.len() {
                             // 占位行 index 记账，等结果回填真实 id（会话级编号，
                             // --resume 后非 1 起）。
@@ -704,15 +708,15 @@ pub async fn spawn_cli_backend(
                     let _ = chunks.send(AgentChunk::ToolUse { tool, input, id }).await;
                 }
                 CliEvent::ToolResult {
-                    ref tool,
-                    ref output,
-                    ref id,
-                } if tool == "TaskCreate"
-                    && id
-                        .as_deref()
-                        .is_some_and(|t| pending_task_creates.contains_key(t)) =>
+                    ref output, ref id, ..
+                } if id
+                    .as_deref()
+                    .is_some_and(|t| pending_task_creates.contains_key(t)) =>
                 {
                     // TaskCreate 结果回填真实任务 id（或失败移除占位行）。
+                    // 真机校准（2026-08-31 V3）：tool_result 事件不带工具名（解析
+                    // 层恒产出空串），配对只能靠 tool_use id——pending_task_creates
+                    // 的键本就只来自 TaskCreate 的 ToolUse，按 id 命中无歧义。
                     let tuid = id.clone().unwrap();
                     if let Some(index) = pending_task_creates.remove(&tuid) {
                         if resolve_task_create_result(&mut task_todos, index, output) {
@@ -728,13 +732,15 @@ pub async fn spawn_cli_backend(
                         .await;
                 }
                 CliEvent::ToolResult {
-                    ref tool,
-                    ref output,
-                    ref id,
-                } if tool == "TaskList"
-                    && id.as_deref().is_some_and(|t| pending_task_lists.remove(t)) =>
+                    ref output, ref id, ..
+                } if id
+                    .as_deref()
+                    .is_some_and(|t| pending_task_lists.contains(t)) =>
                 {
                     // TaskList 结果 = 全量权威快照：整表替换（含桌面端历史任务）。
+                    // 同上：按 tool_use id 配对（结果事件无工具名）。
+                    let tuid = id.clone().unwrap();
+                    pending_task_lists.remove(&tuid);
                     if let Some(snapshot) = parse_task_list_snapshot(output) {
                         task_todos = snapshot;
                         let items = task_todos.iter().map(|(_, it)| it.clone()).collect();
@@ -1148,6 +1154,97 @@ mod tests {
         assert!(
             err.to_string().contains("API key invalid"),
             "错误信息应含 error 事件内容: {err}"
+        );
+    }
+
+    /// 真机校准（2026-08-31 V3）：Task* 全链路回归——结果事件**不带工具名**
+    /// （claude stream 解析层恒产出空串，协议事实），配对只能靠 tool_use id。
+    /// 旧代码按 `tool == "TaskCreate"/"TaskList"` 匹配结果臂 → 回填/整表替换
+    /// 全部不可达（真机症状：面板 0/N 永不翻转）。本测试走真实读循环复现。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn task_tools_correlate_by_id_with_nameless_results() {
+        // 载荷序列：Create×2 → 结果回填（会话级 id #7/#8）→ Update 翻转 →
+        // List USE → List 结果整表替换（乙 in_progress 仅存在于权威快照中）。
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg(
+            "printf 'CREATE_1\\nCREATE_2\\nRES_1\\nRES_2\\nUPDATE\\nLIST_USE\\nLIST_RES\\nDONE\\n'",
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::types::AgentChunk>(64);
+        let parse = |line: &str| {
+            match line.trim_end() {
+                "CREATE_1" => CliEvent::ToolUse {
+                    tool: "TaskCreate".into(),
+                    input: r#"{"subject":"任务甲"}"#.into(),
+                    session: None,
+                    id: Some("t1".into()),
+                },
+                "CREATE_2" => CliEvent::ToolUse {
+                    tool: "TaskCreate".into(),
+                    input: r#"{"subject":"任务乙"}"#.into(),
+                    session: None,
+                    id: Some("t2".into()),
+                },
+                // 结果事件 tool 恒为空串——与 claude stream 解析层产出一致。
+                "RES_1" => CliEvent::ToolResult {
+                    tool: String::new(),
+                    output: "Task #7 created successfully: 任务甲".into(),
+                    id: Some("t1".into()),
+                },
+                "RES_2" => CliEvent::ToolResult {
+                    tool: String::new(),
+                    output: "Task #8 created successfully: 任务乙".into(),
+                    id: Some("t2".into()),
+                },
+                "UPDATE" => CliEvent::ToolUse {
+                    tool: "TaskUpdate".into(),
+                    input: r#"{"taskId":"7","status":"completed"}"#.into(),
+                    session: None,
+                    id: Some("t3".into()),
+                },
+                "LIST_USE" => CliEvent::ToolUse {
+                    tool: "TaskList".into(),
+                    input: "{}".into(),
+                    session: None,
+                    id: Some("t4".into()),
+                },
+                "LIST_RES" => CliEvent::ToolResult {
+                    tool: String::new(),
+                    output: "#7 [completed] 任务甲\n#8 [in_progress] 任务乙".into(),
+                    id: Some("t4".into()),
+                },
+                "DONE" => CliEvent::Final {
+                    text: "ok".into(),
+                    session: None,
+                    origin_kind: None,
+                },
+                _ => CliEvent::Skip,
+            }
+        };
+        let outcome = spawn_cli_backend(cmd, parse, tx, "test-backend", &[], None)
+            .await
+            .expect("应成功收尾");
+        assert_eq!(outcome.final_text, "ok");
+        let mut snapshots = Vec::new();
+        while let Ok(c) = rx.try_recv() {
+            if let crate::types::AgentChunk::TodoList { items } = c {
+                snapshots.push(items);
+            }
+        }
+        // 回填发生（id #7 被解析）→ Update 能匹配翻转：甲 completed 的快照必现。
+        assert!(
+            snapshots.iter().any(|items| items
+                .iter()
+                .any(|i| i.text == "任务甲" && i.status == TodoStatus::Completed)),
+            "Update 应翻转到 completed：{snapshots:?}"
+        );
+        // TaskList 权威快照整表替换：乙 in_progress 只可能来自 LIST_RES。
+        assert!(
+            snapshots.last().is_some_and(|items| items
+                .iter()
+                .any(|i| i.text == "任务乙" && i.status == TodoStatus::InProgress)),
+            "最终快照应为 TaskList 权威视图：{:?}",
+            snapshots.last()
         );
     }
 
