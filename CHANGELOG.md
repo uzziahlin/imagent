@@ -2,6 +2,18 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [Unreleased]
+
+### Changed
+- **默认超时预算放宽（适配长程任务）**：`agent_timeout_secs` 默认 0（关闭）→
+  **3600（1 小时）**——单轮硬上限；`agent_idle_timeout_secs` 默认 300 →
+  **1200（20 分钟）**。动机：单次长工具执行（大构建/全量测试）与后台子任务
+  静默等待都是合法的 >5 分钟静默场景，旧默认会误杀（后台任务被进程组连坐）。
+  会话级 `/timeout`、全局 `/config agent_idle_timeout_secs` 逃生通道不变。
+  ⚠️ 升级注意：默认总超时非 0 后 D8 校验随之生效——存量配置若显式设
+  `permission_ask_timeout_secs ≥ 3600` 且未配 `agent_timeout_secs`，启动会被拒
+  （按提示调大总超时或显式 `agent_timeout_secs = 0` 关闭）。
+
 ## [1.14.0] — 2026-08-29
 
 > **飞书 × Claude 交互通道深度迭代（v3）+ 真机校准第一轮**：对照业界实现

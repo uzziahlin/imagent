@@ -779,7 +779,7 @@ pub async fn spawn_cli_backend(
                             active = bg_active,
                             "Final 到达但有活跃后台任务，继续等完成通知");
                         // 空闲看门狗 keepalive：dispatch 层以「连续无 chunk」判挂死
-                        //（默认 300s），等后台完成期间可能超——用空 Thought chunk
+                        //（默认 1200s），等后台完成期间可能超——用空 Thought chunk
                         // 喂狗（不进正文，卡片无感知）。
                         let _ = chunks.send(AgentChunk::Thought(String::new())).await;
                     } else {
