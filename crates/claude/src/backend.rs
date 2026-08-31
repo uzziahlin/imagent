@@ -32,10 +32,6 @@ pub struct ClaudeBackend {
     model: RwLock<Option<String>>,
     /// W1-2/W1-3/W1-4：config 侧运行参数（SIGHUP 经 [`Self::set_runtime_opts`] 整体替换）。
     runtime: RwLock<RuntimeOpts>,
-    /// 后台任务唤醒通道（真机校准 2026-08-31）：托管进程自然退出时经此唤醒
-    /// 会话汇总。main 启动注入；None = 功能未接线。
-    bg_wake_tx:
-        RwLock<Option<tokio::sync::mpsc::UnboundedSender<imagent_core::backend_common::BgWake>>>,
     /// 审批传输通道（config `claude_permission_channel`，SIGHUP 热切）：
     /// Control = canUseTool 双工协议（SDK 现行标准，缺省）；Mcp = 旧
     /// `--permission-prompt-tool` 机制（legacy 回退）。
@@ -77,7 +73,6 @@ impl ClaudeBackend {
             model: RwLock::new(None),
             runtime: RwLock::new(RuntimeOpts::default()),
             permission_channel: RwLock::new(PermissionChannel::default()),
-            bg_wake_tx: RwLock::new(None),
         }
     }
 
@@ -89,7 +84,6 @@ impl ClaudeBackend {
             model: RwLock::new(None),
             runtime: RwLock::new(RuntimeOpts::default()),
             permission_channel: RwLock::new(PermissionChannel::default()),
-            bg_wake_tx: RwLock::new(None),
         }
     }
 
@@ -107,20 +101,11 @@ impl ClaudeBackend {
             model: RwLock::new(None),
             runtime: RwLock::new(RuntimeOpts::default()),
             permission_channel: RwLock::new(PermissionChannel::default()),
-            bg_wake_tx: RwLock::new(None),
         }
     }
 }
 
 impl ClaudeBackend {
-    /// 注入后台任务唤醒通道（main 启动接线；dispatcher 的 rx 侧消费）。
-    pub fn set_bg_wake(
-        &self,
-        tx: tokio::sync::mpsc::UnboundedSender<imagent_core::backend_common::BgWake>,
-    ) {
-        *self.bg_wake_tx.write() = Some(tx);
-    }
-
     /// 设置审批传输通道（config `claude_permission_channel`，main 启动 +
     /// SIGHUP 调用；值已过 config 校验，lossy 兜底 control）。
     pub fn set_permission_channel(&self, channel: &str) {
@@ -398,7 +383,6 @@ impl Backend for ClaudeBackend {
                 conv_id: conv_id.to_string(),
                 ask_timeout: self.ask_timeout,
                 initial_stdin_message: sdk_user_message(prompt),
-                bg_wake: self.bg_wake_tx.read().clone(),
             })
         } else {
             cmd.arg("-p").arg(prompt);
@@ -570,9 +554,11 @@ fn claude_parse(line: &str) -> CliEvent {
         }
     }
     match parse_line(line) {
+        ParsedEvent::BgTasksChanged { active } => CliEvent::BgTasksChanged { active },
         ParsedEvent::Result {
             text,
             is_error,
+            origin_kind,
             session_id,
             usage,
         } => {
@@ -587,6 +573,7 @@ fn claude_parse(line: &str) -> CliEvent {
                 CliEvent::Final {
                     text,
                     session: session_id,
+                    origin_kind,
                 }
             };
             match usage {

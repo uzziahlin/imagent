@@ -31,9 +31,15 @@ pub struct ToolResultItem {
 pub enum ParsedEvent {
     /// `type == "result"` 的终止事件。附带 usage（顶层 `total_cost_usd` +
     /// `usage` 对象的 input/output/cache_read tokens；缺失字段为 None/0）。
+    /// 真机校准（2026-08-31）：background_tasks_changed → 活跃后台任务计数。
+    BgTasksChanged { active: usize },
     Result {
         text: String,
         is_error: bool,
+        /// 真机校准（2026-08-31）：`origin.kind == "task-notification"` 标识后台
+        /// 子任务完成通知轮（非用户轮）——网关据此在活跃后台任务未清零时
+        /// 不提前终止读循环。
+        origin_kind: Option<String>,
         session_id: Option<String>,
         usage: Option<UsageStats>,
     },
@@ -102,6 +108,11 @@ pub fn parse_line(line: &str) -> ParsedEvent {
             ParsedEvent::Result {
                 text,
                 is_error,
+                origin_kind: value
+                    .get("origin")
+                    .and_then(|o| o.get("kind"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 session_id,
                 usage: extract_usage(&value),
             }
@@ -112,6 +123,20 @@ pub fn parse_line(line: &str) -> ParsedEvent {
             tool_uses: extract_tool_uses(&value),
             session_id,
         },
+        Some("system") => {
+            // 真机校准（2026-08-31）：background_tasks_changed 的 tasks 是当前
+            // 活跃后台任务权威快照（每变化必发）——网关据此决定是否等完成通知。
+            if value.get("subtype").and_then(Value::as_str) == Some("background_tasks_changed") {
+                let active = value
+                    .get("tasks")
+                    .and_then(Value::as_array)
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                ParsedEvent::BgTasksChanged { active }
+            } else {
+                ParsedEvent::Other { session_id }
+            }
+        }
         Some("user") => {
             let results = extract_tool_results(&value);
             if results.is_empty() {
@@ -289,6 +314,7 @@ mod tests {
         assert_eq!(
             parse_line(line),
             ParsedEvent::Result {
+                origin_kind: None,
                 text: "pong".to_string(),
                 is_error: false,
                 session_id: Some("abc-123".to_string()),
@@ -333,6 +359,7 @@ mod tests {
         assert_eq!(
             parse_line(line),
             ParsedEvent::Result {
+                origin_kind: None,
                 text: "boom: bad prompt".to_string(),
                 is_error: true,
                 session_id: Some("s-7".to_string()),
@@ -347,6 +374,7 @@ mod tests {
         assert_eq!(
             parse_line(line),
             ParsedEvent::Result {
+                origin_kind: None,
                 text: "ok".to_string(),
                 is_error: false,
                 session_id: None,
