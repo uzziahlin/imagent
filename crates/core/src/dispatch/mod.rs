@@ -150,6 +150,13 @@ fn format_duration_human(d: Duration) -> String {
     }
 }
 
+/// 后台唤醒合成消息的 sender 标识（审计/日志可辨；不过 IM 鉴权）。
+const SYNTHETIC_SENDER: &str = "imagent:bg-wake";
+
+/// 后台唤醒注入的合成 prompt：引导模型读取已排队的任务通知并汇总给用户。
+const BG_WAKE_PROMPT: &str =
+    "【系统通知】此前派出的后台子任务已全部结束（完成通知已注入会话）。请查看各任务通知/结果，向用户汇总：每个任务做了什么、结果如何、总体结论。若无实际任务结果，简短说明即可，不要编造。";
+
 /// S-7：backend 失败统一文案模板——人可读摘要 + 是否可续接 + 建议动作；
 /// 技术细节（原始错误串）只进服务端日志，不再裸发给用户。
 fn backend_failure_reply(backend_name: &str) -> String {
@@ -496,6 +503,11 @@ pub struct Dispatcher {
     /// 审批集（ask 模式下仅清单内工具过 IM 审批，其余放行；空 = 全部过审）。
     /// main 启动注入 + SIGHUP 热重载（见 [`Self::set_approval_tools`]）。
     approval_tools: Arc<RwLock<Vec<String>>>,
+    /// 后台任务唤醒 rx（真机校准 2026-08-31：托管进程自然退出 → 注入汇总
+    /// 轮次）。None = 未接线（测试缺省）。
+    bg_wake_rx: tokio::sync::Mutex<
+        Option<tokio::sync::mpsc::UnboundedReceiver<crate::backend_common::BgWake>>,
+    >,
     /// 管理员 sender（可 /allow /config /perm /admin）。S2：空 = **无人**是
     /// 管理员（IM 内管理命令全部不可用，须通过 CLI / setup 配置 admin_senders）。
     admin_senders: Arc<RwLock<Vec<String>>>,
@@ -595,6 +607,7 @@ impl Dispatcher {
             stranger_p2p_hint: RwLock::new(true),
             reply_mode: Arc::new(RwLock::new(ReplyMode::Card)),
             approval_tools: Arc::new(RwLock::new(Vec::new())),
+            bg_wake_rx: tokio::sync::Mutex::new(None),
             admin_senders: Arc::new(RwLock::new(admin_senders)),
             shutdown: Arc::new(tokio_util::sync::CancellationToken::new()),
             tasks: Arc::new(Mutex::new(tokio::task::JoinSet::new())),
@@ -612,6 +625,14 @@ impl Dispatcher {
     }
 
     /// 审批集注入/热重载（main 启动与 SIGHUP 调用；空 = 全部权限请求过审）。
+    /// 接线后台任务唤醒通道（main 启动调用：rx 归 dispatcher，tx 注入 backend）。
+    pub fn set_bg_wake_rx(
+        &self,
+        rx: tokio::sync::mpsc::UnboundedReceiver<crate::backend_common::BgWake>,
+    ) {
+        *self.bg_wake_rx.blocking_lock() = Some(rx);
+    }
+
     pub fn set_approval_tools(&self, tools: Vec<String>) {
         *self.approval_tools.write() = tools;
     }
@@ -1000,6 +1021,39 @@ impl Dispatcher {
                 _ = self.shutdown.cancelled() => {
                     info!(target: "imagent::core", "shutdown 信号到达，停止接收新消息，drain in-flight task");
                     break;
+                }
+                // 后台任务唤醒（真机校准 2026-08-31）：托管进程自然退出 = 后台
+                // 工作收尾 → 注入合成汇总轮次（上游 CLI 通知要等下一条输入，
+                // #88378/#1030；OpenClaw 同构的「完成→唤醒会话」）。
+                Some(wake) = async {
+                    let mut g = self.bg_wake_rx.lock().await;
+                    match g.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    info!(target: "imagent::core", conv_id = %wake.conv_id,
+                        "后台任务收尾唤醒：注入汇总轮次");
+                    let msg = InboundMessage {
+                        conv_id: crate::types::ConvId(wake.conv_id.clone()),
+                        sender: crate::types::UserId(SYNTHETIC_SENDER.into()),
+                        text: Some(BG_WAKE_PROMPT.into()),
+                        media: Vec::new(),
+                        media_errors: Vec::new(),
+                        mentions: Vec::new(),
+                        mentioned_bot: true,
+                        ask_req: None,
+                        reply_to: None,
+                        source_msg_id: None,
+                        control: None,
+                        reply_hint: crate::types::ReplyHint::None,
+                    };
+                    let disp = self.clone();
+                    tokio::spawn(async move {
+                        // 直达 runner 入口（合成消息非用户输入，不过 IM 鉴权；
+                        // conv 锁/排队/批处理语义全保留）。
+                        disp.dispatch_agent_message(msg).await;
+                    });
                 }
                 msg = self.platform.recv() => match msg {
                     Ok(msg) => {
