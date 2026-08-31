@@ -130,7 +130,8 @@ allowed_senders = []        # 留空 = 发现模式（先看日志拿你的 from
 # approval_tools = ["Bash", "WebFetch", "mcp__*"]  # 审批集：ask 模式下只有这些工具过 IM 审批，其余直接放行；空=全部过审
 # allowed_chats = ["feishu:oc_xxx"]  # 会话(群)白名单：群消息 chat 放行 OR sender 放行（/chat 可动态管理）
 # ask_via_im_conv = "feishu:ou_xxx"  # 终端 agent 的 ask_via_im 提问投递会话（配了才启用，见「终端 agent 接入」）
-# agent_idle_timeout_secs = 300      # 空闲看门狗：连续无输出 N 秒自动终止（0=关）
+# agent_timeout_secs = 3600          # 单次运行总超时(秒)；默认 1 小时，0=关闭(防挂死全靠空闲看门狗)
+# agent_idle_timeout_secs = 1200     # 空闲看门狗：连续无输出 N 秒自动终止；默认 20 分钟（0=关；/timeout 可按会话覆盖）
 # batch_window_ms = 1500             # 连发消息合并为一轮 prompt 的窗口（0=关）
 # cot_detail = "brief"               # 工具过程展示 off / brief / detailed（/config 可热改；/config cot 为 per-conv 覆盖）
 # quiet_hours = "22:00-08:00"        # 免打扰时段(本地时区,可跨天)：时段内加急(buzz)提醒降级普通消息，内容不变；不设=不启用

@@ -276,9 +276,8 @@ pub struct Config {
     #[serde(default = "default_fragment_interval_ms")]
     pub message_fragment_interval_ms: u64,
     /// 单次 agent 运行总超时（秒）。超时则中止该次 run（依赖 backend 的
-    /// `kill_on_drop` 杀子进程）。**默认 0 = 关闭**：这是墙钟总预算，与 agent
-    /// 是否活跃无关，长任务会被误杀；防挂死由空闲看门狗
-    /// （`agent_idle_timeout_secs`，连续无输出才杀）承担。仅在需要硬上限时设置。
+    /// `kill_on_drop` 杀子进程）。默认 3600（1 小时）——墙钟总预算与 agent 是否
+    /// 活跃无关，设得过长误杀长任务，设为 0 = 关闭（防挂死完全交给空闲看门狗）。
     #[serde(default = "default_agent_timeout_secs")]
     pub agent_timeout_secs: u64,
     /// 权限审批（Ask 模式）等待用户回复的超时（秒），超时则 deny。默认 300（5 分钟）。
@@ -302,7 +301,9 @@ pub struct Config {
     pub shutdown_grace_secs: u64,
     /// 空闲看门狗（秒）：agent 连续该时长无任何输出（chunk）则终止本轮并杀子进程，
     /// 防 stream 僵死干等 agent_timeout 总预算。等待 IM 权限审批期间看门狗自动暂停
-    /// （审批有独立的 permission_ask_timeout_secs 预算）。默认 300；0 = 关闭。
+    /// （审批有独立的 permission_ask_timeout_secs 预算）。默认 1200（20 分钟——
+    /// 单次长工具执行/后台子任务静默等待是合法场景，窗口过短会误杀长程任务）；
+    /// 0 = 关闭。
     #[serde(default = "default_agent_idle_timeout_secs")]
     pub agent_idle_timeout_secs: u64,
     /// 批处理窗口（毫秒）：runner 起跑前等待后续消息并入同一轮 prompt 的时长；
@@ -514,7 +515,7 @@ fn default_fragment_interval_ms() -> u64 {
     400
 }
 fn default_agent_timeout_secs() -> u64 {
-    0
+    3600
 }
 fn default_permission_ask_timeout_secs() -> u64 {
     300
@@ -526,7 +527,7 @@ fn default_shutdown_grace_secs() -> u64 {
     60
 }
 fn default_agent_idle_timeout_secs() -> u64 {
-    300
+    1200
 }
 fn default_batch_window_ms() -> u64 {
     1500
@@ -786,8 +787,8 @@ permission_mode = "auto"    # 缺省=auto：claude-cli=透传 claude 原生 auto
 # metrics_addr = "127.0.0.1:9100"   # 默认关闭；设为 "ip:port" 开启 /metrics + /health HTTP server
 # message_max_len = 2000              # 单条出站消息字符上限（Unicode char，三平台生效：ilink/feishu/wecom 各与自身协议上限取 min）；不设 = 仅用平台协议上限
 # message_fragment_interval_ms = 400  # 分片间发送间隔（ms）
-# agent_timeout_secs = 0              # 单次运行总超时(秒)；0=关闭(默认，防挂死靠 idle 看门狗)；设为正数即硬上限
-# agent_idle_timeout_secs = 300       # 空闲看门狗(秒)：连续无输出则终止本轮；0=关闭
+# agent_timeout_secs = 3600           # 单次运行总超时(秒)；默认 3600(1小时)；0=关闭(防挂死全靠 idle 看门狗)
+# agent_idle_timeout_secs = 1200      # 空闲看门狗(秒)：连续无输出则终止本轮；默认 1200(20分钟)；0=关闭
 # batch_window_ms = 1500              # 批处理窗口(ms)：连发消息合并为一轮 prompt；0=关闭
 # cot_detail = "brief"                # 工具过程展示：off | brief(默认) | detailed（/config 可热改）
 # permission_ask_timeout_secs = 300   # Ask 模式等用户回复超时(秒，独立预算，不挤占 agent 超时)
@@ -1122,7 +1123,7 @@ message_fragment_interval_ms = 250
     fn idle_timeout_and_batch_window_default() {
         let p = tmp_path("idle_def", r#"default_workdir = "/tmp/ws""#);
         let cfg = Config::load(&p).expect("parse");
-        assert_eq!(cfg.agent_idle_timeout_secs, 300);
+        assert_eq!(cfg.agent_idle_timeout_secs, 1200);
         assert_eq!(cfg.batch_window_ms, 1500);
         cleanup(&p);
     }
@@ -1193,12 +1194,21 @@ message_fragment_interval_ms = 250
             );
             cleanup(&p);
         }
-        // 合法：显式小于通过；默认（agent_timeout=0 关闭）不适用该约束。
+        // 合法：显式小于通过；默认组合（总超时 3600 > 审批 300）满足预算关系。
         let p = tmp_path("lt_ok", "default_workdir = \"/tmp/ws\"\nagent_timeout_secs = 301\npermission_ask_timeout_secs = 300\n");
         assert!(Config::load(&p).is_ok());
         let p = tmp_path("off_ok", "default_workdir = \"/tmp/ws\"\n");
         assert!(Config::load(&p).is_ok());
-        assert_eq!(default_agent_timeout_secs(), 0);
+        assert_eq!(default_agent_timeout_secs(), 3600);
+        cleanup(&p);
+        // 默认总超时 3600 非 0：显式超大审批超时（≥ 默认总超时）且未显式配
+        // agent_timeout_secs 的存量配置，升级后会被 D8 拒绝——需显式提高总超时或置 0。
+        let p = tmp_path(
+            "ask_over_default_total",
+            "default_workdir = \"/tmp/ws\"\npermission_ask_timeout_secs = 7200\n",
+        );
+        let err = Config::load(&p).expect_err("审批超时 ≥ 默认总超时应拒绝");
+        assert!(format!("{err}").contains("必须小于"));
         cleanup(&p);
     }
 

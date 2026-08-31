@@ -203,8 +203,8 @@ impl Dispatcher {
         }
         let join = tokio::spawn(async move {
             let backend_name = backend.name();
-            // agent_timeout = 0（默认）= 关闭总超时：墙钟总预算会误杀持续输出的
-            // 长任务，防挂死由空闲看门狗（idle_timeout）承担。
+            // agent_timeout = 0 = 关闭总超时（默认 3600s=1h 硬上限）：墙钟总预算
+            // 会误杀持续输出的超长任务，关闭后防挂死由空闲看门狗（idle_timeout）承担。
             if agent_timeout.is_zero() {
                 return backend
                     .run(
