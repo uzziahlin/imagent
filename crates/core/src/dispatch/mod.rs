@@ -1549,6 +1549,8 @@ impl Dispatcher {
             name: active_name.clone(),
             created_at: now,
             updated_at: now,
+            // 仅新会话 id 才走到这里：新会话任务库为空（快照 None）。
+            task_todos: None,
         };
         if let Err(e) = self.store.upsert_session(&row).await {
             warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "中断路径 upsert_session 失败");

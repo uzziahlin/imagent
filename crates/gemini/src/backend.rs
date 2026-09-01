@@ -63,6 +63,7 @@ impl Backend for GeminiBackend {
         workdir: &std::path::Path,
         allowed_tools: &[String],
         chunks: tokio::sync::mpsc::Sender<AgentChunk>,
+        _initial_todos: &[imagent_core::TodoItem],
     ) -> Result<RunOutcome> {
         debug!(target: "imagent::gemini", conv_id, "gemini run start");
         // B13a：ARG_MAX 防护——gemini 的 prompt 只能整条作 `--prompt=<prompt>` 单
@@ -112,6 +113,8 @@ impl Backend for GeminiBackend {
             // S-2：仅透传 gemini(Google) 所需凭据（最小授权）。
             &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
             None,
+            // gemini 无 Task\* 工具族：不播种。
+            Vec::new(),
         )
         .await
     }
@@ -240,7 +243,15 @@ mod tests {
         let long = "x".repeat(MAX_PROMPT_BYTES + 1);
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let err = GeminiBackend::new()
-            .run("c1", &long, None, std::path::Path::new("/tmp"), &[], tx)
+            .run(
+                "c1",
+                &long,
+                None,
+                std::path::Path::new("/tmp"),
+                &[],
+                tx,
+                &[],
+            )
             .await
             .unwrap_err();
         let msg = err.to_string();

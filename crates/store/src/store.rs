@@ -36,6 +36,12 @@ pub struct SessionRow {
     pub name: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// TaskList 预热（2026-09-01）：该会话最近一份全量任务快照（JSON，含真实
+    /// 任务 id），轮首播种给 backend 的待办累积器。NULL = 从未持久化（冷启动
+    /// 走转录兜底）。/new 删整行，快照随之清除。serde default：旧序列化数据
+    /// （audit 等）反序列化时无此字段。
+    #[serde(default)]
+    pub task_todos: Option<String>,
 }
 
 /// 一行动态白名单记录（C1）。
@@ -521,7 +527,7 @@ impl Store {
         let inner = self.inner.clone();
         blocking_with(inner, move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT conv_id, session_id, agent_kind, workdir, name, created_at, updated_at \
+                "SELECT conv_id, session_id, agent_kind, workdir, name, created_at, updated_at, task_todos \
                  FROM sessions WHERE conv_id = ?1",
             )?;
             let mut rows = stmt.query(rusqlite::params![conv_id])?;
@@ -536,6 +542,7 @@ impl Store {
                     name: r.get::<_, Option<String>>(4)?,
                     created_at: r.get(5)?,
                     updated_at: r.get(6)?,
+                    task_todos: r.get::<_, Option<String>>(7)?,
                 })),
             }
         })
@@ -555,14 +562,15 @@ impl Store {
             // 崩溃会漏历史行（/resume 丢会话），且每轮两次独立 fsync。
             let tx = conn.unchecked_transaction()?;
             tx.execute(
-                "INSERT INTO sessions (conv_id, session_id, agent_kind, workdir, name, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                "INSERT INTO sessions (conv_id, session_id, agent_kind, workdir, name, created_at, updated_at, task_todos) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
                  ON CONFLICT(conv_id) DO UPDATE SET \
                    session_id = excluded.session_id, \
                    agent_kind = excluded.agent_kind, \
                    workdir    = excluded.workdir, \
                    name       = excluded.name, \
-                   updated_at = excluded.updated_at",
+                   updated_at = excluded.updated_at, \
+                   task_todos = excluded.task_todos",
                 // 更新分支：created_at 不在 SET 列中 → 保留原值。
                 rusqlite::params![
                     row.conv_id,
@@ -572,6 +580,7 @@ impl Store {
                     row.name,
                     row.created_at,
                     now,
+                    row.task_todos,
                 ],
             )?;
             tx.execute(
@@ -602,6 +611,21 @@ impl Store {
             conn.execute(
                 "DELETE FROM sessions WHERE conv_id = ?1",
                 rusqlite::params![conv_id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// TaskList 预热（2026-09-01）：定向更新该 conv 的任务快照列（不动
+    /// session_id 等其余字段——冷启动回写用，避免整行 upsert 与轮末落库竞争）。
+    pub async fn set_session_todos(&self, conv_id: &str, todos: Option<&str>) -> Result<()> {
+        let (conv_id, todos) = (conv_id.to_string(), todos.map(str::to_string));
+        let inner = self.inner.clone();
+        blocking_with_retry(inner, move |conn| {
+            conn.execute(
+                "UPDATE sessions SET task_todos = ?2 WHERE conv_id = ?1",
+                rusqlite::params![conv_id, todos],
             )?;
             Ok(())
         })
@@ -1788,6 +1812,7 @@ mod tests {
             name: None,
             created_at: at,
             updated_at: at,
+            task_todos: None,
         };
         store.upsert_session(&row("s1", 100)).await.unwrap();
         store.upsert_session(&row("s2", 200)).await.unwrap();
@@ -1822,6 +1847,7 @@ mod tests {
             name: None,
             created_at: 1,
             updated_at: 1,
+            task_todos: None,
         };
         for i in 0..60 {
             store
@@ -1944,6 +1970,7 @@ mod tests {
             name: None,
             created_at: 1_000_000,
             updated_at: 1_000_000,
+            task_todos: None,
         };
         store.upsert_session(&row).await.unwrap();
 
@@ -1979,6 +2006,52 @@ mod tests {
 
         store.delete_session("ilink:user1").await.unwrap();
         assert!(store.get_session("ilink:user1").await.unwrap().is_none());
+    }
+
+    /// TaskList 预热（2026-09-01）：task_todos 列随 upsert 读写 + 定向更新不
+    /// 动其余字段 + /new 删行连带清快照。
+    #[tokio::test]
+    async fn session_task_todos_roundtrip_and_targeted_update() {
+        let db = TempDb::new("sess-todos").await;
+        let store = Store::open(&db.path).await.unwrap();
+        let row = SessionRow {
+            conv_id: "feishu:c1".into(),
+            session_id: "sess-A".into(),
+            agent_kind: "claude-cli".into(),
+            workdir: "/tmp/proj".into(),
+            name: None,
+            created_at: 1,
+            updated_at: 1,
+            task_todos: None,
+        };
+        store.upsert_session(&row).await.unwrap();
+        assert!(store
+            .get_session("feishu:c1")
+            .await
+            .unwrap()
+            .unwrap()
+            .task_todos
+            .is_none());
+
+        // 轮末落库：快照随行写入。
+        let mut row2 = row.clone();
+        row2.task_todos =
+            Some(r#"{"at":100,"items":[{"id":"1","text":"任务","status":"Completed"}]}"#.into());
+        store.upsert_session(&row2).await.unwrap();
+        let got = store.get_session("feishu:c1").await.unwrap().unwrap();
+        assert!(got.task_todos.as_deref().unwrap().contains("\"id\":\"1\""));
+
+        // 冷启动回写：定向更新快照列，session_id 不动。
+        store
+            .set_session_todos("feishu:c1", Some(r#"{"at":200,"items":[]}"#))
+            .await
+            .unwrap();
+        let got = store.get_session("feishu:c1").await.unwrap().unwrap();
+        assert_eq!(got.session_id, "sess-A", "定向更新不得动 session_id");
+        assert!(got.task_todos.as_deref().unwrap().contains("\"at\":200"));
+
+        // 不存在的 conv：no-op 不报错。
+        store.set_session_todos("feishu:none", None).await.unwrap();
     }
 
     #[tokio::test]
@@ -2223,6 +2296,7 @@ mod tests {
                             name: None,
                             created_at: 1,
                             updated_at: 1,
+                            task_todos: None,
                         })
                         .await
                         .expect("并发 upsert 不应因 BUSY 失败");
@@ -2994,6 +3068,7 @@ mod tests {
                 name: None,
                 created_at: 1,
                 updated_at: 1,
+                task_todos: None,
             })
             .await
             .unwrap();
@@ -3009,6 +3084,7 @@ mod tests {
             name: Some("refactor".into()),
             created_at: 1,
             updated_at: 1,
+            task_todos: None,
         };
         store
             .switch_named_session("c1", "refactor", Some(&sr))
@@ -3046,6 +3122,7 @@ mod tests {
                 name: None,
                 created_at: 1,
                 updated_at: 1,
+                task_todos: None,
             })
             .await
             .unwrap();

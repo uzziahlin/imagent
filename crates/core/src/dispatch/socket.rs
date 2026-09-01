@@ -734,7 +734,7 @@ impl Dispatcher {
         router
             .set_card_msg_id(&conv_id, &request_id, card_msg_id)
             .await;
-        // P1-G/S-3：权限回复等待独立预算 permission_ask_timeout（默认 300s，不挤占
+        // P1-G/S-3：权限回复等待独立预算 permission_ask_timeout（默认 900s，不挤占
         // agent_timeout 的执行预算）。agent 死或用户长时间不回复时，超时回 deny 并 drop
         // receiver，避免 pending 永驻把后续消息误当回复吞。
         // P1-8：超时/router-drop 分支显式 cancel，移除 pending map 残留。

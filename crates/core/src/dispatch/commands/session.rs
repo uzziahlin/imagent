@@ -203,6 +203,8 @@ impl Dispatcher {
             name: None,
             created_at: now,
             updated_at: now,
+            // 重绑到历史会话：新会话的任务库快照未知，置空走冷启动（转录兜底）。
+            task_todos: None,
         };
         if let Err(e) = self.store.upsert_session(&row).await {
             self.reply(conv, &format!("恢复失败：{e}"), hint).await;
@@ -272,6 +274,8 @@ impl Dispatcher {
                     name: Some(name.into()),
                     created_at: row.created_at,
                     updated_at: now,
+                    // /switch 重绑：任务库快照随会话换绑置空（冷启动兜底）。
+                    task_todos: None,
                 };
                 if let Err(e) = self
                     .store
@@ -472,6 +476,8 @@ impl Dispatcher {
                         &workdir,
                         &tools,
                         tx,
+                        // /compact 是系统发起的维护轮，不播种任务面板。
+                        &[],
                     )
                     .await;
             }
@@ -484,6 +490,7 @@ impl Dispatcher {
                     &workdir,
                     &tools,
                     tx,
+                    &[],
                 ),
             )
             .await

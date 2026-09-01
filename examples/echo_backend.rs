@@ -24,6 +24,7 @@ impl Backend for EchoBackend {
         _workdir: &Path,
         _allowed_tools: &[String],
         chunks: mpsc::Sender<AgentChunk>,
+        _initial_todos: &[imagent_core::TodoItem],
     ) -> Result<RunOutcome> {
         // 流式推一个 Final chunk（core 收到后回传 IM）。
         let _ = chunks.send(AgentChunk::Final(prompt.to_string())).await;
@@ -53,7 +54,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let tools: Vec<String> = vec!["Read".to_string()];
 
     let outcome = backend
-        .run("example-conv", &prompt, None, &workdir, &tools, tx)
+        .run("example-conv", &prompt, None, &workdir, &tools, tx, &[])
         .await?;
 
     println!("session_id: {}", outcome.session_id.0);

@@ -323,6 +323,16 @@ impl Backend for ClaudeBackend {
         NAME
     }
 
+    /// TaskList 预热冷启动：回放 ~/.claude/projects 转录推导任务终态
+    ///（与在线读循环同一状态机，见 sessions::replay_task_todos）。
+    fn derive_task_todos(
+        &self,
+        session_id: &str,
+        workdir: &std::path::Path,
+    ) -> Option<Vec<imagent_core::TodoItem>> {
+        crate::sessions::replay_task_todos(workdir, session_id)
+    }
+
     /// W1-2：/model 热设（进程内；SIGHUP 时 main 重设回 config 基准值）。
     fn set_model(&self, model: Option<String>) {
         *self.model.write() = model;
@@ -359,6 +369,7 @@ impl Backend for ClaudeBackend {
         workdir: &std::path::Path,
         allowed_tools: &[String],
         chunks: tokio::sync::mpsc::Sender<AgentChunk>,
+        initial_todos: &[imagent_core::TodoItem],
     ) -> Result<RunOutcome> {
         // 构造命令（prompt 作为单个 arg，不经 shell；stdin/stdout/stderr/kill_on_drop
         // 由 spawn_cli_backend 统一加）。
@@ -498,6 +509,8 @@ impl Backend for ClaudeBackend {
             // S-2：仅透传 claude 所需凭据/端点（最小授权）。
             &["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"],
             control_io,
+            // TaskList 预热：会话既有任务快照作累积器初值。
+            initial_todos.to_vec(),
         )
         .await;
         // S-6 / P3-2：run 结束（claude 子进程已退出）清理本次 mcp 配置，避免
@@ -510,7 +523,8 @@ impl Backend for ClaudeBackend {
 }
 
 /// claude stream-json 行 → [`CliEvent`] 适配（见 [`parse_line`]）。
-fn claude_parse(line: &str) -> CliEvent {
+/// pub(crate)：sessions.rs 的转录回放（TaskList 预热冷启动）复用同一解析。
+pub(crate) fn claude_parse(line: &str) -> CliEvent {
     // canUseTool 控制请求（--input-format stream-json 双工协议）：弱解析——
     // type==control_request 即认，字段名容错（tool_name|tool、input|arguments），
     // 提取失败也产生事件（subtype 透传；responder 对非 can_use_tool 回 error
@@ -800,6 +814,7 @@ mod tests {
                 &workdir,
                 &allowed,
                 tx,
+                &[],
             )
             .await
             .expect("claude run should succeed");

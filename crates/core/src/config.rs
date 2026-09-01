@@ -280,7 +280,8 @@ pub struct Config {
     /// 活跃无关，设得过长误杀长任务，设为 0 = 关闭（防挂死完全交给空闲看门狗）。
     #[serde(default = "default_agent_timeout_secs")]
     pub agent_timeout_secs: u64,
-    /// 权限审批（Ask 模式）等待用户回复的超时（秒），超时则 deny。默认 300（5 分钟）。
+    /// 权限审批（Ask 模式）等待用户回复的超时（秒），超时则 deny。默认 900
+    /// （15 分钟——IM 异步场景 5 分钟常来不及批，/stats 真机实测 timeout 占 16%）。
     /// S-3：独立预算——审批等待不再挤占 `agent_timeout` 的执行预算（`agent_timeout`
     /// 覆盖审批 + 执行总和）。D8：`agent_timeout_secs` 非 0（启用总超时）时必须
     /// 小于它（否则慢审批撑满 agent 总预算、看门狗语义错乱），加载期强制校验、
@@ -292,7 +293,7 @@ pub struct Config {
     #[serde(default)]
     pub ask_via_im_conv: Option<String>,
     /// `ask_via_im` 等待用户回复的超时（秒），可被工具调用的 timeout_secs 覆盖。
-    /// 远程场景用户可能长时间不在，默认 1800（30 分钟），远大于审批的 300。
+    /// 远程场景用户可能长时间不在，默认 1800（30 分钟），远大于审批的 900。
     #[serde(default = "default_ask_via_im_timeout_secs")]
     pub ask_via_im_timeout_secs: u64,
     /// 优雅退出（SIGINT/SIGTERM）drain in-flight task 的宽限期（秒）。超时则 abort
@@ -518,7 +519,7 @@ fn default_agent_timeout_secs() -> u64 {
     3600
 }
 fn default_permission_ask_timeout_secs() -> u64 {
-    300
+    900
 }
 fn default_ask_via_im_timeout_secs() -> u64 {
     1800
@@ -791,7 +792,7 @@ permission_mode = "auto"    # 缺省=auto：claude-cli=透传 claude 原生 auto
 # agent_idle_timeout_secs = 1200      # 空闲看门狗(秒)：连续无输出则终止本轮；默认 1200(20分钟)；0=关闭
 # batch_window_ms = 1500              # 批处理窗口(ms)：连发消息合并为一轮 prompt；0=关闭
 # cot_detail = "brief"                # 工具过程展示：off | brief(默认) | detailed（/config 可热改）
-# permission_ask_timeout_secs = 300   # Ask 模式等用户回复超时(秒，独立预算，不挤占 agent 超时)
+# permission_ask_timeout_secs = 900   # Ask 模式等用户回复超时(秒，独立预算，不挤占 agent 超时；默认 15 分钟)
 # ask_via_im_conv = "feishu:ou_xxx"   # 终端 agent 的 ask_via_im 工具投递目标会话（设了才启用；配合 `imagent mcp-ask` 挂到任意终端 agent 的 MCP 配置）
 # ask_via_im_timeout_secs = 1800      # ask_via_im 等待回复超时(秒，默认 30 分钟，可被调用覆盖)
 # shutdown_grace_secs = 60            # 优雅退出 drain 宽限(秒)；超时 abort 在飞 task
@@ -1200,6 +1201,7 @@ message_fragment_interval_ms = 250
         let p = tmp_path("off_ok", "default_workdir = \"/tmp/ws\"\n");
         assert!(Config::load(&p).is_ok());
         assert_eq!(default_agent_timeout_secs(), 3600);
+        assert_eq!(default_permission_ask_timeout_secs(), 900);
         cleanup(&p);
         // 默认总超时 3600 非 0：显式超大审批超时（≥ 默认总超时）且未显式配
         // agent_timeout_secs 的存量配置，升级后会被 D8 拒绝——需显式提高总超时或置 0。

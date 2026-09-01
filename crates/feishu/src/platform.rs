@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::sync::{mpsc, Mutex, RwLock};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use imagent_core::{
     command_card_fallback_text, split_message, CardButton, CardTerminal, ConvId, CoreError, Dedup,
@@ -779,7 +779,7 @@ impl FeishuPlatform {
                             &app_id_for_drain,
                             &app_secret_for_drain,
                             &ConvId(format!("feishu:{chat_id}")),
-                            "👋 我已加入本群！群内 @我 发消息即可驱动 agent。\n管理员可发送 /chat allow 放行本群（放行前我不会响应消息）；/help 查看全部命令。",
+                            "👋 我已加入本群！群内 @我 发消息即可驱动 agent。\n管理员可发送 /chat allow 放行本群（放行前我不会响应消息）；/help 查看全部命令。\n💬 会话规则：群主时间线直接 @我 = 续同一会话；点消息「回复」进话题 = 开独立会话（互不共享上下文/待办）。",
                         )
                         .await;
                     }
@@ -800,12 +800,30 @@ impl FeishuPlatform {
                     .await;
                     continue;
                 }
-                // 真机排障：无法解析的 payload 头部（截断）记 warn，定位事件结构差异。
+                // 真机排障：兜底分类——已知「正常忽略」的事件（策略过滤的群消息、
+                // 表情回执/自身回声）降 DEBUG，避免淹没真正需要排障的 WARN
+                //（真机校准 2026-09-01：V2/V3 期间大量正常消息被记成 WARN 误导视线）。
                 let head: String = String::from_utf8_lossy(&payload)
                     .chars()
                     .take(400)
                     .collect();
-                warn!(target: "feishu", payload_head = %head, "无法解析/非目标事件，丢弃");
+                let etype = serde_json::from_slice::<serde_json::Value>(&payload)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("header")?
+                            .get("event_type")?
+                            .as_str()
+                            .map(str::to_string)
+                    });
+                match etype.as_deref() {
+                    Some("im.message.receive_v1") => {
+                        debug!(target: "feishu", payload_head = %head, "消息未过准入策略（如群内未@），忽略");
+                    }
+                    Some("im.message.reaction.created_v1") => {
+                        debug!(target: "feishu", payload_head = %head, "表情事件回执（多为自身回声），忽略");
+                    }
+                    _ => warn!(target: "feishu", payload_head = %head, "无法解析/非目标事件，丢弃"),
+                }
             }
         });
 

@@ -148,7 +148,7 @@ pub struct JoinedChat {
 }
 
 /// W2-2：任务清单项状态（Claude Code 的 TodoWrite / ACP Plan）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TodoStatus {
     Pending,
     InProgress,
@@ -156,10 +156,24 @@ pub enum TodoStatus {
 }
 
 /// W2-2：任务清单项。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// TaskList 预热（2026-09-01）：`id` 为 Task\* 工具族的真实任务 id（会话级
+/// 连续编号）——跨轮 TaskUpdate 按 id 匹配与会话快照持久化都靠它；
+/// TodoWrite/ACP 路径无 id（None）。serde default 兼容旧序列化数据。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TodoItem {
+    #[serde(default)]
+    pub id: Option<String>,
     pub text: String,
     pub status: TodoStatus,
+}
+
+/// TaskList 预热（2026-09-01）：会话任务快照的持久化载荷（sessions.task_todos
+/// 列）。`at` 为落库时刻 unix 秒——为将来「转录 mtime 较新才重解析」的漂移
+/// 校对预留。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TaskTodosPayload {
+    pub at: i64,
+    pub items: Vec<TodoItem>,
 }
 
 /// Backend 流式产出的分块。

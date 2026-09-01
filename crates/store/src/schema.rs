@@ -3,7 +3,7 @@
 //! 用 `PRAGMA user_version` 做简单线性迁移：v1 = 建 5 张基础表，v2 = 动态白名单 + 审计日志。
 
 /// 当前代码支持的最新 schema 版本（migrate 上限 + user_version 过新拒绝阈值，P2-O）。
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// v1 全部建表语句（`CREATE TABLE IF NOT EXISTS`，可重复执行）。
 pub const SCHEMA_V1: &str = r#"
@@ -148,6 +148,11 @@ CREATE TABLE IF NOT EXISTS run_stats (
 /// 聚合成本须知道每轮由谁触发）。存量行为 NULL（上限统计从升级后新行起算）。
 pub const SCHEMA_V9: &str = "ALTER TABLE run_stats ADD COLUMN sender TEXT;";
 
+/// v10：sessions 增加 task_todos 列（TaskList 预热——每会话最近一份全量任务
+/// 快照 JSON，含真实任务 id；轮首播种给 backend 待办累积器）。存量行 NULL
+/// （冷启动首轮走转录兜底或空降级）。
+pub const SCHEMA_V10: &str = "ALTER TABLE sessions ADD COLUMN task_todos TEXT;";
+
 /// 在已打开的连接上跑线性迁移。幂等：逐版本推进（v1→v2→…），已到目标版本则跳过。
 pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     let current: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -202,6 +207,10 @@ pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     if current < 9 {
         tx.execute_batch(SCHEMA_V9)?;
         tx.pragma_update(None, "user_version", 9_i64)?;
+    }
+    if current < 10 {
+        tx.execute_batch(SCHEMA_V10)?;
+        tx.pragma_update(None, "user_version", 10_i64)?;
     }
     tx.commit()?;
     Ok(())
