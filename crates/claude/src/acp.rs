@@ -678,6 +678,7 @@ impl Backend for AcpBackend {
         workdir: &std::path::Path,
         allowed_tools: &[String],
         chunks: tokio::sync::mpsc::Sender<AgentChunk>,
+        _initial_todos: &[imagent_core::TodoItem],
     ) -> Result<RunOutcome> {
         // allowed_tools 暂无 ACP 直接映射（session/new 无工具白名单字段），依赖 cwd
         // 锁定 + claude 自身工具策略 + 权限审批收敛。
@@ -830,6 +831,7 @@ async fn forward_update(state: &StreamState, update: SessionUpdate) {
                         _ => TodoStatus::Pending,
                     };
                     Some(TodoItem {
+                        id: None,
                         text: text.to_string(),
                         status,
                     })
@@ -1120,14 +1122,14 @@ mod tests {
         let a = backend.clone();
         let wd = workdir.clone();
         let run_a = tokio::spawn(async move {
-            let _ = a.run("lim-a", "slow", None, &wd, &[], tx_a).await;
+            let _ = a.run("lim-a", "slow", None, &wd, &[], tx_a, &[]).await;
         });
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // 上限 1：第二个 conv 被拒，且错误提示可读。
         let (tx_b, _rx_b) = tokio::sync::mpsc::channel::<AgentChunk>(64);
         let err = backend
-            .run("lim-b", "fast", None, &workdir, &[], tx_b)
+            .run("lim-b", "fast", None, &workdir, &[], tx_b, &[])
             .await
             .expect_err("上限 1 时第二个 conv 应被拒绝");
         assert!(err.to_string().contains("上限"), "错误应说明上限: {err}");
@@ -1450,14 +1452,14 @@ mod tests {
         let a = backend.clone();
         let wd = workdir.clone();
         let run_a = tokio::spawn(async move {
-            let _ = a.run("conv-a", "slow", None, &wd, &[], tx_a).await;
+            let _ = a.run("conv-a", "slow", None, &wd, &[], tx_a, &[]).await;
         });
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // B 起跑并立即放行其闸门——旧全局单连接串行模型下 B 的 prompt 排在 A
         // 之后，即便闸门开了也拿不到响应；per-conv 模型下 B 应立即完成。
         let (tx_b, _rx_b) = tokio::sync::mpsc::channel::<AgentChunk>(64);
-        let run_b = backend.run("conv-b", "fast", None, &workdir, &[], tx_b);
+        let run_b = backend.run("conv-b", "fast", None, &workdir, &[], tx_b, &[]);
         let mut run_b = std::pin::pin!(run_b);
         let _ = release_b.send(true);
         let out_b = tokio::time::timeout(Duration::from_secs(5), run_b.as_mut())
@@ -1494,7 +1496,7 @@ mod tests {
         let a = backend_for_a.clone();
         let wd = workdir.clone();
         let run_a = tokio::spawn(async move {
-            let _ = a.run("conv-a", "slow", None, &wd, &[], tx_a).await;
+            let _ = a.run("conv-a", "slow", None, &wd, &[], tx_a, &[]).await;
         });
         tokio::time::sleep(Duration::from_millis(300)).await;
         run_a.abort(); // 等 A 进入 prompt 后 cancel
@@ -1512,7 +1514,7 @@ mod tests {
 
         // B 不受影响：照常完成。
         let (tx_b, _rx_b) = tokio::sync::mpsc::channel::<AgentChunk>(64);
-        let run_b = backend_for_a.run("conv-b", "fast", None, &workdir, &[], tx_b);
+        let run_b = backend_for_a.run("conv-b", "fast", None, &workdir, &[], tx_b, &[]);
         let mut run_b = std::pin::pin!(run_b);
         let _ = release_b.send(true);
         let out_b = tokio::time::timeout(Duration::from_secs(5), run_b.as_mut())
@@ -1605,6 +1607,7 @@ mod tests {
                 &workdir,
                 &[],
                 tx,
+                &[],
             )
             .await
             .expect_err("LoadSession 失败应返回错误");
@@ -1691,7 +1694,15 @@ mod tests {
         let workdir = std::env::current_dir().unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentChunk>(64);
         let outcome = backend
-            .run("e2e", "Reply with exactly: hi", None, &workdir, &[], tx)
+            .run(
+                "e2e",
+                "Reply with exactly: hi",
+                None,
+                &workdir,
+                &[],
+                tx,
+                &[],
+            )
             .await
             .expect("acp run 应成功");
         assert!(!outcome.final_text.is_empty(), "final_text 不应为空");

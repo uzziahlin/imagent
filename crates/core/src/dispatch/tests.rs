@@ -306,6 +306,7 @@ impl Backend for MockBackend {
         _workdir: &std::path::Path,
         _allowed_tools: &[String],
         chunks: mpsc::Sender<AgentChunk>,
+        _initial_todos: &[crate::types::TodoItem],
     ) -> Result<crate::types::RunOutcome> {
         // P1-7 测试：fail 模式直接返 Err，触发 handle 失败路径。
         if self.fail {
@@ -2954,6 +2955,7 @@ async fn stop_aborts_compact() {
             name: None,
             created_at: now,
             updated_at: now,
+            task_todos: None,
         })
         .await
         .unwrap();

@@ -62,10 +62,40 @@ impl Dispatcher {
         let _ = self.platform.send_typing(&conv, &hint).await;
 
         // 取续接 session；store 错误仅 log 后当 None。
+        // TaskList 预热（2026-09-01）：轮首任务快照判定树——②行内 task_todos
+        // 非 NULL 直接用（快路径）；③NULL（/resume 的电脑端会话 / 升级首轮 /
+        // 上轮中断未落库）→ backend 本地转录推导（claude 系），结果（含空）
+        // 回写 DB，此后永远走②。
+        let mut seed_todos: Vec<crate::types::TodoItem> = Vec::new();
         let existing: Option<SessionId> = match self.store.get_session(&conv.0).await {
             Ok(Some(row)) => {
                 // 校验 agent_kind：跨后端切换时不复用旧 session_id（格式不兼容会错乱）。
                 if row.agent_kind == self.backend.name() {
+                    seed_todos = match &row.task_todos {
+                        Some(json) => serde_json::from_str::<crate::types::TaskTodosPayload>(json)
+                            .map(|p| p.items)
+                            .unwrap_or_default(),
+                        None => {
+                            let wd = std::path::PathBuf::from(&row.workdir);
+                            let derived = self
+                                .backend
+                                .derive_task_todos(&row.session_id, &wd)
+                                .unwrap_or_default();
+                            let payload = crate::types::TaskTodosPayload {
+                                at: now_secs(),
+                                items: derived.clone(),
+                            };
+                            if let Ok(s) = serde_json::to_string(&payload) {
+                                if let Err(e) =
+                                    self.store.set_session_todos(&conv.0, Some(&s)).await
+                                {
+                                    warn!(target: "imagent::core", conv_id = %conv.0, error = %e,
+                                        "转录兜底快照回写失败（不影响本轮，下轮重试）");
+                                }
+                            }
+                            derived
+                        }
+                    };
                     Some(SessionId(row.session_id))
                 } else {
                     warn!(
@@ -214,6 +244,7 @@ impl Dispatcher {
                         &workdir,
                         &tools,
                         tx,
+                        &seed_todos,
                     )
                     .await;
             }
@@ -226,6 +257,7 @@ impl Dispatcher {
                     &workdir,
                     &tools,
                     tx,
+                    &seed_todos,
                 ),
             )
             .await
@@ -645,7 +677,10 @@ impl Dispatcher {
             }
         }
         // W2-2：纯文本平台追加任务清单进度（卡片平台由卡片 checklist 渲染）。
-        if let Some(todos) = latest_todos.filter(|t| !t.is_empty() && card.is_none()) {
+        if let Some(todos) = latest_todos
+            .as_ref()
+            .filter(|t| !t.is_empty() && card.is_none())
+        {
             let done = todos
                 .iter()
                 .filter(|t| t.status == crate::types::TodoStatus::Completed)
@@ -760,6 +795,19 @@ impl Dispatcher {
                 "backend 返回空 session_id（疑似非正常终止），不更新 session 映射"
             );
         } else {
+            // TaskList 预热：本轮最新任务快照（TodoList chunk 累积，含真实 id）
+            // 随会话行落库；无任务活动的轮次保留 NULL（换绑/新会话语义正确，
+            // 冷启动由转录兜底接管）。at 为将来「转录较新才重解析」预留。
+            let todos_json = latest_todos
+                .as_ref()
+                .filter(|v| !v.is_empty())
+                .and_then(|items| {
+                    serde_json::to_string(&crate::types::TaskTodosPayload {
+                        at: now,
+                        items: items.clone(),
+                    })
+                    .ok()
+                });
             let row = SessionRow {
                 conv_id: conv.0.clone(),
                 session_id: outcome.session_id.0.clone(),
@@ -768,6 +816,7 @@ impl Dispatcher {
                 name: active_name.clone(),
                 created_at: now,
                 updated_at: now,
+                task_todos: todos_json,
             };
             if let Err(e) = self.store.upsert_session(&row).await {
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "upsert_session 失败");

@@ -64,6 +64,7 @@ impl Backend for CodexBackend {
         workdir: &std::path::Path,
         allowed_tools: &[String],
         chunks: tokio::sync::mpsc::Sender<AgentChunk>,
+        _initial_todos: &[imagent_core::TodoItem],
     ) -> Result<RunOutcome> {
         debug!(target: "imagent::codex", conv_id, "codex run start");
         // B11 幽灵会话预检（参照 claude 的 session_exists 毒化防护）：失败轮次的
@@ -109,6 +110,8 @@ impl Backend for CodexBackend {
             // S-2：仅透传 codex(OpenAI) 所需凭据/端点（最小授权）。
             &["OPENAI_API_KEY", "OPENAI_BASE_URL"],
             None,
+            // codex 无 Task\* 工具族：不播种。
+            Vec::new(),
         )
         .await
     }

@@ -126,6 +126,64 @@ pub(crate) fn session_exists(workdir: &Path, session_id: &str) -> bool {
         .is_some_and(|base| session_exists_in(&base.join("projects"), workdir, session_id))
 }
 
+/// TaskList 预热冷启动（2026-09-01）：回放会话 jsonl 的 Task\* 工具事件，推导
+/// 任务终态快照（含真实任务 id）。转录行与 CLI stdout 流式事件同构（assistant
+/// 的 tool_use / user 的 tool_result），复用 backend 的
+/// [`crate::backend::claude_parse`] 与 core 的 TaskTodosState——和在线读循环
+/// **同一套状态机**，语义不漂移。文件不存在返回 None；存在则返回终态（可为
+/// 空——core 照常回写快照列终结冷启动，之后永远走 DB 快路径）。
+pub(crate) fn replay_task_todos(
+    workdir: &Path,
+    session_id: &str,
+) -> Option<Vec<imagent_core::TodoItem>> {
+    replay_task_todos_at(&default_claude_dir()?.join("projects"), workdir, session_id)
+}
+
+/// [`replay_task_todos`] 的可注入版本（测试用自定义根目录）。
+pub(crate) fn replay_task_todos_at(
+    base: &Path,
+    workdir: &Path,
+    session_id: &str,
+) -> Option<Vec<imagent_core::TodoItem>> {
+    use std::io::BufRead;
+    for enc in encode_candidates(workdir) {
+        let path = base.join(enc).join(format!("{session_id}.jsonl"));
+        let Ok(f) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let mut state = imagent_core::backend_common::TaskTodosState::new(Vec::new());
+        for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
+            match crate::backend::claude_parse(&line) {
+                imagent_core::backend_common::CliEvent::Multi(evs) => {
+                    for ev in evs {
+                        replay_feed(&mut state, &ev);
+                    }
+                }
+                ev => replay_feed(&mut state, &ev),
+            }
+        }
+        return Some(state.finish());
+    }
+    None
+}
+
+fn replay_feed(
+    state: &mut imagent_core::backend_common::TaskTodosState,
+    ev: &imagent_core::backend_common::CliEvent,
+) {
+    match ev {
+        imagent_core::backend_common::CliEvent::ToolUse {
+            tool, input, id, ..
+        } => {
+            state.on_tool_use(tool, input, id.as_deref());
+        }
+        imagent_core::backend_common::CliEvent::ToolResult { output, id, .. } => {
+            state.on_tool_result(id.as_deref(), output);
+        }
+        _ => {}
+    }
+}
+
 /// W4-2：会话 jsonl → Markdown 转录（/export 数据源）。逐行解析 user/assistant
 /// 消息的 text 块（tool_use/tool_result/meta 行跳过——转录面向人读对话，非完整
 /// 调试转储）；行级解析失败跳过不中断。找不到文件或无对话内容返回 None。
@@ -294,6 +352,50 @@ mod tests {
         // 不存在的会话 → None。
         assert!(export_session_md_at(&dir, std::path::Path::new("/tmp/ws"), "nope").is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TaskList 预热冷启动（2026-09-01）：转录回放 Task\* 事件推导任务终态
+    ///（与在线读循环同一状态机）——Create 回填真实 id、Update 翻转、deleted
+    /// 删行；转录行与 CLI stdout 流式事件同构。
+    #[test]
+    fn replay_task_todos_from_transcript() {
+        let root = tmp_root("replay");
+        let workdir = std::path::Path::new("/tmp/ws");
+        let sid = "sess-tp1";
+        let lines: Vec<String> = vec![
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"建任务"}]}}"#.into(),
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"c1","name":"TaskCreate","input":{"subject":"任务甲"}}]}}"#.into(),
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"c1","content":"Task #1 created successfully: 任务甲"}]}}"#.into(),
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"c2","name":"TaskCreate","input":{"subject":"任务乙"}}]}}"#.into(),
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"c2","content":"Task #2 created successfully: 任务乙"}]}}"#.into(),
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"c3","name":"TaskUpdate","input":{"status":"completed","taskId":"1"}}]}}"#.into(),
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"c3","content":"Updated task #1 status"}]}}"#.into(),
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"c4","name":"TaskUpdate","input":{"status":"deleted","taskId":"2"}}]}}"#.into(),
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"c4","content":"Updated task #2 deleted"}]}}"#.into(),
+        ];
+        write_session(&root, workdir, sid, &lines);
+        let items = replay_task_todos_at(&root.join("projects"), workdir, sid).expect("应回放终态");
+        assert_eq!(items.len(), 1, "deleted 的 #2 应移除：{items:?}");
+        assert_eq!(
+            items[0].id.as_deref(),
+            Some("1"),
+            "真实 id 应回填：{items:?}"
+        );
+        assert_eq!(items[0].text, "任务甲");
+        assert_eq!(items[0].status, imagent_core::TodoStatus::Completed);
+        // 无 Task\* 事件的转录 → 空快照（Some——终结冷启动）；不存在 → None。
+        write_session(
+            &root,
+            workdir,
+            "sess-empty",
+            &[r#"{"type":"user","message":{"content":[{"type":"text","text":"hi"}]}}"#.into()],
+        );
+        assert!(
+            replay_task_todos_at(&root.join("projects"), workdir, "sess-empty")
+                .is_some_and(|v| v.is_empty())
+        );
+        assert!(replay_task_todos_at(&root.join("projects"), workdir, "nope").is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     use super::*;

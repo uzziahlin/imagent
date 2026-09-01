@@ -131,7 +131,11 @@ pub fn todo_write_items(tool: &str, input: &str) -> Option<Vec<TodoItem>> {
                 Some("in_progress") => TodoStatus::InProgress,
                 _ => TodoStatus::Pending,
             };
-            Some(TodoItem { text, status })
+            Some(TodoItem {
+                id: None,
+                text,
+                status,
+            })
         })
         .collect::<Vec<_>>();
     (!items.is_empty()).then_some(items)
@@ -219,6 +223,7 @@ fn apply_task_tool(list: &mut Vec<(String, TodoItem)>, tool: &str, input_json: &
             list.push((
                 String::new(),
                 TodoItem {
+                    id: None,
                     text: subject.to_string(),
                     status: TodoStatus::Pending,
                 },
@@ -265,11 +270,109 @@ fn apply_task_tool(list: &mut Vec<(String, TodoItem)>, tool: &str, input_json: &
     }
 }
 
-/// 从 CliEvent::ToolUse 取工具调用 id（W2-3 配对键）。
-fn ev_id_of(ev: &CliEvent) -> Option<String> {
-    match ev {
-        CliEvent::ToolUse { id, .. } => id.clone(),
-        _ => None,
+/// Task\* 工具族的待办累积状态机（TaskList 预热重构，2026-09-01）。
+/// 读循环（增量）与转录回放（冷启动兜底）**共用同一实现**——此前回放若另写
+/// 一份逻辑必然漂移。语义与真机校准一致：
+/// - Create 占位空 id → 结果 "Task #N created" 按 tool_use id 回填真实 id；
+/// - Update 按真实 id 翻状态（`status=deleted` 删行）；
+/// - List 的 USE 不改清单但记账，结果按 `#N [status] subject` 整表替换；
+/// - ToolResult 事件无工具名（解析层恒空串），一律按 tool_use id 配对。
+pub struct TaskTodosState {
+    list: Vec<(String, TodoItem)>,
+    /// TaskCreate 的 tool_use id → 占位行 index（结果到达回填真实 id）。
+    pending_creates: std::collections::HashMap<String, usize>,
+    /// TaskList 的 tool_use id（结果到达即整表替换）。
+    pending_lists: std::collections::HashSet<String>,
+}
+
+impl TaskTodosState {
+    /// `initial` 为播种快照（TaskList 预热；空 = 全新累积）。
+    pub fn new(initial: Vec<TodoItem>) -> Self {
+        Self {
+            list: initial
+                .into_iter()
+                .map(|it| (it.id.clone().unwrap_or_default(), it))
+                .collect(),
+            pending_creates: std::collections::HashMap::new(),
+            pending_lists: std::collections::HashSet::new(),
+        }
+    }
+
+    /// 该 tool_use id 的结果是否需要本状态机消费（结果臂路由判据）。
+    pub fn cares_about(&self, tool_use_id: &str) -> bool {
+        self.pending_creates.contains_key(tool_use_id) || self.pending_lists.contains(tool_use_id)
+    }
+
+    fn snapshot(&self) -> Vec<TodoItem> {
+        self.list
+            .iter()
+            .map(|(id, it)| TodoItem {
+                id: (!id.is_empty()).then(|| id.clone()),
+                ..it.clone()
+            })
+            .collect()
+    }
+
+    /// Task\* 的 ToolUse 到达。返回 Some(全量快照) = 有变化需发 chunk
+    ///（TaskList 的 USE 恒 None——只记账，等结果整表替换）。
+    pub fn on_tool_use(
+        &mut self,
+        tool: &str,
+        input: &str,
+        tool_use_id: Option<&str>,
+    ) -> Option<Vec<TodoItem>> {
+        let before = self.list.len();
+        let applied = apply_task_tool(&mut self.list, tool, input);
+        // TaskList 的 USE 不改清单（apply_task_tool 对其恒 false），但它的结果
+        // 要做整表替换——记账必须独立于 applied（真机校准 2026-08-31 V3：
+        // 原先 insert 写在 applied 分支内不可达）。
+        if tool == "TaskList" {
+            if let Some(t) = tool_use_id {
+                self.pending_lists.insert(t.to_string());
+            }
+        }
+        if applied {
+            if tool == "TaskCreate" && before < self.list.len() {
+                if let Some(t) = tool_use_id {
+                    self.pending_creates.insert(t.to_string(), before);
+                }
+            }
+            return Some(self.snapshot());
+        }
+        None
+    }
+
+    /// Task\* 的 ToolResult 到达（无工具名，按 tool_use id 配对；同一 id 二次
+    /// 到达自然 no-op——记账已消费）。返回 Some(全量快照) = 有变化需发 chunk。
+    pub fn on_tool_result(
+        &mut self,
+        tool_use_id: Option<&str>,
+        output: &str,
+    ) -> Option<Vec<TodoItem>> {
+        let tuid = tool_use_id?;
+        if let Some(index) = self.pending_creates.remove(tuid) {
+            // TaskCreate 结果：回填真实 id（失败则移除占位行）。
+            return resolve_task_create_result(&mut self.list, index, output)
+                .then(|| self.snapshot());
+        }
+        if self.pending_lists.remove(tuid) {
+            // TaskList 结果：全量权威快照整表替换（含桌面端历史任务）。
+            if let Some(snap) = parse_task_list_snapshot(output) {
+                self.list = snap;
+                return Some(self.snapshot());
+            }
+            return None;
+        }
+        None
+    }
+
+    /// 终态快照（含真实任务 id；播种遗留 + 本轮变化）。
+    pub fn finish(self) -> Vec<TodoItem> {
+        self.snapshot()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.list.is_empty()
     }
 }
 
@@ -310,6 +413,7 @@ fn parse_task_list_snapshot(output: &str) -> Option<Vec<(String, TodoItem)>> {
         out.push((
             id.to_string(),
             TodoItem {
+                id: Some(id.to_string()),
                 text: text.to_string(),
                 status,
             },
@@ -400,6 +504,7 @@ pub async fn spawn_cli_backend(
     backend_name: &'static str,
     passthrough_env: &[&str],
     control: Option<ControlIo>,
+    initial_todos: Vec<TodoItem>,
 ) -> Result<RunOutcome> {
     if control.is_some() {
         // 控制通道：stdin 必须保持打开（control_response 回写 + SDK 式 prompt
@@ -487,14 +592,18 @@ pub async fn spawn_cli_backend(
     let mut terminal_seen = false;
     // 活跃后台任务计数（background_tasks_changed 权威快照）。
     let mut bg_active: usize = 0;
-    // Task* 工具族的待办累积（claude 2.x 的 TodoWrite 后继，见 apply_task_tool）。
-    let mut task_todos: Vec<(String, TodoItem)> = Vec::new();
-    // TaskCreate 的 tool_use id → 占位行 index（结果到达后回填真实任务 id）。
-    let mut pending_task_creates: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    // TaskList 调用的 tool_use id（结果到达即整表替换快照）。
-    let mut pending_task_lists: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    // Task* 工具族的待办累积状态机（claude 2.x 的 TodoWrite 后继）。TaskList
+    // 预热（2026-09-01）：会话既有任务快照（sessions.task_todos）作初值——
+    // 跨轮 TaskUpdate 按真实 id 匹配、卡片开局即显示遗留任务；空种子（新会话/
+    // 无快照）行为与旧版一致。
+    let mut task_state = TaskTodosState::new(initial_todos);
+    if !task_state.is_empty() {
+        let _ = chunks
+            .send(AgentChunk::TodoList {
+                items: task_state.snapshot(),
+            })
+            .await;
+    }
 
     loop {
         let line = match read_line_capped(&mut reader, MAX_STDOUT_LINE_BYTES).await {
@@ -649,31 +758,13 @@ pub async fn spawn_cli_backend(
                 CliEvent::ToolUse {
                     ref tool,
                     ref input,
+                    ref id,
                     ..
                 } if tool == "TaskCreate" || tool == "TaskUpdate" || tool == "TaskList" => {
-                    // Task* 工具族 → 待办清单（全量快照语义，与 TodoWrite 路径
+                    // Task* 工具族 → 待办状态机（全量快照语义，与 TodoWrite 路径
                     // 同一 chunk 类型）。仍落入下方通用 ToolUse 处理（工具轨迹
                     // 面板同样展示）——此处只追加清单 chunk。
-                    let before = task_todos.len();
-                    let applied = apply_task_tool(&mut task_todos, tool, input);
-                    // TaskList 的 USE 本身不改清单（apply_task_tool 对其恒
-                    // false——真机校准 2026-08-31 V3 自查：原先 insert 写在
-                    // applied 分支内不可达），但它的**结果**要做整表替换——
-                    // 记账必须独立于 applied。
-                    if tool == "TaskList" {
-                        if let Some(tuid) = ev_id_of(&ev) {
-                            pending_task_lists.insert(tuid);
-                        }
-                    }
-                    if applied {
-                        if tool == "TaskCreate" && before < task_todos.len() {
-                            // 占位行 index 记账，等结果回填真实 id（会话级编号，
-                            // --resume 后非 1 起）。
-                            if let Some(tuid) = ev_id_of(&ev) {
-                                pending_task_creates.insert(tuid, before);
-                            }
-                        }
-                        let items = task_todos.iter().map(|(_, it)| it.clone()).collect();
+                    if let Some(items) = task_state.on_tool_use(tool, input, id.as_deref()) {
                         let _ = chunks.send(AgentChunk::TodoList { items }).await;
                     }
                     // 重新匹配进通用臂：构造值消费。
@@ -716,41 +807,12 @@ pub async fn spawn_cli_backend(
                 }
                 CliEvent::ToolResult {
                     ref output, ref id, ..
-                } if id
-                    .as_deref()
-                    .is_some_and(|t| pending_task_creates.contains_key(t)) =>
-                {
-                    // TaskCreate 结果回填真实任务 id（或失败移除占位行）。
-                    // 真机校准（2026-08-31 V3）：tool_result 事件不带工具名（解析
-                    // 层恒产出空串），配对只能靠 tool_use id——pending_task_creates
-                    // 的键本就只来自 TaskCreate 的 ToolUse，按 id 命中无歧义。
-                    let tuid = id.clone().unwrap();
-                    if let Some(index) = pending_task_creates.remove(&tuid) {
-                        if resolve_task_create_result(&mut task_todos, index, output) {
-                            let items = task_todos.iter().map(|(_, it)| it.clone()).collect();
-                            let _ = chunks.send(AgentChunk::TodoList { items }).await;
-                        }
-                    }
-                    let CliEvent::ToolResult { tool, output, id } = ev else {
-                        unreachable!("已按 ToolResult 分派")
-                    };
-                    let _ = chunks
-                        .send(AgentChunk::ToolResult { tool, output, id })
-                        .await;
-                }
-                CliEvent::ToolResult {
-                    ref output, ref id, ..
-                } if id
-                    .as_deref()
-                    .is_some_and(|t| pending_task_lists.contains(t)) =>
-                {
-                    // TaskList 结果 = 全量权威快照：整表替换（含桌面端历史任务）。
-                    // 同上：按 tool_use id 配对（结果事件无工具名）。
-                    let tuid = id.clone().unwrap();
-                    pending_task_lists.remove(&tuid);
-                    if let Some(snapshot) = parse_task_list_snapshot(output) {
-                        task_todos = snapshot;
-                        let items = task_todos.iter().map(|(_, it)| it.clone()).collect();
+                } if id.as_deref().is_some_and(|t| task_state.cares_about(t)) => {
+                    // Task\* 结果（Create 回填真实 id / List 整表替换）。真机校准
+                    //（2026-08-31 V3）：tool_result 事件不带工具名（解析层恒产
+                    // 空串），配对只能靠 tool_use id——记账键只来自对应工具的
+                    // ToolUse，按 id 命中无歧义。语义收敛在 TaskTodosState。
+                    if let Some(items) = task_state.on_tool_result(id.as_deref(), output) {
                         let _ = chunks.send(AgentChunk::TodoList { items }).await;
                     }
                     let CliEvent::ToolResult { tool, output, id } = ev else {
@@ -1126,7 +1188,7 @@ mod tests {
         cmd.arg("-c").arg("printf 'one\\ntwo\\n'");
         let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::types::AgentChunk>(64);
         let parse = |line: &str| CliEvent::Text(line.trim_end().to_string());
-        let outcome = spawn_cli_backend(cmd, parse, tx, "test-backend", &[], None)
+        let outcome = spawn_cli_backend(cmd, parse, tx, "test-backend", &[], None, Vec::new())
             .await
             .expect("echo run 应成功");
         assert_eq!(outcome.final_text, "one\n\ntwo");
@@ -1155,7 +1217,7 @@ mod tests {
                 CliEvent::Skip
             }
         };
-        let err = spawn_cli_backend(cmd, parse, tx, "test-backend", &[], None)
+        let err = spawn_cli_backend(cmd, parse, tx, "test-backend", &[], None, Vec::new())
             .await
             .expect_err("无 final 文本应失败");
         assert!(
@@ -1228,7 +1290,7 @@ mod tests {
                 _ => CliEvent::Skip,
             }
         };
-        let outcome = spawn_cli_backend(cmd, parse, tx, "test-backend", &[], None)
+        let outcome = spawn_cli_backend(cmd, parse, tx, "test-backend", &[], None, Vec::new())
             .await
             .expect("应成功收尾");
         assert_eq!(outcome.final_text, "ok");
@@ -1252,6 +1314,60 @@ mod tests {
                 .any(|i| i.text == "任务乙" && i.status == TodoStatus::InProgress)),
             "最终快照应为 TaskList 权威视图：{:?}",
             snapshots.last()
+        );
+    }
+
+    /// TaskList 预热（2026-09-01）：播种快照成为累积器初值——①轮首立即发出
+    /// 遗留任务面板 chunk；②跨轮 TaskUpdate 按种子里的真实 id 匹配翻转
+    ///（未播种时匹配不到、面板丢失历史——本次特性的核心断言）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn task_tools_seed_enables_cross_round_update() {
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg("printf 'UPDATE\\nDONE\\n'");
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::types::AgentChunk>(64);
+        let parse = |line: &str| match line.trim_end() {
+            "UPDATE" => CliEvent::ToolUse {
+                tool: "TaskUpdate".into(),
+                input: r#"{"taskId":"7","status":"completed"}"#.into(),
+                session: None,
+                id: Some("t9".into()),
+            },
+            "DONE" => CliEvent::Final {
+                text: "ok".into(),
+                session: None,
+                origin_kind: None,
+            },
+            _ => CliEvent::Skip,
+        };
+        // 种子：上一轮遗留任务 #7（真实 id 已回填）。
+        let seed = vec![TodoItem {
+            id: Some("7".into()),
+            text: "旧任务".into(),
+            status: TodoStatus::Pending,
+        }];
+        let outcome = spawn_cli_backend(cmd, parse, tx, "test-backend", &[], None, seed)
+            .await
+            .expect("应成功收尾");
+        assert_eq!(outcome.final_text, "ok");
+        let mut snapshots = Vec::new();
+        while let Ok(c) = rx.try_recv() {
+            if let crate::types::AgentChunk::TodoList { items } = c {
+                snapshots.push(items);
+            }
+        }
+        // ① 轮首种子 chunk（无任何工具活动也应显示遗留任务）。
+        assert_eq!(
+            snapshots.first().map(|v| v.len()),
+            Some(1),
+            "轮首应播种遗留任务：{snapshots:?}"
+        );
+        // ② TaskUpdate 命中种子 id 翻转（未播种则无此 chunk）。
+        assert!(
+            snapshots.iter().any(|items| items
+                .iter()
+                .any(|i| i.text == "旧任务" && i.status == TodoStatus::Completed)),
+            "跨轮 Update 应按种子 id 翻转：{snapshots:?}"
         );
     }
 
@@ -1339,7 +1455,7 @@ mod tests {
             ]),
             _ => CliEvent::Skip,
         };
-        let outcome = spawn_cli_backend(cmd, parse, tx, "test-backend", &[], None)
+        let outcome = spawn_cli_backend(cmd, parse, tx, "test-backend", &[], None, Vec::new())
             .await
             .expect("run 应成功");
         let u = outcome.usage.expect("应累积出 usage");
@@ -1387,7 +1503,7 @@ mod tests {
         };
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(15),
-            spawn_cli_backend(cmd, parse, tx, "test-ctrl", &[], Some(io)),
+            spawn_cli_backend(cmd, parse, tx, "test-ctrl", &[], Some(io), Vec::new()),
         )
         .await;
         assert!(
@@ -1478,6 +1594,7 @@ mod tests {
         let mut fail = vec![(
             String::new(),
             TodoItem {
+                id: None,
                 text: "x".into(),
                 status: TodoStatus::Pending,
             },

@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 use crate::error::Result;
-use crate::types::{AgentChunk, LocalSession, RunOutcome, SessionId};
+use crate::types::{AgentChunk, LocalSession, RunOutcome, SessionId, TodoItem};
 
 /// B3：backend 的权限审批能力档位（能力协商，dispatcher 启动时校验）。
 ///
@@ -74,7 +74,12 @@ pub trait Backend: Send + Sync {
     /// - `session`：`None` 新建，`Some(id)` 续接已存在会话；
     /// - `workdir`：agent 工作根目录（cwd，非沙箱）；
     /// - `allowed_tools`：允许的工具白名单（如 `["Read","Edit"]`）；
-    /// - `chunks`：流式分块通道，core 消费。
+    /// - `chunks`：流式分块通道，core 消费；
+    /// - `initial_todos`：TaskList 预热种子（会话既有任务快照，含真实任务
+    ///   id）。CLI 系 backend 把它作为待办累积器初值（跨轮 TaskUpdate 按 id
+    ///   匹配 + 开局面板）；不关心的 backend 忽略。
+    // 参数已达 8 个——再增应收敛为 RoundContext 结构（历史演化提醒）。
+    #[allow(clippy::too_many_arguments)]
     async fn run(
         &self,
         conv_id: &str,
@@ -83,10 +88,23 @@ pub trait Backend: Send + Sync {
         workdir: &Path,
         allowed_tools: &[String],
         chunks: mpsc::Sender<AgentChunk>,
+        initial_todos: &[TodoItem],
     ) -> Result<RunOutcome>;
 
     /// agent 类型，如 `"claude-cli"`。
     fn name(&self) -> &'static str;
+
+    /// TaskList 预热冷启动（2026-09-01）：无持久化快照（sessions.task_todos 为
+    /// NULL——/resume 恢复的电脑端会话 / 升级首轮 / 上轮中断）时，从 backend
+    /// 本地存储推导该会话的任务终态（claude 系为 ~/.claude/projects 转录回放）。
+    /// 返回 None = 无本地转录概念（core 降级为空种子）。同步调用，须无副作用。
+    fn derive_task_todos(
+        &self,
+        _session_id: &str,
+        _workdir: &std::path::Path,
+    ) -> Option<Vec<TodoItem>> {
+        None
+    }
 
     /// P8-4：backend 原生权限模式透传覆盖（如 claude 的 `--permission-mode`）。
     /// None = 按档缺省（见各 backend）；Some = 显式值。默认 no-op（不支持原生

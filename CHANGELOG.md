@@ -2,6 +2,35 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [Unreleased]
+
+### Added
+- **TaskList 预热（会话级任务快照持久化 + 轮首播种）**：Task\* 待办面板此前
+  是轮内的——新一轮不显示历史任务、跨轮 TaskUpdate 按真实 id 匹配不到，
+  除非 agent 碰巧调 TaskList。现在：①`sessions` 新列 `task_todos`
+  （SCHEMA_V10）存每会话最近一份全量快照（含真实任务 id），轮末随会话行
+  落库；②轮首经 `Backend::run` 新参数 `initial_todos` 播种给读循环累积器
+  ——卡片开局即显示遗留任务、跨轮 Update 命中种子 id；③冷启动兜底（快照
+  为 NULL：/resume 的电脑端会话 / 升级首轮 / 上轮中断）回放
+  `~/.claude/projects` 转录推导终态并回写，此后永远走 DB 快路径；④任务
+  语义收敛为 `TaskTodosState` 状态机——在线读循环与转录回放同一实现，
+  杜绝两处漂移。/new 删行连带清快照；换绑会话（/resume、/switch）置空走
+  冷启动。TodoWrite/ACP 无 id 路径不受影响（TodoItem.id 可选）。
+
+### Changed
+- **审批等待默认放宽**：`permission_ask_timeout_secs` 300 → **900（15 分钟）**
+  ——/stats 真机实测审批 timeout 占 16%（25 次里 4 次），IM 异步场景 5 分钟
+  常来不及批。900 < 总超时 3600，D8 校验天然满足。
+
+### Fixed
+- **平台事件兜底日志分流**：策略过滤的正常群消息（未@）与表情回执此前记
+  WARN「无法解析/非目标事件」——大量正常流量误导排障视线。现按事件类型
+  分流：receive_v1（未过准入）与 reaction 回执降 DEBUG，真正未知类型才
+  保留 WARN。
+- **入群欢迎语 / /help 补会话规则提示**：点消息「回复」进话题 = 开独立
+  会话（不共享上下文/待办）；群主时间线直接 @ = 续同一会话——真机踩过
+  （话题里找不到主会话的任务库）。
+
 ## [1.15.1] — 2026-09-01
 
 > **真机校准第四轮收口**：后台子任务通知看门狗 keepalive、Task\* 待办面板

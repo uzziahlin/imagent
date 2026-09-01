@@ -2149,14 +2149,17 @@ mod tests {
     fn stream_body_renders_todos_and_thoughts() {
         let todos = vec![
             imagent_core::TodoItem {
+                id: None,
                 text: "分析需求".into(),
                 status: imagent_core::TodoStatus::Completed,
             },
             imagent_core::TodoItem {
+                id: None,
                 text: "写代码".into(),
                 status: imagent_core::TodoStatus::InProgress,
             },
             imagent_core::TodoItem {
+                id: None,
                 text: "测试".into(),
                 status: imagent_core::TodoStatus::Pending,
             },
