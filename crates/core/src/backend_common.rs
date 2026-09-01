@@ -231,6 +231,13 @@ fn apply_task_tool(list: &mut Vec<(String, TodoItem)>, tool: &str, input_json: &
             };
             let status = v.get("status").and_then(|s| s.as_str());
             let subject = v.get("subject").and_then(|s| s.as_str());
+            // 真机校准（2026-09-01 实测）：status=deleted 把任务从权威视图移除
+            //（后续 TaskList 不再列出）——面板同步删行，而非回落 Pending。
+            if status == Some("deleted") {
+                let before = list.len();
+                list.retain(|(id, _)| id != task_id);
+                return list.len() != before;
+            }
             let Some(entry) = list.iter_mut().find(|(id, _)| id == task_id) else {
                 return false;
             };
@@ -1452,6 +1459,21 @@ mod tests {
             r#"{"taskId":"9","status":"completed"}"#
         ));
         assert!(!apply_task_tool(&mut list, "TaskCreate", "not json"));
+        // 删除（真机校准 2026-09-01 实测：status=deleted 从权威视图移除该行，
+        // 面板同步删行而非回落 Pending）。
+        assert!(apply_task_tool(
+            &mut list,
+            "TaskUpdate",
+            r#"{"taskId":"8","status":"deleted"}"#
+        ));
+        assert_eq!(list.len(), 1, "删除 #8 后只剩 #7");
+        assert_eq!(list[0].0, "7");
+        // 删除不存在的 id：no-op（不误报变更）。
+        assert!(!apply_task_tool(
+            &mut list,
+            "TaskUpdate",
+            r#"{"taskId":"9","status":"deleted"}"#
+        ));
         // 创建失败（结果无 Task #N）：占位行移除。
         let mut fail = vec![(
             String::new(),

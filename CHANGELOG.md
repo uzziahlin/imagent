@@ -5,6 +5,10 @@
 ## [Unreleased]
 
 ### Fixed
+- **Task\* 面板支持 `status=deleted` 删行（真机实测语义）**：TaskUpdate 的
+  `status: "deleted"` 会把任务从 CLI 权威视图移除（实测 TaskList 不再列出），
+  增量映射原先把未知状态回落 Pending——现在同步删行；删除不存在的 id 为
+  no-op。模型可据此清理会话内历史任务（如「把 #1–#3 删掉」）。
 - **Task\* 待办面板状态永不翻转（V3 真机发现，双重死路）**：① claude 流式
   tool_result 事件**不带工具名**（解析层恒产出空串），而读循环的 TaskCreate
   结果回填臂 / TaskList 权威快照臂按 `tool == "..."` 匹配——永不命中，真实
