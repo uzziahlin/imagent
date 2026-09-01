@@ -5,6 +5,9 @@
 ## [Unreleased]
 
 ### Fixed
+- **`/export`（及 `/file` 出站文件）上传必败 234001**：上传接口 `file_type`
+  合法枚举仅 opus/mp4/pdf/doc/xls/ppt/**stream**，通用文件应用 stream；原值
+  `"file"` 不在枚举内，飞书报 Invalid request param（P2 真机首测即中）。
 - **Task\* 面板支持 `status=deleted` 删行（真机实测语义）**：TaskUpdate 的
   `status: "deleted"` 会把任务从 CLI 权威视图移除（实测 TaskList 不再列出），
   增量映射原先把未知状态回落 Pending——现在同步删行；删除不存在的 id 为
