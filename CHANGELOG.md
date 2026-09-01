@@ -2,7 +2,12 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
-## [Unreleased]
+## [1.16.0] — 2026-09-02
+
+> **TaskList 预热 + 体验收尾**：会话级任务快照持久化 + 轮首播种 + 转录冷启动
+> 兜底，待办面板从「轮内」升级为「会话级」；审批等待放宽至 15 分钟；平台
+> 日志分流与话题域提示。真机验证：跨轮播种翻转、/resume 转录推导（部署后
+> 零 TaskCreate 而新群快照含完整历史任务——回放指纹）。634 tests / 0 failed。
 
 ### Added
 - **TaskList 预热（会话级任务快照持久化 + 轮首播种）**：Task\* 待办面板此前

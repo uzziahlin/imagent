@@ -1497,7 +1497,7 @@ dependencies = [
 
 [[package]]
 name = "imagent"
-version = "1.15.1"
+version = "1.16.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1525,7 +1525,7 @@ dependencies = [
 
 [[package]]
 name = "imagent-claude"
-version = "1.15.1"
+version = "1.16.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -1541,7 +1541,7 @@ dependencies = [
 
 [[package]]
 name = "imagent-codex"
-version = "1.15.1"
+version = "1.16.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1554,7 +1554,7 @@ dependencies = [
 
 [[package]]
 name = "imagent-core"
-version = "1.15.1"
+version = "1.16.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1576,7 +1576,7 @@ dependencies = [
 
 [[package]]
 name = "imagent-feishu"
-version = "1.15.1"
+version = "1.16.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1598,7 +1598,7 @@ dependencies = [
 
 [[package]]
 name = "imagent-gemini"
-version = "1.15.1"
+version = "1.16.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1610,7 +1610,7 @@ dependencies = [
 
 [[package]]
 name = "imagent-ilink"
-version = "1.15.1"
+version = "1.16.0"
 dependencies = [
  "aes 0.9.2",
  "anyhow",
@@ -1639,7 +1639,7 @@ dependencies = [
 
 [[package]]
 name = "imagent-store"
-version = "1.15.1"
+version = "1.16.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1659,7 +1659,7 @@ dependencies = [
 
 [[package]]
 name = "imagent-wecom"
-version = "1.15.1"
+version = "1.16.0"
 dependencies = [
  "anyhow",
  "async-trait",
