@@ -2,9 +2,26 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
-## [Unreleased]
+## [1.15.1] — 2026-09-01
+
+> **真机校准第四轮收口**：后台子任务通知看门狗 keepalive、Task\* 待办面板
+> 双死路修复、默认超时预算放宽、出站文件上传 234001。全部经飞书真机逐项
+> 验证（V1/V2/V3/P2 四组，含边界与回归）。631 tests / 0 failed。
+
+### Added
+- **后台子任务完成通知（不中断等待）**：claude 2.x 派后台子 agent 后，主
+  agent 输出结论时任务未完——旧实现此刻终止进程组，后台任务被连坐杀掉、
+  结果永远丢失。现在读循环检测 `background_tasks_changed` 的活跃计数：
+  Final 到达但仍有活跃后台任务时不终止，继续在同一 stdout 上接收每个任务
+  的完成通知轮（`origin.kind=task-notification`），全部完成才收尾。前台子
+  agent 不进计数、不触发等待（V3 真机验证：Agent 工具 0 次误判）。
 
 ### Fixed
+  可能长时间无输出（系统事件不产 chunk），dispatch 层看门狗会在
+  agent_idle_timeout 后终止本轮——通知永远等不到。现在在
+  background_tasks_changed 与带活跃任务的 Final 到达时发空 Thought chunk
+  喂狗（不进正文/卡片，仅重置 idle 计时）。V2 真机双路验证：存活侧
+  （180s 窗口 + 100s 静默）存活收通知；终止侧（60s 窗口）精确 61s 超时。
 - **`/export`（及 `/file` 出站文件）上传必败 234001**：上传接口 `file_type`
   合法枚举仅 opus/mp4/pdf/doc/xls/ppt/**stream**，通用文件应用 stream；原值
   `"file"` 不在枚举内，飞书报 Invalid request param（P2 真机首测即中）。
