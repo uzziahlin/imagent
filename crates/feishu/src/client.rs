@@ -712,7 +712,9 @@ pub async fn upload_file(
         let url = format!("{base}/open-apis/im/v1/files");
         let part = reqwest::multipart::Part::bytes(bytes).file_name(file_name.to_string());
         let form = reqwest::multipart::Form::new()
-            .text("file_type", "file")
+            // file_type 合法枚举 opus/mp4/pdf/doc/xls/ppt/stream（飞书文档）；
+            // 通用文件用 stream——"file" 不在枚举内，真机报 234001。
+            .text("file_type", "stream")
             .text("file_name", file_name.to_string())
             .part("file", part);
         let client = dl_client().clone();
