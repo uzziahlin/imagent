@@ -1239,6 +1239,37 @@ fn render_multi_question_card(
     )
 }
 
+/// AskUserQuestion input → 人读问题列表（文本降级路径用；v1.17.1）。
+/// 解析失败返回 None（调用方回落审批文本格式）。
+pub fn questions_as_text(tool_input: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(tool_input).ok()?;
+    let qs = v.get("questions")?.as_array()?;
+    let mut out = String::from("需要你的输入（多题请逐题作答）：");
+    for (i, q) in qs.iter().enumerate() {
+        let question = q.get("question")?.as_str()?.trim();
+        let header = q
+            .get("header")
+            .and_then(|h| h.as_str())
+            .filter(|h| !h.trim().is_empty())
+            .unwrap_or(question);
+        let labels: Vec<String> = q
+            .get("options")?
+            .as_array()?
+            .iter()
+            .filter_map(|o| o.get("label")?.as_str().map(str::to_string))
+            .collect();
+        if question.is_empty() || labels.is_empty() {
+            return None;
+        }
+        out.push_str(&format!(
+            "\n{}. 【{header}】{question}\n   选项：{}",
+            i + 1,
+            labels.join(" / ")
+        ));
+    }
+    Some(out)
+}
+
 /// 问题卡的「已记录选择」终态（区别于审批卡的已批准/已拒绝）。
 pub fn render_question_card_resolved(choice: &str) -> String {
     serde_json::json!({
@@ -1785,7 +1816,18 @@ mod tests {
         assert!(json.contains("❌ 出错"), "终态 footer: {json}");
     }
 
-    /// P6：AskUserQuestion 输入 → 问题卡（标题栏 + 选项按钮 + imagent_ask value）。
+    /// v1.17.1 真机输入回归：话题内 4 问（带 150+ 字描述）曾因话题分支不走
+    /// 问题渲染降级审批卡——本测试钉住真实形态的输入必须渲染出多题卡。
+    #[test]
+    fn question_card_real_device_4q_input() {
+        let input = r#"{"questions":[{"question":"本次部署选择哪个环境？","header":"部署环境","multiSelect":false,"options":[{"label":"测试环境","description":"选择测试环境意味着新版本将首先部署到隔离的测试集群或测试服务器上，不会影响线上真实用户的访问。测试环境通常配置与生产相近，但数据为模拟或脱敏数据，适合验证新功能的正确性、接口兼容性以及性能表现。在测试环境完成冒烟测试、回归测试并通过验收标准后，再推进到生产环境，可以大幅降低发布风险，是大多数团队推荐的标准发布流程的第一步。"},{"label":"生产环境","description":"选择生产环境意味着本次变更将直接发布到线上，真实用户流量会立即接触到新版本。这种方式适用于紧急修复（如线上故障的热修复）、改动极小且风险可控的场景，或者测试环境已提前完成充分验证的情况。直接上生产虽然节省时间，但一旦存在问题会直接影响用户体验和业务指标，建议配合灰度发布、蓝绿部署或快速回滚方案，以确保出现异常时能在最短时间内恢复。"}]},{"question":"部署前是否进行备份？","header":"部署前备份","multiSelect":false,"options":[{"label":"备份","description":"部署前对数据库、配置文件、静态资源以及当前运行的程序版本进行完整备份，是保障发布安全的关键措施。一旦新版本出现数据异常、配置错误或功能回退，可以迅速通过备份回滚到上一个稳定状态，将故障影响时间和范围降到最低。备份内容应包括数据库快照、关键配置项的导出以及当前制品版本的归档，并建议在部署前验证备份的完整性和可恢复性，避免需要回滚时才发现备份不可用。"},{"label":"不备份","description":"跳过备份可以缩短部署前的准备时间，适用于本次变更不涉及数据库结构或数据变更、仅为静态资源更新或前端页面调整等低风险场景。但需要明确的是，一旦部署过程中出现意外（如配置覆盖错误、数据误写、版本损坏），将没有直接的回滚依据，只能通过重新构建旧版本或手工修复来恢复，恢复周期和不确定性都会显著增加。选择此项前请确认本次变更确实无数据风险且具备快速重建能力。"}]},{"question":"部署前是否通知团队？","header":"团队通知","multiSelect":false,"options":[{"label":"通知团队","description":"部署前通过群消息、邮件或工单系统通知研发、测试、运维及相关业务方，说明发布时间、影响范围、变更内容和回滚预案。这样做可以让相关人员在出现异常时第一时间知晓原因并协同处理，避免值班同学面对突发状况毫无头绪；同时也便于测试同学在发布后及时跟进验证，业务方也能提前向用户说明可能出现的短暂波动。透明的发布沟通是成熟团队协作的基本规范，尤其是生产环境发布更应坚持这一原则。"},{"label":"不通知","description":"不主动通知团队，适用于深夜低风险的小型变更、个人测试项目，或团队已明确约定无需通知的自动化发布流程（例如 CI/CD 流水线自动触发）。好处是减少沟通成本、流程更轻量，发布者可以完全自主掌控节奏。但风险在于：一旦部署引发线上异常，其他人对此变更毫不知情，排查问题时会缺少关键上下文，值班或接手同学可能重复排查甚至误判原因，协作效率反而下降。请确认本次变更影响面足够小再选择此项。"}]},{"question":"部署是立即执行还是等待窗口期？","header":"执行时机","multiSelect":false,"options":[{"label":"立即执行","description":"确认方案后马上开始部署，适合紧急修复线上故障、解决阻塞他人进展的问题、或已经过充分测试验证且风险很低的变更。立即执行能最快让变更生效，缩短问题暴露和修复之间的等待时间。但要注意：如果当前正处于业务高峰期（如促销活动、用户访问高峰），立即上线可能放大潜在问题的影响面。选择此项前建议确认当前流量处于安全水平、回滚方案已就绪，并且你有足够时间在场观察发布后的监控指标。"},{"label":"等待窗口期","description":"将部署安排在预先约定的低流量时间窗口（如深夜、凌晨或周末）执行，这是生产发布的行业惯例。窗口期内用户访问量低，即使出现异常，受影响的用户数量和业务损失也最小；同时此时段通常没有其他变更并行发布，出现问题更容易定位归因。代价是需要等待，紧急问题可能等不起，且深夜发布对执行者的精力也是考验，建议窗口期发布配合双人复核机制。如果变更不紧急且影响面较大，优先推荐等待窗口期执行。"}]}]}"#;
+        let rendered = render_question_card(input, "feishu:oc_test", "req_test", None, 300);
+        assert!(rendered.is_some(), "真机 4 问输入应渲染多题卡");
+        if let Some(json) = rendered {
+            assert!(json.contains("ask_opt_0"), "多题字段: {json}");
+        }
+    }
+
     #[test]
     fn render_question_card_options_and_fallback() {
         let input = serde_json::json!({

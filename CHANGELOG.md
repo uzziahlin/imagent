@@ -2,6 +2,15 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.17.1] — 2026-09-02
+
+### Fixed
+- **话题/评论线程内的 AskUserQuestion 仍降级审批卡**（v1.17.0 真机验证发现）：
+  问题卡渲染判定只存在于主时间线分支，话题分支（reply API 路径）与评论/文本
+  降级仍走审批卡裸显 JSON——真机复现：话题内 4 问测试收到"回复 y 允许"审批
+  文本。修复：`is_question` 判定前移至分支之前，话题分支复用问题卡；文本降级
+  新增 `questions_as_text` 人读列表（`回复 ask:题=答案`）。附真机输入回归测试。
+
 ## [1.17.0] — 2026-09-02
 
 > **steering 运行中转向（头牌）+ 审计修复七项 + AskUserQuestion 多问题单卡 +
