@@ -50,14 +50,13 @@ impl Dispatcher {
         // 最终回复前置断档提示（见下方 reply 组装处）。
         let continuation_orphan = is_continuation_prompt(base_prompt.trim());
 
-        // W3-3：记录本轮用户 prompt（/retry 数据源；空文本/纯媒体不记）。
-        if !base_prompt.trim().is_empty() {
-            let mut lp = self.last_prompts.lock().await;
-            if lp.len() > 500 {
-                lp.clear(); // 粗上限：超量整体重置（防泄漏；丢失仅影响 /retry）。
-            }
-            lp.insert(conv.0.clone(), base_prompt.trim().to_string());
-        }
+        // W3-3 / P0-5（v1.17）：可重试 prompt 快照——**仅失败路径落库**（store
+        // config 表，重启不丢），成功轮不覆盖——失败卡上的「重试本轮」因此
+        // 永远指向失败那轮（旧内存 map 每轮覆盖：用户点按钮时重放的可能是
+        // 新一批的 prompt）。
+        let retry_prompt: Option<String> =
+            (!base_prompt.trim().is_empty()).then(|| base_prompt.trim().to_string());
+
         // best-effort typing 指示（agent 处理中）；失败仅 log，不阻塞后续。
         let _ = self.platform.send_typing(&conv, &hint).await;
 
@@ -77,10 +76,16 @@ impl Dispatcher {
                             .unwrap_or_default(),
                         None => {
                             let wd = std::path::PathBuf::from(&row.workdir);
-                            let derived = self
-                                .backend
-                                .derive_task_todos(&row.session_id, &wd)
-                                .unwrap_or_default();
+                            let sid_for_replay = row.session_id.clone();
+                            // P1（v1.17）：转录回放是同步逐行 IO+解析（大会话可
+                            // 达 MB 级），下放 blocking 池防阻塞 async worker。
+                            let backend = self.backend.clone();
+                            let derived = tokio::task::spawn_blocking(move || {
+                                backend.derive_task_todos(&sid_for_replay, &wd)
+                            })
+                            .await
+                            .unwrap_or_default()
+                            .unwrap_or_default();
                             let payload = crate::types::TaskTodosPayload {
                                 at: now_secs(),
                                 items: derived.clone(),
@@ -182,35 +187,8 @@ impl Dispatcher {
             .await;
             return None;
         }
-        // W4-1：per-sender 成本上限（滚动 24h 窗口；None = 不限）。超限直接回执
-        // 不启动 agent——多用户群部署的运营护栏（上限内的轮次正常执行）。
-        if let Some(limit) = self.sender_cost_limit {
-            let since = now_secs() - 86_400;
-            let spent = self
-                .store
-                .sender_cost_since(&sender_id, since)
-                .await
-                .unwrap_or(0.0);
-            if spent >= limit {
-                warn!(
-                    target: "imagent::core",
-                    conv_id = %conv.0,
-                    sender = %sender_id,
-                    spent,
-                    limit,
-                    "sender 成本上限命中，拒绝本轮"
-                );
-                self.reply(
-                    &conv,
-                    &format!(
-                        "💰 你近 24 小时的用量已达上限（${spent:.2} / 上限 ${limit:.2}），本轮未执行。\n窗口按时间滚动恢复，或请联系管理员调整 sender_daily_cost_limit_usd。"
-                    ),
-                    &hint,
-                )
-                .await;
-                return None;
-            }
-        }
+        // W4-1 per-sender 成本上限检查已挪到入队闸门（dispatch_agent_message，
+        // P0-3 v1.17：逐消息检查防「排进他人批次绕过」）——此处不再重复。
         let tools = self.allowed_tools.read().clone();
         let prompt_owned = prompt.clone();
         let conv_id_owned = conv.0.clone();
@@ -231,6 +209,11 @@ impl Dispatcher {
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "消息表情处理中标注失败（不影响主流程）");
             }
         }
+        // steering（v1.17）：运行中转向通道——dispatcher 侧保留 sender 注册进
+        // running 句柄（运行中到达的文本消息注入当轮 stdin）；receiver 随 run
+        // 进入 backend（不支持的后端 drop，running 注册 steer=None 消息排队）。
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let steer_capable = backend.supports_steering();
         let join = tokio::spawn(async move {
             let backend_name = backend.name();
             // agent_timeout = 0 = 关闭总超时（默认 3600s=1h 硬上限）：墙钟总预算
@@ -245,6 +228,7 @@ impl Dispatcher {
                         &tools,
                         tx,
                         &seed_todos,
+                        steer_rx,
                     )
                     .await;
             }
@@ -258,6 +242,7 @@ impl Dispatcher {
                     &tools,
                     tx,
                     &seed_todos,
+                    steer_rx,
                 ),
             )
             .await
@@ -274,10 +259,13 @@ impl Dispatcher {
         });
         // P4-1：注册在飞句柄（/stop 中断用）。runner 持 conv 锁跨轮，同 conv 不可能
         // 并发两轮；轮次结束由 run_agent_round 统一移除。
-        self.running
-            .lock()
-            .await
-            .insert(conv.0.clone(), join.abort_handle());
+        self.running.lock().await.insert(
+            conv.0.clone(),
+            RoundHandle {
+                abort: join.abort_handle(),
+                steer: steer_capable.then_some(steer_tx),
+            },
+        );
 
         // 收集 chunks：Final/Error 落库，ToolUse 累积用于最终工具摘要。
         let mut final_text: Option<String> = None;
@@ -505,7 +493,9 @@ impl Dispatcher {
                 // 收敛询问卡），防残留 pending 把后续消息误当审批回复吞掉。
                 self.cancel_pending_on_exit(&conv).await;
                 // W3-3：失败后的快捷操作卡（重试/自检/新会话，仅卡片平台）。
-                self.send_failure_quick_actions(&conv, &hint).await;
+                self.persist_retry_prompt(&conv, &retry_prompt).await;
+                self.send_failure_quick_actions(&conv, &hint, retry_prompt.is_some())
+                    .await;
                 self.react_msg(&conv, &react_mids, false).await;
                 // conv 锁由 runner 循环持有并统一释放（P1-7 防泄漏语义不变）。
                 return None;
@@ -567,7 +557,9 @@ impl Dispatcher {
                 // cancel_all；/stop 已清过则此处为幂等 no-op）。
                 self.cancel_pending_on_exit(&conv).await;
                 // W3-3：中断后的快捷操作卡（同失败路径）。
-                self.send_failure_quick_actions(&conv, &hint).await;
+                self.persist_retry_prompt(&conv, &retry_prompt).await;
+                self.send_failure_quick_actions(&conv, &hint, retry_prompt.is_some())
+                    .await;
                 self.react_msg(&conv, &react_mids, false).await;
                 return None;
             }
@@ -595,7 +587,9 @@ impl Dispatcher {
                 self.persist_learned_session(&conv, existing_sid.as_deref(), &learned_sid)
                     .await;
                 self.cancel_pending_on_exit(&conv).await;
-                self.send_failure_quick_actions(&conv, &hint).await;
+                self.persist_retry_prompt(&conv, &retry_prompt).await;
+                self.send_failure_quick_actions(&conv, &hint, retry_prompt.is_some())
+                    .await;
                 self.react_msg(&conv, &react_mids, false).await;
                 return None;
             }
@@ -856,22 +850,43 @@ impl Dispatcher {
         }
         // conv 锁由 runner 循环持有并统一释放；在飞注册由 run_agent_round 统一移除。
         // W2-5：成功轮次返回上下文水位（runner 循环据此触发自动 compact）。
+        // 上下文水位可视化（v1.17）：usage.input_tokens ≈ 上一轮上下文规模，
+        // 落 per-conv KV（/status 展示与自动压缩阈值的距离）。失败仅 log。
+        if let Some(tokens) = outcome.usage.as_ref().map(|u| u.input_tokens) {
+            if let Err(e) = self
+                .store
+                .set_config(&format!("ctx_watermark:{}", conv.0), &tokens.to_string())
+                .await
+            {
+                warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "上下文水位落库失败（不影响轮次）");
+            }
+        }
         outcome.usage.as_ref().map(|u| u.input_tokens)
     }
 
-    /// W3-3：失败/中断终态后的快捷操作卡（仅卡片平台）：🔁 重试本轮（有最近
+    /// P0-5（v1.17）：失败路径把可重试 prompt 落库（store config 表）——重启
+    /// 不丢、成功轮不覆盖（修「失败卡重试按钮重放新一批 prompt」竞态）。
+    async fn persist_retry_prompt(&self, conv: &ConvId, retry_prompt: &Option<String>) {
+        if let Some(p) = retry_prompt {
+            let payload = serde_json::json!({ "prompt": p, "at": now_secs() });
+            if let Err(e) = self
+                .store
+                .set_config(&format!("last_prompt:{}", conv.0), &payload.to_string())
+                .await
+            {
+                warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "retry prompt 落库失败（不影响失败卡）");
+            }
+        }
+    }
+
+    /// W3-3：失败/中断终态后的快捷操作卡（仅卡片平台）：🔁 重试本轮（有可重试
     /// prompt 时）/ 🩺 自检 / 🆕 新会话——失败后最常用的下一步动作一键可达。
     /// 纯文本平台不发（失败文案已含 /doctor 指引；按钮卡降级为文字列表是噪音）。
-    async fn send_failure_quick_actions(&self, conv: &ConvId, hint: &ReplyHint) {
+    async fn send_failure_quick_actions(&self, conv: &ConvId, hint: &ReplyHint, retryable: bool) {
         if !self.platform.supports_streaming_card(conv) {
             return;
         }
-        let has_retry = self
-            .last_prompts
-            .lock()
-            .await
-            .get(&conv.0)
-            .is_some_and(|p| !p.trim().is_empty());
+        let has_retry = retryable;
         let mut buttons = Vec::new();
         if has_retry {
             buttons.push(CardButton {

@@ -1047,14 +1047,15 @@ pub(crate) fn render_question_card_note(
         .and_then(|q| q.as_array())
         .map(|a| a.len())
         .unwrap_or(1);
-    let mut extra = String::new();
+    // P0-AUQ（v1.17）：多问题 → 单卡一次提交（CLI 的 AskUserQuestion 一次
+    // control 交互=整个工具调用，逐题追问做不到——协议只给一次响应机会）。
+    // 每题一个表单字段 ask_opt_{i}，选项 value=「{header}={label}」——回调
+    // 拼接成校准过的 `用户选择：Q1=x；Q2=y` 格式一次回传。
     if n_questions > 1 {
-        extra.push_str(&format!(
-            "\n（本次共 {n_questions} 个问题，将依次询问——此卡只答第一问）"
-        ));
+        return render_multi_question_card(&v, conv_id, request_id, sender, note);
     }
     let use_form = multi || opts.len() > 4;
-    let content = format!("❓ {question}{extra}");
+    let content = format!("❓ {question}");
     let body_elements: Vec<serde_json::Value> = if use_form {
         // 表单形态：选项 value 即 label（回传直接走 ask 通道语义，与按钮一致）。
         let options: Vec<serde_json::Value> = opts
@@ -1137,6 +1138,102 @@ pub(crate) fn render_question_card_note(
                 "template": "blue"
             },
             "body": { "elements": body_elements }
+        })
+        .to_string(),
+    )
+}
+
+/// P0-AUQ（v1.17）：多问题单卡一次提交。每题一节（题头/题面/选项描述小字）+
+/// 一个表单控件（multiSelect→checkbox，否则 select_static——按钮做不了按题
+/// 分组）；一次「提交」回传全部选择。选项 value=「{header}={label}」，回调侧
+/// 按 `；` 拼接成校准过的多答案格式（deny+message 一次带回）。
+fn render_multi_question_card(
+    v: &serde_json::Value,
+    conv_id: &str,
+    request_id: &str,
+    sender: Option<&str>,
+    note: &str,
+) -> Option<String> {
+    let qs = v.get("questions")?.as_array()?;
+    let mut fields: Vec<serde_json::Value> = Vec::new();
+    let mut sections: Vec<serde_json::Value> = Vec::new();
+    for (i, q) in qs.iter().enumerate() {
+        let question = q.get("question")?.as_str()?.trim().to_string();
+        let header = q
+            .get("header")
+            .and_then(|h| h.as_str())
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| question.chars().take(10).collect());
+        let multi = q
+            .get("multiSelect")
+            .and_then(|m| m.as_bool())
+            .unwrap_or(false);
+        let mut lines = vec![format!("**{}. {}** — {question}", i + 1, header)];
+        let mut opt_values: Vec<serde_json::Value> = Vec::new();
+        for o in q.get("options")?.as_array()? {
+            let label = o.get("label")?.as_str()?.trim().to_string();
+            if label.is_empty() {
+                continue;
+            }
+            if let Some(d) = o
+                .get("description")
+                .and_then(|d| d.as_str())
+                .filter(|d| !d.trim().is_empty())
+            {
+                lines.push(format!("- **{label}**：{}", truncate_chars(d.trim(), 60)));
+            } else {
+                lines.push(format!("- **{label}**"));
+            }
+            // value 携带题头（回调拼接 用户选择：题=答案）。
+            opt_values.push(serde_json::json!({
+                "text": { "tag": "plain_text", "content": label },
+                "value": format!("{header}={label}")
+            }));
+        }
+        if opt_values.is_empty() {
+            return None;
+        }
+        sections.push(serde_json::json!({
+            "tag": "markdown", "content": mask_emails(&lines.join("\n"))
+        }));
+        fields.push(if multi {
+            serde_json::json!({ "tag": "checkbox", "name": format!("ask_opt_{i}"), "options": opt_values })
+        } else {
+            serde_json::json!({ "tag": "select_static", "name": format!("ask_opt_{i}"), "options": opt_values })
+        });
+    }
+    let mut elements = vec![note_element(note), serde_json::json!({ "tag": "hr" })];
+    // 题面与控件交替：题 i 的说明紧邻其控件（全说明在上/全控件在下会被滚动分离）。
+    for (s, f) in sections.into_iter().zip(fields.into_iter()) {
+        elements.push(s);
+        elements.push(f);
+    }
+    elements.push(serde_json::json!({ "tag": "hr" }));
+    elements.push(flow_button_row(&[serde_json::json!({
+        "tag": "button",
+        "name": "submit_btn",
+        "text": { "tag": "plain_text", "content": "提交全部答案" },
+        "type": "primary",
+        "form_action_type": "submit",
+        "behaviors": [{ "type": "callback", "value": ask_value_wrap(
+            serde_json::json!({ "imagent_form": "ask" }),
+            conv_id, request_id, sender,
+        )}]
+    })]));
+    // checkbox 必须包在 form 里才有提交语义；select_static 同form（一次提交全部）。
+    let elements = vec![serde_json::json!({
+        "tag": "form", "name": "imagent_ask", "elements": elements
+    })];
+    Some(
+        serde_json::json!({
+            "schema": "2.0",
+            "header": {
+                "title": { "tag": "plain_text", "content": "❓ 需要你的输入（多题一次提交）" },
+                "template": "blue"
+            },
+            "body": { "elements": elements }
         })
         .to_string(),
     )
@@ -2396,18 +2493,32 @@ mod tests {
         let btn = render_question_card(&few, "c", "r", None, 300).expect("少选项应渲染");
         assert!(btn.contains("\"imagent_ask\":\"A\""), "按钮形态保留: {btn}");
         assert!(!btn.contains("\"tag\":\"form\""), "少选项不用表单: {btn}");
-        // 多问题标注：只答第一问。
+        // 多问题（P0-AUQ v1.17）：单卡一次提交——每题一个 ask_opt_{i} 字段，
+        // 选项 value=「题头=选项」，一次提交全部。
         let multi_q = serde_json::json!({
             "questions": [
-                {"question": "第一问？", "options": [{"label":"A"}]},
-                {"question": "第二问？", "options": [{"label":"B"}]}
+                {"question": "第一问？", "header": "问一", "options": [{"label":"A"}]},
+                {"question": "第二问？", "header": "问二",
+                 "multiSelect": true,
+                 "options": [{"label":"B"},{"label":"C","description":"说明"}]}
             ]
         })
         .to_string();
         let mq = render_question_card(&multi_q, "c", "r", None, 300).expect("应渲染");
         assert!(
-            mq.contains("将依次询问") && mq.contains("只答第一问"),
-            "多问题标注: {mq}"
+            mq.contains("\"name\":\"ask_opt_0\"") && mq.contains("\"name\":\"ask_opt_1\""),
+            "每题一字段: {mq}"
+        );
+        assert!(
+            mq.contains("\"value\":\"问一=A\"") && mq.contains("\"value\":\"问二=B\""),
+            "value 携带题头: {mq}"
+        );
+        assert!(mq.contains("提交全部答案"), "一次提交: {mq}");
+        assert!(mq.contains("说明"), "选项描述保留: {mq}");
+        // 第二题 multiSelect → checkbox；第一题 select_static。
+        assert!(
+            mq.contains("\"tag\":\"checkbox\"") && mq.contains("\"tag\":\"select_static\""),
+            "控件分流: {mq}"
         );
     }
 

@@ -392,6 +392,11 @@ pub struct Config {
     /// 格式约束等，追加在 agent 自身 system prompt 之后。改动需重启/SIGHUP。
     #[serde(default)]
     pub append_system_prompt: Option<String>,
+    /// 快捷命令（v1.17）：`/name` → prompt 模板（`$args` = 命令剩余参数）。
+    /// 例：`shortcuts = { deploy = "跑 ./scripts/deploy.sh 并汇报结果 $args" }`
+    /// → `/deploy --dry-run`。命中前先查内置命令（不可覆盖 /stop 等）。
+    #[serde(default)]
+    pub shortcuts: std::collections::HashMap<String, String>,
     /// W2-5：自动 compact 阈值（tokens）——成功轮次的上下文水位
     /// （usage.input_tokens）达到阈值即自动走 /compact 管道（生成摘要 + 重置，
     /// 对齐 Claude Code 原生 auto-compact）。默认 120_000；0 = 关闭。

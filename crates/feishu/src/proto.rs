@@ -363,24 +363,47 @@ pub fn parse_card_action_event(payload: &[u8]) -> Option<(String, InboundMessage
     // action.value 里，在 action.form_value（lcab dispatcher 同款校准）。两类表单：
     // - "config"：把 (key, string value) 拼成 `/config form k=v k=v` 命令文本，
     //   走与手打命令相同的鉴权（admin 门槛）/分派；
-    // - "ask"：问题卡表单（>4 选项下拉 / 多选 checkbox）——form_value.ask_opt
-    //   为单值（select_static）或数组（checkbox，多选语义「、」拼接），回成
-    //   `ask:<选择>` 走与选项按钮相同的审批回复路由（req 编码在 value，精确路由）。
+    // - "ask"：问题卡表单（>4 选项下拉 / 多选 checkbox / **多题一次提交**）——
+    //   form_value.ask_opt（单题兼容：单值下拉直通 / 数组多选「、」拼接）与
+    //   form_value.ask_opt_{i}（多题：value=「题头=选项」，题间「；」拼接），
+    //   回成 `ask:<选择>` 走与选项按钮相同的审批回复路由（req 编码在 value）。
     let text: String = if form_kind == Some("ask") {
         let fv = evt.event.action.get("form_value")?;
-        let joined = match fv.get("ask_opt") {
-            Some(serde_json::Value::String(s)) => s.clone(),
-            Some(serde_json::Value::Array(a)) => a
-                .iter()
-                .filter_map(|v| v.as_str())
-                .collect::<Vec<_>>()
-                .join("、"),
-            _ => return None,
+        let field_joined = |v: &serde_json::Value| -> Option<String> {
+            let joined = match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Array(a) => a
+                    .iter()
+                    .filter_map(|x| x.as_str())
+                    .collect::<Vec<_>>()
+                    .join("、"),
+                _ => return None,
+            };
+            (!joined.is_empty()).then_some(joined)
         };
-        if joined.is_empty() {
-            return None;
+        // 多题字段 ask_opt_0..N 按序拼接；单题旧字段 ask_opt 兜底。
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(obj) = fv.as_object() {
+            let mut idx_keys: Vec<(u32, &String)> = obj
+                .keys()
+                .filter_map(|k| {
+                    k.strip_prefix("ask_opt_")
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .map(|i| (i, k))
+                })
+                .collect();
+            idx_keys.sort();
+            for (_, k) in idx_keys {
+                if let Some(p) = obj.get(k).and_then(field_joined) {
+                    parts.push(p);
+                }
+            }
         }
-        format!("ask:{joined}")
+        if parts.is_empty() {
+            let joined = fv.get("ask_opt").and_then(field_joined)?;
+            parts.push(joined);
+        }
+        format!("ask:{}", parts.join("；"))
     } else if form_kind.is_some() {
         let fv = evt
             .event
@@ -2317,6 +2340,28 @@ mod tests {
             Some("ask:数据库迁移、接口改造"),
             "多选语义拼接: {:?}",
             multi.text
+        );
+        // 多题字段（P0-AUQ v1.17）：ask_opt_0..N 按序「；」拼接（值=题头=选项）。
+        let (_, mq, _) = parse_card_action_event(&mk(serde_json::json!({
+            "ask_opt_1": "是否备份=是",
+            "ask_opt_0": "部署环境=测试环境"
+        })))
+        .expect("多题表单应回调");
+        assert_eq!(
+            mq.text.as_deref(),
+            Some("ask:部署环境=测试环境；是否备份=是"),
+            "多题拼接（题序）: {:?}",
+            mq.text
+        );
+        // 多题含 checkbox：题内「、」、题间「；」。
+        let (_, mqm, _) = parse_card_action_event(&mk(serde_json::json!({
+            "ask_opt_0": "环境=测试",
+            "ask_opt_1": ["范围=前端", "范围=后端"]
+        })))
+        .expect("多题多选应回调");
+        assert_eq!(
+            mqm.text.as_deref(),
+            Some("ask:环境=测试；范围=前端、范围=后端")
         );
         // 空数组 / 缺字段 → 丢弃。
         assert!(parse_card_action_event(&mk(serde_json::json!({"ask_opt": []}))).is_none());

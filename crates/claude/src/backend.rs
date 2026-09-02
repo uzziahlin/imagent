@@ -333,6 +333,12 @@ impl Backend for ClaudeBackend {
         crate::sessions::replay_task_todos(workdir, session_id)
     }
 
+    /// steering（v1.17）：control 通道（stream-json stdin）支持运行中转向；
+    /// MCP 通道无 stdin，不支持（消息回落排队）。
+    fn supports_steering(&self) -> bool {
+        *self.permission_channel.read() == PermissionChannel::Control
+    }
+
     /// W1-2：/model 热设（进程内；SIGHUP 时 main 重设回 config 基准值）。
     fn set_model(&self, model: Option<String>) {
         *self.model.write() = model;
@@ -370,6 +376,7 @@ impl Backend for ClaudeBackend {
         allowed_tools: &[String],
         chunks: tokio::sync::mpsc::Sender<AgentChunk>,
         initial_todos: &[imagent_core::TodoItem],
+        steer: tokio::sync::mpsc::Receiver<String>,
     ) -> Result<RunOutcome> {
         // 构造命令（prompt 作为单个 arg，不经 shell；stdin/stdout/stderr/kill_on_drop
         // 由 spawn_cli_backend 统一加）。
@@ -511,6 +518,9 @@ impl Backend for ClaudeBackend {
             control_io,
             // TaskList 预热：会话既有任务快照作累积器初值。
             initial_todos.to_vec(),
+            // steering（v1.17）：仅 control 通道有 stdin（stream-json 输入），
+            // MCP 模式给 None（dispatcher 侧 supports_steering 已对齐）。
+            use_control.then_some(steer),
         )
         .await;
         // S-6 / P3-2：run 结束（claude 子进程已退出）清理本次 mcp 配置，避免
@@ -815,6 +825,11 @@ mod tests {
                 &allowed,
                 tx,
                 &[],
+                {
+                    let (sx, rx) = tokio::sync::mpsc::channel(1);
+                    drop(sx);
+                    rx
+                },
             )
             .await
             .expect("claude run should succeed");

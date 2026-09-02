@@ -77,8 +77,12 @@ pub trait Backend: Send + Sync {
     /// - `chunks`：流式分块通道，core 消费；
     /// - `initial_todos`：TaskList 预热种子（会话既有任务快照，含真实任务
     ///   id）。CLI 系 backend 把它作为待办累积器初值（跨轮 TaskUpdate 按 id
-    ///   匹配 + 开局面板）；不关心的 backend 忽略。
-    // 参数已达 8 个——再增应收敛为 RoundContext 结构（历史演化提醒）。
+    ///   匹配 + 开局面板）；不关心的 backend 忽略；
+    /// - `steer`：运行中转向通道（v1.17）——dispatcher 把运行中到达的用户
+    ///   消息经此注入当轮（CLI 系 backend 转写 stdin user 行；实验校准：CLI
+    ///   在下个工具边界交付）。不支持的 backend 直接 drop（dispatcher 依
+    ///   [`Backend::supports_steering`] 决定是否启用）。
+    // 参数已达 9 个——再增应收敛为 RoundContext 结构（历史演化提醒）。
     #[allow(clippy::too_many_arguments)]
     async fn run(
         &self,
@@ -89,7 +93,14 @@ pub trait Backend: Send + Sync {
         allowed_tools: &[String],
         chunks: mpsc::Sender<AgentChunk>,
         initial_todos: &[TodoItem],
+        steer: mpsc::Receiver<String>,
     ) -> Result<RunOutcome>;
+
+    /// 是否支持运行中转向（v1.17）：dispatcher 据此决定运行中消息是注入当轮
+    /// 还是排队下一轮。默认 false；claude-cli（control 通道）覆写 true。
+    fn supports_steering(&self) -> bool {
+        false
+    }
 
     /// agent 类型，如 `"claude-cli"`。
     fn name(&self) -> &'static str;
