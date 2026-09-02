@@ -1999,18 +1999,51 @@ impl Platform for FeishuPlatform {
         let sender = self.last_sender(&conv.0).await;
         let sender_opt = (!sender.is_empty()).then_some(sender.as_str());
         let timeout = self.ask_timeout_secs;
-        // P6 遗留补齐：话题群——reply API 把审批卡发进原话题（与流式卡同路），
-        // 失败降级文本（文本经 send_text 的线程分支也落回话题）。
-        // P8-2：话题群的复用槽与普通 conv 同一套（patch 话题内旧卡同样有效）。
-        if let Some((_chat, root_id)) = thread_target_from_conv(conv) {
-            let card_json = render_permission_card(
-                tool_name,
+        // P6（AskUserQuestion 透传）：agent 的问题渲染成「问题 + 选项」卡而非
+        // 允许/拒绝审批卡——**判定在话题/评论分支之前**（v1.17.1 修：原判定在
+        // 主时间线分支内，话题里的问题仍降级审批卡裸显 JSON——真机 2026-09-02
+        // 复现：话题内 4 问测试收到"回复 y 允许"审批文本）。
+        let is_question = tool_name == "AskUserQuestion"
+            && crate::card::render_question_card(
                 input_summary,
                 &conv.0,
                 request_id,
                 sender_opt,
                 timeout,
-            );
+            )
+            .is_some();
+        // P6 遗留补齐：话题群——reply API 把询问卡发进原话题（与流式卡同路），
+        // 失败降级文本（文本经 send_text 的线程分支也落回话题）。
+        // P8-2：话题群的复用槽与普通 conv 同一套（patch 话题内旧卡同样有效）。
+        if let Some((_chat, root_id)) = thread_target_from_conv(conv) {
+            let card_json = if is_question {
+                crate::card::render_question_card(
+                    input_summary,
+                    &conv.0,
+                    request_id,
+                    sender_opt,
+                    timeout,
+                )
+                .unwrap_or_else(|| {
+                    render_permission_card(
+                        tool_name,
+                        input_summary,
+                        &conv.0,
+                        request_id,
+                        sender_opt,
+                        timeout,
+                    )
+                })
+            } else {
+                render_permission_card(
+                    tool_name,
+                    input_summary,
+                    &conv.0,
+                    request_id,
+                    sender_opt,
+                    timeout,
+                )
+            };
             return match self
                 .with_token(|t| {
                     let root_id = root_id.clone();
@@ -2025,7 +2058,7 @@ impl Platform for FeishuPlatform {
                 Ok(mid) => {
                     if let Some(mid) = &mid {
                         let render = AskRender {
-                            question: false,
+                            question: is_question,
                             tool_name: tool_name.to_string(),
                             input: input_summary.to_string(),
                             sender,
@@ -2046,17 +2079,7 @@ impl Platform for FeishuPlatform {
         }
         let (receive_id, kind) = receive_target_from_conv(conv)
             .ok_or_else(|| CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0)))?;
-        // P6（AskUserQuestion 透传）：agent 的问题渲染成「问题 + 选项按钮」卡，
-        // 而非降级的 允许/拒绝 审批卡；解析失败降级普通审批卡。
-        let is_question = tool_name == "AskUserQuestion"
-            && crate::card::render_question_card(
-                input_summary,
-                &conv.0,
-                request_id,
-                sender_opt,
-                timeout,
-            )
-            .is_some();
+        // is_question 已在上方话题分支前统一判定（v1.17.1）。
         let card_json = if is_question {
             crate::card::render_question_card(
                 input_summary,
@@ -2134,6 +2157,21 @@ impl Platform for FeishuPlatform {
         input_summary: &str,
         hint: &ReplyHint,
     ) -> Result<()> {
+        // v1.17.1：AskUserQuestion 的文本降级（评论线程/卡发送失败）不再裸显
+        // JSON——按问题列表渲染，答案走既有的 ask: 回复通道。
+        if tool_name == "AskUserQuestion" {
+            if let Some(questions) = crate::card::questions_as_text(input_summary) {
+                let prefix = if comment_target_from_conv(conv).is_some() {
+                    "@bot "
+                } else {
+                    ""
+                };
+                let text = format!(
+                    "❓ {questions}\n\n请{prefix}回复 ask:选项（多题用「；」分隔，如 ask:题一=甲；题二=乙）。"
+                );
+                return self.send_text(conv, &text, hint).await;
+            }
+        }
         let summary = imagent_core::render::tool_summary(tool_name, input_summary);
         let text = if comment_target_from_conv(conv).is_some() {
             format!("🔐 请求执行 {tool_name}：{summary}\n\n请回复 @bot y 允许 / @bot n 拒绝。")
