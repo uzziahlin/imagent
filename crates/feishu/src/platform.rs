@@ -2003,8 +2003,11 @@ impl Platform for FeishuPlatform {
         // 允许/拒绝审批卡——**判定在话题/评论分支之前**（v1.17.1 修：原判定在
         // 主时间线分支内，话题里的问题仍降级审批卡裸显 JSON——真机 2026-09-02
         // 复现：话题内 4 问测试收到"回复 y 允许"审批文本）。
-        let is_question = tool_name == "AskUserQuestion"
-            && crate::card::render_question_card(
+        // v1.17.2：降级时 warn 携带长度与解析失败原因——v1.17.0 曾有一例
+        // 正常群内降级审批卡（body 4257 卡片形态），根因未定位，此日志让
+        // 复发时可诊断（截断？解析？形状变化？）。
+        let is_question = if tool_name == "AskUserQuestion" {
+            let ok = crate::card::render_question_card(
                 input_summary,
                 &conv.0,
                 request_id,
@@ -2012,6 +2015,17 @@ impl Platform for FeishuPlatform {
                 timeout,
             )
             .is_some();
+            if !ok {
+                warn!(target: "feishu", conv = %conv.0,
+                    len = input_summary.chars().count(),
+                    parse_ok = serde_json::from_str::<serde_json::Value>(input_summary).is_ok(),
+                    tail = %input_summary.chars().rev().take(8).collect::<String>(),
+                    "AskUserQuestion 问题卡渲染失败，降级审批卡（tail 应为 } 否则被截断）");
+            }
+            ok
+        } else {
+            false
+        };
         // P6 遗留补齐：话题群——reply API 把询问卡发进原话题（与流式卡同路），
         // 失败降级文本（文本经 send_text 的线程分支也落回话题）。
         // P8-2：话题群的复用槽与普通 conv 同一套（patch 话题内旧卡同样有效）。
