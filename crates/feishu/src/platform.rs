@@ -2020,7 +2020,7 @@ impl Platform for FeishuPlatform {
                     len = input_summary.chars().count(),
                     parse_ok = serde_json::from_str::<serde_json::Value>(input_summary).is_ok(),
                     tail = %input_summary.chars().rev().take(8).collect::<String>(),
-                    "AskUserQuestion 问题卡渲染失败，降级审批卡（tail 应为 } 否则被截断）");
+                    "AskUserQuestion 问题卡渲染失败，降级审批卡（tail 应为右花括号，否则被截断）");
             }
             ok
         } else {
