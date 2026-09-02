@@ -64,6 +64,7 @@ impl Backend for GeminiBackend {
         allowed_tools: &[String],
         chunks: tokio::sync::mpsc::Sender<AgentChunk>,
         _initial_todos: &[imagent_core::TodoItem],
+        _steer: tokio::sync::mpsc::Receiver<String>,
     ) -> Result<RunOutcome> {
         debug!(target: "imagent::gemini", conv_id, "gemini run start");
         // B13a：ARG_MAX 防护——gemini 的 prompt 只能整条作 `--prompt=<prompt>` 单
@@ -115,6 +116,7 @@ impl Backend for GeminiBackend {
             None,
             // gemini 无 Task\* 工具族：不播种。
             Vec::new(),
+            None,
         )
         .await
     }
@@ -251,6 +253,11 @@ mod tests {
                 &[],
                 tx,
                 &[],
+                {
+                    let (sx, rx) = tokio::sync::mpsc::channel(1);
+                    drop(sx);
+                    rx
+                },
             )
             .await
             .unwrap_err();

@@ -2,6 +2,61 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.17.0] — 2026-09-02
+
+> **steering 运行中转向（头牌）+ 审计修复七项 + AskUserQuestion 多问题单卡 +
+> /queue + 快捷命令**。全部协议行为经本地 CLI 实测校准（转向交付时序/审批
+> 优先/多消息合并/多答案回传四项实验）。640 tests / 0 failed。
+
+### Added
+- **steering（运行中转向）**：agent 运行期间到达的文本消息不再排队等下一轮
+  ——经 stdin（stream-json user 行）**注入当轮**，CLI 在下个工具边界交付并
+  改道（实验校准：不打断轮次、审批挂起期间扣住不插队、连发多条自动合并，
+  无需自家防抖）。架构：stdin 重构为专职写入 task（控制响应+转向两路汇合），
+  `Backend::run` 新增 steer 通道参数 + `supports_steering` 能力声明（claude-cli
+  control 通道支持；MCP 通道/ACP/其他后端回落排队旧行为）；running 注册表从
+  裸 AbortHandle 扩为 `{abort, steer}`。媒体消息仍排队。
+- **AskUserQuestion 多问题单卡一次提交**：原只渲染第一问（"依次询问"假设
+  错——CLI 一次 control 交互=整个工具调用，无逐题机制）。现在全部问题渲染
+  进一张表单卡（每题 select/checkbox + 选项描述小字），一次提交经
+  deny+message 回传全部选择（`用户选择：题=答案；…`，多答案格式已校准）。
+- **/queue [drop n]**：排队消息从黑盒变可观测/可操控——列出内容+发送者+
+  摘要；选择性丢弃（仅自己的或 admin）。
+- **快捷命令（config `shortcuts`）**：`/name` → prompt 模板（`$args` 占位），
+  例 `deploy = "跑 ./deploy.sh 并汇报 $args"`。走完整 agent 分派路径
+  （鉴权/批处理/steering），SIGHUP 热重载。
+- **上下文水位可视化**：每轮落库 `usage.input_tokens` 水位，/status 展示
+  「上下文 X tok（阈值 Y，Z%）」——距自动压缩的余量一目了然。
+
+### Fixed
+- **后台通知轮 Final 覆盖主答案**（P0-1）：`origin.kind=task-notification` 的
+  result 不再整体覆盖 `final_text`（其内容经 Text chunk 已按 B9 追加；覆盖
+  会让裸通知文本成为最终回复）。
+- **ACP 成本记账虚高**（P0-2）：UsageUpdate 是会话累计水位，原每轮整段落库
+  → run_stats 求和严重虚高（per-sender 日上限失效）。现按基线差值记**本轮
+  增量**（换会话/重连首轮保守整段）。CLI 路径「取最后非 None」经实测证明
+  正确（total_cost_usd 本就是会话累计），不动。
+- **成本上限绕过**（P0-3）：检查从轮首（只查批次首 sender——超限用户把消息
+  排进他人批次即可绕过）挪到入队闸门**逐消息**检查，覆盖 handle//retry/排队
+  全部入口。
+- **/stop 生效窗口**（P0-4）：批窗口等待与 take_batch→注册间隙（typing/store/
+  转录推导多段 await）内查无在飞句柄、拦不住即将起跑的轮。runner 持 conv 锁
+  贯穿全程——try_lock 失败即设停止标记，runner 循环起跑前拦截（60s 过期防
+  stray /stop 误杀后续轮）。
+- **/retry 数据源重做**（P0-5）：内存 map（重启丢、每轮覆盖——失败卡按钮
+  点按时重放的可能已是新一批）→ store 持久化，**仅失败轮写入**：重启不丢、
+  成功轮不覆盖、失败卡永远指向失败那轮。
+- **/stop 与 steering 语义冲突**（P0-6）：缺省 /stop 是「中断+自动续跑」，
+  却仍清「始终允许」→ 续跑轮重复弹审批。现仅 `/stop all`（硬停）收回授权；
+  顺带修参数大小写敏感。
+- **session id 字节切片 panic**（P0-7）：三处 `&id[..n]` 遇多字节字符边界
+  直接 panic，改 `chars().take()`。
+- **AskUserQuestion 截断降级**：多题+描述 JSON 超 2000 字符被截断且 `…`
+  后缀破坏 JSON → 问题卡解析失败降级成审批卡裸显 JSON。问题路径上限放大
+  到 8000。
+- **转录回放阻塞 async 线程**：TaskList 预热冷启动的 jsonl 回放下放
+  spawn_blocking。
+
 ## [1.16.0] — 2026-09-02
 
 > **TaskList 预热 + 体验收尾**：会话级任务快照持久化 + 轮首播种 + 转录冷启动

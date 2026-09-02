@@ -96,14 +96,14 @@ impl TaskBudgets {
     }
 }
 
-fn now_secs() -> i64 {
+pub(super) fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
 /// 把字符串按字符截断到 n 个字符，超出则加省略号。
-fn truncate_str(s: &str, n: usize) -> String {
+pub(super) fn truncate_str(s: &str, n: usize) -> String {
     let count = s.chars().count();
     let t: String = s.chars().take(n).collect();
     if count > n {
@@ -399,7 +399,7 @@ fn merge_batch(batch: Vec<InboundMessage>) -> InboundMessage {
 
 /// P10：排队消息 → 展示摘要（最新一条）：文本取前 40 字符（S-6：按注释口径
 /// 截断，防长消息把卡片 footer 撑爆）；纯媒体给占位。
-fn latest_snippet(msg: &InboundMessage) -> String {
+pub(super) fn latest_snippet(msg: &InboundMessage) -> String {
     match msg.text.as_deref() {
         Some(t) if !t.trim().is_empty() => truncate_str(t.trim(), 40),
         _ if !msg.media.is_empty() => "（图片/文件）".to_string(),
@@ -425,6 +425,15 @@ struct ResumeEntry {
 
 /// /resume 列表缓存（D7）：key = (conv, sender)，值带写入时刻（TTL 惰性过期）。
 type ResumeCache = HashMap<(String, String), (Instant, Vec<ResumeEntry>)>;
+
+/// 在飞轮次句柄（v1.17 steering）：
+/// - `abort`：/stop 中断用（原裸 AbortHandle）；
+/// - `steer`：运行中转向通道（control 通道 CLI 支持；None = 不支持，消息排队）。
+#[derive(Clone)]
+pub(super) struct RoundHandle {
+    pub(super) abort: tokio::task::AbortHandle,
+    pub(super) steer: Option<tokio::sync::mpsc::Sender<String>>,
+}
 
 pub struct Dispatcher {
     platform: Arc<dyn Platform>,
@@ -463,13 +472,21 @@ pub struct Dispatcher {
     started_at: Instant,
     /// per-conv 在飞 agent 任务注册表（`/stop` 中断用）：conv_id → join task 的
     /// AbortHandle。同 conv 轮次串行（conv 锁保证），key 插入/移除无 ABA。
-    running: Mutex<HashMap<String, tokio::task::AbortHandle>>,
+    running: Mutex<HashMap<String, RoundHandle>>,
     /// per-conv 批处理队列：runner 在飞期间到达的消息暂存（entry 存在 = runner
     /// 活跃；runner 取空交还时移除）。入队与取批共用一把锁，杜绝 lost-wakeup。
     queues: Mutex<HashMap<String, Vec<InboundMessage>>>,
     /// P10：per-conv 排队状态（count + 最新摘要）——入队路径写、取批//stop 清、
     /// CardSession 每次 patch 拉取渲染进 Running footer（状态上卡，不发消息）。
     queued_hints: Arc<Mutex<HashMap<String, crate::card_session::QueuedHint>>>,
+    /// 快捷命令（v1.17）：config `shortcuts`（name → prompt 模板，`$args`
+    /// 占位）。main 启动/SIGHUP 经 [`Dispatcher::set_shortcuts`] 注入。
+    shortcuts: Arc<std::sync::RwLock<HashMap<String, String>>>,
+    /// P0-4（v1.17）：per-conv 停止标记（conv → 设置时刻）。/stop 在批窗口/
+    /// 注册间隙查无在飞句柄、但 conv 锁被 runner 持有时设置；runner 循环取批
+    /// 后起跑前检查，命中（60s 内）则本批不启动。过期兜底防 stray /stop 误杀
+    /// 之后不相关的轮次。
+    stop_requested: Arc<Mutex<HashMap<String, i64>>>,
     /// per-conv 最近一次 `/resume` 渲染的列表（P4-11）：序号选择取缓存，
     /// 防两次调用间本机会话 mtime 变化导致错位；S-16：选中不移除条目（防序号
     /// 前移错位），陈旧由 D7 的 TTL 惰性过期兜底。
@@ -503,7 +520,6 @@ pub struct Dispatcher {
     pending_hint_last: Mutex<HashMap<String, Instant>>,
     /// W3-3：per-conv 最近一轮的用户 prompt（/retry 与失败快捷操作卡用）。
     /// 上限 500 条（超量整体清空——粗防泄漏，语义无损）。
-    last_prompts: Mutex<HashMap<String, String>>,
     /// 优雅退出信号（P1-5）：收到 SIGINT/SIGTERM 后 cancel，run() 停止收新消息并
     /// drain。D4：改用 CancellationToken（持久信号）——`Notify::notify_waiters` 只
     /// 唤醒**已注册**的等待者，信号先于监听者 await 到达时存在丢失窗口。
@@ -585,9 +601,10 @@ impl Dispatcher {
             running: Mutex::new(HashMap::new()),
             queues: Mutex::new(HashMap::new()),
             queued_hints: Arc::new(Mutex::new(HashMap::new())),
+            stop_requested: Arc::new(Mutex::new(HashMap::new())),
+            shortcuts: Arc::new(std::sync::RwLock::new(HashMap::new())),
             resume_cache: Mutex::new(HashMap::new()),
             pending_hint_last: Mutex::new(HashMap::new()),
-            last_prompts: Mutex::new(HashMap::new()),
             idle_overrides: Mutex::new(HashMap::new()),
             cot_overrides: Mutex::new(HashMap::new()),
             quiet_hours_raw: RwLock::new(None),
@@ -655,6 +672,11 @@ impl Dispatcher {
     /// 调用者是否为管理员（可 /allow /config /perm /admin）。S2：admin_senders
     /// 空 = **无人**是管理员（旧「空 = 全员可」语义使群部署下任意白名单成员可
     /// 自扩权，已收紧）；非空则严格匹配（P2-D）。
+    /// 快捷命令注入（v1.17）：main 启动与 SIGHUP 热重载时调用。
+    pub fn set_shortcuts(&self, map: HashMap<String, String>) {
+        *self.shortcuts.write().expect("shortcuts 写锁") = map;
+    }
+
     fn is_admin(&self, sender: &str) -> bool {
         let admins = self.admin_senders.read();
         let trimmed = sender.trim();
@@ -1216,6 +1238,43 @@ impl Dispatcher {
         let mut map = self.queues.lock().await;
         match map.get_mut(conv) {
             Some(pending) => {
+                // steering（v1.17，实验校准 2026-09-01）：运行中到达的**文本**
+                // 消息直接注入当轮 stdin——CLI 在下个工具边界交付并改道；连发
+                // 多条由 CLI 自动合并（无需自家防抖）。媒体消息走不了 stdin、
+                // 注入失败（轮恰收尾/通道满）回落排队。多发送者不加【标注】
+                //（stdin 单流；群聊归属由 agent 上下文自行分辨）。
+                if msg.media.is_empty() && msg.control.is_none() {
+                    if let Some(text) = msg.text.as_deref().map(str::trim).filter(|t| !t.is_empty())
+                    {
+                        let steered = {
+                            let running = self.running.lock().await;
+                            running
+                                .get(conv)
+                                .and_then(|h| h.steer.as_ref())
+                                .is_some_and(|tx| tx.try_send(text.to_string()).is_ok())
+                        };
+                        if steered {
+                            drop(map);
+                            // 回执：⏳ 打在消息上（注入效果由 agent 续写可见）。
+                            if let Some(mid) =
+                                msg.source_msg_id.clone().filter(|m| m.starts_with("om_"))
+                            {
+                                if let Err(e) = self
+                                    .platform
+                                    .react_to_message(
+                                        &ConvId(conv.to_string()),
+                                        &mid,
+                                        crate::MsgReaction::Queued,
+                                    )
+                                    .await
+                                {
+                                    tracing::debug!(target: "imagent::core", error = %e, "转向消息表情标注失败（不影响注入）");
+                                }
+                            }
+                            return false;
+                        }
+                    }
+                }
                 if pending.len() >= PENDING_QUEUE_CAP {
                     drop(map);
                     warn!(

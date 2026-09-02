@@ -2,6 +2,17 @@
 
 use super::*;
 
+/// P0-AUQ（v1.17）：询问输入截断上限——AskUserQuestion 的多题+描述 JSON 轻松
+/// 超 2000 字符，且 truncate 的 `…` 后缀会让 JSON 非法 → 问题卡解析降级成
+/// 审批卡裸显 JSON（真机症状）。问题路径放大到 8000（卡片 30KB 上限内）。
+fn ask_input_cap(tool_name: &str) -> usize {
+    if tool_name == "AskUserQuestion" {
+        8000
+    } else {
+        2000
+    }
+}
+
 impl Dispatcher {
     /// spawn socket accept task：每个连接独立 spawn，读权限请求 → send_text 询问
     /// 用户 → register 等 receiver → 写回复回 socket。
@@ -487,7 +498,7 @@ impl Dispatcher {
                 "options": options.iter().map(|o| serde_json::json!({"label": o})).collect::<Vec<_>>(),
             }]
         });
-        let input_summary = truncate_str(&input.to_string(), 2000);
+        let input_summary = truncate_str(&input.to_string(), ask_input_cap("AskUserQuestion"));
         // D5：先 register 占位（card_msg_id 后补）再发卡——否则用户极快点按钮时
         // 回调在 register 前到达，route 未命中回落 handle 被当普通 prompt 吞掉。
         let rx = router
@@ -690,7 +701,7 @@ impl Dispatcher {
         // 复用 recv 循环的审批回复路由，core 不感知按钮。
         // P6：80 截断装不下 AskUserQuestion 的问题+选项 JSON；放到 2000（卡片
         // 30KB 上限内安全，仍防超长轰炸）。
-        let input_summary = truncate_str(&input_str, 2000);
+        let input_summary = truncate_str(&input_str, ask_input_cap(&tool_name));
         // D5：先 register 占位再发卡——防用户极速点按钮时回调先于 register 到达，
         // route 未命中回落 handle 被当普通 prompt。P1-3：发送失败 → 撤占位、
         // 回写 deny 并 return，不留 pending。

@@ -112,14 +112,33 @@ impl Dispatcher {
                 };
                 format!(
                     "{label}（{}…，{}）",
-                    &row.session_id[..row.session_id.len().min(12)],
+                    row.session_id.chars().take(12).collect::<String>(),
                     row.agent_kind
                 )
             }
             _ => "无（下条消息新建）".to_string(),
         };
+        // 上下文水位（v1.17）：上轮 usage.input_tokens + 与自动压缩阈值的距离
+        //（0 = 自动压缩关闭，仅展示水位）。
+        let ctx_line = match self
+            .store
+            .get_config(&format!("ctx_watermark:{}", conv.0))
+            .await
+        {
+            Ok(Some(raw)) => raw.parse::<u64>().ok().map(|tokens| {
+                let threshold = self.auto_compact_threshold;
+                if threshold > 0 {
+                    let pct = tokens * 100 / threshold.max(1);
+                    format!("\n- 🧠 上下文：{tokens} tok（阈值 {threshold}，{pct}%）")
+                } else {
+                    format!("\n- 🧠 上下文：{tokens} tok（自动压缩已关闭）")
+                }
+            }),
+            _ => None,
+        }
+        .unwrap_or_default();
         let text = format!(
-                            "📊 当前状态\n- 🤖 后端：{}（{}）\n- 💬 本会话：{}，排队 {} 条\n- 🔗 会话：{sess_desc}\n- 📁 工作目录：{}\n- 🏃 全局在飞：{in_flight} 个\n- ⏱️ 运行时长：{}",
+                            "📊 当前状态\n- 🤖 后端：{}（{}）\n- 💬 本会话：{}，排队 {} 条\n- 🔗 会话：{sess_desc}{ctx_line}\n- 📁 工作目录：{}\n- 🏃 全局在飞：{in_flight} 个\n- ⏱️ 运行时长：{}",
                             self.backend.name(),
                             self.platform.name(),
                             if running_here { "任务在跑" } else { "无任务" },
@@ -676,26 +695,32 @@ impl Dispatcher {
         .await;
     }
 
-    /// /retry —— 重发本会话最近一轮的用户 prompt（W3-3：失败/中断后一键续接
-    /// 会话再试）。走与普通消息**完全相同**的 handle 路径（鉴权/批处理/轮次
-    /// 语义一致），无需独立执行逻辑。
+    /// /retry —— 重发本会话**最近一次失败轮**的用户 prompt（W3-3：失败/中断后
+    /// 一键续接会话再试）。走与普通消息**完全相同**的 handle 路径（鉴权/批处理/
+    /// 轮次语义一致），无需独立执行逻辑。
+    /// P0-5（v1.17）：数据源从内存 map 改为 store config（`last_prompt:<conv>`，
+    /// 仅失败路径写入）——重启不丢、成功轮不覆盖、失败卡按钮永远指向失败那轮。
     pub(super) async fn cmd_retry(
         &self,
         conv: &ConvId,
         sender: &crate::types::UserId,
         hint: &ReplyHint,
     ) {
-        let prompt = self
-            .last_prompts
-            .lock()
+        let prompt = match self
+            .store
+            .get_config(&format!("last_prompt:{}", conv.0))
             .await
-            .get(&conv.0)
-            .cloned()
-            .filter(|p| !p.trim().is_empty());
+        {
+            Ok(Some(raw)) => serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .and_then(|v| v.get("prompt").and_then(|p| p.as_str()).map(str::to_string))
+                .filter(|p| !p.trim().is_empty()),
+            _ => None,
+        };
         let Some(prompt) = prompt else {
             self.reply(
                 conv,
-                "本会话没有可重试的历史指令（直接重发消息即可开始）。",
+                "本会话没有可重试的历史指令（最近一轮成功，或直接重发消息即可开始）。",
                 hint,
             )
             .await;
@@ -789,6 +814,116 @@ impl Dispatcher {
             }
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// /queue [drop <n>] —— 查看本会话排队中的消息（agent 运行期间到达、待下
+    /// 一轮合并）；`drop <n>` 选择性丢弃（仅自己的消息或 admin）。P0-5 同批
+    ///（v1.17）：此前队列是黑盒——只有 /stop 回执里的数字与整队清空。
+    pub(super) async fn cmd_queue(
+        &self,
+        conv: &ConvId,
+        sender: &str,
+        hint: &ReplyHint,
+        parts: &[&str],
+    ) {
+        // drop 子命令：先做权限与序号校验，再在同一 queues 临界区移除并刷新
+        // queued_hints（count 变化需反映到卡片 footer）。
+        if parts.get(1).map(|s| s.trim()) == Some("drop") {
+            let Some(n) = parts.get(2).and_then(|s| s.trim().parse::<usize>().ok()) else {
+                self.reply(
+                    conv,
+                    "用法：/queue drop <序号>（序号见 /queue 列表，1 起）",
+                    hint,
+                )
+                .await;
+                return;
+            };
+            if n == 0 {
+                self.reply(conv, "序号从 1 开始。", hint).await;
+                return;
+            }
+            let is_admin = self.is_admin(sender);
+            let removed_sender;
+            {
+                let mut map = self.queues.lock().await;
+                let Some(q) = map.get_mut(&conv.0) else {
+                    self.reply(conv, "队列为空。", hint).await;
+                    return;
+                };
+                if n > q.len() {
+                    let len = q.len();
+                    drop(map);
+                    self.reply(conv, &format!("序号超出范围（当前 {len} 条）。"), hint)
+                        .await;
+                    return;
+                }
+                let idx = n - 1;
+                removed_sender = q[idx].sender.0.clone();
+                if removed_sender != sender && !is_admin {
+                    self.reply(conv, "只能丢弃自己排队的消息（或联系管理员处理）。", hint)
+                        .await;
+                    return;
+                }
+                let removed = q.remove(idx);
+                let count = q.len();
+                if count == 0 {
+                    // 与取批路径同语义：留空 Vec 不删 entry（runner 循环依赖）。
+                    self.queued_hints.lock().await.remove(&conv.0);
+                } else if let Some(last) = q.last() {
+                    self.queued_hints.lock().await.insert(
+                        conv.0.clone(),
+                        crate::card_session::QueuedHint {
+                            count,
+                            latest: super::super::latest_snippet(last),
+                        },
+                    );
+                }
+                drop(map);
+                let snippet = removed
+                    .text
+                    .as_deref()
+                    .map(|t| super::super::truncate_str(t.trim(), 30))
+                    .unwrap_or_else(|| "（纯媒体）".into());
+                self.reply(
+                    conv,
+                    &format!("🗑️ 已丢弃第 {n} 条（{removed_sender}）：{snippet}"),
+                    hint,
+                )
+                .await;
+                return;
+            }
+        }
+        // 列表视图。
+        let list: Vec<(String, String)> = {
+            let map = self.queues.lock().await;
+            match map.get(&conv.0) {
+                None => Vec::new(),
+                Some(q) => q
+                    .iter()
+                    .map(|m| {
+                        let snippet = match m.text.as_deref() {
+                            Some(t) if !t.trim().is_empty() => {
+                                super::super::truncate_str(t.trim(), 40)
+                            }
+                            _ if !m.media.is_empty() => format!("（媒体 ×{}）", m.media.len()),
+                            _ => "（空）".into(),
+                        };
+                        (m.sender.0.clone(), snippet)
+                    })
+                    .collect(),
+            }
+        };
+        if list.is_empty() {
+            self.reply(conv, "📭 本会话当前没有排队中的消息。", hint)
+                .await;
+            return;
+        }
+        let mut body = String::from("📋 排队中的消息（下一轮合并执行）：");
+        for (i, (s, snippet)) in list.iter().enumerate() {
+            body.push_str(&format!("\n{}. 【{s}】{snippet}", i + 1));
+        }
+        body.push_str("\n\n丢弃某条：/queue drop <序号>（仅自己的或 admin）。");
+        self.reply(conv, &body, hint).await;
     }
 
     /// /stats [today|7d|all] —— token 用量/成本统计（默认 7d）。全局 + 本会话
@@ -1030,7 +1165,7 @@ impl Dispatcher {
 
     /// /help —— 命令总表（P6-3：飞书等卡片平台带常用命令按钮）。
     pub(super) async fn cmd_help(&self, conv: &ConvId, hint: &ReplyHint) {
-        let body = "🗂 会话\n- /new 重置会话\n- /switch <name> 切换/新建命名会话\n- /sessions 列出命名会话\n- /resume [n] 恢复历史/本机会话\n- /compact 压缩上下文\n- /retry 重试最近一轮（失败后一键续接）\n- /export 导出当前会话为 Markdown\n\n📁 目录与文件\n- /cd <path> 切工作目录\n- /ws save|use|remove <name> 命名工作空间\n- /img <path> 发图片 · /file <path> 发文件\n\n🛡️ 权限与运行\n- /perm <off|allow|deny|ask> 权限模式\n- /stop 中断任务（排队消息保留并自动续跑；/stop all 全部丢弃）\n- /timeout <分钟|off|default> 会话级空闲看门狗\n- /model [名称|default] 查看/切换模型（切换需管理员）\n\n🧪 状态与诊断\n- /status 状态 · /doctor 自检 · /reconnect 重连\n- /config [k v] 查看/热改配置 · /audit [n] 审计日志\n\n👥 白名单与管理（管理员）\n- /allow、/disallow 授权/撤权（飞书群内可 @ 对方）\n- /chat allow|deny|allow-all|list 会话白名单\n- /admin list|add|remove 管理员\n- /list 白名单 · /whoami 我的 id\n\n💬 会话规则：群主时间线直接 @我 = 续同一会话；点消息「回复」进话题 = 开独立会话（互不共享上下文/待办）。\n\n其他内容直接发给 agent 即可（任务运行中发送的消息会排队合并进下一轮）。";
+        let body = "🗂 会话\n- /new 重置会话\n- /switch <name> 切换/新建命名会话\n- /sessions 列出命名会话\n- /resume [n] 恢复历史/本机会话\n- /compact 压缩上下文\n- /retry 重试最近一轮（失败后一键续接）\n- /export 导出当前会话为 Markdown\n\n📁 目录与文件\n- /cd <path> 切工作目录\n- /ws save|use|remove <name> 命名工作空间\n- /img <path> 发图片 · /file <path> 发文件\n\n🛡️ 权限与运行\n- /perm <off|allow|deny|ask> 权限模式\n- /stop 中断任务（排队消息保留并自动续跑；/stop all 全部丢弃）\n- /queue [drop <n>] 查看/丢弃排队中的消息\n- /timeout <分钟|off|default> 会话级空闲看门狗\n- /model [名称|default] 查看/切换模型（切换需管理员）\n\n🧪 状态与诊断\n- /status 状态 · /doctor 自检 · /reconnect 重连\n- /config [k v] 查看/热改配置 · /audit [n] 审计日志\n\n👥 白名单与管理（管理员）\n- /allow、/disallow 授权/撤权（飞书群内可 @ 对方）\n- /chat allow|deny|allow-all|list 会话白名单\n- /admin list|add|remove 管理员\n- /list 白名单 · /whoami 我的 id\n\n💬 会话规则：群主时间线直接 @我 = 续同一会话；点消息「回复」进话题 = 开独立会话（互不共享上下文/待办）。\n\n其他内容直接发给 agent 即可（任务运行中发送的消息会排队合并进下一轮）。";
         let buttons = vec![
             CardButton {
                 label: "📊 状态".into(),

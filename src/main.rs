@@ -656,6 +656,8 @@ async fn main() -> Result<()> {
                 config.cot_detail,
                 initial_admins,
             ));
+            // 快捷命令（v1.17）：config.shortcuts 注入（SIGHUP 热重载同步）。
+            dispatcher.set_shortcuts(config.shortcuts.clone());
             // P7-A3/A4：启动偏好（陌生人 @ 提示开关 + 私聊引导开关 + 回复形态），
             // 构造后注入。
             dispatcher.set_prefs(
@@ -1342,6 +1344,7 @@ fn spawn_sighup_handler(
                     dispatcher.reload_tools(cfg.allowed_tools.clone());
                     dispatcher.set_approval_tools(cfg.approval_tools.clone());
                     backend.set_native_permission_mode(cfg.backend_permission_mode.clone());
+                    dispatcher.set_shortcuts(cfg.shortcuts.clone());
                     // 审批通道热切（control ↔ mcp 即时生效，下一轮 agent 起走新通道）。
                     if let Some(b) = &claude_cli {
                         b.set_permission_channel(&cfg.claude_permission_channel);

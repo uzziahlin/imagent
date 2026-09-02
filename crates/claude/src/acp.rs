@@ -359,11 +359,17 @@ impl Default for AcpBackend {
 ///   `stop_reason`，最终回复文本必须从流式 `AgentMessageChunk` 累积。
 /// - `usage`：W2-4——`UsageUpdate` 通知的**最新**会话水位（ACP 语义是会话累计值，
 ///   替换而非求和），turn 结束时并入 RunOutcome.usage。
+/// - `cost_baseline`：P0-2（v1.17 审计）——cost 累计水位记账基线（上次轮末的
+///   `(session_id, 累计cost)`）。RunOutcome 落库的是**本轮增量**（累计差，负值
+///   钳 0），否则每轮把会话累计当单轮成本记账、run_stats 求和严重虚高（per-
+///   sender 日上限失效）。连接重建/进程重启后基线丢失，首轮保守记整段（仅此
+///   一轮，旧实现是每轮都虚高）。换会话（--resume 到别处）基线不命中同理。
 #[derive(Clone)]
 struct StreamState {
     chunks: tokio::sync::mpsc::Sender<AgentChunk>,
     agent_text: Arc<Mutex<String>>,
     usage: Arc<Mutex<Option<UsageStats>>>,
+    cost_baseline: Arc<Mutex<Option<(String, f64)>>>,
 }
 
 impl StreamState {
@@ -372,6 +378,26 @@ impl StreamState {
             chunks,
             agent_text: Arc::new(Mutex::new(String::new())),
             usage: Arc::new(Mutex::new(None)),
+            cost_baseline: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// 累计 usage → 本轮增量 usage（P0-2）。cost 按基线差值；tokens 语义上是
+    /// 上下文水位（ACP 不提供每轮 token），保持透传。
+    async fn round_delta_usage(&self, sid: &str, cumulative: UsageStats) -> UsageStats {
+        let mut bl = self.cost_baseline.lock().await;
+        let round_cost = match &*bl {
+            Some((bsid, base)) if bsid == sid => {
+                cumulative.total_cost_usd.map(|c| (c - base).max(0.0))
+            }
+            _ => cumulative.total_cost_usd,
+        };
+        if let Some(c) = cumulative.total_cost_usd {
+            *bl = Some((sid.to_string(), c));
+        }
+        UsageStats {
+            total_cost_usd: round_cost,
+            ..cumulative
         }
     }
 }
@@ -565,9 +591,12 @@ impl LongLivedAcp {
                                 Ok(resp) => {
                                     let final_text = st.agent_text.lock().await.clone();
                                     // W2-4：stop_reason（MaxTokens/Refusal 等）
-                                    // + 会话累计 usage（UsageUpdate 最新值）。
+                                    // + usage（UsageUpdate 最新值→P0-2 本轮增量）。
                                     let stop_reason = stop_reason_str(&resp.stop_reason);
-                                    let usage = *st.usage.lock().await;
+                                    let usage = match *st.usage.lock().await {
+                                        Some(u) => Some(st.round_delta_usage(&sid, u).await),
+                                        None => None,
+                                    };
                                     let _ = st.chunks.send(AgentChunk::Final(final_text.clone())).await;
                                     let _ = req.resp.send(Ok(RunOutcome {
                                         session_id: SessionId(sid),
@@ -679,6 +708,7 @@ impl Backend for AcpBackend {
         allowed_tools: &[String],
         chunks: tokio::sync::mpsc::Sender<AgentChunk>,
         _initial_todos: &[imagent_core::TodoItem],
+        _steer: tokio::sync::mpsc::Receiver<String>,
     ) -> Result<RunOutcome> {
         // allowed_tools 暂无 ACP 直接映射（session/new 无工具白名单字段），依赖 cwd
         // 锁定 + claude 自身工具策略 + 权限审批收敛。
@@ -1039,6 +1069,38 @@ mod tests {
     use agent_client_protocol::{Agent, Channel};
     use std::time::Duration;
 
+    /// P0-2（v1.17）：cost 累计水位 → 本轮增量。首轮=整段；同会话后续=差值；
+    /// 会话累计回落（换会话/重置）→ 钳 0；换 session id → 基线不命中重新整段。
+    #[tokio::test]
+    async fn acp_cost_delta_round_accounting() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<AgentChunk>(8);
+        let st = StreamState::new(tx);
+        let u = |cost: f64| UsageStats {
+            input_tokens: 1000,
+            output_tokens: 0,
+            cached_tokens: None,
+            total_cost_usd: Some(cost),
+        };
+        // 首轮：无基线 → 整段（新会话语义正确）。
+        assert_eq!(
+            st.round_delta_usage("s1", u(0.10)).await.total_cost_usd,
+            Some(0.10)
+        );
+        // 同会话第二轮：差值（浮点近似）。
+        let delta2 = st.round_delta_usage("s1", u(0.35)).await.total_cost_usd;
+        assert!((delta2.unwrap() - 0.25).abs() < 1e-9, "delta={delta2:?}");
+        // 累计回落（水位重置）→ 钳 0，不产负成本。
+        assert_eq!(
+            st.round_delta_usage("s1", u(0.05)).await.total_cost_usd,
+            Some(0.0)
+        );
+        // 换会话：基线不命中 → 重新整段。
+        assert_eq!(
+            st.round_delta_usage("s2", u(0.40)).await.total_cost_usd,
+            Some(0.40)
+        );
+    }
+
     #[test]
     fn name_is_claude_acp() {
         assert_eq!(AcpBackend::new().name(), "claude-acp");
@@ -1122,14 +1184,24 @@ mod tests {
         let a = backend.clone();
         let wd = workdir.clone();
         let run_a = tokio::spawn(async move {
-            let _ = a.run("lim-a", "slow", None, &wd, &[], tx_a, &[]).await;
+            let _ = a
+                .run("lim-a", "slow", None, &wd, &[], tx_a, &[], {
+                    let (sx, rx) = tokio::sync::mpsc::channel(1);
+                    drop(sx);
+                    rx
+                })
+                .await;
         });
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // 上限 1：第二个 conv 被拒，且错误提示可读。
         let (tx_b, _rx_b) = tokio::sync::mpsc::channel::<AgentChunk>(64);
         let err = backend
-            .run("lim-b", "fast", None, &workdir, &[], tx_b, &[])
+            .run("lim-b", "fast", None, &workdir, &[], tx_b, &[], {
+                let (sx, rx) = tokio::sync::mpsc::channel(1);
+                drop(sx);
+                rx
+            })
             .await
             .expect_err("上限 1 时第二个 conv 应被拒绝");
         assert!(err.to_string().contains("上限"), "错误应说明上限: {err}");
@@ -1452,14 +1524,24 @@ mod tests {
         let a = backend.clone();
         let wd = workdir.clone();
         let run_a = tokio::spawn(async move {
-            let _ = a.run("conv-a", "slow", None, &wd, &[], tx_a, &[]).await;
+            let _ = a
+                .run("conv-a", "slow", None, &wd, &[], tx_a, &[], {
+                    let (sx, rx) = tokio::sync::mpsc::channel(1);
+                    drop(sx);
+                    rx
+                })
+                .await;
         });
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // B 起跑并立即放行其闸门——旧全局单连接串行模型下 B 的 prompt 排在 A
         // 之后，即便闸门开了也拿不到响应；per-conv 模型下 B 应立即完成。
         let (tx_b, _rx_b) = tokio::sync::mpsc::channel::<AgentChunk>(64);
-        let run_b = backend.run("conv-b", "fast", None, &workdir, &[], tx_b, &[]);
+        let run_b = backend.run("conv-b", "fast", None, &workdir, &[], tx_b, &[], {
+            let (sx, rx) = tokio::sync::mpsc::channel(1);
+            drop(sx);
+            rx
+        });
         let mut run_b = std::pin::pin!(run_b);
         let _ = release_b.send(true);
         let out_b = tokio::time::timeout(Duration::from_secs(5), run_b.as_mut())
@@ -1496,7 +1578,13 @@ mod tests {
         let a = backend_for_a.clone();
         let wd = workdir.clone();
         let run_a = tokio::spawn(async move {
-            let _ = a.run("conv-a", "slow", None, &wd, &[], tx_a, &[]).await;
+            let _ = a
+                .run("conv-a", "slow", None, &wd, &[], tx_a, &[], {
+                    let (sx, rx) = tokio::sync::mpsc::channel(1);
+                    drop(sx);
+                    rx
+                })
+                .await;
         });
         tokio::time::sleep(Duration::from_millis(300)).await;
         run_a.abort(); // 等 A 进入 prompt 后 cancel
@@ -1514,7 +1602,11 @@ mod tests {
 
         // B 不受影响：照常完成。
         let (tx_b, _rx_b) = tokio::sync::mpsc::channel::<AgentChunk>(64);
-        let run_b = backend_for_a.run("conv-b", "fast", None, &workdir, &[], tx_b, &[]);
+        let run_b = backend_for_a.run("conv-b", "fast", None, &workdir, &[], tx_b, &[], {
+            let (sx, rx) = tokio::sync::mpsc::channel(1);
+            drop(sx);
+            rx
+        });
         let mut run_b = std::pin::pin!(run_b);
         let _ = release_b.send(true);
         let out_b = tokio::time::timeout(Duration::from_secs(5), run_b.as_mut())
@@ -1608,6 +1700,11 @@ mod tests {
                 &[],
                 tx,
                 &[],
+                {
+                    let (sx, rx) = tokio::sync::mpsc::channel(1);
+                    drop(sx);
+                    rx
+                },
             )
             .await
             .expect_err("LoadSession 失败应返回错误");
@@ -1702,6 +1799,11 @@ mod tests {
                 &[],
                 tx,
                 &[],
+                {
+                    let (sx, rx) = tokio::sync::mpsc::channel(1);
+                    drop(sx);
+                    rx
+                },
             )
             .await
             .expect("acp run 应成功");

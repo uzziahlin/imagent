@@ -474,6 +474,19 @@ pub struct ControlIo {
     pub initial_stdin_message: String,
 }
 
+/// steering（v1.17，实验校准 2026-09-01）：运行中转向消息 → stdin 的
+/// stream-json user 行（与初始 prompt 同构）。CLI 在**下个工具边界**交付并
+/// 改道（不打断轮次、审批挂起期间扣住、连发多条自动合并——三项均实测）。
+fn steer_user_message(text: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({
+            "type": "user",
+            "message": { "role": "user", "content": [ { "type": "text", "text": text } ] }
+        })
+    )
+}
+
 /// 组装 control_response 响应行（写回子进程 stdin）。形态按 Agent SDK 双工协议
 /// （**待真机校准**：字段名/大小写以实测为准，错则 claude 视为未答复挂起——
 /// 兜底见 spawn 循环的 error 响应）。
@@ -497,6 +510,7 @@ fn control_response_line(request_id: &str, reply: &crate::permission::Permission
     format!("{resp}\n")
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn_cli_backend(
     mut cmd: tokio::process::Command,
     parse: impl Fn(&str) -> CliEvent,
@@ -505,6 +519,7 @@ pub async fn spawn_cli_backend(
     passthrough_env: &[&str],
     control: Option<ControlIo>,
     initial_todos: Vec<TodoItem>,
+    steer: Option<tokio::sync::mpsc::Receiver<String>>,
 ) -> Result<RunOutcome> {
     if control.is_some() {
         // 控制通道：stdin 必须保持打开（control_response 回写 + SDK 式 prompt
@@ -548,8 +563,10 @@ pub async fn spawn_cli_backend(
         .take()
         .ok_or_else(|| CoreError::Backend(backend_name, "stderr not piped".into()))?;
 
-    // 控制通道：取 stdin 写入首条 user 消息（SDK 式 prompt 投递），并保持写
-    // 句柄供 control_response 回写。写入失败不致命（claude 侧报 EOF 可见错误）。
+    // 控制通道：取 stdin 写入首条 user 消息（SDK 式 prompt 投递），随后把
+    // stdin 移交**专职写入 task**——两路输入汇合：读循环的控制响应回写
+    // （ctrl_tx）+ dispatcher 的运行中转向消息（steer_rx，v1.17）。
+    // 写入失败不致命（claude 侧报 EOF 可见错误）。
     let mut stdin_w = child.stdin.take();
     if let (Some(w), Some(io)) = (&mut stdin_w, &control) {
         // 诊断（control 通道真机校准）：初始写入失败必须显式可见——静默吞错
@@ -563,6 +580,50 @@ pub async fn spawn_cli_backend(
         tracing::debug!(target: "imagent::backend", bytes = io.initial_stdin_message.len(),
             "control 通道初始 stdin 消息已写入");
     }
+    // stdin 专职写入 task（v1.17 steering）：ctrl_tx 关闭（读循环退出）即结束
+    // 并 drop stdin——等价旧路径的 `drop(stdin_w.take())` EOF 语义。
+    let (ctrl_tx, mut ctrl_rx) = tokio::sync::mpsc::channel::<String>(16);
+    // Option 归一化为具体 Receiver：None 时用立即关闭的占位通道（首轮 recv
+    // 返回 None → steer_open=false，之后只等控制响应）。
+    let (placeholder_tx, placeholder_rx) = tokio::sync::mpsc::channel::<String>(1);
+    drop(placeholder_tx);
+    let mut steer_rx = steer.unwrap_or(placeholder_rx);
+    let stdin_writer = tokio::spawn(async move {
+        let Some(mut w) = stdin_w else {
+            // 无 stdin（非 control 通道）：消费两个通道防发送方永久阻塞。
+            return;
+        };
+        let mut steer_open = true;
+        loop {
+            let line: Option<String> = if steer_open {
+                tokio::select! {
+                    l = ctrl_rx.recv() => l,
+                    s = steer_rx.recv() => match s {
+                        Some(text) => Some(steer_user_message(&text)),
+                        // steer 发送端随轮次注册移除而 drop——后续只等控制响应。
+                        None => {
+                            steer_open = false;
+                            continue;
+                        }
+                    },
+                }
+            } else {
+                ctrl_rx.recv().await
+            };
+            match line {
+                Some(l) => {
+                    if w.write_all(l.as_bytes()).await.is_err() {
+                        break;
+                    }
+                    if w.flush().await.is_err() {
+                        break;
+                    }
+                }
+                // ctrl 关闭（读循环退出）→ drop stdin（EOF 语义）。
+                None => break,
+            }
+        }
+    });
 
     // B5：进程组 kill 守卫——run future 被 drop（dispatch 超时 / /stop）时对整个
     // 进程组 killpg(SIGKILL)，连孙进程（MCP server、Bash 工具）一并收割。正常
@@ -717,13 +778,9 @@ pub async fn spawn_cli_backend(
                                 })
                             )
                         };
-                        if let Some(w) = stdin_w.as_mut() {
-                            if let Err(e) = w.write_all(line.as_bytes()).await {
-                                tracing::warn!(target: "imagent::backend", error = %e,
-                                    "control_response 回写失败（claude 可能挂起或自行 deny）");
-                            }
-                            let _ = w.flush().await;
-                        }
+                        // 控制响应经专职写入 task 落 stdin（v1.17 重构：stdin 由
+                        // writer task 独占，读循环只投递）。
+                        let _ = ctrl_tx.send(line).await;
                     }
                     None => {
                         tracing::warn!(target: "imagent::backend", backend = backend_name,
@@ -837,7 +894,7 @@ pub async fn spawn_cli_backend(
                 CliEvent::Final {
                     text,
                     session,
-                    origin_kind: _,
+                    origin_kind,
                 } => {
                     if let Some(s) = session {
                         if session_id.is_empty() && !s.is_empty() {
@@ -845,7 +902,14 @@ pub async fn spawn_cli_backend(
                         }
                         session_id = s;
                     }
-                    final_text = text;
+                    // P0-1（v1.17 审计）：后台任务完成通知轮（origin.kind=
+                    // task-notification）的 result **不覆盖** final_text——该轮
+                    // 的续写内容已经由前面的 Text chunk 按 B9 语义追加进正文，
+                    // 整体覆盖会把主答案冲掉（裸通知文本成为最终回复）。主轮的
+                    // Final 保持权威整体覆盖语义（claude result 是该轮完整文本）。
+                    if origin_kind.as_deref() != Some("task-notification") {
+                        final_text = text;
+                    }
                     reached_terminal = true; // N8：标记由终止事件产出（非中间 Text 后 EOF）
                                              // 真机校准（2026-08-31）：活跃后台任务未清零时不终止——
                                              // CLI 会在同一 stdout 推送每个任务的完成通知轮。
@@ -927,7 +991,9 @@ pub async fn spawn_cli_backend(
     // stdin、进程应自然退出；5s 兜底后 kill。
     let status: std::result::Result<std::process::ExitStatus, std::io::Error> = if control.is_some()
     {
-        drop(stdin_w.take());
+        // 读循环退出：关 ctrl 通道 → stdin writer task 退出并 drop stdin（EOF）。
+        drop(ctrl_tx);
+        let _ = stdin_writer.await;
         match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
             Ok(res) => res,
             Err(_) => {
@@ -1188,9 +1254,10 @@ mod tests {
         cmd.arg("-c").arg("printf 'one\\ntwo\\n'");
         let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::types::AgentChunk>(64);
         let parse = |line: &str| CliEvent::Text(line.trim_end().to_string());
-        let outcome = spawn_cli_backend(cmd, parse, tx, "test-backend", &[], None, Vec::new())
-            .await
-            .expect("echo run 应成功");
+        let outcome =
+            spawn_cli_backend(cmd, parse, tx, "test-backend", &[], None, Vec::new(), None)
+                .await
+                .expect("echo run 应成功");
         assert_eq!(outcome.final_text, "one\n\ntwo");
         // 两个 Text chunk 均已推送。
         let mut texts = Vec::new();
@@ -1217,7 +1284,7 @@ mod tests {
                 CliEvent::Skip
             }
         };
-        let err = spawn_cli_backend(cmd, parse, tx, "test-backend", &[], None, Vec::new())
+        let err = spawn_cli_backend(cmd, parse, tx, "test-backend", &[], None, Vec::new(), None)
             .await
             .expect_err("无 final 文本应失败");
         assert!(
@@ -1290,9 +1357,10 @@ mod tests {
                 _ => CliEvent::Skip,
             }
         };
-        let outcome = spawn_cli_backend(cmd, parse, tx, "test-backend", &[], None, Vec::new())
-            .await
-            .expect("应成功收尾");
+        let outcome =
+            spawn_cli_backend(cmd, parse, tx, "test-backend", &[], None, Vec::new(), None)
+                .await
+                .expect("应成功收尾");
         assert_eq!(outcome.final_text, "ok");
         let mut snapshots = Vec::new();
         while let Ok(c) = rx.try_recv() {
@@ -1314,6 +1382,59 @@ mod tests {
                 .any(|i| i.text == "任务乙" && i.status == TodoStatus::InProgress)),
             "最终快照应为 TaskList 权威视图：{:?}",
             snapshots.last()
+        );
+    }
+
+    /// P0-1（v1.17 审计）：后台通知轮（origin.kind=task-notification）的 Final
+    /// 不得覆盖 final_text——主答案保留；通知轮内容经 Text chunk（B9 追加）
+    /// 已在正文里。旧代码无条件覆盖，裸通知文本成为最终回复。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bg_notification_final_does_not_overwrite_main_answer() {
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("printf 'BG_ON\\nMAIN\\nNOTIF_TEXT\\nNOTIF_FINAL\\nBG_OFF\\nLAST_FINAL\\n'");
+        let (tx, _rx) = tokio::sync::mpsc::channel::<crate::types::AgentChunk>(64);
+        let parse = |line: &str| match line.trim_end() {
+            "BG_ON" => CliEvent::BgTasksChanged { active: 1 },
+            "MAIN" => CliEvent::Final {
+                text: "主答案：两个任务已派出".into(),
+                session: None,
+                origin_kind: None,
+            },
+            "NOTIF_TEXT" => CliEvent::Text("任务1完成：共 42 个文件".into()),
+            "NOTIF_FINAL" => CliEvent::Final {
+                text: "任务1完成".into(),
+                session: None,
+                origin_kind: Some("task-notification".into()),
+            },
+            "BG_OFF" => CliEvent::BgTasksChanged { active: 0 },
+            "LAST_FINAL" => CliEvent::Final {
+                text: "任务2完成".into(),
+                session: None,
+                origin_kind: Some("task-notification".into()),
+            },
+            _ => CliEvent::Skip,
+        };
+        let outcome =
+            spawn_cli_backend(cmd, parse, tx, "test-backend", &[], None, Vec::new(), None)
+                .await
+                .expect("应等完通知后收尾");
+        // 主答案未被通知轮覆盖，通知轮的续写经 Text 追加保留。
+        assert!(
+            outcome.final_text.contains("主答案"),
+            "主答案必须保留: {:?}",
+            outcome.final_text
+        );
+        assert!(
+            outcome.final_text.contains("共 42 个文件"),
+            "通知续写应追加进正文: {:?}",
+            outcome.final_text
+        );
+        assert!(
+            !outcome.final_text.trim().eq("任务1完成"),
+            "不得只剩裸通知文本: {:?}",
+            outcome.final_text
         );
     }
 
@@ -1346,7 +1467,7 @@ mod tests {
             text: "旧任务".into(),
             status: TodoStatus::Pending,
         }];
-        let outcome = spawn_cli_backend(cmd, parse, tx, "test-backend", &[], None, seed)
+        let outcome = spawn_cli_backend(cmd, parse, tx, "test-backend", &[], None, seed, None)
             .await
             .expect("应成功收尾");
         assert_eq!(outcome.final_text, "ok");
@@ -1455,9 +1576,10 @@ mod tests {
             ]),
             _ => CliEvent::Skip,
         };
-        let outcome = spawn_cli_backend(cmd, parse, tx, "test-backend", &[], None, Vec::new())
-            .await
-            .expect("run 应成功");
+        let outcome =
+            spawn_cli_backend(cmd, parse, tx, "test-backend", &[], None, Vec::new(), None)
+                .await
+                .expect("run 应成功");
         let u = outcome.usage.expect("应累积出 usage");
         assert_eq!(u.input_tokens, 11);
         assert_eq!(u.output_tokens, 7);
@@ -1503,7 +1625,7 @@ mod tests {
         };
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(15),
-            spawn_cli_backend(cmd, parse, tx, "test-ctrl", &[], Some(io), Vec::new()),
+            spawn_cli_backend(cmd, parse, tx, "test-ctrl", &[], Some(io), Vec::new(), None),
         )
         .await;
         assert!(

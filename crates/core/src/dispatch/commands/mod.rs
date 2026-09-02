@@ -296,6 +296,10 @@ impl Dispatcher {
                         self.cmd_stop(&conv, &hint, &parts).await;
                         return;
                     }
+                    "/queue" => {
+                        self.cmd_queue(&conv, &sender.0, &hint, &parts).await;
+                        return;
+                    }
                     "/model" => {
                         self.cmd_model(&conv, &sender.0, &hint, &parts).await;
                         return;
@@ -305,6 +309,26 @@ impl Dispatcher {
                         return;
                     }
                     _ => {
+                        // 快捷命令（v1.17）：config `shortcuts` 把 /name 映射到
+                        // prompt 模板（`$args` = 命令剩余参数）——按普通 agent
+                        // 消息分派（完整鉴权/批处理/steering 路径）。未命中才
+                        // 走未知命令提示。
+                        let name = cmd.trim_start_matches('/');
+                        let template = self
+                            .shortcuts
+                            .read()
+                            .expect("shortcuts 读锁")
+                            .get(name)
+                            .cloned();
+                        if let Some(template) = template {
+                            let args = parts[1..].join(" ");
+                            let prompt = template.replace("$args", &args);
+                            let mut m = msg;
+                            m.text = Some(prompt);
+                            m.source_msg_id = None; // 快捷展开非原文，不锚表情
+                            self.dispatch_agent_message(m).await;
+                            return;
+                        }
                         // S-12：模糊匹配建议 + 分组竖排命令表（与 /help 分组同构）。
                         let text = unknown_command_reply(&cmd);
                         self.reply(&conv, &text, &hint).await;
@@ -344,12 +368,61 @@ impl Dispatcher {
     pub(super) async fn dispatch_agent_message(&self, msg: InboundMessage) {
         let conv = msg.conv_id.clone();
         let hint = msg.reply_hint.clone();
+        // W4-1 per-sender 成本上限（P0-3 v1.17：挪到入队闸门**逐消息**检查）。
+        // 原在轮首只查批次首 sender——超限用户把消息排进他人批次即可绕过，
+        // 且整轮花费错记到首 sender 头上。闸门覆盖所有入口（handle / /retry /
+        // 排队），语义：轮成本记到发起者（首位 sender）。
+        if let Some(limit) = self.sender_cost_limit {
+            let since = super::now_secs() - 86_400;
+            let spent = self
+                .store
+                .sender_cost_since(&msg.sender.0, since)
+                .await
+                .unwrap_or(0.0);
+            if spent >= limit {
+                warn!(
+                    target: "imagent::core",
+                    conv_id = %conv.0,
+                    sender = %msg.sender.0,
+                    spent,
+                    limit,
+                    "sender 成本上限命中，拒绝入队"
+                );
+                self.reply(
+                    &conv,
+                    &format!(
+                        "💰 你近 24 小时的用量已达上限（${spent:.2} / 上限 ${limit:.2}），本条未执行。\n窗口按时间滚动恢复，或请联系管理员调整 sender_daily_cost_limit_usd。"
+                    ),
+                    &hint,
+                )
+                .await;
+                return;
+            }
+        }
         if !self.enqueue_or_become_runner(&conv.0, msg, &hint).await {
             return;
         }
         let lock = self.acquire_conv_lock(&conv.0).await;
         let _guard = lock.lock().await;
         while let Some(batch) = self.take_batch_after_window(&conv.0).await {
+            // P0-4（v1.17）：起跑前停止标记检查——/stop 在批窗口/注册间隙设置，
+            // 命中（60s 内）则本批不启动（批已被取走消费，按中断语义丢弃）。
+            {
+                let mut sr = self.stop_requested.lock().await;
+                let hit = sr
+                    .remove(&conv.0)
+                    .is_some_and(|ts| super::now_secs() - ts <= 60);
+                if hit {
+                    drop(sr);
+                    self.reply(
+                        &conv,
+                        "⏹️ 已中断：轮次在启动前被 /stop 拦下（本批消息未执行）",
+                        &hint,
+                    )
+                    .await;
+                    break;
+                }
+            }
             // 表情锚（全部批次消息的平台 id，首条=轮次触发）：排队⏳的消息随批
             // 翻 OnIt→终态；非 om_（合成消息）过滤。
             let react_mids: Vec<String> = batch

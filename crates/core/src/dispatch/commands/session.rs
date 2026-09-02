@@ -68,7 +68,7 @@ impl Dispatcher {
                 };
                 // 摘要缺省回退 id 前缀（历史行无首条消息）。
                 let desc = if e.first_prompt.is_empty() {
-                    format!("{}…", &e.session_id[..e.session_id.len().min(16)])
+                    format!("{}…", e.session_id.chars().take(16).collect::<String>())
                 } else {
                     e.first_prompt.clone()
                 };
@@ -212,7 +212,8 @@ impl Dispatcher {
         }
         // 回到未命名（与命名 session 的绑定解耦，同 /switch 语义）。
         let _ = self.store.delete_config(&active_name_key(&conv.0)).await;
-        let sid_short = &target.session_id[..target.session_id.len().min(16)];
+        // P0-7：chars 截断——字节切片遇多字节 id 边界 panic。
+        let sid_short = target.session_id.chars().take(16).collect::<String>();
         let fork_note = if target.from_local {
             "\n⚠️ 该会话来自电脑端：续接将从此处分叉（不是同步）；若终端仍开着请先退出。"
         } else {
@@ -476,8 +477,13 @@ impl Dispatcher {
                         &workdir,
                         &tools,
                         tx,
-                        // /compact 是系统发起的维护轮，不播种任务面板。
+                        // /compact 是系统发起的维护轮，不播种任务面板、无转向。
                         &[],
+                        {
+                            let (s, r) = mpsc::channel(1);
+                            drop(s);
+                            r
+                        },
                     )
                     .await;
             }
@@ -491,6 +497,11 @@ impl Dispatcher {
                     &tools,
                     tx,
                     &[],
+                    {
+                        let (s, r) = mpsc::channel(1);
+                        drop(s);
+                        r
+                    },
                 ),
             )
             .await
@@ -507,11 +518,14 @@ impl Dispatcher {
         });
         // P5-16：注册进 running——/stop 此前中断不了 /compact
         //（长摘要生成只能干等 agent_timeout）。conv 锁由调用方
-        // 持有，注册/移除无 ABA（新轮次须先等锁）。
-        self.running
-            .lock()
-            .await
-            .insert(conv.0.clone(), join.abort_handle());
+        // 持有，注册/移除无 ABA（新轮次须先等锁）。/compact 无转向。
+        self.running.lock().await.insert(
+            conv.0.clone(),
+            RoundHandle {
+                abort: join.abort_handle(),
+                steer: None,
+            },
+        );
         let mut summary: Option<String> = None;
         while let Some(chunk) = rx.recv().await {
             if let AgentChunk::Final(t) = chunk {
@@ -590,9 +604,19 @@ impl Dispatcher {
         // D6：去掉前置 has_pending（与 cancel_all 两步锁间隙可能被 route 击穿），
         // 直接 cancel_all 并按其返回的被清列表判断是否需要收敛询问卡。
         let cleared = self.router.cancel_all(&conv.0).await;
-        // D-记忆：中断即收回「始终允许」授权——/stop 语义是全停，旧授权不应
-        // 在下一次任务继续生效。
-        self.router.clear_session_allows(&conv.0).await;
+        // D-记忆 / P0-6（v1.17）：缺省 /stop 是「中断 + 排队自动续跑」（W1-1
+        // steering 语义）——续跑轮常是同一任务的继续，收回「始终允许」会让它
+        // 重复弹审批。仅 `/stop all`（硬停、丢队列）时收回授权。
+        let hard_early = matches!(
+            parts
+                .get(1)
+                .map(|s| s.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("all") | Some("全部")
+        );
+        if hard_early {
+            self.router.clear_session_allows(&conv.0).await;
+        }
         if !cleared.is_empty() {
             // P5-16：收敛审批询问本身——把 IM 里滞留的询问卡片 patch 成
             // 「已中断」（纯文本询问平台 no-op）。best-effort。多 pending 并存
@@ -605,15 +629,26 @@ impl Dispatcher {
         let aborted = if let Some(h) = &running {
             // abort → backend.run future drop → 杀子进程：
             // CLI 后端 kill_on_drop；ACP 后端 cancel 分支 → 杀连接。
-            h.abort();
+            h.abort.abort();
             true
         } else {
+            // P0-4（v1.17）：批窗口等待 / take_batch→running.insert 注册间隙
+            //（typing、store 查询、转录推导等多段 await）内查无在飞句柄。
+            // runner 持 conv 锁贯穿整个循环——try_lock 失败 ⇒ runner 活着但
+            // 轮未注册：设停止标记，runner 循环在起跑前拦截本批。
+            let lock = self.acquire_conv_lock(&conv.0).await;
+            if lock.try_lock().is_err() {
+                self.stop_requested
+                    .lock()
+                    .await
+                    .insert(conv.0.clone(), super::now_secs());
+            }
             false
         };
         // W1-1：缺省保留排队（runner 自动续跑 = steering）；`/stop all` 清空排队
         // + 排队状态（P10 hint）——硬停语义。S-4（原子）：清空与 hint 清理在
         // 同一 queues 临界区。
-        let hard = matches!(parts.get(1).map(|s| s.trim()), Some("all") | Some("全部"));
+        let hard = hard_early;
         let queued = if hard {
             let mut map = self.queues.lock().await;
             let n = map.remove(&conv.0).map(|q| q.len()).unwrap_or(0);

@@ -184,6 +184,9 @@ struct MockBackend {
     tools_to_emit: Arc<TokioMutex<Vec<(String, String)>>>,
     /// run 直接返 Err（P1-7 失败路径测试用）。
     fail: bool,
+    /// steering（v1.17）：supports_steering 返回值 + 注入文本捕获。
+    steerable: bool,
+    steer_seen: Arc<TokioMutex<Vec<String>>>,
     /// 本次 run 构造的 RunOutcome.terminal 值（默认 true = 正常终止）。
     terminal: bool,
     /// run 记录后先 sleep 该时长（P4 /stop、批处理、空闲看门狗测试用）。
@@ -215,6 +218,8 @@ impl MockBackend {
             order: order.clone(),
             tools_to_emit: Arc::new(TokioMutex::new(Vec::new())),
             fail: false,
+            steerable: false,
+            steer_seen: Arc::new(TokioMutex::new(Vec::new())),
             terminal: true,
             slow_ms: 0,
             announce_session: None,
@@ -307,7 +312,20 @@ impl Backend for MockBackend {
         _allowed_tools: &[String],
         chunks: mpsc::Sender<AgentChunk>,
         _initial_todos: &[crate::types::TodoItem],
+        steer: mpsc::Receiver<String>,
     ) -> Result<crate::types::RunOutcome> {
+        // P0-5 测试：prompt 记录先于 fail 判断（失败轮也要捕获收到的 prompt）。
+        self.prompts.lock().await.push(prompt.to_string());
+        // steering（v1.17）：drain 转向通道并记录（sender drop 即结束）。
+        {
+            let seen = self.steer_seen.clone();
+            let mut steer = steer;
+            tokio::spawn(async move {
+                while let Some(t) = steer.recv().await {
+                    seen.lock().await.push(t);
+                }
+            });
+        }
         // P1-7 测试：fail 模式直接返 Err，触发 handle 失败路径。
         if self.fail {
             return Err(crate::error::CoreError::Backend(
@@ -315,10 +333,9 @@ impl Backend for MockBackend {
                 "mock failure (fail=true)".into(),
             ));
         }
-        // 记录续接情况 + 执行顺序 + 收到的 prompt。
+        // 记录续接情况 + 执行顺序。
         let my_order = self.order.fetch_add(1, Ordering::SeqCst);
         self.calls.lock().await.push(session.map(|s| s.0.clone()));
-        self.prompts.lock().await.push(prompt.to_string());
 
         // P5-5：开跑即 announce（模拟 CLI 首事件带 session id）。
         if let Some(sid) = &self.announce_session {
@@ -381,6 +398,10 @@ impl Backend for MockBackend {
     }
     fn name(&self) -> &'static str {
         "mock-backend"
+    }
+
+    fn supports_steering(&self) -> bool {
+        self.steerable
     }
     async fn list_local_sessions(&self, _workdir: &std::path::Path) -> Vec<LocalSession> {
         self.local_sessions.lock().await.clone()
@@ -2051,6 +2072,223 @@ async fn stop_preserves_queued_messages_and_continues() {
     drop_db(ctx.db).await;
 }
 
+/// P0-5（v1.17）：/queue 列表展示 + 选择性丢弃（自己的可删、他人的需 admin）。
+#[tokio::test]
+async fn queue_list_and_selective_drop() {
+    let _serial = SERIAL.lock().await;
+    // 显式 admin 列表（仅 bob）——alice 非 admin 才能测「他人消息拒删」。
+    let _ = std::fs::create_dir_all("/tmp/imagent-test-ws");
+    let (plat, inbox, send_count) = MockPlatform::new();
+    let (back, calls, prompts, order) = MockBackend::new_slow(300);
+    let (store, db) = tmp_store().await;
+    let auth = Auth::new(vec!["alice".into(), "bob".into()]);
+    let disp = Arc::new(Dispatcher::new(
+        Arc::new(plat),
+        Arc::new(back),
+        store,
+        auth,
+        std::path::PathBuf::from("/tmp/imagent-test-ws"),
+        vec!["Read".into()],
+        PermissionMode::Off,
+        TaskBudgets {
+            batch_window: Duration::from_millis(1),
+            ..test_budgets()
+        },
+        CotDetail::Brief,
+        vec!["bob".into()],
+    ));
+    let ctx = Ctx {
+        disp,
+        inbox,
+        send_count,
+        calls,
+        prompts,
+        order,
+        db: db.clone(),
+    };
+    let disp = ctx.disp.clone();
+    let runner = tokio::spawn(async move {
+        disp.handle(msg("c1", "alice", "round A")).await;
+    });
+    assert!(wait_registered(&ctx, "c1").await, "在飞任务应已注册");
+    ctx.disp.handle(msg("c1", "bob", "bob 的补充")).await;
+    ctx.disp.handle(msg("c1", "alice", "alice 的补充")).await;
+    for _ in 0..400 {
+        if ctx
+            .disp
+            .queues
+            .lock()
+            .await
+            .get("c1")
+            .is_some_and(|q| q.len() == 2)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // 列表：两条带发送者与摘要。
+    ctx.disp.handle(msg("c1", "alice", "/queue")).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox
+            .iter()
+            .any(|t| t.contains("【bob】bob 的补充") && t.contains("【alice】alice 的补充")),
+        "列表应含发送者与摘要: {inbox:?}"
+    );
+    // alice（非 admin）不能删 bob 的（第 1 条）。
+    ctx.disp.handle(msg("c1", "alice", "/queue drop 1")).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.iter().any(|t| t.contains("只能丢弃自己排队的消息")),
+        "他人消息应拒删: {inbox:?}"
+    );
+    // 删自己的（第 2 条）成功，剩 bob 的一条。
+    ctx.disp.handle(msg("c1", "alice", "/queue drop 2")).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.iter().any(|t| t.contains("已丢弃第 2 条")),
+        "删除回执: {inbox:?}"
+    );
+    let q = ctx.disp.queues.lock().await;
+    let q = q.get("c1").expect("entry 保留");
+    assert_eq!(q.len(), 1, "应剩 bob 的一条");
+    assert_eq!(q[0].sender.0, "bob");
+    drop_db(ctx.db).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), runner).await;
+}
+
+/// 快捷命令（v1.17）：config.shortcuts 的 /name → prompt 展开（$args 替换），
+/// 走完整 agent 分派路径；未命中的斜杠词仍回未知命令提示。
+#[tokio::test]
+async fn shortcut_expands_to_prompt() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    let mut shortcuts = std::collections::HashMap::new();
+    shortcuts.insert(
+        "deploy".into(),
+        "跑 ./scripts/deploy.sh 并汇报结果 $args".into(),
+    );
+    ctx.disp.set_shortcuts(shortcuts);
+    ctx.disp
+        .handle(msg("c1", "alice", "/deploy --dry-run"))
+        .await;
+    let prompts = ctx.prompts.lock().await.clone();
+    assert_eq!(
+        prompts,
+        vec!["跑 ./scripts/deploy.sh 并汇报结果 --dry-run".to_string()],
+        "快捷命令应展开为 prompt: {prompts:?}"
+    );
+    // 未命中 → 未知命令提示（不进 agent）。
+    ctx.disp.handle(msg("c1", "alice", "/nosuch")).await;
+    let prompts = ctx.prompts.lock().await.clone();
+    assert_eq!(prompts.len(), 1, "未知命令不应进 agent");
+    drop_db(ctx.db).await;
+}
+
+/// steering（v1.17）：运行中到达的文本消息经 steer 通道注入当轮（不排队、
+/// 不再起第二轮）；实验校准 CLI 在下个工具边界交付。不支持转向的后端回落排队
+///（supports_steering=false 时 running 句柄 steer=None）。
+#[tokio::test]
+async fn steering_injects_midround_text() {
+    let _serial = SERIAL.lock().await;
+    let _ = std::fs::create_dir_all("/tmp/imagent-test-ws");
+    let (plat, inbox, send_count) = MockPlatform::new();
+    let (mut back, calls, prompts, order) = MockBackend::new_slow(400);
+    back.steerable = true;
+    let steer_seen = back.steer_seen.clone();
+    let (store, db) = tmp_store().await;
+    let auth = Auth::new(vec!["alice".into()]);
+    let admins = auth.snapshot();
+    let disp = Arc::new(Dispatcher::new(
+        Arc::new(plat),
+        Arc::new(back),
+        store,
+        auth,
+        std::path::PathBuf::from("/tmp/imagent-test-ws"),
+        vec!["Read".into()],
+        PermissionMode::Off,
+        TaskBudgets {
+            batch_window: Duration::from_millis(1),
+            ..test_budgets()
+        },
+        CotDetail::Brief,
+        admins,
+    ));
+    let ctx = Ctx {
+        disp: disp.clone(),
+        inbox,
+        send_count,
+        calls,
+        prompts: prompts.clone(),
+        order,
+        db: db.clone(),
+    };
+    let d = disp.clone();
+    let runner = tokio::spawn(async move {
+        d.handle(msg("c1", "alice", "round A")).await;
+    });
+    assert!(wait_registered(&ctx, "c1").await, "在飞任务应已注册");
+    // 两条运行中消息 → 注入当轮（不排队）。
+    ctx.disp.handle(msg("c1", "alice", "中途补充")).await;
+    ctx.disp.handle(msg("c1", "alice", "再补充")).await;
+    for _ in 0..400 {
+        if steer_seen.lock().await.len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        steer_seen.lock().await.clone(),
+        vec!["中途补充".to_string(), "再补充".to_string()],
+        "两条都应注入"
+    );
+    assert!(
+        ctx.disp
+            .queues
+            .lock()
+            .await
+            .get("c1")
+            .is_none_or(|q| q.is_empty()),
+        "注入的消息不进队列"
+    );
+    let done = tokio::time::timeout(Duration::from_secs(5), runner).await;
+    assert!(done.is_ok(), "runner 应结束");
+    // 只跑了初始一轮（注入不产生新轮次）。
+    assert_eq!(prompts.lock().await.clone(), vec!["round A".to_string()]);
+    drop_db(ctx.db).await;
+}
+
+/// steering（v1.17）：不支持转向的后端（缺省）——运行中消息回落排队，
+/// 轮结束后合并为下一轮（旧行为保持）。
+#[tokio::test]
+async fn steering_unsupported_falls_back_to_queue() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build_slow(
+        Auth::new(vec!["alice".into()]),
+        200,
+        TaskBudgets {
+            batch_window: Duration::from_millis(1),
+            ..test_budgets()
+        },
+    )
+    .await;
+    let disp = ctx.disp.clone();
+    let runner = tokio::spawn(async move {
+        disp.handle(msg("c1", "alice", "round A")).await;
+    });
+    assert!(wait_registered(&ctx, "c1").await);
+    ctx.disp.handle(msg("c1", "alice", "运行中补充")).await;
+    let done = tokio::time::timeout(Duration::from_secs(5), runner).await;
+    assert!(done.is_ok());
+    let prompts = ctx.prompts.lock().await.clone();
+    assert_eq!(
+        prompts,
+        vec!["round A".to_string(), "运行中补充".to_string()],
+        "不支持转向时应排队合并进下一轮"
+    );
+    drop_db(ctx.db).await;
+}
+
 /// P4-2：运行中到达的消息排队到下一轮，且合并为一轮（B、C 合成 "B\n\nC"）。
 #[tokio::test]
 async fn messages_during_run_merge_into_next_round() {
@@ -3710,24 +3948,64 @@ async fn sender_cost_limit_rejects_when_exceeded() {
     drop_db(ctx.db).await;
 }
 
-/// W3-3：/retry 重发本会话最近一轮的用户 prompt（走完整 runner 路径）；
-/// 无历史时回可行动提示。
+/// W3-3 + P0-5（v1.17）：/retry 重发**最近失败轮**的 prompt（成功轮不落库、
+/// 不覆盖——失败卡按钮永远指向失败那轮）；无历史时回可行动提示。
 #[tokio::test]
 async fn retry_reruns_last_prompt() {
     let _serial = SERIAL.lock().await;
-    let ctx = build(Auth::new(vec!["alice".into()])).await;
-    // 先跑一轮真实任务（prompt 落 last_prompts）。
-    ctx.disp.handle(msg("c1", "alice", "第一轮任务")).await;
-    assert_eq!(ctx.prompts.lock().await.len(), 1);
-    // /retry → 同一 prompt 再跑一轮。
-    ctx.disp.handle(msg("c1", "alice", "/retry")).await;
-    let prompts = ctx.prompts.lock().await.clone();
-    assert_eq!(
-        prompts,
-        vec!["第一轮任务".to_string(), "第一轮任务".to_string()],
-        "/retry 应重发最近 prompt: {prompts:?}"
-    );
-    drop_db(ctx.db).await;
+    // 失败轮：prompt 落库（store config），/retry 走完整 runner 路径重发。
+    {
+        let _ = std::fs::create_dir_all("/tmp/imagent-test-ws");
+        let (plat, inbox, send_count) = MockPlatform::new();
+        let (back, calls, prompts, order) = MockBackend::new_failing();
+        let (store, db) = tmp_store().await;
+        let auth = Auth::new(vec!["alice".into()]);
+        let disp = Arc::new(Dispatcher::new(
+            Arc::new(plat),
+            Arc::new(back),
+            store,
+            auth.clone(),
+            std::path::PathBuf::from("/tmp/imagent-test-ws"),
+            vec!["Read".into()],
+            PermissionMode::Off,
+            test_budgets(),
+            CotDetail::Brief,
+            auth.snapshot(),
+        ));
+        let ctx = Ctx {
+            disp,
+            inbox,
+            send_count,
+            calls,
+            prompts,
+            order,
+            db: db.clone(),
+        };
+        ctx.disp.handle(msg("c1", "alice", "第一轮任务")).await;
+        assert_eq!(ctx.prompts.lock().await.len(), 1);
+        ctx.disp.handle(msg("c1", "alice", "/retry")).await;
+        let prompts = ctx.prompts.lock().await.clone();
+        assert_eq!(
+            prompts,
+            vec!["第一轮任务".to_string(), "第一轮任务".to_string()],
+            "/retry 应重发失败轮 prompt: {prompts:?}"
+        );
+        drop_db(ctx.db).await;
+    }
+
+    // 成功轮之后直接 /retry：无可重试（成功不落库）→ 提示。
+    {
+        let ctx = build(Auth::new(vec!["alice".into()])).await;
+        ctx.disp.handle(msg("c1", "alice", "成功任务")).await;
+        assert_eq!(ctx.prompts.lock().await.len(), 1);
+        ctx.disp.handle(msg("c1", "alice", "/retry")).await;
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(
+            inbox.iter().any(|t| t.contains("没有可重试")),
+            "成功轮后 /retry 应提示: {inbox:?}"
+        );
+        drop_db(ctx.db).await;
+    }
 
     // 无历史（新会话直接 /retry）→ 提示而非静默。
     let ctx = build(Auth::new(vec!["alice".into()])).await;
