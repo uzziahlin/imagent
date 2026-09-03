@@ -850,9 +850,13 @@ impl Dispatcher {
         }
         // conv 锁由 runner 循环持有并统一释放；在飞注册由 run_agent_round 统一移除。
         // W2-5：成功轮次返回上下文水位（runner 循环据此触发自动 compact）。
-        // 上下文水位可视化（v1.17）：usage.input_tokens ≈ 上一轮上下文规模，
-        // 落 per-conv KV（/status 展示与自动压缩阈值的距离）。失败仅 log。
-        if let Some(tokens) = outcome.usage.as_ref().map(|u| u.input_tokens) {
+        // 上下文水位可视化（v1.17）：input + cached（cache_read）≈ 上一轮完整
+        // 上下文规模——缓存命中时 input_tokens 只含非缓存部分（真机 2026-09-03：
+        // 长 resume 会话仅 182），不含 cached 会严重低估，/status 展示与自动
+        // 压缩阈值距离双双失真。落 per-conv KV，失败仅 log。
+        let ctx_tokens =
+            |u: &crate::types::UsageStats| u.input_tokens + u.cached_tokens.unwrap_or(0);
+        if let Some(tokens) = outcome.usage.as_ref().map(ctx_tokens) {
             if let Err(e) = self
                 .store
                 .set_config(&format!("ctx_watermark:{}", conv.0), &tokens.to_string())
@@ -861,7 +865,7 @@ impl Dispatcher {
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "上下文水位落库失败（不影响轮次）");
             }
         }
-        outcome.usage.as_ref().map(|u| u.input_tokens)
+        outcome.usage.as_ref().map(ctx_tokens)
     }
 
     /// P0-5（v1.17）：失败路径把可重试 prompt 落库（store config 表）——重启
