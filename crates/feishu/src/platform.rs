@@ -563,8 +563,9 @@ impl FeishuPlatform {
                 // 审批按钮另做**发起者校验**（群 conv 下点击者须为登记的发起者，
                 // 私聊单人免检）。
                 // v1.17.3 诊断：真机 2026-09-03 自由输入值未随 form_value 到达
-                //（select 键都在、_free 键缺失）——debug 级记原始回调载荷，形态
-                // 校准后可移除。
+                //（根因是回调侧题号收集漏 _free 键，已修）。形态已用真机载荷
+                // 校准（free=字符串、未填回空串、未选 select 键缺席）；debug 级
+                // 原始载荷日志留作卡片回调排障。
                 debug!(
                     target: "feishu",
                     payload = %String::from_utf8_lossy(&payload),

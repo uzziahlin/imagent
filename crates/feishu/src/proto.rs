@@ -398,19 +398,11 @@ pub fn parse_card_action_event(payload: &[u8]) -> Option<(String, InboundMessage
             idxes.dedup();
             for i in idxes {
                 // 自由输入非空则优先于选项（对齐 CLI 原生自定义回答；原文进入
-                // 用户选择消息，agent 自行对应到题）。值形态容错（字符串/数组/
-                // 对象 {text|value}）——文档口径为字符串，真机原始载荷见
-                // platform.rs 的 card.action debug 日志，形态校准后收紧。
+                // 用户选择消息，agent 自行对应到题）。形态已校准（2026-09-03
+                // 真机载荷）：值为字符串，未填回空串——空串忽略即回落选项。
                 let free = obj
                     .get(&format!("ask_opt_{i}_free"))
-                    .and_then(|v| {
-                        field_joined(v).or_else(|| {
-                            v.get("text")
-                                .or_else(|| v.get("value"))
-                                .and_then(|x| x.as_str())
-                                .map(String::from)
-                        })
-                    })
+                    .and_then(field_joined)
                     .map(|s| s.trim().to_string())
                     .filter(|t| !t.is_empty());
                 if let Some(f) = free {
@@ -2415,23 +2407,23 @@ mod tests {
             "free-only 题不因选项键缺席而漏: {:?}",
             fonly.text
         );
-        // free 值对象形态容错（{text|value}，形态未证实前的防御）。
-        let (_, fobj, _) = parse_card_action_event(&mk(serde_json::json!({
-            "ask_opt_0_free": {"text": "对象形态的说明"}
+        // 真机载荷原样固化（2026-09-03 校准）：未填的 free 回空串、未选的
+        // select 键整体缺席——空串忽略回落选项，题号两类键并集保证不漏题。
+        let (_, real, _) = parse_card_action_event(&mk(serde_json::json!({
+            "ask_opt_0_free": "我需要发布到开发环境",
+            "ask_opt_1": "是否备份=执行备份",
+            "ask_opt_1_free": "",
+            "ask_opt_2_free": "通知给对应用户",
+            "ask_opt_3": "执行时机=等待窗口期",
+            "ask_opt_3_free": ""
         })))
-        .expect("对象形态 free 应回调");
+        .expect("真机形态应回调");
         assert_eq!(
-            fobj.text.as_deref(),
-            Some("ask:对象形态的说明"),
-            "对象形态 {{text}} 提取: {:?}",
-            fobj.text
-        );
-        let (_, fval, _) = parse_card_action_event(&mk(serde_json::json!({
-            "ask_opt_0_free": {"value": "value 字段形态"}
-        })))
-        .expect("value 形态 free 应回调");
-        assert_eq!(fval.text.as_deref(), Some("ask:value 字段形态"));
-        // 空数组 / 缺字段 → 丢弃。
+            real.text.as_deref(),
+            Some("ask:我需要发布到开发环境；是否备份=执行备份；通知给对应用户；执行时机=等待窗口期"),
+            "真机载荷回放: {:?}",
+            real.text
+        );        // 空数组 / 缺字段 → 丢弃。
         assert!(parse_card_action_event(&mk(serde_json::json!({"ask_opt": []}))).is_none());
         assert!(parse_card_action_event(&mk(serde_json::json!({}))).is_none());
     }
