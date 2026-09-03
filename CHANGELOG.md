@@ -2,6 +2,31 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.17.2] — 2026-09-03
+
+> **AUQ 自由输入（对齐 CLI 自定义回答）+ steering 时代口径修正 + 上下文水位
+> 修复**。真机三轮验证（四问混合表单 / 运行中转向被动复验 / 快捷命令展开）。
+
+### Added
+- **AskUserQuestion 每题自由输入框**：多题单卡的每题下拉/多选下附输入框
+  （CardKit 2.0 input，name=`ask_opt_{i}_free`），填写则**优先于**选项、原文
+  进入用户选择消息（对齐 CLI 原生自定义回答）。真机载荷校准三点：free 值为
+  普通字符串、未填回空串、未选的 select 键整体缺席。
+- **card.action.trigger 原始载荷 debug 日志**：卡片回调排障入口（形态已用
+  真机载荷校准，debug 级零生产成本）。
+
+### Fixed
+- **AUQ 自由输入整题漏传**：回调侧题号只从选项键收集，用户**只用自由输入**
+  作答的题（选项键缺席 form_value）整题被跳过——真机四问混合测试只回传两
+  题。修复：题号从 `ask_opt_{i}` 与 `ask_opt_{i}_free` 两类键并集收集，仅有
+  free 的题照样入列；真机载荷原样固化为回归用例。
+- **上下文水位严重低估**：CLI 的 `usage.input_tokens` 缓存命中时只计非缓存
+  部分（真机：多轮 resume 会话仅 182 tok）——水位改为 `input + cache_read`，
+  /status 展示与 W2-5 自动压缩阈值距离双双恢复准确。
+- **转向与排队回执同打 ⏳ 无法区分**：steering 注入消息回执改 👀（处理中），
+  真排队才 ⏳；/help 尾注同步 steering 时代口径（文字实时转入当轮、媒体走
+  排队）。
+
 ## [1.17.1] — 2026-09-02
 
 ### Fixed
