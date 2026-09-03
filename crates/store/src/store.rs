@@ -1320,6 +1320,100 @@ impl Store {
         .await
     }
 
+    // —— 排队消息持久化（v1.18 迭代，schema v12）——
+    // 入队追加一行（payload = InboundMessage JSON）；取批/清队按 conv 删行；
+    // 队列内容变更（撤回/drop）用 replace 整体重写；启动 load 全量重放。
+    // 语义窗口：内存 take 与 DB 删行非原子，崩溃在两步之间会重放一次已取批
+    // （at-least-once，窗口毫秒级；崩溃丢消息的旧行为更差）。
+
+    pub async fn persist_queued_msg(
+        &self,
+        conv_id: &str,
+        source_msg_id: Option<&str>,
+        payload: &str,
+    ) -> Result<()> {
+        let inner = self.inner.clone();
+        let conv = conv_id.to_string();
+        let mid = source_msg_id.map(str::to_string);
+        let payload = payload.to_string();
+        blocking_with(inner, move |conn| {
+            conn.execute(
+                "INSERT INTO queued_messages (conv_id, source_msg_id, payload, created_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![conv, mid, payload, now_secs()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn clear_queued(&self, conv_id: &str) -> Result<()> {
+        let inner = self.inner.clone();
+        let conv = conv_id.to_string();
+        blocking_with(inner, move |conn| {
+            conn.execute(
+                "DELETE FROM queued_messages WHERE conv_id = ?1",
+                rusqlite::params![conv],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// 队列内容变更后整体重写（撤回/drop）：单事务删旧插新，保 rowid 顺序。
+    pub async fn replace_queued(
+        &self,
+        conv_id: &str,
+        items: &[(Option<String>, String)],
+    ) -> Result<()> {
+        let inner = self.inner.clone();
+        let conv = conv_id.to_string();
+        let items: Vec<(Option<String>, String)> = items.to_vec();
+        blocking_with(inner, move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "DELETE FROM queued_messages WHERE conv_id = ?1",
+                rusqlite::params![conv],
+            )?;
+            for (mid, payload) in &items {
+                tx.execute(
+                    "INSERT INTO queued_messages (conv_id, source_msg_id, payload, created_at) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![conv, mid, payload, now_secs()],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// 重放启动时清空整表（load 之后、handle 之前调用——重放消息重走 enqueue
+    /// 会写新行，旧行必须先清防双份）。
+    pub async fn clear_queued_all(&self) -> Result<()> {
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            conn.execute("DELETE FROM queued_messages", [])?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// 启动重放：全部持久化排队消息（按 rowid 序）。调用方经 handle() 重走
+    /// 完整鉴权/去重/入队管线。
+    pub async fn load_queued_all(&self) -> Result<Vec<(String, String)>> {
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let mut stmt =
+                conn.prepare("SELECT conv_id, payload FROM queued_messages ORDER BY id")?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
     /// 到期任务（enabled 且 next_run <= now）——调度器每个 tick 拉取。
     pub async fn due_cron_jobs(&self, now: i64) -> Result<Vec<CronJobRow>> {
         let inner = self.inner.clone();
@@ -1895,6 +1989,26 @@ mod tests {
         assert_eq!(due[0].id, "abc123");
         // list 只列 enabled。
         store.set_cron_enabled("abc123", false).await.unwrap();
+        // v1.18 迭代：排队消息持久化往返——入队两条、replace 剩一条、清表。
+        store
+            .persist_queued_msg("c1", Some("om_1"), r#"{"text":"a"}"#)
+            .await
+            .unwrap();
+        store
+            .persist_queued_msg("c1", Some("om_2"), r#"{"text":"b"}"#)
+            .await
+            .unwrap();
+        let rows = store.load_queued_all().await.unwrap();
+        assert_eq!(rows.len(), 2, "两条排队行");
+        store
+            .replace_queued("c1", &[(Some("om_2".into()), r#"{"text":"b"}"#.into())])
+            .await
+            .unwrap();
+        let rows = store.load_queued_all().await.unwrap();
+        assert_eq!(rows.len(), 1, "replace 后一条");
+        assert_eq!(rows[0].1, r#"{"text":"b"}"#);
+        store.clear_queued("c1").await.unwrap();
+        assert!(store.load_queued_all().await.unwrap().is_empty());
         assert!(store.list_cron_jobs().await.unwrap().is_empty());
         store.set_cron_enabled("abc123", true).await.unwrap();
         // bump 重排 + 单查 + 删除。

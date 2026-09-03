@@ -562,10 +562,11 @@ impl Dispatcher {
             }
             _ => match arg.parse::<u64>() {
                 Ok(n) if n > 0 => {
-                    // L5（code-review v8）：checked_mul 防整型溢出（debug panic /
-                    // release 回绕自 DoS）+ 30 天上限（43200 分钟）防误设永关。
+                    // L5（code-review v8）：30 天上限（43200 分钟）防误设永关。
+                    //（v9-R14：原 checked_mul(1) 为乘 1 no-op、注释宣称防溢出
+                    // 误导——n 由 u64 parse 直接而来无运算，上限过滤即全部防护。）
                     const TIMEOUT_MAX_MINUTES: u64 = 30 * 24 * 60;
-                    let Some(n) = n.checked_mul(1).filter(|n| *n <= TIMEOUT_MAX_MINUTES) else {
+                    let Some(n) = Some(n).filter(|n| *n <= TIMEOUT_MAX_MINUTES) else {
                         self.reply(
                             conv,
                             &format!("❌ 分钟数需 ≤ {TIMEOUT_MAX_MINUTES}（30 天）"),
@@ -870,6 +871,15 @@ impl Dispatcher {
                     return;
                 }
                 let removed = q.remove(idx);
+                // v1.18 迭代（排队持久化）：drop 后锁外重写整队（含空队=清行）。
+                let persist_items: Vec<(Option<String>, String)> = q
+                    .iter()
+                    .filter_map(|m| {
+                        serde_json::to_string(m)
+                            .ok()
+                            .map(|j| (m.source_msg_id.clone(), j))
+                    })
+                    .collect();
                 let count = q.len();
                 if count == 0 {
                     // 与取批路径同语义：留空 Vec 不删 entry（runner 循环依赖）。
@@ -892,6 +902,9 @@ impl Dispatcher {
                         });
                 }
                 drop(map);
+                if let Err(e) = self.store.replace_queued(&conv.0, &persist_items).await {
+                    warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "丢弃后持久化排队重写失败");
+                }
                 let snippet = removed
                     .text
                     .as_deref()

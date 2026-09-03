@@ -40,15 +40,57 @@ fn cap_md_bytes(md: &str, head_b: usize, tail_b: usize) -> String {
         j
     };
     let omitted = md.len() - head_end - (md.len() - tail_start);
+    // R2（code-review v9）：不再承诺「完整内容见文本消息」——补发与否在 core
+    // 侧按正文长度决定（CARD_TEXT_FULL_THRESHOLD），此处无从得知；8KB-30KB
+    // 区间曾出现「卡上承诺、文本没来」的虚假契约。标注只陈述截断事实，
+    // 超阈正文由 core 主动补发全文文本（阈值已对齐卡上限之下）。
     format!(
-        "{}\n\n…（已截断中段 {omitted} 字节，完整内容见文本消息）…\n\n{}",
+        "{}\n\n…（已截断中段 {omitted} 字节）…\n\n{}",
         &md[..head_end],
         &md[tail_start..]
     )
 }
 
 fn escape_lt(text: &str) -> String {
-    text.replace('<', "\\<")
+    // R13（code-review v9）：围栏代码块内的 `<` 不转义——CommonMark 代码块
+    // 不处理反斜杠转义，此前全串替换把 `a < b` 显示成 `a \< b`。逐行跟踪
+    // ``` / ~~~ 围栏开闭，仅块外转义；行内 code span 同理不转义（见
+    // escape_lt_inline）。
+    let mut out = String::with_capacity(text.len());
+    let mut in_fence = false;
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            out.push_str(line);
+        } else if in_fence {
+            out.push_str(line);
+        } else {
+            out.push_str(&escape_lt_inline(line));
+        }
+    }
+    out
+}
+
+/// 行内 code span（`…`）内的 `<` 不转义（同 R13）：按反引号切分，奇数索引
+/// 段是 span 内容原样保留。未配对反引号/跨行 span 的边界误差可接受——
+/// 展示层少转义优于显示破坏（JSON 结构注入已由 serde 层封死，此处只防
+/// `<at>` 语义注入，代码片段里没有该形态）。
+fn escape_lt_inline(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    for (i, seg) in line.split('`').enumerate() {
+        if i % 2 == 1 {
+            out.push('`');
+            out.push_str(seg);
+            out.push('`');
+        } else {
+            out.push_str(&seg.replace('<', "\\<"));
+        }
+    }
+    out
 }
 
 /// 点分 TLD 要求避开 npm scope（`@larksuite/x`）、版本号（`pkg@1.2.3`）与裸句柄；

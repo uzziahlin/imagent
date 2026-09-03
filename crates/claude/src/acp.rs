@@ -300,6 +300,14 @@ impl AcpBackend {
                 assignments.push(format!("ANTHROPIC_MODEL={m}"));
             }
         }
+        // R12（code-review v9）：JSON 形态命令（SDK `AcpAgent::from_str` 的
+        // spec 分支，自带 command/args/env 字段）不加 /usr/bin/env 前导——
+        // env 会把 `{...}` 整体当可执行文件名 exec，spec 分支永远走不通。
+        // 需要隔离/注入 env 的 JSON 场景在 spec 的 env 字段内自带（model
+        // 同理，spec 形态下忽略运行时 model）。
+        if base.trim_start().starts_with('{') {
+            return base;
+        }
         format!("/usr/bin/env -i {} {base}", assignments.join(" "))
     }
 
@@ -2041,7 +2049,12 @@ mod tests {
     /// H2（code-review v8）：ACP 命令消毒——env -i + 白名单前导；model 注入；
     /// 白名单之外的继承被物理切断。
     #[test]
+    #[serial_test::serial]
     fn sanitized_agent_command_env_isolation() {
+        // R10（code-review v9）：宿主机设了 IMAGENT_ACP_COMMAND（生产配置项）
+        // 时此前确定性失败——先清再断言；serial：env 是进程全局，与同文件的
+        // agent_command_honors_env 互斥。
+        std::env::remove_var("IMAGENT_ACP_COMMAND");
         // 无 model：env -i 前导 + 基础命令殿后。
         let cmd = AcpBackend::sanitized_agent_command(None);
         assert!(cmd.starts_with("/usr/bin/env -i "), "{cmd}");
@@ -2065,5 +2078,19 @@ mod tests {
                 );
             }
         }
+        // 自定义 shell 形态：env 前导照包、自定义串殿后。
+        std::env::set_var("IMAGENT_ACP_COMMAND", "custom-agent --flag");
+        let cmd3 = AcpBackend::sanitized_agent_command(None);
+        assert!(cmd3.starts_with("/usr/bin/env -i "), "{cmd3}");
+        assert!(cmd3.ends_with("custom-agent --flag"), "{cmd3}");
+        // R12：JSON spec 形态不加 env 前导（原样透传给 SDK 解析）。
+        std::env::set_var(
+            "IMAGENT_ACP_COMMAND",
+            r#"{"command":"npx","args":["-y","claude-agent-acp"]}"#,
+        );
+        let cmd4 = AcpBackend::sanitized_agent_command(None);
+        assert!(cmd4.trim_start().starts_with('{'), "{cmd4}");
+        assert!(!cmd4.contains("/usr/bin/env"), "{cmd4}");
+        std::env::remove_var("IMAGENT_ACP_COMMAND");
     }
 }

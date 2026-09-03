@@ -4532,6 +4532,46 @@ async fn stats_includes_approval_group() {
 
 /// v1.18 /cron 全链路：add 校验与落库 → list → 到期驱动 fire_due（合成消息走
 /// handle，MockBackend 收到注入前缀 prompt，store 重排）→ rm。
+/// v1.18 迭代（排队持久化）：启动重放——崩溃前落库的排队消息经
+/// replay_persisted_queue 重新驱动 agent；重放行先清表防双份。
+#[tokio::test]
+async fn queued_messages_replay_after_restart() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    // 模拟崩溃前落库的排队消息（直接走 store，绕过内存入队）。
+    let m = msg("c1", "alice", "崩溃前的任务");
+    let json = serde_json::to_string(&m).unwrap();
+    ctx.disp
+        .store
+        .persist_queued_msg("c1", m.source_msg_id.as_deref(), &json)
+        .await
+        .unwrap();
+    ctx.disp.replay_persisted_queue().await;
+    // 重放消息应驱动 MockBackend（轮询——handle 经 tasks spawn）。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if ctx
+            .prompts
+            .lock()
+            .await
+            .iter()
+            .any(|p| p.contains("崩溃前的任务"))
+        {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("重放消息未驱动 agent: {:?}", ctx.prompts.lock().await);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // 清表生效：重放后表空。
+    assert!(
+        ctx.disp.store.load_queued_all().await.unwrap().is_empty(),
+        "重放后持久化表应清空"
+    );
+    drop_db(ctx.db).await;
+}
+
 #[tokio::test]
 async fn cron_add_list_fire_rm() {
     let _serial = SERIAL.lock().await;

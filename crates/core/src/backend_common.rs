@@ -695,14 +695,15 @@ pub async fn spawn_cli_backend(
                 break;
             }
         };
-        // 诊断（control 通道真机校准）：前 3 行与之后每 50 行记录一次收流进度。
+        // 诊断（control 通道真机校准）：前 3 行与之后每 50 行记录一次收流进度
+        //（v9-R14：注释一直声称取样、实际每行都记——高频输出下 debug 日志
+        // 刷屏，按注释实现取样；thread_local 跨 run 持续累计为既定行为）。
         {
             thread_local! { static N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
             N.with(|n| {
                 let i = n.get() + 1;
                 n.set(i);
-                {
-                    let _ = i;
+                if i <= 3 || i % 50 == 0 {
                     tracing::debug!(target: "imagent::backend", line_no = i,
                         head = %line.chars().take(160).collect::<String>(),
                         "stdout 行");

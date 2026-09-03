@@ -1188,8 +1188,7 @@ fn validate_metrics_bind(socket: SocketAddr, token: Option<&str>) -> Result<(), 
 
 /// S7：Bearer 鉴权判定（纯函数，便于单测）。`token` 为 None 表示未启用
 /// 鉴权（loopback 部署），一律放行；Some 时要求 Authorization 头精确等于
-/// `Bearer <token>`（前缀多余字符不匹配）。非恒定时间比较——token 不匹配
-/// 直接 401，不泄露匹配进度，此处时序侧信道可忽略。
+/// `Bearer <token>`（前缀多余字符不匹配）。恒定时间比较（L14，见函数体）。
 fn bearer_authorized(headers: &axum::http::HeaderMap, token: Option<&str>) -> bool {
     let Some(expected) = token else {
         return true;

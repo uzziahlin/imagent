@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::sync::{mpsc, Mutex, RwLock};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use imagent_core::{
     command_card_fallback_text, split_message, CardButton, CardTerminal, ConvId, CoreError, Dedup,
@@ -77,7 +77,6 @@ struct AskSlot {
     /// patch 到早已被结果卡/后续消息顶离视口的历史卡上——用户看不到询问，
     /// 表现为「卡住」直到超时催办。复用仅在新鲜窗口（见 [`ASK_SLOT_REUSE_WINDOW`]）
     /// 内成立；None = 挂着未决询问或刚登记的新卡（不可复用）。
-    resolved_at: Option<std::time::Instant>,
     /// P10-③：重渲染输入（note 联动更新时按原参数重画整卡，按钮 value 不变）。
     render: AskRender,
 }
@@ -269,8 +268,31 @@ impl FeishuPlatform {
         let thread_active_window = thread_window_of(thread_active_window_secs);
         // W3-1：语音转文字开关（drain 侧消费）。
         let asr_enabled_for_drain = asr_enabled;
+        // v1.18 迭代（housekeeping）：以下四个 per-conv 表先建局部再进 Self——
+        // 后台巡检任务需要共享句柄做粗上限淘汰。
+        let ask_notes_local: Arc<Mutex<HashMap<String, String>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let card_tail_local: Arc<Mutex<HashMap<String, String>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let ask_slots_local: Arc<Mutex<HashMap<String, AskSlot>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let asks_since_card_local: Arc<Mutex<HashMap<String, bool>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        tokio::spawn(housekeeping_loop(HousekeepingMaps {
+            conv_senders: conv_senders.clone(),
+            comment_anchors: comment_anchors.clone(),
+            reply_anchors: reply_anchors.clone(),
+            last_inbound: last_inbound.clone(),
+            card_tail: card_tail_local.clone(),
+            ask_notes: ask_notes_local.clone(),
+            ask_slots: ask_slots_local.clone(),
+            asks_since_card: asks_since_card_local.clone(),
+        }));
         tokio::spawn(async move {
             let mut payload_rx = payload_rx;
+            // v1.18 迭代：per-conv 顺序泵表（见 conv_pump/pump_send）——消息
+            // 事件经泵发出，媒体/合并转发处理 spawn 后按 conv 入队等序。
+            let mut conv_pumps: HashMap<String, mpsc::UnboundedSender<PumpJob>> = HashMap::new();
             while let Some(payload) = payload_rx.recv().await {
                 // 三类事件：普通消息（含媒体下载）/ 审批按钮回调 / 云文档评论。
                 // P6-1：群消息的 @bot 过滤与 @bot 文本剥离需要 bot open_id——
@@ -314,7 +336,7 @@ impl FeishuPlatform {
                         }
                     }
                 }
-                if let Some((msgid, mut msg, pending)) =
+                if let Some((msgid, msg, pending)) =
                     parse_message_event(&payload, &policy, bot.as_deref())
                 {
                     if !dedup.check(&msgid) {
@@ -342,152 +364,35 @@ impl FeishuPlatform {
                         }
                         m.insert(tk.clone(), Instant::now());
                     }
-                    // 下载落盘每个待处理媒体；单个失败只 warn 跳过，不丢整条消息。
-                    for p in &pending {
-                        let token = match fetch_cached_token(
-                            &token_for_drain,
-                            &core_config_for_drain,
-                            &app_id_for_drain,
-                            &app_secret_for_drain,
-                        )
-                        .await
-                        {
-                            Ok(t) => t,
-                            Err(e) => {
-                                warn!(target: "feishu", error = %e, "取 token 失败，跳过该媒体");
-                                msg.media_errors
-                                    .push(format!("{}: 取 token 失败: {e}", p.key));
-                                continue;
-                            }
-                        };
-                        let dl = match p.kind {
-                            "image" => {
-                                download_image(
-                                    &core_config_for_drain,
-                                    &token,
-                                    &p.message_id,
-                                    &p.key,
-                                )
-                                .await
-                            }
-                            // W3-1：语音资源同 file 走 message-resource 接口。
-                            "file" | "audio" => {
-                                download_file(&core_config_for_drain, &token, &p.message_id, &p.key)
-                                    .await
-                            }
-                            _ => continue,
-                        };
-                        // token 失效自愈（与发送侧 with_token 同语义）：清缓存强制
-                        // 刷新后再试一次；二次仍失败如实进 media_errors。
-                        let dl = match dl {
-                            Ok(b) => Ok(b),
-                            Err(e) if crate::client::is_token_invalid_msg(&e.to_string()) => {
-                                warn!(target: "feishu", error = %e, "媒体下载遇 token 失效码，清缓存刷新后重试一次");
-                                *token_for_drain.write().await = None;
-                                let token = match fetch_cached_token(
-                                    &token_for_drain,
-                                    &core_config_for_drain,
-                                    &app_id_for_drain,
-                                    &app_secret_for_drain,
-                                )
-                                .await
-                                {
-                                    Ok(t) => t,
-                                    Err(e2) => {
-                                        msg.media_errors
-                                            .push(format!("{}: 重取 token 失败: {e2}", p.key));
-                                        continue;
-                                    }
-                                };
-                                match p.kind {
-                                    "image" => {
-                                        download_image(
-                                            &core_config_for_drain,
-                                            &token,
-                                            &p.message_id,
-                                            &p.key,
-                                        )
-                                        .await
-                                    }
-                                    "file" | "audio" => {
-                                        download_file(
-                                            &core_config_for_drain,
-                                            &token,
-                                            &p.message_id,
-                                            &p.key,
-                                        )
-                                        .await
-                                    }
-                                    _ => continue,
-                                }
-                            }
-                            other => other,
-                        };
-                        match dl {
-                            Ok(bytes) => {
-                                // W3-1：语音 → speech_to_text 转写（不落盘），
-                                // 文本以【语音】前缀进 prompt；失败回退媒体错误
-                                // 提示（fail-soft——用户收到可行动反馈而非静默）。
-                                if p.kind == "audio" {
-                                    if asr_enabled_for_drain {
-                                        match crate::client::transcribe_audio(
-                                            &core_config_for_drain,
-                                            &token,
-                                            bytes,
-                                        )
-                                        .await
-                                        {
-                                            Ok(t) => {
-                                                let text = format!("【语音】{t}");
-                                                msg.text = match msg.text.take() {
-                                                    Some(prev) if !prev.trim().is_empty() => {
-                                                        Some(format!("{prev}\n\n{text}"))
-                                                    }
-                                                    _ => Some(text),
-                                                };
-                                            }
-                                            Err(e) => {
-                                                warn!(target: "feishu", error = %e, "语音转写失败");
-                                                msg.media_errors.push(format!(
-                                                    "语音转写失败: {e}（可改发文字）"
-                                                ));
-                                            }
-                                        }
-                                    } else {
-                                        msg.media_errors.push(
-                                            "语音转写已关闭（feishu_asr_enabled=false），请改发文字"
-                                                .to_string(),
-                                        );
-                                    }
-                                    continue;
-                                }
-                                match persist_media(p.kind, &p.key, p.file_name.as_deref(), &bytes)
-                                {
-                                    Ok(path) => msg.media.push(MediaRef {
-                                        kind: p.kind.to_string(),
-                                        url: path,
-                                    }),
-                                    Err(e) => {
-                                        warn!(target: "feishu", error = %e, "媒体落盘失败，跳过");
-                                        msg.media_errors.push(format!("{}: 落盘失败: {e}", p.key));
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!(
-                                    target: "feishu",
-                                    error = %e,
-                                    message_id = %p.message_id,
-                                    file_key = %p.key,
-                                    "媒体下载失败，跳过"
-                                );
-                                msg.media_errors.push(format!("{}: 下载失败: {e}", p.key));
-                            }
-                        }
-                    }
-                    if inbound_msg_tx.send(msg).await.is_err() {
+                    // v1.18 迭代（intake 解耦）：媒体下载/转写/落盘移出 drain 串行
+                    // 循环——单条媒体 IO（read_timeout 已兜底停滞，此处再解耦吞吐）
+                    // 不再阻塞其它 conv 的消息/审批回调；per-conv 顺序泵保序。
+                    let conv_key = msg.conv_id.0.clone();
+                    let job = if pending.is_empty() {
+                        PumpJob::Ready(msg)
+                    } else {
+                        let token_lock = token_for_drain.clone();
+                        let cfg = core_config_for_drain.clone();
+                        let aid = app_id_for_drain.clone();
+                        let sec = app_secret_for_drain.clone();
+                        let pending = pending.clone();
+                        PumpJob::Media(tokio::spawn(async move {
+                            process_pending_media(
+                                msg,
+                                &pending,
+                                &token_lock,
+                                &cfg,
+                                &aid,
+                                &sec,
+                                asr_enabled_for_drain,
+                            )
+                            .await
+                        }))
+                    };
+                    if inbound_msg_tx.is_closed() {
                         break;
                     }
+                    pump_send(&mut conv_pumps, &inbound_msg_tx, &conv_key, job);
                     continue;
                 }
                 // 合并转发消息（merged_forward，完整支持——替换 v1.12.0 的「暂不
@@ -497,7 +402,7 @@ impl FeishuPlatform {
                 // 走既有 dedup 管线；不产生 PendingMedia（子消息图片/文件一期只
                 // 占位不下载，与媒体下载管线无冲突）；群内仍要求 @bot（parse 内
                 // 沿用 group_mention_ok，无特判）。
-                if let Some((key, mut mf_msg, meta)) =
+                if let Some((key, mf_msg, meta)) =
                     parse_merged_forward_event(&payload, &policy, bot.as_deref())
                 {
                     if !dedup.check(&key) {
@@ -522,48 +427,66 @@ impl FeishuPlatform {
                         }
                         m.insert(tk.clone(), Instant::now());
                     }
-                    // 拉子消息（token lazy 缓存 + 失效码清缓存自愈一次，与媒体
-                    // 下载路径同姿态，见 fetch_merge_forward_items）。
-                    let fetched = fetch_merge_forward_items(
-                        &core_config_for_drain,
-                        &token_for_drain,
-                        &app_id_for_drain,
-                        &app_secret_for_drain,
-                        &meta.message_id,
-                    )
-                    .await;
-                    match merge_forward_outcome(
-                        &fetched,
-                        meta.title.as_deref(),
-                        meta.summary.as_deref(),
-                    ) {
-                        MergeForwardOutcome::Agent(text) => {
-                            // 转录块作为消息文本送入 agent（占位正文在此替换）。
-                            mf_msg.text = Some(text);
-                            if inbound_msg_tx.send(mf_msg).await.is_err() {
-                                break;
+                    // v1.18 迭代（intake 解耦）：拉子消息（分页 API）与媒体下载
+                    // 同理移出 drain 串行循环——转录产出经 per-conv 泵按序发出；
+                    // Fallback 提示在任务内直发（终态通知，无排序语义）。
+                    let conv_key = mf_msg.conv_id.0.clone();
+                    let cfg = core_config_for_drain.clone();
+                    let token_lock = token_for_drain.clone();
+                    let aid = app_id_for_drain.clone();
+                    let sec = app_secret_for_drain.clone();
+                    let fallback_conv = ConvId(conv_key.clone());
+                    let handle = tokio::spawn(async move {
+                        let fetched = fetch_merge_forward_items(
+                            &cfg,
+                            &token_lock,
+                            &aid,
+                            &sec,
+                            &meta.message_id,
+                        )
+                        .await;
+                        match merge_forward_outcome(
+                            &fetched,
+                            meta.title.as_deref(),
+                            meta.summary.as_deref(),
+                        ) {
+                            MergeForwardOutcome::Agent(text) => {
+                                // 转录块作为消息文本送入 agent（占位正文在此替换）。
+                                let mut m = mf_msg;
+                                m.text = Some(text);
+                                Some(m)
+                            }
+                            MergeForwardOutcome::Fallback(notice) => {
+                                // 拉取失败（权限/网络/消息过期）：回可行动提示，不进
+                                // agent——占位正文不外泄；dedup 已消费，事件重投不会
+                                // 反复打提示。
+                                warn!(
+                                    target: "feishu",
+                                    message_id = %meta.message_id,
+                                    "拉取合并转发子消息失败，回退提示"
+                                );
+                                send_drain_text(
+                                    &cfg,
+                                    &token_lock,
+                                    &aid,
+                                    &sec,
+                                    &fallback_conv,
+                                    &notice,
+                                )
+                                .await;
+                                None
                             }
                         }
-                        MergeForwardOutcome::Fallback(notice) => {
-                            // 拉取失败（权限/网络/消息过期）：回可行动提示，不进
-                            // agent——占位正文不外泄；dedup 已消费，事件重投不会
-                            // 反复打提示。
-                            warn!(
-                                target: "feishu",
-                                message_id = %meta.message_id,
-                                "拉取合并转发子消息失败，回退提示"
-                            );
-                            send_drain_text(
-                                &core_config_for_drain,
-                                &token_for_drain,
-                                &app_id_for_drain,
-                                &app_secret_for_drain,
-                                &mf_msg.conv_id,
-                                &notice,
-                            )
-                            .await;
-                        }
+                    });
+                    if inbound_msg_tx.is_closed() {
+                        break;
                     }
+                    pump_send(
+                        &mut conv_pumps,
+                        &inbound_msg_tx,
+                        &conv_key,
+                        PumpJob::Merged(handle),
+                    );
                     continue;
                 }
                 // P4-4：审批按钮回调（card.action.trigger）→ text="y"/"n" 的
@@ -857,15 +780,15 @@ impl FeishuPlatform {
             token,
             card_seqs: Arc::new(Mutex::new(HashMap::new())),
             card_footers: Arc::new(Mutex::new(HashMap::new())),
-            ask_notes: Arc::new(Mutex::new(HashMap::new())),
-            card_tail: Arc::new(Mutex::new(HashMap::new())),
+            ask_notes: ask_notes_local,
+            card_tail: card_tail_local,
             msg_reactions: Arc::new(Mutex::new(HashMap::new())),
             managed_card_msgs: Arc::new(Mutex::new(HashMap::new())),
             reconnect,
             inbound_rx: Arc::new(Mutex::new(inbound_msg_rx)),
             pending_asks,
-            ask_slots: Arc::new(Mutex::new(HashMap::new())),
-            asks_since_card: Arc::new(Mutex::new(HashMap::new())),
+            ask_slots: ask_slots_local,
+            asks_since_card: asks_since_card_local,
             mention_policy,
             conv_senders,
             comment_anchors,
@@ -1243,7 +1166,6 @@ impl FeishuPlatform {
             AskSlot {
                 msg_id: msg_id.to_string(),
                 pending_req: Some(request_id.to_string()),
-                resolved_at: None,
                 render,
             },
         );
@@ -1293,7 +1215,7 @@ impl FeishuPlatform {
         if let Some(slot) = self.ask_slots.lock().await.get_mut(conv_id) {
             if slot.pending_req.as_deref() == Some(request_id) {
                 slot.pending_req = None;
-                slot.resolved_at = Some(std::time::Instant::now());
+                // v9-R14：resolved_at 死字段已删（只写不读）。
             }
         }
     }
@@ -1491,6 +1413,301 @@ fn group_reply_anchor(conv: &str, source_msg_id: Option<&str>) -> Option<(String
 /// 空串 sender → None（AskRender.sender 的 Option 形态适配渲染入参）。
 fn sender_opt_of(sender: &str) -> Option<&str> {
     (!sender.is_empty()).then_some(sender)
+}
+
+/// housekeeping 巡检覆盖的 per-conv 表（粗上限淘汰，见 housekeeping_loop）。
+struct HousekeepingMaps {
+    conv_senders: Arc<Mutex<HashMap<String, String>>>,
+    comment_anchors: Arc<Mutex<HashMap<String, String>>>,
+    reply_anchors: Arc<Mutex<HashMap<String, String>>>,
+    last_inbound: Arc<Mutex<HashMap<String, String>>>,
+    card_tail: Arc<Mutex<HashMap<String, String>>>,
+    ask_notes: Arc<Mutex<HashMap<String, String>>>,
+    ask_slots: Arc<Mutex<HashMap<String, AskSlot>>>,
+    asks_since_card: Arc<Mutex<HashMap<String, bool>>>,
+}
+
+/// v1.18 迭代（深度 review 结构性项）：后台巡检——
+/// ① 媒体目录 GC：`~/.imagent/media` 此前只进不出（50MB/文件，长期运行磁盘
+///    单调增长）。删除 mtime 超 [`MEDIA_RETENTION`]（7 天）的文件；在飞轮次
+///    引用的媒体最长活几小时，7 天余量充足。
+/// ② per-conv map 粗上限：锚点/发起者/复用槽等表对不活跃会话的条目无限累积
+///    （无 touch 时间戳，做不了精确 LRU）；沿用 thread_active 的「超量整体
+///    重置」先例（[`PER_CONV_MAP_CAP`]），最坏影响是旧会话首个新轮次的锚点/
+///    标注缺失（cosmetic），换内存有界。
+/// 节奏：首扫延迟 10 分钟（单测频繁构造 platform，不让测试进程触碰真实
+/// ~/.imagent/media），此后每 24h 一轮。
+async fn housekeeping_loop(maps: HousekeepingMaps) {
+    tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+    loop {
+        let removed = match tokio::task::spawn_blocking(sweep_media_dir).await {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(target: "feishu", error = %e, "媒体 GC 任务 join 失败");
+                0
+            }
+        };
+        if removed > 0 {
+            info!(target: "feishu", removed, "媒体目录 GC：删除 {removed} 个超期文件");
+        }
+        async fn cap<V>(m: &Arc<Mutex<HashMap<String, V>>>) -> usize {
+            let mut g = m.lock().await;
+            if g.len() > PER_CONV_MAP_CAP {
+                let n = g.len();
+                g.clear();
+                return n;
+            }
+            0
+        }
+        let mut reset = 0usize;
+        reset += cap(&maps.conv_senders).await;
+        reset += cap(&maps.comment_anchors).await;
+        reset += cap(&maps.reply_anchors).await;
+        reset += cap(&maps.last_inbound).await;
+        reset += cap(&maps.card_tail).await;
+        reset += cap(&maps.ask_notes).await;
+        reset += cap(&maps.ask_slots).await;
+        reset += cap(&maps.asks_since_card).await;
+        if reset > 0 {
+            warn!(target: "feishu", reset, "per-conv 状态表超粗上限（>{PER_CONV_MAP_CAP}），整体重置 {reset} 条");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
+    }
+}
+
+/// per-conv 状态表粗上限（见 housekeeping_loop 文档；远超单部署常见会话数）。
+const PER_CONV_MAP_CAP: usize = 1024;
+/// 媒体文件保留期（housekeeping GC）。
+const MEDIA_RETENTION: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
+/// 扫描媒体目录删除超期文件，返回删除数（同步 IO，调用方 spawn_blocking）。
+fn sweep_media_dir() -> usize {
+    match media_dir() {
+        Ok(dir) => sweep_media_dir_at(&dir, MEDIA_RETENTION),
+        Err(e) => {
+            warn!(target: "feishu", error = %e, "媒体 GC：目录不可用");
+            0
+        }
+    }
+}
+
+/// [`sweep_media_dir`] 的可测试形态：按 mtime 删除超期**文件**（不动子目录）。
+fn sweep_media_dir_at(dir: &std::path::Path, retention: std::time::Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for e in entries.flatten() {
+        let Ok(meta) = e.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let stale = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age > retention);
+        if stale && std::fs::remove_file(e.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// 消息待处理媒体的下载/token 自愈/语音转写/落盘（原 drain 内联块，v1.18
+/// 迭代抽离以便 spawn——drain 串行循环不再被单条媒体 IO 阻塞）。单个失败只
+/// 记 media_errors，不丢整条消息（语义与原内联实现一致，含 token 失效码
+/// 清缓存重试一次）。
+#[allow(clippy::too_many_arguments)]
+async fn process_pending_media(
+    mut msg: InboundMessage,
+    pending: &[crate::proto::PendingMedia],
+    token_lock: &Arc<RwLock<Option<(String, Instant)>>>,
+    core_config: &Arc<CoreConfig>,
+    app_id: &str,
+    app_secret: &str,
+    asr_enabled: bool,
+) -> InboundMessage {
+    for p in pending {
+        let token = match fetch_cached_token(token_lock, core_config, app_id, app_secret).await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(target: "feishu", error = %e, "取 token 失败，跳过该媒体");
+                msg.media_errors
+                    .push(format!("{}: 取 token 失败: {e}", p.key));
+                continue;
+            }
+        };
+        let dl = match p.kind {
+            "image" => download_image(core_config, &token, &p.message_id, &p.key).await,
+            // W3-1：语音资源同 file 走 message-resource 接口。
+            "file" | "audio" => download_file(core_config, &token, &p.message_id, &p.key).await,
+            _ => continue,
+        };
+        // token 失效自愈（与发送侧 with_token 同语义）：清缓存强制
+        // 刷新后再试一次；二次仍失败如实进 media_errors。
+        let dl = match dl {
+            Ok(b) => Ok(b),
+            Err(e) if crate::client::is_token_invalid_msg(&e.to_string()) => {
+                warn!(target: "feishu", error = %e, "媒体下载遇 token 失效码，清缓存刷新后重试一次");
+                *token_lock.write().await = None;
+                let token =
+                    match fetch_cached_token(token_lock, core_config, app_id, app_secret).await {
+                        Ok(t) => t,
+                        Err(e2) => {
+                            msg.media_errors
+                                .push(format!("{}: 重取 token 失败: {e2}", p.key));
+                            continue;
+                        }
+                    };
+                match p.kind {
+                    "image" => download_image(core_config, &token, &p.message_id, &p.key).await,
+                    "file" | "audio" => {
+                        download_file(core_config, &token, &p.message_id, &p.key).await
+                    }
+                    _ => continue,
+                }
+            }
+            other => other,
+        };
+        match dl {
+            Ok(bytes) => {
+                // W3-1：语音 → speech_to_text 转写（不落盘），
+                // 文本以【语音】前缀进 prompt；失败回退媒体错误
+                // 提示（fail-soft——用户收到可行动反馈而非静默）。
+                if p.kind == "audio" {
+                    if asr_enabled {
+                        match crate::client::transcribe_audio(core_config, &token, bytes).await {
+                            Ok(t) => {
+                                let text = format!("【语音】{t}");
+                                msg.text = match msg.text.take() {
+                                    Some(prev) if !prev.trim().is_empty() => {
+                                        Some(format!("{prev}\n\n{text}"))
+                                    }
+                                    _ => Some(text),
+                                };
+                            }
+                            Err(e) => {
+                                warn!(target: "feishu", error = %e, "语音转写失败");
+                                msg.media_errors
+                                    .push(format!("语音转写失败: {e}（可改发文字）"));
+                            }
+                        }
+                    } else {
+                        msg.media_errors.push(
+                            "语音转写已关闭（feishu_asr_enabled=false），请改发文字".to_string(),
+                        );
+                    }
+                    continue;
+                }
+                match persist_media(p.kind, &p.key, p.file_name.as_deref(), &bytes) {
+                    Ok(path) => msg.media.push(MediaRef {
+                        kind: p.kind.to_string(),
+                        url: path,
+                    }),
+                    Err(e) => {
+                        warn!(target: "feishu", error = %e, "媒体落盘失败，跳过");
+                        msg.media_errors.push(format!("{}: 落盘失败: {e}", p.key));
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    target: "feishu",
+                    error = %e,
+                    message_id = %p.message_id,
+                    file_key = %p.key,
+                    "媒体下载失败，跳过"
+                );
+                msg.media_errors.push(format!("{}: 下载失败: {e}", p.key));
+            }
+        }
+    }
+    msg
+}
+
+/// per-conv 顺序泵的作业：就绪消息 / 媒体处理任务（等 join 后按序发出）/
+/// 合并转发处理任务（Agent 转录分支产出消息，Fallback 分支在任务内直发提示）。
+// clippy：Ready 变体（InboundMessage ~200B）显著大于 JoinHandle 变体——
+// 瞬态队列作业、同 conv 同时至多几条，装箱得不偿失，允许。
+#[allow(clippy::large_enum_variant)]
+enum PumpJob {
+    Ready(InboundMessage),
+    Media(tokio::task::JoinHandle<InboundMessage>),
+    Merged(tokio::task::JoinHandle<Option<InboundMessage>>),
+}
+
+/// 单 conv 的顺序泵任务：按入队顺序等待作业完成并把消息发往 core 的有界
+/// 入站通道（背压经 outbound.send().await 传导）。空闲 [`PUMP_IDLE`] 后退出
+/// （map 条目由 pump_send 的失败重建路径兜底，不泄漏 task）。
+async fn conv_pump(
+    mut rx: mpsc::UnboundedReceiver<PumpJob>,
+    outbound: mpsc::Sender<InboundMessage>,
+) {
+    loop {
+        let job = match tokio::time::timeout(PUMP_IDLE, rx.recv()).await {
+            Ok(Some(j)) => j,
+            Ok(None) | Err(_) => break, // 通道关闭 / 空闲超时
+        };
+        let msg = match job {
+            PumpJob::Ready(m) => Some(m),
+            PumpJob::Media(h) => match h.await {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    warn!(target: "feishu", error = %e, "媒体处理任务 join 失败（panic？），丢弃该条消息");
+                    None
+                }
+            },
+            PumpJob::Merged(h) => match h.await {
+                Ok(opt) => opt,
+                Err(e) => {
+                    warn!(target: "feishu", error = %e, "合并转发处理任务 join 失败（panic？），丢弃该条消息");
+                    None
+                }
+            },
+        };
+        if let Some(m) = msg {
+            if outbound.send(m).await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
+/// 泵空闲退出窗口（媒体下载最长 read_timeout 级的量级，余量充足）。
+const PUMP_IDLE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// 按 conv 取（或惰性建）泵通道并入队。泵空闲退出后 entry 残留 → send 失败
+/// → 重建一次重发（task 不泄漏、消息不丢）。
+fn pump_send(
+    pumps: &mut HashMap<String, mpsc::UnboundedSender<PumpJob>>,
+    outbound: &mpsc::Sender<InboundMessage>,
+    conv: &str,
+    job: PumpJob,
+) {
+    let spawn_pump = || {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(conv_pump(rx, outbound.clone()));
+        tx
+    };
+    use std::collections::hash_map::Entry;
+    match pumps.entry(conv.to_string()) {
+        Entry::Occupied(mut e) => {
+            if !e.get().is_closed() {
+                let _ = e.get().send(job);
+            } else {
+                // 泵已退出（rx drop）：重建后入队。
+                let tx = spawn_pump();
+                let _ = tx.send(job);
+                e.insert(tx);
+            }
+        }
+        Entry::Vacant(e) => {
+            let tx = spawn_pump();
+            let _ = tx.send(job);
+            e.insert(tx);
+        }
+    }
 }
 
 /// 媒体目录：`<imagent_home>/media/`（0700；P4-10：随 profile 隔离）。
@@ -2285,7 +2502,7 @@ impl Platform for FeishuPlatform {
         // P8-2：conv 级复用槽一并释放（/stop 后短窗口内的下一个询问可复用末张卡）。
         if let Some(slot) = self.ask_slots.lock().await.get_mut(&conv.0) {
             slot.pending_req = None;
-            slot.resolved_at = Some(std::time::Instant::now());
+            // v9-R14：resolved_at 死字段已删（只写不读）。
         }
         for (message_id, tool_name) in hits {
             let card_json = render_permission_card_cancelled(&tool_name);
@@ -2961,6 +3178,78 @@ mod tests {
     /// 用其扩展名；路径穿越（../、分隔符）被净化；无名 file 回退 key.bin。
     /// W4-3：同名媒体不覆盖——第二次落盘加序号后缀。名字带进程 id + 纳秒防
     /// 历史残留（media 目录是真实 ~/.imagent/media，同机器多次跑测试会累积）。
+    /// per-conv 顺序泵：慢媒体任务先入队、就绪消息后入队 → 输出仍按入队序
+    ///（intake 解耦的保序不变量）。
+    #[tokio::test]
+    async fn conv_pump_preserves_order_across_await_jobs() {
+        let (out_tx, mut out_rx) = mpsc::channel::<InboundMessage>(8);
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(conv_pump(rx, out_tx));
+        let mk = |text: &str| InboundMessage {
+            conv_id: ConvId("feishu:ou_pump".into()),
+            sender: imagent_core::UserId("ou_u".into()),
+            text: Some(text.into()),
+            media: vec![],
+            media_errors: Vec::new(),
+            mentions: Vec::new(),
+            mentioned_bot: false,
+            ask_req: None,
+            reply_to: None,
+            source_msg_id: None,
+            control: None,
+            reply_hint: ReplyHint::None,
+        };
+        let slow = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            mk("slow-media")
+        });
+        tx.send(PumpJob::Media(slow)).unwrap();
+        tx.send(PumpJob::Ready(mk("fast-text"))).unwrap();
+        let first = out_rx.recv().await.unwrap();
+        assert_eq!(
+            first.text.as_deref(),
+            Some("slow-media"),
+            "先入队的媒体消息先出"
+        );
+        let second = out_rx.recv().await.unwrap();
+        assert_eq!(
+            second.text.as_deref(),
+            Some("fast-text"),
+            "后入队的就绪消息后出"
+        );
+    }
+
+    /// housekeeping 媒体 GC：按 mtime 删除超期文件、保留新文件与子目录。
+    #[test]
+    fn sweep_media_dir_at_removes_only_stale_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "imagent_media_gc_{}_{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 新文件（保留）。
+        std::fs::write(dir.join("fresh.png"), b"new").unwrap();
+        // 超期文件：mtime 拨回 8 天前（删除）。
+        let old = dir.join("stale.bin");
+        std::fs::write(&old, b"old").unwrap();
+        let ancient = std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 24 * 3600);
+        let f = std::fs::File::options().write(true).open(&old).unwrap();
+        f.set_modified(ancient).unwrap();
+        drop(f);
+        // 子目录不动（防误删未来扩展形态）。
+        std::fs::create_dir_all(dir.join("subdir")).unwrap();
+        let removed = sweep_media_dir_at(&dir, std::time::Duration::from_secs(7 * 24 * 3600));
+        assert_eq!(removed, 1, "只删超期文件");
+        assert!(dir.join("fresh.png").exists(), "新文件保留");
+        assert!(!old.exists(), "超期文件已删");
+        assert!(dir.join("subdir").exists(), "子目录不动");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn persist_media_same_name_gets_suffix() {
         let nanos = std::time::SystemTime::now()
