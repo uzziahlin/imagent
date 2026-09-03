@@ -53,6 +53,20 @@ pub struct AllowedSenderRow {
     pub source: Option<String>,
 }
 
+/// 一行 cron 定时任务（v1.18 /cron；schema v11）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CronJobRow {
+    pub id: String,
+    pub conv: String,
+    pub sender: String,
+    pub expr: String,
+    pub prompt: String,
+    pub created_at: i64,
+    pub last_run: Option<i64>,
+    pub next_run: i64,
+    pub enabled: bool,
+}
+
 /// 一行审计日志记录（C1）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AuditRow {
@@ -1215,6 +1229,153 @@ impl Store {
         .await
     }
 
+    // —— cron 定时任务（v1.18 /cron；schema v11）——
+
+    pub async fn list_cron_jobs(&self) -> Result<Vec<CronJobRow>> {
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, conv, sender, expr, prompt, created_at, last_run, next_run, enabled \
+                 FROM cron_jobs WHERE enabled = 1 ORDER BY next_run",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(CronJobRow {
+                        id: r.get(0)?,
+                        conv: r.get(1)?,
+                        sender: r.get(2)?,
+                        expr: r.get(3)?,
+                        prompt: r.get(4)?,
+                        created_at: r.get(5)?,
+                        last_run: r.get(6)?,
+                        next_run: r.get(7)?,
+                        enabled: r.get::<_, i64>(8)? != 0,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    pub async fn get_cron_job(&self, id: &str) -> Result<Option<CronJobRow>> {
+        let id = id.to_string();
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, conv, sender, expr, prompt, created_at, last_run, next_run, enabled \
+                 FROM cron_jobs WHERE id = ?1",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![id])?;
+            Ok(rows
+                .next()?
+                .map(|r| -> rusqlite::Result<CronJobRow> {
+                    Ok(CronJobRow {
+                        id: r.get(0)?,
+                        conv: r.get(1)?,
+                        sender: r.get(2)?,
+                        expr: r.get(3)?,
+                        prompt: r.get(4)?,
+                        created_at: r.get(5)?,
+                        last_run: r.get(6)?,
+                        next_run: r.get(7)?,
+                        enabled: r.get::<_, i64>(8)? != 0,
+                    })
+                })
+                .transpose()?)
+        })
+        .await
+    }
+
+    pub async fn insert_cron_job(&self, job: &CronJobRow) -> Result<()> {
+        let job = job.clone();
+        let inner = self.inner.clone();
+        blocking_with_retry(inner, move |conn| {
+            conn.execute(
+                "INSERT INTO cron_jobs (id, conv, sender, expr, prompt, created_at, last_run, next_run, enabled) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    job.id,
+                    job.conv,
+                    job.sender,
+                    job.expr,
+                    job.prompt,
+                    job.created_at,
+                    job.last_run,
+                    job.next_run,
+                    job.enabled as i64
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn delete_cron_job(&self, id: &str) -> Result<bool> {
+        let id = id.to_string();
+        let inner = self.inner.clone();
+        blocking_with_retry(inner, move |conn| {
+            Ok(conn.execute("DELETE FROM cron_jobs WHERE id = ?1", rusqlite::params![id])? > 0)
+        })
+        .await
+    }
+
+    /// 到期任务（enabled 且 next_run <= now）——调度器每个 tick 拉取。
+    pub async fn due_cron_jobs(&self, now: i64) -> Result<Vec<CronJobRow>> {
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, conv, sender, expr, prompt, created_at, last_run, next_run, enabled \
+                 FROM cron_jobs WHERE enabled = 1 AND next_run <= ?1 ORDER BY next_run",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![now], |r| {
+                    Ok(CronJobRow {
+                        id: r.get(0)?,
+                        conv: r.get(1)?,
+                        sender: r.get(2)?,
+                        expr: r.get(3)?,
+                        prompt: r.get(4)?,
+                        created_at: r.get(5)?,
+                        last_run: r.get(6)?,
+                        next_run: r.get(7)?,
+                        enabled: r.get::<_, i64>(8)? != 0,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// 触发后重排：记 last_run 并把 next_run 推到下次（调度器在执行注入前调用，
+    /// 防长轮次执行期重复入队）。
+    pub async fn bump_cron_job(&self, id: &str, last_run: i64, next_run: i64) -> Result<()> {
+        let id = id.to_string();
+        let inner = self.inner.clone();
+        blocking_with_retry(inner, move |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET last_run = ?2, next_run = ?3 WHERE id = ?1",
+                rusqlite::params![id, last_run, next_run],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn set_cron_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        let id = id.to_string();
+        let inner = self.inner.clone();
+        blocking_with_retry(inner, move |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET enabled = ?2 WHERE id = ?1",
+                rusqlite::params![id, enabled as i64],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn delete_config(&self, key: &str) -> Result<()> {
         let key = key.to_string();
         let inner = self.inner.clone();
@@ -1698,6 +1859,7 @@ mod tests {
             "config",
             "context_tokens",
             "credentials",
+            "cron_jobs",
             "named_sessions",
             "run_stats",
             "session_history",
@@ -1706,6 +1868,46 @@ mod tests {
         ] {
             assert!(tables.iter().any(|x| x == t), "missing table: {t}");
         }
+    }
+
+    // ---------- cron_jobs（schema v11）----------
+
+    #[tokio::test]
+    async fn cron_job_roundtrip() {
+        let db = TempDb::new("cron").await;
+        let store = Store::open(&db.path).await.expect("open");
+        let job = CronJobRow {
+            id: "abc123".into(),
+            conv: "feishu:oc_x".into(),
+            sender: "ou_u".into(),
+            expr: "0 9 * * *".into(),
+            prompt: "今日摘要".into(),
+            created_at: 1000,
+            last_run: None,
+            next_run: 2000,
+            enabled: true,
+        };
+        store.insert_cron_job(&job).await.expect("insert");
+        // 到期查询：next_run <= now 命中，排序稳定。
+        assert_eq!(store.due_cron_jobs(1999).await.unwrap().len(), 0);
+        let due = store.due_cron_jobs(2000).await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, "abc123");
+        // list 只列 enabled。
+        store.set_cron_enabled("abc123", false).await.unwrap();
+        assert!(store.list_cron_jobs().await.unwrap().is_empty());
+        store.set_cron_enabled("abc123", true).await.unwrap();
+        // bump 重排 + 单查 + 删除。
+        store
+            .bump_cron_job("abc123", 2000, 9000)
+            .await
+            .unwrap();
+        let j = store.get_cron_job("abc123").await.unwrap().expect("get");
+        assert_eq!((j.last_run, j.next_run), (Some(2000), 9000));
+        assert!(store.due_cron_jobs(8999).await.unwrap().is_empty());
+        assert!(store.delete_cron_job("abc123").await.unwrap());
+        assert!(!store.delete_cron_job("abc123").await.unwrap());
+        assert!(store.get_cron_job("abc123").await.unwrap().is_none());
     }
 
     // ---------- run_stats（schema v8）----------

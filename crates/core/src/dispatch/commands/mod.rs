@@ -4,6 +4,7 @@
 //! [`misc`]：状态/工作目录/媒体/帮助。
 
 mod admin;
+mod cron;
 mod misc;
 mod session;
 
@@ -23,7 +24,10 @@ pub(super) const COMMAND_GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     ("📁 目录与文件", &["/cd", "/ws", "/img", "/file"]),
-    ("🛡️ 权限与运行", &["/perm", "/stop", "/timeout", "/model"]),
+    (
+        "🛡️ 权限与运行",
+        &["/perm", "/stop", "/timeout", "/model", "/cron"],
+    ),
     (
         "🧪 状态与诊断",
         &[
@@ -226,6 +230,10 @@ impl Dispatcher {
                     }
                     "/status" => {
                         self.cmd_status(&conv, &hint).await;
+                        return;
+                    }
+                    "/cron" => {
+                        self.cmd_cron(&conv, &sender, &hint, &parts).await;
                         return;
                     }
                     "/stats" => {
@@ -431,6 +439,11 @@ impl Dispatcher {
                 .collect();
             let merged = merge_batch(batch);
             let round_input = self.run_agent_round(merged, react_mids).await;
+            // v1.18：轮末清 steering 注入计数（footer「已注入 N 条」随轮归零；
+            // 保留排队字段——下一批语义仍在）。
+            if let Some(h) = self.queued_hints.lock().await.get_mut(&conv.0) {
+                h.steered = 0;
+            }
             // W2-5：自动 compact——成功轮次的上下文水位超阈值时走既有压缩管道
             //（conv 锁仍在手，与 /compact 同串行域；无活动会话时内部跳过）。
             if let Some(in_tokens) = round_input {

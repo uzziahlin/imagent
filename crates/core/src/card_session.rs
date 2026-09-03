@@ -29,25 +29,33 @@ const THOUGHT_TRUNC_CHARS: usize = 400;
 
 /// P10：本会话的排队状态（运行中入队的消息摘要）。入队路径写、取批/中断清、
 /// CardSession 每次 patch 拉取（活动期随 chunk 刷新 footer 的排队提示）。
+/// v1.18：`steered` 计运行中转向注入的条数（👀 回执之外的卡面可见性——
+/// 真机反馈表情太隐蔽，两次误判「消息丢了」），轮次结束清零。
 #[derive(Debug, Clone, Default)]
 pub(crate) struct QueuedHint {
     /// 排队消息条数。
     pub count: usize,
     /// 最新一条的摘要（≤40 字符；纯媒体消息给「（图片/文件）」占位）。
     pub latest: String,
+    /// 本轮 steering 注入条数（footer「已注入 N 条」）。
+    pub steered: usize,
 }
 
-/// 排队状态 → 展示文案（None = 无需展示）。`📥 排队 N 条，最新：「…」`。
+/// 状态 → 展示文案（None = 无需展示）。`📥 已注入 N 条 · 排队 M 条，最新：「…」`。
 pub(crate) fn queued_hint_display(h: &QueuedHint) -> Option<String> {
-    if h.count == 0 {
-        return None;
+    let mut segs: Vec<String> = Vec::new();
+    if h.steered > 0 {
+        segs.push(format!("已注入 {} 条运行中消息", h.steered));
     }
-    let mut out = format!("📥 排队 {} 条", h.count);
-    if !h.latest.is_empty() {
-        let latest: String = h.latest.chars().take(40).collect();
-        out.push_str(&format!("，最新：「{latest}」"));
+    if h.count > 0 {
+        let mut q = format!("排队 {} 条", h.count);
+        if !h.latest.is_empty() {
+            let latest: String = h.latest.chars().take(40).collect();
+            q.push_str(&format!("，最新：「{latest}」"));
+        }
+        segs.push(q);
     }
-    Some(out)
+    (!segs.is_empty()).then(|| format!("📥 {}", segs.join("，")))
 }
 
 /// 流式卡片会话。

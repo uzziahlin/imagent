@@ -350,6 +350,35 @@ pub async fn urgent_app_buzz(
 /// Wave B：`buzz = true` 时 text 消息体附 `buzz` 字段（飞书加急：客户端强提醒
 /// 振铃）。**待真机校准**：buzz 字段在部分租户/旧客户端不生效时按未知字段忽略，
 /// 退化为普通消息（内容不受影响）。false 时完全不写字段（与既有形态一致）。
+// v1.18 群媒体「回复即定向」：bot 近期发出的消息 id 账本。发送路径零侵入记账
+//（下方三个发送函数成功时 push），事件循环查询——群消息回复命中账本即视为对
+// bot 的显式定向（手机端图片/文件无法携带 @ 的准入补偿；与 @ 等权，白名单/
+// 会话域门禁不变）。std::sync::Mutex：临界区无 await；256 条 FIFO 淘汰。
+static BOT_SENT_MSGS: std::sync::Mutex<std::collections::VecDeque<String>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+const BOT_SENT_CAP: usize = 256;
+
+/// 发送成功路径记账（mid 为平台消息 id，非 om_ 前缀忽略）。
+pub(crate) fn note_bot_sent(mid: Option<&str>) {
+    let Some(m) = mid.filter(|m| m.starts_with("om_")) else {
+        return;
+    };
+    let mut q = BOT_SENT_MSGS.lock().expect("bot_sent 账本锁中毒");
+    if q.len() >= BOT_SENT_CAP {
+        q.pop_front();
+    }
+    q.push_back(m.to_string());
+}
+
+/// parent 是否命中 bot 近期消息（回复即定向判定）。
+pub(crate) fn bot_sent_recently(mid: &str) -> bool {
+    BOT_SENT_MSGS
+        .lock()
+        .expect("bot_sent 账本锁中毒")
+        .iter()
+        .any(|m| m == mid)
+}
+
 pub async fn send_text_msg(
     core_config: &CoreConfig,
     token: &str,
@@ -429,6 +458,7 @@ pub async fn send_card_msg(
             .get("message_id")
             .and_then(|v| v.as_str())
             .map(String::from);
+        note_bot_sent(message_id.as_deref());
         Ok(message_id)
     })
 }
@@ -1389,9 +1419,12 @@ pub async fn reply_message(
             ));
         }
         // P6 遗留补齐：返回回执消息 id（话题内 interactive 卡需要它作 patch 句柄）。
-        Ok(v.pointer("/data/message_id")
+        let mid = v
+            .pointer("/data/message_id")
             .and_then(|m| m.as_str())
-            .map(String::from))
+            .map(String::from);
+        note_bot_sent(mid.as_deref());
+        Ok(mid)
     })
 }
 
@@ -1417,6 +1450,27 @@ mod tests {
     fn constants_sane() {
         assert!(BACKOFF_CAP >= Duration::from_secs(30));
         assert_eq!(PLATFORM, "feishu");
+    }
+
+    #[test]
+    fn bot_sent_ledger_roundtrip_and_cap() {
+        // 命中与未命中（om_ 前缀语义；非 om_ 不入账）。
+        note_bot_sent(Some("om_ledger_1"));
+        assert!(bot_sent_recently("om_ledger_1"));
+        assert!(!bot_sent_recently("om_unknown"));
+        note_bot_sent(Some("not_a_msg_id"));
+        assert!(!bot_sent_recently("not_a_msg_id"));
+        note_bot_sent(None);
+        // FIFO 上限淘汰：灌满 256+1 条，最旧的被挤出。
+        let mut q = BOT_SENT_MSGS.lock().unwrap();
+        q.clear();
+        drop(q);
+        for i in 0..=BOT_SENT_CAP {
+            note_bot_sent(Some(&format!("om_seq_{i}")));
+        }
+        assert!(!bot_sent_recently("om_seq_0"), "最旧条目应被淘汰");
+        assert!(bot_sent_recently("om_seq_1"));
+        assert!(bot_sent_recently(&format!("om_seq_{BOT_SENT_CAP}")));
     }
 
     /// P1：jitter 后退避始终落在 ±20% 区间内（防同步重连风暴但不漂移）。
