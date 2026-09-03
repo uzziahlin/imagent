@@ -13,6 +13,7 @@
 // 这种显式局部豁免；`forbid` 不允许，故不适用。其余全部 crate 用 `forbid`。
 #![deny(unsafe_code)]
 
+pub mod agent_process;
 mod auth;
 mod backend;
 pub mod backend_common;
