@@ -382,6 +382,8 @@ pub fn parse_card_action_event(payload: &[u8]) -> Option<(String, InboundMessage
             (!joined.is_empty()).then_some(joined)
         };
         // 多题字段 ask_opt_0..N 按序拼接；单题旧字段 ask_opt 兜底。
+        // v1.17.2：每题自由输入 ask_opt_{i}_free 非空则**优先于**选项（对齐
+        // CLI 原生自定义回答；原文进入用户选择消息，agent 自行对应到题）。
         let mut parts: Vec<String> = Vec::new();
         if let Some(obj) = fv.as_object() {
             let mut idx_keys: Vec<(u32, &String)> = obj
@@ -393,7 +395,16 @@ pub fn parse_card_action_event(payload: &[u8]) -> Option<(String, InboundMessage
                 })
                 .collect();
             idx_keys.sort();
-            for (_, k) in idx_keys {
+            for (i, k) in idx_keys {
+                let free = obj
+                    .get(&format!("ask_opt_{i}_free"))
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty());
+                if let Some(f) = free {
+                    parts.push(f.to_string());
+                    continue;
+                }
                 if let Some(p) = obj.get(k).and_then(field_joined) {
                     parts.push(p);
                 }
@@ -2362,6 +2373,20 @@ mod tests {
         assert_eq!(
             mqm.text.as_deref(),
             Some("ask:环境=测试；范围=前端、范围=后端")
+        );
+        // 自由输入（v1.17.2）：非空优先于选项、原文进消息；混合时按题序。
+        let (_, mix, _) = parse_card_action_event(&mk(serde_json::json!({
+            "ask_opt_0": "部署环境=测试环境",
+            "ask_opt_0_free": "  ",
+            "ask_opt_1": "是否备份=是",
+            "ask_opt_1_free": "先备份 db 再备份配置"
+        })))
+        .expect("混合应回调");
+        assert_eq!(
+            mix.text.as_deref(),
+            Some("ask:部署环境=测试环境；先备份 db 再备份配置"),
+            "free 优先且空串忽略: {:?}",
+            mix.text
         );
         // 空数组 / 缺字段 → 丢弃。
         assert!(parse_card_action_event(&mk(serde_json::json!({"ask_opt": []}))).is_none());
