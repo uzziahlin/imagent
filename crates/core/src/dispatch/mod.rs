@@ -1255,7 +1255,8 @@ impl Dispatcher {
                         };
                         if steered {
                             drop(map);
-                            // 回执：⏳ 打在消息上（注入效果由 agent 续写可见）。
+                            // 回执：👀 打在消息上（与真排队 ⏳ 区分——steering 是
+                            // 「已注入当轮」，效果由 agent 在下个工具边界续写可见）。
                             if let Some(mid) =
                                 msg.source_msg_id.clone().filter(|m| m.starts_with("om_"))
                             {
@@ -1264,7 +1265,7 @@ impl Dispatcher {
                                     .react_to_message(
                                         &ConvId(conv.to_string()),
                                         &mid,
-                                        crate::MsgReaction::Queued,
+                                        crate::MsgReaction::Processing,
                                     )
                                     .await
                                 {
