@@ -805,18 +805,22 @@ impl FeishuPlatform {
                     continue;
                 }
                 // 不支持类型提示：语音/分享卡片等此前静默丢弃，用户无感知——回一条
-                // 可读提示（p2p 直回；群消息近似按「带 @」门槛发——白名单校验在
-                // core 侧，drain 无白名单状态，见 proto 注释）。
-                if let Some((notice, Some(conv))) = unsupported_message_notice(&payload) {
-                    send_drain_text(
-                        &core_config_for_drain,
-                        &token_for_drain,
-                        &app_id_for_drain,
-                        &app_secret_for_drain,
-                        &conv,
-                        notice,
-                    )
-                    .await;
+                // 可读提示。v1.18 review 收紧：① 过 dedup（message_id）——事件重投/
+                // 断线重连不再重复回执；② 仅 p2p（proto 侧）——群内「带 @」弱门槛
+                // 会让非白名单群的贴纸/分享触发 bot 回复（垃圾消息面 + 存活性探针）。
+                if let Some((notice, dedup_key, Some(conv))) = unsupported_message_notice(&payload)
+                {
+                    if dedup_key.is_some_and(|k| dedup.check(&k)) {
+                        send_drain_text(
+                            &core_config_for_drain,
+                            &token_for_drain,
+                            &app_id_for_drain,
+                            &app_secret_for_drain,
+                            &conv,
+                            notice,
+                        )
+                        .await;
+                    }
                     continue;
                 }
                 // 真机排障：兜底分类——已知「正常忽略」的事件（策略过滤的群消息、
@@ -1254,7 +1258,27 @@ impl FeishuPlatform {
             .insert(conv_id.to_string(), true);
     }
 
-    /// P8-2：取出并清除「发过询问卡」标记（终态消费一次）。
+    /// P8-2：只读「发过询问卡」标记（终态下沉判定用，不消费）。
+    /// v1.18 review：终态 patch 全链路（token 获取 → patch → 下沉重发）都成功
+    /// 才由 [`clear_asks_flag`] 消费——此前 take 在 patch 前消费，patch 失败后
+    /// 标志已丢：重试/孤儿扫描以「未下沉」形态把全文 patch 到早已被顶离视口
+    /// 的旧卡上，设计的下沉 UX 静默丢失且不可恢复。
+    async fn peek_asks_flag(&self, conv_id: &str) -> bool {
+        self.asks_since_card
+            .lock()
+            .await
+            .get(conv_id)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// P8-2：消费「发过询问卡」标记（仅终态全链路成功后调用）。
+    async fn clear_asks_flag(&self, conv_id: &str) {
+        self.asks_since_card.lock().await.remove(conv_id);
+    }
+
+    /// 兼容旧语义的单测辅助（取出并清除）。
+    #[cfg(test)]
     async fn take_asks_flag(&self, conv_id: &str) -> bool {
         self.asks_since_card
             .lock()
@@ -1713,6 +1737,12 @@ async fn notify_expired_ask(
 /// [`FeishuPlatform::get_token`]，故抽出共用（与发送侧共享同一 lazy 缓存）。
 /// P5：读锁快路径 + 写锁双检——此前每次都直接取写锁且跨网络调用（最坏 30s），
 /// token 刷新期间所有发送/媒体下载被串行阻塞。
+/// token 刷新 single-flight（v1.18 review）：抢到它的一方发网络请求，其余
+/// 并发刷新者等它完成后走读锁快路径。此前写锁**跨网络**持有（tokio RwLock
+/// 写偏好，fetch 30s 超时期间全平台发送/patch/下载在锁上排队，每 ~2h 刷新
+/// 卡一次）；token 失效风暴时 N 个并发请求还各自独立重取（撞飞书签发频控）。
+static TOKEN_REFRESH_MU: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn fetch_cached_token(
     token_lock: &Arc<RwLock<Option<(String, Instant)>>>,
     core_config: &CoreConfig,
@@ -1724,15 +1754,17 @@ async fn fetch_cached_token(
             return Ok(token.clone());
         }
     }
-    let mut cache = token_lock.write().await;
-    // 双检：等写锁期间可能已被并发刷新。
-    if let Some((token, fetched_at)) = cache.as_ref() {
+    // 刷新串行化：网络期间 token_lock 完全不被持有，发送方零阻塞。
+    let _refresh_guard = TOKEN_REFRESH_MU.lock().await;
+    // 双检：等刷新权期间可能已被前一个刷新者写回新 token。
+    if let Some((token, fetched_at)) = token_lock.read().await.as_ref() {
         if fetched_at.elapsed() < TOKEN_TTL {
             return Ok(token.clone());
         }
     }
     let token = fetch_token(core_config, app_id, app_secret).await?;
-    *cache = Some((token.clone(), Instant::now()));
+    // 写回仅短暂持写锁（无网络），读锁等待者立即可见。
+    *token_lock.write().await = Some((token.clone(), Instant::now()));
     Ok(token)
 }
 
@@ -2641,10 +2673,12 @@ impl Platform for FeishuPlatform {
         _hint: &ReplyHint,
     ) -> Result<()> {
         // P8-2：终态「结果下沉」——本轮发过询问卡（流式卡被审批卡顶离视口）时，
-        // 流式卡收成指针 stub，完整结果另发新卡落在会话最下面。标记取走即清
-        // （300317 重试 / 重复终态不会二次重发）。
-        let buried =
-            !matches!(card.terminal, CardTerminal::Running) && self.take_asks_flag(&conv.0).await;
+        // 流式卡收成指针 stub，完整结果另发新卡落在会话最下面。
+        // v1.18 review：peek 而非 take——终态全链路（patch + 下沉重发）成功才
+        // 清标志（见 clear_asks_flag）；失败路径保标志，孤儿扫描/重试还能走
+        // 下沉形态补救（此前 patch 前消费，失败后下沉能力静默丢失）。
+        let wants_buried =
+            !matches!(card.terminal, CardTerminal::Running) && self.peek_asks_flag(&conv.0).await;
         let res = self
             .with_token(|token| async move {
                 if let Some(card_id) = handle.strip_prefix("card:") {
@@ -2654,12 +2688,16 @@ impl Platform for FeishuPlatform {
                     // 面板，两形态不一致（用户反馈折叠更好）。Running 仍走 managed
                     // element 流式（打字机/节流/300317 自愈语义不变）。无映射
                     // （重启后）退回 managed 终态 patch（内联形态，可接受降级）。
-                    if !buried
+                    if !wants_buried
                         && !matches!(card.terminal, CardTerminal::Running)
                     {
-                        if let Some(message_id) =
-                            self.managed_card_msgs.lock().await.get(card_id).cloned()
-                        {
+                        // v1.18 review：先 let 绑定再判断——edition 2021 的 if-let
+                        // scrutinee 临时值（MutexGuard）存活到整个 if-let 结束，
+                        // 此前 managed_card_msgs 锁跨 patch 网络调用（30s 超时 +
+                        // 限流重试）长达半分钟，期间其它 conv 的 send_card 登记/
+                        // 终态查询全部排队。
+                        let mid = self.managed_card_msgs.lock().await.get(card_id).cloned();
+                        if let Some(message_id) = mid {
                             let sender = self.last_sender(&conv.0).await;
                             let card_json = render_card(
                                 card,
@@ -2678,7 +2716,7 @@ impl Platform for FeishuPlatform {
                             return res;
                         }
                     }
-                    match self.patch_managed(&token, card_id, card, buried).await {
+                    match self.patch_managed(&token, card_id, card, wants_buried).await {
                     // 300317（sequence 落后）自愈（真机校准）：重启后内存计数器归零，
                     // 但旧卡片的 server 序号已推进（孤儿扫描接管、同进程异常路径）
                     // ——把该卡计数器重置为时间戳级（必然大于 server 序号）整段重试。
@@ -2692,14 +2730,14 @@ impl Platform for FeishuPlatform {
                             .map(|d| d.as_secs() as i64)
                             .unwrap_or(1_000_000_000);
                         *self.card_seqs.lock().await.entry(card_id.to_string()).or_insert(now) = now;
-                        self.patch_managed(&token, card_id, card, buried).await
+                        self.patch_managed(&token, card_id, card, wants_buried).await
                     }
                     other => other,
                 }
             } else if let Some(message_id) = handle.strip_prefix("msg:") {
                 // Wave B-5：整卡重渲染带发起者标注行（群 conv）。
                 let sender = self.last_sender(&conv.0).await;
-                let card_json = if buried {
+                let card_json = if wants_buried {
                     crate::card::render_stub_card(card)
                 } else {
                     render_card(card, &conv.0, (!sender.is_empty()).then_some(sender).as_deref())
@@ -2766,8 +2804,15 @@ impl Platform for FeishuPlatform {
                 };
                 match retry {
                     Ok(()) => {
-                        warn!(target: "feishu", error = %err_text, "终态 patch 失败，已用最小终态卡收敛");
-                        Ok(())
+                        // R1（code-review v9）：最小卡收敛成功**不吞错**——此前返回
+                        // Ok 使 core 的 P5-11 纯文本补发不触发，完整内容永久丢失
+                        //（卡上却标着「完整内容见文本消息」）。上抛原错误让 core
+                        // 补发全文；卡片已 patch 成最小终态（收敛不回退）。
+                        warn!(target: "feishu", error = %err_text, "终态 patch 失败，最小卡已收敛；上抛原错误触发 core 纯文本补发");
+                        Err(CoreError::Platform(
+                            PLATFORM,
+                            format!("{err_text}（终态卡已收敛为最小形态，完整内容由文本消息补发）"),
+                        ))
                     }
                     Err(_) => Err(e),
                 }
@@ -2777,7 +2822,7 @@ impl Platform for FeishuPlatform {
         // 结果下沉重发：流式卡已收敛成指针 → 完整结果另发新卡。Wave B-5：带
         // 发起者标注行。重发失败上抛 Err——core 的 P5-11 兜底会以纯文本补发全文
         //（结论不能因重发失败而丢）。
-        if res.is_ok() && buried {
+        if res.is_ok() && wants_buried {
             let sender = self.last_sender(&conv.0).await;
             let full = render_card(
                 card,
@@ -2788,6 +2833,8 @@ impl Platform for FeishuPlatform {
                 warn!(target: "feishu", error = %e, "结果下沉重发失败，交由 core 纯文本兜底");
                 return Err(e);
             }
+            // 下沉全链路成功才消费标志（失败保标志：孤儿扫描仍可下沉补救）。
+            self.clear_asks_flag(&conv.0).await;
         }
         res
     }

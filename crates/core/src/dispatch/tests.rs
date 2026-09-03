@@ -4589,17 +4589,27 @@ async fn cron_add_list_fire_rm() {
         .await
         .unwrap();
     ctx.disp.fire_due_cron_jobs().await;
-    assert!(
-        ctx.prompts
+    // v1.18 review：fire 分发异步化（spawn 进 tasks——调度器内联 await 整轮
+    // agent 会全局队头阻塞 + 关停失聪），注入经 task 异步到达，轮询等待。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if ctx
+            .prompts
             .lock()
             .await
             .iter()
-            .any(|p| p.contains("定时任务触发") && p.contains("报数")),
-        "到期注入 prompt: {:?}",
-        ctx.prompts.lock().await
-    );
+            .any(|p| p.contains("定时任务触发") && p.contains("报数"))
+        {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("到期注入 prompt: {:?}", ctx.prompts.lock().await);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     // fire 后已重排（next_run 推进到未来，不再 due）。
-    let j = ctx.disp
+    let j = ctx
+        .disp
         .store
         .get_cron_job(&jobs[0].id)
         .await
@@ -4620,14 +4630,13 @@ async fn cron_add_list_fire_rm() {
         "删除回执: {:?}",
         ctx.inbox.lock().await
     );
-    assert!(
-        ctx.disp
-            .store
-            .get_cron_job(&jobs[0].id)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(ctx
+        .disp
+        .store
+        .get_cron_job(&jobs[0].id)
+        .await
+        .unwrap()
+        .is_none());
     drop_db(ctx.db).await;
 }
 

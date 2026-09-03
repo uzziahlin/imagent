@@ -487,6 +487,11 @@ pub struct Dispatcher {
     /// 后起跑前检查，命中（60s 内）则本批不启动。过期兜底防 stray /stop 误杀
     /// 之后不相关的轮次。
     stop_requested: Arc<Mutex<HashMap<String, i64>>>,
+    /// v1.18 review：per-sender 成本上限提示的最近通知时刻（W4-1 刷屏去重）。
+    /// 超限 sender 的每条入站消息（含 cron 合成的每分钟一条）此前都回一条
+    /// 「用量已达上限」——cron 场景一天刷 1440 条。1 小时内同 sender 只提示
+    /// 一次（拒绝照常，只是不再重复说服）。进程内状态即可。
+    budget_notice_last: Mutex<HashMap<String, i64>>,
     /// per-conv 最近一次 `/resume` 渲染的列表（P4-11）：序号选择取缓存，
     /// 防两次调用间本机会话 mtime 变化导致错位；S-16：选中不移除条目（防序号
     /// 前移错位），陈旧由 D7 的 TTL 惰性过期兜底。
@@ -602,6 +607,7 @@ impl Dispatcher {
             queues: Mutex::new(HashMap::new()),
             queued_hints: Arc::new(Mutex::new(HashMap::new())),
             stop_requested: Arc::new(Mutex::new(HashMap::new())),
+            budget_notice_last: Mutex::new(HashMap::new()),
             shortcuts: Arc::new(std::sync::RwLock::new(HashMap::new())),
             resume_cache: Mutex::new(HashMap::new()),
             pending_hint_last: Mutex::new(HashMap::new()),
@@ -1036,6 +1042,8 @@ impl Dispatcher {
         // recv 失败退避（防 client 异常退出后 dispatcher 忙循环刷屏）。
         let mut recv_backoff = std::time::Duration::from_secs(1);
         const RECV_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+        // v1.18 review：session 过期也要先 drain 再返回（见 Err 分支注释）。
+        let mut expired_err: Option<crate::error::CoreError> = None;
         loop {
             // P1-5：监听 shutdown 信号，停止接收新消息并进入 drain。
             tokio::select! {
@@ -1066,16 +1074,57 @@ impl Dispatcher {
                             // 消费；否则回落正常 handle/批处理路径，不再被当
                             // deny 兜底吞掉。多 pending 并存且无锚定时无法消解
                             // 歧义，同样不消费，回一条去重提示引导回复卡片。
-                            let anchored = msg.ask_req.is_some() || msg.reply_to.is_some();
                             let explicit_word = is_explicit_reply_word(text);
-                            let consumable = if anchored {
+                            // 消费门收紧（v1.18 review）：引用回复（reply_to）仅在
+                            // ① 锚点真实命中询问卡，或 ② 明确审批词（y/n/allow/…，
+                            // 兜底单 pending 的「对催办文本回 OK」校准仍成立）时
+                            // 可消费——否则引用任意旧消息的正常追问会 fail-closed
+                            // 解析成 deny，既误拒审批又吞掉消息。按钮回调（ask_req
+                            // 带 request_id 精确路由）不受影响。
+                            let consumable = if msg.ask_req.is_some() {
                                 true
+                            } else if let Some(parent) = msg.reply_to.as_deref() {
+                                explicit_word
+                                    || self
+                                        .router
+                                        .reply_anchor_hits_card(&conv_id, parent)
+                                        .await
                             } else if !explicit_word {
                                 false
                             } else {
                                 matches!(self.router.pending_count(&conv_id).await, 0 | 1)
                             };
-                            let reply = parse_reply(text);
+                            let mut reply = parse_reply(text);
+                            // R4（code-review v9 残余，H1 回复侧）：热切出闭环档
+                            //（deny/off）后，已发出的审批卡在 permission_ask_timeout
+                            //（缺省 300s）窗口内点「允许」仍会放行——投递前复查
+                            // 当前档位，deny/off 一律强制 deny（fail-closed）。仅当
+                            // 该 conv 存在 Permission 类 pending 时生效：ask_via_im
+                            // 的终端问答不受权限档位管辖（Off 档下答 y 是问答不是放行）。
+                            if reply.allow {
+                                let mode = *self.permission_mode.read();
+                                if matches!(
+                                    mode,
+                                    crate::config::PermissionMode::Deny
+                                        | crate::config::PermissionMode::Off
+                                ) && self
+                                    .router
+                                    .has_pending_of_kind(
+                                        &conv_id,
+                                        crate::permission::PendingKind::Permission,
+                                    )
+                                    .await
+                                {
+                                    reply = crate::permission::PermissionReply {
+                                        allow: false,
+                                        always: false,
+                                        message: Some(
+                                            "已按当前 /perm 档位（deny/off）强制拒绝".into(),
+                                        ),
+                                        raw_text: reply.raw_text,
+                                    };
+                                }
+                            }
                             let reply_for_card = reply.clone();
                             // 多 pending 三级路由：按钮回调带 ask_req 精确 → 引用
                             // 回复（reply_to）命中询问卡 → 最新 pending 兜底。
@@ -1188,7 +1237,12 @@ impl Dispatcher {
                                 error = %e,
                                 "session 过期，停止 dispatcher（需重新 login）"
                             );
-                            return Err(e);
+                            // v1.18 review：不走提前 return——那会跳过下方 drain，
+                            // 在飞的 agent 轮次（含其子进程）被 runtime drop 直接
+                            // SIGKILL，恰是 P1-5/R-1 drain 要防的半写场景。break
+                            // 走统一收尾，drain 后再把错误交还调用方。
+                            expired_err = Some(e);
+                            break;
                         }
                         warn!(
                             target: "imagent::core",
@@ -1218,7 +1272,10 @@ impl Dispatcher {
                 tasks.abort_all();
             }
         }
-        Ok(())
+        match expired_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// 取（或创建）conv 串行锁的 Arc clone。
@@ -1336,10 +1393,23 @@ impl Dispatcher {
                 // ③审批等待是最静默的窗口（无 chunk，footer 不动），推送重渲染审批卡
                 // note 行（best-effort）。两者都是状态更新，不往消息流发任何东西。
                 let note = format!("⏳ 等待你审批 · 后面还排着 {count} 条消息");
-                self.queued_hints.lock().await.insert(
-                    conv.to_string(),
-                    crate::card_session::QueuedHint { count, latest, ..Default::default() },
-                );
+                // v1.18 review：合并写入而非整体替换——steered（「已注入 N 条」）
+                // 与 count/latest 属同一 footer 的两个字段，insert(..Default) 会把
+                // 运行中注入计数清零（注入 3 条后再排队 1 条 → footer 只显示排队，
+                // 注入可见性静默消失——恰是该特性最常见的混合使用流）。
+                self.queued_hints
+                    .lock()
+                    .await
+                    .entry(conv.to_string())
+                    .and_modify(|h| {
+                        h.count = count;
+                        h.latest = latest.clone();
+                    })
+                    .or_insert(crate::card_session::QueuedHint {
+                        count,
+                        latest,
+                        ..Default::default()
+                    });
                 if let Err(e) = self
                     .platform
                     .note_queued_on_ask(&ConvId(conv.to_string()), &note, hint)
@@ -1441,10 +1511,18 @@ impl Dispatcher {
             if count == 0 {
                 hints.remove(conv);
             } else {
-                hints.insert(
-                    conv.clone(),
-                    crate::card_session::QueuedHint { count, latest, ..Default::default() },
-                );
+                // 合并写入保 steered（同 enqueue 路径的 v1.18 review 修正）。
+                hints
+                    .entry(conv.clone())
+                    .and_modify(|h| {
+                        h.count = count;
+                        h.latest = latest.clone();
+                    })
+                    .or_insert(crate::card_session::QueuedHint {
+                        count,
+                        latest,
+                        ..Default::default()
+                    });
             }
         }
         removed

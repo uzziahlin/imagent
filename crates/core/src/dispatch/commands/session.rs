@@ -626,11 +626,21 @@ impl Dispatcher {
             }
         }
         let running = self.running.lock().await.remove(&conv.0);
-        let aborted = if let Some(h) = &running {
-            // abort → backend.run future drop → 杀子进程：
-            // CLI 后端 kill_on_drop；ACP 后端 cancel 分支 → 杀连接。
-            h.abort.abort();
-            true
+        // 三态：Aborted（真中断）/ Completed（收尾期竞态——join 已结束，abort 无效
+        // 却曾谎报「已中断」）/ None（无在飞任务，走标记/排队分支）。
+        // Completed 场景：backend.run 已返回、run_agent_round 还在收尾（卡片
+        // finalize/落库持 conv 锁），句柄仍在 map——此前无条件 abort（no-op）+
+        // 回「🛑 已中断」，实际轮次已完整跑完；如实回「已完成」，排队语义
+        //（缺省保留自动续跑）不变，用户要丢弃可 /stop all。
+        let (aborted, completed) = if let Some(h) = &running {
+            if h.abort.is_finished() {
+                (false, true)
+            } else {
+                // abort → backend.run future drop → 杀子进程：
+                // CLI 后端 kill_on_drop；ACP 后端 cancel 分支 → 杀连接。
+                h.abort.abort();
+                (true, false)
+            }
         } else {
             // P0-4（v1.17）：批窗口等待 / take_batch→running.insert 注册间隙
             //（typing、store 查询、转录推导等多段 await）内查无在飞句柄。
@@ -643,7 +653,7 @@ impl Dispatcher {
                     .await
                     .insert(conv.0.clone(), super::now_secs());
             }
-            false
+            (false, false)
         };
         // W1-1：缺省保留排队（runner 自动续跑 = steering）；`/stop all` 清空排队
         // + 排队状态（P10 hint）——硬停语义。S-4（原子）：清空与 hint 清理在
@@ -665,25 +675,38 @@ impl Dispatcher {
         // 真机校准（2026-08）：回执走命令卡（卡片平台渲染卡片，纯文本平台由
         // trait 默认降级文本）——中断时刻本就伴随 ⏹ 终态卡 + 快捷操作卡，夹
         // 一条纯文本 ack 视觉割裂。标题承载结论，正文承载排队语义。
-        let (title, body): (&str, String) = match (aborted, hard, queued) {
-            (true, _, 0) => (
-                "🛑 已中断当前任务",
-                "本轮已停止，进行到的进度已保留，下条消息可续接（全新开始可 /new）。".into(),
-            ),
-            (true, false, n) => (
-                "🛑 已中断当前任务",
-                format!("{n} 条排队消息已保留，将自动转入新一轮；要全部丢弃可发 /stop all。"),
-            ),
-            (true, true, n) => ("🛑 已中断当前任务", format!("已丢弃 {n} 条排队消息。")),
-            (false, _, 0) => ("ℹ️ 当前没有运行中的任务", String::new()),
-            (false, false, n) => (
-                "ℹ️ 当前没有运行中的任务",
-                format!("{n} 条消息排队中，将在下一轮处理。"),
-            ),
-            (false, true, n) => (
-                "ℹ️ 当前没有运行中的任务",
-                format!("已丢弃 {n} 条排队消息。"),
-            ),
+        let (title, body): (&str, String) = if completed {
+            match queued {
+                0 => (
+                    "✅ 任务刚已完成（未中断）",
+                    "本轮在你按停止前已自然结束，结果见上方卡片。".into(),
+                ),
+                n => (
+                    "✅ 任务刚已完成（未中断）",
+                    format!("{n} 条消息排队中，将在下一轮处理；要全部丢弃可发 /stop all。"),
+                ),
+            }
+        } else {
+            match (aborted, hard, queued) {
+                (true, _, 0) => (
+                    "🛑 已中断当前任务",
+                    "本轮已停止，进行到的进度已保留，下条消息可续接（全新开始可 /new）。".into(),
+                ),
+                (true, false, n) => (
+                    "🛑 已中断当前任务",
+                    format!("{n} 条排队消息已保留，将自动转入新一轮；要全部丢弃可发 /stop all。"),
+                ),
+                (true, true, n) => ("🛑 已中断当前任务", format!("已丢弃 {n} 条排队消息。")),
+                (false, _, 0) => ("ℹ️ 当前没有运行中的任务", String::new()),
+                (false, false, n) => (
+                    "ℹ️ 当前没有运行中的任务",
+                    format!("{n} 条消息排队中，将在下一轮处理。"),
+                ),
+                (false, true, n) => (
+                    "ℹ️ 当前没有运行中的任务",
+                    format!("已丢弃 {n} 条排队消息。"),
+                ),
+            }
         };
         if let Err(e) = self
             .platform

@@ -52,6 +52,10 @@ impl Dispatcher {
                     error = %e,
                     "permission socket 路径是目录且无法删除：请手动移除后重启（Ask 权限闭环依赖该 socket）"
                 );
+                // R3（code-review v9）：CAS 已在入口置位，失败必须回滚——否则
+                // 下次热切拿到伪「已就绪」，Ask 档静默退化全 deny。
+                self.socket_spawned
+                    .store(false, std::sync::atomic::Ordering::Release);
                 return false;
             }
         }
@@ -66,6 +70,9 @@ impl Dispatcher {
                     error = %e,
                     "bind permission socket 失败：Ask 权限闭环不可用（降级为无审批，安全 posture 退化）"
                 );
+                // R3：同上，失败回滚标志。
+                self.socket_spawned
+                    .store(false, std::sync::atomic::Ordering::Release);
                 return false;
             }
         };
@@ -75,6 +82,9 @@ impl Dispatcher {
             Ok(l) => l,
             Err(e) => {
                 warn!(target: "imagent::core", error = %e, "from_std permission socket failed");
+                // R3：同上，失败回滚标志。
+                self.socket_spawned
+                    .store(false, std::sync::atomic::Ordering::Release);
                 return false;
             }
         };
