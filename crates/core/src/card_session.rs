@@ -59,10 +59,13 @@ pub(crate) fn queued_hint_display(h: &QueuedHint) -> Option<String> {
 }
 
 /// 流式卡片会话。
-/// 卡片成功终态下需要补发全文文本的字节阈值（真机校准 2026-08-30）：略高于
-/// 平台侧 4KB+4KB 头尾窗预算——只有被截断的正文才补发，避免短内容卡+文本
-/// 双发噪音。
-const CARD_TEXT_FULL_THRESHOLD: usize = 8_500;
+/// 卡片成功终态下需要补发全文文本的字节阈值（真机校准 2026-08-30）。
+/// R2（code-review v9）：取值必须**低于**平台侧 4KB+4KB（8192）头尾窗——
+/// 此前 8500 在 (8192, 8500] 区间留下「卡被截断却不补发」的空洞；正文
+/// 超 8KB ⇒ 卡片 md 必超窗被截 ⇒ 必补发。略低于窗防 md 头部（状态行等）
+/// 占用造成的边界漏发；短内容卡+文本双发噪音的代价可接受（8KB 以上本就
+/// 不适合只读卡）。
+const CARD_TEXT_FULL_THRESHOLD: usize = 8_000;
 
 pub(crate) struct CardSession {
     text: String,

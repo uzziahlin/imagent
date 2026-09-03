@@ -85,18 +85,18 @@
 
 | ID | 级别 | 标题 | 状态 |
 |---|---|---|---|
-| R1 | 🟠 | 终态最小卡兜底吞错 → core 纯文本补发不触发 → 内容丢失 | ⬜ |
-| R2 | 🟠 | 截断标注「见文本消息」虚假承诺（8KB-30KB 区间被截且无补发） | ⬜ |
-| R3 | 🟠 | socket_spawned 失败不回滚（L15 修复反噬，Ask 静默退化） | ⬜ |
-| R4 | 🟠 | H1 残余：route 投递前不复查 mode（热切 deny 后 300s 窗口可绕过） | ⬜ |
-| R5 | 🟠 | L2 残余：ACP hook 路径无哨兵收敛（"y" 当 prompt 原样存在） | ⬜ |
-| R6 | 🟠 | L2 残余：ask_via_im 路径哨兵泄漏为终端答案 + 卡不收敛 | ⬜ |
-| R7 | 🟡 | L8 残留：工具/思考面板、询问卡 question 未转义 | ⬜ |
-| R8 | 🟡 | L9 残留：stream_body_final 未截断（commit 声称三路径实为两处） | ⬜ |
-| R9 | 🟡 | L7 残留：NewSession 分支漏设 loaded_cwd（/cd 假缓存命中） | ⬜ |
-| R10 | 🟡 | env 隔离测试依赖宿主 IMAGENT_ACP_COMMAND（实证翻车） | ⬜ |
-| R11 | 🟡 | claude_parse 丢顶层 arguments 回退 | ⬜ |
-| R12 | 🟡 | JSON 形态 IMAGENT_ACP_COMMAND 破坏 | ⬜ |
-| R13 | 🟡 | escape_lt 破坏代码块内 `<` 显示 | ⬜ |
-| R14 | 🟡 | 微项集合：注释失真/口径/死字段/DoD 缺口/v8 跟踪表回填 | ⬜ |
-| R15 | 🟡 | dl_client 无 read_timeout（下载 body 停滞挂起面） | ⬜ |
+| R1 | 🟠 | 终态最小卡兜底吞错 → core 纯文本补发不触发 → 内容丢失 | ✅ 4ac0146 |
+| R2 | 🟠 | 截断标注「见文本消息」虚假承诺（8KB-30KB 区间被截且无补发） | ✅ 迭代二：标注去承诺 + 补发阈值降到卡上限下（8000<8192） |
+| R3 | 🟠 | socket_spawned 失败不回滚（L15 修复反噬，Ask 静默退化） | ✅ 4ac0146 |
+| R4 | 🟠 | H1 残余：route 投递前不复查 mode（热切 deny 后 300s 窗口可绕过） | ✅ 4ac0146（deny/off 且 conv 有 Permission pending 时强制 deny，不影响 ask_via_im） |
+| R5 | 🟠 | L2 残余：ACP hook 路径无哨兵收敛（"y" 当 prompt 原样存在） | ✅ 迭代二：ACP hook Replied 分支哨兵撤卡 |
+| R6 | 🟠 | L2 残余：ask_via_im 路径哨兵泄漏为终端答案 + 卡不收敛 | ✅ 迭代二：哨兵→撤卡 + dropped 计数 + 错误语义回传 |
+| R7 | 🟡 | L8 残留：工具/思考面板、询问卡 question 未转义 | ✅ 4ac0146 + 迭代二 R13 |
+| R8 | 🟡 | L9 残留：stream_body_final 未截断（commit 声称三路径实为两处） | ✅ 4ac0146 |
+| R9 | 🟡 | L7 残留：NewSession 分支漏设 loaded_cwd（/cd 假缓存命中） | ✅ 4ac0146 |
+| R10 | 🟡 | env 隔离测试依赖宿主 IMAGENT_ACP_COMMAND（实证翻车） | ✅ 迭代二：serial + remove_var + 自定义/JSON 形态断言 |
+| R11 | 🟡 | claude_parse 丢顶层 arguments 回退 | ✅ 迭代二：顶层/嵌套 arguments 回退恢复 |
+| R12 | 🟡 | JSON 形态 IMAGENT_ACP_COMMAND 破坏 | ✅ 迭代二：JSON spec 形态跳过 env 前导 |
+| R13 | 🟡 | escape_lt 破坏代码块内 `<` 显示 | ✅ 迭代二：围栏块/行内 code span 不转义 |
+| R14 | 🟡 | 微项集合：注释失真/口径/死字段/DoD 缺口/v8 跟踪表回填 | ✅ 迭代二（代码微项全清；v8 跟踪表回填未做） |
+| R15 | 🟡 | dl_client 无 read_timeout（下载 body 停滞挂起面） | ✅ 4ac0146（read_timeout 30s） |

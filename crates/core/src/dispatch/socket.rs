@@ -554,7 +554,30 @@ impl Dispatcher {
             "ask_via_im 询问已送达，等待回复"
         );
         let reply = match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(r)) => r,
+            Ok(Ok(r)) => {
+                // v9-R6（L2 残余，ask_via_im 路径）：淘汰哨兵不是用户答案——
+                // (a) 收敛问题卡（防残留可点：点后 route miss，回写文本被当
+                //     prompt 跑一轮 agent）；
+                // (b) 不得把字面 "imagent:evicted" 回写给终端 agent；
+                // (c) 计数按 dropped（系统收敛，非用户答复，不污染 ok 口径）。
+                if r.raw_text.as_deref() == Some(crate::permission::EVICTED_SENTINEL) {
+                    if let Err(e) = platform.cancel_permission_ask(&conv, &request_id).await {
+                        warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "淘汰问答卡收敛失败");
+                    }
+                    METRICS
+                        .ask_via_im_replies
+                        .with_label_values(&["dropped"])
+                        .inc();
+                    Self::write_ask_reply(
+                        &mut stream,
+                        &request_id,
+                        Err("evicted: pending 超上限被系统收敛（请重试提问）"),
+                    )
+                    .await;
+                    return;
+                }
+                r
+            }
             Ok(Err(_)) => {
                 router.cancel(&conv.0, &request_id).await;
                 Self::write_ask_reply(&mut stream, &request_id, Err("router dropped")).await;

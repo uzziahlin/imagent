@@ -3,11 +3,11 @@
 use std::path::PathBuf;
 
 /// 平台会话标识，形如 `ilink:<from_user_id>`、`wecom:<user>`。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ConvId(pub String);
 
 /// 发送者标识（iLink 的 from_user_id 等）。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct UserId(pub String);
 
 /// agent 分配的会话 id（如 Claude 的 session_id）。
@@ -22,7 +22,7 @@ pub struct Workdir(pub PathBuf);
 /// 平台回传一条消息所需的信息。A3（架构债）：原 `ILink` 变体泛化为
 /// `ContextToken`——「回传需携带会话上下文 token」是平台无关概念（iLink 的
 /// context_token 是首个实例，命名不再绑定具体平台）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ReplyHint {
     ContextToken { context_token: String },
     None,
@@ -36,7 +36,7 @@ pub enum ReplyHint {
 pub const CARD_HANDLE_LOST: &str = "imagent:card-handle-lost";
 
 /// 媒体引用（ilink 入站媒体已下载落盘到 `~/.imagent/media/`，url 为本地路径）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MediaRef {
     pub kind: String,
     pub url: String,
@@ -44,7 +44,7 @@ pub struct MediaRef {
 
 /// 消息中 @ 提及的用户（P6-1：平台层从消息元数据解析，正文已替换为 `@名字` 可读
 /// 文本）。命令据此把 `/allow @名字` 解析回平台用户 id，免手打 open_id。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Mention {
     /// 平台用户 id（飞书 open_id / wecom userid / ilink from_user_id）。
     pub user_id: String,
@@ -93,7 +93,7 @@ pub struct CardButton {
 /// 合成 `InboundMessage` 投递进 recv 通道，dispatch 在白名单校验**之前**消费
 /// （见 `handle` 的 control 分支）——控制信号不是对话输入，不应被鉴权丢弃。
 /// 普通消息为 `None`。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum InboundControl {
     /// 用户撤回了消息（飞书 `im.message.recalled_v1`）：被撤回消息的平台侧 id 在
     /// [`InboundMessage::source_msg_id`]，dispatch 据此把同 id 的**排队**消息移出。
@@ -110,6 +110,9 @@ pub enum InboundControl {
 }
 
 /// 入站消息（`Platform::recv` 产出，core 消费）。
+/// serde：排队消息持久化（v1.18 迭代，store `queued_messages`）——控制
+/// 信号（control）是瞬态系统事件不排队，`#[serde(skip)]`。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InboundMessage {
     pub conv_id: ConvId,
     pub sender: UserId,
@@ -133,7 +136,8 @@ pub struct InboundMessage {
     /// 等合成消息为 None。
     pub source_msg_id: Option<String>,
     /// 平台控制信号（消息撤回 / bot 被移出群等系统事件的合成载体）。普通用户
-    /// 消息为 None。
+    /// 消息为 None。serde：瞬态信号不持久化（排队消息恒 None）。
+    #[serde(skip)]
     pub control: Option<InboundControl>,
     pub reply_hint: ReplyHint,
 }

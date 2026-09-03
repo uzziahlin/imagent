@@ -579,10 +579,15 @@ pub(crate) fn claude_parse(line: &str) -> CliEvent {
             let tool_name = pick("tool_name", "tool_name")
                 .or_else(|| pick("tool", "tool_name"))
                 .unwrap_or_default();
+            // R11（code-review v9）：顶层 `arguments` 回退恢复——注释一直宣称
+            // 「input|arguments 容错」，v1.17 改造时回退被删；某版本 CLI 的
+            // canUseTool 以顶层 arguments 携带输入时审批卡会丢输入预览。
             let input = v
                 .get("input")
                 .cloned()
                 .or_else(|| req.and_then(|r| r.get("input")).cloned())
+                .or_else(|| v.get("arguments").cloned())
+                .or_else(|| req.and_then(|r| r.get("arguments")).cloned())
                 .map(|i| i.to_string())
                 .unwrap_or_else(|| "{}".into());
             return CliEvent::ControlRequest {
