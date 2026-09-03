@@ -267,24 +267,15 @@ impl AcpBackend {
     fn sanitized_agent_command(model: Option<String>) -> String {
         let base = Self::agent_command();
         let mut assignments: Vec<String> = Vec::new();
-        let safe = |v: &str| {
-            !v.is_empty()
-                && v.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "._/:=+-@[]".contains(c))
-        };
-        for key in [
-            "PATH",
-            "HOME",
-            "USER",
-            "LOGNAME",
-            "LANG",
-            "LC_ALL",
-            "LC_CTYPE",
-            "TZ",
-            "TMPDIR",
-            "ANTHROPIC_API_KEY",
-            "ANTHROPIC_BASE_URL",
-        ] {
+        // v1.18 迭代：基础运行时白名单与值校验改用 core 共享定义（与 CLI 路径
+        // spawn_cli_backend 同一事实来源，防单边漂移）；凭据类 key 仍是 claude
+        // 特有声明。
+        let safe = imagent_core::agent_process::env_value_safe;
+        for key in imagent_core::agent_process::AGENT_RUNTIME_ENV
+            .iter()
+            .copied()
+            .chain(["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"])
+        {
             match std::env::var(key) {
                 Ok(v) if safe(&v) => assignments.push(format!("{key}={v}")),
                 Ok(_v) => tracing::warn!(

@@ -1234,9 +1234,9 @@ pub fn tools_unrestricted(tools: &[String]) -> bool {
 ///
 /// 其余 env（含各类 `*_API_KEY`、`DATABASE_URL`、CI secret 等）一律不透传——
 /// 由各 backend 经 `spawn_cli_backend` 的 `passthrough_env` 显式声明自己所需 key。
-const ALWAYS_PASSTHROUGH_ENV: &[&str] = &[
-    "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR",
-];
+/// v1.18 迭代：清单本体移至 [`crate::agent_process::AGENT_RUNTIME_ENV`]（与 ACP
+/// 路径共享同一事实来源，防 v8-H2 式的单边修复漂移）；旧名保留为别名。
+const ALWAYS_PASSTHROUGH_ENV: &[&str] = crate::agent_process::AGENT_RUNTIME_ENV;
 
 #[cfg(test)]
 mod tests {
