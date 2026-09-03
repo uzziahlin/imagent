@@ -381,31 +381,43 @@ pub fn parse_card_action_event(payload: &[u8]) -> Option<(String, InboundMessage
             };
             (!joined.is_empty()).then_some(joined)
         };
-        // 多题字段 ask_opt_0..N 按序拼接；单题旧字段 ask_opt 兜底。
-        // v1.17.2：每题自由输入 ask_opt_{i}_free 非空则**优先于**选项（对齐
-        // CLI 原生自定义回答；原文进入用户选择消息，agent 自行对应到题）。
+        // 多题字段按题号归并：ask_opt_{i}（选项值）与 ask_opt_{i}_free（自由
+        // 输入）**都是**该题的键——题号要从两类键一起收集，否则「只用自由输入
+        // 作答的题」（选项键缺席 form_value）整题被漏掉（v1.17.3 真机首测即此
+        // 形态：两题选项 + 两题自由输入，只回传了选项两题）。单题旧字段 ask_opt 兜底。
         let mut parts: Vec<String> = Vec::new();
         if let Some(obj) = fv.as_object() {
-            let mut idx_keys: Vec<(u32, &String)> = obj
+            let mut idxes: Vec<u32> = obj
                 .keys()
                 .filter_map(|k| {
                     k.strip_prefix("ask_opt_")
-                        .and_then(|s| s.parse::<u32>().ok())
-                        .map(|i| (i, k))
+                        .and_then(|s| s.strip_suffix("_free").unwrap_or(s).parse::<u32>().ok())
                 })
                 .collect();
-            idx_keys.sort();
-            for (i, k) in idx_keys {
+            idxes.sort_unstable();
+            idxes.dedup();
+            for i in idxes {
+                // 自由输入非空则优先于选项（对齐 CLI 原生自定义回答；原文进入
+                // 用户选择消息，agent 自行对应到题）。值形态容错（字符串/数组/
+                // 对象 {text|value}）——文档口径为字符串，真机原始载荷见
+                // platform.rs 的 card.action debug 日志，形态校准后收紧。
                 let free = obj
                     .get(&format!("ask_opt_{i}_free"))
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
+                    .and_then(|v| {
+                        field_joined(v).or_else(|| {
+                            v.get("text")
+                                .or_else(|| v.get("value"))
+                                .and_then(|x| x.as_str())
+                                .map(String::from)
+                        })
+                    })
+                    .map(|s| s.trim().to_string())
                     .filter(|t| !t.is_empty());
                 if let Some(f) = free {
-                    parts.push(f.to_string());
+                    parts.push(f);
                     continue;
                 }
-                if let Some(p) = obj.get(k).and_then(field_joined) {
+                if let Some(p) = obj.get(&format!("ask_opt_{i}")).and_then(field_joined) {
                     parts.push(p);
                 }
             }
@@ -2388,6 +2400,37 @@ mod tests {
             "free 优先且空串忽略: {:?}",
             mix.text
         );
+        // 仅自由输入的题（v1.17.3 真机失败形态）：选项键缺席 form_value，
+        // 题号只存在于 _free 键——必须照样入列（旧实现整题漏掉）。
+        let (_, fonly, _) = parse_card_action_event(&mk(serde_json::json!({
+            "ask_opt_0": "备份策略=执行备份",
+            "ask_opt_1": "执行时机=等待窗口期",
+            "ask_opt_2_free": "目标环境用预发环境",
+            "ask_opt_3_free": "团队通知发研发群"
+        })))
+        .expect("仅 free 的题应回调");
+        assert_eq!(
+            fonly.text.as_deref(),
+            Some("ask:备份策略=执行备份；执行时机=等待窗口期；目标环境用预发环境；团队通知发研发群"),
+            "free-only 题不因选项键缺席而漏: {:?}",
+            fonly.text
+        );
+        // free 值对象形态容错（{text|value}，形态未证实前的防御）。
+        let (_, fobj, _) = parse_card_action_event(&mk(serde_json::json!({
+            "ask_opt_0_free": {"text": "对象形态的说明"}
+        })))
+        .expect("对象形态 free 应回调");
+        assert_eq!(
+            fobj.text.as_deref(),
+            Some("ask:对象形态的说明"),
+            "对象形态 {{text}} 提取: {:?}",
+            fobj.text
+        );
+        let (_, fval, _) = parse_card_action_event(&mk(serde_json::json!({
+            "ask_opt_0_free": {"value": "value 字段形态"}
+        })))
+        .expect("value 形态 free 应回调");
+        assert_eq!(fval.text.as_deref(), Some("ask:value 字段形态"));
         // 空数组 / 缺字段 → 丢弃。
         assert!(parse_card_action_event(&mk(serde_json::json!({"ask_opt": []}))).is_none());
         assert!(parse_card_action_event(&mk(serde_json::json!({}))).is_none());

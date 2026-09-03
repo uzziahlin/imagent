@@ -562,6 +562,14 @@ impl FeishuPlatform {
                 // 点终止——proto 侧已判，此处回提示后丢弃，不进 core 分派）；
                 // 审批按钮另做**发起者校验**（群 conv 下点击者须为登记的发起者，
                 // 私聊单人免检）。
+                // v1.17.3 诊断：真机 2026-09-03 自由输入值未随 form_value 到达
+                //（select 键都在、_free 键缺失）——debug 级记原始回调载荷，形态
+                // 校准后可移除。
+                debug!(
+                    target: "feishu",
+                    payload = %String::from_utf8_lossy(&payload),
+                    "card.action.trigger 原始载荷"
+                );
                 if let Some((key, reply_msg, deny)) = parse_card_action_event(&payload) {
                     if let Some(deny_text) = deny {
                         if !dedup.check(&key) {
