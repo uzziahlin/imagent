@@ -96,13 +96,31 @@ impl CronSpec {
     /// from 之后（严格大于）的下次触发时刻（epoch 秒，分钟对齐）。无解
     /// （如 2 月 30 日）在 366 天内搜不到时返回 None。
     pub(super) fn next_after(&self, from_epoch: i64) -> Option<i64> {
-        let offset = local_offset_secs(from_epoch);
+        // v1.18 review：偏移量随步进重算——此前整个 366 天窗口共用起点的单个
+        // 偏移，跨 DST 换点后的触发按旧偏移对齐（每天 9:00 的任务在换点次日
+        // 8:00 触发，错的 next_run 还被落库顺延）。日变更粒度刷新 + 候选命中
+        // 时实时偏移复核（换点发生在凌晨、日边界重算覆盖不到当天 2-3 点后的
+        // 场景），localtime_r 调用量每天至多几次。
+        let mut offset = local_offset_secs(from_epoch);
+        let mut cur_day = (from_epoch + offset).div_euclid(86_400);
         // 从 from 的下一分钟边界开始步进（60s 对齐）。
         let mut t = from_epoch - from_epoch.rem_euclid(60) + 60;
         let limit = t + 366 * 24 * 3600;
         while t <= limit {
+            let day = (t + offset).div_euclid(86_400);
+            if day != cur_day {
+                offset = local_offset_secs(t);
+                cur_day = (t + offset).div_euclid(86_400);
+            }
             let (min, hour, dom, mon, dow) = civil_fields(t + offset);
             if self.matches(min, hour, dom, mon, dow) {
+                // 命中后用候选时刻的实时偏移复核：换点窗口内旧偏移可能给出
+                // 假命中/假错过——刷新偏移重算本分钟（不推进 t）。
+                let fresh = local_offset_secs(t);
+                if fresh != offset {
+                    offset = fresh;
+                    continue;
+                }
                 return Some(t);
             }
             t += 60;
@@ -181,53 +199,66 @@ impl Dispatcher {
         hint: &ReplyHint,
         parts: &[&str],
     ) {
-    let usage = "用法：/cron add <分 时 日 月 周> <指令>…（如 `/cron add 0 9 * * * 给我今日站会摘要`，\"* * * * *\" 每分钟、`0 9 * * 1-5` 工作日 9 点）\n/cron list 列出本会话任务 · /cron rm <id> 删除";
-    let Some(sub) = parts.get(1).map(|s| s.to_ascii_lowercase()) else {
-        self.reply(conv, usage, hint).await;
-        return;
-    };
-    match sub.as_str() {
-        "add" => {
-            // parts: /cron add f1 f2 f3 f4 f5 prompt…
-            if parts.len() < 7 {
-                self.reply(conv, &format!("⚠️ 缺少表达式或指令。\n{usage}"), hint).await;
-                return;
-            }
-            let expr = parts[2..7].join(" ");
-            let prompt = parts[7..].join(" ");
-            let Some(spec) = CronSpec::parse(&expr) else {
-                self.reply(conv, &format!("⚠️ 表达式非法：`{expr}`\n{usage}"), hint).await;
-                return;
-            };
-            let now = super::super::now_secs();
-            let Some(next) = spec.next_after(now) else {
-                self.reply(conv, &format!("⚠️ 表达式一年内无触发时刻（如 2 月 30 日）：`{expr}`"), hint).await;
-                return;
-            };
-            // 每会话上限 20 条：定时注入与手打同权，防滥用占满轮次。
-            let jobs = self.store.list_cron_jobs().await.unwrap_or_default();
-            if jobs.iter().filter(|j| j.conv == conv.0).count() >= 20 {
-                self.reply(conv, "⚠️ 本会话定时任务已达上限（20 条），请先 /cron rm 清理。", hint).await;
-                return;
-            }
-            let id = cron_id(&conv.0, &expr, &prompt);
-            let job = imagent_store::CronJobRow {
-                id: id.clone(),
-                conv: conv.0.clone(),
-                sender: sender.0.clone(),
-                expr: expr.clone(),
-                prompt: prompt.clone(),
-                created_at: now,
-                last_run: None,
-                next_run: next,
-                enabled: true,
-            };
-            if let Err(e) = self.store.insert_cron_job(&job).await {
-                warn!(target: "imagent::core", error = %e, "定时任务落库失败");
-                self.reply(conv, "⚠️ 创建失败（存储错误），请稍后重试。", hint).await;
-                return;
-            }
-            self.reply(
+        let usage = "用法：/cron add <分 时 日 月 周> <指令>…（如 `/cron add 0 9 * * * 给我今日站会摘要`，\"* * * * *\" 每分钟、`0 9 * * 1-5` 工作日 9 点）\n/cron list 列出本会话任务 · /cron rm <id> 删除";
+        let Some(sub) = parts.get(1).map(|s| s.to_ascii_lowercase()) else {
+            self.reply(conv, usage, hint).await;
+            return;
+        };
+        match sub.as_str() {
+            "add" => {
+                // parts: /cron add f1 f2 f3 f4 f5 prompt…
+                if parts.len() < 7 {
+                    self.reply(conv, &format!("⚠️ 缺少表达式或指令。\n{usage}"), hint)
+                        .await;
+                    return;
+                }
+                let expr = parts[2..7].join(" ");
+                let prompt = parts[7..].join(" ");
+                let Some(spec) = CronSpec::parse(&expr) else {
+                    self.reply(conv, &format!("⚠️ 表达式非法：`{expr}`\n{usage}"), hint)
+                        .await;
+                    return;
+                };
+                let now = super::super::now_secs();
+                let Some(next) = spec.next_after(now) else {
+                    self.reply(
+                        conv,
+                        &format!("⚠️ 表达式一年内无触发时刻（如 2 月 30 日）：`{expr}`"),
+                        hint,
+                    )
+                    .await;
+                    return;
+                };
+                // 每会话上限 20 条：定时注入与手打同权，防滥用占满轮次。
+                let jobs = self.store.list_cron_jobs().await.unwrap_or_default();
+                if jobs.iter().filter(|j| j.conv == conv.0).count() >= 20 {
+                    self.reply(
+                        conv,
+                        "⚠️ 本会话定时任务已达上限（20 条），请先 /cron rm 清理。",
+                        hint,
+                    )
+                    .await;
+                    return;
+                }
+                let id = cron_id(&conv.0, &expr, &prompt);
+                let job = imagent_store::CronJobRow {
+                    id: id.clone(),
+                    conv: conv.0.clone(),
+                    sender: sender.0.clone(),
+                    expr: expr.clone(),
+                    prompt: prompt.clone(),
+                    created_at: now,
+                    last_run: None,
+                    next_run: next,
+                    enabled: true,
+                };
+                if let Err(e) = self.store.insert_cron_job(&job).await {
+                    warn!(target: "imagent::core", error = %e, "定时任务落库失败");
+                    self.reply(conv, "⚠️ 创建失败（存储错误），请稍后重试。", hint)
+                        .await;
+                    return;
+                }
+                self.reply(
                 conv,
                 &format!(
                     "✅ 定时任务已创建 `{id}`\n⏰ `{expr}`（本地时区）\n📝 {prompt}\n⏭️ 下次执行：{}",
@@ -236,64 +267,83 @@ impl Dispatcher {
                 hint,
             )
             .await;
-        }
-        "list" => {
-            let jobs = self
-                .store
-                .list_cron_jobs()
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|j| j.conv == conv.0)
-                .collect::<Vec<_>>();
-            if jobs.is_empty() {
-                self.reply(conv, "📭 本会话没有定时任务（/cron add 创建）。", hint).await;
-                return;
             }
-            let mut body = String::from("⏰ 本会话定时任务：");
-            for j in jobs {
-                let next = CronSpec::parse(&j.expr)
-                    .and_then(|s| s.next_after(j.last_run.unwrap_or(j.created_at).max(j.created_at)))
-                    .unwrap_or(j.next_run);
-                body.push_str(&format!(
-                    "\n- `{}` `{}`（下次 {}）→ {}",
-                    j.id,
-                    j.expr,
-                    format_local(next),
-                    truncate_str(&j.prompt, 40)
-                ));
+            "list" => {
+                let jobs = self
+                    .store
+                    .list_cron_jobs()
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|j| j.conv == conv.0)
+                    .collect::<Vec<_>>();
+                if jobs.is_empty() {
+                    self.reply(conv, "📭 本会话没有定时任务（/cron add 创建）。", hint)
+                        .await;
+                    return;
+                }
+                let mut body = String::from("⏰ 本会话定时任务：");
+                for j in jobs {
+                    // v1.18 review：优先展示调度器权威的 next_run（触发时已按实际
+                    // fire 时刻顺延）——此前从 last_run 重算，停机跨过首跑的任务
+                    // 会显示一个过去的「下次执行」直到下个 tick。
+                    let next = if j.next_run > 0 {
+                        j.next_run
+                    } else {
+                        j.last_run.unwrap_or(0)
+                    };
+                    let next = if next > 0 {
+                        next
+                    } else {
+                        CronSpec::parse(&j.expr)
+                            .and_then(|s| s.next_after(j.created_at))
+                            .unwrap_or(j.next_run)
+                    };
+                    body.push_str(&format!(
+                        "\n- `{}` `{}`（下次 {}）→ {}",
+                        j.id,
+                        j.expr,
+                        format_local(next),
+                        truncate_str(&j.prompt, 40)
+                    ));
+                }
+                self.reply(conv, &body, hint).await;
             }
-            self.reply(conv, &body, hint).await;
-        }
-        "rm" => {
-            let Some(id) = parts.get(2) else {
-                self.reply(conv, &format!("⚠️ 缺少 id。\n{usage}"), hint).await;
-                return;
-            };
-            match self.store.get_cron_job(id).await {
-                Ok(Some(job)) if job.conv == conv.0 => {
-                    let is_admin = self.admin_senders.read().contains(&sender.0);
-                    if job.sender != sender.0 && !is_admin {
-                        self.reply(conv, "⛔ 只能删除自己创建的任务（管理员可删任意）。", hint).await;
-                        return;
-                    }
-                    match self.store.delete_cron_job(id).await {
-                        Ok(true) => self.reply(conv, &format!("🗑️ 已删除定时任务 `{id}`。", ), hint).await,
-                        Ok(false) => self.reply(conv, "⚠️ 任务不存在。", hint).await,
-                        Err(e) => {
-                            warn!(target: "imagent::core", error = %e, "定时任务删除失败");
-                            self.reply(conv, "⚠️ 删除失败（存储错误）。", hint).await;
+            "rm" => {
+                let Some(id) = parts.get(2) else {
+                    self.reply(conv, &format!("⚠️ 缺少 id。\n{usage}"), hint)
+                        .await;
+                    return;
+                };
+                match self.store.get_cron_job(id).await {
+                    Ok(Some(job)) if job.conv == conv.0 => {
+                        // v1.18 review：与其它授权门统一走 is_admin（两侧 trim）——
+                        // 直接 contains 会漏掉配置里带首尾空格的 admin。
+                        if job.sender != sender.0 && !self.is_admin(&sender.0) {
+                            self.reply(conv, "⛔ 只能删除自己创建的任务（管理员可删任意）。", hint)
+                                .await;
+                            return;
+                        }
+                        match self.store.delete_cron_job(id).await {
+                            Ok(true) => {
+                                self.reply(conv, &format!("🗑️ 已删除定时任务 `{id}`。",), hint)
+                                    .await
+                            }
+                            Ok(false) => self.reply(conv, "⚠️ 任务不存在。", hint).await,
+                            Err(e) => {
+                                warn!(target: "imagent::core", error = %e, "定时任务删除失败");
+                                self.reply(conv, "⚠️ 删除失败（存储错误）。", hint).await;
+                            }
                         }
                     }
-                }
-                Ok(Some(_)) => self.reply(conv, "⛔ 任务不属于本会话。", hint).await,
-                Ok(None) => self.reply(conv, "⚠️ 任务不存在。", hint).await,
-                Err(e) => {
-                    warn!(target: "imagent::core", error = %e, "定时任务查询失败");
-                    self.reply(conv, "⚠️ 查询失败（存储错误）。", hint).await;
+                    Ok(Some(_)) => self.reply(conv, "⛔ 任务不属于本会话。", hint).await,
+                    Ok(None) => self.reply(conv, "⚠️ 任务不存在。", hint).await,
+                    Err(e) => {
+                        warn!(target: "imagent::core", error = %e, "定时任务查询失败");
+                        self.reply(conv, "⚠️ 查询失败（存储错误）。", hint).await;
+                    }
                 }
             }
-        }
             _ => self.reply(conv, usage, hint).await,
         }
     }
@@ -337,7 +387,14 @@ impl Dispatcher {
                 control: None,
                 reply_hint: ReplyHint::None,
             };
-            self.handle(msg).await;
+            // 调度器只分发不执行：handle 对空闲 conv 会内联跑完整轮 agent（分钟
+            // 级），若在 tick 循环里 await 会（a）队头阻塞所有 conv 的其它 cron
+            // 任务、（b）select 饿死收不到 shutdown。与 recv 循环同款：spawn 进
+            // tasks，drain（P1-5）一并覆盖 cron 驱动的轮次。
+            let this = self.clone();
+            self.tasks.lock().await.spawn(async move {
+                this.handle(msg).await;
+            });
         }
     }
 }

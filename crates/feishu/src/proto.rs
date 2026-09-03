@@ -646,16 +646,21 @@ pub fn thread_key_of_payload(payload: &[u8]) -> Option<String> {
 }
 
 /// 暂不支持的消息类型 → 用户可读提示（语音/分享卡片等，parse_message_event
-/// 对这些类型返回 None 静默丢弃，本函数给出替代提示）。返回 `(提示文案, conv)`：
-/// conv 仅在能确定回执目标且**近似通过可见性门槛**（p2p，或群消息带 @）时给出
-/// ——白名单校验在 core 侧（平台 drain 无白名单状态），群内不带 @ 的消息本就
-/// 不会送达 bot，提示也不应发（近似「只对可达用户提示」）。
+/// 对这些类型返回 None 静默丢弃，本函数给出替代提示）。返回 `(提示文案, 去重键,
+/// conv)`：
+/// - 去重键 = message_id——drain 侧必须过 Dedup（事件重投/断线重连会重复触发，
+///   v1.18 review 前该分支是唯一不经 dedup 的回执路径）；
+/// - conv 仅 p2p 给出（群内「带 @」弱门槛会让**非白名单群**里的贴纸/分享触发
+///   bot 回复——既是垃圾消息面也是 bot 存活性探针；白名单校验在 core 侧，
+///   平台层无从判断，群内一律不提示）。
 ///
 /// merged_forward（合并转发）已完整支持（drain 层拉子消息转录，见
 /// [`parse_merged_forward_event`]），此处保留仅作**回退兜底**：事件缺 message_id
 /// （无法拉子消息）时 parse_merged_forward_event 返回 None，走到这里给可行动
 /// 提示（「解析失败回退现状提示」）。
-pub fn unsupported_message_notice(payload: &[u8]) -> Option<(&'static str, Option<ConvId>)> {
+pub fn unsupported_message_notice(
+    payload: &[u8],
+) -> Option<(&'static str, Option<String>, Option<ConvId>)> {
     let evt: FeishuEvent = serde_json::from_slice(payload).ok()?;
     if evt.header.event_type != "im.message.receive_v1" {
         return None;
@@ -671,25 +676,24 @@ pub fn unsupported_message_notice(payload: &[u8]) -> Option<(&'static str, Optio
         }
         _ => return None,
     };
-    // p2p：直接回私聊；群：须带 @（mentions 非空的弱门槛，同 group_mention_ok
-    // 的 bot id 未知退化形态）。
-    if evt.event.message.chat_type == "p2p" {
-        let oid = evt.event.sender.sender_id.open_id;
-        if oid.is_empty() {
-            return None;
-        }
-        return Some((notice, Some(ConvId(format!("feishu:{oid}")))));
-    }
-    if evt.event.message.mentions.is_empty() {
+    // 仅 p2p 回提示（理由见函数文档）。去重键：message_id，缺省回退 header
+    // event_id（重投事件二者都保持原值，dedup 仍有效）；两者皆缺不发（无法
+    // 去重的回执在事件重投下会刷屏）。
+    if evt.event.message.chat_type != "p2p" {
         return None;
     }
-    let chat = evt
+    let oid = evt.event.sender.sender_id.open_id;
+    if oid.is_empty() {
+        return None;
+    }
+    let key = evt
         .event
-        .chat
-        .as_ref()
-        .map(|c| c.chat_id.clone())
-        .or_else(|| evt.event.message.chat_id.clone())?;
-    Some((notice, Some(ConvId(format!("feishu:{chat}")))))
+        .message
+        .message_id
+        .clone()
+        .filter(|m| !m.is_empty())
+        .or_else(|| evt.header.event_id.clone().filter(|e| !e.is_empty()));
+    Some((notice, key, Some(ConvId(format!("feishu:{oid}")))))
 }
 
 /// W3-1：audio 消息 content `{"file_key":"…","duration":…}` → file_key。
@@ -2428,7 +2432,9 @@ mod tests {
         .expect("仅 free 的题应回调");
         assert_eq!(
             fonly.text.as_deref(),
-            Some("ask:备份策略=执行备份；执行时机=等待窗口期；目标环境用预发环境；团队通知发研发群"),
+            Some(
+                "ask:备份策略=执行备份；执行时机=等待窗口期；目标环境用预发环境；团队通知发研发群"
+            ),
             "free-only 题不因选项键缺席而漏: {:?}",
             fonly.text
         );
@@ -2445,10 +2451,12 @@ mod tests {
         .expect("真机形态应回调");
         assert_eq!(
             real.text.as_deref(),
-            Some("ask:我需要发布到开发环境；是否备份=执行备份；通知给对应用户；执行时机=等待窗口期"),
+            Some(
+                "ask:我需要发布到开发环境；是否备份=执行备份；通知给对应用户；执行时机=等待窗口期"
+            ),
             "真机载荷回放: {:?}",
             real.text
-        );        // 空数组 / 缺字段 → 丢弃。
+        ); // 空数组 / 缺字段 → 丢弃。
         assert!(parse_card_action_event(&mk(serde_json::json!({"ask_opt": []}))).is_none());
         assert!(parse_card_action_event(&mk(serde_json::json!({}))).is_none());
     }
@@ -3044,8 +3052,9 @@ mod tests {
         assert!(thread_key_of_payload(&mk("p2p", Some("om_root1"), "")).is_none());
     }
 
-    /// 不支持类型提示：audio / share_chat / share_user 给文案 + 回执目标（p2p 直回，
-    /// 群须带 @，无 @ 群消息不提示）；其它类型 None。
+    /// 不支持类型提示：audio / share_chat / share_user 给文案 + 去重键 + 回执目标
+    ///（v1.18 收紧：仅 p2p 回执——群内一律不提示，防非白名单群触发 bot 回复；
+    /// 返回 message_id 供 drain 侧 dedup，事件重投不重复回执）；其它类型 None。
     #[test]
     fn unsupported_message_notice_kinds() {
         let mk = |mt: &str, chat_type: &str, mentions: &str| {
@@ -3054,6 +3063,7 @@ mod tests {
                 "event":{
                     "sender":{"sender_id":{"open_id":"ou_u"}},
                     "message":{"message_type":mt,"content":"{}","chat_type":chat_type,
+                        "message_id":"om_n1",
                         "chat_id":"oc_g","mentions":serde_json::from_str::<serde_json::Value>(mentions).unwrap()},
                     "chat":{"chat_id":"oc_g"}
                 }
@@ -3063,21 +3073,22 @@ mod tests {
         };
         // W3-1：audio 已支持（走转写路径），不再出现在提示清单。
         assert!(unsupported_message_notice(&mk("audio", "p2p", "[]")).is_none());
-        let (notice, conv) =
+        let (notice, key, conv) =
             unsupported_message_notice(&mk("share_chat", "p2p", "[]")).expect("群名片应提示");
         assert!(notice.contains("分享卡片"), "{notice}");
         assert_eq!(conv.unwrap().0, "feishu:ou_u");
-        let (notice, _) =
+        assert_eq!(key.as_deref(), Some("om_n1"), "去重键 = message_id");
+        let (notice, _, _) =
             unsupported_message_notice(&mk("share_user", "p2p", "[]")).expect("用户名片应提示");
         assert!(notice.contains("名片"), "{notice}");
-        // 群 + 带 @ → 提示（回群）。
-        let (_, conv) = unsupported_message_notice(&mk(
+        // 群 + 带 @ → 不提示（v1.18 收紧：白名单在 core 侧，群内弱门槛会打搅
+        // 非白名单群）。
+        assert!(unsupported_message_notice(&mk(
             "share_chat",
             "group",
-            r#"[{"key":"@_user_1","id":{"open_id":"ou_bot"}}]"#,
+            r#"[{"key":"@_user_1","id":{"open_id":"ou_bot"}}]"#
         ))
-        .expect("群 @ 分享应提示");
-        assert_eq!(conv.unwrap().0, "feishu:oc_g");
+        .is_none());
         // 群 + 无 @ → 不提示（消息本不会送达处理）。
         assert!(unsupported_message_notice(&mk("share_chat", "group", "[]")).is_none());
         // 支持的类型 → None。
@@ -3098,14 +3109,15 @@ mod tests {
                 "header":{"event_type":"im.message.receive_v1"},
                 "event":{
                     "sender":{"sender_id":{"open_id":"ou_u"}},
-                    "message":{"message_type":mt,"content":"{}","chat_type":"p2p"}
+                    "message":{"message_type":mt,"content":"{}","chat_type":"p2p",
+                        "message_id":"om_rich1"}
                 }
             })
             .to_string()
             .into_bytes()
         };
         for mt in ["merged_forward", "sticker", "media", "video"] {
-            let (notice, conv) =
+            let (notice, key, conv) =
                 unsupported_message_notice(&mk(mt)).unwrap_or_else(|| panic!("{mt} 应提示"));
             assert!(
                 notice.contains("暂不支持合并转发/表情包/视频消息"),
@@ -3113,6 +3125,7 @@ mod tests {
             );
             assert!(notice.contains("发文字或截图"), "{mt}: {notice}");
             assert_eq!(conv.unwrap().0, "feishu:ou_u");
+            assert_eq!(key.as_deref(), Some("om_rich1"));
         }
     }
 
@@ -3284,9 +3297,11 @@ mod tests {
     fn parse_merged_forward_event_missing_id_falls_to_notice() {
         let p = mk_merged_forward_payload("evt_mf4", None, "{}", "p2p", "");
         assert!(parse_merged_forward_event(&p, &MentionPolicy::PERMISSIVE, None).is_none());
-        let (notice, conv) = unsupported_message_notice(&p).expect("缺 message_id 应回退提示");
+        let (notice, key, conv) = unsupported_message_notice(&p).expect("缺 message_id 应回退提示");
         assert!(notice.contains("暂不支持合并转发"), "{notice}");
         assert_eq!(conv.unwrap().0, "feishu:ou_fwd");
+        // 去重键回退到 header event_id（重投事件同 id，drain 侧 dedup 仍有效）。
+        assert_eq!(key.as_deref(), Some("evt_mf4"));
         // 非目标事件 / 非 merged_forward 消息类型 → None。
         let text_payload = br#"{"header":{"event_type":"im.message.receive_v1"},
             "event":{"sender":{"sender_id":{"open_id":"ou_x"}},"message":{"message_type":"text","content":"{\"text\":\"hi\"}","chat_type":"p2p","message_id":"om_t"}}}"#;
@@ -3765,7 +3780,19 @@ fn peek_group_reply_parent_shapes() {
         peek_group_reply_parent(&mk("group", Some("om_p1"))).as_deref(),
         Some("om_p1")
     );
-    assert_eq!(peek_group_reply_parent(&mk("p2p", Some("om_p1"))), None, "私聊无需豁免");
-    assert_eq!(peek_group_reply_parent(&mk("group", None)), None, "非回复形态");
-    assert_eq!(peek_group_reply_parent(&mk("group", Some(""))), None, "空 parent");
+    assert_eq!(
+        peek_group_reply_parent(&mk("p2p", Some("om_p1"))),
+        None,
+        "私聊无需豁免"
+    );
+    assert_eq!(
+        peek_group_reply_parent(&mk("group", None)),
+        None,
+        "非回复形态"
+    );
+    assert_eq!(
+        peek_group_reply_parent(&mk("group", Some(""))),
+        None,
+        "空 parent"
+    );
 }

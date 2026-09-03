@@ -508,6 +508,10 @@ impl Backend for ClaudeBackend {
         // 诊断（control 通道真机校准）：完整 spawn 参数。
         tracing::debug!(target: "imagent::backend", args = ?cmd,
             "claude spawn 参数（get_all）");
+        // 清理 guard 先于 await 建立（见 McpCleanupGuard 文档）：cancel 路径
+        // 才是它存在的理由。命名 `_` 前缀保留绑定到函数尾，正常返回时随
+        // result 组装一并 drop（同步 unlink）。
+        let _mcp_cleanup = mcp_json.as_ref().map(|p| McpCleanupGuard(p.clone()));
         let result = spawn_cli_backend(
             cmd,
             claude_parse,
@@ -523,12 +527,24 @@ impl Backend for ClaudeBackend {
             use_control.then_some(steer),
         )
         .await;
-        // S-6 / P3-2：run 结束（claude 子进程已退出）清理本次 mcp 配置，避免
-        // ~/.imagent 堆积 mcp_*.json 残留 + 文件名泄漏 conv_id。
-        if let Some(p) = &mcp_json {
-            let _ = tokio::fs::remove_file(p).await;
-        }
         result
+    }
+}
+
+/// S-6 / P3-2 收尾（v1.18 review）：mcp_*.json 清理 drop-guard。此前清理写在
+/// `spawn_cli_backend(...).await` 之后——run future 被 cancel（/stop、看门狗
+/// 超时 abort）时 await 之后的代码永不执行，配置文件恰在「取消」这一最常见
+/// 路径上残留（~/.imagent 堆积 + 文件名泄漏 conv_id）。guard 覆盖正常返回与
+/// drop 两条路径；Drop 内用同步 unlink（单次快 syscall，可在任意上下文执行）。
+struct McpCleanupGuard(std::path::PathBuf);
+
+impl Drop for McpCleanupGuard {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.0) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(target: "imagent::backend", error = %e, path = %self.0.display(), "清理 mcp 配置失败");
+            }
+        }
     }
 }
 

@@ -331,7 +331,12 @@ fn render_tool_panel(tools: &[ToolCall], border_color: &str) -> serde_json::Valu
     let n = tools.len();
     let mut lines = String::new();
     for t in tools {
-        lines.push_str(&format!("- {}\n", mask_emails(&tool_card_line(t))));
+        // R7（code-review v9 残留）：工具摘要可携带文件内容片段，<at id=…>
+        // 注入面与正文三路径同权——escape_lt 收口（mask_emails 只掩邮箱）。
+        lines.push_str(&format!(
+            "- {}\n",
+            escape_lt(&mask_emails(&tool_card_line(t)))
+        ));
     }
     serde_json::json!({
         "tag": "collapsible_panel",
@@ -355,7 +360,7 @@ fn render_thought_panel(thoughts: &[String], border_color: &str) -> serde_json::
     for t in &thoughts[start..] {
         lines.push_str(&format!(
             "> {}\n",
-            mask_emails(&truncate_chars(t.trim(), 400))
+            escape_lt(&mask_emails(&truncate_chars(t.trim(), 400)))
         ));
     }
     serde_json::json!({
@@ -702,7 +707,15 @@ fn stream_body_final_inner(card: &OutboundCard, err: Option<&str>) -> String {
 }
 
 pub fn stream_body_final(card: &OutboundCard, err: Option<&str>) -> String {
-    escape_lt(&stream_body_final_inner(card, err))
+    // R8（code-review v9 残留）：终态 managed md_body 此前无截断，仅靠「超限
+    // patch 失败→最小卡兜底」收敛（兜底又踩 R1）。与 render_card 主正文同额
+    //（4KB+4KB 头尾窗）；被截时 core 侧 CARD_TEXT_FULL_THRESHOLD 成功路径
+    // 会补发全文文本，不丢内容。
+    escape_lt(&cap_md_bytes(
+        &stream_body_final_inner(card, err),
+        4_096,
+        4_096,
+    ))
 }
 
 /// 终态「结果下沉」指针正文（P8-2）：本轮发过询问卡（流式卡已被顶离视口）时，
@@ -769,10 +782,13 @@ fn perm_detail_md(tool_name: &str, input_summary: &str) -> (String, Vec<String>)
     };
     // Bash 的命令由下方代码块承载（解码后原文），head 不再重复命令摘要；
     // 其余工具 head 保留单行摘要。
+    // R7（code-review v9 残留）：head 摘要行用户/agent 可控，<at id=…> 注入面
+    // 与正文同权——escape_lt（代码块 body 不转义：CommonMark 代码块内反斜杠
+    // 转义不生效，转义反而破坏显示，见 R13）。
     let head = if summary.is_empty() || lang == "bash" {
         format!("**{tool_name}**")
     } else {
-        format!("**{tool_name}** — {summary}")
+        format!("**{tool_name}** — {}", escape_lt(&summary))
     };
     // 真机校准（2026-08）：Bash 审批的代码块直接展示**命令本身**，不再裹 JSON
     // 信封——pretty JSON 会把命令里的引号转义（\"）原样暴露，且 command 在
@@ -1084,7 +1100,7 @@ pub(crate) fn render_question_card_note(
             "下拉选择后点「提交」"
         };
         vec![
-            serde_json::json!({ "tag": "markdown", "content": mask_emails(&content) }),
+            serde_json::json!({ "tag": "markdown", "content": escape_lt(&mask_emails(&content)) }),
             note_element(note),
             serde_json::json!({ "tag": "hr" }),
             serde_json::json!({ "tag": "form", "name": "imagent_ask", "elements": [
@@ -1124,7 +1140,7 @@ pub(crate) fn render_question_card_note(
             })
             .collect();
         vec![
-            serde_json::json!({ "tag": "markdown", "content": mask_emails(&content) }),
+            serde_json::json!({ "tag": "markdown", "content": escape_lt(&mask_emails(&content)) }),
             note_element(note),
             serde_json::json!({ "tag": "hr" }),
             flow_button_row(&opt_buttons),
@@ -1383,7 +1399,7 @@ fn body_block_elements(body_md: &str) -> Vec<serde_json::Value> {
                     content.push_str(l);
                 }
                 out.push(serde_json::json!({
-                    "tag": "markdown", "content": mask_emails(&content)
+                    "tag": "markdown", "content": escape_lt(&mask_emails(&content))
                 }));
                 lines.by_ref().for_each(drop);
                 break;

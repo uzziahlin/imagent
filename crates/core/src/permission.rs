@@ -350,6 +350,17 @@ impl PermissionRouter {
             .map_or(0, |v| v.len())
     }
 
+    /// 引用回复的锚点（parent_msg_id）是否命中该 conv 仍 pending 的询问卡。
+    /// 消费门（dispatch mod.rs）用它与「明确审批词」联合判定：**锚点未命中的
+    /// 引用回复不再可消费**——否则引用任意旧消息的正常追问会经 route 的单
+    /// pending 兜底劫持审批（fail-closed 解析成 deny，消息还被吞掉）。
+    pub async fn reply_anchor_hits_card(&self, conv_id: &str, parent_msg_id: &str) -> bool {
+        self.pending.lock().await.get(conv_id).is_some_and(|v| {
+            v.iter()
+                .any(|p| p.card_msg_id.as_deref() == Some(parent_msg_id))
+        })
+    }
+
     /// D5：回填询问卡消息 id（register 先占位、发卡成功后锚定引用回复路由）。
     /// 返回是否命中仍在等待的 pending（已被消费/取消则 false，无害）。
     pub async fn set_card_msg_id(

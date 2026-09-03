@@ -50,6 +50,18 @@ impl Dispatcher {
         // 最终回复前置断档提示（见下方 reply 组装处）。
         let continuation_orphan = is_continuation_prompt(base_prompt.trim());
 
+        // P0-4 补完（v1.18 review）：本Conv 停止标记水位——下方 preamble（typing/
+        // store 读/转录回放/媒体提示/表情）含多个 await，/resume 首轮可达分钟级；
+        // 期间 /stop 无 running 句柄只能设标记。spawn 前按「水位之后新增」复查
+        //（见 spawn 前注释），水位在此先取。
+        let stop_mark_epoch = self
+            .stop_requested
+            .lock()
+            .await
+            .get(&conv.0)
+            .copied()
+            .unwrap_or(0);
+
         // W3-3 / P0-5（v1.17）：可重试 prompt 快照——**仅失败路径落库**（store
         // config 表，重启不丢），成功轮不覆盖——失败卡上的「重试本轮」因此
         // 永远指向失败那轮（旧内存 map 每轮覆盖：用户点按钮时重放的可能是
@@ -214,6 +226,26 @@ impl Dispatcher {
         // 进入 backend（不支持的后端 drop，running 注册 steer=None 消息排队）。
         let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<String>(8);
         let steer_capable = backend.supports_steering();
+        // P0-4 补完：注册前停止标记复查——批循环顶部的检查到此处隔了整个
+        // preamble（转录回放分钟级），期间 /stop 找不到 running 句柄、只能设
+        // 标记，而标记按 60s TTL 在批循环顶部消费：起跑后即失效、用户被回
+        // 「当前没有运行中的任务」但轮次照跑。以「起点水位之后新增的标记」
+        // 判定（时间戳单调，免 TTL——长 preamble 也不漏），命中按中断语义收口。
+        {
+            let hit = {
+                let mut sr = self.stop_requested.lock().await;
+                sr.remove(&conv.0).is_some_and(|ts| ts > stop_mark_epoch)
+            };
+            if hit {
+                self.reply(
+                    &conv,
+                    "⏹️ 已中断：轮次在启动前被 /stop 拦下（本批消息未执行）",
+                    &hint,
+                )
+                .await;
+                return None;
+            }
+        }
         let join = tokio::spawn(async move {
             let backend_name = backend.name();
             // agent_timeout = 0 = 关闭总超时（默认 3600s=1h 硬上限）：墙钟总预算
@@ -304,6 +336,13 @@ impl Dispatcher {
         let mut streamed_text = String::new();
         // W2-2：最新任务清单状态（纯文本平台最终回复的进度行来源）。
         let mut latest_todos: Option<Vec<crate::types::TodoItem>> = None;
+        // D3 补丁（v1.18 review）：豁免总额预算（每段静默期）。router 按 conv
+        // 查询会把终端侧（ask_via_im / 终端 agent 经 permission socket）挂在
+        // 同一 conv 的 Permission pending 也计入——其超时可到 86400s，足以把
+        // IM 轮的空闲看门狗无限豁免（agent_timeout 缺省 0 = 永不超时）。
+        // 本会话审批自身预算 = permission_ask_timeout，合法豁免不会超过它；
+        // 超过即照常判空闲。任何 chunk 到达（审批后 agent 复工）重置预算。
+        let mut exempt_secs: u64 = 0;
         loop {
             // P4-6：COT 档位每轮读取（/config 热改对下一轮生效；Wave B-7：
             // per-conv 覆盖优先，/config cot 白名单用户可改自己会话）。
@@ -316,18 +355,23 @@ impl Dispatcher {
                 }
             } else {
                 match tokio::time::timeout(idle_timeout, rx.recv()).await {
-                    Ok(Some(c)) => c,
+                    Ok(Some(c)) => {
+                        exempt_secs = 0;
+                        c
+                    }
                     Ok(None) => break,
                     // D3：仅**权限审批**的 pending 豁免看门狗（审批预算
                     // permission_ask_timeout 独立兜底）；终端 ask_via_im 的 pending
                     // 超时可到 86400s，不得无限豁免 IM 会话空闲看门狗。
                     Err(_)
-                        if self
-                            .router
-                            .has_pending_of_kind(&conv.0, PendingKind::Permission)
-                            .await =>
+                        if exempt_secs < self.permission_ask_timeout.as_secs()
+                            && self
+                                .router
+                                .has_pending_of_kind(&conv.0, PendingKind::Permission)
+                                .await =>
                     {
-                        continue
+                        exempt_secs += idle_timeout.as_secs().max(1);
+                        continue;
                     }
                     Err(_) => {
                         idle_timed_out = true;

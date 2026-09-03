@@ -1898,10 +1898,7 @@ mod tests {
         assert!(store.list_cron_jobs().await.unwrap().is_empty());
         store.set_cron_enabled("abc123", true).await.unwrap();
         // bump 重排 + 单查 + 删除。
-        store
-            .bump_cron_job("abc123", 2000, 9000)
-            .await
-            .unwrap();
+        store.bump_cron_job("abc123", 2000, 9000).await.unwrap();
         let j = store.get_cron_job("abc123").await.unwrap().expect("get");
         assert_eq!((j.last_run, j.next_run), (Some(2000), 9000));
         assert!(store.due_cron_jobs(8999).await.unwrap().is_empty());

@@ -76,6 +76,12 @@ pub(crate) struct CardSession {
     phase: CardPhase,
     msg_id: Option<String>,
     last_patch: Instant,
+    /// v1.18 review：无句柄时的**建卡失败**退避时钟。D9 只覆盖有句柄的 update
+    /// 重试（last_patch 仅成功推进）；send_card 持续失败（权限缺失/持续限流）
+    /// 时此前每个 chunk 都触发一次全新建卡（实体创建 + 锚定回复），零节流零
+    /// 退避——与 500ms 节流设计相反的 API 压力与 warn 刷屏。None = 最近建卡
+    /// 成功（或从未失败），走常规节流。
+    last_create_fail: Option<Instant>,
     /// 轮次起点（Running footer 运行时长的基准，见 [`OutboundCard::run_secs`]）。
     started: Instant,
     /// 在飞卡片登记（P4_ROADMAP 第六批）：首帧句柄落库、终态成功摘除——进程崩溃
@@ -107,6 +113,7 @@ impl CardSession {
             phase: CardPhase::Thinking,
             msg_id: None,
             last_patch: Instant::now(),
+            last_create_fail: None,
             started: Instant::now(),
             store,
             conv,
@@ -300,6 +307,15 @@ impl CardSession {
             if since < CARD_THROTTLE {
                 tokio::time::sleep(CARD_THROTTLE - since).await;
             }
+        } else if let Some(ts) = self.last_create_fail {
+            // 建卡失败退避（见字段文档）：上次失败 2s 内到达的 chunk 合帧到窗口
+            // 边界再试一次，而不是每 chunk 全新建卡。终态不受影响（finalize 绕
+            // 过本方法直调 dispatch_card，保证收尾机会）。
+            const CREATE_FAIL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+            let since = ts.elapsed();
+            if since < CREATE_FAIL_BACKOFF {
+                tokio::time::sleep(CREATE_FAIL_BACKOFF - since).await;
+            }
         }
         self.dispatch_card(terminal, conv, hint, platform).await;
     }
@@ -343,6 +359,7 @@ impl CardSession {
             None => match platform.send_card(conv, &card, hint).await {
                 Ok(id) => {
                     self.msg_id = id;
+                    self.last_create_fail = None;
                     // 拿到真实卡片句柄（None = 平台降级纯文本，无卡片可滞留）即登记；
                     // 失败仅 warn——卡片路径不能反向打断 agent 回复。
                     if let Some(h) = &self.msg_id {
@@ -360,7 +377,10 @@ impl CardSession {
                     }
                     Ok(())
                 }
-                Err(e) => Err(e),
+                Err(e) => {
+                    self.last_create_fail = Some(Instant::now());
+                    Err(e)
+                }
             },
             Some(mid) => match platform.update_card(conv, mid, &card, hint).await {
                 // 句柄丢失自愈：平台回报「卡片不存在/已删除」（错误串含
@@ -390,6 +410,7 @@ impl CardSession {
                         match platform.send_card(conv, &card, hint).await {
                             Ok(id) => {
                                 self.msg_id = id;
+                                self.last_create_fail = None;
                                 if let Some(h) = &self.msg_id {
                                     if let Err(rec_err) = self
                                         .store
@@ -405,7 +426,10 @@ impl CardSession {
                                 }
                                 Ok(())
                             }
-                            Err(send_err) => Err(send_err),
+                            Err(send_err) => {
+                                self.last_create_fail = Some(Instant::now());
+                                Err(send_err)
+                            }
                         }
                     }
                 }

@@ -847,6 +847,10 @@ impl Dispatcher {
             {
                 let mut map = self.queues.lock().await;
                 let Some(q) = map.get_mut(&conv.0) else {
+                    // v1.18 review：回执移到锁外——reply 含平台发送（超时 + 退避
+                    // 重试），持全局 queues 锁 await 会卡住所有 conv 的入队/取批/
+                    // steering；越界分支早有此纪律，这两个分支是回归。
+                    drop(map);
                     self.reply(conv, "队列为空。", hint).await;
                     return;
                 };
@@ -860,6 +864,7 @@ impl Dispatcher {
                 let idx = n - 1;
                 removed_sender = q[idx].sender.0.clone();
                 if removed_sender != sender && !is_admin {
+                    drop(map);
                     self.reply(conv, "只能丢弃自己排队的消息（或联系管理员处理）。", hint)
                         .await;
                     return;
@@ -870,14 +875,21 @@ impl Dispatcher {
                     // 与取批路径同语义：留空 Vec 不删 entry（runner 循环依赖）。
                     self.queued_hints.lock().await.remove(&conv.0);
                 } else if let Some(last) = q.last() {
-                    self.queued_hints.lock().await.insert(
-                        conv.0.clone(),
-                        crate::card_session::QueuedHint {
+                    // 合并写入保 steered（同 enqueue 路径的 v1.18 review 修正：
+                    // insert(..Default) 会把「已注入 N 条」清零）。
+                    self.queued_hints
+                        .lock()
+                        .await
+                        .entry(conv.0.clone())
+                        .and_modify(|h| {
+                            h.count = count;
+                            h.latest = super::super::latest_snippet(last);
+                        })
+                        .or_insert_with(|| crate::card_session::QueuedHint {
                             count,
                             latest: super::super::latest_snippet(last),
                             ..Default::default()
-                        },
-                    );
+                        });
                 }
                 drop(map);
                 let snippet = removed

@@ -53,6 +53,12 @@ fn dl_client() -> &'static reqwest::Client {
     C.get_or_init(|| {
         reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
+            // R15（code-review v9，v1.18 review 复核仍未修）：body 停滞（建连后
+            // 黑洞/NAT 静默丢弃）时 chunk() 会永久挂起——drain task 串行处理事件，
+            // 一次挂起即全平台事件停摆（消息/审批/撤回全部排队）。read_timeout
+            // 只在「持续无数据」时触发，慢而流动的大下载不受影响（区别于 total
+            // timeout，勿改回）。
+            .read_timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("reqwest client 构建")
     })
@@ -709,6 +715,17 @@ pub async fn upload_image(
     file_name: &str,
     bytes: Vec<u8>,
 ) -> imagent_core::Result<String> {
+    // 上站与下载同一大小上限：下载侧有双重 cap，上传侧此前无上限——agent 可
+    // 让 bot 读任意大本地文件进内存并上传（agent 轮挂起 + 内存尖峰）。
+    if bytes.len() as u64 > MEDIA_MAX_BYTES {
+        return Err(imagent_core::CoreError::Platform(
+            PLATFORM,
+            format!(
+                "upload_image: 文件过大（{} > {MEDIA_MAX_BYTES} 字节）",
+                bytes.len()
+            ),
+        ));
+    }
     retry_on_rate_limit!(async {
         // bytes 被请求体消费，重试路径须重建（图片通常 <几 MB，clone 可接受）。
         let bytes = bytes.clone();
@@ -736,6 +753,16 @@ pub async fn upload_file(
     file_name: &str,
     bytes: Vec<u8>,
 ) -> imagent_core::Result<String> {
+    // 同 upload_image：上传侧大小上限（此前仅下载侧有）。
+    if bytes.len() as u64 > MEDIA_MAX_BYTES {
+        return Err(imagent_core::CoreError::Platform(
+            PLATFORM,
+            format!(
+                "upload_file: 文件过大（{} > {MEDIA_MAX_BYTES} 字节）",
+                bytes.len()
+            ),
+        ));
+    }
     retry_on_rate_limit!(async {
         let bytes = bytes.clone();
         let base = core_config.base_url().trim_end_matches('/').to_string();
@@ -912,6 +939,9 @@ async fn ogg_to_pcm(bytes: Vec<u8>) -> imagent_core::Result<Vec<u8>> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // ffmpeg 挂死（坏输入等待 stdin / 死循环滤镜）时由超时分支 drop child
+        // 触发 kill——不带 kill_on_drop 的话超时只丢 future，进程泄漏。
+        .kill_on_drop(true)
         .spawn()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -928,9 +958,26 @@ async fn ogg_to_pcm(bytes: Vec<u8>) -> imagent_core::Result<Vec<u8>> {
         // 写完即随 task 结束 drop stdin → EOF，ffmpeg 正常收尾。
         let _ = stdin.write_all(&bytes).await;
     });
-    let out = child.wait_with_output().await.map_err(|e| {
-        imagent_core::CoreError::Platform(PLATFORM, format!("等待 ffmpeg 失败: {e}"))
-    })?;
+    // IM 语音条上限 60s 音频，120s 转码预算已极宽裕；此前 wait_with_output 无
+    // 超时——挂在 drain 串行路径上会阻塞全平台事件（同 dl_client read_timeout
+    // 的教训）。超时分支 drop future → kill_on_drop 杀进程；feed 的 write 随
+    // 进程死亡报错自然结束。
+    let out = match tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        child.wait_with_output(),
+    )
+    .await
+    {
+        Ok(r) => r.map_err(|e| {
+            imagent_core::CoreError::Platform(PLATFORM, format!("等待 ffmpeg 失败: {e}"))
+        })?,
+        Err(_) => {
+            return Err(imagent_core::CoreError::Platform(
+                PLATFORM,
+                "ffmpeg 转码超时（120s，已终止）".into(),
+            ));
+        }
+    };
     let _ = feed.await;
     if !out.status.success() {
         return Err(imagent_core::CoreError::Platform(

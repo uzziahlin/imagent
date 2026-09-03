@@ -189,6 +189,8 @@ impl AcpBackend {
         let hook = self.hook.read().clone();
         let idle = self.conn_idle_recycle;
         let ll = match self.spawn_transport().await? {
+            // ghost 预检仅真机启用：预检依赖 ~/.claude 本地存储，mock 通道的
+            // 会话语义由测试自定义（sid 不必真实存在）。
             Transport::Real(agent) => LongLivedAcp::spawn(
                 agent,
                 Arc::clone(&self.permission_mode),
@@ -196,6 +198,7 @@ impl AcpBackend {
                 conv.to_string(),
                 Arc::clone(&self.conns),
                 idle,
+                true,
             )?,
             #[cfg(test)]
             Transport::Mock(ch) => LongLivedAcp::spawn(
@@ -205,6 +208,7 @@ impl AcpBackend {
                 conv.to_string(),
                 Arc::clone(&self.conns),
                 idle,
+                false,
             )?,
         };
         g.insert(conv.to_string(), ll.clone());
@@ -405,6 +409,10 @@ impl StreamState {
 /// 长驻 AcpAgent/connection：单 conv 的跨 run 复用（B2/P5-14）。
 struct LongLivedAcp {
     prompt_tx: tokio::sync::mpsc::Sender<PromptReq>,
+    /// 连接建立/握手失败的最近原因：`connect_with` 的 Err 此前被 `let _ =`
+    /// 吞掉且无日志，run() 只能报笼统「长驻 ACP task 无响应」。存此供
+    /// run() 在 task 无响应时折叠真实原因。
+    connect_error: Arc<Mutex<Option<String>>>,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -421,6 +429,16 @@ struct PromptReq {
 }
 
 impl LongLivedAcp {
+    /// task 无响应时折叠真实原因：优先连接建立阶段记录的错误（此前被
+    /// `let _ =` 吞掉、只能报笼统「无响应」），否则用调用方给的兜底文案。
+    fn dead_reason(&self, fallback: &str) -> String {
+        self.connect_error
+            .try_lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .unwrap_or_else(|| fallback.to_string())
+    }
+
     /// spawn 单 conv 的长驻 task：`connect_with` 建连接（spawn claude-agent-acp 子
     /// 进程；SDK `ChildGuard` 在 connection drop 时 kill，无泄漏），main_fn 内 loop
     /// 接收 prompt 跨 run 复用同一子进程 + connection。
@@ -434,6 +452,7 @@ impl LongLivedAcp {
         conv: String,
         conns: Arc<Mutex<HashMap<String, Arc<LongLivedAcp>>>>,
         idle_recycle: std::time::Duration,
+        ghost_precheck: bool,
     ) -> Result<Arc<LongLivedAcp>>
     where
         T: agent_client_protocol::ConnectTo<Client> + 'static,
@@ -445,10 +464,17 @@ impl LongLivedAcp {
         let current: Arc<Mutex<Option<StreamState>>> = Arc::new(Mutex::new(None));
         let current_for_notif = current.clone();
         let current_for_main = current.clone();
+        // P0-2 收尾：cost 基线跨轮共享——此前每轮 StreamState::new 新建，上一轮
+        // 末写入的基线随 st 一起销毁，下一轮永远走「无基线→记整段累计」分支，
+        // 轮次增量记账从未生效（单测复用同一 st，恰好掩盖了该集成缝隙；连接
+        // 重建/进程重启后基线丢失仍按首轮保守记整段，语义不变）。
+        let cost_baseline = Arc::new(Mutex::new(None::<(String, f64)>));
+        let connect_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let connect_error_for_task = connect_error.clone();
         let perm_for_handler = perm_mode;
         let conv_for_handler = conv.clone();
         let _task = tokio::spawn(async move {
-            let _ = Client
+            let connect_result = Client
                 .builder()
                 .on_receive_notification(
                     async move |notification: SessionNotification, _cx: ConnectionTo<_>| {
@@ -516,17 +542,42 @@ impl LongLivedAcp {
                                 None => break, // 所有 sender drop（shutdown 清理）
                             },
                         };
-                        let st = StreamState::new(req.chunks.clone());
+                        let mut st = StreamState::new(req.chunks.clone());
+                        // 注入连接级共享 cost 基线（见 spawn 处注释）。
+                        st.cost_baseline = cost_baseline.clone();
                         *current_for_main.lock().await = Some(st.clone());
                         let cwd = req.cwd.clone();
-                        let sid = match req.session.clone() {
+                        // 幽灵会话预检（与 CLI 路径 backend.rs:429-442 同源防御）：
+                        // 本地不存在的 sid 走 LoadSession 必失败——失败路径回错并
+                        // 断连接、不产 SessionStarted，store 里的失效 sid 永不更新，
+                        // 该 conv 每条消息重复毒化直到 /new。预检不存在即降级
+                        // NewSession，靠下方 SessionStarted 落库替换失效 sid。
+                        //（缓存命中分支免预检：能在本连接 load 成功过，agent
+                        //  进程内仍持该会话状态。ghost_precheck=false 为 mock
+                        //  传输——测试自定义会话语义，sid 不必真实存在。）
+                        let want_load = match req.session.clone() {
                             Some(s)
                                 if loaded.as_deref() == Some(s.as_str())
                                     && loaded_cwd.as_deref() == Some(cwd.as_path()) =>
                             {
-                                s
+                                Some((s, true))
                             }
-                            Some(s) => match connection
+                            Some(s) if !ghost_precheck || crate::sessions::session_exists(&cwd, &s) => {
+                                Some((s, false))
+                            }
+                            Some(s) => {
+                                warn!(
+                                    target: "claude-acp",
+                                    session_id = %s,
+                                    "续接的 session 在 ~/.claude 本地存储不存在（幽灵会话），弃用续接开新会话"
+                                );
+                                None
+                            }
+                            None => None,
+                        };
+                        let sid = match want_load {
+                            Some((s, true)) => s,
+                            Some((s, false)) => match connection
                                 .send_request(LoadSessionRequest::new(s.clone(), cwd.clone()))
                                 .block_task()
                                 .await
@@ -557,6 +608,10 @@ impl LongLivedAcp {
                                 Ok(resp) => {
                                     let sid = resp.session_id.to_string();
                                     loaded = Some(sid.clone());
+                                    // R9（code-review v9）：NewSession 也更新 loaded_cwd
+                                    // ——只设 sid 会让旧 cwd 残留，空闲窗内 /cd 往返
+                                    // 后双比缓存假命中，prompt 跑在错误目录。
+                                    loaded_cwd = Some(cwd.clone());
                                     sid
                                 }
                                 Err(e) => {
@@ -611,6 +666,14 @@ impl LongLivedAcp {
                                         NAME,
                                         format!("acp prompt 失败: {e}"),
                                     )));
+                                    // prompt 失败 = agent 自报会话状态有问题（区别于
+                                    // 传输错误）。此前 loaded 原样保留、下一轮跳过
+                                    // LoadSession 直怼同一会话，反复失败到空闲回收
+                                    // ——与 LoadSession 失败断连的策略不一致。清缓存
+                                    // 强制下一轮重 Load（配合幽灵预检，失效则自动
+                                    // 降级 NewSession）。
+                                    loaded = None;
+                                    loaded_cwd = None;
                                 }
                             },
                             _ = req.cancel => {
@@ -630,6 +693,13 @@ impl LongLivedAcp {
                     Ok(())
                 })
                 .await;
+            if let Err(e) = connect_result {
+                // 连接建立失败（claude-agent-acp 未安装 / env 消毒后 PATH 断 /
+                // 初始化握手失败）：落日志 + 存原因。排队/后续请求的 resp_tx
+                // 随 task 退出被 drop，run() 据 connect_error 报真实原因。
+                warn!(target: "claude-acp", error = %e, "ACP 连接建立失败（spawn/握手）");
+                *connect_error_for_task.lock().await = Some(format!("ACP 连接建立失败: {e}"));
+            }
             // 连接断开（子进程退出/崩溃/空闲回收/cancel）：长驻 task 结束。B2：从
             // map 自摘除（same_channel 防误删已被重建替代的新条目）；prompt_tx 随之
             // 关闭，下次 run() 检测后重建。
@@ -641,7 +711,11 @@ impl LongLivedAcp {
                 g.remove(&conv);
             }
         });
-        Ok(Arc::new(LongLivedAcp { prompt_tx, _task }))
+        Ok(Arc::new(LongLivedAcp {
+            prompt_tx,
+            connect_error,
+            _task,
+        }))
     }
 }
 
@@ -739,9 +813,28 @@ impl Backend for AcpBackend {
             match send.await {
                 Ok(()) => {
                     let _cancel_guard = cancel_tx;
-                    return resp_rx
-                        .await
-                        .map_err(|_| CoreError::Backend(NAME, "长驻 ACP task 无响应".into()))?;
+                    match resp_rx.await {
+                        Ok(res) => return res,
+                        // 发送成功但 task 在响应前死亡（task 已决意退出、channel
+                        // 尚未关闭的窗口——空闲回收/上一轮 LoadSession 失败 break/
+                        // 连接死亡）：与 SendError 同款重建重试一次，否则用户看到
+                        // 的是一次本可自愈的失败。
+                        Err(_) if attempt == 0 => {
+                            warn!(
+                                target: "claude-acp",
+                                conv_id,
+                                "长驻 ACP task 响应前退出（竞态），重建连接重试一次"
+                            );
+                            self.remove_conn_if_same(conv_id, &ll).await;
+                            ll = self.long_lived(conv_id).await?;
+                        }
+                        Err(_) => {
+                            return Err(CoreError::Backend(
+                                NAME,
+                                ll.dead_reason("长驻 ACP task 无响应（重建后仍无响应）"),
+                            ));
+                        }
+                    }
                 }
                 Err(_) if attempt == 0 => {
                     // 发送失败 = 连接刚好退出（空闲回收/崩溃竞态）：先显式移除 map 中
@@ -758,7 +851,7 @@ impl Backend for AcpBackend {
                 Err(_) => {
                     return Err(CoreError::Backend(
                         NAME,
-                        "长驻 ACP task 已退出（重建后仍失败，下次 run 将再重建）".into(),
+                        ll.dead_reason("长驻 ACP task 已退出（重建后仍失败，下次 run 将再重建）"),
                     ));
                 }
             }
@@ -1035,10 +1128,24 @@ fn reject_outcome(options: &[PermissionOption]) -> RequestPermissionOutcome {
         .unwrap_or(RequestPermissionOutcome::Cancelled)
 }
 
-/// 选一个 allow 类选项构造 outcome；若无 allow 选项则取首个；都没有则 Cancelled。
+/// 选一个 allow 类选项构造 outcome；无 allow 选项时的回退顺序：
+/// ① 任一**非 Reject** 选项（如未知的「always allow with updated settings」
+/// 类变体，non_exhaustive 防future）——此前直接取首个，选项列表只有
+/// Reject 类时会**在 allow/off 档静默选中拒绝**，档位语义被反转；
+/// ② 仍无则 Cancelled（交由 agent 处理取消，fail-closed 且不冒充选择）。
 fn allow_outcome(options: &[PermissionOption]) -> RequestPermissionOutcome {
     select_option(options, true)
-        .or_else(|| options.first().map(|o| o.option_id.clone()))
+        .or_else(|| {
+            options
+                .iter()
+                .find(|o| {
+                    !matches!(
+                        o.kind,
+                        PermissionOptionKind::RejectOnce | PermissionOptionKind::RejectAlways
+                    )
+                })
+                .map(|o| o.option_id.clone())
+        })
         .map(|id| RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(id)))
         .unwrap_or(RequestPermissionOutcome::Cancelled)
 }
@@ -1099,6 +1206,117 @@ mod tests {
             st.round_delta_usage("s2", u(0.40)).await.total_cost_usd,
             Some(0.40)
         );
+    }
+
+    /// P0-2 收尾回归（集成级）：同一连接连续两轮，第二轮 cost 必须按基线差
+    /// 记增量。此前 StreamState（含 cost_baseline）随每轮 `StreamState::new`
+    /// 重建，基线从未跨轮存活——本测试驱动真实 spawn 路径（mock Channel +
+    /// 长驻 task loop），恰好覆盖上面单测复用同一 st 时测不到的集成缝隙。
+    /// mock agent：每轮 prompt 先推 UsageUpdate（会话累计 0.10 / 0.35 USD）
+    /// 再回 EndTurn。
+    #[tokio::test]
+    async fn acp_two_turns_cost_delta_integration() {
+        use agent_client_protocol::schema::v1::{Cost, UsageUpdate};
+        let (agent_side, client_side) = Channel::duplex();
+        let sid = "cost-s1".to_string();
+        let sid_for_prompt = sid.clone();
+        let turn = Arc::new(std::sync::Mutex::new(0u32));
+        tokio::spawn(async move {
+            let _ = Agent
+                .builder()
+                .name("mock-cost")
+                .on_receive_request(
+                    async move |req: InitializeRequest, responder, _cx: ConnectionTo<_>| {
+                        responder.respond(
+                            InitializeResponse::new(req.protocol_version)
+                                .agent_capabilities(AgentCapabilities::new()),
+                        )
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |_req: NewSessionRequest, responder, _cx: ConnectionTo<_>| {
+                        responder.respond(NewSessionResponse::new(sid.clone()))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |_req: LoadSessionRequest, responder, _cx: ConnectionTo<_>| {
+                        responder.respond(LoadSessionResponse::new())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |_req: PromptRequest, responder, cx: ConnectionTo<_>| {
+                        let cumulative = {
+                            let mut g = turn.lock().unwrap();
+                            *g += 1;
+                            // 会话累计成本：轮 1 = 0.10，轮 2 = 0.35（增量 0.25）。
+                            [0.10_f64, 0.35][(*g - 1) as usize]
+                        };
+                        cx.send_notification(SessionNotification::new(
+                            sid_for_prompt.clone(),
+                            SessionUpdate::UsageUpdate(
+                                UsageUpdate::new(100, 1000).cost(Cost::new(cumulative, "USD")),
+                            ),
+                        ))?;
+                        responder.respond(PromptResponse::new(StopReason::EndTurn))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_to(agent_side)
+                .await;
+        });
+        let chan = std::sync::Mutex::new(Some(client_side));
+        let backend = AcpBackend::new().with_mock_factory(Arc::new(move || {
+            chan.lock()
+                .unwrap()
+                .take()
+                .expect("mock 通道只建连一次（同 conv 复用长驻连接）")
+        }));
+        let wd = std::env::temp_dir();
+        let closed_steer = || {
+            let (sx, rx) = tokio::sync::mpsc::channel(1);
+            drop(sx);
+            rx
+        };
+
+        // 轮 1：无基线 → 保守记整段 0.10。
+        let (tx1, _rx1) = tokio::sync::mpsc::channel::<AgentChunk>(64);
+        let out1 = backend
+            .run(
+                "conv-cost",
+                "turn1",
+                None,
+                &wd,
+                &[],
+                tx1,
+                &[],
+                closed_steer(),
+            )
+            .await
+            .expect("轮 1 应成功");
+        assert_eq!(out1.session_id.0, "cost-s1");
+        let c1 = out1.usage.expect("轮 1 应带 usage").total_cost_usd;
+        assert!((c1.unwrap() - 0.10).abs() < 1e-9, "轮1={c1:?}");
+
+        // 轮 2：同连接（缓存命中免 LoadSession）→ 基线差 0.35 - 0.10 = 0.25。
+        let (tx2, _rx2) = tokio::sync::mpsc::channel::<AgentChunk>(64);
+        let out2 = backend
+            .run(
+                "conv-cost",
+                "turn2",
+                Some(&out1.session_id),
+                &wd,
+                &[],
+                tx2,
+                &[],
+                closed_steer(),
+            )
+            .await
+            .expect("轮 2 应成功");
+        let c2 = out2.usage.expect("轮 2 应带 usage").total_cost_usd;
+        assert!((c2.unwrap() - 0.25).abs() < 1e-9, "轮2={c2:?}");
     }
 
     #[test]
@@ -1317,19 +1535,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn permission_outcome_off_falls_back_to_first() {
-        // 无 allow 选项时，Off 走 allow_outcome → 取首个兜底。
-        let request = dummy_perm_request(vec![perm_option(
-            "reject",
-            PermissionOptionKind::RejectOnce,
-        )]);
+    async fn permission_outcome_off_reject_only_options_cancel() {
+        // 无 allow 选项且仅有 Reject 类选项时，Off 档不得静默选中拒绝（此前
+        // 「取首个兜底」会反转档位语义）——应 Cancelled，交由 agent fail-closed。
+        let request = dummy_perm_request(vec![
+            perm_option("reject", PermissionOptionKind::RejectOnce),
+            perm_option("reject_always", PermissionOptionKind::RejectAlways),
+        ]);
         let mode = RwLock::new(PermissionMode::Off);
-        match permission_outcome(&request, "c", &mode, None).await {
-            RequestPermissionOutcome::Selected(sel) => {
-                assert_eq!(sel.option_id.0.as_ref(), "reject")
-            }
-            _ => panic!("Off 无 allow 选项时应取首个兜底"),
-        }
+        assert!(matches!(
+            permission_outcome(&request, "c", &mode, None).await,
+            RequestPermissionOutcome::Cancelled
+        ));
     }
 
     #[tokio::test]
@@ -1635,6 +1852,7 @@ mod tests {
                     format!("conv-{i}"),
                     Arc::new(LongLivedAcp {
                         prompt_tx: tx,
+                        connect_error: Arc::new(Mutex::new(None)),
                         _task: tokio::spawn(async {}),
                     }),
                 );
@@ -1724,6 +1942,7 @@ mod tests {
         let (new_tx, _new_rx) = tokio::sync::mpsc::channel::<PromptReq>(8);
         let old_ll = Arc::new(LongLivedAcp {
             prompt_tx: old_tx,
+            connect_error: Arc::new(Mutex::new(None)),
             _task: tokio::spawn(async {}),
         });
 
@@ -1742,6 +1961,7 @@ mod tests {
         // map 中已被重建的新条目：不同 channel → 不动。
         let rebuilt = Arc::new(LongLivedAcp {
             prompt_tx: new_tx,
+            connect_error: Arc::new(Mutex::new(None)),
             _task: tokio::spawn(async {}),
         });
         backend
@@ -1767,6 +1987,7 @@ mod tests {
             "conv-z".into(),
             Arc::new(LongLivedAcp {
                 prompt_tx: tx,
+                connect_error: Arc::new(Mutex::new(None)),
                 _task: tokio::spawn(async {}),
             }),
         );

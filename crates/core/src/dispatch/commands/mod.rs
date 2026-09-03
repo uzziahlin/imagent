@@ -396,14 +396,30 @@ impl Dispatcher {
                     limit,
                     "sender 成本上限命中，拒绝入队"
                 );
-                self.reply(
-                    &conv,
-                    &format!(
-                        "💰 你近 24 小时的用量已达上限（${spent:.2} / 上限 ${limit:.2}），本条未执行。\n窗口按时间滚动恢复，或请联系管理员调整 sender_daily_cost_limit_usd。"
-                    ),
-                    &hint,
-                )
-                .await;
+                // v1.18 review：提示去重——cron 合成消息每分钟过闸，超限期间
+                // 此前每条都回「已达上限」（一天 1440 条）。同 sender 1 小时至多
+                // 提示一次；拒绝本身照常。
+                let now = super::now_secs();
+                let should_notice = {
+                    let mut last = self.budget_notice_last.lock().await;
+                    let hit = last.get(&msg.sender.0).copied().unwrap_or(0) + 3600 <= now;
+                    if hit {
+                        // 顺带清理过期条目（小 map，全扫可接受）。
+                        last.retain(|_, ts| now - *ts < 7200);
+                        last.insert(msg.sender.0.clone(), now);
+                    }
+                    hit
+                };
+                if should_notice {
+                    self.reply(
+                        &conv,
+                        &format!(
+                            "💰 你近 24 小时的用量已达上限（${spent:.2} / 上限 ${limit:.2}），本条未执行。\n窗口按时间滚动恢复，或请联系管理员调整 sender_daily_cost_limit_usd。"
+                        ),
+                        &hint,
+                    )
+                    .await;
+                }
                 return;
             }
         }
