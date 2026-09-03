@@ -1203,12 +1203,27 @@ fn render_multi_question_card(
         } else {
             serde_json::json!({ "tag": "select_static", "name": format!("ask_opt_{i}"), "options": opt_values })
         });
+        // v1.17.2：每题附自由输入框（对齐 CLI 原生「用户自定义回答」）——
+        // name=ask_opt_{i}_free，回调侧非空则优先于选项（placeholder 注明）。
+        fields.push(serde_json::json!({
+            "tag": "input",
+            "name": format!("ask_opt_{i}_free"),
+            "placeholder": { "tag": "plain_text", "content": "或自行输入（填写则优先于上方选项）" },
+            "max_length": 300
+        }));
     }
     let mut elements = vec![note_element(note), serde_json::json!({ "tag": "hr" })];
     // 题面与控件交替：题 i 的说明紧邻其控件（全说明在上/全控件在下会被滚动分离）。
-    for (s, f) in sections.into_iter().zip(fields.into_iter()) {
+    // fields 长度 = 2×题数（控件+自由输入框），与 sections 按题分组对应。
+    let mut fit = fields.into_iter();
+    for s in sections.into_iter() {
         elements.push(s);
-        elements.push(f);
+        if let Some(f) = fit.next() {
+            elements.push(f);
+        }
+        if let Some(f) = fit.next() {
+            elements.push(f);
+        }
     }
     elements.push(serde_json::json!({ "tag": "hr" }));
     elements.push(flow_button_row(&[serde_json::json!({
