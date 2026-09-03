@@ -2,6 +2,28 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.18.0] — 2026-09-03
+
+> **/cron 定时任务（头牌）+ 群媒体回复即定向 + 转向回执上卡**。全仓 653
+> tests / 0 failed、clippy 零警告；store 线性迁移 v11（真库升级验证通过）。
+
+### Added
+- **`/cron` 定时任务**：`/cron add <分 时 日 月 周> <指令>`（本地时区，支持
+  `*` / `*/n` / 范围 / 列表，Vixie dom/dow OR 语义）、`/cron list`、
+  `/cron rm <id>`（限创建者或管理员；每会话上限 20 条）。纯 rust cron 引擎
+  （civil 日期算法 + libc 本地时区/DST，零新增依赖）；store v11 `cron_jobs`
+  表持久化；调度器 30s tick，**触发前先重排** next_run（防长轮次执行期重复
+  入队），停机期间错过的到期首个 tick 触发一次后顺延、不补跑。到期消息经
+  正常 handle 管线注入——白名单/会话域/审批链与手打消息完全同权。
+- **群媒体「回复即定向」**：群里回复（引用）bot 消息发出的图片/文件视为
+  显式定向，豁免 require_mention——手机端纯图片无法携带 @（此前群媒体实际
+  不可达）。实现：client 层 bot 已发消息账本（256 条 FIFO，三个发送函数
+  成功时零侵入记账）+ 群回复 parent 命中判定。白名单/会话域门禁不变，
+  与 @ 等权。
+- **转向回执上卡**：steering 注入后流式卡 footer 显示「📥 已注入 N 条运行
+  中消息」（轮次结束清零，与排队提示同框）——消除 👀 表情回执过于隐蔽导致
+  的「消息丢了」误判（真机两次复现）。
+
 ## [1.17.2] — 2026-09-03
 
 > **AUQ 自由输入（对齐 CLI 自定义回答）+ steering 时代口径修正 + 上下文水位
