@@ -774,3 +774,16 @@ deploy/），注册当前二进制路径与 --profile；`uninstall`/`status` 对
 
 真机验证清单：`/chat allow-all` 真实翻页；`/admin add @名字` 群内流程；
 reply_mode=text 一轮完整对话的纯文本流形态。
+
+# P8 待办 —— 2026-09-03 真机校准遗留
+
+- **群媒体准入缺口**：群聊纯图片/文件消息无法携带 @（手机端无富文本合成路径），
+  `require_mention_in_group` 默认下媒体在群里永远进不来——媒体实际只在私聊可用。
+  候选方案：**回复 bot 消息的图片视为隐式定向**（reply 的 parent 指向 bot 近期
+  消息 → 免 @ 放行，语义对齐「点消息回复进话题」的定向意图）；或媒体单独豁免
+  （风险：群里所有图片都进 agent，噪声大，不推荐）。
+- **转向回执可见性**：steering 注入消息打 👀（OnIt）表情，真机反馈「太隐蔽、
+  与普通送达状态混淆」。候选：流式卡 footer 追加「📥 已注入 N 条运行中消息」。
+- **08-31 启动 panic 存档**：两次启动死在 "Cannot block the current thread from
+  within a runtime"（std 锁在 runtime 内 block；当日后续启动已正常，未复现）——
+  下次大改启动路径时留意 sync 锁的调用位置。
