@@ -121,6 +121,31 @@ impl MessageMention {
     }
 }
 
+/// v1.18 回复即定向预检：群消息（回复形态）的 parent_id。parent 命中 bot
+/// 近期消息（client::bot_sent_recently）时事件循环放宽 require_mention——
+/// 群里纯图片/文件无法携带 @（手机端无富文本合成路径），回复 bot 的消息本身
+/// 即显式定向。仅群（chat_type=group）且 parent 非空返回 Some。
+pub(crate) fn peek_group_reply_parent(payload: &[u8]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct P {
+        event: E,
+    }
+    #[derive(serde::Deserialize)]
+    struct E {
+        message: M,
+    }
+    #[derive(serde::Deserialize)]
+    struct M {
+        chat_type: String,
+        #[serde(default)]
+        parent_id: Option<String>,
+    }
+    let p: P = serde_json::from_slice(payload).ok()?;
+    (p.event.message.chat_type == "group")
+        .then(|| p.event.message.parent_id.filter(|s| !s.is_empty()))
+        .flatten()
+}
+
 /// mention 处理策略（P6-1）：由 platform 层注入 config，纯函数可测。
 #[derive(Debug, Clone, Copy)]
 pub struct MentionPolicy {
@@ -3723,4 +3748,24 @@ mod tests {
             "非命令群消息仍须 @"
         );
     }
+}
+
+/// v1.18 回复即定向预检：仅群回复形态返回 parent。
+#[test]
+fn peek_group_reply_parent_shapes() {
+    let mk = |chat_type: &str, parent: Option<&str>| {
+        serde_json::json!({
+            "header": {"event_type": "im.message.receive_v1"},
+            "event": {"message": {"chat_type": chat_type, "parent_id": parent}}
+        })
+        .to_string()
+        .into_bytes()
+    };
+    assert_eq!(
+        peek_group_reply_parent(&mk("group", Some("om_p1"))).as_deref(),
+        Some("om_p1")
+    );
+    assert_eq!(peek_group_reply_parent(&mk("p2p", Some("om_p1"))), None, "私聊无需豁免");
+    assert_eq!(peek_group_reply_parent(&mk("group", None)), None, "非回复形态");
+    assert_eq!(peek_group_reply_parent(&mk("group", Some(""))), None, "空 parent");
 }

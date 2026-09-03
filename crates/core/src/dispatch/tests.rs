@@ -1895,6 +1895,7 @@ fn queued_hint_display_shapes() {
     let h = QueuedHint {
         count: 2,
         latest: "别用 npm，改用 pnpm".into(),
+        ..Default::default()
     };
     assert_eq!(
         queued_hint_display(&h).as_deref(),
@@ -1903,6 +1904,7 @@ fn queued_hint_display_shapes() {
     let long = QueuedHint {
         count: 1,
         latest: "x".repeat(100),
+        ..Default::default()
     };
     let out = queued_hint_display(&long).unwrap();
     assert!(out.chars().count() <= "📥 排队 1 条，最新：「」".chars().count() + 40);
@@ -4526,4 +4528,128 @@ async fn stats_includes_approval_group() {
         "(60+120+180+300)/4 = 165s ≈ 2 分钟: {stats_msg}"
     );
     drop_db(ctx.db).await;
+}
+
+/// v1.18 /cron 全链路：add 校验与落库 → list → 到期驱动 fire_due（合成消息走
+/// handle，MockBackend 收到注入前缀 prompt，store 重排）→ rm。
+#[tokio::test]
+async fn cron_add_list_fire_rm() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    // 非法表达式（分钟 99）→ 明确回执，不落库。
+    ctx.disp
+        .handle(msg("c1", "alice", "/cron add 99 * * * * 坏表达式"))
+        .await;
+    assert!(
+        ctx.inbox
+            .lock()
+            .await
+            .iter()
+            .any(|t| t.contains("表达式非法")),
+        "非法表达式回执: {:?}",
+        ctx.inbox.lock().await
+    );
+    assert!(
+        ctx.disp.store.list_cron_jobs().await.unwrap().is_empty(),
+        "非法表达式不应落库"
+    );
+    // 合法表达式（每分钟）→ 落库 + 创建回执。
+    ctx.disp
+        .handle(msg("c1", "alice", "/cron add * * * * * 报数"))
+        .await;
+    assert!(
+        ctx.inbox
+            .lock()
+            .await
+            .iter()
+            .any(|t| t.contains("定时任务已创建")),
+        "创建回执: {:?}",
+        ctx.inbox.lock().await
+    );
+    let jobs = ctx.disp.store.list_cron_jobs().await.unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].conv, "c1");
+    assert_eq!(jobs[0].sender, "alice");
+    assert_eq!(jobs[0].prompt, "报数");
+    // list → 本会话任务可见。
+    ctx.disp.handle(msg("c1", "alice", "/cron list")).await;
+    assert!(
+        ctx.inbox
+            .lock()
+            .await
+            .iter()
+            .any(|t| t.contains("报数") && t.contains("⏰")),
+        "list 回执: {:?}",
+        ctx.inbox.lock().await
+    );
+    // 到期驱动：把 next_run 拨到过去 → fire_due 合成消息走 handle（一轮执行）。
+    ctx.disp
+        .store
+        .bump_cron_job(&jobs[0].id, 0, 1)
+        .await
+        .unwrap();
+    ctx.disp.fire_due_cron_jobs().await;
+    assert!(
+        ctx.prompts
+            .lock()
+            .await
+            .iter()
+            .any(|p| p.contains("定时任务触发") && p.contains("报数")),
+        "到期注入 prompt: {:?}",
+        ctx.prompts.lock().await
+    );
+    // fire 后已重排（next_run 推进到未来，不再 due）。
+    let j = ctx.disp
+        .store
+        .get_cron_job(&jobs[0].id)
+        .await
+        .unwrap()
+        .expect("任务仍在");
+    assert!(j.next_run > 1, "重排后 next_run 应在未来: {}", j.next_run);
+    // 他人不可删（非 admin 场景：build 把 alice 设为 admin，这里用第三者 bob
+    // 未在白名单——handle 直接丢弃，改用 creator 本人删）。
+    ctx.disp
+        .handle(msg("c1", "alice", &format!("/cron rm {}", jobs[0].id)))
+        .await;
+    assert!(
+        ctx.inbox
+            .lock()
+            .await
+            .iter()
+            .any(|t| t.contains("已删除定时任务")),
+        "删除回执: {:?}",
+        ctx.inbox.lock().await
+    );
+    assert!(
+        ctx.disp
+            .store
+            .get_cron_job(&jobs[0].id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    drop_db(ctx.db).await;
+}
+
+/// v1.18 footer：steered 段与排队段并存/单独展示；全零不展示。
+#[test]
+fn queued_hint_display_with_steered() {
+    use crate::card_session::{queued_hint_display, QueuedHint};
+    let s = QueuedHint {
+        steered: 2,
+        ..Default::default()
+    };
+    assert_eq!(
+        queued_hint_display(&s).as_deref(),
+        Some("📥 已注入 2 条运行中消息")
+    );
+    let both = QueuedHint {
+        steered: 1,
+        count: 3,
+        latest: "看这张图".into(),
+    };
+    assert_eq!(
+        queued_hint_display(&both).as_deref(),
+        Some("📥 已注入 1 条运行中消息，排队 3 条，最新：「看这张图」")
+    );
 }

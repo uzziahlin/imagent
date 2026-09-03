@@ -291,6 +291,16 @@ impl FeishuPlatform {
                 // 本条豁免 require_mention（追问场景免于每条 @）。普通群
                 // thread_key 不命中，不豁免。Wave B-8：窗口时长改 config 注入
                 //（thread_active_window，0 = 关闭豁免）。
+                // v1.18 群媒体「回复即定向」：回复 bot 近期消息的群消息（图片/
+                // 文件等无法携带 @ 的形态）视为对 bot 的显式定向，豁免
+                // require_mention——与 @ 等权（白名单/会话域门禁不变）。
+                if policy.require_mention_in_group {
+                    if let Some(parent) = crate::proto::peek_group_reply_parent(&payload) {
+                        if crate::client::bot_sent_recently(&parent) {
+                            policy.require_mention_in_group = false;
+                        }
+                    }
+                }
                 let thread_key = thread_key_of_payload(&payload);
                 if !thread_active_window.is_zero() {
                     if let Some(tk) = &thread_key {

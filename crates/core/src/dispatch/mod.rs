@@ -1012,6 +1012,27 @@ impl Dispatcher {
             ));
         }
 
+        // v1.18 /cron：定时任务调度器——30s tick 查询到期任务，合成消息走正常
+        // handle 管线（白名单/会话域/审批链与手打消息完全同权）。触发前先重排
+        // next_run（防长轮次执行期重复入队）；停机期间错过的到期首个 tick 触发
+        // 一次后顺延，不补跑。
+        {
+            let disp = self.clone();
+            let shutdown = self.shutdown.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => break,
+                        _ = tick.tick() => disp.fire_due_cron_jobs().await,
+                    }
+                }
+                info!(target: "imagent::core", "cron 调度器退出");
+            });
+        }
+
         // recv 失败退避（防 client 异常退出后 dispatcher 忙循环刷屏）。
         let mut recv_backoff = std::time::Duration::from_secs(1);
         const RECV_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1255,6 +1276,14 @@ impl Dispatcher {
                         };
                         if steered {
                             drop(map);
+                            // 卡面可见性（v1.18）：footer「已注入 N 条」——表情回执
+                            // 之外的二次确认，轮次结束清零（见 runner 循环）。
+                            self.queued_hints
+                                .lock()
+                                .await
+                                .entry(conv.to_string())
+                                .or_default()
+                                .steered += 1;
                             // 回执：👀 打在消息上（与真排队 ⏳ 区分——steering 是
                             // 「已注入当轮」，效果由 agent 在下个工具边界续写可见）。
                             if let Some(mid) =
@@ -1309,7 +1338,7 @@ impl Dispatcher {
                 let note = format!("⏳ 等待你审批 · 后面还排着 {count} 条消息");
                 self.queued_hints.lock().await.insert(
                     conv.to_string(),
-                    crate::card_session::QueuedHint { count, latest },
+                    crate::card_session::QueuedHint { count, latest, ..Default::default() },
                 );
                 if let Err(e) = self
                     .platform
@@ -1414,7 +1443,7 @@ impl Dispatcher {
             } else {
                 hints.insert(
                     conv.clone(),
-                    crate::card_session::QueuedHint { count, latest },
+                    crate::card_session::QueuedHint { count, latest, ..Default::default() },
                 );
             }
         }
