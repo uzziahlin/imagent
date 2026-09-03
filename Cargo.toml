@@ -56,7 +56,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 dirs = "5"
-toml = "0.8"
+toml = "1.1"
 # RUSTSEC-2024-0437：默认特性的 protobuf 2.28 有递归崩溃漏洞，我们只用文本
 # 格式指标（registry/text encoding），关掉 protobuf 导出器特性即可移除该依赖。
 prometheus = { version = "0.13", default-features = false }
