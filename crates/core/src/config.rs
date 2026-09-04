@@ -397,11 +397,24 @@ pub struct Config {
     /// → `/deploy --dry-run`。命中前先查内置命令（不可覆盖 /stop 等）。
     #[serde(default)]
     pub shortcuts: std::collections::HashMap<String, String>,
-    /// W2-5：自动 compact 阈值（tokens）——成功轮次的上下文水位
-    /// （usage.input_tokens）达到阈值即自动走 /compact 管道（生成摘要 + 重置，
-    /// 对齐 Claude Code 原生 auto-compact）。默认 120_000；0 = 关闭。
+    /// W2-5：自动 compact 阈值（tokens，**绝对值档**）——成功轮次的上下文水位
+    /// （usage.input+cache_read）达到阈值即自动走 /compact 管道（生成摘要 +
+    /// 重置，对齐 Claude Code 原生 auto-compact）。默认 120_000；0 = 关闭。
+    /// 注意：设置了比例档（`model_context_window_tokens`）时本档被覆盖。
     #[serde(default = "default_auto_compact_threshold_tokens")]
     pub auto_compact_threshold_tokens: u64,
+    /// v1.18：当前模型的上下文窗口大小（tokens，**比例档**开关）——设置后
+    /// 自动压缩阈值 = 窗口 × `auto_compact_window_ratio`（覆盖绝对值档）。
+    /// 动机：120k 绝对默认按 200k 窗口校准，1M 窗口的大窗模型（GLM 等）会
+    /// 过早压缩丢细节。claude CLI 的 usage 不回传窗口字段、无法自动探测，
+    /// 由部署者按所用模型填写（如 1000000）；ACP 路径后续可从 UsageUpdate
+    /// 的 size 字段自动学习（follow-up）。0（默认）= 未声明，用绝对值档。
+    #[serde(default)]
+    pub model_context_window_tokens: u64,
+    /// v1.18：自动压缩的窗口比例（0 < r ≤ 1，缺省 0.8 = 80% 水位触发）。
+    /// 仅 `model_context_window_tokens > 0` 时生效。
+    #[serde(default = "default_auto_compact_window_ratio")]
+    pub auto_compact_window_ratio: f64,
     /// W2-4：claude-acp 并发连接上限（每会话一条长驻子进程连接；超限拒绝）。
     /// 默认 8；仅 `agent = "claude-acp"` 生效。改动需重启。
     #[serde(default = "default_acp_max_connections")]
@@ -541,6 +554,9 @@ fn default_batch_window_ms() -> u64 {
 fn default_auto_compact_threshold_tokens() -> u64 {
     120_000
 }
+fn default_auto_compact_window_ratio() -> f64 {
+    0.8
+}
 fn default_acp_max_connections() -> usize {
     8
 }
@@ -551,7 +567,21 @@ fn default_feishu_asr_enabled() -> bool {
     true
 }
 
+/// 自动压缩阈值下限（0 = 关闭；非 0 生效值须 ≥ 此值，防配出每轮必压的极小值）。
+pub const AUTO_COMPACT_MIN: u64 = 10_000;
+
 impl Config {
+    /// v1.18：自动压缩**生效**阈值——比例档（窗口 × 比例）优先（窗口已声明
+    /// 即激活），否则绝对值档（`auto_compact_threshold_tokens`，0 = 关闭）。
+    /// 阈值语义：成功轮次的上下文水位（input + cache_read）达到即触发。
+    pub fn effective_auto_compact_threshold(&self) -> u64 {
+        if self.model_context_window_tokens > 0 {
+            (self.model_context_window_tokens as f64 * self.auto_compact_window_ratio) as u64
+        } else {
+            self.auto_compact_threshold_tokens
+        }
+    }
+
     /// 默认配置文件路径：`<imagent_home>/config.toml`（P4-10：随 profile 隔离）。
     pub fn default_path() -> Option<PathBuf> {
         Some(crate::paths::imagent_home().join("config.toml"))
@@ -727,7 +757,6 @@ impl Config {
         }
         // W2-5：自动 compact 阈值边界（0 = 关闭；非 0 须 ≥ 10k，防把阈值配成
         // 每轮必压的极小值）。
-        const AUTO_COMPACT_MIN: u64 = 10_000;
         if cfg.auto_compact_threshold_tokens != 0
             && cfg.auto_compact_threshold_tokens < AUTO_COMPACT_MIN
         {
@@ -735,6 +764,31 @@ impl Config {
                 "auto_compact_threshold_tokens 须为 0（关闭）或 ≥ {AUTO_COMPACT_MIN}（当前 {}）",
                 cfg.auto_compact_threshold_tokens
             )));
+        }
+        // v1.18：比例档校验——窗口声明即激活比例档；窗口/比例/生效阈值各有
+        // 边界（生效阈值同样须 ≥ AUTO_COMPACT_MIN，防小窗 × 比例配出必压值）。
+        if cfg.model_context_window_tokens != 0 {
+            if cfg.model_context_window_tokens < AUTO_COMPACT_MIN {
+                return Err(CoreError::Config(format!(
+                    "model_context_window_tokens 须为 0（未声明）或 ≥ {AUTO_COMPACT_MIN}（当前 {}）",
+                    cfg.model_context_window_tokens
+                )));
+            }
+            if !(0.0..=1.0).contains(&cfg.auto_compact_window_ratio)
+                || cfg.auto_compact_window_ratio <= 0.0
+            {
+                return Err(CoreError::Config(format!(
+                    "auto_compact_window_ratio 须在 (0, 1]（当前 {}）",
+                    cfg.auto_compact_window_ratio
+                )));
+            }
+            let effective = cfg.effective_auto_compact_threshold();
+            if effective != 0 && effective < AUTO_COMPACT_MIN {
+                return Err(CoreError::Config(format!(
+                    "比例档生效阈值（窗口 {} × 比例 {} = {effective}）低于最小值 {AUTO_COMPACT_MIN}",
+                    cfg.model_context_window_tokens, cfg.auto_compact_window_ratio
+                )));
+            }
         }
         // W4-1：成本上限须为正数（0 / 负数视为配置错误而非「立即全拒」）。
         if let Some(l) = cfg.sender_daily_cost_limit_usd {
@@ -962,6 +1016,66 @@ platform = "ilink"
         nope.push("imagent_core_cfg_does_not_exist.toml");
         let err = Config::load(&nope).unwrap_err();
         assert!(matches!(err, CoreError::Io(_)), "{err:?}");
+    }
+
+    /// v1.18：自动压缩比例档——窗口声明即激活，阈值 = 窗口 × 比例（覆盖绝对值档）。
+    #[test]
+    fn auto_compact_ratio_mode_effective_threshold() {
+        let p = tmp_path(
+            "ac_ratio",
+            r#"default_workdir = "/tmp/ws"
+model_context_window_tokens = 1000000
+"#,
+        );
+        let cfg = Config::load(&p).expect("parse");
+        // 缺省比例 0.8 → 800k，覆盖绝对值档默认 120k。
+        assert_eq!(cfg.effective_auto_compact_threshold(), 800_000);
+        cleanup(&p);
+    }
+
+    /// 未声明窗口（默认）→ 绝对值档（默认 120k / 配置值）。
+    #[test]
+    fn auto_compact_absolute_fallback_without_window() {
+        let p = tmp_path(
+            "ac_abs",
+            r#"default_workdir = "/tmp/ws"
+auto_compact_threshold_tokens = 300000
+"#,
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(cfg.effective_auto_compact_threshold(), 300_000);
+        cleanup(&p);
+    }
+
+    /// 比例档校验：比例越界 / 窗口过小 / 生效阈值过小均拒绝。
+    #[test]
+    fn auto_compact_ratio_validation() {
+        let mk = |body: &str| {
+            let p = tmp_path("ac_bad", body);
+            let r = Config::load(&p);
+            cleanup(&p);
+            r
+        };
+        let err = mk(
+            "default_workdir = \"/tmp/ws\"\nmodel_context_window_tokens = 100000\nauto_compact_window_ratio = 1.5\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("auto_compact_window_ratio"),
+            "{err}"
+        );
+        let err =
+            mk("default_workdir = \"/tmp/ws\"\nmodel_context_window_tokens = 5000\n").unwrap_err();
+        assert!(
+            err.to_string().contains("model_context_window_tokens"),
+            "{err}"
+        );
+        // 窗口 10k × 比例 0.5 = 5k < AUTO_COMPACT_MIN → 拒绝。
+        let err = mk(
+            "default_workdir = \"/tmp/ws\"\nmodel_context_window_tokens = 10000\nauto_compact_window_ratio = 0.5\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("低于最小值"), "{err}");
     }
 
     #[test]

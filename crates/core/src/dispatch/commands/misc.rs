@@ -126,7 +126,9 @@ impl Dispatcher {
             .await
         {
             Ok(Some(raw)) => raw.parse::<u64>().ok().map(|tokens| {
-                let threshold = self.auto_compact_threshold;
+                let threshold = self
+                    .auto_compact_threshold
+                    .load(std::sync::atomic::Ordering::Relaxed);
                 if threshold > 0 {
                     let pct = tokens * 100 / threshold.max(1);
                     format!("\n- 🧠 上下文：{tokens} tok（阈值 {threshold}，{pct}%）")
