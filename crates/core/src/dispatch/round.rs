@@ -730,7 +730,9 @@ impl Dispatcher {
         // 仅在自动压缩关闭（阈值 0）或水位在 80k~阈值之间时提示。
         // 取舍：OutboundCard 的 footer 无自由文本通道，提示追加在回复正文末尾
         //（卡片/纯文本两条路径都可见，语义同为「完成后给用户的建议」）。
-        let auto_threshold = self.auto_compact_threshold;
+        let auto_threshold = self
+            .auto_compact_threshold
+            .load(std::sync::atomic::Ordering::Relaxed);
         if outcome
             .usage
             .as_ref()

@@ -90,7 +90,8 @@ impl TaskBudgets {
             shutdown_grace: Duration::from_secs(c.shutdown_grace_secs),
             agent_idle_timeout: Duration::from_secs(c.agent_idle_timeout_secs),
             batch_window: Duration::from_millis(c.batch_window_ms),
-            auto_compact_threshold_tokens: c.auto_compact_threshold_tokens,
+            // v1.18：生效阈值（比例档窗口×比例优先，见 Config 文档）。
+            auto_compact_threshold_tokens: c.effective_auto_compact_threshold(),
             sender_daily_cost_limit_usd: c.sender_daily_cost_limit_usd,
         }
     }
@@ -467,7 +468,8 @@ pub struct Dispatcher {
     /// `/config batch_window_ms` 可热改，故共享句柄。
     batch_window: Arc<RwLock<Duration>>,
     /// W2-5：自动 compact 阈值（tokens；0 = 关闭）。config 注入。
-    auto_compact_threshold: u64,
+    /// v1.18：AtomicU64——SIGHUP 热改（此前启动快照，改 config 须重启）。
+    auto_compact_threshold: std::sync::atomic::AtomicU64,
     /// W4-1：per-sender 成本上限（美元，滚动 24h；None = 不限）。config 注入。
     sender_cost_limit: Option<f64>,
     /// 工具过程（COT）展示档位（P4-6）：`/config cot_detail` 可热改。
@@ -603,7 +605,9 @@ impl Dispatcher {
             shutdown_grace: budgets.shutdown_grace,
             agent_idle_timeout: Arc::new(RwLock::new(budgets.agent_idle_timeout)),
             batch_window: Arc::new(RwLock::new(budgets.batch_window)),
-            auto_compact_threshold: budgets.auto_compact_threshold_tokens,
+            auto_compact_threshold: std::sync::atomic::AtomicU64::new(
+                budgets.auto_compact_threshold_tokens,
+            ),
             sender_cost_limit: budgets.sender_daily_cost_limit_usd,
             cot_detail: Arc::new(RwLock::new(cot_detail)),
             started_at: Instant::now(),
@@ -704,6 +708,13 @@ impl Dispatcher {
     }
 
     /// SIGHUP 热重载：整体替换 allowed_tools。
+    /// v1.18：自动压缩阈值热改（SIGHUP）——此前为启动快照，改 config 须重启。
+    /// 生效阈值的计算（比例档优先）在 Config 侧完成，此处只接收结果。
+    pub fn reload_auto_compact_threshold(&self, threshold: u64) {
+        self.auto_compact_threshold
+            .store(threshold, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn reload_tools(&self, tools: Vec<String>) {
         *self.allowed_tools.write() = tools;
     }

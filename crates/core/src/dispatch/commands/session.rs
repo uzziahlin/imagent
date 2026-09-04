@@ -394,7 +394,9 @@ impl Dispatcher {
     /// [`Self::compact_session_locked`]。调用点在 runner 循环（conv 锁已持有，
     /// 与 /compact 同串行域）。压缩轮注册进 running，/stop 可中断。
     pub(super) async fn maybe_auto_compact(&self, conv: &ConvId, hint: &ReplyHint, in_tokens: u64) {
-        let threshold = self.auto_compact_threshold;
+        let threshold = self
+            .auto_compact_threshold
+            .load(std::sync::atomic::Ordering::Relaxed);
         if threshold == 0 || in_tokens < threshold {
             return;
         }
