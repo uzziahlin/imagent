@@ -70,6 +70,7 @@ struct PendingAskCard {
 /// （已批准/已拒绝/已中断）可被下一个询问**原地 patch 复用**——顺序询问
 /// 不再每条刷一张新卡把流式卡顶上去；`Some(req)` = 挂着未决询问
 /// （并发询问须另发新卡，防顶掉别人还没答的请求）。
+#[derive(Debug)]
 struct AskSlot {
     msg_id: String,
     pending_req: Option<String>,
@@ -82,7 +83,7 @@ struct AskSlot {
 }
 
 /// 询问卡的渲染输入（复用槽与新卡登记时记录）。
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct AskRender {
     /// 是否 AskUserQuestion 问题卡（否则审批卡）。
     question: bool,
@@ -97,7 +98,36 @@ struct AskRender {
 ///
 /// 持有发消息所需的 core 配置 + 凭据 + token 缓存；收消息由后台 WS task 推入
 /// inbound channel。token 走 lazy 刷新（不用后台定时 task），避免过期窗口。
+/// per-conv 会话状态（v1.18 review「ConvState 收敛」）：原 9 张独立的
+/// `conv → X` 表（发起者/评论锚/回复锚/最近入站/话题活跃/卡片尾巴/审批 note/
+/// 审批复用槽/下沉标记）收敛为单表单结构——「每 conv 轮次串行」这个此前只能
+/// 靠通读推演的隐含不变量自此有唯一载体，锁纪律（单锁、锁内无 IO）与粗上限
+/// 淘汰（housekeeping）也只需做一次。字段语义见各字段注释（均原样迁移）。
+#[derive(Debug, Default)]
+struct ConvState {
+    /// 最近一次入站消息 sender（轮次发起者近似——审批卡/终止按钮的点击者校验锚）。
+    sender: Option<String>,
+    /// 评论 conv（`feishu:comment:<token>`）→ 最近评论 comment_id（回复目标锚点）。
+    comment_anchor: Option<String>,
+    /// 群 conv 回复锚点（本轮发起消息 id——send_typing 从 last_inbound 提升）。
+    reply_anchor: Option<String>,
+    /// 最近一条入站消息 id（回复锚点候选）。
+    last_inbound: Option<String>,
+    /// 话题免 @ 窗口的最近活跃时刻（窗口判定按 elapsed，过期条目无需清理）。
+    thread_active_at: Option<Instant>,
+    /// 最新卡片平台消息 id（强提醒 urgent_app 的加急对象）。
+    card_tail: Option<String>,
+    /// 审批卡 note 行缓存（排队计数不变不重画）。
+    ask_note: Option<String>,
+    /// 审批/问题卡复用槽（P8-2：下一个询问原地 patch 复用末张卡）。
+    ask_slot: Option<AskSlot>,
+    /// 本轮流式卡发送之后是否发过询问卡（终态「结果下沉」判定，P8-2）。
+    asks_since_card: bool,
+}
+
 pub struct FeishuPlatform {
+    /// per-conv 会话状态（v1.18 review「ConvState 收敛」，见 [`ConvState`]）。
+    conv_states: Arc<Mutex<HashMap<String, ConvState>>>,
     /// 发消息用配置（HTTP OpenAPI + 取 token）。
     core_config: Arc<CoreConfig>,
     app_id: String,
@@ -109,12 +139,6 @@ pub struct FeishuPlatform {
     /// P8-1：已上屏的 footer 文案缓存（per card_id）——分阶段 footer 只在**变化时**
     /// patch（思考中→调用工具→输出中），节流 tick 间内容相同则跳过，不浪费调用。
     card_footers: Arc<Mutex<HashMap<String, String>>>,
-    /// P10-③：审批卡 note 行缓存（per conv）——排队计数不变不重画。
-    ask_notes: Arc<Mutex<HashMap<String, String>>>,
-    /// 每会话最新卡片的平台消息 id（真机校准 2026-08）：强提醒（urgent_app）
-    /// 的加急对象——审批催办对审批卡、完成提醒对流式终态卡，卡直接弹通知而
-    /// 非另发 buzz 文本。send_card / update_card / 审批卡登记时刷新。
-    card_tail: Arc<Mutex<HashMap<String, String>>>,
     /// bot 对用户消息的表情标注状态：om_ 消息 id → 当前 reaction_id（终态翻转
     /// 时先删旧表情再打新表情；仅内存态，重启后旧表情滞留无害——新一轮会重打）。
     msg_reactions: Arc<Mutex<HashMap<String, String>>>,
@@ -128,20 +152,8 @@ pub struct FeishuPlatform {
     /// pending 询问卡登记（多卡并存）：request_id → 卡片信息。
     /// cancel/resolve 按 request_id 精确收敛；`cancel_all_permission_asks` 按 conv 遍历。
     pending_asks: Arc<Mutex<HashMap<String, PendingAskCard>>>,
-    /// P8-2：审批卡复用槽（per conv，见 [`AskSlot`]）。
-    ask_slots: Arc<Mutex<HashMap<String, AskSlot>>>,
-    /// P8-2：本轮流式卡发送之后是否发过询问卡——终态时判定流式卡已被顶离
-    /// 视口，触发「结果下沉」（流式卡收成指针 + 完整结果另发新卡落底）。
-    asks_since_card: Arc<Mutex<HashMap<String, bool>>>,
     /// P6-1：群消息 @bot 过滤策略（与 drain task 共享，`/config` 热切换）。
     mention_policy: Arc<RwLock<crate::proto::MentionPolicy>>,
-    /// conv → 最近一次入站消息 sender（轮次发起者近似——每 conv 轮次串行，
-    /// 审批询问/流式卡发起时取最近 sender 编码进卡片 value 与 pending 登记）。
-    conv_senders: Arc<Mutex<HashMap<String, String>>>,
-    /// 评论 conv（`feishu:comment:<file_token>`）→ 最近评论 comment_id（回复目标
-    /// 锚点表——会话锚放宽后 conv 不再内嵌 comment_id，drain 收到评论事件时登记，
-    /// 发送侧据此路由回复；存量内嵌形态 conv 兜底）。
-    comment_anchors: Arc<Mutex<HashMap<String, String>>>,
     /// 审批/问题卡自动拒绝倒计时的真实值（core `permission_ask_timeout_secs`，
     /// 构造注入——卡片 note 文案与实际超时行为一致，不再硬编码 5 分钟）。
     ask_timeout_secs: u64,
@@ -154,13 +166,6 @@ pub struct FeishuPlatform {
     /// buzz 类加急提醒（send_urgent_text）在窗口内降级为普通消息（不加 buzz
     /// 字段），只影响加急不影响内容。本地时区判定（chrono Local）。
     quiet_hours: Option<imagent_core::QuietHours>,
-    /// Wave B-6：群 conv → 本轮发起消息 id（回复锚点表）。drain 收到普通群消息
-    /// 时登记（见 [`group_reply_anchor`]），发送侧（send_text / 卡片）据此用
-    /// reply API 把回复锚回发起消息。取舍：conv 级近似（与 conv_senders 同姿态
-    /// ——每 conv 轮次串行，运行中他人新消息会更新锚点，误差窗口极窄）。
-    reply_anchors: Arc<Mutex<HashMap<String, String>>>,
-    /// W3-5：最近一条入站消息 id（锚点候选；send_typing 轮次锚定时提升）。
-    last_inbound: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl FeishuPlatform {
@@ -245,48 +250,19 @@ impl FeishuPlatform {
         let pending_asks: Arc<Mutex<HashMap<String, PendingAskCard>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let pending_asks_for_drain = pending_asks.clone();
-        // conv 发起者 / 话题活跃窗口（drain task 与发送侧共享）。
-        let conv_senders: Arc<Mutex<HashMap<String, String>>> =
+        // v1.18 review「ConvState 收敛」：原 9 张 conv 键表（发起者/评论锚/
+        // 回复锚/最近入站/话题活跃/……）收敛为单表，drain 与发送侧共享一份。
+        let conv_states: Arc<Mutex<HashMap<String, ConvState>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let conv_senders_for_drain = conv_senders.clone();
-        // 评论回复目标锚点表（drain 登记、发送侧消费）。
-        let comment_anchors: Arc<Mutex<HashMap<String, String>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let comment_anchors_for_drain = comment_anchors.clone();
-        let thread_active: Arc<Mutex<HashMap<String, Instant>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let thread_active_for_drain = thread_active.clone();
-        // Wave B-6：群 conv 回复锚点表（send_typing 轮次锚定时提升、发送侧消费）。
-        let reply_anchors: Arc<Mutex<HashMap<String, String>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        // W3-5：最近一条入站消息（锚点候选）——drain 登记；send_typing（core 每轮
-        // 开始调用）提升为回复锚点，运行中他人新消息不再抢走本轮 reply 锚。
-        let last_inbound: Arc<Mutex<HashMap<String, String>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let last_inbound_for_drain = last_inbound.clone();
+        let conv_states_for_drain = conv_states.clone();
         // Wave B-8：话题免 @ 窗口（config 注入；0 = 关闭）。
         let thread_active_window = thread_window_of(thread_active_window_secs);
         // W3-1：语音转文字开关（drain 侧消费）。
         let asr_enabled_for_drain = asr_enabled;
-        // v1.18 迭代（housekeeping）：以下四个 per-conv 表先建局部再进 Self——
-        // 后台巡检任务需要共享句柄做粗上限淘汰。
-        let ask_notes_local: Arc<Mutex<HashMap<String, String>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let card_tail_local: Arc<Mutex<HashMap<String, String>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let ask_slots_local: Arc<Mutex<HashMap<String, AskSlot>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let asks_since_card_local: Arc<Mutex<HashMap<String, bool>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        // v1.18 迭代（housekeeping）：per-conv 状态表粗上限淘汰（ConvState
+        // 收敛后只剩这一张表）。
         tokio::spawn(housekeeping_loop(HousekeepingMaps {
-            conv_senders: conv_senders.clone(),
-            comment_anchors: comment_anchors.clone(),
-            reply_anchors: reply_anchors.clone(),
-            last_inbound: last_inbound.clone(),
-            card_tail: card_tail_local.clone(),
-            ask_notes: ask_notes_local.clone(),
-            ask_slots: ask_slots_local.clone(),
-            asks_since_card: asks_since_card_local.clone(),
+            conv_states: conv_states.clone(),
         }));
         tokio::spawn(async move {
             let mut payload_rx = payload_rx;
@@ -326,10 +302,11 @@ impl FeishuPlatform {
                 let thread_key = thread_key_of_payload(&payload);
                 if !thread_active_window.is_zero() {
                     if let Some(tk) = &thread_key {
-                        if thread_active_for_drain
+                        if conv_states_for_drain
                             .lock()
                             .await
                             .get(tk)
+                            .and_then(|s| s.thread_active_at)
                             .is_some_and(|t| t.elapsed() < thread_active_window)
                         {
                             policy.require_mention_in_group = false;
@@ -342,27 +319,24 @@ impl FeishuPlatform {
                     if !dedup.check(&msgid) {
                         continue;
                     }
-                    // 记录 conv 发起者（审批卡/终止按钮的发起者校验锚）与话题
-                    // 活跃时刻（免 @ 窗口续期；有界防泄漏）。
-                    conv_senders_for_drain
-                        .lock()
-                        .await
-                        .insert(msg.conv_id.0.clone(), msg.sender.0.clone());
-                    // Wave B-6/W3-5：普通群消息登记**锚点候选**（最近一条入站消息
-                    // id）——send_typing（core 每轮开始调用）提升为回复锚点后，
-                    // 发送侧据此用 reply API 把回复/卡片锚回该消息（私聊/话题/
-                    // 评论不登记：私聊无引用需求，话题已锚 root，评论走评论回复）。
-                    if let Some((conv, anchor)) =
-                        group_reply_anchor(&msg.conv_id.0, msg.source_msg_id.as_deref())
+                    // 记录 conv 发起者（审批卡/终止按钮的发起者校验锚）、锚点候选
+                    //（最近一条入站消息 id——send_typing 提升为回复锚点）与话题活跃
+                    // 时刻（免 @ 窗口续期）。ConvState 收敛后单锁单 entry 完成；
+                    // 有界性由 housekeeping 粗上限统一承担（原 512 整体重置删除）。
                     {
-                        last_inbound_for_drain.lock().await.insert(conv, anchor);
-                    }
-                    if let Some(tk) = &thread_key {
-                        let mut m = thread_active_for_drain.lock().await;
-                        if m.len() > 512 {
-                            m.clear(); // 粗上限：超量整体重置（窗口语义无损）。
+                        let mut m = conv_states_for_drain.lock().await;
+                        let st = m.entry(msg.conv_id.0.clone()).or_default();
+                        st.sender = Some(msg.sender.0.clone());
+                        if let Some((conv, anchor)) =
+                            group_reply_anchor(&msg.conv_id.0, msg.source_msg_id.as_deref())
+                        {
+                            st.last_inbound = Some(anchor);
+                            let _ = conv;
                         }
-                        m.insert(tk.clone(), Instant::now());
+                        if let Some(tk) = &thread_key {
+                            m.entry(tk.clone()).or_default().thread_active_at =
+                                Some(Instant::now());
+                        }
                     }
                     // v1.18 迭代（intake 解耦）：媒体下载/转写/落盘移出 drain 串行
                     // 循环——单条媒体 IO（read_timeout 已兜底停滞，此处再解耦吞吐）
@@ -411,21 +385,20 @@ impl FeishuPlatform {
                     // 与普通消息一致的登记（转录消息同样发起一轮 agent）：conv 发起
                     // 者（审批卡点击者校验锚）/ 锚点候选（W3-5：send_typing 轮次
                     // 锚定时提升为回复锚点）/ 话题活跃免 @ 续期。
-                    conv_senders_for_drain
-                        .lock()
-                        .await
-                        .insert(mf_msg.conv_id.0.clone(), mf_msg.sender.0.clone());
-                    if let Some((conv, anchor)) =
-                        group_reply_anchor(&mf_msg.conv_id.0, mf_msg.source_msg_id.as_deref())
                     {
-                        last_inbound_for_drain.lock().await.insert(conv, anchor);
-                    }
-                    if let Some(tk) = &thread_key {
-                        let mut m = thread_active_for_drain.lock().await;
-                        if m.len() > 512 {
-                            m.clear(); // 粗上限：超量整体重置（窗口语义无损）。
+                        let mut m = conv_states_for_drain.lock().await;
+                        let st = m.entry(mf_msg.conv_id.0.clone()).or_default();
+                        st.sender = Some(mf_msg.sender.0.clone());
+                        if let Some((conv, anchor)) =
+                            group_reply_anchor(&mf_msg.conv_id.0, mf_msg.source_msg_id.as_deref())
+                        {
+                            st.last_inbound = Some(anchor);
+                            let _ = conv;
                         }
-                        m.insert(tk.clone(), Instant::now());
+                        if let Some(tk) = &thread_key {
+                            m.entry(tk.clone()).or_default().thread_active_at =
+                                Some(Instant::now());
+                        }
                     }
                     // v1.18 迭代（intake 解耦）：拉子消息（分页 API）与媒体下载
                     // 同理移出 drain 串行循环——转录产出经 per-conv 泵按序发出；
@@ -542,10 +515,12 @@ impl FeishuPlatform {
                     }
                     // conv 发起者更新（按钮触发的轮次由点击者发起）。
                     if !reply_msg.sender.0.is_empty() {
-                        conv_senders_for_drain
+                        conv_states_for_drain
                             .lock()
                             .await
-                            .insert(reply_msg.conv_id.0.clone(), reply_msg.sender.0.clone());
+                            .entry(reply_msg.conv_id.0.clone())
+                            .or_default()
+                            .sender = Some(reply_msg.sender.0.clone());
                     }
                     // 过期反馈：req 已不在 pending_asks（询问已批准/拒绝/中断/
                     // 超时收敛，或复用槽换了新请求）→ 回一条「已过期」提示而非
@@ -616,10 +591,12 @@ impl FeishuPlatform {
                         // 会话锚放宽：登记回复目标锚点（conv → comment_id）——发送
                         // 侧（send_text/send_media 评论分支）据此路由回复。
                         if dedup.check(&key) {
-                            comment_anchors_for_drain
+                            conv_states_for_drain
                                 .lock()
                                 .await
-                                .insert(cm.conv_id.0.clone(), comment_id);
+                                .entry(cm.conv_id.0.clone())
+                                .or_default()
+                                .comment_anchor = Some(comment_id);
                             if inbound_msg_tx.send(cm).await.is_err() {
                                 break;
                             }
@@ -780,22 +757,18 @@ impl FeishuPlatform {
             token,
             card_seqs: Arc::new(Mutex::new(HashMap::new())),
             card_footers: Arc::new(Mutex::new(HashMap::new())),
-            ask_notes: ask_notes_local,
-            card_tail: card_tail_local,
+            conv_states: conv_states.clone(),
             msg_reactions: Arc::new(Mutex::new(HashMap::new())),
             managed_card_msgs: Arc::new(Mutex::new(HashMap::new())),
             reconnect,
             inbound_rx: Arc::new(Mutex::new(inbound_msg_rx)),
             pending_asks,
-            ask_slots: ask_slots_local,
-            asks_since_card: asks_since_card_local,
+
             mention_policy,
-            conv_senders,
-            comment_anchors,
+
             ask_timeout_secs,
             quiet_hours,
-            reply_anchors,
-            last_inbound,
+
             text_split_max: message_max_len
                 .unwrap_or(FEISHU_TEXT_MAX)
                 .min(FEISHU_TEXT_MAX),
@@ -966,7 +939,7 @@ impl FeishuPlatform {
                         &conv.0,
                         (!sender.is_empty()).then_some(sender).as_deref(),
                     );
-                    let res = patch_card(&self.core_config, &token, &message_id, &card_json).await;
+                    let res = patch_card(&self.core_config, token, &message_id, &card_json).await;
                     if res.is_ok() {
                         // 终态清理（与 patch_managed 终态分支同语义——本分支
                         // 提前 return 会绕过那边的清理，防 per-card 状态泄漏）。
@@ -976,10 +949,7 @@ impl FeishuPlatform {
                     return res;
                 }
             }
-            match self
-                .patch_managed(&token, card_id, card, wants_buried)
-                .await
-            {
+            match self.patch_managed(token, card_id, card, wants_buried).await {
                 // 300317（sequence 落后）自愈（真机校准）：重启后内存计数器归零，
                 // 但旧卡片的 server 序号已推进（孤儿扫描接管、同进程异常路径）
                 // ——把该卡计数器重置为时间戳级（必然大于 server 序号）整段重试。
@@ -998,8 +968,7 @@ impl FeishuPlatform {
                     let mut seqs = self.card_seqs.lock().await;
                     let v = seqs.entry(card_id.to_string()).or_insert(now);
                     *v = (*v).max(now).saturating_add(1);
-                    self.patch_managed(&token, card_id, card, wants_buried)
-                        .await
+                    self.patch_managed(token, card_id, card, wants_buried).await
                 }
                 other => other,
             }
@@ -1015,7 +984,7 @@ impl FeishuPlatform {
                     (!sender.is_empty()).then_some(sender).as_deref(),
                 )
             };
-            patch_card(&self.core_config, &token, message_id, &card_json).await
+            patch_card(&self.core_config, token, message_id, &card_json).await
         } else {
             Err(CoreError::Platform(
                 PLATFORM,
@@ -1208,29 +1177,31 @@ impl FeishuPlatform {
     /// 刷新会话最新卡片记录（card_tail，强提醒加急对象）。
     async fn note_card_tail(&self, conv_id: &str, msg_id: &str) {
         if msg_id.starts_with("om_") {
-            self.card_tail
+            self.conv_states
                 .lock()
                 .await
-                .insert(conv_id.to_string(), msg_id.to_string());
+                .entry(conv_id.to_string())
+                .or_default()
+                .card_tail = Some(msg_id.to_string());
         }
     }
 
     async fn last_sender(&self, conv_id: &str) -> String {
-        self.conv_senders
+        self.conv_states
             .lock()
             .await
             .get(conv_id)
-            .cloned()
+            .and_then(|s| s.sender.clone())
             .unwrap_or_default()
     }
 
     /// Wave B-6：该 conv 的回复锚点（最近一条普通群消息的 message_id；无则 None）。
     async fn reply_anchor(&self, conv_id: &str) -> Option<String> {
-        self.reply_anchors
+        self.conv_states
             .lock()
             .await
             .get(conv_id)
-            .cloned()
+            .and_then(|s| s.reply_anchor.clone())
             .filter(|a| !a.is_empty())
     }
 
@@ -1298,23 +1269,27 @@ impl FeishuPlatform {
         self.note_card_tail(conv_id, msg_id).await;
         self.record_pending_ask(request_id, conv_id, msg_id, tool_name, &sender)
             .await;
-        self.ask_slots.lock().await.insert(
-            conv_id.to_string(),
-            AskSlot {
-                msg_id: msg_id.to_string(),
-                pending_req: Some(request_id.to_string()),
-                render,
-            },
-        );
+        self.conv_states
+            .lock()
+            .await
+            .entry(conv_id.to_string())
+            .or_default()
+            .ask_slot = Some(AskSlot {
+            msg_id: msg_id.to_string(),
+            pending_req: Some(request_id.to_string()),
+            render,
+        });
         self.mark_ask_sent(conv_id).await;
     }
 
     /// P8-2：标记本轮流式卡之后发过询问卡（终态「结果下沉」判定）。
     async fn mark_ask_sent(&self, conv_id: &str) {
-        self.asks_since_card
+        self.conv_states
             .lock()
             .await
-            .insert(conv_id.to_string(), true);
+            .entry(conv_id.to_string())
+            .or_default()
+            .asks_since_card = true;
     }
 
     /// P8-2：只读「发过询问卡」标记（终态下沉判定用，不消费）。
@@ -1323,36 +1298,46 @@ impl FeishuPlatform {
     /// 标志已丢：重试/孤儿扫描以「未下沉」形态把全文 patch 到早已被顶离视口
     /// 的旧卡上，设计的下沉 UX 静默丢失且不可恢复。
     async fn peek_asks_flag(&self, conv_id: &str) -> bool {
-        self.asks_since_card
+        self.conv_states
             .lock()
             .await
             .get(conv_id)
-            .copied()
-            .unwrap_or(false)
+            .is_some_and(|s| s.asks_since_card)
     }
 
     /// P8-2：消费「发过询问卡」标记（仅终态全链路成功后调用）。
     async fn clear_asks_flag(&self, conv_id: &str) {
-        self.asks_since_card.lock().await.remove(conv_id);
+        self.conv_states
+            .lock()
+            .await
+            .entry(conv_id.to_string())
+            .or_default()
+            .asks_since_card = false;
     }
 
     /// 兼容旧语义的单测辅助（取出并清除）。
     #[cfg(test)]
     async fn take_asks_flag(&self, conv_id: &str) -> bool {
-        self.asks_since_card
+        self.conv_states
             .lock()
             .await
-            .remove(conv_id)
+            .get_mut(conv_id)
+            .map(|s| std::mem::replace(&mut s.asks_since_card, false))
             .unwrap_or(false)
     }
 
     /// P8-2：释放该 conv 的复用槽（询问收敛后调用——卡保留在 IM 里，下一个
     /// 询问原地 patch 复用，不另发新卡）。
     async fn free_ask_slot(&self, conv_id: &str, request_id: &str) {
-        if let Some(slot) = self.ask_slots.lock().await.get_mut(conv_id) {
+        if let Some(slot) = self
+            .conv_states
+            .lock()
+            .await
+            .get_mut(conv_id)
+            .and_then(|s| s.ask_slot.as_mut())
+        {
             if slot.pending_req.as_deref() == Some(request_id) {
                 slot.pending_req = None;
-                // v9-R14：resolved_at 死字段已删（只写不读）。
             }
         }
     }
@@ -1406,11 +1391,11 @@ impl FeishuPlatform {
         // 刚重启、锚点表为空）无法定位评论线程，如实报错。
         if let Some((file_token, legacy_cid)) = comment_target_from_conv(conv) {
             let comment_id = self
-                .comment_anchors
+                .conv_states
                 .lock()
                 .await
                 .get(&conv.0)
-                .cloned()
+                .and_then(|s| s.comment_anchor.clone())
                 .or(legacy_cid);
             let Some(comment_id) = comment_id else {
                 return Err(CoreError::Platform(
@@ -1552,16 +1537,10 @@ fn sender_opt_of(sender: &str) -> Option<&str> {
     (!sender.is_empty()).then_some(sender)
 }
 
-/// housekeeping 巡检覆盖的 per-conv 表（粗上限淘汰，见 housekeeping_loop）。
+/// housekeeping 巡检覆盖的 per-conv 状态表（粗上限淘汰，见 housekeeping_loop）。
+/// ConvState 收敛后仅剩这一张。
 struct HousekeepingMaps {
-    conv_senders: Arc<Mutex<HashMap<String, String>>>,
-    comment_anchors: Arc<Mutex<HashMap<String, String>>>,
-    reply_anchors: Arc<Mutex<HashMap<String, String>>>,
-    last_inbound: Arc<Mutex<HashMap<String, String>>>,
-    card_tail: Arc<Mutex<HashMap<String, String>>>,
-    ask_notes: Arc<Mutex<HashMap<String, String>>>,
-    ask_slots: Arc<Mutex<HashMap<String, AskSlot>>>,
-    asks_since_card: Arc<Mutex<HashMap<String, bool>>>,
+    conv_states: Arc<Mutex<HashMap<String, ConvState>>>,
 }
 
 /// v1.18 迭代（深度 review 结构性项）：后台巡检——
@@ -1596,17 +1575,9 @@ async fn housekeeping_loop(maps: HousekeepingMaps) {
             }
             0
         }
-        let mut reset = 0usize;
-        reset += cap(&maps.conv_senders).await;
-        reset += cap(&maps.comment_anchors).await;
-        reset += cap(&maps.reply_anchors).await;
-        reset += cap(&maps.last_inbound).await;
-        reset += cap(&maps.card_tail).await;
-        reset += cap(&maps.ask_notes).await;
-        reset += cap(&maps.ask_slots).await;
-        reset += cap(&maps.asks_since_card).await;
+        let reset = cap(&maps.conv_states).await;
         if reset > 0 {
-            warn!(target: "feishu", reset, "per-conv 状态表超粗上限（>{PER_CONV_MAP_CAP}），整体重置 {reset} 条");
+            warn!(target: "feishu", reset, "per-conv 状态表超粗上限（>{PER_CONV_MAP_CAP}），整体重置 {reset} 个会话条目");
         }
         tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
     }
@@ -2229,7 +2200,12 @@ impl Platform for FeishuPlatform {
         //（urgent_app）——卡直接弹通知、不产生额外文本消息（此前 buzz 文本
         // 与卡片流视觉割裂）。审批催办时最新卡即审批卡、完成提醒时即终态卡。
         // 无卡 / 无接收人 / 接口失败（权限缺失等）回退 buzz 文本（fail-soft）。
-        let tail = self.card_tail.lock().await.get(&conv.0).cloned();
+        let tail = self
+            .conv_states
+            .lock()
+            .await
+            .get(&conv.0)
+            .and_then(|s| s.card_tail.clone());
         let sender = self.last_sender(&conv.0).await;
         if let (Some(mid), false) = (tail, sender.is_empty()) {
             match self
@@ -2264,11 +2240,11 @@ impl Platform for FeishuPlatform {
         // **待真机校准**），给用户可读错误而非静默失败。
         if let Some((file_token, legacy_cid)) = comment_target_from_conv(conv) {
             let comment_id = self
-                .comment_anchors
+                .conv_states
                 .lock()
                 .await
                 .get(&conv.0)
-                .cloned()
+                .and_then(|s| s.comment_anchor.clone())
                 .or(legacy_cid);
             let Some(comment_id) = comment_id else {
                 return Err(CoreError::Platform(
@@ -2382,11 +2358,13 @@ impl Platform for FeishuPlatform {
         // 锚点。此后本轮运行中他人新消息只更新 last_inbound（下轮才生效），
         // 本轮的流式卡/回复不再被无关新消息抢走 reply 锚（修复 conv 级「最近
         // 一条」近似在群协作下的锚点漂移）。
-        if let Some(anchor) = self.last_inbound.lock().await.get(&conv.0).cloned() {
-            self.reply_anchors
-                .lock()
-                .await
-                .insert(conv.0.clone(), anchor);
+        {
+            let mut m = self.conv_states.lock().await;
+            if let Some(s) = m.get_mut(&conv.0) {
+                if let Some(a) = s.last_inbound.clone() {
+                    s.reply_anchor = Some(a);
+                }
+            }
         }
         Ok(())
     }
@@ -2663,9 +2641,14 @@ impl Platform for FeishuPlatform {
         });
         drop(all);
         // P8-2：conv 级复用槽一并释放（/stop 后短窗口内的下一个询问可复用末张卡）。
-        if let Some(slot) = self.ask_slots.lock().await.get_mut(&conv.0) {
+        if let Some(slot) = self
+            .conv_states
+            .lock()
+            .await
+            .get_mut(&conv.0)
+            .and_then(|s| s.ask_slot.as_mut())
+        {
             slot.pending_req = None;
-            // v9-R14：resolved_at 死字段已删（只写不读）。
         }
         for (message_id, tool_name) in hits {
             let card_json = render_permission_card_cancelled(&tool_name);
@@ -2728,8 +2711,8 @@ impl Platform for FeishuPlatform {
     /// 不变不重画）；无未决槽 no-op。best-effort。
     async fn note_queued_on_ask(&self, conv: &ConvId, note: &str, _hint: &ReplyHint) -> Result<()> {
         let (msg_id, render, request_id) = {
-            let slots = self.ask_slots.lock().await;
-            let Some(slot) = slots.get(&conv.0) else {
+            let states = self.conv_states.lock().await;
+            let Some(slot) = states.get(&conv.0).and_then(|s| s.ask_slot.as_ref()) else {
                 return Ok(());
             };
             let Some(req) = slot.pending_req.clone() else {
@@ -2739,19 +2722,24 @@ impl Platform for FeishuPlatform {
         };
         // 去重：note 不变不重画。
         {
-            let mut notes = self.ask_notes.lock().await;
-            if notes.get(&conv.0).map(String::as_str) == Some(note) {
+            let mut states = self.conv_states.lock().await;
+            let unchanged = states
+                .get(&conv.0)
+                .and_then(|s| s.ask_note.as_deref())
+                .is_some_and(|prev| prev == note);
+            if unchanged {
                 return Ok(());
             }
-            notes.insert(conv.0.clone(), note.to_string());
+            states.entry(conv.0.clone()).or_default().ask_note = Some(note.to_string());
         }
         // L17（code-review v8）：快照→网络→patch 期间终态可能已落——重渲染前
         // 复查 pending 仍是快照的 request_id，否则放弃（防终态卡被翻回带按钮
         // 的 pending 态误导点击；过期点击本有时效兜底，此处消歧义）。
         {
-            let slots = self.ask_slots.lock().await;
-            let still_pending = slots
+            let states = self.conv_states.lock().await;
+            let still_pending = states
                 .get(&conv.0)
+                .and_then(|s| s.ask_slot.as_ref())
                 .map(|sl| sl.pending_req.as_deref() == Some(request_id.as_str()))
                 .unwrap_or(false);
             if !still_pending {
@@ -2926,10 +2914,12 @@ impl Platform for FeishuPlatform {
     ) -> Result<Option<String>> {
         // P8-2：新一轮流式卡——「之后发过询问卡」标记清零（conv 轮次串行，
         // 无并发覆盖问题）。
-        self.asks_since_card
+        self.conv_states
             .lock()
             .await
-            .insert(conv.0.clone(), false);
+            .entry(conv.0.clone())
+            .or_default()
+            .asks_since_card = false;
         // 发起者（最近 sender）：编码进初始卡的 ⏹ 终止按钮 value（群 conv 下点击者
         // 校验）；Wave B-5：群 conv 初始卡顶部加「发起者」标注行。占位/未知为
         // None（旧语义，不校验）。
@@ -3073,8 +3063,8 @@ impl Platform for FeishuPlatform {
         // 永远失败——清 per-card 缓存（序列号/footer），错误附 CARD_HANDLE_LOST
         // 哨兵（core CardSession 据此摘 live_cards 并置空句柄，Running 期下帧
         // 重发新卡，启动扫描据此作废登记）。C：终态失败的最小卡收敛（见
-        /// minimize_terminal_card）。Running 失败不触发 C（流式帧失败由下帧/
-        /// 看门狗兜底——原守卫的语义保留在 match arm 条件里）。
+        // minimize_terminal_card）。Running 失败不触发 C（流式帧失败由下帧/
+        // 看门狗兜底——原守卫的语义保留在 match arm 条件里）。
         let outcome = match res {
             Ok(()) => PatchOutcome::Delivered,
             Err(e) if is_card_not_exist_msg(&e.to_string()) => {
@@ -3377,7 +3367,12 @@ mod tests {
         .expect("构造");
         let conv = ConvId("feishu:ou_x".into());
         // send_card 的清零等价于直接写 false（方法本身需 HTTP，此处测标记语义）。
-        p.asks_since_card.lock().await.insert(conv.0.clone(), false);
+        p.conv_states
+            .lock()
+            .await
+            .entry(conv.0.clone())
+            .or_default()
+            .asks_since_card = false;
         assert!(!p.take_asks_flag(&conv.0).await, "未发询问 → 不下沉");
         p.mark_ask_sent(&conv.0).await;
         assert!(p.take_asks_flag(&conv.0).await, "发过询问 → 下沉");
@@ -3540,10 +3535,12 @@ mod tests {
         assert!(!p.in_quiet_hours(), "未配置恒不在免打扰");
         // 锚点表 roundtrip。
         assert!(p.reply_anchor("feishu:oc_g").await.is_none(), "空表 → None");
-        p.reply_anchors
+        p.conv_states
             .lock()
             .await
-            .insert("feishu:oc_g".to_string(), "om_1".to_string());
+            .entry("feishu:oc_g".to_string())
+            .or_default()
+            .reply_anchor = Some("om_1".to_string());
         assert_eq!(
             p.reply_anchor("feishu:oc_g").await.as_deref(),
             Some("om_1"),
