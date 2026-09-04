@@ -407,9 +407,13 @@ pub struct Config {
     /// 自动压缩阈值 = 窗口 × `auto_compact_window_ratio`（覆盖绝对值档）。
     /// 动机：120k 绝对默认按 200k 窗口校准，1M 窗口的大窗模型（GLM 等）会
     /// 过早压缩丢细节。claude CLI 的 usage 不回传窗口字段、无法自动探测，
-    /// 由部署者按所用模型填写（如 1000000）；ACP 路径后续可从 UsageUpdate
-    /// 的 size 字段自动学习（follow-up）。0（默认）= 未声明，用绝对值档。
-    #[serde(default)]
+    /// 由部署者按所用模型填写；ACP 路径后续可从 UsageUpdate 的 size 字段
+    /// 自动学习（follow-up）。
+    /// **默认 1_000_000**（按大窗模型假定的比例档缺省）——200k 窗口的
+    /// Claude 系模型请显式声明 200000（否则阈值 800k 高于模型硬上限，
+    /// 水位撞窗前永不触发自动压缩，将以 API 上下文溢出错误收场）；
+    /// 设 0 = 回退绝对值档（`auto_compact_threshold_tokens`）。
+    #[serde(default = "default_model_context_window_tokens")]
     pub model_context_window_tokens: u64,
     /// v1.18：自动压缩的窗口比例（0 < r ≤ 1，缺省 0.8 = 80% 水位触发）。
     /// 仅 `model_context_window_tokens > 0` 时生效。
@@ -556,6 +560,9 @@ fn default_auto_compact_threshold_tokens() -> u64 {
 }
 fn default_auto_compact_window_ratio() -> f64 {
     0.8
+}
+fn default_model_context_window_tokens() -> u64 {
+    1_000_000
 }
 fn default_acp_max_connections() -> usize {
     8
@@ -861,7 +868,10 @@ permission_mode = "auto"    # 缺省=auto：claude-cli=透传 claude 原生 auto
 # disallowed_tools = ["WebSearch"]  # 禁用工具黑名单（--disallowedTools；与 allowed_tools 独立，黑名单优先）
 # mcp_config_path = "~/.claude/mcp.json"  # 用户 MCP servers 合并进每次 run（给 agent 挂工具；imagent 条目名保留）
 # append_system_prompt = "你在飞书里服务团队，回复保持简洁中文"  # 附加系统提示（--append-system-prompt）
-# auto_compact_threshold_tokens = 120000  # 自动 compact：上下文水位超阈值自动压缩（对齐 Claude Code auto-compact；0=关闭）
+# 自动 compact（v1.18 比例档缺省生效）：水位达模型窗口 × 80% 触发压缩。
+# model_context_window_tokens = 1000000   # 模型上下文窗口（缺省 1M 大窗假定；200k 窗口的 Claude 系模型请显式写 200000）
+# auto_compact_window_ratio = 0.8         # 触发比例（缺省 0.8）
+# auto_compact_threshold_tokens = 120000  # 绝对值档：仅窗口设 0 时生效（0=关闭）
 # acp_max_connections = 8      # claude-acp 并发连接上限（仅 agent="claude-acp"）
 # acp_idle_recycle_secs = 600  # claude-acp 连接空闲回收（秒；仅 agent="claude-acp"）
 # feishu_asr_enabled = true     # 飞书语音转文字（需后台申请语音识别权限；失败回退提示，仅 feishu）
@@ -1033,17 +1043,23 @@ model_context_window_tokens = 1000000
         cleanup(&p);
     }
 
-    /// 未声明窗口（默认）→ 绝对值档（默认 120k / 配置值）。
+    /// 显式 window=0 → 绝对值档（配置值）；缺省窗口 = 1M → 比例档 800k。
     #[test]
-    fn auto_compact_absolute_fallback_without_window() {
+    fn auto_compact_absolute_fallback_and_default_window() {
         let p = tmp_path(
             "ac_abs",
             r#"default_workdir = "/tmp/ws"
 auto_compact_threshold_tokens = 300000
+model_context_window_tokens = 0
 "#,
         );
         let cfg = Config::load(&p).expect("parse");
         assert_eq!(cfg.effective_auto_compact_threshold(), 300_000);
+        cleanup(&p);
+        // 缺省（不写任何相关键）：窗口默认 1M × 0.8 = 800k。
+        let p = tmp_path("ac_default", r#"default_workdir = "/tmp/ws""#);
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(cfg.effective_auto_compact_threshold(), 800_000);
         cleanup(&p);
     }
 
