@@ -887,6 +887,143 @@ impl FeishuPlatform {
     /// `card_footers` 缓存去重——内容不变不发；终态收敛成 完成/出错/已中断。
     /// P8-2：`stub = true`（终态结果下沉）时终态正文用指针 stub 替代全文——
     /// 全文由调用方以新卡重发在下方。
+    /// update_card 阶段 C（v1.18 review 状态机化抽离，行为与原内联块一致）：
+    /// 终态 patch 失败（超限 200860/230099 等）时原卡停在「思考中」——最小化
+    /// 终态卡重试一次保证卡片必然收敛。R1（code-review v9）：收敛成功也上抛
+    /// 加工后的原错误（触发 core P5-11 纯文本补发）；再失败维持原错误。
+    async fn minimize_terminal_card(
+        &self,
+        handle: &str,
+        done: bool,
+        original: CoreError,
+    ) -> PatchOutcome {
+        let err_text = original.to_string();
+        let minimal = crate::card::render_overflow_terminal_card(done);
+        // 重试目标：msg: 句柄直用；card: 句柄经映射表换消息 id。
+        let target_mid: Option<String> = match handle.strip_prefix("msg:") {
+            Some(m) => Some(m.to_string()),
+            None => match handle.strip_prefix("card:") {
+                Some(cid) => self.managed_card_msgs.lock().await.get(cid).cloned(),
+                None => None,
+            },
+        };
+        let retry = match target_mid {
+            Some(mid) => {
+                self.with_token(move |t| {
+                    let minimal = minimal.clone();
+                    let mid = mid.clone();
+                    async move { patch_card(&self.core_config, &t, &mid, &minimal).await }
+                })
+                .await
+            }
+            None => Err(CoreError::Platform(
+                PLATFORM,
+                "终态重试无目标消息 id".into(),
+            )),
+        };
+        match retry {
+            Ok(()) => {
+                warn!(target: "feishu", error = %err_text, "终态 patch 失败，最小卡已收敛；上抛原错误触发 core 纯文本补发");
+                PatchOutcome::Minimized(CoreError::Platform(
+                    PLATFORM,
+                    format!("{err_text}（终态卡已收敛为最小形态，完整内容由文本消息补发）"),
+                ))
+            }
+            Err(_) => PatchOutcome::Failed(original),
+        }
+    }
+
+    /// update_card 阶段 A（token 作用域内的主 patch，v1.18 review 状态机化抽离）：
+    /// card: 句柄 →〔终态且未下沉：im-patch 整卡快路径（无映射降级 managed）〕
+    /// → managed element 流式 + 300317 序列重置重试；msg: 句柄 → 整卡/stub 重渲染；
+    /// 其余 → 非法句柄。行为与抽离前的闭包逐分支一致。
+    async fn patch_any_handle(
+        &self,
+        token: &str,
+        conv: &ConvId,
+        handle: &str,
+        card: &OutboundCard,
+        wants_buried: bool,
+    ) -> Result<()> {
+        if let Some(card_id) = handle.strip_prefix("card:") {
+            // 真机校准（2026-08）：终态且未下沉时改**整卡 im patch**
+            // （render_card 折叠面板布局）——统一视觉：此前 managed 终态把
+            // 工具轨迹/思考过程内联进 md_body（长卡），而结果下沉新卡是折叠
+            // 面板，两形态不一致（用户反馈折叠更好）。Running 仍走 managed
+            // element 流式（打字机/节流/300317 自愈语义不变）。无映射
+            // （重启后）退回 managed 终态 patch（内联形态，可接受降级）。
+            if !wants_buried && !matches!(card.terminal, CardTerminal::Running) {
+                // v1.18 review：先 let 绑定再判断——edition 2021 的 if-let
+                // scrutinee 临时值（MutexGuard）存活到整个 if-let 结束，
+                // 此前 managed_card_msgs 锁跨 patch 网络调用（30s 超时 +
+                // 限流重试）长达半分钟，期间其它 conv 的 send_card 登记/
+                // 终态查询全部排队。
+                let mid = self.managed_card_msgs.lock().await.get(card_id).cloned();
+                if let Some(message_id) = mid {
+                    let sender = self.last_sender(&conv.0).await;
+                    let card_json = render_card(
+                        card,
+                        &conv.0,
+                        (!sender.is_empty()).then_some(sender).as_deref(),
+                    );
+                    let res = patch_card(&self.core_config, &token, &message_id, &card_json).await;
+                    if res.is_ok() {
+                        // 终态清理（与 patch_managed 终态分支同语义——本分支
+                        // 提前 return 会绕过那边的清理，防 per-card 状态泄漏）。
+                        self.card_seqs.lock().await.remove(card_id);
+                        self.card_footers.lock().await.remove(card_id);
+                    }
+                    return res;
+                }
+            }
+            match self
+                .patch_managed(&token, card_id, card, wants_buried)
+                .await
+            {
+                // 300317（sequence 落后）自愈（真机校准）：重启后内存计数器归零，
+                // 但旧卡片的 server 序号已推进（孤儿扫描接管、同进程异常路径）
+                // ——把该卡计数器重置为时间戳级（必然大于 server 序号）整段重试。
+                Err(e) if e.to_string().contains("300317") => {
+                    warn!(target: "feishu", card_id, "sequence 落后（300317），重置计数器后重试");
+                    // sequence 是 int32：用**秒级**时间戳（~1.8e9 < 2^31，
+                    // 2038 年前安全）；毫秒会溢出被 9499 拒（真机踩过）。
+                    // 秒级值必然大于服务端已用的小序号，满足严格递增。
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(1_000_000_000);
+                    // CAS（v1.18 review）：原写法直接覆写——并发 300317 同时
+                    // 重置会写出相同 seq（两个重试再撞 300317）。只增不降且
+                    // +1，并发重置也严格递增（int32 上限 2038 年，见上）。
+                    let mut seqs = self.card_seqs.lock().await;
+                    let v = seqs.entry(card_id.to_string()).or_insert(now);
+                    *v = (*v).max(now).saturating_add(1);
+                    self.patch_managed(&token, card_id, card, wants_buried)
+                        .await
+                }
+                other => other,
+            }
+        } else if let Some(message_id) = handle.strip_prefix("msg:") {
+            // Wave B-5：整卡重渲染带发起者标注行（群 conv）。
+            let sender = self.last_sender(&conv.0).await;
+            let card_json = if wants_buried {
+                crate::card::render_stub_card(card)
+            } else {
+                render_card(
+                    card,
+                    &conv.0,
+                    (!sender.is_empty()).then_some(sender).as_deref(),
+                )
+            };
+            patch_card(&self.core_config, &token, message_id, &card_json).await
+        } else {
+            Err(CoreError::Platform(
+                PLATFORM,
+                format!("非法卡片句柄: {handle}"),
+            ))
+        }
+    }
+
     async fn patch_managed(
         &self,
         token: &str,
@@ -1628,6 +1765,32 @@ async fn process_pending_media(
 
 /// per-conv 顺序泵的作业：就绪消息 / 媒体处理任务（等 join 后按序发出）/
 /// 合并转发处理任务（Agent 转录分支产出消息，Fallback 分支在任务内直发提示）。
+/// update_card 自愈管线的显式阶段结果（v1.18 review「update_card 状态机化」：
+/// 此前四层自愈以嵌套 match + 后置 match 链叠在 160 行闭包里，层间移交只能
+/// 通读推演；命名结果让每层职责与后续动作一目了然——Delivered 才走下沉重发，
+/// Minimized 上抛原错触发 core 纯文本补发，HandleLost 附哨兵供 core 摘句柄）。
+enum PatchOutcome {
+    /// 主 patch 成功（Running 流式帧 / 终态整卡 im-patch / managed element）。
+    Delivered,
+    /// 原卡被删除/撤回——per-card 缓存已清，错误已附 CARD_HANDLE_LOST 哨兵。
+    HandleLost(CoreError),
+    /// 终态超限失败但最小终态卡已收敛——上抛加工后的原错误（R1 语义）。
+    Minimized(CoreError),
+    /// 未触发自愈/自愈无效的失败，原样上抛。
+    Failed(CoreError),
+}
+
+impl PatchOutcome {
+    fn into_result(self) -> Result<()> {
+        match self {
+            PatchOutcome::Delivered => Ok(()),
+            PatchOutcome::HandleLost(e) | PatchOutcome::Minimized(e) | PatchOutcome::Failed(e) => {
+                Err(e)
+            }
+        }
+    }
+}
+
 // clippy：Ready 变体（InboundMessage ~200B）显著大于 JoinHandle 变体——
 // 瞬态队列作业、同 conv 同时至多几条，装箱得不偿失，允许。
 #[allow(clippy::large_enum_variant)]
@@ -2897,149 +3060,47 @@ impl Platform for FeishuPlatform {
         let wants_buried =
             !matches!(card.terminal, CardTerminal::Running) && self.peek_asks_flag(&conv.0).await;
         let res = self
-            .with_token(|token| async move {
-                if let Some(card_id) = handle.strip_prefix("card:") {
-                    // 真机校准（2026-08）：终态且未下沉时改**整卡 im patch**
-                    // （render_card 折叠面板布局）——统一视觉：此前 managed 终态把
-                    // 工具轨迹/思考过程内联进 md_body（长卡），而结果下沉新卡是折叠
-                    // 面板，两形态不一致（用户反馈折叠更好）。Running 仍走 managed
-                    // element 流式（打字机/节流/300317 自愈语义不变）。无映射
-                    // （重启后）退回 managed 终态 patch（内联形态，可接受降级）。
-                    if !wants_buried
-                        && !matches!(card.terminal, CardTerminal::Running)
-                    {
-                        // v1.18 review：先 let 绑定再判断——edition 2021 的 if-let
-                        // scrutinee 临时值（MutexGuard）存活到整个 if-let 结束，
-                        // 此前 managed_card_msgs 锁跨 patch 网络调用（30s 超时 +
-                        // 限流重试）长达半分钟，期间其它 conv 的 send_card 登记/
-                        // 终态查询全部排队。
-                        let mid = self.managed_card_msgs.lock().await.get(card_id).cloned();
-                        if let Some(message_id) = mid {
-                            let sender = self.last_sender(&conv.0).await;
-                            let card_json = render_card(
-                                card,
-                                &conv.0,
-                                (!sender.is_empty()).then_some(sender).as_deref(),
-                            );
-                            let res =
-                                patch_card(&self.core_config, &token, &message_id, &card_json)
-                                    .await;
-                            if res.is_ok() {
-                                // 终态清理（与 patch_managed 终态分支同语义——本分支
-                                // 提前 return 会绕过那边的清理，防 per-card 状态泄漏）。
-                                self.card_seqs.lock().await.remove(card_id);
-                                self.card_footers.lock().await.remove(card_id);
-                            }
-                            return res;
-                        }
-                    }
-                    match self.patch_managed(&token, card_id, card, wants_buried).await {
-                    // 300317（sequence 落后）自愈（真机校准）：重启后内存计数器归零，
-                    // 但旧卡片的 server 序号已推进（孤儿扫描接管、同进程异常路径）
-                    // ——把该卡计数器重置为时间戳级（必然大于 server 序号）整段重试。
-                    Err(e) if e.to_string().contains("300317") => {
-                        warn!(target: "feishu", card_id, "sequence 落后（300317），重置计数器后重试");
-                        // sequence 是 int32：用**秒级**时间戳（~1.8e9 < 2^31，
-                        // 2038 年前安全）；毫秒会溢出被 9499 拒（真机踩过）。
-                        // 秒级值必然大于服务端已用的小序号，满足严格递增。
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(1_000_000_000);
-                        *self.card_seqs.lock().await.entry(card_id.to_string()).or_insert(now) = now;
-                        self.patch_managed(&token, card_id, card, wants_buried).await
-                    }
-                    other => other,
+            .with_token(|token| {
+                let this = self;
+                async move {
+                    this.patch_any_handle(&token, conv, handle, card, wants_buried)
+                        .await
                 }
-            } else if let Some(message_id) = handle.strip_prefix("msg:") {
-                // Wave B-5：整卡重渲染带发起者标注行（群 conv）。
-                let sender = self.last_sender(&conv.0).await;
-                let card_json = if wants_buried {
-                    crate::card::render_stub_card(card)
-                } else {
-                    render_card(card, &conv.0, (!sender.is_empty()).then_some(sender).as_deref())
-                };
-                patch_card(&self.core_config, &token, message_id, &card_json).await
-            } else {
-                Err(CoreError::Platform(
-                    PLATFORM,
-                    format!("非法卡片句柄: {handle}"),
-                ))
-            }
             })
             .await;
-        // 卡片不存在/已删除自愈（安全批次）：原卡片被用户删除/撤回后 patch 永远
-        // 失败。清本平台 per-card 缓存（序列号/footer），错误附加 CARD_HANDLE_LOST
-        // 哨兵——core CardSession 据此摘 live_cards 登记并把句柄置空（Running 期
-        // 下帧重发新卡），启动扫描据此作废登记（终止无限重试）。
-        let res = match res {
+        // 阶段 B/C（v1.18 review 状态机化）：失败路径的两层自愈收敛为显式
+        // PatchOutcome。B（安全批次，原注释）：原卡片被用户删除/撤回后 patch
+        // 永远失败——清 per-card 缓存（序列号/footer），错误附 CARD_HANDLE_LOST
+        // 哨兵（core CardSession 据此摘 live_cards 并置空句柄，Running 期下帧
+        // 重发新卡，启动扫描据此作废登记）。C：终态失败的最小卡收敛（见
+        /// minimize_terminal_card）。Running 失败不触发 C（流式帧失败由下帧/
+        /// 看门狗兜底——原守卫的语义保留在 match arm 条件里）。
+        let outcome = match res {
+            Ok(()) => PatchOutcome::Delivered,
             Err(e) if is_card_not_exist_msg(&e.to_string()) => {
                 warn!(target: "feishu", handle, "卡片不存在/已删除，清缓存并上报句柄丢失");
                 if let Some(card_id) = handle.strip_prefix("card:") {
                     self.card_seqs.lock().await.remove(card_id);
                     self.card_footers.lock().await.remove(card_id);
                 }
-                Err(CoreError::Platform(
+                PatchOutcome::HandleLost(CoreError::Platform(
                     PLATFORM,
                     format!("{e}（{CARD_HANDLE_LOST}）"),
                 ))
             }
-            other => other,
-        };
-        // 真机校准（2026-08-30）：终态 patch 失败（超限 200860/230099 等）时原卡
-        // 停在「思考中」——最小化终态卡重试一次，保证卡片必然收敛（完整内容由
-        // core P5-11 纯文本兜底）。best-effort，再失败维持原错误上抛。
-        let res = match res {
             Err(e)
                 if !matches!(card.terminal, CardTerminal::Running)
                     && !e.to_string().contains(CARD_HANDLE_LOST) =>
             {
-                let err_text = e.to_string();
                 let done = matches!(card.terminal, CardTerminal::Done);
-                let minimal = crate::card::render_overflow_terminal_card(done);
-                // 重试目标：msg: 句柄直用；card: 句柄经映射表换消息 id。
-                let target_mid: Option<String> = match handle.strip_prefix("msg:") {
-                    Some(m) => Some(m.to_string()),
-                    None => match handle.strip_prefix("card:") {
-                        Some(cid) => self.managed_card_msgs.lock().await.get(cid).cloned(),
-                        None => None,
-                    },
-                };
-                let retry = match target_mid {
-                    Some(mid) => {
-                        self.with_token(move |t| {
-                            let minimal = minimal.clone();
-                            let mid = mid.clone();
-                            async move { patch_card(&self.core_config, &t, &mid, &minimal).await }
-                        })
-                        .await
-                    }
-                    None => Err(CoreError::Platform(
-                        PLATFORM,
-                        "终态重试无目标消息 id".into(),
-                    )),
-                };
-                match retry {
-                    Ok(()) => {
-                        // R1（code-review v9）：最小卡收敛成功**不吞错**——此前返回
-                        // Ok 使 core 的 P5-11 纯文本补发不触发，完整内容永久丢失
-                        //（卡上却标着「完整内容见文本消息」）。上抛原错误让 core
-                        // 补发全文；卡片已 patch 成最小终态（收敛不回退）。
-                        warn!(target: "feishu", error = %err_text, "终态 patch 失败，最小卡已收敛；上抛原错误触发 core 纯文本补发");
-                        Err(CoreError::Platform(
-                            PLATFORM,
-                            format!("{err_text}（终态卡已收敛为最小形态，完整内容由文本消息补发）"),
-                        ))
-                    }
-                    Err(_) => Err(e),
-                }
+                self.minimize_terminal_card(handle, done, e).await
             }
-            other => other,
+            Err(e) => PatchOutcome::Failed(e),
         };
-        // 结果下沉重发：流式卡已收敛成指针 → 完整结果另发新卡。Wave B-5：带
-        // 发起者标注行。重发失败上抛 Err——core 的 P5-11 兜底会以纯文本补发全文
-        //（结论不能因重发失败而丢）。
-        if res.is_ok() && wants_buried {
+        // 阶段 D：结果下沉重发——流式卡已收敛成指针 → 完整结果另发新卡（Wave
+        // B-5：带发起者标注行）。仅 Delivered 走此步；重发失败上抛 Err（core 的
+        // P5-11 兜底纯文本补发全文，结论不能因重发失败而丢）。
+        if matches!(outcome, PatchOutcome::Delivered) && wants_buried {
             let sender = self.last_sender(&conv.0).await;
             let full = render_card(
                 card,
@@ -3053,7 +3114,7 @@ impl Platform for FeishuPlatform {
             // 下沉全链路成功才消费标志（失败保标志：孤儿扫描仍可下沉补救）。
             self.clear_asks_flag(&conv.0).await;
         }
-        res
+        outcome.into_result()
     }
 
     fn name(&self) -> &'static str {
