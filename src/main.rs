@@ -788,22 +788,36 @@ async fn main() -> Result<()> {
                 shutdown_signal().await;
                 dispatcher_for_signal.shutdown();
             });
-            match dispatcher.run().await {
-                Ok(()) => tracing::info!(target: "imagent::ops", "dispatcher 退出（drain 完成）"),
+            // v1.18 review（agent-2 #1）：异常退出必须以非 0 退出码结束——此前
+            // Err 分支打印后照样 exit 0，systemd `Restart=on-failure` 视为成功
+            // 永不拉起（bot 静默下线）。区分退出码：1 = 通用异常，2 = session
+            // 过期（需人工 login；launchd KeepAlive 循环重启时日志可辨）。
+            let exit_code = match dispatcher.run().await {
+                Ok(()) => {
+                    tracing::info!(target: "imagent::ops", "dispatcher 退出（drain 完成）");
+                    None
+                }
                 Err(e) => {
                     if matches!(e, imagent_core::CoreError::SessionExpired(_)) {
                         tracing::error!("dispatcher 退出：{e}");
                         println!("iLink session 已过期，请重新运行 `imagent login` 扫码登录。");
+                        Some(2)
                     } else {
                         tracing::error!("dispatcher 异常退出：{e}");
                         println!("imagent 异常退出：{e}");
+                        Some(1)
                     }
                 }
-            }
+            };
             // 退出接线：显式调用 backend 的 shutdown（claude-acp 断开全部
             // per-conv 连接并 kill ACP 子进程；其余后端默认 no-op）——此前只靠
             // Drop 兜底，Arc 泄漏/延迟 drop 场景下子进程会活到 OS 清理。
             backend.shutdown().await;
+            // v1.18 review：带退出码收尾（见上）。shutdown 已完成后才退出，
+            // 不打断清理；exit 跳过后续无操作语句。
+            if let Some(code) = exit_code {
+                std::process::exit(code);
+            }
             // R-3：清理 permission.sock（P1-5 计划 ③，原未落地）；P5-9b：握手
             // token 文件一并清理。
             #[cfg(unix)]
@@ -883,10 +897,18 @@ async fn main() -> Result<()> {
             );
         }
         Cmd::Stop => {
-            println!(
-                "imagent 为前台运行模式。停止方式：在 `start` 的终端按 Ctrl-C，或 `kill {}`。",
-                std::process::id()
-            );
+            // v1.18 review（agent-2 #8）：提示里的 PID 应是**运行中实例**的——
+            // 此前打印本进程（stop 命令自身）的 pid，操作员照做会杀错/杀空。
+            let pid = imagent_core::paths::imagent_home()
+                .join("instance.lock")
+                .to_string_lossy()
+                .to_string();
+            let pid_hint = std::fs::read_to_string(&*pid)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .map(|p| format!("或 `kill {p}`"))
+                .unwrap_or_else(|| "实例未运行（无 PID 记录）".into());
+            println!("imagent 为前台运行模式。停止方式：在 `start` 的终端按 Ctrl-C，{pid_hint}。");
         }
         Cmd::Setup { platform } => {
             setup::run(platform).await?;
@@ -1345,6 +1367,18 @@ fn spawn_sighup_handler(
                     // v1.18：自动压缩阈值热改（比例档窗口×比例的计算在 Config 侧）。
                     dispatcher
                         .reload_auto_compact_threshold(cfg.effective_auto_compact_threshold());
+                    // v1.18 review（agent-2 #4）：admin 名单热改（config 种子 ∪
+                    // store 动态条目，与启动并集口径一致）——授权类配置静默不
+                    // 生效最伤运维（移除的管理员保留权限到重启）。
+                    {
+                        let mut admins = cfg.admin_senders.clone();
+                        for a in store.list_admin_senders().await.unwrap_or_default() {
+                            if !admins.contains(&a) {
+                                admins.push(a);
+                            }
+                        }
+                        dispatcher.reload_admins(admins);
+                    }
                     backend.set_native_permission_mode(cfg.backend_permission_mode.clone());
                     dispatcher.set_shortcuts(cfg.shortcuts.clone());
                     // 审批通道热切（control ↔ mcp 即时生效，下一轮 agent 起走新通道）。
@@ -1408,6 +1442,14 @@ async fn shutdown_signal() {
             }
             _ = term.recv() => {
                 tracing::info!(target: "imagent::ops", "received SIGTERM, shutting down");
+                // v1.18 review（agent-2 #11）：与 SIGINT 同款二次信号强退——
+                // systemd stop 后 drain 挂死时操作员只能 kill -9 的出口。
+                tracing::info!(target: "imagent::ops", "再次收到 SIGTERM 立即强制退出");
+                tokio::spawn(async move {
+                    term.recv().await;
+                    eprintln!("收到第二次 SIGTERM，立即强制退出");
+                    std::process::exit(143);
+                });
             }
         }
     }

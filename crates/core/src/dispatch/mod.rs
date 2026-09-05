@@ -356,6 +356,15 @@ fn is_p2p_conv(conv: &str) -> bool {
 /// 拼接；sender 与 reply_hint 取首条（各消息入队前已各自过白名单）。
 /// P10-④：批内出现**多个不同发送者**（群聊多人）时给各段加说话人标注——
 /// 合并不再丢失归属，agent 能区分谁说了哪句；单人连发保持原样（不加噪音）。
+/// 排队元素（见 [`Dispatcher::queues`] 字段文档）。
+#[derive(Debug)]
+struct QueuedMsg {
+    /// queued_messages.rowid；0 = 持久化失败（仅内存，崩溃即丢——与旧无持久化
+    /// 行为等同，warn 已在入队处记录）。
+    rowid: i64,
+    msg: InboundMessage,
+}
+
 fn merge_batch(batch: Vec<InboundMessage>) -> InboundMessage {
     let multi_sender = batch
         .iter()
@@ -436,10 +445,6 @@ pub(super) struct RoundHandle {
     pub(super) steer: Option<tokio::sync::mpsc::Sender<String>>,
 }
 
-/// 持久化排队行（source_msg_id, InboundMessage JSON）——撤回/drop 后
-/// replace_queued 整体重写用（mod.rs / commands 共享）。
-type PersistQueueItems = Vec<(Option<String>, String)>;
-
 pub struct Dispatcher {
     platform: Arc<dyn Platform>,
     backend: Arc<dyn Backend>,
@@ -481,7 +486,10 @@ pub struct Dispatcher {
     running: Mutex<HashMap<String, RoundHandle>>,
     /// per-conv 批处理队列：runner 在飞期间到达的消息暂存（entry 存在 = runner
     /// 活跃；runner 取空交还时移除）。入队与取批共用一把锁，杜绝 lost-wakeup。
-    queues: Mutex<HashMap<String, Vec<InboundMessage>>>,
+    /// 排队元素：内存消息 + 持久化行 rowid（0 = 落行失败，无崩溃保护）。
+    /// v1.18 review：取批/撤回/drop 按 rowid 精确删行，替代整 conv DELETE
+    ///（防连带删掉并发入队的新消息的行）。
+    queues: Mutex<HashMap<String, Vec<QueuedMsg>>>,
     /// P10：per-conv 排队状态（count + 最新摘要）——入队路径写、取批//stop 清、
     /// CardSession 每次 patch 拉取渲染进 Running footer（状态上卡，不发消息）。
     queued_hints: Arc<Mutex<HashMap<String, crate::card_session::QueuedHint>>>,
@@ -689,6 +697,14 @@ impl Dispatcher {
     /// 快捷命令注入（v1.17）：main 启动与 SIGHUP 热重载时调用。
     pub fn set_shortcuts(&self, map: HashMap<String, String>) {
         *self.shortcuts.write().expect("shortcuts 写锁") = map;
+    }
+
+    /// v1.18 review（agent-2 #4）：admin 名单热改（SIGHUP）——授权类配置静默
+    /// 不生效最伤运维（移除的管理员保留权限到重启）。语义与启动并集一致：
+    /// config 种子 ∪ store 动态条目（/admin add 持久化的），由调用方（main）
+    /// 完成并集后传入。
+    pub fn reload_admins(&self, admins: Vec<String>) {
+        *self.admin_senders.write() = admins;
     }
 
     fn is_admin(&self, sender: &str) -> bool {
@@ -1412,26 +1428,23 @@ impl Dispatcher {
                 // ⏳「稍等」打在入队消息上（runner 空闲后随批翻 OnIt→终态）；
                 // push 前 capture（msg 被 move 进队列）。
                 let queued_mid = msg.source_msg_id.clone().filter(|m| m.starts_with("om_"));
-                // v1.18 迭代（排队持久化）：序列化在锁内（纯 CPU），落行在锁外。
-                let persist_json = serde_json::to_string(&msg).ok();
-                pending.push(msg);
-                // S-3（P10）：锁内只做入队与快照，hint 写入 / note 推送（网络 IO）
-                // 移到 drop(map) 之后——与上方上限分支同款纪律，不在 queues 锁
-                // 持有期间 await。
-                let count = pending.len();
-                let latest = latest_snippet(&pending[pending.len() - 1]);
+                // S-3（P10）：锁内只做快照，persist（IO）与 hint/note 推送移到
+                // drop(map) 之后——不在 queues 锁持有期间 await。
                 drop(map);
-                // v1.18 迭代（排队持久化）：崩溃后启动重放的行来源（best-effort——
-                // 落库失败只 warn，退化为旧的无持久化行为，不阻塞排队本身）。
-                if let Some(json) = persist_json {
-                    if let Err(e) = self
-                        .store
-                        .persist_queued_msg(conv, queued_mid.as_deref(), &json)
-                        .await
-                    {
-                        warn!(target: "imagent::core", conv_id = conv, error = %e, "排队消息持久化失败（崩溃将丢失该条）");
-                    }
-                }
+                // v1.18 review（排队持久化重做）：**先落行再入队**（rowid 随元素
+                // 进队列，取批按行精确删）。旧序（先入队后落行）在「落行完成前
+                // 被取批」时该行不属于批次 rowid 集合而残留，崩溃后会重放已处理
+                // 消息；新序崩溃在两步之间 = 行在内存无 → 重放执行（语义正确）。
+                // 代价：persist 期间 runner 可能取空并移除 entry → or_default 重建
+                //（无 runner 的空 entry 等下一条消息激活——批窗口静默使该窗口
+                // 实际不可达，与既有同款竞态一致）。
+                let rowid = self.persist_queued(conv, queued_mid.as_deref(), &msg).await;
+                let mut map = self.queues.lock().await;
+                let pending = map.entry(conv.to_string()).or_default();
+                pending.push(QueuedMsg { rowid, msg });
+                let count = pending.len();
+                let latest = latest_snippet(&pending[pending.len() - 1].msg);
+                drop(map);
                 // P10：排队状态上卡——①②流式卡 footer 由 CardSession 下次 patch 拉取；
                 // ③审批等待是最静默的窗口（无 chunk，footer 不动），推送重渲染审批卡
                 // note 行（best-effort）。两者都是状态更新，不往消息流发任何东西。
@@ -1489,8 +1502,40 @@ impl Dispatcher {
                 false
             }
             None => {
-                map.insert(conv.to_string(), vec![msg]);
+                // v1.18 review：本条将成为 runner 的首批——同样先落行再入队
+                //（此前该分支完全绕过持久化，是排队崩溃保护的漏洞）。
+                drop(map);
+                let queued_mid = msg.source_msg_id.clone().filter(|m| m.starts_with("om_"));
+                let rowid = self.persist_queued(conv, queued_mid.as_deref(), &msg).await;
+                let mut map = self.queues.lock().await;
+                let elem = QueuedMsg { rowid, msg };
+                match map.get_mut(conv) {
+                    // persist 期间他条消息建了队：并入（两批经 take 原子取、
+                    // 不相交，语义不变）。
+                    Some(pending) => pending.push(elem),
+                    None => {
+                        map.insert(conv.to_string(), vec![elem]);
+                    }
+                }
                 true
+            }
+        }
+    }
+
+    /// 排队行落库（入队前调用）：返回 rowid（0 = 失败，元素仅内存、崩溃即丢
+    /// ——与无持久化行为等同，warn 已记）。失败不阻塞排队本身。
+    async fn persist_queued(&self, conv: &str, mid: Option<&str>, msg: &InboundMessage) -> i64 {
+        match serde_json::to_string(msg) {
+            Ok(json) => match self.store.persist_queued_msg(conv, mid, &json).await {
+                Ok(id) => id,
+                Err(e) => {
+                    warn!(target: "imagent::core", conv_id = conv, error = %e, "排队消息持久化失败（崩溃将丢失该条）");
+                    0
+                }
+            },
+            Err(e) => {
+                warn!(target: "imagent::core", conv_id = conv, error = %e, "排队消息序列化失败（崩溃将丢失该条）");
+                0
             }
         }
     }
@@ -1533,11 +1578,16 @@ impl Dispatcher {
         self.queued_hints.lock().await.remove(conv);
         let batch = std::mem::take(pending);
         drop(map);
-        // v1.18 迭代（排队持久化）：批次取走即清行（重放源与内存队列同步）。
-        if let Err(e) = self.store.clear_queued(conv).await {
-            warn!(target: "imagent::core", conv_id = conv, error = %e, "持久化排队清理失败（下次启动可能重放已处理消息）");
+        // v1.18 review（排队持久化重做）：按 rowid 精确删本批行——整 conv
+        // DELETE 会连带删掉「取批释放锁之后、DELETE 落库前」并发入队的新消息
+        // 的行（内存排队、DB 无行 = 崩溃即丢）。rowid=0（落行失败）跳过。
+        let rowids: Vec<i64> = batch.iter().map(|q| q.rowid).filter(|r| *r > 0).collect();
+        if !rowids.is_empty() {
+            if let Err(e) = self.store.delete_queued_rows(&rowids).await {
+                warn!(target: "imagent::core", conv_id = conv, error = %e, "持久化排队清理失败（下次启动可能重放已处理消息）");
+            }
         }
-        Some(batch)
+        Some(batch.into_iter().map(|q| q.msg).collect::<Vec<_>>())
     }
 
     /// v1.18 迭代（排队持久化）：启动时重放崩溃前落库的排队消息。语义：
@@ -1582,26 +1632,31 @@ impl Dispatcher {
     async fn remove_queued_by_msg_id(&self, msg_id: &str) -> usize {
         let mut map = self.queues.lock().await;
         let mut removed = 0usize;
-        let mut dirty: Vec<(String, PersistQueueItems)> = Vec::new();
+        // v1.18 review（排队持久化重做）：撤回按被撤元素的 rowid 精确删行
+        //（替代整队重写——并发入队的新行不再有被重写吞掉的风险）。
+        let mut removed_ids: Vec<i64> = Vec::new();
         for (conv, pending) in map.iter_mut() {
             let before = pending.len();
-            pending.retain(|m| m.source_msg_id.as_deref() != Some(msg_id));
+            let mut kept = Vec::with_capacity(before);
+            for q in pending.drain(..) {
+                if q.msg.source_msg_id.as_deref() == Some(msg_id) {
+                    if q.rowid > 0 {
+                        removed_ids.push(q.rowid);
+                    }
+                } else {
+                    kept.push(q);
+                }
+            }
+            *pending = kept;
             if pending.len() == before {
                 continue;
             }
             removed += before - pending.len();
-            // v1.18 迭代（排队持久化）：撤回后重写持久化行（锁内收集、锁外 IO）。
-            let items = pending
-                .iter()
-                .filter_map(|m| {
-                    serde_json::to_string(m)
-                        .ok()
-                        .map(|j| (m.source_msg_id.clone(), j))
-                })
-                .collect();
-            dirty.push((conv.clone(), items));
             let count = pending.len();
-            let latest = pending.last().map(latest_snippet).unwrap_or_default();
+            let latest = pending
+                .last()
+                .map(|q| latest_snippet(&q.msg))
+                .unwrap_or_default();
             let mut hints = self.queued_hints.lock().await;
             if count == 0 {
                 hints.remove(conv);
@@ -1621,11 +1676,9 @@ impl Dispatcher {
             }
         }
         drop(map);
-        // v1.18 迭代：锁外重写受影响 conv 的持久化行（含清空——replace 对空
-        // items 即 DELETE）。
-        for (conv, items) in dirty {
-            if let Err(e) = self.store.replace_queued(&conv, &items).await {
-                warn!(target: "imagent::core", conv_id = %conv, error = %e, "撤回后持久化排队重写失败");
+        if !removed_ids.is_empty() {
+            if let Err(e) = self.store.delete_queued_rows(&removed_ids).await {
+                warn!(target: "imagent::core", error = %e, "撤回后持久化行删除失败（重启后该撤回消息可能被重放执行）");
             }
         }
         removed

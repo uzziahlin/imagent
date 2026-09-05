@@ -2154,7 +2154,7 @@ async fn queue_list_and_selective_drop() {
     let q = ctx.disp.queues.lock().await;
     let q = q.get("c1").expect("entry 保留");
     assert_eq!(q.len(), 1, "应剩 bob 的一条");
-    assert_eq!(q[0].sender.0, "bob");
+    assert_eq!(q[0].msg.sender.0, "bob");
     drop_db(ctx.db).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), runner).await;
 }
@@ -3680,7 +3680,7 @@ async fn recall_removes_matching_queued_message() {
         map.get("feishu:ou_t")
             .map(|q| {
                 q.iter()
-                    .filter_map(|m| m.source_msg_id.clone())
+                    .filter_map(|m| m.msg.source_msg_id.clone())
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default()
@@ -4444,7 +4444,7 @@ async fn context_watermark_hint_on_large_input() {
     assert!(
         inbox
             .iter()
-            .any(|t| t.contains("上下文较大") && t.contains("/compact")),
+            .any(|t| t.contains("上下文约") && t.contains("较大") && t.contains("/compact")),
         "超水位提示 /compact: {inbox:?}"
     );
     drop_db(ctx.db).await;

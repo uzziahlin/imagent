@@ -1231,6 +1231,36 @@ impl Store {
 
     // —— cron 定时任务（v1.18 /cron；schema v11）——
 
+    /// v1.18 review（agent-2 #9）：停用（enabled=0）的 cron 任务清单——
+    /// 「表达式无解自动停用」的任务此前无声消失（list 过滤 enabled=1），
+    /// 用户连 /cron rm 需要的 id 都拿不到。
+    pub async fn list_disabled_cron_jobs(&self) -> Result<Vec<CronJobRow>> {
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, conv, sender, expr, prompt, created_at, last_run, next_run, enabled \
+                 FROM cron_jobs WHERE enabled = 0 ORDER BY next_run",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(CronJobRow {
+                        id: r.get(0)?,
+                        conv: r.get(1)?,
+                        sender: r.get(2)?,
+                        expr: r.get(3)?,
+                        prompt: r.get(4)?,
+                        created_at: r.get(5)?,
+                        last_run: r.get(6)?,
+                        next_run: r.get(7)?,
+                        enabled: r.get::<_, i64>(8)? != 0,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
     pub async fn list_cron_jobs(&self) -> Result<Vec<CronJobRow>> {
         let inner = self.inner.clone();
         blocking_with(inner, move |conn| {
@@ -1326,31 +1356,61 @@ impl Store {
     // 语义窗口：内存 take 与 DB 删行非原子，崩溃在两步之间会重放一次已取批
     // （at-least-once，窗口毫秒级；崩溃丢消息的旧行为更差）。
 
+    /// 返回新行 rowid（调用方随内存队列元素保存，取批按行精确删）。
     pub async fn persist_queued_msg(
         &self,
         conv_id: &str,
         source_msg_id: Option<&str>,
         payload: &str,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         let inner = self.inner.clone();
         let conv = conv_id.to_string();
         let mid = source_msg_id.map(str::to_string);
         let payload = payload.to_string();
-        blocking_with(inner, move |conn| {
+        // v1.18 review（agent-2 #10）：与其它写路径同用 BUSY 退避——入队落行
+        // 遇锁争用失败一次 = 该条消息静默失去崩溃保护（仅 warn）。
+        blocking_with_retry(inner, move |conn| {
             conn.execute(
                 "INSERT INTO queued_messages (conv_id, source_msg_id, payload, created_at) \
                  VALUES (?1, ?2, ?3, ?4)",
                 rusqlite::params![conv, mid, payload, now_secs()],
             )?;
+            Ok(conn.last_insert_rowid())
+        })
+        .await
+    }
+
+    /// v1.18 review（agent-1 #3 / agent-2 #3）：按 rowid 精确删除取走的批次行
+    /// ——此前取批按整 conv DELETE，会连带删掉「取批 drop 锁之后、DELETE 执行
+    /// 之前」并发入队的新消息的行（在内存里排队、DB 无行 = 崩溃即丢，恰是本
+    /// 功能要防的场景）。
+    pub async fn delete_queued_rows(&self, rowids: &[i64]) -> Result<()> {
+        if rowids.is_empty() {
+            return Ok(());
+        }
+        let inner = self.inner.clone();
+        let ids = rowids.to_vec();
+        blocking_with_retry(inner, move |conn| {
+            for id in &ids {
+                conn.execute(
+                    "DELETE FROM queued_messages WHERE id = ?1",
+                    rusqlite::params![id],
+                )?;
+            }
             Ok(())
         })
         .await
     }
 
+    /// 语义（v1.18 review 诚实化）：**按 conv 整表删除**——调用方是
+    /// 「按 rowid 精确删本批」与「/stop all 丢弃全队」两处；取批路径用
+    /// delete_queued_rows。被取走的批次在取批即删（at-most-once：轮次中途
+    /// 崩溃该批不重放——进行中轮次由孤儿卡扫描告知用户；未取走的排队行
+    /// 才是崩溃保护的对象）。
     pub async fn clear_queued(&self, conv_id: &str) -> Result<()> {
         let inner = self.inner.clone();
         let conv = conv_id.to_string();
-        blocking_with(inner, move |conn| {
+        blocking_with_retry(inner, move |conn| {
             conn.execute(
                 "DELETE FROM queued_messages WHERE conv_id = ?1",
                 rusqlite::params![conv],
@@ -1369,7 +1429,7 @@ impl Store {
         let inner = self.inner.clone();
         let conv = conv_id.to_string();
         let items: Vec<(Option<String>, String)> = items.to_vec();
-        blocking_with(inner, move |conn| {
+        blocking_with_retry(inner, move |conn| {
             let tx = conn.unchecked_transaction()?;
             tx.execute(
                 "DELETE FROM queued_messages WHERE conv_id = ?1",
@@ -1392,7 +1452,7 @@ impl Store {
     /// 会写新行，旧行必须先清防双份）。
     pub async fn clear_queued_all(&self) -> Result<()> {
         let inner = self.inner.clone();
-        blocking_with(inner, move |conn| {
+        blocking_with_retry(inner, move |conn| {
             conn.execute("DELETE FROM queued_messages", [])?;
             Ok(())
         })
@@ -1645,15 +1705,19 @@ impl Store {
             let tx = conn.unchecked_transaction()?;
             match &activate {
                 Some(row) => {
+                    // v1.18 review（agent-2 #2）：task_todos 一并写入——此前该列
+                    // 遗漏，upsert 命中冲突时不更新：旧会话的任务快照泄漏进新激活
+                    // 的会话（调用方传 None 的「随换绑置空」意图被静默击败）。
                     tx.execute(
-                        "INSERT INTO sessions (conv_id, session_id, agent_kind, workdir, name, created_at, updated_at) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                        "INSERT INTO sessions (conv_id, session_id, agent_kind, workdir, name, created_at, updated_at, task_todos) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
                          ON CONFLICT(conv_id) DO UPDATE SET \
                            session_id = excluded.session_id, \
                            agent_kind = excluded.agent_kind, \
                            workdir    = excluded.workdir, \
                            name       = excluded.name, \
-                           updated_at = excluded.updated_at",
+                           updated_at = excluded.updated_at, \
+                           task_todos = excluded.task_todos",
                         rusqlite::params![
                             row.conv_id,
                             row.session_id,
@@ -1662,6 +1726,7 @@ impl Store {
                             row.name,
                             row.created_at,
                             now,
+                            row.task_todos,
                         ],
                     )?;
                     tx.execute(

@@ -96,31 +96,19 @@ impl CronSpec {
     /// from 之后（严格大于）的下次触发时刻（epoch 秒，分钟对齐）。无解
     /// （如 2 月 30 日）在 366 天内搜不到时返回 None。
     pub(super) fn next_after(&self, from_epoch: i64) -> Option<i64> {
-        // v1.18 review：偏移量随步进重算——此前整个 366 天窗口共用起点的单个
-        // 偏移，跨 DST 换点后的触发按旧偏移对齐（每天 9:00 的任务在换点次日
-        // 8:00 触发，错的 next_run 还被落库顺延）。日变更粒度刷新 + 候选命中
-        // 时实时偏移复核（换点发生在凌晨、日边界重算覆盖不到当天 2-3 点后的
-        // 场景），localtime_r 调用量每天至多几次。
-        let mut offset = local_offset_secs(from_epoch);
-        let mut cur_day = (from_epoch + offset).div_euclid(86_400);
+        // v1.18 review（agent-1 #2，二次修正）：**每步**取实时偏移。上一版按
+        // 「日变更 + 命中复核」刷新，春令时前移日（02:00→03:00）仍有漏跑：
+        // 真实 09:00 的 epoch 用旧偏移求 civil 得 16:00 不匹配，t 被步过后
+        // 再也回不来（命中复核只能拒绝假命中、救不回被步过的真值）。逐分钟
+        // 调 localtime_r 直至首个命中——典型代价 ~1440 次/天边界，最坏无解
+        // 扫满一年（每次 add 至多一趟，毫秒级 syscall 可接受）。
         // 从 from 的下一分钟边界开始步进（60s 对齐）。
         let mut t = from_epoch - from_epoch.rem_euclid(60) + 60;
         let limit = t + 366 * 24 * 3600;
         while t <= limit {
-            let day = (t + offset).div_euclid(86_400);
-            if day != cur_day {
-                offset = local_offset_secs(t);
-                cur_day = (t + offset).div_euclid(86_400);
-            }
+            let offset = local_offset_secs(t);
             let (min, hour, dom, mon, dow) = civil_fields(t + offset);
             if self.matches(min, hour, dom, mon, dow) {
-                // 命中后用候选时刻的实时偏移复核：换点窗口内旧偏移可能给出
-                // 假命中/假错过——刷新偏移重算本分钟（不推进 t）。
-                let fresh = local_offset_secs(t);
-                if fresh != offset {
-                    offset = fresh;
-                    continue;
-                }
                 return Some(t);
             }
             t += 60;
@@ -269,7 +257,7 @@ impl Dispatcher {
             .await;
             }
             "list" => {
-                let jobs = self
+                let mut jobs = self
                     .store
                     .list_cron_jobs()
                     .await
@@ -277,6 +265,12 @@ impl Dispatcher {
                     .into_iter()
                     .filter(|j| j.conv == conv.0)
                     .collect::<Vec<_>>();
+                // v1.18 review（agent-2 #9）：把「表达式无解被自动停用」的任务也
+                // 列出来（带标记）——否则任务无声消失、用户连 rm 的 id 都拿不到
+                //（store 的 list 只返回 enabled=1，停用行走 list_disabled）。
+                if let Ok(disabled) = self.store.list_disabled_cron_jobs().await {
+                    jobs.extend(disabled.into_iter().filter(|j| j.conv == conv.0));
+                }
                 if jobs.is_empty() {
                     self.reply(conv, "📭 本会话没有定时任务（/cron add 创建）。", hint)
                         .await;
@@ -299,11 +293,17 @@ impl Dispatcher {
                             .and_then(|s| s.next_after(j.created_at))
                             .unwrap_or(j.next_run)
                     };
+                    let enabled_mark = if j.enabled {
+                        String::new()
+                    } else {
+                        "〔已停用：表达式无解〕".to_string()
+                    };
                     body.push_str(&format!(
-                        "\n- `{}` `{}`（下次 {}）→ {}",
+                        "\n- `{}` `{}`（下次 {}）{} → {}",
                         j.id,
                         j.expr,
                         format_local(next),
+                        enabled_mark,
                         truncate_str(&j.prompt, 40)
                     ));
                 }
@@ -365,6 +365,18 @@ impl Dispatcher {
                 None => {
                     warn!(target: "imagent::core", id = %job.id, "定时任务表达式已无解，停用");
                     let _ = self.store.set_cron_enabled(&job.id, false).await;
+                    // v1.18 review（agent-2 #9）：停用必须让会话知道——此前静默
+                    // 停用 + list 过滤 enabled=1，任务「无声消失」且 /cron rm
+                    // 需要用户已看不见的 id。
+                    self.reply(
+                        &ConvId(job.conv.clone()),
+                        &format!(
+                            "⏰ 定时任务 `{}`（`{}`）的表达式一年内无触发时刻，已自动停用。\n如需修正可 /cron rm {} 后重建。",
+                            job.id, job.expr, job.id
+                        ),
+                        &ReplyHint::None,
+                    )
+                    .await;
                     continue;
                 }
             };
