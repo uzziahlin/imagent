@@ -865,7 +865,7 @@ impl Dispatcher {
                     return;
                 }
                 let idx = n - 1;
-                removed_sender = q[idx].sender.0.clone();
+                removed_sender = q[idx].msg.sender.0.clone();
                 if removed_sender != sender && !is_admin {
                     drop(map);
                     self.reply(conv, "只能丢弃自己排队的消息（或联系管理员处理）。", hint)
@@ -873,15 +873,6 @@ impl Dispatcher {
                     return;
                 }
                 let removed = q.remove(idx);
-                // v1.18 迭代（排队持久化）：drop 后锁外重写整队（含空队=清行）。
-                let persist_items: Vec<(Option<String>, String)> = q
-                    .iter()
-                    .filter_map(|m| {
-                        serde_json::to_string(m)
-                            .ok()
-                            .map(|j| (m.source_msg_id.clone(), j))
-                    })
-                    .collect();
                 let count = q.len();
                 if count == 0 {
                     // 与取批路径同语义：留空 Vec 不删 entry（runner 循环依赖）。
@@ -895,19 +886,24 @@ impl Dispatcher {
                         .entry(conv.0.clone())
                         .and_modify(|h| {
                             h.count = count;
-                            h.latest = super::super::latest_snippet(last);
+                            h.latest = super::super::latest_snippet(&last.msg);
                         })
                         .or_insert_with(|| crate::card_session::QueuedHint {
                             count,
-                            latest: super::super::latest_snippet(last),
+                            latest: super::super::latest_snippet(&last.msg),
                             ..Default::default()
                         });
                 }
                 drop(map);
-                if let Err(e) = self.store.replace_queued(&conv.0, &persist_items).await {
-                    warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "丢弃后持久化排队重写失败");
+                // v1.18 review（排队持久化重做）：按被丢元素的 rowid 精确删行
+                //（替代整队重写——并发入队的新行不受影响）。
+                if removed.rowid > 0 {
+                    if let Err(e) = self.store.delete_queued_rows(&[removed.rowid]).await {
+                        warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "丢弃后持久化行删除失败（重启后可能重放该条）");
+                    }
                 }
                 let snippet = removed
+                    .msg
                     .text
                     .as_deref()
                     .map(|t| super::super::truncate_str(t.trim(), 30))
@@ -928,7 +924,8 @@ impl Dispatcher {
                 None => Vec::new(),
                 Some(q) => q
                     .iter()
-                    .map(|m| {
+                    .map(|q| {
+                        let m = &q.msg;
                         let snippet = match m.text.as_deref() {
                             Some(t) if !t.trim().is_empty() => {
                                 super::super::truncate_str(t.trim(), 40)

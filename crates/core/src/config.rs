@@ -796,6 +796,15 @@ impl Config {
                     cfg.model_context_window_tokens, cfg.auto_compact_window_ratio
                 )));
             }
+            // v1.18 review（agent-1 #5 补充）：ratio = 1.0 时阈值 == 窗口硬上限，
+            // 水位通常先撞 API 上下文溢出——自动压缩形同虚设且无 0 的「关闭」
+            // 语义，明确警示。
+            if cfg.auto_compact_window_ratio >= 1.0 {
+                tracing::warn!(
+                    target: "imagent::config",
+                    "auto_compact_window_ratio = 1.0：阈值等于模型窗口硬上限，自动压缩大概率永不触发（建议 0.8~0.9；确要关闭请把 model_context_window_tokens 设 0 走绝对值档）"
+                );
+            }
         }
         // W4-1：成本上限须为正数（0 / 负数视为配置错误而非「立即全拒」）。
         if let Some(l) = cfg.sender_daily_cost_limit_usd {

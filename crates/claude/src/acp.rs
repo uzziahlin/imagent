@@ -58,6 +58,9 @@ const DEFAULT_AGENT_CMD: &str = "claude-agent-acp";
 /// B2/P5-14：per-conv 连接的并发上限（= 同时存活的 claude-agent-acp 子进程数）。
 /// 超限直接拒绝（回可读错误）而非排队——排队会把排队时长烧进 agent_timeout
 /// （正是 P5-14 要修的问题），拒绝让用户侧显式重试/减少并发。
+/// cost 基线 map 上限（v1.18 review：超限整体清空，防长生命周期泄漏）。
+const COST_BASELINE_CAP: usize = 512;
+
 const MAX_CONCURRENT_CONNS: usize = 8;
 
 /// B2/P5-14：连接空闲回收时长：该 conv 的连接在此窗口内没有任何新 prompt，则断开
@@ -79,6 +82,13 @@ pub struct AcpBackend {
     model: RwLock<Option<String>>,
     /// B2/P5-14：conv_id → 长驻连接 map（惰性建立；task 退出时自摘除）。
     conns: Arc<Mutex<HashMap<String, Arc<LongLivedAcp>>>>,
+    /// v1.18 review（agent-1 #6）：cost 基线 **backend 级** per-session map
+    ///（sid → 上次轮末累计 cost）。此前基线挂在连接上，空闲回收（缺省 600s）
+    /// 重建连接即丢——下一轮走「无基线→记整段累计」分支，把会话累计全额记
+    /// 成单轮成本，叠加进 per-sender 24h 滚动预算（W4-1），可误触发预算拒绝。
+    /// 进程生命周期内存活；上限 [`COST_BASELINE_CAP`] 防泄漏（超限整体清空，
+    /// 代价是下轮各会话保守记整段一次）。
+    cost_baselines: Arc<Mutex<HashMap<String, f64>>>,
     /// 并发连接上限（默认 [`MAX_CONCURRENT_CONNS`]；`with_conn_limits` 可配）。
     /// W2-4：经 main 从 config（`acp_max_connections`）注入。
     max_conns: usize,
@@ -98,6 +108,7 @@ impl AcpBackend {
             hook: RwLock::new(None),
             model: RwLock::new(None),
             conns: Arc::new(Mutex::new(HashMap::new())),
+            cost_baselines: Arc::new(Mutex::new(HashMap::new())),
             max_conns: MAX_CONCURRENT_CONNS,
             conn_idle_recycle: CONN_IDLE_RECYCLE,
             #[cfg(test)]
@@ -124,6 +135,7 @@ impl AcpBackend {
             hook: RwLock::new(None),
             model: RwLock::new(None),
             conns: Arc::new(Mutex::new(HashMap::new())),
+            cost_baselines: Arc::new(Mutex::new(HashMap::new())),
             max_conns: MAX_CONCURRENT_CONNS,
             conn_idle_recycle: CONN_IDLE_RECYCLE,
             #[cfg(test)]
@@ -139,6 +151,7 @@ impl AcpBackend {
             hook: RwLock::new(None),
             model: RwLock::new(None),
             conns: Arc::new(Mutex::new(HashMap::new())),
+            cost_baselines: Arc::new(Mutex::new(HashMap::new())),
             max_conns: MAX_CONCURRENT_CONNS,
             conn_idle_recycle: CONN_IDLE_RECYCLE,
             #[cfg(test)]
@@ -197,6 +210,7 @@ impl AcpBackend {
                 hook,
                 conv.to_string(),
                 Arc::clone(&self.conns),
+                Arc::clone(&self.cost_baselines),
                 idle,
                 true,
             )?,
@@ -207,6 +221,7 @@ impl AcpBackend {
                 hook,
                 conv.to_string(),
                 Arc::clone(&self.conns),
+                Arc::clone(&self.cost_baselines),
                 idle,
                 false,
             )?,
@@ -444,12 +459,14 @@ impl LongLivedAcp {
     ///
     /// 泛型 `T`：真机为 `AcpAgent`（子进程 stdio）；测试为 in-process `Channel`
     /// （假 agent，见 tests）。
+    #[allow(clippy::too_many_arguments)] // v1.18 review：cost_baselines 进程级基线句柄入参（参数面随防线增长，聚 struct 收益低）
     fn spawn<T>(
         transport: T,
         perm_mode: Arc<RwLock<PermissionMode>>,
         hook: Option<ImPermissionHook>,
         conv: String,
         conns: Arc<Mutex<HashMap<String, Arc<LongLivedAcp>>>>,
+        cost_baselines: Arc<Mutex<HashMap<String, f64>>>,
         idle_recycle: std::time::Duration,
         ghost_precheck: bool,
     ) -> Result<Arc<LongLivedAcp>>
@@ -465,9 +482,10 @@ impl LongLivedAcp {
         let current_for_main = current.clone();
         // P0-2 收尾：cost 基线跨轮共享——此前每轮 StreamState::new 新建，上一轮
         // 末写入的基线随 st 一起销毁，下一轮永远走「无基线→记整段累计」分支，
-        // 轮次增量记账从未生效（单测复用同一 st，恰好掩盖了该集成缝隙；连接
-        // 重建/进程重启后基线丢失仍按首轮保守记整段，语义不变）。
-        let cost_baseline = Arc::new(Mutex::new(None::<(String, f64)>));
+        // 轮次增量记账从未生效（单测复用同一 st，恰好掩盖了该集成缝隙）。
+        // v1.18 review（agent-1 #6）：基线再提升到 **backend 级** per-session
+        // map——连接空闲回收重建后仍在，避免「回收后首轮把会话累计全额记进
+        // per-sender 24h 预算」的误触发。进程重启后仍按首轮保守记整段。
         let connect_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let connect_error_for_task = connect_error.clone();
         let perm_for_handler = perm_mode;
@@ -541,9 +559,19 @@ impl LongLivedAcp {
                                 None => break, // 所有 sender drop（shutdown 清理）
                             },
                         };
-                        let mut st = StreamState::new(req.chunks.clone());
-                        // 注入连接级共享 cost 基线（见 spawn 处注释）。
-                        st.cost_baseline = cost_baseline.clone();
+                        let st = StreamState::new(req.chunks.clone());
+                        // 注入 backend 级共享 cost 基线（见 spawn 处注释）：
+                        // 预填该会话上次轮末的累计值（无记录 = None，首轮保守
+                        // 记整段——与连接重建语义一致）。
+                        {
+                            let baselines = cost_baselines.lock().await;
+                            if let Some(base) = baselines.get(&req.session.clone().unwrap_or_default()) {
+                                *st.cost_baseline.lock().await = Some((
+                                    req.session.clone().unwrap_or_default(),
+                                    *base,
+                                ));
+                            }
+                        }
                         *current_for_main.lock().await = Some(st.clone());
                         let cwd = req.cwd.clone();
                         // 幽灵会话预检（与 CLI 路径 backend.rs:429-442 同源防御）：
@@ -651,6 +679,17 @@ impl LongLivedAcp {
                                         Some(u) => Some(st.round_delta_usage(&sid, u).await),
                                         None => None,
                                     };
+                                    // v1.18 review：轮末新基线回写 backend 级 map
+                                    //（连接回收后下轮预填，防整段重复记账触发
+                                    // per-sender 预算误拒；超限整体清空防泄漏）。
+                                    let baseline_out = st.cost_baseline.lock().await.clone();
+                                    if let Some((bsid, base)) = baseline_out {
+                                        let mut baselines = cost_baselines.lock().await;
+                                        if baselines.len() >= COST_BASELINE_CAP {
+                                            baselines.clear();
+                                        }
+                                        baselines.insert(bsid, base);
+                                    }
                                     let _ = st.chunks.send(AgentChunk::Final(final_text.clone())).await;
                                     let _ = req.resp.send(Ok(RunOutcome {
                                         session_id: SessionId(sid),

@@ -76,8 +76,7 @@ struct AskSlot {
     pending_req: Option<String>,
     /// 最近一次询问收敛的时刻。真机校准（2026-08）：跨轮次复用会把新询问
     /// patch 到早已被结果卡/后续消息顶离视口的历史卡上——用户看不到询问，
-    /// 表现为「卡住」直到超时催办。复用仅在新鲜窗口（见 [`ASK_SLOT_REUSE_WINDOW`]）
-    /// 内成立；None = 挂着未决询问或刚登记的新卡（不可复用）。
+    /// 表现为「卡住」直到超时催办。复用仅设计于新鲜窗口内成立；None = 挂着未决询问或刚登记的新卡（不可复用）。
     /// P10-③：重渲染输入（note 联动更新时按原参数重画整卡，按钮 value 不变）。
     render: AskRender,
 }
@@ -1566,18 +1565,27 @@ async fn housekeeping_loop(maps: HousekeepingMaps) {
         if removed > 0 {
             info!(target: "feishu", removed, "媒体目录 GC：删除 {removed} 个超期文件");
         }
-        async fn cap<V>(m: &Arc<Mutex<HashMap<String, V>>>) -> usize {
-            let mut g = m.lock().await;
-            if g.len() > PER_CONV_MAP_CAP {
-                let n = g.len();
-                g.clear();
-                return n;
+        // v1.18 review（agent-1 #4）：选择性驱逐——整体 clear() 有两个非
+        // cosmetic 代价：① comment conv 的 comment_anchor 被清后 send_text
+        // 直接报「评论线程缺少回复目标」（硬失败，非观感）；② 审批等待中的
+        // ask_slot 丢失断掉 note 联动。改为：超限时先驱逐「无挂起审批的非
+        // 评论会话」条目；仍超限才整体清空（防御性兜底，实际不可达）。
+        {
+            let mut states = maps.conv_states.lock().await;
+            if states.len() > PER_CONV_MAP_CAP {
+                let before = states.len();
+                states.retain(|key, st| {
+                    key.starts_with("feishu:comment:")
+                        || st
+                            .ask_slot
+                            .as_ref()
+                            .is_some_and(|s| s.pending_req.is_some())
+                });
+                let evicted = before - states.len();
+                if evicted > 0 {
+                    warn!(target: "feishu", evicted, "per-conv 状态表超粗上限（>{PER_CONV_MAP_CAP}），驱逐 {evicted} 个非活跃会话条目（评论会话与挂起审批豁免）");
+                }
             }
-            0
-        }
-        let reset = cap(&maps.conv_states).await;
-        if reset > 0 {
-            warn!(target: "feishu", reset, "per-conv 状态表超粗上限（>{PER_CONV_MAP_CAP}），整体重置 {reset} 个会话条目");
         }
         tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
     }
@@ -1772,16 +1780,20 @@ enum PumpJob {
 }
 
 /// 单 conv 的顺序泵任务：按入队顺序等待作业完成并把消息发往 core 的有界
-/// 入站通道（背压经 outbound.send().await 传导）。空闲 [`PUMP_IDLE`] 后退出
-/// （map 条目由 pump_send 的失败重建路径兜底，不泄漏 task）。
+/// 入站通道（背压经 outbound.send().await 传导）。
+/// v1.18 review（agent-1 #1）：**不做空闲退出**——「发送方 is_closed 检查通过
+/// → 泵恰好超时退出 → 缓冲作业随 rx drop 丢失」是丢消息竞态（dedup 已消费
+/// id，丢了即永久丢）。泵仅在 outbound 关闭（core 停机）或全 sender drop 时
+/// 退出；map 无界增长由 pump_send 的上限驱逐兜住（驱逐 = drop sender，泵把
+/// 缓冲作业处理完再干净退出，不丢）。闲置泵只是 parked task（百字节级）。
 async fn conv_pump(
     mut rx: mpsc::UnboundedReceiver<PumpJob>,
     outbound: mpsc::Sender<InboundMessage>,
 ) {
     loop {
-        let job = match tokio::time::timeout(PUMP_IDLE, rx.recv()).await {
-            Ok(Some(j)) => j,
-            Ok(None) | Err(_) => break, // 通道关闭 / 空闲超时
+        let job = match rx.recv().await {
+            Some(j) => j,
+            None => break, // 全部 sender drop
         };
         let msg = match job {
             PumpJob::Ready(m) => Some(m),
@@ -1808,9 +1820,6 @@ async fn conv_pump(
     }
 }
 
-/// 泵空闲退出窗口（媒体下载最长 read_timeout 级的量级，余量充足）。
-const PUMP_IDLE: std::time::Duration = std::time::Duration::from_secs(120);
-
 /// 按 conv 取（或惰性建）泵通道并入队。泵空闲退出后 entry 残留 → send 失败
 /// → 重建一次重发（task 不泄漏、消息不丢）。
 fn pump_send(
@@ -1824,15 +1833,24 @@ fn pump_send(
         tokio::spawn(conv_pump(rx, outbound.clone()));
         tx
     };
+    // v1.18 review（agent-1 #1）：上限驱逐——drop sender 后泵先把缓冲作业
+    // 处理完再退出（recv None），不丢消息；被驱逐 conv 的下一条消息走重建。
+    if pumps.len() >= PER_CONV_MAP_CAP {
+        if let Some(oldest) = pumps.keys().next().cloned() {
+            if let Some(tx) = pumps.remove(&oldest) {
+                debug!(target: "feishu", conv = %oldest, "泵表超上限，驱逐最旧条目（缓冲作业由泵排空后自然退出）");
+                drop(tx);
+            }
+        }
+    }
     use std::collections::hash_map::Entry;
     match pumps.entry(conv.to_string()) {
         Entry::Occupied(mut e) => {
-            if !e.get().is_closed() {
-                let _ = e.get().send(job);
-            } else {
-                // 泵已退出（rx drop）：重建后入队。
+            // SendError 含被退回的 job：重建泵后原样重发（此前 `let _ =` 把
+            // job 一并丢弃——可检测的丢失没有兜底）。
+            if let Err(undelivered) = e.get().send(job) {
                 let tx = spawn_pump();
-                let _ = tx.send(job);
+                let _ = tx.send(undelivered.0);
                 e.insert(tx);
             }
         }

@@ -121,7 +121,10 @@ fn capture_envs() -> Vec<(String, String)> {
         .collect()
 }
 
-fn run(cmd: &str, args: &[&str]) -> Result<String> {
+/// 返回 (输出文本, 是否成功退出)。v1.18 review（agent-2 #5）：此前非零退出
+/// 也返回 Ok(text)、调用方无从判断——install 对 launchctl load 失败照样打印
+/// 「✅ 已安装并启动」（服务实际没起来）。强制步骤用 [`run_mandatory`]。
+fn run(cmd: &str, args: &[&str]) -> Result<(String, bool)> {
     let out = std::process::Command::new(cmd)
         .args(args)
         .output()
@@ -131,12 +134,29 @@ fn run(cmd: &str, args: &[&str]) -> Result<String> {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    if !out.status.success() {
-        // launchctl/systemctl 非零退出不一定是失败（如 unload 不存在的服务），
-        // 调用方据语义判断；这里返回文本 + 状态码由调用方处理。
-        return Ok(text.trim().to_string());
+    Ok((text.trim().to_string(), out.status.success()))
+}
+
+/// 强制步骤：非零退出即 Err（区别于 unload 类 best-effort 步骤）。
+fn run_mandatory(cmd: &str, args: &[&str]) -> Result<String> {
+    let (text, ok) = run(cmd, args)?;
+    if !ok {
+        return Err(anyhow!("{cmd} {} 失败：{}", args.join(" "), text));
     }
-    Ok(text.trim().to_string())
+    Ok(text)
+}
+
+/// 服务定义文件落盘后 chmod 0600（v1.18 review agent-2 #6：定义内嵌
+/// IMAGENT_FEISHU_APP_SECRET 明文，此前按 umask 0644 世界可读——与
+/// config.toml 0600 的既定 posture 不一致）。
+fn write_unit_secret_safe(path: &std::path::Path, content: String) -> Result<()> {
+    std::fs::write(path, content)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 /// `service install`：写定义文件 + 加载启动。
@@ -183,11 +203,11 @@ pub fn install(profile: Option<&str>) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         let plist = render_plist(&exe, profile, &platform_name, &envs, &log);
-        std::fs::write(&path, plist)?;
+        write_unit_secret_safe(&path, plist)?;
         let lbl = label(profile);
-        // 先卸旧（不存在时报错可忽略）再加载。
+        // 先卸旧（不存在时报错可忽略）再加载（load 为强制步骤——失败如实报错）。
         let _ = run("launchctl", &["unload", &path.to_string_lossy()]);
-        run("launchctl", &["load", &path.to_string_lossy()])?;
+        run_mandatory("launchctl", &["load", &path.to_string_lossy()])?;
         println!("✅ 已安装并启动 launchd 用户代理 {lbl}");
         println!("   定义：{}", path.display());
         println!("   日志：{log}");
@@ -199,10 +219,10 @@ pub fn install(profile: Option<&str>) -> Result<()> {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let unit = render_unit(&exe, profile, &platform_name, &envs);
-        std::fs::write(&path, unit)?;
+        write_unit_secret_safe(&path, unit)?;
         let name = label(profile).replace("com.imagent", "imagent");
         run("systemctl", &["--user", "daemon-reload"])?;
-        run("systemctl", &["--user", "enable", "--now", &name])?;
+        run_mandatory("systemctl", &["--user", "enable", "--now", &name])?;
         println!("✅ 已安装并启动 systemd 用户服务 {name}");
         println!("   定义：{}", path.display());
         println!("   日志：journalctl --user -u {name} -f");
@@ -250,7 +270,7 @@ pub fn status(profile: Option<&str>) -> Result<()> {
     {
         let lbl = label(profile);
         match run("launchctl", &["list"]) {
-            Ok(list) => {
+            Ok((list, _ok)) => {
                 let hit = list
                     .lines()
                     .find(|l| l.split('\t').nth(2) == Some(lbl.as_str()));
@@ -273,7 +293,7 @@ pub fn status(profile: Option<&str>) -> Result<()> {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let name = label(profile).replace("com.imagent", "imagent");
-        let out = run("systemctl", &["--user", "is-active", &name])?;
+        let (out, _ok) = run("systemctl", &["--user", "is-active", &name])?;
         println!("{name}：{out}");
     }
     #[cfg(not(unix))]

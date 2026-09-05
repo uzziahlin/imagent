@@ -663,12 +663,24 @@ impl Dispatcher {
         let hard = hard_early;
         let queued = if hard {
             let mut map = self.queues.lock().await;
-            let n = map.remove(&conv.0).map(|q| q.len()).unwrap_or(0);
+            // v1.18 review（排队持久化重做）：按被丢元素的 rowid 精确删行——
+            // 整 conv DELETE 会连带删掉并发入队新消息的行。
+            let (n, rowids) = match map.remove(&conv.0) {
+                Some(q) => (
+                    q.len(),
+                    q.iter()
+                        .map(|qm| qm.rowid)
+                        .filter(|r| *r > 0)
+                        .collect::<Vec<_>>(),
+                ),
+                None => (0, Vec::new()),
+            };
             self.queued_hints.lock().await.remove(&conv.0);
             drop(map);
-            // v1.18 迭代（排队持久化）：硬停清队列同步清持久化行。
-            if let Err(e) = self.store.clear_queued(&conv.0).await {
-                warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "硬停清持久化排队失败");
+            if !rowids.is_empty() {
+                if let Err(e) = self.store.delete_queued_rows(&rowids).await {
+                    warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "硬停清持久化排队失败");
+                }
             }
             n
         } else {

@@ -730,22 +730,22 @@ impl Dispatcher {
         // 仅在自动压缩关闭（阈值 0）或水位在 80k~阈值之间时提示。
         // 取舍：OutboundCard 的 footer 无自由文本通道，提示追加在回复正文末尾
         //（卡片/纯文本两条路径都可见，语义同为「完成后给用户的建议」）。
+        // v1.18 review（agent-1 #7）：提示口径与触发口径统一为 input + cached
+        // （ctx_tokens）——此前提示用 input_tokens 裸值：缓存主导的会话（真机
+        // 实测 input 182 / cached 12 万）提示永不触发、且与自动压缩判据各说
+        // 各话。auto_threshold==0（关闭）时才提示。
+        let ctx_tokens =
+            |u: &crate::types::UsageStats| u.input_tokens + u.cached_tokens.unwrap_or(0);
         let auto_threshold = self
             .auto_compact_threshold
             .load(std::sync::atomic::Ordering::Relaxed);
-        if outcome
-            .usage
-            .as_ref()
-            .is_some_and(|u| u.input_tokens > 80_000)
-            && (auto_threshold == 0
-                || outcome
-                    .usage
-                    .as_ref()
-                    .is_some_and(|u| u.input_tokens < auto_threshold))
+        let watermark = outcome.usage.as_ref().map(ctx_tokens);
+        if watermark.is_some_and(|n| n > 80_000)
+            && (auto_threshold == 0 || watermark.is_some_and(|n| n < auto_threshold))
         {
-            let n = outcome.usage.as_ref().map(|u| u.input_tokens).unwrap_or(0);
+            let n = watermark.unwrap_or(0);
             reply.push_str(&format!(
-                "\n\n📊 本轮输入约 {n} tokens，上下文较大，建议 /compact。"
+                "\n\n📊 当前上下文约 {n} tokens，较大，建议 /compact。"
             ));
         }
         if let Some(c) = card.as_mut() {
