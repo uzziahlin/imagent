@@ -129,6 +129,9 @@ fn local_offset_secs(epoch: i64) -> i64 {
         if libc::localtime_r(&t, &mut tm).is_null() {
             return 0;
         }
+        // c_long 在 64 位 unix 即 i64（CI 的 clippy 视为 unnecessary_cast）、
+        // 32 位为 i32——显式 cast 保跨平台，对 64 位 clippy 定点豁免。
+        #[allow(clippy::unnecessary_cast)]
         tm.tm_gmtoff as i64
     }
 }
