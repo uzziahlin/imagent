@@ -212,6 +212,17 @@ impl ReplyMode {
     }
 }
 
+/// v1.20 webhook 入站条目（见 [`Config::webhooks`]）。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WebhookEntry {
+    /// 路径鉴权 token（≥16 字符；建议 32+ 位随机 hex）。
+    pub token: String,
+    /// 投递会话（如 `feishu:oc_xxx` / `feishu:ou_xxx`，须在会话白名单）。
+    pub conv: String,
+    /// 展示名（注入消息的来源前缀 `【name】`，如 "ci" / "grafana"）。
+    pub name: String,
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Config {
     /// agent 工作根目录（agent 的 cwd，**非沙箱**：仅决定工作目录，不限制可读路径；
@@ -266,6 +277,17 @@ pub struct Config {
     /// 默认 `None`（关闭——开源分发时不默认开启监听端口）；显式设置地址即开启。
     #[serde(default = "default_metrics_addr")]
     pub metrics_addr: Option<String>,
+    /// v1.20 webhook 入站：事件（CI / 告警 / 定时系统）→ 会话注入的 HTTP 监听
+    /// 地址（如 `"127.0.0.1:18443"`）。None/空 = 关闭。路由 `POST /hook/<token>`，
+    /// 鉴权 = 路径中的 token 本身（与 [[webhook]] 表匹配）；非 loopback 部署
+    /// 靠 token 防护（建议 32+ 位随机串）。
+    #[serde(default)]
+    pub webhook_addr: Option<String>,
+    /// v1.20：token → 投递会话映射表（可多条，TOML 形态 `[[webhook]]`）。
+    /// 投递会话须过会话白名单（/chat allow）才会驱动 agent——与手打消息
+    /// 同权，无旁路。
+    #[serde(default, rename = "webhook")]
+    pub webhooks: Vec<WebhookEntry>,
     /// 出站消息单条字符上限（Unicode char 计）。超长则由各 Platform 的 `send_text`
     /// 在内部分片——**三平台生效**（ilink / feishu / wecom，各平台再与自身协议
     /// 硬上限取 min：飞书 28000、企微 4000 字节）。`None` = 不按此配置分片
@@ -691,6 +713,43 @@ impl Config {
         // 同词表）。
         // H3（code-review v8）：message_max_len 下界——wecom 分片对 ≤3 有零
         // 前进死循环风险（运行期另有 clamp 兜底），启动期直接拒绝把问题前置。
+        // v1.20 webhook 入站校验：token 强度、conv 非空、token 唯一；
+        // 配置了一半（addr 无条目 / 条目无 addr）给 warn 不阻启动。
+        {
+            const TOKEN_MIN: usize = 16;
+            let mut seen = std::collections::HashSet::new();
+            for w in &cfg.webhooks {
+                if w.token.len() < TOKEN_MIN {
+                    return Err(CoreError::Config(format!(
+                        "webhook token 至少 {TOKEN_MIN} 字符（name={}）——路径即鉴权，过短可爆破",
+                        w.name
+                    )));
+                }
+                if w.conv.trim().is_empty() {
+                    return Err(CoreError::Config(format!(
+                        "webhook conv 不能为空（name={}）",
+                        w.name
+                    )));
+                }
+                if !seen.insert(w.token.as_str()) {
+                    return Err(CoreError::Config(format!(
+                        "webhook token 重复（name={}）",
+                        w.name
+                    )));
+                }
+            }
+            let addr_set = cfg
+                .webhook_addr
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty());
+            if addr_set && cfg.webhooks.is_empty() {
+                tracing::warn!(target: "imagent::config", "webhook_addr 已配置但 [[webhook]] 表为空——server 会启动但所有请求 404");
+            }
+            if !addr_set && !cfg.webhooks.is_empty() {
+                tracing::warn!(target: "imagent::config", "[[webhook]] 有条目但未配置 webhook_addr——webhook 入站未启用");
+            }
+        }
         if let Some(n) = cfg.message_max_len {
             if n < 4 {
                 return Err(CoreError::Config(format!(
@@ -1035,6 +1094,48 @@ platform = "ilink"
         nope.push("imagent_core_cfg_does_not_exist.toml");
         let err = Config::load(&nope).unwrap_err();
         assert!(matches!(err, CoreError::Io(_)), "{err:?}");
+    }
+
+    /// v1.20 webhook 入站配置：条目解析 + 三类校验拒绝。
+    #[test]
+    fn webhook_config_parse_and_validate() {
+        let p = tmp_path(
+            "wh_ok",
+            r#"default_workdir = "/tmp/ws"
+webhook_addr = "127.0.0.1:18443"
+[[webhook]]
+token = "0123456789abcdef0123456789abcdef"
+conv = "feishu:oc_g"
+name = "ci"
+"#,
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(cfg.webhooks.len(), 1);
+        assert_eq!(cfg.webhooks[0].name, "ci");
+        assert_eq!(cfg.webhook_addr.as_deref(), Some("127.0.0.1:18443"));
+        cleanup(&p);
+        // 短 token 拒绝。
+        let mk = |body: &str| {
+            let p = tmp_path("wh_bad", body);
+            let r = Config::load(&p);
+            cleanup(&p);
+            r
+        };
+        let err = mk(
+            "default_workdir = \"/tmp/ws\"\n[[webhook]]\ntoken = \"short\"\nconv = \"c\"\nname = \"x\"\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("token 至少"), "{err}");
+        let err = mk(
+            "default_workdir = \"/tmp/ws\"\n[[webhook]]\ntoken = \"aaaaaaaaaaaaaaaa\"\nconv = \"\"\nname = \"x\"\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("conv 不能为空"), "{err}");
+        let err = mk(
+            "default_workdir = \"/tmp/ws\"\n[[webhook]]\ntoken = \"aaaaaaaaaaaaaaaa\"\nconv = \"c\"\nname = \"x\"\n[[webhook]]\ntoken = \"aaaaaaaaaaaaaaaa\"\nconv = \"c2\"\nname = \"y\"\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("重复"), "{err}");
     }
 
     /// v1.18：自动压缩比例档——窗口声明即激活，阈值 = 窗口 × 比例（覆盖绝对值档）。

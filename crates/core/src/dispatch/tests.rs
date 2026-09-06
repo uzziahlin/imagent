@@ -4532,6 +4532,34 @@ async fn stats_includes_approval_group() {
 
 /// v1.18 /cron 全链路：add 校验与落库 → list → 到期驱动 fire_due（合成消息走
 /// handle，MockBackend 收到注入前缀 prompt，store 重排）→ rm。
+/// v1.20 webhook 注入：inject() → handle() 完整管线（会话白名单门）→ 驱动 agent。
+#[tokio::test]
+async fn webhook_inject_drives_agent_via_handle() {
+    let _serial = SERIAL.lock().await;
+    // conv 白名单放行 c1（Auth::with_chats）。
+    let auth = Auth::with_chats(vec![], vec!["c1".into()]);
+    let ctx = build(auth).await;
+    let msg = msg("c1", "webhook:ci", "【ci】deploy failed on main");
+    ctx.disp.inject(msg).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if ctx
+            .prompts
+            .lock()
+            .await
+            .iter()
+            .any(|p| p.contains("deploy failed on main"))
+        {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("webhook 注入未驱动 agent: {:?}", ctx.prompts.lock().await);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    drop_db(ctx.db).await;
+}
+
 /// v1.18 迭代（排队持久化）：启动重放——崩溃前落库的排队消息经
 /// replay_persisted_queue 重新驱动 agent；重放行先清表防双份。
 #[tokio::test]
