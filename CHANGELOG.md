@@ -2,6 +2,30 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.20.0] — 2026-09-06
+
+> **事件驱动跃迁**：Webhook 入站（头牌）+ ACP 窗口自学习 + 崩溃轮次恢复
+> + compact 卡片化 + /cron 停机补跑。产品从「你打字时刻」延伸到「你不打字
+> 的时刻」——CI 失败、监控告警等外部事件直接进会话驱动 agent。全仓 670
+> tests / 0 failed、clippy 零警告。
+
+### Added
+- **Webhook 入站**：`webhook_addr` + `[[webhook]]`（token/conv/name），
+  `POST /hook/<token>` 注入指定会话——与手打消息同权走鉴权/审批管线
+  （token ≥16 字符校验 + 会话白名单门，无旁路）；body ≤64KB，JSON
+  text 字段优先；消息带【name】来源前缀
+- **ACP 窗口自学习**：`UsageUpdate.size`（真实模型窗口）经
+  RunOutcome.usage.context_window 上抛，比例档阈值动态重算——200k 模型
+  零配置防溢出；绝对值档/关闭尊重显式配置不覆盖；SIGHUP 重置回 config
+- **崩溃轮次恢复**：轮首落 `inflight_prompt` 标记、正常收尾清除；重启
+  扫描残留转 `/retry` 数据源并通知会话一键续跑
+- **/cron 停机补跑**：`cron_catchup = one(缺省)|off|all`——all 逐周期
+  补跑上限 3 条（标注 i/n，DST 正确计数），off 陈旧到期只重排
+
+### Changed
+- 自动/手动 compact 通知与摘要改命令卡（+/stats 快捷按钮；纯文本平台
+  trait 降级）——消除 400 字纯文本突兀（冒烟实测反馈）
+
 ## [1.19.2] — 2026-09-06
 
 > **CI 修复 + 依赖批次**。v1.19.1 的 CI（非 Release 产物）因 clippy 平台

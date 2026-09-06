@@ -33,11 +33,12 @@ imagent 是一个常驻网关进程：监听 IM 私聊 / 群聊消息 → 鉴权
 - 🌉 **平台 / 后端双抽象**：换 IM 只加 adapter，换 agent 只加 impl。
 - 🔐 **安全第一**：发送者白名单 + 会话（群）白名单 + `allowed_tools` 收敛 + workdir 锁定 + **IM 内权限审批闭环**（按钮卡片 / 文本 y/n——按钮卡片仅飞书）。
 - 💬 **会话连续**：per-chat session 持久化（SQLite），重启可续；`--resume`；`/switch` 多命名会话；`/resume` 统一列表无感接管历史/电脑端 Claude Code 会话。
-- ⏰ **定时任务（/cron）**：5 字段 cron 表达式（本地时区含 DST）+ store 持久化，到期消息走与手打完全相同的鉴权/审批管线——日报、巡检、定时批处理一句话建好；停机错过的首个周期触发一次后顺延。
+- ⏰ **定时任务（/cron）**：5 字段 cron 表达式（本地时区含 DST）+ store 持久化，到期消息走与手打完全相同的鉴权/审批管线——日报、巡检、定时批处理一句话建好；停机补跑策略 `cron_catchup = one|off|all`（逐周期补跑上限 3 条 / 陈旧跳过 / 触发一次）。
+- 📡 **Webhook 入站**：`POST /hook/<token>` 把 CI 失败、监控告警等外部事件注入指定会话——与手打消息同权走鉴权/审批管线（token 路径鉴权 + 会话白名单，无旁路），agent 接事件自动排障、审批卡上放行修复。
 - 🛑 **任务控制（steering）**：`/stop` 随时中断在飞任务（杀 agent 子进程），**排队消息保留并自动转入下一轮**（对齐 Claude Code 的 Esc + 队列注入语义——运行中发补充/纠正不再丢，注入条数上卡片 footer 可见）；空闲看门狗自动终止无输出的僵死任务；失败后一键 `/retry` 续接。
-- 🛟 **崩溃不丢消息**：排队消息实时落库（schema v12），进程崩溃 / `kill -9` / 断电后重启自动重放——批处理与 steering 队列不再随进程消失。
+- 🛟 **崩溃不丢消息**：排队消息实时落库（schema v12），进程崩溃 / `kill -9` / 断电后重启自动重放——批处理与 steering 队列不再随进程消失；**执行中的轮次**同样留痕（轮首落 inflight 标记），重启后通知会话可 `/retry` 一键续跑。
 - 🔁 **消息批处理**：运行中到达的消息排队，与连发消息合并为一轮执行（不重复跑轮、不烧 token；批窗口静默判停自适应）；`/queue list|drop` 队列可视化管理。
-- 📊 **用量护栏**：`/stats` 成本统计 + 自动 compact（**比例档：水位达模型上下文窗口 80% 触发**，窗口缺省 1M、比例可配——大窗模型不再被 200k 时代校准的固定阈值过早压缩）+ per-sender 成本上限（滚动 24h）。
+- 📊 **用量护栏**：`/stats` 成本统计 + 自动 compact（**比例档：水位达模型上下文窗口 80% 触发**；ACP 路径经 `UsageUpdate.size` **自动学习真实窗口**——200k 模型零配置防溢出）+ per-sender 成本上限（滚动 24h）；压缩通知/摘要走命令卡。
 - 💭 **thinking / 任务清单**：思考过程与正文分离透出（卡片折叠区展示，cot 档位控制）；Claude Code 的 Task* / ACP Plan 渲染成卡片 checklist 进度。
 - 🎤 **语音输入（飞书）**：语音条自动转文字进 prompt（speech_to_text，需后台申请语音识别权限）。
 - 🛠️ **IM 内运维**：`/status` `/doctor` `/reconnect` `/config`（COT 三档展示 off/brief/detailed 等热改；SIGHUP 热载工具白名单/审批集/管理员名单/压缩阈值）。
@@ -141,6 +142,14 @@ allowed_senders = []        # 留空 = 发现模式（先看日志拿你的 from
 # quiet_hours = "22:00-08:00"        # 免打扰时段(本地时区,可跨天)：时段内加急(buzz)提醒降级普通消息，内容不变；不设=不启用
 # feishu_thread_active_window_secs = 1800  # 话题群免@窗口(秒)：话题内近期有消息则豁免群消息须@bot；默认30分钟，0=关闭
 # platform = "feishu"                # wecom/feishu 经 config 凭据接入（见下）
+
+# ===== 事件入站（v1.20 webhook）=====
+# webhook_addr = "127.0.0.1:18443"   # POST /hook/<token>；非 loopback 部署靠 32+ 位随机 token 防护
+# [[webhook]]                         # token → 会话（须 /chat allow 放行才会驱动 agent）
+# token = "0123456789abcdef0123456789abcdef"
+# conv  = "feishu:oc_xxx"
+# name  = "ci"                        # 注入消息带【ci】来源前缀
+# cron_catchup = "one"                # /cron 停机补跑：one(缺省)|off(陈旧跳过)|all(逐周期补跑,上限3)
 
 # ===== 用量护栏（v1.19 比例档）=====
 # 自动压缩：上下文水位达 模型窗口 × 80% 触发（摘要+重置+下轮注入【前情摘要】）。
@@ -367,6 +376,7 @@ imagent mcp-ask --print-config
 | P7 | ✅ | `/admin` 动态管理 + `/chat allow-all` + 陌生人提示开关 + `/config reply_mode` + `profile export/import` |
 | v1.8–v1.10 | ✅ | 四轮深度 code review（60+ 项修复：env 消毒/超时纪律/审批 fail-closed/转发代批防护）；AUQ 自由输入；steering；上下文水位含缓存 |
 | v1.18 | ✅ | `/cron` 定时任务（头牌）+ 群媒体「回复即定向」+ 转向回执上卡 |
+| v1.20 | ✅ | **Webhook 入站**（事件驱动：CI/告警→会话→审批）+ ACP 窗口自学习 + 崩溃轮次恢复（/retry 续跑）+ compact 卡片化 + /cron 停机补跑 |
 | v1.19 | ✅ | 深度 review 双批修复（42 项）+ 事件 intake 与媒体 IO 解耦 + **排队消息持久化（崩溃不丢）** + update_card 状态机化 / ConvState 收敛 + **自动压缩比例档（窗口 80%）** + housekeeping（媒体 GC） |
 
 > **当前状态**：**v1.19.x**（见 [Releases](https://github.com/uzziahlin/imagent/releases)）。质量基线：`cargo test --workspace` 664+ 全绿、clippy 零警告、CI 双平台 + audit/deny；历史复审记录 [`docs/CODE_REVIEW_v10.md`](docs/CODE_REVIEW_v10.md)（含功能挖掘路线图：ACP 窗口自动学习 / /cron 停机补跑 / webhook 入站 / 审批聚合卡）。
