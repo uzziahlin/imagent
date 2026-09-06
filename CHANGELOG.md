@@ -2,6 +2,24 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.19.2] — 2026-09-06
+
+> **CI 修复 + 依赖批次**。v1.19.1 的 CI（非 Release 产物）因 clippy 平台
+> 差异红：`local_offset_secs` 的 `c_long as i64` 在 CI 64 位 unix 被判
+> `unnecessary_cast`（本地 macOS 同版本 clippy 不报，无法本地拦截）——
+> 函数级定点豁免修复；顺带收口 5 项 dependabot 依赖升级（每步本地全量
+> 验证：clippy 零警告 + 664 tests 全绿）。
+
+### Fixed
+- CI clippy：`local_offset_secs` 的 c_long 转换定点豁免（显式 cast 保留
+  32 位平台正确性；表达式属性未稳定，豁免上移函数级）。
+
+### Changed
+- 依赖升级：async-trait 0.1.92、dirs 6.0、base64 0.23（树内传递依赖暂存
+  双版本）、ecb 0.2（block-padding 0.4 + hybrid-array；ilink AES-ECB
+  往返测试全过）、toml 1.1（spec 1.1.0；config 解析测试全过）。
+- CI workflow：actions/checkout v4 → v7（9 处）。
+
 ## [1.19.1] — 2026-09-06
 
 > **README 全量重写**（对齐 v1.19 现状）。无代码变更；二进制与 v1.19.0
