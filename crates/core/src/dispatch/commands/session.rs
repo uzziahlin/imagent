@@ -373,14 +373,21 @@ impl Dispatcher {
             }
             Some(sid) => match self.compact_session_locked(conv, &sid).await {
                 Ok(summary_text) => {
-                    self.reply(
-                        conv,
-                        &format!(
-                            "已压缩会话。摘要：\n\n{summary_text}\n\n（新会话将保留此摘要延续上下文）"
-                        ),
-                        hint,
-                    )
-                    .await;
+                    // v1.20 卡片化：与自动压缩同款（标题卡 + /stats 快捷键）。
+                    let _ = self
+                        .platform
+                        .send_command_card(
+                            conv,
+                            "✅ 会话已压缩",
+                            &format!("{summary_text}\n\n（新会话将保留此摘要延续上下文）"),
+                            &[crate::types::CardButton {
+                                label: "📊 查看水位".into(),
+                                command: "/status".into(),
+                                style: crate::types::CardButtonStyle::Default,
+                            }],
+                            hint,
+                        )
+                        .await;
                 }
                 Err(e) => {
                     self.reply(conv, &e, hint).await;
@@ -412,24 +419,35 @@ impl Dispatcher {
             threshold,
             "上下文水位超阈值，自动压缩（auto_compact）"
         );
-        self.reply(
-            conv,
-            &format!(
-                "🧠 本轮输入约 {in_tokens} tokens（超过阈值 {threshold}），正在自动压缩上下文……"
-            ),
-            hint,
-        )
-        .await;
+        // v1.20 卡片化：压缩通知走命令卡（纯文本平台 trait 降级）。
+        let _ = self
+            .platform
+            .send_command_card(
+                conv,
+                "🧠 正在自动压缩上下文",
+                &format!(
+                    "本轮上下文水位 {in_tokens} tokens 已超过阈值 {threshold}，正在生成摘要并重置会话……"
+                ),
+                &[],
+                hint,
+            )
+            .await;
         match self.compact_session_locked(conv, &sid).await {
             Ok(summary) => {
-                self.reply(
-                    conv,
-                    &format!(
-                        "✅ 已自动压缩。摘要：\n\n{summary}\n\n（新会话将保留此摘要延续上下文）"
-                    ),
-                    hint,
-                )
-                .await;
+                let _ = self
+                    .platform
+                    .send_command_card(
+                        conv,
+                        "✅ 上下文已压缩",
+                        &format!("{summary}\n\n（新会话将保留此摘要延续上下文）"),
+                        &[crate::types::CardButton {
+                            label: "📊 查看水位".into(),
+                            command: "/status".into(),
+                            style: crate::types::CardButtonStyle::Default,
+                        }],
+                        hint,
+                    )
+                    .await;
             }
             Err(e) => {
                 warn!(

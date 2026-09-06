@@ -20,6 +20,11 @@ impl Dispatcher {
         // 统一收尾：移除在飞注册（inner 未及注册时为幂等 no-op）。同 conv 轮次串行
         // （conv 锁），key 移除无 ABA。
         self.running.lock().await.remove(&conv_key);
+        // v1.20 崩溃轮次恢复：正常收尾（成功/失败/中断都经此）清除 inflight。
+        let _ = self
+            .store
+            .delete_config(&format!("inflight_prompt:{}", conv_key))
+            .await;
         tokens
     }
 
@@ -219,6 +224,20 @@ impl Dispatcher {
                 .await
             {
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "消息表情处理中标注失败（不影响主流程）");
+            }
+        }
+        // v1.20 崩溃轮次恢复：轮首落 inflight 标记（prompt + 时刻）——轮次任何
+        // 正常收尾（成功/失败/中断）由 run_agent_round 统一清除；进程崩溃/
+        // kill -9 时残留，下次启动 recover_crashed_rounds 转成 last_prompt
+        //（复用 /retry 完整机制）并通知会话。best-effort，失败不阻轮次。
+        {
+            let payload = serde_json::json!({ "prompt": prompt, "at": now_secs() });
+            if let Err(e) = self
+                .store
+                .set_config(&format!("inflight_prompt:{}", conv.0), &payload.to_string())
+                .await
+            {
+                warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "inflight 轮次标记落库失败（崩溃恢复将缺失本轮）");
             }
         }
         // steering（v1.17）：运行中转向通道——dispatcher 侧保留 sender 注册进

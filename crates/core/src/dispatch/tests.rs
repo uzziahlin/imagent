@@ -4082,7 +4082,7 @@ async fn auto_compact_triggers_after_threshold() {
     );
     let inbox_seen = ctx.inbox.lock().await.clone();
     assert!(
-        inbox_seen.iter().any(|t| t.contains("已自动压缩")),
+        inbox_seen.iter().any(|t| t.contains("上下文已压缩")),
         "应回自动压缩完成: {inbox_seen:?}"
     );
     // 压缩后活动会话被重置（下次消息新建）。
@@ -4540,6 +4540,55 @@ async fn stats_includes_approval_group() {
 
 /// v1.18 /cron 全链路：add 校验与落库 → list → 到期驱动 fire_due（合成消息走
 /// handle，MockBackend 收到注入前缀 prompt，store 重排）→ rm。
+/// v1.20 崩溃轮次恢复：inflight 残留 → 转 last_prompt（/retry 数据源）+
+/// 会话收到可续跑通知。
+#[tokio::test]
+async fn crashed_round_recovery_moves_to_retry() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    // 模拟崩溃残留（轮首写入、未及清除）。
+    let payload = serde_json::json!({ "prompt": "跑一半的长任务", "at": 100 });
+    // Ctx 无 store 句柄——经 check() 重开同库写入（dispatcher 与之共享 db 文件）。
+    let store = ctx.check().await;
+    store
+        .set_config("inflight_prompt:c1", &payload.to_string())
+        .await
+        .unwrap();
+    ctx.disp.recover_crashed_rounds().await;
+    // 已转 last_prompt 且 inflight 清除。
+    let retry = store.get_config("last_prompt:c1").await.unwrap();
+    assert!(
+        retry.as_deref().unwrap_or("").contains("跑一半的长任务"),
+        "last_prompt={retry:?}"
+    );
+    assert!(
+        store
+            .get_config("inflight_prompt:c1")
+            .await
+            .unwrap()
+            .is_none(),
+        "inflight 应已清除"
+    );
+    // 会话收到通知（轮询——reply 经 platform）。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if ctx
+            .inbox
+            .lock()
+            .await
+            .iter()
+            .any(|t| t.contains("/retry") && t.contains("未完成"))
+        {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("未收到崩溃恢复通知: {:?}", ctx.inbox.lock().await);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    drop_db(ctx.db).await;
+}
+
 /// v1.20 窗口自学习：ACP 报告窗口 → 比例档阈值重算（默认 1M×0.8=800k，
 /// 学习 200k → 160k）；窗口未变 no-op。
 #[tokio::test]
