@@ -1555,12 +1555,14 @@ mod tests {
                 output_tokens: 5,
                 cached_tokens: Some(2),
                 total_cost_usd: None,
+                context_window: None,
             }),
             "U2" => CliEvent::Usage(crate::types::UsageStats {
                 input_tokens: 1,
                 output_tokens: 2,
                 cached_tokens: None,
                 total_cost_usd: Some(0.012),
+                context_window: None,
             }),
             "END" => CliEvent::Multi(vec![
                 CliEvent::Usage(crate::types::UsageStats {
@@ -1568,6 +1570,7 @@ mod tests {
                     output_tokens: 0,
                     cached_tokens: None,
                     total_cost_usd: Some(0.05),
+                    context_window: None,
                 }),
                 CliEvent::Final {
                     text: "done".into(),

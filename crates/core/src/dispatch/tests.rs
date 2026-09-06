@@ -631,7 +631,10 @@ fn test_budgets() -> TaskBudgets {
         agent_idle_timeout: Duration::from_secs(300),
         batch_window: Duration::from_millis(1),
         // W2-5：测试默认关闭自动 compact（个别用例显式开启）；W4-1 成本上限默认不限。
+        // v1.20：窗口原料默认 0（绝对值档语义，学习 no-op）。
         auto_compact_threshold_tokens: 0,
+        auto_compact_window_tokens: 0,
+        auto_compact_window_ratio: 0.8,
         sender_daily_cost_limit_usd: None,
     }
 }
@@ -3497,6 +3500,8 @@ async fn stop_on_text_platform_marks_interrupted() {
         30_000,
         TaskBudgets {
             auto_compact_threshold_tokens: 0,
+            auto_compact_window_tokens: 0,
+            auto_compact_window_ratio: 0.8,
             sender_daily_cost_limit_usd: None,
             agent_timeout: Duration::ZERO,
             permission_ask_timeout: Duration::from_secs(5),
@@ -4032,6 +4037,7 @@ async fn auto_compact_triggers_after_threshold() {
         output_tokens: 100,
         cached_tokens: None,
         total_cost_usd: Some(0.1),
+        context_window: None,
     };
     let (back, calls, prompts, order) = MockBackend::new_with_usage(usage);
     let _ = std::fs::create_dir_all("/tmp/imagent-test-ws");
@@ -4437,6 +4443,7 @@ async fn context_watermark_hint_on_large_input() {
         output_tokens: 500,
         cached_tokens: None,
         total_cost_usd: None,
+        context_window: None,
     };
     let ctx = build_with_usage(auth.clone(), usage).await;
     feed_and_wait(&ctx, vec![msg("c1", "alice", "分析一下")], 1).await;
@@ -4455,6 +4462,7 @@ async fn context_watermark_hint_on_large_input() {
         output_tokens: 100,
         cached_tokens: None,
         total_cost_usd: None,
+        context_window: None,
     };
     let ctx = build_with_usage(auth, usage).await;
     feed_and_wait(&ctx, vec![msg("c1", "alice", "分析一下")], 1).await;
@@ -4532,6 +4540,50 @@ async fn stats_includes_approval_group() {
 
 /// v1.18 /cron 全链路：add 校验与落库 → list → 到期驱动 fire_due（合成消息走
 /// handle，MockBackend 收到注入前缀 prompt，store 重排）→ rm。
+/// v1.20 窗口自学习：ACP 报告窗口 → 比例档阈值重算（默认 1M×0.8=800k，
+/// 学习 200k → 160k）；窗口未变 no-op。
+#[tokio::test]
+async fn learned_context_window_recalibrates_threshold() {
+    let _serial = SERIAL.lock().await;
+    // 测试基建默认关闭自动压缩——显式构造比例档预算（1M×0.8）。
+    let ctx = build_slow(
+        Auth::new(vec!["alice".into()]),
+        0,
+        TaskBudgets {
+            auto_compact_threshold_tokens: 800_000,
+            auto_compact_window_tokens: 1_000_000,
+            auto_compact_window_ratio: 0.8,
+            sender_daily_cost_limit_usd: None,
+            agent_timeout: Duration::ZERO,
+            permission_ask_timeout: Duration::from_secs(5),
+            ask_via_im_timeout: Duration::from_secs(5),
+            shutdown_grace: Duration::from_secs(5),
+            agent_idle_timeout: Duration::ZERO,
+            batch_window: Duration::ZERO,
+        },
+    )
+    .await;
+    let t0 = ctx
+        .disp
+        .auto_compact_threshold
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(t0, 800_000, "比例档 1M×0.8");
+    ctx.disp.note_learned_context_window(200_000);
+    let t1 = ctx
+        .disp
+        .auto_compact_threshold
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(t1, 160_000, "学习 200k → 200k×0.8");
+    // 重复同值 no-op（无重算副作用可从窗口不变验证）。
+    ctx.disp.note_learned_context_window(200_000);
+    let w = ctx
+        .disp
+        .auto_compact_window
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(w, 200_000);
+    drop_db(ctx.db).await;
+}
+
 /// v1.20 webhook 注入：inject() → handle() 完整管线（会话白名单门）→ 驱动 agent。
 #[tokio::test]
 async fn webhook_inject_drives_agent_via_handle() {

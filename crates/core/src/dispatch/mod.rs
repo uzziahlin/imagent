@@ -73,9 +73,13 @@ pub struct TaskBudgets {
     /// 批处理窗口：runner 起跑前等待后续消息并入同一轮的时长（`batch_window_ms`；
     /// 零值 = 关闭）。
     pub batch_window: Duration,
-    /// W2-5：自动 compact 阈值（`auto_compact_threshold_tokens`；0 = 关闭）——
-    /// 成功轮次的上下文水位（usage.input_tokens）达到阈值即自动走 /compact 管道。
+    /// W2-5：自动 compact 生效阈值（0 = 关闭；v1.19 起为比例档计算结果）。
     pub auto_compact_threshold_tokens: u64,
+    /// v1.20 窗口自学习：比例档窗口原料（config `model_context_window_tokens`；
+    /// 0 = 绝对值档）。运行期可被 ACP 学习值覆盖（见 Dispatcher 字段注释）。
+    pub auto_compact_window_tokens: u64,
+    /// v1.20：比例档比例（config `auto_compact_window_ratio`）。
+    pub auto_compact_window_ratio: f64,
     /// W4-1：per-sender 成本上限（美元，滚动 24h；None = 不限）。
     pub sender_daily_cost_limit_usd: Option<f64>,
 }
@@ -92,6 +96,8 @@ impl TaskBudgets {
             batch_window: Duration::from_millis(c.batch_window_ms),
             // v1.18：生效阈值（比例档窗口×比例优先，见 Config 文档）。
             auto_compact_threshold_tokens: c.effective_auto_compact_threshold(),
+            auto_compact_window_tokens: c.model_context_window_tokens,
+            auto_compact_window_ratio: c.auto_compact_window_ratio,
             sender_daily_cost_limit_usd: c.sender_daily_cost_limit_usd,
         }
     }
@@ -475,6 +481,13 @@ pub struct Dispatcher {
     /// W2-5：自动 compact 阈值（tokens；0 = 关闭）。config 注入。
     /// v1.18：AtomicU64——SIGHUP 热改（此前启动快照，改 config 须重启）。
     auto_compact_threshold: std::sync::atomic::AtomicU64,
+    /// v1.20 窗口自学习：比例档当前窗口（初始 = config，ACP `UsageUpdate.size`
+    /// 学习后覆盖——仅比例档激活时生效；绝对值档/关闭尊重显式配置）。
+    auto_compact_window: std::sync::atomic::AtomicU64,
+    /// v1.20：比例档比例（与窗口配套重算；SIGHUP 热改故 RwLock）。
+    auto_compact_ratio: parking_lot::RwLock<f64>,
+    /// v1.20：绝对值档阈值（窗口=0 时生效；学习不覆盖显式绝对值档）。
+    auto_compact_absolute: parking_lot::RwLock<u64>,
     /// W4-1：per-sender 成本上限（美元，滚动 24h；None = 不限）。config 注入。
     sender_cost_limit: Option<f64>,
     /// 工具过程（COT）展示档位（P4-6）：`/config cot_detail` 可热改。
@@ -616,6 +629,17 @@ impl Dispatcher {
             auto_compact_threshold: std::sync::atomic::AtomicU64::new(
                 budgets.auto_compact_threshold_tokens,
             ),
+            auto_compact_window: std::sync::atomic::AtomicU64::new(
+                budgets.auto_compact_window_tokens,
+            ),
+            auto_compact_ratio: parking_lot::RwLock::new(budgets.auto_compact_window_ratio),
+            auto_compact_absolute: parking_lot::RwLock::new(
+                if budgets.auto_compact_window_tokens > 0 {
+                    0
+                } else {
+                    budgets.auto_compact_threshold_tokens
+                },
+            ),
             sender_cost_limit: budgets.sender_daily_cost_limit_usd,
             cot_detail: Arc::new(RwLock::new(cot_detail)),
             started_at: Instant::now(),
@@ -724,11 +748,47 @@ impl Dispatcher {
     }
 
     /// SIGHUP 热重载：整体替换 allowed_tools。
-    /// v1.18：自动压缩阈值热改（SIGHUP）——此前为启动快照，改 config 须重启。
-    /// 生效阈值的计算（比例档优先）在 Config 侧完成，此处只接收结果。
-    pub fn reload_auto_compact_threshold(&self, threshold: u64) {
+    /// v1.18：自动压缩预算热改（SIGHUP）——此前为启动快照，改 config 须重启。
+    /// v1.20：从「只收阈值」升级为收三原料（窗口/比例/绝对值），重置窗口
+    /// 回 config 值（ACP 学习值随之重新校准）并重算生效阈值。
+    pub fn reload_auto_compact_budget(&self, window: u64, ratio: f64, absolute: u64) {
+        self.auto_compact_window
+            .store(window, std::sync::atomic::Ordering::Relaxed);
+        *self.auto_compact_ratio.write() = ratio;
+        *self.auto_compact_absolute.write() = absolute;
+        let effective = if window > 0 {
+            (window as f64 * ratio) as u64
+        } else {
+            absolute
+        };
         self.auto_compact_threshold
-            .store(threshold, std::sync::atomic::Ordering::Relaxed);
+            .store(effective, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// v1.20 窗口自学习：ACP `UsageUpdate.size` 报告的真实模型窗口（每轮经
+    /// RunOutcome.usage.context_window 上抛）。仅**比例档激活**（初始窗口>0）
+    /// 时覆盖——绝对值档/关闭是用户显式选择，不自动改写。窗口变化即重算
+    /// 阈值 = 窗口 × 比例；200k 模型部署从此不再依赖手配窗口。
+    pub fn note_learned_context_window(&self, window: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if window == 0 {
+            return;
+        }
+        let cur = self.auto_compact_window.load(Relaxed);
+        if cur == 0 || window == cur {
+            return; // 绝对值/关闭档：尊重显式配置；窗口未变：no-op
+        }
+        let threshold = (window as f64 * *self.auto_compact_ratio.read()) as u64;
+        self.auto_compact_window.store(window, Relaxed);
+        self.auto_compact_threshold.store(threshold, Relaxed);
+        info!(
+            target: "imagent::core",
+            learned_window = window,
+            ratio = *self.auto_compact_ratio.read(),
+            threshold,
+            prev_window = cur,
+            "ACP 窗口自学习：自动压缩阈值按真实模型窗口重算"
+        );
     }
 
     pub fn reload_tools(&self, tools: Vec<String>) {

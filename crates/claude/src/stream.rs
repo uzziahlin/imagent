@@ -169,6 +169,9 @@ fn extract_usage(value: &Value) -> Option<UsageStats> {
         output_tokens: output.unwrap_or(0),
         cached_tokens: cached,
         total_cost_usd: cost,
+        // claude CLI 的 usage 不回传窗口（v1.20 ACP 路径经 UsageUpdate.size
+        // 自动学习）。
+        context_window: None,
     })
 }
 
@@ -323,6 +326,7 @@ mod tests {
                     output_tokens: 4,
                     cached_tokens: Some(120),
                     total_cost_usd: Some(0.001),
+                    context_window: None,
                 }),
             }
         );

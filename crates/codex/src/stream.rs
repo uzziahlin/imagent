@@ -183,6 +183,8 @@ fn extract_usage(value: &Value) -> Option<UsageStats> {
         output_tokens: output.unwrap_or(0),
         cached_tokens: num("cached_input_tokens"),
         total_cost_usd: u.get("total_cost_usd").and_then(Value::as_f64),
+        // codex/gemini CLI 不回传窗口（v1.20 窗口自学习仅 ACP 路径）。
+        context_window: None,
     })
 }
 
@@ -242,6 +244,7 @@ mod tests {
                     output_tokens: 2,
                     cached_tokens: Some(7),
                     total_cost_usd: None,
+                    context_window: None,
                 }),
             }
         );

@@ -1495,9 +1495,17 @@ fn spawn_sighup_handler(
                     dispatcher.auth().reload_chats(chats);
                     dispatcher.reload_tools(cfg.allowed_tools.clone());
                     dispatcher.set_approval_tools(cfg.approval_tools.clone());
-                    // v1.18：自动压缩阈值热改（比例档窗口×比例的计算在 Config 侧）。
-                    dispatcher
-                        .reload_auto_compact_threshold(cfg.effective_auto_compact_threshold());
+                    // v1.18/v1.20：自动压缩预算热改（窗口重置回 config 值，
+                    // ACP 学习值在下一轮重新校准）。
+                    dispatcher.reload_auto_compact_budget(
+                        cfg.model_context_window_tokens,
+                        cfg.auto_compact_window_ratio,
+                        if cfg.model_context_window_tokens > 0 {
+                            0
+                        } else {
+                            cfg.auto_compact_threshold_tokens
+                        },
+                    );
                     // v1.18 review（agent-2 #4）：admin 名单热改（config 种子 ∪
                     // store 动态条目，与启动并集口径一致）——授权类配置静默不
                     // 生效最伤运维（移除的管理员保留权限到重启）。

@@ -902,6 +902,16 @@ impl Dispatcher {
         // 压缩阈值距离双双失真。落 per-conv KV，失败仅 log。
         let ctx_tokens =
             |u: &crate::types::UsageStats| u.input_tokens + u.cached_tokens.unwrap_or(0);
+        // v1.20 窗口自学习：ACP 报告的模型窗口（UsageUpdate.size）上抛校准
+        // 比例档（见 note_learned_context_window；CLI 路径恒 None，no-op）。
+        if let Some(w) = outcome
+            .usage
+            .as_ref()
+            .and_then(|u| u.context_window)
+            .filter(|w| *w > 0)
+        {
+            self.note_learned_context_window(w);
+        }
         if let Some(tokens) = outcome.usage.as_ref().map(ctx_tokens) {
             if let Err(e) = self
                 .store
