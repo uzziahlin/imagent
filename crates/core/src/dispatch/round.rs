@@ -23,7 +23,7 @@ impl Dispatcher {
         // v1.20 崩溃轮次恢复：正常收尾（成功/失败/中断都经此）清除 inflight。
         let _ = self
             .store
-            .delete_config(&format!("inflight_prompt:{}", conv_key))
+            .delete_config(&format!("inflight_prompt:{conv_key}"))
             .await;
         tokens
     }
