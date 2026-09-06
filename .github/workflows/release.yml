@@ -16,7 +16,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install libdbus-1-dev (Linux keyring backend)
         run: |
           sudo systemctl stop unattended-upgrades.service || true
@@ -46,7 +46,7 @@ jobs:
           # - { os: windows-latest, target: x86_64-pc-windows-msvc, artifact: imagent-windows-x86_64.exe }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install libdbus-1-dev (Linux keyring backend：keyring sync-secret-service 经 libdbus-sys)
         if: matrix.os == 'ubuntu-latest'
         run: |
