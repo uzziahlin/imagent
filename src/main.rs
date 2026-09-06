@@ -1362,6 +1362,7 @@ async fn webhook_handler(
         control: None,
         reply_hint: imagent_core::ReplyHint::None,
     };
+    tracing::info!(target: "imagent::ops", conv = %conv, name = %name, "webhook 命中，注入 dispatcher");
     st.dispatcher.inject(msg).await;
     (StatusCode::ACCEPTED, "queued\n")
 }
