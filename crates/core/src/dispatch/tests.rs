@@ -635,6 +635,7 @@ fn test_budgets() -> TaskBudgets {
         auto_compact_threshold_tokens: 0,
         auto_compact_window_tokens: 0,
         auto_compact_window_ratio: 0.8,
+        cron_catchup: crate::config::CronCatchup::One,
         sender_daily_cost_limit_usd: None,
     }
 }
@@ -3502,6 +3503,7 @@ async fn stop_on_text_platform_marks_interrupted() {
             auto_compact_threshold_tokens: 0,
             auto_compact_window_tokens: 0,
             auto_compact_window_ratio: 0.8,
+            cron_catchup: crate::config::CronCatchup::One,
             sender_daily_cost_limit_usd: None,
             agent_timeout: Duration::ZERO,
             permission_ask_timeout: Duration::from_secs(5),
@@ -4538,6 +4540,80 @@ async fn stats_includes_approval_group() {
     drop_db(ctx.db).await;
 }
 
+/// v1.20 /cron 停机补跑：all 策略下错过多周期逐条补跑（标注 i/n，上限 3）；
+/// off 策略下陈旧到期只重排不触发。
+#[tokio::test]
+async fn cron_catchup_all_backfills_and_off_skips_stale() {
+    let _serial = SERIAL.lock().await;
+    // —— all：错过 3 个周期的每分钟任务 → 补 3 条 ——
+    let budgets = TaskBudgets {
+        cron_catchup: crate::config::CronCatchup::All,
+        ..test_budgets()
+    };
+    let ctx = build_slow(Auth::new(vec!["alice".into()]), 0, budgets).await;
+    ctx.disp
+        .handle(msg("c1", "alice", "/cron add * * * * * 报数"))
+        .await;
+    let jobs = ctx.check().await.list_cron_jobs().await.unwrap();
+    let j = &jobs[0];
+    // 模拟停机错过：把 next_run 拨回 4 分钟前。
+    ctx.check()
+        .await
+        .bump_cron_job(&j.id, 0, crate::dispatch::now_secs() - 240)
+        .await
+        .unwrap();
+    ctx.disp.fire_due_cron_jobs().await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut count: u32;
+    loop {
+        // 批处理会把同 conv 的补跑消息合并为一轮 prompt——按「补跑」标记
+        // 出现次数计（而非消息条数）。
+        count = ctx
+            .prompts
+            .lock()
+            .await
+            .iter()
+            .map(|p| p.matches("补跑").count() as u32)
+            .sum();
+        if count >= 3 || std::time::Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        count,
+        3,
+        "all 应补跑 3 条（上限）: {:?}",
+        ctx.prompts.lock().await
+    );
+    drop_db(ctx.db).await;
+
+    // —— off：陈旧到期跳过 ——
+    let budgets = TaskBudgets {
+        cron_catchup: crate::config::CronCatchup::Off,
+        ..test_budgets()
+    };
+    let ctx = build_slow(Auth::new(vec!["alice".into()]), 0, budgets).await;
+    ctx.disp
+        .handle(msg("c1", "alice", "/cron add * * * * * 报数"))
+        .await;
+    let jobs = ctx.check().await.list_cron_jobs().await.unwrap();
+    let j = &jobs[0];
+    ctx.check()
+        .await
+        .bump_cron_job(&j.id, 0, crate::dispatch::now_secs() - 240)
+        .await
+        .unwrap();
+    ctx.disp.fire_due_cron_jobs().await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !ctx.prompts.lock().await.iter().any(|p| p.contains("报数")),
+        "off 陈旧到期不应触发: {:?}",
+        ctx.prompts.lock().await
+    );
+    drop_db(ctx.db).await;
+}
+
 /// v1.18 /cron 全链路：add 校验与落库 → list → 到期驱动 fire_due（合成消息走
 /// handle，MockBackend 收到注入前缀 prompt，store 重排）→ rm。
 /// v1.20 崩溃轮次恢复：inflight 残留 → 转 last_prompt（/retry 数据源）+
@@ -4602,6 +4678,7 @@ async fn learned_context_window_recalibrates_threshold() {
             auto_compact_threshold_tokens: 800_000,
             auto_compact_window_tokens: 1_000_000,
             auto_compact_window_ratio: 0.8,
+            cron_catchup: crate::config::CronCatchup::One,
             sender_daily_cost_limit_usd: None,
             agent_timeout: Duration::ZERO,
             permission_ask_timeout: Duration::from_secs(5),

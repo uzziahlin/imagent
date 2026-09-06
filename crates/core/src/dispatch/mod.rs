@@ -80,6 +80,8 @@ pub struct TaskBudgets {
     pub auto_compact_window_tokens: u64,
     /// v1.20：比例档比例（config `auto_compact_window_ratio`）。
     pub auto_compact_window_ratio: f64,
+    /// v1.20：/cron 停机补跑策略（config `cron_catchup`；改动需重启）。
+    pub cron_catchup: crate::config::CronCatchup,
     /// W4-1：per-sender 成本上限（美元，滚动 24h；None = 不限）。
     pub sender_daily_cost_limit_usd: Option<f64>,
 }
@@ -98,6 +100,7 @@ impl TaskBudgets {
             auto_compact_threshold_tokens: c.effective_auto_compact_threshold(),
             auto_compact_window_tokens: c.model_context_window_tokens,
             auto_compact_window_ratio: c.auto_compact_window_ratio,
+            cron_catchup: c.cron_catchup,
             sender_daily_cost_limit_usd: c.sender_daily_cost_limit_usd,
         }
     }
@@ -488,6 +491,8 @@ pub struct Dispatcher {
     auto_compact_ratio: parking_lot::RwLock<f64>,
     /// v1.20：绝对值档阈值（窗口=0 时生效；学习不覆盖显式绝对值档）。
     auto_compact_absolute: parking_lot::RwLock<u64>,
+    /// v1.20：/cron 停机补跑策略（Copy 值，启动注入；改动重启生效）。
+    pub(crate) cron_catchup: crate::config::CronCatchup,
     /// W4-1：per-sender 成本上限（美元，滚动 24h；None = 不限）。config 注入。
     sender_cost_limit: Option<f64>,
     /// 工具过程（COT）展示档位（P4-6）：`/config cot_detail` 可热改。
@@ -632,6 +637,7 @@ impl Dispatcher {
             auto_compact_window: std::sync::atomic::AtomicU64::new(
                 budgets.auto_compact_window_tokens,
             ),
+            cron_catchup: budgets.cron_catchup,
             auto_compact_ratio: parking_lot::RwLock::new(budgets.auto_compact_window_ratio),
             auto_compact_absolute: parking_lot::RwLock::new(
                 if budgets.auto_compact_window_tokens > 0 {
