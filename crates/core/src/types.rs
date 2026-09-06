@@ -233,6 +233,10 @@ pub struct UsageStats {
     pub cached_tokens: Option<u64>,
     /// 本次 run 的美元成本（仅 claude 提供；缺失为 None）。
     pub total_cost_usd: Option<f64>,
+    /// 模型上下文窗口大小（tokens；v1.20：ACP `UsageUpdate.size` 自动学习，
+    /// 用于自动压缩比例档的窗口校准——200k 模型部署不再依赖手配。CLI 路径
+    /// usage 不回传窗口，恒 None）。
+    pub context_window: Option<u64>,
 }
 
 impl UsageStats {
@@ -244,6 +248,7 @@ impl UsageStats {
             output_tokens: self.output_tokens + later.output_tokens,
             cached_tokens: later.cached_tokens.or(self.cached_tokens),
             total_cost_usd: later.total_cost_usd.or(self.total_cost_usd),
+            context_window: later.context_window.or(self.context_window),
         }
     }
 
@@ -391,6 +396,7 @@ mod tests {
             output_tokens: output,
             cached_tokens: cached,
             total_cost_usd: cost,
+            context_window: None,
         }
     }
 

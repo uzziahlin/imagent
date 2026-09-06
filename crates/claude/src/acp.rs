@@ -1015,6 +1015,10 @@ async fn forward_update(state: &StreamState, update: SessionUpdate) {
                     output_tokens: 0,
                     cached_tokens: None,
                     total_cost_usd: cost,
+                    // v1.20 窗口自学习：ACP `UsageUpdate.size` = 模型上下文
+                    // 窗口——经 RunOutcome 上抛 dispatcher 校准自动压缩比例档
+                    //（200k 模型部署不再依赖手配 model_context_window_tokens）。
+                    context_window: (u.size > 0).then_some(u.size),
                 });
             }
             None
@@ -1225,6 +1229,7 @@ mod tests {
             output_tokens: 0,
             cached_tokens: None,
             total_cost_usd: Some(cost),
+            context_window: None,
         };
         // 首轮：无基线 → 整段（新会话语义正确）。
         assert_eq!(
@@ -1337,6 +1342,8 @@ mod tests {
         assert_eq!(out1.session_id.0, "cost-s1");
         let c1 = out1.usage.expect("轮 1 应带 usage").total_cost_usd;
         assert!((c1.unwrap() - 0.10).abs() < 1e-9, "轮1={c1:?}");
+        // v1.20 窗口自学习：UsageUpdate.size 透传到 RunOutcome.usage。
+        assert_eq!(out1.usage.unwrap().context_window, Some(1000));
 
         // 轮 2：同连接（缓存命中免 LoadSession）→ 基线差 0.35 - 0.10 = 0.25。
         let (tx2, _rx2) = tokio::sync::mpsc::channel::<AgentChunk>(64);
