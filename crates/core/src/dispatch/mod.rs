@@ -1013,6 +1013,17 @@ impl Dispatcher {
     /// 主循环。循环 `platform.recv()`，每条消息 `tokio::spawn` 处理（不阻塞 recv）。
     /// recv 返回 Err 时：session 过期 → 优雅停止（返回 Err 让 main 提示重新 login）；
     /// 其它错误 → 指数退避后继续重试（防 client 异常退出导致 dispatcher 忙循环刷屏；ilink 长轮询层另有退避），不 panic。
+    /// v1.20 webhook 入站：外部事件（CI/告警，main 的 HTTP server 调用）注入。
+    /// 与 cron 触发同款：spawn 进 tasks（drain 覆盖）+ 走 handle() 完整管线
+    ///（鉴权/审批/批处理与手打消息完全同权——注入消息的 conv 须在会话
+    /// 白名单，无旁路）。
+    pub async fn inject(self: &Arc<Self>, msg: InboundMessage) {
+        let this = self.clone();
+        self.tasks.lock().await.spawn(async move {
+            this.handle(msg).await;
+        });
+    }
+
     pub async fn run(self: Arc<Self>) -> Result<()> {
         // B3：能力矩阵一行（启动日志，审计/排障用）。
         let cap = self.backend.permission_capability();

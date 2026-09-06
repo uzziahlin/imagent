@@ -14,9 +14,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{anyhow, Result};
-use axum::extract::State;
+use axum::body::Bytes;
+use axum::extract::rejection::BytesRejection;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
-use axum::{routing::get, Json, Router};
+use axum::response::IntoResponse;
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use tracing_subscriber::EnvFilter;
@@ -732,6 +736,31 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // 9.5 v1.20 webhook 入站：事件 → 会话（须 [[webhook]] 条目 + 会话白名单）。
+            if let Some(addr) = config
+                .webhook_addr
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                match addr.parse::<SocketAddr>() {
+                    Ok(socket) => {
+                        if config.webhooks.is_empty() {
+                            tracing::warn!(target: "imagent::ops", "webhook_addr 已配置但 [[webhook]] 表为空，webhook server 未启动");
+                        } else {
+                            spawn_webhook_server(
+                                socket,
+                                config.webhooks.clone(),
+                                dispatcher.clone(),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "imagent::ops", addr = addr, error = %e, "webhook_addr 解析失败，webhook server 未启动");
+                    }
+                }
+            }
+
             // 10. SIGHUP 热重载（白名单 / allowed_tools / permission_mode / 模型与运行参数）。
             #[cfg(unix)]
             spawn_sighup_handler(
@@ -1211,6 +1240,20 @@ fn validate_metrics_bind(socket: SocketAddr, token: Option<&str>) -> Result<(), 
 /// S7：Bearer 鉴权判定（纯函数，便于单测）。`token` 为 None 表示未启用
 /// 鉴权（loopback 部署），一律放行；Some 时要求 Authorization 头精确等于
 /// `Bearer <token>`（前缀多余字符不匹配）。恒定时间比较（L14，见函数体）。
+/// v1.20 webhook：body → 注入文本（JSON text 字段优先 / 纯文本兜底 / 空拒绝）。
+#[test]
+fn webhook_body_text_variants() {
+    assert_eq!(
+        webhook_body_text(br#"{"text":"deploy failed","run":42}"#),
+        Some("deploy failed".into())
+    );
+    assert_eq!(webhook_body_text(b"  raw text  "), Some("raw text".into()));
+    assert_eq!(webhook_body_text(b""), None);
+    assert_eq!(webhook_body_text(b"   "), None);
+    // JSON 无 text 字段 → 整包作为文本（lossy 容忍）。
+    assert!(webhook_body_text(br#"{"other":1}"#).is_some());
+}
+
 fn bearer_authorized(headers: &axum::http::HeaderMap, token: Option<&str>) -> bool {
     let Some(expected) = token else {
         return true;
@@ -1235,6 +1278,94 @@ fn bearer_authorized(headers: &axum::http::HeaderMap, token: Option<&str>) -> bo
 }
 
 /// 起 HTTP server（/metrics + /health），独立 tokio task。失败仅 warn。
+/// v1.20 webhook 入站：`POST /hook/<token>` → 事件文本注入对应会话。
+/// 鉴权 = 路径 token 与 config [[webhook]] 精确匹配；body ≤64KB；
+/// JSON `{"text": "..."}` 取 text，否则整包作为纯文本。与 /cron 同走
+/// handle() 完整管线（会话白名单门内才有 agent，无旁路）。
+#[derive(Clone)]
+struct WebhookState {
+    /// token → (conv, name)
+    routes: std::collections::HashMap<String, (String, String)>,
+    dispatcher: Arc<imagent_core::Dispatcher>,
+}
+
+fn spawn_webhook_server(
+    socket: SocketAddr,
+    entries: Vec<imagent_core::WebhookEntry>,
+    dispatcher: Arc<imagent_core::Dispatcher>,
+) {
+    let routes = entries
+        .into_iter()
+        .map(|e| (e.token, (e.conv, e.name)))
+        .collect();
+    let state = WebhookState { routes, dispatcher };
+    let app = Router::new()
+        .route("/hook/:token", post(webhook_handler))
+        .layer(DefaultBodyLimit::max(64 * 1024))
+        .with_state(state);
+    tokio::spawn(async move {
+        let listener = match tokio::net::TcpListener::bind(socket).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(target: "imagent::ops", addr = %socket, error = %e, "bind webhook addr 失败（webhook 入站不可用）");
+                return;
+            }
+        };
+        tracing::info!(target: "imagent::ops", addr = %socket, "webhook 入站 listening（POST /hook/<token>）");
+        if let Err(e) = axum::serve(listener, app).await {
+            tracing::warn!(target: "imagent::ops", addr = %socket, error = %e, "webhook HTTP server 退出");
+        }
+    });
+}
+
+/// body → 注入文本：JSON 带 text 字段取之；否则整包 UTF-8 文本；空/非 UTF-8 拒。
+fn webhook_body_text(body: &[u8]) -> Option<String> {
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+        if let Some(t) = v.get("text").and_then(|t| t.as_str()) {
+            let t = t.trim();
+            if t.is_empty() {
+                return None;
+            }
+            return Some(t.to_string());
+        }
+    }
+    let s = String::from_utf8_lossy(body);
+    let s = s.trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+async fn webhook_handler(
+    State(st): State<WebhookState>,
+    axum::extract::Path(token): axum::extract::Path<String>,
+    body: Result<Bytes, BytesRejection>,
+) -> impl IntoResponse {
+    let Some((conv, name)) = st.routes.get(&token) else {
+        return (StatusCode::NOT_FOUND, "unknown token\n");
+    };
+    let Ok(bytes) = body else {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "body too large (64KB)\n");
+    };
+    let Some(text) = webhook_body_text(&bytes) else {
+        return (StatusCode::BAD_REQUEST, "empty or undecodable body\n");
+    };
+    let msg = imagent_core::InboundMessage {
+        conv_id: imagent_core::ConvId(conv.clone()),
+        sender: imagent_core::UserId(format!("webhook:{name}")),
+        text: Some(format!("【{name}】{text}")),
+        media: vec![],
+        media_errors: Vec::new(),
+        mentions: Vec::new(),
+        mentioned_bot: false,
+        ask_req: None,
+        reply_to: None,
+        source_msg_id: None,
+        control: None,
+        reply_hint: imagent_core::ReplyHint::None,
+    };
+    st.dispatcher.inject(msg).await;
+    (StatusCode::ACCEPTED, "queued\n")
+}
+
 fn spawn_metrics_server(
     addr: SocketAddr,
     store: imagent_store::Store,
