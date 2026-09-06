@@ -2,6 +2,52 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.19.0] — 2026-09-06
+
+> **深度 review 双批修复（30 + 12 项）+ intake 结构性解耦 + 排队消息持久化
+> + 两项大重构（update_card 状态机化 / ConvState 收敛）+ 自动压缩比例档**。
+> 真机冒烟 A1-A6 通过（流式卡/审批/下沉/超长补发/GC/重连）；store 线性迁移
+> v12；全仓 664 tests / 0 failed、clippy 零警告。复审记录见
+> `docs/CODE_REVIEW_v10.md`（含功能挖掘路线图）。
+
+### Added
+- **自动压缩比例档**：`model_context_window_tokens`（缺省 1M）×
+  `auto_compact_window_ratio`（缺省 0.8）——水位达模型窗口 80% 才压缩，
+  替代按 200k 窗口校准的 120k 绝对默认（大窗模型过早压缩丢细节）；
+  阈值 SIGHUP 热改；`/status` 水位百分比随生效阈值动态。
+- **排队消息持久化**（store v12 `queued_messages`）：入队先落行、取批/撤回/
+  `/queue drop`/`/stop all` 按 rowid 精确删行、崩溃重启经 handle() 重放——
+  批处理 + steering 队列不再无声丢失；`/cron list` 显示已停用任务；cron
+  表达式无解自动停用时通知会话。
+- **housekeeping 后台巡检**（24h）：媒体目录 7 天 GC + per-conv 状态表
+  选择性上限驱逐（评论会话/挂起审批豁免）。
+
+### Changed
+- **事件 intake 与媒体 IO 解耦**（feishu）：媒体下载/语音转写/合并转发拉取
+  spawn 出 drain 串行循环，per-conv 顺序泵保序——单 conv 慢媒体不再阻塞其它
+  会话的消息与审批回调。
+- **update_card 状态机化**：四层自愈收敛为显式 `PatchOutcome` 管线
+  （Delivered/HandleLost/Minimized/Failed），300317 序列重置改 CAS。
+- **ConvState 收敛**：9 张 per-conv 表（发起者/评论锚/回复锚/最近入站/话题
+  活跃/卡片尾巴/审批 note/复用槽/下沉标记）合为单表单结构，锁纪律与淘汰
+  只做一次。
+- **agent 子进程策略统一**：CLI/ACP env 白名单与值校验单一事实来源
+  （`core::agent_process`）。
+- **ACP cost 基线提升 backend 级**（空闲回收不丢，per-sender 预算不误拒）；
+  幽灵会话预检降级 NewSession；连接错误不再吞（真实原因入错误消息）。
+
+### Fixed
+- v9 遗留全清（R1-R15）：终态最小卡不吞错（触发纯文本补发）、热切 deny 后
+  审批卡不可绕、淘汰哨兵三路径收敛、`escape_lt` 跳过代码块、JSON 形态
+  ACP 命令等。
+- /stop 双竞态（启动空窗水位复查 + 收尾期三态回执）、引用回复不再劫持审批、
+  看门狗豁免预算化、事件去重 24h 窗（防断连重投重复跑 agent）、飞书
+  token single-flight、媒体下载/ffmpeg/上传超时与上限、`switch_named_session`
+  丢 task_todos 列、cron DST 漏跑、dispatcher 异常退出码非 0（systemd
+  `Restart=on-failure` 生效）、service 单元 0600 + 安装失败不谎报、SIGHUP
+  热载 admin_senders、SIGTERM 二次强退等——完整清单见
+  `docs/CODE_REVIEW_v10.md` §一。
+
 ## [1.18.0] — 2026-09-03
 
 > **/cron 定时任务（头牌）+ 群媒体回复即定向 + 转向回执上卡**。全仓 653
