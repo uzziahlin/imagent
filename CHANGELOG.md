@@ -2,6 +2,20 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.19.1] — 2026-09-06
+
+> **README 全量重写**（对齐 v1.19 现状）。无代码变更；二进制与 v1.19.0
+> 行为一致，仅随版本号重编。
+
+### Changed
+- **README 重写**：特性清单补齐 /cron、排队持久化（崩溃不丢）、自动压缩
+  比例档（窗口 80%）、群媒体回复即定向、/queue 与 /cron 命令表、
+  「始终允许」会话级 allow-set、超长输出补发语义；配置示例新增用量护栏
+  三键（含 200k 模型显式声明提示）；路线表从 v1.0.0 时代更新至 v1.19
+  （v1.8-v1.10 四轮 review / v1.18 / v1.19 各阶段）；service 章节标注
+  v1.19.0 起的 0600/退出码/诚实报错改进；文档索引指向 ARCHITECTURE /
+  FEISHU_DESIGN / CODE_REVIEW_v10。
+
 ## [1.19.0] — 2026-09-06
 
 > **深度 review 双批修复（30 + 12 项）+ intake 结构性解耦 + 排队消息持久化
