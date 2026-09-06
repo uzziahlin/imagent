@@ -1134,6 +1134,8 @@ impl Dispatcher {
         // v1.18 迭代（排队持久化）：重放崩溃前持久化的排队消息——先清行再
         // handle（重放消息重走 enqueue 会写新行，防双份；经完整鉴权/去重管线）。
         self.replay_persisted_queue().await;
+        // v1.20：崩溃轮次恢复（inflight 残留 → /retry + 会话通知）。
+        self.recover_crashed_rounds().await;
 
         // v1.18 /cron：定时任务调度器——30s tick 查询到期任务，合成消息走正常
         // handle 管线（白名单/会话域/审批链与手打消息完全同权）。触发前先重排
@@ -1659,6 +1661,43 @@ impl Dispatcher {
             }
         }
         Some(batch.into_iter().map(|q| q.msg).collect::<Vec<_>>())
+    }
+
+    /// v1.20 崩溃轮次恢复：启动时扫描 `inflight_prompt:*` 残留（轮首落库、
+    /// 正常收尾清除——残留 = 上次进程在轮次执行中死亡：崩溃 / kill -9 / 断电）。
+    /// 处置：转存为 `last_prompt:`（复用 /retry 完整机制：失败卡快捷按钮与
+    /// /retry 命令都读它）+ 通知会话可一键续跑。
+    async fn recover_crashed_rounds(self: &Arc<Self>) {
+        let rows = match self.store.list_config("inflight_prompt:").await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(target: "imagent::core", error = %e, "崩溃轮次标记扫描失败（跳过恢复）");
+                return;
+            }
+        };
+        for (key, payload) in rows {
+            let Some(conv) = key.strip_prefix("inflight_prompt:") else {
+                continue;
+            };
+            info!(target: "imagent::core", conv_id = conv, "检测到崩溃前未完成的轮次，转入 /retry 可恢复");
+            // 转存 last_prompt（/retry 数据源；解析失败也照存原文本，尽力保留）。
+            let prompt_text = serde_json::from_str::<serde_json::Value>(&payload)
+                .ok()
+                .and_then(|v| v.get("prompt").and_then(|p| p.as_str()).map(str::to_string))
+                .unwrap_or(payload.clone());
+            let last_payload = serde_json::json!({ "prompt": prompt_text, "at": now_secs() });
+            let _ = self
+                .store
+                .set_config(&format!("last_prompt:{conv}"), &last_payload.to_string())
+                .await;
+            let _ = self.store.delete_config(&key).await;
+            self.reply(
+                &ConvId(conv.to_string()),
+                "⚠️ 进程上次在任务执行中退出，该轮未完成。发 /retry 可续跑上一轮指令。",
+                &ReplyHint::None,
+            )
+            .await;
+        }
     }
 
     /// v1.18 迭代（排队持久化）：启动时重放崩溃前落库的排队消息。语义：
