@@ -385,29 +385,64 @@ impl Dispatcher {
                 warn!(target: "imagent::core", error = %e, id = %job.id, "定时任务重排失败（跳过本次触发）");
                 continue;
             }
-            info!(target: "imagent::core", id = %job.id, conv_id = %job.conv, "定时任务触发");
-            let msg = InboundMessage {
-                conv_id: ConvId(job.conv.clone()),
-                sender: UserId(job.sender.clone()),
-                text: Some(format!("⏰ 定时任务触发，请执行：{}", job.prompt)),
-                media: vec![],
-                media_errors: Vec::new(),
-                mentions: Vec::new(),
-                mentioned_bot: false,
-                ask_req: None,
-                reply_to: None,
-                source_msg_id: None,
-                control: None,
-                reply_hint: ReplyHint::None,
+            // v1.20 停机补跑：数出旧 next_run 之后到 now 之间错过的额外周期数
+            //（本到期槽自身算 1）。off：陈旧（错过 ≥2 槽）只重排不触发；all：
+            // 逐槽补跑，上限 3 条（防雪崩），消息标注 (i/n)；one（缺省）：现状
+            // 只触发一次。
+            let extra_missed = CronSpec::parse(&job.expr)
+                .map(|s| {
+                    let mut t = job.next_run;
+                    let mut n = 0u32;
+                    while let Some(next_t) = s.next_after(t) {
+                        if next_t > now || n >= 3 {
+                            break;
+                        }
+                        t = next_t;
+                        n += 1;
+                    }
+                    n
+                })
+                .unwrap_or(0);
+            let fires: u32 = match self.cron_catchup {
+                crate::config::CronCatchup::One => 1,
+                crate::config::CronCatchup::Off => {
+                    if extra_missed >= 1 {
+                        info!(target: "imagent::core", id = %job.id, extra_missed, "陈旧到期按 off 策略跳过（仅重排）");
+                        continue;
+                    }
+                    1
+                }
+                crate::config::CronCatchup::All => (1 + extra_missed).min(3),
             };
-            // 调度器只分发不执行：handle 对空闲 conv 会内联跑完整轮 agent（分钟
-            // 级），若在 tick 循环里 await 会（a）队头阻塞所有 conv 的其它 cron
-            // 任务、（b）select 饿死收不到 shutdown。与 recv 循环同款：spawn 进
-            // tasks，drain（P1-5）一并覆盖 cron 驱动的轮次。
-            let this = self.clone();
-            self.tasks.lock().await.spawn(async move {
-                this.handle(msg).await;
-            });
+            info!(target: "imagent::core", id = %job.id, conv_id = %job.conv, fires, "定时任务触发");
+            for i in 1..=fires {
+                let tag = if fires > 1 {
+                    format!("（补跑 {i}/{fires}）")
+                } else {
+                    String::new()
+                };
+                let msg = InboundMessage {
+                    conv_id: ConvId(job.conv.clone()),
+                    sender: UserId(job.sender.clone()),
+                    text: Some(format!("⏰ 定时任务触发{tag}，请执行：{}", job.prompt)),
+                    media: vec![],
+                    media_errors: Vec::new(),
+                    mentions: Vec::new(),
+                    mentioned_bot: false,
+                    ask_req: None,
+                    reply_to: None,
+                    source_msg_id: None,
+                    control: None,
+                    reply_hint: ReplyHint::None,
+                };
+                // 调度器只分发不执行：handle 对空闲 conv 会内联跑完整轮 agent
+                //（分钟级），tick 循环里 await 会队头阻塞 + 饿死 shutdown。与
+                // recv 循环同款：spawn 进 tasks（drain 覆盖）。
+                let this = self.clone();
+                self.tasks.lock().await.spawn(async move {
+                    this.handle(msg).await;
+                });
+            }
         }
     }
 }

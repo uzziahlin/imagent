@@ -212,6 +212,38 @@ impl ReplyMode {
     }
 }
 
+/// v1.20 /cron 停机补跑策略（`cron_catchup`）：
+/// - `one`（默认，既有行为）：停机错过的到期只触发一次后顺延；
+/// - `off`：错过超过一个周期的陈旧到期直接跳过（只重排不执行）——防重启后
+///   旧任务突然全跑；
+/// - `all`：逐周期补跑，单次上限 3 条（防雪崩），消息标注 (i/n)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+pub enum CronCatchup {
+    #[default]
+    One,
+    Off,
+    All,
+}
+
+impl CronCatchup {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "one" => Some(Self::One),
+            "off" => Some(Self::Off),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::One => "one",
+            Self::Off => "off",
+            Self::All => "all",
+        }
+    }
+}
+
 /// v1.20 webhook 入站条目（见 [`Config::webhooks`]）。
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct WebhookEntry {
@@ -288,6 +320,9 @@ pub struct Config {
     /// 同权，无旁路。
     #[serde(default, rename = "webhook")]
     pub webhooks: Vec<WebhookEntry>,
+    /// v1.20：/cron 停机补跑策略（见 [`CronCatchup`]；缺省 one）。
+    #[serde(default)]
+    pub cron_catchup: CronCatchup,
     /// 出站消息单条字符上限（Unicode char 计）。超长则由各 Platform 的 `send_text`
     /// 在内部分片——**三平台生效**（ilink / feishu / wecom，各平台再与自身协议
     /// 硬上限取 min：飞书 28000、企微 4000 字节）。`None` = 不按此配置分片
