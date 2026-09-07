@@ -444,7 +444,13 @@ impl Dispatcher {
                         &hint,
                     )
                     .await;
-                    break;
+                    // v1.21 review（P1）：不能 break——take 已把 entry 留成空
+                    // Vec，正常退出靠下一轮 take 的「空 → 删 entry 返回 None」
+                    // 收尾；break 跳过该收尾后空 entry 悬挂，本 conv 所有后续
+                    // 消息只入队不取批（死队列直到 /stop all 或重启）。continue
+                    // 走完自然退出路径；/stop 之后新到的消息也不受影响（标记
+                    // 已消费，下一批照常执行）。
+                    continue;
                 }
             }
             // 表情锚（全部批次消息的平台 id，首条=轮次触发）：排队⏳的消息随批

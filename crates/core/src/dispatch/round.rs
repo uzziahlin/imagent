@@ -21,10 +21,20 @@ impl Dispatcher {
         // （conv 锁），key 移除无 ABA。
         self.running.lock().await.remove(&conv_key);
         // v1.20 崩溃轮次恢复：正常收尾（成功/失败/中断都经此）清除 inflight。
-        let _ = self
+        // v1.21 review：清除失败必须 warn——残留的 inflight 行会让下次启动把
+        // 已完成的轮次误判为崩溃并推 /retry（副作用类 prompt 有重复执行风险）。
+        if let Err(e) = self
             .store
             .delete_config(&format!("inflight_prompt:{conv_key}"))
-            .await;
+            .await
+        {
+            warn!(
+                target: "imagent::core",
+                conv_id = %conv_key,
+                error = %e,
+                "崩溃标记清除失败（下次启动可能误判崩溃轮并推 /retry）"
+            );
+        }
         tokens
     }
 

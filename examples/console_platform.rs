@@ -38,6 +38,7 @@ impl Platform for ConsolePlatform {
             reply_to: None,
             source_msg_id: None,
             control: None,
+            no_steer: false,
             reply_hint: ReplyHint::None,
         })
     }

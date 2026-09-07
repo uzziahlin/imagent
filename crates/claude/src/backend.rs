@@ -518,7 +518,16 @@ impl Backend for ClaudeBackend {
             chunks,
             NAME,
             // S-2：仅透传 claude 所需凭据/端点（最小授权）。
-            &["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"],
+            // v1.21：ANTHROPIC_AUTH_TOKEN（auth_token 登录形态）+ GH_TOKEN/
+            // GITHUB_TOKEN（/cron 拉 gh CLI 查 CI 等自动化场景——agent 需要它
+            // 才能跑 gh run list）。
+            &[
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_BASE_URL",
+                "ANTHROPIC_AUTH_TOKEN",
+                "GH_TOKEN",
+                "GITHUB_TOKEN",
+            ],
             control_io,
             // TaskList 预热：会话既有任务快照作累积器初值。
             initial_todos.to_vec(),

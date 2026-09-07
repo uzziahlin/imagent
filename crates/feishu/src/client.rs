@@ -29,7 +29,7 @@ use open_lark::{CoreConfig, RequestOption};
 use crate::proto::{MergedForwardItem, ReceiveIdKind};
 
 /// 平台名常量（错误构造用）。
-const PLATFORM: &str = "feishu";
+pub(crate) const PLATFORM: &str = "feishu";
 
 /// M1/M6（code-review v8）：模块级共享 reqwest client——此前 13 处裸
 /// `Client::new()` 每请求新建（流式卡 patch 每帧完整 TCP+TLS 握手、TIME_WAIT
@@ -99,18 +99,77 @@ impl FeishuWsClient {
 
     /// 主循环：重连外层 loop。`LarkWsClient::open` 阻塞运行会话，结束/断开才返回，
     /// 返回即按指数退避 sleep 后重连。
+    /// v1.21 review（无事件看门狗）：`open()` 静默黑洞（NAT 丢弃半开 TCP、SDK
+    /// 内部卡死）时既不返回错误也不触发断开——事件断流且永不重连，只能人工
+    /// /reconnect。加第三支：连续 WS_IDLE_WATCHDOG 无任何 payload 则强制丢弃
+    /// open future 重连（转发 task 负责更新活跃时刻）。
     pub async fn run(self, payload_tx: mpsc::UnboundedSender<Vec<u8>>) {
+        const WS_IDLE_WATCHDOG: Duration = Duration::from_secs(30 * 60);
+        // 转发 task：handler → 本 channel → 转发到真正的 payload_tx，顺带记录
+        // 活跃时刻（看门狗数据源）。事件路径多一跳内存传递，代价可忽略。
+        let (watch_tx, mut watch_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let last_event = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+        last_event.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        {
+            let last_event = last_event.clone();
+            let payload_tx = payload_tx.clone();
+            tokio::spawn(async move {
+                while let Some(buf) = watch_rx.recv().await {
+                    last_event.store(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    if payload_tx.send(buf).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
         let mut backoff = Duration::from_secs(1);
         loop {
             let handler = EventDispatcherHandler::builder()
-                .payload_sender(payload_tx.clone())
+                .payload_sender(watch_tx.clone())
                 .build();
             let opened_at = std::time::Instant::now();
+            let watchdog = {
+                let last_event = last_event.clone();
+                async move {
+                    loop {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        let idle =
+                            (now - last_event.load(std::sync::atomic::Ordering::Relaxed)).max(0);
+                        if idle >= WS_IDLE_WATCHDOG.as_secs() as i64 {
+                            return;
+                        }
+                        tokio::time::sleep(WS_IDLE_WATCHDOG - Duration::from_secs(idle as u64))
+                            .await;
+                    }
+                }
+            };
             tokio::select! {
                 res = LarkWsClient::open(self.ws_config.clone(), handler) => match res {
                     Ok(()) => {
-                        info!(target: "feishu", "长连接正常结束，重连");
-                        backoff = Duration::from_secs(1);
+                        // v1.21 review：Ok 分支同样要求健康存活时长才重置退避——
+                        // SDK 某些异常下「正常」快速返回（握手即优雅关闭）会让
+                        // 退避永不增长，形成 ~1s 间隔重连循环。
+                        if opened_at.elapsed() >= HEALTHY_CONN_MIN_LIFETIME {
+                            info!(target: "feishu", "长连接健康期后正常结束，重置退避重连");
+                            backoff = Duration::from_secs(1);
+                        } else {
+                            warn!(target: "feishu", uptime_ms = opened_at.elapsed().as_millis() as u64, "长连接快速「正常」返回（疑似握手即断），保留退避重连");
+                        }
                     }
                     Err(WsClientError::ConnectionClosed { reason }) => {
                         // M5（code-review v8）：服务端按 PingInterval 例行踢空闲
@@ -131,6 +190,15 @@ impl FeishuWsClient {
                 },
                 _ = self.reconnect.notified() => {
                     info!(target: "feishu", "收到 /reconnect 指令，主动断开重连");
+                    backoff = Duration::from_secs(1);
+                },
+                _ = watchdog => {
+                    warn!(
+                        target: "feishu",
+                        idle_secs = WS_IDLE_WATCHDOG.as_secs(),
+                        "长连接无事件看门狗触发（疑似静默黑洞），强制丢弃连接重连"
+                    );
+                    // 黑洞连接不可信但新连接是全新握手：退避重置 1s 起步。
                     backoff = Duration::from_secs(1);
                 }
             }
@@ -369,7 +437,7 @@ pub(crate) fn note_bot_sent(mid: Option<&str>) {
     let Some(m) = mid.filter(|m| m.starts_with("om_")) else {
         return;
     };
-    let mut q = BOT_SENT_MSGS.lock().expect("bot_sent 账本锁中毒");
+    let mut q = BOT_SENT_MSGS.lock().unwrap_or_else(|e| e.into_inner());
     if q.len() >= BOT_SENT_CAP {
         q.pop_front();
     }
@@ -380,7 +448,7 @@ pub(crate) fn note_bot_sent(mid: Option<&str>) {
 pub(crate) fn bot_sent_recently(mid: &str) -> bool {
     BOT_SENT_MSGS
         .lock()
-        .expect("bot_sent 账本锁中毒")
+        .unwrap_or_else(|e| e.into_inner())
         .iter()
         .any(|m| m == mid)
 }
@@ -619,7 +687,7 @@ pub async fn patch_card_settings(
 // 两路同构，见 platform.rs）。
 
 /// 媒体下载大小上限（与 ilink 一致：50MB；防恶意/误发大文件把内存打爆）。
-const MEDIA_MAX_BYTES: u64 = 50 * 1024 * 1024;
+pub(crate) const MEDIA_MAX_BYTES: u64 = 50 * 1024 * 1024;
 
 /// 「获取消息中的资源文件」手写实现（P5 快赢：SDK 版全量缓冲无大小上限）。
 /// GET `/im/v1/messages/{message_id}/resources/{file_key}?type=<kind>`，

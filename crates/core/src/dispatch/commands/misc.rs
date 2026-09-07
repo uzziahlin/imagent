@@ -741,6 +741,8 @@ impl Dispatcher {
             reply_to: None,
             source_msg_id: None,
             control: None,
+            // /retry 是用户显式动作，保留 steering 语义（运行中注入当轮追问）。
+            no_steer: false,
             reply_hint: hint.clone(),
         };
         self.dispatch_agent_message(msg).await;

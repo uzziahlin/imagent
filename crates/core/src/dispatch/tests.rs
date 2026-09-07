@@ -426,6 +426,7 @@ fn msg(conv: &str, sender: &str, text: &str) -> InboundMessage {
         reply_to: None,
         source_msg_id: None,
         control: None,
+        no_steer: false,
         reply_hint: ReplyHint::None,
     }
 }
@@ -930,6 +931,7 @@ async fn pure_media_all_failed_replies_error() {
         reply_to: None,
         source_msg_id: None,
         control: None,
+        no_steer: false,
         reply_hint: ReplyHint::None,
     };
     feed_and_wait(&ctx, vec![m], 0).await;
@@ -2424,8 +2426,10 @@ async fn pending_queue_cap_warns_and_drops() {
     ctx.disp.handle(msg("c1", "alice", "/stop all")).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), runner).await;
     let inbox = ctx.inbox.lock().await.clone();
+    // v1.21 review：告警改为 per-conv 时间窗去重（洪泛源刷屏/平台频控防护）
+    //——5 条超限只回 1 条告警（丢弃照常）。
     let overflow = inbox.iter().filter(|t| t.contains("已达上限")).count();
-    assert!(overflow >= 5, "超限的 5 条应各回一次告警: {inbox:?}");
+    assert_eq!(overflow, 1, "超限告警应按 conv 去重（只回一次）: {inbox:?}");
     let prompts = ctx.prompts.lock().await.clone();
     assert_eq!(
         prompts.len(),
@@ -3626,6 +3630,7 @@ fn recall_msg(conv: &str, msg_id: &str, notify: Option<&str>, probes: &[&str]) -
             notify_conv: notify.map(|c| ConvId(c.into())),
             probe_convs: probes.iter().map(|c| ConvId((*c).into())).collect(),
         }),
+        no_steer: false,
         reply_hint: ReplyHint::None,
     }
 }
@@ -3792,6 +3797,7 @@ async fn bot_removed_from_chat_revokes_and_notifies_admin() {
         reply_to: None,
         source_msg_id: None,
         control: Some(crate::types::InboundControl::BotRemovedFromChat),
+        no_steer: false,
         reply_hint: ReplyHint::None,
     };
     ctx.disp.handle(removed).await;
@@ -3825,6 +3831,7 @@ async fn bot_removed_from_chat_revokes_and_notifies_admin() {
         reply_to: None,
         source_msg_id: None,
         control: Some(crate::types::InboundControl::BotRemovedFromChat),
+        no_steer: false,
         reply_hint: ReplyHint::None,
     };
     ctx.disp.handle(removed).await;
@@ -4707,6 +4714,129 @@ async fn learned_context_window_recalibrates_threshold() {
         .auto_compact_window
         .load(std::sync::atomic::Ordering::Relaxed);
     assert_eq!(w, 200_000);
+    // v1.21 护栏：区间外的学习值丢弃（阈值不变）。
+    ctx.disp.note_learned_context_window(1);
+    ctx.disp.note_learned_context_window(999_999_999);
+    let t2 = ctx
+        .disp
+        .auto_compact_threshold
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(t2, 160_000, "异常窗口（过小/过大）应被丢弃");
+    drop_db(ctx.db).await;
+}
+
+/// v1.21 review（P1）：cron/webhook 合成消息（no_steer）不被 steering 劫持——
+/// 运行中到达时排队为独立轮次（可审计/持久化），不注入当轮 stdin。
+#[tokio::test]
+async fn no_steer_message_queues_instead_of_steering() {
+    let _serial = SERIAL.lock().await;
+    let _ = std::fs::create_dir_all("/tmp/imagent-test-ws");
+    let (plat, inbox, send_count) = MockPlatform::new();
+    let (mut back, calls, prompts, order) = MockBackend::new_slow(300);
+    back.steerable = true;
+    let steer_seen = back.steer_seen.clone();
+    let (store, db) = tmp_store().await;
+    let auth = Auth::new(vec!["alice".into()]);
+    let admins = auth.snapshot();
+    let disp = Arc::new(Dispatcher::new(
+        Arc::new(plat),
+        Arc::new(back),
+        store,
+        auth,
+        std::path::PathBuf::from("/tmp/imagent-test-ws"),
+        vec!["Read".into()],
+        PermissionMode::Off,
+        TaskBudgets {
+            batch_window: Duration::from_millis(1),
+            ..test_budgets()
+        },
+        CotDetail::Brief,
+        admins,
+    ));
+    let ctx = Ctx {
+        disp: disp.clone(),
+        inbox,
+        send_count,
+        calls,
+        prompts: prompts.clone(),
+        order,
+        db: db.clone(),
+    };
+    let d = disp.clone();
+    let runner = tokio::spawn(async move {
+        d.handle(msg("c1", "alice", "round A")).await;
+    });
+    assert!(wait_registered(&ctx, "c1").await, "在飞任务应已注册");
+    // 合成消息（no_steer=true）：即使后端支持 steering 也应排队。
+    // sender 用已授权的 alice（鉴权门与 steering 正交，本测试只验证路由层）。
+    let mut cron_msg = msg("c1", "alice", "【ci】deploy failed");
+    cron_msg.no_steer = true;
+    ctx.disp.handle(cron_msg).await;
+    let done = tokio::time::timeout(Duration::from_secs(5), runner).await;
+    assert!(done.is_ok(), "runner 应结束");
+    // 排队消息随后作为独立轮次执行（prompts 两条），且从未进 steer 通道。
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if ctx.prompts.lock().await.len() >= 2 {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("合成消息未被排队执行");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let prompts_now = ctx.prompts.lock().await.clone();
+    assert_eq!(
+        prompts_now,
+        vec!["round A".to_string(), "【ci】deploy failed".to_string()],
+        "no_steer 消息应作为独立轮次执行"
+    );
+    assert!(
+        steer_seen.lock().await.is_empty(),
+        "no_steer 消息不应注入当轮 stdin"
+    );
+    drop_db(ctx.db).await;
+}
+
+/// v1.21 review（P1）：/stop 在批窗口期拦截批次后，队列不能死锁——后续消息
+/// 仍应正常取批执行。回归锚：旧实现 break 跳过空 entry 收尾，本 conv 所有
+/// 后续消息永久滞留。
+#[tokio::test]
+async fn stop_interception_does_not_strand_queue() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build_slow(
+        Auth::new(vec!["alice".into()]),
+        150,
+        TaskBudgets {
+            batch_window: Duration::from_millis(50),
+            ..test_budgets()
+        },
+    )
+    .await;
+    let disp = ctx.disp.clone();
+    // 预设停止标记（模拟 /stop 恰在批窗口期到达：标记设置时 running 尚未注册）。
+    disp.stop_requested
+        .lock()
+        .await
+        .insert("c1".into(), crate::dispatch::now_secs());
+    // 第一条消息成为 runner，取批后命中停止标记 → 批次丢弃。
+    let runner = tokio::spawn(async move {
+        disp.handle(msg("c1", "alice", "被拦截的批次")).await;
+    });
+    let done = tokio::time::timeout(Duration::from_secs(5), runner).await;
+    assert!(done.is_ok(), "runner 应结束（拦截路径）");
+    // 关键回归点：/stop 之后的新消息必须还能被处理（旧实现死队列）。
+    let disp2 = ctx.disp.clone();
+    let runner2 = tokio::spawn(async move {
+        disp2.handle(msg("c1", "alice", "stop 之后的新消息")).await;
+    });
+    let done2 = tokio::time::timeout(Duration::from_secs(5), runner2).await;
+    assert!(done2.is_ok(), "后续消息的 runner 应正常完成");
+    let prompts = ctx.prompts.lock().await.clone();
+    assert!(
+        prompts.contains(&"stop 之后的新消息".to_string()),
+        "新消息应被执行（死队列回归）：{prompts:?}"
+    );
     drop_db(ctx.db).await;
 }
 
@@ -4718,7 +4848,8 @@ async fn webhook_inject_drives_agent_via_handle() {
     let auth = Auth::with_chats(vec![], vec!["c1".into()]);
     let ctx = build(auth).await;
     let msg = msg("c1", "webhook:ci", "【ci】deploy failed on main");
-    ctx.disp.inject(msg).await;
+    // v1.21：inject 返回 Result（停机拒绝）；测试态未 shutdown，恒 Ok。
+    ctx.disp.inject(msg).await.expect("inject 应成功（未停机）");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         if ctx

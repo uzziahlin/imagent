@@ -737,6 +737,10 @@ async fn main() -> Result<()> {
             }
 
             // 9.5 v1.20 webhook 入站：事件 → 会话（须 [[webhook]] 条目 + 会话白名单）。
+            // v1.21 review：startup_recovery 必须先于 webhook accept——旧时序里
+            // 启动窗口内注入的消息会撞上 replay 的 clear_queued_all（双执行窗口）、
+            // recover 也可能把抢跑轮次误判为崩溃轮。
+            dispatcher.startup_recovery().await;
             if let Some(addr) = config
                 .webhook_addr
                 .as_deref()
@@ -1299,6 +1303,9 @@ fn spawn_webhook_server(
         .map(|e| (e.token, (e.conv, e.name)))
         .collect();
     let state = WebhookState { routes, dispatcher };
+    // v1.21 review：停机时停止 accept——drain 期间注入只会挂死/被丢弃，
+    // 优雅关停让客户端拿到连接关闭而非假 202。
+    let shutdown = state.dispatcher.shutdown_token();
     let app = Router::new()
         .route("/hook/:token", post(webhook_handler))
         .layer(DefaultBodyLimit::max(64 * 1024))
@@ -1312,9 +1319,13 @@ fn spawn_webhook_server(
             }
         };
         tracing::info!(target: "imagent::ops", addr = %socket, "webhook 入站 listening（POST /hook/<token>）");
-        if let Err(e) = axum::serve(listener, app).await {
+        if let Err(e) = axum::serve(listener, app)
+            .with_graceful_shutdown(async move { shutdown.cancelled().await })
+            .await
+        {
             tracing::warn!(target: "imagent::ops", addr = %socket, error = %e, "webhook HTTP server 退出");
         }
+        tracing::info!(target: "imagent::ops", "webhook server 已随停机关闭");
     });
 }
 
@@ -1360,11 +1371,21 @@ async fn webhook_handler(
         reply_to: None,
         source_msg_id: None,
         control: None,
+        // v1.21 review：合成消息不走 steering（独立轮次 + 持久化兜底）。
+        no_steer: true,
         reply_hint: imagent_core::ReplyHint::None,
     };
     tracing::info!(target: "imagent::ops", conv = %conv, name = %name, "webhook 命中，注入 dispatcher");
-    st.dispatcher.inject(msg).await;
-    (StatusCode::ACCEPTED, "queued\n")
+    match st.dispatcher.inject(msg).await {
+        Ok(()) => (StatusCode::ACCEPTED, "queued\n"),
+        Err(e) => {
+            tracing::warn!(target: "imagent::ops", error = %e, "webhook 注入被拒（停机中）");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "shutting down, retry later\n",
+            )
+        }
+    }
 }
 
 fn spawn_metrics_server(
