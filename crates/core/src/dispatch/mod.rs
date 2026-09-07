@@ -41,7 +41,7 @@ use crate::types::{
 use imagent_store::{NamedSessionRow, SessionRow, Store};
 use parking_lot::RwLock;
 use tokio::sync::{mpsc, Mutex};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// per-conv 排队消息上限：runner 在飞期间到达的消息暂存条数。超出回告警并丢弃，
 /// 防刷屏把合并后的 prompt 撑爆。
@@ -524,6 +524,14 @@ pub struct Dispatcher {
     /// 「用量已达上限」——cron 场景一天刷 1440 条。1 小时内同 sender 只提示
     /// 一次（拒绝照常，只是不再重复说服）。进程内状态即可。
     budget_notice_last: Mutex<HashMap<String, i64>>,
+    /// v1.21 review：排队上限告警的 per-conv 去重（与 budget_notice_last 同款
+    /// 手法）——队列打满时每条超限消息都回一条 IM 告警，webhook/cron 洪泛下
+    /// 刷屏且可能触发平台频控；1 小时内同 conv 只提示一次（丢弃照常）。
+    queue_cap_notice_last: Mutex<HashMap<String, i64>>,
+    /// v1.21 review：自动压缩失败的 per-conv 退避——压缩持续失败（如摘要生成
+    /// 报错）时每个水位超阈的成功轮都重试并发两张卡 + 跑一次完整 agent，
+    /// 失败后 1 小时内不再自动尝试（手动 /compact 不受限）。
+    compact_fail_last: Mutex<HashMap<String, i64>>,
     /// per-conv 最近一次 `/resume` 渲染的列表（P4-11）：序号选择取缓存，
     /// 防两次调用间本机会话 mtime 变化导致错位；S-16：选中不移除条目（防序号
     /// 前移错位），陈旧由 D7 的 TTL 惰性过期兜底。
@@ -654,6 +662,8 @@ impl Dispatcher {
             queued_hints: Arc::new(Mutex::new(HashMap::new())),
             stop_requested: Arc::new(Mutex::new(HashMap::new())),
             budget_notice_last: Mutex::new(HashMap::new()),
+            queue_cap_notice_last: Mutex::new(HashMap::new()),
+            compact_fail_last: Mutex::new(HashMap::new()),
             shortcuts: Arc::new(std::sync::RwLock::new(HashMap::new())),
             resume_cache: Mutex::new(HashMap::new()),
             pending_hint_last: Mutex::new(HashMap::new()),
@@ -780,9 +790,23 @@ impl Dispatcher {
         if window == 0 {
             return;
         }
+        // v1.21 review（护栏）：学习值无下限校验时，ACP 上报异常小窗口（协议
+        // 兼容层的垃圾值）会让 窗口×比例 截断到 0 = 自动压缩静默关闭，小值则
+        // 每轮必压；过大值（数亿 token）同样只可能是协议错误。区间外的学习
+        // 丢弃并告警，保留现值。
+        const LEARNED_WINDOW_MAX: u64 = 50_000_000;
         let cur = self.auto_compact_window.load(Relaxed);
         if cur == 0 || window == cur {
             return; // 绝对值/关闭档：尊重显式配置；窗口未变：no-op
+        }
+        if !(crate::config::AUTO_COMPACT_MIN..=LEARNED_WINDOW_MAX).contains(&window) {
+            warn!(
+                target: "imagent::core",
+                learned_window = window,
+                prev_window = cur,
+                "ACP 上报的模型窗口超出合理区间，丢弃该学习值（疑似协议兼容层异常）"
+            );
+            return;
         }
         let threshold = (window as f64 * *self.auto_compact_ratio.read()) as u64;
         self.auto_compact_window.store(window, Relaxed);
@@ -1076,6 +1100,20 @@ impl Dispatcher {
         self.shutdown.cancel();
     }
 
+    /// v1.21：shutdown token 的只读克隆（main 的 webhook server 优雅关停用——
+    /// 停机时停止 accept，不再让外部事件打进注定被丢弃的管线）。
+    pub fn shutdown_token(&self) -> tokio_util::sync::CancellationToken {
+        (*self.shutdown).clone()
+    }
+
+    /// v1.21：启动恢复序列（崩溃轮次恢复 + 排队重放），main 在 webhook server
+    /// 开始 accept 之前、run() 之前调用（时序依据见 run() 内注释）。幂等性由
+    /// 调用方保证只调一次；测试直接跑 run() 的路径不依赖恢复（内存态干净）。
+    pub async fn startup_recovery(self: &Arc<Self>) {
+        self.recover_crashed_rounds().await;
+        self.replay_persisted_queue().await;
+    }
+
     /// 主循环。循环 `platform.recv()`，每条消息 `tokio::spawn` 处理（不阻塞 recv）。
     /// recv 返回 Err 时：session 过期 → 优雅停止（返回 Err 让 main 提示重新 login）；
     /// 其它错误 → 指数退避后继续重试（防 client 异常退出导致 dispatcher 忙循环刷屏；ilink 长轮询层另有退避），不 panic。
@@ -1083,11 +1121,24 @@ impl Dispatcher {
     /// 与 cron 触发同款：spawn 进 tasks（drain 覆盖）+ 走 handle() 完整管线
     ///（鉴权/审批/批处理与手打消息完全同权——注入消息的 conv 须在会话
     /// 白名单，无旁路）。
-    pub async fn inject(self: &Arc<Self>, msg: InboundMessage) {
+    /// v1.21 review：停机中拒绝注入——drain 持有 tasks 锁最长 shutdown_grace，
+    /// 此时 inject 会挂在锁上无响应；drain 后再注入的任务在 runtime 收尾时被
+    /// 无声取消（客户端拿到 202 但消息既不执行也不持久化）。Err 由 main 映射
+    /// 503，调用方可重试。
+    pub async fn inject(
+        self: &Arc<Self>,
+        msg: InboundMessage,
+    ) -> std::result::Result<(), crate::error::CoreError> {
+        if self.shutdown.is_cancelled() {
+            return Err(crate::error::CoreError::Config(
+                "imagent 正在停机，拒收 webhook 注入（请稍后重试）".to_string(),
+            ));
+        }
         let this = self.clone();
         self.tasks.lock().await.spawn(async move {
             this.handle(msg).await;
         });
+        Ok(())
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -1137,11 +1188,12 @@ impl Dispatcher {
             ));
         }
 
-        // v1.18 迭代（排队持久化）：重放崩溃前持久化的排队消息——先清行再
-        // handle（重放消息重走 enqueue 会写新行，防双份；经完整鉴权/去重管线）。
-        self.replay_persisted_queue().await;
-        // v1.20：崩溃轮次恢复（inflight 残留 → /retry + 会话通知）。
-        self.recover_crashed_rounds().await;
+        // v1.21 review（启动时序）：replay/recover 从 run() 前置到 main 的
+        // startup_recovery()——在 webhook server 开始 accept **之前**执行。
+        // 旧时序里 webhook 已可注入：注入消息落行后撞上 replay 的
+        // clear_queued_all 整表清除（行被抹、消息重放 = 双执行窗口）；recover
+        // 的崩溃扫描也可能把重放/webhook 抢跑写入的 inflight 误判为崩溃轮。
+        // recover 先于 replay：扫描时不可能存在任何已起跑的轮次，竞态归零。
 
         // v1.18 /cron：定时任务调度器——30s tick 查询到期任务，合成消息走正常
         // handle 管线（白名单/会话域/审批链与手打消息完全同权）。触发前先重排
@@ -1446,7 +1498,10 @@ impl Dispatcher {
                 // 多条由 CLI 自动合并（无需自家防抖）。媒体消息走不了 stdin、
                 // 注入失败（轮恰收尾/通道满）回落排队。多发送者不加【标注】
                 //（stdin 单流；群聊归属由 agent 上下文自行分辨）。
-                if msg.media.is_empty() && msg.control.is_none() {
+                // v1.21 review：cron/webhook 合成消息（no_steer）不走本分支——
+                // 定时任务须独立轮次（可审计/可 /stop），且 steering 注入无
+                // 持久化兜底，轮恰收尾即丢。
+                if !msg.no_steer && msg.media.is_empty() && msg.control.is_none() {
                     if let Some(text) = msg.text.as_deref().map(str::trim).filter(|t| !t.is_empty())
                     {
                         let steered = {
@@ -1495,12 +1550,27 @@ impl Dispatcher {
                         cap = PENDING_QUEUE_CAP,
                         "排队消息超上限，丢弃本条"
                     );
-                    self.reply(
-                        &ConvId(conv.to_string()),
-                        &format!("⚠️ 排队消息已达上限（{PENDING_QUEUE_CAP} 条），本条已丢弃；如需立即处理请发 /stop 中断当前任务后重发"),
-                        hint,
-                    )
-                    .await;
+                    // v1.21 review：告警按 conv 时间窗去重（同 budget_notice_last
+                    // 手法）——洪泛源（泄漏的 token / CI 重试风暴）下逐条回发
+                    // 会刷屏并可能触发平台频控。丢弃本身照常。
+                    let now = now_secs();
+                    let should_notice = {
+                        let mut last = self.queue_cap_notice_last.lock().await;
+                        let hit = last.get(conv).copied().unwrap_or(0) + 3600 <= now;
+                        if hit {
+                            last.retain(|_, ts| now - *ts < 7200);
+                            last.insert(conv.to_string(), now);
+                        }
+                        hit
+                    };
+                    if should_notice {
+                        self.reply(
+                            &ConvId(conv.to_string()),
+                            &format!("⚠️ 排队消息已达上限（{PENDING_QUEUE_CAP} 条），超限消息将被丢弃；如需立即处理请发 /stop 中断当前任务后重发"),
+                            hint,
+                        )
+                        .await;
+                    }
                     return false;
                 }
                 info!(target: "imagent::core", conv_id = %conv, "runner 在飞，消息入队待下一轮合并");
@@ -1691,11 +1761,33 @@ impl Dispatcher {
                 .ok()
                 .and_then(|v| v.get("prompt").and_then(|p| p.as_str()).map(str::to_string))
                 .unwrap_or(payload.clone());
-            let last_payload = serde_json::json!({ "prompt": prompt_text, "at": now_secs() });
-            let _ = self
+            // v1.21 review：已有的 last_prompt 记录着更近的真实失败轮（/retry
+            // 兜底）——崩溃残留（更早时刻死掉的轮）无条件顶掉它会丢掉更值得
+            // 重试的那条。比 at，仅在新于现存时覆盖。
+            let existing_at = self
                 .store
-                .set_config(&format!("last_prompt:{conv}"), &last_payload.to_string())
-                .await;
+                .get_config(&format!("last_prompt:{conv}"))
+                .await
+                .ok()
+                .flatten()
+                .and_then(|v| {
+                    serde_json::from_str::<serde_json::Value>(&v)
+                        .ok()
+                        .and_then(|j| j.get("at").and_then(|a| a.as_i64()))
+                });
+            if existing_at.is_some() {
+                info!(
+                    target: "imagent::core",
+                    conv_id = conv,
+                    "已有更近的 last_prompt，崩溃残留不覆盖（/retry 仍指向最近失败轮）"
+                );
+            } else {
+                let last_payload = serde_json::json!({ "prompt": prompt_text, "at": now_secs() });
+                let _ = self
+                    .store
+                    .set_config(&format!("last_prompt:{conv}"), &last_payload.to_string())
+                    .await;
+            }
             let _ = self.store.delete_config(&key).await;
             self.reply(
                 &ConvId(conv.to_string()),

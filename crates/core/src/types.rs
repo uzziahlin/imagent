@@ -139,6 +139,13 @@ pub struct InboundMessage {
     /// 消息为 None。serde：瞬态信号不持久化（排队消息恒 None）。
     #[serde(skip)]
     pub control: Option<InboundControl>,
+    /// 合成来源（cron 触发 / webhook 注入）标记：这类消息不走 steering——
+    /// 定时任务语义是「独立轮次、可审计、可 /stop」，被 try_send 灌进当轮
+    /// stdin 会劫持无关在飞任务，且 steering 注入不落任何持久化（轮恰收尾
+    /// 即静默丢失）。用户手打消息恒 false（steering 为实时追问设计）。
+    /// serde default：旧排队行无此列，反序列化补 false。
+    #[serde(default)]
+    pub no_steer: bool,
     pub reply_hint: ReplyHint,
 }
 

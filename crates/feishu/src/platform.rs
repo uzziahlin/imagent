@@ -481,15 +481,14 @@ impl FeishuPlatform {
                         if !dedup.check(&key) {
                             continue;
                         }
-                        send_drain_text(
+                        spawn_drain_text(
                             &core_config_for_drain,
                             &token_for_drain,
                             &app_id_for_drain,
                             &app_secret_for_drain,
-                            &reply_msg.conv_id,
-                            &deny_text,
-                        )
-                        .await;
+                            reply_msg.conv_id.clone(),
+                            deny_text.clone(),
+                        );
                         // 安全批次（转发代批）：deny 文案回原 conv 之外，给点击者
                         // （operator）私聊补一条同文案——转发场景下原 conv 里没人
                         // 知道有人替点了按钮，第二触达让点击者明确知道被拒。
@@ -497,15 +496,14 @@ impl FeishuPlatform {
                         if !reply_msg.sender.0.is_empty()
                             && reply_msg.conv_id.0 != format!("feishu:{}", reply_msg.sender.0)
                         {
-                            send_drain_text(
+                            spawn_drain_text(
                                 &core_config_for_drain,
                                 &token_for_drain,
                                 &app_id_for_drain,
                                 &app_secret_for_drain,
-                                &ConvId(format!("feishu:{}", reply_msg.sender.0)),
-                                &deny_text,
-                            )
-                            .await;
+                                ConvId(format!("feishu:{}", reply_msg.sender.0)),
+                                deny_text.clone(),
+                            );
                         }
                         continue;
                     }
@@ -529,14 +527,14 @@ impl FeishuPlatform {
                         let pending = pending_asks_for_drain.lock().await.get(&req).cloned();
                         match pending {
                             None => {
-                                notify_expired_ask(
+                                spawn_drain_text(
                                     &core_config_for_drain,
                                     &token_for_drain,
                                     &app_id_for_drain,
                                     &app_secret_for_drain,
-                                    &reply_msg.conv_id,
-                                )
-                                .await;
+                                    reply_msg.conv_id.clone(),
+                                    "⏳ 该询问已过期或已被处理，无需再次点击。".to_string(),
+                                );
                                 continue;
                             }
                             // 发起者校验（群 conv）：询问由发起者登记，他人点击
@@ -546,18 +544,17 @@ impl FeishuPlatform {
                                     && !is_private_conv(&card.conv_id)
                                     && card.sender != reply_msg.sender.0
                                 {
-                                    send_drain_text(
+                                    spawn_drain_text(
                                         &core_config_for_drain,
                                         &token_for_drain,
                                         &app_id_for_drain,
                                         &app_secret_for_drain,
-                                        &reply_msg.conv_id,
-                                        &format!(
+                                        reply_msg.conv_id.clone(),
+                                        format!(
                                             "⛔ 该询问由 {} 发起，仅其本人可答复。",
                                             card.sender
                                         ),
-                                    )
-                                    .await;
+                                    );
                                     continue;
                                 }
                             }
@@ -628,15 +625,14 @@ impl FeishuPlatform {
                             && !is_private_conv(&card.conv_id)
                             && card.sender != operator
                         {
-                            send_drain_text(
+                            spawn_drain_text(
                                 &core_config_for_drain,
                                 &token_for_drain,
                                 &app_id_for_drain,
                                 &app_secret_for_drain,
-                                &ConvId(card.conv_id.clone()),
-                                &format!("⛔ 该询问由 {} 发起，仅其本人可答复。", card.sender),
-                            )
-                            .await;
+                                ConvId(card.conv_id.clone()),
+                                format!("⛔ 该询问由 {} 发起，仅其本人可答复。", card.sender),
+                            );
                             continue;
                         }
                         let reaction_msg = InboundMessage {
@@ -651,6 +647,7 @@ impl FeishuPlatform {
                             reply_to: Some(reacted_msg),
                             source_msg_id: None,
                             control: None,
+                            no_steer: false,
                             reply_hint: ReplyHint::None,
                         };
                         if inbound_msg_tx.send(reaction_msg).await.is_err() {
@@ -691,15 +688,14 @@ impl FeishuPlatform {
                 // 模式），无敏感信息。
                 if let Some((key, chat_id)) = crate::proto::parse_bot_added_event(&payload) {
                     if dedup.check(&key) {
-                        send_drain_text(
+                        spawn_drain_text(
                             &core_config_for_drain,
                             &token_for_drain,
                             &app_id_for_drain,
                             &app_secret_for_drain,
-                            &ConvId(format!("feishu:{chat_id}")),
-                            "👋 我已加入本群！群内 @我 发消息即可驱动 agent。\n管理员可发送 /chat allow 放行本群（放行前我不会响应消息）；/help 查看全部命令。\n💬 会话规则：群主时间线直接 @我 = 续同一会话；点消息「回复」进话题 = 开独立会话（互不共享上下文/待办）。",
-                        )
-                        .await;
+                            ConvId(format!("feishu:{chat_id}")),
+                            "👋 我已加入本群！群内 @我 发消息即可驱动 agent。\n管理员可发送 /chat allow 放行本群（放行前我不会响应消息）；/help 查看全部命令。\n💬 会话规则：群主时间线直接 @我 = 续同一会话；点消息「回复」进话题 = 开独立会话（互不共享上下文/待办）。".to_string(),
+                        );
                     }
                     continue;
                 }
@@ -710,15 +706,14 @@ impl FeishuPlatform {
                 if let Some((notice, dedup_key, Some(conv))) = unsupported_message_notice(&payload)
                 {
                     if dedup_key.is_some_and(|k| dedup.check(&k)) {
-                        send_drain_text(
+                        spawn_drain_text(
                             &core_config_for_drain,
                             &token_for_drain,
                             &app_id_for_drain,
                             &app_secret_for_drain,
-                            &conv,
-                            notice,
-                        )
-                        .await;
+                            conv,
+                            notice.to_string(),
+                        );
                     }
                     continue;
                 }
@@ -818,8 +813,16 @@ impl FeishuPlatform {
     }
 
     /// 取该 card_id 的下一个 sequence（严格递增；element 与 settings PATCH 共用）。
+    /// v1.21 review：终态清理失败路径（Failed/HandleLost 之外的残留）无上限——
+    /// 加与 managed_card_msgs 同款粗上限兜底（clear 后 seq 从 0 重起有 300317
+    /// 自愈兜底，可接受）。
     async fn next_card_seq(&self, card_id: &str) -> i64 {
+        const CARD_SEQ_CAP: usize = 2048;
         let mut m = self.card_seqs.lock().await;
+        if m.len() >= CARD_SEQ_CAP {
+            m.clear();
+            warn!(target: "feishu", "card_seqs 超粗上限（{CARD_SEQ_CAP}），整体清空兜底（seq 经 300317 自愈重置）");
+        }
         let entry = m.entry(card_id.to_string()).or_insert(0);
         *entry += 1;
         *entry
@@ -1107,9 +1110,16 @@ impl FeishuPlatform {
 
     /// footer 变化才 patch（缓存命中跳过）；失败仅 warn（footer 是点缀，正文/终态
     /// 才是主流程）。同时管理 `card_footers` 缓存的写入与终态清理。
+    /// v1.21 review：终态清理失败路径的 footer 条目无上限（card_seqs 同款），
+    /// 写入侧加粗上限兜底。
     async fn patch_footer_if_changed(&self, token: &str, card_id: &str, footer: &str) {
+        const CARD_FOOTER_CAP: usize = 2048;
         let changed = {
             let mut m = self.card_footers.lock().await;
+            if m.len() >= CARD_FOOTER_CAP {
+                m.clear();
+                warn!(target: "feishu", "card_footers 超粗上限（{CARD_FOOTER_CAP}），整体清空兜底");
+            }
             if m.get(card_id).map(String::as_str) == Some(footer) {
                 false
             } else {
@@ -1585,6 +1595,18 @@ async fn housekeeping_loop(maps: HousekeepingMaps) {
                 if evicted > 0 {
                     warn!(target: "feishu", evicted, "per-conv 状态表超粗上限（>{PER_CONV_MAP_CAP}），驱逐 {evicted} 个非活跃会话条目（评论会话与挂起审批豁免）");
                 }
+                // v1.21 review：注释承诺的「仍超限才整体清空」兜底此前并未实现
+                //——评论会话数本身超限时表永不收缩（每文档评论一个 conv 键，
+                // 长跑无界慢泄漏）。兜底清空（评论锚丢失是硬失败，但无界增长
+                // 更糟；恢复路径：下一条评论事件重建锚点）。
+                if states.len() > PER_CONV_MAP_CAP {
+                    warn!(
+                        target: "feishu",
+                        remained = states.len(),
+                        "选择性驱逐后仍超上限（评论会话/挂起审批条目过多），整体清空兜底"
+                    );
+                    states.clear();
+                }
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
@@ -1968,18 +1990,35 @@ async fn ensure_bot_open_id(
     if bot_open_id.read().await.is_some() {
         return;
     }
+    // v1.21 review（负缓存）：HTTP 分区期间 drain 串行循环里每条群消息事件都
+    // 内联重试一次 30s 超时的取值——全平台入站被队头阻塞。失败后 60s 内不再
+    // 重试（期间维持弱过滤降级，恢复由下一窗口的首次事件触发）。
+    static BOT_ID_FAIL_AT: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+    const BOT_ID_FAIL_NEG_TTL: Duration = Duration::from_secs(60);
+    {
+        let fail_at = BOT_ID_FAIL_AT.lock().unwrap_or_else(|e| e.into_inner());
+        if fail_at.is_some_and(|t| t.elapsed() < BOT_ID_FAIL_NEG_TTL) {
+            return;
+        }
+    }
     let fetched = async {
         let t = fetch_cached_token(token_lock, core_config, app_id, app_secret).await?;
         fetch_bot_open_id(core_config, &t).await
     }
     .await;
     match fetched {
-        Ok(b) => *bot_open_id.write().await = Some(b),
-        Err(e) => warn!(
-            target: "feishu",
-            error = %e,
-            "取 bot open_id 失败，@bot 过滤退化为弱过滤（须含 @）"
-        ),
+        Ok(b) => {
+            *BOT_ID_FAIL_AT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *bot_open_id.write().await = Some(b)
+        }
+        Err(e) => {
+            *BOT_ID_FAIL_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+            warn!(
+                target: "feishu",
+                error = %e,
+                "取 bot open_id 失败，@bot 过滤退化为弱过滤（须含 @）；60s 内不再重试"
+            )
+        }
     }
 }
 
@@ -2078,28 +2117,57 @@ async fn send_drain_text(
     }
 }
 
+/// v1.21 review：媒体上传读前大小预检——返回 Some(Err) 表示超限/不可访问，
+/// 调用方在读文件前拒绝（防任意大文件整读进内存）。metadata 失败放行（交给
+/// 后续 read 的真实错误路径——此处只拦「确定超限」的）。
+async fn media_size_violation(url: &str) -> Option<CoreError> {
+    match tokio::fs::metadata(url).await {
+        Ok(meta) if meta.len() > crate::client::MEDIA_MAX_BYTES => Some(CoreError::Platform(
+            PLATFORM,
+            format!(
+                "媒体文件 {} 大小 {}MB 超上限 {}MB，拒绝上传",
+                url,
+                meta.len() / (1024 * 1024),
+                crate::client::MEDIA_MAX_BYTES / (1024 * 1024)
+            ),
+        )),
+        _ => None,
+    }
+}
+
+/// v1.21 review（drain 解耦）：drain 串行事件循环里的 best-effort 提示改为
+/// spawn 后台发送——HTTP 分区时这些内联 await（token 懒取 + 发送，最坏 30s+）
+/// 会把整个入站管道（含审批回调、撤回事件）队头阻塞，payload 无界 channel
+/// 随之膨胀。提示类消息无顺序要求，解耦零代价。
+fn spawn_drain_text(
+    core_config: &Arc<CoreConfig>,
+    token_lock: &Arc<RwLock<Option<(String, Instant)>>>,
+    app_id: &str,
+    app_secret: &str,
+    conv: ConvId,
+    text: String,
+) {
+    let core_config = core_config.clone();
+    let token_lock = token_lock.clone();
+    let app_id = app_id.to_string();
+    let app_secret = app_secret.to_string();
+    tokio::spawn(async move {
+        send_drain_text(
+            &core_config,
+            &token_lock,
+            &app_id,
+            &app_secret,
+            &conv,
+            &text,
+        )
+        .await;
+    });
+}
+
 /// 过期询问的点击反馈（drain task 用）：向该 conv 回一条「已过期」文本——
 /// 询问卡收敛（批准/拒绝/中断/超时）后按钮仍在卡上，用户迟点不应静默无响应。
 /// 评论 conv 的过期文案与聊天场景同句（回评论线程）。
 /// best-effort：发送失败仅 warn（提示丢失无害，core 的 miss 分支照旧兜底丢弃）。
-async fn notify_expired_ask(
-    core_config: &CoreConfig,
-    token_lock: &Arc<RwLock<Option<(String, Instant)>>>,
-    app_id: &str,
-    app_secret: &str,
-    conv: &ConvId,
-) {
-    send_drain_text(
-        core_config,
-        token_lock,
-        app_id,
-        app_secret,
-        conv,
-        "⏳ 该询问已过期或已被处理，无需再次点击。",
-    )
-    .await;
-}
-
 /// 取当前 token：缓存命中（未过 TTL）则返回，否则 `fetch_token` 刷新并缓存。
 ///
 /// 提成模块级自由函数——drain task 持有 `Arc<RwLock<…>>` 句柄而无 `&self`，无法调
@@ -2123,6 +2191,12 @@ async fn fetch_cached_token(
             return Ok(token.clone());
         }
     }
+    // v1.21 review（失败负缓存）：token 端点故障期间每个调用方在 single-flight
+    // 门上排队、各自串行做一次 30s 超时的失败刷新（等待时间随人数线性放大，
+    // 恢复瞬间集中重试）。失败结果短 TTL 负缓存：5s 内的后续调用直接复用上
+    // 一次错误，不撞端点。
+    static TOKEN_FAIL: std::sync::Mutex<Option<(String, Instant)>> = std::sync::Mutex::new(None);
+    const TOKEN_FAIL_NEG_TTL: Duration = Duration::from_secs(5);
     // 刷新串行化：网络期间 token_lock 完全不被持有，发送方零阻塞。
     let _refresh_guard = TOKEN_REFRESH_MU.lock().await;
     // 双检：等刷新权期间可能已被前一个刷新者写回新 token。
@@ -2131,10 +2205,30 @@ async fn fetch_cached_token(
             return Ok(token.clone());
         }
     }
-    let token = fetch_token(core_config, app_id, app_secret).await?;
-    // 写回仅短暂持写锁（无网络），读锁等待者立即可见。
-    *token_lock.write().await = Some((token.clone(), Instant::now()));
-    Ok(token)
+    {
+        let fail = TOKEN_FAIL.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((err, at)) = fail.as_ref() {
+            if at.elapsed() < TOKEN_FAIL_NEG_TTL {
+                return Err(imagent_core::CoreError::Platform(
+                    crate::client::PLATFORM,
+                    format!("tenant token 刷新近期失败（{err}），负缓存窗口内直接复用错误"),
+                ));
+            }
+        }
+    }
+    match fetch_token(core_config, app_id, app_secret).await {
+        Ok(token) => {
+            // 写回仅短暂持写锁（无网络），读锁等待者立即可见。
+            *token_lock.write().await = Some((token.clone(), Instant::now()));
+            *TOKEN_FAIL.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            Ok(token)
+        }
+        Err(e) => {
+            *TOKEN_FAIL.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some((e.to_string(), Instant::now()));
+            Err(e)
+        }
+    }
 }
 
 #[async_trait]
@@ -2276,6 +2370,11 @@ impl Platform for FeishuPlatform {
                     "评论线程暂不支持发送文件，请在聊天会话中获取文件。".to_string(),
                 ));
             }
+            // v1.21 review：读前大小预检——50MB 上限此前在 client 上传侧才查，
+            // `tokio::fs::read` 会先把任意大文件整读进内存（OOM 风险）。
+            if let Some(e) = media_size_violation(&media.url).await {
+                return Err(e);
+            }
             let bytes = tokio::fs::read(&media.url).await.map_err(|e| {
                 CoreError::Platform(PLATFORM, format!("读媒体文件 {}: {e}", media.url))
             })?;
@@ -2312,6 +2411,10 @@ impl Platform for FeishuPlatform {
         let thread = thread_target_from_conv(conv);
         let (receive_id, kind) = receive_target_from_conv(conv)
             .ok_or_else(|| CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0)))?;
+        // v1.21 review：读前大小预检（同上方评论分支——防大文件整读进内存）。
+        if let Some(e) = media_size_violation(&media.url).await {
+            return Err(e);
+        }
         let bytes = tokio::fs::read(&media.url)
             .await
             .map_err(|e| CoreError::Platform(PLATFORM, format!("读媒体文件 {}: {e}", media.url)))?;
@@ -3266,6 +3369,7 @@ mod tests {
             reply_to: None,
             source_msg_id: None,
             control: None,
+            no_steer: false,
             reply_hint: ReplyHint::None,
         };
         let slow = tokio::spawn(async move {

@@ -550,6 +550,29 @@ pub async fn spawn_cli_backend(
         }
     }
 
+    // v1.21 review（argv 预检）：prompt 以单 argv 传入（`-p <prompt>` / `-- <prompt>`）
+    // 的后端在 prompt 超过内核 MAX_ARG_STRLEN（Linux 128KB）时拿到裸 E2BIG
+    // 「failed to spawn」——dispatch 注入的 compact_summary + 媒体提示可撑到该量级。
+    // gemini 侧已有 64KB 守卫（MAX_PROMPT_BYTES），此处统一到 spawn 层：超限给
+    // 可读错误（提示改用 control 通道后端或缩短上下文）。
+    #[cfg(unix)]
+    {
+        const MAX_PROMPT_ARG_BYTES: usize = 100 * 1024;
+        let oversize = cmd
+            .as_std()
+            .get_args()
+            .any(|a| a.as_encoded_bytes().len() > MAX_PROMPT_ARG_BYTES);
+        if oversize {
+            return Err(CoreError::Backend(
+                backend_name,
+                format!(
+                    "prompt 参数超过 {MAX_PROMPT_ARG_BYTES} 字节（接近内核单参数上限），拒绝 spawn；\
+                     请缩短上下文（/compact）或改用 stdin 投递的后端通道"
+                ),
+            ));
+        }
+    }
+
     let mut child = cmd
         .spawn()
         .map_err(|e| CoreError::Backend(backend_name, format!("failed to spawn: {e}")))?;
@@ -1013,7 +1036,22 @@ pub async fn spawn_cli_backend(
             }
         }
     } else {
-        child.wait().await
+        // v1.21 review：非 control 路径同样加 wait 超时——读到 EOF 后子进程
+        // 不退出（`agent_timeout=0 且 idle_timeout=0` 均显式关闭的组合下无
+        // dispatch 层兜底）会永久挂起本轮。
+        match tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await {
+            Ok(res) => res,
+            Err(_) => {
+                tracing::warn!(target: "imagent::backend",
+                    "非 control 通道 CLI 输出结束后 10s 未退出，kill 兜底");
+                #[cfg(unix)]
+                if let Some(g) = group_guard.as_mut() {
+                    g.killpg();
+                }
+                let _ = child.kill().await;
+                child.wait().await
+            }
+        }
     };
     // B5：正常 wait 返回 → 进程组主进程已退出，disarm 防 pid 复用误杀无关进程组。
     #[cfg(unix)]

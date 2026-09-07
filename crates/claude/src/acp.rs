@@ -289,7 +289,14 @@ impl AcpBackend {
         for key in imagent_core::agent_process::AGENT_RUNTIME_ENV
             .iter()
             .copied()
-            .chain(["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"])
+            // v1.21 review：补 ANTHROPIC_AUTH_TOKEN——用 auth_token（而非 API
+            // key）登录的 Claude 经 env -i 后静默无法认证，错误表现为笼统的
+            // 连接失败（CLI 路径 passthrough 同步增补）。
+            .chain([
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_BASE_URL",
+                "ANTHROPIC_AUTH_TOKEN",
+            ])
         {
             match std::env::var(key) {
                 Ok(v) if safe(&v) => assignments.push(format!("{key}={v}")),
@@ -526,10 +533,34 @@ impl LongLivedAcp {
                     agent_client_protocol::on_receive_request!(),
                 )
                 .connect_with(transport, |connection: ConnectionTo<_>| async move {
-                    connection
-                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
-                        .block_task()
-                        .await?;
+                    // v1.21 review（P1，连接建立看门狗）：initialize 握手此前无任何
+                    // 超时——子进程 spawn 成功但对握手永不应答时闭包永久挂起：
+                    // connect_error 永不写入、prompt_tx 永久存活、占满 8 个连接
+                    // 槽位即全局拒绝服务（用户等满 idle_timeout 拿「无响应」且
+                    // 永不自愈）。60s 超时后闭包返回 Err → 连接销毁、槽位释放、
+                    // run() 经 dead_reason 拿到真实原因。
+                    const CONNECT_HANDSHAKE_TIMEOUT: std::time::Duration =
+                        std::time::Duration::from_secs(60);
+                    match tokio::time::timeout(
+                        CONNECT_HANDSHAKE_TIMEOUT,
+                        connection
+                            .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                            .block_task(),
+                    )
+                    .await
+                    {
+                        Ok(res) => {
+                            res?;
+                        }
+                        Err(_) => {
+                            return Err(agent_client_protocol::Error::new(
+                                -32000,
+                                format!(
+                                    "acp initialize 握手 {CONNECT_HANDSHAKE_TIMEOUT:?} 无应答（agent 子进程僵死），断开重试"
+                                ),
+                            ));
+                        }
+                    }
                     // P5-4：会话选择以 req.session（dispatch 从 store 读出的权威值）为
                     // 准。此前的 per-conv sessions 缓存命中即用、无视 req.session，导致
                     // /new（store 已删映射）后仍续接旧会话、/resume /switch 接管后仍跑
@@ -604,58 +635,103 @@ impl LongLivedAcp {
                         };
                         let sid = match want_load {
                             Some((s, true)) => s,
-                            Some((s, false)) => match connection
-                                .send_request(LoadSessionRequest::new(s.clone(), cwd.clone()))
-                                .block_task()
+                            // v1.21 review（P1，会话建立看门狗）：load/new 此前
+                            // 裸 await 无超时——dispatch 超时 drop run future 时
+                            // cancel oneshot 只 select 在 prompt 阶段，session 建立
+                            // 阶段被丢弃后任务若卡死即永久阻塞：连接与子进程泄漏、
+                            // 该 conv 每条消息重复「排队→等满 idle_timeout→失败」。
+                            // 60s 超时走既有 Err 分支（回真实原因 + 断连自愈）。
+                            Some((s, false)) => {
+                                const SESSION_SETUP_TIMEOUT: std::time::Duration =
+                                    std::time::Duration::from_secs(60);
+                                match tokio::time::timeout(
+                                    SESSION_SETUP_TIMEOUT,
+                                    connection
+                                        .send_request(LoadSessionRequest::new(
+                                            s.clone(),
+                                            cwd.clone(),
+                                        ))
+                                        .block_task(),
+                                )
                                 .await
-                            {
-                                Ok(_) => {
-                                    loaded = Some(s.clone());
-                                    loaded_cwd = Some(cwd.clone());
-                                    s
+                                {
+                                    Ok(Ok(_)) => {
+                                        loaded = Some(s.clone());
+                                        loaded_cwd = Some(cwd.clone());
+                                        s
+                                    }
+                                    Ok(Err(e)) => {
+                                        // 会话续接失败必须把真实原因写回 req.resp——
+                                        // 此前 `?` 直接上抛闭包错误，而外层 `let _ =`
+                                        // 丢弃 Err 且 resp 从不 send，run 侧只拿到
+                                        // 笼统的「长驻 ACP task 无响应」。杀掉本连接
+                                        //（会话状态已不可信）但让调用方看到真实错误。
+                                        let _ = req.resp.send(Err(CoreError::Backend(
+                                            NAME,
+                                            format!("acp load session 失败: {e}"),
+                                        )));
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        let _ = req.resp.send(Err(CoreError::Backend(
+                                            NAME,
+                                            format!(
+                                                "acp load session {SESSION_SETUP_TIMEOUT:?} 无应答（agent 子进程僵死），已断开本会话连接"
+                                            ),
+                                        )));
+                                        break;
+                                    }
                                 }
-                                Err(e) => {
-                                    // 会话续接失败必须把真实原因写回 req.resp——
-                                    // 此前 `?` 直接上抛闭包错误，而外层 `let _ =` 丢弃
-                                    // Err 且 resp 从不 send，run 侧只拿到笼统的
-                                    // 「长驻 ACP task 无响应」。杀掉本连接（会话状态
-                                    // 已不可信）但让调用方看到真实错误。
-                                    let _ = req.resp.send(Err(CoreError::Backend(
-                                        NAME,
-                                        format!("acp load session 失败: {e}"),
-                                    )));
-                                    break;
-                                }
-                            },
-                            None => match connection
-                                .send_request(NewSessionRequest::new(cwd.clone()))
-                                .block_task()
+                            }
+                            None => {
+                                const SESSION_SETUP_TIMEOUT: std::time::Duration =
+                                    std::time::Duration::from_secs(60);
+                                match tokio::time::timeout(
+                                    SESSION_SETUP_TIMEOUT,
+                                    connection
+                                        .send_request(NewSessionRequest::new(cwd.clone()))
+                                        .block_task(),
+                                )
                                 .await
-                            {
-                                Ok(resp) => {
-                                    let sid = resp.session_id.to_string();
-                                    loaded = Some(sid.clone());
-                                    // R9（code-review v9）：NewSession 也更新 loaded_cwd
-                                    // ——只设 sid 会让旧 cwd 残留，空闲窗内 /cd 往返
-                                    // 后双比缓存假命中，prompt 跑在错误目录。
-                                    loaded_cwd = Some(cwd.clone());
-                                    sid
+                                {
+                                    Ok(Ok(resp)) => {
+                                        let sid = resp.session_id.to_string();
+                                        loaded = Some(sid.clone());
+                                        // R9（code-review v9）：NewSession 也更新
+                                        // loaded_cwd——只设 sid 会让旧 cwd 残留，
+                                        // 空闲窗内 /cd 往返后双比缓存假命中，
+                                        // prompt 跑在错误目录。
+                                        loaded_cwd = Some(cwd.clone());
+                                        sid
+                                    }
+                                    Ok(Err(e)) => {
+                                        let _ = req.resp.send(Err(CoreError::Backend(
+                                            NAME,
+                                            format!("acp new session 失败: {e}"),
+                                        )));
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        let _ = req.resp.send(Err(CoreError::Backend(
+                                            NAME,
+                                            format!(
+                                                "acp new session {SESSION_SETUP_TIMEOUT:?} 无应答（agent 子进程僵死），已断开本会话连接"
+                                            ),
+                                        )));
+                                        break;
+                                    }
                                 }
-                                Err(e) => {
-                                    let _ = req.resp.send(Err(CoreError::Backend(
-                                        NAME,
-                                        format!("acp new session 失败: {e}"),
-                                    )));
-                                    break;
-                                }
-                            },
+                            }
                         };
                         // P5-5：session 一经建立/续接即通知 dispatch——被 /stop 或超时
                         // 中断的轮次拿不到 RunOutcome，靠它落库续接。
-                        let _ = st
-                            .chunks
-                            .send(AgentChunk::SessionStarted(sid.clone()))
-                            .await;
+                        // v1.21 review：与 forward_update 同款 30s 超时（通道满 +
+                        // 消费方失联时不许永久挂起 turn 主循环）。
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            st.chunks.send(AgentChunk::SessionStarted(sid.clone())),
+                        )
+                        .await;
                         let blocks = vec![ContentBlock::Text(TextContent::new(req.prompt.clone()))];
                         let prompt_fut = connection
                             .send_request(PromptRequest::new(
@@ -920,10 +996,10 @@ async fn forward_update(state: &StreamState, update: SessionUpdate) {
     let chunk = match update {
         SessionUpdate::AgentMessageChunk(chunk) => {
             if let Some(text) = text_of(&chunk.content) {
-                // 累计 agent 文本（同步 try_lock，不阻塞 dispatch loop）。
-                if let Ok(mut buf) = state.agent_text.try_lock() {
-                    buf.push_str(&text);
-                }
+                // 累计 agent 文本。v1.21 review：try_lock 失败即丢该段文本
+                //（final_text 缺口，零日志零补偿）——主循环对 agent_text 的持锁
+                // 全是微秒级 clone/读，改 lock().await 等待无害且零丢失。
+                state.agent_text.lock().await.push_str(&text);
                 Some(AgentChunk::Text(text))
             } else {
                 None
@@ -1009,18 +1085,19 @@ async fn forward_update(state: &StreamState, update: SessionUpdate) {
                 .as_ref()
                 .filter(|c| c.currency.eq_ignore_ascii_case("USD"))
                 .map(|c| c.amount);
-            if let Ok(mut g) = state.usage.try_lock() {
-                *g = Some(UsageStats {
-                    input_tokens: u.used,
-                    output_tokens: 0,
-                    cached_tokens: None,
-                    total_cost_usd: cost,
-                    // v1.20 窗口自学习：ACP `UsageUpdate.size` = 模型上下文
-                    // 窗口——经 RunOutcome 上抛 dispatcher 校准自动压缩比例档
-                    //（200k 模型部署不再依赖手配 model_context_window_tokens）。
-                    context_window: (u.size > 0).then_some(u.size),
-                });
-            }
+            // v1.21 review：此前 try_lock 失败静默丢弃整条 UsageUpdate——cost 基线
+            // 缺口（轮末增量记错）+ 窗口学习丢失。主循环对 usage 的持锁均微秒级，
+            // lock().await 等待零丢失。
+            *state.usage.lock().await = Some(UsageStats {
+                input_tokens: u.used,
+                output_tokens: 0,
+                cached_tokens: None,
+                total_cost_usd: cost,
+                // v1.20 窗口自学习：ACP `UsageUpdate.size` = 模型上下文
+                // 窗口——经 RunOutcome 上抛 dispatcher 校准自动压缩比例档
+                //（200k 模型部署不再依赖手配 model_context_window_tokens）。
+                context_window: (u.size > 0).then_some(u.size),
+            });
             None
         }
         other => {

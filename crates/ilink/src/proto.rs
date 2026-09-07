@@ -216,6 +216,7 @@ pub fn msg_to_inbound(msg: &Msg) -> InboundMessage {
         reply_to: None,
         source_msg_id: None,
         control: None,
+        no_steer: false,
         reply_hint: ReplyHint::ContextToken {
             context_token: msg.context_token.clone().unwrap_or_default(),
         },

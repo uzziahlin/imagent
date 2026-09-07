@@ -10,8 +10,28 @@
 
 /// 运行 agent 子进程所需的最小环境变量集（S-2 消毒后仅透传这些；各 backend
 /// 的凭据类 key 由调用方经 `passthrough_env` / ACP 命令前导另行声明）。
+/// v1.21 review：补网络代理与证书链——企业网/本机代理（HTTPS_PROXY 等）部署
+/// 下缺这些键时 agent 静默无法联网，错误表现为笼统的连接失败。
 pub const AGENT_RUNTIME_ENV: &[&str] = &[
-    "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR",
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TMPDIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
 ];
 
 /// env 值安全性：ACP 路径把 `NAME=value` 作为 argv 注入 `/usr/bin/env`，值含
@@ -32,11 +52,25 @@ mod tests {
     fn runtime_env_covers_process_basics() {
         // 与旧两处白名单逐项一致（漂移即测试失败）。
         for key in [
-            "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR",
+            "PATH",
+            "HOME",
+            "USER",
+            "LOGNAME",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "TZ",
+            "TMPDIR",
+            "HTTPS_PROXY",
+            "SSL_CERT_FILE",
         ] {
             assert!(AGENT_RUNTIME_ENV.contains(&key), "缺 {key}");
         }
-        assert_eq!(AGENT_RUNTIME_ENV.len(), 9, "白名单应恰好 9 项");
+        assert_eq!(
+            AGENT_RUNTIME_ENV.len(),
+            19,
+            "白名单应恰好 19 项（9 基础 + 10 网络/证书）"
+        );
     }
 
     #[test]

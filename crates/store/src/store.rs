@@ -1038,17 +1038,23 @@ impl Store {
         let inner = self.inner.clone();
         blocking_with_retry(inner, move |conn| {
             let now = now_secs();
-            conn.execute(
+            // v1.21 review（幂等）：INSERT + 轮转 DELETE 是两条独立 autocommit——
+            // BUSY 整闭包重放时 INSERT 再执行一次 = 同轮成本/审计双记
+            //（run_stats 双计会让 per-sender 预算虚高误拒）。包进单事务：
+            // BUSY 回滚后重放幂等。
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
                 "INSERT INTO audit_log (ts, action, actor, target, detail) \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 rusqlite::params![now, action, actor, target, detail],
             )?;
             // P2-R：审计日志轮转——保留最近 10000 条。用 max(id) 范围删除（索引高效），
             // 替代原 `NOT IN (SELECT ... LIMIT 10000)` 子查询（每条 O(N) 全扫）。
-            conn.execute(
+            tx.execute(
                 "DELETE FROM audit_log WHERE id <= (SELECT MAX(id) FROM audit_log) - 10000",
                 [],
             )?;
+            tx.commit()?;
             Ok(())
         })
         .await
@@ -1134,7 +1140,11 @@ impl Store {
         );
         let inner = self.inner.clone();
         blocking_with_retry(inner, move |conn| {
-            conn.execute(
+            // v1.21 review（幂等）：同 append_audit——INSERT + 轮转 DELETE 包进
+            // 单事务，BUSY 重放不再双计成本（sender_cost_since 求和虚高会误触
+            // per-sender 日上限拒绝消息）。
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
                 "INSERT INTO run_stats                    (conv_id, agent_kind, input_tokens, output_tokens, cached_tokens, cost_usd, ts, sender)                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 rusqlite::params![
                     conv_id,
@@ -1148,10 +1158,11 @@ impl Store {
                 ],
             )?;
             // 轮转：保留最近 10000 条（同 audit_log 的 P2-R 手法）。
-            conn.execute(
+            tx.execute(
                 "DELETE FROM run_stats WHERE id <= (SELECT MAX(id) FROM run_stats) - 10000",
                 [],
             )?;
+            tx.commit()?;
             Ok(())
         })
         .await
@@ -1391,12 +1402,17 @@ impl Store {
         let inner = self.inner.clone();
         let ids = rowids.to_vec();
         blocking_with_retry(inner, move |conn| {
+            // v1.21 review：逐行 DELETE 包单事务——部分删除后崩溃残留的行会在
+            // 下次启动被重放（at-least-once 窗口比必要的大）；事务内要么全删
+            // 要么全留。
+            let tx = conn.unchecked_transaction()?;
             for id in &ids {
-                conn.execute(
+                tx.execute(
                     "DELETE FROM queued_messages WHERE id = ?1",
                     rusqlite::params![id],
                 )?;
             }
+            tx.commit()?;
             Ok(())
         })
         .await

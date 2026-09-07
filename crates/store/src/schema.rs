@@ -3,7 +3,7 @@
 //! 用 `PRAGMA user_version` 做简单线性迁移：v1 = 建 5 张基础表，v2 = 动态白名单 + 审计日志。
 
 /// 当前代码支持的最新 schema 版本（migrate 上限 + user_version 过新拒绝阈值，P2-O）。
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 13;
 
 /// v1 全部建表语句（`CREATE TABLE IF NOT EXISTS`，可重复执行）。
 pub const SCHEMA_V1: &str = r#"
@@ -177,6 +177,12 @@ pub const SCHEMA_V12: &str = "CREATE TABLE IF NOT EXISTS queued_messages (
   created_at     INTEGER NOT NULL
 );";
 
+/// v13：run_stats (sender, ts) 索引——配置 per-sender 日限额后，每条入站消息的
+/// 预算闸门都做一次 `SUM(cost_usd) WHERE sender=? AND ts>=?`；无索引时全表扫
+///（轮转上限 1 万行，叠加单连接锁，消息热路径尾延迟放大）。
+pub const SCHEMA_V13: &str =
+    "CREATE INDEX IF NOT EXISTS idx_run_stats_sender_ts ON run_stats(sender, ts);";
+
 /// 在已打开的连接上跑线性迁移。幂等：逐版本推进（v1→v2→…），已到目标版本则跳过。
 pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     let current: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -243,6 +249,10 @@ pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     if current < 12 {
         tx.execute_batch(SCHEMA_V12)?;
         tx.pragma_update(None, "user_version", 12_i64)?;
+    }
+    if current < 13 {
+        tx.execute_batch(SCHEMA_V13)?;
+        tx.pragma_update(None, "user_version", 13_i64)?;
     }
     tx.commit()?;
     Ok(())

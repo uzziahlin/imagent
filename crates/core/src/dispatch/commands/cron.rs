@@ -188,7 +188,7 @@ impl Dispatcher {
         hint: &ReplyHint,
         parts: &[&str],
     ) {
-        let usage = "用法：/cron add <分 时 日 月 周> <指令>…（如 `/cron add 0 9 * * * 给我今日站会摘要`，\"* * * * *\" 每分钟、`0 9 * * 1-5` 工作日 9 点）\n/cron list 列出本会话任务 · /cron rm <id> 删除";
+        let usage = "用法：/cron add <分 时 日 月 周> <指令>…（如 `/cron add 0 9 * * * 给我今日站会摘要`，\"* * * * *\" 每分钟、`0 9 * * 1-5` 工作日 9 点）\n/cron list 列出本会话任务 · /cron rm <id> 删除 · /cron enable|disable <id> 启停";
         let Some(sub) = parts.get(1).map(|s| s.to_ascii_lowercase()) else {
             self.reply(conv, usage, hint).await;
             return;
@@ -297,7 +297,9 @@ impl Dispatcher {
                     let enabled_mark = if j.enabled {
                         String::new()
                     } else {
-                        "〔已停用：表达式无解〕".to_string()
+                        // v1.21：停用原因不再只有「表达式无解」（失权自动停用/
+                        // 手动 disable），列表只标状态不猜原因。
+                        "〔已停用，/cron enable 可恢复〕".to_string()
                     };
                     body.push_str(&format!(
                         "\n- `{}` `{}`（下次 {}）{} → {}",
@@ -345,6 +347,98 @@ impl Dispatcher {
                     }
                 }
             }
+            "enable" | "disable" => {
+                // v1.21：与失权/无解自动停用配套的手动启停。enable 须过权
+                //（conv 失权时启了也只会再次被自动停用）+ 表达式仍有解；disable
+                // 任意时候可停。权限与 rm 同口径（本人或管理员）。
+                let enable = sub == "enable";
+                let Some(id) = parts.get(2) else {
+                    self.reply(conv, &format!("⚠️ 缺少 id。\n{usage}"), hint)
+                        .await;
+                    return;
+                };
+                match self.store.get_cron_job(id).await {
+                    Ok(Some(job)) if job.conv == conv.0 => {
+                        if job.sender != sender.0 && !self.is_admin(&sender.0) {
+                            self.reply(
+                                conv,
+                                "⛔ 只能操作自己创建的任务（管理员可操作任意）。",
+                                hint,
+                            )
+                            .await;
+                            return;
+                        }
+                        if job.enabled == enable {
+                            let state = if enable {
+                                "已处于启用状态"
+                            } else {
+                                "已处于停用状态"
+                            };
+                            self.reply(conv, &format!("ℹ️ 任务 `{id}` {state}。",), hint)
+                                .await;
+                            return;
+                        }
+                        if enable {
+                            if !self.auth.is_allowed(sender) && !self.auth.is_chat_allowed(&conv.0)
+                            {
+                                self.reply(
+                                    conv,
+                                    "⛔ 本会话当前未获授权（/chat allow 或 sender 白名单），启用后会被立即自动停用；请先恢复授权。",
+                                    hint,
+                                )
+                                .await;
+                                return;
+                            }
+                            // 无解表达式启用后只会再次被自动停用——提前拦下并说明。
+                            if CronSpec::parse(&job.expr)
+                                .and_then(|s| s.next_after(super::super::now_secs()))
+                                .is_none()
+                            {
+                                self.reply(
+                                    conv,
+                                    &format!(
+                                        "⚠️ 任务 `{}` 的表达式 `{}` 一年内无触发时刻，启用无意义；请 /cron rm 后用修正的表达式重建。",
+                                        job.id, job.expr
+                                    ),
+                                    hint,
+                                )
+                                .await;
+                                return;
+                            }
+                        }
+                        match self.store.set_cron_enabled(id, enable).await {
+                            Ok(()) => {
+                                let head = if enable {
+                                    "▶️ 已启用"
+                                } else {
+                                    "⏸️ 已停用"
+                                };
+                                let tail = if enable {
+                                    let next = CronSpec::parse(&job.expr)
+                                        .and_then(|s| s.next_after(super::super::now_secs()))
+                                        .map(|t| format!("，下次 {}", format_local(t)))
+                                        .unwrap_or_default();
+                                    next
+                                } else {
+                                    String::new()
+                                };
+                                self.reply(conv, &format!("{head}定时任务 `{id}`{tail}。",), hint)
+                                    .await
+                            }
+                            Err(e) => {
+                                warn!(target: "imagent::core", error = %e, "定时任务启停失败");
+                                self.reply(conv, "⚠️ 操作失败（存储错误）。", hint).await;
+                            }
+                        }
+                    }
+                    Ok(Some(_)) => self.reply(conv, "⛔ 任务不属于本会话。", hint).await,
+                    Ok(None) => self.reply(conv, "⚠️ 任务不存在。", hint).await,
+                    Err(e) => {
+                        warn!(target: "imagent::core", error = %e, "定时任务查询失败");
+                        self.reply(conv, "⚠️ 查询失败（存储错误）。", hint).await;
+                    }
+                }
+            }
             _ => self.reply(conv, usage, hint).await,
         }
     }
@@ -361,6 +455,27 @@ impl Dispatcher {
             }
         };
         for job in due {
+            // v1.21 review（失权治理）：conv 被 /chat deny（或 bot 被移群收回
+            // 授权）后 cron 行不清理——每周期照常合成消息被鉴权丢弃；p2p conv
+            // 叠加 stranger_p2p_hint 时每次触发回一条引导（每分钟任务 = 每天
+            // 1440 条 DM）。触发前按 handle 同口径预检，失权即停用任务并通知
+            // 会话一次（终态，不再循环）。
+            if !self.auth.is_allowed(&UserId(job.sender.clone()))
+                && !self.auth.is_chat_allowed(&job.conv)
+            {
+                warn!(target: "imagent::core", id = %job.id, conv_id = %job.conv, "定时任务所属会话已失权，自动停用");
+                let _ = self.store.set_cron_enabled(&job.id, false).await;
+                self.reply(
+                    &ConvId(job.conv.clone()),
+                    &format!(
+                        "⏰ 定时任务 `{}`（`{}`）所属会话已失去授权（/chat deny 或 bot 被移出群），已自动停用。\n重新授权后可用 /cron enable {} 恢复。",
+                        job.id, job.expr, job.id
+                    ),
+                    &ReplyHint::None,
+                )
+                .await;
+                continue;
+            }
             let next = match CronSpec::parse(&job.expr).and_then(|s| s.next_after(now)) {
                 Some(n) => n,
                 None => {
@@ -388,31 +503,39 @@ impl Dispatcher {
             // v1.20 停机补跑：数出旧 next_run 之后到 now 之间错过的额外周期数
             //（本到期槽自身算 1）。off：陈旧（错过 ≥2 槽）只重排不触发；all：
             // 逐槽补跑，上限 3 条（防雪崩），消息标注 (i/n)；one（缺省）：现状
-            // 只触发一次。
-            let extra_missed = CronSpec::parse(&job.expr)
-                .map(|s| {
-                    let mut t = job.next_run;
-                    let mut n = 0u32;
-                    while let Some(next_t) = s.next_after(t) {
-                        if next_t > now || n >= 3 {
-                            break;
-                        }
-                        t = next_t;
-                        n += 1;
-                    }
-                    n
-                })
-                .unwrap_or(0);
+            // 只触发一次。v1.21 review：计数只在 all 档才需要——one/off 档白做
+            // 最多 4 次 next_after 逐分钟扫描（约 50ms 级）。
             let fires: u32 = match self.cron_catchup {
                 crate::config::CronCatchup::One => 1,
                 crate::config::CronCatchup::Off => {
-                    if extra_missed >= 1 {
-                        info!(target: "imagent::core", id = %job.id, extra_missed, "陈旧到期按 off 策略跳过（仅重排）");
+                    // off 档只需判断「是否陈旧」：next_run 之外还有 ≥1 个错过
+                    // 槽 = 陈旧。单步 next_after 即可判定。
+                    let stale = CronSpec::parse(&job.expr)
+                        .and_then(|s| s.next_after(job.next_run))
+                        .is_some_and(|t| t <= now);
+                    if stale {
+                        info!(target: "imagent::core", id = %job.id, "陈旧到期按 off 策略跳过（仅重排）");
                         continue;
                     }
                     1
                 }
-                crate::config::CronCatchup::All => (1 + extra_missed).min(3),
+                crate::config::CronCatchup::All => {
+                    let extra_missed = CronSpec::parse(&job.expr)
+                        .map(|s| {
+                            let mut t = job.next_run;
+                            let mut n = 0u32;
+                            while let Some(next_t) = s.next_after(t) {
+                                if next_t > now || n >= 3 {
+                                    break;
+                                }
+                                t = next_t;
+                                n += 1;
+                            }
+                            n
+                        })
+                        .unwrap_or(0);
+                    (1 + extra_missed).min(3)
+                }
             };
             info!(target: "imagent::core", id = %job.id, conv_id = %job.conv, fires, "定时任务触发");
             for i in 1..=fires {
@@ -433,6 +556,8 @@ impl Dispatcher {
                     reply_to: None,
                     source_msg_id: None,
                     control: None,
+                    // v1.21 review：合成消息不走 steering（独立轮次 + 持久化兜底）。
+                    no_steer: true,
                     reply_hint: ReplyHint::None,
                 };
                 // 调度器只分发不执行：handle 对空闲 conv 会内联跑完整轮 agent

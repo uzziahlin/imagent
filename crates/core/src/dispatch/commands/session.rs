@@ -407,6 +407,24 @@ impl Dispatcher {
         if threshold == 0 || in_tokens < threshold {
             return;
         }
+        // v1.21 review（失败退避）：压缩持续失败时，每个水位超阈的成功轮都会
+        // 重试压缩（两张卡 + 一次完整 agent 跑）——失败后 1 小时内不再自动
+        // 尝试（水位提示照常，手动 /compact 不受限）。
+        const COMPACT_FAIL_BACKOFF_SECS: i64 = 3600;
+        {
+            let last = self.compact_fail_last.lock().await;
+            if let Some(&ts) = last.get(&conv.0) {
+                if crate::dispatch::now_secs() - ts < COMPACT_FAIL_BACKOFF_SECS {
+                    debug!(
+                        target: "imagent::core",
+                        conv_id = %conv.0,
+                        in_tokens,
+                        "自动压缩处于失败退避窗口，本轮跳过（可手动 /compact）"
+                    );
+                    return;
+                }
+            }
+        }
         // 无活动会话（本轮未落库/失败）不压缩。
         let Ok(Some(row)) = self.store.get_session(&conv.0).await else {
             return;
@@ -434,6 +452,8 @@ impl Dispatcher {
             .await;
         match self.compact_session_locked(conv, &sid).await {
             Ok(summary) => {
+                // 成功即清退避标记（下次水位超阈恢复自动尝试）。
+                self.compact_fail_last.lock().await.remove(&conv.0);
                 let _ = self
                     .platform
                     .send_command_card(
@@ -454,11 +474,15 @@ impl Dispatcher {
                     target: "imagent::core",
                     conv_id = %conv.0,
                     error = %e,
-                    "自动压缩失败（下轮水位仍高会再次尝试）"
+                    "自动压缩失败（1 小时内不再自动重试，可手动 /compact）"
                 );
+                self.compact_fail_last
+                    .lock()
+                    .await
+                    .insert(conv.0.clone(), crate::dispatch::now_secs());
                 self.reply(
                     conv,
-                    "⚠️ 自动压缩失败（不影响既有会话；可稍后手动 /compact）。",
+                    "⚠️ 自动压缩失败（不影响既有会话；1 小时内不再自动重试，可手动 /compact）。",
                     hint,
                 )
                 .await;
