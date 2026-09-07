@@ -253,6 +253,15 @@ pub struct WebhookEntry {
     pub conv: String,
     /// 展示名（注入消息的来源前缀 `【name】`，如 "ci" / "grafana"）。
     pub name: String,
+    /// 可选 HMAC-SHA256 验签密钥（GitHub webhook secret 同款协议：请求头
+    /// `X-Hub-Signature-256: sha256=<hex>` = HMAC(body)）。设置后签名不符
+    /// 直接 401——公网/隧道部署下防止 token 泄漏被伪造事件。
+    #[serde(default)]
+    pub secret: Option<String>,
+    /// 每 token 限速（请求/秒，缺省 10；0 = 不限）。洪泛源（重试风暴/
+    /// 恶意刷）下保护 IM 侧不刷屏、不触发平台频控。
+    #[serde(default)]
+    pub rps: Option<f64>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -771,6 +780,23 @@ impl Config {
                         "webhook token 重复（name={}）",
                         w.name
                     )));
+                }
+                // v1.21 防护套件：secret 强度与 rps 边界。
+                if let Some(s) = w.secret.as_deref() {
+                    if s.len() < 8 {
+                        return Err(CoreError::Config(format!(
+                            "webhook secret 至少 8 字符（name={}）——过短可爆破",
+                            w.name
+                        )));
+                    }
+                }
+                if let Some(rps) = w.rps {
+                    if !(0.0..=1000.0).contains(&rps) {
+                        return Err(CoreError::Config(format!(
+                            "webhook rps 须在 [0, 1000]（name={}，当前 {rps}）；0 = 不限速",
+                            w.name
+                        )));
+                    }
                 }
             }
             let addr_set = cfg

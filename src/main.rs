@@ -1258,6 +1258,84 @@ fn webhook_body_text_variants() {
     assert!(webhook_body_text(br#"{"other":1}"#).is_some());
 }
 
+/// v1.21：HMAC 验签——正签通过、错签/错体/畸形 hex 拒绝（GitHub sha256= 前缀
+/// 与裸 hex 两形态）。
+#[test]
+fn webhook_signature_verify() {
+    use hmac::Mac as _;
+    let secret = "topsecret-0123456789";
+    let body = br#"{"text":"hi"}"#;
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(body);
+    let sig = hex::encode(mac.finalize().into_bytes().as_slice());
+    assert!(verify_webhook_signature(
+        secret,
+        body,
+        &format!("sha256={sig}")
+    ));
+    assert!(verify_webhook_signature(secret, body, &sig));
+    assert!(!verify_webhook_signature(secret, body, "sha256=deadbeef"));
+    assert!(!verify_webhook_signature(
+        secret,
+        b"tampered",
+        &format!("sha256={sig}")
+    ));
+    assert!(!verify_webhook_signature(
+        "other-secret",
+        body,
+        &format!("sha256={sig}")
+    ));
+    assert!(!verify_webhook_signature(secret, body, "not-hex!"));
+    assert!(!verify_webhook_signature(secret, body, ""));
+}
+
+/// v1.21：令牌桶——rps>0 时容量 = max(1, rps)，耗尽 429，回填后恢复；
+/// rps=0 不限速。
+#[test]
+fn webhook_token_bucket() {
+    let mut b = TokenBucket::new(2.0);
+    assert!(b.try_take(2.0));
+    assert!(b.try_take(2.0));
+    assert!(!b.try_take(2.0), "容量 2 应耗尽");
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    assert!(b.try_take(2.0), "回填 ~1.2 个后应恢复");
+    let mut unbounded = TokenBucket::new(0.0);
+    for _ in 0..100 {
+        assert!(unbounded.try_take(0.0), "rps=0 不限速");
+    }
+}
+
+/// v1.21：GitHub 原生 payload → 摘要文本（workflow_run 终态/中间态、push、
+/// 未知事件 Skip）。
+#[test]
+fn github_event_summary_variants() {
+    let wf = br#"{"action":"completed","workflow_run":{"name":"CI","head_branch":"main","conclusion":"failure","run_number":42,"html_url":"https://github.com/u/r/actions/runs/1","actor":{"login":"uzziahlin"}},"repository":{"full_name":"u/r"}}"#;
+    match github_event_text("workflow_run", wf) {
+        GithubEventText::Text(t) => {
+            assert!(t.contains("CI") && t.contains("failure") && t.contains("runs/1"));
+        }
+        GithubEventText::Skip => panic!("completed 应产出文本"),
+    }
+    let wf_mid = br#"{"action":"in_progress","workflow_run":{"name":"CI"}}"#;
+    assert!(matches!(
+        github_event_text("workflow_run", wf_mid),
+        GithubEventText::Skip
+    ));
+    let push = br#"{"pusher":{"name":"alice"},"ref":"refs/heads/main","compare":"https://github.com/u/r/compare/a...b","repository":{"full_name":"u/r"},"commits":[{"message":"fix: one\n\nbody"},{"message":"feat: two"}]}"#;
+    match github_event_text("push", push) {
+        GithubEventText::Text(t) => {
+            assert!(t.contains("alice") && t.contains("fix: one") && t.contains("feat: two"));
+        }
+        GithubEventText::Skip => panic!("push 应产出文本"),
+    }
+    assert!(matches!(
+        github_event_text("star", br#"{}"#),
+        GithubEventText::Skip
+    ));
+    assert_eq!(truncate_chars("abcdef", 3), "abc…");
+    assert_eq!(truncate_chars("ab", 3), "ab");
+}
+
 fn bearer_authorized(headers: &axum::http::HeaderMap, token: Option<&str>) -> bool {
     let Some(expected) = token else {
         return true;
@@ -1286,11 +1364,88 @@ fn bearer_authorized(headers: &axum::http::HeaderMap, token: Option<&str>) -> bo
 /// 鉴权 = 路径 token 与 config [[webhook]] 精确匹配；body ≤64KB；
 /// JSON `{"text": "..."}` 取 text，否则整包作为纯文本。与 /cron 同走
 /// handle() 完整管线（会话白名单门内才有 agent，无旁路）。
+/// v1.21 防护套件：可选 HMAC-SHA256 验签（GitHub webhook secret 协议）+
+/// 每 token 令牌桶限速 + GitHub 原生 payload 结构化摘要。
 #[derive(Clone)]
 struct WebhookState {
-    /// token → (conv, name)
-    routes: std::collections::HashMap<String, (String, String)>,
+    /// token → 路由（含验签密钥/限速桶）
+    routes: std::collections::HashMap<String, std::sync::Arc<WebhookRoute>>,
     dispatcher: Arc<imagent_core::Dispatcher>,
+}
+
+/// 单条 webhook 路由：投递目标 + 防护配置 + 限速桶（std Mutex——临界区纯内存
+/// 无 await）。
+struct WebhookRoute {
+    conv: String,
+    name: String,
+    /// HMAC-SHA256 验签密钥（GitHub webhook secret 协议）。None = 不验签。
+    secret: Option<String>,
+    /// 令牌桶速率（请求/秒）；0 = 不限速。
+    rps: f64,
+    bucket: std::sync::Mutex<TokenBucket>,
+}
+
+/// 简单令牌桶（纯内存，webhook 单进程内生效）。
+struct TokenBucket {
+    tokens: f64,
+    last: std::time::Instant,
+}
+
+impl TokenBucket {
+    fn new(full: f64) -> Self {
+        Self {
+            tokens: full,
+            last: std::time::Instant::now(),
+        }
+    }
+    /// 尝试取 1 个令牌：先按 elapsed×rps 回填（封顶容量 = max(1, rps)，约 1s
+    /// 突发余量），余量 ≥1 才放行。
+    fn try_take(&mut self, rps: f64) -> bool {
+        if rps <= 0.0 {
+            return true; // 不限速
+        }
+        let cap = rps.max(1.0);
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last).as_secs_f64();
+        if elapsed > 0.0 {
+            self.tokens = (self.tokens + elapsed * rps).min(cap);
+            self.last = now;
+        }
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// v1.21 HMAC-SHA256 验签（GitHub webhook secret 同款协议）：
+/// `X-Hub-Signature-256: sha256=<hex>`（也兼容裸 hex 的 `X-Signature` 形态）。
+/// 常数时间比较（防时序侧信道）；hex 解码失败/长度不符直接 false。
+fn verify_webhook_signature(secret: &str, body: &[u8], header_value: &str) -> bool {
+    use hmac::Mac as _;
+    let hex_sig = header_value
+        .strip_prefix("sha256=")
+        .unwrap_or(header_value)
+        .trim();
+    let Ok(expect) = hex::decode(hex_sig) else {
+        return false;
+    };
+    let Ok(mut mac) = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()) else {
+        return false;
+    };
+    mac.update(body);
+    let computed = mac.finalize().into_bytes();
+    // 常数时间比较（与 bearer_authorized 同款 XOR 累计——不引入 subtle 依赖）。
+    let n = computed.len().max(expect.len());
+    let mut diff: u8 = (computed.len() != expect.len()) as u8;
+    for i in 0..n {
+        let x = computed.get(i).copied().unwrap_or(0);
+        let y = expect.get(i).copied().unwrap_or(0);
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn spawn_webhook_server(
@@ -1298,9 +1453,22 @@ fn spawn_webhook_server(
     entries: Vec<imagent_core::WebhookEntry>,
     dispatcher: Arc<imagent_core::Dispatcher>,
 ) {
+    const DEFAULT_WEBHOOK_RPS: f64 = 10.0;
     let routes = entries
         .into_iter()
-        .map(|e| (e.token, (e.conv, e.name)))
+        .map(|e| {
+            let rps = e.rps.unwrap_or(DEFAULT_WEBHOOK_RPS);
+            (
+                e.token,
+                std::sync::Arc::new(WebhookRoute {
+                    conv: e.conv,
+                    name: e.name,
+                    secret: e.secret,
+                    rps,
+                    bucket: std::sync::Mutex::new(TokenBucket::new(rps.max(1.0))),
+                }),
+            )
+        })
         .collect();
     let state = WebhookState { routes, dispatcher };
     // v1.21 review：停机时停止 accept——drain 期间注入只会挂死/被丢弃，
@@ -1345,24 +1513,213 @@ fn webhook_body_text(body: &[u8]) -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
 }
 
+/// v1.21 GitHub 原生事件解析结果：`Text` 注入会话；`Skip` 确认收到但不注入
+///（进行中/未订阅的中间事件——注入只会产生噪音与无效 agent 轮次）。
+enum GithubEventText {
+    Text(String),
+    Skip,
+}
+
+/// GitHub webhook payload（`X-GitHub-Event` 头存在时）→ 可读事件摘要。
+/// 覆盖 CI/协作主链路事件；未识别的事件类型一律 Skip（raw JSON 注入只会让
+/// agent 解析噪音——自定义注入请走无该头的 JSON `{"text": ...}` 形态）。
+fn github_event_text(event: &str, body: &[u8]) -> GithubEventText {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return GithubEventText::Skip;
+    };
+    let s = |path: &[&str]| -> String {
+        let mut cur = &v;
+        for k in path {
+            cur = &cur[*k];
+        }
+        cur.as_str().unwrap_or_default().to_string()
+    };
+    match event {
+        "ping" => GithubEventText::Text(format!(
+            "🏓 GitHub webhook 连通性测试成功：仓库 {} 的事件订阅已生效。",
+            s(&["repository", "full_name"])
+        )),
+        "workflow_run" => {
+            // 只注入终态（completed）——requested/in_progress 每次跑三连发，
+            // 中间态对「驱动 agent」无信息量。
+            if s(&["action"]) != "completed" {
+                return GithubEventText::Skip;
+            }
+            let conclusion = s(&["workflow_run", "conclusion"]);
+            let mark = match conclusion.as_str() {
+                "success" => "✅",
+                "failure" => "❌",
+                "cancelled" => "⚠️",
+                _ => "⏹️",
+            };
+            GithubEventText::Text(format!(
+                "{mark} GitHub Actions：「{}」（{} 分支）{}\n仓库 {} · 触发 {} · 第 {} 次运行\n{}",
+                s(&["workflow_run", "name"]),
+                s(&["workflow_run", "head_branch"]),
+                conclusion,
+                s(&["repository", "full_name"]),
+                s(&["workflow_run", "actor", "login"]),
+                v["workflow_run"]["run_number"].as_i64().unwrap_or(0),
+                s(&["workflow_run", "html_url"]),
+            ))
+        }
+        "push" => {
+            let commits = v["commits"].as_array().cloned().unwrap_or_default();
+            let msgs: Vec<String> = commits
+                .iter()
+                .take(3)
+                .filter_map(|c| {
+                    c["message"]
+                        .as_str()
+                        .and_then(|m| m.lines().next())
+                        .map(str::to_string)
+                })
+                .collect();
+            let list = if msgs.is_empty() {
+                "（无提交——可能是分支删除或 tag 操作）".to_string()
+            } else {
+                let mut l = msgs
+                    .iter()
+                    .map(|m| format!("- {m}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if commits.len() > msgs.len() {
+                    l.push_str(&format!("\n- ……等共 {} 个提交", commits.len()));
+                }
+                l
+            };
+            let git_ref = s(&["ref"]).trim_start_matches("refs/heads/").to_string();
+            GithubEventText::Text(format!(
+                "📦 GitHub push：{} → {}（{}）\n{}\n{}",
+                s(&["pusher", "name"]),
+                s(&["repository", "full_name"]),
+                git_ref,
+                list,
+                s(&["compare"])
+            ))
+        }
+        "issues" => {
+            let action = s(&["action"]);
+            // assigned/labeled/unassigned 等低价值动作跳过。
+            if !matches!(action.as_str(), "opened" | "closed" | "reopened") {
+                return GithubEventText::Skip;
+            }
+            let mark = if action == "closed" { "✅" } else { "🎯" };
+            GithubEventText::Text(format!(
+                "{mark} GitHub issue {}：#{} {}\nby {} · {}\n{}",
+                action,
+                v["issue"]["number"].as_i64().unwrap_or(0),
+                s(&["issue", "title"]),
+                s(&["issue", "user", "login"]),
+                s(&["repository", "full_name"]),
+                s(&["issue", "html_url"]),
+            ))
+        }
+        "issue_comment" => {
+            if s(&["action"]) != "created" {
+                return GithubEventText::Skip;
+            }
+            let body_txt = truncate_chars(&s(&["comment", "body"]), 300);
+            GithubEventText::Text(format!(
+                "💬 GitHub 新评论（{}#{} {}）：\n{}：{}\n{}",
+                s(&["repository", "full_name"]),
+                v["issue"]["number"].as_i64().unwrap_or(0),
+                s(&["issue", "title"]),
+                s(&["comment", "user", "login"]),
+                body_txt,
+                s(&["comment", "html_url"]),
+            ))
+        }
+        "pull_request" => {
+            let action = s(&["action"]);
+            if !matches!(
+                action.as_str(),
+                "opened" | "closed" | "reopened" | "review_requested"
+            ) {
+                return GithubEventText::Skip;
+            }
+            let merged = v["pull_request"]["merged"].as_bool().unwrap_or(false);
+            let action_disp = if merged {
+                "merged（已合并）".to_string()
+            } else {
+                action
+            };
+            let mark = if merged { "🎉" } else { "🌱" };
+            GithubEventText::Text(format!(
+                "{mark} GitHub PR {}：#{} {}\nby {} · {} ← {}\n{}",
+                action_disp,
+                v["pull_request"]["number"].as_i64().unwrap_or(0),
+                s(&["pull_request", "title"]),
+                s(&["pull_request", "user", "login"]),
+                s(&["pull_request", "base", "ref"]),
+                s(&["pull_request", "head", "ref"]),
+                s(&["pull_request", "html_url"]),
+            ))
+        }
+        _ => GithubEventText::Skip,
+    }
+}
+
+/// 按字符截断（中文安全），尾加省略标记。
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let t: String = s.chars().take(max).collect();
+    format!("{t}…")
+}
+
 async fn webhook_handler(
     State(st): State<WebhookState>,
     axum::extract::Path(token): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> impl IntoResponse {
-    let Some((conv, name)) = st.routes.get(&token) else {
+    let Some(route) = st.routes.get(&token) else {
         return (StatusCode::NOT_FOUND, "unknown token\n");
     };
     let Ok(bytes) = body else {
         return (StatusCode::PAYLOAD_TOO_LARGE, "body too large (64KB)\n");
     };
-    let Some(text) = webhook_body_text(&bytes) else {
-        return (StatusCode::BAD_REQUEST, "empty or undecodable body\n");
+    // v1.21 防护①：HMAC 验签（配置了 secret 时强制）——GitHub 头
+    // `X-Hub-Signature-256: sha256=<hex>`；兼容裸 hex 的 `X-Signature`。
+    if let Some(secret) = route.secret.as_deref() {
+        let sig = headers
+            .get("x-hub-signature-256")
+            .or_else(|| headers.get("x-signature"))
+            .and_then(|h| h.to_str().ok());
+        let ok = sig.is_some_and(|s| verify_webhook_signature(secret, &bytes, s));
+        if !ok {
+            tracing::warn!(target: "imagent::ops", name = %route.name, "webhook 验签失败/缺失，拒绝");
+            return (StatusCode::UNAUTHORIZED, "invalid signature\n");
+        }
+    }
+    // v1.21 防护②：每 token 令牌桶限速。
+    {
+        let mut bucket = route.bucket.lock().unwrap_or_else(|e| e.into_inner());
+        if !bucket.try_take(route.rps) {
+            return (StatusCode::TOO_MANY_REQUESTS, "rate limited\n");
+        }
+    }
+    // v1.21 GitHub 原生事件：X-GitHub-Event 头存在 → 结构化摘要（未知事件
+    // Skip 确认不注入）；否则走通用 text 提取。
+    let text = match headers.get("x-github-event").and_then(|h| h.to_str().ok()) {
+        Some(event) => match github_event_text(event, &bytes) {
+            GithubEventText::Text(t) => t,
+            GithubEventText::Skip => {
+                tracing::debug!(target: "imagent::ops", event, name = %route.name, "GitHub 事件按策略跳过（中间态/未订阅）");
+                return (StatusCode::ACCEPTED, "ignored\n");
+            }
+        },
+        None => match webhook_body_text(&bytes) {
+            Some(t) => t,
+            None => return (StatusCode::BAD_REQUEST, "empty or undecodable body\n"),
+        },
     };
     let msg = imagent_core::InboundMessage {
-        conv_id: imagent_core::ConvId(conv.clone()),
-        sender: imagent_core::UserId(format!("webhook:{name}")),
-        text: Some(format!("【{name}】{text}")),
+        conv_id: imagent_core::ConvId(route.conv.clone()),
+        sender: imagent_core::UserId(format!("webhook:{}", route.name)),
+        text: Some(format!("【{}】{}", route.name, text)),
         media: vec![],
         media_errors: Vec::new(),
         mentions: Vec::new(),
@@ -1375,7 +1732,7 @@ async fn webhook_handler(
         no_steer: true,
         reply_hint: imagent_core::ReplyHint::None,
     };
-    tracing::info!(target: "imagent::ops", conv = %conv, name = %name, "webhook 命中，注入 dispatcher");
+    tracing::info!(target: "imagent::ops", conv = %route.conv, name = %route.name, "webhook 命中，注入 dispatcher");
     match st.dispatcher.inject(msg).await {
         Ok(()) => (StatusCode::ACCEPTED, "queued\n"),
         Err(e) => {

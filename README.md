@@ -143,12 +143,18 @@ allowed_senders = []        # 留空 = 发现模式（先看日志拿你的 from
 # feishu_thread_active_window_secs = 1800  # 话题群免@窗口(秒)：话题内近期有消息则豁免群消息须@bot；默认30分钟，0=关闭
 # platform = "feishu"                # wecom/feishu 经 config 凭据接入（见下）
 
-# ===== 事件入站（v1.20 webhook）=====
-# webhook_addr = "127.0.0.1:18443"   # POST /hook/<token>；非 loopback 部署靠 32+ 位随机 token 防护
+# ===== 事件入站（v1.20 webhook；v1.21 防护套件 + GitHub 原生事件）=====
+# webhook_addr = "127.0.0.1:18443"   # POST /hook/<token>；非 loopback 部署建议 secret 验签 + 32+ 位随机 token
 # [[webhook]]                         # token → 会话（须 /chat allow 放行才会驱动 agent）
 # token = "0123456789abcdef0123456789abcdef"
 # conv  = "feishu:oc_xxx"
 # name  = "ci"                        # 注入消息带【ci】来源前缀
+# secret = "github-webhook-secret"    # 可选 HMAC-SHA256 验签（GitHub webhook secret 同款：
+#                                     #   X-Hub-Signature-256: sha256=<hex>；公网/隧道部署强烈建议）
+# rps = 10                            # 可选限速（请求/秒，缺省 10；0 = 不限）
+# GitHub 原生事件：带 X-GitHub-Event 头的请求自动解析为可读摘要注入
+#（workflow_run 终态/push/issues/评论/PR/ping；未识别事件确认但不注入）；
+# 其它来源请 POST JSON {"text":"..."} 或纯文本。
 # cron_catchup = "one"                # /cron 停机补跑：one(缺省)|off(陈旧跳过)|all(逐周期补跑,上限3)
 
 # ===== 用量护栏（v1.19 比例档）=====

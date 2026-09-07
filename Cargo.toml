@@ -44,6 +44,7 @@ hex = "0.4"
 aes-gcm = "0.10"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 sha2 = "0.10"
+hmac = { version = "0.12", default-features = false }
 
 # 存储 / 工具
 rusqlite = { version = "0.31", features = ["bundled"] }
@@ -92,6 +93,9 @@ anyhow = { workspace = true }
 dirs = { workspace = true }
 serde_json = { workspace = true }
 axum = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
 reqwest = { workspace = true }
