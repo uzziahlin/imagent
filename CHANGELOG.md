@@ -2,6 +2,47 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.21.0] — 2026-09-04
+
+> **v1.20 复审修复批次**（docs/CODE_REVIEW_v11.md）：新功能（webhook/cron/
+> ACP 窗口学习/崩溃恢复）与既有机制的集成缝隙集中修复——4 类 P1 全清，
+> 共 26 项。全仓 672 tests / 0 failed、clippy 零警告。
+
+### Fixed
+- **P1 /stop 死队列**：批窗口期 /stop 拦截批次后空队列 entry 悬挂，本会话
+  后续消息永久滞留（只入队不执行）直到重启——改走自然退出路径并加回归
+  测试
+- **P1 cron/webhook 被 steering 劫持**：合成消息此前被 `try_send` 灌进在飞
+  无关轮次的 stdin（独立轮次语义破坏 + 注入无持久化、轮收尾即丢）；
+  `InboundMessage` 增 `no_steer` 标记，cron/webhook 一律独立轮次
+- **P1 ACP 永久毒化**：initialize 握手 / LoadSession / NewSession /
+  SessionStarted 阶段无超时——agent 子进程僵死时连接永久挂起、8 槽位占满
+  即全局拒绝服务；各阶段超时（60s/30s）后自愈断连并回真实错误
+- **P1 store 成本双计**：run_stats/audit 的 INSERT+轮转 DELETE 非幂等 +
+  BUSY 重放双记——per-sender 日预算虚高误拒；包单事务后重放幂等
+- **feishu P1 三连**：send_media 读前无大小预检（OOM 风险）；drain 循环
+  内联 await 提示发送（HTTP 分区时全平台入站队头阻塞 30s+）；WS 连接
+  静默黑洞永不重连（新增 30min 无事件看门狗）
+- webhook 启动时序：replay/recover 前置到 accept 之前（启动窗口双执行/
+  崩溃轮误判归零）；停机期注入改 503 + server 随停机优雅关停（假 202 修复）
+- cron 失权治理：会话 deny 后任务自动停用 + 一次性通知（此前 p2p 每分钟
+  任务 = 每天 1440 条引导 DM）；新增 `/cron enable|disable` 手动启停
+- 窗口自学习护栏（区间外学习值丢弃）；自动压缩失败 1h 退避；排队上限
+  告警 per-conv 去重；崩溃恢复不覆盖更近的 last_prompt；inflight 清除
+  失败留痕
+- ACP try_lock 失败静默丢文本/UsageUpdate（cost 基线 + 窗口学习丢失）
+- token 刷新失败 5s 负缓存；WS Ok() 快速返回不再重置退避（重连循环）；
+  housekeeping 驱逐兜底 clear；card_seqs/card_footers 上限；BOT_SENT
+  锁中毒恢复
+- prompt argv 100KB 预检（E2BIG 可读化）；非 control 路径 child.wait
+  10s 超时
+
+### Changed
+- env 白名单：`ANTHROPIC_AUTH_TOKEN` + 代理/证书 9 键（HTTP(S)_PROXY/
+  NO_PROXY/SSL_CERT_*）；CLI 另增 `GH_TOKEN`/`GITHUB_TOKEN` 透传
+  （/cron 拉 gh 查 CI 场景）
+- store v13 迁移：run_stats `(sender, ts)` 索引（日限额闸门免全表扫）
+
 ## [1.20.0] — 2026-09-06
 
 > **事件驱动跃迁**：Webhook 入站（头牌）+ ACP 窗口自学习 + 崩溃轮次恢复
