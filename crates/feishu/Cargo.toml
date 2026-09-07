@@ -11,6 +11,8 @@ publish.workspace = true
 imagent-core = { path = "../core" }
 # v1.21 outbox：发送失败的持久化重试队列（drain 提示类 best-effort 消息落盘）。
 imagent-store = { path = "../store" }
+# v1.21 入站管道可观测性：与 core/ilink 共享默认 registry 自注册指标。
+prometheus = { workspace = true }
 openlark = { workspace = true }
 # Wave B-4：quiet_hours 免打扰时段的本地时区判定（Local::now；已是 lock 内传递
 # 依赖，无新增包）。

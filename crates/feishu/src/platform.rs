@@ -179,6 +179,28 @@ struct SendBucket {
     last: Instant,
 }
 
+/// v1.21 可观测性：drain 单事件时延 guard——构造于事件取出、drop 于处理完
+///（含 continue 路径），Drop 时 observe。
+struct DrainEventTimer {
+    started: Instant,
+}
+
+impl Default for DrainEventTimer {
+    fn default() -> Self {
+        Self {
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for DrainEventTimer {
+    fn drop(&mut self) {
+        crate::metrics::METRICS
+            .drain_event
+            .observe(self.started.elapsed().as_secs_f64());
+    }
+}
+
 impl FeishuPlatform {
     /// 构造并后台 spawn：① WS client run task（收事件 + 重连）；
     /// ② drain task（payload → `parse_message_event` → Dedup → inbound channel）。
@@ -285,6 +307,12 @@ impl FeishuPlatform {
             // 事件经泵发出，媒体/合并转发处理 spawn 后按 conv 入队等序。
             let mut conv_pumps: HashMap<String, mpsc::UnboundedSender<PumpJob>> = HashMap::new();
             while let Some(payload) = payload_rx.recv().await {
+                // v1.21 可观测性：单事件处理时延 + channel 积压采样（停摆
+                // 先行信号，见 metrics.rs 文档）。
+                crate::metrics::METRICS
+                    .ws_backlog
+                    .set(payload_rx.len() as f64);
+                let _drain_timer = DrainEventTimer::default();
                 // 三类事件：普通消息（含媒体下载）/ 审批按钮回调 / 云文档评论。
                 // P6-1：群消息的 @bot 过滤与 @bot 文本剥离需要 bot open_id——
                 // 首个群消息事件懒取（与评论事件共用缓存），失败退化为弱过滤。
@@ -1896,6 +1924,9 @@ async fn conv_pump(
             Some(j) => j,
             None => break, // 全部 sender drop
         };
+        // v1.21 可观测性：取件即减（与 pump_send 的 inc 配对）——gauge 反映
+        // 「已入队未取件」的总量，媒体队头阻塞时先行增长。
+        crate::metrics::METRICS.pump_pending.dec();
         let msg = match job {
             PumpJob::Ready(m) => Some(m),
             PumpJob::Media(h) => match h.await {
@@ -1945,21 +1976,30 @@ fn pump_send(
         }
     }
     use std::collections::hash_map::Entry;
-    match pumps.entry(conv.to_string()) {
+    let sent = match pumps.entry(conv.to_string()) {
         Entry::Occupied(mut e) => {
             // SendError 含被退回的 job：重建泵后原样重发（此前 `let _ =` 把
             // job 一并丢弃——可检测的丢失没有兜底）。
-            if let Err(undelivered) = e.get().send(job) {
-                let tx = spawn_pump();
-                let _ = tx.send(undelivered.0);
-                e.insert(tx);
+            match e.get().send(job) {
+                Ok(()) => true,
+                Err(undelivered) => {
+                    let tx = spawn_pump();
+                    let ok = tx.send(undelivered.0).is_ok();
+                    e.insert(tx);
+                    ok
+                }
             }
         }
         Entry::Vacant(e) => {
             let tx = spawn_pump();
-            let _ = tx.send(job);
+            let ok = tx.send(job).is_ok();
             e.insert(tx);
+            ok
         }
+    };
+    // v1.21 可观测性：入队成功即增（与 conv_pump 取件时的 dec 配对）。
+    if sent {
+        crate::metrics::METRICS.pump_pending.inc();
     }
 }
 
@@ -2379,7 +2419,10 @@ async fn fetch_cached_token(
     static TOKEN_FAIL: std::sync::Mutex<Option<(String, Instant)>> = std::sync::Mutex::new(None);
     const TOKEN_FAIL_NEG_TTL: Duration = Duration::from_secs(5);
     // 刷新串行化：网络期间 token_lock 完全不被持有，发送方零阻塞。
+    // v1.21 可观测性：single-flight 门等待人数（增长 = token 端点故障先行信号）。
+    crate::metrics::METRICS.token_waiters.inc();
     let _refresh_guard = TOKEN_REFRESH_MU.lock().await;
+    crate::metrics::METRICS.token_waiters.dec();
     // 双检：等刷新权期间可能已被前一个刷新者写回新 token。
     if let Some((token, fetched_at)) = token_lock.read().await.as_ref() {
         if fetched_at.elapsed() < TOKEN_TTL {
