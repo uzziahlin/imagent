@@ -102,7 +102,7 @@ struct AskRender {
 /// 审批复用槽/下沉标记）收敛为单表单结构——「每 conv 轮次串行」这个此前只能
 /// 靠通读推演的隐含不变量自此有唯一载体，锁纪律（单锁、锁内无 IO）与粗上限
 /// 淘汰（housekeeping）也只需做一次。字段语义见各字段注释（均原样迁移）。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ConvState {
     /// 最近一次入站消息 sender（轮次发起者近似——审批卡/终止按钮的点击者校验锚）。
     sender: Option<String>,
@@ -122,6 +122,27 @@ struct ConvState {
     ask_slot: Option<AskSlot>,
     /// 本轮流式卡发送之后是否发过询问卡（终态「结果下沉」判定，P8-2）。
     asks_since_card: bool,
+    /// v1.21 LRU：最近活跃时刻（入站消息/评论锚点/发起者更新时刷新）。
+    /// housekeeping 超上限时按此排序驱逐最久未活跃的会话（替代 v1.18 的
+    /// 「整体选择性驱逐」——活跃会话不再被误伤，评论会话/挂起审批仍豁免）。
+    last_touched: Instant,
+}
+
+impl Default for ConvState {
+    fn default() -> Self {
+        Self {
+            sender: None,
+            comment_anchor: None,
+            reply_anchor: None,
+            last_inbound: None,
+            thread_active_at: None,
+            card_tail: None,
+            ask_note: None,
+            ask_slot: None,
+            asks_since_card: false,
+            last_touched: Instant::now(),
+        }
+    }
 }
 
 pub struct FeishuPlatform {
@@ -370,15 +391,19 @@ impl FeishuPlatform {
                         let mut m = conv_states_for_drain.lock().await;
                         let st = m.entry(msg.conv_id.0.clone()).or_default();
                         st.sender = Some(msg.sender.0.clone());
+                        // v1.21 LRU：入站消息 = 活跃信号。
+                        st.last_touched = Instant::now();
                         if let Some((conv, anchor)) =
                             group_reply_anchor(&msg.conv_id.0, msg.source_msg_id.as_deref())
                         {
                             st.last_inbound = Some(anchor);
                             let _ = conv;
                         }
+                        st.last_touched = Instant::now();
                         if let Some(tk) = &thread_key {
-                            m.entry(tk.clone()).or_default().thread_active_at =
-                                Some(Instant::now());
+                            let st = m.entry(tk.clone()).or_default();
+                            st.thread_active_at = Some(Instant::now());
+                            st.last_touched = Instant::now();
                         }
                     }
                     // v1.18 迭代（intake 解耦）：媒体下载/转写/落盘移出 drain 串行
@@ -439,8 +464,9 @@ impl FeishuPlatform {
                             let _ = conv;
                         }
                         if let Some(tk) = &thread_key {
-                            m.entry(tk.clone()).or_default().thread_active_at =
-                                Some(Instant::now());
+                            let st = m.entry(tk.clone()).or_default();
+                            st.thread_active_at = Some(Instant::now());
+                            st.last_touched = Instant::now();
                         }
                     }
                     // v1.18 迭代（intake 解耦）：拉子消息（分页 API）与媒体下载
@@ -635,12 +661,11 @@ impl FeishuPlatform {
                         // 会话锚放宽：登记回复目标锚点（conv → comment_id）——发送
                         // 侧（send_text/send_media 评论分支）据此路由回复。
                         if dedup.check(&key) {
-                            conv_states_for_drain
-                                .lock()
-                                .await
-                                .entry(cm.conv_id.0.clone())
-                                .or_default()
-                                .comment_anchor = Some(comment_id);
+                            let mut m = conv_states_for_drain.lock().await;
+                            let st = m.entry(cm.conv_id.0.clone()).or_default();
+                            st.comment_anchor = Some(comment_id);
+                            st.last_touched = Instant::now();
+                            drop(m);
                             if inbound_msg_tx.send(cm).await.is_err() {
                                 break;
                             }
@@ -1690,27 +1715,38 @@ async fn housekeeping_loop(maps: HousekeepingMaps) {
         {
             let mut states = maps.conv_states.lock().await;
             if states.len() > PER_CONV_MAP_CAP {
-                let before = states.len();
-                states.retain(|key, st| {
+                // v1.21 精确 LRU（替代 v1.18 的整体选择性驱逐）：按 last_touched
+                // 排序驱逐最久未活跃的条目——活跃会话不再被误伤；评论会话
+                //（锚点丢失 = 回复硬失败）与挂起审批（note 联动）仍豁免。
+                let exempt = |key: &str, st: &ConvState| {
                     key.starts_with("feishu:comment:")
                         || st
                             .ask_slot
                             .as_ref()
                             .is_some_and(|s| s.pending_req.is_some())
-                });
-                let evicted = before - states.len();
-                if evicted > 0 {
-                    warn!(target: "feishu", evicted, "per-conv 状态表超粗上限（>{PER_CONV_MAP_CAP}），驱逐 {evicted} 个非活跃会话条目（评论会话与挂起审批豁免）");
+                };
+                let over = states.len() - PER_CONV_MAP_CAP;
+                let mut victims: Vec<(Instant, String)> = states
+                    .iter()
+                    .filter(|(k, st)| !exempt(k, st))
+                    .map(|(k, st)| (st.last_touched, k.clone()))
+                    .collect();
+                victims.sort_unstable();
+                let n = victims.len().min(over);
+                for (_, k) in victims.drain(..n) {
+                    states.remove(&k);
                 }
-                // v1.21 review：注释承诺的「仍超限才整体清空」兜底此前并未实现
-                //——评论会话数本身超限时表永不收缩（每文档评论一个 conv 键，
-                // 长跑无界慢泄漏）。兜底清空（评论锚丢失是硬失败，但无界增长
-                // 更糟；恢复路径：下一条评论事件重建锚点）。
+                if n > 0 {
+                    warn!(target: "feishu", evicted = n, "per-conv 状态表超上限（>{PER_CONV_MAP_CAP}），LRU 驱逐 {n} 个最久未活跃会话（评论会话与挂起审批豁免）");
+                }
+                // 兜底清空：豁免条目本身超限时表仍不收缩（每文档评论一个
+                // conv 键的长跑慢泄漏面）——评论锚丢失是硬失败，但无界增长
+                // 更糟；恢复路径：下一条评论事件重建锚点。
                 if states.len() > PER_CONV_MAP_CAP {
                     warn!(
                         target: "feishu",
                         remained = states.len(),
-                        "选择性驱逐后仍超上限（评论会话/挂起审批条目过多），整体清空兜底"
+                        "LRU 驱逐后仍超上限（豁免条目过多），整体清空兜底"
                     );
                     states.clear();
                 }
