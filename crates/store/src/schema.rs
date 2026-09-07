@@ -3,7 +3,7 @@
 //! 用 `PRAGMA user_version` 做简单线性迁移：v1 = 建 5 张基础表，v2 = 动态白名单 + 审计日志。
 
 /// 当前代码支持的最新 schema 版本（migrate 上限 + user_version 过新拒绝阈值，P2-O）。
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// v1 全部建表语句（`CREATE TABLE IF NOT EXISTS`，可重复执行）。
 pub const SCHEMA_V1: &str = r#"
@@ -183,6 +183,20 @@ pub const SCHEMA_V12: &str = "CREATE TABLE IF NOT EXISTS queued_messages (
 pub const SCHEMA_V13: &str =
     "CREATE INDEX IF NOT EXISTS idx_run_stats_sender_ts ON run_stats(sender, ts);";
 
+/// v14：发送侧 outbox（v1.21）——平台 best-effort 消息（deny/过期提示、限流
+/// 重试耗尽的用户可见文案）失败后落盘，后台泵按指数退避重发直至成功或尝试
+/// 上限（at-least-once，text 类消息幂等友好）。
+pub const SCHEMA_V14: &str = "CREATE TABLE IF NOT EXISTS outbox (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  conv       TEXT NOT NULL,
+  kind       TEXT NOT NULL,
+  payload    TEXT NOT NULL,
+  attempts   INTEGER NOT NULL DEFAULT 0,
+  next_try   INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_outbox_next_try ON outbox(next_try);";
+
 /// 在已打开的连接上跑线性迁移。幂等：逐版本推进（v1→v2→…），已到目标版本则跳过。
 pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     let current: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -253,6 +267,10 @@ pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     if current < 13 {
         tx.execute_batch(SCHEMA_V13)?;
         tx.pragma_update(None, "user_version", 13_i64)?;
+    }
+    if current < 14 {
+        tx.execute_batch(SCHEMA_V14)?;
+        tx.pragma_update(None, "user_version", 14_i64)?;
     }
     tx.commit()?;
     Ok(())

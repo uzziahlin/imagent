@@ -504,6 +504,15 @@ pub struct Config {
     /// 媒体错误提示（fail-soft，不影响其余消息）。仅 feishu 平台生效。
     #[serde(default = "default_feishu_asr_enabled")]
     pub feishu_asr_enabled: bool,
+    /// v1.21：飞书 per-conv 出站令牌桶速率（消息创建/秒；0 = 关闭）。缺省 5——
+    /// 主动预算发送频率，把「挨 429 再被动退避」翻转为「不触发 429」。
+    /// 等待上限 2s（超时放行，被动退避仍兜底）。仅 feishu 平台生效。
+    #[serde(default = "default_feishu_send_rps")]
+    pub feishu_send_rps: f64,
+}
+
+fn default_feishu_send_rps() -> f64 {
+    5.0
 }
 
 /// 缺省工具集：读/检索/联网/文件编辑类（与 Edit 同风险级：workdir 内写或只读），

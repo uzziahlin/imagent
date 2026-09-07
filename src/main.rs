@@ -1165,6 +1165,9 @@ async fn build_platform(
                 config.quiet_hours_parsed,
                 config.feishu_thread_active_window_secs,
                 config.feishu_asr_enabled,
+                // v1.21：发送侧 outbox 持久化重试 + per-conv 令牌桶。
+                Some(store.clone()),
+                config.feishu_send_rps,
             )?))
         }
         _ => {

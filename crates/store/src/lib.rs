@@ -17,6 +17,6 @@ mod store;
 
 pub use error::{Result, StoreError};
 pub use store::{
-    AllowedSenderRow, AuditRow, CronJobRow, LiveCardRow, NamedSessionRow, RunStatRow,
-    SessionHistoryRow, SessionRow, Store,
+    AllowedSenderRow, AuditRow, CronJobRow, LiveCardRow, NamedSessionRow, OutboxRow, RunStatRow,
+    SessionHistoryRow, SessionRow, Store, OUTBOX_MAX_ATTEMPTS,
 };
