@@ -2,6 +2,43 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.22.0] — 2026-09-04
+
+> **运维托付批次**（v11 复审路线图五连）：webhook 防护套件 + GitHub 原生
+> 事件、发送侧 outbox 持久化重试、/model 全后端覆盖 + codex 任务面板、
+> 入站管道四指标、conv_states 精确 LRU。产品从「能用」推向「可托付」。
+> 全仓 679 tests / 0 failed、clippy 零警告。
+
+### Added
+- **webhook 防护套件**：`[[webhook]]` 增可选 `secret`（HMAC-SHA256 验签，
+  GitHub `X-Hub-Signature-256` 协议同款，常数时间比较，不符 401）与 `rps`
+  （令牌桶限速，缺省 10/s，超限 429）——公网/隧道部署下 token 泄漏不再
+  等于可伪造事件
+- **GitHub 原生事件**：带 `X-GitHub-Event` 头的请求自动解析为可读摘要注入
+  （workflow_run 终态 / push 提交列表 / issues / 评论 / PR 含 merged 🎉 /
+  ping）；中间态与未识别事件 202+ignored（raw JSON 不再灌给 agent）
+- **发送侧 outbox 持久化重试**（store v14）：drain 提示类消息（deny/过期/
+  欢迎/不支持类型）发送失败落盘，后台泵 10s tick 指数退避重发（15s→1h，
+  上限 16 次）——HTTP 分区期间被扣下的提示恢复后仍可见
+- **per-conv 发送令牌桶**（`feishu_send_rps`，缺省 5/s）：send_text/send_card
+  创建路径先取名额（等待上限 2s）——把「挨 429 再被动退避」翻转为「主动
+  不触发 429」
+- **/model 全后端覆盖**：codex（`exec -m`）/ gemini（`-m`）实现模型选择，
+  与 claude 系同走 `/model [名称|default]`（切换需管理员）
+- **codex 任务面板**：`todo_list` 事件解析 items[]{id,text,status} 映射
+  TodoList——流式卡获得与 claude 同款任务清单展示
+- **入站管道四指标**：`imagent_feishu_drain_event_seconds`（单事件时延
+  histogram）/ `ws_payload_backlog`（channel 积压）/ `pump_pending`（泵深度，
+  inc/dec 配对）/ `token_refresh_waiters`（刷新等待人数）——v11 复审确认的
+  三类停摆（drain 队头阻塞/媒体队头阻塞/token 故障）的先行信号
+
+### Changed
+- conv_states 精确 LRU：增 `last_touched`，housekeeping 超上限按活跃时刻
+  排序驱逐（评论会话/挂起审批豁免不变）——活跃会话锚点不再被粗上限驱逐
+  误伤
+- `/cron` 失权自动停用配套新增 `/cron enable|disable <id>`；停用任务列表
+  标注恢复指引
+
 ## [1.21.0] — 2026-09-04
 
 > **v1.20 复审修复批次**（docs/CODE_REVIEW_v11.md）：新功能（webhook/cron/
