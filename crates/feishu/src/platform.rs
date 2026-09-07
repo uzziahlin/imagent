@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::sync::{mpsc, Mutex, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use imagent_core::{
     command_card_fallback_text, split_message, CardButton, CardTerminal, ConvId, CoreError, Dedup,
@@ -165,6 +165,18 @@ pub struct FeishuPlatform {
     /// buzz 类加急提醒（send_urgent_text）在窗口内降级为普通消息（不加 buzz
     /// 字段），只影响加急不影响内容。本地时区判定（chrono Local）。
     quiet_hours: Option<imagent_core::QuietHours>,
+    /// v1.21 per-conv 发送令牌桶速率（消息创建/秒；0 = 关闭）。主动预算出站
+    /// 频率——把「挨 429 再被动退避」翻转为「不触发 429」。
+    send_rps: f64,
+    /// per-conv 令牌桶状态（粗上限清理，见 [`Self::acquire_send_slot`]）。
+    send_budget: Arc<Mutex<HashMap<String, SendBucket>>>,
+}
+
+/// v1.21：per-conv 发送令牌桶（令牌数 + 上次回填时刻）。
+#[derive(Clone, Copy)]
+struct SendBucket {
+    tokens: f64,
+    last: Instant,
 }
 
 impl FeishuPlatform {
@@ -194,6 +206,8 @@ impl FeishuPlatform {
         quiet_hours: Option<imagent_core::QuietHours>,
         thread_active_window_secs: u64,
         asr_enabled: bool,
+        outbox: Option<imagent_store::Store>,
+        send_rps: f64,
     ) -> Result<Self> {
         let ws_config = Arc::new(
             Config::builder()
@@ -233,6 +247,8 @@ impl FeishuPlatform {
         let app_id_for_drain = app_id.clone();
         let app_secret_for_drain = app_secret.clone();
         let token_for_drain = token.clone();
+        // v1.21 outbox：drain 提示类发送失败 → 落盘重试（None = 未接 store）。
+        let outbox_for_drain = outbox.clone();
         // P5-8：bot 自身 open_id 懒取缓存（@bot 过滤用；open_id 随应用固定，
         // 进程内取一次。取不到时 parse_comment_event 退化为弱过滤）。
         let bot_open_id: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
@@ -488,6 +504,7 @@ impl FeishuPlatform {
                             &app_secret_for_drain,
                             reply_msg.conv_id.clone(),
                             deny_text.clone(),
+                            outbox_for_drain.as_ref(),
                         );
                         // 安全批次（转发代批）：deny 文案回原 conv 之外，给点击者
                         // （operator）私聊补一条同文案——转发场景下原 conv 里没人
@@ -503,6 +520,7 @@ impl FeishuPlatform {
                                 &app_secret_for_drain,
                                 ConvId(format!("feishu:{}", reply_msg.sender.0)),
                                 deny_text.clone(),
+                                outbox_for_drain.as_ref(),
                             );
                         }
                         continue;
@@ -534,6 +552,7 @@ impl FeishuPlatform {
                                     &app_secret_for_drain,
                                     reply_msg.conv_id.clone(),
                                     "⏳ 该询问已过期或已被处理，无需再次点击。".to_string(),
+                                    outbox_for_drain.as_ref(),
                                 );
                                 continue;
                             }
@@ -554,6 +573,7 @@ impl FeishuPlatform {
                                             "⛔ 该询问由 {} 发起，仅其本人可答复。",
                                             card.sender
                                         ),
+                                        outbox_for_drain.as_ref(),
                                     );
                                     continue;
                                 }
@@ -632,6 +652,7 @@ impl FeishuPlatform {
                                 &app_secret_for_drain,
                                 ConvId(card.conv_id.clone()),
                                 format!("⛔ 该询问由 {} 发起，仅其本人可答复。", card.sender),
+                                outbox_for_drain.as_ref(),
                             );
                             continue;
                         }
@@ -695,6 +716,7 @@ impl FeishuPlatform {
                             &app_secret_for_drain,
                             ConvId(format!("feishu:{chat_id}")),
                             "👋 我已加入本群！群内 @我 发消息即可驱动 agent。\n管理员可发送 /chat allow 放行本群（放行前我不会响应消息）；/help 查看全部命令。\n💬 会话规则：群主时间线直接 @我 = 续同一会话；点消息「回复」进话题 = 开独立会话（互不共享上下文/待办）。".to_string(),
+                            outbox_for_drain.as_ref(),
                         );
                     }
                     continue;
@@ -713,6 +735,7 @@ impl FeishuPlatform {
                             &app_secret_for_drain,
                             conv,
                             notice.to_string(),
+                            outbox_for_drain.as_ref(),
                         );
                     }
                     continue;
@@ -744,7 +767,7 @@ impl FeishuPlatform {
             }
         });
 
-        Ok(Self {
+        let platform = Self {
             core_config,
             app_id,
             app_secret,
@@ -769,7 +792,63 @@ impl FeishuPlatform {
             comment_split_max: message_max_len
                 .unwrap_or(FEISHU_COMMENT_TEXT_MAX)
                 .min(FEISHU_COMMENT_TEXT_MAX),
-        })
+            send_rps,
+            send_budget: Arc::new(Mutex::new(HashMap::new())),
+        };
+        // v1.21 outbox 泵：每 10s 拉到期行重发（feishu_text），指数退避
+        // 15s→1h 封顶，成功删行、超 OUTBOX_MAX_ATTEMPTS 放弃并 error 留痕。
+        if let Some(store) = outbox {
+            let cfg = platform.core_config.clone();
+            let token_lock = platform.token.clone();
+            let aid = platform.app_id.clone();
+            let sec = platform.app_secret.clone();
+            tokio::spawn(async move {
+                outbox_pump(store, cfg, token_lock, aid, sec).await;
+            });
+        }
+        Ok(platform)
+    }
+
+    /// v1.21 per-conv 发送令牌桶：消息创建前取一个发送名额（速率
+    /// `send_rps`/秒，容量 = max(1, rps)，约 1s 突发）。等待上限 2s——超时
+    /// 放行（预算是主动平滑不是硬闸，429 自愈链路仍兜底）。0 = 关闭。
+    async fn acquire_send_slot(&self, conv: &str) {
+        if self.send_rps <= 0.0 {
+            return;
+        }
+        const WAIT_CAP_MS: u64 = 2_000;
+        const POLL_MS: u64 = 20;
+        const BUDGET_MAP_CAP: usize = 4096;
+        let deadline = Instant::now() + Duration::from_millis(WAIT_CAP_MS);
+        loop {
+            {
+                let mut m = self.send_budget.lock().await;
+                // 粗上限：桶表只随 conv 数增长，超限整体清空（桶满后按速率
+                // 重建，瞬时限流无害）。
+                if m.len() > BUDGET_MAP_CAP {
+                    m.clear();
+                }
+                let now = Instant::now();
+                let cap = self.send_rps.max(1.0);
+                let b = m.entry(conv.to_string()).or_insert(SendBucket {
+                    tokens: cap,
+                    last: now,
+                });
+                let elapsed = now.duration_since(b.last).as_secs_f64();
+                if elapsed > 0.0 {
+                    b.tokens = (b.tokens + elapsed * self.send_rps).min(cap);
+                    b.last = now;
+                }
+                if b.tokens >= 1.0 {
+                    b.tokens -= 1.0;
+                    return;
+                }
+            }
+            if Instant::now() >= deadline {
+                return; // 预算等待超时：放行（429 被动退避仍兜底）
+            }
+            tokio::time::sleep(Duration::from_millis(POLL_MS)).await;
+        }
     }
 
     /// 取当前 token：缓存命中（未过 TTL）则返回，否则 `fetch_token` 刷新并缓存。
@@ -2085,35 +2164,46 @@ async fn send_drain_text(
     conv: &ConvId,
     text: &str,
 ) {
-    let send = async {
-        let t = fetch_cached_token(token_lock, core_config, app_id, app_secret).await?;
-        if let Some((file_token, comment_id)) = comment_target_from_conv(conv) {
-            return match comment_id {
-                Some(cid) => reply_comment(core_config, &t, &file_token, &cid, text)
-                    .await
-                    .map(|_| ()),
-                // 新形态评论 conv 无锚点：无处可回，跳过（无害——提示性文案）。
-                None => Ok(()),
-            };
-        }
-        if let Some((_chat, root_id)) = thread_target_from_conv(conv) {
-            reply_message(
-                core_config,
-                &t,
-                &root_id,
-                "text",
-                &serde_json::json!({ "text": text }).to_string(),
-            )
-            .await
-            .map(|_| ())
-        } else if let Some((receive_id, kind)) = receive_target_from_conv(conv) {
-            send_text_msg(core_config, &t, &receive_id, kind, text, false).await
-        } else {
-            Ok(())
-        }
-    };
-    if let Err(e) = send.await {
+    if let Err(e) =
+        send_drain_text_result(core_config, token_lock, app_id, app_secret, conv, text).await
+    {
         warn!(target: "feishu", error = %e, "drain 提示发送失败（无害）");
+    }
+}
+
+/// [`send_drain_text`] 的 Result 形态（outbox 泵需要成败信号驱动退避）。
+async fn send_drain_text_result(
+    core_config: &CoreConfig,
+    token_lock: &Arc<RwLock<Option<(String, Instant)>>>,
+    app_id: &str,
+    app_secret: &str,
+    conv: &ConvId,
+    text: &str,
+) -> Result<()> {
+    let t = fetch_cached_token(token_lock, core_config, app_id, app_secret).await?;
+    if let Some((file_token, comment_id)) = comment_target_from_conv(conv) {
+        return match comment_id {
+            Some(cid) => reply_comment(core_config, &t, &file_token, &cid, text)
+                .await
+                .map(|_| ()),
+            // 新形态评论 conv 无锚点：无处可回，跳过（无害——提示性文案）。
+            None => Ok(()),
+        };
+    }
+    if let Some((_chat, root_id)) = thread_target_from_conv(conv) {
+        reply_message(
+            core_config,
+            &t,
+            &root_id,
+            "text",
+            &serde_json::json!({ "text": text }).to_string(),
+        )
+        .await
+        .map(|_| ())
+    } else if let Some((receive_id, kind)) = receive_target_from_conv(conv) {
+        send_text_msg(core_config, &t, &receive_id, kind, text, false).await
+    } else {
+        Ok(())
     }
 }
 
@@ -2146,13 +2236,17 @@ fn spawn_drain_text(
     app_secret: &str,
     conv: ConvId,
     text: String,
+    outbox: Option<&imagent_store::Store>,
 ) {
     let core_config = core_config.clone();
     let token_lock = token_lock.clone();
     let app_id = app_id.to_string();
     let app_secret = app_secret.to_string();
+    let outbox = outbox.cloned();
     tokio::spawn(async move {
-        send_drain_text(
+        // v1.21 outbox：失败不再无声丢失——落 outbox 表由后台泵退避重发
+        //（未接 store 的部署保持旧 warn 语义）。
+        if let Err(e) = send_drain_text_result(
             &core_config,
             &token_lock,
             &app_id,
@@ -2160,8 +2254,95 @@ fn spawn_drain_text(
             &conv,
             &text,
         )
-        .await;
+        .await
+        {
+            warn!(target: "feishu", error = %e, conv_id = %conv.0, "drain 提示发送失败（转入 outbox 重试）");
+            if let Some(store) = outbox {
+                let payload = serde_json::json!({ "conv": conv.0, "text": text }).to_string();
+                if let Err(e2) = store.enqueue_outbox(&conv.0, "feishu_text", &payload).await {
+                    warn!(target: "feishu", error = %e2, "outbox 落盘失败（提示丢失）");
+                }
+            }
+        }
     });
+}
+
+/// v1.21 outbox 泵：每 10s 拉到期行重发（kind=feishu_text）。指数退避
+/// 15s→1h 封顶；成功删行；超 [`imagent_store::OUTBOX_MAX_ATTEMPTS`] 放弃并
+/// error 留痕（约 10h 仍不达——继续保留只会撑爆表，文案已过时效）。
+async fn outbox_pump(
+    store: imagent_store::Store,
+    core_config: Arc<CoreConfig>,
+    token_lock: Arc<RwLock<Option<(String, Instant)>>>,
+    app_id: String,
+    app_secret: String,
+) {
+    const TICK: Duration = Duration::from_secs(10);
+    loop {
+        tokio::time::sleep(TICK).await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let due = match store.due_outbox(now, 10).await {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(target: "feishu", error = %e, "outbox 拉取失败（本轮跳过）");
+                continue;
+            }
+        };
+        for row in due {
+            if row.kind != "feishu_text" {
+                continue; // 未知 kind 不动（当前只有 feishu_text 一种）
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&row.payload) else {
+                error!(target: "feishu", id = row.id, "outbox 行解析失败，放弃");
+                let _ = store.outbox_mark_sent(row.id).await;
+                continue;
+            };
+            let (Some(conv), Some(text)) = (
+                v.get("conv").and_then(|c| c.as_str()),
+                v.get("text").and_then(|c| c.as_str()),
+            ) else {
+                error!(target: "feishu", id = row.id, "outbox 行缺 conv/text，放弃");
+                let _ = store.outbox_mark_sent(row.id).await;
+                continue;
+            };
+            // send_drain_text 内部已吞错误（warn），泵需要成败信号——直接
+            // 调内部闭包等价逻辑：这里取 Result 的直发形态。
+            let sent = send_drain_text_result(
+                &core_config,
+                &token_lock,
+                &app_id,
+                &app_secret,
+                &ConvId(conv.to_string()),
+                text,
+            )
+            .await;
+            match sent {
+                Ok(()) => {
+                    info!(target: "feishu", id = row.id, conv_id = conv, attempts = row.attempts, "outbox 重发成功");
+                    let _ = store.outbox_mark_sent(row.id).await;
+                }
+                Err(e) => {
+                    // 15s × 2^attempts，封顶 1h。
+                    let backoff = (15i64 << row.attempts.min(8)).clamp(15, 3600);
+                    let kept = store.outbox_mark_failed(row.id, now + backoff).await;
+                    match kept {
+                        Ok(true) => {
+                            warn!(target: "feishu", id = row.id, attempts = row.attempts, error = %e, "outbox 重发失败（退避后再试）")
+                        }
+                        Ok(false) => {
+                            error!(target: "feishu", id = row.id, attempts = row.attempts, conv_id = conv, "outbox 重试耗尽，放弃（提示丢失）")
+                        }
+                        Err(e2) => {
+                            warn!(target: "feishu", id = row.id, error = %e2, "outbox 状态更新失败")
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// 过期询问的点击反馈（drain task 用）：向该 conv 回一条「已过期」文本——
@@ -2299,6 +2480,8 @@ impl Platform for FeishuPlatform {
     }
 
     async fn send_text(&self, conv: &ConvId, text: &str, hint: &ReplyHint) -> Result<()> {
+        // v1.21：消息创建走 per-conv 令牌桶（主动预算，防 429）。
+        self.acquire_send_slot(&conv.0).await;
         self.send_text_opts(conv, text, hint, false).await
     }
 
@@ -3033,6 +3216,9 @@ impl Platform for FeishuPlatform {
         card: &OutboundCard,
         _hint: &ReplyHint,
     ) -> Result<Option<String>> {
+        // v1.21：卡片创建与文本同走 per-conv 令牌桶（update_card 的 patch
+        // 不在此列——流式帧已有节流与 seq）。
+        self.acquire_send_slot(&conv.0).await;
         // P8-2：新一轮流式卡——「之后发过询问卡」标记清零（conv 轮次串行，
         // 无并发覆盖问题）。
         self.conv_states
@@ -3485,6 +3671,9 @@ mod tests {
             None,
             1800,
             true,
+            // v1.21：outbox 未接 store / 发送限速关闭（测试态）。
+            None,
+            0.0,
         )
         .expect("构造");
         let conv = ConvId("feishu:ou_x".into());
@@ -3515,6 +3704,9 @@ mod tests {
             None,
             1800,
             true,
+            // v1.21：outbox 未接 store / 发送限速关闭（测试态）。
+            None,
+            0.0,
         )
         .expect("构造");
         p.pending_asks.lock().await.insert(
@@ -3550,6 +3742,9 @@ mod tests {
             None,
             1800,
             true,
+            // v1.21：outbox 未接 store / 发送限速关闭（测试态）。
+            None,
+            0.0,
         )
         .expect("构造");
         assert_eq!(p.require_mention_in_group().await, Some(true));
@@ -3651,6 +3846,9 @@ mod tests {
             None,
             1800,
             true,
+            // v1.21：outbox 未接 store / 发送限速关闭（测试态）。
+            None,
+            0.0,
         )
         .expect("构造");
         assert!(p.quiet_hours.is_none(), "未配置 → None");
@@ -3686,6 +3884,8 @@ mod tests {
                 None,
                 1800,
                 true,
+                None,
+                0.0,
             )
             .expect("构造")
         };

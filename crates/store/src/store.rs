@@ -123,6 +123,19 @@ pub struct LiveCardRow {
     pub updated_at: i64,
 }
 
+/// outbox 待重发行（schema v14，v1.21 发送侧持久化重试）。
+#[derive(Debug, Clone)]
+pub struct OutboxRow {
+    pub id: i64,
+    pub conv: String,
+    pub kind: String,
+    pub payload: String,
+    pub attempts: i64,
+}
+
+/// outbox 单条消息的最大重发次数（指数退避 15s→1h，总计约 10h 窗口）。
+pub const OUTBOX_MAX_ATTEMPTS: i64 = 16;
+
 struct Inner {
     conn: Mutex<rusqlite::Connection>,
 }
@@ -1490,6 +1503,94 @@ impl Store {
         .await
     }
 
+    // —— outbox（v1.21 发送侧持久化重试；schema v14）——
+
+    /// 落一条待重发的出站消息。`kind` 由平台侧自定义（如 feishu_text），
+    /// `payload` 为平台可自解释的 JSON。
+    pub async fn enqueue_outbox(&self, conv: &str, kind: &str, payload: &str) -> Result<()> {
+        let (conv, kind, payload) = (conv.to_string(), kind.to_string(), payload.to_string());
+        let inner = self.inner.clone();
+        blocking_with_retry(inner, move |conn| {
+            conn.execute(
+                "INSERT INTO outbox (conv, kind, payload, attempts, next_try, created_at) \
+                 VALUES (?1, ?2, ?3, 0, ?4, ?4)",
+                rusqlite::params![conv, kind, payload, now_secs()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// 到期待重发行（每 tick 有界拉取，防单轮重发风暴）。
+    pub async fn due_outbox(&self, now: i64, limit: u32) -> Result<Vec<OutboxRow>> {
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, conv, kind, payload, attempts FROM outbox \
+                 WHERE next_try <= ?1 ORDER BY next_try LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![now, limit], |r| {
+                    Ok(OutboxRow {
+                        id: r.get(0)?,
+                        conv: r.get(1)?,
+                        kind: r.get(2)?,
+                        payload: r.get(3)?,
+                        attempts: r.get(4)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// 重发成功：删行。
+    pub async fn outbox_mark_sent(&self, id: i64) -> Result<()> {
+        let inner = self.inner.clone();
+        blocking_with_retry(inner, move |conn| {
+            conn.execute("DELETE FROM outbox WHERE id = ?1", rusqlite::params![id])?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// 重发失败：attempts+1、next_try 顺延。超过 [`OUTBOX_MAX_ATTEMPTS`] 次删行
+    ///（返回 false = 已放弃）——文案类消息重发 16 次（约 10h 退避窗口）仍不达，
+    /// 保留只会让表无限膨胀。
+    pub async fn outbox_mark_failed(&self, id: i64, next_try: i64) -> Result<bool> {
+        let inner = self.inner.clone();
+        blocking_with_retry(inner, move |conn| {
+            let n = conn.execute(
+                "UPDATE outbox SET attempts = attempts + 1, next_try = ?2 WHERE id = ?1",
+                rusqlite::params![id, next_try],
+            )?;
+            if n == 0 {
+                return Ok(false); // 行已不在（并发泵/上次成功）——按已了结处理
+            }
+            let attempts: i64 =
+                conn.query_row("SELECT attempts FROM outbox WHERE id = ?1", [id], |r| {
+                    r.get(0)
+                })?;
+            if attempts >= OUTBOX_MAX_ATTEMPTS {
+                conn.execute("DELETE FROM outbox WHERE id = ?1", rusqlite::params![id])?;
+                return Ok(false);
+            }
+            Ok(true)
+        })
+        .await
+    }
+
+    /// 队列深度（/health 与排障用）。
+    pub async fn outbox_depth(&self) -> Result<i64> {
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let n: i64 = conn.query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get(0))?;
+            Ok(n)
+        })
+        .await
+    }
+
     /// 到期任务（enabled 且 next_run <= now）——调度器每个 tick 拉取。
     pub async fn due_cron_jobs(&self, now: i64) -> Result<Vec<CronJobRow>> {
         let inner = self.inner.clone();
@@ -2774,6 +2875,51 @@ mod tests {
         // 再次 open 同一库（迁移已是 v1，应跳过建表、不报错）
         let s2 = Store::open(&db.path).await.unwrap();
         drop(s2);
+    }
+
+    /// v1.21 outbox：入队 → 到期拉取 → 成功删行；失败退避（未到期不拉）→
+    /// 尝试上限放弃。
+    #[tokio::test]
+    async fn outbox_lifecycle() {
+        let db = TempDb::new("outbox").await;
+        let store = Store::open(&db.path).await.unwrap();
+
+        store
+            .enqueue_outbox("feishu:oc_a", "feishu_text", r#"{"conv":"x","text":"hi"}"#)
+            .await
+            .unwrap();
+        assert_eq!(store.outbox_depth().await.unwrap(), 1);
+
+        // next_try = 入队时刻 → 立即到期。
+        let now = now_secs();
+        let due = store.due_outbox(now, 10).await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].kind, "feishu_text");
+        assert_eq!(due[0].attempts, 0);
+
+        // 失败 → 退避到 now+60：窗口内不再到期。
+        assert!(store.outbox_mark_failed(due[0].id, now + 60).await.unwrap());
+        assert!(store.due_outbox(now + 59, 10).await.unwrap().is_empty());
+        let due2 = store.due_outbox(now + 61, 10).await.unwrap();
+        assert_eq!(due2.len(), 1);
+        assert_eq!(due2[0].attempts, 1);
+
+        // 成功 → 删行。
+        store.outbox_mark_sent(due2[0].id).await.unwrap();
+        assert_eq!(store.outbox_depth().await.unwrap(), 0);
+
+        // 尝试上限：连续失败到 OUTBOX_MAX_ATTEMPTS 后放弃（返回 false、行删除）。
+        store
+            .enqueue_outbox("feishu:oc_a", "feishu_text", "{}")
+            .await
+            .unwrap();
+        let row = store.due_outbox(now, 10).await.unwrap().remove(0);
+        let mut kept = true;
+        for i in 0..OUTBOX_MAX_ATTEMPTS {
+            kept = store.outbox_mark_failed(row.id, now + i).await.unwrap();
+        }
+        assert!(!kept, "超上限应放弃");
+        assert_eq!(store.outbox_depth().await.unwrap(), 0);
     }
 
     #[tokio::test]
