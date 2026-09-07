@@ -17,11 +17,20 @@ use crate::stream::{parse_line, ParsedEvent};
 /// Google Gemini CLI 后端。
 ///
 /// MVP 无状态、不做 IM 权限审批闭环（依赖 approval-mode + workdir 锁定兜底）。
-pub struct GeminiBackend;
+pub struct GeminiBackend {
+    /// v1.21 /model：运行时模型覆盖（`gemini -m <model>`；None = CLI 默认）。
+    model: std::sync::RwLock<Option<String>>,
+    // TODO(v1.22)：幽灵会话预检需先真机校准 ~/.gemini/tmp 的存储布局
+    //（文件名与 session id 的映射关系）——布局猜错会把所有正常续接误判为
+    // 幽灵、直接弄坏 resume。gemini 失败轮的 Init(id) 通常不落库，毒化风险
+    // 本就低于 codex/claude，待有真机数据再接。
+}
 
 impl GeminiBackend {
     pub fn new() -> Self {
-        Self
+        Self {
+            model: std::sync::RwLock::new(None),
+        }
     }
 }
 
@@ -53,6 +62,19 @@ impl Backend for GeminiBackend {
     /// warn 忽略（main 侧带能力矩阵的明确 warn）。
     fn permission_capability(&self) -> PermissionCapability {
         PermissionCapability::NativeOnly
+    }
+
+    /// v1.21 /model：gemini CLI 原生 `-m/--model` 档位（gemini-2.5-pro 等）。
+    fn supports_model_selection(&self) -> bool {
+        true
+    }
+
+    fn set_model(&self, model: Option<String>) {
+        *self.model.write().unwrap_or_else(|e| e.into_inner()) = model;
+    }
+
+    fn model(&self) -> Option<String> {
+        self.model.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     async fn run(
@@ -104,6 +126,10 @@ impl Backend for GeminiBackend {
         }
         // headless 必需：信任当前 workspace，否则 trustedFolders 拒绝。
         cmd.arg("--skip-trust");
+        // v1.21 /model：运行时模型覆盖（None = CLI 默认）。
+        if let Some(m) = self.model.read().unwrap_or_else(|e| e.into_inner()).clone() {
+            cmd.arg("-m").arg(m);
+        }
         // prompt 绑定到 flag（防止 prompt 以 `-` 开头被误解析）。
         cmd.arg(format!("--prompt={prompt}"));
         spawn_cli_backend(
