@@ -17,11 +17,17 @@ use crate::stream::{parse_line, ParsedEvent};
 /// OpenAI Codex CLI 后端。
 ///
 /// MVP 无状态、不做 IM 权限审批闭环（Codex 自身有沙箱模型兜底）。
-pub struct CodexBackend;
+pub struct CodexBackend {
+    /// v1.21 /model：运行时模型覆盖（`codex exec -m <model>`；None = CLI 默认）。
+    /// std RwLock——临界区纯读写无 await，trait 的 &self 接口下最小改造。
+    model: std::sync::RwLock<Option<String>>,
+}
 
 impl CodexBackend {
     pub fn new() -> Self {
-        Self
+        Self {
+            model: std::sync::RwLock::new(None),
+        }
     }
 }
 
@@ -43,6 +49,19 @@ impl Backend for CodexBackend {
     /// bypass 参数拒绝映射）。trait 默认即 Unsupported，此处显式覆写留注释锚点。
     fn permission_capability(&self) -> PermissionCapability {
         PermissionCapability::Unsupported
+    }
+
+    /// v1.21 /model：codex exec 原生 `-m` 档位（gpt-5-codex 等）。
+    fn supports_model_selection(&self) -> bool {
+        true
+    }
+
+    fn set_model(&self, model: Option<String>) {
+        *self.model.write().unwrap_or_else(|e| e.into_inner()) = model;
+    }
+
+    fn model(&self) -> Option<String> {
+        self.model.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// P5：扫 `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`（session_meta 的
@@ -99,7 +118,8 @@ impl Backend for CodexBackend {
         // P1-1：-s 必须在 `--` 之前——clap 的 `--` 之后全是 positional，codex exec
         // 用 trailing_var_arg 收集 prompt，原实现把 -s 放在 -- 之后导致 sandbox 模式
         // 被并入 prompt 字符串、从未生效（退到默认 read-only，用户配 Edit/Write 仍写不了）。
-        let args = codex_args(session, sandbox_mode, prompt);
+        let model = self.model.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let args = codex_args(session, sandbox_mode, model.as_deref(), prompt);
         let mut cmd = Command::new("codex");
         cmd.current_dir(workdir);
         cmd.args(args);
@@ -154,6 +174,7 @@ fn codex_parse(line: &str) -> CliEvent {
         // 瞬时重连」的原考量），但内容会被记录；若最终无任何 final 文本（如
         // 「API key invalid」这类致命错误），作为失败原因在 IM 可见。
         ParsedEvent::Error { message } => CliEvent::TransientError(message),
+        ParsedEvent::TodoList { items } => CliEvent::TodoList { items },
         ParsedEvent::Skip => CliEvent::Skip,
     }
 }
@@ -187,7 +208,12 @@ fn pick_sandbox(allowed_tools: &[String]) -> &'static str {
 ///
 /// **P1-1**：`-s <sandbox>` 必须在 `--` **之前**（options 区）；`--` 之后只留 prompt
 /// 作纯 positional（P2-J：防 prompt 以 `-` 开头被误解析为 flag）。
-fn codex_args(session: Option<&SessionId>, sandbox_mode: &str, prompt: &str) -> Vec<String> {
+fn codex_args(
+    session: Option<&SessionId>,
+    sandbox_mode: &str,
+    model: Option<&str>,
+    prompt: &str,
+) -> Vec<String> {
     let mut args: Vec<String> = vec!["exec".into()];
     if let Some(s) = session {
         args.push("resume".into());
@@ -195,6 +221,11 @@ fn codex_args(session: Option<&SessionId>, sandbox_mode: &str, prompt: &str) -> 
     }
     args.push("--json".into());
     args.push("--skip-git-repo-check".into());
+    // v1.21 /model：-m 与 -s 同在 options 区（`--` 之前）。
+    if let Some(m) = model {
+        args.push("-m".into());
+        args.push(m.into());
+    }
     args.push("-s".into());
     args.push(sandbox_mode.into());
     args.push("--".into());
@@ -265,7 +296,7 @@ mod tests {
     #[test]
     fn sandbox_flag_precedes_dashdash_new_session() {
         // P1-1：-s 必须在 -- 之前，否则被 codex 当 positional 并入 prompt。
-        let args = codex_args(None, "workspace-write", "hello");
+        let args = codex_args(None, "workspace-write", None, "hello");
         let dashdash = args.iter().position(|a| a == "--").unwrap();
         let s_idx = args.iter().position(|a| a == "-s").unwrap();
         assert!(
@@ -279,7 +310,7 @@ mod tests {
     #[test]
     fn sandbox_flag_precedes_dashdash_resume() {
         let sid = SessionId("thread-123".into());
-        let args = codex_args(Some(&sid), "read-only", "do thing");
+        let args = codex_args(Some(&sid), "read-only", None, "do thing");
         let dashdash = args.iter().position(|a| a == "--").unwrap();
         let s_idx = args.iter().position(|a| a == "-s").unwrap();
         assert!(s_idx < dashdash);
@@ -287,5 +318,42 @@ mod tests {
         let resume_idx = args.iter().position(|a| a == "resume").unwrap();
         assert_eq!(args[resume_idx + 1], "thread-123");
         assert_eq!(args[dashdash + 1], "do thing");
+    }
+
+    /// v1.21 /model：-m 注入且在 options 区（`--` 之前）；None 时不加。
+    #[test]
+    fn model_flag_in_options_region() {
+        let args = codex_args(None, "read-only", Some("gpt-5-codex"), "hi");
+        let dashdash = args.iter().position(|a| a == "--").unwrap();
+        let m_idx = args.iter().position(|a| a == "-m").unwrap();
+        assert!(m_idx < dashdash, "-m 必须在 -- 之前");
+        assert_eq!(args[m_idx + 1], "gpt-5-codex");
+        assert!(
+            !codex_args(None, "read-only", None, "hi").contains(&"-m".to_string()),
+            "None 模型不应加 -m"
+        );
+    }
+
+    /// v1.21：todo_list 事件 → TodoList 面板（此前归 Other 丢弃）。
+    #[test]
+    fn todo_list_event_maps_to_todo_panel() {
+        let line = r#"{"type":"item.completed","item":{"id":"t1","type":"todo_list","items":[
+            {"id":"1","text":"扫描代码","status":"completed"},
+            {"id":"2","text":"修复缺陷","status":"in_progress"},
+            {"id":"3","text":"回归测试"}
+        ]}}"#;
+        match codex_parse(line) {
+            CliEvent::TodoList { items } => {
+                assert_eq!(items.len(), 3);
+                assert_eq!(items[0].status, imagent_core::TodoStatus::Completed);
+                assert_eq!(items[1].status, imagent_core::TodoStatus::InProgress);
+                assert_eq!(items[2].status, imagent_core::TodoStatus::Pending);
+            }
+            other => panic!("期望 TodoList，得到 {other:?}"),
+        }
+        // items 缺失/为空 → Other（宁可无面板不可错面板；thread_id 缺席 →
+        // codex_parse 把 Other 映射为 Skip）。
+        let bad = r#"{"type":"item.completed","item":{"id":"t1","type":"todo_list"}}"#;
+        assert!(matches!(codex_parse(bad), CliEvent::Skip));
     }
 }

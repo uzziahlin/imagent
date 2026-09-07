@@ -604,7 +604,8 @@ impl Dispatcher {
 
     /// /model [name|default] —— 查看/热切运行时模型（W1-2）。
     ///
-    /// 仅支持模型选择的后端可用（claude-cli `--model` / claude-acp env）；
+    /// 仅支持模型选择的后端可用（claude-cli `--model` / claude-acp env /
+    /// codex `-m` / gemini `-m`，v1.21 起全覆盖）；
     /// 查看对所有白名单用户开放，**切换需 admin**——模型影响成本与行为，多人
     /// 共用网关时不宜任意成员切换。进程内生效，重启/SIGHUP 恢复 config 的
     /// `claude_model` 基准值；切换落审计。

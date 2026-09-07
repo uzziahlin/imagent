@@ -286,7 +286,7 @@ secret 轮换 / 环境变量变化后：重新 `export` + `imagent service insta
 | `/compact` | 软压缩上下文（摘要 + 重置 + 延续）；自动触发条件见[用量护栏](#设计取舍)：水位（input+缓存）达 模型窗口 × `auto_compact_window_ratio`（缺省 80%） |
 | `/retry` | 重发最近一轮指令（失败/中断后一键续接） |
 | `/export` | 当前会话导出为 Markdown 文件回传（claude 系后端） |
-| `/model [名称\|default]` | 查看/热切模型（切换需管理员；claude 系后端） |
+| `/model [名称\|default]` | 查看/热切模型（切换需管理员；claude 系 / codex `-m` / gemini `-m` 全支持） |
 | `/cd [path]` | 切工作目录（`/resume` 本机会话列表随之变化） |
 | `/ws list\|save\|use\|remove` | 命名工作空间 |
 | `/img <path>` `/file <path>` | 发 workdir 内图片 / 任意文件到 IM |

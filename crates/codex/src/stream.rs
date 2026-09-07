@@ -30,6 +30,12 @@ pub enum ParsedEvent {
     TurnFailed { message: String },
     /// 顶层 `error` 事件（可能瞬时重连，上层 best-effort，不致命）。
     Error { message: String },
+    /// v1.21：`item.*` + `item.type == "todo_list"`——任务清单全量快照
+    ///（codex 的 plan/todo 事件，此前归 Other 丢弃）。字段形态宽容解析：
+    /// `item.items[]` 的 id/text/status，status ∈ pending/in_progress/completed
+    ///（缺失/未知 → Pending）；items 缺失或形态不符退回 Other（宁可无面板
+    /// 不可错面板）。
+    TodoList { items: Vec<imagent_core::TodoItem> },
     /// 其余有效 JSON 事件（reasoning / file_change / todo_list / 未识别…），
     /// 附带该行中可能出现的 `thread_id`，便于上层尽早捕获。
     Other { thread_id: Option<String> },
@@ -164,8 +170,40 @@ fn parse_item(event_type: &str, value: &Value, thread_id: Option<String>) -> Par
             };
             ParsedEvent::ToolResult { tool, output }
         }
+        (_, Some("todo_list")) => match parse_todo_items(item) {
+            Some(items) => ParsedEvent::TodoList { items },
+            None => ParsedEvent::Other { thread_id },
+        },
         _ => ParsedEvent::Other { thread_id },
     }
+}
+
+/// todo_list item → TodoItem 列表（items 缺失/空/形态不符返回 None 走 Other）。
+fn parse_todo_items(item: &Value) -> Option<Vec<imagent_core::TodoItem>> {
+    let arr = item.get("items")?.as_array()?;
+    if arr.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(arr.len());
+    for e in arr {
+        let text = e.get("text").and_then(Value::as_str)?.trim().to_string();
+        if text.is_empty() {
+            return None;
+        }
+        let status = match e.get("status").and_then(Value::as_str) {
+            Some("in_progress") | Some("InProgress") => imagent_core::TodoStatus::InProgress,
+            Some("completed") | Some("Completed") | Some("done") => {
+                imagent_core::TodoStatus::Completed
+            }
+            _ => imagent_core::TodoStatus::Pending,
+        };
+        out.push(imagent_core::TodoItem {
+            id: e.get("id").and_then(Value::as_str).map(str::to_string),
+            text,
+            status,
+        });
+    }
+    Some(out)
 }
 
 /// 从 turn.completed 事件抽取 usage 对象（input/output/cached tokens，
