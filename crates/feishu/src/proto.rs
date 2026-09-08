@@ -343,11 +343,23 @@ pub fn parse_card_action_event(payload: &[u8]) -> Option<(String, InboundMessage
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(i64::MAX);
-        if now - ts > CMD_BUTTON_TTL_SECS {
+        // 卡片 UX 批（v1.24）：value 可携带自定义 ttl（安全命令 7 天，见 card
+        // 的 is_safe_long_ttl_command）；缺省仍 24h。
+        let ttl = value
+            .get("ttl")
+            .and_then(|v| v.as_i64())
+            .filter(|t| *t > 0)
+            .unwrap_or(CMD_BUTTON_TTL_SECS);
+        if now - ts > ttl {
+            let human = if ttl > 48 * 3600 {
+                format!("{} 天", ttl / (24 * 3600))
+            } else {
+                format!("{} 小时", ttl / 3600)
+            };
             return Some((
                 dummy_card_action_key(&evt, conv),
                 dummy_card_action_msg(&evt, conv),
-                Some("⏳ 该按钮已过期（超过 24 小时），请重新发起。".to_string()),
+                Some(format!("⏳ 该按钮已过期（超过 {human}），请重新发起。")),
             ));
         }
     }
