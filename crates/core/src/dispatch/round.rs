@@ -375,46 +375,79 @@ impl Dispatcher {
         // 本会话审批自身预算 = permission_ask_timeout，合法豁免不会超过它；
         // 超过即照常判空闲。任何 chunk 到达（审批后 agent 复工）重置预算。
         let mut exempt_secs: u64 = 0;
+        // v1.23 心跳节拍：recv 超时统一取 min(idle_timeout, HEARTBEAT_TICK)，
+        // 静默期每拍做一次卡片心跳（footer 时长走动 + 审批等待态翻转）——
+        // 审批等待/长静默期卡片「冻结成卡死假象」由此消除。空闲判定改为
+        // since_chunk 自计数（语义与旧整段超时一致）。
+        const HEARTBEAT_TICK: std::time::Duration = std::time::Duration::from_secs(30);
+        let mut since_chunk = std::time::Instant::now();
         loop {
             // P4-6：COT 档位每轮读取（/config 热改对下一轮生效；Wave B-7：
             // per-conv 覆盖优先，/config cot 白名单用户可改自己会话）。
             let cot = self.cot_for(&conv.0).await;
             let idle_timeout = self.idle_timeout_for(&conv.0).await;
             let chunk = if idle_timeout.is_zero() {
-                match rx.recv().await {
-                    Some(c) => c,
-                    None => break,
-                }
-            } else {
-                match tokio::time::timeout(idle_timeout, rx.recv()).await {
+                // 看门狗关闭：心跳节拍仍生效（卡片可视化），但不做空闲判停。
+                match tokio::time::timeout(HEARTBEAT_TICK, rx.recv()).await {
                     Ok(Some(c)) => {
-                        exempt_secs = 0;
+                        since_chunk = std::time::Instant::now();
                         c
                     }
                     Ok(None) => break,
-                    // D3：仅**权限审批**的 pending 豁免看门狗（审批预算
-                    // permission_ask_timeout 独立兜底）；终端 ask_via_im 的 pending
-                    // 超时可到 86400s，不得无限豁免 IM 会话空闲看门狗。
-                    Err(_)
-                        if exempt_secs < self.permission_ask_timeout.as_secs()
-                            && self
-                                .router
-                                .has_pending_of_kind(&conv.0, PendingKind::Permission)
-                                .await =>
-                    {
-                        exempt_secs += idle_timeout.as_secs().max(1);
+                    Err(_) => {
+                        let waiting = self
+                            .router
+                            .has_pending_of_kind(&conv.0, PendingKind::Permission)
+                            .await;
+                        if let Some(c) = card.as_mut() {
+                            c.heartbeat(waiting, &conv, &hint, self.platform.as_ref())
+                                .await;
+                        }
                         continue;
                     }
+                }
+            } else {
+                let tick = idle_timeout.min(HEARTBEAT_TICK);
+                match tokio::time::timeout(tick, rx.recv()).await {
+                    Ok(Some(c)) => {
+                        exempt_secs = 0;
+                        since_chunk = std::time::Instant::now();
+                        c
+                    }
+                    Ok(None) => break,
                     Err(_) => {
-                        idle_timed_out = true;
-                        METRICS.agent_timeouts.with_label_values(&["idle"]).inc();
-                        warn!(
-                            target: "imagent::core",
-                            conv_id = %conv.0,
-                            idle = ?idle_timeout,
-                            "agent 空闲超时（连续无输出），终止本轮"
-                        );
-                        break;
+                        // D3：仅**权限审批**的 pending 豁免看门狗（审批预算
+                        // permission_ask_timeout 独立兜底）；终端 ask_via_im 的
+                        // pending 超时可到 86400s，不得无限豁免。
+                        let waiting = self
+                            .router
+                            .has_pending_of_kind(&conv.0, PendingKind::Permission)
+                            .await;
+                        if since_chunk.elapsed() >= idle_timeout {
+                            if exempt_secs < self.permission_ask_timeout.as_secs() && waiting {
+                                // 豁免：累计静默秒数进豁免预算，重排静默起点
+                                //（语义同旧的逐段累加：审批期间逐步烧预算）。
+                                exempt_secs += since_chunk.elapsed().as_secs().max(1);
+                                since_chunk = std::time::Instant::now();
+                            } else {
+                                idle_timed_out = true;
+                                METRICS.agent_timeouts.with_label_values(&["idle"]).inc();
+                                warn!(
+                                    target: "imagent::core",
+                                    conv_id = %conv.0,
+                                    idle = ?idle_timeout,
+                                    "agent 空闲超时（连续无输出），终止本轮"
+                                );
+                                break;
+                            }
+                        }
+                        // v1.23 心跳：静默期每拍刷新 footer（时长走动）；审批
+                        // pending 时阶段翻 WaitingApproval（下个 chunk 自然翻回）。
+                        if let Some(c) = card.as_mut() {
+                            c.heartbeat(waiting, &conv, &hint, self.platform.as_ref())
+                                .await;
+                        }
+                        continue;
                     }
                 }
             };
