@@ -2,6 +2,33 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.22.1] — 2026-09-08
+
+> **v12 复审修复批次**（docs/CODE_REVIEW_v12.md）：v1.21/v1.22 新代码对抗
+> 复审 + 盲区补审，24 项修复（含 1 项 v1.21 引入的方向性回归）。
+> 全仓 680 tests / 0 failed、clippy 零警告。
+
+### Fixed
+- **P1 崩溃恢复 last_prompt 保护方向反了**（v1.21 引入）：实现成「存在即
+  不覆盖」从未比时间戳——轮次串行下崩溃轮必然更新，常见场景整体禁用
+  崩溃恢复且 /retry 指向更旧 prompt（副作用指令重跑风险）；真比较 at +
+  回归锚测试
+- **P1 card.rs `<at>` 注入收口遗漏**（第三次同类）：多题卡题面、/resume
+  「内容」列（用户原文）、未配对行、heading、已记录选择回显、tool_name
+  六出口全部补 escape_lt/mask_emails
+- **撤 WS 无事件看门狗**（v1.22 引入的有害冗余）：核实 openlark SDK 自带
+  120s 心跳超时已覆盖静默黑洞，看门狗判据是业务 payload——低流量部署的
+  健康连接曾被每 30min 误杀
+- /cron enable 重置 next_run（停用期陈旧值曾致立即补跑）+ 权限判任务
+  归属；/resume 接管清 session allow-set（「始终允许」不再跨会话延续）
+- token_refresh_waiters 指标 Drop guard 化（future 取消泄漏）；GitHub
+  事件必要字段缺失即 Skip；wecom subscribe ack 必须携带 errcode；ilink
+  游标读失败即停（空游标可触发大批重放）；setup EOF 优雅退出 + 覆盖前
+  备份；service plist/unit 模板转义
+- P3 批：outbox 失败事务化、/health 接 outbox_pending、ACP SessionStarted
+  超时 warn、inject 锁后复查、令牌桶补 send_media/send_command_card、
+  permission 计数清理、ilink persist_media 原子 0600 + 出站媒体上限等
+
 ## [1.22.0] — 2026-09-04
 
 > **运维托付批次**（v11 复审路线图五连）：webhook 防护套件 + GitHub 原生
