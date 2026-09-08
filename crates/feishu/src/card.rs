@@ -39,13 +39,14 @@ fn cap_md_bytes(md: &str, head_b: usize, tail_b: usize) -> String {
         }
         j
     };
-    let omitted = md.len() - head_end - (md.len() - tail_start);
     // R2（code-review v9）：不再承诺「完整内容见文本消息」——补发与否在 core
     // 侧按正文长度决定（CARD_TEXT_FULL_THRESHOLD），此处无从得知；8KB-30KB
     // 区间曾出现「卡上承诺、文本没来」的虚假契约。标注只陈述截断事实，
     // 超阈正文由 core 主动补发全文文本（阈值已对齐卡上限之下）。
+    // 卡片 UX 批（v1.24）：标注按行数（字节对用户是黑话）；仍是真实省略量。
+    let omitted_lines = md[head_end..tail_start].lines().count().max(1);
     format!(
-        "{}\n\n…（已截断中段 {omitted} 字节）…\n\n{}",
+        "{}\n\n…（中间约 {omitted_lines} 行已省略）…\n\n{}",
         &md[..head_end],
         &md[tail_start..]
     )
@@ -205,6 +206,30 @@ pub(crate) fn terminal_done_footer(run_secs: u64, usage_display: Option<&str>) -
     out
 }
 
+/// 卡片 UX 批（v1.24）：终态卡摘要（config.summary，会话列表/通知预览用）。
+/// Done 取结论首行（剥 markdown 强调符，截 50 字）；Error/中断给状态语。
+fn terminal_summary(card: &OutboundCard, err: Option<&str>) -> String {
+    match err {
+        None => {
+            let first = card
+                .text
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("");
+            let plain: String = first.replace("**", "").replace('#', "").replace('`', "'");
+            let plain = plain.trim();
+            if plain.is_empty() {
+                "✅ 已完成".to_string()
+            } else {
+                format!("✅ {}", truncate_chars(plain, 50))
+            }
+        }
+        Some("已中断") => "⏹ 已中断".to_string(),
+        Some(_) => "❌ 任务失败".to_string(),
+    }
+}
+
 /// Wave B-5：群 conv 卡片的「发起者」标注行（markdown 元素形态）。
 ///
 /// 形态取舍：CardKit markdown 组件支持 `<at id=…></at>` 标签（**待真机校准**：
@@ -324,6 +349,18 @@ pub fn render_card(card: &OutboundCard, conv_id: &str, sender: Option<&str>) -> 
     // Running 态带终止按钮（终态移除——整卡 patch 每次重渲染，自然消失）。
     if streaming {
         elements.push(stop_button(conv_id, None));
+    } else if err.is_none() {
+        // 卡片 UX 批（v1.24）：成功终态不再是交互真空（失败卡已有三键）——
+        // 完成后最自然的动作：再跑一次（/again 数据源 last_success_prompt
+        // 本轮刚落库）/ 导出留档。仅新建卡路径可加按钮（managed element
+        // PATCH 限制，本函数正是新建/整卡 patch 的画布）。
+        let again = cb_button("🔁 再跑一次", "primary", cmd_value(conv_id, "/again", None));
+        let export = cb_button(
+            "📄 导出会话",
+            "default",
+            cmd_value(conv_id, "/export", None),
+        );
+        elements.push(flow_button_row(&[again, export]));
     } else if err.is_some() {
         // Wave B-11：失败终态卡补「🩺 自检」按钮——一键 /doctor 排障（失败后
         // 用户最需要的下一步动作）。managed（card: 句柄）路径 element PATCH 只能
@@ -344,7 +381,12 @@ pub fn render_card(card: &OutboundCard, conv_id: &str, sender: Option<&str>) -> 
             "summary": { "content": phase_footer(card.phase) }
         })
     } else {
-        serde_json::json!({ "streaming_mode": false })
+        // 卡片 UX 批（v1.24）：终态 summary——会话列表/通知预览处此前显示默认
+        // 文本，改带结论首行（Done）或失败标记（Error），聊天列表一眼可辨。
+        serde_json::json!({
+            "streaming_mode": false,
+            "summary": { "content": terminal_summary(card, err) }
+        })
     };
     let mut card = serde_json::json!({
         "schema": "2.0",
@@ -464,6 +506,18 @@ fn tool_stats_summary(tools: &[ToolCall]) -> String {
 /// 绝——卡片长期滞留 IM，过期上下文的命令点击应明确提示而非照旧执行）。
 /// `sender`（发起轮次用户 open_id，群 conv 下校验点击者）仅终止按钮携带——命令
 /// 卡按钮无「发起者」语义（命令卡由命令回执触发，非轮次锚定）。
+/// 卡片 UX 批（v1.24）：安全命令的按钮有效期放宽到 7 天——失败卡的「🔁 重试」
+/// 隔天点击回「已过期」白白损失一次本可成功的重试（/retry 数据源本身是持久的）；
+/// 24h 窗口保留给携带即时上下文的命令（/ws use 指向可能已删除等）。
+const SAFE_CMD_TTL_SECS: i64 = 7 * 24 * 3600;
+
+/// 命令是否为安全长时效类（重放无状态副作用 / 数据源持久）。
+fn is_safe_long_ttl_command(command: &str) -> bool {
+    const SAFE_PREFIXES: &[&str] = &["/retry", "/again", "/doctor", "/export", "/help"];
+    let first_word = command.split_whitespace().next().unwrap_or("");
+    SAFE_PREFIXES.contains(&first_word)
+}
+
 fn cmd_value(conv_id: &str, command: &str, sender: Option<&str>) -> serde_json::Value {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -472,6 +526,9 @@ fn cmd_value(conv_id: &str, command: &str, sender: Option<&str>) -> serde_json::
     let mut v = serde_json::json!({
         "imagent_cmd": command, "conv": conv_id, "ts": ts
     });
+    if is_safe_long_ttl_command(command) {
+        v["ttl"] = serde_json::json!(SAFE_CMD_TTL_SECS);
+    }
     if let Some(s) = sender.filter(|s| !s.is_empty()) {
         v["sender"] = serde_json::json!(s);
     }
@@ -671,10 +728,22 @@ fn todo_list_md(todos: &[imagent_core::TodoItem]) -> Option<String> {
             format!("- {mark} {}{icon}", t.text)
         })
         .collect();
+    let total = todos.len();
+    // 卡片 UX 批（v1.24）：▓ 进度条（10 段量化）——长任务进度一眼可感。
+    let filled = if total == 0 {
+        0
+    } else {
+        (done * 10 + total / 2) / total
+    };
+    let bar = format!(
+        "{}{}",
+        "▓".repeat(filled.min(10)),
+        "░".repeat(10 - filled.min(10))
+    );
     Some(format!(
-        "**📋 计划**（{}/{}）\n{}",
+        "**📋 计划** {bar} {}/{}\n{}",
         done,
-        todos.len(),
+        total,
         lines.join("\n")
     ))
 }
@@ -2395,7 +2464,10 @@ mod tests {
         let mut card = body_card_of("正文内容", &[], &["旧思考", "最新思考"]);
         card.todos = todos;
         let md = stream_body_md(&card);
-        assert!(md.contains("**📋 计划**（1/3）"), "进度计数: {md}");
+        assert!(
+            md.contains("**📋 计划** ▓▓▓░░░░░░░ 1/3"),
+            "进度计数+进度条: {md}"
+        );
         assert!(md.contains("- [x] 分析需求"), "完成项: {md}");
         assert!(md.contains("- [ ] 写代码 ⏳"), "进行中项: {md}");
         assert!(md.contains("- [ ] 测试"), "待办项: {md}");
@@ -3165,6 +3237,44 @@ mod tests {
             "内容不丢: {json}"
         );
     }
+    /// 卡片 UX 批（v1.24）：成功终态卡带「再跑/导出」快捷动作 + summary 结论。
+    #[test]
+    fn done_card_has_quick_actions_and_summary() {
+        let mut card = body_card_of("部署完成，版本 v1.2.3 已上线", &[], &[]);
+        card.terminal = CardTerminal::Done;
+        let json = render_card(&card, "feishu:ou_u1", None);
+        assert!(json.contains("再跑一次"), "应有再跑按钮: {json}");
+        assert!(json.contains("导出会话"), "应有导出按钮: {json}");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let summary = v
+            .pointer("/config/summary/content")
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
+        assert!(
+            summary.contains("部署完成"),
+            "summary 带结论首行: {summary}"
+        );
+        // 安全命令按钮带 7 天 ttl。
+        assert!(json.contains("\"ttl\":"), "安全命令带 ttl: {json}");
+    }
+
+    /// 安全命令 7 天 TTL / 普通命令维持缺省（24h 由 proto 侧兜底）。
+    #[test]
+    fn cmd_value_ttl_by_command_safety() {
+        assert!(cmd_value("feishu:oc_x", "/retry", None)
+            .get("ttl")
+            .is_some());
+        assert!(cmd_value("feishu:oc_x", "/again", None)
+            .get("ttl")
+            .is_some());
+        assert!(
+            cmd_value("feishu:oc_x", "/ws use main", None)
+                .get("ttl")
+                .is_none(),
+            "带状态上下文的命令维持 24h 缺省"
+        );
+    }
+
     /// 真机校准（2026-08-30）：卡片上限按**字节**计——24K 字符（~30KB）实测被
     /// 200860 拒。cap_md_bytes 字节制头尾窗口 + char 边界安全。
     #[test]
@@ -3174,7 +3284,7 @@ mod tests {
         let long = "https://example.com/很长的路径".repeat(2000); // 远超 8KB
         let capped = cap_md_bytes(&long, 4_096, 4_096);
         assert!(capped.len() < long.len(), "必须截断");
-        assert!(capped.contains("已截断中段"), "带截断标注");
+        assert!(capped.contains("行已省略"), "带截断标注: {capped}");
         assert!(
             capped.len() < 9_500,
             "截后总长受字节预算约束: {}",
