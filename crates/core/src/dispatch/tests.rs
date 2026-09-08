@@ -4741,6 +4741,54 @@ async fn crashed_round_recovery_prefers_newer_inflight() {
     drop_db(ctx.db).await;
 }
 
+/// v1.23 指令复用：成功轮 prompt 落 last_success_prompt → /again 重跑
+///（与 /retry 的失败轮分键互不干扰）。
+#[tokio::test]
+async fn again_replays_last_success_prompt() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    // 一轮成功任务（MockBackend 默认成功终态）。
+    ctx.disp.handle(msg("c1", "alice", "生成日报")).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if !ctx.prompts.lock().await.is_empty() {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("首轮未执行");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // 等轮次收尾落库（handle 直跑完含收尾）。
+    let store = ctx.check().await;
+    assert!(
+        store
+            .get_config("last_success_prompt:c1")
+            .await
+            .unwrap()
+            .is_some(),
+        "成功轮应落 last_success_prompt"
+    );
+    // /again 重跑。
+    ctx.disp.handle(msg("c1", "alice", "/again")).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if ctx.prompts.lock().await.len() >= 2 {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("/again 未重跑: {:?}", ctx.prompts.lock().await);
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        ctx.prompts.lock().await[1],
+        "生成日报",
+        "/again 应重放成功轮 prompt"
+    );
+    drop_db(ctx.db).await;
+}
+
 /// v1.23 allow-set 可见性：always 落地 → /perm list 可见 → /perm revoke
 /// 单项撤销 → 再次 list 为空。
 #[tokio::test]

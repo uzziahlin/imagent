@@ -780,6 +780,23 @@ impl Dispatcher {
                 "\n\n📊 当前上下文约 {n} tokens，较大，建议 /compact。"
             ));
         }
+        // v1.23 指令复用：成功轮 prompt 落 `last_success_prompt:<conv>`（与
+        // 失败轮的 last_prompt 分键互不干扰）——/again 与失败卡的对称物。
+        if outcome.terminal {
+            if let Some(p) = retry_prompt.as_deref().filter(|p| !p.trim().is_empty()) {
+                let payload = serde_json::json!({ "prompt": p, "at": now_secs() });
+                if let Err(e) = self
+                    .store
+                    .set_config(
+                        &format!("last_success_prompt:{}", conv.0),
+                        &payload.to_string(),
+                    )
+                    .await
+                {
+                    warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "success prompt 落库失败（不影响本轮）");
+                }
+            }
+        }
         if let Some(c) = card.as_mut() {
             let terminal = if outcome.terminal {
                 CardTerminal::Done

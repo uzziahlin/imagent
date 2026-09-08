@@ -749,6 +749,57 @@ impl Dispatcher {
         self.dispatch_agent_message(msg).await;
     }
 
+    /// /again —— 重跑最近一次**成功**轮的指令（v1.23 指令复用；与 /retry 的
+    /// 失败轮重试对称）。数据源 `last_success_prompt:<conv>`（成功轮落库，
+    /// 与失败轮的 last_prompt 分键）。巡检/日报类「隔天再跑一次」从此不必
+    /// 手打全文。
+    pub(super) async fn cmd_again(
+        &self,
+        conv: &ConvId,
+        sender: &crate::types::UserId,
+        hint: &ReplyHint,
+    ) {
+        let prompt = match self
+            .store
+            .get_config(&format!("last_success_prompt:{}", conv.0))
+            .await
+        {
+            Ok(Some(raw)) => serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .and_then(|v| v.get("prompt").and_then(|p| p.as_str()).map(str::to_string))
+                .filter(|p| !p.trim().is_empty()),
+            _ => None,
+        };
+        let Some(prompt) = prompt else {
+            self.reply(
+                conv,
+                "本会话还没有成功完成的指令可复用（先跑完一轮；失败轮的重试用 /retry）。",
+                hint,
+            )
+            .await;
+            return;
+        };
+        let digest = truncate_str(&prompt, 60);
+        let msg = InboundMessage {
+            conv_id: conv.clone(),
+            sender: sender.clone(),
+            text: Some(prompt),
+            media: Vec::new(),
+            media_errors: Vec::new(),
+            mentions: Vec::new(),
+            mentioned_bot: false,
+            ask_req: None,
+            reply_to: None,
+            source_msg_id: None,
+            control: None,
+            no_steer: false,
+            reply_hint: hint.clone(),
+        };
+        self.reply(conv, &format!("🔁 再跑一次：{digest}"), hint)
+            .await;
+        self.dispatch_agent_message(msg).await;
+    }
+
     /// /export —— 当前会话导出为 Markdown 文件回传（W4-2）。走 backend 的本机
     /// 会话存储转录（claude 系支持；codex/gemini 回不支持提示）。导出文件经
     /// send_media 发送后即删（media 目录，0600）。
@@ -1253,7 +1304,31 @@ impl Dispatcher {
 
     /// /help —— 命令总表（P6-3：飞书等卡片平台带常用命令按钮）。
     pub(super) async fn cmd_help(&self, conv: &ConvId, hint: &ReplyHint) {
-        let body = "🗂 会话\n- /new 重置会话\n- /switch <name> 切换/新建命名会话\n- /sessions 列出命名会话\n- /resume [n] 恢复历史/本机会话\n- /compact 压缩上下文\n- /retry 重试最近一轮（失败后一键续接）\n- /export 导出当前会话为 Markdown\n\n📁 目录与文件\n- /cd <path> 切工作目录\n- /ws save|use|remove <name> 命名工作空间\n- /img <path> 发图片 · /file <path> 发文件\n\n🛡️ 权限与运行\n- /perm <off|allow|deny|ask> 权限模式\n- /stop 中断任务（排队消息保留并自动续跑；/stop all 全部丢弃）\n- /queue [drop <n>] 查看/丢弃排队中的消息\n- /timeout <分钟|off|default> 会话级空闲看门狗\n- /cron add <分 时 日 月 周> <指令> 定时执行（本地时区）· /cron list · /cron rm <id>\n- /model [名称|default] 查看/切换模型（切换需管理员）\n\n🧪 状态与诊断\n- /status 状态 · /doctor 自检 · /reconnect 重连\n- /config [k v] 查看/热改配置 · /audit [n] 审计日志\n\n👥 白名单与管理（管理员）\n- /allow、/disallow 授权/撤权（飞书群内可 @ 对方）\n- /chat allow|deny|allow-all|list 会话白名单\n- /admin list|add|remove 管理员\n- /list 白名单 · /whoami 我的 id\n\n💬 会话规则：群主时间线直接 @我 = 续同一会话；点消息「回复」进话题 = 开独立会话（互不共享上下文/待办）。\n\n其他内容直接发给 agent 即可（运行中发文字会实时转入当前轮次、下个工具边界生效 👀；图片/文件等媒体走排队、合并进下一轮 ⏳）。";
+        let mut body = "🗂 会话\n- /new 重置会话\n- /switch <name> 切换/新建命名会话\n- /sessions 列出命名会话\n- /resume [n] 恢复历史/本机会话\n- /compact 压缩上下文\n- /retry 重试最近一轮（失败后一键续接）· /again 再跑最近一次成功指令\n- /export [n] 导出当前（或 /resume 序号）会话为 Markdown\n\n📁 目录与文件\n- /cd <path> 切工作目录\n- /ws save|use|remove <name> 命名工作空间\n- /img <path> 发图片 · /file <path> 发文件\n\n🛡️ 权限与运行\n- /perm <off|allow|deny|ask> 权限模式 · /perm list 查看会话授权 · /perm revoke <工具> 撤销\n- /stop 中断任务（排队消息保留并自动续跑；/stop all 全部丢弃）\n- /queue [drop <n>] 查看/丢弃排队中的消息\n- /timeout <分钟|off|default> 会话级空闲看门狗\n- /cron add <分 时 日 月 周> <指令> 定时执行（本地时区）· /cron list · rm/enable/disable <id>\n- /model [名称|default] 查看/切换模型（切换需管理员）\n\n🧪 状态与诊断\n- /status 状态 · /doctor 自检 · /reconnect 重连\n- /config [k v] 查看/热改配置 · /audit [n] 审计日志\n\n👥 白名单与管理（管理员）\n- /allow、/disallow 授权/撤权（飞书群内可 @ 对方）\n- /chat allow|deny|allow-all|list 会话白名单\n- /admin list|add|remove 管理员\n- /list 白名单 · /whoami 我的 id\n\n💬 会话规则：群主时间线直接 @我 = 续同一会话；点消息「回复」进话题 = 开独立会话（互不共享上下文/待办）。\n\n其他内容直接发给 agent 即可（运行中发文字会实时转入当前轮次、下个工具边界生效 👀；图片/文件等媒体走排队、合并进下一轮 ⏳）。".to_string();
+        // v1.23：动态追加 shortcuts 段——快捷命令此前零发现性（忘了名字就
+        // 永久失联，只能翻 config.toml）。
+        {
+            let sc = self
+                .shortcuts
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if !sc.is_empty() {
+                let mut names: Vec<&String> = sc.keys().collect();
+                names.sort();
+                let lines: Vec<String> = names
+                    .iter()
+                    .map(|n| {
+                        let tpl = sc[*n].split_whitespace().collect::<Vec<_>>().join(" ");
+                        format!("- /{n} → {}", truncate_str(&tpl, 40))
+                    })
+                    .collect();
+                body.push_str(&format!(
+                    "\n\n⌨️ 自定义快捷命令\n{}\n（发送 /名称 [参数]；模板里 $args 为参数占位）",
+                    lines.join("\n")
+                ));
+            }
+        }
         let buttons = vec![
             CardButton {
                 label: "📊 状态".into(),
@@ -1286,7 +1361,7 @@ impl Dispatcher {
                 style: CardButtonStyle::Danger,
             },
         ];
-        self.reply_card(conv, "🤖 imagent 命令", body, buttons, hint)
+        self.reply_card(conv, "🤖 imagent 命令", &body, buttons, hint)
             .await;
     }
 }

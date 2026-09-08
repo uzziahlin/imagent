@@ -21,6 +21,7 @@ pub(super) const COMMAND_GROUPS: &[(&str, &[&str])] = &[
             "/resume",
             "/compact",
             "/retry",
+            "/again",
         ],
     ),
     ("📁 目录与文件", &["/cd", "/ws", "/img", "/file"]),
@@ -268,6 +269,10 @@ impl Dispatcher {
                         self.cmd_compact(&conv, &hint).await;
                         return;
                     }
+                    "/again" => {
+                        self.cmd_again(&conv, &sender, &hint).await;
+                        return;
+                    }
                     "/retry" => {
                         self.cmd_retry(&conv, &sender, &hint).await;
                         return;
@@ -338,7 +343,28 @@ impl Dispatcher {
                             return;
                         }
                         // S-12：模糊匹配建议 + 分组竖排命令表（与 /help 分组同构）。
-                        let text = unknown_command_reply(&cmd);
+                        let mut text = unknown_command_reply(&cmd);
+                        // v1.23：附已配置的 shortcuts（此前忘了快捷名只能翻
+                        // config.toml；此处列名即可自愈）。
+                        {
+                            let sc = self
+                                .shortcuts
+                                .read()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .clone();
+                            if !sc.is_empty() {
+                                let mut names: Vec<&String> = sc.keys().collect();
+                                names.sort();
+                                text.push_str(&format!(
+                                    "\n\n⌨️ 可用快捷命令：{}",
+                                    names
+                                        .iter()
+                                        .map(|n| format!("/{n}"))
+                                        .collect::<Vec<_>>()
+                                        .join(" ")
+                                ));
+                            }
+                        }
                         self.reply(&conv, &text, &hint).await;
                         return;
                     }
