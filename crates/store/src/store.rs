@@ -2982,11 +2982,14 @@ mod tests {
         assert_eq!(store.outbox_depth().await.unwrap(), 0);
 
         // 尝试上限：连续失败到 OUTBOX_MAX_ATTEMPTS 后放弃（返回 false、行删除）。
+        // 时间戳重新取——入队 next_try = 真实当前秒，慢机上用段首的旧 now
+        // 查询会 miss（CI 真机踩过）。
         store
             .enqueue_outbox("feishu:oc_a", "feishu_text", "{}")
             .await
             .unwrap();
-        let row = store.due_outbox(now, 10).await.unwrap().remove(0);
+        let now2 = now_secs();
+        let row = store.due_outbox(now2, 10).await.unwrap().remove(0);
         let mut kept = true;
         for i in 0..OUTBOX_MAX_ATTEMPTS {
             kept = store.outbox_mark_failed(row.id, now + i).await.unwrap();
