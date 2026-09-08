@@ -36,6 +36,11 @@ pub struct SessionRow {
     pub name: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// v1.23 会话可辨认：首条 prompt 摘要（≤80 字符）。**仅落 session_history
+    /// 副表**（主表无此列）；写入为 COALESCE 语义——已有值不覆盖、NULL 回填，
+    /// 调用方无需关心是否首写。None = 未知（如中断路径学到的裸 sid）。
+    #[serde(default)]
+    pub first_prompt: Option<String>,
     /// TaskList 预热（2026-09-01）：该会话最近一份全量任务快照（JSON，含真实
     /// 任务 id），轮首播种给 backend 的待办累积器。NULL = 从未持久化（冷启动
     /// 走转录兜底）。/new 删整行，快照随之清除。serde default：旧序列化数据
@@ -97,6 +102,8 @@ pub struct SessionHistoryRow {
     pub agent_kind: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// v1.23 会话可辨认：首条 prompt 摘要（旧行/未记录为 NULL）。
+    pub first_prompt: Option<String>,
 }
 
 /// 一行 per-run 用量记录（schema v8，`/stats` 数据源）。
@@ -561,6 +568,8 @@ impl Store {
             match rows.next()? {
                 None => Ok(None),
                 Some(r) => Ok(Some(SessionRow {
+                    // 主表无 first_prompt 列（仅历史副表）。
+                    first_prompt: None,
                     conv_id: r.get(0)?,
                     session_id: r.get(1)?,
                     agent_kind: r.get(2)?,
@@ -611,10 +620,19 @@ impl Store {
                 ],
             )?;
             tx.execute(
-                "INSERT INTO session_history (conv_id, session_id, agent_kind, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT(conv_id, session_id) DO UPDATE SET updated_at = excluded.updated_at",
-                rusqlite::params![row.conv_id, row.session_id, row.agent_kind, now, now],
+                "INSERT INTO session_history (conv_id, session_id, agent_kind, created_at, updated_at, first_prompt) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(conv_id, session_id) DO UPDATE SET \
+                   updated_at = excluded.updated_at, \
+                   first_prompt = COALESCE(session_history.first_prompt, excluded.first_prompt)",
+                rusqlite::params![
+                    row.conv_id,
+                    row.session_id,
+                    row.agent_kind,
+                    now,
+                    now,
+                    row.first_prompt,
+                ],
             )?;
             // P5-store：session_history per-conv 轮转——保留最近 50 条（调用方
             // list_session_history 上限 50；此前只增不删，长生命周期部署无限增长）。
@@ -947,7 +965,7 @@ impl Store {
         let inner = self.inner.clone();
         blocking_with(inner, move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT conv_id, session_id, agent_kind, created_at, updated_at \
+                "SELECT conv_id, session_id, agent_kind, created_at, updated_at, first_prompt \
                  FROM session_history WHERE conv_id = ?1 ORDER BY updated_at DESC LIMIT ?2",
             )?;
             let rows = stmt.query_map(rusqlite::params![conv_id, limit_i], |r| {
@@ -957,6 +975,7 @@ impl Store {
                     agent_kind: r.get::<_, Option<String>>(2)?,
                     created_at: r.get(3)?,
                     updated_at: r.get(4)?,
+                    first_prompt: r.get(5)?,
                 })
             })?;
             let mut v = Vec::new();
@@ -2306,6 +2325,7 @@ mod tests {
         let db = TempDb::new("hist").await;
         let store = Store::open(&db.path).await.unwrap();
         let row = |sid: &str, at: i64| SessionRow {
+            first_prompt: None,
             conv_id: "c1".into(),
             session_id: sid.into(),
             agent_kind: "mock".into(),
@@ -2341,6 +2361,7 @@ mod tests {
         let db = TempDb::new("hist_rot").await;
         let store = Store::open(&db.path).await.unwrap();
         let row = |conv: &str, sid: &str| SessionRow {
+            first_prompt: None,
             conv_id: conv.into(),
             session_id: sid.into(),
             agent_kind: "mock".into(),
@@ -2464,6 +2485,7 @@ mod tests {
         let store = Store::open(&db.path).await.unwrap();
 
         let row = SessionRow {
+            first_prompt: None,
             conv_id: "ilink:user1".into(),
             session_id: "sess-A".into(),
             agent_kind: "claude-cli".into(),
@@ -2516,6 +2538,7 @@ mod tests {
         let db = TempDb::new("sess-todos").await;
         let store = Store::open(&db.path).await.unwrap();
         let row = SessionRow {
+            first_prompt: None,
             conv_id: "feishu:c1".into(),
             session_id: "sess-A".into(),
             agent_kind: "claude-cli".into(),
@@ -2790,6 +2813,7 @@ mod tests {
                 for i in 0..TIMES {
                     store
                         .upsert_session(&SessionRow {
+                            first_prompt: None,
                             conv_id: format!("conv-{t}"),
                             session_id: format!("sess-{t}-{i}"),
                             agent_kind: "mock".into(),
@@ -2871,6 +2895,49 @@ mod tests {
                 .unwrap(),
             Some("tok-2".into())
         );
+    }
+
+    /// v1.23 会话可辨认：first_prompt 首写保留（后续轮次 None 不覆盖）、
+    /// NULL 回填、list 可读。
+    #[tokio::test]
+    async fn session_history_first_prompt_semantics() {
+        let db = TempDb::new("fp").await;
+        let store = Store::open(&db.path).await.unwrap();
+        let row = |fp: Option<&str>, sid: &str| SessionRow {
+            conv_id: "c1".into(),
+            session_id: sid.into(),
+            agent_kind: "claude-cli".into(),
+            workdir: "/tmp".into(),
+            name: None,
+            created_at: 1,
+            updated_at: 1,
+            first_prompt: fp.map(str::to_string),
+            task_todos: None,
+        };
+        // 首轮：写入摘要。
+        store
+            .upsert_session(&row(Some("帮我修登录 bug"), "s1"))
+            .await
+            .unwrap();
+        // 二轮（续接同 sid）：prompt 未知（None）——不应覆盖已有摘要。
+        store.upsert_session(&row(None, "s1")).await.unwrap();
+        // 新会话：先 None（中断路径），随后带摘要——NULL 应被回填。
+        store.upsert_session(&row(None, "s2")).await.unwrap();
+        store
+            .upsert_session(&row(Some("写周报"), "s2"))
+            .await
+            .unwrap();
+
+        let hist = store.list_session_history("c1", 10).await.unwrap();
+        assert_eq!(hist.len(), 2);
+        let get = |sid: &str| {
+            hist.iter()
+                .find(|h| h.session_id == sid)
+                .and_then(|h| h.first_prompt.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(get("s1"), "帮我修登录 bug", "已有值不被 None 覆盖");
+        assert_eq!(get("s2"), "写周报", "NULL 应回填");
     }
 
     #[tokio::test]
@@ -3607,6 +3674,7 @@ mod tests {
             .unwrap();
         store
             .upsert_session(&SessionRow {
+                first_prompt: None,
                 conv_id: "c1".into(),
                 session_id: "sess-old".into(),
                 agent_kind: "mock".into(),
@@ -3623,6 +3691,7 @@ mod tests {
             .await
             .unwrap();
         let sr = SessionRow {
+            first_prompt: None,
             conv_id: "c1".into(),
             session_id: "sess-named".into(),
             agent_kind: "mock".into(),
@@ -3661,6 +3730,7 @@ mod tests {
         let store = Store::open(&db.path).await.unwrap();
         store
             .upsert_session(&SessionRow {
+                first_prompt: None,
                 conv_id: "c2".into(),
                 session_id: "sess-old".into(),
                 agent_kind: "mock".into(),

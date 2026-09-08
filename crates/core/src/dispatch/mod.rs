@@ -2102,6 +2102,8 @@ impl Dispatcher {
             .to_string();
         let row = SessionRow {
             conv_id: conv.0.clone(),
+            // 学到的裸 sid 无 prompt 上下文——None（历史行已有值则 COALESCE 保留）。
+            first_prompt: None,
             session_id: sid.to_string(),
             agent_kind: self.backend.name().to_string(),
             workdir: workdir.clone(),

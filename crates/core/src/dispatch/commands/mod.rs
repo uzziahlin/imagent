@@ -273,7 +273,7 @@ impl Dispatcher {
                         return;
                     }
                     "/export" => {
-                        self.cmd_export(&conv, &hint).await;
+                        self.cmd_export(&conv, &sender, &hint, &parts).await;
                         return;
                     }
                     "/cd" => {

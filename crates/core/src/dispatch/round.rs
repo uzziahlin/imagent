@@ -64,6 +64,9 @@ impl Dispatcher {
         // 无可续接会话且 prompt 命中续接词表（继续/接着/然后…，≤4 字）时，
         // 最终回复前置断档提示（见下方 reply 组装处）。
         let continuation_orphan = is_continuation_prompt(base_prompt.trim());
+        // v1.23 会话可辨认：轮次 prompt 摘要（base_prompt 随后被 move 进
+        // prompt 载体，此处先行截断保存）。
+        let first_prompt_digest = truncate_str(base_prompt.trim(), 80);
 
         // P0-4 补完（v1.18 review）：本Conv 停止标记水位——下方 preamble（typing/
         // store 读/转录回放/媒体提示/表情）含多个 await，/resume 首轮可达分钟级；
@@ -879,6 +882,9 @@ impl Dispatcher {
                 });
             let row = SessionRow {
                 conv_id: conv.0.clone(),
+                // v1.23 会话可辨认：轮次 prompt 摘要入历史副表（COALESCE——
+                // 会话既有值不覆盖，仅首写/NULL 回填）。
+                first_prompt: Some(first_prompt_digest.clone()),
                 session_id: outcome.session_id.0.clone(),
                 agent_kind: self.backend.name().to_string(),
                 workdir: workdir_for_row.clone(),
