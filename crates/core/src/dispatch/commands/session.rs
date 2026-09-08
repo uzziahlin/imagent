@@ -366,7 +366,19 @@ impl Dispatcher {
                         format_rel_ts(r.updated_at)
                     ));
                 }
-                self.reply(conv, &table, hint).await;
+                // v1.24 卡片 UX：前 9 条各带「切换」按钮（与 /resume 的接管
+                // 按钮同款配对行布局——手机端双列行替代四列表格）。
+                let buttons: Vec<crate::types::CardButton> = rows
+                    .iter()
+                    .take(9)
+                    .map(|r| crate::types::CardButton {
+                        label: format!("切换 {}", r.name),
+                        command: format!("/switch {}", r.name),
+                        style: crate::types::CardButtonStyle::Default,
+                    })
+                    .collect();
+                self.reply_card(conv, "🗂 命名会话", &table, buttons, hint)
+                    .await;
             }
             Err(e) => {
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "list_named_sessions 失败");

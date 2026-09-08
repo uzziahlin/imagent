@@ -1276,32 +1276,11 @@ impl Dispatcher {
             lines.len(),
             lines.join("\n")
         );
-        // CardKit 视觉改版：卡片平台回命令卡（markdown 表格）；纯文本平台保持
-        // 现有列表文本。
-        if self.platform.supports_streaming_card(conv) {
-            let mut table = String::from("| 时间 | 动作 | 操作者 | 摘要 |\n|---|---|---|---|\n");
-            for r in &rows {
-                let actor = r.actor.as_deref().unwrap_or("-");
-                let mut detail = r.target.clone().unwrap_or_default();
-                if let Some(d) = &r.detail {
-                    if !detail.is_empty() {
-                        detail.push(' ');
-                    }
-                    detail.push_str(d);
-                }
-                table.push_str(&format!(
-                    "| {} | {} | {} | {} |\n",
-                    format_rel_ts(r.ts),
-                    r.action.replace('|', "\\|"),
-                    actor.replace('|', "\\|"),
-                    truncate_str(&detail, 60).replace('|', "\\|")
-                ));
-            }
-            self.reply_card(conv, "📋 审计日志", &table, vec![], hint)
-                .await;
-        } else {
-            self.reply(conv, &text, hint).await;
-        }
+        // v1.24 卡片 UX：四列表格在手机窄屏挤压严重——卡片平台与文本平台
+        // 统一为逐条列表（时间 · 动作 · 操作者一行 + 摘要随行）。
+        let _ = &text;
+        self.reply_card(conv, "📋 审计日志", &text, vec![], hint)
+            .await;
     }
 
     /// /help —— 命令总表（P6-3：飞书等卡片平台带常用命令按钮）。

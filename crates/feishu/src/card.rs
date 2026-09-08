@@ -1634,13 +1634,16 @@ fn try_paired_rows(
 ) -> Option<Vec<serde_json::Value>> {
     let rows = table_rows(body_md)?;
     let data = &rows[1..];
-    // /resume 模式：全部按钮形如「接管 N」。
-    let resume_idx: Option<Vec<usize>> = buttons
+    // 行配对模式（v1.24 扩展）：按钮「接管 N」（/resume，行首=序号）或
+    // 「切换 X」（/sessions，行首=名称）——后缀与行首键精确匹配。
+    let pair_idx: Option<Vec<(&str, usize)>> = buttons
         .iter()
-        .map(|b| {
+        .enumerate()
+        .map(|(i, b)| {
             b.label
                 .strip_prefix("接管 ")
-                .and_then(|n| n.parse::<usize>().ok())
+                .or_else(|| b.label.strip_prefix("切换 "))
+                .map(|s| (s, i))
         })
         .collect::<Option<Vec<_>>>();
     let mut elements: Vec<serde_json::Value> = Vec::new();
@@ -1648,15 +1651,11 @@ fn try_paired_rows(
     let mut unpaired_rows: Vec<&Vec<String>> = Vec::new();
     for row in data {
         let key = row.first()?.trim().to_string();
-        if resume_idx.is_some() {
-            if let Some(i) = resume_idx
-                .as_ref()?
-                .iter()
-                .position(|n| n.to_string() == key)
-            {
-                let btn = render_cmd_button(&buttons[i], conv_id);
+        if let Some(pairs) = pair_idx.as_ref() {
+            if let Some((_, i)) = pairs.iter().find(|(s, _)| *s == key) {
+                let btn = render_cmd_button(&buttons[*i], conv_id);
                 elements.push(two_col_row(resume_row_left(row), vec![btn]));
-                used_buttons.push(i);
+                used_buttons.push(*i);
                 continue;
             }
         } else {
