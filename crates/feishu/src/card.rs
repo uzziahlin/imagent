@@ -994,7 +994,8 @@ pub(crate) fn render_permission_card_note(
         ),
     );
     deny_btn["width"] = serde_json::json!("fill");
-    let mut always_btn = cb_button(
+    // v1.23：持续授权比单次决策重——挂二次确认（allow/deny 单次决策不挂）。
+    let mut always_btn = cb_button_confirm(
         "♾️ 本次会话始终允许",
         "default",
         ask_value_wrap(
@@ -1003,6 +1004,7 @@ pub(crate) fn render_permission_card_note(
             request_id,
             sender,
         ),
+        "本会话内此工具将不再询问，直接执行。确认持续授权？",
     );
     always_btn["width"] = serde_json::json!("fill");
     elements.push(serde_json::json!({

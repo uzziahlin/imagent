@@ -317,6 +317,30 @@ impl PermissionRouter {
             .is_some_and(|s| s.contains(tool_name))
     }
 
+    /// v1.23 可见性：该 conv 的 allow-set 快照（排序展示用；空 = 无持续授权）。
+    pub async fn session_allow_snapshot(&self, conv_id: &str) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .session_allows
+            .lock()
+            .await
+            .get(conv_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// v1.23 可见性：单项撤销「始终允许」。返回是否存在该条目。
+    pub async fn revoke_session_allow(&self, conv_id: &str, tool_name: &str) -> bool {
+        self.session_allows
+            .lock()
+            .await
+            .get_mut(conv_id)
+            .is_some_and(|s| s.remove(tool_name))
+    }
+
     /// D-记忆：清空该 conv 的会话级 allow-set（/stop、/new）。
     pub async fn clear_session_allows(&self, conv_id: &str) {
         self.session_allows.lock().await.remove(conv_id);

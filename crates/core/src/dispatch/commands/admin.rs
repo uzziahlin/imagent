@@ -770,6 +770,61 @@ impl Dispatcher {
         parts: &[&str],
     ) {
         let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+        // v1.23 可见性子命令（先于模式切换解析）：「始终允许」是会话内持续
+        // 授权，此前不可见不可单项撤销（只能 /new 丢会话或 /stop 硬停）。
+        match arg {
+            "list" => {
+                let allows = self.router.session_allow_snapshot(&conv.0).await;
+                let cur = *self.permission_mode.read();
+                let allow_block = if allows.is_empty() {
+                    "本会话无「始终允许」的工具。".to_string()
+                } else {
+                    format!(
+                        "本会话已始终允许 {} 个工具：\n- {}\n（单项撤销：/perm revoke <工具名>；整体清空：/new 或 /stop）",
+                        allows.len(),
+                        allows.join("\n- ")
+                    )
+                };
+                self.reply(
+                    conv,
+                    &format!("当前权限模式：{}\n{allow_block}", cur.as_str()),
+                    hint,
+                )
+                .await;
+                return;
+            }
+            "revoke" => {
+                let Some(tool) = parts.get(2).map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+                    self.reply(
+                        conv,
+                        "用法：/perm revoke <工具名>（查看可撤销项：/perm list）。",
+                        hint,
+                    )
+                    .await;
+                    return;
+                };
+                match self.router.revoke_session_allow(&conv.0, tool).await {
+                    true => {
+                        self.reply(
+                            conv,
+                            &format!("✅ 已撤销「{tool}」的始终允许（下次使用将重新询问）。"),
+                            hint,
+                        )
+                        .await;
+                    }
+                    false => {
+                        self.reply(
+                            conv,
+                            &format!("「{tool}」不在本会话的始终允许清单里（查看：/perm list）。"),
+                            hint,
+                        )
+                        .await;
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
         if arg.is_empty() {
             let cur = *self.permission_mode.read();
             // auto-claude 是 auto 在 claude-cli 下的解析产物，附说明防「设置了
@@ -782,7 +837,7 @@ impl Dispatcher {
             self.reply(
                 conv,
                 &format!(
-                    "当前权限模式：{}{note}\n用法：/perm <auto|off|allow|deny|ask>",
+                    "当前权限模式：{}{note}\n用法：/perm <auto|off|allow|deny|ask> · /perm list 查看会话授权 · /perm revoke <工具> 撤销",
                     cur.as_str()
                 ),
                 hint,
