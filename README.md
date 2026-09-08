@@ -152,6 +152,7 @@ allowed_senders = []        # 留空 = 发现模式（先看日志拿你的 from
 # secret = "github-webhook-secret"    # 可选 HMAC-SHA256 验签（GitHub webhook secret 同款：
 #                                     #   X-Hub-Signature-256: sha256=<hex>；公网/隧道部署强烈建议）
 # rps = 10                            # 可选限速（请求/秒，缺省 10；0 = 不限）
+# feishu_urgent_on_ask = true         # 审批/问题卡到达即应用内加急弹通知（缺省开；免打扰时段自动跳过）
 # GitHub 原生事件：带 X-GitHub-Event 头的请求自动解析为可读摘要注入
 #（workflow_run 终态/push/issues/评论/PR/ping；未识别事件确认但不注入）；
 # 其它来源请 POST JSON {"text":"..."} 或纯文本。

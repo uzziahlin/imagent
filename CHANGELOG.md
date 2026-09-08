@@ -2,6 +2,37 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.24.0] — 2026-09-08
+
+> **飞书卡片交互与美化批次**（三批 12 项）：成功终态快捷动作、审批到达
+> 即加急、任务摘要可辨认、移动端适配。全仓 686 tests / 0 failed。
+> 能力边界内实现（managed 卡 element PATCH 只能动 markdown；note/action/
+> tag 组件 V2 已废弃——真机校准约束均在注释留档）。
+
+### Added
+- **成功终态卡快捷动作**：「🔁 再跑一次」（/again）+「📄 导出会话」按钮
+  行——完成后的自然动作此前只能手打命令（失败卡早有三键）
+- **审批/问题卡到达即加急**（urgent_app 弹通知，`feishu_urgent_on_ask`
+  缺省开，免打扰时段跳过）——长任务挂后台时第一时间看到审批请求，而非
+  等 permission_ask_timeout 超时 auto-deny
+- **任务摘要可辨认**：OutboundCard.task_digest（首条 prompt 摘要）——
+  Running 首帧与卡片 summary 显示「🧠 处理中：修复登录页…」，聊天列表
+  预览/回到旧卡一眼认出是哪个任务
+- **进群欢迎命令卡**：按钮可点（📖 命令帮助 / ✅ 放行本群），替代一段
+  纯文本墙（卡片失败回落文本→outbox 兜底）
+- **终态 config.summary**：Done 带结论首行（截 50 字）——会话列表/通知
+  预览可辨认完成的是什么（此前显示默认文本）
+- **/sessions 切换按钮**：前 9 条各带「切换 <名称>」——配对行双列布局
+  （与 /resume 接管按钮同款），手机端告别四列表格
+- checklist 进度条：`📋 计划 ▓▓▓░░░░░░░ 1/3`
+
+### Changed
+- /retry /again /doctor /export /help 按钮有效期 24h→7 天（value 带
+  ttl；带状态上下文的 /ws use 等维持 24h）——失败卡重试按钮隔天不再
+  「已过期」白丢一次重试
+- /audit 卡片平台从四列表格统一为逐条列表（窄屏挤压修复）
+- 截断标注从字节改行数（「中间约 N 行已省略」）
+
 ## [1.23.0] — 2026-09-08
 
 > **交互体验批次**（v12 复审产品方向 Top5 全落地）：会话记忆可辨认、
