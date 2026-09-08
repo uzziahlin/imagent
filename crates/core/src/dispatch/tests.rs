@@ -4672,6 +4672,61 @@ async fn crashed_round_recovery_moves_to_retry() {
     drop_db(ctx.db).await;
 }
 
+/// v1.23 review（方向修正回归锚）：前一轮失败留下 last_prompt（旧 at）、
+/// 崩溃轮 inflight 更新——恢复后 /retry 必须指向**崩溃轮**（更新的那条）。
+/// v1.21 的实现（存在即不覆盖）在此场景会保留旧 prompt，等于禁用崩溃恢复
+/// 且引导用户重跑更早的副作用指令。
+#[tokio::test]
+async fn crashed_round_recovery_prefers_newer_inflight() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    let store = ctx.check().await;
+    // 场景：轮 1「部署 staging」失败（last_prompt at=100）→ 轮 2「回滚」
+    // 进行中崩溃（inflight at=200）。
+    store
+        .set_config(
+            "last_prompt:c1",
+            &serde_json::json!({ "prompt": "部署 staging", "at": 100 }).to_string(),
+        )
+        .await
+        .unwrap();
+    store
+        .set_config(
+            "inflight_prompt:c1",
+            &serde_json::json!({ "prompt": "回滚", "at": 200 }).to_string(),
+        )
+        .await
+        .unwrap();
+    ctx.disp.recover_crashed_rounds().await;
+    let retry = store.get_config("last_prompt:c1").await.unwrap();
+    assert!(
+        retry.as_deref().unwrap_or("").contains("回滚"),
+        "崩溃轮（更新的 inflight）应接管 last_prompt：{retry:?}"
+    );
+    // 反向：现存 last_prompt 严格更新（inflight 清理失败残留的陈旧标记）→ 保留现存。
+    store
+        .set_config(
+            "last_prompt:c2",
+            &serde_json::json!({ "prompt": "新失败轮", "at": 500 }).to_string(),
+        )
+        .await
+        .unwrap();
+    store
+        .set_config(
+            "inflight_prompt:c2",
+            &serde_json::json!({ "prompt": "陈旧残留", "at": 100 }).to_string(),
+        )
+        .await
+        .unwrap();
+    ctx.disp.recover_crashed_rounds().await;
+    let keep = store.get_config("last_prompt:c2").await.unwrap();
+    assert!(
+        keep.as_deref().unwrap_or("").contains("新失败轮"),
+        "陈旧 inflight 不应顶掉更新的 last_prompt：{keep:?}"
+    );
+    drop_db(ctx.db).await;
+}
+
 /// v1.20 窗口自学习：ACP 报告窗口 → 比例档阈值重算（默认 1M×0.8=800k，
 /// 学习 200k → 160k）；窗口未变 no-op。
 #[tokio::test]

@@ -132,10 +132,13 @@ impl WeComWsClient {
             Ok(Some(Ok(msg))) => match msg.into_text() {
                 Ok(text) => match parse_frame(&text) {
                     Ok(frame) => {
-                        let ok = frame.errcode.unwrap_or(0) == 0;
+                        // v1.23 review：首帧必须**携带 errcode 字段**才算 ack——
+                        // 此前 unwrap_or(0) 让任何非 ack 首帧（事件/ping）都伪装
+                        // 通过认证，真失败时连接静默无入站。
+                        let ok = frame.errcode == Some(0);
                         debug!(
                             target: "wecom",
-                            errcode = frame.errcode.unwrap_or(-1),
+                            errcode = ?frame.errcode,
                             authed = ok,
                             "收到 subscribe ack"
                         );

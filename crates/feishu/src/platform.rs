@@ -399,7 +399,6 @@ impl FeishuPlatform {
                             st.last_inbound = Some(anchor);
                             let _ = conv;
                         }
-                        st.last_touched = Instant::now();
                         if let Some(tk) = &thread_key {
                             let st = m.entry(tk.clone()).or_default();
                             st.thread_active_at = Some(Instant::now());
@@ -1318,12 +1317,12 @@ impl FeishuPlatform {
     /// 刷新会话最新卡片记录（card_tail，强提醒加急对象）。
     async fn note_card_tail(&self, conv_id: &str, msg_id: &str) {
         if msg_id.starts_with("om_") {
-            self.conv_states
-                .lock()
-                .await
-                .entry(conv_id.to_string())
-                .or_default()
-                .card_tail = Some(msg_id.to_string());
+            let mut m = self.conv_states.lock().await;
+            let st = m.entry(conv_id.to_string()).or_default();
+            st.card_tail = Some(msg_id.to_string());
+            // v1.23 review：发送侧活跃也是 LRU 活跃信号——长会话持续出卡但
+            // 暂无入站时不该被驱逐（card_tail 丢失会把加急降级为普通文本）。
+            st.last_touched = Instant::now();
         }
     }
 
@@ -2455,10 +2454,19 @@ async fn fetch_cached_token(
     static TOKEN_FAIL: std::sync::Mutex<Option<(String, Instant)>> = std::sync::Mutex::new(None);
     const TOKEN_FAIL_NEG_TTL: Duration = Duration::from_secs(5);
     // 刷新串行化：网络期间 token_lock 完全不被持有，发送方零阻塞。
-    // v1.21 可观测性：single-flight 门等待人数（增长 = token 端点故障先行信号）。
+    // v1.23 review：等待人数改 Drop guard——调用方 future 在等锁期间被取消
+    //（dispatch 超时 drop 发送 future 是常态路径）时裸 inc/dec 会永久泄漏
+    // 计数，指标假阳。
+    struct WaiterGuard;
+    impl Drop for WaiterGuard {
+        fn drop(&mut self) {
+            crate::metrics::METRICS.token_waiters.dec();
+        }
+    }
     crate::metrics::METRICS.token_waiters.inc();
+    let _waiter = WaiterGuard;
     let _refresh_guard = TOKEN_REFRESH_MU.lock().await;
-    crate::metrics::METRICS.token_waiters.dec();
+    drop(_waiter);
     // 双检：等刷新权期间可能已被前一个刷新者写回新 token。
     if let Some((token, fetched_at)) = token_lock.read().await.as_ref() {
         if fetched_at.elapsed() < TOKEN_TTL {
@@ -2668,6 +2676,9 @@ impl Platform for FeishuPlatform {
                 })
                 .await;
         }
+        // v1.23 review：媒体上传是最重的出站请求——纳入 per-conv 令牌桶
+        //（此前只在 send_text/send_card，覆盖面不全）。
+        self.acquire_send_slot(&conv.0).await;
         // agent 产出媒体回传（P6-7：按 kind 分流——image 走图片消息，其余走文件
         // 消息）：读本地文件 → 上传拿 key → 发消息。话题群 conv → reply API 落回话题。
         let thread = thread_target_from_conv(conv);
@@ -3224,6 +3235,8 @@ impl Platform for FeishuPlatform {
         buttons: &[CardButton],
         hint: &ReplyHint,
     ) -> Result<()> {
+        // v1.23 review：命令卡直发（不走 send_card）——补令牌桶覆盖。
+        self.acquire_send_slot(&conv.0).await;
         if comment_target_from_conv(conv).is_some() {
             return self
                 .send_text(

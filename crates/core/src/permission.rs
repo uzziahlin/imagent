@@ -320,6 +320,10 @@ impl PermissionRouter {
     /// D-记忆：清空该 conv 的会话级 allow-set（/stop、/new）。
     pub async fn clear_session_allows(&self, conv_id: &str) {
         self.session_allows.lock().await.remove(conv_id);
+        // v1.23 review：伴生的 per-conv 计数/时戳一并清理——此前只增不清，
+        // 长寿命进程 × 大量会话缓慢泄漏。
+        self.ask_counters.lock().await.remove(conv_id);
+        self.last_decision_at.lock().await.remove(conv_id);
     }
 
     /// 是否有 conv 处于等待回复状态。

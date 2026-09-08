@@ -99,65 +99,22 @@ impl FeishuWsClient {
 
     /// 主循环：重连外层 loop。`LarkWsClient::open` 阻塞运行会话，结束/断开才返回，
     /// 返回即按指数退避 sleep 后重连。
-    /// v1.21 review（无事件看门狗）：`open()` 静默黑洞（NAT 丢弃半开 TCP、SDK
-    /// 内部卡死）时既不返回错误也不触发断开——事件断流且永不重连，只能人工
-    /// /reconnect。加第三支：连续 WS_IDLE_WATCHDOG 无任何 payload 则强制丢弃
-    /// open future 重连（转发 task 负责更新活跃时刻）。
+    ///
+    /// v1.23 review（撤看门狗）：v1.21 曾加「30min 无 payload 强制重连」看门狗，
+    /// 核实 openlark 0.20.0 SDK 后确认其**有害且冗余**：SDK 自带 WS 层心跳
+    /// 存活检查（`session.rs` 的 `heartbeat_timeout=120s`——入站 WS Ping 刷新
+    /// `last_activity`，超时即 `begin_close` → `open()` 返回 → 本循环重连），
+    /// 静默黑洞连接 120s 内已被 SDK 处理；而看门狗的活跃信号只有**业务
+    /// payload**，低流量部署（夜间私聊、安静群）30 分钟无事件是常态——
+    /// 健康连接被每半小时误杀一次。判据（业务事件）与目标（连接存活性）
+    /// 不同层面，不该由我们判定。
     pub async fn run(self, payload_tx: mpsc::UnboundedSender<Vec<u8>>) {
-        const WS_IDLE_WATCHDOG: Duration = Duration::from_secs(30 * 60);
-        // 转发 task：handler → 本 channel → 转发到真正的 payload_tx，顺带记录
-        // 活跃时刻（看门狗数据源）。事件路径多一跳内存传递，代价可忽略。
-        let (watch_tx, mut watch_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let last_event = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
-        last_event.store(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        {
-            let last_event = last_event.clone();
-            let payload_tx = payload_tx.clone();
-            tokio::spawn(async move {
-                while let Some(buf) = watch_rx.recv().await {
-                    last_event.store(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    if payload_tx.send(buf).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
         let mut backoff = Duration::from_secs(1);
         loop {
             let handler = EventDispatcherHandler::builder()
-                .payload_sender(watch_tx.clone())
+                .payload_sender(payload_tx.clone())
                 .build();
             let opened_at = std::time::Instant::now();
-            let watchdog = {
-                let last_event = last_event.clone();
-                async move {
-                    loop {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0);
-                        let idle =
-                            (now - last_event.load(std::sync::atomic::Ordering::Relaxed)).max(0);
-                        if idle >= WS_IDLE_WATCHDOG.as_secs() as i64 {
-                            return;
-                        }
-                        tokio::time::sleep(WS_IDLE_WATCHDOG - Duration::from_secs(idle as u64))
-                            .await;
-                    }
-                }
-            };
             tokio::select! {
                 res = LarkWsClient::open(self.ws_config.clone(), handler) => match res {
                     Ok(()) => {
@@ -192,15 +149,6 @@ impl FeishuWsClient {
                     info!(target: "feishu", "收到 /reconnect 指令，主动断开重连");
                     backoff = Duration::from_secs(1);
                 },
-                _ = watchdog => {
-                    warn!(
-                        target: "feishu",
-                        idle_secs = WS_IDLE_WATCHDOG.as_secs(),
-                        "长连接无事件看门狗触发（疑似静默黑洞），强制丢弃连接重连"
-                    );
-                    // 黑洞连接不可信但新连接是全新握手：退避重置 1s 起步。
-                    backoff = Duration::from_secs(1);
-                }
             }
             // P1：退避加 ±20% 随机 jitter（防多实例同步重连风暴），基础值仍按
             // 指数增长（jitter 不参与翻倍，避免抖动累积漂移）。

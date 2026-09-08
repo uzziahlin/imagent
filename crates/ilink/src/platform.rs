@@ -91,11 +91,18 @@ impl ILinkPlatform {
     /// → 前进游标。游标在消息全部处理完后才更新：处理中 crash → 游标未动 →
     /// 下次重拉同批，重复消息由 dedup 吸收（at-least-once，优于丢消息）。
     async fn fetch_updates(&self) -> Result<Vec<InboundMessage>> {
-        let buf = self
-            .store
-            .get_sync_buf(PLATFORM, &self.account_id)
-            .await
-            .unwrap_or(None);
+        // v1.23 review：游标**读取**失败此前被静默吞掉（unwrap_or(None) → 带空
+        // 游标请求，服务端可能按重置语义大批重放；DB 故障跨 dedup 窗后恢复
+        // 甚至重复驱动 agent）。读失败即报错——让 recv 的退避重试接管，宁可
+        // 暂停拉取也不带空游标请求（与写侧 set_sync_buf 的重试+告警对称）。
+        let buf = match self.store.get_sync_buf(PLATFORM, &self.account_id).await {
+            Ok(b) => b,
+            Err(e) => {
+                use tracing::error;
+                error!(target: "ilink", error = %e, "同步游标读取失败，暂停本轮拉取（不带空游标请求）");
+                return Err(e.into());
+            }
+        };
         let body = json!({ "get_updates_buf": buf.unwrap_or_default() });
         let resp: UpdatesResp = self
             .client
@@ -248,6 +255,16 @@ impl ILinkPlatform {
                         return None;
                     }
                 };
+                // v1.23 review：插入时顺带清理过期条目 + 粗上限（此前只判失效
+                // 不删除，peer 无限增长）。
+                {
+                    let mut tickets = self.typing_tickets.lock().await;
+                    let now = Instant::now();
+                    tickets.retain(|_, (_, at)| now.duration_since(*at).as_secs() < 600);
+                    if tickets.len() >= 1024 {
+                        tickets.clear();
+                    }
+                }
                 self.typing_tickets.lock().await.insert(
                     peer.to_string(),
                     (ticket.clone(), Instant::now() + TYPING_TICKET_TTL),
@@ -278,7 +295,21 @@ impl ILinkPlatform {
         let peer = Self::peer_of(conv);
         let token = self.resolve_context_token(&peer, hint).await;
 
-        // 1. 读本地文件。
+        // 1. 读本地文件。v1.23 review：读前大小预检（出站媒体此前无上限，
+        // 与入站 50MB 上限不对称——大文件整读即 OOM 尖峰）。
+        if let Ok(meta) = std::fs::metadata(&media.url) {
+            const OUTBOUND_MEDIA_MAX: u64 = 50 * 1024 * 1024;
+            if meta.len() > OUTBOUND_MEDIA_MAX {
+                return Err(CoreError::Platform(
+                    "ilink",
+                    format!(
+                        "媒体文件 {} 大小超上限 {}MB，拒绝上传",
+                        media.url,
+                        OUTBOUND_MEDIA_MAX / (1024 * 1024)
+                    ),
+                ));
+            }
+        }
         let plaintext = std::fs::read(&media.url).map_err(|e| {
             CoreError::Platform("ilink", format!("read media file {:?}: {e}", media.url))
         })?;
@@ -698,14 +729,26 @@ fn persist_media(kind: &str, file_name: Option<&str>, bytes: &[u8]) -> Result<St
     let ext = guess_ext(file_name, kind);
     let fname = format!("{}{ext}", uuid::Uuid::new_v4().simple());
     let path = dir.join(fname);
-    std::fs::write(&path, bytes)
-        .map_err(|e| CoreError::Platform("ilink", format!("write media {path:?}: {e}")))?;
-    // P2-V：媒体文件权限 0600（headless 部署隐私——解密后的私聊媒体不暴露给同机
-    // 其他用户；默认按 umask 可能 0644）。
+    // P2-V：媒体文件权限 0600（headless 部署隐私——解密后的私聊媒体不暴露
+    // 给同机其他用户）。v1.23：改 OpenOptions 原子创建（先 write 后 chmod 有
+    // umask 0644 的暴露窗口，且 set_permissions 失败被忽略）。
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| CoreError::Platform("ilink", format!("write media {path:?}: {e}")))?;
+        f.write_all(bytes)
+            .map_err(|e| CoreError::Platform("ilink", format!("write media {path:?}: {e}")))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, bytes)
+            .map_err(|e| CoreError::Platform("ilink", format!("write media {path:?}: {e}")))?;
     }
     Ok(path.to_string_lossy().into_owned())
 }

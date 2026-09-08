@@ -47,6 +47,21 @@ fn unit_path(profile: Option<&str>) -> Result<PathBuf> {
 /// launchd plist 模板：注册当前二进制 + start + 可选 --profile；把安装进程持有的
 /// 凭据环境变量快照进服务（KeepAlive 崩溃自动拉起）。
 #[cfg(target_os = "macos")]
+/// v1.23 review：plist/unit 模板值转义——secret 含 &/</" 时裸内插会产生
+/// 非法 XML（launchd 加载失败）或注入额外 Environment= 指令（systemd）。
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// systemd unit 值清洗：引号/换行/分号在 Environment="k=v" 语境可断句注入
+/// ——直接替换为安全字符（这些值是路径/secret，正常不含此类字符）。
+#[cfg(all(unix, not(target_os = "macos")))]
+fn unit_escape(s: &str) -> String {
+    s.replace(['"', '\n', ';'], "_")
+}
+
 fn render_plist(
     exe: &str,
     profile: Option<&str>,
@@ -55,11 +70,14 @@ fn render_plist(
     log: &str,
 ) -> String {
     let mut args = format!(
-        "        <string>{exe}</string>\n        <string>start</string>\n        <string>--platform</string>\n        <string>{platform}</string>"
+        "        <string>{}</string>\n        <string>start</string>\n        <string>--platform</string>\n        <string>{}</string>",
+        xml_escape(exe),
+        xml_escape(platform)
     );
     if let Some(p) = profile.filter(|p| !p.is_empty()) {
         args.push_str(&format!(
-            "\n        <string>--profile</string>\n        <string>{p}</string>"
+            "\n        <string>--profile</string>\n        <string>{}</string>",
+            xml_escape(p)
         ));
     }
     let mut env = String::new();
@@ -67,7 +85,9 @@ fn render_plist(
         env.push_str("    <key>EnvironmentVariables</key>\n    <dict>\n");
         for (k, v) in envs {
             env.push_str(&format!(
-                "        <key>{k}</key>\n        <string>{v}</string>\n"
+                "        <key>{}</key>\n        <string>{}</string>\n",
+                xml_escape(k),
+                xml_escape(v)
             ));
         }
         env.push_str("    </dict>\n");
@@ -80,10 +100,11 @@ fn render_plist(
          \x20   <key>ProgramArguments</key>\n    <array>\n{args}\n    </array>\n\n{env}\
          \x20   <key>RunAtLoad</key>\n    <true/>\n\n\
          \x20   <key>KeepAlive</key>\n    <true/>\n\n\
-         \x20   <key>StandardOutPath</key>\n    <string>{log}</string>\n\
-         \x20   <key>StandardErrorPath</key>\n    <string>{log}</string>\n\
+         \x20   <key>StandardOutPath</key>\n    <string>{log_}</string>\n\
+         \x20   <key>StandardErrorPath</key>\n    <string>{log_}</string>\n\
          </dict>\n</plist>\n",
         label = label(profile),
+        log_ = xml_escape(log),
     )
 }
 
@@ -95,13 +116,21 @@ fn render_unit(
     platform: &str,
     envs: &[(String, String)],
 ) -> String {
-    let mut exec = format!("{exe} start --platform {platform}");
+    let mut exec = format!(
+        "{} start --platform {}",
+        unit_escape(exe),
+        unit_escape(platform)
+    );
     if let Some(p) = profile.filter(|p| !p.is_empty()) {
-        exec.push_str(&format!(" --profile {p}"));
+        exec.push_str(&format!(" --profile {}", unit_escape(p)));
     }
     let mut env = String::new();
     for (k, v) in envs {
-        env.push_str(&format!("Environment=\"{k}={v}\"\n"));
+        env.push_str(&format!(
+            "Environment=\"{}={}\"\n",
+            unit_escape(k),
+            unit_escape(v)
+        ));
     }
     let name = label(profile).replace("com.imagent", "imagent");
     format!(

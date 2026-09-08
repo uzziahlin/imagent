@@ -379,7 +379,11 @@ impl Dispatcher {
                             return;
                         }
                         if enable {
-                            if !self.auth.is_allowed(sender) && !self.auth.is_chat_allowed(&conv.0)
+                            // v1.23 review：与 fire 侧失权预检同口径——判任务
+                            // 归属（job.sender / job.conv）而非命令发送者，防
+                            // 「enable 通过 → 下个 tick 又自动停用」的来回通知。
+                            if !self.auth.is_allowed(&UserId(job.sender.clone()))
+                                && !self.auth.is_chat_allowed(&job.conv)
                             {
                                 self.reply(
                                     conv,
@@ -406,19 +410,36 @@ impl Dispatcher {
                                 return;
                             }
                         }
+                        // v1.23 review：停用期间 next_run 停在过去——enable 只翻
+                        // enabled 位会让下个 tick 按「到期」立即触发（One 档跑
+                        // 一轮、All 档连补 3 轮），与回复承诺的「下次时刻」矛盾。
+                        // 启用时把 next_run 重排到下个未来时刻（停用期的槽不补）。
+                        let next_reset = if enable {
+                            CronSpec::parse(&job.expr)
+                                .and_then(|s| s.next_after(super::super::now_secs()))
+                        } else {
+                            None
+                        };
                         match self.store.set_cron_enabled(id, enable).await {
                             Ok(()) => {
+                                if let Some(next) = next_reset {
+                                    if let Err(e) = self
+                                        .store
+                                        .bump_cron_job(id, job.last_run.unwrap_or(0), next)
+                                        .await
+                                    {
+                                        warn!(target: "imagent::core", error = %e, id = id, "启用重排 next_run 失败（任务仍已启用）");
+                                    }
+                                }
                                 let head = if enable {
                                     "▶️ 已启用"
                                 } else {
                                     "⏸️ 已停用"
                                 };
                                 let tail = if enable {
-                                    let next = CronSpec::parse(&job.expr)
-                                        .and_then(|s| s.next_after(super::super::now_secs()))
+                                    next_reset
                                         .map(|t| format!("，下次 {}", format_local(t)))
-                                        .unwrap_or_default();
-                                    next
+                                        .unwrap_or_default()
                                 } else {
                                     String::new()
                                 };

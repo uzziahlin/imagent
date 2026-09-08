@@ -807,6 +807,13 @@ impl Config {
                         )));
                     }
                 }
+                // v1.23 review：send_rps 边界（负值/NaN 走关闭或怪路径）。
+                if !(0.0..=100.0).contains(&cfg.feishu_send_rps) || cfg.feishu_send_rps.is_nan() {
+                    return Err(CoreError::Config(format!(
+                        "feishu_send_rps 须在 [0, 100]（当前 {}）；0 = 关限速",
+                        cfg.feishu_send_rps
+                    )));
+                }
             }
             let addr_set = cfg
                 .webhook_addr
