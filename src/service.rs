@@ -46,9 +46,9 @@ fn unit_path(profile: Option<&str>) -> Result<PathBuf> {
 
 /// launchd plist 模板：注册当前二进制 + start + 可选 --profile；把安装进程持有的
 /// 凭据环境变量快照进服务（KeepAlive 崩溃自动拉起）。
-#[cfg(target_os = "macos")]
 /// v1.23 review：plist/unit 模板值转义——secret 含 &/</" 时裸内插会产生
 /// 非法 XML（launchd 加载失败）或注入额外 Environment= 指令（systemd）。
+#[cfg(target_os = "macos")]
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -62,6 +62,7 @@ fn unit_escape(s: &str) -> String {
     s.replace(['"', '\n', ';'], "_")
 }
 
+#[cfg(target_os = "macos")]
 fn render_plist(
     exe: &str,
     profile: Option<&str>,
