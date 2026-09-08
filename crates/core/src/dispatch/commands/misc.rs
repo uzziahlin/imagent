@@ -752,20 +752,76 @@ impl Dispatcher {
     /// /export —— 当前会话导出为 Markdown 文件回传（W4-2）。走 backend 的本机
     /// 会话存储转录（claude 系支持；codex/gemini 回不支持提示）。导出文件经
     /// send_media 发送后即删（media 目录，0600）。
-    pub(super) async fn cmd_export(&self, conv: &ConvId, hint: &ReplyHint) {
-        let Some(row) = self.store.get_session(&conv.0).await.ok().flatten() else {
-            self.reply(
-                conv,
-                "当前无活动会话可导出（先发一条消息开启会话；/resume 可恢复历史）。",
-                hint,
-            )
-            .await;
-            return;
+    pub(super) async fn cmd_export(
+        &self,
+        conv: &ConvId,
+        sender: &crate::types::UserId,
+        hint: &ReplyHint,
+        parts: &[&str],
+    ) {
+        // v1.23：/export [n]——带序号时导 /resume 列表里的历史会话（此前只能
+        // 导当前活动会话，而用户最想找回结论的恰是非活动历史会话）。序号取
+        // resume_cache（与 /resume <n> 同源，防列表漂移错位）。
+        let (sid_for_export, sid_note) = match parts
+            .get(1)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            Some(n) => {
+                let Ok(idx) = n.parse::<usize>() else {
+                    self.reply(conv, "⚠️ 用法：/export [序号]（序号 = /resume 列表编号；无参 = 导出当前活动会话）。", hint).await;
+                    return;
+                };
+                let cached = {
+                    let cache = self.resume_cache.lock().await;
+                    cache.get(&(conv.0.clone(), sender.0.clone())).cloned()
+                };
+                let Some((at, list)) = cached else {
+                    self.reply(conv, "⚠️ 没有可用的 /resume 列表——先发 /resume 查看历史会话，再 /export <序号>。", hint).await;
+                    return;
+                };
+                const RESUME_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+                if at.elapsed() > RESUME_CACHE_TTL {
+                    self.reply(
+                        conv,
+                        "⚠️ /resume 列表已过期（超过 10 分钟）——重新 /resume 后再 /export <序号>。",
+                        hint,
+                    )
+                    .await;
+                    return;
+                }
+                let Some(entry) = list.get(idx.wrapping_sub(1)).filter(|_| idx >= 1) else {
+                    self.reply(
+                        conv,
+                        &format!("⚠️ 序号超出范围（列表共 {} 条）。", list.len()),
+                        hint,
+                    )
+                    .await;
+                    return;
+                };
+                let sid8: String = entry.session_id.chars().take(8).collect();
+                (
+                    entry.session_id.clone(),
+                    format!("（/resume #{n} · {sid8}…）"),
+                )
+            }
+            None => {
+                let Some(row) = self.store.get_session(&conv.0).await.ok().flatten() else {
+                    self.reply(
+                        conv,
+                        "当前无活动会话可导出（先发一条消息开启会话；/resume 列历史后 /export <序号> 导任意会话）。",
+                        hint,
+                    )
+                    .await;
+                    return;
+                };
+                (row.session_id, String::new())
+            }
         };
         let wd = self.resolve_workdir(&conv.0).await;
         let Some(md) = self
             .backend
-            .export_session_markdown(&wd, &row.session_id)
+            .export_session_markdown(&wd, &sid_for_export)
             .await
         else {
             self.reply(
@@ -792,7 +848,7 @@ impl Dispatcher {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
         }
-        let sid8: String = row.session_id.chars().take(8).collect();
+        let sid8: String = sid_for_export.chars().take(8).collect();
         let fname = format!("session-{sid8}-{}.md", now_secs());
         let path = dir.join(&fname);
         if let Err(e) = std::fs::write(&path, md) {
@@ -811,8 +867,12 @@ impl Dispatcher {
         };
         match self.platform.send_media(conv, &media, hint).await {
             Ok(()) => {
-                self.reply(conv, &format!("✅ 已导出会话 {sid8}…（{fname}）"), hint)
-                    .await
+                self.reply(
+                    conv,
+                    &format!("✅ 已导出会话 {sid8}…{sid_note}（{fname}）"),
+                    hint,
+                )
+                .await
             }
             Err(e) => {
                 self.reply(conv, &format!("导出文件发送失败：{e}"), hint)

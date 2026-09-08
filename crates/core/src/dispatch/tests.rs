@@ -1594,12 +1594,25 @@ async fn sessions_command_lists_named_with_active_mark() {
     feed_and_wait(&ctx, vec![msg("s3", "alice", "/sessions")], 2).await;
     let inbox = ctx.inbox.lock().await.clone();
     let listing = inbox.last().unwrap();
-    assert!(listing.contains("命名会话"), "listing={listing}");
+    // v1.23 表格化：| 名称 | 时间 | 内容 |（内容 = first_prompt 摘要）。
+    assert!(
+        listing.contains("| 名称 | 时间 | 内容 |"),
+        "listing={listing}"
+    );
     assert!(listing.contains("alpha"), "listing={listing}");
     assert!(listing.contains("beta"), "listing={listing}");
+    // 会话摘要可辨认（v1.23 核心目标）：各自的 first_prompt 出现在列表里。
+    assert!(
+        listing.contains("a work"),
+        "alpha 摘要应可见，listing={listing}"
+    );
+    assert!(
+        listing.contains("b work"),
+        "beta 摘要应可见，listing={listing}"
+    );
     // beta 为活动，应带（当前）；alpha 不应带。
     assert!(
-        listing.contains("beta（当前）"),
+        listing.contains("beta *（当前）*"),
         "活动命名应带（当前），listing={listing}"
     );
     drop_db(ctx.db).await;
@@ -3196,6 +3209,7 @@ async fn stop_aborts_compact() {
     ctx.check()
         .await
         .upsert_session(&imagent_store::SessionRow {
+            first_prompt: None,
             conv_id: "c1".into(),
             session_id: "sess-9".into(),
             agent_kind: "mock-backend".into(),
@@ -3489,7 +3503,7 @@ async fn switch_without_name_lists_sessions() {
     assert!(
         inbox
             .iter()
-            .any(|t| t.contains("命名会话") && t.contains("work")),
+            .any(|t| t.contains("| 名称 | 时间 | 内容 |") && t.contains("work")),
         "应列出命名会话 work: {inbox:?}"
     );
     drop_db(ctx.db).await;

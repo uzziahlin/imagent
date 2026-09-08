@@ -193,6 +193,9 @@ impl Dispatcher {
         let now = now_secs();
         let row = SessionRow {
             conv_id: conv.0.clone(),
+            // v1.23：接管时把 /resume 列表里的首条摘要带进历史行（💻 本机
+            // 会话此前无 IM 历史记录）。
+            first_prompt: (!target.first_prompt.is_empty()).then(|| target.first_prompt.clone()),
             session_id: target.session_id.clone(),
             agent_kind: current_kind.to_string(),
             workdir: self
@@ -269,6 +272,7 @@ impl Dispatcher {
                 let now = now_secs();
                 let sr = SessionRow {
                     conv_id: conv.0.clone(),
+                    first_prompt: None,
                     session_id: row.session_id.clone(),
                     agent_kind: row
                         .agent_kind
@@ -331,13 +335,38 @@ impl Dispatcher {
                     .await
                     .unwrap_or(None)
                     .unwrap_or_default();
-                let mut lines = String::from("🗂 命名会话：");
+                // v1.23 表格化：与 /resume 同形态（时间 + 内容摘要）——此前只有
+                // 「名称 + sid 8 位」，信息密度断崖。摘要经 session_history 的
+                // first_prompt join（无记录回退 sid 前缀）。
+                let hist = self
+                    .store
+                    .list_session_history(&conv.0, 50)
+                    .await
+                    .unwrap_or_default();
+                let mut table = String::from("| 名称 | 时间 | 内容 |\n|---|---|---|\n");
                 for r in &rows {
-                    let mark = if r.name == active { "（当前）" } else { "" };
-                    let sid: String = r.session_id.chars().take(8).collect();
-                    lines.push_str(&format!("\n- {}{}（{}…）", r.name, mark, sid));
+                    let mark = if r.name == active {
+                        " *（当前）*"
+                    } else {
+                        ""
+                    };
+                    let desc = hist
+                        .iter()
+                        .find(|h| h.session_id == r.session_id)
+                        .and_then(|h| h.first_prompt.clone())
+                        .filter(|p| !p.trim().is_empty())
+                        .unwrap_or_else(|| {
+                            format!("{}…", r.session_id.chars().take(10).collect::<String>())
+                        })
+                        .replace('|', "\\|");
+                    let sid_short: String = r.session_id.chars().take(6).collect();
+                    table.push_str(&format!(
+                        "| {}{mark} · `{sid_short}…` | {} | {desc} |\n",
+                        r.name,
+                        format_rel_ts(r.updated_at)
+                    ));
                 }
-                self.reply(conv, &lines, hint).await;
+                self.reply(conv, &table, hint).await;
             }
             Err(e) => {
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "list_named_sessions 失败");
