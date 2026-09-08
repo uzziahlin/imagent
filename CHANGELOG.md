@@ -2,6 +2,32 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.23.0] — 2026-09-08
+
+> **交互体验批次**（v12 复审产品方向 Top5 全落地）：会话记忆可辨认、
+> allow-set 可见性、指令复用、审批等待可视化、说话人归属贯通。
+> 全仓 684 tests / 0 failed、clippy 零警告。
+
+### Added
+- **会话记忆可辨认**（store v15）：session_history 增 first_prompt 列
+  （COALESCE 语义：已有值不覆盖、NULL 回填）——纯 IM 使用的会话在
+  /resume 列表此前只剩 id 前缀无法辨认，现在全量有摘要；`/export [n]`
+  按序号导任意历史会话；`/sessions` 表格化（名称/时间/内容）
+- **allow-set 可见性**：`/perm list` 展示本会话「始终允许」清单 +
+  `/perm revoke <工具>` 单项撤销（持续授权不再黑箱）；「♾️ 本次会话
+  始终允许」按钮挂二次确认
+- **指令复用**：成功轮 prompt 落 `last_success_prompt`（与失败轮分键），
+  `/again` 再跑最近成功指令——巡检/日报类不必手打全文；/help 与未知
+  命令提示动态列出已配置的 shortcuts
+- **审批等待可视化**：CardPhase 增 WaitingApproval（footer「⏳ 等待审批
+  中」）；chunk 循环 30s 心跳节拍——静默期 footer 时长持续走动，卡片
+  不再冻结成「卡死」假象（空闲判定语义不变，D3 审批豁免保持）
+- **说话人归属贯通**：InboundMessage 增 sender_name（飞书 contact API
+  懒解析缓存，缺权限 fail-soft 回退 open_id 短版）；群 conv steering
+  注入带【名字】（此前排队有归属、转向没有）；merge_batch 标注从裸
+  open_id 换可解析名字；发起者锚定轮次首条消息（Platform 增
+  note_round_initiator）——A 发起任务后 B 插话不再连坐审批按钮点击权
+
 ## [1.22.1] — 2026-09-08
 
 > **v12 复审修复批次**（docs/CODE_REVIEW_v12.md）：v1.21/v1.22 新代码对抗

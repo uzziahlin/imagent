@@ -283,6 +283,8 @@ secret 轮换 / 环境变量变化后：重新 `export` + `imagent service insta
 | `/switch <name>` | 切到 / 新建命名会话（多任务并行上下文） |
 | `/sessions` | 列命名会话（`*` 标当前） |
 | `/resume [n]` | 统一恢复列表：📱 IM 会话 ∪ 💻 电脑端 Claude Code 会话（摘要+时间辨认，按序号接管，无需会话 id） |
+| `/export [n]` | 导出当前（或 /resume 序号）会话为 Markdown 文件 |
+| `/again` | 再跑最近一次成功指令（与 /retry 的失败轮重试对称） |
 | `/compact` | 软压缩上下文（摘要 + 重置 + 延续）；自动触发条件见[用量护栏](#设计取舍)：水位（input+缓存）达 模型窗口 × `auto_compact_window_ratio`（缺省 80%） |
 | `/retry` | 重发最近一轮指令（失败/中断后一键续接） |
 | `/export` | 当前会话导出为 Markdown 文件回传（claude 系后端） |
@@ -292,6 +294,7 @@ secret 轮换 / 环境变量变化后：重新 `export` + `imagent service insta
 | `/img <path>` `/file <path>` | 发 workdir 内图片 / 任意文件到 IM |
 | `/timeout [N\|off\|default]` | 会话级空闲看门狗（分钟） |
 | `/perm <auto\|off\|allow\|deny\|ask>` | 权限模式热切（auto=按后端自动选档） |
+| `/perm list` / `/perm revoke <工具>` | 查看/单项撤销本会话「始终允许」清单 |
 | `/stop [all]` | 中断在飞任务（**排队消息保留并自动转入下一轮**——对齐 Claude Code 的 Esc+队列注入语义；`/stop all` 硬停清空排队；任务恰在收尾时如实回「已完成」不谎报中断） |
 | `/queue list\|drop <n>` | 查看当前会话排队消息 / 丢弃指定序号（自己的或管理员） |
 | `/cron add <分 时 日 月 周> <指令>` | 定时任务（本地时区含 DST；`*`/`*/n`/范围/列表，`/cron add */10 * * * * 检查构建`） |
@@ -316,7 +319,7 @@ secret 轮换 / 环境变量变化后：重新 `export` + `imagent service insta
 
 回复 `y` → 执行；其它 → 拒绝。基于 Claude Code 的 `--permission-prompt-tool` MCP 回调实现。**飞书**下询问是「✅ 允许 / ⛔ 拒绝 / 始终允许」按钮卡片——点一下即回，无需打字；「始终允许」记入会话级 allow-set（同工具不再问，`/stop all` 或 `/new` 清空）。等审批期间 `/stop` 仍可用（自动回 deny 中止）。超长输出的终态卡自动截断（头尾窗）并**补发全文文本**——结论不因卡片大小限制丢失。
 
-审批粒度（claude-cli，由松到紧叠加）：`permission_mode = "auto"`（缺省：透传 Claude Code 原生 **auto 模式** `--permission-mode auto`——分类器自动放行安全操作，高危提示进 IM）→ `backend_permission_mode` 改透传值（`default`/`acceptEdits`/`plan`/`auto`/`dontAsk`/`bypassPermissions`）→ `ask`（claude 的每个权限提示都进 IM）→ `approval_tools` 审批集（清单外提示直接放行，可与任意档叠加）。`/perm` 可热切（Ask 闭环类需重启生效）；`backend_permission_mode` 支持 SIGHUP 热重载。旧版 claude CLI（<2.1.228）不认 auto 会静默回退 default（≈全量进 IM，降级安全）。
+审批粒度（claude-cli，由松到紧叠加）：`permission_mode = "auto"`（缺省：透传 Claude Code 原生 **auto 模式** `--permission-mode auto`——分类器自动放行安全操作，高危提示进 IM）→ `backend_permission_mode` 改透传值（`default`/`acceptEdits`/`plan`/`auto`/`dontAsk`/`bypassPermissions`）→ `ask`（claude 的每个权限提示都进 IM）→ `approval_tools` 审批集（清单外提示直接放行，可与任意档叠加）。`/perm` 可热切（Ask 闭环类需重启生效）；`backend_permission_mode` 支持 SIGHUP 热重载。群聊多人协作时消息带【名字】归属标注（飞书经 contact API 懒解析展示名，需 `contact:user.base:readonly` 权限——缺权限回退 open_id 短版）；审批等待期流式卡显示「⏳ 等待审批中」并持续心跳（不再冻结成卡死假象）。旧版 claude CLI（<2.1.228）不认 auto 会静默回退 default（≈全量进 IM，降级安全）。
 
 ## 终端 agent 接入：ask_via_im（人不在电脑前也能问你）
 
