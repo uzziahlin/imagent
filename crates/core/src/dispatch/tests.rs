@@ -4741,6 +4741,54 @@ async fn crashed_round_recovery_prefers_newer_inflight() {
     drop_db(ctx.db).await;
 }
 
+/// v1.23 allow-set 可见性：always 落地 → /perm list 可见 → /perm revoke
+/// 单项撤销 → 再次 list 为空。
+#[tokio::test]
+async fn perm_list_and_revoke_session_allows() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    // 模拟用户在审批卡点了「始终允许」。
+    ctx.disp.router.allow_always("c1", "Bash").await;
+    ctx.disp.router.allow_always("c1", "WebFetch").await;
+    ctx.disp.handle(msg("c1", "alice", "/perm list")).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    let listing = inbox.last().unwrap();
+    assert!(
+        listing.contains("Bash") && listing.contains("WebFetch"),
+        "{listing}"
+    );
+    assert!(listing.contains("2 个工具"), "{listing}");
+    // 撤销一项。
+    ctx.disp
+        .handle(msg("c1", "alice", "/perm revoke Bash"))
+        .await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.last().unwrap().contains("已撤销"),
+        "{}",
+        inbox.last().unwrap()
+    );
+    // 再 list：只剩 WebFetch。
+    ctx.disp.handle(msg("c1", "alice", "/perm list")).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    let listing = inbox.last().unwrap();
+    assert!(
+        listing.contains("WebFetch") && !listing.contains("\n- Bash"),
+        "{listing}"
+    );
+    // 撤销不存在的条目：明确回执。
+    ctx.disp
+        .handle(msg("c1", "alice", "/perm revoke Bash"))
+        .await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.last().unwrap().contains("不在本会话"),
+        "{}",
+        inbox.last().unwrap()
+    );
+    drop_db(ctx.db).await;
+}
+
 /// v1.20 窗口自学习：ACP 报告窗口 → 比例档阈值重算（默认 1M×0.8=800k，
 /// 学习 200k → 160k）；窗口未变 no-op。
 #[tokio::test]
