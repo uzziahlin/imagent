@@ -417,6 +417,7 @@ fn msg(conv: &str, sender: &str, text: &str) -> InboundMessage {
     InboundMessage {
         conv_id: ConvId(conv.into()),
         sender: UserId(sender.into()),
+        sender_name: None,
         text: Some(text.into()),
         media: Vec::new(),
         media_errors: Vec::new(),
@@ -922,6 +923,7 @@ async fn pure_media_all_failed_replies_error() {
     let m = InboundMessage {
         conv_id: ConvId("feishu:ou_t".into()),
         sender: UserId("alice".into()),
+        sender_name: None,
         text: None,
         media: vec![],
         media_errors: vec!["img_x: 下载失败: boom".into()],
@@ -2258,9 +2260,13 @@ async fn steering_injects_midround_text() {
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    // v1.23 说话人归属：群 conv（c1 非 p2p）的转向注入带【标注】。
     assert_eq!(
         steer_seen.lock().await.clone(),
-        vec!["中途补充".to_string(), "再补充".to_string()],
+        vec![
+            "【alice】中途补充".to_string(),
+            "【alice】再补充".to_string()
+        ],
         "两条都应注入"
     );
     assert!(
@@ -3632,6 +3638,7 @@ fn recall_msg(conv: &str, msg_id: &str, notify: Option<&str>, probes: &[&str]) -
     InboundMessage {
         conv_id: ConvId(conv.into()),
         sender: UserId(String::new()),
+        sender_name: None,
         text: None,
         media: Vec::new(),
         media_errors: Vec::new(),
@@ -3802,6 +3809,7 @@ async fn bot_removed_from_chat_revokes_and_notifies_admin() {
     let removed = InboundMessage {
         conv_id: ConvId("feishu:oc_dead".into()),
         sender: UserId(String::new()),
+        sender_name: None,
         text: None,
         media: Vec::new(),
         media_errors: Vec::new(),
@@ -3836,6 +3844,7 @@ async fn bot_removed_from_chat_revokes_and_notifies_admin() {
     let removed = InboundMessage {
         conv_id: ConvId("feishu:oc_unknown".into()),
         sender: UserId(String::new()),
+        sender_name: None,
         text: None,
         media: Vec::new(),
         media_errors: Vec::new(),

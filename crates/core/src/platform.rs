@@ -27,6 +27,11 @@ pub trait Platform: Send + Sync {
         false
     }
 
+    /// v1.23 说话人归属：dispatch 在每轮首条消息分派前调用——平台可据此
+    /// 锚定「本轮发起者」（卡片标注/按钮点击权校验），避免被运行中的插话
+    /// 者漂移。默认 no-op。
+    async fn note_round_initiator(&self, _conv: &ConvId, _sender: &str) {}
+
     /// 发卡片，返回 message_id（供后续 [`Platform::update_card`] 增量更新）。
     /// 不支持卡片的平台默认降级：把 `card.text` 当文本发送，返回 None。
     async fn send_card(

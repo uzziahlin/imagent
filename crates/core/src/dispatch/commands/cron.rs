@@ -568,6 +568,7 @@ impl Dispatcher {
                 let msg = InboundMessage {
                     conv_id: ConvId(job.conv.clone()),
                     sender: UserId(job.sender.clone()),
+                    sender_name: None,
                     text: Some(format!("⏰ 定时任务触发{tag}，请执行：{}", job.prompt)),
                     media: vec![],
                     media_errors: Vec::new(),

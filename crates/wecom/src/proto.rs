@@ -203,6 +203,7 @@ pub fn parse_msg_callback(frame: &WsFrame) -> imagent_core::Result<(String, Inbo
     let inbound = InboundMessage {
         conv_id,
         sender: UserId(userid),
+        sender_name: None,
         text,
         media: vec![],
         media_errors: Vec::new(),

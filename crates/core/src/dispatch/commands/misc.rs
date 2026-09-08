@@ -733,6 +733,7 @@ impl Dispatcher {
         let msg = InboundMessage {
             conv_id: conv.clone(),
             sender: sender.clone(),
+            sender_name: None,
             text: Some(prompt),
             media: Vec::new(),
             media_errors: Vec::new(),
@@ -783,6 +784,7 @@ impl Dispatcher {
         let msg = InboundMessage {
             conv_id: conv.clone(),
             sender: sender.clone(),
+            sender_name: None,
             text: Some(prompt),
             media: Vec::new(),
             media_errors: Vec::new(),
