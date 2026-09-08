@@ -966,7 +966,8 @@ impl Store {
         blocking_with(inner, move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT conv_id, session_id, agent_kind, created_at, updated_at, first_prompt \
-                 FROM session_history WHERE conv_id = ?1 ORDER BY updated_at DESC LIMIT ?2",
+                 FROM session_history WHERE conv_id = ?1 \
+                 ORDER BY updated_at DESC, rowid ASC LIMIT ?2",
             )?;
             let rows = stmt.query_map(rusqlite::params![conv_id, limit_i], |r| {
                 Ok(SessionHistoryRow {
