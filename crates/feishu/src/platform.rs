@@ -194,6 +194,8 @@ pub struct FeishuPlatform {
     /// v1.21 per-conv 发送令牌桶速率（消息创建/秒；0 = 关闭）。主动预算出站
     /// 频率——把「挨 429 再被动退避」翻转为「不触发 429」。
     send_rps: f64,
+    /// v1.24 卡片 UX：审批/问题卡到达即加急（config feishu_urgent_on_ask）。
+    urgent_on_ask: bool,
     /// per-conv 令牌桶状态（粗上限清理，见 [`Self::acquire_send_slot`]）。
     send_budget: Arc<Mutex<HashMap<String, SendBucket>>>,
 }
@@ -256,6 +258,7 @@ impl FeishuPlatform {
         asr_enabled: bool,
         outbox: Option<imagent_store::Store>,
         send_rps: f64,
+        urgent_on_ask: bool,
     ) -> Result<Self> {
         let ws_config = Arc::new(
             Config::builder()
@@ -819,13 +822,15 @@ impl FeishuPlatform {
                 // 模式），无敏感信息。
                 if let Some((key, chat_id)) = crate::proto::parse_bot_added_event(&payload) {
                     if dedup.check(&key) {
-                        spawn_drain_text(
+                        // v1.24 卡片 UX：进群欢迎从一段纯文本升级为命令卡——
+                        // 第一印象带可点按钮（帮助/放行），不再是一堵文字墙。
+                        // 失败（卡片权限缺失等）回落旧文本形态（outbox 兜底）。
+                        spawn_welcome_card(
                             &core_config_for_drain,
                             &token_for_drain,
                             &app_id_for_drain,
                             &app_secret_for_drain,
-                            ConvId(format!("feishu:{chat_id}")),
-                            "👋 我已加入本群！群内 @我 发消息即可驱动 agent。\n管理员可发送 /chat allow 放行本群（放行前我不会响应消息）；/help 查看全部命令。\n💬 会话规则：群主时间线直接 @我 = 续同一会话；点消息「回复」进话题 = 开独立会话（互不共享上下文/待办）。".to_string(),
+                            &chat_id,
                             outbox_for_drain.as_ref(),
                         );
                     }
@@ -903,6 +908,7 @@ impl FeishuPlatform {
                 .unwrap_or(FEISHU_COMMENT_TEXT_MAX)
                 .min(FEISHU_COMMENT_TEXT_MAX),
             send_rps,
+            urgent_on_ask,
             send_budget: Arc::new(Mutex::new(HashMap::new())),
         };
         // v1.21 outbox 泵：每 10s 拉到期行重发（feishu_text），指数退避
@@ -1467,6 +1473,27 @@ impl FeishuPlatform {
     ) {
         let sender = self.last_sender(conv_id).await;
         self.note_card_tail(conv_id, msg_id).await;
+        // v1.24 卡片 UX：审批/问题卡到达即应用内加急——弹通知触达（免打扰
+        // 时段跳过；urgent_app 只对最新卡生效，刚 note_card_tail 即本卡）。
+        // spawn：不阻塞审批 hook 返回。加急对象 = 发起者（该答复的人）。
+        if self.urgent_on_ask && !self.in_quiet_hours() && !sender.is_empty() {
+            let cfg = self.core_config.clone();
+            let token_lock = self.token.clone();
+            let aid = self.app_id.clone();
+            let sec = self.app_secret.clone();
+            let mid = msg_id.to_string();
+            let uid = sender.clone();
+            tokio::spawn(async move {
+                match fetch_cached_token(&token_lock, &cfg, &aid, &sec).await {
+                    Ok(t) => {
+                        if let Err(e) = crate::client::urgent_app_buzz(&cfg, &t, &mid, &uid).await {
+                            debug!(target: "feishu", error = %e, "审批卡加急失败（不影响审批流程）");
+                        }
+                    }
+                    Err(e) => debug!(target: "feishu", error = %e, "审批卡加急取 token 失败"),
+                }
+            });
+        }
         self.record_pending_ask(request_id, conv_id, msg_id, tool_name, &sender)
             .await;
         self.conv_states
@@ -2364,6 +2391,79 @@ async fn media_size_violation(url: &str) -> Option<CoreError> {
 /// spawn 后台发送——HTTP 分区时这些内联 await（token 懒取 + 发送，最坏 30s+）
 /// 会把整个入站管道（含审批回调、撤回事件）队头阻塞，payload 无界 channel
 /// 随之膨胀。提示类消息无顺序要求，解耦零代价。
+/// v1.24 卡片 UX：进群欢迎命令卡（按钮可点：帮助/放行），失败回落旧文本。
+fn spawn_welcome_card(
+    core_config: &Arc<CoreConfig>,
+    token_lock: &Arc<RwLock<Option<(String, Instant)>>>,
+    app_id: &str,
+    app_secret: &str,
+    chat_id: &str,
+    outbox: Option<&imagent_store::Store>,
+) {
+    use imagent_core::{CardButton, CardButtonStyle};
+    let body = "群内 **@我** 发消息即可驱动 agent（Claude Code 等）。\n\n**先放行**：管理员发送 `/chat allow` 放行本群（放行前我不会响应消息）。\n\n**会话规则**：群主时间线直接 @我 = 续同一会话；点消息「回复」进话题 = 开独立会话（互不共享上下文/待办）。\n\n**排队与转向**：我运行中发文字会实时转入当前任务（👀）；图片/文件排队下一轮（⏳）。";
+    let conv_id = format!("feishu:{chat_id}");
+    let card_json = crate::card::render_command_card(
+        "👋 你好，我是 agent 网关",
+        body,
+        &[
+            CardButton {
+                label: "📖 命令帮助".into(),
+                command: "/help".into(),
+                style: CardButtonStyle::Primary,
+            },
+            CardButton {
+                label: "✅ 放行本群（管理员）".into(),
+                command: "/chat allow".into(),
+                style: CardButtonStyle::Default,
+            },
+        ],
+        &conv_id,
+    );
+    let core_config = core_config.clone();
+    let token_lock = token_lock.clone();
+    let app_id = app_id.to_string();
+    let app_secret = app_secret.to_string();
+    let chat_id = chat_id.to_string();
+    let outbox = outbox.cloned();
+    tokio::spawn(async move {
+        let sent = match fetch_cached_token(&token_lock, &core_config, &app_id, &app_secret).await {
+            Ok(t) => {
+                crate::client::send_card_msg(
+                    &core_config,
+                    &t,
+                    &chat_id,
+                    crate::proto::ReceiveIdKind::ChatId,
+                    &card_json,
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        };
+        if sent.is_err() {
+            warn!(target: "feishu", "欢迎卡发送失败，回落文本形态");
+            let conv = ConvId(format!("feishu:{chat_id}"));
+            let text = "👋 我已加入本群！群内 @我 发消息即可驱动 agent。\n管理员可发送 /chat allow 放行本群（放行前我不会响应消息）；/help 查看全部命令。".to_string();
+            if let Err(e) = send_drain_text_result(
+                &core_config,
+                &token_lock,
+                &app_id,
+                &app_secret,
+                &conv,
+                &text,
+            )
+            .await
+            {
+                warn!(target: "feishu", error = %e, conv_id = %conv.0, "欢迎文本回落也失败（转 outbox）");
+                if let Some(store) = outbox {
+                    let payload = serde_json::json!({ "conv": conv.0, "text": text }).to_string();
+                    let _ = store.enqueue_outbox(&conv.0, "feishu_text", &payload).await;
+                }
+            }
+        }
+    });
+}
+
 fn spawn_drain_text(
     core_config: &Arc<CoreConfig>,
     token_lock: &Arc<RwLock<Option<(String, Instant)>>>,
@@ -3421,7 +3521,11 @@ impl Platform for FeishuPlatform {
                 async move {
                     match create_card_entity(
                         &t,
-                        &render_stream_init_card(&conv_for_init, sender_opt.as_deref()),
+                        &render_stream_init_card(
+                            &conv_for_init,
+                            sender_opt.as_deref(),
+                            card.task_digest.as_deref(),
+                        ),
                     )
                     .await
                     {
@@ -3836,9 +3940,10 @@ mod tests {
             None,
             1800,
             true,
-            // v1.21：outbox 未接 store / 发送限速关闭（测试态）。
+            // v1.21：outbox 未接 store / 发送限速关闭（测试态）；v1.24 加急关。
             None,
             0.0,
+            false,
         )
         .expect("构造");
         let conv = ConvId("feishu:ou_x".into());
@@ -3869,9 +3974,10 @@ mod tests {
             None,
             1800,
             true,
-            // v1.21：outbox 未接 store / 发送限速关闭（测试态）。
+            // v1.21：outbox 未接 store / 发送限速关闭（测试态）；v1.24 加急关。
             None,
             0.0,
+            false,
         )
         .expect("构造");
         p.pending_asks.lock().await.insert(
@@ -3907,9 +4013,10 @@ mod tests {
             None,
             1800,
             true,
-            // v1.21：outbox 未接 store / 发送限速关闭（测试态）。
+            // v1.21：outbox 未接 store / 发送限速关闭（测试态）；v1.24 加急关。
             None,
             0.0,
+            false,
         )
         .expect("构造");
         assert_eq!(p.require_mention_in_group().await, Some(true));
@@ -4011,9 +4118,10 @@ mod tests {
             None,
             1800,
             true,
-            // v1.21：outbox 未接 store / 发送限速关闭（测试态）。
+            // v1.21：outbox 未接 store / 发送限速关闭（测试态）；v1.24 加急关。
             None,
             0.0,
+            false,
         )
         .expect("构造");
         assert!(p.quiet_hours.is_none(), "未配置 → None");
@@ -4051,6 +4159,7 @@ mod tests {
                 true,
                 None,
                 0.0,
+                false,
             )
             .expect("构造")
         };

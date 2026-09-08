@@ -69,6 +69,9 @@ const CARD_TEXT_FULL_THRESHOLD: usize = 8_000;
 
 pub(crate) struct CardSession {
     text: String,
+    /// v1.24 卡片 UX：任务摘要（首条 prompt 前 N 字）——snapshot 进
+    /// OutboundCard.task_digest，Running 首帧/summary 渲染用。
+    pub(crate) task_digest: Option<String>,
     tools: Vec<ToolCall>,
     /// W2-1：思考片段（最近 MAX_THOUGHTS 条，单条截断 THOUGHT_TRUNC_CHARS）。
     thoughts: Vec<String>,
@@ -110,6 +113,7 @@ impl CardSession {
     ) -> Self {
         Self {
             text: String::new(),
+            task_digest: None,
             tools: Vec::new(),
             thoughts: Vec::new(),
             todos: Vec::new(),
@@ -361,6 +365,7 @@ impl CardSession {
             .get(&self.conv.0)
             .and_then(queued_hint_display);
         let card = OutboundCard {
+            task_digest: None,
             text: self.text.clone(),
             tool_calls: self.tools.clone(),
             thoughts: self.thoughts.clone(),
@@ -515,6 +520,7 @@ pub async fn sweep_live_cards(store: &Store, platform: &dyn Platform) {
             continue;
         }
         let card = OutboundCard {
+            task_digest: None,
             text: "⏸️ imagent 已重启，本次生成被中断（未产出结论）。请重新发送指令。".to_string(),
             tool_calls: Vec::new(),
             thoughts: Vec::new(),

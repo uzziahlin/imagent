@@ -386,6 +386,10 @@ pub struct OutboundCard {
     /// 本轮成本摘要（UsageStats.display()，如 `$0.012` 或 `in 1.2k · out 3.4k tokens`）；
     /// None = backend 未产出 usage。终态 footer 追加展示（`✅ 已完成 · $0.012`）。
     pub usage_display: Option<String>,
+    /// 卡片 UX 批（v1.24）：任务摘要（首条 prompt 前 N 字）——Running 首帧
+    /// 「🧠 处理中：…」与卡片 summary 用，聊天列表/回到旧卡时可辨认任务。
+    /// None = 未知（合成消息等）。
+    pub task_digest: Option<String>,
     /// 卡片终态。
     pub terminal: CardTerminal,
 }

@@ -504,6 +504,11 @@ pub struct Config {
     /// 媒体错误提示（fail-soft，不影响其余消息）。仅 feishu 平台生效。
     #[serde(default = "default_feishu_asr_enabled")]
     pub feishu_asr_enabled: bool,
+    /// 卡片 UX 批（v1.24）：审批/问题卡到达即应用内加急（urgent_app 弹通知）——
+    /// 长任务挂后台时用户第一时间看到审批请求，而非等半小时超时 auto-deny。
+    /// 免打扰时段（quiet_hours）内不加急。嫌吵可关。仅 feishu 平台。
+    #[serde(default = "default_feishu_urgent_on_ask")]
+    pub feishu_urgent_on_ask: bool,
     /// v1.21：飞书 per-conv 出站令牌桶速率（消息创建/秒；0 = 关闭）。缺省 5——
     /// 主动预算发送频率，把「挨 429 再被动退避」翻转为「不触发 429」。
     /// 等待上限 2s（超时放行，被动退避仍兜底）。仅 feishu 平台生效。
@@ -513,6 +518,10 @@ pub struct Config {
 
 fn default_feishu_send_rps() -> f64 {
     5.0
+}
+
+fn default_feishu_urgent_on_ask() -> bool {
+    true
 }
 
 /// 缺省工具集：读/检索/联网/文件编辑类（与 Edit 同风险级：workdir 内写或只读），
