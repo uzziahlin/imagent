@@ -122,6 +122,10 @@ struct ConvState {
     ask_slot: Option<AskSlot>,
     /// 本轮流式卡发送之后是否发过询问卡（终态「结果下沉」判定，P8-2）。
     asks_since_card: bool,
+    /// v1.23 发起者锚定：本轮**首条消息**的 sender（dispatch 轮首注入）——
+    /// 此前用「最近 sender 近似」，群内 B 发一条 steering/排队即把发起者翻成
+    /// B（连坐审批/终止按钮的点击权校验）。None = 无轮次记录（回退 sender）。
+    round_initiator: Option<String>,
     /// v1.21 LRU：最近活跃时刻（入站消息/评论锚点/发起者更新时刷新）。
     /// housekeeping 超上限时按此排序驱逐最久未活跃的会话（替代 v1.18 的
     /// 「整体选择性驱逐」——活跃会话不再被误伤，评论会话/挂起审批仍豁免）。
@@ -140,6 +144,7 @@ impl Default for ConvState {
             ask_note: None,
             ask_slot: None,
             asks_since_card: false,
+            round_initiator: None,
             last_touched: Instant::now(),
         }
     }
@@ -286,12 +291,20 @@ impl FeishuPlatform {
         // token Arc 须在 spawn 前创建：drain task 下载媒体需取 token（发送/接收共用
         // 同一 lazy 刷新缓存，见 fetch_cached_token）。
         let token: Arc<RwLock<Option<(String, Instant)>>> = Arc::new(RwLock::new(None));
+        // v1.23 说话人归属：open_id → 展示名缓存（contact 懒解析 + 失败负缓存）。
+        let user_names: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+        let user_name_failed: Arc<Mutex<HashMap<String, Instant>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let core_config_for_drain = core_config.clone();
         let app_id_for_drain = app_id.clone();
         let app_secret_for_drain = app_secret.clone();
         let token_for_drain = token.clone();
         // v1.21 outbox：drain 提示类发送失败 → 落盘重试（None = 未接 store）。
         let outbox_for_drain = outbox.clone();
+        let user_names_for_drain = user_names.clone();
+        let user_name_failed_for_drain = user_name_failed.clone();
+        // v1.23 说话人归属：展示名缓存（contact 懒解析）。
+
         // P5-8：bot 自身 open_id 懒取缓存（@bot 过滤用；open_id 随应用固定，
         // 进程内取一次。取不到时 parse_comment_event 退化为弱过滤）。
         let bot_open_id: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
@@ -377,7 +390,7 @@ impl FeishuPlatform {
                         }
                     }
                 }
-                if let Some((msgid, msg, pending)) =
+                if let Some((msgid, mut msg, pending)) =
                     parse_message_event(&payload, &policy, bot.as_deref())
                 {
                     if !dedup.check(&msgid) {
@@ -408,6 +421,50 @@ impl FeishuPlatform {
                     // v1.18 迭代（intake 解耦）：媒体下载/转写/落盘移出 drain 串行
                     // 循环——单条媒体 IO（read_timeout 已兜底停滞，此处再解耦吞吐）
                     // 不再阻塞其它 conv 的消息/审批回调；per-conv 顺序泵保序。
+                    // v1.23 说话人归属：命中缓存即带名；未命中 spawn 预热
+                    //（contact API，失败 1h 负缓存）——本轮标注回退 id 短版，
+                    // 下一轮起有名字。非阻塞（drain 循环不等网络）。
+                    {
+                        let oid = msg.sender.0.clone();
+                        let known = user_names_for_drain.lock().await.get(&oid).cloned();
+                        let has_name = known.is_some();
+                        msg.sender_name = known;
+                        if !has_name {
+                            let recently_failed = user_name_failed_for_drain
+                                .lock()
+                                .await
+                                .get(&oid)
+                                .is_some_and(|t| t.elapsed() < Duration::from_secs(3600));
+                            if !recently_failed {
+                                let cfg = core_config_for_drain.clone();
+                                let tl = token_for_drain.clone();
+                                let aid = app_id_for_drain.clone();
+                                let sec = app_secret_for_drain.clone();
+                                let cache = user_names_for_drain.clone();
+                                let failed = user_name_failed_for_drain.clone();
+                                tokio::spawn(async move {
+                                    let fetched = async {
+                                        let t = fetch_cached_token(&tl, &cfg, &aid, &sec).await?;
+                                        crate::client::fetch_user_display_name(&cfg, &t, &oid).await
+                                    }
+                                    .await;
+                                    match fetched {
+                                        Ok(name) => {
+                                            let mut m = cache.lock().await;
+                                            if m.len() > 4096 {
+                                                m.clear();
+                                            }
+                                            m.insert(oid, name);
+                                        }
+                                        Err(e) => {
+                                            debug!(target: "feishu", error = %e, "用户名解析失败（标注回退 open_id；1h 内不重试）");
+                                            failed.lock().await.insert(oid, Instant::now());
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
                     let conv_key = msg.conv_id.0.clone();
                     let job = if pending.is_empty() {
                         PumpJob::Ready(msg)
@@ -711,6 +768,7 @@ impl FeishuPlatform {
                         let reaction_msg = InboundMessage {
                             conv_id: ConvId(card.conv_id.clone()),
                             sender: imagent_core::UserId(operator),
+                            sender_name: None,
                             text: Some(reply.to_string()),
                             media: Vec::new(),
                             media_errors: Vec::new(),
@@ -1327,11 +1385,13 @@ impl FeishuPlatform {
     }
 
     async fn last_sender(&self, conv_id: &str) -> String {
+        // v1.23：优先本轮首条消息的 sender（dispatch 轮首锚定）——「最近
+        // sender」会被运行中的插话者漂移。
         self.conv_states
             .lock()
             .await
             .get(conv_id)
-            .and_then(|s| s.sender.clone())
+            .and_then(|s| s.round_initiator.clone().or_else(|| s.sender.clone()))
             .unwrap_or_default()
     }
 
@@ -2504,6 +2564,18 @@ impl Platform for FeishuPlatform {
     /// bot 对用户消息的表情标注：OnIt（在做了）→ DONE / CrossMark。
     /// emoji key 真机校准（2026-08）验证可用且**大小写敏感**（全大写报 231001）。
     /// 翻转 = 删旧表情 + 打新表情；删失败（过期/已撤回）仅 log，新表情照打。
+    /// v1.23 发起者锚定：dispatch 在每轮首条消息分派前调用——本 conv 的
+    /// 卡片发起者/按钮点击权锚定到轮次发起者（漂移修复见 last_sender）。
+    async fn note_round_initiator(&self, conv: &ConvId, sender: &str) {
+        if sender.is_empty() {
+            return;
+        }
+        let mut m = self.conv_states.lock().await;
+        let st = m.entry(conv.0.clone()).or_default();
+        st.round_initiator = Some(sender.to_string());
+        st.last_touched = Instant::now();
+    }
+
     async fn react_to_message(
         &self,
         conv: &ConvId,
@@ -3638,6 +3710,7 @@ mod tests {
         let mk = |text: &str| InboundMessage {
             conv_id: ConvId("feishu:ou_pump".into()),
             sender: imagent_core::UserId("ou_u".into()),
+            sender_name: None,
             text: Some(text.into()),
             media: vec![],
             media_errors: Vec::new(),

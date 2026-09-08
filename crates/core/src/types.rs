@@ -116,6 +116,11 @@ pub enum InboundControl {
 pub struct InboundMessage {
     pub conv_id: ConvId,
     pub sender: UserId,
+    /// v1.23 说话人归属：发送者展示名（飞书经 contact API 懒解析缓存；
+    /// 无名平台/未解析时 None——标注回退 open_id 短版）。serde default 兼容
+    /// 旧持久化行。
+    #[serde(default)]
+    pub sender_name: Option<String>,
     pub text: Option<String>,
     /// 入站媒体引用（ilink 图片/文件等已落盘；无媒体则空）。
     pub media: Vec<MediaRef>,

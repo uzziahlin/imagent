@@ -207,6 +207,7 @@ pub fn msg_to_inbound(msg: &Msg) -> InboundMessage {
     InboundMessage {
         conv_id: ConvId(format!("ilink:{}", msg.from_user_id)),
         sender: UserId(msg.from_user_id.clone()),
+        sender_name: None,
         text: if text.is_empty() { None } else { Some(text) },
         media: Vec::new(),
         media_errors: Vec::new(),

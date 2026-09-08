@@ -59,6 +59,9 @@ impl Dispatcher {
         let conv = msg.conv_id.clone();
         let hint = msg.reply_hint.clone();
         let sender_id = msg.sender.0.clone();
+        // v1.23 发起者锚定：本轮首条消息（merge_batch 保序首条）——平台的
+        // 卡片发起者标注与按钮点击权锚定到它，不被运行中插话者漂移。
+        self.platform.note_round_initiator(&conv, &sender_id).await;
         let base_prompt = msg.text.clone().unwrap_or_default();
         // Wave B-9：断档续接判定（base_prompt 被 move 进 prompt 载体前先算好）：
         // 无可续接会话且 prompt 命中续接词表（继续/接着/然后…，≤4 字）时，

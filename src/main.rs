@@ -1748,6 +1748,7 @@ async fn webhook_handler(
     let msg = imagent_core::InboundMessage {
         conv_id: imagent_core::ConvId(route.conv.clone()),
         sender: imagent_core::UserId(format!("webhook:{}", route.name)),
+        sender_name: None,
         text: Some(format!("【{}】{}", route.name, text)),
         media: vec![],
         media_errors: Vec::new(),

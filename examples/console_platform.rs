@@ -29,6 +29,7 @@ impl Platform for ConsolePlatform {
         Ok(InboundMessage {
             conv_id: ConvId("console:local".to_string()),
             sender: UserId("local-user".to_string()),
+            sender_name: None,
             text: Some(text),
             media: Vec::new(),
             media_errors: Vec::new(),

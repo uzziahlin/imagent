@@ -489,6 +489,7 @@ pub fn parse_card_action_event(payload: &[u8]) -> Option<(String, InboundMessage
         InboundMessage {
             conv_id: ConvId(conv.to_string()),
             sender: UserId(open_id),
+            sender_name: None,
             text: Some(text),
             media: vec![],
             media_errors: Vec::new(),
@@ -535,6 +536,7 @@ fn dummy_card_action_msg(evt: &CardActionEvent, conv: &str) -> InboundMessage {
     InboundMessage {
         conv_id: ConvId(conv.to_string()),
         sender: UserId(card_operator_open_id(evt).unwrap_or_default()),
+        sender_name: None,
         text: None,
         media: vec![],
         media_errors: Vec::new(),
@@ -894,6 +896,7 @@ pub fn parse_comment_event(
             // comment_id 不再进 conv，单独返回由 drain 登记进 platform 锚点表。
             conv_id: ConvId(format!("{COMMENT_CONV_PREFIX}{}", b.file_token)),
             sender: UserId(open_id),
+            sender_name: None,
             text: Some(text.join("\n")),
             media: vec![],
             media_errors: Vec::new(),
@@ -979,6 +982,7 @@ pub fn parse_menu_event(payload: &[u8]) -> Option<(String, InboundMessage)> {
         InboundMessage {
             conv_id: ConvId(conv),
             sender: UserId(open_id),
+            sender_name: None,
             text: Some("/help".to_string()),
             media: vec![],
             media_errors: Vec::new(),
@@ -1070,6 +1074,7 @@ pub fn parse_recall_event(payload: &[u8]) -> Option<(String, InboundMessage)> {
                 .clone()
                 .unwrap_or_else(|| ConvId(format!("feishu:{mid}"))),
             sender: UserId(sender_open.unwrap_or_default()),
+            sender_name: None,
             text: None,
             media: vec![],
             media_errors: Vec::new(),
@@ -1128,6 +1133,7 @@ pub fn parse_bot_removed_event(payload: &[u8]) -> Option<(String, InboundMessage
         InboundMessage {
             conv_id: ConvId(format!("feishu:{chat_id}")),
             sender: UserId(String::new()),
+            sender_name: None,
             text: None,
             media: vec![],
             media_errors: Vec::new(),
@@ -1332,6 +1338,7 @@ fn assemble_event_message(
     let msg = InboundMessage {
         conv_id: ConvId(conv),
         sender: UserId(open_id),
+        sender_name: None,
         text,
         media: vec![],
         media_errors: Vec::new(),

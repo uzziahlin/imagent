@@ -374,6 +374,16 @@ struct QueuedMsg {
     msg: InboundMessage,
 }
 
+/// v1.23 说话人归属：标注名——优先展示名，回退 open_id 前 10 位（群聊中
+/// agent 与用户都能分辨「谁在说话」；裸 open_id 对 agent 上下文不可解析）。
+fn sender_label(msg: &InboundMessage) -> String {
+    msg.sender_name
+        .as_deref()
+        .filter(|n| !n.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| msg.sender.0.chars().take(10).collect())
+}
+
 fn merge_batch(batch: Vec<InboundMessage>) -> InboundMessage {
     let multi_sender = batch
         .iter()
@@ -383,14 +393,14 @@ fn merge_batch(batch: Vec<InboundMessage>) -> InboundMessage {
         > 1;
     let mut it = batch.into_iter();
     let mut first = it.next().expect("merge_batch: batch 非空");
-    let first_sender = first.sender.0.clone();
+    let first_label = sender_label(&first);
     let mut texts: Vec<String> = first
         .text
         .take()
         .filter(|t| !t.trim().is_empty())
         .map(|t| {
             if multi_sender {
-                format!("【{first_sender}】{t}")
+                format!("【{first_label}】{t}")
             } else {
                 t
             }
@@ -398,9 +408,10 @@ fn merge_batch(batch: Vec<InboundMessage>) -> InboundMessage {
         .into_iter()
         .collect();
     for m in it {
+        let label = sender_label(&m);
         if let Some(t) = m.text.filter(|t| !t.trim().is_empty()) {
             texts.push(if multi_sender {
-                format!("【{}】{t}", m.sender.0)
+                format!("【{label}】{t}")
             } else {
                 t
             });
@@ -1517,10 +1528,21 @@ impl Dispatcher {
                             running
                                 .get(conv)
                                 .and_then(|h| h.steer.as_ref())
-                                .is_some_and(|tx| tx.try_send(text.to_string()).is_ok())
+                                .is_some_and(|tx| {
+                                    let labeled = if is_p2p_conv(conv) {
+                                        text.to_string()
+                                    } else {
+                                        format!("【{}】{text}", sender_label(&msg))
+                                    };
+                                    tx.try_send(labeled).is_ok()
+                                })
                         };
                         if steered {
                             drop(map);
+                            // v1.23 说话人归属：群 conv 的转向注入带【标注】——
+                            // 此前排队路径有归属、转向路径没有，群聊中 B 插话
+                            // 纠正时 agent 无法分辨是 A 改口还是 B 的意见。p2p
+                            // 单人会话不加（唯一说话人，纯噪音）。
                             // 卡面可见性（v1.18）：footer「已注入 N 条」——表情回执
                             // 之外的二次确认，轮次结束清零（见 runner 循环）。
                             self.queued_hints

@@ -1117,6 +1117,51 @@ pub async fn fetch_token(
 /// 取机器人自身 open_id（P5-8：云文档评论 @bot 过滤用）。
 /// GET `/open-apis/bot/v3/info`，需 tenant_access_token；成功后由调用方缓存
 /// （open_id 随应用固定，进程内取一次即可）。
+/// v1.23 说话人归属：open_id → 展示名（GET contact/v3/users/{id}）。
+/// 需 `contact:user.base:readonly` 权限——无权限/接口失败由调用方 fail-soft
+///（标注回退 open_id 短版），不阻塞消息路径。
+pub async fn fetch_user_display_name(
+    core_config: &CoreConfig,
+    token: &str,
+    open_id: &str,
+) -> imagent_core::Result<String> {
+    let base = core_config.base_url().trim_end_matches('/').to_string();
+    let url = format!("{base}/open-apis/contact/v3/users/{open_id}?user_id_type=open_id");
+    let client = api_client().clone();
+    let resp = client
+        .get(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| {
+            imagent_core::CoreError::Platform(PLATFORM, format!("fetch_user_display_name: {e}"))
+        })?;
+    let v: serde_json::Value = resp.json().await.map_err(|e| {
+        imagent_core::CoreError::Platform(PLATFORM, format!("fetch_user_display_name: {e}"))
+    })?;
+    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
+        return Err(imagent_core::CoreError::Platform(
+            PLATFORM,
+            format!("fetch_user_display_name: code={code} {msg}"),
+        ));
+    }
+    let name = v
+        .pointer("/data/user/name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        return Err(imagent_core::CoreError::Platform(
+            PLATFORM,
+            "fetch_user_display_name: 用户名为空".to_string(),
+        ));
+    }
+    Ok(name)
+}
+
 pub async fn fetch_bot_open_id(
     core_config: &CoreConfig,
     token: &str,
