@@ -345,12 +345,14 @@ impl Dispatcher {
         let card_allowed = self.platform.supports_streaming_card(&conv)
             && *self.reply_mode.read() == ReplyMode::Card;
         let mut card = if card_allowed {
-            Some(CardSession::new(
+            let mut s = CardSession::new(
                 self.store.clone(),
                 conv.clone(),
                 self.platform.name(),
                 self.queued_hints.clone(),
-            ))
+            );
+            s.task_digest = Some(first_prompt_digest.clone());
+            Some(s)
         } else {
             None
         };

@@ -279,10 +279,15 @@ pub fn render_card(card: &OutboundCard, conv_id: &str, sender: Option<&str>) -> 
             Some(e.as_str()),
         ),
     };
+    let opening_owned;
     let text = if card.text.is_empty() {
         // 明确状态语而非模糊的「…」：首 chunk 前的静默期（CLI 冷启动 + 模型
-        // 首 token 可达十几秒）让用户确知任务已被接收处理。
-        "🧠 已接收任务，正在处理…"
+        // 首 token 可达十几秒）。v1.24：带任务摘要（可辨认是哪个任务）。
+        opening_owned = match card.task_digest.as_deref().filter(|d| !d.trim().is_empty()) {
+            Some(d) => format!("🧠 处理中：{}…", truncate_chars(d.trim(), 60)),
+            None => "🧠 已接收任务，正在处理…".to_string(),
+        };
+        opening_owned.as_str()
     } else {
         &card.text
     };
@@ -376,9 +381,13 @@ pub fn render_card(card: &OutboundCard, conv_id: &str, sender: Option<&str>) -> 
     // Running 态带自定义 summary（卡片列表预览/通知处显示，默认「生成中」）；
     // Done 态 streaming=false 不需要 summary。
     let config = if streaming {
+        let summary = match card.task_digest.as_deref().filter(|d| !d.trim().is_empty()) {
+            Some(d) => format!("🧠 处理中：{}", truncate_chars(d.trim(), 40)),
+            None => phase_footer(card.phase).to_string(),
+        };
         serde_json::json!({
             "streaming_mode": true,
-            "summary": { "content": phase_footer(card.phase) }
+            "summary": { "content": summary }
         })
     } else {
         // 卡片 UX 批（v1.24）：终态 summary——会话列表/通知预览处此前显示默认
@@ -616,23 +625,37 @@ fn panel_header(title_md: &str) -> serde_json::Value {
 /// PATCH 整体覆盖，发起者行不能放进 md_body）；element PATCH 只动带 element_id
 /// 的组件，本行在整个流式期持续可见。发起者 = 最近 sender 近似（见 platform
 /// conv_senders 注释）。
-pub fn render_stream_init_card(conv_id: &str, sender: Option<&str>) -> String {
+pub fn render_stream_init_card(
+    conv_id: &str,
+    sender: Option<&str>,
+    task_digest: Option<&str>,
+) -> String {
+    // v1.24：首帧带任务摘要（首条 prompt 前 N 字）——回到旧卡/列表预览可辨认
+    // 这是哪个任务；无 digest（合成消息）退回通用文案。
+    let opening = match task_digest.filter(|d| !d.trim().is_empty()) {
+        Some(d) => format!("🧠 处理中：{}…", truncate_chars(d.trim(), 60)),
+        None => "🧠 已接收任务，正在处理…".to_string(),
+    };
     let mut elements = Vec::new();
     if let Some(line) = sender_anchor_line(sender, !crate::proto::is_private_conv(conv_id)) {
         elements.push(line);
     }
     elements.extend(vec![
-        serde_json::json!({ "tag": "markdown", "element_id": "md_body", "content": "🧠 已接收任务，正在处理…" }),
+        serde_json::json!({ "tag": "markdown", "element_id": "md_body", "content": opening }),
         serde_json::json!({ "tag": "markdown", "element_id": "md_footer", "content": "🧠 思考中…", "text_size": "notation" }),
         // P9-1：⏹ 终止按钮常驻（element PATCH 只更新 markdown，按钮不受流式
         // 影响；终态后仍在，点击回「当前没有运行中的任务」，无害）。
         stop_button(conv_id, sender)
     ]);
+    let summary_of = match task_digest.filter(|d| !d.trim().is_empty()) {
+        Some(d) => format!("🧠 处理中：{}", truncate_chars(d.trim(), 40)),
+        None => "🧠 正在执行任务…".to_string(),
+    };
     serde_json::json!({
         "schema": "2.0",
         "config": {
             "streaming_mode": true,
-            "summary": { "content": "🧠 正在执行任务…" }
+            "summary": { "content": summary_of }
         },
         "body": { "elements": elements }
     })
@@ -694,7 +717,10 @@ fn stream_body_md_inner_full(card: &OutboundCard) -> String {
         out.push_str(&format!("> 💭 {}", truncate_chars(thought, 120)));
     }
     if out.is_empty() {
-        out.push_str("🧠 已接收任务，正在处理…");
+        match card.task_digest.as_deref().filter(|d| !d.trim().is_empty()) {
+            Some(d) => out.push_str(&format!("🧠 处理中：{}…", truncate_chars(d.trim(), 60))),
+            None => out.push_str("🧠 已接收任务，正在处理…"),
+        }
     }
     mask_emails(&out)
 }
@@ -1830,6 +1856,7 @@ mod tests {
     /// 与既有 `card_of`（terminal 维度）区分命名。
     fn body_card_of(text: &str, tools: &[ToolCall], thoughts: &[&str]) -> OutboundCard {
         OutboundCard {
+            task_digest: None,
             text: text.into(),
             tool_calls: tools.to_vec(),
             thoughts: thoughts.iter().map(|s| s.to_string()).collect(),
@@ -1845,6 +1872,7 @@ mod tests {
     #[test]
     fn render_running_has_markdown() {
         let card = OutboundCard {
+            task_digest: None,
             text: "hello".into(),
             tool_calls: vec![],
             phase: CardPhase::Thinking,
@@ -1874,6 +1902,7 @@ mod tests {
             (CardPhase::Outputting, "✍️ 输出中…"),
         ] {
             let card = OutboundCard {
+                task_digest: None,
                 text: "x".into(),
                 tool_calls: vec![],
                 phase,
@@ -1894,6 +1923,7 @@ mod tests {
     #[test]
     fn render_done_with_tools() {
         let card = OutboundCard {
+            task_digest: None,
             text: "done".into(),
             tool_calls: vec![tool("Read", "src/main.rs", true)],
             phase: CardPhase::Outputting,
@@ -1923,6 +1953,7 @@ mod tests {
             .map(|i| tool("Bash", &format!("cmd-{i}"), true))
             .collect();
         let card = OutboundCard {
+            task_digest: None,
             text: "out".into(),
             tool_calls: tools,
             phase: CardPhase::ToolRunning,
@@ -1939,6 +1970,7 @@ mod tests {
         assert!(!json.contains("前面还有"), "面板不截断: {json}");
         // 流式 md 仍折叠（最近 5 条）。
         let running = OutboundCard {
+            task_digest: None,
             text: "out".into(),
             tool_calls: (0..10)
                 .map(|i| tool("Bash", &format!("cmd-{i}"), true))
@@ -1959,6 +1991,7 @@ mod tests {
     #[test]
     fn render_error() {
         let card = OutboundCard {
+            task_digest: None,
             text: "".into(),
             tool_calls: vec![],
             phase: CardPhase::Thinking,
@@ -2211,6 +2244,7 @@ mod tests {
         assert_eq!(running_footer(CardPhase::Thinking, None, 0), "🧠 思考中…");
         // 降级卡 footer 同样组合。
         let card = OutboundCard {
+            task_digest: None,
             text: "x".into(),
             tool_calls: vec![],
             phase: CardPhase::Outputting,
@@ -2331,7 +2365,7 @@ mod tests {
     /// 命令按钮 value 带 ts（过期拒绝）与终止按钮的 sender（发起者校验）。
     #[test]
     fn cmd_button_value_carries_ts_and_sender() {
-        let init = render_stream_init_card("feishu:oc_g", Some("ou_owner"));
+        let init = render_stream_init_card("feishu:oc_g", Some("ou_owner"), None);
         assert!(
             init.contains("\"sender\":\"ou_owner\""),
             "终止按钮带发起者: {init}"
@@ -2342,7 +2376,7 @@ mod tests {
             "命令编码: {init}"
         );
         // 无发起者（私聊/未知）不编码 sender。
-        let init2 = render_stream_init_card("feishu:ou_t", None);
+        let init2 = render_stream_init_card("feishu:ou_t", None, None);
         assert!(!init2.contains("\"sender\":"), "无 sender 不编码: {init2}");
         // 命令卡按钮带 ts。
         let json = render_command_card(
@@ -2362,7 +2396,7 @@ mod tests {
     /// 回调注入 /stop + conv 编码）；终态不带。
     #[test]
     fn stop_button_on_running_cards_only() {
-        let init = render_stream_init_card("feishu:ou_t", None);
+        let init = render_stream_init_card("feishu:ou_t", None, None);
         assert!(init.contains("⏹ 终止"), "init 卡终止按钮: {init}");
         assert!(
             init.contains("\"imagent_cmd\":\"/stop\""),
@@ -2374,6 +2408,7 @@ mod tests {
         );
 
         let running = OutboundCard {
+            task_digest: None,
             text: "x".into(),
             tool_calls: vec![],
             phase: CardPhase::Outputting,
@@ -2387,6 +2422,7 @@ mod tests {
         let json = render_card(&running, "feishu:ou_t", None);
         assert!(json.contains("⏹ 终止"), "Running 降级卡带终止按钮: {json}");
         let done = OutboundCard {
+            task_digest: None,
             text: "ok".into(),
             tool_calls: vec![],
             phase: CardPhase::Outputting,
@@ -2496,7 +2532,7 @@ mod tests {
 
     #[test]
     fn stream_init_card_has_element_id_and_streaming() {
-        let json = render_stream_init_card("feishu:ou_t", None);
+        let json = render_stream_init_card("feishu:ou_t", None, None);
         assert!(json.contains("element_id"), "初始卡应含 element_id: {json}");
         assert!(json.contains("md_body"), "正文组件锚点: {json}");
         assert!(json.contains("\"streaming_mode\":true"), "应开流式: {json}");
@@ -2546,6 +2582,7 @@ mod tests {
             "⏹ 已中断\n\n⬇️ 详情见下方消息"
         );
         let card = OutboundCard {
+            task_digest: None,
             text: "结论".into(),
             tool_calls: vec![tool("Bash", "ls", true)],
             phase: CardPhase::Outputting,
@@ -2758,12 +2795,13 @@ mod tests {
     /// 空正文占位：init 卡与流式 md 均为明确状态语（非「…」）。
     #[test]
     fn empty_body_placeholder_is_explicit() {
-        let init = render_stream_init_card("feishu:ou_t", None);
+        let init = render_stream_init_card("feishu:ou_t", None, None);
         assert!(
             init.contains("🧠 已接收任务，正在处理"),
             "init 卡状态语: {init}"
         );
         let card = OutboundCard {
+            task_digest: None,
             text: "".into(),
             tool_calls: vec![],
             phase: CardPhase::Thinking,
@@ -2787,6 +2825,7 @@ mod tests {
 
     fn card_of(terminal: CardTerminal, tools: Vec<ToolCall>) -> OutboundCard {
         OutboundCard {
+            task_digest: None,
             text: "结论".into(),
             tool_calls: tools,
             phase: CardPhase::Outputting,
@@ -2831,7 +2870,7 @@ mod tests {
             !running.contains("\"header\""),
             "Running 不加 header: {running}"
         );
-        let init = render_stream_init_card("feishu:ou_t", None);
+        let init = render_stream_init_card("feishu:ou_t", None, None);
         assert!(
             !init.contains("\"header\""),
             "流式初始卡不加 header: {init}"
@@ -3136,7 +3175,7 @@ mod tests {
             "空 sender 不加"
         );
         // 初始卡（群）含标注行且在 md_body 之前；（私聊）不含。
-        let init_group = render_stream_init_card("feishu:oc_g", Some("ou_owner"));
+        let init_group = render_stream_init_card("feishu:oc_g", Some("ou_owner"), None);
         assert!(
             init_group.contains("<at id=") && init_group.contains("ou_owner"),
             "{init_group}"
@@ -3145,10 +3184,11 @@ mod tests {
             init_group.find("<at").unwrap() < init_group.find("md_body").unwrap(),
             "发起者行在正文组件之前"
         );
-        let init_p2p = render_stream_init_card("feishu:ou_t", Some("ou_t"));
+        let init_p2p = render_stream_init_card("feishu:ou_t", Some("ou_t"), None);
         assert!(!init_p2p.contains("<at"), "私聊初始卡不加: {init_p2p}");
         // 整卡路径（render_card）同款：群含、私聊不含。
         let card = OutboundCard {
+            task_digest: None,
             text: "x".into(),
             tool_calls: vec![],
             phase: CardPhase::Thinking,
@@ -3179,6 +3219,7 @@ mod tests {
         assert_eq!(format_run_len(90000), "1d1h");
         // 整卡渲染带出该 footer。
         let card = OutboundCard {
+            task_digest: None,
             text: "x".into(),
             tool_calls: vec![],
             phase: CardPhase::Thinking,
