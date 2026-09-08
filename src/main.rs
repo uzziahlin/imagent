@@ -1205,6 +1205,9 @@ struct Health {
     uptime_secs: u64,
     version: &'static str,
     sessions: i64,
+    /// v1.23：发送侧重试队列深度（outbox 表行数）——持续 >0 说明出站通路
+    /// 在退避重发（0 = 健康）。
+    outbox_pending: i64,
 }
 
 /// 共享给 axum handler 的状态。
@@ -1548,6 +1551,13 @@ fn github_event_text(event: &str, body: &[u8]) -> GithubEventText {
             if s(&["action"]) != "completed" {
                 return GithubEventText::Skip;
             }
+            // v1.23 review：必要字段缺失（name/html_url）拼出的空壳文本会
+            // 驱动一整轮 agent 却无信息量——与「未识别事件 Skip」同哲学拦下。
+            let wf_name = s(&["workflow_run", "name"]);
+            let wf_url = s(&["workflow_run", "html_url"]);
+            if wf_name.is_empty() || wf_url.is_empty() {
+                return GithubEventText::Skip;
+            }
             let conclusion = s(&["workflow_run", "conclusion"]);
             let mark = match conclusion.as_str() {
                 "success" => "✅",
@@ -1557,16 +1567,21 @@ fn github_event_text(event: &str, body: &[u8]) -> GithubEventText {
             };
             GithubEventText::Text(format!(
                 "{mark} GitHub Actions：「{}」（{} 分支）{}\n仓库 {} · 触发 {} · 第 {} 次运行\n{}",
-                s(&["workflow_run", "name"]),
+                wf_name,
                 s(&["workflow_run", "head_branch"]),
                 conclusion,
                 s(&["repository", "full_name"]),
                 s(&["workflow_run", "actor", "login"]),
                 v["workflow_run"]["run_number"].as_i64().unwrap_or(0),
-                s(&["workflow_run", "html_url"]),
+                wf_url,
             ))
         }
         "push" => {
+            let pusher = s(&["pusher", "name"]);
+            let repo = s(&["repository", "full_name"]);
+            if pusher.is_empty() || repo.is_empty() {
+                return GithubEventText::Skip;
+            }
             let commits = v["commits"].as_array().cloned().unwrap_or_default();
             let msgs: Vec<String> = commits
                 .iter()
@@ -1575,7 +1590,7 @@ fn github_event_text(event: &str, body: &[u8]) -> GithubEventText {
                     c["message"]
                         .as_str()
                         .and_then(|m| m.lines().next())
-                        .map(str::to_string)
+                        .map(|m| truncate_chars(m, 200))
                 })
                 .collect();
             let list = if msgs.is_empty() {
@@ -1594,8 +1609,8 @@ fn github_event_text(event: &str, body: &[u8]) -> GithubEventText {
             let git_ref = s(&["ref"]).trim_start_matches("refs/heads/").to_string();
             GithubEventText::Text(format!(
                 "📦 GitHub push：{} → {}（{}）\n{}\n{}",
-                s(&["pusher", "name"]),
-                s(&["repository", "full_name"]),
+                pusher,
+                repo,
                 git_ref,
                 list,
                 s(&["compare"])
@@ -1605,6 +1620,10 @@ fn github_event_text(event: &str, body: &[u8]) -> GithubEventText {
             let action = s(&["action"]);
             // assigned/labeled/unassigned 等低价值动作跳过。
             if !matches!(action.as_str(), "opened" | "closed" | "reopened") {
+                return GithubEventText::Skip;
+            }
+            let (title, url) = (s(&["issue", "title"]), s(&["issue", "html_url"]));
+            if title.is_empty() || url.is_empty() {
                 return GithubEventText::Skip;
             }
             let mark = if action == "closed" { "✅" } else { "🎯" };
@@ -1647,6 +1666,13 @@ fn github_event_text(event: &str, body: &[u8]) -> GithubEventText {
             } else {
                 action
             };
+            let (title, url) = (
+                s(&["pull_request", "title"]),
+                s(&["pull_request", "html_url"]),
+            );
+            if title.is_empty() || url.is_empty() {
+                return GithubEventText::Skip;
+            }
             let mark = if merged { "🎉" } else { "🌱" };
             GithubEventText::Text(format!(
                 "{mark} GitHub PR {}：#{} {}\nby {} · {} ← {}\n{}",
@@ -1804,6 +1830,7 @@ async fn health_handler(
                 uptime_secs: 0,
                 version: "",
                 sessions: -1,
+                outbox_pending: -1,
             }),
         );
     }
@@ -1825,11 +1852,13 @@ async fn health_handler(
                 .unwrap_or(false)
         }
     };
+    let outbox_pending = st.store.outbox_depth().await.unwrap_or(0);
     let body = Health {
         logged_in,
         uptime_secs: st.start_at.elapsed().as_secs(),
         version: env!("CARGO_PKG_VERSION"),
         sessions,
+        outbox_pending,
     };
     (StatusCode::OK, Json(body))
 }

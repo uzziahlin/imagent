@@ -51,6 +51,12 @@ fn cap_md_bytes(md: &str, head_b: usize, tail_b: usize) -> String {
     )
 }
 
+/// 反引号包裹的行内片段安全化（tool_name 等）：去掉反引号（防破坏外层
+/// code span）+ `<at>` 注入收口（escape_lt_inline 已按 span 边界处理）。
+fn sanitize_inline(text: &str) -> String {
+    escape_lt_inline(&text.replace('`', "'"))
+}
+
 fn escape_lt(text: &str) -> String {
     // R13（code-review v9）：围栏代码块内的 `<` 不转义——CommonMark 代码块
     // 不处理反斜杠转义，此前全串替换把 `a < b` 显示成 `a \< b`。逐行跟踪
@@ -1025,7 +1031,7 @@ pub fn render_permission_card_cancelled(tool_name: &str) -> String {
         "schema": "2.0",
         "header": { "title": { "tag": "plain_text", "content": "⏹ 询问已结束" }, "template": "grey" },
         "body": { "elements": [
-            { "tag": "markdown", "content": format!("`{tool_name}` 的本次询问已结束，无需处理。") },
+            { "tag": "markdown", "content": format!("`{}` 的本次询问已结束，无需处理。", sanitize_inline(tool_name)) },
             // 中断/审批超时/被取代的原因说明走 note 提示条（元信息类注释行）。
             note_element("原因：任务中断 · 审批超时 · 被后续询问取代")
         ]}
@@ -1039,7 +1045,7 @@ pub fn render_permission_card_superseded(tool_name: &str) -> String {
         "schema": "2.0",
         "header": { "title": { "tag": "plain_text", "content": "🔁 已被新询问取代" }, "template": "grey" },
         "body": { "elements": [
-            { "tag": "markdown", "content": format!("`{tool_name}` 的询问已被更新的询问取代（agent 并发请求时旧请求自动拒绝），请处理最新一张。") }
+            { "tag": "markdown", "content": format!("`{}` 的询问已被更新的询问取代（agent 并发请求时旧请求自动拒绝），请处理最新一张。", sanitize_inline(tool_name)) }
         ]}
     })
     .to_string()
@@ -1253,8 +1259,10 @@ fn render_multi_question_card(
         if opt_values.is_empty() {
             return None;
         }
+        // v1.23 review：题面/描述来自 agent（可引用不可信内容）——与正文
+        // 三路径同款 <at> 注入收口（此前漏了 escape_lt）。
         sections.push(serde_json::json!({
-            "tag": "markdown", "content": mask_emails(&lines.join("\n"))
+            "tag": "markdown", "content": escape_lt(&mask_emails(&lines.join("\n")))
         }));
         fields.push(if multi {
             serde_json::json!({ "tag": "checkbox", "name": format!("ask_opt_{i}"), "options": opt_values })
@@ -1349,7 +1357,7 @@ pub fn render_question_card_resolved(choice: &str) -> String {
         "schema": "2.0",
         "header": { "title": { "tag": "plain_text", "content": "✅ 已记录选择" }, "template": "grey" },
         "body": { "elements": [
-            { "tag": "markdown", "content": format!("已记录你的选择：{choice}。任务继续处理中。") }
+            { "tag": "markdown", "content": format!("已记录你的选择：{}。任务继续处理中。", escape_lt(&mask_emails(choice))) }
         ]}
     })
     .to_string()
@@ -1430,7 +1438,7 @@ fn body_block_elements(body_md: &str) -> Vec<serde_json::Value> {
                 // 组标题独立成 heading 元素（/help 的「🗂 会话\n- …」形态——
                 // 标题与列表间无空行，块内再拆）。
                 out.push(serde_json::json!({
-                    "tag": "markdown", "content": first, "text_size": "heading-large"
+                    "tag": "markdown", "content": escape_lt(first), "text_size": "heading-large"
                 }));
             } else {
                 // 标题后无内容（单行块）或列表/表格行：整体一个普通元素
@@ -1506,7 +1514,9 @@ fn resume_row_left(cells: &[String]) -> Vec<serde_json::Value> {
     if md.is_empty() {
         Vec::new()
     } else {
-        vec![serde_json::json!({ "tag": "markdown", "content": md })]
+        // v1.23 review：「内容」列是会话首条 prompt（用户原文）——<at> 注入
+        // 收口（此前的漏网出口之一）。
+        vec![serde_json::json!({ "tag": "markdown", "content": escape_lt(&mask_emails(&md)) })]
     }
 }
 
@@ -1590,7 +1600,9 @@ fn try_paired_rows(
             md.push_str(&format!("|{}|\n", r.join("|")));
         }
         md.push_str("\n（其余会话发送 /resume <序号> 接管）");
-        elements.push(serde_json::json!({ "tag": "markdown", "content": md }));
+        elements.push(
+            serde_json::json!({ "tag": "markdown", "content": escape_lt(&mask_emails(&md)) }),
+        );
     }
     // 未配对按钮：底部 flow 行。
     let leftover: Vec<serde_json::Value> = buttons

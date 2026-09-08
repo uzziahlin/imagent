@@ -1135,7 +1135,15 @@ impl Dispatcher {
             ));
         }
         let this = self.clone();
-        self.tasks.lock().await.spawn(async move {
+        let mut tasks = self.tasks.lock().await;
+        // v1.23 review：拿锁后复查——检查与拿锁之间 shutdown 可能已开始
+        //（drain 持 tasks 锁），此时 spawn 的任务会在 drain 之后被无声取消。
+        if self.shutdown.is_cancelled() {
+            return Err(crate::error::CoreError::Config(
+                "imagent 正在停机，拒收 webhook 注入（请稍后重试）".to_string(),
+            ));
+        }
+        tasks.spawn(async move {
             this.handle(msg).await;
         });
         Ok(())
@@ -1761,9 +1769,17 @@ impl Dispatcher {
                 .ok()
                 .and_then(|v| v.get("prompt").and_then(|p| p.as_str()).map(str::to_string))
                 .unwrap_or(payload.clone());
-            // v1.21 review：已有的 last_prompt 记录着更近的真实失败轮（/retry
-            // 兜底）——崩溃残留（更早时刻死掉的轮）无条件顶掉它会丢掉更值得
-            // 重试的那条。比 at，仅在新于现存时覆盖。
+            // v1.23 review（修正 v1.21 的方向反转）：v1.21 实现写成「存在
+            // last_prompt 即不覆盖」——但轮次按 conv 串行下，崩溃残留的
+            // inflight（轮首写入）**必然新于**任何先前的 last_prompt（失败
+            // 收尾写入），旧实现等于在「前一轮曾失败」的常见场景下整体禁用
+            // 崩溃恢复、且通知仍引导用户 /retry 到更旧的 prompt（副作用类
+            // 指令有重复执行风险）。正确语义：解析 inflight 自带的 at，
+            // 仅当现存 last_prompt 严格更新（inflight 清理失败留下的陈旧
+            // 标记，见 round.rs 清除失败 warn 路径）才保留现存值。
+            let inflight_at = serde_json::from_str::<serde_json::Value>(&payload)
+                .ok()
+                .and_then(|v| v.get("at").and_then(|a| a.as_i64()));
             let existing_at = self
                 .store
                 .get_config(&format!("last_prompt:{conv}"))
@@ -1775,14 +1791,20 @@ impl Dispatcher {
                         .ok()
                         .and_then(|j| j.get("at").and_then(|a| a.as_i64()))
                 });
-            if existing_at.is_some() {
+            let keep_existing = match (inflight_at, existing_at) {
+                (_, None) => false,                  // 无现存：崩溃轮接管
+                (None, Some(_)) => false, // inflight 无 at（旧格式）：串行不变量下仍以崩溃轮为准
+                (Some(cur), Some(old)) => old > cur, // 现存严格更新（陈旧 inflight 残留）才保留
+            };
+            if keep_existing {
                 info!(
                     target: "imagent::core",
                     conv_id = conv,
-                    "已有更近的 last_prompt，崩溃残留不覆盖（/retry 仍指向最近失败轮）"
+                    "现存 last_prompt 比崩溃残留更新（陈旧 inflight），不覆盖"
                 );
             } else {
-                let last_payload = serde_json::json!({ "prompt": prompt_text, "at": now_secs() });
+                let at = inflight_at.unwrap_or_else(now_secs);
+                let last_payload = serde_json::json!({ "prompt": prompt_text, "at": at });
                 let _ = self
                     .store
                     .set_config(&format!("last_prompt:{conv}"), &last_payload.to_string())
@@ -1820,7 +1842,13 @@ impl Dispatcher {
         info!(target: "imagent::core", n = rows.len(), "重放崩溃前持久化的排队消息");
         for (conv, payload) in rows {
             match serde_json::from_str::<InboundMessage>(&payload) {
-                Ok(msg) => {
+                Ok(mut msg) => {
+                    // v1.23 review：旧版（< v1.21）落盘的 cron/webhook 排队行
+                    // 反序列化时 serde default 把 no_steer 补成 false——按合成
+                    // sender 形态补判，防重放时被 steering 吸进在飞轮。
+                    if !msg.no_steer && msg.sender.0.starts_with("webhook:") {
+                        msg.no_steer = true;
+                    }
                     let this = self.clone();
                     self.tasks.lock().await.spawn(async move {
                         this.handle(msg).await;

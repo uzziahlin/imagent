@@ -1561,7 +1561,11 @@ impl Store {
     pub async fn outbox_mark_failed(&self, id: i64, next_try: i64) -> Result<bool> {
         let inner = self.inner.clone();
         blocking_with_retry(inner, move |conn| {
-            let n = conn.execute(
+            // v1.23 review：UPDATE→SELECT→DELETE 包单事务——BUSY 整闭包重放
+            // 时裸跑的 UPDATE 会二次执行（attempts 双跳，消息提前耗尽被放弃），
+            // 与 append_run_stat 的事务化修法一致。
+            let tx = conn.unchecked_transaction()?;
+            let n = tx.execute(
                 "UPDATE outbox SET attempts = attempts + 1, next_try = ?2 WHERE id = ?1",
                 rusqlite::params![id, next_try],
             )?;
@@ -1569,13 +1573,15 @@ impl Store {
                 return Ok(false); // 行已不在（并发泵/上次成功）——按已了结处理
             }
             let attempts: i64 =
-                conn.query_row("SELECT attempts FROM outbox WHERE id = ?1", [id], |r| {
+                tx.query_row("SELECT attempts FROM outbox WHERE id = ?1", [id], |r| {
                     r.get(0)
                 })?;
             if attempts >= OUTBOX_MAX_ATTEMPTS {
-                conn.execute("DELETE FROM outbox WHERE id = ?1", rusqlite::params![id])?;
+                tx.execute("DELETE FROM outbox WHERE id = ?1", rusqlite::params![id])?;
+                tx.commit()?;
                 return Ok(false);
             }
+            tx.commit()?;
             Ok(true)
         })
         .await

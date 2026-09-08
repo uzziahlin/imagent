@@ -726,12 +726,21 @@ impl LongLivedAcp {
                         // P5-5：session 一经建立/续接即通知 dispatch——被 /stop 或超时
                         // 中断的轮次拿不到 RunOutcome，靠它落库续接。
                         // v1.21 review：与 forward_update 同款 30s 超时（通道满 +
-                        // 消费方失联时不许永久挂起 turn 主循环）。
-                        let _ = tokio::time::timeout(
+                        // 消费方失联时不许永久挂起 turn 主循环）。超时即 sid 不
+                        // 落库（崩溃/中断的续接兜底缺失），必须 warn 留痕。
+                        if tokio::time::timeout(
                             std::time::Duration::from_secs(30),
                             st.chunks.send(AgentChunk::SessionStarted(sid.clone())),
                         )
-                        .await;
+                        .await
+                        .is_err()
+                        {
+                            warn!(
+                                target: "claude-acp",
+                                session_id = %sid,
+                                "SessionStarted 推送 30s 超时（通道满/消费方失联），sid 未落库——崩溃续接兜底缺失"
+                            );
+                        }
                         let blocks = vec![ContentBlock::Text(TextContent::new(req.prompt.clone()))];
                         let prompt_fut = connection
                             .send_request(PromptRequest::new(

@@ -100,6 +100,19 @@ fn confirm_overwrite(cfg_path: &std::path::Path) -> Result<bool> {
         "⚠️  已存在配置 {}——向导产出的新配置将覆盖它（数据库/凭据不受影响）。",
         cfg_path.display()
     );
+    // v1.23 review：覆盖前留备份——手工调好的白名单/管理员/时段等运行配置
+    // 不落 store，直接覆盖即全部清零回发现模式。
+    let backup = cfg_path.with_extension(format!(
+        "toml.bak.{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    ));
+    match std::fs::copy(cfg_path, &backup) {
+        Ok(_) => println!("   旧配置已备份到 {}", backup.display()),
+        Err(e) => println!("   ⚠️ 旧配置备份失败（{e}），覆盖后不可恢复"),
+    }
     if !confirm("继续覆盖？", false)? {
         println!("已取消。");
         return Ok(false);
@@ -262,7 +275,11 @@ fn prompt(label: &str, default: &str) -> Result<String> {
     }
     std::io::stdout().flush()?;
     let mut buf = String::new();
-    std::io::stdin().read_line(&mut buf)?;
+    // v1.23 review：EOF（Ctrl-D/管道输入）必须报错退出——返回空串会让
+    // 必填项校验（如 workdir）无限重打印「请重输」忙转。
+    if std::io::stdin().read_line(&mut buf)? == 0 {
+        return Err(anyhow!("输入已结束（EOF），向导退出"));
+    }
     let t = buf.trim();
     if t.is_empty() {
         Ok(default.to_string())

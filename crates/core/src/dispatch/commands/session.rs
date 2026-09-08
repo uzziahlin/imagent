@@ -219,6 +219,10 @@ impl Dispatcher {
         } else {
             ""
         };
+        // v1.23 review：接管即换会话——session allow-set（「本次会话始终允许」）
+        // 不清空会跨会话延续，与 permission.rs「换会话不应继承旧授权」语义
+        // 矛盾（与 /new、/stop 硬停同款清理）。
+        self.router.clear_session_allows(&conv.0).await;
         self.reply(
             conv,
             &format!("✅ 已接管会话 {sid_short}…（下条消息续接）{fork_note}"),
