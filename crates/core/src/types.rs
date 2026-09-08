@@ -346,6 +346,9 @@ pub enum CardPhase {
     ToolRunning,
     /// 正在流式输出正文。
     Outputting,
+    /// v1.23 审批等待可视化：agent 在等 IM 审批回复（轮次 chunk 循环的
+    /// 看门狗豁免分支置位；下个 chunk 到达自然翻回对应阶段）。
+    WaitingApproval,
 }
 
 /// 流式卡片的抽象内容（平台无关）。core dispatch 累积 agent 输出成此结构，

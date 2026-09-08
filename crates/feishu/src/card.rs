@@ -136,6 +136,8 @@ pub fn phase_footer(phase: CardPhase) -> &'static str {
         CardPhase::Thinking => "🧠 思考中…",
         CardPhase::ToolRunning => "🧰 正在调用工具…",
         CardPhase::Outputting => "✍️ 输出中…",
+        // v1.23：审批等待（点击上方审批卡 / 回复 y·n·always）。
+        CardPhase::WaitingApproval => "⏳ 等待审批中（请处理询问卡）…",
     }
 }
 

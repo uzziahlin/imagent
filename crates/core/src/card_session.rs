@@ -142,6 +142,28 @@ impl CardSession {
         }
     }
 
+    /// v1.23 审批等待可视化：chunk 静默期的心跳 patch——卡片 footer 的运行
+    /// 时长继续走动（run_secs 随 patch 刷新），审批等待时阶段翻
+    /// WaitingApproval。仅在距上次 patch ≥ HEARTBEAT 时动作（不冲击 500ms
+    /// 节流语义）。`waiting` = 当前有权限审批 pending。
+    pub(crate) async fn heartbeat(
+        &mut self,
+        waiting: bool,
+        conv: &ConvId,
+        hint: &ReplyHint,
+        platform: &dyn Platform,
+    ) {
+        const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(25);
+        if self.msg_id.is_none() || self.last_patch.elapsed() < HEARTBEAT {
+            return;
+        }
+        if waiting {
+            self.phase = CardPhase::WaitingApproval;
+        }
+        self.dispatch_card(CardTerminal::Running, conv, hint, platform)
+            .await;
+    }
+
     /// 累积文本增量，节流 patch（Running 态）；阶段翻到「输出中」。
     pub(crate) async fn append_text(
         &mut self,
@@ -963,5 +985,39 @@ mod tests {
             "窗口内的尾帧应 flush 上卡（累积文本）: {updates:?}"
         );
         rm_db(&db);
+    }
+    /// v1.23 心跳：静默 ≥25s 才 patch（节流语义不破坏）；waiting=true 翻
+    /// WaitingApproval 阶段（footer 文案由平台渲染）。
+    #[tokio::test]
+    async fn heartbeat_patches_when_stale_and_flips_waiting_phase() {
+        let platform = RecordingCardPlatform {
+            name: "rec",
+            update_fails: false,
+            updates: StdMutex::new(Vec::new()),
+            run_secs_seen: StdMutex::new(Vec::new()),
+        };
+        let p = &platform as &dyn Platform;
+        let (store, _db) = tmp_store("hb").await;
+        let conv = ConvId("c1".into());
+        let mut cs = CardSession::new(store, conv.clone(), platform.name(), Default::default());
+        let hint = ReplyHint::None;
+        cs.append_text("hi", &conv, &hint, p).await;
+        let updates_after_append = platform.updates.lock().unwrap().len();
+        // 刚 patch 过：心跳应跳过（< 25s）。
+        cs.heartbeat(false, &conv, &hint, p).await;
+        assert_eq!(
+            platform.updates.lock().unwrap().len(),
+            updates_after_append,
+            "25s 内心跳不应 patch"
+        );
+        // 模拟静默超窗：回拨 last_patch。
+        cs.last_patch = std::time::Instant::now() - std::time::Duration::from_secs(30);
+        cs.heartbeat(false, &conv, &hint, p).await;
+        assert!(platform.updates.lock().unwrap().len() > updates_after_append);
+        assert_eq!(cs.phase, CardPhase::Outputting, "非 waiting 不改阶段");
+        // waiting=true：阶段翻 WaitingApproval。
+        cs.last_patch = std::time::Instant::now() - std::time::Duration::from_secs(30);
+        cs.heartbeat(true, &conv, &hint, p).await;
+        assert_eq!(cs.phase, CardPhase::WaitingApproval);
     }
 }
