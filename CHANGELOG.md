@@ -2,6 +2,20 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.25.1] — 2026-09-09
+
+> **真机修复**：两处用户可见缺陷（水位提示失效 + webhook 轮整卡拒收）。
+
+### Fixed
+- **水位提示在比例档下每轮误报**：80k 硬阈是 120k 窗口时代遗留，「80k~
+  阈值之间提示」的条件在 1M×0.8 比例档下 86k 也触发（每轮噪音）。改为
+  **仅自动压缩关闭档**提醒；且从污染 agent 回复正文改为独立命令卡（带
+  /compact 按钮），per-conv 1h 去重
+- **webhook/cron 合成消息轮次整卡被飞书拒收**（降级纯文本）：发起者
+  `<at>` 标注未校验 sender 形态，`webhook:ci` 等非 open_id 直接拼进 at
+  标签触发 100290 "invalid user resource"——sender_anchor_line 只对
+  `ou_` 前缀渲染，合成来源跳过标注行
+
 ## [1.25.0] — 2026-09-09
 
 > **交互深化批次**（竞品对标后聚焦飞书-Claude Code 链路）：引用消息作

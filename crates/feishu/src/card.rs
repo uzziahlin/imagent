@@ -243,7 +243,11 @@ pub(crate) fn sender_anchor_line(
     sender: Option<&str>,
     is_group: bool,
 ) -> Option<serde_json::Value> {
-    let s = sender.filter(|s| !s.is_empty())?;
+    // v1.25.1 真机修复：只对合法 open_id（ou_ 前缀）渲染 <at>——合成消息的
+    // sender（webhook:ci / 定时任务等非 ou_ 形态）此前直接拼进 at 标签，
+    // 飞书校验 "invalid user resource" 整卡拒收（230099/100290），CardSession
+    // 连续建卡失败后降级纯文本。合成来源跳过标注行（无发起者语义）。
+    let s = sender.filter(|s| s.starts_with("ou_") && !s.is_empty())?;
     if !is_group {
         return None;
     }
@@ -3341,6 +3345,20 @@ mod tests {
             "内容不丢: {json}"
         );
     }
+    /// v1.25.1 真机修复：非 ou_ 形态的 sender（webhook:ci 等合成来源）不渲染
+    /// <at> 标注——此前非法 at 标签导致整卡被飞书拒收（100290）降级纯文本。
+    #[test]
+    fn sender_anchor_requires_open_id_form() {
+        // 合法 open_id：渲染 at 标注。
+        assert!(sender_anchor_line(Some("ou_abc123"), true).is_some());
+        // 合成来源 / 空：跳过（防整卡拒收）。
+        assert!(sender_anchor_line(Some("webhook:ci"), true).is_none());
+        assert!(sender_anchor_line(Some(""), true).is_none());
+        assert!(sender_anchor_line(None, true).is_none());
+        // 私聊：即使合法也不加。
+        assert!(sender_anchor_line(Some("ou_abc123"), false).is_none());
+    }
+
     /// 卡片 UX 批（v1.24）：成功终态卡带「再跑/导出」快捷动作 + summary 结论。
     #[test]
     fn done_card_has_quick_actions_and_summary() {

@@ -795,28 +795,48 @@ impl Dispatcher {
                 .count();
             reply.push_str(&format!("\n\n📋 计划进度：{}/{} 完成", done, todos.len()));
         }
-        // Wave B-9：上下文水位提示——本轮输入 token 超过 80k 时提醒压缩。
-        // W2-5：自动压缩开启时不重复提醒（超阈值将自动 /compact，用户无需动作）；
-        // 仅在自动压缩关闭（阈值 0）或水位在 80k~阈值之间时提示。
-        // 取舍：OutboundCard 的 footer 无自由文本通道，提示追加在回复正文末尾
-        //（卡片/纯文本两条路径都可见，语义同为「完成后给用户的建议」）。
-        // v1.18 review（agent-1 #7）：提示口径与触发口径统一为 input + cached
-        // （ctx_tokens）——此前提示用 input_tokens 裸值：缓存主导的会话（真机
-        // 实测 input 182 / cached 12 万）提示永不触发、且与自动压缩判据各说
-        // 各话。auto_threshold==0（关闭）时才提示。
+        // Wave B-9：上下文水位提示——**仅在自动压缩关闭（阈值 0）时**提醒手动
+        // /compact。v1.25.1 真机修复：此前「80k~阈值之间也提示」的条件在比例档
+        //（1M×0.8=800k）下 80k~800k 每轮触发（86k 也提示）——80k 硬阈是 120k
+        // 窗口时代遗留，比例档激活时超阈自动压缩会处理，中间态提示纯噪音。
+        // 形态修复：不再追加进回复正文（污染 agent 产出），改独立命令卡（带
+        // /compact 按钮）；per-conv 1h 去重防连发。口径：input + cached。
         let ctx_tokens =
             |u: &crate::types::UsageStats| u.input_tokens + u.cached_tokens.unwrap_or(0);
         let auto_threshold = self
             .auto_compact_threshold
             .load(std::sync::atomic::Ordering::Relaxed);
         let watermark = outcome.usage.as_ref().map(ctx_tokens);
-        if watermark.is_some_and(|n| n > 80_000)
-            && (auto_threshold == 0 || watermark.is_some_and(|n| n < auto_threshold))
-        {
+        if auto_threshold == 0 && watermark.is_some_and(|n| n > 80_000) {
             let n = watermark.unwrap_or(0);
-            reply.push_str(&format!(
-                "\n\n📊 当前上下文约 {n} tokens，较大，建议 /compact。"
-            ));
+            let now = now_secs();
+            let should_notice = {
+                let mut last = self.watermark_notice_last.lock().await;
+                let hit = last.get(&conv.0).copied().unwrap_or(0) + 3600 <= now;
+                if hit {
+                    last.retain(|_, ts| now - *ts < 7200);
+                    last.insert(conv.0.clone(), now);
+                }
+                hit
+            };
+            if should_notice {
+                let _ = self
+                    .platform
+                    .send_command_card(
+                        &conv,
+                        "📊 上下文水位",
+                        &format!(
+                            "当前上下文约 **{n}** tokens，较大（自动压缩已关闭）。\n\n建议 /compact 生成摘要重置，或配置 auto_compact_window_ratio 让其自动处理。"
+                        ),
+                        &[crate::types::CardButton {
+                            label: "🧠 立即压缩".into(),
+                            command: "/compact".into(),
+                            style: crate::types::CardButtonStyle::Primary,
+                        }],
+                        &hint,
+                    )
+                    .await;
+            }
         }
         // v1.23 指令复用：成功轮 prompt 落 `last_success_prompt:<conv>`（与
         // 失败轮的 last_prompt 分键互不干扰）——/again 与失败卡的对称物。
