@@ -543,6 +543,8 @@ pub struct Dispatcher {
     /// 报错）时每个水位超阈的成功轮都重试并发两张卡 + 跑一次完整 agent，
     /// 失败后 1 小时内不再自动尝试（手动 /compact 不受限）。
     compact_fail_last: Mutex<HashMap<String, i64>>,
+    /// v1.25.1：水位提示卡 per-conv 1h 去重（仅自动压缩关闭档触发）。
+    watermark_notice_last: Mutex<HashMap<String, i64>>,
     /// per-conv 最近一次 `/resume` 渲染的列表（P4-11）：序号选择取缓存，
     /// 防两次调用间本机会话 mtime 变化导致错位；S-16：选中不移除条目（防序号
     /// 前移错位），陈旧由 D7 的 TTL 惰性过期兜底。
@@ -675,6 +677,7 @@ impl Dispatcher {
             budget_notice_last: Mutex::new(HashMap::new()),
             queue_cap_notice_last: Mutex::new(HashMap::new()),
             compact_fail_last: Mutex::new(HashMap::new()),
+            watermark_notice_last: Mutex::new(HashMap::new()),
             shortcuts: Arc::new(std::sync::RwLock::new(HashMap::new())),
             resume_cache: Mutex::new(HashMap::new()),
             pending_hint_last: Mutex::new(HashMap::new()),
