@@ -1120,6 +1120,52 @@ pub async fn fetch_token(
 /// v1.23 说话人归属：open_id → 展示名（GET contact/v3/users/{id}）。
 /// 需 `contact:user.base:readonly` 权限——无权限/接口失败由调用方 fail-soft
 ///（标注回退 open_id 短版），不阻塞消息路径。
+/// v1.25 引用上下文：拉单条消息（GET /im/v1/messages/{id}）——返回
+/// (message_type, content JSON 原文)。需 bot 所在会话的消息读权限
+///（im:message:readonly）；失败由调用方 fail-soft。
+pub async fn fetch_message_raw(
+    core_config: &CoreConfig,
+    token: &str,
+    message_id: &str,
+) -> imagent_core::Result<(String, String)> {
+    let base = core_config.base_url().trim_end_matches('/').to_string();
+    let url = format!("{base}/open-apis/im/v1/messages/{message_id}?user_id_type=open_id");
+    let client = api_client().clone();
+    let resp = client
+        .get(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| {
+            imagent_core::CoreError::Platform(PLATFORM, format!("fetch_message_raw: {e}"))
+        })?;
+    let v: serde_json::Value = resp.json().await.map_err(|e| {
+        imagent_core::CoreError::Platform(PLATFORM, format!("fetch_message_raw: {e}"))
+    })?;
+    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
+        return Err(imagent_core::CoreError::Platform(
+            PLATFORM,
+            format!("fetch_message_raw: code={code} {msg}"),
+        ));
+    }
+    let mt = v
+        .pointer("/data/items/0/msg_type")
+        .or_else(|| v.pointer("/data/msg_type"))
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_string();
+    let content = v
+        .pointer("/data/items/0/body/content")
+        .or_else(|| v.pointer("/data/body/content"))
+        .or_else(|| v.pointer("/data/items/0/content"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string();
+    Ok((mt, content))
+}
+
 pub async fn fetch_user_display_name(
     core_config: &CoreConfig,
     token: &str,

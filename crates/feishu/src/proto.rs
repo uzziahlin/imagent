@@ -125,6 +125,22 @@ impl MessageMention {
 /// 近期消息（client::bot_sent_recently）时事件循环放宽 require_mention——
 /// 群里纯图片/文件无法携带 @（手机端无富文本合成路径），回复 bot 的消息本身
 /// 即显式定向。仅群（chat_type=group）且 parent 非空返回 Some。
+/// v1.25 引用上下文：被引用消息正文 → 纯文本（text 取 JSON text 字段；
+/// post 复用 parse_post 的文本提取）。空/不支持类型返回 None。
+pub fn quoted_context_text(msg_type: &str, content: &str) -> Option<String> {
+    let text = match msg_type {
+        "text" => serde_json::from_str::<serde_json::Value>(content)
+            .ok()?
+            .get("text")?
+            .as_str()?
+            .trim()
+            .to_string(),
+        "post" => parse_post(content, None)?.0?.trim().to_string(),
+        _ => return None,
+    };
+    (!text.is_empty()).then_some(text)
+}
+
 pub(crate) fn peek_group_reply_parent(payload: &[u8]) -> Option<String> {
     #[derive(serde::Deserialize)]
     struct P {
@@ -1870,6 +1886,21 @@ mod tests {
     }
 
     /// p2p 文本：conv=feishu:<open_id>、sender=open_id、text 正确、dedup=event_id。
+    #[test]
+    fn quoted_context_text_variants() {
+        // v1.25 引用上下文：text 取 JSON text；post 复用 parse_post；空/不支持 None。
+        assert_eq!(
+            quoted_context_text("text", r#"{"text":"被引用的内容"}"#).as_deref(),
+            Some("被引用的内容")
+        );
+        let post =
+            r#"{"content":[[{"tag":"text","text":"第一行"},{"tag":"text","text":"第二行"}]]}"#;
+        let got = quoted_context_text("post", post).unwrap_or_default();
+        assert!(got.contains("第一行") && got.contains("第二行"), "{got}");
+        assert!(quoted_context_text("text", r#"{"text":"  "}"#).is_none());
+        assert!(quoted_context_text("image", "{}").is_none());
+    }
+
     #[test]
     fn parse_p2p_text() {
         let payload = br#"{

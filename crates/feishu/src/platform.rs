@@ -469,7 +469,16 @@ impl FeishuPlatform {
                         }
                     }
                     let conv_key = msg.conv_id.0.clone();
-                    let job = if pending.is_empty() {
+                    // v1.25 引用上下文：回复（parent_id）消息拉被引用正文前置进
+                    // prompt——群聊引用追问是 Slack 线程上下文的等价物。守卫：
+                    // ①短文本（≤4 字符，疑似 y/n 审批回复）不加引，防破坏
+                    // 审批路由；②拉取失败 fail-soft 原样发送。与媒体处理合流
+                    // 到同一异步作业（保序经泵）。
+                    let quote_parent = crate::proto::peek_group_reply_parent(&payload)
+                        .filter(|p| p.starts_with("om_"))
+                        .filter(|_| msg.text.as_deref().is_some_and(|t| t.trim().len() > 4));
+                    let needs_async = !pending.is_empty() || quote_parent.is_some();
+                    let job = if !needs_async {
                         PumpJob::Ready(msg)
                     } else {
                         let token_lock = token_for_drain.clone();
@@ -478,6 +487,18 @@ impl FeishuPlatform {
                         let sec = app_secret_for_drain.clone();
                         let pending = pending.clone();
                         PumpJob::Media(tokio::spawn(async move {
+                            let mut msg = msg;
+                            if let Some(parent_id) = quote_parent.as_deref() {
+                                enrich_with_quote(
+                                    &mut msg,
+                                    parent_id,
+                                    &token_lock,
+                                    &cfg,
+                                    &aid,
+                                    &sec,
+                                )
+                                .await;
+                            }
                             process_pending_media(
                                 msg,
                                 &pending,
@@ -1886,6 +1907,38 @@ fn sweep_media_dir_at(dir: &std::path::Path, retention: std::time::Duration) -> 
 /// 记 media_errors，不丢整条消息（语义与原内联实现一致，含 token 失效码
 /// 清缓存重试一次）。
 #[allow(clippy::too_many_arguments)]
+/// v1.25 引用上下文：拉被引用消息正文并前置进 prompt（fail-soft——
+/// 权限缺失/网络失败原样通过，仅 debug 留痕）。
+async fn enrich_with_quote(
+    msg: &mut InboundMessage,
+    parent_id: &str,
+    token_lock: &Arc<RwLock<Option<(String, Instant)>>>,
+    cfg: &CoreConfig,
+    aid: &str,
+    sec: &str,
+) {
+    let fetched = async {
+        let t = fetch_cached_token(token_lock, cfg, aid, sec).await?;
+        crate::client::fetch_message_raw(cfg, &t, parent_id).await
+    }
+    .await;
+    match fetched {
+        Ok((mt, content)) => {
+            if let Some(quote) = crate::proto::quoted_context_text(&mt, &content) {
+                let quote: String = quote.chars().take(500).collect();
+                let base = msg.text.take().unwrap_or_default();
+                msg.text = Some(format!(
+                    "（用户引用了以下消息，针对它追问）:\n> {}\n\n{base}",
+                    quote.replace('\n', "\n> ")
+                ));
+            }
+        }
+        Err(e) => {
+            debug!(target: "feishu", error = %e, parent_id, "引用消息拉取失败（原样发送）");
+        }
+    }
+}
+
 async fn process_pending_media(
     mut msg: InboundMessage,
     pending: &[crate::proto::PendingMedia],
