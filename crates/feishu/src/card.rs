@@ -203,6 +203,10 @@ pub(crate) fn terminal_done_footer(run_secs: u64, usage_display: Option<&str>) -
     if let Some(u) = usage_display {
         out.push_str(&format!(" · {u}"));
     }
+    // v1.25：完成时刻（HH:MM 本地）——隔天翻旧卡可辨是什么时候跑完的。
+    use chrono::Timelike;
+    let now = chrono::Local::now();
+    out.push_str(&format!(" · {:02}:{:02}", now.hour(), now.minute()));
     out
 }
 
@@ -1634,15 +1638,18 @@ fn try_paired_rows(
 ) -> Option<Vec<serde_json::Value>> {
     let rows = table_rows(body_md)?;
     let data = &rows[1..];
-    // 行配对模式（v1.24 扩展）：按钮「接管 N」（/resume，行首=序号）或
-    // 「切换 X」（/sessions，行首=名称）——后缀与行首键精确匹配。
+    // 行配对模式（v1.24 扩展 / v1.25 泛化）：按钮「<动作> <键>」与行首键
+    // 精确匹配——接管（/resume 序号）/ 切换（/sessions 名称）；使用/删除
+    // （/ws）/ 暂停/恢复（/cron）/ 丢弃（/queue）走多钮分支（一行可配多枚）。
+    const SINGLE_PREFIXES: &[&str] = &["接管 ", "切换 "];
+    const MULTI_PREFIXES: &[&str] = &["使用 ", "删除 ", "暂停 ", "恢复 ", "丢弃 "];
     let pair_idx: Option<Vec<(&str, usize)>> = buttons
         .iter()
         .enumerate()
         .map(|(i, b)| {
-            b.label
-                .strip_prefix("接管 ")
-                .or_else(|| b.label.strip_prefix("切换 "))
+            SINGLE_PREFIXES
+                .iter()
+                .find_map(|p| b.label.strip_prefix(p))
                 .map(|s| (s, i))
         })
         .collect::<Option<Vec<_>>>();
@@ -1659,13 +1666,10 @@ fn try_paired_rows(
                 continue;
             }
         } else {
-            // /ws 模式：按名称配「使用 X」/「删除 X」两钮。
+            // 多钮模式：按行首键配「使用/删除/暂停/恢复/丢弃 X」。
             let mut row_btns: Vec<usize> = Vec::new();
             for (i, b) in buttons.iter().enumerate() {
-                let name = b
-                    .label
-                    .strip_prefix("使用 ")
-                    .or_else(|| b.label.strip_prefix("删除 "));
+                let name = MULTI_PREFIXES.iter().find_map(|p| b.label.strip_prefix(p));
                 if name == Some(key.as_str()) {
                     row_btns.push(i);
                 }
@@ -3207,12 +3211,14 @@ mod tests {
     /// 无 usage 省成本段；时长格式化分档。
     #[test]
     fn terminal_done_footer_carries_run_len() {
-        assert_eq!(
-            terminal_done_footer(1800, Some("$0.012")),
-            "✅ 已完成 · 30m · $0.012"
+        let f = terminal_done_footer(1800, Some("$0.012"));
+        assert!(f.starts_with("✅ 已完成 · 30m · $0.012 · "), "footer: {f}");
+        assert!(
+            f.ends_with('m') || f.chars().rev().take(1).all(|c| c.is_ascii_digit()),
+            "尾随 HH:MM: {f}"
         );
-        assert_eq!(terminal_done_footer(42, None), "✅ 已完成 · 42s");
-        assert_eq!(terminal_done_footer(0, None), "✅ 已完成 · 0s");
+        assert!(terminal_done_footer(42, None).starts_with("✅ 已完成 · 42s · "));
+        assert!(terminal_done_footer(0, None).starts_with("✅ 已完成 · 0s · "));
         assert_eq!(format_run_len(750), "12m");
         assert_eq!(format_run_len(3661), "1h01m");
         assert_eq!(format_run_len(90000), "1d1h");
@@ -3230,7 +3236,7 @@ mod tests {
             run_secs: 1800,
         };
         let json = render_card(&card, "feishu:ou_t", None);
-        assert!(json.contains("✅ 已完成 · 30m · $0.5"), "footer: {json}");
+        assert!(json.contains("✅ 已完成 · 30m · $0.5 · "), "footer: {json}");
     }
 
     /// Wave B-11：失败终态卡补「🩺 自检」按钮——value 编码 /doctor 命令（回调

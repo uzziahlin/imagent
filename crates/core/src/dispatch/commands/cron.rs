@@ -277,8 +277,11 @@ impl Dispatcher {
                         .await;
                     return;
                 }
-                let mut body = String::from("⏰ 本会话定时任务：");
-                for j in jobs {
+                // v1.25 卡片化：表格 + 每行「启停/删除」按钮（配对行布局；
+                // 权限校验在命令层不变）。
+                let mut body = String::from("| id | 下次 | 任务 |\n|---|---|---|");
+                let mut buttons: Vec<crate::types::CardButton> = Vec::new();
+                for j in &jobs {
                     // v1.18 review：优先展示调度器权威的 next_run（触发时已按实际
                     // fire 时刻顺延）——此前从 last_run 重算，停机跨过首跑的任务
                     // 会显示一个过去的「下次执行」直到下个 tick。
@@ -294,23 +297,42 @@ impl Dispatcher {
                             .and_then(|s| s.next_after(j.created_at))
                             .unwrap_or(j.next_run)
                     };
-                    let enabled_mark = if j.enabled {
-                        String::new()
+                    let next_disp = if j.enabled {
+                        format_local(next)
                     } else {
-                        // v1.21：停用原因不再只有「表达式无解」（失权自动停用/
-                        // 手动 disable），列表只标状态不猜原因。
-                        "〔已停用，/cron enable 可恢复〕".to_string()
+                        // v1.21：停用原因不猜（失权自动停用/手动 disable 同形态）。
+                        format!("已停用（原定 {}）", format_local(next))
                     };
                     body.push_str(&format!(
-                        "\n- `{}` `{}`（下次 {}）{} → {}",
+                        "\n| {} | {} | {} |",
                         j.id,
-                        j.expr,
-                        format_local(next),
-                        enabled_mark,
-                        truncate_str(&j.prompt, 40)
+                        next_disp,
+                        truncate_str(&j.prompt, 40).replace('|', "\\|")
                     ));
+                    // 启停 toggle（按当前状态给反向动作）+ 删除（危险钮自带确认）。
+                    buttons.push(if j.enabled {
+                        crate::types::CardButton {
+                            label: format!("暂停 {}", j.id),
+                            command: format!("/cron disable {}", j.id),
+                            style: crate::types::CardButtonStyle::Default,
+                        }
+                    } else {
+                        crate::types::CardButton {
+                            label: format!("恢复 {}", j.id),
+                            command: format!("/cron enable {}", j.id),
+                            style: crate::types::CardButtonStyle::Default,
+                        }
+                    });
+                    buttons.push(crate::types::CardButton {
+                        label: format!("删除 {}", j.id),
+                        command: format!("/cron rm {}", j.id),
+                        style: crate::types::CardButtonStyle::Danger,
+                    });
                 }
-                self.reply(conv, &body, hint).await;
+                // 行按钮上限 18（9 行 × 2 钮；更长列表退化为文本序号操作）。
+                buttons.truncate(18);
+                self.reply_card(conv, "⏰ 定时任务", &body, buttons, hint)
+                    .await;
             }
             "rm" => {
                 let Some(id) = parts.get(2) else {

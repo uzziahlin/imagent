@@ -22,6 +22,7 @@ pub(super) const COMMAND_GROUPS: &[(&str, &[&str])] = &[
             "/compact",
             "/retry",
             "/again",
+            "/last",
         ],
     ),
     ("📁 目录与文件", &["/cd", "/ws", "/img", "/file"]),
@@ -267,6 +268,10 @@ impl Dispatcher {
                     }
                     "/compact" => {
                         self.cmd_compact(&conv, &hint).await;
+                        return;
+                    }
+                    "/last" => {
+                        self.cmd_last(&conv, &hint).await;
                         return;
                     }
                     "/again" => {

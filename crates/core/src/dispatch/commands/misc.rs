@@ -1059,12 +1059,84 @@ impl Dispatcher {
                 .await;
             return;
         }
-        let mut body = String::from("📋 排队中的消息（下一轮合并执行）：");
+        // v1.25 卡片化：表格 + 前 9 条各带「丢弃」按钮（配对行布局；权限
+        // 校验在 drop 命令层不变）。发送者用展示名（v1.23 sender_name）回退
+        // 短 id。
+        let mut body = String::from("| # | 发送者 | 内容 |\n|---|---|---|");
         for (i, (s, snippet)) in list.iter().enumerate() {
-            body.push_str(&format!("\n{}. 【{s}】{snippet}", i + 1));
+            let who = s.rsplit_once('_').map(|(_, t)| t).unwrap_or(s.as_str());
+            let who: String = who.chars().take(8).collect();
+            body.push_str(&format!(
+                "\n| {} | {}… | {} |",
+                i + 1,
+                who,
+                snippet.replace('|', "\\|")
+            ));
         }
-        body.push_str("\n\n丢弃某条：/queue drop <序号>（仅自己的或 admin）。");
-        self.reply(conv, &body, hint).await;
+        let buttons: Vec<crate::types::CardButton> = (1..=list.len().min(9))
+            .map(|n| crate::types::CardButton {
+                label: format!("丢弃 {n}"),
+                command: format!("/queue drop {n}"),
+                style: crate::types::CardButtonStyle::Danger,
+            })
+            .collect();
+        self.reply_card(conv, "📋 排队中的消息", &body, buttons, hint)
+            .await;
+    }
+
+    /// /last —— 回看本会话最近一次成功轮（v1.25）：任务摘要 + 结论 + 耗时/
+    /// 成本。长会话翻旧结论不再滚屏或全量 /export。
+    pub(super) async fn cmd_last(&self, conv: &ConvId, hint: &ReplyHint) {
+        let row = self
+            .store
+            .get_config(&format!("last_round:{}", conv.0))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+        let Some(v) = row else {
+            self.reply(
+                conv,
+                "本会话还没有可回看的完成轮（成功跑完一轮后可 /last 回看）。",
+                hint,
+            )
+            .await;
+            return;
+        };
+        let gets = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let prompt = gets("prompt");
+        let head = gets("head");
+        let secs = v.get("secs").and_then(|x| x.as_u64()).unwrap_or(0);
+        let usage = gets("usage");
+        let at = v.get("at").and_then(|x| x.as_i64()).unwrap_or(0);
+        let mut body = format!(
+            "**🎯 任务**\n{}\n\n**✅ 结论**\n{}",
+            super::super::truncate_str(prompt.trim(), 80),
+            super::super::truncate_str(head.trim(), 400)
+        );
+        let run = if secs < 60 {
+            format!("{secs}s")
+        } else {
+            format!("{}m{}s", secs / 60, secs % 60)
+        };
+        body.push_str(&format!("\n\n⏱ {} · {}", run, super::format_rel_ts(at)));
+        if !usage.is_empty() {
+            body.push_str(&format!(" · {usage}"));
+        }
+        let buttons = vec![
+            crate::types::CardButton {
+                label: "🔁 再跑一次".into(),
+                command: "/again".into(),
+                style: crate::types::CardButtonStyle::Primary,
+            },
+            crate::types::CardButton {
+                label: "📄 导出会话".into(),
+                command: "/export".into(),
+                style: crate::types::CardButtonStyle::Default,
+            },
+        ];
+        self.reply_card(conv, "🕘 上一轮", &body, buttons, hint)
+            .await;
     }
 
     /// /stats [today|7d|all] —— token 用量/成本统计（默认 7d）。全局 + 本会话
@@ -1285,7 +1357,7 @@ impl Dispatcher {
 
     /// /help —— 命令总表（P6-3：飞书等卡片平台带常用命令按钮）。
     pub(super) async fn cmd_help(&self, conv: &ConvId, hint: &ReplyHint) {
-        let mut body = "🗂 会话\n- /new 重置会话\n- /switch <name> 切换/新建命名会话\n- /sessions 列出命名会话\n- /resume [n] 恢复历史/本机会话\n- /compact 压缩上下文\n- /retry 重试最近一轮（失败后一键续接）· /again 再跑最近一次成功指令\n- /export [n] 导出当前（或 /resume 序号）会话为 Markdown\n\n📁 目录与文件\n- /cd <path> 切工作目录\n- /ws save|use|remove <name> 命名工作空间\n- /img <path> 发图片 · /file <path> 发文件\n\n🛡️ 权限与运行\n- /perm <off|allow|deny|ask> 权限模式 · /perm list 查看会话授权 · /perm revoke <工具> 撤销\n- /stop 中断任务（排队消息保留并自动续跑；/stop all 全部丢弃）\n- /queue [drop <n>] 查看/丢弃排队中的消息\n- /timeout <分钟|off|default> 会话级空闲看门狗\n- /cron add <分 时 日 月 周> <指令> 定时执行（本地时区）· /cron list · rm/enable/disable <id>\n- /model [名称|default] 查看/切换模型（切换需管理员）\n\n🧪 状态与诊断\n- /status 状态 · /doctor 自检 · /reconnect 重连\n- /config [k v] 查看/热改配置 · /audit [n] 审计日志\n\n👥 白名单与管理（管理员）\n- /allow、/disallow 授权/撤权（飞书群内可 @ 对方）\n- /chat allow|deny|allow-all|list 会话白名单\n- /admin list|add|remove 管理员\n- /list 白名单 · /whoami 我的 id\n\n💬 会话规则：群主时间线直接 @我 = 续同一会话；点消息「回复」进话题 = 开独立会话（互不共享上下文/待办）。\n\n其他内容直接发给 agent 即可（运行中发文字会实时转入当前轮次、下个工具边界生效 👀；图片/文件等媒体走排队、合并进下一轮 ⏳）。".to_string();
+        let mut body = "🗂 会话\n- /new 重置会话\n- /switch <name> 切换/新建命名会话\n- /sessions 列出命名会话\n- /resume [n] 恢复历史/本机会话\n- /compact 压缩上下文\n- /retry 重试最近一轮（失败后一键续接）· /again 再跑最近成功指令\n- /last 回看上一轮（任务+结论+耗时）\n- /export [n] 导出当前（或 /resume 序号）会话为 Markdown\n\n📁 目录与文件\n- /cd <path> 切工作目录\n- /ws save|use|remove <name> 命名工作空间\n- /img <path> 发图片 · /file <path> 发文件\n\n🛡️ 权限与运行\n- /perm <off|allow|deny|ask> 权限模式 · /perm list 查看会话授权 · /perm revoke <工具> 撤销\n- /stop 中断任务（排队消息保留并自动续跑；/stop all 全部丢弃）\n- /queue [drop <n>] 查看/丢弃排队中的消息\n- /timeout <分钟|off|default> 会话级空闲看门狗\n- /cron add <分 时 日 月 周> <指令> 定时执行（本地时区）· /cron list · rm/enable/disable <id>\n- /model [名称|default] 查看/切换模型（切换需管理员）\n\n🧪 状态与诊断\n- /status 状态 · /doctor 自检 · /reconnect 重连\n- /config [k v] 查看/热改配置 · /audit [n] 审计日志\n\n👥 白名单与管理（管理员）\n- /allow、/disallow 授权/撤权（飞书群内可 @ 对方）\n- /chat allow|deny|allow-all|list 会话白名单\n- /admin list|add|remove 管理员\n- /list 白名单 · /whoami 我的 id\n\n💬 会话规则：群主时间线直接 @我 = 续同一会话；点消息「回复」进话题 = 开独立会话（互不共享上下文/待办）。\n\n其他内容直接发给 agent 即可（运行中发文字会实时转入当前轮次、下个工具边界生效 👀；图片/文件等媒体走排队、合并进下一轮 ⏳）。".to_string();
         // v1.23：动态追加 shortcuts 段——快捷命令此前零发现性（忘了名字就
         // 永久失联，只能翻 config.toml）。
         {
