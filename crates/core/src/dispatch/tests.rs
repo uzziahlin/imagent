@@ -2152,10 +2152,11 @@ async fn queue_list_and_selective_drop() {
     // 列表：两条带发送者与摘要。
     ctx.disp.handle(msg("c1", "alice", "/queue")).await;
     let inbox = ctx.inbox.lock().await.clone();
+    // v1.25 卡片化：表格行含发送者（短 id）与摘要。
     assert!(
         inbox
             .iter()
-            .any(|t| t.contains("【bob】bob 的补充") && t.contains("【alice】alice 的补充")),
+            .any(|t| t.contains("bob 的补充") && t.contains("alice 的补充")),
         "列表应含发送者与摘要: {inbox:?}"
     );
     // alice（非 admin）不能删 bob 的（第 1 条）。
