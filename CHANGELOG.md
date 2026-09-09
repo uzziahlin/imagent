@@ -2,6 +2,30 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.25.0] — 2026-09-09
+
+> **交互深化批次**（竞品对标后聚焦飞书-Claude Code 链路）：引用消息作
+> 上下文、/cron //queue 卡片化带按钮、/last 回看、/help 折叠分组、工具
+> 类型图标。全仓 687 tests / 0 failed、clippy 零警告。
+
+### Added
+- **引用消息作上下文**：群聊「回复引用 + @bot 追问」时拉被引用消息正文
+  进 prompt（前置引用块，截 500 字）——Slack 线程上下文的飞书等价物；
+  短文本守卫防破坏 y/n 审批路由；fail-soft（需 im:message:readonly）
+- **/last 回看上一轮**：最近成功轮的任务摘要+结论+耗时/成本（附再跑/
+  导出按钮）——长会话翻旧结论不再滚屏或全量 /export
+- **/cron list 卡片化**：每行「暂停/恢复」toggle + 「删除」危险钮（自带
+  二次确认）——enable/disable/rm 命令终于有按钮入口
+- **/queue 卡片化**：前 9 条各带「丢弃」按钮（配对行布局）
+- **/help 折叠面板分组**：30+ 命令收纳为 🚀 常用（展开）+ 六组折叠面板
+  （collapsible_panel 复用；纯文本平台平铺紧凑形态）
+- 终态 footer 补完成时刻（✅ 已完成 · 30m · $0.012 · 14:32）
+
+### Changed
+- 工具行加类型图标：📖 Read / ✏️ Edit / ⚡ Bash / 🔍 Grep / 🌐 WebFetch /
+  📋 Task*·Todo / 🔌 mcp__* / 🔧 其他（卡片/文本两形态）
+- 配对行按钮约定泛化：一行可配多枚（使用/删除/暂停/恢复/丢弃）
+
 ## [1.24.0] — 2026-09-08
 
 > **飞书卡片交互与美化批次**（三批 12 项）：成功终态快捷动作、审批到达
