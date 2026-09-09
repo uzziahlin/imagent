@@ -1530,6 +1530,64 @@ fn render_cmd_button(b: &CardButton, conv_id: &str) -> serde_json::Value {
 /// text_size 支持性**待真机校准**，不支持时退化为独立元素+空行亦成立）；
 /// 其余块原样。不再是一整块 400+ 字符 markdown。
 fn body_block_elements(body_md: &str) -> Vec<serde_json::Value> {
+    // v1.25 折叠围栏：`:::collapse 标题` … `:::`（`+` 变体默认展开）→
+    // collapsible_panel 元素（/help 长命令表分组收纳）。围栏外的段落走
+    // 既有块逻辑；纯文本平台不会收到围栏（core 按平台选择形态）。
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    let mut plain = String::new();
+    let mut fence: Option<(bool, String, String)> = None; // (expanded, title, inner)
+    for line in body_md.lines() {
+        let trimmed = line.trim();
+        if let Some((expand, title)) = trimmed
+            .strip_prefix(":::collapse+ ")
+            .map(|t| (true, t.to_string()))
+            .or_else(|| {
+                trimmed
+                    .strip_prefix(":::collapse ")
+                    .map(|t| (false, t.to_string()))
+            })
+        {
+            if !plain.trim().is_empty() {
+                out.extend(plain_block_elements(&plain));
+                plain.clear();
+            }
+            fence = Some((expand, title, String::new()));
+            continue;
+        }
+        if trimmed == ":::" {
+            if let Some((expand, title, inner)) = fence.take() {
+                let inner_els = plain_block_elements(&inner);
+                out.push(serde_json::json!({
+                    "tag": "collapsible_panel",
+                    "expanded": expand,
+                    "header": panel_header(&title),
+                    "border": { "color": "grey", "corner_radius": "5px" },
+                    "vertical_spacing": "8px",
+                    "padding": "8px 8px 8px 8px",
+                    "elements": inner_els
+                }));
+            }
+            continue;
+        }
+        match fence.as_mut() {
+            Some((_, _, inner)) => {
+                inner.push_str(line);
+                inner.push('\n');
+            }
+            None => {
+                plain.push_str(line);
+                plain.push('\n');
+            }
+        }
+    }
+    if !plain.trim().is_empty() {
+        out.extend(plain_block_elements(&plain));
+    }
+    out
+}
+
+/// 无围栏正文的原有块逻辑（body_block_elements 拆出）。
+fn plain_block_elements(body_md: &str) -> Vec<serde_json::Value> {
     let mut out: Vec<serde_json::Value> = Vec::new();
     for block in body_md.split("\n\n").filter(|b| !b.trim().is_empty()) {
         let mut lines = block.lines().peekable();
@@ -1945,7 +2003,7 @@ mod tests {
         assert!(json.contains("collapsible_panel"), "折叠面板: {json}");
         assert!(json.contains("corner_radius"), "面板边框: {json}");
         assert!(json.contains("notation"), "小字号: {json}");
-        assert!(json.contains("✅ **Read**"), "工具状态行: {json}");
+        assert!(json.contains("✅ 📖 **Read**"), "工具状态行: {json}");
     }
 
     /// 终态卡折叠面板全量罗列：不丢最早工具（终态后可回看完整轨迹）；
@@ -2554,7 +2612,7 @@ mod tests {
         let tools = vec![tool("Bash", "ls -la", false)];
         let md = stream_body_md(&body_card_of("进度", &tools, &[]));
         assert!(md.contains("进度"));
-        assert!(md.contains("⏳ **Bash** — ls -la"), "工具引用行: {md}");
+        assert!(md.contains("⏳ ⚡ **Bash** — ls -la"), "工具引用行: {md}");
         // 仅工具（无正文）。
         let only = stream_body_md(&body_card_of("", &tools, &[]));
         assert!(only.starts_with("> ⏳"), "无正文时工具行开头: {only}");
@@ -2627,8 +2685,8 @@ mod tests {
         // 状态行归 md_footer——正文不得再拼「完成」（真机反馈过双行）。
         assert!(!out.contains("完成"), "正文不应含状态词: {out}");
         // 终态附全量工具明细（引用行）——managed 路径终态后可回看轨迹。
-        assert!(out.contains("> ✅ **Bash** — a"), "全量明细: {out}");
-        assert!(out.contains("> ✅ **Read** — c"), "全量明细: {out}");
+        assert!(out.contains("> ✅ ⚡ **Bash** — a"), "全量明细: {out}");
+        assert!(out.contains("> ✅ 📖 **Read** — c"), "全量明细: {out}");
         // Error 终态带 ❌ 前置（具体原因正文承载）。
         let err = stream_body_final(&body_card_of("", &[], &[]), Some("boom"));
         assert!(err.contains("❌ 出错：boom"), "错误前置: {err}");

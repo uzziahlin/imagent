@@ -64,13 +64,34 @@ pub fn tool_status_icon(done: bool) -> &'static str {
     }
 }
 
-/// 卡片（markdown）形态的工具行：`✅ **Bash** — git status`。
+/// 卡片（markdown）形态的工具行：`✅ ⚡ **Bash** — git status`。
 pub fn tool_card_line(t: &ToolCall) -> String {
     let icon = tool_status_icon(t.done);
+    let type_icon = tool_type_icon(&t.name);
     if t.summary.is_empty() {
-        format!("{icon} **{}**", t.name)
+        format!("{icon} {type_icon} **{}**", t.name)
     } else {
-        format!("{icon} **{}** — {}", t.name, t.summary)
+        format!("{icon} {type_icon} **{}** — {}", t.name, t.summary)
+    }
+}
+
+/// v1.25 工具类型图标（轨迹扫一眼有层次）：按工具名映射，未知归 🔧。
+/// 前缀匹配（mcp__* / Task* 族）优先于全名表。
+pub fn tool_type_icon(name: &str) -> &'static str {
+    if name.starts_with("mcp__") {
+        return "🔌";
+    }
+    if name.starts_with("Task") {
+        return "📋";
+    }
+    match name {
+        "Read" | "NotebookRead" => "📖",
+        "Edit" | "Write" | "NotebookEdit" => "✏️",
+        "Bash" => "⚡",
+        "Grep" | "Glob" => "🔍",
+        "WebFetch" | "WebSearch" => "🌐",
+        "TodoWrite" => "📋",
+        _ => "🔧",
     }
 }
 
@@ -78,10 +99,11 @@ pub fn tool_card_line(t: &ToolCall) -> String {
 /// `✅ Bash — git status`。
 pub fn tool_text_line(t: &ToolCall) -> String {
     let icon = tool_status_icon(t.done);
+    let type_icon = tool_type_icon(&t.name);
     if t.summary.is_empty() {
-        format!("{icon} {}", t.name)
+        format!("{icon} {type_icon} {}", t.name)
     } else {
-        format!("{icon} {} — {}", t.name, t.summary)
+        format!("{icon} {type_icon} {} — {}", t.name, t.summary)
     }
 }
 
@@ -180,14 +202,14 @@ mod tests {
             done: true,
             id: None,
         };
-        assert_eq!(tool_card_line(&t), "✅ **Bash** — git status");
-        assert_eq!(tool_text_line(&t), "✅ Bash — git status");
+        assert_eq!(tool_card_line(&t), "✅ ⚡ **Bash** — git status");
+        assert_eq!(tool_text_line(&t), "✅ ⚡ Bash — git status");
         let running = ToolCall {
             name: "Read".into(),
             summary: String::new(),
             done: false,
             id: None,
         };
-        assert_eq!(tool_card_line(&running), "⏳ **Read**");
+        assert_eq!(tool_card_line(&running), "⏳ 📖 **Read**");
     }
 }
