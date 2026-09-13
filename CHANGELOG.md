@@ -2,6 +2,21 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.25.2] — 2026-09-13
+
+> **引用会话记录修复**（真机反馈）：引用合并转发消息（聊天记录卡片）
+> 整链失效 + 私聊引用未覆盖。
+
+### Fixed
+- **引用合并转发消息时 agent 收不到会话记录**：被引用对象是
+  merged_forward 类型（本体 content 为占位符）——此前该类型直接放弃
+  （quoted_context_text 只认 text/post），现补全链路：再调子消息接口
+  拉全量 → 复用合并转发转录 → 作为引用上下文注入（截 1500 字）
+- **私聊引用回复未覆盖**：peek 只认群消息（chat_type == group）——新增
+  peek_reply_parent 不限会话形态，群「回复即定向」语义保持不变
+- 引用图片/文件/卡片等类型时给类型占位（`[图片]`/`[interactive]`——
+  agent 至少知道引用的是什么，不再静默放弃）
+
 ## [1.25.1] — 2026-09-09
 
 > **真机修复**：两处用户可见缺陷（水位提示失效 + webhook 轮整卡拒收）。
