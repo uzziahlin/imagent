@@ -2673,8 +2673,10 @@ async fn resume_lists_and_restores_history() {
     assert!(list.contains("*"), "当前会话应带 *: {list}");
     assert!(list.contains("📱"), "历史会话标 📱: {list}");
     drop(inbox);
-    // 恢复 1 号（sess-0）→ 下条消息续接 sess-0。
-    ctx.disp.handle(msg("c1", "alice", "/resume 1")).await;
+    // 恢复 2 号（sess-0，较老那条）→ 下条消息续接 sess-0。列表排序
+    // 「updated_at DESC, rowid DESC」：行 1 恒为最新（sess-1，当前）、行 2
+    // 恒为 sess-0——不依赖两轮是否跨秒（同秒并列按插入序取新）。
+    ctx.disp.handle(msg("c1", "alice", "/resume 2")).await;
     feed_and_wait(&ctx, vec![msg("c1", "alice", "after resume")], 3).await;
     let calls = ctx.calls.lock().await.clone();
     assert_eq!(
@@ -3476,15 +3478,16 @@ async fn resume_numbering_stable_after_selection() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    // 选中 1（sess-0）后，2 仍指向 sess-1（而非移除后前移的 sess-0 复用）。
+    // 选中 1（sess-1，最新）后，2 仍指向 sess-0（而非移除后前移复用）——
+    // 排序「updated_at DESC, rowid DESC」下行 1 恒为最新插入。
     ctx.disp.handle(msg("c1", "alice", "/resume 1")).await;
     ctx.disp.handle(msg("c1", "alice", "/resume 2")).await;
     feed_and_wait(&ctx, vec![msg("c1", "alice", "after")], 3).await;
     let calls = ctx.calls.lock().await.clone();
     assert_eq!(
         calls.last(),
-        Some(&Some("sess-1".to_string())),
-        "选中 2 应续接 sess-1（序号未被消费重排）: {calls:?}"
+        Some(&Some("sess-0".to_string())),
+        "选中 2 应续接 sess-0（序号未被消费重排）: {calls:?}"
     );
     drop_db(ctx.db).await;
 }

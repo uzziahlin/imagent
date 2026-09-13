@@ -967,7 +967,7 @@ impl Store {
             let mut stmt = conn.prepare(
                 "SELECT conv_id, session_id, agent_kind, created_at, updated_at, first_prompt \
                  FROM session_history WHERE conv_id = ?1 \
-                 ORDER BY updated_at DESC, rowid ASC LIMIT ?2",
+                 ORDER BY updated_at DESC, rowid DESC LIMIT ?2",
             )?;
             let rows = stmt.query_map(rusqlite::params![conv_id, limit_i], |r| {
                 Ok(SessionHistoryRow {
@@ -2336,13 +2336,21 @@ mod tests {
             updated_at: at,
             task_todos: None,
         };
-        store.upsert_session(&row("s1", 100)).await.unwrap();
-        store.upsert_session(&row("s2", 200)).await.unwrap();
-        // 同 session 重复 upsert 不产生新历史行，只刷新 updated_at。
-        store.upsert_session(&row("s1", 300)).await.unwrap();
+        // upsert 的 updated_at 取服务端 now（不看行值）——用真实跨秒保证
+        // 顺序可判：s1 先写，s2 后写（不同秒）→ s2 前；再刷新 s1（又跨秒）
+        // → s1 回到最前。同秒并列由 rowid DESC 兜底（最新插入在前）。
+        store.upsert_session(&row("s1", 0)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        store.upsert_session(&row("s2", 0)).await.unwrap();
         let hist = store.list_session_history("c1", 10).await.unwrap();
         assert_eq!(hist.len(), 2, "两个不同 session 各一行: {hist:?}");
-        // 最近更新的排前（s1 刚被 300 时刻刷新）。
+        assert_eq!(hist[0].session_id, "s2", "后写的排前: {hist:?}");
+        // 同 session 重复 upsert 不产生新历史行，只刷新 updated_at。
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        store.upsert_session(&row("s1", 0)).await.unwrap();
+        let hist = store.list_session_history("c1", 10).await.unwrap();
+        assert_eq!(hist.len(), 2, "刷新不新增行: {hist:?}");
+        // 最近更新的排前（s1 刚被刷新）。
         assert_eq!(hist[0].session_id, "s1");
         assert_eq!(hist[1].session_id, "s2");
         // limit 生效。
