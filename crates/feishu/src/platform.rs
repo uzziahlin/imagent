@@ -474,8 +474,7 @@ impl FeishuPlatform {
                     // ①短文本（≤4 字符，疑似 y/n 审批回复）不加引，防破坏
                     // 审批路由；②拉取失败 fail-soft 原样发送。与媒体处理合流
                     // 到同一异步作业（保序经泵）。
-                    let quote_parent = crate::proto::peek_group_reply_parent(&payload)
-                        .filter(|p| p.starts_with("om_"))
+                    let quote_parent = crate::proto::peek_reply_parent(&payload)
                         .filter(|_| msg.text.as_deref().is_some_and(|t| t.trim().len() > 4));
                     let needs_async = !pending.is_empty() || quote_parent.is_some();
                     let job = if !needs_async {
@@ -1922,21 +1921,54 @@ async fn enrich_with_quote(
         crate::client::fetch_message_raw(cfg, &t, parent_id).await
     }
     .await;
-    match fetched {
-        Ok((mt, content)) => {
-            if let Some(quote) = crate::proto::quoted_context_text(&mt, &content) {
-                let quote: String = quote.chars().take(500).collect();
-                let base = msg.text.take().unwrap_or_default();
-                msg.text = Some(format!(
-                    "（用户引用了以下消息，针对它追问）:\n> {}\n\n{base}",
-                    quote.replace('\n', "\n> ")
-                ));
+    let is_merged_forward = fetched.as_ref().is_ok_and(|(mt, _)| mt == "merged_forward");
+    let quote = match fetched {
+        Ok((mt, content)) => match mt.as_str() {
+            // 引用的是合并转发消息（聊天记录卡片）：本体 content 是占位符，
+            // 须再调子消息接口拉全量并转录（v1.25.2 补——此前该类型直接
+            // 放弃，引用会话记录场景整链失效）。转录放宽到 1500 字（会话
+            // 记录天然长于单条消息）。
+            "merged_forward" => {
+                let token = match fetch_cached_token(token_lock, cfg, aid, sec).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        debug!(target: "feishu", error = %e, "引用合并转发取 token 失败");
+                        return;
+                    }
+                };
+                match crate::client::list_merge_forward(cfg, &token, parent_id).await {
+                    Ok(items) => Some(
+                        crate::proto::render_merge_forward_transcript(&items, None, None)
+                            .trim()
+                            .to_string(),
+                    ),
+                    Err(e) => {
+                        debug!(target: "feishu", error = %e, parent_id, "引用合并转发子消息拉取失败");
+                        return;
+                    }
+                }
             }
-        }
+            // 图片/文件/卡片等：给类型占位（agent 至少知道引用的是什么）。
+            "image" | "media" | "file" | "sticker" | "emotion" | "interactive" => {
+                Some(format!("[{mt}]"))
+            }
+            _ => crate::proto::quoted_context_text(&mt, &content),
+        },
         Err(e) => {
             debug!(target: "feishu", error = %e, parent_id, "引用消息拉取失败（原样发送）");
+            return;
         }
-    }
+    };
+    let Some(quote) = quote.filter(|q| !q.trim().is_empty()) else {
+        return;
+    };
+    let cap = if is_merged_forward { 1_500 } else { 500 };
+    let quote: String = quote.chars().take(cap).collect();
+    let base = msg.text.take().unwrap_or_default();
+    msg.text = Some(format!(
+        "（用户引用了以下消息，针对它追问）:\n> {}\n\n{base}",
+        quote.replace('\n', "\n> ")
+    ));
 }
 
 async fn process_pending_media(

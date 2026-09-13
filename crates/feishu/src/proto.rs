@@ -141,6 +141,30 @@ pub fn quoted_context_text(msg_type: &str, content: &str) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+/// v1.25.2：不限会话形态的 parent_id 提取（引用上下文用——私聊引用此前被
+/// 群版 peek 跳过）。群「回复即定向」仍用 [`peek_group_reply_parent`]。
+pub(crate) fn peek_reply_parent(payload: &[u8]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct P {
+        event: E,
+    }
+    #[derive(serde::Deserialize)]
+    struct E {
+        message: M,
+    }
+    #[derive(serde::Deserialize)]
+    struct M {
+        #[serde(default)]
+        parent_id: Option<String>,
+    }
+    let p: P = serde_json::from_slice(payload).ok()?;
+    p.event
+        .message
+        .parent_id
+        .filter(|s| !s.is_empty())
+        .filter(|s| s.starts_with("om_"))
+}
+
 pub(crate) fn peek_group_reply_parent(payload: &[u8]) -> Option<String> {
     #[derive(serde::Deserialize)]
     struct P {
@@ -1886,6 +1910,49 @@ mod tests {
     }
 
     /// p2p 文本：conv=feishu:<open_id>、sender=open_id、text 正确、dedup=event_id。
+    /// v1.25.2：peek_reply_parent 不限会话形态（私聊引用此前被群版跳过）。
+    #[test]
+    fn peek_reply_parent_accepts_p2p() {
+        #[derive(serde::Serialize)]
+        struct Mk<'a> {
+            event: Msg<'a>,
+        }
+        #[derive(serde::Serialize)]
+        struct Msg<'a> {
+            message: M<'a>,
+        }
+        #[derive(serde::Serialize)]
+        struct M<'a> {
+            chat_type: &'a str,
+            parent_id: Option<&'a str>,
+        }
+        let mk = |ct: &str, p: Option<&str>| {
+            serde_json::to_vec(&Mk {
+                event: Msg {
+                    message: M {
+                        chat_type: ct,
+                        parent_id: p,
+                    },
+                },
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            peek_reply_parent(&mk("p2p", Some("om_p1"))).as_deref(),
+            Some("om_p1"),
+            "私聊引用也应提取 parent_id"
+        );
+        assert_eq!(
+            peek_reply_parent(&mk("group", Some("om_p1"))).as_deref(),
+            Some("om_p1")
+        );
+        assert!(peek_reply_parent(&mk("p2p", None)).is_none());
+        assert!(
+            peek_reply_parent(&mk("p2p", Some(""))).is_none(),
+            "空 id 不放行"
+        );
+    }
+
     #[test]
     fn quoted_context_text_variants() {
         // v1.25 引用上下文：text 取 JSON text；post 复用 parse_post；空/不支持 None。
