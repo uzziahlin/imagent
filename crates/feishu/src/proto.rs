@@ -1737,6 +1737,18 @@ pub fn render_merge_forward_transcript(
     }
     let mut included = 0usize;
     let mut truncated = false;
+    // 平台限制（2026-09 官方双语文档确认）：资源下载接口不支持合并转发
+    // 子消息（图片/视频/文件只可占位）。统计不可读媒体数，末尾给一句引导
+    // ——agent 据此主动告知用户「单独发图即可分析」，不再各自踩一遍疑问。
+    let unreadable_media = items
+        .iter()
+        .filter(|it| {
+            matches!(
+                it.message_type.as_str(),
+                "image" | "media" | "file" | "sticker" | "emotion" | "video"
+            )
+        })
+        .count();
     for item in items {
         let line = format!("\n{}", merge_forward_line(item));
         let ll = line.chars().count();
@@ -1756,6 +1768,11 @@ pub fn render_merge_forward_transcript(
     }
     if truncated {
         out.push_str(&format!("\n（已截断，共 {n} 条中前 {included} 条）"));
+    }
+    if unreadable_media > 0 {
+        out.push_str(&format!(
+            "\n（注：记录中另有 {unreadable_media} 条图片/文件，飞书 API 限制无法读取合并转发内的媒体；需要分析请单独发送该图）"
+        ));
     }
     out
 }
@@ -3539,6 +3556,38 @@ mod tests {
         assert!(t.contains("[Alice] [图片]"), "纯图 post 占位: {t}");
         assert!(t.contains("[Alice] [富文本消息]"), "空 post 占位: {t}");
         assert!(t.contains("[Bob] @_user_1 看这个"), "占位保留原样: {t}");
+    }
+
+    /// v1.25.2：不可读媒体（图片/文件等）计数 + 末尾引导标注；纯文本记录不加。
+    #[test]
+    fn render_transcript_media_hint() {
+        let items = vec![
+            mf_item("text", r#"{"text":"看下这个设计"}"#, Some("A"), "ou_a", 0),
+            mf_item("image", r#"{"image_key":"img_v3_x"}"#, Some("A"), "ou_a", 0),
+            mf_item(
+                "file",
+                r#"{"file_key":"f1","file_name":"a.pdf"}"#,
+                Some("B"),
+                "ou_b",
+                0,
+            ),
+        ];
+        let t = render_merge_forward_transcript(&items, None, None);
+        assert!(t.contains("[图片]"), "{t}");
+        assert!(
+            t.contains("另有 2 条图片/文件") && t.contains("单独发送该图"),
+            "媒体引导缺失: {t}"
+        );
+        // 纯文本记录：无引导行。
+        let text_only = vec![mf_item(
+            "text",
+            r#"{"text":"纯文字"}"#,
+            Some("A"),
+            "ou_a",
+            0,
+        )];
+        let t2 = render_merge_forward_transcript(&text_only, None, None);
+        assert!(!t2.contains("图片/文件"), "{t2}");
     }
 
     /// 转录截断保护：超 8000 字符按字符边界截断，尾部标注「（已截断，共 N 条中
