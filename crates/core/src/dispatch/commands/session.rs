@@ -7,7 +7,7 @@ impl Dispatcher {
     /// /new —— 重置会话（删活动 session + active_name）。
     pub(super) async fn cmd_new(&self, conv: &ConvId, hint: &ReplyHint) {
         // P1-F：取 conv 串行锁，与在飞 agent task 串行（避免并发改 session 损坏状态）。
-        let _conv_lock = self.acquire_conv_lock(&conv.0).await;
+        let _conv_lock = self.acquire_conv_lock_with_ack(&conv.0, hint, "/new").await;
         let _conv_guard = _conv_lock.lock().await;
         // 删除该 conv 的 session 行（下次新建），失败仅 log。
         if let Err(e) = self.store.delete_session(&conv.0).await {
@@ -41,7 +41,9 @@ impl Dispatcher {
         // （💻，仅当前 backend 支持时合并）。用户按序号选择，无需知道
         // session id；选中 💻 即自动接管（写 sessions 表绑定）。
         // P1-F：取 conv 串行锁，与在飞 agent task 串行。
-        let _conv_lock = self.acquire_conv_lock(&conv.0).await;
+        let _conv_lock = self
+            .acquire_conv_lock_with_ack(&conv.0, hint, "/resume")
+            .await;
         let _conv_guard = _conv_lock.lock().await;
         let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
 
@@ -237,7 +239,9 @@ impl Dispatcher {
     /// /switch <name> —— 切换/新建命名会话（跨后端校验）。
     pub(super) async fn cmd_switch(&self, conv: &ConvId, hint: &ReplyHint, parts: &[&str]) {
         // P1-F：取 conv 串行锁（同 /new）。
-        let _conv_lock = self.acquire_conv_lock(&conv.0).await;
+        let _conv_lock = self
+            .acquire_conv_lock_with_ack(&conv.0, hint, "/switch")
+            .await;
         let _conv_guard = _conv_lock.lock().await;
         let name = parts.get(1).map(|s| s.trim()).unwrap_or("");
         if name.is_empty() {
@@ -397,7 +401,9 @@ impl Dispatcher {
     pub(super) async fn cmd_compact(&self, conv: &ConvId, hint: &ReplyHint) {
         // P1-F：取 conv 串行锁——/compact 内 resume 当前 session 生成摘要，
         // 须与在飞 agent task 串行（否则并发 resume 同 session 损坏状态）。
-        let _conv_lock = self.acquire_conv_lock(&conv.0).await;
+        let _conv_lock = self
+            .acquire_conv_lock_with_ack(&conv.0, hint, "/compact")
+            .await;
         let _conv_guard = _conv_lock.lock().await;
         let existing_sid: Option<SessionId> = match self.store.get_session(&conv.0).await {
             Ok(Some(row)) => Some(SessionId(row.session_id)),
@@ -613,6 +619,8 @@ impl Dispatcher {
             RoundHandle {
                 abort: join.abort_handle(),
                 steer: None,
+                started: std::time::Instant::now(),
+                digest: Some("压缩上下文（/compact）".to_string()),
             },
         );
         let mut summary: Option<String> = None;

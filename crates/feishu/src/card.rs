@@ -58,6 +58,41 @@ fn sanitize_inline(text: &str) -> String {
     escape_lt_inline(&text.replace('`', "'"))
 }
 
+/// v1.26 构造收口：markdown 元素的唯一出口——转义（<at> 注入防线）与邮箱
+/// 掩码（租户审计）内建，调用方传**原始内容**。这是同类问题（v8→v12→
+/// v1.25.1 三次人肉审出遗漏）的根治：新构造点不可能忘记转义。
+/// text_size 可选（notation 小字）；element_id 可选（managed 流式锚点）。
+fn md_element(content: &str) -> serde_json::Value {
+    serde_json::json!({
+        "tag": "markdown",
+        "content": escape_lt(&mask_emails(content)),
+    })
+}
+
+fn md_element_sized(content: &str, text_size: &str) -> serde_json::Value {
+    serde_json::json!({
+        "tag": "markdown",
+        "content": escape_lt(&mask_emails(content)),
+        "text_size": text_size,
+    })
+}
+
+fn md_element_anchored(
+    element_id: &str,
+    content: &str,
+    text_size: Option<&str>,
+) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "tag": "markdown",
+        "element_id": element_id,
+        "content": content,
+    });
+    if let Some(s) = text_size {
+        v["text_size"] = serde_json::json!(s);
+    }
+    v
+}
+
 fn escape_lt(text: &str) -> String {
     // R13（code-review v9）：围栏代码块内的 `<` 不转义——CommonMark 代码块
     // 不处理反斜杠转义，此前全串替换把 `a < b` 显示成 `a \< b`。逐行跟踪
@@ -315,9 +350,7 @@ pub fn render_card(card: &OutboundCard, conv_id: &str, sender: Option<&str>) -> 
         Some(t) => format!("{t}\n\n{text}"),
         None => text.into_owned(),
     };
-    elements.push(
-        serde_json::json!({ "tag": "markdown", "content": escape_lt(&cap_md_bytes(&mask_emails(&body_md), 4_096, 4_096)) }),
-    );
+    elements.push(md_element(&cap_md_bytes(&body_md, 4_096, 4_096)));
     if !card.tool_calls.is_empty() {
         // 长正文分段：正文与工具面板间用真 hr 组件分隔（降级路径专属——
         // managed 路径的 md_body 是单 markdown 组件，用 `---` 文本分割线，
@@ -328,15 +361,14 @@ pub fn render_card(card: &OutboundCard, conv_id: &str, sender: Option<&str>) -> 
         // 拒收——200621 "not support tag: tag"，结果下沉降级纯文本；V2 无等价
         // 胶囊组件，统计信息以文本行承载。Running 态不加（统计未收敛）。
         if !streaming {
-            elements.push(serde_json::json!({
-                "tag": "markdown",
-                "content": format!(
+            elements.push(md_element_sized(
+                &format!(
                     "🔧 工具 {} 次：{}",
                     card.tool_calls.len(),
                     tool_stats_summary(&card.tool_calls)
                 ),
-                "text_size": "notation"
-            }));
+                "notation",
+            ));
         }
         // 面板边框随终态：Running=blue / Done=grey / Error=red。
         let border = if streaming {
@@ -356,9 +388,7 @@ pub fn render_card(card: &OutboundCard, conv_id: &str, sender: Option<&str>) -> 
         elements.push(render_thought_panel(&card.thoughts, border));
     }
     // 状态 footer：note 行（notation 小字号）体现终态 / 流式阶段。
-    elements.push(serde_json::json!({
-        "tag": "markdown", "content": footer, "text_size": "notation"
-    }));
+    elements.push(md_element_sized(&footer, "notation"));
     // Running 态带终止按钮（终态移除——整卡 patch 每次重渲染，自然消失）。
     if streaming {
         elements.push(stop_button(conv_id, None));
@@ -454,7 +484,7 @@ fn render_tool_panel(tools: &[ToolCall], border_color: &str) -> serde_json::Valu
         "border": { "color": border_color, "corner_radius": "5px" },
         "vertical_spacing": "8px",
         "padding": "8px 8px 8px 8px",
-        "elements": [{ "tag": "markdown", "content": lines, "text_size": "notation" }]
+        "elements": [md_element_sized(&lines, "notation")]
     })
 }
 
@@ -479,7 +509,7 @@ fn render_thought_panel(thoughts: &[String], border_color: &str) -> serde_json::
         "border": { "color": border_color, "corner_radius": "5px" },
         "vertical_spacing": "8px",
         "padding": "8px 8px 8px 8px",
-        "elements": [{ "tag": "markdown", "content": lines, "text_size": "notation" }]
+        "elements": [md_element_sized(&lines, "notation")]
     })
 }
 
@@ -497,11 +527,7 @@ fn border_color_of(err: Option<&str>) -> &'static str {
 /// "unsupported tag note"——审批卡整卡被拒、降级纯文本）。V2 的小字提示用
 /// markdown + `text_size: "notation"`（流式卡 footer 同款，已真机验证可发）。
 fn note_element(text: &str) -> serde_json::Value {
-    serde_json::json!({
-        "tag": "markdown",
-        "content": mask_emails(text),
-        "text_size": "notation"
-    })
+    md_element_sized(text, "notation")
 }
 
 /// 按工具名计数的统计行（`Bash×2 · Read×1`）——终态整卡与流式终态（结果下沉）
@@ -649,11 +675,11 @@ pub fn render_stream_init_card(
         elements.push(line);
     }
     elements.extend(vec![
-        serde_json::json!({ "tag": "markdown", "element_id": "md_body", "content": opening }),
-        serde_json::json!({ "tag": "markdown", "element_id": "md_footer", "content": "🧠 思考中…", "text_size": "notation" }),
+        md_element_anchored("md_body", &opening, None),
+        md_element_anchored("md_footer", "🧠 思考中…", Some("notation")),
         // P9-1：⏹ 终止按钮常驻（element PATCH 只更新 markdown，按钮不受流式
         // 影响；终态后仍在，点击回「当前没有运行中的任务」，无害）。
-        stop_button(conv_id, sender)
+        stop_button(conv_id, sender),
     ]);
     let summary_of = match task_digest.filter(|d| !d.trim().is_empty()) {
         Some(d) => format!("🧠 处理中：{}", truncate_chars(d.trim(), 40)),
@@ -913,7 +939,7 @@ pub fn render_stub_card(card: &OutboundCard) -> String {
         "config": { "streaming_mode": false },
         "header": terminal_header(err),
         "body": { "elements": [
-            { "tag": "markdown", "content": stub_body(card.tool_calls.len(), err) }
+            md_element(&stub_body(card.tool_calls.len(), err))
         ] }
     })
     .to_string()
@@ -1062,7 +1088,7 @@ pub(crate) fn render_permission_card_note(
 ) -> String {
     let (detail, detail_notes) = perm_detail_md(tool_name, input_summary);
     let mut elements = vec![
-        serde_json::json!({ "tag": "markdown", "content": detail }),
+        md_element(&detail),
         // 倒计时 / 排队提示 note（markdown+notation 小字；note 组件 V2 已移除，
         // 真机校准 2026-08）。md_footer 锚点不受影响（managed 卡约束）。
         note_element(note),
@@ -1138,7 +1164,7 @@ pub fn render_permission_card_cancelled(tool_name: &str) -> String {
         "schema": "2.0",
         "header": { "title": { "tag": "plain_text", "content": "⏹ 询问已结束" }, "template": "grey" },
         "body": { "elements": [
-            { "tag": "markdown", "content": format!("`{}` 的本次询问已结束，无需处理。", sanitize_inline(tool_name)) },
+            md_element(&format!("`{}` 的本次询问已结束，无需处理。", sanitize_inline(tool_name))),
             // 中断/审批超时/被取代的原因说明走 note 提示条（元信息类注释行）。
             note_element("原因：任务中断 · 审批超时 · 被后续询问取代")
         ]}
@@ -1152,7 +1178,7 @@ pub fn render_permission_card_superseded(tool_name: &str) -> String {
         "schema": "2.0",
         "header": { "title": { "tag": "plain_text", "content": "🔁 已被新询问取代" }, "template": "grey" },
         "body": { "elements": [
-            { "tag": "markdown", "content": format!("`{}` 的询问已被更新的询问取代（agent 并发请求时旧请求自动拒绝），请处理最新一张。", sanitize_inline(tool_name)) }
+            md_element(&format!("`{}` 的询问已被更新的询问取代（agent 并发请求时旧请求自动拒绝），请处理最新一张。", sanitize_inline(tool_name)))
         ]}
     })
     .to_string()
@@ -1255,11 +1281,11 @@ pub(crate) fn render_question_card_note(
             "下拉选择后点「提交」"
         };
         vec![
-            serde_json::json!({ "tag": "markdown", "content": escape_lt(&mask_emails(&content)) }),
+            md_element(&content),
             note_element(note),
             serde_json::json!({ "tag": "hr" }),
             serde_json::json!({ "tag": "form", "name": "imagent_ask", "elements": [
-                serde_json::json!({ "tag": "markdown", "content": submit_tip }),
+                md_element(submit_tip),
                 field,
                 serde_json::json!({ "tag": "hr" }),
                 flow_button_row(&[serde_json::json!({
@@ -1295,7 +1321,7 @@ pub(crate) fn render_question_card_note(
             })
             .collect();
         vec![
-            serde_json::json!({ "tag": "markdown", "content": escape_lt(&mask_emails(&content)) }),
+            md_element(&content),
             note_element(note),
             serde_json::json!({ "tag": "hr" }),
             flow_button_row(&opt_buttons),
@@ -1368,9 +1394,7 @@ fn render_multi_question_card(
         }
         // v1.23 review：题面/描述来自 agent（可引用不可信内容）——与正文
         // 三路径同款 <at> 注入收口（此前漏了 escape_lt）。
-        sections.push(serde_json::json!({
-            "tag": "markdown", "content": escape_lt(&mask_emails(&lines.join("\n")))
-        }));
+        sections.push(md_element(&lines.join("\n")));
         fields.push(if multi {
             serde_json::json!({ "tag": "checkbox", "name": format!("ask_opt_{i}"), "options": opt_values })
         } else {
@@ -1464,7 +1488,7 @@ pub fn render_question_card_resolved(choice: &str) -> String {
         "schema": "2.0",
         "header": { "title": { "tag": "plain_text", "content": "✅ 已记录选择" }, "template": "grey" },
         "body": { "elements": [
-            { "tag": "markdown", "content": format!("已记录你的选择：{}。任务继续处理中。", escape_lt(&mask_emails(choice))) }
+            md_element(&format!("已记录你的选择：{choice}。任务继续处理中。"))
         ]}
     })
     .to_string()
@@ -1485,7 +1509,7 @@ pub fn render_overflow_terminal_card(done: bool) -> String {
         "schema": "2.0",
         "header": { "title": { "tag": "plain_text", "content": title }, "template": template },
         "body": { "elements": [
-            { "tag": "markdown", "content": "输出超出卡片大小上限，完整内容已转为**文本消息**发送（见下方/相邻消息）。" }
+            md_element("输出超出卡片大小上限，完整内容已转为**文本消息**发送（见下方/相邻消息）。")
         ]}
     })
     .to_string()
@@ -1498,7 +1522,7 @@ pub fn render_permission_card_resolved(tool_name: &str, allowed: bool) -> String
         "schema": "2.0",
         "header": { "title": { "tag": "plain_text", "content": format!("{mark} {verb}") }, "template": "grey" },
         "body": { "elements": [
-            { "tag": "markdown", "content": format!("`{tool_name}` 的执行询问{verb}，任务继续处理中。") }
+            md_element(&format!("`{tool_name}` 的执行询问{verb}，任务继续处理中。"))
         ]}
     })
     .to_string()
@@ -1602,9 +1626,7 @@ fn plain_block_elements(body_md: &str) -> Vec<serde_json::Value> {
             if is_heading && !rest.is_empty() {
                 // 组标题独立成 heading 元素（/help 的「🗂 会话\n- …」形态——
                 // 标题与列表间无空行，块内再拆）。
-                out.push(serde_json::json!({
-                    "tag": "markdown", "content": escape_lt(first), "text_size": "heading-large"
-                }));
+                out.push(md_element_sized(first, "heading-large"));
             } else {
                 // 标题后无内容（单行块）或列表/表格行：整体一个普通元素
                 //（标题行并入，避免空元素）。
@@ -1613,9 +1635,7 @@ fn plain_block_elements(body_md: &str) -> Vec<serde_json::Value> {
                     content.push('\n');
                     content.push_str(l);
                 }
-                out.push(serde_json::json!({
-                    "tag": "markdown", "content": escape_lt(&mask_emails(&content))
-                }));
+                out.push(md_element(&content));
                 lines.by_ref().for_each(drop);
                 break;
             }
@@ -1681,7 +1701,7 @@ fn resume_row_left(cells: &[String]) -> Vec<serde_json::Value> {
     } else {
         // v1.23 review：「内容」列是会话首条 prompt（用户原文）——<at> 注入
         // 收口（此前的漏网出口之一）。
-        vec![serde_json::json!({ "tag": "markdown", "content": escape_lt(&mask_emails(&md)) })]
+        vec![md_element(&md)]
     }
 }
 
@@ -1737,10 +1757,10 @@ fn try_paired_rows(
                 }
             }
             if !row_btns.is_empty() {
-                let left = vec![serde_json::json!({
-                    "tag": "markdown",
-                    "content": format!("**{key}**\n{}", row.get(1).map(String::as_str).unwrap_or(""))
-                })];
+                let left = vec![md_element(&format!(
+                    "**{key}**\n{}",
+                    row.get(1).map(String::as_str).unwrap_or("")
+                ))];
                 let btns: Vec<serde_json::Value> = row_btns
                     .iter()
                     .map(|i| render_cmd_button(&buttons[*i], conv_id))
@@ -1764,9 +1784,7 @@ fn try_paired_rows(
             md.push_str(&format!("|{}|\n", r.join("|")));
         }
         md.push_str("\n（其余会话发送 /resume <序号> 接管）");
-        elements.push(
-            serde_json::json!({ "tag": "markdown", "content": escape_lt(&mask_emails(&md)) }),
-        );
+        elements.push(md_element(&md));
     }
     // 未配对按钮：底部 flow 行。
     let leftover: Vec<serde_json::Value> = buttons
@@ -1860,10 +1878,7 @@ pub fn render_config_form_card(entries: &[ConfigFormField], conv_id: &str) -> St
                 })
             })
             .collect();
-        form_elements.push(serde_json::json!({
-            "tag": "markdown",
-            "content": format!("**{}**", f.label)
-        }));
+        form_elements.push(md_element(&format!("**{}**", f.label)));
         form_elements.push(serde_json::json!({
             "tag": "select_static",
             "name": f.key,
@@ -1890,7 +1905,7 @@ pub fn render_config_form_card(entries: &[ConfigFormField], conv_id: &str) -> St
             "template": "blue"
         },
         "body": { "elements": [
-            { "tag": "markdown", "content": "下拉选择后点「提交」，立即生效（重启回 config.toml 值；也可继续用 `/config <key> <value>` 文本命令）。" },
+            md_element("下拉选择后点「提交」，立即生效（重启回 config.toml 值；也可继续用 `/config <key> <value>` 文本命令）。"),
             { "tag": "hr" },
             { "tag": "form", "name": "imagent_config", "elements": form_elements }
         ] }

@@ -2749,6 +2749,54 @@ impl Platform for FeishuPlatform {
     /// bot 对用户消息的表情标注：OnIt（在做了）→ DONE / CrossMark。
     /// emoji key 真机校准（2026-08）验证可用且**大小写敏感**（全大写报 231001）。
     /// 翻转 = 删旧表情 + 打新表情；删失败（过期/已撤回）仅 log，新表情照打。
+    /// v1.26 权限自检：三级探测（token → bot 能力 → 消息读权限）+ 功能↔权限
+    /// 对照表。消息读探测用合成 message_id 调 GET /im/v1/messages——按错误
+    /// 形态分类：对象不存在类（230001/99991672/not exist）= 权限已通（API
+    /// 放行了调用，只是对象没有）；无权限类 = 缺 scope。真实踩坑驱动（用户
+    /// 三连问：引用/合并转发静默失败、权限概念混淆、开通后忘发布版本）。
+    async fn doctor_probes(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        // ① tenant token（凭据/网络）
+        let token = match self.get_token().await {
+            Ok(t) => {
+                out.push("✅ 飞书 token 获取正常（凭据/网络连通）".into());
+                t
+            }
+            Err(e) => {
+                out.push(format!(
+                    "⚠️ 飞书 token 获取失败：{e}（检查 app_id/secret 与网络）"
+                ));
+                return out;
+            }
+        };
+        // ② bot 能力（GET /bot/v3/info）
+        match crate::client::fetch_bot_open_id(&self.core_config, &token).await {
+            Ok(_) => out.push("✅ 机器人能力正常（bot info 可读）".into()),
+            Err(e) => out.push(format!(
+                "⚠️ bot info 读取失败：{e}（开发者后台 → 应用能力 → 开启机器人）"
+            )),
+        }
+        // ③ 消息读权限（im:message:readonly / im:message）
+        match crate::client::fetch_message_raw(&self.core_config, &token, "om_doctor_probe").await {
+            Ok(_) => out.push("✅ 消息读取权限正常".into()),
+            Err(e) => {
+                let es = e.to_string();
+                let not_exist = es.contains("230001")
+                    || es.contains("99991672")
+                    || es.to_ascii_lowercase().contains("not exist");
+                if not_exist {
+                    out.push("✅ 消息读取权限正常（探测 id 不存在 = 调用被放行）".into());
+                } else {
+                    out.push(format!(
+                        "⚠️ 消息读取疑似缺权限：{es}\n   → 开发者后台 → 权限管理 → 开通 im:message:readonly 并**创建新版本发布**（只勾选不发布不生效）。影响：引用上下文、合并转发转录"
+                    ));
+                }
+            }
+        }
+        out.push("📋 功能↔权限对照：合并转发/引用上下文需 im:message:readonly；媒体下载需 im:resource；加急需 im:message.urgent:send；进群事件需订阅 im.chat.member.bot.added_v1（事件与回调页）".into());
+        out
+    }
+
     /// v1.23 发起者锚定：dispatch 在每轮首条消息分派前调用——本 conv 的
     /// 卡片发起者/按钮点击权锚定到轮次发起者（漂移修复见 last_sender）。
     async fn note_round_initiator(&self, conv: &ConvId, sender: &str) {

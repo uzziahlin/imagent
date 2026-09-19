@@ -27,6 +27,12 @@ pub trait Platform: Send + Sync {
         false
     }
 
+    /// v1.26 权限自检：平台侧 API 权限/连通性探测（/doctor 追加段）。
+    /// 返回逐行诊断（✅/⚠️ + 可行动指引）。默认无（纯文本平台）。
+    async fn doctor_probes(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// v1.23 说话人归属：dispatch 在每轮首条消息分派前调用——平台可据此
     /// 锚定「本轮发起者」（卡片标注/按钮点击权校验），避免被运行中的插话
     /// 者漂移。默认 no-op。
