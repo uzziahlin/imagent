@@ -1,0 +1,24 @@
+{
+  "schema": "2.0",
+  "header": {
+    "event_id": "fixture-quote-001",
+    "event_type": "im.message.receive_v1",
+    "create_time": "1700000000000"
+  },
+  "event": {
+    "sender": { "sender_id": { "open_id": "ou_fixture_user", "union_id": "on_x", "user_id": "u" } },
+    "message": {
+      "message_id": "om_fixture_reply",
+      "root_id": "",
+      "parent_id": "om_fixture_quoted",
+      "create_time": "1700000001000",
+      "chat_id": "oc_fixture_group",
+      "chat_type": "group",
+      "message_type": "text",
+      "content": "{\"text\":\"这条消息里的方案是什么意思？@_user_1\"}",
+      "mentions": [
+        { "key": "@_user_1", "id": { "open_id": "ou_fixture_bot", "name": "agent", "tenant_key": "t" } }
+      ]
+    }
+  }
+}
