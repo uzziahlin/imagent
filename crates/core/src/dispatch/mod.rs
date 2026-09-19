@@ -1123,10 +1123,35 @@ impl Dispatcher {
         (*self.shutdown).clone()
     }
 
+    /// v1.26：启动时把 store 持久化的 MCP servers 同步进 backend（/mcp 命令
+    /// 热改的持久层，重启不丢；config.toml 的 mcp_config_path 文件源由 backend
+    /// 构造时自行解析，两源在 write_mcp_config 合并）。
+    async fn sync_mcp_on_boot(&self) {
+        let rows = match self.store.list_config("mcp_server:").await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(target: "imagent::core", error = %e, "MCP servers 启动载入失败");
+                return;
+            }
+        };
+        if rows.is_empty() {
+            return;
+        }
+        let mut servers = serde_json::Map::new();
+        for (k, v) in rows {
+            let name = k.strip_prefix("mcp_server:").unwrap_or(&k).to_string();
+            servers.insert(name, serde_json::json!({ "url": v.trim() }));
+        }
+        self.backend
+            .set_user_mcp_servers(serde_json::json!({ "mcpServers": servers }));
+        info!(target: "imagent::core", n = servers.len(), "MCP servers 已从 store 载入");
+    }
+
     /// v1.21：启动恢复序列（崩溃轮次恢复 + 排队重放），main 在 webhook server
     /// 开始 accept 之前、run() 之前调用（时序依据见 run() 内注释）。幂等性由
     /// 调用方保证只调一次；测试直接跑 run() 的路径不依赖恢复（内存态干净）。
     pub async fn startup_recovery(self: &Arc<Self>) {
+        self.sync_mcp_on_boot().await;
         self.recover_crashed_rounds().await;
         self.replay_persisted_queue().await;
     }

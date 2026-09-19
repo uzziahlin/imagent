@@ -26,7 +26,7 @@ fn resolve_mention_target<'a>(arg: &str, mentions: &'a [Mention]) -> Option<&'a 
 impl Dispatcher {
     /// S2：管理命令被拒时的提示文案——admin_senders 为空（= 无人是管理员）时
     /// 附配置引导，避免用户误以为白名单用户仍可操作。
-    fn admin_denied_reply(&self, action: &str) -> String {
+    pub(super) fn admin_denied_reply(&self, action: &str) -> String {
         if self.admin_senders.read().is_empty() {
             format!(
                 "仅管理员（admin_senders）可{action}。当前 admin_senders 为空（无人是管理员），\

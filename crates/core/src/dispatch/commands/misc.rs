@@ -1117,6 +1117,150 @@ impl Dispatcher {
             .await;
     }
 
+    /// /mcp —— 用户 MCP servers 热管理（v1.26 能力批）：list / add <名> <url> /
+    /// rm <名>。store 持久化 + claude backend 内存镜像热更，下一轮 spawn 生效
+    ///（write_mcp_config 现读）。admin 门槛：加 server = 给 agent 扩工具面。
+    /// 形态：URL 型（streamable http / sse）。保留名 imagent 被拒（审批闭环专用）。
+    pub(super) async fn cmd_mcp(
+        &self,
+        conv: &ConvId,
+        sender: &str,
+        hint: &ReplyHint,
+        parts: &[&str],
+    ) {
+        if !self.is_admin(sender) {
+            let msg = self.admin_denied_reply("管理 MCP servers");
+            self.reply(conv, &msg, hint).await;
+            return;
+        }
+        let sub = parts.get(1).map(|s| s.trim()).unwrap_or("");
+        match sub {
+            "list" | "" => {
+                let rows = self
+                    .store
+                    .list_config("mcp_server:")
+                    .await
+                    .unwrap_or_default();
+                if rows.is_empty() {
+                    self.reply(conv, "📭 未配置 MCP servers（/mcp add <名> <url>）。config.toml 的 mcp_config_path 文件源不受影响、照常合并。", hint).await;
+                    return;
+                }
+                let mut body = String::from("| 名 | URL |\n|---|---|");
+                for (k, v) in &rows {
+                    let name = k.strip_prefix("mcp_server:").unwrap_or(k);
+                    let url = v.trim().chars().take(60).collect::<String>();
+                    body.push_str(&format!("\n| {name} | {url} |"));
+                }
+                let buttons = rows
+                    .iter()
+                    .filter_map(|(k, _)| k.strip_prefix("mcp_server:"))
+                    .take(9)
+                    .map(|n| crate::types::CardButton {
+                        label: format!("移除 {n}"),
+                        command: format!("/mcp rm {n}"),
+                        style: crate::types::CardButtonStyle::Danger,
+                    })
+                    .collect::<Vec<_>>();
+                self.reply_card(conv, "🔌 MCP servers", &body, buttons, hint)
+                    .await;
+            }
+            "add" => {
+                let (Some(name), Some(url)) = (
+                    parts.get(2).map(|s| s.trim()),
+                    parts.get(3).map(|s| s.trim()),
+                ) else {
+                    self.reply(
+                        conv,
+                        "用法：/mcp add <名> <url>（URL 型 server，streamable http / sse）",
+                        hint,
+                    )
+                    .await;
+                    return;
+                };
+                if name.is_empty() || url.is_empty() || !url.starts_with("http") {
+                    self.reply(conv, "⚠️ 名与 URL 必填，URL 须 http(s):// 开头。", hint)
+                        .await;
+                    return;
+                }
+                if name == "imagent" {
+                    self.reply(conv, "⛔ `imagent` 是审批闭环保留名。", hint)
+                        .await;
+                    return;
+                }
+                if let Err(e) = self
+                    .store
+                    .set_config(&format!("mcp_server:{name}"), url)
+                    .await
+                {
+                    self.reply(conv, &format!("⚠️ 保存失败：{e}"), hint).await;
+                    return;
+                }
+                if let Err(e) = self.sync_mcp_to_backend().await {
+                    warn!(target: "imagent::core", error = %e, "MCP 热更同步 backend 失败（下轮不生效）");
+                }
+                self.reply(
+                    conv,
+                    &format!("✅ 已添加 MCP server `{name}`，下一轮任务生效。agent 侧工具名形如 `mcp__{name}__<tool>`。"),
+                    hint,
+                )
+                .await;
+            }
+            "rm" => {
+                let Some(name) = parts.get(2).map(|s| s.trim()).filter(|n| !n.is_empty()) else {
+                    self.reply(conv, "用法：/mcp rm <名>", hint).await;
+                    return;
+                };
+                let key = format!("mcp_server:{name}");
+                let exists = self
+                    .store
+                    .get_config(&key)
+                    .await
+                    .map(|v| v.is_some())
+                    .unwrap_or(false);
+                if !exists {
+                    self.reply(conv, &format!("⚠️ `{name}` 不存在。"), hint)
+                        .await;
+                    return;
+                }
+                if let Err(e) = self.store.delete_config(&key).await {
+                    self.reply(conv, &format!("⚠️ 删除失败：{e}"), hint).await;
+                    return;
+                }
+                if let Err(e) = self.sync_mcp_to_backend().await {
+                    warn!(target: "imagent::core", error = %e, "MCP 热更同步 backend 失败（下轮不生效）");
+                }
+                self.reply(
+                    conv,
+                    &format!("🗑️ 已移除 MCP server `{name}`（已起的轮次不受影响，下一轮生效）。"),
+                    hint,
+                )
+                .await;
+            }
+            _ => {
+                self.reply(
+                    conv,
+                    "用法：/mcp list · /mcp add <名> <url> · /mcp rm <名>",
+                    hint,
+                )
+                .await
+            }
+        }
+    }
+
+    /// store 的 MCP servers → backend 热更（Backend::set_user_mcp_servers，
+    /// claude 实现合并进 extra_mcp；其余后端默认 no-op）。
+    async fn sync_mcp_to_backend(&self) -> anyhow::Result<()> {
+        let rows = self.store.list_config("mcp_server:").await?;
+        let mut servers = serde_json::Map::new();
+        for (k, v) in rows {
+            let name = k.strip_prefix("mcp_server:").unwrap_or(&k).to_string();
+            servers.insert(name, serde_json::json!({ "url": v.trim() }));
+        }
+        self.backend
+            .set_user_mcp_servers(serde_json::json!({ "mcpServers": servers }));
+        Ok(())
+    }
+
     /// /last —— 回看本会话最近一次成功轮（v1.25）：任务摘要 + 结论 + 耗时/
     /// 成本。长会话翻旧结论不再滚屏或全量 /export。
     pub(super) async fn cmd_last(&self, conv: &ConvId, hint: &ReplyHint) {

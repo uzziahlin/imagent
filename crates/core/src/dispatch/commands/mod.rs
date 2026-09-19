@@ -270,6 +270,10 @@ impl Dispatcher {
                         self.cmd_compact(&conv, &hint).await;
                         return;
                     }
+                    "/mcp" => {
+                        self.cmd_mcp(&conv, &sender.0, &hint, &parts).await;
+                        return;
+                    }
                     "/last" => {
                         self.cmd_last(&conv, &hint).await;
                         return;
