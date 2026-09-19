@@ -2,6 +2,30 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.26.0] — 2026-09-14
+
+> **可诊断性 + 能力面 + 质量护城河批次**：/doctor 权限自检、/mcp 热管理、
+> 命令排队回执、/status 明细、md_element 收口、事件回放测试基建。
+> 全仓 693 tests / 0 failed、clippy 零警告。
+
+### Added
+- **/doctor 平台权限自检**：tenant token → bot 能力 → 消息读权限三级探测，
+  错误形态翻译成可行动指引（含「开通后须发布版本」提醒）+ 功能↔权限
+  对照表——权限类静默失败（引用/合并转发收不到）一次 /doctor 定位
+- **/mcp 热管理**：`/mcp add <名> <url> · list · rm`——agent 的 MCP
+  servers IM 内一句话扩展（store 持久化 + backend 热更，下一轮生效、
+  重启不丢；与 config 文件源合并；admin 门槛）——加数据库/浏览器等
+  tool server 不必手编 JSON 重启
+- **命令排队回执**：任务在飞时 /new //resume //switch //compact 先回
+  「已排队」提示——此前无回执静默等锁
+- **/status 在飞明细**：每个会话的任务摘要 + 运行时长 + 本会话标记
+- **事件回放测试基建**：真实事件 fixture（引用回复/合并转发/私聊文本）
+  → 解析管线断言——字段形态假设前移到 CI（v1.25.2 教训的护城河）
+
+### Changed
+- md_element/sized/anchored 构造收口：markdown 元素唯一出口（转义+掩码
+  内建），24 处裸构造迁移——`<at>` 注入防线三次人肉审出遗漏的结构性根治
+
 ## [1.25.2] — 2026-09-13
 
 > **引用会话记录修复**（真机反馈）：引用合并转发消息（聊天记录卡片）
