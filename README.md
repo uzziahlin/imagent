@@ -296,6 +296,7 @@ secret 轮换 / 环境变量变化后：重新 `export` + `imagent service insta
 | `/timeout [N\|off\|default]` | 会话级空闲看门狗（分钟） |
 | `/perm <auto\|off\|allow\|deny\|ask>` | 权限模式热切（auto=按后端自动选档） |
 | `/perm list` / `/perm revoke <工具>` | 查看/单项撤销本会话「始终允许」清单 |
+| `/mcp list · add <名> <url> · rm <名>` | agent 的 MCP servers 热管理（管理员；下一轮生效，重启不丢；与 config `mcp_config_path` 文件源合并） |
 | `/stop [all]` | 中断在飞任务（**排队消息保留并自动转入下一轮**——对齐 Claude Code 的 Esc+队列注入语义；`/stop all` 硬停清空排队；任务恰在收尾时如实回「已完成」不谎报中断） |
 | `/queue list\|drop <n>` | 查看当前会话排队消息 / 丢弃指定序号（自己的或管理员） |
 | `/cron add <分 时 日 月 周> <指令>` | 定时任务（本地时区含 DST；`*`/`*/n`/范围/列表，`/cron add */10 * * * * 检查构建`） |

@@ -348,6 +348,11 @@ impl Backend for ClaudeBackend {
         self.model.read().clone()
     }
 
+    fn set_user_mcp_servers(&self, servers: serde_json::Value) {
+        // v1.26 /mcp 热管理：下一轮 spawn 生效（write_mcp_config 现读）。
+        self.runtime.write().extra_mcp = Some(servers);
+    }
+
     fn supports_model_selection(&self) -> bool {
         true
     }

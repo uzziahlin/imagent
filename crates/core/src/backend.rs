@@ -139,6 +139,11 @@ pub trait Backend: Send + Sync {
         None
     }
 
+    /// v1.26 /mcp 热管理：热更新用户 MCP servers（值形如 {"mcpServers": {...}}，
+    /// 与 mcp_config_path 文件源同构）。claude 系实现合并进每次 spawn 的
+    /// --mcp-config；其余后端默认 no-op（无 MCP 通道）。
+    fn set_user_mcp_servers(&self, _servers: serde_json::Value) {}
+
     /// W1-2：是否支持模型选择（不支持的后端 `/model` 回明确提示而非静默无效）。
     fn supports_model_selection(&self) -> bool {
         false
