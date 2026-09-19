@@ -1,0 +1,24 @@
+{
+  "schema": "2.0",
+  "header": {
+    "event_id": "fixture-mf-001",
+    "event_type": "im.message.receive_v1",
+    "create_time": "1700000000000"
+  },
+  "event": {
+    "sender": { "sender_id": { "open_id": "ou_fixture_user" } },
+    "message": {
+      "message_id": "om_fixture_mf",
+      "root_id": "",
+      "parent_id": "",
+      "create_time": "1700000001000",
+      "chat_id": "oc_fixture_group",
+      "chat_type": "group",
+      "message_type": "merged_forward",
+      "content": "{\"title\":\"讨论\",\"summary\":\"3 条消息\"}",
+      "mentions": [
+        { "key": "@_user_1", "id": { "open_id": "ou_fixture_bot" } }
+      ]
+    }
+  }
+}

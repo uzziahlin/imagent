@@ -143,7 +143,7 @@ pub fn quoted_context_text(msg_type: &str, content: &str) -> Option<String> {
 
 /// v1.25.2：不限会话形态的 parent_id 提取（引用上下文用——私聊引用此前被
 /// 群版 peek 跳过）。群「回复即定向」仍用 [`peek_group_reply_parent`]。
-pub(crate) fn peek_reply_parent(payload: &[u8]) -> Option<String> {
+pub fn peek_reply_parent(payload: &[u8]) -> Option<String> {
     #[derive(serde::Deserialize)]
     struct P {
         event: E,
