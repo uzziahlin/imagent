@@ -331,6 +331,8 @@ impl Dispatcher {
             RoundHandle {
                 abort: join.abort_handle(),
                 steer: steer_capable.then_some(steer_tx),
+                started: std::time::Instant::now(),
+                digest: Some(first_prompt_digest.clone()),
             },
         );
 

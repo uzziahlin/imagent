@@ -95,7 +95,35 @@ impl Dispatcher {
             .get(&conv.0)
             .map(|q| q.len())
             .unwrap_or(0);
-        let in_flight = self.running.lock().await.len();
+        // v1.26 明细：每个在飞会话的任务摘要 + 已运行时长（Omnara dashboard
+        // 的 IM 平民版——此前只有一个数字）。
+        let running_detail: Vec<String> = {
+            let running = self.running.lock().await;
+            running
+                .iter()
+                .map(|(rc, h)| {
+                    let secs = h.started.elapsed().as_secs();
+                    let run = if secs < 60 {
+                        format!("{secs}s")
+                    } else {
+                        format!("{}m{}s", secs / 60, secs % 60)
+                    };
+                    let digest = h
+                        .digest
+                        .as_deref()
+                        .filter(|d| !d.is_empty())
+                        .map(|d| super::super::truncate_str(d, 30))
+                        .unwrap_or_else(|| "（任务）".into());
+                    let mark = if rc.as_str() == conv.0.as_str() {
+                        "（本会话）"
+                    } else {
+                        ""
+                    };
+                    format!("\n- {digest} · 已跑 {run}{mark}")
+                })
+                .collect()
+        };
+        let in_flight = running_detail.len();
         let wd = self.resolve_workdir(&conv.0).await;
         let name_key = active_name_key(&conv.0);
         let (sess, active) = tokio::join!(
@@ -140,12 +168,13 @@ impl Dispatcher {
         }
         .unwrap_or_default();
         let text = format!(
-                            "📊 当前状态\n- 🤖 后端：{}（{}）\n- 💬 本会话：{}，排队 {} 条\n- 🔗 会话：{sess_desc}{ctx_line}\n- 📁 工作目录：{}\n- 🏃 全局在飞：{in_flight} 个\n- ⏱️ 运行时长：{}",
+                            "📊 当前状态\n- 🤖 后端：{}（{}）\n- 💬 本会话：{}，排队 {} 条\n- 🔗 会话：{sess_desc}{ctx_line}\n- 📁 工作目录：{}\n- 🏃 全局在飞：{in_flight} 个{}\n- ⏱️ 运行时长：{}",
                             self.backend.name(),
                             self.platform.name(),
                             if running_here { "任务在跑" } else { "无任务" },
                             queued_here,
                             wd.display(),
+                            running_detail.join(""),
                             format_uptime(self.started_at.elapsed()),
                         );
         self.reply(conv, &text, hint).await;
@@ -183,6 +212,10 @@ impl Dispatcher {
         } else {
             format!("ℹ️ 在飞任务 {in_flight} 个（/stop 可中断）")
         });
+        // v1.26：平台侧 API 权限探测（token/bot 能力/消息读 + 功能对照表）。
+        for l in self.platform.doctor_probes().await {
+            lines.push(l);
+        }
         lines.push(format!(
             "ℹ️ 平台 {} / 后端 {}（{}）",
             self.platform.name(),

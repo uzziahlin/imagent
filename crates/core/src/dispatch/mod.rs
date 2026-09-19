@@ -463,6 +463,9 @@ type ResumeCache = HashMap<(String, String), (Instant, Vec<ResumeEntry>)>;
 pub(super) struct RoundHandle {
     pub(super) abort: tokio::task::AbortHandle,
     pub(super) steer: Option<tokio::sync::mpsc::Sender<String>>,
+    /// v1.26 /status 明细：轮次起跑时刻 + 任务摘要（task_digest 同源）。
+    pub(super) started: std::time::Instant,
+    pub(super) digest: Option<String>,
 }
 
 pub struct Dispatcher {
@@ -1486,6 +1489,29 @@ impl Dispatcher {
         map.entry(conv.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    /// v1.26 排队回执：会话命令（/new //compact //resume 等）取 conv 锁前
+    /// 若有在飞轮次，先回一条「已排队」提示——此前这些命令无回执静默等锁，
+    /// 长任务期间用户不知命令是否送达。命令语义不变（锁到手照常执行）。
+    async fn acquire_conv_lock_with_ack(
+        &self,
+        conv: &str,
+        hint: &ReplyHint,
+        cmd: &str,
+    ) -> Arc<Mutex<()>> {
+        let busy = self.running.lock().await.contains_key(conv);
+        if busy {
+            self.reply(
+                &ConvId(conv.to_string()),
+                &format!(
+                    "⏳ 当前有任务在跑，{cmd} 已排队——任务结束后自动执行（要立即生效可先 /stop）"
+                ),
+                hint,
+            )
+            .await;
+        }
+        self.acquire_conv_lock(conv).await
     }
 
     /// 回收 conv 串行锁（P1-7：失败/正常路径统一调用，防 conv_locks HashMap 项
