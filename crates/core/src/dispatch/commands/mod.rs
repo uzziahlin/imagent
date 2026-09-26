@@ -495,6 +495,10 @@ impl Dispatcher {
                 .filter_map(|m| m.source_msg_id.clone().filter(|s| s.starts_with("om_")))
                 .collect();
             let merged = merge_batch(batch);
+            // P2（code-review v13）：全局并发护栏——持 conv 锁后、spawn agent 前
+            // 取 permit（等待期间本 conv 后续消息照常入队等下一批）。permit 跨
+            // 整轮持有（含轮后的自动 compact），迭代末 Drop 归还。
+            let _round_permit = self.acquire_round_permit(&conv.0).await;
             let round_input = self.run_agent_round(merged, react_mids).await;
             // v1.18：轮末清 steering 注入计数（footer「已注入 N 条」随轮归零；
             // 保留排队字段——下一批语义仍在）。

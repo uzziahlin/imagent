@@ -93,6 +93,8 @@ type InboxHandle = Arc<TokioMutex<Vec<String>>>;
 type CounterHandle = Arc<AtomicUsize>;
 type CallsHandle = Arc<TokioMutex<Vec<Option<String>>>>;
 type PromptsHandle = Arc<TokioMutex<Vec<String>>>;
+/// P2（v13）：MockPlatform 入站队列句柄（编程 run() 的 recv 流用）。
+type RecvQueueHandle = Arc<TokioMutex<Option<Vec<InboundMessage>>>>;
 
 // ---------- mock platform ----------
 
@@ -110,6 +112,10 @@ struct MockPlatform {
     reactions: Arc<TokioMutex<Vec<(String, crate::types::MsgReaction)>>>,
     /// typing 闸门（默认 None：send_typing 立即返回）。
     typing_gate: Option<TypingGate>,
+    /// P2（v13）：resolve_permission_ask 闸门（默认 None：立即返回）。Some 时
+    /// 先记 [resolve-enter] 标记再挂起等 notify——验证 recv 循环不被慢收敛
+    /// 卡死（spawn 化回归）。
+    resolve_gate: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl MockPlatform {
@@ -123,6 +129,7 @@ impl MockPlatform {
             urgent: false,
             reactions: Arc::new(TokioMutex::new(Vec::new())),
             typing_gate: None,
+            resolve_gate: None,
         };
         (p, inbox, send_count)
     }
@@ -132,6 +139,23 @@ impl MockPlatform {
         let (mut p, inbox, count) = Self::new();
         p.urgent = true;
         (p, inbox, count)
+    }
+
+    /// P2（v13）：resolve_permission_ask 挂起变体（闸门由测试持有）；一并返回
+    /// recv 队列句柄（编程 run() 的入站流用）。
+    #[allow(clippy::type_complexity)]
+    fn new_slow_resolve() -> (
+        Self,
+        InboxHandle,
+        CounterHandle,
+        RecvQueueHandle,
+        Arc<tokio::sync::Notify>,
+    ) {
+        let (mut p, inbox, count) = Self::new();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        p.resolve_gate = Some(gate.clone());
+        let queue = p.recv_queue.clone();
+        (p, inbox, count, queue, gate)
     }
 }
 
@@ -233,6 +257,19 @@ impl Platform for MockPlatform {
     fn name(&self) -> &'static str {
         "mock"
     }
+    /// P2（v13）：闸门变体——记录「已进入」后挂起等 notify（30s 兜底防悬挂）。
+    async fn resolve_permission_ask(
+        &self,
+        _conv: &ConvId,
+        _request_id: &str,
+        _reply: &crate::permission::PermissionReply,
+    ) -> Result<()> {
+        if let Some(g) = &self.resolve_gate {
+            self.inbox.lock().await.push("[resolve-enter]".to_string());
+            let _ = tokio::time::timeout(Duration::from_secs(30), g.notified()).await;
+        }
+        Ok(())
+    }
 }
 
 // ---------- mock backend ----------
@@ -269,6 +306,9 @@ struct MockBackend {
     capability: crate::backend::PermissionCapability,
     /// RunOutcome 携带的 usage（run_stats 落库/自动压缩阈值测试用；默认 None）。
     usage: Option<crate::types::UsageStats>,
+    /// P2（v13）：完成闸门（默认 None：立即完成）。Some 时 run 记录调用后挂起
+    /// 等 notify_waiters——并发护栏测试用（精确控制「轮次在飞」窗口）。
+    complete_gate: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl MockBackend {
@@ -293,6 +333,7 @@ impl MockBackend {
             local_sessions: Arc::new(TokioMutex::new(Vec::new())),
             capability: crate::backend::PermissionCapability::Unsupported,
             usage: None,
+            complete_gate: None,
         };
         (b, calls, prompts, order)
     }
@@ -373,6 +414,20 @@ impl MockBackend {
         *b.local_sessions.lock().await = local;
         (b, calls, prompts, order)
     }
+    /// P2（v13）：完成闸门变体——run 开跑（调用已记录）后挂起等 notify_waiters，
+    /// 精确制造「轮次在飞」窗口（并发护栏测试用）。
+    fn new_gated() -> (
+        Self,
+        CallsHandle,
+        PromptsHandle,
+        CounterHandle,
+        Arc<tokio::sync::Notify>,
+    ) {
+        let (mut b, calls, prompts, order) = Self::new();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        b.complete_gate = Some(gate.clone());
+        (b, calls, prompts, order, gate)
+    }
 }
 
 #[async_trait]
@@ -425,6 +480,11 @@ impl Backend for MockBackend {
 
         // 稍微让出调度器，便于测试串行。
         tokio::task::yield_now().await;
+
+        // P2（v13）：完成闸门——调用已记录（在飞可观测）后挂起，等测试放行。
+        if let Some(g) = &self.complete_gate {
+            let _ = tokio::time::timeout(Duration::from_secs(60), g.notified()).await;
+        }
 
         // P2-11：发完 delta 即挂起（不发 Final、不返回）——等 /stop abort。
         if self.stream_then_hang {
@@ -729,6 +789,8 @@ fn test_budgets() -> TaskBudgets {
         auto_compact_window_ratio: 0.8,
         cron_catchup: crate::config::CronCatchup::One,
         sender_daily_cost_limit_usd: None,
+        // P2（v13）：既有用例默认不限制并发（护栏用例显式设置上限）。
+        max_concurrent_rounds: 0,
     }
 }
 
@@ -3923,6 +3985,7 @@ async fn stop_on_text_platform_marks_interrupted() {
             shutdown_grace: Duration::from_secs(5),
             agent_idle_timeout: Duration::ZERO,
             batch_window: Duration::ZERO,
+            max_concurrent_rounds: 0,
         },
     )
     .await;
@@ -4560,6 +4623,7 @@ async fn wait_reply_buzz_once_then_timeout() {
             None,
             crate::permission::PendingKind::Permission,
             Some("Bash"),
+            None,
         )
         .await;
     let out = super::wait_reply_with_buzz(
@@ -4587,6 +4651,7 @@ async fn wait_reply_buzz_once_then_timeout() {
             None,
             crate::permission::PendingKind::Permission,
             Some("Read"),
+            None,
         )
         .await;
     tokio::spawn(async move {
@@ -4601,6 +4666,7 @@ async fn wait_reply_buzz_once_then_timeout() {
                     always: false,
                     message: None,
                     raw_text: Some("y".into()),
+                    cancelled: false,
                 },
             )
             .await;
@@ -4688,6 +4754,7 @@ async fn round_buzzes_done_when_ask_happened() {
             None,
             crate::permission::PendingKind::Permission,
             Some("Bash"),
+            None,
         )
         .await;
     handle.await.expect("round");
@@ -4733,6 +4800,7 @@ async fn round_buzzes_done_when_ask_happened() {
             None,
             crate::permission::PendingKind::Permission,
             Some("Bash"),
+            None,
         )
         .await;
     handle.await.expect("round");
@@ -5203,6 +5271,7 @@ async fn learned_context_window_recalibrates_threshold() {
             shutdown_grace: Duration::from_secs(5),
             agent_idle_timeout: Duration::ZERO,
             batch_window: Duration::ZERO,
+            max_concurrent_rounds: 0,
         },
     )
     .await;
@@ -5548,4 +5617,530 @@ fn queued_hint_display_with_steered() {
         queued_hint_display(&both).as_deref(),
         Some("📥 已注入 1 条运行中消息，排队 3 条，最新：「看这张图」")
     );
+}
+
+// ---------- P2（code-review v13）调度批：recv 解阻塞 / 并发护栏 / 发起者锚定 / ask 取消 ----------
+
+/// 与 build_with_parts 相同但允许指定 budgets 与 permission_mode（v13 批测试用）。
+async fn build_with_parts_full(
+    auth: Auth,
+    plat: MockPlatform,
+    back: MockBackend,
+    budgets: TaskBudgets,
+    mode: PermissionMode,
+) -> Ctx {
+    let _ = std::fs::create_dir_all("/tmp/imagent-test-ws");
+    let (inbox, send_count) = (plat_inbox_of(&plat), plat_count_of(&plat));
+    let (store, db) = tmp_store().await;
+    let admins = auth.snapshot();
+    let disp = Arc::new(Dispatcher::new(
+        Arc::new(plat),
+        Arc::new(back),
+        store,
+        auth,
+        std::path::PathBuf::from("/tmp/imagent-test-ws"),
+        vec!["Read".into(), "Edit".into()],
+        mode,
+        budgets,
+        CotDetail::Brief,
+        admins,
+    ));
+    Ctx {
+        disp,
+        inbox,
+        send_count,
+        calls: Default::default(),
+        prompts: Default::default(),
+        order: Default::default(),
+        db,
+    }
+}
+
+/// 等待谓词成立（5s 上限；5ms 轮询）。谓词是「借 ctx 返回 future」的闭包
+///（Box::pin 消 async 块对借用生命周期的推断歧义）。
+async fn wait_until<F>(ctx: &Ctx, f: F) -> bool
+where
+    F: Fn(&Ctx) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + '_>>,
+{
+    for _ in 0..1000 {
+        if f(ctx).await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    f(ctx).await
+}
+
+/// P2（v13）①：审批决策后的平台收敛（resolve_permission_ask）挂起时，recv 主循环
+/// 不得被卡死——后续消息照常处理。回归点：route 命中分支的 resolve/审计/提示
+/// 此前内联 await，飞书 429/token 刷新（30s+）期间所有 conv 的入站消息停摆。
+#[tokio::test]
+async fn recv_loop_survives_slow_ask_resolution() {
+    let _serial = SERIAL.lock().await;
+    let (plat, inbox, _count, recv_queue, resolve_gate) = MockPlatform::new_slow_resolve();
+    let (back, _calls, _prompts, _order) = MockBackend::new();
+    let mut ctx = build_with_parts_full(
+        Auth::new(vec!["alice".into()]),
+        plat,
+        back,
+        test_budgets(),
+        PermissionMode::Allow,
+    )
+    .await;
+    ctx.inbox = inbox.clone();
+
+    // 预挂一个带发起者的 pending；recv 队列：先 "y"（决策回复），后普通消息。
+    let rx = ctx
+        .disp
+        .router()
+        .register(
+            "c1",
+            "r-1",
+            None,
+            crate::permission::PendingKind::Permission,
+            Some("Bash"),
+            Some("alice"),
+        )
+        .await;
+    *recv_queue.lock().await = Some(vec![
+        msg("c1", "alice", "y"),
+        msg("c1", "alice", "second message"),
+    ]);
+
+    let run_handle = {
+        let disp = ctx.disp.clone();
+        tokio::spawn(async move {
+            let _ = disp.run().await;
+        })
+    };
+
+    // ① resolve 已进入平台调用（决策已 route，spawn 的收敛任务在跑且挂起）。
+    assert!(
+        wait_until(&ctx, |c| {
+            Box::pin(async move { c.inbox.lock().await.iter().any(|t| t == "[resolve-enter]") })
+        })
+        .await,
+        "resolve 任务应已进入（决策已送达）"
+    );
+    // ② 闸门不放行的前提下，后续消息仍被处理（backend 跑完并回复）——
+    //    旧实现里 resolve 内联 await 会把 recv 循环钉死在这里。
+    assert!(
+        wait_until(&ctx, |c| {
+            Box::pin(async move { c.inbox.lock().await.iter().any(|t| t.starts_with("reply#")) })
+        })
+        .await,
+        "慢 resolve 不得阻塞 recv 循环处理后续消息: {:?}",
+        ctx.inbox.lock().await
+    );
+    // ③ 决策本体已送达等待者（allow——Allow 档无 R4 强制 deny）。
+    let decision = tokio::time::timeout(Duration::from_secs(2), rx)
+        .await
+        .expect("决策应立即送达")
+        .expect("sender 未 drop");
+    assert!(decision.allow, "alice 本人回复 y 应放行");
+
+    // 收尾：放行闸门 + shutdown，drain 不悬挂。
+    resolve_gate.notify_waiters();
+    ctx.disp.shutdown();
+    let _ = tokio::time::timeout(Duration::from_secs(5), run_handle).await;
+    drop_db(ctx.db).await;
+}
+
+/// P2（v13）②：全局并发护栏——上限 1 时两个 conv 的轮次串行（第二个等
+/// permit 到第一个整轮结束）；上限 0（不限制）时并行。gated backend 精确
+/// 控制「在飞」窗口。
+#[tokio::test]
+async fn max_concurrent_rounds_gates_cross_conv_parallelism() {
+    let _serial = SERIAL.lock().await;
+    let auth = Auth::new(vec!["alice".into()]);
+
+    // ---- 上限 1：串行。----
+    let (plat, _pi, _pc) = MockPlatform::new();
+    let (back, calls, _prompts, _order, gate) = MockBackend::new_gated();
+    let mut budgets = test_budgets();
+    budgets.max_concurrent_rounds = 1;
+    let mut ctx =
+        build_with_parts_full(auth.clone(), plat, back, budgets, PermissionMode::Off).await;
+    ctx.calls = calls.clone();
+
+    let d1 = ctx.disp.clone();
+    let h1 = tokio::spawn(async move { d1.handle(msg("c1", "alice", "task one")).await });
+    let d2 = ctx.disp.clone();
+    let h2 = tokio::spawn(async move { d2.handle(msg("c2", "alice", "task two")).await });
+
+    // 第一个轮次起跑（调用已记录）。
+    assert!(
+        wait_until(&ctx, |c| Box::pin(async move {
+            !c.calls.lock().await.is_empty()
+        }))
+        .await,
+        "第一个 conv 的轮次应起跑"
+    );
+    // 闸门不放行期间，第二个 conv 必须还在等 permit（不得起跑）。
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        ctx.calls.lock().await.len(),
+        1,
+        "上限 1：第二轮次应等 permit，不得并行起跑"
+    );
+    // 放行第一轮 → permit 释放 → 第二轮起跑。
+    gate.notify_one();
+    assert!(
+        wait_until(&ctx, |c| Box::pin(async move {
+            c.calls.lock().await.len() >= 2
+        }))
+        .await,
+        "第一轮完成后第二轮应立即起跑"
+    );
+    gate.notify_one();
+    let _ = tokio::time::timeout(Duration::from_secs(5), h1).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), h2).await;
+    // 在飞 gauge 归零（permit guard Drop 收口）。
+    assert_eq!(
+        crate::metrics::METRICS.running_rounds.get(),
+        0,
+        "全部轮次结束后在飞 gauge 应归零"
+    );
+    drop_db(ctx.db).await;
+
+    // ---- 上限 0：并行不受限。----
+    let (plat0, _pi0, _pc0) = MockPlatform::new();
+    let (back0, calls0, _prompts0, _order0, gate0) = MockBackend::new_gated();
+    let mut budgets0 = test_budgets();
+    budgets0.max_concurrent_rounds = 0;
+    let mut ctx0 = build_with_parts_full(auth, plat0, back0, budgets0, PermissionMode::Off).await;
+    ctx0.calls = calls0.clone();
+    let d1 = ctx0.disp.clone();
+    let h1 = tokio::spawn(async move { d1.handle(msg("c1", "alice", "task one")).await });
+    let d2 = ctx0.disp.clone();
+    let h2 = tokio::spawn(async move { d2.handle(msg("c2", "alice", "task two")).await });
+    // 闸门完全不放行，两个轮次都应已在飞。
+    assert!(
+        wait_until(&ctx0, |c| Box::pin(async move {
+            c.calls.lock().await.len() >= 2
+        }))
+        .await,
+        "上限 0 = 不限制：两轮应并行起跑"
+    );
+    gate0.notify_one();
+    gate0.notify_one();
+    let _ = tokio::time::timeout(Duration::from_secs(5), h1).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), h2).await;
+    drop_db(ctx0.db).await;
+}
+
+/// P2（v13）②：热改重建信号量——上限 1 → 4 后，**后续 acquire** 走新闸立即
+/// 放行；已在旧信号量上排队的等待者不受热改影响（仍按旧闸顺序）。notify_one
+/// 的 stored permit 语义使放行确定性成立（notify_waiters 对未注册等待者丢唤醒）。
+#[tokio::test]
+async fn max_concurrent_rounds_hot_reload_rebuilds_gate() {
+    let _serial = SERIAL.lock().await;
+    let auth = Auth::new(vec!["alice".into()]);
+    let (plat, _pi, _pc) = MockPlatform::new();
+    let (back, calls, _prompts, _order, gate) = MockBackend::new_gated();
+    let mut budgets = test_budgets();
+    budgets.max_concurrent_rounds = 1;
+    let mut ctx = build_with_parts_full(auth, plat, back, budgets, PermissionMode::Off).await;
+    ctx.calls = calls;
+
+    // A：占住旧闸唯一的 permit，在完成闸门挂起。
+    let d1 = ctx.disp.clone();
+    let h1 = tokio::spawn(async move { d1.handle(msg("c1", "alice", "one")).await });
+    assert!(
+        wait_until(&ctx, |c| Box::pin(async move {
+            !c.calls.lock().await.is_empty()
+        }))
+        .await,
+        "A 应起跑（旧闸唯一 permit）"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await; // A 注册到完成闸门。
+                                                          // B：热改**前**起跑 → snapshot 旧信号量 → 在旧闸排队。
+    let d2 = ctx.disp.clone();
+    let h2 = tokio::spawn(async move { d2.handle(msg("c2", "alice", "two")).await });
+    tokio::time::sleep(Duration::from_millis(100)).await; // 确保 B 已在旧 sem 等待。
+    assert_eq!(ctx.calls.lock().await.len(), 1, "B 应在旧闸排队，不得起跑");
+    // 热改放宽到 4：C 的新 acquire 走新闸，不等 A/B。
+    ctx.disp.reload_max_concurrent_rounds(4);
+    let d3 = ctx.disp.clone();
+    let h3 = tokio::spawn(async move { d3.handle(msg("c3", "alice", "three")).await });
+    assert!(
+        wait_until(&ctx, |c| Box::pin(async move {
+            c.calls.lock().await.len() >= 2
+        }))
+        .await,
+        "热改后新起跑的 C 应立即经新闸拿到 permit"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        ctx.calls.lock().await.len(),
+        2,
+        "B 仍在旧闸排队（热改不影响已排队等待者），在飞 = A + C"
+    );
+    // 放行 A → 旧 permit 释放 → B 按旧闸起跑。
+    gate.notify_one();
+    assert!(
+        wait_until(&ctx, |c| Box::pin(async move {
+            c.calls.lock().await.len() >= 3
+        }))
+        .await,
+        "A 完成后 B 应经旧闸放行"
+    );
+    gate.notify_one(); // 放行 B。
+    gate.notify_one(); // 放行 C。
+    let _ = tokio::time::timeout(Duration::from_secs(5), h1).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), h2).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), h3).await;
+    drop_db(ctx.db).await;
+}
+
+/// P2（v13）③：审批发起者锚定贯通文本路径——群 conv 里 A 发起的审批，B 打
+/// "y" 不得消费（pending 保留 + 明确提示 + 消息不吞继续走 agent 管线）；A 打
+/// "y" 正常放行。经 run() recv 循环全链路验证。admin 代批另在 helper 级验证
+/// （见 permission_initiator_block_admin_bypass）。
+#[tokio::test]
+async fn permission_initiator_anchor_gates_text_replies() {
+    let _serial = SERIAL.lock().await;
+    let (plat, inbox, _count, recv_queue) = {
+        let (p, i, c) = MockPlatform::new();
+        let q = p.recv_queue.clone();
+        (p, i, c, q)
+    };
+    let (back, _calls, prompts, _order) = MockBackend::new();
+    let mut ctx = build_with_parts_full(
+        Auth::new(vec!["alice".into(), "bob".into()]),
+        plat,
+        back,
+        test_budgets(),
+        PermissionMode::Allow,
+    )
+    .await;
+    // 测试基建默认把白名单全员设为 admin——本用例要求 bob 只是白名单成员
+    //（非 admin 不可代批），收窄 admin 名单到 alice。
+    ctx.disp.reload_admins(vec!["alice".into()]);
+    ctx.inbox = inbox.clone();
+    ctx.prompts = prompts.clone();
+
+    // A（alice）发起的审批 pending。
+    let rx = ctx
+        .disp
+        .router()
+        .register(
+            "c-group",
+            "r-1",
+            None,
+            crate::permission::PendingKind::Permission,
+            Some("Bash"),
+            Some("alice"),
+        )
+        .await;
+    // B 先答（不得消费）——先只投 B 的消息，断言完拦截形态再投 A 的
+    //（两条背靠背到达时 pending 保留断言会有「A 已消费」竞态）。
+    *recv_queue.lock().await = Some(vec![msg("c-group", "bob", "y")]);
+    let run_handle = {
+        let disp = ctx.disp.clone();
+        tokio::spawn(async move {
+            let _ = disp.run().await;
+        })
+    };
+
+    // B 的 "y"：被锚定拦截——提示出现、pending 保留、消息本身继续走 agent
+    //（不吞：backend 收到 prompt "y"）。
+    assert!(
+        wait_until(&ctx, |c| {
+            Box::pin(async move {
+                c.inbox
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|t| t.contains("该询问由 alice 发起"))
+            })
+        })
+        .await,
+        "B 的回复应收到发起者锚定提示: {:?}",
+        ctx.inbox.lock().await
+    );
+    assert!(
+        wait_until(&ctx, |c| {
+            Box::pin(async move { c.prompts.lock().await.iter().any(|p| p == "y") })
+        })
+        .await,
+        "被拦截的消息不得被吞——应继续走 agent 管线: {:?}",
+        ctx.prompts.lock().await
+    );
+    assert!(
+        ctx.disp.router().has_pending("c-group").await,
+        "拦截不得消费 pending（留给发起者）"
+    );
+
+    // A 的 "y"：正常放行。
+    recv_queue
+        .lock()
+        .await
+        .as_mut()
+        .expect("recv 队列仍在")
+        .push(msg("c-group", "alice", "y"));
+    let decision = tokio::time::timeout(Duration::from_secs(5), rx)
+        .await
+        .expect("A 的回复应在合理时间内消费")
+        .expect("sender 未 drop");
+    assert!(decision.allow, "发起者本人回复 y 应放行");
+
+    ctx.disp.shutdown();
+    let _ = tokio::time::timeout(Duration::from_secs(5), run_handle).await;
+    drop_db(ctx.db).await;
+}
+
+/// P2（v13）③：admin 代批豁免——pending 锚定发起者 alice，非 admin 的 bob 被
+/// 拦、admin 的 bob 放行（helper 级；recv 循环行为由上一用例覆盖）。
+#[tokio::test]
+async fn permission_initiator_block_admin_bypass() {
+    let _serial = SERIAL.lock().await;
+    // alice/bob 白名单；仅 bob 是 admin。
+    let ctx = build_with_admin(
+        Auth::new(vec!["alice".into(), "bob".into()]),
+        vec!["bob".into()],
+    )
+    .await;
+    let _rx = ctx
+        .disp
+        .router()
+        .register(
+            "c-group",
+            "r-1",
+            None,
+            crate::permission::PendingKind::Permission,
+            Some("Bash"),
+            Some("alice"),
+        )
+        .await;
+    // bob 是 admin：放行（None）。
+    assert!(
+        ctx.disp
+            .permission_initiator_block("c-group", &msg("c-group", "bob", "y"))
+            .await
+            .is_none(),
+        "admin 可代批发起者锚定的询问"
+    );
+    // carol 非白名单也非 admin：锚定判定本身仍命中（消费门 can_route 另拦）。
+    let _rx2 = ctx
+        .disp
+        .router()
+        .register(
+            "c-group",
+            "r-2",
+            None,
+            crate::permission::PendingKind::Permission,
+            Some("Bash"),
+            Some("alice"),
+        )
+        .await;
+    assert_eq!(
+        ctx.disp
+            .permission_initiator_block("c-group", &msg("c-group", "carol", "y"))
+            .await,
+        Some("alice".to_string()),
+        "非 admin 仍被锚定拦截"
+    );
+    drop_db(ctx.db).await;
+}
+
+/// P2（v13）④：cancel_all/单条 cancel 对 ask 终端路径回 **Err**（提问被取消），
+/// 不再把「cancelled（任务被 /stop 中断…）」当用户回答文本回写；permission
+/// 路径语义不变（= deny）。
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelled_ask_returns_error_to_terminal() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let _serial = SERIAL.lock().await;
+    let ctx = build_with_mode(Auth::new(vec!["alice".into()]), PermissionMode::Ask).await;
+    let dir = std::env::temp_dir().join(format!("imagent-sock-cancel-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let sock = dir.join("permission.sock");
+    ctx.disp
+        .spawn_socket_accept(sock.to_string_lossy().into_owned());
+    let token_path = dir.join("permission.token");
+    for _ in 0..400 {
+        if sock.exists() && token_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let token = std::fs::read_to_string(&token_path)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // ask 分支：提问送达后 cancel（模拟 /stop 的 cancel_all）→ 终端收到
+    // {"kind":"ask","text":null,"error":"cancelled…"}，而非把文案当答案。
+    {
+        let mut s = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        s.write_all(format!("{token}\n").as_bytes()).await.unwrap();
+        s.write_all(
+            "{\"kind\":\"ask\",\"conv_id\":\"c1\",\"request_id\":\"a-1\",\"question\":\"选哪个方案\"}\n"
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        s.flush().await.unwrap();
+        assert!(
+            wait_until(&ctx, |c| {
+                Box::pin(async move {
+                    c.inbox
+                        .lock()
+                        .await
+                        .iter()
+                        .any(|t| t.contains("AskUserQuestion"))
+                })
+            })
+            .await,
+            "ask 询问应送达 IM"
+        );
+        ctx.disp.router.cancel("c1", "a-1").await;
+        let mut buf = String::new();
+        let mut r = tokio::io::BufReader::new(s);
+        let _ = tokio::time::timeout(Duration::from_secs(2), r.read_line(&mut buf)).await;
+        assert!(
+            buf.contains("\"text\":null") && buf.contains("cancelled"),
+            "cancelled 的 ask 应回 Err（text=null + error），而非当用户回答: {buf}"
+        );
+    }
+
+    // permission 分支：cancel 语义不变 = deny（cancelled 标记不改变 permission
+    // 协议的 allow:false 回复形态）。
+    {
+        let mut s = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        s.write_all(format!("{token}\n").as_bytes()).await.unwrap();
+        s.write_all(
+            b"{\"conv_id\":\"c1\",\"request_id\":\"p-1\",\"tool_name\":\"Bash\",\"input\":{}}\n",
+        )
+        .await
+        .unwrap();
+        s.flush().await.unwrap();
+        assert!(
+            wait_until(&ctx, |c| {
+                Box::pin(async move {
+                    c.inbox
+                        .lock()
+                        .await
+                        .iter()
+                        .any(|t| t.contains("请求执行 Bash"))
+                })
+            })
+            .await,
+            "permission 询问应送达 IM"
+        );
+        ctx.disp.router.cancel("c1", "p-1").await;
+        let mut buf = String::new();
+        let mut r = tokio::io::BufReader::new(s);
+        let _ = tokio::time::timeout(Duration::from_secs(2), r.read_line(&mut buf)).await;
+        assert!(
+            buf.contains("\"allow\":false"),
+            "cancelled 的 permission 应回 deny: {buf}"
+        );
+    }
+
+    ctx.disp.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+    drop_db(ctx.db).await;
 }

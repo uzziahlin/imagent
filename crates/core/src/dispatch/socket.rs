@@ -135,6 +135,8 @@ impl Dispatcher {
         let expected_token = token;
         // H1（code-review v8）：permission_mode 共享句柄——连接处理侧实时读档。
         let permission_mode = self.permission_mode.clone();
+        // P2（v13）：轮次发起者表——permission 分支注册 pending 时锚定发起者。
+        let round_initiators = self.round_initiators.clone();
         tokio::spawn(async move {
             // 鉴权基准：只接受与本进程同 uid 的连接（MCP 子进程由本进程 spawn，必然同 uid）。
             // P2-7/P5-9b 威胁模型：peer_uid 防「跨 uid 伪造」；握手 token 把「同 uid
@@ -158,6 +160,7 @@ impl Dispatcher {
                                     let ask_via_im_timeout = ask_via_im_timeout;
                                     let expected_token = expected_token.clone();
                                     let permission_mode = permission_mode.clone();
+                                    let round_initiators = round_initiators.clone();
                                     tasks.lock().await.spawn(async move {
                                         Self::handle_permission_socket(
                                             stream,
@@ -169,6 +172,7 @@ impl Dispatcher {
                                             ask_via_im_timeout,
                                             expected_token,
                                             permission_mode,
+                                            round_initiators,
                                         )
                                         .await;
                                     });
@@ -295,6 +299,7 @@ impl Dispatcher {
         ask_via_im_timeout: std::time::Duration,
         expected_token: String,
         permission_mode: std::sync::Arc<parking_lot::RwLock<PermissionMode>>,
+        round_initiators: super::RoundInitiators,
     ) {
         // P5-9b：读两行——首行握手 token、次行 JSON 请求。必须共用一个 BufReader：
         // 分开建会把第二行的数据吞进被丢弃的缓冲区。reader 在块内 drop 以释放
@@ -378,6 +383,7 @@ impl Dispatcher {
                     permission_ask_timeout,
                     &req,
                     permission_mode,
+                    round_initiators,
                 )
                 .await;
             }
@@ -512,7 +518,7 @@ impl Dispatcher {
         // D5：先 register 占位（card_msg_id 后补）再发卡——否则用户极快点按钮时
         // 回调在 register 前到达，route 未命中回落 handle 被当普通 prompt 吞掉。
         let rx = router
-            .register(&conv.0, &request_id, None, PendingKind::Ask, None)
+            .register(&conv.0, &request_id, None, PendingKind::Ask, None, None)
             .await;
         let card_msg_id = match platform
             .send_permission_ask(
@@ -572,6 +578,23 @@ impl Dispatcher {
                         &mut stream,
                         &request_id,
                         Err("evicted: pending 超上限被系统收敛（请重试提问）"),
+                    )
+                    .await;
+                    return;
+                }
+                // P2（code-review v13）：系统取消（/stop 的 cancel_all、超限淘汰
+                // 顶替等）不是用户回答——向终端 MCP 客户端回**错误**（语义
+                // 「提问被取消」，agent 自行决定重试/放弃），而非把「cancelled
+                // （任务被 /stop 中断…）」当用户原话回写让它继续推理。
+                if r.cancelled {
+                    METRICS
+                        .ask_via_im_replies
+                        .with_label_values(&["dropped"])
+                        .inc();
+                    Self::write_ask_reply(
+                        &mut stream,
+                        &request_id,
+                        Err(r.message.as_deref().unwrap_or("cancelled: 提问被取消")),
                     )
                     .await;
                     return;
@@ -650,6 +673,7 @@ impl Dispatcher {
         permission_ask_timeout: std::time::Duration,
         req: &serde_json::Value,
         permission_mode: std::sync::Arc<parking_lot::RwLock<PermissionMode>>,
+        round_initiators: super::RoundInitiators,
     ) {
         let tool_name = req
             .get("tool_name")
@@ -695,6 +719,7 @@ impl Dispatcher {
                     always: false,
                     message: Some("auto-allowed: tool not in approval_tools".into()),
                     raw_text: None,
+                    cancelled: false,
                 },
             )
             .await;
@@ -722,6 +747,7 @@ impl Dispatcher {
                         "auto-allowed: tool in session allow-set（本会话已始终允许）".into(),
                     ),
                     raw_text: None,
+                    cancelled: false,
                 },
             )
             .await;
@@ -729,6 +755,10 @@ impl Dispatcher {
         }
         let input_str = req.get("input").map(|v| v.to_string()).unwrap_or_default();
         let conv_id = conv.0.clone();
+        // P2（v13）：发起者锚定——permission socket 请求来自该 conv 在飞轮次的
+        // MCP 子进程，取 core 侧轮次发起者表；无记录（非轮次路径/收尾间隙）为
+        // None，维持既有不比对语义。
+        let initiator = round_initiators.lock().await.get(&conv_id).cloned();
         // P4-4：询问用户——平台支持交互卡片时发「按钮卡片」（send_permission_ask
         // 覆写），否则默认纯文本。按钮点击由平台侧转成携带 ask_req 的入站消息，
         // 复用 recv 循环的审批回复路由，core 不感知按钮。
@@ -745,6 +775,7 @@ impl Dispatcher {
                 None,
                 PendingKind::Permission,
                 Some(&tool_name),
+                initiator.as_deref(),
             )
             .await;
         let card_msg_id = match platform
@@ -768,6 +799,7 @@ impl Dispatcher {
                         always: false,
                         message: Some("send_text failed: IM 不可达".into()),
                         raw_text: None,
+                        cancelled: false,
                     },
                 )
                 .await;
@@ -818,6 +850,7 @@ impl Dispatcher {
                     always: false,
                     message: Some("permission router dropped".into()),
                     raw_text: None,
+                    cancelled: false,
                 }
             }
             super::AskWaitOutcome::TimedOut => {
@@ -859,6 +892,7 @@ impl Dispatcher {
                         "permission ask timed out after {permission_ask_timeout:?}"
                     )),
                     raw_text: None,
+                    cancelled: false,
                 }
             }
         };

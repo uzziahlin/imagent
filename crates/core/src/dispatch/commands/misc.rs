@@ -124,6 +124,14 @@ impl Dispatcher {
                 .collect()
         };
         let in_flight = running_detail.len();
+        // P2（code-review v13）：全局并发护栏——「在飞轮次 X/Y（上限）」；上限 0
+        //（不限制）显示 X（无上限）。取实时在飞数而非 gauge（running 表同源）。
+        let gate_limit = self.round_gate.read().limit;
+        let in_flight_line = if gate_limit == 0 {
+            format!("在飞轮次 {in_flight}（无上限）")
+        } else {
+            format!("在飞轮次 {in_flight}/{gate_limit}")
+        };
         let wd = self.resolve_workdir(&conv.0).await;
         let name_key = active_name_key(&conv.0);
         let (sess, active) = tokio::join!(
@@ -168,7 +176,7 @@ impl Dispatcher {
         }
         .unwrap_or_default();
         let text = format!(
-                            "📊 当前状态\n- 🤖 后端：{}（{}）\n- 💬 本会话：{}，排队 {} 条\n- 🔗 会话：{sess_desc}{ctx_line}\n- 📁 工作目录：{}\n- 🏃 全局在飞：{in_flight} 个{}\n- ⏱️ 运行时长：{}",
+                            "📊 当前状态\n- 🤖 后端：{}（{}）\n- 💬 本会话：{}，排队 {} 条\n- 🔗 会话：{sess_desc}{ctx_line}\n- 📁 工作目录：{}\n- 🏃 全局：{in_flight_line}{}\n- ⏱️ 运行时长：{}",
                             self.backend.name(),
                             self.platform.name(),
                             if running_here { "任务在跑" } else { "无任务" },

@@ -84,6 +84,9 @@ pub struct TaskBudgets {
     pub cron_catchup: crate::config::CronCatchup,
     /// W4-1：per-sender 成本上限（美元，滚动 24h；None = 不限）。
     pub sender_daily_cost_limit_usd: Option<f64>,
+    /// P2（code-review v13）：全局在飞轮数上限（config `max_concurrent_rounds`；
+    /// 0 = 不限制）。生存护栏，非配额——见 config 字段文档。
+    pub max_concurrent_rounds: usize,
 }
 
 impl TaskBudgets {
@@ -102,6 +105,7 @@ impl TaskBudgets {
             auto_compact_window_ratio: c.auto_compact_window_ratio,
             cron_catchup: c.cron_catchup,
             sender_daily_cost_limit_usd: c.sender_daily_cost_limit_usd,
+            max_concurrent_rounds: c.max_concurrent_rounds,
         }
     }
 }
@@ -589,7 +593,39 @@ pub struct Dispatcher {
     /// D12：permission socket accept task 是否已 spawn（幂等防重复 spawn；
     /// run() 启动与 /perm ask 热切共用同一路径）。
     socket_spawned: std::sync::atomic::AtomicBool,
+    /// P2（code-review v13）：全局并发护栏——跨 conv 的在飞 agent 轮数上限。
+    /// `running` 表只做 per-conv 串行，N 个 conv 在飞 = N 个 agent 子进程，
+    /// 多群/cron 齐点/webhook 风暴下无界（内存与 API 配额同炸）。信号量在
+    /// runner 持 conv 锁后、spawn agent 前获取，等待期间该 conv 后续消息照常
+    /// 排队。SIGHUP 热改 = 重建信号量（见 [`Self::reload_max_concurrent_rounds`]，
+    /// 只影响后续 acquire；在飞 permit 与已排队等待者不受影响）。
+    round_gate: parking_lot::RwLock<RoundGate>,
+    /// P2（code-review v13）：per-conv 当前轮次发起者（审批锚定用）。轮次起跑
+    /// 时与 `note_round_initiator` 同步记录，run_agent_round 统一收尾清除；
+    /// /compact 自动轮在轮次收尾后触发，届时已清除（锚定回退 None，宁漏拒
+    /// 不误拒）。socket/hook 侧注册 pending 时据此锚定发起者。
+    round_initiators: RoundInitiators,
 }
+
+/// P2（code-review v13）：全局在飞轮数闸门。`limit` = 配置上限（0 = 不限制，
+/// 此时 `sem` 不参与获取）；`sem` 持有跨整轮（含自动 compact 轮）。重建 =
+/// 热改上限（旧 permit 继续有效，新 acquire 走新闸）。
+pub(crate) struct RoundGate {
+    pub(crate) limit: usize,
+    pub(crate) sem: Arc<tokio::sync::Semaphore>,
+}
+
+impl RoundGate {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            sem: Arc::new(tokio::sync::Semaphore::new(limit)),
+        }
+    }
+}
+
+/// per-conv 轮次发起者表（conv_id → sender id）。
+type RoundInitiators = Arc<Mutex<HashMap<String, String>>>;
 
 impl Dispatcher {
     #[allow(clippy::too_many_arguments)]
@@ -692,6 +728,8 @@ impl Dispatcher {
             shutdown: Arc::new(tokio_util::sync::CancellationToken::new()),
             tasks: Arc::new(Mutex::new(tokio::task::JoinSet::new())),
             socket_spawned: std::sync::atomic::AtomicBool::new(false),
+            round_gate: parking_lot::RwLock::new(RoundGate::new(budgets.max_concurrent_rounds)),
+            round_initiators: Arc::new(Mutex::new(HashMap::new())),
         };
         // S2：admin_senders 为空 = 无人是管理员，IM 内管理命令全部不可用——
         // 构造即显著提示（防用户以为白名单用户仍可 /allow）。
@@ -777,6 +815,38 @@ impl Dispatcher {
         self.auth.is_allowed(&msg.sender) || self.is_admin(&msg.sender.0)
     }
 
+    /// P2（code-review v13）发起者锚定门：按 route() 同款三级解析定位 pending，
+    /// 携带发起者且回复 sender 非发起者时返回 `Some(initiator)`（recv 循环据此
+    /// 拒绝消费并提示）。**admin 放行**——管理员代批是合理语义（运维代管场景）。
+    /// 私聊天然不受影响（conv 内只有 owner 一人，initiator == sender）。
+    /// 调用方须已确认消息形态可消费（consumable），否则 pending 解析无意义。
+    async fn permission_initiator_block(
+        &self,
+        conv_id: &str,
+        msg: &InboundMessage,
+    ) -> Option<String> {
+        let initiator = self
+            .router
+            .pending_initiator_mismatch(
+                conv_id,
+                msg.ask_req.as_deref(),
+                msg.reply_to.as_deref(),
+                &msg.sender.0,
+            )
+            .await?;
+        if self.is_admin(&msg.sender.0) {
+            debug!(
+                target: "imagent::core",
+                conv_id = conv_id,
+                sender = %msg.sender.0,
+                initiator = %initiator,
+                "admin 代批发起者锚定的询问（放行）"
+            );
+            return None;
+        }
+        Some(initiator)
+    }
+
     /// SIGHUP 热重载：整体替换 allowed_tools。
     /// v1.18：自动压缩预算热改（SIGHUP）——此前为启动快照，改 config 须重启。
     /// v1.20：从「只收阈值」升级为收三原料（窗口/比例/绝对值），重置窗口
@@ -793,6 +863,29 @@ impl Dispatcher {
         };
         self.auto_compact_threshold
             .store(effective, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// P2（code-review v13）：SIGHUP 热改全局并发护栏——重建信号量为新 permit
+    /// 数（与 `reload_auto_compact_budget` 同款「整体替换句柄」手法：Semaphore
+    /// 无法原地缩放）。热改只影响**后续 acquire**：在飞轮持有旧信号量的 permit
+    /// 照常运行，已在旧信号量上排队的等待者也按旧闸放行（缩容时旧 permit 释放
+    /// 后新 acquire 才受新上限约束——语义为「不打断进行中的工作」，与配置
+    /// 文档一致）。main 的 SIGHUP 处理器调用。
+    pub fn reload_max_concurrent_rounds(&self, limit: usize) {
+        // 先取快照并**释放读锁**再拿写锁——持读锁取写锁在 parking_lot 上是
+        // 自死锁（写侧等所有读者，读者是自己）。读写间隙的并发 reload 最坏
+        // 后写覆盖（幂等配置值，语义无损）。
+        let prev = self.round_gate.read().limit;
+        if prev == limit {
+            return; // 无变化不重建（避免无谓换闸）。
+        }
+        *self.round_gate.write() = RoundGate::new(limit);
+        info!(
+            target: "imagent::core",
+            new_limit = limit,
+            prev_limit = prev,
+            "全局并发护栏热改（只影响后续 acquire，在飞轮不受影响）"
+        );
     }
 
     /// v1.20 窗口自学习：ACP `UsageUpdate.size` 报告的真实模型窗口（每轮经
@@ -935,11 +1028,15 @@ impl Dispatcher {
         let timeout = self.permission_ask_timeout;
         // Wave B-11：超时分支落 timeout 审计（审批统计聚合数据源）。
         let store = self.store.clone();
+        // P2（v13）：发起者锚定——hook 触发于 backend.run 期间，取该 conv 当前
+        // 轮次发起者（run_round_inner 与 note_round_initiator 同步写入）。
+        let round_initiators = self.round_initiators.clone();
         Arc::new(move |ask: crate::backend::ImPermissionAsk| {
             let platform = platform.clone();
             let router = router.clone();
             let approval_tools = approval_tools.clone();
             let store = store.clone();
+            let round_initiators = round_initiators.clone();
             Box::pin(async move {
                 // 审批集外直接放行（空集 = 全部过审），与 socket 路径口径一致。
                 if !crate::permission::needs_approval(&approval_tools.read(), &ask.tool_name) {
@@ -974,6 +1071,9 @@ impl Dispatcher {
                     return true;
                 }
                 let conv = ConvId(ask.conv_id.clone());
+                // P2（v13）：发起者锚定——无在飞轮次记录（compact 自动轮等边缘
+                // 场景）时为 None，维持既有不比对语义。
+                let initiator = round_initiators.lock().await.get(&ask.conv_id).cloned();
                 // D5：先 register 占位再发卡（防极速按钮回调先于 register 到达）。
                 let rx = router
                     .register(
@@ -982,6 +1082,7 @@ impl Dispatcher {
                         None,
                         PendingKind::Permission,
                         Some(&ask.tool_name),
+                        initiator.as_deref(),
                     )
                     .await;
                 // S-5（泄漏防护）：本 hook future 被 drop（run 被 /stop abort、总超时
@@ -1319,6 +1420,16 @@ impl Dispatcher {
                                 matches!(self.router.pending_count(&conv_id).await, 0 | 1)
                             };
                             let mut reply = parse_reply(text);
+                            // P2（code-review v13）发起者锚定：命中的 pending 携带
+                            // 发起者且回复者既非发起者也非 admin → 拒绝消费（pending
+                            // 保留，消息继续走后续管线）。补齐 v1.23 按钮路径之外的
+                            // 文本路径——否则白名单群里成员 B 打字 "y" 可批准成员 A
+                            // 触发的删库级 Bash。
+                            let initiator_block = if consumable {
+                                self.permission_initiator_block(&conv_id, &msg).await
+                            } else {
+                                None
+                            };
                             // R4（code-review v9 残余，H1 回复侧）：热切出闭环档
                             //（deny/off）后，已发出的审批卡在 permission_ask_timeout
                             //（缺省 300s）窗口内点「允许」仍会放行——投递前复查
@@ -1346,13 +1457,14 @@ impl Dispatcher {
                                             "已按当前 /perm 档位（deny/off）强制拒绝".into(),
                                         ),
                                         raw_text: reply.raw_text,
+                                        cancelled: false,
                                     };
                                 }
                             }
                             let reply_for_card = reply.clone();
                             // 多 pending 三级路由：按钮回调带 ask_req 精确 → 引用
                             // 回复（reply_to）命中询问卡 → 最新 pending 兜底。
-                            let routed = if consumable {
+                            let routed = if consumable && initiator_block.is_none() {
                                 self.router
                                     .route(
                                         &conv_id,
@@ -1392,42 +1504,59 @@ impl Dispatcher {
                                 } else {
                                     "permission_decision"
                                 };
-                                if let Err(e) = self
-                                    .store
-                                    .append_audit(
-                                        audit_action,
-                                        Some(&msg.sender.0),
-                                        Some(&conv_id),
-                                        Some(&audit_detail),
-                                    )
-                                    .await
+                                // P2（code-review v13）：审计与卡片收敛都是决策后的
+                                // best-effort 收尾（oneshot 决策已在 route() 内同步
+                                // 送达）——改 spawn 执行，防飞书 429/token 刷新
+                                //（最坏 30s+）期间挂住整个 recv 循环（所有 conv 的
+                                // 入站消息、其它审批回复、/stop 全停摆）。
                                 {
-                                    tracing::warn!(
-                                        target: "imagent::core",
-                                        error = %e,
-                                        "append_audit(permission_decision) 失败"
-                                    );
+                                    let store = self.store.clone();
+                                    let sender = msg.sender.0.clone();
+                                    let conv = conv_id.clone();
+                                    self.tasks.lock().await.spawn(async move {
+                                        if let Err(e) = store
+                                            .append_audit(
+                                                audit_action,
+                                                Some(&sender),
+                                                Some(&conv),
+                                                Some(&audit_detail),
+                                            )
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                target: "imagent::core",
+                                                error = %e,
+                                                "append_audit(permission_decision) 失败"
+                                            );
+                                        }
+                                    });
                                 }
                                 // 真机校准 UX：决策已达 MCP，立即把询问卡收敛成
                                 // 「已批准/已拒绝」终态（best-effort，无卡 no-op）；
                                 // 问题卡（P6）显示「已记录你的选择：<选项>」。
-                                if let Err(e) = self
-                                    .platform
-                                    .resolve_permission_ask(&msg.conv_id, &req, &reply_for_card)
-                                    .await
                                 {
-                                    tracing::warn!(
-                                        target: "imagent::core",
-                                        error = %e,
-                                        "询问卡收敛失败（不影响审批结果）"
-                                    );
+                                    let platform = self.platform.clone();
+                                    let conv = msg.conv_id.clone();
+                                    self.tasks.lock().await.spawn(async move {
+                                        if let Err(e) = platform
+                                            .resolve_permission_ask(&conv, &req, &reply_for_card)
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                target: "imagent::core",
+                                                error = %e,
+                                                "询问卡收敛失败（不影响审批结果）"
+                                            );
+                                        }
+                                    });
                                 }
                                 continue;
                             }
-                            // D2：未被消费但确有 pending——回一条去重提示，引导
-                            // 用户回复询问卡（或 y/n），避免静默落进 agent 批处理
-                            // 造成「发了没人理」的困惑；60s 窗口去重防刷屏。
-                            if self.router.has_pending(&conv_id).await {
+                            // P2 发起者锚定拒绝：不消费 pending，回明确提示（与 D2
+                            // 同一个 60s 去重窗口——同属「有 pending 但未消费」的
+                            // 引导形态）；消息本身继续走后续 handle 管线（不吞）。
+                            // 提示发送同样 spawn（send_text 含退避重试，见上）。
+                            if let Some(initiator) = initiator_block {
                                 let now = Instant::now();
                                 let mut last = self.pending_hint_last.lock().await;
                                 let due = last
@@ -1436,15 +1565,40 @@ impl Dispatcher {
                                 if due {
                                     last.insert(conv_id.clone(), now);
                                     drop(last);
+                                    let text = format!(
+                                        "⏳ 该询问由 {initiator} 发起，请由其本人或管理员答复"
+                                    );
+                                    let conv = msg.conv_id.clone();
+                                    let hint = msg.reply_hint.clone();
+                                    let this = self.clone();
+                                    self.tasks.lock().await.spawn(async move {
+                                        this.reply(&conv, &text, &hint).await;
+                                    });
+                                }
+                            } else if self.router.has_pending(&conv_id).await {
+                                // D2：未被消费但确有 pending——回一条去重提示，引导
+                                // 用户回复询问卡（或 y/n），避免静默落进 agent 批处理
+                                // 造成「发了没人理」的困惑；60s 窗口去重防刷屏。
+                                let now = Instant::now();
+                                let mut last = self.pending_hint_last.lock().await;
+                                let due = last
+                                    .get(&conv_id)
+                                    .is_none_or(|t| now.duration_since(*t) >= PENDING_HINT_DEDUPE);
+                                if due {
+                                    // 去重窗口状态先落（spawn 前）——防慢发送期间
+                                    // 并发消息重复提示。
+                                    last.insert(conv_id.clone(), now);
+                                    drop(last);
                                     let n = self.router.pending_count(&conv_id).await;
-                                    self.reply(
-                                        &msg.conv_id,
-                                        &format!(
-                                            "⚠️ 当前有 {n} 项待审批/待回答的询问，请回复对应询问卡（多待决时需引用对应卡片），或直接回复 y / n 表态（始终允许可回复 always）。"
-                                        ),
-                                        &msg.reply_hint,
-                                    )
-                                    .await;
+                                    let text = format!(
+                                        "⚠️ 当前有 {n} 项待审批/待回答的询问，请回复对应询问卡（多待决时需引用对应卡片），或直接回复 y / n 表态（始终允许可回复 always）。"
+                                    );
+                                    let conv = msg.conv_id.clone();
+                                    let hint = msg.reply_hint.clone();
+                                    let this = self.clone();
+                                    self.tasks.lock().await.spawn(async move {
+                                        this.reply(&conv, &text, &hint).await;
+                                    });
                                 }
                             }
                         }
