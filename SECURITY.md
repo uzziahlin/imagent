@@ -15,6 +15,42 @@
 - **agent 权限收敛**：`workdir` 仅作 cwd（**非沙箱**，不限制可读路径，靠 `--allowedTools` + `permission_mode` 兜底）、`--allowedTools` 配置收敛、`--permission-prompt-tool` 绕过。
 - **SSRF**：媒体 CDN 下载。
 
+## 威胁模型与边界（必读）
+
+**核心事实**：agent 子进程以**宿主用户同一 uid** 运行。IM 权限审批闭环约束的是
+「agent（claude 等）发起的工具调用」，**不约束**「同 uid 进程对文件系统的读写能力」。
+这两者是不同的信任边界——审批闭环管住了工具面，管不住进程面。
+
+因此，在「agent 被提示注入操纵」（例如让它读了一个含恶意指令的网页/文件）的场景下，
+即使 Bash 全部过审，被操纵的 agent 仍可用 claude 默认免审的 `Read`/`Glob`/`Grep`：
+
+1. **读 `~/.imagent/` 状态目录**：`imagent.db`（明文回退形态下含 iLink `bot_token`；
+   `allowed_senders`/`audit_log`/`session_history`——含全部会话 prompt；`queued_messages`）。
+2. **读主进程环境**（Linux `/proc/<pid>/environ`，macOS `ps eww`）：取得
+   `IMAGENT_FEISHU_APP_SECRET` / `IMAGENT_HTTP_TOKEN` / `IMAGENT_PASSPHRASE`——
+   子进程 env 白名单透传只防「意外继承」，防不住「主动读取」。
+3. **写 DB 做持久化后门**：向 `allowed_senders` 表 INSERT 攻击者 sender（下次
+   SIGHUP/重启经 config ∪ store 并集生效）。
+4. **权限 socket**：同 uid 通过 SO_PEERCRED，配合 token 文件可伪造 ask 注入
+   （**不能**伪造 approve——闭环本身没破）。
+5. Linux Secret Service 下 keyring 凭据对同会话任意进程可读。
+
+**部署风险分级**：
+
+| 形态 | 评估 |
+|---|---|
+| 单人私聊自用 | 可接受（攻击者 ≈ 你自己；真正边界是你的 IM 账号） |
+| **多人群聊白名单** | **风险显著上调**：任一白名单成员触发的提示注入，即可能按上述路径拿到 bot 凭据并给自己开后门。群白名单的语义是「信任这些人**本人**」，不是「信任他们的 prompt 供应链」 |
+
+**建议缓解**（按性价比）：
+
+- 给 agent 配 `permission_mode = "ask"` + `approval_tools` 收紧审批面（已在做的）；
+- **专用运行用户**跑 imagent（`User=imagent`），把 `~/.imagent` 与你的日常账户隔离；
+- Linux systemd 加固：`ProtectHome=read-only`、`PrivateTmp=yes`、`NoNewPrivileges=yes`
+  （`deploy/` 下的 unit 有雏形）；
+- 设置 `IMAGENT_PASSPHRASE`（凭据回退形态加密，见 S3），并知悉其**不**防同 uid 读取
+  （passphrase 在环境变量里，同 uid 可读）——它防的是**落盘文件泄漏**，不是本节场景。
+
 ## 已有的加固（defense-in-depth）
 
 - **IM 入口白名单鉴权**：iLink bot 任何人可加好友，非白名单 sender 丢弃（DESIGN §9.①）。
