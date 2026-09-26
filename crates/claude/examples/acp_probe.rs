@@ -18,6 +18,9 @@ async fn main() -> anyhow::Result<()> {
         .nth(1)
         .unwrap_or_else(|| "claude-agent-acp".into());
     let cwd = std::env::args().nth(2).unwrap_or_else(|| ".".into());
+    let prompt_text = std::env::args()
+        .nth(3)
+        .unwrap_or_else(|| "Reply with exactly: hi".into());
 
     let agent = AcpAgent::from_str(&cmd)?;
     let agent = agent.with_debug(dbg as fn(&str, _));
@@ -43,13 +46,12 @@ async fn main() -> anyhow::Result<()> {
                 let sid = session.session_id.clone();
                 eprintln!("[probe] session/new ok: {sid}");
 
-                // 一轮真实 prompt（与 e2e 同款构造）：观察是否返回。
+                // 一轮真实 prompt（与 e2e 同款构造）：观察是否返回。prompt 可由
+                // argv[3] 覆盖（默认 "Reply with exactly: hi"）。
                 let prompt = PromptRequest::new(
                     sid.clone(),
                     vec![agent_client_protocol::schema::v1::ContentBlock::Text(
-                        agent_client_protocol::schema::v1::TextContent::new(
-                            "Reply with exactly: hi",
-                        ),
+                        agent_client_protocol::schema::v1::TextContent::new(&prompt_text),
                     )],
                 );
                 match connection.send_request(prompt).block_task().await {
