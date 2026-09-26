@@ -612,18 +612,22 @@ impl FeishuPlatform {
                 }
                 // P4-4：审批按钮回调（card.action.trigger）→ text="y"/"n" 的
                 // 入站消息，core 的审批回复路由消费（parse_reply("y")=allow）。
-                // 安全批次扩展：回调解析带第三元素 deny（命令按钮过期 / 群内他人
-                // 点终止——proto 侧已判，此处回提示后丢弃，不进 core 分派）；
+                // 安全批次扩展：回调解析带第三元素 deny（命令按钮过期 / 他人点
+                // 终止或命令按钮——全形态校验，proto 侧已判，此处回提示后丢弃，
+                // 不进 core 分派）；
                 // 审批按钮另做**发起者校验**（群 conv 下点击者须为登记的发起者，
                 // 私聊单人免检）。
                 // v1.17.3 诊断：真机 2026-09-03 自由输入值未随 form_value 到达
                 //（根因是回调侧题号收集漏 _free 键，已修）。形态已用真机载荷
                 // 校准（free=字符串、未填回空串、未选 select 键缺席）；debug 级
-                // 原始载荷日志留作卡片回调排障。
+                // 原始载荷日志留作卡片回调排障。v13-P3：截断到头 400 字符——
+                // 完整载荷含 Bash 审批命令全文（可能有 secret/内网地址）与用户
+                // 表单输入，全量进日志的泄露面大于排障价值（与下方兜底分类日志
+                // 同款 payload_head 手法）。
                 debug!(
                     target: "feishu",
-                    payload = %String::from_utf8_lossy(&payload),
-                    "card.action.trigger 原始载荷"
+                    payload_head = %payload_head(&payload, 400),
+                    "card.action.trigger 原始载荷（头 400 字符）"
                 );
                 if let Some((key, reply_msg, deny)) = parse_card_action_event(&payload) {
                     if let Some(deny_text) = deny {
@@ -878,10 +882,7 @@ impl FeishuPlatform {
                 // 真机排障：兜底分类——已知「正常忽略」的事件（策略过滤的群消息、
                 // 表情回执/自身回声）降 DEBUG，避免淹没真正需要排障的 WARN
                 //（真机校准 2026-09-01：V2/V3 期间大量正常消息被记成 WARN 误导视线）。
-                let head: String = String::from_utf8_lossy(&payload)
-                    .chars()
-                    .take(400)
-                    .collect();
+                let head: String = payload_head(&payload, 400);
                 let etype = serde_json::from_slice::<serde_json::Value>(&payload)
                     .ok()
                     .and_then(|v| {
@@ -1782,6 +1783,17 @@ fn group_reply_anchor(conv: &str, source_msg_id: Option<&str>) -> Option<(String
 /// 空串 sender → None（AskRender.sender 的 Option 形态适配渲染入参）。
 fn sender_opt_of(sender: &str) -> Option<&str> {
     (!sender.is_empty()).then_some(sender)
+}
+
+/// 原始事件载荷的日志安全形态：头 `max_chars` 字符（char 边界安全，多字节
+/// UTF-8 不劈开）。v13-P3 收口——`card.action.trigger` 载荷含 Bash 审批命令
+/// 全文（可能有 secret/内网地址）与用户表单输入，全量进日志的泄露面大于排障
+/// 价值；与兜底分类日志（原 head-400 内联写法）统一到本函数。
+fn payload_head(payload: &[u8], max_chars: usize) -> String {
+    String::from_utf8_lossy(payload)
+        .chars()
+        .take(max_chars)
+        .collect()
 }
 
 /// housekeeping 巡检覆盖的 per-conv 状态表（粗上限淘汰，见 housekeeping_loop）。
@@ -3632,9 +3644,9 @@ impl Platform for FeishuPlatform {
             .entry(conv.0.clone())
             .or_default()
             .asks_since_card = false;
-        // 发起者（最近 sender）：编码进初始卡的 ⏹ 终止按钮 value（群 conv 下点击者
-        // 校验）；Wave B-5：群 conv 初始卡顶部加「发起者」标注行。占位/未知为
-        // None（旧语义，不校验）。
+        // 发起者（最近 sender）：编码进初始卡的 ⏹ 终止按钮 value（回调侧全形态
+        // 校验点击者，v13-P2）；Wave B-5：群 conv 初始卡顶部加「发起者」标注行。
+        // 占位/未知为 None（旧语义，不校验）。
         let sender = self.last_sender(&conv.0).await;
         let sender_opt = (!sender.is_empty()).then_some(sender);
         if let Some((_chat, root_id)) = thread_target_from_conv(conv) {
@@ -4203,6 +4215,26 @@ mod tests {
         assert_eq!(thread_window_of(0), Duration::ZERO);
         assert_eq!(thread_window_of(600), Duration::from_secs(600));
         assert_eq!(thread_window_of(1800), Duration::from_secs(30 * 60));
+    }
+
+    /// v13-P3：载荷日志截断——头 400 字符（card.action.trigger 载荷含 Bash 审批
+    /// 命令全文/用户表单输入，不全文进日志）；多字节 UTF-8 不劈开；短/恰好
+    /// 等长载荷原样。
+    #[test]
+    fn payload_head_truncates_for_logging() {
+        let short = br#"{"header":{"event_type":"card.action.trigger"}}"#;
+        assert_eq!(
+            payload_head(short, 400),
+            String::from_utf8_lossy(short).to_string()
+        );
+        // 多字节：500 个「好」（1500 字节）→ 截到 400 字符，char 边界安全。
+        let long = "好".repeat(500);
+        let head = payload_head(long.as_bytes(), 400);
+        assert_eq!(head.chars().count(), 400);
+        assert!(head.chars().all(|c| c == '好'), "不得劈开多字节字符");
+        // 恰好等长 → 不截断。
+        let exact = "a".repeat(400);
+        assert_eq!(payload_head(exact.as_bytes(), 400), exact);
     }
 
     /// 合并转发 drain 产出：拉取成功 → 「（以下为用户转发的聊天记录）」前缀 +
