@@ -379,8 +379,11 @@ pub struct CardOperatorId {
 /// 空间）。24h 覆盖正常使用节奏（当天发的卡当天/次日点完），过期明确回提示。
 pub const CMD_BUTTON_TTL_SECS: i64 = 24 * 3600;
 
-/// conv 是否为私聊形态（`feishu:ou_…`）——审批/终止按钮的点击者校验只在群 conv
-/// 生效（私聊单人，点击者必为发起者）；评论 conv 等多方可见形态一律按群处理。
+/// conv 是否为私聊形态（`feishu:ou_…`）。v13-P2 起按钮 value 的发起者校验已
+/// **全形态**（卡片可被转发，点击者身份与 conv 形态无关）；本函数仍用于：
+/// 卡片「发起者」标注行仅群 conv 添加（card::sender_anchor_line）、审批
+/// pending_asks 兜底校验（platform drain，存量无 sender 卡）。评论 conv 等
+/// 多方可见形态一律按群处理。
 pub fn is_private_conv(conv: &str) -> bool {
     conv.strip_prefix("feishu:").is_some_and(|rest| {
         let id = rest.split(':').next().unwrap_or(rest);
@@ -395,8 +398,9 @@ pub fn is_private_conv(conv: &str) -> bool {
 ///   走与手打命令完全相同的鉴权/分派路径（admin 门槛等不豁免）。
 ///
 /// 返回 `(dedup_key, 入站消息, deny 提示)`：`deny = Some(文案)` 表示该点击被
-/// 安全策略拒绝（过期按钮 / 群内非发起者点终止）——**不**产生入站消息（msg 为
-/// 占位空壳，调用方只回 deny 文案），防过期/越权命令进 core 分派。
+/// 安全策略拒绝（过期按钮 / 非发起者点终止或命令按钮——全形态校验）——**不**
+/// 产生入站消息（msg 为占位空壳，调用方只回 deny 文案），防过期/越权命令进
+/// core 分派。
 ///
 /// 非 imagent 按钮 / 缺 conv / conv 无 `feishu:` 前缀（伪造防） / 缺 open_id /
 /// 命令非 `/` 开头（防伪造非命令文本）返回 None。
@@ -461,10 +465,9 @@ pub fn parse_card_action_event(payload: &[u8]) -> Option<(String, InboundMessage
     }
     // 审批/问题/表单按钮发起者校验（安全：卡片转发代批）：value.sender 为询问
     // 发起者的编码，**全形态**校验 operator==sender——私聊 conv 也不豁免（卡片
-    // 可被转发到任意会话，点击者身份与 conv 形态无关；与命令按钮的「私聊免检」
-    // 不同——询问类按钮直接产出审批决定/用户选择，代批面更大）。不符回明确
-    // 提示，不注入 y/n/ask 文本。无 sender 的存量卡兼容放行（pending_asks 侧的
-    // 群形态校验仍兜底）。
+    // 可被转发到任意会话，点击者身份与 conv 形态无关；v13-P2 起命令按钮同款
+    // 全形态，见下方）。不符回明确提示，不注入 y/n/ask 文本。无 sender 的存量
+    // 卡兼容放行（pending_asks 侧的群形态校验仍兜底）。
     let ask_like = act.is_some() || ask_choice.is_some() || form_kind.is_some();
     if ask_like {
         if let Some(owner) = value.get("sender").and_then(|v| v.as_str()) {
@@ -479,8 +482,11 @@ pub fn parse_card_action_event(payload: &[u8]) -> Option<(String, InboundMessage
         }
     }
     // 命令按钮发起者校验（终止按钮等）：value.sender 为发起轮次用户的编码，
-    // 群 conv（多方可见）下点击者须为发起者本人；私聊不校验（单人）。
-    if cmd.is_some() && !is_private_conv(conv) {
+    // **全形态**校验 operator==sender——与上方询问类同理由（v13-P2 对齐）：
+    // 卡片可被转发到任意会话，点击者身份与 conv 形态无关（私聊卡被转发给
+    // 白名单用户 B 后，B 点击即在编码的私聊 conv 执行 /stop /new /again）。
+    // 无 sender 的存量卡兼容放行（与询问类同款）。
+    if cmd.is_some() {
         if let Some(owner) = value.get("sender").and_then(|v| v.as_str()) {
             let open_id = card_operator_open_id(&evt)?;
             if open_id != owner {
@@ -1135,7 +1141,8 @@ pub struct RecallBody {
 /// 会话：notify_conv 优先事件 chat_id（群/单聊均可直达），回退撤回者私聊 conv；
 /// probe_convs 汇总两种 key 形态——私聊消息的排队 key 是发送者 conv（feishu:ou_*），
 /// 与事件携带的 chat_id 形态（feishu:oc_*）不同，在飞判定需两者都试。
-/// 非 target 事件 / 缺 message_id 返回 None。
+/// 非 target 事件 / 缺 message_id / chat_id 与 sender 双缺（管理员撤回形态，
+/// 无处回执——伪造 message_id conv 只会发送失败，见函数体注释）返回 None。
 pub fn parse_recall_event(payload: &[u8]) -> Option<(String, InboundMessage)> {
     let evt: RecallEvent = serde_json::from_slice(payload).ok()?;
     if evt.header.event_type != "im.message.recalled_v1" {
@@ -1160,7 +1167,12 @@ pub fn parse_recall_event(payload: &[u8]) -> Option<(String, InboundMessage)> {
     let sender_conv = sender_open
         .as_deref()
         .map(|o| ConvId(format!("feishu:{o}")));
-    let notify_conv = chat_conv.clone().or_else(|| sender_conv.clone());
+    // v13-P3：chat_id 与 sender 双缺（管理员撤回形态）时不再伪造
+    // `feishu:{message_id}` conv——om_ 前缀不是合法会话 id（平台 send 按
+    // ou_/oc_ 前缀路由），core 侧任何经它的回执必然发送失败；该形态直接
+    // 忽略（代价是牺牲此形态下「按 message_id 移除排队消息」的能力：事件
+    // 字段形态本身待真机校准，fail-closed 优于带病解析）。
+    let notify_conv = chat_conv.clone().or_else(|| sender_conv.clone())?;
     let mut probe_convs = Vec::new();
     if let (Some(c), Some(s)) = (&chat_conv, &sender_conv) {
         if c != s {
@@ -1178,9 +1190,7 @@ pub fn parse_recall_event(payload: &[u8]) -> Option<(String, InboundMessage)> {
     Some((
         key,
         InboundMessage {
-            conv_id: notify_conv
-                .clone()
-                .unwrap_or_else(|| ConvId(format!("feishu:{mid}"))),
+            conv_id: notify_conv.clone(),
             sender: UserId(sender_open.unwrap_or_default()),
             sender_name: None,
             text: None,
@@ -1192,7 +1202,7 @@ pub fn parse_recall_event(payload: &[u8]) -> Option<(String, InboundMessage)> {
             reply_to: None,
             source_msg_id: Some(mid),
             control: Some(imagent_core::InboundControl::MessageRecalled {
-                notify_conv,
+                notify_conv: Some(notify_conv),
                 probe_convs,
             }),
             no_steer: false,
@@ -3238,8 +3248,9 @@ mod tests {
         assert_eq!(msg.text.as_deref(), Some("/ws use main"));
     }
 
-    /// 命令按钮发起者校验：群 conv 下 operator ≠ value.sender → deny；发起者本人 /
-    /// 私聊（单人）/ 无 sender（旧卡）→ 放行。
+    /// 命令按钮发起者校验（v13-P2 全形态）：operator ≠ value.sender → deny（群
+    /// 与私聊 conv 同规则——卡片可被转发到任意会话，点击者身份与 conv 形态
+    /// 无关）；发起者本人 / 无 sender（旧卡兼容）→ 放行。
     #[test]
     fn command_button_sender_guard() {
         let mk = |sender: Option<&str>, conv: &str, operator: &str| {
@@ -3268,18 +3279,31 @@ mod tests {
                 .expect("应解析");
         assert!(deny.is_none());
         assert_eq!(msg.text.as_deref(), Some("/stop"));
-        // 私聊：他人形态的 open_id（实际不可能）也不校验——单人 conv 语义。
+        // 私聊 conv（转发场景：卡片被转发给他人，按钮 value 仍编码原会话与
+        // 发起者）+ 他人点击 → 同样 deny——v13-P2 起私聊不再免检。
         let (_, _, deny) =
-            parse_card_action_event(&mk(Some("ou_owner"), "feishu:ou_x", "ou_other"))
+            parse_card_action_event(&mk(Some("ou_owner"), "feishu:ou_owner", "ou_other"))
                 .expect("应解析");
-        assert!(deny.is_none(), "私聊不校验: {deny:?}");
+        assert!(
+            deny.as_deref().is_some_and(|d| d.contains("仅发起者")),
+            "私聊 conv 同样校验: {deny:?}"
+        );
+        // 私聊 conv + 发起者本人 → 放行（正常路径）。
+        let (_, msg, deny) =
+            parse_card_action_event(&mk(Some("ou_owner"), "feishu:ou_owner", "ou_owner"))
+                .expect("应解析");
+        assert!(deny.is_none());
+        assert_eq!(msg.text.as_deref(), Some("/stop"));
         // 话题群 conv 同样属群形态（非 ou_ 前缀）。
         assert!(!is_private_conv("feishu:oc_g:om_root"));
         assert!(is_private_conv("feishu:ou_x"));
-        // 无 sender（旧卡）→ 不校验。
+        // 无 sender（旧卡）→ 不校验（兼容放行，群/私聊同规则）。
         let (_, _, deny) =
             parse_card_action_event(&mk(None, "feishu:oc_g", "ou_any")).expect("应解析");
         assert!(deny.is_none(), "旧卡兼容: {deny:?}");
+        let (_, _, deny) =
+            parse_card_action_event(&mk(None, "feishu:ou_x", "ou_any")).expect("应解析");
+        assert!(deny.is_none(), "私聊旧卡兼容: {deny:?}");
     }
 
     /// conv 前缀校验：value.conv 无 feishu: 前缀（伪造/跨平台）→ None。
@@ -3995,18 +4019,13 @@ mod tests {
             panic!("控制类型不符");
         };
         assert_eq!(notify_conv.as_ref().unwrap().0, "feishu:ou_sender");
-        // 仅 message_id（无 chat_id / sender）：仍可按 id 移除排队消息——解析成功，
-        // 但 notify/probe 为空（无处回提示、无法判定在飞）。
-        let (_, msg) = parse_recall_event(&mk(None, None)).expect("仅有 id 也应解析");
-        let imagent_core::InboundControl::MessageRecalled {
-            notify_conv,
-            probe_convs,
-        } = msg.control.as_ref().unwrap()
-        else {
-            panic!("控制类型不符");
-        };
-        assert!(notify_conv.is_none());
-        assert!(probe_convs.is_empty());
+        // 双缺（管理员撤回形态，v13-P3）：无处回执——不再伪造
+        // feishu:{message_id}（om_ 前缀非合法 conv，经它回提示必然发送失败），
+        // 直接忽略该事件。
+        assert!(
+            parse_recall_event(&mk(None, None)).is_none(),
+            "chat_id 与 sender 双缺应忽略"
+        );
         // 非目标事件 / 缺 message_id → None。
         assert!(
             parse_recall_event(b"{\"header\":{\"event_type\":\"im.message.receive_v1\"}}")

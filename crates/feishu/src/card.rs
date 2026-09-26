@@ -61,6 +61,9 @@ fn sanitize_inline(text: &str) -> String {
 /// v1.26 构造收口：markdown 元素的唯一出口——转义（<at> 注入防线）与邮箱
 /// 掩码（租户审计）内建，调用方传**原始内容**。这是同类问题（v8→v12→
 /// v1.25.1 三次人肉审出遗漏）的根治：新构造点不可能忘记转义。
+/// v13-P1 补洞：`md_element_anchored` 此前绕过收口（<at> 注入第 4 洞——
+/// managed 流式卡初始帧的 md_body 承载 task_digest=用户原始 prompt 前 60
+/// 字），现与另外两个构造点同款内建。三个构造器一个不落。
 /// text_size 可选（notation 小字）；element_id 可选（managed 流式锚点）。
 fn md_element(content: &str) -> serde_json::Value {
     serde_json::json!({
@@ -85,7 +88,7 @@ fn md_element_anchored(
     let mut v = serde_json::json!({
         "tag": "markdown",
         "element_id": element_id,
-        "content": content,
+        "content": escape_lt(&mask_emails(content)),
     });
     if let Some(s) = text_size {
         v["text_size"] = serde_json::json!(s);
@@ -274,6 +277,12 @@ fn terminal_summary(card: &OutboundCard, err: Option<&str>) -> String {
 /// 形态取舍：CardKit markdown 组件支持 `<at id=…></at>` 标签（**待真机校准**：
 /// 若该租户卡片 markdown 不支持 at，标签原文会显示为文本——届时退化为
 /// 「→ 发起者 <open_id>」纯文本行，只改本函数一处）。私聊不加（单人无歧义）。
+///
+/// **全文件唯一合法 `<at>` 构造点**（v13-P1 声明豁免）：不受 md_element*
+/// 的 escape_lt 收口约束——bot 名义 @ 发起者本人是设计意图（本函数的目的
+/// 就是产出 at 标签），且 open_id 经下方 `ou_` 前缀过滤来自平台事件校验过的
+/// 值、非用户可控文本。未来任何「统一转义」改造不得把此处一并转义（转义后
+/// 标注行退化为原文标签文本，失去 @ 语义）。
 pub(crate) fn sender_anchor_line(
     sender: Option<&str>,
     is_group: bool,
@@ -390,8 +399,10 @@ pub fn render_card(card: &OutboundCard, conv_id: &str, sender: Option<&str>) -> 
     // 状态 footer：note 行（notation 小字号）体现终态 / 流式阶段。
     elements.push(md_element_sized(&footer, "notation"));
     // Running 态带终止按钮（终态移除——整卡 patch 每次重渲染，自然消失）。
+    // v13-P3：sender 透传编码进按钮 value——此前恒 None，降级/话题群卡在群里
+    // 任何人可点终止（managed 路径 render_stream_init_card 一直带 sender）。
     if streaming {
-        elements.push(stop_button(conv_id, None));
+        elements.push(stop_button(conv_id, sender));
     } else if err.is_none() {
         // 卡片 UX 批（v1.24）：成功终态不再是交互真空（失败卡已有三键）——
         // 完成后最自然的动作：再跑一次（/again 数据源 last_success_prompt
@@ -547,8 +558,9 @@ fn tool_stats_summary(tools: &[ToolCall]) -> String {
 
 /// 命令按钮 value 公共字段：命令 + conv + `ts`（epoch 秒，proto 回调侧超 24h 拒
 /// 绝——卡片长期滞留 IM，过期上下文的命令点击应明确提示而非照旧执行）。
-/// `sender`（发起轮次用户 open_id，群 conv 下校验点击者）仅终止按钮携带——命令
-/// 卡按钮无「发起者」语义（命令卡由命令回执触发，非轮次锚定）。
+/// `sender`（发起轮次用户 open_id，回调侧全形态校验点击者，见 proto 的
+/// 命令按钮发起者校验）仅终止按钮携带——命令卡按钮无「发起者」语义（命令卡
+/// 由命令回执触发，非轮次锚定）。
 /// 卡片 UX 批（v1.24）：安全命令的按钮有效期放宽到 7 天——失败卡的「🔁 重试」
 /// 隔天点击回「已过期」白白损失一次本可成功的重试（/retry 数据源本身是持久的）；
 /// 24h 窗口保留给携带即时上下文的命令（/ws use 指向可能已删除等）。
@@ -580,8 +592,9 @@ fn cmd_value(conv_id: &str, command: &str, sender: Option<&str>) -> serde_json::
 
 /// ⏹ 终止按钮（lcab stopButton 同款）：Running 态挂在卡片底部，点击回调注入
 /// `/stop`（imagent_cmd 机制，走与手打命令相同的鉴权/分派）。`sender` 为发起
-/// 轮次的用户 open_id——群 conv 下 proto 回调校验点击者须为发起者本人（他人
-/// 点击回「仅发起者可操作」）；私聊不校验（单人）。
+/// 轮次的用户 open_id——proto 回调**全形态**校验点击者须为发起者本人（v13-P2：
+/// 卡片可被转发到任意会话，点击者身份与 conv 形态无关，私聊不豁免）；无
+/// sender 编码的存量卡兼容放行。
 /// managed 卡终态后按钮无法移除（element PATCH 只能动 markdown）——点击回
 /// 「当前没有运行中的任务」，无害。
 fn stop_button(conv_id: &str, sender: Option<&str>) -> serde_json::Value {
@@ -2515,6 +2528,80 @@ mod tests {
         };
         let json2 = render_card(&done, "feishu:ou_t", None);
         assert!(!json2.contains("⏹ 终止"), "终态不带终止按钮: {json2}");
+    }
+
+    /// v13-P1：md_element_anchored 转义收口——task_digest（用户原始 prompt 前
+    /// 60 字）经初始卡 md_body 渲染时，`<at id=…>` 注入须转义、邮箱须掩码
+    ///（此前初始帧绕过收口，patch 路径有转义、同一 md_body 组件不一致）；
+    /// sender_anchor_line 是全文件唯一合法 at 构造点，输出保持未转义标签。
+    #[test]
+    fn stream_init_card_escapes_digest_injection() {
+        let digest = "提醒 <at id=\"ou_victim\"></at> 与 a@b.com 对齐";
+        let md_body_content = |json: &str| -> String {
+            let v: serde_json::Value = serde_json::from_str(json).expect("初始卡 JSON 合法");
+            v.pointer("/body/elements")
+                .and_then(|e| e.as_array())
+                .expect("elements 数组")
+                .iter()
+                .find(|e| e.get("element_id").and_then(|x| x.as_str()) == Some("md_body"))
+                .expect("md_body 元素")["content"]
+                .as_str()
+                .expect("content 为字符串")
+                .to_string()
+        };
+        // 私聊（无发起者标注行）：md_body 的注入须转义 + 掩码。
+        let init = render_stream_init_card("feishu:ou_t", None, Some(digest));
+        let content = md_body_content(&init);
+        assert!(
+            content.contains("\\<at id=\"ou_victim\""),
+            "at 注入须转义为 \\<at: {content}"
+        );
+        assert!(
+            !content.contains("<at id=\"ou_victim\"></at>"),
+            "原始（未转义）at 闭合标签不得出现: {content}"
+        );
+        assert!(
+            content.contains("a[at]b.com") && !content.contains("a@b.com"),
+            "邮箱须掩码（租户审计防整卡拒收）: {content}"
+        );
+        // 群 conv + 发起者：标注行是唯一合法构造点，仍输出未转义 at 标签。
+        let init_group = render_stream_init_card("feishu:oc_g", Some("ou_owner"), Some(digest));
+        let v: serde_json::Value = serde_json::from_str(&init_group).expect("群初始卡 JSON 合法");
+        let anchor = v
+            .pointer("/body/elements")
+            .and_then(|e| e.as_array())
+            .expect("elements 数组")
+            .iter()
+            .find(|e| {
+                e.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c.contains("发起的任务"))
+            })
+            .expect("发起者标注行");
+        let anchor_content = anchor["content"].as_str().expect("content 字符串");
+        assert!(
+            anchor_content.contains("<at id=\"ou_owner\"></at>"),
+            "合法构造点保持未转义 at 标签: {anchor_content}"
+        );
+        // 同卡 md_body 仍转义（两形态并存互不干扰）。
+        assert!(md_body_content(&init_group).contains("\\<at id=\"ou_victim\""));
+    }
+
+    /// v13-P3：降级/话题群路径 Running 卡的 ⏹ 终止按钮也编码发起者（此前恒
+    /// None，群里任何人可点终止）；无 sender 维持旧语义不编码（proto 兼容放行）。
+    #[test]
+    fn degraded_running_card_stop_button_carries_sender() {
+        let running = card_of(CardTerminal::Running, vec![]);
+        let json = render_card(&running, "feishu:oc_g", Some("ou_owner"));
+        assert!(
+            json.contains("\"imagent_cmd\":\"/stop\"") && json.contains("\"sender\":\"ou_owner\""),
+            "降级卡终止按钮编码发起者: {json}"
+        );
+        let none = render_card(&running, "feishu:oc_g", None);
+        assert!(
+            none.contains("\"imagent_cmd\":\"/stop\"") && !none.contains("\"sender\":"),
+            "无 sender 不编码（存量卡兼容）: {none}"
+        );
     }
 
     /// P9-1：空产出占位（空串 patch 可能被拒/显示空白）。
