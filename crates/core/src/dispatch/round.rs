@@ -2,6 +2,69 @@
 
 use super::*;
 
+/// P2-11（code-review v13）：非卡片平台的 Text chunk 合帧窗口。不做成配置项：
+/// 与 feishu 侧 `message_fragment_interval_ms`（分片发送间隔）同族的「平台
+/// 节奏」参数——两处窗口本就同量级（400ms），暴露成配置只会膨胀配置面而无人
+/// 调优，跟随平台限流现状以常量维护。
+const TEXT_COALESCE_WINDOW: Duration = Duration::from_millis(400);
+
+/// P2-11：非卡片平台（ilink/wecom，或卡片平台的 reply_mode=text）Text chunk
+/// 合帧缓冲。claude-acp 的 Text chunk 是 delta 级（每条几字符），逐条
+/// `send_text` 会把一段长回答打成数百条几字符的 IM 消息（刷屏 + 打爆平台
+/// QPS）。Text 先入缓冲，满足任一条件即 flush 为一条消息：
+/// ①距上次 flush ≥ [`TEXT_COALESCE_WINDOW`]——deadline 绝对（基于上次 flush
+///   时刻），由消费循环的 recv 超时驱动，chunk 连续到达不会推迟它；
+/// ②非 Text chunk 到达（保序：先 flush 文本再处理该 chunk）；
+/// ③Final/Error/流结束/中断退出（缓冲里未发的文本必须送达，不能丢）。
+///
+/// 只改发送粒度，不改既有语义：「`reply_ok` 只记成功送达前缀（P5-10 去重）+
+/// 失败段落留给最终全量兜底（P5-第五批）」逐 flush 保持——用户最终仍看到
+/// 完整文本。
+struct TextCoalescer {
+    buf: String,
+    last_flush: Instant,
+}
+
+impl TextCoalescer {
+    fn new() -> Self {
+        Self {
+            buf: String::new(),
+            last_flush: Instant::now(),
+        }
+    }
+
+    fn push(&mut self, delta: &str) {
+        self.buf.push_str(delta);
+    }
+
+    /// 距窗口到期剩余时长（缓冲空 = None：无待发文本，无需定时）。
+    fn till_deadline(&self) -> Option<Duration> {
+        if self.buf.is_empty() {
+            return None;
+        }
+        Some(TEXT_COALESCE_WINDOW.saturating_sub(self.last_flush.elapsed()))
+    }
+
+    /// flush 缓冲为一条消息；成功送达才累积进 `streamed_text` 前缀（P5-10：
+    /// 失败段落留给最终全量兜底，两处皆不失）。空缓冲 no-op。
+    async fn flush(
+        &mut self,
+        disp: &Dispatcher,
+        conv: &ConvId,
+        hint: &ReplyHint,
+        streamed_text: &mut String,
+    ) {
+        if self.buf.is_empty() {
+            return;
+        }
+        let text = std::mem::take(&mut self.buf);
+        self.last_flush = Instant::now();
+        if disp.reply_ok(conv, &text, hint).await {
+            streamed_text.push_str(&text);
+        }
+    }
+}
+
 impl Dispatcher {
     /// 单轮 agent 执行（P4 批处理 runner 循环的循环体）：合并后的消息 → typing →
     /// 续接 session → 媒体提示 / 前情摘要注入 → 流式收集（含空闲看门狗）→ 回传 →
@@ -278,6 +341,10 @@ impl Dispatcher {
                     &hint,
                 )
                 .await;
+                // P3（code-review v13）：上方已对本批消息打 👀（Processing），
+                // 拦截 early-return 不翻回则表情恒挂「在做了」。与 /stop 中断
+                // 运行中轮次同款收口（Failed 终态），保证每个 👀 都有终态。
+                self.react_msg(&conv, &react_mids, false).await;
                 return None;
             }
         }
@@ -347,13 +414,19 @@ impl Dispatcher {
         let card_allowed = self.platform.supports_streaming_card(&conv)
             && *self.reply_mode.read() == ReplyMode::Card;
         let mut card = if card_allowed {
-            let mut s = CardSession::new(
+            // P1-1（code-review v13）：CardSession 内部常驻 patcher 任务——chunk
+            // 消费方只更新累积状态并置脏唤醒（同步、零睡眠/零平台调用），节流
+            // 睡眠与 platform patch 全部移到 patcher，delta 级 chunk 流
+            // （claude-acp）不再被 500ms 节流钉死消费速率。conv/hint/platform
+            // 轮次内恒定，构造时一次性捕获（见 card_session.rs）。
+            let s = CardSession::new(
                 self.store.clone(),
                 conv.clone(),
-                self.platform.name(),
+                self.platform.clone(),
+                hint.clone(),
                 self.queued_hints.clone(),
             );
-            s.task_digest = Some(first_prompt_digest.clone());
+            s.set_task_digest(Some(first_prompt_digest.clone()));
             Some(s)
         } else {
             None
@@ -362,8 +435,8 @@ impl Dispatcher {
         // 静默期（CLI 冷启动 + 模型首 token，数秒到十几秒）用户无从得知消息
         // 已被接收。非卡片平台已有 typing / 流式文本路径，不加纯文本 ack
         //（避免与后续流式分片重复）。
-        if let Some(c) = card.as_mut() {
-            c.ensure_started(&conv, &hint, self.platform.as_ref()).await;
+        if let Some(c) = card.as_ref() {
+            c.ensure_started();
         }
         // P4-3：空闲看门狗——连续 agent_idle_timeout 无任何 chunk 则 abort（杀子进程）。
         // 等权限审批期间暂停（审批有独立的 permission_ask_timeout 预算兜底）。
@@ -373,6 +446,8 @@ impl Dispatcher {
         let mut learned_sid: Option<String> = None;
         // P5-10：非卡片平台已实时推送的 Text 前缀——最终回复只补差量，防重发。
         let mut streamed_text = String::new();
+        // P2-11：非卡片平台的 Text 合帧缓冲（见 TextCoalescer 文档）。
+        let mut text_buf = TextCoalescer::new();
         // W2-2：最新任务清单状态（纯文本平台最终回复的进度行来源）。
         let mut latest_todos: Option<Vec<crate::types::TodoItem>> = None;
         // D3 补丁（v1.18 review）：豁免总额预算（每段静默期）。router 按 conv
@@ -393,9 +468,16 @@ impl Dispatcher {
             // per-conv 覆盖优先，/config cot 白名单用户可改自己会话）。
             let cot = self.cot_for(&conv.0).await;
             let idle_timeout = self.idle_timeout_for(&conv.0).await;
+            // P2-11：合帧窗口 deadline 并入 recv 超时——deadline 绝对（基于上次
+            // flush 时刻），chunk 连续到达不会推迟它；到点走超时分支 flush。
+            let text_due = text_buf.till_deadline();
             let chunk = if idle_timeout.is_zero() {
                 // 看门狗关闭：心跳节拍仍生效（卡片可视化），但不做空闲判停。
-                match tokio::time::timeout(HEARTBEAT_TICK, rx.recv()).await {
+                let tick = match text_due {
+                    Some(d) => HEARTBEAT_TICK.min(d),
+                    None => HEARTBEAT_TICK,
+                };
+                match tokio::time::timeout(tick, rx.recv()).await {
                     Ok(Some(c)) => {
                         since_chunk = std::time::Instant::now();
                         c
@@ -406,15 +488,19 @@ impl Dispatcher {
                             .router
                             .has_pending_of_kind(&conv.0, PendingKind::Permission)
                             .await;
-                        if let Some(c) = card.as_mut() {
-                            c.heartbeat(waiting, &conv, &hint, self.platform.as_ref())
-                                .await;
+                        if let Some(c) = card.as_ref() {
+                            c.heartbeat(waiting);
                         }
+                        // P2-11：合帧窗口到点（由 recv 超时驱动）。
+                        text_buf.flush(self, &conv, &hint, &mut streamed_text).await;
                         continue;
                     }
                 }
             } else {
-                let tick = idle_timeout.min(HEARTBEAT_TICK);
+                let tick = match text_due {
+                    Some(d) => idle_timeout.min(HEARTBEAT_TICK).min(d),
+                    None => idle_timeout.min(HEARTBEAT_TICK),
+                };
                 match tokio::time::timeout(tick, rx.recv()).await {
                     Ok(Some(c)) => {
                         exempt_secs = 0;
@@ -450,10 +536,11 @@ impl Dispatcher {
                         }
                         // v1.23 心跳：静默期每拍刷新 footer（时长走动）；审批
                         // pending 时阶段翻 WaitingApproval（下个 chunk 自然翻回）。
-                        if let Some(c) = card.as_mut() {
-                            c.heartbeat(waiting, &conv, &hint, self.platform.as_ref())
-                                .await;
+                        if let Some(c) = card.as_ref() {
+                            c.heartbeat(waiting);
                         }
+                        // P2-11：合帧窗口到点（由 recv 超时驱动）。
+                        text_buf.flush(self, &conv, &hint, &mut streamed_text).await;
                         continue;
                     }
                 }
@@ -465,25 +552,31 @@ impl Dispatcher {
                         learned_sid = Some(sid);
                     }
                 }
-                AgentChunk::Final(t) => final_text = Some(t),
-                AgentChunk::Error(e) => error_text = Some(e),
+                AgentChunk::Final(t) => {
+                    // P2-11：流收尾信号（保序）——先 flush 缓冲文本再记录终稿。
+                    text_buf.flush(self, &conv, &hint, &mut streamed_text).await;
+                    final_text = Some(t);
+                }
+                AgentChunk::Error(e) => {
+                    text_buf.flush(self, &conv, &hint, &mut streamed_text).await;
+                    error_text = Some(e);
+                }
                 AgentChunk::Thought(t) => {
                     // W2-1：思考过程仅卡片平台展示（折叠区，渲染层按 cot 档位过滤）；
                     // 纯文本平台忽略——正文流式已体现活跃，逐条思考反而刷屏。
                     if cot == CotDetail::Off {
                         continue;
                     }
-                    if let Some(c) = card.as_mut() {
-                        c.append_thought(&t, &conv, &hint, self.platform.as_ref())
-                            .await;
+                    if let Some(c) = card.as_ref() {
+                        c.append_thought(&t);
                     }
                 }
                 AgentChunk::TodoList { items } => {
                     // W2-2：任务清单（全量替换）——卡片平台实时 checklist；
                     // 纯文本平台保留最新状态，最终回复追加进度行。
-                    if let Some(c) = card.as_mut() {
-                        c.set_todos(&items, &conv, &hint, self.platform.as_ref())
-                            .await;
+                    text_buf.flush(self, &conv, &hint, &mut streamed_text).await;
+                    if let Some(c) = card.as_ref() {
+                        c.set_todos(&items);
                     }
                     latest_todos = Some(items);
                 }
@@ -492,6 +585,9 @@ impl Dispatcher {
                     if cot == CotDetail::Off {
                         continue;
                     }
+                    // P2-11：非 Text chunk 到达即先 flush 缓冲文本（保序 + 提前
+                    // 释放，不等窗口到期）。
+                    text_buf.flush(self, &conv, &hint, &mut streamed_text).await;
                     // P8-1：input JSON → 人可读单行摘要（Bash 取 command、Read 取
                     // file_path…），再按 COT 档截断——替代此前的裸 JSON 截断。
                     let summary = truncate_str(
@@ -504,16 +600,8 @@ impl Dispatcher {
                         done: false,
                         id: id.clone(),
                     });
-                    if let Some(c) = card.as_mut() {
-                        c.append_tool(
-                            &tool,
-                            &summary,
-                            id.as_deref(),
-                            &conv,
-                            &hint,
-                            self.platform.as_ref(),
-                        )
-                        .await;
+                    if let Some(c) = card.as_ref() {
+                        c.append_tool(&tool, &summary, id.as_deref());
                     }
                 }
                 AgentChunk::ToolResult { tool, id, .. } => {
@@ -521,6 +609,8 @@ impl Dispatcher {
                     // 同名最早未完成——并行同名调用不再错配）；结果内容仍不进 IM
                     //（防止把大段输出刷进卡片）。
                     if cot != CotDetail::Off {
+                        // P2-11：保序 flush（同 ToolUse）。
+                        text_buf.flush(self, &conv, &hint, &mut streamed_text).await;
                         // W2-3：优先按 id 精确配对（首个借用先落地结束，再做名字
                         // 兜底——避免链式 or_else 的双重可变借用）。
                         let by_id = match id.as_deref() {
@@ -536,36 +626,35 @@ impl Dispatcher {
                         if let Some(t) = target {
                             t.done = true;
                         }
-                        if let Some(c) = card.as_mut() {
-                            c.finish_tool(
-                                &tool,
-                                id.as_deref(),
-                                &conv,
-                                &hint,
-                                self.platform.as_ref(),
-                            )
-                            .await;
+                        if let Some(c) = card.as_ref() {
+                            c.finish_tool(&tool, id.as_deref());
                         }
                     }
                 }
                 AgentChunk::Media { path } => {
+                    // P2-11：媒体产出与文本的先后关系在回复流里可见，先 flush。
+                    text_buf.flush(self, &conv, &hint, &mut streamed_text).await;
                     media_out.push(path);
                 }
                 AgentChunk::Text(t) => {
-                    if let Some(c) = card.as_mut() {
-                        c.append_text(&t, &conv, &hint, self.platform.as_ref())
-                            .await;
+                    if let Some(c) = card.as_ref() {
+                        c.append_text(&t);
                     } else {
-                        // P2-F：中间 Text chunk 实时推 IM（流式体验，而非全部丢弃只发最终 Final）。
-                        // P5-10：累积**已成功送达**的前缀，最终回复据此只补差量；
-                        // P5-第五批：失败不累积——该段留给最终全量兜底，两处皆失。
-                        if self.reply_ok(&conv, &t, &hint).await {
-                            streamed_text.push_str(&t);
-                        }
+                        // P2-F：中间 Text chunk 实时推 IM（流式体验，而非全部丢弃
+                        // 只发最终 Final）。P2-11：delta 级 chunk（claude-acp）逐条
+                        // 发送会刷屏并打爆平台 QPS——先入合帧缓冲，由窗口/非
+                        // Text chunk/流结束统一 flush（见 TextCoalescer 文档）。
+                        text_buf.push(&t);
                     }
                 }
             }
         }
+
+        // P2-11：流结束/中断退出的统一收口——合帧缓冲里未发的文本必须送达
+        //（不能丢），且先于终态回复/失败模板/中断标记。覆盖：channel 关闭
+        //（正常收尾与 abort 后的排空——sender drop 后 recv 仍会先送完缓冲
+        // chunk 再报 None）、空闲看门狗 break。
+        text_buf.flush(self, &conv, &hint, &mut streamed_text).await;
 
         // P4-3：空闲超时 → abort join（杀子进程链路同 /stop），走下方 cancelled 分支。
         if idle_timed_out {
@@ -590,9 +679,6 @@ impl Dispatcher {
                         Some(m.as_str()),
                         &tool_calls,
                         CardTerminal::Error(m.clone()),
-                        &conv,
-                        &hint,
-                        self.platform.as_ref(),
                     )
                     .await;
                 } else {
@@ -631,9 +717,6 @@ impl Dispatcher {
                             Some(m.as_str()),
                             &tool_calls,
                             CardTerminal::Error(m.clone()),
-                            &conv,
-                            &hint,
-                            self.platform.as_ref(),
                         )
                         .await;
                     } else {
@@ -647,15 +730,8 @@ impl Dispatcher {
                     );
                     // /stop 命令侧已回确认，这里只把流式卡片收敛到终态（防停在「生成中」）。
                     if let Some(c) = card.as_mut() {
-                        c.finalize(
-                            Some(""),
-                            &tool_calls,
-                            CardTerminal::Error("已中断".into()),
-                            &conv,
-                            &hint,
-                            self.platform.as_ref(),
-                        )
-                        .await;
+                        c.finalize(Some(""), &tool_calls, CardTerminal::Error("已中断".into()))
+                            .await;
                     } else {
                         // S-17：纯文本平台此前中断后静默——半截流式文本后无任何标记，
                         // 用户分不清「说完了」还是「被打断」。补一条短中断标记。
@@ -690,9 +766,6 @@ impl Dispatcher {
                         Some(m.as_str()),
                         &tool_calls,
                         CardTerminal::Error(m.clone()),
-                        &conv,
-                        &hint,
-                        self.platform.as_ref(),
                     )
                     .await;
                 } else {
@@ -840,16 +913,9 @@ impl Dispatcher {
                 CardTerminal::Error("agent 异常退出".into())
             };
             // 成本摘要（成功终态 footer 展示 `✅ 已完成 · $0.012`）。
-            c.usage_display = outcome.usage.as_ref().map(|u| u.display());
-            c.finalize(
-                Some(reply.as_str()),
-                &tool_calls,
-                terminal,
-                &conv,
-                &hint,
-                self.platform.as_ref(),
-            )
-            .await;
+            c.set_usage_display(outcome.usage.as_ref().map(|u| u.display()));
+            c.finalize(Some(reply.as_str()), &tool_calls, terminal)
+                .await;
         } else if !reply.is_empty() {
             // P5-10：流式已推完且无差量、无工具摘要时不发空消息。
             self.reply(&conv, &reply, &hint).await;

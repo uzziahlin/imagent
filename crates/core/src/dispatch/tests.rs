@@ -99,11 +99,17 @@ type PromptsHandle = Arc<TokioMutex<Vec<String>>>;
 /// mock platform：`inbox` 收到的出站文本，`recv_queue` 可编程的入站流。
 /// Wave B：`urgent` 变体支持加急文本（supports_urgent_text = true，加急消息以
 /// `[buzz] ` 前缀记入 inbox——完成强提醒/催办测试断言用）。
+/// P3（v13 批）：`reactions` 记录表情标注（react_to_message 全记录）；
+/// `typing_gate` 把 send_typing 钉在可观测窗口（见 TypingGate）。
 struct MockPlatform {
     recv_queue: Arc<TokioMutex<Option<Vec<InboundMessage>>>>,
     inbox: Arc<TokioMutex<Vec<String>>>,
     send_count: Arc<AtomicUsize>,
     urgent: bool,
+    /// 表情标注记录（stop-拦截收口测试用；默认空收，不影响既有断言）。
+    reactions: Arc<TokioMutex<Vec<(String, crate::types::MsgReaction)>>>,
+    /// typing 闸门（默认 None：send_typing 立即返回）。
+    typing_gate: Option<TypingGate>,
 }
 
 impl MockPlatform {
@@ -115,6 +121,8 @@ impl MockPlatform {
             inbox: inbox.clone(),
             send_count: send_count.clone(),
             urgent: false,
+            reactions: Arc::new(TokioMutex::new(Vec::new())),
+            typing_gate: None,
         };
         (p, inbox, send_count)
     }
@@ -124,6 +132,39 @@ impl MockPlatform {
         let (mut p, inbox, count) = Self::new();
         p.urgent = true;
         (p, inbox, count)
+    }
+}
+
+/// P3 stop-拦截测试的 typing 闸门：send_typing 置 entered 后挂起等一次性
+/// release 信号——把 run_round_inner 的 preamble 钉在「停止水位已读（line ~78）、
+/// 👀 未打（line ~236）」之间的确定窗口里，测试在窗口内注入停止标记，精确
+/// 命中起跑前的二次复查分支（而非批循环顶部的首次检查）。
+#[derive(Clone)]
+struct TypingGate {
+    entered: Arc<std::sync::atomic::AtomicBool>,
+    release: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+}
+
+impl TypingGate {
+    fn new() -> (Self, tokio::sync::oneshot::Sender<()>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (
+            Self {
+                entered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                release: Arc::new(std::sync::Mutex::new(Some(rx))),
+            },
+            tx,
+        )
+    }
+
+    async fn hold(&self) {
+        self.entered
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // 先把 Receiver 取出再 await——std MutexGuard 不能跨 await（Send 约束）。
+        let rx = self.release.lock().unwrap().take();
+        if let Some(rx) = rx {
+            let _ = rx.await;
+        }
     }
 }
 
@@ -154,6 +195,26 @@ impl Platform for MockPlatform {
     }
     fn supports_urgent_text(&self) -> bool {
         self.urgent
+    }
+    /// P3：typing 闸门（默认立即返回；测试置 gate 后挂起等 release）。
+    async fn send_typing(&self, _conv: &ConvId, _hint: &ReplyHint) -> Result<()> {
+        if let Some(g) = &self.typing_gate {
+            g.hold().await;
+        }
+        Ok(())
+    }
+    /// P3：表情标注全记录（stop-拦截收口测试断言用）。
+    async fn react_to_message(
+        &self,
+        _conv: &ConvId,
+        source_msg_id: &str,
+        reaction: crate::types::MsgReaction,
+    ) -> Result<()> {
+        self.reactions
+            .lock()
+            .await
+            .push((source_msg_id.to_string(), reaction));
+        Ok(())
     }
     async fn send_media(
         &self,
@@ -197,6 +258,9 @@ struct MockBackend {
     /// P5-10：流式模式——逐段发 Text，Final/RunOutcome 为全量拼接（模拟
     /// codex/gemini/ACP「中间 Text + Final 全量」语义，去重测试用）。默认空。
     stream_texts: Vec<String>,
+    /// P2-11：发完 stream_texts 后挂起 60s（无 Final、不返回）——中断路径的
+    /// 合帧缓冲 flush 测试用（等 /stop abort）。
+    stream_then_hang: bool,
     /// P5-第五批：announce session 后直接返 Err（Err 路径 session 持久化测试用）。
     fail_after_announce: Option<String>,
     /// `list_local_sessions` 返回的本机会话（P4-11 统一 /resume 测试用）。
@@ -224,6 +288,7 @@ impl MockBackend {
             slow_ms: 0,
             announce_session: None,
             stream_texts: Vec::new(),
+            stream_then_hang: false,
             fail_after_announce: None,
             local_sessions: Arc::new(TokioMutex::new(Vec::new())),
             capability: crate::backend::PermissionCapability::Unsupported,
@@ -291,6 +356,15 @@ impl MockBackend {
         b.stream_texts = texts;
         (b, calls, prompts, order)
     }
+    /// P2-11：发完 delta 后挂起（无 Final）——中断路径缓冲 flush 测试用。
+    fn new_stream_then_hang(
+        texts: Vec<String>,
+    ) -> (Self, CallsHandle, PromptsHandle, CounterHandle) {
+        let (mut b, calls, prompts, order) = Self::new();
+        b.stream_texts = texts;
+        b.stream_then_hang = true;
+        (b, calls, prompts, order)
+    }
     /// `list_local_sessions` 返回固定本机会话列表（P4-11 统一 /resume 测试用）。
     async fn new_with_local(
         local: Vec<LocalSession>,
@@ -351,6 +425,22 @@ impl Backend for MockBackend {
 
         // 稍微让出调度器，便于测试串行。
         tokio::task::yield_now().await;
+
+        // P2-11：发完 delta 即挂起（不发 Final、不返回）——等 /stop abort。
+        if self.stream_then_hang {
+            for t in &self.stream_texts {
+                let _ = chunks.send(AgentChunk::Text(t.clone())).await;
+            }
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            // 正常测试路径在上一行被 abort，走不到这里；返回值仅为类型完备。
+            return Ok(crate::types::RunOutcome {
+                session_id: SessionId("sess-hang".into()),
+                final_text: String::new(),
+                terminal: false,
+                usage: None,
+                stop_reason: None,
+            });
+        }
 
         // P4：慢后端——记录后挂起（不发任何 chunk），供 /stop、批处理、空闲
         // 看门狗测试制造「在飞任务」窗口。
@@ -796,6 +886,140 @@ async fn build_announce_fail(auth: Auth, sid: &str) -> Ctx {
         order,
         db,
     }
+}
+
+/// P2-11：发完 delta 挂起的流式后端（中断路径缓冲 flush 测试用）。
+async fn build_stream_then_hang(auth: Auth, texts: Vec<String>) -> Ctx {
+    let (plat, inbox, send_count) = MockPlatform::new();
+    let (back, calls, prompts, order) = MockBackend::new_stream_then_hang(texts);
+    let (store, db) = tmp_store().await;
+
+    let admins = auth.snapshot();
+    let disp = Arc::new(Dispatcher::new(
+        Arc::new(plat),
+        Arc::new(back),
+        store,
+        auth,
+        std::path::PathBuf::from("/tmp/imagent-test-ws"),
+        vec!["Read".into(), "Edit".into()],
+        PermissionMode::Off,
+        test_budgets(),
+        CotDetail::Brief,
+        admins,
+    ));
+
+    Ctx {
+        disp,
+        inbox,
+        send_count,
+        calls,
+        prompts,
+        order,
+        db,
+    }
+}
+
+// ---------- P1-1 集成吞吐锚：卡片能力平台 mock ----------
+
+/// 卡片能力平台 mock：send_card 恒成功返回句柄，update_card 全记录文本快照
+///（模拟 feishu 卡片路径；平台侧无节流——节流在 CardSession）。文本路径同
+/// MockPlatform（记 inbox）。
+struct CardCapablePlatform {
+    inbox: Arc<TokioMutex<Vec<String>>>,
+    send_count: Arc<AtomicUsize>,
+    updates: Arc<TokioMutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl Platform for CardCapablePlatform {
+    async fn recv(&self) -> Result<InboundMessage> {
+        // 测试不经 run/recv（直接 handle），永不返回。
+        loop {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+    }
+    async fn send_text(&self, _conv: &ConvId, text: &str, _hint: &ReplyHint) -> Result<()> {
+        self.inbox.lock().await.push(text.to_string());
+        self.send_count.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn send_media(
+        &self,
+        _conv: &ConvId,
+        _media: &crate::types::MediaRef,
+        _hint: &ReplyHint,
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn name(&self) -> &'static str {
+        "mock-cards"
+    }
+    fn supports_streaming_card(&self, _conv: &ConvId) -> bool {
+        true
+    }
+    async fn send_card(
+        &self,
+        _conv: &ConvId,
+        _card: &crate::types::OutboundCard,
+        _hint: &ReplyHint,
+    ) -> Result<Option<String>> {
+        Ok(Some("card:tput".into()))
+    }
+    async fn update_card(
+        &self,
+        _conv: &ConvId,
+        _message_id: &str,
+        card: &crate::types::OutboundCard,
+        _hint: &ReplyHint,
+    ) -> Result<()> {
+        self.updates.lock().await.push(card.text.clone());
+        Ok(())
+    }
+}
+
+/// P1-1：卡片平台 + delta 级流式后端的 dispatcher（集成吞吐锚用）。
+/// 返回 Ctx 与 update_card 收到的文本快照句柄。
+async fn build_card_streaming(
+    auth: Auth,
+    texts: Vec<String>,
+) -> (Ctx, Arc<TokioMutex<Vec<String>>>) {
+    let (back, calls, prompts, order) = MockBackend::new_streaming(texts);
+    let plat = CardCapablePlatform {
+        inbox: Arc::new(TokioMutex::new(Vec::new())),
+        send_count: Arc::new(AtomicUsize::new(0)),
+        updates: Arc::new(TokioMutex::new(Vec::new())),
+    };
+    let inbox = plat.inbox.clone();
+    let send_count = plat.send_count.clone();
+    let updates = plat.updates.clone();
+    let (store, db) = tmp_store().await;
+
+    let admins = auth.snapshot();
+    let disp = Arc::new(Dispatcher::new(
+        Arc::new(plat),
+        Arc::new(back),
+        store,
+        auth,
+        std::path::PathBuf::from("/tmp/imagent-test-ws"),
+        vec!["Read".into(), "Edit".into()],
+        PermissionMode::Off,
+        test_budgets(),
+        CotDetail::Brief,
+        admins,
+    ));
+
+    (
+        Ctx {
+            disp,
+            inbox,
+            send_count,
+            calls,
+            prompts,
+            order,
+            db,
+        },
+        updates,
+    )
 }
 
 /// 等待 conv 的在飞任务注册出现（join spawn 后写入 running map）。
@@ -3053,6 +3277,8 @@ async fn stop_persists_learned_session() {
 
 /// P5-10：非卡片平台流式 Text 已实时推送——最终回复只补差量，不整段重发
 /// （codex/gemini/ACP 的「中间 Text + Final 全量」语义此前会推两遍）。
+/// P2-11：推送粒度改为 400ms 合帧——两段 delta 合并为一条流式消息送达
+///（语义等价：用户仍在流式阶段看到全部中间文本，且只看到一次）。
 #[tokio::test]
 async fn streamed_text_not_duplicated_on_plain_platform() {
     let _serial = SERIAL.lock().await;
@@ -3063,19 +3289,173 @@ async fn streamed_text_not_duplicated_on_plain_platform() {
     .await;
     feed_and_wait(&ctx, vec![msg("c1", "alice", "问题")], 1).await;
     let inbox = ctx.inbox.lock().await.clone();
-    // 两段流式文本都应实时推送。
+    // 两段流式文本都应实时推送（合帧后同一条消息内先后可见）。
     assert!(
-        inbox.iter().any(|t| t == "答案第一段。"),
-        "应实时推送第一段: {inbox:?}"
-    );
-    assert!(
-        inbox.iter().any(|t| t == "答案第二段。"),
-        "应实时推送第二段: {inbox:?}"
+        inbox
+            .iter()
+            .any(|t| t.contains("答案第一段。") && t.contains("答案第二段。")),
+        "应实时推送流式文本（合帧）: {inbox:?}"
     );
     // 全量文本不应作为最终回复再发一遍。
     let dup = inbox.iter().filter(|t| t.contains("答案第一段。")).count();
     assert_eq!(dup, 1, "Final 全量不应重发: {inbox:?}");
     drop_db(ctx.db).await;
+}
+
+/// P1-1 吞吐锚（集成）：卡片平台 × delta 级 Text 流（50 条，模拟 claude-acp
+/// 粒度），整轮耗时应远低于「每 chunk 睡 500ms」的旧节奏（50×500ms = 25s，
+/// 可拖到逼近 agent_timeout）——节流睡眠已移出消费路径（CardSession 常驻
+/// patcher）；终态卡仍携带全部累积文本（数据不因解耦丢失）。
+#[tokio::test]
+async fn card_round_consumes_delta_stream_fast() {
+    let _serial = SERIAL.lock().await;
+    let texts: Vec<String> = (0..50).map(|i| format!("片段{i}，")).collect();
+    let (ctx, updates) = build_card_streaming(Auth::new(vec!["alice".into()]), texts).await;
+    let t0 = std::time::Instant::now();
+    ctx.disp.handle(msg("c1", "alice", "长任务")).await;
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "delta 流整轮耗时应 < 2s（节流不得阻塞消费循环）: {elapsed:?}"
+    );
+    let ups = updates.lock().await.clone();
+    assert!(
+        ups.iter()
+            .any(|t| t.contains("片段0，") && t.contains("片段49，")),
+        "终态卡应含全部累积文本: {ups:?}"
+    );
+    drop_db(ctx.db).await;
+}
+
+/// P2-11：文本平台（无卡）delta 合帧——50 条 delta 只产生少量消息（≤5），
+/// 且每段内容恰好送达一次（合帧只改发送粒度，不改「用户看到完整文本」）。
+#[tokio::test]
+async fn text_platform_coalesces_delta_stream() {
+    let _serial = SERIAL.lock().await;
+    let texts: Vec<String> = (0..50).map(|i| format!("段{i}；")).collect();
+    let ctx = build_streaming(Auth::new(vec!["alice".into()]), texts).await;
+    feed_and_wait(&ctx, vec![msg("c1", "alice", "问题")], 1).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    let streamed: Vec<&String> = inbox.iter().filter(|t| t.contains("段0；")).collect();
+    assert!(!streamed.is_empty(), "流式文本应实时送达: {inbox:?}");
+    assert!(
+        streamed.len() <= 5,
+        "50 条 delta 应合帧为 ≤5 条消息（防刷屏/打爆 QPS）: {inbox:?}"
+    );
+    // 完整性：50 段每段恰好出现一次（无丢失、无重复；Final 差量为空不再补发）。
+    for i in 0..50 {
+        let needle = format!("段{i}；");
+        let n: usize = inbox.iter().map(|t| t.matches(&needle).count()).sum();
+        assert_eq!(n, 1, "第 {i} 段应恰好送达一次: {inbox:?}");
+    }
+    drop_db(ctx.db).await;
+}
+
+/// P2-11：中断（/stop）退出路径的合帧缓冲不丢——缓冲中的未发文本在终态
+/// 回复前 flush。abort 后 sender drop，消费方仍会先排空 channel 里缓冲的
+/// chunk（tokio mpsc 语义）再退出循环，随后的统一收口 flush 把它们送达。
+#[tokio::test]
+async fn abort_flushes_coalesced_text_buffer() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build_stream_then_hang(
+        Auth::new(vec!["alice".into()]),
+        vec!["中途的".to_string(), "部分输出".to_string()],
+    )
+    .await;
+    let disp = ctx.disp.clone();
+    let runner = tokio::spawn(async move {
+        disp.handle(msg("c1", "alice", "长任务")).await;
+    });
+    assert!(wait_registered(&ctx, "c1").await, "任务应在飞");
+    // 给 delta 到达留余量（< 合帧窗口 400ms，确保走的是中断 flush 而非定时
+    // flush；即便偶发超窗，定时 flush 也已送达文本，断言不 flake）。
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    ctx.disp.handle(msg("c1", "alice", "/stop")).await;
+    let done = tokio::time::timeout(Duration::from_secs(5), runner).await;
+    assert!(done.is_ok(), "被中断的 runner 应很快退出");
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.iter().any(|t| t.contains("中途的部分输出")),
+        "中断前缓冲的文本必须 flush（不能丢）: {inbox:?}"
+    );
+    assert!(
+        inbox.iter().any(|t| t.contains("本轮已被中断")),
+        "文本平台应补中断标记: {inbox:?}"
+    );
+    drop_db(ctx.db).await;
+}
+
+/// P3（v13 批）：/stop 拦截（round.rs 起跑前二次复查命中）时本批消息已打
+/// 👀（Processing）——early return 必须把表情翻回终态（Failed），否则用户
+/// 消息永远挂着「在做了」。typing 闸门把 preamble 钉在「水位已读、👀 已打」
+/// 之后的窗口，测试在窗口内注入停止标记，精确命中该分支。
+#[tokio::test]
+async fn stop_interception_flips_processing_reaction() {
+    let _serial = SERIAL.lock().await;
+    let auth = Auth::new(vec!["alice".into()]);
+    let (gate, release) = TypingGate::new();
+    let (plat, _inbox, _send_count) = MockPlatform::new();
+    let reactions = plat.reactions.clone();
+    let plat = MockPlatform {
+        typing_gate: Some(gate.clone()),
+        ..plat
+    };
+    let (back, _calls, _prompts, _order) = MockBackend::new();
+    let (store, db) = tmp_store().await;
+    let admins = auth.snapshot();
+    let disp = Arc::new(Dispatcher::new(
+        Arc::new(plat),
+        Arc::new(back),
+        store,
+        auth,
+        std::path::PathBuf::from("/tmp/imagent-test-ws"),
+        vec!["Read".into()],
+        PermissionMode::Off,
+        test_budgets(),
+        CotDetail::Brief,
+        admins,
+    ));
+    let d = disp.clone();
+    let runner = tokio::spawn(async move {
+        d.run_agent_round(msg("c1", "alice", "将被拦截的批次"), vec!["om_9".into()])
+            .await;
+    });
+    // 等 preamble 走到 typing（stop_mark_epoch 已读、👀 未打）。
+    for _ in 0..400 {
+        if gate.entered.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        gate.entered.load(Ordering::SeqCst),
+        "preamble 应走到 typing 闸门"
+    );
+    // 窗口内注入停止标记（ts > 轮首水位 0）→ 👀 已打后的二次复查命中拦截。
+    disp.stop_requested
+        .lock()
+        .await
+        .insert("c1".into(), crate::dispatch::now_secs());
+    release.send(()).expect("release typing gate");
+    let done = tokio::time::timeout(Duration::from_secs(5), runner).await;
+    assert!(done.is_ok(), "拦截路径应结束");
+    let reactions = reactions.lock().await.clone();
+    let idx_processing = reactions
+        .iter()
+        .position(|(id, r)| id == "om_9" && *r == crate::types::MsgReaction::Processing);
+    let idx_failed = reactions
+        .iter()
+        .position(|(id, r)| id == "om_9" && *r == crate::types::MsgReaction::Failed);
+    assert!(idx_processing.is_some(), "拦截前应打 👀: {reactions:?}");
+    assert!(
+        idx_failed.is_some(),
+        "拦截 early-return 应把 👀 翻回终态: {reactions:?}"
+    );
+    assert!(
+        idx_failed.unwrap() > idx_processing.unwrap(),
+        "Failed 应在 Processing 之后: {reactions:?}"
+    );
+    drop_db(db).await;
 }
 
 /// P5-15：本机会话 cwd 与当前 workdir 不符时拒绝接管（防目录编码冲突串项目）。
@@ -3239,9 +3619,13 @@ async fn stop_aborts_compact() {
     let done = tokio::time::timeout(Duration::from_secs(5), runner).await;
     assert!(done.is_ok(), "被中断的 /compact 应很快退出");
     let inbox = ctx.inbox.lock().await.clone();
+    // P3（v13 批）：/stop 中断是正常语义，不再裸泄 JoinError（"task N was
+    // cancelled"），改回可读文案（会话保留、可重新 /compact）。
     assert!(
-        inbox.iter().any(|t| t.contains("摘要任务异常")),
-        "应回中断提示: {inbox:?}"
+        inbox
+            .iter()
+            .any(|t| t.contains("已中断") && t.contains("可重新 /compact")),
+        "应回中断提示（可重新 /compact）: {inbox:?}"
     );
     assert!(ctx.disp.running.lock().await.is_empty(), "在飞注册应清空");
     drop_db(ctx.db).await;

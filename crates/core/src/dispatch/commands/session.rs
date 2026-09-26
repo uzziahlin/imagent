@@ -646,6 +646,17 @@ impl Dispatcher {
                 );
                 return Err(format!("生成摘要失败：{e}"));
             }
+            Err(e) if e.is_cancelled() => {
+                // P3（code-review v13）：/stop / 看门狗中断（JoinError::is_cancelled）
+                // 不是异常——裸泄 JoinError 会给用户显示 "task 123 was cancelled"。
+                // 中断语义：session 保留、摘要未落，可直接重新 /compact。
+                warn!(
+                    target: "imagent::core",
+                    conv_id = %conv.0,
+                    "compact 摘要任务被中断（/stop 或超时 abort）"
+                );
+                return Err("⏹️ 已中断，会话未压缩（可重新 /compact）".to_string());
+            }
             Err(e) => {
                 warn!(
                     target: "imagent::core",
