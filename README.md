@@ -373,6 +373,7 @@ imagent mcp-ask --print-config
 - **工具收敛**：`allowed_tools` 可选（缺省 = 全部工具，`[]`/`["*"]` 同义不限制；显式清单 = 白名单）；workdir 用 `current_dir` 锁定，危险操作靠 `permission_mode = "ask"` IM 审批兜底。
 - **权限审批**：危险操作 IM approve/deny（文本 / 按钮卡片）；卡片 markdown 层 `<at>` 注入面全路径转义（bot 不可被借以 @ 任意租户用户）。
 - **store 加固**：文件 0600 / 目录 0700；CDN 下载 SSRF 白名单；服务定义（内嵌 secret）0600。
+- **威胁模型**：审批闭环约束「agent 发起的工具调用」，不约束「同 uid 进程的读写能力」——agent 子进程与 imagent 同用户运行，提示注入场景下仍有残留攻击面。**多人群白名单部署前务必读 [SECURITY.md「威胁模型与边界」](SECURITY.md#威胁模型与边界必读)**。
 - 详见 [`SECURITY.md`](SECURITY.md)。
 
 ## 路线
