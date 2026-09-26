@@ -382,8 +382,8 @@ impl Default for AcpBackend {
 /// - `chunks`：core 传入的通道（克隆一份给 handler，handler 直接推 `AgentChunk`）。
 /// - `agent_text`：累计 `AgentMessageChunk` 文本——ACP 的 `session/prompt` 响应只带
 ///   `stop_reason`，最终回复文本必须从流式 `AgentMessageChunk` 累积。
-/// - `usage`：W2-4——`UsageUpdate` 通知的**最新**会话水位（ACP 语义是会话累计值，
-///   替换而非求和），turn 结束时并入 RunOutcome.usage。
+/// - `usage`：W2-4——`UsageUpdate` 通知的**最新**会话水位（used = 轮末最后一次
+///   请求的完整上下文规模，替换而非求和），turn 结束时并入 RunOutcome.usage。
 /// - `cost_baseline`：P0-2（v1.17 审计）——cost 累计水位记账基线（上次轮末的
 ///   `(session_id, 累计cost)`）。RunOutcome 落库的是**本轮增量**（累计差，负值
 ///   钳 0），否则每轮把会话累计当单轮成本记账、run_stats 求和严重虚高（per-
@@ -1086,9 +1086,12 @@ async fn forward_update(state: &StreamState, update: SessionUpdate) {
             (!items.is_empty()).then_some(AgentChunk::TodoList { items })
         }
         SessionUpdate::UsageUpdate(u) => {
-            // W2-4：上下文水位 + 累计成本。ACP 的 used 是**会话累计**上下文 token
-            //（非本轮增量）、cost 是会话累计成本——替换而非求和。仅记入共享状态，
-            // turn 结束并入 RunOutcome（不推 chunk，不是 IM 可读内容）。
+            // W2-4：上下文水位 + 累计成本。ACP 的 used 是**轮末最后一次主对话
+            // 请求的完整上下文规模**（适配器 0.70 语义：input+output+cache_read+
+            // cache_creation——即会话当前水位而非每轮增量，替换而非求和；真机
+            // 2026-09-25 GLM 网关双调用探针验证：两次调用只报末次 ~22k，不求和）；
+            // cost 是会话累计成本。仅记入共享状态，turn 结束并入 RunOutcome
+            //（不推 chunk，不是 IM 可读内容）。
             let cost = u
                 .cost
                 .as_ref()
