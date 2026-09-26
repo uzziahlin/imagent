@@ -159,9 +159,9 @@ impl Dispatcher {
                     .load(std::sync::atomic::Ordering::Relaxed);
                 if threshold > 0 {
                     let pct = tokens * 100 / threshold.max(1);
-                    format!("\n- 🧠 上下文：{tokens} tok（阈值 {threshold}，{pct}%）")
+                    format!("\n- 🧠 上下文：{tokens} tok（会话累计，阈值 {threshold}，{pct}%）")
                 } else {
-                    format!("\n- 🧠 上下文：{tokens} tok（自动压缩已关闭）")
+                    format!("\n- 🧠 上下文：{tokens} tok（会话累计，自动压缩已关闭）")
                 }
             }),
             _ => None,

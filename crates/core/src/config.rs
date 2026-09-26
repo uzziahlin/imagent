@@ -465,20 +465,19 @@ pub struct Config {
     pub shortcuts: std::collections::HashMap<String, String>,
     /// W2-5：自动 compact 阈值（tokens，**绝对值档**）——成功轮次的上下文水位
     /// （usage.input+cache_read）达到阈值即自动走 /compact 管道（生成摘要 +
-    /// 重置，对齐 Claude Code 原生 auto-compact）。默认 120_000；0 = 关闭。
-    /// 注意：设置了比例档（`model_context_window_tokens`）时本档被覆盖。
+    /// 重置，对齐 Claude Code 原生 auto-compact）。**默认 0 = 关闭**（v1.27.0
+    /// 起自动压缩默认不启用——网关 token 口径与 CLI 估算有偏差，误触发代价高；
+    /// 需要者显式配置开启）。注意：设置了比例档（`model_context_window_tokens`）
+    /// 时本档被覆盖。
     #[serde(default = "default_auto_compact_threshold_tokens")]
     pub auto_compact_threshold_tokens: u64,
     /// v1.18：当前模型的上下文窗口大小（tokens，**比例档**开关）——设置后
     /// 自动压缩阈值 = 窗口 × `auto_compact_window_ratio`（覆盖绝对值档）。
-    /// 动机：120k 绝对默认按 200k 窗口校准，1M 窗口的大窗模型（GLM 等）会
-    /// 过早压缩丢细节。claude CLI 的 usage 不回传窗口字段、无法自动探测，
-    /// 由部署者按所用模型填写；ACP 路径后续可从 UsageUpdate 的 size 字段
-    /// 自动学习（follow-up）。
-    /// **默认 1_000_000**（按大窗模型假定的比例档缺省）——200k 窗口的
-    /// Claude 系模型请显式声明 200000（否则阈值 800k 高于模型硬上限，
-    /// 水位撞窗前永不触发自动压缩，将以 API 上下文溢出错误收场）；
-    /// 设 0 = 回退绝对值档（`auto_compact_threshold_tokens`）。
+    /// **默认 0 = 自动压缩整体关闭**（比例档与绝对值档均不激活；v1.27.0 起
+    /// 默认不自动压缩、不主动提醒，需要者按所用模型显式开启：200k 窗口的
+    /// Claude 系模型设 200000，1M 大窗模型（GLM 等）设 1000000）。
+    /// ACP 路径的窗口自学习仅在比例档已激活（本值 > 0）时校准阈值，
+    /// 关闭态不会被运行时学习值重新启用。
     #[serde(default = "default_model_context_window_tokens")]
     pub model_context_window_tokens: u64,
     /// v1.18：自动压缩的窗口比例（0 < r ≤ 1，缺省 0.8 = 80% 水位触发）。
@@ -640,13 +639,13 @@ fn default_batch_window_ms() -> u64 {
     1500
 }
 fn default_auto_compact_threshold_tokens() -> u64 {
-    120_000
+    0
 }
 fn default_auto_compact_window_ratio() -> f64 {
     0.8
 }
 fn default_model_context_window_tokens() -> u64 {
-    1_000_000
+    0
 }
 fn default_acp_max_connections() -> usize {
     8
@@ -1234,14 +1233,14 @@ model_context_window_tokens = 1000000
 "#,
         );
         let cfg = Config::load(&p).expect("parse");
-        // 缺省比例 0.8 → 800k，覆盖绝对值档默认 120k。
+        // 缺省比例 0.8 → 800k（v1.27.0 起窗口须显式声明才激活比例档）。
         assert_eq!(cfg.effective_auto_compact_threshold(), 800_000);
         cleanup(&p);
     }
 
-    /// 显式 window=0 → 绝对值档（配置值）；缺省窗口 = 1M → 比例档 800k。
+    /// 显式 window=0 → 绝对值档（配置值）；缺省（不写任何相关键）→ 关闭。
     #[test]
-    fn auto_compact_absolute_fallback_and_default_window() {
+    fn auto_compact_absolute_fallback_and_default_off() {
         let p = tmp_path(
             "ac_abs",
             r#"default_workdir = "/tmp/ws"
@@ -1252,10 +1251,10 @@ model_context_window_tokens = 0
         let cfg = Config::load(&p).expect("parse");
         assert_eq!(cfg.effective_auto_compact_threshold(), 300_000);
         cleanup(&p);
-        // 缺省（不写任何相关键）：窗口默认 1M × 0.8 = 800k。
+        // v1.27.0：缺省 = 0（自动压缩默认关闭，不自动压缩也不提醒）。
         let p = tmp_path("ac_default", r#"default_workdir = "/tmp/ws""#);
         let cfg = Config::load(&p).expect("parse");
-        assert_eq!(cfg.effective_auto_compact_threshold(), 800_000);
+        assert_eq!(cfg.effective_auto_compact_threshold(), 0);
         cleanup(&p);
     }
 

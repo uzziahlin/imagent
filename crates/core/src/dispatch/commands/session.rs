@@ -489,13 +489,16 @@ impl Dispatcher {
             "上下文水位超阈值，自动压缩（auto_compact）"
         );
         // v1.20 卡片化：压缩通知走命令卡（纯文本平台 trait 降级）。
+        // v1.27.0 措辞修正：水位是**会话累计上下文**（最后请求的完整上下文
+        // 规模，含历史轮次与缓存命中部分），非本轮新增 token——「本轮上下文
+        // 水位」的旧措辞让用户误读为单轮消耗量。
         let _ = self
             .platform
             .send_command_card(
                 conv,
                 "🧠 正在自动压缩上下文",
                 &format!(
-                    "本轮上下文水位 {in_tokens} tokens 已超过阈值 {threshold}，正在生成摘要并重置会话……"
+                    "会话累计上下文 {in_tokens} tokens（含历史轮次与缓存命中，非本轮新增）已超过阈值 {threshold}，正在生成摘要并重置会话……"
                 ),
                 &[],
                 hint,

@@ -74,7 +74,7 @@ imagent 的几个关键取舍（解释「为什么这么设计」，而非与某
 - **发送者白名单是硬约束，不是可选**：iLink bot 任何人都能加好友，没有白名单 = 任意人都能驱动你的 agent 执行命令。
 - **session 持久化到 SQLite**：进程重启可续（`--resume`），崩溃不丢上下文；排队消息同样落库（schema v12）——重启重放。SQLite 经 `rusqlite` 的 `bundled` feature **静态链接进二进制**，运行时无需宿主安装 SQLite。
 - **IM 内权限审批闭环**（核心特性）：危险工具（如 `Bash`）执行前，先在 IM 向你 approve/deny——把 agent 的执行权关进用户审批的笼子。
-- **自动压缩按模型窗口比例**：上下文水位（input + cache_read）达窗口 80% 才压缩，窗口由部署者声明（CLI 的 usage 不回传窗口字段）；200k 窗口的 Claude 系模型显式声明即可，比例与绝对值双档并存。
+- **自动压缩可选、默认关闭**：上下文水位（input + cache_read）达「模型窗口 × 比例」才压缩；v1.27.0 起默认不启用（网关 token 口径与 CLI 估算存在偏差，误压缩丢上下文细节的代价高于收益），显式声明 `model_context_window_tokens`（比例档）或 `auto_compact_threshold_tokens`（绝对值档）开启；200k 窗口的 Claude 系模型声明 200000 即可，双档并存。
 - **限流服从式退避**：被限流就退避等待，**绝不绕过风控**（合规红线）。
 - **单二进制 + 低运行时依赖**：除 Linux 下凭据可选经 `libdbus`（Secret Service；无该环境则自动回退，见 [安全](#安全)）外，不依赖宿主环境。
 
@@ -159,10 +159,11 @@ allowed_senders = []        # 留空 = 发现模式（先看日志拿你的 from
 # cron_catchup = "one"                # /cron 停机补跑：one(缺省)|off(陈旧跳过)|all(逐周期补跑,上限3)
 
 # ===== 用量护栏（v1.19 比例档）=====
-# 自动压缩：上下文水位达 模型窗口 × 80% 触发（摘要+重置+下轮注入【前情摘要】）。
-# model_context_window_tokens = 1000000   # 模型上下文窗口（缺省 1M 大窗假定；200k 窗口的 Claude 系模型请显式写 200000）
+# 自动压缩：**默认关闭**（v1.27.0 起——不自动压缩、不主动提醒；需要者显式开启）。
+# 开启比例档：上下文水位达 模型窗口 × ratio 触发（摘要+重置+下轮注入【前情摘要】）。
+# model_context_window_tokens = 1000000   # 模型上下文窗口（设 >0 即开启比例档；200k 窗口的 Claude 系模型写 200000；缺省 0 = 关闭）
 # auto_compact_window_ratio = 0.8         # 触发比例（缺省 0.8；两项均支持 SIGHUP 热改）
-# auto_compact_threshold_tokens = 120000  # 绝对值档：仅窗口设 0 时生效（0=关闭自动压缩）
+# auto_compact_threshold_tokens = 120000  # 绝对值档：仅窗口设 0 且本值 >0 时生效
 EOF
 ```
 
@@ -286,7 +287,7 @@ secret 轮换 / 环境变量变化后：重新 `export` + `imagent service insta
 | `/resume [n]` | 统一恢复列表：📱 IM 会话 ∪ 💻 电脑端 Claude Code 会话（摘要+时间辨认，按序号接管，无需会话 id） |
 | `/export [n]` | 导出当前（或 /resume 序号）会话为 Markdown 文件 |
 | `/again` | 再跑最近一次成功指令（与 /retry 的失败轮重试对称） |
-| `/compact` | 软压缩上下文（摘要 + 重置 + 延续）；自动触发条件见[用量护栏](#设计取舍)：水位（input+缓存）达 模型窗口 × `auto_compact_window_ratio`（缺省 80%） |
+| `/compact` | 软压缩上下文（摘要 + 重置 + 延续）；自动触发**默认关闭**，开启方式见[用量护栏](#设计取舍)：水位（input+缓存）达 模型窗口 × `auto_compact_window_ratio`（缺省 80%） |
 | `/retry` | 重发最近一轮指令（失败/中断后一键续接） |
 | `/export` | 当前会话导出为 Markdown 文件回传（claude 系后端） |
 | `/model [名称\|default]` | 查看/热切模型（切换需管理员；claude 系 / codex `-m` / gemini `-m` 全支持） |

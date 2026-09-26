@@ -797,49 +797,9 @@ impl Dispatcher {
                 .count();
             reply.push_str(&format!("\n\n📋 计划进度：{}/{} 完成", done, todos.len()));
         }
-        // Wave B-9：上下文水位提示——**仅在自动压缩关闭（阈值 0）时**提醒手动
-        // /compact。v1.25.1 真机修复：此前「80k~阈值之间也提示」的条件在比例档
-        //（1M×0.8=800k）下 80k~800k 每轮触发（86k 也提示）——80k 硬阈是 120k
-        // 窗口时代遗留，比例档激活时超阈自动压缩会处理，中间态提示纯噪音。
-        // 形态修复：不再追加进回复正文（污染 agent 产出），改独立命令卡（带
-        // /compact 按钮）；per-conv 1h 去重防连发。口径：input + cached。
-        let ctx_tokens =
-            |u: &crate::types::UsageStats| u.input_tokens + u.cached_tokens.unwrap_or(0);
-        let auto_threshold = self
-            .auto_compact_threshold
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let watermark = outcome.usage.as_ref().map(ctx_tokens);
-        if auto_threshold == 0 && watermark.is_some_and(|n| n > 80_000) {
-            let n = watermark.unwrap_or(0);
-            let now = now_secs();
-            let should_notice = {
-                let mut last = self.watermark_notice_last.lock().await;
-                let hit = last.get(&conv.0).copied().unwrap_or(0) + 3600 <= now;
-                if hit {
-                    last.retain(|_, ts| now - *ts < 7200);
-                    last.insert(conv.0.clone(), now);
-                }
-                hit
-            };
-            if should_notice {
-                let _ = self
-                    .platform
-                    .send_command_card(
-                        &conv,
-                        "📊 上下文水位",
-                        &format!(
-                            "当前上下文约 **{n}** tokens，较大（自动压缩已关闭）。\n\n建议 /compact 生成摘要重置，或配置 auto_compact_window_ratio 让其自动处理。"
-                        ),
-                        &[crate::types::CardButton {
-                            label: "🧠 立即压缩".into(),
-                            command: "/compact".into(),
-                            style: crate::types::CardButtonStyle::Primary,
-                        }],
-                        &hint,
-                    )
-                    .await;
-            }
-        }
+        // v1.27.0：Wave B-9 的 80k 水位提示卡已随「自动压缩默认关闭」移除
+        // ——默认档既不自动压缩也不主动提醒（需要者显式配置开启自动压缩）；
+        // 水位仍落库（ctx_watermark）供 /status 按需查看。
         // v1.23 指令复用：成功轮 prompt 落 `last_success_prompt:<conv>`（与
         // 失败轮的 last_prompt 分键互不干扰）——/again 与失败卡的对称物。
         // v1.25 /last：同一处落 `last_round:<conv>` 快照（任务+结论+耗时+成本）
@@ -1041,6 +1001,26 @@ impl Dispatcher {
             self.note_learned_context_window(w);
         }
         if let Some(tokens) = outcome.usage.as_ref().map(ctx_tokens) {
+            // v1.27.0：水位 > 已知窗口（如 1.53M > 1M）物理上不可能来自单次
+            // 请求的真实上下文——上游网关 token 口径与 CLI 本地估算分歧（中文/
+            // 图片 tokenizer 差异）或缓存字段双计。数字照用（超阈压缩仍正确：
+            // 上下文按网关口径确实已爆），warn 留痕便于排障。窗口来源：ACP
+            // UsageUpdate.size（CLI 路径恒 None，no-op）。
+            if let Some(w) = outcome
+                .usage
+                .as_ref()
+                .and_then(|u| u.context_window)
+                .filter(|w| *w > 0)
+                .filter(|w| tokens > *w)
+            {
+                warn!(
+                    target: "imagent::core",
+                    conv_id = %conv.0,
+                    watermark = tokens,
+                    window = w,
+                    "上下文水位超过模型窗口（网关 token 口径异常，仍按阈值压缩）"
+                );
+            }
             if let Err(e) = self
                 .store
                 .set_config(&format!("ctx_watermark:{}", conv.0), &tokens.to_string())

@@ -203,7 +203,7 @@ struct MockBackend {
     local_sessions: Arc<TokioMutex<Vec<LocalSession>>>,
     /// S-1/S-2：权限能力档位（默认 Unsupported；FullLoop 供闭环类测试覆写）。
     capability: crate::backend::PermissionCapability,
-    /// Wave B-9：RunOutcome 携带的 usage（上下文水位提示测试用；默认 None）。
+    /// RunOutcome 携带的 usage（run_stats 落库/自动压缩阈值测试用；默认 None）。
     usage: Option<crate::types::UsageStats>,
 }
 
@@ -3924,17 +3924,6 @@ async fn build_urgent_slow(auth: Auth, slow_ms: u64) -> Ctx {
     ctx
 }
 
-/// Wave B-9：usage 变体（RunOutcome.usage 透传，上下文水位测试用）。
-async fn build_with_usage(auth: Auth, usage: crate::types::UsageStats) -> Ctx {
-    let (plat, _i, _c) = MockPlatform::new();
-    let (back, calls, prompts, order) = MockBackend::new_with_usage(usage);
-    let mut ctx = build_with_parts(auth, plat, back, "/tmp/imagent-test-ws".into()).await;
-    ctx.calls = calls;
-    ctx.prompts = prompts;
-    ctx.order = order;
-    ctx
-}
-
 /// W4-1：per-sender 成本上限——近 24h 累计达上限的新轮次直接拒绝（不启动
 /// agent），回执说明；未达上限正常执行。
 #[tokio::test]
@@ -4465,47 +4454,6 @@ async fn continuation_orphan_hint_on_fresh_conv() {
             .count(),
         3,
         "有会话续接不提示: {inbox:?}"
-    );
-    drop_db(ctx.db).await;
-}
-
-/// Wave B-9：上下文水位——本轮输入 > 80k tokens 时完成回复追加 /compact 建议。
-#[tokio::test]
-async fn context_watermark_hint_on_large_input() {
-    let _serial = SERIAL.lock().await;
-    let auth = Auth::new(vec!["alice".into()]);
-    let usage = crate::types::UsageStats {
-        input_tokens: 90_000,
-        output_tokens: 500,
-        cached_tokens: None,
-        total_cost_usd: None,
-        context_window: None,
-    };
-    let ctx = build_with_usage(auth.clone(), usage).await;
-    feed_and_wait(&ctx, vec![msg("c1", "alice", "分析一下")], 1).await;
-    let inbox = ctx.inbox.lock().await.clone();
-    assert!(
-        inbox
-            .iter()
-            .any(|t| t.contains("上下文约") && t.contains("较大") && t.contains("/compact")),
-        "超水位提示 /compact: {inbox:?}"
-    );
-    drop_db(ctx.db).await;
-
-    // 低于水位：不提示。
-    let usage = crate::types::UsageStats {
-        input_tokens: 80_000,
-        output_tokens: 100,
-        cached_tokens: None,
-        total_cost_usd: None,
-        context_window: None,
-    };
-    let ctx = build_with_usage(auth, usage).await;
-    feed_and_wait(&ctx, vec![msg("c1", "alice", "分析一下")], 1).await;
-    let inbox = ctx.inbox.lock().await.clone();
-    assert!(
-        !inbox.iter().any(|t| t.contains("/compact")),
-        "80k（≤阈值）不提示: {inbox:?}"
     );
     drop_db(ctx.db).await;
 }
