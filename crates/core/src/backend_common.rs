@@ -782,6 +782,7 @@ pub async fn spawn_cli_backend(
                                     always: false,
                                     message: Some(format!("control 通道询问失败: {e}")),
                                     raw_text: None,
+                                    cancelled: false,
                                 },
                             };
                             control_response_line(&request_id, &reply)

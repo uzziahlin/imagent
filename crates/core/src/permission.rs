@@ -83,6 +83,12 @@ pub struct PermissionReply {
     /// 用户回复的**原文**（按钮回调为 `ask:<选项>` 展开、自由文本为原文）。
     /// 权限路径不读它（allow/deny 语义不变）；ask_via_im 路径以它作为用户答案回传。
     pub raw_text: Option<String>,
+    /// P2（code-review v13）：系统取消标记——cancel/cancel_all/superseded 等
+    /// **非用户答复**的收敛路径置 true。区分「用户说了什么」与「等待被系统
+    /// 掐断」：ask_via_im 终端路径据此回 Err（提问被取消，agent 自行决定重试/
+    /// 放弃）而非把 cancel 文案当用户回答回写；permission 路径语义不变
+    /// （allow=false 即 deny）。用户真实答复恒 false。
+    pub cancelled: bool,
 }
 
 /// 精确 allow 词表（trim + 小写后全字匹配）。P2-G/P2-12：不用「首字符 y/Y」
@@ -172,6 +178,7 @@ pub fn parse_reply(text: &str) -> PermissionReply {
             always: false,
             message: Some("empty reply".into()),
             raw_text: None,
+            cancelled: false,
         };
     }
     // P6（AskUserQuestion 答案路由）：问题卡的选项按钮回调转成 "ask:<选项>"。
@@ -185,6 +192,7 @@ pub fn parse_reply(text: &str) -> PermissionReply {
                 always: false,
                 message: Some(format!("用户选择：{choice}")),
                 raw_text: Some(format!("用户选择：{choice}")),
+                cancelled: false,
             };
         }
     }
@@ -205,6 +213,7 @@ pub fn parse_reply(text: &str) -> PermissionReply {
             Some(format!("denied by user reply: {t}"))
         },
         raw_text: Some(t.to_string()),
+        cancelled: false,
     }
 }
 
@@ -230,6 +239,11 @@ struct PendingAsk {
     tool_name: Option<String>,
     /// 来源（D3 看门狗豁免只认 Permission）。
     kind: PendingKind,
+    /// P2（code-review v13）：发起者锚定——触发本轮任务/该询问的 sender id。
+    /// 群聊里白名单成员 B 打字 "y" 不得批准成员 A 触发的删库级 Bash：pending
+    /// 带发起者且回复 sender ≠ 发起者时拒绝消费（admin 可代批）。None = 未知
+    /// 发起者（终端 ask_via_im / 旧调用方），维持既有语义不比对。
+    initiator: Option<String>,
     /// Wave B-11：登记时刻——route 时算 waited_secs（审批响应时长，审计/统计）。
     created_at: Instant,
     tx: oneshot::Sender<PermissionReply>,
@@ -425,6 +439,7 @@ impl PermissionRouter {
         card_msg_id: Option<String>,
         kind: PendingKind,
         tool_name: Option<&str>,
+        initiator: Option<&str>,
     ) -> oneshot::Receiver<PermissionReply> {
         let (tx, rx) = oneshot::channel();
         let entry = PendingAsk {
@@ -432,6 +447,9 @@ impl PermissionRouter {
             card_msg_id,
             tool_name: tool_name.filter(|s| !s.is_empty()).map(|s| s.to_string()),
             kind,
+            initiator: initiator
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().to_string()),
             created_at: Instant::now(),
             tx,
         };
@@ -446,11 +464,14 @@ impl PermissionRouter {
         let list = map.entry(conv_id.to_string()).or_default();
         if let Some(i) = list.iter().position(|p| p.request_id == request_id) {
             let old = list.remove(i);
+            // P2：superseded 是系统顶替而非用户答复——置 cancelled（ask 终端路径
+            // 回 Err，不把文案当用户回答）。
             let _ = old.tx.send(PermissionReply {
                 allow: false,
                 always: false,
                 message: Some("superseded（同一请求被重新发起）".into()),
                 raw_text: None,
+                cancelled: true,
             });
         }
         list.push(entry);
@@ -459,11 +480,13 @@ impl PermissionRouter {
             // L2（code-review v8）：淘汰携带哨兵 raw_text——Replied 分支据此走与
             // TimedOut 同款的平台收敛（撤卡），防残留 pending 卡点「允许」→
             // route miss → 字面 "y" 被当 prompt 跑一轮 agent。
+            // P2：同为系统收敛，置 cancelled（哨兵分支先行，见 ask 终端路径）。
             let _ = oldest.tx.send(PermissionReply {
                 allow: false,
                 always: false,
                 message: Some("cancelled（pending 超上限，最旧询问被收敛）".into()),
                 raw_text: Some(EVICTED_SENTINEL.to_string()),
+                cancelled: true,
             });
         }
         rx
@@ -485,21 +508,7 @@ impl PermissionRouter {
     ) -> Option<RoutedDecision> {
         let mut map = self.pending.lock().await;
         let list = map.get_mut(conv_id)?;
-        let idx = match (req_hint, parent_msg_id) {
-            (Some(req), _) => list.iter().position(|p| p.request_id == req)?,
-            // 真机校准（2026-08）：引用的若不是询问卡（如对 ⏰ 催办文本回 OK），
-            // 锚点不匹配不能让回复直接失效——**单 pending 无歧义**时兜底该条；
-            // 多 pending 并存仍返回 None（锚定失败无法消解歧义，走提示引导）。
-            (None, Some(mid)) => match list
-                .iter()
-                .position(|p| p.card_msg_id.as_deref() == Some(mid))
-            {
-                Some(i) => i,
-                None if list.len() == 1 => 0,
-                None => return None,
-            },
-            (None, None) => list.len().checked_sub(1)?,
-        };
+        let idx = resolve_pending_idx(list, req_hint, parent_msg_id)?;
         let hit = list.remove(idx);
         if list.is_empty() {
             map.remove(conv_id);
@@ -534,8 +543,32 @@ impl PermissionRouter {
         })
     }
 
+    /// P2（code-review v13）发起者锚定：按与 [`route`](Self::route) 完全相同的
+    /// 三级解析定位 pending，仅当**命中的条目携带发起者**且 `sender` 不是它时
+    /// 返回 `Some(initiator)`（调用方据此拒绝消费并提示；admin 代批的豁免由
+    /// 调用方判定——router 不持有 admin 名单）。无可消费 pending / 发起者未知 /
+    /// sender 即发起者 → None（维持既有行为）。
+    ///
+    /// 只读不消费：真正的消费仍由 route() 完成（两步之间 pending 状态可能变
+    /// 化，route 自身按同一解析重定位，最坏错过一次锚定——安全方向：宁可漏拒
+    /// 不可误拒发起者本人）。
+    pub async fn pending_initiator_mismatch(
+        &self,
+        conv_id: &str,
+        req_hint: Option<&str>,
+        parent_msg_id: Option<&str>,
+        sender: &str,
+    ) -> Option<String> {
+        let map = self.pending.lock().await;
+        let list = map.get(conv_id)?;
+        let idx = resolve_pending_idx(list, req_hint, parent_msg_id)?;
+        let initiator = list[idx].initiator.as_deref()?;
+        (initiator != sender).then(|| initiator.to_string())
+    }
+
     /// 清理单个 pending（超时 / router-drop 路径）：投递 deny（fail-closed）唤醒
     /// 等待者。send 失败 = receiver 已 drop（等待方先超时），无害。
+    /// P2：置 cancelled——这是系统取消而非用户答复，ask 终端路径据此回 Err。
     pub async fn cancel(&self, conv_id: &str, request_id: &str) {
         let mut map = self.pending.lock().await;
         let Some(list) = map.get_mut(conv_id) else {
@@ -552,12 +585,15 @@ impl PermissionRouter {
                 always: false,
                 message: Some("cancelled（任务被 /stop 中断或审批超时）".into()),
                 raw_text: None,
+                cancelled: true,
             });
         }
     }
 
     /// 清理该 conv 的**全部** pending（/stop 路径）：逐个投递 deny 唤醒等待者，
     /// 返回被清理的 request_id 列表（调用方据此收敛询问卡）。
+    /// P2：置 cancelled（同 [`cancel`](Self::cancel)——/stop 文案不得被终端
+    /// agent 当成「用户说：cancelled…」继续推理）。
     pub async fn cancel_all(&self, conv_id: &str) -> Vec<String> {
         let removed = self
             .pending
@@ -573,10 +609,36 @@ impl PermissionRouter {
                     always: false,
                     message: Some("cancelled（任务被 /stop 中断或审批超时）".into()),
                     raw_text: None,
+                    cancelled: true,
                 });
                 p.request_id
             })
             .collect()
+    }
+}
+
+/// route()/pending_initiator_mismatch() 共用的三级 pending 解析（抽出共用防
+/// 两处判定漂移——锚定校验消费的必须是 route 将要消费的同一条 pending）：
+/// 1. req_hint 精确匹配 request_id；
+/// 2. parent_msg_id 命中询问卡 card_msg_id；单 pending 锚不匹配时兜底该条
+///    （真机校准：对催办文本回 OK 的场景），多 pending 歧义不消费；
+/// 3. 两者皆缺时最新 pending 兜底。
+fn resolve_pending_idx(
+    list: &[PendingAsk],
+    req_hint: Option<&str>,
+    parent_msg_id: Option<&str>,
+) -> Option<usize> {
+    match (req_hint, parent_msg_id) {
+        (Some(req), _) => list.iter().position(|p| p.request_id == req),
+        (None, Some(mid)) => match list
+            .iter()
+            .position(|p| p.card_msg_id.as_deref() == Some(mid))
+        {
+            Some(i) => Some(i),
+            None if list.len() == 1 => Some(0),
+            None => None,
+        },
+        (None, None) => list.len().checked_sub(1),
     }
 }
 
@@ -595,7 +657,7 @@ mod tests {
         // P1-8：cancel 清理 pending，避免超时/router-drop 残留累积。
         let r = PermissionRouter::new();
         let _rx = r
-            .register("conv1", "req1", None, PendingKind::Permission, None)
+            .register("conv1", "req1", None, PendingKind::Permission, None, None)
             .await;
         assert!(r.has_pending("conv1").await);
         r.cancel("conv1", "req1").await;
@@ -608,7 +670,7 @@ mod tests {
     async fn cancel_waits_no_more_denies_waiter() {
         let r = PermissionRouter::new();
         let rx = r
-            .register("conv1", "req1", None, PendingKind::Permission, None)
+            .register("conv1", "req1", None, PendingKind::Permission, None, None)
             .await;
         r.cancel("conv1", "req1").await;
         // 等待者应立即（而非超时后）收到 deny。
@@ -627,7 +689,14 @@ mod tests {
     async fn route_unmatched_anchor_falls_back_when_single_pending() {
         let r = PermissionRouter::new();
         let rx = r
-            .register("c", "r-1", None, PendingKind::Permission, Some("Bash"))
+            .register(
+                "c",
+                "r-1",
+                None,
+                PendingKind::Permission,
+                Some("Bash"),
+                None,
+            )
             .await;
         // 锚定一个非询问卡的消息 id。
         let hit = r
@@ -640,6 +709,7 @@ mod tests {
                     always: false,
                     message: None,
                     raw_text: Some("OK".into()),
+                    cancelled: false,
                 },
             )
             .await;
@@ -652,10 +722,24 @@ mod tests {
 
         // 多 pending + 锚不匹配 → None（歧义不消费）。
         let _rx2 = r
-            .register("c", "r-2", None, PendingKind::Permission, Some("Bash"))
+            .register(
+                "c",
+                "r-2",
+                None,
+                PendingKind::Permission,
+                Some("Bash"),
+                None,
+            )
             .await;
         let _rx3 = r
-            .register("c", "r-3", None, PendingKind::Permission, Some("Read"))
+            .register(
+                "c",
+                "r-3",
+                None,
+                PendingKind::Permission,
+                Some("Read"),
+                None,
+            )
             .await;
         assert!(
             r.route(
@@ -666,7 +750,8 @@ mod tests {
                     allow: true,
                     always: false,
                     message: None,
-                    raw_text: None
+                    raw_text: None,
+                    cancelled: false
                 }
             )
             .await
@@ -680,10 +765,10 @@ mod tests {
     async fn multi_pending_routes_by_request_id() {
         let r = PermissionRouter::new();
         let rx_im = r
-            .register("c", "im-1", None, PendingKind::Permission, None)
+            .register("c", "im-1", None, PendingKind::Permission, None, None)
             .await;
         let rx_term = r
-            .register("c", "t-1", None, PendingKind::Permission, None)
+            .register("c", "t-1", None, PendingKind::Permission, None, None)
             .await;
         // 按钮/回调带 req=t-1 → 只唤醒终端一路。
         let hit = r
@@ -696,6 +781,7 @@ mod tests {
                     always: false,
                     message: None,
                     raw_text: Some("用户选择：B".into()),
+                    cancelled: false,
                 },
             )
             .await;
@@ -717,6 +803,7 @@ mod tests {
                     always: false,
                     message: None,
                     raw_text: Some("y".into()),
+                    cancelled: false,
                 },
             )
             .await;
@@ -736,6 +823,7 @@ mod tests {
                 Some("om_old".to_string()),
                 PendingKind::Permission,
                 None,
+                None,
             )
             .await;
         let _rx_new = r
@@ -744,6 +832,7 @@ mod tests {
                 "t-1",
                 Some("om_new".to_string()),
                 PendingKind::Permission,
+                None,
                 None,
             )
             .await;
@@ -757,6 +846,7 @@ mod tests {
                     always: false,
                     message: None,
                     raw_text: Some("y".into()),
+                    cancelled: false,
                 },
             )
             .await;
@@ -773,10 +863,10 @@ mod tests {
     async fn reregister_same_request_id_supersedes() {
         let r = PermissionRouter::new();
         let rx_old = r
-            .register("c", "req1", None, PendingKind::Permission, None)
+            .register("c", "req1", None, PendingKind::Permission, None, None)
             .await;
         let _rx_new = r
-            .register("c", "req1", None, PendingKind::Permission, None)
+            .register("c", "req1", None, PendingKind::Permission, None, None)
             .await;
         let old = tokio::time::timeout(std::time::Duration::from_secs(1), rx_old)
             .await
@@ -793,10 +883,10 @@ mod tests {
     async fn cancel_all_wakes_every_waiter() {
         let r = PermissionRouter::new();
         let rx1 = r
-            .register("c", "a", None, PendingKind::Permission, None)
+            .register("c", "a", None, PendingKind::Permission, None, None)
             .await;
         let rx2 = r
-            .register("c", "b", None, PendingKind::Permission, None)
+            .register("c", "b", None, PendingKind::Permission, None, None)
             .await;
         let ids = r.cancel_all("c").await;
         assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
@@ -893,7 +983,14 @@ mod tests {
     async fn route_always_populates_session_allow_set() {
         let r = PermissionRouter::new();
         let _rx = r
-            .register("c", "p-1", None, PendingKind::Permission, Some("Bash"))
+            .register(
+                "c",
+                "p-1",
+                None,
+                PendingKind::Permission,
+                Some("Bash"),
+                None,
+            )
             .await;
         assert!(!r.is_session_allowed("c", "Bash").await);
         let hit = r
@@ -906,6 +1003,7 @@ mod tests {
                     always: true,
                     message: None,
                     raw_text: Some("always".into()),
+                    cancelled: false,
                 },
             )
             .await
@@ -925,7 +1023,7 @@ mod tests {
         );
         // Ask 来源的 always 不落 allow-set（提问无工具语义）。
         let _rx_ask = r
-            .register("c", "a-1", None, PendingKind::Ask, Some("Bash"))
+            .register("c", "a-1", None, PendingKind::Ask, Some("Bash"), None)
             .await;
         let _ = r
             .route(
@@ -937,12 +1035,13 @@ mod tests {
                     always: true,
                     message: None,
                     raw_text: None,
+                    cancelled: false,
                 },
             )
             .await;
         // Bash 已在（来自 p-1），验证 Ask 不新增：换一个工具名观察。
         let _rx_ask2 = r
-            .register("c", "a-2", None, PendingKind::Ask, Some("WebFetch"))
+            .register("c", "a-2", None, PendingKind::Ask, Some("WebFetch"), None)
             .await;
         let _ = r
             .route(
@@ -954,6 +1053,7 @@ mod tests {
                     always: true,
                     message: None,
                     raw_text: None,
+                    cancelled: false,
                 },
             )
             .await;
@@ -997,7 +1097,7 @@ mod tests {
         let r = PermissionRouter::new();
         assert!(!r.has_pending("c1").await);
         let rx = r
-            .register("c1", "req1", None, PendingKind::Permission, None)
+            .register("c1", "req1", None, PendingKind::Permission, None, None)
             .await;
         assert!(r.has_pending("c1").await);
         let hit = r
@@ -1010,6 +1110,7 @@ mod tests {
                     always: false,
                     message: None,
                     raw_text: None,
+                    cancelled: false,
                 },
             )
             .await;
@@ -1032,6 +1133,7 @@ mod tests {
                     always: false,
                     message: None,
                     raw_text: None,
+                    cancelled: false,
                 },
             )
             .await;
@@ -1043,11 +1145,13 @@ mod tests {
     async fn pending_kind_distinguishes_permission_and_ask() {
         let r = PermissionRouter::new();
         let _rx_perm = r
-            .register("c", "p-1", None, PendingKind::Permission, None)
+            .register("c", "p-1", None, PendingKind::Permission, None, None)
             .await;
         assert!(r.has_pending_of_kind("c", PendingKind::Permission).await);
         assert!(!r.has_pending_of_kind("c", PendingKind::Ask).await);
-        let _rx_ask = r.register("c", "a-1", None, PendingKind::Ask, None).await;
+        let _rx_ask = r
+            .register("c", "a-1", None, PendingKind::Ask, None, None)
+            .await;
         assert!(r.has_pending_of_kind("c", PendingKind::Ask).await);
         // pending_count 反映并存条数（D2 歧义判定用）。
         assert_eq!(r.pending_count("c").await, 2);
@@ -1062,7 +1166,7 @@ mod tests {
     async fn set_card_msg_id_backfills_placeholder() {
         let r = PermissionRouter::new();
         let _rx = r
-            .register("c", "req1", None, PendingKind::Permission, None)
+            .register("c", "req1", None, PendingKind::Permission, None, None)
             .await;
         assert!(
             r.set_card_msg_id("c", "req1", Some("om_1".to_string()))
@@ -1078,6 +1182,7 @@ mod tests {
                     always: false,
                     message: None,
                     raw_text: None,
+                    cancelled: false,
                 },
             )
             .await;
@@ -1113,7 +1218,14 @@ mod tests {
     async fn route_reports_waited_secs() {
         let r = PermissionRouter::new();
         let rx = r
-            .register("c", "req1", None, PendingKind::Permission, Some("Bash"))
+            .register(
+                "c",
+                "req1",
+                None,
+                PendingKind::Permission,
+                Some("Bash"),
+                None,
+            )
             .await;
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         let hit = r
@@ -1126,6 +1238,7 @@ mod tests {
                     always: false,
                     message: None,
                     raw_text: Some("y".into()),
+                    cancelled: false,
                 },
             )
             .await
@@ -1138,7 +1251,7 @@ mod tests {
         );
         // 稍等后再 route 第二条，waited_secs 至少 1 秒（秒粒度）。
         let rx2 = r
-            .register("c", "req2", None, PendingKind::Permission, None)
+            .register("c", "req2", None, PendingKind::Permission, None, None)
             .await;
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         let hit2 = r
@@ -1151,6 +1264,7 @@ mod tests {
                     always: false,
                     message: None,
                     raw_text: None,
+                    cancelled: false,
                 },
             )
             .await
@@ -1171,7 +1285,7 @@ mod tests {
         let r = PermissionRouter::new();
         assert_eq!(r.ask_count("c").await, 0);
         let _rx1 = r
-            .register("c", "a", None, PendingKind::Permission, None)
+            .register("c", "a", None, PendingKind::Permission, None, None)
             .await;
         assert_eq!(r.ask_count("c").await, 1);
         r.cancel("c", "a").await;
@@ -1180,7 +1294,9 @@ mod tests {
             1,
             "cancel 清 pending 但计数不回退（单调）"
         );
-        let _rx2 = r.register("c", "b", None, PendingKind::Ask, None).await;
+        let _rx2 = r
+            .register("c", "b", None, PendingKind::Ask, None, None)
+            .await;
         assert_eq!(r.ask_count("c").await, 2);
         // 其它 conv 不受影响。
         assert_eq!(r.ask_count("other").await, 0);
@@ -1194,10 +1310,161 @@ mod tests {
                     always: false,
                     message: None,
                     raw_text: None,
+                    cancelled: false,
                 },
             )
             .await;
         assert_eq!(r.ask_count("c").await, 2, "route 不回退计数");
+    }
+
+    /// P2（v13）：发起者锚定——pending 带 initiator 且回复 sender ≠ initiator 时
+    /// pending_initiator_mismatch 命中；sender 即发起者 / initiator 未知 / 无
+    /// pending → None（不拦截）。
+    #[tokio::test]
+    async fn initiator_anchor_blocks_non_initiator_reply() {
+        let r = PermissionRouter::new();
+        let _rx = r
+            .register(
+                "group",
+                "p-1",
+                None,
+                PendingKind::Permission,
+                Some("Bash"),
+                Some("alice"),
+            )
+            .await;
+        // 非 initiator（群成员 bob）：命中，携带发起者 id。
+        assert_eq!(
+            r.pending_initiator_mismatch("group", None, None, "bob")
+                .await,
+            Some("alice".to_string()),
+            "B 的回复不得消费 A 发起的审批"
+        );
+        // 发起者本人：放行。
+        assert_eq!(
+            r.pending_initiator_mismatch("group", None, None, "alice")
+                .await,
+            None,
+            "发起者本人不受拦截"
+        );
+        // 按钮路径（req_hint）与引用路径（parent 锚点）解析同一条 pending。
+        assert_eq!(
+            r.pending_initiator_mismatch("group", Some("p-1"), None, "bob")
+                .await,
+            Some("alice".to_string())
+        );
+        // initiator 未知（None 注册）：不比对（终端 ask_via_im / 旧调用方）。
+        let _rx2 = r
+            .register("group", "p-2", None, PendingKind::Permission, None, None)
+            .await;
+        assert_eq!(
+            r.pending_initiator_mismatch("group", Some("p-2"), None, "bob")
+                .await,
+            None,
+            "无发起者的 pending 不拦截"
+        );
+        // 无 pending / req 未命中：None。
+        assert_eq!(
+            r.pending_initiator_mismatch("group", Some("nope"), None, "bob")
+                .await,
+            None
+        );
+        assert_eq!(
+            r.pending_initiator_mismatch("other", None, None, "bob")
+                .await,
+            None
+        );
+    }
+
+    /// P2（v13）：锚定拦截只读不消费——被拦截后 pending 保留，发起者本人
+    /// route 仍可正常送达。
+    #[tokio::test]
+    async fn initiator_anchor_keeps_pending_for_initiator() {
+        let r = PermissionRouter::new();
+        let rx = r
+            .register(
+                "group",
+                "p-1",
+                None,
+                PendingKind::Permission,
+                Some("Bash"),
+                Some("alice"),
+            )
+            .await;
+        assert!(r
+            .pending_initiator_mismatch("group", None, None, "bob")
+            .await
+            .is_some());
+        assert!(r.has_pending("group").await, "拦截不得消费 pending");
+        // 发起者 route：正常送达 allow。
+        let hit = r
+            .route(
+                "group",
+                None,
+                None,
+                PermissionReply {
+                    allow: true,
+                    always: false,
+                    message: None,
+                    raw_text: Some("y".into()),
+                    cancelled: false,
+                },
+            )
+            .await;
+        assert_eq!(hit.as_ref().map(|d| d.request_id.as_str()), Some("p-1"));
+        assert!(rx.await.unwrap().allow);
+    }
+
+    /// P2（v13）：cancel / cancel_all / superseded / 淘汰都是**系统取消**——
+    /// 置 cancelled: true（ask 终端路径据此回 Err，不把文案当用户回答）；
+    /// parse_reply（用户真实回复）恒 false。
+    #[tokio::test]
+    async fn system_cancels_mark_cancelled_flag() {
+        let r = PermissionRouter::new();
+        // cancel 单条。
+        let rx1 = r
+            .register("c", "a", None, PendingKind::Ask, None, None)
+            .await;
+        r.cancel("c", "a").await;
+        let reply = rx1.await.unwrap();
+        assert!(
+            !reply.allow && reply.cancelled,
+            "cancel 必须 deny + cancelled"
+        );
+
+        // cancel_all 全部。
+        let rx2 = r
+            .register("c", "b", None, PendingKind::Ask, None, None)
+            .await;
+        let rx3 = r
+            .register("c", "d", None, PendingKind::Permission, None, None)
+            .await;
+        let _ = r.cancel_all("c").await;
+        for rx in [rx2, rx3] {
+            let reply = rx.await.unwrap();
+            assert!(
+                !reply.allow && reply.cancelled,
+                "cancel_all 必须 deny + cancelled"
+            );
+        }
+
+        // superseded（同 request_id 重注册顶替旧等待者）。
+        let rx_old = r
+            .register("c2", "req", None, PendingKind::Ask, None, None)
+            .await;
+        let _rx_new = r
+            .register("c2", "req", None, PendingKind::Ask, None, None)
+            .await;
+        let old = rx_old.await.unwrap();
+        assert!(
+            !old.allow && old.cancelled,
+            "superseded 是系统顶替，非用户答复"
+        );
+
+        // 用户真实回复（parse_reply）不带 cancelled。
+        assert!(!parse_reply("y").cancelled);
+        assert!(!parse_reply("n").cancelled);
+        assert!(!parse_reply("").cancelled);
     }
 }
 

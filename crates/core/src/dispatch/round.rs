@@ -65,7 +65,71 @@ impl TextCoalescer {
     }
 }
 
+/// P2（code-review v13）：排队深度 gauge 的 Drop guard——acquire 等待期间
+/// runner task 被 abort（shutdown drain / 未来取消路径）时裸 inc/dec 会永久
+/// 泄漏计数（与 feishu `token_refresh_waiters` 的 WaiterGuard 同款先例）。
+struct RoundQueueGuard;
+
+impl Drop for RoundQueueGuard {
+    fn drop(&mut self) {
+        crate::metrics::METRICS.round_queue_depth.dec();
+    }
+}
+
+/// P2（code-review v13）：全局并发护栏的轮次持票。permit 跨整轮（runner 循环
+/// 单次迭代 = 一轮 + 其后的自动 compact）持有；Drop 同时归还信号量 permit 与
+/// 在飞 gauge——runner task 被 abort 也经 Drop 收口，不泄漏。
+pub(super) struct RoundPermit {
+    /// None = 上限 0（不限制），无信号量参与（gauge 照常计数）。
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl Drop for RoundPermit {
+    fn drop(&mut self) {
+        // permit 先于 gauge 归还（同线程内唤醒者要等本 task 让出才可能 inc，
+        // 常见路径无早退窗口；多 worker 下瞬时最多偏差 1，gauge 语义可接受）。
+        drop(self.permit.take());
+        crate::metrics::METRICS.running_rounds.dec();
+    }
+}
+
 impl Dispatcher {
+    /// P2（code-review v13）：获取全局在飞轮 permit（上限 0 = 不限制，直接放
+    /// 行）。获取不到不算错误——排队等待（该 conv 后续消息照常入队等下一批，
+    /// 语义自然）；等待期间持有 [`RoundQueueGuard`] 维护排队深度 gauge。
+    pub(super) async fn acquire_round_permit(&self, conv: &str) -> RoundPermit {
+        // 快照（limit, sem）后立即放读锁——parking_lot 守卫不跨 await。
+        // 热改并发时该快照即本轮的「闸」：已在旧 sem 上排队的等待者按旧闸
+        // 放行（见 reload_max_concurrent_rounds）。
+        let (limit, sem) = {
+            let g = self.round_gate.read();
+            (g.limit, g.sem.clone())
+        };
+        if limit == 0 {
+            crate::metrics::METRICS.running_rounds.inc();
+            return RoundPermit { permit: None };
+        }
+        crate::metrics::METRICS.round_queue_depth.inc();
+        let _queued = RoundQueueGuard;
+        let running = crate::metrics::METRICS.running_rounds.get();
+        debug!(
+            target: "imagent::core",
+            conv_id = conv,
+            limit,
+            running,
+            "等待全局并发护栏 permit（多群/cron 齐点下的生存护栏）"
+        );
+        let permit = sem
+            .acquire_owned()
+            .await
+            .expect("round semaphore 永不 close");
+        drop(_queued);
+        crate::metrics::METRICS.running_rounds.inc();
+        RoundPermit {
+            permit: Some(permit),
+        }
+    }
+
     /// 单轮 agent 执行（P4 批处理 runner 循环的循环体）：合并后的消息 → typing →
     /// 续接 session → 媒体提示 / 前情摘要注入 → 流式收集（含空闲看门狗）→ 回传 →
     /// 落库。conv 串行锁由调用方（runner 循环）持有，本函数不再管理锁。
@@ -83,6 +147,10 @@ impl Dispatcher {
         // 统一收尾：移除在飞注册（inner 未及注册时为幂等 no-op）。同 conv 轮次串行
         // （conv 锁），key 移除无 ABA。
         self.running.lock().await.remove(&conv_key);
+        // P2（v13）：发起者锚定表同步收尾——轮次结束后该 conv 无在飞发起者
+        //（compact 自动轮在收尾后触发，届时审批 pending 的锚定为 None：宁漏拒
+        // 不误拒，不用陈旧发起者拦人）。
+        self.round_initiators.lock().await.remove(&conv_key);
         // v1.20 崩溃轮次恢复：正常收尾（成功/失败/中断都经此）清除 inflight。
         // v1.21 review：清除失败必须 warn——残留的 inflight 行会让下次启动把
         // 已完成的轮次误判为崩溃并推 /retry（副作用类 prompt 有重复执行风险）。
@@ -125,6 +193,13 @@ impl Dispatcher {
         // v1.23 发起者锚定：本轮首条消息（merge_batch 保序首条）——平台的
         // 卡片发起者标注与按钮点击权锚定到它，不被运行中插话者漂移。
         self.platform.note_round_initiator(&conv, &sender_id).await;
+        // P2（v13）：core 侧同步记录（审批 pending 的发起者锚定数据源——
+        // build_im_permission_hook / permission socket 注册 pending 时读取；
+        // 平台的 note_round_initiator 是平台内部状态，core 取不回来）。
+        self.round_initiators
+            .lock()
+            .await
+            .insert(conv.0.clone(), sender_id.clone());
         let base_prompt = msg.text.clone().unwrap_or_default();
         // Wave B-9：断档续接判定（base_prompt 被 move 进 prompt 载体前先算好）：
         // 无可续接会话且 prompt 命中续接词表（继续/接着/然后…，≤4 字）时，

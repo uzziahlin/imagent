@@ -80,12 +80,14 @@ pub fn fixed_reply(mode: PermissionMode) -> PermissionReply {
             always: false,
             message: None,
             raw_text: None,
+            cancelled: false,
         },
         PermissionMode::Deny => PermissionReply {
             allow: false,
             always: false,
             message: Some("denied by imagent permission_mode=deny".into()),
             raw_text: None,
+            cancelled: false,
         },
         // Off / Ask 不应走固定策略；兜底 deny。
         _ => PermissionReply {
@@ -93,6 +95,7 @@ pub fn fixed_reply(mode: PermissionMode) -> PermissionReply {
             always: false,
             message: Some("imagent permission mode does not allow".into()),
             raw_text: None,
+            cancelled: false,
         },
     }
 }
@@ -133,6 +136,7 @@ pub fn handle_request(req: &Value, mode: PermissionMode) -> Option<Value> {
                     always: false,
                     message: Some("ask/off not handled in pure handler".into()),
                     raw_text: None,
+                    cancelled: false,
                 }
             };
             let input = req
@@ -244,6 +248,7 @@ pub async fn ask_via_socket(
         always: false,
         message,
         raw_text: None,
+        cancelled: false,
     })
 }
 
@@ -311,6 +316,7 @@ pub async fn run_mcp_server(
                     always: false,
                     message: Some(format!("imagent socket error: {e}")),
                     raw_text: None,
+                    cancelled: false,
                 },
             };
             let result = build_call_response(&reply, &input);
@@ -808,6 +814,7 @@ mod tests {
             always: false,
             message: None,
             raw_text: None,
+            cancelled: false,
         };
         let resp = build_call_response(&reply, &json!({"command": "ls"}));
         let text = resp["content"][0]["text"].as_str().unwrap();
@@ -824,6 +831,7 @@ mod tests {
             always: false,
             message: Some("nope".into()),
             raw_text: None,
+            cancelled: false,
         };
         let resp = build_call_response(&reply, &json!({}));
         let text = resp["content"][0]["text"].as_str().unwrap();

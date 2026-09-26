@@ -11,7 +11,7 @@ use std::sync::LazyLock;
 
 use prometheus::{
     register_counter_vec, register_histogram, register_int_counter, register_int_counter_vec,
-    Encoder, Histogram, IntCounter, IntCounterVec, TextEncoder,
+    register_int_gauge, Encoder, Histogram, IntCounter, IntCounterVec, IntGauge, TextEncoder,
 };
 
 /// 全局指标集合。惰性初始化（首次访问即注册到默认 registry）。
@@ -41,6 +41,13 @@ pub struct Metrics {
     /// 成本（美元）累计，label `backend`。仅 claude 提供成本数据；f64 计数器
     /// （Prometheus 的 Counter 即 float64）。
     pub cost_usd: prometheus::CounterVec,
+    /// P2（code-review v13）：当前在飞 agent 轮数（跨 conv）。permit 获取后 inc、
+    /// 轮次持票（dispatch::round::RoundPermit）Drop 时 dec——上限 0（不限制）时
+    /// 照常计数（gauge 直接维护，不依赖「上限 - 可用 permit」换算）。
+    pub running_rounds: IntGauge,
+    /// P2（code-review v13）：等待并发护栏 permit 的轮数（排队深度）。acquire 前
+    /// inc、获得/被取消 dec（Drop guard 防 future 取消泄漏）。
+    pub round_queue_depth: IntGauge,
 }
 
 impl Metrics {
@@ -95,6 +102,16 @@ impl Metrics {
                 &["backend"]
             )
             .expect("register cost_usd"),
+            running_rounds: register_int_gauge!(
+                "imagent_running_rounds",
+                "当前在飞 agent 轮数（跨 conv；上限 0=不限制时照常计数）"
+            )
+            .expect("register running_rounds"),
+            round_queue_depth: register_int_gauge!(
+                "imagent_round_queue_depth",
+                "等待全局并发护栏 permit 的轮数（排队深度）"
+            )
+            .expect("register round_queue_depth"),
         }
     }
 }
@@ -137,6 +154,10 @@ mod tests {
             .cost_usd
             .with_label_values(&["claude-cli"])
             .inc_by(0.5);
+        METRICS.running_rounds.inc();
+        METRICS.running_rounds.dec(); // 平衡：gauge 不留残值（其它测试断言归零态）
+        METRICS.round_queue_depth.inc();
+        METRICS.round_queue_depth.dec();
         let out = render();
         assert!(
             out.contains("imagent_messages_in_total"),
@@ -169,6 +190,14 @@ mod tests {
         assert!(
             out.contains("imagent_cost_usd_total"),
             "missing cost_usd: {out}"
+        );
+        assert!(
+            out.contains("imagent_running_rounds"),
+            "missing running_rounds: {out}"
+        );
+        assert!(
+            out.contains("imagent_round_queue_depth"),
+            "missing round_queue_depth: {out}"
         );
     }
 }
