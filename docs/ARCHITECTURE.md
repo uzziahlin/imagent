@@ -39,7 +39,7 @@ crates/
 ├── claude/  CLI（stream-json 解析）+ ACP（JSON-RPC 长驻）；~/.claude 会话扫描
 ├── codex/   codex exec；~/.codex/sessions rollout 扫描（/resume 接管）
 ├── gemini/  gemini CLI（无本机存储概念，/resume 仅 IM 历史）
-└── store/   SQLite（bundled 静态链接）schema v1→v9 线性迁移（见 §5）
+└── store/   SQLite（bundled 静态链接）schema v1→v15 线性迁移（见 §5）
 fuzz/        cargo-fuzz targets：ilink 协议解析 / CDN host SSRF / 飞书事件解析
 src/main.rs  组装：CLI（clap）、单实例锁、信号、/health + /metrics、孤儿卡片扫描
 ```
@@ -50,10 +50,11 @@ src/main.rs  组装：CLI（clap）、单实例锁、信号、/health + /metrics
 crates/core/src/
 ├── dispatch/
 │   ├── mod.rs       Dispatcher 状态 + run() 主循环 + conv 锁/批处理 runner + reply 基元
-│   ├── commands/    handle()：发现态引导 → 白名单门 → 28 命令分派 → 普通消息入口
+│   ├── commands/    handle()：发现态引导 → 白名单门 → 30+ 命令分派 → 普通消息入口
 │   │   ├── admin.rs   /allow /disallow /list /whoami /chat /config /perm（多数 admin 门槛）
-│   │   ├── session.rs /new /switch /sessions /resume /compact /stop
-│   │   └── misc.rs    /status /doctor /reconnect /cd /ws /img /help
+│   │   ├── session.rs /new /switch /sessions /resume /compact /stop /again /export
+│   │   ├── cron.rs    /cron 定时任务（持久化、失权自动停用、停机补跑 one|off|all）
+│   │   └── misc.rs    /status /doctor /reconnect /cd /ws /img /mcp /last /help
 │   ├── round.rs     单轮 agent 状态机：typing → 续接 → 摘要注入 → 流式收集（看门狗）
 │   │                → 回传 → 落库；中止/失败路径的 session 持久化
 │   └── socket.rs    权限审批 Unix socket（peer-uid 鉴权 + token 双行握手）
@@ -87,17 +88,20 @@ Platform::recv ─→ 鉴权门（sender ∪ 会话白名单；空白名单=发�
 中断后**排队消息保留**、runner 自动取批续跑 = steering 语义，`/stop all` 才硬停
 清队列）；**审批等待暂停看门狗**（审批有独立超时预算）。
 
-## 5. 存储（schema v9）
+## 5. 存储（schema v15）
 
 | 表 | 用途 |
 |---|---|
 | `credentials` | 平台凭据（keyring 优先，明文回退可关 fail-closed） |
-| `sessions` / `named_sessions` / `session_history` | 每 conv 活动 session / 命名会话 / 历史侧表（/resume 数据源，保 50） |
+| `sessions` / `named_sessions` / `session_history` | 每 conv 活动 session / 命名会话 / 历史侧表（/resume 数据源，保 50；v15 加 `first_prompt`——纯 IM 会话可辨认） |
 | `sync_buf` / `context_tokens` | iLink 长轮询游标 / 出站 context_token |
-| `run_stats` | per-run 用量/成本（v8；v9 加 `sender` 列——per-sender 成本上限数据源；轮转 10000 条） |
-| `config` | KV：workdir、active_name、compact 摘要、命名工作空间 |
-| `allowed_senders` / `allowed_chats` / `audit_log` | 双白名单 + 审计 |
+| `run_stats` | per-run 用量/成本（v8；v9 加 `sender` 列——per-sender 成本上限数据源；v13 `(sender,ts)` 索引；轮转 10000 条） |
+| `config` | KV：workdir、active_name、compact 摘要、命名工作空间、`ctx_watermark:*` / `last_prompt:*` / `inflight_prompt:*` / `last_round:*` 等轮次状态键 |
+| `allowed_senders` / `allowed_chats` / `admin_senders` / `audit_log` | 双白名单 + 管理员 + 审计 |
 | `live_cards` | 在飞流式卡片登记（孤儿卡片启动关流，见 §7） |
+| `cron_jobs`（v11） | /cron 定时任务（失权自动停用、停机补跑策略见 `cron_catchup`） |
+| `queued_messages`（v12） | 排队消息实时落库——崩溃/断电后重启重放（崩溃不丢消息） |
+| `outbox`（v14） | 发送侧提示类消息持久化重试（HTTP 分区期间扣下的消息恢复后仍可见；泵 10s tick 指数退避） |
 
 keyring username 带 profile 段：`{profile}:{platform}:{account}`（旧键读取
 fallback）。DB / WAL / SHM / socket / token / 媒体文件统一 0600，媒体目录 0700。
@@ -133,6 +137,20 @@ claude（--permission-prompt-tool）─MCP─→ imagent mcp 子进程
 - **限流**：飞书手写 HTTP + SDK 路径统一 429/230020 退避重试；token 失效错误码
   （99991663 族）清缓存强制刷新重试一次。
 - **热重载**：SIGHUP 重读 config（permission_mode / allowed_tools 即时生效）。
+- **排队持久化与崩溃轮次恢复**（schema v12 起）：排队消息实时落库
+  `queued_messages`，崩溃/`kill -9`/断电后重启自动重放；执行中的轮次轮首落
+  `inflight_prompt:*` 标记、正常收尾清除——重启扫描残留转 /retry 数据源并通知
+  会话一键续跑（时间戳取更新者，防旧残留覆盖新失败）。
+- **发送侧 outbox**（store v14）：drain 提示类消息发送失败落盘，后台泵 10s tick
+  指数退避重发（15s→1h，上限 16 次）；`/health` 暴露 `outbox_pending`。
+- **webhook 入站 server**：`webhook_addr` + `[[webhook]]`（token/conv/name），与手打
+  消息同权走鉴权管线；HMAC-SHA256 验签（GitHub 协议同款）+ per-hook 令牌桶限速 +
+  GitHub 原生事件解析（workflow_run/push/issues/PR）；合成消息 `no_steer`（独立
+  轮次，不被 steering 注入在飞轮）。
+- **cron 调度器**：5 字段 cron（本地时区含 DST），会话 deny 后任务自动停用 +
+  一次性通知；停机补跑策略 `cron_catchup = one|off|all`（逐周期上限 3）。
+- **housekeeping**：媒体目录 7 天 GC；ConvState 精确 LRU（超上限按活跃时刻驱逐，
+  评论会话/挂起审批豁免）；map 上限清理（card_seqs/card_footers 等）。
 
 ## 8. 可观测
 

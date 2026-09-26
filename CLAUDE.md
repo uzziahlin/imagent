@@ -10,14 +10,14 @@
 这是一个 **Rust 写的 IM ↔ agent 网关**，8 个 crate 的 workspace（`core` 调度/鉴权/权限 / `feishu`+`wecom`+`ilink` 三平台 / `claude`（CLI+ACP）+`codex`+`gemini` 四后端 / `store` SQLite 持久化 + 二进制 `src/`）。
 
 开始写代码前，**必须先读**：
-1. **`docs/ARCHITECTURE.md`** —— 当前架构总览（crate 划分、数据流、安全不变量）。
-2. **`docs/CODE_REVIEW_v7.md`** —— 最新深度审查清单 + 修复进度（v7：安全收紧 6 项 + 调度正确性 11 项 + backend 正确性 8 项 + 迭代批 12 项）。改代码前先看这里，避免重复已知问题；每条 issue 带 `file:line` + 失败场景 + 修复方向（历史 v1–v6 归档在 `docs/` 与 `docs/internal/`）。
+1. **`docs/ARCHITECTURE.md`** —— 当前架构总览（crate 划分、数据流、安全不变量；随迭代维护）。
+2. **`docs/` 下编号最大的 `CODE_REVIEW_vN.md`**（当前 **v13**）—— 最新深度审查清单 + 修复进度 + 迭代路线批次。改代码前先看这里，避免重复已知问题；每条 issue 带 `file:line` + 失败场景 + 修复方向（历史版本归档在 `docs/` 与 `docs/internal/`）。
 3. **`docs/DESIGN.md` / `docs/FEISHU_DESIGN.md`** —— 架构设计与飞书平台（一等公民）专项设计。
 4. **`docs/RESEARCH.md`** —— 调研结论归档（iLink 协议/合规、Claude CLI/ACP 接口、竞品对照）。
-5. **`CHANGELOG.md`** —— 各版本交付明细（P4–P10 迭代纪要都在版本头引用里）。
+5. **`CHANGELOG.md`** —— 各版本交付明细（当前版本以此为准，勿凭记忆）。
 6. 长期决策与教训在 **engram 记忆库**，`project_id = "imagent"`（不是 "engram"）：`search_memory` / `architectural_decisions` / `recent_failures`。
 
-当前进度：**P0–P10 全部交付，v1.9.x 已发布**。三平台（飞书为一等公民：CardKit 真流式卡片/审批按钮卡/云文档评论；wecom 长连接；ilink 实验性私聊）× 四后端（claude-cli/claude-acp/codex/gemini）。安全审查最新为 `docs/CODE_REVIEW_v6.md` / `v7.md`（v1–v5 历史归档在 `docs/internal/`）。CI 双平台（ubuntu + macOS）跑 fmt/clippy/test/MSRV/audit/deny；tag push 触发 CI 测试 + Release 前置测试 job（发布流程：打 `v*` tag → release.yml 构建 macOS arm64/x86_64 + Linux x86_64 产物并附 sha256 上传 GitHub Releases）。
+当前进度：P0–P10 全部交付，v1.2x 系列迭代中（版本以 CHANGELOG 为准）。三平台（飞书为一等公民：CardKit 真流式卡片/审批按钮卡/云文档评论；wecom 长连接；ilink 实验性私聊）× 四后端（claude-cli/claude-acp/codex/gemini）+ webhook/cron 事件驱动。CI 双平台（ubuntu + macOS）跑 fmt/clippy/test/MSRV/audit/deny；tag push 触发 CI 测试 + Release 前置测试 job（发布流程：打 `v*` tag → release.yml 构建 macOS arm64/x86_64 + Linux x86_64 产物并附 sha256 上传 GitHub Releases）。
 
 代码改动约定：`.rs` 生产代码需方案设计到位 + `cargo test --workspace` 验证 + commit 注明待 review（详见 `CONTRIBUTING.md`）。
 

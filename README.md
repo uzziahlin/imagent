@@ -285,11 +285,10 @@ secret 轮换 / 环境变量变化后：重新 `export` + `imagent service insta
 | `/switch <name>` | 切到 / 新建命名会话（多任务并行上下文） |
 | `/sessions` | 列命名会话（`*` 标当前） |
 | `/resume [n]` | 统一恢复列表：📱 IM 会话 ∪ 💻 电脑端 Claude Code 会话（摘要+时间辨认，按序号接管，无需会话 id） |
-| `/export [n]` | 导出当前（或 /resume 序号）会话为 Markdown 文件 |
+| `/export [n]` | 导出当前（或 /resume 序号）会话为 Markdown 文件（claude 系后端） |
 | `/again` | 再跑最近一次成功指令（与 /retry 的失败轮重试对称） |
 | `/compact` | 软压缩上下文（摘要 + 重置 + 延续）；自动触发**默认关闭**，开启方式见[用量护栏](#设计取舍)：水位（input+缓存）达 模型窗口 × `auto_compact_window_ratio`（缺省 80%） |
 | `/retry` | 重发最近一轮指令（失败/中断后一键续接） |
-| `/export` | 当前会话导出为 Markdown 文件回传（claude 系后端） |
 | `/model [名称\|default]` | 查看/热切模型（切换需管理员；claude 系 / codex `-m` / gemini `-m` 全支持） |
 | `/cd [path]` | 切工作目录（`/resume` 本机会话列表随之变化） |
 | `/ws list\|save\|use\|remove` | 命名工作空间 |
@@ -392,7 +391,7 @@ imagent mcp-ask --print-config
 | v1.20 | ✅ | **Webhook 入站**（事件驱动：CI/告警→会话→审批）+ ACP 窗口自学习 + 崩溃轮次恢复（/retry 续跑）+ compact 卡片化 + /cron 停机补跑 |
 | v1.19 | ✅ | 深度 review 双批修复（42 项）+ 事件 intake 与媒体 IO 解耦 + **排队消息持久化（崩溃不丢）** + update_card 状态机化 / ConvState 收敛 + **自动压缩比例档（窗口 80%）** + housekeeping（媒体 GC） |
 
-> **当前状态**：**v1.19.x**（见 [Releases](https://github.com/uzziahlin/imagent/releases)）。质量基线：`cargo test --workspace` 664+ 全绿、clippy 零警告、CI 双平台 + audit/deny；历史复审记录 [`docs/CODE_REVIEW_v10.md`](docs/CODE_REVIEW_v10.md)（含功能挖掘路线图：ACP 窗口自动学习 / /cron 停机补跑 / webhook 入站 / 审批聚合卡）。
+> **当前状态**：以 [CHANGELOG.md](CHANGELOG.md) 最新版本为准（历史复审记录见 `docs/CODE_REVIEW_*.md`，最新一轮 [`docs/CODE_REVIEW_v13.md`](docs/CODE_REVIEW_v13.md)）。质量基线：`cargo test --workspace` 全绿、clippy 零警告、CI 双平台 + audit/deny。
 
 详见 [`docs/`](docs/)（[ARCHITECTURE](docs/ARCHITECTURE.md) / [DESIGN](docs/DESIGN.md) / [FEISHU_DESIGN](docs/FEISHU_DESIGN.md) / [RESEARCH](docs/RESEARCH.md) / [CODE_REVIEW_v10](docs/CODE_REVIEW_v10.md)）。
 
@@ -404,7 +403,7 @@ cargo clippy --workspace --all-targets -- -D warnings   # 0 warning
 cargo fmt --all --check
 ```
 
-crate：`core`（调度/鉴权/session/权限/任务控制/cron）+ `ilink`（iLink 协议）+ `wecom`（企业微信长连接）+ `feishu`（飞书长连接 + CardKit + 云文档评论）+ `claude`（CLI/ACP backend）+ `codex` + `gemini` + `store`（SQLite，schema v12）。
+crate：`core`（调度/鉴权/session/权限/任务控制/cron）+ `ilink`（iLink 协议）+ `wecom`（企业微信长连接）+ `feishu`（飞书长连接 + CardKit + 云文档评论）+ `claude`（CLI/ACP backend）+ `codex` + `gemini` + `store`（SQLite，schema v15 线性迁移）。
 
 ## License
 
