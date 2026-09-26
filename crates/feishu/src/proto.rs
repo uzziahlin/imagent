@@ -141,6 +141,62 @@ pub fn quoted_context_text(msg_type: &str, content: &str) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+/// 引用的 interactive 卡片 → 文本转录。v1.27.0 修复：bot 自身回复即卡片，
+/// 此前引用只剩 `[interactive]` 占位、追问整链失效。
+///
+/// 递归收集卡片 JSON 中带文本的组件（`markdown`/`plain_text`/`lark_md` 的
+/// `content`），容器组件（form/column_set/collapsible_panel/未知 tag）自动
+/// 下钻——按钮文案、下拉/多选选项、面板正文随之收齐，第三方 schema 1.0
+/// 卡（div/note/action）同形态覆盖。模板卡（`type=template`，正文不在
+/// content 里）与抽不到任何文本的结构返回 None，由调用方回退占位。
+/// 只走 header.title 与 elements 树，config（summary 等元信息）不入正文。
+pub fn card_text_transcript(content: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(content).ok()?;
+    if v.get("type").and_then(|t| t.as_str()) == Some("template") {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    collect_card_text(v.pointer("/header/title"), &mut parts);
+    for root in ["/body/elements", "/elements"] {
+        collect_card_text(v.pointer(root), &mut parts);
+    }
+    let text = parts
+        .into_iter()
+        .filter(|p| !p.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!text.is_empty()).then_some(text)
+}
+
+/// 卡片节点 → 文本片段（`card_text_transcript` 的递归体）：文本组件取
+/// content；其余对象/数组全部下钻——容器与未来新增组件不丢其中文本，
+/// 无 tag 的字符串叶子（value 等业务载荷）天然不收。
+fn collect_card_text(node: Option<&serde_json::Value>, out: &mut Vec<String>) {
+    let Some(node) = node else { return };
+    match node {
+        serde_json::Value::Object(map) => {
+            match map.get("tag").and_then(|t| t.as_str()).unwrap_or("") {
+                "markdown" | "plain_text" | "lark_md" => {
+                    if let Some(c) = map.get("content").and_then(|c| c.as_str()) {
+                        out.push(c.trim().to_string());
+                    }
+                }
+                _ => {
+                    for v in map.values() {
+                        collect_card_text(Some(v), out);
+                    }
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                collect_card_text(Some(v), out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// v1.25.2：不限会话形态的 parent_id 提取（引用上下文用——私聊引用此前被
 /// 群版 peek 跳过）。群「回复即定向」仍用 [`peek_group_reply_parent`]。
 pub fn peek_reply_parent(payload: &[u8]) -> Option<String> {
@@ -1855,7 +1911,11 @@ fn merge_forward_body(item: &MergedForwardItem) -> String {
             }
         }
         "media" | "video" => "[视频]".to_string(),
-        "interactive" => "[卡片消息]".to_string(),
+        // 卡片（含本 bot 回复卡）：抽文本正文（v1.27.0——此前只占位，聊天记录
+        // 里引用 bot 回答追问同样失效）；模板卡/抽不到回退占位。
+        "interactive" => {
+            card_text_transcript(&item.content).unwrap_or_else(|| "[卡片消息]".to_string())
+        }
         // 嵌套合并转发：**不递归**调 list_merge_forward——嵌套层数无界，每层一次
         // 分页拉取，深度 × API 配额易失控（用户「转发套转发」是常态），一期只
         // 标注占位让 agent 知道结构，用户需要细节可展开后单发。
@@ -1983,6 +2043,79 @@ mod tests {
         assert!(got.contains("第一行") && got.contains("第二行"), "{got}");
         assert!(quoted_context_text("text", r#"{"text":"  "}"#).is_none());
         assert!(quoted_context_text("image", "{}").is_none());
+    }
+
+    /// v1.27.0 引用卡片修复：interactive 卡抽文本正文（本 bot 回复卡的
+    /// schema 2.0 形态——markdown 正文/折叠面板/按钮行/notation footer）。
+    #[test]
+    fn card_text_transcript_bot_schema2_card() {
+        let card = r#"{
+            "schema": "2.0",
+            "header": { "title": { "tag": "plain_text", "content": "✅ 完成" } },
+            "config": { "streaming_mode": false, "summary": { "content": "列表预览不入正文" } },
+            "body": { "elements": [
+                { "tag": "markdown", "content": "修复建议：升级 rustls 后重试。" },
+                { "tag": "hr" },
+                { "tag": "markdown", "content": "🔧 工具 2 次：Bash×2", "text_size": "notation" },
+                { "tag": "collapsible_panel", "expanded": false,
+                  "header": { "title": { "tag": "markdown", "content": "🔧 工具轨迹（2）" } },
+                  "elements": [ { "tag": "markdown", "content": "- cargo test", "text_size": "notation" } ] },
+                { "tag": "column_set", "flex_mode": "flow", "columns": [
+                    { "tag": "column", "width": "auto", "elements": [
+                        { "tag": "button", "text": { "tag": "plain_text", "content": "🔁 再跑一次" },
+                          "type": "primary",
+                          "behaviors": [ { "type": "callback", "value": { "command": "/again" } } ] }
+                    ] }
+                ] }
+            ] }
+        }"#;
+        let got = card_text_transcript(card).unwrap_or_default();
+        assert!(got.contains("✅ 完成"), "header 标题应收录: {got}");
+        assert!(got.contains("修复建议：升级 rustls 后重试。"), "{got}");
+        assert!(got.contains("🔧 工具轨迹（2）"), "面板头应收录: {got}");
+        assert!(got.contains("- cargo test"), "面板正文应收录: {got}");
+        assert!(got.contains("🔁 再跑一次"), "按钮文案应收录: {got}");
+        assert!(
+            !got.contains("列表预览不入正文"),
+            "config.summary 不入正文: {got}"
+        );
+        assert!(!got.contains("/again"), "按钮 value 业务载荷不收: {got}");
+    }
+
+    /// 模板卡（正文不在 content）→ None 回退占位；第三方 schema 1.0 卡
+    /// （div/lark_md + note + action）同 walker 覆盖；空/非法输入 None。
+    #[test]
+    fn card_text_transcript_template_and_foreign_schema1() {
+        let template = r#"{
+            "type": "template",
+            "data": { "template_id": "tmpl_x", "template_variable": { "k": "v" } }
+        }"#;
+        assert!(card_text_transcript(template).is_none());
+
+        let v1 = r#"{
+            "config": {},
+            "elements": [
+                { "tag": "div",
+                  "text": { "tag": "lark_md", "content": "**审批单** AP-1024" },
+                  "fields": [ { "is_short": true, "text": { "tag": "lark_md", "content": "状态：待审批" } } ] },
+                { "tag": "note", "elements": [ { "tag": "plain_text", "content": "来自审批中心" } ] },
+                { "tag": "action", "actions": [
+                    { "tag": "button", "text": { "tag": "lark_md", "content": "通过" }, "type": "primary" }
+                ] }
+            ]
+        }"#;
+        let got = card_text_transcript(v1).unwrap_or_default();
+        assert!(
+            got.contains("AP-1024") && got.contains("状态：待审批"),
+            "{got}"
+        );
+        assert!(
+            got.contains("来自审批中心") && got.contains("通过"),
+            "{got}"
+        );
+
+        assert!(card_text_transcript("{}").is_none());
+        assert!(card_text_transcript("not json").is_none());
     }
 
     #[test]

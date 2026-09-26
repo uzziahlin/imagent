@@ -1922,6 +1922,9 @@ async fn enrich_with_quote(
     }
     .await;
     let is_merged_forward = fetched.as_ref().is_ok_and(|(mt, _)| mt == "merged_forward");
+    // 引用卡片与聊天记录同权重放宽到 1500 字：卡片正文即完整 agent 回复
+    //（发送侧上限 8KB），500 字截断恰好砍在用户追问的报错/结论上。
+    let mut wide_quote = is_merged_forward;
     let quote = match fetched {
         Ok((mt, content)) => match mt.as_str() {
             // 引用的是合并转发消息（聊天记录卡片）：本体 content 是占位符，
@@ -1948,10 +1951,15 @@ async fn enrich_with_quote(
                     }
                 }
             }
-            // 图片/文件/卡片等：给类型占位（agent 至少知道引用的是什么）。
-            "image" | "media" | "file" | "sticker" | "emotion" | "interactive" => {
-                Some(format!("[{mt}]"))
+            // v1.27.0 修复：引用卡片（bot 自身回复即 interactive 卡）此前只剩
+            // [interactive] 占位、追问整链失效——抽卡片文本正文（proto::
+            // card_text_transcript），模板卡/抽不到回退类型占位。
+            "interactive" => {
+                wide_quote = true;
+                crate::proto::card_text_transcript(&content).or(Some("[卡片消息]".to_string()))
             }
+            // 图片/文件等：给类型占位（agent 至少知道引用的是什么）。
+            "image" | "media" | "file" | "sticker" | "emotion" => Some(format!("[{mt}]")),
             _ => crate::proto::quoted_context_text(&mt, &content),
         },
         Err(e) => {
@@ -1962,7 +1970,7 @@ async fn enrich_with_quote(
     let Some(quote) = quote.filter(|q| !q.trim().is_empty()) else {
         return;
     };
-    let cap = if is_merged_forward { 1_500 } else { 500 };
+    let cap = if wide_quote { 1_500 } else { 500 };
     let quote: String = quote.chars().take(cap).collect();
     let base = msg.text.take().unwrap_or_default();
     msg.text = Some(format!(
