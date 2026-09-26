@@ -245,6 +245,9 @@ impl FeishuPlatform {
     /// - `thread_active_window_secs`（Wave B-8）：话题免 @ 窗口（0 = 关闭）。
     /// - `asr_enabled`（W3-1）：语音转文字开关（config `feishu_asr_enabled`。
     ///   关闭时语音消息回退为提示，不调 speech_to_text）。
+    /// - `group_context_messages`（T10）：群聊上下文注入条数（config
+    ///   `feishu_group_context_messages`，0 = 关闭）——群消息触发轮次时拉本群
+    ///   最近 N 条消息前置进 prompt（fail-soft）。
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         app_id: String,
@@ -259,6 +262,7 @@ impl FeishuPlatform {
         outbox: Option<imagent_store::Store>,
         send_rps: f64,
         urgent_on_ask: bool,
+        group_context_messages: usize,
     ) -> Result<Self> {
         let ws_config = Arc::new(
             Config::builder()
@@ -331,6 +335,9 @@ impl FeishuPlatform {
         let conv_states_for_drain = conv_states.clone();
         // Wave B-8：话题免 @ 窗口（config 注入；0 = 关闭）。
         let thread_active_window = thread_window_of(thread_active_window_secs);
+        // T10：群聊上下文注入条数（config 注入；0 = 关闭）——drain 侧普通群消息
+        // 进轮次时拉本群最近 N 条前置注入。
+        let group_context_messages_for_drain = group_context_messages;
         // W3-1：语音转文字开关（drain 侧消费）。
         let asr_enabled_for_drain = asr_enabled;
         // v1.18 迭代（housekeeping）：per-conv 状态表粗上限淘汰（ConvState
@@ -476,7 +483,15 @@ impl FeishuPlatform {
                     // 到同一异步作业（保序经泵）。
                     let quote_parent = crate::proto::peek_reply_parent(&payload)
                         .filter(|_| msg.text.as_deref().is_some_and(|t| t.trim().len() > 4));
-                    let needs_async = !pending.is_empty() || quote_parent.is_some();
+                    // T10 群聊上下文：群 conv（含话题群——免 @ 窗口语义下同样
+                    // 适用，无需特判）且配置 > 0 时拉本群最近 N 条前置注入；
+                    // 私聊/评论 conv 天然不命中。与引用上下文同款 fail-soft，
+                    // 同一异步作业内**后于**引用注入执行（群上下文块在引用块
+                    // 之前——更早的背景）。
+                    let group_ctx_chat = crate::proto::group_chat_id_of_conv(&msg.conv_id.0)
+                        .filter(|_| group_context_messages_for_drain > 0);
+                    let needs_async =
+                        !pending.is_empty() || quote_parent.is_some() || group_ctx_chat.is_some();
                     let job = if !needs_async {
                         PumpJob::Ready(msg)
                     } else {
@@ -485,12 +500,25 @@ impl FeishuPlatform {
                         let aid = app_id_for_drain.clone();
                         let sec = app_secret_for_drain.clone();
                         let pending = pending.clone();
+                        let group_ctx_limit = group_context_messages_for_drain;
                         PumpJob::Media(tokio::spawn(async move {
                             let mut msg = msg;
                             if let Some(parent_id) = quote_parent.as_deref() {
                                 enrich_with_quote(
                                     &mut msg,
                                     parent_id,
+                                    &token_lock,
+                                    &cfg,
+                                    &aid,
+                                    &sec,
+                                )
+                                .await;
+                            }
+                            if let Some(chat_id) = group_ctx_chat.as_deref() {
+                                enrich_with_group_context(
+                                    &mut msg,
+                                    chat_id,
+                                    group_ctx_limit,
                                     &token_lock,
                                     &cfg,
                                     &aid,
@@ -1989,6 +2017,74 @@ async fn enrich_with_quote(
         "（用户引用了以下消息，针对它追问）:\n> {}\n\n{base}",
         quote.replace('\n', "\n> ")
     ));
+}
+
+/// T10 群聊上下文注入：拉本群最近 N 条消息转录为前置块进 prompt（Slack 线程
+/// 上下文的飞书等价物——「帮我们看看刚才讨论的」类追问不再失忆）。
+///
+/// - fail-soft：token/权限/网络任一失败 `debug!` 一条后原样通过，轮次照常
+///   （token 失效码自愈一次，与媒体下载同款）；
+/// - 全部条目被过滤（如只有 bot 自己的消息）→ 不注入（[`render_group_context_block`]
+///   返回 None）；
+/// - 与引用上下文共存时**后于**其执行（调用序），群上下文块落在引用块之前——
+///   更早的背景；纯媒体轮次（text 空）只注入块本身。
+#[allow(clippy::too_many_arguments)]
+async fn enrich_with_group_context(
+    msg: &mut InboundMessage,
+    chat_id: &str,
+    limit: usize,
+    token_lock: &Arc<RwLock<Option<(String, Instant)>>>,
+    cfg: &CoreConfig,
+    aid: &str,
+    sec: &str,
+) {
+    let fetched = async {
+        let t = fetch_cached_token(token_lock, cfg, aid, sec).await?;
+        crate::client::list_chat_messages(cfg, &t, chat_id, limit, aid).await
+    }
+    .await;
+    let items = match fetched {
+        Ok(items) => items,
+        // token 失效自愈：清缓存强制刷新后重试一次（与媒体下载同语义）。
+        Err(e) if crate::client::is_token_invalid_msg(&e.to_string()) => {
+            *token_lock.write().await = None;
+            match async {
+                let t = fetch_cached_token(token_lock, cfg, aid, sec).await?;
+                crate::client::list_chat_messages(cfg, &t, chat_id, limit, aid).await
+            }
+            .await
+            {
+                Ok(items) => items,
+                Err(e2) => {
+                    debug!(
+                        target: "feishu",
+                        error = %e2,
+                        chat_id,
+                        "群上下文拉取失败（token 刷新后仍失败，跳过注入）"
+                    );
+                    return;
+                }
+            }
+        }
+        Err(e) => {
+            debug!(
+                target: "feishu",
+                error = %e,
+                chat_id,
+                "群上下文拉取失败（权限/网络，跳过注入）"
+            );
+            return;
+        }
+    };
+    let Some(block) = crate::proto::render_group_context_block(&items) else {
+        return;
+    };
+    let base = msg.text.take().unwrap_or_default();
+    msg.text = Some(if base.trim().is_empty() {
+        block
+    } else {
+        format!("{block}\n\n{base}")
+    });
 }
 
 async fn process_pending_media(
@@ -4097,6 +4193,7 @@ mod tests {
             None,
             0.0,
             false,
+            0,
         )
         .expect("构造");
         let conv = ConvId("feishu:ou_x".into());
@@ -4131,6 +4228,7 @@ mod tests {
             None,
             0.0,
             false,
+            0,
         )
         .expect("构造");
         p.pending_asks.lock().await.insert(
@@ -4170,6 +4268,7 @@ mod tests {
             None,
             0.0,
             false,
+            0,
         )
         .expect("构造");
         assert_eq!(p.require_mention_in_group().await, Some(true));
@@ -4295,6 +4394,7 @@ mod tests {
             None,
             0.0,
             false,
+            0,
         )
         .expect("构造");
         assert!(p.quiet_hours.is_none(), "未配置 → None");
@@ -4333,6 +4433,7 @@ mod tests {
                 None,
                 0.0,
                 false,
+                0,
             )
             .expect("构造")
         };
@@ -4348,5 +4449,218 @@ mod tests {
         let p = mk(Some(1_000_000));
         assert_eq!(p.text_split_max, FEISHU_TEXT_MAX);
         assert_eq!(p.comment_split_max, FEISHU_COMMENT_TEXT_MAX);
+    }
+
+    // ---------- T10：群聊上下文注入（本地回环 mock HTTP） ----------
+
+    /// loopback mock 的代理豁免（一次性）：常见代理环境（`http_proxy=
+    /// http://127.0.0.1:7897` 一类）会把发往 127.0.0.1 的请求劫去代理回 502。
+    /// reqwest 在**首次构建** client 时读环境——须在此之前把 loopback 并进
+    /// NO_PROXY（保留用户原值）。api_client 是全局 OnceLock 且测试内无其它
+    /// 触网路径（发送类函数不被任何测试引用），无先后竞态。
+    fn ensure_no_proxy_for_loopback() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let merged = match std::env::var("NO_PROXY") {
+                Ok(prev) if !prev.trim().is_empty() => format!("{prev},127.0.0.1,localhost"),
+                _ => "127.0.0.1,localhost".to_string(),
+            };
+            std::env::set_var("NO_PROXY", merged);
+        });
+    }
+
+    /// mock 的按 path 分发闭包类型（type_complexity 收敛）。
+    type MockRespond = std::sync::Arc<dyn Fn(&str) -> (u16, String) + Send + Sync>;
+
+    /// 本地回环 mock 飞书 OpenAPI：按请求 path 分发 `(status, JSON body)`。
+    /// 群上下文/引用上下文的拉取都走 `core_config.base_url()` 直拼 URL——指向
+    /// 本 server 即可离线验收完整注入管线（真实 reqwest HTTP 栈，假后端）。
+    async fn spawn_mock_feishu(respond: MockRespond) -> String {
+        ensure_no_proxy_for_loopback();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let respond = respond.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .split(' ')
+                        .nth(1)
+                        .unwrap_or("/")
+                        .split('?')
+                        .next()
+                        .unwrap_or("/")
+                        .to_string();
+                    let (status, body) = respond(&path);
+                    let resp = format!(
+                        "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://127.0.0.1:{}", addr.port())
+    }
+
+    /// 群上下文测试底座：指向 mock 的 CoreConfig（app_id 即 bot 判定入参）。
+    fn mock_core_config(base_url: &str) -> Arc<CoreConfig> {
+        Arc::new(
+            CoreConfig::builder()
+                .app_id("cli_mock".to_string())
+                .app_secret("sec_mock".to_string())
+                .base_url(base_url.to_string())
+                .req_timeout(Duration::from_secs(5))
+                .build(),
+        )
+    }
+
+    /// 预填缓存 token 的 lock（TTL 内命中，不打真 token 端点）。
+    fn cached_token() -> Arc<RwLock<Option<(String, Instant)>>> {
+        Arc::new(RwLock::new(Some(("t_mock".to_string(), Instant::now()))))
+    }
+
+    /// 群文本入站消息（@bot 已剥离后的形态）。
+    fn mk_group_text_msg(text: &str) -> InboundMessage {
+        InboundMessage {
+            conv_id: ConvId("feishu:oc_g".into()),
+            sender: imagent_core::UserId("ou_sender".into()),
+            sender_name: None,
+            text: Some(text.into()),
+            media: vec![],
+            media_errors: Vec::new(),
+            mentions: Vec::new(),
+            mentioned_bot: true,
+            ask_req: None,
+            reply_to: None,
+            source_msg_id: Some("om_now".into()),
+            control: None,
+            no_steer: false,
+            reply_hint: ReplyHint::None,
+        }
+    }
+
+    /// 「获取会话历史消息」mock 响应（ByCreateTimeDesc：最新在前；1 条 bot 消息
+    /// 混在中间——sender_type=app 且 app_id 命中 cli_mock，双判定形态都覆盖）。
+    fn group_context_list_body() -> String {
+        let content = |t: &str| serde_json::to_string(&serde_json::json!({ "text": t })).unwrap();
+        serde_json::json!({
+            "code": 0,
+            "data": { "items": [
+                {
+                    "message_id": "om_3", "msg_type": "text", "create_time": "1788000003",
+                    "sender": { "id": "ou_b0c072f42e7c1b09", "id_type": "open_id", "sender_type": "user" },
+                    "content": content("最新这条")
+                },
+                {
+                    "message_id": "om_2", "msg_type": "image", "create_time": "1788000002",
+                    "sender": { "id": "ou_b0c072f42e7c1b09", "id_type": "open_id",
+                                "sender_type": "app", "app_id": "cli_mock" },
+                    "content": "{}"
+                },
+                {
+                    "message_id": "om_1", "msg_type": "text", "create_time": "1788000001",
+                    "sender": { "id": "ou_alice", "id_type": "open_id", "sender_type": "user", "name": "Alice" },
+                    "content": content("最早这条")
+                }
+            ]}
+        })
+        .to_string()
+    }
+
+    /// 群消息进轮次 → 本群最近 N 条（跳过 bot 消息、时间正序）前置注入 prompt，
+    /// 头尾格式与正文保留都在位。
+    #[tokio::test]
+    async fn enrich_with_group_context_injects_recent_block() {
+        let base = spawn_mock_feishu(std::sync::Arc::new(|path: &str| {
+            assert!(
+                path.starts_with("/open-apis/im/v1/messages"),
+                "路径: {path}"
+            );
+            (200u16, group_context_list_body())
+        }))
+        .await;
+        let cfg = mock_core_config(&base);
+        let token = cached_token();
+        let mut msg = mk_group_text_msg("帮我们看看刚才讨论的");
+        enrich_with_group_context(&mut msg, "oc_g", 10, &token, &cfg, "cli_mock", "sec_mock").await;
+        let text = msg.text.as_deref().expect("应注入文本");
+        assert!(
+            text.starts_with("【群最近上下文（2 条，最新在最后）】"),
+            "{text}"
+        );
+        // bot 消息（om_2）被跳过：条数 2 且无 [图片] 占位。
+        assert!(!text.contains("[图片]"), "bot 消息应跳过: {text}");
+        // 正序：Alice（最早）在前，bob 短 id（最新）在后；名字优先、缺名回退后 8 位。
+        let alice = text.find("Alice: 最早这条").expect("最早条应在前半");
+        let bob = text.find("2e7c1b09: 最新这条").expect("最新条应在后半");
+        assert!(alice < bob, "按时间正序（最新在最后）: {text}");
+        // 尾注 + 用户正文保留。
+        let tail = text.find("（以下是用户本轮消息）").expect("尾注在位");
+        assert!(tail < text.find("帮我们看看刚才讨论的").unwrap(), "{text}");
+        // 总长 ≤ 上限（chars）。
+        assert!(text.chars().count() <= crate::proto::GROUP_CONTEXT_MAX_CHARS);
+    }
+
+    /// API 失败（权限不足 code!=0）→ fail-soft：debug 留痕，prompt 原样通过。
+    #[tokio::test]
+    async fn enrich_with_group_context_failsoft_on_api_error() {
+        let base = spawn_mock_feishu(std::sync::Arc::new(|_path: &str| {
+            (
+                200u16,
+                r#"{"code":230002,"msg":"no permission"}"#.to_string(),
+            )
+        }))
+        .await;
+        let cfg = mock_core_config(&base);
+        let token = cached_token();
+        let mut msg = mk_group_text_msg("原文不动");
+        enrich_with_group_context(&mut msg, "oc_g", 10, &token, &cfg, "cli_mock", "sec_mock").await;
+        assert_eq!(
+            msg.text.as_deref(),
+            Some("原文不动"),
+            "fail-soft 应原样通过"
+        );
+    }
+
+    /// 与引用上下文共存：群上下文块在引用块**之前**（更早的背景），正文最后
+    ///（对齐 drain 内「先 quote 后 group」的调用序）。
+    #[tokio::test]
+    async fn enrich_with_quote_then_group_context_order() {
+        let quote_body = serde_json::json!({
+            "code": 0,
+            "data": { "items": [ {
+                "msg_type": "text",
+                "body": { "content":
+                    serde_json::to_string(&serde_json::json!({"text": "被引用的报错内容"})).unwrap() }
+            }]}
+        })
+        .to_string();
+        let base = spawn_mock_feishu(std::sync::Arc::new(move |path: &str| {
+            // 单条消息 GET（引用）与列表 GET（群上下文）按 path 分发。
+            if path == "/open-apis/im/v1/messages" {
+                (200u16, group_context_list_body())
+            } else {
+                (200u16, quote_body.clone())
+            }
+        }))
+        .await;
+        let cfg = mock_core_config(&base);
+        let token = cached_token();
+        let mut msg = mk_group_text_msg("这个报错怎么修");
+        enrich_with_quote(&mut msg, "om_parent", &token, &cfg, "cli_mock", "sec_mock").await;
+        enrich_with_group_context(&mut msg, "oc_g", 10, &token, &cfg, "cli_mock", "sec_mock").await;
+        let text = msg.text.as_deref().expect("两块都应注入");
+        let group = text.find("【群最近上下文").expect("群上下文块在位");
+        let quote = text.find("（用户引用了以下消息").expect("引用块在位");
+        let body = text.find("这个报错怎么修").expect("正文在位");
+        assert!(group < quote && quote < body, "群上下文→引用→正文: {text}");
     }
 }

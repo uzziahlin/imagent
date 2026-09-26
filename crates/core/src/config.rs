@@ -513,10 +513,31 @@ pub struct Config {
     /// 等待上限 2s（超时放行，被动退避仍兜底）。仅 feishu 平台生效。
     #[serde(default = "default_feishu_send_rps")]
     pub feishu_send_rps: f64,
+    /// T10：飞书群聊上下文注入条数（仅 feishu 平台）——群消息触发轮次时自动
+    /// 拉取本群最近 N 条消息前置注入 prompt（agent 获得群聊记忆，「刚才讨论的
+    /// 什么」类追问不再失忆）。默认 10；0 = 关闭；上限 50（越界 warn + 钳位）。
+    /// 需要应用具备 `im:message` 读权限（与收消息/合并转发转录同源）——拉取
+    /// fail-soft：权限不足/网络失败仅跳过注入，不阻塞轮次。改动需重启。
+    #[serde(default = "default_feishu_group_context_messages")]
+    pub feishu_group_context_messages: usize,
+    /// P2（code-review v13）：全局在飞 agent 轮数上限（跨 conv 信号量）。缺省 4
+    /// ——NAS/小服务器多群部署的**生存护栏**：`running` 表只做 per-conv 串行，
+    /// N 个 conv 在飞 = N 个 agent 子进程（ACP 连接池 8 有隐式封顶，CLI 无界），
+    /// 多群/cron 齐点/webhook 风暴场景内存与 API 配额同炸。0 = 不限制。
+    /// 超限的轮不报错、只排队（conv 串行语义不变）；SIGHUP 热改生效——只影响
+    /// 后续 acquire，在飞轮与已排队等待者不受影响（见
+    /// `Dispatcher::reload_max_concurrent_rounds`）。
+    #[serde(default = "default_max_concurrent_rounds")]
+    pub max_concurrent_rounds: usize,
 }
 
 fn default_feishu_send_rps() -> f64 {
     5.0
+}
+/// P2（v13）：并发护栏缺省 4——单机 NAS 部署（多群 + cron）实测安全档；
+/// 详见 Config::max_concurrent_rounds 文档。
+fn default_max_concurrent_rounds() -> usize {
+    4
 }
 
 fn default_feishu_urgent_on_ask() -> bool {
@@ -552,6 +573,9 @@ fn default_stranger_p2p_hint() -> bool {
 }
 fn default_feishu_thread_active_window_secs() -> u64 {
     30 * 60
+}
+fn default_feishu_group_context_messages() -> usize {
+    10
 }
 
 /// P6-8：工作目录安全校验——拒绝过宽位置（agent 以 cwd 定位工作区，`/`、home 根、
@@ -720,6 +744,20 @@ impl Config {
                 "feishu_thread_active_window_secs 上限 {THREAD_WINDOW_MAX_SECS}（当前 {}）；0 = 关闭话题免 @ 豁免",
                 cfg.feishu_thread_active_window_secs
             )));
+        }
+
+        // T10：群聊上下文注入条数边界（0 = 关闭；上限 50 = 会话历史 API 的
+        // page_size 上限，防一次拉爆配额/prompt）。与线程窗口的硬错不同，这里
+        // 越界 **warn + 钳位**——上下文注入是 fail-soft 增强，不值得拒启。
+        const FEISHU_GROUP_CONTEXT_MAX: usize = 50;
+        if cfg.feishu_group_context_messages > FEISHU_GROUP_CONTEXT_MAX {
+            tracing::warn!(
+                target: "imagent::core",
+                "feishu_group_context_messages 上限 {}（当前 {}）；已钳位，0 = 关闭群上下文注入",
+                FEISHU_GROUP_CONTEXT_MAX,
+                cfg.feishu_group_context_messages
+            );
+            cfg.feishu_group_context_messages = FEISHU_GROUP_CONTEXT_MAX;
         }
 
         // W1-2：模型串 trim，空白视为未设置（防 `claude_model = ""` 附加空 flag）。
@@ -1028,6 +1066,7 @@ permission_mode = "auto"    # 缺省=auto：claude-cli=透传 claude 原生 auto
 # acp_max_connections = 8      # claude-acp 并发连接上限（仅 agent="claude-acp"）
 # acp_idle_recycle_secs = 600  # claude-acp 连接空闲回收（秒；仅 agent="claude-acp"）
 # feishu_asr_enabled = true     # 飞书语音转文字（需后台申请语音识别权限；失败回退提示，仅 feishu）
+# feishu_group_context_messages = 10  # 群消息触发轮次时拉本群最近 N 条消息前置注入 prompt（需 im:message 读权限，fail-soft）；默认10，0=关闭，上限50
 # sender_daily_cost_limit_usd = 5.0  # per-sender 成本上限（美元，滚动 24h 窗口；不设 = 不限）
 "#;
 }
@@ -1781,6 +1820,46 @@ message_fragment_interval_ms = 250
             "default_workdir = \"/tmp/ws\"\nfeishu_thread_active_window_secs = 90000\n",
         );
         assert!(Config::load(&p).is_err(), "超 24h 应报错");
+        cleanup(&p);
+    }
+
+    /// T10：群聊上下文注入条数——默认 10；可自定义（0 = 关闭）；越界 warn + 钳 50
+    ///（fail-soft 增强不拒启，与话题窗口的硬错取舍不同）。
+    #[test]
+    fn feishu_group_context_messages_default_zero_and_clamp() {
+        let p = tmp_path("gc_def", r#"default_workdir = "/tmp/ws""#);
+        let cfg = Config::load(&p).expect("ok");
+        assert_eq!(cfg.feishu_group_context_messages, 10);
+        cleanup(&p);
+        let p = tmp_path(
+            "gc_custom",
+            "default_workdir = \"/tmp/ws\"\nfeishu_group_context_messages = 5\n",
+        );
+        let cfg = Config::load(&p).expect("ok");
+        assert_eq!(cfg.feishu_group_context_messages, 5);
+        cleanup(&p);
+        // 0 = 关闭；上限 50 本身合法。
+        let p = tmp_path(
+            "gc_zero",
+            "default_workdir = \"/tmp/ws\"\nfeishu_group_context_messages = 0\n",
+        );
+        let cfg = Config::load(&p).expect("ok");
+        assert_eq!(cfg.feishu_group_context_messages, 0);
+        cleanup(&p);
+        let p = tmp_path(
+            "gc_max",
+            "default_workdir = \"/tmp/ws\"\nfeishu_group_context_messages = 50\n",
+        );
+        let cfg = Config::load(&p).expect("ok");
+        assert_eq!(cfg.feishu_group_context_messages, 50);
+        cleanup(&p);
+        // 越界钳位 50（warn 不拒启）。
+        let p = tmp_path(
+            "gc_huge",
+            "default_workdir = \"/tmp/ws\"\nfeishu_group_context_messages = 500\n",
+        );
+        let cfg = Config::load(&p).expect("ok");
+        assert_eq!(cfg.feishu_group_context_messages, 50, "越界应钳位 50");
         cleanup(&p);
     }
 

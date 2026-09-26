@@ -1380,25 +1380,8 @@ fn merge_forward_item_of(v: &serde_json::Value) -> Option<MergedForwardItem> {
         content: str_of("content"),
         sender_id,
         sender_name,
-        create_time_ms: merge_forward_create_time(obj.get("create_time")),
+        create_time_ms: crate::proto::create_time_ms_of(obj.get("create_time")),
     })
-}
-
-/// create_time 宽容解析：字符串 / 数字皆可；秒级值（0 < ts < 1e11，毫秒形态最早
-/// 1973 年）自动 ×1000 归一毫秒——飞书各 API 时间戳单位不统一，按量级判别。
-/// **待真机校准**：真机确认恒为毫秒后可去掉归一。
-fn merge_forward_create_time(v: Option<&serde_json::Value>) -> i64 {
-    let raw = v
-        .and_then(|x| {
-            x.as_i64()
-                .or_else(|| x.as_str().and_then(|s| s.parse::<i64>().ok()))
-        })
-        .unwrap_or(0);
-    if raw > 0 && raw < 100_000_000_000 {
-        raw * 1000
-    } else {
-        raw
-    }
 }
 
 /// 查询合并转发消息的子消息列表（合并转发完整支持）：GET
@@ -1454,6 +1437,70 @@ pub async fn list_merge_forward(
     }
     out.truncate(500);
     Ok(out)
+}
+
+/// T10 群聊上下文：获取会话历史消息（GET `/im/v1/messages?container_id_type=chat`，
+/// 官方「获取会话历史消息」API）——按 `ByCreateTimeDesc` 拉本群最近 `limit` 条
+///（单页：page_size 上限 50 = config 钳位上限，无需翻页）。
+///
+/// **手写 reqwest 而非 SDK 的 `ListMessagesRequest`**（open-lark 0.20 已有此 API）：
+/// SDK 返回非类型化 `serde_json::Value`，不省任何解析代码；手写路径与同文件的
+/// `list_merge_forward`（同为「按会话拉消息列表」）形态一致，且 429 归一标记 +
+/// [`retry_on_rate_limit`] 退避是既有消息列表拉取的统一做法（SDK 调用点
+/// `list_joined_chats` 无退避包裹）。条目宽容提取见
+/// [`proto::parse_group_context_items`]（待真机校准）。
+///
+/// 需 `im:message` 读权限（与收消息/合并转发转录同源）；失败由调用方 fail-soft
+///（debug 留痕，跳过注入不阻塞轮次）。`own_app_id` 为本应用 app_id（bot 自身
+/// 消息判定的双保险之一，见 [`proto::parse_group_context_items`]）。
+pub async fn list_chat_messages(
+    core_config: &CoreConfig,
+    token: &str,
+    chat_id: &str,
+    limit: usize,
+    own_app_id: &str,
+) -> imagent_core::Result<Vec<crate::proto::GroupContextItem>> {
+    let base = core_config.base_url().trim_end_matches('/').to_string();
+    // 防御性钳位（config 侧已钳 0/50）：page_size 合法域 [1, 50]。
+    let page_size = limit.clamp(1, 50);
+    let v: serde_json::Value = retry_on_rate_limit!(async {
+        let resp = api_client()
+            .clone()
+            .get(format!("{base}/open-apis/im/v1/messages"))
+            .bearer_auth(token)
+            .query(&[
+                ("container_id_type", "chat".to_string()),
+                ("container_id", chat_id.to_string()),
+                ("sort_type", "ByCreateTimeDesc".to_string()),
+                ("page_size", page_size.to_string()),
+                ("user_id_type", "open_id".to_string()),
+            ])
+            .send()
+            .await
+            .map_err(|e| {
+                imagent_core::CoreError::Platform(PLATFORM, format!("list_chat_messages: {e}"))
+            })?;
+        // 429 先归一标记（否则非 JSON 体解析错误不含可识别串，退避重试不生效）。
+        if resp.status().as_u16() == 429 {
+            return Err(imagent_core::CoreError::Platform(
+                PLATFORM,
+                "list_chat_messages: HTTP 429".to_string(),
+            ));
+        }
+        let v: serde_json::Value = resp.json().await.map_err(|e| {
+            imagent_core::CoreError::Platform(PLATFORM, format!("list_chat_messages: {e}"))
+        })?;
+        let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
+            return Err(imagent_core::CoreError::Platform(
+                PLATFORM,
+                format!("list_chat_messages: code={code} {msg}"),
+            ));
+        }
+        Ok(v)
+    })?;
+    Ok(crate::proto::parse_group_context_items(&v, own_app_id))
 }
 
 /// 回复云文档评论（P4-9）：POST `/drive/v1/files/{file_token}/comments/{comment_id}/replies`。
@@ -1779,32 +1826,6 @@ mod tests {
         assert_eq!(page.items.len(), 1, "非对象跳过，残缺对象保留");
         assert_eq!(page.items[0].message_type, "");
         assert_eq!(page.items[0].create_time_ms, 0);
-    }
-
-    /// create_time 量级归一：秒级 ×1000，毫秒原样，非法/缺省 0。
-    #[test]
-    fn merge_forward_create_time_normalization() {
-        assert_eq!(
-            merge_forward_create_time(Some(&serde_json::json!(1787912340))),
-            1_787_912_340_000,
-            "秒级归一毫秒"
-        );
-        assert_eq!(
-            merge_forward_create_time(Some(&serde_json::json!("1787912345678"))),
-            1_787_912_345_678,
-            "毫秒字符串原样"
-        );
-        assert_eq!(
-            merge_forward_create_time(Some(&serde_json::json!(0))),
-            0,
-            "0 保持（缺失语义）"
-        );
-        assert_eq!(
-            merge_forward_create_time(Some(&serde_json::json!("abc"))),
-            0,
-            "非法字符串 → 0"
-        );
-        assert_eq!(merge_forward_create_time(None), 0, "缺省 → 0");
     }
 
     #[tokio::test]

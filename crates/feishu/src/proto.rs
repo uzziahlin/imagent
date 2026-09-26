@@ -1886,18 +1886,23 @@ fn merge_forward_time_label(ms: i64) -> Option<String> {
         .map(|dt| dt.format("%H:%M").to_string())
 }
 
-/// 子消息类型 → 转录正文。媒体类（图片/表情/视频/文件）一期**不下载**，只占位
-/// 让 agent 知道「这里有个媒体」（用户需要细节可截图/单发）；text/post 取文字。
+/// 子消息类型 → 转录正文（共享映射见 [`message_body_of`]）。
 fn merge_forward_body(item: &MergedForwardItem) -> String {
-    match item.message_type.as_str() {
-        // text：取 content JSON 的 text；@_user_N 占位**保留原样**——子消息无
-        // mentions 元数据（API 不回该字段），正则清掉会丢「此处有 @」的语义、
-        // 名字又无从还原，保留原样是最简单且不撒谎的选择（真机确认子消息
-        // content 确实带占位后再考虑清洗）。
-        "text" => extract_text(&item.content).unwrap_or_else(|| "[文本消息]".to_string()),
-        // post：复用既有 post→文本逻辑（parse_post）。图片节点一期不下载：有文字
+    message_body_of(&item.message_type, &item.content)
+}
+
+/// 消息 (类型, content) → 转录正文——合并转发子消息与 T10 群聊上下文**共用**的
+/// 类型映射。媒体类（图片/表情/视频/文件）不下载，只占位让 agent 知道「这里有
+/// 个媒体」（用户需要细节可截图/单发）；text/post 取文字。
+fn message_body_of(mt: &str, content: &str) -> String {
+    match mt {
+        // text：取 content JSON 的 text；@_user_N 占位**保留原样**——列表类 API
+        // 不回 mentions 元数据，正则清掉会丢「此处有 @」的语义、名字又无从
+        // 还原，保留原样是最简单且不撒谎的选择。
+        "text" => extract_text(content).unwrap_or_else(|| "[文本消息]".to_string()),
+        // post：复用既有 post→文本逻辑（parse_post）。图片节点不下载：有文字
         // 只取文字（agent 拿不到图，占位反而误导）；纯图 post 以 [图片] 示意。
-        "post" => match parse_post(&item.content, None) {
+        "post" => match parse_post(content, None) {
             Some((Some(t), _, _)) if !t.trim().is_empty() => t,
             Some((_, pending, _)) if !pending.is_empty() => "[图片]".to_string(),
             _ => "[富文本消息]".to_string(),
@@ -1906,7 +1911,7 @@ fn merge_forward_body(item: &MergedForwardItem) -> String {
         "sticker" | "emotion" => "[表情]".to_string(),
         // file：content JSON 有 file_name 则带上（agent 至少知道是什么文件）。
         "file" => {
-            let name = serde_json::from_str::<serde_json::Value>(&item.content)
+            let name = serde_json::from_str::<serde_json::Value>(content)
                 .ok()
                 .and_then(|v| {
                     v.get("file_name")
@@ -1923,9 +1928,7 @@ fn merge_forward_body(item: &MergedForwardItem) -> String {
         "media" | "video" => "[视频]".to_string(),
         // 卡片（含本 bot 回复卡）：抽文本正文（v1.27.0——此前只占位，聊天记录
         // 里引用 bot 回答追问同样失效）；模板卡/抽不到回退占位。
-        "interactive" => {
-            card_text_transcript(&item.content).unwrap_or_else(|| "[卡片消息]".to_string())
-        }
+        "interactive" => card_text_transcript(content).unwrap_or_else(|| "[卡片消息]".to_string()),
         // 嵌套合并转发：**不递归**调 list_merge_forward——嵌套层数无界，每层一次
         // 分页拉取，深度 × API 配额易失控（用户「转发套转发」是常态），一期只
         // 标注占位让 agent 知道结构，用户需要细节可展开后单发。
@@ -1981,6 +1984,199 @@ pub fn thread_target_from_conv(conv: &ConvId) -> Option<(String, String)> {
         return None;
     }
     Some((chat_id.to_string(), root_id.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// T10：群聊上下文注入——群消息触发轮次时拉本群最近 N 条消息前置进 prompt。
+// ---------------------------------------------------------------------------
+
+/// 群 conv → 会话历史 API 的 chat_id（T10 群上下文注入用）：普通群
+/// `feishu:oc_xxx` 与话题群 `feishu:oc_xxx:om_root` 都取首段 `oc_xxx`（话题内
+/// 免 @ 窗口与注入同语义，无需特判——上下文按整群拉取）。私聊（`ou_` 前缀）、
+/// 评论 conv（`feishu:comment:…`）、非法前缀返回 None（不注入）。
+pub fn group_chat_id_of_conv(conv: &str) -> Option<String> {
+    let rest = conv.strip_prefix("feishu:")?;
+    let id = rest.split(':').next().unwrap_or(rest);
+    (!id.is_empty() && id.starts_with("oc_")).then(|| id.to_string())
+}
+
+/// 「获取会话历史消息」（GET `/im/v1/messages`，container_id_type=chat）返回的
+/// 单条消息解析产物（`parse_group_context_items` 提取后交
+/// [`render_group_context_block`] 转录）。字段按飞书文档公开形态建模，
+/// **待真机校准**（宽容提取：类型名 message_type/msg_type 两名、时间戳字符串/
+/// 数字/秒级归一等都兼容，手法同 [`MergedForwardItem`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupContextItem {
+    /// 发送者标识（user_id_type=open_id 请求下为 open_id；app 消息为 app 标识）。
+    pub sender_id: String,
+    /// 发送者显示名（API 可缺省——缺失时转录用 id 后 8 位，见
+    /// [`merge_forward_sender_label`]）。
+    pub sender_name: Option<String>,
+    /// 是否 bot/app 发的消息（sender_type=app 或 sender.app_id 命中本应用）——
+    /// 转录时跳过：自身回复是 agent 输出回声，其它 bot 消息是自动化噪音。
+    pub from_bot: bool,
+    /// 消息类型（text/post/image/…，映射见 [`message_body_of`]）。
+    pub message_type: String,
+    /// 消息 content（JSON 字符串，形态同普通消息：`{"text":"…"}` 等）。
+    pub content: String,
+    /// 创建时间（毫秒 epoch；0 = 缺失/非法）。
+    pub create_time_ms: i64,
+}
+
+/// 解析「获取会话历史消息」响应的 `data.items`（纯函数，mock JSON 可测）。
+/// 宽容姿态（同 [`MergedForwardItem`] 的提取取舍）：非对象条目跳过、字段缺失给
+/// 默认值不丢整条；`own_app_id` 为本应用 app_id（drain 侧的构造入参，同事件
+/// header.app_id 来源）——`sender.sender_type == "app"` 或 `sender.app_id` 命中
+/// 即标 `from_bot`。信封 code 检查在 client 层（此处只管 data 提取）。
+pub fn parse_group_context_items(v: &serde_json::Value, own_app_id: &str) -> Vec<GroupContextItem> {
+    let items = v
+        .pointer("/data/items")
+        .and_then(|i| i.as_array())
+        .cloned()
+        .unwrap_or_default();
+    items
+        .iter()
+        .filter_map(|it| {
+            let obj = it.as_object()?;
+            let str_of = |k: &str| {
+                obj.get(k)
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let sender = obj.get("sender").and_then(|s| s.as_object());
+            let (sender_id, sender_name, from_bot) = match sender {
+                Some(s) => {
+                    let id = s
+                        .get("id")
+                        .and_then(|x| x.as_str())
+                        .or_else(|| s.get("open_id").and_then(|x| x.as_str()))
+                        .unwrap_or("")
+                        .to_string();
+                    let name = s
+                        .get("name")
+                        .and_then(|x| x.as_str())
+                        .map(str::trim)
+                        .filter(|n| !n.is_empty())
+                        .map(String::from);
+                    // bot 判定双保险：sender_type=app（含自身与其它应用）或
+                    // app_id 命中本应用（字段形态变化时任一命中即跳过）。
+                    let sender_type = s.get("sender_type").and_then(|x| x.as_str()).unwrap_or("");
+                    let app_id = s.get("app_id").and_then(|x| x.as_str()).unwrap_or("");
+                    let from_bot =
+                        sender_type == "app" || (!app_id.is_empty() && app_id == own_app_id);
+                    (id, name, from_bot)
+                }
+                None => (String::new(), None, false),
+            };
+            Some(GroupContextItem {
+                sender_id,
+                sender_name,
+                from_bot,
+                message_type: obj
+                    .get("message_type")
+                    .and_then(|x| x.as_str())
+                    .or_else(|| obj.get("msg_type").and_then(|x| x.as_str()))
+                    .unwrap_or("")
+                    .to_string(),
+                content: str_of("content"),
+                create_time_ms: create_time_ms_of(obj.get("create_time")),
+            })
+        })
+        .collect()
+}
+
+/// 群上下文注入块的总长上限（**字符**而非字节——CJK 安全，对齐引用/合并转发
+/// 转录的 1500 档）：群历史是背景信息，超长会挤占本轮 prompt 预算。
+pub const GROUP_CONTEXT_MAX_CHARS: usize = 1_500;
+/// 单条消息正文的截断长度（字符）——群聊消息绝大多数在此之内，超长的粘贴
+/// 内容截断保头。
+const GROUP_CONTEXT_LINE_MAX_CHARS: usize = 200;
+/// 截断标注行「（已截断，共 N 条中前 M 条）」的保守预留（n ≤ 50 时最长约
+/// 22 字符，取 24）：行累计预算预先扣掉，保证标注 + 尾注后总长仍 ≤ 上限。
+const GROUP_CONTEXT_TRUNC_NOTE_RESERVE: usize = 24;
+
+/// 把群历史条目转录为前置注入块（纯函数，验收核心）：
+///
+/// ```text
+/// 【群最近上下文（3 条，最新在最后）】
+/// Alice: 上一条讨论
+/// ou_xxx 后 8 位: [图片]
+/// Bob: 最新这条
+///
+/// （以下是用户本轮消息）
+/// ```
+///
+/// - 跳过 `from_bot` 条目（agent 输出回声/自动化噪音）；全部被跳过 → None（不注入）；
+/// - 按时间**正序**排列（API 以 ByCreateTimeDesc 拉回最新 N 条，此处稳定升序
+///   ——最新在最后，读感同聊天记录）；时间缺失（0）按原相对序沉底；
+/// - 每条 `{发送者名或 id 后 8 位}: {正文截 200 字}`（类型映射与合并转发转录
+///   共用 [`message_body_of`]：text/post 取文字，媒体给 `[图片]` 式占位）；
+/// - 总长（含尾注）≤ [`GROUP_CONTEXT_MAX_CHARS`]：逐行累计预算，超限停止并
+///   标注「（已截断，共 N 条中前 M 条）」；尾注「（以下是用户本轮消息）」恒保留。
+pub fn render_group_context_block(items: &[GroupContextItem]) -> Option<String> {
+    // 尾注恒保留：正文（头 + 行 + 截断标注）的总预算 = 上限 - 尾注长。
+    let tail = "\n\n（以下是用户本轮消息）";
+    let budget = GROUP_CONTEXT_MAX_CHARS - tail.chars().count();
+    let mut kept: Vec<&GroupContextItem> = items.iter().filter(|it| !it.from_bot).collect();
+    kept.sort_by_key(|it| it.create_time_ms);
+    if kept.is_empty() {
+        return None;
+    }
+    let n = kept.len();
+    let mut out = format!("【群最近上下文（{n} 条，最新在最后）】");
+    let mut used = out.chars().count();
+    let mut included = 0usize;
+    let mut truncated = false;
+    for it in kept {
+        let sender = merge_forward_sender_label(&it.sender_name, &it.sender_id);
+        let body: String = message_body_of(&it.message_type, &it.content)
+            .chars()
+            .take(GROUP_CONTEXT_LINE_MAX_CHARS)
+            .collect();
+        let line = format!("\n{sender}: {body}");
+        let ll = line.chars().count();
+        if used + ll > budget.saturating_sub(GROUP_CONTEXT_TRUNC_NOTE_RESERVE) {
+            // 首条就超限也硬截保留一条（空转录对 agent 无信息量）；按字符边界截。
+            if included == 0 {
+                let room = budget
+                    .saturating_sub(used + GROUP_CONTEXT_TRUNC_NOTE_RESERVE + 1)
+                    .min(ll.saturating_sub(1));
+                out.push('\n');
+                out.push_str(&line[1..].chars().take(room).collect::<String>());
+                included = 1;
+            }
+            truncated = true;
+            break;
+        }
+        out.push_str(&line);
+        used += ll;
+        included += 1;
+    }
+    if truncated {
+        out.push_str(&format!("\n（已截断，共 {n} 条中前 {included} 条）"));
+    }
+    // 防御性硬截（预算预留足够时通常不触发）：保证总长恒 ≤ 上限。
+    let body: String = out.chars().take(budget).collect();
+    Some(format!("{body}{tail}"))
+}
+
+/// create_time 宽容解析：字符串 / 数字皆可；秒级值（0 < ts < 1e11，毫秒形态最早
+/// 1973 年）自动 ×1000 归一毫秒——飞书各 API 时间戳单位不统一，按量级判别。
+/// **待真机校准**：真机确认恒为毫秒后可去掉归一。
+///（自 client.rs 移入——合并转发子消息与群历史消息两处共用同一语义。）
+pub(crate) fn create_time_ms_of(v: Option<&serde_json::Value>) -> i64 {
+    let raw = v
+        .and_then(|x| {
+            x.as_i64()
+                .or_else(|| x.as_str().and_then(|s| s.parse::<i64>().ok()))
+        })
+        .unwrap_or(0);
+    if raw > 0 && raw < 100_000_000_000 {
+        raw * 1000
+    } else {
+        raw
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4086,6 +4282,202 @@ mod tests {
         assert!(
             parse_message_event(&txt, &policy, None).is_none(),
             "非命令群消息仍须 @"
+        );
+    }
+
+    // ---------- T10：群聊上下文注入（mock JSON → 解析/转录纯函数） ----------
+
+    /// create_time 量级归一（自 client.rs 随函数移入）：秒级 ×1000，毫秒原样，
+    /// 非法/缺省 0。合并转发子消息与 T10 群历史消息共用。
+    #[test]
+    fn create_time_ms_of_normalization() {
+        assert_eq!(
+            create_time_ms_of(Some(&serde_json::json!(1787912340))),
+            1_787_912_340_000,
+            "秒级归一毫秒"
+        );
+        assert_eq!(
+            create_time_ms_of(Some(&serde_json::json!("1787912345678"))),
+            1_787_912_345_678,
+            "毫秒字符串原样"
+        );
+        assert_eq!(
+            create_time_ms_of(Some(&serde_json::json!(0))),
+            0,
+            "0 保持（缺失语义）"
+        );
+        assert_eq!(
+            create_time_ms_of(Some(&serde_json::json!("abc"))),
+            0,
+            "非法字符串 → 0"
+        );
+        assert_eq!(create_time_ms_of(None), 0, "缺省 → 0");
+    }
+
+    /// 构造群历史条目（转录测试用）。
+    fn gc_item(
+        sender: &str,
+        name: Option<&str>,
+        from_bot: bool,
+        mt: &str,
+        content: &str,
+        ms: i64,
+    ) -> GroupContextItem {
+        GroupContextItem {
+            sender_id: sender.to_string(),
+            sender_name: name.map(String::from),
+            from_bot,
+            message_type: mt.to_string(),
+            content: content.to_string(),
+            create_time_ms: ms,
+        }
+    }
+
+    /// conv → 群 chat_id：普通群/话题群命中；私聊、评论 conv、非法前缀不注入。
+    #[test]
+    fn group_chat_id_of_conv_variants() {
+        assert_eq!(
+            group_chat_id_of_conv("feishu:oc_g"),
+            Some("oc_g".to_string()),
+            "普通群"
+        );
+        assert_eq!(
+            group_chat_id_of_conv("feishu:oc_g:om_root"),
+            Some("oc_g".to_string()),
+            "话题群取首段（与免 @ 窗口同语义，无需特判）"
+        );
+        assert_eq!(group_chat_id_of_conv("feishu:ou_u"), None, "私聊不注入");
+        assert_eq!(
+            group_chat_id_of_conv("feishu:comment:doxcnXYZ"),
+            None,
+            "评论 conv 不注入"
+        );
+        assert_eq!(group_chat_id_of_conv("wecom:oc_g"), None, "跨平台串号");
+        assert_eq!(group_chat_id_of_conv("feishu:"), None, "空 id");
+    }
+
+    /// 「获取会话历史消息」响应 JSON → 条目：字段宽容提取（类型两名/时间秒归一/
+    /// sender name）、bot 双判定（sender_type=app 或 app_id 命中本应用）。
+    #[test]
+    fn parse_group_context_items_tolerant_and_bot_detection() {
+        let body = serde_json::json!({
+            "code": 0,
+            "data": { "items": [
+                {
+                    "message_id": "om_1", "msg_type": "text", "create_time": "1788000001",
+                    "sender": { "id": "ou_alice", "id_type": "open_id", "sender_type": "user", "name": "Alice" },
+                    "content": "{\"text\":\"早上好\"}"
+                },
+                {
+                    "message_id": "om_2", "message_type": "post", "create_time": "1788000002000",
+                    "sender": { "id": "ou_bob", "id_type": "open_id", "sender_type": "app" },
+                    "content": "{}"
+                },
+                {
+                    "message_id": "om_3", "msg_type": "text", "create_time": "1788000003",
+                    "sender": { "id": "ou_x", "id_type": "open_id", "sender_type": "user", "app_id": "cli_self" },
+                    "content": "{}"
+                },
+                "not-an-object"
+            ]}
+        });
+        let items = parse_group_context_items(&body, "cli_self");
+        assert_eq!(items.len(), 3, "非对象条目跳过: {items:?}");
+        // 字段提取 + 秒级时间归一毫秒。
+        assert_eq!(items[0].sender_name.as_deref(), Some("Alice"));
+        assert_eq!(items[0].message_type, "text");
+        assert_eq!(items[0].create_time_ms, 1_788_000_001_000);
+        // message_type/msg_type 两名兼容 + 数字毫秒原样。
+        assert_eq!(items[1].message_type, "post");
+        assert_eq!(items[1].create_time_ms, 1_788_000_002_000);
+        // bot 双判定：sender_type=app（其它应用）与 app_id 命中本应用都算。
+        assert!(items[1].from_bot, "sender_type=app 应标 bot");
+        assert!(items[2].from_bot, "app_id 命中本应用应标 bot");
+        assert!(!items[0].from_bot);
+        // data.items 缺失（异常信封）→ 空（不 panic）。
+        assert!(parse_group_context_items(&serde_json::json!({}), "cli_self").is_empty());
+    }
+
+    /// 转录块：跳过 bot、时间正序（最新在最后）、名字/短 id 标注、类型占位、
+    /// 头尾格式、全 bot/空 → None。
+    #[test]
+    fn render_group_context_block_orders_filters_and_formats() {
+        // 输入按 API 返回序（desc：最新在前），渲染应翻成正序。
+        let items = vec![
+            gc_item(
+                "ou_b0c072f42e7c1b09",
+                None,
+                false,
+                "text",
+                &serde_json::to_string(&serde_json::json!({"text": "最新这条"})).unwrap(),
+                3000,
+            ),
+            gc_item(
+                "ou_bot",
+                Some("agent"),
+                true,
+                "text",
+                &serde_json::to_string(&serde_json::json!({"text": "bot 回声"})).unwrap(),
+                2000,
+            ),
+            gc_item("ou_alice", Some("Alice"), false, "image", "{}", 1000),
+        ];
+        let block = render_group_context_block(&items).expect("应有块");
+        assert!(
+            block.starts_with("【群最近上下文（2 条，最新在最后）】"),
+            "{block}"
+        );
+        assert!(!block.contains("bot 回声"), "bot 条目应跳过: {block}");
+        assert!(!block.contains("agent"), "bot 名字不应出现: {block}");
+        // 正序：早（Alice [图片]）在前、晚（bob 短 id 文本）在后。
+        let img = block.find("Alice: [图片]").expect("图片占位 + 名字标注");
+        let latest = block
+            .find("2e7c1b09: 最新这条")
+            .expect("缺名回退 id 后 8 位");
+        assert!(img < latest, "最新在最后: {block}");
+        // 尾注在块尾。
+        assert!(block.ends_with("（以下是用户本轮消息）"), "{block}");
+        // 单条正文截 200 字。
+        let long: String = "长".repeat(300);
+        let items = vec![gc_item(
+            "ou_l",
+            None,
+            false,
+            "text",
+            &serde_json::to_string(&serde_json::json!({"text": long})).unwrap(),
+            1,
+        )];
+        let block = render_group_context_block(&items).expect("应有块");
+        let body_len = block.lines().nth(1).map(|l| l.chars().count()).unwrap_or(0);
+        assert!(
+            body_len <= "ou_l".len() + 2 + GROUP_CONTEXT_LINE_MAX_CHARS,
+            "单条截 200 字: {block}"
+        );
+        // 空 / 全 bot → None（不注入）。
+        assert!(render_group_context_block(&[]).is_none());
+        let all_bot = vec![gc_item("ou_bot", None, true, "text", "{}", 1)];
+        assert!(render_group_context_block(&all_bot).is_none());
+    }
+
+    /// 总长预算：多条超长消息累计超 1500 字符 → 截断标注 + 尾注保留 + 总长恒
+    /// ≤ 上限（chars，CJK 安全）。
+    #[test]
+    fn render_group_context_block_respects_total_budget() {
+        let long: String = "话".repeat(GROUP_CONTEXT_LINE_MAX_CHARS);
+        let content = serde_json::to_string(&serde_json::json!({ "text": long })).unwrap();
+        let items: Vec<GroupContextItem> = (0..20)
+            .map(|i| gc_item(&format!("ou_{i}"), None, false, "text", &content, i + 1))
+            .collect();
+        let block = render_group_context_block(&items).expect("应有块");
+        assert!(
+            block.chars().count() <= GROUP_CONTEXT_MAX_CHARS,
+            "总长 ≤ 上限: {}",
+            block.chars().count()
+        );
+        assert!(block.contains("（已截断，共 20 条中前"), "{block}");
+        assert!(
+            block.ends_with("（以下是用户本轮消息）"),
+            "尾注恒保留: {block}"
         );
     }
 }

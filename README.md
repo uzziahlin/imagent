@@ -42,7 +42,7 @@ imagent 是一个常驻网关进程：监听 IM 私聊 / 群聊消息 → 鉴权
 - 💭 **thinking / 任务清单**：思考过程与正文分离透出（卡片折叠区展示，cot 档位控制）；Claude Code 的 Task* / ACP Plan 渲染成卡片 checklist 进度。
 - 🎤 **语音输入（飞书）**：语音条自动转文字进 prompt（speech_to_text，需后台申请语音识别权限）。
 - 🛠️ **IM 内运维**：`/status` `/doctor` `/reconnect` `/config`（COT 三档展示 off/brief/detailed 等热改；SIGHUP 热载工具白名单/审批集/管理员名单/压缩阈值）。
-- 📄 **飞书生态**（一等公民）：CardKit 真流式卡片（分阶段 footer + 工具 ⏳/✅ 实时行 + ⏹ 终止按钮）、审批/问题/命令标题卡（按钮 primary/danger + flow 自适应布局）、`/config` 下拉表单卡、邮箱掩码防租户审计拦截、云文档评论 @bot 触发（同评论线程回复）、合并转发聊天记录自动转录、**群里回复 bot 消息发图/文件 = 显式定向**（豁免 @，手机端纯图片可达）。
+- 📄 **飞书生态**（一等公民）：CardKit 真流式卡片（分阶段 footer + 工具 ⏳/✅ 实时行 + ⏹ 终止按钮）、审批/问题/命令标题卡（按钮 primary/danger + flow 自适应布局）、`/config` 下拉表单卡、邮箱掩码防租户审计拦截、云文档评论 @bot 触发（同评论线程回复）、合并转发聊天记录自动转录、**群聊上下文注入**（群消息触发轮次自动拉本群最近 N 条消息作前置上下文——Slack 线程上下文的飞书等价物，`feishu_group_context_messages`，默认 10、0=关闭）、**群里回复 bot 消息发图/文件 = 显式定向**（豁免 @，手机端纯图片可达）。
 - 💻 **终端 agent 反向接入（ask_via_im）**：电脑终端上任意 agent 需要你决策时，把问题转发到飞书——人不在电脑前也能在手机上点按钮作答；多 agent 并发按 request_id 精确分发（见[终端 agent 接入](#终端-agent-接入ask_via-im人不在电脑前也能问你)）。
 - 🧩 **Profile 多实例**：`--profile` 一部署多 bot 身份（config/db/socket/媒体全隔离）。
 - 🛡️ **限流熔断**：`sendmessage` 服从式退避（防封号，不绕风控）。
@@ -210,7 +210,7 @@ imagent start            # 前台常驻，Ctrl-C 退出
 
 **③ 开通权限**：「权限管理」开通并**发布**：
 
-- `im:message`（读取与发送单聊、群聊消息）——必须。合并转发聊天记录转录（自动拉子消息转成文本给 agent 阅读）依赖同一读权限调「查询合并转发消息列表」接口——真机确认：若拉取报权限错误，需在后台补开对应的 im:message 读权限并发布版本；
+- `im:message`（读取与发送单聊、群聊消息）——必须。合并转发聊天记录转录（自动拉子消息转成文本给 agent 阅读）与群聊上下文注入（拉本群最近 N 条消息作前置上下文，`feishu_group_context_messages`）**复用同一读权限**（分别调「查询合并转发消息列表」「获取会话历史消息」接口，拉不到自动跳过不阻塞轮次）——真机确认：若拉取报权限错误，需在后台补开对应的 im:message 读权限并发布版本；
 - `im:message.group_at_msg`（仅收 @机器人 的群消息；要全收群消息改用 `group_msg` 并把 config 的 `feishu_require_mention_in_group` 设为 `false`）；
 - `cardkit:card:write`（CardKit 流式卡片）——可选，缺省自动降级整卡刷新；
 - `drive:comment`（云文档评论）——可选，配合上表评论事件。

@@ -1166,10 +1166,11 @@ async fn build_platform(
                 config.feishu_thread_active_window_secs,
                 config.feishu_asr_enabled,
                 // v1.21：发送侧 outbox 持久化重试 + per-conv 令牌桶；
-                // v1.24：审批卡到达即加急。
+                // v1.24：审批卡到达即加急；T10：群聊上下文注入条数。
                 Some(store.clone()),
                 config.feishu_send_rps,
                 config.feishu_urgent_on_ask,
+                config.feishu_group_context_messages,
             )?))
         }
         _ => {
