@@ -318,7 +318,8 @@ secret 轮换 / 环境变量变化后：重新 `export` + `imagent service insta
 | `/cron add <分 时 日 月 周> <指令>` | 定时任务（本地时区含 DST；`*`/`*/n`/范围/列表，`/cron add */10 * * * * 检查构建`） |
 | `/cron list` `/cron rm <id>` | 列出（含已停用）/ 删除定时任务（限创建者或管理员；每会话上限 20 条） |
 | `/config [k v]` | 查看 / 热改配置（cot_detail / batch_window_ms / agent_idle_timeout_secs / require_mention / reply_mode，管理员）；`/config cot <off\|brief\|detailed\|default>` 为**本会话** COT 偏好（白名单可用，免 admin） |
-| `/status` `/doctor` `/reconnect` | 运行状态（含上下文水位与阈值距离）/ 自检 / 强制平台重连 |
+| `/status` `/doctor` `/reconnect` | 运行状态（含上下文水位与阈值距离）/ 自检（平台权限 + 安全维度）/ 强制平台重连 |
+| `/tasks` | 本会话在飞轮次的实时进度（checklist + 工具统计）——纯文本平台/不想翻卡片场景的进度入口 |
 | `/allow <id\|@名字>` `/disallow` | 授权 / 撤销 sender（飞书群内可直接 @ 对方，管理员门槛） |
 | `/admin [list\|add\|remove]` | 管理员动态管理（首位设立自动带操作者，防自锁；SIGHUP 同步 config 变更） |
 | `/chat allow\|deny\|allow-all\|list` | 会话（群）白名单；`allow-all` 批量放行 bot 已加入的全部群 |
