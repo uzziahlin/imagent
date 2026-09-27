@@ -605,6 +605,13 @@ pub struct Dispatcher {
     /// /compact 自动轮在轮次收尾后触发，届时已清除（锚定回退 None，宁漏拒
     /// 不误拒）。socket/hook 侧注册 pending 时据此锚定发起者。
     round_initiators: RoundInitiators,
+    /// T4（P1-3）：「allowed_tools 非全量 × 后端不支持逐工具白名单」告警的
+    /// 去重状态——最近一次评估时的工具清单签名（同签名不重复 warn，配置
+    /// 变更后再进入告警态重新告警）。见 [`Self::capability_surface_warnings`]。
+    allowlist_warn_state: parking_lot::Mutex<Option<Vec<String>>>,
+    /// T4（P3-3）：「permission_mode = allow/deny × 非 FullLoop」告警的去重
+    /// 状态——最近一次评估时的档位签名。语义同 [`Self::allowlist_warn_state`]。
+    perm_mode_warn_state: parking_lot::Mutex<Option<PermissionMode>>,
 }
 
 /// P2（code-review v13）：全局在飞轮数闸门。`limit` = 配置上限（0 = 不限制，
@@ -626,6 +633,53 @@ impl RoundGate {
 
 /// per-conv 轮次发起者表（conv_id → sender id）。
 type RoundInitiators = Arc<Mutex<HashMap<String, String>>>;
+
+/// T4（P1-3）：「allowed_tools 在该后端不生效」的告警/回执文案（None = 该
+/// 组合无需提示）。warn 与展示共用同一份事实文案，避免两处口径漂移。
+pub(crate) fn allowlist_divergence_notice(
+    tools: &[String],
+    backend_name: &str,
+    supports_allowlist: bool,
+) -> Option<String> {
+    if !crate::backend::tool_allowlist_diverges(tools, supports_allowlist) {
+        return None;
+    }
+    Some(format!(
+        "allowed_tools = {tools:?} 在后端 {backend_name} 不按逐工具白名单生效：\
+         当前后端不支持 allowed_tools 收敛，工具面实际由{}决定，参见 SECURITY.md「已知限制」",
+        tool_boundary_mechanism(backend_name)
+    ))
+}
+
+/// T4（P3-3）：「permission_mode = allow/deny 在该后端无执行点」的告警/回执
+/// 文案（None = 该组合无需提示）。
+pub(crate) fn perm_mode_dead_notice(
+    mode: PermissionMode,
+    backend_name: &str,
+    capability: crate::backend::PermissionCapability,
+) -> Option<String> {
+    if !crate::backend::perm_mode_lacks_execution(mode, capability) {
+        return None;
+    }
+    Some(format!(
+        "permission_mode = \"{}\" 在后端 {backend_name}（{}）无执行点（无审批回调），\
+         实际边界 = allowed_tools / 后端沙箱",
+        mode.as_str(),
+        capability.as_str()
+    ))
+}
+
+/// T4：不支持逐工具白名单的后端，工具面实际由什么决定（告警文案用）。按
+/// backend name 描述已知后端的机制；未知后端给通用描述（能力位才是判定
+/// 事实，此处仅文案）。
+fn tool_boundary_mechanism(backend_name: &str) -> &'static str {
+    match backend_name {
+        "claude-acp" => "claude 自身工具策略 + IM 权限审批（ACP 协议无 --allowedTools 等价机制）",
+        "codex" => "codex 沙箱档位（-s read-only/workspace-write，allowed_tools 仅粗粒度收敛）",
+        "gemini" => "gemini --approval-mode + sandbox（allowed_tools 仅粗粒度收敛）",
+        _ => "后端自身的工具策略/沙箱机制",
+    }
+}
 
 impl Dispatcher {
     #[allow(clippy::too_many_arguments)]
@@ -730,6 +784,8 @@ impl Dispatcher {
             socket_spawned: std::sync::atomic::AtomicBool::new(false),
             round_gate: parking_lot::RwLock::new(RoundGate::new(budgets.max_concurrent_rounds)),
             round_initiators: Arc::new(Mutex::new(HashMap::new())),
+            allowlist_warn_state: parking_lot::Mutex::new(None),
+            perm_mode_warn_state: parking_lot::Mutex::new(None),
         };
         // S2：admin_senders 为空 = 无人是管理员，IM 内管理命令全部不可用——
         // 构造即显著提示（防用户以为白名单用户仍可 /allow）。
@@ -928,8 +984,64 @@ impl Dispatcher {
         );
     }
 
-    pub fn reload_tools(&self, tools: Vec<String>) {
+    /// SIGHUP 热重载：整体替换 allowed_tools。
+    ///
+    /// T4（P1-3）：替换后重评能力面告警（返回本次实际发出的告警文案，空 =
+    /// 无新告警；调用方可忽略——main 不用，测试/排障可观测）。
+    pub fn reload_tools(&self, tools: Vec<String>) -> Vec<String> {
         *self.allowed_tools.write() = tools;
+        self.capability_surface_warnings()
+    }
+
+    /// T4（P1-3/P3-3）：能力面矩阵告警——启动（run）/ SIGHUP 热载
+    /// （[`Self::reload_tools`] / [`Self::reload_permission_mode`]）/ `/perm`
+    /// 热切三个点位共用。覆盖两个反向缝隙（fail-closed 只堵了「闭环档 ×
+    /// 非 FullLoop」一个象限）：
+    /// 1. **P1-3**：allowed_tools 非全量白名单 × 后端不支持逐工具白名单——
+    ///    用户配置的工具边界静默失效（acp 完全不生效；codex/gemini 仅粗粒度
+    ///    映射到 sandbox/approval-mode）；
+    /// 2. **P3-3**：permission_mode = allow/deny × 非 FullLoop——该档位的执行
+    ///    位置在审批回调的固定答复，无回调后端上等于空操作，实际边界 =
+    ///    allowed_tools / 后端沙箱。
+    ///
+    /// 去重：同一状态签名只 warn 一次；配置变更（签名变化）后再进入告警态
+    /// 重新告警（SIGHUP 无变化时不刷屏）。返回本次实际发出的告警文案
+    /// （空 = 无新告警；测试断言用）。
+    pub(crate) fn capability_surface_warnings(&self) -> Vec<String> {
+        let mut emitted = Vec::new();
+        // 维度一（P1-3）：工具白名单 × 后端能力位。
+        let tools = self.allowed_tools.read().clone();
+        if let Some(notice) = allowlist_divergence_notice(
+            &tools,
+            self.backend.name(),
+            self.backend.supports_tool_allowlist(),
+        ) {
+            let mut st = self.allowlist_warn_state.lock();
+            if st.as_ref() != Some(&tools) {
+                warn!(target: "imagent::core", backend = self.backend.name(), "{notice}");
+                emitted.push(notice);
+            }
+            *st = Some(tools);
+        } else {
+            *self.allowlist_warn_state.lock() = None;
+        }
+        // 维度二（P3-3）：allow/deny 档位 × 非 FullLoop 能力。
+        let mode = *self.permission_mode.read();
+        if let Some(notice) = perm_mode_dead_notice(
+            mode,
+            self.backend.name(),
+            self.backend.permission_capability(),
+        ) {
+            let mut st = self.perm_mode_warn_state.lock();
+            if *st != Some(mode) {
+                warn!(target: "imagent::core", backend = self.backend.name(), "{notice}");
+                emitted.push(notice);
+            }
+            *st = Some(mode);
+        } else {
+            *self.perm_mode_warn_state.lock() = None;
+        }
+        emitted
     }
 
     /// SIGHUP 热重载：更新 permission_mode（与 ClaudeBackend 共享同一句柄时
@@ -976,6 +1088,9 @@ impl Dispatcher {
             )));
         }
         *self.permission_mode.write() = mode;
+        // T4（P3-3）：热切后重评能力面告警（allow/deny × 非 FullLoop 无执行点；
+        // 去重防 SIGHUP 重复刷屏）。/perm 回执另行带同一文案（用户即时可见）。
+        let _ = self.capability_surface_warnings();
         Ok(())
     }
 
@@ -1299,6 +1414,7 @@ impl Dispatcher {
             permission_mode = mode.as_str(),
             capability = cap.as_str(),
             native_passthrough = self.backend.supports_native_permission_mode(),
+            tool_allowlist = self.backend.supports_tool_allowlist(),
             "权限能力矩阵"
         );
         // B3（fail-closed）：闭环类档位（Ask / auto-claude）要求 backend 支持
@@ -1313,6 +1429,10 @@ impl Dispatcher {
                 cap.as_str()
             )));
         }
+        // T4（P1-3/P3-3）：能力面矩阵告警（allowed_tools × 白名单能力 /
+        // allow|deny × 非 FullLoop）。置于 fail-closed 拒绝之后——ask 档位由
+        // 上方启动校验直接拒绝，不进告警面。
+        let _ = self.capability_surface_warnings();
         // B3：把 IM 审批闭环回调注入 backend（与 claude-cli 的 MCP→socket 闭环
         // 同一条 PermissionRouter 通道；ACP 的 session/request_permission 走此）。
         let hook = self.build_im_permission_hook();

@@ -868,6 +868,13 @@ impl Backend for AcpBackend {
         PermissionCapability::FullLoop
     }
 
+    /// T4（P1-3）：ACP 协议（session/new）无 `--allowedTools` 等价的工具白名单
+    /// 字段——allowed_tools 在本后端不生效（run 开头的 debug log 说明依赖
+    /// cwd 锁定 + 权限审批收敛），core 据此能力位在启动/SIGHUP//perm 告警。
+    fn supports_tool_allowlist(&self) -> bool {
+        false
+    }
+
     /// B3：dispatcher `run()` 启动时注入 IM 审批闭环回调（新连接 spawn 时读取）。
     fn set_im_permission_hook(&self, hook: Option<ImPermissionHook>) {
         *self.hook.write() = hook;
@@ -1467,6 +1474,14 @@ mod tests {
             AcpBackend::new().permission_capability(),
             PermissionCapability::FullLoop
         );
+    }
+
+    #[test]
+    fn tool_allowlist_is_unsupported() {
+        // T4（P1-3）：ACP 协议无 --allowedTools 等价机制——如实声明 false，
+        // core 据此对「allowed_tools 非全量」配置告警（P1-3：两个 FullLoop
+        // 后端间安全配置静默分叉的裂缝）。
+        assert!(!AcpBackend::new().supports_tool_allowlist());
     }
 
     #[test]

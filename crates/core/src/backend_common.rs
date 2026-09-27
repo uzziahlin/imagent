@@ -6,6 +6,7 @@
 //! 保持不变（各自 `ParsedEvent`），由 backend 的适配闭包映射到统一的 [`CliEvent`]。
 
 use std::process::Stdio;
+use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -655,7 +656,14 @@ pub async fn spawn_cli_backend(
     let mut group_guard = child.id().map(GroupKillGuard::new);
 
     // 并发读 stderr，避免子进程 stderr 写满管道缓冲（~64KB）导致死锁。
-    let stderr_handle = tokio::spawn(async move { read_stderr_to_string(stderr).await });
+    // P2-9：读到共享缓冲（逐行增量，见 read_stderr_into）——正常路径 join 后
+    // 取全文；join 超时放弃时仍能从 sink 取已读快照作告警的截断头部。
+    let stderr_sink: Arc<parking_lot::Mutex<String>> =
+        Arc::new(parking_lot::Mutex::new(String::new()));
+    let stderr_sink_reader = stderr_sink.clone();
+    let mut stderr_handle = tokio::spawn(async move {
+        read_stderr_into(stderr, &stderr_sink_reader).await;
+    });
 
     let mut reader = BufReader::new(stdout);
     let mut session_id = String::new();
@@ -1059,7 +1067,26 @@ pub async fn spawn_cli_backend(
     if let Some(g) = group_guard.as_mut() {
         g.disarm();
     }
-    let stderr_msg = stderr_handle.await.unwrap_or_default();
+    // P2-9：正常完成路径的 stderr 收尾加超时——孙进程持管道写端时裸 join 会
+    // 永久挂起（run future 挂到空闲看门狗 + fd 泄漏；cancel/超时路径都有
+    // killpg 兜底，唯独 happy path 漏了）。超时放弃剩余 stderr（仅诊断信息），
+    // warn 一条带已读快照的截断头部后继续走收尾；abort 读取任务释放本侧读端
+    // fd（对端孙进程的后续 stderr 写将得到 EPIPE，不必陪等）。
+    if tokio::time::timeout(STDERR_DRAIN_TIMEOUT, &mut stderr_handle)
+        .await
+        .is_err()
+    {
+        stderr_handle.abort();
+        let head: String = stderr_sink.lock().chars().take(160).collect();
+        tracing::warn!(
+            target: "imagent::backend",
+            backend = backend_name,
+            head = %head,
+            timeout_secs = STDERR_DRAIN_TIMEOUT.as_secs(),
+            "stderr 收尾超时，放弃剩余 stderr 继续收尾（疑似孙进程持有 stderr 管道写端未重定向）"
+        );
+    }
+    let stderr_msg = std::mem::take(&mut *stderr_sink.lock());
 
     if let Some(t) = error_text {
         // 真机校准：claude resume 幽灵会话等场景产出 is_error 且 result 文本缺失
@@ -1151,11 +1178,36 @@ fn diagnose(
 ///
 /// 任一超限后继续 drain（不 break），防子进程 stderr 管道写满 ~64KB 阻塞子进程。
 /// B1：真实 IO 错误（非 InvalidInput 超长语义）warn 并终止读取（忙循环无意义）。
+///
+/// P2-9：读取循环本体在 [`read_stderr_into`]（共享 sink 增量写入）；本函数保留
+/// 原签名，读完取全文。
 pub async fn read_stderr_to_string(stderr: tokio::process::ChildStderr) -> String {
+    let sink: Arc<parking_lot::Mutex<String>> = Arc::new(parking_lot::Mutex::new(String::new()));
+    read_stderr_into(stderr, &sink).await;
+    let out = std::mem::take(&mut *sink.lock());
+    out
+}
+
+/// [`read_stderr_to_string`] 的共享 sink 变体：每接受一行即追加进 sink（P2-9：
+/// 读取任务超时被放弃/中止时，调用方仍能从 sink 取到已读部分作诊断快照）。
+/// 输出与逐行 `Vec::join("\n")` 逐字节一致（首元素前无分隔符）。
+pub async fn read_stderr_into(
+    stderr: tokio::process::ChildStderr,
+    sink: &Arc<parking_lot::Mutex<String>>,
+) {
     let mut reader = BufReader::new(stderr);
     let mut total = 0usize;
     let mut truncated = false;
-    let mut buf = Vec::new();
+    // join("\n") 语义的增量等价：首个元素前无分隔符，其后每个元素前置 "\n"。
+    let mut first = true;
+    fn push(sink: &Arc<parking_lot::Mutex<String>>, first: &mut bool, s: String) {
+        let mut g = sink.lock();
+        if !*first {
+            g.push('\n');
+        }
+        *first = false;
+        g.push_str(&s);
+    }
     loop {
         match read_line_capped(&mut reader, MAX_STDERR_LINE_BYTES).await {
             Ok(Some(line)) => {
@@ -1165,12 +1217,14 @@ pub async fn read_stderr_to_string(stderr: tokio::process::ChildStderr) -> Strin
                 total += line.len() + 1;
                 if total > MAX_STDERR_BYTES {
                     truncated = true;
-                    buf.push(format!(
-                        "…[stderr 截断：超过 {MAX_STDERR_BYTES} 字节上限，丢弃后续]"
-                    ));
+                    push(
+                        sink,
+                        &mut first,
+                        format!("…[stderr 截断：超过 {MAX_STDERR_BYTES} 字节上限，丢弃后续]"),
+                    );
                     continue;
                 }
-                buf.push(line);
+                push(sink, &mut first, line);
             }
             Ok(None) => break, // EOF
             Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
@@ -1179,9 +1233,11 @@ pub async fn read_stderr_to_string(stderr: tokio::process::ChildStderr) -> Strin
                 // 剩余（不累积），防 OOM。
                 if !truncated {
                     truncated = true;
-                    buf.push(format!(
-                        "…[stderr 单行超过 {MAX_STDERR_LINE_BYTES} 字节，截断并丢弃后续]"
-                    ));
+                    push(
+                        sink,
+                        &mut first,
+                        format!("…[stderr 单行超过 {MAX_STDERR_LINE_BYTES} 字节，截断并丢弃后续]"),
+                    );
                 }
             }
             Err(e) => {
@@ -1196,7 +1252,6 @@ pub async fn read_stderr_to_string(stderr: tokio::process::ChildStderr) -> Strin
             }
         }
     }
-    buf.join("\n")
 }
 
 /// stdout 单行字节上限（S-5）：防 agent 输出无 `\n` 的超长行（如 base64 流）
@@ -1205,6 +1260,12 @@ const MAX_STDOUT_LINE_BYTES: usize = 8 * 1024 * 1024;
 
 /// stderr 累积字节上限（S-5）：长会话 stderr 膨胀，超限截断。
 const MAX_STDERR_BYTES: usize = 64 * 1024;
+
+/// P2-9：正常完成路径（wait 返回 Ok）的 stderr 收尾超时——agent 主进程退出但
+/// 其孙进程（如 Bash 里 `sleep 10000 &` 未重定向 stderr）持有 stderr 管道写端
+/// 时，裸 join 会挂到空闲看门狗（默认 20min）+ fd 泄漏（cancel/超时路径都有
+/// killpg 兜底，唯独 happy path 漏了）。超时即放弃剩余 stderr（仅诊断信息）。
+const STDERR_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// stderr 单行字节上限（S-5）：防 agent 向 stderr 写无 `\n` 的超长流（可被 prompt
 /// injection 构造）导致单行全量分配 OOM。与 stdout 的 [`MAX_STDOUT_LINE_BYTES`] 对称。
@@ -1330,6 +1391,43 @@ mod tests {
         assert!(
             err.to_string().contains("API key invalid"),
             "错误信息应含 error 事件内容: {err}"
+        );
+    }
+
+    /// P2-9：正常完成路径的 stderr 收尾超时——agent 主进程退出但其孙进程
+    /// （未重定向 stderr 的 `sleep 10 &` 继承管道写端）存活时，收尾的 stderr
+    /// join 须在 [`super::STDERR_DRAIN_TIMEOUT`]（5s）后放弃并继续走收尾。
+    /// 旧实现裸 `stderr_handle.await`：本场景挂到空闲看门狗（默认 20min）+
+    /// fd 泄漏（cancel/超时路径都有 killpg 兜底，唯独 happy path 漏了）——
+    /// 修复前本测试的外层 15s timeout 直接失败。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stderr_drain_times_out_when_grandchild_holds_pipe() {
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        // sh 写一行 stderr（进已读快照）+ 一行 Final（stdout）后立即退出；
+        // 后台 sleep 继承 stderr 写端并存活 10s > 5s 收尾超时。
+        cmd.arg("-c")
+            .arg("echo 'partial diagnostics' >&2; printf 'ok\\n'; sleep 10 &");
+        let (tx, _rx) = tokio::sync::mpsc::channel::<crate::types::AgentChunk>(64);
+        let parse = |line: &str| CliEvent::Final {
+            text: line.trim_end().to_string(),
+            session: None,
+            origin_kind: None,
+        };
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            spawn_cli_backend(cmd, parse, tx, "test-backend", &[], None, Vec::new(), None),
+        )
+        .await
+        .expect("收尾须在 15s 内完成（stderr 超时放弃后继续走收尾）")
+        .expect("run 应成功");
+        assert_eq!(outcome.final_text, "ok");
+        // 确实走了超时放弃路径（等满 5s），而非孙进程意外退出带来的快速 join。
+        assert!(
+            started.elapsed() >= super::STDERR_DRAIN_TIMEOUT,
+            "应等待到 stderr 收尾超时才返回: {:?}",
+            started.elapsed()
         );
     }
 

@@ -580,30 +580,11 @@ async fn main() -> Result<()> {
                 );
             }
 
-            // B3：闭环类档位（ask/auto-claude）×非 FullLoop 后端由 Dispatcher::run
-            // 启动校验 fail-closed 拒绝（此处不再重复 warn）；allow/deny 在非闭环
-            // 后端仅由 agent 自身 sandbox/approval-mode 兜底，保留显式 warn。
-            if perm_resolved.is_enabled() && matches!(config.agent.as_str(), "codex" | "gemini") {
-                tracing::warn!(
-                    target: "imagent::ops",
-                    agent = %config.agent,
-                    "后端不支持 IM 权限审批闭环，permission_mode 的 IM 侧决策不生效（仅靠 agent 自身 sandbox/approval-mode 兜底）；如需 IM approve/deny 请用 claude 系后端"
-                );
-            }
-
-            // S-1：ACP 后端不强制 allowed_tools（CLI 用 --allowedTools 收敛，ACP 无等价机制）。
-            // 用户配置 allowed_tools 期望工具白名单时需知晓：ACP 下工具收敛只能靠
-            // permission_mode=ask/deny 审批闭环兜底，否则 claude 可用其请求的任意工具。
-            let tools_expect_allowlist = !config.allowed_tools.is_empty()
-                && !imagent_core::backend_common::tools_unrestricted(&config.allowed_tools);
-            if config.agent.as_str() == "claude-acp" && tools_expect_allowlist {
-                tracing::warn!(
-                    target: "imagent::ops",
-                    agent = %config.agent,
-                    "claude-acp 后端不强制 allowed_tools（--allowedTools 在 ACP 无等价机制）；\
-                     工具收敛需依赖 permission_mode=ask/deny，否则 claude 可用其请求的任意工具"
-                );
-            }
+            // B3/T4：能力面矩阵告警统一收敛到 Dispatcher（run 启动 + SIGHUP +
+            // /perm 三点位，按 Backend 能力位判定而非后端名硬编码）：
+            // - 闭环档位（ask/auto-claude）×非 FullLoop：run() 启动 fail-closed 拒绝；
+            // - allow/deny ×非 FullLoop（无审批回调 = 无执行点）：capability_surface_warnings warn；
+            // - allowed_tools 非全量 × 后端不支持逐工具白名单（如 ACP）：同上。
 
             // 7. auth —— 白名单：config 种子 ∪ store 已有（CLI /allow 或 IM /allow 持久化）；
             //    会话（群）白名单同构（P4-5）。
