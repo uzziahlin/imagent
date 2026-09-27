@@ -3029,6 +3029,245 @@ async fn status_doctor_reconnect_reply() {
     drop_db(ctx.db).await;
 }
 
+// ---------- T8（v13 安全批）：/doctor 安全自检 ----------
+
+/// /doctor 端到端：「🛡️ 安全」分组六项检查接线可见。凭据维度用空表断言
+/// （确定性：不 put_credential——store 作为依赖编译时 cfg!(test) 不生效，
+/// macOS 真机会写 OS keychain；明文/加密/keyring 各态由 store 侧
+/// credential_forms 测试 + 下方纯函数测试覆盖）。
+#[tokio::test]
+async fn doctor_security_section_reports_risks() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    // 两个会话（无 workdir 覆盖 → 有效 workdir 均为 default）。
+    for conv in ["c1", "c2"] {
+        ctx.disp
+            .store
+            .upsert_session(&SessionRow {
+                first_prompt: None,
+                conv_id: conv.into(),
+                session_id: "s".into(),
+                agent_kind: "mock-backend".into(),
+                workdir: "/tmp/imagent-test-ws".into(),
+                name: None,
+                created_at: 1,
+                updated_at: 1,
+                task_todos: None,
+            })
+            .await
+            .unwrap();
+    }
+    // webhook 摘要：公网监听 + 条目无 secret（启动期应拒——出现即漂移，模拟注入）。
+    ctx.disp.set_webhook_exposure(crate::WebhookExposure {
+        listening: true,
+        loopback: false,
+        entry_secrets: vec![false],
+        any_replay_window: false,
+    });
+    ctx.disp.handle(msg("c1", "alice", "/doctor")).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    let doctor = inbox
+        .iter()
+        .rev()
+        .find(|t| t.contains("🛡️ 安全"))
+        .expect("应有安全分组: {inbox:?}");
+    // ① 凭据：空表 → ✅（查询接线证明；各形态文案见纯函数测试）。
+    assert!(
+        doctor.contains("✅ 凭据：无落库凭据"),
+        "空表应为无凭据行: {doctor}"
+    );
+    // ② webhook：非 loopback × 无 secret = 配置漂移兜底。
+    assert!(
+        doctor.contains("webhook 非 loopback 且有条目未配 secret"),
+        "应告警 webhook 漂移: {doctor}"
+    );
+    // ③ 共享工作区：两会话共享 default workdir。
+    assert!(
+        doctor.contains("2 个会话共享工作区 /tmp/imagent-test-ws"),
+        "应告警共享工作区: {doctor}"
+    );
+    // ④ 权限 × 能力：build() 的 tools = [Read, Edit] × Mock 不支持逐工具白名单。
+    assert!(
+        doctor.contains("不按逐工具白名单生效"),
+        "应告警能力错配: {doctor}"
+    );
+    // ⑤ 护栏：test_budgets 默认 max_concurrent_rounds=0 + 自动压缩关闭。
+    assert!(
+        doctor.contains("全局并发护栏未设上限"),
+        "应告警护栏无上限: {doctor}"
+    );
+    assert!(
+        doctor.contains("自动压缩未启用（v1.27 起默认关闭"),
+        "应有自动压缩信息行: {doctor}"
+    );
+    // ⑥ 体积信息行。
+    assert!(doctor.contains("ℹ️ 体积：DB"), "应有体积信息行: {doctor}");
+    drop_db(ctx.db).await;
+}
+
+/// 检查 ① 纯函数：凭据形态四态文案。
+#[test]
+fn doctor_credential_line_states() {
+    use super::commands::doctor_credential_line;
+    let f = |keyring, encrypted, plaintext, passphrase_set| imagent_store::CredentialForms {
+        keyring,
+        encrypted,
+        plaintext,
+        passphrase_set,
+    };
+    // 空表。
+    assert!(doctor_credential_line(&f(0, 0, 0, false)).contains("无落库凭据"));
+    // 明文 + 无 passphrase = ❌ + 补救指引。
+    let s = doctor_credential_line(&f(0, 0, 2, false));
+    assert!(
+        s.starts_with("❌") && s.contains("2 条") && s.contains("IMAGENT_PASSPHRASE"),
+        "{s}"
+    );
+    // 明文 + 已设 passphrase = ⚠️（惰性迁移提示）。
+    let s = doctor_credential_line(&f(0, 0, 1, true));
+    assert!(s.starts_with("⚠️") && s.contains("惰性迁移"), "{s}");
+    // keyring / 加密形态 = ✅（计数可见）。
+    let s = doctor_credential_line(&f(1, 2, 0, false));
+    assert!(
+        s.starts_with("✅") && s.contains("keyring 1") && s.contains("加密 2"),
+        "{s}"
+    );
+}
+
+/// 检查 ② 纯函数：webhook 暴露面四态（loopback 优先于 secret 缺配）。
+#[test]
+fn doctor_webhook_line_states() {
+    use super::commands::doctor_webhook_line;
+    let mk = |listening, loopback, secrets: &[bool], replay| crate::WebhookExposure {
+        listening,
+        loopback,
+        entry_secrets: secrets.to_vec(),
+        any_replay_window: replay,
+    };
+    assert!(doctor_webhook_line(&mk(false, false, &[], false)).contains("未启用"));
+    // loopback 且有条目缺 secret 仍 ✅（loopback 免 secret，口径同启动校验）。
+    assert!(doctor_webhook_line(&mk(true, true, &[false], false)).contains("loopback"));
+    // 非 loopback × 有条目缺 secret = ❌ 配置漂移。
+    let s = doctor_webhook_line(&mk(true, false, &[true, false], false));
+    assert!(s.starts_with("❌") && s.contains("配置漂移"), "{s}");
+    // 非 loopback × 全 secret = ⚠️ 重放防护（未配 replay_window 时给建议）。
+    let s = doctor_webhook_line(&mk(true, false, &[true], false));
+    assert!(
+        s.starts_with("⚠️") && s.contains("去重 LRU 恒开") && s.contains("replay_window_secs"),
+        "{s}"
+    );
+    // 已启用时间戳协议 → 不再给配置建议。
+    assert!(doctor_webhook_line(&mk(true, false, &[true], true)).contains("时间戳协议已启用"));
+}
+
+/// 检查 ③ 纯函数：共享工作区分组（覆盖键共享 / default 隐式共享 / 尾部斜杠
+/// 归一化 / 无共享）。
+#[test]
+fn doctor_shared_workdir_lines_grouping() {
+    use super::commands::doctor_shared_workdir_lines;
+    let default = std::path::Path::new("/tmp/imagent-test-ws");
+    // 覆盖键共享（"/tmp/shared-a" 与 "/tmp/shared-a/" 归一为同一路径）。
+    let overrides = vec![
+        ("workdir:c1".to_string(), "/tmp/shared-a".to_string()),
+        ("workdir:c2".to_string(), "/tmp/shared-a/".to_string()),
+    ];
+    let lines = doctor_shared_workdir_lines(&overrides, &[], default);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].contains("2 个会话共享工作区 /tmp/shared-a"),
+        "{}",
+        lines[0]
+    );
+    // 无覆盖的多会话 → 隐式共享 default_workdir（SECURITY.md「多用户共享
+    // default_workdir」风险入口）。
+    let lines = doctor_shared_workdir_lines(
+        &[],
+        &["c1".to_string(), "c2".to_string(), "c3".to_string()],
+        default,
+    );
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].contains("3 个会话共享工作区 /tmp/imagent-test-ws"),
+        "{}",
+        lines[0]
+    );
+    // 会话各有独立覆盖 → ✅ 无共享。
+    let overrides = vec![
+        ("workdir:c1".to_string(), "/tmp/w1".to_string()),
+        ("workdir:c2".to_string(), "/tmp/w2".to_string()),
+    ];
+    let lines =
+        doctor_shared_workdir_lines(&overrides, &["c1".to_string(), "c2".to_string()], default);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].starts_with("✅"), "{}", lines[0]);
+}
+
+/// 检查 ④ 纯函数：权限 × 能力矩阵（复用 T4 文案）。
+#[test]
+fn doctor_capability_lines_matrix() {
+    use super::commands::doctor_capability_lines;
+    use crate::PermissionCapability as PC;
+    // ① 工具白名单非全量 × 不支持逐工具白名单 → T4 P1-3 文案。
+    let lines = doctor_capability_lines(
+        &["Read".to_string()],
+        PermissionMode::Off,
+        "claude-acp",
+        false,
+        PC::FullLoop,
+    );
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("不按逐工具白名单生效"), "{}", lines[0]);
+    // ② allow 档 × 非 FullLoop → T4 P3-3 文案。
+    let lines = doctor_capability_lines(
+        &["*".to_string()],
+        PermissionMode::Allow,
+        "codex",
+        false,
+        PC::Unsupported,
+    );
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("无执行点"), "{}", lines[0]);
+    // 全匹配 → ✅。
+    let lines = doctor_capability_lines(
+        &["Read".to_string()],
+        PermissionMode::Ask,
+        "claude-cli",
+        true,
+        PC::FullLoop,
+    );
+    assert!(lines[0].starts_with("✅"), "{}", lines[0]);
+}
+
+/// 检查 ⑤⑥ 纯函数：护栏水位两档 + 体积行格式。
+#[test]
+fn doctor_guardrail_and_size_lines() {
+    use super::commands::{doctor_guardrail_lines, doctor_size_line};
+    // 0/0：护栏 ⚠️ + 自动压缩 ℹ️（v1.27 默认关，非风险项）。
+    let lines = doctor_guardrail_lines(0, 0);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines[0].starts_with("⚠️") && lines[0].contains("max_concurrent_rounds"),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines[1].starts_with("ℹ️") && lines[1].contains("v1.27"),
+        "{}",
+        lines[1]
+    );
+    // 设值：✅ ×2。
+    let lines = doctor_guardrail_lines(4, 120_000);
+    assert!(
+        lines[0].contains("4 轮上限") && lines[1].contains("120000 tok"),
+        "{lines:?}"
+    );
+    // 体积行格式（B 与 MB 档）。
+    assert_eq!(
+        doctor_size_line(512, 3 * 1024 * 1024),
+        "ℹ️ 体积：DB 512 B · 媒体 3.0 MB"
+    );
+}
+
 // ---------- T11（v13 #4）：/tasks 轮次进度面板 ----------
 
 /// /tasks：在飞轮次 → checklist 进度（▓ 进度条 + 逐项 ✅/⏳/◌）+ 工具统计；

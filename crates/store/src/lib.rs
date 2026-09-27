@@ -17,8 +17,8 @@ mod store;
 
 pub use error::{Result, StoreError};
 pub use store::{
-    AllowedSenderRow, AuditRow, CronJobRow, LiveCardRow, NamedSessionRow, OutboxRow, RunStatRow,
-    SessionHistoryRow, SessionRow, Store, OUTBOX_MAX_ATTEMPTS,
+    AllowedSenderRow, AuditRow, CredentialForms, CronJobRow, LiveCardRow, NamedSessionRow,
+    OutboxRow, RunStatRow, SessionHistoryRow, SessionRow, Store, OUTBOX_MAX_ATTEMPTS,
 };
 
 /// bundled SQLite 编译期版本（libsqlite3-sys 的 `SQLITE_VERSION` 常量）。

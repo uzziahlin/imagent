@@ -39,7 +39,7 @@ pub use config::{
     validate_workdir, Config, CotDetail, PermissionMode, QuietHours, ReplyMode, WebhookEntry,
 };
 pub use dedup::Dedup;
-pub use dispatch::{Dispatcher, TaskBudgets};
+pub use dispatch::{Dispatcher, TaskBudgets, WebhookExposure};
 pub use error::{CoreError, Result};
 pub use message::split_message;
 pub use metrics::Metrics;
