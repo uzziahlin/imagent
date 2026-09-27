@@ -617,6 +617,14 @@ fn msg(conv: &str, sender: &str, text: &str) -> InboundMessage {
 }
 
 async fn tmp_store() -> (Store, std::path::PathBuf) {
+    // 测试基建约定（v1.28 发布三连 flake 根因）：所有直连 Dispatcher::new 的
+    // 构造助手都用字面量 workdir "/tmp/imagent-test-ws"，而 run_round_inner
+    // 对 workdir 做 is_dir 预检（Wave B-10，与生产行为一致）——干净容器里
+    // 该目录是否被建取决于同 binary 其它测试的执行顺序，是「时有时无、
+    // 断言行号漂移」型 flake 的来源。每个构造助手都经本函数，在此统一
+    // 幂等创建，未来新助手自动覆盖（build_with_workdir 的自建逻辑保留，
+    // 自定义路径不受影响）。
+    let _ = std::fs::create_dir_all("/tmp/imagent-test-ws");
     let mut p = std::env::temp_dir();
     p.push(format!(
         "imagent_core_dispatch_{}_{}.sqlite",
