@@ -1,8 +1,17 @@
-//! [`AcpBackend`]：基于 `claude-agent-acp` 长驻子进程的 agent 执行器（ACP/JSON-RPC）。
+//! [`AcpBackend`]：基于 ACP 协议（JSON-RPC over stdio）的 agent 执行器。
 //!
 //! 与 [`crate::ClaudeBackend`]（CLI 模式 `claude -p`）同 `impl Backend`，内部换用 ACP
-//! 协议：imagent 作 Client，spawn `claude-agent-acp` 作 Agent 子进程，通过 stdin/stdout
-//! 的 JSON-RPC 通信。
+//! 协议：imagent 作 Client，spawn ACP agent 作 Agent 子进程，通过 stdin/stdout
+//! 的 JSON-RPC 通信。两种装配（T9，v13 产品批 #1——ACP 是协议不是单 agent，
+//! gemini-cli / opencode / cursor 等均有（或有）ACP 适配器）：
+//!
+//! - `agent = "claude-acp"`：默认 spawn `claude-agent-acp`（可被环境变量
+//!   `IMAGENT_ACP_COMMAND` 或 config `acp_command` 覆盖），本机会话存储走
+//!   `~/.claude`（[`ClaudeStorage`]）——行为与本 crate 历史版本一致；
+//! - `agent = "acp"`：接入**任意** ACP agent——启动命令来自 config `acp_command`
+//!   （必填，config 层校验），零 claude 存储假设（[`NoStorage`]：不做幽灵会话
+//!   预检、不参与 /resume 本机扫描与 /export）。审批闭环（`request_permission`
+//!   → IM 审批卡）随协议自动覆盖。
 //!
 //! ## 协议映射
 //!
@@ -28,6 +37,7 @@
 //! [`AgentChunk`]: imagent_core::AgentChunk
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -49,11 +59,70 @@ use parking_lot::RwLock;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-/// ACP backend 的固定名称。
+/// ACP backend（claude-acp 装配）的固定名称。
 const NAME: &str = "claude-acp";
+
+/// T9：泛化 ACP backend（`agent = "acp"` 装配）的固定名称。
+const GENERIC_NAME: &str = "acp";
 
 /// 默认 spawn 的 agent 命令（PATH 可见的 `claude-agent-acp`）。
 const DEFAULT_AGENT_CMD: &str = "claude-agent-acp";
+
+/// T9（v13 产品批 #1）：ACP 后端的本机存储适配——claude 特有的会话存储假设
+/// 从协议实现中隔离（crate 内部抽象，不进 core）。
+///
+/// 此前 ghost 会话预检与 /resume 本机扫描直接调 `crate::sessions`（扫
+/// `~/.claude/projects`），对非 claude 的 ACP agent 是错误假设：其 session id
+/// 在 `~/.claude` 里必然不存在——续接会被误判为幽灵会话、每轮弃用续接开新
+/// 会话。claude-acp 装配挂 [`ClaudeStorage`]（行为与抽取前一致），泛化装配
+/// （`agent = "acp"`）挂 [`NoStorage`]（全空 = 不预检、不扫描、不导出）。
+trait AcpStorage: Send + Sync {
+    /// 续接前预检 session 是否真实存在（防幽灵会话）；false = 视为幽灵
+    /// （弃用续接、降级 NewSession）。无本机存储概念的实现恒 true（直接续接，
+    /// 幽灵判定交回 agent 自身的 session/load 失败语义）。
+    fn session_exists(&self, workdir: &Path, session_id: &str) -> bool;
+    /// /resume 的本机会话列表（💻 段数据源）；空 = 该 agent 无本机扫描概念。
+    fn list_local_sessions(&self, workdir: &Path) -> Vec<LocalSession>;
+    /// W4-2 /export 的会话转录导出；None = 无本机可读存储。
+    fn export_session_markdown(&self, workdir: &Path, session_id: &str) -> Option<String>;
+}
+
+/// claude-acp 的存储适配：`~/.claude/projects` 布局（与 claude-cli 的 --resume
+/// 同一存储）。
+struct ClaudeStorage;
+
+impl AcpStorage for ClaudeStorage {
+    fn session_exists(&self, workdir: &Path, session_id: &str) -> bool {
+        crate::sessions::session_exists(workdir, session_id)
+    }
+
+    fn list_local_sessions(&self, workdir: &Path) -> Vec<LocalSession> {
+        crate::sessions::scan_for_backend(workdir)
+    }
+
+    fn export_session_markdown(&self, workdir: &Path, session_id: &str) -> Option<String> {
+        crate::sessions::export_session_md(workdir, session_id)
+    }
+}
+
+/// 泛化 ACP agent（`agent = "acp"`）的空适配：无本机会话存储概念——不预检
+/// （续接直接发 session/load，成败由 agent 自身回答）、不参与 /resume 本机
+/// 扫描与 /export（/resume 自动退化为纯 IM 历史）。
+struct NoStorage;
+
+impl AcpStorage for NoStorage {
+    fn session_exists(&self, _workdir: &Path, _session_id: &str) -> bool {
+        true
+    }
+
+    fn list_local_sessions(&self, _workdir: &Path) -> Vec<LocalSession> {
+        Vec::new()
+    }
+
+    fn export_session_markdown(&self, _workdir: &Path, _session_id: &str) -> Option<String> {
+        None
+    }
+}
 
 /// B2/P5-14：per-conv 连接的并发上限（= 同时存活的 claude-agent-acp 子进程数）。
 /// 超限直接拒绝（回可读错误）而非排队——排队会把排队时长烧进 agent_timeout
@@ -68,10 +137,12 @@ const MAX_CONCURRENT_CONNS: usize = 8;
 /// （泄漏回收保底；shutdown 时 [`AcpBackend::shutdown`] 全量清理）。
 const CONN_IDLE_RECYCLE: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// `claude-agent-acp` 长驻子进程 Backend（ACP/JSON-RPC）。
+/// ACP 长驻子进程 Backend（ACP/JSON-RPC）。
 ///
 /// 持有共享的 [`PermissionMode`] 句柄（与 [`crate::ClaudeBackend`] 一致，支持 SIGHUP
-/// 热重载）。连接按 conv 惰性建立、长驻复用（见模块级「连接模型」）。
+/// 热重载）。连接按 conv 惰性建立、长驻复用（见模块级「连接模型」）。两种装配
+/// 见模块级文档（T9）：claude-acp（默认命令 + [`ClaudeStorage`]）/ 泛化 acp
+/// （[`AcpBackend::with_agent_command`] + [`NoStorage`]）。
 pub struct AcpBackend {
     permission_mode: Arc<RwLock<PermissionMode>>,
     /// B3：dispatcher 注入的 IM 审批闭环回调（run() 启动时注入一次；None =
@@ -95,6 +166,16 @@ pub struct AcpBackend {
     /// 连接空闲回收时长（默认 [`CONN_IDLE_RECYCLE`]；`with_conn_limits` 可配）。
     /// W2-4：经 main 从 config（`acp_idle_recycle_secs`）注入。
     conn_idle_recycle: std::time::Duration,
+    /// T9：backend 名（错误前缀 / `Backend::name`）——claude-acp 装配为
+    /// [`NAME`]，泛化装配（`with_agent_command`）为 [`GENERIC_NAME`]。
+    name: &'static str,
+    /// T9：本机存储适配（幽灵会话预检 / /resume 本机扫描 / /export）。
+    /// claude-acp = [`ClaudeStorage`]（~/.claude），泛化 = [`NoStorage`]。
+    storage: Arc<dyn AcpStorage>,
+    /// T9：config `acp_command` 的启动命令覆盖（泛化装配必填、claude-acp 可选
+    /// 覆盖默认命令）。命令选择优先级：本字段 > `IMAGENT_ACP_COMMAND` >
+    /// [`DEFAULT_AGENT_CMD`]（见 [`AcpBackend::agent_command`]）。
+    command: Option<String>,
     /// 测试专用：mock transport 工厂（in-process 假 agent，替代 spawn 子进程）。
     #[cfg(test)]
     mock_factory: Option<Arc<dyn Fn() -> agent_client_protocol::Channel + Send + Sync>>,
@@ -103,17 +184,7 @@ pub struct AcpBackend {
 impl AcpBackend {
     /// 默认构造（`PermissionMode::Off`，等同 CLI 的 Off 行为）。
     pub fn new() -> Self {
-        Self {
-            permission_mode: Arc::new(RwLock::new(PermissionMode::Off)),
-            hook: RwLock::new(None),
-            model: RwLock::new(None),
-            conns: Arc::new(Mutex::new(HashMap::new())),
-            cost_baselines: Arc::new(Mutex::new(HashMap::new())),
-            max_conns: MAX_CONCURRENT_CONNS,
-            conn_idle_recycle: CONN_IDLE_RECYCLE,
-            #[cfg(test)]
-            mock_factory: None,
-        }
+        Self::claude_default(Arc::new(RwLock::new(PermissionMode::Off)))
     }
 
     /// builder 风格配置连接上限/空闲回收时长（默认 [`MAX_CONCURRENT_CONNS`] /
@@ -128,32 +199,43 @@ impl AcpBackend {
         self
     }
 
+    /// T9（ACP 泛化）：以任意 ACP agent 命令构造——name 报 [`GENERIC_NAME`]
+    ///（`"acp"`）、挂 [`NoStorage`]（无 ~/.claude 假设：不预检 / 不本机扫描 /
+    /// 不导出）、启动命令取 `command`（来自 config `acp_command`，main 装配，
+    /// config 层已校验必填）。与 `with_conn_limits` 同为 builder，可链式调用。
+    pub fn with_agent_command(mut self, command: String) -> Self {
+        self.name = GENERIC_NAME;
+        self.storage = Arc::new(NoStorage);
+        self.command = Some(command);
+        self
+    }
+
     /// 用指定权限模式构造。
     pub fn with_permission_mode(mode: PermissionMode) -> Self {
-        Self {
-            permission_mode: Arc::new(RwLock::new(mode)),
-            hook: RwLock::new(None),
-            model: RwLock::new(None),
-            conns: Arc::new(Mutex::new(HashMap::new())),
-            cost_baselines: Arc::new(Mutex::new(HashMap::new())),
-            max_conns: MAX_CONCURRENT_CONNS,
-            conn_idle_recycle: CONN_IDLE_RECYCLE,
-            #[cfg(test)]
-            mock_factory: None,
-        }
+        Self::claude_default(Arc::new(RwLock::new(mode)))
     }
 
     /// 用外部共享句柄构造——与 `Dispatcher` 共享同一 `Arc<RwLock<PermissionMode>>`，
     /// 使 SIGHUP 热重载对 backend 即时生效（每次 `run` 取最新值）。
     pub fn with_permission_mode_shared(mode: Arc<RwLock<PermissionMode>>) -> Self {
+        Self::claude_default(mode)
+    }
+
+    /// claude-acp 缺省装配（三个 pub 构造共用，防字段漂移）：name =
+    /// [`NAME`]、[`ClaudeStorage`] 存储、无 config 命令覆盖（走
+    /// `IMAGENT_ACP_COMMAND` / 默认命令兜底）。
+    fn claude_default(permission_mode: Arc<RwLock<PermissionMode>>) -> Self {
         Self {
-            permission_mode: mode,
+            permission_mode,
             hook: RwLock::new(None),
             model: RwLock::new(None),
             conns: Arc::new(Mutex::new(HashMap::new())),
             cost_baselines: Arc::new(Mutex::new(HashMap::new())),
             max_conns: MAX_CONCURRENT_CONNS,
             conn_idle_recycle: CONN_IDLE_RECYCLE,
+            name: NAME,
+            storage: Arc::new(ClaudeStorage),
+            command: None,
             #[cfg(test)]
             mock_factory: None,
         }
@@ -169,12 +251,16 @@ impl AcpBackend {
         self
     }
 
-    /// 解析要 spawn 的 agent 命令字符串。
+    /// 解析要 spawn 的 agent 命令字符串（T9 后为实例方法）。
     ///
-    /// 优先取环境变量 `IMAGENT_ACP_COMMAND`（便于切版本/加参数），否则用
-    /// [`DEFAULT_AGENT_CMD`]。支持 shell 风格拆分（由 crate 的 `AcpAgent::from_str`
-    /// 处理）。
-    fn agent_command() -> String {
+    /// 优先级：config `acp_command`（[`Self::with_agent_command`] 注入，泛化
+    /// 装配必填）> 环境变量 `IMAGENT_ACP_COMMAND`（便于切版本/加参数，保持
+    /// 兼容）> [`DEFAULT_AGENT_CMD`]。支持 shell 风格拆分（由 crate 的
+    /// `AcpAgent::from_str` 处理）。
+    fn agent_command(&self) -> String {
+        if let Some(cmd) = &self.command {
+            return cmd.clone();
+        }
         std::env::var("IMAGENT_ACP_COMMAND").unwrap_or_else(|_| DEFAULT_AGENT_CMD.into())
     }
 
@@ -189,7 +275,7 @@ impl AcpBackend {
         }
         if g.len() >= self.max_conns {
             return Err(CoreError::Backend(
-                NAME,
+                self.name,
                 format!(
                     "ACP 并发连接已达上限 {}（每会话一条长驻子进程连接），\
                      本会话请求被拒绝；请减少并发会话，或等待空闲连接回收（约 {} 分钟）\
@@ -202,8 +288,10 @@ impl AcpBackend {
         let hook = self.hook.read().clone();
         let idle = self.conn_idle_recycle;
         let ll = match self.spawn_transport().await? {
-            // ghost 预检仅真机启用：预检依赖 ~/.claude 本地存储，mock 通道的
-            // 会话语义由测试自定义（sid 不必真实存在）。
+            // 存储适配随 transport 选型：真机用 backend 的 per-agent 存储
+            //（claude-acp = ClaudeStorage 扫 ~/.claude；泛化 acp = NoStorage
+            // 不预检）；mock 通道的会话语义由测试自定义（sid 不必真实存在），
+            // 挂 NoStorage 跳过预检。
             Transport::Real(agent) => LongLivedAcp::spawn(
                 agent,
                 Arc::clone(&self.permission_mode),
@@ -212,7 +300,8 @@ impl AcpBackend {
                 Arc::clone(&self.conns),
                 Arc::clone(&self.cost_baselines),
                 idle,
-                true,
+                self.name,
+                Arc::clone(&self.storage),
             )?,
             #[cfg(test)]
             Transport::Mock(ch) => LongLivedAcp::spawn(
@@ -223,7 +312,8 @@ impl AcpBackend {
                 Arc::clone(&self.conns),
                 Arc::clone(&self.cost_baselines),
                 idle,
-                false,
+                self.name,
+                Arc::new(NoStorage),
             )?,
         };
         g.insert(conv.to_string(), ll.clone());
@@ -261,9 +351,9 @@ impl AcpBackend {
         if let Some(f) = &self.mock_factory {
             return Ok(Transport::Mock(f()));
         }
-        let cmd = Self::sanitized_agent_command(self.model.read().clone());
+        let cmd = self.sanitized_agent_command(self.model.read().clone());
         let agent = AcpAgent::from_str(&cmd)
-            .map_err(|e| CoreError::Backend(NAME, format!("解析 agent 命令失败: {e}")))?;
+            .map_err(|e| CoreError::Backend(self.name, format!("解析 agent 命令失败: {e}")))?;
         Ok(Transport::Real(agent))
     }
 
@@ -277,10 +367,10 @@ impl AcpBackend {
     /// 后仅注入白名单（对齐 CLI 路径 [`imagent_core::backend_common::ALWAYS_PASSTHROUGH_ENV`]
     /// 以及 claude 凭据两键）。值含空白/引号/元字符时跳过该键（赋值经 shell_words
     /// 再切分会破形；白名单键的常规值——路径/键/locale——均无此类字符）。
-    /// 自定义 `IMAGENT_ACP_COMMAND` 同样经此消毒（需要额外 env 的场景可在命令
-    /// 里自带 `env NAME=value` 前缀）。
-    fn sanitized_agent_command(model: Option<String>) -> String {
-        let base = Self::agent_command();
+    /// 自定义 `IMAGENT_ACP_COMMAND` / config `acp_command` 同样经此消毒（需要
+    /// 额外 env 的场景可在命令里自带 `env NAME=value` 前缀）。
+    fn sanitized_agent_command(&self, model: Option<String>) -> String {
+        let base = self.agent_command();
         let mut assignments: Vec<String> = Vec::new();
         // v1.18 迭代：基础运行时白名单与值校验改用 core 共享定义（与 CLI 路径
         // spawn_cli_backend 同一事实来源，防单边漂移）；凭据类 key 仍是 claude
@@ -460,9 +550,10 @@ impl LongLivedAcp {
             .unwrap_or_else(|| fallback.to_string())
     }
 
-    /// spawn 单 conv 的长驻 task：`connect_with` 建连接（spawn claude-agent-acp 子
-    /// 进程；SDK `ChildGuard` 在 connection drop 时 kill，无泄漏），main_fn 内 loop
-    /// 接收 prompt 跨 run 复用同一子进程 + connection。
+    /// spawn 单 conv 的长驻 task：`connect_with` 建连接（spawn ACP agent 子进程；
+    /// SDK `ChildGuard` 在 connection drop 时 kill，无泄漏），main_fn 内 loop
+    /// 接收 prompt 跨 run 复用同一子进程 + connection。`storage` 为 T9 的
+    /// per-agent 本机存储适配（幽灵会话预检走它），`name` 用于错误前缀。
     ///
     /// 泛型 `T`：真机为 `AcpAgent`（子进程 stdio）；测试为 in-process `Channel`
     /// （假 agent，见 tests）。
@@ -475,7 +566,8 @@ impl LongLivedAcp {
         conns: Arc<Mutex<HashMap<String, Arc<LongLivedAcp>>>>,
         cost_baselines: Arc<Mutex<HashMap<String, f64>>>,
         idle_recycle: std::time::Duration,
-        ghost_precheck: bool,
+        name: &'static str,
+        storage: Arc<dyn AcpStorage>,
     ) -> Result<Arc<LongLivedAcp>>
     where
         T: agent_client_protocol::ConnectTo<Client> + 'static,
@@ -611,8 +703,10 @@ impl LongLivedAcp {
                         // 该 conv 每条消息重复毒化直到 /new。预检不存在即降级
                         // NewSession，靠下方 SessionStarted 落库替换失效 sid。
                         //（缓存命中分支免预检：能在本连接 load 成功过，agent
-                        //  进程内仍持该会话状态。ghost_precheck=false 为 mock
-                        //  传输——测试自定义会话语义，sid 不必真实存在。）
+                        //  进程内仍持该会话状态。预检经 T9 的 storage 适配：
+                        //  ClaudeStorage 扫 ~/.claude；NoStorage 恒 true——泛化
+                        //  agent 无本机存储概念，幽灵判定交回 agent 自身 load
+                        //  失败语义；mock 传输同挂 NoStorage，测试自定义会话语义。）
                         let want_load = match req.session.clone() {
                             Some(s)
                                 if loaded.as_deref() == Some(s.as_str())
@@ -620,7 +714,7 @@ impl LongLivedAcp {
                             {
                                 Some((s, true))
                             }
-                            Some(s) if !ghost_precheck || crate::sessions::session_exists(&cwd, &s) => {
+                            Some(s) if storage.session_exists(&cwd, &s) => {
                                 Some((s, false))
                             }
                             Some(s) => {
@@ -667,14 +761,14 @@ impl LongLivedAcp {
                                         // 笼统的「长驻 ACP task 无响应」。杀掉本连接
                                         //（会话状态已不可信）但让调用方看到真实错误。
                                         let _ = req.resp.send(Err(CoreError::Backend(
-                                            NAME,
+                                            name,
                                             format!("acp load session 失败: {e}"),
                                         )));
                                         break;
                                     }
                                     Err(_) => {
                                         let _ = req.resp.send(Err(CoreError::Backend(
-                                            NAME,
+                                            name,
                                             format!(
                                                 "acp load session {SESSION_SETUP_TIMEOUT:?} 无应答（agent 子进程僵死），已断开本会话连接"
                                             ),
@@ -706,14 +800,14 @@ impl LongLivedAcp {
                                     }
                                     Ok(Err(e)) => {
                                         let _ = req.resp.send(Err(CoreError::Backend(
-                                            NAME,
+                                            name,
                                             format!("acp new session 失败: {e}"),
                                         )));
                                         break;
                                     }
                                     Err(_) => {
                                         let _ = req.resp.send(Err(CoreError::Backend(
-                                            NAME,
+                                            name,
                                             format!(
                                                 "acp new session {SESSION_SETUP_TIMEOUT:?} 无应答（agent 子进程僵死），已断开本会话连接"
                                             ),
@@ -786,7 +880,7 @@ impl LongLivedAcp {
                                 }
                                 Err(e) => {
                                     let _ = req.resp.send(Err(CoreError::Backend(
-                                        NAME,
+                                        name,
                                         format!("acp prompt 失败: {e}"),
                                     )));
                                     // prompt 失败 = agent 自报会话状态有问题（区别于
@@ -801,7 +895,7 @@ impl LongLivedAcp {
                             },
                             _ = req.cancel => {
                                 let _ = req.resp.send(Err(CoreError::Backend(
-                                    NAME,
+                                    name,
                                     "acp prompt 被 cancel（run 超时/drop，已杀本会话连接）".into(),
                                 )));
                                 break;
@@ -844,8 +938,12 @@ impl LongLivedAcp {
 
 #[async_trait]
 impl Backend for AcpBackend {
+    /// T9：claude-acp 装配报 [`NAME`]（`"claude-acp"`），泛化装配
+    /// （[`AcpBackend::with_agent_command`]）报 [`GENERIC_NAME`]（`"acp"`）。
+    /// core 以此做 agent_kind 会话路由（跨后端切换不复用旧 session）与
+    /// 能力面文案。
     fn name(&self) -> &'static str {
-        NAME
+        self.name
     }
 
     /// W2-4：/model 热设——本会话已有连接不追改（子进程 env 已定），下一次建连
@@ -880,19 +978,21 @@ impl Backend for AcpBackend {
         *self.hook.write() = hook;
     }
 
-    /// P4-11：ACP 的 LoadSession 与 CLI 的 --resume 共用同一 claude 会话存储，
-    /// 扫描逻辑同 ClaudeBackend。
+    /// P4-11：本机会话列表（/resume 的 💻 段）——经 T9 存储适配路由：claude-acp
+    /// 扫 `~/.claude`（LoadSession 与 CLI 的 --resume 同一存储）；泛化 acp 无
+    /// 本机扫描概念（空，/resume 自动退化为纯 IM 历史）。
     async fn list_local_sessions(&self, workdir: &std::path::Path) -> Vec<LocalSession> {
-        crate::sessions::scan_for_backend(workdir)
+        self.storage.list_local_sessions(workdir)
     }
 
-    /// W4-2：会话转录导出（与 CLI 同一 ~/.claude 存储）。
+    /// W4-2：会话转录导出（/export）——claude-acp 走 ~/.claude jsonl；泛化 acp
+    /// 无本机可读存储（None）。
     async fn export_session_markdown(
         &self,
         workdir: &std::path::Path,
         session_id: &str,
     ) -> Option<String> {
-        crate::sessions::export_session_md(workdir, session_id)
+        self.storage.export_session_markdown(workdir, session_id)
     }
 
     /// 进程退出接线（main 在 dispatcher.run() 返回后统一调用）：断开全部
@@ -960,7 +1060,7 @@ impl Backend for AcpBackend {
                         }
                         Err(_) => {
                             return Err(CoreError::Backend(
-                                NAME,
+                                self.name,
                                 ll.dead_reason("长驻 ACP task 无响应（重建后仍无响应）"),
                             ));
                         }
@@ -980,7 +1080,7 @@ impl Backend for AcpBackend {
                 }
                 Err(_) => {
                     return Err(CoreError::Backend(
-                        NAME,
+                        self.name,
                         ll.dead_reason("长驻 ACP task 已退出（重建后仍失败，下次 run 将再重建）"),
                     ));
                 }
@@ -1484,20 +1584,29 @@ mod tests {
         assert!(!AcpBackend::new().supports_tool_allowlist());
     }
 
+    /// T9：命令选择优先级——config `acp_command` > 环境变量
+    /// `IMAGENT_ACP_COMMAND` > 默认 `claude-agent-acp`（claude-acp 装配的 env
+    /// 覆盖行为保持兼容）。
     #[test]
     #[serial_test::serial]
-    fn agent_command_honors_env() {
+    fn agent_command_priority_config_env_default() {
         std::env::remove_var("IMAGENT_ACP_COMMAND");
-        assert_eq!(AcpBackend::agent_command(), DEFAULT_AGENT_CMD);
+        // 默认档。
+        assert_eq!(AcpBackend::new().agent_command(), DEFAULT_AGENT_CMD);
 
+        // env 覆盖默认。
         std::env::set_var(
             "IMAGENT_ACP_COMMAND",
             "npx -y @zed-industries/claude-code-acp@latest",
         );
         assert_eq!(
-            AcpBackend::agent_command(),
+            AcpBackend::new().agent_command(),
             "npx -y @zed-industries/claude-code-acp@latest"
         );
+
+        // config（with_agent_command 注入）压过 env。
+        let generic = AcpBackend::new().with_agent_command("opencode-acp".into());
+        assert_eq!(generic.agent_command(), "opencode-acp");
         std::env::remove_var("IMAGENT_ACP_COMMAND");
     }
 
@@ -2188,22 +2297,22 @@ mod tests {
         assert!(got_final, "应推送 Final chunk");
     }
     /// H2（code-review v8）：ACP 命令消毒——env -i + 白名单前导；model 注入；
-    /// 白名单之外的继承被物理切断。
+    /// 白名单之外的继承被物理切断。T9：config `acp_command` 与 env 同走消毒。
     #[test]
     #[serial_test::serial]
     fn sanitized_agent_command_env_isolation() {
         // R10（code-review v9）：宿主机设了 IMAGENT_ACP_COMMAND（生产配置项）
         // 时此前确定性失败——先清再断言；serial：env 是进程全局，与同文件的
-        // agent_command_honors_env 互斥。
+        // agent_command_priority_config_env_default 互斥。
         std::env::remove_var("IMAGENT_ACP_COMMAND");
         // 无 model：env -i 前导 + 基础命令殿后。
-        let cmd = AcpBackend::sanitized_agent_command(None);
+        let cmd = AcpBackend::new().sanitized_agent_command(None);
         assert!(cmd.starts_with("/usr/bin/env -i "), "{cmd}");
         assert!(cmd.ends_with("claude-agent-acp"), "{cmd}");
         // PATH 在真实环境中必然存在且安全 → 一定被注入。
         assert!(cmd.contains("PATH="), "{cmd}");
         // 有 model：ANTHROPIC_MODEL 注入。
-        let cmd2 = AcpBackend::sanitized_agent_command(Some("glm-5.3[1M]".into()));
+        let cmd2 = AcpBackend::new().sanitized_agent_command(Some("glm-5.3[1M]".into()));
         assert!(cmd2.contains("ANTHROPIC_MODEL=glm-5.3[1M]"), "{cmd2}");
         // 值含空格的键在真实环境难保证存在——形态由 safe 闭包保证（间接）：
         // 命令不含未加引号的空白赋值段。
@@ -2221,7 +2330,7 @@ mod tests {
         }
         // 自定义 shell 形态：env 前导照包、自定义串殿后。
         std::env::set_var("IMAGENT_ACP_COMMAND", "custom-agent --flag");
-        let cmd3 = AcpBackend::sanitized_agent_command(None);
+        let cmd3 = AcpBackend::new().sanitized_agent_command(None);
         assert!(cmd3.starts_with("/usr/bin/env -i "), "{cmd3}");
         assert!(cmd3.ends_with("custom-agent --flag"), "{cmd3}");
         // R12：JSON spec 形态不加 env 前导（原样透传给 SDK 解析）。
@@ -2229,9 +2338,114 @@ mod tests {
             "IMAGENT_ACP_COMMAND",
             r#"{"command":"npx","args":["-y","claude-agent-acp"]}"#,
         );
-        let cmd4 = AcpBackend::sanitized_agent_command(None);
+        let cmd4 = AcpBackend::new().sanitized_agent_command(None);
         assert!(cmd4.trim_start().starts_with('{'), "{cmd4}");
         assert!(!cmd4.contains("/usr/bin/env"), "{cmd4}");
         std::env::remove_var("IMAGENT_ACP_COMMAND");
+        // T9：config 命令（with_agent_command）与 env 同走消毒——env -i 前导 +
+        // 配置命令殿后（config 优先级高于 env，见 agent_command_priority）。
+        std::env::set_var("IMAGENT_ACP_COMMAND", "from-env");
+        let generic = AcpBackend::new().with_agent_command("opencode-acp --flag".into());
+        let cmd5 = generic.sanitized_agent_command(None);
+        assert!(cmd5.starts_with("/usr/bin/env -i "), "{cmd5}");
+        assert!(cmd5.ends_with("opencode-acp --flag"), "{cmd5}");
+        assert!(!cmd5.contains("from-env"), "{cmd5}");
+        std::env::remove_var("IMAGENT_ACP_COMMAND");
+    }
+
+    // ------------------------------------------------------------------
+    // T9（v13 产品批 #1）：泛化 ACP 装配（`agent = "acp"` + acp_command）。
+    // ------------------------------------------------------------------
+
+    /// 泛化装配的可见面：name 报 "acp"；NoStorage 直接放行任意 sid、本机扫描
+    /// 为空、无转录导出（零 claude 假设）。
+    #[test]
+    fn no_storage_allows_every_session_and_scans_nothing() {
+        let s = NoStorage;
+        let wd = Path::new("/nonexistent-workdir");
+        assert!(s.session_exists(wd, "any-session-id"));
+        assert!(s.list_local_sessions(wd).is_empty());
+        assert!(s.export_session_markdown(wd, "any-session-id").is_none());
+    }
+
+    /// 泛化装配的 Backend 可见面：name = "acp"（claude-acp 装配仍报
+    /// "claude-acp"，见 name_is_claude_acp 回归锚）；/resume 本机段为空、
+    /// /export None；能力位与 claude-acp 一致（FullLoop——审批闭环随协议走）。
+    #[tokio::test]
+    async fn generic_acp_backend_surface() {
+        let b = AcpBackend::new().with_agent_command("opencode-acp".into());
+        assert_eq!(b.name(), "acp");
+        let wd = std::env::temp_dir();
+        assert!(b.list_local_sessions(&wd).await.is_empty());
+        assert!(b.export_session_markdown(&wd, "whatever").await.is_none());
+        assert_eq!(b.permission_capability(), PermissionCapability::FullLoop);
+        assert!(!b.supports_tool_allowlist());
+        // claude-acp 装配（回归锚）：name 不受 builder 影响。
+        assert_eq!(AcpBackend::new().name(), "claude-acp");
+    }
+
+    /// 泛化装配不做幽灵会话预检：传入一个 ~/.claude 里必然不存在的 sid，
+    /// 仍直接发 session/load（mock 未注册 load 处理器 → 报真实 load 错误）。
+    /// 若误用 ClaudeStorage 预检，此处会静默降级 session/new 而成功返回——
+    /// 断言错误即证明走的是 NoStorage（不扫 ~/.claude）。
+    #[tokio::test]
+    async fn generic_acp_skips_claude_ghost_precheck() {
+        let (agent_side, client_side) = Channel::duplex();
+        tokio::spawn(async move {
+            let _ = Agent
+                .builder()
+                .name("mock-no-load")
+                .on_receive_request(
+                    async move |req: InitializeRequest, responder, _cx: ConnectionTo<_>| {
+                        responder.respond(
+                            InitializeResponse::new(req.protocol_version)
+                                .agent_capabilities(AgentCapabilities::new()),
+                        )
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |_req: NewSessionRequest, responder, _cx: ConnectionTo<_>| {
+                        responder.respond(NewSessionResponse::new("never-s1".to_string()))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_to(agent_side)
+                .await;
+        });
+        let chan = std::sync::Mutex::new(Some(client_side));
+        let backend = AcpBackend::new().with_agent_command("opencode-acp".into());
+        let backend = backend.with_mock_factory(Arc::new(move || {
+            chan.lock()
+                .unwrap()
+                .take()
+                .expect("mock 通道只建连一次（同 conv 复用长驻连接）")
+        }));
+        let workdir = std::env::temp_dir();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<AgentChunk>(64);
+
+        let err = backend
+            .run(
+                "conv-generic",
+                "hi",
+                Some(&SessionId("ghost-sid-not-in-claude-dir".into())),
+                &workdir,
+                &[],
+                tx,
+                &[],
+                {
+                    let (sx, rx) = tokio::sync::mpsc::channel(1);
+                    drop(sx);
+                    rx
+                },
+            )
+            .await
+            .expect_err("NoStorage 不预检 → LoadSession 直达 mock（无 load 处理器必失败）");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("load session"),
+            "应真实发出 session/load 而非降级 new: {msg}"
+        );
+        assert!(msg.contains("acp)"), "错误前缀应为泛化 name（acp）: {msg}");
     }
 }

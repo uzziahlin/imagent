@@ -559,7 +559,7 @@ async fn main() -> Result<()> {
                 &config,
                 perm_mode.clone(),
                 std::time::Duration::from_secs(config.permission_ask_timeout_secs),
-            );
+            )?;
             // W1-2：模型基准值（config `claude_model`）——/model 的运行时热设以
             // 此为初值，SIGHUP 重载时重设回 config 值。
             backend.set_model(config.claude_model.clone());
@@ -1035,22 +1035,34 @@ async fn main() -> Result<()> {
 ///
 /// - `"codex"` → [`imagent_codex::CodexBackend`]；
 /// - `"gemini"` → [`imagent_gemini::GeminiBackend`]；
-/// - `"claude-acp"` → [`imagent_claude::AcpBackend`]（ACP/JSON-RPC 长驻子进程模式，
-///   与 `claude-cli` 并存；共享 permission_mode 句柄，SIGHUP 即时生效）；
+/// - `"claude-acp"` → [`imagent_claude::AcpBackend`]（Claude 的 ACP/JSON-RPC 长驻
+///   子进程模式，默认命令 `claude-agent-acp`、本机存储走 ~/.claude，与 `claude-cli`
+///   并存；共享 permission_mode 句柄，SIGHUP 即时生效）；
+/// - `"acp"` → [`imagent_claude::AcpBackend`] 泛化装配（T9：任意 ACP agent——
+///   命令来自 config `acp_command`（必填，config 层已校验）、无 ~/.claude 存储
+///   假设；审批闭环随 ACP 协议覆盖，`permission_mode = "ask"` 可用）；
 /// - 其它（含默认 `"claude-cli"`）→ [`imagent_claude::ClaudeBackend`]，
 ///   行为与单后端时期完全一致（permission_mode 共享句柄，SIGHUP 即时生效）。
+///
+/// Err 仅一种来源：`agent = "acp"` 而 `acp_command` 缺失（config 校验已拦，
+/// 此处 fail-closed 兜底，防绕过校验的构造路径静默落到 claude 默认命令）。
+///
+/// 返回的二元组：泛化 backend 句柄 + claude-cli 专属句柄（SIGHUP 重载运行
+/// 参数用；非 claude-cli 后端为 None）。
+type BuiltBackend = (
+    Arc<dyn imagent_core::Backend>,
+    Option<Arc<imagent_claude::ClaudeBackend>>,
+);
+
 fn build_backend(
     config: &imagent_core::Config,
     perm_mode: Arc<parking_lot::RwLock<imagent_core::PermissionMode>>,
     ask_timeout: std::time::Duration,
-) -> (
-    Arc<dyn imagent_core::Backend>,
-    Option<Arc<imagent_claude::ClaudeBackend>>,
-) {
+) -> Result<BuiltBackend> {
     match config.agent.as_str() {
-        "codex" => (Arc::new(imagent_codex::CodexBackend::new()), None),
-        "gemini" => (Arc::new(imagent_gemini::GeminiBackend::new()), None),
-        "claude-acp" => (
+        "codex" => Ok((Arc::new(imagent_codex::CodexBackend::new()), None)),
+        "gemini" => Ok((Arc::new(imagent_gemini::GeminiBackend::new()), None)),
+        "claude-acp" => Ok((
             Arc::new(
                 imagent_claude::AcpBackend::with_permission_mode_shared(perm_mode)
                     // W2-4：连接参数接 config（并发上限 / 空闲回收）。
@@ -1060,7 +1072,29 @@ fn build_backend(
                     ),
             ),
             None,
-        ),
+        )),
+        "acp" => {
+            // T9：泛化 ACP 接入——命令必填（config 归一后空白也已滤为 None，
+            // 此处再兜底一次，错误文案与 config 校验同源）。
+            let command = config.acp_command.clone().ok_or_else(|| {
+                anyhow!(
+                    "agent = \"acp\" 需要配置 acp_command（启动目标 ACP agent 的命令，\
+                     如 acp_command = \"opencode-acp\" 或 \"gemini --experimental-acp\"，\
+                     以目标 agent 的 ACP 接入文档为准）"
+                )
+            })?;
+            Ok((
+                Arc::new(
+                    imagent_claude::AcpBackend::with_permission_mode_shared(perm_mode)
+                        .with_conn_limits(
+                            config.acp_max_connections,
+                            std::time::Duration::from_secs(config.acp_idle_recycle_secs),
+                        )
+                        .with_agent_command(command),
+                ),
+                None,
+            ))
+        }
         _ => {
             let b = Arc::new(imagent_claude::ClaudeBackend::with_permission_mode_shared(
                 perm_mode,
@@ -1073,7 +1107,7 @@ fn build_backend(
             // 系统提示 / 用户 MCP servers）。具体类型上调用（trait 不暴露
             // claude 专有参数）；句柄额外返回给 SIGHUP 重载用。
             apply_claude_runtime_opts(&b, config);
-            (b.clone(), Some(b))
+            Ok((b.clone(), Some(b)))
         }
     }
 }
