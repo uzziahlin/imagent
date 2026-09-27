@@ -8,9 +8,10 @@
 use std::process::Stdio;
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 
 use crate::error::{CoreError, Result};
+use crate::lineio::read_line_capped;
 use crate::types::{AgentChunk, RunOutcome, SessionId, TodoItem, TodoStatus, UsageStats};
 
 /// 三 CLI backend 的 stdout 行解析统一事件。各 backend 的适配闭包把自己的
@@ -22,6 +23,12 @@ pub enum CliEvent {
     /// 中间文本（best-effort 推 IM；codex AgentMessage / gemini AssistantMessage /
     /// claude assistant 文本 B8）。同时作为 final_text 候选（按序拼接，见 B9）。
     Text(String),
+    /// 同一条消息的**增量片段**（gemini stream-json 的 `delta:true`，T20 碎化
+    /// 修复）：推 IM 的 chunk 语义与 [`CliEvent::Text`] 相同（流式卡片逐段
+    /// append），但 final_text 累积**直接续接、不插 `\n\n`**——B9 的空行
+    /// 分隔是给「多条完整消息」的，碎片之间补空行会把一句话拆成空行分隔的
+    /// 碎段（真机症状：流式卡与 final_text 按碎片空行分隔）。
+    TextDelta(String),
     /// W2-1：思考过程（claude assistant 的 thinking 块）——与 Text 分离，
     /// 不进 final_text、不进正文流，仅推 Thought chunk（卡片折叠展示）。
     Thought(String),
@@ -196,7 +203,8 @@ impl Drop for GroupKillGuard {
 /// RunOutcome。三 CLI backend 共用，零行为差异（仅去重）。
 ///
 /// `cmd` 由调用方构造好（cwd/args 已设；本函数统一加 stdin/stdout/stderr/kill_on_drop）。
-/// `parse` 是各 backend 的「行 → CliEvent」适配闭包。`backend_name` 用于错误信息。
+/// `parse` 是各 backend 的「行 → CliEvent」适配闭包（T20 起 `FnMut`——gemini 的
+/// delta 增量缓冲需要跨行状态，见 [`CliEvent::TextDelta`]）。`backend_name` 用于错误信息。
 /// `passthrough_env`：S-2——本函数会先 `env_clear()`，再仅透传 [`ALWAYS_PASSTHROUGH_ENV`]
 /// 以及调用方声明的这些 key（各 backend 传自己的 API key，最小授权）。传 `&[]` 则只透传
 /// 运行时必需变量（PATH/HOME/...）。
@@ -514,7 +522,7 @@ fn control_response_line(request_id: &str, reply: &crate::permission::Permission
 #[allow(clippy::too_many_arguments)]
 pub async fn spawn_cli_backend(
     mut cmd: tokio::process::Command,
-    parse: impl Fn(&str) -> CliEvent,
+    mut parse: impl FnMut(&str) -> CliEvent,
     chunks: tokio::sync::mpsc::Sender<AgentChunk>,
     backend_name: &'static str,
     passthrough_env: &[&str],
@@ -703,7 +711,8 @@ pub async fn spawn_cli_backend(
             Ok(None) => break,
             // B1：read_line_capped 的 Err 有两种语义——
             // - ErrorKind::InvalidInput：单行超 MAX_STDOUT_LINE_BYTES（无 \n 的超长
-            //   输出，S-5 防僵尸行 OOM）→ 可跳过语义，跳过该行继续；
+            //   输出，S-5 防僵尸行 OOM）→ 可跳过语义（T20 起该函数已把整行消费
+            //   到 \n 再返回，continue 即从下一行干净恢复，无残段误解析）；
             // - 其它（管道 EIO / EBADF 等真实 IO 错误）→ 持续性，continue 会忙循环
             //   空转，记录后终止读取循环（已收集的 final/error 不受影响）。
             Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
@@ -826,11 +835,20 @@ pub async fn spawn_cli_backend(
                         // B9：多条完整 agent_message 按序拼接（\n\n 分隔）。原先
                         // 「最后一次赋值胜出」会丢多消息 turn 的前几条内容。终止事件
                         // （Final）仍整体覆盖 final_text（claude result 权威文本语义
-                        // 不变）；CliEvent 无 delta 概念，各 backend 的 Text 均为
-                        // 完整消息，直接拼接。
+                        // 不变）；完整消息语义见 Text——delta 片段走 TextDelta 直接
+                        // 续接，不在此列。
                         if !final_text.is_empty() {
                             final_text.push_str("\n\n");
                         }
+                        final_text.push_str(&t);
+                    }
+                }
+                // T20（gemini delta 碎化修复）：增量片段——流式 chunk 照推（卡片
+                // append_text 语义），final_text 直接续接（不插 \n\n）。与 ACP 路径
+                // 的 AgentMessageChunk 累积语义（agent_text.push_str 无分隔）对齐。
+                CliEvent::TextDelta(t) => {
+                    if !t.is_empty() {
+                        let _ = chunks.send(AgentChunk::Text(t.clone())).await;
                         final_text.push_str(&t);
                     }
                 }
@@ -1229,8 +1247,8 @@ pub async fn read_stderr_into(
             Ok(None) => break, // EOF
             Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
                 // B1（可跳过语义）：单行超 MAX_STDERR_LINE_BYTES（无 `\n` 超长输出）：
-                // read_line_capped 已 consume 到上限点。push 截断标记并继续 drain 该行
-                // 剩余（不累积），防 OOM。
+                // read_line_capped（T20 起）已把整行消费到 \n 再返回——push 截断标记
+                // 后继续读下一行（不累积），防 OOM 且无残段误解析。
                 if !truncated {
                     truncated = true;
                     push(
@@ -1270,41 +1288,6 @@ const STDERR_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// stderr 单行字节上限（S-5）：防 agent 向 stderr 写无 `\n` 的超长流（可被 prompt
 /// injection 构造）导致单行全量分配 OOM。与 stdout 的 [`MAX_STDOUT_LINE_BYTES`] 对称。
 const MAX_STDERR_LINE_BYTES: usize = 1024 * 1024;
-
-/// 按字节读一行，上限 `max_bytes`（S-5）。超限返回 Err（调用方跳过该行）。
-/// 覆盖 `AsyncBufReadExt::lines()` 无上限的语义（一行无 `\n` 的超长输出会全量分配）。
-/// B1：Err 语义二分——`ErrorKind::InvalidInput` = 单行超长（调用方可跳行继续）；
-/// 其它 kind = 真实 IO 错误（持续性，调用方应终止读取）。
-async fn read_line_capped<R: tokio::io::AsyncBufRead + Unpin>(
-    reader: &mut R,
-    max_bytes: usize,
-) -> std::io::Result<Option<String>> {
-    let mut buf: Vec<u8> = Vec::with_capacity(512);
-    loop {
-        let available = reader.fill_buf().await?;
-        if available.is_empty() {
-            return if buf.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
-            };
-        }
-        if let Some(nl) = available.iter().position(|&b| b == b'\n') {
-            buf.extend_from_slice(&available[..=nl]);
-            reader.consume(nl + 1);
-            return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
-        }
-        buf.extend_from_slice(available);
-        let n = available.len();
-        reader.consume(n);
-        if buf.len() > max_bytes {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("line exceeds {max_bytes} bytes"),
-            ));
-        }
-    }
-}
 
 /// 视为需要写/执行权限的工具名（codex sandbox / gemini approval 收敛用，大小写敏感）。
 /// codex/gemini 原各自定义且逐字相同。
@@ -1368,6 +1351,55 @@ mod tests {
             }
         }
         assert_eq!(texts, vec!["one".to_string(), "two".to_string()]);
+    }
+
+    /// T20（gemini delta 碎化修复）：TextDelta 片段直接续接进 final_text——
+    /// 不插 `\n\n`（B9 的空行分隔只属于完整消息 Text）；流式 Text chunk 照推。
+    /// 修复前 gemini 的 delta:true 行被当完整 Text，一句「你好世界」会被拼成
+    /// 「你\n\n好\n\n世界」。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn text_delta_fragments_concatenate_without_separator() {
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg("printf 'frag1\\nfrag2\\nfrag3\\n'");
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::types::AgentChunk>(64);
+        // 有状态解析（FnMut——T20 起 spawn_cli_backend 的 parse 契约）：首见
+        // frag3 时追加 Terminal 触发收尾（final 取累积文本）。
+        let mut seen_final_line = false;
+        let parse = |line: &str| {
+            if line.trim_end() == "frag3" && !seen_final_line {
+                seen_final_line = true;
+                CliEvent::Multi(vec![
+                    CliEvent::TextDelta("frag3".into()),
+                    CliEvent::Terminal { session: None },
+                ])
+            } else {
+                CliEvent::TextDelta(line.trim_end().to_string())
+            }
+        };
+        let outcome =
+            spawn_cli_backend(cmd, parse, tx, "test-backend", &[], None, Vec::new(), None)
+                .await
+                .expect("echo run 应成功");
+        assert_eq!(
+            outcome.final_text, "frag1frag2frag3",
+            "delta 片段无空行分隔"
+        );
+        // 三个片段均作为流式 Text chunk 推送（卡片 append 语义）。
+        let mut texts = Vec::new();
+        while let Ok(c) = rx.try_recv() {
+            if let crate::types::AgentChunk::Text(t) = c {
+                texts.push(t);
+            }
+        }
+        assert_eq!(
+            texts,
+            vec![
+                "frag1".to_string(),
+                "frag2".to_string(),
+                "frag3".to_string()
+            ]
+        );
     }
 
     /// B10：final 为空但沿途有 TransientError（如「API key invalid」）时，

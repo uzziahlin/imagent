@@ -51,6 +51,17 @@ pub fn qualified_tool_name() -> String {
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
+/// MCP server stdin 单行字节上限（v13 P3 还债批：run_mcp_server /
+/// run_ask_mcp_server 此前裸用无上限的 `lines()`）。取 8MB 与
+/// backend_common 的 agent stdout 单行上限（`MAX_STDOUT_LINE_BYTES`）同口径：
+/// tools/call 单行携带**完整工具入参**（Write/Edit 的大文件内容、ask_via_im
+/// 的多行长问题），permission socket 侧的 64KB 口径（单行审批卡帧）会误杀
+/// 合法的大参数调用——8MB 既覆盖真实载荷又保留 OOM 兜底（无 `\n` 超长流可
+/// 被 prompt injection 构造）。超限 fail-stop（break 退出 server）：超长行
+/// 解析不出 request id、无法回 JSON-RPC 错误响应，静默跳行则对端（claude）
+/// 的 tools/call 会永久挂起——退出 server 让 MCP 调用失败可见。
+const MAX_MCP_STDIN_LINE_BYTES: usize = 8 * 1024 * 1024;
+
 /// `tools/list` 的工具描述（纯函数，便于单测）。`bitable = true`（feishu_bitable_*
 /// 配置齐备，backend 写 mcp 配置时经 `--bitable 1` 传入）时追加两个数据面工具。
 pub fn build_tools_list(bitable: bool) -> Value {
@@ -376,14 +387,18 @@ pub async fn run_mcp_server(
 ) -> io::Result<()> {
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
-    let mut lines = BufReader::new(stdin).lines();
+    let mut reader = BufReader::new(stdin);
 
     loop {
-        let line = match lines.next_line().await {
+        // 上限读行（见 MAX_MCP_STDIN_LINE_BYTES）：EOF/IO 错误/超长行统一
+        // 终止 server（超长 fail-stop 的取舍见常量注释）。
+        let line = match crate::lineio::read_line_capped(&mut reader, MAX_MCP_STDIN_LINE_BYTES)
+            .await
+        {
             Ok(Some(l)) => l,
             Ok(None) => break, // EOF（claude 关闭 stdin）
             Err(e) => {
-                warn!(target: "imagent::mcp", error = %e, "stdin read error");
+                warn!(target: "imagent::mcp", error = %e, "stdin 读行失败/单行超长，终止 MCP server");
                 break;
             }
         };
@@ -723,14 +738,17 @@ pub async fn run_ask_mcp_server(
 ) -> io::Result<()> {
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
-    let mut lines = BufReader::new(stdin).lines();
+    let mut reader = BufReader::new(stdin);
 
     loop {
-        let line = match lines.next_line().await {
+        // 与 run_mcp_server 同款上限读行（见 MAX_MCP_STDIN_LINE_BYTES 注释）。
+        let line = match crate::lineio::read_line_capped(&mut reader, MAX_MCP_STDIN_LINE_BYTES)
+            .await
+        {
             Ok(Some(l)) => l,
             Ok(None) => break,
             Err(e) => {
-                warn!(target: "imagent::mcp", error = %e, "stdin read error");
+                warn!(target: "imagent::mcp", error = %e, "stdin 读行失败/单行超长，终止 MCP server");
                 break;
             }
         };

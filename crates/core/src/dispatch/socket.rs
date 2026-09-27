@@ -211,14 +211,17 @@ impl Dispatcher {
     }
 
     /// 读一行权限 socket 报文（15s 超时 + 64KiB 上限）。None = EOF/超时/超长
-    ///（后两者记日志）。
+    ///（后两者记日志）。读行实现走 [`crate::lineio::read_line_capped`]（v13
+    /// P3 还债批：与 backend_common 的 CLI 读行共用一份，超长行「读到 `\n`
+    /// 再丢」语义由 util 保证；此处 Err 一律返回 None 丢弃连接——协议是
+    /// 单行 JSON 帧，超长即对端异常，fail-closed 断开）。
     #[cfg(unix)]
     async fn read_socket_line(
         reader: &mut tokio::io::BufReader<&mut tokio::net::UnixStream>,
     ) -> Option<String> {
         match tokio::time::timeout(
             std::time::Duration::from_secs(15),
-            Self::read_line_capped(reader, 64 * 1024),
+            crate::lineio::read_line_capped(reader, 64 * 1024),
         )
         .await
         {
@@ -230,41 +233,6 @@ impl Dispatcher {
             Err(_) => {
                 warn!(target: "imagent::core", "permission socket 读行超时（15s）");
                 None
-            }
-        }
-    }
-
-    /// 读一行（到 `\n`），上限 `max_bytes` 字节，超限返 Err（P1-9：防同 uid 进程
-    /// 发巨大行 OOM）。返回 None 表示对端 EOF（未发数据即关）。
-    #[cfg(unix)]
-    pub(crate) async fn read_line_capped<R: tokio::io::AsyncBufRead + Unpin>(
-        reader: &mut R,
-        max_bytes: usize,
-    ) -> std::io::Result<Option<String>> {
-        use tokio::io::AsyncBufReadExt;
-        let mut buf: Vec<u8> = Vec::with_capacity(512);
-        loop {
-            let available = reader.fill_buf().await?;
-            if available.is_empty() {
-                return if buf.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
-                };
-            }
-            if let Some(nl) = available.iter().position(|&b| b == b'\n') {
-                buf.extend_from_slice(&available[..=nl]);
-                reader.consume(nl + 1);
-                return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
-            }
-            buf.extend_from_slice(available);
-            let n = available.len();
-            reader.consume(n);
-            if buf.len() > max_bytes {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("permission request line exceeds {max_bytes} bytes"),
-                ));
             }
         }
     }
