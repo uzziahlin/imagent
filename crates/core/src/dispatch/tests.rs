@@ -1185,7 +1185,11 @@ async fn any_queued(disp: &Dispatcher) -> bool {
 
 /// 等待 conv 的在飞任务注册出现（join spawn 后写入 ConvState.running）。
 async fn wait_registered(ctx: &Ctx, conv: &str) -> bool {
-    for _ in 0..400 {
+    // 预算必须显著大于 batch_window（缺省 1.5s 静默判停后才取批起跑注册）：
+    // 此前 2s（400×5ms）在 CI 满载 runner 上余量不足（1.5s 窗口 + 调度/
+    // preflight IO 抖动 > 0.5s 即 flake，v1.28 两次发布翻车点）。成功即早退，
+    // 常态零成本；上限放大到 10s 只影响失败路径的报错延迟。
+    for _ in 0..2000 {
         if conv_running(&ctx.disp, conv).await {
             return true;
         }
@@ -1203,7 +1207,7 @@ async fn feed_and_wait(ctx: &Ctx, msgs: Vec<InboundMessage>, want_calls: usize) 
         disp.handle(m).await;
     }
     // 等待到 calls 计数达到预期。
-    for _ in 0..400 {
+    for _ in 0..2000 {
         if ctx.order.load(Ordering::SeqCst) >= want_calls {
             break;
         }
@@ -2392,7 +2396,7 @@ async fn stop_drops_queued_messages() {
     ctx.disp.handle(msg("c1", "alice", "queued B")).await;
     ctx.disp.handle(msg("c1", "alice", "queued C")).await;
     // 等 2 条都入队。
-    for _ in 0..400 {
+    for _ in 0..2000 {
         if conv_queued_len(&ctx.disp, "c1").await == 2 {
             break;
         }
@@ -2441,7 +2445,7 @@ async fn stop_preserves_queued_messages_and_continues() {
     assert!(wait_registered(&ctx, "c1").await, "在飞任务应已注册");
     ctx.disp.handle(msg("c1", "alice", "queued B")).await;
     ctx.disp.handle(msg("c1", "alice", "queued C")).await;
-    for _ in 0..400 {
+    for _ in 0..2000 {
         if conv_queued_len(&ctx.disp, "c1").await == 2 {
             break;
         }
@@ -2507,7 +2511,7 @@ async fn queue_list_and_selective_drop() {
     assert!(wait_registered(&ctx, "c1").await, "在飞任务应已注册");
     ctx.disp.handle(msg("c1", "bob", "bob 的补充")).await;
     ctx.disp.handle(msg("c1", "alice", "alice 的补充")).await;
-    for _ in 0..400 {
+    for _ in 0..2000 {
         if conv_queued_len(&ctx.disp, "c1").await == 2 {
             break;
         }
@@ -2625,7 +2629,7 @@ async fn steering_injects_midround_text() {
     // 两条运行中消息 → 注入当轮（不排队）。
     ctx.disp.handle(msg("c1", "alice", "中途补充")).await;
     ctx.disp.handle(msg("c1", "alice", "再补充")).await;
-    for _ in 0..400 {
+    for _ in 0..2000 {
         if steer_seen.lock().await.len() == 2 {
             break;
         }
@@ -4001,7 +4005,7 @@ async fn stop_persists_learned_session() {
     let runner2 = tokio::spawn(async move {
         disp.handle(msg("c1", "alice", "after stop")).await;
     });
-    for _ in 0..400 {
+    for _ in 0..2000 {
         if ctx.calls.lock().await.len() >= 2 {
             break;
         }
@@ -4178,7 +4182,7 @@ async fn stop_interception_flips_processing_reaction() {
             .await;
     });
     // 等 preamble 走到 typing（stop_mark_epoch 已读、👀 未打）。
-    for _ in 0..400 {
+    for _ in 0..2000 {
         if gate.entered.load(Ordering::SeqCst) {
             break;
         }
@@ -4263,7 +4267,7 @@ async fn permission_socket_token_handshake() {
         .spawn_socket_accept(sock.to_string_lossy().into_owned());
     // 等 socket 与 token 文件就绪。
     let token_path = dir.join("permission.token");
-    for _ in 0..400 {
+    for _ in 0..2000 {
         if sock.exists() && token_path.exists() {
             break;
         }
@@ -4318,7 +4322,7 @@ async fn permission_socket_token_handshake() {
             .unwrap();
         s.flush().await.unwrap();
         let mut asked = false;
-        for _ in 0..400 {
+        for _ in 0..2000 {
             if ctx
                 .inbox
                 .lock()
@@ -4393,7 +4397,7 @@ async fn bitable_socket_routes_and_reports_unconfigured() {
     ctx.disp
         .spawn_socket_accept(sock.to_string_lossy().into_owned());
     let token_path = dir.join("permission.token");
-    for _ in 0..400 {
+    for _ in 0..2000 {
         if sock.exists() && token_path.exists() {
             break;
         }
@@ -4750,7 +4754,7 @@ async fn resume_numbering_stable_after_selection() {
     // feed_and_wait 只等 backend 调用计数，第二轮的 session 落库在其之后
     // （慢 runner 上可能滞后）——轮询重发 /resume 直到列表出现两行，消除
     // 「列表仅 1 行 → /resume 2 无效」的竞态（单用户场景重发即刷新缓存）。
-    for _ in 0..200 {
+    for _ in 0..600 {
         ctx.disp.handle(msg("c1", "alice", "/resume")).await;
         let ok = ctx
             .inbox
@@ -4975,7 +4979,7 @@ async fn recall_removes_matching_queued_message() {
     m2.source_msg_id = Some("om_keep".into());
     ctx.disp.handle(m1).await;
     ctx.disp.handle(m2).await;
-    for _ in 0..400 {
+    for _ in 0..2000 {
         if conv_queued_len(&ctx.disp, "feishu:ou_t").await == 2 {
             break;
         }
@@ -7190,7 +7194,7 @@ async fn cancelled_ask_returns_error_to_terminal() {
     ctx.disp
         .spawn_socket_accept(sock.to_string_lossy().into_owned());
     let token_path = dir.join("permission.token");
-    for _ in 0..400 {
+    for _ in 0..2000 {
         if sock.exists() && token_path.exists() {
             break;
         }
