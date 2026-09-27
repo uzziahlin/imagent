@@ -262,6 +262,14 @@ pub struct WebhookEntry {
     /// 恶意刷）下保护 IM 侧不刷屏、不触发平台频控。
     #[serde(default)]
     pub rps: Option<f64>,
+    /// v1.24 防重放（opt-in）：> 0 时启用自约定时间戳协议——请求须带
+    /// `X-Imagent-Timestamp: <unix 秒>` 头，验签串从 `body` 改为 `{ts}.{body}`，
+    /// 且 `|now - ts| > replay_window_secs` 即 401。须与 `secret` 同配
+    ///（未签名的时间戳攻击者可随意刷新，无防护意义——启动校验拒绝）。
+    /// GitHub 原生 webhook 签名不含时间戳、无法配合本协议（公网 + GitHub
+    /// 场景靠签名去重 + HTTPS）；自建发送端建议开启。
+    #[serde(default)]
+    pub replay_window_secs: u64,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -853,6 +861,15 @@ impl Config {
                         )));
                     }
                 }
+                // v1.24：时间戳协议须与 secret 同配——未签名的 ts 攻击者可
+                // 随意刷新，「启用但无防护」的静默假安全直接启动期拒绝。
+                if w.replay_window_secs > 0 && w.secret.is_none() {
+                    return Err(CoreError::Config(format!(
+                        "webhook replay_window_secs > 0 须同时配置 secret（name={}）——\
+                         未签名时间戳无防重放意义",
+                        w.name
+                    )));
+                }
                 // v1.23 review：send_rps 边界（负值/NaN 走关闭或怪路径）。
                 if !(0.0..=100.0).contains(&cfg.feishu_send_rps) || cfg.feishu_send_rps.is_nan() {
                     return Err(CoreError::Config(format!(
@@ -1260,6 +1277,54 @@ name = "ci"
         )
         .unwrap_err();
         assert!(err.to_string().contains("重复"), "{err}");
+    }
+
+    /// v1.24：replay_window_secs 解析（缺省 0 = 不启用）+ 「> 0 须配 secret」
+    /// 启动期拒绝。
+    #[test]
+    fn webhook_replay_window_config() {
+        // 缺省 = 0（时间戳协议不启用，行为与 v1.21 完全一致）。
+        let p = tmp_path(
+            "wh_rw_default",
+            r#"default_workdir = "/tmp/ws"
+[[webhook]]
+token = "0123456789abcdef0123456789abcdef"
+conv = "feishu:oc_g"
+name = "ci"
+"#,
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(cfg.webhooks[0].replay_window_secs, 0);
+        cleanup(&p);
+        // 显式配置 + secret：解析通过。
+        let p = tmp_path(
+            "wh_rw_ok",
+            r#"default_workdir = "/tmp/ws"
+[[webhook]]
+token = "0123456789abcdef0123456789abcdef"
+conv = "feishu:oc_g"
+name = "ci"
+secret = "topsecret-0123456789"
+replay_window_secs = 300
+"#,
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(cfg.webhooks[0].replay_window_secs, 300);
+        cleanup(&p);
+        // > 0 但无 secret：拒绝启动（未签名时间戳无防护意义）。
+        let p = tmp_path(
+            "wh_rw_no_secret",
+            r#"default_workdir = "/tmp/ws"
+[[webhook]]
+token = "0123456789abcdef0123456789abcdef"
+conv = "feishu:oc_g"
+name = "ci"
+replay_window_secs = 300
+"#,
+        );
+        let err = Config::load(&p).unwrap_err();
+        assert!(err.to_string().contains("须同时配置 secret"), "{err}");
+        cleanup(&p);
     }
 
     /// v1.18：自动压缩比例档——窗口声明即激活，阈值 = 窗口 × 比例（覆盖绝对值档）。
