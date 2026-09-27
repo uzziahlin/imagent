@@ -161,7 +161,7 @@ impl FeishuWsClient {
 /// P1：`[-0.2, 0.2]` 均匀随机 jitter 因子。
 fn rand_jitter() -> f64 {
     use rand::Rng;
-    rand::thread_rng().gen_range(-0.2f64..=0.2f64)
+    rand::rng().random_range(-0.2f64..=0.2f64)
 }
 
 /// P1：退避时长加 ±20% jitter（纯函数，便于单测）。固定退避序列会让多实例
@@ -1068,8 +1068,8 @@ fn asr_request_body(pcm: &[u8]) -> String {
     use base64::Engine;
     use rand::Rng;
     let speech = base64::engine::general_purpose::STANDARD.encode(pcm);
-    let file_id: String = rand::thread_rng()
-        .sample_iter(rand::distributions::Alphanumeric)
+    let file_id: String = rand::rng()
+        .sample_iter(rand::distr::Alphanumeric)
         .take(16)
         .map(char::from)
         .collect();

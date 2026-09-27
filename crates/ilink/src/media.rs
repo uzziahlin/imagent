@@ -82,7 +82,7 @@ pub fn aes_decrypt(ciphertext: &[u8], key: &[u8; 16]) -> Option<Vec<u8>> {
 pub fn random_aes_key() -> [u8; 16] {
     use rand::RngCore;
     let mut k = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut k);
+    rand::rng().fill_bytes(&mut k);
     k
 }
 
