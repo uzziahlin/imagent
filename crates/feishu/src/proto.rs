@@ -156,9 +156,9 @@ pub fn card_text_transcript(content: &str) -> Option<String> {
         return None;
     }
     let mut parts: Vec<String> = Vec::new();
-    collect_card_text(v.pointer("/header/title"), &mut parts);
+    collect_card_text(v.pointer("/header/title"), &mut parts, 0);
     for root in ["/body/elements", "/elements"] {
-        collect_card_text(v.pointer(root), &mut parts);
+        collect_card_text(v.pointer(root), &mut parts, 0);
     }
     let text = parts
         .into_iter()
@@ -168,11 +168,29 @@ pub fn card_text_transcript(content: &str) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+/// 卡片文本 walker 的显式递归深度上限（P3，v13 遗留 fuzz 缺口收口）。
+/// 此前栈安全**隐式**依赖 serde_json 解析期的 128 层嵌套上限——那是解析器的
+/// 实现细节（换迭代式解析/调整上限即失效，且 walker 每层的栈帧开销高于解析
+/// 器单层）。显式 64 层上限作双保险：合法 CardKit 卡片组件层级是个位数，
+/// 超深子树按恶意/畸形输入处理——返回空 + debug 留痕，不栈溢出。
+const CARD_TEXT_MAX_DEPTH: usize = 64;
+
 /// 卡片节点 → 文本片段（`card_text_transcript` 的递归体）：文本组件取
 /// content；其余对象/数组全部下钻——容器与未来新增组件不丢其中文本，
 /// 无 tag 的字符串叶子（value 等业务载荷）天然不收。
-fn collect_card_text(node: Option<&serde_json::Value>, out: &mut Vec<String>) {
+/// `depth` 为显式递归深度（入口传 0），超 [`CARD_TEXT_MAX_DEPTH`] 截断该子树
+/// （双保险理由见常量注释）。
+fn collect_card_text(node: Option<&serde_json::Value>, out: &mut Vec<String>, depth: usize) {
     let Some(node) = node else { return };
+    if depth >= CARD_TEXT_MAX_DEPTH {
+        tracing::debug!(
+            target: "feishu",
+            depth,
+            "card_text_transcript 子树深度超上限（{}），截断",
+            CARD_TEXT_MAX_DEPTH
+        );
+        return;
+    }
     match node {
         serde_json::Value::Object(map) => {
             match map.get("tag").and_then(|t| t.as_str()).unwrap_or("") {
@@ -183,14 +201,14 @@ fn collect_card_text(node: Option<&serde_json::Value>, out: &mut Vec<String>) {
                 }
                 _ => {
                     for v in map.values() {
-                        collect_card_text(Some(v), out);
+                        collect_card_text(Some(v), out, depth + 1);
                     }
                 }
             }
         }
         serde_json::Value::Array(arr) => {
             for v in arr {
-                collect_card_text(Some(v), out);
+                collect_card_text(Some(v), out, depth + 1);
             }
         }
         _ => {}
@@ -1342,12 +1360,16 @@ pub fn parse_message_event(
     // 真机校准（2026-08-30）：**斜杠命令豁免**——`/chat allow` 是群放行的
     // 引导命令（先有鸡还是先有蛋：不带 @ 的它被这里拦掉，群永远无法自助放行），
     // 命令自身的 admin/白名单门禁在 dispatch 层独立生效，豁免不放大权限面。
+    // P3（v13 遗留）：豁免收敛为**已知命令白名单**——首词命中 core 分派表的
+    // 命令词才豁免（判定见 [`is_known_slash_command`]）；未命中的斜杠文本
+    // （`/foo 是什么意思` 一类闲聊）按普通消息走 mention 门，不再制造未知
+    // 命令回执噪音。私聊不受影响（group_mention_ok 对 p2p 恒放行）。
     let is_command = mt == "text"
         && serde_json::from_str::<serde_json::Value>(&evt.event.message.content)
             .ok()
             .as_ref()
             .and_then(|v| v.get("text").and_then(|t| t.as_str()))
-            .map(|t| t.trim_start().starts_with('/'))
+            .map(is_known_slash_command)
             .unwrap_or(false);
     if !is_command
         && !group_mention_ok(
@@ -1518,6 +1540,29 @@ fn assemble_event_message(
         reply_hint: ReplyHint::None,
     };
     Some((dedup_key, msg))
+}
+
+/// 群斜杠免检白名单判定（P3，v13 遗留「群内斜杠免检噪音」）：首词（空白
+/// 分隔的首个 token）为 core 命令分派表的已知命令词才豁免 mention 门。
+/// - **首词**语义与 core 分派一致（`handle` 取 `parts[0]`）：`/chat allow`、
+///   `/status 查一下` 都算命中——平台层无从区分「命令参数」与「跟的闲聊」，
+///   白名单挡的是**未知**命令词（`/foo 是什么意思`），已知命令带尾巴仍由
+///   core 正常分派（参数被忽略，非噪音）；
+/// - 命令词小写比较（core 分派同款 `to_ascii_lowercase`，`/STATUS` 命中）；
+/// - 全角斜杠 `／` 不归一（core 分派归一，但平台层豁免维持 ASCII `'/'` 语义
+///   不变——全角命令带 @ 照常进分派）；
+/// - config `shortcuts` 的自定义 `/name` 不在清单（解析层无 config 视野），
+///   群内使用需 @bot。
+fn is_known_slash_command(text: &str) -> bool {
+    // split_whitespace 自带前导空白跳过（clippy::trim_split_whitespace）。
+    let Some(first) = text.split_whitespace().next() else {
+        return false;
+    };
+    if !first.starts_with('/') {
+        return false;
+    }
+    let lowered = first.to_ascii_lowercase();
+    imagent_core::Dispatcher::known_command_words().contains(&lowered.as_str())
 }
 
 /// 群消息 @bot 过滤（P6-1）。
@@ -2365,6 +2410,35 @@ mod tests {
 
         assert!(card_text_transcript("{}").is_none());
         assert!(card_text_transcript("not json").is_none());
+    }
+
+    /// P3（v13 遗留 fuzz 缺口）：深嵌套卡片（≤128 层，serde_json 合法解析域）
+    /// → walker 显式深度上限截断超深子树——不栈溢出、深部文本被截、顶层
+    /// 浅层文本照常收集；边界内（< 64 层）不截断。
+    #[test]
+    fn card_text_transcript_deep_nesting_truncated_not_crash() {
+        // 100 层 wrap 嵌套 + 底部深埋 markdown（elements 子项深度 101 ≥ 64）。
+        let mut deep = serde_json::json!({ "tag": "markdown", "content": "深处的文本" });
+        for _ in 0..100 {
+            deep = serde_json::json!({ "wrap": deep });
+        }
+        let card = serde_json::json!({
+            "elements": [
+                { "tag": "markdown", "content": "顶层文本" },
+                deep,
+            ]
+        });
+        let got = card_text_transcript(&card.to_string()).unwrap_or_default();
+        assert!(got.contains("顶层文本"), "浅层文本照常收集: {got}");
+        assert!(!got.contains("深处的文本"), "超深子树应截断: {got}");
+        // 边界内（60 层 wrap，markdown 对象深度 61 < 64）不截断。
+        let mut ok = serde_json::json!({ "tag": "markdown", "content": "边界内文本" });
+        for _ in 0..60 {
+            ok = serde_json::json!({ "wrap": ok });
+        }
+        let card2 = serde_json::json!({ "elements": [ok] });
+        let got2 = card_text_transcript(&card2.to_string()).unwrap();
+        assert!(got2.contains("边界内文本"), "边界内不截断: {got2}");
     }
 
     #[test]
@@ -4367,20 +4441,57 @@ mod tests {
     }
     /// 真机校准（2026-08-30）：群内不带 @ 的 `/chat allow` 此前在 @ 过滤层被
     /// 丢弃（引导命令死锁——群无法自助放行）。斜杠命令豁免；非命令仍拦。
+    /// P3（v13 遗留）：豁免收敛为已知命令白名单——首词命中 core 分派表才放行，
+    /// 未知斜杠词（`/foo 是什么意思`）按普通消息走 mention 门（要 @ 才触发）。
     #[test]
     fn group_slash_command_bypasses_mention_filter() {
-        let cmd = mk_group_mention_payload("e-cmd-1", "/chat allow", "[]");
         let policy = MentionPolicy::REQUIRE_BOT;
-        assert!(
-            parse_message_event(&cmd, &policy, None).is_some(),
-            "群内斜杠命令不应被 @ 过滤拦截"
+        // 已知命令（含引导命令与带参形态）：豁免 mention 门。
+        for cmd in ["/chat allow", "/status", "/status 查一下", "/STATUS"] {
+            let p = mk_group_mention_payload("e-cmd-1", cmd, "[]");
+            assert!(
+                parse_message_event(&p, &policy, None).is_some(),
+                "群内已知命令 {cmd} 不应被 @ 过滤拦截"
+            );
+        }
+        // 未知斜杠词：不再豁免——不带 @ 被拦（修复前任何 '/' 开头都豁免，
+        // 群友闲聊 `/foo 是什么意思` 也进命令分派回未知命令提示，噪音）。
+        for noise in ["/foo 是什么意思", "/salute!"] {
+            let p = mk_group_mention_payload("e-noise-1", noise, "[]");
+            assert!(
+                parse_message_event(&p, &policy, None).is_none(),
+                "未知斜杠词 {noise} 不带 @ 应被拦"
+            );
+        }
+        // 同一条未知斜杠词带 @bot → mention 门照常放行（@ 即显式定向）。
+        let at_bot = mk_group_mention_payload(
+            "e-noise-2",
+            "@_user_1 /foo 是什么意思",
+            r#"[{"key":"@_user_1","id":{"open_id":"ou_bot"},"name":"agent"}]"#,
         );
+        assert!(parse_message_event(&at_bot, &policy, Some("ou_bot")).is_some());
         // 对照：不带 @ 的普通文本仍被拦。
         let txt = mk_group_mention_payload("e-txt-1", "你好", "[]");
         assert!(
             parse_message_event(&txt, &policy, None).is_none(),
             "非命令群消息仍须 @"
         );
+        // 私聊照旧：任何斜杠文本（含未知词）不受 mention 门影响。
+        let p2p = serde_json::json!({
+            "header":{"event_id":"e-p2p","event_type":"im.message.receive_v1"},
+            "event":{"sender":{"sender_id":{"open_id":"ou_u"}},
+                "message":{"message_type":"text","content":"{\"text\":\"/foo 是什么意思\"}",
+                "chat_type":"p2p"}}
+        })
+        .to_string()
+        .into_bytes();
+        assert!(
+            parse_message_event(&p2p, &policy, Some("ou_bot")).is_some(),
+            "私聊不受斜杠白名单影响"
+        );
+        // 快捷/审批短文本守卫不受影响：非斜杠（y/n）永不豁免（沿用 mention 门）。
+        let y = mk_group_mention_payload("e-y", "y", "[]");
+        assert!(parse_message_event(&y, &policy, None).is_none());
     }
 
     // ---------- T10：群聊上下文注入（mock JSON → 解析/转录纯函数） ----------

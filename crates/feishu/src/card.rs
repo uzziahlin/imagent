@@ -250,6 +250,8 @@ pub(crate) fn terminal_done_footer(run_secs: u64, usage_display: Option<&str>) -
 
 /// 卡片 UX 批（v1.24）：终态卡摘要（config.summary，会话列表/通知预览用）。
 /// Done 取结论首行（剥 markdown 强调符，截 50 字）；Error/中断给状态语。
+/// P3（v13 遗留）：结论首行同过 mask_emails + 先掩后截（与 Running 态 digest
+/// summary 同口径——拦截面与正文一致，理由见 render_card 的 summary 注释）。
 fn terminal_summary(card: &OutboundCard, err: Option<&str>) -> String {
     match err {
         None => {
@@ -264,7 +266,7 @@ fn terminal_summary(card: &OutboundCard, err: Option<&str>) -> String {
             if plain.is_empty() {
                 "✅ 已完成".to_string()
             } else {
-                format!("✅ {}", truncate_chars(plain, 50))
+                format!("✅ {}", truncate_chars(&mask_emails(plain), 50))
             }
         }
         Some("已中断") => "⏹ 已中断".to_string(),
@@ -429,9 +431,12 @@ pub fn render_card(card: &OutboundCard, conv_id: &str, sender: Option<&str>) -> 
 
     // Running 态带自定义 summary（卡片列表预览/通知处显示，默认「生成中」）；
     // Done 态 streaming=false 不需要 summary。
+    // P3（v13 遗留）：summary 统一过 mask_emails——正文三路径已掩码，列表预览
+    // 不掩会让整卡被租户审计拒收（拦截面与正文不一致）。先掩后截：截断后的
+    // 残缺邮箱不再匹配掩码正则，裸 @ 会漏出（纯文本字段无注入语义，仅掩码）。
     let config = if streaming {
         let summary = match card.task_digest.as_deref().filter(|d| !d.trim().is_empty()) {
-            Some(d) => format!("🧠 处理中：{}", truncate_chars(d.trim(), 40)),
+            Some(d) => format!("🧠 处理中：{}", truncate_chars(&mask_emails(d.trim()), 40)),
             None => phase_footer(card.phase).to_string(),
         };
         serde_json::json!({
@@ -694,8 +699,10 @@ pub fn render_stream_init_card(
         // 影响；终态后仍在，点击回「当前没有运行中的任务」，无害）。
         stop_button(conv_id, sender),
     ]);
+    // P3（v13 遗留）：summary 过 mask_emails + 先掩后截（理由见 render_card 的
+    // streaming summary 注释——managed 初始卡与整卡两路径同口径）。
     let summary_of = match task_digest.filter(|d| !d.trim().is_empty()) {
-        Some(d) => format!("🧠 处理中：{}", truncate_chars(d.trim(), 40)),
+        Some(d) => format!("🧠 处理中：{}", truncate_chars(&mask_emails(d.trim()), 40)),
         None => "🧠 正在执行任务…".to_string(),
     };
     serde_json::json!({
@@ -2316,6 +2323,63 @@ mod tests {
         for keep in ["@larksuite/x", "pkg@1.2.3", "user@localhost", "@所有人"] {
             assert_eq!(mask_emails(keep), keep, "不应误伤: {keep}");
         }
+    }
+
+    /// P3（v13 遗留）：config.summary 的 digest/结论邮箱掩码——列表预览与正文
+    /// 拦截面一致（正文三路径已 mask_emails，summary 不掩会让整卡被租户审计
+    /// 拒收）。覆盖三构造点：managed 初始卡、整卡 Running、终态 Done 首行。
+    #[test]
+    fn config_summary_masks_emails_all_three_sites() {
+        let digest = "发给 someone@example.com 的邮件";
+        // ① managed 流式初始卡（render_stream_init_card）。
+        let init = render_stream_init_card("feishu:ou_u", None, Some(digest));
+        let v: serde_json::Value = serde_json::from_str(&init).expect("合法 JSON");
+        let summary = v["config"]["summary"]["content"].as_str().unwrap();
+        assert!(summary.contains("someone[at]example.com"), "{summary}");
+        assert!(!summary.contains("someone@example.com"), "{summary}");
+        // 正文（md_body）既有掩码行为不变。
+        assert!(init.contains("someone[at]example.com"));
+        assert!(!init.contains("someone@example.com"));
+        // ② 整卡 Running（render_card streaming 分支）。
+        let running = OutboundCard {
+            task_digest: Some(digest.into()),
+            text: String::new(),
+            tool_calls: vec![],
+            phase: CardPhase::Thinking,
+            thoughts: Vec::new(),
+            todos: Vec::new(),
+            queued_hint: None,
+            terminal: CardTerminal::Running,
+            usage_display: None,
+            run_secs: 0,
+        };
+        let card = render_card(&running, "feishu:ou_u", None);
+        let v: serde_json::Value = serde_json::from_str(&card).expect("合法 JSON");
+        let summary = v["config"]["summary"]["content"].as_str().unwrap();
+        assert!(summary.contains("someone[at]example.com"), "{summary}");
+        assert!(!summary.contains("someone@example.com"), "{summary}");
+        // ③ 终态 Done（terminal_summary 取结论首行）。
+        let done = OutboundCard {
+            task_digest: None,
+            text: "结论：已回复 alice@example.net，抄送 bob@test.org".into(),
+            tool_calls: vec![],
+            phase: CardPhase::Outputting,
+            thoughts: Vec::new(),
+            todos: Vec::new(),
+            queued_hint: None,
+            terminal: CardTerminal::Done,
+            usage_display: None,
+            run_secs: 1,
+        };
+        let card = render_card(&done, "feishu:ou_u", None);
+        let v: serde_json::Value = serde_json::from_str(&card).expect("合法 JSON");
+        let summary = v["config"]["summary"]["content"].as_str().unwrap();
+        assert!(summary.contains("alice[at]example.net"), "{summary}");
+        assert!(summary.contains("bob[at]test.org"), "{summary}");
+        assert!(!summary.contains("alice@example.net"), "{summary}");
+        // 无 digest/无邮箱路径行为不变（占位文案不受掩码影响）。
+        let plain = render_stream_init_card("feishu:ou_u", None, None);
+        assert!(plain.contains("🧠 正在执行任务…"));
     }
 
     /// P10：Running footer 组合——阶段 + 运行时长 + 排队提示；无附加纯阶段文案。

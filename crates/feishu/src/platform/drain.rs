@@ -1366,6 +1366,7 @@ pub(super) async fn send_drain_text_result(
             &root_id,
             "text",
             &serde_json::json!({ "text": text }).to_string(),
+            None,
         )
         .await
         .map(|_| ())
