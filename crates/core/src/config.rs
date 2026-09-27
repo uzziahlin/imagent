@@ -537,6 +537,17 @@ pub struct Config {
     /// `Dispatcher::reload_max_concurrent_rounds`）。
     #[serde(default = "default_max_concurrent_rounds")]
     pub max_concurrent_rounds: usize,
+    /// T7（code-review v13 §四.1，v1.28 安全批）：把 imagent 状态目录挡在 agent
+    /// 读视野外（**默认 true**）。claude-cli 后端每轮 spawn 注入 `--settings` deny
+    /// 规则——`Read`/`Edit`/`Write`/`Glob`/`Grep` 五条 `{imagent_home}/**` 绝对
+    /// 路径 glob（profile 感知，路径取 `crate::paths::imagent_home()`），防提示
+    /// 注入后的 agent 用默认免审只读工具直读 `imagent.db`（凭据/白名单/全部会话
+    /// prompt）。设 false 关闭（极少数需要 agent 读自家状态的调试场景）。
+    /// SIGHUP 热改生效（下一轮起）。仅 claude-cli 生效——ACP 命令行由
+    /// `IMAGENT_ACP_COMMAND` 外部指定，无法可靠追加参数（见 SECURITY.md 已知
+    /// 限制）；Bash 读取路径不受限（同 uid 进程边界，见威胁模型章）。
+    #[serde(default = "default_hide_state_dir_from_agent")]
+    pub hide_state_dir_from_agent: bool,
 }
 
 fn default_feishu_send_rps() -> f64 {
@@ -546,6 +557,12 @@ fn default_feishu_send_rps() -> f64 {
 /// 详见 Config::max_concurrent_rounds 文档。
 fn default_max_concurrent_rounds() -> usize {
     4
+}
+
+/// T7（v13 §四.1）：状态目录 deny 默认开启——安全缺省（要关须显式写
+/// `hide_state_dir_from_agent = false`），详见 Config::hide_state_dir_from_agent。
+fn default_hide_state_dir_from_agent() -> bool {
+    true
 }
 
 fn default_feishu_urgent_on_ask() -> bool {
@@ -1027,6 +1044,31 @@ impl Config {
             )));
         }
 
+        // T7：workdir 落在状态目录（生效 home 或基座 ~/.imagent）内 + deny 开启
+        // → agent 对工作区的文件读取会被 --settings deny 逐次拦下，轮次事实性
+        // 不可用。warn 不拒启：罕见误配、运行期症状明显，拒启反而挡住「确实要
+        // 在状态目录旁调试」的特殊场景（此时可显式 hide_state_dir_from_agent
+        // = false）。
+        if cfg.hide_state_dir_from_agent {
+            let mut deny_roots = vec![crate::paths::imagent_home()];
+            if let Some(h) = dirs::home_dir() {
+                let base = h.join(".imagent");
+                if !deny_roots.contains(&base) {
+                    deny_roots.push(base);
+                }
+            }
+            if deny_roots
+                .iter()
+                .any(|r| cfg.default_workdir.starts_with(r))
+            {
+                tracing::warn!(
+                    target: "imagent::config",
+                    workdir = %cfg.default_workdir.display(),
+                    "default_workdir 位于 imagent 状态目录内，hide_state_dir_from_agent 的 deny 规则会拦下 agent 对工作区的读取——请挪出工作区，或显式设 hide_state_dir_from_agent = false"
+                );
+            }
+        }
+
         Ok(cfg)
     }
 
@@ -1085,6 +1127,7 @@ permission_mode = "auto"    # 缺省=auto：claude-cli=透传 claude 原生 auto
 # feishu_asr_enabled = true     # 飞书语音转文字（需后台申请语音识别权限；失败回退提示，仅 feishu）
 # feishu_group_context_messages = 10  # 群消息触发轮次时拉本群最近 N 条消息前置注入 prompt（需 im:message 读权限，fail-soft）；默认10，0=关闭，上限50
 # sender_daily_cost_limit_usd = 5.0  # per-sender 成本上限（美元，滚动 24h 窗口；不设 = 不限）
+# hide_state_dir_from_agent = true   # 状态目录 deny（默认开，仅 claude-cli）：每轮注入 --settings deny 把 ~/.imagent 挡在 agent 读视野外（Read/Edit/Write/Glob/Grep）；false=关闭（调试用）
 "#;
 }
 /// claude `--permission-mode` 合法值归一（入参已小写化）：manual→default
@@ -1506,6 +1549,24 @@ message_fragment_interval_ms = 250
         );
         let cfg = Config::load(&p).expect("parse");
         assert!(cfg.require_keyring);
+        cleanup(&p);
+    }
+
+    /// T7（v13 §四.1）：hide_state_dir_from_agent 缺省 true（安全缺省，claude-cli
+    /// per-run 注入 --settings deny）；显式 false 可关（agent 读自家状态的调试
+    /// 场景）。
+    #[test]
+    fn hide_state_dir_from_agent_default_true_and_explicit_false() {
+        let p = tmp_path("hide_sd_def", r#"default_workdir = "/tmp/ws""#);
+        let cfg = Config::load(&p).expect("parse");
+        assert!(cfg.hide_state_dir_from_agent, "缺省应开启");
+        cleanup(&p);
+        let p = tmp_path(
+            "hide_sd_off",
+            "default_workdir = \"/tmp/ws\"\nhide_state_dir_from_agent = false\n",
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert!(!cfg.hide_state_dir_from_agent, "显式 false 应关闭");
         cleanup(&p);
     }
 

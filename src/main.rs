@@ -1078,13 +1078,15 @@ fn build_backend(
     }
 }
 
-/// W1-2/W1-3/W1-4：claude-cli 运行参数注入（启动与 SIGHUP 共用同一接线）。
+/// W1-2/W1-3/W1-4 + T7：claude-cli 运行参数注入（启动与 SIGHUP 共用同一接线）。
+/// T7 的 hide_state_dir 同此热改（整体替换，下一轮 spawn 生效）。
 fn apply_claude_runtime_opts(b: &imagent_claude::ClaudeBackend, config: &imagent_core::Config) {
     b.set_runtime_opts(
         config.claude_fallback_model.clone(),
         config.disallowed_tools.clone(),
         config.append_system_prompt.clone(),
         config.mcp_config_path.as_deref(),
+        config.hide_state_dir_from_agent,
     );
 }
 

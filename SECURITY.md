@@ -59,6 +59,7 @@
 - **S3 凭据应用层加密**：设置环境变量 `IMAGENT_PASSPHRASE` 后，OS keyring 不可用（headless/CI 常见）或写入失败时，凭据以 **AES-256-GCM + PBKDF2-SHA256（100k 迭代）** 加密落 SQLite（`enc:v1:` 版本化格式，随机 salt + nonce）；读取兼容 keyring / 加密 / 明文三形态，存量明文在读取时惰性迁移为加密形态。未设 passphrase 的明文回退日志升级为 error（headless 场景不阻断的取舍）。实现见 `crates/store/src/crypto.rs`。
 - **S7 metrics/health 端点鉴权**：设置环境变量 `IMAGENT_HTTP_TOKEN` 后，`/metrics` 与 `/health` 要求 Bearer token（不匹配返回 401）；**非 loopback 绑定且未配 token 时拒绝启动**（fail-closed）——暴露到网络的指标端点不会无鉴权裸奔。
 - **权限能力协商 fail-closed（v1.9.0 行为变更）**：`Backend` trait 新增 `PermissionCapability`（FullLoop / NativeOnly / Unsupported）；闭环类权限档（`permission_mode = "ask"` / claude 的 auto 档）× 非 FullLoop 后端（codex / gemini / 旧配置形态）**启动即拒绝**，不再静默忽略权限模式（此前 ask 档在无审批能力后端被静默降级 = 事实上的 fail-open）。`/perm` 热切同口径校验。
+- **状态目录 deny（T7，默认开）**：`hide_state_dir_from_agent`（缺省 `true`，仅 claude-cli 后端）每轮 spawn 注入 `--settings` 内联 deny 规则——`Read`/`Edit`/`Write`/`Glob`/`Grep` × `//<imagent_home>/**` 绝对路径 glob（profile 感知 + 基座 `~/.imagent`，覆盖 symlink 形态）——把 imagent 状态目录移出 agent 读视野，防提示注入后的 agent 用默认免审只读工具直读 `imagent.db`（凭据/白名单/全部会话 prompt）。deny 无条件压过任何来源的 allow，对默认免审工具同样生效。SIGHUP 热改（下一轮起）。**边界**：Bash/子进程间接读取仍不可挡（同 uid 进程级边界，见上文威胁模型；Read deny 对 Bash 中被识别的 `cat`/`head` 等点名文件的命令生效，对不点名文件的命令与任意子进程无效）；`Glob`/`Grep` 的路径形态规则当前 CLI 不 consult（`Read` 规则 best-effort 连带覆盖二者的 `path` 参数）；claude-acp 后端不注入（见已知限制）。需让 agent 读自家状态时显式设 `false`。
 - **store 文件 0600 / 目录 0700**（unix）。
 - **SSRF 白名单**：媒体下载仅允许 `novac2c.cdn.weixin.qq.com` 等 CDN 主机。
 - **限流熔断**：sendmessage 服从式退避（不绕风控）。
@@ -68,4 +69,5 @@
 - `bot_token` 优先经 **OS keyring 加密落盘**（store `credentials` 表只存 `keyring:<platform>:<account>` 指针 marker）；无 keychain 环境（headless/CI）或 keyring 写入失败时回退落 SQLite——**设置了 `IMAGENT_PASSPHRASE` 则回退形态为 AES-256-GCM 加密**（见上方 S3），否则为明文（error 日志提示）。旧库中的明文凭据会在读取时懒迁移到 keyring 或加密形态（见 `crates/store/src/credentials.rs`）。
 - **`wecom_secret` 明文存 config.toml**（与 iLink `bot_token` 走 OS keyring 不一致）：务必把 config.toml 收紧到 `0600`。完整 keyring 保护（含 bootstrap 命令）见 `docs/CODE_REVIEW_v6.md` R3。
 - **ACP 后端（`agent = "claude-acp"`）`allowed_tools` 不生效**：ACP 协议无 `--allowedTools` 等价机制，工具收敛只能靠 `permission_mode = ask/deny` 兜底；且 `Off` 在 ACP = **全放行**（与 CLI 的 `Off` = 不挂审批不同）。如需 `--allowedTools` 收敛 + 完整 IM 审批闭环，请用 `claude-cli` 后端。
+- **claude-acp 后端无状态目录 deny**：ACP 的 claude 命令行由 `IMAGENT_ACP_COMMAND` 外部指定，网关无法可靠追加 `--settings` deny 参数——`hide_state_dir_from_agent` 仅 claude-cli 生效。用 ACP 且在意该面时，可在 `IMAGENT_ACP_COMMAND` 指向的包装脚本里自行补 `--settings`，或依赖进程级隔离（专用用户/sandbox）。
 - iLink 是腾讯对外协议的第三方 Rust 实现，使用者自负合规责任（见 README 免责声明 + RESEARCH §2）。
