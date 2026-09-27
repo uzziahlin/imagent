@@ -70,4 +70,5 @@
 - **`wecom_secret` 明文存 config.toml**（与 iLink `bot_token` 走 OS keyring 不一致）：务必把 config.toml 收紧到 `0600`。完整 keyring 保护（含 bootstrap 命令）见 `docs/CODE_REVIEW_v6.md` R3。
 - **ACP 后端（`agent = "claude-acp"`）`allowed_tools` 不生效**：ACP 协议无 `--allowedTools` 等价机制，工具收敛只能靠 `permission_mode = ask/deny` 兜底；且 `Off` 在 ACP = **全放行**（与 CLI 的 `Off` = 不挂审批不同）。如需 `--allowedTools` 收敛 + 完整 IM 审批闭环，请用 `claude-cli` 后端。
 - **claude-acp 后端无状态目录 deny**：ACP 的 claude 命令行由 `IMAGENT_ACP_COMMAND` 外部指定，网关无法可靠追加 `--settings` deny 参数——`hide_state_dir_from_agent` 仅 claude-cli 生效。用 ACP 且在意该面时，可在 `IMAGENT_ACP_COMMAND` 指向的包装脚本里自行补 `--settings`，或依赖进程级隔离（专用用户/sandbox）。
+- **云文档评论会话的信任边界**：conv `feishu:comment:<file_token>` 放行后，**所有能评论该文档的协作者**共享同一个 agent 会话（上下文 / 会话级 allow-set / 工作区互通），且回复锚定评论者本人（v13 后）。放行一个文档会话 = 放行该文档的**全体协作者**驱动 agent——协作者范围通常远大于 IM 白名单。文档权限请按此口径收敛（链接分享/协作者清单），或对高敏文档不开评论会话。
 - iLink 是腾讯对外协议的第三方 Rust 实现，使用者自负合规责任（见 README 免责声明 + RESEARCH §2）。
