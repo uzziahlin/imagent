@@ -2,6 +2,75 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.27.0] — 2026-09-27
+
+> **v13 深度审查修复批**（docs/CODE_REVIEW_v13.md：四路对抗深审，4 P1 +
+> 9 P2）：吞吐面/威胁模型补审发现的系统性问题集中修复 + 威胁模型文档。
+> 全仓 739 tests / 0 failed、clippy 零警告。
+
+### ⚠️ 行为变更
+- **自动压缩默认关闭**：`model_context_window_tokens` 与
+  `auto_compact_threshold_tokens` 缺省均改为 0（此前 1M/120k）——网关
+  token 口径与 CLI 估算存在偏差，误压缩丢上下文细节的代价高于收益；
+  80k 水位提示卡一并移除。需要者显式声明开启（比例/绝对双档保留）
+- **max_concurrent_rounds = 4（新缺省）**：全局并发护栏（0=不限）——多群
+  /cron 齐点/webhook 风暴下 N 个 agent 子进程无上限并发的时代结束
+- **webhook 非 loopback 无 secret 拒绝启动**（对齐 metrics 端点口径）
+
+### Fixed
+- **P1 卡片节流钉死消费速率**：500ms 节流睡眠此前发生在 chunk 消费路径，
+  claude-acp 的 delta 级流被钉死 ~2 条/秒，长轮可拖到 agent_timeout 报废
+  ——CardSession 重构为常驻 patcher 任务（消费方只置脏+唤醒，零阻塞）
+- **P1 `<at>` 注入第 4 洞**：`md_element_anchored` 绕过 v1.26 转义收口
+  （managed 流式卡初始帧 md_body 承载用户原始 prompt 前 60 字）——收口
+  补齐，`sender_anchor_line` 声明为唯一合法 `<at>` 构造点
+- **P1 ACP 忽略 allowed_tools 静默分叉**：`Backend` trait 新增
+  `supports_tool_allowlist` 能力位，启动/SIGHUP//perm 三点位告警（此前
+  两个 FullLoop 后端间安全配置静默失效，仅 debug log）
+- **P1 webhook 无重放防护**：两层防护——签名去重 LRU（默认启用，同字节
+  重放必命中 409）+ opt-in 时间戳协议（`X-Imagent-Timestamp` + 签名覆盖
+  `ts.body`）；配 `replay_window_secs` 未配 secret 直接拒启
+- **P2 命令按钮私聊免检 sender**：卡片转发 = 跨会话注入（B 点击即可在
+  A 的私聊会话执行 /stop /new /again）——改全形态校验对齐询问类
+- **P2 cancel 文案伪装用户回答**：ask_via_im 终端提问在被 /stop 波及时
+  收到「cancelled（…）」当作用户答复继续推理——cancelled 哨兵 + 终端侧
+  回 Err
+- **P2 recv 主循环内联平台调用**：审批收尾（审计/卡片收敛/提示）spawn
+  化——飞书 429/token 刷新期间全平台入站停摆 30s+ 的队头阻塞残余
+- **P2 审批发起者锚定贯通文本路径**：群内白名单成员打 "y" 代批他人
+  触发的危险操作——PendingAsk 存发起者，非发起者拒绝（admin 可代批）
+- **P2 正常完成路径 stderr 挂起**：孙进程持有 stderr 写端时 run 挂到
+  空闲看门狗（20min）+ fd 泄漏——5s 超时 abort 读取端（cancel/超时路径
+  本有 killpg 兜底，本项补齐唯一漏网的 happy path）
+- **P2 非卡片平台 ACP delta 刷屏**：逐条 send_text 打爆 QPS——400ms
+  合帧缓冲（中断路径缓冲文本必达）
+- P3 批：/stop 拦截批次表情恒挂 👀、/compact 中断裸泄 JoinError、
+  降级卡终止按钮无发起者编码、撤回双缺形态伪造非法 conv、卡片回调日志
+  全量落盘（截断 400）、deny/allow × 非闭环后端无执行点提示
+
+### Added
+- **威胁模型与边界文档**（SECURITY.md）：「agent = 同 uid 宿主用户」定位
+  为显式信任边界——提示注入场景 5 条残留路径、单人 vs 多人群部署风险
+  分级、缓解清单
+- **飞书群聊上下文注入**：群 @bot 自动拉最近 N 条群消息（缺省 10）作
+  前置上下文（跳 bot/截断/正序；fail-soft）——群协作场景 agent 获得
+  群记忆
+- **云文档评论链路补全**：回复锚定评论者本人（此前锚「最后评论者」，
+  回答落错线程）+ 划词引用片段注入（agent 知道用户在评论文档哪一段）
+- **引用卡片转录**：引用/合并转发聊天记录里的 bot 回复卡可追问
+  （card_text_transcript 抽卡片文本正文）
+- **消费侧可观测**：`imagent_running_rounds` / `imagent_round_queue_depth`
+  gauge（Drop guard 防取消泄漏）；/status 在飞明细含全局上限
+- **能力面告警贯通**：/perm 回执与启动日志可见「该档位在此后端无执行点
+  / 不支持 allowed_tools 收敛」——能力协商矩阵补齐反向象限
+
+### Changed
+- ACP UsageUpdate 语义勘误（used = 轮末最后一次请求的完整上下文规模，
+  真机双调用探针验证）
+- 文档单一事实源修缮：ARCHITECTURE 补 cron/webhook/outbox/排队持久化/
+  崩溃恢复/housekeeping 六子系统（schema v9→v15）、README/CLAUDE.md
+  版本漂移修正、删误提交垃圾文件
+
 ## [1.26.0] — 2026-09-14
 
 > **可诊断性 + 能力面 + 质量护城河批次**：/doctor 权限自检、/mcp 热管理、
