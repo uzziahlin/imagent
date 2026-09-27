@@ -1525,6 +1525,126 @@ pub async fn list_chat_messages(
     Ok(crate::proto::parse_group_context_items(&v, own_app_id))
 }
 
+// ---------------------------------------------------------------------------
+// T12（v13 产品批 #3）：Bitable 多维表格数据面。agent 经 `imagent mcp` 的
+// bitable_list_fields / bitable_append_row 工具 → permission socket
+//（kind=bitable）→ BitableApi（crate::bitable::FeishuBitable）→ 以下 HTTP。
+// ---------------------------------------------------------------------------
+
+/// T12：列出多维表格字段——GET `/bitable/v1/apps/{app_token}/tables/{table_id}/fields`。
+///
+/// MVP 单页（page_size=50，fields API 的 page_size 上限）：数据面字段清单用于
+/// agent 写行前对齐列名，超 50 列的表罕见；`has_more` 时取首页并 debug 留痕
+///（完整翻页留待真机需求再补）。手写 reqwest + [`retry_on_rate_limit!`] +
+/// [`feishu_api_resp`]（对齐 [`list_chat_messages`] 的写法）。需应用开通
+/// `bitable:app` 读写权限。条目宽容提取见 [`parse_bitable_fields`]（纯函数，
+/// 有单测钉住；响应字段形态**待真机校准**）。
+pub async fn list_bitable_fields(
+    core_config: &CoreConfig,
+    token: &str,
+    app_token: &str,
+    table_id: &str,
+) -> imagent_core::Result<Vec<imagent_core::BitableField>> {
+    let base = core_config.base_url().trim_end_matches('/').to_string();
+    let v: serde_json::Value = retry_on_rate_limit!(async {
+        let resp = api_client()
+            .clone()
+            .get(format!(
+                "{base}/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields"
+            ))
+            .bearer_auth(token)
+            .query(&[("page_size", "50")])
+            .send()
+            .await
+            .map_err(|e| {
+                imagent_core::CoreError::Platform(PLATFORM, format!("bitable_list_fields: {e}"))
+            })?;
+        feishu_api_resp(resp, "bitable_list_fields").await
+    })?;
+    if v.pointer("/data/has_more")
+        .and_then(|m| m.as_bool())
+        .unwrap_or(false)
+    {
+        tracing::debug!(
+            target: "feishu",
+            app_token, table_id,
+            "bitable 字段超过 50（has_more=true），MVP 只取首页字段清单"
+        );
+    }
+    Ok(parse_bitable_fields(&v))
+}
+
+/// [`list_bitable_fields`] 的响应解析（纯函数，便于单测）：`data.items[]` 的
+/// `field_name` + 类型（优先可读的 `ui_type` 字符串，回退 `type` 字段——旧版
+/// API 形态是整数枚举，toString 兜底）。
+pub(crate) fn parse_bitable_fields(v: &serde_json::Value) -> Vec<imagent_core::BitableField> {
+    v.pointer("/data/items")
+        .and_then(|i| i.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|it| {
+                    let name = it.get("field_name").and_then(|n| n.as_str())?;
+                    let field_type = it
+                        .get("ui_type")
+                        .and_then(|t| t.as_str())
+                        .map(str::to_string)
+                        .or_else(|| it.get("type").and_then(|t| t.as_str()).map(str::to_string))
+                        .or_else(|| {
+                            it.get("type")
+                                .and_then(|t| t.as_i64())
+                                .map(|n| n.to_string())
+                        })
+                        .unwrap_or_default();
+                    Some(imagent_core::BitableField {
+                        name: name.to_string(),
+                        field_type,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// T12：追加一行记录——POST `/bitable/v1/apps/{app_token}/tables/{table_id}/records`，
+/// body `{"fields": {...}}`（键=列名、值=标量），返回新记录 `record_id`。
+///
+/// 字段名不匹配是高频错误（飞书回 FieldNameNotFound 类业务码）——错误 message
+/// 经 [`feishu_api_resp`] 原样透传（`msg=` 段），agent 可按提示修列名。限流走
+/// [`retry_on_rate_limit!`]（数据面写入不能因 429 静默丢行）。
+pub async fn append_bitable_record(
+    core_config: &CoreConfig,
+    token: &str,
+    app_token: &str,
+    table_id: &str,
+    fields: &serde_json::Map<String, serde_json::Value>,
+) -> imagent_core::Result<String> {
+    retry_on_rate_limit!(async {
+        let base = core_config.base_url().trim_end_matches('/').to_string();
+        let url = format!("{base}/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records");
+        let client = api_client().clone();
+        let resp = client
+            .post(&url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({ "fields": fields }))
+            .send()
+            .await
+            .map_err(|e| {
+                imagent_core::CoreError::Platform(PLATFORM, format!("bitable_append_row: {e}"))
+            })?;
+        let v = feishu_api_resp(resp, "bitable_append_row").await?;
+        v.pointer("/data/record/record_id")
+            .and_then(|r| r.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                imagent_core::CoreError::Platform(
+                    PLATFORM,
+                    "bitable_append_row: 响应缺 record/record_id".into(),
+                )
+            })
+    })
+}
+
 /// 回复云文档评论（P4-9）：POST `/drive/v1/files/{file_token}/comments/{comment_id}/replies`。
 ///
 /// 手写 HTTP（open-lark 0.20 无 drive 评论模块，同 CardKit 做法）。需应用开通

@@ -4261,6 +4261,149 @@ async fn permission_socket_token_handshake() {
     drop_db(ctx.db).await;
 }
 
+/// T12（v13 产品批 #3）：Mock BitableApi——记录收到的 (op, fields) 供 socket
+/// 路由测试断言。
+type BitableCalls =
+    Arc<TokioMutex<Vec<(String, Option<serde_json::Map<String, serde_json::Value>>)>>>;
+struct MockBitable {
+    calls: BitableCalls,
+}
+
+#[async_trait]
+impl crate::bitable::BitableApi for MockBitable {
+    async fn list_fields(&self) -> Result<Vec<crate::bitable::BitableField>> {
+        self.calls.lock().await.push(("list_fields".into(), None));
+        Ok(vec![
+            crate::bitable::BitableField {
+                name: "任务".into(),
+                field_type: "Text".into(),
+            },
+            crate::bitable::BitableField {
+                name: "完成时间".into(),
+                field_type: "DateTime".into(),
+            },
+        ])
+    }
+    async fn append_row(
+        &self,
+        fields: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<String> {
+        self.calls
+            .lock()
+            .await
+            .push(("append_row".into(), Some(fields)));
+        Ok("rec_mock_1".into())
+    }
+}
+
+/// T12：`kind=bitable` socket 路由——op/fields 透传到注入的 BitableApi、
+/// 回包 ok/data 形态；未注入（None）回「未配置 feishu_bitable_*」错误文案；
+/// 参数残缺（fields 缺失/空）与未知 op 在主进程侧拦下。
+#[cfg(unix)]
+#[tokio::test]
+async fn bitable_socket_routes_and_reports_unconfigured() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let _serial = SERIAL.lock().await;
+    let ctx = build_with_mode(Auth::new(vec!["alice".into()]), PermissionMode::Off).await;
+    let dir = std::env::temp_dir().join(format!("imagent-sock-bitable-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let sock = dir.join("permission.sock");
+    ctx.disp
+        .spawn_socket_accept(sock.to_string_lossy().into_owned());
+    let token_path = dir.join("permission.token");
+    for _ in 0..400 {
+        if sock.exists() && token_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let token = std::fs::read_to_string(&token_path)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // 辅助：发一行 kind=bitable 请求，读一行回复。
+    async fn roundtrip(sock: &std::path::Path, token: &str, body: &str) -> String {
+        let mut s = tokio::net::UnixStream::connect(sock).await.unwrap();
+        s.write_all(format!("{token}\n").as_bytes()).await.unwrap();
+        s.write_all(format!("{body}\n").as_bytes()).await.unwrap();
+        s.flush().await.unwrap();
+        let mut buf = String::new();
+        let mut r = tokio::io::BufReader::new(s);
+        let _ = tokio::time::timeout(Duration::from_secs(5), r.read_line(&mut buf)).await;
+        buf
+    }
+
+    // ① 注入 mock → append_row 收到 op+fields，回包带 record_id。
+    let calls: BitableCalls = Arc::new(TokioMutex::new(Vec::new()));
+    ctx.disp.set_bitable(Some(Arc::new(MockBitable {
+        calls: calls.clone(),
+    })));
+    let reply = roundtrip(
+        &sock,
+        &token,
+        r#"{"kind":"bitable","conv_id":"c1","op":"append_row","fields":{"任务":"巡检","状态":"通过"}}"#,
+    )
+    .await;
+    assert!(
+        reply.contains("\"ok\":true") && reply.contains("rec_mock_1"),
+        "append_row 应回 ok+record_id: {reply}"
+    );
+    let got = calls.lock().await.clone();
+    assert_eq!(got.len(), 1, "mock 应收到一次调用");
+    assert_eq!(got[0].0, "append_row");
+    let fields = got[0].1.as_ref().expect("append_row 应带 fields");
+    assert_eq!(fields.get("任务"), Some(&serde_json::json!("巡检")));
+    assert_eq!(fields.get("状态"), Some(&serde_json::json!("通过")));
+
+    // ② list_fields → 回字段数组（name/type 形态）。
+    let reply = roundtrip(
+        &sock,
+        &token,
+        r#"{"kind":"bitable","conv_id":"c1","op":"list_fields"}"#,
+    )
+    .await;
+    assert!(reply.contains("\"ok\":true"), "{reply}");
+    assert!(
+        reply.contains("任务") && reply.contains("Text") && reply.contains("DateTime"),
+        "字段摘要应含 name/type: {reply}"
+    );
+    assert_eq!(calls.lock().await.len(), 2, "list_fields 也应记一笔");
+
+    // ③ 参数残缺：fields 缺失 / 空对象 → ok=false（不进 mock）。
+    for bad in [
+        r#"{"kind":"bitable","conv_id":"c1","op":"append_row"}"#,
+        r#"{"kind":"bitable","conv_id":"c1","op":"append_row","fields":{}}"#,
+        r#"{"kind":"bitable","conv_id":"c1","op":"bogus"}"#,
+    ] {
+        let before = calls.lock().await.len();
+        let reply = roundtrip(&sock, &token, bad).await;
+        assert!(
+            reply.contains("\"ok\":false"),
+            "残缺请求应回错: {bad} → {reply}"
+        );
+        assert_eq!(calls.lock().await.len(), before, "不应触达 mock: {bad}");
+    }
+
+    // ④ 未注入（None，配置不齐备）→ 明确的配置引导错误。
+    ctx.disp.set_bitable(None);
+    let reply = roundtrip(
+        &sock,
+        &token,
+        r#"{"kind":"bitable","conv_id":"c1","op":"list_fields"}"#,
+    )
+    .await;
+    assert!(reply.contains("\"ok\":false"), "{reply}");
+    assert!(
+        reply.contains("feishu_bitable_app_token") && reply.contains("feishu_bitable_table_id"),
+        "未配置文案应指名配置键: {reply}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    drop_db(ctx.db).await;
+}
+
 /// P5-第五批：/stop 可中断 /compact（注册进 running；被中断后回异常提示，
 /// 在飞注册清空）。
 #[tokio::test]

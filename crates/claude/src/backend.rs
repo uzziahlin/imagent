@@ -66,6 +66,11 @@ pub struct RuntimeOpts {
     /// true 由 main 接线注入；`Default` = false 仅是库裸用形态）。为 true 时每轮
     /// spawn 附加 `--settings` deny 规则，见 [`state_dir_deny_settings`]。
     pub hide_state_dir: bool,
+    /// T12（v13 产品批 #3）：Bitable 数据面开关（config `feishu_bitable_app_token`
+    /// 与 `feishu_bitable_table_id` 齐备且 platform=feishu，main 判定后注入）。
+    /// 为 true 时 mcp 配置的 imagent 条目追加 `--bitable 1`——MCP server 暴露
+    /// bitable_list_fields / bitable_append_row 工具（下一轮 spawn 生效）。
+    pub bitable: bool,
 }
 
 impl ClaudeBackend {
@@ -126,11 +131,11 @@ impl ClaudeBackend {
         *self.native_perm_mode.write() = mode;
     }
 
-    /// W1-2/W1-3/W1-4 + T7：注入 config 侧运行参数（main 启动与 SIGHUP 调用；
+    /// W1-2/W1-3/W1-4 + T7/T12：注入 config 侧运行参数（main 启动与 SIGHUP 调用；
     /// `extra_mcp_path` 现场读取解析，读失败 warn 后按无用户 servers 处理——
     /// config load 期已校验过一次，此处失败属文件后来被改动）。T7 的
-    /// `hide_state_dir` 见 [`RuntimeOpts::hide_state_dir`]（SIGHUP 整体替换，
-    /// 下一轮 spawn 生效）。
+    /// `hide_state_dir` 见 [`RuntimeOpts::hide_state_dir`]；T12 的 `bitable`
+    /// 见 [`RuntimeOpts::bitable`]（均 SIGHUP 整体替换，下一轮 spawn 生效）。
     pub fn set_runtime_opts(
         &self,
         fallback_model: Option<String>,
@@ -138,6 +143,7 @@ impl ClaudeBackend {
         append_system_prompt: Option<String>,
         extra_mcp_path: Option<&std::path::Path>,
         hide_state_dir: bool,
+        bitable: bool,
     ) {
         let extra_mcp = extra_mcp_path.and_then(|p| {
             std::fs::read_to_string(p)
@@ -163,6 +169,7 @@ impl ClaudeBackend {
             append_system_prompt,
             extra_mcp,
             hide_state_dir,
+            bitable,
         };
     }
 }
@@ -317,13 +324,20 @@ fn sanitize_filename(s: &str) -> String {
 /// W1-3：`extra`（用户 `mcp_config_path` 的解析产物）中的 `mcpServers` 条目会
 /// **合并**进生成配置（给 agent 挂用户工具）；名为 [`imagent_core::mcp::SERVER_NAME`]
 /// 的条目跳过（审批闭环专用名，防遮蔽）。`sock = None` 表示不挂审批闭环
-/// （permission_mode=Off 但用户配置了 MCP servers 时：纯用户工具，无 imagent 条目）。
+/// （permission_mode=Off / Control 通道：纯用户工具，无 imagent 条目）。
+///
+/// T12：`bitable = true`（feishu_bitable_* 配置齐备）时**即使 sock=None 也挂
+/// imagent 条目**——bitable 数据面工具与审批闭环共用同一 MCP server 子进程和
+/// permission socket（bitable 请求走 `kind=bitable` 消息，与审批互不干扰）；
+/// 此时 socket 路径取默认 `permission.sock`。`--bitable` 恒传 0|1（参数形态
+/// 稳定，MCP server 侧无需猜测缺省）。
 async fn write_mcp_config(
     conv_id: &str,
     sock: Option<&str>,
     mode: PermissionMode,
     ask_timeout_secs: u64,
     extra: Option<&serde_json::Value>,
+    bitable: bool,
 ) -> std::io::Result<std::path::PathBuf> {
     let exe = std::env::current_exe()?;
     let mut servers = serde_json::Map::new();
@@ -343,7 +357,12 @@ async fn write_mcp_config(
             servers.insert(k.clone(), v.clone());
         }
     }
-    if let Some(sock) = sock {
+    if sock.is_some() || bitable {
+        // sock=None + bitable（Control 审批通道 + 数据面）时 MCP server 仍需
+        // socket 连主进程——回落默认 permission.sock 路径。
+        let sock_path = sock
+            .map(str::to_string)
+            .unwrap_or_else(permission_sock_path);
         servers.insert(
             imagent_core::mcp::SERVER_NAME.to_string(),
             serde_json::json!({
@@ -351,9 +370,10 @@ async fn write_mcp_config(
                 // S-3：--ask-timeout 把 permission_ask_timeout 传给 MCP server 子进程，
                 // 与 dispatcher 审批等待预算对齐（防 MCP 先超时返 deny）。
                 "args": [
-                    "mcp", "--conv-id", conv_id, "--sock", sock,
+                    "mcp", "--conv-id", conv_id, "--sock", sock_path,
                     "--mode", mode.as_str(),
                     "--ask-timeout", ask_timeout_secs.to_string(),
+                    "--bitable", if bitable { "1" } else { "0" },
                 ]
             }),
         );
@@ -552,12 +572,19 @@ impl Backend for ClaudeBackend {
         // 时回调 permission_request，由 MCP server 依模式 allow/deny 或经 socket 转 IM 询问。
         // W1-3：用户配置了 MCP servers 时，即使 Off 档也写 mcp 配置（纯用户工具，
         // 不含 imagent 审批条目、不挂 --permission-prompt-tool）。
+        // T12：bitable 数据面（opts.bitable）也经同一 MCP server 挂载——即使
+        // Control 通道（sock=None）也写 imagent 条目（write_mcp_config 内回落
+        // 默认 sock 路径），agent 获得 bitable_* 工具。
         let mode = *self.permission_mode.read();
         let extra = opts.extra_mcp.clone();
+        let bitable = opts.bitable;
         let use_control = control_io.is_some();
-        let mcp_json: Option<std::path::PathBuf> = if mode.is_enabled() || extra.is_some() {
-            // Control 通道：审批不经 MCP（sock=None——mcp 配置只承载用户 servers，
-            // 无 imagent 条目、不挂 --permission-prompt-tool）。
+        let mcp_json: Option<std::path::PathBuf> = if mode.is_enabled()
+            || extra.is_some()
+            || bitable
+        {
+            // Control 通道：审批不经 MCP（sock=None——mcp 配置只承载用户 servers
+            // 与 bitable，无 --permission-prompt-tool）。
             let sock = (mode.is_enabled() && !use_control).then(permission_sock_path);
             match write_mcp_config(
                 conv_id,
@@ -565,6 +592,7 @@ impl Backend for ClaudeBackend {
                 mode,
                 self.ask_timeout.as_secs(),
                 extra.as_ref(),
+                bitable,
             )
             .await
             {
@@ -1015,6 +1043,7 @@ mod tests {
             PermissionMode::Ask,
             300,
             Some(&extra),
+            false,
         )
         .await
         .expect("写 mcp 配置");
@@ -1031,12 +1060,57 @@ mod tests {
             serde_json::json!(std::env::current_exe().unwrap().to_string_lossy()),
             "imagent 条目须为审批闭环定义（用户 evil-override 被跳过）: {raw}"
         );
+        // bitable=0 恒传（参数形态稳定）。
+        let args = servers[imagent_core::mcp::SERVER_NAME]["args"]
+            .as_array()
+            .expect("args 数组");
+        let bitable_flag = args
+            .iter()
+            .position(|a| a == "--bitable")
+            .expect("--bitable 恒传");
+        assert_eq!(args[bitable_flag + 1], "0", "未启用传 0: {raw}");
         let _ = std::fs::remove_file(&p);
 
-        // sock = None：纯用户条目，无 imagent 审批 server。
-        let p = write_mcp_config("test_conv", None, PermissionMode::Off, 300, Some(&extra))
+        // T12：sock = None + bitable = true（Control 审批通道 + 数据面）——
+        // 仍挂 imagent 条目（socket 路径回落默认 permission.sock），--bitable 1。
+        let p = write_mcp_config("test_conv", None, PermissionMode::Off, 300, None, true)
             .await
             .expect("写 mcp 配置");
+        let raw = std::fs::read_to_string(&p).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let servers = v["mcpServers"].as_object().expect("mcpServers 对象");
+        let args = servers[imagent_core::mcp::SERVER_NAME]["args"]
+            .as_array()
+            .expect("bitable 启用时 imagent 条目应存在: {raw}");
+        let flag = args
+            .iter()
+            .position(|a| a == "--bitable")
+            .expect("--bitable 应存在");
+        assert_eq!(args[flag + 1], "1", "启用传 1: {raw}");
+        let sock_idx = args
+            .iter()
+            .position(|a| a == "--sock")
+            .expect("MCP server 仍需 socket 连主进程");
+        assert!(
+            args[sock_idx + 1]
+                .as_str()
+                .unwrap()
+                .contains("permission.sock"),
+            "sock 回落默认路径: {raw}"
+        );
+        let _ = std::fs::remove_file(&p);
+
+        // sock = None + bitable = false：纯用户条目，无 imagent 审批 server。
+        let p = write_mcp_config(
+            "test_conv",
+            None,
+            PermissionMode::Off,
+            300,
+            Some(&extra),
+            false,
+        )
+        .await
+        .expect("写 mcp 配置");
         let raw = std::fs::read_to_string(&p).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let servers = v["mcpServers"].as_object().expect("mcpServers 对象");
@@ -1048,7 +1122,7 @@ mod tests {
         let _ = std::fs::remove_file(&p);
 
         // extra = None + sock = None：空 mcpServers（调用方不会走到，防呆）。
-        let p = write_mcp_config("test_conv", None, PermissionMode::Off, 300, None)
+        let p = write_mcp_config("test_conv", None, PermissionMode::Off, 300, None, false)
             .await
             .expect("写 mcp 配置");
         let raw = std::fs::read_to_string(&p).unwrap();

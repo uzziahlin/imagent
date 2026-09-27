@@ -114,6 +114,10 @@ enum Cmd {
         /// S-3：socket 读超时（秒，= config.permission_ask_timeout_secs），与 dispatcher 审批预算对齐。
         #[arg(long, default_value_t = 300)]
         ask_timeout: u64,
+        /// T12：是否暴露 bitable 数据面工具（write_mcp_config 按
+        /// feishu_bitable_* 配置写入 0|1；1 时 tools/list 追加两个 bitable 工具）。
+        #[arg(long, default_value_t = 0)]
+        bitable: u8,
     },
     /// 内部子命令：面向终端 agent 的「问人」MCP server（stdio JSON-RPC），暴露
     /// `ask_via_im` 工具。挂在任意终端 agent 的 MCP 配置里（command=imagent，
@@ -553,6 +557,14 @@ async fn main() -> Result<()> {
             }
             let platform = build_platform(platform_name, &config, store.clone()).await?;
 
+            // T12：Bitable 数据面启用判定（claude 运行参数 --bitable 与
+            // Dispatcher 注入共用同一判定）；未启用原因一次性 warn（缺一/非
+            // feishu 平台——配置了但无效的场景给用户看得见的反馈）。
+            if let Some(reason) = config.bitable_disable_reason(platform_name) {
+                tracing::warn!(target: "imagent::ops", "{reason}");
+            }
+            let bitable_on = config.bitable_enabled_for(platform_name);
+
             // 孤儿流式卡片关流（P4_ROADMAP 第六批）：上次进程退出时滞留「生成中」的
             // 卡片按 store 登记逐张 patch 成「已中断」，失败保留登记下次再试。
             imagent_core::sweep_live_cards(&store, platform.as_ref()).await;
@@ -574,6 +586,7 @@ async fn main() -> Result<()> {
                 &config,
                 perm_mode.clone(),
                 std::time::Duration::from_secs(config.permission_ask_timeout_secs),
+                bitable_on,
             )?;
             // W1-2：模型基准值（config `claude_model`）——/model 的运行时热设以
             // 此为初值，SIGHUP 重载时重设回 config 值。
@@ -676,6 +689,9 @@ async fn main() -> Result<()> {
                 );
             }
             dispatcher.set_approval_tools(config.approval_tools.clone());
+            // T12：Bitable 数据面注入（platform=feishu 且 app_token/table_id 齐备
+            // → feishu 实现挂进 Dispatcher；socket kind=bitable 请求经它落飞书）。
+            apply_bitable(&dispatcher, &config, platform_name);
 
             // 9. 运维 HTTP server（/metrics + /health）。metrics_addr 为 None 或空串则关闭。
             let start_at = std::time::Instant::now();
@@ -792,6 +808,7 @@ async fn main() -> Result<()> {
                 claude_cli_handle,
                 config_path.clone(),
                 http_store.clone(),
+                platform_name.to_string(),
             );
             #[cfg(not(unix))]
             {
@@ -1009,6 +1026,7 @@ async fn main() -> Result<()> {
             sock,
             mode,
             ask_timeout,
+            bitable,
         } => {
             // 作为 claude 的 MCP 权限审批 server（stdio JSON-RPC）。
             let mode = imagent_core::PermissionMode::from_str_lossy(&mode);
@@ -1016,6 +1034,7 @@ async fn main() -> Result<()> {
                 target: "imagent::mcp",
                 conv_id = %conv_id, sock = %sock, mode = mode.as_str(),
                 ask_timeout_secs = ask_timeout,
+                bitable,
                 "MCP permission server starting"
             );
             if let Err(e) = imagent_core::mcp::run_mcp_server(
@@ -1023,6 +1042,7 @@ async fn main() -> Result<()> {
                 sock,
                 mode,
                 std::time::Duration::from_secs(ask_timeout),
+                bitable != 0,
             )
             .await
             {
@@ -1409,6 +1429,7 @@ fn build_backend(
     config: &imagent_core::Config,
     perm_mode: Arc<parking_lot::RwLock<imagent_core::PermissionMode>>,
     ask_timeout: std::time::Duration,
+    bitable: bool,
 ) -> Result<BuiltBackend> {
     match config.agent.as_str() {
         "codex" => Ok((Arc::new(imagent_codex::CodexBackend::new()), None)),
@@ -1457,22 +1478,80 @@ fn build_backend(
             // W1-2/W1-3/W1-4：claude-cli 运行参数（fallback 模型 / 禁用工具 /
             // 系统提示 / 用户 MCP servers）。具体类型上调用（trait 不暴露
             // claude 专有参数）；句柄额外返回给 SIGHUP 重载用。
-            apply_claude_runtime_opts(&b, config);
+            // T12：bitable 开关经 RuntimeOpts 进 write_mcp_config（--bitable）。
+            // claude-cli 之外的分支忽略该参数（bitable 工具面只在 claude-cli
+            // 存在——ACP 的 MCP 配置不经 write_mcp_config）。
+            apply_claude_runtime_opts(&b, config, bitable);
             Ok((b.clone(), Some(b)))
         }
     }
 }
 
-/// W1-2/W1-3/W1-4 + T7：claude-cli 运行参数注入（启动与 SIGHUP 共用同一接线）。
-/// T7 的 hide_state_dir 同此热改（整体替换，下一轮 spawn 生效）。
-fn apply_claude_runtime_opts(b: &imagent_claude::ClaudeBackend, config: &imagent_core::Config) {
+/// W1-2/W1-3/W1-4 + T7/T12：claude-cli 运行参数注入（启动与 SIGHUP 共用同一
+/// 接线）。T7 的 hide_state_dir、T12 的 bitable 同此热改（整体替换，下一轮
+/// spawn 生效）。
+fn apply_claude_runtime_opts(
+    b: &imagent_claude::ClaudeBackend,
+    config: &imagent_core::Config,
+    bitable: bool,
+) {
     b.set_runtime_opts(
         config.claude_fallback_model.clone(),
         config.disallowed_tools.clone(),
         config.append_system_prompt.clone(),
         config.mcp_config_path.as_deref(),
         config.hide_state_dir_from_agent,
+        bitable,
     );
+}
+
+/// T12：构造 feishu Bitable 实现注入 Dispatcher（启动与 SIGHUP 共用）。
+/// 未启用（含撤销配置的 SIGHUP）显式置 None——后续 socket 请求回「未配置」
+/// 错误而非半生效。凭据与平台同源（feishu_app_id / IMAGENT_FEISHU_APP_SECRET
+/// env / feishu_base_url）：启动路径早于此已过 platform=feishu 校验，此处对
+/// 缺凭据兜底 warn（SIGHUP 改动凭据后未重启 env 的场景）。
+fn apply_bitable(
+    dispatcher: &imagent_core::Dispatcher,
+    config: &imagent_core::Config,
+    platform_name: &str,
+) {
+    if !config.bitable_enabled_for(platform_name) {
+        dispatcher.set_bitable(None);
+        return;
+    }
+    let Some(app_id) = config.feishu_app_id.clone() else {
+        tracing::warn!(
+            target: "imagent::ops",
+            "feishu_bitable 已配置但缺 feishu_app_id，Bitable 数据面未注入"
+        );
+        dispatcher.set_bitable(None);
+        return;
+    };
+    let Ok(app_secret) = std::env::var("IMAGENT_FEISHU_APP_SECRET") else {
+        tracing::warn!(
+            target: "imagent::ops",
+            "feishu_bitable 已配置但缺环境变量 IMAGENT_FEISHU_APP_SECRET，Bitable 数据面未注入"
+        );
+        dispatcher.set_bitable(None);
+        return;
+    };
+    let base_url = config
+        .feishu_base_url
+        .clone()
+        .unwrap_or_else(|| "https://open.feishu.cn".to_string());
+    // enabled_for 已保证两者 Some（load 期空白归一为 None）。
+    let app_token = config.feishu_bitable_app_token.clone().unwrap_or_default();
+    let table_id = config.feishu_bitable_table_id.clone().unwrap_or_default();
+    tracing::info!(
+        target: "imagent::ops",
+        table_id = %table_id,
+        "Bitable 数据面已启用（claude-cli agent 获得 bitable_list_fields / \
+         bitable_append_row 工具；建议专用表，写入需审批可把 \
+         mcp__imagent__bitable_append_row 加入 approval_tools）"
+    );
+    dispatcher.set_bitable(Some(Arc::new(imagent_feishu::FeishuBitable::new(
+        app_id, app_secret, base_url, app_token, table_id,
+    ))));
 }
 
 // ---------------------------------------------------------------------------
@@ -2432,6 +2511,7 @@ fn spawn_sighup_handler(
     claude_cli: Option<Arc<imagent_claude::ClaudeBackend>>,
     config_path: PathBuf,
     store: imagent_store::Store,
+    platform_name: String,
 ) {
     tokio::spawn(async move {
         let mut sig = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
@@ -2502,10 +2582,18 @@ fn spawn_sighup_handler(
                     // SIGHUP 语义即「回到配置面」）。
                     backend.set_model(cfg.claude_model.clone());
                     // W1-2/W1-3/W1-4：claude-cli 运行参数整体替换（含用户 MCP
-                    // 配置文件的现场重读）。
+                    // 配置文件的现场重读）。T12：bitable 开关同轮刷新（下一轮
+                    // spawn 的 mcp 配置按新值挂载/撤销 --bitable）。
                     if let Some(b) = &claude_cli {
-                        apply_claude_runtime_opts(b, &cfg);
+                        apply_claude_runtime_opts(b, &cfg, cfg.bitable_enabled_for(&platform_name));
                     }
+                    // T12：Bitable 数据面热改——注入/撤销 feishu 实现与 MCP 工具
+                    // 挂载同轮刷新（app_token/table_id 改动 = 重建句柄，删配置 =
+                    // 置 None，后续请求回「未配置」）。
+                    if let Some(reason) = cfg.bitable_disable_reason(&platform_name) {
+                        tracing::warn!(target: "imagent::ops", "{reason}");
+                    }
+                    apply_bitable(&dispatcher, &cfg, &platform_name);
                     let perm = cfg.permission_mode.resolve(&cfg.agent);
                     // S-1：热切校验失败（闭环档 × 非 FullLoop 后端 / socket 失败）
                     // 拒绝并保留既有模式——error 级日志便于发现「改了配置没生效」。

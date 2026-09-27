@@ -541,6 +541,24 @@ pub struct Config {
     /// fail-soft：权限不足/网络失败仅跳过注入，不阻塞轮次。改动需重启。
     #[serde(default = "default_feishu_group_context_messages")]
     pub feishu_group_context_messages: usize,
+    /// T12（v13 产品批 #3）：飞书多维表格（Bitable）数据面——多维表格 app_token
+    ///（URL `.../base/<app_token>` 段，`bascn` 开头）。与 `feishu_bitable_table_id`
+    /// **两者齐备才启用**；启用后 agent（claude-cli，经 `imagent mcp` server）获得
+    /// `bitable_list_fields` / `bitable_append_row` 两个 MCP 工具，可向该表写行。
+    /// 仅 `platform = "feishu"` 生效（其它平台配置了则启动 warn 并忽略）；
+    /// **claude-cli only**——ACP 后端的 MCP 配置不经 write_mcp_config，无此工具面。
+    /// SIGHUP 热改生效（下一轮 spawn 挂载 / 撤销）。
+    ///
+    /// ⚠️ 安全：启用 = agent 可向该表**追加任意行**。建议用专用表（不要指向生产
+    /// 台账）；需要审批的用户把 `mcp__imagent__bitable_append_row` 加进
+    /// `approval_tools`（ask 类档位下该工具的每次写入都会过 IM 审批）。
+    /// 需应用开通 `bitable:app` 读写权限。
+    #[serde(default)]
+    pub feishu_bitable_app_token: Option<String>,
+    /// T12：多维表格数据表 id（URL `.../table/<table_id>` 段，`tbl` 开头）。
+    /// 启用条件与安全注意见 [`Config::feishu_bitable_app_token`]。
+    #[serde(default)]
+    pub feishu_bitable_table_id: Option<String>,
     /// P2（code-review v13）：全局在飞 agent 轮数上限（跨 conv 信号量）。缺省 4
     /// ——NAS/小服务器多群部署的**生存护栏**：`running` 表只做 per-conv 串行，
     /// N 个 conv 在飞 = N 个 agent 子进程（ACP 连接池 8 有隐式封顶，CLI 无界），
@@ -1073,6 +1091,19 @@ impl Config {
             ));
         }
 
+        // T12：bitable 配置 trim，空白视为未设置（与 claude_model 同款归一——
+        // 空串按缺一处理会落入「配置了一半」的 warn 而非静默半启用）。
+        cfg.feishu_bitable_app_token = cfg
+            .feishu_bitable_app_token
+            .take()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        cfg.feishu_bitable_table_id = cfg
+            .feishu_bitable_table_id
+            .take()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         // T7：workdir 落在状态目录（生效 home 或基座 ~/.imagent）内 + deny 开启
         // → agent 对工作区的文件读取会被 --settings deny 逐次拦下，轮次事实性
         // 不可用。warn 不拒启：罕见误配、运行期症状明显，拒启反而挡住「确实要
@@ -1107,6 +1138,37 @@ impl Config {
     /// （含 /chat deny 收回群授权）」——保留探测供启动告警提醒补配 admin_senders。
     pub fn admin_gap_with_chat_allowlist(&self) -> bool {
         !self.allowed_chats.is_empty() && self.admin_senders.is_empty()
+    }
+
+    /// T12：Bitable 数据面是否启用——`feishu_bitable_app_token` 与
+    /// `feishu_bitable_table_id` **齐备** 且 platform 为 feishu（`platform` 入参
+    /// 取实际生效值——CLI `--platform` 覆盖时由 main 传入覆盖后的名字）。
+    /// 启用矩阵见测试 `bitable_enable_matrix`。
+    pub fn bitable_enabled_for(&self, platform: &str) -> bool {
+        platform == "feishu"
+            && self.feishu_bitable_app_token.is_some()
+            && self.feishu_bitable_table_id.is_some()
+    }
+
+    /// T12：未启用的原因文案（启动 / SIGHUP warn 用；`None` = 已启用或无需提示）：
+    /// - 只配置一半 → 提示补齐（缺一即整组不生效）；
+    /// - 两者齐备但 platform 非 feishu → 提示仅飞书生效、已忽略。
+    pub fn bitable_disable_reason(&self, platform: &str) -> Option<String> {
+        let has_token = self.feishu_bitable_app_token.is_some();
+        let has_table = self.feishu_bitable_table_id.is_some();
+        if has_token != has_table {
+            return Some(
+                "feishu_bitable_app_token 与 feishu_bitable_table_id 需同时配置才启用 \
+                 Bitable 数据面（当前只配置了一半，整体不生效）"
+                    .to_string(),
+            );
+        }
+        if has_token && platform != "feishu" {
+            return Some(format!(
+                "feishu_bitable_* 仅在 platform = \"feishu\" 时生效（当前 {platform}），已忽略"
+            ));
+        }
+        None
     }
 
     /// 供首次使用打印的模板字符串（default_workdir 用占位，不写死任何机器路径）。
@@ -1157,6 +1219,8 @@ permission_mode = "auto"    # 缺省=auto：claude-cli=透传 claude 原生 auto
 #                              #   "gemini --experimental-acp"，以目标 agent 的 ACP 接入文档为准；claude-acp 可选覆盖默认命令）
 # feishu_asr_enabled = true     # 飞书语音转文字（需后台申请语音识别权限；失败回退提示，仅 feishu）
 # feishu_group_context_messages = 10  # 群消息触发轮次时拉本群最近 N 条消息前置注入 prompt（需 im:message 读权限，fail-soft）；默认10，0=关闭，上限50
+# feishu_bitable_app_token = "bascnXXX"  # 飞书多维表格数据面：app_token + table_id 齐备才启用（仅 feishu + claude-cli）；agent 获得 bitable_list_fields/bitable_append_row 工具可向该表写行——建议专用表，需审批把 mcp__imagent__bitable_append_row 加进 approval_tools
+# feishu_bitable_table_id = "tblXXX"     # 同上（缺省关闭；SIGHUP 热改生效）
 # sender_daily_cost_limit_usd = 5.0  # per-sender 成本上限（美元，滚动 24h 窗口；不设 = 不限）
 # hide_state_dir_from_agent = true   # 状态目录 deny（默认开，仅 claude-cli）：每轮注入 --settings deny 把 ~/.imagent 挡在 agent 读视野外（Read/Edit/Write/Glob/Grep）；false=关闭（调试用）
 "#;
@@ -2075,6 +2139,70 @@ message_fragment_interval_ms = 250
         );
         let cfg = Config::load(&p).expect("ok");
         assert_eq!(cfg.feishu_group_context_messages, 50, "越界应钳位 50");
+        cleanup(&p);
+    }
+
+    /// T12：bitable 启用矩阵——齐备（feishu）/缺一/非 feishu 平台/全缺；空白串
+    /// 归一为未设置（缺一 warn 而非静默半启用）。
+    #[test]
+    fn bitable_enable_matrix() {
+        // ① 齐备 + feishu → 启用，无告警。
+        let p = tmp_path(
+            "bitable_on",
+            "default_workdir = \"/tmp/ws\"\nplatform = \"feishu\"\n\
+             feishu_bitable_app_token = \"bascnXXX\"\nfeishu_bitable_table_id = \"tblXXX\"\n",
+        );
+        let cfg = Config::load(&p).expect("ok");
+        assert!(cfg.bitable_enabled_for("feishu"));
+        assert_eq!(cfg.bitable_disable_reason("feishu"), None);
+        cleanup(&p);
+
+        // ② 缺 table_id（含空白串归一）→ 不启用 + 提示补齐。
+        for (name, body) in [
+            (
+                "bitable_half",
+                "default_workdir = \"/tmp/ws\"\nplatform = \"feishu\"\n\
+                 feishu_bitable_app_token = \"bascnXXX\"\n",
+            ),
+            (
+                "bitable_blank",
+                "default_workdir = \"/tmp/ws\"\nplatform = \"feishu\"\n\
+                 feishu_bitable_app_token = \"bascnXXX\"\nfeishu_bitable_table_id = \"  \"\n",
+            ),
+        ] {
+            let p = tmp_path(name, body);
+            let cfg = Config::load(&p).expect("ok");
+            assert!(!cfg.bitable_enabled_for("feishu"), "{name} 不应启用");
+            let reason = cfg.bitable_disable_reason("feishu").expect("缺一应有提示");
+            assert!(
+                reason.contains("同时配置"),
+                "{name} 提示应指向补齐: {reason}"
+            );
+            cleanup(&p);
+        }
+
+        // ③ 齐备但 platform 非 feishu → 不启用 + 提示已忽略。
+        let p = tmp_path(
+            "bitable_other_platform",
+            "default_workdir = \"/tmp/ws\"\nplatform = \"wecom\"\n\
+             feishu_bitable_app_token = \"bascnXXX\"\nfeishu_bitable_table_id = \"tblXXX\"\n",
+        );
+        let cfg = Config::load(&p).expect("ok");
+        assert!(!cfg.bitable_enabled_for("wecom"));
+        let reason = cfg
+            .bitable_disable_reason("wecom")
+            .expect("非 feishu 应提示");
+        assert!(
+            reason.contains("feishu") && reason.contains("忽略"),
+            "{reason}"
+        );
+        cleanup(&p);
+
+        // ④ 全缺 → 不启用、无告警（静默关闭是缺省态）。
+        let p = tmp_path("bitable_off", r#"default_workdir = "/tmp/ws""#);
+        let cfg = Config::load(&p).expect("ok");
+        assert!(!cfg.bitable_enabled_for("ilink"));
+        assert_eq!(cfg.bitable_disable_reason("ilink"), None);
         cleanup(&p);
     }
 

@@ -1,13 +1,17 @@
-//! MCP server over stdio（claude `--permission-prompt-tool` 回调目标）。
+//! MCP server over stdio（claude `--permission-prompt-tool` 回调目标 + Bitable
+//! 数据面工具挂载点）。
 //!
 //! claude 遇需权限的工具时，通过 MCP JSON-RPC 2.0 调用名为 `permission_request`
 //! 的工具。本模块实现一个最小 stdio server：
 //! - `initialize` → 返回协议版本 + capabilities + serverInfo；
-//! - `tools/list` → 返回单个工具 `permission_request`；
+//! - `tools/list` → 返回 `permission_request`；`--bitable 1` 时追加
+//!   [`BITABLE_LIST_FIELDS_TOOL`] / [`BITABLE_APPEND_ROW_TOOL`]（T12 数据面）；
 //! - `tools/call(name=permission_request)` → 依 `PermissionMode` 返回 allow/deny：
 //!   - `Allow`/`Deny`：固定策略，立即返回；
 //!   - `Ask`：通过 unix socket 请求主进程路由到 IM，阻塞等待用户回复；
 //!   - `Off`：不应到达（Off 时不挂 MCP），按 deny 兜底。
+//! - `tools/call(name=bitable_*)` → 经同一 unix socket 的 `kind=bitable` 消息
+//!   转发主进程（与审批消息互不干扰；与 permission_mode 正交）。
 //!
 //! 纯函数 `build_tools_list` / `build_call_response` 便于单测；真实 socket 连接
 //! 在 `run_mcp_server` 中包。
@@ -24,6 +28,16 @@ use crate::permission::PermissionReply;
 
 pub const TOOL_NAME: &str = "permission_request";
 
+/// T12：bitable 工具名——列出多维表格字段（无参）。
+pub const BITABLE_LIST_FIELDS_TOOL: &str = "bitable_list_fields";
+
+/// T12：bitable 工具名——向多维表格追加一行（参数 `fields`：object）。
+pub const BITABLE_APPEND_ROW_TOOL: &str = "bitable_append_row";
+
+/// `tools/list` 里 bitable_append_row 的参数描述（键=列名，先查列再写行）。
+const BITABLE_FIELDS_DESC: &str =
+    "要写入的列值：键=列名（先调 bitable_list_fields 查可用列），值=标量（文本/数字/布尔）";
+
 /// `--mcp-config` 里注册的 server 名（backend 写配置时用）。与 [`TOOL_NAME`] 一起
 /// 决定 claude 眼中的工具全名。
 pub const SERVER_NAME: &str = "imagent";
@@ -37,22 +51,40 @@ pub fn qualified_tool_name() -> String {
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
-/// `tools/list` 的工具描述（纯函数，便于单测）。
-pub fn build_tools_list() -> Value {
-    json!({
-        "tools": [{
-            "name": TOOL_NAME,
-            "description": "IM 权限审批：claude 遇需权限的工具时回调，由 imagent 转交 IM 用户 approve/deny。",
+/// `tools/list` 的工具描述（纯函数，便于单测）。`bitable = true`（feishu_bitable_*
+/// 配置齐备，backend 写 mcp 配置时经 `--bitable 1` 传入）时追加两个数据面工具。
+pub fn build_tools_list(bitable: bool) -> Value {
+    let mut tools = vec![json!({
+        "name": TOOL_NAME,
+        "description": "IM 权限审批：claude 遇需权限的工具时回调，由 imagent 转交 IM 用户 approve/deny。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tool_name": { "type": "string", "description": "请求授权的工具名（如 Bash）" },
+                "input": { "type": "object", "description": "工具入参" }
+            },
+            "required": ["tool_name"]
+        }
+    })];
+    if bitable {
+        tools.push(json!({
+            "name": BITABLE_LIST_FIELDS_TOOL,
+            "description": "列出飞书多维表格（Bitable）当前表的所有字段（列名+类型）。写行前先调它确认可用列名与类型。",
+            "inputSchema": { "type": "object", "properties": {} }
+        }));
+        tools.push(json!({
+            "name": BITABLE_APPEND_ROW_TOOL,
+            "description": "向飞书多维表格追加一行记录，返回新记录 record_id。列名不匹配会被飞书拒绝（错误信息含原因），先调 bitable_list_fields 对齐列名。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "tool_name": { "type": "string", "description": "请求授权的工具名（如 Bash）" },
-                    "input": { "type": "object", "description": "工具入参" }
+                    "fields": { "type": "object", "description": BITABLE_FIELDS_DESC }
                 },
-                "required": ["tool_name"]
+                "required": ["fields"]
             }
-        }]
-    })
+        }));
+    }
+    json!({ "tools": tools })
 }
 
 /// 由回复构造 `tools/call` 的结果（纯函数，便于单测）。
@@ -104,8 +136,10 @@ pub fn fixed_reply(mode: PermissionMode) -> PermissionReply {
 ///
 /// 返回要写回 stdout 的 JSON-RPC 响应（已含 `id`）。通知（无 `id`）返回 None。
 /// `params_for_call` 是 Ask 模式下需要 socket roundtrip 时调用的回调；纯函数版本
-/// 传入 `None` 时，Ask 按 deny 兜底（便于单测）。
-pub fn handle_request(req: &Value, mode: PermissionMode) -> Option<Value> {
+/// 传入 `None` 时，Ask 按 deny 兜底（便于单测）。`bitable` 只影响 `tools/list`
+/// 的工具面（bitable 工具的 `tools/call` 需 socket，由 server 循环拦截，纯函数
+/// 版本按 unknown tool 回错）。
+pub fn handle_request(req: &Value, mode: PermissionMode, bitable: bool) -> Option<Value> {
     let id = req.get("id")?;
     let method = req.get("method")?.as_str()?;
     let result: Value = match method {
@@ -114,7 +148,7 @@ pub fn handle_request(req: &Value, mode: PermissionMode) -> Option<Value> {
             "capabilities": { "tools": {} },
             "serverInfo": { "name": "imagent-permission", "version": env!("CARGO_PKG_VERSION") }
         }),
-        "tools/list" => build_tools_list(),
+        "tools/list" => build_tools_list(bitable),
         "tools/call" => {
             let name = req
                 .pointer("/params/name")
@@ -252,6 +286,75 @@ pub async fn ask_via_socket(
     })
 }
 
+/// `kind = "bitable"` 的 socket roundtrip（T12 数据面）：op + 可选 fields →
+/// 主进程注入的 BitableApi（feishu 实现）→ 一行 JSON 回写。
+///
+/// 请求：`{ "kind": "bitable", "conv_id": "...", "op": "list_fields" |
+/// "append_row", "fields": {...} }`（list_fields 不带 fields）；回复：
+/// `{ "kind": "bitable", "ok": true, "data": ... }` /
+/// `{ "kind": "bitable", "ok": false, "error": "..." }`。
+/// 返回 `Ok(Ok(data))` = 成功数据（list_fields=字段数组 / append_row=record_id）；
+/// `Ok(Err(err))` = 主进程侧错误（未配置 / 飞书 API 失败，文案可直读）；
+/// `Err(io)` = socket 层失败（主进程未运行等）。
+///
+/// 读超时覆盖 feishu HTTP 最坏路径（30s 请求超时 × 429 退避重试），与审批的
+/// ask_timeout 语义不同——数据面调用没有「用户慢回复」维度。
+pub async fn bitable_call_via_socket(
+    sock: &str,
+    conv_id: &str,
+    op: &str,
+    fields: Option<&serde_json::Map<String, Value>>,
+) -> io::Result<std::result::Result<Value, String>> {
+    let mut stream = UnixStream::connect(sock).await?;
+    // 握手 token 与审批/ask 通道同一份（主进程 bind 时生成 <sock_dir>/
+    // permission.token；见 ask_via_socket 注释）。
+    let token_path = std::path::Path::new(sock)
+        .parent()
+        .map(|d| d.join("permission.token"))
+        .unwrap_or_else(|| std::path::PathBuf::from("permission.token"));
+    let token = std::fs::read_to_string(&token_path)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    stream.write_all(format!("{token}\n").as_bytes()).await?;
+    stream.flush().await?;
+    let mut req = json!({
+        "kind": "bitable",
+        "conv_id": conv_id,
+        "op": op,
+    });
+    if let Some(f) = fields {
+        req["fields"] = Value::Object(f.clone());
+    }
+    stream.write_all(format!("{req}\n").as_bytes()).await?;
+    stream.flush().await?;
+
+    let mut reader = BufReader::new(&mut stream);
+    let mut buf = String::new();
+    const BITABLE_SOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
+    match tokio::time::timeout(BITABLE_SOCK_BUDGET, reader.read_line(&mut buf)).await {
+        Ok(res) => {
+            res?;
+        }
+        Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("bitable reply timed out (>{BITABLE_SOCK_BUDGET:?})"),
+            ))
+        }
+    }
+    let v: Value = serde_json::from_str(buf.trim())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("parse reply: {e}")))?;
+    if v.get("ok").and_then(|o| o.as_bool()) == Some(true) {
+        return Ok(Ok(v.get("data").cloned().unwrap_or(Value::Null)));
+    }
+    let err = v
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap_or("unknown error")
+        .to_string();
+    Ok(Err(err))
+}
+
 /// 生成 request_id（多 pending 路由 key）：`<prefix>-<hex>`。
 fn new_request_id(prefix: &str) -> String {
     format!(
@@ -262,11 +365,14 @@ fn new_request_id(prefix: &str) -> String {
 }
 
 /// MCP server 主循环（stdio）。读 stdin 一行 JSON、写 stdout 一行 JSON。
+/// `bitable`（= mcp 配置的 `--bitable 1`）时 tools/list 追加 bitable 工具、
+/// tools/call 转发 socket `kind=bitable`（见 [`bitable_call_via_socket`]）。
 pub async fn run_mcp_server(
     conv_id: String,
     sock: String,
     mode: PermissionMode,
     ask_timeout: std::time::Duration,
+    bitable: bool,
 ) -> io::Result<()> {
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
@@ -293,10 +399,26 @@ pub async fn run_mcp_server(
             }
         };
 
-        // tools/call 在 Ask 闭环类模式（Ask / AutoClaude）需要 socket roundtrip；
-        // 其它走纯 handler。
+        // tools/call 分流：bitable 工具（数据面，与 permission_mode 正交）→
+        // kind=bitable socket；其余在 Ask 闭环类模式（Ask / AutoClaude）走审批
+        // roundtrip；再其余走纯 handler。bitable 判定必须先于 needs_socket——
+        // 否则 Ask 档下 bitable 调用会被误当权限请求推 IM 审批。
         let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
-        let resp = if method == "tools/call" && mode.needs_socket() {
+        let tool_name = req
+            .pointer("/params/name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let resp = if method == "tools/call"
+            && bitable
+            && (tool_name == BITABLE_LIST_FIELDS_TOOL || tool_name == BITABLE_APPEND_ROW_TOOL)
+        {
+            let id = req.get("id").cloned().unwrap_or(Value::Null);
+            json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": run_bitable_tool_call(&sock, &conv_id, &tool_name, &req).await
+            })
+        } else if method == "tools/call" && mode.needs_socket() {
             let (tool_name, input) = extract_call_args(&req);
             // 多 pending：每次调用独立 request_id（同 conv 与其它询问并存互不顶替）。
             let request_id = new_request_id("p");
@@ -323,7 +445,7 @@ pub async fn run_mcp_server(
             let id = req.get("id").cloned().unwrap_or(Value::Null);
             json!({ "jsonrpc": "2.0", "id": id, "result": result })
         } else {
-            match handle_request(&req, mode) {
+            match handle_request(&req, mode, bitable) {
                 Some(v) => v,
                 None => continue, // 通知（无 id），不回
             }
@@ -338,6 +460,52 @@ pub async fn run_mcp_server(
         let _ = stdout.flush().await;
     }
     Ok(())
+}
+
+/// bitable 工具单次调用的 MCP `result` 载荷（`{content, isError}`，形态对齐
+/// ask server 的 tools/call 回包）：参数校验 → socket kind=bitable → 文本化。
+async fn run_bitable_tool_call(sock: &str, conv_id: &str, tool_name: &str, req: &Value) -> Value {
+    let op = if tool_name == BITABLE_LIST_FIELDS_TOOL {
+        "list_fields"
+    } else {
+        "append_row"
+    };
+    // append_row 参数前置校验（fail-fast，不占 socket 往返）：fields 须为非空对象。
+    let fields = req
+        .pointer("/params/arguments/fields")
+        .and_then(|v| v.as_object())
+        .cloned();
+    if op == "append_row" && fields.as_ref().is_none_or(|f| f.is_empty()) {
+        return json!({
+            "content": [ { "type": "text",
+                "text": "fields 必须是非空对象（键=列名，值=标量；先调 bitable_list_fields 查可用列）" } ],
+            "isError": true
+        });
+    }
+    let outcome = bitable_call_via_socket(sock, conv_id, op, fields.as_ref()).await;
+    let (text, is_error) = match outcome {
+        Ok(Ok(data)) => (bitable_result_text(&data), false),
+        Ok(Err(err)) => (format!("bitable 调用失败：{err}"), true),
+        Err(e) => (
+            format!(
+                "imagent 主进程不可达（{e}）——请确认 imagent 已在运行且 feishu_bitable_* 配置齐备"
+            ),
+            true,
+        ),
+    };
+    json!({
+        "content": [ { "type": "text", "text": text } ],
+        "isError": is_error
+    })
+}
+
+/// bitable 成功数据的文本化：标量直出（record_id），复合值序列化为 JSON
+///（list_fields 的字段数组）。
+fn bitable_result_text(data: &Value) -> String {
+    match data {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -745,10 +913,38 @@ mod tests {
 
     #[test]
     fn tools_list_has_permission_request() {
-        let list = build_tools_list();
+        let list = build_tools_list(false);
         let tools = list.get("tools").and_then(|t| t.as_array()).unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], TOOL_NAME);
+    }
+
+    /// T12：`--bitable 1` 时 tools/list 追加两个数据面工具（形态与
+    /// permission_request 同构：name/description/inputSchema；append_row 的
+    /// fields 必填）。
+    #[test]
+    fn tools_list_bitable_flag_appends_data_tools() {
+        let list = build_tools_list(true);
+        let tools = list.get("tools").and_then(|t| t.as_array()).unwrap();
+        assert_eq!(tools.len(), 3, "permission_request + 2 个 bitable 工具");
+        assert_eq!(tools[1]["name"], BITABLE_LIST_FIELDS_TOOL);
+        assert_eq!(tools[2]["name"], BITABLE_APPEND_ROW_TOOL);
+        assert_eq!(
+            tools[2]["inputSchema"]["required"][0], "fields",
+            "append_row 的 fields 必填"
+        );
+        let desc = tools[2]["inputSchema"]["properties"]["fields"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            desc.contains("bitable_list_fields"),
+            "描述应引导先查列: {desc}"
+        );
+        // 0（缺省）时纯审批面——不泄漏数据面工具（未配置的部署 agent 看不到）。
+        assert_eq!(
+            build_tools_list(false)["tools"].as_array().unwrap().len(),
+            1
+        );
     }
 
     /// ask server 的 tools/list 暴露 ask_via_im + notify_via_im 两个工具。
@@ -843,7 +1039,7 @@ mod tests {
     #[test]
     fn handle_initialize_returns_capabilities() {
         let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize" });
-        let resp = handle_request(&req, PermissionMode::Allow).unwrap();
+        let resp = handle_request(&req, PermissionMode::Allow, false).unwrap();
         assert_eq!(resp["id"], 1);
         assert_eq!(resp["result"]["protocolVersion"], PROTOCOL_VERSION);
         assert!(resp["result"]["capabilities"]["tools"].is_object());
@@ -852,7 +1048,7 @@ mod tests {
     #[test]
     fn handle_tools_list() {
         let req = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" });
-        let resp = handle_request(&req, PermissionMode::Allow).unwrap();
+        let resp = handle_request(&req, PermissionMode::Allow, false).unwrap();
         assert_eq!(resp["result"]["tools"][0]["name"], TOOL_NAME);
     }
 
@@ -862,7 +1058,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",
             "params": { "name": TOOL_NAME, "arguments": { "tool_name": "Bash", "input": {"command":"ls"} } }
         });
-        let resp = handle_request(&req, PermissionMode::Allow).unwrap();
+        let resp = handle_request(&req, PermissionMode::Allow, false).unwrap();
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         let payload: Value = serde_json::from_str(text).unwrap();
         assert_eq!(payload["behavior"], "allow");
@@ -874,7 +1070,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 4, "method": "tools/call",
             "params": { "name": TOOL_NAME, "arguments": { "tool_name": "Bash" } }
         });
-        let resp = handle_request(&req, PermissionMode::Deny).unwrap();
+        let resp = handle_request(&req, PermissionMode::Deny, false).unwrap();
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         let payload: Value = serde_json::from_str(text).unwrap();
         assert_eq!(payload["behavior"], "deny");
@@ -883,13 +1079,129 @@ mod tests {
     #[test]
     fn handle_unknown_method_returns_error() {
         let req = json!({ "jsonrpc": "2.0", "id": 5, "method": "foo/bar" });
-        let resp = handle_request(&req, PermissionMode::Allow).unwrap();
+        let resp = handle_request(&req, PermissionMode::Allow, false).unwrap();
         assert_eq!(resp["error"]["code"], -32601);
     }
 
     #[test]
     fn handle_notification_no_response() {
         let req = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
-        assert!(handle_request(&req, PermissionMode::Allow).is_none());
+        assert!(handle_request(&req, PermissionMode::Allow, false).is_none());
+    }
+
+    /// T12：bitable 工具在纯 handler 按 unknown tool 回错（真实调用需 socket，
+    /// 由 server 循环拦截）——防纯路径误吞。
+    #[test]
+    fn handle_request_rejects_bitable_tools_without_socket() {
+        let req = json!({
+            "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+            "params": { "name": BITABLE_APPEND_ROW_TOOL, "arguments": { "fields": {"a": 1} } }
+        });
+        let resp = handle_request(&req, PermissionMode::Allow, true).unwrap();
+        assert_eq!(resp["error"]["code"], -32602);
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(BITABLE_APPEND_ROW_TOOL));
+    }
+
+    /// T12：append_row 参数前置校验——fields 缺失/空对象在 server 侧直接回
+    /// isError（不占 socket 往返；sock 给不可达路径证明未触网）。
+    #[tokio::test]
+    async fn bitable_tool_call_validates_fields_before_socket() {
+        for args in [
+            json!({}),
+            json!({ "fields": {} }),
+            json!({ "fields": "not-an-object" }),
+        ] {
+            let req = json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": BITABLE_APPEND_ROW_TOOL, "arguments": args }
+            });
+            let result = run_bitable_tool_call(
+                "/nonexistent/imagent.sock",
+                "c1",
+                BITABLE_APPEND_ROW_TOOL,
+                &req,
+            )
+            .await;
+            assert_eq!(result["isError"], true, "{args}");
+            assert!(
+                result["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("fields"),
+                "文案应指向 fields 参数: {result}"
+            );
+        }
+    }
+
+    /// T12：`kind=bitable` socket 报文形态——首行握手 token、次行请求 JSON
+    ///（kind/conv_id/op/fields 四件套），回包 ok/data 解析。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bitable_socket_request_shape_and_reply_parse() {
+        let dir = std::env::temp_dir().join(format!("imagent-mcp-bitable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 主进程侧等价物：预写 token + 起一个两连次的 mock listener（第一次回
+        // ok=true，第二次回 ok=false——同一 listener 顺序 accept，免二次 bind）。
+        std::fs::write(dir.join("permission.token"), "tok-test\n").unwrap();
+        let sock_path = dir.join("permission.sock");
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let captured = tokio::spawn(async move {
+            async fn serve_once(s: &mut tokio::net::UnixStream, reply: &str) -> (String, String) {
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+                let mut lr = BufReader::new(s);
+                let mut token_line = String::new();
+                lr.read_line(&mut token_line).await.unwrap();
+                let mut req_line = String::new();
+                lr.read_line(&mut req_line).await.unwrap();
+                lr.get_mut().write_all(reply.as_bytes()).await.unwrap();
+                lr.get_mut().flush().await.unwrap();
+                (token_line, req_line)
+            }
+            let (mut s1, _) = listener.accept().await.unwrap();
+            let first = serve_once(
+                &mut s1,
+                "{\"kind\":\"bitable\",\"ok\":true,\"data\":\"recABC\"}\n",
+            )
+            .await;
+            let (mut s2, _) = listener.accept().await.unwrap();
+            let second = serve_once(
+                &mut s2,
+                "{\"kind\":\"bitable\",\"ok\":false,\"error\":\"boom\"}\n",
+            )
+            .await;
+            (first, second)
+        });
+
+        let mut fields = serde_json::Map::new();
+        fields.insert("任务".into(), json!("巡检"));
+        fields.insert("状态".into(), json!("通过"));
+        let sock = sock_path.to_string_lossy().into_owned();
+        let data = bitable_call_via_socket(&sock, "feishu:ou_x", "append_row", Some(&fields))
+            .await
+            .expect("socket 层应成功")
+            .expect("主进程侧应成功");
+        assert_eq!(data, json!("recABC"), "append_row 成功数据 = record_id");
+
+        let err = bitable_call_via_socket(&sock, "feishu:ou_x", "list_fields", None)
+            .await
+            .expect("socket 层应成功")
+            .expect_err("ok=false 应映射 Err");
+        assert_eq!(err, "boom", "失败文案透传");
+
+        let ((token_line, req_line), (token2, _)) = captured.await.unwrap();
+        assert_eq!(token_line.trim(), "tok-test", "首行必须是握手 token");
+        assert_eq!(token2.trim(), "tok-test", "每次连接都带 token");
+        let req: Value = serde_json::from_str(req_line.trim()).unwrap();
+        assert_eq!(req["kind"], "bitable");
+        assert_eq!(req["conv_id"], "feishu:ou_x");
+        assert_eq!(req["op"], "append_row");
+        assert_eq!(req["fields"]["任务"], "巡检");
+        assert_eq!(req["fields"]["状态"], "通过");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

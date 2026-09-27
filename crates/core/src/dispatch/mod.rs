@@ -616,6 +616,12 @@ pub struct Dispatcher {
     /// 注入一次；server 不随 SIGHUP 重启，摘要与 server 同生命周期——不设
     /// 热载）。`/doctor` 安全自检读取。
     webhook_exposure: parking_lot::RwLock<WebhookExposure>,
+    /// T12（v13 产品批 #3）：Bitable 数据面句柄（feishu 实现）。None = 未启用
+    ///（config `feishu_bitable_app_token`/`table_id` 不齐备或非 feishu 平台）。
+    /// main 启动注入 + SIGHUP 热改（见 [`Self::set_bitable`]）；socket accept
+    /// task 经 Arc clone 共享读取（`kind=bitable` 请求路由到它，见 socket.rs）。
+    /// `parking_lot` RwLock：临界区只做 clone，无 await。
+    bitable: Arc<RwLock<Option<Arc<dyn crate::bitable::BitableApi>>>>,
 }
 
 /// P2（code-review v13）：全局在飞轮数闸门。`limit` = 配置上限（0 = 不限制，
@@ -746,6 +752,10 @@ impl ConvState {
 /// per-conv 状态表句柄：Dispatcher 持有；需要跨任务共享的读取方（CardSession
 /// patcher 的排队提示快照、权限 socket 任务的发起者锚定）经 Arc clone 拿同表。
 pub(crate) type ConvStates = Arc<Mutex<HashMap<String, ConvState>>>;
+
+/// T12：Bitable 数据面共享句柄（Dispatcher 与 permission socket accept task
+/// 共享——`kind=bitable` 请求在连接处理里读当前值，SIGHUP 热改即时可见）。
+pub(crate) type BitableHandle = Arc<RwLock<Option<Arc<dyn crate::bitable::BitableApi>>>>;
 
 /// T18：per-conv 状态表粗上限（housekeeping 60s 节拍 LRU 驱逐；远超单部署
 /// 常见会话数，对齐 feishu 侧 PER_CONV_MAP_CAP 的量级取舍）。
@@ -895,6 +905,7 @@ impl Dispatcher {
             allowlist_warn_state: parking_lot::Mutex::new(None),
             perm_mode_warn_state: parking_lot::Mutex::new(None),
             webhook_exposure: parking_lot::RwLock::new(WebhookExposure::default()),
+            bitable: Arc::new(RwLock::new(None)),
         };
         // S2：admin_senders 为空 = 无人是管理员，IM 内管理命令全部不可用——
         // 构造即显著提示（防用户以为白名单用户仍可 /allow）。
@@ -917,6 +928,21 @@ impl Dispatcher {
     /// 自检的 webhook 入口面数据源。
     pub fn set_webhook_exposure(&self, exposure: WebhookExposure) {
         *self.webhook_exposure.write() = exposure;
+    }
+
+    /// T12（v13 产品批 #3）：Bitable 数据面注入/热改（main 启动 + SIGHUP 调用）。
+    /// `Some` = 启用（feishu 实现，`kind=bitable` socket 请求经它落飞书）；
+    /// `None` = 撤销（SIGHUP 删配置的语义——后续请求回「未配置」错误而非半生效）。
+    /// 纯状态写入、无副作用（不 bind socket）：bitable 仅随 claude-cli（FullLoop，
+    /// run() 无论档位都 bind socket）部署，socket 已由该路径保证；MCP 工具挂载
+    /// 看的是 backend 运行参数（下一轮 spawn 生效），请求路由读本句柄（即时）。
+    pub fn set_bitable(&self, api: Option<Arc<dyn crate::bitable::BitableApi>>) {
+        *self.bitable.write() = api;
+    }
+
+    /// T12：Bitable 是否已注入（run() 的 socket 启动判定用）。
+    pub fn bitable_enabled(&self) -> bool {
+        self.bitable.read().is_some()
     }
 
     /// P7：启动偏好注入（main 在 run 前调一次；构造器保持零新参，测试无感）。
@@ -1652,14 +1678,19 @@ impl Dispatcher {
         // H1（code-review v8）：FullLoop 后端（claude 系）无论档位都 bind——
         // control 通道下 claude 自身门禁仍可能发 canUseTool（allow 档也有询问，
         // 由 socket 侧 mode 闸门固定放行），不 bind 则 allow 退化 deny。
+        // T12：注入了 Bitable 数据面时同样必须 bind——`kind=bitable` 请求与审批
+        // 共用同一 socket（claude-cli 恒 FullLoop 已覆盖，此处兜底未来非 claude
+        // 后端接入的场景）。
         let mode_needs_sock = self.permission_mode.read().needs_socket()
             || self.backend.permission_capability()
-                == crate::backend::PermissionCapability::FullLoop;
+                == crate::backend::PermissionCapability::FullLoop
+            || self.bitable_enabled();
         if mode_needs_sock && !self.ensure_permission_socket() {
             return Err(crate::error::CoreError::Config(
-                "permission_mode 为 Ask/auto-claude（IM 审批闭环）档位，但权限审批 socket 启动失败\
-                 （Unix domain socket 不可用或路径无法绑定）。Ask 闭环完全不可用，拒绝启动；\
-                 请改用 permission_mode = auto/off/allow/deny，或在 macOS/Linux 修复 socket 路径后重启"
+                "permission_mode 为 Ask/auto-claude（IM 审批闭环）档位（或 Bitable 数据面已启用），\
+                 但权限审批 socket 启动失败（Unix domain socket 不可用或路径无法绑定）。\
+                 Ask 闭环完全不可用，拒绝启动；请改用 permission_mode = auto/off/allow/deny，\
+                 或在 macOS/Linux 修复 socket 路径后重启"
                     .to_string(),
             ));
         }

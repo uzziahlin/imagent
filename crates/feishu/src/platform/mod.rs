@@ -19,7 +19,7 @@ mod outbox;
 mod state;
 
 #[cfg(test)]
-mod testutil;
+pub(crate) mod testutil;
 
 use ask::{sender_opt_of, AskRender, PendingAskCard};
 use state::{housekeeping_loop, ConvState, HousekeepingMaps};
@@ -1017,7 +1017,9 @@ async fn media_size_violation(url: &str) -> Option<CoreError> {
 /// 卡一次）；token 失效风暴时 N 个并发请求还各自独立重取（撞飞书签发频控）。
 static TOKEN_REFRESH_MU: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-async fn fetch_cached_token(
+/// `pub(crate)`：T12 bitable 数据面（crate::bitable）与 platform 发送/下载侧
+/// 共用同一 lazy 刷新缓存与 single-flight 语义。
+pub(crate) async fn fetch_cached_token(
     token_lock: &Arc<RwLock<Option<(String, Instant)>>>,
     core_config: &CoreConfig,
     app_id: &str,
