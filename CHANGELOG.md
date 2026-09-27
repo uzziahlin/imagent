@@ -2,14 +2,61 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
-## [Unreleased]
+## [1.28.0] — 2026-09-27
+
+> **v13 路线收官批**（docs/CODE_REVIEW_v13.md 迭代路线全部交付）：安全模型
+> 深化 + 产品跃迁（ACP 泛化/群上下文/Bitable）+ 运维故事（backup/日志轮转/
+> 供应链）+ 结构还债（ConvState/platform 拆分）。全仓 812 tests / 0 failed、
+> clippy 零警告。
+
+### Added
+- **agent 状态目录最小权限化（默认开）**：claude-cli per-run 注入
+  `--settings` deny 规则（Read/Edit/Write/Glob/Grep × 状态目录，双斜杠
+  绝对路径 + 字面/canonicalize 双形态 + profile 双根）——提示注入后的
+  agent 不再能直接读 `~/.imagent/imagent.db`（威胁模型第一层技术缓解，
+  SECURITY.md 已实现化）
+- **ACP 生态泛化（最大架构杠杆）**：`agent = "acp"` + `acp_command` 接入
+  任意 ACP agent（三处 claude 存储假设抽 AcpStorage trait——ghost 预检/
+  本机扫描/导出）——IM 审批闭环覆盖面 2 → N 后端；claude-acp 逐字节不变
+- **群聊上下文注入**：群 @bot 自动带最近 N 条群消息（缺省 10）作前置
+  上下文——群协作场景 agent 获得群记忆（Slack 线程上下文的飞书等价物）
+- **Bitable 数据面**：`bitable_list_fields` / `bitable_append_row` 两 MCP
+  工具（复用 imagent mcp server + socket 新 kind）——巡检结果/台账等结构化
+  产出直写多维表格
+- **/doctor 安全自检六项**：凭据形态/webhook 暴露面/共享工作区/权限×能力
+  错配/护栏水位/DB·媒体体积——部署风险一条命令可见
+- **/tasks 轮次面板 + 消费侧三指标**：channel_depth gauge / patch 时延 /
+  合帧字节 histogram（消费端背压的先行信号，v13 P1 整类问题的观测面）
+- **imagent backup**：VACUUM INTO 一致性快照 + config 副本 + MANIFEST
+  （sha256/恢复步骤/keyring 提示），保留 10 份自动清理，允许运行中备份
+- **macOS 日志轮转**：daemon.log copytruncate（50MB 阈值/保留 5 份，
+  env 可调）——launchd 持 fd 的机制约束与丢日志窗口如实文档化
+- **云文档评论链路**：回复锚定评论者本人（此前锚最后评论者，答非所问线程）
+  + 划词引用片段注入（agent 知道用户在评论文档哪一段）
+
+### Fixed
+- **ACP 审批阻塞 dispatch loop**：审批等待（最长 900s）经 cx.spawn 移出
+  SDK dispatch loop——通知不再积压；同轮多审批由串行变并行
+- **codex 每轮消息全目录扫描**：rollout 文件名内嵌 thread uuid，O(1)
+  定位（数月使用后轮次启动延迟线性劣化的问题消除）；两扫描器同 mtime
+  排序加决胜键（/resume 列表不再漂移）
+- **gemini delta:true 碎化**：final_text 不再按碎片空行分隔
+- **read_line_capped 双副本 + 存量 bug**：抽 core::lineio 单一来源；超长行
+  「读到换行再丢」（残段不再被当新行误解析）；顺带修「单块内含换行的整行
+  绕过上限」的原有 bug；mcp.rs 两处 stdin 裸读行补 8MB 上限（64KB 会误杀
+  大工具入参的合法审批请求）
 
 ### Changed
-- **rusqlite 0.31 → 0.40.2（供应链，CODE_REVIEW_v13 P3）**：bundled SQLite
-  3.45.0 → 3.53.2（2024 初 → 当前），业务 API 零变更；cargo-audit 对 bundled
-  C 代码的 CVE 失明——dependabot（weekly）承接版本更新提醒，季度人工核对
-  libsqlite3-sys（见根 Cargo.toml 注释 + CONTRIBUTING）；/doctor 增
-  「SQLite <version>（bundled）」运行时可观测行
+- **rusqlite 0.31 → 0.40.2（供应链）**：bundled SQLite 3.45.0 → 3.53.2，
+  业务 API 零变更；dependabot（weekly）承接版本提醒，季度人工核对
+  libsqlite3-sys；/doctor 增 SQLite 版本行
+- **feishu platform.rs 拆分**：4890 行 → platform/ 六模块（drain/ask/
+  outbox/state/testutil）；drain 单事件解析最坏 14 次 → 恒 2 次
+  （event_type 精确分派）；12 处错误码提取收编结构化 FeishuApiError
+  （SDK Display 串匹配降为兜底）
+- **Dispatcher ConvState 单表收敛**：10 个 per-conv 独立 map 合一
+  （LRU cap 512 + running/排队/挂审批豁免矩阵）——锁序注释纪律与话题群
+  map 慢泄漏（P3-5）随之消除；10 步迁移每步全量测试
 
 ## [1.27.0] — 2026-09-27
 
