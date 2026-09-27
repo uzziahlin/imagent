@@ -16,6 +16,7 @@ mod schema;
 mod store;
 
 pub use error::{Result, StoreError};
+pub use schema::SCHEMA_VERSION;
 pub use store::{
     AllowedSenderRow, AuditRow, CredentialForms, CronJobRow, LiveCardRow, NamedSessionRow,
     OutboxRow, RunStatRow, SessionHistoryRow, SessionRow, Store, OUTBOX_MAX_ATTEMPTS,

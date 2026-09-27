@@ -1886,6 +1886,29 @@ impl Store {
         .await
     }
 
+    /// T14（v13 运维批 #1）：`VACUUM INTO` 一致性快照——把整个数据库写成
+    /// `dest` 处的单文件副本，返回快照时的 schema 版本（user_version）。
+    ///
+    /// 一致性语义：VACUUM INTO 在单条 SQL 语句内完成整库复制，语句开始时取
+    /// 读快照——WAL 模式下快照包含「语句开始前已提交」的全部事务（**含 WAL
+    /// 中尚未 checkpoint 的已提交数据**），且仅包含它们。因此允许实例运行中
+    /// 调用（只需读锁，不与写入者冲突），**不持 instance 锁**——备份不要求
+    /// 先停机；语句执行期间/之后新提交的数据不在快照内，这是不停机备份的
+    /// 固有语义（取舍由调用方写进 MANIFEST / README）。
+    ///
+    /// `dest` 必须不存在（SQLite 要求目标文件未创建）——调用方先写同盘 tmp
+    /// 再 rename 进备份目录（对齐仓内 temp+rename 先例）。
+    pub async fn backup_snapshot(&self, dest: &Path) -> Result<i64> {
+        let dest = dest.to_path_buf();
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            conn.execute("VACUUM INTO ?1", rusqlite::params![dest.to_string_lossy()])?;
+            let v: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+            Ok(v)
+        })
+        .await
+    }
+
     pub async fn delete_named_session(&self, conv_id: &str, name: &str) -> Result<()> {
         let (conv_id, name) = (conv_id.to_string(), name.to_string());
         let inner = self.inner.clone();
@@ -2252,6 +2275,49 @@ mod tests {
         ] {
             assert!(tables.iter().any(|x| x == t), "missing table: {t}");
         }
+    }
+
+    // ---------- T14（v13 运维批 #1）：VACUUM INTO 一致性快照 ----------
+
+    /// 快照可打开（迁移幂等通过）、user_version 与源库一致；快照之后的源库
+    /// 写入不出现在快照文件里（不停机备份的一致性边界）。
+    #[tokio::test]
+    async fn backup_snapshot_consistency() {
+        let db = TempDb::new("bk_snap").await;
+        let store = Store::open(&db.path).await.expect("open");
+        store
+            .add_allowed_sender("snap-a", None, Some("test"))
+            .await
+            .expect("seed before snapshot");
+
+        // 快照写到同盘 tmp 路径（调用方约定：目标必须不存在）。
+        let snap = db.path.with_extension("db.snap");
+        let _ = std::fs::remove_file(&snap);
+        let schema_v = store.backup_snapshot(&snap).await.expect("VACUUM INTO");
+        assert_eq!(schema_v, crate::schema::SCHEMA_VERSION);
+
+        // 快照生成后源库继续写入——不应进入已生成的快照文件。
+        store
+            .add_allowed_sender("snap-b", None, Some("test"))
+            .await
+            .expect("write after snapshot");
+
+        // 快照可正常打开（幂等迁移通过），内容 = 快照时刻（含 a 不含 b）。
+        let restored = Store::open(&snap).await.expect("open snapshot");
+        let senders = restored.list_allowed_senders().await.expect("list");
+        assert!(senders.iter().any(|s| s == "snap-a"));
+        assert!(
+            !senders.iter().any(|s| s == "snap-b"),
+            "快照后的写入不应出现在快照里"
+        );
+
+        // user_version 与源库一致（直接读快照文件原始值，不经 Store）。
+        let raw = rusqlite::Connection::open(&snap).expect("raw open snapshot");
+        let v: i64 = raw
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .expect("snapshot user_version");
+        assert_eq!(v, schema_v);
+        let _ = std::fs::remove_file(&snap);
     }
 
     // ---------- cron_jobs（schema v11）----------
