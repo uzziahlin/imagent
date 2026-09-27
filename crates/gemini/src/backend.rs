@@ -20,10 +20,26 @@ use crate::stream::{parse_line, ParsedEvent};
 pub struct GeminiBackend {
     /// v1.21 /model：运行时模型覆盖（`gemini -m <model>`；None = CLI 默认）。
     model: std::sync::RwLock<Option<String>>,
-    // TODO(v1.22)：幽灵会话预检需先真机校准 ~/.gemini/tmp 的存储布局
-    //（文件名与 session id 的映射关系）——布局猜错会把所有正常续接误判为
-    // 幽灵、直接弄坏 resume。gemini 失败轮的 Init(id) 通常不落库，毒化风险
-    // 本就低于 codex/claude，待有真机数据再接。
+    // 【记录在案的已知限制】幽灵会话预检不做（v13 P3 批定案，非待办）。
+    //
+    // 背景：claude/codex 均有 run 前的 session_exists 预检（防失败轮泄漏的
+    // session id 毒化 resume）。gemini 侧不引入同款预检的原因：
+    //
+    // 1. 布局映射仍无法确定性解析。本机实测（2026-09）`~/.gemini/tmp/` 的
+    //    观测形态是 `<目录名>/chats/session-<ISO 时间戳>-<8 位 hex>.jsonl`，
+    //    文件首行 `{"sessionId":"<uuid>","projectHash":…}`——文件名里的 8 位
+    //    hex 是 sessionId uuid 的**前 8 字符**，且目录名疑似 workdir 的最后
+    //    一段路径名（证据：ai-harness / imagent / tmp 三个目录），但两点均
+    //    未获官方文档或足够样本确认；
+    // 2. 关键缺口：`init` 事件上报的 `session_id` 到底是完整 uuid 还是 8 位
+    //    短 id 没有真机捕获样本——映射猜错方向（前缀 vs 全等）会把**所有
+    //    正常续接**误判为幽灵会话、每轮弃上下文重开，比不预检（毒化轮次
+    //    resume 失败一次、用户 /new 自愈）伤害大得多；
+    // 3. gemini 失败轮的 Init(id) 通常不落库（dispatch 只在成功/中断路径
+    //    记 session），毒化概率本就低于 codex/claude。
+    //
+    // 重启该工作的前置条件：真机捕获一条 `gemini -o stream-json` 的 init 行
+    // 与对应的 ~/.gemini/tmp 文件名，确认 id 形态与目录规则。
 }
 
 impl GeminiBackend {
@@ -132,9 +148,11 @@ impl Backend for GeminiBackend {
         }
         // prompt 绑定到 flag（防止 prompt 以 `-` 开头被误解析）。
         cmd.arg(format!("--prompt={prompt}"));
+        // parse 为有状态解析器（FnMut 闭包承载，见 GeminiParser 文档）。
+        let mut parser = GeminiParser::new();
         spawn_cli_backend(
             cmd,
-            gemini_parse,
+            move |line: &str| parser.parse(line),
             chunks,
             NAME,
             // S-2：仅透传 gemini(Google) 所需凭据（最小授权）。
@@ -148,47 +166,94 @@ impl Backend for GeminiBackend {
     }
 }
 
-/// gemini stream-json 行 → [`CliEvent`] 适配（见 [`parse_line`]）。
-fn gemini_parse(line: &str) -> CliEvent {
-    match parse_line(line) {
-        ParsedEvent::Init {
-            session_id,
-            model: _,
-        } => CliEvent::Session(session_id),
-        ParsedEvent::AssistantMessage { text } => {
+/// gemini stream-json 行 → [`CliEvent`] 的**有状态**适配器（T20 delta 碎化
+/// 修复；spawn_cli_backend 的 parse 参数自本批起为 FnMut，承载跨行状态）。
+///
+/// 修复背景：gemini 的流式输出把同一条 assistant 消息拆成多条
+/// `{"delta":true}` 行，旧解析把它们当**完整消息**（CliEvent::Text），
+/// backend_common 的 B9 规则按 `\n\n` 拼接——一句话被空行拆成碎段（流式卡
+/// 与 final_text 双双碎化）。
+///
+/// 语义：
+/// - `delta:true` 片段 → [`CliEvent::TextDelta`]（流式 chunk 照推、final_text
+///   直接续接不插分隔），并在本解析器累积；
+/// - 片段流之后到达的**无 delta 完整消息**：与累积同文 → 视为流结束后的
+///   全文回放，去重跳过（不重复进 final_text）；异文 → 新的完整消息，走
+///   [`CliEvent::Text`]（B9 `\n\n` 语义正确分隔多条消息）并重置累积；
+/// - 始终无完整消息回放的输出（纯 delta 流）累积结果即最终文本——
+///   TextDelta 的直接续接已把它拼完整。
+/// - 其余事件与旧 `gemini_parse`（无状态版本）逐一同构。
+struct GeminiParser {
+    /// 未结块的 delta 累积（同一条消息的片段拼接，用于与完整消息比对去重）。
+    delta_acc: String,
+}
+
+impl GeminiParser {
+    fn new() -> Self {
+        Self {
+            delta_acc: String::new(),
+        }
+    }
+
+    fn parse(&mut self, line: &str) -> CliEvent {
+        match parse_line(line) {
+            ParsedEvent::Init {
+                session_id,
+                model: _,
+            } => CliEvent::Session(session_id),
+            ParsedEvent::AssistantMessage { text, delta } => self.assistant_message(text, delta),
+            ParsedEvent::ToolUse { tool, input } => CliEvent::ToolUse {
+                tool,
+                input,
+                session: None,
+                id: None,
+            },
+            ParsedEvent::ToolResult { tool, output } => CliEvent::ToolResult {
+                tool,
+                output,
+                id: None,
+            },
+            ParsedEvent::Result { usage } => {
+                // usage 须在 Terminal 之前——读取循环在 Terminal 处 break。
+                match usage {
+                    Some(u) => CliEvent::Multi(vec![
+                        CliEvent::Usage(u),
+                        CliEvent::Terminal { session: None },
+                    ]),
+                    None => CliEvent::Terminal { session: None },
+                }
+            }
+            ParsedEvent::Error { message } => CliEvent::Error {
+                text: message,
+                session: None,
+            },
+            ParsedEvent::Other => CliEvent::Skip,
+            ParsedEvent::Skip => CliEvent::Skip,
+        }
+    }
+
+    /// assistant message 的 delta 分流（见结构体文档的语义说明）。
+    fn assistant_message(&mut self, text: String, delta: bool) -> CliEvent {
+        if delta {
             if text.is_empty() {
+                return CliEvent::Skip;
+            }
+            self.delta_acc.push_str(&text);
+            return CliEvent::TextDelta(text);
+        }
+        if !self.delta_acc.is_empty() {
+            let acc = std::mem::take(&mut self.delta_acc);
+            if text == acc {
+                // 完整消息与已流出的片段同文：流结束后的全文回放，去重。
                 CliEvent::Skip
             } else {
                 CliEvent::Text(text)
             }
+        } else if text.is_empty() {
+            CliEvent::Skip
+        } else {
+            CliEvent::Text(text)
         }
-        ParsedEvent::ToolUse { tool, input } => CliEvent::ToolUse {
-            tool,
-            input,
-            session: None,
-            id: None,
-        },
-        ParsedEvent::ToolResult { tool, output } => CliEvent::ToolResult {
-            tool,
-            output,
-            id: None,
-        },
-        ParsedEvent::Result { usage } => {
-            // usage 须在 Terminal 之前——读取循环在 Terminal 处 break。
-            match usage {
-                Some(u) => CliEvent::Multi(vec![
-                    CliEvent::Usage(u),
-                    CliEvent::Terminal { session: None },
-                ]),
-                None => CliEvent::Terminal { session: None },
-            }
-        }
-        ParsedEvent::Error { message } => CliEvent::Error {
-            text: message,
-            session: None,
-        },
-        ParsedEvent::Other => CliEvent::Skip,
-        ParsedEvent::Skip => CliEvent::Skip,
     }
 }
 
@@ -296,5 +361,137 @@ mod tests {
     #[test]
     fn threshold_is_max_prompt_bytes() {
         assert_eq!(MAX_PROMPT_BYTES, 64 * 1024);
+    }
+
+    // ------------------------------------------------------------------
+    // T20：delta:true 碎化修复（GeminiParser 有状态适配）。
+    // ------------------------------------------------------------------
+
+    fn delta_line(text: &str) -> String {
+        serde_json::json!({
+            "type": "message", "role": "assistant", "content": text, "delta": true
+        })
+        .to_string()
+    }
+
+    fn full_line(text: &str) -> String {
+        serde_json::json!({
+            "type": "message", "role": "assistant", "content": text
+        })
+        .to_string()
+    }
+
+    /// delta 片段必须产 TextDelta（而非被当完整消息的 Text）——后者经 B9 规则
+    /// `\n\n` 拼接，一句话「你好，世界」会被拆成空行分隔的碎段。
+    #[test]
+    fn delta_fragments_emit_text_delta() {
+        let mut p = GeminiParser::new();
+        assert!(matches!(
+            p.parse(&delta_line("你好，")),
+            CliEvent::TextDelta(t) if t == "你好，"
+        ));
+        assert!(matches!(
+            p.parse(&delta_line("世界")),
+            CliEvent::TextDelta(t) if t == "世界"
+        ));
+        // 纯 delta 流（无完整消息回放）后正常终结。
+        assert!(matches!(
+            p.parse(r#"{"type":"result","status":"success"}"#),
+            CliEvent::Terminal { session: None }
+        ));
+    }
+
+    /// 流结束后同文完整消息 = 全文回放，去重跳过（不重复进 final_text）。
+    #[test]
+    fn full_message_replay_after_deltas_is_suppressed() {
+        let mut p = GeminiParser::new();
+        p.parse(&delta_line("He"));
+        p.parse(&delta_line("llo"));
+        assert!(
+            matches!(p.parse(&full_line("Hello")), CliEvent::Skip),
+            "同文回放不得再当完整消息拼入"
+        );
+        // 去重后状态已重置：后续完整消息恢复正常 Text 语义。
+        assert!(matches!(
+            p.parse(&full_line("第二条")),
+            CliEvent::Text(t) if t == "第二条"
+        ));
+    }
+
+    /// 片段后到达的**异文**完整消息 = 新消息，走完整消息 Text（B9 `\n\n`
+    /// 分隔语义），且重置累积（再下一同文消息不再误判为回放）。
+    #[test]
+    fn distinct_full_message_after_deltas_is_new_text() {
+        let mut p = GeminiParser::new();
+        p.parse(&delta_line("流式段"));
+        assert!(matches!(
+            p.parse(&full_line("完整回复")),
+            CliEvent::Text(t) if t == "完整回复"
+        ));
+        // 累积已清：同文「流式段」此时是独立完整消息，正常 Text。
+        assert!(matches!(
+            p.parse(&full_line("流式段")),
+            CliEvent::Text(t) if t == "流式段"
+        ));
+    }
+
+    /// 无 delta 的普通完整消息行为不变（向后兼容旧版 gemini CLI）。
+    #[test]
+    fn plain_messages_unchanged() {
+        let mut p = GeminiParser::new();
+        assert!(matches!(p.parse(&full_line("first")), CliEvent::Text(t) if t == "first"));
+        assert!(matches!(p.parse(&full_line("")), CliEvent::Skip));
+        assert!(
+            matches!(p.parse(&delta_line("")), CliEvent::Skip),
+            "空 delta 片段无信息量，跳过"
+        );
+    }
+
+    /// 端到端碎化回归（走 spawn_cli_backend 真读循环 + /bin/sh 假 gemini）：
+    /// 一条消息的 3 个 delta 片段 → final_text 无空行分隔地拼成整句；流式
+    /// Text chunk 逐片段推送。修复前 final_text = "你\n\n好\n\n世界"。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delta_stream_final_text_is_not_fragmented() {
+        use imagent_core::AgentChunk;
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+        let payload = format!(
+            "printf '%s\\n' {} {} {} {}",
+            q(&delta_line("你好，")),
+            q(&delta_line("世界")),
+            q(&delta_line("！")),
+            q(r#"{"type":"result","status":"success"}"#)
+        );
+        cmd.arg("-c").arg(payload);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentChunk>(64);
+        let mut parser = GeminiParser::new();
+        let outcome = imagent_core::backend_common::spawn_cli_backend(
+            cmd,
+            move |line: &str| parser.parse(line),
+            tx,
+            "gemini",
+            &[],
+            None,
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("假 gemini 流应成功");
+        assert_eq!(
+            outcome.final_text, "你好，世界！",
+            "碎片直接续接，无空行分隔"
+        );
+        let mut texts = Vec::new();
+        while let Ok(c) = rx.try_recv() {
+            if let AgentChunk::Text(t) = c {
+                texts.push(t);
+            }
+        }
+        assert_eq!(
+            texts,
+            vec!["你好，".to_string(), "世界".to_string(), "！".to_string()],
+            "delta 片段照常流式推送"
+        );
     }
 }

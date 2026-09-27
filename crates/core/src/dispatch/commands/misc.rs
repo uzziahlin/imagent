@@ -1169,7 +1169,9 @@ impl Dispatcher {
                     self.reply(conv, "⚠️ 没有可用的 /resume 列表——先发 /resume 查看历史会话，再 /export <序号>。", hint).await;
                     return;
                 };
-                const RESUME_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+                // v13 P3 还债批：TTL 不再本地重复定义——用 dispatch 模块的单一
+                // 来源 RESUME_CACHE_TTL（与 /resume <n> 的过期判定同值，防两处
+                // 漂移后 /export 与 /resume 对「过期」判断不一致）。
                 if at.elapsed() > RESUME_CACHE_TTL {
                     self.reply(
                         conv,

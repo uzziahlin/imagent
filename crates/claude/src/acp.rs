@@ -23,7 +23,8 @@
 //! - `session/request_permission` → Agent 反向调用 Client 请求工具权限，本 backend 按
 //!   [`PermissionMode`] 自动响应；Ask 档经注入的 [`ImPermissionHook`]（B3）把审批卡
 //!   发进 IM 等用户 y/n，超时 deny（与 claude-cli 的 MCP 闭环同一 PermissionRouter
-//!   通道）。
+//!   通道）。审批等待经 SDK 的 `cx.spawn` 移出 dispatch loop（P2-13）——回调内联
+//!   await 最长 900s 会把流式通知与后续请求全部积压在连接上。
 //!
 //! ## 连接模型（B2 / roadmap P5-14：per-conv 长驻连接）
 //!
@@ -609,18 +610,38 @@ impl LongLivedAcp {
                 .on_receive_request(
                     async move |request: RequestPermissionRequest,
                                 responder,
-                                _cx: ConnectionTo<_>| {
-                        // B3：Ask/AutoClaude 档经注入的 IM 审批闭环回调（与
-                        // claude-cli 的 MCP → socket → PermissionRouter 同一通道）；
-                        // 超时 deny 由 hook 内部（permission_ask_timeout）兜底。
-                        let outcome = permission_outcome(
-                            &request,
-                            &conv_for_handler,
-                            &perm_for_handler,
-                            hook.as_ref(),
-                        )
-                        .await;
-                        responder.respond(RequestPermissionResponse::new(outcome))
+                                cx: ConnectionTo<_>| {
+                        // P2-13：审批等待移出 SDK dispatch loop。SDK 源码
+                        //（agent-client-protocol jsonrpc.rs「Handlers Must Not
+                        // Block」/on_receive_request 的 Ordering 注释）明示：
+                        // 回调内联 await 会阻塞该连接的全部后续消息——Ask 档
+                        // 的 IM 审批等待（最长 permission_ask_timeout，默认
+                        // 900s）期间 session/update 流式通知与后续请求全部
+                        // 积压、一轮多审批强制串行。经 SDK 正规逃生门
+                        // `cx.spawn` 把「await hook → respond」移入并发任务，
+                        // 本回调立即返回（Handled::Yes）。
+                        //
+                        // 任务持有 responder（owned，随连接存活）与所需状态
+                        //（conv / 权限档句柄 / hook 的克隆）——不依赖
+                        // StreamState，turn 收尾清 current 不影响审批收尾；
+                        // 连接断开时任务随连接销毁（SDK Task 生命周期）。
+                        // spawn 失败（连接正在关闭，task_tx 已关）上抛 Err 终
+                        // 止——连接已死，无需也无法应答。
+                        let conv = conv_for_handler.clone();
+                        let perm = Arc::clone(&perm_for_handler);
+                        let hook = hook.clone();
+                        cx.spawn(async move {
+                            // B3：Ask/AutoClaude 档经注入的 IM 审批闭环回调（与
+                            // claude-cli 的 MCP → socket → PermissionRouter 同一
+                            // 通道）；超时 deny 由 hook 内部
+                            //（permission_ask_timeout）兜底。spawn 化后同轮多个
+                            // 权限请求并行审批（CLI 路径的 M3 串行取舍不适用
+                            // 于 ACP：通知不再陪审批等待）。
+                            let outcome = permission_outcome(&request, &conv, &perm, hook.as_ref())
+                                .await;
+                            responder.respond(RequestPermissionResponse::new(outcome))
+                        })?;
+                        Ok(())
                     },
                     agent_client_protocol::on_receive_request!(),
                 )
@@ -2089,6 +2110,162 @@ mod tests {
             .expect("B 不应受 A cancel 影响")
             .expect("B run 应成功");
         assert_eq!(out_b.final_text, "echo:fast");
+    }
+
+    /// P2-13 回归：审批等待不得阻塞 SDK dispatch loop。mock agent 在 prompt 轮内
+    /// 依次：① 发 request_permission（客户端 hook 挂起等闸门，不放行）；② 发一条
+    /// 流式文本通知（排在权限请求**之后**——若 handler 内联 await，该通知与后续
+    /// PromptResponse 全部积压）；③ spawn 后台任务等审批响应并记录；④ 立即回
+    /// PromptResponse。修复前 run() 会被审批等待拖死（终态排在积压队列尾）；
+    /// 修复后（cx.spawn）通知照常到达、run() 正常返回。放行闸门后另断言审批
+    /// 响应正确送达（spawn 的任务完成了 respond 闭环）。
+    #[tokio::test]
+    async fn permission_wait_does_not_block_dispatch_loop() {
+        let (agent_side, client_side) = Channel::duplex();
+        let sid = "perm-s1".to_string();
+        let sid_for_new = sid.clone();
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        let release_for_hook = release_rx.clone();
+        let outcome_seen: Arc<std::sync::Mutex<Option<RequestPermissionOutcome>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let outcome_cell = outcome_seen.clone();
+        tokio::spawn(async move {
+            let _ = Agent
+                .builder()
+                .name("mock-perm")
+                .on_receive_request(
+                    async move |req: InitializeRequest, responder, _cx: ConnectionTo<_>| {
+                        responder.respond(
+                            InitializeResponse::new(req.protocol_version)
+                                .agent_capabilities(AgentCapabilities::new()),
+                        )
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |_req: NewSessionRequest, responder, _cx: ConnectionTo<_>| {
+                        responder.respond(NewSessionResponse::new(sid_for_new.clone()))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |_req: LoadSessionRequest, responder, _cx: ConnectionTo<_>| {
+                        responder.respond(LoadSessionResponse::new())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |_req: PromptRequest, responder, cx: ConnectionTo<_>| {
+                        // AsyncFnMut 可能多次调用：嵌套 spawn 任务只能捕获
+                        // 本次调用的克隆（从闭包捕获态 clone 到调用局部）。
+                        let sid_req = sid.clone();
+                        let sid_notif = sid.clone();
+                        let cell = outcome_cell.clone();
+                        // ① 权限请求（先入队；Ask 档 hook 将挂起等闸门）。
+                        let mut tc =
+                            ToolCallUpdate::new("tc-perm", ToolCallUpdateFields::default());
+                        tc.fields.title = Some("Bash rm -rf /tmp/x".into());
+                        let options = vec![
+                            perm_option("allow", PermissionOptionKind::AllowOnce),
+                            perm_option("reject", PermissionOptionKind::RejectOnce),
+                        ];
+                        let sent =
+                            cx.send_request(RequestPermissionRequest::new(sid_req, tc, options));
+                        // ② 流式文本通知：排在权限请求之后——修复前会被内联的
+                        //    审批等待积压，永远到不了客户端。
+                        cx.send_notification(SessionNotification::new(
+                            sid_notif,
+                            SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                ContentBlock::Text(TextContent::new("during-perm".to_string())),
+                            )),
+                        ))?;
+                        // ③ 后台等审批响应并记录（不能内联 await：会堵死本 agent
+                        //    的 dispatch loop，客户端的响应永远路由不进来）。
+                        cx.spawn(async move {
+                            let resp: RequestPermissionResponse = sent.block_task().await?;
+                            *cell.lock().unwrap() = Some(resp.outcome);
+                            Ok(())
+                        })?;
+                        // ④ 立即回 PromptResponse——断言核心：客户端不被审批
+                        //    等待拖住。
+                        responder.respond(PromptResponse::new(StopReason::EndTurn))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_to(agent_side)
+                .await;
+        });
+
+        // 审批 hook：等闸门放行才回答（true = 放行）。watch::Receiver 可 Clone，
+        // hook（Fn）每次调用持自己的克隆。
+        let hook: ImPermissionHook = Arc::new(move |_ask| {
+            let mut rx = release_for_hook.clone();
+            Box::pin(async move {
+                while !*rx.borrow_and_update() {
+                    if rx.changed().await.is_err() {
+                        return false; // 发送端全丢（测试异常）：deny 兜底
+                    }
+                }
+                true
+            })
+        });
+        let backend = AcpBackend::with_permission_mode(PermissionMode::Ask);
+        backend.set_im_permission_hook(Some(hook));
+        let chan = std::sync::Mutex::new(Some(client_side));
+        let backend = backend.with_mock_factory(Arc::new(move || {
+            chan.lock()
+                .unwrap()
+                .take()
+                .expect("mock 通道只建连一次（同 conv 复用长驻连接）")
+        }));
+        let workdir = std::env::temp_dir();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentChunk>(64);
+
+        // 闸门未放行（审批挂着）——run() 必须照常完成（5s 上限，修复前必超时）。
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            backend.run("conv-perm", "hi", None, &workdir, &[], tx, &[], {
+                let (sx, rx) = tokio::sync::mpsc::channel(1);
+                drop(sx);
+                rx
+            }),
+        )
+        .await
+        .expect("run() 不应被审批等待阻塞（P2-13：审批已 cx.spawn 出 dispatch loop）")
+        .expect("run 应成功");
+        // 权限请求之后的流式通知未被积压：进正文与 chunk 流。
+        assert!(
+            out.final_text.contains("during-perm"),
+            "通知应穿透审批等待: {}",
+            out.final_text
+        );
+        let mut saw_text = false;
+        while let Ok(c) = rx.try_recv() {
+            if matches!(&c, AgentChunk::Text(t) if t == "during-perm") {
+                saw_text = true;
+            }
+        }
+        assert!(saw_text, "during-perm 应作为 Text chunk 推达");
+
+        // 放行闸门 → hook 放行 → spawn 的审批任务应答 allow 选项（respond 闭环）。
+        let _ = release_tx.send(true);
+        for _ in 0..250 {
+            if outcome_seen.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let outcome = outcome_seen.lock().unwrap().take();
+        match outcome {
+            Some(RequestPermissionOutcome::Selected(sel)) => {
+                assert_eq!(
+                    sel.option_id.0.as_ref(),
+                    "allow",
+                    "hook 放行应送达 allow 选项"
+                );
+            }
+            other => panic!("审批响应应经 spawn 任务正确送达: {other:?}"),
+        }
     }
 
     /// B2：并发上限——超 [`MAX_CONCURRENT_CONNS`] 的新 conv 直接拒绝（可读错误），

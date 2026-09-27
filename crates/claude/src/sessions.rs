@@ -9,16 +9,15 @@
 //!
 //! 全部纯函数 + 容错解析（任何异常按「无摘要」处理，不影响列出会话）；时间统一用
 //! 文件 mtime（免解析 JSONL 内的 ISO8601）。目录不存在返回空（claude 未用过/
-//! 版本布局变化 → `/resume` 自动退化为纯 IM 历史，不报错）。
+//! 版本布局变化 → `/resume` 自动退化为纯 IM 历史，不报错）。文件头读取与摘要
+//! 消毒的公共骨架在 [`imagent_core::session_scan`]（与 codex 扫描器共享，
+//! v13 P2-12 去重）。
 
 use std::path::{Path, PathBuf};
 
+use imagent_core::session_scan::{dir_entries, read_head_values, sanitize_summary};
 use imagent_core::LocalSession;
 
-/// 每个会话头部最多读的字节数（首条 user 消息通常在前几行；cap 防大文件全读）。
-const HEAD_CAP: usize = 64 * 1024;
-/// 摘要长度上限（char 计）。
-const SUMMARY_CHARS: usize = 60;
 /// 默认列出条数（dispatch 侧再截前 10 展示）。
 const DEFAULT_LIMIT: usize = 15;
 
@@ -64,22 +63,22 @@ pub fn list_local_sessions(claude_dir: &Path, workdir: &Path, limit: usize) -> V
     let mut out: Vec<(std::time::SystemTime, LocalSession)> = Vec::new();
     for enc in encode_candidates(workdir) {
         let dir = claude_dir.join("projects").join(enc);
-        let rd = match std::fs::read_dir(&dir) {
-            Ok(r) => r,
-            Err(_) => continue, // 候选目录不存在：正常（该编码规则下无会话）
-        };
-        for entry in rd.flatten() {
-            if entry.path().extension().and_then(|s| s.to_str()) != Some("jsonl") {
+        // 候选目录不存在（read_dir Err）→ dir_entries 给空，正常路径。
+        for entry in dir_entries(&dir) {
+            if entry.extension().and_then(|s| s.to_str()) != Some("jsonl") {
                 continue;
             }
-            let session_id = match entry.path().file_stem().and_then(|s| s.to_str()) {
+            let session_id = match entry.file_stem().and_then(|s| s.to_str()) {
                 Some(s) => s.to_string(),
                 None => continue,
             };
             if !seen.insert(session_id.clone()) {
                 continue;
             }
-            let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
+            let Ok(md) = std::fs::metadata(&entry) else {
+                continue;
+            };
+            let Ok(mtime) = md.modified() else {
                 continue;
             };
             let updated_at = mtime
@@ -87,7 +86,7 @@ pub fn list_local_sessions(claude_dir: &Path, workdir: &Path, limit: usize) -> V
                 .ok()
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            let (first_prompt, cwd) = read_head_info(&entry.path());
+            let (first_prompt, cwd) = read_head_info(&entry);
             out.push((
                 mtime,
                 LocalSession {
@@ -99,7 +98,12 @@ pub fn list_local_sessions(claude_dir: &Path, workdir: &Path, limit: usize) -> V
             ));
         }
     }
-    out.sort_by(|a, b| b.0.cmp(&a.0));
+    // mtime 倒序；同 mtime 以 session_id 倒序决胜（P2-12：纯 mtime 比较在并列
+    // 时依赖目录枚举序，跨调用不稳定——/resume 序号会漂移错位）。
+    out.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.session_id.cmp(&a.1.session_id))
+    });
     out.truncate(limit);
     out.into_iter().map(|(_, s)| s).collect()
 }
@@ -240,27 +244,18 @@ fn session_exists_in(base: &Path, workdir: &Path, session_id: &str) -> bool {
         .any(|enc| base.join(enc).join(format!("{session_id}.jsonl")).is_file())
 }
 
-/// 读文件头部（≤ HEAD_CAP）：`(首条可展示的 user 消息文本, 会话记录的 cwd)`。
+/// 读文件头部（≤ [`imagent_core::session_scan::HEAD_CAP`]，共享骨架）：
+/// `(首条可展示的 user 消息文本, 会话记录的 cwd)`。
 ///
 /// 摘要跳过：非 user 行、`isMeta` 行、`<` 开头的命令/系统注入文本、tool_result 块。
 /// cwd 取首个带非空 `cwd` 字符串字段的行（真实 jsonl 几乎每行都有；P5-15 接管
 /// 校验用，解析不到为 None → 跳过校验不阻塞列出）。
 fn read_head_info(path: &Path) -> (String, Option<String>) {
-    use std::io::Read;
-    let mut f = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return (String::new(), None),
-    };
-    let mut buf = vec![0u8; HEAD_CAP];
-    let Ok(n) = f.read(&mut buf) else {
+    let Some(values) = read_head_values(path) else {
         return (String::new(), None);
     };
-    buf.truncate(n);
     let mut cwd: Option<String> = None;
-    for line in buf.split(|&b| b == b'\n') {
-        let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
-            continue;
-        };
+    for v in values {
         if cwd.is_none() {
             if let Some(c) = v
                 .get("cwd")
@@ -311,18 +306,12 @@ fn extract_content_text(content: Option<&serde_json::Value>) -> Option<String> {
     }
 }
 
-/// 摘要消毒：压空白（含换行）、截 SUMMARY_CHARS 字符加省略号。
-fn sanitize_summary(s: &str) -> String {
-    let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() > SUMMARY_CHARS {
-        format!("{}…", flat.chars().take(SUMMARY_CHARS).collect::<String>())
-    } else {
-        flat
-    }
-}
+// 摘要消毒（sanitize_summary）已上移 imagent_core::session_scan 共享
+//（v13 P2-12 去重）。
 
 #[cfg(test)]
 mod tests {
+    use imagent_core::session_scan::SUMMARY_CHARS;
     /// W4-2：jsonl → Markdown 转录——user/assistant 文本块成段、tool/meta 行
     /// 跳过；找不到文件 None。
     #[test]
@@ -523,6 +512,35 @@ mod tests {
         assert_eq!(list[0].session_id, "new", "mtime 新的在前: {list:?}");
         assert_eq!(list[1].session_id, "old");
         assert_eq!(list[1].first_prompt, "old work");
+    }
+
+    /// P2-12：同 mtime 并列时以 session_id 决胜（确定性排序）——纯 mtime 比较
+    /// 依赖目录枚举序，跨调用不稳定，/resume 序号会漂移错位。
+    #[test]
+    fn same_mtime_tiebreak_orders_by_session_id() {
+        let root = tmp_root("tie");
+        let wd = Path::new("/tmp/proj-tie");
+        write_session(&root, wd, "s-b", &[user_line("b".into())]);
+        write_session(&root, wd, "s-a", &[user_line("a".into())]);
+        // 强制同 mtime（FileTimes 精确设置，绕开写入时序与 fs 精度）。
+        let same = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let times = std::fs::FileTimes::new().set_modified(same);
+        let dir = root
+            .join("projects")
+            .join(wd.to_string_lossy().replace('/', "-"));
+        for id in ["s-a", "s-b"] {
+            std::fs::File::options()
+                .write(true)
+                .open(dir.join(format!("{id}.jsonl")))
+                .unwrap()
+                .set_times(times)
+                .unwrap();
+        }
+        for _ in 0..3 {
+            let list = list_local_sessions(&root, wd, 10);
+            let ids: Vec<&str> = list.iter().map(|s| s.session_id.as_str()).collect();
+            assert_eq!(ids, vec!["s-b", "s-a"], "同 mtime 按 session_id 倒序决胜");
+        }
     }
 
     #[test]

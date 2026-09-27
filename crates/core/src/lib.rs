@@ -24,6 +24,7 @@ pub mod dedup;
 mod dispatch;
 mod error;
 pub mod instance;
+pub mod lineio;
 pub mod mcp;
 mod message;
 pub mod metrics;
@@ -31,6 +32,7 @@ pub mod paths;
 mod permission;
 mod platform;
 pub mod render;
+pub mod session_scan;
 mod types;
 
 pub use auth::Auth;

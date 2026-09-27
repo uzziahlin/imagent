@@ -20,8 +20,11 @@ pub enum ParsedEvent {
         session_id: String,
         model: Option<String>,
     },
-    /// `message` 且 `role == "assistant"`：agent 文本回复。
-    AssistantMessage { text: String },
+    /// `message` 且 `role == "assistant"`：agent 文本回复。`delta = true` 标记
+    /// 该消息是**增量片段**（流式 delta 而非完整消息，T20 碎化修复）——消费方
+    /// （backend 适配层的 [`crate::backend::GeminiParser`]）须走增量缓冲：片段
+    /// 直接续接、不参与完整消息的 `\n\n` 拼接，否则一句话会被空行拆成碎段。
+    AssistantMessage { text: String, delta: bool },
     /// `tool_use`：工具调用。
     ToolUse { tool: String, input: String },
     /// `tool_result`：工具结果。
@@ -42,8 +45,8 @@ pub enum ParsedEvent {
 /// - JSON 解析失败（含空行）→ [`ParsedEvent::Skip`]，永不 panic。
 /// - `type == "init"` → [`ParsedEvent::Init`]（`session_id`，可选 `model`）。
 /// - `type == "message"` 且 `role == "assistant"` →
-///   [`ParsedEvent::AssistantMessage`]（`content`）；`role != "assistant"`（如
-///   user）→ [`ParsedEvent::Other`]。
+///   [`ParsedEvent::AssistantMessage`]（`content`；`delta:true` 时 `delta = true`，
+///   标识增量片段）；`role != "assistant"`（如 user）→ [`ParsedEvent::Other`]。
 /// - `type == "tool_use"` → [`ParsedEvent::ToolUse`] `{ tool: tool_name, input:
 ///   parameters 序列化为 JSON 字符串 }`。
 /// - `type == "tool_result"` → [`ParsedEvent::ToolResult`] `{ tool:
@@ -78,6 +81,9 @@ pub fn parse_line(line: &str) -> ParsedEvent {
             if role == "assistant" {
                 ParsedEvent::AssistantMessage {
                     text: value.get("content").map(text_of).unwrap_or_default(),
+                    // delta 标记缺省 false：无标记的 message 按完整消息处理
+                    //（向后兼容——旧版 gemini CLI 无 delta 语义）。
+                    delta: value.get("delta").and_then(Value::as_bool).unwrap_or(false),
                 }
             } else {
                 // user message 等不计入 final 文本。
@@ -214,18 +220,30 @@ mod tests {
         assert_eq!(
             parse_line(line),
             ParsedEvent::AssistantMessage {
-                text: "The output `hello`.".into()
+                text: "The output `hello`.".into(),
+                delta: false,
             }
         );
     }
 
+    /// T20：delta 标记必须解析出来（消费方据此走增量缓冲，不再当完整消息）。
     #[test]
     fn assistant_message_with_delta() {
         let line = r#"{"type":"message","role":"assistant","content":"partial","delta":true}"#;
         assert_eq!(
             parse_line(line),
             ParsedEvent::AssistantMessage {
-                text: "partial".into()
+                text: "partial".into(),
+                delta: true,
+            }
+        );
+        // delta 字段非布尔（异常形态）按缺省 false 容错。
+        let bad = r#"{"type":"message","role":"assistant","content":"x","delta":"yes"}"#;
+        assert_eq!(
+            parse_line(bad),
+            ParsedEvent::AssistantMessage {
+                text: "x".into(),
+                delta: false,
             }
         );
     }

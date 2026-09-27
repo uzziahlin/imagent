@@ -5,27 +5,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
 
-#[cfg(unix)]
-#[tokio::test]
-async fn read_line_capped_rejects_oversized() {
-    // P1-9：超过上限（无换行）→ Err，防同 uid 进程发巨大行 OOM。
-    let bytes: Vec<u8> = vec![b'x'; 1000];
-    let mut reader = tokio::io::BufReader::new(&bytes[..]);
-    let res = Dispatcher::read_line_capped(&mut reader, 100).await;
-    assert!(res.is_err(), "oversized line must error");
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn read_line_capped_reads_normal_line() {
-    let bytes: &[u8] = b"{\"conv_id\":\"c1\"}\nextra";
-    let mut reader = tokio::io::BufReader::new(bytes);
-    let line = Dispatcher::read_line_capped(&mut reader, 1024)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(line, "{\"conv_id\":\"c1\"}\n");
-}
+// 注：read_line_capped 的读行测试已随 P3 还债批迁移至 `crate::lineio` 的测试
+// 模块（原 Dispatcher::read_line_capped 重复实现已删除，两处共用一份）。
 
 #[tokio::test]
 async fn conv_lock_released_on_backend_failure() {
