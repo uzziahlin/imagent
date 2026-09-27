@@ -686,6 +686,13 @@ pub struct CommentBody {
     /// 评论内容实体数组：`{"type":"text","text":"…"}` / at / img 等（未知 type 忽略）。
     #[serde(default)]
     pub content: Vec<CommentContentNode>,
+    /// T13：划词评论引用的文档原文片段。字段名对齐官方评论实体——file-comment
+    /// list API 的 `quote`（「局部评论的引用字段」，全文评论 `is_whole=true` 无此
+    /// 值）；`quoted_text` 作形态漂移别名。事件侧字段**未经真机抓包确认**，
+    /// fail-soft：缺失/空白不注入（见 [`render_comment_quote_block`]），fixture
+    /// 单测钉住假设形态（tests/fixtures/comment_docx_*.json）。
+    #[serde(default, alias = "quoted_text")]
+    pub quote: Option<String>,
     #[serde(default)]
     pub sender: Option<Sender>,
 }
@@ -722,6 +729,31 @@ pub fn is_comment_event(payload: &[u8]) -> bool {
                 .map(|t| t == "drive.file.comment.created_v1")
         })
         .unwrap_or(false)
+}
+
+/// T13：评论引用片段注入块的截断上限（字符）——对齐引用上下文/群上下文的
+/// 截断档（500 字），防超长划词挤占本轮 prompt 预算。
+pub const COMMENT_QUOTE_MAX_CHARS: usize = 500;
+
+/// T13：评论引用片段 → prompt 前置注入块（纯函数，验收核心）：
+///
+/// ```text
+/// 【评论所在文档片段】
+/// {quote 截 500 字}
+///
+/// {用户评论正文}
+/// ```
+///
+/// 对齐仓内注入风格（`【…】` 头 + 空行分隔正文，见 [`render_group_context_block`]）。
+/// quote 缺失/纯空白（全文评论、字段形态漂移）返回 None——fail-soft，不注入
+/// 不影响主链路。
+pub fn render_comment_quote_block(quote: &str) -> Option<String> {
+    let trimmed = quote.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let body: String = trimmed.chars().take(COMMENT_QUOTE_MAX_CHARS).collect();
+    Some(format!("【评论所在文档片段】\n{body}"))
 }
 
 /// 廉价判定 payload 是否为**群聊**消息事件（P6-1：drain 据此懒取 bot open_id——
@@ -1001,6 +1033,15 @@ pub fn parse_comment_event(
             content_hash(&text.join("\n"))
         )
     });
+    // T13：划词评论的引用片段前置注入——用户在评论文档哪一段，agent 此前
+    // 只能盲答。quote 缺失/空白（全文评论、字段漂移）不注入（fail-soft）。
+    let body = text.join("\n");
+    let text = b
+        .quote
+        .as_deref()
+        .and_then(render_comment_quote_block)
+        .map(|blk| format!("{blk}\n\n{body}"))
+        .unwrap_or(body);
     Some((
         key,
         b.comment_id.clone(),
@@ -1011,7 +1052,7 @@ pub fn parse_comment_event(
             conv_id: ConvId(format!("{COMMENT_CONV_PREFIX}{}", b.file_token)),
             sender: UserId(open_id),
             sender_name: None,
-            text: Some(text.join("\n")),
+            text: Some(text),
             media: vec![],
             media_errors: Vec::new(),
             mentions: Vec::new(),
@@ -3162,6 +3203,61 @@ mod tests {
         assert!(parse_comment_event(mk(text_node, "ou_a").as_bytes(), None).is_none());
         // bot id 未知（弱过滤）：有 at（任意）→ 过。
         assert!(parse_comment_event(mk(at_other, "ou_a").as_bytes(), None).is_some());
+    }
+
+    /// T13：划词评论的引用片段前置注入——块头在位、原文与用户正文保序；
+    /// quote 缺失/空白不注入；`quoted_text` 别名容错；超长截 500 字。
+    #[test]
+    fn parse_comment_event_quote_injection() {
+        let mk = |quote: &str| {
+            format!(
+                r#"{{"header":{{"event_id":"e","event_type":"drive.file.comment.created_v1"}},
+                "event":{{"comment_id":"c1","file_token":"f1","quote":{quote},
+                "content":[{{"type":"at","user_id":"ou_bot"}},{{"type":"text","text":"这段啥情况"}}],
+                "sender":{{"sender_id":{{"open_id":"ou_a"}},"sender_type":"user"}}}}}}"#
+            )
+        };
+        // 有 quote：块在正文之前，两段都保留。
+        let payload = mk(r#""营收环比下降 12%，主因续约延期""#);
+        let (_, _, msg) = parse_comment_event(payload.as_bytes(), Some("ou_bot")).unwrap();
+        let text = msg.text.as_deref().expect("应有正文");
+        let blk = text.find("【评论所在文档片段】").expect("引用块在位");
+        let quote = text.find("营收环比下降 12%").expect("引用原文在位");
+        let body = text.find("这段啥情况").expect("用户正文在位");
+        assert!(blk < quote && quote < body, "块头→引用→正文: {text}");
+
+        // 空白 quote：不注入，正文原样。
+        let payload = mk(r#""   ""#);
+        let (_, _, msg) = parse_comment_event(payload.as_bytes(), Some("ou_bot")).unwrap();
+        assert_eq!(msg.text.as_deref(), Some("这段啥情况"), "空白不注入");
+
+        // quoted_text 别名（形态漂移容错）。
+        let alias = r#"{"header":{"event_id":"e","event_type":"drive.file.comment.created_v1"},
+            "event":{"comment_id":"c1","file_token":"f1","quoted_text":"别名片段",
+            "content":[{"type":"at","user_id":"ou_bot"},{"type":"text","text":"看下"}],
+            "sender":{"sender_id":{"open_id":"ou_a"}}}}"#;
+        let (_, _, msg) = parse_comment_event(alias.as_bytes(), Some("ou_bot")).unwrap();
+        assert!(
+            msg.text.as_deref().unwrap_or_default().contains("别名片段"),
+            "别名也注入: {:?}",
+            msg.text
+        );
+
+        // 超长截断：600 字引用 → 注入体恰 500 字（char 边界安全）。
+        let long = "长".repeat(600);
+        let payload = mk(&format!("{long:?}"));
+        let (_, _, msg) = parse_comment_event(payload.as_bytes(), Some("ou_bot")).unwrap();
+        let text = msg.text.unwrap();
+        let injected = text
+            .split("【评论所在文档片段】\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n\n").next())
+            .expect("应注入引用块");
+        assert_eq!(
+            injected.chars().count(),
+            COMMENT_QUOTE_MAX_CHARS,
+            "截到上限"
+        );
     }
 
     // ---------- P6-1：mention 基础设施（@bot 过滤 / 占位剥离 / mentions 元数据） ----------

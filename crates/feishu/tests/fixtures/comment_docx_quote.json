@@ -1,0 +1,31 @@
+{
+  "schema": "2.0",
+  "header": {
+    "event_id": "evt_fixture_comment_quote",
+    "event_type": "drive.file.comment.created_v1",
+    "create_time": "1788000001000",
+    "token": "tok_fixture",
+    "app_id": "cli_fixture",
+    "tenant_key": "tk_fixture"
+  },
+  "event": {
+    "comment_id": "7034fixturecm1",
+    "file_token": "doxcnFixture",
+    "file_type": "docx",
+    "is_whole": false,
+    "quote": "本季度 Northwind 区域营收环比下降 12%，主因是大客户续约延期与渠道库存去化。",
+    "content": [
+      { "type": "text", "text": "这段为什么下滑" },
+      { "type": "at", "user_id": "ou_fixture_bot" }
+    ],
+    "sender": {
+      "sender_id": {
+        "open_id": "ou_fixture_user",
+        "union_id": "on_fixture_user",
+        "user_id": "usr_fixture"
+      },
+      "sender_type": "user",
+      "tenant_key": "tk_fixture"
+    }
+  }
+}

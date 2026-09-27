@@ -1,0 +1,30 @@
+{
+  "schema": "2.0",
+  "header": {
+    "event_id": "evt_fixture_comment_whole",
+    "event_type": "drive.file.comment.created_v1",
+    "create_time": "1788000002000",
+    "token": "tok_fixture",
+    "app_id": "cli_fixture",
+    "tenant_key": "tk_fixture"
+  },
+  "event": {
+    "comment_id": "7034fixturecm2",
+    "file_token": "doxcnFixture",
+    "file_type": "docx",
+    "is_whole": true,
+    "content": [
+      { "type": "at", "user_id": "ou_fixture_bot" },
+      { "type": "text", "text": " 总结一下全文要点" }
+    ],
+    "sender": {
+      "sender_id": {
+        "open_id": "ou_fixture_user",
+        "union_id": "on_fixture_user",
+        "user_id": "usr_fixture"
+      },
+      "sender_type": "user",
+      "tenant_key": "tk_fixture"
+    }
+  }
+}
