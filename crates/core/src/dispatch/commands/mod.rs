@@ -34,6 +34,7 @@ pub(super) const COMMAND_GROUPS: &[(&str, &[&str])] = &[
         "🧪 状态与诊断",
         &[
             "/status",
+            "/tasks",
             "/stats",
             "/doctor",
             "/reconnect",
@@ -232,6 +233,10 @@ impl Dispatcher {
                     }
                     "/status" => {
                         self.cmd_status(&conv, &hint).await;
+                        return;
+                    }
+                    "/tasks" => {
+                        self.cmd_tasks(&conv, &hint).await;
                         return;
                     }
                     "/cron" => {

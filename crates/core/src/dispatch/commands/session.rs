@@ -617,6 +617,8 @@ impl Dispatcher {
         // P5-16：注册进 running——/stop 此前中断不了 /compact
         //（长摘要生成只能干等 agent_timeout）。conv 锁由调用方
         // 持有，注册/移除无 ABA（新轮次须先等锁）。/compact 无转向。
+        // T11：快照保持空默认——本消费循环只提取 Final，摘要生成的中间
+        // chunk 不上面板；/tasks 对压缩轮显示 digest + 时长 + 工具 0 次。
         self.running.lock().await.insert(
             conv.0.clone(),
             RoundHandle {
@@ -624,6 +626,7 @@ impl Dispatcher {
                 steer: None,
                 started: std::time::Instant::now(),
                 digest: Some("压缩上下文（/compact）".to_string()),
+                snapshot: Arc::new(std::sync::Mutex::new(RoundSnapshot::default())),
             },
         );
         let mut summary: Option<String> = None;

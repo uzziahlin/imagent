@@ -48,6 +48,21 @@ pub struct Metrics {
     /// P2（code-review v13）：等待并发护栏 permit 的轮数（排队深度）。acquire 前
     /// inc、获得/被取消 dec（Drop guard 防 future 取消泄漏）。
     pub round_queue_depth: IntGauge,
+    /// T11（v13 #4）：chunk channel 积压深度。round 消费循环**每次迭代**刷新
+    /// （`rx.len()`，tokio mpsc `Receiver::len` 自 1.38 稳定，workspace 1.5x 可用）
+    /// ——消费端背压（P1-1/P2-11 整类问题）的最直接先行信号：消费被平台 IO 钉死
+    /// 时该值会顶到 channel 容量（32）并停留。全局单 gauge 不带 conv label（会话
+    /// 维度做 label 是高基数时间序列）；多 conv 并发在飞时值为「最近一次观测」，
+    /// 卡住的 conv 每次迭代都写高值，观测层面不受影响。
+    pub agent_channel_depth: IntGauge,
+    /// T11：卡片 patch 时延（秒）——card_session 的 `dispatch_patch` 全路径计时
+    /// （平台 send_card/update_card + live_cards 登记落库）。bucket 对齐时延类
+    /// 建议分布（5ms～10s）。
+    pub card_patch_seconds: Histogram,
+    /// T11：文本平台合帧 flush 的字节量（round::TextCoalescer::flush）。观察
+    /// P2-11 合帧效果——delta 级 chunk（claude-acp）应聚成较大消息而非逐条
+    /// 发送；bucket 对数分布（16B～64KB）。
+    pub text_flush_bytes: Histogram,
 }
 
 impl Metrics {
@@ -112,6 +127,23 @@ impl Metrics {
                 "等待全局并发护栏 permit 的轮数（排队深度）"
             )
             .expect("register round_queue_depth"),
+            agent_channel_depth: register_int_gauge!(
+                "imagent_agent_channel_depth",
+                "agent chunk channel 积压深度（round 消费循环每迭代刷新；消费端背压先行信号）"
+            )
+            .expect("register agent_channel_depth"),
+            card_patch_seconds: register_histogram!(
+                "imagent_card_patch_seconds",
+                "卡片 patch 时延（card_session dispatch_patch 全路径）",
+                vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+            )
+            .expect("register card_patch_seconds"),
+            text_flush_bytes: register_histogram!(
+                "imagent_text_flush_bytes",
+                "文本平台合帧 flush 的字节量（TextCoalescer::flush，观察合帧效果）",
+                vec![16.0, 64.0, 256.0, 1024.0, 4096.0, 16384.0, 65536.0]
+            )
+            .expect("register text_flush_bytes"),
         }
     }
 }
@@ -158,6 +190,11 @@ mod tests {
         METRICS.running_rounds.dec(); // 平衡：gauge 不留残值（其它测试断言归零态）
         METRICS.round_queue_depth.inc();
         METRICS.round_queue_depth.dec();
+        // T11：消费侧三指标——gauge 观测后归零平衡，histogram 观测一次。
+        METRICS.agent_channel_depth.set(3);
+        METRICS.agent_channel_depth.set(0);
+        METRICS.card_patch_seconds.observe(0.05);
+        METRICS.text_flush_bytes.observe(256.0);
         let out = render();
         assert!(
             out.contains("imagent_messages_in_total"),
@@ -198,6 +235,18 @@ mod tests {
         assert!(
             out.contains("imagent_round_queue_depth"),
             "missing round_queue_depth: {out}"
+        );
+        assert!(
+            out.contains("imagent_agent_channel_depth"),
+            "missing agent_channel_depth: {out}"
+        );
+        assert!(
+            out.contains("imagent_card_patch_seconds"),
+            "missing card_patch_seconds: {out}"
+        );
+        assert!(
+            out.contains("imagent_text_flush_bytes"),
+            "missing text_flush_bytes: {out}"
         );
     }
 }

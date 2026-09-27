@@ -188,6 +188,59 @@ impl Dispatcher {
         self.reply(conv, &text, hint).await;
     }
 
+    /// /tasks —— 轮次内部进度面板（T11，v13 #4）：本 conv 在飞轮次的 checklist
+    /// 进度（▓ 进度条 + 逐项 ✅/⏳/◌，格式复用卡片侧 checklist）+ 工具统计。
+    /// /status 只有轮级摘要（任务 + 时长），轮次内部进度此前仅卡片平台 checklist
+    /// 可见——纯文本平台（wecom/ilink）与「不想翻卡片」场景由此获得查看入口。
+    /// 白名单即可用（非 admin）：查看型只读无副作用，群 conv 任何人可看。
+    pub(super) async fn cmd_tasks(&self, conv: &ConvId, hint: &ReplyHint) {
+        // 取句柄即 clone、锁外渲染（v1.18 纪律：不持 running 锁跨 reply 的 await）。
+        let handle = self.running.lock().await.get(&conv.0).cloned();
+        let Some(h) = handle else {
+            // 文案对齐 /stop 无任务时的口径。
+            self.reply(conv, "ℹ️ 当前没有运行中的任务", hint).await;
+            return;
+        };
+        // 快照读（std Mutex 短临界区，不跨 await；clone 后立即放锁）。
+        let snap = h.snapshot.lock().unwrap().clone();
+        let mut out = String::from("📋 任务面板");
+        if let Some(d) = h.digest.as_deref().filter(|d| !d.is_empty()) {
+            out.push_str(&format!("：{}", truncate_str(d.trim(), 40)));
+        }
+        out.push_str(&format!("\n⏱️ 已跑 {}", format_uptime(h.started.elapsed())));
+        // checklist：与卡片侧 todo_list_md 同款 10 段 ▓ 进度条 + 逐项状态行
+        //（文本面板改用 ✅/⏳/◌ 图标承载 markdown checkbox 语义）。
+        if !snap.todos.is_empty() {
+            let total = snap.todos.len();
+            let done = snap
+                .todos
+                .iter()
+                .filter(|t| t.status == crate::types::TodoStatus::Completed)
+                .count();
+            let filled = ((done * 10) + total / 2) / total;
+            out.push_str(&format!(
+                "\n📋 计划 {}{} {}/{}",
+                "▓".repeat(filled.min(10)),
+                "░".repeat(10 - filled.min(10)),
+                done,
+                total
+            ));
+            for t in &snap.todos {
+                let icon = match t.status {
+                    crate::types::TodoStatus::Completed => "✅",
+                    crate::types::TodoStatus::InProgress => "⏳",
+                    crate::types::TodoStatus::Pending => "◌",
+                };
+                out.push_str(&format!("\n{icon} {}", truncate_str(t.text.trim(), 60)));
+            }
+        }
+        out.push_str(&format!("\n🔧 工具 {} 次", snap.tool_calls));
+        if let Some(last) = snap.last_tool.as_deref() {
+            out.push_str(&format!("，最近：{last}"));
+        }
+        self.reply(conv, &out, hint).await;
+    }
+
     /// /doctor —— 自检（workdir/store/在飞任务）。
     pub(super) async fn cmd_doctor(&self, conv: &ConvId, hint: &ReplyHint) {
         // P4-7：自检——workdir / store / 后端 / 在飞任务。
@@ -1559,7 +1612,7 @@ impl Dispatcher {
                 (":::collapse 📁 目录与文件", "- /cd <path> 切工作目录 · /ws save|use|remove <name> 命名空间\n- /img <path> 发图片 · /file <path> 发文件"),
                 (":::collapse 🛡️ 权限与运行", "- /perm <off|allow|deny|ask> 模式 · /perm list 查看 · /perm revoke <工具> 撤销\n- /timeout <分钟|off|default> 空闲看门狗 · /model [名称|default] 模型"),
                 (":::collapse ⏰ 定时任务", "- /cron add <分 时 日 月 周> <指令>（本地时区）\n- /cron list · rm <id> · enable|disable <id>"),
-                (":::collapse 🧪 状态与诊断", "- /status 状态 · /doctor 自检 · /reconnect 重连\n- /config [k v] 热改 · /stats [today|7d|all] 用量 · /audit [n] 审计"),
+                (":::collapse 🧪 状态与诊断", "- /status 状态 · /tasks 轮次进度 · /doctor 自检 · /reconnect 重连\n- /config [k v] 热改 · /stats [today|7d|all] 用量 · /audit [n] 审计"),
                 (":::collapse 👥 管理（管理员）", "- /allow、/disallow 授权（群内可 @ 对方）· /chat allow|deny|allow-all|list\n- /admin list|add|remove · /list 白名单 · /whoami 我的 id"),
             ]
             .iter()
@@ -1567,7 +1620,7 @@ impl Dispatcher {
             .collect::<Vec<_>>()
             .join("\n\n")
         } else {
-            "🗂 会话\n- /new 重置 · /switch 切换 · /sessions · /resume [n] · /compact · /retry · /again · /last · /export [n]\n\n📁 目录与文件\n- /cd · /ws save|use|remove · /img · /file\n\n🛡️ 权限与运行\n- /perm <off|allow|deny|ask> · /perm list · /perm revoke <工具>\n- /stop · /queue [drop n] · /timeout · /model\n\n⏰ 定时\n- /cron add <分 时 日 月 周> <指令> · list · rm · enable|disable\n\n🧪 诊断\n- /status · /doctor · /reconnect · /config · /stats · /audit\n\n👥 管理（管理员）\n- /allow · /disallow · /chat · /admin · /list · /whoami".to_string()
+            "🗂 会话\n- /new 重置 · /switch 切换 · /sessions · /resume [n] · /compact · /retry · /again · /last · /export [n]\n\n📁 目录与文件\n- /cd · /ws save|use|remove · /img · /file\n\n🛡️ 权限与运行\n- /perm <off|allow|deny|ask> · /perm list · /perm revoke <工具>\n- /stop · /queue [drop n] · /timeout · /model\n\n⏰ 定时\n- /cron add <分 时 日 月 周> <指令> · list · rm · enable|disable\n\n🧪 诊断\n- /status · /tasks 轮次进度 · /doctor · /reconnect · /config · /stats · /audit\n\n👥 管理（管理员）\n- /allow · /disallow · /chat · /admin · /list · /whoami".to_string()
         };
         body = format!("{groups}\n\n{body}");
         // v1.23：动态追加 shortcuts 段——快捷命令此前零发现性（忘了名字就

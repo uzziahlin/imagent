@@ -312,6 +312,10 @@ struct MockBackend {
     /// P2（v13）：完成闸门（默认 None：立即完成）。Some 时 run 记录调用后挂起
     /// 等 notify_waiters——并发护栏测试用（精确控制「轮次在飞」窗口）。
     complete_gate: Option<Arc<tokio::sync::Notify>>,
+    /// T11（/tasks 面板）：进入完成闸门前先发的 TodoList / ToolUse chunk——制造
+    /// 「轮次在飞且已有内部进度」的窗口（默认空 = 行为不变）。
+    pre_gate_todos: Vec<crate::types::TodoItem>,
+    pre_gate_tools: Vec<(String, String)>,
 }
 
 impl MockBackend {
@@ -338,6 +342,8 @@ impl MockBackend {
             allowlist_supported: false,
             usage: None,
             complete_gate: None,
+            pre_gate_todos: Vec::new(),
+            pre_gate_tools: Vec::new(),
         };
         (b, calls, prompts, order)
     }
@@ -418,6 +424,25 @@ impl MockBackend {
         *b.local_sessions.lock().await = local;
         (b, calls, prompts, order)
     }
+    /// T11（/tasks 面板测试）：gated 变体 + 挂起前先发 TodoList / ToolUse chunk
+    /// ——「轮次在飞且已有内部进度」的精确窗口。
+    fn new_gated_with_progress(
+        todos: Vec<crate::types::TodoItem>,
+        tools: Vec<(String, String)>,
+    ) -> (
+        Self,
+        CallsHandle,
+        PromptsHandle,
+        CounterHandle,
+        Arc<tokio::sync::Notify>,
+    ) {
+        let (mut b, calls, prompts, order) = Self::new();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        b.complete_gate = Some(gate.clone());
+        b.pre_gate_todos = todos;
+        b.pre_gate_tools = tools;
+        (b, calls, prompts, order, gate)
+    }
     /// P2（v13）：完成闸门变体——run 开跑（调用已记录）后挂起等 notify_waiters，
     /// 精确制造「轮次在飞」窗口（并发护栏测试用）。
     fn new_gated() -> (
@@ -484,6 +509,25 @@ impl Backend for MockBackend {
 
         // 稍微让出调度器，便于测试串行。
         tokio::task::yield_now().await;
+
+        // T11（/tasks 面板）：进闸门前先发进度 chunk（默认空 = 行为不变）——
+        // 消费循环把它们写进 RoundSnapshot 后挂起，面板查询窗口即就绪。
+        if !self.pre_gate_todos.is_empty() {
+            let _ = chunks
+                .send(AgentChunk::TodoList {
+                    items: self.pre_gate_todos.clone(),
+                })
+                .await;
+        }
+        for (tool, input) in &self.pre_gate_tools {
+            let _ = chunks
+                .send(AgentChunk::ToolUse {
+                    tool: tool.clone(),
+                    input: input.clone(),
+                    id: None,
+                })
+                .await;
+        }
 
         // P2（v13）：完成闸门——调用已记录（在飞可观测）后挂起，等测试放行。
         if let Some(g) = &self.complete_gate {
@@ -2981,6 +3025,97 @@ async fn status_doctor_reconnect_reply() {
     assert!(
         inbox.iter().any(|t| t.contains("重连指令失败")),
         "默认平台应报不支持重连: {inbox:?}"
+    );
+    drop_db(ctx.db).await;
+}
+
+// ---------- T11（v13 #4）：/tasks 轮次进度面板 ----------
+
+/// /tasks：在飞轮次 → checklist 进度（▓ 进度条 + 逐项 ✅/⏳/◌）+ 工具统计；
+/// 无在飞 → 提示文案（对齐 /stop 口径）。MockBackend 在完成闸门前发
+/// TodoList + ToolUse chunk，制造「在飞且已有内部进度」的窗口。
+#[tokio::test]
+async fn tasks_command_shows_progress_and_tool_stats() {
+    let _serial = SERIAL.lock().await;
+    let auth = Auth::new(vec!["alice".into()]);
+    let (plat, _pi, _pc) = MockPlatform::new();
+    let (back, calls, _prompts, _order, gate) = MockBackend::new_gated_with_progress(
+        vec![
+            crate::types::TodoItem {
+                id: None,
+                text: "复现问题".into(),
+                status: crate::types::TodoStatus::Completed,
+            },
+            crate::types::TodoItem {
+                id: None,
+                text: "修复代码".into(),
+                status: crate::types::TodoStatus::InProgress,
+            },
+            crate::types::TodoItem {
+                id: None,
+                text: "回归测试".into(),
+                status: crate::types::TodoStatus::Pending,
+            },
+        ],
+        vec![
+            ("Bash".into(), r#"{"command":"git status"}"#.into()),
+            ("Read".into(), r#"{"file_path":"src/main.rs"}"#.into()),
+        ],
+    );
+    let mut ctx =
+        build_with_parts_full(auth, plat, back, test_budgets(), PermissionMode::Off).await;
+    ctx.calls = calls.clone();
+    // 起一轮（在飞），等 TodoList chunk 被消费进快照（todos 非空 = 面板数据就绪）。
+    let d = ctx.disp.clone();
+    let h = tokio::spawn(async move { d.handle(msg("c1", "alice", "修一个 bug")).await });
+    assert!(
+        wait_until(&ctx, |c| {
+            Box::pin(async move {
+                c.disp
+                    .running
+                    .lock()
+                    .await
+                    .get("c1")
+                    .is_some_and(|rh| !rh.snapshot.lock().unwrap().todos.is_empty())
+            })
+        })
+        .await,
+        "在飞轮次应已消费 TodoList chunk"
+    );
+    // /tasks：checklist 进度 + 逐项状态 + 工具统计（2 次调用，最近 = Read）。
+    ctx.disp.handle(msg("c1", "alice", "/tasks")).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    let panel = inbox
+        .iter()
+        .rev()
+        .find(|t| t.contains("任务面板"))
+        .expect("/tasks 应回进度面板");
+    assert!(panel.contains("📋 计划"), "应含计划行: {panel}");
+    assert!(panel.contains("▓"), "应含 ▓ 进度条: {panel}");
+    assert!(panel.contains("1/3"), "应含完成计数 1/3: {panel}");
+    assert!(panel.contains("✅ 复现问题"), "完成项图标+文本: {panel}");
+    assert!(panel.contains("⏳ 修复代码"), "进行项图标+文本: {panel}");
+    assert!(panel.contains("◌ 回归测试"), "待办项图标+文本: {panel}");
+    assert!(
+        panel.contains("🔧 工具 2 次，最近：Read — src/main.rs"),
+        "工具统计应含次数与最近调用: {panel}"
+    );
+    // 放行 → 轮次收尾 → 在飞注册清除。
+    gate.notify_one();
+    let _ = tokio::time::timeout(Duration::from_secs(5), h).await;
+    assert!(
+        wait_until(&ctx, |c| {
+            Box::pin(async move { c.disp.running.lock().await.is_empty() })
+        })
+        .await,
+        "轮次应已收尾"
+    );
+    // 无在飞轮次 → 无任务提示。
+    ctx.disp.handle(msg("c1", "alice", "/tasks")).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.iter().any(|t| t.contains("当前没有运行中的任务")),
+        "无在飞轮次应回提示: {inbox:?}"
     );
     drop_db(ctx.db).await;
 }
