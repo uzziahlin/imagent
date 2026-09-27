@@ -34,7 +34,7 @@ imagent 是一个常驻网关进程：监听 IM 私聊 / 群聊消息 → 鉴权
 - 🔐 **安全第一**：发送者白名单 + 会话（群）白名单 + `allowed_tools` 收敛 + workdir 锁定 + **IM 内权限审批闭环**（按钮卡片 / 文本 y/n——按钮卡片仅飞书）。
 - 💬 **会话连续**：per-chat session 持久化（SQLite），重启可续；`--resume`；`/switch` 多命名会话；`/resume` 统一列表无感接管历史/电脑端 Claude Code 会话。
 - ⏰ **定时任务（/cron）**：5 字段 cron 表达式（本地时区含 DST）+ store 持久化，到期消息走与手打完全相同的鉴权/审批管线——日报、巡检、定时批处理一句话建好；停机补跑策略 `cron_catchup = one|off|all`（逐周期补跑上限 3 条 / 陈旧跳过 / 触发一次）。
-- 📡 **Webhook 入站**：`POST /hook/<token>` 把 CI 失败、监控告警等外部事件注入指定会话——与手打消息同权走鉴权/审批管线（token 路径鉴权 + 会话白名单，无旁路），agent 接事件自动排障、审批卡上放行修复。
+- 📡 **Webhook 入站**：`POST /hook/<token>` 把 CI 失败、监控告警等外部事件注入指定会话——与手打消息同权走鉴权/审批管线（token 路径鉴权 + HMAC 验签 + 两层防重放 + 会话白名单，无旁路；非 loopback 绑定未配 secret 拒绝启动），agent 接事件自动排障、审批卡上放行修复。
 - 🛑 **任务控制（steering）**：`/stop` 随时中断在飞任务（杀 agent 子进程），**排队消息保留并自动转入下一轮**（对齐 Claude Code 的 Esc + 队列注入语义——运行中发补充/纠正不再丢，注入条数上卡片 footer 可见）；空闲看门狗自动终止无输出的僵死任务；失败后一键 `/retry` 续接。
 - 🛟 **崩溃不丢消息**：排队消息实时落库（schema v12），进程崩溃 / `kill -9` / 断电后重启自动重放——批处理与 steering 队列不再随进程消失；**执行中的轮次**同样留痕（轮首落 inflight 标记），重启后通知会话可 `/retry` 一键续跑。
 - 🔁 **消息批处理**：运行中到达的消息排队，与连发消息合并为一轮执行（不重复跑轮、不烧 token；批窗口静默判停自适应）；`/queue list|drop` 队列可视化管理。
@@ -143,8 +143,8 @@ allowed_senders = []        # 留空 = 发现模式（先看日志拿你的 from
 # feishu_thread_active_window_secs = 1800  # 话题群免@窗口(秒)：话题内近期有消息则豁免群消息须@bot；默认30分钟，0=关闭
 # platform = "feishu"                # wecom/feishu 经 config 凭据接入（见下）
 
-# ===== 事件入站（v1.20 webhook；v1.21 防护套件 + GitHub 原生事件）=====
-# webhook_addr = "127.0.0.1:18443"   # POST /hook/<token>；非 loopback 部署建议 secret 验签 + 32+ 位随机 token
+# ===== 事件入站（v1.20 webhook；v1.21 防护套件 + GitHub 原生事件；v1.24 防重放）=====
+# webhook_addr = "127.0.0.1:18443"   # POST /hook/<token>；非 loopback 绑定且任一条目未配 secret → 拒绝启动（fail-closed）
 # [[webhook]]                         # token → 会话（须 /chat allow 放行才会驱动 agent）
 # token = "0123456789abcdef0123456789abcdef"
 # conv  = "feishu:oc_xxx"
@@ -152,6 +152,17 @@ allowed_senders = []        # 留空 = 发现模式（先看日志拿你的 from
 # secret = "github-webhook-secret"    # 可选 HMAC-SHA256 验签（GitHub webhook secret 同款：
 #                                     #   X-Hub-Signature-256: sha256=<hex>；公网/隧道部署强烈建议）
 # rps = 10                            # 可选限速（请求/秒，缺省 10；0 = 不限）
+# replay_window_secs = 300            # v1.24 防重放·第 2 层（opt-in，须配 secret）：请求须带
+#                                     #   X-Imagent-Timestamp: <unix秒>，验签串改为 "{ts}.{body}"，
+#                                     #   |now-ts| > 窗口 → 401。自建发送端建议开启，示例：
+#                                     #   ts=$(date +%s); body='{"text":"CI failed"}'
+#                                     #   sig=$(printf '%s.%s' "$ts" "$body" | openssl dgst -sha256 -hmac "$SECRET" | sed 's/^.* //')
+#                                     #   curl -H "X-Imagent-Timestamp: $ts" -H "X-Hub-Signature-256: sha256=$sig" \
+#                                     #        -d "$body" http://127.0.0.1:18443/hook/<token>
+#                                     #   GitHub 原生签名不含时间戳、无法配合本协议——公网 + GitHub 场景
+#                                     #   靠第 1 层去重 + HTTPS。两层防重放：① 验签通过后按 (token,签名)
+#                                     #   去重（默认启用，10 分钟内同签名重发 409——重放字节必相同即被拦；
+#                                     #   代价：合法的同字节重发也被拦，等 10 分钟后重发即可）；② 本协议。
 # feishu_urgent_on_ask = true         # 审批/问题卡到达即应用内加急弹通知（缺省开；免打扰时段自动跳过）
 # GitHub 原生事件：带 X-GitHub-Event 头的请求自动解析为可读摘要注入
 #（workflow_run 终态/push/issues/评论/PR/ping；未识别事件确认但不注入）；

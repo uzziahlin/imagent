@@ -730,6 +730,13 @@ async fn main() -> Result<()> {
             {
                 match addr.parse::<SocketAddr>() {
                     Ok(socket) => {
+                        // v1.24 fail-closed（对齐 metrics 的 S7 口径）：非
+                        // loopback 绑定且任一 [[webhook]] 条目未配 secret →
+                        // 拒绝启动——webhook 能直接驱动 agent，不允许多一条
+                        // 无验签的公网入口。
+                        if let Err(reason) = validate_webhook_bind(socket, &config.webhooks) {
+                            return Err(anyhow!("webhook_addr 配置不安全，拒绝启动：{reason}"));
+                        }
                         if config.webhooks.is_empty() {
                             tracing::warn!(target: "imagent::ops", "webhook_addr 已配置但 [[webhook]] 表为空，webhook server 未启动");
                         } else {
@@ -1356,11 +1363,18 @@ fn bearer_authorized(headers: &axum::http::HeaderMap, token: Option<&str>) -> bo
 /// handle() 完整管线（会话白名单门内才有 agent，无旁路）。
 /// v1.21 防护套件：可选 HMAC-SHA256 验签（GitHub webhook secret 协议）+
 /// 每 token 令牌桶限速 + GitHub 原生 payload 结构化摘要。
+/// v1.24 防重放两层：① 验签通过后按 (token, 签名) 进程内去重（同字节重放
+/// 409）；② opt-in 时间戳协议 `X-Imagent-Timestamp`（验签串 `{ts}.{body}`，
+/// 过窗 401）——见 [`webhook_gate`] / [`ReplayGuard`]。
 #[derive(Clone)]
 struct WebhookState {
     /// token → 路由（含验签密钥/限速桶）
     routes: std::collections::HashMap<String, std::sync::Arc<WebhookRoute>>,
     dispatcher: Arc<imagent_core::Dispatcher>,
+    /// v1.24 第 1 层防重放：验签通过签名的进程级去重表（所有路由共享，
+    /// 键含 token）。Clone 语义 = 共享同一张表（axum 每 connection 克隆
+    /// state，去重必须进程级生效）。
+    seen: ReplayGuard,
 }
 
 /// 单条 webhook 路由：投递目标 + 防护配置 + 限速桶（std Mutex——临界区纯内存
@@ -1370,9 +1384,178 @@ struct WebhookRoute {
     name: String,
     /// HMAC-SHA256 验签密钥（GitHub webhook secret 协议）。None = 不验签。
     secret: Option<String>,
+    /// v1.24 时间戳协议窗口（秒）；0 = 不启用（验签串 = body 原文）。
+    replay_window_secs: u64,
     /// 令牌桶速率（请求/秒）；0 = 不限速。
     rps: f64,
     bucket: std::sync::Mutex<TokenBucket>,
+}
+
+/// v1.24 第 1 层防重放：验签通过签名的去重表（进程内 LRU——容量
+/// [`REPLAY_SEEN_CAPACITY`] / 条目 TTL [`REPLAY_SEEN_TTL`]）。手法与 feishu
+/// 评论锚点表同款：HashMap + 插入时间戳，超容先清过期、再淘汰最旧；不引
+/// lru 依赖。std Mutex——临界区纯内存无 await（与限速桶同款理由）。
+///
+/// 原理：攻击者无法伪造新签名（HMAC），因此所有「能通过验签的重放」与
+/// 首发字节完全相同 → 签名相同 → 去重即可拦截。代价：**合法的完全相同
+/// 事件在 TTL 内重发会被误拦**（如手动重跑同一 GitHub event——罕见，
+/// README 已说明；等 TTL 过后可重发，或发送端启用时间戳协议让每次签名
+/// 天然不同）。
+#[derive(Clone, Default)]
+struct ReplayGuard {
+    inner: Arc<std::sync::Mutex<std::collections::HashMap<String, Instant>>>,
+}
+
+/// 签名去重表容量：默认 rps=10 下 10 分钟 ≈ 6000 个合法签名，1024 是
+/// 「正常流量全覆盖 + 洪泛下内存有界」的折中——被容量挤出的条目失去
+/// 去重记忆（极端洪泛下少量重放漏网），换来表恒定 ≤1024 条。
+const REPLAY_SEEN_CAPACITY: usize = 1024;
+/// 签名去重条目 TTL：≥ GitHub 对重复 delivery 的自查窗口（5 分钟），
+/// 覆盖绝大多数重试/重放场景。
+const REPLAY_SEEN_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+impl ReplayGuard {
+    /// 首见（或条目已过 TTL）→ 记录并放行（true）；TTL 内重复 → 判定
+    /// 重放（false）。`now` 由调用方传入便于单测拨钟。
+    fn admit(&self, key: &str, now: Instant) -> bool {
+        let fresh = |t: &Instant| -> bool {
+            now.checked_duration_since(*t)
+                .unwrap_or(std::time::Duration::ZERO)
+                < REPLAY_SEEN_TTL
+        };
+        let mut m = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // 命中未过期条目 = 确定重放——判定优先于容量淘汰（被查键不应在
+        // 自己的查询里被挤出而放行）。
+        if let Some(t) = m.get(key) {
+            if fresh(t) {
+                return false;
+            }
+        }
+        // 容量护栏：先清过期；仍满则淘汰最旧（重复命中不刷新时间戳，
+        // 插入序即新旧序）。
+        if m.len() >= REPLAY_SEEN_CAPACITY {
+            m.retain(|_, t| fresh(t));
+            while m.len() >= REPLAY_SEEN_CAPACITY {
+                let Some(oldest) = m.iter().min_by_key(|(_, t)| *t).map(|(k, _)| k.clone()) else {
+                    break;
+                };
+                m.remove(&oldest);
+            }
+        }
+        m.insert(key.to_string(), now);
+        true
+    }
+}
+
+/// v1.24 fail-closed 绑定校验（纯函数，便于单测；口径对齐
+/// [`validate_metrics_bind`]）：webhook 绑定非 loopback 且任一条目未配
+/// `secret` → 拒绝启动。webhook 能直接驱动一整轮 agent，防护面不得低于
+/// metrics 端点——「公网裸 token 即可伪造事件」不允许带病运行。
+fn validate_webhook_bind(
+    socket: SocketAddr,
+    entries: &[imagent_core::WebhookEntry],
+) -> Result<(), String> {
+    if socket.ip().is_loopback() {
+        return Ok(());
+    }
+    match entries.iter().find(|e| e.secret.is_none()) {
+        None => Ok(()),
+        Some(e) => Err(format!(
+            "绑定非 loopback 地址 {socket} 且 [[webhook]] name={} 未配置 secret，\
+             webhook 可直接驱动 agent，公网裸 token 即可伪造事件；\
+             请为每条 webhook 配置 secret 或绑定 127.0.0.1",
+            e.name
+        )),
+    }
+}
+
+/// v1.24 webhook 入站防护门（纯函数，便于单测）：验签（含 opt-in 时间戳
+/// 协议）→ 签名去重。配置了 secret 的条目必经此门；通过返回 Ok(())，
+/// 拒绝返回 (状态码, 文案)。
+///
+/// 两层防重放：
+/// 1. 签名去重（默认启用）——见 [`ReplayGuard`]；
+/// 2. 时间戳协议（`replay_window_secs > 0` 时）——请求须带
+///    `X-Imagent-Timestamp: <unix 秒>`，验签串从 `body` 改为 `{ts}.{body}`
+///    （ts 参与签名、不可伪造），`|now - ts| > 窗口` 即 401。两层叠加：
+///    去重拦「同字节重放」，时间戳拦「窗口外的任何重放（含首发迟到）」。
+fn webhook_gate(
+    route: &WebhookRoute,
+    token: &str,
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+    now_unix: u64,
+    guard: &ReplayGuard,
+) -> Result<(), (StatusCode, &'static str)> {
+    let Some(secret) = route.secret.as_deref() else {
+        // 未配 secret：无签名可验/可去重（非 loopback 绑定由启动期
+        // validate_webhook_bind fail-closed 把关）。
+        return Ok(());
+    };
+    // 验签串：默认 body 原文；启用时间戳协议时 "{ts}.{body}"（u64 无负值，
+    // 解析失败 = 头缺失/非数字，一律 401）。
+    let (signing_input, ts) = if route.replay_window_secs > 0 {
+        let ts = headers
+            .get("x-imagent-timestamp")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .ok_or((
+                StatusCode::UNAUTHORIZED,
+                "missing or invalid X-Imagent-Timestamp\n",
+            ))?;
+        let mut input = format!("{ts}.").into_bytes();
+        input.extend_from_slice(body);
+        (input, Some(ts))
+    } else {
+        (body.to_vec(), None)
+    };
+    let sig = webhook_signature_header(headers);
+    if !sig.is_some_and(|s| verify_webhook_signature(secret, &signing_input, s)) {
+        return Err((StatusCode::UNAUTHORIZED, "invalid signature\n"));
+    }
+    // 时间戳新鲜度：ts 已参与验签，此处拒绝的必然是「曾经合法」的旧签名
+    // 请求 = 重放（绝对差判定，容忍双向时钟偏移）。ts 仅在协议启用时为 Some。
+    if let Some(ts) = ts {
+        if !timestamp_within_window(now_unix, ts, route.replay_window_secs) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "timestamp outside replay window\n",
+            ));
+        }
+    }
+    // 第 1 层去重：键 = (token, 规范化签名 hex)。
+    let key = format!(
+        "{token}\u{0}{}",
+        webhook_signature_key_hex(sig.unwrap_or_default())
+    );
+    if !guard.admit(&key, Instant::now()) {
+        return Err((StatusCode::CONFLICT, "replay detected\n"));
+    }
+    Ok(())
+}
+
+/// 验签头原文（GitHub `X-Hub-Signature-256: sha256=<hex>` 或裸 hex 的
+/// `X-Signature`）。两层去重键从同一处取值。
+fn webhook_signature_header(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get("x-hub-signature-256")
+        .or_else(|| headers.get("x-signature"))
+        .and_then(|h| h.to_str().ok())
+}
+
+/// 验签头 → 去重键的规范化 hex：去 `sha256=` 前缀 + trim + 小写。大小写
+/// hex 解码等值（验签都会过），不规范化则攻击者换大小写即可绕过去重。
+fn webhook_signature_key_hex(sig: &str) -> String {
+    sig.strip_prefix("sha256=")
+        .unwrap_or(sig)
+        .trim()
+        .to_ascii_lowercase()
+}
+
+/// v1.24 时间戳新鲜度：|now - ts| ≤ window 即新鲜（绝对差容忍双向时钟
+/// 偏移；相等视为新鲜——窗口边界含端点）。
+fn timestamp_within_window(now_unix: u64, ts: u64, window: u64) -> bool {
+    now_unix.abs_diff(ts) <= window
 }
 
 /// 简单令牌桶（纯内存，webhook 单进程内生效）。
@@ -1454,13 +1637,18 @@ fn spawn_webhook_server(
                     conv: e.conv,
                     name: e.name,
                     secret: e.secret,
+                    replay_window_secs: e.replay_window_secs,
                     rps,
                     bucket: std::sync::Mutex::new(TokenBucket::new(rps.max(1.0))),
                 }),
             )
         })
         .collect();
-    let state = WebhookState { routes, dispatcher };
+    let state = WebhookState {
+        routes,
+        dispatcher,
+        seen: ReplayGuard::default(),
+    };
     // v1.21 review：停机时停止 accept——drain 期间注入只会挂死/被丢弃，
     // 优雅关停让客户端拿到连接关闭而非假 202。
     let shutdown = state.dispatcher.shutdown_token();
@@ -1694,18 +1882,18 @@ async fn webhook_handler(
     let Ok(bytes) = body else {
         return (StatusCode::PAYLOAD_TOO_LARGE, "body too large (64KB)\n");
     };
-    // v1.21 防护①：HMAC 验签（配置了 secret 时强制）——GitHub 头
-    // `X-Hub-Signature-256: sha256=<hex>`；兼容裸 hex 的 `X-Signature`。
-    if let Some(secret) = route.secret.as_deref() {
-        let sig = headers
-            .get("x-hub-signature-256")
-            .or_else(|| headers.get("x-signature"))
-            .and_then(|h| h.to_str().ok());
-        let ok = sig.is_some_and(|s| verify_webhook_signature(secret, &bytes, s));
-        if !ok {
-            tracing::warn!(target: "imagent::ops", name = %route.name, "webhook 验签失败/缺失，拒绝");
-            return (StatusCode::UNAUTHORIZED, "invalid signature\n");
-        }
+    // v1.21 防护① + v1.24 两层防重放（配置了 secret 时强制）：HMAC 验签
+    //（GitHub 头 `X-Hub-Signature-256: sha256=<hex>`，兼容裸 hex 的
+    // `X-Signature`）→ opt-in 时间戳协议 → 签名去重 LRU（同签名 409）。
+    // 时钟早于 epoch（系统时钟异常）时 now_unix 取 u64::MAX：时间戳协议
+    // 请求全部 401（fail-closed），未启用协议的路径不受影响。
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(u64::MAX);
+    if let Err((code, msg)) = webhook_gate(route, &token, &headers, &bytes, now_unix, &st.seen) {
+        tracing::warn!(target: "imagent::ops", name = %route.name, status = %code, "webhook 验签/防重放拒绝");
+        return (code, msg);
     }
     // v1.21 防护②：每 token 令牌桶限速。
     {
@@ -2064,4 +2252,280 @@ mod metrics_auth_tests {
     /// 进程级 env 在并行测试间共享，不宜 set_var 直接断言）。
     #[test]
     fn blank_env_token_means_unset() {}
+}
+
+/// v1.24 webhook 防重放 / fail-closed 单测（纯函数层——防护门
+/// [`webhook_gate`] 与 [`validate_webhook_bind`] 均为无 IO 纯函数）。
+#[cfg(test)]
+mod webhook_replay_tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue};
+    use hmac::Mac as _;
+
+    const SECRET: &str = "topsecret-0123456789";
+
+    fn hmac_hex(secret: &str, input: &[u8]) -> String {
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(input);
+        hex::encode(mac.finalize().into_bytes().as_slice())
+    }
+
+    /// 时间戳协议验签串：`{ts}.{body}`。
+    fn ts_signing_input(ts: u64, body: &[u8]) -> Vec<u8> {
+        let mut v = format!("{ts}.").into_bytes();
+        v.extend_from_slice(body);
+        v
+    }
+
+    fn route(secret: Option<&str>, replay_window_secs: u64) -> WebhookRoute {
+        WebhookRoute {
+            conv: "feishu:oc_t".into(),
+            name: "t".into(),
+            secret: secret.map(str::to_string),
+            replay_window_secs,
+            rps: 0.0,
+            bucket: std::sync::Mutex::new(TokenBucket::new(0.0)),
+        }
+    }
+
+    fn headers(pairs: &[(&str, String)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                k.parse::<axum::http::HeaderName>().unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    /// 第 1 层去重表本体：TTL 内同键拦截、TTL 过后放行；容量护栏——
+    /// 满容量先清过期、再淘汰最旧，被查键不被自己的查询挤出。
+    #[test]
+    fn replay_guard_ttl_and_capacity() {
+        let g = ReplayGuard::default();
+        let t0 = Instant::now();
+        assert!(g.admit("a", t0), "首见放行");
+        assert!(
+            !g.admit(
+                "a",
+                t0 + REPLAY_SEEN_TTL - std::time::Duration::from_secs(1)
+            ),
+            "TTL 内重复 → 重放"
+        );
+        assert!(
+            g.admit(
+                "a",
+                t0 + REPLAY_SEEN_TTL + std::time::Duration::from_secs(1)
+            ),
+            "TTL 过后重发 → 放行（合法同字节事件的重发出口）"
+        );
+
+        // 容量：灌满 1024 个新鲜键（时间戳严格递增，k0 最旧）。
+        let g2 = ReplayGuard::default();
+        for i in 0..REPLAY_SEEN_CAPACITY {
+            assert!(g2.admit(
+                &format!("k{i}"),
+                t0 + std::time::Duration::from_millis(i as u64)
+            ));
+        }
+        let len = |g: &ReplayGuard| g.inner.lock().unwrap_or_else(|e| e.into_inner()).len();
+        assert_eq!(len(&g2), REPLAY_SEEN_CAPACITY);
+        assert!(
+            g2.admit("overflow", t0 + std::time::Duration::from_secs(5)),
+            "满容量时新键仍放行"
+        );
+        assert_eq!(len(&g2), REPLAY_SEEN_CAPACITY, "容量恒定（最旧 k0 被淘汰）");
+        assert!(
+            !g2.admit("k1", t0 + std::time::Duration::from_secs(5)),
+            "未淘汰的近期键仍拦截"
+        );
+        assert!(
+            g2.admit("k0", t0 + std::time::Duration::from_secs(6)),
+            "k0 已被容量淘汰，去重记忆重开——容量护栏优先于 TTL"
+        );
+    }
+
+    /// 同签名重复 POST → 第二次 409；换 token / 换签名大小写不构成绕过。
+    #[test]
+    fn gate_replay_same_signature_second_post_409() {
+        let body = br#"{"text":"deploy failed"}"#;
+        let sig = hmac_hex(SECRET, body);
+        let r = route(Some(SECRET), 0);
+        let guard = ReplayGuard::default();
+        let now = 1_700_000_000_u64;
+
+        let h = headers(&[("x-hub-signature-256", format!("sha256={sig}"))]);
+        assert_eq!(
+            webhook_gate(&r, "token-a", &h, body, now, &guard),
+            Ok(()),
+            "首发验签去重通过"
+        );
+        let err = webhook_gate(&r, "token-a", &h, body, now, &guard).unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT, "同 (token,签名) 重放 → 409");
+        assert_eq!(err.1, "replay detected\n");
+
+        // 大小写 hex / 裸 hex 形态：验签等价 → 去重键规范化后相同 → 仍 409。
+        let h_upper = headers(&[(
+            "x-hub-signature-256",
+            format!("sha256={}", sig.to_uppercase()),
+        )]);
+        assert_eq!(
+            webhook_gate(&r, "token-a", &h_upper, body, now, &guard)
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT,
+            "签名换大小写不可绕过去重"
+        );
+        let h_bare = headers(&[("x-signature", sig.clone())]);
+        assert_eq!(
+            webhook_gate(&r, "token-a", &h_bare, body, now, &guard)
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT,
+            "裸 hex 头形态与 sha256= 前缀形态同键"
+        );
+
+        // 不同 token（另一条 webhook 路由收到同样签名）互不误拦。
+        assert_eq!(
+            webhook_gate(&r, "token-b", &h, body, now, &guard),
+            Ok(()),
+            "键含 token，跨路由不串"
+        );
+
+        // 未配 secret 的路由：门直通（非 loopback 无 secret 由启动校验拒绝）。
+        let r_nosec = route(None, 0);
+        assert_eq!(
+            webhook_gate(&r_nosec, "token-a", &HeaderMap::new(), body, now, &guard),
+            Ok(())
+        );
+    }
+
+    /// 第 2 层时间戳协议（opt-in）：缺失 ts → 401；过期 ts（签名正确）→ 401；
+    /// 新鲜 ts + `{ts}.{body}` 正签 → 放行；body 原文签名（协议未生效形态）→ 401；
+    /// 两层叠加——新鲜 ts 重复 POST → 409。
+    #[test]
+    fn gate_timestamp_protocol_variants() {
+        let body = br#"{"text":"deploy failed"}"#;
+        let r = route(Some(SECRET), 300);
+        let now = 1_700_000_000_u64;
+        let fresh_ts = now - 10;
+        let stale_ts = now - 1000; // 超出 300s 窗口
+
+        // 缺失 X-Imagent-Timestamp → 401。
+        let sig_fresh = hmac_hex(SECRET, &ts_signing_input(fresh_ts, body));
+        let h_no_ts = headers(&[("x-hub-signature-256", format!("sha256={sig_fresh}"))]);
+        let err = webhook_gate(&r, "t", &h_no_ts, body, now, &ReplayGuard::default()).unwrap_err();
+        assert_eq!(
+            (err.0, err.1),
+            (
+                StatusCode::UNAUTHORIZED,
+                "missing or invalid X-Imagent-Timestamp\n"
+            )
+        );
+
+        // 过期 ts + 对 "{ts}.{body}" 的正确签名 → 401（曾经合法的旧请求 = 重放）。
+        let sig_stale = hmac_hex(SECRET, &ts_signing_input(stale_ts, body));
+        let h_stale = headers(&[
+            ("x-imagent-timestamp", stale_ts.to_string()),
+            ("x-hub-signature-256", format!("sha256={sig_stale}")),
+        ]);
+        let err = webhook_gate(&r, "t", &h_stale, body, now, &ReplayGuard::default()).unwrap_err();
+        assert_eq!(
+            (err.0, err.1),
+            (
+                StatusCode::UNAUTHORIZED,
+                "timestamp outside replay window\n"
+            )
+        );
+
+        // 未来侧偏移同样拒绝（绝对差判定）。
+        let future_ts = now + 1000;
+        let sig_future = hmac_hex(SECRET, &ts_signing_input(future_ts, body));
+        let h_future = headers(&[
+            ("x-imagent-timestamp", future_ts.to_string()),
+            ("x-hub-signature-256", format!("sha256={sig_future}")),
+        ]);
+        assert_eq!(
+            webhook_gate(&r, "t", &h_future, body, now, &ReplayGuard::default())
+                .unwrap_err()
+                .0,
+            StatusCode::UNAUTHORIZED,
+            "未来侧超窗同样拒绝（容忍双向偏移但不放行超窗）"
+        );
+
+        // 对 body 原文的签名（协议生效后旧发送端形态）→ 验签即 401。
+        let sig_body_only = hmac_hex(SECRET, body);
+        let h_body_sig = headers(&[
+            ("x-imagent-timestamp", fresh_ts.to_string()),
+            ("x-hub-signature-256", format!("sha256={sig_body_only}")),
+        ]);
+        assert_eq!(
+            webhook_gate(&r, "t", &h_body_sig, body, now, &ReplayGuard::default())
+                .unwrap_err()
+                .0,
+            StatusCode::UNAUTHORIZED,
+            "验签串已改为 {{ts}}.{{body}}，body 原文签名不再通过"
+        );
+
+        // 新鲜 ts + 正确签名 → 放行；同 (token,签名) 重发 → 409（两层叠加）。
+        let h_fresh = headers(&[
+            ("x-imagent-timestamp", fresh_ts.to_string()),
+            ("x-hub-signature-256", format!("sha256={sig_fresh}")),
+        ]);
+        let guard = ReplayGuard::default();
+        assert_eq!(webhook_gate(&r, "t", &h_fresh, body, now, &guard), Ok(()));
+        assert_eq!(
+            webhook_gate(&r, "t", &h_fresh, body, now, &guard)
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT,
+            "时间戳协议与去重叠加：同签名重发仍 409"
+        );
+
+        // 窗口边界：|now - ts| == window 视为新鲜（端点含）。
+        let edge_ts = now - 300;
+        let sig_edge = hmac_hex(SECRET, &ts_signing_input(edge_ts, body));
+        let h_edge = headers(&[
+            ("x-imagent-timestamp", edge_ts.to_string()),
+            ("x-hub-signature-256", format!("sha256={sig_edge}")),
+        ]);
+        assert_eq!(
+            webhook_gate(&r, "t", &h_edge, body, now, &ReplayGuard::default()),
+            Ok(()),
+            "窗口端点视为新鲜"
+        );
+    }
+
+    /// v1.24 fail-closed：非 loopback 且任一条目未配 secret → 拒绝；
+    /// loopback 或全部条目配齐 secret → 放行。
+    #[test]
+    fn non_loopback_webhook_without_secret_is_rejected() {
+        let pub_addr: SocketAddr = "0.0.0.0:18443".parse().unwrap();
+        let lo_addr: SocketAddr = "127.0.0.1:18443".parse().unwrap();
+        let v6lo: SocketAddr = "[::1]:18443".parse().unwrap();
+        let mk = |secret: Option<&str>, name: &str| imagent_core::WebhookEntry {
+            token: "0123456789abcdef0123456789abcdef".into(),
+            conv: "feishu:oc_g".into(),
+            name: name.into(),
+            secret: secret.map(str::to_string),
+            rps: None,
+            replay_window_secs: 0,
+        };
+
+        assert!(validate_webhook_bind(pub_addr, &[mk(None, "ci")]).is_err());
+        // 任一条目未配即拒绝（混配不放行），报错点名具体条目。
+        let err = validate_webhook_bind(pub_addr, &[mk(Some("s-pair-01"), "ci"), mk(None, "cron")])
+            .unwrap_err();
+        assert!(
+            err.contains("name=cron") && err.contains("secret"),
+            "msg={err}"
+        );
+        assert!(err.contains("127.0.0.1"), "给出可操作修复指引：{err}");
+        assert!(validate_webhook_bind(pub_addr, &[mk(Some("s-pair-01"), "ci")]).is_ok());
+        assert!(validate_webhook_bind(lo_addr, &[mk(None, "ci")]).is_ok());
+        assert!(validate_webhook_bind(v6lo, &[mk(None, "ci")]).is_ok());
+        // 空表 + 非 loopback：server 本就不启动，校验不阻拦（保持既有 warn 路径）。
+        assert!(validate_webhook_bind(pub_addr, &[]).is_ok());
+    }
 }
