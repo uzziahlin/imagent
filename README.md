@@ -293,6 +293,8 @@ imagent service uninstall  # 停止并卸载
 
 secret 轮换 / 环境变量变化后：重新 `export` + `imagent service install`（先卸旧再装新，等效更新）。多实例：`imagent --profile work service install` → 独立服务与状态目录。
 
+**日志轮转**：macOS 守护日志 `~/.imagent/logs/daemon.log` 由进程内置 size 轮转——超过 50MB 触发（copytruncate，保留最近 5 份）；阈值用 `IMAGENT_LOG_MAX_MB` 调整（单位 MB，`0` = 不限，改后 `export` + 重装服务生效）。Linux 日志走 journal，轮转/限额由 journald 自身配置（如 `SystemMaxUse=`）管理。
+
 ## 命令（IM 内）
 
 | 命令 | 作用 |
@@ -318,7 +320,7 @@ secret 轮换 / 环境变量变化后：重新 `export` + `imagent service insta
 | `/cron add <分 时 日 月 周> <指令>` | 定时任务（本地时区含 DST；`*`/`*/n`/范围/列表，`/cron add */10 * * * * 检查构建`） |
 | `/cron list` `/cron rm <id>` | 列出（含已停用）/ 删除定时任务（限创建者或管理员；每会话上限 20 条） |
 | `/config [k v]` | 查看 / 热改配置（cot_detail / batch_window_ms / agent_idle_timeout_secs / require_mention / reply_mode，管理员）；`/config cot <off\|brief\|detailed\|default>` 为**本会话** COT 偏好（白名单可用，免 admin） |
-| `/status` `/doctor` `/reconnect` | 运行状态（含上下文水位与阈值距离）/ 自检（平台权限 + 安全维度）/ 强制平台重连 |
+| `/status` `/doctor` `/reconnect` | 运行状态（含上下文水位与阈值距离）/ 自检（平台权限 + 安全维度：凭据明文形态、webhook 暴露面、共享工作区、权限×能力错配、护栏水位、DB/媒体体积）/ 强制平台重连 |
 | `/tasks` | 本会话在飞轮次的实时进度（checklist + 工具统计）——纯文本平台/不想翻卡片场景的进度入口 |
 | `/allow <id\|@名字>` `/disallow` | 授权 / 撤销 sender（飞书群内可直接 @ 对方，管理员门槛） |
 | `/admin [list\|add\|remove]` | 管理员动态管理（首位设立自动带操作者，防自锁；SIGHUP 同步 config 变更） |

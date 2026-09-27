@@ -490,6 +490,24 @@ pub(super) struct RoundHandle {
     pub(super) snapshot: Arc<std::sync::Mutex<RoundSnapshot>>,
 }
 
+/// T8（v13 安全批）：webhook 暴露面摘要——`/doctor` 安全自检的入口面数据源。
+/// core 拿不到 Config 与 webhook server 的绑定事实（server 在 main 装配），
+/// 由 main 在 spawn webhook server 处把判定原料注入 Dispatcher（风格对齐
+/// [`Dispatcher::set_approval_tools`]）。bool 向量足够支撑三档判定：
+/// 非 loopback × 有无 secret（🔴 漂移）/ 非 loopback × 全 secret（🟡 重放
+/// 防护提示）/ loopback（🟢）。
+#[derive(Debug, Clone, Default)]
+pub struct WebhookExposure {
+    /// webhook server 是否在监听（webhook_addr 有效解析且 `[[webhook]]` 非空）。
+    pub listening: bool,
+    /// 绑定地址是否 loopback（127.x / ::1——仅本机可达）。
+    pub loopback: bool,
+    /// 每条 `[[webhook]]` 是否配置了验签 secret（与条目同序）。
+    pub entry_secrets: Vec<bool>,
+    /// 任一条目启用时间戳防重放协议（`replay_window_secs > 0`）。
+    pub any_replay_window: bool,
+}
+
 pub struct Dispatcher {
     platform: Arc<dyn Platform>,
     backend: Arc<dyn Backend>,
@@ -630,6 +648,10 @@ pub struct Dispatcher {
     /// T4（P3-3）：「permission_mode = allow/deny × 非 FullLoop」告警的去重
     /// 状态——最近一次评估时的档位签名。语义同 [`Self::allowlist_warn_state`]。
     perm_mode_warn_state: parking_lot::Mutex<Option<PermissionMode>>,
+    /// T8（v13 安全批）：webhook 暴露面摘要（main 在 spawn webhook server 处
+    /// 注入一次；server 不随 SIGHUP 重启，摘要与 server 同生命周期——不设
+    /// 热载）。`/doctor` 安全自检读取。
+    webhook_exposure: parking_lot::RwLock<WebhookExposure>,
 }
 
 /// P2（code-review v13）：全局在飞轮数闸门。`limit` = 配置上限（0 = 不限制，
@@ -804,6 +826,7 @@ impl Dispatcher {
             round_initiators: Arc::new(Mutex::new(HashMap::new())),
             allowlist_warn_state: parking_lot::Mutex::new(None),
             perm_mode_warn_state: parking_lot::Mutex::new(None),
+            webhook_exposure: parking_lot::RwLock::new(WebhookExposure::default()),
         };
         // S2：admin_senders 为空 = 无人是管理员，IM 内管理命令全部不可用——
         // 构造即显著提示（防用户以为白名单用户仍可 /allow）。
@@ -819,6 +842,13 @@ impl Dispatcher {
     /// 审批集注入/热重载（main 启动与 SIGHUP 调用；空 = 全部权限请求过审）。
     pub fn set_approval_tools(&self, tools: Vec<String>) {
         *self.approval_tools.write() = tools;
+    }
+
+    /// T8（v13 安全批）：webhook 暴露面摘要注入（main 在 spawn webhook server
+    /// 处调用一次；server 不随 SIGHUP 重启，故无热载路径）。`/doctor` 安全
+    /// 自检的 webhook 入口面数据源。
+    pub fn set_webhook_exposure(&self, exposure: WebhookExposure) {
+        *self.webhook_exposure.write() = exposure;
     }
 
     /// P7：启动偏好注入（main 在 run 前调一次；构造器保持零新参，测试无感）。

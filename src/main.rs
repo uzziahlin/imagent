@@ -740,6 +740,22 @@ async fn main() -> Result<()> {
                         if config.webhooks.is_empty() {
                             tracing::warn!(target: "imagent::ops", "webhook_addr 已配置但 [[webhook]] 表为空，webhook server 未启动");
                         } else {
+                            // T8（v13 安全批）：/doctor 安全自检的 webhook 暴露面
+                            // 摘要注入（core 拿不到 Config/绑定事实；server 不随
+                            // SIGHUP 重启，摘要与 server 同生命周期，只注入一次）。
+                            dispatcher.set_webhook_exposure(imagent_core::WebhookExposure {
+                                listening: true,
+                                loopback: socket.ip().is_loopback(),
+                                entry_secrets: config
+                                    .webhooks
+                                    .iter()
+                                    .map(|e| e.secret.is_some())
+                                    .collect(),
+                                any_replay_window: config
+                                    .webhooks
+                                    .iter()
+                                    .any(|e| e.replay_window_secs > 0),
+                            });
                             spawn_webhook_server(
                                 socket,
                                 config.webhooks.clone(),

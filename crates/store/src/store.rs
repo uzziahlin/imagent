@@ -58,6 +58,30 @@ pub struct AllowedSenderRow {
     pub source: Option<String>,
 }
 
+/// T8（v13 安全批）：credentials 表的形态聚合（`/doctor` 凭据自检数据源）。
+/// 三形态判别沿用读取路径的口径：keyring marker（真值在 OS keyring）/
+/// `enc:v1:`·`enc:v2:`（passphrase 加密回退）/ 裸明文（旧库或无 passphrase
+/// 的回退——明文落盘是 `/doctor` 要喊出来的部署风险）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CredentialForms {
+    /// keyring 指针形态条数。
+    pub keyring: i64,
+    /// passphrase 加密形态条数。
+    pub encrypted: i64,
+    /// 裸明文形态条数。
+    pub plaintext: i64,
+    /// 当前是否有生效 passphrase（显式 `set_passphrase` 或 `IMAGENT_PASSPHRASE`；
+    /// 判定口径同 `effective_passphrase`，测试环境不看 env）。
+    pub passphrase_set: bool,
+}
+
+impl CredentialForms {
+    /// 总条数。
+    pub fn total(&self) -> i64 {
+        self.keyring + self.encrypted + self.plaintext
+    }
+}
+
 /// 一行 cron 定时任务（v1.18 /cron；schema v11）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CronJobRow {
@@ -399,6 +423,35 @@ impl Store {
                 Ok(Some((account_id, resolved)))
             }
         }
+    }
+
+    /// T8（v13 安全批）：credentials 全表按形态计数（只读聚合，`/doctor` 凭据
+    /// 自检数据源）。判别逻辑与读取路径同源（`is_keyring_marker` / `is_encrypted`），
+    /// 不触发懒迁移、不接触 keychain——纯落盘形态巡检。
+    pub async fn credential_forms(&self) -> Result<CredentialForms> {
+        let inner = self.inner.clone();
+        let blobs = blocking_with(inner, move |conn| {
+            let mut stmt = conn.prepare("SELECT blob FROM credentials")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+        .await?;
+        let mut forms = CredentialForms::default();
+        for blob in &blobs {
+            if crate::credentials::is_keyring_marker(blob) {
+                forms.keyring += 1;
+            } else if crate::crypto::is_encrypted(blob) {
+                forms.encrypted += 1;
+            } else {
+                forms.plaintext += 1;
+            }
+        }
+        forms.passphrase_set = self.effective_passphrase().is_some();
+        Ok(forms)
     }
 
     /// 把 DB 中读出的原始 blob 解析为真实凭据（S3：三种形态）：
@@ -1804,6 +1857,35 @@ impl Store {
         .await
     }
 
+    /// T8（v13 安全批）：sessions 表全部 conv_id（只读，`/doctor` 共享工作区
+    /// 检查的会话枚举源——与 `workdir:<conv>` 覆盖键求并后构成完整会话面）。
+    pub async fn list_session_convs(&self) -> Result<Vec<String>> {
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let mut stmt = conn.prepare("SELECT DISTINCT conv_id FROM sessions")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r?);
+            }
+            Ok(v)
+        })
+        .await
+    }
+
+    /// T8（v13 安全批）：DB 主文件大小（字节）。`/doctor` 体积信息行数据源——
+    /// Store 不持有文件路径（Inner 只有 Connection），经 SQLite 自身元数据
+    /// （`PRAGMA page_count × page_size`）取值；不含 `-wal`/`-shm` 副本。
+    pub async fn db_size_bytes(&self) -> Result<u64> {
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let pages: i64 = conn.pragma_query_value(None, "page_count", |r| r.get(0))?;
+            let page_size: i64 = conn.pragma_query_value(None, "page_size", |r| r.get(0))?;
+            Ok(pages.max(0).saturating_mul(page_size.max(0)) as u64)
+        })
+        .await
+    }
+
     pub async fn delete_named_session(&self, conv_id: &str, name: &str) -> Result<()> {
         let (conv_id, name) = (conv_id.to_string(), name.to_string());
         let inner = self.inner.clone();
@@ -2456,6 +2538,90 @@ mod tests {
         );
         assert_eq!(cred_puts[0].target.as_deref(), Some("bot1"));
         assert_eq!(cred_puts[0].detail.as_deref(), Some("plaintext-fallback"));
+    }
+
+    // ---------- T8（v13 安全批）：/doctor introspection 查询 ----------
+
+    /// credential_forms：三形态计数 + passphrase 生效位。测试环境 keyring 恒
+    /// 不可用（cfg!(test)）→ put 走回退：无 passphrase 明文、有 passphrase
+    /// 加密；keyring 指针形态经直写 marker 行构造（生产由 keyring 命中产生，
+    /// 判别函数同源，见 credentials::is_keyring_marker）。
+    #[tokio::test]
+    async fn credential_forms_counts_three_shapes() {
+        let db = TempDb::new("cred_forms").await;
+        let store = Store::open(&db.path).await.unwrap();
+        // 无 passphrase：明文回退 ×1。
+        store
+            .put_credential("ilink", "bot1", r#"{"token":"a"}"#)
+            .await
+            .unwrap();
+        let forms = store.credential_forms().await.unwrap();
+        assert_eq!(
+            (forms.plaintext, forms.encrypted, forms.keyring),
+            (1, 0, 0),
+            "无 passphrase 的回退应计明文: {forms:?}"
+        );
+        assert!(!forms.passphrase_set, "未设 passphrase");
+        // 设 passphrase 后新写入走加密回退；再直写一条 keyring marker 行。
+        store.set_passphrase(Some("pw-doctor"));
+        store
+            .put_credential("ilink", "bot2", r#"{"token":"b"}"#)
+            .await
+            .unwrap();
+        let inner = store.inner.clone();
+        blocking_with(inner, move |conn| {
+            conn.execute(
+                "INSERT INTO credentials (platform, account_id, blob, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params!["feishu", "app1", "keyring:feishu:app1", 1],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let forms = store.credential_forms().await.unwrap();
+        assert_eq!(
+            (forms.plaintext, forms.encrypted, forms.keyring),
+            (1, 1, 1),
+            "三形态各 1 条: {forms:?}"
+        );
+        assert_eq!(forms.total(), 3);
+        assert!(forms.passphrase_set, "显式 set_passphrase 应生效");
+    }
+
+    /// list_session_convs：DISTINCT 枚举（upsert 覆盖同 conv 不产生新条目）。
+    #[tokio::test]
+    async fn list_session_convs_distinct() {
+        let db = TempDb::new("sess_convs").await;
+        let store = Store::open(&db.path).await.unwrap();
+        for (conv, sid) in [("c1", "s1"), ("c2", "s2"), ("c1", "s3")] {
+            store
+                .upsert_session(&SessionRow {
+                    first_prompt: None,
+                    conv_id: conv.into(),
+                    session_id: sid.into(),
+                    agent_kind: "claude-cli".into(),
+                    workdir: "/tmp/proj".into(),
+                    name: None,
+                    created_at: 1,
+                    updated_at: 1,
+                    task_todos: None,
+                })
+                .await
+                .unwrap();
+        }
+        let mut convs = store.list_session_convs().await.unwrap();
+        convs.sort();
+        assert_eq!(convs, vec!["c1".to_string(), "c2".to_string()]);
+    }
+
+    /// db_size_bytes：PRAGMA 口径，建库（含迁移写入）即非 0。
+    #[tokio::test]
+    async fn db_size_bytes_positive() {
+        let db = TempDb::new("db_size").await;
+        let store = Store::open(&db.path).await.unwrap();
+        let size = store.db_size_bytes().await.unwrap();
+        assert!(size > 0, "建库后应有非零大小: {size}");
     }
 
     #[cfg(unix)]

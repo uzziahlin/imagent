@@ -83,6 +83,188 @@ fn audit_detail_field<'a>(detail: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
+// ---------- T8（v13 安全批）：/doctor 安全自检 ----------
+// 六项检查各为独立纯函数（数据由 cmd_doctor 采集后传入），便于单测直接构造
+// 各状态断言文案。目标读者：跑公网 webhook / 多人群白名单 / 默认配置的用户
+// ——把「只有读了 SECURITY.md 才知道」的部署风险变成一条命令可见。
+
+/// 字节数 → 人读形态（体积信息行用）：`42 B` / `1.2 KB` / `3.4 MB` / `1.1 GB`。
+fn format_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.1} KB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// 检查 ①：凭据形态（数据源：store credentials 只读聚合
+/// [`imagent_store::Store::credential_forms`]）。
+/// 明文行存在且无 passphrase = ❌（明文进 SQLite 及 WAL 副本，headless 回退的
+/// 真实泄漏面；补救 = 设 `IMAGENT_PASSPHRASE` 走加密回退形态）；明文行存在但
+/// 已设 passphrase = ⚠️（读取时惰性迁移为加密形态）；无明文（keyring 指针 /
+/// 加密）或无凭据 = ✅。
+pub(crate) fn doctor_credential_line(forms: &imagent_store::CredentialForms) -> String {
+    if forms.total() == 0 {
+        return "✅ 凭据：无落库凭据".into();
+    }
+    if forms.plaintext > 0 {
+        if !forms.passphrase_set {
+            return format!(
+                "❌ 凭据明文落盘 {} 条且未设 passphrase——设 IMAGENT_PASSPHRASE 可走加密回退形态（见 SECURITY.md 威胁模型）",
+                forms.plaintext
+            );
+        }
+        return format!(
+            "⚠️ 凭据明文落盘 {} 条（已设 passphrase，读取时会惰性迁移为加密形态）",
+            forms.plaintext
+        );
+    }
+    format!(
+        "✅ 凭据形态：keyring {} · 加密 {}（无明文）",
+        forms.keyring, forms.encrypted
+    )
+}
+
+/// 检查 ②：webhook 暴露面（数据源：main 装配时注入的 [`crate::WebhookExposure`]
+/// 摘要——core 拿不到 Config 与绑定事实）。三档：非 loopback × 任一条目无
+/// secret = ❌（启动期 fail-closed 应已拒绝，出现即配置漂移——复查兜底）；
+/// 非 loopback × 全有 secret = ⚠️（提示重放防护层：签名去重 LRU 恒开 +
+/// replay_window 建议）；loopback / 未启用 = ✅。
+pub(crate) fn doctor_webhook_line(exposure: &crate::WebhookExposure) -> String {
+    if !exposure.listening {
+        return "✅ webhook 入站未启用（无 HTTP 暴露面）".into();
+    }
+    if exposure.loopback {
+        return "✅ webhook 绑定 loopback（仅本机可达）".into();
+    }
+    if exposure.entry_secrets.iter().any(|s| !s) {
+        return "❌ webhook 非 loopback 且有条目未配 secret——公网裸 token 即可伪造事件（启动期应已拒绝，出现即配置漂移，请复查 config）".into();
+    }
+    let replay = if exposure.any_replay_window {
+        "时间戳协议已启用"
+    } else {
+        "建议配置 replay_window_secs 启用时间戳窗口"
+    };
+    format!("⚠️ webhook 暴露非 loopback 地址：验签 secret 已全配；重放防护 = 签名去重 LRU 恒开，{replay}")
+}
+
+/// 检查 ③：共享工作区。数据源：`workdir:<conv>` 覆盖键（config 表）∪ sessions
+/// 表会话枚举；有效 workdir = 覆盖值否则 `default_workdir`（与 `resolve_workdir`
+/// 同口径）。多个 conv 指向同一路径 = ⚠️（协作模型：成员互见产物——多用户
+/// 共享 default_workdir 的后果此前只有 SECURITY.md 有写）。路径归一化仅做
+/// trim + 去尾部 `/`（`/a/dir` 与 `/a/dir/` 同目录；不做 canonicalize——
+/// 目录可能已不存在，巡检不应有副作用）。
+pub(crate) fn doctor_shared_workdir_lines(
+    overrides: &[(String, String)],
+    session_convs: &[String],
+    default_workdir: &std::path::Path,
+) -> Vec<String> {
+    let normalize = |p: &str| -> String {
+        let t = p.trim();
+        t.trim_end_matches('/').to_string()
+    };
+    // conv → 有效 workdir（覆盖键优先；会话行无覆盖则落 default）。
+    let mut effective: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (k, v) in overrides {
+        let conv = k.strip_prefix("workdir:").unwrap_or(k);
+        effective.insert(conv.to_string(), normalize(v));
+    }
+    let default = normalize(&default_workdir.to_string_lossy());
+    for conv in session_convs {
+        effective
+            .entry(conv.clone())
+            .or_insert_with(|| default.clone());
+    }
+    // 路径 → 会话数；≥2 的组逐组提示（组大小降序、至多 3 组防刷屏）。
+    let mut by_path: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for p in effective.values() {
+        *by_path.entry(p.as_str()).or_default() += 1;
+    }
+    let mut shared: Vec<(&str, usize)> = by_path.into_iter().filter(|(_, n)| *n >= 2).collect();
+    shared.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    if shared.is_empty() {
+        return vec!["✅ 工作区无共享（无多会话指向同一目录）".into()];
+    }
+    let mut out: Vec<String> = shared
+        .iter()
+        .take(3)
+        .map(|(path, n)| {
+            format!(
+                "⚠️ {n} 个会话共享工作区 {path}（协作模型：成员互见产物；如需隔离用 /cd 或 /ws）"
+            )
+        })
+        .collect();
+    if shared.len() > 3 {
+        out.push(format!("ℹ️ 另有 {} 组共享工作区", shared.len() - 3));
+    }
+    out
+}
+
+/// 检查 ④：权限 × 能力错配（复用 T4 判定函数与文案——doctor 把启动 / SIGHUP
+/// 时点的 warn 矩阵变为随时可查）：
+/// 1. allowed_tools 非全量 × 后端不支持逐工具白名单（`allowlist_divergence_notice`）；
+/// 2. permission_mode = allow/deny × 非 FullLoop 后端（`perm_mode_dead_notice`）。
+pub(crate) fn doctor_capability_lines(
+    tools: &[String],
+    mode: PermissionMode,
+    backend_name: &str,
+    supports_allowlist: bool,
+    capability: crate::PermissionCapability,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(notice) = allowlist_divergence_notice(tools, backend_name, supports_allowlist) {
+        out.push(format!("⚠️ {notice}"));
+    }
+    if let Some(notice) = perm_mode_dead_notice(mode, backend_name, capability) {
+        out.push(format!("⚠️ {notice}"));
+    }
+    if out.is_empty() {
+        out.push(format!(
+            "✅ 权限 × 能力匹配（工具白名单与权限档位在后端 {backend_name} 均有执行点）"
+        ));
+    }
+    out
+}
+
+/// 检查 ⑤：护栏水位。`max_concurrent_rounds = 0`（不限制）= ⚠️（多群/cron/
+/// webhook 齐点时在飞轮数无界——内存与 API 配额同炸）；auto-compact 生效阈值
+/// 0（比例/绝对双档全关）= ℹ️ 信息行（v1.27 起默认关闭，非风险项）。
+pub(crate) fn doctor_guardrail_lines(
+    max_concurrent_rounds: usize,
+    auto_compact_threshold: u64,
+) -> Vec<String> {
+    vec![
+        if max_concurrent_rounds == 0 {
+            "⚠️ 全局并发护栏未设上限（max_concurrent_rounds = 0）——多群/cron/webhook 齐点时在飞轮数无界".to_string()
+        } else {
+            format!("✅ 全局并发护栏：{max_concurrent_rounds} 轮上限")
+        },
+        if auto_compact_threshold == 0 {
+            "ℹ️ 自动压缩未启用（v1.27 起默认关闭，需要者配置开启）".to_string()
+        } else {
+            format!("✅ 自动压缩已启用（阈值 {auto_compact_threshold} tok）")
+        },
+    ]
+}
+
+/// 检查 ⑥：体积信息行（DB 主文件 + 媒体目录——非风险项，容量水位可观测；
+/// 媒体目录有 7 天 TTL 清理，见 main 的 sweep 循环）。
+pub(crate) fn doctor_size_line(db_bytes: u64, media_bytes: u64) -> String {
+    format!(
+        "ℹ️ 体积：DB {} · 媒体 {}",
+        format_bytes(db_bytes),
+        format_bytes(media_bytes)
+    )
+}
+
 impl Dispatcher {
     /// /status —— 本会话 + 全局运行状态。
     pub(super) async fn cmd_status(&self, conv: &ConvId, hint: &ReplyHint) {
@@ -293,8 +475,57 @@ impl Dispatcher {
                 "纯文本"
             }
         ));
+        // T8（v13 安全批）：追加「🛡️ 安全」分组——把「只有读了 SECURITY.md
+        // 才知道」的部署风险（凭据明文/入口暴露/共享工作区/权限×能力错配/
+        // 护栏水位/体积）一条命令可见。单项查询失败只降级为该行告警，不阻断
+        // 其余检查。
+        lines.push("🛡️ 安全：".into());
+        lines.extend(self.doctor_security_lines().await);
         let text = format!("🩺 自检结果：\n{}", lines.join("\n"));
         self.reply(conv, &text, hint).await;
+    }
+
+    /// T8：/doctor 安全分组的数据采集与组装。六项检查的判定各自在独立纯函数
+    /// 里（见上），此处只负责取数与容错。
+    async fn doctor_security_lines(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        // ① 凭据形态（store 只读聚合，不触发懒迁移/不接触 keychain）。
+        match self.store.credential_forms().await {
+            Ok(forms) => out.push(doctor_credential_line(&forms)),
+            Err(e) => out.push(format!("⚠️ 凭据形态查询失败：{e}")),
+        }
+        // ② webhook 暴露面（main 装配时注入的摘要快照）。
+        out.push(doctor_webhook_line(&self.webhook_exposure.read()));
+        // ③ 共享工作区：workdir 覆盖键 ∪ sessions 会话枚举（并发取数）。
+        let (overrides, convs) = tokio::join!(
+            self.store.list_config("workdir:"),
+            self.store.list_session_convs()
+        );
+        match (overrides, convs) {
+            (Ok(o), Ok(c)) => {
+                out.extend(doctor_shared_workdir_lines(&o, &c, &self.default_workdir))
+            }
+            (Err(e), _) | (_, Err(e)) => out.push(format!("⚠️ 工作区共享检查查询失败：{e}")),
+        }
+        // ④ 权限 × 能力错配（复用 T4 判定函数；读当前热载态）。
+        out.extend(doctor_capability_lines(
+            &self.allowed_tools.read(),
+            *self.permission_mode.read(),
+            self.backend.name(),
+            self.backend.supports_tool_allowlist(),
+            self.backend.permission_capability(),
+        ));
+        // ⑤ 护栏水位（round_gate 当前上限 + 自动压缩生效阈值）。
+        out.extend(doctor_guardrail_lines(
+            self.round_gate.read().limit,
+            self.auto_compact_threshold
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ));
+        // ⑥ 体积信息行（DB 主文件经 PRAGMA；媒体目录平铺求和）。
+        let db_bytes = self.store.db_size_bytes().await.unwrap_or(0);
+        let media_bytes = crate::paths::dir_size_bytes(&crate::paths::imagent_home().join("media"));
+        out.push(doctor_size_line(db_bytes, media_bytes));
+        out
     }
 
     /// /reconnect —— 强制平台重连。

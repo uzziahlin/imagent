@@ -48,6 +48,24 @@ pub fn sweep_media_before(dir: &std::path::Path, cutoff: std::time::SystemTime) 
     n
 }
 
+/// T8（v13 安全批）：目录内文件大小合计（字节；`/doctor` 体积信息行的媒体
+/// 目录数据源）。不递归——媒体目录是平的（与 [`sweep_media_before`]
+/// 同款遍历口径）；目录不存在返回 0，单文件 metadata 失败仅跳过。
+pub fn dir_size_bytes(dir: &std::path::Path) -> u64 {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in rd.flatten() {
+        if let Ok(md) = entry.metadata() {
+            if md.is_file() {
+                total += md.len();
+            }
+        }
+    }
+    total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,6 +102,19 @@ mod tests {
         assert!(!dir.join("a.bin").exists());
         // 目录不存在：0，不 panic。
         assert_eq!(sweep_media_before(&dir.join("nope"), far_future), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T8：目录大小合计（平铺口径，与 sweep 同遍历）+ 目录缺失安全返回 0。
+    #[test]
+    fn dir_size_sums_flat_files() {
+        let dir = std::env::temp_dir().join(format!("imagent-dirsz-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.bin"), vec![0u8; 1024]).unwrap();
+        std::fs::write(dir.join("b.bin"), vec![0u8; 2048]).unwrap();
+        assert_eq!(dir_size_bytes(&dir), 3072, "应合计平铺文件大小");
+        assert_eq!(dir_size_bytes(&dir.join("nope")), 0, "目录缺失应返回 0");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

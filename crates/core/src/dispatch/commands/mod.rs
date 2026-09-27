@@ -10,6 +10,15 @@ mod session;
 
 use super::*;
 
+/// T8（v13 安全批）：/doctor 安全自检的六项检查（misc 实现，`pub(crate)`
+/// 定位）——re-export 到 commands 层供 `dispatch::tests` 单测（仅测试构建
+/// 使用，cfg(test) 门控防非测试构建的 unused-import 告警）。
+#[cfg(test)]
+pub(super) use misc::{
+    doctor_capability_lines, doctor_credential_line, doctor_guardrail_lines,
+    doctor_shared_workdir_lines, doctor_size_line, doctor_webhook_line,
+};
+
 /// S-12：全部支持的斜杠命令，按 /help 分组同构（未知命令提示竖排分组展示）。
 pub(super) const COMMAND_GROUPS: &[(&str, &[&str])] = &[
     (
