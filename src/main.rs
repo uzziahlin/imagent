@@ -515,6 +515,12 @@ async fn main() -> Result<()> {
             let _instance_lock =
                 imagent_core::instance::acquire(&imagent_core::paths::imagent_home())?;
 
+            // T15（CODE_REVIEW_v13 P3）：daemon.log 启动期轮转检查——launchd
+            // plist 把守护进程 stdout/stderr 指到 ~/.imagent/logs/daemon.log 只增
+            // 不减。形态判定与 copytruncate 机制见 service::rotate_daemon_log_if_needed
+            // 注释；前台 / Linux journal 形态下文件不存在即 no-op。
+            service::rotate_daemon_log_if_needed();
+
             // 2. store（多份：dispatcher / HTTP /health / SIGHUP 各持一份 Clone）
             let store = imagent_store::Store::open(&db_path).await?;
             // P1-C：据 config.require_keyring 切换凭据 fail-closed
@@ -806,6 +812,17 @@ async fn main() -> Result<()> {
                         );
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
+                }
+            });
+
+            // T15：daemon.log 尺寸轮转 10 分钟节拍复查（启动时已查过一次）。
+            // launchd 追加写不会自己变小，运行中长期驻留同样会撑爆磁盘；
+            // 机制/形态判定见 service::rotate_daemon_log_if_needed 注释。
+            // IMAGENT_LOG_MAX_MB=0（不限）时每次节拍仅读 env 一次即短路。
+            tokio::spawn(async {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(10 * 60)).await;
+                    service::rotate_daemon_log_if_needed();
                 }
             });
 
