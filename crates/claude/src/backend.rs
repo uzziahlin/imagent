@@ -62,6 +62,10 @@ pub struct RuntimeOpts {
     /// 用户 MCP servers 配置（`mcp_config_path` 的解析产物，顶层含 `mcpServers`；
     /// 合并进每次生成的 mcp 配置）。
     pub extra_mcp: Option<serde_json::Value>,
+    /// T7（v13 §四.1）：状态目录 deny（config `hide_state_dir_from_agent`，缺省
+    /// true 由 main 接线注入；`Default` = false 仅是库裸用形态）。为 true 时每轮
+    /// spawn 附加 `--settings` deny 规则，见 [`state_dir_deny_settings`]。
+    pub hide_state_dir: bool,
 }
 
 impl ClaudeBackend {
@@ -122,15 +126,18 @@ impl ClaudeBackend {
         *self.native_perm_mode.write() = mode;
     }
 
-    /// W1-2/W1-3/W1-4：注入 config 侧运行参数（main 启动与 SIGHUP 调用；
+    /// W1-2/W1-3/W1-4 + T7：注入 config 侧运行参数（main 启动与 SIGHUP 调用；
     /// `extra_mcp_path` 现场读取解析，读失败 warn 后按无用户 servers 处理——
-    /// config load 期已校验过一次，此处失败属文件后来被改动）。
+    /// config load 期已校验过一次，此处失败属文件后来被改动）。T7 的
+    /// `hide_state_dir` 见 [`RuntimeOpts::hide_state_dir`]（SIGHUP 整体替换，
+    /// 下一轮 spawn 生效）。
     pub fn set_runtime_opts(
         &self,
         fallback_model: Option<String>,
         disallowed_tools: Vec<String>,
         append_system_prompt: Option<String>,
         extra_mcp_path: Option<&std::path::Path>,
+        hide_state_dir: bool,
     ) {
         let extra_mcp = extra_mcp_path.and_then(|p| {
             std::fs::read_to_string(p)
@@ -155,6 +162,7 @@ impl ClaudeBackend {
             disallowed_tools,
             append_system_prompt,
             extra_mcp,
+            hide_state_dir,
         };
     }
 }
@@ -189,6 +197,84 @@ fn claude_native_perm_args(mode: PermissionMode, native_override: Option<&str>) 
         Some(m) => vec!["--permission-mode".to_string(), m],
         None => Vec::new(),
     }
+}
+
+/// T7（v13 §四.1）：状态目录 deny 覆盖的工具面。`Read` 是主力——官方文档
+/// （permissions #read-and-edit）明示 Read deny 会 best-effort 连带覆盖 Grep/
+/// Glob 的 `path` 参数与同路径的 Edit/Write（连带阻断需 CLI ≥2.1.208/2.1.228）；
+/// Write/Glob/Grep 的路径规则当前 CLI 不一定 consult（2.1.283 实测 Write 拦截
+/// 生效、Glob/Grep 路径形态不生效），保留五条是显式声明 + 对 CLI 语义演进的
+/// 鲁棒性（多出的规则被忽略，无害）。
+const STATE_DIR_DENY_TOOLS: &[&str] = &["Read", "Edit", "Write", "Glob", "Grep"];
+
+/// T7：deny 规则覆盖的状态目录根集合（去重、只收绝对路径）：
+/// - 当前生效 home（[`imagent_core::paths::imagent_home`]，profile 感知——run 时
+///   读 env 与被 spawn 的子进程继承口径一致）；
+/// - 缺省基座 `~/.imagent`（profile 模式下基座还压着其它 profile 与默认库——
+///   只挡 profile 子目录会留跨 profile 读 `imagent.db` 的口子；与生效 home 相同
+///   时去重为一条）。
+fn state_dir_deny_roots() -> Vec<std::path::PathBuf> {
+    let mut roots = vec![imagent_core::paths::imagent_home()];
+    if let Some(h) = dirs::home_dir() {
+        let base = h.join(".imagent");
+        if !roots.contains(&base) {
+            roots.push(base);
+        }
+    }
+    roots.retain(|p| {
+        let abs = p.is_absolute();
+        if !abs {
+            tracing::warn!(
+                target: "imagent::backend",
+                path = %p.display(),
+                "状态目录非绝对路径，deny 规则无法覆盖（home 解析异常形态）"
+            );
+        }
+        abs
+    });
+    roots
+}
+
+/// T7：构造 `--settings` 内联 JSON——`permissions.deny` 五工具 × 每个根目录的
+/// `//<绝对路径>/**` glob。**绝对路径必须 `//` 双斜杠前缀**（官方文档
+/// permissions #read-and-edit：单斜杠锚定 settings 来源目录而非文件系统根；
+/// 2.1.283 真机实证 `Read(//abs/**)` 拦截、`Read(/abs/**)` 不拦截）。同一根的
+/// canonicalize 形态（macOS /tmp→/private/tmp 等 symlink 消解）与字面形态一并
+/// 覆盖，防经 symlink 别名绕过。deny 与用户/项目 settings 里的 deny 按并集
+/// 合并（settings #lists-merge），不会互相覆盖。
+fn state_dir_deny_settings(roots: &[std::path::PathBuf]) -> String {
+    let mut deny: Vec<String> = Vec::new();
+    for root in roots {
+        // 字面 + canonicalize 两种形态（相同则自然去重）。
+        let mut forms = vec![root.clone()];
+        if let Ok(canon) = root.canonicalize() {
+            if !forms.contains(&canon) {
+                forms.push(canon);
+            }
+        }
+        for form in forms {
+            // 绝对路径自带头 `/`，前置一个 `/` 恰成 `//` 规则前缀。
+            let body = form.to_string_lossy();
+            let body = body.trim_start_matches('/');
+            for tool in STATE_DIR_DENY_TOOLS {
+                let rule = format!("{tool}(//{body}/**)");
+                if !deny.contains(&rule) {
+                    deny.push(rule);
+                }
+            }
+        }
+    }
+    serde_json::json!({ "permissions": { "deny": deny } }).to_string()
+}
+
+/// T7：状态目录 deny 的 spawn 参数（`hide=false` 返回空，不附加）。
+/// `--settings <file-or-json>` 接受内联 JSON 字符串（CLI reference；2.1.283
+/// 真机验证规则生效）——无临时文件、无清理负担。
+fn hide_state_dir_args(hide: bool, roots: &[std::path::PathBuf]) -> Vec<String> {
+    if !hide {
+        return Vec::new();
+    }
+    vec!["--settings".to_string(), state_dir_deny_settings(roots)]
 }
 
 /// Control 通道首条 stdin 消息（SDK 式 user 投递，`--input-format stream-json`）：
@@ -436,6 +522,14 @@ impl Backend for ClaudeBackend {
         }
         if let Some(sys) = opts.append_system_prompt.clone() {
             cmd.arg("--append-system-prompt").arg(&sys);
+        }
+        // T7（v13 §四.1）：状态目录最小权限化——`hide_state_dir_from_agent`
+        //（缺省 true，SIGHUP 经 set_runtime_opts 下一轮生效）时 per-run 注入
+        // `--settings` deny，把 imagent home（profile 感知 + 基座 ~/.imagent）
+        // 挡在 agent 读视野外。与 permission_mode 正交：Read/Glob/Grep 默认免审，
+        // 审批闭环管不到它们，deny 才是这道面的闸。
+        for a in hide_state_dir_args(opts.hide_state_dir, &state_dir_deny_roots()) {
+            cmd.arg(a);
         }
         // 幽灵会话预检（真机校准）：失败轮次泄漏并落库的 session id 在 ~/.claude
         // 本地存储并无对应 jsonl——resume 它只会得到 is_error 空文本 result 且每轮
@@ -775,6 +869,116 @@ mod tests {
         );
     }
 
+    /// T7：deny 规则形态——五工具 × `//<绝对路径>/**` 双斜杠 glob（单斜杠不
+    /// 匹配绝对路径，真机实证见 [`state_dir_deny_settings`] 文档）；多根成比例
+    /// 展开；JSON 结构 `permissions.deny`。
+    #[test]
+    fn state_dir_deny_settings_five_tools_absolute_double_slash() {
+        let roots = vec![std::path::PathBuf::from("/Users/t/.imagent")];
+        let raw = state_dir_deny_settings(&roots);
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("应为合法内联 JSON");
+        let deny = v["permissions"]["deny"]
+            .as_array()
+            .unwrap_or_else(|| panic!("permissions.deny 应为数组: {raw}"));
+        assert_eq!(deny.len(), 5, "五工具各一条: {raw}");
+        for tool in STATE_DIR_DENY_TOOLS {
+            let rule = serde_json::json!(format!("{tool}(//Users/t/.imagent/**)"));
+            assert!(deny.contains(&rule), "缺 {tool} 规则: {raw}");
+        }
+        // 两个根（profile home + 基座）→ 每工具两条。
+        let roots = vec![
+            std::path::PathBuf::from("/Users/t/.imagent/profiles/p1"),
+            std::path::PathBuf::from("/Users/t/.imagent"),
+        ];
+        let v: serde_json::Value = serde_json::from_str(&state_dir_deny_settings(&roots)).unwrap();
+        assert_eq!(v["permissions"]["deny"].as_array().unwrap().len(), 10);
+    }
+
+    /// T7：symlink 别名覆盖——根目录经 symlink 引用时，字面与 canonicalize 两种
+    /// 形态的规则都要在（防 agent 经 symlink 路径绕过字面 glob）。
+    #[test]
+    fn state_dir_deny_settings_covers_symlink_alias() {
+        let tag = std::process::id();
+        let real = std::env::temp_dir().join(format!("imagent_deny_real_{tag}"));
+        std::fs::create_dir_all(&real).unwrap();
+        let link = std::env::temp_dir().join(format!("imagent_deny_link_{tag}"));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let raw = state_dir_deny_settings(&[link.clone()]);
+        // 断言 needle 与生成器同构：绝对路径剥前导 `/`，`//` + 剥离后路径。
+        let needle = |p: &std::path::Path| {
+            format!(
+                "Read(//{}/**",
+                p.display().to_string().trim_start_matches('/')
+            )
+        };
+        assert!(raw.contains(&needle(&link)), "应含字面形态: {raw}");
+        let canon = real.canonicalize().unwrap();
+        assert!(
+            raw.contains(&needle(&canon)),
+            "应含 canonicalize 形态: {raw}"
+        );
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&real);
+    }
+
+    /// T7：根集合——无 profile = [基座 ~/.imagent] 单条；profile 模式 =
+    /// [生效 home, 基座]（跨 profile 读 imagent.db 的口子也挡上）。env 是进程
+    /// 全局，serial 与同文件其它 env 测试互斥。
+    #[serial_test::serial]
+    #[test]
+    fn state_dir_deny_roots_profile_aware_and_dedup() {
+        std::env::remove_var(imagent_core::paths::IMAGENT_HOME_ENV);
+        let base = dirs::home_dir().unwrap().join(".imagent");
+        assert_eq!(
+            state_dir_deny_roots(),
+            vec![base.clone()],
+            "无 profile：生效 home 即基座"
+        );
+        let profile = std::env::temp_dir().join(format!(
+            "imagent_claude_roots_{tag}",
+            tag = std::process::id()
+        ));
+        std::env::set_var(imagent_core::paths::IMAGENT_HOME_ENV, &profile);
+        assert_eq!(
+            state_dir_deny_roots(),
+            vec![profile, base],
+            "profile 模式：生效 home + 基座"
+        );
+        std::env::remove_var(imagent_core::paths::IMAGENT_HOME_ENV);
+    }
+
+    /// T7：开关——关 → 不附加；开 → argv 含 `--settings` 且内联 JSON 含五条
+    /// deny 与正确的绝对 home（经 [`state_dir_deny_roots`] 取 env 感知口径）。
+    #[serial_test::serial]
+    #[test]
+    fn hide_state_dir_args_toggle_and_home_from_env() {
+        assert!(
+            hide_state_dir_args(false, &[std::path::PathBuf::from("/Users/t/.imagent")]).is_empty()
+        );
+        // 固定根：--settings + 合法 JSON（内联形态，无临时文件）。
+        let on = hide_state_dir_args(true, &[std::path::PathBuf::from("/Users/t/.imagent")]);
+        assert_eq!(on.len(), 2);
+        assert_eq!(on[0], "--settings");
+        serde_json::from_str::<serde_json::Value>(&on[1]).expect("应为合法内联 JSON");
+        // env 隔离到 profile 形态：规则含 profile home 与基座 ~/.imagent。
+        let home = std::env::temp_dir().join(format!(
+            "imagent_claude_hide_{tag}",
+            tag = std::process::id()
+        ));
+        std::env::set_var(imagent_core::paths::IMAGENT_HOME_ENV, &home);
+        let on = hide_state_dir_args(true, &state_dir_deny_roots());
+        assert_eq!(on[0], "--settings");
+        for p in [&home, &dirs::home_dir().unwrap().join(".imagent")] {
+            let needle = format!(
+                "Read(//{}/**",
+                p.display().to_string().trim_start_matches('/')
+            );
+            assert!(on[1].contains(&needle), "缺 {p:?} 的 Read 规则: {}", on[1]);
+        }
+        std::env::remove_var(imagent_core::paths::IMAGENT_HOME_ENV);
+    }
+
     #[test]
     fn sanitize_filename_strips_traversal() {
         // P2-I：路径遍历 / 分隔符必须消毒为文件名安全片段。
@@ -787,7 +991,9 @@ mod tests {
 
     /// W1-3：用户 MCP servers 合并——extra 的条目并入、保留名 imagent 被跳过
     /// （审批条目由 sock 分支写入、同名遮蔽不可能）；sock=None 时纯用户条目、
-    /// 无 imagent 审批 server。
+    /// 无 imagent 审批 server。serial：env（IMAGENT_HOME）是进程全局，与 T7 的
+    /// 两个 env 测试互斥。
+    #[serial_test::serial]
     #[tokio::test]
     async fn mcp_config_merges_user_servers_and_guards_reserved_name() {
         // 隔离 IMAGENT_HOME（write_mcp_config 锚定它写文件），测试后恢复。
