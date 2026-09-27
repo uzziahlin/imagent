@@ -221,7 +221,9 @@ pub fn peek_reply_parent(payload: &[u8]) -> Option<String> {
         .filter(|s| s.starts_with("om_"))
 }
 
-pub(crate) fn peek_group_reply_parent(payload: &[u8]) -> Option<String> {
+/// T19 起 drain 分派改用 Value 导航（platform/drain.rs 的同名 helper），字节版
+/// 保留作等价性钉子（drain 测试 value_helpers_match_proto_predicates 对照）。
+pub fn peek_group_reply_parent(payload: &[u8]) -> Option<String> {
     #[derive(serde::Deserialize)]
     struct P {
         event: E,

@@ -9,7 +9,11 @@
 //! - [`client`]：`FeishuWsClient` 驱动 `open-lark` 长连接（外层重连 loop）；
 //!   `send_text_msg` / `fetch_token` 走独立 HTTP。
 //! - [`platform`]：[`FeishuPlatform`] 实现 [`imagent_core::Platform`]，spawn
-//!   双 task（WS 收事件 + drain 解析入队），recv / send_text。
+//!   双 task（WS 收事件 + drain 解析入队），recv / send_text。T19 拆分为子模块：
+//!   `platform/drain.rs`（WS 事件 drain 循环——单次 Value 解析 + event_type 精确
+//!   分派）、`platform/ask.rs`（ask/审批卡生命周期）、`platform/outbox.rs`
+//!   （发送侧 outbox 泵）、`platform/state.rs`（per-conv 状态 + 媒体落盘 +
+//!   housekeeping）。
 //!
 //! 鉴权（白名单）由 core 做，本 crate 不做白名单——只透传 sender 的 `open_id`。
 
