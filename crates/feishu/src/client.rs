@@ -171,10 +171,155 @@ fn jittered_backoff(base: Duration, factor: f64) -> Duration {
     Duration::from_secs_f64((base.as_secs_f64() * (1.0 + factor)).max(0.001))
 }
 
-/// 识别限流类错误（HTTP 429 / 飞书频控业务码 230020）。
-/// 两种错误串形态都要覆盖：手写 HTTP 路径（"HTTP 429" / "code=230020"）与
-/// SDK 路径（open-lark `ApiError` Display = "API错误 {raw_code} {endpoint}: {msg}"，
-/// raw_code 即飞书业务码或合成 HTTP status；业务变体则 Debug 打印枚举名）。
+// ---------------------------------------------------------------------------
+// 结构化错误码中间层（T19/v13-P3）。
+//
+// 手写 HTTP 路径的响应解析统一走 [`feishu_api_resp`]：HTTP 状态 → 信封
+// `code != 0` → [`FeishuApiError { code, msg }`]，错误串规范化为
+// `"{op}: code={code} msg={msg}"`（429 归一为 code=429 + msg="HTTP 429"，串内
+// 保留 "HTTP 429" 标记供既有匹配）。自愈判定（限流丢帧 / token 刷新重试 /
+// 卡片不存在清缓存）优先按 code 精确判定（[`is_rate_limited_err`] 等，
+// 经 [`FeishuApiError::from_error_str`] 从自有格式还原——**自有格式**与 SDK 的
+// Display 无关）；open-lark SDK 路径产出的错误无结构化 code，保留 Display
+// 字符串匹配兜底（[`is_rate_limited_msg`] 等）——**串匹配是 SDK Display 的
+// 隐性契约**（SDK 改格式即静默失效，升级 SDK 须回归下方钉住用例）。
+// ---------------------------------------------------------------------------
+
+/// 手写 HTTP 路径的结构化业务错误（见模块注释）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FeishuApiError {
+    /// 飞书业务码；HTTP 层错误合成 `code = status`（429 即合成码）。
+    pub(crate) code: i64,
+    pub(crate) msg: String,
+}
+
+impl FeishuApiError {
+    /// 限流：HTTP 429 / 频控业务码 230020（出处：飞书开放平台「频率控制」，
+    /// code 230020 = app 频控，HTTP 429 = 网关限流）。
+    pub(crate) fn is_rate_limited(&self) -> bool {
+        self.code == 429 || self.code == 230020
+    }
+
+    /// token 失效族（出处：飞书错误码表 99991661-64/68/79——tenant/app access
+    /// token 空、格式错、无效、内部错误、invalid app_access_token）。
+    pub(crate) fn is_token_invalid(&self) -> bool {
+        matches!(self.code, 99991661..=99991664 | 99991668 | 99991679)
+    }
+
+    /// 卡片/消息不存在（出处：im 与 CardKit patch 共用的 230002「资源不存在」；
+    /// 刻意不含 300317 sequence 落后——另有自愈路径）。
+    pub(crate) fn is_card_not_exist(&self) -> bool {
+        self.code == 230002
+    }
+
+    /// 从 CoreError 错误串还原结构化错误：仅认本模块 `feishu_api_resp` 产出的
+    /// 规范化形态（`… code={code} msg={msg}`）。这是**自有格式**（还原失败 =
+    /// SDK 路径等外来错误串）返回 None，调用方回落串匹配兜底。
+    fn from_error_str(s: &str) -> Option<Self> {
+        let i = s.find("code=")?;
+        let digits: String = s[i + 5..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        let code: i64 = digits.parse().ok()?;
+        // msg= 是自有格式的构成部分（也排除恰好内嵌 "code=" 的 SDK msg 误判）。
+        let msg = s[i..]
+            .find("msg=")
+            .map(|m| s[i + m + 4..].to_string())
+            .unwrap_or_default();
+        Some(Self { code, msg })
+    }
+
+    /// 规范化错误串（与 [`feishu_api_resp`] 的产出口径一致）。
+    fn into_core_error(self, op: &str) -> imagent_core::CoreError {
+        imagent_core::CoreError::Platform(PLATFORM, self.to_error_str(op))
+    }
+
+    fn to_error_str(&self, op: &str) -> String {
+        format!("{op}: code={} msg={}", self.code, self.msg)
+    }
+}
+
+/// 统一手写 HTTP 路径的响应解析（收编此前散落的 5 处复制粘贴 code 提取）：
+/// ① HTTP 429 → 合成 `FeishuApiError { code: 429, msg: "HTTP 429" }`（错误串含
+///    "HTTP 429" 标记，retry 宏与串匹配均识别）；
+/// ② 非 JSON 响应（网关 404 页等）→ 报出状态码与原文截断，而非无信息量的
+///    "error decoding response body"（同 transcribe_audio 的真机教训）；
+/// ③ 信封 `code != 0` → `FeishuApiError { code, msg }`；
+/// 成功返回信封 Value（各调用方自行取 data 字段）。
+async fn feishu_api_resp(
+    resp: reqwest::Response,
+    op: &str,
+) -> imagent_core::Result<serde_json::Value> {
+    if resp.status().as_u16() == 429 {
+        return Err(FeishuApiError {
+            code: 429,
+            msg: "HTTP 429".to_string(),
+        }
+        .into_core_error(op));
+    }
+    let status = resp.status().as_u16();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| imagent_core::CoreError::Platform(PLATFORM, format!("{op}: {e}")))?;
+    let v: serde_json::Value = serde_json::from_str(&body).map_err(|_| {
+        imagent_core::CoreError::Platform(
+            PLATFORM,
+            format!(
+                "{op}: HTTP {status} 非 JSON 响应: {}",
+                truncate_for_error(&body, 120)
+            ),
+        )
+    })?;
+    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
+        return Err(FeishuApiError {
+            code,
+            msg: msg.to_string(),
+        }
+        .into_core_error(op));
+    }
+    Ok(v)
+}
+
+/// 限流判定（CoreError 入口，platform 自愈链路用）：手写 HTTP 路径按结构化
+/// code 精确判定；SDK 路径回落 Display 串匹配（隐性契约，见模块注释）。
+pub(crate) fn is_rate_limited_err(e: &imagent_core::CoreError) -> bool {
+    let s = e.to_string();
+    match FeishuApiError::from_error_str(&s) {
+        Some(api) => api.is_rate_limited(),
+        None => is_rate_limited_msg(&s),
+    }
+}
+
+/// 卡片不存在判定（语义同 [`is_rate_limited_err`]，code 清单见
+/// [`FeishuApiError::is_card_not_exist`]）。
+pub(crate) fn is_card_not_exist_err(e: &imagent_core::CoreError) -> bool {
+    let s = e.to_string();
+    match FeishuApiError::from_error_str(&s) {
+        Some(api) => api.is_card_not_exist(),
+        None => is_card_not_exist_msg(&s),
+    }
+}
+
+/// token 失效判定（语义同 [`is_rate_limited_err`]，code 清单见
+/// [`FeishuApiError::is_token_invalid`]）。
+pub(crate) fn is_token_invalid_err(e: &imagent_core::CoreError) -> bool {
+    let s = e.to_string();
+    match FeishuApiError::from_error_str(&s) {
+        Some(api) => api.is_token_invalid(),
+        None => is_token_invalid_msg(&s),
+    }
+}
+
+/// 识别限流类错误（HTTP 429 / 飞书频控业务码 230020）——**SDK Display 串匹配
+/// 兜底**（隐性契约，见模块注释；手写 HTTP 路径已结构化，走
+/// [`is_rate_limited_err`]）。两种错误串形态都要覆盖：手写路径遗留形态
+/// （"HTTP 429" / "code=230020"）与 SDK 路径（open-lark `ApiError` Display =
+/// "API错误 {raw_code} {endpoint}: {msg}"，raw_code 即飞书业务码或合成 HTTP
+/// status；业务变体则 Debug 打印枚举名）。
 pub(crate) fn is_rate_limited_msg(msg: &str) -> bool {
     msg.contains("HTTP 429")
         || msg.contains("code=230020")
@@ -184,7 +329,8 @@ pub(crate) fn is_rate_limited_msg(msg: &str) -> bool {
 }
 
 /// 识别「卡片不存在/已删除」类错误（流式卡自愈用，platform 层据此清缓存 +
-/// 回报 CARD_HANDLE_LOST 让 core 重发新卡）。
+/// 回报 CARD_HANDLE_LOST 让 core 重发新卡）——**SDK Display 串匹配兜底**（手写
+/// HTTP 路径已结构化，走 [`is_card_not_exist_err`]）。
 ///
 /// 覆盖形态（离线按飞书错误码知识取「不存在」类，**待真机校准**补全清单）：
 /// - im 消息 patch：`code=230002`（消息/卡片不存在）、msg 含 "not exist"；
@@ -199,9 +345,11 @@ pub(crate) fn is_card_not_exist_msg(msg: &str) -> bool {
         || msg.contains("卡片不存在")
 }
 
-/// 识别 token 失效类错误码（99991661-64/68/79：tenant/app access token 空、格式错、
-/// 无效、内部错误）。缓存 token 被服务端提前吊销（app_secret 轮换 / 后台强制失效）
-/// 时，TTL 内重用旧值永远失败——platform 层据此清缓存强制刷新重试一次。
+/// 识别 token 失效类错误码（99991661-64/68/79：tenant/app access token 空、
+/// 格式错、无效、内部错误）——**SDK Display 串匹配兜底**（手写 HTTP 路径已
+/// 结构化，走 [`is_token_invalid_err`]）。缓存 token 被服务端提前吊销
+/// （app_secret 轮换 / 后台强制失效）时，TTL 内重用旧值永远失败——platform
+/// 层据此清缓存强制刷新重试一次。
 pub(crate) fn is_token_invalid_msg(msg: &str) -> bool {
     const TOKEN_INVALID_CODES: [&str; 6] = [
         "99991661", "99991662", "99991663", "99991664", "99991668", "99991679",
@@ -211,7 +359,8 @@ pub(crate) fn is_token_invalid_msg(msg: &str) -> bool {
 }
 
 /// 限流退避重试——500ms → 1s → 2s 最多三次重试，其它错误立即失败。
-/// 手写 HTTP 与 SDK 路径通用（识别见 [`is_rate_limited_msg`]）。
+/// 手写 HTTP 与 SDK 路径通用（识别见 [`is_rate_limited_err`]：结构化 code
+/// 优先，SDK Display 串匹配兜底）。
 macro_rules! retry_on_rate_limit {
     ($body:expr) => {{
         let mut delay = std::time::Duration::from_millis(500);
@@ -219,7 +368,7 @@ macro_rules! retry_on_rate_limit {
             match $body.await {
                 Ok(v) => break Ok(v),
                 Err(e) => {
-                    if is_rate_limited_msg(&format!("{e}")) && delay <= std::time::Duration::from_secs(2)
+                    if is_rate_limited_err(&e) && delay <= std::time::Duration::from_secs(2)
                     {
                         tracing::warn!(
                             target: "feishu",
@@ -259,17 +408,7 @@ pub async fn create_reaction(
         .map_err(|e| {
             imagent_core::CoreError::Platform(PLATFORM, format!("create_reaction: {e}"))
         })?;
-    let v: serde_json::Value = resp.json().await.map_err(|e| {
-        imagent_core::CoreError::Platform(PLATFORM, format!("create_reaction: {e}"))
-    })?;
-    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-    if code != 0 {
-        let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
-        return Err(imagent_core::CoreError::Platform(
-            PLATFORM,
-            format!("create_reaction: code={code} msg={msg} emoji={emoji_type}"),
-        ));
-    }
+    let v = feishu_api_resp(resp, "create_reaction").await?;
     v.get("data")
         .and_then(|d| d.get("reaction_id"))
         .and_then(|r| r.as_str())
@@ -301,18 +440,7 @@ pub async fn delete_reaction(
         .map_err(|e| {
             imagent_core::CoreError::Platform(PLATFORM, format!("delete_reaction: {e}"))
         })?;
-    let v: serde_json::Value = resp.json().await.map_err(|e| {
-        imagent_core::CoreError::Platform(PLATFORM, format!("delete_reaction: {e}"))
-    })?;
-    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-    if code != 0 {
-        let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
-        return Err(imagent_core::CoreError::Platform(
-            PLATFORM,
-            format!("delete_reaction: code={code} msg={msg}"),
-        ));
-    }
-    Ok(())
+    feishu_api_resp(resp, "delete_reaction").await.map(|_| ())
 }
 
 /// 应用内加急（buzz）已有消息（真机校准 2026-08）：PATCH
@@ -343,25 +471,7 @@ pub async fn urgent_app_buzz(
         .map_err(|e| {
             imagent_core::CoreError::Platform(PLATFORM, format!("urgent_app_buzz: {e}"))
         })?;
-    let status = resp.status().as_u16();
-    let body = resp.text().await.map_err(|e| {
-        imagent_core::CoreError::Platform(PLATFORM, format!("urgent_app_buzz: {e}"))
-    })?;
-    let v: serde_json::Value = serde_json::from_str(&body).map_err(|_| {
-        imagent_core::CoreError::Platform(
-            PLATFORM,
-            format!("urgent_app_buzz: HTTP {status} 非 JSON 响应: {body:?}"),
-        )
-    })?;
-    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-    if code != 0 {
-        let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
-        return Err(imagent_core::CoreError::Platform(
-            PLATFORM,
-            format!("urgent_app_buzz: code={code} msg={msg}"),
-        ));
-    }
-    Ok(())
+    feishu_api_resp(resp, "urgent_app_buzz").await.map(|_| ())
 }
 
 /// 发送一条文本消息（HTTP OpenAPI，低层写法，手动注入 token）。
@@ -520,26 +630,9 @@ const CARDKIT_BASE: &str = "https://open.feishu.cn/open-apis/cardkit/v1";
 /// 解析 CardKit 响应信封：code 非 0 报错，否则取 `data` 下指定字段的字符串值。
 /// P5-第五批：先判 HTTP 状态——429 归一为含「HTTP 429」标记的错误（供
 /// retry_on_rate_limit 识别重试；此前直接 json() 解析非 JSON 体，错误串不含
-/// 标记导致重试不生效）。
+/// 标记导致重试不生效）。T19：HTTP/信封层统一收编进 [`feishu_api_resp`]。
 async fn cardkit_resp(resp: reqwest::Response, op: &str) -> imagent_core::Result<String> {
-    if resp.status().as_u16() == 429 {
-        return Err(imagent_core::CoreError::Platform(
-            PLATFORM,
-            format!("{op}: HTTP 429"),
-        ));
-    }
-    let v: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| imagent_core::CoreError::Platform(PLATFORM, format!("{op}: {e}")))?;
-    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-    if code != 0 {
-        let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
-        return Err(imagent_core::CoreError::Platform(
-            PLATFORM,
-            format!("{op}: code={code} msg={msg}"),
-        ));
-    }
+    let v = feishu_api_resp(resp, op).await?;
     Ok(v.get("data").map(|d| d.to_string()).unwrap_or_default())
 }
 
@@ -800,23 +893,7 @@ pub async fn upload_file(
             .map_err(|e| {
                 imagent_core::CoreError::Platform(PLATFORM, format!("upload_file: {e}"))
             })?;
-        if resp.status().as_u16() == 429 {
-            return Err(imagent_core::CoreError::Platform(
-                PLATFORM,
-                "upload_file: HTTP 429".to_string(),
-            ));
-        }
-        let v: serde_json::Value = resp.json().await.map_err(|e| {
-            imagent_core::CoreError::Platform(PLATFORM, format!("upload_file: {e}"))
-        })?;
-        let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-        if code != 0 {
-            let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
-            return Err(imagent_core::CoreError::Platform(
-                PLATFORM,
-                format!("upload_file: code={code} msg={msg}"),
-            ));
-        }
+        let v = feishu_api_resp(resp, "upload_file").await?;
         v.get("data")
             .and_then(|d| d.get("file_key"))
             .and_then(|k| k.as_str())
@@ -1139,17 +1216,7 @@ pub async fn fetch_message_raw(
         .map_err(|e| {
             imagent_core::CoreError::Platform(PLATFORM, format!("fetch_message_raw: {e}"))
         })?;
-    let v: serde_json::Value = resp.json().await.map_err(|e| {
-        imagent_core::CoreError::Platform(PLATFORM, format!("fetch_message_raw: {e}"))
-    })?;
-    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-    if code != 0 {
-        let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
-        return Err(imagent_core::CoreError::Platform(
-            PLATFORM,
-            format!("fetch_message_raw: code={code} {msg}"),
-        ));
-    }
+    let v = feishu_api_resp(resp, "fetch_message_raw").await?;
     let mt = v
         .pointer("/data/items/0/msg_type")
         .or_else(|| v.pointer("/data/msg_type"))
@@ -1182,17 +1249,7 @@ pub async fn fetch_user_display_name(
         .map_err(|e| {
             imagent_core::CoreError::Platform(PLATFORM, format!("fetch_user_display_name: {e}"))
         })?;
-    let v: serde_json::Value = resp.json().await.map_err(|e| {
-        imagent_core::CoreError::Platform(PLATFORM, format!("fetch_user_display_name: {e}"))
-    })?;
-    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-    if code != 0 {
-        let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
-        return Err(imagent_core::CoreError::Platform(
-            PLATFORM,
-            format!("fetch_user_display_name: code={code} {msg}"),
-        ));
-    }
+    let v = feishu_api_resp(resp, "fetch_user_display_name").await?;
     let name = v
         .pointer("/data/user/name")
         .and_then(|n| n.as_str())
@@ -1223,17 +1280,7 @@ pub async fn fetch_bot_open_id(
         .map_err(|e| {
             imagent_core::CoreError::Platform(PLATFORM, format!("fetch_bot_open_id: {e}"))
         })?;
-    let v: serde_json::Value = resp.json().await.map_err(|e| {
-        imagent_core::CoreError::Platform(PLATFORM, format!("fetch_bot_open_id: {e}"))
-    })?;
-    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-    if code != 0 {
-        let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
-        return Err(imagent_core::CoreError::Platform(
-            PLATFORM,
-            format!("fetch_bot_open_id: code={code} msg={msg}"),
-        ));
-    }
+    let v = feishu_api_resp(resp, "fetch_bot_open_id").await?;
     // 真机校准（2026-08-30）：bot/v3/info 响应为顶层 {"bot":{"open_id":…}}，
     // 无 data 包装（离线按 data.open_id 建模落空 → @ 过滤长期弱化运行）。
     v.pointer("/bot/open_id")
@@ -1417,16 +1464,9 @@ pub async fn list_merge_forward(
             let resp = req.send().await.map_err(|e| {
                 imagent_core::CoreError::Platform(PLATFORM, format!("list_merge_forward: {e}"))
             })?;
-            // 429 先归一标记（否则非 JSON 体解析错误不含可识别串，重试不生效）。
-            if resp.status().as_u16() == 429 {
-                return Err(imagent_core::CoreError::Platform(
-                    PLATFORM,
-                    "list_merge_forward: HTTP 429".to_string(),
-                ));
-            }
-            let v: serde_json::Value = resp.json().await.map_err(|e| {
-                imagent_core::CoreError::Platform(PLATFORM, format!("list_merge_forward: {e}"))
-            })?;
+            // 信封 code!=0 检查在 parse_merge_forward_page（纯函数，有单测钉住）；
+            // 这里只收编 HTTP 层（429 归一 / 非 JSON 报状态码）。
+            let v = feishu_api_resp(resp, "list_merge_forward").await?;
             parse_merge_forward_page(&v)
         })?;
         out.extend(page.items);
@@ -1480,25 +1520,7 @@ pub async fn list_chat_messages(
             .map_err(|e| {
                 imagent_core::CoreError::Platform(PLATFORM, format!("list_chat_messages: {e}"))
             })?;
-        // 429 先归一标记（否则非 JSON 体解析错误不含可识别串，退避重试不生效）。
-        if resp.status().as_u16() == 429 {
-            return Err(imagent_core::CoreError::Platform(
-                PLATFORM,
-                "list_chat_messages: HTTP 429".to_string(),
-            ));
-        }
-        let v: serde_json::Value = resp.json().await.map_err(|e| {
-            imagent_core::CoreError::Platform(PLATFORM, format!("list_chat_messages: {e}"))
-        })?;
-        let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-        if code != 0 {
-            let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
-            return Err(imagent_core::CoreError::Platform(
-                PLATFORM,
-                format!("list_chat_messages: code={code} {msg}"),
-            ));
-        }
-        Ok(v)
+        feishu_api_resp(resp, "list_chat_messages").await
     })?;
     Ok(crate::proto::parse_group_context_items(&v, own_app_id))
 }
@@ -1553,25 +1575,7 @@ pub async fn reply_comment_nodes(
             .map_err(|e| {
                 imagent_core::CoreError::Platform(PLATFORM, format!("reply_comment: {e}"))
             })?;
-        // P5-第五批：429 先归一标记（否则非 JSON 体解析错误不含可识别串）。
-        if resp.status().as_u16() == 429 {
-            return Err(imagent_core::CoreError::Platform(
-                PLATFORM,
-                "reply_comment: HTTP 429".to_string(),
-            ));
-        }
-        let v: serde_json::Value = resp.json().await.map_err(|e| {
-            imagent_core::CoreError::Platform(PLATFORM, format!("reply_comment: {e}"))
-        })?;
-        let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-        if code != 0 {
-            let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
-            return Err(imagent_core::CoreError::Platform(
-                PLATFORM,
-                format!("reply_comment: code={code} msg={msg}"),
-            ));
-        }
-        Ok(())
+        feishu_api_resp(resp, "reply_comment").await.map(|_| ())
     })
 }
 
@@ -1602,23 +1606,7 @@ pub async fn reply_message(
             .map_err(|e| {
                 imagent_core::CoreError::Platform(PLATFORM, format!("reply_message: {e}"))
             })?;
-        if resp.status().as_u16() == 429 {
-            return Err(imagent_core::CoreError::Platform(
-                PLATFORM,
-                "reply_message: HTTP 429".to_string(),
-            ));
-        }
-        let v: serde_json::Value = resp.json().await.map_err(|e| {
-            imagent_core::CoreError::Platform(PLATFORM, format!("reply_message: {e}"))
-        })?;
-        let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-        if code != 0 {
-            let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
-            return Err(imagent_core::CoreError::Platform(
-                PLATFORM,
-                format!("reply_message: code={code} msg={msg}"),
-            ));
-        }
+        let v = feishu_api_resp(resp, "reply_message").await?;
         // P6 遗留补齐：返回回执消息 id（话题内 interactive 卡需要它作 patch 句柄）。
         let mid = v
             .pointer("/data/message_id")
@@ -1687,6 +1675,86 @@ mod tests {
                 "j={j:?}"
             );
         }
+    }
+
+    /// T19 结构化错误码：自有格式（feishu_api_resp 产出）能还原出 code/msg；
+    /// SDK Display 形态（无 "code=… msg="）还原失败 → None（回落串匹配兜底）。
+    #[test]
+    fn feishu_api_error_extraction() {
+        let api = FeishuApiError::from_error_str("reply_comment: code=230020 msg=too many request")
+            .expect("自有格式应还原");
+        assert_eq!(api.code, 230020);
+        assert_eq!(api.msg, "too many request");
+        // 429 归一形态：code=429 + msg=HTTP 429（串内保留 "HTTP 429" 标记）。
+        let api429 =
+            FeishuApiError::from_error_str("patch_card_element: code=429 msg=HTTP 429").unwrap();
+        assert_eq!(api429.code, 429);
+        assert!(api429.is_rate_limited());
+        assert!(api429
+            .to_error_str("patch_card_element")
+            .contains("HTTP 429"));
+        // SDK Display：无 code=/msg= 结构 → None。
+        for sdk in [
+            "API错误 429 response: too many request",
+            "send_message: 认证失败: invalid access token for authorization",
+            "网络错误: connection refused",
+        ] {
+            assert!(
+                FeishuApiError::from_error_str(sdk).is_none(),
+                "SDK 串应回落: {sdk}"
+            );
+        }
+    }
+
+    /// T19 code 精确判定（CoreError 入口）：手写 HTTP 路径的自有格式按 code 判
+    /// （等值比较，无子串误伤）；SDK Display 串仍由兜底匹配命中。
+    #[test]
+    fn error_predicates_code_based() {
+        let mk = |s: &str| imagent_core::CoreError::Platform(PLATFORM, s.to_string());
+        // 限流：业务码 230020 / 合成 429；相邻码（1230200 / 300317）不误伤。
+        assert!(is_rate_limited_err(&mk(
+            "reply_comment: code=230020 msg=xx"
+        )));
+        assert!(is_rate_limited_err(&mk(
+            "upload_file: code=429 msg=HTTP 429"
+        )));
+        assert!(!is_rate_limited_err(&mk(
+            "patch_card_element: code=1230200 msg=xx"
+        )));
+        assert!(!is_rate_limited_err(&mk(
+            "patch_card_element: code=300317 msg=sequence error"
+        )));
+        // SDK 形态兜底仍生效。
+        assert!(is_rate_limited_err(&mk(
+            "API错误 429 response: too many request"
+        )));
+        assert!(is_rate_limited_err(&mk("业务错误 TooManyRequests: xx")));
+        // token 失效族：99991661-64/68/79 命中，邻近码不误伤。
+        for code in [99991661, 99991662, 99991663, 99991664, 99991668, 99991679] {
+            assert!(is_token_invalid_err(&mk(&format!(
+                "fetch_bot_open_id: code={code} msg=xx"
+            ))));
+        }
+        assert!(!is_token_invalid_err(&mk(
+            "fetch_bot_open_id: code=99991665 msg=xx"
+        )));
+        assert!(is_token_invalid_err(&mk(
+            "API错误 99991663 response: Invalid access token for authorization"
+        )));
+        // 卡片不存在：230002 命中；300317（sequence，另有自愈）不误伤。
+        assert!(is_card_not_exist_err(&mk(
+            "patch_card: code=230002 msg=card not exist"
+        )));
+        assert!(!is_card_not_exist_err(&mk(
+            "patch_card_element: code=300317 msg=sequence error"
+        )));
+        assert!(is_card_not_exist_err(&mk(
+            "API错误 230002 response: message not found"
+        )));
+        // 非飞书错误不受影响。
+        assert!(!is_rate_limited_err(&mk("网络错误: connection refused")));
+        assert!(!is_token_invalid_err(&mk("download resource: HTTP 429")));
+        assert!(!is_card_not_exist_err(&mk("网络错误: connection refused")));
     }
 
     /// 第六批：token 失效错误码识别——SDK ApiError Display 形态（"API错误
