@@ -295,6 +295,48 @@ secret 轮换 / 环境变量变化后：重新 `export` + `imagent service insta
 
 **日志轮转**：macOS 守护日志 `~/.imagent/logs/daemon.log` 由进程内置 size 轮转——超过 50MB 触发（copytruncate，保留最近 5 份）；阈值用 `IMAGENT_LOG_MAX_MB` 调整（单位 MB，`0` = 不限，改后 `export` + 重装服务生效）。Linux 日志走 journal，轮转/限额由 journald 自身配置（如 `SystemMaxUse=`）管理。
 
+## 备份与恢复（imagent backup）
+
+升级 / 换机 / 误删 profile 前，一条命令拿到一致性快照：
+
+```bash
+imagent backup                    # 默认 <imagent_home>/backups/（profile 感知）
+imagent backup --out /mnt/nas/    # 自定义输出根目录
+imagent --profile work backup     # 备份 work profile（落 profile 目录下 backups/）
+```
+
+每份备份是单个目录（`imagent-backup-<profile>-<UTC时间戳>/`），内含三件：
+
+| 产物 | 内容 |
+|---|---|
+| `imagent.db.snapshot` | SQLite `VACUUM INTO` 一致性快照（全部会话/白名单/凭据密文/审计/定时任务等） |
+| `config.toml` | 配置副本（备份时无 config 则跳过，MANIFEST 如实记录） |
+| `MANIFEST.txt` | imagent 版本、schema 版本、各文件 sha256、恢复步骤与限制说明 |
+
+要点：
+
+- **运行中可备份**（不持实例锁、无需先停机）：`VACUUM INTO` 对运行中的 WAL 库生成读一致快照，包含备份开始前已提交的全部事务（含 WAL 中尚未 checkpoint 的已提交数据）；快照开始后新提交的数据不在内——不停机备份的固有语义，恢复后以快照点为准继续。要拿到「绝对完整」的停机点快照，先停服务再 backup 也完全可以。
+- **keyring 凭据不在快照内**：iLink 登录态存在 OS 钥匙串（机器绑定），换机/重装后需重录——iLink 重新 `imagent login` 扫码；WeCom 重配 `wecom_secret`；飞书重设 `IMAGENT_FEISHU_APP_SECRET`。
+- **媒体目录不进快照**（`<imagent_home>/media` 为入站缓存，体积不可控且可重新获取）。
+- **保留策略**：备份根目录自动保留最近 10 份，超出清最旧（按目录名排序）。
+- 备份产物统一 0600、目录 0700（快照含 credentials 表，config 副本可能含 secret）。
+
+**恢复步骤**（README 与每份 MANIFEST.txt 内同款）：
+
+```bash
+# 1. 停止 imagent（start 终端 Ctrl-C / `imagent service uninstall` / kill）
+# 2. 用快照替换主库（旧库的 -wal/-shm 残留一并删掉，避免旧 WAL 混入新库）
+cp imagent-backup-default-YYYYMMDD-HHMMSS/imagent.db.snapshot ~/.imagent/imagent.db
+rm -f ~/.imagent/imagent.db-wal ~/.imagent/imagent.db-shm
+# 3. 如有 config 副本，一并放回
+cp imagent-backup-default-YYYYMMDD-HHMMSS/config.toml ~/.imagent/config.toml
+# 4. 重录凭据（见上：login / wecom_secret / 飞书 secret）
+# 5. 重新启动——schema 迁移自动向前
+imagent start
+```
+
+> **降级不可恢复**：恢复只能「旧快照 + 相同或更新的 imagent 二进制」（启动时 schema 自动向前迁移）；**schema 更新的快照不能被旧版 imagent 打开**（启动会拒绝比代码新的 `user_version`）。升级出问题想回退二进制时，请用升级**前**生成的备份，不要用升级后新产生的备份配旧二进制。
+
 ## 命令（IM 内）
 
 | 命令 | 作用 |
