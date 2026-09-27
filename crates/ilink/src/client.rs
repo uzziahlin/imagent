@@ -75,7 +75,7 @@ impl ILinkClient {
 
     /// 每请求随机 `X-WECHAT-UIN`（base64 随机 u32 小端字节），防重放。
     fn random_uin() -> String {
-        let v: u32 = rand::thread_rng().gen();
+        let v: u32 = rand::rng().random();
         base64::engine::general_purpose::STANDARD.encode(v.to_le_bytes())
     }
 

@@ -153,8 +153,8 @@ async fn post_noauth<T: serde::de::DeserializeOwned>(
     body: &serde_json::Value,
 ) -> Result<T> {
     let url = format!("{base_url}{endpoint}");
-    let uin = base64::engine::general_purpose::STANDARD
-        .encode(rand::thread_rng().gen::<u32>().to_le_bytes());
+    let uin =
+        base64::engine::general_purpose::STANDARD.encode(rand::rng().random::<u32>().to_le_bytes());
     let resp = http
         .post(&url)
         .header("AuthorizationType", "ilink_bot_token")
