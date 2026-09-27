@@ -1173,10 +1173,37 @@ async fn build_card_streaming(
     )
 }
 
-/// 等待 conv 的在飞任务注册出现（join spawn 后写入 running map）。
+// T18 机械调整辅助：在飞轮次原活在独立 running map，并入 ConvState 单表后
+// 测试断言改走下列只读辅助（语义与原 contains_key / len / is_empty 一致）。
+async fn conv_running(disp: &Dispatcher, conv: &str) -> bool {
+    disp.peek_conv(conv, |cs| cs.is_some_and(|c| c.running.is_some()))
+        .await
+}
+
+async fn running_rounds(disp: &Dispatcher) -> usize {
+    let map = disp.conv_states.lock().await;
+    map.values().filter(|cs| cs.running.is_some()).count()
+}
+
+/// T18 机械调整辅助：conv 的排队条数（原 queues map get(conv).len()）。
+async fn conv_queued_len(disp: &Dispatcher, conv: &str) -> usize {
+    disp.peek_conv(conv, |cs| {
+        cs.and_then(|c| c.queue.as_ref()).map_or(0, Vec::len)
+    })
+    .await
+}
+
+/// T18 机械调整辅助：是否有 conv 挂起队列（原 queues map is_empty 的反义；
+/// 留空 Vec 的 entry 也算——与旧 entry 存在语义一致）。
+async fn any_queued(disp: &Dispatcher) -> bool {
+    let map = disp.conv_states.lock().await;
+    map.values().any(|cs| cs.queue.is_some())
+}
+
+/// 等待 conv 的在飞任务注册出现（join spawn 后写入 ConvState.running）。
 async fn wait_registered(ctx: &Ctx, conv: &str) -> bool {
     for _ in 0..400 {
-        if ctx.disp.running.lock().await.contains_key(conv) {
+        if conv_running(&ctx.disp, conv).await {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -2341,7 +2368,7 @@ async fn stop_aborts_running_task() {
         !inbox.iter().any(|t| t.starts_with("reply#")),
         "中断后不应有 Final 回复: {inbox:?}"
     );
-    assert!(ctx.disp.running.lock().await.is_empty(), "在飞注册应清空");
+    assert_eq!(running_rounds(&ctx.disp).await, 0, "在飞注册应清空");
     assert_eq!(ctx.prompts.lock().await.len(), 1, "恰一轮被中断的执行");
     drop_db(ctx.db).await;
 }
@@ -2383,14 +2410,7 @@ async fn stop_drops_queued_messages() {
     ctx.disp.handle(msg("c1", "alice", "queued C")).await;
     // 等 2 条都入队。
     for _ in 0..400 {
-        if ctx
-            .disp
-            .queues
-            .lock()
-            .await
-            .get("c1")
-            .is_some_and(|q| q.len() == 2)
-        {
+        if conv_queued_len(&ctx.disp, "c1").await == 2 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -2439,14 +2459,7 @@ async fn stop_preserves_queued_messages_and_continues() {
     ctx.disp.handle(msg("c1", "alice", "queued B")).await;
     ctx.disp.handle(msg("c1", "alice", "queued C")).await;
     for _ in 0..400 {
-        if ctx
-            .disp
-            .queues
-            .lock()
-            .await
-            .get("c1")
-            .is_some_and(|q| q.len() == 2)
-        {
+        if conv_queued_len(&ctx.disp, "c1").await == 2 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -2512,14 +2525,7 @@ async fn queue_list_and_selective_drop() {
     ctx.disp.handle(msg("c1", "bob", "bob 的补充")).await;
     ctx.disp.handle(msg("c1", "alice", "alice 的补充")).await;
     for _ in 0..400 {
-        if ctx
-            .disp
-            .queues
-            .lock()
-            .await
-            .get("c1")
-            .is_some_and(|q| q.len() == 2)
-        {
+        if conv_queued_len(&ctx.disp, "c1").await == 2 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -2548,10 +2554,16 @@ async fn queue_list_and_selective_drop() {
         inbox.iter().any(|t| t.contains("已丢弃第 2 条")),
         "删除回执: {inbox:?}"
     );
-    let q = ctx.disp.queues.lock().await;
-    let q = q.get("c1").expect("entry 保留");
-    assert_eq!(q.len(), 1, "应剩 bob 的一条");
-    assert_eq!(q[0].msg.sender.0, "bob");
+    // （T18 机械调整：queues 并入 ConvState 单表；entry 保留 = queue 仍在。）
+    let (q_len, first_sender) = {
+        let map = ctx.disp.conv_states.lock().await;
+        map.get("c1")
+            .and_then(|cs| cs.queue.as_ref())
+            .map(|q| (q.len(), q[0].msg.sender.0.clone()))
+            .expect("entry 保留")
+    };
+    assert_eq!(q_len, 1, "应剩 bob 的一条");
+    assert_eq!(first_sender, "bob");
     drop_db(ctx.db).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), runner).await;
 }
@@ -2646,12 +2658,7 @@ async fn steering_injects_midround_text() {
         "两条都应注入"
     );
     assert!(
-        ctx.disp
-            .queues
-            .lock()
-            .await
-            .get("c1")
-            .is_none_or(|q| q.is_empty()),
+        conv_queued_len(&ctx.disp, "c1").await == 0,
         "注入的消息不进队列"
     );
     let done = tokio::time::timeout(Duration::from_secs(5), runner).await;
@@ -2787,9 +2794,9 @@ async fn idle_watchdog_terminates_silent_agent() {
     );
     assert!(!inbox.iter().any(|t| t.starts_with("reply#")));
     assert_eq!(ctx.prompts.lock().await.len(), 1);
-    assert!(ctx.disp.running.lock().await.is_empty(), "在飞注册应清空");
+    assert_eq!(running_rounds(&ctx.disp).await, 0, "在飞注册应清空");
     assert!(
-        ctx.disp.queues.lock().await.is_empty(),
+        !any_queued(&ctx.disp).await,
         "runner 退出后队列 entry 应移除"
     );
     drop_db(ctx.db).await;
@@ -3310,11 +3317,13 @@ async fn tasks_command_shows_progress_and_tool_stats() {
     assert!(
         wait_until(&ctx, |c| {
             Box::pin(async move {
+                // T18 机械调整：running 并入 ConvState 单表。
                 c.disp
-                    .running
+                    .conv_states
                     .lock()
                     .await
                     .get("c1")
+                    .and_then(|cs| cs.running.as_ref())
                     .is_some_and(|rh| !rh.snapshot.lock().unwrap().todos.is_empty())
             })
         })
@@ -3344,7 +3353,7 @@ async fn tasks_command_shows_progress_and_tool_stats() {
     let _ = tokio::time::timeout(Duration::from_secs(5), h).await;
     assert!(
         wait_until(&ctx, |c| {
-            Box::pin(async move { c.disp.running.lock().await.is_empty() })
+            Box::pin(async move { running_rounds(&c.disp).await == 0 })
         })
         .await,
         "轮次应已收尾"
@@ -3918,10 +3927,7 @@ async fn stop_persists_learned_session() {
     let done = tokio::time::timeout(Duration::from_secs(5), runner).await;
     assert!(done.is_ok(), "被中断的 runner 应很快退出");
     // persist 在轮次结束（running 移除）之前完成，此处应已观察到。
-    assert!(
-        !ctx.disp.running.lock().await.contains_key("c1"),
-        "在飞注册应清空"
-    );
+    assert!(!conv_running(&ctx.disp, "c1").await, "在飞注册应清空");
     // 下条消息：应续接学到的 sess-learned（而非 None 开新会话）。
     let disp = ctx.disp.clone();
     let runner2 = tokio::spawn(async move {
@@ -4102,10 +4108,11 @@ async fn stop_interception_flips_processing_reaction() {
         "preamble 应走到 typing 闸门"
     );
     // 窗口内注入停止标记（ts > 轮首水位 0）→ 👀 已打后的二次复查命中拦截。
-    disp.stop_requested
-        .lock()
-        .await
-        .insert("c1".into(), crate::dispatch::now_secs());
+    // （T18 机械调整：stop_requested 并入 ConvState 单表。）
+    disp.with_conv("c1", |cs| {
+        cs.stop_requested = Some(crate::dispatch::now_secs())
+    })
+    .await;
     release.send(()).expect("release typing gate");
     let done = tokio::time::timeout(Duration::from_secs(5), runner).await;
     assert!(done.is_ok(), "拦截路径应结束");
@@ -4156,7 +4163,7 @@ async fn resume_rejects_local_session_cwd_mismatch() {
         "cwd 不符应拒绝接管并引导 /cd: {inbox:?}"
     );
     // 未接管：session 映射不应变化。
-    assert!(ctx.disp.running.lock().await.is_empty(), "无在飞任务");
+    assert_eq!(running_rounds(&ctx.disp).await, 0, "无在飞任务");
     drop_db(ctx.db).await;
 }
 
@@ -4297,7 +4304,7 @@ async fn stop_aborts_compact() {
             .any(|t| t.contains("已中断") && t.contains("可重新 /compact")),
         "应回中断提示（可重新 /compact）: {inbox:?}"
     );
-    assert!(ctx.disp.running.lock().await.is_empty(), "在飞注册应清空");
+    assert_eq!(running_rounds(&ctx.disp).await, 0, "在飞注册应清空");
     drop_db(ctx.db).await;
 }
 
@@ -4745,14 +4752,7 @@ async fn recall_removes_matching_queued_message() {
     ctx.disp.handle(m1).await;
     ctx.disp.handle(m2).await;
     for _ in 0..400 {
-        if ctx
-            .disp
-            .queues
-            .lock()
-            .await
-            .get("feishu:ou_t")
-            .is_some_and(|q| q.len() == 2)
-        {
+        if conv_queued_len(&ctx.disp, "feishu:ou_t").await == 2 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -4768,8 +4768,10 @@ async fn recall_removes_matching_queued_message() {
         .await;
     // 队列只剩 om_keep。
     let queued_ids: Vec<String> = {
-        let map = ctx.disp.queues.lock().await;
+        // （T18 机械调整：queues 并入 ConvState 单表。）
+        let map = ctx.disp.conv_states.lock().await;
         map.get("feishu:ou_t")
+            .and_then(|cs| cs.queue.as_ref())
             .map(|q| {
                 q.iter()
                     .filter_map(|m| m.msg.source_msg_id.clone())
@@ -4782,14 +4784,14 @@ async fn recall_removes_matching_queued_message() {
         vec!["om_keep".to_string()],
         "撤回后队列应只剩 om_keep"
     );
-    // 排队提示同步收缩。
+    // 排队提示同步收缩。（T18 机械调整：queued_hints 并入 ConvState 单表。）
     assert!(
         ctx.disp
-            .queued_hints
-            .lock()
+            .peek_conv("feishu:ou_t", |cs| {
+                cs.and_then(|c| c.queued_hint.as_ref()).map(|h| h.count)
+            })
             .await
-            .get("feishu:ou_t")
-            .is_some_and(|h| h.count == 1),
+            .is_some_and(|count| count == 1),
         "排队提示应收缩为 1"
     );
     // 撤回排队消息不回任何提示（静默移除）。
@@ -6002,10 +6004,11 @@ async fn stop_interception_does_not_strand_queue() {
     .await;
     let disp = ctx.disp.clone();
     // 预设停止标记（模拟 /stop 恰在批窗口期到达：标记设置时 running 尚未注册）。
-    disp.stop_requested
-        .lock()
-        .await
-        .insert("c1".into(), crate::dispatch::now_secs());
+    // （T18 机械调整：stop_requested 并入 ConvState 单表。）
+    disp.with_conv("c1", |cs| {
+        cs.stop_requested = Some(crate::dispatch::now_secs())
+    })
+    .await;
     // 第一条消息成为 runner，取批后命中停止标记 → 批次丢弃。
     let runner = tokio::spawn(async move {
         disp.handle(msg("c1", "alice", "被拦截的批次")).await;
@@ -6750,5 +6753,205 @@ async fn cancelled_ask_returns_error_to_terminal() {
 
     ctx.disp.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
+    drop_db(ctx.db).await;
+}
+
+// ---------------------------------------------------------------------------
+// T18（ConvState 单表）：LRU 驱逐矩阵测试。随 map 迁移批次扩展豁免维度
+//（running / 排队豁免在对应字段并入后补齐）。
+// ---------------------------------------------------------------------------
+
+/// T18：LRU 驱逐基础——超上限按 last_touched 驱逐最久未活跃的 conv；挂起审批
+/// （router pending）豁免；未超上限不动。
+#[tokio::test]
+async fn conv_state_lru_evicts_idle_keeps_pending() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    // 三个 conv：old（最久未活跃）/ fresh（较新）/ pending（挂起审批）。
+    ctx.disp
+        .with_conv("c_old", |cs| cs.idle_override = Some(Duration::ZERO))
+        .await;
+    // 刻意把 old 的 last_touched 回拨（checked_sub 防时钟过young panic）。
+    {
+        let mut map = ctx.disp.conv_states.lock().await;
+        if let Some(cs) = map.get_mut("c_old") {
+            cs.last_touched = cs
+                .last_touched
+                .checked_sub(Duration::from_secs(3600))
+                .unwrap_or(cs.last_touched);
+        }
+    }
+    ctx.disp
+        .with_conv("c_fresh", |cs| {
+            cs.idle_override = Some(Duration::from_secs(60))
+        })
+        .await;
+    let _rx = ctx
+        .disp
+        .router()
+        .register(
+            "c_pending",
+            "r-1",
+            None,
+            crate::permission::PendingKind::Permission,
+            Some("Bash"),
+            None,
+        )
+        .await;
+    ctx.disp
+        .with_conv("c_pending", |cs| cs.idle_override = Some(Duration::ZERO))
+        .await;
+    // 未超上限：no-op。
+    assert_eq!(ctx.disp.evict_idle_conv_states(10).await, 0);
+    // cap=2：驱逐最久未活跃的 old（fresh 较新、pending 挂审批豁免）。
+    let removed = ctx.disp.evict_idle_conv_states(2).await;
+    assert_eq!(removed, 1, "应驱逐 1 个（old）");
+    let map = ctx.disp.conv_states.lock().await;
+    assert!(map.contains_key("c_fresh"), "较新会话保留");
+    assert!(map.contains_key("c_pending"), "挂起审批的会话豁免");
+    assert!(!map.contains_key("c_old"), "最久未活跃会话被驱逐");
+    drop(map);
+    drop_db(ctx.db).await;
+}
+
+/// T18：驱逐后再来的 conv 从干净状态开始（等价重启语义）——内存覆盖项
+///（/timeout 的 idle_override）丢失，回到全局默认。
+#[tokio::test]
+async fn conv_state_evicted_conv_starts_clean() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    ctx.disp
+        .with_conv("c1", |cs| cs.idle_override = Some(Duration::ZERO))
+        .await;
+    // 驱逐（cap=0 强制清空可驱逐条目）。
+    let removed = ctx.disp.evict_idle_conv_states(0).await;
+    assert_eq!(removed, 1);
+    {
+        let map = ctx.disp.conv_states.lock().await;
+        assert!(!map.contains_key("c1"), "应被驱逐");
+    }
+    // 再来：从干净状态开始（override 丢失 = 重启语义）。
+    let v = ctx
+        .disp
+        .peek_conv("c1", |cs| cs.and_then(|c| c.idle_override))
+        .await;
+    assert_eq!(v, None, "驱逐后的 conv 从干净状态开始");
+    drop_db(ctx.db).await;
+}
+
+/// T18：with_conv 把回到全空的 entry 自动剪除（表不积空 entry）。
+#[tokio::test]
+async fn conv_state_entry_pruned_when_empty() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    ctx.disp
+        .with_conv("c1", |cs| cs.idle_override = Some(Duration::ZERO))
+        .await;
+    {
+        let map = ctx.disp.conv_states.lock().await;
+        assert!(map.contains_key("c1"));
+    }
+    ctx.disp.with_conv("c1", |cs| cs.idle_override = None).await;
+    let map = ctx.disp.conv_states.lock().await;
+    assert!(!map.contains_key("c1"), "回到全空的 entry 应被剪除");
+    drop(map);
+    drop_db(ctx.db).await;
+}
+
+/// T18：LRU 驱逐豁免矩阵（完整版）——running / queue（runner 活跃）的 conv
+/// 不被驱逐，仅静默会话被驱逐。queue=Some(空 Vec)（取批间隙）同样豁免
+///（runner 循环仍依赖该身份）。
+#[tokio::test]
+async fn conv_state_lru_exempts_running_and_queued() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    // idle：最久未活跃，应被驱逐。
+    ctx.disp
+        .with_conv("c_idle", |cs| cs.idle_override = Some(Duration::ZERO))
+        .await;
+    // running：伪造在飞句柄（abort handle 挂在一个长睡任务上）。
+    let jh = tokio::spawn(async {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    });
+    ctx.disp
+        .with_conv("c_running", |cs| {
+            cs.running = Some(RoundHandle {
+                abort: jh.abort_handle(),
+                steer: None,
+                started: std::time::Instant::now(),
+                digest: None,
+                snapshot: Arc::new(std::sync::Mutex::new(RoundSnapshot::default())),
+            });
+        })
+        .await;
+    // queued：runner 活跃（含空 Vec 形态——取批间隙）。
+    ctx.disp
+        .with_conv("c_queued", |cs| {
+            cs.queue = Some(Vec::new());
+        })
+        .await;
+    // 回拨 idle 的 last_touched，确保它是最旧。
+    {
+        let mut map = ctx.disp.conv_states.lock().await;
+        if let Some(cs) = map.get_mut("c_idle") {
+            cs.last_touched = cs
+                .last_touched
+                .checked_sub(Duration::from_secs(3600))
+                .unwrap_or(cs.last_touched);
+        }
+    }
+    // cap=2：只能驱逐 idle（running/queued 豁免），驱逐后表长 = cap = 2
+    //（豁免条目不强行清空——feishu 侧的兜底清空在 core 不适用：丢 running
+    // 句柄会让 /stop 失效，比超限更糟）。
+    let removed = ctx.disp.evict_idle_conv_states(2).await;
+    assert_eq!(removed, 1, "只应驱逐 idle 会话");
+    let map = ctx.disp.conv_states.lock().await;
+    assert!(!map.contains_key("c_idle"), "静默会话被驱逐");
+    assert!(map.contains_key("c_running"), "在飞轮会话豁免");
+    assert!(map.contains_key("c_queued"), "排队（runner 活跃）会话豁免");
+    assert_eq!(map.len(), 2, "驱逐非豁免条目后收缩到 cap，豁免条目保留");
+    drop(map);
+    jh.abort();
+    drop_db(ctx.db).await;
+}
+
+/// T18：驱逐不丢排队语义的根基——队列本体在 ConvState，驱逐只发生在
+/// queue=None 的会话上；再次断言 cap=0 下 running/queued 也不被清。
+#[tokio::test]
+async fn conv_state_evict_zero_cap_keeps_exempt() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    let jh = tokio::spawn(async {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    });
+    ctx.disp
+        .with_conv("c_running", |cs| {
+            cs.running = Some(RoundHandle {
+                abort: jh.abort_handle(),
+                steer: None,
+                started: std::time::Instant::now(),
+                digest: None,
+                snapshot: Arc::new(std::sync::Mutex::new(RoundSnapshot::default())),
+            });
+        })
+        .await;
+    ctx.disp
+        .with_conv("c_queued", |cs| {
+            cs.queue = Some(vec![QueuedMsg {
+                rowid: 0,
+                msg: msg("c_queued", "alice", "排着"),
+            }]);
+        })
+        .await;
+    ctx.disp
+        .with_conv("c_idle", |cs| cs.pending_hint_last = Some(Instant::now()))
+        .await;
+    let removed = ctx.disp.evict_idle_conv_states(0).await;
+    assert_eq!(removed, 1, "cap=0 只驱逐非豁免条目");
+    let map = ctx.disp.conv_states.lock().await;
+    assert!(map.contains_key("c_running") && map.contains_key("c_queued"));
+    assert!(!map.contains_key("c_idle"));
+    drop(map);
+    jh.abort();
     drop_db(ctx.db).await;
 }

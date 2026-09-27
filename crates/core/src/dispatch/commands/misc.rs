@@ -268,21 +268,19 @@ pub(crate) fn doctor_size_line(db_bytes: u64, media_bytes: u64) -> String {
 impl Dispatcher {
     /// /status —— 本会话 + 全局运行状态。
     pub(super) async fn cmd_status(&self, conv: &ConvId, hint: &ReplyHint) {
-        // P4-7：本会话 + 全局运行状态。
-        let running_here = self.running.lock().await.contains_key(&conv.0);
-        let queued_here = self
-            .queues
-            .lock()
-            .await
-            .get(&conv.0)
-            .map(|q| q.len())
-            .unwrap_or(0);
-        // v1.26 明细：每个在飞会话的任务摘要 + 已运行时长（Omnara dashboard
-        // 的 IM 平民版——此前只有一个数字）。
-        let running_detail: Vec<String> = {
-            let running = self.running.lock().await;
-            running
+        // P4-7：本会话 + 全局运行状态。T18：在飞轮次与排队队列同在 ConvState
+        // 单表（原 running/queues 两表），一次锁内取齐三份数据（原子快照，
+        // 输出与旧版一致）。
+        let (running_here, queued_here, running_detail) = {
+            let states = self.conv_states.lock().await;
+            let running_here = states.get(&conv.0).is_some_and(|cs| cs.running.is_some());
+            let queued_here = states
+                .get(&conv.0)
+                .and_then(|cs| cs.queue.as_ref())
+                .map_or(0, Vec::len);
+            let running_detail = states
                 .iter()
+                .filter_map(|(rc, cs)| cs.running.as_ref().map(|h| (rc, h)))
                 .map(|(rc, h)| {
                     let secs = h.started.elapsed().as_secs();
                     let run = if secs < 60 {
@@ -303,7 +301,8 @@ impl Dispatcher {
                     };
                     format!("\n- {digest} · 已跑 {run}{mark}")
                 })
-                .collect()
+                .collect::<Vec<_>>();
+            (running_here, queued_here, running_detail)
         };
         let in_flight = running_detail.len();
         // P2（code-review v13）：全局并发护栏——「在飞轮次 X/Y（上限）」；上限 0
@@ -376,8 +375,11 @@ impl Dispatcher {
     /// 可见——纯文本平台（wecom/ilink）与「不想翻卡片」场景由此获得查看入口。
     /// 白名单即可用（非 admin）：查看型只读无副作用，群 conv 任何人可看。
     pub(super) async fn cmd_tasks(&self, conv: &ConvId, hint: &ReplyHint) {
-        // 取句柄即 clone、锁外渲染（v1.18 纪律：不持 running 锁跨 reply 的 await）。
-        let handle = self.running.lock().await.get(&conv.0).cloned();
+        // 取句柄即 clone、锁外渲染（v1.18 纪律：不持 ConvState 表锁跨 reply 的
+        // await；T18 起 running 活在单表）。
+        let handle = self
+            .peek_conv(&conv.0, |cs| cs.and_then(|c| c.running.clone()))
+            .await;
         let Some(h) = handle else {
             // 文案对齐 /stop 无任务时的口径。
             self.reply(conv, "ℹ️ 当前没有运行中的任务", hint).await;
@@ -455,7 +457,10 @@ impl Dispatcher {
         } else {
             lines.push("⚠️ 会话映射计数失败".into());
         }
-        let in_flight = self.running.lock().await.len();
+        let in_flight = {
+            let states = self.conv_states.lock().await;
+            states.values().filter(|cs| cs.running.is_some()).count()
+        };
         lines.push(if in_flight == 0 {
             "✅ 无在飞任务".to_string()
         } else {
@@ -579,11 +584,9 @@ impl Dispatcher {
                 // P5 快赢：/resume 列表缓存随 workdir 失效——列表按
                 // conv 当前目录扫描，切目录后旧序号指向的是旧目录的
                 // 会话（且接管前有 cwd 校验兜底）。
-                // D7：缓存 key 已改为 (conv, sender)，按 conv 前缀全量失效。
-                self.resume_cache
-                    .lock()
-                    .await
-                    .retain(|(c, _), _| c != &conv.0);
+                // D7：缓存按 (conv, sender) 隔离——本 conv 全部 sender 一并失效
+                //（T18 并入 ConvState 后 = 清空本 conv 字段）。
+                self.with_conv(&conv.0, |cs| cs.resume_cache.clear()).await;
                 self.reply(
                     conv,
                     &format!("✅ 工作目录已切到 {arg}（下条消息生效）"),
@@ -687,11 +690,8 @@ impl Dispatcher {
                             Ok(_) => {
                                 // P5-第五批：同 /cd——切目录后失效
                                 // /resume 列表缓存（列表按当前目录扫描）。
-                                // D7：缓存 key 已改为 (conv, sender)，按 conv 前缀全量失效。
-                                self.resume_cache
-                                    .lock()
-                                    .await
-                                    .retain(|(c, _), _| c != &conv.0);
+                                // D7：本 conv 全部 sender 一并失效（同 /cd）。
+                                self.with_conv(&conv.0, |cs| cs.resume_cache.clear()).await;
                                 self.reply(conv, &format!("✅ 已切到「{arg}」（{path}）"), hint)
                                     .await
                             }
@@ -860,7 +860,10 @@ impl Dispatcher {
         let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
         let global = self.agent_idle_timeout.read().as_secs();
         if arg.is_empty() {
-            let cur = match self.idle_overrides.lock().await.get(&conv.0) {
+            let cur_override = self
+                .peek_conv(&conv.0, |cs| cs.and_then(|c| c.idle_override))
+                .await;
+            let cur = match cur_override {
                 Some(d) if d.is_zero() => "已关闭（本会话覆盖）".to_string(),
                 Some(d) => format!("{} 分钟（本会话覆盖）", d.as_secs() / 60),
                 None => format!("跟随全局 {global} 秒（0=关）"),
@@ -877,15 +880,13 @@ impl Dispatcher {
         }
         match arg.to_ascii_lowercase().as_str() {
             "off" => {
-                self.idle_overrides
-                    .lock()
-                    .await
-                    .insert(conv.0.clone(), Duration::ZERO);
+                self.with_conv(&conv.0, |cs| cs.idle_override = Some(Duration::ZERO))
+                    .await;
                 self.reply(conv, "✅ 本会话空闲看门狗已关闭（仅本会话）", hint)
                     .await;
             }
             "default" => {
-                self.idle_overrides.lock().await.remove(&conv.0);
+                self.with_conv(&conv.0, |cs| cs.idle_override = None).await;
                 self.reply(
                     conv,
                     &format!("✅ 已清除本会话覆盖，回到全局 {global} 秒"),
@@ -909,7 +910,8 @@ impl Dispatcher {
                         return;
                     };
                     let d = Duration::from_secs(n * 60);
-                    self.idle_overrides.lock().await.insert(conv.0.clone(), d);
+                    self.with_conv(&conv.0, |cs| cs.idle_override = Some(d))
+                        .await;
                     self.reply(
                         conv,
                         &format!("✅ 本会话空闲看门狗 = {n} 分钟（agent 连续无输出即终止）"),
@@ -1157,8 +1159,11 @@ impl Dispatcher {
                     return;
                 };
                 let cached = {
-                    let cache = self.resume_cache.lock().await;
-                    cache.get(&(conv.0.clone(), sender.0.clone())).cloned()
+                    let key = sender.0.clone();
+                    self.peek_conv(&conv.0, move |cs| {
+                        cs.and_then(|c| c.resume_cache.get(&key).cloned())
+                    })
+                    .await
                 };
                 let Some((at, list)) = cached else {
                     self.reply(conv, "⚠️ 没有可用的 /resume 列表——先发 /resume 查看历史会话，再 /export <序号>。", hint).await;
@@ -1276,8 +1281,11 @@ impl Dispatcher {
         hint: &ReplyHint,
         parts: &[&str],
     ) {
-        // drop 子命令：先做权限与序号校验，再在同一 queues 临界区移除并刷新
-        // queued_hints（count 变化需反映到卡片 footer）。
+        // drop 子命令：先做权限与序号校验，再在 ConvState 同一临界区移除并收缩
+        // 排队提示（count 变化需反映到卡片 footer）。T18：队列与 hint 同表，
+        // 校验+移除+hint 收缩一锁完成；回执与删行 IO 在锁外（reply 含平台
+        // 发送——超时 + 退避重试，持全局表锁 await 会卡住所有 conv 的
+        // 入队/取批/steering）。
         if parts.get(1).map(|s| s.trim()) == Some("drop") {
             let Some(n) = parts.get(2).and_then(|s| s.trim().parse::<usize>().ok()) else {
                 self.reply(
@@ -1293,81 +1301,104 @@ impl Dispatcher {
                 return;
             }
             let is_admin = self.is_admin(sender);
-            let removed_sender;
-            {
-                let mut map = self.queues.lock().await;
-                let Some(q) = map.get_mut(&conv.0) else {
-                    // v1.18 review：回执移到锁外——reply 含平台发送（超时 + 退避
-                    // 重试），持全局 queues 锁 await 会卡住所有 conv 的入队/取批/
-                    // steering；越界分支早有此纪律，这两个分支是回归。
-                    drop(map);
+            // 锁内校验 + 移除的结果（回执/删行 IO 全在锁外分支）。
+            enum DropOutcome {
+                NoQueue,
+                OutOfRange(usize),
+                NotYours,
+                Dropped {
+                    sender: String,
+                    snippet: String,
+                    rowid: i64,
+                },
+            }
+            let outcome = {
+                let mut states = self.conv_states.lock().await;
+                match states.get_mut(&conv.0) {
+                    None => DropOutcome::NoQueue,
+                    Some(cs) => match cs.queue.as_mut() {
+                        None => DropOutcome::NoQueue,
+                        Some(q) => {
+                            if n > q.len() {
+                                DropOutcome::OutOfRange(q.len())
+                            } else {
+                                let idx = n - 1;
+                                let removed_sender = q[idx].msg.sender.0.clone();
+                                if removed_sender != sender && !is_admin {
+                                    DropOutcome::NotYours
+                                } else {
+                                    let removed = q.remove(idx);
+                                    let count = q.len();
+                                    let latest = q
+                                        .last()
+                                        .map(|last| super::super::latest_snippet(&last.msg));
+                                    // q 的借用到此为止（不相交字段路径，NLL 放行）。
+                                    // 与取批路径同语义：留空 Vec 不交还 runner 身份
+                                    //（runner 循环依赖）。hint：count==0 清除、否则
+                                    // 合并写入保 steered（同 enqueue 路径的 v1.18
+                                    // review 修正：整体替换会把「已注入 N 条」清零）。
+                                    if count == 0 {
+                                        cs.queued_hint = None;
+                                    } else if let Some(latest) = latest {
+                                        let h = cs.queued_hint.get_or_insert_default();
+                                        h.count = count;
+                                        h.latest = latest;
+                                    }
+                                    let snippet = removed
+                                        .msg
+                                        .text
+                                        .as_deref()
+                                        .map(|t| super::super::truncate_str(t.trim(), 30))
+                                        .unwrap_or_else(|| "（纯媒体）".into());
+                                    DropOutcome::Dropped {
+                                        sender: removed_sender,
+                                        snippet,
+                                        rowid: removed.rowid,
+                                    }
+                                }
+                            }
+                        }
+                    },
+                }
+            };
+            match outcome {
+                DropOutcome::NoQueue => {
                     self.reply(conv, "队列为空。", hint).await;
-                    return;
-                };
-                if n > q.len() {
-                    let len = q.len();
-                    drop(map);
+                }
+                DropOutcome::OutOfRange(len) => {
                     self.reply(conv, &format!("序号超出范围（当前 {len} 条）。"), hint)
                         .await;
-                    return;
                 }
-                let idx = n - 1;
-                removed_sender = q[idx].msg.sender.0.clone();
-                if removed_sender != sender && !is_admin {
-                    drop(map);
+                DropOutcome::NotYours => {
                     self.reply(conv, "只能丢弃自己排队的消息（或联系管理员处理）。", hint)
                         .await;
-                    return;
                 }
-                let removed = q.remove(idx);
-                let count = q.len();
-                if count == 0 {
-                    // 与取批路径同语义：留空 Vec 不删 entry（runner 循环依赖）。
-                    self.queued_hints.lock().await.remove(&conv.0);
-                } else if let Some(last) = q.last() {
-                    // 合并写入保 steered（同 enqueue 路径的 v1.18 review 修正：
-                    // insert(..Default) 会把「已注入 N 条」清零）。
-                    self.queued_hints
-                        .lock()
-                        .await
-                        .entry(conv.0.clone())
-                        .and_modify(|h| {
-                            h.count = count;
-                            h.latest = super::super::latest_snippet(&last.msg);
-                        })
-                        .or_insert_with(|| crate::card_session::QueuedHint {
-                            count,
-                            latest: super::super::latest_snippet(&last.msg),
-                            ..Default::default()
-                        });
-                }
-                drop(map);
-                // v1.18 review（排队持久化重做）：按被丢元素的 rowid 精确删行
-                //（替代整队重写——并发入队的新行不受影响）。
-                if removed.rowid > 0 {
-                    if let Err(e) = self.store.delete_queued_rows(&[removed.rowid]).await {
-                        warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "丢弃后持久化行删除失败（重启后可能重放该条）");
+                DropOutcome::Dropped {
+                    sender: removed_sender,
+                    snippet,
+                    rowid,
+                } => {
+                    // v1.18 review（排队持久化重做）：按被丢元素的 rowid 精确删行
+                    //（替代整队重写——并发入队的新行不受影响）。
+                    if rowid > 0 {
+                        if let Err(e) = self.store.delete_queued_rows(&[rowid]).await {
+                            warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "丢弃后持久化行删除失败（重启后可能重放该条）");
+                        }
                     }
+                    self.reply(
+                        conv,
+                        &format!("🗑️ 已丢弃第 {n} 条（{removed_sender}）：{snippet}"),
+                        hint,
+                    )
+                    .await;
                 }
-                let snippet = removed
-                    .msg
-                    .text
-                    .as_deref()
-                    .map(|t| super::super::truncate_str(t.trim(), 30))
-                    .unwrap_or_else(|| "（纯媒体）".into());
-                self.reply(
-                    conv,
-                    &format!("🗑️ 已丢弃第 {n} 条（{removed_sender}）：{snippet}"),
-                    hint,
-                )
-                .await;
-                return;
             }
+            return;
         }
         // 列表视图。
         let list: Vec<(String, String)> = {
-            let map = self.queues.lock().await;
-            match map.get(&conv.0) {
+            let states = self.conv_states.lock().await;
+            match states.get(&conv.0).and_then(|cs| cs.queue.as_ref()) {
                 None => Vec::new(),
                 Some(q) => q
                     .iter()

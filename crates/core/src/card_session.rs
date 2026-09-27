@@ -20,7 +20,6 @@
 //! agent 回复）。设计借鉴 lcab 的 `RunState + renderCard + update`，但 core 只产
 //! 平台无关的 [`OutboundCard`]，卡片 JSON 渲染由各 Platform 实现。
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -47,8 +46,10 @@ const MAX_THOUGHTS: usize = 10;
 /// W2-1：单条思考片段的字符截断上限（防超长推理占满卡片）。
 const THOUGHT_TRUNC_CHARS: usize = 400;
 
-/// P10：dispatcher 侧排队状态句柄的类型别名（patcher 每次 patch 拉取）。
-type QueuedHints = Arc<tokio::sync::Mutex<HashMap<String, QueuedHint>>>;
+/// P10/T18：dispatcher 侧 per-conv 状态表句柄（patcher 每次 patch 拉取该
+/// conv 的排队提示快照；原为独立的 queued_hints 表句柄，T18 并入 ConvState
+/// 单表后共享整表——锁内只做 get + clone 的纯内存快照）。
+type QueuedHints = crate::dispatch::ConvStates;
 
 /// P10：本会话的排队状态（运行中入队的消息摘要）。入队路径写、取批/中断清、
 /// CardSession 每次 patch 拉取（活动期随 chunk 刷新 footer 的排队提示）。
@@ -525,19 +526,19 @@ async fn patcher_task(
 /// 仅由 patcher 任务调用（单任务串行 ⇒ msg_id / last_patch 等句柄与时钟字段
 /// 无并发写）。**任何时刻不得持有 state 锁**（platform/store 的 await 期间
 /// chunk 消费方仍需写入累积字段——消费路径绝不能被平台 IO 阻塞，这正是
-/// P1-1 的核心约束；clippy::await_holding_lock 把关）。锁序：先 queued_hints
-/// （短暂持有）后 state，无嵌套。
+/// P1-1 的核心约束；clippy::await_holding_lock 把关）。锁序：先 ConvState
+/// 表（短暂持有，取排队提示快照）后 state，无嵌套。
 async fn dispatch_patch(env: &PatchEnv, state: &Mutex<CardState>, terminal: CardTerminal) -> bool {
     // T11：patch 全路径计时（平台 send/update + live_cards 登记落库）——消费侧
     // 可观测指标 imagent_card_patch_seconds 的唯一观测点。函数单出口，结尾 observe。
     let patch_started = Instant::now();
-    // ① 快照：排队提示 + 卡片内容（state 短临界区，无 await）。
+    // ① 快照：排队提示（ConvState 表短临界区，无 await）+ 卡片内容（state）。
     let queued = env
         .queued_hints
         .lock()
         .await
         .get(&env.conv.0)
-        .and_then(queued_hint_display);
+        .and_then(|cs| cs.queued_hint_display());
     let (card, msg_id) = {
         let s = state.lock().unwrap();
         let card = OutboundCard {

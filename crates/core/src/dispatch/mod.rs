@@ -369,7 +369,7 @@ fn is_p2p_conv(conv: &str) -> bool {
 /// 拼接；sender 与 reply_hint 取首条（各消息入队前已各自过白名单）。
 /// P10-④：批内出现**多个不同发送者**（群聊多人）时给各段加说话人标注——
 /// 合并不再丢失归属，agent 能区分谁说了哪句；单人连发保持原样（不加噪音）。
-/// 排队元素（见 [`Dispatcher::queues`] 字段文档）。
+/// 排队元素（见 [`ConvState::queue`] 字段文档）。
 #[derive(Debug)]
 struct QueuedMsg {
     /// queued_messages.rowid；0 = 持久化失败（仅内存，崩溃即丢——与旧无持久化
@@ -457,8 +457,9 @@ struct ResumeEntry {
     cwd: Option<String>,
 }
 
-/// /resume 列表缓存（D7）：key = (conv, sender)，值带写入时刻（TTL 惰性过期）。
-type ResumeCache = HashMap<(String, String), (Instant, Vec<ResumeEntry>)>;
+/// /resume 列表缓存（D7）：key = sender（conv 由 [`ConvState`] 表键承载——
+/// T18 并入单表前为 (conv, sender) 二元组），值带写入时刻（TTL 惰性过期）。
+type ResumeCache = HashMap<String, (Instant, Vec<ResumeEntry>)>;
 
 /// T11（v13 #4）：轮次内部进度快照（/tasks 面板数据源）。round 消费循环在
 /// TodoList / ToolUse chunk 处更新（std Mutex 短临界区，零 IO——chunk 消费路径
@@ -479,7 +480,7 @@ pub(super) struct RoundSnapshot {
 /// - `abort`：/stop 中断用（原裸 AbortHandle）；
 /// - `steer`：运行中转向通道（control 通道 CLI 支持；None = 不支持，消息排队）；
 /// - `snapshot`：T11 轮次进度共享快照（消费循环写、/tasks 读）。
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(super) struct RoundHandle {
     pub(super) abort: tokio::task::AbortHandle,
     pub(super) steer: Option<tokio::sync::mpsc::Sender<String>>,
@@ -553,26 +554,9 @@ pub struct Dispatcher {
     cot_detail: Arc<RwLock<CotDetail>>,
     /// 进程启动时刻（`/status` uptime 用）。
     started_at: Instant,
-    /// per-conv 在飞 agent 任务注册表（`/stop` 中断用）：conv_id → join task 的
-    /// AbortHandle。同 conv 轮次串行（conv 锁保证），key 插入/移除无 ABA。
-    running: Mutex<HashMap<String, RoundHandle>>,
-    /// per-conv 批处理队列：runner 在飞期间到达的消息暂存（entry 存在 = runner
-    /// 活跃；runner 取空交还时移除）。入队与取批共用一把锁，杜绝 lost-wakeup。
-    /// 排队元素：内存消息 + 持久化行 rowid（0 = 落行失败，无崩溃保护）。
-    /// v1.18 review：取批/撤回/drop 按 rowid 精确删行，替代整 conv DELETE
-    ///（防连带删掉并发入队的新消息的行）。
-    queues: Mutex<HashMap<String, Vec<QueuedMsg>>>,
-    /// P10：per-conv 排队状态（count + 最新摘要）——入队路径写、取批//stop 清、
-    /// CardSession 每次 patch 拉取渲染进 Running footer（状态上卡，不发消息）。
-    queued_hints: Arc<Mutex<HashMap<String, crate::card_session::QueuedHint>>>,
     /// 快捷命令（v1.17）：config `shortcuts`（name → prompt 模板，`$args`
     /// 占位）。main 启动/SIGHUP 经 [`Dispatcher::set_shortcuts`] 注入。
     shortcuts: Arc<std::sync::RwLock<HashMap<String, String>>>,
-    /// P0-4（v1.17）：per-conv 停止标记（conv → 设置时刻）。/stop 在批窗口/
-    /// 注册间隙查无在飞句柄、但 conv 锁被 runner 持有时设置；runner 循环取批
-    /// 后起跑前检查，命中（60s 内）则本批不启动。过期兜底防 stray /stop 误杀
-    /// 之后不相关的轮次。
-    stop_requested: Arc<Mutex<HashMap<String, i64>>>,
     /// v1.18 review：per-sender 成本上限提示的最近通知时刻（W4-1 刷屏去重）。
     /// 超限 sender 的每条入站消息（含 cron 合成的每分钟一条）此前都回一条
     /// 「用量已达上限」——cron 场景一天刷 1440 条。1 小时内同 sender 只提示
@@ -582,23 +566,10 @@ pub struct Dispatcher {
     /// 手法）——队列打满时每条超限消息都回一条 IM 告警，webhook/cron 洪泛下
     /// 刷屏且可能触发平台频控；1 小时内同 conv 只提示一次（丢弃照常）。
     queue_cap_notice_last: Mutex<HashMap<String, i64>>,
-    /// v1.21 review：自动压缩失败的 per-conv 退避——压缩持续失败（如摘要生成
-    /// 报错）时每个水位超阈的成功轮都重试并发两张卡 + 跑一次完整 agent，
-    /// 失败后 1 小时内不再自动尝试（手动 /compact 不受限）。
-    compact_fail_last: Mutex<HashMap<String, i64>>,
-    /// per-conv 最近一次 `/resume` 渲染的列表（P4-11）：序号选择取缓存，
-    /// 防两次调用间本机会话 mtime 变化导致错位；S-16：选中不移除条目（防序号
-    /// 前移错位），陈旧由 D7 的 TTL 惰性过期兜底。
-    /// D7：key 为 (conv, sender)——群聊多用户共用 conv，仅按 conv 缓存会互相
-    /// 覆盖错位；值带写入时刻，超过 [`RESUME_CACHE_TTL`] 惰性过期。
-    resume_cache: Mutex<ResumeCache>,
-    /// P6-9：per-conv 空闲看门狗覆盖（`/timeout`）——`Some(ZERO)` = 本会话关闭；
-    /// 无条目 = 跟随全局 `agent_idle_timeout`。进程内（会话级旋钮，不落盘）。
-    idle_overrides: Mutex<HashMap<String, Duration>>,
-    /// Wave B-7：per-conv COT 档位覆盖（`/config cot`，白名单用户可改自己会话）。
-    /// 无条目 = 跟随全局 `cot_detail`（`/config cot_detail`，admin）。进程内
-    /// （会话级偏好，不落盘——与 idle_overrides 同姿态）。
-    cot_overrides: Mutex<HashMap<String, CotDetail>>,
+    /// T18：per-conv 状态单表（结构、锁纪律与 LRU 驱逐见 [`ConvState`]）。
+    /// tokio Mutex 对齐既有 per-conv map 风格（原 `running`/`queues` 等同款）；
+    /// 临界区纯内存读写，无同步上下文访问点（std Mutex 换锁收益不存在）。
+    conv_states: ConvStates,
     /// Wave B-4：quiet_hours 原文（config 注入，仅 /config 展示用——降级判定在
     /// 各平台实现侧，core 不重复实现时区逻辑）。
     quiet_hours_raw: RwLock<Option<String>>,
@@ -615,8 +586,6 @@ pub struct Dispatcher {
     /// 管理员 sender（可 /allow /config /perm /admin）。S2：空 = **无人**是
     /// 管理员（IM 内管理命令全部不可用，须通过 CLI / setup 配置 admin_senders）。
     admin_senders: Arc<RwLock<Vec<String>>>,
-    /// D2：per-conv 最近一次「存在待审批项」提示的时刻（PENDING_HINT_DEDUPE 去重）。
-    pending_hint_last: Mutex<HashMap<String, Instant>>,
     /// W3-3：per-conv 最近一轮的用户 prompt（/retry 与失败快捷操作卡用）。
     /// 上限 500 条（超量整体清空——粗防泄漏，语义无损）。
     /// 优雅退出信号（P1-5）：收到 SIGINT/SIGTERM 后 cancel，run() 停止收新消息并
@@ -636,11 +605,6 @@ pub struct Dispatcher {
     /// 排队。SIGHUP 热改 = 重建信号量（见 [`Self::reload_max_concurrent_rounds`]，
     /// 只影响后续 acquire；在飞 permit 与已排队等待者不受影响）。
     round_gate: parking_lot::RwLock<RoundGate>,
-    /// P2（code-review v13）：per-conv 当前轮次发起者（审批锚定用）。轮次起跑
-    /// 时与 `note_round_initiator` 同步记录，run_agent_round 统一收尾清除；
-    /// /compact 自动轮在轮次收尾后触发，届时已清除（锚定回退 None，宁漏拒
-    /// 不误拒）。socket/hook 侧注册 pending 时据此锚定发起者。
-    round_initiators: RoundInitiators,
     /// T4（P1-3）：「allowed_tools 非全量 × 后端不支持逐工具白名单」告警的
     /// 去重状态——最近一次评估时的工具清单签名（同签名不重复 warn，配置
     /// 变更后再进入告警态重新告警）。见 [`Self::capability_surface_warnings`]。
@@ -671,8 +635,121 @@ impl RoundGate {
     }
 }
 
-/// per-conv 轮次发起者表（conv_id → sender id）。
-type RoundInitiators = Arc<Mutex<HashMap<String, String>>>;
+/// T18（v13 还债批 #1，结构性）：per-conv 状态单表。
+///
+/// 此前 Dispatcher 持有 ~10 张按 conv 键控的独立 map（排队队列 / 排队提示 /
+/// 在飞轮次 / 停止标记 / 空闲看门狗覆盖 / COT 覆盖 / 待审批提示去重 / 压缩
+/// 失败退避 / 轮次发起者 / resume 缓存），分散加锁、靠注释维持「锁序
+/// queues→{running,hints} 单向」纪律。收敛为单表后：一把锁、临界区内**零
+/// await 零 IO**（纯内存读写，见 [`Dispatcher::with_conv`]）；话题群 conv 无限
+/// 基数下的慢泄漏（P3-5）由 LRU 驱逐兜底（豁免矩阵见
+/// [`Dispatcher::evict_idle_conv_states`]）。跨 await 的复合操作沿用
+/// 「锁内快照 → 锁外决策/IO → 锁内回写」模式（S-3/S-4 的复查手法）。
+///
+/// 十张 map 已全部并入（语义与原独立 map 完全一致，见各字段注释；迁移批次
+/// 见 CHANGELOG T18）。`conv_locks` 是串行化原语不是状态，保持独立。
+#[derive(Debug)]
+pub(crate) struct ConvState {
+    /// P6-9：空闲看门狗覆盖（原 `idle_overrides` map）——`Some(ZERO)` = 本会话
+    /// 关闭；None = 跟随全局 `agent_idle_timeout`。进程内（会话级旋钮，不落盘）。
+    idle_override: Option<Duration>,
+    /// Wave B-7：COT 档位覆盖（原 `cot_overrides` map，`/config cot`，白名单
+    /// 用户可改自己会话）——None = 跟随全局 `cot_detail`（`/config cot_detail`，
+    /// admin）。进程内（会话级偏好，不落盘）。
+    cot_override: Option<CotDetail>,
+    /// D2：最近一次「存在待审批项」提示的时刻（原 `pending_hint_last` map，
+    /// [`PENDING_HINT_DEDUPE`] 去重）。
+    pending_hint_last: Option<Instant>,
+    /// v1.21 review：自动压缩失败的退避起点（原 `compact_fail_last` map，
+    /// epoch 秒）——失败后 1 小时内不再自动尝试（手动 /compact 不受限）。
+    compact_fail_last: Option<i64>,
+    /// per-conv `/resume` 列表缓存（原 `resume_cache` map，P4-11/D7）：key =
+    /// sender（群聊多用户共用 conv，仅按 conv 缓存会互相覆盖错位）；值带写入
+    /// 时刻，超 [`RESUME_CACHE_TTL`] 惰性过期；S-16：选中不移除条目（防序号
+    /// 前移错位）。
+    resume_cache: ResumeCache,
+    /// P0-4（v1.17）：停止标记（原 `stop_requested` map，epoch 秒）。/stop 在
+    /// 批窗口/注册间隙查无在飞句柄、但 conv 锁被 runner 持有时设置；runner
+    /// 循环取批后起跑前检查，命中（60s 内）则本批不启动；轮次起跑前按
+    /// 「起点水位之后新增」复查。过期兜底防 stray /stop 误杀之后不相关的轮次。
+    stop_requested: Option<i64>,
+    /// P2（code-review v13）：当前轮次发起者（原 `round_initiators` map，sender
+    /// id）——审批锚定用。轮次起跑时与 `note_round_initiator` 同步记录，
+    /// run_agent_round 统一收尾清除；/compact 自动轮在轮次收尾后触发，届时
+    /// 已清除（锚定回退 None，宁漏拒不误拒）。socket/hook 侧注册 pending 时
+    /// 据此锚定发起者（跨任务经 [`ConvStates`] 句柄共享本表）。
+    round_initiator: Option<String>,
+    /// P10：排队状态（原 `queued_hints` map，count + 最新摘要 + steered 注入
+    /// 计数）——入队路径写、取批//stop 清、CardSession 每次 patch 拉取渲染进
+    /// Running footer（状态上卡，不发消息；patcher 经 [`ConvStates`] 句柄
+    /// 共享读取）。
+    queued_hint: Option<crate::card_session::QueuedHint>,
+    /// 在飞 agent 轮次句柄（原 `running` map，`/stop` 中断用；/compact 摘要
+    /// 轮同样注册）。同 conv 轮次串行（conv 锁保证），插入/移除无 ABA。
+    running: Option<RoundHandle>,
+    /// 批处理队列（原 `queues` map）——runner 在飞期间到达的消息暂存。
+    /// **Some = runner 活跃**（含取批后的空 Vec：L4 留空不删语义），None =
+    /// 无 runner。入队与取批同锁原子判定，杜绝 lost-wakeup。排队元素：内存
+    /// 消息 + 持久化行 rowid（0 = 落行失败，无崩溃保护）。v1.18 review：
+    /// 取批/撤回/drop 按 rowid 精确删行，替代整 conv DELETE（防连带删掉并发
+    /// 入队的新消息的行）。
+    queue: Option<Vec<QueuedMsg>>,
+    /// LRU 驱逐依据：最近一次**写**该 conv 状态的时刻。读路径不续命——活跃
+    /// conv（在飞轮 / 排队）本就由豁免矩阵保护，此字段只需刻画「静默会话的
+    /// 陈旧度」。
+    last_touched: Instant,
+}
+
+impl Default for ConvState {
+    fn default() -> Self {
+        Self {
+            idle_override: None,
+            cot_override: None,
+            pending_hint_last: None,
+            compact_fail_last: None,
+            resume_cache: HashMap::new(),
+            stop_requested: None,
+            round_initiator: None,
+            queued_hint: None,
+            running: None,
+            queue: None,
+            last_touched: Instant::now(),
+        }
+    }
+}
+
+impl ConvState {
+    /// CardSession patcher 的排队提示展示快照（P10：footer「排队 N 条 / 已
+    /// 注入 N 条」）。跨模块只读入口——`queued_hint` 字段本身不外露。
+    pub(crate) fn queued_hint_display(&self) -> Option<String> {
+        self.queued_hint
+            .as_ref()
+            .and_then(crate::card_session::queued_hint_display)
+    }
+
+    /// 全字段空（无任何有效状态）——回到此形态即删 entry：表不因空 entry 累积，
+    /// 驱逐语义也更精确（「此 conv 无内存状态」等价重启前的干净形态）。
+    fn is_empty(&self) -> bool {
+        self.idle_override.is_none()
+            && self.cot_override.is_none()
+            && self.pending_hint_last.is_none()
+            && self.compact_fail_last.is_none()
+            && self.resume_cache.is_empty()
+            && self.stop_requested.is_none()
+            && self.round_initiator.is_none()
+            && self.queued_hint.is_none()
+            && self.running.is_none()
+            && self.queue.is_none()
+    }
+}
+
+/// per-conv 状态表句柄：Dispatcher 持有；需要跨任务共享的读取方（CardSession
+/// patcher 的排队提示快照、权限 socket 任务的发起者锚定）经 Arc clone 拿同表。
+pub(crate) type ConvStates = Arc<Mutex<HashMap<String, ConvState>>>;
+
+/// T18：per-conv 状态表粗上限（housekeeping 60s 节拍 LRU 驱逐；远超单部署
+/// 常见会话数，对齐 feishu 侧 PER_CONV_MAP_CAP 的量级取舍）。
+const CONV_STATES_CAP: usize = 512;
 
 /// T4（P1-3）：「allowed_tools 在该后端不生效」的告警/回执文案（None = 该
 /// 组合无需提示）。warn 与展示共用同一份事实文案，避免两处口径漂移。
@@ -801,18 +878,10 @@ impl Dispatcher {
             sender_cost_limit: budgets.sender_daily_cost_limit_usd,
             cot_detail: Arc::new(RwLock::new(cot_detail)),
             started_at: Instant::now(),
-            running: Mutex::new(HashMap::new()),
-            queues: Mutex::new(HashMap::new()),
-            queued_hints: Arc::new(Mutex::new(HashMap::new())),
-            stop_requested: Arc::new(Mutex::new(HashMap::new())),
             budget_notice_last: Mutex::new(HashMap::new()),
             queue_cap_notice_last: Mutex::new(HashMap::new()),
-            compact_fail_last: Mutex::new(HashMap::new()),
             shortcuts: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            resume_cache: Mutex::new(HashMap::new()),
-            pending_hint_last: Mutex::new(HashMap::new()),
-            idle_overrides: Mutex::new(HashMap::new()),
-            cot_overrides: Mutex::new(HashMap::new()),
+            conv_states: Arc::new(Mutex::new(HashMap::new())),
             quiet_hours_raw: RwLock::new(None),
             stranger_mention_hint: RwLock::new(false),
             stranger_p2p_hint: RwLock::new(true),
@@ -823,7 +892,6 @@ impl Dispatcher {
             tasks: Arc::new(Mutex::new(tokio::task::JoinSet::new())),
             socket_spawned: std::sync::atomic::AtomicBool::new(false),
             round_gate: parking_lot::RwLock::new(RoundGate::new(budgets.max_concurrent_rounds)),
-            round_initiators: Arc::new(Mutex::new(HashMap::new())),
             allowlist_warn_state: parking_lot::Mutex::new(None),
             perm_mode_warn_state: parking_lot::Mutex::new(None),
             webhook_exposure: parking_lot::RwLock::new(WebhookExposure::default()),
@@ -870,10 +938,94 @@ impl Dispatcher {
         *self.quiet_hours_raw.write() = raw;
     }
 
+    // ---- T18：ConvState 单表访问入口 --------------------------------------
+    // 纪律：闭包临界区内**零 await、零平台/存储调用**（纯内存读写）；需要跨
+    // await 的复合操作用显式 lock → 快照 → drop → IO → 回写（见
+    // enqueue_or_become_runner / take_batch_after_window 的 S-3/S-4 模式）。
+
+    /// 取该 conv 的可变状态（无则创建）并刷新 last_touched；闭包返回后若状态
+    /// 回到全空（[`ConvState::is_empty`]）则删 entry（表不积空 entry）。写路径
+    /// 入口。
+    async fn with_conv<R>(&self, conv: &str, f: impl FnOnce(&mut ConvState) -> R) -> R {
+        let mut map = self.conv_states.lock().await;
+        let cs = map.entry(conv.to_string()).or_default();
+        cs.last_touched = Instant::now();
+        let r = f(cs);
+        if cs.is_empty() {
+            map.remove(conv);
+        }
+        r
+    }
+
+    /// 只读窥视（无则 None；不建 entry、不触碰 last_touched——读路径不给 LRU
+    /// 续命，活跃性由写路径与驱逐豁免矩阵承载）。读路径入口。
+    async fn peek_conv<R>(&self, conv: &str, f: impl FnOnce(Option<&ConvState>) -> R) -> R {
+        let map = self.conv_states.lock().await;
+        f(map.get(conv))
+    }
+
+    /// T18：per-conv 状态表 LRU 驱逐（run() 的 housekeeping 60s 节拍调用；
+    /// 测试直调小上限验证豁免矩阵）。超 `cap` 按 last_touched 驱逐最久未活跃
+    /// 的会话。**豁免**（不驱逐）：
+    /// ① 有在飞轮（running）——句柄丢失会让 /stop 失效；
+    /// ② runner 活跃（queue 为 Some，含取批后的空 Vec）——队列本体丢失会
+    ///    改变批处理语义（在内存排队、行还在 store 的消息将等不到下一轮）；
+    /// ③ 有挂起审批（PermissionRouter pending）——对齐 feishu 侧 ConvState
+    ///    「挂起审批不动」的豁免语义（本表只丢提示去重时间戳，但驱逐活跃
+    ///    等待中的会话徒增噪音）。
+    /// router 的 pending 查询是 async（临界区内不可调用），故三段式：锁内
+    /// 快照候选 → 锁外查 router → 锁内复核（last_touched 未变且仍非豁免）
+    /// 再驱逐。被驱逐 conv 再来消息时从干净状态开始（等价重启语义：内存
+    /// 覆盖项丢失；持久化状态——workdir / session 映射 / 排队消息行——全在
+    /// store，不受影响）。返回驱逐条数。
+    pub(crate) async fn evict_idle_conv_states(&self, cap: usize) -> usize {
+        // ① 锁内快照候选（当前批次内存可判定的非豁免条目）。
+        let candidates: Vec<(Instant, String)> = {
+            let map = self.conv_states.lock().await;
+            if map.len() <= cap {
+                return 0;
+            }
+            map.iter()
+                .filter(|(_, cs)| cs.running.is_none() && cs.queue.is_none())
+                .map(|(k, cs)| (cs.last_touched, k.clone()))
+                .collect()
+        };
+        // ② 锁外查 router pending——挂起审批的会话豁免。
+        let mut evictable: Vec<(Instant, String)> = Vec::with_capacity(candidates.len());
+        for (t, conv) in candidates {
+            if !self.router.has_pending(&conv).await {
+                evictable.push((t, conv));
+            }
+        }
+        evictable.sort_unstable();
+        // ③ 锁内复核 + 驱逐：逐条核对 last_touched 未变（窗口期被写路径触碰
+        // 者跳过，下轮再来），驱逐到表长 ≤ cap。
+        let mut removed = 0usize;
+        let mut map = self.conv_states.lock().await;
+        let mut need = map.len().saturating_sub(cap);
+        for (t, conv) in evictable {
+            if need == 0 {
+                break;
+            }
+            let still_idle = map.get(&conv).is_some_and(|cs| {
+                cs.last_touched == t && cs.running.is_none() && cs.queue.is_none()
+            });
+            if still_idle {
+                map.remove(&conv);
+                removed += 1;
+                need -= 1;
+            }
+        }
+        removed
+    }
+
     /// P6-9：该会话的空闲看门狗——`/timeout` 覆盖优先（ZERO=关），否则全局值。
     async fn idle_timeout_for(&self, conv: &str) -> Duration {
-        if let Some(d) = self.idle_overrides.lock().await.get(conv) {
-            return *d;
+        if let Some(d) = self
+            .peek_conv(conv, |cs| cs.and_then(|c| c.idle_override))
+            .await
+        {
+            return d;
         }
         *self.agent_idle_timeout.read()
     }
@@ -881,8 +1033,11 @@ impl Dispatcher {
     /// Wave B-7：该会话的 COT 档位——`/config cot` 覆盖优先，否则全局值
     /// （`/config cot_detail`，admin）。每轮读取，热改对下一轮生效。
     async fn cot_for(&self, conv: &str) -> CotDetail {
-        if let Some(d) = self.cot_overrides.lock().await.get(conv) {
-            return *d;
+        if let Some(d) = self
+            .peek_conv(conv, |cs| cs.and_then(|c| c.cot_override))
+            .await
+        {
+            return d;
         }
         *self.cot_detail.read()
     }
@@ -1192,14 +1347,15 @@ impl Dispatcher {
         // Wave B-11：超时分支落 timeout 审计（审批统计聚合数据源）。
         let store = self.store.clone();
         // P2（v13）：发起者锚定——hook 触发于 backend.run 期间，取该 conv 当前
-        // 轮次发起者（run_round_inner 与 note_round_initiator 同步写入）。
-        let round_initiators = self.round_initiators.clone();
+        // 轮次发起者（run_round_inner 与 note_round_initiator 同步写入；T18 起
+        // 活在 ConvState 单表，hook 经 [`ConvStates`] 句柄共享读取）。
+        let conv_states = self.conv_states.clone();
         Arc::new(move |ask: crate::backend::ImPermissionAsk| {
             let platform = platform.clone();
             let router = router.clone();
             let approval_tools = approval_tools.clone();
             let store = store.clone();
-            let round_initiators = round_initiators.clone();
+            let conv_states = conv_states.clone();
             Box::pin(async move {
                 // 审批集外直接放行（空集 = 全部过审），与 socket 路径口径一致。
                 if !crate::permission::needs_approval(&approval_tools.read(), &ask.tool_name) {
@@ -1236,7 +1392,11 @@ impl Dispatcher {
                 let conv = ConvId(ask.conv_id.clone());
                 // P2（v13）：发起者锚定——无在飞轮次记录（compact 自动轮等边缘
                 // 场景）时为 None，维持既有不比对语义。
-                let initiator = round_initiators.lock().await.get(&ask.conv_id).cloned();
+                let initiator = conv_states
+                    .lock()
+                    .await
+                    .get(&ask.conv_id)
+                    .and_then(|cs| cs.round_initiator.clone());
                 // D5：先 register 占位再发卡（防极速按钮回调先于 register 到达）。
                 let rx = router
                     .register(
@@ -1532,6 +1692,36 @@ impl Dispatcher {
             });
         }
 
+        // T18：per-conv 状态表 housekeeping——60s 节拍 LRU 驱逐：超
+        // [`CONV_STATES_CAP`] 按 last_touched 驱逐最久未活跃会话（挂起审批/
+        // 在飞轮/排队中的 conv 豁免，见 [`Self::evict_idle_conv_states`]）。
+        // 话题群 conv 无限基数下 per-conv 内存状态的慢泄漏（P3-5）由此收口。
+        {
+            let disp = self.clone();
+            let shutdown = self.shutdown.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => break,
+                        _ = tick.tick() => {
+                            let evicted = disp.evict_idle_conv_states(CONV_STATES_CAP).await;
+                            if evicted > 0 {
+                                info!(
+                                    target: "imagent::core",
+                                    evicted,
+                                    "per-conv 状态表超上限，LRU 驱逐 {evicted} 个最久未活跃会话"
+                                );
+                            }
+                        }
+                    }
+                }
+                info!(target: "imagent::core", "per-conv 状态表 housekeeping 退出");
+            });
+        }
+
         // recv 失败退避（防 client 异常退出后 dispatcher 忙循环刷屏）。
         let mut recv_backoff = std::time::Duration::from_secs(1);
         const RECV_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1726,13 +1916,18 @@ impl Dispatcher {
                             // 提示发送同样 spawn（send_text 含退避重试，见上）。
                             if let Some(initiator) = initiator_block {
                                 let now = Instant::now();
-                                let mut last = self.pending_hint_last.lock().await;
-                                let due = last
-                                    .get(&conv_id)
-                                    .is_none_or(|t| now.duration_since(*t) >= PENDING_HINT_DEDUPE);
+                                let due = self
+                                    .with_conv(&conv_id, |cs| {
+                                        let due = cs
+                                            .pending_hint_last
+                                            .is_none_or(|t| now.duration_since(t) >= PENDING_HINT_DEDUPE);
+                                        if due {
+                                            cs.pending_hint_last = Some(now);
+                                        }
+                                        due
+                                    })
+                                    .await;
                                 if due {
-                                    last.insert(conv_id.clone(), now);
-                                    drop(last);
                                     let text = format!(
                                         "⏳ 该询问由 {initiator} 发起，请由其本人或管理员答复"
                                     );
@@ -1748,15 +1943,20 @@ impl Dispatcher {
                                 // 用户回复询问卡（或 y/n），避免静默落进 agent 批处理
                                 // 造成「发了没人理」的困惑；60s 窗口去重防刷屏。
                                 let now = Instant::now();
-                                let mut last = self.pending_hint_last.lock().await;
-                                let due = last
-                                    .get(&conv_id)
-                                    .is_none_or(|t| now.duration_since(*t) >= PENDING_HINT_DEDUPE);
+                                let due = self
+                                    .with_conv(&conv_id, |cs| {
+                                        let due = cs
+                                            .pending_hint_last
+                                            .is_none_or(|t| now.duration_since(t) >= PENDING_HINT_DEDUPE);
+                                        if due {
+                                            // 去重窗口状态先落（spawn 前）——防慢
+                                            // 发送期间并发消息重复提示。
+                                            cs.pending_hint_last = Some(now);
+                                        }
+                                        due
+                                    })
+                                    .await;
                                 if due {
-                                    // 去重窗口状态先落（spawn 前）——防慢发送期间
-                                    // 并发消息重复提示。
-                                    last.insert(conv_id.clone(), now);
-                                    drop(last);
                                     let n = self.router.pending_count(&conv_id).await;
                                     let text = format!(
                                         "⚠️ 当前有 {n} 项待审批/待回答的询问，请回复对应询问卡（多待决时需引用对应卡片），或直接回复 y / n 表态（始终允许可回复 always）。"
@@ -1844,7 +2044,9 @@ impl Dispatcher {
         hint: &ReplyHint,
         cmd: &str,
     ) -> Arc<Mutex<()>> {
-        let busy = self.running.lock().await.contains_key(conv);
+        let busy = self
+            .peek_conv(conv, |cs| cs.is_some_and(|c| c.running.is_some()))
+            .await;
         if busy {
             self.reply(
                 &ConvId(conv.to_string()),
@@ -1872,19 +2074,46 @@ impl Dispatcher {
     }
 
     /// 普通消息入队（P4-2 批处理）：runner 在飞 → push pending 返回 false（本 task
-    /// 即返，消息将在下一轮合并）；无 runner → 建 entry 返回 true（调用方成为
-    /// runner）。入队/成为 runner 在同一把 queues 锁内原子判定——与
+    /// 即返，消息将在下一轮合并）；无 runner → 建 queue 返回 true（调用方成为
+    /// runner）。入队/成为 runner 在同一 ConvState 临界区内原子判定——与
     /// [`take_batch_after_window`](Self::take_batch_after_window) 的取批/交还互斥，
     /// 杜绝「消息卡在无人认领的队列」（lost-wakeup）。超上限回告警并丢弃。
+    /// T18：原 queues/running/queued_hints 三锁协同（锁序 queues→{running,hints}
+    /// 单向）收敛为单表单锁；跨 await 的复合操作保持「锁内快照 → 锁外 IO →
+    /// 锁内回写 → 复查」结构（S-3/S-4 手法）。
     async fn enqueue_or_become_runner(
         &self,
         conv: &str,
         msg: InboundMessage,
         hint: &ReplyHint,
     ) -> bool {
-        let mut map = self.queues.lock().await;
-        match map.get_mut(conv) {
-            Some(pending) => {
+        /// 锁内判定的入队动作（临界区零 IO，全部副作用移到锁外执行）。
+        enum EnqueuePlan {
+            /// 已 steering 注入当轮（无需排队）。
+            Steered,
+            /// 队列打满，本条丢弃（告警去重在锁外）。
+            QueueFull,
+            /// runner 在飞，本条入队（先落行再回写）。
+            QueuePending { queued_mid: Option<String> },
+            /// 无 runner，本条成为首批（先落行再回写）。
+            BecomeRunner { queued_mid: Option<String> },
+        }
+        // ① 锁内判定 + steering 尝试（try_send 非阻塞、纯内存）。原
+        // queues→running 嵌套锁在单表内同临界区消解：注入判定与 steered
+        // 计数原子落地（旧版两锁之间的窗口会丢 footer 计数）。
+        let plan = {
+            let mut states = self.conv_states.lock().await;
+            let runner_active = states.get(conv).is_some_and(|cs| cs.queue.is_some());
+            if !runner_active {
+                // v1.18 review：本条将成为 runner 的首批——同样先落行再入队
+                //（此前该分支完全绕过持久化，是排队崩溃保护的漏洞）。
+                let queued_mid = msg.source_msg_id.clone().filter(|m| m.starts_with("om_"));
+                drop(states);
+                EnqueuePlan::BecomeRunner { queued_mid }
+            } else {
+                let cs = states
+                    .get_mut(conv)
+                    .expect("上方 is_some_and 已判定 entry 在");
                 // steering（v1.17，实验校准 2026-09-01）：运行中到达的**文本**
                 // 消息直接注入当轮 stdin——CLI 在下个工具边界交付并改道；连发
                 // 多条由 CLI 自动合并（无需自家防抖）。媒体消息走不了 stdin、
@@ -1893,131 +2122,132 @@ impl Dispatcher {
                 // v1.21 review：cron/webhook 合成消息（no_steer）不走本分支——
                 // 定时任务须独立轮次（可审计/可 /stop），且 steering 注入无
                 // 持久化兜底，轮恰收尾即丢。
+                let mut steered = false;
                 if !msg.no_steer && msg.media.is_empty() && msg.control.is_none() {
                     if let Some(text) = msg.text.as_deref().map(str::trim).filter(|t| !t.is_empty())
                     {
-                        let steered = {
-                            let running = self.running.lock().await;
-                            running
-                                .get(conv)
-                                .and_then(|h| h.steer.as_ref())
-                                .is_some_and(|tx| {
-                                    let labeled = if is_p2p_conv(conv) {
-                                        text.to_string()
-                                    } else {
-                                        format!("【{}】{text}", sender_label(&msg))
-                                    };
-                                    tx.try_send(labeled).is_ok()
-                                })
-                        };
-                        if steered {
-                            drop(map);
-                            // v1.23 说话人归属：群 conv 的转向注入带【标注】——
-                            // 此前排队路径有归属、转向路径没有，群聊中 B 插话
-                            // 纠正时 agent 无法分辨是 A 改口还是 B 的意见。p2p
-                            // 单人会话不加（唯一说话人，纯噪音）。
-                            // 卡面可见性（v1.18）：footer「已注入 N 条」——表情回执
-                            // 之外的二次确认，轮次结束清零（见 runner 循环）。
-                            self.queued_hints
-                                .lock()
-                                .await
-                                .entry(conv.to_string())
-                                .or_default()
-                                .steered += 1;
-                            // 回执：👀 打在消息上（与真排队 ⏳ 区分——steering 是
-                            // 「已注入当轮」，效果由 agent 在下个工具边界续写可见）。
-                            if let Some(mid) =
-                                msg.source_msg_id.clone().filter(|m| m.starts_with("om_"))
-                            {
-                                if let Err(e) = self
-                                    .platform
-                                    .react_to_message(
-                                        &ConvId(conv.to_string()),
-                                        &mid,
-                                        crate::MsgReaction::Processing,
-                                    )
-                                    .await
-                                {
-                                    tracing::debug!(target: "imagent::core", error = %e, "转向消息表情标注失败（不影响注入）");
-                                }
-                            }
-                            return false;
-                        }
+                        steered = cs
+                            .running
+                            .as_ref()
+                            .and_then(|h| h.steer.as_ref())
+                            .is_some_and(|tx| {
+                                let labeled = if is_p2p_conv(conv) {
+                                    text.to_string()
+                                } else {
+                                    format!("【{}】{text}", sender_label(&msg))
+                                };
+                                tx.try_send(labeled).is_ok()
+                            });
                     }
                 }
-                if pending.len() >= PENDING_QUEUE_CAP {
-                    drop(map);
-                    warn!(
-                        target: "imagent::core",
-                        conv_id = %conv,
-                        cap = PENDING_QUEUE_CAP,
-                        "排队消息超上限，丢弃本条"
-                    );
-                    // v1.21 review：告警按 conv 时间窗去重（同 budget_notice_last
-                    // 手法）——洪泛源（泄漏的 token / CI 重试风暴）下逐条回发
-                    // 会刷屏并可能触发平台频控。丢弃本身照常。
-                    let now = now_secs();
-                    let should_notice = {
-                        let mut last = self.queue_cap_notice_last.lock().await;
-                        let hit = last.get(conv).copied().unwrap_or(0) + 3600 <= now;
-                        if hit {
-                            last.retain(|_, ts| now - *ts < 7200);
-                            last.insert(conv.to_string(), now);
-                        }
-                        hit
-                    };
-                    if should_notice {
-                        self.reply(
+                if steered {
+                    // v1.23 说话人归属：群 conv 的转向注入带【标注】——此前排队
+                    // 路径有归属、转向路径没有，群聊中 B 插话纠正时 agent 无法
+                    // 分辨是 A 改口还是 B 的意见。p2p 单人会话不加（唯一说话
+                    // 人，纯噪音）。
+                    // 卡面可见性（v1.18）：footer「已注入 N 条」——表情回执之外
+                    // 的二次确认，轮次结束清零（见 runner 循环）。
+                    cs.last_touched = Instant::now();
+                    cs.queued_hint.get_or_insert_default().steered += 1;
+                    drop(states);
+                    EnqueuePlan::Steered
+                } else {
+                    let queue_len = cs.queue.as_ref().map_or(0, Vec::len);
+                    drop(states);
+                    if queue_len >= PENDING_QUEUE_CAP {
+                        EnqueuePlan::QueueFull
+                    } else {
+                        info!(target: "imagent::core", conv_id = %conv, "runner 在飞，消息入队待下一轮合并");
+                        // ⏳「稍等」打在入队消息上（runner 空闲后随批翻 OnIt→
+                        // 终态）；push 前 capture（msg 被 move 进队列）。
+                        let queued_mid = msg.source_msg_id.clone().filter(|m| m.starts_with("om_"));
+                        EnqueuePlan::QueuePending { queued_mid }
+                    }
+                }
+            }
+        };
+        match plan {
+            EnqueuePlan::Steered => {
+                // 回执：👀 打在消息上（与真排队 ⏳ 区分——steering 是「已注入
+                // 当轮」，效果由 agent 在下个工具边界续写可见）。
+                if let Some(mid) = msg.source_msg_id.clone().filter(|m| m.starts_with("om_")) {
+                    if let Err(e) = self
+                        .platform
+                        .react_to_message(
                             &ConvId(conv.to_string()),
-                            &format!("⚠️ 排队消息已达上限（{PENDING_QUEUE_CAP} 条），超限消息将被丢弃；如需立即处理请发 /stop 中断当前任务后重发"),
-                            hint,
+                            &mid,
+                            crate::MsgReaction::Processing,
                         )
-                        .await;
+                        .await
+                    {
+                        tracing::debug!(target: "imagent::core", error = %e, "转向消息表情标注失败（不影响注入）");
                     }
-                    return false;
                 }
-                info!(target: "imagent::core", conv_id = %conv, "runner 在飞，消息入队待下一轮合并");
-                // ⏳「稍等」打在入队消息上（runner 空闲后随批翻 OnIt→终态）；
-                // push 前 capture（msg 被 move 进队列）。
-                let queued_mid = msg.source_msg_id.clone().filter(|m| m.starts_with("om_"));
-                // S-3（P10）：锁内只做快照，persist（IO）与 hint/note 推送移到
-                // drop(map) 之后——不在 queues 锁持有期间 await。
-                drop(map);
+                false
+            }
+            EnqueuePlan::QueueFull => {
+                warn!(
+                    target: "imagent::core",
+                    conv_id = %conv,
+                    cap = PENDING_QUEUE_CAP,
+                    "排队消息超上限，丢弃本条"
+                );
+                // v1.21 review：告警按 conv 时间窗去重（同 budget_notice_last
+                // 手法）——洪泛源（泄漏的 token / CI 重试风暴）下逐条回发
+                // 会刷屏并可能触发平台频控。丢弃本身照常。
+                let now = now_secs();
+                let should_notice = {
+                    let mut last = self.queue_cap_notice_last.lock().await;
+                    let hit = last.get(conv).copied().unwrap_or(0) + 3600 <= now;
+                    if hit {
+                        last.retain(|_, ts| now - *ts < 7200);
+                        last.insert(conv.to_string(), now);
+                    }
+                    hit
+                };
+                if should_notice {
+                    self.reply(
+                        &ConvId(conv.to_string()),
+                        &format!("⚠️ 排队消息已达上限（{PENDING_QUEUE_CAP} 条），超限消息将被丢弃；如需立即处理请发 /stop 中断当前任务后重发"),
+                        hint,
+                    )
+                    .await;
+                }
+                false
+            }
+            EnqueuePlan::QueuePending { queued_mid } => {
                 // v1.18 review（排队持久化重做）：**先落行再入队**（rowid 随元素
                 // 进队列，取批按行精确删）。旧序（先入队后落行）在「落行完成前
                 // 被取批」时该行不属于批次 rowid 集合而残留，崩溃后会重放已处理
                 // 消息；新序崩溃在两步之间 = 行在内存无 → 重放执行（语义正确）。
-                // 代价：persist 期间 runner 可能取空并移除 entry → or_default 重建
-                //（无 runner 的空 entry 等下一条消息激活——批窗口静默使该窗口
-                // 实际不可达，与既有同款竞态一致）。
+                // 代价：persist 期间 runner 可能取空并交还身份 → 回写时重建
+                //（无 runner 的挂起 queue 等下一条消息激活——批窗口静默使该
+                // 窗口实际不可达，与既有同款竞态一致）。
                 let rowid = self.persist_queued(conv, queued_mid.as_deref(), &msg).await;
-                let mut map = self.queues.lock().await;
-                let pending = map.entry(conv.to_string()).or_default();
-                pending.push(QueuedMsg { rowid, msg });
-                let count = pending.len();
-                let latest = latest_snippet(&pending[pending.len() - 1].msg);
-                drop(map);
-                // P10：排队状态上卡——①②流式卡 footer 由 CardSession 下次 patch 拉取；
-                // ③审批等待是最静默的窗口（无 chunk，footer 不动），推送重渲染审批卡
-                // note 行（best-effort）。两者都是状态更新，不往消息流发任何东西。
-                let note = format!("⏳ 等待你审批 · 后面还排着 {count} 条消息");
-                // v1.18 review：合并写入而非整体替换——steered（「已注入 N 条」）
-                // 与 count/latest 属同一 footer 的两个字段，insert(..Default) 会把
-                // 运行中注入计数清零（注入 3 条后再排队 1 条 → footer 只显示排队，
-                // 注入可见性静默消失——恰是该特性最常见的混合使用流）。
-                self.queued_hints
-                    .lock()
-                    .await
-                    .entry(conv.to_string())
-                    .and_modify(|h| {
+                // ② 回写：push 与 hint 更新同临界区（原子——旧版两锁间隙靠下方
+                // 复查兜底，现为同锁天然一致，复查保留为 note IO 期间的兜底）。
+                let count = self
+                    .with_conv(conv, |cs| {
+                        let pending = cs.queue.get_or_insert_with(Vec::new);
+                        pending.push(QueuedMsg { rowid, msg });
+                        let count = pending.len();
+                        let latest = latest_snippet(&pending[pending.len() - 1].msg);
+                        // v1.18 review：合并写入而非整体替换——steered（「已注入
+                        // N 条」）与 count/latest 属同一 footer 的两个字段，整体
+                        // 替换会把运行中注入计数清零（注入 3 条后再排队 1 条 →
+                        // footer 只显示排队，注入可见性静默消失——恰是该特性最
+                        // 常见的混合使用流）。
+                        let h = cs.queued_hint.get_or_insert_default();
                         h.count = count;
-                        h.latest = latest.clone();
+                        h.latest = latest;
+                        count
                     })
-                    .or_insert(crate::card_session::QueuedHint {
-                        count,
-                        latest,
-                        ..Default::default()
-                    });
+                    .await;
+                // P10：排队状态上卡——①②流式卡 footer 由 CardSession 下次 patch
+                // 拉取；③审批等待是最静默的窗口（无 chunk，footer 不动），推送
+                // 重渲染审批卡 note 行（best-effort）。两者都是状态更新，不往
+                // 消息流发任何东西。
+                let note = format!("⏳ 等待你审批 · 后面还排着 {count} 条消息");
                 if let Err(e) = self
                     .platform
                     .note_queued_on_ask(&ConvId(conv.to_string()), &note, hint)
@@ -2038,37 +2268,36 @@ impl Dispatcher {
                         tracing::debug!(target: "imagent::core", error = %e, "排队消息表情标注失败（不影响排队）");
                     }
                 }
-                // S-3/S-4 竞态兜底：锁外写 hint 期间本批可能已被 runner 取走（queues
-                // entry 已移除、hint 已清）——复查一次，entry 不在则撤回 stale hint。
+                // S-3/S-4 竞态兜底：note/react IO 期间本批可能已被 runner 取走
+                //（queue 交还、hint 已清）——复查一次，队列不在/已空则撤回
+                // stale hint。
+                // L4（code-review v8）：取批留空 Vec 不交还——is_none() 守卫漏过
+                //「queue 在但已空」形态，stale hint 永不撤回。
                 if self
-                    .queues
-                    .lock()
+                    .peek_conv(conv, |cs| {
+                        cs.is_none_or(|c| c.queue.as_ref().is_none_or(|q| q.is_empty()))
+                    })
                     .await
-                    .get(conv)
-                    .is_none_or(|q| q.is_empty())
                 {
-                    // L4（code-review v8）：取批留空 Vec 不删 entry——原 is_none()
-                    // 守卫漏过「entry 在但已空」形态，stale hint 永不撤回。
-                    self.queued_hints.lock().await.remove(conv);
+                    self.with_conv(conv, |cs| cs.queued_hint = None).await;
                 }
                 false
             }
-            None => {
-                // v1.18 review：本条将成为 runner 的首批——同样先落行再入队
-                //（此前该分支完全绕过持久化，是排队崩溃保护的漏洞）。
-                drop(map);
-                let queued_mid = msg.source_msg_id.clone().filter(|m| m.starts_with("om_"));
+            EnqueuePlan::BecomeRunner { queued_mid } => {
                 let rowid = self.persist_queued(conv, queued_mid.as_deref(), &msg).await;
-                let mut map = self.queues.lock().await;
+                let mut states = self.conv_states.lock().await;
+                let cs = states.entry(conv.to_string()).or_default();
+                cs.last_touched = Instant::now();
                 let elem = QueuedMsg { rowid, msg };
-                match map.get_mut(conv) {
+                match cs.queue.as_mut() {
                     // persist 期间他条消息建了队：并入（两批经 take 原子取、
                     // 不相交，语义不变）。
                     Some(pending) => pending.push(elem),
                     None => {
-                        map.insert(conv.to_string(), vec![elem]);
+                        cs.queue = Some(vec![elem]);
                     }
                 }
+                drop(states);
                 true
             }
         }
@@ -2092,8 +2321,8 @@ impl Dispatcher {
         }
     }
 
-    /// runner 起跑前等批处理窗口，然后原子取批：pending 空 → 删 entry（交还 runner
-    /// 身份）返回 None；非空 → drain 返回 Some（窗口期入队的消息自然并入本批）。
+    /// runner 起跑前等批处理窗口，然后原子取批：pending 空 → 交还 runner 身份
+    /// 返回 None；非空 → drain 返回 Some（窗口期入队的消息自然并入本批）。
     ///
     /// W1-5（自适应窗口）：出批条件从「固定睡一个窗口」改为「**静默一个窗口**」
     /// ——连发未停（每窗口内仍有新消息入队）则继续等，硬上限（3× 窗口、封顶
@@ -2101,35 +2330,56 @@ impl Dispatcher {
     /// 窗口、无新消息即出批）；用户长连发时不再被窗口边界切成多轮。
     async fn take_batch_after_window(&self, conv: &str) -> Option<Vec<InboundMessage>> {
         let window = *self.batch_window.read();
+        let queue_len = || async {
+            self.peek_conv(conv, |cs| {
+                cs.map_or(0, |c| c.queue.as_ref().map_or(0, Vec::len))
+            })
+            .await
+        };
         if !window.is_zero() {
             const TOTAL_CAP_MS: u64 = 10_000;
             let cap = window
                 .saturating_mul(3)
                 .min(Duration::from_millis(TOTAL_CAP_MS));
             let started = Instant::now();
-            let mut last_len = self.queues.lock().await.get(conv).map_or(0, |q| q.len());
+            let mut last_len = queue_len().await;
             loop {
                 tokio::time::sleep(window).await;
-                let now_len = self.queues.lock().await.get(conv).map_or(0, |q| q.len());
+                let now_len = queue_len().await;
                 if now_len == last_len || started.elapsed() >= cap {
                     break;
                 }
                 last_len = now_len;
             }
         }
-        let mut map = self.queues.lock().await;
-        let pending = map.get_mut(conv)?;
-        if pending.is_empty() {
-            map.remove(conv);
-            return None;
-        }
-        // S-4（原子）：取批与清 hint 在**同一** queues 临界区内完成——先清后取
-        // 分离会有间隙：/stop 或新入队消息在两步之间落地导致 hint 与实际队列错位。
-        // P10：本批转入处理——排队提示清零（本轮运行中新入队的会重新累积，
-        // 展示在下一张卡 / 下一轮）。
-        self.queued_hints.lock().await.remove(conv);
-        let batch = std::mem::take(pending);
-        drop(map);
+        // S-4（原子）：取批、清 hint、交还身份在同一临界区完成——先清后取分离
+        // 会有间隙：/stop 或新入队消息在两步之间落地导致 hint 与实际队列错位
+        //（T18 前靠 queues+queued_hints 两锁同持保证，单表后天然同临界区）。
+        let mut states = self.conv_states.lock().await;
+        let batch = match states.get_mut(conv) {
+            // 无 entry 或无 runner 身份：runner 退出。
+            None => return None,
+            Some(cs) => {
+                let pending = cs.queue.as_mut()?;
+                if pending.is_empty() {
+                    // 交还 runner 身份（queue 置 None，等价旧 map.remove(entry)；
+                    // entry 若因此全空则剪除）。
+                    cs.queue = None;
+                    if cs.is_empty() {
+                        states.remove(conv);
+                    }
+                    return None;
+                }
+                // P10：本批转入处理——排队提示清零（本轮运行中新入队的会重新
+                // 累积，展示在下一张卡 / 下一轮）。
+                cs.queued_hint = None;
+                // L4（code-review v8）：取批留空 Vec 不交还身份——`Some(空 Vec)`
+                // 仍代表 runner 活跃，杜绝「取批间隙新消息成为第二个 runner /
+                // 消息卡在无人认领的队列」。mem::take 清空内容、保留身份。
+                std::mem::take(pending)
+            }
+        };
+        drop(states);
         // v1.18 review（排队持久化重做）：按 rowid 精确删本批行——整 conv
         // DELETE 会连带删掉「取批释放锁之后、DELETE 落库前」并发入队的新消息
         // 的行（内存排队、DB 无行 = 崩溃即丢）。rowid=0（落行失败）跳过。
@@ -2259,54 +2509,52 @@ impl Dispatcher {
     /// 消息撤回（一期）：按平台消息 id 把同 id 的**排队**消息移出。全队列扫描——
     /// 撤回事件携带的会话 key（chat_id 形态）与排队 key（私聊为发送者 conv）可能
     /// 不同形，按 id 匹配最稳。命中则同步收缩排队提示（count/latest，空队列清
-    /// hint；锁序 queues→queued_hints 与入队/取批路径一致）。返回命中条数。
+    /// hint）——T18 起队列与 hint 同在 ConvState 单表，单临界区完成。返回命中
+    /// 条数。
     async fn remove_queued_by_msg_id(&self, msg_id: &str) -> usize {
-        let mut map = self.queues.lock().await;
         let mut removed = 0usize;
         // v1.18 review（排队持久化重做）：撤回按被撤元素的 rowid 精确删行
         //（替代整队重写——并发入队的新行不再有被重写吞掉的风险）。
         let mut removed_ids: Vec<i64> = Vec::new();
-        for (conv, pending) in map.iter_mut() {
-            let before = pending.len();
-            let mut kept = Vec::with_capacity(before);
-            for q in pending.drain(..) {
-                if q.msg.source_msg_id.as_deref() == Some(msg_id) {
-                    if q.rowid > 0 {
-                        removed_ids.push(q.rowid);
+        {
+            let mut states = self.conv_states.lock().await;
+            for (_conv, cs) in states.iter_mut() {
+                let Some(pending) = cs.queue.as_mut() else {
+                    continue;
+                };
+                let before = pending.len();
+                let mut kept = Vec::with_capacity(before);
+                for q in pending.drain(..) {
+                    if q.msg.source_msg_id.as_deref() == Some(msg_id) {
+                        if q.rowid > 0 {
+                            removed_ids.push(q.rowid);
+                        }
+                    } else {
+                        kept.push(q);
                     }
-                } else {
-                    kept.push(q);
                 }
-            }
-            *pending = kept;
-            if pending.len() == before {
-                continue;
-            }
-            removed += before - pending.len();
-            let count = pending.len();
-            let latest = pending
-                .last()
-                .map(|q| latest_snippet(&q.msg))
-                .unwrap_or_default();
-            let mut hints = self.queued_hints.lock().await;
-            if count == 0 {
-                hints.remove(conv);
-            } else {
-                // 合并写入保 steered（同 enqueue 路径的 v1.18 review 修正）。
-                hints
-                    .entry(conv.clone())
-                    .and_modify(|h| {
-                        h.count = count;
-                        h.latest = latest.clone();
-                    })
-                    .or_insert(crate::card_session::QueuedHint {
-                        count,
-                        latest,
-                        ..Default::default()
-                    });
+                *pending = kept;
+                if pending.len() == before {
+                    continue;
+                }
+                removed += before - pending.len();
+                let count = pending.len();
+                let latest = pending
+                    .last()
+                    .map(|q| latest_snippet(&q.msg))
+                    .unwrap_or_default();
+                if count == 0 {
+                    cs.queued_hint = None;
+                } else {
+                    // 合并写入保 steered（同 enqueue 路径的 v1.18 review 修正）。
+                    let h = cs.queued_hint.get_or_insert_default();
+                    h.count = count;
+                    h.latest = latest;
+                }
+                // 与取批路径同语义：留空 Vec 不交还 runner 身份（runner 循环
+                // 依赖），entry 剪除交给 with_conv / 取批收尾。
             }
         }
-        drop(map);
         if !removed_ids.is_empty() {
             if let Err(e) = self.store.delete_queued_rows(&removed_ids).await {
                 warn!(target: "imagent::core", error = %e, "撤回后持久化行删除失败（重启后该撤回消息可能被重放执行）");
@@ -2343,8 +2591,10 @@ impl Dispatcher {
                     return;
                 }
                 let running_here = {
-                    let running = self.running.lock().await;
-                    probe_convs.iter().any(|c| running.contains_key(&c.0))
+                    let states = self.conv_states.lock().await;
+                    probe_convs
+                        .iter()
+                        .any(|c| states.get(&c.0).is_some_and(|cs| cs.running.is_some()))
                 };
                 if running_here {
                     if let Some(conv) = notify_conv {
