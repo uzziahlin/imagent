@@ -319,6 +319,12 @@ impl Backend for ClaudeBackend {
         PermissionCapability::FullLoop
     }
 
+    /// T4（P1-3）：CLI 把 allowed_tools 逐工具透传 `--allowedTools`（run 内
+    /// 非全量时附加），支持工具白名单收敛。
+    fn supports_tool_allowlist(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         NAME
     }
@@ -719,6 +725,13 @@ mod tests {
             ClaudeBackend::new().permission_capability(),
             PermissionCapability::FullLoop
         );
+    }
+
+    /// T4（P1-3）：能力位——CLI 逐工具透传 `--allowedTools`，支持 allowed_tools
+    /// 白名单收敛（非全量清单在此后端生效，core 不告警）。
+    #[test]
+    fn supports_tool_allowlist_is_true() {
+        assert!(ClaudeBackend::new().supports_tool_allowlist());
     }
 
     #[test]

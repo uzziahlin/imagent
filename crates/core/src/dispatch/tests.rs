@@ -304,6 +304,9 @@ struct MockBackend {
     local_sessions: Arc<TokioMutex<Vec<LocalSession>>>,
     /// S-1/S-2：权限能力档位（默认 Unsupported；FullLoop 供闭环类测试覆写）。
     capability: crate::backend::PermissionCapability,
+    /// T4（P1-3）：supports_tool_allowlist 能力位（默认 false = 不支持逐工具
+    /// 白名单，能力面告警测试用）。
+    allowlist_supported: bool,
     /// RunOutcome 携带的 usage（run_stats 落库/自动压缩阈值测试用；默认 None）。
     usage: Option<crate::types::UsageStats>,
     /// P2（v13）：完成闸门（默认 None：立即完成）。Some 时 run 记录调用后挂起
@@ -332,6 +335,7 @@ impl MockBackend {
             fail_after_announce: None,
             local_sessions: Arc::new(TokioMutex::new(Vec::new())),
             capability: crate::backend::PermissionCapability::Unsupported,
+            allowlist_supported: false,
             usage: None,
             complete_gate: None,
         };
@@ -559,6 +563,9 @@ impl Backend for MockBackend {
     fn permission_capability(&self) -> crate::backend::PermissionCapability {
         self.capability
     }
+    fn supports_tool_allowlist(&self) -> bool {
+        self.allowlist_supported
+    }
 }
 
 // ---------- helpers ----------
@@ -666,6 +673,44 @@ async fn build_with_mode(auth: Auth, mode: PermissionMode) -> Ctx {
         auth,
         std::path::PathBuf::from("/tmp/imagent-test-ws"),
         vec!["Read".into(), "Edit".into()],
+        mode,
+        test_budgets(),
+        CotDetail::Brief,
+        admins,
+    ));
+    Ctx {
+        disp,
+        inbox,
+        send_count,
+        calls,
+        prompts,
+        order,
+        db,
+    }
+}
+
+/// T4（能力面矩阵）：与 build 相同，但可指定 allowed_tools / 权限档位 /
+/// MockBackend 能力位（P1-3 白名单能力 + P3-3 审批能力，告警矩阵测试用）。
+async fn build_capability(
+    auth: Auth,
+    tools: Vec<String>,
+    mode: PermissionMode,
+    capability: crate::backend::PermissionCapability,
+    allowlist_supported: bool,
+) -> Ctx {
+    let (plat, inbox, send_count) = MockPlatform::new();
+    let (mut back, calls, prompts, order) = MockBackend::new();
+    back.capability = capability;
+    back.allowlist_supported = allowlist_supported;
+    let (store, db) = tmp_store().await;
+    let admins = auth.snapshot();
+    let disp = Arc::new(Dispatcher::new(
+        Arc::new(plat),
+        Arc::new(back),
+        store,
+        auth,
+        std::path::PathBuf::from("/tmp/imagent-test-ws"),
+        tools,
         mode,
         test_budgets(),
         CotDetail::Brief,
@@ -3253,6 +3298,188 @@ async fn perm_ask_rejected_for_non_fullloop_backend() {
         "auto 解析为非闭环档应可热切: {inbox:?}"
     );
     drop(inbox);
+    drop_db(ctx.db).await;
+}
+
+/// T4（P1-3/P3-3）：能力面告警判定的纯函数矩阵——「是否应告警」的单测锚点
+///（仓内无 tracing 捕获先例，判定抽成纯函数；文案与三点位接线由下方
+/// 集成测试覆盖）。
+#[test]
+fn capability_divergence_predicates_matrix() {
+    use crate::backend::{perm_mode_lacks_execution, tool_allowlist_diverges};
+    // P1-3：allowed_tools 非全量 × 不支持逐工具白名单 → 告警；全量（空/["*"]）
+    // 或后端支持（claude-cli 的 --allowedTools）→ 不告警。
+    assert!(tool_allowlist_diverges(&["Read".to_string()], false));
+    assert!(
+        !tool_allowlist_diverges(&["Read".to_string()], true),
+        "CLI 后端 × 非全量 allowlist → 无 warn"
+    );
+    assert!(!tool_allowlist_diverges(&[], false));
+    assert!(!tool_allowlist_diverges(&["*".to_string()], false));
+    assert!(!tool_allowlist_diverges(&["*".to_string()], true));
+    // P3-3：allow/deny × 非 FullLoop → 告警；FullLoop（deny 经审批回调执行）/
+    // ask（由启动 fail-closed 拒绝，不进告警面）/ off（无 IM 侧决策）→ 不告警。
+    use crate::backend::PermissionCapability::{FullLoop, NativeOnly, Unsupported};
+    assert!(perm_mode_lacks_execution(PermissionMode::Deny, NativeOnly));
+    assert!(perm_mode_lacks_execution(
+        PermissionMode::Allow,
+        Unsupported
+    ));
+    assert!(!perm_mode_lacks_execution(PermissionMode::Deny, FullLoop));
+    assert!(
+        !perm_mode_lacks_execution(PermissionMode::Ask, NativeOnly),
+        "ask 档由 fail-closed 启动拒绝管，不进告警面"
+    );
+    assert!(!perm_mode_lacks_execution(PermissionMode::Off, Unsupported));
+}
+
+/// T4（P1-3）：配置非全量 allowlist × 不支持逐工具白名单的后端（模拟
+/// claude-acp 能力位）→ 启动点位（run() 启动调用同一
+/// capability_surface_warnings）产生告警；同状态去重只一次，配置变更
+///（SIGHUP reload_tools）后再进入告警态重新告警。
+#[tokio::test]
+async fn capability_warns_allowlist_divergence_and_dedups() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build_capability(
+        Auth::new(vec!["alice".into()]),
+        vec!["Read".into(), "Edit".into()],
+        PermissionMode::Off,
+        crate::backend::PermissionCapability::FullLoop,
+        false, // 模拟 claude-acp：不支持逐工具白名单（P1-3 裂缝侧）。
+    )
+    .await;
+    // 首评：恰一条告警，说明清单不生效 + 后端机制 + SECURITY.md 指引。
+    let notices = ctx.disp.capability_surface_warnings();
+    assert_eq!(
+        notices.len(),
+        1,
+        "非全量 allowlist × 不支持 → 恰一条告警: {notices:?}"
+    );
+    assert!(
+        notices[0].contains("allowed_tools")
+            && notices[0].contains("不支持")
+            && notices[0].contains("SECURITY.md"),
+        "告警应说明白名单不生效并指向文档: {notices:?}"
+    );
+    // 同状态重评（模拟无变化 SIGHUP）：去重，不再告警。
+    assert!(
+        ctx.disp.capability_surface_warnings().is_empty(),
+        "同状态不重复告警"
+    );
+    // 配置变更：全量 → 解除；再切回非全量 → 重新告警。
+    assert!(
+        ctx.disp.reload_tools(vec!["*".into()]).is_empty(),
+        "全量语义不应告警"
+    );
+    let re = ctx.disp.reload_tools(vec!["Read".into()]);
+    assert_eq!(re.len(), 1, "配置变更后再进入告警态应重新告警: {re:?}");
+    drop_db(ctx.db).await;
+}
+
+/// T4（P1-3）：后端支持逐工具白名单（模拟 claude-cli 能力位 = true）× 非全量
+/// allowlist → 两维均无告警（配置按清单生效，不应打扰）。
+#[tokio::test]
+async fn no_capability_warn_when_backend_supports_allowlist() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build_capability(
+        Auth::new(vec!["alice".into()]),
+        vec!["Read".into(), "Edit".into()],
+        PermissionMode::Deny,
+        crate::backend::PermissionCapability::FullLoop,
+        true, // 模拟 claude-cli：--allowedTools 透传。
+    )
+    .await;
+    assert!(
+        ctx.disp.capability_surface_warnings().is_empty(),
+        "CLI 后端 × 非全量 allowlist（FullLoop）→ 无 warn"
+    );
+    drop_db(ctx.db).await;
+}
+
+/// T4（P3-3）：permission_mode = allow/deny × 非 FullLoop（NativeOnly /
+/// Unsupported 均无审批回调）→ 告警「无执行点」；FullLoop / off → 无告警。
+#[tokio::test]
+async fn capability_warns_dead_perm_mode_on_non_fullloop() {
+    let _serial = SERIAL.lock().await;
+    use crate::backend::PermissionCapability::{FullLoop, NativeOnly, Unsupported};
+    for cap in [NativeOnly, Unsupported] {
+        let ctx = build_capability(
+            Auth::new(vec!["alice".into()]),
+            vec!["*".into()], // 全量工具：隔离维度二。
+            PermissionMode::Deny,
+            cap,
+            false,
+        )
+        .await;
+        let notices = ctx.disp.capability_surface_warnings();
+        assert_eq!(notices.len(), 1, "deny × {cap:?} → 恰一条: {notices:?}");
+        assert!(
+            notices[0].contains("无执行点") && notices[0].contains("allowed_tools"),
+            "告警应说明档位无执行点与实际边界: {notices:?}"
+        );
+        drop_db(ctx.db).await;
+    }
+    // 反例一：FullLoop × deny（deny 经审批回调固定答复执行）→ 无告警。
+    let ctx = build_capability(
+        Auth::new(vec!["alice".into()]),
+        vec!["*".into()],
+        PermissionMode::Deny,
+        FullLoop,
+        false,
+    )
+    .await;
+    assert!(ctx.disp.capability_surface_warnings().is_empty());
+    drop_db(ctx.db).await;
+    // 反例二：off × 非 FullLoop（off 本就无 IM 侧决策）→ 无告警。
+    let ctx = build_capability(
+        Auth::new(vec!["alice".into()]),
+        vec!["*".into()],
+        PermissionMode::Off,
+        Unsupported,
+        false,
+    )
+    .await;
+    assert!(ctx.disp.capability_surface_warnings().is_empty());
+    drop_db(ctx.db).await;
+}
+
+/// T4（P3-3）：/perm 切 deny × NativeOnly 后端 → 回执直接带「无执行点」提示
+///（用户能立刻看到，不用翻日志）；切 off → 回执不带提示。
+#[tokio::test]
+async fn perm_deny_receipt_carries_dead_mode_notice() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build_capability(
+        Auth::new(vec!["alice".into()]),
+        vec!["*".into()],
+        PermissionMode::Off,
+        crate::backend::PermissionCapability::NativeOnly,
+        false,
+    )
+    .await;
+    ctx.disp.handle(msg("c1", "alice", "/perm deny")).await;
+    assert!(
+        matches!(*ctx.disp.permission_mode.read(), PermissionMode::Deny),
+        "deny × 非 FullLoop 应热切成功（fail-closed 只管闭环档）"
+    );
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox
+            .iter()
+            .any(|t| t.contains("✅ 权限模式已切到 deny") && t.contains("无执行点")),
+        "回执应带「无执行点」提示: {inbox:?}"
+    );
+    drop(inbox);
+    // off：本就无 IM 侧决策，回执不带提示。
+    ctx.disp.handle(msg("c1", "alice", "/perm off")).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    let off_receipt = inbox
+        .iter()
+        .find(|t| t.contains("已切到 off"))
+        .expect("应有 off 回执");
+    assert!(
+        !off_receipt.contains("无执行点"),
+        "off 回执不应带提示: {off_receipt}"
+    );
     drop_db(ctx.db).await;
 }
 

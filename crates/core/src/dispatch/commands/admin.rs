@@ -925,7 +925,17 @@ impl Dispatcher {
                 // 回执不再要求重启。S-1：reload Result 化（能力/socket 失败回执）。
                 match self.reload_permission_mode(mode) {
                     Ok(()) => {
-                        self.reply(conv, &format!("✅ 权限模式已切到 {arg}"), hint)
+                        // T4（P3-3）：切到 allow/deny × 非 FullLoop 后端——回执直接
+                        // 带同一提示（用户能立刻看到，不用翻日志；warn 面在
+                        // reload_permission_mode 内部的 capability_surface_warnings）。
+                        let notice = perm_mode_dead_notice(
+                            mode,
+                            self.backend.name(),
+                            self.backend.permission_capability(),
+                        )
+                        .map(|t| format!("\n⚠️ {t}"))
+                        .unwrap_or_default();
+                        self.reply(conv, &format!("✅ 权限模式已切到 {arg}{notice}"), hint)
                             .await;
                     }
                     Err(e) => {

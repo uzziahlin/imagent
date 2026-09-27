@@ -39,6 +39,30 @@ impl PermissionCapability {
     }
 }
 
+/// T4（P1-3）：能力面矩阵判定——`allowed_tools` 为非全量白名单（非空且非
+/// `["*"]` 语义，见 [`crate::backend_common::tools_unrestricted`]）× 后端不支持
+/// 逐工具白名单（[`Backend::supports_tool_allowlist`] = false）→ 应告警：工具
+/// 清单在该后端不按条目生效，工具面实际由后端自身机制决定（P1-3：两个
+/// FullLoop 后端间安全配置静默分叉——CLI 收敛、ACP 全量）。
+pub(crate) fn tool_allowlist_diverges(tools: &[String], supports_allowlist: bool) -> bool {
+    !crate::backend_common::tools_unrestricted(tools) && !supports_allowlist
+}
+
+/// T4（P3-3）：`permission_mode = allow/deny` × 后端权限能力非
+/// [`PermissionCapability::FullLoop`] → 应告警：该档位在此后端**无执行点**
+/// （deny/allow 的执行位置在审批回调的固定答复，NativeOnly/Unsupported 后端
+/// 没有审批回调），实际边界 = allowed_tools / 后端沙箱。ask/auto-claude 档位
+/// 由启动 fail-closed 直接拒绝（不进告警面）；off 档位本就无 IM 侧决策。
+pub(crate) fn perm_mode_lacks_execution(
+    mode: crate::config::PermissionMode,
+    capability: PermissionCapability,
+) -> bool {
+    matches!(
+        mode,
+        crate::config::PermissionMode::Allow | crate::config::PermissionMode::Deny
+    ) && capability != PermissionCapability::FullLoop
+}
+
 /// B3：backend → dispatcher 的 IM 审批请求（与 claude-cli MCP 闭环同一语义通道；
 /// ACP 的 `session/request_permission` 映射到此处）。
 #[derive(Debug, Clone)]
@@ -155,6 +179,17 @@ pub trait Backend: Send + Sync {
     /// 如实覆写（claude-cli / claude-acp = FullLoop，gemini = NativeOnly）。
     fn permission_capability(&self) -> PermissionCapability {
         PermissionCapability::Unsupported
+    }
+
+    /// T4（P1-3）：是否支持 `allowed_tools` 的**逐工具白名单**收敛。
+    /// `false` = 该后端不按清单逐工具限制工具面（配置完全不生效，或仅粗粒度
+    /// 映射到后端自身机制）——core 据此在启动 / SIGHUP 热载 / `/perm` 热切时
+    /// 告警（见 dispatch 的能力面矩阵告警）。默认 `false`；claude-cli 覆写
+    /// `true`（`--allowedTools` 透传）。事实依据：claude-acp 无 ACP 等价机制
+    /// （session/new 无工具白名单字段）；codex / gemini 仅把 allowed_tools
+    /// 粗粒度收敛到 sandbox / approval-mode 档位（非逐工具白名单），均取默认。
+    fn supports_tool_allowlist(&self) -> bool {
+        false
     }
 
     /// B3：注入 IM 审批闭环回调（dispatcher `run()` 启动时调用一次）。
