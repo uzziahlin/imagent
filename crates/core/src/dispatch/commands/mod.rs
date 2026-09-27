@@ -19,6 +19,52 @@ pub(super) use misc::{
     doctor_shared_workdir_lines, doctor_size_line, doctor_webhook_line,
 };
 
+/// P3（v13 遗留「群内斜杠免检噪音」）：命令分派表（[`Dispatcher::handle`] 的
+/// match）的**全部**命令词（小写、含 `/` 前缀）。feishu 平台层的群 mention 门
+/// 用它做「已知命令」豁免判定——只放行真实命令，`/xxx 是什么意思` 一类闲聊
+/// 不再触发命令分派回未知命令提示。与 match 分派的一致性由本文件底部钉住
+/// 测试看护（新命令加 match 臂而漏登记此处时测试红）。
+/// 注意与 [`COMMAND_GROUPS`]（/help 展示表）职责不同：本清单以**可分派**为准
+/// （含 /mcp、/export、/queue 等未入 help 分组的命令），二者不要求互相覆盖。
+/// config `shortcuts` 的自定义 `/name` 不在此清单（平台解析层无 config 视野，
+/// 群内使用需 @bot）。
+const KNOWN_COMMAND_WORDS: &[&str] = &[
+    "/admin",
+    "/again",
+    "/allow",
+    "/audit",
+    "/cd",
+    "/chat",
+    "/compact",
+    "/config",
+    "/cron",
+    "/disallow",
+    "/doctor",
+    "/export",
+    "/file",
+    "/help",
+    "/img",
+    "/last",
+    "/list",
+    "/mcp",
+    "/model",
+    "/new",
+    "/perm",
+    "/queue",
+    "/reconnect",
+    "/resume",
+    "/retry",
+    "/sessions",
+    "/stats",
+    "/status",
+    "/stop",
+    "/switch",
+    "/tasks",
+    "/timeout",
+    "/whoami",
+    "/ws",
+];
+
 /// S-12：全部支持的斜杠命令，按 /help 分组同构（未知命令提示竖排分组展示）。
 pub(super) const COMMAND_GROUPS: &[(&str, &[&str])] = &[
     (
@@ -105,6 +151,15 @@ pub(super) fn unknown_command_reply(cmd: &str) -> String {
 }
 
 impl Dispatcher {
+    /// 已知斜杠命令词表（[`KNOWN_COMMAND_WORDS`] 的公开出口）。关联函数形态
+    /// （而非模块级 `pub fn`）：`commands` 是 dispatch 下的私有模块，模块级
+    /// pub fn 无法穿透 `dispatch`/`commands` 私有模块链被平台 crate 引用；
+    /// `Dispatcher` 已在 crate 根 re-export，本文件本就持有其 impl 块——零
+    /// 额外导出链。feishu 的群 mention 门消费（见 proto 的 is_known_slash_command）。
+    pub fn known_command_words() -> &'static [&'static str] {
+        KNOWN_COMMAND_WORDS
+    }
+
     /// 处理单条消息。内部任何错误都 log 并吞掉，不影响主循环。
     pub(super) async fn handle(&self, msg: InboundMessage) {
         let conv = msg.conv_id.clone();
@@ -532,5 +587,45 @@ impl Dispatcher {
         }
         drop(_guard);
         self.release_conv_lock(&conv.0, lock).await;
+    }
+}
+
+#[cfg(test)]
+mod known_words_tests {
+    use super::*;
+
+    /// 钉住：[`Dispatcher::known_command_words`] 与 handle() 命令分派 match 的
+    /// 臂完全一致——新命令加了 match 臂而漏登记清单时测试红（feishu 群内斜杠
+    /// 免检白名单随之失效：新命令在群里不带 @ 会被 mention 门拦下）。
+    /// 提取方式：扫描本文件源码中形如 `"/xxx" =>` 的 match 臂字面量（分派
+    /// match 是文件内唯一该形态的字符串臂，见上方 grep 验证过的 34 臂）。
+    #[test]
+    fn known_command_words_match_dispatch_arms() {
+        let src = include_str!("mod.rs");
+        let mut arms: Vec<&str> = Vec::new();
+        for line in src.lines() {
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed.strip_prefix('"') else {
+                continue;
+            };
+            let Some((word, _)) = rest.split_once("\" =>") else {
+                continue;
+            };
+            if word.starts_with('/') {
+                arms.push(word);
+            }
+        }
+        arms.sort_unstable();
+        arms.dedup();
+        let mut listed = Dispatcher::known_command_words().to_vec();
+        listed.sort_unstable();
+        assert_eq!(
+            arms, listed,
+            "分派臂与 known_command_words 不一致：新命令须在 match 与清单两处同步登记"
+        );
+        assert!(!listed.is_empty());
+        // 清单自身无重复（排序后相邻比较）。
+        let dup = listed.windows(2).any(|w| w[0] == w[1]);
+        assert!(!dup, "known_command_words 存在重复项");
     }
 }
