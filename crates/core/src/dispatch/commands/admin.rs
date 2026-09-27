@@ -773,6 +773,16 @@ impl Dispatcher {
         parts: &[&str],
     ) {
         let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+        // v13 P3-7（安全收紧，用户可见行为变更）：/perm list 与 /perm revoke 加
+        // admin 门槛——「始终允许」清单是会话级**持续授权面**（revoke 可撤掉
+        // 本会话已授予的免审授权、list 暴露会话授权轮廓），查看/撤销与
+        // /config 同级敏感；此前白名单任意成员可用。/perm 本体（模式热切）
+        // 的门槛不变（沿用下方既有 admin 校验）。
+        if matches!(arg, "list" | "revoke") && !self.is_admin(&sender.0) {
+            let msg = self.admin_denied_reply("查看或撤销会话级授权");
+            self.reply(conv, &msg, hint).await;
+            return;
+        }
         // v1.23 可见性子命令（先于模式切换解析）：「始终允许」是会话内持续
         // 授权，此前不可见不可单项撤销（只能 /new 丢会话或 /stop 硬停）。
         match arg {

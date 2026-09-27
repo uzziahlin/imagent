@@ -489,6 +489,12 @@ impl Dispatcher {
     /// 调度器主体（run() 内 spawn，30s tick）：到期任务先重排（防长轮次执行期
     /// 重复入队）再合成消息走 handle——白名单/会话域/审批链与手打消息完全同权。
     pub(crate) async fn fire_due_cron_jobs(self: &Arc<Self>) {
+        // v13 P3：shutdown 已开始则整轮跳过——此时尚未 bump，错过槽保留在
+        // next_run，下次启动按停机补跑语义处理（不丢该槽）。tick 循环 select
+        // 已 biased 于 shutdown，此处兜「取消与本次调用并发」的窗口与直接调用。
+        if self.shutdown.is_cancelled() {
+            return;
+        }
         let now = super::super::now_secs();
         let due = match self.store.due_cron_jobs(now).await {
             Ok(d) => d,
@@ -608,7 +614,16 @@ impl Dispatcher {
                 //（分钟级），tick 循环里 await 会队头阻塞 + 饿死 shutdown。与
                 // recv 循环同款：spawn 进 tasks（drain 覆盖）。
                 let this = self.clone();
-                self.tasks.lock().await.spawn(async move {
+                let mut tasks = self.tasks.lock().await;
+                // v13 P3（drain 期竞态，v11#10 webhook inject 同族修法）：拿锁后
+                // 复查 shutdown——drain 持 tasks 锁期间本循环阻塞在 lock() 上，
+                // drain 结束后再 spawn 的 handle 无人 join、随 runtime 退出被
+                // 无声取消（触发丢失）。已过 bump 的槽位按停机错过处理（One 档
+                // 语义：该槽不补跑）。
+                if self.shutdown.is_cancelled() {
+                    return;
+                }
+                tasks.spawn(async move {
                     this.handle(msg).await;
                 });
             }

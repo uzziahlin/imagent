@@ -1,5 +1,7 @@
 use super::*;
 use crate::types::{ConvId, LocalSession, Mention, ReplyHint, SessionId, UserId};
+// v13 P3：媒体提示构造（round 模块私有辅助，测试直调存在性矩阵）。
+use super::round::media_hint_for;
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -2783,6 +2785,91 @@ async fn idle_watchdog_terminates_silent_agent() {
     drop_db(ctx.db).await;
 }
 
+/// v13 P3：看门狗豁免预算按本轮 Permission 审批次数放大——同轮两次慢审批
+/// 的累计静默超过单次 permission_ask_timeout 不被误杀（旧实现钳死单次预算，
+/// 第 N 个审批中途被杀）；审批 pending 清空后长静默仍照常判停（防挂死语义
+/// 不变）。无审批场景由 idle_watchdog_terminates_silent_agent 覆盖。
+#[tokio::test]
+async fn watchdog_exempt_budget_scales_with_approval_count() {
+    let _serial = SERIAL.lock().await;
+    // 时基：idle=500ms（豁免 tick），permission_ask_timeout=2s（单份预算）。
+    // 豁免按整秒烧（as_secs().max(1)）：旧实现 cap=2 → 第 3 个 tick（t≈1.5s）
+    // 即判停；新实现 cap=2 份 ×2s=4s → t≈1.8s 仍在飞（最早 t≈2.5s 才可能
+    // 判停），两档间隔足以区分回归。
+    let ctx = build_slow(
+        Auth::new(vec!["alice".into()]),
+        60_000,
+        TaskBudgets {
+            agent_idle_timeout: Duration::from_millis(500),
+            permission_ask_timeout: Duration::from_secs(2),
+            batch_window: Duration::from_millis(1),
+            ..test_budgets()
+        },
+    )
+    .await;
+    let disp = ctx.disp.clone();
+    let runner = tokio::spawn(async move { disp.handle(msg("c1", "alice", "slow work")).await });
+    assert!(wait_registered(&ctx, "c1").await, "轮次应已起跑");
+    // 同轮两次审批（登记即计数；保持 pending 使 D3 豁免的 waiting 成立——
+    // 慢后端不产 chunk，静默持续累积）。
+    let _rx1 = ctx
+        .disp
+        .router
+        .register(
+            "c1",
+            "req-w1",
+            None,
+            crate::permission::PendingKind::Permission,
+            Some("Bash"),
+            None,
+        )
+        .await;
+    let _rx2 = ctx
+        .disp
+        .router
+        .register(
+            "c1",
+            "req-w2",
+            None,
+            crate::permission::PendingKind::Permission,
+            Some("Bash"),
+            None,
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(1_800)).await;
+    assert!(
+        conv_running(&ctx.disp, "c1").await,
+        "两次审批的累计静默不应触发看门狗"
+    );
+    {
+        let inbox = ctx.inbox.lock().await.clone();
+        assert!(
+            !inbox.iter().any(|t| t.contains("空闲超时")),
+            "不应有超时提示: {inbox:?}"
+        );
+    }
+    // 审批 pending 清空 → waiting 失效 → 照常按预算判停。
+    ctx.disp.router.cancel_all("c1").await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if ctx
+            .inbox
+            .lock()
+            .await
+            .iter()
+            .any(|t| t.contains("空闲超时"))
+        {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("审批清空后应恢复看门狗判停: {:?}", ctx.inbox.lock().await);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(5), runner).await;
+    drop_db(ctx.db).await;
+}
+
 /// P4-2：排队上限——超限消息回告警并丢弃，runner 不受影响。
 #[tokio::test]
 async fn pending_queue_cap_warns_and_drops() {
@@ -4024,9 +4111,22 @@ async fn abort_flushes_coalesced_text_buffer() {
         disp.handle(msg("c1", "alice", "长任务")).await;
     });
     assert!(wait_registered(&ctx, "c1").await, "任务应在飞");
-    // 给 delta 到达留余量（< 合帧窗口 400ms，确保走的是中断 flush 而非定时
-    // flush；即便偶发超窗，定时 flush 也已送达文本，断言不 flake）。
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // 等到 backend run 已实际启动（calls 记录）再补少量通道发送余量后 /stop——
+    // 固定 sleep 在 CI 慢机上不够（v1.28 首发翻车：调度停顿使 /stop 抢在
+    // delta 产出之前，缓冲为空无可 flush）。run() 一旦被调度，两段 Text 的
+    // 通道 send 与挂起之间无其它 await，100ms 余量足够；等待本身不限时长
+    // （wait_registered 只保证注册，不保证 run 已跑）。
+    for _ in 0..2000 {
+        if !ctx.calls.lock().await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        !ctx.calls.lock().await.is_empty(),
+        "backend run 应已启动（否则测试前提不成立）"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
     ctx.disp.handle(msg("c1", "alice", "/stop")).await;
     let done = tokio::time::timeout(Duration::from_secs(5), runner).await;
     assert!(done.is_ok(), "被中断的 runner 应很快退出");
@@ -5888,6 +5988,90 @@ async fn crashed_round_recovery_prefers_newer_inflight() {
     drop_db(ctx.db).await;
 }
 
+/// v13 P3（崩溃恢复双注入）：轮首 inflight 必须落 **base_prompt**（注入前）
+/// ——带摘要注入的轮崩溃后 /retry 重放走完整注入管道，【前情摘要】在重放
+/// prompt 里恰出现一次。旧实现存注入后的 prompt：崩溃轮未成功落库、摘要
+/// 未删且重放轮 existing=None → 摘要二次注入（陈旧媒体路径提示同族残留）。
+#[tokio::test]
+async fn crashed_round_retry_replays_base_prompt_single_summary() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build_slow(
+        Auth::new(vec!["alice".into()]),
+        60_000,
+        TaskBudgets {
+            batch_window: Duration::from_millis(1),
+            ..test_budgets()
+        },
+    )
+    .await;
+    // 预置摘要 + 无活动 session → 首轮新建会话注入摘要。
+    ctx.check()
+        .await
+        .set_config("compact_summary:c5", "旧会话的摘要内容")
+        .await
+        .unwrap();
+    let disp = ctx.disp.clone();
+    let runner = tokio::spawn(async move { disp.handle(msg("c5", "alice", "继续整理")).await });
+    // 首轮起跑（注入后 prompt 已送达 backend，含一次摘要）。
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while ctx.prompts.lock().await.is_empty() {
+        if std::time::Instant::now() > deadline {
+            panic!("首轮未起跑: {:?}", ctx.prompts.lock().await);
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // 轮在飞：inflight 行已落库——必须是注入前的 base（旧实现此处即回归点）。
+    let store = ctx.check().await;
+    let inflight = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(v) = store.get_config("inflight_prompt:c5").await.unwrap() {
+                break v;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("inflight 标记未落库");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&inflight).unwrap();
+    assert_eq!(
+        parsed["prompt"].as_str(),
+        Some("继续整理"),
+        "inflight 应存注入前 base prompt：{inflight}"
+    );
+    // 正常收尾（/stop 中断，摘要按 P1-K 保留）清除本轮 inflight；再把捕获的
+    // base 版 payload 写回，模拟「轮首落库后进程崩溃」的残留行。
+    ctx.disp.handle(msg("c5", "alice", "/stop")).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), runner).await;
+    store
+        .set_config("inflight_prompt:c5", &inflight)
+        .await
+        .unwrap();
+    ctx.disp.recover_crashed_rounds().await;
+    // /retry 重放：慢轮被中断未落 session（existing=None）→ 摘要恰注入一次。
+    let disp = ctx.disp.clone();
+    let runner2 = tokio::spawn(async move { disp.handle(msg("c5", "alice", "/retry")).await });
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while ctx.prompts.lock().await.len() < 2 {
+        if std::time::Instant::now() > deadline {
+            panic!("/retry 未重放: {:?}", ctx.prompts.lock().await);
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let replayed = ctx.prompts.lock().await[1].clone();
+    assert_eq!(
+        replayed.matches("【前情摘要】").count(),
+        1,
+        "重放轮摘要应恰注入一次：{replayed}"
+    );
+    assert!(replayed.ends_with("继续整理"), "base 应在末尾：{replayed}");
+    // 收尾：中断重放轮，防 60s 慢后端拖住测试。
+    ctx.disp.handle(msg("c5", "alice", "/stop")).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), runner2).await;
+    drop_db(ctx.db).await;
+}
+
 /// v1.23 指令复用：成功轮 prompt 落 last_success_prompt → /again 重跑
 ///（与 /retry 的失败轮分键互不干扰）。
 #[tokio::test]
@@ -5979,6 +6163,59 @@ async fn perm_list_and_revoke_session_allows() {
     assert!(
         inbox.last().unwrap().contains("不在本会话"),
         "{}",
+        inbox.last().unwrap()
+    );
+    drop_db(ctx.db).await;
+}
+
+/// v13 P3-7（安全收紧）：/perm list 与 /perm revoke 加 admin 门槛——「始终
+/// 允许」清单是会话级持续授权面，查看/撤销与 /config 同门槛；非 admin 回
+/// 明确拒绝且授权不被撤销。/perm 本体（模式热切）门槛不变（上方
+/// perm_switch_requires_admin 覆盖）。
+#[tokio::test]
+async fn perm_list_and_revoke_require_admin() {
+    let _serial = SERIAL.lock().await;
+    // bob 白名单但非 admin（admin 只有 alice）。
+    let ctx = build_with_admin(
+        Auth::new(vec!["alice".into(), "bob".into()]),
+        vec!["alice".into()],
+    )
+    .await;
+    ctx.disp.router.allow_always("c1", "Bash").await;
+    ctx.disp.handle(msg("c1", "bob", "/perm list")).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.last().unwrap().contains("仅管理员"),
+        "非 admin /perm list 应被拒：{}",
+        inbox.last().unwrap()
+    );
+    ctx.disp.handle(msg("c1", "bob", "/perm revoke Bash")).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.last().unwrap().contains("仅管理员"),
+        "非 admin /perm revoke 应被拒：{}",
+        inbox.last().unwrap()
+    );
+    // 拒绝不产生副作用：授权仍在。
+    assert!(
+        ctx.disp.router.is_session_allowed("c1", "Bash").await,
+        "被拒的 revoke 不得撤销授权"
+    );
+    // admin 照常可用（可见 + 可撤销）。
+    ctx.disp.handle(msg("c1", "alice", "/perm list")).await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.last().unwrap().contains("Bash"),
+        "admin /perm list 应放行：{}",
+        inbox.last().unwrap()
+    );
+    ctx.disp
+        .handle(msg("c1", "alice", "/perm revoke Bash"))
+        .await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.last().unwrap().contains("已撤销"),
+        "admin /perm revoke 应放行：{}",
         inbox.last().unwrap()
     );
     drop_db(ctx.db).await;
@@ -6223,6 +6460,88 @@ async fn queued_messages_replay_after_restart() {
     drop_db(ctx.db).await;
 }
 
+/// v13 P3（媒体 GC 与排队重放错位）：排队行引用的媒体路径已被 7 天 GC 删除
+/// ——重放取批构造 prompt 时注入过期占位而非死路径（fail-soft 不阻断轮次，
+/// agent 知道该让用户重发）。
+#[tokio::test]
+async fn queued_media_replay_expired_path_degrades() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    // 模拟崩溃前落库的排队消息：媒体指向已不存在的本地路径。
+    let mut m = msg("c1", "alice", "看下这张图");
+    m.media.push(MediaRef {
+        kind: "image".to_string(),
+        url: "/nonexistent/imagent/media/img_gone.png".to_string(),
+    });
+    let json = serde_json::to_string(&m).unwrap();
+    ctx.disp
+        .store
+        .persist_queued_msg("c1", m.source_msg_id.as_deref(), &json)
+        .await
+        .unwrap();
+    ctx.disp.replay_persisted_queue().await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if ctx
+            .prompts
+            .lock()
+            .await
+            .iter()
+            .any(|p| p.contains("看下这张图"))
+        {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("重放消息未驱动 agent: {:?}", ctx.prompts.lock().await);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let prompt = ctx.prompts.lock().await[0].clone();
+    assert!(prompt.contains("【用户发来媒体】"), "{prompt}");
+    assert!(
+        prompt.contains("（该媒体已过期自动清理，请让用户重发）"),
+        "缺失媒体应注入过期占位：{prompt}"
+    );
+    assert!(
+        !prompt.contains("/nonexistent/imagent/media/img_gone.png"),
+        "死路径不应进 prompt：{prompt}"
+    );
+    drop_db(ctx.db).await;
+}
+
+/// v13 P3：media_hint_for 的存在性矩阵——文件在则路径照发；缺失替换为过期
+/// 占位；下载失败项照旧列出；全空无提示。
+#[test]
+fn media_hint_checks_file_existence() {
+    let dir = std::env::temp_dir().join(format!("imagent-media-hint-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let live = dir.join("live.png");
+    std::fs::write(&live, b"png").unwrap();
+    let media = vec![
+        MediaRef {
+            kind: "image".to_string(),
+            url: live.to_string_lossy().to_string(),
+        },
+        MediaRef {
+            kind: "file".to_string(),
+            url: dir.join("gone.pdf").to_string_lossy().to_string(),
+        },
+    ];
+    let hint = media_hint_for(&media, &[]);
+    assert!(hint.contains("live.png"), "{hint}");
+    assert!(
+        hint.contains("（该媒体已过期自动清理，请让用户重发）"),
+        "{hint}"
+    );
+    assert!(!hint.contains("gone.pdf"), "{hint}");
+    // 下载失败项与全空行为不变。
+    let hint2 = media_hint_for(&[], &["img_x: 下载失败".to_string()]);
+    assert!(hint2.contains("该媒体获取失败"), "{hint2}");
+    assert_eq!(media_hint_for(&[], &[]), "");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn cron_add_list_fire_rm() {
     let _serial = SERIAL.lock().await;
@@ -6328,6 +6647,82 @@ async fn cron_add_list_fire_rm() {
         .await
         .unwrap()
         .is_none());
+    drop_db(ctx.db).await;
+}
+
+/// v13 P3（cron drain 竞态，v11#10 webhook inject 同族）：drain 持 tasks 锁
+/// 期间 fire 阻塞在 lock()——drain 结束后再 spawn 的 handle 无人 join、随
+/// runtime 退出被无声取消（触发丢失）。修复：拿锁后复查 shutdown，已停机
+/// 则不再 spawn。
+#[tokio::test]
+async fn cron_fire_race_with_drain_skips_spawn() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    ctx.disp
+        .handle(msg("c1", "alice", "/cron add * * * * * 报数"))
+        .await;
+    let jobs = ctx.disp.store.list_cron_jobs().await.unwrap();
+    assert_eq!(jobs.len(), 1);
+    ctx.disp
+        .store
+        .bump_cron_job(&jobs[0].id, 0, 1)
+        .await
+        .unwrap();
+    // 模拟 drain 进行中：占住 tasks 锁，fire 将阻塞在 lock()（store 查询/重排
+    // 均在锁外完成，150ms 足以到达锁点）。
+    let guard = ctx.disp.tasks.lock().await;
+    let disp = ctx.disp.clone();
+    let fire = tokio::spawn(async move { disp.fire_due_cron_jobs().await });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    // fire 挂锁期间 shutdown 开始（= drain 已在进行的语义），随后「drain 结束」。
+    ctx.disp.shutdown();
+    drop(guard);
+    let _ = tokio::time::timeout(Duration::from_secs(5), fire).await;
+    // 拿锁后复查拒绝 spawn：backend 未收到任何注入 prompt。
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        ctx.prompts.lock().await.is_empty(),
+        "停机竞态窗口内不应 spawn：{:?}",
+        ctx.prompts.lock().await
+    );
+    drop_db(ctx.db).await;
+}
+
+/// v13 P3 对照：shutdown 已开始时 fire 直接整轮返回——不 bump（错过槽保留
+/// 在 next_run，下次启动按停机补跑语义处理、不丢该槽）也不触发。
+#[tokio::test]
+async fn cron_fire_after_shutdown_returns_without_bump() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    ctx.disp
+        .handle(msg("c1", "alice", "/cron add * * * * * 报数"))
+        .await;
+    let jobs = ctx.disp.store.list_cron_jobs().await.unwrap();
+    assert_eq!(jobs.len(), 1);
+    ctx.disp
+        .store
+        .bump_cron_job(&jobs[0].id, 0, 1)
+        .await
+        .unwrap();
+    ctx.disp.shutdown();
+    ctx.disp.fire_due_cron_jobs().await;
+    assert!(
+        ctx.prompts.lock().await.is_empty(),
+        "停机后 fire 不应触发: {:?}",
+        ctx.prompts.lock().await
+    );
+    let j = ctx
+        .disp
+        .store
+        .get_cron_job(&jobs[0].id)
+        .await
+        .unwrap()
+        .expect("任务仍在");
+    assert!(
+        j.next_run <= 1,
+        "不应重排（错过槽保留给下次启动补跑）: {}",
+        j.next_run
+    );
     drop_db(ctx.db).await;
 }
 

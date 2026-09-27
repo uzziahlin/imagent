@@ -79,6 +79,35 @@ impl Drop for RoundQueueGuard {
     }
 }
 
+/// 构造「用户发来媒体」前置提示（run_round_inner 注入用）。
+/// v13 P3（媒体 GC 与排队重放错位）：逐项检查本地文件存在性——排队消息
+/// 持久化无 TTL，而媒体目录 7 天 GC（main 的 sweep_media_before），停机
+/// 超过 7 天后重放的排队消息会引用已删除的死路径（agent 拿到 Read 必失败
+/// 的路径且无从得知原因）；缺失项替换为过期占位（fail-soft，不阻断轮次
+/// ——用户重发即可）。`MediaRef.url` 的契约是本地路径（types.rs：全平台
+/// 入站媒体均落盘后填充），存在性检查即有效性检查。
+pub(super) fn media_hint_for(media: &[MediaRef], media_errors: &[String]) -> String {
+    if media.is_empty() && media_errors.is_empty() {
+        return String::new();
+    }
+    let mut lines: Vec<String> = media
+        .iter()
+        .map(|m| {
+            if std::path::Path::new(&m.url).is_file() {
+                format!("- {}：{}", m.kind, m.url)
+            } else {
+                format!("- {}：（该媒体已过期自动清理，请让用户重发）", m.kind)
+            }
+        })
+        .collect();
+    lines.extend(
+        media_errors
+            .iter()
+            .map(|e| format!("- ⚠️ 该媒体获取失败：{e}")),
+    );
+    format!("【用户发来媒体】\n{}\n\n——\n\n", lines.join("\n"))
+}
+
 /// P2（code-review v13）：全局并发护栏的轮次持票。permit 跨整轮（runner 循环
 /// 单次迭代 = 一轮 + 其后的自动 compact）持有；Drop 同时归还信号量 permit 与
 /// 在飞 gauge——runner task 被 abort 也经 Drop 收口，不泄漏。
@@ -297,21 +326,8 @@ impl Dispatcher {
 
         // 媒体提示：把本地媒体路径前置告知 agent（claude 可 Read 本地文件）；
         // 下载失败的媒体也一并列出，让 agent 知道用户附了图但没拿到。
-        let media_hint = if msg.media.is_empty() && msg.media_errors.is_empty() {
-            String::new()
-        } else {
-            let mut lines: Vec<String> = msg
-                .media
-                .iter()
-                .map(|m| format!("- {}：{}", m.kind, m.url))
-                .collect();
-            lines.extend(
-                msg.media_errors
-                    .iter()
-                    .map(|e| format!("- ⚠️ 该媒体获取失败：{e}")),
-            );
-            format!("【用户发来媒体】\n{}\n\n——\n\n", lines.join("\n"))
-        };
+        // v13 P3：存在性检查与过期占位见 media_hint_for。
+        let media_hint = media_hint_for(&msg.media, &msg.media_errors);
 
         // 新建 session（无 existing）时，一次性注入压缩摘要作为前情摘要。
         // P1-K：摘要删除推迟到 run 成功落库后——若 run 失败（session 未建成），
@@ -338,6 +354,10 @@ impl Dispatcher {
         // Wave B-2：本轮起点的询问登记计数快照——结束时对比，判定「本轮是否
         // 发生过审批/询问」（完成强提醒触发条件）。
         let asks_at_start = self.router.ask_count(&conv.0).await;
+        // v13 P3：本轮 **Permission 类**审批登记计数快照——D3 看门狗豁免上限
+        // 按本轮审批次数放大（见消费循环 D3 分支注释；Ask 类不计：终端
+        // ask_via_im 的超时可到 86400s，不得放大豁免预算）。
+        let perm_asks_at_start = self.router.permission_ask_count(&conv.0).await;
         let (tx, mut rx) = mpsc::channel::<AgentChunk>(32);
         let backend = self.backend.clone();
         let workdir = self.resolve_workdir(&conv.0).await;
@@ -388,8 +408,17 @@ impl Dispatcher {
         // 正常收尾（成功/失败/中断）由 run_agent_round 统一清除；进程崩溃/
         // kill -9 时残留，下次启动 recover_crashed_rounds 转成 last_prompt
         //（复用 /retry 完整机制）并通知会话。best-effort，失败不阻轮次。
+        // v13 P3（双注入修复）：落 **base_prompt**（注入前，与 last_prompt 同源
+        // 的 retry_prompt）而非注入后的 prompt——恢复转 /retry 重放时走完整
+        // 注入管道，摘要/媒体提示由重放轮各自恰好注入一次；存注入后版本会把
+        // 【前情摘要】与陈旧媒体路径提示二次带进重放轮（崩溃轮未成功落库、
+        // 摘要未删且 existing=None → 再注入一次）。纯媒体轮 base 为空也照落
+        //（崩溃标记语义不变），恢复侧对空 prompt 清标记不引导 /retry。
         {
-            let payload = serde_json::json!({ "prompt": prompt, "at": now_secs() });
+            let payload = serde_json::json!({
+                "prompt": retry_prompt.as_deref().unwrap_or(""),
+                "at": now_secs()
+            });
             if let Err(e) = self
                 .store
                 .set_config(&format!("inflight_prompt:{}", conv.0), &payload.to_string())
@@ -540,8 +569,9 @@ impl Dispatcher {
         // 查询会把终端侧（ask_via_im / 终端 agent 经 permission socket）挂在
         // 同一 conv 的 Permission pending 也计入——其超时可到 86400s，足以把
         // IM 轮的空闲看门狗无限豁免（agent_timeout 缺省 0 = 永不超时）。
-        // 本会话审批自身预算 = permission_ask_timeout，合法豁免不会超过它；
-        // 超过即照常判空闲。任何 chunk 到达（审批后 agent 复工）重置预算。
+        // 本会话审批自身预算 = permission_ask_timeout × 本轮审批次数（v13 P3
+        // 起按次放大，见 D3 分支），合法豁免不会超过它；超过即照常判空闲。
+        // 任何 chunk 到达（审批后 agent 复工）重置预算。
         let mut exempt_secs: u64 = 0;
         // v1.23 心跳节拍：recv 超时统一取 min(idle_timeout, HEARTBEAT_TICK)，
         // 静默期每拍做一次卡片心跳（footer 时长走动 + 审批等待态翻转）——
@@ -606,7 +636,20 @@ impl Dispatcher {
                             .has_pending_of_kind(&conv.0, PendingKind::Permission)
                             .await;
                         if since_chunk.elapsed() >= idle_timeout {
-                            if exempt_secs < self.permission_ask_timeout.as_secs() && waiting {
+                            // v13 P3：豁免上限 = permission_ask_timeout ×
+                            // max(1, 本轮 Permission 类审批登记数)。旧实现钳死
+                            // 单次预算（默认 900s）：同轮 N 个连续慢审批各有
+                            // 独立预算，agent 审批间隙无 chunk 时累计静默
+                            // N×等待时长 会超过单次预算，第 N 个审批中途被看门狗
+                            // 误杀。防挂死语义不变——豁免仍要求 Permission pending
+                            // 在场（waiting），审批自身由 permission_ask_timeout
+                            // 超时 fail-closed 兜底，pending 消失后按原预算照常
+                            // 判停（max(1) 保底 = 无审批长静默仍按单次预算杀）。
+                            let perm_asks = self.router.permission_ask_count(&conv.0).await;
+                            let exempt_cap = self.permission_ask_timeout.as_secs().saturating_mul(
+                                perm_asks.saturating_sub(perm_asks_at_start).max(1),
+                            );
+                            if exempt_secs < exempt_cap && waiting {
                                 // 豁免：累计静默秒数进豁免预算，重排静默起点
                                 //（语义同旧的逐段累加：审批期间逐步烧预算）。
                                 exempt_secs += since_chunk.elapsed().as_secs().max(1);
