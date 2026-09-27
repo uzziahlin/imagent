@@ -1413,9 +1413,12 @@ mod tests {
             s.append_text(&format!("s{i}"));
         }
         let elapsed = t0.elapsed();
+        // 上界取「串行被平台 IO 阻塞（10 × 200ms = 2s）」与「完全无阻塞」之间
+        // 的 1.5s：证明消费路径不被平台延迟钉死即可——CI 慢机的调度抖动不该
+        // 让断言 flake（此前 500ms 在 2 核 runner 上偶发超限）。
         assert!(
-            elapsed < Duration::from_millis(500),
-            "消费方不得被平台 IO 阻塞（10 次 append 应在单次 update 延迟内完成）: {elapsed:?}"
+            elapsed < Duration::from_millis(1500),
+            "消费方不得被平台 IO 阻塞（10 次 append 应远快于串行 2s）: {elapsed:?}"
         );
         s.finalize(None, &[], CardTerminal::Done).await;
         assert!(
