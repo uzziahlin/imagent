@@ -2,6 +2,15 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [Unreleased]
+
+### Changed
+- **rusqlite 0.31 → 0.40.2（供应链，CODE_REVIEW_v13 P3）**：bundled SQLite
+  3.45.0 → 3.53.2（2024 初 → 当前），业务 API 零变更；cargo-audit 对 bundled
+  C 代码的 CVE 失明——dependabot（weekly）承接版本更新提醒，季度人工核对
+  libsqlite3-sys（见根 Cargo.toml 注释 + CONTRIBUTING）；/doctor 增
+  「SQLite <version>（bundled）」运行时可观测行
+
 ## [1.27.0] — 2026-09-27
 
 > **v13 深度审查修复批**（docs/CODE_REVIEW_v13.md：四路对抗深审，4 P1 +

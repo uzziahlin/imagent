@@ -2970,6 +2970,13 @@ async fn status_doctor_reconnect_reply() {
             .any(|t| t.contains("🩺") && t.contains("存储读写正常")),
         "/doctor 应含自检结果: {inbox:?}"
     );
+    // T16：/doctor 展示 bundled SQLite 版本（内嵌 C 代码的 CVE 不进 cargo-audit）。
+    assert!(
+        inbox
+            .iter()
+            .any(|t| t.contains("🩺") && t.contains("SQLite 3.")),
+        "/doctor 应含 SQLite 版本行: {inbox:?}"
+    );
     // MockPlatform 未覆写 reconnect → 默认不支持，回告警而非成功。
     assert!(
         inbox.iter().any(|t| t.contains("重连指令失败")),

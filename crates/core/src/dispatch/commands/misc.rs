@@ -208,6 +208,12 @@ impl Dispatcher {
             Err(e) => lines.push(format!("⚠️ 存储写入失败：{e}")),
         }
         let _ = self.store.delete_config(&probe_key).await;
+        // T16：SQLite 版本可观测——bundled SQLite 的 CVE 不进 cargo-audit，
+        // 部署侧从 /doctor 看实际内嵌版本（编译期常量 = bundled 运行时版本）。
+        lines.push(format!(
+            "ℹ️ SQLite {}（bundled）",
+            imagent_store::sqlite_version()
+        ));
         let n_sess = self.store.count_sessions().await.unwrap_or(-1);
         if n_sess >= 0 {
             lines.push(format!("✅ 会话映射：{n_sess} 条"));
