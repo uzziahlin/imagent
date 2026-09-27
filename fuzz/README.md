@@ -29,5 +29,5 @@ corpus / crash artifacts 存于 `fuzz/<target>/`（已 gitignore）。
 |---|---|
 | `ilink_proto_parse` | `proto::parse_frame` 帧解析（任意字节） |
 | `ilink_media_cdn_host` | `media::assert_cdn_host` SSRF host 校验（任意 URL） |
-| `feishu_event_parse` | 飞书事件 payload 解析（消息/卡片回调/云文档评论，任意 JSON） |
+| `feishu_event_parse` | 飞书 drain 链**全部**纯解析/谓词函数（v13-P3 补齐）：消息（`parse_message_event` / `parse_merged_forward_event`，MentionPolicy × bot 两态 / `unsupported_message_notice` / `peek_reply_parent` / `peek_group_reply_parent` / `thread_key_of_payload`）+ 事件（卡片回调 / 云文档评论 / 表情回应 / 菜单 / 撤回 / bot 进出群）+ 引用正文转录（`quoted_context_text` / `card_text_transcript`，任意 JSON） |
 | `wecom_frame_parse` | 企微 WS 入站帧两级解析：`proto::parse_frame` → `proto::parse_msg_callback`（任意 JSON 文本） |
