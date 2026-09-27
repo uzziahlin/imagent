@@ -11,7 +11,8 @@
 //! parent 提取），不写完整 JSON 比对（脆）。
 
 use imagent_feishu::proto::{
-    parse_merged_forward_event, parse_message_event, peek_reply_parent, MentionPolicy,
+    parse_comment_event, parse_merged_forward_event, parse_message_event, peek_reply_parent,
+    MentionPolicy,
 };
 
 fn fixture(name: &str) -> Vec<u8> {
@@ -73,4 +74,44 @@ fn replay_p2p_text() {
     assert_eq!(msg.text.as_deref(), Some("帮我看看这个"));
     assert!(pending.is_empty());
     assert!(peek_reply_parent(&payload).is_none(), "非回复形态无 parent");
+}
+
+/// 云文档**划词**评论 @bot（T13）：comment_id / 发起者 / conv 解析 + 引用片段
+/// 注入块在位。字段形态以 fixture 钉住——`quote` 对齐官方评论实体字段名
+///（file-comment list API 的「局部评论的引用字段」），事件侧未经真机抓包
+/// 确认前以此为假设基线（漂移 → fail-soft 不注入，本断言红即字段变了）。
+#[test]
+fn replay_comment_docx_quote() {
+    let payload = fixture("comment_docx_quote.json");
+    let (key, comment_id, msg) = parse_comment_event(&payload, BOT)
+        .unwrap_or_else(|| panic!("划词评论事件应被解析（@bot 在 content at 节点）"));
+    assert!(!key.is_empty(), "dedup key 存在");
+    // 回复目标锚点（drain 登记进锚点表）与轮次发起者。
+    assert_eq!(comment_id, "7034fixturecm1");
+    assert_eq!(msg.conv_id.0, "feishu:comment:doxcnFixture");
+    assert_eq!(msg.sender.0, "ou_fixture_user");
+    // 引用片段注入块：块头 → 引用原文 → 用户评论正文。
+    let text = msg.text.as_deref().expect("应有正文");
+    let blk = text.find("【评论所在文档片段】").expect("引用块在位");
+    let quote = text
+        .find("本季度 Northwind 区域营收环比下降 12%")
+        .expect("被引用的文档原文片段在位");
+    let body = text.find("这段为什么下滑").expect("评论正文保留");
+    assert!(blk < quote && quote < body, "块头→引用→正文: {text}");
+}
+
+/// 云文档**全文**评论 @bot（is_whole、无 quote）：无引用片段可注入——正文
+/// 原样通过（fail-soft 不注入，主链路不受影响）。
+#[test]
+fn replay_comment_docx_whole_no_quote() {
+    let payload = fixture("comment_docx_whole.json");
+    let (_, comment_id, msg) =
+        parse_comment_event(&payload, BOT).unwrap_or_else(|| panic!("全文评论事件应被解析"));
+    assert_eq!(comment_id, "7034fixturecm2");
+    let text = msg.text.as_deref().unwrap_or_default();
+    assert!(
+        !text.contains("【评论所在文档片段】"),
+        "无 quote 不注入: {text}"
+    );
+    assert_eq!(text, " 总结一下全文要点", "正文原样: {text}");
 }

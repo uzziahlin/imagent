@@ -93,6 +93,17 @@ struct AskRender {
     sender: String,
 }
 
+/// T13：per 评论者的回复锚点条目（comment_id + LRU 时间戳）。
+#[derive(Debug, Clone)]
+struct CommentAnchorEntry {
+    comment_id: String,
+    touched: Instant,
+}
+
+/// per-conv 评论者锚点表上限（LRU 淘汰最久未活跃——单文档同时活跃的评论者
+/// 远低于此；与 ConvState 表的 housekeeping 粗上限独立，此处按 touched 精确 LRU）。
+const COMMENT_ANCHOR_CAP: usize = 64;
+
 /// 飞书 Platform 适配器。
 ///
 /// 持有发消息所需的 core 配置 + 凭据 + token 缓存；收消息由后台 WS task 推入
@@ -106,8 +117,14 @@ struct AskRender {
 struct ConvState {
     /// 最近一次入站消息 sender（轮次发起者近似——审批卡/终止按钮的点击者校验锚）。
     sender: Option<String>,
-    /// 评论 conv（`feishu:comment:<token>`）→ 最近评论 comment_id（回复目标锚点）。
+    /// 评论 conv 的**回退**锚点：最近一条评论的 comment_id（轮次发起者无评论
+    /// 记录时用它回复——进程重启后 per 评论者表已清、或发起者非评论触发）。
     comment_anchor: Option<String>,
+    /// T13 回复锚定评论者：评论者 open_id → 其最近评论 id。回复按**轮次发起者**
+    /// （[`ConvState::round_initiator`]）取锚——A @bot 提问后 B 抢先评论，A 的
+    /// 回答不再被拽到 B 的评论线程下（此前单一「最近评论」锚点的归属错乱）。
+    /// 容量 [`COMMENT_ANCHOR_CAP`]，LRU 淘汰（见 [`ConvState::note_comment`]）。
+    comment_anchors: HashMap<String, CommentAnchorEntry>,
     /// 群 conv 回复锚点（本轮发起消息 id——send_typing 从 last_inbound 提升）。
     reply_anchor: Option<String>,
     /// 最近一条入站消息 id（回复锚点候选）。
@@ -137,6 +154,7 @@ impl Default for ConvState {
         Self {
             sender: None,
             comment_anchor: None,
+            comment_anchors: HashMap::new(),
             reply_anchor: None,
             last_inbound: None,
             thread_active_at: None,
@@ -147,6 +165,45 @@ impl Default for ConvState {
             round_initiator: None,
             last_touched: Instant::now(),
         }
+    }
+}
+
+impl ConvState {
+    /// T13：登记一条入站评论（drain 评论分支调用）——刷新「最近评论」回退锚点
+    /// 与评论者本人锚点。超 [`COMMENT_ANCHOR_CAP`] 时 LRU 淘汰最久未活跃的
+    /// **其他**评论者（同评论者更新走覆盖，不触发淘汰）。
+    fn note_comment(&mut self, sender: &str, comment_id: &str) {
+        self.comment_anchor = Some(comment_id.to_string());
+        if self.comment_anchors.len() >= COMMENT_ANCHOR_CAP
+            && !self.comment_anchors.contains_key(sender)
+        {
+            if let Some(oldest) = self
+                .comment_anchors
+                .iter()
+                .min_by_key(|(_, e)| e.touched)
+                .map(|(k, _)| k.clone())
+            {
+                self.comment_anchors.remove(&oldest);
+            }
+        }
+        self.comment_anchors.insert(
+            sender.to_string(),
+            CommentAnchorEntry {
+                comment_id: comment_id.to_string(),
+                touched: Instant::now(),
+            },
+        );
+    }
+
+    /// T13：解析评论回复目标锚点。优先**轮次发起者**的最近评论（A 的回答落回
+    /// A 的评论线程；发起者同人多次评论取其最新一条——仍是本人线程）；发起者
+    /// 未记录（重启/合成消息）或其无评论记录时，回退「最近一条评论」（与修复
+    /// 前行为一致，不更差）。发起者评论被 LRU 淘汰（>64 评论者）同样回退。
+    fn resolve_comment_anchor(&self, initiator: Option<&str>) -> Option<String> {
+        initiator
+            .and_then(|s| self.comment_anchors.get(s))
+            .map(|e| e.comment_id.clone())
+            .or_else(|| self.comment_anchor.clone())
     }
 }
 
@@ -770,11 +827,13 @@ impl FeishuPlatform {
                         parse_comment_event(&payload, bot.as_deref())
                     {
                         // 会话锚放宽：登记回复目标锚点（conv → comment_id）——发送
-                        // 侧（send_text/send_media 评论分支）据此路由回复。
+                        // 侧（send_text/send_media 评论分支）据此路由回复。T13：
+                        // 双锚点登记（评论者本人 + 最近评论回退），发送侧按轮次
+                        // 发起者解析（B 抢先评论不再截走 A 的回答）。
                         if dedup.check(&key) {
                             let mut m = conv_states_for_drain.lock().await;
                             let st = m.entry(cm.conv_id.0.clone()).or_default();
-                            st.comment_anchor = Some(comment_id);
+                            st.note_comment(&cm.sender.0, &comment_id);
                             st.last_touched = Instant::now();
                             drop(m);
                             if inbound_msg_tx.send(cm).await.is_err() {
@@ -1663,15 +1722,18 @@ impl FeishuPlatform {
         let text = &mask_emails(text);
         // P4-9：评论线程 conv → 回复云文档评论（每分片一条回复）。
         // 会话锚放宽批次：conv 只锚 file_token，回复目标 comment_id 优先取 drain
-        // 登记的锚点表（最近一条评论）；存量 conv 的内嵌形态兜底。两者皆无（进程
+        // 登记的锚点表；存量 conv 的内嵌形态兜底。两者皆无（进程
         // 刚重启、锚点表为空）无法定位评论线程，如实报错。
+        // T13：锚点按**轮次发起者**解析（A 的回答落回 A 的评论线程），发起者
+        // 无记录回退最近一条评论——此前恒取「最新评论」，B 抢先评论会把 A 的
+        // 回答回复到 B 的评论下（归属错乱）。
         if let Some((file_token, legacy_cid)) = comment_target_from_conv(conv) {
             let comment_id = self
                 .conv_states
                 .lock()
                 .await
                 .get(&conv.0)
-                .and_then(|s| s.comment_anchor.clone())
+                .and_then(|s| s.resolve_comment_anchor(s.round_initiator.as_deref()))
                 .or(legacy_cid);
             let Some(comment_id) = comment_id else {
                 return Err(CoreError::Platform(
@@ -3042,12 +3104,14 @@ impl Platform for FeishuPlatform {
         // 文件实体评论回复不支持（drive 评论内容实体只有 text/at/img——离线确认，
         // **待真机校准**），给用户可读错误而非静默失败。
         if let Some((file_token, legacy_cid)) = comment_target_from_conv(conv) {
+            // T13：锚点解析与 send_text 评论分支同款——轮次发起者优先，最近
+            // 评论回退（B 抢先评论不截走 A 的回答）。
             let comment_id = self
                 .conv_states
                 .lock()
                 .await
                 .get(&conv.0)
-                .and_then(|s| s.comment_anchor.clone())
+                .and_then(|s| s.resolve_comment_anchor(s.round_initiator.as_deref()))
                 .or(legacy_cid);
             let Some(comment_id) = comment_id else {
                 return Err(CoreError::Platform(
@@ -4662,5 +4726,165 @@ mod tests {
         let quote = text.find("（用户引用了以下消息").expect("引用块在位");
         let body = text.find("这个报错怎么修").expect("正文在位");
         assert!(group < quote && quote < body, "群上下文→引用→正文: {text}");
+    }
+
+    // ---------- T13：评论回复锚定轮次发起者 + 引用片段注入 ----------
+
+    /// 构造指向 mock 的 platform（token 预填缓存，不打真 token 端点）。
+    async fn mk_platform_with_mock(base: &str) -> FeishuPlatform {
+        let p = FeishuPlatform::new(
+            "cli_test".into(),
+            "secret_test".into(),
+            base.to_string(),
+            true,
+            None,
+            300,
+            None,
+            1800,
+            true,
+            None,
+            0.0,
+            false,
+            0,
+        )
+        .expect("构造");
+        *p.token.write().await = Some(("t_mock".to_string(), Instant::now()));
+        p
+    }
+
+    /// 核心场景：A @bot 提问（c_a）→ B 抢先又评论（c_b，更晚登记）→ 回复的
+    /// reply_comment POST 锚定 **A** 的 comment_id（此前恒取「最新评论」会把
+    /// A 的回答拽到 B 的评论线程下）。mock 回环断言真实请求路径（只记录评论
+    /// 回复路径——后台 WS 重连也会打到 mock，须滤除防串扰）。
+    #[tokio::test]
+    async fn comment_reply_anchors_round_initiator() {
+        let hits: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let hits_c = hits.clone();
+        let base = spawn_mock_feishu(std::sync::Arc::new(move |path: &str| {
+            if path.contains("/comments/") {
+                hits_c.lock().unwrap().push(path.to_string());
+            }
+            (200u16, r#"{"code":0,"msg":"success"}"#.to_string())
+        }))
+        .await;
+        let p = mk_platform_with_mock(&base).await;
+        {
+            let mut m = p.conv_states.lock().await;
+            let st = m.entry("feishu:comment:ft_doc".into()).or_default();
+            st.note_comment("ou_a", "c_a");
+            st.note_comment("ou_b", "c_b"); // B 抢先评论（最新登记）
+            st.round_initiator = Some("ou_a".into()); // 轮次由 A 发起
+        }
+        p.send_text(
+            &ConvId("feishu:comment:ft_doc".into()),
+            "A 问题的答案",
+            &ReplyHint::None,
+        )
+        .await
+        .expect("评论回复应成功");
+        let paths = hits.lock().unwrap();
+        assert_eq!(
+            paths.last().map(String::as_str),
+            Some("/open-apis/drive/v1/files/ft_doc/comments/c_a/replies"),
+            "回复锚定轮次发起者 A 的评论: {paths:?}"
+        );
+    }
+
+    /// 回退链：发起者无评论记录 / 无发起者 → 回退「最近一条评论」（修复前
+    /// 行为，不更差）；锚点表整空 → 存量 conv 内嵌 comment_id 兜底；发起者
+    /// 同人多次评论 → 取其最新一条（仍是本人线程）。
+    #[tokio::test]
+    async fn comment_reply_anchor_fallbacks() {
+        let hits: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let hits_c = hits.clone();
+        let base = spawn_mock_feishu(std::sync::Arc::new(move |path: &str| {
+            if path.contains("/comments/") {
+                hits_c.lock().unwrap().push(path.to_string());
+            }
+            (200u16, r#"{"code":0,"msg":"success"}"#.to_string())
+        }))
+        .await;
+        let p = mk_platform_with_mock(&base).await;
+        let conv = ConvId("feishu:comment:ft_doc".into());
+        // ① 发起者（ou_c）无评论记录 → 回退最近一条（c_b）。
+        {
+            let mut m = p.conv_states.lock().await;
+            let st = m.entry(conv.0.clone()).or_default();
+            st.note_comment("ou_a", "c_a");
+            st.note_comment("ou_b", "c_b");
+            st.round_initiator = Some("ou_c".into());
+        }
+        p.send_text(&conv, "1", &ReplyHint::None).await.unwrap();
+        // ② 无发起者记录（重启后）→ 同样回退最近一条。
+        p.conv_states
+            .lock()
+            .await
+            .get_mut(&conv.0)
+            .unwrap()
+            .round_initiator = None;
+        p.send_text(&conv, "2", &ReplyHint::None).await.unwrap();
+        // ③ 发起者同人两次评论 → 取其最新。
+        {
+            let mut m = p.conv_states.lock().await;
+            let st = m.get_mut(&conv.0).unwrap();
+            st.note_comment("ou_a", "c_a2");
+            st.round_initiator = Some("ou_a".into());
+        }
+        p.send_text(&conv, "3", &ReplyHint::None).await.unwrap();
+        // ④ 锚点表整空 + 存量内嵌形态 conv → 内嵌 comment_id 兜底。
+        p.send_text(
+            &ConvId("feishu:comment:ft_legacy:c_old".into()),
+            "4",
+            &ReplyHint::None,
+        )
+        .await
+        .unwrap();
+        let paths = hits.lock().unwrap();
+        let expected = [
+            "/open-apis/drive/v1/files/ft_doc/comments/c_b/replies",
+            "/open-apis/drive/v1/files/ft_doc/comments/c_b/replies",
+            "/open-apis/drive/v1/files/ft_doc/comments/c_a2/replies",
+            "/open-apis/drive/v1/files/ft_legacy/comments/c_old/replies",
+        ];
+        assert_eq!(&*paths, &expected, "回退链按序生效");
+    }
+
+    /// 评论者锚点表 LRU：超 [`COMMENT_ANCHOR_CAP`]（64）淘汰最久未活跃条目；
+    /// 同评论者更新走覆盖不触发淘汰；「最近评论」回退锚点不受 LRU 影响。
+    #[test]
+    fn comment_anchor_map_lru_cap() {
+        let mut st = ConvState::default();
+        for i in 0..COMMENT_ANCHOR_CAP {
+            st.note_comment(&format!("ou_{i}"), "c");
+        }
+        assert_eq!(st.comment_anchors.len(), COMMENT_ANCHOR_CAP);
+        // 拨定 LRU 序：手工把 ou_0 的 touched 置为当前（必然晚于上面全部插入）。
+        let now = Instant::now();
+        st.comment_anchors.get_mut("ou_0").unwrap().touched = now;
+        // 同评论者（ou_1）更新：不淘汰、len 不变、id 已刷新。
+        st.note_comment("ou_1", "c_1b");
+        assert_eq!(st.comment_anchors.len(), COMMENT_ANCHOR_CAP);
+        assert_eq!(
+            st.resolve_comment_anchor(Some("ou_1")).as_deref(),
+            Some("c_1b")
+        );
+        // 新评论者进入：LRU 淘汰最久未活跃的 ou_2（ou_0 已拨新、ou_1 刚更新）。
+        st.note_comment("ou_new", "c_new");
+        assert_eq!(st.comment_anchors.len(), COMMENT_ANCHOR_CAP, "上限不变");
+        assert!(st.comment_anchors.contains_key("ou_0"), "活跃者保留");
+        assert!(st.comment_anchors.contains_key("ou_1"), "刚更新者保留");
+        assert!(
+            !st.comment_anchors.contains_key("ou_2"),
+            "最久未活跃者被淘汰"
+        );
+        assert_eq!(
+            st.resolve_comment_anchor(Some("ou_new")).as_deref(),
+            Some("c_new")
+        );
+        // 被淘汰者回退「最近评论」（c_new 刚登记即最近）。
+        assert_eq!(
+            st.resolve_comment_anchor(Some("ou_2")).as_deref(),
+            Some("c_new")
+        );
     }
 }
