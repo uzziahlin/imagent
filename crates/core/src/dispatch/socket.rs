@@ -138,6 +138,9 @@ impl Dispatcher {
         // P2（v13）：per-conv 状态表句柄——permission 分支注册 pending 时读该
         // conv 的轮次发起者做锚定（T18 起发起者活在 ConvState 单表）。
         let conv_states = self.conv_states.clone();
+        // T12：Bitable 数据面句柄——kind=bitable 分支实时读当前注入值（SIGHUP
+        // 热改对后续请求即时生效）。
+        let bitable = self.bitable.clone();
         tokio::spawn(async move {
             // 鉴权基准：只接受与本进程同 uid 的连接（MCP 子进程由本进程 spawn，必然同 uid）。
             // P2-7/P5-9b 威胁模型：peer_uid 防「跨 uid 伪造」；握手 token 把「同 uid
@@ -162,6 +165,7 @@ impl Dispatcher {
                                     let expected_token = expected_token.clone();
                                     let permission_mode = permission_mode.clone();
                                     let conv_states = conv_states.clone();
+                                    let bitable = bitable.clone();
                                     tasks.lock().await.spawn(async move {
                                         Self::handle_permission_socket(
                                             stream,
@@ -174,6 +178,7 @@ impl Dispatcher {
                                             expected_token,
                                             permission_mode,
                                             conv_states,
+                                            bitable,
                                         )
                                         .await;
                                     });
@@ -301,6 +306,7 @@ impl Dispatcher {
         expected_token: String,
         permission_mode: std::sync::Arc<parking_lot::RwLock<PermissionMode>>,
         conv_states: super::ConvStates,
+        bitable: super::BitableHandle,
     ) {
         // P5-9b：读两行——首行握手 token、次行 JSON 请求。必须共用一个 BufReader：
         // 分开建会把第二行的数据吞进被丢弃的缓冲区。reader 在块内 drop 以释放
@@ -371,6 +377,11 @@ impl Dispatcher {
                 // notify_via_im：单向通知——直接 send_text 到目标 conv，不进
                 // router（不占 pending 槽、不等回复），结果一行 JSON 回写 socket。
                 Self::handle_notify_socket(stream, platform, conv, &req).await;
+            }
+            SocketKind::Bitable => {
+                // T12：Bitable 数据面——list_fields/append_row 转注入的 BitableApi
+                //（feishu 实现），不进 router（无 IM 交互），结果一行 JSON 回写。
+                Self::handle_bitable_socket(stream, bitable, conv, &req).await;
             }
             SocketKind::Permission => {
                 Self::handle_permission_kind_socket(
@@ -655,6 +666,143 @@ impl Dispatcher {
         .await;
     }
 
+    /// `kind = "bitable"`（T12 数据面）：`op=list_fields|append_row` → 注入的
+    /// [`BitableApi`](crate::bitable::BitableApi)（feishu 实现）。
+    ///
+    /// 请求字段：`op`（必填）、`fields`（append_row 必填：键=列名、值=标量）；
+    /// 回复一行 JSON：`{"kind":"bitable","ok":true,"data":...}`（list_fields=
+    /// 字段数组 / append_row=record_id）/ `{"kind":"bitable","ok":false,
+    /// "error":"..."}`。未注入（None，配置不齐备/非 feishu）→ 回
+    /// [`crate::bitable::NOT_CONFIGURED_MSG`]（配置引导，fail-fast 不静默）。
+    #[cfg(unix)]
+    async fn handle_bitable_socket(
+        mut stream: tokio::net::UnixStream,
+        bitable: super::BitableHandle,
+        conv: ConvId,
+        req: &serde_json::Value,
+    ) {
+        let op = req
+            .get("op")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let Some(api) = bitable.read().clone() else {
+            warn!(
+                target: "imagent::core",
+                conv_id = %conv.0,
+                op = %op,
+                "bitable 请求被拒：数据面未注入（feishu_bitable_* 未配置齐备）"
+            );
+            Self::write_bitable_reply(
+                &mut stream,
+                false,
+                None,
+                Some(crate::bitable::NOT_CONFIGURED_MSG),
+            )
+            .await;
+            return;
+        };
+        match op.as_str() {
+            "list_fields" => match api.list_fields().await {
+                Ok(fields) => {
+                    info!(
+                        target: "imagent::core",
+                        conv_id = %conv.0,
+                        count = fields.len(),
+                        "bitable list_fields 已回包"
+                    );
+                    let data = serde_json::to_value(&fields).unwrap_or_default();
+                    Self::write_bitable_reply(&mut stream, true, Some(&data), None).await;
+                }
+                Err(e) => {
+                    warn!(
+                        target: "imagent::core",
+                        conv_id = %conv.0,
+                        error = %e,
+                        "bitable list_fields 失败（飞书 API 错误透传）"
+                    );
+                    Self::write_bitable_reply(&mut stream, false, None, Some(&e.to_string())).await;
+                }
+            },
+            "append_row" => {
+                let fields = req.get("fields").and_then(|v| v.as_object());
+                let Some(fields) = fields.filter(|f| !f.is_empty()) else {
+                    Self::write_bitable_reply(
+                        &mut stream,
+                        false,
+                        None,
+                        Some("fields 必须是非空对象（键=列名，值=标量）"),
+                    )
+                    .await;
+                    return;
+                };
+                match api.append_row(fields.clone()).await {
+                    Ok(record_id) => {
+                        info!(
+                            target: "imagent::core",
+                            conv_id = %conv.0,
+                            record_id = %record_id,
+                            cols = fields.len(),
+                            "bitable append_row 已写入"
+                        );
+                        Self::write_bitable_reply(
+                            &mut stream,
+                            true,
+                            Some(&serde_json::json!(record_id)),
+                            None,
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        warn!(
+                            target: "imagent::core",
+                            conv_id = %conv.0,
+                            error = %e,
+                            "bitable append_row 失败（飞书 API 错误透传——字段名不匹配是高频原因）"
+                        );
+                        Self::write_bitable_reply(&mut stream, false, None, Some(&e.to_string()))
+                            .await;
+                    }
+                }
+            }
+            _ => {
+                Self::write_bitable_reply(
+                    &mut stream,
+                    false,
+                    None,
+                    Some(&format!(
+                        "unknown op: {op:?}（可用 list_fields | append_row）"
+                    )),
+                )
+                .await;
+            }
+        }
+    }
+
+    /// 写 bitable 分支的一行 JSON 回复（形态见 [`Self::handle_bitable_socket`]）。
+    #[cfg(unix)]
+    async fn write_bitable_reply(
+        stream: &mut tokio::net::UnixStream,
+        ok: bool,
+        data: Option<&serde_json::Value>,
+        error: Option<&str>,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        let mut resp = serde_json::json!({ "kind": "bitable", "ok": ok });
+        if ok {
+            resp["data"] = data.cloned().unwrap_or(serde_json::Value::Null);
+        } else if let Some(e) = error {
+            resp["error"] = serde_json::json!(e);
+        }
+        let mut out = resp.to_string();
+        out.push('\n');
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let _ = stream.write_all(out.as_bytes()).await;
+            let _ = stream.flush().await;
+        })
+        .await;
+    }
+
     /// `kind = "permission"`（缺省）：原有审批语义，带 request_id。
     ///
     /// - **P1-3**：send_text 失败时回写 deny 并 return（不挂 pending——否则用户看不到
@@ -907,18 +1055,20 @@ impl Dispatcher {
 }
 
 /// socket 请求的 kind 分类（纯函数，便于单测）：ask=终端问答、notify=单向通知、
-/// 其余（含缺省 "permission"）=IM 权限审批。
+/// bitable=多维表格数据面（T12）、其余（含缺省 "permission"）=IM 权限审批。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SocketKind {
     Permission,
     Ask,
     Notify,
+    Bitable,
 }
 
 pub(crate) fn classify_socket_kind(kind: &str) -> SocketKind {
     match kind {
         "ask" => SocketKind::Ask,
         "notify" => SocketKind::Notify,
+        "bitable" => SocketKind::Bitable,
         _ => SocketKind::Permission,
     }
 }
@@ -1057,12 +1207,13 @@ mod notify_tests {
         assert!(t2.contains("通知") && t2.ends_with("done"), "{t2}");
     }
 
-    /// dispatch 分支：kind 值映射——"notify" 走单向通知，"ask" 走问答，其余
-    /// （含缺省 "permission"）走审批。
+    /// dispatch 分支：kind 值映射——"notify" 走单向通知，"ask" 走问答，
+    /// "bitable" 走数据面，其余（含缺省 "permission"）走审批。
     #[test]
     fn socket_kind_routing_words() {
         assert_eq!(classify_socket_kind("notify"), SocketKind::Notify);
         assert_eq!(classify_socket_kind("ask"), SocketKind::Ask);
+        assert_eq!(classify_socket_kind("bitable"), SocketKind::Bitable);
         assert_eq!(classify_socket_kind("permission"), SocketKind::Permission);
         // 未知/缺省 kind 回落审批语义（与旧协议兼容）。
         assert_eq!(classify_socket_kind("unknown"), SocketKind::Permission);

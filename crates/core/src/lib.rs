@@ -17,6 +17,7 @@ pub mod agent_process;
 mod auth;
 mod backend;
 pub mod backend_common;
+pub mod bitable;
 mod card_session;
 mod config;
 pub mod dedup;
@@ -34,6 +35,7 @@ mod types;
 
 pub use auth::Auth;
 pub use backend::{Backend, ImPermissionAsk, ImPermissionHook, PermissionCapability};
+pub use bitable::{BitableApi, BitableField};
 pub use card_session::sweep_live_cards;
 pub use config::{
     validate_workdir, Config, CotDetail, PermissionMode, QuietHours, ReplyMode, WebhookEntry,

@@ -42,7 +42,7 @@ imagent 是一个常驻网关进程：监听 IM 私聊 / 群聊消息 → 鉴权
 - 💭 **thinking / 任务清单**：思考过程与正文分离透出（卡片折叠区展示，cot 档位控制）；Claude Code 的 Task* / ACP Plan 渲染成卡片 checklist 进度。
 - 🎤 **语音输入（飞书）**：语音条自动转文字进 prompt（speech_to_text，需后台申请语音识别权限）。
 - 🛠️ **IM 内运维**：`/status` `/doctor` `/reconnect` `/config`（COT 三档展示 off/brief/detailed 等热改；SIGHUP 热载工具白名单/审批集/管理员名单/压缩阈值）。
-- 📄 **飞书生态**（一等公民）：CardKit 真流式卡片（分阶段 footer + 工具 ⏳/✅ 实时行 + ⏹ 终止按钮）、审批/问题/命令标题卡（按钮 primary/danger + flow 自适应布局）、`/config` 下拉表单卡、邮箱掩码防租户审计拦截、云文档评论 @bot 触发（同评论线程回复）、合并转发聊天记录自动转录、**群聊上下文注入**（群消息触发轮次自动拉本群最近 N 条消息作前置上下文——Slack 线程上下文的飞书等价物，`feishu_group_context_messages`，默认 10、0=关闭）、**群里回复 bot 消息发图/文件 = 显式定向**（豁免 @，手机端纯图片可达）。
+- 📄 **飞书生态**（一等公民）：CardKit 真流式卡片（分阶段 footer + 工具 ⏳/✅ 实时行 + ⏹ 终止按钮）、审批/问题/命令标题卡（按钮 primary/danger + flow 自适应布局）、`/config` 下拉表单卡、邮箱掩码防租户审计拦截、云文档评论 @bot 触发（同评论线程回复）、合并转发聊天记录自动转录、**群聊上下文注入**（群消息触发轮次自动拉本群最近 N 条消息作前置上下文——Slack 线程上下文的飞书等价物，`feishu_group_context_messages`，默认 10、0=关闭）、**群里回复 bot 消息发图/文件 = 显式定向**（豁免 @，手机端纯图片可达）、**多维表格数据面**（agent 经 `bitable_list_fields` / `bitable_append_row` 工具把任务清单、巡检结果、成本台账等结构化产出直接写进飞书 Bitable——Slack 生态无等价物，见[多维表格数据面](#多维表格数据面agent-的结构化产出)）。
 - 💻 **终端 agent 反向接入（ask_via_im）**：电脑终端上任意 agent 需要你决策时，把问题转发到飞书——人不在电脑前也能在手机上点按钮作答；多 agent 并发按 request_id 精确分发（见[终端 agent 接入](#终端-agent-接入ask_via-im人不在电脑前也能问你)）。
 - 🧩 **Profile 多实例**：`--profile` 一部署多 bot 身份（config/db/socket/媒体全隔离）。
 - 🛡️ **限流熔断**：`sendmessage` 服从式退避（防封号，不绕风控）。
@@ -144,6 +144,8 @@ allowed_senders = []        # 留空 = 发现模式（先看日志拿你的 from
 # cot_detail = "brief"               # 工具过程展示 off / brief / detailed（/config 可热改；/config cot 为 per-conv 覆盖）
 # quiet_hours = "22:00-08:00"        # 免打扰时段(本地时区,可跨天)：时段内加急(buzz)提醒降级普通消息，内容不变；不设=不启用
 # feishu_thread_active_window_secs = 1800  # 话题群免@窗口(秒)：话题内近期有消息则豁免群消息须@bot；默认30分钟，0=关闭
+# feishu_bitable_app_token = "bascnXXX"    # 多维表格数据面（仅 feishu + claude-cli）：app_token + table_id 齐备才启用，
+# feishu_bitable_table_id  = "tblXXX"      #   agent 获得 bitable_list_fields/bitable_append_row 工具可向该表写行（建议专用表）
 # platform = "feishu"                # wecom/feishu 经 config 凭据接入（见下）
 
 # ===== 事件入站（v1.20 webhook；v1.21 防护套件 + GitHub 原生事件；v1.24 防重放）=====
@@ -229,7 +231,8 @@ imagent start            # 前台常驻，Ctrl-C 退出
 - `im:message`（读取与发送单聊、群聊消息）——必须。合并转发聊天记录转录（自动拉子消息转成文本给 agent 阅读）与群聊上下文注入（拉本群最近 N 条消息作前置上下文，`feishu_group_context_messages`）**复用同一读权限**（分别调「查询合并转发消息列表」「获取会话历史消息」接口，拉不到自动跳过不阻塞轮次）——真机确认：若拉取报权限错误，需在后台补开对应的 im:message 读权限并发布版本；
 - `im:message.group_at_msg`（仅收 @机器人 的群消息；要全收群消息改用 `group_msg` 并把 config 的 `feishu_require_mention_in_group` 设为 `false`）；
 - `cardkit:card:write`（CardKit 流式卡片）——可选，缺省自动降级整卡刷新；
-- `drive:comment`（云文档评论）——可选，配合上表评论事件。
+- `drive:comment`（云文档评论）——可选，配合上表评论事件；
+- `bitable:app`（多维表格读写）——可选，仅启用[多维表格数据面](#多维表格数据面agent-的结构化产出)时需要。
 
 **④ 发布生效**：「版本管理与发布」→ 创建版本并发布——**权限与事件订阅都要发布后才生效**，新手最常漏这步。
 
@@ -258,6 +261,30 @@ imagent allow ou_xxx        # 或 config 里填 allowed_senders = ["ou_xxx"]
 ```
 
 之后发消息 agent 即执行并回传；要启用终端 agent 提问转发（ask_via_im），再在 config 设 `ask_via_im_conv = "feishu:ou_xxx"`（见[终端 agent 接入](#终端-agent-接入ask_via-im人不在电脑前也能问你)）。
+
+## 多维表格（Bitable）数据面：agent 的结构化产出
+
+任务清单、巡检结果、成本台账这类**结构化**产出，此前只能刷屏卡片或落文件。开启 Bitable 数据面后，agent（claude-cli）直接把结果写进飞书多维表格——与 `/cron` 定时巡检天然咬合（每轮结果一行，表格即台账）；Slack 生态没有等价物。
+
+```toml
+# ~/.imagent/config.toml（platform = "feishu" 且 agent = "claude-cli" 时生效）
+feishu_bitable_app_token = "bascnXXX"   # 多维表格 URL .../base/<这段>
+feishu_bitable_table_id  = "tblXXX"     # 同 URL .../table/<这段>
+```
+
+两项**齐备才启用**（缺一整组不生效，启动时 warn 提示）；SIGHUP 热改生效。启用后 agent 的 MCP 工具面多出两个工具（复用 `imagent mcp` 审批 server 挂载，不新起子进程）：
+
+- `bitable_list_fields`——列出该表全部列（列名 + 类型），写行前先调它对齐列名；
+- `bitable_append_row`——追加一行（`fields` 键=列名、值=标量），返回 record_id。列名写错会被飞书拒绝，错误信息含原因（agent 可自行修正重试）。
+
+**安全注意**：
+
+- 启用 = agent 可向该表**追加任意行**（MVP 无删改面）。**建议用专用表**（如 `imagent-巡检台账`），不要指向生产台账；
+- 写入需过 IM 审批的用户，把 `mcp__imagent__bitable_append_row` 加进 `approval_tools`（ask 类档位下该工具每次写入都会进审批卡）；
+- 应用需开通 `bitable:app` 读写权限（见[接入飞书](#接入飞书完整流程)③）；
+- 仅 claude-cli 后端支持（ACP 的 MCP 配置不经 write_mcp_config）；仅 `platform = "feishu"` 生效，其它平台配置了会 warn 并忽略。
+
+链路：`claude（MCP stdio）→ imagent mcp server（bitable_* 工具）→ permission socket（kind=bitable）→ core BitableApi → 飞书 OpenAPI（走既有 429 退避）`。
 
 
 ## 后台常驻（imagent service）

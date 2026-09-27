@@ -14,11 +14,14 @@
 //!   分派）、`platform/ask.rs`（ask/审批卡生命周期）、`platform/outbox.rs`
 //!   （发送侧 outbox 泵）、`platform/state.rs`（per-conv 状态 + 媒体落盘 +
 //!   housekeeping）。
+//! - [`bitable`]：[`FeishuBitable`]（T12 数据面）——core `BitableApi` 的飞书
+//!   实现（list_fields / append_row，HTTP 走 client 的 429 退避）。
 //!
 //! 鉴权（白名单）由 core 做，本 crate 不做白名单——只透传 sender 的 `open_id`。
 
 #![forbid(unsafe_code)]
 
+mod bitable;
 mod card;
 mod client;
 mod metrics;
@@ -27,4 +30,5 @@ mod platform;
 /// 打外部输入攻击面（fuzz/fuzz_targets/feishu_event_parse.rs）。
 pub mod proto;
 
+pub use bitable::FeishuBitable;
 pub use platform::FeishuPlatform;
