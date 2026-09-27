@@ -460,9 +460,25 @@ struct ResumeEntry {
 /// /resume 列表缓存（D7）：key = (conv, sender)，值带写入时刻（TTL 惰性过期）。
 type ResumeCache = HashMap<(String, String), (Instant, Vec<ResumeEntry>)>;
 
+/// T11（v13 #4）：轮次内部进度快照（/tasks 面板数据源）。round 消费循环在
+/// TodoList / ToolUse chunk 处更新（std Mutex 短临界区，零 IO——chunk 消费路径
+/// 不因面板观测增加任何 await）；/tasks 只读克隆。纯文本平台（wecom/ilink）与
+/// 「不想翻卡片」场景由此获得轮次内部进度入口（/status 只有轮级摘要，此前
+/// checklist 进度仅卡片平台可见）。
+#[derive(Debug, Default, Clone)]
+pub(super) struct RoundSnapshot {
+    /// 最新任务清单（TodoList chunk 全量替换语义）。
+    pub(super) todos: Vec<crate::types::TodoItem>,
+    /// 本轮工具调用累计次数。
+    pub(super) tool_calls: usize,
+    /// 最近一次工具调用单行摘要（`Bash — git status`，展示格式即拼好）。
+    pub(super) last_tool: Option<String>,
+}
+
 /// 在飞轮次句柄（v1.17 steering）：
 /// - `abort`：/stop 中断用（原裸 AbortHandle）；
-/// - `steer`：运行中转向通道（control 通道 CLI 支持；None = 不支持，消息排队）。
+/// - `steer`：运行中转向通道（control 通道 CLI 支持；None = 不支持，消息排队）；
+/// - `snapshot`：T11 轮次进度共享快照（消费循环写、/tasks 读）。
 #[derive(Clone)]
 pub(super) struct RoundHandle {
     pub(super) abort: tokio::task::AbortHandle,
@@ -470,6 +486,8 @@ pub(super) struct RoundHandle {
     /// v1.26 /status 明细：轮次起跑时刻 + 任务摘要（task_digest 同源）。
     pub(super) started: std::time::Instant,
     pub(super) digest: Option<String>,
+    /// T11：进度快照句柄（Arc 共享——/stop remove 句柄后消费循环仍持有至轮末）。
+    pub(super) snapshot: Arc<std::sync::Mutex<RoundSnapshot>>,
 }
 
 pub struct Dispatcher {

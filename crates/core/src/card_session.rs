@@ -528,6 +528,9 @@ async fn patcher_task(
 /// P1-1 的核心约束；clippy::await_holding_lock 把关）。锁序：先 queued_hints
 /// （短暂持有）后 state，无嵌套。
 async fn dispatch_patch(env: &PatchEnv, state: &Mutex<CardState>, terminal: CardTerminal) -> bool {
+    // T11：patch 全路径计时（平台 send/update + live_cards 登记落库）——消费侧
+    // 可观测指标 imagent_card_patch_seconds 的唯一观测点。函数单出口，结尾 observe。
+    let patch_started = Instant::now();
     // ① 快照：排队提示 + 卡片内容（state 短临界区，无 await）。
     let queued = env
         .queued_hints
@@ -671,6 +674,9 @@ async fn dispatch_patch(env: &PatchEnv, state: &Mutex<CardState>, terminal: Card
             s.last_patch = Instant::now();
         }
     }
+    crate::metrics::METRICS
+        .card_patch_seconds
+        .observe(patch_started.elapsed().as_secs_f64());
     ok
 }
 

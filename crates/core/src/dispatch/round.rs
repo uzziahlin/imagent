@@ -59,6 +59,9 @@ impl TextCoalescer {
         }
         let text = std::mem::take(&mut self.buf);
         self.last_flush = Instant::now();
+        // T11：观察合帧效果——本次 flush 的字节量（delta 级 chunk 应聚成较大
+        // 消息；持续落在最小 bucket = 合帧失效，平台 QPS 又被逐条打爆）。
+        METRICS.text_flush_bytes.observe(text.len() as f64);
         if disp.reply_ok(conv, &text, hint).await {
             streamed_text.push_str(&text);
         }
@@ -466,6 +469,9 @@ impl Dispatcher {
                 }
             }
         });
+        // T11：轮次进度共享快照——消费循环在 TodoList/ToolUse chunk 处写入，
+        // /tasks 面板经 running 句柄只读（std Mutex 短临界区，零 IO）。
+        let round_snap = Arc::new(std::sync::Mutex::new(RoundSnapshot::default()));
         // P4-1：注册在飞句柄（/stop 中断用）。runner 持 conv 锁跨轮，同 conv 不可能
         // 并发两轮；轮次结束由 run_agent_round 统一移除。
         self.running.lock().await.insert(
@@ -475,6 +481,7 @@ impl Dispatcher {
                 steer: steer_capable.then_some(steer_tx),
                 started: std::time::Instant::now(),
                 digest: Some(first_prompt_digest.clone()),
+                snapshot: round_snap.clone(),
             },
         );
 
@@ -539,6 +546,9 @@ impl Dispatcher {
         const HEARTBEAT_TICK: std::time::Duration = std::time::Duration::from_secs(30);
         let mut since_chunk = std::time::Instant::now();
         loop {
+            // T11（v13 #4）：chunk channel 积压深度——每迭代刷新（背压先行信号：
+            // 消费被平台 IO 钉死时该值顶到容量 32 并停留，见 metrics.rs 取舍注释）。
+            METRICS.agent_channel_depth.set(rx.len() as i64);
             // P4-6：COT 档位每轮读取（/config 热改对下一轮生效；Wave B-7：
             // per-conv 覆盖优先，/config cot 白名单用户可改自己会话）。
             let cot = self.cot_for(&conv.0).await;
@@ -653,9 +663,22 @@ impl Dispatcher {
                     if let Some(c) = card.as_ref() {
                         c.set_todos(&items);
                     }
+                    // T11：快照同源全量替换（/tasks 面板数据）。
+                    round_snap.lock().unwrap().todos = items.clone();
                     latest_todos = Some(items);
                 }
                 AgentChunk::ToolUse { tool, input, id } => {
+                    // P8-1：input JSON → 人可读单行摘要（Bash 取 command、Read 取
+                    // file_path…）——替代此前的裸 JSON 截断。
+                    let raw_summary = crate::render::tool_summary(&tool, &input);
+                    // T11：工具统计快照先于 COT 档判定——/tasks 是独立查看入口，
+                    // cot off 只关展示过程，不影响主动查询的面板数据；摘要截断
+                    // 用固定上限（cot off 的 input_trunc=0 会把展示截断截成空）。
+                    {
+                        let mut s = round_snap.lock().unwrap();
+                        s.tool_calls += 1;
+                        s.last_tool = Some(format!("{tool} — {}", truncate_str(&raw_summary, 80)));
+                    }
                     // P4-6：off 档不收集工具过程（无摘要、无卡片工具面板）。
                     if cot == CotDetail::Off {
                         continue;
@@ -663,12 +686,8 @@ impl Dispatcher {
                     // P2-11：非 Text chunk 到达即先 flush 缓冲文本（保序 + 提前
                     // 释放，不等窗口到期）。
                     text_buf.flush(self, &conv, &hint, &mut streamed_text).await;
-                    // P8-1：input JSON → 人可读单行摘要（Bash 取 command、Read 取
-                    // file_path…），再按 COT 档截断——替代此前的裸 JSON 截断。
-                    let summary = truncate_str(
-                        &crate::render::tool_summary(&tool, &input),
-                        cot.input_trunc(),
-                    );
+                    // 展示侧摘要按 COT 档截断（卡片/最终摘要用）。
+                    let summary = truncate_str(&raw_summary, cot.input_trunc());
                     tool_calls.push(ToolCall {
                         name: tool.clone(),
                         summary: summary.clone(),
@@ -725,6 +744,9 @@ impl Dispatcher {
             }
         }
 
+        // T11：本轮 channel 已关闭（退出时必然为空），积压 gauge 归零——不留
+        // 上一次观测的残值误导「仍有积压」。
+        METRICS.agent_channel_depth.set(0);
         // P2-11：流结束/中断退出的统一收口——合帧缓冲里未发的文本必须送达
         //（不能丢），且先于终态回复/失败模板/中断标记。覆盖：channel 关闭
         //（正常收尾与 abort 后的排空——sender drop 后 recv 仍会先送完缓冲
