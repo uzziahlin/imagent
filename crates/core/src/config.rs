@@ -493,13 +493,26 @@ pub struct Config {
     #[serde(default = "default_auto_compact_window_ratio")]
     pub auto_compact_window_ratio: f64,
     /// W2-4：claude-acp 并发连接上限（每会话一条长驻子进程连接；超限拒绝）。
-    /// 默认 8；仅 `agent = "claude-acp"` 生效。改动需重启。
+    /// 默认 8；仅 `agent = "claude-acp"` / `"acp"` 生效。改动需重启。
     #[serde(default = "default_acp_max_connections")]
     pub acp_max_connections: usize,
     /// W2-4：claude-acp 连接空闲回收时长（秒；窗口内无新 prompt 则断开子进程）。
-    /// 默认 600；仅 `agent = "claude-acp"` 生效。改动需重启。
+    /// 默认 600；仅 `agent = "claude-acp"` / `"acp"` 生效。改动需重启。
     #[serde(default = "default_acp_idle_recycle_secs")]
     pub acp_idle_recycle_secs: u64,
+    /// T9（v13 产品批 #1）：ACP 泛化接入——启动目标 ACP agent 的命令串（shell
+    /// 风格拆分、支持参数，也接受 `IMAGENT_ACP_COMMAND` 的 JSON spec 形态）。
+    /// - `agent = "acp"` 时**必填**（缺失/空白拒绝启动——无 claude 默认命令可
+    ///   兜底），接入任意 ACP agent，如 `acp_command = "opencode-acp"` 或
+    ///   `acp_command = "gemini --experimental-acp"`（**以目标 agent 的 ACP 接入
+    ///   文档为准**）；
+    /// - `agent = "claude-acp"` 时可选：覆盖默认命令，优先级 = 本字段 >
+    ///   环境变量 `IMAGENT_ACP_COMMAND` > 默认 `claude-agent-acp`。
+    ///   泛化装配无 ~/.claude 存储假设（不做幽灵会话预检、/resume 无本机段、
+    ///   /export 不可用）；审批闭环随 ACP 协议覆盖（permission_mode = "ask" 可用）。
+    ///   改动需重启。
+    #[serde(default)]
+    pub acp_command: Option<String>,
     /// W4-1：per-sender 成本上限（美元，**滚动 24h 窗口**）——该发送者近 24h
     /// 累计成本达到上限后新轮次直接拒绝（回执说明）。多用户群部署的运营护栏。
     /// None（默认）= 不限制。统计依赖 run_stats.sender（v9 起记录；升级前的
@@ -1043,6 +1056,22 @@ impl Config {
                 cfg.acp_idle_recycle_secs
             )));
         }
+        // T9：acp_command 归一（trim；空白即视为缺失）+ 泛化装配必填校验——
+        // `agent = "acp"` 无 claude 默认命令可兜底，缺失即启动报错（fail-fast，
+        // 文案给出可操作例子；main 装配侧另有同语义兜底防御）。
+        cfg.acp_command = cfg
+            .acp_command
+            .take()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if cfg.agent == "acp" && cfg.acp_command.is_none() {
+            return Err(CoreError::Config(
+                "agent = \"acp\" 需要配置 acp_command（启动目标 ACP agent 的命令，\
+                 如 acp_command = \"opencode-acp\" 或 \"gemini --experimental-acp\"，\
+                 以目标 agent 的 ACP 接入文档为准）"
+                    .into(),
+            ));
+        }
 
         // T7：workdir 落在状态目录（生效 home 或基座 ~/.imagent）内 + deny 开启
         // → agent 对工作区的文件读取会被 --settings deny 逐次拦下，轮次事实性
@@ -1087,7 +1116,7 @@ allowed_senders = []        # 留空 = 发现模式（只打日志记录入站 s
 # allowed_chats = ["feishu:oc_xxx"]   # 会话(群)白名单：群消息 chat 放行 OR sender 放行即过（/chat 可动态管理）
 # admin_senders = []          # 可 /allow 等管理命令的管理员 sender；空=无人是管理员(IM 内管理命令不可用，须 CLI/setup 配置)
 # allowed_tools = ["*"]                      # 缺省=全部工具（不收敛）；要白名单显式列（如 ["Read","Edit"]）；执行类建议配 permission_mode="ask"
-agent = "claude-cli"         # claude-cli(默认) | claude-acp(ACP长驻子进程) | codex | gemini
+agent = "claude-cli"         # claude-cli(默认) | claude-acp(Claude ACP长驻子进程) | acp(任意ACP agent,配acp_command) | codex | gemini
 platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人) | feishu(飞书,配 feishu_app_id + 环境变量 IMAGENT_FEISHU_APP_SECRET)
 # feishu_app_id = "cli_xxx"            # 飞书自建应用 app_id（仅 platform="feishu"；app_secret 走环境变量，keyring 为后续 P2）
 # feishu_base_url = "https://open.feishu.cn"  # 可选，默认 https://open.feishu.cn；Lark 国际版 https://open.larksuite.com（MVP 不覆盖）
@@ -1122,8 +1151,10 @@ permission_mode = "auto"    # 缺省=auto：claude-cli=透传 claude 原生 auto
 # model_context_window_tokens = 1000000   # 模型上下文窗口（缺省 1M 大窗假定；200k 窗口的 Claude 系模型请显式写 200000）
 # auto_compact_window_ratio = 0.8         # 触发比例（缺省 0.8）
 # auto_compact_threshold_tokens = 120000  # 绝对值档：仅窗口设 0 时生效（0=关闭）
-# acp_max_connections = 8      # claude-acp 并发连接上限（仅 agent="claude-acp"）
-# acp_idle_recycle_secs = 600  # claude-acp 连接空闲回收（秒；仅 agent="claude-acp"）
+# acp_max_connections = 8      # ACP 并发连接上限（仅 agent="claude-acp"/"acp"）
+# acp_idle_recycle_secs = 600  # ACP 连接空闲回收（秒；仅 agent="claude-acp"/"acp"）
+# acp_command = "opencode-acp" # agent="acp" 必填：启动目标 ACP agent 的命令（如 "opencode-acp" /
+#                              #   "gemini --experimental-acp"，以目标 agent 的 ACP 接入文档为准；claude-acp 可选覆盖默认命令）
 # feishu_asr_enabled = true     # 飞书语音转文字（需后台申请语音识别权限；失败回退提示，仅 feishu）
 # feishu_group_context_messages = 10  # 群消息触发轮次时拉本群最近 N 条消息前置注入 prompt（需 im:message 读权限，fail-soft）；默认10，0=关闭，上限50
 # sender_daily_cost_limit_usd = 5.0  # per-sender 成本上限（美元，滚动 24h 窗口；不设 = 不限）
@@ -1261,7 +1292,65 @@ platform = "ilink"
         assert_eq!(cfg.platform, "ilink");
         assert_eq!(cfg.agent, "claude-cli");
         assert_eq!(cfg.platform, "ilink");
+        // T9：acp_command 缺省 None（claude-acp 装配无新增约束）。
+        assert!(cfg.acp_command.is_none());
         cleanup(&p);
+    }
+
+    /// T9（ACP 泛化）：`agent = "acp"` 必配 `acp_command`——缺失/空白拒绝启动
+    /// 且文案可操作（带例子）；配了则 trim 归一后放行。
+    #[test]
+    fn acp_agent_requires_acp_command() {
+        let missing = tmp_path(
+            "acp_no_cmd",
+            r#"default_workdir = "/tmp/ws"
+agent = "acp"
+"#,
+        );
+        let err = Config::load(&missing).unwrap_err().to_string();
+        assert!(err.contains("acp_command"), "文案应点名配置项: {err}");
+        assert!(err.contains("opencode-acp"), "文案应带可操作例子: {err}");
+        cleanup(&missing);
+
+        // 空白串同样视为缺失。
+        let blank = tmp_path(
+            "acp_blank_cmd",
+            r#"default_workdir = "/tmp/ws"
+agent = "acp"
+acp_command = "   "
+"#,
+        );
+        assert!(
+            Config::load(&blank)
+                .unwrap_err()
+                .to_string()
+                .contains("acp_command"),
+            "空白 acp_command 应视为缺失"
+        );
+        cleanup(&blank);
+
+        // 正常路径：命令 trim 归一；claude-acp 不配 acp_command 照常通过。
+        let ok = tmp_path(
+            "acp_ok",
+            r#"default_workdir = "/tmp/ws"
+agent = "acp"
+acp_command = "  gemini --experimental-acp  "
+"#,
+        );
+        let cfg = Config::load(&ok).expect("agent=acp + acp_command 应通过");
+        assert_eq!(
+            cfg.acp_command.as_deref(),
+            Some("gemini --experimental-acp")
+        );
+        cleanup(&ok);
+        let claude_acp = tmp_path(
+            "acp_claude",
+            r#"default_workdir = "/tmp/ws"
+agent = "claude-acp"
+"#,
+        );
+        assert!(Config::load(&claude_acp).is_ok());
+        cleanup(&claude_acp);
     }
 
     #[test]

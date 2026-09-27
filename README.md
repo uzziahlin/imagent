@@ -55,8 +55,9 @@ imagent 是一个常驻网关进程：监听 IM 私聊 / 群聊消息 → 鉴权
 ```
 trait Platform                        trait Backend
 ├── ilink  (个人微信私聊, 实验性)       ├── claude (CLI + ACP 长驻子进程)
-├── wecom  (企业微信长连接, 单聊文本)   ├── codex  (codex exec --json)
-└── feishu (飞书私聊/群/云文档评论)     └── gemini (gemini -p -o stream-json)
+├── wecom  (企业微信长连接, 单聊文本)   ├── acp    (任意 ACP agent, 配 acp_command)
+└── feishu (飞书私聊/群/云文档评论)     ├── codex  (codex exec --json)
+                                      └── gemini (gemini -p -o stream-json)
         ↕                              ↕
               core: 调度 / 鉴权 / 会话路由 (store 持久化) / 权限审批闭环
                     任务控制(/stop/批处理/看门狗/排队持久化) / /cron 调度
@@ -133,6 +134,8 @@ allowed_senders = []        # 留空 = 发现模式（先看日志拿你的 from
 # permission_mode = "auto"  # 缺省=auto：claude-cli=透传 claude 原生 auto 模式(分类器自动放行安全操作,高危进 IM)+审批闭环；其余后端=off；显式 ask=每个提示都进 IM
 # backend_permission_mode = "auto"  # 后端原生权限模式透传(claude→--permission-mode，覆盖 auto 档缺省)：default|acceptEdits|plan|auto|dontAsk|bypassPermissions；codex/gemini 暂不支持(warn 忽略)
 # approval_tools = ["Bash", "WebFetch", "mcp__*"]  # 审批集：ask 模式下只有这些工具过 IM 审批，其余直接放行；空=全部过审
+# agent = "claude-cli"   # 换 agent 后端：claude-cli(默认) | claude-acp(Claude ACP 长驻子进程) | acp(任意 ACP agent，配 acp_command) | codex | gemini
+# acp_command = "opencode-acp"  # agent="acp" 必填：启动目标 ACP agent 的命令（如 "opencode-acp" / "gemini --experimental-acp"，以目标 agent 的 ACP 接入文档为准；claude-acp 下可选覆盖默认命令，优先级 acp_command > 环境变量 IMAGENT_ACP_COMMAND > claude-agent-acp）
 # allowed_chats = ["feishu:oc_xxx"]  # 会话(群)白名单：群消息 chat 放行 OR sender 放行（/chat 可动态管理）
 # ask_via_im_conv = "feishu:ou_xxx"  # 终端 agent 的 ask_via_im 提问投递会话（配了才启用，见「终端 agent 接入」）
 # agent_timeout_secs = 3600          # 单次运行总超时(秒)；默认 1 小时，0=关闭(防挂死全靠空闲看门狗)
@@ -181,6 +184,8 @@ EOF
 > **`allowed_tools` 要不要写？** 不必填——**缺省即全部工具**（`["*"]` 语义：不附加 claude 的 `--allowedTools`，CLI 自身默认全量；codex 收敛到 `workspace-write`、gemini 收敛到 `auto_edit`，均不进各自最高危档）。要收敛 agent 的能力边界就显式列白名单：清单外的工具 agent 根本用不了。注意**全量 ≠ 免审**——缺省 `permission_mode = "auto"`（claude-cli 即透传 Claude Code 2026 新出的 **auto 权限模式**：独立分类器逐动作审查，安全操作自动放行，只有高危动作——`curl|bash`、外发敏感数据、强推、`git reset --hard` 等——拦下经 IM 审批）下，危险操作执行前仍会在 IM 向你审批；显式写 `[]` 与 `["*"]` 同义（不限制）。嫌全审太吵？配 **`approval_tools` 审批集**（如 `["Bash", "mcp__*"]`）：只有清单内工具过 IM 审批，其余权限请求直接放行（支持尾部 `*` 前缀匹配；空 = 全部过审）。
 
 > **飞书**：`platform = "feishu"` + `feishu_app_id` + 环境变量 `IMAGENT_FEISHU_APP_SECRET`——完整开通步骤见[接入飞书](#接入飞书完整流程)。**WeCom**：`wecom_bot_id` + `wecom_secret`。两者都免公网（长连接收，HTTP 发）。
+
+> **接入任意 ACP agent**：ACP（Agent Client Protocol）是协议不是单 agent——`agent = "acp"` + `acp_command = "<启动命令>"` 即可把任何说 ACP 协议的 agent 接进来（opencode / gemini-cli / cursor 等均有（或有）ACP 适配器），例如 `acp_command = "opencode-acp"` 或 `acp_command = "gemini --experimental-acp"`（具体命令以目标 agent 的 ACP 接入文档为准）。IM 审批闭环（`permission_mode = "ask"`：危险操作发审批卡等你 y/n）随协议自动覆盖这些后端。注意两点：`allowed_tools` 逐工具白名单在 ACP 系后端不生效（协议无等价机制，见 [SECURITY.md](SECURITY.md) 已知限制）；泛化装配无 Claude 本机会话存储概念，`/resume` 退化为纯 IM 历史、`/export` 不可用。
 
 ### 登录 + 运行
 
