@@ -178,7 +178,8 @@ fn jittered_backoff(base: Duration, factor: f64) -> Duration {
 // `code != 0` → [`FeishuApiError { code, msg }`]，错误串规范化为
 // `"{op}: code={code} msg={msg}"`（429 归一为 code=429 + msg="HTTP 429"，串内
 // 保留 "HTTP 429" 标记供既有匹配）。自愈判定（限流丢帧 / token 刷新重试 /
-// 卡片不存在清缓存）优先按 code 精确判定（[`is_rate_limited_err`] 等，
+// 卡片不存在清缓存 / 300317 sequence 重置 / 200850 流式重开）优先按 code
+// 精确判定（[`is_rate_limited_err`] 等，
 // 经 [`FeishuApiError::from_error_str`] 从自有格式还原——**自有格式**与 SDK 的
 // Display 无关）；open-lark SDK 路径产出的错误无结构化 code，保留 Display
 // 字符串匹配兜底（[`is_rate_limited_msg`] 等）——**串匹配是 SDK Display 的
@@ -210,6 +211,20 @@ impl FeishuApiError {
     /// 刻意不含 300317 sequence 落后——另有自愈路径）。
     pub(crate) fn is_card_not_exist(&self) -> bool {
         self.code == 230002
+    }
+
+    /// CardKit sequence 落后（出处：300317——element/settings PATCH 的 sequence
+    /// 不严格递增；重启后内存计数器归零触发。自愈：计数器重置为时间戳级后
+    /// 整段重试，见 platform::patch_any_handle）。
+    pub(crate) fn is_sequence_stale(&self) -> bool {
+        self.code == 300317
+    }
+
+    /// 流式卡片超时（出处：200850——服务端流式窗口超时自动关闭 streaming，
+    /// 长任务 Running 期会触发。自愈：重开 streaming_mode 重试，仍超时退化
+    /// 关流式 raw patch，见 platform::patch_managed）。
+    pub(crate) fn is_stream_timeout(&self) -> bool {
+        self.code == 200850
     }
 
     /// 从 CoreError 错误串还原结构化错误：仅认本模块 `feishu_api_resp` 产出的
@@ -314,6 +329,26 @@ pub(crate) fn is_token_invalid_err(e: &imagent_core::CoreError) -> bool {
     }
 }
 
+/// CardKit sequence 落后判定（语义同 [`is_rate_limited_err`]，code 见
+/// [`FeishuApiError::is_sequence_stale`]——300317 自愈重试用）。
+pub(crate) fn is_sequence_stale_err(e: &imagent_core::CoreError) -> bool {
+    let s = e.to_string();
+    match FeishuApiError::from_error_str(&s) {
+        Some(api) => api.is_sequence_stale(),
+        None => is_sequence_stale_msg(&s),
+    }
+}
+
+/// 流式卡片超时判定（语义同 [`is_rate_limited_err`]，code 见
+/// [`FeishuApiError::is_stream_timeout`]——200850 自愈重开流式用）。
+pub(crate) fn is_stream_timeout_err(e: &imagent_core::CoreError) -> bool {
+    let s = e.to_string();
+    match FeishuApiError::from_error_str(&s) {
+        Some(api) => api.is_stream_timeout(),
+        None => is_stream_timeout_msg(&s),
+    }
+}
+
 /// 识别限流类错误（HTTP 429 / 飞书频控业务码 230020）——**SDK Display 串匹配
 /// 兜底**（隐性契约，见模块注释；手写 HTTP 路径已结构化，走
 /// [`is_rate_limited_err`]）。两种错误串形态都要覆盖：手写路径遗留形态
@@ -356,6 +391,19 @@ pub(crate) fn is_token_invalid_msg(msg: &str) -> bool {
     ];
     TOKEN_INVALID_CODES.iter().any(|c| msg.contains(c))
         || msg.to_ascii_lowercase().contains("invalid access token")
+}
+
+/// 识别 CardKit sequence 落后（300317）——**SDK Display 串匹配兜底**（手写
+/// HTTP 路径已结构化，走 [`is_sequence_stale_err`]；形态对齐其余码：自有格式
+/// `code=300317` + SDK `ApiError` Display 携带的 raw_code）。
+pub(crate) fn is_sequence_stale_msg(msg: &str) -> bool {
+    msg.contains("code=300317") || msg.contains("API错误 300317")
+}
+
+/// 识别流式卡片超时（200850）——**SDK Display 串匹配兜底**（手写 HTTP 路径
+/// 已结构化，走 [`is_stream_timeout_err`]；形态对齐其余码）。
+pub(crate) fn is_stream_timeout_msg(msg: &str) -> bool {
+    msg.contains("code=200850") || msg.contains("API错误 200850")
 }
 
 /// 限流退避重试——500ms → 1s → 2s 最多三次重试，其它错误立即失败。
@@ -522,6 +570,33 @@ pub async fn send_text_msg(
     // 幂等键：每次逻辑发送生成一次，所有限流重试共用（飞书 message create 的
     // uuid 幂等键）——首次请求可能已达服务端，重试换新 uuid 会让用户收到重复消息。
     let idempotency_key = uuid::Uuid::new_v4().to_string();
+    send_text_msg_with_uuid(
+        core_config,
+        token,
+        receive_id,
+        kind,
+        text,
+        buzz,
+        &idempotency_key,
+    )
+    .await
+}
+
+/// [`send_text_msg`] 的外带幂等键版：reply→create 双跳共用同一 uuid（P3-1，
+/// platform::send_text_opts 消费）——reply 超时但服务端已落消息时，回退
+/// create 携同一键，服务端幂等窗口内去重，用户不再收两条。reply 与 create
+/// 是否共享去重命名空间**待真机校准**（不共享时退化为现状双发，共享键无
+/// 负作用——uuid 语义本就是「一次逻辑发送一个键」）。
+pub async fn send_text_msg_with_uuid(
+    core_config: &CoreConfig,
+    token: &str,
+    receive_id: &str,
+    kind: ReceiveIdKind,
+    text: &str,
+    buzz: bool,
+    idempotency_uuid: &str,
+) -> imagent_core::Result<()> {
+    let idempotency_key = idempotency_uuid.to_string();
     retry_on_rate_limit!(async {
         // buzz 仅在 true 时写入（缺省形态与历史一致，防旧端点拒绝未知字段）。
         let content = if buzz {
@@ -1703,24 +1778,34 @@ pub async fn reply_comment_nodes(
 /// `message_id` 为话题根消息；`content` 为对应 msg_type 的 JSON 字符串
 /// （与 create 一致，如 `{"text":"…"}` / `{"image_key":"…"}`）。
 /// SDK（openlark 0.20）无此 API，raw reqwest（同 reply_comment 模式）。
+///
+/// P3-1（双跳幂等）：`idempotency_uuid` 为可选幂等键——官方文档确认 reply
+/// API 请求体支持 `uuid`（同键 1 小时内至多成功一条，上限 50 字符；open-lark
+/// `ReplyMessageBody` 亦有该字段）。send_text 分片循环的 reply→create 回退
+/// 双跳共用同一 uuid（见 [`send_text_msg_with_uuid`]）。
 pub async fn reply_message(
     core_config: &CoreConfig,
     token: &str,
     message_id: &str,
     msg_type: &str,
     content: &str,
+    idempotency_uuid: Option<&str>,
 ) -> imagent_core::Result<Option<String>> {
     retry_on_rate_limit!(async {
         let base = core_config.base_url().trim_end_matches('/').to_string();
         let url = format!("{base}/open-apis/im/v1/messages/{message_id}/reply");
+        let mut body = serde_json::json!({
+            "msg_type": msg_type,
+            "content": content,
+        });
+        if let Some(u) = idempotency_uuid {
+            body["uuid"] = serde_json::json!(u);
+        }
         let client = api_client().clone();
         let resp = client
             .post(&url)
             .bearer_auth(token)
-            .json(&serde_json::json!({
-                "msg_type": msg_type,
-                "content": content,
-            }))
+            .json(&body)
             .send()
             .await
             .map_err(|e| {
@@ -1875,6 +1960,50 @@ mod tests {
         assert!(!is_rate_limited_err(&mk("网络错误: connection refused")));
         assert!(!is_token_invalid_err(&mk("download resource: HTTP 429")));
         assert!(!is_card_not_exist_err(&mk("网络错误: connection refused")));
+    }
+
+    /// P3（v13 遗留）：300317（sequence 落后）/ 200850（流式超时）自愈码的
+    /// 结构化判定——手写 HTTP 路径按 code 等值，SDK Display 串匹配兜底；
+    /// 相邻码不误伤（此前 platform 层的裸串匹配 `contains("300317")` /
+    /// `contains("code=200850")` 已切换到本判定）。
+    #[test]
+    fn sequence_stale_and_stream_timeout_code_based() {
+        let mk = |s: &str| imagent_core::CoreError::Platform(PLATFORM, s.to_string());
+        // 300317：自有格式 + SDK Display 兜底；相邻码（300316/300318/1300317）不误伤。
+        assert!(is_sequence_stale_err(&mk(
+            "patch_card_element: code=300317 msg=sequence error"
+        )));
+        assert!(is_sequence_stale_err(&mk(
+            "API错误 300317 response: sequence not increase"
+        )));
+        for near in [300316, 300318, 1300317] {
+            assert!(
+                !is_sequence_stale_err(&mk(&format!("patch_card_element: code={near} msg=xx"))),
+                "相邻码 {near} 不应误伤"
+            );
+        }
+        // 200850：自有格式 + SDK Display 兜底；相邻码不误伤。
+        assert!(is_stream_timeout_err(&mk(
+            "patch_card_element: code=200850 msg=streaming timeout"
+        )));
+        assert!(is_stream_timeout_err(&mk(
+            "API错误 200850 response: streaming card timeout"
+        )));
+        for near in [200851, 200860, 1200850] {
+            assert!(
+                !is_stream_timeout_err(&mk(&format!("patch_card_element: code={near} msg=xx"))),
+                "相邻码 {near} 不应误伤"
+            );
+        }
+        // 两码互不误伤 + 无关错误不受影响。
+        assert!(!is_sequence_stale_err(&mk(
+            "patch_card_element: code=200850 msg=streaming timeout"
+        )));
+        assert!(!is_stream_timeout_err(&mk(
+            "patch_card_element: code=300317 msg=sequence error"
+        )));
+        assert!(!is_sequence_stale_err(&mk("网络错误: connection refused")));
+        assert!(!is_stream_timeout_err(&mk("download resource: HTTP 429")));
     }
 
     /// 第六批：token 失效错误码识别——SDK ApiError Display 形态（"API错误

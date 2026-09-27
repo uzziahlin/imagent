@@ -506,7 +506,24 @@ mod tests {
             user_line("new work".into()),
         )
         .unwrap();
-        // 让 new 的 mtime 严格更晚（fs 精度兜底：不 sleep 则靠写入顺序，可能同秒）。
+        // 强制 new 的 mtime 严格更晚（FileTimes 显式设定，与下方 tiebreak 测试
+        // 同款）：CI 的 Linux 文件系统 mtime 粒度粗（两次快速写入同秒并列），
+        // 此前只靠写入顺序——v1.27/v1.28 的 Release 前置测试两次都翻在这里
+        //（并列时代码路径还不同：枚举序 vs tiebreak 决胜序，都断言 new 在前）。
+        let older = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        let newer = older + std::time::Duration::from_secs(3600);
+        let dir = root
+            .join("projects")
+            .join(wd.to_string_lossy().replace('/', "-"));
+        for (id, at) in [("old.jsonl", older), ("new.jsonl", newer)] {
+            let times = std::fs::FileTimes::new().set_modified(at);
+            std::fs::File::options()
+                .write(true)
+                .open(dir.join(id))
+                .unwrap()
+                .set_times(times)
+                .unwrap();
+        }
         let list = list_local_sessions(&root, wd, 10);
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].session_id, "new", "mtime 新的在前: {list:?}");

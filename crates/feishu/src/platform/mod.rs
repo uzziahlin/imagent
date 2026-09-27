@@ -45,9 +45,10 @@ use crate::card::{
     render_permission_card_cancelled, render_stream_init_card, stream_body_final, stream_body_md,
 };
 use crate::client::{
-    create_card_entity, fetch_token, is_card_not_exist_err, is_rate_limited_err, list_joined_chats,
-    patch_card, patch_card_element, patch_card_settings, reply_comment, reply_comment_nodes,
-    reply_message, send_card_msg, send_file_msg, send_image_msg, send_text_msg, upload_file,
+    create_card_entity, fetch_token, is_card_not_exist_err, is_rate_limited_err,
+    is_sequence_stale_err, is_stream_timeout_err, list_joined_chats, patch_card,
+    patch_card_element, patch_card_settings, reply_comment, reply_comment_nodes, reply_message,
+    send_card_msg, send_file_msg, send_image_msg, send_text_msg_with_uuid, upload_file,
     upload_image, FeishuWsClient,
 };
 use crate::proto::{
@@ -507,7 +508,9 @@ impl FeishuPlatform {
                 // 300317（sequence 落后）自愈（真机校准）：重启后内存计数器归零，
                 // 但旧卡片的 server 序号已推进（孤儿扫描接管、同进程异常路径）
                 // ——把该卡计数器重置为时间戳级（必然大于 server 序号）整段重试。
-                Err(e) if e.to_string().contains("300317") => {
+                // P3：判定走 client::is_sequence_stale_err（结构化 code 优先，
+                // SDK Display 串匹配兜底；此前为裸 contains("300317")）。
+                Err(e) if is_sequence_stale_err(&e) => {
                     warn!(target: "feishu", card_id, "sequence 落后（300317），重置计数器后重试");
                     // sequence 是 int32：用**秒级**时间戳（~1.8e9 < 2^31，
                     // 2038 年前安全）；毫秒会溢出被 9499 拒（真机踩过）。
@@ -571,7 +574,9 @@ impl FeishuPlatform {
                     }
                     // 流式超时（200850）：服务端已自动关流式，长任务 Running 期会触发。
                     // 自愈一级：重开 streaming_mode 后重试一次（sequence 继续递增）。
-                    Err(e) if e.to_string().contains("code=200850") => {
+                    // P3：判定走 client::is_stream_timeout_err（结构化 code 优先，
+                    // SDK Display 串匹配兜底；此前为裸 contains("code=200850")）。
+                    Err(e) if is_stream_timeout_err(&e) => {
                         warn!(target: "feishu", card_id, "流式超时，重开 streaming_mode 后重试");
                         let settings =
                             serde_json::json!({ "config": { "streaming_mode": true } }).to_string();
@@ -588,7 +593,7 @@ impl FeishuPlatform {
                             // 自愈二级（升级兜底）：重开流式后仍 200850——CardKit 无
                             // 「重建实体」API（离线确认，**待真机校准**），退化为
                             // 关流式 + 全量 raw patch 一次（无打字机但内容不丢帧）。
-                            Err(e2) if e2.to_string().contains("code=200850") => {
+                            Err(e2) if is_stream_timeout_err(&e2) => {
                                 warn!(target: "feishu", card_id, "重开流式仍超时，退化关闭流式后 raw patch");
                                 let off = serde_json::json!({
                                     "config": { "streaming_mode": false }
@@ -753,7 +758,16 @@ impl FeishuPlatform {
         content: &str,
     ) -> Result<Option<String>> {
         if let Some(anchor) = self.reply_anchor(&conv.0).await {
-            match reply_message(&self.core_config, token, &anchor, "interactive", content).await {
+            match reply_message(
+                &self.core_config,
+                token,
+                &anchor,
+                "interactive",
+                content,
+                None,
+            )
+            .await
+            {
                 Ok(mid) => {
                     if let Some(m) = &mid {
                         self.note_card_tail(&conv.0, m).await;
@@ -788,8 +802,15 @@ impl FeishuPlatform {
                     let root_id = root_id.clone();
                     let card_json = card_json.to_string();
                     async move {
-                        reply_message(&self.core_config, &t, &root_id, "interactive", &card_json)
-                            .await
+                        reply_message(
+                            &self.core_config,
+                            &t,
+                            &root_id,
+                            "interactive",
+                            &card_json,
+                            None,
+                        )
+                        .await
                     }
                 })
                 .await
@@ -886,7 +907,8 @@ impl FeishuPlatform {
                         let root_id = root_id.clone();
                         let content = content.clone();
                         async move {
-                            reply_message(&self.core_config, &t, &root_id, "text", &content).await
+                            reply_message(&self.core_config, &t, &root_id, "text", &content, None)
+                                .await
                         }
                     })
                     .await
@@ -908,37 +930,81 @@ impl FeishuPlatform {
         // 发送——内容不能因引用失败而丢。私聊无锚点，走原路径。
         // Wave B-4：buzz（加急）消息不走锚点——reply API 的 text content 加急
         // 字段未验证（**待真机校准**），加急走 create 路径保 buzz 字段生效。
-        let anchor = if buzz {
+        // P3-1（锚点失效记忆）：`anchor` 为可变局部——reply 失败一次后置 None，
+        // 本条消息（单次 send_text 调用）内的后续分片直接走 create，不再每片
+        // 重复试错 reply（锚点被撤回时 N 片 = N 次注定失败的调用 + N 条 warn
+        // 噪音）。记忆范围仅本次调用：跨消息不记忆（下一条消息锚点可能已换新，
+        // reply_anchor 每次调用重新解析）。
+        let mut anchor = if buzz {
             None
         } else {
             self.reply_anchor(&conv.0).await
         };
         for (i, chunk) in chunks.into_iter().enumerate() {
+            // P3-1（双跳幂等）：同一分片的 reply 尝试与 create 回退共用同一
+            // 幂等 uuid——reply 超时但服务端已落消息时，create 携同键在飞书
+            // 幂等窗口（1 小时）内被去重，用户不再收到两条。reply 与 create
+            // 是否共享去重命名空间**待真机校准**（不共享时退化为现状双发，
+            // 共享键无负作用——uuid 语义本就是「一次逻辑发送一个键」）。
+            let idem = uuid::Uuid::new_v4().to_string();
+            let anchor_now = anchor.clone();
             // P5：同上——分片失败标注序号（此前中途 ? 退出，截断无标记）。
-            if let Err(e) = self
+            // 返回值标记本片是否经 reply 送达（false = 走了 create 回退）。
+            let sent = self
                 .with_token(|t| {
                     let receive_id = receive_id.clone();
                     let chunk = chunk.clone();
-                    let anchor = anchor.clone();
+                    let idem = idem.clone();
+                    let anchor_now = anchor_now.clone();
                     async move {
-                        if let Some(a) = anchor.as_deref() {
+                        if let Some(a) = anchor_now.as_deref() {
                             let content = serde_json::json!({ "text": chunk }).to_string();
-                            if reply_message(&self.core_config, &t, a, "text", &content)
-                                .await
-                                .is_ok()
+                            match reply_message(
+                                &self.core_config,
+                                &t,
+                                a,
+                                "text",
+                                &content,
+                                Some(&idem),
+                            )
+                            .await
                             {
-                                return Ok(());
+                                Ok(_) => return Ok(true),
+                                Err(e) => {
+                                    warn!(target: "feishu", conv_id = %conv.0, anchor = a,
+                                        error = %e,
+                                        "reply 引用锚点失败（可能被撤回），本条后续分片改走普通发送");
+                                }
                             }
                         }
-                        send_text_msg(&self.core_config, &t, &receive_id, kind, &chunk, buzz).await
+                        send_text_msg_with_uuid(
+                            &self.core_config,
+                            &t,
+                            &receive_id,
+                            kind,
+                            &chunk,
+                            buzz,
+                            &idem,
+                        )
+                        .await
+                        .map(|_| false)
                     }
                 })
-                .await
-            {
-                return Err(CoreError::Platform(
-                    PLATFORM,
-                    format!("第 {}/{} 片发送失败（回复可能被截断）：{e}", i + 1, total),
-                ));
+                .await;
+            match sent {
+                Ok(via_reply) => {
+                    // 锚点失效记忆：reply 失败回退 create 后清锚点（via_reply =
+                    // false 且原有锚点），后续分片不再试 reply。
+                    if !via_reply {
+                        anchor = None;
+                    }
+                }
+                Err(e) => {
+                    return Err(CoreError::Platform(
+                        PLATFORM,
+                        format!("第 {}/{} 片发送失败（回复可能被截断）：{e}", i + 1, total),
+                    ));
+                }
             }
         }
         Ok(())
@@ -1360,7 +1426,7 @@ impl Platform for FeishuPlatform {
                     // 话题群：与文本同路——reply API 落回原话题。
                     Some(root) => {
                         let mt = if is_image { "image" } else { "file" };
-                        reply_message(&self.core_config, &t, &root, mt, &content.to_string())
+                        reply_message(&self.core_config, &t, &root, mt, &content.to_string(), None)
                             .await
                             .map(|_| ())
                     }
@@ -1511,8 +1577,15 @@ impl Platform for FeishuPlatform {
                     let root_id = root_id.clone();
                     let card_json = card_json.clone();
                     async move {
-                        reply_message(&self.core_config, &t, &root_id, "interactive", &card_json)
-                            .await
+                        reply_message(
+                            &self.core_config,
+                            &t,
+                            &root_id,
+                            "interactive",
+                            &card_json,
+                            None,
+                        )
+                        .await
                     }
                 })
                 .await
@@ -1845,8 +1918,15 @@ impl Platform for FeishuPlatform {
                     let root_id = root_id.clone();
                     let card_json = card_json.clone();
                     async move {
-                        reply_message(&self.core_config, &t, &root_id, "interactive", &card_json)
-                            .await
+                        reply_message(
+                            &self.core_config,
+                            &t,
+                            &root_id,
+                            "interactive",
+                            &card_json,
+                            None,
+                        )
+                        .await
                     }
                 })
                 .await
@@ -1899,8 +1979,15 @@ impl Platform for FeishuPlatform {
                     let root_id = root_id.clone();
                     let card_json = card_json.clone();
                     async move {
-                        reply_message(&self.core_config, &t, &root_id, "interactive", &card_json)
-                            .await
+                        reply_message(
+                            &self.core_config,
+                            &t,
+                            &root_id,
+                            "interactive",
+                            &card_json,
+                            None,
+                        )
+                        .await
                     }
                 })
                 .await
@@ -1976,8 +2063,15 @@ impl Platform for FeishuPlatform {
                     let root_id = root_id.clone();
                     let card_json = card_json.clone();
                     async move {
-                        reply_message(&self.core_config, &t, &root_id, "interactive", &card_json)
-                            .await
+                        reply_message(
+                            &self.core_config,
+                            &t,
+                            &root_id,
+                            "interactive",
+                            &card_json,
+                            None,
+                        )
+                        .await
                     }
                 })
                 .await
@@ -2168,7 +2262,7 @@ impl Platform for FeishuPlatform {
 mod tests {
     use super::*;
     use crate::proto::ReceiveIdKind;
-    use testutil::{mk_platform_with_mock, spawn_mock_feishu};
+    use testutil::{mk_platform_with_mock, spawn_mock_feishu, spawn_mock_feishu_req};
 
     #[test]
     fn conv_roundtrip() {
@@ -2400,5 +2494,153 @@ mod tests {
             "/open-apis/drive/v1/files/ft_legacy/comments/c_old/replies",
         ];
         assert_eq!(&*paths, &expected, "回退链按序生效");
+    }
+
+    // ---------- P3-1：reply→create 双跳（锚点失效记忆 + 双跳幂等） ----------
+
+    /// 锚点失效（被撤回形态 230002）后，同一条消息的 N 个分片只发 **1 次**
+    /// reply 尝试 + N 次 create（锚点失效记忆：失败一次即清锚点，不再每片
+    /// 重复试错）；且首片的 reply 与 create 回退请求体携带**同一** uuid（双跳
+    /// 共用幂等键——reply 超时但服务端已落消息时 create 同键被去重）。
+    /// mock 回环走真实 reqwest HTTP 栈（reply 手写路径 + create SDK 路径）。
+    #[tokio::test]
+    async fn reply_anchor_failure_memory_and_shared_uuid() {
+        #[derive(Default)]
+        struct Hits {
+            replies: Vec<String>,
+            creates: Vec<String>,
+        }
+        let hits: Arc<std::sync::Mutex<Hits>> = Default::default();
+        let hits_c = hits.clone();
+        let base = spawn_mock_feishu_req(Arc::new(move |path: &str, body: &str| {
+            let bare = path.split('?').next().unwrap_or("/");
+            let uuid_of = |b: &str| {
+                serde_json::from_str::<serde_json::Value>(b)
+                    .ok()
+                    .and_then(|v| v.get("uuid").and_then(|u| u.as_str().map(str::to_string)))
+            };
+            if bare.ends_with("/reply") {
+                hits_c
+                    .lock()
+                    .unwrap()
+                    .replies
+                    .push(uuid_of(body).unwrap_or_default());
+                // 锚点失效形态：被回复消息不存在（code != 0 → reply 报错回退）。
+                return (
+                    200u16,
+                    r#"{"code":230002,"msg":"message not exist"}"#.to_string(),
+                );
+            }
+            if bare == "/open-apis/im/v1/messages" {
+                hits_c
+                    .lock()
+                    .unwrap()
+                    .creates
+                    .push(uuid_of(body).unwrap_or_default());
+                return (
+                    200u16,
+                    r#"{"code":0,"msg":"success","data":{"message_id":"om_new"}}"#.to_string(),
+                );
+            }
+            (200u16, r#"{"code":0,"msg":"success"}"#.to_string())
+        }))
+        .await;
+        // 分片上限 10 字符：23 字符文本 → 3 片（直连 mock；token 预填不打真端点）。
+        let p = FeishuPlatform::new(
+            "cli_test".into(),
+            "secret_test".into(),
+            base,
+            true,
+            Some(10),
+            300,
+            None,
+            1800,
+            true,
+            None,
+            0.0,
+            false,
+            0,
+        )
+        .expect("构造");
+        *p.token.write().await = Some(("t_mock".to_string(), Instant::now()));
+        p.conv_states
+            .lock()
+            .await
+            .entry("feishu:oc_grp".to_string())
+            .or_default()
+            .reply_anchor = Some("om_dead".into());
+        p.send_text(
+            &ConvId("feishu:oc_grp".into()),
+            "aa bb cc dd ee ff gg hh",
+            &ReplyHint::None,
+        )
+        .await
+        .expect("锚点失效回退 create 后应整条成功");
+        let h = hits.lock().unwrap();
+        assert_eq!(h.replies.len(), 1, "锚点失效记忆：仅首片尝试 reply");
+        assert_eq!(h.creates.len(), 3, "3 片全部经 create 送达");
+        assert!(!h.replies[0].is_empty(), "reply 请求体应携带 uuid");
+        assert_eq!(h.replies[0], h.creates[0], "首片双跳共用同一幂等 uuid");
+        assert_ne!(h.creates[0], h.creates[1], "不同分片各自独立 uuid");
+        assert_ne!(h.creates[1], h.creates[2], "不同分片各自独立 uuid");
+    }
+
+    /// 对照：锚点健康时整条消息全走 reply（每片一次 reply、零 create），
+    /// 每片各自独立 uuid。
+    #[tokio::test]
+    async fn reply_anchor_healthy_all_chunks_via_reply() {
+        #[derive(Default)]
+        struct Hits {
+            replies: usize,
+            creates: usize,
+        }
+        let hits: Arc<std::sync::Mutex<Hits>> = Default::default();
+        let hits_c = hits.clone();
+        let base = spawn_mock_feishu_req(Arc::new(move |path: &str, _body: &str| {
+            let bare = path.split('?').next().unwrap_or("/");
+            if bare.ends_with("/reply") {
+                hits_c.lock().unwrap().replies += 1;
+            } else if bare == "/open-apis/im/v1/messages" {
+                hits_c.lock().unwrap().creates += 1;
+            }
+            (
+                200u16,
+                r#"{"code":0,"msg":"success","data":{"message_id":"om_ok"}}"#.to_string(),
+            )
+        }))
+        .await;
+        let p = FeishuPlatform::new(
+            "cli_test".into(),
+            "secret_test".into(),
+            base,
+            true,
+            Some(10),
+            300,
+            None,
+            1800,
+            true,
+            None,
+            0.0,
+            false,
+            0,
+        )
+        .expect("构造");
+        *p.token.write().await = Some(("t_mock".to_string(), Instant::now()));
+        p.conv_states
+            .lock()
+            .await
+            .entry("feishu:oc_grp".to_string())
+            .or_default()
+            .reply_anchor = Some("om_alive".into());
+        p.send_text(
+            &ConvId("feishu:oc_grp".into()),
+            "aa bb cc dd ee ff gg hh",
+            &ReplyHint::None,
+        )
+        .await
+        .expect("健康锚点全走 reply 应成功");
+        let h = hits.lock().unwrap();
+        assert_eq!(h.replies, 3, "3 片各一次 reply");
+        assert_eq!(h.creates, 0, "锚点健康不落 create");
     }
 }

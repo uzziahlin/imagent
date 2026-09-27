@@ -274,6 +274,11 @@ pub struct PermissionRouter {
     /// 轮次起止各取一次快照对比，即可判定「本轮是否发生过审批/询问」——
     /// 完成强提醒的触发条件之一。
     ask_counters: Mutex<HashMap<String, u64>>,
+    /// v13 P3：per-conv **Permission 类**审批登记计数（单调递增，不随 pending
+    /// 清理回退；Ask 类不计入）。round 起止快照差 = 本轮审批次数——D3 空闲
+    /// 看门狗的豁免总额按此放大（每份审批有独立的 permission_ask_timeout
+    /// 预算兜底；终端 ask_via_im 超时可到 86400s，不得进入该分子）。
+    permission_ask_counters: Mutex<HashMap<String, u64>>,
     /// 真机校准（2026-08）：per-conv 最近一次**用户审批决定**（route 命中）的
     /// 时刻——完成强提醒的抑制条件：刚批准过 = 用户显然在线，紧接着的完成
     /// 推送是打扰（实测：3m11s 轮次批准后数十秒完成仍推送）。
@@ -286,6 +291,7 @@ impl PermissionRouter {
             pending: Mutex::new(HashMap::new()),
             session_allows: Mutex::new(HashMap::new()),
             ask_counters: Mutex::new(HashMap::new()),
+            permission_ask_counters: Mutex::new(HashMap::new()),
             last_decision_at: Mutex::new(HashMap::new()),
         }
     }
@@ -304,6 +310,19 @@ impl PermissionRouter {
 
     pub async fn ask_count(&self, conv_id: &str) -> u64 {
         self.ask_counters
+            .lock()
+            .await
+            .get(conv_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// v13 P3：该 conv 的累计 **Permission 类**审批登记数（单调递增，不随
+    /// pending 清理回退；Ask 类不计）。round 起止快照差 = 本轮审批次数——
+    /// D3 空闲看门狗的豁免总额按此放大（每份审批有独立 permission_ask_timeout
+    /// 预算兜底）。
+    pub async fn permission_ask_count(&self, conv_id: &str) -> u64 {
+        self.permission_ask_counters
             .lock()
             .await
             .get(conv_id)
@@ -361,6 +380,7 @@ impl PermissionRouter {
         // v1.23 review：伴生的 per-conv 计数/时戳一并清理——此前只增不清，
         // 长寿命进程 × 大量会话缓慢泄漏。
         self.ask_counters.lock().await.remove(conv_id);
+        self.permission_ask_counters.lock().await.remove(conv_id);
         self.last_decision_at.lock().await.remove(conv_id);
     }
 
@@ -461,6 +481,15 @@ impl PermissionRouter {
             .await
             .entry(conv_id.to_string())
             .or_insert(0) += 1;
+        // v13 P3：Permission 类单独计数（看门狗豁免分子；Ask 类不计）。
+        if kind == PendingKind::Permission {
+            *self
+                .permission_ask_counters
+                .lock()
+                .await
+                .entry(conv_id.to_string())
+                .or_insert(0) += 1;
+        }
         let list = map.entry(conv_id.to_string()).or_default();
         if let Some(i) = list.iter().position(|p| p.request_id == request_id) {
             let old = list.remove(i);
@@ -662,6 +691,31 @@ mod tests {
         assert!(r.has_pending("conv1").await);
         r.cancel("conv1", "req1").await;
         assert!(!r.has_pending("conv1").await);
+    }
+
+    /// v13 P3：Permission 类审批登记计数——只计 Permission、不计 Ask（终端
+    /// ask_via_im），且不随 pending 清理回退（单调，供 round 起止快照差值）。
+    #[tokio::test]
+    async fn permission_ask_count_tracks_only_permission_kind() {
+        let r = PermissionRouter::new();
+        let _rx1 = r
+            .register("c", "r-1", None, PendingKind::Permission, None, None)
+            .await;
+        let _rx2 = r
+            .register("c", "r-2", None, PendingKind::Permission, None, None)
+            .await;
+        let _ask = r
+            .register("c", "r-3", None, PendingKind::Ask, None, None)
+            .await;
+        assert_eq!(r.permission_ask_count("c").await, 2);
+        // 总询问计数（Wave B-2）两类都计。
+        assert_eq!(r.ask_count("c").await, 3);
+        // pending 清理后计数不回退。
+        r.cancel_all("c").await;
+        assert_eq!(r.permission_ask_count("c").await, 2);
+        // /new·/stop 清会话伴生清理。
+        r.clear_session_allows("c").await;
+        assert_eq!(r.permission_ask_count("c").await, 0);
     }
 
     /// P5-16：cancel 唤醒等待者并 fail-closed 回 deny——不再挂满
