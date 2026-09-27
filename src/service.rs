@@ -144,8 +144,15 @@ fn render_unit(
 }
 
 /// 安装时应快照进服务定义的环境变量（凭据等——不快照则守护进程取不到）。
+/// T15：IMAGENT_LOG_MAX_MB（daemon.log 轮转阈值）一并快照——守护进程形态下
+/// 该 env 决定轮转阈值，不快照则 install 时的设置对守护进程不生效。
 fn capture_envs() -> Vec<(String, String)> {
-    const KEYS: &[&str] = &["IMAGENT_FEISHU_APP_SECRET", "IMAGENT_HOME", "RUST_LOG"];
+    const KEYS: &[&str] = &[
+        "IMAGENT_FEISHU_APP_SECRET",
+        "IMAGENT_HOME",
+        "RUST_LOG",
+        "IMAGENT_LOG_MAX_MB",
+    ];
     KEYS.iter()
         .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
         .collect()
@@ -225,9 +232,10 @@ pub fn install(profile: Option<&str>) -> Result<()> {
     // 日志路径仅 launchd 用（systemd 走 journal）——随平台门控，防 Linux 下未用告警。
     #[cfg(target_os = "macos")]
     let log = {
-        let log_dir = imagent_core::paths::imagent_home().join("logs");
-        std::fs::create_dir_all(&log_dir)?;
-        log_dir.join("daemon.log").to_string_lossy().into_owned()
+        if let Some(dir) = daemon_log_path().parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        daemon_log_path().to_string_lossy().into_owned()
     };
 
     #[cfg(target_os = "macos")]
@@ -333,6 +341,206 @@ pub fn status(profile: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// T15：daemon.log 尺寸轮转（copytruncate）—— CODE_REVIEW_v13 P3
+//「macOS daemon.log 无限增长，全仓无任何轮转机制」。
+// ---------------------------------------------------------------------------
+
+/// daemon.log 路径：`<imagent_home>/logs/daemon.log`（install 写进 plist
+/// `StandardOutPath/StandardErrorPath` 的同一形态，轮转目标）。
+pub fn daemon_log_path() -> PathBuf {
+    imagent_core::paths::imagent_home()
+        .join("logs")
+        .join("daemon.log")
+}
+
+/// 轮转阈值 env 名（单位 MB）：缺省回落 [`DEFAULT_LOG_MAX_MB`]，`0` = 不限。
+/// 随 install 快照进服务定义（见 [`capture_envs`]）——守护进程形态改值需
+/// `export` 新值后重跑 `imagent service install`（或手改 plist 后重新 load）。
+pub const LOG_MAX_MB_ENV: &str = "IMAGENT_LOG_MAX_MB";
+
+/// 默认阈值 50MB。
+pub const DEFAULT_LOG_MAX_MB: u64 = 50;
+
+/// 保留最近 5 份轮转归档（`daemon.log.<epoch>`），超出删最旧。
+pub const LOG_ROTATE_KEEP: usize = 5;
+
+/// 解析阈值（MB；纯函数便于单测）：缺省/空白 → 默认值；`0` → `Ok(None)`
+///（不限，关闭轮转）；合法正整数 → `Ok(Some(mb))`；非法 → `Err`（调用方
+/// warn 后回落默认——坏 env 不应阻断守护进程启动）。
+fn parse_log_max_mb(raw: Option<&str>) -> Result<Option<u64>, String> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(Some(DEFAULT_LOG_MAX_MB));
+    };
+    let mb = raw
+        .parse::<u64>()
+        .map_err(|_| format!("{LOG_MAX_MB_ENV}={raw:?} 不是合法的非负整数"))?;
+    Ok((mb > 0).then_some(mb))
+}
+
+/// 当前生效阈值（字节）：`None` = 不限。每次检查时现读 env（读 env 廉价，
+/// 且 launchctl setenv / 手改 plist 重启后的下一节拍即可吃到新值）。
+fn log_max_bytes() -> Option<u64> {
+    match parse_log_max_mb(std::env::var(LOG_MAX_MB_ENV).ok().as_deref()) {
+        Ok(mb) => mb.map(|m| m.saturating_mul(1024 * 1024)),
+        Err(e) => {
+            tracing::warn!(
+                target: "imagent::ops",
+                "{e}，daemon.log 轮转阈值回落默认 {DEFAULT_LOG_MAX_MB}MB"
+            );
+            Some(DEFAULT_LOG_MAX_MB * 1024 * 1024)
+        }
+    }
+}
+
+/// copytruncate 本体：把 `log` 当前内容复制为归档 `dest`，再把 `log` **原地**
+/// truncate(0)。
+///
+/// # 为什么必须是 copytruncate 而不是 rename（plist 形态的机制约束，勿改）
+///
+/// launchd 对 plist `StandardOutPath/StandardErrorPath` 的实现是在 spawn 守护
+/// 进程时打开该路径一次、把 **fd** 接到子进程的 stdout/stderr（O_APPEND 追加
+/// 写）——它持有的是 fd（指向 inode），不是路径：
+/// - 若用 rename 轮转（`daemon.log` → `daemon.log.<epoch>`），launchd 的 fd
+///   仍指向旧 inode（此后挂在改名后的归档路径上），新日志继续写进归档文件，
+///   而之后重建的 `daemon.log` 永远收不到输出——轮转静默失效，这是 plist
+///   捕获 stdout 形态的经典坑。
+/// - copytruncate 不动 inode：复制出归档后把原文件 `set_len(0)`，launchd 的
+///   fd 保持有效，O_APPEND 保证下一次 write 原子定位到（已归零的）文件末尾。
+///
+/// # 丢日志窗口
+///
+/// `fs::copy` 完成到 `set_len(0)` 之间写入的日志行会被截掉——最坏丢秒级
+/// 日志。这与业界 logrotate 的 copytruncate 语义一致，是无外部工具协作下
+/// plist 形态的最优解，可接受。
+fn copytruncate(log: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    std::fs::copy(log, dest)?;
+    // write(true) + set_len(0) = 原地截断（inode 不变）；sync_all 让截断即时
+    // 落盘，防崩溃后文件长度回弹。
+    let f = std::fs::OpenOptions::new().write(true).open(log)?;
+    f.set_len(0)?;
+    f.sync_all()
+}
+
+/// 归档命名：`<base>.<epoch>`（epoch 秒）；同秒内再次轮转（正常 10 分钟节拍
+/// 下不可达，测试拨钟/手动触发会撞）追加 `.<n>` 序号避免覆盖既有归档。
+fn next_rotated_dest(dir: &std::path::Path, log: &std::path::Path, epoch: u64) -> PathBuf {
+    let base = file_base(log);
+    let primary = dir.join(format!("{base}.{epoch}"));
+    if !primary.exists() {
+        return primary;
+    }
+    for i in 1u64..1000 {
+        let p = dir.join(format!("{base}.{epoch}.{i}"));
+        if !p.exists() {
+            return p;
+        }
+    }
+    primary
+}
+
+/// 清理归档：按文件名中的 epoch（旧→新）排序，保留最近 `keep` 份，超出删
+/// 最旧。删除 best-effort（失败跳过，下一节拍再试）；返回成功删除数。
+fn prune_rotated(dir: &std::path::Path, log: &std::path::Path, keep: usize) -> usize {
+    let prefix = format!("{}.", file_base(log));
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut entries: Vec<(u64, u64, PathBuf)> = rd
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .filter_map(|p| {
+            let name = p.file_name()?.to_string_lossy().into_owned();
+            let rest = name.strip_prefix(&prefix)?;
+            // 主 epoch + 可选同秒碰撞序号 ".n"：`daemon.log.1700000000[.2]`。
+            let (epoch, sub) = match rest.split_once('.') {
+                Some((a, b)) => (a.parse::<u64>().ok()?, b.parse::<u64>().ok()?),
+                None => (rest.parse::<u64>().ok()?, 0),
+            };
+            Some((epoch, sub, p))
+        })
+        .collect();
+    // (epoch, sub) 升序 = 时间旧→新（PathBuf 仅作平局比较项，不影响语义）。
+    entries.sort_unstable();
+    let excess = entries.len().saturating_sub(keep);
+    entries
+        .into_iter()
+        .take(excess)
+        .filter(|(_, _, p)| std::fs::remove_file(p).is_ok())
+        .count()
+}
+
+fn file_base(log: &std::path::Path) -> String {
+    log.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "daemon.log".to_string())
+}
+
+/// 单次轮转判定（参数化，便于单测用 tmp 目录）：文件不存在 → `Ok(false)`
+///（Linux journal / 未装服务形态天然 no-op）；大小未超阈 → `Ok(false)`；
+/// 超阈（严格大于）→ copytruncate + 清理超保留数的归档 → `Ok(true)`。
+fn rotate_if_over(
+    log: &std::path::Path,
+    max_bytes: u64,
+    keep: usize,
+    now_epoch: u64,
+) -> std::io::Result<bool> {
+    let meta = match std::fs::metadata(log) {
+        Ok(m) => m,
+        // 不存在是常态（Linux 走 journal / 前台未装服务），静默跳过。
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if !meta.is_file() || meta.len() <= max_bytes {
+        return Ok(false);
+    }
+    let dir = log.parent().unwrap_or_else(|| std::path::Path::new("."));
+    copytruncate(log, &next_rotated_dest(dir, log, now_epoch))?;
+    prune_rotated(dir, log, keep);
+    Ok(true)
+}
+
+/// 轮转检查入口（启动 + 每 10 分钟节拍调用；best-effort——失败仅 warn，
+/// 绝不影响主流程）。
+///
+/// **形态判定**：`imagent start` 是前台与 launchd 守护的同一入口（plist
+/// `ProgramArguments` = `<exe> start --platform …`，无 `--daemon` 标志），
+/// 无法也不必区分，统一按「文件存在且超阈」判定：
+/// - macOS launchd（`service install`）：plist 把 stdout/stderr 指到本文件，
+///   真正的轮转目标；
+/// - macOS 前台：仅装过服务时该文件才存在，顺手轮转无害且同样值得；
+/// - Linux：`service install` 的 systemd unit 不写 StandardOutput（走
+///   journal），本文件天然不存在 → no-op；journal 的轮转归 journald 管。
+///
+/// 并发安全：同 IMAGENT_HOME 双实例被 instance 锁互斥，不存在两个进程
+/// 同时轮转；与 launchd 的写入方-轮转方关系见 [`copytruncate`] 注释。
+pub fn rotate_daemon_log_if_needed() {
+    let Some(max_bytes) = log_max_bytes() else {
+        return; // 0 = 不限
+    };
+    let log = daemon_log_path();
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match rotate_if_over(&log, max_bytes, LOG_ROTATE_KEEP, now_epoch) {
+        Ok(true) => tracing::info!(
+            target: "imagent::ops",
+            log = %log.display(),
+            keep = LOG_ROTATE_KEEP,
+            "daemon.log 超阈已轮转（copytruncate，最坏丢复制与截断之间的秒级日志）"
+        ),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            target: "imagent::ops",
+            log = %log.display(),
+            error = %e,
+            "daemon.log 轮转失败（继续运行，下一节拍重试）"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,5 +597,208 @@ mod tests {
         let u2 = render_unit("/x/imagent", None, "ilink", &[]);
         assert!(u2.contains("ExecStart=/x/imagent start --platform ilink"));
         assert!(!u2.contains("--profile"));
+    }
+}
+
+/// T15 daemon.log 轮转单测：全部走 tmp 目录参数化，不碰真实 `~/.imagent`。
+#[cfg(test)]
+mod logrotate_tests {
+    use super::*;
+
+    /// 每测试独立 tmp 目录（tag 唯一，并行测试互不干扰）；结尾 best-effort 清理。
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "imagent-t15-logrotate-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn log_in(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("daemon.log")
+    }
+
+    /// 轮转判定：未超阈不动原文件；恰好等于阈值不轮转（严格大于才轮转）；
+    /// 超阈 → 原文件截 0、归档 `<base>.<epoch>` 含旧内容。
+    #[test]
+    fn rotate_decision_over_and_under_threshold() {
+        let dir = tmp_dir("decision");
+        let log = log_in(&dir);
+        // 未超阈（3 字节 vs 阈值 10）：不动。
+        std::fs::write(&log, "abc").unwrap();
+        assert!(!rotate_if_over(&log, 10, 5, 1_700_000_000).unwrap());
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "abc");
+
+        // 恰好等于阈值：不轮转（「超过」= 严格大于）。
+        std::fs::write(&log, "0123456789").unwrap();
+        assert!(!rotate_if_over(&log, 10, 5, 1_700_000_000).unwrap());
+
+        // 超阈（11 > 10）：轮转。
+        std::fs::write(&log, "0123456789A").unwrap();
+        assert!(rotate_if_over(&log, 10, 5, 1_700_000_000).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "",
+            "轮转后原文件应截 0"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("daemon.log.1700000000")).unwrap(),
+            "0123456789A",
+            "归档应含轮转前的全部内容"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// copytruncate 全链路：写 → 轮转 → 新写入 → 归档仍是旧内容、原文件只有
+    /// 新内容；且截断是**原地**的（unix 下 inode 不变——launchd 持 fd 的前提，
+    /// rename 方案正是在此断裂）。
+    #[test]
+    fn copytruncate_write_rotate_write_old_content_preserved() {
+        let dir = tmp_dir("chain");
+        let log = log_in(&dir);
+        std::fs::write(&log, "old-line-1\nold-line-2\n").unwrap();
+        #[cfg(unix)]
+        let inode_before = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&log).unwrap().ino()
+        };
+        assert!(rotate_if_over(&log, 8, 5, 1_700_000_000).unwrap());
+        // 轮转后继续写（模拟 launchd 追加）。
+        std::fs::write(&log, "new-line-1\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("daemon.log.1700000000")).unwrap(),
+            "old-line-1\nold-line-2\n",
+            "归档必须保留轮转前的旧内容"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "new-line-1\n",
+            "原文件只应含轮转后的新写入"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(&log).unwrap().ino(),
+                inode_before,
+                "copytruncate 必须原地截断（inode 不变）——rename 会换 inode，launchd 的 fd 将指向归档"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 机制级验证（模拟 launchd）：外部进程以 O_APPEND 持有 fd 的文件被本机制
+    /// 轮转后，经旧 fd 继续写——写入应落到截断后的文件末尾（无 NUL 洞），
+    /// 而非写到截断前的旧 offset。
+    #[test]
+    fn held_append_fd_survives_truncation() {
+        use std::io::Write;
+        let dir = tmp_dir("append-fd");
+        let log = log_in(&dir);
+        let mut held = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&log)
+            .unwrap();
+        writeln!(held, "before-rotate").unwrap();
+        assert!(rotate_if_over(&log, 4, 5, 1_700_000_000).unwrap());
+        // launchd 的 fd 仍打开且 O_APPEND：下一次 write 定位到（已归零的）末尾。
+        writeln!(held, "after-rotate").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "after-rotate\n",
+            "经旧 fd 的写入应落在新文件末尾，无 NUL 洞"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("daemon.log.1700000000")).unwrap(),
+            "before-rotate\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 保留 N 份：7 份归档（含同秒碰撞序号档）keep=5 → 删最旧 2 份，其余保留；
+    /// 排序按 epoch（而非文件名字典序——跨位数字典序会错）。
+    #[test]
+    fn prune_keeps_newest_n() {
+        let dir = tmp_dir("prune");
+        let log = log_in(&dir);
+        for (ep, sub) in [
+            (999_u64, 0_u64),
+            (1000, 0),
+            (1000, 1), // 同秒碰撞档
+            (1001, 0),
+            (1002, 0),
+            (998, 0),
+            (1003, 0),
+        ] {
+            let name = if sub == 0 {
+                format!("daemon.log.{ep}")
+            } else {
+                format!("daemon.log.{ep}.{sub}")
+            };
+            std::fs::write(dir.join(name), "x").unwrap();
+        }
+        let removed = prune_rotated(&dir, &log, 5);
+        assert_eq!(removed, 2, "7 份 keep 5 → 删最旧 2（epoch 998 与 999）");
+        assert!(!dir.join("daemon.log.998").exists());
+        assert!(!dir.join("daemon.log.999").exists());
+        for keep_name in [
+            "daemon.log.1000",
+            "daemon.log.1000.1",
+            "daemon.log.1001",
+            "daemon.log.1002",
+            "daemon.log.1003",
+        ] {
+            assert!(dir.join(keep_name).exists(), "应保留 {keep_name}");
+        }
+        // 不足 keep 份时全保留、不误删。
+        assert_eq!(prune_rotated(&dir, &log, 5), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 同秒两次轮转（epoch 碰撞）：第二次归档拿 `.<n>` 序号，两份内容都不丢。
+    #[test]
+    fn same_epoch_collision_gets_suffix() {
+        let dir = tmp_dir("collision");
+        let log = log_in(&dir);
+        std::fs::write(&log, "first-batch").unwrap();
+        assert!(rotate_if_over(&log, 4, 5, 1_700_000_000).unwrap());
+        std::fs::write(&log, "second-batch").unwrap();
+        assert!(rotate_if_over(&log, 4, 5, 1_700_000_000).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("daemon.log.1700000000")).unwrap(),
+            "first-batch"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("daemon.log.1700000000.1")).unwrap(),
+            "second-batch",
+            "同秒第二次轮转应拿序号后缀而非覆盖"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 文件不存在（Linux journal / 前台未装服务形态）→ no-op 不报错。
+    #[test]
+    fn missing_log_is_noop() {
+        let dir = tmp_dir("missing");
+        assert!(!rotate_if_over(&log_in(&dir), 10, 5, 1).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 阈值 env 解析：缺省/空白 → 默认 50；"0" → None（不限）；合法值直通；
+    /// 非法（非数字/负数）→ Err（调用方 warn 后回落默认）。
+    #[test]
+    fn parse_env_variants() {
+        assert_eq!(parse_log_max_mb(None), Ok(Some(DEFAULT_LOG_MAX_MB)));
+        assert_eq!(parse_log_max_mb(Some("")), Ok(Some(DEFAULT_LOG_MAX_MB)));
+        assert_eq!(parse_log_max_mb(Some("  ")), Ok(Some(DEFAULT_LOG_MAX_MB)));
+        assert_eq!(parse_log_max_mb(Some("0")), Ok(None), "0 = 不限");
+        assert_eq!(parse_log_max_mb(Some(" 0 ")), Ok(None));
+        assert_eq!(parse_log_max_mb(Some("200")), Ok(Some(200)));
+        assert!(parse_log_max_mb(Some("abc")).is_err());
+        assert!(parse_log_max_mb(Some("-1")).is_err());
+        assert!(parse_log_max_mb(Some("1.5")).is_err());
     }
 }

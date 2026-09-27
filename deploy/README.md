@@ -26,6 +26,8 @@ tail -f /usr/local/var/log/imagent.log
 # 卸载：launchctl unload ~/Library/LaunchAgents/com.imagent.plist
 ```
 
+> 优先用 `imagent service install`（自动注册二进制/凭据/平台）。内置日志轮转（50MB 触发、保留 5 份，`IMAGENT_LOG_MAX_MB` 可调）只覆盖它的日志路径 `~/.imagent/logs/daemon.log`——本静态模板的自选日志路径不在轮转范围内，需自行配 newsyslog/logrotate。
+
 ## 指标（Prometheus）
 
 `config.toml` 默认**不开启** metrics（`metrics_addr` 留空 / 不设）；设为 `"127.0.0.1:9100"` 即开启。
