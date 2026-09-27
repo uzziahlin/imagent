@@ -84,11 +84,13 @@ impl Dispatcher {
             }
             let n_rows = list.len();
             // 缓存本列表：序号选择取缓存（防两次调用间本机会话
-            // mtime 变化导致序号错位）。D7：key 按 (conv, sender) 隔离 + 带时间戳。
-            self.resume_cache
-                .lock()
-                .await
-                .insert((conv.0.clone(), sender.0.clone()), (Instant::now(), list));
+            // mtime 变化导致序号错位）。D7：按 (conv, sender) 隔离 + 带时间戳
+            //（T18：conv 由 ConvState 表键承载，字段内 key 只剩 sender）。
+            self.with_conv(&conv.0, |cs| {
+                cs.resume_cache
+                    .insert(sender.0.clone(), (Instant::now(), list));
+            })
+            .await;
             // P6-3：前 9 条各带「接管」按钮（点击 = /resume <n>；卡片按钮数克制，
             // 长列表仍以文本序号为准）。
             let buttons: Vec<CardButton> = (1..=n_rows.min(9))
@@ -116,25 +118,28 @@ impl Dispatcher {
         // 选择目标：序号 → 取缓存列表（选中即消费，防陈旧序号）；
         // 非 数字 → 按 session_id 在新鲜合并列表里找。
         let target: Option<ResumeEntry> = if let Ok(n) = arg.parse::<usize>() {
-            let mut cache = self.resume_cache.lock().await;
-            let key = (conv.0.clone(), sender.0.clone());
-            let expired = cache
-                .get(&key)
-                .is_some_and(|(ts, _)| ts.elapsed() >= RESUME_CACHE_TTL);
-            if expired {
-                cache.remove(&key);
-            }
-            // D7：过期视同未列过表（列表可能已变化，引导重看）。
-            // S-16：选中**不再移除**缓存条目——移除会让后续序号整体前移错位
-            //（选中 1 后原 2 号变 1 号，连选即错会话）。缓存本就有 TTL（10 分钟）
-            // 惰性过期防陈旧；失败路径也无需恢复缓存（条目未动）。
-            cache.get(&key).and_then(|(_, l)| {
-                if n >= 1 && n <= l.len() {
-                    Some(l[n - 1].clone())
-                } else {
-                    None
+            let key = sender.0.clone();
+            self.with_conv(&conv.0, move |cs| {
+                let expired = cs
+                    .resume_cache
+                    .get(&key)
+                    .is_some_and(|(ts, _)| ts.elapsed() >= RESUME_CACHE_TTL);
+                if expired {
+                    cs.resume_cache.remove(&key);
                 }
+                // D7：过期视同未列过表（列表可能已变化，引导重看）。
+                // S-16：选中**不再移除**缓存条目——移除会让后续序号整体前移错位
+                //（选中 1 后原 2 号变 1 号，连选即错会话）。缓存本就有 TTL（10 分钟）
+                // 惰性过期防陈旧；失败路径也无需恢复缓存（条目未动）。
+                cs.resume_cache.get(&key).and_then(|(_, l)| {
+                    if n >= 1 && n <= l.len() {
+                        Some(l[n - 1].clone())
+                    } else {
+                        None
+                    }
+                })
             })
+            .await
         } else {
             self.merged_resume_list(&conv.0)
                 .await
@@ -463,8 +468,10 @@ impl Dispatcher {
         // 尝试（水位提示照常，手动 /compact 不受限）。
         const COMPACT_FAIL_BACKOFF_SECS: i64 = 3600;
         {
-            let last = self.compact_fail_last.lock().await;
-            if let Some(&ts) = last.get(&conv.0) {
+            let last = self
+                .peek_conv(&conv.0, |cs| cs.and_then(|c| c.compact_fail_last))
+                .await;
+            if let Some(ts) = last {
                 if crate::dispatch::now_secs() - ts < COMPACT_FAIL_BACKOFF_SECS {
                     debug!(
                         target: "imagent::core",
@@ -507,7 +514,8 @@ impl Dispatcher {
         match self.compact_session_locked(conv, &sid).await {
             Ok(summary) => {
                 // 成功即清退避标记（下次水位超阈恢复自动尝试）。
-                self.compact_fail_last.lock().await.remove(&conv.0);
+                self.with_conv(&conv.0, |cs| cs.compact_fail_last = None)
+                    .await;
                 let _ = self
                     .platform
                     .send_command_card(
@@ -530,10 +538,10 @@ impl Dispatcher {
                     error = %e,
                     "自动压缩失败（1 小时内不再自动重试，可手动 /compact）"
                 );
-                self.compact_fail_last
-                    .lock()
-                    .await
-                    .insert(conv.0.clone(), crate::dispatch::now_secs());
+                self.with_conv(&conv.0, |cs| {
+                    cs.compact_fail_last = Some(crate::dispatch::now_secs())
+                })
+                .await;
                 self.reply(
                     conv,
                     "⚠️ 自动压缩失败（不影响既有会话；1 小时内不再自动重试，可手动 /compact）。",
@@ -614,21 +622,22 @@ impl Dispatcher {
                 }
             }
         });
-        // P5-16：注册进 running——/stop 此前中断不了 /compact
+        // P5-16：注册进在飞表——/stop 此前中断不了 /compact
         //（长摘要生成只能干等 agent_timeout）。conv 锁由调用方
         // 持有，注册/移除无 ABA（新轮次须先等锁）。/compact 无转向。
         // T11：快照保持空默认——本消费循环只提取 Final，摘要生成的中间
         // chunk 不上面板；/tasks 对压缩轮显示 digest + 时长 + 工具 0 次。
-        self.running.lock().await.insert(
-            conv.0.clone(),
-            RoundHandle {
+        // T18：在飞句柄活在 ConvState 单表。
+        self.with_conv(&conv.0, |cs| {
+            cs.running = Some(RoundHandle {
                 abort: join.abort_handle(),
                 steer: None,
                 started: std::time::Instant::now(),
                 digest: Some("压缩上下文（/compact）".to_string()),
                 snapshot: Arc::new(std::sync::Mutex::new(RoundSnapshot::default())),
-            },
-        );
+            });
+        })
+        .await;
         let mut summary: Option<String> = None;
         while let Some(chunk) = rx.recv().await {
             if let AgentChunk::Final(t) = chunk {
@@ -637,7 +646,7 @@ impl Dispatcher {
         }
         let join_res = join.await;
         // 无论成败，先摘除在飞注册（/stop 已抢先摘除时为 no-op）。
-        self.running.lock().await.remove(&conv.0);
+        self.with_conv(&conv.0, |cs| cs.running = None).await;
         let summary_text = match join_res {
             Ok(Ok(o)) => summary.unwrap_or(o.final_text),
             Ok(Err(e)) => {
@@ -739,11 +748,11 @@ impl Dispatcher {
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "撤回权限询问失败（不影响中断）");
             }
         }
-        let running = self.running.lock().await.remove(&conv.0);
+        let running = self.with_conv(&conv.0, |cs| cs.running.take()).await;
         // 三态：Aborted（真中断）/ Completed（收尾期竞态——join 已结束，abort 无效
         // 却曾谎报「已中断」）/ None（无在飞任务，走标记/排队分支）。
         // Completed 场景：backend.run 已返回、run_agent_round 还在收尾（卡片
-        // finalize/落库持 conv 锁），句柄仍在 map——此前无条件 abort（no-op）+
+        // finalize/落库持 conv 锁），句柄仍在表——此前无条件 abort（no-op）+
         // 回「🛑 已中断」，实际轮次已完整跑完；如实回「已完成」，排队语义
         //（缺省保留自动续跑）不变，用户要丢弃可 /stop all。
         let (aborted, completed) = if let Some(h) = &running {
@@ -762,33 +771,40 @@ impl Dispatcher {
             // 轮未注册：设停止标记，runner 循环在起跑前拦截本批。
             let lock = self.acquire_conv_lock(&conv.0).await;
             if lock.try_lock().is_err() {
-                self.stop_requested
-                    .lock()
-                    .await
-                    .insert(conv.0.clone(), super::now_secs());
+                self.with_conv(&conv.0, |cs| cs.stop_requested = Some(super::now_secs()))
+                    .await;
             }
             (false, false)
         };
         // W1-1：缺省保留排队（runner 自动续跑 = steering）；`/stop all` 清空排队
         // + 排队状态（P10 hint）——硬停语义。S-4（原子）：清空与 hint 清理在
-        // 同一 queues 临界区。
+        // 同一临界区（T18：队列与 hint 同在 ConvState 单表）。
         let hard = hard_early;
         let queued = if hard {
-            let mut map = self.queues.lock().await;
             // v1.18 review（排队持久化重做）：按被丢元素的 rowid 精确删行——
             // 整 conv DELETE 会连带删掉并发入队新消息的行。
-            let (n, rowids) = match map.remove(&conv.0) {
-                Some(q) => (
-                    q.len(),
-                    q.iter()
-                        .map(|qm| qm.rowid)
-                        .filter(|r| *r > 0)
-                        .collect::<Vec<_>>(),
-                ),
-                None => (0, Vec::new()),
+            let (n, rowids) = {
+                let mut states = self.conv_states.lock().await;
+                let (n, rowids, emptied) = match states.get_mut(&conv.0) {
+                    Some(cs) => {
+                        let q = cs.queue.take().unwrap_or_default();
+                        cs.queued_hint = None;
+                        (
+                            q.len(),
+                            q.iter()
+                                .map(|qm| qm.rowid)
+                                .filter(|r| *r > 0)
+                                .collect::<Vec<_>>(),
+                            cs.is_empty(),
+                        )
+                    }
+                    None => (0, Vec::new(), false),
+                };
+                if emptied {
+                    states.remove(&conv.0);
+                }
+                (n, rowids)
             };
-            self.queued_hints.lock().await.remove(&conv.0);
-            drop(map);
             if !rowids.is_empty() {
                 if let Err(e) = self.store.delete_queued_rows(&rowids).await {
                     warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "硬停清持久化排队失败");
@@ -796,12 +812,10 @@ impl Dispatcher {
             }
             n
         } else {
-            self.queues
-                .lock()
-                .await
-                .get(&conv.0)
-                .map(|q| q.len())
-                .unwrap_or(0)
+            self.peek_conv(&conv.0, |cs| {
+                cs.and_then(|c| c.queue.as_ref()).map_or(0, Vec::len)
+            })
+            .await
         };
         // 真机校准（2026-08）：回执走命令卡（卡片平台渲染卡片，纯文本平台由
         // trait 默认降级文本）——中断时刻本就伴随 ⏹ 终态卡 + 快捷操作卡，夹

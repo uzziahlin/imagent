@@ -135,8 +135,9 @@ impl Dispatcher {
         let expected_token = token;
         // H1（code-review v8）：permission_mode 共享句柄——连接处理侧实时读档。
         let permission_mode = self.permission_mode.clone();
-        // P2（v13）：轮次发起者表——permission 分支注册 pending 时锚定发起者。
-        let round_initiators = self.round_initiators.clone();
+        // P2（v13）：per-conv 状态表句柄——permission 分支注册 pending 时读该
+        // conv 的轮次发起者做锚定（T18 起发起者活在 ConvState 单表）。
+        let conv_states = self.conv_states.clone();
         tokio::spawn(async move {
             // 鉴权基准：只接受与本进程同 uid 的连接（MCP 子进程由本进程 spawn，必然同 uid）。
             // P2-7/P5-9b 威胁模型：peer_uid 防「跨 uid 伪造」；握手 token 把「同 uid
@@ -160,7 +161,7 @@ impl Dispatcher {
                                     let ask_via_im_timeout = ask_via_im_timeout;
                                     let expected_token = expected_token.clone();
                                     let permission_mode = permission_mode.clone();
-                                    let round_initiators = round_initiators.clone();
+                                    let conv_states = conv_states.clone();
                                     tasks.lock().await.spawn(async move {
                                         Self::handle_permission_socket(
                                             stream,
@@ -172,7 +173,7 @@ impl Dispatcher {
                                             ask_via_im_timeout,
                                             expected_token,
                                             permission_mode,
-                                            round_initiators,
+                                            conv_states,
                                         )
                                         .await;
                                     });
@@ -299,7 +300,7 @@ impl Dispatcher {
         ask_via_im_timeout: std::time::Duration,
         expected_token: String,
         permission_mode: std::sync::Arc<parking_lot::RwLock<PermissionMode>>,
-        round_initiators: super::RoundInitiators,
+        conv_states: super::ConvStates,
     ) {
         // P5-9b：读两行——首行握手 token、次行 JSON 请求。必须共用一个 BufReader：
         // 分开建会把第二行的数据吞进被丢弃的缓冲区。reader 在块内 drop 以释放
@@ -383,7 +384,7 @@ impl Dispatcher {
                     permission_ask_timeout,
                     &req,
                     permission_mode,
-                    round_initiators,
+                    conv_states,
                 )
                 .await;
             }
@@ -673,7 +674,7 @@ impl Dispatcher {
         permission_ask_timeout: std::time::Duration,
         req: &serde_json::Value,
         permission_mode: std::sync::Arc<parking_lot::RwLock<PermissionMode>>,
-        round_initiators: super::RoundInitiators,
+        conv_states: super::ConvStates,
     ) {
         let tool_name = req
             .get("tool_name")
@@ -756,9 +757,13 @@ impl Dispatcher {
         let input_str = req.get("input").map(|v| v.to_string()).unwrap_or_default();
         let conv_id = conv.0.clone();
         // P2（v13）：发起者锚定——permission socket 请求来自该 conv 在飞轮次的
-        // MCP 子进程，取 core 侧轮次发起者表；无记录（非轮次路径/收尾间隙）为
-        // None，维持既有不比对语义。
-        let initiator = round_initiators.lock().await.get(&conv_id).cloned();
+        // MCP 子进程，取 core 侧轮次发起者（ConvState 单表）；无记录（非轮次
+        // 路径/收尾间隙）为 None，维持既有不比对语义。
+        let initiator = conv_states
+            .lock()
+            .await
+            .get(&conv_id)
+            .and_then(|cs| cs.round_initiator.clone());
         // P4-4：询问用户——平台支持交互卡片时发「按钮卡片」（send_permission_ask
         // 覆写），否则默认纯文本。按钮点击由平台侧转成携带 ask_req 的入站消息，
         // 复用 recv 循环的审批回复路由，core 不感知按钮。

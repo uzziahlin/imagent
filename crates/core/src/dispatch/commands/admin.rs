@@ -572,7 +572,10 @@ impl Dispatcher {
             let perm = self.permission_mode.read().as_str();
             let reply_mode = self.reply_mode.read().as_str();
             // Wave B-7：本会话 COT 覆盖（有则标注，无则跟随全局）。
-            let cot_conv = match self.cot_overrides.lock().await.get(&conv.0) {
+            let cot_override = self
+                .peek_conv(&conv.0, |cs| cs.and_then(|c| c.cot_override))
+                .await;
+            let cot_conv = match cot_override {
                 Some(d) => format!("{}（本会话覆盖）", d.as_str()),
                 None => format!("{cot}（跟随全局）"),
             };
@@ -685,13 +688,13 @@ impl Dispatcher {
     /// 覆盖回全局）。返回面向用户的结果文案。
     async fn apply_conv_cot(&self, conv: &str, value: &str) -> String {
         if value.eq_ignore_ascii_case("default") {
-            self.cot_overrides.lock().await.remove(conv);
+            self.with_conv(conv, |cs| cs.cot_override = None).await;
             let global = self.cot_detail.read().as_str();
             return format!("✅ 已清除本会话覆盖，回到全局 cot_detail = {global}");
         }
         match CotDetail::from_str_lossy(value) {
             Some(d) => {
-                self.cot_overrides.lock().await.insert(conv.to_string(), d);
+                self.with_conv(conv, |cs| cs.cot_override = Some(d)).await;
                 format!(
                     "✅ 本会话 cot = {}（仅本会话生效；/config cot default 恢复全局）",
                     d.as_str()

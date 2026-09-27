@@ -481,12 +481,14 @@ impl Dispatcher {
             // P0-4（v1.17）：起跑前停止标记检查——/stop 在批窗口/注册间隙设置，
             // 命中（60s 内）则本批不启动（批已被取走消费，按中断语义丢弃）。
             {
-                let mut sr = self.stop_requested.lock().await;
-                let hit = sr
-                    .remove(&conv.0)
-                    .is_some_and(|ts| super::now_secs() - ts <= 60);
+                let hit = self
+                    .with_conv(&conv.0, |cs| {
+                        cs.stop_requested
+                            .take()
+                            .is_some_and(|ts| super::now_secs() - ts <= 60)
+                    })
+                    .await;
                 if hit {
-                    drop(sr);
                     self.reply(
                         &conv,
                         "⏹️ 已中断：轮次在启动前被 /stop 拦下（本批消息未执行）",
@@ -515,10 +517,13 @@ impl Dispatcher {
             let _round_permit = self.acquire_round_permit(&conv.0).await;
             let round_input = self.run_agent_round(merged, react_mids).await;
             // v1.18：轮末清 steering 注入计数（footer「已注入 N 条」随轮归零；
-            // 保留排队字段——下一批语义仍在）。
-            if let Some(h) = self.queued_hints.lock().await.get_mut(&conv.0) {
-                h.steered = 0;
-            }
+            // 保留排队字段——下一批语义仍在）。T18：hint 活在 ConvState 单表。
+            self.with_conv(&conv.0, |cs| {
+                if let Some(h) = cs.queued_hint.as_mut() {
+                    h.steered = 0;
+                }
+            })
+            .await;
             // W2-5：自动 compact——成功轮次的上下文水位超阈值时走既有压缩管道
             //（conv 锁仍在手，与 /compact 同串行域；无活动会话时内部跳过）。
             if let Some(in_tokens) = round_input {

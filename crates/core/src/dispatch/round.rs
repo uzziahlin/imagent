@@ -149,11 +149,15 @@ impl Dispatcher {
         let tokens = self.run_round_inner(msg, react_mids).await;
         // 统一收尾：移除在飞注册（inner 未及注册时为幂等 no-op）。同 conv 轮次串行
         // （conv 锁），key 移除无 ABA。
-        self.running.lock().await.remove(&conv_key);
-        // P2（v13）：发起者锚定表同步收尾——轮次结束后该 conv 无在飞发起者
+        // P2（v13）：发起者锚定同步收尾——轮次结束后该 conv 无在飞发起者
         //（compact 自动轮在收尾后触发，届时审批 pending 的锚定为 None：宁漏拒
-        // 不误拒，不用陈旧发起者拦人）。
-        self.round_initiators.lock().await.remove(&conv_key);
+        // 不误拒，不用陈旧发起者拦人）。T18：两表已并入 ConvState 单表，同一
+        // 临界区清除（with_conv 对回到全空的 entry 自动剪除）。
+        self.with_conv(&conv_key, |cs| {
+            cs.running = None;
+            cs.round_initiator = None;
+        })
+        .await;
         // v1.20 崩溃轮次恢复：正常收尾（成功/失败/中断都经此）清除 inflight。
         // v1.21 review：清除失败必须 warn——残留的 inflight 行会让下次启动把
         // 已完成的轮次误判为崩溃并推 /retry（副作用类 prompt 有重复执行风险）。
@@ -199,10 +203,10 @@ impl Dispatcher {
         // P2（v13）：core 侧同步记录（审批 pending 的发起者锚定数据源——
         // build_im_permission_hook / permission socket 注册 pending 时读取；
         // 平台的 note_round_initiator 是平台内部状态，core 取不回来）。
-        self.round_initiators
-            .lock()
-            .await
-            .insert(conv.0.clone(), sender_id.clone());
+        self.with_conv(&conv.0, |cs| {
+            cs.round_initiator = Some(sender_id.clone());
+        })
+        .await;
         let base_prompt = msg.text.clone().unwrap_or_default();
         // Wave B-9：断档续接判定（base_prompt 被 move 进 prompt 载体前先算好）：
         // 无可续接会话且 prompt 命中续接词表（继续/接着/然后…，≤4 字）时，
@@ -217,11 +221,8 @@ impl Dispatcher {
         // 期间 /stop 无 running 句柄只能设标记。spawn 前按「水位之后新增」复查
         //（见 spawn 前注释），水位在此先取。
         let stop_mark_epoch = self
-            .stop_requested
-            .lock()
+            .peek_conv(&conv.0, |cs| cs.and_then(|c| c.stop_requested))
             .await
-            .get(&conv.0)
-            .copied()
             .unwrap_or(0);
 
         // W3-3 / P0-5（v1.17）：可重试 prompt 快照——**仅失败路径落库**（store
@@ -408,10 +409,13 @@ impl Dispatcher {
         // 「当前没有运行中的任务」但轮次照跑。以「起点水位之后新增的标记」
         // 判定（时间戳单调，免 TTL——长 preamble 也不漏），命中按中断语义收口。
         {
-            let hit = {
-                let mut sr = self.stop_requested.lock().await;
-                sr.remove(&conv.0).is_some_and(|ts| ts > stop_mark_epoch)
-            };
+            let hit = self
+                .with_conv(&conv.0, |cs| {
+                    cs.stop_requested
+                        .take()
+                        .is_some_and(|ts| ts > stop_mark_epoch)
+                })
+                .await;
             if hit {
                 self.reply(
                     &conv,
@@ -473,17 +477,17 @@ impl Dispatcher {
         // /tasks 面板经 running 句柄只读（std Mutex 短临界区，零 IO）。
         let round_snap = Arc::new(std::sync::Mutex::new(RoundSnapshot::default()));
         // P4-1：注册在飞句柄（/stop 中断用）。runner 持 conv 锁跨轮，同 conv 不可能
-        // 并发两轮；轮次结束由 run_agent_round 统一移除。
-        self.running.lock().await.insert(
-            conv.0.clone(),
-            RoundHandle {
+        // 并发两轮；轮次结束由 run_agent_round 统一移除。T18：注册进 ConvState。
+        self.with_conv(&conv.0, |cs| {
+            cs.running = Some(RoundHandle {
                 abort: join.abort_handle(),
                 steer: steer_capable.then_some(steer_tx),
                 started: std::time::Instant::now(),
                 digest: Some(first_prompt_digest.clone()),
                 snapshot: round_snap.clone(),
-            },
-        );
+            });
+        })
+        .await;
 
         // 收集 chunks：Final/Error 落库，ToolUse 累积用于最终工具摘要。
         let mut final_text: Option<String> = None;
@@ -506,7 +510,7 @@ impl Dispatcher {
                 conv.clone(),
                 self.platform.clone(),
                 hint.clone(),
-                self.queued_hints.clone(),
+                self.conv_states.clone(),
             );
             s.set_task_digest(Some(first_prompt_digest.clone()));
             Some(s)
