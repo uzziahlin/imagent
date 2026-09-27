@@ -47,7 +47,10 @@ sha2 = "0.10"
 hmac = { version = "0.12", default-features = false }
 
 # 存储 / 工具
-rusqlite = { version = "0.31", features = ["bundled"] }
+# bundled SQLite 的 CVE 不进 cargo-audit（audit 只看 RUSTSEC，bundled 的 C 代码
+# 无 advisory 源）；升级本依赖 = 升级内嵌 SQLite，需定期（每季度）手动检查
+# libsqlite3-sys 版本（T16 供应链，见 CODE_REVIEW_v13 P3）。运行时版本见 /doctor。
+rusqlite = { version = "0.40", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 qrcode = "0.14"        # 扫码登录终端二维码
 rand = "0.8"

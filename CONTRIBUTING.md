@@ -21,6 +21,10 @@
   - `--allowedTools` 配置收敛 + workdir 锁定。
   - iLink 定位「OpenClaw 协议 Rust 实现」，**绝不实现**绕频率/风控功能。
 - 协议字段以**一手实测**为准（curl / 抓包 / 对照 hermes weixin.py），不照假设。
+- **依赖供应链**：cargo-audit/deny 只覆盖 RUSTSEC advisory；rusqlite 的
+  `bundled` feature 内嵌的 SQLite C 代码**不在其覆盖范围**——升级 rusqlite
+  即升级内嵌 SQLite，需定期（每季度）手动检查 libsqlite3-sys 版本是否有
+  安全更新（运行时版本可经 `/doctor` 观测）。
 - commit message 清晰（`feat(crate): ...` / `fix: ...` / `docs: ...`）。
 
 ## 安全漏洞

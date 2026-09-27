@@ -20,3 +20,12 @@ pub use store::{
     AllowedSenderRow, AuditRow, CronJobRow, LiveCardRow, NamedSessionRow, OutboxRow, RunStatRow,
     SessionHistoryRow, SessionRow, Store, OUTBOX_MAX_ATTEMPTS,
 };
+
+/// bundled SQLite 编译期版本（libsqlite3-sys 的 `SQLITE_VERSION` 常量）。
+///
+/// bundled feature 下 SQLite 随 libsqlite3-sys 源码内嵌编译，编译期版本即运行时
+/// 版本；暴露给 `/doctor` 展示（T16：内嵌 C 代码的 CVE 不进 cargo-audit，部署侧
+/// 只能从这里观测实际 SQLite 版本）。
+pub fn sqlite_version() -> &'static str {
+    rusqlite::version()
+}
