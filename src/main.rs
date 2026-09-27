@@ -210,6 +210,47 @@ fn profile_state_dir(name: &str) -> anyhow::Result<PathBuf> {
     profile_root(name)
 }
 
+/// login/allow 的并发风险探测（CODE_REVIEW_v13 横切项「login/allow 子命令不持
+/// 实例锁」）：`instance` 模块明确仅 `start` 获取实例锁——运行中的主进程旁边跑
+/// `imagent login` / `imagent allow` 会并发改写凭据/白名单（WAL 防单页损坏但
+/// 不防逻辑竞争：login 覆盖凭据、allow 与 SIGHUP 的白名单整体替换互踩）。
+///
+/// 探测复用 `imagent_core::instance` 的 flock 语义（现有基建，不强造 try-probe
+/// API）：尝试 acquire——成功说明无主进程持锁（File 立即 drop 释放；期间锁文件
+/// 会被短暂写入本进程 PID，与崩溃残留同形态，flock 互斥不依赖文件内容，后续
+/// `start` 照常接管）；失败且为 Config 错误（unix 上即 flock 争用）说明锁被
+/// 持有。IO 错误（锁文件打不开等）不构成「主进程运行中」的证据，不提示。
+///
+/// 返回提示文案（Some = 锁被持有）；**只提示不阻断**——用户可能就是要热改
+/// （如换号重登）。竞态取舍：探测持锁的微秒窗口内恰有 `start` 并发启动会被
+/// 误拒（start 明确报错可重试），远小于漏提示的运维风险面。
+#[cfg(unix)]
+fn instance_running_warning(home: &Path) -> Option<&'static str> {
+    match imagent_core::instance::acquire(home) {
+        Ok(_released_on_return) => None,
+        Err(imagent_core::CoreError::Config(_)) => Some(
+            "⚠️ 检测到 imagent 主进程运行中：并发修改凭据/白名单有竞态风险，建议先 \
+             imagent stop；继续执行风险自负",
+        ),
+        Err(_) => None,
+    }
+}
+
+/// 非 unix：flock 不可用（项目本身 unix-only——permission.sock 依赖 unix
+/// domain socket），探测恒无提示。
+#[cfg(not(unix))]
+fn instance_running_warning(_home: &Path) -> Option<&'static str> {
+    None
+}
+
+/// login/allow 执行前的并发风险提示（打印一行 warn，不阻断——见
+/// [`instance_running_warning`]）。
+fn warn_if_instance_running(home: &Path) {
+    if let Some(msg) = instance_running_warning(home) {
+        eprintln!("{msg}");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // rustls 0.23 breaking change：必须显式安装 process-level CryptoProvider，
@@ -263,6 +304,9 @@ async fn main() -> Result<()> {
                     "login 仅支持 ilink 平台（WeCom 用 config 的 bot_id + secret，不走扫码登录），收到 platform={platform}"
                 ));
             }
+            // v13 横切项：主进程运行中并发 login 会竞态改写凭据——先探测提示
+            //（不阻断，用户可能就是要热改；见 instance_running_warning）。
+            warn_if_instance_running(&data_dir);
             let store = imagent_store::Store::open(&db_path).await?;
             // P5：login 写凭据也按 profile 分 keyring 键（与 start 一致）。
             store.set_keyring_scope(cli.profile.as_deref().unwrap_or(""));
@@ -961,6 +1005,9 @@ async fn main() -> Result<()> {
             platform: _,
             sender,
         } => {
+            // v13 横切项：主进程运行中并发 allow 会竞态改写白名单——先探测提示
+            //（不阻断；见 instance_running_warning）。
+            warn_if_instance_running(&data_dir);
             // 本地操作者（最高权限）：直接写入白名单 + 审计。空白名单时的唯一 bootstrap。
             let store = imagent_store::Store::open(&db_path).await?;
             store
@@ -3217,5 +3264,41 @@ mod backup_tests {
         );
         assert!(prune_backups(&root.join("nope"), "default", BACKUP_KEEP).is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// v13 横切项（login/allow 并发风险提示）单测：实例锁被持有时给出 warn 文案，
+/// 无人持锁 / 释放后无提示。锁探测经 imagent_core::instance 的 flock 语义
+///（临时目录即真实锁文件，无需 mock）。
+#[cfg(all(test, unix))]
+mod instance_warning_tests {
+    use super::*;
+
+    #[test]
+    fn instance_warning_only_when_lock_held() {
+        let home = std::env::temp_dir().join(format!("imagent-cli-warn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        // 无人持锁：无提示（探测内部 acquire 成功即释放，不残留持锁状态）。
+        assert!(
+            instance_running_warning(&home).is_none(),
+            "无人持锁不应提示"
+        );
+
+        // 持锁期间（模拟运行中的主进程——同进程另一 fd 持 flock，语义等价）：
+        // 给出含关键信息的 warn 文案。
+        let _guard = imagent_core::instance::acquire(&home).expect("测试先取锁");
+        let msg = instance_running_warning(&home).expect("持锁期间应给出提示");
+        assert!(msg.contains("主进程"), "点名主进程: {msg}");
+        assert!(msg.contains("竞态风险"), "说明风险: {msg}");
+        assert!(msg.contains("imagent stop"), "给出可操作建议: {msg}");
+        assert!(msg.contains("风险自负"), "不阻断的姿态: {msg}");
+
+        // 释放后（主进程退出）：回到无提示。
+        drop(_guard);
+        assert!(instance_running_warning(&home).is_none(), "释放后不应提示");
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
