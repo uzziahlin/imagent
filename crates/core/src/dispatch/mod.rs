@@ -2445,6 +2445,13 @@ impl Dispatcher {
                 .ok()
                 .and_then(|v| v.get("prompt").and_then(|p| p.as_str()).map(str::to_string))
                 .unwrap_or(payload.clone());
+            // v13 P3（base 语义配套）：纯媒体轮的 inflight prompt 为空——无可
+            // 重放指令（/retry 对空 prompt 回「没有可重试」），不覆盖
+            // last_prompt 也不发误导性的 /retry 通知，清标记即收口。
+            if prompt_text.trim().is_empty() {
+                let _ = self.store.delete_config(&key).await;
+                continue;
+            }
             // v1.23 review（修正 v1.21 的方向反转）：v1.21 实现写成「存在
             // last_prompt 即不覆盖」——但轮次按 conv 串行下，崩溃残留的
             // inflight（轮首写入）**必然新于**任何先前的 last_prompt（失败
