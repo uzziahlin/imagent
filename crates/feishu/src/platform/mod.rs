@@ -1197,7 +1197,7 @@ impl Platform for FeishuPlatform {
                 }
             }
         }
-        out.push("📋 功能↔权限对照：合并转发/引用上下文需 im:message:readonly；媒体下载需 im:resource；加急需 im:message.urgent:send；进群事件需订阅 im.chat.member.bot.added_v1（事件与回调页）".into());
+        out.push("📋 功能↔权限对照：合并转发/引用上下文走「获取指定消息」接口（同③探测），需 im:message:readonly，**群聊消息**另需 im:message.group_msg；媒体下载需 im:resource；加急需 im:message.urgent:send；进群事件需订阅 im.chat.member.bot.added_v1（事件与回调页）".into());
         out
     }
 
