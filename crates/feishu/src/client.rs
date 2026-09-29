@@ -1281,7 +1281,12 @@ pub async fn fetch_message_raw(
     message_id: &str,
 ) -> imagent_core::Result<(String, String)> {
     let base = core_config.base_url().trim_end_matches('/').to_string();
-    let url = format!("{base}/open-apis/im/v1/messages/{message_id}?user_id_type=open_id");
+    // card_msg_content_type=user_card_content（真机校准 2026-09-29）：CardKit
+    // 卡片不带该参数抓回的是「请升级客户端」降级占位卡，带上则返回原始卡片
+    // JSON（引用卡片追问的正文抽取依赖于此）。
+    let url = format!(
+        "{base}/open-apis/im/v1/messages/{message_id}?user_id_type=open_id&card_msg_content_type=user_card_content"
+    );
     let client = api_client().clone();
     let resp = client
         .get(&url)
@@ -1496,6 +1501,10 @@ fn merge_forward_item_of(v: &serde_json::Value) -> Option<MergedForwardItem> {
     })
 }
 
+/// 嵌套合并转发的一次转录内展开预算（「转发套转发」常态下 5 条已覆盖绝大
+/// 多数场景；更深/超预算的嵌套仍留占位——深度 × API 配额的旧取舍仍在）。
+const NESTED_MERGE_FORWARD_MAX: usize = 5;
+
 /// 拉取合并转发消息的子消息列表（合并转发完整支持）：官方机制是**复用**
 /// 「获取指定消息的内容」接口——GET `/im/v1/messages/{message_id}` 查
 /// msg_type=merged_forward 的消息时，响应 `data.items[]` 一次带回 1 条父
@@ -1510,7 +1519,43 @@ fn merge_forward_item_of(v: &serde_json::Value) -> Option<MergedForwardItem> {
 /// `body.content`（JSON 字符串）/ `sender.id`（无名字字段，转录用 id 后
 /// 8 位兜底）/ `create_time`（毫秒字符串）。宽容提取见
 /// [`parse_merge_forward_sub_messages`]。
+///
+/// `card_msg_content_type=user_card_content`（真机校准 2026-09-29）：不带该
+/// 参数时 CardKit 卡片（本 bot 回复卡）抓回的是「请升级客户端」降级占位卡；
+/// 带上则返回发送时/终态的原始卡片 JSON（`body.elements` 带 markdown 正文，
+/// card_text_transcript 可抽文本）。
+///
+/// 嵌套合并转发（子消息里的 merge_forward）：v1.28.4 起有界展开——每条嵌套
+/// 再拉一次本接口（上限 [`NESTED_MERGE_FORWARD_MAX`] 条，更深的仍留占位），
+/// 子条目继承嵌套父条目的时间戳（全局时间序排序后整块不散架）。
 pub async fn list_merge_forward(
+    core_config: &CoreConfig,
+    token: &str,
+    message_id: &str,
+) -> imagent_core::Result<Vec<MergedForwardItem>> {
+    let mut subs = fetch_merge_forward_sub_items(core_config, token, message_id).await?;
+    // 嵌套有界展开（单次 transcript 至多 5 次额外拉取；失败留占位 fail-soft）。
+    let mut budget = NESTED_MERGE_FORWARD_MAX;
+    let mut out: Vec<MergedForwardItem> = Vec::with_capacity(subs.len());
+    for it in subs.drain(..) {
+        let is_nested = matches!(it.message_type.as_str(), "merge_forward" | "merged_forward");
+        if !is_nested || budget == 0 {
+            out.push(it);
+            continue;
+        }
+        budget -= 1;
+        match fetch_merge_forward_sub_items(core_config, token, &it.message_id).await {
+            Ok(children) if !children.is_empty() => {
+                out.extend(flatten_nested_expansion(&it, children))
+            }
+            _ => out.push(it), // 拉取失败/空：保留原占位条目
+        }
+    }
+    Ok(out)
+}
+
+/// 单次「获取指定消息」拉取 + 子消息解析（[`list_merge_forward`] 的原语）。
+async fn fetch_merge_forward_sub_items(
     core_config: &CoreConfig,
     token: &str,
     message_id: &str,
@@ -1520,7 +1565,7 @@ pub async fn list_merge_forward(
         let resp = api_client()
             .clone()
             .get(format!(
-                "{base}/open-apis/im/v1/messages/{message_id}?user_id_type=open_id"
+                "{base}/open-apis/im/v1/messages/{message_id}?user_id_type=open_id&card_msg_content_type=user_card_content"
             ))
             .bearer_auth(token)
             .send()
@@ -1533,6 +1578,36 @@ pub async fn list_merge_forward(
         feishu_api_resp(resp, "list_merge_forward").await
     })?;
     parse_merge_forward_sub_messages(&v)
+}
+
+/// 嵌套展开的展平（纯函数，单测钉住）：嵌套父条目 → 「展开头」合成条目 +
+/// 全部子条目。子条目缺省 sender 继承父条目；**时间一律继承父条目**——子条目
+/// 自身时间通常更早，保留会被全局时间序排序拆到展开头之前、整块散架
+///（继承后稳定排序保持插入序，嵌套块内部相对序仍忠实）。孙级嵌套（子条目
+/// 里的 merge_forward）不在此展开（深度已到），由 message_body_of 落占位。
+fn flatten_nested_expansion(
+    parent: &MergedForwardItem,
+    children: Vec<MergedForwardItem>,
+) -> Vec<MergedForwardItem> {
+    let n = children.len();
+    let mut out = Vec::with_capacity(children.len() + 1);
+    out.push(MergedForwardItem {
+        message_id: parent.message_id.clone(),
+        message_type: "text".to_string(),
+        content: serde_json::json!({ "text": format!("┌ 嵌套合并转发展开（{n} 条，原为一条转发消息）：") })
+            .to_string(),
+        sender_id: parent.sender_id.clone(),
+        sender_name: parent.sender_name.clone(),
+        create_time_ms: parent.create_time_ms,
+    });
+    for mut c in children {
+        if c.sender_id.is_empty() {
+            c.sender_id = parent.sender_id.clone();
+        }
+        c.create_time_ms = parent.create_time_ms;
+        out.push(c);
+    }
+    out
 }
 
 /// T10 群聊上下文：获取会话历史消息（GET `/im/v1/messages?container_id_type=chat`，
@@ -2053,6 +2128,51 @@ mod tests {
         ] {
             assert!(!is_rate_limited_msg(miss), "不应识别: {miss}");
         }
+    }
+
+    /// 嵌套展开的展平（纯函数）：展开头在前、子条目继承缺省 sender/时间、
+    /// 时间序排序后整块不散架。
+    #[test]
+    fn nested_expansion_flatten() {
+        let parent = MergedForwardItem {
+            message_id: "om_nested".into(),
+            message_type: "merge_forward".into(),
+            content: "Merged and Forwarded Message".into(),
+            sender_id: "ou_sender123456".into(),
+            sender_name: None,
+            create_time_ms: 1_790_000_000_000,
+        };
+        let children = vec![
+            MergedForwardItem {
+                message_id: "om_c1".into(),
+                message_type: "text".into(),
+                content: r#"{"text":"嵌套里的第一条"}"#.into(),
+                sender_id: "ou_inner".into(),
+                sender_name: None,
+                create_time_ms: 1_789_000_000_000,
+            },
+            MergedForwardItem {
+                message_id: "om_c2".into(),
+                message_type: "text".into(),
+                content: r#"{"text":"第二条（无 sender/时间）"}"#.into(),
+                sender_id: String::new(),
+                sender_name: None,
+                create_time_ms: 0,
+            },
+        ];
+        let flat = flatten_nested_expansion(&parent, children);
+        assert_eq!(flat.len(), 3, "{flat:?}");
+        // 展开头：text 合成条目，标注条数。
+        assert_eq!(flat[0].message_type, "text");
+        assert!(
+            flat[0].content.contains("嵌套合并转发展开（2 条"),
+            "{flat:?}"
+        );
+        // 子条目保留自身 sender；时间一律继承嵌套父（全局排序不拆散块）。
+        assert_eq!(flat[1].sender_id, "ou_inner");
+        assert_eq!(flat[1].create_time_ms, 1_790_000_000_000, "继承嵌套父时间");
+        assert_eq!(flat[2].sender_id, "ou_sender123456", "缺省继承嵌套父");
+        assert_eq!(flat[2].create_time_ms, 1_790_000_000_000, "继承嵌套父时间");
     }
 
     /// 合并转发子消息解析（mock JSON，真机 schema：items[] 父消息 + 带
