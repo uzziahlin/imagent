@@ -2,6 +2,20 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.28.3] — 2026-09-29
+
+> **群上下文注入整链修复**（真机验证反馈追补）：agent 收到的群最近上下文
+> 只有类型占位标签、无正文——与 1.28.1/1.28.2 同族的「离线建模字段名未
+> 真机校准」欠账。feishu 181 tests 全绿。
+
+### Fixed
+- **群上下文内容提取**：`parse_group_context_items` 此前读顶层 `content`，
+  真机「获取会话历史消息」的内容在 `body.content`（sender 亦无 name
+  字段）——改 body.content 优先 + 顶层回退，与合并转发子消息提取对齐
+- **可观测性**：群上下文两处失败日志 debug → warn（附 im:message.group_msg
+  权限指引）；新增退化转录检测（text 条目正文为空 → warn 附每条形状，
+  与合并转发同款）
+
 ## [1.28.2] — 2026-09-29
 
 > **合并转发类型串单复数错位修复**（v1.28.1 追补）：飞书 API 与事件侧的
