@@ -1292,19 +1292,25 @@ pub async fn fetch_message_raw(
             imagent_core::CoreError::Platform(PLATFORM, format!("fetch_message_raw: {e}"))
         })?;
     let v = feishu_api_resp(resp, "fetch_message_raw").await?;
-    let mt = v
-        .pointer("/data/items/0/msg_type")
-        .or_else(|| v.pointer("/data/msg_type"))
-        .and_then(|m| m.as_str())
-        .unwrap_or("")
-        .to_string();
-    let content = v
-        .pointer("/data/items/0/body/content")
-        .or_else(|| v.pointer("/data/body/content"))
-        .or_else(|| v.pointer("/data/items/0/content"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("")
-        .to_string();
+    // 字段提取统一走 proto::parse_raw_message_item（列表类 API 单一事实源，
+    // 2026-09-29 真机校准收口）；items[0] 之外的旧版裸 data 信封保留指针回退。
+    let raw = v
+        .pointer("/data/items/0")
+        .and_then(crate::proto::parse_raw_message_item);
+    let (mt, content) = match raw {
+        Some(r) => (r.message_type, r.content),
+        None => (
+            v.pointer("/data/msg_type")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string(),
+            v.pointer("/data/body/content")
+                .or_else(|| v.pointer("/data/content"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string(),
+        ),
+    };
     Ok((mt, content))
 }
 
@@ -1475,51 +1481,18 @@ fn parse_merge_forward_sub_messages(
     Ok(subs)
 }
 
-/// 单个 item 的宽容提取（非对象跳过；字段缺失给默认值，见
-/// [`parse_merge_forward_sub_messages`] 的形态说明）。
+/// 单个 item → [`MergedForwardItem`]。字段提取统一走
+/// [`crate::proto::parse_raw_message_item`]（列表类 API 的单一事实源，
+/// 2026-09-29 真机校准收口——宽容姿态/回退集中维护）。
 fn merge_forward_item_of(v: &serde_json::Value) -> Option<MergedForwardItem> {
-    let obj = v.as_object()?;
-    let str_of = |k: &str| {
-        obj.get(k)
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string()
-    };
-    let (sender_id, sender_name) = match obj.get("sender").and_then(|s| s.as_object()) {
-        Some(s) => (
-            s.get("id")
-                .and_then(|x| x.as_str())
-                .or_else(|| s.get("open_id").and_then(|x| x.as_str()))
-                .unwrap_or("")
-                .to_string(),
-            s.get("name")
-                .and_then(|x| x.as_str())
-                .map(str::trim)
-                .filter(|n| !n.is_empty())
-                .map(String::from),
-        ),
-        None => (String::new(), None),
-    };
+    let raw = crate::proto::parse_raw_message_item(v)?;
     Some(MergedForwardItem {
-        message_id: str_of("message_id"),
-        message_type: obj
-            .get("message_type")
-            .and_then(|x| x.as_str())
-            .or_else(|| obj.get("msg_type").and_then(|x| x.as_str()))
-            .unwrap_or("")
-            .to_string(),
-        // 官方「获取指定消息」item 的内容在 body.content（真机 schema）；
-        // 顶层 content 作兼容回退。
-        content: obj
-            .get("body")
-            .and_then(|b| b.get("content"))
-            .and_then(|x| x.as_str())
-            .or_else(|| obj.get("content").and_then(|x| x.as_str()))
-            .unwrap_or("")
-            .to_string(),
-        sender_id,
-        sender_name,
-        create_time_ms: crate::proto::create_time_ms_of(obj.get("create_time")),
+        message_id: raw.message_id,
+        message_type: raw.message_type,
+        content: raw.content,
+        sender_id: raw.sender_id,
+        sender_name: raw.sender_name,
+        create_time_ms: raw.create_time_ms,
     })
 }
 
