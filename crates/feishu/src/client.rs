@@ -1455,6 +1455,23 @@ fn parse_merge_forward_sub_messages(
             .filter_map(merge_forward_item_of)
             .collect();
     }
+    // 退化转录检测（2026-09-29 真机反馈：客户端「聊天记录」形态待验）——
+    // text 子消息正文为空（转录将落 [文本消息] 占位）时 warn 可见并附每条
+    // 形状（类型=… 正文长度=…），正常转录静默。
+    if subs
+        .iter()
+        .any(|it| it.message_type == "text" && it.content.trim().is_empty())
+    {
+        let shape: Vec<String> = subs
+            .iter()
+            .map(|it| format!("{}({}B)", it.message_type, it.content.len()))
+            .collect();
+        warn!(
+            target: "feishu",
+            items = shape.join(","),
+            "合并转发子消息含空正文的 text 条目（转录将退化占位）——疑似该消息形态的字段结构与已知 schema 不符，抓取上面 items 形状排障"
+        );
+    }
     Ok(subs)
 }
 

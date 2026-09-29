@@ -2020,7 +2020,9 @@ fn message_body_of(mt: &str, content: &str) -> String {
         // 嵌套合并转发：**不递归**调 list_merge_forward——嵌套层数无界，每层一次
         // 分页拉取，深度 × API 配额易失控（用户「转发套转发」是常态），一期只
         // 标注占位让 agent 知道结构，用户需要细节可展开后单发。
-        "merged_forward" => "[合并转发消息（嵌套）]".to_string(),
+        // 真机校准（2026-09-29）：拉取 API 的嵌套子消息类型是单数
+        // merge_forward（此前只认复数 → 全部落「未知类型消息」占位）。
+        "merged_forward" | "merge_forward" => "[合并转发消息（嵌套）]".to_string(),
         _ => "[未知类型消息]".to_string(),
     }
 }
@@ -4015,11 +4017,14 @@ mod tests {
             mf_item("video", "{}", Some("Bob"), "ou_d", 0),
             mf_item("interactive", "{}", Some("Bob"), "ou_d", 0),
             mf_item("merged_forward", "{}", Some("Bob"), "ou_d", 0),
+            // 真机校准（2026-09-29）：拉取 API 的嵌套合并转发是单数
+            // merge_forward（事件侧才是复数）——两种都映射嵌套占位。
+            mf_item("merge_forward", "{}", Some("Bob"), "ou_d", 0),
             mf_item("audio", "{}", Some("Bob"), "ou_d", 0),
             mf_item("unknown_kind", "{}", None, "", 0),
         ];
         let t = render_merge_forward_transcript(&items, None, None);
-        assert!(t.starts_with("【合并转发聊天记录】共 12 条"), "{t}");
+        assert!(t.starts_with("【合并转发聊天记录】共 13 条"), "{t}");
         assert!(t.contains("[Alice 09:05] 文本内容"), "{t}");
         // 无 name → id 后 8 位；时间正常（ms+60s → 09:06）。
         assert!(t.contains("[bbbb9999 09:06] [图片]"), "{t}");
