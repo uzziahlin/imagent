@@ -2090,6 +2090,100 @@ pub fn group_chat_id_of_conv(conv: &str) -> Option<String> {
     (!id.is_empty() && id.starts_with("oc_")).then(|| id.to_string())
 }
 
+/// 「获取指定消息 / 获取会话历史消息」列表类 API 单条 item 的统一提取产物。
+///
+/// 真机校准（2026-09-29）收口：合并转发子消息（client::merge_forward_item_of）、
+/// 群历史（[`parse_group_context_items`]）、单条拉取（client::fetch_message_raw）
+/// 三处此前各自手写字段名，同一批 schema 偏差打了两遍——提取口径从此单一
+/// 事实源，宽容姿态（字段别名/回退）集中维护、集中测试。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RawMessageItem {
+    pub message_id: String,
+    /// 类型：`msg_type`（真机主形态），兼容别名 `message_type`。注意拉取 API
+    /// 的合并转发是**单数** `merge_forward`，事件侧才是复数（见
+    /// [`message_body_of`] 的双形态分支）。
+    pub message_type: String,
+    /// 正文 JSON 字符串（`{"text":"…"}` 等形态）：`body.content`（真机）优先，
+    /// 顶层 `content` 兼容回退。
+    pub content: String,
+    pub sender_id: String,
+    /// 真机 sender 无 name 字段（可缺省——转录用 id 后 8 位兜底）。
+    pub sender_name: Option<String>,
+    /// `sender.sender_type`（"user"/"app"/…；空 = 缺失）——群上下文 bot 判定用。
+    pub sender_type: String,
+    /// `sender.app_id`（bot 判定第二保险；空 = 缺失/非应用发送）。
+    pub sender_app_id: String,
+    /// 合并转发子消息的父级 id（None = 父消息本体或非合并转发场景）。
+    pub upper_message_id: Option<String>,
+    /// 毫秒 epoch（0 = 缺失/非法；秒级自动 ×1000 归一，见 [`create_time_ms_of`]）。
+    pub create_time_ms: i64,
+}
+
+/// 单条列表 item → [`RawMessageItem`]（非对象返回 None；字段缺失给默认值不丢
+/// 整条——转录对残缺条目有占位语义，见 [`message_body_of`]）。
+pub(crate) fn parse_raw_message_item(v: &serde_json::Value) -> Option<RawMessageItem> {
+    let obj = v.as_object()?;
+    let str_of = |k: &str| {
+        obj.get(k)
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let (sender_id, sender_name, sender_type, sender_app_id) =
+        match obj.get("sender").and_then(|s| s.as_object()) {
+            Some(s) => {
+                let id = s
+                    .get("id")
+                    .and_then(|x| x.as_str())
+                    .or_else(|| s.get("open_id").and_then(|x| x.as_str()))
+                    .unwrap_or("")
+                    .to_string();
+                let name = s
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(String::from);
+                (
+                    id,
+                    name,
+                    s.get("sender_type")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    s.get("app_id")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                )
+            }
+            None => (String::new(), None, String::new(), String::new()),
+        };
+    let upper = str_of("upper_message_id");
+    Some(RawMessageItem {
+        message_id: str_of("message_id"),
+        message_type: obj
+            .get("msg_type")
+            .and_then(|x| x.as_str())
+            .or_else(|| obj.get("message_type").and_then(|x| x.as_str()))
+            .unwrap_or("")
+            .to_string(),
+        content: obj
+            .get("body")
+            .and_then(|b| b.get("content"))
+            .and_then(|x| x.as_str())
+            .or_else(|| obj.get("content").and_then(|x| x.as_str()))
+            .unwrap_or("")
+            .to_string(),
+        sender_id,
+        sender_name,
+        sender_type,
+        sender_app_id,
+        upper_message_id: (!upper.is_empty()).then_some(upper),
+        create_time_ms: create_time_ms_of(obj.get("create_time")),
+    })
+}
+
 /// 「获取会话历史消息」（GET `/im/v1/messages`，container_id_type=chat）返回的
 /// 单条消息解析产物（`parse_group_context_items` 提取后交
 /// [`render_group_context_block`] 转录）。字段按飞书文档公开形态建模，
@@ -2127,54 +2221,20 @@ pub fn parse_group_context_items(v: &serde_json::Value, own_app_id: &str) -> Vec
     items
         .iter()
         .filter_map(|it| {
-            let obj = it.as_object()?;
-            let sender = obj.get("sender").and_then(|s| s.as_object());
-            let (sender_id, sender_name, from_bot) = match sender {
-                Some(s) => {
-                    let id = s
-                        .get("id")
-                        .and_then(|x| x.as_str())
-                        .or_else(|| s.get("open_id").and_then(|x| x.as_str()))
-                        .unwrap_or("")
-                        .to_string();
-                    let name = s
-                        .get("name")
-                        .and_then(|x| x.as_str())
-                        .map(str::trim)
-                        .filter(|n| !n.is_empty())
-                        .map(String::from);
-                    // bot 判定双保险：sender_type=app（含自身与其它应用）或
-                    // app_id 命中本应用（字段形态变化时任一命中即跳过）。
-                    let sender_type = s.get("sender_type").and_then(|x| x.as_str()).unwrap_or("");
-                    let app_id = s.get("app_id").and_then(|x| x.as_str()).unwrap_or("");
-                    let from_bot =
-                        sender_type == "app" || (!app_id.is_empty() && app_id == own_app_id);
-                    (id, name, from_bot)
-                }
-                None => (String::new(), None, false),
-            };
+            // 字段提取统一走 parse_raw_message_item（单一事实源，2026-09-29
+            // 真机校准收口——此处此前的手写提取漏 body.content 导致整链占位）。
+            let raw = parse_raw_message_item(it)?;
+            // bot 判定双保险：sender_type=app（含自身与其它应用）或 app_id
+            // 命中本应用（字段形态变化时任一命中即跳过）。
+            let from_bot = raw.sender_type == "app"
+                || (!raw.sender_app_id.is_empty() && raw.sender_app_id == own_app_id);
             Some(GroupContextItem {
-                sender_id,
-                sender_name,
+                sender_id: raw.sender_id,
+                sender_name: raw.sender_name,
                 from_bot,
-                message_type: obj
-                    .get("message_type")
-                    .and_then(|x| x.as_str())
-                    .or_else(|| obj.get("msg_type").and_then(|x| x.as_str()))
-                    .unwrap_or("")
-                    .to_string(),
-                // 真机校准（2026-09-29）：列表类 API（会话历史/合并转发）的内容
-                // 都在 body.content——此前只读顶层 content，群上下文整链只剩
-                // 类型占位标签（[文本消息]/[未知类型消息]）。顶层 content 保留
-                // 为兼容回退。
-                content: obj
-                    .get("body")
-                    .and_then(|b| b.get("content"))
-                    .and_then(|x| x.as_str())
-                    .or_else(|| obj.get("content").and_then(|x| x.as_str()))
-                    .unwrap_or("")
-                    .to_string(),
-                create_time_ms: create_time_ms_of(obj.get("create_time")),
+                message_type: raw.message_type,
+                content: raw.content,
+                create_time_ms: raw.create_time_ms,
             })
         })
         .collect()
@@ -4572,6 +4632,52 @@ mod tests {
         );
         assert_eq!(group_chat_id_of_conv("wecom:oc_g"), None, "跨平台串号");
         assert_eq!(group_chat_id_of_conv("feishu:"), None, "空 id");
+    }
+
+    /// 列表类 API 单条 item 统一提取（单一事实源）：真机 schema（msg_type +
+    /// body.content + sender{id,sender_type} 无 name + upper_message_id +
+    /// 毫秒字符串时间）与宽容回退（message_type 别名 / 顶层 content / 秒级
+    /// 归一 / open_id 别名）钉住——字段名漂移在此一处红灯，不再三处各错各的。
+    #[test]
+    fn parse_raw_message_item_real_schema_and_tolerances() {
+        // 真机抓包形态（2026-09-29，合并转发子消息；内容替换为等价文本）。
+        let real = serde_json::json!({
+            "message_id": "om_sub1",
+            "upper_message_id": "om_parent",
+            "msg_type": "text",
+            "create_time": "1790680932661",
+            "sender": { "id": "ou_alice", "id_type": "open_id", "sender_type": "user" },
+            "body": { "content": "{\"text\":\"早上好\"}" }
+        });
+        let raw = parse_raw_message_item(&real).expect("对象应解析");
+        assert_eq!(raw.message_type, "text");
+        assert_eq!(raw.content, "{\"text\":\"早上好\"}", "body.content 优先");
+        assert_eq!(raw.sender_id, "ou_alice");
+        assert_eq!(raw.sender_name, None, "真机 sender 无 name");
+        assert_eq!(raw.sender_type, "user");
+        assert_eq!(raw.upper_message_id.as_deref(), Some("om_parent"));
+        assert_eq!(raw.create_time_ms, 1_790_680_932_661);
+
+        // 宽容回退：message_type 别名 / 顶层 content / open_id / 秒级 ×1000 /
+        // upper 缺失 → None。
+        let legacy = serde_json::json!({
+            "message_type": "image",
+            "content": "{\"image_key\":\"img_v3_x\"}",
+            "create_time": 1787912340,
+            "sender": { "open_id": "ou_bobxxxxxxxxxxxx", "app_id": "cli_self" }
+        });
+        let raw = parse_raw_message_item(&legacy).expect("对象应解析");
+        assert_eq!(raw.message_type, "image");
+        assert_eq!(raw.content, "{\"image_key\":\"img_v3_x\"}");
+        assert_eq!(raw.sender_id, "ou_bobxxxxxxxxxxxx");
+        assert_eq!(raw.sender_app_id, "cli_self");
+        assert_eq!(raw.upper_message_id, None);
+        assert_eq!(raw.create_time_ms, 1_787_912_340_000);
+
+        // 非对象 / 空对象：None / 全默认值不炸。
+        assert!(parse_raw_message_item(&serde_json::json!("x")).is_none());
+        let raw = parse_raw_message_item(&serde_json::json!({})).expect("空对象默认值");
+        assert_eq!(raw, RawMessageItem::default());
     }
 
     /// 「获取会话历史消息」响应 JSON → 条目：字段宽容提取（类型两名/时间秒归一/
