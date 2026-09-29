@@ -2,6 +2,24 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.28.1] — 2026-09-29
+
+> **合并转发整链修复（真机校准批）**：引用/直发合并转发自 v1.25.2 上线起
+> 每次拉取必失败且静默——根因是所调端点不存在（真机 token 实测裸 404）。
+> 全仓 797 tests / 0 failed、clippy 零警告。
+
+### Fixed
+- **合并转发子消息拉取整链修复**：`list_merge_forward` 此前调
+  `GET /im/v1/messages/{id}/merge_forward`——该端点不存在（真机 404 page
+  not found），fail-soft 吞掉后引用合并转发上下文永远缺省、直发合并转发
+  恒回「无法读取」。改用官方机制：GET /im/v1/messages/{id} 查 merged_forward
+  消息时响应 `items[]` 一次带回 1 父 + N 子消息（`upper_message_id` 非空
+  即子消息）。解析按真机 schema（`body.content`、sender 无名、毫秒时间戳）
+  + 字段漂移防御回退；删除不存在的分页逻辑
+- **排障性**：引用上下文三处失败日志 debug → warn（默认 INFO 级可见——
+  本次根因排查难即难在静默）；/doctor 对照表补「群聊消息另需
+  im:message.group_msg」
+
 ## [1.28.0] — 2026-09-27
 
 > **v13 路线收官批**（docs/CODE_REVIEW_v13.md 迭代路线全部交付）：安全模型
