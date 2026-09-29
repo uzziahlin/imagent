@@ -989,7 +989,7 @@ async fn enrich_with_group_context(
             {
                 Ok(items) => items,
                 Err(e2) => {
-                    debug!(
+                    warn!(
                         target: "feishu",
                         error = %e2,
                         chat_id,
@@ -1000,15 +1000,31 @@ async fn enrich_with_group_context(
             }
         }
         Err(e) => {
-            debug!(
+            warn!(
                 target: "feishu",
                 error = %e,
                 chat_id,
-                "群上下文拉取失败（权限/网络，跳过注入）"
+                "群上下文拉取失败（权限/网络，跳过注入）——群消息历史需 im:message:readonly + im:message.group_msg"
             );
             return;
         }
     };
+    // 退化转录检测（真机校准教训）：text 条目正文为空 → 群上下文只剩类型
+    // 占位标签，warn 附形状便于定位 schema 漂移（正常路径静默）。
+    if items
+        .iter()
+        .any(|it| it.message_type == "text" && it.content.trim().is_empty())
+    {
+        let shape: Vec<String> = items
+            .iter()
+            .map(|it| format!("{}({}B)", it.message_type, it.content.len()))
+            .collect();
+        warn!(
+            target: "feishu",
+            items = shape.join(","),
+            "群上下文含空正文的 text 条目（转录将退化占位）——疑似字段结构与已知 schema 不符"
+        );
+    }
     let Some(block) = crate::proto::render_group_context_block(&items) else {
         return;
     };

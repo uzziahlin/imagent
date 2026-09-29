@@ -2128,12 +2128,6 @@ pub fn parse_group_context_items(v: &serde_json::Value, own_app_id: &str) -> Vec
         .iter()
         .filter_map(|it| {
             let obj = it.as_object()?;
-            let str_of = |k: &str| {
-                obj.get(k)
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string()
-            };
             let sender = obj.get("sender").and_then(|s| s.as_object());
             let (sender_id, sender_name, from_bot) = match sender {
                 Some(s) => {
@@ -2169,7 +2163,17 @@ pub fn parse_group_context_items(v: &serde_json::Value, own_app_id: &str) -> Vec
                     .or_else(|| obj.get("msg_type").and_then(|x| x.as_str()))
                     .unwrap_or("")
                     .to_string(),
-                content: str_of("content"),
+                // 真机校准（2026-09-29）：列表类 API（会话历史/合并转发）的内容
+                // 都在 body.content——此前只读顶层 content，群上下文整链只剩
+                // 类型占位标签（[文本消息]/[未知类型消息]）。顶层 content 保留
+                // 为兼容回退。
+                content: obj
+                    .get("body")
+                    .and_then(|b| b.get("content"))
+                    .and_then(|x| x.as_str())
+                    .or_else(|| obj.get("content").and_then(|x| x.as_str()))
+                    .unwrap_or("")
+                    .to_string(),
                 create_time_ms: create_time_ms_of(obj.get("create_time")),
             })
         })
@@ -4571,7 +4575,8 @@ mod tests {
     }
 
     /// 「获取会话历史消息」响应 JSON → 条目：字段宽容提取（类型两名/时间秒归一/
-    /// sender name）、bot 双判定（sender_type=app 或 app_id 命中本应用）。
+    /// sender name、**body.content 优先 + 顶层 content 回退**——真机校准 2026-09-29）、
+    /// bot 双判定（sender_type=app 或 app_id 命中本应用）。
     #[test]
     fn parse_group_context_items_tolerant_and_bot_detection() {
         let body = serde_json::json!({
@@ -4579,8 +4584,8 @@ mod tests {
             "data": { "items": [
                 {
                     "message_id": "om_1", "msg_type": "text", "create_time": "1788000001",
-                    "sender": { "id": "ou_alice", "id_type": "open_id", "sender_type": "user", "name": "Alice" },
-                    "content": "{\"text\":\"早上好\"}"
+                    "sender": { "id": "ou_alice", "id_type": "open_id", "sender_type": "user" },
+                    "body": { "content": "{\"text\":\"早上好\"}" }
                 },
                 {
                     "message_id": "om_2", "message_type": "post", "create_time": "1788000002000",
@@ -4597,9 +4602,14 @@ mod tests {
         });
         let items = parse_group_context_items(&body, "cli_self");
         assert_eq!(items.len(), 3, "非对象条目跳过: {items:?}");
-        // 字段提取 + 秒级时间归一毫秒。
-        assert_eq!(items[0].sender_name.as_deref(), Some("Alice"));
+        // 字段提取 + 秒级时间归一毫秒；真机 schema：sender 无 name、内容在
+        // body.content（此前只读顶层 content → 全空，只剩类型占位标签）。
+        assert_eq!(items[0].sender_name, None, "真机 sender 无 name 字段");
         assert_eq!(items[0].message_type, "text");
+        assert_eq!(
+            items[0].content, "{\"text\":\"早上好\"}",
+            "body.content 优先提取"
+        );
         assert_eq!(items[0].create_time_ms, 1_788_000_001_000);
         // message_type/msg_type 两名兼容 + 数字毫秒原样。
         assert_eq!(items[1].message_type, "post");
