@@ -199,6 +199,13 @@ fn collect_card_text(node: Option<&serde_json::Value>, out: &mut Vec<String>, de
                         out.push(c.trim().to_string());
                     }
                 }
+                // 降级占位卡的形态（真机 2026-09-29：不带 user_card_content 参数
+                // 时 CardKit 卡抓回的 stub 用 {"tag":"text","text":"…"}）。
+                "text" => {
+                    if let Some(t) = map.get("text").and_then(|t| t.as_str()) {
+                        out.push(t.trim().to_string());
+                    }
+                }
                 _ => {
                     for v in map.values() {
                         collect_card_text(Some(v), out, depth + 1);
@@ -1903,7 +1910,12 @@ pub fn render_merge_forward_transcript(
             )
         })
         .count();
-    for item in items {
+    // 真机校准（2026-09-29）：客户端合并转发的 items 顺序是用户勾选序而非
+    // 时间序（实测 13:08→19:22→13:33→…交错）——按 create_time 稳定升序排，
+    // 缺失时间（0）沉底保持相对序。
+    let mut ordered: Vec<&MergedForwardItem> = items.iter().collect();
+    ordered.sort_by_key(|it| (it.create_time_ms == 0, it.create_time_ms));
+    for item in ordered {
         let line = format!("\n{}", merge_forward_line(item));
         let ll = line.chars().count();
         if used + ll > MERGE_FORWARD_TRANSCRIPT_MAX {
@@ -1987,7 +1999,14 @@ fn message_body_of(mt: &str, content: &str) -> String {
         // text：取 content JSON 的 text；@_user_N 占位**保留原样**——列表类 API
         // 不回 mentions 元数据，正则清掉会丢「此处有 @」的语义、名字又无从
         // 还原，保留原样是最简单且不撒谎的选择。
-        "text" => extract_text(content).unwrap_or_else(|| "[文本消息]".to_string()),
+        "text" => extract_text(content)
+            .or_else(|| {
+                // 撤回消息的 content 是字面量 "This message was recalled"
+                //（真机 2026-09-29：非 JSON，落 [文本消息] 占位误导 agent）。
+                (content.trim() == "This message was recalled")
+                    .then(|| "[已撤回的消息]".to_string())
+            })
+            .unwrap_or_else(|| "[文本消息]".to_string()),
         // post：复用既有 post→文本逻辑（parse_post）。图片节点不下载：有文字
         // 只取文字（agent 拿不到图，占位反而误导）；纯图 post 以 [图片] 示意。
         "post" => match parse_post(content, None) {
@@ -2014,6 +2033,41 @@ fn message_body_of(mt: &str, content: &str) -> String {
             }
         }
         "media" | "video" => "[视频]".to_string(),
+        // 群系统事件（建群/改名/邀请…，真机 2026-09-29 群历史实测）：content
+        // 为 {"template":"{from_user} started the group chat.","from_user":{…}}，
+        // 模板变量用同名字段填充（对象取 name，字符串原样），填不上保留 {var}
+        // 原样——此前落 [未知类型消息] 纯占位。截 120 字（事件文案都很短）。
+        "system" => {
+            let rendered = serde_json::from_str::<serde_json::Value>(content)
+                .ok()
+                .and_then(|v| {
+                    let template = v.get("template")?.as_str()?.to_string();
+                    let mut filled = template.clone();
+                    if let Some(obj) = v.as_object() {
+                        for (k, val) in obj {
+                            if k == "template" {
+                                continue;
+                            }
+                            let repl = val
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .or_else(|| val.as_str())
+                                .unwrap_or("");
+                            if !repl.is_empty() {
+                                filled = filled.replace(&format!("{{{k}}}"), repl);
+                            }
+                        }
+                    }
+                    (!filled.trim().is_empty()).then_some(filled)
+                });
+            match rendered {
+                Some(t) => {
+                    let t: String = t.chars().take(120).collect();
+                    format!("[系统消息] {t}")
+                }
+                None => "[系统消息]".to_string(),
+            }
+        }
         // 卡片（含本 bot 回复卡）：抽文本正文（v1.27.0——此前只占位，聊天记录
         // 里引用 bot 回答追问同样失效）；模板卡/抽不到回退占位。
         "interactive" => card_text_transcript(content).unwrap_or_else(|| "[卡片消息]".to_string()),
@@ -4182,6 +4236,75 @@ mod tests {
         )];
         let t2 = render_merge_forward_transcript(&text_only, None, None);
         assert!(!t2.contains("图片/文件"), "{t2}");
+    }
+
+    /// 转录时间序（真机校准 2026-09-29）：客户端合并转发的 items 是勾选序
+    /// 非时间序——渲染按 create_time 稳定升序排，缺失（0）沉底保持相对序。
+    #[test]
+    fn render_transcript_orders_by_create_time() {
+        let items = vec![
+            mf_item(
+                "text",
+                r#"{"text":"晚上的"}"#,
+                Some("C"),
+                "ou_c",
+                1_790_000_000_000,
+            ),
+            mf_item(
+                "text",
+                r#"{"text":"早上的"}"#,
+                Some("A"),
+                "ou_a",
+                1_780_000_000_000,
+            ),
+            mf_item("text", r#"{"text":"无时间的"}"#, Some("X"), "ou_x", 0),
+            mf_item(
+                "text",
+                r#"{"text":"中午的"}"#,
+                Some("B"),
+                "ou_b",
+                1_785_000_000_000,
+            ),
+        ];
+        let t = render_merge_forward_transcript(&items, None, None);
+        let a = t.find("早上的").expect("missing");
+        let b = t.find("中午的").expect("missing");
+        let c = t.find("晚上的").expect("missing");
+        let x = t.find("无时间的").expect("missing");
+        assert!(a < b && b < c && c < x, "升序 + 缺失沉底: {t}");
+    }
+
+    /// system 系统事件模板渲染（真机群历史实测形态）与撤回消息标记：
+    /// 此前分别落 [未知类型消息]/[文本消息] 纯占位。
+    #[test]
+    fn system_event_and_recalled_rendering() {
+        let sys = mf_item(
+            "system",
+            r#"{"template":"{from_user} started the group chat.","from_user":{"name":"林昱在"}}"#,
+            None,
+            "ou_s",
+            100,
+        );
+        let renamed = mf_item(
+            "system",
+            r#"{"template":"{from_user} updated the group name from \"{old}\" to \"{new}\".","from_user":{"name":"林昱在"},"old":{"name":"旧名"},"new":{"name":"新名"}}"#,
+            None,
+            "ou_s",
+            200,
+        );
+        let recalled = mf_item("text", "This message was recalled", None, "ou_r", 300);
+        let t = render_merge_forward_transcript(&[sys, renamed, recalled], None, None);
+        assert!(
+            t.contains("[系统消息] 林昱在 started the group chat"),
+            "{t}"
+        );
+        assert!(
+            t.contains("林昱在 updated the group name from \"旧名\" to \"新名\""),
+            "{t}"
+        );
+        assert!(t.contains("[已撤回的消息]"), "{t}");
+        assert!(!t.contains("[未知类型消息]"), "{t}");
+        assert!(!t.contains("[文本消息]"), "{t}");
     }
 
     /// 转录截断保护：超 8000 字符按字符边界截断，尾部标注「（已截断，共 N 条中
