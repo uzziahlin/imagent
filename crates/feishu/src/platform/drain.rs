@@ -903,7 +903,7 @@ async fn enrich_with_quote(
                 let token = match fetch_cached_token(token_lock, cfg, aid, sec).await {
                     Ok(t) => t,
                     Err(e) => {
-                        debug!(target: "feishu", error = %e, "引用合并转发取 token 失败");
+                        warn!(target: "feishu", error = %e, "引用合并转发取 token 失败（本轮引用上下文缺省，用户提问照常）");
                         return;
                     }
                 };
@@ -914,7 +914,7 @@ async fn enrich_with_quote(
                             .to_string(),
                     ),
                     Err(e) => {
-                        debug!(target: "feishu", error = %e, parent_id, "引用合并转发子消息拉取失败");
+                        warn!(target: "feishu", error = %e, parent_id, "引用合并转发子消息拉取失败（本轮引用上下文缺省，用户提问照常）——v1.26.x 教训：此类静默失败此前 debug 级不可见，排查极难");
                         return;
                     }
                 }
@@ -931,7 +931,7 @@ async fn enrich_with_quote(
             _ => crate::proto::quoted_context_text(&mt, &content),
         },
         Err(e) => {
-            debug!(target: "feishu", error = %e, parent_id, "引用消息拉取失败（原样发送）");
+            warn!(target: "feishu", error = %e, parent_id, "引用消息拉取失败（原样发送，引用上下文缺省）");
             return;
         }
     };
