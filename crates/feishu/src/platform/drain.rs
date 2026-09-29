@@ -889,7 +889,11 @@ async fn enrich_with_quote(
         crate::client::fetch_message_raw(cfg, &t, parent_id).await
     }
     .await;
-    let is_merged_forward = fetched.as_ref().is_ok_and(|(mt, _)| mt == "merged_forward");
+    // 真机校准（2026-09-29）：拉取 API 的 msg_type 是单数 merge_forward，
+    // 事件侧才是复数 merged_forward（飞书两面命名不一致）——两个都认。
+    let is_merged_forward = fetched
+        .as_ref()
+        .is_ok_and(|(mt, _)| matches!(mt.as_str(), "merged_forward" | "merge_forward"));
     // 引用卡片与聊天记录同权重放宽到 1500 字：卡片正文即完整 agent 回复
     //（发送侧上限 8KB），500 字截断恰好砍在用户追问的报错/结论上。
     let mut wide_quote = is_merged_forward;
@@ -898,8 +902,9 @@ async fn enrich_with_quote(
             // 引用的是合并转发消息（聊天记录卡片）：本体 content 是占位符，
             // 须再调子消息接口拉全量并转录（v1.25.2 补——此前该类型直接
             // 放弃，引用会话记录场景整链失效）。转录放宽到 1500 字（会话
-            // 记录天然长于单条消息）。
-            "merged_forward" => {
+            // 记录天然长于单条消息）。类型串双形态见上方 is_merged_forward
+            // 校准注释（API 单数 / 事件复数）。
+            "merged_forward" | "merge_forward" => {
                 let token = match fetch_cached_token(token_lock, cfg, aid, sec).await {
                     Ok(t) => t,
                     Err(e) => {
