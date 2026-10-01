@@ -42,7 +42,7 @@ base64 = "0.23"
 hex = "0.4"
 # S3 凭据应用层加密（store：keyring 不可用时的加密回退）
 aes-gcm = "0.10"
-pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
 sha2 = "0.10"
 hmac = { version = "0.12", default-features = false }
 
