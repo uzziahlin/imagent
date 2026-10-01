@@ -311,7 +311,11 @@ imagent service install
 ```bash
 imagent service status     # 运行状态
 imagent service uninstall  # 停止并卸载
+imagent service print      # 预览将写入的服务定义（--format launchd|systemd、--exe/--platform/--log-path 覆盖；不安装、不写文件、不需 root）
 ```
+
+> `deploy/` 下的静态 launchd/systemd 模板即 `service print` 的输出（单一事实源，
+> 勿手改；刷新方法见 `deploy/README.md` 顶部）。
 
 | | macOS（launchd 用户代理） | Linux（systemd 用户单元） |
 |---|---|---|
@@ -494,7 +498,7 @@ cargo clippy --workspace --all-targets -- -D warnings   # 0 warning
 cargo fmt --all --check
 ```
 
-crate：`core`（调度/鉴权/session/权限/任务控制/cron）+ `ilink`（iLink 协议）+ `wecom`（企业微信长连接）+ `feishu`（飞书长连接 + CardKit + 云文档评论）+ `claude`（CLI/ACP backend）+ `codex` + `gemini` + `store`（SQLite，schema v15 线性迁移）。
+crate：`core`（调度/鉴权/session/权限/任务控制/cron）+ `ilink`（iLink 协议）+ `wecom`（企业微信长连接）+ `feishu`（飞书长连接 + CardKit + 云文档评论）+ `claude`（CLI/ACP backend）+ `codex` + `gemini` + `store`（SQLite，schema v16 线性迁移）。
 
 ## License
 

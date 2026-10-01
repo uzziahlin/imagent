@@ -101,3 +101,15 @@ jobs:
       - uses: taiki-e/install-action@cargo-deny
       - name: cargo deny check
         run: cargo deny check licenses sources bans
+
+  docs:
+    # 文档单一事实源断言（B2 批 · 任务 3）：历史三次漂移（ARCHITECTURE 写旧
+    # schema、README 写旧版本、CLAUDE.md 指旧 review 轮次）。规则与取舍见
+    # scripts/check_docs.sh 头注释——失败信息直接给出 文件:行号 + 漂移原句。
+    # 纯 bash + coreutils，秒级完成，不值得并入需要装 Rust 工具链的 job。
+    name: docs single-source-of-truth
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: check docs drift
+        run: bash scripts/check_docs.sh

@@ -744,8 +744,11 @@ impl Dispatcher {
             // P5-16：收敛审批询问本身——把 IM 里滞留的询问卡片 patch 成
             // 「已中断」（纯文本询问平台 no-op）。best-effort。多 pending 并存
             // 后按 conv 全量收敛（终端 ask 与 IM 审批都可能挂着）。
-            if let Err(e) = self.platform.cancel_all_permission_asks(conv).await {
-                warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "撤回权限询问失败（不影响中断）");
+            // B1：能力门——非 ASK 平台跳过（default 亦 no-op）。
+            if platform_supports(self.platform.as_ref(), PlatformCaps::ASK, "ask") {
+                if let Err(e) = self.platform.cancel_all_permission_asks(conv).await {
+                    warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "撤回权限询问失败（不影响中断）");
+                }
             }
         }
         let running = self.with_conv(&conv.0, |cs| cs.running.take()).await;

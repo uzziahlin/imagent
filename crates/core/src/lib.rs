@@ -28,6 +28,7 @@ pub mod lineio;
 pub mod mcp;
 mod message;
 pub mod metrics;
+pub mod outbox;
 pub mod paths;
 mod permission;
 mod platform;
@@ -50,7 +51,7 @@ pub use metrics::Metrics;
 pub use permission::{
     default_sock_path, needs_approval, parse_reply, PermissionReply, PermissionRouter,
 };
-pub use platform::{command_card_fallback_text, Platform};
+pub use platform::{command_card_fallback_text, Platform, PlatformCaps};
 pub use types::{
     AgentChunk, CardButton, CardButtonStyle, CardPhase, CardTerminal, ConfigFormField, ConvId,
     InboundControl, InboundMessage, JoinedChat, LocalSession, MediaRef, Mention, MsgReaction,

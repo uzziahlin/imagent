@@ -1602,20 +1602,74 @@ impl Store {
         .await
     }
 
-    /// 到期待重发行（每 tick 有界拉取，防单轮重发风暴）。
+    /// 到期待重发行（每 tick 有界拉取，防单轮重发风暴）。Wave C（出站可靠性
+    /// 收敛）：按 `kind` 过滤——每个 core `OutboxDriver` 只拉自己的 kind
+    ///（feishu_text / wecom_text），跨 kind 行不占本 driver 的 LIMIT 名额
+    ///（v14 P3o 的未知 kind 饿死问题在查询层结构性消除；无人认领的 kind 由
+    /// `due_outbox_unknown_kinds` + sweeper 兜底，见 core::outbox）。
     /// (code-review v14 P3-g)：排序加 `, id` 决胜——next_try 是秒粒度，同秒到期
     /// 的多条消息裸 `ORDER BY next_try` 顺序不定（SQLite 不保证），消费侧
-    ///（feishu outbox 泵）已按入队序发出，store 侧补上决胜列保证「同秒到期按
+    ///（core outbox driver）已按入队序发出，store 侧补上决胜列保证「同秒到期按
     /// 入队序发出」，避免乱序到达用户侧。
-    pub async fn due_outbox(&self, now: i64, limit: u32) -> Result<Vec<OutboxRow>> {
+    pub async fn due_outbox(&self, kind: &str, now: i64, limit: u32) -> Result<Vec<OutboxRow>> {
+        let kind = kind.to_string();
         let inner = self.inner.clone();
         blocking_with(inner, move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, conv, kind, payload, attempts FROM outbox \
-                 WHERE next_try <= ?1 ORDER BY next_try, id LIMIT ?2",
+                 WHERE kind = ?1 AND next_try <= ?2 ORDER BY next_try, id LIMIT ?3",
             )?;
             let rows = stmt
-                .query_map(rusqlite::params![now, limit], |r| {
+                .query_map(rusqlite::params![kind, now, limit], |r| {
+                    Ok(OutboxRow {
+                        id: r.get(0)?,
+                        conv: r.get(1)?,
+                        kind: r.get(2)?,
+                        payload: r.get(3)?,
+                        attempts: r.get(4)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// 到期且 **kind 不在 `known` 名单内** 的行（Wave C sweeper 数据面）。
+    /// `known` = 当前进程在跑的 driver kind 集合——不在此列的行没有任何
+    /// driver 会拉取（`due_outbox` 按 kind 过滤后对它们不可见），若放任不管
+    /// 会永久滞留撑表。sweeper 据此把它们推后 + 告警 + attempts 递增最终
+    /// 回收（v14 P3o 防御的泛化形态，见 core::outbox）。空名单 = 全部行视为
+    /// 未知（ilink-only 部署清剿历史 feishu/wecom 积压）。
+    pub async fn due_outbox_unknown_kinds(
+        &self,
+        known: &[String],
+        now: i64,
+        limit: u32,
+    ) -> Result<Vec<OutboxRow>> {
+        let known = known.to_vec();
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            // 占位符严格按参数顺序生成：?1 = now，?2..?n+1 = known 各 kind，
+            // 最后 ?n+2 = limit（params_from_iter 按位置绑定）。
+            let mut sql = "SELECT id, conv, kind, payload, attempts FROM outbox \
+                           WHERE next_try <= ?"
+                .to_string();
+            if !known.is_empty() {
+                let placeholders: Vec<&str> = known.iter().map(|_| "?").collect();
+                sql.push_str(&format!(" AND kind NOT IN ({})", placeholders.join(", ")));
+            }
+            sql.push_str(" ORDER BY next_try, id LIMIT ?");
+            // 参数序与 SQL 占位符序严格一致：now, known 各 kind…, limit。
+            let mut bound: Vec<rusqlite::types::Value> = Vec::with_capacity(known.len() + 2);
+            bound.push(now.into());
+            for k in &known {
+                bound.push(k.clone().into());
+            }
+            bound.push(limit.into());
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(bound), |r| {
                     Ok(OutboxRow {
                         id: r.get(0)?,
                         conv: r.get(1)?,
@@ -2121,9 +2175,24 @@ where
     F: Fn(&rusqlite::Connection) -> Result<T> + Send + 'static,
     T: Send + 'static,
 {
+    blocking_with_retry_backoff(inner, f, std::time::Duration::from_millis(50)).await
+}
+
+/// [`blocking_with_retry`] 的可参数化退避版——生产路径固定 50ms 起步；测试用
+/// 大退避（秒级）把「退避期间锁已释放」的顺序断言撑出远超插桩/调度抖动的
+/// 余量（10ms 级容差在 tarpaulin 下曾误红，见 busy_backoff_does_not_hold_lock）。
+async fn blocking_with_retry_backoff<F, T>(
+    inner: Arc<Inner>,
+    f: F,
+    first_backoff: std::time::Duration,
+) -> Result<T>
+where
+    F: Fn(&rusqlite::Connection) -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
     const MAX_ATTEMPTS: u32 = 5;
     let join = tokio::task::spawn_blocking(move || {
-        let mut delay = std::time::Duration::from_millis(50);
+        let mut delay = first_backoff;
         let mut attempt = 1u32;
         loop {
             // 锁作用域限于单次尝试：BUSY 退避 sleep 前必须 drop guard（见注释 2）。
@@ -3287,15 +3356,19 @@ mod tests {
 
         // next_try = 入队时刻 → 立即到期。
         let now = now_secs();
-        let due = store.due_outbox(now, 10).await.unwrap();
+        let due = store.due_outbox("feishu_text", now, 10).await.unwrap();
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].kind, "feishu_text");
         assert_eq!(due[0].attempts, 0);
 
         // 失败 → 退避到 now+60：窗口内不再到期。
         assert!(store.outbox_mark_failed(due[0].id, now + 60).await.unwrap());
-        assert!(store.due_outbox(now + 59, 10).await.unwrap().is_empty());
-        let due2 = store.due_outbox(now + 61, 10).await.unwrap();
+        assert!(store
+            .due_outbox("feishu_text", now + 59, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        let due2 = store.due_outbox("feishu_text", now + 61, 10).await.unwrap();
         assert_eq!(due2.len(), 1);
         assert_eq!(due2[0].attempts, 1);
 
@@ -3311,13 +3384,110 @@ mod tests {
             .await
             .unwrap();
         let now2 = now_secs();
-        let row = store.due_outbox(now2, 10).await.unwrap().remove(0);
+        let row = store
+            .due_outbox("feishu_text", now2, 10)
+            .await
+            .unwrap()
+            .remove(0);
         let mut kept = true;
         for i in 0..OUTBOX_MAX_ATTEMPTS {
             kept = store.outbox_mark_failed(row.id, now + i).await.unwrap();
         }
         assert!(!kept, "超上限应放弃");
         assert_eq!(store.outbox_depth().await.unwrap(), 0);
+    }
+
+    /// Wave C（出站可靠性收敛）：due_outbox 按 kind 过滤——一个 driver 的
+    /// 到期行不掺其它 kind（跨 kind 不占 LIMIT 名额，饿死问题结构性消除）。
+    #[tokio::test]
+    async fn outbox_due_filters_by_kind() {
+        let db = TempDb::new("outbox_kind").await;
+        let store = Store::open(&db.path).await.unwrap();
+        for (conv, kind) in [
+            ("feishu:a", "feishu_text"),
+            ("feishu:b", "feishu_text"),
+            ("wecom:A", "wecom_text"),
+        ] {
+            store
+                .enqueue_outbox(conv, kind, &format!(r#"{{"conv":"{conv}"}}"#))
+                .await
+                .unwrap();
+        }
+        let now = now_secs();
+        let feishu = store.due_outbox("feishu_text", now, 10).await.unwrap();
+        assert_eq!(
+            feishu.iter().map(|r| r.conv.as_str()).collect::<Vec<_>>(),
+            vec!["feishu:a", "feishu:b"],
+            "feishu driver 只见 feishu_text"
+        );
+        let wecom = store.due_outbox("wecom_text", now, 10).await.unwrap();
+        assert_eq!(
+            wecom.iter().map(|r| r.conv.as_str()).collect::<Vec<_>>(),
+            vec!["wecom:A"],
+            "wecom driver 只见 wecom_text"
+        );
+        // 不存在的 kind：空（driver 停机期间行只是不可见，由 sweeper 兜底）。
+        assert!(store
+            .due_outbox("nope_text", now, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        // 深度统计不分 kind（/health 的 outbox_pending 为全表口径）。
+        assert_eq!(store.outbox_depth().await.unwrap(), 3);
+    }
+
+    /// Wave C sweeper 数据面：due_outbox_unknown_kinds 只返回不在 known 名单
+    /// 的到期行；未到期行不可见；空名单 = 全部视为未知。
+    #[tokio::test]
+    async fn outbox_unknown_kinds_query() {
+        let db = TempDb::new("outbox_unknown").await;
+        let store = Store::open(&db.path).await.unwrap();
+        store
+            .enqueue_outbox("feishu:a", "feishu_text", "{}")
+            .await
+            .unwrap();
+        store
+            .enqueue_outbox("wecom:A", "wecom_text", "{}")
+            .await
+            .unwrap();
+        store
+            .enqueue_outbox("wecom:B", "wecom_text", "{}")
+            .await
+            .unwrap();
+        let now = now_secs();
+        // 两个 driver 都在跑：无未知行。
+        let known = vec!["feishu_text".to_string(), "wecom_text".to_string()];
+        assert!(store
+            .due_outbox_unknown_kinds(&known, now, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        // 只跑 wecom driver：feishu 行成为「未知」。
+        let wecom_only = vec!["wecom_text".to_string()];
+        let unknown = store
+            .due_outbox_unknown_kinds(&wecom_only, now, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            unknown.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>(),
+            vec!["feishu_text"]
+        );
+        // 退避后未到期 → 不可见（sweeper 推后 1h 期间不再重复告警）。
+        let id = unknown[0].id;
+        assert!(store.outbox_mark_failed(id, now + 3600).await.unwrap());
+        assert!(store
+            .due_outbox_unknown_kinds(&wecom_only, now, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        // 空名单（ilink-only 部署）：全部行都是未知——feishu 行在退避中
+        // （next_try=now+3600）未到期，本轮可见的只有两条 wecom 行。
+        let all = store.due_outbox_unknown_kinds(&[], now, 10).await.unwrap();
+        assert_eq!(
+            all.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>(),
+            vec!["wecom_text", "wecom_text"],
+            "空名单应视全部 kind 为未知"
+        );
     }
 
     /// (code-review v14 P3-g)：同秒（同 next_try）到期的多条按入队序（id 升序）
@@ -3344,7 +3514,7 @@ mod tests {
             .await
             .unwrap();
         }
-        let due = store.due_outbox(1000, 10).await.unwrap();
+        let due = store.due_outbox("feishu_text", 1000, 10).await.unwrap();
         let convs: Vec<String> = due.into_iter().map(|r| r.conv).collect();
         assert_eq!(
             convs,
@@ -3888,8 +4058,10 @@ mod tests {
 
     /// #3：退避 sleep 期间不持连接锁——用**顺序断言**而非绝对时长（CI runner
     /// 调度抖动会让时长断言误报）：闭包首次调用持锁 sleep 后返回 BUSY，退避
-    /// 50ms（锁外）后重试。插队写入若在重试开始前完成，即证明退避期间锁
-    /// 已释放（若持锁 sleep，插队必然排到重试之后）。10ms 为唤醒调度容差。
+    /// （测试注入 1.5s，锁外）后重试。插队写入若在重试开始前 ≥500ms 完成，
+    /// 即证明退避期间锁已释放（若持锁 sleep，插队必然排到重试之后、
+    /// done ≥ retry_at）。余量取秒级——10ms 级容差在 tarpaulin 插桩变慢下
+    /// 曾让唤醒调度滞后误红（v1.29.0 coverage 两次误红之一）。
     #[tokio::test]
     async fn busy_backoff_does_not_hold_lock() {
         let db = TempDb::new("busy_lock").await;
@@ -3900,14 +4072,18 @@ mod tests {
         let c = calls.clone();
         let r2 = retry2_start.clone();
         let slow = tokio::spawn(async move {
-            blocking_with_retry(inner, move |_conn| {
-                if c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 1 {
-                    std::thread::sleep(std::time::Duration::from_millis(300));
-                    return Err(busy_error());
-                }
-                *r2.lock().unwrap() = Some(std::time::Instant::now());
-                Ok(())
-            })
+            blocking_with_retry_backoff(
+                inner,
+                move |_conn| {
+                    if c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 1 {
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        return Err(busy_error());
+                    }
+                    *r2.lock().unwrap() = Some(std::time::Instant::now());
+                    Ok(())
+                },
+                std::time::Duration::from_millis(1500),
+            )
             .await
         });
         // 等闭包确认进入首次持锁执行段，再等到持锁中段（远离窗口边界）。
@@ -3921,8 +4097,8 @@ mod tests {
         let retry_at = *retry2_start.lock().unwrap();
         let retry_at = retry_at.expect("重试应已发生");
         assert!(
-            done_instant <= retry_at + std::time::Duration::from_millis(10),
-            "插队写入（完成于 {done_instant:?}）应先于退避重试（{retry_at:?}）——\
+            done_instant + std::time::Duration::from_millis(500) < retry_at,
+            "插队写入（完成于 {done_instant:?}）应显著先于退避重试（{retry_at:?}）——\
              退避期间锁应已释放"
         );
     }

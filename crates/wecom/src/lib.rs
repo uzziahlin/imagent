@@ -17,5 +17,5 @@ mod platform;
 pub mod proto;
 
 pub use client::probe_credentials;
-pub use platform::WeComPlatform;
+pub use platform::{WeComPlatform, OUTBOX_KIND};
 pub use proto::Credentials;

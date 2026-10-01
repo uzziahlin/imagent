@@ -53,9 +53,14 @@ fn cap_md_bytes(md: &str, head_b: usize, tail_b: usize) -> String {
 }
 
 /// 反引号包裹的行内片段安全化（tool_name 等）：去掉反引号（防破坏外层
-/// code span）+ `<at>` 注入收口（escape_lt_inline 已按 span 边界处理）。
+/// code span 配对）。
+/// A2 等价性修正（双转义伪影）：此处**不再预转义** `<`——外层 md_element 的
+/// escape_lt 会按行转义，预转义 + 再转义在多行 tool_name 上产出 `\\<at`
+/// （v14 P3j 同款双重转义伪影，被等价性不变量测试钉出）。剥反引号后内容
+/// 落在字面反引号对内（code span 保留区，标签惰性），越出 span 的部分由
+/// escape_lt 的行级 fail-safe（未配对反引号/未闭合围栏全量转义）兜住。
 fn sanitize_inline(text: &str) -> String {
-    escape_lt_inline(&text.replace('`', "'"))
+    text.replace('`', "'")
 }
 
 /// v1.26 构造收口：markdown 元素内容的主出口——转义（<at> 注入防线）与邮箱
@@ -3792,13 +3797,29 @@ mod tests {
 
         let p = render_permission_card_resolved("Bash` <at id=\"ou_victim\"></at>", true);
         let pc = md_content(&p);
+        // A2 等价性修正后的期望：剥反引号的工具名落在字面反引号对内（code
+        // span 保留区）——原始 <at> 以惰性代码文本呈现（span 内标签不解析），
+        // 反引号已剥、无法越出 span（越出即被 escape_lt 行级 fail-safe 转义，
+        // 见 invariant_no_bare_at_outside_code_all_entries）。
         assert!(
-            pc.contains("\\<at id=\"ou_victim\""),
-            "tool_name 须 sanitize: {pc}"
+            pc.contains("`Bash' <at id=\"ou_victim\"></at>`"),
+            "span 内惰性形态: {pc}"
         );
+        assert_eq!(
+            pc.matches('`').count(),
+            2,
+            "仅包裹用的反引号对（用户反引号已剥）: {pc}"
+        );
+        // 多行 tool_name：不再产生 \\< 双重转义伪影（A2 修正点）。
+        let multi = render_permission_card_resolved(
+            "```rust\nfn a() {}\n<at id=\"ou_v\"></at>\n尾 <",
+            false,
+        );
+        let mc = md_content(&multi);
+        assert!(!mc.contains("\\\\<at"), "多行 tool_name 不得双重转义: {mc}");
         assert!(
-            !pc.contains("<at id=\"ou_victim\"></at>"),
-            "不得有原始标签: {pc}"
+            hits_outside_code(&mc, "<at") == 0,
+            "多行 tool_name 的裸 <at 只能在 span/围栏保留区内: {mc}"
         );
     }
 
@@ -4057,5 +4078,527 @@ mod tests {
         // 无转义竖线的行为不变。
         let plain = table_rows("| a | b |\n|---|---|\n| 1 | 2 |").expect("应识别");
         assert_eq!(plain[1], vec!["1", "2"]);
+    }
+
+    // ------------------------------------------------------------------
+    // A2 渲染层等价性测试（历史债务批）：对抗样本 × 全部导出渲染入口的
+    // 跨入口不变量——转义 / 掩码 / 截断 / 双转义 / 面板预算。渲染层历史每个
+    // 注入洞都源于「同一不变量在多条路径上口径漂移」，这里把同一样本打进
+    // **所有**入口、断言不变量本身（属性测试的确定性形态：有限样本集 ×
+    // 入口矩阵 × 硬断言；无新依赖）。
+    // ------------------------------------------------------------------
+
+    /// 对抗性样本集（共享生成器）：每条瞄准一种历史上真实出现过的漂移形态
+    /// ——未配对反引号、未闭合围栏、`<at>` 标签、邮箱/SSH remote、多字节跨
+    /// 截断边界、管道符表格、超长行。
+    fn adversarial_samples() -> Vec<String> {
+        vec![
+            // 未配对反引号 + at 注入（v14 P1 第 5 洞）。
+            "x` <at id=\"ou_evil\"></at> 尾部".into(),
+            // 配对 code span 内的 at（合法保留区）+ span 外注入。
+            "`<at id=\"ou_span\"></at>` 外部 <at id=\"ou_evil2\"></at>".into(),
+            // 未闭合围栏 + 其后的 at 注入（v14 P1 第 2 洞）。
+            "```rust\nfn a() {}\n<at id=\"ou_evil3\"></at>\n未闭合尾部 <".into(),
+            // 配对围栏（~~~ 变体）内的 at（合法保留区）+ 围栏外注入。
+            "~~~\n<at id=\"ou_fence\"></at>\n~~~\n<at id=\"ou_evil4\"></at>".into(),
+            // 邮箱（掩码口径）+ SSH remote 形态。
+            "联系 someone@example.com 与 git@github.com:org/repo.git".into(),
+            // 管道符 + 表格样文本 + 转义竖线（P3l 的切列漂移面）。
+            "| # | 来源 | 内容 |\n|---|---|---|\n| 1 | 💻 | 查 `a \\| b` 的输出 |\n裸 | 管道"
+                .into(),
+            // 多字节字符跨 4096 字节头窗边界（"很" 3 字节，4096 % 3 == 1）。
+            "很".repeat(2_800),
+            // 超长单行（无换行的截断面）。
+            "长".repeat(9_000),
+            // 组合形态：围栏 + 反引号 + at + 邮箱同场。
+            "```bash\necho a@b.com\n```\n`x` y` <at id=\"ou_evil5\"></at> z@c.io".into(),
+        ]
+    }
+
+    /// sender_anchor_line 的合法 `<at>` 精确形态（唯一豁免构造点）。
+    const LEGAL_ANCHOR_TAG: &str = r#"<at id="ou_owner"></at>"#;
+
+    /// 收集 JSON 树的全部字符串叶子，并标注其是否承载 **markdown 语义**
+    /// （`tag:"markdown"` 组件的 content/title）。`<at>` 注入面只在 markdown
+    /// 字段——plain_text（按钮 label、选项 text、header title 等）对 at 标签
+    /// 惰性，生产侧刻意只做邮箱掩码不做转义（P3i 口径）；掩码不变量则对
+    /// **全部**叶子生效（租户审计拦截面与字段语义无关）。
+    fn collect_leaves(v: &serde_json::Value, markdown: bool, out: &mut Vec<(String, bool)>) {
+        match v {
+            serde_json::Value::String(s) => out.push((s.clone(), markdown)),
+            serde_json::Value::Array(a) => {
+                for x in a {
+                    collect_leaves(x, markdown, out);
+                }
+            }
+            serde_json::Value::Object(o) => {
+                let is_md = o.get("tag").and_then(|t| t.as_str()) == Some("markdown");
+                for (k, x) in o {
+                    let child_md = markdown || (is_md && (k == "content" || k == "title"));
+                    collect_leaves(x, child_md, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 入口矩阵：同一样本打进所有导出渲染入口，返回 (入口名, 叶子集)。
+    /// JSON 出口解析回树再收集（断言在**解码后**文本上做，避开 JSON 转义层）；
+    /// 纯 md 出口（stream_body 系）以单叶子（markdown=true）携带。
+    fn render_all_entries(sample: &str) -> Vec<(&'static str, Vec<(String, bool)>)> {
+        let parse = |name: &'static str, json: String| -> Vec<(String, bool)> {
+            let v: serde_json::Value = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("入口 {name} 应产出合法 JSON: {e}"));
+            let mut leaves = Vec::new();
+            collect_leaves(&v, false, &mut leaves);
+            leaves
+        };
+        let running = body_card_of(sample, &[], &[]);
+        let mut done = body_card_of(sample, &[], &[]);
+        done.terminal = CardTerminal::Done;
+        let mut errored = body_card_of(sample, &[], &[]);
+        errored.terminal = CardTerminal::Error("boom".into());
+
+        let mut out: Vec<(&'static str, Vec<(String, bool)>)> = vec![
+            (
+                "render_card:running",
+                parse(
+                    "render_card:running",
+                    render_card(&running, "feishu:ou_t", None),
+                ),
+            ),
+            (
+                "render_card:done",
+                parse("render_card:done", render_card(&done, "feishu:ou_t", None)),
+            ),
+            (
+                "render_card:error",
+                parse(
+                    "render_card:error",
+                    render_card(&errored, "feishu:ou_t", None),
+                ),
+            ),
+            // 群 + 发起者在场：sender_anchor_line（唯一合法 <at> 构造点）对照。
+            (
+                "render_card:running+anchor",
+                parse(
+                    "render_card:running+anchor",
+                    render_card(&running, "feishu:oc_g", Some("ou_owner")),
+                ),
+            ),
+            (
+                "render_stream_init_card",
+                parse(
+                    "render_stream_init_card",
+                    render_stream_init_card("feishu:ou_t", None, Some(sample)),
+                ),
+            ),
+            (
+                "render_stream_init_card+anchor",
+                parse(
+                    "render_stream_init_card+anchor",
+                    render_stream_init_card("feishu:oc_g", Some("ou_owner"), Some(sample)),
+                ),
+            ),
+            (
+                "render_stream_init_card:private_sender",
+                parse(
+                    "render_stream_init_card:private_sender",
+                    render_stream_init_card("feishu:ou_t", Some("ou_t"), Some(sample)),
+                ),
+            ),
+            ("stream_body_md", vec![(stream_body_md(&running), true)]),
+            (
+                "stream_body_final",
+                vec![(stream_body_final(&done, None), true)],
+            ),
+            (
+                "stream_body_final:err",
+                vec![(stream_body_final(&errored, Some("boom")), true)],
+            ),
+        ];
+        // 面板（v14 P2-2/P3j 的双重转义与字节预算面）。
+        let tools = vec![tool("Bash", sample, true)];
+        let mut panel_leaves = Vec::new();
+        collect_leaves(&render_tool_panel(&tools, "grey"), false, &mut panel_leaves);
+        out.push(("render_tool_panel", panel_leaves));
+        let thoughts = vec![sample.to_string()];
+        let mut thought_leaves = Vec::new();
+        collect_leaves(
+            &render_thought_panel(&thoughts, "grey"),
+            false,
+            &mut thought_leaves,
+        );
+        out.push(("render_thought_panel", thought_leaves));
+        // 审批/问题卡族（pending / resolved 全形态）。
+        out.push((
+            "render_permission_card",
+            parse(
+                "render_permission_card",
+                render_permission_card("Bash", sample, "feishu:ou_t", "req_a2", None, 300),
+            ),
+        ));
+        let q_input = serde_json::json!({
+            "questions": [{
+                "question": sample,
+                "options": [{"label": sample}, {"label": "对照"}]
+            }]
+        })
+        .to_string();
+        out.push((
+            "render_question_card",
+            parse(
+                "render_question_card",
+                render_question_card(&q_input, "feishu:ou_t", "req_a2", None, 300)
+                    .expect("问题卡应渲染"),
+            ),
+        ));
+        let multi_q = serde_json::json!({
+            "questions": [
+                {"question": sample, "header": "问一", "options": [{"label": sample}]},
+                {"question": "二问？", "options": [{"label": "B"}]}
+            ]
+        })
+        .to_string();
+        out.push((
+            "render_question_card:multi",
+            parse(
+                "render_question_card:multi",
+                render_question_card(&multi_q, "feishu:ou_t", "req_a2", None, 300)
+                    .expect("多题卡应渲染"),
+            ),
+        ));
+        out.push((
+            "render_question_card_resolved",
+            parse(
+                "render_question_card_resolved",
+                render_question_card_resolved(sample),
+            ),
+        ));
+        out.push((
+            "render_permission_card_resolved:allow",
+            parse(
+                "render_permission_card_resolved:allow",
+                render_permission_card_resolved(sample, true),
+            ),
+        ));
+        out.push((
+            "render_permission_card_resolved:deny",
+            parse(
+                "render_permission_card_resolved:deny",
+                render_permission_card_resolved(sample, false),
+            ),
+        ));
+        out.push((
+            "render_permission_card_cancelled",
+            parse(
+                "render_permission_card_cancelled",
+                render_permission_card_cancelled(sample),
+            ),
+        ));
+        out.push((
+            "render_permission_card_superseded",
+            parse(
+                "render_permission_card_superseded",
+                render_permission_card_superseded(sample),
+            ),
+        ));
+        // 标题旁路（v14 P1 第 5 洞点名的 md_element* 收口外出口）。
+        let mut header_leaves = Vec::new();
+        collect_leaves(&panel_header(sample), false, &mut header_leaves);
+        out.push(("panel_header", header_leaves));
+        // 命令卡（body_block_elements / try_paired_rows / :::collapse 围栏）。
+        out.push((
+            "render_command_card",
+            parse(
+                "render_command_card",
+                render_command_card("t", sample, &[], "feishu:oc_g"),
+            ),
+        ));
+        out.push((
+            "render_command_card:collapse",
+            parse(
+                "render_command_card:collapse",
+                render_command_card(
+                    "t",
+                    &format!(":::collapse {sample}\n{sample}\n:::"),
+                    &[],
+                    "feishu:oc_g",
+                ),
+            ),
+        ));
+        // config 表单卡（label 经 md_element）。
+        let cfg_entries = vec![ConfigFormField {
+            key: "k".into(),
+            label: format!("设置 {sample}"),
+            current: "a".into(),
+            options: vec![("a".into(), "甲".into()), ("b".into(), "乙".into())],
+        }];
+        out.push((
+            "render_config_form_card",
+            parse(
+                "render_config_form_card",
+                render_config_form_card(&cfg_entries, "feishu:ou_t"),
+            ),
+        ));
+        // stub / overflow 终态（正文与样本无关——「不可见」也须满足掩码不变量）。
+        out.push((
+            "render_stub_card",
+            parse("render_stub_card", render_stub_card(&done)),
+        ));
+        out.push((
+            "render_overflow_terminal_card",
+            parse(
+                "render_overflow_terminal_card",
+                render_overflow_terminal_card(true),
+            ),
+        ));
+        out
+    }
+
+    /// 普通文本段内找 pattern 命中；`<at` 形态豁免「反斜杠紧前缀」（已转义
+    /// 的 `\<at` 不算裸）。
+    fn pattern_hits(seg: &str, pat: &str) -> usize {
+        let bytes = seg.as_bytes();
+        let pat_bytes = pat.as_bytes();
+        let mut hits = 0;
+        let mut i = 0;
+        while i + pat_bytes.len() <= bytes.len() {
+            if &bytes[i..i + pat_bytes.len()] == pat_bytes {
+                let escaped = i > 0 && bytes[i - 1] == b'\\';
+                if !escaped {
+                    hits += 1;
+                }
+                i += pat_bytes.len();
+            } else {
+                i += 1;
+            }
+        }
+        hits
+    }
+
+    /// 不变量扫描器：统计落在「配对 code span / 配对围栏」**之外**的 pattern
+    /// 命中数。豁免规则与生产 escape_lt / escape_lt_inline 的保留区逐条对齐
+    ///（围栏行切换状态、围栏内整行保留、未配对反引号整行按普通文本）。
+    fn hits_outside_code(text: &str, pat: &str) -> usize {
+        let is_fence = |line: &str| {
+            let t = line.trim_start();
+            t.starts_with("```") || t.starts_with("~~~")
+        };
+        let mut in_fence = false;
+        let mut hits = 0;
+        for line in text.split('\n') {
+            if is_fence(line) {
+                in_fence = !in_fence;
+                continue;
+            }
+            if in_fence {
+                continue;
+            }
+            let segs: Vec<&str> = line.split('`').collect();
+            if segs.len() % 2 == 0 {
+                hits += pattern_hits(line, pat);
+            } else {
+                for (i, seg) in segs.iter().enumerate() {
+                    if i % 2 == 0 {
+                        hits += pattern_hits(seg, pat);
+                    }
+                }
+            }
+        }
+        hits
+    }
+
+    /// 不变量 1（转义）：markdown 语义叶子中，除 sender_anchor_line 的合法
+    /// `<at>` 与配对 code span / 围栏保留区外，不存在裸 `<at` / `</at`。
+    #[test]
+    fn invariant_no_bare_at_outside_code_all_entries() {
+        for sample in adversarial_samples() {
+            for (entry, leaves) in render_all_entries(&sample) {
+                for (t, markdown) in &leaves {
+                    if !markdown {
+                        continue;
+                    }
+                    let cleaned = t.replace(LEGAL_ANCHOR_TAG, "");
+                    for pat in ["<at", "</at"] {
+                        let hits = hits_outside_code(&cleaned, pat);
+                        assert_eq!(
+                            hits, 0,
+                            "入口 {entry} 在 code span/围栏外漏出裸 {pat}（{hits} 处）\n样本: {sample:?}\n文本: {cleaned:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// 不变量 4（双转义）：markdown 语义叶子中不存在 `\\<at`（双重转义特征
+    /// ——`\<` 再被转义一次的伪影），code span / 围栏内除外。
+    #[test]
+    fn invariant_no_double_escape_all_entries() {
+        for sample in adversarial_samples() {
+            for (entry, leaves) in render_all_entries(&sample) {
+                for (t, markdown) in &leaves {
+                    if !markdown {
+                        continue;
+                    }
+                    let hits = hits_outside_code(t, "\\\\<at");
+                    assert_eq!(
+                        hits, 0,
+                        "入口 {entry} 出现双重转义伪影 \\\\<at（{hits} 处）\n样本: {sample:?}\n文本: {t:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 不变量 2（掩码一致性）：同一段含邮箱输入打进所有入口，输出里邮箱
+    /// **要么被掩码、要么不可见**——任何叶子都不含裸邮箱/裸 SSH remote；
+    /// 承载正文的入口必须真的以掩码形态呈现（掩码不是「静默丢正文」）。
+    #[test]
+    fn invariant_email_masking_consistent_all_entries() {
+        let samples = adversarial_samples();
+        let sample = &samples[4]; // 邮箱 + SSH remote 样本
+        for (entry, leaves) in render_all_entries(sample) {
+            for (t, _markdown) in &leaves {
+                assert!(
+                    !t.contains("someone@example.com"),
+                    "入口 {entry} 漏出裸邮箱: {t:?}"
+                );
+                assert!(
+                    !t.contains("git@github.com"),
+                    "入口 {entry} 漏出裸 SSH remote: {t:?}"
+                );
+            }
+        }
+        let body_carrying = [
+            "render_card:running",
+            "render_card:done",
+            "render_card:error",
+            "render_stream_init_card",
+            "stream_body_md",
+            "stream_body_final",
+            "stream_body_final:err",
+            "render_permission_card",
+            "render_question_card",
+            "render_question_card:multi",
+            "render_tool_panel",
+            "render_thought_panel",
+            "panel_header",
+            "render_command_card",
+            "render_command_card:collapse",
+        ];
+        let rendered = render_all_entries(sample);
+        for entry in body_carrying {
+            let (_, leaves) = rendered
+                .iter()
+                .find(|(name, _)| *name == entry)
+                .unwrap_or_else(|| panic!("入口 {entry} 应在矩阵中"));
+            let joined: String = leaves.iter().map(|(t, _)| t.as_str()).collect();
+            assert!(
+                joined.contains("someone[at]example.com"),
+                "承载正文的入口 {entry} 必须呈现掩码形态"
+            );
+        }
+    }
+
+    /// 不变量 3（截断一致性）：cap 后截断标记恰好出现一次；无替换字符；头段
+    /// 是原文的**字符级前缀**（多字节跨边界被安全处理——残缺字节会破坏前缀
+    /// 性或产生 U+FFFD）。覆盖 render_card 三终态与 stream 双出口；审批详情
+    /// 的字符截断提示同样恰好一次（P3k 的入口矩阵口径重申）。
+    #[test]
+    fn invariant_truncation_marker_once_and_char_boundary_safe() {
+        let samples = adversarial_samples();
+        // 多字节跨边界（"很"×2800，头窗 4096 劈在字符中间）与超长单行。
+        for sample in [&samples[6], &samples[7]] {
+            let running = body_card_of(sample, &[], &[]);
+            let mut done = body_card_of(sample, &[], &[]);
+            done.terminal = CardTerminal::Done;
+            let mut errored = body_card_of(sample, &[], &[]);
+            errored.terminal = CardTerminal::Error("boom".into());
+            for (name, json) in [
+                (
+                    "render_card:running",
+                    render_card(&running, "feishu:ou_t", None),
+                ),
+                ("render_card:done", render_card(&done, "feishu:ou_t", None)),
+                (
+                    "render_card:error",
+                    render_card(&errored, "feishu:ou_t", None),
+                ),
+            ] {
+                assert_eq!(
+                    json.matches("行已省略").count(),
+                    1,
+                    "入口 {name} 截断标记恰好一次"
+                );
+                assert!(!json.contains('\u{FFFD}'), "入口 {name} 无残缺多字节");
+            }
+            for (name, md) in [
+                ("stream_body_md", stream_body_md(&running)),
+                ("stream_body_final", stream_body_final(&done, None)),
+            ] {
+                assert_eq!(
+                    md.matches("行已省略").count(),
+                    1,
+                    "入口 {name} 截断标记恰好一次"
+                );
+                assert!(!md.contains('\u{FFFD}'), "入口 {name} 无残缺多字节");
+                // 头段前缀性：截断点在字符边界上（多字节跨边界的安全等价断言）。
+                let head_end = md
+                    .find("\n\n…（中间约")
+                    .unwrap_or_else(|| panic!("入口 {name} 应含截断标注: {md:?}"));
+                assert!(
+                    sample.starts_with(&md[..head_end]),
+                    "入口 {name} 头段应是原文的字符级前缀"
+                );
+            }
+        }
+        // 审批详情截断：提示恰好一次。
+        let long_input = format!(r#"{{"command":"echo {}"}}"#, "x".repeat(1_500));
+        let perm = render_permission_card("Bash", &long_input, "feishu:ou_t", "r", None, 300);
+        assert_eq!(perm.matches("已截断，仅显示前 1000 字符").count(), 1);
+    }
+
+    /// 不变量 5（面板预算）：N 个超长工具行 + 超长思考行时 render_card 总长
+    /// 有界（P2-2 既有单测并入入口矩阵口径：工具面板超预算折叠恰好一次、最新
+    /// 行保留；思考面板先按条数截到最近 5 条 × 单条 400 字符，字节预算天然
+    /// 够用——两条上限路径各有归属）。
+    #[test]
+    fn invariant_panel_budget_bounds_total_card_size() {
+        let long_summary = "查".repeat(300);
+        let tools: Vec<ToolCall> = (0..300)
+            .map(|i| ToolCall {
+                name: "Bash".into(),
+                summary: format!("{long_summary}#{i}"),
+                done: true,
+                id: None,
+            })
+            .collect();
+        let thoughts: Vec<String> = (0..300)
+            .map(|i| format!("想{i}!{}", "考".repeat(300)))
+            .collect();
+        let mut card = body_card_of("结论", &tools, &[]);
+        card.thoughts = thoughts;
+        card.terminal = CardTerminal::Done;
+        let json = render_card(&card, "feishu:ou_t", None);
+        assert!(
+            json.len() < 45_000,
+            "整卡 JSON 总长有界（修前同规模 ~130KB 顶穿 30KB 卡上限）: {}",
+            json.len()
+        );
+        assert_eq!(
+            json.matches("已折叠").count(),
+            1,
+            "工具面板超预算折叠恰好一次: {}",
+            json.len()
+        );
+        assert_eq!(json.matches("⏫ 前面还有").count(), 1, "折叠提示恰好一次");
+        assert!(json.contains("#299"), "最新工具行保留");
+        assert!(json.contains("想299!"), "最新思考行保留（最近 5 条窗口）");
+        assert!(
+            !json.contains("想5!"),
+            "更早的思考不在（THOUGHT_PANEL_LINES 条数截断先行）"
+        );
     }
 }

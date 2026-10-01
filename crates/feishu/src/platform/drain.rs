@@ -1680,7 +1680,9 @@ fn spawn_welcome_card(
                 if let Some(store) = outbox {
                     // P2-5（code-review v14）：落盘 payload 带幂等 uuid（泵重发透传）。
                     let payload = super::outbox::outbox_payload(&conv.0, &text);
-                    let _ = store.enqueue_outbox(&conv.0, "feishu_text", &payload).await;
+                    let _ = store
+                        .enqueue_outbox(&conv.0, super::outbox::OUTBOX_KIND, &payload)
+                        .await;
                 }
             }
         }
@@ -1718,7 +1720,10 @@ fn spawn_drain_text(
             if let Some(store) = outbox {
                 // P2-5（code-review v14）：落盘 payload 带幂等 uuid（泵重发透传）。
                 let payload = super::outbox::outbox_payload(&conv.0, &text);
-                if let Err(e2) = store.enqueue_outbox(&conv.0, "feishu_text", &payload).await {
+                if let Err(e2) = store
+                    .enqueue_outbox(&conv.0, super::outbox::OUTBOX_KIND, &payload)
+                    .await
+                {
                     warn!(target: "feishu", error = %e2, "outbox 落盘失败（提示丢失）");
                 }
             }
