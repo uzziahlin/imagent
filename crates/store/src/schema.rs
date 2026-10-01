@@ -3,7 +3,7 @@
 //! 用 `PRAGMA user_version` 做简单线性迁移：v1 = 建 5 张基础表，v2 = 动态白名单 + 审计日志。
 
 /// 当前代码支持的最新 schema 版本（migrate 上限 + user_version 过新拒绝阈值，P2-O）。
-pub const SCHEMA_VERSION: i64 = 15;
+pub const SCHEMA_VERSION: i64 = 16;
 
 /// v1 全部建表语句（`CREATE TABLE IF NOT EXISTS`，可重复执行）。
 pub const SCHEMA_V1: &str = r#"
@@ -202,9 +202,30 @@ CREATE INDEX IF NOT EXISTS idx_outbox_next_try ON outbox(next_try);";
 /// 摘要（≤80 字符），COALESCE 语义：已有值不覆盖、NULL 回填。
 pub const SCHEMA_V15: &str = "ALTER TABLE session_history ADD COLUMN first_prompt TEXT;";
 
+/// v16：webhook 防重放签名去重持久层（code-review v14 P3-b）——v1.24 的第 1 层
+/// 去重（验签通过后按 (token, 签名) 拦同字节重放）此前只在内存（LRU 1024 条），
+/// 进程重启即失忆：重启窗口内的重放（攻击者掐点重启/发布）可再次通过。本表把
+/// 已验证签名落库，`replay_window_secs > 0` 的路由启用（窗口即保留期，insert 时
+/// 顺手 prune）。sig = `"{token}\u{0}{规范化签名hex}"`（与内存层同键，含 token
+/// 防跨路由串）。
+pub const SCHEMA_V16: &str = "CREATE TABLE IF NOT EXISTS webhook_seen (
+  sig TEXT PRIMARY KEY,
+  ts  INTEGER NOT NULL
+);";
+
 /// 在已打开的连接上跑线性迁移。幂等：逐版本推进（v1→v2→…），已到目标版本则跳过。
-pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
-    let current: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+///
+/// 迁移竞态（code-review v14 P3-c）：`user_version` 的读取必须在事务**内**——
+/// 两个进程并发首开同一库时，旧实现「先裸读 user_version 再 BEGIN（DEFERRED）」，
+/// 后者可能在前者提交前读到旧版本、随后重复跑迁移（CREATE IF NOT EXISTS 撞
+/// AUTOINCREMENT/ALTER 已存在列时报错）。改用 `BEGIN IMMEDIATE`：取写锁成功后
+/// 再读 `user_version`，后者必然看到前者已提交的版本并提前返回（等待期间
+/// busy_timeout 5s 生效，见 open_and_setup）。
+pub fn migrate(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+    // P2-N：整体迁移包在事务内，失败回滚（避免半迁移状态不一致）；
+    // IMMEDIATE 见函数注释（P3-c）——写锁先于 user_version 读取。
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let current: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
     // P2-O：拒绝比代码更新的 user_version（旧代码跑新 DB 可能丢迁移 / 数据不一致）。
     if current > SCHEMA_VERSION {
         return Err(rusqlite::Error::ToSqlConversionFailure(
@@ -218,9 +239,7 @@ pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
         tracing::debug!(current, "store schema already at latest version");
         return Ok(());
     }
-    // P2-N：整体迁移包在事务内，失败回滚（避免半迁移状态不一致）。
     tracing::info!(target: "store", current, goal = SCHEMA_VERSION, "running store schema migration");
-    let tx = conn.unchecked_transaction()?;
     if current < 1 {
         tx.execute_batch(SCHEMA_V1)?;
         tx.pragma_update(None, "user_version", 1_i64)?;
@@ -280,6 +299,10 @@ pub fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     if current < 15 {
         tx.execute_batch(SCHEMA_V15)?;
         tx.pragma_update(None, "user_version", 15_i64)?;
+    }
+    if current < 16 {
+        tx.execute_batch(SCHEMA_V16)?;
+        tx.pragma_update(None, "user_version", 16_i64)?;
     }
     tx.commit()?;
     Ok(())
