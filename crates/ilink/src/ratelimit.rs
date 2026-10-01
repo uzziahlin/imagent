@@ -199,8 +199,19 @@ mod tests {
         b.record_event().await;
         let r1 = b.cooldown_remaining().await;
         // cooldown 中再记录一次，candidate > open_until → 推后。
+        // 剩余量以「各自读数时刻的 now」为基准，两次读数间的真实耗时会让
+        // r2 天然小于 r1（tarpaulin 插桩下可达数十 ms，曾致 coverage 误红）——
+        // 用读数区间外的时钟边界补偿后再比较，等价于直接断言
+        // open_until 未被缩短（U2 ≥ U1 ⇔ r2 + (t2-t1) ≥ r1，而
+        // after-before ≥ t2-t1，故该式是必要条件的稳健近似）。
+        let before = std::time::Instant::now();
         b.record_event().await;
         let r2 = b.cooldown_remaining().await;
-        assert!(r2 >= r1, "new event should not shorten existing cooldown");
+        let after = std::time::Instant::now();
+        assert!(
+            r2 + after.duration_since(before) >= r1,
+            "new event should not shorten existing cooldown: r1={r1:?} r2={r2:?} elapsed={:?}",
+            after.duration_since(before)
+        );
     }
 }
