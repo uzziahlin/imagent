@@ -69,7 +69,7 @@ prometheus = { version = "0.13", default-features = false }
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
 axum = "0.7"
 # ACP（Agent Client Protocol）：claude-agent-acp 长驻子进程模式（agent-client-protocol SDK）
-agent-client-protocol = "1"
+agent-client-protocol = "2"
 # 飞书 open-lark SDK（package name=openlark，lib name=open_lark，二者不同名是 SDK 设计）
 openlark = { version = "0.20", default-features = false, features = ["auth", "communication", "websocket"] }
 
