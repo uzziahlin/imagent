@@ -100,8 +100,18 @@ impl ILinkClient {
 
         let status = resp.status();
         if status.is_server_error() || status.is_client_error() {
-            // session 失效等多以 401/403 体现：在错误信息里保留状态码，
-            // 便于 platform 层做 SESSION_EXPIRED 判定。
+            // P3-a（code-review v14）：401/403 = 鉴权失效（bot_token 过期/吊销），
+            // 直接返回 typed `CoreError::SessionExpired`——调用方用 `matches!`
+            // 判定，不再靠 Display 字符串「HTTP 401/403」匹配（文案一改即静默
+            // 失配）。其余 4xx/5xx（404 端点漂移、500 抖动重试等）仍为 Platform
+            // 错误。
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN
+            {
+                return Err(CoreError::SessionExpired(format!(
+                    "POST {endpoint}: HTTP {status}"
+                )));
+            }
             return Err(CoreError::Platform(
                 "ilink",
                 format!("POST {endpoint}: HTTP {status}"),
@@ -156,5 +166,57 @@ mod tests {
     fn client_builds_with_default_base() {
         let c = ILinkClient::new(None, "tok".into(), "bot".into(), "user".into()).unwrap();
         assert_eq!(c.base_url(), DEFAULT_BASE_URL);
+    }
+
+    /// P3-a（code-review v14）：HTTP 401/403 必须映射为 typed `SessionExpired`、
+    /// 其余 4xx/5xx 保持 `Platform`——platform 层已改为 `matches!` 判定，若此处
+    /// 退回字符串形态，session 失效将漏判（表现为无限退避重试而非提示重登录）。
+    /// 用一次性 TCP listener 回原始 HTTP 响应，不依赖外部 mock server crate。
+    #[tokio::test]
+    async fn post_json_maps_401_403_to_typed_session_expired() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 开发机常配置 http_proxy/all_proxy 等代理环境变量——reqwest 默认遵循，
+        // 会把发往 127.0.0.1 的请求交给代理（表现为 502），故显式豁免 loopback。
+        // 本测试是 ilink 测试二进制中唯一读代理环境的用例，进程内无并发竞争。
+        std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
+
+        async fn serve_once(listener: tokio::net::TcpListener, status_line: &'static str) {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            // 读完请求头（丢弃 body）即回响应。
+            let _ = sock.read(&mut buf).await;
+            let resp =
+                format!("HTTP/1.1 {status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        }
+
+        for (status_line, expect_expired) in [
+            ("401 Unauthorized", true),
+            ("403 Forbidden", true),
+            ("500 Internal Server Error", false),
+            ("404 Not Found", false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(serve_once(listener, status_line));
+            let client = ILinkClient::new(
+                Some(format!("http://{addr}")),
+                "tok".into(),
+                "b".into(),
+                "u".into(),
+            )
+            .unwrap();
+            let err = client
+                .post_json::<serde_json::Value>("/x", &serde_json::json!({}))
+                .await
+                .unwrap_err();
+            let is_expired = matches!(err, CoreError::SessionExpired(_));
+            assert_eq!(
+                is_expired, expect_expired,
+                "{status_line} 判定错误：{err:?}"
+            );
+            server.await.unwrap();
+        }
     }
 }

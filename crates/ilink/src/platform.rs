@@ -13,8 +13,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures::future::join_all;
+use futures::stream::{FuturesUnordered, StreamExt};
 use serde_json::json;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, error, warn};
 
 use imagent_core::{ConvId, CoreError, InboundMessage, MediaRef, Platform, ReplyHint, Result};
@@ -24,7 +26,7 @@ use crate::client::ILinkClient;
 use crate::dedup::Dedup;
 use crate::proto::{
     classify_send, extract_media_refs, extract_text, msg_to_inbound, GetConfigResp, Msg,
-    SendMsgResp, SendOutcome, UpdatesResp,
+    RawMediaRef, SendMsgResp, SendOutcome, UpdatesResp,
 };
 
 const PLATFORM: &str = "ilink";
@@ -33,6 +35,15 @@ const ILINK_PREFIX: &str = "ilink:";
 const BACKOFF_CAP: Duration = Duration::from_secs(30);
 /// typing_ticket 缓存 TTL（协议侧 600s，留 100s 余量提前刷新）。
 const TYPING_TICKET_TTL: Duration = Duration::from_secs(500);
+/// P2-2（code-review v14）：批内媒体下载并发上限（信号量）。此前逐条消息、
+/// 逐个媒体顺序 await，单文件最长 45s（HTTP 超时）× 批内媒体数串行累加，阻塞
+/// **所有**会话的入站投递。4 并发对 CDN 是礼貌值（再高易触发风控/带宽挤占）。
+const MEDIA_DOWNLOAD_CONCURRENCY: usize = 4;
+/// P2-2（code-review v14）：单条消息媒体处理总预算（含信号量排队与下载）。
+/// 超预算即放弃该消息剩余未完成媒体项（warn 标记失败），文本照常投递——
+/// 媒体是增强信息，不能让它无限期拖住整批入站。60s ≈ 允许一轮完整重试
+/// （单下载上限 45s）但为批内其他消息留出余量。
+const MEDIA_TOTAL_BUDGET: Duration = Duration::from_secs(60);
 
 pub struct ILinkPlatform {
     client: Arc<ILinkClient>,
@@ -42,6 +53,9 @@ pub struct ILinkPlatform {
     /// 上次长轮询批量取到的消息，`recv` 逐条弹出。
     pending: Mutex<Vec<InboundMessage>>,
     /// 出站串行：同一 bot 同一时刻只有一条 sendmessage 在飞。
+    /// P3-c（code-review v14）：锁只覆盖「读熔断状态 + 发包 + 即时分类」的
+    /// 临界区；重试的冷却/退避 sleep 在锁外（见 [`ILinkPlatform::send_with_retry`]），
+    /// peer A 重试等待（最坏 ~1min）不再卡死 peer B 的发送。
     send_lock: Mutex<()>,
     /// 被动限流熔断器。
     breaker: crate::ratelimit::RateBreaker,
@@ -111,10 +125,33 @@ impl ILinkPlatform {
 
         // 先处理所有消息（含媒体下载），再前进游标：crash 在处理中 → 游标未动 →
         // 下次重拉同批，重复消息由 dedup 吸收（at-least-once，优于丢消息）。
-        let mut out = Vec::with_capacity(resp.msgs.len());
+        //
+        // P2-2（code-review v14）：媒体下载从「逐条消息逐个媒体顺序 await」改为
+        // ①各消息廉价阶段（去重/token/构造 inbound）保持顺序串行；②媒体阶段批内
+        // 并发（futures + 批级 Semaphore(4) 限流）且单条消息有 60s 总预算上限。
+        // 此前单文件最长 45s × 批内媒体数串行累加，阻塞**所有**会话的入站。
+        // 注：「文本先投递、媒体后补」的完全解耦是结构性改动（需把媒体阶段挪出
+        // recv 关键路径并定义媒体后到时的消费端语义），本轮不做——本批消息仍
+        // 在批处理完成后一并投递，只是总时长被并发与预算限界。
+        let mut prepared: Vec<(InboundMessage, Vec<RawMediaRef>)> =
+            Vec::with_capacity(resp.msgs.len());
         for msg in &resp.msgs {
-            self.process_msg(msg, &mut out).await;
+            if let Some(p) = self.prepare_msg(msg).await {
+                prepared.push(p);
+            }
         }
+
+        // 媒体阶段：批级信号量限流下的并发下载（每条消息独立预算兜底）。
+        let semaphore = Arc::new(Semaphore::new(MEDIA_DOWNLOAD_CONCURRENCY));
+        join_all(
+            prepared
+                .iter_mut()
+                .map(|(ib, refs)| self.process_media_phase(ib, std::mem::take(refs), &semaphore)),
+        )
+        .await;
+
+        // 投递顺序与批次内消息顺序一致（媒体阶段不改变排列）。
+        let out: Vec<InboundMessage> = prepared.into_iter().map(|(ib, _)| ib).collect();
 
         if let Some(new_buf) = resp.get_updates_buf.as_deref() {
             if !new_buf.is_empty() {
@@ -157,10 +194,13 @@ impl ILinkPlatform {
         Ok(out)
     }
 
-    async fn process_msg(&self, msg: &Msg, out: &mut Vec<InboundMessage>) {
+    /// P2-2（code-review v14）：`process_msg` 拆分的廉价阶段——去重 + 更新该
+    /// peer 最新 context_token + 构造 InboundMessage（媒体引用做 owned 快照，
+    /// 并发阶段不再借用原始 Msg）。返回 `None` = 去重丢弃。
+    async fn prepare_msg(&self, msg: &Msg) -> Option<(InboundMessage, Vec<RawMediaRef>)> {
         let key = dedup_key(msg);
         if !self.dedup.check(&key) {
-            return;
+            return None;
         }
         // 更新该 peer 最新 context_token（发消息回传）。
         if let Some(token) = msg.context_token.as_deref() {
@@ -180,33 +220,56 @@ impl ILinkPlatform {
             }
         }
 
-        let mut ib = msg_to_inbound(msg);
-        // 阶段 A：下载入站媒体（图片/文件/视频），存 ~/.imagent/media/。
-        // 逐个尽力而为：单个失败仅 log，不丢整条消息（文本仍可用）。
-        for raw in extract_media_refs(msg) {
-            match crate::media::download_media(
-                self.client.http(),
-                raw.encrypt_query_param.as_deref(),
-                raw.aes_key.as_deref(),
-                raw.full_url.as_deref(),
-            )
-            .await
-            {
-                Ok(bytes) => match persist_media(raw.kind, raw.file_name.as_deref(), &bytes) {
-                    Ok(path) => ib.media.push(MediaRef {
+        let ib = msg_to_inbound(msg);
+        let refs = extract_media_refs(msg);
+        Some((ib, refs))
+    }
+
+    /// P2-2（code-review v14）：单条消息的媒体阶段——下载 CDN（AES 解密）+
+    /// 落盘。并发与总预算见 [`drain_media_with_budget`]；信号量在批级共享
+    /// （fetch_updates 创建），单条多图消息不会独占全部并发槽。
+    async fn process_media_phase(
+        &self,
+        ib: &mut InboundMessage,
+        refs: Vec<RawMediaRef>,
+        semaphore: &Arc<Semaphore>,
+    ) {
+        if refs.is_empty() {
+            return; // 纯文本消息零开销直过。
+        }
+        let total = refs.len();
+        let futs: FuturesUnordered<_> = refs
+            .into_iter()
+            .enumerate()
+            .map(|(idx, raw)| {
+                let permit = semaphore.clone().acquire_owned();
+                async move {
+                    // 信号量在 future 内获取：批内所有消息的所有媒体统一排队，
+                    // 并发上限全局生效。
+                    let _permit = permit.await.expect("媒体下载信号量随批存活，不会 close");
+                    // 阶段 A：下载入站媒体（图片/文件/视频），存 ~/.imagent/media/。
+                    // 单个失败仅 log，不丢整条消息（文本仍可用）。
+                    let r: std::result::Result<MediaRef, String> = crate::media::download_media(
+                        self.client.http(),
+                        raw.encrypt_query_param.as_deref(),
+                        raw.aes_key.as_deref(),
+                        raw.full_url.as_deref(),
+                    )
+                    .await
+                    .map_err(|e| format!("download media 失败: {e}"))
+                    .and_then(|bytes| {
+                        persist_media(raw.kind, raw.file_name.as_deref(), &bytes)
+                            .map_err(|e| format!("persist media 失败: {e}"))
+                    })
+                    .map(|path| MediaRef {
                         kind: raw.kind.to_string(),
                         url: path,
-                    }),
-                    Err(e) => {
-                        warn!(target: "ilink", kind = raw.kind, error = %e, "persist media 失败")
-                    }
-                },
-                Err(e) => {
-                    warn!(target: "ilink", kind = raw.kind, error = %e, "download media 失败")
+                    });
+                    (idx, raw.kind, r)
                 }
-            }
-        }
-        out.push(ib);
+            })
+            .collect();
+        drain_media_with_budget(&mut ib.media, futs, MEDIA_TOTAL_BUDGET, total).await;
     }
 
     /// 解析发送阶段 context_token：优先 hint，否则读 store。
@@ -405,61 +468,10 @@ impl ILinkPlatform {
         }
         let body = serde_json::json!({ "msg": msg });
 
-        // 出站串行 + 服从式退避（同 send_text）。
-        let _guard = self.send_lock.lock().await;
-        const MAX_RETRIES: usize = 4;
-        const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(3);
-        let mut attempt: usize = 0;
-        loop {
-            let remain = self.breaker.cooldown_remaining().await;
-            if !remain.is_zero() {
-                tokio::time::sleep(remain).await;
-            }
-            attempt += 1;
-            match self
-                .client
-                .post_json::<SendMsgResp>("/ilink/bot/sendmessage", &body)
-                .await
-            {
-                Ok(resp) => match classify_send(&resp) {
-                    SendOutcome::Success => {
-                        self.breaker.reset().await;
-                        return Ok(());
-                    }
-                    SendOutcome::SessionExpired => {
-                        return Err(CoreError::SessionExpired("re-login required".into()));
-                    }
-                    SendOutcome::RateLimited => {
-                        self.breaker.record_event().await;
-                        if attempt > MAX_RETRIES {
-                            return Err(CoreError::Platform(
-                                "ilink",
-                                "sendmessage(media) rate-limited after retries".into(),
-                            ));
-                        }
-                        tokio::time::sleep(RATE_LIMIT_BACKOFF).await;
-                        continue;
-                    }
-                    SendOutcome::OtherError(s) => {
-                        return Err(CoreError::Platform(
-                            "ilink",
-                            format!("sendmessage(media) failed: {s}"),
-                        ));
-                    }
-                },
-                Err(e) => {
-                    if is_session_expired(&format!("{e}")) {
-                        return Err(CoreError::SessionExpired("re-login required".into()));
-                    }
-                    if attempt > MAX_RETRIES {
-                        return Err(e);
-                    }
-                    let backoff = Duration::from_secs(attempt as u64);
-                    warn!(target: "ilink", err = %e, attempt, "sendmessage(media) network error, backing off");
-                    tokio::time::sleep(backoff).await;
-                }
-            }
-        }
+        // 出站串行 + 服从式退避：与 send_text 共用 send_with_retry（P3-b，
+        // code-review v14：此前两份复制的重试逻辑已分叉——media 路径缺
+        // tripped / circuit-open 告警日志）。
+        self.send_with_retry(&body, "(media)").await
     }
     /// 发送单条文本（body 构造 + sendmessage 重试 + 限流熔断服从）。
     /// 每条独立走出站串行锁（片间 sleep 时释放锁，不长时间阻塞出站）。
@@ -478,80 +490,188 @@ impl ILinkPlatform {
             msg["context_token"] = json!(token);
         }
         let body = json!({ "msg": msg });
-        // 出站串行：同一 bot 同一时刻只有一条 sendmessage 在飞，
-        // 避免并发叠加触发限流。
-        let _guard = self.send_lock.lock().await;
+        // 出站串行 + 服从式退避：与 send_media 共用 send_with_retry（P3-b，
+        // code-review v14：双份复制的重试逻辑收口；锁语义见 P3-c）。
+        self.send_with_retry(&body, "").await
+    }
 
-        const MAX_RETRIES: usize = 4;
-        const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(3);
-        let mut attempt: usize = 0;
-        loop {
-            // 熔断前置闸：cooldown 未过则等待（服从式退避，不发包）。
-            let remain = self.breaker.cooldown_remaining().await;
-            if !remain.is_zero() {
-                warn!(target: "ilink", cooldown_ms = remain.as_millis() as u64, "rate-limit circuit open, pausing sends");
-                tokio::time::sleep(remain).await;
-            }
-
-            attempt += 1;
-            match self
-                .client
-                .post_json::<SendMsgResp>("/ilink/bot/sendmessage", &body)
-                .await
-            {
-                Ok(resp) => match classify_send(&resp) {
-                    SendOutcome::Success => {
-                        self.breaker.reset().await;
-                        return Ok(());
-                    }
-                    SendOutcome::SessionExpired => {
-                        return Err(CoreError::SessionExpired("re-login required".into()));
-                    }
-                    SendOutcome::RateLimited => {
-                        let tripped = self.breaker.record_event().await;
-                        if tripped {
-                            warn!(target: "ilink", "rate-limit circuit opened by sendmessage");
-                        }
-                        if attempt > MAX_RETRIES {
-                            return Err(CoreError::Platform(
-                                "ilink",
-                                "sendmessage rate-limited after retries".into(),
-                            ));
-                        }
-                        warn!(target: "ilink", attempt, "sendmessage rate-limited, backing off");
-                        tokio::time::sleep(RATE_LIMIT_BACKOFF).await;
-                        continue;
-                    }
-                    SendOutcome::OtherError(s) => {
-                        return Err(CoreError::Platform(
-                            "ilink",
-                            format!("sendmessage failed: {s}"),
-                        ));
-                    }
-                },
-                Err(e) => {
-                    // HTTP/网络层错误：先判 session_expired（401/403 字样）。
-                    let es = format!("{e}");
-                    if is_session_expired(&es) {
-                        return Err(CoreError::SessionExpired("re-login required".into()));
-                    }
-                    if attempt > MAX_RETRIES {
-                        return Err(e);
-                    }
-                    // 网络异常线性退避：1s, 2s, 3s, 4s。
-                    let backoff = Duration::from_secs(attempt as u64);
-                    warn!(target: "ilink", err = %es, attempt, backoff_ms = backoff.as_millis() as u64, "sendmessage network error, backing off");
-                    tokio::time::sleep(backoff).await;
-                    continue;
-                }
-            }
-        }
+    /// P3-b（code-review v14）：文本/媒体 sendmessage 的共用发送入口。
+    /// 重试/熔断/退避核心见 [`send_retry_loop`]；`label` 仅用于错误文案区分
+    /// 路径（`""` / `"(media)"`，与旧文案逐字兼容）。
+    async fn send_with_retry(&self, body: &serde_json::Value, label: &str) -> Result<()> {
+        let client = self.client.clone();
+        send_retry_loop(&self.send_lock, &self.breaker, label, || {
+            client.post_json::<SendMsgResp>("/ilink/bot/sendmessage", body)
+        })
+        .await
     }
 }
 
 /// 判断缓存的 typing_ticket 是否仍有效：非空 + 未过 TTL。
 fn ticket_valid(ticket: &str, expiry: Instant, now: Instant) -> bool {
     !ticket.is_empty() && expiry > now
+}
+
+/// P2-2（code-review v14）：单条消息媒体项的收集循环——deadline 预算内等
+/// FuturesUnordered 逐项完成，预算耗尽即放弃剩余项（warn 记数、文本照投递）。
+///
+/// 泛型注入下载 future（真实路径见 [`ILinkPlatform::process_media_phase`]），
+/// 使并发/预算行为可用可控 future + paused 时钟做回归测试。
+///
+/// 每个 future 输出 `(原序号, kind, 结果)`：成功项按原序号放回槽位，最终
+/// `media_out` 保持与消息内媒体顺序一致（并发完成顺序不影响结果顺序）。
+async fn drain_media_with_budget<Fut>(
+    media_out: &mut Vec<MediaRef>,
+    futs: FuturesUnordered<Fut>,
+    budget: Duration,
+    total: usize,
+) where
+    Fut: std::future::Future<Output = (usize, &'static str, std::result::Result<MediaRef, String>)>,
+{
+    let mut slots: Vec<Option<MediaRef>> = vec![None; total];
+    let mut completed = 0usize;
+    let mut futs = futs;
+    let deadline = tokio::time::Instant::now() + budget;
+    while completed < total {
+        match tokio::time::timeout_at(deadline, futs.next()).await {
+            Ok(Some((idx, _kind, Ok(m)))) => {
+                slots[idx] = Some(m);
+                completed += 1;
+            }
+            Ok(Some((_, kind, Err(e)))) => {
+                // 单个失败仅 log，不丢整条消息（文本仍可用）——与旧行为一致。
+                warn!(target: "ilink", kind, error = %e, "媒体项处理失败（仅丢该媒体）");
+                completed += 1;
+            }
+            Ok(None) => break, // 全部完成（防御分支，正常由 completed==total 退出）
+            Err(_) => {
+                // P2-2：预算耗尽。未完成项（含仍在排队/在途的）放弃——媒体是
+                // 增强信息，不能让它无限期拖住整批入站投递。
+                let abandoned = total - completed;
+                warn!(
+                    target: "ilink",
+                    budget_ms = budget.as_millis() as u64,
+                    abandoned,
+                    "单条消息媒体处理总预算耗尽：未完成媒体项标记失败，文本照常投递（code-review v14 P2-2）"
+                );
+                break;
+            }
+        }
+    }
+    media_out.extend(slots.into_iter().flatten());
+}
+
+/// P3-b（code-review v14）：send_retry_loop 单轮结果——包已发完，或需等待后
+/// 重试（等待发生在锁外，见下）。
+enum SendStep {
+    Done,
+    Wait(Duration),
+}
+
+/// P3-b/P3-c（code-review v14）：sendmessage「发送 + 重试」共用核心。
+///
+/// 此前 send_media_inner / send_text_one 各持一份复制（熔断前置闸、MAX_RETRIES、
+/// 限流退避、网络退避），已分叉——media 路径漏了 `tripped` 与 circuit-open
+/// 的 warn 日志（限流熔断触发时无可观测痕迹）。收口为单一实现，两路共用。
+///
+/// 锁语义（P3-c）：send_lock 只在「读熔断状态 + 发包 + 即时分类」的临界区内
+/// 持有；熔断冷却 / 限流退避 / 网络退避的 sleep 一律在锁外。此前整个重试循环
+/// 持锁（最坏 4 次重试 × 退避 ≈ 1 分钟），bot 级单锁下 peer A 的重试会卡死
+/// peer B 的全部发送。串行语义不变：任一时刻至多一条 sendmessage 在飞（发包
+/// 必持锁）；冷却期判断在锁内，sleep 醒来后回到循环头重新取锁、重查熔断状态
+/// （等待期间他人可能已重新触发熔断，不可跳过复查）。
+///
+/// 泛型注入发送动作（do_send）：真实路径 = client.post_json；测试注入可控
+/// 响应序列验证重试/熔断/锁释放行为（code-review v14 回归）。
+async fn send_retry_loop<F, Fut>(
+    send_lock: &Mutex<()>,
+    breaker: &crate::ratelimit::RateBreaker,
+    label: &str,
+    mut do_send: F,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<SendMsgResp>>,
+{
+    const MAX_RETRIES: usize = 4;
+    const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(3);
+    let mut attempt: usize = 0;
+    loop {
+        let step = {
+            let _guard = send_lock.lock().await;
+            // 熔断前置闸：cooldown 未过则等待（服从式退避，不发包）。
+            let remain = breaker.cooldown_remaining().await;
+            if !remain.is_zero() {
+                warn!(
+                    target: "ilink",
+                    cooldown_ms = remain.as_millis() as u64,
+                    "rate-limit circuit open, pausing sends"
+                );
+                SendStep::Wait(remain)
+            } else {
+                attempt += 1;
+                match do_send().await {
+                    Ok(resp) => match classify_send(&resp) {
+                        SendOutcome::Success => {
+                            breaker.reset().await;
+                            SendStep::Done
+                        }
+                        SendOutcome::SessionExpired => {
+                            return Err(CoreError::SessionExpired("re-login required".into()));
+                        }
+                        SendOutcome::RateLimited => {
+                            // P3-b：tripped warn 此前只有 text 路径有——熔断触发
+                            // 无可观测痕迹，现已两路统一。
+                            let tripped = breaker.record_event().await;
+                            if tripped {
+                                warn!(target: "ilink", "rate-limit circuit opened by sendmessage");
+                            }
+                            if attempt > MAX_RETRIES {
+                                return Err(CoreError::Platform(
+                                    "ilink",
+                                    format!("sendmessage{label} rate-limited after retries"),
+                                ));
+                            }
+                            warn!(target: "ilink", attempt, "sendmessage rate-limited, backing off");
+                            SendStep::Wait(RATE_LIMIT_BACKOFF)
+                        }
+                        SendOutcome::OtherError(s) => {
+                            return Err(CoreError::Platform(
+                                "ilink",
+                                format!("sendmessage{label} failed: {s}"),
+                            ));
+                        }
+                    },
+                    Err(e) => {
+                        // P3-a（code-review v14）：401/403 已由 client 层返回 typed
+                        // SessionExpired，这里用 matches! 判定（不再字符串匹配）。
+                        if is_session_expired(&e) {
+                            return Err(e);
+                        }
+                        if attempt > MAX_RETRIES {
+                            return Err(e);
+                        }
+                        // 网络异常线性退避：1s, 2s, 3s, 4s。
+                        let backoff = Duration::from_secs(attempt as u64);
+                        warn!(
+                            target: "ilink",
+                            err = %e,
+                            attempt,
+                            backoff_ms = backoff.as_millis() as u64,
+                            "sendmessage network error, backing off"
+                        );
+                        SendStep::Wait(backoff)
+                    }
+                }
+            }
+        };
+        match step {
+            SendStep::Done => return Ok(()),
+            // P3-c：退避在锁外 sleep——等待期间 send_lock 完全释放，其他 peer
+            // 的发送可正常进入临界区。
+            SendStep::Wait(d) => tokio::time::sleep(d).await,
+        }
+    }
 }
 
 /// 去重 key：优先 `message_id`，否则 `from_user_id + 文本` 组合。
@@ -594,12 +714,13 @@ impl Platform for ILinkPlatform {
                         break;
                     }
                     Err(e) => {
-                        let msg_str = format!("{e}");
-                        // SESSION_EXPIRED：session 失效，需重新登录。
-                        if is_session_expired(&msg_str) {
+                        // SESSION_EXPIRED：session 失效，需重新登录（P3-a：typed
+                        // 判定——client 层 401/403 已返回 SessionExpired variant）。
+                        if is_session_expired(&e) {
                             error!(target: "ilink", "session expired, re-login required");
-                            return Err(CoreError::SessionExpired("please re-login".into()));
+                            return Err(e);
                         }
+                        let msg_str = format!("{e}");
                         warn!(target: "ilink", err = %msg_str, backoff_ms = backoff.as_millis() as u64, "getupdates failed, backing off");
                         if backoff >= BACKOFF_CAP {
                             return Err(CoreError::Platform(
@@ -683,9 +804,19 @@ impl Platform for ILinkPlatform {
     }
 }
 
-/// 判定错误信息是否指示 session 失效（HTTP 401/403 或文本 SESSION_EXPIRED）。
-fn is_session_expired(msg: &str) -> bool {
-    msg.contains("SESSION_EXPIRED") || msg.contains("HTTP 401") || msg.contains("HTTP 403")
+/// 判定错误是否指示 session 失效。
+///
+/// P3-a（code-review v14）：改 typed 判定（`matches!` SessionExpired variant）。
+/// 生成路径已全部核对无遗漏：
+/// - HTTP 401/403 由 `client::post_json` 直接返回 typed `CoreError::SessionExpired`；
+/// - 响应体 ret/errcode 的过期形态（-14 / -2+"unknown error"）由 `classify_send`
+///   判为 `SendOutcome::SessionExpired` 后同样转 typed。
+///
+/// 旧的 Display 字符串匹配（「HTTP 401/403」「SESSION_EXPIRED」子串）已删——
+/// crate 内无任何代码再生成含这些子串的错误文案（login 的 401 文案不进本层），
+/// 字符串形态文案一改即静默失配，故按 variant 判定。
+fn is_session_expired(e: &CoreError) -> bool {
+    matches!(e, CoreError::SessionExpired(_))
 }
 
 /// 媒体目录：`<imagent_home>/media/`（0700；随 profile 隔离——此前写死
@@ -795,11 +926,27 @@ mod tests {
         assert_eq!(dedup_key(&msg), "fc:u:c");
     }
 
+    /// P3-a（code-review v14）：typed 判定——仅 `SessionExpired` variant 命中。
+    /// Display 携带「HTTP 401」字样的 `Platform` 错误**不再**匹配（字符串匹配
+    /// 已删，401/403 在 client 层就转成了 typed variant）。
     #[test]
-    fn session_expired_detection() {
-        assert!(is_session_expired("POST x: HTTP 401"));
-        assert!(is_session_expired("SESSION_EXPIRED: token invalid"));
-        assert!(!is_session_expired("POST x: HTTP 500"));
+    fn session_expired_detection_typed() {
+        assert!(is_session_expired(&CoreError::SessionExpired(
+            "re-login required".into()
+        )));
+        // 旧字符串形态（若未来有人退回 Platform+401 文案）必须**不**命中——
+        // 钉住「判定只认 variant」的契约。
+        assert!(!is_session_expired(&CoreError::Platform(
+            "ilink",
+            "POST x: HTTP 401".into()
+        )));
+        assert!(!is_session_expired(&CoreError::Platform(
+            "ilink",
+            "POST x: HTTP 500".into()
+        )));
+        assert!(!is_session_expired(&CoreError::Store(
+            imagent_store::StoreError::Other("x".into())
+        )));
     }
 
     #[test]
@@ -823,5 +970,243 @@ mod tests {
         let exp = now + Duration::from_secs(400);
         // 即使未过期，空 ticket 也判无效（需刷新）。
         assert!(!ticket_valid("", exp, now));
+    }
+
+    // ------------------------------------------------------------------
+    // P2-2（code-review v14）：媒体并发 + 单消息总预算
+    // ------------------------------------------------------------------
+
+    /// 预算耗尽：永不完成的下载在 60s 预算处被放弃（warn 记数），已完成的
+    /// 成功项保留、顺序稳定、文本照投递（media 只含成功项）。start_paused
+    /// 让 60s 预算在 mock 时钟上瞬时推进。四个 async 块形态各异，Box::pin
+    /// 统一成同一 Fut 类型。
+    #[tokio::test(start_paused = true)]
+    async fn media_budget_abandons_stuck_downloads_keeps_finished() {
+        type Item = (usize, &'static str, std::result::Result<MediaRef, String>);
+        type ItemFut = std::pin::Pin<Box<dyn std::future::Future<Output = Item>>>;
+        let futs: FuturesUnordered<ItemFut> = vec![
+            // #0 立即成功。
+            Box::pin(async {
+                (
+                    0usize,
+                    "image",
+                    Ok(MediaRef {
+                        kind: "image".into(),
+                        url: "/a".into(),
+                    }),
+                )
+            }) as ItemFut,
+            // #1 永不完成（模拟 CDN 挂死：单文件 45s 超时也兜不住的形态）。
+            Box::pin(async { std::future::pending::<Item>().await }) as ItemFut,
+            // #2 立即失败（下载错误——仅丢该媒体项）。
+            Box::pin(async { (2usize, "file", Err("download media 失败: boom".into())) })
+                as ItemFut,
+            // #3 也立即成功——验证顺序按原序号而非完成顺序。
+            Box::pin(async {
+                (
+                    3usize,
+                    "file",
+                    Ok(MediaRef {
+                        kind: "file".into(),
+                        url: "/d".into(),
+                    }),
+                )
+            }) as ItemFut,
+        ]
+        .into_iter()
+        .collect();
+        let mut media = Vec::new();
+        let start = tokio::time::Instant::now();
+        drain_media_with_budget(&mut media, futs, Duration::from_secs(60), 4).await;
+        // 预算等待确实发生（mock 时钟推进到 ≥60s）。
+        assert!(
+            start.elapsed() >= Duration::from_secs(60),
+            "预算应耗尽：elapsed={:?}",
+            start.elapsed()
+        );
+        // 只有 #0/#3 成功项、按原序号排列。
+        let urls: Vec<&str> = media.iter().map(|m| m.url.as_str()).collect();
+        assert_eq!(urls, vec!["/a", "/d"], "只保留成功项且按原序");
+    }
+
+    /// 全部顺利完成（远小于预算）→ 不等待、全量收集。
+    #[tokio::test(start_paused = true)]
+    async fn media_budget_completes_within_budget() {
+        let futs: FuturesUnordered<_> = (0..3usize)
+            .map(|i| async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                (
+                    i,
+                    "image",
+                    Ok(MediaRef {
+                        kind: "image".into(),
+                        url: format!("/{i}"),
+                    }),
+                )
+            })
+            .collect();
+        let mut media = Vec::new();
+        drain_media_with_budget(&mut media, futs, Duration::from_secs(60), 3).await;
+        assert_eq!(media.len(), 3, "预算内应全部完成");
+        let urls: Vec<&str> = media.iter().map(|m| m.url.as_str()).collect();
+        assert_eq!(urls, vec!["/0", "/1", "/2"], "顺序稳定");
+    }
+
+    /// 信号量限流语义（与生产同款形态）：8 个 10s 任务 × 4 并发 ≈ 20s 完成
+    /// （若信号量失效则 ~10s，若串行则 ~80s 超预算）——钉住「并发=4」的档位。
+    #[tokio::test(start_paused = true)]
+    async fn media_downloads_throttled_by_semaphore() {
+        let sem = Arc::new(Semaphore::new(MEDIA_DOWNLOAD_CONCURRENCY));
+        let futs: FuturesUnordered<_> = (0..8usize)
+            .map(|i| {
+                let permit = sem.clone().acquire_owned();
+                async move {
+                    let _p = permit.await.unwrap();
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    (
+                        i,
+                        "image",
+                        Ok(MediaRef {
+                            kind: "image".into(),
+                            url: format!("/{i}"),
+                        }),
+                    )
+                }
+            })
+            .collect();
+        let start = tokio::time::Instant::now();
+        let mut media = Vec::new();
+        drain_media_with_budget(&mut media, futs, Duration::from_secs(60), 8).await;
+        assert_eq!(media.len(), 8, "预算内应全部完成");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(19),
+            "应有并发限流（两波 10s ≈ 20s）：elapsed={elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(60),
+            "不应超出预算：elapsed={elapsed:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // P3-b/P3-c（code-review v14）：sendmessage 重试核心
+    // ------------------------------------------------------------------
+
+    /// 网络错误重试后成功：第 1/2 次网络错误、第 3 次成功 → Ok。
+    #[tokio::test(start_paused = true)]
+    async fn send_retry_recovers_after_transient_errors() {
+        let lock = Mutex::new(());
+        let breaker =
+            crate::ratelimit::RateBreaker::new(Duration::from_secs(30), 3, Duration::from_secs(30));
+        let attempts = std::cell::Cell::new(0usize);
+        let r = send_retry_loop(&lock, &breaker, "", || {
+            let n = attempts.get() + 1;
+            attempts.set(n);
+            async move {
+                if n < 3 {
+                    Err(CoreError::Platform("ilink", "network".into()))
+                } else {
+                    // ret/errcode 均 None → classify Success。
+                    Ok(SendMsgResp::default())
+                }
+            }
+        })
+        .await;
+        assert!(r.is_ok(), "瞬态错误应在重试后成功：{r:?}");
+        assert_eq!(attempts.get(), 3);
+    }
+
+    /// 网络错误重试耗尽（MAX_RETRIES=4 → 共 5 次尝试）→ 报原始 Err。
+    #[tokio::test(start_paused = true)]
+    async fn send_retry_gives_up_after_max_retries() {
+        let lock = Mutex::new(());
+        let breaker =
+            crate::ratelimit::RateBreaker::new(Duration::from_secs(30), 3, Duration::from_secs(30));
+        let attempts = std::cell::Cell::new(0usize);
+        let r = send_retry_loop(&lock, &breaker, "", || {
+            attempts.set(attempts.get() + 1);
+            async { Err(CoreError::Platform("ilink", "boom".into())) }
+        })
+        .await;
+        let e = r.unwrap_err();
+        let msg = format!("{e}");
+        assert!(msg.contains("boom"), "应保留原始错误：{msg}");
+        assert_eq!(attempts.get(), 5, "4 次重试 + 首次 = 5 次尝试");
+    }
+
+    /// P3-c：退避 sleep 期间 send_lock 必须可用（旧实现整循环持锁，peer A 重试
+    /// 卡死 peer B）。观察者在重试退避窗口内 try_lock 应成功。
+    #[tokio::test(start_paused = true)]
+    async fn send_lock_released_during_backoff_sleep() {
+        let lock = Mutex::new(());
+        let breaker =
+            crate::ratelimit::RateBreaker::new(Duration::from_secs(30), 3, Duration::from_secs(30));
+        let attempts = std::cell::Cell::new(0usize);
+        let saw_free = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_free2 = saw_free.clone();
+        let (r, _) = tokio::join!(
+            send_retry_loop(&lock, &breaker, "", || {
+                let n = attempts.get() + 1;
+                attempts.set(n);
+                async move {
+                    if n < 3 {
+                        Err(CoreError::Platform("ilink", "network".into()))
+                    } else {
+                        Ok(SendMsgResp::default())
+                    }
+                }
+            }),
+            async {
+                // 与重试退避并发跑：任一时刻锁可取即证明退避不持锁。
+                for _ in 0..50 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if lock.try_lock().is_ok() {
+                        saw_free2.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            }
+        );
+        assert!(r.is_ok());
+        assert!(
+            saw_free.load(std::sync::atomic::Ordering::SeqCst),
+            "退避窗口内 send_lock 应可被其他 peer 获取"
+        );
+    }
+
+    /// 限流重试耗尽 → 「rate-limited after retries」文案（label 区分 media 路径，
+    /// 与旧文案逐字兼容）。breaker 的 cooldown 用 `std::Instant`（真实钟），
+    /// paused mock 时钟不驱动它——故取小 cooldown（50ms 真实时间）防测试
+    /// 空转等待 30s；前置闸（circuit-open Wait 分支）仍会被覆盖。
+    #[tokio::test(start_paused = true)]
+    async fn send_retry_rate_limited_exhausts_with_label() {
+        let lock = Mutex::new(());
+        // threshold=1：单次限流即熔断。
+        let breaker = crate::ratelimit::RateBreaker::new(
+            Duration::from_secs(30),
+            1,
+            Duration::from_millis(50),
+        );
+        let attempts = std::cell::Cell::new(0usize);
+        let r = send_retry_loop(&lock, &breaker, "(media)", || {
+            attempts.set(attempts.get() + 1);
+            async {
+                Ok(SendMsgResp {
+                    ret: Some(-2),
+                    errcode: None,
+                    errmsg: None,
+                })
+            }
+        })
+        .await;
+        let e = r.unwrap_err();
+        let msg = format!("{e}");
+        assert!(
+            msg.contains("sendmessage(media) rate-limited after retries"),
+            "文案错误：{msg}"
+        );
+        assert_eq!(attempts.get(), 5, "4 次重试 + 首次 = 5 次尝试");
+        // 熔断器已被限流事件触发（最后一次 record_event 刚推开 cooldown）。
+        assert!(breaker.cooldown_remaining().await > Duration::ZERO);
     }
 }

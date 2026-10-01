@@ -1,9 +1,12 @@
 name: fuzz
 
-# 周期性 fuzz（第二波 S-补充）：fuzz/ 三个 target（ilink_proto_parse /
-# ilink_media_cdn_host / feishu_event_parse），覆盖外部输入攻击面（协议解析 +
-# CDN host SSRF + 飞书事件 payload）。仅靠本地手跑无法保证 corpus 增长与回归
-# 发现，故每周跑一次（各 300s）。手动触发：Actions → fuzz → Run workflow。
+# 周期性 fuzz（第二波 S-补充）：fuzz/ 四个 target（ilink_proto_parse /
+# ilink_media_cdn_host / feishu_event_parse / wecom_frame_parse），覆盖外部输入
+# 攻击面（协议解析 ×2 + CDN host SSRF + 飞书事件 payload）。仅靠本地手跑无法
+# 保证 corpus 增长与回归发现，故每周跑一次（各 300s）。手动触发：Actions →
+# fuzz → Run workflow。
+# P3-e（code-review v14）：补 wecom_frame_parse——企微 WS 帧解析此前只在
+# ilink/feishu 侧周期 fuzz，企微回归无 corpus 增长保障。
 
 on:
   schedule:
@@ -41,3 +44,6 @@ jobs:
         run: cargo +nightly fuzz run ilink_media_cdn_host -- -max_total_time=300
       - name: Fuzz feishu_event_parse (300s)
         run: cargo +nightly fuzz run feishu_event_parse -- -max_total_time=300
+      # P3-e（code-review v14）：补漏的第四个 target——企微 WS 帧解析。
+      - name: Fuzz wecom_frame_parse (300s)
+        run: cargo +nightly fuzz run wecom_frame_parse -- -max_total_time=300

@@ -19,15 +19,19 @@ qrcode = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
-anyhow = { workspace = true }
-thiserror = { workspace = true }
+# P3-d（code-review v14）：删除零引用的 anyhow/thiserror（错误统一走
+# imagent_core::CoreError）与零引用的 ecb/dirs（AES-ECB 逐块手写于 media.rs，
+# 媒体目录用 imagent_core::paths::imagent_home）。
 uuid = { workspace = true }
 aes = { workspace = true }
-ecb = { workspace = true }
 cipher = { workspace = true }
 hex = { workspace = true }
 md5 = "0.7"
-dirs = { workspace = true }
 prometheus = { workspace = true }
 futures = { workspace = true }
 url = { workspace = true }
+
+[dev-dependencies]
+# P2-2/P3-c（code-review v14）回归测试用 `#[tokio::test(start_paused = true)]`
+# （mock 时钟驱动 60s 媒体预算/退避等待，测试瞬时完成）——test-util 不进生产构建。
+tokio = { workspace = true, features = ["test-util"] }

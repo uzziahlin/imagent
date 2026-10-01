@@ -12,11 +12,17 @@ imagent-core = { path = "../core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+# P3-g（code-review v14）：CancellationToken 停机信号——平台 drop 后后台
+# client run / drain 任务可感知退出，不再无限重连。
+tokio-util = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
-anyhow = { workspace = true }
-thiserror = { workspace = true }
 rand = { workspace = true }
 futures = { workspace = true }
 tokio-tungstenite = { workspace = true }
 url = { workspace = true }
+
+[dev-dependencies]
+# P2-1（code-review v14）回归测试用 `#[tokio::test(start_paused = true)]`
+# （mock 时钟驱动 5s 出站超时，测试瞬时完成）——test-util 不进生产构建。
+tokio = { workspace = true, features = ["test-util"] }
