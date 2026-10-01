@@ -33,7 +33,7 @@ use crate::metrics::METRICS;
 use crate::permission::{
     is_explicit_reply_word, parse_reply, PendingKind, PermissionReply, PermissionRouter,
 };
-use crate::platform::Platform;
+use crate::platform::{Platform, PlatformCaps};
 use crate::types::{
     AgentChunk, CardButton, CardButtonStyle, CardTerminal, ConfigFormField, ConvId, InboundMessage,
     MediaRef, ReplyHint, SessionId, ToolCall,
@@ -174,6 +174,45 @@ fn backend_failure_reply(backend_name: &str) -> String {
     )
 }
 
+/// B1 能力门：best-effort 平台调用前查 [`PlatformCaps`]，平台未声明该能力则
+/// 返回 false（调用方跳过）。**行为不变**——过此门的族 default 本就是 no-op
+/// （ASK 收敛族 / REACTIONS / TYPING / URGENT_TEXT），跳过只省一次注定无效的
+/// 往返；default = 文本降级的方法（send_card / send_permission_ask /
+/// send_command_card / send_config_form / send_urgent_text 催办）**禁止**过此门
+/// ——降级文本本身就是用户可见交付，跳过等于吞消息。
+///
+/// 「为什么不生效」保持可观测：每族首次跳过记一条 debug（进程级一次——caps
+/// 进程内恒定，逐消息重复无信息量）。
+fn platform_supports(platform: &dyn Platform, cap: PlatformCaps, family: &'static str) -> bool {
+    let caps = platform.capabilities();
+    if caps.contains(cap) {
+        return true;
+    }
+    capability_skip_logged(platform, caps, cap, family);
+    false
+}
+
+/// 能力跳过的 debug 去重（能力位 ≤32 个，u64 位图锁无关够用）。
+fn capability_skip_logged(
+    platform: &dyn Platform,
+    caps: PlatformCaps,
+    cap: PlatformCaps,
+    family: &'static str,
+) {
+    static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // 调用方传单能力位（多位于此无意义，取首位）。
+    let bit = 1u64 << cap.bits().trailing_zeros();
+    if LOGGED.fetch_or(bit, std::sync::atomic::Ordering::SeqCst) & bit == 0 {
+        debug!(
+            target: "imagent::core",
+            platform = platform.name(),
+            family,
+            caps = %caps.summary(),
+            "平台未声明该能力，跳过 best-effort 调用（default 亦为 no-op，行为不变）"
+        );
+    }
+}
+
 /// Wave B-1：审批等待过半的加急催办文案（纯函数，便于单测）。
 /// 剩余分钟向上取整（剩 30 秒显示「剩 1 分钟」，宁多勿少）。
 /// 真机校准（2026-08）：措辞平台中立——卡片平台按钮/👍 可用，纯文本平台
@@ -229,12 +268,17 @@ async fn wait_reply_with_buzz(
             //    复用 P10-③ note 联动，纯文本平台 no-op）；
             // ② 加急文本推送（buzz 弹窗——用户可能没开聊天窗口，note patch
             //    无法主动触达；真机校准 2026-08 保留文本的根本原因）。
+            // B1：①过 ASK 能力门（无卡可收敛的平台跳过注定 no-op 的调用）；
+            // ②**不过门**——send_urgent_text 的 default 降级为普通文本，这条
+            // 催办文本本身就是纯文本平台的交付（跳过等于吞催办）。
             let remaining = timeout.saturating_sub(started.elapsed());
             let text = approval_buzz_text(tool_name, remaining);
             let note = approval_buzz_note(remaining);
-            let _ = platform
-                .note_queued_on_ask(conv, &note, &ReplyHint::None)
-                .await;
+            if platform_supports(platform, PlatformCaps::ASK, "ask") {
+                let _ = platform
+                    .note_queued_on_ask(conv, &note, &ReplyHint::None)
+                    .await;
+            }
             if let Err(e) = platform
                 .send_urgent_text(conv, &text, &ReplyHint::None)
                 .await
@@ -1554,10 +1598,13 @@ impl Dispatcher {
                         // 「允许」route miss，字面 "y" 会被当 prompt 跑一轮
                         // agent），再原样回 deny（deny 与 socket 路径同口径）。
                         if r.raw_text.as_deref() == Some(crate::permission::EVICTED_SENTINEL) {
-                            if let Err(e) =
-                                platform.cancel_permission_ask(&conv, &ask.request_id).await
-                            {
-                                warn!(target: "imagent::core", error = %e, "淘汰询问收敛失败");
+                            // B1：非 ASK 平台无卡可收敛，能力门跳过（default 亦 no-op）。
+                            if platform_supports(platform.as_ref(), PlatformCaps::ASK, "ask") {
+                                if let Err(e) =
+                                    platform.cancel_permission_ask(&conv, &ask.request_id).await
+                                {
+                                    warn!(target: "imagent::core", error = %e, "淘汰询问收敛失败");
+                                }
                             }
                         }
                         METRICS
@@ -1577,9 +1624,13 @@ impl Dispatcher {
                     AskWaitOutcome::TimedOut => {
                         router.cancel(&ask.conv_id, &ask.request_id).await;
                         // 超时自动拒绝后收敛滞留询问卡（best-effort）。
-                        if let Err(e) = platform.cancel_permission_ask(&conv, &ask.request_id).await
-                        {
-                            warn!(target: "imagent::core", error = %e, "超时询问卡收敛失败（不影响 deny）");
+                        // B1：能力门——非 ASK 平台跳过（default 亦 no-op）。
+                        if platform_supports(platform.as_ref(), PlatformCaps::ASK, "ask") {
+                            if let Err(e) =
+                                platform.cancel_permission_ask(&conv, &ask.request_id).await
+                            {
+                                warn!(target: "imagent::core", error = %e, "超时询问卡收敛失败（不影响 deny）");
+                            }
                         }
                         // S-18：超时 deny 不能对用户无声——回一条可读消息，说明
                         // 已自动拒绝及后果（否则用户以为点了稍后再说还有效）。
@@ -1719,6 +1770,15 @@ impl Dispatcher {
             native_passthrough = self.backend.supports_native_permission_mode(),
             tool_allowlist = self.backend.supports_tool_allowlist(),
             "权限能力矩阵"
+        );
+        // B1：平台能力面一行（与 Backend 侧权限能力矩阵对称；逐项展开见
+        // /doctor 的「平台能力」节）。caps 进程内恒定，启动打一次即可。
+        info!(
+            target: "imagent::core",
+            platform = self.platform.name(),
+            caps = %self.platform.capabilities().summary(),
+            caps_bits = self.platform.capabilities().bits(),
+            "平台能力矩阵"
         );
         // B3（fail-closed）：闭环类档位（Ask / auto-claude）要求 backend 支持
         // IM 审批闭环。此前 codex/gemini 在 ask 档下静默忽略审批（等于全放行），
@@ -1992,7 +2052,13 @@ impl Dispatcher {
                                 // 真机校准 UX：决策已达 MCP，立即把询问卡收敛成
                                 // 「已批准/已拒绝」终态（best-effort，无卡 no-op）；
                                 // 问题卡（P6）显示「已记录你的选择：<选项>」。
-                                {
+                                // B1：能力门——非 ASK 平台连 spawn 都省（default 亦
+                                // no-op，跳过不影响审批结果）。
+                                if platform_supports(
+                                    self.platform.as_ref(),
+                                    PlatformCaps::ASK,
+                                    "ask",
+                                ) {
                                     let platform = self.platform.clone();
                                     let conv = msg.conv_id.clone();
                                     self.tasks.lock().await.spawn(async move {
@@ -2270,17 +2336,20 @@ impl Dispatcher {
             EnqueuePlan::Steered => {
                 // 回执：👀 打在消息上（与真排队 ⏳ 区分——steering 是「已注入
                 // 当轮」，效果由 agent 在下个工具边界续写可见）。
-                if let Some(mid) = msg.source_msg_id.clone().filter(|m| m.starts_with("om_")) {
-                    if let Err(e) = self
-                        .platform
-                        .react_to_message(
-                            &ConvId(conv.to_string()),
-                            &mid,
-                            crate::MsgReaction::Processing,
-                        )
-                        .await
-                    {
-                        tracing::debug!(target: "imagent::core", error = %e, "转向消息表情标注失败（不影响注入）");
+                // B1：能力门——非 REACTIONS 平台跳过（default 亦 no-op）。
+                if platform_supports(self.platform.as_ref(), PlatformCaps::REACTIONS, "reactions") {
+                    if let Some(mid) = msg.source_msg_id.clone().filter(|m| m.starts_with("om_")) {
+                        if let Err(e) = self
+                            .platform
+                            .react_to_message(
+                                &ConvId(conv.to_string()),
+                                &mid,
+                                crate::MsgReaction::Processing,
+                            )
+                            .await
+                        {
+                            tracing::debug!(target: "imagent::core", error = %e, "转向消息表情标注失败（不影响注入）");
+                        }
                     }
                 }
                 false
@@ -2365,25 +2434,30 @@ impl Dispatcher {
                 // 拉取；③审批等待是最静默的窗口（无 chunk，footer 不动），推送
                 // 重渲染审批卡 note 行（best-effort）。两者都是状态更新，不往
                 // 消息流发任何东西。
+                // B1：双能力门——非 ASK/REACTIONS 平台跳过（default 均 no-op）。
                 let note = format!("⏳ 等待你审批 · 后面还排着 {count} 条消息");
-                if let Err(e) = self
-                    .platform
-                    .note_queued_on_ask(&ConvId(conv.to_string()), &note, hint)
-                    .await
-                {
-                    tracing::debug!(target: "imagent::core", error = %e, "审批卡排队 note 更新失败（不影响排队）");
-                }
-                if let Some(mid) = &queued_mid {
+                if platform_supports(self.platform.as_ref(), PlatformCaps::ASK, "ask") {
                     if let Err(e) = self
                         .platform
-                        .react_to_message(
-                            &ConvId(conv.to_string()),
-                            mid,
-                            crate::MsgReaction::Queued,
-                        )
+                        .note_queued_on_ask(&ConvId(conv.to_string()), &note, hint)
                         .await
                     {
-                        tracing::debug!(target: "imagent::core", error = %e, "排队消息表情标注失败（不影响排队）");
+                        tracing::debug!(target: "imagent::core", error = %e, "审批卡排队 note 更新失败（不影响排队）");
+                    }
+                }
+                if platform_supports(self.platform.as_ref(), PlatformCaps::REACTIONS, "reactions") {
+                    if let Some(mid) = &queued_mid {
+                        if let Err(e) = self
+                            .platform
+                            .react_to_message(
+                                &ConvId(conv.to_string()),
+                                mid,
+                                crate::MsgReaction::Queued,
+                            )
+                            .await
+                        {
+                            tracing::debug!(target: "imagent::core", error = %e, "排队消息表情标注失败（不影响排队）");
+                        }
                     }
                 }
                 // S-3/S-4 竞态兜底：note/react IO 期间本批可能已被 runner 取走

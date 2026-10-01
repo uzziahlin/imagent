@@ -177,6 +177,21 @@ impl TypingGate {
 
 #[async_trait]
 impl Platform for MockPlatform {
+    /// B1：能力声明与覆写清单对齐——REACTIONS（react_to_message 全记录）/
+    /// TYPING（send_typing 闸门）/ MEDIA_UPLOAD（send_media）/ ASK
+    ///（resolve_permission_ask 闸门）；URGENT_TEXT 随 `urgent` 变体
+    ///（supports_urgent_text 同源）。新增覆写须同步。
+    fn capabilities(&self) -> PlatformCaps {
+        let mut caps = PlatformCaps::REACTIONS
+            | PlatformCaps::TYPING
+            | PlatformCaps::MEDIA_UPLOAD
+            | PlatformCaps::ASK;
+        if self.urgent {
+            caps |= PlatformCaps::URGENT_TEXT;
+        }
+        caps
+    }
+
     async fn recv(&self) -> Result<InboundMessage> {
         loop {
             let mut q = self.recv_queue.lock().await;
@@ -1092,6 +1107,12 @@ struct CardCapablePlatform {
 
 #[async_trait]
 impl Platform for CardCapablePlatform {
+    /// B1：能力声明与覆写清单对齐——CARDS（supports_streaming_card /
+    /// send_card / update_card）+ MEDIA_UPLOAD（send_media）。
+    fn capabilities(&self) -> PlatformCaps {
+        PlatformCaps::CARDS | PlatformCaps::MEDIA_UPLOAD
+    }
+
     async fn recv(&self) -> Result<InboundMessage> {
         // 测试不经 run/recv（直接 handle），永不返回。
         loop {
@@ -3341,6 +3362,61 @@ fn doctor_capability_lines_matrix() {
         PC::FullLoop,
     );
     assert!(lines[0].starts_with("✅"), "{}", lines[0]);
+}
+
+/// B1：/doctor 平台能力面纯函数矩阵——逐项 ✅/❌ + reply_mode=card × 非 CARDS
+/// 错配提示（ALL 表长参与断言，新增能力位自动纳入）。
+#[test]
+fn doctor_platform_caps_lines_matrix() {
+    use super::commands::doctor_platform_caps_lines;
+    let n = PlatformCaps::ALL.len();
+
+    // 空集（纯文本平台）× card 档 → 表头 + 全 ❌ + 1 行错配提示。
+    let lines = doctor_platform_caps_lines(PlatformCaps::empty(), ReplyMode::Card);
+    assert_eq!(lines.len(), 1 + n + 1, "{lines:?}");
+    assert!(
+        lines[0].contains(&format!("平台能力（0/{n} 项）")),
+        "{}",
+        lines[0]
+    );
+    for l in &lines[1..1 + n] {
+        assert!(l.starts_with("❌"), "{}", l);
+    }
+    let warn = lines.last().unwrap();
+    assert!(warn.contains("reply_mode = card"), "{warn}");
+    assert!(warn.contains("不支持流式卡片"), "{warn}");
+
+    // ilink 面（media+typing）× text 档 → 混合 ✅/❌，无错配尾行。
+    let lines = doctor_platform_caps_lines(
+        PlatformCaps::MEDIA_UPLOAD | PlatformCaps::TYPING,
+        ReplyMode::Text,
+    );
+    assert_eq!(lines.len(), 1 + n, "{lines:?}");
+    assert!(
+        lines[0].contains(&format!("平台能力（2/{n} 项）")),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("✅ 媒体回传")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("✅ typing 指示")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("❌ 流式卡片")),
+        "{lines:?}"
+    );
+
+    // feishu 面（全亮）× card 档 → 逐项全 ✅、无错配。
+    let full = PlatformCaps::ALL
+        .iter()
+        .fold(PlatformCaps::empty(), |acc, (c, _, _)| acc | *c);
+    let lines = doctor_platform_caps_lines(full, ReplyMode::Card);
+    assert_eq!(lines.len(), 1 + n, "{lines:?}");
+    assert!(lines[1..].iter().all(|l| l.starts_with("✅")), "{lines:?}");
 }
 
 /// 检查 ⑤⑥ 纯函数：护栏水位两档 + 体积行格式。

@@ -18,6 +18,8 @@ mod drain;
 mod outbox;
 mod state;
 
+pub use outbox::OUTBOX_KIND;
+
 #[cfg(test)]
 pub(crate) mod testutil;
 
@@ -34,7 +36,7 @@ use tracing::warn;
 
 use imagent_core::{
     command_card_fallback_text, split_message, CardButton, CardTerminal, ConvId, CoreError, Dedup,
-    InboundMessage, JoinedChat, MediaRef, OutboundCard, Platform, ReplyHint, Result,
+    InboundMessage, JoinedChat, MediaRef, OutboundCard, Platform, PlatformCaps, ReplyHint, Result,
     CARD_HANDLE_LOST,
 };
 
@@ -76,17 +78,19 @@ pub struct FeishuPlatform {
     app_secret: String,
     /// token 缓存：`(token, fetched_at)`，elapsed >= TOKEN_TTL 则刷新。
     token: Arc<RwLock<Option<(String, Instant)>>>,
-    /// CardKit 卡片的 sequence 计数（element/settings PATCH 共用，per card_id 严格递增）。
-    card_seqs: Arc<Mutex<HashMap<String, i64>>>,
-    /// P8-1：已上屏的 footer 文案缓存（per card_id）——分阶段 footer 只在**变化时**
-    /// patch（思考中→调用工具→输出中），节流 tick 间内容相同则跳过，不浪费调用。
-    card_footers: Arc<Mutex<HashMap<String, String>>>,
+    /// A2（历史债务批：发送侧单表化）：per-card 发送侧状态单表——原
+    /// `card_seqs` / `card_footers` / `managed_card_msgs` 三张平行 map（各自
+    /// 独立 cap、6 处手工 remove 维持生命周期）合一，键 = CardKit card_id。
+    /// conv 侧 v1.18 已做过同型手术（[`ConvState`]），这是没做完的第二轮。
+    /// 不变量唯一出处：登记只在 send_card（managed 发送成功）与 seq/footer
+    /// 懒分配；终态清理只走 [`Self::release_card`]；粗上限只走
+    /// [`enforce_card_state_cap`]（见 [`CardState`] 字段注释）。
+    card_states: Arc<Mutex<HashMap<String, CardState>>>,
     /// bot 对用户消息的表情标注状态：om_ 消息 id → 当前 reaction_id（终态翻转
     /// 时先删旧表情再打新表情；仅内存态，重启后旧表情滞留无害——新一轮会重打）。
+    /// A2 边界：键是**用户消息 id**（非 card_id），生命周期跟表情翻转而非卡片
+    /// 流式生命周期——语义是 per-message，刻意不并入 [`CardState`] 单表。
     msg_reactions: Arc<Mutex<HashMap<String, String>>>,
-    /// managed 流式卡的 card_id → 平台消息 id（om_）：终态整卡 patch 用
-    /// （CardKit 句柄只有实体 id，im PATCH 需要消息 id；send 时记录）。
-    managed_card_msgs: Arc<Mutex<HashMap<String, String>>>,
     /// `/reconnect` 强制重连信号（与 WS run task 共享，P4-7）。
     reconnect: Arc<tokio::sync::Notify>,
     /// 已解析的入站消息 channel，`recv` 直接 await。
@@ -110,6 +114,8 @@ pub struct FeishuPlatform {
     quiet_hours: Option<imagent_core::QuietHours>,
     /// v1.21 per-conv 发送令牌桶速率（消息创建/秒；0 = 关闭）。主动预算出站
     /// 频率——把「挨 429 再被动退避」翻转为「不触发 429」。
+    /// A2 边界：令牌桶按 **conv** 键控（粗上限见 [`Self::acquire_send_slot`]），
+    /// 语义是 per-conv 不是 per-card，刻意不并入 [`CardState`] 单表。
     send_rps: f64,
     /// v1.24 卡片 UX：审批/问题卡到达即加急（config feishu_urgent_on_ask）。
     urgent_on_ask: bool,
@@ -122,6 +128,70 @@ pub struct FeishuPlatform {
 struct SendBucket {
     tokens: f64,
     last: Instant,
+}
+
+/// A2（历史债务批）：发送侧 per-card 状态单表条目——原 `card_seqs`（i64）/
+/// `card_footers`（String）/ `managed_card_msgs`（om_ 消息 id）三张平行 map
+/// 合并为一个结构。此前任一新增终态路径漏一处 remove 即泄漏到各自 cap 的
+/// 整体 clear()（清空又把活跃卡的 seq 一起丢，靠 300317 自愈救回）；单表后
+/// 「登记 / 终态释放 / cap 驱逐」各只有唯一出处。
+#[derive(Debug)]
+struct CardState {
+    /// CardKit PATCH sequence（element 与 settings 共用，per card 严格递增）。
+    /// 300317 自愈会把该卡重置为时间戳级（见 [`FeishuPlatform::patch_any_handle`]）。
+    seq: i64,
+    /// P8-1：已上屏的 footer 文案缓存——分阶段 footer 只在**变化时** patch；
+    /// v14 P3m：footer patch **任何失败**回滚到 None（下次比较必然不等）。
+    /// None = 无记录/已回滚（旧实现是整表条目 remove，语义等价）。
+    footer: Option<String>,
+    /// managed 流式卡的平台消息 id（om_）：终态整卡 im-patch 快路径与
+    /// [`FeishuPlatform::minimize_terminal_card`] 兜底的目标；send 时登记。
+    msg_id: Option<String>,
+    /// 最近触碰时刻（seq 分配 / footer 比对 / 消息 id 登记 / 300317 重置均
+    /// 刷新）：[`enforce_card_state_cap`] 按它 LRU 驱逐——活跃流式卡每个节流
+    /// 帧都触碰、天然豁免（替代旧三表「各自整体 clear()」误伤活跃卡）。
+    last_touched: Instant,
+}
+
+impl Default for CardState {
+    fn default() -> Self {
+        Self {
+            seq: 0,
+            footer: None,
+            msg_id: None,
+            last_touched: Instant::now(),
+        }
+    }
+}
+
+/// per-card 状态表粗上限（A2 后唯一 cap 出处）：对齐旧 `card_seqs`/
+/// `card_footers` 的 2048（旧 `managed_card_msgs` 为 1024）——单表一条 =
+/// 一张在册卡，总量不超过旧任一单表的最紧约束。
+const CARD_STATE_CAP: usize = 2048;
+
+/// per-card 状态表粗上限的**唯一执行点**（A2）：超限按 `last_touched` LRU
+/// 驱逐最旧条目，给即将插入的条目腾位。与旧「各自 clear()」的差异：活跃卡
+/// 不再被误伤（seq 丢失 → 300317 → 自愈的链路只在「活跃卡恰好最旧」的罕见
+/// 情况兜底，与旧行为等价且触发面更小）。只在校验写入路径调用：next_card_seq
+/// / patch_footer_if_changed / send_card 登记 / send_card footer 预填。
+fn enforce_card_state_cap(m: &mut HashMap<String, CardState>) {
+    if m.len() < CARD_STATE_CAP {
+        return;
+    }
+    let evict = m.len() + 1 - CARD_STATE_CAP;
+    let mut victims: Vec<(Instant, String)> = m
+        .iter()
+        .map(|(k, st)| (st.last_touched, k.clone()))
+        .collect();
+    victims.sort_unstable();
+    for (_, k) in victims.into_iter().take(evict) {
+        m.remove(&k);
+    }
+    warn!(
+        target: "feishu",
+        evict,
+        "card_states 超粗上限（{CARD_STATE_CAP}），LRU 驱逐最久未活跃卡"
+    );
 }
 
 impl FeishuPlatform {
@@ -245,11 +315,9 @@ impl FeishuPlatform {
             app_id,
             app_secret,
             token,
-            card_seqs: Arc::new(Mutex::new(HashMap::new())),
-            card_footers: Arc::new(Mutex::new(HashMap::new())),
+            card_states: Arc::new(Mutex::new(HashMap::new())),
             conv_states: conv_states.clone(),
             msg_reactions: Arc::new(Mutex::new(HashMap::new())),
-            managed_card_msgs: Arc::new(Mutex::new(HashMap::new())),
             reconnect,
             inbound_rx: Arc::new(Mutex::new(inbound_msg_rx)),
             pending_asks,
@@ -269,16 +337,15 @@ impl FeishuPlatform {
             urgent_on_ask,
             send_budget: Arc::new(Mutex::new(HashMap::new())),
         };
-        // v1.21 outbox 泵：每 10s 拉到期行重发（feishu_text），指数退避
-        // 15s→1h 封顶，成功删行、超 OUTBOX_MAX_ATTEMPTS 放弃并 error 留痕。
+        // v1.21 outbox 泵（Wave C：泵本体上移 core `OutboxDriver`）：每 10s 拉
+        // 到期行重发（kind=feishu_text），指数退避 15s→1h 封顶，成功删行、超
+        // OUTBOX_MAX_ATTEMPTS 放弃并 error 留痕——feishu v1.21 行为逐字保留。
         if let Some(store) = outbox {
             let cfg = platform.core_config.clone();
             let token_lock = platform.token.clone();
             let aid = platform.app_id.clone();
             let sec = platform.app_secret.clone();
-            tokio::spawn(async move {
-                outbox::outbox_pump(store, cfg, token_lock, aid, sec).await;
-            });
+            outbox::spawn_outbox_driver(store, cfg, token_lock, aid, sec);
         }
         Ok(platform)
     }
@@ -366,19 +433,26 @@ impl FeishuPlatform {
     }
 
     /// 取该 card_id 的下一个 sequence（严格递增；element 与 settings PATCH 共用）。
-    /// v1.21 review：终态清理失败路径（Failed/HandleLost 之外的残留）无上限——
-    /// 加与 managed_card_msgs 同款粗上限兜底（clear 后 seq 从 0 重起有 300317
-    /// 自愈兜底，可接受）。
+    /// A2：原 `card_seqs` 并入 [`CardState`] 单表；粗上限由
+    /// [`enforce_card_state_cap`] LRU 驱逐（旧「整体 clear() 把活跃卡 seq 一并
+    /// 清空、全靠 300317 自愈救回」的兜底语义保留，但活跃卡因 last_touched
+    /// 持续刷新天然豁免，触发面收窄到真正的滞留条目）。
     async fn next_card_seq(&self, card_id: &str) -> i64 {
-        const CARD_SEQ_CAP: usize = 2048;
-        let mut m = self.card_seqs.lock().await;
-        if m.len() >= CARD_SEQ_CAP {
-            m.clear();
-            warn!(target: "feishu", "card_seqs 超粗上限（{CARD_SEQ_CAP}），整体清空兜底（seq 经 300317 自愈重置）");
-        }
-        let entry = m.entry(card_id.to_string()).or_insert(0);
-        *entry += 1;
-        *entry
+        let mut m = self.card_states.lock().await;
+        enforce_card_state_cap(&mut m);
+        let st = m.entry(card_id.to_string()).or_default();
+        st.seq += 1;
+        st.last_touched = Instant::now();
+        st.seq
+    }
+
+    /// per-card 状态终态清理的**单一出口**（A2）：整条移除该卡的发送侧状态
+    /// （seq / footer 缓存 / msg_id 映射）。幂等——键不存在时 no-op，多条终态
+    /// 路径重叠（终态 patch 成功 + core 终态重试 + HandleLost 之后的启动扫描
+    /// 收尾）重复调用无害。调用点只在 [`Self::update_card`] 的 outcome 归集处
+    /// （判定见 [`should_release_card_state`]），Running 流式帧不释放。
+    async fn release_card(&self, card_id: &str) {
+        self.card_states.lock().await.remove(card_id);
     }
 
     /// 降级路径：发 raw 卡片消息（content=卡片 JSON），句柄 `msg:<message_id>`。
@@ -412,7 +486,7 @@ impl FeishuPlatform {
     /// 300317 自愈重试共用。
     ///
     /// P8-1：Running 期 footer 按阶段（思考中/调用工具/输出中）patch，经
-    /// `card_footers` 缓存去重——内容不变不发；终态收敛成 完成/出错/已中断。
+    /// [`CardState::footer`] 缓存去重——内容不变不发；终态收敛成 完成/出错/已中断。
     /// P8-2：`stub = true`（终态结果下沉）时终态正文用指针 stub 替代全文——
     /// 全文由调用方以新卡重发在下方。
     /// update_card 阶段 C（v1.18 review 状态机化抽离，行为与原内联块一致）：
@@ -427,11 +501,18 @@ impl FeishuPlatform {
     ) -> PatchOutcome {
         let err_text = original.to_string();
         let minimal = crate::card::render_overflow_terminal_card(done);
-        // 重试目标：msg: 句柄直用；card: 句柄经映射表换消息 id。
+        // 重试目标：msg: 句柄直用；card: 句柄经单表换消息 id。
+        // A2 时序保证：release_card 在 update_card 的 outcome 归集处（即本函数
+        // 返回之后）才执行——最小终态卡兜底拿得到 msg_id 映射。
         let target_mid: Option<String> = match handle.strip_prefix("msg:") {
             Some(m) => Some(m.to_string()),
             None => match handle.strip_prefix("card:") {
-                Some(cid) => self.managed_card_msgs.lock().await.get(cid).cloned(),
+                Some(cid) => self
+                    .card_states
+                    .lock()
+                    .await
+                    .get(cid)
+                    .and_then(|st| st.msg_id.clone()),
                 None => None,
             },
         };
@@ -483,10 +564,15 @@ impl FeishuPlatform {
             if !wants_buried && !matches!(card.terminal, CardTerminal::Running) {
                 // v1.18 review：先 let 绑定再判断——edition 2021 的 if-let
                 // scrutinee 临时值（MutexGuard）存活到整个 if-let 结束，
-                // 此前 managed_card_msgs 锁跨 patch 网络调用（30s 超时 +
-                // 限流重试）长达半分钟，期间其它 conv 的 send_card 登记/
-                // 终态查询全部排队。
-                let mid = self.managed_card_msgs.lock().await.get(card_id).cloned();
+                // 此前映射锁跨 patch 网络调用（30s 超时 + 限流重试）长达
+                // 半分钟，期间其它 conv 的 send_card 登记/终态查询全部排队。
+                // A2：三表并一后锁的守卫面更宽（seq/footer 同锁），纪律不变。
+                let mid = self
+                    .card_states
+                    .lock()
+                    .await
+                    .get(card_id)
+                    .and_then(|st| st.msg_id.clone());
                 if let Some(message_id) = mid {
                     let sender = self.last_sender(&conv.0).await;
                     let card_json = render_card(
@@ -494,14 +580,11 @@ impl FeishuPlatform {
                         &conv.0,
                         (!sender.is_empty()).then_some(sender).as_deref(),
                     );
-                    let res = patch_card(&self.core_config, token, &message_id, &card_json).await;
-                    if res.is_ok() {
-                        // 终态清理（与 patch_managed 终态分支同语义——本分支
-                        // 提前 return 会绕过那边的清理，防 per-card 状态泄漏）。
-                        self.card_seqs.lock().await.remove(card_id);
-                        self.card_footers.lock().await.remove(card_id);
-                    }
-                    return res;
+                    // A2：终态清理不再内联在本分支——统一上移到 update_card
+                    // 的 outcome 归集处（release_card 单一出口），失败路径
+                    // （minimize_terminal_card 还要用 msg_id 映射）不会被提前
+                    // 清理破坏。
+                    return patch_card(&self.core_config, token, &message_id, &card_json).await;
                 }
             }
             match self.patch_managed(token, card_id, card, wants_buried).await {
@@ -522,9 +605,15 @@ impl FeishuPlatform {
                     // CAS（v1.18 review）：原写法直接覆写——并发 300317 同时
                     // 重置会写出相同 seq（两个重试再撞 300317）。只增不降且
                     // +1，并发重置也严格递增（int32 上限 2038 年，见上）。
-                    let mut seqs = self.card_seqs.lock().await;
-                    let v = seqs.entry(card_id.to_string()).or_insert(now);
-                    *v = (*v).max(now).saturating_add(1);
+                    // A2：seq 计数器并入单表（同刷新 last_touched）；锁收进
+                    // 独立作用域——原实现 guard 跨 patch_managed 网络调用
+                    // 存活，单表后守卫面变宽（全平台卡状态），必须先释放。
+                    {
+                        let mut m = self.card_states.lock().await;
+                        let st = m.entry(card_id.to_string()).or_default();
+                        st.seq = st.seq.max(now).saturating_add(1);
+                        st.last_touched = Instant::now();
+                    }
                     self.patch_managed(token, card_id, card, wants_buried).await
                 }
                 other => other,
@@ -654,11 +743,11 @@ impl FeishuPlatform {
                     serde_json::json!({ "config": { "streaming_mode": false } }).to_string();
                 let seq2 = self.next_card_seq(card_id).await;
                 let res = patch_card_settings(token, card_id, &settings, seq2).await;
-                // L1（code-review v8）：终态清理（与 im-patch 终态分支同语义）——
-                // card_seqs/card_footers 每卡 2 条泄漏、无 cap 无过期；清理放在
-                // settings patch 之后（失败也不致命：条目泄漏 ≠ 功能受损）。
-                self.card_seqs.lock().await.remove(card_id);
-                self.card_footers.lock().await.remove(card_id);
+                // A2：终态清理不再内联于此（原 L1：card_seqs/card_footers 两处
+                // remove）——统一上移到 update_card 的 outcome 归集处
+                // （release_card 单一出口）。时序上刻意放在 minimize_terminal_card
+                // 之后：终态失败时最小终态卡兜底还要用 msg_id 映射，此处提前
+                // 整条清除会把它砍断。
                 res?;
                 element
             }
@@ -666,28 +755,27 @@ impl FeishuPlatform {
     }
 
     /// footer 变化才 patch（缓存命中跳过）；失败仅 warn（footer 是点缀，正文/终态
-    /// 才是主流程）。同时管理 `card_footers` 缓存的写入与终态清理。
-    /// v1.21 review：终态清理失败路径的 footer 条目无上限（card_seqs 同款），
-    /// 写入侧加粗上限兜底。
+    /// 才是主流程）。管理 [`CardState::footer`] 缓存的写入与失败回滚。
+    /// A2：原 `card_footers` 并入单表——footer 比较、缓存写入与 seq 分配合并进
+    /// 同一临界区（旧实现是 footer 表与 seq 表两段锁，中间可被各自 cap clear
+    /// 穿插）；粗上限统一走 [`enforce_card_state_cap`]。
     async fn patch_footer_if_changed(&self, token: &str, card_id: &str, footer: &str) {
-        const CARD_FOOTER_CAP: usize = 2048;
-        let changed = {
-            let mut m = self.card_footers.lock().await;
-            if m.len() >= CARD_FOOTER_CAP {
-                m.clear();
-                warn!(target: "feishu", "card_footers 超粗上限（{CARD_FOOTER_CAP}），整体清空兜底");
-            }
-            if m.get(card_id).map(String::as_str) == Some(footer) {
-                false
+        let changed_seq = {
+            let mut m = self.card_states.lock().await;
+            enforce_card_state_cap(&mut m);
+            let st = m.entry(card_id.to_string()).or_default();
+            st.last_touched = Instant::now();
+            if st.footer.as_deref() == Some(footer) {
+                None
             } else {
-                m.insert(card_id.to_string(), footer.to_string());
-                true
+                st.footer = Some(footer.to_string());
+                st.seq += 1;
+                Some(st.seq)
             }
         };
-        if !changed {
+        let Some(seq) = changed_seq else {
             return;
-        }
-        let seq = self.next_card_seq(card_id).await;
+        };
         // P3m（code-review v14）：footer patch **任何失败**都回滚缓存条目——
         // 此前仅限流分支回滚，非限流失败（网络抖动/500 等）会让本窗口内后续
         // 相同 footer 被误判「已上屏」而跳过，内容永久丢失直到 footer 再变化
@@ -699,7 +787,14 @@ impl FeishuPlatform {
             } else {
                 tracing::warn!(target: "feishu", error = %e, "footer patch 失败（不影响主流程，回滚缓存）");
             }
-            self.card_footers.lock().await.remove(card_id);
+            // A2：回滚只清 footer 字段（旧实现整条 remove）——单表里 seq/msg_id
+            // 属于仍然活跃的卡，不能陪葬；置 None 与旧 remove 语义等价（下次
+            // 比较必然不等，不再误判「已上屏」）。
+            let mut m = self.card_states.lock().await;
+            if let Some(st) = m.get_mut(card_id) {
+                st.footer = None;
+                st.last_touched = Instant::now();
+            }
         }
     }
     /// conv 最近一次入站消息的 sender（轮次发起者近似——每 conv 轮次串行，询问
@@ -1033,12 +1128,25 @@ fn thread_window_of(secs: u64) -> Duration {
 enum PatchOutcome {
     /// 主 patch 成功（Running 流式帧 / 终态整卡 im-patch / managed element）。
     Delivered,
-    /// 原卡被删除/撤回——per-card 缓存已清，错误已附 CARD_HANDLE_LOST 哨兵。
+    /// 原卡被删除/撤回——per-card 状态已由 [`FeishuPlatform::release_card`]
+    /// 释放（见 update_card 的统一释放点），错误已附 CARD_HANDLE_LOST 哨兵。
     HandleLost(CoreError),
     /// 终态超限失败但最小终态卡已收敛——上抛加工后的原错误（R1 语义）。
     Minimized(CoreError),
     /// 未触发自愈/自愈无效的失败，原样上抛。
     Failed(CoreError),
+}
+
+/// A2：本次 update_card 结束后是否释放该卡的 per-card 状态（update_card 的
+/// 统一释放点用，纯函数便于矩阵测试）。释放的充要条件：
+/// - **终态**（Done/Error）：四个 outcome 全释放——Delivered 自不必说；
+///   Minimized/Failed 的结论已由最小终态卡或 core P5-11 纯文本兜底收口，
+///   状态留着只是泄漏（旧行为：seq/footer 在 patch_managed 内联清了，msg_id
+///   滞留到 cap）。
+/// - **Running**：仅 HandleLost 释放（卡已物理消失，core 会重发新卡、新卡新
+///   键）；Delivered/Failed 保留（下帧继续用 seq/footer 缓存）。
+fn should_release_card_state(terminal: &CardTerminal, outcome: &PatchOutcome) -> bool {
+    matches!(outcome, PatchOutcome::HandleLost(_)) || !matches!(terminal, CardTerminal::Running)
 }
 
 impl PatchOutcome {
@@ -1153,6 +1261,27 @@ pub(crate) async fn fetch_cached_token(
 
 #[async_trait]
 impl Platform for FeishuPlatform {
+    /// B1 能力声明：飞书全亮（`PlatformCaps::ALL` 全位）。与覆写方法清单对齐，
+    /// 新增覆写须同步——逐族对照：
+    /// - CARDS：supports_streaming_card / send_card / update_card
+    /// - ASK：send_permission_ask(_text) / note_queued_on_ask /
+    ///   cancel(_all)_permission_ask / resolve_permission_ask
+    /// - COMMAND_CARDS：send_command_card
+    /// - FORMS：send_config_form
+    /// - REACTIONS：react_to_message
+    /// - TYPING：send_typing（双 tab 停靠 typing 文本）
+    /// - MEDIA_UPLOAD：send_media（im/v1/files 上传）
+    /// - URGENT_TEXT：send_urgent_text / supports_urgent_text（buzz 字段）
+    /// - RECONNECT：reconnect（WS 断开重连）
+    /// - GROUP_CHATS：require_mention_in_group / set_… / list_joined_chats
+    /// （doctor_probes / note_round_initiator 为协作钩子，无能力位。）
+    /// 一致性测试 `feishu_caps_match_overrides` 钉住本值。
+    fn capabilities(&self) -> PlatformCaps {
+        PlatformCaps::ALL
+            .iter()
+            .fold(PlatformCaps::empty(), |acc, (c, _, _)| acc | *c)
+    }
+
     /// bot 对用户消息的表情标注：OnIt（在做了）→ DONE / CrossMark。
     /// emoji key 真机校准（2026-08）验证可用且**大小写敏感**（全大写报 231001）。
     /// 翻转 = 删旧表情 + 打新表情；删失败（过期/已撤回）仅 log，新表情照打。
@@ -2119,13 +2248,15 @@ impl Platform for FeishuPlatform {
                             {
                                 Ok(mid) => {
                                     if let Some(m) = mid {
-                                        let mut mm = self.managed_card_msgs.lock().await;
-                                        if mm.len() > 1024 {
-                                            // 粗上限（超量整体重置，同 thread_active
-                                            // 惯例）：清后旧卡终态退回内联形态（可接受）。
-                                            mm.clear();
-                                        }
-                                        mm.insert(card_id.clone(), m);
+                                        // A2：原 managed_card_msgs 登记并入单表
+                                        //（粗上限统一走 enforce_card_state_cap 的
+                                        // LRU 驱逐——旧「超量整体重置」会把活跃卡
+                                        // 的映射一起清掉，终态退回内联形态）。
+                                        let mut mm = self.card_states.lock().await;
+                                        enforce_card_state_cap(&mut mm);
+                                        let st = mm.entry(card_id.clone()).or_default();
+                                        st.msg_id = Some(m);
+                                        st.last_touched = Instant::now();
                                     }
                                     Ok(Some(format!("card:{card_id}")))
                                 }
@@ -2162,14 +2293,15 @@ impl Platform for FeishuPlatform {
             })
             .await;
         // 初始 footer 预填缓存（footer 预填批次）：初始模板的 md_footer 就是
-        // 「🧠 思考中…」——预填 card_footers 后首次 Running patch 若 footer 仍是
-        // 思考中（未带秒数/排队）会被去重跳过，不再重复 patch 同内容。
+        // 「🧠 思考中…」——预填后首次 Running patch 若 footer 仍是思考中（未带
+        // 秒数/排队）会被去重跳过，不再重复 patch 同内容。A2：并入单表。
         if let Ok(Some(handle)) = &res {
             if let Some(card_id) = handle.strip_prefix("card:") {
-                self.card_footers
-                    .lock()
-                    .await
-                    .insert(card_id.to_string(), "🧠 思考中…".to_string());
+                let mut m = self.card_states.lock().await;
+                enforce_card_state_cap(&mut m);
+                let st = m.entry(card_id.to_string()).or_default();
+                st.footer = Some("🧠 思考中…".to_string());
+                st.last_touched = Instant::now();
             }
         }
         res
@@ -2205,19 +2337,15 @@ impl Platform for FeishuPlatform {
             .await;
         // 阶段 B/C（v1.18 review 状态机化）：失败路径的两层自愈收敛为显式
         // PatchOutcome。B（安全批次，原注释）：原卡片被用户删除/撤回后 patch
-        // 永远失败——清 per-card 缓存（序列号/footer），错误附 CARD_HANDLE_LOST
-        // 哨兵（core CardSession 据此摘 live_cards 并置空句柄，Running 期下帧
-        // 重发新卡，启动扫描据此作废登记）。C：终态失败的最小卡收敛（见
-        // minimize_terminal_card）。Running 失败不触发 C（流式帧失败由下帧/
-        // 看门狗兜底——原守卫的语义保留在 match arm 条件里）。
+        // 永远失败——per-card 状态经统一释放点清除（见下方 A2 注释），错误附
+        // CARD_HANDLE_LOST 哨兵（core CardSession 据此摘 live_cards 并置空句柄，
+        // Running 期下帧重发新卡，启动扫描据此作废登记）。C：终态失败的最小卡
+        // 收敛（见 minimize_terminal_card）。Running 失败不触发 C（流式帧失败由
+        // 下帧/看门狗兜底——原守卫的语义保留在 match arm 条件里）。
         let outcome = match res {
             Ok(()) => PatchOutcome::Delivered,
             Err(e) if is_card_not_exist_err(&e) => {
                 warn!(target: "feishu", handle, "卡片不存在/已删除，清缓存并上报句柄丢失");
-                if let Some(card_id) = handle.strip_prefix("card:") {
-                    self.card_seqs.lock().await.remove(card_id);
-                    self.card_footers.lock().await.remove(card_id);
-                }
                 PatchOutcome::HandleLost(CoreError::Platform(
                     PLATFORM,
                     format!("{e}（{CARD_HANDLE_LOST}）"),
@@ -2232,6 +2360,17 @@ impl Platform for FeishuPlatform {
             }
             Err(e) => PatchOutcome::Failed(e),
         };
+        // A2（终态清理单一出口）：card: 句柄的 per-card 状态在 outcome 归集后
+        // 统一释放。收敛自旧实现分散在三处的手工 remove（im-patch 快路径成功、
+        // patch_managed 终态、HandleLost），并补上旧路径漏掉的 Minimized/Failed
+        // 终态（此前 msg_id 映射要滞留到 cap 清空）。放在 minimize_terminal_card
+        // 之后是刻意时序：终态失败的兜底重试要用 msg_id 映射。判定见
+        // [`should_release_card_state`]——Running 流式帧不释放（状态仍活跃）。
+        if let Some(card_id) = handle.strip_prefix("card:") {
+            if should_release_card_state(&card.terminal, &outcome) {
+                self.release_card(card_id).await;
+            }
+        }
         // 阶段 D：结果下沉重发——流式卡已收敛成指针 → 完整结果另发新卡（Wave
         // B-5：带发起者标注行）。仅 Delivered 走此步；重发失败上抛 Err（core 的
         // P5-11 兜底纯文本补发全文，结论不能因重发失败而丢）。
@@ -2285,6 +2424,44 @@ mod tests {
     fn unused_import_guard() {
         // 保持导入被使用，防止编译告警。
         let _ = ConvId("x".into());
+    }
+
+    /// B1：caps 声明与覆写清单一致性——飞书全亮。`capabilities()` 覆写处的
+    /// 逐族对照注释即静态清单；本测试钉住声明值，新增覆写忘加位在此红。
+    /// URGENT_TEXT 位与 supports_urgent_text 同源核对。占位凭据（同
+    /// require_mention 测试），capabilities() 为纯同步声明不触网。
+    #[tokio::test]
+    async fn feishu_caps_match_overrides() {
+        let p = FeishuPlatform::new(
+            "cli_test".into(),
+            "secret_test".into(),
+            "https://open.feishu.cn".into(),
+            true,
+            None,
+            300,
+            None,
+            1800,
+            true,
+            None,
+            0.0,
+            false,
+            0,
+        )
+        .expect("构造");
+        let caps = p.capabilities();
+        let full = PlatformCaps::ALL
+            .iter()
+            .fold(PlatformCaps::empty(), |acc, (c, _, _)| acc | *c);
+        assert_eq!(
+            caps, full,
+            "飞书应声明全部能力位（capabilities 注释逐族对照）"
+        );
+        // URGENT_TEXT ↔ supports_urgent_text 同步（core 完费提醒消费 caps 位）。
+        assert_eq!(
+            caps.contains(PlatformCaps::URGENT_TEXT),
+            p.supports_urgent_text()
+        );
+        assert!(p.supports_urgent_text());
     }
 
     /// P6 遗留补齐：require_mention 热切换——共享句柄 get/set 往返（drain task
@@ -2645,5 +2822,282 @@ mod tests {
         let h = hits.lock().unwrap();
         assert_eq!(h.replies, 3, "3 片各一次 reply");
         assert_eq!(h.creates, 0, "锚点健康不落 create");
+    }
+
+    // ------------------------------------------------------------------
+    // A2（历史债务批）：per-card 状态单表（CardState）——终态释放收敛 +
+    // cap 单一出处 + 「释放后确实清空 / 多终态路径不双重不漏」矩阵。
+    // ------------------------------------------------------------------
+
+    /// 手工登记一张「已发送且流式中」的卡（等价 send_card managed 成功 +
+    /// 若干 Running patch）——离线构造，不打 cardkit 真域名。
+    async fn seeded_card(p: &FeishuPlatform, card_id: &str, msg_id: &str) {
+        p.card_states.lock().await.insert(
+            card_id.to_string(),
+            CardState {
+                seq: 5,
+                footer: Some("🧠 思考中…".to_string()),
+                msg_id: Some(msg_id.to_string()),
+                last_touched: Instant::now(),
+            },
+        );
+    }
+
+    fn done_card(text: &str) -> OutboundCard {
+        OutboundCard {
+            task_digest: None,
+            text: text.into(),
+            tool_calls: vec![],
+            phase: imagent_core::CardPhase::Outputting,
+            thoughts: vec![],
+            todos: vec![],
+            queued_hint: None,
+            run_secs: 1,
+            usage_display: None,
+            terminal: CardTerminal::Done,
+        }
+    }
+
+    /// 终态释放后状态**确实清空**（seq / footer / msg_id 三字段整条走），
+    /// 且 release_card 幂等——多条终态路径重叠（终态成功后 core 终态重试、
+    /// HandleLost 后启动扫描收尾）重复调用不炸、不残留。
+    #[tokio::test]
+    async fn release_card_clears_all_state_and_is_idempotent() {
+        let p = mk_platform_with_mock("http://127.0.0.1:9").await;
+        seeded_card(&p, "ck_a", "om_1").await;
+        p.card_states.lock().await.insert(
+            "ck_other".into(),
+            CardState {
+                ..Default::default()
+            },
+        );
+        p.release_card("ck_a").await;
+        assert!(
+            p.card_states.lock().await.get("ck_a").is_none(),
+            "终态释放后该卡条目必须整条清空"
+        );
+        // 双重释放：同键再调 + 从未登记的键，均为 no-op。
+        p.release_card("ck_a").await;
+        p.release_card("ck_never").await;
+        let m = p.card_states.lock().await;
+        assert!(m.get("ck_a").is_none(), "双重释放不复活条目");
+        assert!(m.contains_key("ck_other"), "释放精确到键，不殃及他卡");
+        assert_eq!(m.len(), 1);
+    }
+
+    /// seq 分配严格递增且落在单表条目上（msg_id/footer 不受影响）。
+    #[tokio::test]
+    async fn next_card_seq_strictly_increases_in_single_table() {
+        let p = mk_platform_with_mock("http://127.0.0.1:9").await;
+        assert_eq!(p.next_card_seq("ck_x").await, 1);
+        assert_eq!(p.next_card_seq("ck_x").await, 2);
+        {
+            let m = p.card_states.lock().await;
+            let st = m.get("ck_x").expect("seq 分配即登记");
+            assert_eq!(st.seq, 2);
+            assert_eq!(st.msg_id, None, "懒分配不伪造 msg_id");
+            assert_eq!(st.footer, None, "懒分配不伪造 footer");
+        }
+        // 另一卡独立计数（互不串号）。
+        assert_eq!(p.next_card_seq("ck_y").await, 1);
+    }
+
+    /// 「多条终态路径不会漏释放」的判定矩阵（should_release_card_state）：
+    /// 终态四结局全释放（含旧实现漏掉的 Minimized/Failed）；Running 仅
+    /// HandleLost 释放、Delivered/Failed 保留（流式继续用 seq/footer）。
+    #[test]
+    fn should_release_card_state_matrix() {
+        let err = || CoreError::Platform(PLATFORM, "x".into());
+        let running = CardTerminal::Running;
+        let done = CardTerminal::Done;
+        let error = CardTerminal::Error("boom".into());
+        for terminal in [&done, &error] {
+            assert!(
+                should_release_card_state(terminal, &PatchOutcome::Delivered),
+                "终态 Delivered 释放"
+            );
+            assert!(
+                should_release_card_state(terminal, &PatchOutcome::Minimized(err())),
+                "终态 Minimized 释放（旧实现漏）"
+            );
+            assert!(
+                should_release_card_state(terminal, &PatchOutcome::Failed(err())),
+                "终态 Failed 释放（旧实现漏 msg_id）"
+            );
+            assert!(
+                should_release_card_state(terminal, &PatchOutcome::HandleLost(err())),
+                "终态 HandleLost 释放"
+            );
+        }
+        assert!(
+            !should_release_card_state(&running, &PatchOutcome::Delivered),
+            "Running 流式帧不释放"
+        );
+        assert!(
+            !should_release_card_state(&running, &PatchOutcome::Failed(err())),
+            "Running 失败保留（下帧重试）"
+        );
+        assert!(
+            should_release_card_state(&running, &PatchOutcome::HandleLost(err())),
+            "Running HandleLost 释放（卡已物理消失，core 重发新卡）"
+        );
+    }
+
+    /// 集成（mock 回环，真实 update_card 链路）：终态 + msg_id 映射在册 →
+    /// im-patch 快路径成功 → Delivered → release_card 清空单表条目。
+    #[tokio::test]
+    async fn terminal_im_patch_fast_path_releases_card_state() {
+        let base = spawn_mock_feishu(Arc::new(|_path: &str| {
+            // open-lark SDK 的成功响应要求 data 字段（缺则「成功响应缺少必需的
+            // data 字段」校验失败）。
+            (
+                200u16,
+                r#"{"code":0,"msg":"success","data":{}}"#.to_string(),
+            )
+        }))
+        .await;
+        let p = mk_platform_with_mock(&base).await;
+        seeded_card(&p, "ck_term", "om_card").await;
+        p.update_card(
+            &ConvId("feishu:ou_u".into()),
+            "card:ck_term",
+            &done_card("结论"),
+            &ReplyHint::None,
+        )
+        .await
+        .expect("终态整卡 im-patch 应成功（mock 放行）");
+        assert!(
+            p.card_states.lock().await.get("ck_term").is_none(),
+            "终态 Delivered 后 per-card 状态必须释放"
+        );
+        // msg: 句柄不涉及单表（整卡直打消息 id）——释放点不误伤。
+    }
+
+    /// 集成（mock 回环）：终态 patch 失败 → minimize_terminal_card 仍能从单表
+    /// 拿到 msg_id 映射（释放刻意推迟到兜底之后）→ 最小终态卡收敛成功 →
+    /// Minimized 结局同样释放。
+    #[tokio::test]
+    async fn minimized_terminal_releases_after_fallback_keeps_mapping_usable() {
+        let im_patches = Arc::new(std::sync::Mutex::new(0u32));
+        let n = im_patches.clone();
+        let base = spawn_mock_feishu(Arc::new(move |path: &str| {
+            // 只按目标消息的 im PATCH 计数——后台 WS 重连的 GET 也会打到共享
+            // mock，全量计数会串扰（既有测试同款滤除，见评论回复路径测试）。
+            if !path.contains("/open-apis/im/v1/messages/om_card") {
+                return (
+                    200u16,
+                    r#"{"code":0,"msg":"success","data":{}}"#.to_string(),
+                );
+            }
+            let mut c = n.lock().unwrap();
+            *c += 1;
+            // 第 1 次：终态整卡 patch 失败（230099 超限，非 not-exist）；
+            // 第 2 次：最小终态卡兜底成功（SDK 成功响应需带 data 字段）。
+            if *c == 1 {
+                (
+                    200u16,
+                    r#"{"code":230099,"msg":"card size limit"}"#.to_string(),
+                )
+            } else {
+                (
+                    200u16,
+                    r#"{"code":0,"msg":"success","data":{}}"#.to_string(),
+                )
+            }
+        }))
+        .await;
+        let p = mk_platform_with_mock(&base).await;
+        seeded_card(&p, "ck_min", "om_card").await;
+        let res = p
+            .update_card(
+                &ConvId("feishu:ou_u".into()),
+                "card:ck_min",
+                &done_card("结论"),
+                &ReplyHint::None,
+            )
+            .await;
+        let err = res.expect_err("最小终态卡收敛后仍上抛加工原错误（R1 语义）");
+        assert!(
+            err.to_string().contains("终态卡已收敛为最小形态"),
+            "Minimized 形态: {err}"
+        );
+        assert!(
+            p.card_states.lock().await.get("ck_min").is_none(),
+            "Minimized 终态后 per-card 状态必须释放"
+        );
+    }
+
+    /// cap 单一出处（enforce_card_state_cap）：超限 LRU 驱逐**最旧**条目、
+    /// 活跃卡（last_touched 新）保留——替代旧「各自整体 clear() 把活跃卡 seq
+    /// 一起丢」的兜底。拨定确定性时刻（Instant 回退构造），不依赖时钟分辨率。
+    #[tokio::test]
+    async fn card_state_cap_evicts_oldest_keeps_active() {
+        let p = mk_platform_with_mock("http://127.0.0.1:9").await;
+        let base = Instant::now();
+        {
+            let mut m = p.card_states.lock().await;
+            // 预插到恰好上限（stale CAP-1 条 + 活跃 1 条）：下一次写入触发
+            // 驱逐 1 条（腾位给新条目）。
+            for i in 0..CARD_STATE_CAP - 1 {
+                m.insert(
+                    format!("ck_stale_{i:04}"),
+                    CardState {
+                        seq: 1,
+                        footer: None,
+                        msg_id: Some(format!("om_{i}")),
+                        // i 越小越旧：ck_stale_0000 是全场最旧。
+                        last_touched: base - Duration::from_secs((CARD_STATE_CAP - i) as u64),
+                    },
+                );
+            }
+            // 活跃卡：比所有 stale 条目都新。
+            m.insert(
+                "ck_active".into(),
+                CardState {
+                    seq: 42,
+                    footer: Some("🧰 正在调用工具…".into()),
+                    msg_id: Some("om_active".into()),
+                    last_touched: base,
+                },
+            );
+        }
+        // 触发写入侧 cap：next_card_seq 分配新卡。
+        let seq = p.next_card_seq("ck_new").await;
+        assert_eq!(seq, 1, "新卡 seq 从 1 起");
+        {
+            let m = p.card_states.lock().await;
+            assert!(!m.contains_key("ck_stale_0000"), "最旧条目被 LRU 驱逐");
+            assert!(
+                m.contains_key("ck_stale_0001"),
+                "次旧条目仍在（只驱逐腾位所需的 1 条）"
+            );
+            assert!(
+                m.contains_key("ck_active"),
+                "活跃卡（last_touched 最新）不被 cap 误伤——旧 clear() 会把它一起清掉"
+            );
+            assert!(m.contains_key("ck_new"), "新条目在驱逐后成功登记");
+            assert_eq!(m.len(), CARD_STATE_CAP, "总量回到上限内");
+        }
+        // 再触发一次：驱逐下一条最旧（ck_stale_0001）。
+        p.next_card_seq("ck_new2").await;
+        let m = p.card_states.lock().await;
+        assert!(!m.contains_key("ck_stale_0001"), "第二轮驱逐次旧");
+        assert_eq!(m.len(), CARD_STATE_CAP);
+    }
+
+    /// footer 缓存去重：内容不变不分配 seq、不发 patch（离线断言——缓存命中
+    /// 路径在 any 网络调用之前返回）。
+    #[tokio::test]
+    async fn footer_cache_hit_skips_patch_and_seq_allocation() {
+        let p = mk_platform_with_mock("http://127.0.0.1:9").await;
+        seeded_card(&p, "ck_f", "om_f").await;
+        // 与预填一致的 footer（"🧠 思考中…"）：缓存命中，seq 保持 5。
+        p.patch_footer_if_changed("t_mock", "ck_f", "🧠 思考中…")
+            .await;
+        assert_eq!(
+            p.card_states.lock().await.get("ck_f").unwrap().seq,
+            5,
+            "缓存命中不分配 seq"
+        );
     }
 }

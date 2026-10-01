@@ -12,7 +12,8 @@
 //!   双 task（WS 收事件 + drain 解析入队），recv / send_text。T19 拆分为子模块：
 //!   `platform/drain.rs`（WS 事件 drain 循环——单次 Value 解析 + event_type 精确
 //!   分派）、`platform/ask.rs`（ask/审批卡生命周期）、`platform/outbox.rs`
-//!   （发送侧 outbox 泵）、`platform/state.rs`（per-conv 状态 + 媒体落盘 +
+//!   （发送侧 outbox：payload 契约 + core OutboxDriver 接线，Wave C 泵本体
+//!   上移 core）、`platform/state.rs`（per-conv 状态 + 媒体落盘 +
 //!   housekeeping）。
 //! - [`bitable`]：[`FeishuBitable`]（T12 数据面）——core `BitableApi` 的飞书
 //!   实现（list_fields / append_row，HTTP 走 client 的 429 退避）。
@@ -32,3 +33,6 @@ pub mod proto;
 
 pub use bitable::FeishuBitable;
 pub use platform::FeishuPlatform;
+/// feishu 在 store outbox 表的 kind（Wave C 出站可靠性收敛）：store 行写入方
+/// 与 main 装配未知 kind sweeper 的 known 名单同源此常量，防拼写漂移。
+pub use platform::OUTBOX_KIND;

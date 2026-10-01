@@ -1657,6 +1657,7 @@ dependencies = [
  "async-trait",
  "futures",
  "imagent-core",
+ "imagent-store",
  "rand 0.9.4",
  "serde",
  "serde_json",

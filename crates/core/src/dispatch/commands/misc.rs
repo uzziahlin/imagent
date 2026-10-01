@@ -234,6 +234,45 @@ pub(crate) fn doctor_capability_lines(
     out
 }
 
+/// B1：/doctor 平台能力面——`PlatformCaps` 逐项 ✅/❌（表驱动自
+/// [`PlatformCaps::ALL`]，新增能力位自动可见）+ 已知「配置预期 × 平台能力」
+/// 错配提示。纯函数（caps 与 reply_mode 均为运行时可查快照），
+/// `dispatch::tests` 直测矩阵。
+///
+/// 错配 ①：`reply_mode = card` × 非 CARDS 平台——config 层无此校验（reply_mode
+/// 是全局配置、平台在运行期才确定），doctor 兜底提示（实际行为：round 侧
+/// supports_streaming_card 已自动按纯文本回复，只是配置意图未兑现）。
+pub(crate) fn doctor_platform_caps_lines(caps: PlatformCaps, reply_mode: ReplyMode) -> Vec<String> {
+    let mut out = vec![format!(
+        "🔌 平台能力（{}/{} 项）：",
+        caps.count(),
+        PlatformCaps::ALL.len()
+    )];
+    for (cap, _, label) in PlatformCaps::ALL {
+        out.push(format!(
+            "{} {label}（{}）",
+            if caps.contains(*cap) { "✅" } else { "❌" },
+            cap_summary_name(cap)
+        ));
+    }
+    if reply_mode == ReplyMode::Card && !caps.contains(PlatformCaps::CARDS) {
+        out.push(
+            "⚠️ reply_mode = card，但当前平台不支持流式卡片——实际已按纯文本回复（可用 /config reply_mode text 显式对齐）"
+                .to_string(),
+        );
+    }
+    out
+}
+
+/// 能力位的日志短名（`ALL` 三元组第二列；独立小函数避免调用点解构噪音）。
+fn cap_summary_name(cap: &PlatformCaps) -> &'static str {
+    PlatformCaps::ALL
+        .iter()
+        .find(|(c, _, _)| c == cap)
+        .map(|(_, short, _)| *short)
+        .unwrap_or("unknown")
+}
+
 /// 检查 ⑤：护栏水位。`max_concurrent_rounds = 0`（不限制）= ⚠️（多群/cron/
 /// webhook 齐点时在飞轮数无界——内存与 API 配额同炸）；auto-compact 生效阈值
 /// 0（比例/绝对双档全关）= ℹ️ 信息行（v1.27 起默认关闭，非风险项）。
@@ -490,6 +529,11 @@ impl Dispatcher {
             } else {
                 "纯文本"
             }
+        ));
+        // B1：平台能力面——caps 逐项 + 配置×能力错配（reply_mode 为当前热改值）。
+        lines.extend(doctor_platform_caps_lines(
+            self.platform.capabilities(),
+            *self.reply_mode.read(),
         ));
         // T8（v13 安全批）：追加「🛡️ 安全」分组——把「只有读了 SECURITY.md
         // 才知道」的部署风险（凭据明文/入口暴露/共享工作区/权限×能力错配/

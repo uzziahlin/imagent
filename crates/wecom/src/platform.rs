@@ -5,7 +5,11 @@
 //!   [`crate::proto::parse_msg_callback`] 解析为 [`InboundMessage`] 返回。
 //! - `send_text()`：`userid_from_conv` 还原 userid → 超限分片（见
 //!   [`WECOM_TEXT_MAX_BYTES`]）逐片 `build_send_markdown_frame` → 出站 channel。
-//!   hint 忽略（WeCom 仅靠 conv_id 解析 userid）。
+//!   hint 忽略（WeCom 仅靠 conv_id 解析 userid）。Wave C（出站可靠性收敛）：
+//!   「明确未送达」的失败（出站 channel 关闭 = client 已退出）转入 store
+//!   outbox（kind=`wecom_text`）由 core `OutboxDriver` 退避重发——断连/重启
+//!   不再丢回复；「可能已送达」的超时失败不入队（协议无幂等键，盲重发有重复
+//!   风险），保持 P2-1 的即时报错语义。取舍详见 [`SendFail`]。
 //! - `send_media()`：**不支持**（需 upload_media 三步，留后）——显式返回 Err，
 //!   core 命令层会把失败文案回给用户，不再谎报成功。
 //! - `send_typing()`：no-op（WeCom 协议无 typing 语义）。
@@ -16,16 +20,21 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
+use imagent_core::outbox::{OutboxDeliver, OutboxDriver};
 use imagent_core::{
-    ConvId, CoreError, Dedup, InboundMessage, MediaRef, Platform, ReplyHint, Result,
+    ConvId, CoreError, Dedup, InboundMessage, MediaRef, Platform, PlatformCaps, ReplyHint, Result,
 };
 
 use crate::client::{InboundFrame, OutboundFrame, WeComWsClient};
 use crate::proto::{build_send_markdown_frame, parse_msg_callback, userid_from_conv};
 
 const PLATFORM: &str = "wecom";
+
+/// wecom 在 store outbox 表的 kind（Wave C 出站可靠性收敛）：store 行写入方
+/// 与 main 装配未知 kind sweeper 的 known 名单同源此常量，防拼写漂移。
+pub const OUTBOX_KIND: &str = "wecom_text";
 
 /// 出站 markdown 文本的单片字节上限。
 ///
@@ -64,6 +73,112 @@ fn split_text_by_bytes(text: &str, max_bytes: usize) -> Vec<String> {
 /// H3（code-review v8）：分片下界（见 [`wecom_split_cap`]）。
 const WECOM_MIN_SPLIT_BYTES: usize = 4;
 
+// ---------------------------------------------------------------------------
+// Wave C（出站可靠性收敛）：outbox 落盘/回放
+// ---------------------------------------------------------------------------
+
+/// outbox 落盘 payload 构造：`{conv, chunks}`——`chunks` 为**已编号**的剩余
+/// 分片（`(i/n)` 后缀在 live 发送时已拼好，回放按原样逐片发，编号与用户已
+/// 收到的前缀连续；重新切分会算出新编号，反而与已送达前缀错位）。
+///
+/// 注意与 feishu 的差异：**不含幂等 uuid**——企微 aibot_send_msg 无幂等键
+/// （见 [`SendFail`] 文档），存一个协议不认的键只会误导排障。防重复靠入队
+/// 口径收敛（只对明确未送达的 [`SendFail::Closed`] 入队）。
+fn outbox_payload(conv: &str, chunks: &[String]) -> String {
+    serde_json::json!({ "conv": conv, "chunks": chunks }).to_string()
+}
+
+/// payload 往返解析（纯函数，便于单测）——`(conv, chunks)`。缺字段 / 非
+/// JSON / 空 chunks 均回 None（调用方按放弃处理）。
+fn parse_outbox_payload(payload: &str) -> Option<(String, Vec<String>)> {
+    let v: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let conv = v.get("conv").and_then(|c| c.as_str())?.to_string();
+    let chunks = v
+        .get("chunks")?
+        .as_array()?
+        .iter()
+        .map(|c| c.as_str().map(String::from))
+        .collect::<Option<Vec<_>>>()?;
+    if chunks.is_empty() {
+        return None;
+    }
+    Some((conv, chunks))
+}
+
+/// outbox 交付闭包：逐片重发（编号沿用落盘时的 `(i/n)`，见 [`outbox_payload`]）。
+/// 与平台共享出站 channel——client 恢复消费后帧即送达；channel 仍关闭则失败
+/// 退避（重启后由新平台的 driver 排空积压）。独立成函数便于单测「恢复后
+/// 送达」（构造活 channel 直接调闭包）。
+fn outbox_deliver(outbound_tx: mpsc::Sender<OutboundFrame>) -> OutboxDeliver {
+    Arc::new(move |row| {
+        let tx = outbound_tx.clone();
+        Box::pin(async move {
+            let Some((conv, chunks)) = parse_outbox_payload(&row.payload) else {
+                // 与 feishu 同语义：解析失败按放弃处理（重试也不会成功）——
+                // error 留痕、返回 Ok 让 driver 删行。
+                error!(target: "wecom", id = row.id, "outbox 行解析失败，放弃");
+                return Ok(());
+            };
+            let total = chunks.len();
+            let userid = userid_from_conv(&ConvId(conv));
+            for (i, content) in chunks.iter().enumerate() {
+                let frame = build_send_markdown_frame(&userid, content);
+                if let Err(f) = send_frame_bounded_for(&tx, frame, OUTBOX_DELIVER_TIMEOUT).await {
+                    return Err(f.error(i, total));
+                }
+            }
+            Ok(())
+        })
+    })
+}
+
+/// [`WeComPlatform::send_text`] 的逐片发送循环（独立成函数便于单测失败分流）。
+///
+/// 失败分流（Wave C，取舍详见 [`SendFail`]）：
+/// - 超时（可能已送达 + 协议无幂等键）→ 即时报错，不入 outbox（防重复）；
+/// - channel 关闭（明确未送达）→ 剩余片（含本片）入 outbox 由 driver 重发，
+///   报 Ok（重试语义接管交付）；未接 store 或落盘失败 → 回退 P2-1 即时报错。
+async fn send_text_frames(
+    outbound_tx: &mpsc::Sender<OutboundFrame>,
+    outbox: Option<&imagent_store::Store>,
+    conv: &ConvId,
+    contents: &[String],
+) -> Result<()> {
+    let userid = userid_from_conv(conv);
+    let total = contents.len();
+    for (i, content) in contents.iter().enumerate() {
+        let frame = build_send_markdown_frame(&userid, content);
+        // P5：中途失败标明分片序号——用户能感知回复被截断而非静默缺尾。
+        // P2-1（code-review v14）：失败即中断——后续片不再发（5s 有界等待，
+        // channel 满且 client 停滞时不再无限挂起 dispatch）。
+        match send_frame_bounded_for(outbound_tx, frame, OUTBOUND_SEND_TIMEOUT).await {
+            Ok(()) => {}
+            Err(SendFail::Timeout) => {
+                return Err(SendFail::Timeout.error(i, total));
+            }
+            Err(SendFail::Closed) => {
+                if let Some(store) = outbox {
+                    let payload = outbox_payload(&conv.0, &contents[i..]);
+                    if let Err(e) = store.enqueue_outbox(&conv.0, OUTBOX_KIND, &payload).await {
+                        warn!(
+                            target: "wecom", error = %e, conv_id = %conv.0,
+                            "outbox 落盘失败（回复丢失，回退即时报错）"
+                        );
+                        return Err(SendFail::Closed.error(i, total));
+                    }
+                    debug!(
+                        target: "wecom", conv_id = %conv.0, chunks_left = total - i,
+                        "发送通道已关闭，剩余回复转入 outbox（恢复后送达）"
+                    );
+                    return Ok(());
+                }
+                return Err(SendFail::Closed.error(i, total));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 出站分片字节上限：`min(config.message_max_len, WECOM_TEXT_MAX_BYTES)`
 /// （config 未设 = 仅协议上限）。纯函数便于单测；跨单位（config 按字符、企微
 /// 按字节）取 min 偏保守——多切不少切，配置上限不会被平台放大。
@@ -83,36 +198,66 @@ fn wecom_split_cap(message_max_len: Option<usize>) -> usize {
 /// 抛用户可见错误，对齐 ilink sendmessage「失败即报」的语义。
 const OUTBOUND_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// 单片出站发送：有界等待 + 统一错误文案（报出分片序号）。
+/// Wave C（出站可靠性收敛）：outbox 交付路径的等待上限。live 路径 5s 是为了
+/// 不挂死 dispatch；后台泵没有这个约束，给足余量让「channel 短暂满、恢复后
+/// 排空」的场景一次等待就成功（60s 内 client 未恢复则退避再试，语义等价但
+/// 少烧一次 attempts）。
+const OUTBOX_DELIVER_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// P2-1 失败的两种形态（Wave C 起是 outbox 入队与否的分流依据）：
+/// - [`SendFail::Closed`]：出站 channel 已关闭（client run task 退出）——帧
+///   **确定未入队、确定未送达**，重发无重复风险 → 转入 outbox 退避重发；
+/// - [`SendFail::Timeout`]：有界等待超时（channel 满、client 停滞）——取消
+///   `send` future 时存在 permit 刚好取得的小竞窗（帧可能已入队并随恢复送
+///   达）。**企微 aibot_send_msg 无幂等键**（req_id 只是关联号，服务端不去
+///   重；与 feishu 的幂等 uuid 不同），对这类「可能已送达」的失败入 outbox
+///   重试可能让用户收到两条——故保持 P2-1 即时报错语义，取舍为「可能丢一条
+///   但绝不重复」，与 feishu「有幂等键、任何失败都可安全重试」互补。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendFail {
+    Closed,
+    Timeout,
+}
+
+impl SendFail {
+    /// 用户可见错误文案（P2-1 原文逐字保留；报出分片序号）。超时文案用
+    /// 「可能未送达」而非「未送达」——permit 竞窗内帧可能已入队。
+    fn error(self, idx: usize, total: usize) -> CoreError {
+        match self {
+            SendFail::Closed => CoreError::Platform(
+                PLATFORM,
+                format!(
+                    "第 {}/{} 片发送失败（回复可能被截断）：出站 channel 已关闭（client 已退出）",
+                    idx + 1,
+                    total
+                ),
+            ),
+            SendFail::Timeout => CoreError::Platform(
+                PLATFORM,
+                format!(
+                    "第 {}/{} 片发送超时（WS 断连或认证失败），本片可能未送达（回复可能被截断）",
+                    idx + 1,
+                    total
+                ),
+            ),
+        }
+    }
+}
+
+/// 单片出站发送：有界等待 + 失败形态分类（文案由 [`SendFail::error`] 统一）。
 ///
-/// P2-1（code-review v14）：超时/关闭都转为用户可见的 `Err`。取消 `send`
-/// future 时存在 permit 刚好取得的小竞窗（帧可能已入队），故超时文案用
-/// 「可能未送达」而非「未送达」。多片循环里任一片失败即由调用方 `?` 中断
-/// 返回——前面片已缺时继续发后续片只会让截断更难被用户感知。
-async fn send_frame_bounded(
+/// P2-1（code-review v14）：超时/关闭都转为调用方可区分的失败。多片循环里
+/// 任一片失败即由调用方处理——前面片已缺时继续发后续片只会让截断更难被
+/// 用户感知。
+async fn send_frame_bounded_for(
     tx: &mpsc::Sender<OutboundFrame>,
     frame: OutboundFrame,
-    idx: usize,
-    total: usize,
-) -> Result<()> {
-    match tokio::time::timeout(OUTBOUND_SEND_TIMEOUT, tx.send(frame)).await {
+    timeout: Duration,
+) -> std::result::Result<(), SendFail> {
+    match tokio::time::timeout(timeout, tx.send(frame)).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(_)) => Err(CoreError::Platform(
-            PLATFORM,
-            format!(
-                "第 {}/{} 片发送失败（回复可能被截断）：出站 channel 已关闭（client 已退出）",
-                idx + 1,
-                total
-            ),
-        )),
-        Err(_) => Err(CoreError::Platform(
-            PLATFORM,
-            format!(
-                "第 {}/{} 片发送超时（WS 断连或认证失败），本片可能未送达（回复可能被截断）",
-                idx + 1,
-                total
-            ),
-        )),
+        Ok(Err(_)) => Err(SendFail::Closed),
+        Err(_) => Err(SendFail::Timeout),
     }
 }
 
@@ -134,21 +279,29 @@ pub struct WeComPlatform {
     /// P3-g（code-review v14）：停机信号。`Drop` 时 cancel——后台 client run /
     /// drain 任务随之退出。此前两个后台任务与进程同生命周期，平台 drop 后仍
     /// 无限重连，是潜伏问题（测试隔离、多 profile 热替换场景会泄漏旧连接循环）；
-    /// 修成显式可控的停机通路。
+    /// 修成显式可控的停机通路。Wave C：outbox driver 挂本 token 的 child
+    ///（平台退出连动停泵；泵退出不反向杀平台）。
     shutdown: CancellationToken,
+    /// Wave C（出站可靠性收敛）：发送侧 outbox 持久化重试句柄（None = 未接
+    /// store，「明确未送达」失败保持 P2-1 即时报错语义）。
+    outbox: Option<imagent_store::Store>,
 }
 
 impl WeComPlatform {
     /// 构造并后台 spawn：
     /// 1. client `run` task（建连/认证/心跳/重连/收发）；
-    /// 2. drain task：把 client 推来的 `aibot_msg_callback` 帧解析入 pending 队列。
+    /// 2. drain task：把 client 推来的 `aibot_msg_callback` 帧解析入 pending 队列；
+    /// 3. （`outbox` = Some 时）core `OutboxDriver`（kind=wecom_text）：排空
+    ///    历史积压 + 承接此后「明确未送达」失败的重发。
     ///
     /// `message_max_len`：core config `message_max_len`（None = 不按配置分片）。
+    /// `outbox`：store 句柄（main 装配；None 保持旧行为）。
     pub fn new(
         bot_id: String,
         secret: String,
         ws_url: String,
         message_max_len: Option<usize>,
+        outbox: Option<imagent_store::Store>,
     ) -> Self {
         let (inbound_frame_tx, inbound_frame_rx) = mpsc::channel::<InboundFrame>(64);
         let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundFrame>(64);
@@ -211,12 +364,27 @@ impl WeComPlatform {
             debug!(target: "wecom", "inbound drain task 退出");
         });
 
+        // Wave C（出站可靠性收敛）：outbox driver——停机挂平台 token 的 child
+        //（平台 Drop 连动停泵；泵自身退出不反向杀平台后台任务），经平台自己
+        // 的出站 channel 交付（client 恢复消费即送达）。
+        if let Some(store) = outbox.clone() {
+            OutboxDriver::new(
+                store,
+                OUTBOX_KIND,
+                outbox_deliver(outbound_tx.clone()),
+                "wecom",
+            )
+            .with_shutdown(shutdown.child_token())
+            .spawn();
+        }
+
         Self {
             outbound_tx,
             reconnect,
             inbound_rx: Arc::new(Mutex::new(inbound_msg_rx)),
             text_split_max_bytes: wecom_split_cap(message_max_len),
             shutdown,
+            outbox,
         }
     }
 }
@@ -233,6 +401,19 @@ impl Drop for WeComPlatform {
 
 #[async_trait]
 impl Platform for WeComPlatform {
+    /// B1 能力声明：仅强制重连。与覆写方法清单对齐，新增覆写须同步——逐族
+    /// 对照：
+    /// - RECONNECT：reconnect（notify_one 逼 client task 重连）✅
+    /// - TYPING：send_typing 有覆写但为 no-op（协议无 typing 语义）❌ 不声明
+    /// - MEDIA_UPLOAD：send_media 有覆写但显式 Err（upload_media 三步未实现）
+    ///   ❌ 不声明——声明必须与「覆写的实际能力」一致，而非「是否覆写」
+    /// - CARDS/ASK/COMMAND_CARDS/FORMS/REACTIONS/URGENT_TEXT/GROUP_CHATS：
+    ///   无覆写（走 trait 纯文本/no-op default）❌
+    /// 一致性测试 `wecom_caps_match_overrides` 钉住本值。
+    fn capabilities(&self) -> PlatformCaps {
+        PlatformCaps::RECONNECT
+    }
+
     async fn recv(&self) -> Result<InboundMessage> {
         // 直接 await 入站 channel（drain task 解析后 send 进来），无消息时零唤醒。
         self.inbound_rx.lock().await.recv().await.ok_or_else(|| {
@@ -241,25 +422,26 @@ impl Platform for WeComPlatform {
     }
 
     async fn send_text(&self, conv: &ConvId, text: &str, _hint: &ReplyHint) -> Result<()> {
-        let userid = userid_from_conv(conv);
         // 超限分片（与飞书/ilink 同思路）：按字节安全阈值切（config
         // message_max_len 与协议上限取 min，见 text_split_max_bytes），多片加
         // (i/n) 编号后缀，用户能感知这是同一回复的一部分且未被截断。
+        // 编号在入列前拼好（live 与 outbox 回放共用同一批已编号内容，回放
+        // 编号与已送达前缀连续——见 outbox_payload）。userid 还原与逐片发送
+        // 循环在 send_text_frames（独立成函数便于单测失败分流）。
         let chunks = split_text_by_bytes(text, self.text_split_max_bytes);
         let total = chunks.len();
-        for (i, chunk) in chunks.into_iter().enumerate() {
-            let content = if total > 1 {
-                format!("({}/{}) {}", i + 1, total, chunk)
-            } else {
-                chunk
-            };
-            let frame = build_send_markdown_frame(&userid, &content);
-            // P5：中途失败标明分片序号——用户能感知回复被截断而非静默缺尾。
-            // P2-1（code-review v14）：`?` 失败即中断——后续片不再发（send_frame_bounded
-            // 内有 5s 有界等待，channel 满且 client 停滞时不再无限挂起 dispatch）。
-            send_frame_bounded(&self.outbound_tx, frame, i, total).await?;
-        }
-        Ok(())
+        let contents: Vec<String> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, chunk)| {
+                if total > 1 {
+                    format!("({}/{}) {}", i + 1, total, chunk)
+                } else {
+                    chunk.clone()
+                }
+            })
+            .collect();
+        send_text_frames(&self.outbound_tx, self.outbox.as_ref(), conv, &contents).await
     }
 
     async fn send_media(&self, _conv: &ConvId, _media: &MediaRef, _hint: &ReplyHint) -> Result<()> {
@@ -554,22 +736,31 @@ mod tests {
             .await
             .unwrap();
         let frame = build_send_markdown_frame("u", "second");
-        let e = send_frame_bounded(&tx, frame, 1, 2).await.unwrap_err();
-        let msg = format!("{e}");
+        let f = send_frame_bounded_for(&tx, frame, OUTBOUND_SEND_TIMEOUT)
+            .await
+            .unwrap_err();
+        assert_eq!(f, SendFail::Timeout, "channel 满应判为超时形态");
+        let msg = format!("{}", f.error(1, 2));
         assert!(msg.contains("发送超时"), "应为超时错误：{msg}");
         assert!(msg.contains("WS 断连或认证失败"), "应说明可能原因：{msg}");
         assert!(msg.contains("2/2"), "文案应含分片序号：{msg}");
     }
 
-    /// channel 关闭（client 退出）→ 立即失败，文案区分于超时。
+    /// channel 关闭（client 退出）→ 立即失败且形态为 Closed（outbox 入队
+    /// 分流依据），文案区分于超时。
     #[tokio::test]
     async fn send_frame_bounded_reports_closed_channel() {
         let (tx, rx) = mpsc::channel::<OutboundFrame>(1);
         drop(rx);
-        let e = send_frame_bounded(&tx, build_send_markdown_frame("u", "x"), 0, 1)
-            .await
-            .unwrap_err();
-        let msg = format!("{e}");
+        let f = send_frame_bounded_for(
+            &tx,
+            build_send_markdown_frame("u", "x"),
+            OUTBOUND_SEND_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(f, SendFail::Closed, "channel 关闭应判为明确未送达");
+        let msg = format!("{}", f.error(0, 1));
         assert!(msg.contains("已关闭"), "应为 channel 关闭错误：{msg}");
         assert!(msg.contains("1/1"), "文案应含分片序号：{msg}");
     }
@@ -582,9 +773,13 @@ mod tests {
         let rx_handle = tokio::spawn(async move {
             let _ = rx.recv().await;
         });
-        send_frame_bounded(&tx, build_send_markdown_frame("u", "hi"), 0, 1)
-            .await
-            .expect("畅通 channel 应 Ok");
+        send_frame_bounded_for(
+            &tx,
+            build_send_markdown_frame("u", "hi"),
+            OUTBOUND_SEND_TIMEOUT,
+        )
+        .await
+        .expect("畅通 channel 应 Ok");
         rx_handle.await.unwrap();
     }
 
@@ -602,10 +797,263 @@ mod tests {
             "secret".into(),
             "wss://127.0.0.1:1".into(),
             None,
+            None,
         );
         let token = p.shutdown.clone();
         assert!(!token.is_cancelled());
         drop(p);
         assert!(token.is_cancelled(), "Drop 必须 cancel 停机信号");
+    }
+
+    /// B1：caps 声明与覆写清单一致性（`capabilities()` 覆写处的逐族对照注释
+    /// 即静态清单，本测试钉值防漂移）。构造同 drop 测试：loopback 拒连、后台
+    /// 任务退避空转，capabilities() 为纯同步声明不触网。
+    /// 覆写≠支持：send_media 覆写但显式 Err、send_typing 覆写但 no-op——
+    /// 如实不声明 MEDIA_UPLOAD / TYPING。
+    #[tokio::test]
+    async fn wecom_caps_match_overrides() {
+        let p = WeComPlatform::new(
+            "bot".into(),
+            "secret".into(),
+            "wss://127.0.0.1:1".into(),
+            None,
+            None,
+        );
+        let caps = p.capabilities();
+        assert_eq!(caps, PlatformCaps::RECONNECT, "wecom 仅声明强制重连");
+        // URGENT_TEXT ↔ supports_urgent_text 同源（wecom 走 default false）。
+        assert_eq!(
+            caps.contains(PlatformCaps::URGENT_TEXT),
+            p.supports_urgent_text()
+        );
+        drop(p);
+    }
+
+    // ------------------------------------------------------------------
+    // Wave C（出站可靠性收敛）：outbox 入队 / 恢复送达 / 超限丢弃
+    // ------------------------------------------------------------------
+
+    use std::path::PathBuf;
+
+    fn temp_db_path(name: &str) -> PathBuf {
+        let pid = std::process::id();
+        let mut p = std::env::temp_dir();
+        p.push(format!("imagent_wecom_outbox_test_{pid}_{name}.db"));
+        p
+    }
+
+    struct TempDb(PathBuf);
+
+    impl TempDb {
+        async fn new(name: &str) -> Self {
+            let path = temp_db_path(name);
+            for ext in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+            }
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            for ext in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{ext}", self.0.display()));
+            }
+        }
+    }
+
+    /// 轮询断言：异步谓词在 `timeout` 内变 true，否则 panic。
+    async fn eventually<F, Fut>(timeout: std::time::Duration, pred: F)
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if pred().await {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "条件在 {timeout:?} 内未满足"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    fn unix_now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    /// payload 往返：chunks 原样（含已编号后缀）；畸形输入回 None。
+    #[test]
+    fn outbox_payload_roundtrip() {
+        let chunks = vec!["(1/2) 前半".to_string(), "(2/2) 后半".to_string()];
+        let payload = outbox_payload("wecom:Alice", &chunks);
+        let (conv, got) = parse_outbox_payload(&payload).expect("应可解析");
+        assert_eq!(conv, "wecom:Alice");
+        assert_eq!(got, chunks);
+        // 落盘内容不含伪造的幂等键（协议无对应物，存了只会误导排障）。
+        assert!(!payload.contains("uuid"), "wecom payload 不含 uuid");
+        // 畸形：非 JSON / 缺 chunks / 空 chunks → None。
+        assert!(parse_outbox_payload("not json").is_none());
+        assert!(parse_outbox_payload(r#"{"conv":"wecom:A"}"#).is_none());
+        assert!(
+            parse_outbox_payload(r#"{"conv":"wecom:A","chunks":[]}"#).is_none(),
+            "空 chunks 视为无效行（放弃）"
+        );
+    }
+
+    /// 断连（channel 关闭）期发送：剩余片入 outbox（kind=wecom_text、含
+    /// 未送达的已编号分片），调用方收 Ok（重试语义接管，不再即时报错）。
+    #[tokio::test]
+    async fn closed_channel_enqueues_remaining_chunks() {
+        let db = TempDb::new("enqueue").await;
+        let store = imagent_store::Store::open(&db.0).await.unwrap();
+        let (tx, rx) = mpsc::channel::<OutboundFrame>(8);
+        drop(rx); // channel 关闭 = client 已退出 = 明确未送达
+        let contents = vec![
+            "(1/3) a".to_string(),
+            "(2/3) b".to_string(),
+            "(3/3) c".to_string(),
+        ];
+        send_text_frames(&tx, Some(&store), &ConvId("wecom:Alice".into()), &contents)
+            .await
+            .expect("closed → 入队成功后应报 Ok");
+        let due = store.due_outbox(OUTBOX_KIND, unix_now(), 10).await.unwrap();
+        assert_eq!(due.len(), 1, "应恰好入队一行");
+        assert_eq!(due[0].conv, "wecom:Alice");
+        let (conv, chunks) = parse_outbox_payload(&due[0].payload).unwrap();
+        assert_eq!(conv, "wecom:Alice");
+        assert_eq!(chunks, contents, "全部片入队（首片即失败，无一送达）");
+    }
+
+    /// 多片中途断连：已送达前缀不入队，剩余片（编号连续）入队。
+    ///
+    /// 容量 1 + 只收一帧后 drop 接收端：此后发送方必然在某一未送达片上撞
+    /// Closed（在飞 permit 至多让一帧再入缓冲并随 drop 丢弃）——落盘的是
+    /// contents[k..] 的某个后缀（k 视调度为 1 或 2），断言按「非空前缀已
+    /// 交付 + 剩余片原样入队」的不变量写，不赌确切切点。
+    #[tokio::test]
+    async fn mid_message_closed_channel_enqueues_only_remaining() {
+        let db = TempDb::new("enqueue_mid").await;
+        let store = imagent_store::Store::open(&db.0).await.unwrap();
+        let (tx, mut rx) = mpsc::channel::<OutboundFrame>(1);
+        let contents = vec![
+            "(1/3) a".to_string(),
+            "(2/3) b".to_string(),
+            "(3/3) c".to_string(),
+        ];
+        let send = tokio::spawn({
+            let tx = tx.clone();
+            let store = store.clone();
+            let conv = ConvId("wecom:Bob".into());
+            let contents = contents.clone();
+            async move { send_text_frames(&tx, Some(&store), &conv, &contents).await }
+        });
+        let first = rx.recv().await.expect("第 1 片应送达");
+        let first_json = crate::proto::frame_to_string(&first).unwrap();
+        assert!(first_json.contains("(1/3) a"), "首片应带编号: {first_json}");
+        drop(rx);
+        send.await.unwrap().expect("入队接管后应报 Ok");
+        let due = store.due_outbox(OUTBOX_KIND, unix_now(), 10).await.unwrap();
+        assert_eq!(due.len(), 1);
+        let (_, got) = parse_outbox_payload(&due[0].payload).unwrap();
+        assert!(
+            !got.is_empty() && got.len() < contents.len(),
+            "应入队未送达的剩余片（非空真后缀）：{got:?}"
+        );
+        let k = contents.len() - got.len();
+        assert!(k >= 1, "已收到首片，入队起点不得早于第 2 片：{got:?}");
+        assert_eq!(
+            got,
+            &contents[k..],
+            "入队片须是原编号内容的连续后缀（不重发已送达前缀）"
+        );
+    }
+
+    /// 未接 store（None）时 closed 保持 P2-1 即时报错（旧部署兼容）。
+    #[tokio::test]
+    async fn closed_channel_without_store_still_errors() {
+        let (tx, rx) = mpsc::channel::<OutboundFrame>(1);
+        drop(rx);
+        let e = send_text_frames(&tx, None, &ConvId("wecom:Carol".into()), &["x".to_string()])
+            .await
+            .unwrap_err();
+        let msg = format!("{e}");
+        assert!(msg.contains("已关闭"), "无 store 应回退旧报错：{msg}");
+    }
+
+    /// 恢复后送达：outbox 行 + 活 channel（模拟 client 恢复/重启后新平台）→
+    /// driver 逐片发出、行删除。这是「断连不再丢消息」的端到端闭环。
+    #[tokio::test]
+    async fn outbox_row_delivered_after_recovery() {
+        let db = TempDb::new("recover").await;
+        let store = imagent_store::Store::open(&db.0).await.unwrap();
+        // 断连期落下的积压（closed 路径同构）。
+        store
+            .enqueue_outbox(
+                "wecom:Dave",
+                OUTBOX_KIND,
+                &outbox_payload(
+                    "wecom:Dave",
+                    &["(1/2) hi".to_string(), "(2/2) there".to_string()],
+                ),
+            )
+            .await
+            .unwrap();
+        // 「恢复」：新 channel 有活消费者（新平台的 client run task 等价物）。
+        let (tx, mut rx) = mpsc::channel::<OutboundFrame>(8);
+        OutboxDriver::new(store.clone(), OUTBOX_KIND, outbox_deliver(tx), "wecom")
+            .with_tick(std::time::Duration::from_millis(20))
+            .spawn();
+        let f1 = rx.recv().await.expect("恢复后第 1 片应送达");
+        let f2 = rx.recv().await.expect("恢复后第 2 片应送达");
+        for (f, want) in [(f1, "(1/2) hi"), (f2, "(2/2) there")] {
+            let json = crate::proto::frame_to_string(&f).unwrap();
+            assert!(json.contains(want), "帧内容应含 {want}: {json}");
+            assert!(json.contains("aibot_send_msg"), "应为发送帧: {json}");
+        }
+        eventually(std::time::Duration::from_secs(5), || async {
+            store.outbox_depth().await.unwrap() == 0
+        })
+        .await;
+    }
+
+    /// 超限丢弃：attempts 顶到上限前一行，channel 持续关闭（永久断连）→
+    /// driver 最后一次失败后回收行（error 留痕），表不膨胀。
+    #[tokio::test]
+    async fn outbox_row_dropped_after_max_attempts_on_persistent_failure() {
+        let db = TempDb::new("exhaust").await;
+        let store = imagent_store::Store::open(&db.0).await.unwrap();
+        store
+            .enqueue_outbox(
+                "wecom:Eve",
+                OUTBOX_KIND,
+                &outbox_payload("wecom:Eve", &["x".to_string()]),
+            )
+            .await
+            .unwrap();
+        let row = store
+            .due_outbox(OUTBOX_KIND, unix_now(), 10)
+            .await
+            .unwrap()
+            .remove(0);
+        for _ in 0..(imagent_store::OUTBOX_MAX_ATTEMPTS - 1) {
+            assert!(store.outbox_mark_failed(row.id, unix_now()).await.unwrap());
+        }
+        // channel 关闭：driver 的交付永远失败。
+        let (tx, rx) = mpsc::channel::<OutboundFrame>(8);
+        drop(rx);
+        OutboxDriver::new(store.clone(), OUTBOX_KIND, outbox_deliver(tx), "wecom")
+            .with_tick(std::time::Duration::from_millis(20))
+            .spawn();
+        eventually(std::time::Duration::from_secs(5), || async {
+            store.outbox_depth().await.unwrap() == 0
+        })
+        .await;
     }
 }

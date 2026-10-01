@@ -20,6 +20,14 @@ trait Platform（收发 IM）              trait Backend（执行 agent）
   `update_card`（流式卡片）/ `send_permission_ask` + `cancel_permission_ask`（审批卡）/
   `reconnect` / `supports_streaming_card`。默认实现把卡片降级为纯文本——新平台只需
   实现文本路径即可接入。
+- **能力协商 PlatformCaps**（Wave B1，`core::platform::PlatformCaps`）：十能力位
+  bitflags（CARDS / ASK / COMMAND_CARDS / FORMS / REACTIONS / TYPING / MEDIA_UPLOAD /
+  URGENT_TEXT / RECONNECT / GROUP_CHATS），`capabilities()` 显式声明「平台覆写了
+  哪些能力族的平台语义」——**覆写必须置位、置位必须与实际覆写一致**（各平台
+  impl 旁的清单注释 + crate 测试钉值防漂移）。声明 ≠ 可调：default 方法本身就是
+  安全降级（no-op / 纯文本），能力位只作 core 调用点的加速与 `/doctor` 能力面
+  的可观测，不改变用户可见行为。新增交互特性须同时做三件事：trait 方法（安全
+  default）+ 能力位（含 `ALL` 表）+ `/doctor` 自动可见。
 - **Backend**（`core::backend`）：**无状态执行器**。`run(conv, prompt, session,
   workdir, allowed_tools, chunks)` 经 `AgentChunk` 流推中间事件（`Text` / `ToolUse` /
   `ToolResult` / `Media` / `SessionStarted` / `Final` / `Error`）；session 生命周期
@@ -39,7 +47,7 @@ crates/
 ├── claude/  CLI（stream-json 解析）+ ACP（JSON-RPC 长驻）；~/.claude 会话扫描
 ├── codex/   codex exec；~/.codex/sessions rollout 扫描（/resume 接管）
 ├── gemini/  gemini CLI（无本机存储概念，/resume 仅 IM 历史）
-└── store/   SQLite（bundled 静态链接）schema v1→v15 线性迁移（见 §5）
+└── store/   SQLite（bundled 静态链接）schema v1→v16 线性迁移（见 §5）
 fuzz/        cargo-fuzz targets：ilink 协议解析 / CDN host SSRF / 飞书事件解析
 src/main.rs  组装：CLI（clap）、单实例锁、信号、/health + /metrics、孤儿卡片扫描
 ```
@@ -88,7 +96,7 @@ Platform::recv ─→ 鉴权门（sender ∪ 会话白名单；空白名单=发�
 中断后**排队消息保留**、runner 自动取批续跑 = steering 语义，`/stop all` 才硬停
 清队列）；**审批等待暂停看门狗**（审批有独立超时预算）。
 
-## 5. 存储（schema v15）
+## 5. 存储（schema v16）
 
 | 表 | 用途 |
 |---|---|
@@ -101,7 +109,8 @@ Platform::recv ─→ 鉴权门（sender ∪ 会话白名单；空白名单=发�
 | `live_cards` | 在飞流式卡片登记（孤儿卡片启动关流，见 §7） |
 | `cron_jobs`（v11） | /cron 定时任务（失权自动停用、停机补跑策略见 `cron_catchup`） |
 | `queued_messages`（v12） | 排队消息实时落库——崩溃/断电后重启重放（崩溃不丢消息） |
-| `outbox`（v14） | 发送侧提示类消息持久化重试（HTTP 分区期间扣下的消息恢复后仍可见；泵 10s tick 指数退避） |
+| `outbox`（v14） | 发送侧持久化重试（Wave C 起双 kind：`feishu_text` 提示类 / `wecom_text` 回复分片；core `OutboxDriver` 每 10s tick 按 kind 拉取，指数退避） |
+| `webhook_seen`（v16） | webhook 防重放去重持久层——已验证 `(token, 签名)` 落库（重启不失忆；`replay_window_secs` 窗口即保留期，insert 顺手 prune） |
 
 keyring username 带 profile 段：`{profile}:{platform}:{account}`（旧键读取
 fallback）。DB / WAL / SHM / socket / token / 媒体文件统一 0600，媒体目录 0700。
@@ -141,8 +150,22 @@ claude（--permission-prompt-tool）─MCP─→ imagent mcp 子进程
   `queued_messages`，崩溃/`kill -9`/断电后重启自动重放；执行中的轮次轮首落
   `inflight_prompt:*` 标记、正常收尾清除——重启扫描残留转 /retry 数据源并通知
   会话一键续跑（时间戳取更新者，防旧残留覆盖新失败）。
-- **发送侧 outbox**（store v14）：drain 提示类消息发送失败落盘，后台泵 10s tick
-  指数退避重发（15s→1h，上限 16 次）；`/health` 暴露 `outbox_pending`。
+- **出站可靠性 outbox**（store v14 起；Wave C 出站可靠性收敛）：store 持久化
+  outbox 表 + core 共享交付泵 `core::outbox::OutboxDriver`（每平台一个实例、一个
+  kind：`feishu_text` / `wecom_text`）。泵 10s tick 拉到期行（批 10）、逐条串行
+  交付、指数退避 15s→1h、上限 16 次（约 10h 窗口，超限丢弃 + error 留痕）——
+  at-least-once。三平台出站语义对照：
+
+  | 平台 | live 失败入队口径 | 幂等保护 | 断连期行为 |
+  |---|---|---|---|
+  | feishu | 任何 HTTP 发送失败（drain 提示类 + 欢迎卡回落） | 落盘生成 uuid、重发透传（飞书幂等键去重） | 入队退避重发，恢复后送达 |
+  | wecom | 仅「明确未送达」（出站 channel 关闭 = client 已退出）；「超时（可能已送达）」不入队 | 协议无幂等键——防重复靠入队口径收敛（宁丢勿重，用户可 /again） | channel 关闭即入队；重启后新平台的 driver 排空积压 |
+  | ilink | **不接入** | 协议无交付回执/幂等键，盲重试有重复风险；SessionExpired 下跨重启重试无意义；进程内重试 + 熔断已覆盖瞬态 | 进程内重试 + 熔断（决策记档见 `core::outbox` 模块文档） |
+
+  未知 kind 防御（v14 P3o 泛化）：`due_outbox` 按 kind 过滤后，无人认领的 kind
+  （平台撤下后的历史积压等）由 main 装配的 sweeper 推后 1h + 告警 + attempts
+  递增最终回收，防永久滞留撑表。`/health` 的 `outbox_pending` 为跨 kind 合计
+  深度。
 - **webhook 入站 server**：`webhook_addr` + `[[webhook]]`（token/conv/name），与手打
   消息同权走鉴权管线；HMAC-SHA256 验签（GitHub 协议同款）+ per-hook 令牌桶限速 +
   GitHub 原生事件解析（workflow_run/push/issues/PR）；合成消息 `no_steer`（独立

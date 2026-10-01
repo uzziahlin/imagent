@@ -210,6 +210,10 @@ impl Dispatcher {
     /// 表情终态标注（best-effort）：落在轮次触发的用户消息上（merge_batch 保留
     /// 首条消息的 source_msg_id）。None 锚（合成消息/无平台 id）no-op。
     async fn react_msg(&self, conv: &ConvId, mids: &[String], done: bool) {
+        // B1：能力门——非 REACTIONS 平台整段跳过（default 亦 no-op）。
+        if !platform_supports(self.platform.as_ref(), PlatformCaps::REACTIONS, "reactions") {
+            return;
+        }
         let r = if done {
             crate::MsgReaction::Done
         } else {
@@ -262,7 +266,10 @@ impl Dispatcher {
             (!base_prompt.trim().is_empty()).then(|| base_prompt.trim().to_string());
 
         // best-effort typing 指示（agent 处理中）；失败仅 log，不阻塞后续。
-        let _ = self.platform.send_typing(&conv, &hint).await;
+        // B1：能力门——协议无 typing 语义的平台跳过（default 亦 no-op）。
+        if platform_supports(self.platform.as_ref(), PlatformCaps::TYPING, "typing") {
+            let _ = self.platform.send_typing(&conv, &hint).await;
+        }
 
         // 取续接 session；store 错误仅 log 后当 None。
         // TaskList 预热（2026-09-01）：轮首任务快照判定树——②行内 task_todos
@@ -410,13 +417,16 @@ impl Dispatcher {
         // default——/cd 后两才会分叉（P5 修正，与 /resume 的记法对齐）。
         let workdir_for_row = workdir.to_string_lossy().to_string();
         // 👀「在做了」打在本批全部消息上（含排队⏳ 翻转；失败仅 warn）。
-        for mid in &react_mids {
-            if let Err(e) = self
-                .platform
-                .react_to_message(&conv, mid, crate::MsgReaction::Processing)
-                .await
-            {
-                warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "消息表情处理中标注失败（不影响主流程）");
+        // B1：能力门——非 REACTIONS 平台整段跳过（default 亦 no-op）。
+        if platform_supports(self.platform.as_ref(), PlatformCaps::REACTIONS, "reactions") {
+            for mid in &react_mids {
+                if let Err(e) = self
+                    .platform
+                    .react_to_message(&conv, mid, crate::MsgReaction::Processing)
+                    .await
+                {
+                    warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "消息表情处理中标注失败（不影响主流程）");
+                }
             }
         }
         // v1.20 崩溃轮次恢复：轮首落 inflight 标记（prompt + 时刻）——轮次任何
@@ -1105,7 +1115,9 @@ impl Dispatcher {
         if outcome.terminal
             && should_buzz_done(elapsed, asks_delta)
             && !user_present
-            && self.platform.supports_urgent_text()
+            // B1：能力门统一走 caps 位（URGENT_TEXT 与 supports_urgent_text 由
+            // 平台一致性测试钉住同步；mock 平台两者同源）。
+            && platform_supports(self.platform.as_ref(), PlatformCaps::URGENT_TEXT, "urgent_text")
         {
             let text = task_done_buzz_text(
                 elapsed,
@@ -1364,13 +1376,16 @@ impl Dispatcher {
     async fn cancel_pending_on_exit(&self, conv: &ConvId) {
         let cleared = self.router.cancel_all(&conv.0).await;
         if !cleared.is_empty() {
-            if let Err(e) = self.platform.cancel_all_permission_asks(conv).await {
-                warn!(
-                    target: "imagent::core",
-                    conv_id = %conv.0,
-                    error = %e,
-                    "轮次失败路径收敛权限询问卡失败（不影响 deny 结果）"
-                );
+            // B1：能力门——非 ASK 平台无卡可收敛（default 亦 no-op）。
+            if platform_supports(self.platform.as_ref(), PlatformCaps::ASK, "ask") {
+                if let Err(e) = self.platform.cancel_all_permission_asks(conv).await {
+                    warn!(
+                        target: "imagent::core",
+                        conv_id = %conv.0,
+                        error = %e,
+                        "轮次失败路径收敛权限询问卡失败（不影响 deny 结果）"
+                    );
+                }
             }
         }
     }

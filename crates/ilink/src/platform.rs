@@ -19,7 +19,9 @@ use serde_json::json;
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, error, warn};
 
-use imagent_core::{ConvId, CoreError, InboundMessage, MediaRef, Platform, ReplyHint, Result};
+use imagent_core::{
+    ConvId, CoreError, InboundMessage, MediaRef, Platform, PlatformCaps, ReplyHint, Result,
+};
 use imagent_store::Store;
 
 use crate::client::ILinkClient;
@@ -688,6 +690,19 @@ fn dedup_key(msg: &Msg) -> String {
 
 #[async_trait]
 impl Platform for ILinkPlatform {
+    /// B1 能力声明：媒体回传 + typing。与覆写方法清单对齐，新增覆写须同步——
+    /// 逐族对照：
+    /// - MEDIA_UPLOAD：send_media（下载→AES 解密→上传回传管线）✅
+    /// - TYPING：send_typing（getconfig 取 ticket + sendtyping，真实语义）✅
+    /// - CARDS/ASK/COMMAND_CARDS/FORMS/REACTIONS/URGENT_TEXT/GROUP_CHATS/
+    ///   RECONNECT：无覆写（走 trait 纯文本/no-op/Err default）❌——注意询问
+    ///   闭环本身**可用**（send_permission_ask 文本 default），只是无卡可收敛，
+    ///   故不声明 ASK 位。
+    /// 一致性测试 `ilink_caps_match_overrides` 钉住本值。
+    fn capabilities(&self) -> PlatformCaps {
+        PlatformCaps::MEDIA_UPLOAD | PlatformCaps::TYPING
+    }
+
     async fn recv(&self) -> Result<InboundMessage> {
         loop {
             // 1. 先弹缓存
@@ -1208,5 +1223,29 @@ mod tests {
         assert_eq!(attempts.get(), 5, "4 次重试 + 首次 = 5 次尝试");
         // 熔断器已被限流事件触发（最后一次 record_event 刚推开 cooldown）。
         assert!(breaker.cooldown_remaining().await > Duration::ZERO);
+    }
+
+    /// B1：caps 声明与覆写清单一致性（`capabilities()` 覆写处的逐族对照注释
+    /// 即静态清单，本测试钉值防漂移）。capabilities() 为纯同步声明不触网。
+    #[tokio::test]
+    async fn ilink_caps_match_overrides() {
+        let client = ILinkClient::new(None, "tok".into(), "bot".into(), "user".into()).unwrap();
+        let db =
+            std::env::temp_dir().join(format!("imagent-ilink-caps-{}.db", uuid::Uuid::new_v4()));
+        let store = Store::open(&db).await.expect("open store");
+        let p = ILinkPlatform::new(client, store, "acct".into(), None, Duration::from_millis(0));
+        let caps = p.capabilities();
+        assert_eq!(
+            caps,
+            PlatformCaps::MEDIA_UPLOAD | PlatformCaps::TYPING,
+            "ilink 仅声明媒体回传 + typing"
+        );
+        // URGENT_TEXT ↔ supports_urgent_text 同源（ilink 走 default false）。
+        assert_eq!(
+            caps.contains(PlatformCaps::URGENT_TEXT),
+            p.supports_urgent_text()
+        );
+        drop(p);
+        let _ = std::fs::remove_file(&db);
     }
 }

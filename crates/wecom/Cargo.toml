@@ -9,6 +9,9 @@ publish.workspace = true
 
 [dependencies]
 imagent-core = { path = "../core" }
+# Wave C（出站可靠性收敛）：发送失败持久化重试队列——断连期扣下的回复经
+# store outbox 表（kind=wecom_text）重发，core OutboxDriver 驱动。
+imagent-store = { path = "../store" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

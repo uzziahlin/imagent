@@ -16,7 +16,7 @@ use super::*;
 #[cfg(test)]
 pub(super) use misc::{
     doctor_capability_lines, doctor_credential_line, doctor_guardrail_lines,
-    doctor_shared_workdir_lines, doctor_size_line, doctor_webhook_line,
+    doctor_platform_caps_lines, doctor_shared_workdir_lines, doctor_size_line, doctor_webhook_line,
 };
 
 /// P3（v13 遗留「群内斜杠免检噪音」）：命令分派表（[`Dispatcher::handle`] 的

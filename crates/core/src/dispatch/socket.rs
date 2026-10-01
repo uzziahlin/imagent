@@ -547,8 +547,12 @@ impl Dispatcher {
                 // (b) 不得把字面 "imagent:evicted" 回写给终端 agent；
                 // (c) 计数按 dropped（系统收敛，非用户答复，不污染 ok 口径）。
                 if r.raw_text.as_deref() == Some(crate::permission::EVICTED_SENTINEL) {
-                    if let Err(e) = platform.cancel_permission_ask(&conv, &request_id).await {
-                        warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "淘汰问答卡收敛失败");
+                    // B1：能力门——非 ASK 平台无卡可收敛（default 亦 no-op）。
+                    if super::platform_supports(platform.as_ref(), super::PlatformCaps::ASK, "ask")
+                    {
+                        if let Err(e) = platform.cancel_permission_ask(&conv, &request_id).await {
+                            warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "淘汰问答卡收敛失败");
+                        }
                     }
                     METRICS
                         .ask_via_im_replies
@@ -588,8 +592,11 @@ impl Dispatcher {
             }
             Err(_) => {
                 router.cancel(&conv.0, &request_id).await;
-                if let Err(e) = platform.cancel_permission_ask(&conv, &request_id).await {
-                    warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "超时询问卡收敛失败（不影响回传）");
+                // B1：能力门——非 ASK 平台无卡可收敛（default 亦 no-op）。
+                if super::platform_supports(platform.as_ref(), super::PlatformCaps::ASK, "ask") {
+                    if let Err(e) = platform.cancel_permission_ask(&conv, &request_id).await {
+                        warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "超时询问卡收敛失败（不影响回传）");
+                    }
                 }
                 METRICS
                     .ask_via_im_replies
@@ -949,7 +956,10 @@ impl Dispatcher {
             super::AskWaitOutcome::Replied(r) => {
                 // L2（code-review v8）：淘汰哨兵 → 与 TimedOut 同款平台收敛
                 //（撤卡防过期点击），再原样回 deny。
-                if r.raw_text.as_deref() == Some(crate::permission::EVICTED_SENTINEL) {
+                // B1：能力门——非 ASK 平台无卡可收敛（default 亦 no-op）。
+                if r.raw_text.as_deref() == Some(crate::permission::EVICTED_SENTINEL)
+                    && super::platform_supports(platform.as_ref(), super::PlatformCaps::ASK, "ask")
+                {
                     if let Err(e) = platform.cancel_permission_ask(&conv, &request_id).await {
                         warn!(target: "imagent::core", error = %e, "淘汰询问收敛失败");
                     }
@@ -978,8 +988,11 @@ impl Dispatcher {
                 router.cancel(&conv_id, &request_id).await;
                 // 真机校准 UX：超时自动拒绝后把滞留的询问卡收敛成终态（否则
                 // 卡片保持可点，用户点了只会得到「已超时」的空转）。best-effort。
-                if let Err(e) = platform.cancel_permission_ask(&conv, &request_id).await {
-                    warn!(target: "imagent::core", conv_id = %conv_id, error = %e, "超时询问卡收敛失败（不影响 deny）");
+                // B1：能力门——非 ASK 平台无卡可收敛（default 亦 no-op）。
+                if super::platform_supports(platform.as_ref(), super::PlatformCaps::ASK, "ask") {
+                    if let Err(e) = platform.cancel_permission_ask(&conv, &request_id).await {
+                        warn!(target: "imagent::core", conv_id = %conv_id, error = %e, "超时询问卡收敛失败（不影响 deny）");
+                    }
                 }
                 METRICS
                     .permission_decisions

@@ -7,16 +7,11 @@
 
     <key>ProgramArguments</key>
     <array>
-        <!-- 按实际安装路径调整 -->
         <string>/usr/local/bin/imagent</string>
         <string>start</string>
+        <string>--platform</string>
+        <string>feishu</string>
     </array>
-
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>RUST_LOG</key>
-        <string>info</string>
-    </dict>
 
     <key>RunAtLoad</key>
     <true/>
@@ -26,8 +21,7 @@
 
     <key>StandardOutPath</key>
     <string>/usr/local/var/log/imagent.log</string>
-
     <key>StandardErrorPath</key>
-    <string>/usr/local/var/log/imagent.err.log</string>
+    <string>/usr/local/var/log/imagent.log</string>
 </dict>
 </plist>

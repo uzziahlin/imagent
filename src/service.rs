@@ -48,7 +48,10 @@ fn unit_path(profile: Option<&str>) -> Result<PathBuf> {
 /// 凭据环境变量快照进服务（KeepAlive 崩溃自动拉起）。
 /// v1.23 review：plist/unit 模板值转义——secret 含 &/</" 时裸内插会产生
 /// 非法 XML（launchd 加载失败）或注入额外 Environment= 指令（systemd）。
-#[cfg(target_os = "macos")]
+/// B2（deploy 合流）：xml_escape/render_plist 与 unit_escape/render_unit 均为纯
+/// 字符串渲染，**不再按 OS cfg 门控**——`service print --format` 需在任意平台
+/// 生成两种格式（deploy/ 模板刷新 + 双平台测试覆盖），OS 差异只留在
+/// install/uninstall/status 的落盘/加载路径。
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -57,12 +60,10 @@ fn xml_escape(s: &str) -> String {
 
 /// systemd unit 值清洗：引号/换行/分号在 Environment="k=v" 语境可断句注入
 /// ——直接替换为安全字符（这些值是路径/secret，正常不含此类字符）。
-#[cfg(all(unix, not(target_os = "macos")))]
 fn unit_escape(s: &str) -> String {
     s.replace(['"', '\n', ';'], "_")
 }
 
-#[cfg(target_os = "macos")]
 fn render_plist(
     exe: &str,
     profile: Option<&str>,
@@ -110,7 +111,6 @@ fn render_plist(
 }
 
 /// systemd 用户单元模板（ExecStart 同参数；日志 journalctl）。
-#[cfg(all(unix, not(target_os = "macos")))]
 fn render_unit(
     exe: &str,
     profile: Option<&str>,
@@ -141,6 +141,95 @@ fn render_unit(
          Restart=on-failure\nRestartSec=5\n\n\
          [Install]\nWantedBy=default.target\n"
     )
+}
+
+// ---------------------------------------------------------------------------
+// B2（deploy 合流）：`service print` —— deploy/ 静态模板与 install 程序化路径的
+// 单一事实源。此前两套内容手工分叉（静态模板缺 `--platform`，v13 记过此债：
+// 复制模板装出的守护进程会误走缺省平台解析）。现约定：deploy/ 下模板 = 本
+// 命令在固定参数下的输出（刷新方法见 deploy/README.md 顶部），勿手改模板。
+// ---------------------------------------------------------------------------
+
+/// 服务定义输出格式（`service print --format`）。
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnitFormat {
+    /// macOS launchd 用户代理 plist。
+    Launchd,
+    /// Linux systemd 用户单元。
+    Systemd,
+}
+
+impl UnitFormat {
+    /// 当前 OS 的缺省格式（print 不传 --format 时用）。
+    pub fn current_os() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            Self::Launchd
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            Self::Systemd
+        }
+        #[cfg(not(unix))]
+        {
+            Self::Systemd
+        }
+    }
+}
+
+/// `service print`：把 install 会写盘的服务定义渲染到 stdout。**不安装、不写
+/// 任何文件、不调 launchctl/systemctl、不需要 root**——幂等可重复，退出码恒 0
+///（输入非法才非 0）。与 [`install`] 的差异仅三点，均为「预览/模板」场景取舍：
+/// - 平台解析：`--platform` 覆盖 > config.platform（无 config 时允许 `--platform`
+///   直给——模板生成机未必初始化过 config；install 则强制读 config 防静默装错）。
+/// - 凭据环境变量快照：**默认不附**（`--with-env` 才附）——print 的输出常被粘贴
+///   进 issue/文档/入库存模板，凭据默认不进场；对齐 install 全貌时再显式开启。
+/// - 二进制路径：`--exe` 覆盖 > 当前二进制（刷新 deploy 模板固定传
+///   `/usr/local/bin/imagent`，避免开发者本机 target/ 路径入库）。
+pub fn print(
+    profile: Option<&str>,
+    format: UnitFormat,
+    exe: Option<&str>,
+    platform: Option<&str>,
+    log_path: Option<&str>,
+    with_env: bool,
+) -> Result<()> {
+    let exe = match exe {
+        Some(e) => e.to_string(),
+        None => std::env::current_exe()
+            .map_err(|e| anyhow!("定位当前二进制失败：{e}（可用 --exe 覆盖）"))?
+            .to_string_lossy()
+            .into_owned(),
+    };
+    let platform_name = match platform {
+        Some(p) => p.to_string(),
+        None => {
+            let cfg_path = imagent_core::Config::default_path()
+                .ok_or_else(|| anyhow!("无法定位 config 路径（print 可用 --platform 跳过读取）"))?;
+            imagent_core::Config::load(&cfg_path)
+                .map_err(|e| {
+                    anyhow!(
+                        "读取 {} 失败：{e}\n（print 可用 --platform 覆盖，无需先 setup）",
+                        cfg_path.display()
+                    )
+                })?
+                .platform
+        }
+    };
+    let envs = if with_env { capture_envs() } else { Vec::new() };
+    let content = match format {
+        UnitFormat::Launchd => {
+            // 日志路径仅 launchd 语义（systemd 走 journal）——--log-path 在
+            // Systemd 格式下无对应字段，忽略（README 已注明）。
+            let log = log_path
+                .map(str::to_string)
+                .unwrap_or_else(|| daemon_log_path().to_string_lossy().into_owned());
+            render_plist(&exe, profile, &platform_name, &envs, &log)
+        }
+        UnitFormat::Systemd => render_unit(&exe, profile, &platform_name, &envs),
+    };
+    print!("{content}");
+    Ok(())
 }
 
 /// 安装时应快照进服务定义的环境变量（凭据等——不快照则守护进程取不到）。
@@ -584,7 +673,6 @@ mod tests {
         assert_eq!(label(Some("")), "com.imagent");
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn plist_shape() {
         let p = render_plist(
@@ -611,7 +699,6 @@ mod tests {
         assert!(p2.contains("<string>com.imagent</string>"));
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn unit_shape() {
         let u = render_unit(
@@ -629,6 +716,47 @@ mod tests {
         let u2 = render_unit("/x/imagent", None, "ilink", &[]);
         assert!(u2.contains("ExecStart=/x/imagent start --platform ilink"));
         assert!(!u2.contains("--profile"));
+    }
+
+    /// B2 deploy 合流：deploy/ 静态模板 = `service print` 在固定参数下的输出
+    /// （刷新命令见 deploy/README.md）。本测试固化模板关键字段——尤其
+    /// `--platform` 参数位（历史债：静态模板缺失该位，复制装出的守护进程
+    /// 误走缺省平台解析）。若本测试红了，先改生成器再重刷模板，勿手改模板。
+    #[test]
+    fn template_shape_matches_deploy_refresh() {
+        // 与 deploy/README.md 刷新命令同参（launchd：--log-path 取旧模板的
+        // /usr/local/var/log，README 注明该路径不在内置轮转范围）。
+        let p = render_plist(
+            "/usr/local/bin/imagent",
+            None,
+            "feishu",
+            &[],
+            "/usr/local/var/log/imagent.log",
+        );
+        assert!(p.contains("<string>/usr/local/bin/imagent</string>"), "{p}");
+        assert!(p.contains("<string>start</string>"), "{p}");
+        // --platform 参数位：模板必须显式带平台（缺这位的旧债正是 B2 要消除的分叉点）。
+        assert!(
+            p.contains("<string>--platform</string>") && p.contains("<string>feishu</string>"),
+            "plist 模板必须含 --platform 入参位: {p}"
+        );
+        assert!(p.contains("<string>com.imagent</string>"), "{p}");
+        assert!(
+            p.contains("<string>/usr/local/var/log/imagent.log</string>"),
+            "{p}"
+        );
+        assert!(p.contains("KeepAlive"), "{p}");
+
+        let u = render_unit("/usr/local/bin/imagent", None, "feishu", &[]);
+        assert!(
+            u.contains("ExecStart=/usr/local/bin/imagent start --platform feishu"),
+            "{u}"
+        );
+        assert!(u.contains("Restart=on-failure"), "{u}");
+        assert!(u.contains("WantedBy=default.target"), "{u}");
+        // 模板（--with-env 关闭）不应含凭据快照位。
+        assert!(!p.contains("IMAGENT_FEISHU_APP_SECRET"), "{p}");
+        assert!(!u.contains("Environment="), "{u}");
     }
 }
 

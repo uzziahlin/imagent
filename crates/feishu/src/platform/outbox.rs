@@ -1,19 +1,27 @@
-//! v1.21 outbox 发送侧重试泵（T19 拆分自 platform.rs，纯移动）。
+//! v1.21 outbox 发送侧持久化重试（T19 拆分自 platform.rs；Wave C 出站可靠性
+//! 收敛：泵本体上移 core `OutboxDriver`，本文件只剩 feishu 的 payload 契约与
+//! 交付闭包接线）。
 //!
-//! drain 侧提示类发送失败后落盘（store outbox 表，kind=`feishu_text`），由本
-//! 后台泵周期拉取到期行重发；成败信号来自 [`super::drain::send_drain_text_result`]
-//! 的直发形态。
+//! drain 侧提示类发送失败后落盘（store outbox 表，kind=[`OUTBOX_KIND`]），
+//! 由 core driver 周期拉取到期行重发；成败信号来自
+//! [`super::drain::send_drain_text_result`] 的直发形态。泵的退避/超限丢弃/
+//! 停机语义与日志文案见 `imagent_core::outbox` 模块文档（feishu v1.21 行为
+//! 逐字保留，日志 target 仍为 "feishu"——用户既有日志过滤不断档）。
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::error;
 
+use imagent_core::outbox::{OutboxDeliver, OutboxDriver};
 use imagent_core::ConvId;
 use open_lark::CoreConfig;
 
 use super::drain::send_drain_text_result_with_uuid;
+
+/// feishu 在 store outbox 表的 kind（main 装配 sweeper 的 known 名单同源）。
+pub const OUTBOX_KIND: &str = "feishu_text";
 
 /// P2-5（code-review v14）：outbox 落盘 payload 构造（含幂等 uuid）。
 /// uuid 在 enqueue 时生成一次、随 payload 持久化——泵重发时**透传同一 uuid**
@@ -42,51 +50,35 @@ fn parse_outbox_payload(payload: &str) -> Option<(String, String, Option<String>
     Some((conv, text, uuid))
 }
 
-/// v1.21 outbox 泵：每 10s 拉到期行重发（kind=feishu_text）。指数退避
-/// 15s→1h 封顶；成功删行；超 [`imagent_store::OUTBOX_MAX_ATTEMPTS`] 放弃并
-/// error 留痕（约 10h 仍不达——继续保留只会撑爆表，文案已过时效）。
-pub(super) async fn outbox_pump(
+/// Wave C：拉起 core [`OutboxDriver`]（kind=`feishu_text`）。交付闭包内聚
+/// feishu 特有逻辑：payload 解析（失败按旧语义放弃——error 留痕 + 返回 Ok
+/// 让 driver 删行）、幂等 uuid 透传（P2-5）、评论/话题/普通 conv 三路直发
+/// （[`send_drain_text_result_with_uuid`]）。
+pub(super) fn spawn_outbox_driver(
     store: imagent_store::Store,
     core_config: Arc<CoreConfig>,
     token_lock: Arc<RwLock<Option<(String, Instant)>>>,
     app_id: String,
     app_secret: String,
 ) {
-    const TICK: Duration = Duration::from_secs(10);
-    loop {
-        tokio::time::sleep(TICK).await;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let due = match store.due_outbox(now, 10).await {
-            Ok(d) => d,
-            Err(e) => {
-                warn!(target: "feishu", error = %e, "outbox 拉取失败（本轮跳过）");
-                continue;
-            }
-        };
-        for row in due {
-            // P3o（code-review v14）：未知 kind 不再 continue 原地空转（该行
-            // next_try 未变，会**永久占住** LIMIT 10 让真正的 feishu_text 行
-            // 饿死）——推后 1h 重看（用现有 outbox_mark_failed 语义实现，
-            // attempts 递增最终会被 OUTBOX_MAX_ATTEMPTS 回收，双保险）。
-            if row.kind != "feishu_text" {
-                warn!(target: "feishu", id = row.id, kind = %row.kind, "outbox 未知 kind，推后 1h 重看（不阻塞到期队列）");
-                let _ = store.outbox_mark_failed(row.id, now + 3600).await;
-                continue;
-            }
+    let deliver: OutboxDeliver = Arc::new(move |row| {
+        let core_config = core_config.clone();
+        let token_lock = token_lock.clone();
+        let app_id = app_id.clone();
+        let app_secret = app_secret.clone();
+        Box::pin(async move {
             let Some((conv, text, uuid)) = parse_outbox_payload(&row.payload) else {
+                // 旧 feishu 泵语义：解析失败按放弃处理（重试 16 次也不会成功）
+                // ——error 留痕、返回 Ok 让 driver 删行。
                 error!(target: "feishu", id = row.id, "outbox 行解析失败，放弃");
-                let _ = store.outbox_mark_sent(row.id).await;
-                continue;
+                return Ok(());
             };
             // P2-5：落盘时的 uuid 透传（旧行无 uuid → 现生成，整个重试周期内
             // 每次重试共用本键——重试间换键同样会双发）。
             let idem = uuid.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             // send_drain_text 内部已吞错误（warn），泵需要成败信号——直接
             // 调内部闭包等价逻辑：这里取 Result 的直发形态。
-            let sent = send_drain_text_result_with_uuid(
+            send_drain_text_result_with_uuid(
                 &core_config,
                 &token_lock,
                 &app_id,
@@ -95,31 +87,10 @@ pub(super) async fn outbox_pump(
                 &text,
                 Some(&idem),
             )
-            .await;
-            match sent {
-                Ok(()) => {
-                    info!(target: "feishu", id = row.id, conv_id = conv, attempts = row.attempts, "outbox 重发成功");
-                    let _ = store.outbox_mark_sent(row.id).await;
-                }
-                Err(e) => {
-                    // 15s × 2^attempts，封顶 1h。
-                    let backoff = (15i64 << row.attempts.min(8)).clamp(15, 3600);
-                    let kept = store.outbox_mark_failed(row.id, now + backoff).await;
-                    match kept {
-                        Ok(true) => {
-                            warn!(target: "feishu", id = row.id, attempts = row.attempts, error = %e, "outbox 重发失败（退避后再试）")
-                        }
-                        Ok(false) => {
-                            error!(target: "feishu", id = row.id, attempts = row.attempts, conv_id = conv, "outbox 重试耗尽，放弃（提示丢失）")
-                        }
-                        Err(e2) => {
-                            warn!(target: "feishu", id = row.id, error = %e2, "outbox 状态更新失败")
-                        }
-                    }
-                }
-            }
-        }
-    }
+            .await
+        })
+    });
+    OutboxDriver::new(store, OUTBOX_KIND, deliver, "feishu").spawn();
 }
 
 #[cfg(test)]
@@ -151,5 +122,12 @@ mod tests {
         // 缺字段 / 非 JSON：None（调用方放弃该行）。
         assert!(parse_outbox_payload("not json").is_none());
         assert!(parse_outbox_payload(r#"{"conv":"c"}"#).is_none());
+    }
+
+    /// Wave C：kind 常量钉值——store 行、main 的 sweeper 名单、日志口径都
+    /// 以它为单一事实源，漂移即测试红。
+    #[test]
+    fn outbox_kind_value() {
+        assert_eq!(OUTBOX_KIND, "feishu_text");
     }
 }
