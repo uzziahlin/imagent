@@ -7,10 +7,10 @@
 //! 捕获变量收敛为结构体，纯移动）。
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
 use tracing::{debug, warn};
 
 use imagent_core::{ConvId, Dedup, InboundMessage, MediaRef, ReplyHint, Result};
@@ -51,6 +51,15 @@ impl Drop for DrainEventTimer {
             .observe(self.started.elapsed().as_secs_f64());
     }
 }
+
+/// P2-3（code-review v14）：媒体下载 / 合并转发拉取 / 群上下文拉取的全局
+/// 并发闸（drain 三类作业此前无并发上限——事件风暴下 spawn 无界，同时打满
+/// 连接与内存）。permit 在进入下载段前 acquire_owned、hold 到该段落盘完成
+///（drop）；下载侧「整读进内存」的结构性改造（流式落盘）另行，本闸是并发
+/// 面的止血。8 与 mock/真机常见的 50 并发连接上限留出余量。
+/// Arc 包装：acquire_owned 需要 `self: Arc<Self>`（permit 'static 可跨 await
+/// 移动进 spawn 的任务）。
+static MEDIA_SEMAPHORE: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(8)));
 
 /// drain task 的共享句柄集合（原 new() 内联 spawn 闭包的捕获变量收敛为
 /// 结构体——字段语义与原局部变量一一对应，纯移动）。
@@ -226,6 +235,13 @@ pub(super) async fn run(ctx: DrainContext) {
                         let sec = app_secret.clone();
                         let fallback_conv = ConvId(conv_key.clone());
                         let handle = tokio::spawn(async move {
+                            // P2-3（code-review v14）：合并转发拉取与媒体下载同
+                            // 走并发闸（permit 覆盖整个分页拉取段）。
+                            let _permit = MEDIA_SEMAPHORE
+                                .clone()
+                                .acquire_owned()
+                                .await
+                                .expect("MEDIA_SEMAPHORE 永不关闭");
                             let fetched = fetch_merge_forward_items(
                                 &cfg,
                                 &token_lock,
@@ -356,25 +372,31 @@ pub(super) async fn run(ctx: DrainContext) {
                     let conv_key = msg.conv_id.0.clone();
                     // v1.25 引用上下文：回复（parent_id）消息拉被引用正文前置进
                     // prompt——群聊引用追问是 Slack 线程上下文的等价物。守卫：
-                    // ①短文本（≤4 字符，疑似 y/n 审批回复）不加引，防破坏
-                    // 审批路由；②拉取失败 fail-soft 原样发送。与媒体处理合流
-                    // 到同一异步作业（保序经泵）。
+                    // ①审批/询问/命令候选（is_explicit_reply_word 或 ask:/斜杠
+                    // 前缀，见 [`quote_parent_for`]）不加引，防破坏审批路由；
+                    // ②拉取失败 fail-soft 原样发送。与媒体处理合流到同一异步
+                    // 作业（保序经泵）。
                     // T19：peek_reply_parent 的字节版重解析改为复用已解析消息的
                     // reply_to（= parent_id，非空过滤同源）+ om_ 前缀过滤——与原
                     // 谓词等价（peek_reply_parent 即 parent_id 非空 + om_ 前缀），
                     // 省一次反序列化。
-                    let quote_parent = msg
-                        .reply_to
-                        .clone()
-                        .filter(|p| p.starts_with("om_"))
-                        .filter(|_| msg.text.as_deref().is_some_and(|t| t.trim().len() > 4));
+                    // P2-1（code-review v14）：守卫改为「不是审批/询问/命令候选
+                    // 才注入」——旧的 `trim().len() > 4` 是字节数，中文审批词
+                    // （允许/没问题）与 always 全部漏拦：引文前置后
+                    // parse_reply 全字匹配失败 → 批准变拒绝。
+                    let quote_parent = quote_parent_for(&msg);
                     // T10 群聊上下文：群 conv（含话题群——免 @ 窗口语义下同样
                     // 适用，无需特判）且配置 > 0 时拉本群最近 N 条前置注入；
                     // 私聊/评论 conv 天然不命中。与引用上下文同款 fail-soft，
                     // 同一异步作业内**后于**引用注入执行（群上下文块在引用块
                     // 之前——更早的背景）。
+                    // P2-4（code-review v14）：话题 conv 附带话题 root——拉取后
+                    // 只保留本话题条目（话题=独立会话）。
                     let group_ctx_chat = crate::proto::group_chat_id_of_conv(&msg.conv_id.0)
                         .filter(|_| group_context_messages > 0);
+                    let group_ctx_thread_root =
+                        thread_target_from_conv(&ConvId(msg.conv_id.0.clone()))
+                            .map(|(_, root)| root);
                     let needs_async =
                         !pending.is_empty() || quote_parent.is_some() || group_ctx_chat.is_some();
                     let job = if !needs_async {
@@ -386,6 +408,7 @@ pub(super) async fn run(ctx: DrainContext) {
                         let sec = app_secret.clone();
                         let pending = pending.clone();
                         let group_ctx_limit = group_context_messages;
+                        let group_ctx_thread_root = group_ctx_thread_root.clone();
                         PumpJob::Media(tokio::spawn(async move {
                             let mut msg = msg;
                             if let Some(parent_id) = quote_parent.as_deref() {
@@ -404,6 +427,7 @@ pub(super) async fn run(ctx: DrainContext) {
                                     &mut msg,
                                     chat_id,
                                     group_ctx_limit,
+                                    group_ctx_thread_root.as_deref(),
                                     &token_lock,
                                     &cfg,
                                     &aid,
@@ -858,6 +882,81 @@ fn group_reply_anchor(conv: &str, source_msg_id: Option<&str>) -> Option<(String
     Some((conv.to_string(), mid.to_string()))
 }
 
+/// P2-1（code-review v14）：审批回复词表的**本地镜像**——core 的判定函数
+/// `permission::is_explicit_reply_word`（ALLOW/DENY/ALWAYS 词表全字匹配）在
+/// HEAD 未公开导出（`mod permission` 私有，`pub use` 清单不含它，已核实），
+/// feishu 侧只能镜像；词表演进（如 P2-12 补中文确认词）须同步此处，core
+/// 导出后换用 `imagent_core::permission::is_explicit_reply_word` 消重。
+const REPLY_ALLOW_WORDS: &[&str] = &[
+    "y",
+    "yes",
+    "ye",
+    "yep",
+    "yeah",
+    "ok",
+    "okay",
+    "是",
+    "允许",
+    "好",
+    "好的",
+    "可以",
+    "行",
+    "没问题",
+    "好呀",
+    "行吧",
+    "可以吧",
+    "嗯",
+];
+const REPLY_DENY_WORDS: &[&str] = &[
+    "n",
+    "no",
+    "nope",
+    "nah",
+    "不",
+    "否",
+    "不要",
+    "不行",
+    "不可以",
+    "不许",
+    "拒绝",
+    "不批",
+];
+const REPLY_ALWAYS_WORDS: &[&str] = &["always", "始终允许", "会话内允许"];
+
+/// [`REPLY_*_WORDS`] 的全字匹配（trim + 小写），语义镜像 core 的
+/// `is_explicit_reply_word`。
+fn is_explicit_reply_word(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let lower = t.to_ascii_lowercase();
+    REPLY_ALLOW_WORDS.contains(&lower.as_str())
+        || REPLY_DENY_WORDS.contains(&lower.as_str())
+        || REPLY_ALWAYS_WORDS.contains(&lower.as_str())
+}
+
+/// P2-1（code-review v14）：引用注入的准入守卫（纯函数，便于单测）。
+/// 回复（reply_to = om_ 平台消息）且正文**不是**审批/询问/命令候选时才注入
+/// 引文：
+/// - 审批词表（上方本地镜像，全字匹配）命中 → 跳过——引文会把「允许」前置成
+///   「（用户引用了…）:\n> …\n\n允许」，parse_reply 全字匹配失败，批准变拒绝；
+/// - `ask:` 前缀（AskUserQuestion 选项回执）与 `/` 前缀（斜杠命令）同理跳过。
+///
+/// 旧守卫 `trim().len() > 4` 是**字节**数——中文审批词与 always 全部漏拦。
+fn quote_parent_for(msg: &InboundMessage) -> Option<String> {
+    let parent = msg.reply_to.as_deref().filter(|p| p.starts_with("om_"))?;
+    let text = msg
+        .text
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())?;
+    if is_explicit_reply_word(text) || text.starts_with("ask:") || text.starts_with('/') {
+        return None;
+    }
+    Some(parent.to_string())
+}
+
 /// 原始事件载荷的日志安全形态：头 `max_chars` 字符（char 边界安全，多字节
 /// UTF-8 不劈开）。v13-P3 收口——`card.action.trigger` 载荷含 Bash 审批命令
 /// 全文（可能有 secret/内网地址）与用户表单输入，全量进日志的泄露面大于排障
@@ -912,7 +1011,17 @@ async fn enrich_with_quote(
                         return;
                     }
                 };
-                match crate::client::list_merge_forward(cfg, &token, parent_id).await {
+                // P3b（code-review v14）：引用路径 expand_nested=false——嵌套
+                // 展开只有直发 8000 字预算才做；引用块预算 1500 字，展开的
+                // 嵌套条目随即被截掉，白付每次 1 条的拉取配额。
+                match crate::client::list_merge_forward(cfg, &token, parent_id, false).await {
+                    Ok(items) if items.is_empty() => {
+                        // P3c（code-review v14）：空 items 不注入「共 0 条」
+                        // 占位转录（可能已撤回或形态异常）——fail-soft 静默跳过
+                        //（引用是辅助上下文，回提示反而是噪音）。
+                        debug!(target: "feishu", parent_id, "引用合并转发子消息为空（可能已撤回），跳过引用注入");
+                        return;
+                    }
                     Ok(items) => Some(
                         crate::proto::render_merge_forward_transcript(&items, None, None)
                             .trim()
@@ -944,7 +1053,14 @@ async fn enrich_with_quote(
         return;
     };
     let cap = if wide_quote { 1_500 } else { 500 };
+    let total = quote.chars().count();
+    // P3b（code-review v14）：截断处补标记——静默截断让 agent 把残句当全文。
     let quote: String = quote.chars().take(cap).collect();
+    let quote = if total > cap {
+        format!("{quote}\n（引用内容过长已截断）")
+    } else {
+        quote
+    };
     let base = msg.text.take().unwrap_or_default();
     msg.text = Some(format!(
         "（用户引用了以下消息，针对它追问）:\n> {}\n\n{base}",
@@ -961,22 +1077,56 @@ async fn enrich_with_quote(
 ///   返回 None）；
 /// - 与引用上下文共存时**后于**其执行（调用序），群上下文块落在引用块之前——
 ///   更早的背景；纯媒体轮次（text 空）只注入块本身。
+/// - P2-4（code-review v14）：话题 conv（`thread_root` 非 None）只保留 root_id
+///   匹配本话题的条目——「话题=独立会话互不共享上下文」；响应缺 root_id 字段
+///   （API 形态不含话题归属）则整轮跳过注入（fail-safe：宁缺毋跨话题）。
+/// - P2-4（code-review v14）：per-chat 15s 拉取去抖（时间窗内重复拉取直接跳过
+///   ——只去抖**拉取**，注入语义不变；失败也占窗，防拉取错误风暴）。
 #[allow(clippy::too_many_arguments)]
 async fn enrich_with_group_context(
     msg: &mut InboundMessage,
     chat_id: &str,
     limit: usize,
+    thread_root: Option<&str>,
     token_lock: &Arc<RwLock<Option<(String, Instant)>>>,
     cfg: &CoreConfig,
     aid: &str,
     sec: &str,
 ) {
+    // P2-4：per-chat 拉取去抖（15s）。std::sync::Mutex：临界区无 await。
+    // 粗上限：超限整体清空（与 user_names 等表的惯例一致——去抖窗短暂失效
+    // 无害，下轮重新记账）。
+    static GROUP_CTX_FETCH_AT: LazyLock<std::sync::Mutex<HashMap<String, Instant>>> =
+        LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+    const GROUP_CTX_DEBOUNCE: Duration = Duration::from_secs(15);
+    const GROUP_CTX_CHAT_CAP: usize = 512;
+    {
+        let mut last = GROUP_CTX_FETCH_AT.lock().unwrap_or_else(|e| e.into_inner());
+        if last.len() >= GROUP_CTX_CHAT_CAP {
+            last.clear();
+        }
+        if last
+            .get(chat_id)
+            .is_some_and(|t| t.elapsed() < GROUP_CTX_DEBOUNCE)
+        {
+            debug!(target: "feishu", chat_id, "群上下文 15s 去抖窗口内，跳过本轮拉取");
+            return;
+        }
+        last.insert(chat_id.to_string(), Instant::now());
+    }
+    // P2-3：下载段并发闸（token 失效自愈的重试也在 permit 内——同一次拉取
+    // 不应并发两份）。
+    let _permit = MEDIA_SEMAPHORE
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("MEDIA_SEMAPHORE 永不关闭");
     let fetched = async {
         let t = fetch_cached_token(token_lock, cfg, aid, sec).await?;
         crate::client::list_chat_messages(cfg, &t, chat_id, limit, aid).await
     }
     .await;
-    let items = match fetched {
+    let mut items = match fetched {
         Ok(items) => items,
         // token 失效自愈：清缓存强制刷新后重试一次（与媒体下载同语义）。
         Err(e) if crate::client::is_token_invalid_err(&e) => {
@@ -1009,6 +1159,16 @@ async fn enrich_with_group_context(
             return;
         }
     };
+    // P2-4：话题过滤——只留 root_id 匹配本话题的条目；响应若整体缺 root_id
+    // 字段（无任何非空值），无法区分话题归属，跳过注入（宁缺毋跨话题）。
+    if let Some(root) = thread_root {
+        let field_usable = items.iter().any(|it| !it.root_id.is_empty());
+        if !field_usable {
+            debug!(target: "feishu", chat_id, "话题群历史响应缺 root_id 字段，跳过注入（防跨话题共享上下文）");
+            return;
+        }
+        items.retain(|it| it.root_id == root);
+    }
     // 退化转录检测（真机校准教训）：text 条目正文为空 → 群上下文只剩类型
     // 占位标签，warn 附形状便于定位 schema 漂移（正常路径静默）。
     if items
@@ -1055,6 +1215,13 @@ async fn process_pending_media(
                 continue;
             }
         };
+        // P2-3（code-review v14）：下载段并发闸——permit 覆盖下载+落盘/转写
+        //（迭代末 drop），事件风暴下并发下载有界；非下载段（记账等）不占 permit。
+        let _dl_permit = MEDIA_SEMAPHORE
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("MEDIA_SEMAPHORE 永不关闭");
         let dl = match p.kind {
             "image" => download_image(core_config, &token, &p.message_id, &p.key).await,
             // W3-1：语音资源同 file 走 message-resource 接口。
@@ -1302,12 +1469,12 @@ async fn fetch_merge_forward_items(
     message_id: &str,
 ) -> Result<Vec<MergedForwardItem>> {
     let t = fetch_cached_token(token_lock, core_config, app_id, app_secret).await?;
-    match list_merge_forward(core_config, &t, message_id).await {
+    match list_merge_forward(core_config, &t, message_id, true).await {
         Err(e) if crate::client::is_token_invalid_err(&e) => {
             warn!(target: "feishu", error = %e, "合并转发拉取遇 token 失效码，清缓存刷新后重试一次");
             *token_lock.write().await = None;
             let fresh = fetch_cached_token(token_lock, core_config, app_id, app_secret).await?;
-            list_merge_forward(core_config, &fresh, message_id).await
+            list_merge_forward(core_config, &fresh, message_id, true).await
         }
         other => other,
     }
@@ -1332,6 +1499,12 @@ fn merge_forward_outcome(
     summary: Option<&str>,
 ) -> MergeForwardOutcome {
     match fetched {
+        // P3c（code-review v14）：空 items 不产出「共 0 条」占位转录进 agent
+        //（可能已撤回或形态异常）——与拉取失败同走 Fallback 用户可读提示
+        //（语义一致：直发合并转发是用户显式动作，缺内容须可感知）。
+        Ok(items) if items.is_empty() => MergeForwardOutcome::Fallback(
+            "⚠️ 转发记录拉取为空（可能已撤回或形态异常），请直接复制文字发送".into(),
+        ),
         Ok(items) => MergeForwardOutcome::Agent(format!(
             "（以下为用户转发的聊天记录）\n\n{}",
             render_merge_forward_transcript(items, title, summary)
@@ -1370,6 +1543,30 @@ pub(super) async fn send_drain_text_result(
     conv: &ConvId,
     text: &str,
 ) -> Result<()> {
+    send_drain_text_result_with_uuid(
+        core_config,
+        token_lock,
+        app_id,
+        app_secret,
+        conv,
+        text,
+        None,
+    )
+    .await
+}
+
+/// P2-5（code-review v14）：[`send_drain_text_result`] 的外带幂等键版——
+/// outbox 泵重发时透传落盘时的 uuid（reply/create 路径同键，飞书幂等窗口内
+/// 去重，重试不再重复触达）；None = 现生成（原语义）。
+pub(super) async fn send_drain_text_result_with_uuid(
+    core_config: &CoreConfig,
+    token_lock: &Arc<RwLock<Option<(String, Instant)>>>,
+    app_id: &str,
+    app_secret: &str,
+    conv: &ConvId,
+    text: &str,
+    idempotency_uuid: Option<&str>,
+) -> Result<()> {
     let t = fetch_cached_token(token_lock, core_config, app_id, app_secret).await?;
     if let Some((file_token, comment_id)) = comment_target_from_conv(conv) {
         return match comment_id {
@@ -1387,12 +1584,26 @@ pub(super) async fn send_drain_text_result(
             &root_id,
             "text",
             &serde_json::json!({ "text": text }).to_string(),
-            None,
+            idempotency_uuid,
         )
         .await
         .map(|_| ())
     } else if let Some((receive_id, kind)) = receive_target_from_conv(conv) {
-        send_text_msg(core_config, &t, &receive_id, kind, text, false).await
+        match idempotency_uuid {
+            Some(u) => {
+                crate::client::send_text_msg_with_uuid(
+                    core_config,
+                    &t,
+                    &receive_id,
+                    kind,
+                    text,
+                    false,
+                    u,
+                )
+                .await
+            }
+            None => send_text_msg(core_config, &t, &receive_id, kind, text, false).await,
+        }
     } else {
         Ok(())
     }
@@ -1467,7 +1678,8 @@ fn spawn_welcome_card(
             {
                 warn!(target: "feishu", error = %e, conv_id = %conv.0, "欢迎文本回落也失败（转 outbox）");
                 if let Some(store) = outbox {
-                    let payload = serde_json::json!({ "conv": conv.0, "text": text }).to_string();
+                    // P2-5（code-review v14）：落盘 payload 带幂等 uuid（泵重发透传）。
+                    let payload = super::outbox::outbox_payload(&conv.0, &text);
                     let _ = store.enqueue_outbox(&conv.0, "feishu_text", &payload).await;
                 }
             }
@@ -1504,7 +1716,8 @@ fn spawn_drain_text(
         {
             warn!(target: "feishu", error = %e, conv_id = %conv.0, "drain 提示发送失败（转入 outbox 重试）");
             if let Some(store) = outbox {
-                let payload = serde_json::json!({ "conv": conv.0, "text": text }).to_string();
+                // P2-5（code-review v14）：落盘 payload 带幂等 uuid（泵重发透传）。
+                let payload = super::outbox::outbox_payload(&conv.0, &text);
                 if let Err(e2) = store.enqueue_outbox(&conv.0, "feishu_text", &payload).await {
                     warn!(target: "feishu", error = %e2, "outbox 落盘失败（提示丢失）");
                 }
@@ -1737,6 +1950,17 @@ mod tests {
             }
             other => panic!("失败路径应为 Fallback: {other:?}"),
         }
+
+        // P3c（code-review v14）：空 items（可能已撤回/形态异常）不产出
+        // 「共 0 条」占位转录进 agent——同样走 Fallback 用户可读提示。
+        match merge_forward_outcome(&Ok(Vec::new()), None, None) {
+            MergeForwardOutcome::Fallback(notice) => {
+                assert!(notice.contains("转发记录拉取为空"), "{notice}");
+                assert!(notice.contains("可能已撤回"), "{notice}");
+                assert!(notice.contains("请直接复制文字发送"), "{notice}");
+            }
+            other => panic!("空 items 应为 Fallback: {other:?}"),
+        }
     }
 
     /// 群文本入站消息（@bot 已剥离后的形态）。
@@ -1789,6 +2013,8 @@ mod tests {
 
     /// 群消息进轮次 → 本群最近 N 条（跳过 bot 消息、时间正序）前置注入 prompt，
     /// 头尾格式与正文保留都在位。
+    /// P2-4（code-review v14）：chat id 用测试唯一值——群上下文拉取有 per-chat
+    /// 15s 去抖（全局表），并行测试共用 chat id 会互相吃掉拉取窗口。
     #[tokio::test]
     async fn enrich_with_group_context_injects_recent_block() {
         let base = spawn_mock_feishu(std::sync::Arc::new(|path: &str| {
@@ -1802,7 +2028,17 @@ mod tests {
         let cfg = mock_core_config(&base);
         let token = cached_token();
         let mut msg = mk_group_text_msg("帮我们看看刚才讨论的");
-        enrich_with_group_context(&mut msg, "oc_g", 10, &token, &cfg, "cli_mock", "sec_mock").await;
+        enrich_with_group_context(
+            &mut msg,
+            "oc_g_inject",
+            10,
+            None,
+            &token,
+            &cfg,
+            "cli_mock",
+            "sec_mock",
+        )
+        .await;
         let text = msg.text.as_deref().expect("应注入文本");
         assert!(
             text.starts_with("【群最近上下文（2 条，最新在最后）】"),
@@ -1834,7 +2070,17 @@ mod tests {
         let cfg = mock_core_config(&base);
         let token = cached_token();
         let mut msg = mk_group_text_msg("原文不动");
-        enrich_with_group_context(&mut msg, "oc_g", 10, &token, &cfg, "cli_mock", "sec_mock").await;
+        enrich_with_group_context(
+            &mut msg,
+            "oc_g_failsoft",
+            10,
+            None,
+            &token,
+            &cfg,
+            "cli_mock",
+            "sec_mock",
+        )
+        .await;
         assert_eq!(
             msg.text.as_deref(),
             Some("原文不动"),
@@ -1843,7 +2089,7 @@ mod tests {
     }
 
     /// 与引用上下文共存：群上下文块在引用块**之前**（更早的背景），正文最后
-    ///（对齐 drain 内「先 quote 后 group」的调用序）。
+    ///（对齐 drain 内「先 quote 后 group」的调用序）。chat id 唯一（去抖）。
     #[tokio::test]
     async fn enrich_with_quote_then_group_context_order() {
         let quote_body = serde_json::json!({
@@ -1868,7 +2114,17 @@ mod tests {
         let token = cached_token();
         let mut msg = mk_group_text_msg("这个报错怎么修");
         enrich_with_quote(&mut msg, "om_parent", &token, &cfg, "cli_mock", "sec_mock").await;
-        enrich_with_group_context(&mut msg, "oc_g", 10, &token, &cfg, "cli_mock", "sec_mock").await;
+        enrich_with_group_context(
+            &mut msg,
+            "oc_g_order",
+            10,
+            None,
+            &token,
+            &cfg,
+            "cli_mock",
+            "sec_mock",
+        )
+        .await;
         let text = msg.text.as_deref().expect("两块都应注入");
         let group = text.find("【群最近上下文").expect("群上下文块在位");
         let quote = text.find("（用户引用了以下消息").expect("引用块在位");
@@ -1951,5 +2207,381 @@ mod tests {
             "header": {"event_type": "im.message.receive_v1"}, "event": {"message": {}}
         });
         assert_eq!(message_type_of(&no_type), "");
+    }
+
+    // ------------------------------------------------------------------
+    // code-review v14：P2-1（引用守卫）/ P2-3（并发闸）/ P2-4（话题过滤+去抖）
+    // / P3b（引用截断标记+免嵌套展开）/ P3c（空 items 不注入）
+    // ------------------------------------------------------------------
+
+    /// 带指定 reply_to 的群消息（P2-1 守卫测试用）。
+    fn mk_reply_msg(text: &str, reply_to: Option<&str>) -> InboundMessage {
+        let mut m = mk_group_text_msg(text);
+        m.reply_to = reply_to.map(String::from);
+        m
+    }
+
+    /// P2-1：引用注入守卫——审批/询问/命令候选不注入引文（原样发送）。
+    /// 旧守卫 `trim().len() > 4` 是字节数：中文审批词（允许/没问题）与
+    /// always（5 字节，trim 后 ≤4 的 y/n 更不必说）全部漏拦，引文前置后
+    /// parse_reply 全字匹配失败 → 批准变拒绝。
+    #[test]
+    fn quote_guard_blocks_reply_candidates() {
+        // 精确审批词（core 词表的本地镜像）：中英文全字命中 → 不注入。
+        for word in [
+            "y",
+            "n",
+            "yes",
+            "no",
+            "ok",
+            "always",
+            "允许",
+            "拒绝",
+            "可以",
+            "没问题",
+            "始终允许",
+            "会话内允许",
+        ] {
+            let msg = mk_reply_msg(word, Some("om_quoted"));
+            assert!(
+                quote_parent_for(&msg).is_none(),
+                "审批词「{word}」不得被前置引文污染"
+            );
+        }
+        // ask: 回执与斜杠命令：同样不注入。
+        for t in ["ask:方案A", "/help", "/config require_mention on"] {
+            let msg = mk_reply_msg(t, Some("om_quoted"));
+            assert!(
+                quote_parent_for(&msg).is_none(),
+                "「{t}」不得被前置引文污染"
+            );
+        }
+        // 自由文本追问：照常注入（引用上下文的正常场景）。
+        let free = mk_reply_msg("这个报错怎么解决", Some("om_quoted"));
+        assert_eq!(quote_parent_for(&free).as_deref(), Some("om_quoted"));
+        // 「允许」出现在长句中不是审批词（全字匹配语义）——照常注入。
+        let free2 = mk_reply_msg("允许我补充一点背景再回答", Some("om_quoted"));
+        assert!(quote_parent_for(&free2).is_some(), "自由长句照常注入");
+        // 非回复 / 空 text / 非 om_ parent：不注入（原有守卫语义）。
+        assert!(quote_parent_for(&mk_reply_msg("随便聊聊", None)).is_none());
+        assert!(quote_parent_for(&mk_reply_msg("", Some("om_q"))).is_none());
+        assert!(quote_parent_for(&mk_reply_msg("文本", Some("oc_not_msg"))).is_none());
+    }
+
+    /// P2-3：媒体/合并转发/群上下文的并发闸——permit 数恒 8，acquire/release
+    /// 往返后恢复；并发任务观测到的同时在临界区的数量 ≤ 8。
+    #[tokio::test]
+    async fn media_semaphore_bounds_concurrency() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // 上限断言（并行测试可能瞬时持有 permit，只验「不多于 8」）。
+        assert!(MEDIA_SEMAPHORE.available_permits() <= 8, "permit 总数=8");
+        // 并发观测：20 个任务各占 permit 50ms，任意时刻临界区 ≤ 8
+        //（其他测试若同时持 permit 只会让观测值更小，断言方向安全）。
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let inflight = inflight.clone();
+            let max_seen = max_seen.clone();
+            handles.push(tokio::spawn(async move {
+                let _p = MEDIA_SEMAPHORE
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("MEDIA_SEMAPHORE 永不关闭");
+                let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                inflight.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert!(
+            max_seen.load(Ordering::SeqCst) <= 8,
+            "并发临界区 ≤ 8: {}",
+            max_seen.load(Ordering::SeqCst)
+        );
+        assert_eq!(inflight.load(Ordering::SeqCst), 0, "全部释放");
+    }
+
+    /// P2-4：话题群只保留本话题条目——root_id 匹配 conv 第三段的才注入，
+    /// 其它话题/主时间线条目不进 prompt（话题=独立会话互不共享上下文）。
+    #[tokio::test]
+    async fn group_context_thread_filter_keeps_only_own_thread() {
+        let body = serde_json::json!({
+            "code": 0,
+            "data": { "items": [
+                {
+                    "message_id": "om_t1", "msg_type": "text", "create_time": "1788000001",
+                    "root_id": "om_root_a",
+                    "sender": { "id": "ou_a", "id_type": "open_id", "sender_type": "user" },
+                    "body": { "content": "{\"text\":\"本话题的消息\"}" }
+                },
+                {
+                    "message_id": "om_t2", "msg_type": "text", "create_time": "1788000002",
+                    "root_id": "om_root_b",
+                    "sender": { "id": "ou_b", "id_type": "open_id", "sender_type": "user" },
+                    "body": { "content": "{\"text\":\"别的话题的消息\"}" }
+                },
+                {
+                    "message_id": "om_main", "msg_type": "text", "create_time": "1788000003",
+                    "sender": { "id": "ou_c", "id_type": "open_id", "sender_type": "user" },
+                    "body": { "content": "{\"text\":\"主时间线的消息\"}" }
+                }
+            ]}
+        })
+        .to_string();
+        let base = spawn_mock_feishu(std::sync::Arc::new(move |_path: &str| {
+            (200u16, body.clone())
+        }))
+        .await;
+        let cfg = mock_core_config(&base);
+        let token = cached_token();
+        let mut msg = mk_group_text_msg("继续这个话题");
+        enrich_with_group_context(
+            &mut msg,
+            "oc_thread",
+            10,
+            Some("om_root_a"),
+            &token,
+            &cfg,
+            "cli_mock",
+            "sec_mock",
+        )
+        .await;
+        let text = msg.text.as_deref().expect("应注入");
+        assert!(text.contains("本话题的消息"), "{text}");
+        assert!(!text.contains("别的话题的消息"), "跨话题不得泄漏: {text}");
+        assert!(!text.contains("主时间线的消息"), "主时间线不得泄漏: {text}");
+        assert!(text.ends_with("继续这个话题"), "正文保留: {text}");
+        // 本话题条目被过滤后为空（窗口内无本话题消息）→ 不注入（render None）。
+        let mut msg2 = mk_group_text_msg("新话题首问");
+        enrich_with_group_context(
+            &mut msg2,
+            "oc_thread2",
+            10,
+            Some("om_root_none"),
+            &token,
+            &cfg,
+            "cli_mock",
+            "sec_mock",
+        )
+        .await;
+        assert_eq!(
+            msg2.text.as_deref(),
+            Some("新话题首问"),
+            "无本话题条目 → 不注入"
+        );
+    }
+
+    /// P2-4：话题 conv 且响应缺 root_id 字段（API 形态不含话题归属）→
+    /// 跳过注入（fail-safe 宁缺毋跨话题）；普通群 conv（thread_root=None）
+    /// 不受影响照常注入。
+    #[tokio::test]
+    async fn group_context_thread_skip_when_root_id_missing() {
+        let base = spawn_mock_feishu(std::sync::Arc::new(|_path: &str| {
+            (200u16, group_context_list_body())
+        }))
+        .await;
+        let cfg = mock_core_config(&base);
+        let token = cached_token();
+        // 话题 conv：group_context_list_body 的条目无 root_id → 跳过。
+        let mut thread_msg = mk_group_text_msg("话题内追问");
+        enrich_with_group_context(
+            &mut thread_msg,
+            "oc_thread_noroot",
+            10,
+            Some("om_root_x"),
+            &token,
+            &cfg,
+            "cli_mock",
+            "sec_mock",
+        )
+        .await;
+        assert_eq!(
+            thread_msg.text.as_deref(),
+            Some("话题内追问"),
+            "缺 root_id 字段：跳过注入（不跨话题共享）"
+        );
+        // 普通群（thread_root=None）：照常注入（root_id 缺失不影响）。
+        let mut plain_msg = mk_group_text_msg("普通群追问");
+        enrich_with_group_context(
+            &mut plain_msg,
+            "oc_plain_noroot",
+            10,
+            None,
+            &token,
+            &cfg,
+            "cli_mock",
+            "sec_mock",
+        )
+        .await;
+        assert!(
+            plain_msg
+                .text
+                .as_deref()
+                .unwrap()
+                .contains("【群最近上下文"),
+            "普通群不受话题过滤影响"
+        );
+    }
+
+    /// P2-4：per-chat 15s 拉取去抖——窗口内同 chat 的第二次拉取直接跳过
+    ///（HTTP 不再打），注入语义不变（本轮不注入）。
+    #[tokio::test]
+    async fn group_context_debounce_skips_refetch_within_window() {
+        let hits = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let hits_c = hits.clone();
+        let base = spawn_mock_feishu(std::sync::Arc::new(move |_path: &str| {
+            *hits_c.lock().unwrap() += 1;
+            (200u16, group_context_list_body())
+        }))
+        .await;
+        let cfg = mock_core_config(&base);
+        let token = cached_token();
+        let mut first = mk_group_text_msg("第一条");
+        enrich_with_group_context(
+            &mut first,
+            "oc_debounce",
+            10,
+            None,
+            &token,
+            &cfg,
+            "cli_mock",
+            "sec_mock",
+        )
+        .await;
+        assert!(
+            first.text.as_deref().unwrap().contains("【群最近上下文"),
+            "窗口外首次拉取照常注入"
+        );
+        let mut second = mk_group_text_msg("第二条");
+        enrich_with_group_context(
+            &mut second,
+            "oc_debounce",
+            10,
+            None,
+            &token,
+            &cfg,
+            "cli_mock",
+            "sec_mock",
+        )
+        .await;
+        assert_eq!(*hits.lock().unwrap(), 1, "窗口内不重复拉取");
+        assert_eq!(
+            second.text.as_deref(),
+            Some("第二条"),
+            "去抖轮次原样通过（不注入）"
+        );
+    }
+
+    /// P3b：引用合并转发——超 1500 字截断处补「（引用内容过长已截断）」标记；
+    /// 引用路径 expand_nested=false（嵌套条目不再逐条拉取，GET 次数有界）。
+    #[tokio::test]
+    async fn quote_merge_forward_truncation_marker_and_no_nested_expansion() {
+        let long_text: String = "报错日志".repeat(800); // 转录 > 1500 字符
+        let parent_body = serde_json::json!({
+            "code": 0,
+            "data": { "items": [ {
+                "msg_type": "merge_forward",
+                "body": { "content": "Merged and Forwarded Message" }
+            }]}
+        })
+        .to_string();
+        let sub_items_body = serde_json::json!({
+            "code": 0,
+            "data": { "items": [
+                { "message_id": "om_parent", "msg_type": "merge_forward" },
+                {
+                    "message_id": "om_sub_long", "upper_message_id": "om_parent",
+                    "msg_type": "text", "create_time": "1788000001",
+                    "sender": { "id": "ou_a", "id_type": "open_id", "sender_type": "user" },
+                    "body": { "content": format!("{{\"text\":\"{long_text}\"}}") }
+                },
+                {
+                    "message_id": "om_sub_nested", "upper_message_id": "om_parent",
+                    "msg_type": "merge_forward", "create_time": "1788000002",
+                    "sender": { "id": "ou_b", "id_type": "open_id", "sender_type": "user" },
+                    "body": { "content": "Merged and Forwarded Message" }
+                }
+            ]}
+        })
+        .to_string();
+        let gets = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let gets_c = gets.clone();
+        let base = spawn_mock_feishu(std::sync::Arc::new(move |_path: &str| {
+            let n = {
+                let mut g = gets_c.lock().unwrap();
+                *g += 1;
+                *g
+            };
+            // ① fetch_message_raw（父消息形态）；② list_merge_forward（子消息）。
+            if n == 1 {
+                (200u16, parent_body.clone())
+            } else {
+                (200u16, sub_items_body.clone())
+            }
+        }))
+        .await;
+        let cfg = mock_core_config(&base);
+        let token = cached_token();
+        let mut msg = mk_group_text_msg("这个转发里的报错怎么修");
+        enrich_with_quote(&mut msg, "om_parent", &token, &cfg, "cli_mock", "sec_mock").await;
+        let text = msg.text.as_deref().expect("应注入引用");
+        assert!(
+            text.contains("（引用内容过长已截断）"),
+            "截断处补标记: {text}"
+        );
+        assert!(text.contains("这个转发里的报错怎么修"), "正文保留: {text}");
+        // expand_nested=false：嵌套条目（om_sub_nested）不再拉取——GET 恰 2 次
+        //（父消息 + 子消息列表），无第三次。
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let total_gets = *gets.lock().unwrap();
+        assert_eq!(total_gets, 2, "引用路径不展开嵌套: {total_gets}");
+    }
+
+    /// P3c：引用合并转发拉回空 items（可能已撤回或形态异常）——不注入
+    /// 「共 0 条」占位转录，prompt 原样通过。
+    #[tokio::test]
+    async fn quote_merge_forward_empty_items_skips_injection() {
+        let parent_body = serde_json::json!({
+            "code": 0,
+            "data": { "items": [ {
+                "msg_type": "merge_forward",
+                "body": { "content": "Merged and Forwarded Message" }
+            }]}
+        })
+        .to_string();
+        let empty_body = serde_json::json!({
+            "code": 0,
+            "data": { "items": [ { "message_id": "om_parent", "msg_type": "merge_forward" } ] }
+        })
+        .to_string();
+        let gets = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let gets_c = gets.clone();
+        let base = spawn_mock_feishu(std::sync::Arc::new(move |_path: &str| {
+            let n = {
+                let mut g = gets_c.lock().unwrap();
+                *g += 1;
+                *g
+            };
+            if n == 1 {
+                (200u16, parent_body.clone())
+            } else {
+                (200u16, empty_body.clone())
+            }
+        }))
+        .await;
+        let cfg = mock_core_config(&base);
+        let token = cached_token();
+        let mut msg = mk_group_text_msg("看看这个转发");
+        enrich_with_quote(&mut msg, "om_parent", &token, &cfg, "cli_mock", "sec_mock").await;
+        assert_eq!(
+            msg.text.as_deref(),
+            Some("看看这个转发"),
+            "空 items 不注入占位转录"
+        );
     }
 }

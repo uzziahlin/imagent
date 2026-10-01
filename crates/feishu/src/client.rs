@@ -267,11 +267,19 @@ async fn feishu_api_resp(
     op: &str,
 ) -> imagent_core::Result<serde_json::Value> {
     if resp.status().as_u16() == 429 {
-        return Err(FeishuApiError {
-            code: 429,
-            msg: "HTTP 429".to_string(),
-        }
-        .into_core_error(op));
+        // P3p（code-review v14）：读取 Retry-After 头（只处理秒数形态；HTTP-date
+        // 形态不解析，回退固定退避）进错误串——retry 宏据此 sleep，不再无视
+        // 服务端明示的等待窗口（固定 500ms 序列会连续撞同一窗口）。
+        let retry_after = resp
+            .headers()
+            .get("Retry-After")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        let msg = match retry_after {
+            Some(secs) => format!("HTTP 429 (Retry-After: {secs}s)"),
+            None => "HTTP 429".to_string(),
+        };
+        return Err(FeishuApiError { code: 429, msg }.into_core_error(op));
     }
     let status = resp.status().as_u16();
     let body = resp
@@ -409,6 +417,9 @@ pub(crate) fn is_stream_timeout_msg(msg: &str) -> bool {
 /// 限流退避重试——500ms → 1s → 2s 最多三次重试，其它错误立即失败。
 /// 手写 HTTP 与 SDK 路径通用（识别见 [`is_rate_limited_err`]：结构化 code
 /// 优先，SDK Display 串匹配兜底）。
+/// P3p（code-review v14）：错误串携带 `Retry-After: Ns`（feishu_api_resp 的
+/// 429 分支写入）时，sleep min(N, 60s)——服务端明示的等待窗口优先；无头
+/// （或 SDK 路径错误串无标记）回退固定序列。
 macro_rules! retry_on_rate_limit {
     ($body:expr) => {{
         let mut delay = std::time::Duration::from_millis(500);
@@ -418,12 +429,16 @@ macro_rules! retry_on_rate_limit {
                 Err(e) => {
                     if is_rate_limited_err(&e) && delay <= std::time::Duration::from_secs(2)
                     {
+                        let wait = retry_after_secs(&e)
+                            .map(|s| std::time::Duration::from_secs(s.min(60)))
+                            .unwrap_or(delay);
                         tracing::warn!(
                             target: "feishu",
-                            backoff_ms = delay.as_millis() as u64,
+                            backoff_ms = wait.as_millis() as u64,
+                            retry_after = ?retry_after_secs(&e),
                             "限流（429/230020），退避后重试"
                         );
-                        tokio::time::sleep(delay).await;
+                        tokio::time::sleep(wait).await;
                         delay *= 2;
                         continue;
                     }
@@ -432,6 +447,74 @@ macro_rules! retry_on_rate_limit {
             }
         }
     }};
+}
+
+/// P3p（code-review v14）：从错误串提取 Retry-After 秒数——只认本模块
+/// feishu_api_resp 写入的 `(Retry-After: Ns)` 标记（秒数形态；HTTP-date 不
+/// 解析），其余（SDK 路径）返回 None 走固定退避。
+fn retry_after_secs(e: &imagent_core::CoreError) -> Option<u64> {
+    const MARK: &str = "(Retry-After: ";
+    let s = e.to_string();
+    let i = s.find(MARK)?;
+    let digits: String = s[i + MARK.len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+}
+
+/// P3q（code-review v14）：URL path 拼接点的外部 id 校验——message_id /
+/// file_key / comment_id 等来自事件与回调的字符串直接进 format! 拼 path，含
+/// `/`、`?`、`#`、`%` 等 URL 保留字符时构成 path 穿越 / 查询注入面。白名单按
+/// **字符集**收敛：非空 + 仅 `[A-Za-z0-9_-]`（本文件出现的 id 形态——om_/
+/// ou_/oc_/img_/file_/ft_/cli_/wt_/ec_ 等前缀族——全部满足；前缀枚举随 id 族
+/// 演化易漏（reaction/comment id 形态未齐），字符集闸同样拦住保留字符且零误伤）。
+fn valid_path_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// [`valid_path_id`] 的 Result 形态：无效直接返回错误、不打请求。
+fn ensure_path_id(op: &str, id: &str) -> imagent_core::Result<()> {
+    valid_path_id(id).then_some(()).ok_or_else(|| {
+        imagent_core::CoreError::Platform(
+            PLATFORM,
+            format!(
+                "{op}: 非法 id（含 URL 保留字符，已拒绝请求）: {}",
+                truncate_for_error(id, 64)
+            ),
+        )
+    })
+}
+
+/// 「获取指定消息」GET 的查询串（P3e，code-review v14 常量化——两处手写
+/// 复制漂移只在一边改时发生）。`card_msg_content_type=user_card_content`：
+/// 不带该参数时 CardKit 卡片抓回「请升级客户端」降级占位卡，带上则返回原始
+/// 卡片 JSON（真机校准 2026-09-29，引用卡片正文抽取依赖于此）。
+const MESSAGE_GET_QUERY: &str = "user_id_type=open_id&card_msg_content_type=user_card_content";
+
+/// P3e（code-review v14）：「获取指定消息」GET 的共用原语（原
+/// fetch_message_raw / fetch_merge_forward_sub_items 两处手写样板收编）。
+/// 返回信封 Value（HTTP/信封错误统一由 [`feishu_api_resp`] 报出）。
+async fn get_message_raw(
+    core_config: &CoreConfig,
+    token: &str,
+    message_id: &str,
+    op: &str,
+) -> imagent_core::Result<serde_json::Value> {
+    ensure_path_id(op, message_id)?;
+    let base = core_config.base_url().trim_end_matches('/').to_string();
+    let resp = api_client()
+        .clone()
+        .get(format!(
+            "{base}/open-apis/im/v1/messages/{message_id}?{MESSAGE_GET_QUERY}"
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| imagent_core::CoreError::Platform(PLATFORM, format!("{op}: {e}")))?;
+    feishu_api_resp(resp, op).await
 }
 
 /// 对消息添加表情回复（真机校准 2026-08 验证）：POST
@@ -444,6 +527,7 @@ pub async fn create_reaction(
     message_id: &str,
     emoji_type: &str,
 ) -> imagent_core::Result<String> {
+    ensure_path_id("create_reaction", message_id)?;
     let base = core_config.base_url().trim_end_matches('/').to_string();
     let url = format!("{base}/open-apis/im/v1/messages/{message_id}/reactions");
     let client = api_client().clone();
@@ -477,6 +561,8 @@ pub async fn delete_reaction(
     message_id: &str,
     reaction_id: &str,
 ) -> imagent_core::Result<()> {
+    ensure_path_id("delete_reaction", message_id)?;
+    ensure_path_id("delete_reaction", reaction_id)?;
     let base = core_config.base_url().trim_end_matches('/').to_string();
     let url = format!("{base}/open-apis/im/v1/messages/{message_id}/reactions/{reaction_id}");
     let client = api_client().clone();
@@ -504,6 +590,7 @@ pub async fn urgent_app_buzz(
     message_id: &str,
     user_open_id: &str,
 ) -> imagent_core::Result<()> {
+    ensure_path_id("urgent_app_buzz", message_id)?;
     let base = core_config.base_url().trim_end_matches('/').to_string();
     // 真机校准（2026-08）：query 参数为 snake_case `user_id_type`——驼峰
     // userIdType 报 99992402 field validation failed（实测）。
@@ -617,13 +704,22 @@ pub async fn send_text_msg_with_uuid(
         let option = RequestOption::builder()
             .tenant_access_token(token.to_string())
             .build();
-        CreateMessageRequest::new(core_config.clone())
+        let resp: serde_json::Value = CreateMessageRequest::new(core_config.clone())
             .receive_id_type(id_type)
             .execute_with_options(body, option)
             .await
             .map_err(|e| {
                 imagent_core::CoreError::Platform(PLATFORM, format!("send_message: {e}"))
             })?;
+        // P3r（code-review v14）：「回复即定向」账本补记 create 路径——resp 已是
+        // data 内容（message_id 在顶层，同 send_card_msg 形态）；群用户回复这条
+        // 文本即视为对 bot 定向（图片/文件无法携带 @ 的准入补偿，见
+        // note_bot_sent）。响应缺 id（形态漂移）则跳过记账，发送不受影响。
+        let mid = resp
+            .get("message_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        note_bot_sent(mid.as_deref());
         Ok(())
     })
 }
@@ -817,6 +913,8 @@ async fn download_message_resource(
     file_key: &str,
     kind: &str,
 ) -> imagent_core::Result<Vec<u8>> {
+    ensure_path_id("download resource", message_id)?;
+    ensure_path_id("download resource", file_key)?;
     retry_on_rate_limit!(async {
         let base = core_config.base_url().trim_end_matches('/').to_string();
         let url = format!(
@@ -987,9 +1085,11 @@ pub async fn upload_file(
 ///
 /// 飞书语音条下载产物为 ogg/opus，接口仅收 16k s16le mono pcm——先经 ffmpeg
 /// 子进程转码（缺 ffmpeg / 转码失败由调用方 fail-soft 回退）。响应
-/// `{"code":0,"data":{"recognition_text":"…"}}`。单次不重试：99991400 实测为
-/// HTTP 400 形态（标准频控是 429），属「特殊频控」——租户未开通语音服务/
-/// 免费版门禁，立即重试无意义，报可行动原因。
+/// `{"code":0,"data":{"recognition_text":"…"}}`。
+/// P3s（code-review v14）：总超时放宽到 90s（api_client 的 30s 会掐断 60s
+/// 音频的识别——按请求级 timeout 覆写，不影响其它 API 调用）；标准频控 429
+/// 走 [`retry_on_rate_limit!`] 退避，99991400（HTTP 400 形态特殊频控——租户
+/// 未开通语音服务/免费版门禁）不重试，报可行动原因。
 pub async fn transcribe_audio(
     core_config: &CoreConfig,
     token: &str,
@@ -999,30 +1099,39 @@ pub async fn transcribe_audio(
     let body = asr_request_body(&pcm);
     let base = core_config.base_url().trim_end_matches('/').to_string();
     let url = format!("{base}/open-apis/speech_to_text/v1/speech/file_recognize");
-    let client = api_client().clone();
-    let resp = client
-        .post(&url)
-        .bearer_auth(token)
-        .header("Content-Type", "application/json; charset=utf-8")
-        .body(body)
-        .send()
-        .await
-        .map_err(|e| {
+    retry_on_rate_limit!(async {
+        // 重试要求 body 可重建（闭包重入）。
+        let body = body.clone();
+        let resp = api_client()
+            .clone()
+            .post(&url)
+            // P3s：识别是长计算（60s 音频），请求级 90s 覆写 api_client 的 30s
+            // 总超时；dl_client 的 read_timeout(30s) 在「服务端长时间零字节」
+            // 时同样会掐断，故不用 dl_client。
+            .timeout(std::time::Duration::from_secs(90))
+            .bearer_auth(token)
+            .header("Content-Type", "application/json; charset=utf-8")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| {
+                imagent_core::CoreError::Platform(PLATFORM, format!("transcribe_audio: {e}"))
+            })?;
+        if resp.status().as_u16() == 429 {
+            // 归一为可被 retry 宏识别的限流标记。
+            return Err(imagent_core::CoreError::Platform(
+                PLATFORM,
+                "transcribe_audio: HTTP 429".to_string(),
+            ));
+        }
+        // 先取原始文本再解析：非 JSON 响应（如网关 404 页）时报出状态码与原文
+        // 片段，而非无信息量的 "error decoding response body"（本次校准的实际教训）。
+        let status = resp.status().as_u16();
+        let text = resp.text().await.map_err(|e| {
             imagent_core::CoreError::Platform(PLATFORM, format!("transcribe_audio: {e}"))
         })?;
-    if resp.status().as_u16() == 429 {
-        return Err(imagent_core::CoreError::Platform(
-            PLATFORM,
-            "transcribe_audio: HTTP 429".to_string(),
-        ));
-    }
-    // 先取原始文本再解析：非 JSON 响应（如网关 404 页）时报出状态码与原文
-    // 片段，而非无信息量的 "error decoding response body"（本次校准的实际教训）。
-    let status = resp.status().as_u16();
-    let text = resp.text().await.map_err(|e| {
-        imagent_core::CoreError::Platform(PLATFORM, format!("transcribe_audio: {e}"))
-    })?;
-    parse_asr_response(status, &text)
+        parse_asr_response(status, &text)
+    })
 }
 
 /// 解析 ASR 响应（纯函数，供单测）：非 JSON 报状态码+原文截断；code!=0 报
@@ -1280,23 +1389,8 @@ pub async fn fetch_message_raw(
     token: &str,
     message_id: &str,
 ) -> imagent_core::Result<(String, String)> {
-    let base = core_config.base_url().trim_end_matches('/').to_string();
-    // card_msg_content_type=user_card_content（真机校准 2026-09-29）：CardKit
-    // 卡片不带该参数抓回的是「请升级客户端」降级占位卡，带上则返回原始卡片
-    // JSON（引用卡片追问的正文抽取依赖于此）。
-    let url = format!(
-        "{base}/open-apis/im/v1/messages/{message_id}?user_id_type=open_id&card_msg_content_type=user_card_content"
-    );
-    let client = api_client().clone();
-    let resp = client
-        .get(&url)
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| {
-            imagent_core::CoreError::Platform(PLATFORM, format!("fetch_message_raw: {e}"))
-        })?;
-    let v = feishu_api_resp(resp, "fetch_message_raw").await?;
+    // P3e（code-review v14）：GET 样板收编进 get_message_raw（查询串常量化）。
+    let v = get_message_raw(core_config, token, message_id, "fetch_message_raw").await?;
     // 字段提取统一走 proto::parse_raw_message_item（列表类 API 单一事实源，
     // 2026-09-29 真机校准收口）；items[0] 之外的旧版裸 data 信封保留指针回退。
     let raw = v
@@ -1324,6 +1418,7 @@ pub async fn fetch_user_display_name(
     token: &str,
     open_id: &str,
 ) -> imagent_core::Result<String> {
+    ensure_path_id("fetch_user_display_name", open_id)?;
     let base = core_config.base_url().trim_end_matches('/').to_string();
     let url = format!("{base}/open-apis/contact/v3/users/{open_id}?user_id_type=open_id");
     let client = api_client().clone();
@@ -1504,7 +1599,6 @@ fn merge_forward_item_of(v: &serde_json::Value) -> Option<MergedForwardItem> {
 /// 嵌套合并转发的一次转录内展开预算（「转发套转发」常态下 5 条已覆盖绝大
 /// 多数场景；更深/超预算的嵌套仍留占位——深度 × API 配额的旧取舍仍在）。
 const NESTED_MERGE_FORWARD_MAX: usize = 5;
-
 /// 拉取合并转发消息的子消息列表（合并转发完整支持）：官方机制是**复用**
 /// 「获取指定消息的内容」接口——GET `/im/v1/messages/{message_id}` 查
 /// msg_type=merged_forward 的消息时，响应 `data.items[]` 一次带回 1 条父
@@ -1528,17 +1622,28 @@ const NESTED_MERGE_FORWARD_MAX: usize = 5;
 /// 嵌套合并转发（子消息里的 merge_forward）：v1.28.4 起有界展开——每条嵌套
 /// 再拉一次本接口（上限 [`NESTED_MERGE_FORWARD_MAX`] 条，更深的仍留占位），
 /// 子条目继承嵌套父条目的时间戳（全局时间序排序后整块不散架）。
+///
+/// `expand_nested`（P3b，code-review v14）：直发路径（8000 字转录预算）传
+/// true；引用路径（1500 字预算）传 false——展开的嵌套条目随即被截掉，白付
+/// 每条一次的拉取配额。
 pub async fn list_merge_forward(
     core_config: &CoreConfig,
     token: &str,
     message_id: &str,
+    expand_nested: bool,
 ) -> imagent_core::Result<Vec<MergedForwardItem>> {
     let mut subs = fetch_merge_forward_sub_items(core_config, token, message_id).await?;
+    if !expand_nested {
+        return Ok(subs);
+    }
     // 嵌套有界展开（单次 transcript 至多 5 次额外拉取；失败留占位 fail-soft）。
     let mut budget = NESTED_MERGE_FORWARD_MAX;
     let mut out: Vec<MergedForwardItem> = Vec::with_capacity(subs.len());
     for it in subs.drain(..) {
-        let is_nested = matches!(it.message_type.as_str(), "merge_forward" | "merged_forward");
+        // P3d（code-review v14）：message_id 为空的嵌套条目跳过展开——
+        // 展开必发一次注定失败的 HTTP（空 id 拼 path 形态非法）。
+        let is_nested = matches!(it.message_type.as_str(), "merge_forward" | "merged_forward")
+            && !it.message_id.is_empty();
         if !is_nested || budget == 0 {
             out.push(it);
             continue;
@@ -1560,22 +1665,11 @@ async fn fetch_merge_forward_sub_items(
     token: &str,
     message_id: &str,
 ) -> imagent_core::Result<Vec<MergedForwardItem>> {
-    let base = core_config.base_url().trim_end_matches('/').to_string();
+    // P3e（code-review v14）：GET 样板收编进 get_message_raw（查询串常量化）。
+    // 信封 code!=0 检查在 parse_merge_forward_sub_messages（纯函数，有单测
+    // 钉住）；get_message_raw 内已收编 HTTP 层（429 归一 / 非 JSON 报状态码）。
     let v = retry_on_rate_limit!(async {
-        let resp = api_client()
-            .clone()
-            .get(format!(
-                "{base}/open-apis/im/v1/messages/{message_id}?user_id_type=open_id&card_msg_content_type=user_card_content"
-            ))
-            .bearer_auth(token)
-            .send()
-            .await
-            .map_err(|e| {
-                imagent_core::CoreError::Platform(PLATFORM, format!("list_merge_forward: {e}"))
-            })?;
-        // 信封 code!=0 检查在 parse_merge_forward_sub_messages（纯函数，有单测
-        // 钉住）；这里只收编 HTTP 层（429 归一 / 非 JSON 报状态码）。
-        feishu_api_resp(resp, "list_merge_forward").await
+        get_message_raw(core_config, token, message_id, "list_merge_forward").await
     })?;
     parse_merge_forward_sub_messages(&v)
 }
@@ -1676,6 +1770,8 @@ pub async fn list_bitable_fields(
     app_token: &str,
     table_id: &str,
 ) -> imagent_core::Result<Vec<imagent_core::BitableField>> {
+    ensure_path_id("bitable_list_fields", app_token)?;
+    ensure_path_id("bitable_list_fields", table_id)?;
     let base = core_config.base_url().trim_end_matches('/').to_string();
     let v: serde_json::Value = retry_on_rate_limit!(async {
         let resp = api_client()
@@ -1750,6 +1846,8 @@ pub async fn append_bitable_record(
     table_id: &str,
     fields: &serde_json::Map<String, serde_json::Value>,
 ) -> imagent_core::Result<String> {
+    ensure_path_id("bitable_append_row", app_token)?;
+    ensure_path_id("bitable_append_row", table_id)?;
     retry_on_rate_limit!(async {
         let base = core_config.base_url().trim_end_matches('/').to_string();
         let url = format!("{base}/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records");
@@ -1811,6 +1909,8 @@ pub async fn reply_comment_nodes(
     comment_id: &str,
     content_nodes: serde_json::Value,
 ) -> imagent_core::Result<()> {
+    ensure_path_id("reply_comment", file_token)?;
+    ensure_path_id("reply_comment", comment_id)?;
     retry_on_rate_limit!(async {
         let base = core_config.base_url().trim_end_matches('/').to_string();
         let url = format!(
@@ -1847,6 +1947,7 @@ pub async fn reply_message(
     content: &str,
     idempotency_uuid: Option<&str>,
 ) -> imagent_core::Result<Option<String>> {
+    ensure_path_id("reply_message", message_id)?;
     retry_on_rate_limit!(async {
         let base = core_config.base_url().trim_end_matches('/').to_string();
         let url = format!("{base}/open-apis/im/v1/messages/{message_id}/reply");
@@ -2397,5 +2498,113 @@ mod tests {
             pcm.len()
         );
         assert!(pcm.len() % 2 == 0, "s16le 应为 2 字节对齐");
+    }
+
+    // ------------------------------------------------------------------
+    // code-review v14：P3p（Retry-After）/ P3q（path id 白名单）/ P3r（create
+    // 路径记账）/ P3d（空 id 不展开嵌套）
+    // ------------------------------------------------------------------
+
+    /// P3p：Retry-After 秒数从错误串提取——feishu_api_resp 429 分支写入的
+    /// `(Retry-After: Ns)` 标记可还原；无标记 / HTTP-date 形态 / SDK 串 → None
+    ///（固定退避兜底）。
+    #[test]
+    fn retry_after_secs_extraction() {
+        let mk = |s: &str| imagent_core::CoreError::Platform(PLATFORM, s.to_string());
+        assert_eq!(
+            retry_after_secs(&mk("patch_card: code=429 msg=HTTP 429 (Retry-After: 30s)")),
+            Some(30)
+        );
+        assert_eq!(
+            retry_after_secs(&mk("send_card: code=429 msg=HTTP 429 (Retry-After: 1s)")),
+            Some(1)
+        );
+        // 无标记（含裸 429）→ None。
+        assert_eq!(
+            retry_after_secs(&mk("upload_file: code=429 msg=HTTP 429")),
+            None
+        );
+        assert_eq!(retry_after_secs(&mk("网络错误: connection refused")), None);
+        // HTTP-date 形态（非秒数）→ None（只处理秒数，回退固定序列）。
+        assert_eq!(
+            retry_after_secs(&mk(
+                "x: code=429 msg=HTTP 429 (Retry-After: Wed, 21 Oct 2026 07:28:00 GMT)"
+            )),
+            None
+        );
+        // 带标记的错误仍被识别为限流（is_rate_limited 与 Retry-After 解析正交）。
+        assert!(is_rate_limited_err(&mk(
+            "patch_card: code=429 msg=HTTP 429 (Retry-After: 30s)"
+        )));
+    }
+
+    /// P3q：path id 白名单——合法 id 形态（各前缀族）放行；URL 保留字符
+    ///（path 穿越/查询注入面）拒绝；空串拒绝。
+    #[test]
+    fn valid_path_id_whitelist() {
+        for ok in [
+            "om_abc123",
+            "ou_b0c072f42e7c1b09",
+            "oc_g",
+            "img_v3_abc",
+            "file_v3_x",
+            "ft_doxcnABC",
+            "cli_a1b2c3",
+            "wt_wildcard",
+            "ec_ext",
+            "bascnAAA",
+            "7034fixturecm1",
+        ] {
+            assert!(valid_path_id(ok), "应放行: {ok}");
+        }
+        for bad in [
+            "",
+            "om_1/../../secret",
+            "om_1?user_id_type=open_id",
+            "om_1#frag",
+            "om_1%20x",
+            "om_1 x",
+            "../../etc/passwd",
+            "om_é",
+        ] {
+            assert!(!valid_path_id(bad), "应拒绝: {bad:?}");
+        }
+        // Result 形态：无效 id 直接报错（不打请求）。
+        let e = ensure_path_id("op", "om_1/../x").unwrap_err();
+        assert!(e.to_string().contains("非法 id"), "{e}");
+        assert!(ensure_path_id("op", "om_ok").is_ok());
+    }
+
+    /// P3r：「回复即定向」账本补记 create 路径——send_text_msg_with_uuid 成功
+    /// 后取回 data.message_id 记账（此前 create 响应被丢弃，群用户回复 bot 的
+    /// 纯文本消息无法命中「回复即定向」豁免）。mock 回环走真实 HTTP 栈。
+    #[tokio::test]
+    async fn send_text_with_uuid_notes_created_message_id() {
+        let base = crate::platform::testutil::spawn_mock_feishu_req(Arc::new(
+            |_path: &str, _body: &str| {
+                (
+                    200u16,
+                    r#"{"code":0,"msg":"success","data":{"message_id":"om_created_ledger_1"}}"#
+                        .to_string(),
+                )
+            },
+        ))
+        .await;
+        let cfg = crate::platform::testutil::mock_core_config(&base);
+        send_text_msg_with_uuid(
+            &cfg,
+            "t_mock",
+            "ou_u",
+            crate::proto::ReceiveIdKind::OpenId,
+            "文本",
+            false,
+            "idem-key-ledger",
+        )
+        .await
+        .expect("mock create 应成功");
+        assert!(
+            bot_sent_recently("om_created_ledger_1"),
+            "create 产出的 message_id 须进「回复即定向」账本"
+        );
     }
 }
