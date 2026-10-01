@@ -305,6 +305,16 @@ fn permission_sock_path() -> String {
         .into_owned()
 }
 
+/// (code-review v14) P1：Control 通道是否附加 `--permission-prompt-tool stdio`。
+/// Off 档**不**附加——统一「Off = 网关不代答，交 agent 自身策略」：不挂审批
+/// 通道时 headless claude 对未批工具直接拒绝（真机校准结论见 run 内注释），
+/// 而非经网关代答 deny。其余档照挂（含防御性的未解析 Auto——该档不应到达
+/// 运行时，真到达时宁可挂上审批通道由网关侧档位逻辑接管）。不用
+/// `!mode.is_enabled()` 判定：它把未解析的 Auto 也算作未接线，语义不同。
+fn control_uses_prompt_tool(mode: PermissionMode) -> bool {
+    !matches!(mode, PermissionMode::Off)
+}
+
 /// 把 conv_id 消毒为文件名安全片段（P2-I：防路径遍历——`/`、`..`、`:` 等替换为 `_``）。
 /// 仅用于构造 `mcp_<conv>.json` 文件名；MCP server 的 `--conv-id` 参数仍用原 conv_id（路由一致）。
 fn sanitize_filename(s: &str) -> String {
@@ -472,7 +482,15 @@ impl Backend for ClaudeBackend {
     /// P4-11：扫 `~/.claude/projects/<workdir编码>/*.jsonl`（电脑端开的会话与
     /// IM 会话同存储），供统一 /resume 列表合并展示。
     async fn list_local_sessions(&self, workdir: &std::path::Path) -> Vec<LocalSession> {
-        crate::sessions::scan_for_backend(workdir)
+        // (code-review v14) P3-c：扫描是同步阻塞 IO（目录遍历 + 每文件 64KB 头
+        // 读），裸跑 async 会卡 tokio worker（/resume 期间其它会话的消息分发
+        // 停摆）——下放 blocking 池，对齐 codex 先例（crates/codex/src/backend.rs
+        // list_local_sessions）。JoinError（panic）按空列表兜底：扫描失败只
+        // 影响 💻 段缺省，不阻断 /resume。
+        let wd = workdir.to_path_buf();
+        tokio::task::spawn_blocking(move || crate::sessions::scan_for_backend(&wd))
+            .await
+            .unwrap_or_default()
     }
 
     /// W4-2：会话转录导出（与 /resume 同一 ~/.claude 存储）。
@@ -507,12 +525,29 @@ impl Backend for ClaudeBackend {
         //   stdin user 消息投递，stdin 保持打开供 control_response 回写；
         // - Mcp（legacy 回退）：`-p <prompt>` + MCP prompt-tool + 子进程/临时配置。
         let channel = *self.permission_channel.read();
+        // (code-review v14) P1：权限档位读取上移——Control 通道的审批接线
+        // （`--permission-prompt-tool stdio`）与下方 mcp 配置分支须看**同一轮**
+        // 快照：RwLock 热切（SIGHUP///perm）下两次读取可能得到不同档位，拼出
+        // 「未挂审批参数却挂审批 server」的杂交命令。命令按轮构建，单次快照即
+        // 热切安全（下一轮取新值）。
+        let mode = *self.permission_mode.read();
         let control_io = if channel == PermissionChannel::Control {
             cmd.arg("-p").arg("--input-format").arg("stream-json");
             // 真机校准（2026-08-30）：`stdio` 特殊值把审批接到 stdio 控制通道
             //（SDK 同款接线）——不传则 claude 对未批工具**直接拒绝**不发
             // control_request（实测）。
-            cmd.arg("--permission-prompt-tool").arg("stdio");
+            // (code-review v14) P1：Off 档不再附加——此前无条件挂 prompt-tool 使
+            // CLI 的 Off 变成「网关代答 deny」（经 permission.sock 按 Off 档回拒），
+            // 与 ACP 侧 Off=自动放行 相互矛盾（语义反转）。统一为「Off = 网关不
+            // 代答，交 agent 自身策略」：不挂审批通道，headless claude 对未批工具
+            // 按上方真机校准结论直接拒绝，不经 IM 审批。无 prompt-tool 则 claude
+            // 不发 can_use_tool control_request，ControlIo 的审批回写路径自然不
+            // 触发（其余 control_request subtype 仍由 responder 回 error 防挂起，
+            // 不涉 IM）；ControlIo 本身保留——stdin 投递 prompt / steering / EOF
+            // 收尾语义不随档位变化。
+            if control_uses_prompt_tool(mode) {
+                cmd.arg("--permission-prompt-tool").arg("stdio");
+            }
             Some(imagent_core::backend_common::ControlIo {
                 sock: permission_sock_path(),
                 conv_id: conv_id.to_string(),
@@ -575,7 +610,7 @@ impl Backend for ClaudeBackend {
         // T12：bitable 数据面（opts.bitable）也经同一 MCP server 挂载——即使
         // Control 通道（sock=None）也写 imagent 条目（write_mcp_config 内回落
         // 默认 sock 路径），agent 获得 bitable_* 工具。
-        let mode = *self.permission_mode.read();
+        // mode 已在审批通道分支前读取（(code-review v14) P1 单轮快照，见上）。
         let extra = opts.extra_mcp.clone();
         let bitable = opts.bitable;
         let use_control = control_io.is_some();
@@ -1274,6 +1309,30 @@ mod tests {
         // lossy：未知值兜底 control。
         b.set_permission_channel("nope");
         assert_eq!(*b.permission_channel.read(), PermissionChannel::Control);
+    }
+
+    /// (code-review v14) P1 回归：Control 通道审批接线开关——Off 档不挂
+    /// `--permission-prompt-tool stdio`（网关不代答，headless claude 自拒未批
+    /// 工具），其余档（含防御性的未解析 Auto）照挂。修复前 Off 也无条件附加，
+    /// 使 CLI 的 Off 变成「网关代答 deny」。
+    #[test]
+    fn control_prompt_tool_off_mode_not_attached() {
+        assert!(
+            !control_uses_prompt_tool(PermissionMode::Off),
+            "Off 档不得挂 --permission-prompt-tool stdio（网关不代答）"
+        );
+        for m in [
+            PermissionMode::Allow,
+            PermissionMode::Deny,
+            PermissionMode::Ask,
+            PermissionMode::AutoClaude,
+            PermissionMode::Auto,
+        ] {
+            assert!(
+                control_uses_prompt_tool(m),
+                "{m:?} 档 Control 通道应挂审批接线"
+            );
+        }
     }
     /// 真机校准（2026-08-30）：resume 带后台子任务会话时 init 后立刻出现的
     /// 退化 result（stop_reason:null + num_turns:0 + 无文本）是控制面事件，

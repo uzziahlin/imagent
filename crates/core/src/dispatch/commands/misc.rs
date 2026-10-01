@@ -267,20 +267,32 @@ pub(crate) fn doctor_size_line(db_bytes: u64, media_bytes: u64) -> String {
 
 impl Dispatcher {
     /// /status —— 本会话 + 全局运行状态。
-    pub(super) async fn cmd_status(&self, conv: &ConvId, hint: &ReplyHint) {
+    /// P3-a（code-review v14）：`sender` 用于 admin 判定——在飞任务的 prompt
+    /// 摘要（digest）是跨会话信息泄露面（群 A 里能看到群 B 正在跑什么指令，
+    /// 可能含他群的敏感 prompt），非 admin 只见**本 conv** 的 digest 明细 +
+    /// 全局在飞计数；admin（运维需要全局视野）保留完整明细。
+    pub(super) async fn cmd_status(&self, conv: &ConvId, sender: &str, hint: &ReplyHint) {
         // P4-7：本会话 + 全局运行状态。T18：在飞轮次与排队队列同在 ConvState
         // 单表（原 running/queues 两表），一次锁内取齐三份数据（原子快照，
         // 输出与旧版一致）。
-        let (running_here, queued_here, running_detail) = {
+        let admin = self.is_admin(sender);
+        let (running_here, queued_here, in_flight, running_detail) = {
             let states = self.conv_states.lock().await;
             let running_here = states.get(&conv.0).is_some_and(|cs| cs.running.is_some());
             let queued_here = states
                 .get(&conv.0)
                 .and_then(|cs| cs.queue.as_ref())
                 .map_or(0, Vec::len);
-            let running_detail = states
+            let running_all = states
                 .iter()
                 .filter_map(|(rc, cs)| cs.running.as_ref().map(|h| (rc, h)))
+                .collect::<Vec<_>>();
+            // P3-a：全局计数对所有人可见（生存/容量水位，无内容）；digest 明细
+            // 非 admin 只保留本 conv 条目。
+            let in_flight = running_all.len();
+            let running_detail = running_all
+                .into_iter()
+                .filter(|(rc, _)| admin || rc.as_str() == conv.0.as_str())
                 .map(|(rc, h)| {
                     let secs = h.started.elapsed().as_secs();
                     let run = if secs < 60 {
@@ -302,9 +314,8 @@ impl Dispatcher {
                     format!("\n- {digest} · 已跑 {run}{mark}")
                 })
                 .collect::<Vec<_>>();
-            (running_here, queued_here, running_detail)
+            (running_here, queued_here, in_flight, running_detail)
         };
-        let in_flight = running_detail.len();
         // P2（code-review v13）：全局并发护栏——「在飞轮次 X/Y（上限）」；上限 0
         //（不限制）显示 X（无上限）。取实时在飞数而非 gauge（running 表同源）。
         let gate_limit = self.round_gate.read().limit;

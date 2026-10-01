@@ -32,8 +32,21 @@
 //! 惰性建立（首次 run 时）、空闲 [`CONN_IDLE_RECYCLE`] 回收、并发上限
 //! [`MAX_CONCURRENT_CONNS`]（超限拒绝并回可读错误）。单会话的超时 cancel /
 //! LoadSession 失败只杀**该会话的**连接（旧实现全局单连接 + 串行主循环，A 的长任务
-//! 让 B 排队烧 agent_timeout，A 的 cancel 殃及所有会话——P5-14）。子进程由 SDK 的
-//! ChildGuard 在 connection drop 时 kill（无泄漏）。
+//! 让 B 排队烧 agent_timeout，A 的 cancel 殃及所有会话——P5-14）。
+//!
+//! ## 子进程收割的已知限制（(code-review v14) P2，如实披露）
+//!
+//! connection drop 时 SDK（agent-client-protocol 1.0.1）的 `ChildGuard` 只 kill
+//! **直接子进程**（`async_process::Child::kill`，单 pid）——孙进程（ACP agent
+//! 内部再 spawn 的 claude CLI / MCP server / Bash 工具）可能存活为孤儿，继续以
+//! 该会话的上下文运行直至自行退出。CLI 路径的进程组收割
+//!（backend_common.rs：`process_group(0)` + GroupKillGuard 的 killpg）在此**不可
+//! 得**：SDK 的 spawn 封闭在 `AcpAgent::connect_to` 内部（自建
+//! `async_process::Command`，无 Command 注入点），Child 句柄不外露（无 pid 访问
+//! 器）；且依赖 crate 无 `async-process` 直接依赖可用（SDK 亦不 re-export）、
+//! async-process 2.5 本身无 `process_group` API——自定义 transport 也组不起进程
+//! 组。改进方向是上游 PR（暴露 spawn 注入 / 进程组选项）；风险面与部署侧缓解见
+//! SECURITY.md「已知限制」。
 //!
 //! [`AgentChunk`]: imagent_core::AgentChunk
 
@@ -183,7 +196,9 @@ pub struct AcpBackend {
 }
 
 impl AcpBackend {
-    /// 默认构造（`PermissionMode::Off`，等同 CLI 的 Off 行为）。
+    /// 默认构造（`PermissionMode::Off`——ACP 侧 Off = 自动放行 agent 的权限
+    /// 请求；与 CLI 侧 Off（不挂审批通道、headless 自拒）殊途且风险更高，见
+    /// [`permission_outcome`] 的语义说明）。
     pub fn new() -> Self {
         Self::claude_default(Arc::new(RwLock::new(PermissionMode::Off)))
     }
@@ -417,8 +432,9 @@ impl AcpBackend {
 
     /// B2：shutdown 全量清理——断开全部 per-conv 连接（map 清空后最后一个 sender
     /// drop → 长驻 task 的 recv 返回 None → connect_with 闭包返回 → connection
-    /// drop → SDK ChildGuard kill 子进程）。独立部署（非 dispatcher 注入）时由
-    /// 持有方调用；进程退出路径由空闲回收 + OS 清理兜底。
+    /// drop → SDK ChildGuard kill 直接子进程；孙进程限制见模块头「子进程收割的
+    /// 已知限制」）。独立部署（非 dispatcher 注入）时由持有方调用；进程退出路径
+    /// 由空闲回收 + OS 清理兜底。
     pub async fn shutdown(&self) {
         let conns: Vec<Arc<LongLivedAcp>> =
             self.conns.lock().await.drain().map(|(_, v)| v).collect();
@@ -430,7 +446,7 @@ impl AcpBackend {
 /// Drop 时兜底清理：[`AcpBackend::shutdown`] 尚未被 main/core 侧接线调用（不能改
 /// 其他 crate），最后持有方 drop backend 时在此释放全部连接条目——map 内的
 /// sender 克隆 drop 后，长驻 task 的 recv 返回 None / 空闲回收超时退出 →
-/// connection drop → SDK ChildGuard kill 子进程。
+/// connection drop → SDK ChildGuard kill 直接子进程（孙进程限制见模块头）。
 ///
 /// Drop 不是 async：用 `try_lock` 非阻塞拿 map（拿不到说明并发 run 正持锁，
 /// 记 warn 放弃——空闲回收 + OS 清理兜底；绝不阻塞/嵌套 runtime）。
@@ -484,6 +500,9 @@ impl Default for AcpBackend {
 struct StreamState {
     chunks: tokio::sync::mpsc::Sender<AgentChunk>,
     agent_text: Arc<Mutex<String>>,
+    /// (code-review v14) P3-b：agent_text 总量帽（16MB，与 CLI 路径 final_text
+    /// 同款 [`imagent_core::backend_common::push_text_capped`]）的截断标志。
+    agent_text_truncated: Arc<Mutex<bool>>,
     usage: Arc<Mutex<Option<UsageStats>>>,
     cost_baseline: Arc<Mutex<Option<(String, f64)>>>,
 }
@@ -493,6 +512,7 @@ impl StreamState {
         Self {
             chunks,
             agent_text: Arc::new(Mutex::new(String::new())),
+            agent_text_truncated: Arc::new(Mutex::new(false)),
             usage: Arc::new(Mutex::new(None)),
             cost_baseline: Arc::new(Mutex::new(None)),
         }
@@ -552,9 +572,10 @@ impl LongLivedAcp {
     }
 
     /// spawn 单 conv 的长驻 task：`connect_with` 建连接（spawn ACP agent 子进程；
-    /// SDK `ChildGuard` 在 connection drop 时 kill，无泄漏），main_fn 内 loop
-    /// 接收 prompt 跨 run 复用同一子进程 + connection。`storage` 为 T9 的
-    /// per-agent 本机存储适配（幽灵会话预检走它），`name` 用于错误前缀。
+    /// SDK `ChildGuard` 在 connection drop 时 kill 直接子进程——孙进程存活限制
+    /// 见模块头「子进程收割的已知限制」），main_fn 内 loop 接收 prompt 跨 run
+    /// 复用同一子进程 + connection。`storage` 为 T9 的 per-agent 本机存储适配
+    /// （幽灵会话预检走它），`name` 用于错误前缀。
     ///
     /// 泛型 `T`：真机为 `AcpAgent`（子进程 stdio）；测试为 in-process `Channel`
     /// （假 agent，见 tests）。
@@ -1003,7 +1024,15 @@ impl Backend for AcpBackend {
     /// 扫 `~/.claude`（LoadSession 与 CLI 的 --resume 同一存储）；泛化 acp 无
     /// 本机扫描概念（空，/resume 自动退化为纯 IM 历史）。
     async fn list_local_sessions(&self, workdir: &std::path::Path) -> Vec<LocalSession> {
-        self.storage.list_local_sessions(workdir)
+        // (code-review v14) P3-c：扫描是同步阻塞 IO（目录遍历 + 每文件 64KB 头
+        // 读），裸跑 async 会卡 tokio worker——下放 blocking 池（对齐 codex 与
+        // claude-cli 先例）。storage 适配是 sync trait，包裹放实现侧。JoinError
+        //（panic）按空列表兜底：扫描失败只影响 💻 段缺省，不阻断 /resume。
+        let wd = workdir.to_path_buf();
+        let storage = Arc::clone(&self.storage);
+        tokio::task::spawn_blocking(move || storage.list_local_sessions(&wd))
+            .await
+            .unwrap_or_default()
     }
 
     /// W4-2：会话转录导出（/export）——claude-acp 走 ~/.claude jsonl；泛化 acp
@@ -1136,7 +1165,19 @@ async fn forward_update(state: &StreamState, update: SessionUpdate) {
                 // 累计 agent 文本。v1.21 review：try_lock 失败即丢该段文本
                 //（final_text 缺口，零日志零补偿）——主循环对 agent_text 的持锁
                 // 全是微秒级 clone/读，改 lock().await 等待无害且零丢失。
-                state.agent_text.lock().await.push_str(&text);
+                // (code-review v14) P3-b：累积改经 16MB 总量帽（SDK 传输层读
+                // stdout 无上限（M2 已记限制），OOM 兜底只能做在累积侧；超限
+                // 截断 + 一次性标记，Text chunk 流照推）。
+                {
+                    let mut acc = state.agent_text.lock().await;
+                    let mut truncated = state.agent_text_truncated.lock().await;
+                    imagent_core::backend_common::push_text_capped(
+                        &mut acc,
+                        "",
+                        &text,
+                        &mut truncated,
+                    );
+                }
                 Some(AgentChunk::Text(text))
             } else {
                 None
@@ -1315,8 +1356,12 @@ fn truncate_chars(s: &str, n: usize) -> String {
 
 /// 按 [`PermissionMode`] 计算 `session/request_permission` 的响应 outcome。
 ///
-/// - `Allow` / `Off`（默认）→ 选一个 allow 类选项（让 claude 按 allowed_tools 自理，
-///   等同 CLI 的 Off 行为）。
+/// - `Allow` / `Off`（默认）→ 选一个 allow 类选项。(code-review v14) P1 语义
+///   校正：ACP 侧的 Off = **自动放行 agent 的权限请求**（网关不代答），与 CLI
+///   侧的 Off（不挂审批通道、headless claude 对未批工具自拒）**殊途**——两者
+///   都不经 IM 审批，但 ACP 路径 `allowed_tools` 不生效（[`AcpBackend::
+///   supports_tool_allowlist`] = false，工具白名单收敛缺失），风险更高；该差异
+///   由能力矩阵的 off × acp 象限警告披露，此处不再错误宣称「等同 CLI 的 Off」。
 /// - `Deny` → 选一个 reject 类选项；若无则 Cancelled。
 /// - `Ask` / `AutoClaude`（IM 审批闭环）→ B3：经注入的 [`ImPermissionHook`] 把审批
 ///   卡发进 IM、等待 y/n（超时 deny，由 hook 内部的 permission_ask_timeout 兜底），
@@ -1330,11 +1375,12 @@ async fn permission_outcome(
     let mode = *mode.read();
     match mode {
         PermissionMode::Deny => reject_outcome(&request.options),
-        // Auto 不会出现在运行时句柄里（main/SIGHUP//perm 均先 resolve）；
-        // 防御性按未接线=放行 Off 同路处理（resolve 后 ACP 本就映射 Off）。
-        PermissionMode::Allow | PermissionMode::Off | PermissionMode::Auto => {
-            allow_outcome(&request.options)
-        }
+        PermissionMode::Allow | PermissionMode::Off => allow_outcome(&request.options),
+        // (code-review v14) P1：Auto 不应到达运行时（main / SIGHUP / /perm 均先
+        // resolve 折算成具体档）——真到达说明某条装配路径漏了 resolve，此时档位
+        // 语义未知，防御性 fail-closed 拒绝（此前 allow_outcome 是 fail-open：
+        // 半接状态下的未知档直接放行高危工具）。
+        PermissionMode::Auto => reject_outcome(&request.options),
         PermissionMode::Ask | PermissionMode::AutoClaude => {
             let Some(hook) = hook else {
                 // B3：hook 未注入（backend 被独立使用、未经 Dispatcher::run 注入）时
@@ -1752,6 +1798,45 @@ mod tests {
         }
     }
 
+    /// (code-review v14) P3-b 回归：agent_text 总量帽——16MB（与 CLI 路径
+    /// final_text 同款 [`imagent_core::backend_common::push_text_capped`]）。
+    /// 超限截断 + 一次性标记；Text chunk 流照推（流式卡片不受影响）。
+    /// SDK 传输层读 stdout 无上限（M2 已记限制），OOM 兜底只能做在累积侧。
+    #[tokio::test]
+    async fn forward_update_agent_text_accumulation_is_capped() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentChunk>(64);
+        let state = StreamState::new(tx);
+        let mb = "x".repeat(1024 * 1024);
+        for _ in 0..17 {
+            forward_update(
+                &state,
+                SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                    TextContent::new(mb.clone()),
+                ))),
+            )
+            .await;
+        }
+        let acc = state.agent_text.lock().await.clone();
+        assert!(
+            acc.len() <= imagent_core::backend_common::MAX_FINAL_TEXT_BYTES,
+            "总量有界: {}",
+            acc.len()
+        );
+        assert!(
+            acc.ends_with("…[输出超长已截断]"),
+            "应以截断标记收尾: {}",
+            &acc[acc.len() - 48..]
+        );
+        // chunk 流照推：17 条 Text 全部到达。
+        let mut texts = 0usize;
+        while let Ok(c) = rx.try_recv() {
+            if matches!(c, AgentChunk::Text(_)) {
+                texts += 1;
+            }
+        }
+        assert_eq!(texts, 17, "截断不影响 chunk 流");
+    }
+
     #[tokio::test]
     async fn forward_update_tool_call_emits_tool_use() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<AgentChunk>(16);
@@ -1883,6 +1968,39 @@ mod tests {
             perm_option("allow2", PermissionOptionKind::AllowAlways),
         ]);
         let mode = RwLock::new(PermissionMode::Deny);
+        assert!(matches!(
+            permission_outcome(&request, "c", &mode, None).await,
+            RequestPermissionOutcome::Cancelled
+        ));
+    }
+
+    /// (code-review v14) P1 回归：未解析的 Auto 到达运行时属装配缺陷（main/
+    /// SIGHUP///perm 均先 resolve），防御分支必须 fail-closed——有 reject 选项
+    /// 时选 reject、否则 Cancelled，绝不放行（此前 allow_outcome 是 fail-open）。
+    #[tokio::test]
+    async fn permission_outcome_auto_fails_closed() {
+        // 有 reject 选项：选 reject。
+        let request = dummy_perm_request(vec![
+            perm_option("allow", PermissionOptionKind::AllowOnce),
+            perm_option("reject", PermissionOptionKind::RejectOnce),
+        ]);
+        let mode = RwLock::new(PermissionMode::Auto);
+        match permission_outcome(&request, "c", &mode, None).await {
+            RequestPermissionOutcome::Selected(sel) => {
+                assert_eq!(
+                    sel.option_id.0.as_ref(),
+                    "reject",
+                    "Auto 防御分支应 fail-closed 选 reject"
+                )
+            }
+            _ => panic!("Auto 防御分支应为 Selected(reject)"),
+        }
+        // 无 reject 选项：Cancelled（交由 agent 处理取消），也不放行。
+        let request = dummy_perm_request(vec![
+            perm_option("allow1", PermissionOptionKind::AllowOnce),
+            perm_option("allow2", PermissionOptionKind::AllowAlways),
+        ]);
+        let mode = RwLock::new(PermissionMode::Auto);
         assert!(matches!(
             permission_outcome(&request, "c", &mode, None).await,
             RequestPermissionOutcome::Cancelled

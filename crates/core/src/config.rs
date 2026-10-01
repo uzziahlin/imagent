@@ -7,11 +7,16 @@ use crate::error::{CoreError, Result};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PermissionMode {
-    /// 按后端自动选档（2026-08 起为**缺省**）：claude-cli（支持 IM 审批闭环）→
-    /// [`PermissionMode::AutoClaude`]（claude 原生 acceptEdits + 危险工具走 IM，
-    /// 即 Claude Code 的「auto 模式」）；claude-acp / codex / gemini（闭环未接）→
-    /// [`PermissionMode::Off`]（靠各自 sandbox / approval-mode 兜底）。启动 /
-    /// SIGHUP / `/perm auto` 均先 [`PermissionMode::resolve`] 成具体档再入运行时。
+    /// 按后端自动选档（2026-08 起为**缺省**）：claude-cli →
+    /// [`PermissionMode::AutoClaude`]（透传 claude 原生 `--permission-mode auto`：
+    /// CLI 独立分类器逐动作审查 + 危险工具经审批闭环走 IM，即 Claude Code 的
+    /// 「auto 模式」）；其余后端 → [`PermissionMode::Off`]（(code-review v14)
+    /// 语义统一为「网关不代答、交 agent 自身权限策略」：codex / gemini 无 IM
+    /// 审批闭环，靠各自 sandbox / approval-mode 兜底；claude-acp **已是 FullLoop
+    /// 闭环后端**，但 auto 的增值在原生 `--permission-mode auto` 透传，ACP 通道
+    /// 无该注入点、auto 语义无法构造——需要 IM 审批闭环时显式配 ask，off × acp
+    /// 象限的风险差异由能力矩阵警告披露）。启动 / SIGHUP / `/perm auto` 均先
+    /// [`PermissionMode::resolve`] 成具体档再入运行时。
     #[default]
     Auto,
     /// **运行时专属档**（配置面不可直接写，仅由 `auto` 在 claude-cli 下解析产生）：
@@ -21,7 +26,12 @@ pub enum PermissionMode {
     /// 的动作都进 IM）少打扰）。透传值可由 `claude_permission_mode` 配置覆盖。
     #[serde(skip)]
     AutoClaude,
-    /// 不启用权限审批：claude 按 --allowedTools 自行处理（P1 既有行为）。
+    /// 网关不代答权限请求，交 agent 自身策略（(code-review v14) 统一语义）：
+    /// claude-cli 不挂审批通道（headless claude 对未批工具按自身策略直接拒绝，
+    /// 见 `imagent-claude` backend.rs 的真机校准注释）；claude-acp 对
+    /// `session/request_permission` 自动选 allow（风险更高——该路径
+    /// allowed_tools 不生效，由能力矩阵警告披露）；codex / gemini 靠各自
+    /// sandbox / approval-mode 兜底。三者殊途但都不经 IM 审批。
     Off,
     /// MCP server 永远 allow（不发 IM、不阻塞；快速放行模式）。
     Allow,
@@ -268,6 +278,10 @@ pub struct WebhookEntry {
     ///（未签名的时间戳攻击者可随意刷新，无防护意义——启动校验拒绝）。
     /// GitHub 原生 webhook 签名不含时间戳、无法配合本协议（公网 + GitHub
     /// 场景靠签名去重 + HTTPS）；自建发送端建议开启。
+    ///
+    /// 启用本窗口时，第 1 层「签名去重」同时**持久化到 SQLite**（webhook_seen
+    /// 表，v16——重启不失效；窗口即 SQLite 保留期，过期自动清理）；未启用时
+    /// 去重仅进程内（LRU 1024 条 / TTL 10 分钟，重启后重开）。
     #[serde(default)]
     pub replay_window_secs: u64,
 }
@@ -291,6 +305,9 @@ pub struct Config {
     #[serde(default = "default_tools")]
     pub allowed_tools: Vec<String>,
     #[serde(default = "default_agent")]
+    /// agent 后端名（claude-cli / claude-acp / acp / codex / gemini）。**改动需
+    /// 重启**：后端实现与运行参数在启动期装配，SIGHUP 不换后端（只热载参数），
+    /// 重载后自动档权限解析仍按启动后端进行。
     pub agent: String,
     #[serde(default = "default_platform")]
     pub platform: String,
@@ -324,20 +341,24 @@ pub struct Config {
     pub backend_permission_mode: Option<String>,
     /// Prometheus 指标 / 健康检查 HTTP 监听地址（如 `"127.0.0.1:9100"`）。
     /// 默认 `None`（关闭——开源分发时不默认开启监听端口）；显式设置地址即开启。
+    /// **改动需重启**：监听 socket 在启动期创建，SIGHUP 不重建。
     #[serde(default = "default_metrics_addr")]
     pub metrics_addr: Option<String>,
     /// v1.20 webhook 入站：事件（CI / 告警 / 定时系统）→ 会话注入的 HTTP 监听
     /// 地址（如 `"127.0.0.1:18443"`）。None/空 = 关闭。路由 `POST /hook/<token>`，
     /// 鉴权 = 路径中的 token 本身（与 [[webhook]] 表匹配）；非 loopback 部署
-    /// 靠 token 防护（建议 32+ 位随机串）。
+    /// 靠 token 防护（建议 32+ 位随机串）。**改动需重启**：监听 socket 与路由表
+    /// 在启动期创建，SIGHUP 不重建。
     #[serde(default)]
     pub webhook_addr: Option<String>,
     /// v1.20：token → 投递会话映射表（可多条，TOML 形态 `[[webhook]]`）。
     /// 投递会话须过会话白名单（/chat allow）才会驱动 agent——与手打消息
-    /// 同权，无旁路。
+    /// 同权，无旁路。**改动需重启**：路由表随 webhook server 启动期构建，
+    /// SIGHUP 不重建。
     #[serde(default, rename = "webhook")]
     pub webhooks: Vec<WebhookEntry>,
-    /// v1.20：/cron 停机补跑策略（见 [`CronCatchup`]；缺省 one）。
+    /// v1.20：/cron 停机补跑策略（见 [`CronCatchup`]；缺省 one）。**改动需
+    /// 重启**：调度器在启动期读取，SIGHUP 不热载。
     #[serde(default)]
     pub cron_catchup: CronCatchup,
     /// 出站消息单条字符上限（Unicode char 计）。超长则由各 Platform 的 `send_text`
@@ -352,6 +373,7 @@ pub struct Config {
     /// 单次 agent 运行总超时（秒）。超时则中止该次 run（依赖 backend 的
     /// `kill_on_drop` 杀子进程）。默认 3600（1 小时）——墙钟总预算与 agent 是否
     /// 活跃无关，设得过长误杀长任务，设为 0 = 关闭（防挂死完全交给空闲看门狗）。
+    /// **改动需重启**：预算在启动期注入运行时，SIGHUP 不热载。
     #[serde(default = "default_agent_timeout_secs")]
     pub agent_timeout_secs: u64,
     /// 权限审批（Ask 模式）等待用户回复的超时（秒），超时则 deny。默认 900
@@ -378,11 +400,12 @@ pub struct Config {
     /// 防 stream 僵死干等 agent_timeout 总预算。等待 IM 权限审批期间看门狗自动暂停
     /// （审批有独立的 permission_ask_timeout_secs 预算）。默认 1200（20 分钟——
     /// 单次长工具执行/后台子任务静默等待是合法场景，窗口过短会误杀长程任务）；
-    /// 0 = 关闭。
+    /// 0 = 关闭。**改动需重启**：预算在启动期注入运行时，SIGHUP 不热载。
     #[serde(default = "default_agent_idle_timeout_secs")]
     pub agent_idle_timeout_secs: u64,
     /// 批处理窗口（毫秒）：runner 起跑前等待后续消息并入同一轮 prompt 的时长；
     /// 运行中到达的消息同样排队到下一轮合并（以 \n\n 拼接）。默认 1500；0 = 关闭。
+    /// **改动需重启**：窗口在启动期注入运行时，SIGHUP 不热载。
     #[serde(default = "default_batch_window_ms")]
     pub batch_window_ms: u64,
     /// 工具过程（COT）展示档位（P4-6）：off / brief（默认）/ detailed。
@@ -402,6 +425,10 @@ pub struct Config {
     /// ⚠️ S-4：secret 当前明文存于此文件（与 iLink bot_token 走 OS keyring 不一致）。
     /// 务必将 config.toml 收紧到 0600；完整 keyring 保护（含 bootstrap 命令）见
     /// docs/CODE_REVIEW_v4.md S-4（后续）。
+    ///
+    /// 建议改用 `imagent login wecom`（P3-h，code-review v14）：secret 交互录入后
+    /// 走 store 凭据（OS keyring 优先、passphrase 加密回退），本键降级为兼容既有
+    /// 部署的明文回退（启动读取顺序：store 优先 → 本键）。
     #[serde(default)]
     pub wecom_secret: Option<String>,
     /// 飞书自建应用 app_id（可选；仅 `platform = "feishu"` 时使用）。非敏感。
@@ -418,16 +445,19 @@ pub struct Config {
     pub feishu_require_mention_in_group: bool,
     /// 陌生人被 @ 提示（P7-A3；默认 false = 完全静默，防探测）。开启后：未过白名单
     /// 的群消息若 @ 了 bot，回一句「管理员可 /chat allow」引导（私聊始终静默）。
+    /// **改动需重启**：启动偏好（prefs）在启动期注入 Dispatcher，SIGHUP 不热载。
     #[serde(default)]
     pub stranger_mention_hint: bool,
     /// 私聊陌生人引导（默认 true）：未过白名单的**私聊**消息回一句引导（含 sender
     /// id 与「联系管理员 /allow <id>」）。与 `stranger_mention_hint` 的区别：群内
     /// 默认静默是防探测（群成员构成敏感面）；私聊是用户**主动**找 bot，消息本就
     /// 一对一到达，无探测面可言——默认引导，帮首次使用者拿到自己的 id 完成授权。
-    /// 关闭后私聊同样完全静默。
+    /// 关闭后私聊同样完全静默。**改动需重启**（同 prefs 注入时机）。
     #[serde(default = "default_stranger_p2p_hint")]
     pub stranger_p2p_hint: bool,
     /// 回复形态偏好（P7-A4；默认 card）。text = 不建卡走纯文本流（/config 可热改）。
+    /// **改动需重启**：启动偏好（prefs）在启动期注入 Dispatcher，SIGHUP 不热载
+    ///（/config 的运行时热改不受影响）。
     #[serde(default)]
     pub reply_mode: ReplyMode,
     /// Wave B-4：免打扰时段（`"22:00-08:00"`，本地时区，可跨天；None = 不启用）。
@@ -516,7 +546,8 @@ pub struct Config {
     /// W4-1：per-sender 成本上限（美元，**滚动 24h 窗口**）——该发送者近 24h
     /// 累计成本达到上限后新轮次直接拒绝（回执说明）。多用户群部署的运营护栏。
     /// None（默认）= 不限制。统计依赖 run_stats.sender（v9 起记录；升级前的
-    /// 历史行无 sender，不计入）。
+    /// 历史行无 sender，不计入）。**改动需重启**：预算闸门在启动期注入运行时，
+    /// SIGHUP 不热载。
     #[serde(default)]
     pub sender_daily_cost_limit_usd: Option<f64>,
     /// W3-1：飞书语音转文字（speech_to_text/v1/file_recognize，60s 内语音条）。

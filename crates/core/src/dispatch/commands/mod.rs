@@ -296,7 +296,7 @@ impl Dispatcher {
                         return;
                     }
                     "/status" => {
-                        self.cmd_status(&conv, &hint).await;
+                        self.cmd_status(&conv, &sender.0, &hint).await;
                         return;
                     }
                     "/tasks" => {
@@ -570,6 +570,33 @@ impl Dispatcher {
             // 取 permit（等待期间本 conv 后续消息照常入队等下一批）。permit 跨
             // 整轮持有（含轮后的自动 compact），迭代末 Drop 归还。
             let _round_permit = self.acquire_round_permit(&conv.0).await;
+            // P2（code-review v14）：permit 等待期间到达的 /stop——默认 4 路闸门
+            // 下 acquire 可排队分钟级（多群/cron 齐点），期间新设置的停止标记
+            // 会被 round.rs 的 stop_mark_epoch（permit 之后才读取）当「起点
+            // 水位基线」吞掉，而批循环顶部的检查早已过去——/stop 在整个排队
+            // 窗口失效。故 permit 到手后、起跑前补一次与批循环顶部同款的无
+            // 条件停止检查（round.rs 内现有的 epoch 复查保留，覆盖 preamble
+            // 窗口）。命中则回复拦截文案并 continue：与 v1.21 注释同理不能
+            // break——take 已把 entry 留成空 Vec，break 悬挂空 entry 成死队列，
+            // continue 走完 take 收尾自然退出。
+            {
+                let hit = self
+                    .with_conv(&conv.0, |cs| {
+                        cs.stop_requested
+                            .take()
+                            .is_some_and(|ts| super::now_secs() - ts <= 60)
+                    })
+                    .await;
+                if hit {
+                    self.reply(
+                        &conv,
+                        "⏹️ 已中断：轮次在启动前被 /stop 拦下（本批消息未执行）",
+                        &hint,
+                    )
+                    .await;
+                    continue;
+                }
+            }
             let round_input = self.run_agent_round(merged, react_mids).await;
             // v1.18：轮末清 steering 注入计数（footer「已注入 N 条」随轮归零；
             // 保留排队字段——下一批语义仍在）。T18：hint 活在 ConvState 单表。

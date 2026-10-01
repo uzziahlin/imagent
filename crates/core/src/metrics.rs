@@ -52,8 +52,9 @@ pub struct Metrics {
     /// （`rx.len()`，tokio mpsc `Receiver::len` 自 1.38 稳定，workspace 1.5x 可用）
     /// ——消费端背压（P1-1/P2-11 整类问题）的最直接先行信号：消费被平台 IO 钉死
     /// 时该值会顶到 channel 容量（32）并停留。全局单 gauge 不带 conv label（会话
-    /// 维度做 label 是高基数时间序列）；多 conv 并发在飞时值为「最近一次观测」，
-    /// 卡住的 conv 每次迭代都写高值，观测层面不受影响。
+    /// 维度做 label 是高基数时间序列）；P3-c（code-review v14）起由
+    /// [`AgentChannelDepthSlot`] 按轮差量记账，多轮并发在飞时值为「Σ 各轮深度」
+    ///（轮退出 Drop 归零自己的贡献，不再互踩）。
     pub agent_channel_depth: IntGauge,
     /// T11：卡片 patch 时延（秒）——card_session 的 `dispatch_patch` 全路径计时
     /// （平台 send_card/update_card + live_cards 登记落库）。bucket 对齐时延类
@@ -151,6 +152,39 @@ impl Metrics {
 /// 全局指标单例。访问即触发注册。
 pub static METRICS: LazyLock<Metrics> = LazyLock::new(Metrics::new);
 
+/// P3-c（code-review v14）：[`Metrics::agent_channel_depth`] 的按轮记账句柄。
+/// 旧的全局单值 `set()` 语义在多轮并发在飞时互踩：后观测的轮覆盖先写值、
+/// 先退出的轮把 `set(0)` 打在别的轮头上（在飞深度被清零，背压信号失真）。
+/// 改为「Σ 各轮本地深度」的合计记账：每轮 set 前先减旧值再加新值（差量
+/// 增减），轮退出（含 future 被 abort——drain 的 abort_all）时 Drop guard 减掉
+/// 最后观测值归零自己的贡献。合计语义下该 gauge 仍是消费端背压先行信号
+///（消费被平台 IO 钉死时，Σ 顶到 32×在飞轮数并停留）。
+#[derive(Debug, Default)]
+pub(crate) struct AgentChannelDepthSlot {
+    /// 本轮最近一次上报的深度（Drop 时的归还基数）。
+    last: i64,
+}
+
+impl AgentChannelDepthSlot {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// 上报本轮当前深度（差量应用到全局 gauge，不动其它轮的贡献）。
+    pub(crate) fn set(&mut self, depth: i64) {
+        METRICS.agent_channel_depth.add(depth - self.last);
+        self.last = depth;
+    }
+}
+
+impl Drop for AgentChannelDepthSlot {
+    fn drop(&mut self) {
+        if self.last != 0 {
+            METRICS.agent_channel_depth.sub(self.last);
+        }
+    }
+}
+
 /// 收集默认 registry 全部指标为 Prometheus 文本格式（供 `/metrics`）。
 pub fn render() -> String {
     let encoder = TextEncoder::new();
@@ -167,8 +201,13 @@ pub fn render() -> String {
 mod tests {
     use super::*;
 
+    /// 本模块两个测试都触碰全局 gauge，串行化防互相干扰（dispatch 集成测试
+    /// 对 gauge 的贡献是差量平衡的，无净残值）。
+    static METRICS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn render_contains_registered_metrics() {
+        let _g = METRICS_TEST_LOCK.lock().unwrap();
         // 触发惰性初始化并产生一次计数。
         METRICS.messages_in.inc();
         METRICS.backend_calls.inc();
@@ -248,5 +287,39 @@ mod tests {
             out.contains("imagent_text_flush_bytes"),
             "missing text_flush_bytes: {out}"
         );
+    }
+
+    /// P3-c（code-review v14）：按轮记账槽——多轮（两个槽并发存活）时全局
+    /// gauge 为「Σ 各轮深度」（差量增减），槽 Drop 归零自己的贡献；旧的裸
+    /// set() 语义会让后写覆盖先写、先退出的轮清零在飞轮的观测。
+    /// 同 binary 的 dispatch 集成测试会瞬时触碰该全局 gauge（µs 级、差量
+    /// 平衡），断言偶发失配时整体重试——真实回归会稳定失败，不因此被掩盖。
+    #[test]
+    fn channel_depth_slot_sums_and_releases() {
+        let _g = METRICS_TEST_LOCK.lock().unwrap();
+        for _ in 0..100 {
+            let before = METRICS.agent_channel_depth.get();
+            let mut ok = true;
+            {
+                let mut s1 = AgentChannelDepthSlot::new();
+                s1.set(3);
+                ok &= METRICS.agent_channel_depth.get() == before + 3;
+                {
+                    let mut s2 = AgentChannelDepthSlot::new();
+                    s2.set(5);
+                    ok &= METRICS.agent_channel_depth.get() == before + 8;
+                    // s2 退出：只归还自己的 5（旧 set(0) 语义会连 s1 的 3 一起清掉）。
+                }
+                ok &= METRICS.agent_channel_depth.get() == before + 3;
+                // 同槽降观测：差量 -2。
+                s1.set(1);
+                ok &= METRICS.agent_channel_depth.get() == before + 1;
+            }
+            ok &= METRICS.agent_channel_depth.get() == before;
+            if ok {
+                return;
+            }
+        }
+        panic!("AgentChannelDepthSlot 合计记账断言持续不成立（真实回归，非并行测试干扰）");
     }
 }
