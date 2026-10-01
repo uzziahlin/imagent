@@ -620,7 +620,7 @@ pub async fn spawn_cli_backend(
     let (placeholder_tx, placeholder_rx) = tokio::sync::mpsc::channel::<String>(1);
     drop(placeholder_tx);
     let mut steer_rx = steer.unwrap_or(placeholder_rx);
-    let stdin_writer = tokio::spawn(async move {
+    let mut stdin_writer = tokio::spawn(async move {
         let Some(mut w) = stdin_w else {
             // 无 stdin（非 control 通道）：消费两个通道防发送方永久阻塞。
             return;
@@ -676,6 +676,9 @@ pub async fn spawn_cli_backend(
     let mut reader = BufReader::new(stdout);
     let mut session_id = String::new();
     let mut final_text = String::new();
+    // (code-review v14) P3-b：final_text 总量帽（16MB）的截断标志——置位后
+    // Text/TextDelta 不再累积（chunk 流照推），见 [`push_text_capped`]。
+    let mut final_truncated = false;
     let mut error_text: Option<String> = None;
     let mut reached_terminal = false;
     // B10：非致命 error 事件累积（codex 顶层 `error`，可能瞬时重连）。不中断流；
@@ -837,10 +840,9 @@ pub async fn spawn_cli_backend(
                         // （Final）仍整体覆盖 final_text（claude result 权威文本语义
                         // 不变）；完整消息语义见 Text——delta 片段走 TextDelta 直接
                         // 续接，不在此列。
-                        if !final_text.is_empty() {
-                            final_text.push_str("\n\n");
-                        }
-                        final_text.push_str(&t);
+                        // (code-review v14) P3-b：累积改经 [`push_text_capped`]
+                        //（16MB 总量帽，OOM 兜底）。
+                        push_text_capped(&mut final_text, "\n\n", &t, &mut final_truncated);
                     }
                 }
                 // T20（gemini delta 碎化修复）：增量片段——流式 chunk 照推（卡片
@@ -849,7 +851,8 @@ pub async fn spawn_cli_backend(
                 CliEvent::TextDelta(t) => {
                     if !t.is_empty() {
                         let _ = chunks.send(AgentChunk::Text(t.clone())).await;
-                        final_text.push_str(&t);
+                        // (code-review v14) P3-b：同上，经 [`push_text_capped`] 累积。
+                        push_text_capped(&mut final_text, "", &t, &mut final_truncated);
                     }
                 }
                 // W2-1：思考过程——仅推 chunk（卡片折叠展示），不进 final_text
@@ -960,6 +963,10 @@ pub async fn spawn_cli_backend(
                     // Final 保持权威整体覆盖语义（claude result 是该轮完整文本）。
                     if origin_kind.as_deref() != Some("task-notification") {
                         final_text = text;
+                        // (code-review v14) P3-b：整体覆盖重置截断标志——覆盖后
+                        // 累积容量恢复（bg_active>0 时 Final 后仍有通知 Text 追加，
+                        // 此前置位会让后续追加被误吞）。
+                        final_truncated = false;
                     }
                     reached_terminal = true; // N8：标记由终止事件产出（非中间 Text 后 EOF）
                                              // 真机校准（2026-08-31）：活跃后台任务未清零时不终止——
@@ -1044,7 +1051,25 @@ pub async fn spawn_cli_backend(
     {
         // 读循环退出：关 ctrl 通道 → stdin writer task 退出并 drop stdin（EOF）。
         drop(ctrl_tx);
-        let _ = stdin_writer.await;
+        // (code-review v14) P3-a：stdin writer 收尾加超时（与下方 stderr 收尾同款）。
+        // writer task 可能阻塞在对已满 stdin 管道的 write_all/flush 上——子进程
+        // 打完终态行后不再读 stdin（如 agent 僵死、或只顾跑剩余逻辑），steer /
+        // 控制响应把 ~64KB 管道缓冲灌满后 write_all 永不返回，裸 join 会把收尾
+        // 挂到空闲看门狗 + fd 泄漏（cancel / killpg 路径有兜底，唯独这条 happy
+        // path 收尾漏了）。超时 abort 释放 writer task（stdin 写端 fd 随之丢弃，
+        // EOF 语义改由下方 wait 超时 → kill 兜底）后继续收尾。
+        if tokio::time::timeout(STDIN_WRITER_DRAIN_TIMEOUT, &mut stdin_writer)
+            .await
+            .is_err()
+        {
+            stdin_writer.abort();
+            tracing::warn!(
+                target: "imagent::backend",
+                backend = backend_name,
+                timeout_secs = STDIN_WRITER_DRAIN_TIMEOUT.as_secs(),
+                "stdin writer 收尾超时（疑似子进程 stdin 管道写满且不再读取），abort 后继续收尾"
+            );
+        }
         match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
             Ok(res) => res,
             Err(_) => {
@@ -1279,11 +1304,77 @@ const MAX_STDOUT_LINE_BYTES: usize = 8 * 1024 * 1024;
 /// stderr 累积字节上限（S-5）：长会话 stderr 膨胀，超限截断。
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 
+/// (code-review v14) P3-b：正文（final_text / ACP agent_text）的总量累积帽。
+/// stderr 有 64KB 总帽、stdout 有单行 8MB 帽，但正文累积此前**无总量上限**——
+/// 「cat 大文件」类多行输出可把 final_text 无限撑大（OOM 面）。16MB 对正常长
+/// 回复远够用（IM 侧本就有展示截断），仅作内存兜底；超限截断 + 一次性标记，
+/// chunk 流照推（流式卡片不受影响）。
+pub const MAX_FINAL_TEXT_BYTES: usize = 16 * 1024 * 1024;
+
+/// (code-review v14) P3-b：正文总量超帽的一次性截断标记（见 [`push_text_capped`]）。
+const FINAL_TEXT_TRUNCATION_MARKER: &str = "\n…[输出超长已截断]";
+
+/// (code-review v14) P3-b：把 `s` 原地截到 `max_bytes` 内的最大字符边界（不撕裂
+/// UTF-8；`String::truncate` 要求边界，先回退到边界再截）。
+fn truncate_at_char_boundary(s: &mut String, max_bytes: usize) {
+    if s.len() <= max_bytes {
+        return;
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s.truncate(cut);
+}
+
+/// (code-review v14) P3-b：带总量帽的正文累积——把 `piece`（经 `sep` 分隔：
+/// [`CliEvent::Text`] 用 `"\n\n"`、[`CliEvent::TextDelta`] 与 ACP 的
+/// AgentMessageChunk 用 `""`）追加进 `acc`；超过 [`MAX_FINAL_TEXT_BYTES`] 时截到
+/// 帽内最大字符边界（不撕裂 UTF-8）并追加一次性标记，`truncated` 置位后本函数
+/// no-op。CLI 路径（final_text）与 ACP 路径（agent_text）共用同一实现，防单边
+/// 漂移。
+pub fn push_text_capped(acc: &mut String, sep: &str, piece: &str, truncated: &mut bool) {
+    if *truncated || piece.is_empty() {
+        return;
+    }
+    let sep_len = if acc.is_empty() { 0 } else { sep.len() };
+    if acc.len() + sep_len + piece.len() <= MAX_FINAL_TEXT_BYTES {
+        if sep_len > 0 {
+            acc.push_str(sep);
+        }
+        acc.push_str(piece);
+        return;
+    }
+    // 超帽：先把 acc 自身截到「帽 - 标记预留」（under-cap 路径可把它填到帽，
+    // 直接叠标记会越帽），再续 piece 到剩余空间，最后一次性标记收尾（此后
+    // no-op）。
+    let budget = MAX_FINAL_TEXT_BYTES - FINAL_TEXT_TRUNCATION_MARKER.len();
+    truncate_at_char_boundary(acc, budget);
+    let sep_len = if acc.is_empty() { 0 } else { sep.len() };
+    let room = budget.saturating_sub(acc.len() + sep_len);
+    let mut cut = piece.len().min(room);
+    while cut > 0 && !piece.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    if cut > 0 && sep_len > 0 {
+        acc.push_str(sep);
+    }
+    acc.push_str(&piece[..cut]);
+    acc.push_str(FINAL_TEXT_TRUNCATION_MARKER);
+    *truncated = true;
+}
+
 /// P2-9：正常完成路径（wait 返回 Ok）的 stderr 收尾超时——agent 主进程退出但
 /// 其孙进程（如 Bash 里 `sleep 10000 &` 未重定向 stderr）持有 stderr 管道写端
 /// 时，裸 join 会挂到空闲看门狗（默认 20min）+ fd 泄漏（cancel/超时路径都有
 /// killpg 兜底，唯独 happy path 漏了）。超时即放弃剩余 stderr（仅诊断信息）。
 const STDERR_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// (code-review v14) P3-a：control 通道收尾的 stdin writer join 超时——writer
+/// task 阻塞在对已满 stdin 管道的 write_all/flush（子进程不再读 stdin）时裸
+/// join 会挂到空闲看门狗 + fd 泄漏。与 [`STDERR_DRAIN_TIMEOUT`] 同款语义、
+/// 同取 5s（超时 abort 后继续 wait/kill 收尾，stdin 的 EOF 语义由 kill 兜底）。
+const STDIN_WRITER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// stderr 单行字节上限（S-5）：防 agent 向 stderr 写无 `\n` 的超长流（可被 prompt
 /// injection 构造）导致单行全量分配 OOM。与 stdout 的 [`MAX_STDOUT_LINE_BYTES`] 对称。
@@ -1324,8 +1415,8 @@ const ALWAYS_PASSTHROUGH_ENV: &[&str] = crate::agent_process::AGENT_RUNTIME_ENV;
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_task_tool, image_write_path, parse_task_list_snapshot, resolve_task_create_result,
-        spawn_cli_backend, CliEvent, ControlIo,
+        apply_task_tool, image_write_path, parse_task_list_snapshot, push_text_capped,
+        resolve_task_create_result, spawn_cli_backend, CliEvent, ControlIo,
     };
     use crate::types::{TodoItem, TodoStatus};
 
@@ -1460,6 +1551,127 @@ mod tests {
             started.elapsed() >= super::STDERR_DRAIN_TIMEOUT,
             "应等待到 stderr 收尾超时才返回: {:?}",
             started.elapsed()
+        );
+    }
+
+    /// (code-review v14) P3-a 回归：control 通道收尾的 stdin writer join 加超时。
+    /// writer task 阻塞在对已满 stdin 管道的 write_all（子进程打完终态行后不再
+    /// 读 stdin）时，旧实现裸 `stdin_writer.await` 会永久挂起收尾（挂到空闲
+    /// 看门狗 + fd 泄漏）。经 steer 通道灌一条超管道缓冲（~64KB）的消息使 writer
+    /// 阻塞在 write_all，断言收尾在超时 + abort 后照常完成（修复前本测试的
+    /// 外层 20s timeout 直接失败）。子进程 sleep 6s 后自退：wait 阶段拿 Ok 返回，
+    /// 免去 kill 分支的额外 5s。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdin_writer_drain_times_out_when_pipe_full() {
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        // 打一行 Final（读循环随即 break 进入收尾），然后 sleep——不读 stdin、
+        // 不退出，使 writer 的 steer 写入灌满 ~64KB 管道缓冲后阻塞在 write_all。
+        cmd.arg("-c").arg("printf 'ok\\n'; sleep 6");
+        let (tx, _rx) = tokio::sync::mpsc::channel::<crate::types::AgentChunk>(64);
+        let parse = |line: &str| CliEvent::Final {
+            text: line.trim_end().to_string(),
+            session: None,
+            origin_kind: None,
+        };
+        // steer 通道预灌 1MB（> 任何 unix 管道缓冲上限），writer 必然阻塞。
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<String>(1);
+        steer_tx.send("x".repeat(1024 * 1024)).await.unwrap();
+        let io = ControlIo {
+            sock: "/nonexistent/permission.sock".into(),
+            conv_id: "test-conv".into(),
+            ask_timeout: std::time::Duration::from_secs(2),
+            initial_stdin_message: "{}\n".into(),
+        };
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            spawn_cli_backend(
+                cmd,
+                parse,
+                tx,
+                "test-backend",
+                &[],
+                Some(io),
+                Vec::new(),
+                Some(steer_rx),
+            ),
+        )
+        .await
+        .expect("收尾须在 20s 内完成（stdin writer 超时 abort 后继续收尾）")
+        .expect("run 应成功");
+        assert_eq!(outcome.final_text, "ok");
+        // 确实走了超时 abort 路径（等满 5s），而非 writer 意外快速退出。
+        assert!(
+            started.elapsed() >= super::STDIN_WRITER_DRAIN_TIMEOUT,
+            "应等待到 stdin writer 收尾超时才返回: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// (code-review v14) P3-b 回归：final_text 总量帽（[`push_text_capped`]）——
+    /// 帽内正常累积（含分隔符）；超帽截断 + 一次性标记；标记后继续累积 no-op；
+    /// 截断点不撕裂 UTF-8 多字节字符。
+    #[test]
+    fn push_text_capped_truncates_once_with_marker() {
+        let mut acc = String::new();
+        let mut truncated = false;
+        // 帽内：分隔符 + 拼接（B9 语义不变）。
+        push_text_capped(&mut acc, "\n\n", "hello", &mut truncated);
+        push_text_capped(&mut acc, "\n\n", "world", &mut truncated);
+        assert_eq!(acc, "hello\n\nworld");
+        assert!(!truncated);
+        // delta 形态（无分隔符）帽内直接续接。
+        push_text_capped(&mut acc, "", "!", &mut truncated);
+        assert_eq!(acc, "hello\n\nworld!");
+        // 灌过 16MB 总帽：截断发生，总量有界且以一次性标记收尾。
+        let mb = "x".repeat(1024 * 1024);
+        while !truncated {
+            push_text_capped(&mut acc, "\n\n", &mb, &mut truncated);
+        }
+        assert!(
+            acc.len() <= super::MAX_FINAL_TEXT_BYTES,
+            "总量有界: {}",
+            acc.len()
+        );
+        assert!(
+            acc.ends_with(super::FINAL_TEXT_TRUNCATION_MARKER),
+            "应以截断标记收尾: {}…",
+            &acc[acc.len() - 64..]
+        );
+        // 标记置位后：后续累积 no-op（不再追加、标记只出现一次）。
+        let len_at_trunc = acc.len();
+        push_text_capped(&mut acc, "\n\n", &mb, &mut truncated);
+        assert_eq!(acc.len(), len_at_trunc, "截断后累积应 no-op");
+        // 空片段恒 no-op。
+        push_text_capped(&mut acc, "\n\n", "", &mut truncated);
+        assert_eq!(acc.len(), len_at_trunc);
+    }
+
+    /// (code-review v14) P3-b：截断点不撕裂 UTF-8——剩余空间不足以容纳整段
+    /// 多字节文本时，截到最大字符边界（结果仍是合法 str，中文字符不拦腰截断）。
+    #[test]
+    fn push_text_capped_respects_char_boundary() {
+        // 布局：budget = MAX - 标记(24B)；filler 填到 budget - 8 → 截断分支的
+        // room = 8；piece「你好世界」×5（60B > 32B 余量触发截断）→ 8 不是汉字
+        // 边界（3B/字），回退到 6 → 恰好放下「你好」两个完整汉字。
+        let marker_len = super::FINAL_TEXT_TRUNCATION_MARKER.len();
+        let filler = "x".repeat(super::MAX_FINAL_TEXT_BYTES - marker_len - 8);
+        let mut acc = String::new();
+        let mut truncated = false;
+        push_text_capped(&mut acc, "", &filler, &mut truncated);
+        assert!(!truncated, "预留后填充不应截断");
+        push_text_capped(&mut acc, "", &"你好世界".repeat(5), &mut truncated);
+        assert!(truncated, "超预留应截断");
+        assert!(
+            acc.ends_with(&format!("你好{}", super::FINAL_TEXT_TRUNCATION_MARKER)),
+            "应截在汉字边界: …{}",
+            &acc[acc.len() - marker_len - 12..]
+        );
+        assert!(
+            acc.len() <= super::MAX_FINAL_TEXT_BYTES,
+            "总量有界: {}",
+            acc.len()
         );
     }
 

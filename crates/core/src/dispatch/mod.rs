@@ -612,6 +612,10 @@ pub struct Dispatcher {
     /// T4（P3-3）：「permission_mode = allow/deny × 非 FullLoop」告警的去重
     /// 状态——最近一次评估时的档位签名。语义同 [`Self::allowlist_warn_state`]。
     perm_mode_warn_state: parking_lot::Mutex<Option<PermissionMode>>,
+    /// 【P2 能力矩阵 · code-review v14】：「off/auto（解析为 off）× claude-acp
+    /// 形态后端」告警的去重状态——最近一次评估时的档位签名。语义同
+    /// [`Self::allowlist_warn_state`]（离开告警态清空，再进入重新告警）。
+    acp_off_warn_state: parking_lot::Mutex<Option<PermissionMode>>,
     /// T8（v13 安全批）：webhook 暴露面摘要（main 在 spawn webhook server 处
     /// 注入一次；server 不随 SIGHUP 重启，摘要与 server 同生命周期——不设
     /// 热载）。`/doctor` 安全自检读取。
@@ -796,6 +800,37 @@ pub(crate) fn perm_mode_dead_notice(
     ))
 }
 
+/// 【P2 能力矩阵 · code-review v14】：「off/auto（解析为 off）× claude-acp 形态
+/// 后端」象限的告警文案（None = 无需提示）。该象限下网关对 ACP 的
+/// session/request_permission 一律自动放行（等同 allow），叠加 P1-3 已知限制
+///（allowed_tools 在 ACP 后端不生效）后，高危工具完全不再经 IM 审批——与
+/// claude-cli 的同档位行为（off 下工具面仍被 --allowedTools 收敛）不同。两个
+/// FullLoop 后端间安全姿态静默分叉，用户极可能以为一致，故显式告警请确认。
+/// 判定用能力位签名（FullLoop 且不支持逐工具白名单）而非后端名匹配——目前
+/// 唯一命中是 claude-acp，未来同形态后端同样适用。
+pub(crate) fn acp_off_mode_notice(
+    mode: PermissionMode,
+    backend_name: &str,
+    capability: crate::backend::PermissionCapability,
+    supports_allowlist: bool,
+) -> Option<String> {
+    if capability != crate::backend::PermissionCapability::FullLoop || supports_allowlist {
+        return None;
+    }
+    // auto 解析：claude-acp 下 auto → off。运行时句柄通常已是解析后的具体档
+    //（main 启动/SIGHUP 均先 resolve），这里再 resolve 一次兜底直写 auto 的
+    // 路径（与 main 的 resolve 同源，backend_name 即解析依据）。
+    if mode.resolve(backend_name) != PermissionMode::Off {
+        return None;
+    }
+    Some(format!(
+        "permission_mode = \"{}\" 运行于后端 {backend_name}：网关将自动放行全部权限请求（等同 allow），\
+         allowed_tools 白名单在 ACP 后端不生效、高危工具不再经 IM 审批——与 claude-cli 同档位\
+         行为（off 下仍有 --allowedTools 收敛）不同，请显式确认。参见 SECURITY.md「已知限制」",
+        mode.as_str()
+    ))
+}
+
 /// T4：不支持逐工具白名单的后端，工具面实际由什么决定（告警文案用）。按
 /// backend name 描述已知后端的机制；未知后端给通用描述（能力位才是判定
 /// 事实，此处仅文案）。
@@ -904,6 +939,7 @@ impl Dispatcher {
             round_gate: parking_lot::RwLock::new(RoundGate::new(budgets.max_concurrent_rounds)),
             allowlist_warn_state: parking_lot::Mutex::new(None),
             perm_mode_warn_state: parking_lot::Mutex::new(None),
+            acp_off_warn_state: parking_lot::Mutex::new(None),
             webhook_exposure: parking_lot::RwLock::new(WebhookExposure::default()),
             bitable: Arc::new(RwLock::new(None)),
         };
@@ -1231,7 +1267,11 @@ impl Dispatcher {
     ///    映射到 sandbox/approval-mode）；
     /// 2. **P3-3**：permission_mode = allow/deny × 非 FullLoop——该档位的执行
     ///    位置在审批回调的固定答复，无回调后端上等于空操作，实际边界 =
-    ///    allowed_tools / 后端沙箱。
+    ///    allowed_tools / 后端沙箱；
+    /// 3. **P2（code-review v14）**：off/auto（解析为 off）× claude-acp 形态
+    ///    （FullLoop 但无逐工具白名单）——网关自动放行全部权限请求（等同
+    ///    allow），高危工具不再经 IM 审批且 allowed_tools 不生效，与
+    ///    claude-cli 同档位行为分叉，须显式确认（见 [`acp_off_mode_notice`]）。
     ///
     /// 去重：同一状态签名只 warn 一次；配置变更（签名变化）后再进入告警态
     /// 重新告警（SIGHUP 无变化时不刷屏）。返回本次实际发出的告警文案
@@ -1269,6 +1309,26 @@ impl Dispatcher {
             *st = Some(mode);
         } else {
             *self.perm_mode_warn_state.lock() = None;
+        }
+        // 维度三【P2 · code-review v14】：off/auto（解析为 off）× claude-acp 形态
+        //（FullLoop 但无逐工具白名单）——网关自动放行全部权限请求，高危工具
+        // 不再经 IM 审批且 allowed_tools 不生效，与 claude-cli 同档位行为分叉。
+        // 接线与前两维同款（run() 启动 / reload_tools / reload_permission_mode
+        // 三个点位共用本函数，SIGHUP 自然生效）。
+        if let Some(notice) = acp_off_mode_notice(
+            mode,
+            self.backend.name(),
+            self.backend.permission_capability(),
+            self.backend.supports_tool_allowlist(),
+        ) {
+            let mut st = self.acp_off_warn_state.lock();
+            if *st != Some(mode) {
+                warn!(target: "imagent::core", backend = self.backend.name(), "{notice}");
+                emitted.push(notice);
+            }
+            *st = Some(mode);
+        } else {
+            *self.acp_off_warn_state.lock() = None;
         }
         emitted
     }
@@ -1353,6 +1413,15 @@ impl Dispatcher {
     /// 暴露 auth（main 的 SIGHUP task 用其 reload）。
     pub fn auth(&self) -> &Auth {
         &self.auth
+    }
+
+    /// 启动时选定的后端名（= config.agent 原样）。backend 在 main 装配期构建、
+    /// SIGHUP 只热载参数不换后端实现，故 `name()` 即启动期值——无需另存一份。
+    /// main 的 SIGHUP 处理器用它对**运行中后端**解析新 config 的 permission_mode
+    /// （resolve 按后端分叉：claude-cli → auto-claude，其余 → off），避免用错
+    /// 重载前旧 config.agent 的档位。
+    pub fn agent_label(&self) -> &'static str {
+        self.backend.name()
     }
 
     /// 暴露 router（主进程 socket accept task 用）。
@@ -2251,29 +2320,47 @@ impl Dispatcher {
                 // 进队列，取批按行精确删）。旧序（先入队后落行）在「落行完成前
                 // 被取批」时该行不属于批次 rowid 集合而残留，崩溃后会重放已处理
                 // 消息；新序崩溃在两步之间 = 行在内存无 → 重放执行（语义正确）。
-                // 代价：persist 期间 runner 可能取空并交还身份 → 回写时重建
-                //（无 runner 的挂起 queue 等下一条消息激活——批窗口静默使该
-                // 窗口实际不可达，与既有同款竞态一致）。
                 let rowid = self.persist_queued(conv, queued_mid.as_deref(), &msg).await;
                 // ② 回写：push 与 hint 更新同临界区（原子——旧版两锁间隙靠下方
                 // 复查兜底，现为同锁天然一致，复查保留为 note IO 期间的兜底）。
-                let count = self
-                    .with_conv(conv, |cs| {
-                        let pending = cs.queue.get_or_insert_with(Vec::new);
-                        pending.push(QueuedMsg { rowid, msg });
-                        let count = pending.len();
-                        let latest = latest_snippet(&pending[pending.len() - 1].msg);
-                        // v1.18 review：合并写入而非整体替换——steered（「已注入
-                        // N 条」）与 count/latest 属同一 footer 的两个字段，整体
-                        // 替换会把运行中注入计数清零（注入 3 条后再排队 1 条 →
-                        // footer 只显示排队，注入可见性静默消失——恰是该特性最
-                        // 常见的混合使用流）。
-                        let h = cs.queued_hint.get_or_insert_default();
-                        h.count = count;
-                        h.latest = latest;
-                        count
+                // P1（code-review v14）：回写临界区内先复查 runner 身份。persist
+                //（SQLite INSERT，可排队毫秒级）期间，在飞 runner 可能恰好取到
+                // 空批并置 queue=None 交还身份退出——旧实现的无条件
+                // get_or_insert 会在此时重建队列，造出「无 runner 的孤儿队列」；
+                // 而 runner 身份恰是 queue.is_some()，后续消息只会继续入队、
+                // 永不接棒，会话永久停摆（旧注释「等下一条消息激活」的断言
+                // 错误）。对称复用 BecomeRunner 分支语义：queue 已交还 → 本条
+                // 消息照常入队但**接棒成为 runner**（返回 true，调用方进入
+                // runner 循环接手）；任务即将执行，「后面还排着 N 条」的
+                // note_queued_on_ask 与排队表情标注语义不符，下方整段跳过
+                //（S-3/S-4 的 stale hint 复查同理）。
+                let (became_runner, count) = self
+                    .with_conv(conv, |cs| match cs.queue.as_mut() {
+                        Some(pending) => {
+                            pending.push(QueuedMsg { rowid, msg });
+                            let count = pending.len();
+                            let latest = latest_snippet(&pending[pending.len() - 1].msg);
+                            // v1.18 review：合并写入而非整体替换——steered（「已注入
+                            // N 条」）与 count/latest 属同一 footer 的两个字段，整体
+                            // 替换会把运行中注入计数清零（注入 3 条后再排队 1 条 →
+                            // footer 只显示排队，注入可见性静默消失——恰是该特性最
+                            // 常见的混合使用流）。
+                            let h = cs.queued_hint.get_or_insert_default();
+                            h.count = count;
+                            h.latest = latest;
+                            (false, count)
+                        }
+                        // runner 已在 persist 窗口内交还身份（交还语义 = 队列
+                        // 必空）：本条接棒建队，元素即本条。
+                        None => {
+                            cs.queue = Some(vec![QueuedMsg { rowid, msg }]);
+                            (true, 1)
+                        }
                     })
                     .await;
+                if became_runner {
+                    return true;
+                }
                 // P10：排队状态上卡——①②流式卡 footer 由 CardSession 下次 patch
                 // 拉取；③审批等待是最静默的窗口（无 chunk，footer 不动），推送
                 // 重渲染审批卡 note 行（best-effort）。两者都是状态更新，不往

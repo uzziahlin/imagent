@@ -284,24 +284,39 @@ impl Dispatcher {
                             // P1（v1.17）：转录回放是同步逐行 IO+解析（大会话可
                             // 达 MB 级），下放 blocking 池防阻塞 async worker。
                             let backend = self.backend.clone();
-                            let derived = tokio::task::spawn_blocking(move || {
+                            // P3-b（code-review v14）：JoinError 与 None 都**跳过
+                            // 回写**（保留 NULL，下轮重试）——旧实现的双层
+                            // unwrap_or_default 把「推导失败/后端不支持」静默折叠
+                            // 成「空快照」固化进 DB；NULL 的语义是「待推导」，
+                            // 被空快照顶掉后永远走快路径，转录兜底不再有机会
+                            // 重试。只有真实的 Some 才 set_session_todos。
+                            let derived = match tokio::task::spawn_blocking(move || {
                                 backend.derive_task_todos(&sid_for_replay, &wd)
                             })
                             .await
-                            .unwrap_or_default()
-                            .unwrap_or_default();
-                            let payload = crate::types::TaskTodosPayload {
-                                at: now_secs(),
-                                items: derived.clone(),
-                            };
-                            if let Ok(s) = serde_json::to_string(&payload) {
-                                if let Err(e) =
-                                    self.store.set_session_todos(&conv.0, Some(&s)).await
-                                {
+                            {
+                                Err(e) => {
                                     warn!(target: "imagent::core", conv_id = %conv.0, error = %e,
-                                        "转录兜底快照回写失败（不影响本轮，下轮重试）");
+                                        "derive_task_todos 任务失败，本轮跳过快照回写（保留 NULL 下轮重试）");
+                                    Vec::new()
                                 }
-                            }
+                                Ok(None) => Vec::new(),
+                                Ok(Some(items)) => {
+                                    let payload = crate::types::TaskTodosPayload {
+                                        at: now_secs(),
+                                        items: items.clone(),
+                                    };
+                                    if let Ok(s) = serde_json::to_string(&payload) {
+                                        if let Err(e) =
+                                            self.store.set_session_todos(&conv.0, Some(&s)).await
+                                        {
+                                            warn!(target: "imagent::core", conv_id = %conv.0, error = %e,
+                                                "转录兜底快照回写失败（不影响本轮，下轮重试）");
+                                        }
+                                    }
+                                    items
+                                }
+                            };
                             derived
                         }
                     };
@@ -579,10 +594,14 @@ impl Dispatcher {
         // since_chunk 自计数（语义与旧整段超时一致）。
         const HEARTBEAT_TICK: std::time::Duration = std::time::Duration::from_secs(30);
         let mut since_chunk = std::time::Instant::now();
+        // P3-c（code-review v14）：本轮的 channel 深度记账槽（差量作用于全局
+        // gauge，Drop 归零自己的贡献）——替代旧的裸 `set()`，多轮并发在飞时
+        // 不再把彼此的观测互相覆盖/清零。
+        let mut channel_depth = crate::metrics::AgentChannelDepthSlot::new();
         loop {
             // T11（v13 #4）：chunk channel 积压深度——每迭代刷新（背压先行信号：
             // 消费被平台 IO 钉死时该值顶到容量 32 并停留，见 metrics.rs 取舍注释）。
-            METRICS.agent_channel_depth.set(rx.len() as i64);
+            channel_depth.set(rx.len() as i64);
             // P4-6：COT 档位每轮读取（/config 热改对下一轮生效；Wave B-7：
             // per-conv 覆盖优先，/config cot 白名单用户可改自己会话）。
             let cot = self.cot_for(&conv.0).await;
@@ -791,9 +810,10 @@ impl Dispatcher {
             }
         }
 
-        // T11：本轮 channel 已关闭（退出时必然为空），积压 gauge 归零——不留
-        // 上一次观测的残值误导「仍有积压」。
-        METRICS.agent_channel_depth.set(0);
+        // T11：本轮 channel 已关闭（退出时必然为空），深度 gauge 的本轮贡献由
+        // channel_depth 的 Drop guard 归零（含 future 被 abort 的退出路径）——
+        // 不留残值误导「仍有积压」，也不再误清并发在飞轮的观测（P3-c）。
+        drop(channel_depth);
         // P2-11：流结束/中断退出的统一收口——合帧缓冲里未发的文本必须送达
         //（不能丢），且先于终态回复/失败模板/中断标记。覆盖：channel 关闭
         //（正常收尾与 abort 后的排空——sender drop 后 recv 仍会先送完缓冲

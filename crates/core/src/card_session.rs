@@ -261,11 +261,25 @@ impl CardSession {
     /// 时长继续走动（run_secs 随 patch 刷新），审批等待时阶段翻
     /// WaitingApproval。仅在距上次 patch ≥ HEARTBEAT 时动作（不冲击 500ms
     /// 节流语义）。`waiting` = 当前有权限审批 pending。
+    /// P3-d（code-review v14）：无句柄（msg_id=None）不再短路——建卡瞬时失败
+    /// （限流/网络抖动）后 patcher 已把 flushed_gen 追平，若无新事件就停留在
+    /// Idle 永不重试建卡；「建卡失败 + 首 token 长静默」期间用户完全看不到
+    /// 「任务已接收」卡。心跳改为无句柄也 bump gen 驱动 patcher 重试建卡：
+    /// 重试节奏受 CREATE_FAIL_BACKOFF（last_create_fail 2s 窗口，见
+    /// [`patch_delay`]）自然约束，成功拿到句柄后恢复常规 25s 心跳，不会风暴。
     pub(crate) fn heartbeat(&self, waiting: bool) {
         const HEARTBEAT: Duration = Duration::from_secs(25);
         let due = {
             let mut s = self.inner.lock().unwrap();
-            if s.msg_id.is_none() || s.last_patch.elapsed() < HEARTBEAT {
+            if s.msg_id.is_none() {
+                // 无句柄：无 last_patch 可依（从未成功 patch 过），每次心跳都
+                // 推进 gen 让 patcher 重试建卡（退避窗口内 patcher 睡到边界）。
+                if waiting {
+                    s.phase = CardPhase::WaitingApproval;
+                }
+                s.gen += 1;
+                true
+            } else if s.last_patch.elapsed() < HEARTBEAT {
                 false
             } else {
                 if waiting {
@@ -1295,6 +1309,110 @@ mod tests {
             std::time::Instant::now() - std::time::Duration::from_secs(30);
         cs.heartbeat(true);
         wait_until(|| async { cs.inner.lock().unwrap().phase == CardPhase::WaitingApproval }).await;
+    }
+
+    /// P3-d（code-review v14）：首建失败的平台 mock——send_card 第一次失败
+    /// （模拟瞬时限流/网络抖动），之后成功；尝试次数全记录。
+    struct CreateFailOncePlatform {
+        sends: StdMutex<usize>,
+        fail_first: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl Platform for CreateFailOncePlatform {
+        async fn recv(&self) -> Result<crate::types::InboundMessage> {
+            Err(CoreError::Platform("mock-cf", "无入站".into()))
+        }
+        async fn send_text(&self, _conv: &ConvId, _text: &str, _hint: &ReplyHint) -> Result<()> {
+            Ok(())
+        }
+        async fn send_media(
+            &self,
+            _conv: &ConvId,
+            _media: &crate::types::MediaRef,
+            _hint: &ReplyHint,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn name(&self) -> &'static str {
+            "mock-cf"
+        }
+        fn supports_streaming_card(&self, _conv: &ConvId) -> bool {
+            true
+        }
+        async fn send_card(
+            &self,
+            _conv: &ConvId,
+            _card: &OutboundCard,
+            _hint: &ReplyHint,
+        ) -> Result<Option<String>> {
+            *self.sends.lock().unwrap() += 1;
+            if self
+                .fail_first
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                Err(CoreError::Platform(
+                    "mock-cf",
+                    "send_card 失败（模拟瞬时抖动）".into(),
+                ))
+            } else {
+                Ok(Some("card:re".into()))
+            }
+        }
+        async fn update_card(
+            &self,
+            _conv: &ConvId,
+            _handle: &str,
+            _card: &OutboundCard,
+            _hint: &ReplyHint,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// P3-d（code-review v14）：建卡瞬时失败 + 首 token 长静默——首次 send_card
+    /// 失败后 patcher 回到 Idle（gen 已追平），无新 chunk 就永不重试；heartbeat
+    /// 不再因「无句柄」短路，bump gen 驱动 patcher 重建成功（用户在静默期仍能
+    /// 看到「任务已接收」卡）。重试节奏由 CREATE_FAIL_BACKOFF 约束（此处回拨
+    /// 退避时钟跳过 2s 等待，退避语义由 patch_delay 覆盖，不重复验证）。
+    #[tokio::test]
+    async fn heartbeat_recreates_card_after_transient_create_failure() {
+        let (store, db) = tmp_store("hb-recreate").await;
+        let plat = Arc::new(CreateFailOncePlatform {
+            sends: StdMutex::new(0),
+            fail_first: std::sync::atomic::AtomicBool::new(true),
+        });
+        let conv = ConvId("c1".into());
+        let mut s = CardSession::new(
+            store.clone(),
+            conv.clone(),
+            plat.clone(),
+            ReplyHint::None,
+            Default::default(),
+        );
+        // 首建失败（句柄仍无，patcher 记退避后回 Idle）。
+        s.ensure_started();
+        wait_until(|| async { *plat.sends.lock().unwrap() == 1 }).await;
+        assert!(
+            s.inner.lock().unwrap().msg_id.is_none(),
+            "首次建卡应失败（模拟瞬时抖动）"
+        );
+        // 长静默期心跳驱动重建。
+        s.inner.lock().unwrap().last_create_fail =
+            Some(std::time::Instant::now() - CREATE_FAIL_BACKOFF);
+        s.heartbeat(false);
+        wait_until(|| async { store.list_live_cards().await.is_ok_and(|r| !r.is_empty()) }).await;
+        let sends = *plat.sends.lock().unwrap();
+        assert_eq!(
+            sends, 2,
+            "心跳应驱动第二次建卡（失败一次后重试成功）: {sends}"
+        );
+        assert!(
+            s.inner.lock().unwrap().msg_id.is_some(),
+            "重试成功后应持有句柄"
+        );
+        s.finalize(Some("结论"), &[], CardTerminal::Done).await;
+        rm_db(&db);
     }
 
     /// P1-1 吞吐锚：delta 级 chunk 流（50 条）的消费路径零阻塞——`append_text`

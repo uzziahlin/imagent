@@ -299,6 +299,10 @@ struct MockBackend {
     /// 「轮次在飞且已有内部进度」的窗口（默认空 = 行为不变）。
     pre_gate_todos: Vec<crate::types::TodoItem>,
     pre_gate_tools: Vec<(String, String)>,
+    /// P3-b（code-review v14）：derive_task_todos 行为注入——None = trait 缺省
+    /// （无本地转录概念）；Some(Ok(items)) = 推导出任务清单；Some(Err(())) =
+    /// panic（模拟转录回放崩溃 → JoinError 路径）。
+    derive_todos: Option<std::result::Result<Vec<crate::types::TodoItem>, ()>>,
 }
 
 impl MockBackend {
@@ -327,6 +331,7 @@ impl MockBackend {
             complete_gate: None,
             pre_gate_todos: Vec::new(),
             pre_gate_tools: Vec::new(),
+            derive_todos: None,
         };
         (b, calls, prompts, order)
     }
@@ -592,6 +597,19 @@ impl Backend for MockBackend {
     }
     fn supports_tool_allowlist(&self) -> bool {
         self.allowlist_supported
+    }
+    /// P3-b（code-review v14）：按注入行为返回（Err 分支 panic 由 spawn_blocking
+    /// 捕获为 JoinError，正是要测的失败形态）。
+    fn derive_task_todos(
+        &self,
+        _session_id: &str,
+        _workdir: &std::path::Path,
+    ) -> Option<Vec<crate::types::TodoItem>> {
+        match &self.derive_todos {
+            None => None,
+            Some(Ok(items)) => Some(items.clone()),
+            Some(Err(())) => panic!("derive_task_todos 模拟 panic（JoinError 路径测试）"),
+        }
     }
 }
 
@@ -3813,7 +3831,9 @@ async fn capability_warns_allowlist_divergence_and_dedups() {
     let ctx = build_capability(
         Auth::new(vec!["alice".into()]),
         vec!["Read".into(), "Edit".into()],
-        PermissionMode::Off,
+        // v14：维度三（off × acp 形态）接入后，Off 档会同时命中新告警；本测试
+        // 隔离维度一，改用 Deny（FullLoop × deny 两维均无告警）。
+        PermissionMode::Deny,
         crate::backend::PermissionCapability::FullLoop,
         false, // 模拟 claude-acp：不支持逐工具白名单（P1-3 裂缝侧）。
     )
@@ -3910,6 +3930,93 @@ async fn capability_warns_dead_perm_mode_on_non_fullloop() {
     )
     .await;
     assert!(ctx.disp.capability_surface_warnings().is_empty());
+    drop_db(ctx.db).await;
+}
+
+/// 【P2 能力矩阵 · code-review v14】维度三：off × claude-acp 形态（FullLoop 且
+/// 无逐工具白名单）→ 告警「网关自动放行全部权限请求（等同 allow），与
+/// claude-cli 同档位行为不同」；去重一次；档位切走（deny）解除、切回重新告警
+///（SIGHUP /perm 热切路径共用 capability_surface_warnings）。反例：claude-cli
+/// 形态（FullLoop + 支持白名单）× off 不告警；非 FullLoop × off 不告警（维度二
+/// 已覆盖该后端的语义）。
+#[tokio::test]
+async fn capability_warns_acp_off_mode_divergence() {
+    let _serial = SERIAL.lock().await;
+    use crate::backend::PermissionCapability::{FullLoop, Unsupported};
+    // 正例：acp 形态 × off（全量工具，隔离维度一）→ 恰一条维度三告警。
+    let ctx = build_capability(
+        Auth::new(vec!["alice".into()]),
+        vec!["*".into()],
+        PermissionMode::Off,
+        FullLoop,
+        false, // 模拟 claude-acp：FullLoop 但不支持逐工具白名单。
+    )
+    .await;
+    let notices = ctx.disp.capability_surface_warnings();
+    assert_eq!(notices.len(), 1, "off × acp 形态 → 恰一条: {notices:?}");
+    assert!(
+        notices[0].contains("自动放行全部权限请求")
+            && notices[0].contains("claude-cli")
+            && notices[0].contains("不生效"),
+        "告警应说明等同 allow、与 cli 行为对照、白名单不生效: {notices:?}"
+    );
+    // 同状态去重（模拟无变化 SIGHUP）。
+    assert!(
+        ctx.disp.capability_surface_warnings().is_empty(),
+        "同状态不重复告警"
+    );
+    // 档位切走（deny）→ 解除；切回 off → 重新告警。直接写共享句柄模拟热切
+    //（reload_permission_mode 内部会先调一次 capability_surface_warnings，
+    // 消费掉首告警使外层断言错位；热切与直写最终都收敛到同一评估函数）。
+    *ctx.disp.permission_mode.write() = PermissionMode::Deny;
+    assert!(
+        ctx.disp.capability_surface_warnings().is_empty(),
+        "deny × acp 形态不在维度三告警面"
+    );
+    *ctx.disp.permission_mode.write() = PermissionMode::Off;
+    let re = ctx.disp.capability_surface_warnings();
+    assert_eq!(re.len(), 1, "再进入告警态应重新告警: {re:?}");
+    drop_db(ctx.db).await;
+
+    // 反例一：claude-cli 形态（FullLoop + 支持白名单）× off → 无告警（off 下
+    // 工具面仍被 --allowedTools 收敛，无分叉）。
+    let ctx = build_capability(
+        Auth::new(vec!["alice".into()]),
+        vec!["*".into()],
+        PermissionMode::Off,
+        FullLoop,
+        true,
+    )
+    .await;
+    assert!(
+        ctx.disp.capability_surface_warnings().is_empty(),
+        "cli 形态 × off → 无维度三告警"
+    );
+    drop_db(ctx.db).await;
+
+    // 反例二：非 FullLoop × off → 无告警。
+    let ctx = build_capability(
+        Auth::new(vec!["alice".into()]),
+        vec!["*".into()],
+        PermissionMode::Off,
+        Unsupported,
+        false,
+    )
+    .await;
+    assert!(
+        ctx.disp.capability_surface_warnings().is_empty(),
+        "非 FullLoop × off → 无维度三告警"
+    );
+    drop_db(ctx.db).await;
+}
+
+/// v14（铺路项）：[`Dispatcher::agent_label`] 返回启动后端名（= backend.name()
+/// 即 config.agent；SIGHUP 不换后端实现）——供 main 的 SIGHUP 侧解析权限档位。
+#[tokio::test]
+async fn agent_label_returns_startup_backend_name() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    assert_eq!(ctx.disp.agent_label(), "mock-backend");
     drop_db(ctx.db).await;
 }
 
@@ -6401,6 +6508,256 @@ async fn stop_interception_does_not_strand_queue() {
         "新消息应被执行（死队列回归）：{prompts:?}"
     );
     drop_db(ctx.db).await;
+}
+
+/// P1（code-review v14）：QueuePending 回写孤儿队列竞态——入队判定时 runner
+/// 在飞（queue=Some），persist 落行期间 runner 取到空批交还身份（queue=None）
+/// 退出；回写临界区必须识别「身份已交还」并**接棒成为 runner**（返回 true、
+/// 调用方进入 runner 循环），而非无条件重建队列留下孤儿——runner 身份恰是
+/// queue.is_some()，孤儿队列使后续消息只入队不接棒，会话永久停摆。
+/// 构造手法（current-thread 运行时确定性编排）：spawn 后单个 yield 让
+/// handle 走完 ① 判定（锁内见 Some → QueuePending）并挂起在 persist 的
+/// spawn_blocking 上；resume 与下方改态之间无任何调度点，交错确定成立。
+#[tokio::test]
+async fn queue_pending_writeback_takes_over_when_runner_exits_during_persist() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build(Auth::new(vec!["alice".into()])).await;
+    let disp = ctx.disp.clone();
+    // 预置「runner 在飞、空批持身份」形态（L4：Some(空 Vec) = runner 活跃）。
+    disp.with_conv("c1", |cs| cs.queue = Some(Vec::new())).await;
+    let runner = {
+        let disp = disp.clone();
+        tokio::spawn(async move {
+            disp.handle(msg("c1", "alice", "竞态消息")).await;
+        })
+    };
+    // 单次 yield：handle 完成入队判定（见 Some）→ 挂起在 persist 落行。
+    tokio::task::yield_now().await;
+    // persist 窗口内：runner 取到空批交还身份退出（take_batch 的空队退出分支
+    // 置 queue=None；entry 全空被 with_conv 剪除，与真实路径一致）。
+    disp.with_conv("c1", |cs| cs.queue = None).await;
+    let done = tokio::time::timeout(Duration::from_secs(5), runner).await;
+    assert!(done.is_ok(), "接棒 runner 应完成整轮（而非悬挂）");
+    // 回归点：消息被执行——旧实现回写无条件重建队列 → enqueue 返回 false →
+    // 消息永久悬挂在无 runner 的队列里。
+    let prompts = ctx.prompts.lock().await.clone();
+    assert!(
+        prompts.iter().any(|p| p.contains("竞态消息")),
+        "接棒后消息应被执行而非悬挂: {prompts:?}"
+    );
+    // 无孤儿队列残留：轮次结束队列已交还。
+    assert_eq!(conv_queued_len(&disp, "c1").await, 0);
+    drop_db(ctx.db).await;
+}
+
+/// P2（code-review v14）：/stop 在全局并发闸门排队期间失效——上限 1 时第二个
+/// conv 的轮次在 acquire_round_permit 上排队（生产默认 4 路，可排队分钟级），
+/// 期间新设置的 stop_requested 会被 round.rs 的 stop_mark_epoch（permit 之后
+/// 才读）当「起点水位基线」吞掉，而批循环顶部的检查早已过去。回归：permit
+/// 到手后、起跑前补一次无条件停止检查——轮次不启动、批次被拦下且回复。
+#[tokio::test]
+async fn stop_during_permit_wait_intercepts_round() {
+    let _serial = SERIAL.lock().await;
+    let auth = Auth::new(vec!["alice".into()]);
+    let (plat, _pi, _pc) = MockPlatform::new();
+    let (back, calls, _prompts, _order, gate) = MockBackend::new_gated();
+    let mut budgets = test_budgets();
+    budgets.max_concurrent_rounds = 1;
+    let mut ctx = build_with_parts_full(auth, plat, back, budgets, PermissionMode::Off).await;
+    ctx.calls = calls.clone();
+
+    // c1 占住唯一 permit（gated 挂起中，轮次在飞）。
+    let d1 = ctx.disp.clone();
+    let h1 = tokio::spawn(async move { d1.handle(msg("c1", "alice", "task one")).await });
+    assert!(
+        wait_until(&ctx, |c| Box::pin(async move {
+            !c.calls.lock().await.is_empty()
+        }))
+        .await,
+        "第一个 conv 的轮次应起跑"
+    );
+    // c2 进入 permit 排队（批循环顶部检查已过；批已取走）。
+    let d2 = ctx.disp.clone();
+    let h2 = tokio::spawn(async move { d2.handle(msg("c2", "alice", "task two")).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        ctx.calls.lock().await.len(),
+        1,
+        "c2 应在等 permit，不得并行起跑"
+    );
+    // 排队窗口内 /stop 到达（cmd_stop 的「无在飞句柄 + conv 锁被 runner 持有」
+    // 路径设标记；此处直设，与命令侧同一字段）。
+    ctx.disp
+        .with_conv("c2", |cs| {
+            cs.stop_requested = Some(crate::dispatch::now_secs())
+        })
+        .await;
+    // 放行 c1 → permit 归还 → c2 拿到 permit：新检查应拦下本批（continue 走完
+    // take 收尾退出，不留死队列）。
+    gate.notify_one();
+    let done2 = tokio::time::timeout(Duration::from_secs(5), h2).await;
+    assert!(done2.is_ok(), "c2 的 runner 应在拦截后正常退出");
+    let _ = tokio::time::timeout(Duration::from_secs(5), h1).await;
+    // 回归点：c2 的轮次未启动（旧实现直接起跑，/stop 被基线吞掉）。
+    assert_eq!(
+        ctx.calls.lock().await.len(),
+        1,
+        "permit 等待期间设置的 /stop 应拦下 c2 轮次"
+    );
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox
+            .iter()
+            .any(|t| t.contains("轮次在启动前被 /stop 拦下")),
+        "应回复拦截文案: {inbox:?}"
+    );
+    drop_db(ctx.db).await;
+}
+
+/// P3-a（code-review v14）：/status 跨会话泄露 prompt 摘要——在飞任务的
+/// digest 是跨会话信息泄露面（群 A 可见他群正在执行的指令内容），非 admin
+/// 只见**本 conv** 的 digest 明细 + 全局在飞计数；admin（运维需全局视野）
+/// 保留完整明细。两个 conv 各挂一个 gated 在飞轮次制造稳定观察窗口。
+#[tokio::test]
+async fn status_hides_other_conv_digest_from_non_admin() {
+    let _serial = SERIAL.lock().await;
+    let auth = Auth::new(vec!["alice".into(), "boss".into()]);
+    let (plat, _pi, _pc) = MockPlatform::new();
+    let (back, _calls, _prompts, _order, gate) = MockBackend::new_gated();
+    let ctx = build_with_parts_full(auth, plat, back, test_budgets(), PermissionMode::Off).await;
+    // 仅 boss 是 admin（alice 在白名单内但非管理员）。
+    ctx.disp.reload_admins(vec!["boss".into()]);
+
+    let d1 = ctx.disp.clone();
+    let h1 =
+        tokio::spawn(async move { d1.handle(msg("convA", "alice", "SECRET-TASK-ALPHA")).await });
+    let d2 = ctx.disp.clone();
+    let h2 = tokio::spawn(async move { d2.handle(msg("convB", "boss", "SECRET-TASK-BETA")).await });
+    assert!(
+        wait_until(&ctx, |c| {
+            Box::pin(async move { running_rounds(&c.disp).await >= 2 })
+        })
+        .await,
+        "两个 conv 的轮次应都在飞（digest 已注册）"
+    );
+    // 非 admin（alice）在 convA 查：本会话摘要可见、他会话摘要不见、全局
+    // 计数保留。
+    ctx.disp.handle(msg("convA", "alice", "/status")).await;
+    let alice_view = ctx.inbox.lock().await.clone();
+    let status_a = alice_view
+        .iter()
+        .rev()
+        .find(|t| t.contains("📊 当前状态"))
+        .expect("alice 的 /status 应有回执");
+    assert!(
+        status_a.contains("SECRET-TASK-ALPHA"),
+        "本会话摘要应可见: {status_a}"
+    );
+    assert!(
+        !status_a.contains("SECRET-TASK-BETA"),
+        "他会话摘要不应泄露给非 admin: {status_a}"
+    );
+    assert!(
+        status_a.contains("在飞轮次 2"),
+        "全局计数应保留: {status_a}"
+    );
+    // admin（boss）在 convA 查：完整明细（两条 digest 都可见）。
+    ctx.disp.handle(msg("convA", "boss", "/status")).await;
+    let boss_view = ctx.inbox.lock().await.clone();
+    let status_b = boss_view
+        .iter()
+        .rev()
+        .find(|t| t.contains("📊 当前状态"))
+        .expect("boss 的 /status 应有回执");
+    assert!(
+        status_b.contains("SECRET-TASK-ALPHA") && status_b.contains("SECRET-TASK-BETA"),
+        "admin 应见全局明细: {status_b}"
+    );
+    // 收尾：放行两个 gated 轮次并等 runner 退出（drop db 前不残留写者）。
+    gate.notify_one();
+    gate.notify_one();
+    let _ = tokio::time::timeout(Duration::from_secs(5), h1).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), h2).await;
+    drop_db(ctx.db).await;
+}
+
+/// P3-b（code-review v14）：derive_task_todos 失败不固化空快照——转录推导
+/// panic（spawn_blocking 捕获为 JoinError）或后端返回 None 时**跳过回写**
+/// （sessions.task_todos 保持 NULL，下轮重试）；只有真实 Some 才落库。旧实现
+/// 的双层 unwrap_or_default 把失败静默折叠成空快照固化，NULL 的「待推导」
+/// 语义被永久顶掉。观察窗口：gated 轮次在飞（推导发生在 preamble，早于
+/// run；轮末成功 upsert 会按本轮 TodoList 重写快照，故须在飞时断言）。
+#[tokio::test]
+async fn derive_todos_failure_keeps_null_for_retry() {
+    let _serial = SERIAL.lock().await;
+    use crate::types::{TodoItem, TodoStatus};
+    let derived_item = || TodoItem {
+        id: Some("t-1".into()),
+        text: "推导出的既有任务".into(),
+        status: TodoStatus::InProgress,
+    };
+    // (注入行为, 期望的 task_todos 内容断言)：Err = panic→JoinError；
+    // None = 后端无转录概念；Some = 推导成功。
+    type DeriveCase = (
+        Option<std::result::Result<Vec<TodoItem>, ()>>,
+        Option<&'static str>,
+    );
+    let cases: Vec<DeriveCase> = vec![
+        (Some(Err(())), None),
+        (None, None),
+        (Some(Ok(vec![derived_item()])), Some("推导出的既有任务")),
+    ];
+    for (behavior, expect) in cases {
+        let (plat, _pi, _pc) = MockPlatform::new();
+        let (mut back, _calls, _prompts, _order, gate) = MockBackend::new_gated();
+        back.derive_todos = behavior;
+        let ctx = build_with_parts_full(
+            Auth::new(vec!["alice".into()]),
+            plat,
+            back,
+            test_budgets(),
+            PermissionMode::Off,
+        )
+        .await;
+        // 预置会话行：agent_kind 与 mock 一致、task_todos = NULL（触发推导路径）。
+        let row = imagent_store::SessionRow {
+            conv_id: "c1".into(),
+            session_id: "sess-pre".into(),
+            agent_kind: "mock-backend".into(),
+            workdir: "/tmp/imagent-test-ws".into(),
+            name: None,
+            created_at: crate::dispatch::now_secs(),
+            updated_at: crate::dispatch::now_secs(),
+            first_prompt: None,
+            task_todos: None,
+        };
+        ctx.disp
+            .store
+            .upsert_session(&row)
+            .await
+            .expect("预置会话行");
+        let disp = ctx.disp.clone();
+        let h = tokio::spawn(async move { disp.handle(msg("c1", "alice", "跑一轮")).await });
+        assert!(
+            wait_registered(&ctx, "c1").await,
+            "轮次应注册在飞（推导已发生）"
+        );
+        let stored = ctx.disp.store.get_session("c1").await.expect("查会话行");
+        let todos = stored.expect("会话行应存在").task_todos;
+        match expect {
+            None => assert!(
+                todos.is_none(),
+                "失败/None 路径不得固化快照（应保持 NULL 待下轮重试）: {todos:?}"
+            ),
+            Some(want) => assert!(
+                todos.as_deref().is_some_and(|j| j.contains(want)),
+                "Some 路径应落库推导快照: {todos:?}"
+            ),
+        }
+        gate.notify_one();
+        let _ = tokio::time::timeout(Duration::from_secs(5), h).await;
+        drop_db(ctx.db).await;
+    }
 }
 
 /// v1.20 webhook 注入：inject() → handle() 完整管线（会话白名单门）→ 驱动 agent。
