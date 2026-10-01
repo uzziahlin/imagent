@@ -55,14 +55,20 @@ pub(crate) fn is_encrypted(blob: &str) -> bool {
         && blob.len() > ENC_FAMILY_PREFIX.len() + 3 // "v_:" 至少还要有 1 字节 payload
 }
 
-/// 用 passphrase 加密明文 blob，产出 `enc:v2:...` 形态字符串。
+/// 用 passphrase 加密明文 blob，产出 `enc:v2:...` 形态字符串（KDF 可注入，
+/// 见 [`encrypt_with`]）。
 ///
 /// `aad` 为 GCM 附加认证数据——绑定凭据归属（`platform:account_id`），
 /// 密文挪行（同库不同账号）时解密失败，防错配注入。
-pub(crate) fn encrypt(passphrase: &str, plaintext: &str, aad: &str) -> Result<String, String> {
+pub(crate) fn encrypt_with(
+    passphrase: &str,
+    plaintext: &str,
+    aad: &str,
+    kdf: KdfFn<'_>,
+) -> Result<String, String> {
     let mut salt = [0u8; SALT_LEN];
     OsRng.fill_bytes(&mut salt);
-    let key = derive_key(passphrase, &salt, PBKDF2_ITERS_V2);
+    let key = kdf(passphrase, &salt, PBKDF2_ITERS_V2);
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| format!("AES init: {e}"))?;
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
     let payload = aead_payload(plaintext, aad);
@@ -77,9 +83,26 @@ pub(crate) fn encrypt(passphrase: &str, plaintext: &str, aad: &str) -> Result<St
     Ok(format!("{ENC_PREFIX}{}", B64.encode(payload)))
 }
 
-/// 解密 `enc:v1:` / `enc:v2:` 形态的 blob。错误信息面向运维可读（提示
-/// passphrase 或版本）。`aad` 须与加密时一致（v1 旧格式无 AAD，忽略之）。
+/// [`encrypt_with`] 的纯派生形态（无缓存，模块内单测用）。
+#[cfg(test)]
+pub(crate) fn encrypt(passphrase: &str, plaintext: &str, aad: &str) -> Result<String, String> {
+    encrypt_with(passphrase, plaintext, aad, &derive_key)
+}
+
+/// [`decrypt_with`] 的纯派生形态（无缓存，模块内单测用）。
+#[cfg(test)]
 pub(crate) fn decrypt(passphrase: &str, blob: &str, aad: &str) -> Result<String, String> {
+    decrypt_with(passphrase, blob, aad, &derive_key)
+}
+
+/// 解密 `enc:v1:` / `enc:v2:` 形态的 blob（KDF 可注入）。错误信息面向运维可读
+/// （提示 passphrase 或版本）。`aad` 须与加密时一致（v1 旧格式无 AAD，忽略之）。
+pub(crate) fn decrypt_with(
+    passphrase: &str,
+    blob: &str,
+    aad: &str,
+    kdf: KdfFn<'_>,
+) -> Result<String, String> {
     let v2 = blob.starts_with(ENC_PREFIX);
     if !v2 && !blob.starts_with(ENC_PREFIX_V1) {
         if let Some(rest) = blob.strip_prefix(ENC_FAMILY_PREFIX) {
@@ -115,7 +138,7 @@ pub(crate) fn decrypt(passphrase: &str, blob: &str, aad: &str) -> Result<String,
     };
     let (salt, rest) = rest.split_at(SALT_LEN);
     let (nonce, ct) = rest.split_at(NONCE_LEN);
-    let key = derive_key(passphrase, salt, iters);
+    let key = kdf(passphrase, salt, iters);
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| format!("AES init: {e}"))?;
     let nonce = aes_gcm::Nonce::from_slice(nonce);
     let plain = cipher
@@ -167,6 +190,49 @@ fn derive_key(passphrase: &str, salt: &[u8], iters: u32) -> [u8; KEY_LEN] {
     let mut key = [0u8; KEY_LEN];
     pbkdf2::pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), salt, iters, &mut key);
     key
+}
+
+/// KDF 抽象（code-review v14 P3-d）：加密/解密入口接受外部派生函数，Store 侧
+/// 传入带缓存的实现（见 [`KdfCache`]），纯调用（模块内单测）传 [`derive_key`]。
+type KdfFn<'a> = &'a (dyn Fn(&str, &[u8], u32) -> [u8; KEY_LEN] + Sync);
+
+/// PBKDF2 派生结果单条目缓存（code-review v14 P3-d）。
+///
+/// 为什么缓存：v2 派生 600k 迭代（~数百 ms CPU），而 credentials 读取路径
+/// （`get_credential` / `first_credential`）每次都全量派生——passphrase 来自
+/// `IMAGENT_PASSPHRASE` 环境变量，进程内不变、salt 随凭据行固定，同一行重复
+/// 解密时密钥完全相同，却每次白烧几百毫秒（blocking 线程池被占满时登录/会话
+/// 读凭据全部排队）。命中缓存直接复用；miss 才派生。
+///
+/// 缓存键含 **passphrase 本体**（而非只 (salt, iters)）：`set_passphrase` 在
+/// 测试与运维路径可运行时换口令，若只按 (salt, iters) 缓存，换口令后旧密钥会
+/// 被错误复用（错误口令解密竟然成功 = 密码校验被缓存击穿）。单条目足够——
+/// 典型部署只有一个 passphrase，换口令后旧条目自然被挤出。
+#[derive(Default)]
+pub(crate) struct KdfCache {
+    entry: Option<(String, Vec<u8>, u32, [u8; KEY_LEN])>,
+}
+
+impl KdfCache {
+    /// 命中（passphrase+salt+iters 全同）返回缓存密钥；miss 派生并写入缓存。
+    pub(crate) fn derive(&mut self, passphrase: &str, salt: &[u8], iters: u32) -> [u8; KEY_LEN] {
+        if let Some((p, s, i, k)) = &self.entry {
+            if p == passphrase && s.as_slice() == salt && *i == iters {
+                return *k;
+            }
+        }
+        let key = derive_key(passphrase, salt, iters);
+        self.entry = Some((passphrase.to_string(), salt.to_vec(), iters, key));
+        key
+    }
+
+    /// 是否有与查询参数完全一致的缓存条目（供测试观察命中，不触发派生）。
+    #[cfg(test)]
+    fn hits(&self, passphrase: &str, salt: &[u8], iters: u32) -> bool {
+        self.entry
+            .as_ref()
+            .is_some_and(|(p, s, i, _)| p == passphrase && s.as_slice() == salt && *i == iters)
+    }
 }
 
 #[cfg(test)]
@@ -294,5 +360,46 @@ mod tests {
         assert!(is_encrypted("enc:v1:AAAA"));
         assert!(!is_encrypted("keyring:ilink:bot-1"));
         assert!(!is_encrypted(r#"{"bot_token":"x"}"#));
+    }
+
+    /// (code-review v14 P3-d)：KdfCache 命中语义——同 (pass, salt, iters) 复用
+    /// 条目不重派生；passphrase 变化（换口令）不得命中旧条目（否则错误口令
+    /// 解密会「成功」，密码校验被缓存击穿）；iters 变化同理。
+    #[test]
+    fn kdf_cache_hits_only_on_exact_match() {
+        let mut cache = KdfCache::default();
+        let salt = [1u8; SALT_LEN];
+        let k1 = cache.derive("pass", &salt, 1000);
+        assert!(cache.hits("pass", &salt, 1000), "首派生应写入缓存");
+        let k2 = cache.derive("pass", &salt, 1000);
+        assert_eq!(k1, k2, "命中缓存应返回同一密钥");
+        // 换口令：不得命中（会挤掉旧条目——单条目缓存）。
+        cache.derive("other", &salt, 1000);
+        assert!(!cache.hits("pass", &salt, 1000), "换口令后旧条目必须失效");
+        // iters 不同：不命中。
+        cache.derive("other", &salt, 2000);
+        assert!(!cache.hits("other", &salt, 1000));
+    }
+
+    /// P3-d 端到端：带缓存的加解密与纯派生路径等价（往返成功 + 错误口令仍拒）。
+    /// 命中/失效语义见 [`kdf_cache_hits_only_on_exact_match`]。
+    #[test]
+    fn encrypt_with_cached_kdf_roundtrip() {
+        let cache = std::sync::Arc::new(parking_lot::Mutex::new(KdfCache::default()));
+        let kdf = {
+            let cache = cache.clone();
+            move |p: &str, s: &[u8], i: u32| cache.lock().derive(p, s, i)
+        };
+        let enc = encrypt_with("pass", "secret-blob", "ilink:b1", &kdf).unwrap();
+        assert_eq!(
+            decrypt_with("pass", &enc, "ilink:b1", &kdf).unwrap(),
+            "secret-blob"
+        );
+        // 二次解密（命中缓存路径）结果一致。
+        assert_eq!(
+            decrypt_with("pass", &enc, "ilink:b1", &kdf).unwrap(),
+            "secret-blob"
+        );
+        assert!(decrypt_with("wrong", &enc, "ilink:b1", &kdf).is_err());
     }
 }

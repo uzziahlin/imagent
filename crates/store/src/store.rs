@@ -186,6 +186,11 @@ pub struct Store {
     /// 环境变量 `IMAGENT_PASSPHRASE`。测试环境忽略 env（并行测试共享进程 env，
     /// 避免互相污染），测试用 `set_passphrase` 显式注入。
     passphrase: Arc<parking_lot::RwLock<Option<String>>>,
+    /// (code-review v14 P3-d)：PBKDF2 派生结果单条目缓存（见 `crypto::KdfCache`）
+    /// ——600k 迭代派生 ~数百 ms，credentials 读取路径此前每次全量派生；passphrase
+    /// 进程内不变（env 注入）、salt 随凭据行固定，命中直接复用。缓存键含
+    /// passphrase 本体，`set_passphrase` 换口令后自动失效。
+    kdf_cache: Arc<Mutex<crate::crypto::KdfCache>>,
 }
 
 impl Store {
@@ -199,6 +204,7 @@ impl Store {
             require_keyring: Arc::new(AtomicBool::new(false)),
             keyring_scope: Arc::new(parking_lot::RwLock::new(String::new())),
             passphrase: Arc::new(parking_lot::RwLock::new(None)),
+            kdf_cache: Arc::new(Mutex::new(crate::crypto::KdfCache::default())),
         })
     }
 
@@ -273,7 +279,8 @@ impl Store {
                 Some(pass) => {
                     CREDENTIAL_PLAINTEXT_FALLBACK.inc();
                     let aad = credential_aad(&platform, &account_id);
-                    let enc = encrypt_blocking(pass, blob.to_string(), aad).await?;
+                    let enc = encrypt_blocking(pass, blob.to_string(), aad, self.kdf_cache.clone())
+                        .await?;
                     tracing::info!(
                         target: "store",
                         platform = %platform, account_id = %account_id,
@@ -489,7 +496,7 @@ impl Store {
                 ))
             })?;
             let aad = credential_aad(platform, account_id);
-            decrypt_blocking(pass, raw_blob.to_string(), aad).await
+            decrypt_blocking(pass, raw_blob.to_string(), aad, self.kdf_cache.clone()).await
         } else {
             // 明文：懒迁移——优先 keyring。迁移回写一律 CAS（见函数注释）。
             let scope = self.scope();
@@ -521,7 +528,8 @@ impl Store {
             } else if let Some(pass) = self.effective_passphrase() {
                 // keyring 不可用但配置了 passphrase → 惰性重写为加密形态（S3 迁移路径）。
                 let aad = credential_aad(platform, account_id);
-                let enc = encrypt_blocking(pass, raw_blob.to_string(), aad).await?;
+                let enc = encrypt_blocking(pass, raw_blob.to_string(), aad, self.kdf_cache.clone())
+                    .await?;
                 match self
                     .try_migrate_credential_blob(platform, account_id, raw_blob, &enc)
                     .await
@@ -1595,12 +1603,16 @@ impl Store {
     }
 
     /// 到期待重发行（每 tick 有界拉取，防单轮重发风暴）。
+    /// (code-review v14 P3-g)：排序加 `, id` 决胜——next_try 是秒粒度，同秒到期
+    /// 的多条消息裸 `ORDER BY next_try` 顺序不定（SQLite 不保证），消费侧
+    ///（feishu outbox 泵）已按入队序发出，store 侧补上决胜列保证「同秒到期按
+    /// 入队序发出」，避免乱序到达用户侧。
     pub async fn due_outbox(&self, now: i64, limit: u32) -> Result<Vec<OutboxRow>> {
         let inner = self.inner.clone();
         blocking_with(inner, move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, conv, kind, payload, attempts FROM outbox \
-                 WHERE next_try <= ?1 ORDER BY next_try LIMIT ?2",
+                 WHERE next_try <= ?1 ORDER BY next_try, id LIMIT ?2",
             )?;
             let rows = stmt
                 .query_map(rusqlite::params![now, limit], |r| {
@@ -1666,6 +1678,49 @@ impl Store {
         blocking_with(inner, move |conn| {
             let n: i64 = conn.query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get(0))?;
             Ok(n)
+        })
+        .await
+    }
+
+    // —— webhook_seen（v1.24 防重放第 1 层的持久化形态；schema v16，
+    //     code-review v14 P3-b）——
+
+    /// 签名是否已见过（持久层去重判定）。`sig` = `"{token}\u{0}{规范化签名hex}"`
+    ///（与 main 侧进程内 ReplayGuard 同键，含 token 防跨路由串）。
+    /// 仅 `replay_window_secs > 0` 的路由启用（见 main 的 webhook 入口）。
+    pub async fn webhook_seen_contains(&self, sig: &str) -> Result<bool> {
+        let sig = sig.to_string();
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM webhook_seen WHERE sig = ?1",
+                rusqlite::params![sig],
+                |r| r.get(0),
+            )?;
+            Ok(n > 0)
+        })
+        .await
+    }
+
+    /// 记录已验证签名（`ts` = epoch 秒），顺手 prune 过窗行（`ts < prune_before`）
+    /// ——单条目 insert 顺手做，不另起后台任务（签名表按窗口自清理，量级 =
+    /// 窗口内合法签名数，很小）。`INSERT OR IGNORE` 幂等（并发/重放重复插入不报错）。
+    /// insert + prune 包单事务：BUSY 整闭包重放时不产生半状态（与 append_audit 同款理由）。
+    pub async fn webhook_seen_insert(&self, sig: &str, ts: i64, prune_before: i64) -> Result<()> {
+        let sig = sig.to_string();
+        let inner = self.inner.clone();
+        blocking_with_retry(inner, move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "INSERT OR IGNORE INTO webhook_seen (sig, ts) VALUES (?1, ?2)",
+                rusqlite::params![sig, ts],
+            )?;
+            tx.execute(
+                "DELETE FROM webhook_seen WHERE ts < ?1",
+                rusqlite::params![prune_before],
+            )?;
+            tx.commit()?;
+            Ok(())
         })
         .await
     }
@@ -2127,19 +2182,42 @@ fn is_busy(e: &StoreError) -> bool {
 
 /// S3：在 blocking 线程做 passphrase 加密（PBKDF2 600k 迭代 ~几百 ms，不占运行时线程）。
 /// `aad` 绑定凭据归属（`platform:account_id`），防密文挪行错配（见 crypto 模块）。
-async fn encrypt_blocking(pass: String, plaintext: String, aad: String) -> Result<String> {
-    tokio::task::spawn_blocking(move || crate::crypto::encrypt(&pass, &plaintext, &aad))
-        .await
-        .map_err(|e| StoreError::Other(format!("spawn_blocking join: {e}")))?
-        .map_err(StoreError::Other)
+/// P3-d（code-review v14）：经 Store 的 [`KdfCache`](crate::crypto::KdfCache) 派生
+/// ——同 passphrase+salt 只派生一次，后续加密直接复用缓存密钥。
+async fn encrypt_blocking(
+    pass: String,
+    plaintext: String,
+    aad: String,
+    kdf_cache: Arc<Mutex<crate::crypto::KdfCache>>,
+) -> Result<String> {
+    tokio::task::spawn_blocking(move || {
+        crate::crypto::encrypt_with(&pass, &plaintext, &aad, &|p, s, i| {
+            kdf_cache.lock().derive(p, s, i)
+        })
+    })
+    .await
+    .map_err(|e| StoreError::Other(format!("spawn_blocking join: {e}")))?
+    .map_err(StoreError::Other)
 }
 
-/// S3：在 blocking 线程解密（同上，KDF 计算不占运行时线程）。
-async fn decrypt_blocking(pass: String, blob: String, aad: String) -> Result<String> {
-    tokio::task::spawn_blocking(move || crate::crypto::decrypt(&pass, &blob, &aad))
-        .await
-        .map_err(|e| StoreError::Other(format!("spawn_blocking join: {e}")))?
-        .map_err(StoreError::Other)
+/// S3：在 blocking 线程解密（同上，KDF 计算不占运行时线程）。P3-d：派生走
+/// [`KdfCache`](crate::crypto::KdfCache)——credentials 读取路径反复解密同一行时
+/// 命中缓存，免掉每次 600k 迭代（缓存在 blocking 线程内持锁派生，并发解密
+/// 串行化在所难免，但避免的是重复派生本身）。
+async fn decrypt_blocking(
+    pass: String,
+    blob: String,
+    aad: String,
+    kdf_cache: Arc<Mutex<crate::crypto::KdfCache>>,
+) -> Result<String> {
+    tokio::task::spawn_blocking(move || {
+        crate::crypto::decrypt_with(&pass, &blob, &aad, &|p, s, i| {
+            kdf_cache.lock().derive(p, s, i)
+        })
+    })
+    .await
+    .map_err(|e| StoreError::Other(format!("spawn_blocking join: {e}")))?
+    .map_err(StoreError::Other)
 }
 
 /// 凭据归属 AAD（GCM 附加认证数据）：`platform:account_id`。
@@ -2149,13 +2227,14 @@ fn credential_aad(platform: &str, account_id: &str) -> String {
 
 /// 打开连接、设 PRAGMA、跑迁移、收紧文件/目录权限。
 fn open_and_setup(path: &Path) -> Result<rusqlite::Connection> {
-    let conn = rusqlite::Connection::open(path)?;
+    // mut：迁移内部用 transaction_with_behavior（P3-c，需 &mut）。
+    let mut conn = rusqlite::Connection::open(path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     // P2-P：busy_timeout 5s——多连接（core store + ilink store + /health 查询）竞争时
     // 等待而非立即 SQLITE_BUSY 失败。
     conn.pragma_update(None, "busy_timeout", 5000_i64)?;
-    schema::migrate(&conn).map_err(|e| {
+    schema::migrate(&mut conn).map_err(|e| {
         tracing::error!(error = %e, "store schema migration failed");
         StoreError::Sqlite(e)
     })?;
@@ -2272,6 +2351,8 @@ mod tests {
             "session_history",
             "sessions",
             "sync_buf",
+            // v16（code-review v14 P3-b）：webhook 防重放签名持久层。
+            "webhook_seen",
         ] {
             assert!(tables.iter().any(|x| x == t), "missing table: {t}");
         }
@@ -3237,6 +3318,108 @@ mod tests {
         }
         assert!(!kept, "超上限应放弃");
         assert_eq!(store.outbox_depth().await.unwrap(), 0);
+    }
+
+    /// (code-review v14 P3-g)：同秒（同 next_try）到期的多条按入队序（id 升序）
+    /// 返回——裸 `ORDER BY next_try` 对并列值顺序不定，乱序重发会让用户侧
+    /// 消息错序。用显式 next_try 直写行保证同秒并列确定可判。
+    #[tokio::test]
+    async fn due_outbox_same_next_try_orders_by_id() {
+        let db = TempDb::new("outbox_order").await;
+        let store = Store::open(&db.path).await.unwrap();
+        {
+            let inner = store.inner.clone();
+            blocking_with(inner, move |conn| {
+                // 三条同 next_try=1000，按此顺序写入（id 递增）；第 4 条更早
+                // （next_try=999）应排最前。
+                for (i, next_try) in [(0, 1000), (1, 1000), (2, 1000), (3, 999)] {
+                    conn.execute(
+                        "INSERT INTO outbox (conv, kind, payload, attempts, next_try, created_at) \
+                         VALUES (?1, 'feishu_text', ?2, 0, ?3, 1)",
+                        rusqlite::params![format!("conv-{i}"), format!("{{\"i\":{i}}}"), next_try],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+        let due = store.due_outbox(1000, 10).await.unwrap();
+        let convs: Vec<String> = due.into_iter().map(|r| r.conv).collect();
+        assert_eq!(
+            convs,
+            vec![
+                "conv-3".to_string(), // next_try=999 最先
+                "conv-0".to_string(), // 同秒并列按 id（入队序）
+                "conv-1".to_string(),
+                "conv-2".to_string(),
+            ],
+            "同秒到期应按入队序发出"
+        );
+    }
+
+    /// (code-review v14 P3-b)：webhook_seen 持久层——contains 判定、insert 幂等、
+    /// prune 按窗口顺手清理。
+    #[tokio::test]
+    async fn webhook_seen_contains_insert_and_prune() {
+        let db = TempDb::new("wh_seen").await;
+        let store = Store::open(&db.path).await.unwrap();
+        assert!(
+            !store.webhook_seen_contains("tok\u{0}ab12").await.unwrap(),
+            "空表应未见"
+        );
+        // 记录 k1（ts=1000）；prune_before=0 不清任何行。
+        store
+            .webhook_seen_insert("tok\u{0}ab12", 1000, 0)
+            .await
+            .unwrap();
+        assert!(store.webhook_seen_contains("tok\u{0}ab12").await.unwrap());
+        // 重复插入幂等（INSERT OR IGNORE）。
+        store
+            .webhook_seen_insert("tok\u{0}ab12", 1001, 0)
+            .await
+            .unwrap();
+        // 记录 k2（ts=now），prune_before = now-300 → ts=1000 的 k1 过窗被顺手清掉。
+        let now = now_secs();
+        store
+            .webhook_seen_insert("tok\u{0}cd34", now, now - 300)
+            .await
+            .unwrap();
+        assert!(
+            !store.webhook_seen_contains("tok\u{0}ab12").await.unwrap(),
+            "过窗签名应被 prune"
+        );
+        assert!(store.webhook_seen_contains("tok\u{0}cd34").await.unwrap());
+    }
+
+    /// (code-review v14 P3-d)：KDF 缓存不得击穿口令校验——用正确口令解密一次
+    /// （写入缓存）后换错误口令，解密必须仍失败（缓存键含 passphrase）。
+    #[tokio::test]
+    async fn kdf_cache_does_not_leak_across_passphrases() {
+        let db = TempDb::new("kdf_cache").await;
+        let store = Store::open(&db.path).await.unwrap();
+        store.set_passphrase(Some("right"));
+        store
+            .put_credential("ilink", "bot1", "secret")
+            .await
+            .unwrap();
+        // 正确口令解密成功（此轮写入 KDF 缓存）。
+        assert_eq!(
+            store.get_credential("ilink", "bot1").await.unwrap(),
+            Some("secret".to_string())
+        );
+        // 再来一次（命中缓存路径）。
+        assert_eq!(
+            store.get_credential("ilink", "bot1").await.unwrap(),
+            Some("secret".to_string())
+        );
+        // 换错误口令：缓存不得把旧密钥喂给新口令的解密。
+        store.set_passphrase(Some("wrong"));
+        let err = store.get_credential("ilink", "bot1").await.unwrap_err();
+        assert!(
+            format!("{err}").contains("IMAGENT_PASSPHRASE"),
+            "换口令后应解密失败：{err}"
+        );
     }
 
     #[tokio::test]

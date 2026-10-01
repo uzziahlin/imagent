@@ -299,9 +299,9 @@ async fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Login { platform } => {
-            if platform != "ilink" {
+            if platform != "ilink" && platform != "wecom" {
                 return Err(anyhow!(
-                    "login 仅支持 ilink 平台（WeCom 用 config 的 bot_id + secret，不走扫码登录），收到 platform={platform}"
+                    "login 仅支持 ilink（扫码）与 wecom（bot_id + secret 录入），收到 platform={platform}"
                 ));
             }
             // v13 横切项：主进程运行中并发 login 会竞态改写凭据——先探测提示
@@ -310,18 +310,54 @@ async fn main() -> Result<()> {
             let store = imagent_store::Store::open(&db_path).await?;
             // P5：login 写凭据也按 profile 分 keyring 键（与 start 一致）。
             store.set_keyring_scope(cli.profile.as_deref().unwrap_or(""));
-            println!("开始 iLink 扫码登录，请用手机微信扫描终端二维码 …");
-            let creds = imagent_ilink::login_flow(&store).await?;
-            println!(
-                "登录成功：bot_id={}，user_id={}（凭据已落盘 {}）",
-                creds.ilink_bot_id,
-                creds.ilink_user_id,
-                db_path.display()
-            );
-            println!(
-                "提示：下次 `start` 前建议先用发现模式（config.toml 留空 allowed_senders）跑，\n\
-                 在日志里看到你的 from_user_id，填进 allowed_senders 后重启即可驱动 agent。"
-            );
+            // P2-3（code-review v14）：login 与 start 同库写凭据，require_keyring
+            // 的 fail-closed 语义必须同样作用于 login——否则 config 已设 true 而
+            // login 走默认 false，keyring 不可用时凭据仍明文落盘，把「拒绝明文
+            // 落盘」的安全承诺旁路掉。config 不存在/解析失败时保持默认 false
+            // 并 debug 说明（首次 setup 前登录的场景）。
+            match imagent_core::Config::default_path()
+                .and_then(|p| imagent_core::Config::load(&p).ok())
+            {
+                Some(cfg) => store.set_require_keyring(cfg.require_keyring),
+                None => {
+                    tracing::debug!(
+                        target: "imagent::ops",
+                        "login：config 不存在或解析失败，require_keyring 沿默认 false（首次 setup 前登录场景）"
+                    );
+                }
+            }
+            match platform.as_str() {
+                // P3-h（code-review v14）：wecom secret 改走 login 入 store（keyring
+                // 优先、passphrase 加密回退），bot_id 非敏感仍由 config 提供。
+                "wecom" => {
+                    println!("录入企业微信智能机器人凭据（secret 输入不回显）…");
+                    let bot_id = setup::prompt("bot_id", "")?;
+                    if bot_id.is_empty() {
+                        return Err(anyhow!("bot_id 不能为空"));
+                    }
+                    let secret = setup::prompt_secret("secret")?;
+                    store.put_credential("wecom", &bot_id, &secret).await?;
+                    println!(
+                        "✅ wecom 凭据已落库（account_id={bot_id}，keyring 优先）。\n\
+                           bot_id 请确保已写入 config.toml 的 wecom_bot_id（非敏感，不随凭据存储）；\n\
+                           start 读取顺序：store 凭据优先，config.wecom_secret 为兼容回退。"
+                    );
+                }
+                _ => {
+                    println!("开始 iLink 扫码登录，请用手机微信扫描终端二维码 …");
+                    let creds = imagent_ilink::login_flow(&store).await?;
+                    println!(
+                        "登录成功：bot_id={}，user_id={}（凭据已落盘 {}）",
+                        creds.ilink_bot_id,
+                        creds.ilink_user_id,
+                        db_path.display()
+                    );
+                    println!(
+                        "提示：下次 `start` 前建议先用发现模式（config.toml 留空 allowed_senders）跑，\n\
+                         在日志里看到你的 from_user_id，填进 allowed_senders 后重启即可驱动 agent。"
+                    );
+                }
+            }
         }
         Cmd::AllowChat { conv_id } => {
             // P4-5：会话（群）白名单 bootstrap（与 Allow 同构）。
@@ -738,6 +774,12 @@ async fn main() -> Result<()> {
             apply_bitable(&dispatcher, &config, platform_name);
 
             // 9. 运维 HTTP server（/metrics + /health）。metrics_addr 为 None 或空串则关闭。
+            // P2-2（code-review v14）：bind 提前到 spawn 之前——旧实现先 spawn 再
+            // 在 task 里 bind，失败只 warn/error 后 server 静默消失，配置了
+            // metrics_addr 的运维（Prometheus 抓取/健康探针）要到运行半天才发现
+            // 端口从未起来。取舍：metrics 属观测面，bind 失败打 error 后继续运行
+            //（fail-open，主链路不受影响）；webhook 是入站驱动面（安全面），
+            // bind 失败直接拒绝启动（fail-closed，见 9.5）。
             let start_at = std::time::Instant::now();
             let metrics_addr = config
                 .metrics_addr
@@ -750,7 +792,7 @@ async fn main() -> Result<()> {
             // 本轮不可改，故走 env）。设置后 /metrics 与 /health 要求
             // `Authorization: Bearer <token>`，不匹配返回 401。
             let http_token = metrics_http_token();
-            match metrics_addr {
+            let metrics_listener = match metrics_addr {
                 Some(addr) => match addr.parse::<SocketAddr>() {
                     Ok(socket) => {
                         // S7 fail-closed（与 B3 口径一致）：非 loopback 绑定且未配
@@ -767,37 +809,45 @@ async fn main() -> Result<()> {
                                 "metrics_addr 绑定非 loopback 地址：/metrics 与 /health 已启用 IMAGENT_HTTP_TOKEN Bearer 鉴权"
                             );
                         }
-                        spawn_metrics_server(
-                            socket,
-                            http_store.clone(),
-                            start_at,
-                            platform_name.to_string(),
-                            http_token,
-                            // P5-第五批：wecom 凭据来自 config（store 里永远没有），
-                            // /health 按存在性预判定——其余平台 None 走 store/env 动态查。
-                            if platform_name == "wecom" {
-                                Some(config.wecom_bot_id.is_some() && config.wecom_secret.is_some())
-                            } else {
+                        match tokio::net::TcpListener::bind(socket).await {
+                            Ok(l) => {
+                                tracing::info!(target: "imagent::ops", addr = %socket, "metrics/health HTTP server listening");
+                                Some(l)
+                            }
+                            Err(e) => {
+                                // P2-2：观测面 fail-open——error 打满可见性后继续运行
+                                //（配置了但没监听起来必须在日志可见；/health 未起，
+                                // 探针会得到 connection refused，同样可见）。
+                                tracing::error!(
+                                    target: "imagent::ops",
+                                    addr = %socket, error = %e,
+                                    "bind metrics addr 失败：/metrics 与 /health 不可用（主进程继续运行）"
+                                );
                                 None
-                            },
-                        );
-                        tracing::info!(target: "imagent::ops", addr = %socket, "metrics/health HTTP server listening");
+                            }
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(target: "imagent::ops", addr = addr, error = %e, "metrics_addr 解析失败，HTTP server 未启动");
+                        None
                     }
                 },
                 None => {
                     tracing::info!(target: "imagent::ops", "metrics_addr 为空，HTTP server 关闭");
+                    None
                 }
-            }
+            };
 
             // 9.5 v1.20 webhook 入站：事件 → 会话（须 [[webhook]] 条目 + 会话白名单）。
             // v1.21 review：startup_recovery 必须先于 webhook accept——旧时序里
             // 启动窗口内注入的消息会撞上 replay 的 clear_queued_all（双执行窗口）、
-            // recover 也可能把抢跑轮次误判为崩溃轮。
-            dispatcher.startup_recovery().await;
-            if let Some(addr) = config
+            // recover 也可能把抢跑轮次误判为崩溃轮。P2-2 后 bind 先于 recovery、
+            // accept 后于 recovery，语义不变（bind 只占端口不收请求）。
+            // P2-2（code-review v14）：webhook bind 同样提前 + fail-closed——
+            // 配置了 webhook_addr 却起不来还带病运行，等于「运维以为有 CI 注入、
+            // 实际全部丢失」，入站驱动面不静默降级。
+            let mut webhook_listener: Option<tokio::net::TcpListener> = None;
+            let webhook_listening: Option<bool> = if let Some(addr) = config
                 .webhook_addr
                 .as_deref()
                 .map(str::trim)
@@ -814,7 +864,12 @@ async fn main() -> Result<()> {
                         }
                         if config.webhooks.is_empty() {
                             tracing::warn!(target: "imagent::ops", "webhook_addr 已配置但 [[webhook]] 表为空，webhook server 未启动");
+                            Some(false)
                         } else {
+                            let listener = tokio::net::TcpListener::bind(socket).await.map_err(|e| {
+                                anyhow!("webhook_addr {socket} bind 失败，拒绝启动：{e}（webhook 为入站驱动面，不静默降级）")
+                            })?;
+                            webhook_listener = Some(listener);
                             // T8（v13 安全批）：/doctor 安全自检的 webhook 暴露面
                             // 摘要注入（core 拿不到 Config/绑定事实；server 不随
                             // SIGHUP 重启，摘要与 server 同生命周期，只注入一次）。
@@ -831,20 +886,56 @@ async fn main() -> Result<()> {
                                     .iter()
                                     .any(|e| e.replay_window_secs > 0),
                             });
-                            spawn_webhook_server(
-                                socket,
-                                config.webhooks.clone(),
-                                dispatcher.clone(),
-                            );
+                            Some(true)
                         }
                     }
                     Err(e) => {
                         tracing::warn!(target: "imagent::ops", addr = addr, error = %e, "webhook_addr 解析失败，webhook server 未启动");
+                        Some(false)
                     }
                 }
+            } else {
+                // 未配置 → /health 报 null（P2-2：JSON 友好三态 null/false/true）。
+                None
+            };
+
+            // P3-h（code-review v14）：wecom 的 /health logged_in 预判定——secret
+            // 可能在 store（login wecom）也可能在 config，按存在性取并。
+            let wecom_logged_in_hint = if platform_name == "wecom" {
+                let in_store = http_store
+                    .first_credential("wecom")
+                    .await
+                    .map(|o| o.is_some())
+                    .unwrap_or(false);
+                Some(config.wecom_bot_id.is_some() && (config.wecom_secret.is_some() || in_store))
+            } else {
+                None
+            };
+
+            dispatcher.startup_recovery().await;
+            if let Some(listener) = metrics_listener {
+                spawn_metrics_server(
+                    listener,
+                    http_store.clone(),
+                    start_at,
+                    platform_name.to_string(),
+                    http_token,
+                    wecom_logged_in_hint,
+                    webhook_listening,
+                );
+            }
+            if let Some(listener) = webhook_listener {
+                spawn_webhook_server(
+                    listener,
+                    config.webhooks.clone(),
+                    dispatcher.clone(),
+                    store.clone(),
+                );
             }
 
             // 10. SIGHUP 热重载（白名单 / allowed_tools / permission_mode / 模型与运行参数）。
+            // P2-1b（code-review v14）：带上启动配置的「不可热载键」快照——重载
+            // 时对比打 error，防止「改了没生效」静默。
             #[cfg(unix)]
             spawn_sighup_handler(
                 dispatcher.clone(),
@@ -853,6 +944,7 @@ async fn main() -> Result<()> {
                 config_path.clone(),
                 http_store.clone(),
                 platform_name.to_string(),
+                HotReloadSnapshot::of(&config),
             );
             #[cfg(not(unix))]
             {
@@ -937,19 +1029,22 @@ async fn main() -> Result<()> {
             // per-conv 连接并 kill ACP 子进程；其余后端默认 no-op）——此前只靠
             // Drop 兜底，Arc 泄漏/延迟 drop 场景下子进程会活到 OS 清理。
             backend.shutdown().await;
-            // v1.18 review：带退出码收尾（见上）。shutdown 已完成后才退出，
-            // 不打断清理；exit 跳过后续无操作语句。
-            if let Some(code) = exit_code {
-                std::process::exit(code);
-            }
             // R-3：清理 permission.sock（P1-5 计划 ③，原未落地）；P5-9b：握手
             // token 文件一并清理。
+            // P3-a（code-review v14）：清理必须先于 std::process::exit——exit(1)/
+            // exit(2)（异常退出/SessionExpired）会直接终止进程跳过后续语句，旧
+            // 实现把清理放在 exit 之后，异常路径永远执行不到，sock/token 残留到
+            // 下次启动（陈旧 permission.sock 会让下一实例的审批闭环错接旧文件）。
             #[cfg(unix)]
             if let Some(sock) = imagent_core::default_sock_path() {
                 let _ = std::fs::remove_file(&sock);
                 if let Some(parent) = sock.parent() {
                     let _ = std::fs::remove_file(parent.join("permission.token"));
                 }
+            }
+            // v1.18 review：带退出码收尾（见上）。shutdown 与文件清理完成后才退出。
+            if let Some(code) = exit_code {
+                std::process::exit(code);
             }
         }
         Cmd::Status => {
@@ -964,9 +1059,10 @@ async fn main() -> Result<()> {
                 .map(|c| c.platform)
                 .unwrap_or_else(|| "ilink".to_string());
             match platform_name.as_str() {
-                // 非扫码平台：凭据在 config/env，不走 store。
+                // 非扫码平台：凭据在 config/env/store，不走扫码。
                 "wecom" => println!(
-                    "platform=wecom：凭据来自 config 的 wecom_bot_id / wecom_secret"
+                    "platform=wecom：secret 优先取 store 凭据（`imagent login wecom`），\
+                     回退 config 的 wecom_secret；bot_id 来自 config 的 wecom_bot_id"
                 ),
                 "feishu" => println!(
                     "platform=feishu：凭据来自 config 的 feishu_app_id + 环境变量 IMAGENT_FEISHU_APP_SECRET（当前{}）",
@@ -1043,7 +1139,7 @@ async fn main() -> Result<()> {
         Cmd::Service { action } => {
             // service 定义随 --profile 隔离（com.imagent[.<profile>]）。
             match action {
-                ServiceAction::Install => service::install(cli.profile.as_deref())?,
+                ServiceAction::Install => service::install(cli.profile.as_deref()).await?,
                 ServiceAction::Uninstall => service::uninstall(cli.profile.as_deref())?,
                 ServiceAction::Status => service::status(cli.profile.as_deref())?,
             }
@@ -1607,8 +1703,9 @@ fn apply_bitable(
 
 /// 按 platform 名选择 Platform 实例。
 ///
-/// - `"wecom"` → [`imagent_wecom::WeComPlatform`]：凭据取自 config 的
-///   `wecom_bot_id` / `wecom_secret`（企业微信智能机器人不走扫码登录）。
+/// - `"wecom"` → [`imagent_wecom::WeComPlatform`]：`bot_id` 取自 config（非敏感）；
+///   `secret` 优先取 store 凭据（`imagent login wecom`，keyring/加密落盘），
+///   回退 config 的 `wecom_secret`（明文兼容，P3-h/code-review v14）。
 /// - `"feishu"` → [`imagent_feishu::FeishuPlatform`]：`feishu_app_id` 取自 config，
 ///   `app_secret` 取自环境变量 `IMAGENT_FEISHU_APP_SECRET`（keyring bootstrap 为后续 P2），
 ///   默认 `base_url = https://open.feishu.cn`。
@@ -1625,10 +1722,26 @@ async fn build_platform(
                 .wecom_bot_id
                 .clone()
                 .ok_or_else(|| anyhow!("platform=wecom 需在 config.toml 配置 wecom_bot_id"))?;
-            let secret = config
-                .wecom_secret
-                .clone()
-                .ok_or_else(|| anyhow!("platform=wecom 需在 config.toml 配置 wecom_secret"))?;
+            // P3-h（code-review v14）：secret 读取顺序 = store 凭据
+            // （`imagent login wecom` 写入，keyring 优先 + passphrase 加密回退）
+            // → config.wecom_secret（既有部署的明文兼容回退）。两者皆空才报错
+            // ——此前只认 config 明文，login 写入的凭据无人消费。
+            let secret = match store.get_credential("wecom", &bot_id).await? {
+                Some(s) => {
+                    tracing::info!(
+                        target: "imagent::ops",
+                        account_id = %bot_id,
+                        "wecom secret 取自 store 凭据（imagent login wecom 写入）"
+                    );
+                    s
+                }
+                None => config.wecom_secret.clone().ok_or_else(|| {
+                    anyhow!(
+                        "platform=wecom 需先 `imagent login wecom` 录入 secret，\
+                         或在 config.toml 配置 wecom_secret（兼容回退）"
+                    )
+                })?,
+            };
             // openws 默认地址。
             let ws_url = "wss://openws.work.weixin.qq.com".to_string();
             // message_max_len 三平台生效（安全/一致批次）：企微侧与 4000 字节协议
@@ -1712,6 +1825,14 @@ struct Health {
     /// v1.23：发送侧重试队列深度（outbox 表行数）——持续 >0 说明出站通路
     /// 在退避重发（0 = 健康）。
     outbox_pending: i64,
+    /// P2-2（code-review v14）：metrics HTTP 是否实际在监听。bind 失败时本
+    /// server 不启动（启动日志有 error、探针得到 connection refused），能应答
+    /// 本字段的进程恒 true；保留显式字段让探针脚本按统一契约消费。
+    metrics_listening: bool,
+    /// P2-2（code-review v14）：webhook 入站监听状态三态——`null` = 未配置
+    /// webhook_addr；`true` = 已 bind 且 serve 中；`false` = 配置了但未监听
+    ///（[[webhook]] 表空 / 地址解析失败，启动日志有对应 warn）。
+    webhook_listening: Option<bool>,
 }
 
 /// 共享给 axum handler 的状态。
@@ -1721,12 +1842,14 @@ struct HttpState {
     start_at: Instant,
     /// 实际运行的平台名（P5：/health 的 logged_in 按平台判定）。
     platform: String,
-    /// 预计算的 logged_in（P5-第五批：wecom 凭据在 config，store 查不到）。
+    /// 预计算的 logged_in（P5-第五批：wecom 凭据在 config/store，启动时预算）。
     /// None = 按平台动态查（store / env）。
     logged_in_hint: Option<bool>,
     /// S7：Bearer 鉴权 token。None = loopback 绑定、无鉴权（历史行为）；
     /// Some = 两端点都要求匹配的 `Authorization: Bearer <token>`。
     token: Option<String>,
+    /// P2-2（code-review v14）：webhook 监听三态（见 [`Health::webhook_listening`]）。
+    webhook_listening: Option<bool>,
 }
 
 /// S7：读取可选的 HTTP Bearer 鉴权 token（`IMAGENT_HTTP_TOKEN`）。
@@ -1914,9 +2037,24 @@ struct WebhookRoute {
 /// 事件在 TTL 内重发会被误拦**（如手动重跑同一 GitHub event——罕见，
 /// README 已说明；等 TTL 过后可重发，或发送端启用时间戳协议让每次签名
 /// 天然不同）。
-#[derive(Clone, Default)]
+///
+/// P3-b（code-review v14）：`store` 挂 SQLite 持久层（schema v16 `webhook_seen`）
+/// ——内存表随进程重启清零，重启窗口内的同签名重放会再次通过；落库后跨
+/// 进程生效（`replay_window_secs > 0` 的路由启用，窗口即保留期）。
+#[derive(Clone)]
 struct ReplayGuard {
     inner: Arc<std::sync::Mutex<std::collections::HashMap<String, Instant>>>,
+    /// None = 未接 store（持久层关闭，仅 [`ReplayGuard::default`] 的测试形态）。
+    store: Option<imagent_store::Store>,
+}
+
+impl Default for ReplayGuard {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            store: None,
+        }
+    }
 }
 
 /// 签名去重表容量：默认 rps=10 下 10 分钟 ≈ 6000 个合法签名，1024 是
@@ -1982,12 +2120,17 @@ fn validate_webhook_bind(
     }
 }
 
-/// v1.24 webhook 入站防护门（纯函数，便于单测）：验签（含 opt-in 时间戳
-/// 协议）→ 签名去重。配置了 secret 的条目必经此门；通过返回 Ok(())，
-/// 拒绝返回 (状态码, 文案)。
+/// v1.24 webhook 入站防护门（纯函数，便于单测）：验签（含 opt-in 时间戳协议）。
+/// 通过返回 `Ok(Some(去重键))`（配置了 secret 的路由；`Ok(None)` = 未配
+/// secret、无可验/可去重）；拒绝返回 (状态码, 文案)。
+///
+/// P3-b（code-review v14）：**本函数只做验证、不再记录签名**——去重键交还
+/// 调用方，在「验签 + 时间窗通过 + 未被限流拒绝」之后才进内存/持久去重表。
+/// 旧序「gate 内先 admit 再限流」会让被 429 的请求也占住签名：GitHub 对同一
+/// delivery 的合规重试（同字节同签名）会吃 409「重放」，违反重试协议。
 ///
 /// 两层防重放：
-/// 1. 签名去重（默认启用）——见 [`ReplayGuard`]；
+/// 1. 签名去重（默认启用）——见 [`ReplayGuard`]（进程内）+ webhook_seen 表（持久）；
 /// 2. 时间戳协议（`replay_window_secs > 0` 时）——请求须带
 ///    `X-Imagent-Timestamp: <unix 秒>`，验签串从 `body` 改为 `{ts}.{body}`
 ///    （ts 参与签名、不可伪造），`|now - ts| > 窗口` 即 401。两层叠加：
@@ -1998,12 +2141,11 @@ fn webhook_gate(
     headers: &axum::http::HeaderMap,
     body: &[u8],
     now_unix: u64,
-    guard: &ReplayGuard,
-) -> Result<(), (StatusCode, &'static str)> {
+) -> Result<Option<String>, (StatusCode, &'static str)> {
     let Some(secret) = route.secret.as_deref() else {
         // 未配 secret：无签名可验/可去重（非 loopback 绑定由启动期
         // validate_webhook_bind fail-closed 把关）。
-        return Ok(());
+        return Ok(None);
     };
     // 验签串：默认 body 原文；启用时间戳协议时 "{ts}.{body}"（u64 无负值，
     // 解析失败 = 头缺失/非数字，一律 401）。
@@ -2036,15 +2178,12 @@ fn webhook_gate(
             ));
         }
     }
-    // 第 1 层去重：键 = (token, 规范化签名 hex)。
+    // 去重键 = (token, 规范化签名 hex)，交调用方在限流通过后 admit。
     let key = format!(
         "{token}\u{0}{}",
         webhook_signature_key_hex(sig.unwrap_or_default())
     );
-    if !guard.admit(&key, Instant::now()) {
-        return Err((StatusCode::CONFLICT, "replay detected\n"));
-    }
-    Ok(())
+    Ok(Some(key))
 }
 
 /// 验签头原文（GitHub `X-Hub-Signature-256: sha256=<hex>` 或裸 hex 的
@@ -2135,9 +2274,10 @@ fn verify_webhook_signature(secret: &str, body: &[u8], header_value: &str) -> bo
 }
 
 fn spawn_webhook_server(
-    socket: SocketAddr,
+    listener: tokio::net::TcpListener,
     entries: Vec<imagent_core::WebhookEntry>,
     dispatcher: Arc<imagent_core::Dispatcher>,
+    store: imagent_store::Store,
 ) {
     const DEFAULT_WEBHOOK_RPS: f64 = 10.0;
     let routes = entries
@@ -2157,11 +2297,20 @@ fn spawn_webhook_server(
             )
         })
         .collect();
+    // P3-b（code-review v14）：去重表挂 store 持久层（webhook_seen，v16）——
+    // replay_window_secs > 0 的路由重启后窗口内重放仍被拦。
     let state = WebhookState {
         routes,
         dispatcher,
-        seen: ReplayGuard::default(),
+        seen: ReplayGuard {
+            inner: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            store: Some(store),
+        },
     };
+    let addr = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
     // v1.21 review：停机时停止 accept——drain 期间注入只会挂死/被丢弃，
     // 优雅关停让客户端拿到连接关闭而非假 202。
     let shutdown = state.dispatcher.shutdown_token();
@@ -2170,19 +2319,14 @@ fn spawn_webhook_server(
         .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(state);
     tokio::spawn(async move {
-        let listener = match tokio::net::TcpListener::bind(socket).await {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!(target: "imagent::ops", addr = %socket, error = %e, "bind webhook addr 失败（webhook 入站不可用）");
-                return;
-            }
-        };
-        tracing::info!(target: "imagent::ops", addr = %socket, "webhook 入站 listening（POST /hook/<token>）");
+        // P2-2（code-review v14）：bind 已由调用方完成（fail-closed 拒启）；
+        // 此处仅 accept/serve。
+        tracing::info!(target: "imagent::ops", addr = %addr, "webhook 入站 listening（POST /hook/<token>）");
         if let Err(e) = axum::serve(listener, app)
             .with_graceful_shutdown(async move { shutdown.cancelled().await })
             .await
         {
-            tracing::warn!(target: "imagent::ops", addr = %socket, error = %e, "webhook HTTP server 退出");
+            tracing::warn!(target: "imagent::ops", addr = %addr, error = %e, "webhook HTTP server 退出");
         }
         tracing::info!(target: "imagent::ops", "webhook server 已随停机关闭");
     });
@@ -2397,22 +2541,63 @@ async fn webhook_handler(
     };
     // v1.21 防护① + v1.24 两层防重放（配置了 secret 时强制）：HMAC 验签
     //（GitHub 头 `X-Hub-Signature-256: sha256=<hex>`，兼容裸 hex 的
-    // `X-Signature`）→ opt-in 时间戳协议 → 签名去重 LRU（同签名 409）。
+    // `X-Signature`）→ opt-in 时间戳协议 → 限速 → 签名去重（内存 LRU +
+    // SQLite 持久层，同签名 409）。
+    // P3-b（code-review v14）顺序修正：旧序「签名去重在限速之前」会让被 429
+    // 拒绝的请求也占住签名——GitHub 对同一 delivery 的合规重试（同字节同签名）
+    // 会吃 409「重放」。签名记录必须发生在验签+时间窗通过**且**未被限流拒绝
+    // 之后（429 拒绝不记录签名）。
     // 时钟早于 epoch（系统时钟异常）时 now_unix 取 u64::MAX：时间戳协议
     // 请求全部 401（fail-closed），未启用协议的路径不受影响。
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(u64::MAX);
-    if let Err((code, msg)) = webhook_gate(route, &token, &headers, &bytes, now_unix, &st.seen) {
-        tracing::warn!(target: "imagent::ops", name = %route.name, status = %code, "webhook 验签/防重放拒绝");
-        return (code, msg);
-    }
+    let dedup_key = match webhook_gate(route, &token, &headers, &bytes, now_unix) {
+        Ok(k) => k,
+        Err((code, msg)) => {
+            tracing::warn!(target: "imagent::ops", name = %route.name, status = %code, "webhook 验签/防重放拒绝");
+            return (code, msg);
+        }
+    };
     // v1.21 防护②：每 token 令牌桶限速。
     {
         let mut bucket = route.bucket.lock().unwrap_or_else(|e| e.into_inner());
         if !bucket.try_take(route.rps) {
             return (StatusCode::TOO_MANY_REQUESTS, "rate limited\n");
+        }
+    }
+    // 签名去重（限流通过后才记录，见上）。内存层恒启用；持久层仅
+    // `replay_window_secs > 0` 的路由（窗口即 SQLite 保留期，重启不失效）。
+    if let Some(key) = dedup_key {
+        if !st.seen.admit(&key, Instant::now()) {
+            tracing::warn!(target: "imagent::ops", name = %route.name, status = %StatusCode::CONFLICT, "webhook 签名去重拦截（内存层命中：重放）");
+            return (StatusCode::CONFLICT, "replay detected\n");
+        }
+        if route.replay_window_secs > 0 {
+            if let Some(db) = &st.seen.store {
+                // 内存未命中 → 查库（重启后内存表清零，持久层兜底）；库中也
+                // 未见过才入库（验签+限流已通过 = 真实首见）。查/写失败仅
+                // warn fail-open：持久层是第二道去重，第一道签名验证与内存
+                // 去重不受影响，不值得让 webhook 入站因观测性写失败而拒绝。
+                let boundary =
+                    (now_unix.saturating_sub(route.replay_window_secs)).min(i64::MAX as u64) as i64;
+                let ts = now_unix.min(i64::MAX as u64) as i64;
+                match db.webhook_seen_contains(&key).await {
+                    Ok(true) => {
+                        tracing::warn!(target: "imagent::ops", name = %route.name, status = %StatusCode::CONFLICT, "webhook 签名去重拦截（持久层命中：重放）");
+                        return (StatusCode::CONFLICT, "replay detected\n");
+                    }
+                    Ok(false) => {
+                        if let Err(e) = db.webhook_seen_insert(&key, ts, boundary).await {
+                            tracing::warn!(target: "imagent::ops", error = %e, "webhook 签名入库失败（持久去重 best-effort）");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "imagent::ops", error = %e, "webhook 签名查库失败（持久去重降级内存层）");
+                    }
+                }
+            }
         }
     }
     // v1.21 GitHub 原生事件：X-GitHub-Event 头存在 → 结构化摘要（未知事件
@@ -2461,32 +2646,33 @@ async fn webhook_handler(
 }
 
 fn spawn_metrics_server(
-    addr: SocketAddr,
+    listener: tokio::net::TcpListener,
     store: imagent_store::Store,
     start_at: Instant,
     platform: String,
     token: Option<String>,
     logged_in_hint: Option<bool>,
+    webhook_listening: Option<bool>,
 ) {
+    // P2-2（code-review v14）：listener 由调用方 bind 好后传入（bind 提前 +
+    // 失败可见性见调用点注释）。
+    let addr = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
     let state = HttpState {
         store,
         start_at,
         platform,
         token,
         logged_in_hint,
+        webhook_listening,
     };
     let app = Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health_handler))
         .with_state(state);
     tokio::spawn(async move {
-        let listener = match tokio::net::TcpListener::bind(addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::warn!(target: "imagent::ops", addr = %addr, error = %e, "bind metrics addr 失败");
-                return;
-            }
-        };
         if let Err(e) = axum::serve(listener, app).await {
             tracing::warn!(target: "imagent::ops", addr = %addr, error = %e, "metrics HTTP server 退出");
         }
@@ -2517,6 +2703,8 @@ async fn health_handler(
                 version: "",
                 sessions: -1,
                 outbox_pending: -1,
+                metrics_listening: true,
+                webhook_listening: st.webhook_listening,
             }),
         );
     }
@@ -2545,8 +2733,114 @@ async fn health_handler(
         version: env!("CARGO_PKG_VERSION"),
         sessions,
         outbox_pending,
+        // P2-2（code-review v14）：能应答即 metrics 在监听；webhook 三态透传。
+        metrics_listening: true,
+        webhook_listening: st.webhook_listening,
     };
     (StatusCode::OK, Json(body))
+}
+
+/// SIGHUP 热重载的「不可热载键」快照（code-review v14 P2-1b）。
+///
+/// 这些键在启动期一次性装配（后端实现 / 监听 socket / 平台构造参数 / 预算
+/// 闸门），SIGHUP 改了也不会生效——静默吞掉会让运维误以为已生效。重载时用
+/// 本快照与新 config 快照逐键对比，变化即打 error（列出键名 + 需重启）。
+///
+/// `webhooks` 展平为可比较元组：`WebhookEntry` 未派生 PartialEq（config.rs
+/// 本轮冻结不动），逐字段入元组比较等价；`cron_catchup` 同理用 Debug 串。
+#[cfg(unix)]
+type WebhookEntryKey = (String, String, String, Option<String>, Option<f64>, u64);
+
+#[cfg(unix)]
+struct HotReloadSnapshot {
+    agent: String,
+    webhook_addr: Option<String>,
+    /// (token, conv, name, secret, rps, replay_window_secs) 逐条。
+    webhooks: Vec<WebhookEntryKey>,
+    metrics_addr: Option<String>,
+    sender_daily_cost_limit_usd: Option<f64>,
+    agent_timeout_secs: u64,
+    agent_idle_timeout_secs: u64,
+    batch_window_ms: u64,
+    cron_catchup: String,
+    stranger_mention_hint: bool,
+    stranger_p2p_hint: bool,
+    reply_mode: imagent_core::ReplyMode,
+}
+
+#[cfg(unix)]
+impl HotReloadSnapshot {
+    fn of(cfg: &imagent_core::Config) -> Self {
+        Self {
+            agent: cfg.agent.clone(),
+            webhook_addr: cfg.webhook_addr.clone(),
+            webhooks: cfg
+                .webhooks
+                .iter()
+                .map(|e| {
+                    (
+                        e.token.clone(),
+                        e.conv.clone(),
+                        e.name.clone(),
+                        e.secret.clone(),
+                        e.rps,
+                        e.replay_window_secs,
+                    )
+                })
+                .collect(),
+            metrics_addr: cfg.metrics_addr.clone(),
+            sender_daily_cost_limit_usd: cfg.sender_daily_cost_limit_usd,
+            agent_timeout_secs: cfg.agent_timeout_secs,
+            agent_idle_timeout_secs: cfg.agent_idle_timeout_secs,
+            batch_window_ms: cfg.batch_window_ms,
+            cron_catchup: format!("{:?}", cfg.cron_catchup),
+            stranger_mention_hint: cfg.stranger_mention_hint,
+            stranger_p2p_hint: cfg.stranger_p2p_hint,
+            reply_mode: cfg.reply_mode,
+        }
+    }
+
+    /// 与另一快照逐键比较，返回发生变化的键名（固定顺序，供日志列举）。
+    fn changed_keys(&self, new: &Self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.agent != new.agent {
+            out.push("agent");
+        }
+        if self.webhook_addr != new.webhook_addr {
+            out.push("webhook_addr");
+        }
+        if self.webhooks != new.webhooks {
+            out.push("webhooks");
+        }
+        if self.metrics_addr != new.metrics_addr {
+            out.push("metrics_addr");
+        }
+        if self.sender_daily_cost_limit_usd != new.sender_daily_cost_limit_usd {
+            out.push("sender_daily_cost_limit_usd");
+        }
+        if self.agent_timeout_secs != new.agent_timeout_secs {
+            out.push("agent_timeout_secs");
+        }
+        if self.agent_idle_timeout_secs != new.agent_idle_timeout_secs {
+            out.push("agent_idle_timeout_secs");
+        }
+        if self.batch_window_ms != new.batch_window_ms {
+            out.push("batch_window_ms");
+        }
+        if self.cron_catchup != new.cron_catchup {
+            out.push("cron_catchup");
+        }
+        if self.stranger_mention_hint != new.stranger_mention_hint {
+            out.push("stranger_mention_hint");
+        }
+        if self.stranger_p2p_hint != new.stranger_p2p_hint {
+            out.push("stranger_p2p_hint");
+        }
+        if self.reply_mode != new.reply_mode {
+            out.push("reply_mode");
+        }
+        out
+    }
 }
 
 /// SIGHUP 热重载：重读 config.toml，刷新白名单 / allowed_tools / permission_mode。
@@ -2559,6 +2853,7 @@ fn spawn_sighup_handler(
     config_path: PathBuf,
     store: imagent_store::Store,
     platform_name: String,
+    startup_snapshot: HotReloadSnapshot,
 ) {
     tokio::spawn(async move {
         let mut sig = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
@@ -2568,11 +2863,31 @@ fn spawn_sighup_handler(
                 return;
             }
         };
+        // P2-1b（code-review v14）：上一次成功加载的不可热载键快照。基准取
+        // 启动 config（而非首次 SIGHUP 的加载结果）——启动到首次 SIGHUP 之间
+        // 的变更也要能报出来。
+        let mut last_applied = startup_snapshot;
         loop {
             sig.recv().await;
             tracing::info!(target: "imagent::ops", "received SIGHUP, reloading config");
             match imagent_core::Config::load(&config_path) {
                 Ok(cfg) => {
+                    // P2-1b（code-review v14）：不可热载键对比——任一变化打
+                    // error 列出变更键与「需重启生效」，**不拒绝**重载其余
+                    //（可热载）部分（半生效好过全不生效，日志保证运维知情）。
+                    let snap = HotReloadSnapshot::of(&cfg);
+                    let changed = last_applied.changed_keys(&snap);
+                    if !changed.is_empty() {
+                        tracing::error!(
+                            target: "imagent::ops",
+                            keys = ?changed,
+                            "SIGHUP 检测到 {} 个不可热载配置键变更（{:?}）：需重启生效；\
+                             其余可热载项已按新配置刷新",
+                            changed.len(),
+                            changed
+                        );
+                    }
+                    last_applied = snap;
                     // 白名单：config 种子 ∪ store 已有，整体替换。
                     let mut senders: Vec<String> = cfg.allowed_senders.clone();
                     let stored = store.list_allowed_senders().await.unwrap_or_default();
@@ -2641,7 +2956,13 @@ fn spawn_sighup_handler(
                         tracing::warn!(target: "imagent::ops", "{reason}");
                     }
                     apply_bitable(&dispatcher, &cfg, &platform_name);
-                    let perm = cfg.permission_mode.resolve(&cfg.agent);
+                    // P2-1a（code-review v14）：auto 档按**运行中后端**解析——
+                    // agent 键不可热载（后端实现启动期装配），若按重载 config 的
+                    // agent 字符串解析，把 claude-cli 改成 codex 的那次 SIGHUP
+                    // 会把仍在运行的 claude-cli 从审批闭环（auto-claude）静默
+                    // 降级成 off。agent_label() 返回启动期后端名，保证解析基准
+                    // 与实际运行的后端一致（后端名在下次重启前不会变）。
+                    let perm = cfg.permission_mode.resolve(dispatcher.agent_label());
                     // S-1：热切校验失败（闭环档 × 非 FullLoop 后端 / socket 失败）
                     // 拒绝并保留既有模式——error 级日志便于发现「改了配置没生效」。
                     if let Err(e) = dispatcher.reload_permission_mode(perm) {
@@ -2868,58 +3189,62 @@ mod webhook_replay_tests {
         );
     }
 
-    /// 同签名重复 POST → 第二次 409；换 token / 换签名大小写不构成绕过。
+    /// P3-b（code-review v14）后的 gate 纯验证语义：验签通过返回**去重键**而非
+    /// 自行记录（记录移到限流之后，429 不占签名）；键含 token + 规范化签名
+    /// （大小写 hex / 裸 hex 形态同键，防换大小写绕过）；未配 secret → None。
     #[test]
-    fn gate_replay_same_signature_second_post_409() {
+    fn gate_returns_dedup_key_without_side_effect() {
         let body = br#"{"text":"deploy failed"}"#;
         let sig = hmac_hex(SECRET, body);
         let r = route(Some(SECRET), 0);
-        let guard = ReplayGuard::default();
         let now = 1_700_000_000_u64;
 
         let h = headers(&[("x-hub-signature-256", format!("sha256={sig}"))]);
+        let key = webhook_gate(&r, "token-a", &h, body, now)
+            .expect("首发验签通过")
+            .expect("配 secret 的路由应有去重键");
         assert_eq!(
-            webhook_gate(&r, "token-a", &h, body, now, &guard),
-            Ok(()),
-            "首发验签去重通过"
+            key,
+            format!("token-a\u{0}{}", sig.to_ascii_lowercase()),
+            "键 = token + 小写规范化签名"
         );
-        let err = webhook_gate(&r, "token-a", &h, body, now, &guard).unwrap_err();
-        assert_eq!(err.0, StatusCode::CONFLICT, "同 (token,签名) 重放 → 409");
-        assert_eq!(err.1, "replay detected\n");
 
-        // 大小写 hex / 裸 hex 形态：验签等价 → 去重键规范化后相同 → 仍 409。
+        // 大小写 hex / 裸 hex 头形态：验签等价 → 去重键规范化后相同（防绕过）。
         let h_upper = headers(&[(
             "x-hub-signature-256",
             format!("sha256={}", sig.to_uppercase()),
         )]);
         assert_eq!(
-            webhook_gate(&r, "token-a", &h_upper, body, now, &guard)
-                .unwrap_err()
-                .0,
-            StatusCode::CONFLICT,
+            webhook_gate(&r, "token-a", &h_upper, body, now)
+                .unwrap()
+                .unwrap(),
+            key,
             "签名换大小写不可绕过去重"
         );
         let h_bare = headers(&[("x-signature", sig.clone())]);
         assert_eq!(
-            webhook_gate(&r, "token-a", &h_bare, body, now, &guard)
-                .unwrap_err()
-                .0,
-            StatusCode::CONFLICT,
+            webhook_gate(&r, "token-a", &h_bare, body, now)
+                .unwrap()
+                .unwrap(),
+            key,
             "裸 hex 头形态与 sha256= 前缀形态同键"
         );
 
-        // 不同 token（另一条 webhook 路由收到同样签名）互不误拦。
-        assert_eq!(
-            webhook_gate(&r, "token-b", &h, body, now, &guard),
-            Ok(()),
-            "键含 token，跨路由不串"
-        );
+        // 不同 token（另一条 webhook 路由收到同样签名）键不同，互不误拦。
+        let key_b = webhook_gate(&r, "token-b", &h, body, now).unwrap().unwrap();
+        assert_ne!(key_b, key, "键含 token，跨路由不串");
 
-        // 未配 secret 的路由：门直通（非 loopback 无 secret 由启动校验拒绝）。
+        // gate 不再消费 ReplayGuard：同签名重复过 gate 恒 Ok（去重由调用方在
+        // 限流通过后显式 admit——见 handler；这里直接验证 admit 语义）。
+        let guard = ReplayGuard::default();
+        assert!(guard.admit(&key, Instant::now()), "首见放行");
+        assert!(!guard.admit(&key, Instant::now()), "TTL 内重放拦截");
+
+        // 未配 secret 的路由：门直通且无去重键（非 loopback 无 secret 由启动校验拒绝）。
         let r_nosec = route(None, 0);
         assert_eq!(
-            webhook_gate(&r_nosec, "token-a", &HeaderMap::new(), body, now, &guard),
-            Ok(())
+            webhook_gate(&r_nosec, "token-a", &HeaderMap::new(), body, now),
+            Ok(None)
         );
     }
 
@@ -2937,7 +3262,7 @@ mod webhook_replay_tests {
         // 缺失 X-Imagent-Timestamp → 401。
         let sig_fresh = hmac_hex(SECRET, &ts_signing_input(fresh_ts, body));
         let h_no_ts = headers(&[("x-hub-signature-256", format!("sha256={sig_fresh}"))]);
-        let err = webhook_gate(&r, "t", &h_no_ts, body, now, &ReplayGuard::default()).unwrap_err();
+        let err = webhook_gate(&r, "t", &h_no_ts, body, now).unwrap_err();
         assert_eq!(
             (err.0, err.1),
             (
@@ -2952,7 +3277,7 @@ mod webhook_replay_tests {
             ("x-imagent-timestamp", stale_ts.to_string()),
             ("x-hub-signature-256", format!("sha256={sig_stale}")),
         ]);
-        let err = webhook_gate(&r, "t", &h_stale, body, now, &ReplayGuard::default()).unwrap_err();
+        let err = webhook_gate(&r, "t", &h_stale, body, now).unwrap_err();
         assert_eq!(
             (err.0, err.1),
             (
@@ -2969,9 +3294,7 @@ mod webhook_replay_tests {
             ("x-hub-signature-256", format!("sha256={sig_future}")),
         ]);
         assert_eq!(
-            webhook_gate(&r, "t", &h_future, body, now, &ReplayGuard::default())
-                .unwrap_err()
-                .0,
+            webhook_gate(&r, "t", &h_future, body, now).unwrap_err().0,
             StatusCode::UNAUTHORIZED,
             "未来侧超窗同样拒绝（容忍双向偏移但不放行超窗）"
         );
@@ -2983,26 +3306,25 @@ mod webhook_replay_tests {
             ("x-hub-signature-256", format!("sha256={sig_body_only}")),
         ]);
         assert_eq!(
-            webhook_gate(&r, "t", &h_body_sig, body, now, &ReplayGuard::default())
-                .unwrap_err()
-                .0,
+            webhook_gate(&r, "t", &h_body_sig, body, now).unwrap_err().0,
             StatusCode::UNAUTHORIZED,
             "验签串已改为 {{ts}}.{{body}}，body 原文签名不再通过"
         );
 
-        // 新鲜 ts + 正确签名 → 放行；同 (token,签名) 重发 → 409（两层叠加）。
+        // 新鲜 ts + 正确签名 → 放行（返回去重键）；同键 admit 二次 → 拦截
+        //（两层叠加：时间戳拦窗口外，去重拦窗口内同字节重放）。
         let h_fresh = headers(&[
             ("x-imagent-timestamp", fresh_ts.to_string()),
             ("x-hub-signature-256", format!("sha256={sig_fresh}")),
         ]);
+        let key = webhook_gate(&r, "t", &h_fresh, body, now)
+            .unwrap()
+            .expect("新鲜请求应有去重键");
         let guard = ReplayGuard::default();
-        assert_eq!(webhook_gate(&r, "t", &h_fresh, body, now, &guard), Ok(()));
-        assert_eq!(
-            webhook_gate(&r, "t", &h_fresh, body, now, &guard)
-                .unwrap_err()
-                .0,
-            StatusCode::CONFLICT,
-            "时间戳协议与去重叠加：同签名重发仍 409"
+        assert!(guard.admit(&key, Instant::now()));
+        assert!(
+            !guard.admit(&key, Instant::now()),
+            "时间戳协议与去重叠加：同签名重发被拦"
         );
 
         // 窗口边界：|now - ts| == window 视为新鲜（端点含）。
@@ -3012,9 +3334,8 @@ mod webhook_replay_tests {
             ("x-imagent-timestamp", edge_ts.to_string()),
             ("x-hub-signature-256", format!("sha256={sig_edge}")),
         ]);
-        assert_eq!(
-            webhook_gate(&r, "t", &h_edge, body, now, &ReplayGuard::default()),
-            Ok(()),
+        assert!(
+            webhook_gate(&r, "t", &h_edge, body, now).unwrap().is_some(),
             "窗口端点视为新鲜"
         );
     }
@@ -3049,6 +3370,98 @@ mod webhook_replay_tests {
         assert!(validate_webhook_bind(v6lo, &[mk(None, "ci")]).is_ok());
         // 空表 + 非 loopback：server 本就不启动，校验不阻拦（保持既有 warn 路径）。
         assert!(validate_webhook_bind(pub_addr, &[]).is_ok());
+    }
+}
+
+/// P2-1b（code-review v14）：SIGHUP 不可热载键快照对比单测——逐键变化被报出、
+/// 未变键不误报、webhooks 逐条字段变化（含深层字段）可检出。
+#[cfg(unix)]
+#[cfg(test)]
+mod sighup_hot_reload_tests {
+    use super::*;
+
+    fn snap() -> HotReloadSnapshot {
+        HotReloadSnapshot {
+            agent: "claude-cli".into(),
+            webhook_addr: Some("127.0.0.1:18443".into()),
+            webhooks: vec![(
+                "token-1".into(),
+                "feishu:oc_a".into(),
+                "ci".into(),
+                Some("secret-1".into()),
+                Some(10.0),
+                300,
+            )],
+            metrics_addr: Some("127.0.0.1:9100".into()),
+            sender_daily_cost_limit_usd: Some(5.0),
+            agent_timeout_secs: 3600,
+            agent_idle_timeout_secs: 1200,
+            batch_window_ms: 1500,
+            cron_catchup: "One".into(),
+            stranger_mention_hint: false,
+            stranger_p2p_hint: true,
+            reply_mode: imagent_core::ReplyMode::Card,
+        }
+    }
+
+    /// 全等快照 → 无变更键。
+    #[test]
+    fn identical_snapshots_report_no_change() {
+        assert!(snap().changed_keys(&snap()).is_empty());
+    }
+
+    /// 每个不可热载键的变化都能被点名（逐个翻转断言）。
+    #[test]
+    fn each_key_change_is_reported() {
+        type SnapshotCheck = (Box<dyn Fn(&mut HotReloadSnapshot)>, &'static str);
+        let checks: Vec<SnapshotCheck> = vec![
+            (Box::new(|s| s.agent = "codex".into()), "agent"),
+            (
+                Box::new(|s| s.webhook_addr = Some("127.0.0.1:19000".into())),
+                "webhook_addr",
+            ),
+            (Box::new(|s| s.webhook_addr = None), "webhook_addr"),
+            // webhooks 深层字段（replay_window_secs）变化可检出。
+            (Box::new(|s| s.webhooks[0].5 = 600), "webhooks"),
+            (Box::new(|s| s.webhooks.clear()), "webhooks"),
+            (Box::new(|s| s.metrics_addr = None), "metrics_addr"),
+            (
+                Box::new(|s| s.sender_daily_cost_limit_usd = None),
+                "sender_daily_cost_limit_usd",
+            ),
+            (
+                Box::new(|s| s.agent_timeout_secs = 60),
+                "agent_timeout_secs",
+            ),
+            (
+                Box::new(|s| s.agent_idle_timeout_secs = 60),
+                "agent_idle_timeout_secs",
+            ),
+            (Box::new(|s| s.batch_window_ms = 0), "batch_window_ms"),
+            (Box::new(|s| s.cron_catchup = "Off".into()), "cron_catchup"),
+            (
+                Box::new(|s| s.stranger_mention_hint = true),
+                "stranger_mention_hint",
+            ),
+            (
+                Box::new(|s| s.stranger_p2p_hint = false),
+                "stranger_p2p_hint",
+            ),
+            (
+                Box::new(|s| s.reply_mode = imagent_core::ReplyMode::Text),
+                "reply_mode",
+            ),
+        ];
+        for (mutate, key) in checks {
+            let mut new = snap();
+            mutate(&mut new);
+            let changed = snap().changed_keys(&new);
+            assert_eq!(
+                changed,
+                vec![key],
+                "翻转 {key} 应恰好报出该键，实际 {changed:?}"
+            );
+        }
     }
 }
 

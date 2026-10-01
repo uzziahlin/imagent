@@ -146,12 +146,20 @@ fn render_unit(
 /// 安装时应快照进服务定义的环境变量（凭据等——不快照则守护进程取不到）。
 /// T15：IMAGENT_LOG_MAX_MB（daemon.log 轮转阈值）一并快照——守护进程形态下
 /// 该 env 决定轮转阈值，不快照则 install 时的设置对守护进程不生效。
+/// P3-e（code-review v14）：补 `IMAGENT_PASSPHRASE`（ilink 加密凭据解密口令，
+/// 缺失则守护进程读凭据直接失败）、`IMAGENT_HTTP_TOKEN`（metrics Bearer 鉴权，
+/// 非 loopback 部署缺失会被 S7 fail-closed 拒启）、`IMAGENT_ACP_COMMAND`
+/// （agent=acp/claude-acp 的 ACP 启动命令覆盖）——此前快照漏键，装出来的
+/// 守护进程与交互 shell 行为不一致。
 fn capture_envs() -> Vec<(String, String)> {
     const KEYS: &[&str] = &[
         "IMAGENT_FEISHU_APP_SECRET",
         "IMAGENT_HOME",
         "RUST_LOG",
         "IMAGENT_LOG_MAX_MB",
+        "IMAGENT_PASSPHRASE",
+        "IMAGENT_HTTP_TOKEN",
+        "IMAGENT_ACP_COMMAND",
     ];
     KEYS.iter()
         .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
@@ -197,7 +205,9 @@ fn write_unit_secret_safe(path: &std::path::Path, content: String) -> Result<()>
 }
 
 /// `service install`：写定义文件 + 加载启动。
-pub fn install(profile: Option<&str>) -> Result<()> {
+/// P3-e（code-review v14）：改为 async——安装期检查 ilink 加密凭据需要读
+/// store（SQLite IO），同步签名装不下。
+pub async fn install(profile: Option<&str>) -> Result<()> {
     let exe = std::env::current_exe()
         .map_err(|e| anyhow!("定位当前二进制失败：{e}"))?
         .to_string_lossy()
@@ -228,6 +238,28 @@ pub fn install(profile: Option<&str>) -> Result<()> {
              守护进程取不到交互 shell 的环境变量，安装时会快照进服务定义。\n\
              请先 `export IMAGENT_FEISHU_APP_SECRET=…` 再执行本命令。"
         ));
+    }
+    // P3-e（code-review v14）：platform=ilink 且 store 里存在 enc 形态凭据但
+    // IMAGENT_PASSPHRASE 不在快照 → 拦截安装（比照上方 feishu secret 缺省
+    // 拦截）：守护进程没有 tty 可输口令，缺 passphrase 时读凭据直接失败，
+    // bot 会以「凭据解密失败」反复崩溃重启（KeepAlive 循环）。明文/keyring
+    // 形态不受影响。
+    if platform_name == "ilink" && !envs.iter().any(|(k, _)| k == "IMAGENT_PASSPHRASE") {
+        let db = imagent_core::paths::imagent_home().join("imagent.db");
+        if db.is_file() {
+            let store = imagent_store::Store::open(&db).await?;
+            let forms = store.credential_forms().await?;
+            if forms.encrypted > 0 {
+                return Err(anyhow!(
+                    "platform=ilink 且检测到 {} 条加密形态（enc:v1/v2）凭据，\
+                     但当前 shell 未设置 IMAGENT_PASSPHRASE——\n\
+                     守护进程无 tty 可输口令，缺 passphrase 将解密失败并反复崩溃重启。\n\
+                     请先 `export IMAGENT_PASSPHRASE=…` 再执行本命令\
+                     （安装时会快照进服务定义）。",
+                    forms.encrypted
+                ));
+            }
+        }
     }
     // 日志路径仅 launchd 用（systemd 走 journal）——随平台门控，防 Linux 下未用告警。
     #[cfg(target_os = "macos")]

@@ -166,6 +166,10 @@ async fn setup_feishu(cfg_path: PathBuf) -> Result<()> {
         }
     };
 
+    // P3-f（code-review v14）：所有内插值过 toml_escape——用户输入含 `"`/`\`
+    // 时裸内插产出非法 TOML（或把值后半截变成新键），secret/路径均不例外。
+    let workdir = toml_escape(&workdir)?;
+    let app_id = toml_escape(&app_id)?;
     let cfg = format!(
         "# 由 imagent setup 生成\n\
          default_workdir = \"{workdir}\"\n\
@@ -210,6 +214,11 @@ async fn setup_wecom(cfg_path: PathBuf) -> Result<()> {
             Err(e) => println!("❌ {e}，请重输。"),
         }
     };
+    // P3-f（code-review v14）：内插值过 toml_escape（同 feishu 分支——secret
+    // 含 `"`/`\` 时裸内插产出非法 TOML）。
+    let workdir = toml_escape(&workdir)?;
+    let bot_id = toml_escape(&bot_id)?;
+    let secret = toml_escape(&secret)?;
     let cfg = format!(
         "# 由 imagent setup 生成\n\
          default_workdir = \"{workdir}\"\n\
@@ -219,7 +228,8 @@ async fn setup_wecom(cfg_path: PathBuf) -> Result<()> {
          platform = \"wecom\"\n\
          wecom_bot_id = \"{bot_id}\"\n\
          wecom_secret = \"{secret}\"\n\
-         # ⚠️ secret 明文存于此文件（S-4）：务必保持 0600 权限\n"
+         # ⚠️ secret 明文存于此文件（S-4）：务必保持 0600 权限；建议改用\n\
+         # `imagent login wecom`（secret 入 OS keyring/加密 store，本键留空即可）\n"
     );
     write_config(&cfg_path, &cfg)?;
     println!(
@@ -266,8 +276,9 @@ fn write_config(path: &std::path::Path, content: &str) -> Result<()> {
     Ok(())
 }
 
-/// 读一行，去空白；空输入回默认值。
-fn prompt(label: &str, default: &str) -> Result<String> {
+/// 读一行，去空白；空输入回默认值。`pub(crate)`：main 的 `login wecom` 分支
+/// 复用（bot_id 非敏感，可见输入无妨）。
+pub(crate) fn prompt(label: &str, default: &str) -> Result<String> {
     if default.is_empty() {
         print!("{label}: ");
     } else {
@@ -288,22 +299,72 @@ fn prompt(label: &str, default: &str) -> Result<String> {
     }
 }
 
-/// 敏感输入：不回显（UNIX termios 关 echo；简化实现——读一行，提示输入时不可见性
-/// 非硬性安全边界，secret 只在内存/环境变量流转）。
-fn prompt_secret(label: &str) -> Result<String> {
-    print!("{label}: ");
-    std::io::stdout().flush()?;
-    let mut buf = String::new();
-    std::io::stdin().read_line(&mut buf)?;
-    let t = buf.trim();
-    if t.is_empty() {
-        return Err(anyhow!("{label} 不能为空"));
+/// 敏感输入：TTY 下关回显（rpassword 处理 termios——P3-f，code-review v14：
+/// 旧实现注释声称「termios 关 echo」但实际只是 read_line，secret 全程明文
+/// 回显在终端/录屏里，是兑现承诺而非加固）；非 TTY（管道/CI）回退 read_line
+/// 并显式 warn + 终端提示「输入将回显」（管道场景无 termios 可关，诚实披露
+/// 优于静默明文）。`pub(crate)`：main 的 `login wecom` 分支复用。
+pub(crate) fn prompt_secret(label: &str) -> Result<String> {
+    if std::io::stdin().is_terminal() {
+        let raw = rpassword::prompt_password(format!("{label}: "))
+            .map_err(|e| anyhow!("读取 {label} 失败：{e}"))?;
+        let t = raw.trim();
+        if t.is_empty() {
+            return Err(anyhow!("{label} 不能为空"));
+        }
+        Ok(t.to_string())
+    } else {
+        tracing::warn!(
+            target: "imagent::setup",
+            "stdin 非 tty，{label} 输入将回显（管道场景无 termios 可关）"
+        );
+        println!("（stdin 非 tty：{label} 输入将回显）");
+        let mut buf = String::new();
+        std::io::stdin().read_line(&mut buf)?;
+        let t = buf.trim();
+        if t.is_empty() {
+            return Err(anyhow!("{label} 不能为空"));
+        }
+        Ok(t.to_string())
     }
-    Ok(t.to_string())
+}
+
+/// TOML 基本字符串（basic string）转义（P3-f，code-review v14）：`"` 与 `\`
+/// 按 TOML 规范转义；控制字符（0x00-0x1F/0x7F）**直接拒绝**——TOML 基本串
+/// 不允许裸控制字符，合法转义形态（\n/\t/\uXXXX）对「路径 / app_id / secret」
+/// 这类值没有正常使用场景，拒绝 + 明确报错比猜测转义意图更安全（也避免
+/// 写出换行内嵌的 config 行——那会把后续行变成新键，等于配置注入）。
+fn toml_escape(value: &str) -> Result<String> {
+    if let Some(c) = value.chars().find(|c| c.is_control()) {
+        return Err(anyhow!(
+            "配置值含控制字符（U+{:04X}），无法安全写入 TOML 字符串",
+            c as u32
+        ));
+    }
+    Ok(value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// y/n 确认（default 决定直接回车的行为）。
 fn confirm(label: &str, default: bool) -> Result<bool> {
     let ans = prompt(label, if default { "y" } else { "n" })?;
     Ok(matches!(ans.to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P3-f：TOML 转义——引号/反斜杠正确转义；控制字符拒绝。
+    #[test]
+    fn toml_escape_quotes_backslashes_and_rejects_control() {
+        assert_eq!(toml_escape("plain").unwrap(), "plain");
+        assert_eq!(toml_escape(r#"a"b\c"#).unwrap(), r#"a\"b\\c"#);
+        assert_eq!(toml_escape(r#""""#).unwrap(), r#"\"\""#);
+        assert!(toml_escape("line1\nline2").is_err(), "换行拒绝");
+        assert!(toml_escape("tab\there").is_err(), "Tab 拒绝");
+        assert!(toml_escape("nul\0byte").is_err(), "NUL 拒绝");
+        assert!(toml_escape("del\x7f").is_err(), "DEL 拒绝");
+        // 中文/emoji 正常通过（多字节非控制字符）。
+        assert_eq!(toml_escape("路径/中文🔑").unwrap(), "路径/中文🔑");
+    }
 }
