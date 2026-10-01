@@ -845,12 +845,14 @@ pub fn unsupported_message_notice(
     let notice = match evt.event.message.message_type.as_str() {
         "share_chat" => "🗂 暂不支持群聊分享卡片，请直接发送文字。",
         "share_user" => "👤 暂不支持用户名片分享，请直接发送文字。",
-        // 合并转发（仅回退兜底，正常路径见 parse_merged_forward_event）/
+        // merged_forward 已完整支持（正常路径见 parse_merged_forward_event），
+        // 走到这里 = 事件缺 message_id 等解析异常——P3f（code-review v14）：
+        // 文案不再说「暂不支持合并转发」（误导用户以为功能缺失），改为解析
+        // 异常的可行动指引。
+        "merged_forward" => "📦 消息解析异常，请重新发送或改发文字。",
         // 表情包 / 视频（media=视频流、video=旧字段）：parse 侧静默丢弃，
         // 给可行动提示——用户改发文字或截图即可继续（截图走 image 路径可处理）。
-        "merged_forward" | "sticker" | "media" | "video" => {
-            "📦 暂不支持合并转发/表情包/视频消息，请直接发文字或截图。"
-        }
+        "sticker" | "media" | "video" => "📦 暂不支持表情包/视频消息，请直接发文字或截图。",
         _ => return None,
     };
     // 仅 p2p 回提示（理由见函数文档）。去重键：message_id，缺省回退 header
@@ -1606,7 +1608,13 @@ fn apply_text_mentions(
 ) -> (String, Vec<imagent_core::Mention>) {
     let mut out = text.to_string();
     let mut resolved: Vec<imagent_core::Mention> = Vec::new();
-    for m in mentions {
+    // P3g（code-review v14）：占位键按**长度降序**替换——`@_user_2` 是
+    // `@_user_25` 的前缀，短键先替换会把 `@_user_25` 劈成「@bot名5」残骸
+    // （bot=@_user_2 且正文含 @_user_25 时实打实发生）。降序保证长键先消费
+    // 完整占位；mentions 顺序不保证（事件序任意），不能依赖上游排序。
+    let mut ordered: Vec<&MessageMention> = mentions.iter().collect();
+    ordered.sort_by_key(|m| std::cmp::Reverse(m.key.as_deref().map_or(0, str::len)));
+    for m in ordered {
         let Some(key) = m.key.as_deref().filter(|k| !k.is_empty()) else {
             continue;
         };
@@ -1623,6 +1631,17 @@ fn apply_text_mentions(
             Some(n) => out.replace(key, &format!("@{n}")),
             None => out.replace(key, ""),
         };
+    }
+    // resolved 按**原 mentions 序**产出（与替换序解耦：替换须降序，消费方
+    // 读到的提及列表保持事件原序）。
+    for m in mentions {
+        let Some(open_id) = m.open_id() else {
+            continue;
+        };
+        if bot_open_id == Some(open_id) {
+            continue;
+        }
+        let name = m.name.as_deref().filter(|n| !n.trim().is_empty());
         resolved.push(imagent_core::Mention {
             user_id: open_id.to_string(),
             name: name.unwrap_or_default().to_string(),
@@ -1885,13 +1904,23 @@ pub fn render_merge_forward_transcript(
     summary: Option<&str>,
 ) -> String {
     let n = items.len();
-    let title = title.map(str::trim).filter(|t| !t.is_empty());
-    let mut out = match title {
+    // P3h（code-review v14）：title/summary 是事件 content 的尽力解析产物，
+    // 先各截 200 字符再入基座——不截的超长头会把 used 顶过 8000 预算，首条
+    // 子消息即「超限」，转录只剩头。
+    let title = title
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|t| t.chars().take(200).collect::<String>());
+    let summary = summary
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(200).collect::<String>());
+    let mut out = match title.as_deref() {
         Some(t) => format!("【合并转发聊天记录】{t}"),
         None => format!("【合并转发聊天记录】共 {n} 条"),
     };
     let mut used = out.chars().count();
-    if let Some(s) = summary.map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(s) = summary.as_deref() {
         out.push('\n');
         out.push_str(s);
         used += 1 + s.chars().count();
@@ -1920,10 +1949,15 @@ pub fn render_merge_forward_transcript(
         let ll = line.chars().count();
         if used + ll > MERGE_FORWARD_TRANSCRIPT_MAX {
             // 首条就超限也硬截保留一条（空转录对 agent 无信息量）；按字符边界截。
+            // P3h（code-review v14）：`included` 只在**实际追加了内容**时递增
+            // （截断余量为 0/仅剩换行符时不计——修「前 0 条标成 1 条」）。
             if included == 0 {
                 let room = MERGE_FORWARD_TRANSCRIPT_MAX.saturating_sub(used);
-                out.push_str(&line.chars().take(room).collect::<String>());
-                included = 1;
+                let frag: String = line.chars().take(room).collect();
+                if frag.chars().count() > 1 {
+                    out.push_str(&frag);
+                    included = 1;
+                }
             }
             truncated = true;
             break;
@@ -1932,6 +1966,10 @@ pub fn render_merge_forward_transcript(
         used += ll;
         included += 1;
     }
+    // P3h（code-review v14）：防御性硬截——主体（头 + 行）总长恒 ≤ 上限
+    //（对齐 render_group_context_block 群上下文路径的末尾 take）；截断/媒体
+    // 标注是元信息，拼在 take 之后不计入（口径同下方的测试注释）。
+    let mut out: String = out.chars().take(MERGE_FORWARD_TRANSCRIPT_MAX).collect();
     if truncated {
         out.push_str(&format!("\n（已截断，共 {n} 条中前 {included} 条）"));
     }
@@ -2169,6 +2207,10 @@ pub(crate) struct RawMessageItem {
     pub sender_app_id: String,
     /// 合并转发子消息的父级 id（None = 父消息本体或非合并转发场景）。
     pub upper_message_id: Option<String>,
+    /// 话题归属根消息 id（`root_id`；空 = 缺失或主时间线消息）——群上下文的
+    /// 话题过滤用（P2-4，code-review v14：话题=独立会话，见
+    /// [`parse_group_context_items`]）。
+    pub root_id: String,
     /// 毫秒 epoch（0 = 缺失/非法；秒级自动 ×1000 归一，见 [`create_time_ms_of`]）。
     pub create_time_ms: i64,
 }
@@ -2234,6 +2276,7 @@ pub(crate) fn parse_raw_message_item(v: &serde_json::Value) -> Option<RawMessage
         sender_type,
         sender_app_id,
         upper_message_id: (!upper.is_empty()).then_some(upper),
+        root_id: str_of("root_id"),
         create_time_ms: create_time_ms_of(obj.get("create_time")),
     })
 }
@@ -2257,6 +2300,9 @@ pub struct GroupContextItem {
     pub message_type: String,
     /// 消息 content（JSON 字符串，形态同普通消息：`{"text":"…"}` 等）。
     pub content: String,
+    /// 话题归属根消息 id（空 = 缺失或主时间线消息）——drain 侧据此过滤只留
+    /// 本话题条目（P2-4，code-review v14：话题群上下文不得跨话题共享）。
+    pub root_id: String,
     /// 创建时间（毫秒 epoch；0 = 缺失/非法）。
     pub create_time_ms: i64,
 }
@@ -2288,6 +2334,7 @@ pub fn parse_group_context_items(v: &serde_json::Value, own_app_id: &str) -> Vec
                 from_bot,
                 message_type: raw.message_type,
                 content: raw.content,
+                root_id: raw.root_id,
                 create_time_ms: raw.create_time_ms,
             })
         })
@@ -2327,7 +2374,10 @@ pub fn render_group_context_block(items: &[GroupContextItem]) -> Option<String> 
     let tail = "\n\n（以下是用户本轮消息）";
     let budget = GROUP_CONTEXT_MAX_CHARS - tail.chars().count();
     let mut kept: Vec<&GroupContextItem> = items.iter().filter(|it| !it.from_bot).collect();
-    kept.sort_by_key(|it| it.create_time_ms);
+    // P3a（code-review v14）：缺失时间（0）沉底保持相对序——对齐转录侧
+    // render_merge_forward_transcript 的 tuple key（此前裸 sort_by_key 会把
+    // 0 时间戳的条目排到最前，被预算截断后「最新上下文」只剩无时间条目）。
+    kept.sort_by_key(|it| (it.create_time_ms == 0, it.create_time_ms));
     if kept.is_empty() {
         return None;
     }
@@ -3902,17 +3952,19 @@ mod tests {
             .to_string()
             .into_bytes()
         };
-        for mt in ["merged_forward", "sticker", "media", "video"] {
+        for mt in ["sticker", "media", "video"] {
             let (notice, key, conv) =
                 unsupported_message_notice(&mk(mt)).unwrap_or_else(|| panic!("{mt} 应提示"));
-            assert!(
-                notice.contains("暂不支持合并转发/表情包/视频消息"),
-                "{mt}: {notice}"
-            );
+            assert!(notice.contains("暂不支持表情包/视频消息"), "{mt}: {notice}");
             assert!(notice.contains("发文字或截图"), "{mt}: {notice}");
             assert_eq!(conv.unwrap().0, "feishu:ou_u");
             assert_eq!(key.as_deref(), Some("om_rich1"));
         }
+        // P3f（code-review v14）：merged_forward 回退兜底文案改「解析异常」
+        // 指引（功能已支持，不再误称「暂不支持」）。
+        let (notice, _, _) = unsupported_message_notice(&mk("merged_forward")).unwrap();
+        assert!(notice.contains("消息解析异常"), "{notice}");
+        assert!(notice.contains("改发文字"), "{notice}");
     }
 
     /// Bug：post 富文本 a 节点（超链接）不再丢弃——渲染 `[text](href)`；无 text
@@ -4084,7 +4136,9 @@ mod tests {
         let p = mk_merged_forward_payload("evt_mf4", None, "{}", "p2p", "");
         assert!(parse_merged_forward_event(&p, &MentionPolicy::PERMISSIVE, None).is_none());
         let (notice, key, conv) = unsupported_message_notice(&p).expect("缺 message_id 应回退提示");
-        assert!(notice.contains("暂不支持合并转发"), "{notice}");
+        // P3f（code-review v14）：merged_forward 已支持，兜底文案指向解析异常
+        //（不再是「暂不支持合并转发」）。
+        assert!(notice.contains("消息解析异常"), "{notice}");
         assert_eq!(conv.unwrap().0, "feishu:ou_fwd");
         // 去重键回退到 header event_id（重投事件同 id，drain 侧 dedup 仍有效）。
         assert_eq!(key.as_deref(), Some("evt_mf4"));
@@ -4715,7 +4769,7 @@ mod tests {
         assert_eq!(create_time_ms_of(None), 0, "缺省 → 0");
     }
 
-    /// 构造群历史条目（转录测试用）。
+    /// 构造群历史条目（转录测试用；root_id 缺省空 = 主时间线消息）。
     fn gc_item(
         sender: &str,
         name: Option<&str>,
@@ -4730,6 +4784,7 @@ mod tests {
             from_bot,
             message_type: mt.to_string(),
             content: content.to_string(),
+            root_id: String::new(),
             create_time_ms: ms,
         }
     }
@@ -4931,6 +4986,156 @@ mod tests {
         assert!(
             block.ends_with("（以下是用户本轮消息）"),
             "尾注恒保留: {block}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // code-review v14：P2-4（话题 root_id）/ P3a（0 时间沉底）/ P3g（占位键
+    // 前缀碰撞）/ P3h（转录基座预算）
+    // ------------------------------------------------------------------
+
+    /// P3a：群上下文排序缺失时间（0）沉底——对齐转录侧的 tuple key。修前
+    /// 裸 sort_by_key 会把 0 时间戳条目排到最前，预算截断后上下文被无时间
+    /// 条目占满、真正最近的讨论被截掉。
+    #[test]
+    fn render_group_context_block_zero_time_sinks() {
+        let items = vec![
+            gc_item(
+                "ou_zero",
+                Some("无时间"),
+                false,
+                "text",
+                &serde_json::to_string(&serde_json::json!({"text": "缺时间戳"})).unwrap(),
+                0,
+            ),
+            gc_item(
+                "ou_new",
+                Some("New"),
+                false,
+                "text",
+                &serde_json::to_string(&serde_json::json!({"text": "最新的"})).unwrap(),
+                3_000,
+            ),
+            gc_item(
+                "ou_old",
+                Some("Old"),
+                false,
+                "text",
+                &serde_json::to_string(&serde_json::json!({"text": "最早的"})).unwrap(),
+                1_000,
+            ),
+        ];
+        let block = render_group_context_block(&items).expect("应有块");
+        let old = block.find("最早的").expect("missing");
+        let new = block.find("最新的").expect("missing");
+        let zero = block.find("缺时间戳").expect("missing");
+        assert!(old < new && new < zero, "正序 + 缺失（0）沉底: {block}");
+    }
+
+    /// P2-4：群历史 item 的 root_id（话题归属）宽容提取——真机形态带
+    /// root_id 的条目（话题内消息）可判话题，主时间线/缺失条目为空串。
+    #[test]
+    fn parse_group_context_items_extracts_root_id() {
+        let body = serde_json::json!({
+            "code": 0,
+            "data": { "items": [
+                {
+                    "message_id": "om_t1", "msg_type": "text", "create_time": "1788000001",
+                    "root_id": "om_root_a",
+                    "sender": { "id": "ou_a", "id_type": "open_id", "sender_type": "user" },
+                    "body": { "content": "{\"text\":\"话题 A 内\"}" }
+                },
+                {
+                    "message_id": "om_main", "msg_type": "text", "create_time": "1788000002",
+                    "sender": { "id": "ou_b", "id_type": "open_id", "sender_type": "user" },
+                    "body": { "content": "{\"text\":\"主时间线\"}" }
+                }
+            ]}
+        });
+        let items = parse_group_context_items(&body, "cli_self");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].root_id, "om_root_a", "话题内消息带 root_id");
+        assert_eq!(items[1].root_id, "", "主时间线消息 root_id 空");
+        // 兼容旧构造（合并转发子消息路径）：RawMessageItem 默认 root_id 空。
+        assert_eq!(RawMessageItem::default().root_id, "");
+    }
+
+    /// P3g：`@_user_N` 占位键前缀碰撞——bot=@_user_2 且存在 @_user_25 时，
+    /// 短键先替换会劈坏长键（`@_user_25` → 「@bot名5」残骸）。修后按 key
+    /// 长度降序替换，长键先消费完整占位。
+    #[test]
+    fn mention_placeholder_prefix_collision() {
+        let mentions = r#"[
+            {"key":"@_user_2","id":{"open_id":"ou_bot"},"name":"agent"},
+            {"key":"@_user_25","id":{"open_id":"ou_zhang"},"name":"张三"}
+        ]"#;
+        let p = mk_group_mention_payload("evt_mfp", "@_user_2 看 @_user_25 的报告", mentions);
+        let (_k, msg, _) =
+            parse_message_event(&p, &MentionPolicy::REQUIRE_BOT, Some("ou_bot")).unwrap();
+        assert_eq!(
+            msg.text.as_deref(),
+            Some("看 @张三 的报告"),
+            "长占位键（@_user_25）不得被短键（@_user_2）劈坏: {:?}",
+            msg.text
+        );
+        assert_eq!(msg.mentions.len(), 1);
+        assert_eq!(msg.mentions[0].user_id, "ou_zhang");
+        // 逆序声明的 mentions（长键在前）同样正确（替换序与声明序解耦）。
+        let reversed = r#"[
+            {"key":"@_user_25","id":{"open_id":"ou_zhang"},"name":"张三"},
+            {"key":"@_user_2","id":{"open_id":"ou_bot"},"name":"agent"}
+        ]"#;
+        let p2 = mk_group_mention_payload("evt_mfp2", "@_user_2 看 @_user_25 的报告", reversed);
+        let (_k, msg2, _) =
+            parse_message_event(&p2, &MentionPolicy::REQUIRE_BOT, Some("ou_bot")).unwrap();
+        assert_eq!(msg2.text.as_deref(), Some("看 @张三 的报告"));
+    }
+
+    /// P3h：转录基座受 8000 预算约束——title/summary 先各截 200 字符；
+    /// 超长头不再挤掉全部子消息；`included` 只在实际追加时递增（修「前 0 条
+    /// 标成 1 条」）；末尾防御性硬截恒 ≤ 上限。
+    #[test]
+    fn render_transcript_head_budget_and_included_fix() {
+        // 超长 title/summary（各 5000 字符）：先截 200——子消息仍有预算。
+        let long_title: String = "题".repeat(5_000);
+        let long_summary: String = "摘".repeat(5_000);
+        let items = vec![mf_item(
+            "text",
+            r#"{"text":"正文一"}"#,
+            Some("A"),
+            "ou_a",
+            0,
+        )];
+        let t = render_merge_forward_transcript(&items, Some(&long_title), Some(&long_summary));
+        assert!(
+            t.contains(&"题".repeat(200)),
+            "title 截 200 字符: {}…",
+            &t[..200.min(t.len())]
+        );
+        assert!(!t.contains(&"题".repeat(201)), "title 不得超过 200 字符");
+        assert!(t.contains("[A] 正文一"), "子消息不被超长头挤掉: {t}");
+        assert!(t.chars().count() <= MERGE_FORWARD_TRANSCRIPT_MAX + 60);
+
+        // 「included 只计实际追加」：单条巨长行触发首条硬截——标注为前 1 条
+        //（确实追加了截断片段）且主体 ≤ 上限。注：头截 200 后 used 恒远小于
+        // 预算，0 余量路径（included 错标 1 的原缺陷形态）在公开入参下已不可
+        // 达，防御分支由代码审读保障。
+        let exact_title: String = "题".repeat(200);
+        let huge = "长".repeat(20_000);
+        let one = vec![mf_item(
+            "text",
+            &format!(r#"{{"text":"{huge}"}}"#),
+            None,
+            "ou_x",
+            0,
+        )];
+        let t2 = render_merge_forward_transcript(&one, Some(&exact_title), None);
+        assert!(t2.contains("（已截断，共 1 条中前 1 条）"), "{t2}");
+        let body2 = t2.split("\n（已截断").next().unwrap();
+        assert!(
+            body2.chars().count() <= MERGE_FORWARD_TRANSCRIPT_MAX,
+            "防御性硬截: {}",
+            body2.chars().count()
         );
     }
 }

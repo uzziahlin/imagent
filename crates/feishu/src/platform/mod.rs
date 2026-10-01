@@ -688,15 +688,18 @@ impl FeishuPlatform {
             return;
         }
         let seq = self.next_card_seq(card_id).await;
-        // 限流丢帧：footer 是点缀，不重试不阻塞；缓存条目回滚（否则本窗口内后续
-        // 相同 footer 会被误判「已上屏」而跳过，内容永久丢失直到 footer 再变化）。
+        // P3m（code-review v14）：footer patch **任何失败**都回滚缓存条目——
+        // 此前仅限流分支回滚，非限流失败（网络抖动/500 等）会让本窗口内后续
+        // 相同 footer 被误判「已上屏」而跳过，内容永久丢失直到 footer 再变化
+        //（限流分支的回滚理由泛化到全部失败形态）。
         if let Err(e) = patch_card_element(token, card_id, "md_footer", footer, seq).await {
-            if is_rate_limited_err(&e) {
+            let rate_limited = is_rate_limited_err(&e);
+            if rate_limited {
                 tracing::warn!(target: "feishu", card_id, "footer patch 限流，丢帧并回滚缓存");
-                self.card_footers.lock().await.remove(card_id);
             } else {
-                tracing::warn!(target: "feishu", error = %e, "footer patch 失败（不影响主流程）");
+                tracing::warn!(target: "feishu", error = %e, "footer patch 失败（不影响主流程，回滚缓存）");
             }
+            self.card_footers.lock().await.remove(card_id);
         }
     }
     /// conv 最近一次入站消息的 sender（轮次发起者近似——每 conv 轮次串行，询问

@@ -22,9 +22,8 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
-anyhow = { workspace = true }
-thiserror = { workspace = true }
-dirs = { workspace = true }
+# P3-d（code-review v14）：删除零引用的 anyhow/thiserror/dirs（错误统一走
+# imagent_core::CoreError；路径走 imagent_core::paths）。
 reqwest = { workspace = true }
 regex = { workspace = true }
 uuid = { workspace = true }

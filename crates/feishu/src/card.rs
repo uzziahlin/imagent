@@ -58,12 +58,16 @@ fn sanitize_inline(text: &str) -> String {
     escape_lt_inline(&text.replace('`', "'"))
 }
 
-/// v1.26 构造收口：markdown 元素的唯一出口——转义（<at> 注入防线）与邮箱
+/// v1.26 构造收口：markdown 元素内容的主出口——转义（<at> 注入防线）与邮箱
 /// 掩码（租户审计）内建，调用方传**原始内容**。这是同类问题（v8→v12→
 /// v1.25.1 三次人肉审出遗漏）的根治：新构造点不可能忘记转义。
 /// v13-P1 补洞：`md_element_anchored` 此前绕过收口（<at> 注入第 4 洞——
 /// managed 流式卡初始帧的 md_body 承载 task_digest=用户原始 prompt 前 60
 /// 字），现与另外两个构造点同款内建。三个构造器一个不落。
+/// v14 校准（P1 第 5 洞）：markdown **内容**经此出口收口，但 markdown **标题**
+/// 仍有一个旁路构造点（[`panel_header`]）——其已内建同款转义+掩码；除它
+/// 与 [`sender_anchor_line`]（全文件唯一合法 <at> 构造点）外，不得再新增
+/// 直拼 `"tag":"markdown"` 的构造点。
 /// text_size 可选（notation 小字）；element_id 可选（managed 流式锚点）。
 fn md_element(content: &str) -> serde_json::Value {
     serde_json::json!({
@@ -101,17 +105,46 @@ fn escape_lt(text: &str) -> String {
     // 不处理反斜杠转义，此前全串替换把 `a < b` 显示成 `a \< b`。逐行跟踪
     // ``` / ~~~ 围栏开闭，仅块外转义；行内 code span 同理不转义（见
     // escape_lt_inline）。
-    let mut out = String::with_capacity(text.len());
+    // P1 第 2 洞（code-review v14）：未闭合 ``` 围栏会让 in_fence 永久翻转、
+    // 其后所有行按「围栏内」不转义——攻击者一段以 ``` 开头的正文即可让其后的
+    // `<at id=…>` 免转义通过。先预扫一遍围栏开闭：若到文本末尾 in_fence 仍为
+    // true，则最后一个未闭合围栏行（toggle 序列的最后一个标记行必是未配对的
+    // 开栏行）之后的全部内容回退为全量转义（`<`→`\<`，围栏行本身保留）。
+    // 代价是未闭合围栏后合法代码块的 `<` 也被转义（显示成 \<）——fail-safe
+    // 优先：少转义是注入洞，多转义只是显示瑕疵。
+    let lines: Vec<&str> = text.split('\n').collect();
+    let is_fence_line = |line: &str| {
+        let t = line.trim_start();
+        t.starts_with("```") || t.starts_with("~~~")
+    };
     let mut in_fence = false;
-    for (i, line) in text.split('\n').enumerate() {
+    let mut last_fence_line: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate() {
+        if is_fence_line(line) {
+            in_fence = !in_fence;
+            last_fence_line = Some(i);
+        }
+    }
+    let unclosed_from: Option<usize> = if in_fence {
+        last_fence_line.map(|i| i + 1)
+    } else {
+        None
+    };
+    let mut out = String::with_capacity(text.len());
+    // 渲染期围栏状态：unclosed_from 之前的标记行与预扫完全一致地重放（未闭合
+    // 开栏行恰是最后一个标记行，之后的行都走全量转义分支，不再进入本状态机）。
+    let mut render_fence = false;
+    for (i, line) in lines.iter().enumerate() {
         if i > 0 {
             out.push('\n');
         }
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
+        // 未闭合围栏之后：不再信任围栏/span 边界，全量转义。
+        if unclosed_from.is_some_and(|u| i >= u) {
+            out.push_str(&line.replace('<', "\\<"));
+        } else if is_fence_line(line) {
+            render_fence = !render_fence;
             out.push_str(line);
-        } else if in_fence {
+        } else if render_fence {
             out.push_str(line);
         } else {
             out.push_str(&escape_lt_inline(line));
@@ -121,12 +154,20 @@ fn escape_lt(text: &str) -> String {
 }
 
 /// 行内 code span（`…`）内的 `<` 不转义（同 R13）：按反引号切分，奇数索引
-/// 段是 span 内容原样保留。未配对反引号/跨行 span 的边界误差可接受——
-/// 展示层少转义优于显示破坏（JSON 结构注入已由 serde 层封死，此处只防
-/// `<at>` 语义注入，代码片段里没有该形态）。
+/// 段是 span 内容原样保留。
+/// P1 第 5 洞（code-review v14）：「奇数段是 span」的安全假设被**未配对
+/// 反引号**打破——攻击者一个反引号让其后的 `<at id=…>` 落进奇数段免转义
+/// 通过。修法：先看段数——反引号配对（段数为奇）维持现行为；未配对（段数
+/// 为偶）则全部段按普通文本转义 `<`→`\<`。代价是未配对行里合法 code span
+/// 也被转义（显示成 \<）——fail-safe 优先，理由同 escape_lt 的未闭合围栏。
 fn escape_lt_inline(line: &str) -> String {
+    let segments: Vec<&str> = line.split('`').collect();
+    if segments.len() % 2 == 0 {
+        // 反引号数为奇（未配对）：无法可靠界定 span 边界，整行按普通文本转义。
+        return line.replace('<', "\\<");
+    }
     let mut out = String::with_capacity(line.len());
-    for (i, seg) in line.split('`').enumerate() {
+    for (i, seg) in segments.iter().enumerate() {
         if i % 2 == 1 {
             out.push('`');
             out.push_str(seg);
@@ -361,7 +402,15 @@ pub fn render_card(card: &OutboundCard, conv_id: &str, sender: Option<&str>) -> 
         Some(t) => format!("{t}\n\n{text}"),
         None => text.into_owned(),
     };
-    elements.push(md_element(&cap_md_bytes(&body_md, 4_096, 4_096)));
+    // P2-2（code-review v14）cap 顺序：先 mask 再截断（对齐 stream 路径
+    // stream_body_md_inner 的口径）——截断后的残缺邮箱不再匹配掩码正则，裸 @
+    // 会漏出（理由同下方 summary 注释）。escape 仍由 md_element 收口在截断后
+    // 做（`<`→`\<` 每个 +1 字节，8KB 窗口对 30KB 卡上限余量充足）。
+    elements.push(md_element(&cap_md_bytes(
+        &mask_emails(&body_md),
+        4_096,
+        4_096,
+    )));
     if !card.tool_calls.is_empty() {
         // 长正文分段：正文与工具面板间用真 hr 组件分隔（降级路径专属——
         // managed 路径的 md_body 是单 markdown 组件，用 `---` 文本分割线，
@@ -479,20 +528,17 @@ fn terminal_header_opt(running: bool, err: Option<&str>) -> Option<serde_json::V
 ///
 /// 终态卡**全量罗列**（不截最近 5 条）——面板默认收起不占版面，展开即完整
 /// 工具轨迹，终态后可回看明细（流式期只显最近 5 条，见 [`stream_body_md`]）。
+/// 超出 [`PANEL_MAX_BYTES`] 字节预算时折叠为最近若干条 + 顶部「⏫ 前面还有
+/// M 个…已折叠」（P2-2，见 [`panel_lines_bounded`]）。
 ///
 /// 面板边框色随终态（CardKit 视觉改版）：Running=blue（进行中）/ Done=grey
 /// （信息中性，不再抢视觉）/ Error=red（警示）。
 fn render_tool_panel(tools: &[ToolCall], border_color: &str) -> serde_json::Value {
     let n = tools.len();
-    let mut lines = String::new();
-    for t in tools {
-        // R7（code-review v9 残留）：工具摘要可携带文件内容片段，<at id=…>
-        // 注入面与正文三路径同权——escape_lt 收口（mask_emails 只掩邮箱）。
-        lines.push_str(&format!(
-            "- {}\n",
-            escape_lt(&mask_emails(&tool_card_line(t)))
-        ));
-    }
+    // P3j（code-review v14）：行内容传**原始文本**——md_element_sized 内建
+    // escape+mask（见其文档），外层再包 escape_lt(mask_emails(…)) 会把 `\<`
+    // 二次转义成 `\\<`（双重转义伪影）。
+    let lines = panel_lines_bounded(tools, |t| format!("- {}\n", tool_card_line(t)), "工具调用");
     serde_json::json!({
         "tag": "collapsible_panel",
         "expanded": false,
@@ -507,17 +553,17 @@ fn render_tool_panel(tools: &[ToolCall], border_color: &str) -> serde_json::Valu
 /// W2-1：思考过程折叠面板（与 [`render_tool_panel`] 同款形态）：最近
 /// THOUGHT_PANEL_LINES 条、单条截 400 字符，默认收起。`thoughts` 由 core
 /// CardSession 累积（上限 10 条），此处再截显防超长推理占满面板。
+/// P2-2/P3j（code-review v14）：与工具面板同款字节预算折叠；行内容传原始
+/// 文本（escape+mask 由 md_element_sized 收口，防双重转义）。
 const THOUGHT_PANEL_LINES: usize = 5;
 fn render_thought_panel(thoughts: &[String], border_color: &str) -> serde_json::Value {
     let n = thoughts.len();
     let start = n.saturating_sub(THOUGHT_PANEL_LINES);
-    let mut lines = String::new();
-    for t in &thoughts[start..] {
-        lines.push_str(&format!(
-            "> {}\n",
-            escape_lt(&mask_emails(&truncate_chars(t.trim(), 400)))
-        ));
-    }
+    let lines = panel_lines_bounded(
+        &thoughts[start..],
+        |t| format!("> {}\n", truncate_chars(t.trim(), 400)),
+        "条思考",
+    );
     serde_json::json!({
         "tag": "collapsible_panel",
         "expanded": false,
@@ -527,6 +573,45 @@ fn render_thought_panel(thoughts: &[String], border_color: &str) -> serde_json::
         "padding": "8px 8px 8px 8px",
         "elements": [md_element_sized(&lines, "notation")]
     })
+}
+
+/// 终态折叠面板行集的字节预算（P2-2，code-review v14）：约 40 个工具（长命令
+/// 摘要）逼近 30KB 卡上限，raw 卡路径（msg: 句柄）流式 patch 全部 200860 拒收、
+/// 终态塌缩最小卡。取 10KB：正文 8KB（头尾窗）+ 双面板 2×10KB + 统计行/头部
+/// JSON 开销 ≈ 29KB，压在卡上限内（12KB×2+8KB 会顶穿）。
+const PANEL_MAX_BYTES: usize = 10 * 1024;
+
+/// 面板行集的统一折叠（P2-2，code-review v14）：从**最新**一条往回收行，
+/// 字节预算内尽量多留；一旦超限，其余（更早的）行整体折叠为顶部
+/// 「⏫ 前面还有 M 个{label}已折叠」一行——与流式 STREAM_TOOL_LINES 的
+/// 「最近 N 条」同语义，只是阈值从条数换成字节（防单行超长撑爆面板）。
+/// 最新一条恒保留（空面板对回看无信息量）。
+fn panel_lines_bounded<T>(items: &[T], line_of: impl Fn(&T) -> String, label: &str) -> String {
+    let mut kept: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    let mut skipped = 0usize;
+    let mut folding = false;
+    for it in items.iter().rev() {
+        let l = line_of(it);
+        // 一旦开始折叠，更早的行不再逐条尝试（保持「前面 M 个」的连续语义，
+        // 也避免短行插进长行之间破坏时间序）。
+        if folding || (used + l.len() > PANEL_MAX_BYTES && !kept.is_empty()) {
+            folding = true;
+            skipped += 1;
+            continue;
+        }
+        used += l.len();
+        kept.push(l);
+    }
+    kept.reverse();
+    let mut out = String::new();
+    if skipped > 0 {
+        out.push_str(&format!("- ⏫ 前面还有 {skipped} 个{label}已折叠\n"));
+    }
+    for l in &kept {
+        out.push_str(l);
+    }
+    out
 }
 
 /// 终态 → 工具面板边框色（Running=blue / Done=grey / Error=red）。
@@ -658,9 +743,12 @@ fn cb_button_confirm(
 }
 
 /// 折叠面板头（lcab panelHeader 同款）：markdown 标题 + 展开箭头图标。
+/// P1 第 5 洞（code-review v14）：此处是 md_element* 收口外的 markdown 内容
+/// 旁路——标题同样内建 escape_lt + mask_emails（现有调用方是静态文案
+/// 「🔧 工具轨迹（N）」/:::collapse 标题，零行为变化；新调用方免费获得防线）。
 fn panel_header(title_md: &str) -> serde_json::Value {
     serde_json::json!({
-        "title": { "tag": "markdown", "content": title_md },
+        "title": { "tag": "markdown", "content": escape_lt(&mask_emails(title_md)) },
         "vertical_align": "center",
         "icon": { "tag": "standard_icon", "token": "down-small-ccm_outlined", "size": "16px 16px" },
         "icon_position": "follow_text",
@@ -971,7 +1059,8 @@ pub fn render_stub_card(card: &OutboundCard) -> String {
 /// - 其它工具 → 解析 JSON 走 pretty 打印（解析失败回退原始串）
 ///
 /// 返回 `(markdown 正文, note 提示条列表)`——截断/掩码警告等元信息类注释行
-/// 走 CardKit note 组件（见 [`note_element`]），markdown 正文保留同文案作降级。
+/// 只走 CardKit note 组件（见 [`note_element`]），不再拼进 markdown 正文
+///（P3k，code-review v14：双写双显）。
 fn perm_detail_md(tool_name: &str, input_summary: &str) -> (String, Vec<String>) {
     let summary = tool_summary(tool_name, input_summary);
     let lang = if tool_name == "Bash" || tool_name == "shell" {
@@ -981,13 +1070,13 @@ fn perm_detail_md(tool_name: &str, input_summary: &str) -> (String, Vec<String>)
     };
     // Bash 的命令由下方代码块承载（解码后原文），head 不再重复命令摘要；
     // 其余工具 head 保留单行摘要。
-    // R7（code-review v9 残留）：head 摘要行用户/agent 可控，<at id=…> 注入面
-    // 与正文同权——escape_lt（代码块 body 不转义：CommonMark 代码块内反斜杠
-    // 转义不生效，转义反而破坏显示，见 R13）。
+    // P3j（code-review v14）：head 传**原始内容**——整个 detail 进 md_element
+    // 时统一 escape（代码块 body 在围栏内不转义、head 在围栏外转义），此处外层
+    // 的 escape_lt 会造成 `\<` → `\\<` 双重转义伪影。
     let head = if summary.is_empty() || lang == "bash" {
         format!("**{tool_name}**")
     } else {
-        format!("**{tool_name}** — {}", escape_lt(&summary))
+        format!("**{tool_name}** — {summary}")
     };
     // 真机校准（2026-08）：Bash 审批的代码块直接展示**命令本身**，不再裹 JSON
     // 信封——pretty JSON 会把命令里的引号转义（\"）原样暴露，且 command 在
@@ -1020,17 +1109,18 @@ fn perm_detail_md(tool_name: &str, input_summary: &str) -> (String, Vec<String>)
     // 掩码后的命令执行坏命令。
     let masked = mask_emails(&body);
     let email_masked = masked != body;
-    let mut md = format!("{head}\n```{lang}\n{masked}\n```");
-    // 截断提示进 note 元素（元信息类注释行 CardKit note 化，见 [`note_element`]）。
+    let md = format!("{head}\n```{lang}\n{masked}\n```");
+    // 截断/掩码提示进 note 元素（元信息类注释行 CardKit note 化，见
+    // [`note_element`]）。P3k（code-review v14）：md 正文**不再 append 同文案**
+    // ——调用方已把 notes 渲染为独立 note 元素，此前双写造成「截断/掩码提示
+    // 双显」；纯文本降级路径不消费本函数的 md（降级文案另拼），无需在 md 里
+    // 保留副本。
     let mut notes: Vec<String> = Vec::new();
     if truncated {
         notes.push(format!("…（已截断，仅显示前 {PERM_DETAIL_MAX} 字符）"));
     }
     if email_masked {
         notes.push("⚠️ 邮箱已掩码显示（`[at]`），原命令可直接执行，请勿复制此代码块。".into());
-    }
-    if !notes.is_empty() {
-        md.push_str(&format!("\n\n{}", notes.join("\n\n")));
     }
     (md, notes)
 }
@@ -1255,6 +1345,11 @@ pub(crate) fn render_question_card_note(
     if question.is_empty() || opts.is_empty() {
         return None;
     }
+    // P3i（code-review v14）：选项 label 是 agent 可控回显（可夹带邮箱）——
+    // 下方的展示位全是纯文本字段（plain_text content / 按钮 label / 表单与
+    // 按钮 value），不过 md_element 的掩码收口，构造处统一 mask_emails
+    //（展示 text 与 value 同步处理，回显一致；防裸邮箱触发租户审计整卡 400）。
+    let opts: Vec<String> = opts.into_iter().map(|l| mask_emails(&l)).collect();
     let multi = v
         .pointer("/questions/0/multiSelect")
         .and_then(|m| m.as_bool())
@@ -1383,6 +1478,11 @@ fn render_multi_question_card(
             .filter(|h| !h.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| question.chars().take(10).collect());
+        // P3i（code-review v14）：label/header 是 agent 可控回显且下方落纯文本
+        // 字段（option text/value 无 md_element 掩码收口）——构造处统一
+        // mask_emails（展示与 value 同步；题面 markdown 行经 md_element 自带
+        // 掩码，两路口径一致）。
+        let header = mask_emails(&header);
         let multi = q
             .get("multiSelect")
             .and_then(|m| m.as_bool())
@@ -1390,7 +1490,7 @@ fn render_multi_question_card(
         let mut lines = vec![format!("**{}. {}** — {question}", i + 1, header)];
         let mut opt_values: Vec<serde_json::Value> = Vec::new();
         for o in q.get("options")?.as_array()? {
-            let label = o.get("label")?.as_str()?.trim().to_string();
+            let label = mask_emails(o.get("label")?.as_str()?.trim());
             if label.is_empty() {
                 continue;
             }
@@ -1503,12 +1603,19 @@ pub fn questions_as_text(tool_input: &str) -> Option<String> {
 }
 
 /// 问题卡的「已记录选择」终态（区别于审批卡的已批准/已拒绝）。
+/// P1 第 5 洞（code-review v14）：choice 是用户自由输入的**数据回显**——不做
+/// 语义 markdown。剥反引号（防 `<at id=…>` 借免转义 code span 段通过，也让
+/// 回显不产生 span 语义）后进 md_element（escape 收口，`<` 单次转义）。
+/// 不走完整 sanitize_inline：choice 不落在字面反引号对内（兄弟函数 cancelled/
+/// superseded 的 tool_name 在 code span 里，span 内本就免二次转义），再叠一层
+/// escape_lt_inline 会把 `\<` 二次转义成 `\\<`（v14 P3j 同款双重转义伪影）。
 pub fn render_question_card_resolved(choice: &str) -> String {
+    let echo = choice.replace('`', "'");
     serde_json::json!({
         "schema": "2.0",
         "header": { "title": { "tag": "plain_text", "content": "✅ 已记录选择" }, "template": "grey" },
         "body": { "elements": [
-            md_element(&format!("已记录你的选择：{choice}。任务继续处理中。"))
+            md_element(&format!("已记录你的选择：{echo}。任务继续处理中。"))
         ]}
     })
     .to_string()
@@ -1542,7 +1649,10 @@ pub fn render_permission_card_resolved(tool_name: &str, allowed: bool) -> String
         "schema": "2.0",
         "header": { "title": { "tag": "plain_text", "content": format!("{mark} {verb}") }, "template": "grey" },
         "body": { "elements": [
-            md_element(&format!("`{tool_name}` 的执行询问{verb}，任务继续处理中。"))
+            // P1 第 5 洞（code-review v14）：tool_name 落在一对字面反引号内 =
+            // escape_lt 的免转义 code span 段——过 sanitize_inline 对齐
+            // cancelled/superseded 兄弟函数（剥反引号 + 行内清洗）。
+            md_element(&format!("`{}` 的执行询问{verb}，任务继续处理中。", sanitize_inline(tool_name)))
         ]}
     })
     .to_string()
@@ -1666,17 +1776,14 @@ fn plain_block_elements(body_md: &str) -> Vec<serde_json::Value> {
 
 /// 解析 body_md 里的 markdown 表格为行单元格矩阵（含表头行；分隔行剔除）。
 /// 无表格（< 表头 + 1 数据行）回 None——调用方走平铺降级布局。
+/// P3l（code-review v14）：切分跳过 `\|`（markdown 表格内的转义竖线）——
+/// 此前按裸 `|` 劈开，正文含 `|` 的行（如命令 `a || b`）会把一列劈成多列、
+/// 双列配对错位。单元格里保留 `\|` 原文（未配对行的表格兜底重组仍合法）。
 fn table_rows(body_md: &str) -> Option<Vec<Vec<String>>> {
     let mut rows: Vec<Vec<String>> = body_md
         .lines()
         .filter(|l| l.trim().starts_with('|'))
-        .map(|l| {
-            l.trim()
-                .trim_matches('|')
-                .split('|')
-                .map(|c| c.trim().to_string())
-                .collect::<Vec<_>>()
-        })
+        .map(|l| split_table_row(l.trim()))
         .filter(|cells| !cells.iter().all(|c| c.trim_matches([':', '-']).is_empty()))
         .collect();
     if rows.len() < 2 {
@@ -1688,6 +1795,30 @@ fn table_rows(body_md: &str) -> Option<Vec<Vec<String>>> {
         r.resize(n, String::new());
     }
     Some(rows)
+}
+
+/// 单行表格 → 单元格列表（`\|` 视作单元格内字符，不切列）。
+fn split_table_row(line: &str) -> Vec<String> {
+    let inner = line.trim_matches('|');
+    let mut cells: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if chars.peek() == Some(&'|') => {
+                cur.push('\\');
+                cur.push('|');
+                chars.next();
+            }
+            '|' => {
+                cells.push(cur.trim().to_string());
+                cur.clear();
+            }
+            _ => cur.push(c),
+        }
+    }
+    cells.push(cur.trim().to_string());
+    cells
 }
 
 /// /resume 行的左列元素：来源标记（💻 本机 / 📱 IM）+ 时间 · 内容。
@@ -3581,5 +3712,350 @@ mod tests {
         // 头尾仍是原文的前缀/后缀（char 边界安全，无乱码）。
         let head_ok = long.starts_with(&capped[..capped.find('\n').unwrap_or(0)]);
         assert!(head_ok, "头部为原文前缀");
+    }
+
+    // ------------------------------------------------------------------
+    // code-review v14：P1（<at> 注入第 5 洞）/ P2-2（面板字节预算）/ P3 i·j·k·l
+    // ------------------------------------------------------------------
+
+    /// P1-1：未配对反引号 fail-safe——一个反引号让其后的 `<at id=…>` 落进
+    /// 免转义奇数段的假设被打破，整行回退全量转义；配对反引号行为不变。
+    #[test]
+    fn escape_lt_inline_unpaired_backtick_fail_safe() {
+        // 未配对（1 个反引号 → 2 段）：全部按普通文本转义。
+        let out = escape_lt_inline("x` <at id=\"ou_x\"></at>");
+        assert!(
+            out.contains("\\<at id=\"ou_x\""),
+            "未配对反引号行必须全量转义: {out}"
+        );
+        assert!(
+            !out.contains("<at id=\"ou_x\"></at>"),
+            "不得有免转义段: {out}"
+        );
+        // 配对（2 个反引号 → 3 段）：code span 内原样保留。
+        let paired = escape_lt_inline("`<b>` a < c");
+        assert!(paired.contains("`<b>`"), "配对 span 内不转义: {paired}");
+        assert!(paired.contains("a \\< c"), "span 外照常转义: {paired}");
+        // 无反引号：原行为。
+        assert_eq!(escape_lt_inline("a < b"), "a \\< b");
+    }
+
+    /// P1-2：未闭合 ``` 围栏 fail-safe——此前 in_fence 永久翻转、其后所有行
+    /// 不转义；现最后一个未闭合围栏行之后的内容回退全量转义（围栏行保留）。
+    /// 配对围栏内外的行为不变。
+    #[test]
+    fn escape_lt_unclosed_fence_fail_safe() {
+        let evil = "```rust\ncode <at id=\"ou_victim\"></at>\nmore <";
+        let out = escape_lt(evil);
+        assert!(
+            out.contains("\\<at id=\"ou_victim\""),
+            "未闭合围栏后的注入必须转义: {out}"
+        );
+        assert!(
+            out.contains("more \\<"),
+            "未闭合围栏后的普通 `<` 也转义: {out}"
+        );
+        assert!(out.starts_with("```rust"), "围栏行本身保留: {out}");
+        // 配对围栏：块内 `<` 不转义（R13 行为不变）、块外转义。
+        let ok = escape_lt("```\na < b\n```\nc < d");
+        assert!(ok.contains("a < b"), "配对围栏内不转义: {ok}");
+        assert!(ok.contains("c \\< d"), "围栏外转义: {ok}");
+        // 无围栏：原行为。
+        assert_eq!(escape_lt("x < y"), "x \\< y");
+    }
+
+    /// P1-3/P1-4：resolved 终态卡的数据回显（用户自由输入的 choice / 工具名）
+    /// 不携带语义 markdown——未配对反引号 + `<at>` 组合不得以 bot 名义 @ 任意
+    /// 租户用户。断言走**解码后**的 markdown content（raw JSON 串里反斜杠会被
+    /// 再转义一层，直接 contains 易写错）。
+    #[test]
+    fn resolved_cards_sanitize_echoed_input() {
+        let md_content = |json: &str| -> String {
+            serde_json::from_str::<serde_json::Value>(json)
+                .expect("合法 JSON")
+                .pointer("/body/elements/0/content")
+                .and_then(|c| c.as_str())
+                .expect("content")
+                .to_string()
+        };
+        let q = render_question_card_resolved("x` <at id=\"ou_victim\"></at>");
+        let qc = md_content(&q);
+        assert!(
+            qc.contains("\\<at id=\"ou_victim\""),
+            "choice 回显须转义 at 注入: {qc}"
+        );
+        assert!(
+            !qc.contains("<at id=\"ou_victim\"></at>"),
+            "不得有原始标签: {qc}"
+        );
+        assert!(!qc.contains('`'), "反引号剥除（无 span 语义）: {qc}");
+
+        let p = render_permission_card_resolved("Bash` <at id=\"ou_victim\"></at>", true);
+        let pc = md_content(&p);
+        assert!(
+            pc.contains("\\<at id=\"ou_victim\""),
+            "tool_name 须 sanitize: {pc}"
+        );
+        assert!(
+            !pc.contains("<at id=\"ou_victim\"></at>"),
+            "不得有原始标签: {pc}"
+        );
+    }
+
+    /// P1-5：panel_header 内建转义+掩码（md_element* 收口外的唯一 markdown
+    /// 标题旁路）——静态文案调用方零行为变化，注入内容被拦。
+    #[test]
+    fn panel_header_escapes_and_masks() {
+        let h = panel_header("t <at id=\"ou_v\"></at> a@b.com");
+        let s = h.to_string();
+        assert!(s.contains("\\<at id="), "标题 at 注入须转义: {s}");
+        assert!(s.contains("a[at]b.com"), "标题邮箱须掩码: {s}");
+        // 现有调用方（静态文案）零变化。
+        let plain = panel_header("🔧 工具轨迹（3）").to_string();
+        assert!(plain.contains("🔧 工具轨迹（3）"), "{plain}");
+    }
+
+    /// P2-2：工具面板字节预算——200 个超长工具行折叠为最近若干条 + 顶部
+    /// 「⏫ 前面还有 M 个工具调用已折叠」，render_card JSON 总长有界
+    ///（修前 ~130KB，逼近 30KB 卡上限后 raw 路径流式 patch 全部 200860 拒收）。
+    #[test]
+    fn tool_panel_byte_budget_folds_long_line_sets() {
+        let long_summary = "查".repeat(300);
+        let tools: Vec<ToolCall> = (0..200)
+            .map(|i| ToolCall {
+                name: "Bash".into(),
+                summary: format!("{long_summary}#{i}"),
+                done: true,
+                id: None,
+            })
+            .collect();
+        let card = OutboundCard {
+            task_digest: None,
+            text: "结论".into(),
+            tool_calls: tools,
+            phase: CardPhase::ToolRunning,
+            thoughts: Vec::new(),
+            todos: Vec::new(),
+            queued_hint: None,
+            terminal: CardTerminal::Done,
+            usage_display: None,
+            run_secs: 0,
+        };
+        let json = render_card(&card, "feishu:ou_t", None);
+        assert!(
+            json.contains("⏫ 前面还有"),
+            "超预算必须折叠: {}…",
+            &json[..json.len().min(1_500)]
+        );
+        assert!(json.contains("#199"), "最新一条（199）保留");
+        // JSON 文本里换行是 `\n` 两字符转义形态（Rust 串写作 "\\n"）。
+        assert!(!json.contains("#0\\n"), "最早一条（0）折叠");
+        assert!(json.len() < 45_000, "整卡 JSON 总长有界: {}", json.len());
+        // 小面板（10 条短行）不折叠——终态全量罗列语义不变。
+        let small: Vec<ToolCall> = (0..10)
+            .map(|i| tool("Bash", &format!("cmd-{i}"), true))
+            .collect();
+        let small_card = OutboundCard {
+            task_digest: None,
+            text: "out".into(),
+            tool_calls: small,
+            phase: CardPhase::ToolRunning,
+            thoughts: Vec::new(),
+            todos: Vec::new(),
+            queued_hint: None,
+            terminal: CardTerminal::Done,
+            usage_display: None,
+            run_secs: 0,
+        };
+        let j2 = render_card(&small_card, "feishu:ou_t", None);
+        assert!(!j2.contains("⏫"), "未超预算不折叠: {j2}");
+        assert!(j2.contains("cmd-0"), "全量罗列保留最早: {j2}");
+    }
+
+    /// P2-2 cap 顺序：正文先掩码再截断（对齐 stream 路径）——截断后的残缺
+    /// 邮箱不再匹配掩码正则，裸 @ 会漏出（租户审计拦截整卡）。
+    #[test]
+    fn render_card_masks_before_cap() {
+        // 邮箱横跨头窗字节边界（4082 + 17 = 4099 > 4096）：不先掩码，截断劈在
+        // TLD 中间（"user@example.c"），残缺形态不再匹配掩码正则、裸 @ 漏出。
+        let text = format!("{}user@example.com{}", "a".repeat(4_082), "b".repeat(5_000));
+        let card = OutboundCard {
+            task_digest: None,
+            text,
+            tool_calls: vec![],
+            phase: CardPhase::Thinking,
+            thoughts: Vec::new(),
+            todos: Vec::new(),
+            queued_hint: None,
+            terminal: CardTerminal::Running,
+            usage_display: None,
+            run_secs: 0,
+        };
+        let json = render_card(&card, "feishu:ou_t", None);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let content = v
+            .pointer("/body/elements")
+            .and_then(|e| e.as_array())
+            .and_then(|a| a.first())
+            .and_then(|el| el.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or_default();
+        assert!(
+            content.contains("user[at]"),
+            "先掩后截：@ 已改写 [at]: {content}"
+        );
+        assert!(
+            !content.contains("@example"),
+            "不得漏出裸 @ 邮箱: {content}"
+        );
+    }
+
+    /// P3j：工具/思考面板与审批 head 不再双重转义——原始内容直传
+    /// md_element*（其内部已 escape+mask），`<` 只出现一次反斜杠前缀。
+    #[test]
+    fn no_double_escape_artifacts() {
+        // 工具面板行。
+        let tools = vec![tool("Bash", "echo a<b", true)];
+        let card = OutboundCard {
+            task_digest: None,
+            text: String::new(),
+            tool_calls: tools,
+            phase: CardPhase::ToolRunning,
+            thoughts: Vec::new(),
+            todos: Vec::new(),
+            queued_hint: None,
+            terminal: CardTerminal::Done,
+            usage_display: None,
+            run_secs: 0,
+        };
+        let json = render_card(&card, "feishu:ou_t", None);
+        assert!(
+            json.contains("echo a\\\\<b"),
+            "单次转义（JSON 串内 \\< 呈现 \\\\<）: {json}"
+        );
+        assert!(
+            !json.contains("a\\\\\\\\<b"),
+            "不得出现双重转义伪影: {json}"
+        );
+        // 审批 head（非 Bash 工具的签名行）。
+        let perm = render_permission_card(
+            "Read",
+            r#"{"file_path":"/a/b < c.md"}"#,
+            "feishu:ou_t",
+            "req1",
+            None,
+            300,
+        );
+        assert!(perm.contains("/a/b \\\\< c.md"), "head 单次转义: {perm}");
+        assert!(
+            !perm.contains("/a/b \\\\\\\\< c.md"),
+            "head 不得双重转义: {perm}"
+        );
+    }
+
+    /// P3k：截断/掩码提示只显示一次（独立 note 元素），md 正文不再 append 同文案。
+    #[test]
+    fn perm_detail_notes_not_duplicated_in_md() {
+        // 邮箱放前段（截断前就位——截断只砍尾），长尾凑超 1000 字符触发截断。
+        let long = "x".repeat(1500);
+        let json = render_permission_card(
+            "Bash",
+            &format!(r#"{{"command":"git clone git@github.com:org/repo.git && echo {long}"}}"#),
+            "feishu:ou_t",
+            "req1",
+            None,
+            300,
+        );
+        assert_eq!(
+            json.matches("已截断，仅显示前 1000 字符").count(),
+            1,
+            "截断提示单次: {json}"
+        );
+        assert_eq!(
+            json.matches("邮箱已掩码显示").count(),
+            1,
+            "掩码提示单次: {json}"
+        );
+        assert!(
+            json.contains("[at]github.com"),
+            "邮箱照常掩码（审计强制）: {json}"
+        );
+    }
+
+    /// P3i：问题卡选项 label（agent 可控回显）过 mask_emails——展示 text 与
+    /// value 同步处理，防裸邮箱触发租户审计整卡拒收。
+    #[test]
+    fn question_card_option_labels_masked() {
+        let input = serde_json::json!({
+            "questions": [{
+                "question": "发哪封？",
+                "options": [
+                    {"label": "发给 someone@example.com"},
+                    {"label": "发给 bob@test.org"}
+                ]
+            }]
+        })
+        .to_string();
+        let json = render_question_card(&input, "feishu:ou_q", "reqM", None, 300).expect("应渲染");
+        assert!(
+            json.contains("someone[at]example.com") && json.contains("bob[at]test.org"),
+            "展示位掩码: {json}"
+        );
+        assert!(!json.contains("@example.com"), "不得漏裸邮箱: {json}");
+        assert!(!json.contains("@test.org"), "不得漏裸邮箱: {json}");
+        // value 同步（回传文本与展示一致）。
+        assert!(
+            json.contains("\"imagent_ask\":\"发给 someone[at]example.com\""),
+            "value 同步掩码: {json}"
+        );
+        // 表单形态（>4 选项）与多题形态同样掩码。
+        let many = serde_json::json!({
+            "questions": [{
+                "question": "选？",
+                "options": (1..=6)
+                    .map(|i| serde_json::json!({"label": format!("邮{i}@ex{i}.com")}))
+                    .collect::<Vec<_>>()
+            }]
+        })
+        .to_string();
+        let form = render_question_card(&many, "c", "r", None, 300).expect("应渲染");
+        assert!(form.contains("邮1[at]ex1.com"), "表单 options 掩码: {form}");
+        assert!(!form.contains("@ex1.com"), "{form}");
+        let multi_q = serde_json::json!({
+            "questions": [
+                {"question": "一？", "header": "问一", "options": [{"label":"a@x.io"}]},
+                {"question": "二？", "header": "问二", "options": [{"label":"b@y.io"}]}
+            ]
+        })
+        .to_string();
+        let mq = render_question_card(&multi_q, "c", "r", None, 300).expect("应渲染");
+        assert!(mq.contains("a[at]x.io"), "多题 label 掩码: {mq}");
+        assert!(
+            mq.contains("\"value\":\"问一=a[at]x.io\""),
+            "多题 value 掩码: {mq}"
+        );
+        assert!(!mq.contains("@x.io"), "不得漏裸邮箱: {mq}");
+    }
+
+    /// P3l：表格切分识别 `\|` 转义竖线——正文含 `|` 的行不再被劈成多列，
+    /// /resume、/sessions 的双列配对（按钮 ↔ 行首键）不再错位。
+    #[test]
+    fn table_rows_honor_escaped_pipes() {
+        let body = "| # | 来源 | 内容 |\n|---|---|---|\n| 1 | 💻 | 查 `a \\| b` 的输出 |\n";
+        let rows = table_rows(body).expect("应识别表格");
+        // 分隔行已剔除：rows[0]=表头，rows[1]=数据行。
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0], vec!["#", "来源", "内容"], "表头三列: {rows:?}");
+        assert_eq!(
+            rows[1],
+            vec!["1", "💻", "查 `a \\| b` 的输出"],
+            "转义竖线不切列: {rows:?}"
+        );
+        // 兜底重组（未配对行）仍产出合法 markdown 表格行（保留 `\|` 转义）。
+        let md = format!("|{}|\n", rows[1].join("|"));
+        assert!(md.contains("a \\| b"), "重组保留转义形态: {md}");
+        // 无转义竖线的行为不变。
+        let plain = table_rows("| a | b |\n|---|---|\n| 1 | 2 |").expect("应识别");
+        assert_eq!(plain[1], vec!["1", "2"]);
     }
 }
