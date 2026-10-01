@@ -44,7 +44,7 @@ hex = "0.4"
 aes-gcm = "0.10"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 sha2 = "0.10"
-hmac = { version = "0.12", default-features = false }
+hmac = { version = "0.13", default-features = false }
 
 # 存储 / 工具
 # bundled SQLite 的 CVE 不进 cargo-audit（audit 只看 RUSTSEC，bundled 的 C 代码
