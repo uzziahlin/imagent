@@ -11,9 +11,11 @@
 //! - `send_typing()`：no-op（WeCom 协议无 typing 语义）。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::{mpsc, Mutex};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use imagent_core::{
@@ -74,6 +76,46 @@ fn wecom_split_cap(message_max_len: Option<usize>) -> usize {
         .clamp(WECOM_MIN_SPLIT_BYTES, WECOM_TEXT_MAX_BYTES)
 }
 
+/// P2-1（code-review v14）：出站帧发送等待上限。出站 channel（容量 64）满且
+/// client 侧消费停滞（WS 断连重连退避中 / 认证失败 / 收发循环卡死）时
+/// `send().await` 会无限挂起——上层 dispatch 整轮 await 随之卡死，用户得不到
+/// 任何反馈。5s 对正常路径（client 收发循环毫秒级消费）绰绰有余；超时即向上
+/// 抛用户可见错误，对齐 ilink sendmessage「失败即报」的语义。
+const OUTBOUND_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 单片出站发送：有界等待 + 统一错误文案（报出分片序号）。
+///
+/// P2-1（code-review v14）：超时/关闭都转为用户可见的 `Err`。取消 `send`
+/// future 时存在 permit 刚好取得的小竞窗（帧可能已入队），故超时文案用
+/// 「可能未送达」而非「未送达」。多片循环里任一片失败即由调用方 `?` 中断
+/// 返回——前面片已缺时继续发后续片只会让截断更难被用户感知。
+async fn send_frame_bounded(
+    tx: &mpsc::Sender<OutboundFrame>,
+    frame: OutboundFrame,
+    idx: usize,
+    total: usize,
+) -> Result<()> {
+    match tokio::time::timeout(OUTBOUND_SEND_TIMEOUT, tx.send(frame)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(CoreError::Platform(
+            PLATFORM,
+            format!(
+                "第 {}/{} 片发送失败（回复可能被截断）：出站 channel 已关闭（client 已退出）",
+                idx + 1,
+                total
+            ),
+        )),
+        Err(_) => Err(CoreError::Platform(
+            PLATFORM,
+            format!(
+                "第 {}/{} 片发送超时（WS 断连或认证失败），本片可能未送达（回复可能被截断）",
+                idx + 1,
+                total
+            ),
+        )),
+    }
+}
+
 /// 企业微信 Platform 适配器。
 ///
 /// 持有两条 channel 与后台 client task 通信：出站帧（发给企微）、入站帧（企微
@@ -89,6 +131,11 @@ pub struct WeComPlatform {
     /// （config 未设 = 仅协议上限）。注：config 按字符计、企微按字节计，跨单位
     /// 取 min 偏保守（多切不少切），满足「配置上限不被平台放大」的语义。
     text_split_max_bytes: usize,
+    /// P3-g（code-review v14）：停机信号。`Drop` 时 cancel——后台 client run /
+    /// drain 任务随之退出。此前两个后台任务与进程同生命周期，平台 drop 后仍
+    /// 无限重连，是潜伏问题（测试隔离、多 profile 热替换场景会泄漏旧连接循环）；
+    /// 修成显式可控的停机通路。
+    shutdown: CancellationToken,
 }
 
 impl WeComPlatform {
@@ -114,9 +161,18 @@ impl WeComPlatform {
         };
         let reconnect = std::sync::Arc::new(tokio::sync::Notify::new());
         let reconnect_for_task = reconnect.clone();
+        // P3-g（code-review v14）：停机信号与 client run / drain 两个后台任务共享，
+        // `Drop for WeComPlatform` 时 cancel。
+        let shutdown = CancellationToken::new();
+        let shutdown_for_client = shutdown.clone();
         tokio::spawn(async move {
             client
-                .run(inbound_frame_tx, outbound_rx, reconnect_for_task)
+                .run(
+                    inbound_frame_tx,
+                    outbound_rx,
+                    reconnect_for_task,
+                    shutdown_for_client,
+                )
                 .await;
         });
 
@@ -125,9 +181,18 @@ impl WeComPlatform {
         let (inbound_msg_tx, inbound_msg_rx) = mpsc::channel::<InboundMessage>(64);
         // P1-I：msgid 滑动窗口去重（复用 core::Dedup，与 ilink 同源），重复回调丢弃。
         let dedup = Dedup::default();
+        let shutdown_for_drain = shutdown.clone();
         tokio::spawn(async move {
             let mut inbound_frame_rx = inbound_frame_rx;
-            while let Some(frame) = inbound_frame_rx.recv().await {
+            loop {
+                // P3-g（code-review v14）：停机检查优先于收帧——cancel 后即使
+                // frame channel 仍有积压也立即退出（与 client run 同款检查）。
+                if shutdown_for_drain.is_cancelled() {
+                    break;
+                }
+                let Some(frame) = inbound_frame_rx.recv().await else {
+                    break;
+                };
                 match parse_msg_callback(&frame) {
                     Ok((msgid, msg)) => {
                         if !dedup.check(&msgid) {
@@ -151,7 +216,18 @@ impl WeComPlatform {
             reconnect,
             inbound_rx: Arc::new(Mutex::new(inbound_msg_rx)),
             text_split_max_bytes: wecom_split_cap(message_max_len),
+            shutdown,
         }
+    }
+}
+
+/// P3-g（code-review v14）：显式停机通路——平台 drop 即 cancel，后台 client
+/// run / drain 任务感知后退出，不再无限重连。进程级退出场景由 OS 兜底回收，
+/// 此 Drop 主要覆盖测试隔离与多 profile 热替换（旧 bot 实例被替换掉时其重连
+/// 循环必须随之消亡）。
+impl Drop for WeComPlatform {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
     }
 }
 
@@ -179,16 +255,9 @@ impl Platform for WeComPlatform {
             };
             let frame = build_send_markdown_frame(&userid, &content);
             // P5：中途失败标明分片序号——用户能感知回复被截断而非静默缺尾。
-            self.outbound_tx.send(frame).await.map_err(|_| {
-                CoreError::Platform(
-                    PLATFORM,
-                    format!(
-                        "第 {}/{} 片发送失败（回复可能被截断）：出站 channel 已关闭（client 已退出）",
-                        i + 1,
-                        total
-                    ),
-                )
-            })?;
+            // P2-1（code-review v14）：`?` 失败即中断——后续片不再发（send_frame_bounded
+            // 内有 5s 有界等待，channel 满且 client 停滞时不再无限挂起 dispatch）。
+            send_frame_bounded(&self.outbound_tx, frame, i, total).await?;
         }
         Ok(())
     }
@@ -469,5 +538,74 @@ mod tests {
             let chunks = split_text_by_bytes(&text, cap.max(4));
             assert!(!chunks.is_empty());
         }
+    }
+
+    // ------------------------------------------------------------------
+    // P2-1（code-review v14）：出站发送有界等待
+    // ------------------------------------------------------------------
+
+    /// channel 满且无人消费 → 超时返回用户可见错误（而非无限挂起），文案带
+    /// 分片序号。start_paused 让 5s 超时在 mock 时钟上瞬时推进，测试不真等。
+    #[tokio::test(start_paused = true)]
+    async fn send_frame_bounded_times_out_when_channel_full() {
+        let (tx, _rx_never_consumed) = mpsc::channel::<OutboundFrame>(1);
+        // 占满唯一容量。
+        tx.send(build_send_markdown_frame("u", "filler"))
+            .await
+            .unwrap();
+        let frame = build_send_markdown_frame("u", "second");
+        let e = send_frame_bounded(&tx, frame, 1, 2).await.unwrap_err();
+        let msg = format!("{e}");
+        assert!(msg.contains("发送超时"), "应为超时错误：{msg}");
+        assert!(msg.contains("WS 断连或认证失败"), "应说明可能原因：{msg}");
+        assert!(msg.contains("2/2"), "文案应含分片序号：{msg}");
+    }
+
+    /// channel 关闭（client 退出）→ 立即失败，文案区分于超时。
+    #[tokio::test]
+    async fn send_frame_bounded_reports_closed_channel() {
+        let (tx, rx) = mpsc::channel::<OutboundFrame>(1);
+        drop(rx);
+        let e = send_frame_bounded(&tx, build_send_markdown_frame("u", "x"), 0, 1)
+            .await
+            .unwrap_err();
+        let msg = format!("{e}");
+        assert!(msg.contains("已关闭"), "应为 channel 关闭错误：{msg}");
+        assert!(msg.contains("1/1"), "文案应含分片序号：{msg}");
+    }
+
+    /// 正常路径：channel 畅通 → 立即 Ok，帧原样送达。
+    #[tokio::test]
+    async fn send_frame_bounded_ok_when_channel_drained() {
+        let (tx, mut rx) = mpsc::channel::<OutboundFrame>(8);
+        // 消费者持续在收，发送应立即成功。
+        let rx_handle = tokio::spawn(async move {
+            let _ = rx.recv().await;
+        });
+        send_frame_bounded(&tx, build_send_markdown_frame("u", "hi"), 0, 1)
+            .await
+            .expect("畅通 channel 应 Ok");
+        rx_handle.await.unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // P3-g（code-review v14）：停机通路
+    // ------------------------------------------------------------------
+
+    /// Drop 平台必须 cancel 停机信号（后台 client/drain 任务据此退出）。
+    /// ws_url 用 wss + loopback 端口 1：过 validate_ws_url 且连接立即被拒，
+    /// 后台 run 任务只在退避循环空转，测试不产生真实外连。
+    #[tokio::test]
+    async fn drop_platform_cancels_shutdown_token() {
+        let p = WeComPlatform::new(
+            "bot".into(),
+            "secret".into(),
+            "wss://127.0.0.1:1".into(),
+            None,
+        );
+        let token = p.shutdown.clone();
+        assert!(!token.is_cancelled());
+        drop(p);
+        assert!(token.is_cancelled(), "Drop 必须 cancel 停机信号");
     }
 }

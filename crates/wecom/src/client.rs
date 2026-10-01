@@ -46,14 +46,23 @@ impl WeComWsClient {
     /// 一旦返回（Err 或 Ok）即按指数退避 sleep 后重连。退避在每次成功建连后重置。
     /// `reconnect`（P4-7 `/reconnect`）：notify_one 唤醒 select 丢弃 connect_and_serve
     /// future（连接随 future drop 关闭）→ 退避后重连；退避 sleep 期间通知存 permit。
+    /// `shutdown`（P3-g，code-review v14）：停机信号——平台 drop 后 run 不再无限
+    /// 重连：每轮迭代开头检查 + select 分支打断连接保持态 + 退避 sleep 也可被打断。
     pub async fn run(
         self,
         inbound_tx: mpsc::Sender<InboundFrame>,
         mut outbound_rx: mpsc::Receiver<OutboundFrame>,
         reconnect: std::sync::Arc<tokio::sync::Notify>,
+        shutdown: tokio_util::sync::CancellationToken,
     ) {
         let mut backoff = Duration::from_secs(1);
         loop {
+            // P3-g（code-review v14）：每轮重连迭代开头检查停机信号——此前 run 与
+            // 进程同生命周期，平台 drop 后仍无限重连（潜伏的资源泄漏面）。
+            if shutdown.is_cancelled() {
+                info!(target: "wecom", "停机信号已置位，client run 退出");
+                return;
+            }
             tokio::select! {
                 res = self.connect_and_serve(&inbound_tx, &mut outbound_rx) => match res {
                     Ok(()) => {
@@ -72,11 +81,24 @@ impl WeComWsClient {
                 _ = reconnect.notified() => {
                     info!(target: "wecom", "收到 /reconnect 指令，主动断开重连");
                     backoff = Duration::from_secs(1);
+                },
+                // P3-g：连接保持期间（connect_and_serve 正常态永不返回）也要能
+                // 响应停机——select 丢弃其 future，连接随 future drop 关闭。
+                _ = shutdown.cancelled() => {
+                    info!(target: "wecom", "收到停机信号，client run 退出");
+                    return;
                 }
             }
             // P1：退避加 ±20% 随机 jitter（防多实例同步重连风暴），基础值仍按
             // 指数增长（jitter 不参与翻倍，避免抖动累积漂移）。
-            tokio::time::sleep(jittered_backoff(backoff, rand_jitter())).await;
+            // P3-g：退避 sleep 同样可被停机信号打断——最坏 30s 退避不拖住停机。
+            tokio::select! {
+                _ = tokio::time::sleep(jittered_backoff(backoff, rand_jitter())) => {}
+                _ = shutdown.cancelled() => {
+                    info!(target: "wecom", "停机信号打断退避等待，client run 退出");
+                    return;
+                }
+            }
             backoff = (backoff * 2).min(BACKOFF_CAP);
         }
     }
@@ -426,11 +448,65 @@ mod tests {
 
         let res = tokio::time::timeout(
             Duration::from_millis(200),
-            client.run(inbound_tx, outbound_rx, reconnect),
+            client.run(
+                inbound_tx,
+                outbound_rx,
+                reconnect,
+                tokio_util::sync::CancellationToken::new(),
+            ),
         )
         .await;
         // run 永不返回 → timeout 触发（Err(Elapsed)）= 正常。
         assert!(res.is_err(), "run 应持续重连而非返回");
+    }
+
+    /// P3-g（code-review v14）：停机通路——已 cancel 的 token 让 run 立即返回，
+    /// 不再进入无限重连循环。
+    #[tokio::test]
+    async fn run_returns_promptly_on_cancelled_token() {
+        let client = WeComWsClient {
+            bot_id: "b".into(),
+            secret: "s".into(),
+            ws_url: "ws://127.0.0.1:1".into(),
+        };
+        let (inbound_tx, _inbound_rx) = mpsc::channel::<InboundFrame>(8);
+        let (_outbound_tx, outbound_rx) = mpsc::channel::<OutboundFrame>(8);
+        let reconnect = std::sync::Arc::new(tokio::sync::Notify::new());
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let res = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.run(inbound_tx, outbound_rx, reconnect, token),
+        )
+        .await;
+        assert!(res.is_ok(), "已取消的 token 应让 run 直接退出");
+    }
+
+    /// P3-g（code-review v14）：退避等待期间 cancel 也能打断——run 在 2s 窗口内
+    /// 返回（旧实现退避最长 30s 且无停机通路，永不返回）。
+    #[tokio::test]
+    async fn run_cancel_during_backoff_exits() {
+        let client = WeComWsClient {
+            bot_id: "b".into(),
+            secret: "s".into(),
+            ws_url: "ws://127.0.0.1:1".into(),
+        };
+        let (inbound_tx, _inbound_rx) = mpsc::channel::<InboundFrame>(8);
+        let (_outbound_tx, outbound_rx) = mpsc::channel::<OutboundFrame>(8);
+        let reconnect = std::sync::Arc::new(tokio::sync::Notify::new());
+        let token = tokio_util::sync::CancellationToken::new();
+        let t2 = token.clone();
+        tokio::spawn(async move {
+            // 第一次连接失败进入退避后再 cancel。
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            t2.cancel();
+        });
+        let res = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.run(inbound_tx, outbound_rx, reconnect, token),
+        )
+        .await;
+        assert!(res.is_ok(), "退避中的 cancel 应让 run 及时退出");
     }
 
     /// P6 遗留补齐：凭据探针——连不上的地址应返回 Err（而非挂起/panic）。

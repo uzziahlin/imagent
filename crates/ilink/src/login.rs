@@ -19,6 +19,12 @@ use imagent_store::Store;
 use crate::client::DEFAULT_BASE_URL;
 use crate::proto::{QrcodeResp, QrcodeStatus};
 
+/// P2-3（code-review v14）：轮询 get_qrcode_status 的最小间隔下限。服务端正常
+/// 长轮询会 hold ~35s 才返回，此下限无感；但 wait/scaned/None 等分支遇服务端
+/// 立即返回（异常/网关直答）时，无节流的 `continue` 会紧密轮询——打爆请求
+/// 配额且易触发风控。与模块头注释「~2s 间隔」对齐。
+const POLL_MIN_INTERVAL: Duration = Duration::from_secs(2);
+
 /// 登录所得凭据（落盘 `credentials.blob`）。
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Credentials {
@@ -47,6 +53,11 @@ pub async fn login_flow(store: &Store) -> Result<Credentials> {
 
 /// 可指定 base URL 的登录流程（便于测试/灰度）。
 pub async fn login_flow_with_base(store: &Store, base_url: &str) -> Result<Credentials> {
+    // P2-3（code-review v14）：入参 base_url 过同款白名单校验——此前只校验
+    // 服务端回传的 baseurl（confirmed 分支），调用方传入的 base_url 直接拼进
+    // get_bot_qrcode/get_qrcode_status 的 URL，测试/灰度配错时登录流量（携带
+    // 回传凭据）可能被导向非预期域名。白名单与运行时一致：https + *.weixin.qq.com。
+    let base_url = &validate_baseurl(base_url)?;
     let http = reqwest::Client::builder()
         // get_qrcode_status 是长轮询，未扫码时服务端 hold ~35s 才返回，
         // 故 client 超时需覆盖该窗口（留足余量）。
@@ -87,12 +98,17 @@ pub async fn login_flow_with_base(store: &Store, base_url: &str) -> Result<Crede
     print_qrcode(&qr_scan_data);
     tracing::info!(target: "ilink", "qrcode printed; waiting for scan…");
 
-    // 2. 轮询扫码状态（长轮询：未扫码时服务端 hold ~35s 才返回，正常）
+    // 2. 轮询扫码状态（长轮询：未扫码时服务端 hold ~35s 才返回，正常）。
+    // P2-3（code-review v14）：每个继续轮询的分支统一 sleep POLL_MIN_INTERVAL
+    //（2s 下限）——服务端 hold ~35s 时无感，立即返回时防紧密轮询。
     loop {
         let endpoint = format!("/ilink/bot/get_qrcode_status?qrcode={qrcode_value}");
         let st: QrcodeStatus = post_noauth(&http, base_url, &endpoint, &body).await?;
         match st.status.as_deref() {
-            Some("wait") | Some("scaned") => continue,
+            Some("wait") | Some("scaned") => {
+                tokio::time::sleep(POLL_MIN_INTERVAL).await;
+                continue;
+            }
             Some("scaned_but_redirect") => {
                 // P1：仅 log redirect_host，不切换 base_url
                 tracing::info!(
@@ -100,6 +116,7 @@ pub async fn login_flow_with_base(store: &Store, base_url: &str) -> Result<Crede
                     redirect_host = ?st.redirect_host,
                     "qrcode scanned, redirect indicated (ignored at P1)"
                 );
+                tokio::time::sleep(POLL_MIN_INTERVAL).await;
                 continue;
             }
             Some("expired") => {
@@ -139,7 +156,12 @@ pub async fn login_flow_with_base(store: &Store, base_url: &str) -> Result<Crede
                     format!("unknown qrcode status: {other}"),
                 ))
             }
-            None => continue,
+            // P2-3（code-review v14）：None（响应缺 status 字段）此前裸 continue
+            // 无节流——服务端异常返回无 status 的响应时会忙轮询，同 wait 处理。
+            None => {
+                tokio::time::sleep(POLL_MIN_INTERVAL).await;
+                continue;
+            }
         }
     }
 }
@@ -221,7 +243,16 @@ fn validate_baseurl(raw: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_baseurl;
+    use std::time::Duration;
+
+    use super::{validate_baseurl, POLL_MIN_INTERVAL};
+
+    /// P2-3（code-review v14）：轮询节流下限钉在 2s——与模块头「~2s 间隔」
+    /// 注释一致；回退到无节流（0s）会让立即返回的服务端形态被紧密轮询。
+    #[test]
+    fn poll_interval_floor_is_2s() {
+        assert_eq!(POLL_MIN_INTERVAL, Duration::from_secs(2));
+    }
 
     #[test]
     fn baseurl_default_ok() {
