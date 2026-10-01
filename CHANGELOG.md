@@ -2,6 +2,48 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.30.0] — 2026-10-02
+
+> **还债批**（code-review v14 结构债五件套）：main.rs 拆分、feishu per-card
+> 单表化 + 渲染等价性测试、Platform 能力协商（PlatformCaps）、deploy 合流 +
+> 文档单一事实源 CI 断言、出站可靠性收敛（core OutboxDriver）。行为保持为
+> 主，wecom 断连期回复不再丢失。全仓 934 tests / clippy / fmt / docs 断言
+> 全绿。另核实 rusqlite 升级债已于 2026-09-27 还清（0.40.2 / SQLite 3.53.2）。
+
+### Added
+- **`imagent service print`**：幂等打印 launchd/systemd 单元文件（`--format
+  --exe --platform --log-path --with-env`，不安装不动文件不需 root）——
+  deploy/ 模板改由生成器刷新，`--platform` 缺失的历史分叉消除
+- **PlatformCaps 能力协商**：Platform trait 十能力位（手写 bitflags 零依赖），
+  feishu 全亮 / wecom / ilink 如实声明；`/doctor` 新增平台能力节 +
+  `reply_mode=card`×非卡片平台警告；启动日志打出能力矩阵
+- **core OutboxDriver**：store 持久化出站队列泛化（退避/超限丢弃/停机/
+  per-conv 序）；**wecom 接入**——断连（channel 关闭）期间回复剩余分片转存
+  outbox、恢复后自动送达（「宁丢勿重」：超时类可能已送达故不入队，防止
+  重复）；feishu 泵完整迁移至共享 driver（幂等 uuid 透传保留，行为不变）
+- **文档单一事实源 CI 断言**：`scripts/check_docs.sh` + CI `docs` job——
+  schema 版本 / CODE_REVIEW 轮次 / 工作区版本三处漂移自动拦截（当前指称
+  校准 schema v16）
+
+### Changed
+- **main.rs 拆分**：3717 → 1484 行，webhook/backup/ops 三模块（纯搬移，
+  CLI / 行为 / tracing target 不变）；六段「config ∪ store」并集样板与
+  SIGHUP/Start 装配收敛为共享函数——双清单漂移（历史 bug 温床）结构性消除
+- **feishu per-card 状态单表化**：三张平行 map → CardState 单表，终态清理
+  6 处收敛到 release_card 单点，cap 整体 clear 改 LRU 驱逐（活跃卡不再被
+  误伤）；300317 CAS 守卫不再跨网络调用存活
+- **渲染层等价性测试**：22 个渲染入口 × 5 条不变量（裸 `<at>` 只许合法
+  构造点 / 掩码一致 / 截断标记恰一次 / 无双转义 / 面板有界）——防「同一
+  不变量多路径口径漂移」回归（历史每个注入洞的成因）
+- wecom crate 新增 imagent-store 依赖（outbox 接入）
+
+### Fixed
+- resolved 卡族（permission/question）多行 tool_name 双重转义 `\<` 伪影
+  （等价性测试钉出：sanitize_inline 预转义 + md_element 再转义）
+- 时序脆弱测试加固（tarpaulin 插桩变慢曾致 coverage 两连红）：ilink
+  ratelimit 冷却断言改时钟边界补偿；store busy_backoff 退避参数化（测试
+  注入 1.5s）+ 10ms 容差改秒级余量
+
 ## [1.29.0] — 2026-10-01
 
 > **code-review v14 修复批**（第 14 轮全量对抗审查，3 P1 + 13 P2 + 30+ P3
