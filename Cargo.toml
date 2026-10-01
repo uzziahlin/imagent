@@ -67,7 +67,7 @@ rpassword = "7"
 # 格式指标（registry/text encoding），关掉 protobuf 导出器特性即可移除该依赖。
 prometheus = { version = "0.13", default-features = false }
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
-axum = "0.7"
+axum = "0.8"
 # ACP（Agent Client Protocol）：claude-agent-acp 长驻子进程模式（agent-client-protocol SDK）
 agent-client-protocol = "1"
 # 飞书 open-lark SDK（package name=openlark，lib name=open_lark，二者不同名是 SDK 设计）
