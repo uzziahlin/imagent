@@ -2,6 +2,94 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.29.0] — 2026-10-01
+
+> **code-review v14 修复批**（第 14 轮全量对抗审查，3 P1 + 13 P2 + 30+ P3
+> 全数修复）：`<at>` 注入第 5 洞收口、off × claude-acp 权限语义统一、排队
+> 孤儿队列竞态、引用回复审批词守卫、SIGHUP 双清单收敛、webhook 防重放
+> SQLite 持久化（schema v16）。全仓 966 tests / clippy / fmt 全绿。
+
+### Security
+- **`<at>` 注入第 5 洞**（card.rs）：`escape_lt_inline` 的「奇数段=code span
+  免转义」假设可被未配对反引号翻转——问题卡自由输入/恶意 MCP 工具名里的
+  `<at id=…>` 以 bot 名义 @ 任意租户用户。三处收口：未配对反引号整行回退
+  全量转义（fail-safe）；未闭合围栏同理；choice 回显剥反引号、resolved 卡
+  tool_name 过 `sanitize_inline`；`panel_header` 内建转义
+- **off/auto × claude-acp 语义反转**：同为 FullLoop 的两个后端在
+  `permission_mode=off`（及 auto 默认解析）下行为相反——cli 经 canUseTool
+  闸门 deny、acp 自动放行全部权限请求。统一为「Off = 网关不代答，交 agent
+  自身策略」：cli Control 通道 off 档不再附加 `--permission-prompt-tool`
+  （headless 自拒未批工具）；ACP `Auto` 防御分支从 fail-open 改 fail-closed
+  拒绝；能力矩阵新增 off × acp 象限告警（启动/SIGHUP//perm 三点），修正
+  `resolve()` 过时注释
+- **`/status` 跨会话信息泄露**：非 admin 不再看到其它会话的在飞任务
+  prompt 摘要（本 conv 明细 + 全局计数保留）
+
+### Fixed
+- **排队孤儿队列竞态**（dispatch）：QueuePending 回写与 runner 取空交还
+  身份非原子——persist 窗口内 runner 退出后回写重建无 runner 的队列，会话
+  永久停摆且超限消息丢失（旧注释「等下一条消息激活」断言不成立）。回写
+  临界区发现 `queue=None` 时本条接棒成为 runner
+- **/stop 在并发闸门排队期间失效**：permit 等待窗口内设置的停止标记被
+  水位基线吞掉、轮次照常起跑——拿到 permit 后补无条件拦截
+- **引用回复审批词被引文污染**：守卫 `len()>4` 按字节，中文审批词
+  （允许/没问题）与 always 漏拦，引文前置后全字匹配失败 → 批准变拒绝。
+  改为审批词表 + `ask:`/斜杠前缀命中即跳过注入
+- **raw 卡路径长任务流式全灭**：工具/思考面板无字节上限，约 40 个工具
+  逼近 30KB 卡上限，话题群/降级部署整轮流式更新被 200860 拒收。面板加
+  10KB 折叠预算（「前面还有 M 个已折叠」）
+- **话题群上下文击穿话题隔离**：群上下文注入按整群拉取，话题 B 的消息
+  进话题 A 的 agent prompt——按 root_id 过滤，字段缺失跳过注入（宁缺
+  毋跨话题）+ 15s 拉取去抖
+- **wecom 发送无限挂起**：出站 channel 满且 client 停止消费时 send 永久
+  await——5s 超时返回用户可见错误
+- **ilink 媒体下载阻塞所有会话**：批内顺序 45s×N 改并发下载（4 并发
+  限流）+ 单消息 60s 总预算；登录轮询补 2s 节流下限（风控红线）
+- **SIGHUP 静默降级三链**：权限档位改按**运行中后端**解析（agent 改动
+  未重启不再把 cli 从审批闭环跌到 off）；12 个不可热载键变更打 error
+  「需重启生效」；config 字段文档补标注
+- **webhook/metrics bind fail-open**：webhook 端口占用改为拒绝启动
+  （fail-closed）；`/health` 新增 `webhook_listening`/`metrics_listening`
+- **`require_keyring=true` 对 login 失效**：`imagent login` 现加载 config
+  并生效该开关（headless 明文落盘拦截回到承诺行为）
+- **webhook 防重放重启失忆**：签名去重持久化 SQLite（schema v16），429
+  被拒不再占用签名（GitHub 同 delivery 重试不再吃 409）
+- **ACP/CLI 子进程收尾**：stdin_writer 无超时可挂到看门狗（补 5s）；stdout
+  正文 16MB 总量帽（stderr 64KB 同款）；claude 系 /resume 扫描下放
+  blocking 池
+- **feishu 批**：群上下文缺时间条目 0 沉底；引用合并转发 1500 截断补标记
+  + 嵌套展开按需开关；空 items 走 Fallback 不再「共 0 条」；`@_user_N`
+  前缀碰撞；转录基座超预算；选项 label 补邮箱掩码；双重转义伪影；提示
+  双显；`\|` 表格转义；footer 失败回滚；心跳驱动重建卡片；outbox 未知
+  kind 推后告警 + 重发幂等 uuid 持久化；429 尊重 Retry-After；URL path id
+  白名单校验；create 路径入回复即定向账本；ASR 90s 超时；媒体/转录/上下文
+  作业 8 并发信号量
+- **store/入口批**：并发首开迁移竞态收事务（BEGIN IMMEDIATE 内读
+  user_version）；PBKDF2 派生缓存（键含 passphrase）；service install env
+  快照补 PASSPHRASE/HTTP_TOKEN/ACP_COMMAND + enc 凭据缺 passphrase 拦截；
+  setup 向导 TOML 转义 + secret 关回显（rpassword）；异常退出先清理
+  permission.sock/token；outbox 同秒到期按 id 决胜
+- **ilink/wecom 批**：SessionExpired 改 typed 判定（不靠 Display 子串）；
+  发送重试收口共用 helper（补 media 路径熔断日志）；退避 sleep 移出锁外
+  （peer A 重试不再卡 peer B）；wecom 补 CancellationToken 停机通路
+
+### Added
+- `imagent login wecom`：secret 入 store 凭据通道（keyring/加密回退），
+  config 明文作兼容回退
+- 能力矩阵 off × claude-acp 告警；`/health` 监听状态字段；fuzz CI 补
+  `wecom_frame_parse` target
+
+### Changed
+- **off 档语义统一**（行为变更）：cli Control 通道 off 不再挂审批通道
+  （headless claude 按自身策略拒绝未批工具，与「网关不代答」一致）；
+  ACP `Auto` 防御分支 fail-closed
+- **schema v15 → v16**：新增 `webhook_seen` 防重放去重表（线性迁移，
+  老库自动升级）
+- 依赖清理：删除三平台 crate 共 9 个未使用依赖（anyhow/thiserror/ecb/
+  dirs）；新增 rpassword（setup secret 回显）
+- ACP 子进程树收割的已知限制如实记档（SDK 无注入点，孙进程可能存活，
+  见 SECURITY.md 已知限制节——修正原先「无泄漏」的错误断言）
+
 ## [1.28.4] — 2026-09-29
 
 > **转录真机批**（agent 转录盲区清单四连修）：嵌套合并转发有界展开、卡片
