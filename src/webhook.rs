@@ -90,6 +90,13 @@ const REPLAY_SEEN_CAPACITY: usize = 1024;
 /// 覆盖绝大多数重试/重放场景。
 const REPLAY_SEEN_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
+/// webhook 入站路由模式（axum 0.8 / matchit 0.8 语法 `{token}`）。**版本错位
+/// 警示**：axum 0.7/matchit 0.7 的参数语法是 `:token`，`{token}` 在其下会被当
+/// **字面量段**——编译照过、运行时 webhook 全量 404（依赖升级批曾实际踩到：
+/// axum pin 漏改时路由字符串已先行切换）。路由匹配回归测试钉在
+/// `hook_route_matches_under_current_axum`。
+const HOOK_ROUTE: &str = "/hook/{token}";
+
 impl ReplayGuard {
     /// 首见（或条目已过 TTL）→ 记录并放行（true）；TTL 内重复 → 判定
     /// 重放（false）。`now` 由调用方传入便于单测拨钟。
@@ -274,7 +281,7 @@ impl TokenBucket {
 /// `X-Hub-Signature-256: sha256=<hex>`（也兼容裸 hex 的 `X-Signature` 形态）。
 /// 常数时间比较（防时序侧信道）；hex 解码失败/长度不符直接 false。
 fn verify_webhook_signature(secret: &str, body: &[u8], header_value: &str) -> bool {
-    use hmac::Mac as _;
+    use hmac::{KeyInit as _, Mac as _};
     let hex_sig = header_value
         .strip_prefix("sha256=")
         .unwrap_or(header_value)
@@ -340,7 +347,7 @@ pub(crate) fn spawn_webhook_server(
     // 优雅关停让客户端拿到连接关闭而非假 202。
     let shutdown = state.dispatcher.shutdown_token();
     let app = Router::new()
-        .route("/hook/:token", post(webhook_handler))
+        .route(HOOK_ROUTE, post(webhook_handler))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(state);
     tokio::spawn(async move {
@@ -691,7 +698,7 @@ fn webhook_body_text_variants() {
 /// 与裸 hex 两形态）。
 #[test]
 fn webhook_signature_verify() {
-    use hmac::Mac as _;
+    use hmac::{KeyInit as _, Mac as _};
     let secret = "topsecret-0123456789";
     let body = br#"{"text":"hi"}"#;
     let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
@@ -771,7 +778,7 @@ fn github_event_summary_variants() {
 mod webhook_replay_tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue};
-    use hmac::Mac as _;
+    use hmac::{KeyInit as _, Mac as _};
 
     const SECRET: &str = "topsecret-0123456789";
 
@@ -1039,4 +1046,47 @@ mod webhook_replay_tests {
         // 空表 + 非 loopback：server 本就不启动，校验不阻拦（保持既有 warn 路径）。
         assert!(validate_webhook_bind(pub_addr, &[]).is_ok());
     }
+}
+
+/// 依赖升级批（v1.30.1）回归：`HOOK_ROUTE` 的参数语法必须与**当前 axum 版本**
+/// 的 matchit 语法一致——axum 0.7 下 `{token}` 是字面量段（编译照过、运行时
+/// webhook 全量 404）。用同一常量装一枚极简 router、原生 TCP 发真实 POST，
+/// 断言拿到非 404 响应（这里 handler 恒回 200，路由不匹配才会 404）——
+/// axum 升降版本时若语法错位，本测试直接红。
+#[tokio::test]
+async fn hook_route_matches_under_current_axum() {
+    use axum::routing::post;
+
+    let app = axum::Router::new().route(HOOK_ROUTE, post(|| async { axum::http::StatusCode::OK }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    // 环境代理不得劫持 loopback 直连。
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    use tokio::io::AsyncWriteExt as _;
+    stream
+        .write_all(
+            b"POST /hook/some-token-value HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    use tokio::io::AsyncReadExt as _;
+    let _ = stream.read_to_end(&mut buf).await.unwrap();
+    let head = String::from_utf8_lossy(&buf);
+    let status = head
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default();
+    assert_eq!(
+        status,
+        "200",
+        "HOOK_ROUTE 未匹配（状态行：{}）——axum 版本与路径参数语法错位？",
+        head.lines().next().unwrap_or_default()
+    );
 }

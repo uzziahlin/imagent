@@ -42,9 +42,9 @@ base64 = "0.23"
 hex = "0.4"
 # S3 凭据应用层加密（store：keyring 不可用时的加密回退）
 aes-gcm = "0.10"
-pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
-sha2 = "0.10"
-hmac = { version = "0.12", default-features = false }
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+sha2 = "0.11"
+hmac = { version = "0.13", default-features = false }
 
 # 存储 / 工具
 # bundled SQLite 的 CVE 不进 cargo-audit（audit 只看 RUSTSEC，bundled 的 C 代码
@@ -67,9 +67,9 @@ rpassword = "7"
 # 格式指标（registry/text encoding），关掉 protobuf 导出器特性即可移除该依赖。
 prometheus = { version = "0.13", default-features = false }
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
-axum = "0.7"
+axum = "0.8"
 # ACP（Agent Client Protocol）：claude-agent-acp 长驻子进程模式（agent-client-protocol SDK）
-agent-client-protocol = "1"
+agent-client-protocol = "2"
 # 飞书 open-lark SDK（package name=openlark，lib name=open_lark，二者不同名是 SDK 设计）
 openlark = { version = "0.20", default-features = false, features = ["auth", "communication", "websocket"] }
 
