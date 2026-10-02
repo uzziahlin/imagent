@@ -34,19 +34,17 @@
 //! LoadSession 失败只杀**该会话的**连接（旧实现全局单连接 + 串行主循环，A 的长任务
 //! 让 B 排队烧 agent_timeout，A 的 cancel 殃及所有会话——P5-14）。
 //!
-//! ## 子进程收割的已知限制（(code-review v14) P2，如实披露）
+//! ## 子进程收割（(code-review v14) P2 曾为已知限制，SDK 2.2.0 起解除）
 //!
-//! connection drop 时 SDK（agent-client-protocol 1.0.1）的 `ChildGuard` 只 kill
-//! **直接子进程**（`async_process::Child::kill`，单 pid）——孙进程（ACP agent
-//! 内部再 spawn 的 claude CLI / MCP server / Bash 工具）可能存活为孤儿，继续以
-//! 该会话的上下文运行直至自行退出。CLI 路径的进程组收割
-//!（backend_common.rs：`process_group(0)` + GroupKillGuard 的 killpg）在此**不可
-//! 得**：SDK 的 spawn 封闭在 `AcpAgent::connect_to` 内部（自建
-//! `async_process::Command`，无 Command 注入点），Child 句柄不外露（无 pid 访问
-//! 器）；且依赖 crate 无 `async-process` 直接依赖可用（SDK 亦不 re-export）、
-//! async-process 2.5 本身无 `process_group` API——自定义 transport 也组不起进程
-//! 组。改进方向是上游 PR（暴露 spawn 注入 / 进程组选项）；风险面与部署侧缓解见
-//! SECURITY.md「已知限制」。
+//! connection drop 时 SDK 的 `ChildGuard` 会 SIGKILL **整棵进程组**：agent-client-
+//! protocol 2.2.0 起 `spawn_process` 在 Unix 上显式 `process_group(0)`（子进程自
+//! 成组长——注释点名正是为覆盖 `npx → node`、`uvx → python` 这类包装器孙进程，
+//! 即本仓的 `claude-agent-acp(node) → claude CLI → MCP/Bash` 子树），`ChildGuard::
+//! terminate` 经 rustix `kill_process_group` 收割全组（ESRCH 视为已退出，回退单
+//! pid kill 兜底）。1.0.1 时代「只杀直接子进程、孙进程存活为孤儿」的限制随升级
+//! 消除——本仓生产路径 `connect_with(ConnectionTo)` 恰是 SDK 文档声明的「装进程
+//! 组 guard」路径。（v14 记档背景与当时不可得的证据：spawn 封闭无注入点、Child
+//! 句柄不外露、async-process 无 process_group API——上游已从根上解决。）
 //!
 //! [`AgentChunk`]: imagent_core::AgentChunk
 
@@ -432,8 +430,8 @@ impl AcpBackend {
 
     /// B2：shutdown 全量清理——断开全部 per-conv 连接（map 清空后最后一个 sender
     /// drop → 长驻 task 的 recv 返回 None → connect_with 闭包返回 → connection
-    /// drop → SDK ChildGuard kill 直接子进程；孙进程限制见模块头「子进程收割的
-    /// 已知限制」）。独立部署（非 dispatcher 注入）时由持有方调用；进程退出路径
+    /// drop → SDK ChildGuard SIGKILL 整棵进程组（SDK 2.2.0 起，见模块头「子进程
+    /// 收割」）。独立部署（非 dispatcher 注入）时由持有方调用；进程退出路径
     /// 由空闲回收 + OS 清理兜底。
     pub async fn shutdown(&self) {
         let conns: Vec<Arc<LongLivedAcp>> =
@@ -572,8 +570,8 @@ impl LongLivedAcp {
     }
 
     /// spawn 单 conv 的长驻 task：`connect_with` 建连接（spawn ACP agent 子进程；
-    /// SDK `ChildGuard` 在 connection drop 时 kill 直接子进程——孙进程存活限制
-    /// 见模块头「子进程收割的已知限制」），main_fn 内 loop 接收 prompt 跨 run
+    /// SDK `ChildGuard` 在 connection drop 时 SIGKILL 整棵进程组——SDK 2.2.0 起，
+    /// 见模块头「子进程收割」），main_fn 内 loop 接收 prompt 跨 run
     /// 复用同一子进程 + connection。`storage` 为 T9 的 per-agent 本机存储适配
     /// （幽灵会话预检走它），`name` 用于错误前缀。
     ///
