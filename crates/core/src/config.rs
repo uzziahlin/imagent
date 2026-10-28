@@ -334,6 +334,14 @@ pub struct Config {
     pub agent: String,
     #[serde(default = "default_platform")]
     pub platform: String,
+    /// M2.5 多平台并存列表（如 `["feishu", "web"]`）。**非空时优先于上面的
+    /// `platform` 单值**（装配优先级：CLI `--platform` > 本列表 > 单值；单值
+    /// 字段保留兼容，既有部署零改动）。元素须 ∈ {ilink, wecom, feishu, web}
+    /// 且互异；长度 1 合法（等价单值，装配层直接用单平台、不包组合器）。
+    /// 多平台由 [`crate::MultiPlatform`] 组合器合并（conv 前缀路由），Dispatcher
+    /// 零改动。**改动需重启**：平台在启动期装配，SIGHUP 不换平台。
+    #[serde(default)]
+    pub platforms: Vec<String>,
     /// IM 权限审批模式（默认 Auto：按后端自动选档，见 [`PermissionMode::Auto`]）。
     #[serde(default)]
     pub permission_mode: PermissionMode,
@@ -1216,6 +1224,24 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
+        // M2.5：多平台列表校验——元素须在四平台名单内且互异（重复名 = 组合器
+        // conv 前缀路由歧义，启动期直接拒绝）。长度 1 合法（等价单值路径）。
+        {
+            let mut seen = std::collections::HashSet::new();
+            for p in &cfg.platforms {
+                if !matches!(p.as_str(), "ilink" | "wecom" | "feishu" | "web") {
+                    return Err(CoreError::Config(format!(
+                        "未知 platform={p}（platforms 列表），支持 ilink | wecom | feishu | web"
+                    )));
+                }
+                if !seen.insert(p.as_str()) {
+                    return Err(CoreError::Config(format!(
+                        "platforms 列表出现重复平台 {p}——多平台并存要求名字互异（conv 前缀路由）"
+                    )));
+                }
+            }
+        }
+
         // T7：workdir 落在状态目录（生效 home 或基座 ~/.imagent）内 + deny 开启
         // → agent 对工作区的文件读取会被 --settings deny 逐次拦下，轮次事实性
         // 不可用。warn 不拒启：罕见误配、运行期症状明显，拒启反而挡住「确实要
@@ -1375,6 +1401,7 @@ allowed_senders = []        # 留空 = 发现模式（只打日志记录入站 s
 # allowed_tools = ["*"]                      # 缺省=全部工具（不收敛）；要白名单显式列（如 ["Read","Edit"]）；执行类建议配 permission_mode="ask"
 agent = "claude-cli"         # claude-cli(默认) | claude-acp(Claude ACP长驻子进程) | acp(任意ACP agent,配acp_command) | codex | gemini
 platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人) | feishu(飞书,配 feishu_app_id + 环境变量 IMAGENT_FEISHU_APP_SECRET) | web(网页驾驶舱,配 web_relay_url + 环境变量 IMAGENT_WEB_GATEWAY_TOKEN)
+# platforms = ["feishu", "web"]   # 多平台并存（非空时覆盖上面的 platform 单值）；IM 做通知兜底 + web 做驾驶舱
 # web_relay_url = "wss://your-ecs:8443/imagent/gateway"   # 仅 platform="web"：ECS relay 网关端点（Caddy TLS 终结 + strip /imagent 前缀）；gateway token 走环境变量 IMAGENT_WEB_GATEWAY_TOKEN（敏感不入本文件）；web 消息 sender 恒为 web:user，需加入 allowed_senders（或 admin_senders）白名单才会被处理
 # web_default_session = "default"   # 仅 platform="web"：无 convId 的浏览器消息落到的默认会话名（conv 形如 web:<name>）
 # feishu_app_id = "cli_xxx"            # 飞书自建应用 app_id（仅 platform="feishu"；app_secret 走环境变量，keyring 为后续 P2）
@@ -1569,6 +1596,56 @@ platform = "ilink"
         assert_eq!(cfg.platform, "ilink");
         // T9：acp_command 缺省 None（claude-acp 装配无新增约束）。
         assert!(cfg.acp_command.is_none());
+        cleanup(&p);
+    }
+
+    /// M2.5：platforms 多平台列表——缺省空（单值路径，既有部署零改动）；
+    /// 合法（含单元素）通过；非法名 / 重复拒绝。
+    #[test]
+    fn platforms_list_parse_and_validate() {
+        // 缺省 = 空。
+        let p = tmp_path("pl_default", r#"default_workdir = "/tmp/ws""#);
+        let cfg = Config::load(&p).expect("parse");
+        assert!(cfg.platforms.is_empty());
+        assert_eq!(cfg.platform, "ilink");
+        cleanup(&p);
+        // 合法列表 + 单元素列表（等价单值，装配层不包组合器）。
+        let p = tmp_path(
+            "pl_ok",
+            r#"default_workdir = "/tmp/ws"
+platforms = ["feishu", "web"]
+"#,
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(cfg.platforms, vec!["feishu".to_string(), "web".to_string()]);
+        cleanup(&p);
+        let p = tmp_path(
+            "pl_single",
+            r#"default_workdir = "/tmp/ws"
+platforms = ["feishu"]
+"#,
+        );
+        assert!(Config::load(&p).is_ok(), "单元素列表合法（等价单值）");
+        cleanup(&p);
+        // 非法名。
+        let p = tmp_path(
+            "pl_bad_name",
+            r#"default_workdir = "/tmp/ws"
+platforms = ["telegram"]
+"#,
+        );
+        let err = Config::load(&p).unwrap_err().to_string();
+        assert!(err.contains("未知 platform=telegram"), "{err}");
+        cleanup(&p);
+        // 重复名（组合器前缀路由歧义）。
+        let p = tmp_path(
+            "pl_dup",
+            r#"default_workdir = "/tmp/ws"
+platforms = ["feishu", "feishu"]
+"#,
+        );
+        let err = Config::load(&p).unwrap_err().to_string();
+        assert!(err.contains("重复"), "{err}");
         cleanup(&p);
     }
 

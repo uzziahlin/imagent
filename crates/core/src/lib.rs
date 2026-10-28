@@ -29,6 +29,7 @@ pub mod lineio;
 pub mod mcp;
 mod message;
 pub mod metrics;
+mod multi_platform;
 pub mod outbox;
 pub mod paths;
 mod permission;
@@ -52,6 +53,7 @@ pub use dispatch::{Dispatcher, TaskBudgets, WebhookExposure};
 pub use error::{CoreError, Result};
 pub use message::split_message;
 pub use metrics::Metrics;
+pub use multi_platform::MultiPlatform;
 pub use permission::{
     default_sock_path, is_explicit_reply_word, needs_approval, parse_reply, PermissionReply,
     PermissionRouter,

@@ -651,23 +651,46 @@ async fn main() -> Result<()> {
             // 凭据（读取对旧的无 profile 键 fallback，存量部署零迁移）。
             store.set_keyring_scope(cli.profile.as_deref().unwrap_or(""));
 
-            // 3. platform —— CLI 显式优先，否则 config.platform（未写 = ilink 默认）。
+            // 3. platform —— CLI 显式优先（单平台），否则 config.platforms 多平台
+            // 列表，最后回退 config.platform 单值（未写 = ilink 默认）。
             // 修复（2026-08-24）：此前 CLI 硬默认 ilink——config 写了 feishu/wecom 的
             // 用户不带 --platform 启动会误走 ilink（service install 的守护进程即中招）。
-            let platform_name = platform
-                .as_deref()
-                .filter(|p| !p.is_empty())
-                .unwrap_or(&config.platform);
-            if platform_name != "ilink"
-                && platform_name != "wecom"
-                && platform_name != "feishu"
-                && platform_name != "web"
-            {
-                return Err(anyhow!(
-                    "未知 platform={platform_name}，支持 ilink | wecom | feishu | web"
-                ));
+            // M2.5：platforms 列表非空时多平台并存（如 feishu + web——IM 做轻通知
+            // 兜底、web 做驾驶舱），由 core::MultiPlatform 组合器合并为一个
+            // Arc<dyn Platform>，Dispatcher 零改动；CLI --platform 显式给了则忽略
+            // 列表（命令行意图最明确）。
+            let platform_names: Vec<String> =
+                if let Some(p) = platform.as_deref().filter(|p| !p.is_empty()) {
+                    vec![p.to_string()]
+                } else if !config.platforms.is_empty() {
+                    config.platforms.clone()
+                } else {
+                    vec![config.platform.clone()]
+                };
+            for n in &platform_names {
+                if n != "ilink" && n != "wecom" && n != "feishu" && n != "web" {
+                    return Err(anyhow!(
+                        "未知 platform={n}，支持 ilink | wecom | feishu | web"
+                    ));
+                }
             }
-            let platform = build_platform(platform_name, &config, store.clone()).await?;
+            // 展示名：单平台即名字；多平台并列（+ 连接，仅日志 / /health 展示）。
+            let platform_name = platform_names.join("+");
+            let platform = if platform_names.len() == 1 {
+                build_platform(&platform_names[0], &config, store.clone()).await?
+            } else {
+                let mut children = Vec::with_capacity(platform_names.len());
+                for n in &platform_names {
+                    children.push(build_platform(n, &config, store.clone()).await?);
+                }
+                tracing::info!(
+                    target: "imagent::ops",
+                    platforms = %platform_name,
+                    "多平台并存：MultiPlatform 组合器合并子平台（Dispatcher 零改动）"
+                );
+                Arc::new(imagent_core::MultiPlatform::new(children)?)
+                    as Arc<dyn imagent_core::Platform>
+            };
 
             // Wave C（出站可靠性收敛）：未知 kind sweeper——outbox 行的 kind
             // 不属于当前在跑的 driver（如平台从 config 撤下后的历史积压、kind
@@ -675,19 +698,29 @@ async fn main() -> Result<()> {
             // 防御的泛化形态，见 core::outbox 模块文档）。ilink 无 outbox
             // kind（不接入的决策同样记档在那里），空名单即清剿全部历史行。
             {
-                let driven_kinds: Vec<&str> = match platform_name {
-                    "feishu" => vec![imagent_feishu::OUTBOX_KIND],
-                    "wecom" => vec![imagent_wecom::OUTBOX_KIND],
-                    _ => Vec::new(),
-                };
+                // M2.5：多平台下 outbox kind 名单取**全部**子平台的并集——漏列
+                // 会让某个在跑平台的合法积压行被 sweeper 当未知 kind 回收。
+                let driven_kinds: Vec<&str> = platform_names
+                    .iter()
+                    .flat_map(|n| match n.as_str() {
+                        "feishu" => vec![imagent_feishu::OUTBOX_KIND],
+                        "wecom" => vec![imagent_wecom::OUTBOX_KIND],
+                        _ => Vec::new(),
+                    })
+                    .collect();
                 imagent_core::outbox::spawn_unknown_kind_sweeper(store.clone(), &driven_kinds);
             }
 
             // T12：Bitable 数据面启用判定（claude 运行参数 --bitable 与
             // Dispatcher 注入共用同一判定）；未启用原因一次性 warn（缺一/非
             // feishu 平台——配置了但无效的场景给用户看得见的反馈）。
-            ops::warn_bitable_disable_reason(&config, platform_name);
-            let bitable_on = config.bitable_enabled_for(platform_name);
+            // M2.5：bitable 等按平台名特判的判定取任一子平台命中（feishu+web
+            // 时数据面仍应挂上）；名字参数 = 命中名（无命中给并列展示名，仅
+            // 影响未启用原因的提示文案）。
+            let any_feishu = platform_names.iter().any(|n| n == "feishu");
+            let bitable_view: &str = if any_feishu { "feishu" } else { &platform_name };
+            ops::warn_bitable_disable_reason(&config, bitable_view);
+            let bitable_on = config.bitable_enabled_for(bitable_view);
 
             // 孤儿流式卡片关流（P4_ROADMAP 第六批）：上次进程退出时滞留「生成中」的
             // 卡片按 store 登记逐张 patch 成「已中断」，失败保留登记下次再试。
@@ -807,7 +840,7 @@ async fn main() -> Result<()> {
             dispatcher.set_approval_tools(config.approval_tools.clone());
             // T12：Bitable 数据面注入（platform=feishu 且 app_token/table_id 齐备
             // → feishu 实现挂进 Dispatcher；socket kind=bitable 请求经它落飞书）。
-            ops::apply_bitable(&dispatcher, &config, platform_name);
+            ops::apply_bitable(&dispatcher, &config, bitable_view);
             // v1.32：OS 级沙箱注入（claude-cli 句柄 + 计划返给 delegate 的
             // claude 副后端；Linux 无 bwrap 降级 off 的 warn 在装配函数内打）。
             let sandbox_plan = ops::apply_agent_sandbox(claude_cli_handle.as_deref(), &config);
@@ -947,7 +980,8 @@ async fn main() -> Result<()> {
 
             // P3-h（code-review v14）：wecom 的 /health logged_in 预判定——secret
             // 可能在 store（login wecom）也可能在 config，按存在性取并。
-            let wecom_logged_in_hint = if platform_name == "wecom" {
+            // M2.5：多平台时任一子平台为 wecom 即预算 hint。
+            let wecom_logged_in_hint = if platform_names.iter().any(|n| n == "wecom") {
                 let in_store = http_store
                     .first_credential("wecom")
                     .await
@@ -960,11 +994,20 @@ async fn main() -> Result<()> {
 
             dispatcher.startup_recovery().await;
             if let Some(listener) = metrics_listener {
+                // M2.5：/health 的 logged_in 按平台名判定（feishu→env、
+                // ilink→store 凭据名）——多平台并列名（如 "feishu+web"）会破坏
+                // 这两类判定，取第一个可判定的子平台名（纯 web 组合无凭据面，
+                // 沿用并列名 → store 查无 → false，与单 web 平台现状一致）。
+                let health_platform: String = platform_names
+                    .iter()
+                    .find(|n| matches!(n.as_str(), "feishu" | "wecom" | "ilink"))
+                    .cloned()
+                    .unwrap_or_else(|| platform_name.clone());
                 ops::spawn_metrics_server(
                     listener,
                     http_store.clone(),
                     start_at,
-                    platform_name.to_string(),
+                    health_platform,
                     http_token,
                     wecom_logged_in_hint,
                     webhook_listening,
@@ -989,7 +1032,9 @@ async fn main() -> Result<()> {
                 claude_cli_handle,
                 config_path.clone(),
                 http_store.clone(),
-                platform_name.to_string(),
+                // SIGHUP 侧只用它做 bitable 的 feishu 判定（见 ops.rs
+                // apply_claude_runtime_opts / apply_bitable），多平台给命中名。
+                bitable_view.to_string(),
                 ops::HotReloadSnapshot::of(&config),
             );
             #[cfg(not(unix))]
