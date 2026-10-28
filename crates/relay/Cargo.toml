@@ -18,6 +18,12 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 rust-embed = { workspace = true, features = ["compression"] }
+# 会话层（协议 v1.2）：会话 id（UUID v4）与 token 生成（rand）、token 落盘
+# 只存哈希（sha2 + hex）
+uuid = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 # 集成测试客户端（连真 server 起双端）

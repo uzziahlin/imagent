@@ -37,12 +37,23 @@ const CONV: &str = "web:work";
 const MACHINE: &str = "test-mac";
 
 async fn spawn_test_relay() -> RelayHandle {
+    use imagent_relay::{GatewayTokens, DEFAULT_SESSION_TTL_SECS};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    // v1.2：网关 token-machine 绑定（平台自报 MACHINE，token 必须绑它）；
+    // 会话状态目录用临时目录（每次唯一，不跨用例共享会话）。
     spawn_relay(
         listener,
         RelayConfig {
-            gateway_token: GW_TOKEN.to_string(),
+            gateway_tokens: GatewayTokens::parse(&format!("{MACHINE}={GW_TOKEN}")).unwrap(),
             user_token: USER_TOKEN.to_string(),
+            state_dir: std::env::temp_dir().join(format!(
+                "imagent-web-loopback-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            )),
+            session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
         },
     )
     .expect("测试配置合法")

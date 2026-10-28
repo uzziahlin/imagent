@@ -1565,7 +1565,7 @@ async fn build_platform(
                 anyhow!("platform=web 需在 config.toml 配置 web_relay_url（如 wss://<ecs>:8443/imagent/gateway）")
             })?;
             let gateway_token = std::env::var("IMAGENT_WEB_GATEWAY_TOKEN").map_err(|_| {
-                anyhow!("platform=web 需设置环境变量 IMAGENT_WEB_GATEWAY_TOKEN（与 relay 侧 IMAGENT_RELAY_GATEWAY_TOKEN 同值）")
+                anyhow!("platform=web 需设置环境变量 IMAGENT_WEB_GATEWAY_TOKEN（与 relay 侧 IMAGENT_RELAY_GATEWAY_TOKENS 中本机 machine 绑定的 token 同值——v1.2 起每台 Mac 独立 token）")
             })?;
             let default_session = config
                 .web_default_session

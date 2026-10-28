@@ -1,9 +1,25 @@
 import { useState, type FormEvent } from "react";
+import { deviceSummary } from "../lib/protocol";
 
-/** 登录页：输入 USER_TOKEN → 存 localStorage（key imagent.userToken）→ 进会话页。 */
-export function Login({ onSave }: { onSave: (token: string) => void }) {
+/**
+ * 登录页（v1.2）：输入 USER_TOKEN（+可选设备名）→ 上层经 hello 换发 30 天
+ * 会话凭证（登录成功即从 localStorage 删除 USER_TOKEN；旧 relay 无会话层则
+ * 沿用 token 直连模式）。notice = 认证失败分流提示（会话过期/设备被吊销）。
+ */
+export function Login({
+  notice,
+  onSave,
+}: {
+  /** 认证失败分流提示（会话已过期 / 此设备已被吊销；空串不显示）。 */
+  notice?: string;
+  /** token = USER_TOKEN；deviceName 可选设备名（空串 → 上层用 UA 摘要缺省）。 */
+  onSave: (token: string, deviceName: string) => void;
+}) {
   const [value, setValue] = useState("");
+  const [deviceName, setDeviceName] = useState("");
   const [error, setError] = useState("");
+  // 缺省设备名展示（placeholder；jsdom navigator.userAgent 也可正常摘要）
+  const uaSummary = deviceSummary(navigator.userAgent);
 
   const submit = (e: FormEvent) => {
     e.preventDefault();
@@ -12,7 +28,7 @@ export function Login({ onSave }: { onSave: (token: string) => void }) {
       setError("请输入访问令牌");
       return;
     }
-    onSave(token);
+    onSave(token, deviceName.trim());
   };
 
   // min-h-full 跟随 #root（键盘弹出时 --vvh 收缩，卡片在可见区居中）
@@ -37,6 +53,14 @@ export function Login({ onSave }: { onSave: (token: string) => void }) {
           <p className="mt-1 text-sm text-muted">输入访问令牌连接你的 Mac 网关</p>
         </div>
         <form onSubmit={submit} className="rounded-2xl border border-line bg-panel p-5 shadow-xl">
+          {notice && (
+            <p
+              role="alert"
+              className="mb-3 rounded-lg border border-amber-400/60 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-500/40 dark:bg-amber-950/60 dark:text-amber-200"
+            >
+              {notice}
+            </p>
+          )}
           <label htmlFor="token" className="mb-2 block text-sm font-medium text-ink">
             访问令牌（USER_TOKEN）
           </label>
@@ -57,6 +81,17 @@ export function Login({ onSave }: { onSave: (token: string) => void }) {
             placeholder="imagent.userToken"
             className="w-full rounded-xl border border-line-strong bg-surface px-3 py-2.5 font-mono text-base text-ink outline-none placeholder:text-ghost focus:border-emerald-500"
           />
+          <label htmlFor="device" className="mb-2 mt-4 block text-sm font-medium text-ink">
+            设备名（可选）
+          </label>
+          <input
+            id="device"
+            type="text"
+            value={deviceName}
+            onChange={(e) => setDeviceName(e.target.value)}
+            placeholder={`缺省 ${uaSummary}`}
+            className="w-full rounded-xl border border-line-strong bg-surface px-3 py-2.5 text-base text-ink outline-none placeholder:text-ghost focus:border-emerald-500"
+          />
           {error && <p className="mt-2 text-xs text-err">{error}</p>}
           <button
             type="submit"
@@ -65,8 +100,8 @@ export function Login({ onSave }: { onSave: (token: string) => void }) {
             连接
           </button>
           <p className="mt-3 text-xs leading-relaxed text-faint">
-            令牌仅存于本机 localStorage，只经 WS 首帧 hello 加密通道发送，绝不进入
-            URL。认证失败会返回本页。
+            令牌仅用于首次换取 30 天会话凭证（成功后即从本机删除）；凭证只经 WS
+            首帧 hello 加密通道发送，绝不进入 URL。认证失败会返回本页。
           </p>
         </form>
       </div>

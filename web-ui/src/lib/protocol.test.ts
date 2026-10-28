@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
   DEFAULT_CONV,
   DEFAULT_MACHINE,
+  deviceSummary,
   encodeFrame,
   initialState,
+  normalizeExpiryMs,
   parseFrame,
   reducer,
   spaceOf,
@@ -134,6 +136,105 @@ describe("parseFrame", () => {
     expect(parseFrame('{"v":1,"type":"machines","online":"home-mac"}')).toBeNull();
     expect(parseFrame('{"v":1,"type":"machines","online":[1]}')).toBeNull();
     expect(parseFrame('{"v":1,"type":"machines"}')).toBeNull();
+  });
+
+  it("v1.2 hello_ack 可选 session：缺席合法（旧 relay）、形状齐备合法、畸形 → null", () => {
+    // 缺席（旧 relay）：仍合法
+    expect(parseFrame('{"v":1,"type":"hello_ack","role":"browser"}')).toMatchObject({
+      type: "hello_ack",
+      role: "browser",
+    });
+    // 携带合法 session：原样保留
+    expect(
+      parseFrame(
+        '{"v":1,"type":"hello_ack","role":"browser","session":{"id":"sid-1","token":"st-1","expiresAt":1900000000000}}',
+      ),
+    ).toMatchObject({
+      type: "hello_ack",
+      session: { id: "sid-1", token: "st-1", expiresAt: 1_900_000_000_000 },
+    });
+    // session 形状错误
+    expect(parseFrame('{"v":1,"type":"hello_ack","role":"browser","session":"st-1"}')).toBeNull();
+    expect(parseFrame('{"v":1,"type":"hello_ack","role":"browser","session":{"id":"sid-1"}}')).toBeNull();
+    expect(
+      parseFrame(
+        '{"v":1,"type":"hello_ack","role":"browser","session":{"id":"sid-1","token":"st-1","expiresAt":"tomorrow"}}',
+      ),
+    ).toBeNull();
+  });
+
+  it("v1.2 devices 帧解析：元素形状校验、lastSeen/created 可选、非法 → null", () => {
+    const ok =
+      '{"v":1,"type":"devices","devices":[{"id":"d1","name":"Mac/Chrome","connected":true,"lastSeen":1700000000000,"created":1699000000000},{"id":"d2","name":"iPhone/Safari","connected":false}]}';
+    const f = parseFrame(ok);
+    expect(f).toMatchObject({ type: "devices" });
+    expect((f as { devices: unknown[] }).devices).toHaveLength(2);
+    // 元素非法：缺 id / connected 非布尔 / lastSeen 非数字
+    expect(parseFrame('{"v":1,"type":"devices","devices":[{"name":"x","connected":true}]}')).toBeNull();
+    expect(parseFrame('{"v":1,"type":"devices","devices":[{"id":"d","name":"x","connected":"yes"}]}')).toBeNull();
+    expect(
+      parseFrame('{"v":1,"type":"devices","devices":[{"id":"d","name":"x","connected":true,"lastSeen":"y"}]}'),
+    ).toBeNull();
+    // devices 非数组
+    expect(parseFrame('{"v":1,"type":"devices","devices":"all"}')).toBeNull();
+  });
+});
+
+describe("v1.2 会话层纯函数", () => {
+  it("deviceSummary：常见 UA → OS/浏览器 短名", () => {
+    expect(
+      deviceSummary(
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+      ),
+    ).toBe("iPhone/Safari");
+    expect(
+      deviceSummary(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      ),
+    ).toBe("Mac/Chrome");
+    // Edge/Opera UA 同时含 Chrome/ 与 Safari/：必须判衍生浏览器
+    expect(
+      deviceSummary(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
+      ),
+    ).toBe("Windows/Edge");
+    expect(
+      deviceSummary(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 OPR/112.0.0.0",
+      ),
+    ).toBe("Mac/Opera");
+    expect(
+      deviceSummary(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.4; rv:127.0) Gecko/20100101 Firefox/127.0",
+      ),
+    ).toBe("Mac/Firefox");
+    expect(
+      deviceSummary(
+        "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
+      ),
+    ).toBe("Android/Chrome");
+    expect(
+      deviceSummary(
+        "Mozilla/5.0 (iPad; CPU OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1",
+      ),
+    ).toBe("iPad/Safari");
+  });
+
+  it("deviceSummary：单边命中与全未命中兜底", () => {
+    expect(deviceSummary("Mozilla/5.0 (Macintosh) Firefox/127.0 and-nothing-else")).toBe("Mac/Firefox");
+    // 只有 OS 信号
+    expect(deviceSummary("some-app Windows x64 runtime")).toBe("Windows");
+    // 只有浏览器信号
+    expect(deviceSummary("curl-like agent Chrome/126")).toBe("Chrome");
+    // 全未命中
+    expect(deviceSummary("unknown-client/1.0")).toBe("未知设备");
+    expect(deviceSummary("")).toBe("未知设备");
+  });
+
+  it("normalizeExpiryMs：毫秒 epoch 原样、秒级自动放大、边界不误伤", () => {
+    expect(normalizeExpiryMs(1_900_000_000_000)).toBe(1_900_000_000_000); // 毫秒（2020+）
+    expect(normalizeExpiryMs(1_900_000_000)).toBe(1_900_000_000_000); // 秒级 → ×1000
+    expect(normalizeExpiryMs(0)).toBe(0);
   });
 });
 
@@ -574,6 +675,25 @@ describe("reducer 多机（v1.1）", () => {
     s = run(s, { type: "approval_sent", convId: DEFAULT_CONV, requestId: "r1" });
     expect(convsOf(s)[DEFAULT_CONV].pending).toHaveLength(0);
   });
+
+  it("v1.2 devices 帧：全量覆盖 devices，初始为 null", () => {
+    expect(initialState().devices).toBeNull();
+    const list1 = [
+      { id: "d1", name: "Mac/Chrome", connected: true, lastSeen: 100, created: 50 },
+      { id: "d2", name: "iPhone/Safari", connected: false, lastSeen: 90, created: 60 },
+    ];
+    let s = run(initialState(), {
+      type: "frame",
+      frame: frame('{"v":1,"type":"devices","devices":[{"id":"d1","name":"Mac/Chrome","connected":true,"lastSeen":100,"created":50},{"id":"d2","name":"iPhone/Safari","connected":false,"lastSeen":90,"created":60}]}'),
+    });
+    expect(s.devices).toEqual(list1);
+    // device_revoke 后 relay 回更新列表：全量覆盖（d2 消失）
+    s = run(s, {
+      type: "frame",
+      frame: frame('{"v":1,"type":"devices","devices":[{"id":"d1","name":"Mac/Chrome","connected":true}]}'),
+    });
+    expect(s.devices).toEqual([{ id: "d1", name: "Mac/Chrome", connected: true }]);
+  });
 });
 
 describe("encodeFrame", () => {
@@ -611,6 +731,25 @@ describe("encodeFrame", () => {
     expect(encodeFrame({ v: 1, type: "sync", machine: undefined })).toBe('{"v":1,"type":"sync"}');
     expect(encodeFrame({ v: 1, type: "control", cmd: "stop", args: undefined, machine: undefined })).toBe(
       '{"v":1,"type":"control","cmd":"stop"}',
+    );
+  });
+
+  it("v1.2 hello 双形态与设备管理帧：字段序列化精确（undefined 不出现）", () => {
+    // 首次登录：token + device
+    expect(encodeFrame({ v: 1, type: "hello", token: "t9", device: "Mac/Chrome" })).toBe(
+      '{"v":1,"type":"hello","token":"t9","device":"Mac/Chrome"}',
+    );
+    // 首次登录不带 device：与 v1.1 字节级一致
+    expect(encodeFrame({ v: 1, type: "hello", token: "t9", device: undefined })).toBe(
+      '{"v":1,"type":"hello","token":"t9"}',
+    );
+    // 重连：session 形态（token 不出现）
+    expect(encodeFrame({ v: 1, type: "hello", session: "st-1" })).toBe(
+      '{"v":1,"type":"hello","session":"st-1"}',
+    );
+    expect(encodeFrame({ v: 1, type: "device_list" })).toBe('{"v":1,"type":"device_list"}');
+    expect(encodeFrame({ v: 1, type: "device_revoke", deviceId: "d1" })).toBe(
+      '{"v":1,"type":"device_revoke","deviceId":"d1"}',
     );
   });
 });

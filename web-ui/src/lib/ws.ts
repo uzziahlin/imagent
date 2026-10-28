@@ -1,8 +1,9 @@
 // WS 连接管理（无 UI 依赖、可单测）：
-// connect → 首帧 hello（token 只在此帧出现，绝不进 URL）→ 等 hello_ack
+// connect → 首帧 hello（凭证只在此帧出现，绝不进 URL）→ 等 hello_ack
 // （10s 超时视为失败）→ ready → 立即发 sync（含重连场景）→ 25s 应用层 ping
 // （relay idle 90s 断连）→ 断线指数退避重连 1s→30s（成功重置）→ 收 close 1008
-// 视为 token 无效（onAuthFailed，回登录页清 token，不再重连）→ 收 close 4001
+// 按 reason 分流（session expired/revoked/auth failed，onAuthFailed 带
+// AuthFailReason，调用方清对应凭证回登录页，不再重连）→ 收 close 4001
 // 视为本连接被同 token 新窗口顶替（进入 superseded 终态：停心跳停重连，否则
 // 两窗口互踢死循环；用户显式 connect() 才重连，反之顶替对方是用户意图）→
 // >60s 无任何入站帧视为链路僵死，主动断开重连。
@@ -10,19 +11,26 @@
 // machine 字段——调用方逐帧传入，或经 getMachine 注入（内部自动 sync / 心跳
 // ping 在发送时取值）。machine 未指定时字段不出现，与旧 relay/旧网关字节级
 // 兼容；多机模式下 SPA 必须始终显式带当前机器（否则 relay 回 ambiguous_machine）。
+// v1.2 会话层：hello 双形态——构造带 session（localStorage 恢复的会话凭证）
+// 或 token+device（登录页首次登录）。hello_ack 携带 session 时经 onSession
+// 上抛（App 持久化并删除 USER_TOKEN），此后重连 hello 自动改用 session 形态；
+// hello_ack 无 session（旧 relay）→ 回退现行 token 直连模式（字节级一致）。
 
 import {
   encodeFrame,
+  normalizeExpiryMs,
   parseFrame,
   type ApprovalDecision,
+  type HelloAckFrame,
   type InboundFrame,
   type OutboundFrame,
+  type SessionInfo,
 } from "./protocol";
 
 export type ConnStatus = "connecting" | "ready" | "reconnecting" | "superseded";
 
 /** 事件参数的最小形状（open/error 事件无载荷，message/close 各取所需字段）。 */
-export type WsEvent = { data?: unknown; code?: number };
+export type WsEvent = { data?: unknown; code?: number; reason?: string };
 
 /** 最小 WebSocket 接口（可注入 fake 以单测；浏览器原生 WebSocket 满足之）。 */
 export interface WebSocketLike {
@@ -41,12 +49,20 @@ export interface WebSocketLike {
 
 export interface WsManagerOptions {
   url: string;
-  token: string;
+  /** 首次登录形态：USER_TOKEN（v1.2 起一次性，签发 session 后不再使用）。 */
+  token?: string;
+  /** 重连形态：会话凭证（与 token 二选一，优先）。 */
+  session?: string;
+  /** 首次登录可选设备名（hello 帧 device 字段；旧 relay 忽略未知字段安全）。 */
+  device?: string;
   /** 全部合法入站帧（已过 parseFrame 校验）。 */
   onFrame: (frame: InboundFrame) => void;
   onStatus: (status: ConnStatus) => void;
-  /** close 1008：token 无效，调用方应清 token 回登录页。 */
-  onAuthFailed: () => void;
+  /** close 1008：按 reason 分流的认证失败（调用方应清对应凭证回登录页）。 */
+  onAuthFailed: (reason: AuthFailReason) => void;
+  /** hello_ack 携带 session（新 relay 签发）：调用方持久化并删除 USER_TOKEN。
+   *  旧 relay 不触发（无 session 字段）——保持 USER_TOKEN 直连模式。 */
+  onSession?: (session: SessionInfo) => void;
   /** 注入 WebSocket 构造（单测用 fake）；缺省浏览器原生。 */
   wsFactory?: (url: string) => WebSocketLike;
   /** 当前出站机器（v1.1）：内部自动帧（ready 后首帧 sync / 心跳 ping）发送时
@@ -66,12 +82,89 @@ export const CLOSE_AUTH_FAILED = 1008;
 /** relay 同 token 新连接顶替旧连接 close code（crates/relay CLOSE_SUPERSEDED = 4001）。 */
 export const CLOSE_SUPERSEDED = 4001;
 
+// ---------------------------------------------------------------------------
+// v1.2 凭证存储（localStorage）
+// ---------------------------------------------------------------------------
+
+/** USER_TOKEN 存储位置（安全红线：只存 localStorage、只经 hello 帧发送，绝不
+ *  进 URL；v1.2 起一次性——session 签发即删除）。 */
+export const USER_TOKEN_KEY = "imagent.userToken";
+
+/** 会话凭证存储位置（{id?, token, expiresAt}，30 天）。 */
+export const SESSION_KEY = "imagent.session";
+
+/** localStorage 持久化的会话凭证（id 可选——旧条目容错，有 id 才能标记「本机」）。 */
+export type StoredSession = { id?: string; token: string; expiresAt: number };
+
+export function saveSession(session: StoredSession): void {
+  localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+}
+
+export function clearSession(): void {
+  localStorage.removeItem(SESSION_KEY);
+}
+
+/** 读取会话凭证：形状非法或已过期 → 清掉存储返回 null（过期会话重连必被
+ *  relay 拒，本地预判免一次注定失败的握手）。 */
+export function loadSession(): StoredSession | null {
+  const raw = localStorage.getItem(SESSION_KEY);
+  if (!raw) {
+    return null;
+  }
+  const invalid = (): null => {
+    localStorage.removeItem(SESSION_KEY);
+    return null;
+  };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return invalid();
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    return invalid();
+  }
+  const o = parsed as Record<string, unknown>;
+  if (typeof o.token !== "string" || o.token === "" || typeof o.expiresAt !== "number") {
+    return invalid();
+  }
+  if (normalizeExpiryMs(o.expiresAt) <= Date.now()) {
+    return invalid();
+  }
+  return {
+    id: typeof o.id === "string" ? o.id : undefined,
+    token: o.token,
+    expiresAt: o.expiresAt,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// close 1008 reason 分流（协议 v1.2）
+// ---------------------------------------------------------------------------
+
+/** 认证失败细分（App 据此给登录页不同提示 / 清不同凭证）。 */
+export type AuthFailReason = "session_expired" | "session_revoked" | "auth_failed";
+
+/** close 1008 reason → AuthFailReason：仅识别协议规定的三种字符串，其余
+ *  （含缺席、旧 relay 的任意 reason）一律 auth_failed。 */
+export function authFailReason(reason: string | undefined): AuthFailReason {
+  if (reason === "session expired") {
+    return "session_expired";
+  }
+  if (reason === "session revoked") {
+    return "session_revoked";
+  }
+  return "auth_failed";
+}
+
 export class WsManager {
   private readonly url: string;
-  private readonly token: string;
+  private readonly token: string | undefined;
+  private readonly device: string | undefined;
   private readonly onFrame: (frame: InboundFrame) => void;
   private readonly onStatus: (status: ConnStatus) => void;
-  private readonly onAuthFailed: () => void;
+  private readonly onAuthFailed: (reason: AuthFailReason) => void;
+  private readonly onSession: ((session: SessionInfo) => void) | undefined;
   private readonly wsFactory: (url: string) => WebSocketLike;
   private readonly getMachine: (() => string | undefined) | undefined;
   private readonly helloTimeoutMs: number;
@@ -79,6 +172,10 @@ export class WsManager {
   private readonly deadLinkMs: number;
   private readonly minBackoffMs: number;
   private readonly maxBackoffMs: number;
+
+  /** 当前会话凭证（构造注入或 hello_ack 签发）：一旦持有，重连 hello 即改用
+   *  session 形态（USER_TOKEN 不再出现于任何后续帧）。 */
+  private sessionToken: string | undefined;
 
   private socket: WebSocketLike | null = null;
   private status: ConnStatus = "connecting";
@@ -94,9 +191,12 @@ export class WsManager {
   constructor(opts: WsManagerOptions) {
     this.url = opts.url;
     this.token = opts.token;
+    this.device = opts.device;
+    this.sessionToken = opts.session;
     this.onFrame = opts.onFrame;
     this.onStatus = opts.onStatus;
     this.onAuthFailed = opts.onAuthFailed;
+    this.onSession = opts.onSession;
     this.wsFactory = opts.wsFactory ?? ((u) => new WebSocket(u) as unknown as WebSocketLike);
     this.getMachine = opts.getMachine;
     this.helloTimeoutMs = opts.helloTimeoutMs ?? 10_000;
@@ -154,6 +254,16 @@ export class WsManager {
     return this.send({ v: 1, type: "sync", machine });
   }
 
+  /** v1.2 拉取已登录设备列表（设备面板打开时；仅会话模式对新 relay 使用）。 */
+  sendDeviceList(): boolean {
+    return this.send({ v: 1, type: "device_list" });
+  }
+
+  /** v1.2 吊销设备（relay 回更新后的 devices 帧）。 */
+  sendDeviceRevoke(deviceId: string): boolean {
+    return this.send({ v: 1, type: "device_revoke", deviceId });
+  }
+
   private send(frame: OutboundFrame): boolean {
     if (!this.ready || !this.socket) {
       return false;
@@ -188,13 +298,24 @@ export class WsManager {
       return;
     }
     // 连接后第一帧 hello（relay 认证；成功收 hello_ack，失败 close 1008）
-    this.rawSend(encodeFrame({ v: 1, type: "hello", token: this.token }));
+    this.sendHello();
     this.helloTimer = setTimeout(() => {
       // 10s 无 hello_ack：按失败处理（先摘监听再关 socket，close 事件不再触发）
       this.teardownSocket();
       this.scheduleReconnect();
     }, this.helloTimeoutMs);
   };
+
+  /** hello 双形态（v1.2）：持有会话凭证 → session 形态；否则 token 形态
+   *  （+可选 device）。undefined 字段不序列化，token 形态无 device 时与
+   *  v1.1 字节级一致（旧 relay 兼容；device 对旧 relay 是被忽略的未知字段）。 */
+  private sendHello(): void {
+    this.rawSend(
+      this.sessionToken
+        ? encodeFrame({ v: 1, type: "hello", session: this.sessionToken })
+        : encodeFrame({ v: 1, type: "hello", token: this.token, device: this.device }),
+    );
+  }
 
   private handleMessage = (ev: WsEvent): void => {
     if (typeof ev.data !== "string") {
@@ -206,14 +327,21 @@ export class WsManager {
     }
     this.lastFrameAt = Date.now();
     if (frame.type === "hello_ack" && !this.ready) {
-      this.onHelloAck();
+      this.onHelloAck(frame);
       return;
     }
     this.onFrame(frame);
   };
 
-  private onHelloAck(): void {
+  private onHelloAck(frame: HelloAckFrame): void {
     this.clearHelloTimer();
+    // v1.2：hello_ack 携带 session（新 relay 签发）→ 记住凭证（此后重连 hello
+    // 改用 session 形态）并上抛给调用方持久化；缺席（旧 relay）→ 无操作，
+    // 保持 token 直连模式（字节级回退现行行为）。
+    if (frame.session) {
+      this.sessionToken = frame.session.token;
+      this.onSession?.(frame.session);
+    }
     this.ready = true;
     this.attempts = 0; // 成功即重置退避
     this.setStatus("ready");
@@ -256,9 +384,10 @@ export class WsManager {
     }
     const code = typeof ev.code === "number" ? ev.code : 1006;
     if (code === CLOSE_AUTH_FAILED) {
-      // relay 认证失败：token 无效 → 回登录页，不重连
+      // relay 认证失败：按 close reason 分流（session expired/revoked/其它），
+      // 调用方清对应凭证回登录页；不重连
       this.stopped = true;
-      this.onAuthFailed();
+      this.onAuthFailed(authFailReason(typeof ev.reason === "string" ? ev.reason : undefined));
       return;
     }
     if (code === CLOSE_SUPERSEDED) {

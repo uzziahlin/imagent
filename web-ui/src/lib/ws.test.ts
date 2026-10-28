@@ -1,6 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { WsManager, type WsEvent, type WebSocketLike } from "./ws";
-import type { InboundFrame } from "./protocol";
+import {
+  authFailReason,
+  clearSession,
+  loadSession,
+  saveSession,
+  WsManager,
+  type AuthFailReason,
+  type WsEvent,
+  type WebSocketLike,
+} from "./ws";
+import type { InboundFrame, SessionInfo } from "./protocol";
 
 /** 可控 fake WebSocket：手动 emit 事件、记录出站帧。 */
 class FakeWebSocket implements WebSocketLike {
@@ -387,5 +396,215 @@ describe("WsManager 多机（v1.1）", () => {
     machine = "work-mac"; // machines 帧到达 → App 更新当前机器
     vi.advanceTimersByTime(25_000);
     expect(sock.sent).toContain('{"v":1,"type":"ping","machine":"work-mac"}');
+  });
+});
+
+describe("WsManager 会话层（v1.2）", () => {
+  const SESSION: SessionInfo = { id: "sid-1", token: "st-1", expiresAt: 1_900_000_000_000 };
+  const ACK_WITH_SESSION = JSON.stringify({
+    v: 1,
+    type: "hello_ack",
+    role: "browser",
+    session: SESSION,
+  });
+
+  interface SessHarness {
+    mgr: WsManager;
+    statuses: string[];
+    authReasons: AuthFailReason[];
+    sessions: SessionInfo[];
+  }
+
+  function makeSessManager(opts: { token?: string; session?: string; device?: string }): SessHarness {
+    const statuses: string[] = [];
+    const authReasons: AuthFailReason[] = [];
+    const sessions: SessionInfo[] = [];
+    const mgr = new WsManager({
+      url: "wss://example.test/imagent/ws",
+      token: opts.token,
+      session: opts.session,
+      device: opts.device,
+      onFrame: () => {},
+      onStatus: (s) => statuses.push(s),
+      onAuthFailed: (r) => authReasons.push(r),
+      onSession: (s) => sessions.push(s),
+      wsFactory: (u) => new FakeWebSocket(u),
+    });
+    return { mgr, statuses, authReasons, sessions };
+  }
+
+  it("首次登录 hello 带 token+device；hello_ack 携带 session → onSession 上抛", () => {
+    const h = makeSessManager({ token: "tok-9", device: "Mac/Chrome" });
+    h.mgr.connect();
+    const sock = lastSock();
+    sock.emit("open");
+    expect(sock.sent[0]).toBe('{"v":1,"type":"hello","token":"tok-9","device":"Mac/Chrome"}');
+    sock.serverSend(ACK_WITH_SESSION);
+    expect(h.sessions).toEqual([SESSION]);
+    expect(h.statuses.at(-1)).toBe("ready");
+  });
+
+  it("签发 session 后断线重连：hello 改用 session 形态（token 不再出现）", () => {
+    const h = makeSessManager({ token: "tok-9", device: "Mac/Chrome" });
+    h.mgr.connect();
+    const s1 = lastSock();
+    s1.emit("open");
+    s1.serverSend(ACK_WITH_SESSION);
+    s1.emit("close", { code: 1006 });
+    vi.advanceTimersByTime(1_000); // 退避 1s 到点重连
+    const s2 = lastSock();
+    s2.emit("open");
+    expect(s2.sent[0]).toBe('{"v":1,"type":"hello","session":"st-1"}');
+    s2.serverSend(ACK_WITH_SESSION);
+    expect(h.statuses.at(-1)).toBe("ready");
+  });
+
+  it("构造注入 session（localStorage 恢复）：首帧 hello 即 session 形态", () => {
+    const h = makeSessManager({ session: "st-2" });
+    h.mgr.connect();
+    const sock = lastSock();
+    sock.emit("open");
+    expect(sock.sent[0]).toBe('{"v":1,"type":"hello","session":"st-2"}');
+    // 重连 hello_ack 回剩余有效期 session → 再次上抛（App 刷新本地过期时间）
+    sock.serverSend(
+      JSON.stringify({
+        v: 1,
+        type: "hello_ack",
+        role: "browser",
+        session: { id: "sid-2", token: "st-2", expiresAt: 1_950_000_000_000 },
+      }),
+    );
+    expect(h.sessions).toHaveLength(1);
+    expect(h.sessions[0].expiresAt).toBe(1_950_000_000_000);
+  });
+
+  it("旧 relay 兼容：hello_ack 无 session → onSession 不触发，重连仍是 token 形态（字节级回退）", () => {
+    const h = makeSessManager({ token: "tok-9" });
+    h.mgr.connect();
+    const s1 = lastSock();
+    s1.emit("open");
+    expect(s1.sent[0]).toBe('{"v":1,"type":"hello","token":"tok-9"}');
+    s1.serverSend(HELLO_ACK); // 旧 relay：无 session 字段
+    expect(h.sessions).toHaveLength(0);
+    s1.emit("close", { code: 1006 });
+    vi.advanceTimersByTime(1_000);
+    const s2 = lastSock();
+    s2.emit("open");
+    expect(s2.sent[0]).toBe('{"v":1,"type":"hello","token":"tok-9"}');
+  });
+
+  it("close 1008 按 reason 分流：expired / revoked / 其它（含缺席）→ auth_failed", () => {
+    const h = makeSessManager({ session: "st-1" });
+    h.mgr.connect();
+    const sock = lastSock();
+    sock.emit("open");
+    sock.serverSend(ACK_WITH_SESSION);
+    sock.emit("close", { code: 1008, reason: "session expired" });
+    expect(h.authReasons).toEqual(["session_expired"]);
+    // 不再重连
+    vi.advanceTimersByTime(120_000);
+    expect(FakeWebSocket.created).toHaveLength(1);
+
+    const h2 = makeSessManager({ session: "st-1" });
+    h2.mgr.connect();
+    lastSock().emit("open");
+    lastSock().serverSend(ACK_WITH_SESSION);
+    lastSock().emit("close", { code: 1008, reason: "session revoked" });
+    expect(h2.authReasons).toEqual(["session_revoked"]);
+
+    const h3 = makeSessManager({ token: "tok-9" });
+    h3.mgr.connect();
+    lastSock().emit("open");
+    lastSock().serverSend(HELLO_ACK);
+    // 缺席 reason 与协议外 reason 均归 auth_failed
+    lastSock().emit("close", { code: 1008 });
+    expect(h3.authReasons).toEqual(["auth_failed"]);
+  });
+
+  it("authFailReason 纯函数：三种协议 reason 精确映射，其余归 auth_failed", () => {
+    expect(authFailReason("session expired")).toBe("session_expired");
+    expect(authFailReason("session revoked")).toBe("session_revoked");
+    expect(authFailReason("auth failed")).toBe("auth_failed");
+    expect(authFailReason(undefined)).toBe("auth_failed");
+    expect(authFailReason("Session Expired")).toBe("auth_failed"); // 大小写敏感
+  });
+
+  it("sendDeviceList / sendDeviceRevoke：ready 前返回 false，ready 后字节精确", () => {
+    const h = makeSessManager({ session: "st-1" });
+    h.mgr.connect();
+    expect(h.mgr.sendDeviceList()).toBe(false);
+    expect(h.mgr.sendDeviceRevoke("d1")).toBe(false);
+    const sock = lastSock();
+    sock.emit("open");
+    sock.serverSend(ACK_WITH_SESSION);
+    expect(h.mgr.sendDeviceList()).toBe(true);
+    expect(h.mgr.sendDeviceRevoke("d1")).toBe(true);
+    expect(sock.sent).toContain('{"v":1,"type":"device_list"}');
+    expect(sock.sent).toContain('{"v":1,"type":"device_revoke","deviceId":"d1"}');
+  });
+
+  it("devices 帧经 onFrame 转发（设备列表归 reducer 消费）", () => {
+    const frames: InboundFrame[] = [];
+    const mgr = new WsManager({
+      url: "wss://example.test/imagent/ws",
+      session: "st-1",
+      onFrame: (f) => frames.push(f),
+      onStatus: () => {},
+      onAuthFailed: () => {},
+      wsFactory: (u) => new FakeWebSocket(u),
+    });
+    mgr.connect();
+    const sock = lastSock();
+    sock.emit("open");
+    sock.serverSend(ACK_WITH_SESSION);
+    sock.serverSend(
+      '{"v":1,"type":"devices","devices":[{"id":"d1","name":"Mac/Chrome","connected":true}]}',
+    );
+    expect(frames).toHaveLength(1);
+    expect(frames[0]).toMatchObject({ type: "devices" });
+  });
+});
+
+describe("会话凭证存储（v1.2）", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it("saveSession / loadSession 往返（含 id 字段保留）", () => {
+    saveSession({ id: "sid-1", token: "st-1", expiresAt: Date.now() + 20 * 86_400_000 });
+    expect(loadSession()).toEqual({ id: "sid-1", token: "st-1", expiresAt: expect.any(Number) });
+    expect(loadSession()?.id).toBe("sid-1");
+  });
+
+  it("loadSession：无存储 / 畸形 JSON / 形状非法 → null 并清理", () => {
+    expect(loadSession()).toBeNull();
+    localStorage.setItem("imagent.session", "not-json");
+    expect(loadSession()).toBeNull();
+    expect(localStorage.getItem("imagent.session")).toBeNull();
+    localStorage.setItem("imagent.session", JSON.stringify({ token: "st", expiresAt: "soon" }));
+    expect(loadSession()).toBeNull();
+    localStorage.setItem("imagent.session", JSON.stringify({ token: "", expiresAt: 1 }));
+    expect(loadSession()).toBeNull();
+  });
+
+  it("loadSession：已过期 → null 并清理（秒级时间戳同样判定）", () => {
+    localStorage.setItem(
+      "imagent.session",
+      JSON.stringify({ id: "s", token: "st", expiresAt: Date.now() - 1_000 }),
+    );
+    expect(loadSession()).toBeNull();
+    // 秒级：normalizeExpiryMs 放大后再判
+    localStorage.setItem(
+      "imagent.session",
+      JSON.stringify({ id: "s", token: "st", expiresAt: Math.floor(Date.now() / 1000) - 10 }),
+    );
+    expect(loadSession()).toBeNull();
+    expect(localStorage.getItem("imagent.session")).toBeNull();
+  });
+
+  it("clearSession 清除存储", () => {
+    saveSession({ token: "st", expiresAt: Date.now() + 86_400_000 });
+    clearSession();
+    expect(localStorage.getItem("imagent.session")).toBeNull();
   });
 });

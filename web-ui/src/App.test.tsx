@@ -4,7 +4,9 @@
 // machines(["home-mac","work-mac"])。回归点：machines 帧先于该机器任何消息
 // 帧到达时 spaces 尚无该机器键，App 的 allPending 派生不得因此炸掉整树渲染
 // （React 18 渲染抛错 = 卸载整树 → #root 空白，真机曾复现）。
-import { act, cleanup, render, screen } from "@testing-library/react";
+// v1.2 会话层：换发登录（USER_TOKEN 一次性）/ session 重连 / close 1008 三
+// reason 分流 / 设备管理 UI / 旧 relay 兼容回退的端到端覆盖。
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import type { WsEvent } from "./lib/ws";
@@ -90,6 +92,8 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
   localStorage.clear();
+  // 还原被单测覆写的 navigator.userAgent（实例级 shadow）
+  delete (navigator as { userAgent?: string }).userAgent;
 });
 
 describe("App 挂载 + machines 帧序列（M5 多机白屏回归）", () => {
@@ -157,5 +161,208 @@ describe("App 挂载 + machines 帧序列（M5 多机白屏回归）", () => {
     });
     // 正文（markdown p）与侧栏预览（span）两处均应渲染出来
     expect(screen.getAllByText(/hello from home-mac/).length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.2 会话层：换发登录 / session 重连 / close 1008 分流 / 设备管理 / 旧 relay
+// ---------------------------------------------------------------------------
+
+describe("App 会话层（v1.2）", () => {
+  const DAY = 86_400_000;
+  /** 会话签发 ack（hello_ack.session）。 */
+  const ackWithSession = (id: string, token: string, expiresAt: number) =>
+    JSON.stringify({
+      v: 1,
+      type: "hello_ack",
+      role: "user",
+      session: { id, token, expiresAt },
+    });
+
+  /** 登录页 UI 流程：输入 token（+可选设备名）→ 连接 → open，返回活跃 socket。 */
+  function loginViaUi(token: string, device?: string): FakeWebSocket {
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("访问令牌（USER_TOKEN）"), {
+      target: { value: token },
+    });
+    if (device !== undefined) {
+      fireEvent.change(screen.getByLabelText("设备名（可选）"), {
+        target: { value: device },
+      });
+    }
+    fireEvent.click(screen.getByRole("button", { name: "连接" }));
+    const fake = FakeWebSocket.latest;
+    if (!fake) {
+      throw new Error("登录未创建 WebSocket 连接");
+    }
+    act(() => fake.emit("open"));
+    return fake;
+  }
+
+  /** 预置有效会话后挂载（刷新恢复路径），返回活跃 socket（已 open）。 */
+  function mountWithSession(expiresAt = Date.now() + 20 * DAY): FakeWebSocket {
+    localStorage.setItem(
+      "imagent.session",
+      JSON.stringify({ id: "sid-r", token: "st-r", expiresAt }),
+    );
+    render(<App />);
+    const fake = FakeWebSocket.latest;
+    if (!fake) {
+      throw new Error("App 未创建 WebSocket 连接");
+    }
+    act(() => fake.emit("open"));
+    return fake;
+  }
+
+  it("换发登录：hello 带 token+device；签发 session 后 userToken 即删、会话持久化", () => {
+    const fake = loginViaUi("tok-9", "我的 iPad");
+    expect(fake.sent).toContain(
+      JSON.stringify({ v: 1, type: "hello", token: "tok-9", device: "我的 iPad" }),
+    );
+    // 登录瞬间 userToken 仍可恢复（relay 暂不可达时的重试窗口）
+    expect(localStorage.getItem("imagent.userToken")).toBe("tok-9");
+    act(() => fake.recv(JSON.parse(ackWithSession("sid-1", "st-1", Date.now() + 30 * DAY))));
+    expect(screen.getByText("已连接")).toBeTruthy();
+    const stored = JSON.parse(localStorage.getItem("imagent.session") ?? "null");
+    expect(stored).toMatchObject({ id: "sid-1", token: "st-1" });
+    // USER_TOKEN 一次性：签发即从 localStorage 删除
+    expect(localStorage.getItem("imagent.userToken")).toBeNull();
+  });
+
+  it("登录设备名缺省 → hello 带UA摘要（iPhone/Safari）", () => {
+    Object.defineProperty(navigator, "userAgent", {
+      value:
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+      configurable: true,
+    });
+    const fake = loginViaUi("tok-9");
+    expect(fake.sent).toContain(
+      JSON.stringify({ v: 1, type: "hello", token: "tok-9", device: "iPhone/Safari" }),
+    );
+  });
+
+  it("刷新恢复：hello 用 session 形态；遗留 userToken 被清理", () => {
+    localStorage.setItem("imagent.userToken", "legacy-token");
+    const fake = mountWithSession();
+    expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "hello", session: "st-r" }));
+    expect(localStorage.getItem("imagent.userToken")).toBeNull();
+    act(() => fake.recv(JSON.parse(ackWithSession("sid-r", "st-r", Date.now() + 20 * DAY))));
+    expect(screen.getByText("已连接")).toBeTruthy();
+  });
+
+  it("close 1008 reason=session expired：清会话回登录页，提示「会话已过期」", () => {
+    const fake = mountWithSession();
+    act(() => {
+      fake.emit("close", { code: 1008, reason: "session expired" });
+    });
+    expect(screen.getByRole("alert").textContent).toBe("会话已过期，请重新登录");
+    expect(screen.getByLabelText("访问令牌（USER_TOKEN）")).toBeTruthy();
+    expect(localStorage.getItem("imagent.session")).toBeNull();
+  });
+
+  it("close 1008 reason=session revoked：回登录页提示「此设备已被吊销」", () => {
+    const fake = mountWithSession();
+    act(() => {
+      fake.emit("close", { code: 1008, reason: "session revoked" });
+    });
+    expect(screen.getByRole("alert").textContent).toBe("此设备已被吊销");
+    expect(localStorage.getItem("imagent.session")).toBeNull();
+  });
+
+  it("close 1008 其它/缺席 reason：全清凭证回登录页、无特殊提示（v1.1 行为）", () => {
+    const fake = loginViaUi("tok-9", "Mac/Chrome");
+    act(() => fake.recv(JSON.parse(ackWithSession("sid-1", "st-1", Date.now() + 30 * DAY))));
+    act(() => {
+      fake.emit("close", { code: 1008, reason: "auth failed" });
+    });
+    expect(screen.getByLabelText("访问令牌（USER_TOKEN）")).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(localStorage.getItem("imagent.session")).toBeNull();
+    expect(localStorage.getItem("imagent.userToken")).toBeNull();
+  });
+
+  it("旧 relay 兼容：hello_ack 无 session → userToken 保留、无设备入口（现行模式）", () => {
+    const fake = loginViaUi("tok-9", "Mac/Chrome");
+    act(() => fake.recv({ v: 1, type: "hello_ack", role: "user" }));
+    expect(screen.getByText("已连接")).toBeTruthy();
+    expect(localStorage.getItem("imagent.userToken")).toBe("tok-9");
+    expect(localStorage.getItem("imagent.session")).toBeNull();
+    // 旧 relay 无会话层：设备管理入口与过期横幅均不出现
+    expect(screen.queryByRole("button", { name: /已登录设备/ })).toBeNull();
+    expect(screen.queryByText(/天后过期/)).toBeNull();
+  });
+
+  it("设备管理：打开发 device_list；devices 帧渲染列表（本机标记/相对时间）；吊销其它设备", () => {
+    const fake = mountWithSession();
+    act(() => fake.recv(JSON.parse(ackWithSession("sid-r", "st-r", Date.now() + 20 * DAY))));
+    // 打开设备面板 → 发 device_list
+    fireEvent.click(screen.getByRole("button", { name: "已登录设备" }));
+    expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "device_list" }));
+    expect(screen.getByRole("dialog", { name: "已登录设备" })).toBeTruthy();
+    expect(screen.getByText("加载中…")).toBeTruthy();
+    act(() =>
+      fake.recv({
+        v: 1,
+        type: "devices",
+        devices: [
+          { id: "sid-r", name: "Mac/Chrome", connected: true, lastSeen: Date.now() - 30_000 },
+          { id: "sid-x", name: "iPhone/Safari", connected: false, lastSeen: Date.now() - 2 * 3_600_000 },
+        ],
+      }),
+    );
+    expect(screen.getByText("Mac/Chrome")).toBeTruthy();
+    expect(screen.getByText("iPhone/Safari")).toBeTruthy();
+    expect(screen.getByText("本机")).toBeTruthy();
+    expect(screen.getByText(/刚刚/)).toBeTruthy();
+    expect(screen.getByText(/2 小时前/)).toBeTruthy();
+    // 吊销其它设备 → 发 device_revoke → relay 回更新列表 → 该设备消失
+    fireEvent.click(screen.getByRole("button", { name: "吊销" }));
+    expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "device_revoke", deviceId: "sid-x" }));
+    act(() =>
+      fake.recv({
+        v: 1,
+        type: "devices",
+        devices: [{ id: "sid-r", name: "Mac/Chrome", connected: true, lastSeen: Date.now() }],
+      }),
+    );
+    expect(screen.queryByText("iPhone/Safari")).toBeNull();
+    expect(screen.getByText("本机")).toBeTruthy();
+  });
+
+  it("吊销本机 = 登出：发 device_revoke 后清凭证回登录页", () => {
+    const fake = mountWithSession();
+    act(() => fake.recv(JSON.parse(ackWithSession("sid-r", "st-r", Date.now() + 20 * DAY))));
+    fireEvent.click(screen.getByRole("button", { name: "已登录设备" }));
+    act(() =>
+      fake.recv({
+        v: 1,
+        type: "devices",
+        devices: [{ id: "sid-r", name: "Mac/Chrome", connected: true, lastSeen: Date.now() }],
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "吊销并退出" }));
+    expect(fake.sent).toContain(
+      JSON.stringify({ v: 1, type: "device_revoke", deviceId: "sid-r" }),
+    );
+    expect(screen.getByRole("alert").textContent).toBe("本机设备已吊销，请重新登录");
+    expect(screen.getByLabelText("访问令牌（USER_TOKEN）")).toBeTruthy();
+    expect(localStorage.getItem("imagent.session")).toBeNull();
+  });
+
+  it("会话剩余 <3 天：侧栏底部过期横幅（点击登出回登录页）；29 天不提示", () => {
+    const fake = mountWithSession(Date.now() + 2 * DAY);
+    act(() => fake.recv(JSON.parse(ackWithSession("sid-r", "st-r", Date.now() + 2 * DAY))));
+    const banner = screen.getByRole("button", { name: /天后过期，重新登录可续期/ });
+    expect(banner.textContent).toMatch(/会话 2 天后过期/);
+    fireEvent.click(banner);
+    expect(screen.getByLabelText("访问令牌（USER_TOKEN）")).toBeTruthy();
+    expect(localStorage.getItem("imagent.session")).toBeNull();
+  });
+
+  it("会话剩余 29 天：不出现过期横幅（设备入口仍在）", () => {
+    const fake = mountWithSession(Date.now() + 29 * DAY);
+    act(() => fake.recv(JSON.parse(ackWithSession("sid-r", "st-r", Date.now() + 29 * DAY))));
+    expect(screen.queryByText(/天后过期/)).toBeNull();
+    expect(screen.getByRole("button", { name: "已登录设备" })).toBeTruthy();
   });
 });

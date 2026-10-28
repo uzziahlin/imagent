@@ -490,8 +490,9 @@ pub struct Config {
     /// `wss://<ecs>:8443/imagent/gateway`（公网入口由 Caddy TLS 终结并 strip
     /// `/imagent` 前缀；本地测试可 `ws://127.0.0.1:<port>/gateway`）。网关只发
     /// 出站连接，Mac 零监听端口。gateway token 不入 config（敏感）——走环境
-    /// 变量 `IMAGENT_WEB_GATEWAY_TOKEN`（与 relay 侧 `IMAGENT_RELAY_GATEWAY_TOKEN`
-    /// 同值），对齐飞书 `IMAGENT_FEISHU_APP_SECRET` 先例。
+    /// 变量 `IMAGENT_WEB_GATEWAY_TOKEN`（v1.2 起与 relay 侧
+    /// `IMAGENT_RELAY_GATEWAY_TOKENS` 中**本机 machine** 绑定的 token 同值
+    /// ——每台 Mac 独立 token），对齐飞书 `IMAGENT_FEISHU_APP_SECRET` 先例。
     #[serde(default)]
     pub web_relay_url: Option<String>,
     /// Web 驾驶舱：无 convId 的浏览器消息落到的默认会话名（conv 形如

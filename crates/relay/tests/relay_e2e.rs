@@ -3,14 +3,20 @@
 //!（多 browser 共存广播 / 并存上限 4001 / 单条退出其余存活），以及 v1.1
 //! 多终端用例（多机器并存 / machine 路由 / machines 帧广播 / 同机踢旧 /
 //! 机器上限 / Bearer=default 回退 / 缺省歧义的 bootstrap sync/ping 静默
-//! 豁免）。close code 断言依赖 tungstenite 把 Close 帧投递给应用层，可
-//! 精确断言，无需退化。
+//! 豁免）与 v1.2 会话层用例（登录换发 / sessionToken 重连 / 过期与吊销
+//! reason 区分 / 设备列表与吊销断连 / 会话落盘重启保留 / 会话表上限 /
+//! 网关 token-machine 绑定）。close code 断言依赖 tungstenite 把 Close 帧
+//! 投递给应用层，可精确断言，无需退化。
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
-use imagent_relay::{spawn_relay, RelayConfig, RelayHandle};
+use imagent_relay::{
+    spawn_relay, GatewayTokens, RelayConfig, RelayHandle, DEFAULT_SESSION_TTL_SECS,
+};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::http::Request;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
@@ -19,20 +25,54 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-/// 测试 token（本地随机端口 + loopback，无真实敏感面）。
-const GW_TOKEN: &str = "test-gateway-token-0123456789abcdef";
+/// 测试 token（本地随机端口 + loopback，无真实敏感面）。v1.2 起网关 token
+/// 按 machine 绑定：测试表的每台机器一个独立 token（见 [`gw_token`]）。
 const USER_TOKEN: &str = "test-user-token-0123456789abcdef00";
+/// 测试绑定表覆盖的 machine（既有用例用到的全部身份）。
+const TEST_MACHINES: [&str; 9] = [
+    "default", "home", "work", "other", "m1", "m2", "m3", "m4", "m5",
+];
+
+/// 指定 machine 的网关 token。
+fn gw_token(machine: &str) -> String {
+    format!("test-gateway-token-{machine}")
+}
+
+fn test_gateway_tokens() -> GatewayTokens {
+    let spec = TEST_MACHINES
+        .iter()
+        .map(|m| format!("{m}={}", gw_token(m)))
+        .collect::<Vec<_>>()
+        .join(",");
+    GatewayTokens::parse(&spec).expect("测试绑定表合法")
+}
+
+/// 每个测试 relay 独立的会话状态目录（临时目录，不跨用例共享会话）。
+fn temp_state_dir() -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "imagent-relay-e2e-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+fn test_config(state_dir: &std::path::Path, session_ttl_secs: u64) -> RelayConfig {
+    RelayConfig {
+        gateway_tokens: test_gateway_tokens(),
+        user_token: USER_TOKEN.to_string(),
+        state_dir: state_dir.to_path_buf(),
+        session_ttl_secs,
+    }
+}
+
+async fn spawn_with_config(config: RelayConfig) -> RelayHandle {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    spawn_relay(listener, config).expect("测试配置合法")
+}
 
 async fn spawn_test_relay() -> RelayHandle {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    spawn_relay(
-        listener,
-        RelayConfig {
-            gateway_token: GW_TOKEN.to_string(),
-            user_token: USER_TOKEN.to_string(),
-        },
-    )
-    .expect("测试配置合法")
+    spawn_with_config(test_config(&temp_state_dir(), DEFAULT_SESSION_TTL_SECS)).await
 }
 
 /// WS 握手：path + 可选 Bearer 头。tungstenite 0.29 对自建 Request 不再
@@ -55,6 +95,8 @@ async fn connect_ws(addr: &SocketAddr, path: &str, bearer: Option<&str>) -> Ws {
 }
 
 /// hello 首帧握手（浏览器侧）：发 hello（无 machine 维度）、断言 hello_ack。
+/// v1.2 兼容形态：token 登录（每次换发新会话）；session 形态见
+/// [`resume_session`]。
 async fn hello_handshake(ws: &mut Ws, token: &str) {
     ws.send(Message::text(format!(
         r#"{{"v":1,"type":"hello","token":"{token}"}}"#
@@ -65,11 +107,71 @@ async fn hello_handshake(ws: &mut Ws, token: &str) {
     assert!(ack.contains(r#""type":"hello_ack""#), "hello_ack: {ack}");
 }
 
-/// 网关 hello 握手（v1.1 自报 machine）：发 hello（token+machine），断言
-/// hello_ack 回帧回显相同 machine（身份确认）。
+/// v1.2 登录换发：hello 带 USER_TOKEN（可选 device）→ 断言 hello_ack 携带
+/// session{id, token, expiresAt}，返回 session 对象。
+async fn login_session(ws: &mut Ws, device: Option<&str>) -> serde_json::Value {
+    let device_json = match device {
+        Some(d) => format!(r#","device":"{d}""#),
+        None => String::new(),
+    };
+    ws.send(Message::text(format!(
+        r#"{{"v":1,"type":"hello","token":"{USER_TOKEN}"{device_json}}}"#
+    )))
+    .await
+    .unwrap();
+    let ack = next_text(ws).await;
+    let v: serde_json::Value = serde_json::from_str(&ack).unwrap();
+    assert_eq!(v["type"], "hello_ack", "{ack}");
+    assert_eq!(v["role"], "browser", "{ack}");
+    let session = &v["session"];
+    assert!(
+        session.is_object(),
+        "登录 hello_ack 应携带 session 载荷：{ack}"
+    );
+    assert!(
+        session["id"].as_str().is_some_and(|s| s.len() == 36),
+        "session.id 应为 UUID：{ack}"
+    );
+    assert!(
+        session["token"].as_str().is_some_and(|t| t.len() == 64),
+        "session.token 应为 32B hex：{ack}"
+    );
+    assert!(
+        session["expiresAt"].as_u64().is_some(),
+        "session.expiresAt 应为 unix 秒：{ack}"
+    );
+    v["session"].clone()
+}
+
+/// v1.2 会话重连：hello 带 sessionToken → 断言 hello_ack（含剩余
+/// expiresAt）。
+async fn resume_session(ws: &mut Ws, session_token: &str) -> serde_json::Value {
+    ws.send(Message::text(format!(
+        r#"{{"v":1,"type":"hello","session":"{session_token}"}}"#
+    )))
+    .await
+    .unwrap();
+    let ack = next_text(ws).await;
+    let v: serde_json::Value = serde_json::from_str(&ack).unwrap();
+    assert_eq!(v["type"], "hello_ack", "{ack}");
+    assert_eq!(
+        v["session"]["token"], session_token,
+        "重连 ack 回显 token：{ack}"
+    );
+    assert!(
+        v["session"]["expiresAt"].as_u64().is_some(),
+        "重连 ack 含剩余 expiresAt：{ack}"
+    );
+    v
+}
+
+/// 网关 hello 握手（v1.1 自报 machine + v1.2 token-machine 绑定）：发
+/// hello（该 machine 绑定的 token + machine），断言 hello_ack 回帧回显
+/// 相同 machine（身份确认）。
 async fn gateway_hello(ws: &mut Ws, machine: &str) {
     ws.send(Message::text(format!(
-        r#"{{"v":1,"type":"hello","token":"{GW_TOKEN}","machine":"{machine}"}}"#
+        r#"{{"v":1,"type":"hello","token":"{}","machine":"{machine}"}}"#,
+        gw_token(machine)
     )))
     .await
     .unwrap();
@@ -232,7 +334,7 @@ async fn e2e_bidirectional_passthrough() {
     let handle = spawn_test_relay().await;
     let addr = handle.addr;
 
-    let mut gw = connect_ws(&addr, "/gateway", Some(GW_TOKEN)).await;
+    let mut gw = connect_ws(&addr, "/gateway", Some(&gw_token("default"))).await;
     let ack = next_text(&mut gw).await;
     assert!(
         ack.contains(r#""role":"gateway""#) && ack.contains(r#""machine":"default""#),
@@ -300,7 +402,7 @@ async fn e2e_bearer_header_direct_auth() {
     let handle = spawn_test_relay().await;
     let addr = handle.addr;
 
-    let mut gw = connect_ws(&addr, "/gateway", Some(GW_TOKEN)).await;
+    let mut gw = connect_ws(&addr, "/gateway", Some(&gw_token("default"))).await;
     let ack = next_text(&mut gw).await;
     assert!(
         ack.contains(r#""type":"hello_ack""#) && ack.contains(r#""role":"gateway""#),
@@ -340,7 +442,7 @@ async fn e2e_offline_buffer_replay_in_order() {
     // 等服务端把 3 帧吃进缓冲再连网关（确保走的是缓冲重放路径）。
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let mut gw = connect_ws(&addr, "/gateway", Some(GW_TOKEN)).await;
+    let mut gw = connect_ws(&addr, "/gateway", Some(&gw_token("default"))).await;
     let ack = next_text(&mut gw).await;
     assert!(ack.contains(r#""type":"hello_ack""#), "{ack}");
     for f in frames {
@@ -364,7 +466,7 @@ async fn e2e_machine_online_offline_notify() {
     hello_handshake(&mut br, USER_TOKEN).await;
     consume_browser_snapshots(&mut br, false, &[]).await;
 
-    let mut gw = connect_ws(&addr, "/gateway", Some(GW_TOKEN)).await;
+    let mut gw = connect_ws(&addr, "/gateway", Some(&gw_token("default"))).await;
     let _ = next_text(&mut gw).await; // hello_ack
     let m = next_of_type(&mut br, "machine").await;
     assert_eq!(m["online"], true, "网关上线：{m}");
@@ -387,10 +489,10 @@ async fn e2e_supersede_kicks_old_gateway_4001() {
     let handle = spawn_test_relay().await;
     let addr = handle.addr;
 
-    let mut g1 = connect_ws(&addr, "/gateway", Some(GW_TOKEN)).await;
+    let mut g1 = connect_ws(&addr, "/gateway", Some(&gw_token("default"))).await;
     let _ = next_text(&mut g1).await; // hello_ack
 
-    let mut g2 = connect_ws(&addr, "/gateway", Some(GW_TOKEN)).await;
+    let mut g2 = connect_ws(&addr, "/gateway", Some(&gw_token("default"))).await;
     let ack = next_text(&mut g2).await;
     assert!(ack.contains(r#""type":"hello_ack""#), "新连接正常：{ack}");
 
@@ -431,7 +533,7 @@ async fn e2e_two_browsers_coexist_and_broadcast() {
     consume_browser_snapshots(&mut b2, false, &[]).await;
 
     // 网关上线：machine online 广播，两条都收到。
-    let mut gw = connect_ws(&addr, "/gateway", Some(GW_TOKEN)).await;
+    let mut gw = connect_ws(&addr, "/gateway", Some(&gw_token("default"))).await;
     let _ = next_text(&mut gw).await; // hello_ack
     for (name, ws) in [("b1", &mut b1), ("b2", &mut b2)] {
         let m = next_of_type(ws, "machine").await;
@@ -473,7 +575,7 @@ async fn e2e_browser_cap_9th_close_4001() {
     let handle = spawn_test_relay().await;
     let addr = handle.addr;
 
-    let mut gw = connect_ws(&addr, "/gateway", Some(GW_TOKEN)).await;
+    let mut gw = connect_ws(&addr, "/gateway", Some(&gw_token("default"))).await;
     let _ = next_text(&mut gw).await; // hello_ack
 
     let mut browsers = Vec::new();
@@ -528,7 +630,7 @@ async fn e2e_browser_disconnect_others_keep_receiving() {
     tokio::time::sleep(Duration::from_millis(200)).await; // 等服务端 release
 
     // 网关上线：machine online 广播，b2（仍在线）收到。
-    let mut gw = connect_ws(&addr, "/gateway", Some(GW_TOKEN)).await;
+    let mut gw = connect_ws(&addr, "/gateway", Some(&gw_token("default"))).await;
     let _ = next_text(&mut gw).await;
     let m = next_of_type(&mut b2, "machine").await;
     assert_eq!(m["online"], true, "b2 收上线广播：{m}");
@@ -677,9 +779,10 @@ async fn e2e_gateway_machine_cap_5th_close_4001() {
 
     // 第 5 台（新 machine）：认证通过 → close 4001（reason 满员）。
     let mut g5 = connect_ws(&addr, "/gateway", None).await;
-    g5.send(Message::text(
-        r#"{"v":1,"type":"hello","token":"test-gateway-token-0123456789abcdef","machine":"m5"}"#,
-    ))
+    g5.send(Message::text(format!(
+        r#"{{"v":1,"type":"hello","token":"{}","machine":"m5"}}"#,
+        gw_token("m5")
+    )))
     .await
     .unwrap();
     let frame = expect_close(&mut g5, 4001).await;
@@ -711,7 +814,7 @@ async fn e2e_bearer_coexists_with_named_machine() {
     let handle = spawn_test_relay().await;
     let addr = handle.addr;
 
-    let mut gw_def = connect_ws(&addr, "/gateway", Some(GW_TOKEN)).await;
+    let mut gw_def = connect_ws(&addr, "/gateway", Some(&gw_token("default"))).await;
     let ack = next_text(&mut gw_def).await;
     assert!(
         ack.contains(r#""machine":"default""#),
@@ -905,7 +1008,7 @@ async fn e2e_prefixed_ws_and_healthz_endpoints() {
     // hello_ack 之后紧跟双快照（此时网关未连 → machine false + machines 空）。
     consume_browser_snapshots(&mut br, false, &[]).await;
 
-    let mut gw = connect_ws(&addr, "/imagent/gateway", Some(GW_TOKEN)).await;
+    let mut gw = connect_ws(&addr, "/imagent/gateway", Some(&gw_token("default"))).await;
     let ack = next_text(&mut gw).await;
     assert!(ack.contains(r#""role":"gateway""#), "{ack}");
 
@@ -1033,6 +1136,358 @@ async fn e2e_rate_limit_21st_frame() {
         "{err}"
     );
     expect_close(&mut br, 1008).await;
+
+    handle.shutdown();
+    handle.wait().await;
+}
+
+/// 场景 20（v1.2 会话层）：登录换发 + 重连 + 兼容形态——hello 带 USER_TOKEN
+/// 换发 session{id,token,expiresAt}；新连接带 sessionToken 重连成功（ack
+/// 回显 token 与剩余 expiresAt）；同 sessionToken 多连接共用同一会话（多
+/// 标签）；旧 token 形态仍可用（每次换新会话——curl/脚本兼容路径）；
+/// device_list 看到设备与 connected 标记。
+#[tokio::test]
+async fn e2e_session_login_reconnect_and_legacy_compat() {
+    let handle = spawn_test_relay().await;
+    let addr = handle.addr;
+
+    // 登录换发（device 字段命名）。
+    let mut b1 = connect_ws(&addr, "/ws", None).await;
+    let s1 = login_session(&mut b1, Some("iPhone")).await;
+    let (s1_id, s1_token) = (
+        s1["id"].as_str().unwrap().to_string(),
+        s1["token"].as_str().unwrap().to_string(),
+    );
+    // expiresAt ≈ now + 30d。
+    let exp = s1["expiresAt"].as_u64().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(
+        exp > now + 29 * 86_400 && exp < now + 31 * 86_400,
+        "30 天有效期：{exp}"
+    );
+    consume_browser_snapshots(&mut b1, false, &[]).await;
+
+    // device_list：1 台设备，字段齐全，connected=true（b1 在线）。
+    b1.send(Message::text(r#"{"v":1,"type":"device_list"}"#))
+        .await
+        .unwrap();
+    let devs = next_of_type(&mut b1, "devices").await;
+    let arr = devs["devices"].as_array().expect("devices 数组");
+    assert_eq!(arr.len(), 1, "{devs}");
+    assert_eq!(arr[0]["id"], s1_id, "设备 id = session id：{devs}");
+    assert_eq!(arr[0]["name"], "iPhone", "{devs}");
+    assert_eq!(arr[0]["connected"], true, "{devs}");
+    assert!(arr[0]["lastSeen"].as_u64().is_some(), "{devs}");
+    assert!(arr[0]["created"].as_u64().is_some(), "{devs}");
+
+    // 新连接（第二标签）带 sessionToken 重连：同一会话，connected 保持。
+    let mut b2 = connect_ws(&addr, "/ws", None).await;
+    resume_session(&mut b2, &s1_token).await;
+    consume_browser_snapshots(&mut b2, false, &[]).await;
+    b2.send(Message::text(r#"{"v":1,"type":"device_list"}"#))
+        .await
+        .unwrap();
+    let devs = next_of_type(&mut b2, "devices").await;
+    assert_eq!(
+        devs["devices"].as_array().unwrap().len(),
+        1,
+        "同会话不新增设备：{devs}"
+    );
+
+    // 兼容形态：hello 带 USER_TOKEN（旧形态）→ 每次换发**新**会话。
+    let mut b3 = connect_ws(&addr, "/ws", None).await;
+    hello_handshake(&mut b3, USER_TOKEN).await;
+    consume_browser_snapshots(&mut b3, false, &[]).await;
+    b3.send(Message::text(r#"{"v":1,"type":"device_list"}"#))
+        .await
+        .unwrap();
+    let devs = next_of_type(&mut b3, "devices").await;
+    let arr = devs["devices"].as_array().unwrap();
+    assert_eq!(arr.len(), 2, "旧形态换新会话（新设备条目）：{devs}");
+    assert!(
+        arr.iter().any(|d| d["name"] == "unknown-device"),
+        "无 device 字段且无 UA → unknown-device：{devs}"
+    );
+
+    handle.shutdown();
+    handle.wait().await;
+}
+
+/// 场景 21（v1.2 会话层）：拒绝 reason 区分——伪造 sessionToken → 1008
+/// "auth failed"；hello 无任何凭证 → 1008；过期会话（短 TTL 配置）→ 1008
+/// "session expired"。
+#[tokio::test]
+async fn e2e_session_reject_reasons() {
+    let handle = spawn_test_relay().await;
+    let addr = handle.addr;
+
+    // 伪造 sessionToken。
+    let mut b1 = connect_ws(&addr, "/ws", None).await;
+    b1.send(Message::text(
+        r#"{"v":1,"type":"hello","session":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}"#,
+    ))
+    .await
+    .unwrap();
+    let frame = expect_close(&mut b1, 1008).await;
+    assert!(
+        frame.reason.to_string().contains("auth failed"),
+        "伪造 session token：reason={}",
+        frame.reason
+    );
+
+    // 无任何凭证（token 与 session 皆无）。
+    let mut b2 = connect_ws(&addr, "/ws", None).await;
+    b2.send(Message::text(r#"{"v":1,"type":"hello"}"#))
+        .await
+        .unwrap();
+    expect_close(&mut b2, 1008).await;
+
+    // 过期：1s TTL 配置的独立 relay。
+    drop(handle.wait());
+    let dir = temp_state_dir();
+    let handle2 = spawn_with_config(test_config(&dir, 1)).await;
+    let addr2 = handle2.addr;
+    let mut b3 = connect_ws(&addr2, "/ws", None).await;
+    let s = login_session(&mut b3, Some("iPhone")).await;
+    consume_browser_snapshots(&mut b3, false, &[]).await;
+    drop(b3);
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    let mut b4 = connect_ws(&addr2, "/ws", None).await;
+    b4.send(Message::text(format!(
+        r#"{{"v":1,"type":"hello","session":"{}"}}"#,
+        s["token"].as_str().unwrap()
+    )))
+    .await
+    .unwrap();
+    let frame = expect_close(&mut b4, 1008).await;
+    assert!(
+        frame.reason.to_string().contains("session expired"),
+        "过期会话：reason={}",
+        frame.reason
+    );
+
+    handle2.shutdown();
+    handle2.wait().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 场景 22（v1.2 会话层）：会话表上限 32——32 次登录（逐连接）成功后第
+/// 33 次 close 1008 "too many sessions"（先清理过期/墓碑仍满才拒）。
+#[tokio::test]
+async fn e2e_session_cap_33rd_login_rejected() {
+    let handle = spawn_test_relay().await;
+    let addr = handle.addr;
+
+    // 32 次登录（每次新连接 = 新会话；连接即断，会话保留）。
+    for i in 0..32 {
+        let mut ws = connect_ws(&addr, "/ws", None).await;
+        hello_handshake(&mut ws, USER_TOKEN).await;
+        // 收到 ack 即会话已入表；断开不清会话（断开≠吊销）。
+        drop(ws);
+        let _ = i;
+    }
+    // 第 33 次：USER_TOKEN 正确但表满 → close 1008 "too many sessions"。
+    let mut b33 = connect_ws(&addr, "/ws", None).await;
+    b33.send(Message::text(format!(
+        r#"{{"v":1,"type":"hello","token":"{USER_TOKEN}"}}"#
+    )))
+    .await
+    .unwrap();
+    let frame = expect_close(&mut b33, 1008).await;
+    assert!(
+        frame.reason.to_string().contains("too many sessions"),
+        "reason={}",
+        frame.reason
+    );
+
+    handle.shutdown();
+    handle.wait().await;
+}
+
+/// 场景 23（v1.2 设备管理）：device_revoke——两台设备在线，从 A 吊销 B：
+/// B 的连接被断（close 1008 "session revoked"）、A 收到更新后的 devices 帧
+///（不含 B）、B 的 sessionToken 重连 → 1008 "session revoked"、A 不受影响。
+#[tokio::test]
+async fn e2e_device_revoke_disconnects_target() {
+    let handle = spawn_test_relay().await;
+    let addr = handle.addr;
+
+    let mut a = connect_ws(&addr, "/ws", None).await;
+    let sa = login_session(&mut a, Some("iPhone")).await;
+    consume_browser_snapshots(&mut a, false, &[]).await;
+    let mut b = connect_ws(&addr, "/ws", None).await;
+    let sb = login_session(&mut b, Some("MacBook")).await;
+    consume_browser_snapshots(&mut b, false, &[]).await;
+
+    // A 吊销 B。
+    a.send(Message::text(format!(
+        r#"{{"v":1,"type":"device_revoke","deviceId":"{}"}}"#,
+        sb["id"].as_str().unwrap()
+    )))
+    .await
+    .unwrap();
+    // B 被断：close 1008 "session revoked"。
+    let frame = expect_close(&mut b, 1008).await;
+    assert!(
+        frame.reason.to_string().contains("session revoked"),
+        "被吊销连接：reason={}",
+        frame.reason
+    );
+    // A 收到更新后的 devices 帧：只剩 iPhone。
+    let devs = next_of_type(&mut a, "devices").await;
+    let arr = devs["devices"].as_array().unwrap();
+    assert_eq!(arr.len(), 1, "{devs}");
+    assert_eq!(arr[0]["name"], "iPhone", "{devs}");
+
+    // B 的 sessionToken 重连 → "session revoked"（墓碑 reason 区分）。
+    let mut b2 = connect_ws(&addr, "/ws", None).await;
+    b2.send(Message::text(format!(
+        r#"{{"v":1,"type":"hello","session":"{}"}}"#,
+        sb["token"].as_str().unwrap()
+    )))
+    .await
+    .unwrap();
+    let frame = expect_close(&mut b2, 1008).await;
+    assert!(
+        frame.reason.to_string().contains("session revoked"),
+        "重连被吊销会话：reason={}",
+        frame.reason
+    );
+
+    // A 不受影响（会话仍有效、device_list 可用）。
+    a.send(Message::text(r#"{"v":1,"type":"device_list"}"#))
+        .await
+        .unwrap();
+    let devs = next_of_type(&mut a, "devices").await;
+    assert_eq!(devs["devices"].as_array().unwrap().len(), 1);
+    let _ = sa;
+
+    handle.shutdown();
+    handle.wait().await;
+}
+
+/// 场景 24（v1.2 会话持久化）：relay 重启（同 state 目录）后会话保留——
+/// sessionToken 重连成功、device_list 带出设备（connected 重算）。
+#[tokio::test]
+async fn e2e_sessions_persist_across_relay_restart() {
+    let dir = temp_state_dir();
+    let handle = spawn_with_config(test_config(&dir, DEFAULT_SESSION_TTL_SECS)).await;
+    let addr = handle.addr;
+
+    let mut b = connect_ws(&addr, "/ws", None).await;
+    let s = login_session(&mut b, Some("iPhone")).await;
+    consume_browser_snapshots(&mut b, false, &[]).await;
+    let token = s["token"].as_str().unwrap().to_string();
+    handle.shutdown();
+    handle.wait().await;
+
+    // 重启：新 relay 进程（同 state 目录、新端口）。
+    let handle2 = spawn_with_config(test_config(&dir, DEFAULT_SESSION_TTL_SECS)).await;
+    let addr2 = handle2.addr;
+    let mut b2 = connect_ws(&addr2, "/ws", None).await;
+    resume_session(&mut b2, &token).await;
+    consume_browser_snapshots(&mut b2, false, &[]).await;
+    b2.send(Message::text(r#"{"v":1,"type":"device_list"}"#))
+        .await
+        .unwrap();
+    let devs = next_of_type(&mut b2, "devices").await;
+    let arr = devs["devices"].as_array().unwrap();
+    assert_eq!(arr.len(), 1, "重启后会话保留：{devs}");
+    assert_eq!(arr[0]["name"], "iPhone", "{devs}");
+    assert_eq!(arr[0]["connected"], true, "重连后 connected 重算：{devs}");
+
+    handle2.shutdown();
+    handle2.wait().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 场景 25（v1.2 网关 token-machine 绑定）：token 对且 machine 匹配 →
+/// 通过；token 对但 machine 不匹配（顶替其它机器）→ 1008；未知 token →
+/// 1008；Bearer = default 机器，只有绑定 default 的 token 可走 Bearer。
+#[tokio::test]
+async fn e2e_gateway_token_machine_binding() {
+    let gateway_tokens = GatewayTokens::parse(
+        "default=def-tok-0123456789abcdef,home-mac=home-tok-0123456789abcdef,work-mac=work-tok-0123456789abcdef",
+    )
+    .unwrap();
+    let dir = temp_state_dir();
+    let handle = spawn_with_config(RelayConfig {
+        gateway_tokens,
+        user_token: USER_TOKEN.to_string(),
+        state_dir: dir.clone(),
+        session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
+    })
+    .await;
+    let addr = handle.addr;
+
+    // 正确绑定：token 对 + machine 对。
+    let mut g1 = connect_ws(&addr, "/gateway", None).await;
+    g1.send(Message::text(
+        r#"{"v":1,"type":"hello","token":"home-tok-0123456789abcdef","machine":"home-mac"}"#,
+    ))
+    .await
+    .unwrap();
+    let ack = next_text(&mut g1).await;
+    assert!(
+        ack.contains(r#""machine":"home-mac""#),
+        "正确绑定放行并回显：{ack}"
+    );
+
+    // token 对但 machine 不匹配：home 的 token 顶替 work → 1008。
+    let mut g2 = connect_ws(&addr, "/gateway", None).await;
+    g2.send(Message::text(
+        r#"{"v":1,"type":"hello","token":"home-tok-0123456789abcdef","machine":"work-mac"}"#,
+    ))
+    .await
+    .unwrap();
+    expect_close(&mut g2, 1008).await;
+
+    // 未知 token。
+    let mut g3 = connect_ws(&addr, "/gateway", None).await;
+    g3.send(Message::text(
+        r#"{"v":1,"type":"hello","token":"nobody-knows-this-token","machine":"home-mac"}"#,
+    ))
+    .await
+    .unwrap();
+    expect_close(&mut g3, 1008).await;
+
+    // Bearer = default 机器：非 default 绑定的 token → 1008。
+    let mut g4 = connect_ws(&addr, "/gateway", Some("home-tok-0123456789abcdef")).await;
+    expect_close(&mut g4, 1008).await;
+    // default 绑定的 token → Bearer 直通 default 机器。
+    let mut g5 = connect_ws(&addr, "/gateway", Some("def-tok-0123456789abcdef")).await;
+    let ack = next_text(&mut g5).await;
+    assert!(
+        ack.contains(r#""machine":"default""#),
+        "default 绑定 token 可走 Bearer：{ack}"
+    );
+
+    handle.shutdown();
+    handle.wait().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 场景 26（v1.2 会话层）：浏览器 Bearer USER_TOKEN = 登录形态（curl/脚本
+/// 便利，无从携带 sessionToken）→ 同样换发会话（hello_ack 带 session 载荷）。
+#[tokio::test]
+async fn e2e_browser_bearer_issues_session() {
+    let handle = spawn_test_relay().await;
+    let addr = handle.addr;
+
+    let mut br = connect_ws(&addr, "/ws", Some(USER_TOKEN)).await;
+    let ack = next_text(&mut br).await;
+    assert!(
+        ack.contains(r#""type":"hello_ack""#) && ack.contains(r#""session""#),
+        "Bearer 登录也应换发会话：{ack}"
+    );
+    consume_browser_snapshots(&mut br, false, &[]).await;
+
+    // 错误 Bearer → 失败路径（1008）。
+    let mut bad = connect_ws(&addr, "/ws", Some("wrong-token")).await;
+    expect_close(&mut bad, 1008).await;
 
     handle.shutdown();
     handle.wait().await;

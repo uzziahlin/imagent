@@ -1,5 +1,5 @@
 import { useMemo, useState, type FormEvent, type KeyboardEvent } from "react";
-import { convDisplayName, DEFAULT_MACHINE } from "../lib/protocol";
+import { convDisplayName, DEFAULT_MACHINE, normalizeExpiryMs } from "../lib/protocol";
 
 /** 侧边栏会话项数据（App 从 state 派生）：conv 全名 + 最后消息预览/时间。 */
 export type ConvItem = {
@@ -7,6 +7,9 @@ export type ConvItem = {
   preview: string;
   at: number;
 };
+
+/** 会话过期横幅阈值：剩余不足 3 天开始提示。 */
+const EXPIRY_WARN_DAYS = 3;
 
 /** 会话项时间：当天显示 HH:mm，否则 M/D HH:mm。 */
 function formatTime(at: number): string {
@@ -33,6 +36,8 @@ function formatTime(at: number): string {
  * - 新会话 = 由上层发 `/switch <名字>` message 命令帧（convId 留空落默认
  *   会话），命令语义由网关解析，SPA 同时把当前 conv 切到 `web:<名字>`。
  * - 未收到任何 machines 帧（旧 relay）：不显示机器区，单机行为与升级前一致。
+ * - v1.2 会话层：底部「已登录设备」入口（仅会话模式）与「会话 N 天后过期」
+ *   续期横幅（剩余 < 3 天；点击进入登出流程）。
  *
  * 已知限制：会话内消息历史仅 SPA 内存保留，页面刷新后仅当前卡片由 sync
  * 重发恢复（text/user 回显不重放）。
@@ -44,6 +49,9 @@ export function Sidebar({
   machines,
   machinesKnown,
   currentMachine,
+  sessionExpiresAt,
+  onRenewSession,
+  onOpenDevices,
   onSelect,
   onSelectMachine,
   onCreate,
@@ -57,6 +65,12 @@ export function Sidebar({
   /** 收到过 machines 帧 = 多机模式（显示机器切换器）。 */
   machinesKnown: boolean;
   currentMachine: string;
+  /** v1.2 会话过期时间（ms/秒 epoch 容错）；缺省 = 旧 relay 直连模式。 */
+  sessionExpiresAt?: number;
+  /** 过期横幅点击 → 登出流程（重新登录即续期 30 天）。 */
+  onRenewSession?: () => void;
+  /** v1.2 设备管理入口（App 仅会话模式传入；旧 relay 不显示）。 */
+  onOpenDevices?: () => void;
   onSelect: (conv: string) => void;
   /** 机器切换器点选（切 currentMachine + 触发该机器 sync）。 */
   onSelectMachine: (machine: string) => void;
@@ -65,6 +79,16 @@ export function Sidebar({
 }) {
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState("");
+
+  // v1.2 过期横幅：剩余 < 3 天提示（天数向上取整，至少 1 天）
+  const daysLeft = useMemo(() => {
+    if (sessionExpiresAt === undefined) {
+      return null;
+    }
+    const remain = normalizeExpiryMs(sessionExpiresAt) - Date.now();
+    return Math.max(1, Math.ceil(remain / 86_400_000));
+  }, [sessionExpiresAt]);
+  const expiryWarning = daysLeft !== null && daysLeft < EXPIRY_WARN_DAYS;
 
   // 机器行：在线列表 + 当前选中机器掉线时补一行灰点（保持可见可选，帧会回
   // machine_offline toast 提示原因）。default 不是真实机器，不补。
@@ -206,6 +230,26 @@ export function Sidebar({
       </nav>
 
       <div className="border-t border-line p-2">
+        {/* v1.2 会话过期横幅：点击进入登出流程（重新登录续期 30 天） */}
+        {expiryWarning && onRenewSession && (
+          <button
+            type="button"
+            onClick={onRenewSession}
+            className="mb-1.5 w-full rounded-lg border border-amber-400/60 bg-amber-50 px-3 py-1.5 text-left text-xs text-amber-800 transition-colors hover:bg-amber-100 dark:border-amber-500/40 dark:bg-amber-950/60 dark:text-amber-200 dark:hover:bg-amber-900/60"
+          >
+            会话 {daysLeft} 天后过期，重新登录可续期
+          </button>
+        )}
+        {/* v1.2 设备管理入口（仅会话模式——旧 relay 无会话层不显示） */}
+        {onOpenDevices && (
+          <button
+            type="button"
+            onClick={onOpenDevices}
+            className="mb-1.5 w-full rounded-lg px-3 py-1.5 text-left text-xs text-muted transition-colors hover:bg-panel2 hover:text-ink"
+          >
+            已登录设备
+          </button>
+        )}
         {creating ? (
           <form onSubmit={submit} className="space-y-1.5">
             {/* text-base（16px）：防 iOS Safari 聚焦 <16px 输入框时自动放大页面 */}

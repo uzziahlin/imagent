@@ -1,4 +1,4 @@
-// 帧协议 v1.1（事实源：crates/web/src/lib.rs + crates/relay/src/lib.rs）。
+// 帧协议 v1.2（事实源：crates/web/src/lib.rs + crates/relay/src/lib.rs）。
 // 信封 `{"v":1,"type":...}`，全部 JSON 文本帧。TS 类型与 Rust 侧逐字段对齐：
 // - convId 恒为完整 conv 形态（`web:<session>`）；裸 session 名仅网关侧兼容输入，
 //   SPA 回执帧（message / approval_response）一律原样回传收到的 convId。
@@ -7,6 +7,10 @@
 // - v1.1 多终端：浏览器→网关帧可选带 `machine`（目标机器）；网关→浏览器帧
 //   可选带 `machine`（来源机器，旧网关缺席 → SPA 归 DEFAULT_MACHINE 单机兼容）；
 //   relay→浏览器新增 `machines` 帧（全量在线机器快照）。
+// - v1.2 会话层：首次登录 hello 带 `token`+可选 `device` → hello_ack 携带
+//   `session:{id,token,expiresAt}`（USER_TOKEN 一次性，之后重连 hello 带
+//   `session`）；设备管理 `device_list`/`device_revoke` ↔ `devices` 帧。
+//   hello_ack 无 session 字段 = 旧 relay → SPA 回退现行 USER_TOKEN 直连模式。
 
 export const PROTOCOL_VERSION = 1;
 
@@ -64,10 +68,71 @@ export type CardPayload = {
 export type CardFrameState = "streaming" | "done";
 
 // ---------------------------------------------------------------------------
+// v1.2 会话层
+// ---------------------------------------------------------------------------
+
+/** relay 签发的会话凭证（hello_ack.session）：30 天有效期，重连 hello 用
+ *  session.token 替代 USER_TOKEN。expiresAt 约定毫秒 epoch（秒级经
+ *  normalizeExpiryMs 容错放大）。 */
+export type SessionInfo = { id: string; token: string; expiresAt: number };
+
+/** expiresAt 容错归一毫秒 epoch：秒级时间戳（< 1e12）自动 ×1000。 */
+export function normalizeExpiryMs(expiresAt: number): number {
+  return expiresAt < 1e12 ? expiresAt * 1000 : expiresAt;
+}
+
+/** UA → 设备短名（登录缺省设备名，如「iPhone/Safari」「Mac/Chrome」）。
+ *  纯函数便于单测：OS 取 iPhone/iPad/Android/Mac/Windows/Linux 首个命中；
+ *  浏览器判定顺序敏感——Edge/Opera 的 UA 同时含 Chrome/ 与 Safari/，须先
+ *  判衍生再判本体；两者均未命中给兜底短名。 */
+export function deviceSummary(ua: string): string {
+  const os = ua.includes("iPhone")
+    ? "iPhone"
+    : ua.includes("iPad")
+      ? "iPad"
+      : ua.includes("Android")
+        ? "Android"
+        : ua.includes("Macintosh") || ua.includes("Mac OS X")
+          ? "Mac"
+          : ua.includes("Windows")
+            ? "Windows"
+            : ua.includes("Linux")
+              ? "Linux"
+              : undefined;
+  const browser = /Edg(e)?\//.test(ua)
+    ? "Edge"
+    : ua.includes("OPR/") || ua.includes("Opera")
+      ? "Opera"
+      : ua.includes("Firefox/")
+        ? "Firefox"
+        : ua.includes("Chrome/")
+          ? "Chrome"
+          : ua.includes("Safari/")
+            ? "Safari"
+            : undefined;
+  if (os && browser) {
+    return `${os}/${browser}`;
+  }
+  return os ?? browser ?? "未知设备";
+}
+
+// ---------------------------------------------------------------------------
 // 出站帧（浏览器 → 网关/relay）
 // ---------------------------------------------------------------------------
 
-export type HelloFrame = { v: typeof PROTOCOL_VERSION; type: "hello"; token: string };
+/** hello 双形态（v1.2）：首次登录带 token（+可选 device）；重连带 session
+ *  （session 由新 relay 签发，只会发往新 relay；旧 relay 持有 session 场景
+ *  不存在——token 缺失直接 1008 回登录页）。 */
+export type HelloFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "hello";
+  /** 首次登录：USER_TOKEN（一次性，签发 session 后 SPA 即删除）。 */
+  token?: string;
+  /** 重连：会话凭证。 */
+  session?: string;
+  /** 首次登录可选设备名（缺省 deviceSummary(navigator.userAgent)）。 */
+  device?: string;
+};
 
 export type MessageFrame = {
   v: typeof PROTOCOL_VERSION;
@@ -105,13 +170,25 @@ export type ControlFrame = {
 export type SyncFrame = { v: typeof PROTOCOL_VERSION; type: "sync"; machine?: string };
 export type PingFrame = { v: typeof PROTOCOL_VERSION; type: "ping"; machine?: string };
 
+/** v1.2 设备管理：请求已登录设备列表。 */
+export type DeviceListFrame = { v: typeof PROTOCOL_VERSION; type: "device_list" };
+
+/** v1.2 设备管理：吊销设备（deviceId = devices 帧里的 id）。 */
+export type DeviceRevokeFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "device_revoke";
+  deviceId: string;
+};
+
 export type OutboundFrame =
   | HelloFrame
   | MessageFrame
   | ApprovalResponseFrame
   | ControlFrame
   | SyncFrame
-  | PingFrame;
+  | PingFrame
+  | DeviceListFrame
+  | DeviceRevokeFrame;
 
 /** 出站帧序列化（undefined 字段不序列化，与网关入站解析兼容）。 */
 export function encodeFrame(frame: OutboundFrame): string {
@@ -122,7 +199,14 @@ export function encodeFrame(frame: OutboundFrame): string {
 // 入站帧（网关/relay → 浏览器）
 // ---------------------------------------------------------------------------
 
-export type HelloAckFrame = { v: typeof PROTOCOL_VERSION; type: "hello_ack"; role: string };
+/** v1.2：hello_ack 可选携带 session（旧 relay 缺席 → SPA 回退 USER_TOKEN
+ *  直连模式，行为与 v1.1 完全一致）。 */
+export type HelloAckFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "hello_ack";
+  role: string;
+  session?: SessionInfo;
+};
 
 export type MachineFrame = { v: typeof PROTOCOL_VERSION; type: "machine"; online: boolean };
 
@@ -182,6 +266,23 @@ export type ApprovalResolvedFrame = {
 
 export type PongFrame = { v: typeof PROTOCOL_VERSION; type: "pong" };
 
+/** v1.2 已登录设备项（devices 帧）。lastSeen/created 容错为可选（缺席仅
+ *  影响展示，不影响协议可用性）。 */
+export type DeviceInfo = {
+  id: string;
+  name: string;
+  connected: boolean;
+  lastSeen?: number;
+  created?: number;
+};
+
+/** v1.2：relay→浏览器设备列表快照（device_list 请求 / device_revoke 后回）。 */
+export type DevicesFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "devices";
+  devices: DeviceInfo[];
+};
+
 export type InboundFrame =
   | HelloAckFrame
   | MachineFrame
@@ -191,7 +292,8 @@ export type InboundFrame =
   | CardFrame
   | ApprovalRequestFrame
   | ApprovalResolvedFrame
-  | PongFrame;
+  | PongFrame
+  | DevicesFrame;
 
 // ---------------------------------------------------------------------------
 // parseFrame：v/type 校验 + 每类帧关键字段存在性校验，非法返回 null（不抛）
@@ -212,11 +314,39 @@ const cardShapeOk = (o: Record<string, unknown>): boolean =>
   o.card !== null &&
   isStr(o.card as Record<string, unknown>, "text");
 
+/** v1.2 hello_ack.session：缺席（旧 relay）或 {id,token,expiresAt} 形状齐备。 */
+const sessionOk = (o: Record<string, unknown>): boolean => {
+  const s = o.session;
+  if (s === undefined) {
+    return true;
+  }
+  if (typeof s !== "object" || s === null) {
+    return false;
+  }
+  const r = s as Record<string, unknown>;
+  return isStr(r, "id") && isStr(r, "token") && typeof r.expiresAt === "number";
+};
+
+/** v1.2 devices 帧元素：id/name 字符串、connected 布尔；lastSeen/created
+ *  可选但出现即须为数字（容错展示字段）。 */
+const deviceOk = (d: unknown): boolean => {
+  if (typeof d !== "object" || d === null) {
+    return false;
+  }
+  const r = d as Record<string, unknown>;
+  return (
+    isStr(r, "id") &&
+    isStr(r, "name") &&
+    typeof r.connected === "boolean" &&
+    (r.lastSeen === undefined || typeof r.lastSeen === "number") &&
+    (r.created === undefined || typeof r.created === "number")
+  );
+};
+
 const RESOLVED_DECISIONS: readonly string[] = ["allow", "deny", "always", "cancelled"];
 
 /** 入站帧类型表：type → 关键字段校验（前向兼容靠“未知 type → null”由调用方忽略）。 */
 const INBOUND_CHECKS: Record<string, FieldCheck> = {
-  hello_ack: (o) => isStr(o, "role"),
   machine: (o) => typeof o.online === "boolean",
   machines: (o) =>
     Array.isArray(o.online) && o.online.every((m) => typeof m === "string"),
@@ -233,6 +363,8 @@ const INBOUND_CHECKS: Record<string, FieldCheck> = {
     RESOLVED_DECISIONS.includes(o.decision) &&
     machineOk(o),
   pong: () => true,
+  hello_ack: (o) => isStr(o, "role") && sessionOk(o),
+  devices: (o) => Array.isArray(o.devices) && o.devices.every(deviceOk),
 };
 
 /** 解析一条入站文本帧：信封 v=1 + 已知 type + 关键字段齐备才放行，否则 null。 */
@@ -321,6 +453,8 @@ export type AppState = {
   currentMachine: string;
   /** 旧网关 machine 帧（单机在线态）；多机模式以 machines 列表为准。 */
   machineOnline: boolean;
+  /** v1.2 已登录设备列表（devices 帧）；null = 尚未拉取（设备面板未打开）。 */
+  devices: DeviceInfo[] | null;
   lastError: { code: string; at: number } | null;
   lastNotice: MachineNotice | null;
 };
@@ -349,6 +483,7 @@ export function initialState(): AppState {
     machinesKnown: false,
     currentMachine: DEFAULT_MACHINE,
     machineOnline: false,
+    devices: null,
     lastError: null,
     lastNotice: null,
   };
@@ -603,6 +738,9 @@ function reduceFrame(state: AppState, frame: InboundFrame): AppState {
       return state; // 连接管理层（ws.ts）消费，不进消息流
     case "machines":
       return reduceMachines(state, frame);
+    case "devices":
+      // v1.2 设备列表快照：全量覆盖（device_list 请求 / device_revoke 后回）
+      return { ...state, devices: frame.devices };
     case "machine":
       return { ...state, machineOnline: frame.online };
     case "error":

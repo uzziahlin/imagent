@@ -1,13 +1,13 @@
-//! `imagent-relay`：Web 驾驶舱 M1——ECS 侧无状态 WS 帧中继
-//! （设计见 docs/WEB_DESIGN.md §2/§3.1，规格以任务评审修订版为准）。
+//! `imagent-relay`：Web 驾驶舱——ECS 侧 WS 帧中继 + 会话层
+//!（设计见 docs/WEB_DESIGN.md §2/§3.1，规格以任务评审修订版为准）。
 //!
 //! 拓扑：`浏览器 WS（多连接并存）⇄ relay ⇄ 网关 WS（单连接）`，连接都是
 //! 客户端模式连到本进程（Mac 网关零入站端口）。本 crate 是中继：
-//! **不理解任何业务语义**，只做认证（双 token、fail-closed）、转发
-//! （Hub 状态机）、网关离线缓冲（200 帧 / 1MB）、每连接限流
-//! （20 帧 / 10s）。部署形态：ECS systemd 服务绑 127.0.0.1:3010，公网由
-//! Caddy（8443，TLS 终结）`handle_path /imagent/*` strip 前缀后反代——
-//! relay 看到的路径已是 strip 后的 `/xxx`。
+//! **不理解任何业务语义**，只做认证（fail-closed、网关 token-machine
+//! 绑定、浏览器会话层）、转发（Hub 状态机）、网关离线缓冲（200 帧 /
+//! 1MB）、每连接限流（20 帧 / 10s）。部署形态：ECS systemd 服务绑
+//! 127.0.0.1:3010，公网由 Caddy（8443，TLS 终结）`handle_path /imagent/*`
+//! strip 前缀后反代——relay 看到的路径已是 strip 后的 `/xxx`。
 //!
 //! 端点语义（真机常态：手机 + 电脑 + 多标签同时在线）：
 //! - **浏览器侧多连接并存 + 广播**：同一 user token 的多条 browser 连接
@@ -22,6 +22,21 @@
 //!   Hub 按 machine 槽位存多连接（上限 [`MAX_GATEWAYS`] = 4——满员且非同
 //!   机重连的新连接 close 4001）；**同一 machine 重连仍踢旧**（每台机器
 //!   单连接语义，旧连接 close 4001 superseded）。
+//! - **网关 token-machine 绑定（帧协议 v1.2，L2 安全加固）**：env
+//!   `IMAGENT_RELAY_GATEWAY_TOKENS`（`home-mac=9a08…,work-mac=7f2b…`，
+//!   每台 Mac 一个独立 token，见 [`GatewayTokens`]）：token 匹配**且**
+//!   hello 自报 machine 与绑定一致才放行——一台 Mac 的 token 泄露只能
+//!   扮演它自己，不能顶替其它机器。旧单 token env
+//!   （`IMAGENT_RELAY_GATEWAY_TOKEN`）已删除；两者都未设拒启
+//!   （fail-closed）。
+//! - **浏览器会话层（帧协议 v1.2，L2 安全加固，见 [`sessions`]）**：
+//!   USER_TOKEN 仅登录 hello 一次性换发 30 天会话凭证（sessionToken），
+//!   此后重连用 sessionToken（SPA 不再长期持有 USER_TOKEN）；会话可列表
+//!   /吊销（`device_list` / `device_revoke` transport 管理帧）；会话表落
+//!   盘 `<state_dir>/sessions.json`（env `IMAGENT_RELAY_STATE_DIR`，缺省
+//!   `/var/lib/imagent-relay`，main 负责 mkdir）——**部署注意**：systemd
+//!   需配 `StateDirectory=imagent-relay`（落于同一路径）或显式设该 env，
+//!   否则写盘失败只会降级为「重启后全员重登」。
 //!
 //! 分层（任务说明 §4.7）：核心状态机全部在本 lib（可单测 + 集成测试直接
 //! [`spawn_relay`] 起真 server），`main.rs` 只做 env / bind / tracing 组装。
@@ -30,6 +45,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -46,6 +62,10 @@ use futures::StreamExt;
 use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
+
+mod sessions;
+
+use sessions::{DeviceView, SessionLookup, SessionStore};
 
 /// 统一 tracing target（仓库纪律）。
 const TARGET: &str = "imagent::relay";
@@ -88,6 +108,13 @@ const MAX_GATEWAYS: usize = 4;
 const DEFAULT_MACHINE: &str = "default";
 /// machine id 协议约束（v1.1）：≤32 char，仅 ASCII 字母数字与 `-_`。
 const MACHINE_ID_MAX_CHARS: usize = 32;
+/// 会话有效期缺省（协议 v1.2）：30 天；测试可经
+/// [`RelayConfig::session_ttl_secs`] 缩短验证过期路径。
+pub const DEFAULT_SESSION_TTL_SECS: u64 = 30 * 24 * 3600;
+/// hello `device` 字段协议约束（v1.2）：≤64 char。
+const DEVICE_NAME_MAX_CHARS: usize = 64;
+/// 连接日志里 session id 的展示前缀长度（完整 UUID 不进日志噪音）。
+const SESSION_LOG_PREFIX: usize = 8;
 
 /// WS close code（RFC 6455 + 私有码，§4.2/§4.3/§4.5）。
 const CLOSE_POLICY: u16 = 1008; // 认证失败 / 协议违规（binary、非 hello 首帧）/ 限流
@@ -99,34 +126,143 @@ const CLOSE_SUPERSEDED: u16 = 4001; // 网关新连接顶替旧连接（踢旧�
 // 配置与 fail-closed 校验
 // ---------------------------------------------------------------------------
 
-/// relay 运行配置（token 对）。main 从 env 读取；测试直接构造。
+/// 网关 token-machine 绑定表（协议 v1.2，L2 安全加固）：每台 Mac 一个
+/// 独立 token，env `IMAGENT_RELAY_GATEWAY_TOKENS`（逗号分隔的
+/// `machine=token` 对，如 `home-mac=9a08…,work-mac=7f2b…`）。防的是「单
+/// token 泄露即可扮演任意机器」——绑定校验下，一台 Mac 的 token 泄露只能
+/// 扮演它自己（token 匹配**且** hello 自报 machine 与绑定一致才放行）。
+///
+/// 旧单 token env（`IMAGENT_RELAY_GATEWAY_TOKEN`）已删除：部署面只有我们
+/// 自己的 ECS，升级时同步换 env——ECS 侧改为本表形态；每台 Mac 的
+/// `~/.imagent/web-relay.env`（`IMAGENT_WEB_GATEWAY_TOKEN`）填**自己
+/// machine** 对应的 token（`crates/web` 的 gateway_token 参数不变）。
+#[derive(Clone, Debug, Default)]
+pub struct GatewayTokens {
+    /// machine → token（machine 已过与 hello `machine` 同款的合法性校验）。
+    map: HashMap<String, String>,
+}
+
+impl GatewayTokens {
+    /// 解析 `machine=token` 逗号分隔表（纯函数便于单测）。fail-closed：
+    /// 整体为空 / 表项缺 `=` / machine 或 token 空 / machine 非法（同
+    /// machine id 协议约束）/ machine 重复 / token 重复绑定 → Err（可读
+    /// 信息含修复指引）。空表项（尾随逗号）容忍跳过——有意义的失败
+    ///（缺 `=`、空段值、重复）都会被抓住。
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let mut map: HashMap<String, String> = HashMap::new();
+        let mut seen_tokens: HashMap<String, String> = HashMap::new();
+        for pair in spec.split(',') {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            let (machine, token) = pair.split_once('=').ok_or_else(|| {
+                format!("网关 token 表项 `{pair}` 缺 `=`（格式：machine=token 逗号分隔）")
+            })?;
+            let (machine, token) = (machine.trim(), token.trim());
+            if machine.is_empty() || token.is_empty() {
+                return Err(format!(
+                    "网关 token 表项 `{pair}` 的 machine 或 token 为空（格式：machine=token）"
+                ));
+            }
+            if !valid_machine_id(machine) {
+                return Err(format!(
+                    "网关 token 表项的 machine `{machine}` 非法：≤32 char，仅 ASCII 字母数字与 -_（与 hello machine 同款约束）"
+                ));
+            }
+            if map.insert(machine.to_string(), token.to_string()).is_some() {
+                return Err(format!(
+                    "网关 token 表项的 machine `{machine}` 重复（每台机器一个 token）"
+                ));
+            }
+            if let Some(first) = seen_tokens.insert(token.to_string(), machine.to_string()) {
+                return Err(format!(
+                    "网关 token `{}`… 同时绑定 `{first}` 与 `{machine}`：一个 token 只能绑一台机器（绑定语义）",
+                    token.chars().take(4).collect::<String>()
+                ));
+            }
+        }
+        if map.is_empty() {
+            return Err(
+                "网关 token 表为空：必填 IMAGENT_RELAY_GATEWAY_TOKENS（machine=token 逗号分隔，\
+                 每台 Mac 一个独立 token；openssl rand -hex 32 生成）"
+                    .into(),
+            );
+        }
+        Ok(Self { map })
+    }
+
+    /// 绑定校验（协议 v1.2）：token 逐表项**恒定时间**匹配（不提前
+    /// break），命中后校验 machine 与绑定一致。Bearer 直通无 machine 维度
+    /// → 调用方传 [`DEFAULT_MACHINE`]（只有绑定 default 的 token 可走
+    /// Bearer）。machine 明文等值比较——machine 本就随路由明文出现，不是
+    /// 秘密；恒定时间只保护 token。
+    pub fn verify(&self, machine: &str, token: &str) -> bool {
+        let mut bound: Option<&String> = None;
+        for (m, t) in &self.map {
+            if constant_time_eq(token, t) {
+                bound = Some(m); // 不 break：恒定时间全表扫描
+            }
+        }
+        bound.is_some_and(|m| m == machine)
+    }
+
+    /// 已绑定的 machine 列表（有序，启动日志用；token 绝不外泄）。
+    pub fn machines(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.map.keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// 是否有 token 与给定值相同（RelayConfig 职责分离校验用；配置期
+    /// 等值比较即可，不涉运行时探测）。
+    fn contains_token(&self, token: &str) -> bool {
+        self.map.values().any(|t| t == token)
+    }
+}
+
+/// relay 运行配置。main 从 env 读取；测试直接构造。
 #[derive(Clone)]
 pub struct RelayConfig {
-    /// 网关侧认证 token（`IMAGENT_RELAY_GATEWAY_TOKEN`）。
-    pub gateway_token: String,
-    /// 浏览器侧认证 token（`IMAGENT_RELAY_USER_TOKEN`）。
+    /// 网关侧 token-machine 绑定表（`IMAGENT_RELAY_GATEWAY_TOKENS`）。
+    pub gateway_tokens: GatewayTokens,
+    /// 浏览器侧登录 token（`IMAGENT_RELAY_USER_TOKEN`，仅登录换发会话用）。
     pub user_token: String,
+    /// 会话状态目录（`IMAGENT_RELAY_STATE_DIR`，缺省
+    /// `/var/lib/imagent-relay`，main 负责 mkdir）：会话表落盘
+    /// `<dir>/sessions.json`。systemd 部署可用 `StateDirectory=imagent-relay`
+    /// 落到同一路径。
+    pub state_dir: PathBuf,
+    /// 会话有效期（秒）：缺省 [`DEFAULT_SESSION_TTL_SECS`]（30 天）；测试
+    /// 可缩短验证过期路径。
+    pub session_ttl_secs: u64,
 }
 
 impl RelayConfig {
-    /// fail-closed 校验（§4.2，纯函数便于单测）：任一 token 缺失/空 → 拒
-    /// （不提供无认证模式）；两 token 相同 → 拒（职责分离——拿到一个 token
-    /// 不能同时扮演网关与浏览器两端）。
+    /// fail-closed 校验（§4.2，纯函数便于单测）：token 表/USER_TOKEN 缺失
+    /// 或空 → 拒（不提供无认证模式）；任一网关 token 与 USER_TOKEN 相同
+    /// → 拒（职责分离——拿到一个 token 不能同时扮演网关与浏览器两端）。
     pub fn validate(&self) -> Result<(), String> {
-        if self.gateway_token.trim().is_empty() {
-            return Err("网关 token 缺失或为空：必填 IMAGENT_RELAY_GATEWAY_TOKEN\
-                 （openssl rand -hex 32 生成；relay 不提供无认证模式）"
-                .into());
+        if self.gateway_tokens.is_empty() {
+            return Err(
+                "网关 token 表缺失或为空：必填 IMAGENT_RELAY_GATEWAY_TOKENS（machine=token 逗号分隔，\
+                 每台 Mac 一个独立 token；openssl rand -hex 32 生成；relay 不提供无认证模式）"
+                    .into(),
+            );
         }
         if self.user_token.trim().is_empty() {
             return Err("浏览器 token 缺失或为空：必填 IMAGENT_RELAY_USER_TOKEN\
                  （openssl rand -hex 32 生成）"
                 .into());
         }
-        if self.gateway_token == self.user_token {
+        if self.gateway_tokens.contains_token(&self.user_token) {
             return Err(
-                "IMAGENT_RELAY_GATEWAY_TOKEN 与 IMAGENT_RELAY_USER_TOKEN 不得相同：\
-                 职责分离，防止拿到一个 token 就能扮演网关与浏览器两端"
+                "IMAGENT_RELAY_USER_TOKEN 不得与任何网关 token 相同：职责分离，\
+                 防止拿到一个 token 就能扮演网关与浏览器两端"
                     .into(),
             );
         }
@@ -167,26 +303,57 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// hello 首帧解析（§4.2 主认证形态）
+// hello 首帧解析（§4.2 主认证形态 + v1.2 会话层）
 // ---------------------------------------------------------------------------
 
-/// hello 首帧反序列化形状：`{"v":1,"type":"hello","token":"...","machine":"..."}`
-///（v1.1：machine 可选，网关侧自报身份；浏览器侧无 machine 概念，不发送）。
+/// hello 首帧反序列化形状（v1.2 会话层后的全量字段）：
+/// `{"v":1,"type":"hello","token":"…","machine":"…","session":"…","device":"…"}`
+/// - 网关侧：`token`（machine 绑定校验）+ 可选 `machine` 自报身份
+///   （v1.1）；网关无会话概念，`session` 字段一律拒绝；
+/// - 浏览器侧：`session`（重连）优先，`token`（USER_TOKEN 登录换发）次之，
+///   可选 `device`（≤64 char，缺省记 UA 摘要）；浏览器无 machine 概念
+///   （带了也只经校验不消费）。
 #[derive(Deserialize)]
 struct HelloFrame {
     v: i64,
     #[serde(rename = "type")]
     kind: String,
-    token: String,
+    #[serde(default)]
+    token: Option<String>,
     #[serde(default)]
     machine: Option<String>,
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    device: Option<String>,
+}
+
+/// hello 携带的凭证（v1.2）：`session` 字段优先（重连），`token` 次之
+///（登录换发/网关认证）。
+#[derive(Debug, PartialEq, Eq)]
+enum HelloCredential {
+    /// USER_TOKEN（浏览器登录换发路径）/ 网关 token（machine 绑定校验）。
+    Bootstrap(String),
+    /// 浏览器会话凭证（重连路径）。
+    Session(String),
+}
+
+/// hello 解析产物。
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedHello {
+    credential: HelloCredential,
+    /// 网关侧自报身份（缺省 `"default"`；浏览器侧只校验不消费）。
+    machine: String,
+    /// 浏览器侧设备名（trim 后非空才算；缺省走 UA 摘要，见 `device_name`）。
+    device: Option<String>,
 }
 
 /// hello 解析失败原因（只为日志可读；对外行为一致——close 1008）。
 #[derive(Debug, PartialEq, Eq)]
 enum HelloParseError {
-    /// JSON 畸形 / 缺字段 / token 非字符串 / token 为空串 / machine 非法
-    ///（空串、trim 后为空、超 32 char、含字母数字-_ 之外的字符）。
+    /// JSON 畸形 / 缺任何凭证（token 与 session 皆无）/ 凭证空串 /
+    /// machine 非法（空串、trim 后为空、超 32 char、含字母数字-_ 之外的
+    /// 字符）/ device 超 64 char。
     Malformed,
     /// 首帧 type 不是 hello。
     NotHello,
@@ -194,32 +361,41 @@ enum HelloParseError {
     BadVersion,
 }
 
+/// machine id 合法性判定（trim 后非空、≤32 char、仅 ASCII 字母数字与
+/// `-_`）：hello 自报 machine 与 [`GatewayTokens`] 的绑定 machine 共用
+/// 同一约束。
+fn valid_machine_id(m: &str) -> bool {
+    !m.is_empty()
+        && m.chars().count() <= MACHINE_ID_MAX_CHARS
+        && m.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 /// machine id 校验（v1.1 协议约束，纯函数便于单测）：trim、非空、
 /// ≤32 char、仅 ASCII 字母数字与 `-_`。通过返回 trim 后的值。
 fn validate_machine(raw: &str) -> Result<String, HelloParseError> {
     let m = raw.trim();
-    if m.is_empty() {
-        return Err(HelloParseError::Malformed);
+    if valid_machine_id(m) {
+        Ok(m.to_string())
+    } else {
+        Err(HelloParseError::Malformed)
     }
-    if m.chars().count() > MACHINE_ID_MAX_CHARS {
-        return Err(HelloParseError::Malformed);
-    }
-    if !m
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err(HelloParseError::Malformed);
-    }
-    Ok(m.to_string())
 }
 
-/// 解析首帧 hello（纯函数便于单测），返回 `(token, machine)`。空 token 判
-/// Malformed：空串不可能与合法配置 token 相等，提前拒绝让语义更明确。
-/// machine 缺省（字段不存在）→ `"default"`；带值则经 [`validate_machine`]
-/// 校验（非法拒绝——machine 是路由主键，脏值宁可断连也不静默改写）。
-/// 浏览器侧调用方忽略 machine（浏览器 hello 不带该字段；带了也只校验不
-/// 消费，不影响浏览器路由语义）。
-fn parse_hello(text: &str) -> Result<(String, String), HelloParseError> {
+/// trim 后非空才算有值（None = 字段缺省/空白）。
+fn non_empty_field(raw: &Option<String>) -> Option<String> {
+    let t = raw.as_deref().map(str::trim).filter(|s| !s.is_empty())?;
+    Some(t.to_string())
+}
+
+/// 解析首帧 hello（纯函数便于单测）。凭证分拣（v1.2）：`session` 字段
+/// 优先、`token` 字段次之（换发路径）、两者皆无 Malformed；`session` 带
+/// 值即走会话路径（同时带 token 也一样——session 优先，不回落）。空串
+/// 凭证按 Malformed 拒（空串不可能匹配任何合法凭证，提前拒绝语义更明
+/// 确）。machine 缺省 → `"default"`，带值经 [`validate_machine`] 校验
+///（machine 是路由主键，脏值宁可断连也不静默改写）。device ≤64 char
+///（超限 Malformed），trim 后为空按缺省处理。
+fn parse_hello(text: &str) -> Result<ParsedHello, HelloParseError> {
     let h: HelloFrame = serde_json::from_str(text).map_err(|_| HelloParseError::Malformed)?;
     if h.v != 1 {
         return Err(HelloParseError::BadVersion);
@@ -227,14 +403,29 @@ fn parse_hello(text: &str) -> Result<(String, String), HelloParseError> {
     if h.kind != "hello" {
         return Err(HelloParseError::NotHello);
     }
-    if h.token.is_empty() {
-        return Err(HelloParseError::Malformed);
-    }
+    let credential = match non_empty_field(&h.session) {
+        Some(s) => HelloCredential::Session(s),
+        None => match non_empty_field(&h.token) {
+            Some(t) => HelloCredential::Bootstrap(t),
+            None => return Err(HelloParseError::Malformed),
+        },
+    };
     let machine = match h.machine.as_deref() {
         None => DEFAULT_MACHINE.to_string(),
         Some(m) => validate_machine(m)?,
     };
-    Ok((h.token, machine))
+    let device = non_empty_field(&h.device);
+    if device
+        .as_deref()
+        .is_some_and(|d| d.chars().count() > DEVICE_NAME_MAX_CHARS)
+    {
+        return Err(HelloParseError::Malformed);
+    }
+    Ok(ParsedHello {
+        credential,
+        machine,
+        device,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -314,7 +505,7 @@ impl OfflineBuffer {
 // Hub 状态机（§4.3）
 // ---------------------------------------------------------------------------
 
-/// 连接角色：决定槽位、认证 token 与转发方向。
+/// 连接角色：决定槽位、认证路径与转发方向。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Role {
     Gateway,
@@ -328,27 +519,94 @@ impl Role {
             Role::Browser => "browser",
         }
     }
-
-    fn token(self, cfg: &RelayConfig) -> &str {
-        match self {
-            Role::Gateway => &cfg.gateway_token,
-            Role::Browser => &cfg.user_token,
-        }
-    }
 }
 
 /// relay 自产帧（§4.3 行为 7：除此之外 relay 不解析、不改写、不记录任何
-/// 业务帧内容——machine/error 之外 relay 对帧是「盲」的）。hello_ack 的
-/// `machine` 仅网关侧携带（v1.1 身份确认：回显 hello 自报的 machine）。
-fn hello_ack_frame(role: Role, machine: Option<&str>) -> Message {
-    match machine {
-        Some(m) => Message::text(
-            serde_json::json!({"v": 1, "type": "hello_ack", "role": role.name(), "machine": m})
+/// 业务帧内容——machine/error/session/devices 之外 relay 对帧是「盲」的）。
+/// 网关侧 hello_ack 携带 `machine`（v1.1 身份确认：回显 hello 自报的
+/// machine）；浏览器侧见 [`browser_hello_ack`]（v1.2 携带 session）。
+fn gateway_hello_ack_frame(role: Role, machine: &str) -> Message {
+    Message::text(
+        serde_json::json!({"v": 1, "type": "hello_ack", "role": role.name(), "machine": machine})
+            .to_string(),
+    )
+}
+
+/// 浏览器侧 hello_ack（协议 v1.2 §1/§2）：携带会话凭证载荷
+/// `session:{id,token,expiresAt}`。登录路径 token = 新换发的会话 token
+///（明文只此一次）；重连路径 token = 回显客户端自报的 token（客户端本来
+/// 就持有，回显只为帧形状统一）。expiresAt 为剩余有效期的绝对 unix 秒。
+fn browser_hello_ack(role: Role, session: &BrowserSession) -> Message {
+    Message::text(
+        serde_json::json!({
+            "v": 1,
+            "type": "hello_ack",
+            "role": role.name(),
+            "session": {
+                "id": session.id,
+                "token": session.ack_token,
+                "expiresAt": session.expires_at,
+            }
+        })
+        .to_string(),
+    )
+}
+
+/// devices 帧（协议 v1.2 §4）：设备列表快照（`device_list` 的应答与
+/// `device_revoke` 的回执）。设备按 (created, id) 有序。
+fn devices_frame(devices: &[DeviceView]) -> Message {
+    let arr: Vec<serde_json::Value> = devices
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "id": d.id,
+                "name": d.name,
+                "connected": d.connected,
+                "lastSeen": d.last_seen,
+                "created": d.created,
+            })
+        })
+        .collect();
+    Message::text(serde_json::json!({"v": 1, "type": "devices", "devices": arr}).to_string())
+}
+
+/// 浏览器侧 transport 管理帧（协议 v1.2 §4）：设备列表 / 吊销——浏览器与
+/// relay 自产自消，**不进业务路由**（与 sync/ping 的歧义豁免同级，在
+/// machine 路由之前分拣）。`device_revoke` 缺 deviceId / 非字符串 → 按
+/// no-op 吊销处理（回当前 devices 帧），不让畸形管理帧漏进业务路由。
+#[derive(Debug)]
+enum DeviceFrame {
+    List,
+    Revoke(String),
+}
+
+fn parse_device_frame(text: &str) -> Option<DeviceFrame> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    match v.get("type")?.as_str()? {
+        "device_list" => Some(DeviceFrame::List),
+        "device_revoke" => Some(DeviceFrame::Revoke(
+            v.get("deviceId")
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
                 .to_string(),
-        ),
-        None => Message::text(
-            serde_json::json!({"v": 1, "type": "hello_ack", "role": role.name()}).to_string(),
-        ),
+        )),
+        _ => None,
+    }
+}
+
+/// 设备名解析（协议 v1.2 §1）：hello `device` 字段优先；缺省记 UA 摘要
+///（sha256 前 8 hex，前缀 `ua-`——UA 全文太长且不稳定，摘要够辨识）；
+/// 无 UA（curl/测试客户端）→ `unknown-device`。
+fn device_name(device: Option<&str>, headers: &HeaderMap) -> String {
+    if let Some(d) = device.map(str::trim).filter(|d| !d.is_empty()) {
+        return d.to_string();
+    }
+    match headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(ua) => format!("ua-{}", &sessions::hash_token(ua)[..8]),
+        None => "unknown-device".to_string(),
     }
 }
 
@@ -724,6 +982,12 @@ fn close_msg(code: u16, reason: &'static str) -> Message {
     }))
 }
 
+/// 连接日志的 session 标识（UUID 前 8 位：日志可对上设备，又不至于把
+/// 整个 id 刷进日志噪音）。
+fn session_log_id(id: &str) -> String {
+    id.chars().take(SESSION_LOG_PREFIX).collect()
+}
+
 // ---------------------------------------------------------------------------
 // HTTP 路由（§4.1；relay 看到的是 Caddy strip /imagent 后的路径）
 // ---------------------------------------------------------------------------
@@ -790,11 +1054,13 @@ async fn security_headers(req: Request, next: Next) -> Response {
     res
 }
 
-/// axum 共享状态（每连接 Clone；Arc 内部共享同一 Hub / 配置）。
+/// axum 共享状态（每连接 Clone；Arc 内部共享同一 Hub / 配置 / 会话表）。
 #[derive(Clone)]
 struct RelayState {
     hub: Hub,
     config: Arc<RelayConfig>,
+    /// 会话表（v1.2）：启动时从 `<state_dir>/sessions.json` 加载。
+    sessions: Arc<SessionStore>,
 }
 
 /// SPA 静态资源（M1 占位 index.html；M3 构建产物落入 `static/` 后零改动挂载）。
@@ -909,12 +1175,103 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .strip_prefix("Bearer ")
 }
 
-/// 认证失败路径（§4.2）：sleep 1s（防爆破节奏）后 close 1008。
-/// 日志只记角色与原因，绝不记 token。
+/// 认证失败路径（§4.2 + v1.2 reason 区分）：sleep 1s（防爆破节奏）后
+/// close 1008。reason 区分：`"auth failed"`（凭证不匹配/畸形）/
+/// `"session expired"` / `"session revoked"` / `"too many sessions"`（会话
+/// 表满）。日志只记角色与原因，绝不记 token。
 async fn auth_reject(socket: &mut WebSocket, role: Role, reason: &'static str) {
     tracing::warn!(target: TARGET, role = role.name(), reason, "认证失败，延迟关闭");
     tokio::time::sleep(AUTH_FAIL_DELAY).await;
-    let _ = socket.send(close_msg(CLOSE_POLICY, "auth failed")).await;
+    let _ = socket.send(close_msg(CLOSE_POLICY, reason)).await;
+}
+
+/// 浏览器连接的会话绑定（v1.2）：认证产物，注册 Hub 后 `bind` 进会话表
+///（revoke 断连 / connected 标记 / 日志标识都靠它）。`ack_token` 是回给
+/// 客户端的 hello_ack session 载荷：登录 = 新 token 明文（只此一次），
+/// 重连 = 回显。
+#[derive(Clone)]
+struct BrowserSession {
+    id: String,
+    ack_token: String,
+    expires_at: u64,
+}
+
+/// hello 认证产物（两角色共用一个分拣入口）。
+enum HelloOutcome {
+    /// 网关：machine 身份（token-machine 绑定校验已通过）。
+    Gateway(String),
+    /// 浏览器：会话（登录换发或重连命中）。
+    Browser(BrowserSession),
+}
+
+/// 换发新会话（USER_TOKEN 验证通过后）。会话表满（清理+墓碑淘汰后仍 ≥
+/// [`sessions::MAX_SESSIONS`]）→ Err（调用方 close 1008 "too many
+/// sessions"）。
+fn issue_session(
+    st: &RelayState,
+    headers: &HeaderMap,
+    device: Option<&str>,
+) -> Result<BrowserSession, ()> {
+    let name = device_name(device, headers);
+    let issued = st
+        .sessions
+        .issue(&name, sessions::unix_now(), st.config.session_ttl_secs)?;
+    Ok(BrowserSession {
+        id: issued.id,
+        ack_token: issued.token,
+        expires_at: issued.expires_at,
+    })
+}
+
+/// hello 首帧认证分拣（纯内存操作，锁内微临界区）：
+/// - 网关：Bootstrap 凭证过 [`GatewayTokens::verify`]（token 匹配且
+///   machine 与绑定一致）；session 形态一律拒（网关无会话概念）；
+/// - 浏览器：Session 凭证过 [`SessionStore::verify`]（reason 区分
+///   expired/revoked/auth failed）；Bootstrap 凭证比对 USER_TOKEN → 换发。
+fn auth_hello(
+    st: &RelayState,
+    role: Role,
+    text: &str,
+    headers: &HeaderMap,
+) -> Result<HelloOutcome, &'static str> {
+    let parsed = parse_hello(text).map_err(|_| "auth failed")?;
+    match role {
+        Role::Gateway => match parsed.credential {
+            HelloCredential::Session(_) => Err("auth failed"),
+            HelloCredential::Bootstrap(tok) => {
+                if st.config.gateway_tokens.verify(&parsed.machine, &tok) {
+                    Ok(HelloOutcome::Gateway(parsed.machine))
+                } else {
+                    Err("auth failed")
+                }
+            }
+        },
+        Role::Browser => match parsed.credential {
+            HelloCredential::Session(tok) => {
+                match st.sessions.verify(&tok, sessions::unix_now()) {
+                    SessionLookup::Valid { id, expires_at } => {
+                        Ok(HelloOutcome::Browser(BrowserSession {
+                            id,
+                            // 重连：回显客户端自报的 token。
+                            ack_token: tok,
+                            expires_at,
+                        }))
+                    }
+                    SessionLookup::Expired => Err("session expired"),
+                    SessionLookup::Revoked => Err("session revoked"),
+                    SessionLookup::NotFound => Err("auth failed"),
+                }
+            }
+            HelloCredential::Bootstrap(tok) => {
+                if !constant_time_eq(&tok, &st.config.user_token) {
+                    return Err("auth failed");
+                }
+                issue_session(st, headers, parsed.device.as_deref())
+                    .map(HelloOutcome::Browser)
+                    .map_err(|_| "too many sessions")
+            }
+        },
+    }
 }
 
 /// 向自身 channel 顺序投递（连接尚未进入消费循环）。容量推导见
@@ -928,31 +1285,44 @@ async fn send_all(tx: &mpsc::Sender<Outbound>, items: impl IntoIterator<Item = O
 }
 
 /// 单条 WS 连接完整生命周期：认证（hello / Bearer 直通）→ 注册 Hub →
-/// 转发主循环（限流 + idle 超时 + 停机响应）→ 退出清槽位。
+/// 转发主循环（限流 + idle 超时 + 停机响应 + transport 管理帧）→ 退出清
+/// 槽位。
 async fn handle_connection(mut socket: WebSocket, st: RelayState, role: Role, headers: HeaderMap) {
-    let expected = role.token(&st.config);
-
-    // ---- 认证（§4.2，fail-closed）----
-    // 认证产物：网关侧 machine 身份（hello 自报 / Bearer 回退 default）；
-    // 浏览器侧无 machine 概念（恒 None）。
+    // ---- 认证（§4.2 + v1.2 会话层，fail-closed）----
+    // 认证产物：网关侧 machine 身份（token-machine 绑定校验通过）；浏览器
+    // 侧会话（登录换发或重连命中——每条浏览器连接都绑定一个会话）。
     let mut auth_machine: Option<String> = None;
+    let mut browser_session: Option<BrowserSession> = None;
     // Bearer 正确 → 直进转发态；Bearer 带了但不正确 → 失败路径（不回落
     // hello：发起方已表明认证意图，回落只会让探测多一种节奏）。
     match bearer_token(&headers) {
-        Some(t) if constant_time_eq(t, expected) => {
-            // Bearer 直通无 machine 维度（v1.1 回退兼容：旧网关版本/调试
-            // 脚本）→ default 机器。
-            if role == Role::Gateway {
-                auth_machine = Some(DEFAULT_MACHINE.to_string());
+        Some(t) => {
+            let ok = match role {
+                // Bearer 无 machine 维度 → default 机器：v1.2 绑定语义下只有
+                // 绑定 default 的 token 可走 Bearer（其余 1008）。
+                Role::Gateway => st.config.gateway_tokens.verify(DEFAULT_MACHINE, t),
+                // 浏览器 Bearer = USER_TOKEN 登录形态（curl/脚本便利）→ 换发
+                // 新会话（Bearer 无从携带 sessionToken，重连必须走 hello 帧）。
+                Role::Browser => constant_time_eq(t, &st.config.user_token),
+            };
+            if !ok {
+                auth_reject(&mut socket, role, "auth failed").await;
+                return;
+            }
+            match role {
+                Role::Gateway => auth_machine = Some(DEFAULT_MACHINE.to_string()),
+                Role::Browser => match issue_session(&st, &headers, None) {
+                    Ok(s) => browser_session = Some(s),
+                    Err(()) => {
+                        auth_reject(&mut socket, role, "too many sessions").await;
+                        return;
+                    }
+                },
             }
         }
-        Some(_) => {
-            auth_reject(&mut socket, role, "Authorization Bearer token 不匹配").await;
-            return;
-        }
         None => {
-            // hello 首帧认证：10s 内必须是 `{"v":1,"type":"hello","token":...}`
-            //（网关侧 v1.1 起带 machine 自报身份）。
+            // hello 首帧认证：10s 内必须是 `{"v":1,"type":"hello",…}`（网关
+            // 带 machine 自报 + token；浏览器带 session 重连 / token 登录）。
             match tokio::time::timeout(AUTH_TIMEOUT, socket.next()).await {
                 Err(_) => {
                     tracing::warn!(target: TARGET, role = role.name(), "认证超时（10s 无 hello），关闭");
@@ -961,28 +1331,18 @@ async fn handle_connection(mut socket: WebSocket, st: RelayState, role: Role, he
                 }
                 Ok(None) | Ok(Some(Err(_))) => return, // 连接已断 / 协议错误
                 Ok(Some(Ok(msg))) => {
-                    let authed = match msg {
-                        Message::Text(t) => match parse_hello(t.as_str()) {
-                            Ok((tok, machine)) => {
-                                if !constant_time_eq(&tok, expected) {
-                                    false
-                                } else {
-                                    // machine 身份仅网关侧消费（浏览器 hello 不带该
-                                    // 字段，带了也只经校验不使用）。
-                                    if role == Role::Gateway {
-                                        auth_machine = Some(machine);
-                                    }
-                                    true
-                                }
-                            }
-                            Err(_) => false,
-                        },
-                        _ => false, // 首帧必须是文本 hello
+                    let outcome = match msg {
+                        Message::Text(t) => auth_hello(&st, role, t.as_str(), &headers),
+                        // 首帧必须是文本 hello。
+                        _ => Err("auth failed"),
                     };
-                    if !authed {
-                        auth_reject(&mut socket, role, "首帧不是合法 hello（token 不匹配/畸形）")
-                            .await;
-                        return;
+                    match outcome {
+                        Ok(HelloOutcome::Gateway(machine)) => auth_machine = Some(machine),
+                        Ok(HelloOutcome::Browser(s)) => browser_session = Some(s),
+                        Err(reason) => {
+                            auth_reject(&mut socket, role, reason).await;
+                            return;
+                        }
                     }
                 }
             }
@@ -1016,7 +1376,7 @@ async fn handle_connection(mut socket: WebSocket, st: RelayState, role: Role, he
             }
             // hello_ack 先于重放帧：客户端先确认角色、认证结果与 machine 身份
             //（v1.1 回显自报的 machine），再消费重放。
-            let mut init = vec![Outbound::Msg(hello_ack_frame(role, Some(&machine)))];
+            let mut init = vec![Outbound::Msg(gateway_hello_ack_frame(role, &machine))];
             init.extend(
                 reg.replay
                     .into_iter()
@@ -1049,18 +1409,30 @@ async fn handle_connection(mut socket: WebSocket, st: RelayState, role: Role, he
                     .await;
                 return;
             }
-            // hello_ack 后立即推双快照（§4.3 行为 3）：旧 machine 帧（default
-            // 机器在线状态，v1 兼容——帧序不变）+ 全量 machines 列表（v1.1）。
+            // 会话绑定（v1.2）：失败 = 认证与注册之间会话被吊销（竞态窗口）
+            // ——fail-closed 断开，不留「已吊销会话的幽灵连接」。
+            let session = browser_session.clone().expect("浏览器认证通过后必有会话");
+            if !st.sessions.bind(&session.id, conn_id, tx.clone()) {
+                tracing::warn!(target: TARGET, session = %session_log_id(&session.id), "会话在注册前被吊销，断开");
+                st.hub.release_browser(conn_id);
+                let _ = socket
+                    .send(close_msg(CLOSE_POLICY, "session revoked"))
+                    .await;
+                return;
+            }
+            // hello_ack（含 session 载荷）后立即推双快照（§4.3 行为 3）：旧
+            // machine 帧（default 机器在线状态，v1 兼容——帧序不变）+ 全量
+            // machines 列表（v1.1）。
             send_all(
                 &tx,
                 vec![
-                    Outbound::Msg(hello_ack_frame(role, None)),
+                    Outbound::Msg(browser_hello_ack(role, &session)),
                     Outbound::Msg(machine_frame(reg.machine_online)),
                     Outbound::Msg(machines_frame(&reg.machines)),
                 ],
             )
             .await;
-            tracing::info!(target: TARGET, machine_online = reg.machine_online, machines = ?reg.machines, browsers = reg.browsers, "browser 连接（认证通过）");
+            tracing::info!(target: TARGET, session = %session_log_id(&session.id), machine_online = reg.machine_online, machines = ?reg.machines, browsers = reg.browsers, "browser 连接（认证通过）");
         }
     }
 
@@ -1126,7 +1498,38 @@ async fn handle_connection(mut socket: WebSocket, st: RelayState, role: Role, he
                             // 转交 Utf8Bytes；try_send 不跨连接 await，杜绝
                             // 互相顶死的环。
                             match role {
-                                Role::Browser => match st.hub.route_browser_frame(text.as_str()) {
+                                Role::Browser => {
+                                    // transport 管理帧（v1.2 设备管理）：relay
+                                    // 自产自消，不进业务路由（先于 machine 分拣）。
+                                    if let Some(df) = parse_device_frame(text.as_str()) {
+                                        match df {
+                                            DeviceFrame::List => {
+                                                let _ = socket
+                                                    .send(devices_frame(&st.sessions.devices(
+                                                        sessions::unix_now(),
+                                                    )))
+                                                    .await;
+                                            }
+                                            DeviceFrame::Revoke(device_id) => {
+                                                // 单用户语义（见 SessionStore::revoke
+                                                // 头注释）：任一在线会话可吊销其它。
+                                                // 先摘投递口再回 devices 帧：被吊销
+                                                // 连接的 1008 与新列表都是确定态。
+                                                let closed = st.sessions.revoke(&device_id, sessions::unix_now());
+                                                tracing::info!(target: TARGET, device = %device_id, closed = closed.len(), "会话吊销（device_revoke）");
+                                                for tx in closed {
+                                                    try_send(&tx, Outbound::Close(CLOSE_POLICY, "session revoked"));
+                                                }
+                                                let _ = socket
+                                                    .send(devices_frame(&st.sessions.devices(
+                                                        sessions::unix_now(),
+                                                    )))
+                                                    .await;
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                    match st.hub.route_browser_frame(text.as_str()) {
                                     BrowserRoute::Deliver(gw) => {
                                         tracing::debug!(target: TARGET, bytes = text.len(), "browser → gateway 透传");
                                         try_send(&gw, Outbound::Msg(Message::Text(text)));
@@ -1152,6 +1555,7 @@ async fn handle_connection(mut socket: WebSocket, st: RelayState, role: Role, he
                                         tracing::debug!(target: TARGET, bytes = text.len(), "未指定 machine 且多台网关在线，回 ambiguous_machine");
                                         let _ = socket.send(error_frame("ambiguous_machine")).await;
                                     }
+                                    }
                                 },
                                 Role::Gateway => {
                                     let targets = st.hub.route_gateway_frame();
@@ -1176,6 +1580,10 @@ async fn handle_connection(mut socket: WebSocket, st: RelayState, role: Role, he
 
     // ---- 退出：清槽位（browser 只清自己；网关退出清 machine 槽位并广播）----
     if role == Role::Browser {
+        // 摘会话绑定（connected 置 false；会话保留——断开不等于吊销）。
+        if let Some(session) = &browser_session {
+            st.sessions.unbind(&session.id, conn_id);
+        }
         let browsers = st.hub.release_browser(conn_id);
         // 多端排查：断开后还剩几条 browser 在线。
         tracing::info!(target: TARGET, role = role.name(), browsers, "连接断开");
@@ -1212,7 +1620,8 @@ impl RelayHandle {
 
 /// 起 relay server。必须在 tokio runtime 内调用（内部 tokio::spawn）。
 /// listener 由调用方绑定（校验先行，对齐 `src/webhook.rs` P2-2 先例）；
-/// 配置不合法直接 Err（fail-closed 双保险）。
+/// 配置不合法直接 Err（fail-closed 双保险）。会话表从
+/// `<state_dir>/sessions.json` 加载（v1.2：重启后会话保留）。
 pub fn spawn_relay(listener: TcpListener, config: RelayConfig) -> Result<RelayHandle, String> {
     config.validate()?;
     let addr = listener
@@ -1220,9 +1629,11 @@ pub fn spawn_relay(listener: TcpListener, config: RelayConfig) -> Result<RelayHa
         .map_err(|e| format!("获取监听地址失败：{e}"))?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let hub = Hub::new(shutdown_rx.clone());
+    let sessions = Arc::new(SessionStore::load(&config.state_dir));
     let state = RelayState {
         hub: hub.clone(),
         config: Arc::new(config),
+        sessions,
     };
     let app = Router::new()
         .route("/gateway", get(gateway_ws))
@@ -1350,29 +1761,40 @@ mod tests {
         assert!(!b.push("y"), "加入后超 1MB → 拒");
     }
 
-    /// hello 帧解析：合法 / 缺 token / 畸形 JSON / 非 hello 首帧 / 版本 / 空
-    /// token；v1.1 machine：缺省 default / 显式 / trim / 空串与空白拒绝 /
-    /// 非法字符拒绝 / 超 32 char 拒绝。
+    /// hello 帧解析（v1.2 全量）：token 形态（machine 缺省 default / 显式 /
+    /// trim / 合法字符 / 各类非法拒绝）；session 形态（优先级：session 带
+    /// 值即走会话路径，token 同时存在也不回落）；两者皆无拒绝；空串拒绝；
+    /// device（≤64 char / trim 后空按缺省 / 超限拒绝）。
     #[test]
     fn hello_frame_parsing() {
+        let boot = |t: &str| HelloCredential::Bootstrap(t.to_string());
+        let sess = |t: &str| HelloCredential::Session(t.to_string());
+        let ok = |cred: HelloCredential, machine: &str, device: Option<&str>| {
+            Ok(ParsedHello {
+                credential: cred,
+                machine: machine.to_string(),
+                device: device.map(|d| d.to_string()),
+            })
+        };
+        // token 形态（v1.1 行为不变）。
         assert_eq!(
             parse_hello(r#"{"v":1,"type":"hello","token":"abc"}"#),
-            Ok(("abc".to_string(), "default".to_string())),
+            ok(boot("abc"), "default", None),
             "缺 machine → default"
         );
         assert_eq!(
             parse_hello(r#"{"v":1,"type":"hello","token":"abc","machine":"home-mac"}"#),
-            Ok(("abc".to_string(), "home-mac".to_string())),
+            ok(boot("abc"), "home-mac", None),
             "显式 machine"
         );
         assert_eq!(
             parse_hello(r#"{"v":1,"type":"hello","token":"abc","machine":" home-mac "}"#),
-            Ok(("abc".to_string(), "home-mac".to_string())),
+            ok(boot("abc"), "home-mac", None),
             "machine trim"
         );
         assert_eq!(
             parse_hello(r#"{"v":1,"type":"hello","token":"abc","machine":"work_01"}"#),
-            Ok(("abc".to_string(), "work_01".to_string())),
+            ok(boot("abc"), "work_01", None),
             "下划线与数字合法"
         );
         assert_eq!(
@@ -1403,10 +1825,50 @@ mod tests {
             Err(HelloParseError::Malformed),
             "超 32 char 拒绝"
         );
+        // session 形态（v1.2）：session 优先，兼容的 token 形态并存不回落。
+        assert_eq!(
+            parse_hello(r#"{"v":1,"type":"hello","session":"deadbeef"}"#),
+            ok(sess("deadbeef"), "default", None),
+            "session 重连形态"
+        );
+        assert_eq!(
+            parse_hello(r#"{"v":1,"type":"hello","session":"s1","token":"abc"}"#),
+            ok(sess("s1"), "default", None),
+            "session 字段优先（同时带 token 不回落换发路径）"
+        );
+        assert_eq!(
+            parse_hello(r#"{"v":1,"type":"hello","token":"abc","device":"iPhone"}"#),
+            ok(boot("abc"), "default", Some("iPhone")),
+            "device 字段"
+        );
+        assert_eq!(
+            parse_hello(r#"{"v":1,"type":"hello","token":"abc","device":"  iPhone  "}"#),
+            ok(boot("abc"), "default", Some("iPhone")),
+            "device trim"
+        );
+        assert_eq!(
+            parse_hello(r#"{"v":1,"type":"hello","token":"abc","device":"   "}"#),
+            ok(boot("abc"), "default", None),
+            "device trim 后为空按缺省（UA 摘要）"
+        );
+        assert_eq!(
+            parse_hello(&format!(
+                r#"{{"v":1,"type":"hello","token":"abc","device":"{}"}}"#,
+                "d".repeat(DEVICE_NAME_MAX_CHARS + 1)
+            )),
+            Err(HelloParseError::Malformed),
+            "device 超 64 char 拒绝"
+        );
+        // 缺凭证 / 空凭证 / 畸形。
         assert_eq!(
             parse_hello(r#"{"v":1,"type":"hello"}"#),
             Err(HelloParseError::Malformed),
-            "缺 token"
+            "token 与 session 皆无 → 拒（不得出现无凭证可用路径）"
+        );
+        assert_eq!(
+            parse_hello(r#"{"v":1,"type":"hello","session":""}"#),
+            Err(HelloParseError::Malformed),
+            "空 session 串拒绝（即使同时带合法 token——session 优先）"
         );
         assert_eq!(
             parse_hello("not json"),
@@ -1427,6 +1889,115 @@ mod tests {
             Err(HelloParseError::Malformed),
             "空 token"
         );
+    }
+
+    /// 设备管理帧分拣（v1.2）：device_list / device_revoke（含缺 deviceId
+    /// 的 no-op 形态）/ 业务帧不误判。
+    #[test]
+    fn device_frame_parsing() {
+        assert!(matches!(
+            parse_device_frame(r#"{"v":1,"type":"device_list"}"#),
+            Some(DeviceFrame::List)
+        ));
+        match parse_device_frame(r#"{"v":1,"type":"device_revoke","deviceId":"abc"}"#) {
+            Some(DeviceFrame::Revoke(id)) => assert_eq!(id, "abc"),
+            other => panic!("device_revoke 应解析出 deviceId：{other:?}"),
+        }
+        // 畸形 device_revoke（缺 deviceId / 非字符串）→ no-op 吊销（回
+        // devices 帧），不漏进业务路由。
+        match parse_device_frame(r#"{"v":1,"type":"device_revoke"}"#) {
+            Some(DeviceFrame::Revoke(id)) => assert_eq!(id, ""),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            parse_device_frame(r#"{"v":1,"type":"device_revoke","deviceId":42}"#),
+            Some(DeviceFrame::Revoke(ref id)) if id.is_empty()
+        ));
+        // 业务帧 / 畸形 JSON → None（走正常路由）。
+        assert!(parse_device_frame(r#"{"v":1,"type":"message","text":"hi"}"#).is_none());
+        assert!(parse_device_frame(r#"{"v":1,"type":"sync"}"#).is_none());
+        assert!(parse_device_frame("not json").is_none());
+    }
+
+    /// 设备名解析：device 字段优先（trim）/ UA 摘要 / 无 UA 回退。
+    #[test]
+    fn device_name_resolution() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(
+            device_name(Some(" iPhone "), &headers),
+            "iPhone",
+            "device 字段 trim"
+        );
+        assert_eq!(
+            device_name(Some("   "), &headers),
+            "unknown-device",
+            "device 空白按缺省，且无 UA → unknown-device"
+        );
+        headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0)"),
+        );
+        let n = device_name(None, &headers);
+        assert!(
+            n.starts_with("ua-") && n.len() == 11,
+            "UA 摘要 ua-+8hex：{n}"
+        );
+        // 相同 UA → 相同摘要；不同 UA → 不同摘要。
+        assert_eq!(n, device_name(None, &headers));
+        headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("Mozilla/5.0 (Mac)"),
+        );
+        assert_ne!(n, device_name(None, &headers));
+        // 有 device 字段时 UA 不参与。
+        assert_eq!(device_name(Some("MacBook"), &headers), "MacBook");
+    }
+
+    /// 浏览器 hello_ack 会话载荷 + devices 帧形状（v1.2 帧形状与协议逐字
+    /// 段对照——SPA 侧解析依赖字段名）。
+    #[test]
+    fn session_frames_shape() {
+        let s = BrowserSession {
+            id: "id-1234".to_string(),
+            ack_token: "tok-5678".to_string(),
+            expires_at: 1_900_000_000,
+        };
+        let ack = browser_hello_ack(Role::Browser, &s);
+        let ack: serde_json::Value =
+            serde_json::from_str(ack.into_text().unwrap().as_str()).unwrap();
+        assert_eq!(ack["type"], "hello_ack");
+        assert_eq!(ack["role"], "browser");
+        assert_eq!(ack["session"]["id"], "id-1234");
+        assert_eq!(ack["session"]["token"], "tok-5678");
+        assert_eq!(ack["session"]["expiresAt"], 1_900_000_000);
+
+        let devs = devices_frame(&[
+            DeviceView {
+                id: "d1".to_string(),
+                name: "iPhone".to_string(),
+                connected: true,
+                last_seen: 100,
+                created: 90,
+            },
+            DeviceView {
+                id: "d2".to_string(),
+                name: "Mac".to_string(),
+                connected: false,
+                last_seen: 200,
+                created: 95,
+            },
+        ]);
+        let v: serde_json::Value =
+            serde_json::from_str(devs.into_text().unwrap().as_str()).unwrap();
+        assert_eq!(v["type"], "devices");
+        let arr = v["devices"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["id"], "d1");
+        assert_eq!(arr[0]["name"], "iPhone");
+        assert_eq!(arr[0]["connected"], true);
+        assert_eq!(arr[0]["lastSeen"], 100);
+        assert_eq!(arr[0]["created"], 90);
+        assert_eq!(arr[1]["connected"], false);
     }
 
     /// 业务帧 machine 路由键提取：缺失 / 空串 / 空白 / 非字符串 / 畸形 JSON /
@@ -1482,23 +2053,83 @@ mod tests {
         assert!(!is_ambiguous_silent_kind("not json"));
     }
 
-    /// fail-closed：token 缺失 / 相同 → 拒。
+    /// 网关 token-machine 绑定表（v1.2）：解析（多对/trim/尾随逗号容忍/
+    /// 各类畸形拒绝/重复拒绝）+ 绑定校验（对/错 machine、未知 token、
+    /// Bearer=default 只认 default 绑定）。
+    #[test]
+    fn gateway_tokens_parse_and_verify() {
+        // 合法多对（trim + 尾随逗号容忍）。
+        let t = GatewayTokens::parse(" home-mac = 9a08 , work-mac=7f2b ,, ").unwrap();
+        assert_eq!(
+            t.machines(),
+            vec!["home-mac".to_string(), "work-mac".to_string()]
+        );
+        // 绑定校验：token 对 + machine 对 → 放行。
+        assert!(t.verify("home-mac", "9a08"), "正确绑定");
+        assert!(t.verify("work-mac", "7f2b"), "正确绑定");
+        // token 对但 machine 不匹配 → 拒（泄露只能扮演自己）。
+        assert!(
+            !t.verify("work-mac", "9a08"),
+            "home 的 token 顶替 work → 拒"
+        );
+        assert!(
+            !t.verify("default", "9a08"),
+            "home 的 token 走 Bearer(default) → 拒"
+        );
+        // 未知 token → 拒。
+        assert!(!t.verify("home-mac", "unknown"), "未知 token");
+        assert!(!t.verify("home-mac", ""), "空 token");
+        // default 绑定的 token 可走 Bearer。
+        let t2 = GatewayTokens::parse("default=dk").unwrap();
+        assert!(t2.verify("default", "dk"));
+
+        // 解析失败（fail-closed）：空表 / 缺 `=` / 空段 / 非法 machine /
+        // machine 重复 / token 重复绑定。
+        for (spec, needle) in [
+            ("", "为空"),
+            ("   ", "为空"),
+            ("home-mac", "缺 `=`"),
+            ("home-mac=", "为空"),
+            ("=9a08", "为空"),
+            ("home mac=t1", "非法"),
+            ("家=t1", "非法"),
+            ("home-mac=t1,home-mac=t2", "重复"),
+            ("home-mac=t1,work-mac=t1", "同时绑定"),
+        ] {
+            let err = GatewayTokens::parse(spec).unwrap_err();
+            assert!(err.contains(needle), "spec=`{spec}` msg={err}");
+        }
+    }
+
+    /// fail-closed：网关 token 表缺失 / USER_TOKEN 缺失 / 职责分离（USER_TOKEN
+    /// 与任一网关 token 相同）→ 拒。
     #[test]
     fn fail_closed_token_validation() {
         let cfg = |g: &str, u: &str| RelayConfig {
-            gateway_token: g.to_string(),
+            gateway_tokens: GatewayTokens::parse(g).unwrap(),
             user_token: u.to_string(),
+            state_dir: std::env::temp_dir(),
+            session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
         };
-        assert!(cfg("g-token", "u-token").validate().is_ok());
-        let err = cfg("", "u-token").validate().unwrap_err();
+        assert!(cfg("default=g-token", "u-token").validate().is_ok());
+        // 直接构造空表（parse 已拒绝空表，这里走 validate 防线）。
+        let bad = RelayConfig {
+            gateway_tokens: GatewayTokens::default(),
+            user_token: "u-token".to_string(),
+            state_dir: std::env::temp_dir(),
+            session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
+        };
+        let err = bad.validate().unwrap_err();
         assert!(
-            err.contains("GATEWAY_TOKEN") && err.contains("无认证模式"),
+            err.contains("GATEWAY_TOKENS") && err.contains("无认证模式"),
             "msg={err}"
         );
-        let err = cfg("g-token", "  ").validate().unwrap_err();
+        let err = cfg("default=g-token", "  ").validate().unwrap_err();
         assert!(err.contains("USER_TOKEN"), "msg={err}");
-        let err = cfg("same", "same").validate().unwrap_err();
-        assert!(err.contains("不得相同"), "msg={err}");
+        let err = cfg("default=same,home=other", "same")
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("不得与任何网关 token 相同"), "msg={err}");
     }
 
     /// fail-closed：非 loopback bind → 拒（报错给修复指引）。
