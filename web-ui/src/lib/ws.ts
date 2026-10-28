@@ -117,7 +117,9 @@ export class WsManager {
 
   // ---- 发送 API（ready 前返回 false）----
 
-  sendMessage(convId: string, text: string): boolean {
+  /** convId 传 undefined 时省略该字段（网关落默认会话）——「+ 新会话」的
+   *  /switch 命令文本走默认会话，由网关解析并切出 web:<名字>。 */
+  sendMessage(convId: string | undefined, text: string): boolean {
     return this.send({ v: 1, type: "message", convId, text });
   }
 

@@ -247,7 +247,15 @@ export type PendingApproval = {
 export type ConvState = {
   entries: StreamEntry[];
   pending: PendingApproval[];
+  /** 侧边栏会话项预览：该会话最后一条消息的单行摘要（user/text 原文首行、card 正文首行）。 */
+  lastPreview: string;
+  /** 最后一条消息到达时间（Date.now() 毫秒，仅 UI 展示用）。 */
+  lastAt: number;
 };
+
+/** 消息条目内存护栏：单 conv 超过上限时丢弃最早的本地用户回显（ephemeral）；
+ *  服务端条目（text/card）不丢——卡片终态可由 sync 重发兜底。 */
+export const MAX_STREAM_ENTRIES = 200;
 
 export type AppState = {
   /** key 生成序号（纯函数内单调递增）。 */
@@ -262,7 +270,7 @@ export type AppState = {
 export function initialState(): AppState {
   return {
     seq: 0,
-    convs: { [DEFAULT_CONV]: { entries: [], pending: [] } },
+    convs: { [DEFAULT_CONV]: { entries: [], pending: [], lastPreview: "", lastAt: 0 } },
     convOrder: [DEFAULT_CONV],
     machineOnline: false,
     lastError: null,
@@ -297,9 +305,41 @@ function ensureConv(
     return { convs: state.convs, convOrder: state.convOrder };
   }
   return {
-    convs: { ...state.convs, [convId]: { entries: [], pending: [] } },
+    convs: { ...state.convs, [convId]: { entries: [], pending: [], lastPreview: "", lastAt: 0 } },
     convOrder: [...state.convOrder, convId],
   };
+}
+
+/** 条目 → 侧边栏单行预览（首行、去首尾空白）。 */
+function previewOf(entry: StreamEntry): string {
+  switch (entry.kind) {
+    case "user":
+    case "text":
+    case "approval_note":
+      return firstLine(entry.text);
+    case "card": {
+      const t = firstLine(entry.card.text);
+      return t || entry.card.task_digest || "";
+    }
+  }
+}
+
+function firstLine(s: string): string {
+  const i = s.indexOf("\n");
+  return (i === -1 ? s : s.slice(0, i)).trim();
+}
+
+/** 内存护栏：超上限丢最早的 user 回显；无 user 可丢（纯服务端条目）即停。 */
+function trimEntries(entries: StreamEntry[]): StreamEntry[] {
+  let trimmed = entries;
+  while (trimmed.length > MAX_STREAM_ENTRIES) {
+    const i = trimmed.findIndex((e) => e.kind === "user");
+    if (i === -1) {
+      break;
+    }
+    trimmed = trimmed.filter((_, idx) => idx !== i);
+  }
+  return trimmed;
 }
 
 function appendEntry(state: AppState, convId: string, entry: StreamEntry): AppState {
@@ -308,12 +348,21 @@ function appendEntry(state: AppState, convId: string, entry: StreamEntry): AppSt
   return {
     ...state,
     seq: state.seq + 1,
-    convs: { ...convs, [convId]: { ...conv, entries: [...conv.entries, entry] } },
+    convs: {
+      ...convs,
+      [convId]: {
+        ...conv,
+        entries: trimEntries([...conv.entries, entry]),
+        lastPreview: previewOf(entry),
+        lastAt: Date.now(),
+      },
+    },
     convOrder,
   };
 }
 
-/** card / card_patch：同 conv 内同 messageId 整卡替换（保留原位），否则追加。 */
+/** card / card_patch：同 conv 内同 messageId 整卡替换（保留原位），否则追加。
+ *  概要（lastPreview/lastAt）仅在卡片是会话最新条目时更新——补丁旧卡片不动概要。 */
 function upsertCard(state: AppState, frame: CardFrame): AppState {
   const { convs, convOrder } = ensureConv(state, frame.convId);
   const conv = convs[frame.convId];
@@ -334,10 +383,15 @@ function upsertCard(state: AppState, frame: CardFrame): AppState {
   } else {
     entries = [...conv.entries, entry];
   }
+  entries = trimEntries(entries);
+  const isLatest = idx === -1 || idx === conv.entries.length - 1;
+  const nextConv: ConvState = isLatest
+    ? { ...conv, entries, lastPreview: previewOf(entry), lastAt: Date.now() }
+    : { ...conv, entries };
   return {
     ...state,
     seq: idx >= 0 ? state.seq : state.seq + 1,
-    convs: { ...convs, [frame.convId]: { ...conv, entries } },
+    convs: { ...convs, [frame.convId]: nextConv },
     convOrder,
   };
 }

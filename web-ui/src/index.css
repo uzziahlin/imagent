@@ -2,8 +2,49 @@
 @tailwind components;
 @tailwind utilities;
 
+/*
+ * 深浅色跟随系统 prefers-color-scheme（M3b 约定：无手动切换开关）。
+ * 语义变量 → tailwind 语义色（tailwind.config.js）：surface/panel/panel2/code/
+ * line/line-strong/ink/muted/faint/ghost + 语义强调色 ok/warn/err/info/think。
+ * 少量 alpha 叠加的强调色块（如审批弹层）用 dark: 变体（darkMode: "media"）。
+ */
 :root {
-  color-scheme: dark;
+  color-scheme: light dark;
+  --c-bg: #f6f8fb;
+  --c-panel: rgba(255, 255, 255, 0.85);
+  --c-panel2: #e9eef5;
+  --c-code: #eef2f7;
+  --c-line: #e2e8f0;
+  --c-line-strong: #cbd5e1;
+  --c-ink: #0f172a;
+  --c-muted: #475569;
+  --c-faint: #64748b;
+  --c-ghost: #94a3b8;
+  --c-ok: #047857;
+  --c-warn: #b45309;
+  --c-err: #be123c;
+  --c-info: #0369a1;
+  --c-think: #6d28d9;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --c-bg: #020617;
+    --c-panel: rgba(15, 23, 42, 0.72);
+    --c-panel2: #1e293b;
+    --c-code: #0b1220;
+    --c-line: #1e293b;
+    --c-line-strong: #334155;
+    --c-ink: #e2e8f0;
+    --c-muted: #94a3b8;
+    --c-faint: #64748b;
+    --c-ghost: #475569;
+    --c-ok: #34d399;
+    --c-warn: #fbbf24;
+    --c-err: #fb7185;
+    --c-info: #38bdf8;
+    --c-think: #a78bfa;
+  }
 }
 
 html,
@@ -13,13 +54,13 @@ body,
 }
 
 body {
-  @apply bg-slate-950 text-slate-100 antialiased;
+  @apply bg-surface text-ink antialiased;
 }
 
 /* markdown 排版（.md 命名空间；渲染入口统一在 MarkdownText，安全清洗见该组件） */
 @layer components {
   .md {
-    @apply break-words text-sm leading-relaxed text-slate-200;
+    @apply break-words text-sm leading-relaxed text-ink;
   }
   .md > :first-child {
     margin-top: 0;
@@ -34,7 +75,7 @@ body {
   .md h2,
   .md h3,
   .md h4 {
-    @apply mb-1 mt-3 font-semibold text-slate-50;
+    @apply mb-1 mt-3 font-semibold text-ink;
   }
   .md h1 {
     @apply text-base;
@@ -56,29 +97,29 @@ body {
     @apply my-0.5;
   }
   .md code {
-    @apply rounded bg-slate-800 px-1 py-0.5 font-mono text-[13px] text-emerald-300;
+    @apply rounded bg-code px-1 py-0.5 font-mono text-[13px] text-ok;
   }
   .md pre {
-    @apply my-2 overflow-x-auto rounded-xl border border-slate-800 bg-slate-950/80 p-3;
+    @apply my-2 overflow-x-auto rounded-xl border border-line bg-code p-3;
   }
   /* M3b：代码高亮在此扩展（pre code 覆写为高亮 token 树） */
   .md pre code {
-    @apply bg-transparent p-0 text-slate-200;
+    @apply bg-transparent p-0 text-ink;
   }
   .md blockquote {
-    @apply my-1.5 border-l-2 border-slate-600 pl-3 text-slate-400;
+    @apply my-1.5 border-l-2 border-line-strong pl-3 text-muted;
   }
   .md hr {
-    @apply my-3 border-slate-800;
+    @apply my-3 border-line;
   }
   .md table {
     @apply my-2 w-full text-left text-xs;
   }
   .md th,
   .md td {
-    @apply border border-slate-800 px-2 py-1;
+    @apply border border-line px-2 py-1;
   }
   .md a {
-    @apply break-all text-sky-400 underline underline-offset-2;
+    @apply break-all text-info underline underline-offset-2;
   }
 }

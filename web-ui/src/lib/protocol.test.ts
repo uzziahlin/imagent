@@ -97,7 +97,7 @@ describe("reducer", () => {
   it("初始状态含默认 conv，无消息", () => {
     const s = initialState();
     expect(s.convOrder).toEqual([DEFAULT_CONV]);
-    expect(s.convs[DEFAULT_CONV]).toEqual({ entries: [], pending: [] });
+    expect(s.convs[DEFAULT_CONV]).toEqual({ entries: [], pending: [], lastPreview: "", lastAt: 0 });
     expect(s.machineOnline).toBe(false);
   });
 
@@ -244,6 +244,86 @@ describe("reducer", () => {
     expect(s.convOrder).toContain("web:work");
     expect(s.convs["web:work"].entries).toHaveLength(1);
     expect(s.convs["web:work"].entries[0]).toMatchObject({ kind: "user", text: "列出目录" });
+  });
+
+  it("会话概要：lastPreview/lastAt 随最后一条消息更新（user/text/card 各形态）", () => {
+    let s = initialState();
+    expect(s.convs[DEFAULT_CONV].lastPreview).toBe("");
+    expect(s.convs[DEFAULT_CONV].lastAt).toBe(0);
+    // text：取首行（夹具为 JSON 原文，换行需转义）
+    s = run(s, { type: "frame", frame: frame(TEXT_FRAME("你好\\n第二行")) });
+    expect(s.convs[DEFAULT_CONV].lastPreview).toBe("你好");
+    expect(s.convs[DEFAULT_CONV].lastAt).toBeGreaterThan(0);
+    // user 回显覆盖概要
+    s = run(s, { type: "send_echo", convId: DEFAULT_CONV, text: "用户提问" });
+    expect(s.convs[DEFAULT_CONV].lastPreview).toBe("用户提问");
+    // card：正文首行（夹具为 JSON 原文，换行需转义）
+    s = run(s, {
+      type: "frame",
+      frame: frame(CARD_FRAME({ messageId: "m1", text: "卡片正文首行\\n次行" })),
+    });
+    expect(s.convs[DEFAULT_CONV].lastPreview).toBe("卡片正文首行");
+    // 空正文卡片回退 task_digest
+    s = run(s, {
+      type: "frame",
+      frame: frame(
+        '{"v":1,"type":"card","convId":"web:default","messageId":"m2","state":"streaming","card":{"text":"","tool_calls":[],"thoughts":[],"todos":[],"phase":"thinking","run_secs":1,"task_digest":"部署中","terminal":"running"}}',
+      ),
+    });
+    expect(s.convs[DEFAULT_CONV].lastPreview).toBe("部署中");
+  });
+
+  it("会话概要：card_patch 补丁旧卡片（非最新条目）不覆盖概要", () => {
+    let s = run(
+      initialState(),
+      { type: "frame", frame: frame(CARD_FRAME({ messageId: "m1", text: "旧版" })) },
+      { type: "frame", frame: frame(TEXT_FRAME("后到的文本")) },
+    );
+    s = run(s, {
+      type: "frame",
+      frame: frame(CARD_FRAME({ type: "card_patch", messageId: "m1", text: "新正文" })),
+    });
+    expect(s.convs[DEFAULT_CONV].lastPreview).toBe("后到的文本");
+  });
+
+  it("会话概要：各 conv 独立维护", () => {
+    const s = run(
+      initialState(),
+      { type: "frame", frame: frame(TEXT_FRAME("默认会话消息")) },
+      { type: "frame", frame: frame(TEXT_FRAME("工作会话消息", "web:work")) },
+    );
+    expect(s.convs[DEFAULT_CONV].lastPreview).toBe("默认会话消息");
+    expect(s.convs["web:work"].lastPreview).toBe("工作会话消息");
+  });
+
+  it("内存护栏：超 200 条目丢弃最早的用户回显，服务端条目保留", () => {
+    let s = run(initialState(), { type: "frame", frame: frame(TEXT_FRAME("服务端消息")) });
+    const echoes: Action[] = Array.from({ length: 205 }, (_, i) => ({
+      type: "send_echo",
+      convId: DEFAULT_CONV,
+      text: `msg${i}`,
+    }));
+    s = run(s, ...echoes);
+    const entries = s.convs[DEFAULT_CONV].entries;
+    // 206 条 → 丢 6 条最早 user 回显 → 恰好 200
+    expect(entries).toHaveLength(200);
+    // 服务端 text 条目不丢（卡片由 sync 兜底，text/user 回显属 ephemeral）
+    expect(entries[0]).toMatchObject({ kind: "text", text: "服务端消息" });
+    expect(entries.some((e) => e.kind === "user" && e.text === "msg0")).toBe(false);
+    expect(entries.some((e) => e.kind === "user" && e.text === "msg5")).toBe(false);
+    expect(entries.some((e) => e.kind === "user" && e.text === "msg6")).toBe(true);
+    expect(entries.some((e) => e.kind === "user" && e.text === "msg204")).toBe(true);
+    // 概要仍是最后一条
+    expect(s.convs[DEFAULT_CONV].lastPreview).toBe("msg204");
+  });
+
+  it("内存护栏：无本地回显可丢时（纯服务端条目）不强截断", () => {
+    const actions: Action[] = Array.from({ length: 205 }, (_, i) => ({
+      type: "frame",
+      frame: frame(TEXT_FRAME(`t${i}`)),
+    }));
+    const s = run(initialState(), ...actions);
+    expect(s.convs[DEFAULT_CONV].entries).toHaveLength(205);
   });
 });
 

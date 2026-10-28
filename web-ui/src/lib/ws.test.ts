@@ -291,6 +291,14 @@ describe("WsManager", () => {
     expect(sock.sent).toContain('{"v":1,"type":"control","cmd":"stop"}');
   });
 
+  it("sendMessage convId 传 undefined 时省略 convId（/switch 命令落网关默认会话）", () => {
+    const h = makeManager();
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    expect(h.mgr.sendMessage(undefined, "/switch work")).toBe(true);
+    expect(sock.sent).toContain('{"v":1,"type":"message","text":"/switch work"}');
+  });
+
   it("手动 close 后不再重连", () => {
     const h = makeManager();
     h.mgr.connect();

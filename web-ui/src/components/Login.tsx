@@ -19,7 +19,7 @@ export function Login({ onSave }: { onSave: (token: string) => void }) {
     <div className="flex min-h-dvh items-center justify-center px-4">
       <div className="w-full max-w-sm">
         <div className="mb-8 text-center">
-          <div className="mx-auto mb-3 flex h-14 w-14 items-center justify-center rounded-2xl border border-slate-700 bg-slate-900">
+          <div className="mx-auto mb-3 flex h-14 w-14 items-center justify-center rounded-2xl border border-line-strong bg-panel">
             <svg viewBox="0 0 64 64" className="h-8 w-8" aria-hidden="true">
               <polyline
                 points="14,22 24,32 14,42"
@@ -32,14 +32,11 @@ export function Login({ onSave }: { onSave: (token: string) => void }) {
               <line x1="30" y1="43" x2="50" y2="43" stroke="#34d399" strokeWidth="5" strokeLinecap="round" />
             </svg>
           </div>
-          <h1 className="text-xl font-semibold text-slate-50">imagent · Web 驾驶舱</h1>
-          <p className="mt-1 text-sm text-slate-400">输入访问令牌连接你的 Mac 网关</p>
+          <h1 className="text-xl font-semibold text-ink">imagent · Web 驾驶舱</h1>
+          <p className="mt-1 text-sm text-muted">输入访问令牌连接你的 Mac 网关</p>
         </div>
-        <form
-          onSubmit={submit}
-          className="rounded-2xl border border-slate-800 bg-slate-900/70 p-5 shadow-xl"
-        >
-          <label htmlFor="token" className="mb-2 block text-sm font-medium text-slate-300">
+        <form onSubmit={submit} className="rounded-2xl border border-line bg-panel p-5 shadow-xl">
+          <label htmlFor="token" className="mb-2 block text-sm font-medium text-ink">
             访问令牌（USER_TOKEN）
           </label>
           <input
@@ -53,16 +50,16 @@ export function Login({ onSave }: { onSave: (token: string) => void }) {
               setError("");
             }}
             placeholder="imagent.userToken"
-            className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2.5 font-mono text-sm text-slate-100 outline-none placeholder:text-slate-600 focus:border-emerald-500"
+            className="w-full rounded-xl border border-line-strong bg-surface px-3 py-2.5 font-mono text-sm text-ink outline-none placeholder:text-ghost focus:border-emerald-500"
           />
-          {error && <p className="mt-2 text-xs text-rose-400">{error}</p>}
+          {error && <p className="mt-2 text-xs text-err">{error}</p>}
           <button
             type="submit"
             className="mt-4 w-full rounded-xl bg-emerald-600 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-emerald-500 active:bg-emerald-700"
           >
             连接
           </button>
-          <p className="mt-3 text-xs leading-relaxed text-slate-500">
+          <p className="mt-3 text-xs leading-relaxed text-faint">
             令牌仅存于本机 localStorage，只经 WS 首帧 hello 加密通道发送，绝不进入
             URL。认证失败会返回本页。
           </p>
