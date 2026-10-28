@@ -1,8 +1,9 @@
 //! `imagent-web`：Web 驾驶舱 M2——网关侧 WebPlatform。
 //!
 //! 拓扑（M1 见 `imagent-relay`）：`浏览器 WS ⇄ ECS relay ⇄ 本 crate`。本 crate
-//! 是网关侧**出站** WS 客户端（连 `wss://…/imagent/gateway`，Bearer 头直通
-//! 认证，Mac 零监听端口）+ [`Platform`](imagent_core::Platform) 实现：
+//! 是网关侧**出站** WS 客户端（连 `wss://…/imagent/gateway`，hello 首帧
+//! 认证并自报 machine 身份，Mac 零监听端口）+ [`Platform`](imagent_core::Platform)
+//! 实现：
 //! - [`client`]：WS 客户端任务——重连（指数退避 1s→封顶 30s，成功建连重置）、
 //!   心跳（30s 协议层 Ping，对齐 relay 90s idle 超时）、停机
 //!   （CancellationToken，平台 drop 即退出）。把浏览器帧分拣进 inbound /
@@ -10,11 +11,13 @@
 //! - [`platform`]：`WebPlatform`——`recv`/`send_*` 覆写为帧收发，含审批闭环
 //!   （approval_request / approval_resolved）与 sync 重发（D6 会话恢复）。
 //!
-//! 帧协议 v1（与已部署 relay / M1 对齐）：JSON 文本帧，信封 `{"v":1,"type":…}`。
-//! 入站（浏览器→网关）：`message` / `approval_response` / `control` / `sync` /
-//! `ping`（`machine` / `error` / `hello_ack` 为 relay 自产帧，client 分拣自理）。
-//! 出站（网关→浏览器）：`text` / `card` / `card_patch` / `approval_request` /
-//! `approval_resolved` / `pong`。
+//! 帧协议 v1.1（与 relay / SPA 对齐，M5 多终端管理）：JSON 文本帧，信封
+//! `{"v":1,"type":…}`。入站（浏览器→网关）：`message` / `approval_response` /
+//! `control` / `sync` / `ping`（均可带可选 `machine` 路由字段——relay 据此
+//! 路由到本网关，网关侧无需消费；`machine`/`machines`/`error`/`hello_ack`
+//! 为 relay 自产帧，client 分拣自理）。出站（网关→浏览器）：`text` / `card` /
+//! `card_patch` / `approval_request` / `approval_resolved` / `pong`，**全部
+//! 带本机 `machine` 字段**（SPA 据此区分多台终端）。
 //!
 //! **帧内 convId 协议约定：恒为完整 conv 形态（`web:<session>`）**。出站帧
 //! （text / card / approval_request …）写入的即完整 conv，浏览器回执帧
@@ -22,8 +25,9 @@
 //! 缀；裸 session 名（如 `work`）仅作入站兼容输入，由 `normalize_conv`
 //! 统一归一为完整 conv。
 //!
-//! 本模块承载**帧类型定义与纯函数**（入站映射、出站药化、超限截断），全部
-//! 无 IO 便于单测；网络循环在 [`client`]，[`Platform`] 装配在 [`platform`]。
+//! 本模块承载**帧类型定义与纯函数**（入站映射、出站药化、超限截断、machine
+//! id 规范化），全部无 IO 便于单测（`default_machine_id` 的 hostname 探测
+//! 除外，见其注释）；网络循环在 [`client`]，[`Platform`] 装配在 [`platform`]。
 
 #![deny(unsafe_code)]
 
@@ -42,6 +46,71 @@ use serde::Serialize;
 pub(crate) const TARGET: &str = "imagent::web";
 
 // ---------------------------------------------------------------------------
+// machine 身份（v1.1 多终端管理）
+// ---------------------------------------------------------------------------
+
+/// machine id 协议约束（与 relay hello 校验对齐）：≤32 char，仅 ASCII
+/// 字母数字与 `-_`。
+pub const MACHINE_ID_MAX_CHARS: usize = 32;
+/// machine 身份不可得时的回退值（= 单机旧形态，与 relay 的 default 机器
+/// / Bearer 直通语义同源）。
+pub const DEFAULT_MACHINE_ID: &str = "default";
+
+/// machine id 规范化（纯函数便于单测）：非法字符替换为 `-`、截断到
+/// [`MACHINE_ID_MAX_CHARS`] char、剥首尾 `-`；规范化后为空（如输入全是
+/// 标点/空白）→ None。网关 hello 必须携带 relay 可接受的 machine（非法值
+/// 会被 relay 1008 拒绝进入重连死循环），所以装配期先过本函数。
+pub fn sanitize_machine_id(raw: &str) -> Option<String> {
+    let mapped: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = mapped.trim_matches('-');
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(MACHINE_ID_MAX_CHARS).collect())
+}
+
+/// 缺省 machine id：hostname 短名（第一个 `.` 前的标签，如
+/// `Uzziahs-MacBook-Pro.local` → `Uzziahs-MacBook-Pro`）规范化而来。
+///
+/// 实现说明：web 依赖清单固定（不为此加 crate），本 crate 又
+/// `deny(unsafe_code)`（libc gethostname 需 unsafe），故走 POSIX 标准命令
+/// `hostname`（macOS/Linux 均自带）。只在进程启动装配期调用一次，同步
+/// 开销可忽略。拿不到/规范化为空 → [`DEFAULT_MACHINE_ID`]。
+pub fn default_machine_id() -> String {
+    let raw = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let short = raw.split('.').next().unwrap_or_default();
+    sanitize_machine_id(short).unwrap_or_else(|| DEFAULT_MACHINE_ID.to_string())
+}
+
+/// 装配期 machine id 解析入口（main build_platform web 分支）：
+/// config `web_machine_id` 显式值优先（经 [`sanitize_machine_id`] 规范化），
+/// 缺省取 hostname 短名（[`default_machine_id`]）。显式配置规范化后为空
+/// → warn 并走缺省链（machine 身份非安全面，坏配置不至于阻断网关启动）。
+pub fn resolve_machine_id(configured: Option<&str>) -> String {
+    if let Some(c) = configured {
+        if let Some(s) = sanitize_machine_id(c.trim()) {
+            return s;
+        }
+        tracing::warn!(target: TARGET, raw = %c, "web_machine_id 规范化后为空，回退 hostname 短名");
+    }
+    default_machine_id()
+}
+
+// ---------------------------------------------------------------------------
 // 出站帧（网关 → 浏览器）
 // ---------------------------------------------------------------------------
 
@@ -53,13 +122,15 @@ pub(crate) const TRUNC_HEAD_CHARS: usize = 18_000;
 /// 超限截断的尾部保窗（结论通常在尾部）。
 pub(crate) const TRUNC_TAIL_CHARS: usize = 6_000;
 
-/// 文本帧（send_text 药化）。`hint` 为协议预留位（web 无 context token，
+/// 文本帧（send_text 药化）。`machine` 为本机身份（v1.1 起全部出站帧必带，
+/// SPA 据此区分多台终端）；`hint` 为协议预留位（web 无 context token，
 /// 恒 None 不序列化）。
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct TextFrame {
     v: u8,
     #[serde(rename = "type")]
     kind: &'static str,
+    machine: String,
     #[serde(rename = "convId")]
     conv_id: String,
     text: String,
@@ -73,6 +144,7 @@ pub(crate) struct CardFrame {
     v: u8,
     #[serde(rename = "type")]
     kind: &'static str,
+    machine: String,
     #[serde(rename = "convId")]
     conv_id: String,
     #[serde(rename = "messageId")]
@@ -89,6 +161,7 @@ pub(crate) struct ApprovalRequestFrame {
     v: u8,
     #[serde(rename = "type")]
     kind: &'static str,
+    machine: String,
     #[serde(rename = "convId")]
     conv_id: String,
     #[serde(rename = "requestId")]
@@ -106,6 +179,7 @@ pub(crate) struct ApprovalResolvedFrame {
     v: u8,
     #[serde(rename = "type")]
     kind: &'static str,
+    machine: String,
     #[serde(rename = "convId")]
     conv_id: String,
     #[serde(rename = "requestId")]
@@ -121,12 +195,20 @@ pub(crate) struct PongFrame {
     v: u8,
     #[serde(rename = "type")]
     kind: &'static str,
+    machine: String,
 }
 
 /// pong 帧序列化（client 心跳应答用；形状固定无截断面）。
-pub(crate) fn encode_pong_frame() -> String {
-    serde_json::to_string(&PongFrame { v: 1, kind: "pong" })
-        .unwrap_or_else(|_| r#"{"v":1,"type":"pong"}"#.to_string())
+pub(crate) fn encode_pong_frame(machine: &str) -> String {
+    serde_json::to_string(&PongFrame {
+        v: 1,
+        kind: "pong",
+        machine: machine.to_string(),
+    })
+    .unwrap_or_else(|_| {
+        // 序列化不可失败（纯 String 字段），兜底手拼保证 pong 恒可发。
+        format!(r#"{{"v":1,"type":"pong","machine":"{machine}"}}"#)
+    })
 }
 
 /// [`OutboundCard`] 的可序列化 DTO（core 类型未派生 serde——web 帧协议自带
@@ -280,10 +362,11 @@ where
 }
 
 /// text 帧药化（send_text）。
-pub(crate) fn encode_text_frame(conv_id: &str, text: &str) -> Result<String> {
+pub(crate) fn encode_text_frame(machine: &str, conv_id: &str, text: &str) -> Result<String> {
     let frame = TextFrame {
         v: 1,
         kind: "text",
+        machine: machine.to_string(),
         conv_id: conv_id.to_string(),
         text: text.to_string(),
         hint: None,
@@ -297,6 +380,7 @@ pub(crate) fn encode_text_frame(conv_id: &str, text: &str) -> Result<String> {
 /// card / card_patch 帧药化（send_card / update_card / sync 重发共用）。
 /// `kind` 取 "card" | "card_patch"。
 pub(crate) fn encode_card_frame(
+    machine: &str,
     kind: &'static str,
     conv_id: &str,
     message_id: &str,
@@ -305,6 +389,7 @@ pub(crate) fn encode_card_frame(
     let frame = CardFrame {
         v: 1,
         kind,
+        machine: machine.to_string(),
         conv_id: conv_id.to_string(),
         message_id: message_id.to_string(),
         card: card.clone(),
@@ -322,6 +407,7 @@ pub(crate) fn encode_card_frame(
 /// approval_request 帧药化（send_permission_ask）。inputSummary 经
 /// [`imagent_core::render::tool_summary`] 压缩（≤80 char），无超限面。
 pub(crate) fn encode_approval_request_frame(
+    machine: &str,
     conv_id: &str,
     request_id: &str,
     tool: &str,
@@ -330,6 +416,7 @@ pub(crate) fn encode_approval_request_frame(
     let frame = ApprovalRequestFrame {
         v: 1,
         kind: "approval_request",
+        machine: machine.to_string(),
         conv_id: conv_id.to_string(),
         request_id: request_id.to_string(),
         tool: tool.to_string(),
@@ -341,6 +428,7 @@ pub(crate) fn encode_approval_request_frame(
 
 /// approval_resolved 帧药化（resolve / cancel / cancel_all）。
 pub(crate) fn encode_approval_resolved_frame(
+    machine: &str,
     conv_id: &str,
     request_id: &str,
     decision: &str,
@@ -349,6 +437,7 @@ pub(crate) fn encode_approval_resolved_frame(
     let frame = ApprovalResolvedFrame {
         v: 1,
         kind: "approval_resolved",
+        machine: machine.to_string(),
         conv_id: conv_id.to_string(),
         request_id: request_id.to_string(),
         decision: decision.to_string(),
@@ -697,10 +786,11 @@ mod tests {
 
     #[test]
     fn text_frame_shape() {
-        let json = encode_text_frame("web:work", "你好").unwrap();
+        let json = encode_text_frame("home-mac", "web:work", "你好").unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["v"], 1);
         assert_eq!(v["type"], "text");
+        assert_eq!(v["machine"], "home-mac", "v1.1 出站帧必带 machine");
         assert_eq!(v["convId"], "web:work");
         assert_eq!(v["text"], "你好");
         assert!(v.get("hint").is_none(), "hint 恒 None 不序列化");
@@ -734,10 +824,12 @@ mod tests {
     fn card_frame_shape_and_state_derivation() {
         let running = CardPayload::from_card(&sample_card("流式中", CardTerminal::Running));
         assert_eq!(running.state(), "streaming");
-        let json = encode_card_frame("card", "web:work", "web-card-1", &running).unwrap();
+        let json =
+            encode_card_frame("home-mac", "card", "web:work", "web-card-1", &running).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["v"], 1);
         assert_eq!(v["type"], "card");
+        assert_eq!(v["machine"], "home-mac", "v1.1 出站帧必带 machine");
         assert_eq!(v["convId"], "web:work");
         assert_eq!(v["messageId"], "web-card-1");
         assert_eq!(v["state"], "streaming");
@@ -752,15 +844,17 @@ mod tests {
         // card_patch + 终态 state=done；Error 终态带 error 字段。
         let done = CardPayload::from_card(&sample_card("完成", CardTerminal::Done));
         assert_eq!(done.state(), "done");
-        let json = encode_card_frame("card_patch", "web:work", "web-card-1", &done).unwrap();
+        let json =
+            encode_card_frame("home-mac", "card_patch", "web:work", "web-card-1", &done).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "card_patch");
+        assert_eq!(v["machine"], "home-mac");
         assert_eq!(v["state"], "done");
         assert!(v["card"].get("error").is_none());
 
         let err = CardPayload::from_card(&sample_card("炸了", CardTerminal::Error("boom".into())));
         assert_eq!(err.state(), "done");
-        let json = encode_card_frame("card", "web:work", "web-card-1", &err).unwrap();
+        let json = encode_card_frame("home-mac", "card", "web:work", "web-card-1", &err).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["card"]["terminal"], "error");
         assert_eq!(v["card"]["error"], "boom");
@@ -769,23 +863,32 @@ mod tests {
     #[test]
     fn approval_frames_shape() {
         let json =
-            encode_approval_request_frame("web:c", "req-9", "Bash", "rm -rf /tmp/x").unwrap();
+            encode_approval_request_frame("home-mac", "web:c", "req-9", "Bash", "rm -rf /tmp/x")
+                .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "approval_request");
+        assert_eq!(v["machine"], "home-mac", "v1.1 出站帧必带 machine");
         assert_eq!(v["convId"], "web:c");
         assert_eq!(v["requestId"], "req-9");
         assert_eq!(v["tool"], "Bash");
         assert_eq!(v["inputSummary"], "rm -rf /tmp/x");
 
-        let json =
-            encode_approval_resolved_frame("web:c", "req-9", "cancelled", Some("审批已取消"))
-                .unwrap();
+        let json = encode_approval_resolved_frame(
+            "home-mac",
+            "web:c",
+            "req-9",
+            "cancelled",
+            Some("审批已取消"),
+        )
+        .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "approval_resolved");
+        assert_eq!(v["machine"], "home-mac");
         assert_eq!(v["decision"], "cancelled");
         assert_eq!(v["message"], "审批已取消");
         // message 缺省不序列化。
-        let json = encode_approval_resolved_frame("web:c", "req-9", "allow", None).unwrap();
+        let json =
+            encode_approval_resolved_frame("home-mac", "web:c", "req-9", "allow", None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(v.get("message").is_none());
     }
@@ -797,7 +900,7 @@ mod tests {
         // 25000 个中文 = 75000 字节 < 240KB 不触发；用 10 万中文字（300KB）触发。
         let long_text = "长".repeat(100_000); // 300_000 字节
         let card = CardPayload::from_card(&sample_card(&long_text, CardTerminal::Running));
-        let json = encode_card_frame("card", "web:work", "web-card-1", &card).unwrap();
+        let json = encode_card_frame("home-mac", "card", "web:work", "web-card-1", &card).unwrap();
         assert!(
             json.len() <= FRAME_SOFT_LIMIT_BYTES,
             "截断后帧应 ≤240KB：{}",
@@ -808,14 +911,15 @@ mod tests {
         assert!(text.contains("…[已截断]…"), "应有截断标记");
         assert!(text.starts_with(&"长".repeat(TRUNC_HEAD_CHARS)), "头部保窗");
         assert!(text.ends_with(&"长".repeat(TRUNC_TAIL_CHARS)), "尾部保窗");
+        assert_eq!(v["machine"], "home-mac", "截断重建不丢 machine 字段");
 
         // text 帧同款截断。
-        let json = encode_text_frame("web:work", &long_text).unwrap();
+        let json = encode_text_frame("home-mac", "web:work", &long_text).unwrap();
         assert!(json.len() <= FRAME_SOFT_LIMIT_BYTES);
         assert!(json.contains("…[已截断]…"));
 
         // 未超限帧原样通过。
-        let small = encode_text_frame("web:work", "short").unwrap();
+        let small = encode_text_frame("home-mac", "web:work", "short").unwrap();
         assert!(small.contains("short"));
     }
 
@@ -838,6 +942,51 @@ mod tests {
 
     #[test]
     fn pong_frame_shape() {
-        assert_eq!(encode_pong_frame(), r#"{"v":1,"type":"pong"}"#);
+        assert_eq!(
+            encode_pong_frame("home-mac"),
+            r#"{"v":1,"type":"pong","machine":"home-mac"}"#
+        );
+    }
+
+    /// machine id 规范化：合法值原样 / 非法字符替换 / 首尾 `-` 剥离 / 截断
+    /// 32 char / 全非法输入 → None / 空串 → None。
+    #[test]
+    fn machine_id_sanitization() {
+        assert_eq!(
+            sanitize_machine_id("home-mac"),
+            Some("home-mac".to_string()),
+            "合法值原样"
+        );
+        assert_eq!(sanitize_machine_id("work_01"), Some("work_01".to_string()));
+        assert_eq!(
+            sanitize_machine_id("Uzziahs MacBook.(local)"),
+            Some("Uzziahs-MacBook--local".to_string()),
+            "非法字符替换为 -，首尾 - 剥离"
+        );
+        assert_eq!(
+            sanitize_machine_id(&"m".repeat(MACHINE_ID_MAX_CHARS + 5)),
+            Some("m".repeat(MACHINE_ID_MAX_CHARS)),
+            "截断到 32 char"
+        );
+        assert_eq!(sanitize_machine_id("..."), None, "全标点 → None");
+        assert_eq!(sanitize_machine_id("   "), None, "空白 → None");
+        assert_eq!(sanitize_machine_id(""), None, "空串 → None");
+        assert_eq!(sanitize_machine_id("家"), None, "非 ASCII → None");
+    }
+
+    /// 装配期 machine id 解析：显式配置优先（trim + 规范化）；显式但坏值
+    /// / 缺省 → hostname 短名链（此处只断言非空 + 合法形状——hostname 探测
+    /// 是 IO，交给 `default_machine_id` 的装配期日志，不在单测里钉具体值）。
+    #[test]
+    fn resolve_machine_id_prefers_configured() {
+        assert_eq!(resolve_machine_id(Some(" home-mac ")), "home-mac");
+        assert_eq!(resolve_machine_id(Some("bad value!")), "bad-value");
+        // 缺省链结果必为协议合法值（非空、≤32、合法字符集）。
+        let got = resolve_machine_id(None);
+        assert_eq!(
+            sanitize_machine_id(&got).as_deref(),
+            Some(got.as_str()),
+            "缺省链产出必须已是规范形态：{got}"
+        );
     }
 }

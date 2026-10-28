@@ -1471,9 +1471,11 @@ fn build_backend(
 /// - `"feishu"` → [`imagent_feishu::FeishuPlatform`]：`feishu_app_id` 取自 config，
 ///   `app_secret` 取自环境变量 `IMAGENT_FEISHU_APP_SECRET`（keyring bootstrap 为后续 P2），
 ///   默认 `base_url = https://open.feishu.cn`。
-/// - `"web"` → [`imagent_web::WebPlatform`]（Web 驾驶舱 M2）：`web_relay_url` 取自
+/// - `"web"` → [`imagent_web::WebPlatform`]（Web 驾驶舱 M2/M5）：`web_relay_url` 取自
 ///   config；gateway token 取自环境变量 `IMAGENT_WEB_GATEWAY_TOKEN`（敏感不入
-///   config.toml，与飞书先例同款）；`web_default_session` 缺省 "default"。
+///   config.toml，与飞书先例同款）；`web_default_session` 缺省 "default"；
+///   machine 身份 = `web_machine_id` 显式值 / 缺省 hostname 短名（M5 多终端，
+///   hello 自报给 relay）。
 /// - 其它（含默认 `"ilink"`）→ [`imagent_ilink::ILinkPlatform`]，
 ///   行为与单平台时期完全一致（读 store 的 ilink 凭据 + 扫码登录的 client）。
 async fn build_platform(
@@ -1569,10 +1571,14 @@ async fn build_platform(
                 .web_default_session
                 .clone()
                 .unwrap_or_else(|| "default".to_string());
+            // M5 多终端：machine 身份 = config 显式值 / 缺省 hostname 短名
+            //（imagent_web 内规范化 + 回退 default），hello 自报给 relay。
+            let machine_id = imagent_web::resolve_machine_id(config.web_machine_id.as_deref());
             Ok(Arc::new(imagent_web::WebPlatform::new(
                 relay_url,
                 gateway_token,
                 default_session,
+                machine_id,
             )))
         }
         _ => {

@@ -73,7 +73,7 @@ interface Harness {
   authFailed: number;
 }
 
-function makeManager(token = "tok-1"): Harness {
+function makeManager(token = "tok-1", getMachine?: () => string | undefined): Harness {
   const frames: InboundFrame[] = [];
   const statuses: string[] = [];
   let authFailed = 0;
@@ -86,6 +86,7 @@ function makeManager(token = "tok-1"): Harness {
       authFailed += 1;
     },
     wsFactory: (u) => new FakeWebSocket(u),
+    getMachine,
   });
   return { mgr, frames, statuses, get authFailed() { return authFailed; } };
 }
@@ -308,5 +309,83 @@ describe("WsManager", () => {
     sock.emit("close", { code: 1006 }); // 模拟 close 事件到达
     vi.advanceTimersByTime(120_000);
     expect(FakeWebSocket.created).toHaveLength(1);
+  });
+});
+
+describe("WsManager 多机（v1.1）", () => {
+  it("send 系列带 machine 参数：帧携带该字段", () => {
+    const h = makeManager();
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    expect(h.mgr.sendMessage("web:default", "hi", "home-mac")).toBe(true);
+    expect(h.mgr.sendApprovalResponse("web:work", "req-9", "always", "work-mac")).toBe(true);
+    expect(h.mgr.sendControl("stop", undefined, "home-mac")).toBe(true);
+    expect(h.mgr.sendSync("home-mac")).toBe(true);
+    expect(sock.sent).toContain(
+      '{"v":1,"type":"message","convId":"web:default","text":"hi","machine":"home-mac"}',
+    );
+    expect(sock.sent).toContain(
+      '{"v":1,"type":"approval_response","convId":"web:work","requestId":"req-9","decision":"always","machine":"work-mac"}',
+    );
+    expect(sock.sent).toContain('{"v":1,"type":"control","cmd":"stop","machine":"home-mac"}');
+    expect(sock.sent).toContain('{"v":1,"type":"sync","machine":"home-mac"}');
+  });
+
+  it("send 系列不传 machine：帧不带该字段（旧 relay/旧网关字节级兼容）", () => {
+    const h = makeManager();
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    expect(h.mgr.sendMessage("web:default", "hi")).toBe(true);
+    expect(h.mgr.sendApprovalResponse("web:work", "req-9", "always")).toBe(true);
+    expect(h.mgr.sendControl("stop")).toBe(true);
+    expect(h.mgr.sendSync()).toBe(true);
+    expect(sock.sent).toContain('{"v":1,"type":"message","convId":"web:default","text":"hi"}');
+    expect(sock.sent).toContain(
+      '{"v":1,"type":"approval_response","convId":"web:work","requestId":"req-9","decision":"always"}',
+    );
+    expect(sock.sent).toContain('{"v":1,"type":"control","cmd":"stop"}');
+    expect(sock.sent).toContain('{"v":1,"type":"sync"}');
+  });
+
+  it("sendSync 未 ready 返回 false", () => {
+    const h = makeManager();
+    h.mgr.connect();
+    expect(h.mgr.sendSync("home-mac")).toBe(false);
+  });
+
+  it("getMachine 注入：hello_ack 后自动 sync 与周期 ping 均带当前机器", () => {
+    const h = makeManager("tok-1", () => "home-mac");
+    h.mgr.connect();
+    const sock = lastSock();
+    sock.emit("open");
+    sock.serverSend(HELLO_ACK);
+    expect(h.statuses.at(-1)).toBe("ready");
+    expect(sock.sent[1]).toBe('{"v":1,"type":"sync","machine":"home-mac"}');
+    vi.advanceTimersByTime(25_000);
+    expect(sock.sent).toContain('{"v":1,"type":"ping","machine":"home-mac"}');
+  });
+
+  it("getMachine 返回 undefined：自动 sync/ping 不带 machine（单机兼容路径）", () => {
+    const h = makeManager("tok-1", () => undefined);
+    h.mgr.connect();
+    const sock = lastSock();
+    sock.emit("open");
+    sock.serverSend(HELLO_ACK);
+    expect(sock.sent[1]).toBe('{"v":1,"type":"sync"}');
+    vi.advanceTimersByTime(25_000);
+    expect(sock.sent).toContain('{"v":1,"type":"ping"}');
+  });
+
+  it("getMachine 取值随发送时点变化（机器切换后 ping 带新机器）", () => {
+    let machine: string | undefined = undefined; // 首连尚未收到 machines 帧
+    const h = makeManager("tok-1", () => machine);
+    h.mgr.connect();
+    const sock = lastSock();
+    sock.emit("open");
+    sock.serverSend(HELLO_ACK);
+    expect(sock.sent[1]).toBe('{"v":1,"type":"sync"}');
+    machine = "work-mac"; // machines 帧到达 → App 更新当前机器
+    vi.advanceTimersByTime(25_000);
+    expect(sock.sent).toContain('{"v":1,"type":"ping","machine":"work-mac"}');
   });
 });

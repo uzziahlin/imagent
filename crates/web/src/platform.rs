@@ -98,10 +98,12 @@ fn lock_or_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// sync responder：消费 client 转来的 sync 请求，把卡片缓存全量重发（card
-/// 帧，state 依 terminal）。best-effort——出站队列满即丢弃该轮重发并 warn
-/// （浏览器可再发 sync 刷新，不值得反压阻塞 client 的 sync channel）。
+/// 帧，state 依 terminal，v1.1 起带本机 machine 字段——与首发帧同形）。
+/// best-effort——出站队列满即丢弃该轮重发并 warn（浏览器可再发 sync 刷新，
+/// 不值得反压阻塞 client 的 sync channel）。
 async fn serve_sync_requests(
     mut sync_rx: mpsc::Receiver<()>,
+    machine_id: String,
     cards: Arc<Mutex<CardCache>>,
     outbound_tx: mpsc::Sender<String>,
     shutdown: CancellationToken,
@@ -116,7 +118,7 @@ async fn serve_sync_requests(
                 let snapshot = lock_or_recover(&cards).snapshot();
                 debug!(target: TARGET, convs = snapshot.len(), "sync：重发缓存卡片");
                 for (conv, message_id, card) in snapshot {
-                    match encode_card_frame("card", &conv, &message_id, &card) {
+                    match encode_card_frame(&machine_id, "card", &conv, &message_id, &card) {
                         Ok(json) => {
                             if outbound_tx.try_send(json).is_err() {
                                 warn!(target: TARGET, conv = %conv, "sync 重发出站队列满，丢弃该轮重发");
@@ -140,6 +142,8 @@ async fn serve_sync_requests(
 pub struct WebPlatform {
     /// relay 地址（doctor_probes 展示用）。
     relay_url: String,
+    /// 本机 machine 身份（v1.1 多终端管理）：hello 自报 + 全部出站帧携带。
+    machine_id: String,
     /// 出站帧通道（发给 client → relay → 浏览器）。
     outbound_tx: mpsc::Sender<String>,
     /// `/reconnect` 强制重连信号（与 client run task 共享）。
@@ -162,8 +166,15 @@ impl WebPlatform {
     /// 构造并后台 spawn client 任务（建连/认证/心跳/重连/收发）与 sync
     /// responder 任务。`relay_url` 形如 `wss://…/imagent/gateway`；
     /// `gateway_token` 走 env `IMAGENT_WEB_GATEWAY_TOKEN`（main 装配）；
+    /// `machine_id` 为本机 machine 身份（v1.1，main 经
+    /// [`crate::resolve_machine_id`] 解析：config 显式值 / hostname 短名）；
     /// `default_session` 为无 convId 浏览器消息的落点（缺省 "default"）。
-    pub fn new(relay_url: String, gateway_token: String, default_session: String) -> Self {
+    pub fn new(
+        relay_url: String,
+        gateway_token: String,
+        default_session: String,
+        machine_id: String,
+    ) -> Self {
         let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>(INBOUND_CHANNEL_CAPACITY);
         let (outbound_tx, outbound_rx) = mpsc::channel::<String>(OUTBOUND_CHANNEL_CAPACITY);
         let (sync_tx, sync_rx) = mpsc::channel::<()>(SYNC_CHANNEL_CAPACITY);
@@ -176,6 +187,7 @@ impl WebPlatform {
         let client = WebClient {
             relay_url: relay_url.clone(),
             gateway_token,
+            machine_id: machine_id.clone(),
             default_session,
             online: online.clone(),
             inbound_tx,
@@ -187,6 +199,7 @@ impl WebPlatform {
         let cards: Arc<Mutex<CardCache>> = Arc::new(Mutex::new(CardCache::default()));
         tokio::spawn(serve_sync_requests(
             sync_rx,
+            machine_id.clone(),
             cards.clone(),
             outbound_tx.clone(),
             shutdown.clone(),
@@ -194,6 +207,7 @@ impl WebPlatform {
 
         Self {
             relay_url,
+            machine_id,
             outbound_tx,
             reconnect,
             inbound_rx: Arc::new(AsyncMutex::new(inbound_rx)),
@@ -208,6 +222,11 @@ impl WebPlatform {
     /// relay 连接是否在线（doctor_probes / 测试用）。
     pub fn is_online(&self) -> bool {
         self.online.load(Ordering::Relaxed)
+    }
+
+    /// 本机 machine 身份（测试用）。
+    pub fn machine_id(&self) -> &str {
+        &self.machine_id
     }
 
     /// 出站帧入队（§5.1 断线语义）：try_send——断线期帧排队（Ok），队列满 /
@@ -287,7 +306,7 @@ impl Platform for WebPlatform {
     }
 
     async fn send_text(&self, conv: &ConvId, text: &str, _hint: &ReplyHint) -> Result<()> {
-        let json = encode_text_frame(&conv.0, text)?;
+        let json = encode_text_frame(&self.machine_id, &conv.0, text)?;
         self.enqueue(json)
     }
 
@@ -316,7 +335,7 @@ impl Platform for WebPlatform {
             self.card_seq.fetch_add(1, Ordering::Relaxed) + 1
         );
         let payload = CardPayload::from_card(card);
-        let json = encode_card_frame("card", &conv.0, &message_id, &payload)?;
+        let json = encode_card_frame(&self.machine_id, "card", &conv.0, &message_id, &payload)?;
         lock_or_recover(&self.cards).upsert(&conv.0, &message_id, payload);
         self.enqueue(json)?;
         Ok(Some(message_id))
@@ -330,7 +349,13 @@ impl Platform for WebPlatform {
         _hint: &ReplyHint,
     ) -> Result<()> {
         let payload = CardPayload::from_card(card);
-        let json = encode_card_frame("card_patch", &conv.0, message_id, &payload)?;
+        let json = encode_card_frame(
+            &self.machine_id,
+            "card_patch",
+            &conv.0,
+            message_id,
+            &payload,
+        )?;
         // 缓存语义是「该 conv 最近卡片」，patch 后直接覆盖（message_id 不匹配
         // 的陈旧 patch 也覆盖为最新——终态以最后一次为准）。
         lock_or_recover(&self.cards).upsert(&conv.0, message_id, payload);
@@ -347,7 +372,13 @@ impl Platform for WebPlatform {
     ) -> Result<Option<String>> {
         // inputSummary 压成人可读单行（P8-1，与 feishu 审批卡同源）。
         let summary = imagent_core::render::tool_summary(tool_name, input_summary);
-        let json = encode_approval_request_frame(&conv.0, request_id, tool_name, &summary)?;
+        let json = encode_approval_request_frame(
+            &self.machine_id,
+            &conv.0,
+            request_id,
+            tool_name,
+            &summary,
+        )?;
         self.track_ask(&conv.0, request_id);
         self.enqueue(json)?;
         // 返回 request_id 作 card_msg_id 锚点：浏览器审批回复带 requestId
@@ -369,6 +400,7 @@ impl Platform for WebPlatform {
             "deny"
         };
         let json = encode_approval_resolved_frame(
+            &self.machine_id,
             &conv.0,
             request_id,
             decision,
@@ -380,6 +412,7 @@ impl Platform for WebPlatform {
 
     async fn cancel_permission_ask(&self, conv: &ConvId, request_id: &str) -> Result<()> {
         let json = encode_approval_resolved_frame(
+            &self.machine_id,
             &conv.0,
             request_id,
             "cancelled",
@@ -396,6 +429,7 @@ impl Platform for WebPlatform {
             .unwrap_or_default();
         for request_id in drained {
             let json = encode_approval_resolved_frame(
+                &self.machine_id,
                 &conv.0,
                 &request_id,
                 "cancelled",
@@ -419,7 +453,10 @@ impl Platform for WebPlatform {
         } else {
             "重连中"
         };
-        vec![format!("✅ relay 连接：{state}（{}）", self.relay_url)]
+        vec![format!(
+            "✅ relay 连接：{state}（{}，machine={}）",
+            self.relay_url, self.machine_id
+        )]
     }
 }
 
@@ -436,6 +473,7 @@ mod tests {
             "ws://127.0.0.1:1/gateway".into(),
             "unused-token".into(),
             "default".into(),
+            "test-mac".into(),
         )
     }
 

@@ -10,12 +10,16 @@ const STATUS_META: Record<ConnStatus, { label: string; dot: string }> = {
 };
 
 /**
- * 顶部状态条：relay 连接态 + Mac 在线态（machine 帧）+ 当前 conv + 退出。
- * 移动端左上角 ☰ 打开会话抽屉（桌面端侧边栏常驻，按钮隐藏）。
+ * 顶部状态条：relay 连接态 + 机器在线态 + 当前 conv + 退出。
+ * 机器在线态：多机模式（v1.1）显示当前选中机器名 + machines 列表有无该机器
+ * （App 侧换算后传入 machineOnline）；单机模式沿用旧网关 machine 帧
+ * （machineName 缺省显示「Mac」）。移动端左上角 ☰ 打开会话抽屉（桌面端侧
+ * 边栏常驻，按钮隐藏）。
  */
 export function StatusBar({
   status,
   machineOnline,
+  machineName,
   currentConv,
   onLogout,
   onReconnect,
@@ -23,6 +27,8 @@ export function StatusBar({
 }: {
   status: ConnStatus;
   machineOnline: boolean;
+  /** 多机模式 = 当前机器 id；缺省（旧 relay 单机）显示「Mac」。 */
+  machineName?: string;
   currentConv: string;
   onLogout: () => void;
   /** superseded 态用户显式重连（新连接会顶替另一窗口，是用户意图）。 */
@@ -65,8 +71,8 @@ export function StatusBar({
           className={`h-2 w-2 rounded-full ${machineOnline ? "bg-emerald-400" : "bg-slate-500"}`}
           aria-hidden="true"
         />
-        <span className={machineOnline ? "text-muted" : "text-ghost"}>
-          Mac {machineOnline ? "在线" : "离线"}
+        <span className={`max-w-[16vw] truncate ${machineOnline ? "text-muted" : "text-ghost"}`}>
+          {machineName ?? "Mac"} {machineOnline ? "在线" : "离线"}
         </span>
       </div>
       <div className="ml-auto flex shrink-0 items-center gap-2">

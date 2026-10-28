@@ -498,6 +498,14 @@ pub struct Config {
     /// `web:<name>`）。缺省 "default"。
     #[serde(default)]
     pub web_default_session: Option<String>,
+    /// Web 驾驶舱（M5 多终端，仅 platform 含 web 时读取）：本机在 relay 侧的
+    /// machine 身份——多台 Mac 接同一 ECS relay 时区分终端（浏览器按 machine
+    /// 切换管理；同 machine 新网关连接会顶替旧连接，每台机器单连接）。
+    /// 缺省取 hostname 短名；取不到回退 "default"（单机旧形态）。值经
+    /// 网关侧规范化：仅字母数字-_/≤32 char，非法字符替换为 '-'（协议约束，
+    /// 见 `imagent_web::sanitize_machine_id`）。非敏感（列表帧会广播给浏览器）。
+    #[serde(default)]
+    pub web_machine_id: Option<String>,
     /// 回复形态偏好（P7-A4；默认 card）。text = 不建卡走纯文本流（/config 可热改）。
     /// **改动需重启**：启动偏好（prefs）在启动期注入 Dispatcher，SIGHUP 不热载
     ///（/config 的运行时热改不受影响）。
@@ -1404,6 +1412,7 @@ platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人)
 # platforms = ["feishu", "web"]   # 多平台并存（非空时覆盖上面的 platform 单值）；IM 做通知兜底 + web 做驾驶舱
 # web_relay_url = "wss://your-ecs:8443/imagent/gateway"   # 仅 platform="web"：ECS relay 网关端点（Caddy TLS 终结 + strip /imagent 前缀）；gateway token 走环境变量 IMAGENT_WEB_GATEWAY_TOKEN（敏感不入本文件）；web 消息 sender 恒为 web:user，需加入 allowed_senders（或 admin_senders）白名单才会被处理
 # web_default_session = "default"   # 仅 platform="web"：无 convId 的浏览器消息落到的默认会话名（conv 形如 web:<name>）
+# web_machine_id = "home-mac"       # 仅 platform="web"：本机 machine 身份（多台 Mac 接同一 relay 时区分终端，浏览器按 machine 切换管理；缺省取 hostname 短名；同 machine 新连接会顶替旧连接）
 # feishu_app_id = "cli_xxx"            # 飞书自建应用 app_id（仅 platform="feishu"；app_secret 走环境变量，keyring 为后续 P2）
 # feishu_base_url = "https://open.feishu.cn"  # 可选，默认 https://open.feishu.cn；Lark 国际版 https://open.larksuite.com（MVP 不覆盖）
 # feishu_require_mention_in_group = true       # 群消息须 @bot 才处理（默认 true：客户端过滤 + 剥离 @bot 占位；false=全收，过滤交给事件订阅 scope）
@@ -1646,6 +1655,27 @@ platforms = ["feishu", "feishu"]
         );
         let err = Config::load(&p).unwrap_err().to_string();
         assert!(err.contains("重复"), "{err}");
+        cleanup(&p);
+    }
+
+    /// M5 多终端：`web_machine_id` 字段解析——缺省 None（装配期回退 hostname
+    /// 短名）；显式配置原样透传（值的协议规范化在网关侧
+    /// `imagent_web::resolve_machine_id`，core 不重复协议知识）。
+    #[test]
+    fn web_machine_id_config_parse() {
+        let p = tmp_path("web_machine_default", r#"default_workdir = "/tmp/ws""#);
+        let cfg = Config::load(&p).expect("parse");
+        assert!(cfg.web_machine_id.is_none(), "缺省不配置");
+        cleanup(&p);
+        let p = tmp_path(
+            "web_machine_set",
+            r#"default_workdir = "/tmp/ws"
+platform = "web"
+web_machine_id = "home-mac"
+"#,
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(cfg.web_machine_id.as_deref(), Some("home-mac"));
         cleanup(&p);
     }
 

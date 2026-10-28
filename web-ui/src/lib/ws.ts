@@ -6,6 +6,10 @@
 // 视为本连接被同 token 新窗口顶替（进入 superseded 终态：停心跳停重连，否则
 // 两窗口互踢死循环；用户显式 connect() 才重连，反之顶替对方是用户意图）→
 // >60s 无任何入站帧视为链路僵死，主动断开重连。
+// v1.1 多终端：业务出站帧（message/approval_response/control/sync/ping）可选带
+// machine 字段——调用方逐帧传入，或经 getMachine 注入（内部自动 sync / 心跳
+// ping 在发送时取值）。machine 未指定时字段不出现，与旧 relay/旧网关字节级
+// 兼容；多机模式下 SPA 必须始终显式带当前机器（否则 relay 回 ambiguous_machine）。
 
 import {
   encodeFrame,
@@ -45,6 +49,9 @@ export interface WsManagerOptions {
   onAuthFailed: () => void;
   /** 注入 WebSocket 构造（单测用 fake）；缺省浏览器原生。 */
   wsFactory?: (url: string) => WebSocketLike;
+  /** 当前出站机器（v1.1）：内部自动帧（ready 后首帧 sync / 心跳 ping）发送时
+   *  调用取值；返回 undefined = 单机模式（不带 machine 字段，旧 relay 兼容）。 */
+  getMachine?: () => string | undefined;
   /** 间隔常量可注入（默认即生产值：hello 10s / ping 25s / 僵死 60s / 退避 1s→30s）。 */
   helloTimeoutMs?: number;
   pingIntervalMs?: number;
@@ -66,6 +73,7 @@ export class WsManager {
   private readonly onStatus: (status: ConnStatus) => void;
   private readonly onAuthFailed: () => void;
   private readonly wsFactory: (url: string) => WebSocketLike;
+  private readonly getMachine: (() => string | undefined) | undefined;
   private readonly helloTimeoutMs: number;
   private readonly pingIntervalMs: number;
   private readonly deadLinkMs: number;
@@ -90,6 +98,7 @@ export class WsManager {
     this.onStatus = opts.onStatus;
     this.onAuthFailed = opts.onAuthFailed;
     this.wsFactory = opts.wsFactory ?? ((u) => new WebSocket(u) as unknown as WebSocketLike);
+    this.getMachine = opts.getMachine;
     this.helloTimeoutMs = opts.helloTimeoutMs ?? 10_000;
     this.pingIntervalMs = opts.pingIntervalMs ?? 25_000;
     this.deadLinkMs = opts.deadLinkMs ?? 60_000;
@@ -116,22 +125,33 @@ export class WsManager {
   }
 
   // ---- 发送 API（ready 前返回 false）----
+  // machine 传 undefined 时省略该字段（单机模式与 v1 字节级一致）；
+  // 多机模式必须传当前选中机器（防 relay 回 ambiguous_machine）。
 
   /** convId 传 undefined 时省略该字段（网关落默认会话）——「+ 新会话」的
    *  /switch 命令文本走默认会话，由网关解析并切出 web:<名字>。 */
-  sendMessage(convId: string | undefined, text: string): boolean {
-    return this.send({ v: 1, type: "message", convId, text });
+  sendMessage(convId: string | undefined, text: string, machine?: string): boolean {
+    return this.send({ v: 1, type: "message", convId, text, machine });
   }
 
-  /** convId / requestId 原样回传 approval_request 帧里的值。 */
-  sendApprovalResponse(convId: string, requestId: string, decision: ApprovalDecision): boolean {
-    return this.send({ v: 1, type: "approval_response", convId, requestId, decision });
+  /** convId / requestId 原样回传 approval_request 帧里的值；machine =
+   *  审批来源机器（非当前选中机器的审批也回对应机器）。 */
+  sendApprovalResponse(
+    convId: string,
+    requestId: string,
+    decision: ApprovalDecision,
+    machine?: string,
+  ): boolean {
+    return this.send({ v: 1, type: "approval_response", convId, requestId, decision, machine });
   }
 
-  sendControl(cmd: "stop" | "resume" | "switch", args?: string): boolean {
-    return this.send(
-      args === undefined ? { v: 1, type: "control", cmd } : { v: 1, type: "control", cmd, args },
-    );
+  sendControl(cmd: "stop" | "resume" | "switch", args?: string, machine?: string): boolean {
+    return this.send({ v: 1, type: "control", cmd, args, machine });
+  }
+
+  /** 机器切换后拉该机器卡片缓存（App 层调用；machine 缺省不带字段）。 */
+  sendSync(machine?: string): boolean {
+    return this.send({ v: 1, type: "sync", machine });
   }
 
   private send(frame: OutboundFrame): boolean {
@@ -197,11 +217,19 @@ export class WsManager {
     this.ready = true;
     this.attempts = 0; // 成功即重置退避
     this.setStatus("ready");
-    // 连接成功（含重连）后必须立即发 sync：网关重发全部会话最近卡片终态
-    this.rawSend(encodeFrame({ v: 1, type: "sync" }));
+    // 连接成功（含重连）后必须立即发 sync：网关重发全部会话最近卡片终态。
+    // v1.1：重连时多机模式经 getMachine 带上当前机器；首连尚未收到 machines
+    // 帧（getMachine 为 undefined）不带字段——machines 帧到达后由 App 层再发
+    // 一次带 machine 的 sync（幂等，卡片按 messageId 覆盖）。
+    this.rawSend(encodeFrame({ v: 1, type: "sync", machine: this.machineOf() }));
     this.lastFrameAt = Date.now();
     this.startHeartbeat();
   };
+
+  /** 内部自动帧（sync/ping）的出站机器：注入取值，undefined 不带字段。 */
+  private machineOf(): string | undefined {
+    return this.getMachine?.();
+  }
 
   private startHeartbeat(): void {
     this.stopHeartbeat();
@@ -212,7 +240,7 @@ export class WsManager {
         this.scheduleReconnect();
         return;
       }
-      this.rawSend(encodeFrame({ v: 1, type: "ping" }));
+      this.rawSend(encodeFrame({ v: 1, type: "ping", machine: this.machineOf() }));
     }, this.pingIntervalMs);
   }
 

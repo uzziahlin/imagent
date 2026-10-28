@@ -1,6 +1,7 @@
-//! 回环集成测试（M2 核心验收）：真 relay（`imagent_relay::spawn_relay` 随机
-//! 端口）+ 真 `WebPlatform`（出站连 `/gateway`）+ tokio-tungstenite 模拟浏览器
-//! （连 `/ws`，hello 认证），覆盖任务说明 §8 场景 1-6：
+//! 回环集成测试（M2 核心验收 + M5 多终端 v1.1）：真 relay
+//!（`imagent_relay::spawn_relay` 随机端口）+ 真 `WebPlatform`（出站连
+//! `/gateway`，hello 自报 machine=test-mac）+ tokio-tungstenite 模拟浏览器
+//!（连 `/ws`，hello 认证），覆盖任务说明 §8 场景 1-6：
 //! 1. 建连与在线；
 //! 2. message 帧 → `Platform::recv`；
 //! 3. send_text / send_card / update_card → text / card / card_patch 帧；
@@ -8,6 +9,9 @@
 //! 5. sync 重发；
 //! 6. 断线语义（帧排队不 panic、队列满报错、doctor_probes 重连中——同端口
 //!    重启有竞态，采用任务说明允许的简化方案，见 `disconnect_*` 注释）。
+//!
+//! M5 增补：出站帧全部带 machine 字段；浏览器帧 machine 路由（指定本机 /
+//! 指定离线 machine_offline）。
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -29,6 +33,8 @@ type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const GW_TOKEN: &str = "test-gw-token-0123456789abcdef";
 const USER_TOKEN: &str = "test-user-token-0123456789abc";
 const CONV: &str = "web:work";
+/// 本平台自报的 machine 身份（v1.1 hello + 出站帧携带）。
+const MACHINE: &str = "test-mac";
 
 async fn spawn_test_relay() -> RelayHandle {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -42,7 +48,8 @@ async fn spawn_test_relay() -> RelayHandle {
     .expect("测试配置合法")
 }
 
-/// 起真 relay + 真平台（等在线）+ 模拟浏览器（hello 认证）。
+/// 起真 relay + 真平台（hello 自报 machine，等在线）+ 模拟浏览器（hello
+/// 认证 + machines 快照断言）。
 async fn setup() -> (RelayHandle, WebPlatform, Ws) {
     let handle = spawn_test_relay().await;
     let addr = handle.addr;
@@ -50,11 +57,11 @@ async fn setup() -> (RelayHandle, WebPlatform, Ws) {
         format!("ws://{addr}/gateway"),
         GW_TOKEN.to_string(),
         "default".to_string(),
+        MACHINE.to_string(),
     );
-    // 等 platform 连上 relay（client spawn 后异步建连）。
+    // 等 platform 连上 relay（client spawn 后异步建连 + hello 认证）。
     eventually(Duration::from_secs(10), || platform.is_online()).await;
-    // 浏览器：hello 认证（Bearer 头是网关 Rust 客户端形态，浏览器唯一形态是
-    // 首帧 hello）。
+    // 浏览器：hello 认证（浏览器唯一形态是首帧 hello）。
     let mut ws = connect_ws(&addr, "/ws", None).await;
     ws.send(Message::text(format!(
         r#"{{"v":1,"type":"hello","token":"{USER_TOKEN}"}}"#
@@ -63,7 +70,16 @@ async fn setup() -> (RelayHandle, WebPlatform, Ws) {
     .unwrap();
     let ack = next_text(&mut ws).await;
     assert!(ack.contains(r#""type":"hello_ack""#), "hello_ack：{ack}");
-    // machine 快照（网关已在线）由 next_of_type 跳过，不在此阻塞。
+    // v1.1 machines 快照：平台以 machine=test-mac 在线（default 机器不在线，
+    // 旧 machine 快照为 false，由 next_of_type 跳过）。
+    let machines = next_of_type(&mut ws, "machines").await;
+    let list: Vec<&str> = machines["online"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap())
+        .collect();
+    assert_eq!(list, vec![MACHINE], "machines 快照应含本机：{machines}");
     (handle, platform, ws)
 }
 
@@ -177,11 +193,12 @@ async fn loopback_message_and_outbound_frames() {
         .unwrap();
     assert_eq!(m.conv_id, ConvId("web:default".into()));
 
-    // send_text → text 帧。
+    // send_text → text 帧（带 machine，v1.1）。
     p.send_text(&conv(), "已收到", &ReplyHint::None)
         .await
         .unwrap();
     let v = next_of_type(&mut br, "text").await;
+    assert_eq!(v["machine"], MACHINE, "出站帧带本机 machine");
     assert_eq!(v["convId"], CONV);
     assert_eq!(v["text"], "已收到");
 
@@ -212,6 +229,7 @@ async fn loopback_message_and_outbound_frames() {
         .expect("send_card 返回合成 messageId");
     assert!(mid.starts_with("web-card-"), "{mid}");
     let v = next_of_type(&mut br, "card").await;
+    assert_eq!(v["machine"], MACHINE, "card 帧带本机 machine");
     assert_eq!(v["messageId"], mid);
     assert_eq!(v["state"], "streaming");
     assert_eq!(v["card"]["text"], "流式中");
@@ -226,6 +244,7 @@ async fn loopback_message_and_outbound_frames() {
     .await
     .unwrap();
     let v = next_of_type(&mut br, "card_patch").await;
+    assert_eq!(v["machine"], MACHINE, "card_patch 帧带本机 machine");
     assert_eq!(v["messageId"], mid);
     assert_eq!(v["state"], "done");
     assert_eq!(v["card"]["terminal"], "done");
@@ -236,6 +255,7 @@ async fn loopback_message_and_outbound_frames() {
         .unwrap();
     let v = next_of_type(&mut br, "pong").await;
     assert_eq!(v["type"], "pong");
+    assert_eq!(v["machine"], MACHINE, "pong 帧带本机 machine");
 
     handle.shutdown();
     handle.wait().await;
@@ -266,6 +286,7 @@ async fn loopback_approval_roundtrip() {
         "request_id 即 card_msg_id 锚点"
     );
     let v = next_of_type(&mut br, "approval_request").await;
+    assert_eq!(v["machine"], MACHINE, "approval_request 帧带本机 machine");
     assert_eq!(v["convId"], CONV);
     assert_eq!(v["requestId"], "req-1");
     assert_eq!(v["tool"], "Bash");
@@ -306,6 +327,7 @@ async fn loopback_approval_roundtrip() {
     .await
     .unwrap();
     let v = next_of_type(&mut br, "approval_resolved").await;
+    assert_eq!(v["machine"], MACHINE, "approval_resolved 帧带本机 machine");
     assert_eq!(v["requestId"], "req-1");
     assert_eq!(v["decision"], "always");
 
@@ -375,6 +397,7 @@ async fn loopback_sync_resends_cached_card() {
         .await
         .unwrap();
     let v = next_of_type(&mut br, "card").await;
+    assert_eq!(v["machine"], MACHINE, "sync 重发帧带本机 machine");
     assert_eq!(v["messageId"], mid, "重发携带原 messageId");
     assert_eq!(v["card"]["text"], "最终结果", "重发最新缓存内容");
     assert_eq!(v["state"], "done");
@@ -438,5 +461,45 @@ async fn disconnect_queues_frames_and_reports_reconnecting() {
     assert_eq!(probes.len(), 1);
     assert!(probes[0].contains("重连中"), "{}", probes[0]);
 
+    drop(p);
+}
+
+/// 场景 7（M5 多终端 v1.1）：浏览器帧 machine 路由——指定本机（test-mac）
+/// 正常送达平台（machine 字段对网关透明，不影响 conv 映射）；指定不在线
+/// 机器由 relay 回 machine_offline error（帧不进网关，recv 无感知）。
+#[tokio::test]
+async fn loopback_browser_machine_field_routing() {
+    let (handle, p, mut br) = setup().await;
+
+    // 指定本机 → 正常路由到平台，machine 字段不影响 message 映射。
+    br.send(Message::text(format!(
+        r#"{{"v":1,"type":"message","machine":"{MACHINE}","convId":"work","text":"指定本机"}}"#
+    )))
+    .await
+    .unwrap();
+    let m = tokio::time::timeout(Duration::from_secs(5), p.recv())
+        .await
+        .expect("recv 超时")
+        .expect("recv 正常");
+    assert_eq!(m.conv_id, conv());
+    assert_eq!(m.text.as_deref(), Some("指定本机"));
+
+    // 指定离线机器 → relay 回 machine_offline（网关侧无感知：recv 持续 pending）。
+    br.send(Message::text(
+        r#"{"v":1,"type":"message","machine":"other-mac","text":"指定别机"}"#,
+    ))
+    .await
+    .unwrap();
+    let e = next_of_type(&mut br, "error").await;
+    assert_eq!(e["code"], "machine_offline", "relay 拒绝离线机器：{e}");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), p.recv())
+            .await
+            .is_err(),
+        "machine_offline 帧不应进 recv"
+    );
+
+    handle.shutdown();
+    handle.wait().await;
     drop(p);
 }

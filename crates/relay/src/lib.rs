@@ -14,11 +14,14 @@
 //!   同时注册在 Hub（并存上限 [`MAX_BROWSERS`] = 8，防滥用——满时新连接
 //!   认证通过后仍被 close 4001，复用 superseded 让位语义，SPA 已有 4001
 //!   终态处理：不重连、不与在线连接互踢）；gateway→browser 业务帧与
-//!   machine 上/下线通知向**全部**在线 browser 广播（逐个 try_send，单个
-//!   打满/关闭不影响其余）；任一 browser 的入站帧照旧路由给网关（或入
-//!   离线缓冲），语义不变。
-//! - **网关侧单连接踢旧不变**（网关单实例语义）：新网关连接顶替旧连接，
-//!   旧连接 close 4001 superseded。
+//!   machines 上/下线通知向**全部**在线 browser 广播（逐个 try_send，单个
+//!   打满/关闭不影响其余）；任一 browser 的入站帧按 machine 字段路由给
+//!   对应网关（或入离线缓冲），见 [`Hub::route_browser_frame`]。
+//! - **网关侧多机器并存（帧协议 v1.1，M5 多终端管理）**：每条网关连接在
+//!   hello 帧自报 `machine` 身份（Bearer 直通回退兼容 = `"default"` 机器），
+//!   Hub 按 machine 槽位存多连接（上限 [`MAX_GATEWAYS`] = 4——满员且非同
+//!   机重连的新连接 close 4001）；**同一 machine 重连仍踢旧**（每台机器
+//!   单连接语义，旧连接 close 4001 superseded）。
 //!
 //! 分层（任务说明 §4.7）：核心状态机全部在本 lib（可单测 + 集成测试直接
 //! [`spawn_relay`] 起真 server），`main.rs` 只做 env / bind / tracing 组装。
@@ -62,15 +65,27 @@ const BUF_MAX_FRAMES: usize = 200;
 const BUF_MAX_BYTES: usize = 1024 * 1024;
 /// 单 WS message / 单 frame 上限 256KB（§4.4）：超限 axum 自会以 1009 断开。
 const MAX_WS_MESSAGE_BYTES: usize = 256 * 1024;
-/// 每连接出站 channel 容量。上限推导：hello_ack + machine 快照 + 网关离线
-/// 缓冲全量重放（≤200 帧）必须在**进入消费循环之前**一次性入队也不阻塞，
-/// 故 ≥202；取 512 留余量。业务帧转发走 try_send（打满即丢，见 [`try_send`]），
-/// 连接之间不存在互相 await 的投递环，不会死锁。
+/// 每连接出站 channel 容量。上限推导：网关侧 hello_ack + 离线缓冲全量
+/// 重放（≤200 帧）、浏览器侧 hello_ack + machine/machines 双快照，必须在
+/// **进入消费循环之前**一次性入队也不阻塞，故 ≥202；取 512 留余量。业务
+/// 帧转发走 try_send（打满即丢，见 [`try_send`]），连接之间不存在互相
+/// await 的投递环，不会死锁。
 const CHANNEL_CAPACITY: usize = 512;
 /// 浏览器侧最多并存连接数（防滥用）：真机常态是手机 + 电脑 + 多标签
 ///（≤3~4 条），取 8 留余量。满时新连接认证通过后仍被 close 4001
 ///（复用 superseded 让位语义，SPA 已有 4001 终态处理：不重连）。
 const MAX_BROWSERS: usize = 8;
+/// 网关侧最多并存机器数（v1.1 多终端管理）：每条网关连接按 hello 自报的
+/// machine 占一个槽位。真机常态是 2~3 台（家/公司/便携），取 4 留余量；
+/// 满员且非同机重连的新连接 close 4001（同 machine 重连不受限——踢旧
+/// 顶替，每台机器单连接语义）。
+const MAX_GATEWAYS: usize = 4;
+/// 缺省 machine id（v1.1）：hello 不带 machine / Bearer 直通（无 machine
+/// 维度）都落到 default——与单机时期的语义完全一致（旧网关/旧 SPA 回退
+/// 兼容），旧 `machine` 帧也只表达 default 机器的在线状态。
+const DEFAULT_MACHINE: &str = "default";
+/// machine id 协议约束（v1.1）：≤32 char，仅 ASCII 字母数字与 `-_`。
+const MACHINE_ID_MAX_CHARS: usize = 32;
 
 /// WS close code（RFC 6455 + 私有码，§4.2/§4.3/§4.5）。
 const CLOSE_POLICY: u16 = 1008; // 认证失败 / 协议违规（binary、非 hello 首帧）/ 限流
@@ -153,19 +168,23 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 // hello 首帧解析（§4.2 主认证形态）
 // ---------------------------------------------------------------------------
 
-/// hello 首帧反序列化形状：`{"v":1,"type":"hello","token":"..."}`。
+/// hello 首帧反序列化形状：`{"v":1,"type":"hello","token":"...","machine":"..."}`
+///（v1.1：machine 可选，网关侧自报身份；浏览器侧无 machine 概念，不发送）。
 #[derive(Deserialize)]
 struct HelloFrame {
     v: i64,
     #[serde(rename = "type")]
     kind: String,
     token: String,
+    #[serde(default)]
+    machine: Option<String>,
 }
 
 /// hello 解析失败原因（只为日志可读；对外行为一致——close 1008）。
 #[derive(Debug, PartialEq, Eq)]
 enum HelloParseError {
-    /// JSON 畸形 / 缺字段 / token 非字符串 / token 为空串。
+    /// JSON 畸形 / 缺字段 / token 非字符串 / token 为空串 / machine 非法
+    ///（空串、trim 后为空、超 32 char、含字母数字-_ 之外的字符）。
     Malformed,
     /// 首帧 type 不是 hello。
     NotHello,
@@ -173,9 +192,32 @@ enum HelloParseError {
     BadVersion,
 }
 
-/// 解析首帧 hello（纯函数便于单测）。空 token 判 Malformed：空串不可能与
-/// 合法配置 token 相等，提前拒绝让语义更明确。
-fn parse_hello(text: &str) -> Result<String, HelloParseError> {
+/// machine id 校验（v1.1 协议约束，纯函数便于单测）：trim、非空、
+/// ≤32 char、仅 ASCII 字母数字与 `-_`。通过返回 trim 后的值。
+fn validate_machine(raw: &str) -> Result<String, HelloParseError> {
+    let m = raw.trim();
+    if m.is_empty() {
+        return Err(HelloParseError::Malformed);
+    }
+    if m.chars().count() > MACHINE_ID_MAX_CHARS {
+        return Err(HelloParseError::Malformed);
+    }
+    if !m
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(HelloParseError::Malformed);
+    }
+    Ok(m.to_string())
+}
+
+/// 解析首帧 hello（纯函数便于单测），返回 `(token, machine)`。空 token 判
+/// Malformed：空串不可能与合法配置 token 相等，提前拒绝让语义更明确。
+/// machine 缺省（字段不存在）→ `"default"`；带值则经 [`validate_machine`]
+/// 校验（非法拒绝——machine 是路由主键，脏值宁可断连也不静默改写）。
+/// 浏览器侧调用方忽略 machine（浏览器 hello 不带该字段；带了也只校验不
+/// 消费，不影响浏览器路由语义）。
+fn parse_hello(text: &str) -> Result<(String, String), HelloParseError> {
     let h: HelloFrame = serde_json::from_str(text).map_err(|_| HelloParseError::Malformed)?;
     if h.v != 1 {
         return Err(HelloParseError::BadVersion);
@@ -186,7 +228,11 @@ fn parse_hello(text: &str) -> Result<String, HelloParseError> {
     if h.token.is_empty() {
         return Err(HelloParseError::Malformed);
     }
-    Ok(h.token)
+    let machine = match h.machine.as_deref() {
+        None => DEFAULT_MACHINE.to_string(),
+        Some(m) => validate_machine(m)?,
+    };
+    Ok((h.token, machine))
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +270,16 @@ impl RateWindow {
 
 /// 网关离线缓冲：FIFO，[`BUF_MAX_FRAMES`] 帧 / [`BUF_MAX_BYTES`] 字节先到
 /// 为准，溢出拒新（丢新保旧——保证重放顺序完整）。字节按 UTF-8 计。
+///
+/// M5 多机简化：缓冲保持 per-relay 单 FIFO，**不按 machine 分桶**。理由：
+/// 帧进缓冲的唯一时机是**全部**网关离线（任一在线都不会缓冲）；缓冲帧
+/// 重放给第一个上线的网关。多机并存时 SPA 本就必须显式选 machine 才能发
+/// 帧（缺省路由在多机下是 ambiguous error——bootstrap 期的 sync/ping 静默
+/// 豁免除外，见 [`AMBIGUOUS_SILENT_KINDS`]），「全下线」窗口内积压的帧语义
+/// 上属于「当时选中的机器」，但 SPA 重连后所选机器未必恢复——按 machine
+/// 分桶要么帧永久滞留（无人来取），要么协议再加清理规则，复杂度不匹配
+/// 收益；单 FIFO「先上线先重放」足够覆盖主场景（单机部署 / 多机短暂全掉
+/// 后任一台先恢复）。
 #[derive(Default)]
 struct OfflineBuffer {
     frames: VecDeque<String>,
@@ -280,13 +336,31 @@ impl Role {
 }
 
 /// relay 自产帧（§4.3 行为 7：除此之外 relay 不解析、不改写、不记录任何
-/// 业务帧内容——machine/error 之外 relay 对帧是「盲」的）。
-fn hello_ack_frame(role: Role) -> Message {
-    Message::text(serde_json::json!({"v": 1, "type": "hello_ack", "role": role.name()}).to_string())
+/// 业务帧内容——machine/error 之外 relay 对帧是「盲」的）。hello_ack 的
+/// `machine` 仅网关侧携带（v1.1 身份确认：回显 hello 自报的 machine）。
+fn hello_ack_frame(role: Role, machine: Option<&str>) -> Message {
+    match machine {
+        Some(m) => Message::text(
+            serde_json::json!({"v": 1, "type": "hello_ack", "role": role.name(), "machine": m})
+                .to_string(),
+        ),
+        None => Message::text(
+            serde_json::json!({"v": 1, "type": "hello_ack", "role": role.name()}).to_string(),
+        ),
+    }
 }
 
+/// 旧 `machine` 帧（v1 唯一通知形态，v1.1 保留）：语义收敛为「default
+/// 机器的在线状态」——单机部署（default 机器）与旧 SPA 的行为完全不变；
+/// 非 default 机器上下线不发本帧（新 SPA 看 [`machines_frame`]）。
 fn machine_frame(online: bool) -> Message {
     Message::text(serde_json::json!({"v": 1, "type": "machine", "online": online}).to_string())
+}
+
+/// v1.1 `machines` 帧：全量在线机器列表（排序不敏感，此处给有序输出便于
+/// 测试与日志），任一网关上/下线时向全部在线浏览器广播。
+fn machines_frame(machines: &[String]) -> Message {
+    Message::text(serde_json::json!({"v": 1, "type": "machines", "online": machines}).to_string())
 }
 
 fn error_frame(code: &str) -> Message {
@@ -303,16 +377,17 @@ enum Outbound {
 }
 
 /// Hub 槽位：指向某条连接的出站 channel + 连接身份。conn_id 用于网关
-/// 单槽位防「踢旧后旧连接退出时误清新连接」；browser 并存表以 conn_id
-/// 为键，字段保持单一 Endpoint 形状。
+/// machine 槽位防「踢旧后旧连接退出时误清新连接」；browser 并存表以
+/// conn_id 为键，字段保持单一 Endpoint 形状。
 struct Endpoint {
     conn_id: u64,
     tx: mpsc::Sender<Outbound>,
 }
 
 struct HubState {
-    /// 网关单连接槽位（单实例语义：新顶旧）。
-    gateway: Option<Endpoint>,
+    /// 网关多机器并存表（v1.1）：machine id → 连接槽位（上限
+    /// [`MAX_GATEWAYS`]；同 machine 重连顶替旧连接——每台机器单连接）。
+    gateways: HashMap<String, Endpoint>,
     /// 浏览器多连接并存表：conn_id → 出站投递口（上限 [`MAX_BROWSERS`]）。
     browsers: HashMap<u64, Endpoint>,
     buf: OfflineBuffer,
@@ -328,47 +403,122 @@ struct Hub {
     shutdown: watch::Receiver<bool>,
 }
 
-/// 锁内取全部在线 browser 的投递口（广播目标：machine 通知 / 业务帧
-/// fan-out / 停机 close）。
+/// 锁内取全部在线 browser 的投递口（广播目标：machines/machine 通知 /
+/// 业务帧 fan-out / 停机 close）。
 fn browser_senders(st: &HubState) -> Vec<mpsc::Sender<Outbound>> {
     st.browsers.values().map(|e| e.tx.clone()).collect()
 }
 
+/// 锁内取全量在线 machine 列表（有序输出——machines 帧对 SPA 排序不敏感，
+/// 有序只为测试与日志稳定）。
+fn online_machines(st: &HubState) -> Vec<String> {
+    let mut v: Vec<String> = st.gateways.keys().cloned().collect();
+    v.sort();
+    v
+}
+
 /// 网关注册结果：锁外要做的副作用（踢旧 / 广播上线通知 / 重放缓冲）。
 struct GatewayRegistered {
+    /// 同 machine 旧连接被顶替（每台机器单连接语义）→ 调用方对其 close 4001。
     superseded: Option<mpsc::Sender<Outbound>>,
-    /// 全部在线 browser 的投递口（machine 上线广播目标）。
+    /// 全部在线 browser 的投递口（machines/machine 上线广播目标）。
     browsers: Vec<mpsc::Sender<Outbound>>,
+    /// 注册后全量在线 machine 列表（machines 帧载荷）。
+    machines: Vec<String>,
     replay: Vec<String>,
+    /// 注册后在线网关数（日志）。
+    gateways: usize,
+    /// 本次注册的是否 default 机器（决定是否附带旧 machine 上线帧）。
+    is_default: bool,
 }
 
 /// browser 注册结果（多连接并存版）：不再踢旧。`full` = 并存数已达
 /// [`MAX_BROWSERS`]，本连接未注册（调用方对**自己** close 4001——复用
 /// superseded 让位语义，SPA 已有终态处理）；`machine_online` 为注册时
-/// 快照（gateway 槽位定）；`browsers` 为注册后在线 browser 数（含本
-/// 连接），供连接日志。
+/// **default 机器**在线快照（旧 machine 帧语义，v1.1）；`machines` 为
+/// 注册时全量在线机器列表（v1.1 machines 快照帧载荷）；`browsers` 为
+/// 注册后在线 browser 数（含本连接），供连接日志。
 struct BrowserRegistered {
     full: bool,
     machine_online: bool,
+    machines: Vec<String>,
     browsers: usize,
 }
 
-/// browser 业务帧的路向（§4.3 行为 4）。
+/// browser 业务帧的路向（§4.3 行为 4 + v1.1 §3 路由规则）。
 #[derive(Debug)]
 enum BrowserRoute {
-    /// 网关在线 → 透传（携带网关出站 channel）。
+    /// 命中网关（显式指定该机器在线 / 未指定且恰好一台在线）→ 透传
+    ///（携带网关出站 channel）。
     Deliver(mpsc::Sender<Outbound>),
-    /// 网关离线 → 已入缓冲。
+    /// 全部网关离线 → 已入缓冲（单 FIFO，见 [`OfflineBuffer`] 头注释）。
     Buffered,
-    /// 网关离线且缓冲满 → 不入，调用方向该 browser 回 gateway_offline error。
+    /// 全部网关离线且缓冲满 → 不入，调用方向该 browser 回 gateway_offline error。
     OfflineFull,
+    /// 显式指定 machine 但该机器不在线 → 调用方回 machine_offline error。
+    MachineOffline,
+    /// 未指定 machine 且多台网关在线，但帧类型为 bootstrap 豁免类型
+    ///（sync/ping，见 [`AMBIGUOUS_SILENT_KINDS`]）→ 静默丢弃：不路由、
+    /// 不回错（SPA 收到 machines 帧后会补发带 machine 的 sync；ping 无
+    /// 副作用）。其余帧类型仍 [`BrowserRoute::Ambiguous`]——真实用户操作
+    /// 报错是对的。
+    Ignored,
+    /// 未指定且多台网关在线（缺省路由歧义）→ 调用方回 ambiguous_machine error。
+    Ambiguous,
+}
+
+/// browser→gateway 业务帧的可选 `machine` 路由键提取（v1.1 §3）。
+///
+/// relay 对业务帧保持「盲」（零解析零改写零记录），唯一例外是这一个
+/// 字段：`machine` 是 **transport 层路由键**（决定帧投给哪条网关连接），
+/// 不是业务语义——不读它就无法多机路由；除它之外的任何字段仍然不碰。
+/// JSON 畸形 / 字段缺失 / 非字符串 / trim 后为空 → None（按「未指定」
+/// 路由；畸形帧本身照原样透传或入缓冲，盲转语义不变）。
+fn frame_machine(text: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let m = v.get("machine")?.as_str()?.trim();
+    if m.is_empty() {
+        return None;
+    }
+    Some(m.to_string())
+}
+
+/// 缺省路由歧义（未指定 machine 且多台网关在线）时**静默忽略**的帧类型：
+/// `sync` 与 `ping`。理由（bootstrap 时序豁免）：
+/// - SPA 首连在 hello_ack 后立即发 bootstrap sync，此时 machines 列表帧
+///   尚未到达、无从带 machine（鸡生蛋）；sync 幂等可补发——SPA 收到
+///   machines 帧后会再发一次带 machine 的 sync，此前的无 machine sync
+///   丢弃无害；
+/// - ping 是无副作用探活，丢弃同样无害。
+///
+/// 这两类帧若照常回 `ambiguous_machine`，只会让 SPA 每次连接都弹一次
+///「多台机器在线」toast（4s 噪音）。其余类型（message / approval_response
+/// / control）是真实用户操作，歧义仍回错——见 [`BrowserRoute::Ambiguous`]。
+const AMBIGUOUS_SILENT_KINDS: [&str; 2] = ["sync", "ping"];
+
+/// browser→gateway 帧的 `type` 提取（仅服务于 [`AMBIGUOUS_SILENT_KINDS`]
+/// 判定）。与 [`frame_machine`] 同款纪律：relay 对业务帧保持「盲」，`type`
+/// 只用于歧义分支的静默豁免判定，不消费业务语义。JSON 畸形 / 字段缺失 /
+/// 非字符串 → None（按未知类型处理，走既有 Ambiguous 回错路径）。
+fn frame_kind(text: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    Some(v.get("type")?.as_str()?.to_string())
+}
+
+/// 缺省路由歧义分支的静默豁免判定：帧 type 属于 [`AMBIGUOUS_SILENT_KINDS`]
+///（解析失败 / 未知类型 → false，不豁免）。
+fn is_ambiguous_silent_kind(text: &str) -> bool {
+    match frame_kind(text).as_deref() {
+        Some(k) => AMBIGUOUS_SILENT_KINDS.contains(&k),
+        None => false,
+    }
 }
 
 impl Hub {
     fn new(shutdown: watch::Receiver<bool>) -> Self {
         Self {
             state: Arc::new(Mutex::new(HubState {
-                gateway: None,
+                gateways: HashMap::new(),
                 browsers: HashMap::new(),
                 buf: OfflineBuffer::default(),
             })),
@@ -391,52 +541,87 @@ impl Hub {
         self.shutdown.clone()
     }
 
-    /// 网关注册（§4.3 行为 1，单实例语义不变）：顶替旧槽位（踢旧）、取
-    /// 全部在线 browser 的投递口（上线广播目标）、drain 离线缓冲（重放
-    /// 顺序 = 入队顺序）。
-    fn register_gateway(&self, conn_id: u64, tx: mpsc::Sender<Outbound>) -> GatewayRegistered {
+    /// 网关注册（v1.1 多机器并存）：满员（[`MAX_GATEWAYS`]）且非同机重连
+    /// → None（调用方 close 4001 自己）；否则占该 machine 的槽位——同
+    /// machine 旧连接被顶替（踢旧）、取全部在线 browser 的投递口（上线
+    /// 广播目标）、drain 离线缓冲（重放顺序 = 入队顺序，见
+    /// [`OfflineBuffer`] 头注释的单 FIFO 简化）。
+    fn register_gateway(
+        &self,
+        machine: &str,
+        conn_id: u64,
+        tx: mpsc::Sender<Outbound>,
+    ) -> Option<GatewayRegistered> {
         let mut st = self.lock();
-        let superseded = st.gateway.replace(Endpoint { conn_id, tx }).map(|e| e.tx);
-        let browsers = browser_senders(&st);
-        let replay = st.buf.drain();
-        GatewayRegistered {
-            superseded,
-            browsers,
-            replay,
+        if st.gateways.len() >= MAX_GATEWAYS && !st.gateways.contains_key(machine) {
+            return None;
         }
+        let superseded = st
+            .gateways
+            .insert(machine.to_string(), Endpoint { conn_id, tx })
+            .map(|e| e.tx);
+        let reg = GatewayRegistered {
+            superseded,
+            browsers: browser_senders(&st),
+            machines: online_machines(&st),
+            replay: st.buf.drain(),
+            gateways: st.gateways.len(),
+            is_default: machine == DEFAULT_MACHINE,
+        };
+        Some(reg)
     }
 
-    /// browser 注册（多连接并存，替代原「顶替旧槽位」）：上限未满 → 注册
-    /// 新 conn_id（不踢任何旧连接）+ 当前 machine 快照；已满 → full=true
+    /// browser 注册（多连接并存）：上限未满 → 注册新 conn_id（不踢任何旧
+    /// 连接）+ default 机器快照 + 全量 machines 快照；已满 → full=true
     ///（本连接不注册，调用方 close 4001 自己）。
     fn register_browser(&self, conn_id: u64, tx: mpsc::Sender<Outbound>) -> BrowserRegistered {
         let mut st = self.lock();
         if st.browsers.len() >= MAX_BROWSERS {
             return BrowserRegistered {
                 full: true,
-                machine_online: st.gateway.is_some(),
+                machine_online: st.gateways.contains_key(DEFAULT_MACHINE),
+                machines: online_machines(&st),
                 browsers: st.browsers.len(),
             };
         }
         st.browsers.insert(conn_id, Endpoint { conn_id, tx });
         BrowserRegistered {
             full: false,
-            machine_online: st.gateway.is_some(),
+            machine_online: st.gateways.contains_key(DEFAULT_MACHINE),
+            machines: online_machines(&st),
             browsers: st.browsers.len(),
         }
     }
 
-    /// browser→gateway 帧路向（§4.3 行为 4）：在线透传；离线入缓冲；
-    /// 缓冲满拒新（丢新保旧）。
+    /// browser→gateway 帧路向（§4.3 行为 4 + v1.1 §3 路由规则）：
+    /// - 显式 machine 在线 → 透传；不在线 → [`BrowserRoute::MachineOffline`]；
+    /// - 未指定：恰好一台 → 透传（单机部署 SPA 零升级无感）；多台 → sync/
+    ///   ping 静默丢弃（bootstrap 时序豁免，[`BrowserRoute::Ignored`]），
+    ///   其余 [`BrowserRoute::Ambiguous`]；零台 → 沿用 M1 行为入单 FIFO
+    ///   缓冲（sync/ping 亦照旧入缓冲——豁免只作用于歧义分支），缓冲满
+    ///   拒新（丢新保旧）。
     fn route_browser_frame(&self, text: &str) -> BrowserRoute {
         let mut st = self.lock();
-        if let Some(g) = st.gateway.as_ref() {
-            return BrowserRoute::Deliver(g.tx.clone());
-        }
-        if st.buf.push(text) {
-            BrowserRoute::Buffered
-        } else {
-            BrowserRoute::OfflineFull
+        match frame_machine(text) {
+            Some(m) => match st.gateways.get(&m) {
+                Some(e) => BrowserRoute::Deliver(e.tx.clone()),
+                None => BrowserRoute::MachineOffline,
+            },
+            None => match st.gateways.len() {
+                1 => {
+                    let e = st.gateways.values().next().expect("len==1 必有槽位");
+                    BrowserRoute::Deliver(e.tx.clone())
+                }
+                0 => {
+                    if st.buf.push(text) {
+                        BrowserRoute::Buffered
+                    } else {
+                        BrowserRoute::OfflineFull
+                    }
+                }
+                _ if is_ambiguous_silent_kind(text) => BrowserRoute::Ignored,
+                _ => BrowserRoute::Ambiguous,
+            },
         }
     }
 
@@ -444,52 +629,68 @@ impl Hub {
     /// 在线 browser 的投递口，调用侧逐个 try_send——单个打满/关闭不影响
     /// 其余（已关闭的条目无需在此清理，release 路径会移除）。空 = 无在线
     /// browser，帧直接丢弃不缓存——会话恢复走网关侧重发机制，不归 relay
-    /// 管（docs/WEB_DESIGN.md D6）。
+    /// 管（docs/WEB_DESIGN.md D6）。网关侧出站帧自带 machine 字段（v1.1），
+    /// relay 透传不改、广播全部 browser。
     fn route_gateway_frame(&self) -> Vec<mpsc::Sender<Outbound>> {
         let st = self.lock();
         browser_senders(&st)
     }
 
-    /// 连接退出清槽位（§4.3 行为 2）。browser：多连接并存——只移除自己的
-    /// conn_id 条目（按键精确移除，天然不误伤其它并存连接）。gateway：仅
-    /// 当槽位仍指向本连接（conn_id 相同）才清——踢旧后旧连接退出不得误清
-    /// 新连接；清槽位后向**全部**在线 browser 广播 machine offline（锁内
-    /// 取投递口，锁外投递）。返回清理后在线 browser 数（供断开日志）。
-    fn release(&self, role: Role, conn_id: u64) -> usize {
-        let (notify_offline, browsers) = {
-            let mut st = self.lock();
-            match role {
-                Role::Gateway => {
-                    if st.gateway.as_ref().is_none_or(|e| e.conn_id != conn_id) {
-                        return st.browsers.len();
-                    }
-                    st.gateway = None;
-                    (Some(browser_senders(&st)), st.browsers.len())
-                }
-                Role::Browser => {
-                    st.browsers.remove(&conn_id);
-                    (None, st.browsers.len())
-                }
-            }
-        };
-        if let Some(senders) = notify_offline {
-            let offline = Outbound::Msg(machine_frame(false));
-            for b in senders {
-                try_send(&b, offline.clone());
-            }
-        }
-        browsers
+    /// browser 退出只清自己的槽位（按键精确移除，天然不误伤其它并存连接），
+    /// 返回剩余在线 browser 数（供断开日志）。
+    fn release_browser(&self, conn_id: u64) -> usize {
+        let mut st = self.lock();
+        st.browsers.remove(&conn_id);
+        st.browsers.len()
     }
 
-    /// 服务停机：向网关与全部在线 browser 发 Close（§4.5 graceful
+    /// 网关退出清 machine 槽位（§4.3 行为 2，v1.1 多机版）：仅当该 machine
+    /// 槽位仍指向本连接（conn_id 相同）才清——踢旧后旧连接退出不得误清新
+    /// 连接；清槽位后锁外向**全部**在线 browser 广播 default 机器下线（旧
+    /// machine 帧，仅 default 机器）+ 全量 machines 列表（v1.1）。
+    fn release_gateway(&self, machine: &str, conn_id: u64) -> (usize, usize) {
+        // 锁内：判定槽位归属（非本连接 → 提前 return，不广播）、清槽位、
+        // 快照广播目标与计数。
+        let (senders, machines, is_default, browsers, gateways) = {
+            let mut st = self.lock();
+            let is_current = st
+                .gateways
+                .get(machine)
+                .is_some_and(|e| e.conn_id == conn_id);
+            if !is_current {
+                return (st.browsers.len(), st.gateways.len());
+            }
+            st.gateways.remove(machine);
+            (
+                browser_senders(&st),
+                online_machines(&st),
+                machine == DEFAULT_MACHINE,
+                st.browsers.len(),
+                st.gateways.len(),
+            )
+        };
+        // 旧 machine 帧在前（v1 旧 SPA 看到的帧序不变），machines 帧在后。
+        if is_default {
+            let offline = Outbound::Msg(machine_frame(false));
+            for b in &senders {
+                try_send(b, offline.clone());
+            }
+        }
+        let list = Outbound::Msg(machines_frame(&machines));
+        for b in &senders {
+            try_send(b, list.clone());
+        }
+        (browsers, gateways)
+    }
+
+    /// 服务停机：向全部网关与全部在线 browser 发 Close（§4.5 graceful
     /// shutdown，1001）。
     fn close_all(&self, code: u16, reason: &'static str) {
         let senders = {
             let st = self.lock();
-            st.gateway
-                .as_ref()
+            st.gateways
+                .values()
                 .map(|e| e.tx.clone())
-                .into_iter()
                 .chain(browser_senders(&st))
                 .collect::<Vec<_>>()
         };
@@ -668,16 +869,26 @@ async fn handle_connection(mut socket: WebSocket, st: RelayState, role: Role, he
     let expected = role.token(&st.config);
 
     // ---- 认证（§4.2，fail-closed）----
+    // 认证产物：网关侧 machine 身份（hello 自报 / Bearer 回退 default）；
+    // 浏览器侧无 machine 概念（恒 None）。
+    let mut auth_machine: Option<String> = None;
     // Bearer 正确 → 直进转发态；Bearer 带了但不正确 → 失败路径（不回落
     // hello：发起方已表明认证意图，回落只会让探测多一种节奏）。
     match bearer_token(&headers) {
-        Some(t) if constant_time_eq(t, expected) => {}
+        Some(t) if constant_time_eq(t, expected) => {
+            // Bearer 直通无 machine 维度（v1.1 回退兼容：旧网关版本/调试
+            // 脚本）→ default 机器。
+            if role == Role::Gateway {
+                auth_machine = Some(DEFAULT_MACHINE.to_string());
+            }
+        }
         Some(_) => {
             auth_reject(&mut socket, role, "Authorization Bearer token 不匹配").await;
             return;
         }
         None => {
-            // hello 首帧认证：10s 内必须是 `{"v":1,"type":"hello","token":...}`。
+            // hello 首帧认证：10s 内必须是 `{"v":1,"type":"hello","token":...}`
+            //（网关侧 v1.1 起带 machine 自报身份）。
             match tokio::time::timeout(AUTH_TIMEOUT, socket.next()).await {
                 Err(_) => {
                     tracing::warn!(target: TARGET, role = role.name(), "认证超时（10s 无 hello），关闭");
@@ -686,14 +897,25 @@ async fn handle_connection(mut socket: WebSocket, st: RelayState, role: Role, he
                 }
                 Ok(None) | Ok(Some(Err(_))) => return, // 连接已断 / 协议错误
                 Ok(Some(Ok(msg))) => {
-                    let ok = match msg {
+                    let authed = match msg {
                         Message::Text(t) => match parse_hello(t.as_str()) {
-                            Ok(tok) => constant_time_eq(&tok, expected),
+                            Ok((tok, machine)) => {
+                                if !constant_time_eq(&tok, expected) {
+                                    false
+                                } else {
+                                    // machine 身份仅网关侧消费（浏览器 hello 不带该
+                                    // 字段，带了也只经校验不使用）。
+                                    if role == Role::Gateway {
+                                        auth_machine = Some(machine);
+                                    }
+                                    true
+                                }
+                            }
                             Err(_) => false,
                         },
                         _ => false, // 首帧必须是文本 hello
                     };
-                    if !ok {
+                    if !authed {
                         auth_reject(&mut socket, role, "首帧不是合法 hello（token 不匹配/畸形）")
                             .await;
                         return;
@@ -710,26 +932,47 @@ async fn handle_connection(mut socket: WebSocket, st: RelayState, role: Role, he
 
     match role {
         Role::Gateway => {
-            let reg = st.hub.register_gateway(conn_id, tx.clone());
+            let machine = auth_machine
+                .clone()
+                .expect("网关认证通过后必有 machine 身份");
+            let Some(reg) = st.hub.register_gateway(&machine, conn_id, tx.clone()) else {
+                // 满员（MAX_GATEWAYS 且非同机重连）：认证已通过，close 4001
+                // 让位——复用 superseded 终态语义（新网关客户端按可重连错误
+                // 处理，退避后重试；同 machine 槽位释放后即可再入）。
+                tracing::warn!(target: TARGET, machine = %machine, "网关机器数达上限（MAX_GATEWAYS），close 4001");
+                let _ = socket
+                    .send(close_msg(CLOSE_SUPERSEDED, "too many gateways"))
+                    .await;
+                return;
+            };
             let replayed = reg.replay.len();
             if let Some(old) = reg.superseded {
-                tracing::info!(target: TARGET, "踢旧：新网关连接顶替旧连接（close 4001 superseded）");
+                tracing::info!(target: TARGET, machine = %machine, "踢旧：同 machine 新连接顶替旧连接（close 4001 superseded）");
                 try_send(&old, Outbound::Close(CLOSE_SUPERSEDED, "superseded"));
             }
-            // hello_ack 先于重放帧：客户端先确认角色与认证结果，再消费重放。
-            let mut init = vec![Outbound::Msg(hello_ack_frame(role))];
+            // hello_ack 先于重放帧：客户端先确认角色、认证结果与 machine 身份
+            //（v1.1 回显自报的 machine），再消费重放。
+            let mut init = vec![Outbound::Msg(hello_ack_frame(role, Some(&machine)))];
             init.extend(
                 reg.replay
                     .into_iter()
                     .map(|f| Outbound::Msg(Message::text(f))),
             );
             send_all(&tx, init).await;
-            // 上线通知广播给全部在线 browser（多端并存，逐个 try_send）。
-            let online = Outbound::Msg(machine_frame(true));
-            for b in reg.browsers {
-                try_send(&b, online.clone());
+            // 上线通知广播给全部在线 browser（多端并存，逐个 try_send）：
+            // default 机器附带旧 machine 上线帧（v1 兼容），随后全量 machines
+            // 列表帧（v1.1）。
+            if reg.is_default {
+                let online = Outbound::Msg(machine_frame(true));
+                for b in &reg.browsers {
+                    try_send(b, online.clone());
+                }
             }
-            tracing::info!(target: TARGET, replayed, "gateway 连接（认证通过）");
+            let list = Outbound::Msg(machines_frame(&reg.machines));
+            for b in reg.browsers {
+                try_send(&b, list.clone());
+            }
+            tracing::info!(target: TARGET, machine = %machine, gateways = reg.gateways, replayed, "gateway 连接（认证通过）");
         }
         Role::Browser => {
             let reg = st.hub.register_browser(conn_id, tx.clone());
@@ -742,16 +985,18 @@ async fn handle_connection(mut socket: WebSocket, st: RelayState, role: Role, he
                     .await;
                 return;
             }
-            // hello_ack 后立即推 machine 快照（§4.3 行为 3）。
+            // hello_ack 后立即推双快照（§4.3 行为 3）：旧 machine 帧（default
+            // 机器在线状态，v1 兼容——帧序不变）+ 全量 machines 列表（v1.1）。
             send_all(
                 &tx,
                 vec![
-                    Outbound::Msg(hello_ack_frame(role)),
+                    Outbound::Msg(hello_ack_frame(role, None)),
                     Outbound::Msg(machine_frame(reg.machine_online)),
+                    Outbound::Msg(machines_frame(&reg.machines)),
                 ],
             )
             .await;
-            tracing::info!(target: TARGET, machine_online = reg.machine_online, browsers = reg.browsers, "browser 连接（认证通过）");
+            tracing::info!(target: TARGET, machine_online = reg.machine_online, machines = ?reg.machines, browsers = reg.browsers, "browser 连接（认证通过）");
         }
     }
 
@@ -813,8 +1058,9 @@ async fn handle_connection(mut socket: WebSocket, st: RelayState, role: Role, he
                                 let _ = socket.send(close_msg(CLOSE_POLICY, "rate limited")).await;
                                 break;
                             }
-                            // 定向转发（§4.3 行为 4/5）：零拷贝转交 Utf8Bytes；
-                            // try_send 不跨连接 await，杜绝互相顶死的环。
+                            // 定向转发（§4.3 行为 4/5 + v1.1 §3 路由）：零拷贝
+                            // 转交 Utf8Bytes；try_send 不跨连接 await，杜绝
+                            // 互相顶死的环。
                             match role {
                                 Role::Browser => match st.hub.route_browser_frame(text.as_str()) {
                                     BrowserRoute::Deliver(gw) => {
@@ -822,11 +1068,25 @@ async fn handle_connection(mut socket: WebSocket, st: RelayState, role: Role, he
                                         try_send(&gw, Outbound::Msg(Message::Text(text)));
                                     }
                                     BrowserRoute::Buffered => {
-                                        tracing::debug!(target: TARGET, bytes = text.len(), "网关离线，帧入缓冲");
+                                        tracing::debug!(target: TARGET, bytes = text.len(), "网关全下线，帧入缓冲（单 FIFO）");
                                     }
                                     BrowserRoute::OfflineFull => {
                                         tracing::warn!(target: TARGET, bytes = text.len(), "网关离线缓冲已满，拒新帧（丢新保旧）");
                                         let _ = socket.send(error_frame("gateway_offline")).await;
+                                    }
+                                BrowserRoute::MachineOffline => {
+                                    tracing::debug!(target: TARGET, bytes = text.len(), "目标 machine 不在线，回 machine_offline");
+                                    let _ = socket.send(error_frame("machine_offline")).await;
+                                }
+                                BrowserRoute::Ignored => {
+                                    // bootstrap 时序豁免（见 AMBIGUOUS_SILENT_KINDS）：
+                                    // 静默丢弃不回错——回 ambiguous_machine 只会让 SPA
+                                    // 每次连接弹一次「多台机器在线」toast。
+                                    tracing::debug!(target: TARGET, bytes = text.len(), "sync/ping 未指定 machine 且多台网关在线，静默丢弃");
+                                }
+                                    BrowserRoute::Ambiguous => {
+                                        tracing::debug!(target: TARGET, bytes = text.len(), "未指定 machine 且多台网关在线，回 ambiguous_machine");
+                                        let _ = socket.send(error_frame("ambiguous_machine")).await;
                                     }
                                 },
                                 Role::Gateway => {
@@ -850,13 +1110,15 @@ async fn handle_connection(mut socket: WebSocket, st: RelayState, role: Role, he
         }
     }
 
-    // ---- 退出：清槽位（browser 只清自己；网关退出时广播 browser offline）----
-    let browsers = st.hub.release(role, conn_id);
+    // ---- 退出：清槽位（browser 只清自己；网关退出清 machine 槽位并广播）----
     if role == Role::Browser {
+        let browsers = st.hub.release_browser(conn_id);
         // 多端排查：断开后还剩几条 browser 在线。
         tracing::info!(target: TARGET, role = role.name(), browsers, "连接断开");
     } else {
-        tracing::info!(target: TARGET, role = role.name(), "连接断开");
+        let machine = auth_machine.unwrap_or_default();
+        let (browsers, gateways) = st.hub.release_gateway(&machine, conn_id);
+        tracing::info!(target: TARGET, role = role.name(), machine = %machine, gateways, browsers, "连接断开");
     }
 }
 
@@ -1020,12 +1282,58 @@ mod tests {
         assert!(!b.push("y"), "加入后超 1MB → 拒");
     }
 
-    /// hello 帧解析：合法 / 缺 token / 畸形 JSON / 非 hello 首帧 / 版本 / 空 token。
+    /// hello 帧解析：合法 / 缺 token / 畸形 JSON / 非 hello 首帧 / 版本 / 空
+    /// token；v1.1 machine：缺省 default / 显式 / trim / 空串与空白拒绝 /
+    /// 非法字符拒绝 / 超 32 char 拒绝。
     #[test]
     fn hello_frame_parsing() {
         assert_eq!(
             parse_hello(r#"{"v":1,"type":"hello","token":"abc"}"#),
-            Ok("abc".to_string())
+            Ok(("abc".to_string(), "default".to_string())),
+            "缺 machine → default"
+        );
+        assert_eq!(
+            parse_hello(r#"{"v":1,"type":"hello","token":"abc","machine":"home-mac"}"#),
+            Ok(("abc".to_string(), "home-mac".to_string())),
+            "显式 machine"
+        );
+        assert_eq!(
+            parse_hello(r#"{"v":1,"type":"hello","token":"abc","machine":" home-mac "}"#),
+            Ok(("abc".to_string(), "home-mac".to_string())),
+            "machine trim"
+        );
+        assert_eq!(
+            parse_hello(r#"{"v":1,"type":"hello","token":"abc","machine":"work_01"}"#),
+            Ok(("abc".to_string(), "work_01".to_string())),
+            "下划线与数字合法"
+        );
+        assert_eq!(
+            parse_hello(r#"{"v":1,"type":"hello","token":"abc","machine":""}"#),
+            Err(HelloParseError::Malformed),
+            "空串 machine 拒绝"
+        );
+        assert_eq!(
+            parse_hello(r#"{"v":1,"type":"hello","token":"abc","machine":"   "}"#),
+            Err(HelloParseError::Malformed),
+            "trim 后为空拒绝"
+        );
+        assert_eq!(
+            parse_hello(r#"{"v":1,"type":"hello","token":"abc","machine":"home mac"}"#),
+            Err(HelloParseError::Malformed),
+            "非法字符（空格）拒绝"
+        );
+        assert_eq!(
+            parse_hello(r#"{"v":1,"type":"hello","token":"abc","machine":"家-mac"}"#),
+            Err(HelloParseError::Malformed),
+            "非 ASCII 拒绝（machine 是路由主键，限 ASCII 可打印子集）"
+        );
+        assert_eq!(
+            parse_hello(&format!(
+                r#"{{"v":1,"type":"hello","token":"abc","machine":"{}"}}"#,
+                "m".repeat(MACHINE_ID_MAX_CHARS + 1)
+            )),
+            Err(HelloParseError::Malformed),
+            "超 32 char 拒绝"
         );
         assert_eq!(
             parse_hello(r#"{"v":1,"type":"hello"}"#),
@@ -1051,6 +1359,59 @@ mod tests {
             Err(HelloParseError::Malformed),
             "空 token"
         );
+    }
+
+    /// 业务帧 machine 路由键提取：缺失 / 空串 / 空白 / 非字符串 / 畸形 JSON /
+    /// 畸形但含 machine（JSON 解析失败时整体 None——relay 只在解析成功后取
+    /// 单字段）。
+    #[test]
+    fn frame_machine_extraction() {
+        assert_eq!(
+            frame_machine(r#"{"v":1,"type":"message","text":"hi"}"#),
+            None
+        );
+        assert_eq!(
+            frame_machine(r#"{"v":1,"type":"message","machine":"home","text":"hi"}"#),
+            Some("home".to_string())
+        );
+        assert_eq!(
+            frame_machine(r#"{"v":1,"type":"ping","machine":"  work  "}"#),
+            Some("work".to_string()),
+            "路由键同样 trim"
+        );
+        assert_eq!(frame_machine(r#"{"machine":""}"#), None, "空串按未指定");
+        assert_eq!(frame_machine(r#"{"machine":"   "}"#), None, "空白按未指定");
+        assert_eq!(frame_machine(r#"{"machine":42}"#), None, "非字符串按未指定");
+        assert_eq!(
+            frame_machine("not json"),
+            None,
+            "畸形 JSON 按未指定（帧本身照旧盲转）"
+        );
+    }
+
+    /// 帧 type 提取（歧义静默豁免判定用）：常规 / 缺失 / 非字符串 / 畸形。
+    #[test]
+    fn frame_kind_extraction() {
+        assert_eq!(
+            frame_kind(r#"{"v":1,"type":"sync"}"#),
+            Some("sync".to_string())
+        );
+        assert_eq!(
+            frame_kind(r#"{"v":1,"type":"ping","machine":"m"}"#),
+            Some("ping".to_string())
+        );
+        assert_eq!(frame_kind(r#"{"v":1,"text":"无类型"}"#), None, "缺 type");
+        assert_eq!(frame_kind(r#"{"type":42}"#), None, "非字符串");
+        assert_eq!(frame_kind("not json"), None, "畸形 JSON");
+        // 豁免判定：sync/ping 命中，message / 未知 / 畸形不豁免。
+        assert!(is_ambiguous_silent_kind(r#"{"v":1,"type":"sync"}"#));
+        assert!(is_ambiguous_silent_kind(r#"{"v":1,"type":"ping"}"#));
+        assert!(!is_ambiguous_silent_kind(r#"{"v":1,"type":"message"}"#));
+        assert!(!is_ambiguous_silent_kind(
+            r#"{"v":1,"type":"approval_response"}"#
+        ));
+        assert!(!is_ambiguous_silent_kind(r#"{"v":1,"type":"control"}"#));
+        assert!(!is_ambiguous_silent_kind("not json"));
     }
 
     /// fail-closed：token 缺失 / 相同 → 拒。
@@ -1086,84 +1447,212 @@ mod tests {
         }
     }
 
-    /// Hub 槽位语义：注册/路由/释放互不误伤（无网络，纯 channel）。
+    /// Hub 槽位语义（v1.1 多机版）：注册/路由/释放互不误伤（无网络，纯
+    /// channel）。覆盖：多机器并存、同 machine 踢旧、browser 帧 machine
+    /// 路由（指定命中 / 指定离线 / 缺省单台 / 缺省多台 ambiguous / 全下线
+    /// 入缓冲）、release 广播帧形态。
     #[test]
     fn hub_register_route_release() {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false); // sender 保留，避免触发「控制端丢弃=停机」
         let hub = Hub::new(shutdown_rx);
 
-        // 网关注册：空环境 → 无踢旧、无在线 browser、无重放。
+        // 网关注册（default 机器）：空环境 → 无踢旧、无在线 browser、无重放；
+        // machines 列表含 default、is_default=true。
         let (gw_tx, mut gw_rx) = mpsc::channel(8);
-        let reg = hub.register_gateway(1, gw_tx);
+        let reg = hub.register_gateway("default", 1, gw_tx).unwrap();
         assert!(reg.superseded.is_none() && reg.browsers.is_empty() && reg.replay.is_empty());
+        assert_eq!(reg.machines, vec!["default".to_string()]);
+        assert_eq!(reg.gateways, 1);
+        assert!(reg.is_default);
 
-        // browser 注册（多连接并存）：machine 快照 online（网关在线）。
+        // browser 注册（多连接并存）：default 机器在线快照 + 全量 machines 快照。
         let (br_tx, mut br_rx) = mpsc::channel(8);
         let regb = hub.register_browser(3, br_tx);
         assert!(regb.machine_online && !regb.full && regb.browsers == 1);
+        assert_eq!(regb.machines, vec!["default".to_string()]);
 
-        // 第二条 browser 并存注册：不踢第一条，广播目标含两条。
-        let (br2_tx, mut br2_rx) = mpsc::channel(8);
-        let regb2 = hub.register_browser(4, br2_tx);
-        assert!(regb2.machine_online && regb2.browsers == 2);
-        assert_eq!(hub.route_gateway_frame().len(), 2, "两条 browser 并存");
+        // 第二台机器注册（home）：并存不踢 default；browser 快照含两台。
+        let (home_tx, mut home_rx) = mpsc::channel(8);
+        let reg2 = hub.register_gateway("home", 2, home_tx).unwrap();
+        assert!(reg2.superseded.is_none(), "不同机器不互踢");
+        assert_eq!(
+            reg2.machines,
+            vec!["default".to_string(), "home".to_string()]
+        );
+        assert_eq!(reg2.gateways, 2);
+        assert!(!reg2.is_default);
 
-        // browser 帧 → 网关在线透传。
-        match hub.route_browser_frame("hello") {
+        // ---- machine 路由（v1.1 §3 四分支）----
+        // 显式指定且在线 → 路由到对应机器。
+        match hub.route_browser_frame(r#"{"v":1,"type":"message","machine":"home","text":"a"}"#) {
             BrowserRoute::Deliver(tx) => {
-                try_send(&tx, Outbound::Msg(Message::text("hello")));
+                try_send(&tx, Outbound::Msg(Message::text("a")));
+                assert_eq!(
+                    home_rx.try_recv().ok().and_then(|o| match o {
+                        Outbound::Msg(m) => Some(m.into_text().unwrap().as_str().to_string()),
+                        _ => None,
+                    }),
+                    Some("a".to_string()),
+                    "machine=home 应路由到 home 网关"
+                );
+                // default 机器不受影响。
+                assert!(gw_rx.try_recv().is_err(), "default 网关不应收到 home 帧");
+            }
+            other => panic!("machine=home 在线应 Deliver：{other:?}"),
+        }
+        match hub.route_browser_frame(r#"{"v":1,"type":"message","machine":"default"}"#) {
+            BrowserRoute::Deliver(tx) => {
+                try_send(&tx, Outbound::Msg(Message::text("b")));
                 match gw_rx.try_recv() {
-                    Ok(Outbound::Msg(m)) => assert_eq!(m.into_text().unwrap().as_str(), "hello"),
-                    other => panic!("应透传到网关 channel：{other:?}"),
+                    Ok(Outbound::Msg(m)) => assert_eq!(m.into_text().unwrap().as_str(), "b"),
+                    other => panic!("应透传到 default 网关 channel：{other:?}"),
                 }
             }
-            other => panic!("网关在线应 Deliver：{other:?}"),
+            other => panic!("machine=default 在线应 Deliver：{other:?}"),
         }
+        // 显式指定但不在线 → MachineOffline。
+        assert!(matches!(
+            hub.route_browser_frame(r#"{"v":1,"type":"message","machine":"ghost"}"#),
+            BrowserRoute::MachineOffline
+        ));
+        // 未指定 + 两台在线 → Ambiguous。
+        assert!(matches!(
+            hub.route_browser_frame(r#"{"v":1,"type":"message","text":"c"}"#),
+            BrowserRoute::Ambiguous
+        ));
+        // bootstrap 豁免（v1.1）：sync/ping 未指定 + 多台在线 → 静默忽略
+        //（不路由不回错）；畸形 JSON（type 不可知）不豁免，仍 Ambiguous。
+        assert!(matches!(
+            hub.route_browser_frame(r#"{"v":1,"type":"sync"}"#),
+            BrowserRoute::Ignored
+        ));
+        assert!(matches!(
+            hub.route_browser_frame(r#"{"v":1,"type":"ping"}"#),
+            BrowserRoute::Ignored
+        ));
+        assert!(matches!(
+            hub.route_browser_frame("not json"),
+            BrowserRoute::Ambiguous
+        ));
 
-        // 踢旧：第二条网关注册顶替第一条，旧投递口收到 4001（网关单实例语义）。
+        // 踢旧：同 machine（default）第二条注册顶替第一条，旧投递口由调用方
+        // close 4001（每台机器单连接语义）。
         let (gw2_tx, _gw2_rx) = mpsc::channel(8);
-        let reg2 = hub.register_gateway(2, gw2_tx);
-        let old = reg2.superseded.expect("应有旧连接被顶替");
+        let reg3 = hub.register_gateway("default", 5, gw2_tx).unwrap();
+        let old = reg3.superseded.expect("同 machine 应踢旧");
         try_send(&old, Outbound::Close(CLOSE_SUPERSEDED, "superseded"));
         assert!(matches!(
             gw_rx.try_recv(),
             Ok(Outbound::Close(CLOSE_SUPERSEDED, "superseded"))
         ));
+        assert_eq!(reg3.gateways, 2, "踢旧是顶替不是新增槽位");
 
-        // 旧连接（conn_id=1）退出不得误清新槽位：网关仍在线。
-        hub.release(Role::Gateway, 1);
-        assert!(
-            !hub.route_gateway_frame().is_empty(),
-            "旧连接退出不清新连接的槽位"
-        );
+        // 旧连接（conn_id=1）退出不得误清新槽位：default 机器仍在线。
+        hub.release_gateway("default", 1);
+        assert!(matches!(
+            hub.route_browser_frame(r#"{"v":1,"type":"message","machine":"default","text":"d"}"#),
+            BrowserRoute::Deliver(_)
+        ));
 
-        // 现网关（conn_id=2）退出 → 全部在线 browser 收 machine offline（广播）。
-        hub.release(Role::Gateway, 2);
-        for (name, rx) in [("br", &mut br_rx), ("br2", &mut br2_rx)] {
-            match rx.try_recv() {
-                Ok(Outbound::Msg(m)) => {
-                    let s = m.into_text().unwrap();
-                    assert!(
-                        s.contains(r#""type":"machine""#) && s.contains("false"),
-                        "{name} msg={s}"
-                    );
-                }
-                other => panic!("{name} 应通知离线：{other:?}"),
+        // 现 default 网关（conn_id=5）退出 → 广播：旧 machine(false)（default
+        // 机器，v1 兼容）+ machines 全量列表（剩 home）；两帧顺序 machine 在前。
+        hub.release_gateway("default", 5);
+        match br_rx.try_recv() {
+            Ok(Outbound::Msg(m)) => {
+                let s = m.into_text().unwrap();
+                assert!(
+                    s.contains(r#""type":"machine""#) && s.contains("false"),
+                    "旧 machine 帧（default 下线）：{s}"
+                );
             }
+            other => panic!("应先广播旧 machine 帧：{other:?}"),
+        }
+        match br_rx.try_recv() {
+            Ok(Outbound::Msg(m)) => {
+                let s = m.into_text().unwrap();
+                assert!(
+                    s.contains(r#""type":"machines""#)
+                        && s.contains("home")
+                        && !s.contains("default"),
+                    "machines 列表应只剩 home：{s}"
+                );
+            }
+            other => panic!("应后广播 machines 帧：{other:?}"),
         }
 
-        // 网关离线：browser 帧入缓冲（重放序 = 入队序）。
-        for f in ["1", "2", "3"] {
+        // 未指定 + 仅剩一台（home）→ 路由它（单机部署 SPA 零升级无感）。
+        assert!(matches!(
+            hub.route_browser_frame(r#"{"v":1,"type":"message","text":"e"}"#),
+            BrowserRoute::Deliver(_)
+        ));
+
+        // home 网关退出：非 default 机器 → 只广播 machines，无旧 machine 帧。
+        hub.release_gateway("home", 2);
+        match br_rx.try_recv() {
+            Ok(Outbound::Msg(m)) => {
+                let s = m.into_text().unwrap();
+                assert!(s.contains(r#""type":"machines""#), "machines 广播：{s}");
+            }
+            other => panic!("应广播 machines 帧：{other:?}"),
+        }
+        assert!(
+            br_rx.try_recv().is_err(),
+            "非 default 机器不发旧 machine 帧"
+        );
+
+        // 全下线：未指定帧入缓冲（单 FIFO，重放序 = 入队序）；sync/ping 的
+        // 静默豁免只作用于歧义分支（多台在线），零台在线沿用缓冲语义。
+        let frames = ["1", "2", "3", r#"{"v":1,"type":"sync"}"#];
+        for f in frames {
             assert!(matches!(hub.route_browser_frame(f), BrowserRoute::Buffered));
         }
         let (gw3_tx, _gw3_rx) = mpsc::channel(8);
-        let reg3 = hub.register_gateway(9, gw3_tx);
-        assert_eq!(reg3.replay, vec!["1", "2", "3"], "重放保 FIFO 序");
-        assert_eq!(reg3.browsers.len(), 2, "上线广播目标含全部在线 browser");
+        let reg4 = hub.register_gateway("home", 9, gw3_tx).unwrap();
+        assert_eq!(reg4.replay, frames, "重放保 FIFO 序");
+        assert_eq!(reg4.browsers.len(), 1, "上线广播目标含全部在线 browser");
 
-        // browser 退出只清自己：br（conn_id=3）退出后 br2 仍在。
-        assert_eq!(hub.release(Role::Browser, 3), 1, "剩 1 条在线");
-        assert_eq!(hub.route_gateway_frame().len(), 1, "br2 不受影响");
+        // browser 退出只清自己：br（conn_id=3）退出后广播目标清零。
+        assert_eq!(hub.release_browser(3), 0);
+        assert!(hub.route_gateway_frame().is_empty());
+    }
+
+    /// 网关机器数上限：第 [`MAX_GATEWAYS`] 台（不同 machine）注册成功，第
+    /// MAX_GATEWAYS+1 台 None（调用方 close 4001）；**同 machine 重连不受
+    /// 上限约束**（踢旧顶替，槽位复用）；释放一台后新 machine 可再入。
+    #[test]
+    fn hub_gateway_machine_cap() {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let hub = Hub::new(shutdown_rx);
+
+        for i in 1..=MAX_GATEWAYS {
+            let (tx, _rx) = mpsc::channel(8);
+            let reg = hub
+                .register_gateway(&format!("m{i}"), i as u64, tx)
+                .unwrap_or_else(|| panic!("第 {i} 台应注册成功"));
+            assert_eq!(reg.gateways, i);
+        }
+        // 满员 + 新 machine → None。
+        let (tx, _rx) = mpsc::channel(8);
+        assert!(
+            hub.register_gateway("m-extra", 99, tx).is_none(),
+            "满员新机器应被拒"
+        );
+        // 满员 + 同 machine 重连 → 踢旧顶替（不受上限约束）。
+        let (tx2, _rx2) = mpsc::channel(8);
+        let reg = hub.register_gateway("m2", 100, tx2).unwrap();
+        assert!(reg.superseded.is_some(), "同 machine 重连踢旧");
+        assert_eq!(reg.gateways, MAX_GATEWAYS);
+        // 旧连接（conn_id=2）退出不误清新连接。
+        hub.release_gateway("m2", 2);
+        let (tx3, _rx3) = mpsc::channel(8);
+        assert!(
+            hub.register_gateway("m2", 101, tx3).is_some(),
+            "新连接仍在槽位，同 machine 再连仍走踢旧"
+        );
+        // 释放一台 → 新 machine 槽位立即可复用。
+        hub.release_gateway("m1", 1);
+        let (tx4, _rx4) = mpsc::channel(8);
+        assert!(hub.register_gateway("m-extra", 102, tx4).is_some());
     }
 
     /// browser 并存上限：第 [`MAX_BROWSERS`] 条注册成功，第 MAX_BROWSERS+1
@@ -1187,10 +1676,10 @@ mod tests {
         assert_eq!(reg.browsers, MAX_BROWSERS, "满员时在线数不变");
 
         // 未注册的 conn_id 退出是 no-op（不误伤在线连接）。
-        assert_eq!(hub.release(Role::Browser, 999), MAX_BROWSERS);
+        assert_eq!(hub.release_browser(999), MAX_BROWSERS);
 
         // 释放一条 → 槽位立即可复用。
-        assert_eq!(hub.release(Role::Browser, 1), MAX_BROWSERS - 1);
+        assert_eq!(hub.release_browser(1), MAX_BROWSERS - 1);
         let (tx, _rx) = mpsc::channel(8);
         let reg = hub.register_browser(1000, tx);
         assert!(!reg.full && reg.browsers == MAX_BROWSERS);

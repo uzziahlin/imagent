@@ -1,14 +1,21 @@
-// 帧协议 v1（事实源：crates/web/src/lib.rs + crates/relay/src/lib.rs）。
+// 帧协议 v1.1（事实源：crates/web/src/lib.rs + crates/relay/src/lib.rs）。
 // 信封 `{"v":1,"type":...}`，全部 JSON 文本帧。TS 类型与 Rust 侧逐字段对齐：
 // - convId 恒为完整 conv 形态（`web:<session>`）；裸 session 名仅网关侧兼容输入，
 //   SPA 回执帧（message / approval_response）一律原样回传收到的 convId。
 // - CardPayload 可选字段对齐 Rust `skip_serializing_if = "Option::is_none"`
 //   （缺席即未序列化）。
+// - v1.1 多终端：浏览器→网关帧可选带 `machine`（目标机器）；网关→浏览器帧
+//   可选带 `machine`（来源机器，旧网关缺席 → SPA 归 DEFAULT_MACHINE 单机兼容）；
+//   relay→浏览器新增 `machines` 帧（全量在线机器快照）。
 
 export const PROTOCOL_VERSION = 1;
 
 /** 默认会话（网关 normalize_conv(None, "default") 的落点），恒存在。 */
 export const DEFAULT_CONV = "web:default";
+
+/** 缺省机器 id：帧不带 machine 字段（旧网关）时的归属；也是未收到 machines
+ *  帧（旧 relay）单机模式下 currentMachine 的初值。 */
+export const DEFAULT_MACHINE = "default";
 
 /** conv 显示名：剥 `web:` 前缀（仅展示用，协议回传仍用完整 conv）。 */
 export function convDisplayName(convId: string): string {
@@ -68,6 +75,9 @@ export type MessageFrame = {
   /** 完整 conv（如 web:default）；缺省落网关默认会话。 */
   convId?: string;
   text: string;
+  /** 目标机器（v1.1）：多机在线时未指定会被 relay 回 ambiguous_machine，
+   *  故多机模式下 SPA 必须恒带当前选中机器；单机模式（旧 relay）不带。 */
+  machine?: string;
 };
 
 export type ApprovalDecision = "allow" | "deny" | "always";
@@ -79,6 +89,9 @@ export type ApprovalResponseFrame = {
   convId: string;
   requestId: string;
   decision: ApprovalDecision;
+  /** 目标机器（v1.1）：审批来自哪台机器就回哪台（非当前选中机器的审批
+   *  也要能批）。 */
+  machine?: string;
 };
 
 export type ControlFrame = {
@@ -86,10 +99,11 @@ export type ControlFrame = {
   type: "control";
   cmd: "stop" | "resume" | "switch";
   args?: string;
+  machine?: string;
 };
 
-export type SyncFrame = { v: typeof PROTOCOL_VERSION; type: "sync" };
-export type PingFrame = { v: typeof PROTOCOL_VERSION; type: "ping" };
+export type SyncFrame = { v: typeof PROTOCOL_VERSION; type: "sync"; machine?: string };
+export type PingFrame = { v: typeof PROTOCOL_VERSION; type: "ping"; machine?: string };
 
 export type OutboundFrame =
   | HelloFrame
@@ -112,6 +126,13 @@ export type HelloAckFrame = { v: typeof PROTOCOL_VERSION; type: "hello_ack"; rol
 
 export type MachineFrame = { v: typeof PROTOCOL_VERSION; type: "machine"; online: boolean };
 
+/** v1.1：relay→浏览器全量在线机器快照（连接后推一次，此后任一网关上下线再推）。 */
+export type MachinesFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "machines";
+  online: string[];
+};
+
 export type ErrorFrame = { v: typeof PROTOCOL_VERSION; type: "error"; code: string };
 
 export type TextFrame = {
@@ -121,6 +142,8 @@ export type TextFrame = {
   text: string;
   /** 协议预留位（web 侧恒不发，类型保留）。 */
   hint?: string;
+  /** 来源机器（v1.1）；旧网关缺席 → 归 DEFAULT_MACHINE。 */
+  machine?: string;
 };
 
 /** card（新建/sync 重发）与 card_patch（更新）同形，仅 type 不同。 */
@@ -132,6 +155,7 @@ export type CardFrame = {
   messageId: string;
   card: CardPayload;
   state: CardFrameState;
+  machine?: string;
 };
 
 export type ApprovalRequestFrame = {
@@ -141,6 +165,7 @@ export type ApprovalRequestFrame = {
   requestId: string;
   tool: string;
   inputSummary: string;
+  machine?: string;
 };
 
 export type ResolvedDecision = ApprovalDecision | "cancelled";
@@ -152,6 +177,7 @@ export type ApprovalResolvedFrame = {
   requestId: string;
   decision: ResolvedDecision;
   message?: string;
+  machine?: string;
 };
 
 export type PongFrame = { v: typeof PROTOCOL_VERSION; type: "pong" };
@@ -159,6 +185,7 @@ export type PongFrame = { v: typeof PROTOCOL_VERSION; type: "pong" };
 export type InboundFrame =
   | HelloAckFrame
   | MachineFrame
+  | MachinesFrame
   | ErrorFrame
   | TextFrame
   | CardFrame
@@ -174,6 +201,10 @@ type FieldCheck = (o: Record<string, unknown>) => boolean;
 
 const isStr = (o: Record<string, unknown>, k: string) => typeof o[k] === "string";
 
+/** v1.1 可选 machine 字段：缺席或字符串才合法。 */
+const machineOk = (o: Record<string, unknown>): boolean =>
+  o.machine === undefined || typeof o.machine === "string";
+
 const cardShapeOk = (o: Record<string, unknown>): boolean =>
   isStr(o, "convId") &&
   isStr(o, "messageId") &&
@@ -187,17 +218,20 @@ const RESOLVED_DECISIONS: readonly string[] = ["allow", "deny", "always", "cance
 const INBOUND_CHECKS: Record<string, FieldCheck> = {
   hello_ack: (o) => isStr(o, "role"),
   machine: (o) => typeof o.online === "boolean",
+  machines: (o) =>
+    Array.isArray(o.online) && o.online.every((m) => typeof m === "string"),
   error: (o) => isStr(o, "code"),
-  text: (o) => isStr(o, "convId") && isStr(o, "text"),
-  card: cardShapeOk,
-  card_patch: cardShapeOk,
+  text: (o) => isStr(o, "convId") && isStr(o, "text") && machineOk(o),
+  card: (o) => cardShapeOk(o) && machineOk(o),
+  card_patch: (o) => cardShapeOk(o) && machineOk(o),
   approval_request: (o) =>
-    isStr(o, "convId") && isStr(o, "requestId") && isStr(o, "tool") && isStr(o, "inputSummary"),
+    isStr(o, "convId") && isStr(o, "requestId") && isStr(o, "tool") && isStr(o, "inputSummary") && machineOk(o),
   approval_resolved: (o) =>
     isStr(o, "convId") &&
     isStr(o, "requestId") &&
     typeof o.decision === "string" &&
-    RESOLVED_DECISIONS.includes(o.decision),
+    RESOLVED_DECISIONS.includes(o.decision) &&
+    machineOk(o),
   pong: () => true,
 };
 
@@ -236,8 +270,10 @@ export type StreamEntry =
 
 export type CardEntry = Extract<StreamEntry, { kind: "card" }>;
 
-/** pending 审批（弹层渲染；requestId 为幂等 key）。 */
+/** pending 审批（弹层渲染；requestId 为幂等 key）。machine = 审批来源机器，
+ *  回传 approval_response 时必须带同一 machine（relay 按机器路由）。 */
 export type PendingApproval = {
+  machine: string;
   convId: string;
   requestId: string;
   tool: string;
@@ -253,35 +289,79 @@ export type ConvState = {
   lastAt: number;
 };
 
+/** 单台机器的会话空间：会话表 + conv 插入序（web:default 恒为首项）。 */
+export type MachineSpace = {
+  convs: Record<string, ConvState>;
+  convOrder: string[];
+};
+
 /** 消息条目内存护栏：单 conv 超过上限时丢弃最早的本地用户回显（ephemeral）；
  *  服务端条目（text/card）不丢——卡片终态可由 sync 重发兜底。 */
 export const MAX_STREAM_ENTRIES = 200;
 
+/** 一次性通知（机器自动切换等）：reducer 产出结构化事件，App 映射文案渲染
+ *  toast 后发 clear_notice 清除。 */
+export type MachineNotice =
+  /** 当前机器不在 machines 列表 → 自动切到 to。 */
+  | { kind: "switched"; from: string; to: string; at: number }
+  /** 当前机器掉线且无任何在线机器可切。 */
+  | { kind: "offline"; machine: string; at: number };
+
 export type AppState = {
   /** key 生成序号（纯函数内单调递增）。 */
   seq: number;
-  convs: Record<string, ConvState>;
-  /** conv 集合（插入序，web:default 恒为首项）。 */
-  convOrder: string[];
+  /** 每台机器一个会话空间（key = machine id；恒含 DEFAULT_MACHINE）。 */
+  spaces: Record<string, MachineSpace>;
+  /** 在线机器全量列表（machines 帧覆盖式维护）。 */
+  machines: string[];
+  /** 收到过 machines 帧 = 新 relay 多机模式；false = 旧 relay 单机兼容
+   *  （出站帧不带 machine，不显示机器切换器）。 */
+  machinesKnown: boolean;
+  /** 当前选中机器（侧栏机器切换器 / machines 帧自动掉线切换维护）。 */
+  currentMachine: string;
+  /** 旧网关 machine 帧（单机在线态）；多机模式以 machines 列表为准。 */
   machineOnline: boolean;
   lastError: { code: string; at: number } | null;
+  lastNotice: MachineNotice | null;
 };
+
+/** 只读兜底空空间（未收到任何帧的机器），绝不写回 state。 */
+const EMPTY_SPACE: MachineSpace = { convs: {}, convOrder: [] };
+
+/** 只读访问某机器会话空间（不存在时返回空空间引用，不落 state）。 */
+export function spaceOf(state: AppState, machine: string): MachineSpace {
+  return state.spaces[machine] ?? EMPTY_SPACE;
+}
+
+/** 新机器空间：预置默认会话（与单机模式 initialState 行为一致）。 */
+function newSpace(): MachineSpace {
+  return {
+    convs: { [DEFAULT_CONV]: { entries: [], pending: [], lastPreview: "", lastAt: 0 } },
+    convOrder: [DEFAULT_CONV],
+  };
+}
 
 export function initialState(): AppState {
   return {
     seq: 0,
-    convs: { [DEFAULT_CONV]: { entries: [], pending: [], lastPreview: "", lastAt: 0 } },
-    convOrder: [DEFAULT_CONV],
+    spaces: { [DEFAULT_MACHINE]: newSpace() },
+    machines: [],
+    machinesKnown: false,
+    currentMachine: DEFAULT_MACHINE,
     machineOnline: false,
     lastError: null,
+    lastNotice: null,
   };
 }
 
 export type Action =
   | { type: "frame"; frame: InboundFrame }
-  | { type: "send_echo"; convId: string; text: string }
-  | { type: "approval_sent"; convId: string; requestId: string }
-  | { type: "clear_error" };
+  | { type: "send_echo"; convId: string; text: string; machine?: string }
+  | { type: "approval_sent"; convId: string; requestId: string; machine?: string }
+  /** 用户在机器切换器点选机器（App 同时把当前 conv 切回该机器默认会话）。 */
+  | { type: "select_machine"; machine: string }
+  | { type: "clear_error" }
+  | { type: "clear_notice" };
 
 function resolvedLabel(decision: ResolvedDecision): string {
   switch (decision) {
@@ -296,18 +376,27 @@ function resolvedLabel(decision: ResolvedDecision): string {
   }
 }
 
-/** 确保 conv 存在（不可变），返回新 convs/convOrder。 */
+/** 确保 machine 空间 + conv 存在（不可变），返回新 spaces；均已存在则原样返回。 */
 function ensureConv(
   state: AppState,
+  machine: string,
   convId: string,
-): { convs: Record<string, ConvState>; convOrder: string[] } {
-  if (state.convs[convId]) {
-    return { convs: state.convs, convOrder: state.convOrder };
+): Record<string, MachineSpace> {
+  const hadSpace = state.spaces[machine] !== undefined;
+  const space = hadSpace ? state.spaces[machine] : newSpace();
+  if (hadSpace && space.convs[convId]) {
+    return state.spaces;
   }
-  return {
-    convs: { ...state.convs, [convId]: { entries: [], pending: [], lastPreview: "", lastAt: 0 } },
-    convOrder: [...state.convOrder, convId],
-  };
+  const nextSpace: MachineSpace = space.convs[convId]
+    ? space
+    : {
+        convs: {
+          ...space.convs,
+          [convId]: { entries: [], pending: [], lastPreview: "", lastAt: 0 },
+        },
+        convOrder: [...space.convOrder, convId],
+      };
+  return { ...state.spaces, [machine]: nextSpace };
 }
 
 /** 条目 → 侧边栏单行预览（首行、去首尾空白）。 */
@@ -342,36 +431,48 @@ function trimEntries(entries: StreamEntry[]): StreamEntry[] {
   return trimmed;
 }
 
-function appendEntry(state: AppState, convId: string, entry: StreamEntry): AppState {
-  const { convs, convOrder } = ensureConv(state, convId);
-  const conv = convs[convId];
+function appendEntry(
+  state: AppState,
+  machine: string,
+  convId: string,
+  entry: StreamEntry,
+): AppState {
+  const spaces = ensureConv(state, machine, convId);
+  const space = spaces[machine];
+  const conv = space.convs[convId];
   return {
     ...state,
     seq: state.seq + 1,
-    convs: {
-      ...convs,
-      [convId]: {
-        ...conv,
-        entries: trimEntries([...conv.entries, entry]),
-        lastPreview: previewOf(entry),
-        lastAt: Date.now(),
+    spaces: {
+      ...spaces,
+      [machine]: {
+        ...space,
+        convs: {
+          ...space.convs,
+          [convId]: {
+            ...conv,
+            entries: trimEntries([...conv.entries, entry]),
+            lastPreview: previewOf(entry),
+            lastAt: Date.now(),
+          },
+        },
       },
     },
-    convOrder,
   };
 }
 
-/** card / card_patch：同 conv 内同 messageId 整卡替换（保留原位），否则追加。
+/** card / card_patch：同机器同 conv 内同 messageId 整卡替换（保留原位），否则追加。
  *  概要（lastPreview/lastAt）仅在卡片是会话最新条目时更新——补丁旧卡片不动概要。 */
-function upsertCard(state: AppState, frame: CardFrame): AppState {
-  const { convs, convOrder } = ensureConv(state, frame.convId);
-  const conv = convs[frame.convId];
+function upsertCard(state: AppState, machine: string, frame: CardFrame): AppState {
+  const spaces = ensureConv(state, machine, frame.convId);
+  const space = spaces[machine];
+  const conv = space.convs[frame.convId];
   const idx = conv.entries.findIndex(
     (e) => e.kind === "card" && e.messageId === frame.messageId,
   );
   const entry: CardEntry = {
     kind: "card",
-    key: `card:${frame.convId}:${frame.messageId}`,
+    key: `card:${machine}:${frame.convId}:${frame.messageId}`,
     messageId: frame.messageId,
     card: frame.card,
     state: frame.state,
@@ -391,41 +492,54 @@ function upsertCard(state: AppState, frame: CardFrame): AppState {
   return {
     ...state,
     seq: idx >= 0 ? state.seq : state.seq + 1,
-    convs: { ...convs, [frame.convId]: nextConv },
-    convOrder,
+    spaces: {
+      ...spaces,
+      [machine]: { ...space, convs: { ...space.convs, [frame.convId]: nextConv } },
+    },
   };
 }
 
-function addApproval(state: AppState, frame: ApprovalRequestFrame): AppState {
-  const { convs, convOrder } = ensureConv(state, frame.convId);
-  const conv = convs[frame.convId];
+function addApproval(state: AppState, machine: string, frame: ApprovalRequestFrame): AppState {
+  const spaces = ensureConv(state, machine, frame.convId);
+  const space = spaces[machine];
+  const conv = space.convs[frame.convId];
   if (conv.pending.some((p) => p.requestId === frame.requestId)) {
     return state; // 同 requestId 幂等
   }
   return {
     ...state,
-    convs: {
-      ...convs,
-      [frame.convId]: {
-        ...conv,
-        pending: [
-          ...conv.pending,
-          {
-            convId: frame.convId,
-            requestId: frame.requestId,
-            tool: frame.tool,
-            inputSummary: frame.inputSummary,
+    spaces: {
+      ...spaces,
+      [machine]: {
+        ...space,
+        convs: {
+          ...space.convs,
+          [frame.convId]: {
+            ...conv,
+            pending: [
+              ...conv.pending,
+              {
+                machine,
+                convId: frame.convId,
+                requestId: frame.requestId,
+                tool: frame.tool,
+                inputSummary: frame.inputSummary,
+              },
+            ],
           },
-        ],
+        },
       },
     },
-    convOrder,
   };
 }
 
 /** 移出 pending 并在流里留终态记录；无对应 pending 则忽略（防 sync 噪声）。 */
-function resolveApproval(state: AppState, frame: ApprovalResolvedFrame): AppState {
-  const conv = state.convs[frame.convId];
+function resolveApproval(
+  state: AppState,
+  machine: string,
+  frame: ApprovalResolvedFrame,
+): AppState {
+  const conv = spaceOf(state, machine).convs[frame.convId];
   if (!conv) {
     return state;
   }
@@ -433,16 +547,53 @@ function resolveApproval(state: AppState, frame: ApprovalResolvedFrame): AppStat
   if (pending.length === conv.pending.length) {
     return state;
   }
-  return appendEntry(
-    { ...state, convs: { ...state.convs, [frame.convId]: { ...conv, pending } } },
-    frame.convId,
-    {
-      kind: "approval_note",
-      key: `note:${state.seq + 1}`,
-      text: resolvedLabel(frame.decision),
-      message: frame.message,
+  const stripped: AppState = {
+    ...state,
+    spaces: {
+      ...state.spaces,
+      [machine]: {
+        ...state.spaces[machine],
+        convs: { ...state.spaces[machine].convs, [frame.convId]: { ...conv, pending } },
+      },
     },
-  );
+  };
+  return appendEntry(stripped, machine, frame.convId, {
+    kind: "approval_note",
+    key: `note:${state.seq + 1}`,
+    text: resolvedLabel(frame.decision),
+    message: frame.message,
+  });
+}
+
+/** machines 帧：全量覆盖在线列表；当前机器不在列表时自动切第一台在线并出
+ *  notice（多台网关掉线重排时保证 SPA 仍指向一台在线机器，出站帧不致
+ *  machine_offline）。全部离线无可切时保持当前机器并出 offline notice。 */
+function reduceMachines(state: AppState, frame: MachinesFrame): AppState {
+  const online = frame.online;
+  let { currentMachine } = state;
+  let lastNotice = state.lastNotice;
+  if (!online.includes(currentMachine)) {
+    if (online.length > 0) {
+      lastNotice = { kind: "switched", from: currentMachine, to: online[0], at: Date.now() };
+      currentMachine = online[0];
+    } else if (state.machinesKnown) {
+      lastNotice = { kind: "offline", machine: currentMachine, at: Date.now() };
+    }
+  }
+  return {
+    ...state,
+    machines: online,
+    machinesKnown: true,
+    currentMachine,
+    lastNotice,
+  };
+}
+
+/** 入站帧归属机器：带 machine 字段归该机器，缺省归 DEFAULT_MACHINE（旧网关兼容）。 */
+type MachineBearingFrame = TextFrame | CardFrame | ApprovalRequestFrame | ApprovalResolvedFrame;
+
+function frameMachine(frame: MachineBearingFrame): string {
+  return frame.machine ?? DEFAULT_MACHINE;
 }
 
 function reduceFrame(state: AppState, frame: InboundFrame): AppState {
@@ -450,12 +601,14 @@ function reduceFrame(state: AppState, frame: InboundFrame): AppState {
     case "hello_ack":
     case "pong":
       return state; // 连接管理层（ws.ts）消费，不进消息流
+    case "machines":
+      return reduceMachines(state, frame);
     case "machine":
       return { ...state, machineOnline: frame.online };
     case "error":
       return { ...state, lastError: { code: frame.code, at: Date.now() } };
     case "text":
-      return appendEntry(state, frame.convId, {
+      return appendEntry(state, frameMachine(frame), frame.convId, {
         kind: "text",
         key: `text:${state.seq + 1}`,
         text: frame.text,
@@ -463,11 +616,11 @@ function reduceFrame(state: AppState, frame: InboundFrame): AppState {
       });
     case "card":
     case "card_patch":
-      return upsertCard(state, frame);
+      return upsertCard(state, frameMachine(frame), frame);
     case "approval_request":
-      return addApproval(state, frame);
+      return addApproval(state, frameMachine(frame), frame);
     case "approval_resolved":
-      return resolveApproval(state, frame);
+      return resolveApproval(state, frameMachine(frame), frame);
   }
 }
 
@@ -476,13 +629,16 @@ export function reducer(state: AppState, action: Action): AppState {
     case "frame":
       return reduceFrame(state, action.frame);
     case "send_echo":
-      return appendEntry(state, action.convId, {
+      // machine 缺省落 default 空间（既有单机测试路径兼容）
+      return appendEntry(state, action.machine ?? DEFAULT_MACHINE, action.convId, {
         kind: "user",
         key: `user:${state.seq + 1}`,
         text: action.text,
       });
     case "approval_sent": {
-      const conv = state.convs[action.convId];
+      const machine = action.machine ?? DEFAULT_MACHINE;
+      const space = state.spaces[machine];
+      const conv = space?.convs[action.convId];
       if (!conv) {
         return state;
       }
@@ -492,10 +648,22 @@ export function reducer(state: AppState, action: Action): AppState {
       }
       return {
         ...state,
-        convs: { ...state.convs, [action.convId]: { ...conv, pending } },
+        spaces: {
+          ...state.spaces,
+          [machine]: {
+            ...space,
+            convs: { ...space.convs, [action.convId]: { ...conv, pending } },
+          },
+        },
       };
     }
+    case "select_machine":
+      return state.currentMachine === action.machine
+        ? state
+        : { ...state, currentMachine: action.machine };
     case "clear_error":
       return state.lastError ? { ...state, lastError: null } : state;
+    case "clear_notice":
+      return state.lastNotice ? { ...state, lastNotice: null } : state;
   }
 }

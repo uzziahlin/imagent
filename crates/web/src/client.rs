@@ -1,9 +1,12 @@
 //! 网关侧 WS 客户端任务：出站连 relay `/gateway`，帧收发 + 重连/心跳/停机。
 //!
-//! 职责链（参照 wecom client.rs 的成熟模式）：`connect_async` 建连（`Authorization:
-//! Bearer <token>` 头直通认证——Rust 客户端无需 hello 帧）→ 等 relay 推来的
-//! `hello_ack` 确认 → 收发帧循环；任意环节断开/出错即返回 `Err`，外层
-//! [`WebClient::run`] 按指数退避重连（1s → 2s → … 封顶 30s，成功建连重置）。
+//! 职责链（参照 wecom client.rs 的成熟模式）：`connect_async` 建连 → 发
+//! hello 首帧认证（v1.1 起 token + **machine 身份**自报——relay 按 machine
+//! 分槽位管理多终端；Bearer 头直通形态仍被 relay 接受但固定为 default
+//! 机器，新网关版本统一走 hello）→ 等 relay 回的 `hello_ack`（回显 machine，
+//! 校验与自报一致——不一致按认证失败重连）→ 收发帧循环；任意环节断开/
+//! 出错即返回 `Err`，外层 [`WebClient::run`] 按指数退避重连（1s → 2s → …
+//! 封顶 30s，成功建连重置）。
 //!
 //! 与 [`crate::platform::WebPlatform`] 通过三条 channel 解耦：
 //! - `inbound_tx`：浏览器业务帧映射成的 [`InboundMessage`] → platform.recv；
@@ -12,8 +15,8 @@
 //!
 //! 协议细节（§4）：relay 对浏览器侧有 90s idle 超时，网关 30s 发协议层
 //! `Message::Ping` 保活；浏览器应用层 `ping` JSON 帧由本层直接回 `pong`
-//! （不进 recv）；`machine` / `error` / `hello_ack` 是 relay 自产帧，本层分拣
-//! 自理（在线标志 / warn / debug），不进业务通道。
+//! （不进 recv）；`machine` / `machines` / `error` / `hello_ack` 是 relay
+//! 自产帧，本层分拣自理（在线标志 / warn / debug），不进业务通道。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -37,7 +40,7 @@ use crate::{map_inbound_frame, InboundAction, TARGET};
 /// 建连后的 WS 流类型（connect_async 的产物）。
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-/// hello_ack 等待上限：Bearer 认证通过后 relay 立即推 ack，超时按认证失败
+/// hello_ack 等待上限：hello 发出后 relay 立即回 ack，超时按认证失败
 /// 重连（不空转发——对齐 wecom R-5「认证失败必须重连」纪律）。
 const HELLO_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 /// 心跳间隔：relay idle 超时 90s，30s 协议层 Ping 保活。
@@ -51,14 +54,42 @@ pub(crate) struct WebClient {
     /// 前缀）或 `ws://127.0.0.1:<port>/gateway`（本地/测试）。
     pub(crate) relay_url: String,
     pub(crate) gateway_token: String,
+    /// 本机 machine 身份（v1.1 多终端管理）：hello 自报 + 出站帧携带。
+    pub(crate) machine_id: String,
     /// 无 convId 的浏览器消息落到的默认会话名（映射 message 帧用）。
     pub(crate) default_session: String,
     /// 在线标志（client 维护：连接成功 true，断开 false）——doctor_probes
-    /// 与日志用。relay 的 machine 帧只推浏览器，网关侧标志由连接生命周期
-    /// 自维护；分拣到 machine 时也顺带同步（防御性，正常收不到）。
+    /// 与日志用。relay 的 machine/machines 帧只推浏览器，网关侧标志由连接
+    /// 生命周期自维护；分拣到 machine 时也顺带同步（防御性，正常收不到）。
     pub(crate) online: Arc<AtomicBool>,
     pub(crate) inbound_tx: mpsc::Sender<InboundMessage>,
     pub(crate) sync_tx: mpsc::Sender<()>,
+}
+
+/// hello 首帧构造（v1.1：token + machine 自报；纯函数便于单测）。
+fn hello_frame(token: &str, machine: &str) -> String {
+    serde_json::json!({"v": 1, "type": "hello", "token": token, "machine": machine}).to_string()
+}
+
+/// hello_ack 解析（v1.1）：返回回帧的 machine 字段（relay 回显自报身份）。
+/// 非 hello_ack / 缺 machine（relay < v1.1）/ 畸形 → Err（调用方按认证失败
+/// 重连，不空转发）。
+fn parse_hello_ack(text: &str) -> Result<String> {
+    let v: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| CoreError::Platform(TARGET, format!("hello_ack 解析失败：{e}")))?;
+    let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    if kind != "hello_ack" {
+        return Err(CoreError::Platform(
+            TARGET,
+            format!("认证确认帧异常（type={kind}），按失败重连"),
+        ));
+    }
+    v.get("machine")
+        .and_then(|m| m.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            CoreError::Platform(TARGET, "hello_ack 缺 machine 字段（relay < v1.1？）".into())
+        })
 }
 
 impl WebClient {
@@ -124,31 +155,45 @@ impl WebClient {
         }
     }
 
-    /// 一次完整的「建连 → 认证（Bearer + hello_ack）→ 收发」循环。返回 Err
+    /// 一次完整的「建连 → 认证（hello + hello_ack）→ 收发」循环。返回 Err
     /// 触发外层重连。
     async fn connect_and_serve(&self, outbound_rx: &mut mpsc::Receiver<String>) -> Result<()> {
-        let req = build_request(&self.relay_url, &self.gateway_token)?;
-        info!(target: TARGET, url = %self.relay_url, "连接 relay 中");
+        let req = build_request(&self.relay_url)?;
+        info!(target: TARGET, url = %self.relay_url, machine = %self.machine_id, "连接 relay 中");
         let (mut ws, _resp) = connect_async(req)
             .await
             .map_err(|e| CoreError::Platform(TARGET, format!("relay connect: {e}")))?;
 
-        // Bearer 认证通过后 relay 立即推 hello_ack——等首帧确认认证结果，
-        // 非 hello_ack（error/close）或超时都按认证失败重连（对齐 wecom R-5：
-        // 认证失败不得空转发，否则进程存活但无入站，用户消息静默丢失）。
+        // v1.1 认证：首帧 hello 自报 token + machine，等 relay 回 hello_ack
+        //（回显 machine）并校验与自报一致——不一致视为 relay 侧身份错乱
+        //（如 machine 槽位被同名顶替/漂移），warn 并按认证失败重连，绝不
+        // 空转发（对齐 wecom R-5：认证失败不得空转发，否则进程存活但无
+        // 入站，用户消息静默丢失）。
+        ws.send(Message::text(hello_frame(
+            &self.gateway_token,
+            &self.machine_id,
+        )))
+        .await
+        .map_err(|e| CoreError::Platform(TARGET, format!("hello 发送失败：{e}")))?;
         match tokio::time::timeout(HELLO_ACK_TIMEOUT, ws.next()).await {
             Ok(Some(Ok(msg))) => {
                 let text = msg
                     .into_text()
                     .map_err(|_| CoreError::Platform(TARGET, "hello_ack 帧非文本".into()))?;
-                let kind = serde_json::from_str::<serde_json::Value>(text.as_str())
-                    .ok()
-                    .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
-                    .unwrap_or_default();
-                if kind != "hello_ack" {
+                let ack_machine = parse_hello_ack(text.as_str())?;
+                if ack_machine != self.machine_id {
+                    warn!(
+                        target: TARGET,
+                        ack_machine = %ack_machine,
+                        self_machine = %self.machine_id,
+                        "hello_ack 回显 machine 与自报不一致，按认证失败重连"
+                    );
                     return Err(CoreError::Platform(
                         TARGET,
-                        format!("认证确认帧异常（type={kind}），按失败重连"),
+                        format!(
+                            "hello_ack machine 不一致（ack={ack_machine}，自报={}），重连",
+                            self.machine_id
+                        ),
                     ));
                 }
             }
@@ -164,12 +209,12 @@ impl WebClient {
             Err(_) => {
                 return Err(CoreError::Platform(
                     TARGET,
-                    "等 hello_ack 超时（10s）——Bearer token 可能不匹配".into(),
+                    "等 hello_ack 超时（10s）——gateway token 可能不匹配".into(),
                 ));
             }
         }
         self.online.store(true, Ordering::Relaxed);
-        info!(target: TARGET, "relay 已连接（hello_ack 确认），开始收发");
+        info!(target: TARGET, machine = %self.machine_id, "relay 已连接（hello_ack 确认身份），开始收发");
 
         // 收发循环。interval 首 tick 立即触发，先吃掉避免开局立刻发 ping。
         let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -230,10 +275,12 @@ impl WebClient {
         }
     }
 
-    /// 单条入站文本帧分拣：relay 自产帧（machine/error/hello_ack）本层自理；
-    /// 业务帧（message/approval_response/control/sync/ping）经
-    /// [`map_inbound_frame`] 映射。畸形 JSON warn 丢弃（不断连——浏览器/中继
-    /// 偶发杂帧不致网关重连）。
+    /// 单条入站文本帧分拣：relay 自产帧（machine/machines/error/hello_ack）
+    /// 本层自理（machines 只推浏览器，网关侧正常收不到，落到 Ignore 容错）；
+    /// 业务帧（message/approval_response/control/sync/ping，均可带 relay
+    /// 路由用的 machine 字段——网关侧无需消费）经 [`map_inbound_frame`]
+    /// 映射。畸形 JSON warn 丢弃（不断连——浏览器/中继偶发杂帧不致网关
+    /// 重连）。
     async fn handle_text(&self, ws: &mut WsStream, raw: &str) -> Result<()> {
         let v: serde_json::Value = match serde_json::from_str(raw) {
             Ok(v) => v,
@@ -286,8 +333,11 @@ impl WebClient {
                     }
                 }
                 InboundAction::Ping => {
-                    // 应用层 ping：本层直接回 pong（§4.1，不进 recv）。
-                    let _ = ws.send(Message::text(crate::encode_pong_frame())).await;
+                    // 应用层 ping：本层直接回 pong（§4.1，不进 recv），带本机
+                    // machine（v1.1 全部出站帧约定）。
+                    let _ = ws
+                        .send(Message::text(crate::encode_pong_frame(&self.machine_id)))
+                        .await;
                 }
                 InboundAction::Ignore => {
                     debug!(target: TARGET, kind, "未知入站帧 type，忽略（前向兼容）");
@@ -302,8 +352,10 @@ impl WebClient {
 }
 
 /// 自建 WS Upgrade 请求（tungstenite 0.29 对自建 Request 不自动补握手头，
-/// 须自带 Host/Upgrade/Key 等；Bearer 头走 relay 的直通认证形态 §4.2）。
-fn build_request(relay_url: &str, gateway_token: &str) -> Result<Request<()>> {
+/// 须自带 Host/Upgrade/Key 等）。认证走 v1.1 hello 首帧（token + machine），
+/// 不再附 Bearer 头——Bearer 直通在 relay 侧固定为 default 机器，带上会让
+/// machine 身份失效。
+fn build_request(relay_url: &str) -> Result<Request<()>> {
     Request::builder()
         .uri(relay_url)
         .header("host", host_of(relay_url))
@@ -311,8 +363,6 @@ fn build_request(relay_url: &str, gateway_token: &str) -> Result<Request<()>> {
         .header("upgrade", "websocket")
         .header("sec-websocket-version", "13")
         .header("sec-websocket-key", generate_key())
-        // relay §4.2 形态 2：`Authorization: Bearer <token>` 直通认证。
-        .header("authorization", format!("Bearer {gateway_token}"))
         .body(())
         .map_err(|e| CoreError::Platform(TARGET, format!("构造 relay 请求失败：{e}")))
 }
@@ -347,23 +397,57 @@ mod tests {
         assert_eq!(host_of("not-a-url"), "not-a-url");
     }
 
-    /// 请求构造：Bearer 头与目标 URI 正确进入 Request。
+    /// 请求构造：URI 与握手头正确进入 Request，且**不带** Authorization 头
+    ///（v1.1 认证统一走 hello 首帧——Bearer 直通固定 default 机器，不能带）。
     #[test]
-    fn build_request_carries_bearer_and_uri() {
-        let req = build_request("wss://ecs.example.com/imagent/gateway", "tok-123").unwrap();
+    fn build_request_no_bearer_carries_uri() {
+        let req = build_request("wss://ecs.example.com/imagent/gateway").unwrap();
         assert_eq!(
             req.uri().to_string().as_str(),
             "wss://ecs.example.com/imagent/gateway"
         );
-        assert_eq!(
-            req.headers()
-                .get("authorization")
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            "Bearer tok-123"
+        assert!(
+            req.headers().get("authorization").is_none(),
+            "v1.1 起认证走 hello 帧，不得附 Bearer 头"
         );
         assert_eq!(req.headers().get("upgrade").unwrap(), "websocket");
+    }
+
+    /// hello 帧形状：token + machine 自报（v1.1）。
+    #[test]
+    fn hello_frame_carries_token_and_machine() {
+        let f = hello_frame("tok-123", "home-mac");
+        let v: serde_json::Value = serde_json::from_str(&f).unwrap();
+        assert_eq!(v["v"], 1);
+        assert_eq!(v["type"], "hello");
+        assert_eq!(v["token"], "tok-123");
+        assert_eq!(v["machine"], "home-mac");
+    }
+
+    /// hello_ack 解析：正常回显 machine / 非 hello_ack / 缺 machine（旧
+    /// relay）/ 畸形 JSON 四分支。
+    #[test]
+    fn parse_hello_ack_variants() {
+        assert_eq!(
+            parse_hello_ack(r#"{"v":1,"type":"hello_ack","role":"gateway","machine":"home-mac"}"#)
+                .unwrap(),
+            "home-mac"
+        );
+        assert!(
+            parse_hello_ack(r#"{"v":1,"type":"error","code":"boom"}"#)
+                .unwrap_err()
+                .to_string()
+                .contains("认证确认帧异常"),
+            "非 hello_ack 报错"
+        );
+        assert!(
+            parse_hello_ack(r#"{"v":1,"type":"hello_ack","role":"gateway"}"#)
+                .unwrap_err()
+                .to_string()
+                .contains("machine"),
+            "缺 machine（relay < v1.1）报错"
+        );
+        assert!(parse_hello_ack("not json").is_err(), "畸形 JSON 报错");
     }
 
     /// 已 cancel 的 token 让 run 立即返回（停机通路，对齐 wecom P3-g 测试）。
@@ -374,6 +458,7 @@ mod tests {
         let client = WebClient {
             relay_url: "ws://127.0.0.1:1/gateway".into(),
             gateway_token: "t".into(),
+            machine_id: "test-mac".into(),
             default_session: "default".into(),
             online: Arc::new(AtomicBool::new(false)),
             inbound_tx,
