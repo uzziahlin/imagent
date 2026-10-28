@@ -6,8 +6,9 @@
 ## 0. 一页速览
 
 - **已完成并稳定运行**：Happy 自建中继全套基础设施（ECS 深圳 + 域名 HTTPS + happy-server + 自动续期），手机 App「会话列表不实时刷新」为上游 App 渲染 bug，与我们的部署无关，等 App 更新即可
-- **当前主任务**：在 imagent 项目里迭代一个 **Web 驾驶舱平台**（浏览器远程驾驶 Mac 上的 Claude Code）——设计已完成并经代码级评审修订（`docs/WEB_DESIGN.md`，2026-10-28 评审三修订已写入：M2.5 MultiPlatform / approval 帧补 convId / /resume 提进 M4），**全部决策已拍板，直接进 M1 编码**
-- **开工前置（已完成）**：delegate/sandbox 双批已收尾提交 main（`3aea1d8` feat + `5546886` release，v1.32.0，954 tests / clippy / fmt / docs 全绿）。本文件与 `docs/WEB_DESIGN.md` 仍未跟踪——随 `feat/web-platform` 分支首个 commit 走。另：近期清理过磁盘（删 target/debug 等约 80G），首仓首次 `cargo build` 会全量重建（属正常，几分钟）
+- **当前主任务**：imagent **Web 驾驶舱平台**（分支 `feat/web-platform`）——**M1 已完成并部署验收**（`crates/relay` 代码 commit `e6d11ca`（15 测试全绿）+ ECS systemd 服务 active + Caddy 路由 + Mac 公网 wss 全链路双端实测通过：healthz/错 token 1008/双端互通/machine 上下线通知）。下一步 M2 `crates/web` Platform impl（帧协议以 crates/relay 实现为准：hello 首帧/Bearer 直通两种认证、hello_ack/machine/error 自产帧、ping 文本帧端到端透传）
+- **M2+ 计划**：M2 `crates/web`（Platform impl + WS 客户端 + 配置）→ M2.5 MultiPlatform 组合器（feishu+web 并存）→ M3a/M3b web-ui SPA → M4 端到端验收（含 /resume 接管）。设计全文 `docs/WEB_DESIGN.md`（2026-10-28 评审修订已写入），编码派 subagent、主会话 review（用户 AGENTS.md 纪律）
+- **开工前置（已完成）**：delegate/sandbox 双批已收尾提交 main（`3aea1d8` feat + `5546886` release，v1.32.0）；本文件与 `docs/WEB_DESIGN.md` 已随分支首个 commit（`d6803ce`）入库
 
 ## 1. 基础设施清单（Happy 自建中继，全在运行）
 
@@ -43,8 +44,17 @@ systemctl restart happy-server
 # 证书手动续期+部署（Mac 上；正常不需要，launchd 自动）
 bash ~/.happy-relay/renew.sh    # 日志 ~/.happy-relay/renew.log
 
-# Caddy 配置在 /etc/caddy/Caddyfile（8443 = happy 反代 + welcome banner 分流；443 空闲备用）
-# ⚠️ 未来在本机跑 imagent relay 时，计划在 Caddyfile 增加 handle_path /imagent/* → 127.0.0.1:3010
+# Caddy 配置在 /etc/caddy/Caddyfile（8443 = happy 反代 + welcome banner 分流 + imagent relay 分流；443 空闲备用；改前备份 Caddyfile.bak-web-20261028）
+# imagent relay（Web 驾驶舱 M1，已部署运行 2026-10-28）：
+systemctl status imagent-relay && journalctl -u imagent-relay -n 50
+systemctl restart imagent-relay
+#   二进制 /opt/imagent-relay/imagent-relay（musl 静态 3MB）；env /opt/imagent-relay/env（0600，双 token）
+#   本地 token 副本 ~/.imagent/web-relay.env（0600）；systemd DynamicUser + 全套加固
+# 升级流程（Mac）：cargo zigbuild --release -p imagent-relay --target x86_64-unknown-linux-musl
+#   → workbench upload target/x86_64-unknown-linux-musl/release/imagent-relay /tmp/imagent-relay -i i-example1234567890
+#   → exec "mv /tmp/imagent-relay /opt/imagent-relay/imagent-relay && chmod 755 … && systemctl restart imagent-relay"
+#   ⚠️ workbench 直传 /opt/imagent-relay/ 会报 PathNoWritePermission，一律 /tmp 中转再 mv
+#   ⚠️ cargo install cargo-zigbuild 必须 --locked（非锁定版依赖要 rustc 1.91 > 本地 1.88）
 ```
 
 ### 坑清单（血泪，均已踩过）
@@ -75,7 +85,7 @@ bash ~/.happy-relay/renew.sh    # 日志 ~/.happy-relay/renew.log
 
 ### 3.4 里程碑与工时（AI 辅助编码前提）
 
-- M1 `crates/relay`（~400 行：双 WS 端点 + token + 帧中继 + 缓冲/限流 + rust-embed 静态）+ ECS 部署 + Caddy 路由 —— 0.5-1 天
+- M1 `crates/relay` ✅ **已完成**（2026-10-28：代码 `e6d11ca` + ECS 部署 + 公网验收全过；实做 ~700 行含 15 测试，超出 ~400 行估计——认证双形态/踢旧 conn_id/集成测试更完整）
 - M2 `crates/web`（Platform impl + WS 客户端 + 配置 `[[platform.web]]`）—— 0.5-1 天
 - M3 `web-ui/`（Vite+React+Tailwind：登录/消息流/流式卡片/审批/composer；DOMPurify 必须）—— 1-2 天
 - M4 端到端验收（PWA、断线演练、`ss -tln` 证 Mac 零监听）—— 0.5 天
