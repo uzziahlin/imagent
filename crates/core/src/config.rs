@@ -286,6 +286,29 @@ pub struct WebhookEntry {
     pub replay_window_secs: u64,
 }
 
+/// v1.31 委托编排条目（见 [`Config::delegates`]）。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct DelegateEntry {
+    /// 委托名（唯一、非空；agent 调 `delegate_run` / 用户敲 `/delegate` 用的键）。
+    pub name: String,
+    /// 副后端类型。MVP 限 one-shot 系：`codex` / `gemini` / `claude-cli`
+    ///（长驻 ACP 系不适配「一次性副轮」语义，配了 load 期报错）。
+    pub agent: String,
+    /// 副后端工具白名单。**缺省只读三件套** `["Read","Grep","Glob"]`——委托的
+    /// 安全缺省是只读助手（codex 映射 read-only 沙箱；claude-cli 映射
+    /// `--allowedTools` 且 Off 档下危险工具被 CLI 直接拒绝）；要放宽显式列
+    ///（如加 `"Bash"`），风险自负。`["*"]`/空 与主 backend 同义 = 全量。
+    #[serde(default = "default_delegate_tools")]
+    pub allowed_tools: Vec<String>,
+    /// 副后端模型（`-m` / `--model`；None = CLI 默认）。
+    #[serde(default)]
+    pub model: Option<String>,
+    /// 单次委托总预算（秒）。缺省 600；上限 3600。也是工具请求 `timeout_secs`
+    /// 覆盖值的**上限**（agent 只能调低不能放大）。
+    #[serde(default = "default_delegate_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Config {
     /// agent 工作根目录（agent 的 cwd，**非沙箱**：仅决定工作目录，不限制可读路径；
@@ -610,6 +633,40 @@ pub struct Config {
     /// 限制）；Bash 读取路径不受限（同 uid 进程边界，见威胁模型章）。
     #[serde(default = "default_hide_state_dir_from_agent")]
     pub hide_state_dir_from_agent: bool,
+    /// v1.31 委托编排：`[[delegate]]` 条目表（可多条）。配置后两条暴露面：
+    /// - agent 侧 MCP 工具 `delegate_run(delegate, prompt)`（仅 claude-cli 主后端
+    ///   经 `imagent mcp` server 挂载——agent 在一轮内自行 fan-out 给副后端，
+    ///   如 Claude 写完叫 codex 审）；
+    /// - 用户侧斜杠命令 `/delegate <name> <prompt>`（任意主后端可用）。
+    ///
+    /// 副后端在 workdir 内一次性执行（无会话续接、无 IM 审批闭环——权限请求按
+    /// 各自后端的 Off 档语义处理：claude-cli 直接拒危险工具、codex 落沙箱档），
+    /// 输出截断后回传调用方。SIGHUP 热改生效（main 重建委托表）。
+    #[serde(default, rename = "delegate")]
+    pub delegates: Vec<DelegateEntry>,
+    /// v1.32 OS 级 agent 沙箱（仅 claude-cli 后端接线；codex/gemini 有各自原生
+    /// 沙箱，ACP 命令行外部指定不可控——同 `hide_state_dir_from_agent` 边界）：
+    /// - `"auto"`（缺省）：Guarded 档——内核层定点 deny：状态目录（`~/.imagent`
+    ///   读+写全 deny，`permission.sock`/`token`/每轮 `mcp_*.json` 例外放行——
+    ///   审批闭环/数据面/委托工具不 break）+ 持久化热点写 deny（`~/.ssh`、shell
+    ///   rc、LaunchAgents 等；读保留）。正常开发读写不受影响（零破坏面）。
+    /// - `"strict"`：再把**写**收敛到 workdir / 临时目录 / `~/.claude` /
+    ///   `agent_sandbox_extra_write`（包管理器缓存 `~/.npm`/`~/.cargo` 等不在
+    ///   缺省清单，需要者显式加）。
+    /// - `"off"`：不包装。
+    ///
+    /// 机制：macOS = sandbox-exec（Seatbelt）；Linux = bwrap（未安装降级 off +
+    /// warn）。杀进程语义兼容（进程组 killpg 收割整组）。SIGHUP 热改。
+    #[serde(default = "default_agent_sandbox")]
+    pub agent_sandbox: String,
+    /// strict 档的额外可写目录（绝对路径；SIGHUP 热改）。
+    #[serde(default)]
+    pub agent_sandbox_extra_write: Vec<PathBuf>,
+}
+
+/// v1.32 沙箱缺省 auto（安全缺省——Guarded 档零破坏面；要关须显式 `"off"`）。
+fn default_agent_sandbox() -> String {
+    "auto".to_string()
 }
 
 fn default_feishu_send_rps() -> f64 {
@@ -625,6 +682,18 @@ fn default_max_concurrent_rounds() -> usize {
 /// `hide_state_dir_from_agent = false`），详见 Config::hide_state_dir_from_agent。
 fn default_hide_state_dir_from_agent() -> bool {
     true
+}
+
+/// v1.31 委托工具面安全缺省：只读三件套（委托是「副 agent 替主 agent 干活」，
+/// 默认不赋予写/执行权；要放宽显式列）。codex 侧映射 read-only 沙箱。
+fn default_delegate_tools() -> Vec<String> {
+    vec!["Read".into(), "Grep".into(), "Glob".into()]
+}
+
+/// v1.31 委托单次运行预算缺省（10 分钟——委托轮是「子任务」量级，不该继承
+/// 主轮的 1 小时缺省；上限见 load 期校验 DELEGATE_TIMEOUT_MAX_SECS）。
+fn default_delegate_timeout_secs() -> u64 {
+    600
 }
 
 fn default_feishu_urgent_on_ask() -> bool {
@@ -1160,6 +1229,84 @@ impl Config {
             }
         }
 
+        // v1.31 委托编排校验：名称归一 + 唯一、后端白名单（one-shot 系）、
+        // 预算边界、模型 trim。fail-fast 与 [[webhook]] 同款（配置拼错立即报错，
+        // 不静默半启用——agent 靠工具描述里的名单调用，坏名 = 静默 404）。
+        {
+            const DELEGATE_TIMEOUT_MAX_SECS: u64 = 3600;
+            let mut seen = std::collections::HashSet::new();
+            for d in &mut cfg.delegates {
+                d.name = d.name.trim().to_string();
+                if d.name.is_empty() {
+                    return Err(CoreError::Config(
+                        "delegate name 不能为空（[[delegate]] 条目缺 name 或为空白）".into(),
+                    ));
+                }
+                if !seen.insert(d.name.as_str()) {
+                    return Err(CoreError::Config(format!(
+                        "delegate name 重复（{}）——agent / 用户按名调用，重名无法路由",
+                        d.name
+                    )));
+                }
+                match d.agent.trim() {
+                    "codex" | "gemini" | "claude-cli" => {}
+                    other => {
+                        return Err(CoreError::Config(format!(
+                            "delegate {} 的 agent 仅支持 one-shot 系 codex | gemini | claude-cli \
+                             （当前 {other:?}；长驻 ACP 系不适配一次性副轮语义）",
+                            d.name
+                        )));
+                    }
+                }
+                d.agent = d.agent.trim().to_string();
+                d.model = d
+                    .model
+                    .take()
+                    .map(|m| m.trim().to_string())
+                    .filter(|m| !m.is_empty());
+                if d.timeout_secs == 0 || d.timeout_secs > DELEGATE_TIMEOUT_MAX_SECS {
+                    return Err(CoreError::Config(format!(
+                        "delegate {} 的 timeout_secs 须在 1..={DELEGATE_TIMEOUT_MAX_SECS} \
+                         （当前 {}；子任务量级预算，防挂死）",
+                        d.name, d.timeout_secs
+                    )));
+                }
+            }
+        }
+
+        // v1.32 沙箱：档位值域校验（fail-fast，防拼错静默退化为字串比较不中）；
+        // extra_write 须绝对路径（相对路径在沙箱挂载语义里锚点不明）。缺失目录
+        // 不拒启（workdir 同款取舍：可能晚就绪），warn 提示。
+        {
+            let tier = crate::sandbox::SandboxTier::parse(&cfg.agent_sandbox).ok_or_else(|| {
+                CoreError::Config(format!(
+                    "agent_sandbox 只支持 auto | strict | off（当前 {:?}）",
+                    cfg.agent_sandbox
+                ))
+            })?;
+            let _ = tier;
+            cfg.agent_sandbox_extra_write.retain(|p| {
+                let abs = p.is_absolute();
+                if !abs {
+                    tracing::warn!(
+                        target: "imagent::config",
+                        path = %p.display(),
+                        "agent_sandbox_extra_write 须为绝对路径，已忽略该条"
+                    );
+                }
+                abs
+            });
+            for p in &cfg.agent_sandbox_extra_write {
+                if !p.is_dir() {
+                    tracing::warn!(
+                        target: "imagent::config",
+                        path = %p.display(),
+                        "agent_sandbox_extra_write 指向的目录当前不存在（strict 档挂载时按缺省跳过，目录晚就绪可 SIGHUP 重载）"
+                    );
+                }
+            }
+        }
+
         Ok(cfg)
     }
 
@@ -1179,6 +1326,11 @@ impl Config {
         platform == "feishu"
             && self.feishu_bitable_app_token.is_some()
             && self.feishu_bitable_table_id.is_some()
+    }
+
+    /// v1.32：沙箱档位（load 期已校验值域；此处兜底 Auto 不 panic）。
+    pub fn sandbox_tier(&self) -> crate::sandbox::SandboxTier {
+        crate::sandbox::SandboxTier::parse(&self.agent_sandbox).unwrap_or_default()
     }
 
     /// T12：未启用的原因文案（启动 / SIGHUP warn 用；`None` = 已启用或无需提示）：
@@ -1254,6 +1406,20 @@ permission_mode = "auto"    # 缺省=auto：claude-cli=透传 claude 原生 auto
 # feishu_bitable_table_id = "tblXXX"     # 同上（缺省关闭；SIGHUP 热改生效）
 # sender_daily_cost_limit_usd = 5.0  # per-sender 成本上限（美元，滚动 24h 窗口；不设 = 不限）
 # hide_state_dir_from_agent = true   # 状态目录 deny（默认开，仅 claude-cli）：每轮注入 --settings deny 把 ~/.imagent 挡在 agent 读视野外（Read/Edit/Write/Glob/Grep）；false=关闭（调试用）
+# 委托编排（v1.31）：配置后 agent（claude-cli）获得 delegate_run 工具、用户可用 /delegate 命令，
+# 把子任务 fan-out 给副后端（如 Claude 写完叫 codex 审）。副轮缺省只读（Read/Grep/Glob）、
+# 无 IM 审批、无会话续接，输出截断回传；要放宽显式列 allowed_tools（风险自负）。
+# [[delegate]]
+# name = "review"              # 委托名（唯一；delegate_run / /delegate 按名调用）
+# agent = "codex"              # 副后端：codex | gemini | claude-cli（one-shot 系）
+# allowed_tools = ["Read", "Grep", "Glob"]   # 缺省只读三件套；codex 映射 read-only 沙箱
+# model = "gpt-5-codex"        # 可选模型（-m / --model）
+# timeout_secs = 600           # 单次预算（秒，缺省 600，上限 3600；也是工具覆盖值的上限）
+# OS 级 agent 沙箱（v1.32，仅 claude-cli）：缺省 auto = 内核层 deny 状态目录(~/.imagent，审批 sock/token/mcp json 例外)
+# + 持久化热点写(~/.ssh、shell rc、LaunchAgents)，正常开发读写不受影响；strict = 再把写收敛到
+# workdir/临时目录/~/.claude/下方清单；off = 关闭。macOS=sandbox-exec，Linux=bwrap(未装降级 off+warn)。SIGHUP 热改。
+# agent_sandbox = "auto"                  # auto(缺省) | strict | off
+# agent_sandbox_extra_write = ["/Users/me/.npm", "/Users/me/.cargo"]  # strict 档额外可写目录（绝对路径）
 "#;
 }
 /// claude `--permission-mode` 合法值归一（入参已小写化）：manual→default
@@ -2386,5 +2552,138 @@ append_system_prompt = ""
         );
         assert!(Config::load(&p2).is_ok(), "4 应通过");
         cleanup(&p2);
+    }
+
+    /// v1.31 [[delegate]]：合法配置解析 + 安全缺省（只读三件套 / 600s 预算）。
+    #[test]
+    fn delegate_entry_defaults_and_parse() {
+        let p = tmp_path(
+            "cfg_delegate_ok",
+            r#"default_workdir = "/tmp/ws"
+[[delegate]]
+name = "review"
+agent = "codex"
+"#,
+        );
+        let cfg = Config::load(&p).expect("合法配置应通过");
+        assert_eq!(cfg.delegates.len(), 1);
+        let d = &cfg.delegates[0];
+        assert_eq!(d.name, "review");
+        assert_eq!(d.agent, "codex");
+        assert_eq!(
+            d.allowed_tools,
+            vec!["Read".to_string(), "Grep".to_string(), "Glob".to_string()],
+            "缺省工具面 = 只读三件套"
+        );
+        assert_eq!(d.timeout_secs, 600, "缺省预算 10 分钟");
+        assert!(d.model.is_none());
+        cleanup(&p);
+    }
+
+    /// v1.31：非法 [[delegate]]（重名 / 非法后端 / 超时越界 / 空名）逐项拒启。
+    #[test]
+    fn delegate_entry_validation_rejects() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "dup_name",
+                "name 重复",
+                r#"
+[[delegate]]
+name = "a"
+agent = "codex"
+[[delegate]]
+name = "a"
+agent = "gemini"
+"#,
+            ),
+            (
+                "bad_agent",
+                "ACP 系后端",
+                r#"
+[[delegate]]
+name = "a"
+agent = "acp"
+"#,
+            ),
+            (
+                "timeout_zero",
+                "预算为 0",
+                r#"
+[[delegate]]
+name = "a"
+agent = "codex"
+timeout_secs = 0
+"#,
+            ),
+            (
+                "timeout_over",
+                "预算超上限",
+                r#"
+[[delegate]]
+name = "a"
+agent = "codex"
+timeout_secs = 3601
+"#,
+            ),
+            (
+                "blank_name",
+                "空白名",
+                r#"
+[[delegate]]
+name = "  "
+agent = "codex"
+"#,
+            ),
+        ];
+        for (tag, why, body) in cases {
+            let p = tmp_path(
+                &format!("cfg_delegate_bad_{tag}"),
+                &format!("default_workdir = \"/tmp/ws\"\n{body}"),
+            );
+            assert!(Config::load(&p).is_err(), "{why} 应拒启（{tag}）");
+            cleanup(&p);
+        }
+    }
+
+    /// v1.32 agent_sandbox：缺省 auto；三档解析；未知值拒启；extra_write 相对
+    /// 路径被过滤（warn）、绝对路径保留。
+    #[test]
+    fn agent_sandbox_config_parse_and_validate() {
+        let p = tmp_path("cfg_sandbox_default", "default_workdir = \"/tmp/ws\"\n");
+        let cfg = Config::load(&p).expect("缺省应通过");
+        assert_eq!(cfg.agent_sandbox, "auto", "安全缺省 auto");
+        assert_eq!(cfg.sandbox_tier(), crate::sandbox::SandboxTier::Auto);
+        cleanup(&p);
+
+        for (raw, tier) in [
+            ("strict", crate::sandbox::SandboxTier::Strict),
+            ("off", crate::sandbox::SandboxTier::Off),
+        ] {
+            let p = tmp_path(
+                &format!("cfg_sandbox_{raw}"),
+                &format!("default_workdir = \"/tmp/ws\"\nagent_sandbox = \"{raw}\"\n"),
+            );
+            assert_eq!(Config::load(&p).expect("合法档位").sandbox_tier(), tier);
+            cleanup(&p);
+        }
+
+        let p = tmp_path(
+            "cfg_sandbox_bad",
+            "default_workdir = \"/tmp/ws\"\nagent_sandbox = \"on\"\n",
+        );
+        assert!(Config::load(&p).is_err(), "未知档位应拒启");
+        cleanup(&p);
+
+        let p = tmp_path(
+            "cfg_sandbox_extra",
+            "default_workdir = \"/tmp/ws\"\nagent_sandbox = \"strict\"\nagent_sandbox_extra_write = [\"/tmp\", \"relative/x\"]\n",
+        );
+        let cfg = Config::load(&p).expect("应通过");
+        assert_eq!(
+            cfg.agent_sandbox_extra_write,
+            vec![PathBuf::from("/tmp")],
+            "相对路径被过滤，绝对路径保留"
+        );
+        cleanup(&p);
     }
 }

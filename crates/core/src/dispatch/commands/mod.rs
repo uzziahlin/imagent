@@ -38,6 +38,7 @@ const KNOWN_COMMAND_WORDS: &[&str] = &[
     "/compact",
     "/config",
     "/cron",
+    "/delegate",
     "/disallow",
     "/doctor",
     "/export",
@@ -83,7 +84,7 @@ pub(super) const COMMAND_GROUPS: &[(&str, &[&str])] = &[
     ("📁 目录与文件", &["/cd", "/ws", "/img", "/file"]),
     (
         "🛡️ 权限与运行",
-        &["/perm", "/stop", "/timeout", "/model", "/cron"],
+        &["/perm", "/stop", "/timeout", "/model", "/cron", "/delegate"],
     ),
     (
         "🧪 状态与诊断",
@@ -393,6 +394,10 @@ impl Dispatcher {
                     }
                     "/model" => {
                         self.cmd_model(&conv, &sender.0, &hint, &parts).await;
+                        return;
+                    }
+                    "/delegate" => {
+                        self.cmd_delegate(&conv, &hint, &parts).await;
                         return;
                     }
                     "/help" => {

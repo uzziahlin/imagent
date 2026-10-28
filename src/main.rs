@@ -21,6 +21,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 mod backup;
+mod delegate;
 mod ops;
 mod service;
 mod setup;
@@ -116,6 +117,14 @@ enum Cmd {
         /// feishu_bitable_* 配置写入 0|1；1 时 tools/list 追加两个 bitable 工具）。
         #[arg(long, default_value_t = 0)]
         bitable: u8,
+        /// v1.31：是否暴露委托编排工具（write_mcp_config 按 [[delegate]] 配置
+        /// 写入 0|1；1 时 tools/list 追加 delegate_run）。
+        #[arg(long, default_value_t = 0)]
+        delegate: u8,
+        /// v1.31：可用委托名（逗号分隔，进工具描述；空串 = 无）。与 `--delegate`
+        /// 恒成对写入（参数形态稳定）。
+        #[arg(long, default_value = "")]
+        delegate_names: String,
     },
     /// 内部子命令：面向终端 agent 的「问人」MCP server（stdio JSON-RPC），暴露
     /// `ask_via_im` 工具。挂在任意终端 agent 的 MCP 配置里（command=imagent，
@@ -795,6 +804,12 @@ async fn main() -> Result<()> {
             // T12：Bitable 数据面注入（platform=feishu 且 app_token/table_id 齐备
             // → feishu 实现挂进 Dispatcher；socket kind=bitable 请求经它落飞书）。
             ops::apply_bitable(&dispatcher, &config, platform_name);
+            // v1.32：OS 级沙箱注入（claude-cli 句柄 + 计划返给 delegate 的
+            // claude 副后端；Linux 无 bwrap 降级 off 的 warn 在装配函数内打）。
+            let sandbox_plan = ops::apply_agent_sandbox(claude_cli_handle.as_deref(), &config);
+            // v1.31：委托编排注入（[[delegate]] 条目 → 副后端表；socket
+            // kind=delegate 请求与 /delegate 命令经它跑副轮）。
+            delegate::apply(&dispatcher, &config, &sandbox_plan);
 
             // 9. 运维 HTTP server（/metrics + /health）。metrics_addr 为 None 或空串则关闭。
             // P2-2（code-review v14）：bind 提前到 spawn 之前——旧实现先 spawn 再
@@ -1211,14 +1226,26 @@ async fn main() -> Result<()> {
             mode,
             ask_timeout,
             bitable,
+            delegate,
+            delegate_names,
         } => {
             // 作为 claude 的 MCP 权限审批 server（stdio JSON-RPC）。
             let mode = imagent_core::PermissionMode::from_str_lossy(&mode);
+            // v1.31：--delegate-names CSV → 名单（过滤空白段；--delegate 0 时
+            // 名单仍会被解析但 server 侧不挂工具——两参数恒成对，形态稳定）。
+            let delegates: Vec<String> = delegate_names
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
             tracing::info!(
                 target: "imagent::mcp",
                 conv_id = %conv_id, sock = %sock, mode = mode.as_str(),
                 ask_timeout_secs = ask_timeout,
                 bitable,
+                delegate,
+                delegates = ?delegates,
                 "MCP permission server starting"
             );
             if let Err(e) = imagent_core::mcp::run_mcp_server(
@@ -1227,6 +1254,7 @@ async fn main() -> Result<()> {
                 mode,
                 std::time::Duration::from_secs(ask_timeout),
                 bitable != 0,
+                delegates,
             )
             .await
             {

@@ -585,6 +585,12 @@ impl Dispatcher {
         let db_bytes = self.store.db_size_bytes().await.unwrap_or(0);
         let media_bytes = crate::paths::dir_size_bytes(&crate::paths::imagent_home().join("media"));
         out.push(doctor_size_line(db_bytes, media_bytes));
+        // ⑦ v1.32 OS 级沙箱档位（backend.sandbox_status；None = 该后端无
+        // 接线——codex/gemini 原生沙箱、ACP 不覆盖，如实展示裸跑态）。
+        out.push(match self.backend.sandbox_status() {
+            Some(line) => format!("✅ agent 沙箱：{line}"),
+            None => "ℹ️ agent 沙箱：该后端无 OS 沙箱接线（codex/gemini 走各自原生沙箱；ACP 见 SECURITY.md 已知限制）".to_string(),
+        });
         out
     }
 
@@ -1919,6 +1925,80 @@ impl Dispatcher {
     }
 
     /// /help —— 命令总表（P6-3：飞书等卡片平台带常用命令按钮）。
+    /// v1.31 `/delegate`：委托编排的用户入口。
+    /// - `/delegate` / `/delegate list`：列出已配置委托（名 / 副后端 / 工具面）；
+    /// - `/delegate <name> <子任务...>`：交给命名副后端 one-shot 执行，结果带
+    ///   【委托·name】前缀回传。**不占主会话轮次与上下文**（副轮独立执行）；
+    ///   白名单可用（与普通轮次同级——消耗 token；工具面/预算由 [[delegate]]
+    ///   配置收敛，无 IM 审批闭环）。
+    pub(super) async fn cmd_delegate(&self, conv: &ConvId, hint: &ReplyHint, parts: &[&str]) {
+        let api = self.delegate_handle().read().clone();
+        let Some(api) = api else {
+            self.reply(conv, crate::delegate::NOT_CONFIGURED_MSG, hint)
+                .await;
+            return;
+        };
+        let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+        if arg.is_empty() || arg.eq_ignore_ascii_case("list") {
+            let descs = api.describe();
+            if descs.is_empty() {
+                // 注入了空表属装配异常（main 不注入空表）——防御性兜底。
+                self.reply(conv, crate::delegate::NOT_CONFIGURED_MSG, hint)
+                    .await;
+                return;
+            }
+            let lines: Vec<String> = descs
+                .iter()
+                .map(|d| format!("- **{}**（{} · 工具面：{}）", d.name, d.agent, d.tools))
+                .collect();
+            self.reply(
+                conv,
+                &format!(
+                    "🔀 已配置的委托：\n{}\n\n用法：/delegate <name> <子任务>（副轮不占主会话上下文；工具面/预算见 config.toml 的 [[delegate]]）",
+                    lines.join("\n")
+                ),
+                hint,
+            )
+            .await;
+            return;
+        }
+        let name = arg;
+        let prompt = parts[2..].join(" ").trim().to_string();
+        if prompt.is_empty() {
+            self.reply(
+                conv,
+                &format!(
+                    "用法：/delegate {name} <子任务>（子任务不能为空；/delegate 查看可用委托）"
+                ),
+                hint,
+            )
+            .await;
+            return;
+        }
+        let req = crate::delegate::DelegateRequest {
+            name: name.to_string(),
+            prompt,
+            timeout_secs: None,
+        };
+        // 先回执再跑：副轮可到分钟级，无回执会被当没收到。
+        self.reply(
+            conv,
+            &format!("🔀 委托 {name} 开始执行，结果稍后回传…"),
+            hint,
+        )
+        .await;
+        match api.run(&req).await {
+            Ok(text) => {
+                self.reply(conv, &format!("🔀【委托·{name}】\n{text}"), hint)
+                    .await;
+            }
+            Err(err) => {
+                self.reply(conv, &format!("🔀【委托·{name}】失败：{err}"), hint)
+                    .await;
+            }
+        }
+    }
+
     pub(super) async fn cmd_help(&self, conv: &ConvId, hint: &ReplyHint) {
         let mut body = "其他内容直接发给 agent 即可（运行中发文字实时转入当轮 👀；图片/文件排队下一轮 ⏳）。\n\n💬 会话规则：群主时间线直接 @我 = 续同一会话；点消息「回复」进话题 = 开独立会话。".to_string();
         // v1.25 折叠分组：卡片平台用 :::collapse 围栏（常用组展开、其余
@@ -1929,7 +2009,7 @@ impl Dispatcher {
                 (":::collapse+ 🚀 常用", "- /last 回看上一轮 · /again 再跑成功指令\n- /resume 恢复历史 · /sessions 切换会话\n- /stop 中断 · /queue 查看排队\n- /help 本表"),
                 (":::collapse 🗂 会话管理", "- /new 重置 · /switch <name> 切换/新建命名 · /compact 压缩上下文\n- /retry 重试失败轮 · /export [n] 导出 Markdown"),
                 (":::collapse 📁 目录与文件", "- /cd <path> 切工作目录 · /ws save|use|remove <name> 命名空间\n- /img <path> 发图片 · /file <path> 发文件"),
-                (":::collapse 🛡️ 权限与运行", "- /perm <off|allow|deny|ask> 模式 · /perm list 查看 · /perm revoke <工具> 撤销\n- /timeout <分钟|off|default> 空闲看门狗 · /model [名称|default] 模型"),
+                (":::collapse 🛡️ 权限与运行", "- /perm <off|allow|deny|ask> 模式 · /perm list 查看 · /perm revoke <工具> 撤销\n- /timeout <分钟|off|default> 空闲看门狗 · /model [名称|default] 模型\n- /delegate [list|<name> <子任务>] 委托副 agent（需 config [[delegate]]）"),
                 (":::collapse ⏰ 定时任务", "- /cron add <分 时 日 月 周> <指令>（本地时区）\n- /cron list · rm <id> · enable|disable <id>"),
                 (":::collapse 🧪 状态与诊断", "- /status 状态 · /tasks 轮次进度 · /doctor 自检 · /reconnect 重连\n- /config [k v] 热改 · /stats [today|7d|all] 用量 · /audit [n] 审计"),
                 (":::collapse 👥 管理（管理员）", "- /allow、/disallow 授权（群内可 @ 对方）· /chat allow|deny|allow-all|list\n- /admin list|add|remove · /list 白名单 · /whoami 我的 id"),
@@ -1939,7 +2019,7 @@ impl Dispatcher {
             .collect::<Vec<_>>()
             .join("\n\n")
         } else {
-            "🗂 会话\n- /new 重置 · /switch 切换 · /sessions · /resume [n] · /compact · /retry · /again · /last · /export [n]\n\n📁 目录与文件\n- /cd · /ws save|use|remove · /img · /file\n\n🛡️ 权限与运行\n- /perm <off|allow|deny|ask> · /perm list · /perm revoke <工具>\n- /stop · /queue [drop n] · /timeout · /model\n\n⏰ 定时\n- /cron add <分 时 日 月 周> <指令> · list · rm · enable|disable\n\n🧪 诊断\n- /status · /tasks 轮次进度 · /doctor · /reconnect · /config · /stats · /audit\n\n👥 管理（管理员）\n- /allow · /disallow · /chat · /admin · /list · /whoami".to_string()
+            "🗂 会话\n- /new 重置 · /switch 切换 · /sessions · /resume [n] · /compact · /retry · /again · /last · /export [n]\n\n📁 目录与文件\n- /cd · /ws save|use|remove · /img · /file\n\n🛡️ 权限与运行\n- /perm <off|allow|deny|ask> · /perm list · /perm revoke <工具>\n- /stop · /queue [drop n] · /timeout · /model · /delegate <name> <子任务>\n\n⏰ 定时\n- /cron add <分 时 日 月 周> <指令> · list · rm · enable|disable\n\n🧪 诊断\n- /status · /tasks 轮次进度 · /doctor · /reconnect · /config · /stats · /audit\n\n👥 管理（管理员）\n- /allow · /disallow · /chat · /admin · /list · /whoami".to_string()
         };
         body = format!("{groups}\n\n{body}");
         // v1.23：动态追加 shortcuts 段——快捷命令此前零发现性（忘了名字就

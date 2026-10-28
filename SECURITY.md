@@ -42,6 +42,25 @@
 | 单人私聊自用 | 可接受（攻击者 ≈ 你自己；真正边界是你的 IM 账号） |
 | **多人群聊白名单** | **风险显著上调**：任一白名单成员触发的提示注入，即可能按上述路径拿到 bot 凭据并给自己开后门。群白名单的语义是「信任这些人**本人**」，不是「信任他们的 prompt 供应链」 |
 
+**进程面缓解（v1.32 `agent_sandbox`，默认启用）**：上述 ①③ 与持久化驻留路径已
+在**内核层**收敛——claude-cli 子进程经 macOS Seatbelt（`sandbox-exec`）/ Linux
+bwrap 包装（`allow default` 基座 + 定点 deny，正常开发读写零影响）：
+
+- ① 读 `~/.imagent`：**读+写全 deny**（例外仅 `permission.sock`/`token`/每轮
+  `mcp_*.json`——审批闭环与数据面/委托工具自身的通道，agent 经 MCP 子进程本就
+  持有，无新增暴露）。Bash/任意子进程间接读取同被拦（这是相对 CLI 层
+  `--settings` deny 的本质提升）。
+- ③ 写 DB 后门：同上，写路径同 deny。
+- 持久化驻留：`~/.ssh`、shell rc 文件、LaunchAgents/LaunchDaemons 的**写**被拒
+  （读保留——git push 需要 `~/.ssh` 读）。
+- `strict` 档（可选）：再把全部**写**收敛到 workdir / 临时目录 / `~/.claude` /
+  `agent_sandbox_extra_write` 显式清单。
+
+**残余（沙箱不覆盖，如实声明）**：② 主进程 environ 读取（沙箱不隔离 /proc/ps）；
+④ 同 uid 伪造 socket 连接（token 门槛仍在，见上文）；⑤ keyring 同会话可读——
+这三项的边界仍是「专用运行用户」（见下）。杀进程语义兼容：包装进程进独立进程
+组，`killpg` 整组收割（与 B5 守卫一致）。
+
 **建议缓解**（按性价比）：
 
 - 给 agent 配 `permission_mode = "ask"` + `approval_tools` 收紧审批面（已在做的）；
@@ -60,6 +79,7 @@
 - **S7 metrics/health 端点鉴权**：设置环境变量 `IMAGENT_HTTP_TOKEN` 后，`/metrics` 与 `/health` 要求 Bearer token（不匹配返回 401）；**非 loopback 绑定且未配 token 时拒绝启动**（fail-closed）——暴露到网络的指标端点不会无鉴权裸奔。
 - **权限能力协商 fail-closed（v1.9.0 行为变更）**：`Backend` trait 新增 `PermissionCapability`（FullLoop / NativeOnly / Unsupported）；闭环类权限档（`permission_mode = "ask"` / claude 的 auto 档）× 非 FullLoop 后端（codex / gemini / 旧配置形态）**启动即拒绝**，不再静默忽略权限模式（此前 ask 档在无审批能力后端被静默降级 = 事实上的 fail-open）。`/perm` 热切同口径校验。
 - **状态目录 deny（T7，默认开）**：`hide_state_dir_from_agent`（缺省 `true`，仅 claude-cli 后端）每轮 spawn 注入 `--settings` 内联 deny 规则——`Read`/`Edit`/`Write`/`Glob`/`Grep` × `//<imagent_home>/**` 绝对路径 glob（profile 感知 + 基座 `~/.imagent`，覆盖 symlink 形态）——把 imagent 状态目录移出 agent 读视野，防提示注入后的 agent 用默认免审只读工具直读 `imagent.db`（凭据/白名单/全部会话 prompt）。deny 无条件压过任何来源的 allow，对默认免审工具同样生效。SIGHUP 热改（下一轮起）。**边界**：Bash/子进程间接读取仍不可挡（同 uid 进程级边界，见上文威胁模型；Read deny 对 Bash 中被识别的 `cat`/`head` 等点名文件的命令生效，对不点名文件的命令与任意子进程无效）；`Glob`/`Grep` 的路径形态规则当前 CLI 不 consult（`Read` 规则 best-effort 连带覆盖二者的 `path` 参数）；claude-acp 后端不注入（见已知限制）。需让 agent 读自家状态时显式设 `false`。
+- **OS 级 agent 沙箱（v1.32，默认 `auto`）**：`agent_sandbox = "auto" | "strict" | "off"`（仅 claude-cli 后端，含 delegate 的 claude 副后端）。auto = Guarded 档（状态目录内核级读+写 deny + 持久化热点写 deny，规则序与路径形态真机校准见 `crates/core/src/sandbox.rs` 模块文档）；strict = 再收敛写面。`/doctor` 安全分组第 ⑦ 项展示档位。Linux 宿主无 bwrap 时降级 off + warn。
 - **store 文件 0600 / 目录 0700**（unix）。
 - **SSRF 白名单**：媒体下载仅允许 `novac2c.cdn.weixin.qq.com` 等 CDN 主机。
 - **限流熔断**：sendmessage 服从式退避（不绕风控）。
@@ -72,4 +92,7 @@
 - **claude-acp 后端无状态目录 deny**：ACP 的 claude 命令行由 `IMAGENT_ACP_COMMAND` 外部指定，网关无法可靠追加 `--settings` deny 参数——`hide_state_dir_from_agent` 仅 claude-cli 生效。用 ACP 且在意该面时，可在 `IMAGENT_ACP_COMMAND` 指向的包装脚本里自行补 `--settings`，或依赖进程级隔离（专用用户/sandbox）。
 - **（已解除——agent-client-protocol ≥ 2.2.0）ACP 后端子进程树无进程组收割**：agent-client-protocol 升至 2.2.0 后，SDK spawn 显式 `process_group(0)` 且断连时 `kill_process_group` SIGKILL 整棵子树（`claude-agent-acp → claude CLI → MCP/Bash`），与 claude-cli 路径的 killpg 收敛一致——旧版（1.0.1）只杀直接子进程、孙进程可存活为孤儿的限制不再存在。历史细节见 `crates/claude/src/acp.rs` 模块头。
 - **云文档评论会话的信任边界**：conv `feishu:comment:<file_token>` 放行后，**所有能评论该文档的协作者**共享同一个 agent 会话（上下文 / 会话级 allow-set / 工作区互通），且回复锚定评论者本人（v13 后）。放行一个文档会话 = 放行该文档的**全体协作者**驱动 agent——协作者范围通常远大于 IM 白名单。文档权限请按此口径收敛（链接分享/协作者清单），或对高敏文档不开评论会话。
+- **`agent_sandbox` 仅覆盖 claude-cli 系**（主后端 + delegate 的 claude 副后端）：codex / gemini 有各自原生沙箱（`-s` 档 / approval-mode），叠加双层沙箱会冲突；ACP 命令行由 `IMAGENT_ACP_COMMAND` 外部指定，包装后 agent 自建子进程/stdio 语义不可控（与 `hide_state_dir_from_agent` 同边界）——这两类后端的进程面边界仍靠专用运行用户。
+- **macOS `sandbox-exec` 处于系统弃用状态**（Apple 自用、仍随系统分发且本批已真机校准 darwin 25.6.0 生效）；若未来系统移除，降级路径 = `agent_sandbox = "off"` + 专用运行用户。
+- **Linux `strict` 档为实验性**：只读基座可能挡住 dbus 等 unix socket 场景的连接（ro 挂载上的 socket connect 需要 RW）；遇阻先回 `auto` 档并把所需路径加 `agent_sandbox_extra_write`。
 - iLink 是腾讯对外协议的第三方 Rust 实现，使用者自负合规责任（见 README 免责声明 + RESEARCH §2）。

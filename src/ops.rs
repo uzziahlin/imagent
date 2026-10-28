@@ -57,14 +57,16 @@ pub(crate) fn warn_bitable_disable_reason(config: &imagent_core::Config, platfor
     }
 }
 
-/// W1-2/W1-3/W1-4 + T7/T12：claude-cli 运行参数注入（启动与 SIGHUP 共用同一
-/// 接线）。T7 的 hide_state_dir、T12 的 bitable 同此热改（整体替换，下一轮
-/// spawn 生效）。
+/// W1-2/W1-3/W1-4 + T7/T12 + v1.31 委托：claude-cli 运行参数注入（启动与
+/// SIGHUP 共用同一接线）。T7 的 hide_state_dir、T12 的 bitable、v1.31 的
+/// delegates（`[[delegate]]` 条目名——挂载 delegate_run 工具）同此热改（整体
+/// 替换，下一轮 spawn 生效）。
 pub(crate) fn apply_claude_runtime_opts(
     b: &imagent_claude::ClaudeBackend,
     config: &imagent_core::Config,
     bitable: bool,
 ) {
+    let delegate_names: Vec<String> = config.delegates.iter().map(|d| d.name.clone()).collect();
     b.set_runtime_opts(
         config.claude_fallback_model.clone(),
         config.disallowed_tools.clone(),
@@ -72,6 +74,7 @@ pub(crate) fn apply_claude_runtime_opts(
         config.mcp_config_path.as_deref(),
         config.hide_state_dir_from_agent,
         bitable,
+        delegate_names,
     );
 }
 
@@ -122,6 +125,41 @@ pub(crate) fn apply_bitable(
     dispatcher.set_bitable(Some(Arc::new(imagent_feishu::FeishuBitable::new(
         app_id, app_secret, base_url, app_token, table_id,
     ))));
+}
+
+/// v1.32：OS 级沙箱装配（启动与 SIGHUP 共用）：档位 + 平台探测 → 执行计划
+/// （Linux 无 bwrap 降级 Off + warn；macOS 恒 Seatbelt）→ 注入 claude-cli 句柄。
+/// 返回计划供 delegate 的 claude 副后端同注一份（Off 时 delegate 侧自然裸跑）。
+pub(crate) fn apply_agent_sandbox(
+    claude_cli: Option<&imagent_claude::ClaudeBackend>,
+    config: &imagent_core::Config,
+) -> imagent_core::SandboxPlan {
+    let tier = config.sandbox_tier();
+    let bwrap = if cfg!(target_os = "linux") {
+        imagent_core::sandbox::detect_bwrap()
+    } else {
+        None
+    };
+    let plan = imagent_core::resolve_sandbox(tier, bwrap);
+    if tier != imagent_core::SandboxTier::Off && matches!(plan, imagent_core::SandboxPlan::Off) {
+        // 唯一降级路径：Linux 配了 auto/strict 但宿主没装 bwrap。
+        tracing::warn!(
+            target: "imagent::ops",
+            tier = tier.as_str(),
+            "agent_sandbox 已启用但宿主未安装 bwrap（bubblewrap）——沙箱降级 off；             安装后 SIGHUP 或重启生效（macOS 不受影响，走 sandbox-exec）"
+        );
+    }
+    if let Some(line) = plan.status_line() {
+        tracing::info!(target: "imagent::ops", "{line}");
+    }
+    if let Some(b) = claude_cli {
+        let effective = match &plan {
+            imagent_core::SandboxPlan::Off => None,
+            _ => Some(plan.clone()),
+        };
+        b.set_sandbox(effective, config.agent_sandbox_extra_write.clone());
+    }
+    plan
 }
 
 /// `/health` 返回的 JSON 载荷。
@@ -499,7 +537,8 @@ pub(crate) fn spawn_sighup_handler(
                     backend.set_model(cfg.claude_model.clone());
                     // W1-2/W1-3/W1-4：claude-cli 运行参数整体替换（含用户 MCP
                     // 配置文件的现场重读）。T12：bitable 开关同轮刷新（下一轮
-                    // spawn 的 mcp 配置按新值挂载/撤销 --bitable）。
+                    // spawn 的 mcp 配置按新值挂载/撤销 --bitable）。v1.31：
+                    // delegates 名单同轮刷新（挂载/撤销 --delegate）。
                     if let Some(b) = &claude_cli {
                         apply_claude_runtime_opts(b, &cfg, cfg.bitable_enabled_for(&platform_name));
                     }
@@ -508,6 +547,13 @@ pub(crate) fn spawn_sighup_handler(
                     // 置 None，后续请求回「未配置」）。
                     warn_bitable_disable_reason(&cfg, &platform_name);
                     apply_bitable(&dispatcher, &cfg, &platform_name);
+                    // v1.32：沙箱热改（档位/extra_write/宿主 bwrap 变化均重
+                    // 解析；下一轮 spawn 生效）。
+                    let sandbox_plan = apply_agent_sandbox(claude_cli.as_deref(), &cfg);
+                    // v1.31：委托编排热改——整体重建委托表（one-shot 后端无长驻
+                    // 资源，重建即生效；删光条目 = 置 None）。claude 副后端同注
+                    // 沙箱计划。
+                    crate::delegate::apply(&dispatcher, &cfg, &sandbox_plan);
                     // P2-1a（code-review v14）：auto 档按**运行中后端**解析——
                     // agent 键不可热载（后端实现启动期装配），若按重载 config 的
                     // agent 字符串解析，把 claude-cli 改成 codex 的那次 SIGHUP

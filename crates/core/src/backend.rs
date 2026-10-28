@@ -215,4 +215,12 @@ pub trait Backend: Send + Sync {
     /// 连接、kill ACP 子进程）。此前仅靠 Drop 兜底——Arc 泄漏/静态持有场景
     /// 下子进程会活到 OS 清理，显式接线让退出路径确定。
     async fn shutdown(&self) {}
+
+    /// v1.32：OS 级沙箱状态（`/doctor` 安全维度展示；None = 该后端无沙箱
+    /// 接线——codex/gemini 靠各自原生沙箱、ACP 不覆盖，见 SECURITY.md）。
+    /// claude-cli 覆写（返回装配的 [`crate::sandbox::SandboxPlan`] 的
+    /// status_line）。
+    fn sandbox_status(&self) -> Option<String> {
+        None
+    }
 }

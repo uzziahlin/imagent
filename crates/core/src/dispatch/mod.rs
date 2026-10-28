@@ -670,6 +670,11 @@ pub struct Dispatcher {
     /// task 经 Arc clone 共享读取（`kind=bitable` 请求路由到它，见 socket.rs）。
     /// `parking_lot` RwLock：临界区只做 clone，无 await。
     bitable: Arc<RwLock<Option<Arc<dyn crate::bitable::BitableApi>>>>,
+    /// v1.31 委托编排句柄（main 装配的 `DelegateApi` 实现）。None = 未启用
+    ///（config 无 `[[delegate]]` 条目）。main 启动注入 + SIGHUP 热改（见
+    /// [`Self::set_delegate`]）；socket accept task 共享读取（`kind=delegate`
+    /// 请求路由到它），`/delegate` 命令同读此句柄。
+    delegate: DelegateHandle,
 }
 
 /// P2（code-review v13）：全局在飞轮数闸门。`limit` = 配置上限（0 = 不限制，
@@ -804,6 +809,10 @@ pub(crate) type ConvStates = Arc<Mutex<HashMap<String, ConvState>>>;
 /// T12：Bitable 数据面共享句柄（Dispatcher 与 permission socket accept task
 /// 共享——`kind=bitable` 请求在连接处理里读当前值，SIGHUP 热改即时可见）。
 pub(crate) type BitableHandle = Arc<RwLock<Option<Arc<dyn crate::bitable::BitableApi>>>>;
+
+/// v1.31：委托编排共享句柄（语义同 [`BitableHandle`]——`kind=delegate` 请求与
+/// `/delegate` 命令读当前值，SIGHUP 重建的委托表对后续调用即时可见）。
+pub(crate) type DelegateHandle = Arc<RwLock<Option<Arc<dyn crate::delegate::DelegateApi>>>>;
 
 /// T18：per-conv 状态表粗上限（housekeeping 60s 节拍 LRU 驱逐；远超单部署
 /// 常见会话数，对齐 feishu 侧 PER_CONV_MAP_CAP 的量级取舍）。
@@ -986,6 +995,7 @@ impl Dispatcher {
             acp_off_warn_state: parking_lot::Mutex::new(None),
             webhook_exposure: parking_lot::RwLock::new(WebhookExposure::default()),
             bitable: Arc::new(RwLock::new(None)),
+            delegate: Arc::new(RwLock::new(None)),
         };
         // S2：admin_senders 为空 = 无人是管理员，IM 内管理命令全部不可用——
         // 构造即显著提示（防用户以为白名单用户仍可 /allow）。
@@ -1023,6 +1033,25 @@ impl Dispatcher {
     /// T12：Bitable 是否已注入（run() 的 socket 启动判定用）。
     pub fn bitable_enabled(&self) -> bool {
         self.bitable.read().is_some()
+    }
+
+    /// v1.31：委托编排注入/热改（main 启动 + SIGHUP 调用）。`Some` = 启用
+    ///（main 装配的 `DelegateApi`——`kind=delegate` socket 请求与 `/delegate`
+    /// 命令经它跑副后端）；`None` = 撤销（SIGHUP 删光 `[[delegate]]` 的语义——
+    /// 后续调用回「未配置」错误而非半生效）。与 `set_bitable` 同款纯状态写入。
+    pub fn set_delegate(&self, api: Option<Arc<dyn crate::delegate::DelegateApi>>) {
+        *self.delegate.write() = api;
+    }
+
+    /// v1.31：委托是否已注入（/doctor、命令侧可用性提示用）。
+    pub fn delegate_enabled(&self) -> bool {
+        self.delegate.read().is_some()
+    }
+
+    /// v1.31：`/delegate` 命令的入口句柄（命令分支与 socket 分支同源；crate 内
+    /// 共享，避免命令模块经 Dispatcher 私有字段绕道）。
+    pub(crate) fn delegate_handle(&self) -> DelegateHandle {
+        self.delegate.clone()
     }
 
     /// P7：启动偏好注入（main 在 run 前调一次；构造器保持零新参，测试无感）。

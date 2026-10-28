@@ -1,5 +1,6 @@
 //! [`ClaudeBackend`]：基于 Claude Code CLI 的无状态 agent 执行器。
 
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -36,6 +37,16 @@ pub struct ClaudeBackend {
     /// Control = canUseTool 双工协议（SDK 现行标准，缺省）；Mcp = 旧
     /// `--permission-prompt-tool` 机制（legacy 回退）。
     permission_channel: RwLock<PermissionChannel>,
+    /// v1.32 OS 级沙箱（main 启动 / SIGHUP / delegate 装配注入；None = 未装配 =
+    /// 裸跑，等价 Off）。每 run 现读——热改下一轮 spawn 生效。
+    sandbox: RwLock<SandboxState>,
+}
+
+/// v1.32：沙箱装配状态（执行计划 + strict 档额外可写目录）。
+#[derive(Debug, Clone, Default)]
+struct SandboxState {
+    plan: Option<imagent_core::SandboxPlan>,
+    extra_write: Vec<std::path::PathBuf>,
 }
 
 /// claude 审批传输通道（见 [`ClaudeBackend::permission_channel`]）。
@@ -71,6 +82,12 @@ pub struct RuntimeOpts {
     /// 为 true 时 mcp 配置的 imagent 条目追加 `--bitable 1`——MCP server 暴露
     /// bitable_list_fields / bitable_append_row 工具（下一轮 spawn 生效）。
     pub bitable: bool,
+    /// v1.31 委托编排：`[[delegate]]` 条目名（main 判定后注入）。非空时 mcp 配置
+    /// 的 imagent 条目追加 `--delegate 1 --delegate-names <csv>`——MCP server
+    /// 暴露 `delegate_run` 工具（agent 可把子任务 fan-out 给副后端）。注意：
+    /// **副后端实例不注入本字段**（防递归委托——副 claude 不该再见到
+    /// delegate_run；main 装配侧保证，见 bin 的 delegate 模块）。
+    pub delegates: Vec<String>,
 }
 
 impl ClaudeBackend {
@@ -82,6 +99,7 @@ impl ClaudeBackend {
             model: RwLock::new(None),
             runtime: RwLock::new(RuntimeOpts::default()),
             permission_channel: RwLock::new(PermissionChannel::default()),
+            sandbox: RwLock::new(SandboxState::default()),
         }
     }
 
@@ -93,6 +111,7 @@ impl ClaudeBackend {
             model: RwLock::new(None),
             runtime: RwLock::new(RuntimeOpts::default()),
             permission_channel: RwLock::new(PermissionChannel::default()),
+            sandbox: RwLock::new(SandboxState::default()),
         }
     }
 
@@ -110,6 +129,7 @@ impl ClaudeBackend {
             model: RwLock::new(None),
             runtime: RwLock::new(RuntimeOpts::default()),
             permission_channel: RwLock::new(PermissionChannel::default()),
+            sandbox: RwLock::new(SandboxState::default()),
         }
     }
 }
@@ -125,17 +145,30 @@ impl ClaudeBackend {
         *self.permission_channel.write() = ch;
     }
 
+    /// v1.32：注入 OS 级沙箱执行计划（main 启动 / SIGHUP / delegate 装配调用）。
+    /// `None` = Off（裸跑）；下一轮 spawn 生效。`extra_write` 随计划整体替换
+    ///（strict 档的额外可写目录）。
+    pub fn set_sandbox(
+        &self,
+        plan: Option<imagent_core::SandboxPlan>,
+        extra_write: Vec<std::path::PathBuf>,
+    ) {
+        *self.sandbox.write() = SandboxState { plan, extra_write };
+    }
+
     /// P8-4：设置 `claude_permission_mode` 透传覆盖（SIGHUP 热更新；见
     /// [`claude_native_perm_args`]）。值须已经过 config 校验归一。
     pub fn set_native_permission_mode(&self, mode: Option<String>) {
         *self.native_perm_mode.write() = mode;
     }
 
-    /// W1-2/W1-3/W1-4 + T7/T12：注入 config 侧运行参数（main 启动与 SIGHUP 调用；
-    /// `extra_mcp_path` 现场读取解析，读失败 warn 后按无用户 servers 处理——
-    /// config load 期已校验过一次，此处失败属文件后来被改动）。T7 的
-    /// `hide_state_dir` 见 [`RuntimeOpts::hide_state_dir`]；T12 的 `bitable`
-    /// 见 [`RuntimeOpts::bitable`]（均 SIGHUP 整体替换，下一轮 spawn 生效）。
+    /// W1-2/W1-3/W1-4 + T7/T12 + v1.31 委托：注入 config 侧运行参数（main 启动
+    /// 与 SIGHUP 调用；`extra_mcp_path` 现场读取解析，读失败 warn 后按无用户
+    /// servers 处理——config load 期已校验过一次，此处失败属文件后来被改动）。
+    /// T7 的 `hide_state_dir` 见 [`RuntimeOpts::hide_state_dir`]；T12 的 `bitable`
+    /// 见 [`RuntimeOpts::bitable`]；v1.31 的 `delegates` 见
+    /// [`RuntimeOpts::delegates`]（均 SIGHUP 整体替换，下一轮 spawn 生效）。
+    #[allow(clippy::too_many_arguments)]
     pub fn set_runtime_opts(
         &self,
         fallback_model: Option<String>,
@@ -144,6 +177,7 @@ impl ClaudeBackend {
         extra_mcp_path: Option<&std::path::Path>,
         hide_state_dir: bool,
         bitable: bool,
+        delegates: Vec<String>,
     ) {
         let extra_mcp = extra_mcp_path.and_then(|p| {
             std::fs::read_to_string(p)
@@ -170,6 +204,7 @@ impl ClaudeBackend {
             extra_mcp,
             hide_state_dir,
             bitable,
+            delegates,
         };
     }
 }
@@ -341,6 +376,11 @@ fn sanitize_filename(s: &str) -> String {
 /// permission socket（bitable 请求走 `kind=bitable` 消息，与审批互不干扰）；
 /// 此时 socket 路径取默认 `permission.sock`。`--bitable` 恒传 0|1（参数形态
 /// 稳定，MCP server 侧无需猜测缺省）。
+///
+/// v1.31：`delegate_names` 非空（`[[delegate]]` 已配置）时同 T12 逻辑挂 imagent
+/// 条目并透传 `--delegate 0|1` + `--delegate-names <csv>`（`delegate_run` 工具
+/// 走 `kind=delegate` 消息，与审批/bitable 互不干扰）。两参数恒传（形态稳定）。
+#[allow(clippy::too_many_arguments)]
 async fn write_mcp_config(
     conv_id: &str,
     sock: Option<&str>,
@@ -348,6 +388,7 @@ async fn write_mcp_config(
     ask_timeout_secs: u64,
     extra: Option<&serde_json::Value>,
     bitable: bool,
+    delegate_names: &[String],
 ) -> std::io::Result<std::path::PathBuf> {
     let exe = std::env::current_exe()?;
     let mut servers = serde_json::Map::new();
@@ -367,9 +408,9 @@ async fn write_mcp_config(
             servers.insert(k.clone(), v.clone());
         }
     }
-    if sock.is_some() || bitable {
-        // sock=None + bitable（Control 审批通道 + 数据面）时 MCP server 仍需
-        // socket 连主进程——回落默认 permission.sock 路径。
+    if sock.is_some() || bitable || !delegate_names.is_empty() {
+        // sock=None + bitable/delegates（Control 审批通道 + 数据面/委托）时 MCP
+        // server 仍需 socket 连主进程——回落默认 permission.sock 路径。
         let sock_path = sock
             .map(str::to_string)
             .unwrap_or_else(permission_sock_path);
@@ -384,6 +425,8 @@ async fn write_mcp_config(
                     "--mode", mode.as_str(),
                     "--ask-timeout", ask_timeout_secs.to_string(),
                     "--bitable", if bitable { "1" } else { "0" },
+                    "--delegate", if delegate_names.is_empty() { "0" } else { "1" },
+                    "--delegate-names", delegate_names.join(","),
                 ]
             }),
         );
@@ -443,6 +486,16 @@ impl Backend for ClaudeBackend {
 
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    /// v1.32：装配的沙箱计划状态（`/doctor` 安全维度；None = 未装配/Off——
+    /// 与裸跑等价，doctor 如实展示）。
+    fn sandbox_status(&self) -> Option<String> {
+        self.sandbox
+            .read()
+            .plan
+            .as_ref()
+            .and_then(|p| p.status_line())
     }
 
     /// TaskList 预热冷启动：回放 ~/.claude/projects 转录推导任务终态
@@ -610,13 +663,16 @@ impl Backend for ClaudeBackend {
         // T12：bitable 数据面（opts.bitable）也经同一 MCP server 挂载——即使
         // Control 通道（sock=None）也写 imagent 条目（write_mcp_config 内回落
         // 默认 sock 路径），agent 获得 bitable_* 工具。
+        // v1.31：委托编排（opts.delegates）同 T12 逻辑挂载 delegate_run 工具。
         // mode 已在审批通道分支前读取（(code-review v14) P1 单轮快照，见上）。
         let extra = opts.extra_mcp.clone();
         let bitable = opts.bitable;
+        let delegates = opts.delegates.clone();
         let use_control = control_io.is_some();
         let mcp_json: Option<std::path::PathBuf> = if mode.is_enabled()
             || extra.is_some()
             || bitable
+            || !delegates.is_empty()
         {
             // Control 通道：审批不经 MCP（sock=None——mcp 配置只承载用户 servers
             // 与 bitable，无 --permission-prompt-tool）。
@@ -628,6 +684,7 @@ impl Backend for ClaudeBackend {
                 self.ask_timeout.as_secs(),
                 extra.as_ref(),
                 bitable,
+                &delegates,
             )
             .await
             {
@@ -676,6 +733,44 @@ impl Backend for ClaudeBackend {
         // 诊断（control 通道真机校准）：完整 spawn 参数。
         tracing::debug!(target: "imagent::backend", args = ?cmd,
             "claude spawn 参数（get_all）");
+        // v1.32 OS 级沙箱包装：计划生效时把 cmd 重建为 wrapper 前缀
+        //（sandbox-exec -p <profile> -- / bwrap ... -- claude ...）。mcp_json
+        // 路径进例外清单（claude 启动即读）；env/stdio/进程组由 spawn_cli_backend
+        // 统一加——包装进程进组后 killpg 整组收割连 claude 孙进程，杀进程语义
+        // 与 B5 守卫一致。cwd 从原 cmd 带走（cmd 此处只设置了 cwd + args）。
+        let cmd = {
+            let sandbox_state = self.sandbox.read().clone();
+            let spec = imagent_core::SandboxSpec {
+                workdir: workdir.to_path_buf(),
+                mcp_json: mcp_json.clone(),
+                extra_write: sandbox_state.extra_write.clone(),
+            };
+            match sandbox_state
+                .plan
+                .as_ref()
+                .and_then(|p| imagent_core::sandbox::wrap_command(p, &spec))
+            {
+                Some((wrapper, prefix)) => {
+                    let cwd = cmd.as_std().get_current_dir().map(Path::to_path_buf);
+                    let orig_prog = cmd.as_std().get_program().to_string_lossy().into_owned();
+                    let orig_args: Vec<String> = cmd
+                        .as_std()
+                        .get_args()
+                        .map(|a| a.to_string_lossy().into_owned())
+                        .collect();
+                    let mut wrapped = Command::new(&wrapper);
+                    if let Some(c) = cwd {
+                        wrapped.current_dir(c);
+                    }
+                    wrapped.args(&prefix).arg(orig_prog).args(orig_args);
+                    tracing::debug!(target: "imagent::backend", wrapper = %wrapper,
+                        "claude spawn 已包 OS 沙箱（tier={}）", sandbox_state.plan.as_ref()
+                            .map(|p| p.tier().as_str()).unwrap_or("off"));
+                    wrapped
+                }
+                None => cmd,
+            }
+        };
         // 清理 guard 先于 await 建立（见 McpCleanupGuard 文档）：cancel 路径
         // 才是它存在的理由。命名 `_` 前缀保留绑定到函数尾，正常返回时随
         // result 组装一并 drop（同步 unlink）。
@@ -1079,6 +1174,7 @@ mod tests {
             300,
             Some(&extra),
             false,
+            &[],
         )
         .await
         .expect("写 mcp 配置");
@@ -1108,7 +1204,7 @@ mod tests {
 
         // T12：sock = None + bitable = true（Control 审批通道 + 数据面）——
         // 仍挂 imagent 条目（socket 路径回落默认 permission.sock），--bitable 1。
-        let p = write_mcp_config("test_conv", None, PermissionMode::Off, 300, None, true)
+        let p = write_mcp_config("test_conv", None, PermissionMode::Off, 300, None, true, &[])
             .await
             .expect("写 mcp 配置");
         let raw = std::fs::read_to_string(&p).unwrap();
@@ -1143,6 +1239,7 @@ mod tests {
             300,
             Some(&extra),
             false,
+            &[],
         )
         .await
         .expect("写 mcp 配置");
@@ -1157,11 +1254,54 @@ mod tests {
         let _ = std::fs::remove_file(&p);
 
         // extra = None + sock = None：空 mcpServers（调用方不会走到，防呆）。
-        let p = write_mcp_config("test_conv", None, PermissionMode::Off, 300, None, false)
-            .await
-            .expect("写 mcp 配置");
+        let p = write_mcp_config(
+            "test_conv",
+            None,
+            PermissionMode::Off,
+            300,
+            None,
+            false,
+            &[],
+        )
+        .await
+        .expect("写 mcp 配置");
         let raw = std::fs::read_to_string(&p).unwrap();
         assert!(raw.contains("\"mcpServers\":{}"), "空配置形态: {raw}");
+        let _ = std::fs::remove_file(&p);
+
+        // v1.31：delegates 非空（sock=None + Off）——同 bitable 逻辑挂 imagent 条目，
+        // --delegate 1 + --delegate-names <csv>；名单按入参顺序进 args。
+        let p = write_mcp_config(
+            "test_conv",
+            None,
+            PermissionMode::Off,
+            300,
+            None,
+            false,
+            &["review".to_string(), "ops".to_string()],
+        )
+        .await
+        .expect("写 mcp 配置");
+        let raw = std::fs::read_to_string(&p).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let servers = v["mcpServers"].as_object().expect("mcpServers 对象");
+        assert!(
+            servers.contains_key(imagent_core::mcp::SERVER_NAME),
+            "delegates 非空应挂 imagent 条目: {raw}"
+        );
+        let args = servers[imagent_core::mcp::SERVER_NAME]["args"]
+            .as_array()
+            .expect("args 数组");
+        let d = args
+            .iter()
+            .position(|a| a == "--delegate")
+            .expect("--delegate 恒传");
+        assert_eq!(args[d + 1], "1", "启用传 1: {raw}");
+        let n = args
+            .iter()
+            .position(|a| a == "--delegate-names")
+            .expect("--delegate-names 恒传");
+        assert_eq!(args[n + 1], "review,ops", "CSV 名单: {raw}");
         let _ = std::fs::remove_file(&p);
         // 恢复 env 并清理临时 home。
         std::env::remove_var(imagent_core::paths::IMAGENT_HOME_ENV);

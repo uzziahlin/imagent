@@ -34,6 +34,9 @@ pub const BITABLE_LIST_FIELDS_TOOL: &str = "bitable_list_fields";
 /// T12：bitable 工具名——向多维表格追加一行（参数 `fields`：object）。
 pub const BITABLE_APPEND_ROW_TOOL: &str = "bitable_append_row";
 
+/// v1.31：委托编排工具名——把子任务 fan-out 给命名副后端 one-shot 执行。
+pub const DELEGATE_RUN_TOOL: &str = "delegate_run";
+
 /// `tools/list` 里 bitable_append_row 的参数描述（键=列名，先查列再写行）。
 const BITABLE_FIELDS_DESC: &str =
     "要写入的列值：键=列名（先调 bitable_list_fields 查可用列），值=标量（文本/数字/布尔）";
@@ -63,8 +66,11 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 const MAX_MCP_STDIN_LINE_BYTES: usize = 8 * 1024 * 1024;
 
 /// `tools/list` 的工具描述（纯函数，便于单测）。`bitable = true`（feishu_bitable_*
-/// 配置齐备，backend 写 mcp 配置时经 `--bitable 1` 传入）时追加两个数据面工具。
-pub fn build_tools_list(bitable: bool) -> Value {
+/// 配置齐备，backend 写 mcp 配置时经 `--bitable 1` 传入）时追加两个数据面工具；
+/// `delegates` 非空（`[[delegate]]` 条目名，经 `--delegate-names` 传入）时追加
+/// [`DELEGATE_RUN_TOOL`]（描述里点名可用委托——agent 据此选值，名单过期时
+/// socket 侧错误会带新名单自愈）。
+pub fn build_tools_list(bitable: bool, delegates: &[String]) -> Value {
     let mut tools = vec![json!({
         "name": TOOL_NAME,
         "description": "IM 权限审批：claude 遇需权限的工具时回调，由 imagent 转交 IM 用户 approve/deny。",
@@ -92,6 +98,27 @@ pub fn build_tools_list(bitable: bool) -> Value {
                     "fields": { "type": "object", "description": BITABLE_FIELDS_DESC }
                 },
                 "required": ["fields"]
+            }
+        }));
+    }
+    if !delegates.is_empty() {
+        let names = delegates.join(" | ");
+        tools.push(json!({
+            "name": DELEGATE_RUN_TOOL,
+            "description": format!(
+                "把子任务委托给已配置的副 agent（可用：{names}）one-shot 执行并返回其最终回复。\
+                 适合多模型分工（如写完代码叫 codex 审查）。副 agent 在同一工作目录运行、\
+                 不共享本轮对话（prompt 需自包含上下文）、工具面由配置收敛（通常只读）、\
+                 无审批交互——需要用户决策的事项应转告用户而非在副轮内等待。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "delegate": { "type": "string", "description": format!("委托名（可用：{names}）") },
+                    "prompt": { "type": "string", "description": "子任务正文（自包含上下文——副 agent 看不到本轮对话）" },
+                    "timeout_secs": { "type": "integer", "description": "预算（秒，可选；生效值不超过该委托的配置上限）" }
+                },
+                "required": ["delegate", "prompt"]
             }
         }));
     }
@@ -147,10 +174,15 @@ pub fn fixed_reply(mode: PermissionMode) -> PermissionReply {
 ///
 /// 返回要写回 stdout 的 JSON-RPC 响应（已含 `id`）。通知（无 `id`）返回 None。
 /// `params_for_call` 是 Ask 模式下需要 socket roundtrip 时调用的回调；纯函数版本
-/// 传入 `None` 时，Ask 按 deny 兜底（便于单测）。`bitable` 只影响 `tools/list`
-/// 的工具面（bitable 工具的 `tools/call` 需 socket，由 server 循环拦截，纯函数
-/// 版本按 unknown tool 回错）。
-pub fn handle_request(req: &Value, mode: PermissionMode, bitable: bool) -> Option<Value> {
+/// 传入 `None` 时，Ask 按 deny 兜底（便于单测）。`bitable` / `delegates` 只影响
+/// `tools/list` 的工具面（bitable / delegate 工具的 `tools/call` 需 socket，由
+/// server 循环拦截，纯函数版本按 unknown tool 回错）。
+pub fn handle_request(
+    req: &Value,
+    mode: PermissionMode,
+    bitable: bool,
+    delegates: &[String],
+) -> Option<Value> {
     let id = req.get("id")?;
     let method = req.get("method")?.as_str()?;
     let result: Value = match method {
@@ -159,7 +191,7 @@ pub fn handle_request(req: &Value, mode: PermissionMode, bitable: bool) -> Optio
             "capabilities": { "tools": {} },
             "serverInfo": { "name": "imagent-permission", "version": env!("CARGO_PKG_VERSION") }
         }),
-        "tools/list" => build_tools_list(bitable),
+        "tools/list" => build_tools_list(bitable, delegates),
         "tools/call" => {
             let name = req
                 .pointer("/params/name")
@@ -375,15 +407,93 @@ fn new_request_id(prefix: &str) -> String {
     )
 }
 
+/// `kind = "delegate"` 的 socket roundtrip（v1.31 委托编排）：name/prompt →
+/// 主进程注入的 DelegateApi（副后端 one-shot 运行）→ 一行 JSON 回写。
+///
+/// 请求：`{ "kind": "delegate", "conv_id": "...", "name": "...", "prompt": "...",
+/// "timeout_secs": n? }`；回复：`{ "kind": "delegate", "ok": true, "data": "<文本>"
+/// }` / `{ "kind": "delegate", "ok": false, "error": "..." }`。
+/// 返回口径与 [`bitable_call_via_socket`] 同构：`Ok(Ok(text))` = 副轮最终文本；
+/// `Ok(Err(err))` = 主进程侧错误（未配置 / 未知名 / 超时 / 运行失败）；
+/// `Err(io)` = socket 层失败。
+///
+/// 读超时 = 生效预算 + 120s 余量（主进程侧有同款硬预算兜底，先于此到达；
+/// 余量覆盖回包写出）。预算上限对齐 config 校验的 3600s。
+pub async fn delegate_call_via_socket(
+    sock: &str,
+    conv_id: &str,
+    name: &str,
+    prompt: &str,
+    timeout_secs: Option<u64>,
+) -> io::Result<std::result::Result<String, String>> {
+    let mut stream = UnixStream::connect(sock).await?;
+    // 握手 token 与审批/ask/bitable 通道同一份（<sock_dir>/permission.token）。
+    let token_path = std::path::Path::new(sock)
+        .parent()
+        .map(|d| d.join("permission.token"))
+        .unwrap_or_else(|| std::path::PathBuf::from("permission.token"));
+    let token = std::fs::read_to_string(&token_path)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    stream.write_all(format!("{token}\n").as_bytes()).await?;
+    stream.flush().await?;
+    let mut req = json!({
+        "kind": "delegate",
+        "conv_id": conv_id,
+        "name": name,
+        "prompt": prompt,
+    });
+    if let Some(t) = timeout_secs {
+        req["timeout_secs"] = json!(t);
+    }
+    stream.write_all(format!("{req}\n").as_bytes()).await?;
+    stream.flush().await?;
+
+    let mut reader = BufReader::new(&mut stream);
+    let mut buf = String::new();
+    let budget = std::time::Duration::from_secs(timeout_secs.unwrap_or(600).saturating_add(120));
+    // 读回的是副 agent 最终文本（可到几十 KB）——read_line 无上限，配合上方
+    // 墙钟预算防挂死（上限读行只约束 stdin 侧的请求行，见 MAX_MCP_STDIN_LINE_BYTES）。
+    match tokio::time::timeout(budget, reader.read_line(&mut buf)).await {
+        Ok(res) => {
+            res?;
+        }
+        Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("delegate reply timed out (>{budget:?})"),
+            ))
+        }
+    }
+    let v: Value = serde_json::from_str(buf.trim())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("parse reply: {e}")))?;
+    if v.get("ok").and_then(|o| o.as_bool()) == Some(true) {
+        return Ok(Ok(v
+            .get("data")
+            .and_then(|d| d.as_str())
+            .unwrap_or_default()
+            .to_string()));
+    }
+    let err = v
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap_or("unknown error")
+        .to_string();
+    Ok(Err(err))
+}
+
 /// MCP server 主循环（stdio）。读 stdin 一行 JSON、写 stdout 一行 JSON。
 /// `bitable`（= mcp 配置的 `--bitable 1`）时 tools/list 追加 bitable 工具、
-/// tools/call 转发 socket `kind=bitable`（见 [`bitable_call_via_socket`]）。
+/// tools/call 转发 socket `kind=bitable`（见 [`bitable_call_via_socket`]）；
+/// `delegates` 非空（= `--delegate-names` 逗号名单）时同构追加
+/// [`DELEGATE_RUN_TOOL`] 并转发 socket `kind=delegate`。
 pub async fn run_mcp_server(
     conv_id: String,
     sock: String,
     mode: PermissionMode,
     ask_timeout: std::time::Duration,
     bitable: bool,
+    delegates: Vec<String>,
 ) -> io::Result<()> {
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
@@ -415,9 +525,10 @@ pub async fn run_mcp_server(
         };
 
         // tools/call 分流：bitable 工具（数据面，与 permission_mode 正交）→
-        // kind=bitable socket；其余在 Ask 闭环类模式（Ask / AutoClaude）走审批
-        // roundtrip；再其余走纯 handler。bitable 判定必须先于 needs_socket——
-        // 否则 Ask 档下 bitable 调用会被误当权限请求推 IM 审批。
+        // kind=bitable socket；delegate 工具（委托编排，同正交）→ kind=delegate
+        // socket；其余在 Ask 闭环类模式（Ask / AutoClaude）走审批 roundtrip；
+        // 再其余走纯 handler。bitable/delegate 判定必须先于 needs_socket——
+        // 否则 Ask 档下数据面调用会被误当权限请求推 IM 审批。
         let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
         let tool_name = req
             .pointer("/params/name")
@@ -432,6 +543,13 @@ pub async fn run_mcp_server(
             json!({
                 "jsonrpc": "2.0", "id": id,
                 "result": run_bitable_tool_call(&sock, &conv_id, &tool_name, &req).await
+            })
+        } else if method == "tools/call" && !delegates.is_empty() && tool_name == DELEGATE_RUN_TOOL
+        {
+            let id = req.get("id").cloned().unwrap_or(Value::Null);
+            json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": run_delegate_tool_call(&sock, &conv_id, &req).await
             })
         } else if method == "tools/call" && mode.needs_socket() {
             let (tool_name, input) = extract_call_args(&req);
@@ -460,7 +578,7 @@ pub async fn run_mcp_server(
             let id = req.get("id").cloned().unwrap_or(Value::Null);
             json!({ "jsonrpc": "2.0", "id": id, "result": result })
         } else {
-            match handle_request(&req, mode, bitable) {
+            match handle_request(&req, mode, bitable, &delegates) {
                 Some(v) => v,
                 None => continue, // 通知（无 id），不回
             }
@@ -521,6 +639,53 @@ fn bitable_result_text(data: &Value) -> String {
         Value::String(s) => s.clone(),
         other => other.to_string(),
     }
+}
+
+/// delegate_run 工具单次调用的 MCP `result` 载荷（`{content, isError}`，形态
+/// 对齐 bitable 工具）：参数校验 → socket kind=delegate → 文本化。错误文案
+/// 直读（主进程侧带可用委托名 / 配置引导，agent 可自行修正重试）。
+async fn run_delegate_tool_call(sock: &str, conv_id: &str, req: &Value) -> Value {
+    let args = req
+        .pointer("/params/arguments")
+        .cloned()
+        .unwrap_or(json!({}));
+    let name = args
+        .get("delegate")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let prompt = args
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    // 预算只接受 1..=3600（对齐 config 校验上限；主进程侧还会再与条目上限取 min）。
+    let timeout_secs = args
+        .get("timeout_secs")
+        .and_then(|v| v.as_u64())
+        .filter(|s| (1..=3600).contains(s));
+    if name.is_empty() || prompt.is_empty() {
+        return json!({
+            "content": [ { "type": "text",
+                "text": "delegate 与 prompt 必填且非空（timeout_secs 可选，秒）" } ],
+            "isError": true
+        });
+    }
+    let outcome = delegate_call_via_socket(sock, conv_id, &name, &prompt, timeout_secs).await;
+    let (text, is_error) = match outcome {
+        Ok(Ok(text)) => (text, false),
+        Ok(Err(err)) => (format!("delegate_run 失败（{name}）：{err}"), true),
+        Err(e) => (
+            format!("imagent 主进程不可达（{e}）——请确认 imagent 已在运行且 [[delegate]] 已配置"),
+            true,
+        ),
+    };
+    json!({
+        "content": [ { "type": "text", "text": text } ],
+        "isError": is_error
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -931,7 +1096,7 @@ mod tests {
 
     #[test]
     fn tools_list_has_permission_request() {
-        let list = build_tools_list(false);
+        let list = build_tools_list(false, &[]);
         let tools = list.get("tools").and_then(|t| t.as_array()).unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], TOOL_NAME);
@@ -942,7 +1107,7 @@ mod tests {
     /// fields 必填）。
     #[test]
     fn tools_list_bitable_flag_appends_data_tools() {
-        let list = build_tools_list(true);
+        let list = build_tools_list(true, &[]);
         let tools = list.get("tools").and_then(|t| t.as_array()).unwrap();
         assert_eq!(tools.len(), 3, "permission_request + 2 个 bitable 工具");
         assert_eq!(tools[1]["name"], BITABLE_LIST_FIELDS_TOOL);
@@ -960,9 +1125,149 @@ mod tests {
         );
         // 0（缺省）时纯审批面——不泄漏数据面工具（未配置的部署 agent 看不到）。
         assert_eq!(
-            build_tools_list(false)["tools"].as_array().unwrap().len(),
+            build_tools_list(false, &[])["tools"]
+                .as_array()
+                .unwrap()
+                .len(),
             1
         );
+    }
+
+    /// v1.31：`--delegate-names` 非空时 tools/list 追加 delegate_run 工具——
+    /// 名单进描述（agent 据此选值）、delegate/prompt 必填；空名单不泄漏。
+    #[test]
+    fn tools_list_delegates_appends_delegate_run() {
+        let names = vec!["review".to_string(), "ops".to_string()];
+        let list = build_tools_list(false, &names);
+        let tools = list.get("tools").and_then(|t| t.as_array()).unwrap();
+        assert_eq!(tools.len(), 2, "permission_request + delegate_run");
+        assert_eq!(tools[1]["name"], DELEGATE_RUN_TOOL);
+        let desc = tools[1]["description"].as_str().unwrap();
+        assert!(desc.contains("review | ops"), "描述应点名可用委托: {desc}");
+        assert_eq!(
+            tools[1]["inputSchema"]["required"][0], "delegate",
+            "delegate 必填"
+        );
+        assert_eq!(tools[1]["inputSchema"]["required"][1], "prompt");
+        // 未配置（空名单）不泄漏工具。
+        assert!(!serde_json::to_string(&build_tools_list(false, &[]))
+            .unwrap()
+            .contains(DELEGATE_RUN_TOOL));
+        // 与 bitable 可同时挂载（4 工具）。
+        assert_eq!(
+            build_tools_list(true, &names)["tools"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+    }
+
+    /// v1.31：delegate_run 在纯 handler 按 unknown tool 回错（真实调用需
+    /// socket，由 server 循环拦截）——防纯路径误吞（对齐 bitable 同款测试）。
+    #[test]
+    fn handle_request_rejects_delegate_run_without_socket() {
+        let req = json!({
+            "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+            "params": { "name": DELEGATE_RUN_TOOL, "arguments": { "delegate": "review", "prompt": "x" } }
+        });
+        let resp = handle_request(&req, PermissionMode::Allow, false, &[]).unwrap();
+        assert_eq!(resp["error"]["code"], -32602);
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(DELEGATE_RUN_TOOL));
+    }
+
+    /// v1.31：delegate_run 参数前置校验——delegate/prompt 缺失或空白在 server
+    /// 侧直接回 isError（不占 socket 往返；sock 给不可达路径证明未触网）。
+    #[tokio::test]
+    async fn delegate_tool_call_validates_args_before_socket() {
+        for args in [
+            json!({}),
+            json!({ "delegate": " " }),
+            json!({ "delegate": "review", "prompt": "" }),
+        ] {
+            let req = json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": DELEGATE_RUN_TOOL, "arguments": args }
+            });
+            let result = run_delegate_tool_call("/nonexistent/imagent.sock", "c1", &req).await;
+            assert_eq!(result["isError"], true, "{args}");
+            assert!(
+                result["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("必填"),
+                "文案应指向必填参数: {result}"
+            );
+        }
+    }
+
+    /// v1.31：`kind=delegate` socket 报文形态——首行握手 token、次行请求 JSON
+    ///（kind/conv_id/name/prompt[/timeout_secs]），回包 ok/data 解析（对齐
+    /// bitable 同款 mock-listener 测试）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegate_socket_request_shape_and_reply_parse() {
+        let dir = std::env::temp_dir().join(format!("imagent-mcp-delegate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("permission.token"), "tok-delegate\n").unwrap();
+        let sock_path = dir.join("permission.sock");
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let captured = tokio::spawn(async move {
+            async fn serve_once(s: &mut tokio::net::UnixStream, reply: &str) -> (String, String) {
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+                let mut lr = BufReader::new(s);
+                let mut token_line = String::new();
+                lr.read_line(&mut token_line).await.unwrap();
+                let mut req_line = String::new();
+                lr.read_line(&mut req_line).await.unwrap();
+                lr.get_mut().write_all(reply.as_bytes()).await.unwrap();
+                lr.get_mut().flush().await.unwrap();
+                (token_line, req_line)
+            }
+            let (mut s1, _) = listener.accept().await.unwrap();
+            let first = serve_once(
+                &mut s1,
+                "{\"kind\":\"delegate\",\"ok\":true,\"data\":\"审查通过，无阻塞问题\"}\n",
+            )
+            .await;
+            let (mut s2, _) = listener.accept().await.unwrap();
+            let second = serve_once(
+                &mut s2,
+                "{\"kind\":\"delegate\",\"ok\":false,\"error\":\"未配置的委托名 x\"}\n",
+            )
+            .await;
+            (first, second)
+        });
+
+        let sock = sock_path.to_string_lossy().into_owned();
+        let text =
+            delegate_call_via_socket(&sock, "feishu:ou_x", "review", "检查最近提交", Some(300))
+                .await
+                .expect("socket 层应成功")
+                .expect("主进程侧应成功");
+        assert_eq!(text, "审查通过，无阻塞问题");
+
+        let err = delegate_call_via_socket(&sock, "feishu:ou_x", "x", "y", None)
+            .await
+            .expect("socket 层应成功")
+            .expect_err("ok=false 应映射 Err");
+        assert_eq!(err, "未配置的委托名 x", "失败文案透传");
+
+        let ((token_line, req_line), (token2, _)) = captured.await.unwrap();
+        assert_eq!(token_line.trim(), "tok-delegate", "首行必须是握手 token");
+        assert_eq!(token2.trim(), "tok-delegate");
+        let req: Value = serde_json::from_str(req_line.trim()).unwrap();
+        assert_eq!(req["kind"], "delegate");
+        assert_eq!(req["conv_id"], "feishu:ou_x");
+        assert_eq!(req["name"], "review");
+        assert_eq!(req["prompt"], "检查最近提交");
+        assert_eq!(req["timeout_secs"], 300);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ask server 的 tools/list 暴露 ask_via_im + notify_via_im 两个工具。
@@ -1057,7 +1362,7 @@ mod tests {
     #[test]
     fn handle_initialize_returns_capabilities() {
         let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize" });
-        let resp = handle_request(&req, PermissionMode::Allow, false).unwrap();
+        let resp = handle_request(&req, PermissionMode::Allow, false, &[]).unwrap();
         assert_eq!(resp["id"], 1);
         assert_eq!(resp["result"]["protocolVersion"], PROTOCOL_VERSION);
         assert!(resp["result"]["capabilities"]["tools"].is_object());
@@ -1066,7 +1371,7 @@ mod tests {
     #[test]
     fn handle_tools_list() {
         let req = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" });
-        let resp = handle_request(&req, PermissionMode::Allow, false).unwrap();
+        let resp = handle_request(&req, PermissionMode::Allow, false, &[]).unwrap();
         assert_eq!(resp["result"]["tools"][0]["name"], TOOL_NAME);
     }
 
@@ -1076,7 +1381,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",
             "params": { "name": TOOL_NAME, "arguments": { "tool_name": "Bash", "input": {"command":"ls"} } }
         });
-        let resp = handle_request(&req, PermissionMode::Allow, false).unwrap();
+        let resp = handle_request(&req, PermissionMode::Allow, false, &[]).unwrap();
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         let payload: Value = serde_json::from_str(text).unwrap();
         assert_eq!(payload["behavior"], "allow");
@@ -1088,7 +1393,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 4, "method": "tools/call",
             "params": { "name": TOOL_NAME, "arguments": { "tool_name": "Bash" } }
         });
-        let resp = handle_request(&req, PermissionMode::Deny, false).unwrap();
+        let resp = handle_request(&req, PermissionMode::Deny, false, &[]).unwrap();
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         let payload: Value = serde_json::from_str(text).unwrap();
         assert_eq!(payload["behavior"], "deny");
@@ -1097,14 +1402,14 @@ mod tests {
     #[test]
     fn handle_unknown_method_returns_error() {
         let req = json!({ "jsonrpc": "2.0", "id": 5, "method": "foo/bar" });
-        let resp = handle_request(&req, PermissionMode::Allow, false).unwrap();
+        let resp = handle_request(&req, PermissionMode::Allow, false, &[]).unwrap();
         assert_eq!(resp["error"]["code"], -32601);
     }
 
     #[test]
     fn handle_notification_no_response() {
         let req = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
-        assert!(handle_request(&req, PermissionMode::Allow, false).is_none());
+        assert!(handle_request(&req, PermissionMode::Allow, false, &[]).is_none());
     }
 
     /// T12：bitable 工具在纯 handler 按 unknown tool 回错（真实调用需 socket，
@@ -1115,7 +1420,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 9, "method": "tools/call",
             "params": { "name": BITABLE_APPEND_ROW_TOOL, "arguments": { "fields": {"a": 1} } }
         });
-        let resp = handle_request(&req, PermissionMode::Allow, true).unwrap();
+        let resp = handle_request(&req, PermissionMode::Allow, true, &[]).unwrap();
         assert_eq!(resp["error"]["code"], -32602);
         assert!(resp["error"]["message"]
             .as_str()

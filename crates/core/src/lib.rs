@@ -21,6 +21,7 @@ pub mod bitable;
 mod card_session;
 mod config;
 pub mod dedup;
+pub mod delegate;
 mod dispatch;
 mod error;
 pub mod instance;
@@ -33,6 +34,7 @@ pub mod paths;
 mod permission;
 mod platform;
 pub mod render;
+pub mod sandbox;
 pub mod session_scan;
 mod types;
 
@@ -41,9 +43,11 @@ pub use backend::{Backend, ImPermissionAsk, ImPermissionHook, PermissionCapabili
 pub use bitable::{BitableApi, BitableField};
 pub use card_session::sweep_live_cards;
 pub use config::{
-    validate_workdir, Config, CotDetail, PermissionMode, QuietHours, ReplyMode, WebhookEntry,
+    validate_workdir, Config, CotDetail, DelegateEntry, PermissionMode, QuietHours, ReplyMode,
+    WebhookEntry,
 };
 pub use dedup::Dedup;
+pub use delegate::{DelegateApi, DelegateDesc, DelegateRequest};
 pub use dispatch::{Dispatcher, TaskBudgets, WebhookExposure};
 pub use error::{CoreError, Result};
 pub use message::split_message;
@@ -52,6 +56,7 @@ pub use permission::{
     default_sock_path, needs_approval, parse_reply, PermissionReply, PermissionRouter,
 };
 pub use platform::{command_card_fallback_text, Platform, PlatformCaps};
+pub use sandbox::{resolve as resolve_sandbox, SandboxPlan, SandboxSpec, SandboxTier};
 pub use types::{
     AgentChunk, CardButton, CardButtonStyle, CardPhase, CardTerminal, ConfigFormField, ConvId,
     InboundControl, InboundMessage, JoinedChat, LocalSession, MediaRef, Mention, MsgReaction,

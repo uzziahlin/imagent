@@ -141,6 +141,9 @@ impl Dispatcher {
         // T12：Bitable 数据面句柄——kind=bitable 分支实时读当前注入值（SIGHUP
         // 热改对后续请求即时生效）。
         let bitable = self.bitable.clone();
+        // v1.31：委托编排句柄——kind=delegate 分支实时读当前注入值（SIGHUP
+        // 重建委托表对后续请求即时生效）。
+        let delegate = self.delegate.clone();
         tokio::spawn(async move {
             // 鉴权基准：只接受与本进程同 uid 的连接（MCP 子进程由本进程 spawn，必然同 uid）。
             // P2-7/P5-9b 威胁模型：peer_uid 防「跨 uid 伪造」；握手 token 把「同 uid
@@ -166,6 +169,7 @@ impl Dispatcher {
                                     let permission_mode = permission_mode.clone();
                                     let conv_states = conv_states.clone();
                                     let bitable = bitable.clone();
+                                    let delegate = delegate.clone();
                                     tasks.lock().await.spawn(async move {
                                         Self::handle_permission_socket(
                                             stream,
@@ -179,6 +183,7 @@ impl Dispatcher {
                                             permission_mode,
                                             conv_states,
                                             bitable,
+                                            delegate,
                                         )
                                         .await;
                                     });
@@ -275,6 +280,7 @@ impl Dispatcher {
         permission_mode: std::sync::Arc<parking_lot::RwLock<PermissionMode>>,
         conv_states: super::ConvStates,
         bitable: super::BitableHandle,
+        delegate: super::DelegateHandle,
     ) {
         // P5-9b：读两行——首行握手 token、次行 JSON 请求。必须共用一个 BufReader：
         // 分开建会把第二行的数据吞进被丢弃的缓冲区。reader 在块内 drop 以释放
@@ -350,6 +356,12 @@ impl Dispatcher {
                 // T12：Bitable 数据面——list_fields/append_row 转注入的 BitableApi
                 //（feishu 实现），不进 router（无 IM 交互），结果一行 JSON 回写。
                 Self::handle_bitable_socket(stream, bitable, conv, &req).await;
+            }
+            SocketKind::Delegate => {
+                // v1.31：委托编排——name/prompt 转注入的 DelegateApi（main 装配的
+                // 副后端 one-shot 运行器），不进 router（无 IM 交互），结果一行
+                // JSON 回写。长任务：连接挂到副轮跑完（MCP 侧读超时已对齐预算）。
+                Self::handle_delegate_socket(stream, delegate, conv, &req).await;
             }
             SocketKind::Permission => {
                 Self::handle_permission_kind_socket(
@@ -778,6 +790,111 @@ impl Dispatcher {
         .await;
     }
 
+    /// `kind = "delegate"`（v1.31）：委托编排——解析 name/prompt/timeout_secs →
+    /// 注入的 [`crate::delegate::DelegateApi`] one-shot 执行副后端 → 结果一行
+    /// JSON 回写：`{"kind":"delegate","ok":true,"data":"<最终文本>"}` /
+    /// `{"kind":"delegate","ok":false,"error":"..."}`。不进 router（无 IM 交互）；
+    /// 连接挂到副轮跑完（MCP 侧读超时已对齐委托预算，见 mcp.rs）。
+    ///
+    /// socket 侧硬预算 = 条目预算上限（3600s）+ 120s 余量——实现侧自带的
+    /// 超时（min(工具请求, 条目上限)）先于此到达，触达即实现违约（bug 兜底，
+    /// 防连接 task 永挂）。
+    #[cfg(unix)]
+    async fn handle_delegate_socket(
+        mut stream: tokio::net::UnixStream,
+        delegate: super::DelegateHandle,
+        conv: ConvId,
+        req: &serde_json::Value,
+    ) {
+        let Some(dr) = crate::delegate::parse_delegate_request(req) else {
+            Self::write_delegate_reply(
+                &mut stream,
+                false,
+                Some("name 与 prompt 必填且非空（timeout_secs 可选，秒）"),
+            )
+            .await;
+            return;
+        };
+        let Some(api) = delegate.read().clone() else {
+            warn!(
+                target: "imagent::core",
+                conv_id = %conv.0,
+                delegate = %dr.name,
+                "delegate 请求被拒：委托编排未注入（[[delegate]] 未配置）"
+            );
+            Self::write_delegate_reply(
+                &mut stream,
+                false,
+                Some(crate::delegate::NOT_CONFIGURED_MSG),
+            )
+            .await;
+            return;
+        };
+        const DELEGATE_SOCK_HARD_BUDGET: std::time::Duration =
+            std::time::Duration::from_secs(3600 + 120);
+        match tokio::time::timeout(DELEGATE_SOCK_HARD_BUDGET, api.run(&dr)).await {
+            Ok(Ok(text)) => {
+                info!(
+                    target: "imagent::core",
+                    conv_id = %conv.0,
+                    delegate = %dr.name,
+                    chars = text.chars().count(),
+                    "delegate 副轮完成，已回包"
+                );
+                Self::write_delegate_reply(&mut stream, true, Some(&text)).await;
+            }
+            Ok(Err(err)) => {
+                warn!(
+                    target: "imagent::core",
+                    conv_id = %conv.0,
+                    delegate = %dr.name,
+                    error = %err,
+                    "delegate 副轮失败（错误文案透传调用方）"
+                );
+                Self::write_delegate_reply(&mut stream, false, Some(&err)).await;
+            }
+            Err(_) => {
+                error!(
+                    target: "imagent::core",
+                    conv_id = %conv.0,
+                    delegate = %dr.name,
+                    "delegate 副轮超出 socket 侧硬预算（实现侧超时未生效？）——按超时回包"
+                );
+                Self::write_delegate_reply(
+                    &mut stream,
+                    false,
+                    Some("委托运行超时（超出 socket 侧硬预算，副进程已被中止）"),
+                )
+                .await;
+            }
+        }
+    }
+
+    /// 写 delegate 分支的一行 JSON 回复（形态见 [`Self::handle_delegate_socket`]；
+    /// data 是字符串——副 agent 最终文本，MCP 侧按 string 取用）。
+    #[cfg(unix)]
+    async fn write_delegate_reply(
+        stream: &mut tokio::net::UnixStream,
+        ok: bool,
+        payload: Option<&str>,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        let mut resp = serde_json::json!({ "kind": "delegate", "ok": ok });
+        if ok {
+            resp["data"] = serde_json::json!(payload.unwrap_or_default());
+        } else if let Some(e) = payload {
+            resp["error"] = serde_json::json!(e);
+        }
+        let mut out = resp.to_string();
+        out.push('\n');
+        // 副轮文本可到几十 KB——写超时放宽到 30s（bitable 的 10s 是短回包口径）。
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let _ = stream.write_all(out.as_bytes()).await;
+            let _ = stream.flush().await;
+        })
+        .await;
+    }
+
     /// `kind = "permission"`（缺省）：原有审批语义，带 request_id。
     ///
     /// - **P1-3**：send_text 失败时回写 deny 并 return（不挂 pending——否则用户看不到
@@ -1036,13 +1153,15 @@ impl Dispatcher {
 }
 
 /// socket 请求的 kind 分类（纯函数，便于单测）：ask=终端问答、notify=单向通知、
-/// bitable=多维表格数据面（T12）、其余（含缺省 "permission"）=IM 权限审批。
+/// bitable=多维表格数据面（T12）、delegate=委托编排（v1.31）、其余（含缺省
+/// "permission"）=IM 权限审批。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SocketKind {
     Permission,
     Ask,
     Notify,
     Bitable,
+    Delegate,
 }
 
 pub(crate) fn classify_socket_kind(kind: &str) -> SocketKind {
@@ -1050,6 +1169,7 @@ pub(crate) fn classify_socket_kind(kind: &str) -> SocketKind {
         "ask" => SocketKind::Ask,
         "notify" => SocketKind::Notify,
         "bitable" => SocketKind::Bitable,
+        "delegate" => SocketKind::Delegate,
         _ => SocketKind::Permission,
     }
 }
@@ -1195,8 +1315,9 @@ mod notify_tests {
         assert_eq!(classify_socket_kind("notify"), SocketKind::Notify);
         assert_eq!(classify_socket_kind("ask"), SocketKind::Ask);
         assert_eq!(classify_socket_kind("bitable"), SocketKind::Bitable);
+        assert_eq!(classify_socket_kind("delegate"), SocketKind::Delegate);
         assert_eq!(classify_socket_kind("permission"), SocketKind::Permission);
-        // 未知/缺省 kind 回落审批语义（与旧协议兼容）。
+
         assert_eq!(classify_socket_kind("unknown"), SocketKind::Permission);
         assert_eq!(classify_socket_kind(""), SocketKind::Permission);
     }

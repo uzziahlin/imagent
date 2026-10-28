@@ -31,7 +31,7 @@ imagent 是一个常驻网关进程：监听 IM 私聊 / 群聊消息 → 鉴权
 ## 特性
 
 - 🌉 **平台 / 后端双抽象**：换 IM 只加 adapter，换 agent 只加 impl。
-- 🔐 **安全第一**：发送者白名单 + 会话（群）白名单 + `allowed_tools` 收敛 + workdir 锁定 + **IM 内权限审批闭环**（按钮卡片 / 文本 y/n——按钮卡片仅飞书）。
+- 🔐 **安全第一**：发送者白名单 + 会话（群）白名单 + `allowed_tools` 收敛 + workdir 锁定 + **IM 内权限审批闭环**（按钮卡片 / 文本 y/n——按钮卡片仅飞书）+ **OS 级 agent 沙箱**（v1.32 默认开，仅 claude-cli：内核层 deny 状态目录 `~/.imagent`（审批 sock/token/mcp json 例外）与持久化热点写（`~/.ssh`、shell rc、LaunchAgents）——Bash/子进程间接读取同被拦；`strict` 档再把写收敛到 workdir/临时目录；macOS Seatbelt / Linux bwrap，`/doctor` 可见档位）。
 - 💬 **会话连续**：per-chat session 持久化（SQLite），重启可续；`--resume`；`/switch` 多命名会话；`/resume` 统一列表无感接管历史/电脑端 Claude Code 会话。
 - ⏰ **定时任务（/cron）**：5 字段 cron 表达式（本地时区含 DST）+ store 持久化，到期消息走与手打完全相同的鉴权/审批管线——日报、巡检、定时批处理一句话建好；停机补跑策略 `cron_catchup = one|off|all`（逐周期补跑上限 3 条 / 陈旧跳过 / 触发一次）。
 - 📡 **Webhook 入站**：`POST /hook/<token>` 把 CI 失败、监控告警等外部事件注入指定会话——与手打消息同权走鉴权/审批管线（token 路径鉴权 + HMAC 验签 + 两层防重放 + 会话白名单，无旁路；非 loopback 绑定未配 secret 拒绝启动），agent 接事件自动排障、审批卡上放行修复。
@@ -44,6 +44,7 @@ imagent 是一个常驻网关进程：监听 IM 私聊 / 群聊消息 → 鉴权
 - 🛠️ **IM 内运维**：`/status` `/doctor` `/reconnect` `/config`（COT 三档展示 off/brief/detailed 等热改；SIGHUP 热载工具白名单/审批集/管理员名单/压缩阈值）。
 - 📄 **飞书生态**（一等公民）：CardKit 真流式卡片（分阶段 footer + 工具 ⏳/✅ 实时行 + ⏹ 终止按钮）、审批/问题/命令标题卡（按钮 primary/danger + flow 自适应布局）、`/config` 下拉表单卡、邮箱掩码防租户审计拦截、云文档评论 @bot 触发（同评论线程回复）、合并转发聊天记录自动转录、**群聊上下文注入**（群消息触发轮次自动拉本群最近 N 条消息作前置上下文——Slack 线程上下文的飞书等价物，`feishu_group_context_messages`，默认 10、0=关闭）、**群里回复 bot 消息发图/文件 = 显式定向**（豁免 @，手机端纯图片可达）、**多维表格数据面**（agent 经 `bitable_list_fields` / `bitable_append_row` 工具把任务清单、巡检结果、成本台账等结构化产出直接写进飞书 Bitable——Slack 生态无等价物，见[多维表格数据面](#多维表格数据面agent-的结构化产出)）。
 - 💻 **终端 agent 反向接入（ask_via_im）**：电脑终端上任意 agent 需要你决策时，把问题转发到飞书——人不在电脑前也能在手机上点按钮作答；多 agent 并发按 request_id 精确分发（见[终端 agent 接入](#终端-agent-接入ask_via-im人不在电脑前也能问你)）。
+- 🔀 **委托编排（[[delegate]] + /delegate）**：把命名副后端（codex / gemini / claude-cli）配成「子任务执行器」——agent 在一轮内经 `delegate_run` 工具自行 fan-out（如 Claude 写完代码自动叫 codex 审查），用户也可 `/delegate <name> <子任务>` 显式派活。副轮 one-shot、不占主会话上下文；工具面**缺省只读三件套**（Read/Grep/Glob——codex 映射 read-only 沙箱、claude-cli 映射 `--allowedTools` 且危险工具被拒）、预算 agent 只能调低、全局并发闸 4、输出头尾窗截断；SIGHUP 热改（见 CHANGELOG v1.31.0 已知限制：副轮用量暂不计入 /stats、claude 副轮会话在本机 /resume 列表可见）。
 - 🧩 **Profile 多实例**：`--profile` 一部署多 bot 身份（config/db/socket/媒体全隔离）。
 - 🛡️ **限流熔断**：`sendmessage` 服从式退避（防封号，不绕风控）。
 - 🎨 **媒体收发**：图片 / 文件（AES-128-ECB + CDN，协议强制；仅 iLink——飞书走 OpenAPI 上传，wecom 暂不支持媒体发送）；下载/转码全程超时与大小上限，媒体目录 7 天自动 GC。
@@ -128,7 +129,7 @@ cargo build --release
 ```bash
 mkdir -p ~/.imagent
 cat > ~/.imagent/config.toml <<'EOF'
-default_workdir = "/absolute/path/to/agent/workspace"  # 必填，agent 的 cwd（非沙箱：不限制可读路径，靠 allowed_tools + permission_mode 兜底）
+default_workdir = "/absolute/path/to/agent/workspace"  # 必填，agent 的 cwd（OS 级沙箱见 agent_sandbox；靠 allowed_tools + permission_mode 兜底）
 allowed_senders = []        # 留空 = 发现模式（先看日志拿你的 from_user_id）
 # allowed_tools 不写 = 全部工具（不收敛）；要白名单就显式列，如 ["Read","Edit"]；执行类建议配 permission_mode="ask" 过审
 # permission_mode = "auto"  # 缺省=auto：claude-cli=透传 claude 原生 auto 模式(分类器自动放行安全操作,高危进 IM)+审批闭环；其余后端=off；显式 ask=每个提示都进 IM
@@ -146,6 +147,23 @@ allowed_senders = []        # 留空 = 发现模式（先看日志拿你的 from
 # feishu_thread_active_window_secs = 1800  # 话题群免@窗口(秒)：话题内近期有消息则豁免群消息须@bot；默认30分钟，0=关闭
 # feishu_bitable_app_token = "bascnXXX"    # 多维表格数据面（仅 feishu + claude-cli）：app_token + table_id 齐备才启用，
 # feishu_bitable_table_id  = "tblXXX"      #   agent 获得 bitable_list_fields/bitable_append_row 工具可向该表写行（建议专用表）
+# ===== OS 级 agent 沙箱（v1.32，仅 claude-cli；默认 auto）=====
+# auto  = 内核层 deny：状态目录 ~/.imagent（读+写；例外审批 sock/token/每轮 mcp json）
+#         + 持久化热点写（~/.ssh、shell rc、LaunchAgents；读保留）——正常开发零影响；
+# strict = 再把写收敛到 workdir/临时目录/~/.claude/agent_sandbox_extra_write（包管理器
+#          缓存 ~/.npm、~/.cargo 等需显式加清单）；off = 关闭。
+# macOS = sandbox-exec（Seatbelt）；Linux = bwrap（未安装降级 off+warn）。SIGHUP 热改。
+# agent_sandbox = "auto"
+# agent_sandbox_extra_write = []   # strict 档额外可写目录（绝对路径）
+# 委托编排（v1.31）：配置后 claude-cli agent 获得 delegate_run 工具、/delegate 命令可用——
+# 把子任务 fan-out 给副后端（如 Claude 写完叫 codex 审）。副轮缺省只读（Read/Grep/Glob）、
+# 无 IM 审批、无会话续接；SIGHUP 热改生效。
+# [[delegate]]
+# name = "review"              # 委托名（唯一；delegate_run / /delegate 按名调用）
+# agent = "codex"              # 副后端：codex | gemini | claude-cli（one-shot 系）
+# allowed_tools = ["Read", "Grep", "Glob"]   # 缺省只读三件套；要放宽显式列（风险自负）
+# model = "gpt-5-codex"        # 可选模型
+# timeout_secs = 600           # 单次预算（秒，缺省 600，上限 3600；工具只能调低）
 # platform = "feishu"                # wecom/feishu 经 config 凭据接入（见下）
 
 # ===== 事件入站（v1.20 webhook；v1.21 防护套件 + GitHub 原生事件；v1.24 防重放）=====
@@ -383,6 +401,7 @@ imagent start
 | `/compact` | 软压缩上下文（摘要 + 重置 + 延续）；自动触发**默认关闭**，开启方式见[用量护栏](#设计取舍)：水位（input+缓存）达 模型窗口 × `auto_compact_window_ratio`（缺省 80%） |
 | `/retry` | 重发最近一轮指令（失败/中断后一键续接） |
 | `/model [名称\|default]` | 查看/热切模型（切换需管理员；claude 系 / codex `-m` / gemini `-m` 全支持） |
+| `/delegate [list\|<name> <子任务>]` | 委托编排：列出已配置副后端 / 把子任务 one-shot 交给命名副 agent（结果带【委托·name】前缀，不占主会话上下文；需 config `[[delegate]]`） |
 | `/cd [path]` | 切工作目录（`/resume` 本机会话列表随之变化） |
 | `/ws list\|save\|use\|remove` | 命名工作空间 |
 | `/img <path>` `/file <path>` | 发 workdir 内图片 / 任意文件到 IM |
@@ -466,6 +485,7 @@ imagent mcp-ask --print-config
 - **工具收敛**：`allowed_tools` 可选（缺省 = 全部工具，`[]`/`["*"]` 同义不限制；显式清单 = 白名单）；workdir 用 `current_dir` 锁定，危险操作靠 `permission_mode = "ask"` IM 审批兜底。
 - **状态目录隔离**：`hide_state_dir_from_agent`（默认开，仅 claude-cli）每轮注入 `--settings` deny 规则把 `~/.imagent`（含 profile）挡在 agent 读视野外，防提示注入后直读 `imagent.db`；Bash/子进程间接读取仍属同 uid 进程边界（见 [SECURITY.md 威胁模型](SECURITY.md#威胁模型与边界必读)）。
 - **权限审批**：危险操作 IM approve/deny（文本 / 按钮卡片）；卡片 markdown 层 `<at>` 注入面全路径转义（bot 不可被借以 @ 任意租户用户）。
+- **OS 级沙箱（v1.32 `agent_sandbox`，默认 `auto`，仅 claude-cli）**：macOS Seatbelt / Linux bwrap 包装 agent 子进程——状态目录读+写内核级 deny（例外仅审批 sock/token/每轮 mcp json，审批闭环不 break）、持久化热点（`~/.ssh`、shell rc、LaunchAgents）写 deny（读保留）；`strict` 档把写收敛到 workdir/临时目录/`~/.claude`/`agent_sandbox_extra_write`。杀进程语义兼容（进程组整组收割）。Linux 无 bwrap 降级 off + warn；`/doctor` 安全分组展示档位。
 - **store 加固**：文件 0600 / 目录 0700；CDN 下载 SSRF 白名单；服务定义（内嵌 secret）0600。
 - **威胁模型**：审批闭环约束「agent 发起的工具调用」，不约束「同 uid 进程的读写能力」——agent 子进程与 imagent 同用户运行，提示注入场景下仍有残留攻击面。**多人群白名单部署前务必读 [SECURITY.md「威胁模型与边界」](SECURITY.md#威胁模型与边界必读)**。
 - 详见 [`SECURITY.md`](SECURITY.md)。
@@ -485,6 +505,8 @@ imagent mcp-ask --print-config
 | v1.18 | ✅ | `/cron` 定时任务（头牌）+ 群媒体「回复即定向」+ 转向回执上卡 |
 | v1.20 | ✅ | **Webhook 入站**（事件驱动：CI/告警→会话→审批）+ ACP 窗口自学习 + 崩溃轮次恢复（/retry 续跑）+ compact 卡片化 + /cron 停机补跑 |
 | v1.19 | ✅ | 深度 review 双批修复（42 项）+ 事件 intake 与媒体 IO 解耦 + **排队消息持久化（崩溃不丢）** + update_card 状态机化 / ConvState 收敛 + **自动压缩比例档（窗口 80%）** + housekeeping（媒体 GC） |
+| v1.31 | ✅ | **委托编排批**：`[[delegate]]` + `delegate_run` MCP 工具 + `/delegate` 命令——多 agent fan-out（Claude 写 / codex 审）、副轮缺省只读、预算只降不升、socket `kind=delegate` 第三通路 |
+| v1.32 | ✅ | **OS 级沙箱批**：`agent_sandbox`（auto/strict/off，默认 auto）——状态目录 + 持久化热点内核级 deny（Seatbelt/bwrap，真机校准）、strict 写收敛、`/doctor` 档位、SECURITY.md 威胁模型升级 |
 
 > **当前状态**：以 [CHANGELOG.md](CHANGELOG.md) 最新版本为准（历史复审记录见 `docs/CODE_REVIEW_*.md`，最新一轮 [`docs/CODE_REVIEW_v13.md`](docs/CODE_REVIEW_v13.md)）。质量基线：`cargo test --workspace` 全绿、clippy 零警告、CI 双平台 + audit/deny。
 
