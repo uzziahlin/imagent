@@ -4,7 +4,7 @@
 [workspace]
 resolver = "2"
 exclude = ["fuzz"]  # cargo-fuzz 独立 crate（需 nightly，E-7）
-members = ["crates/store", "crates/core", "crates/claude", "crates/codex", "crates/gemini", "crates/ilink", "crates/wecom", "crates/feishu", "crates/relay"]
+members = ["crates/store", "crates/core", "crates/claude", "crates/codex", "crates/gemini", "crates/ilink", "crates/wecom", "crates/feishu", "crates/relay", "crates/web"]
 
 [workspace.package]
 version = "1.32.0"
@@ -92,6 +92,8 @@ imagent-claude = { path = "crates/claude" }
 imagent-codex = { path = "crates/codex" }
 imagent-gemini = { path = "crates/gemini" }
 imagent-store = { path = "crates/store" }
+# Web 驾驶舱 M2：网关侧 WebPlatform（出站 WS 客户端连 relay）。
+imagent-web = { path = "crates/web" }
 tokio = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }

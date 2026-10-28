@@ -478,6 +478,18 @@ pub struct Config {
     /// 关闭后私聊同样完全静默。**改动需重启**（同 prefs 注入时机）。
     #[serde(default = "default_stranger_p2p_hint")]
     pub stranger_p2p_hint: bool,
+    /// Web 驾驶舱（M2，仅 `platform = "web"`）：relay 网关侧 WS 地址，形如
+    /// `wss://<ecs>:8443/imagent/gateway`（公网入口由 Caddy TLS 终结并 strip
+    /// `/imagent` 前缀；本地测试可 `ws://127.0.0.1:<port>/gateway`）。网关只发
+    /// 出站连接，Mac 零监听端口。gateway token 不入 config（敏感）——走环境
+    /// 变量 `IMAGENT_WEB_GATEWAY_TOKEN`（与 relay 侧 `IMAGENT_RELAY_GATEWAY_TOKEN`
+    /// 同值），对齐飞书 `IMAGENT_FEISHU_APP_SECRET` 先例。
+    #[serde(default)]
+    pub web_relay_url: Option<String>,
+    /// Web 驾驶舱：无 convId 的浏览器消息落到的默认会话名（conv 形如
+    /// `web:<name>`）。缺省 "default"。
+    #[serde(default)]
+    pub web_default_session: Option<String>,
     /// 回复形态偏好（P7-A4；默认 card）。text = 不建卡走纯文本流（/config 可热改）。
     /// **改动需重启**：启动偏好（prefs）在启动期注入 Dispatcher，SIGHUP 不热载
     ///（/config 的运行时热改不受影响）。
@@ -1362,7 +1374,9 @@ allowed_senders = []        # 留空 = 发现模式（只打日志记录入站 s
 # admin_senders = []          # 可 /allow 等管理命令的管理员 sender；空=无人是管理员(IM 内管理命令不可用，须 CLI/setup 配置)
 # allowed_tools = ["*"]                      # 缺省=全部工具（不收敛）；要白名单显式列（如 ["Read","Edit"]）；执行类建议配 permission_mode="ask"
 agent = "claude-cli"         # claude-cli(默认) | claude-acp(Claude ACP长驻子进程) | acp(任意ACP agent,配acp_command) | codex | gemini
-platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人) | feishu(飞书,配 feishu_app_id + 环境变量 IMAGENT_FEISHU_APP_SECRET)
+platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人) | feishu(飞书,配 feishu_app_id + 环境变量 IMAGENT_FEISHU_APP_SECRET) | web(网页驾驶舱,配 web_relay_url + 环境变量 IMAGENT_WEB_GATEWAY_TOKEN)
+# web_relay_url = "wss://your-ecs:8443/imagent/gateway"   # 仅 platform="web"：ECS relay 网关端点（Caddy TLS 终结 + strip /imagent 前缀）；gateway token 走环境变量 IMAGENT_WEB_GATEWAY_TOKEN（敏感不入本文件）；web 消息 sender 恒为 web:user，需加入 allowed_senders（或 admin_senders）白名单才会被处理
+# web_default_session = "default"   # 仅 platform="web"：无 convId 的浏览器消息落到的默认会话名（conv 形如 web:<name>）
 # feishu_app_id = "cli_xxx"            # 飞书自建应用 app_id（仅 platform="feishu"；app_secret 走环境变量，keyring 为后续 P2）
 # feishu_base_url = "https://open.feishu.cn"  # 可选，默认 https://open.feishu.cn；Lark 国际版 https://open.larksuite.com（MVP 不覆盖）
 # feishu_require_mention_in_group = true       # 群消息须 @bot 才处理（默认 true：客户端过滤 + 剥离 @bot 占位；false=全收，过滤交给事件订阅 scope）

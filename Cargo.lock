@@ -1589,6 +1589,7 @@ dependencies = [
  "imagent-gemini",
  "imagent-ilink",
  "imagent-store",
+ "imagent-web",
  "imagent-wecom",
  "parking_lot",
  "reqwest 0.12.28",
@@ -1744,6 +1745,22 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "imagent-web"
+version = "1.32.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "imagent-core",
+ "imagent-relay",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
  "tracing",
 ]
 

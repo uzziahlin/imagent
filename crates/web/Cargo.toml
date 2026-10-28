@@ -1,0 +1,25 @@
+[package]
+name = "imagent-web"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+imagent-core = { path = "../core" }
+tokio = { workspace = true }
+# P3-g 同款停机通路（对齐 wecom）：平台 drop 即 cancel，后台 client / sync
+# responder 任务感知退出，不再无限重连。
+tokio-util = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# 回环集成测试（tests/web_loopback.rs）：起真 relay（随机端口）+ 模拟浏览器。
+imagent-relay = { path = "../relay" }

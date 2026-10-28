@@ -658,9 +658,13 @@ async fn main() -> Result<()> {
                 .as_deref()
                 .filter(|p| !p.is_empty())
                 .unwrap_or(&config.platform);
-            if platform_name != "ilink" && platform_name != "wecom" && platform_name != "feishu" {
+            if platform_name != "ilink"
+                && platform_name != "wecom"
+                && platform_name != "feishu"
+                && platform_name != "web"
+            {
                 return Err(anyhow!(
-                    "未知 platform={platform_name}，支持 ilink | wecom | feishu"
+                    "未知 platform={platform_name}，支持 ilink | wecom | feishu | web"
                 ));
             }
             let platform = build_platform(platform_name, &config, store.clone()).await?;
@@ -1422,6 +1426,9 @@ fn build_backend(
 /// - `"feishu"` → [`imagent_feishu::FeishuPlatform`]：`feishu_app_id` 取自 config，
 ///   `app_secret` 取自环境变量 `IMAGENT_FEISHU_APP_SECRET`（keyring bootstrap 为后续 P2），
 ///   默认 `base_url = https://open.feishu.cn`。
+/// - `"web"` → [`imagent_web::WebPlatform`]（Web 驾驶舱 M2）：`web_relay_url` 取自
+///   config；gateway token 取自环境变量 `IMAGENT_WEB_GATEWAY_TOKEN`（敏感不入
+///   config.toml，与飞书先例同款）；`web_default_session` 缺省 "default"。
 /// - 其它（含默认 `"ilink"`）→ [`imagent_ilink::ILinkPlatform`]，
 ///   行为与单平台时期完全一致（读 store 的 ilink 凭据 + 扫码登录的 client）。
 async fn build_platform(
@@ -1502,6 +1509,26 @@ async fn build_platform(
                 config.feishu_urgent_on_ask,
                 config.feishu_group_context_messages,
             )?))
+        }
+        "web" => {
+            // Web 驾驶舱 M2：relay 地址（非敏感）走 config；gateway token 走
+            // env（敏感不入 config.toml——对齐飞书 IMAGENT_FEISHU_APP_SECRET
+            // 先例）。缺失直接报启动错误（fail-closed，relay 无匿名形态）。
+            let relay_url = config.web_relay_url.clone().ok_or_else(|| {
+                anyhow!("platform=web 需在 config.toml 配置 web_relay_url（如 wss://<ecs>:8443/imagent/gateway）")
+            })?;
+            let gateway_token = std::env::var("IMAGENT_WEB_GATEWAY_TOKEN").map_err(|_| {
+                anyhow!("platform=web 需设置环境变量 IMAGENT_WEB_GATEWAY_TOKEN（与 relay 侧 IMAGENT_RELAY_GATEWAY_TOKEN 同值）")
+            })?;
+            let default_session = config
+                .web_default_session
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
+            Ok(Arc::new(imagent_web::WebPlatform::new(
+                relay_url,
+                gateway_token,
+                default_session,
+            )))
         }
         _ => {
             // 默认 ilink：保持既有行为。

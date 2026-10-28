@@ -53,7 +53,8 @@ pub use error::{CoreError, Result};
 pub use message::split_message;
 pub use metrics::Metrics;
 pub use permission::{
-    default_sock_path, needs_approval, parse_reply, PermissionReply, PermissionRouter,
+    default_sock_path, is_explicit_reply_word, needs_approval, parse_reply, PermissionReply,
+    PermissionRouter,
 };
 pub use platform::{command_card_fallback_text, Platform, PlatformCaps};
 pub use sandbox::{resolve as resolve_sandbox, SandboxPlan, SandboxSpec, SandboxTier};
