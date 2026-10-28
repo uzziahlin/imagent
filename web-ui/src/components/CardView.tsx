@@ -7,6 +7,7 @@ import type {
   TodoStatus,
   ToolCallPayload,
 } from "../lib/protocol";
+import { CopyButton } from "./CopyButton";
 import { MarkdownText } from "./MarkdownText";
 
 const PHASE_META: Record<CardPhase, { label: string; cls: string }> = {
@@ -202,7 +203,10 @@ const Todos = memo(
   (prev, next) => todosEqual(prev.todos, next.todos),
 );
 
-/** markdown 正文：按 text 值 memo（字符串值比较，流式时间线/页脚变化不重渲）。 */
+/** markdown 正文：按 text 值 memo（字符串值比较，流式时间线/页脚变化不重渲）。
+ *  key={text} + animate-fade-in：card_patch 正文变化时轻微淡入（120ms、起始
+ *  0.55——流式高频补丁下是柔和的「呼吸更新」而非闪烁；prefers-reduced-motion
+ *  下由全局规则禁用）。 */
 const MarkdownBody = memo(function MarkdownBody({
   text,
   streaming,
@@ -214,7 +218,7 @@ const MarkdownBody = memo(function MarkdownBody({
     return null;
   }
   return (
-    <div>
+    <div key={text} className="animate-fade-in">
       <MarkdownText source={text} />
       {streaming && (
         <span className="ml-0.5 inline-block animate-pulse align-baseline text-ok" aria-label="生成中">
@@ -248,9 +252,10 @@ const Footer = memo(function Footer({
 });
 
 /**
- * 工具/任务卡片：头部 phase 徽标 + task_digest；正文上方为执行链时间线
- * （tool_calls）与折叠的思考过程（thoughts）；markdown 正文过 DOMPurify
- * 渲染，流式光标在正文末尾；footer 为终态/时长/用量/排队提示。流式更新 =
+ * 工具/任务卡片：头部 phase 徽标 + task_digest（右端整段复制）；正文上方为
+ * 执行链时间线（tool_calls）与折叠的思考过程（thoughts）；markdown 正文经
+ * MarkdownText 渲染（rehype-sanitize 输出层消毒 + highlight.js 语法高亮），
+ * 流式光标在正文末尾；footer 为终态/时长/用量/排队提示。流式更新 =
  * 同 messageId 的 card_patch 整卡替换（上层已归并），子区块 memo 按值比较。
  */
 export function CardView({ entry }: { entry: CardEntry }) {
@@ -264,7 +269,7 @@ export function CardView({ entry }: { entry: CardEntry }) {
       : "border-line";
 
   return (
-    <div className={`rounded-2xl border bg-panel p-3 ${borderCls}`}>
+    <div className={`group rounded-2xl border bg-panel p-3 ${borderCls}`}>
       <div className="mb-2 flex items-center gap-2">
         <span className={`shrink-0 rounded-full px-2 py-0.5 text-xs font-medium ${phase.cls}`}>
           {phase.label}
@@ -272,6 +277,10 @@ export function CardView({ entry }: { entry: CardEntry }) {
         {card.task_digest && (
           <span className="min-w-0 truncate text-xs text-faint">{card.task_digest}</span>
         )}
+        {/* 整段复制卡片正文：桌面 hover 显现 / 移动常显（可长按） */}
+        <span className="ml-auto shrink-0 opacity-60 transition-opacity duration-100 focus-within:opacity-100 md:opacity-0 md:group-hover:opacity-100">
+          <CopyButton getText={() => card.text} label="复制整段" />
+        </span>
       </div>
 
       {card.error && (

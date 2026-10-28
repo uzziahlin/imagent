@@ -242,8 +242,15 @@ describe("reducer", () => {
   it("初始状态含默认 conv，无消息", () => {
     const s = initialState();
     expect(orderOf(s)).toEqual([DEFAULT_CONV]);
-    expect(convsOf(s)[DEFAULT_CONV]).toEqual({ entries: [], pending: [], lastPreview: "", lastAt: 0 });
+    expect(convsOf(s)[DEFAULT_CONV]).toEqual({
+      entries: [],
+      pending: [],
+      lastPreview: "",
+      lastAt: 0,
+      unread: 0,
+    });
     expect(s.machineOnline).toBe(false);
+    expect(s.currentConv).toBe(DEFAULT_CONV);
   });
 
   it("text 帧追加一条助手消息", () => {
@@ -469,6 +476,91 @@ describe("reducer", () => {
     }));
     const s = run(initialState(), ...actions);
     expect(convsOf(s)[DEFAULT_CONV].entries).toHaveLength(205);
+  });
+});
+
+describe("reducer 未读计数（侧栏徽标数据源）", () => {
+  it("非当前 conv 收到 text → unread 累加；当前 conv 与用户回显不计", () => {
+    let s = initialState();
+    s = run(s, { type: "frame", frame: frame(TEXT_FRAME("当前会话消息")) });
+    expect(convsOf(s)[DEFAULT_CONV].unread).toBe(0);
+    s = run(s, { type: "frame", frame: frame(TEXT_FRAME("后台消息", "web:side")) });
+    expect(convsOf(s)["web:side"].unread).toBe(1);
+    // 用户回显（即使落非当前 conv——现实中不会发生）也不计
+    s = run(s, { type: "send_echo", convId: "web:side", text: "用户回显不计数" });
+    expect(convsOf(s)["web:side"].unread).toBe(1);
+    s = run(s, { type: "frame", frame: frame(TEXT_FRAME("又一条", "web:side")) });
+    expect(convsOf(s)["web:side"].unread).toBe(2);
+  });
+
+  it("select_conv 切当前会话并清零未读（同 conv 重复点选幂等）", () => {
+    let s = run(initialState(), { type: "frame", frame: frame(TEXT_FRAME("后台消息", "web:side")) });
+    s = run(s, { type: "select_conv", convId: "web:side" });
+    expect(s.currentConv).toBe("web:side");
+    expect(convsOf(s)["web:side"].unread).toBe(0);
+    // 切走后新消息重新计未读
+    s = run(s, { type: "select_conv", convId: DEFAULT_CONV });
+    s = run(s, { type: "frame", frame: frame(TEXT_FRAME("再来", "web:side")) });
+    expect(convsOf(s)["web:side"].unread).toBe(1);
+    s = run(s, { type: "select_conv", convId: "web:side" });
+    expect(convsOf(s)["web:side"].unread).toBe(0);
+  });
+
+  it("card：已存在 conv 的新卡片插入（非当前）计未读；card_patch / sync 重放替换不计", () => {
+    let s = run(initialState(), { type: "frame", frame: frame(TEXT_FRAME("开场", "web:side")) });
+    s = run(
+      s,
+      { type: "frame", frame: frame(CARD_FRAME({ convId: "web:side", messageId: "m1", text: "任务卡" })) },
+    );
+    expect(convsOf(s)["web:side"].unread).toBe(2); // text + 新卡片插入
+    // card_patch 同 messageId 替换：不追加
+    s = run(s, {
+      type: "frame",
+      frame: frame(
+        CARD_FRAME({ type: "card_patch", convId: "web:side", messageId: "m1", text: "完成", terminal: "done" }),
+      ),
+    });
+    expect(convsOf(s)["web:side"].unread).toBe(2);
+    // 重连 sync 重放（card 类型、同 messageId）→ 覆盖语义：不追加
+    s = run(s, {
+      type: "frame",
+      frame: frame(
+        CARD_FRAME({ type: "card", convId: "web:side", messageId: "m1", text: "完成", terminal: "done" }),
+      ),
+    });
+    expect(convsOf(s)["web:side"].unread).toBe(2);
+  });
+
+  it("card 首次物化 conv（刷新后 sync 恢复 / 新会话首卡）不计未读——刷新不点亮全部会话", () => {
+    let s = initialState();
+    s = run(
+      s,
+      { type: "frame", frame: frame(CARD_FRAME({ convId: "web:synced", messageId: "m9", text: "恢复的卡片", terminal: "done" })) },
+    );
+    expect(convsOf(s)["web:synced"].unread).toBe(0);
+    // conv 已存在后的新卡片才计数
+    s = run(
+      s,
+      { type: "frame", frame: frame(CARD_FRAME({ convId: "web:synced", messageId: "m10", text: "新任务", terminal: "done" })) },
+    );
+    expect(convsOf(s)["web:synced"].unread).toBe(1);
+  });
+
+  it("select_machine：currentConv 回该机器默认会话并清其未读", () => {
+    let s = run(
+      initialState(),
+      { type: "frame", frame: frame(`{"v":1,"type":"machines","online":["home-mac","work-mac"]}`) },
+    );
+    // 首帧 machines 自动选中 home-mac；给 work-mac 的默认会话攒一条未读
+    s = run(s, {
+      type: "frame",
+      frame: frame(`{"v":1,"type":"text","convId":"web:default","text":"hi","machine":"work-mac"}`),
+    });
+    expect(convsOf(s, "work-mac")[DEFAULT_CONV].unread).toBe(1);
+    s = run(s, { type: "select_machine", machine: "work-mac" });
+    expect(s.currentMachine).toBe("work-mac");
+    expect(s.currentConv).toBe(DEFAULT_CONV);
+    expect(convsOf(s, "work-mac")[DEFAULT_CONV].unread).toBe(0);
   });
 });
 

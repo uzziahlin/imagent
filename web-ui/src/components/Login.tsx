@@ -95,7 +95,7 @@ export function Login({
           {error && <p className="mt-2 text-xs text-err">{error}</p>}
           <button
             type="submit"
-            className="mt-4 w-full rounded-xl bg-emerald-600 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-emerald-500 active:bg-emerald-700"
+            className="press mt-4 w-full rounded-xl bg-emerald-600 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-emerald-500 active:bg-emerald-700"
           >
             连接
           </button>

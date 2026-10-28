@@ -23,6 +23,29 @@ export default {
         info: "var(--c-info)",
         think: "var(--c-think)",
       },
+      // 微动效 keyframes（prefers-reduced-motion 禁用见 index.css）：
+      // fade-in：卡片正文流式补丁的轻微淡入（120ms，起始 0.55 避免流式高频闪烁）
+      // slide-in：审批弹层滑入（150ms ease-out）
+      // breathe：在线点呼吸（2.2s 缓慢缩放+透明度；仅 ready/在线态使用）
+      keyframes: {
+        "fade-in": {
+          "0%": { opacity: "0.55" },
+          "100%": { opacity: "1" },
+        },
+        "slide-in": {
+          "0%": { opacity: "0", transform: "translateY(-10px)" },
+          "100%": { opacity: "1", transform: "translateY(0)" },
+        },
+        breathe: {
+          "0%, 100%": { opacity: "1", transform: "scale(1)" },
+          "50%": { opacity: "0.5", transform: "scale(1.3)" },
+        },
+      },
+      animation: {
+        "fade-in": "fade-in 120ms ease-out",
+        "slide-in": "slide-in 150ms ease-out",
+        breathe: "breathe 2.2s ease-in-out infinite",
+      },
     },
   },
   plugins: [],

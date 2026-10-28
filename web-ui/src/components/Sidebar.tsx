@@ -1,11 +1,14 @@
 import { useMemo, useState, type FormEvent, type KeyboardEvent } from "react";
 import { convDisplayName, DEFAULT_MACHINE, normalizeExpiryMs } from "../lib/protocol";
 
-/** 侧边栏会话项数据（App 从 state 派生）：conv 全名 + 最后消息预览/时间。 */
+/** 侧边栏会话项数据（App 从 state 派生）：conv 全名 + 最后消息预览/时间 +
+ *  未读计数（非当前 conv 收到新消息时 reducer 累加，点选清零）。 */
 export type ConvItem = {
   convId: string;
   preview: string;
   at: number;
+  /** 未读条数（0 = 无徽标）。 */
+  unread?: number;
 };
 
 /** 会话过期横幅阈值：剩余不足 3 天开始提示。 */
@@ -212,8 +215,21 @@ export function Sidebar({
                 <span className="min-w-0 flex-1 truncate text-sm font-medium">
                   {convDisplayName(item.convId)}
                 </span>
-                {active && (
-                  <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500" aria-hidden="true" />
+                {/* 未读徽标优先于当前项小圆点（有未读必非当前项） */}
+                {item.unread && item.unread > 0 ? (
+                  <span
+                    className="flex h-4 min-w-[1rem] shrink-0 items-center justify-center rounded-full bg-emerald-500 px-1 text-[10px] font-semibold leading-none text-white"
+                    aria-label={`${item.unread} 条未读`}
+                  >
+                    {item.unread > 99 ? "99+" : item.unread}
+                  </span>
+                ) : (
+                  active && (
+                    <span
+                      className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500"
+                      aria-hidden="true"
+                    />
+                  )
                 )}
               </span>
               <span className="mt-0.5 flex items-baseline gap-2">

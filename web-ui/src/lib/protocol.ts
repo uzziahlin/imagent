@@ -393,10 +393,11 @@ export function parseFrame(raw: string): InboundFrame | null {
 // 应用状态（reducer 归约，纯函数）
 // ---------------------------------------------------------------------------
 
-/** 消息流条目：按到达顺序渲染，三类 + 审批终态记录。 */
+/** 消息流条目：按到达顺序渲染，三类 + 审批终态记录。user/text 带 at（到达
+ *  时间戳，ms epoch，UI 显示 HH:MM；reducer 追加时统一盖戳）。 */
 export type StreamEntry =
-  | { kind: "user"; key: string; text: string }
-  | { kind: "text"; key: string; text: string; hint?: string }
+  | { kind: "user"; key: string; text: string; at?: number }
+  | { kind: "text"; key: string; text: string; hint?: string; at?: number }
   | { kind: "card"; key: string; messageId: string; card: CardPayload; state: CardFrameState }
   | { kind: "approval_note"; key: string; text: string; message?: string };
 
@@ -419,6 +420,10 @@ export type ConvState = {
   lastPreview: string;
   /** 最后一条消息到达时间（Date.now() 毫秒，仅 UI 展示用）。 */
   lastAt: number;
+  /** 未读计数（侧栏徽标）：非当前 conv 收到新消息（text 追加 / 已存在 conv 的新
+   *  card 插入）+1，select_conv 点选清零。card_patch 替换与首次物化的 card 插入
+   *  （sync 重放 / 新会话首卡）不计——防刷新/重连/切机后全部会话被误点亮。 */
+  unread: number;
 };
 
 /** 单台机器的会话空间：会话表 + conv 插入序（web:default 恒为首项）。 */
@@ -451,6 +456,9 @@ export type AppState = {
   machinesKnown: boolean;
   /** 当前选中机器（侧栏机器切换器 / machines 帧自动掉线切换维护）。 */
   currentMachine: string;
+  /** 当前选中会话（侧栏点选 / 新会话创建维护，恒为完整 conv 形态）。未读计数
+   *  的「当前 conv」判定依据（收到的帧落在当前 conv 不计未读）。 */
+  currentConv: string;
   /** 旧网关 machine 帧（单机在线态）；多机模式以 machines 列表为准。 */
   machineOnline: boolean;
   /** v1.2 已登录设备列表（devices 帧）；null = 尚未拉取（设备面板未打开）。 */
@@ -470,7 +478,7 @@ export function spaceOf(state: AppState, machine: string): MachineSpace {
 /** 新机器空间：预置默认会话（与单机模式 initialState 行为一致）。 */
 function newSpace(): MachineSpace {
   return {
-    convs: { [DEFAULT_CONV]: { entries: [], pending: [], lastPreview: "", lastAt: 0 } },
+    convs: { [DEFAULT_CONV]: { entries: [], pending: [], lastPreview: "", lastAt: 0, unread: 0 } },
     convOrder: [DEFAULT_CONV],
   };
 }
@@ -482,6 +490,7 @@ export function initialState(): AppState {
     machines: [],
     machinesKnown: false,
     currentMachine: DEFAULT_MACHINE,
+    currentConv: DEFAULT_CONV,
     machineOnline: false,
     devices: null,
     lastError: null,
@@ -493,8 +502,10 @@ export type Action =
   | { type: "frame"; frame: InboundFrame }
   | { type: "send_echo"; convId: string; text: string; machine?: string }
   | { type: "approval_sent"; convId: string; requestId: string; machine?: string }
-  /** 用户在机器切换器点选机器（App 同时把当前 conv 切回该机器默认会话）。 */
+  /** 用户在机器切换器点选机器（currentConv 同时回到该机器默认会话）。 */
   | { type: "select_machine"; machine: string }
+  /** 用户点选会话（仅切换 SPA 本地当前 conv，不发包；清该 conv 未读）。 */
+  | { type: "select_conv"; convId: string }
   | { type: "clear_error" }
   | { type: "clear_notice" };
 
@@ -527,7 +538,7 @@ function ensureConv(
     : {
         convs: {
           ...space.convs,
-          [convId]: { entries: [], pending: [], lastPreview: "", lastAt: 0 },
+          [convId]: { entries: [], pending: [], lastPreview: "", lastAt: 0, unread: 0 },
         },
         convOrder: [...space.convOrder, convId],
       };
@@ -575,6 +586,12 @@ function appendEntry(
   const spaces = ensureConv(state, machine, convId);
   const space = spaces[machine];
   const conv = space.convs[convId];
+  // user/text 盖到达时间戳（approval_note 不展示时间）
+  const stamped: StreamEntry =
+    entry.kind === "user" || entry.kind === "text" ? { ...entry, at: Date.now() } : entry;
+  // 未读：非当前 conv 的服务端条目（text / approval_note）+1；用户回显恒落
+  // 当前 conv（send_echo 由 App 发送路径产生），不计。
+  const bumpUnread = stamped.kind !== "user" && !(machine === state.currentMachine && convId === state.currentConv);
   return {
     ...state,
     seq: state.seq + 1,
@@ -586,9 +603,10 @@ function appendEntry(
           ...space.convs,
           [convId]: {
             ...conv,
-            entries: trimEntries([...conv.entries, entry]),
-            lastPreview: previewOf(entry),
+            entries: trimEntries([...conv.entries, stamped]),
+            lastPreview: previewOf(stamped),
             lastAt: Date.now(),
+            unread: bumpUnread ? conv.unread + 1 : conv.unread,
           },
         },
       },
@@ -597,8 +615,12 @@ function appendEntry(
 }
 
 /** card / card_patch：同机器同 conv 内同 messageId 整卡替换（保留原位），否则追加。
- *  概要（lastPreview/lastAt）仅在卡片是会话最新条目时更新——补丁旧卡片不动概要。 */
+ *  概要（lastPreview/lastAt）仅在卡片是会话最新条目时更新——补丁旧卡片不动概要。
+ *  未读：仅「已存在的 conv」的新卡片插入计数（非当前 conv）；替换（card_patch /
+ *  sync 重放同 messageId）与 conv 首次物化（刷新/切机后的 sync 恢复、新会话首卡）
+ *  不计——刷新重连后不会把全部会话误点亮。 */
 function upsertCard(state: AppState, machine: string, frame: CardFrame): AppState {
+  const convExisted = state.spaces[machine]?.convs[frame.convId] !== undefined;
   const spaces = ensureConv(state, machine, frame.convId);
   const space = spaces[machine];
   const conv = space.convs[frame.convId];
@@ -621,15 +643,39 @@ function upsertCard(state: AppState, machine: string, frame: CardFrame): AppStat
   }
   entries = trimEntries(entries);
   const isLatest = idx === -1 || idx === conv.entries.length - 1;
-  const nextConv: ConvState = isLatest
-    ? { ...conv, entries, lastPreview: previewOf(entry), lastAt: Date.now() }
-    : { ...conv, entries };
+  const bumpUnread =
+    idx === -1 && convExisted && !(machine === state.currentMachine && frame.convId === state.currentConv);
+  const nextConv: ConvState = {
+    ...conv,
+    entries,
+    unread: bumpUnread ? conv.unread + 1 : conv.unread,
+    ...(isLatest ? { lastPreview: previewOf(entry), lastAt: Date.now() } : {}),
+  };
   return {
     ...state,
     seq: idx >= 0 ? state.seq : state.seq + 1,
     spaces: {
       ...spaces,
       [machine]: { ...space, convs: { ...space.convs, [frame.convId]: nextConv } },
+    },
+  };
+}
+
+/** 清某机器某 conv 的未读计数（点选会话 / 机器切换落在默认会话）；无变化返回原 state。 */
+function clearUnread(state: AppState, machine: string, convId: string): AppState {
+  const space = state.spaces[machine];
+  const conv = space?.convs[convId];
+  if (!space || !conv || conv.unread === 0) {
+    return state;
+  }
+  return {
+    ...state,
+    spaces: {
+      ...state.spaces,
+      [machine]: {
+        ...space,
+        convs: { ...space.convs, [convId]: { ...conv, unread: 0 } },
+      },
     },
   };
 }
@@ -796,9 +842,20 @@ export function reducer(state: AppState, action: Action): AppState {
       };
     }
     case "select_machine":
-      return state.currentMachine === action.machine
-        ? state
-        : { ...state, currentMachine: action.machine };
+      if (state.currentMachine === action.machine) {
+        return state;
+      }
+      // 切机即回到该机器默认会话（视为「已读」落点，清其未读）
+      return clearUnread(
+        { ...state, currentMachine: action.machine, currentConv: DEFAULT_CONV },
+        action.machine,
+        DEFAULT_CONV,
+      );
+    case "select_conv": {
+      // 点选会话：切当前 conv 并清未读；同 conv 重复点选仅承担清零
+      const changed = clearUnread(state, state.currentMachine, action.convId);
+      return changed.currentConv === action.convId ? changed : { ...changed, currentConv: action.convId };
+    }
     case "clear_error":
       return state.lastError ? { ...state, lastError: null } : state;
     case "clear_notice":

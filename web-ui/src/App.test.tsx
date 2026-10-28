@@ -6,7 +6,7 @@
 // （React 18 渲染抛错 = 卸载整树 → #root 空白，真机曾复现）。
 // v1.2 会话层：换发登录（USER_TOKEN 一次性）/ session 重连 / close 1008 三
 // reason 分流 / 设备管理 UI / 旧 relay 兼容回退的端到端覆盖。
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import type { WsEvent } from "./lib/ws";
@@ -364,5 +364,152 @@ describe("App 会话层（v1.2）", () => {
     act(() => fake.recv(JSON.parse(ackWithSession("sid-r", "st-r", Date.now() + 29 * DAY))));
     expect(screen.queryByText(/天后过期/)).toBeNull();
     expect(screen.getByRole("button", { name: "已登录设备" })).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 交互体验批：断线 composer 置灰 / 未读徽标 / 空态示例 prompt / 审批弹层
+// ---------------------------------------------------------------------------
+
+describe("断线 composer 置灰（交互细节）", () => {
+  /** 挂载 + 握手到 ready（单机模式即可），返回活跃 socket。 */
+  function mountReady(): FakeWebSocket {
+    const fake = mountApp();
+    act(() => {
+      fake.emit("open");
+      fake.recv({ v: 1, type: "hello_ack", role: "user" });
+    });
+    return fake;
+  }
+
+  it("ready 可输入；断线（reconnecting）后禁用 + 占位「连接中断，恢复后可发送」", () => {
+    const fake = mountReady();
+    const ta = screen.getByLabelText("消息输入框") as HTMLTextAreaElement;
+    expect(ta.disabled).toBe(false);
+    expect(ta.placeholder).toBe("发消息给 Mac…（Enter 发送）");
+
+    act(() => {
+      fake.emit("close", { code: 1006 });
+    });
+    const disabledTa = screen.getByPlaceholderText("连接中断，恢复后可发送") as HTMLTextAreaElement;
+    expect(disabledTa.disabled).toBe(true);
+    // 发送 / 停止按钮同步禁用
+    expect((screen.getByRole("button", { name: "发送" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "停止" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("superseded（4001 顶替）：同样禁用并提示；点「重新连接」换新连接后恢复", () => {
+    const fake = mountReady();
+    act(() => {
+      fake.emit("close", { code: 4001 });
+    });
+    expect(screen.getByText("已在其它窗口连接")).toBeTruthy();
+    const ta = screen.getByPlaceholderText("已在其它窗口连接，重新连接后可发送") as HTMLTextAreaElement;
+    expect(ta.disabled).toBe(true);
+
+    // 用户显式重连：复用 WsManager 新建连接（新 FakeWebSocket 实例）
+    fireEvent.click(screen.getByRole("button", { name: "重新连接" }));
+    const next = FakeWebSocket.latest;
+    expect(next).toBeTruthy();
+    expect(next).not.toBe(fake);
+    act(() => {
+      next!.emit("open");
+      next!.recv({ v: 1, type: "hello_ack", role: "user" });
+    });
+    const restored = screen.getByLabelText("消息输入框") as HTMLTextAreaElement;
+    expect(restored.disabled).toBe(false);
+  });
+});
+
+describe("未读徽标与空态示例（交互细节）", () => {
+  it("非当前会话收新消息 → 侧栏徽标计数；点选该会话清零", () => {
+    const fake = mountApp();
+    handshake(fake, ["home-mac"]);
+
+    // 当前会话（web:default）消息不产生徽标
+    act(() => {
+      fake.recv({ v: 1, type: "text", convId: "web:default", text: "当前会话消息", machine: "home-mac" });
+    });
+    const defaultBtn = screen.getByRole("button", { name: /default/ });
+    expect(within(defaultBtn).queryByText(/条未读/)).toBeNull();
+
+    // 非当前会话（web:work）消息 → 徽标 1；再来一条 → 2
+    act(() => {
+      fake.recv({ v: 1, type: "text", convId: "web:work", text: "后台第一条", machine: "home-mac" });
+    });
+    let workBtn = screen.getByRole("button", { name: /work/ });
+    expect(within(workBtn).getByText("1")).toBeTruthy();
+    act(() => {
+      fake.recv({ v: 1, type: "text", convId: "web:work", text: "后台第二条", machine: "home-mac" });
+    });
+    workBtn = screen.getByRole("button", { name: /work/ });
+    expect(within(workBtn).getByText("2")).toBeTruthy();
+
+    // 点选 → 清零并切到该会话（aria-current 标记选中）
+    fireEvent.click(workBtn);
+    workBtn = screen.getByRole("button", { name: /work/ });
+    expect(within(workBtn).queryByText("1")).toBeNull();
+    expect(within(workBtn).queryByText("2")).toBeNull();
+    expect(workBtn.getAttribute("aria-current")).toBe("page");
+  });
+
+  it("空态示例 prompt：点击即发送 message 帧 + 本地回显", () => {
+    const fake = mountApp();
+    handshake(fake, ["home-mac"]);
+    const sample = screen.getByRole("button", { name: "看看这个项目结构" });
+    fireEvent.click(sample);
+    expect(fake.sent).toContain(
+      JSON.stringify({
+        v: 1,
+        type: "message",
+        convId: "web:default",
+        text: "看看这个项目结构",
+        machine: "home-mac",
+      }),
+    );
+    // 本地用户回显出现：气泡 + 侧栏预览各一处
+    expect(screen.getAllByText("看看这个项目结构").length).toBe(2);
+    // 发送后空态消失（有条目）
+    expect(screen.queryByRole("button", { name: "帮我写个脚本" })).toBeNull();
+  });
+
+  it("断线时空态示例 prompt 不出现（无法发送）", () => {
+    const fake = mountApp();
+    act(() => {
+      fake.emit("open");
+      fake.recv({ v: 1, type: "hello_ack", role: "user" });
+      fake.emit("close", { code: 1006 });
+    });
+    expect(screen.queryByRole("button", { name: "看看这个项目结构" })).toBeNull();
+  });
+});
+
+describe("审批弹层（slide-in + 移动端触觉）", () => {
+  it("approval_request → 弹层渲染（不炸 vibrate）；拒绝回传 approval_response", () => {
+    const fake = mountApp();
+    handshake(fake, ["home-mac"]);
+    act(() => {
+      fake.recv({
+        v: 1,
+        type: "approval_request",
+        convId: "web:default",
+        requestId: "r1",
+        tool: "Bash",
+        inputSummary: "rm -rf /tmp/x",
+        machine: "home-mac",
+      });
+    });
+    expect(screen.getByRole("alertdialog", { name: "审批请求 Bash" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "拒绝" }));
+    expect(fake.sent).toContain(
+      JSON.stringify({
+        v: 1,
+        type: "approval_response",
+        convId: "web:default",
+        requestId: "r1",
+        decision: "deny",
+        machine: "home-mac",
+      }),
+    );
   });
 });

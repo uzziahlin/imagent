@@ -26,6 +26,7 @@ import { Login } from "./components/Login";
 import { StatusBar } from "./components/StatusBar";
 import { Sidebar, type ConvItem } from "./components/Sidebar";
 import { DeviceManager } from "./components/DeviceManager";
+import { useExitMounted } from "./components/useExitMounted";
 import { MessageList } from "./components/MessageList";
 import { ApprovalPanel } from "./components/ApprovalPanel";
 import { Composer } from "./components/Composer";
@@ -77,7 +78,7 @@ function noticeText(n: MachineNotice): string {
   }
 }
 
-const EMPTY_CONV: ConvState = { entries: [], pending: [], lastPreview: "", lastAt: 0 };
+const EMPTY_CONV: ConvState = { entries: [], pending: [], lastPreview: "", lastAt: 0, unread: 0 };
 
 /** conv 全名（用户输入的名字统一补 web: 前缀，幂等）。 */
 function toConvId(name: string): string {
@@ -93,7 +94,6 @@ export default function App() {
   const [authNotice, setAuthNotice] = useState("");
   const [devicesOpen, setDevicesOpen] = useState(false);
   const [status, setStatus] = useState<ConnStatus>("connecting");
-  const [currentConv, setCurrentConv] = useState(DEFAULT_CONV);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [state, dispatch] = useReducer(reducer, undefined, initialState);
   const wsRef = useRef<WsManager | null>(null);
@@ -192,14 +192,16 @@ export default function App() {
   // （新会话）不在 convOrder 里，前端补一项空预览，避免当前高亮落空。
   // 注意：hook 必须在下方 token 早退之前（hooks 数量不可随登录态变化）。
   const space = spaceOf(state, state.currentMachine);
+  const currentConv = state.currentConv;
   const convItems = useMemo<ConvItem[]>(() => {
     const items = space.convOrder.map((c) => ({
       convId: c,
       preview: space.convs[c]?.lastPreview ?? "",
       at: space.convs[c]?.lastAt ?? 0,
+      unread: space.convs[c]?.unread ?? 0,
     }));
     if (!items.some((i) => i.convId === currentConv)) {
-      items.unshift({ convId: currentConv, preview: "", at: 0 });
+      items.unshift({ convId: currentConv, preview: "", at: 0, unread: 0 });
     }
     return items;
   }, [space, currentConv]);
@@ -224,6 +226,10 @@ export default function App() {
     }
     return out;
   }, [state.machines, state.spaces]);
+
+  // 抽屉内容延迟卸载：退出动画播完后真正离开 DOM——避免桌面侧栏与抽屉内
+  // 两个 Sidebar 常驻导致重复的可访问名/可聚焦元素（hook 须在 auth 早退前）
+  const drawerContentMounted = useExitMounted(drawerOpen, 150);
 
   if (!auth) {
     return (
@@ -273,7 +279,7 @@ export default function App() {
         text: `/switch ${name}`,
         machine: state.currentMachine,
       });
-      setCurrentConv(toConvId(name));
+      dispatch({ type: "select_conv", convId: toConvId(name) });
       setDrawerOpen(false);
     }
     return ok;
@@ -295,12 +301,11 @@ export default function App() {
     }
   };
 
-  /** 侧栏机器切换：会话池 per-machine，当前 conv 回到该机器默认会话；
-   *  sync 由机器维度 effect 统一发出。 */
+  /** 侧栏机器切换：会话池 per-machine，reducer 把当前 conv 回到该机器默认
+   *  会话（并清其未读）；sync 由机器维度 effect 统一发出。 */
   const selectMachine = (m: string) => {
     if (m !== state.currentMachine) {
       dispatch({ type: "select_machine", machine: m });
-      setCurrentConv(DEFAULT_CONV);
     }
   };
 
@@ -344,7 +349,13 @@ export default function App() {
 
   const conv = space.convs[currentConv] ?? EMPTY_CONV;
 
-  const sidebar = (onSelect: (conv: string) => void) => (
+  /** 侧栏点选会话：仅切本地当前 conv + 清未读（reducer），移动端同时收抽屉。 */
+  const selectConv = (c: string) => {
+    dispatch({ type: "select_conv", convId: c });
+    setDrawerOpen(false);
+  };
+
+  const sidebar = (
     <Sidebar
       convs={convItems}
       current={currentConv}
@@ -355,7 +366,7 @@ export default function App() {
       sessionExpiresAt={session?.expiresAt}
       onRenewSession={logout}
       onOpenDevices={session ? openDevices : undefined}
-      onSelect={onSelect}
+      onSelect={selectConv}
       onSelectMachine={selectMachine}
       onCreate={createConv}
     />
@@ -365,26 +376,30 @@ export default function App() {
   return (
     <div className="flex h-full bg-surface text-ink">
       {/* 桌面（≥768px）：左侧固定侧边栏 240px */}
-      <aside className="hidden w-60 shrink-0 border-r border-line bg-panel md:block">
-        {sidebar(setCurrentConv)}
-      </aside>
+      <aside className="hidden w-60 shrink-0 border-r border-line bg-panel md:block">{sidebar}</aside>
 
-      {/* 移动（<768px）：侧边栏变抽屉（遮罩点击关闭） */}
-      {drawerOpen && (
-        <div className="fixed inset-0 z-50 md:hidden">
-          <div
-            className="absolute inset-0 bg-black/50"
-            onClick={() => setDrawerOpen(false)}
-            aria-hidden="true"
-          />
-          <aside className="absolute inset-y-0 left-0 flex w-72 max-w-[85vw] flex-col border-r border-line bg-surface shadow-2xl">
-            {sidebar((c) => {
-              setCurrentConv(c);
-              setDrawerOpen(false);
-            })}
-          </aside>
-        </div>
-      )}
+      {/* 移动（<768px）：侧边栏变抽屉——壳层恒挂载，开关走 150ms 滑入滑出过渡
+          （关闭态 -translate-x-full + invisible：摘出可聚焦/a11y 树；visibility
+          参与过渡，隐藏在动画末尾离散生效；内容再延迟卸载兜底） */}
+      <div
+        className={`fixed inset-0 z-50 md:hidden ${drawerOpen ? "" : "pointer-events-none"}`}
+        aria-hidden={!drawerOpen}
+      >
+        <div
+          className={`absolute inset-0 bg-black/50 transition-opacity duration-150 ease-out ${
+            drawerOpen ? "opacity-100" : "opacity-0"
+          }`}
+          onClick={() => setDrawerOpen(false)}
+          aria-hidden="true"
+        />
+        <aside
+          className={`absolute inset-y-0 left-0 flex w-72 max-w-[85vw] flex-col border-r border-line bg-surface shadow-2xl transition-[transform,visibility] duration-150 ease-out ${
+            drawerOpen ? "translate-x-0" : "-translate-x-full invisible"
+          }`}
+        >
+          {drawerContentMounted && sidebar}
+        </aside>
+      </div>
 
       {/* 右侧聊天区（移动全屏单列） */}
       <div className="flex min-w-0 flex-1 flex-col">
@@ -407,10 +422,13 @@ export default function App() {
             showMachine={state.machinesKnown}
             onRespond={respondApproval}
           />
-          <MessageList entries={conv.entries} />
+          <MessageList
+            entries={conv.entries}
+            onSample={status === "ready" ? (t) => sendMessage(t) : undefined}
+          />
         </main>
         <Composer
-          disabled={status !== "ready"}
+          status={status}
           onSend={sendMessage}
           onStop={() => {
             wsRef.current?.sendControl("stop", undefined, outMachine());
@@ -418,15 +436,14 @@ export default function App() {
         />
       </div>
 
-      {/* v1.2 设备管理弹层（仅会话模式渲染；machinery 状态经 devices 帧） */}
-      {devicesOpen && (
-        <DeviceManager
-          devices={state.devices}
-          selfId={session?.id}
-          onRevoke={revokeDevice}
-          onClose={() => setDevicesOpen(false)}
-        />
-      )}
+      {/* v1.2 设备管理弹层（组件自管进出过渡；machinery 状态经 devices 帧） */}
+      <DeviceManager
+        open={devicesOpen}
+        devices={state.devices}
+        selfId={session?.id}
+        onRevoke={revokeDevice}
+        onClose={() => setDevicesOpen(false)}
+      />
 
       {(state.lastError || state.lastNotice) && (
         <div className="fixed inset-x-0 bottom-24 z-50 mx-auto flex w-fit max-w-[90vw] flex-col items-center gap-2">

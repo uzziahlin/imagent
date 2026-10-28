@@ -73,6 +73,52 @@ body {
   @apply bg-surface text-ink antialiased;
 }
 
+/* ---------------------------------------------------------------------------
+ * 微动效系统偏好：用户开启「减弱动态效果」时禁用全部动画/过渡（含 tailwind
+ * keyframes：fade-in / slide-in / breathe / pulse / spin——无限动画同时截断
+ * iteration，呼吸点等彻底静止）。
+ * --------------------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * 细滚动条（桌面 webkit + Firefox thin；移动端原生覆盖式滚动条不受影响）。
+ * 主题色跟随语义变量（浅色 line-strong / 暗色同变量自动切换）。
+ * --------------------------------------------------------------------------- */
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--c-line-strong);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--c-ghost);
+}
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--c-line-strong) transparent;
+}
+
+/* 按钮按压反馈（消息复制/发送/审批等小操作钮；大列表项与输入控件不加） */
+@layer components {
+  .press {
+    @apply transition-[transform,background-color,border-color,color] duration-100 ease-out active:scale-95;
+  }
+}
+
 /* markdown 排版（.md 命名空间；渲染入口统一在 MarkdownText，安全清洗见该组件） */
 @layer components {
   .md {
@@ -116,9 +162,13 @@ body {
     @apply rounded bg-code px-1 py-0.5 font-mono text-[13px] text-ok;
   }
   .md pre {
-    @apply my-2 overflow-x-auto rounded-xl border border-line bg-code p-3;
+    @apply overflow-x-auto p-3;
   }
-  /* M3b：代码高亮在此扩展（pre code 覆写为高亮 token 树） */
+  /* 代码块外壳（MarkdownText 的 CodeBlock）：头部语言标签/复制条 + 横滚正文。
+   * pre 的圆角/边框/底色上收到外壳（头部条与正文同底同框）。 */
+  .md .code-block pre {
+    @apply my-0;
+  }
   .md pre code {
     @apply bg-transparent p-0 text-ink;
   }
@@ -138,4 +188,68 @@ body {
   .md a {
     @apply break-all text-info underline underline-offset-2;
   }
+}
+
+/* ---------------------------------------------------------------------------
+ * highlight.js token 主题（rehype-highlight 输出的 .hljs-* class；作用域限定
+ * .md）。颜色直接复用语义变量（think/ok/warn/info/err/faint/muted）——深浅色
+ * 随 prefers-color-scheme 切换变量值，无需两套主题文件，产物零 CSS 依赖。
+ * --------------------------------------------------------------------------- */
+.md .hljs-comment,
+.md .hljs-quote {
+  color: var(--c-faint);
+  font-style: italic;
+}
+.md .hljs-keyword,
+.md .hljs-selector-tag,
+.md .hljs-template-tag,
+.md .hljs-doctag,
+.md .hljs-name,
+.md .hljs-tag {
+  color: var(--c-think);
+}
+.md .hljs-string,
+.md .hljs-regexp,
+.md .hljs-addition {
+  color: var(--c-ok);
+}
+.md .hljs-number,
+.md .hljs-literal,
+.md .hljs-symbol,
+.md .hljs-bullet,
+.md .hljs-link {
+  color: var(--c-warn);
+}
+.md .hljs-title,
+.md .hljs-title.function_,
+.md .hljs-section,
+.md .hljs-built_in,
+.md .hljs-type {
+  color: var(--c-info);
+}
+.md .hljs-attr,
+.md .hljs-attribute,
+.md .hljs-variable.language_,
+.md .hljs-template-variable,
+.md .hljs-selector-attr,
+.md .hljs-selector-class,
+.md .hljs-selector-id {
+  color: var(--c-err);
+}
+.md .hljs-meta,
+.md .hljs-meta .hljs-keyword {
+  color: var(--c-muted);
+}
+.md .hljs-operator,
+.md .hljs-punctuation {
+  color: var(--c-muted);
+}
+.md .hljs-deletion {
+  color: var(--c-err);
+}
+.md .hljs-emphasis {
+  font-style: italic;
+}
+.md .hljs-strong {
+  font-weight: 600;
 }

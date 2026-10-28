@@ -2,9 +2,11 @@ import type { ConnStatus } from "../lib/ws";
 import { convDisplayName } from "../lib/protocol";
 
 const STATUS_META: Record<ConnStatus, { label: string; dot: string }> = {
+  // 在线点呼吸（breathe 2.2s 缓慢缩放）：仅 ready 健康 steady 态使用；
+  // connecting 保留脉冲（进行中反馈），reconnecting/superseded 静止不呼吸。
   connecting: { label: "连接中", dot: "bg-amber-400 animate-pulse" },
-  ready: { label: "已连接", dot: "bg-emerald-400" },
-  reconnecting: { label: "重连中", dot: "bg-rose-400 animate-pulse" },
+  ready: { label: "已连接", dot: "bg-emerald-400 animate-breathe" },
+  reconnecting: { label: "重连中", dot: "bg-rose-400" },
   // 被同 token 新窗口顶替：醒目但非错误色（violet，区别于 amber 连接中 / rose 重连中）
   superseded: { label: "已在其它窗口连接", dot: "bg-violet-400" },
 };
@@ -43,7 +45,7 @@ export function StatusBar({
         type="button"
         onClick={onOpenDrawer}
         aria-label="打开会话列表"
-        className="rounded-lg p-1.5 text-muted transition-colors hover:bg-panel2 hover:text-ink md:hidden"
+        className="press rounded-lg p-1.5 text-muted transition-colors hover:bg-panel2 hover:text-ink md:hidden"
       >
         <svg viewBox="0 0 20 20" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
           <line x1="3" y1="5" x2="17" y2="5" strokeLinecap="round" />
@@ -59,7 +61,7 @@ export function StatusBar({
             <span className="hidden text-faint sm:inline">如需在此窗口使用</span>
             <button
               onClick={onReconnect}
-              className="shrink-0 rounded-lg border border-violet-400/60 bg-violet-500/10 px-2 py-0.5 text-xs text-think transition-colors hover:bg-violet-500/20 hover:text-ink dark:border-violet-500/40 dark:text-violet-300"
+              className="press shrink-0 rounded-lg border border-violet-400/60 bg-violet-500/10 px-2 py-0.5 text-xs text-think transition-colors hover:bg-violet-500/20 hover:text-ink dark:border-violet-500/40 dark:text-violet-300"
             >
               重新连接
             </button>
@@ -68,7 +70,9 @@ export function StatusBar({
       </div>
       <div className="hidden items-center gap-1.5 text-xs sm:flex">
         <span
-          className={`h-2 w-2 rounded-full ${machineOnline ? "bg-emerald-400" : "bg-slate-500"}`}
+          className={`h-2 w-2 rounded-full ${
+            machineOnline ? "bg-emerald-400 animate-breathe" : "bg-slate-500"
+          }`}
           aria-hidden="true"
         />
         <span className={`max-w-[16vw] truncate ${machineOnline ? "text-muted" : "text-ghost"}`}>
@@ -81,7 +85,7 @@ export function StatusBar({
         </span>
         <button
           onClick={onLogout}
-          className="rounded-lg px-2 py-1 text-xs text-muted transition-colors hover:bg-panel2 hover:text-ink"
+          className="press rounded-lg px-2 py-1 text-xs text-muted transition-colors hover:bg-panel2 hover:text-ink"
         >
           退出
         </button>
