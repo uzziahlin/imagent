@@ -4,7 +4,7 @@
 [workspace]
 resolver = "2"
 exclude = ["fuzz"]  # cargo-fuzz 独立 crate（需 nightly，E-7）
-members = ["crates/store", "crates/core", "crates/claude", "crates/codex", "crates/gemini", "crates/ilink", "crates/wecom", "crates/feishu"]
+members = ["crates/store", "crates/core", "crates/claude", "crates/codex", "crates/gemini", "crates/ilink", "crates/wecom", "crates/feishu", "crates/relay"]
 
 [workspace.package]
 version = "1.32.0"
@@ -68,6 +68,8 @@ rpassword = "7"
 prometheus = { version = "0.13", default-features = false }
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
 axum = "0.8"
+# Web 驾驶舱（M1）：crates/relay 内嵌 SPA 静态资源（rust-embed）
+rust-embed = "8"
 # ACP（Agent Client Protocol）：claude-agent-acp 长驻子进程模式（agent-client-protocol SDK）
 agent-client-protocol = "2"
 # 飞书 open-lark SDK（package name=openlark，lib name=open_lark，二者不同名是 SDK 设计）
