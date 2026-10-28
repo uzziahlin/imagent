@@ -391,6 +391,28 @@ describe("reducer", () => {
     expect(convsOf(s)[DEFAULT_CONV].entries).toHaveLength(1);
   });
 
+  // MultiPlatform 镜像路由把网关侧 local 终端会话（conv 形态 local:<名>）的
+  // 出站帧同步给 web 平台——SPA 收到 local:xxx 帧即按同机制收集为侧栏会话；
+  // 用户点选后的干预回执（send_echo 落同 conv，出站 message 帧的 convId 由
+  // ws 层原样携带，见 ws.test.ts）不被改写，端到端回到 local 会话。
+  it("local:xxx conv（镜像的本地终端会话）按帧收集，干预回执落同 conv", () => {
+    const s = run(
+      initialState(),
+      { type: "frame", frame: frame(TEXT_FRAME("终端输出", "local:work")) },
+    );
+    expect(orderOf(s)).toEqual([DEFAULT_CONV, "local:work"]);
+    expect(convsOf(s)["local:work"].entries).toHaveLength(1);
+    expect(convsOf(s)["local:work"].entries[0]).toMatchObject({
+      kind: "text",
+      text: "终端输出",
+    });
+    // 点选后干预：用户回显追加到同一 local conv（convId 不被加 web: 前缀）。
+    const after = run(s, { type: "send_echo", convId: "local:work", text: "继续" });
+    const entries = convsOf(after)["local:work"].entries;
+    expect(entries).toHaveLength(2);
+    expect(entries[1]).toMatchObject({ kind: "user", text: "继续" });
+  });
+
   it("send_echo 追加用户回显到指定 conv", () => {
     const s = run(initialState(), { type: "send_echo", convId: "web:work", text: "列出目录" });
     expect(orderOf(s)).toContain("web:work");

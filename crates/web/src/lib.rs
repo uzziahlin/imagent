@@ -23,7 +23,10 @@
 //! （text / card / approval_request …）写入的即完整 conv，浏览器回执帧
 //! （message / approval_response）**原样回传收到的 convId** 即可，不得剥前
 //! 缀；裸 session 名（如 `work`）仅作入站兼容输入，由 `normalize_conv`
-//! 统一归一为完整 conv。
+//! 统一归一为完整 conv。例外透传：`local:<会话名>`（网关侧本地终端会话的
+//! 既有 conv 形态）原样放行——MultiPlatform 把 local 会话出站镜像给 web
+//! 平台（SPA 驾驶舱实时视图），SPA 对 local 会话的干预消息/审批回执须回到
+//! local 会话，不得被强加 `web:` 前缀（详见 [`normalize_conv`]）。
 //!
 //! 本模块承载**帧类型定义与纯函数**（入站映射、出站药化、超限截断、machine
 //! id 规范化），全部无 IO 便于单测（`default_machine_id` 的 hostname 探测
@@ -486,9 +489,15 @@ fn decision_word(decision: &str) -> Option<&'static str> {
 /// （如 `work`）仅作兼容输入，补 `web:` 前缀归一。
 /// - raw 为 None / 空串 → 默认会话 `web:<default_session>`
 /// - raw 以 `web:` 开头 → 原样返回（不双前缀）
+/// - raw 以 `local:` 开头 → **原样透传**：web 出生缺省 `web:` 前缀，而
+///   `local:` 是网关侧本地终端会话（crates/localterm）的既有 conv 形态——
+///   MultiPlatform 镜像路由把 local 会话的出站帧同步给 web 平台，SPA 可直接
+///   寻址 local 会话干预；回执若被强加 `web:` 前缀会造出无人消费的
+///   `web:local:xxx` 幽灵会话，干预/审批闭环断裂。
 /// - 其它（裸 session 名）→ `web:<raw>`
 fn normalize_conv(raw: Option<&str>, default_session: &str) -> String {
     match raw {
+        Some(c) if c.starts_with("local:") => c.to_string(),
         Some(c) if !c.is_empty() && c.starts_with("web:") => c.to_string(),
         Some(c) if !c.is_empty() => format!("web:{c}"),
         _ => format!("web:{default_session}"),
@@ -638,14 +647,49 @@ mod tests {
         assert_eq!(m.conv_id, ConvId("web:work".into()));
     }
 
-    /// convId 三形态归一：None / 空串 → 默认会话；完整 conv 原样（SPA 原样
-    /// 回传出站帧 convId 的正常路径）；裸 session 名补前缀（兼容形态）。
+    /// convId 归一四分支：None / 空串 → 默认会话；完整 web conv 原样（SPA
+    /// 原样回传出站帧 convId 的正常路径）；裸 session 名补前缀（兼容形态）；
+    /// `local:` 前缀原样透传（本地终端会话，见 normalize_conv 注释）。
     #[test]
     fn normalize_conv_three_forms() {
         assert_eq!(normalize_conv(None, "default"), "web:default");
         assert_eq!(normalize_conv(Some(""), "default"), "web:default");
         assert_eq!(normalize_conv(Some("web:work"), "default"), "web:work");
         assert_eq!(normalize_conv(Some("work"), "default"), "web:work");
+        // local: 透传（不双前缀成 web:local:xxx 幽灵会话）。
+        assert_eq!(normalize_conv(Some("local:work"), "default"), "local:work");
+        // 恰好名为 local 的裸 session 名仍走 web: 前缀（无冒号非 local: 前缀）。
+        assert_eq!(normalize_conv(Some("local"), "default"), "web:local");
+    }
+
+    /// local 会话干预闭环（镜像路由配套，必修回归钉）：MultiPlatform 把 local
+    /// 会话出站镜像给 web 平台 → SPA 看到 `local:<名>` conv；用户对它的干预
+    /// message 与审批 approval_response 回执必须原样回到 local conv——被强加
+    /// web: 前缀则路由进 web 幽灵会话，干预与审批全部失效。
+    #[test]
+    fn map_frames_pass_through_local_conv() {
+        // message：SPA 发往 local:work 的干预消息。
+        let act = map_raw_frame(
+            r#"{"v":1,"type":"message","convId":"local:work","text":"继续"}"#,
+            SESSION,
+        );
+        let InboundAction::Message(m) = act else {
+            panic!("local conv 的 message 应映射为 Message：{act:?}")
+        };
+        assert_eq!(m.conv_id, ConvId("local:work".into()));
+        assert_eq!(m.text.as_deref(), Some("继续"));
+
+        // approval_response：镜像 approval_request 的回执（SPA 原样回传 convId）。
+        let act = map_raw_frame(
+            r#"{"v":1,"type":"approval_response","convId":"local:work","requestId":"req-1","decision":"allow"}"#,
+            SESSION,
+        );
+        let InboundAction::Message(m) = act else {
+            panic!("local conv 的 approval_response 应映射为 Message：{act:?}")
+        };
+        assert_eq!(m.conv_id, ConvId("local:work".into()));
+        assert_eq!(m.ask_req.as_deref(), Some("req-1"));
+        assert_eq!(m.text.as_deref(), Some("y"));
     }
 
     #[test]

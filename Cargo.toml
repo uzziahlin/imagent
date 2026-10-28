@@ -4,7 +4,7 @@
 [workspace]
 resolver = "2"
 exclude = ["fuzz"]  # cargo-fuzz 独立 crate（需 nightly，E-7）
-members = ["crates/store", "crates/core", "crates/claude", "crates/codex", "crates/gemini", "crates/ilink", "crates/wecom", "crates/feishu", "crates/relay", "crates/web"]
+members = ["crates/store", "crates/core", "crates/claude", "crates/codex", "crates/gemini", "crates/ilink", "crates/wecom", "crates/feishu", "crates/relay", "crates/web", "crates/localterm"]
 
 [workspace.package]
 version = "1.32.0"
@@ -54,6 +54,10 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 qrcode = "0.14"        # 扫码登录终端二维码
 rand = "0.9"
+# 本地终端（imagent claude）客户端行编辑/历史（crates/localterm term.rs）。
+# 版本上限受 workspace rust-version=1.88 约束：rustyline 18+ 用到 file_lock
+# （Rust 1.89 起稳定），17.x 为 1.88 可编译的最新线。
+rustyline = "17"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
@@ -94,6 +98,8 @@ imagent-gemini = { path = "crates/gemini" }
 imagent-store = { path = "crates/store" }
 # Web 驾驶舱 M2：网关侧 WebPlatform（出站 WS 客户端连 relay）。
 imagent-web = { path = "crates/web" }
+# 本地终端平台（imagent claude）：网关侧 LocalPlatform（unix socket）+ term 客户端。
+imagent-localterm = { path = "crates/localterm" }
 tokio = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }

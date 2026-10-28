@@ -309,6 +309,24 @@ describe("WsManager", () => {
     expect(sock.sent).toContain('{"v":1,"type":"message","text":"/switch work"}');
   });
 
+  // local:xxx 是网关侧本地终端会话的既有 conv 形态（MultiPlatform 镜像路由把
+  // local 会话帧同步给浏览器）。SPA 对 local 会话的干预消息/审批回执必须原样
+  // 携带 local: convId——被改写（如强加 web: 前缀）则网关侧路由进幽灵会话，
+  // 干预与审批闭环断裂。
+  it("local:xxx convId 原样出站不改写（SPA 直接寻址 local 终端会话）", () => {
+    const h = makeManager();
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    expect(h.mgr.sendMessage("local:work", "继续", "home-mac")).toBe(true);
+    expect(h.mgr.sendApprovalResponse("local:work", "req-1", "allow", "home-mac")).toBe(true);
+    expect(sock.sent).toContain(
+      '{"v":1,"type":"message","convId":"local:work","text":"继续","machine":"home-mac"}',
+    );
+    expect(sock.sent).toContain(
+      '{"v":1,"type":"approval_response","convId":"local:work","requestId":"req-1","decision":"allow","machine":"home-mac"}',
+    );
+  });
+
   it("手动 close 后不再重连", () => {
     const h = makeManager();
     h.mgr.connect();

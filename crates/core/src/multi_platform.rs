@@ -23,6 +23,22 @@
 //!
 //! Web 驾驶舱的定位是「与 IM 并存互补：Web 富渲染做驾驶舱，IM 做轻通知兜底」
 //! ——没有本组合器则选 web 即掉 feishu，与主使用场景矛盾。
+//!
+//! ## 镜像路由（local → web，叠加在 A 类归属路由之上）
+//!
+//! 「终端 local 会话 → 网页驾驶舱实时镜像 + 干预」：发往 `local:` 前缀 conv
+//! 的**出站投递方法**，除按前缀归属路由 local 平台外，**同时镜像投递给 web
+//! 平台**（若在 children 中；见 [`MultiPlatform::route_with_mirror`]）。理由：
+//! - web 是驾驶舱（浏览器看全部机器会话的实时视图），local 会话的实时可视化
+//!   正是其核心场景；feishu 等 IM 平台是通知渠道，不应被终端会话的流式文本
+//!   刷屏——不镜像。
+//! - 「一个会话多个视图」的镜像语义与「按前缀归属」的路由并存：主投递结果
+//!   仍是方法的返回值，镜像是 best-effort 旁路（失败仅 warn，不阻塞主路由）。
+//! - 两个例外不镜像：`supports_streaming_card` 是能力查询不是投递（保持按
+//!   前缀单查——local conv 恒 local 平台 false=文本流不受影响）；`note_round_initiator`
+//!   是协作钩子且 web 平台未覆写（镜像恒为 no-op）。
+//! - 配置化锚点：未来若需更多「平台 A 的会话镜像到平台 B」的规则，把这条
+//!   (源前缀 → 目标平台) 硬编码规则升级为 config 驱动的 mirror 规则表。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,6 +56,13 @@ use crate::types::{
 
 /// 组合器自身的平台名（日志 / /doctor 文案用；conv 路由不经过它）。
 const NAME: &str = "multi";
+
+/// 镜像路由规则（理由见模块文档「镜像路由」节）：`local:` 前缀 conv 的出站
+/// 投递除归属平台外同时镜像给 web 平台。web 不在 children（如 feishu+local
+/// 两平台配置）时镜像静默跳过。
+const MIRROR_SOURCE_PREFIX: &str = "local:";
+/// 镜像目标平台名（= 其 conv 前缀）。
+const MIRROR_TARGET_PLATFORM: &str = "web";
 
 /// 入站合流 channel 容量：泵与 dispatcher 消费端之间的缓冲。真实平台的入站
 /// 突发远小于此量级；满了泵会在 `tx.send` 处背压（不丢消息）。
@@ -197,6 +220,49 @@ impl MultiPlatform {
                 )
             })
     }
+
+    /// 镜像目标查找：conv 命中镜像源前缀（[`MIRROR_SOURCE_PREFIX`]）且 children
+    /// 含 web 平台时返回其句柄，否则 None（无镜像）。web conv 自身不命中
+    /// （源前缀是 local:），不会出现「web 主投递 + web 镜像」双发。
+    fn mirror_target(&self, conv: &ConvId) -> Option<Arc<dyn Platform>> {
+        if !conv.0.starts_with(MIRROR_SOURCE_PREFIX) {
+            return None;
+        }
+        self.children
+            .iter()
+            .find(|c| c.name() == MIRROR_TARGET_PLATFORM)
+            .cloned()
+    }
+
+    /// A 类出站投递方法的公共骨架：按 conv 前缀定位归属子平台；命中镜像规则
+    /// （local → web，见模块文档「镜像路由」节）时先把同一投递**镜像**给 web
+    /// 平台，再执行主投递并返回其结果。
+    ///
+    /// - `deliver` 接收目标平台句柄执行真正的投递调用——各出站方法仅参数列表
+    ///   不同，镜像判定/目标查找/warn 收敛在此一处，避免逐方法重复展开；
+    /// - 镜像是 best-effort 旁路：失败（web 掉线、出站队列满等）仅 warn，不
+    ///   阻塞、不改写主路由结果——驾驶舱缺帧由 sync/重连兜底，不能反压终端
+    ///   主会话；
+    /// - 主路由失败（`child_for` 无命中）直接 Err，不镜像——无归属平台的 conv
+    ///   不该凭空造出 web 视图。
+    async fn route_with_mirror<T, F, Fut>(&self, conv: &ConvId, deliver: F) -> Result<T>
+    where
+        F: Fn(Arc<dyn Platform>) -> Fut,
+        Fut: std::future::Future<Output = Result<T>> + Send,
+    {
+        let child = self.child_for(conv)?.clone();
+        if let Some(web) = self.mirror_target(conv) {
+            if let Err(e) = deliver(web).await {
+                tracing::warn!(
+                    target: "imagent::core",
+                    conv = %conv.0,
+                    error = %e,
+                    "local 会话镜像投递 web 平台失败（best-effort，不影响主投递）"
+                );
+            }
+        }
+        deliver(child).await
+    }
 }
 
 impl Drop for MultiPlatform {
@@ -225,11 +291,16 @@ impl Platform for MultiPlatform {
     }
 
     async fn send_text(&self, conv: &ConvId, text: &str, hint: &ReplyHint) -> Result<()> {
-        self.child_for(conv)?.send_text(conv, text, hint).await
+        self.route_with_mirror(conv, |p| async move { p.send_text(conv, text, hint).await })
+            .await
     }
 
     async fn send_media(&self, conv: &ConvId, media: &MediaRef, hint: &ReplyHint) -> Result<()> {
-        self.child_for(conv)?.send_media(conv, media, hint).await
+        self.route_with_mirror(
+            conv,
+            |p| async move { p.send_media(conv, media, hint).await },
+        )
+        .await
     }
 
     fn name(&self) -> &'static str {
@@ -247,6 +318,7 @@ impl Platform for MultiPlatform {
     }
 
     /// 无命中前缀按 false（无该平台 = 该 conv 无卡片语义，core 走纯文本路径）。
+    /// 能力查询不是投递，不参与镜像（local conv 恒 local 平台 false=文本流）。
     fn supports_streaming_card(&self, conv: &ConvId) -> bool {
         self.child_for(conv)
             .map(|c| c.supports_streaming_card(conv))
@@ -259,7 +331,8 @@ impl Platform for MultiPlatform {
         card: &OutboundCard,
         hint: &ReplyHint,
     ) -> Result<Option<String>> {
-        self.child_for(conv)?.send_card(conv, card, hint).await
+        self.route_with_mirror(conv, |p| async move { p.send_card(conv, card, hint).await })
+            .await
     }
 
     async fn update_card(
@@ -269,9 +342,10 @@ impl Platform for MultiPlatform {
         card: &OutboundCard,
         hint: &ReplyHint,
     ) -> Result<()> {
-        self.child_for(conv)?
-            .update_card(conv, message_id, card, hint)
-            .await
+        self.route_with_mirror(conv, |p| async move {
+            p.update_card(conv, message_id, card, hint).await
+        })
+        .await
     }
 
     async fn send_permission_ask(
@@ -282,9 +356,11 @@ impl Platform for MultiPlatform {
         input_summary: &str,
         hint: &ReplyHint,
     ) -> Result<Option<String>> {
-        self.child_for(conv)?
-            .send_permission_ask(conv, request_id, tool_name, input_summary, hint)
-            .await
+        self.route_with_mirror(conv, |p| async move {
+            p.send_permission_ask(conv, request_id, tool_name, input_summary, hint)
+                .await
+        })
+        .await
     }
 
     async fn send_permission_ask_text(
@@ -294,25 +370,33 @@ impl Platform for MultiPlatform {
         input_summary: &str,
         hint: &ReplyHint,
     ) -> Result<()> {
-        self.child_for(conv)?
-            .send_permission_ask_text(conv, tool_name, input_summary, hint)
-            .await
+        self.route_with_mirror(conv, |p| async move {
+            p.send_permission_ask_text(conv, tool_name, input_summary, hint)
+                .await
+        })
+        .await
     }
 
     async fn note_queued_on_ask(&self, conv: &ConvId, note: &str, hint: &ReplyHint) -> Result<()> {
-        self.child_for(conv)?
-            .note_queued_on_ask(conv, note, hint)
-            .await
+        self.route_with_mirror(conv, |p| async move {
+            p.note_queued_on_ask(conv, note, hint).await
+        })
+        .await
     }
 
     async fn cancel_permission_ask(&self, conv: &ConvId, request_id: &str) -> Result<()> {
-        self.child_for(conv)?
-            .cancel_permission_ask(conv, request_id)
-            .await
+        self.route_with_mirror(conv, |p| async move {
+            p.cancel_permission_ask(conv, request_id).await
+        })
+        .await
     }
 
     async fn cancel_all_permission_asks(&self, conv: &ConvId) -> Result<()> {
-        self.child_for(conv)?.cancel_all_permission_asks(conv).await
+        self.route_with_mirror(
+            conv,
+            |p| async move { p.cancel_all_permission_asks(conv).await },
+        )
+        .await
     }
 
     async fn resolve_permission_ask(
@@ -321,9 +405,10 @@ impl Platform for MultiPlatform {
         request_id: &str,
         reply: &crate::permission::PermissionReply,
     ) -> Result<()> {
-        self.child_for(conv)?
-            .resolve_permission_ask(conv, request_id, reply)
-            .await
+        self.route_with_mirror(conv, |p| async move {
+            p.resolve_permission_ask(conv, request_id, reply).await
+        })
+        .await
     }
 
     async fn send_command_card(
@@ -334,9 +419,11 @@ impl Platform for MultiPlatform {
         buttons: &[CardButton],
         hint: &ReplyHint,
     ) -> Result<()> {
-        self.child_for(conv)?
-            .send_command_card(conv, title, body_md, buttons, hint)
-            .await
+        self.route_with_mirror(conv, |p| async move {
+            p.send_command_card(conv, title, body_md, buttons, hint)
+                .await
+        })
+        .await
     }
 
     async fn send_config_form(
@@ -346,9 +433,10 @@ impl Platform for MultiPlatform {
         fallback: &str,
         hint: &ReplyHint,
     ) -> Result<()> {
-        self.child_for(conv)?
-            .send_config_form(conv, entries, fallback, hint)
-            .await
+        self.route_with_mirror(conv, |p| async move {
+            p.send_config_form(conv, entries, fallback, hint).await
+        })
+        .await
     }
 
     async fn react_to_message(
@@ -357,19 +445,22 @@ impl Platform for MultiPlatform {
         source_msg_id: &str,
         reaction: MsgReaction,
     ) -> Result<()> {
-        self.child_for(conv)?
-            .react_to_message(conv, source_msg_id, reaction)
-            .await
+        self.route_with_mirror(conv, |p| async move {
+            p.react_to_message(conv, source_msg_id, reaction).await
+        })
+        .await
     }
 
     async fn send_typing(&self, conv: &ConvId, hint: &ReplyHint) -> Result<()> {
-        self.child_for(conv)?.send_typing(conv, hint).await
+        self.route_with_mirror(conv, |p| async move { p.send_typing(conv, hint).await })
+            .await
     }
 
     async fn send_urgent_text(&self, conv: &ConvId, text: &str, hint: &ReplyHint) -> Result<()> {
-        self.child_for(conv)?
-            .send_urgent_text(conv, text, hint)
-            .await
+        self.route_with_mirror(conv, |p| async move {
+            p.send_urgent_text(conv, text, hint).await
+        })
+        .await
     }
 
     /// any 聚合，与 [`Self::capabilities`] 取并集同理：core 对「完成强提醒」
@@ -449,7 +540,8 @@ impl Platform for MultiPlatform {
         Ok(all)
     }
 
-    /// 无命中前缀静默跳过（无返回值的 best-effort 钩子，无处报错）。
+    /// 无命中前缀静默跳过（无返回值的 best-effort 钩子，无处报错）。不镜像：
+    /// 协作钩子非出站投递，且 web 平台未覆写（镜像恒为 no-op）。
     async fn note_round_initiator(&self, conv: &ConvId, sender: &str) {
         if let Ok(child) = self.child_for(conv) {
             child.note_round_initiator(conv, sender).await;
@@ -476,11 +568,12 @@ mod tests {
     //! 耦合——那边面向 dispatcher 集成，字段面完全不同）。
 
     use super::*;
-    use crate::types::UserId;
+    use crate::types::{CardPhase, CardTerminal, OutboundCard, UserId};
 
     /// 极简 mock 平台：name/caps/urgent/probes 可配；recv 从 mpsc 取（测试
-    /// 注入 Ok/Err）；send_text 记录到共享 Vec；reconnect_ok 决定 reconnect
-    /// 返回 Ok 还是走 default Err（聚合语义测试用）。
+    /// 注入 Ok/Err）；send_text 记录到共享 Vec（send_text_ok=false 时恒 Err，
+    /// 镜像失败语义测试用）；supports_streaming_card 可配（镜像路由测试用）；
+    /// reconnect_ok 决定 reconnect 返回 Ok 还是走 default Err（聚合语义测试用）。
     struct MockPlat {
         name: &'static str,
         caps: PlatformCaps,
@@ -489,16 +582,22 @@ mod tests {
         sent: Arc<TokioMutex<Vec<(String, String)>>>,
         probes: Vec<String>,
         reconnect_ok: bool,
+        /// supports_streaming_card 覆写值（默认 false，与既有用例行为一致）。
+        streaming: bool,
+        /// false = send_text 恒 Err（镜像投递失败不影响主投递的测试用）。
+        send_text_ok: bool,
     }
 
-    /// 构造 mock：返回（平台句柄、recv 注入端、send_text 记录端）。
-    /// `reconnect_ok` 决定 reconnect 返回 Ok 还是 Err（聚合语义测试用）。
-    fn mock(
+    /// 构造全参数 mock（mock / mock_opt 的公共实现）。
+    #[allow(clippy::too_many_arguments)]
+    fn mock_inner(
         name: &'static str,
         caps: PlatformCaps,
         urgent: bool,
         probes: Vec<String>,
         reconnect_ok: bool,
+        streaming: bool,
+        send_text_ok: bool,
     ) -> (Arc<MockPlat>, InjectTx, SentLog) {
         let (tx, rx) = mpsc::channel(8);
         let sent = Arc::new(TokioMutex::new(Vec::new()));
@@ -510,8 +609,40 @@ mod tests {
             sent: sent.clone(),
             probes,
             reconnect_ok,
+            streaming,
+            send_text_ok,
         });
         (p, tx, sent)
+    }
+
+    /// 构造 mock：返回（平台句柄、recv 注入端、send_text 记录端）。
+    /// `reconnect_ok` 决定 reconnect 返回 Ok 还是 Err（聚合语义测试用）。
+    fn mock(
+        name: &'static str,
+        caps: PlatformCaps,
+        urgent: bool,
+        probes: Vec<String>,
+        reconnect_ok: bool,
+    ) -> (Arc<MockPlat>, InjectTx, SentLog) {
+        mock_inner(name, caps, urgent, probes, reconnect_ok, false, true)
+    }
+
+    /// 精简 mock（镜像路由测试用）：caps 空 / 无 probes / reconnect 走 default
+    /// Err，仅可配 supports_streaming_card 与 send_text 是否成功。
+    fn mock_opt(
+        name: &'static str,
+        streaming: bool,
+        send_text_ok: bool,
+    ) -> (Arc<MockPlat>, InjectTx, SentLog) {
+        mock_inner(
+            name,
+            PlatformCaps::empty(),
+            false,
+            Vec::new(),
+            false,
+            streaming,
+            send_text_ok,
+        )
     }
 
     fn imsg(conv: &str) -> InboundMessage {
@@ -533,6 +664,23 @@ mod tests {
         }
     }
 
+    /// 空 tool/todo 的最小卡片夹具（镜像路由测试 send_card 用；mock 未覆写
+    /// send_card，default 降级为 send_text——断言经 sent 记录端生效）。
+    fn sample_card() -> OutboundCard {
+        OutboundCard {
+            text: "卡片".into(),
+            tool_calls: Vec::new(),
+            thoughts: Vec::new(),
+            todos: Vec::new(),
+            phase: CardPhase::Outputting,
+            queued_hint: None,
+            run_secs: 1,
+            usage_display: None,
+            task_digest: None,
+            terminal: CardTerminal::Running,
+        }
+    }
+
     #[async_trait]
     impl Platform for MockPlat {
         fn name(&self) -> &'static str {
@@ -544,6 +692,10 @@ mod tests {
         fn supports_urgent_text(&self) -> bool {
             self.urgent
         }
+        /// 可配覆写（镜像路由测试用：web 平台恒 true 的形态）。
+        fn supports_streaming_card(&self, _conv: &ConvId) -> bool {
+            self.streaming
+        }
         /// 队列空时挂起（sender 在测试手中），与真实平台「无消息长轮询」同形。
         async fn recv(&self) -> Result<InboundMessage> {
             self.rx.lock().await.recv().await.unwrap_or_else(|| {
@@ -554,6 +706,9 @@ mod tests {
             })
         }
         async fn send_text(&self, conv: &ConvId, text: &str, _hint: &ReplyHint) -> Result<()> {
+            if !self.send_text_ok {
+                return Err(CoreError::Platform(self.name, "mock send_text 失败".into()));
+            }
             self.sent
                 .lock()
                 .await
@@ -621,6 +776,92 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("无对应平台"), "{err}");
         assert!(!m.supports_streaming_card(&ConvId("c:z".into())));
+    }
+
+    /// 用例 8：local conv 出站镜像路由——send_text 归属落 local、镜像落 web
+    /// （驾驶舱），feishu（IM 通知渠道）不镜像；web/feishu conv 行为不变；
+    /// Option 返回型方法（send_card）同样镜像；supports_streaming_card 保持
+    /// 按前缀单查（local=false，不因 web 恒 true 被镜像污染）。
+    #[tokio::test]
+    async fn local_conv_outbound_mirrors_to_web() {
+        // local（streaming=false）/ web（streaming=true，真平台形态）/ feishu。
+        let (l, _ltx, l_sent) = mock_opt("local", false, true);
+        let (w, _wtx, w_sent) = mock_opt("web", true, true);
+        let (f, _ftx, f_sent) = mock_opt("feishu", false, true);
+        let m = MultiPlatform::new(vec![l, w, f]).expect("合并 local+web+feishu");
+
+        // local conv：归属 + 镜像双投递。
+        m.send_text(&ConvId("local:work".into()), "hi", &ReplyHint::None)
+            .await
+            .unwrap();
+        assert_eq!(
+            l_sent.lock().await.as_slice(),
+            &[("local:work".to_string(), "hi".to_string())],
+            "归属平台照常收到"
+        );
+        assert_eq!(
+            w_sent.lock().await.as_slice(),
+            &[("local:work".to_string(), "hi".to_string())],
+            "web 驾驶舱镜像收到"
+        );
+        assert!(f_sent.lock().await.is_empty(), "feishu 通知渠道不镜像");
+
+        // Option 返回型方法（send_card→mock default 降级为 send_text 记录）同镜像。
+        m.send_card(
+            &ConvId("local:work".into()),
+            &sample_card(),
+            &ReplyHint::None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(l_sent.lock().await.len(), 2);
+        assert_eq!(w_sent.lock().await.len(), 2, "send_card 同样镜像到 web");
+
+        // web / feishu conv：既有归属路由不变（web conv 不自我镜像）。
+        m.send_text(&ConvId("web:x".into()), "w", &ReplyHint::None)
+            .await
+            .unwrap();
+        m.send_text(&ConvId("feishu:y".into()), "f", &ReplyHint::None)
+            .await
+            .unwrap();
+        assert_eq!(w_sent.lock().await.len(), 3, "web 只多收自己 conv 那条");
+        assert_eq!(
+            f_sent.lock().await.as_slice(),
+            &[("feishu:y".to_string(), "f".to_string())]
+        );
+
+        // 能力查询不镜像：按前缀单查 local（false），不取 web 的 true。
+        assert!(!m.supports_streaming_card(&ConvId("local:work".into())));
+    }
+
+    /// 用例 9：镜像投递失败（web 平台 Err）不影响主投递——local conv 的
+    /// send_text 仍 Ok 且 local 平台照常收到（best-effort 旁路语义）。
+    #[tokio::test]
+    async fn mirror_failure_does_not_block_primary() {
+        let (l, _ltx, l_sent) = mock_opt("local", false, true);
+        let (w, _wtx, _w_sent) = mock_opt("web", true, false); // send_text 恒 Err
+        let m = MultiPlatform::new(vec![l, w]).unwrap();
+        m.send_text(&ConvId("local:work".into()), "hi", &ReplyHint::None)
+            .await
+            .expect("镜像失败不得阻塞主投递");
+        assert_eq!(
+            l_sent.lock().await.as_slice(),
+            &[("local:work".to_string(), "hi".to_string())]
+        );
+    }
+
+    /// 用例 10：children 无 web 平台时镜像静默跳过——local conv 照常 Ok、仅
+    /// local 平台收到（feishu+local 两平台配置形态）。
+    #[tokio::test]
+    async fn mirror_skipped_without_web_child() {
+        let (l, _ltx, l_sent) = mock_opt("local", false, true);
+        let (f, _ftx, f_sent) = mock_opt("feishu", false, true);
+        let m = MultiPlatform::new(vec![l, f]).unwrap();
+        m.send_text(&ConvId("local:x".into()), "hi", &ReplyHint::None)
+            .await
+            .unwrap();
+        assert_eq!(l_sent.lock().await.len(), 1);
+        assert!(f_sent.lock().await.is_empty());
     }
 
     /// 用例 2：recv 合流——a、b 各注入一条，组合器 recv 两次拿到两条（顺序

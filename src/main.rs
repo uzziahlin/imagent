@@ -139,6 +139,15 @@ enum Cmd {
         #[arg(long)]
         print_config: bool,
     },
+    /// 本地终端（完全体）：连接运行中网关的 local 平台（`~/.imagent/local.sock`），
+    /// 会话从网关出生（conv `local:<会话名>`）。**终端只是视图**——Ctrl-C / exit
+    /// 仅退出本视图，会话继续在网关跑（重入续看 / 网页侧接管）。需网关以
+    /// platforms 含 "local" 启动（`imagent start`）；网关未运行时退出码 2。
+    Claude {
+        /// 会话名（缺省 default；conv 形如 local:<名>，与 IM/web 共享同一
+        /// Dispatcher 管线：steering / 审批 / /stop 全可用）。
+        session: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -668,9 +677,9 @@ async fn main() -> Result<()> {
                     vec![config.platform.clone()]
                 };
             for n in &platform_names {
-                if n != "ilink" && n != "wecom" && n != "feishu" && n != "web" {
+                if n != "ilink" && n != "wecom" && n != "feishu" && n != "web" && n != "local" {
                     return Err(anyhow!(
-                        "未知 platform={n}，支持 ilink | wecom | feishu | web"
+                        "未知 platform={n}，支持 ilink | wecom | feishu | web | local"
                     ));
                 }
             }
@@ -773,7 +782,7 @@ async fn main() -> Result<()> {
 
             // 7. auth —— 白名单：config 种子 ∪ store 已有（CLI /allow 或 IM /allow 持久化）；
             //    会话（群）白名单同构（P4-5）。
-            let initial = ops::union_config_store(
+            let mut initial = ops::union_config_store(
                 &config.allowed_senders,
                 store.list_allowed_senders().await.unwrap_or_default(),
             );
@@ -781,14 +790,33 @@ async fn main() -> Result<()> {
                 &config.allowed_chats,
                 store.list_allowed_chats().await.unwrap_or_default(),
             );
+            // local 平台：本地终端 sender（local:user）自动白名单 + 管理员。
+            // 凭证链 = local.sock 0600 + peer uid 校验（LocalPlatform accept 侧）
+            // ——同 uid 即机器本主，与 CLI `imagent allow` 的「本地最高权限」
+            // 同级；不自动放行会让 `imagent claude` 的消息被白名单静默丢弃，
+            // 「终端照常用」不成立。副作用：原本全空白的名单（发现模式）因
+            // local:user 进入而关闭——挂 local 的部署本就默认信任终端操作者，
+            // IM 侧首次授权仍可经私聊陌生人引导（stranger_p2p_hint 默认开）完成。
+            if platform_names.iter().any(|n| n == "local")
+                && !initial.iter().any(|s| s == "local:user")
+            {
+                initial.push("local:user".to_string());
+            }
             let auth = imagent_core::Auth::with_chats(initial, initial_chats);
             let discovery = auth.is_discovery();
 
             // P7-A1：管理员 = config 种子 ∪ store 动态条目（/admin add 持久化）。
-            let initial_admins = ops::union_config_store(
+            let mut initial_admins = ops::union_config_store(
                 &config.admin_senders,
                 store.list_admin_senders().await.unwrap_or_default(),
             );
+            // local:user 同进管理员（同 uid 终端 = 机器本主，/config /admin 等
+            // 管理命令对终端可用；非提权——同 uid 本可直接改 config / 跑 CLI）。
+            if platform_names.iter().any(|n| n == "local")
+                && !initial_admins.iter().any(|s| s == "local:user")
+            {
+                initial_admins.push("local:user".to_string());
+            }
 
             // S2（v7 review）：admin_senders 为空 = 无人可 admin（IM 内管理命令
             // 一律拒绝，提示走 CLI/setup 配置）。群放行时空管理员不再有扩权风险，
@@ -1365,6 +1393,16 @@ async fn main() -> Result<()> {
                 tracing::error!(target: "imagent::mcp", error = %e, "MCP ask server 退出");
             }
         }
+        Cmd::Claude { session } => {
+            // 本地终端客户端：连网关 local.sock（local 平台，unix socket）。
+            // 只做视图——本进程不持实例锁、不驱动 agent；Ctrl-C 退出由
+            // term::run 内部处理（不向网关发停止信号）。退出码 2 = 网关未运行。
+            let socket = data_dir.join("local.sock");
+            let code = imagent_localterm::term::run(&socket, session)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
     }
 
     Ok(())
@@ -1476,6 +1514,10 @@ fn build_backend(
 ///   config.toml，与飞书先例同款）；`web_default_session` 缺省 "default"；
 ///   machine 身份 = `web_machine_id` 显式值 / 缺省 hostname 短名（M5 多终端，
 ///   hello 自报给 relay）。
+/// - `"local"` → [`imagent_localterm::LocalPlatform`]（本地终端，`imagent claude`）：
+///   **无 config 字段**——socket 锚定 `<imagent_home>/local.sock`，凭证 = 文件
+///   0600 + accept 侧 peer uid 校验（同 uid = 机器本主），无可配凭据。会话
+///   conv 形如 `local:<会话名>`，与 IM/web 并存（MultiPlatform 前缀路由）。
 /// - 其它（含默认 `"ilink"`）→ [`imagent_ilink::ILinkPlatform`]，
 ///   行为与单平台时期完全一致（读 store 的 ilink 凭据 + 扫码登录的 client）。
 async fn build_platform(
@@ -1580,6 +1622,14 @@ async fn build_platform(
                 default_session,
                 machine_id,
             )))
+        }
+        "local" => {
+            // 本地终端平台：socket 锚定 imagent home（与 permission.sock 同目录
+            // 约定；--profile 经 IMAGENT_HOME 自动隔离）。无 config 字段——
+            // 本地 socket 的凭证是 0600 权限 + peer uid，无可配凭据。bind 失败
+            // fail-closed（Err 上抛，启动期暴露）。
+            let socket = imagent_core::paths::imagent_home().join("local.sock");
+            Ok(Arc::new(imagent_localterm::LocalPlatform::new(socket)?))
         }
         _ => {
             // 默认 ilink：保持既有行为。

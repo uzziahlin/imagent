@@ -336,10 +336,11 @@ pub struct Config {
     pub platform: String,
     /// M2.5 多平台并存列表（如 `["feishu", "web"]`）。**非空时优先于上面的
     /// `platform` 单值**（装配优先级：CLI `--platform` > 本列表 > 单值；单值
-    /// 字段保留兼容，既有部署零改动）。元素须 ∈ {ilink, wecom, feishu, web}
-    /// 且互异；长度 1 合法（等价单值，装配层直接用单平台、不包组合器）。
+    /// 字段保留兼容，既有部署零改动）。元素须 ∈ {ilink, wecom, feishu, web,
+    /// local} 且互异；长度 1 合法（等价单值，装配层直接用单平台、不包组合器）。
     /// 多平台由 [`crate::MultiPlatform`] 组合器合并（conv 前缀路由），Dispatcher
-    /// 零改动。**改动需重启**：平台在启动期装配，SIGHUP 不换平台。
+    /// 零改动。`local` = 本地终端（`imagent claude`，unix socket，零 config）。
+    /// **改动需重启**：平台在启动期装配，SIGHUP 不换平台。
     #[serde(default)]
     pub platforms: Vec<String>,
     /// IM 权限审批模式（默认 Auto：按后端自动选档，见 [`PermissionMode::Auto`]）。
@@ -1238,9 +1239,9 @@ impl Config {
         {
             let mut seen = std::collections::HashSet::new();
             for p in &cfg.platforms {
-                if !matches!(p.as_str(), "ilink" | "wecom" | "feishu" | "web") {
+                if !matches!(p.as_str(), "ilink" | "wecom" | "feishu" | "web" | "local") {
                     return Err(CoreError::Config(format!(
-                        "未知 platform={p}（platforms 列表），支持 ilink | wecom | feishu | web"
+                        "未知 platform={p}（platforms 列表），支持 ilink | wecom | feishu | web | local"
                     )));
                 }
                 if !seen.insert(p.as_str()) {
@@ -1409,8 +1410,9 @@ allowed_senders = []        # 留空 = 发现模式（只打日志记录入站 s
 # admin_senders = []          # 可 /allow 等管理命令的管理员 sender；空=无人是管理员(IM 内管理命令不可用，须 CLI/setup 配置)
 # allowed_tools = ["*"]                      # 缺省=全部工具（不收敛）；要白名单显式列（如 ["Read","Edit"]）；执行类建议配 permission_mode="ask"
 agent = "claude-cli"         # claude-cli(默认) | claude-acp(Claude ACP长驻子进程) | acp(任意ACP agent,配acp_command) | codex | gemini
-platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人) | feishu(飞书,配 feishu_app_id + 环境变量 IMAGENT_FEISHU_APP_SECRET) | web(网页驾驶舱,配 web_relay_url + 环境变量 IMAGENT_WEB_GATEWAY_TOKEN)
+platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人) | feishu(飞书,配 feishu_app_id + 环境变量 IMAGENT_FEISHU_APP_SECRET) | web(网页驾驶舱,配 web_relay_url + 环境变量 IMAGENT_WEB_GATEWAY_TOKEN) | local(本地终端,零配置)
 # platforms = ["feishu", "web"]   # 多平台并存（非空时覆盖上面的 platform 单值）；IM 做通知兜底 + web 做驾驶舱
+# platforms = ["web", "local"]    # 例：web 驾驶舱 + 本地终端(imagent claude,~/.imagent/local.sock,0600+peer uid 即凭证,sender local:user 自动白名单)
 # web_relay_url = "wss://your-ecs:8443/imagent/gateway"   # 仅 platform="web"：ECS relay 网关端点（Caddy TLS 终结 + strip /imagent 前缀）；gateway token 走环境变量 IMAGENT_WEB_GATEWAY_TOKEN（敏感不入本文件）；web 消息 sender 恒为 web:user，需加入 allowed_senders（或 admin_senders）白名单才会被处理
 # web_default_session = "default"   # 仅 platform="web"：无 convId 的浏览器消息落到的默认会话名（conv 形如 web:<name>）
 # web_machine_id = "home-mac"       # 仅 platform="web"：本机 machine 身份（多台 Mac 接同一 relay 时区分终端，浏览器按 machine 切换管理；缺省取 hostname 短名；同 machine 新连接会顶替旧连接）
@@ -1636,6 +1638,15 @@ platforms = ["feishu"]
 "#,
         );
         assert!(Config::load(&p).is_ok(), "单元素列表合法（等价单值）");
+        cleanup(&p);
+        // local（本地终端，imagent claude）在名单内。
+        let p = tmp_path(
+            "pl_local",
+            r#"default_workdir = "/tmp/ws"
+platforms = ["web", "local"]
+"#,
+        );
+        assert!(Config::load(&p).is_ok(), "local 应在 platforms 名单内");
         cleanup(&p);
         // 非法名。
         let p = tmp_path(

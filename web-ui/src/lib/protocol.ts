@@ -2,6 +2,11 @@
 // 信封 `{"v":1,"type":...}`，全部 JSON 文本帧。TS 类型与 Rust 侧逐字段对齐：
 // - convId 恒为完整 conv 形态（`web:<session>`）；裸 session 名仅网关侧兼容输入，
 //   SPA 回执帧（message / approval_response）一律原样回传收到的 convId。
+//   例外即透传：`local:<会话名>` 是网关侧本地终端会话（crates/localterm）的
+//   既有 conv 形态——MultiPlatform 镜像路由把 local 会话出站同步给 web 平台，
+//   SPA 收到即收集为侧栏会话；对 local 会话的干预消息/审批回执原样携带
+//   local: convId（web 出生才缺省 web: 前缀，网关 normalize_conv 对 local:
+//   前缀透传放行），SPA 侧不对其做任何前缀改写。
 // - CardPayload 可选字段对齐 Rust `skip_serializing_if = "Option::is_none"`
 //   （缺席即未序列化）。
 // - v1.1 多终端：浏览器→网关帧可选带 `machine`（目标机器）；网关→浏览器帧
