@@ -6,8 +6,10 @@
 ## 0. 一页速览
 
 - **已完成并稳定运行**：Happy 自建中继全套基础设施（ECS 深圳 + 域名 HTTPS + happy-server + 自动续期），手机 App「会话列表不实时刷新」为上游 App 渲染 bug，与我们的部署无关，等 App 更新即可
-- **当前主任务**：imagent **Web 驾驶舱平台**（分支 `feat/web-platform`）——**M1 已完成并部署验收**（`crates/relay` 代码 commit `e6d11ca`（15 测试全绿）+ ECS systemd 服务 active + Caddy 路由 + Mac 公网 wss 全链路双端实测通过：healthz/错 token 1008/双端互通/machine 上下线通知）。下一步 M2 `crates/web` Platform impl（帧协议以 crates/relay 实现为准：hello 首帧/Bearer 直通两种认证、hello_ack/machine/error 自产帧、ping 文本帧端到端透传）
-- **M2+ 计划**：M2 `crates/web`（Platform impl + WS 客户端 + 配置）→ M2.5 MultiPlatform 组合器（feishu+web 并存）→ M3a/M3b web-ui SPA → M4 端到端验收（含 /resume 接管）。设计全文 `docs/WEB_DESIGN.md`（2026-10-28 评审修订已写入），编码派 subagent、主会话 review（用户 AGENTS.md 纪律）
+- **当前主任务**：imagent **Web 驾驶舱平台**（分支 `feat/web-platform`）——**M1-M4 全部完成（2026-10-28）**：M1 relay `e6d11ca`（ECS systemd 运行中，含 SPA 产物）/ M2 WebPlatform `eee5719` / M2.5 MultiPlatform 组合器 `ebd6ce7`（`platforms=["feishu","web"]` 并存，Dispatcher 零改动）/ M3a SPA `c559832`（浏览器驾驶舱已上线 `https://relay.example.com:8443/imagent/`）/ M4 端到端验收全过（临时实例真机：消息→agent 流式→终态→掉线检测→自动恢复→/resume 列表→`lsof` 证 Mac 零监听）
+- **M4 网络关键事实**：Mac 直连 ECS 8443 的 **rustls（tokio-tungstenite）TLS 指纹被 DPI RST**（curl/LibreSSL 同款，Node/WebKit 不受影响）——网关侧走 **ssh 隧道**绕开：`ssh -f -N -L 3011:127.0.0.1:3010 root@192.0.2.10`（Mac 公钥已注入 ECS authorized_keys），config `web_relay_url = "ws://127.0.0.1:3011/gateway"`。隧道为手动进程，重启 Mac 后需重起（launchd 常驻化待做）；产品化正解是 crates/web 加 SOCKS5 代理支持（走 Clash），后续批
+- **验收临时实例仍在跑**（可手机直接体验）：`IMAGENT_HOME=/tmp/imagent-m4 ./target/debug/imagent start`（platform=web 单平台、workdir=/tmp/imagent-m4-work 隔离、token 取 `~/.imagent/web-relay.env`）；生产 feishu 实例（release 二进制）全程未动。**正式启用**：生产 config 加 `platforms = ["feishu","web"]` + `web_relay_url` + env `IMAGENT_WEB_GATEWAY_TOKEN`（= relay 侧 GATEWAY_TOKEN）+ `allowed_senders` 加 `"web:user"`，切新 release 构建
+- **已知事项**：① GLM coding plan 工具面为 ToolSearch 延迟制（无 Bash/Read），真机审批闭环无法自然触发（本地全链路已验证 approval 帧闭环）；用户日常形态待确认 ② web 会话在 /resume 列表显示 📱 标记（来源图标细节）③ 纯观看 90s 需 SPA 心跳（已实现 25s ping）④ M3b 富渲染（代码高亮/工具卡折叠/thoughts/rehype-sanitize 替代源文本剥标签）+ relay CSP 头 + PWA service worker 均未做（设计 phase2）
 - **开工前置（已完成）**：delegate/sandbox 双批已收尾提交 main（`3aea1d8` feat + `5546886` release，v1.32.0）；本文件与 `docs/WEB_DESIGN.md` 已随分支首个 commit（`d6803ce`）入库
 
 ## 1. 基础设施清单（Happy 自建中继，全在运行）
@@ -83,12 +85,14 @@ systemctl restart imagent-relay
 2. **前置**：delegate 批次 WIP（16 文件 +1249 行）**已提交完成**（v1.31 委托编排 + v1.32 OS 沙箱双批，见 git log `3aea1d8`/`5546886`）
 3. **评审修订（2026-10-28 代码级评审后拍板）**：① 新增 **M2.5 MultiPlatform 组合器**——现调度器为单 Platform（`Config.platform` 单值），不补则选 web 即掉 feishu，与「IM 兜底」矛盾；组合器自身实现 Platform（recv select 合并 / send 按 conv 前缀路由 / capabilities 交集），Dispatcher 零改动，配置形态 `platforms = ["feishu", "web"]`；② `approval_response` 帧补**必填 convId**（PermissionRouter 按 conv+request_id 路由）；③ `/resume` 接管本机会话**提进 M4 验收**（核心已存在，网页侧只是可点列表）+ M3 拆 M3a（文本流/composer/审批）/ M3b（卡片富渲染）；④ 定位锚点：Web 的增量是驾驶舱体验 + 自有栈，**不是** takeover 实时性——「接管正在跑的本地会话」短期靠 Happy + `/resume` 手递手，终态 `imagent term`（本地前端复用同会话池）上远期路线，均不进 MVP
 
-### 3.4 里程碑与工时（AI 辅助编码前提）
+### 3.4 里程碑（全部完成 2026-10-28）
 
-- M1 `crates/relay` ✅ **已完成**（2026-10-28：代码 `e6d11ca` + ECS 部署 + 公网验收全过；实做 ~700 行含 15 测试，超出 ~400 行估计——认证双形态/踢旧 conn_id/集成测试更完整）
-- M2 `crates/web`（Platform impl + WS 客户端 + 配置 `[[platform.web]]`）—— 0.5-1 天
-- M3 `web-ui/`（Vite+React+Tailwind：登录/消息流/流式卡片/审批/composer；DOMPurify 必须）—— 1-2 天
-- M4 端到端验收（PWA、断线演练、`ss -tln` 证 Mac 零监听）—— 0.5 天
+- M1 `crates/relay` ✅ `e6d11ca`（ECS 运行中；实做 ~700 行 15 测试）
+- M2 `crates/web` ✅ `eee5719`（~2100 行 26 测试：22 单测 + 4 回环集成）
+- M2.5 MultiPlatform ✅ `ebd6ce7`（core 378 测试；caps 并集 + recv 错误隔离）
+- M3a `web-ui/` SPA 基座 ✅ `c559832`（29 前端测试 + 浏览器闭环验收 + relay 直连前缀兼容修复）
+- M4 端到端验收 ✅（公网真机：流式/掉线/恢复//resume/零监听；网络走 ssh 隧道，见 §0）
+- 待办（phase2）：M3b 富渲染、relay CSP 头、SOCKS5 代理支持（替代隧道）、隧道 launchd 常驻、PWA service worker、E2E 加密
 
 ### 3.5 imagent 代码接线要点（已源码考察确认）
 

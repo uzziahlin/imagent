@@ -152,8 +152,8 @@ Mac：imagent gateway
 
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
-| M1 relay | 双 WS 端点 + token + 帧中继 + 缓冲/限流 + 内嵌静态；部署 ECS + Caddy 路由 | wscat 双端互发互通；断网缓冲重放；未带 token 401 |
-| M2 gateway | `crates/web` Platform impl + WS 客户端 + 配置项 | 单测（recv/send 帧映射）；gateway 连 relay，`/doctor` 可见 `web` 平台在线 |
+| M1 relay ✅ | 双 WS 端点 + token + 帧中继 + 缓冲/限流 + 内嵌静态；部署 ECS + Caddy 路由（2026-10-28 完成 `e6d11ca`，Node 双端实测 + 未带 token close 1008） | ✅ |
+| M2 gateway ✅ | `crates/web` Platform impl + WS 客户端 + 配置项（`eee5719`，26 测试含回环集成） | ✅ |
 | **M2.5 MultiPlatform**（2026-10-28 评审新增，开工前已拍板） | 多平台组合器：自身实现 `Platform`——`recv()` select 合并子平台、`send_*` 按 conv 前缀路由（`feishu:` → feishu、`web:` → web）、capabilities 取交集；Dispatcher **零改动**。背景：现调度器为单 Platform（`Config.platform` 单值 → `build_platform` 单个 → Dispatcher 持一个），不补此件则选 web 即掉 feishu，与「IM 做轻通知兜底」自相矛盾。配置形态定为 `platforms = ["feishu", "web"]` 列表（与 `[[platform.web]]` 二选一，实现时定稿） | feishu + web 同时在线：web 驱动轮次、feishu 收审批加急/完成通知；单平台配置行为不变（回归） |
 | M3a web-ui 基座 | 登录页 + 会话页（**文本流 + composer + 审批弹层**先行） | 手机 4G：网页发「列出目录」→ 审批按钮 → 批准 → 流式回显（M3 拆两步：渲染保真度是最大工作量风险，先闭环最短链路） |
 | M3b web-ui 富渲染 | 流式卡片 / 工具折叠卡（对标 ZCode 渐进逼近；diff 视图仍 phase2） | 卡片流式节流与 IM 侧观感等价；长输出截断 + 补全文路径可用 |
