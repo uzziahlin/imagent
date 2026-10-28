@@ -1,5 +1,6 @@
 //! relay 集成测试：真 server（lib `spawn_relay`，绑 127.0.0.1:0 随机端口）
-//! 加 tokio-tungstenite 双客户端，覆盖任务说明 §5 全部 8 个场景。
+//! 加 tokio-tungstenite 客户端，覆盖任务说明 §5 场景与多端并存改造用例
+//!（多 browser 共存广播 / 并存上限 4001 / 单条退出其余存活）。
 //! close code 断言依赖 tungstenite 把 Close 帧投递给应用层，可精确断言，
 //! 无需退化。
 
@@ -302,6 +303,140 @@ async fn e2e_supersede_kicks_old_gateway_4001() {
         .await
         .unwrap();
     assert_eq!(next_text(&mut g2).await, r#"{"v":1,"type":"ping"}"#);
+
+    handle.shutdown();
+    handle.wait().await;
+}
+
+/// 场景 11（多端并存改造）：两条 browser 连接共存（取代原「新 browser
+/// 踢旧 4001」语义——真机常态是手机 + 电脑 + 多标签同时在线）：各自发帧
+/// gateway 都收到；gateway 上/下线 machine 帧与业务帧两条都收到（广播）。
+#[tokio::test]
+async fn e2e_two_browsers_coexist_and_broadcast() {
+    let handle = spawn_test_relay().await;
+    let addr = handle.addr;
+
+    // 两条 browser 先在线（各自 machine 快照 false，第一条不被踢）。
+    let mut b1 = connect_ws(&addr, "/ws", None).await;
+    hello_handshake(&mut b1, USER_TOKEN).await;
+    let snap = next_text(&mut b1).await;
+    assert!(snap.contains(r#""online":false"#), "{snap}");
+    let mut b2 = connect_ws(&addr, "/ws", None).await;
+    hello_handshake(&mut b2, USER_TOKEN).await;
+    let snap = next_text(&mut b2).await;
+    assert!(snap.contains(r#""online":false"#), "{snap}");
+
+    // 网关上线：machine online 广播，两条都收到。
+    let mut gw = connect_ws(&addr, "/gateway", Some(GW_TOKEN)).await;
+    let _ = next_text(&mut gw).await; // hello_ack
+    let m = next_text(&mut b1).await;
+    assert!(m.contains(r#""online":true"#), "b1 收上线广播：{m}");
+    let m = next_text(&mut b2).await;
+    assert!(m.contains(r#""online":true"#), "b2 收上线广播：{m}");
+
+    // 两条 browser 各自发帧 → gateway 都收到（入站语义不变）。
+    let m1 = r#"{"v":1,"type":"message","from":"b1"}"#;
+    b1.send(Message::text(m1)).await.unwrap();
+    assert_eq!(next_text(&mut gw).await, m1, "b1 → gateway");
+    let m2 = r#"{"v":1,"type":"message","from":"b2"}"#;
+    b2.send(Message::text(m2)).await.unwrap();
+    assert_eq!(next_text(&mut gw).await, m2, "b2 → gateway");
+
+    // gateway 发一帧 → 两条 browser 都收到（广播）。
+    let g = r#"{"v":1,"type":"text","text":"hi-all"}"#;
+    gw.send(Message::text(g)).await.unwrap();
+    assert_eq!(next_text(&mut b1).await, g, "b1 收广播");
+    assert_eq!(next_text(&mut b2).await, g, "b2 收广播");
+
+    // 网关干净断开 → machine offline 广播，两条都收到。
+    gw.close(None).await.unwrap();
+    let m = next_text(&mut b1).await;
+    assert!(m.contains(r#""online":false"#), "b1 收下线广播：{m}");
+    let m = next_text(&mut b2).await;
+    assert!(m.contains(r#""online":false"#), "b2 收下线广播：{m}");
+
+    handle.shutdown();
+    handle.wait().await;
+}
+
+/// 场景 12（多端并存改造）：并存上限——8 条（relay `MAX_BROWSERS`）注册
+/// 成功后，第 9 条认证通过仍被 close 4001（满员让位，复用 superseded
+/// 语义，SPA 已有终态处理）；在线 8 条收广播不受影响。
+#[tokio::test]
+async fn e2e_browser_cap_9th_close_4001() {
+    let handle = spawn_test_relay().await;
+    let addr = handle.addr;
+
+    let mut gw = connect_ws(&addr, "/gateway", Some(GW_TOKEN)).await;
+    let _ = next_text(&mut gw).await; // hello_ack
+
+    let mut browsers = Vec::new();
+    for _ in 0..8 {
+        let mut ws = connect_ws(&addr, "/ws", None).await;
+        hello_handshake(&mut ws, USER_TOKEN).await;
+        let snap = next_text(&mut ws).await;
+        assert!(snap.contains(r#""online":true"#), "{snap}");
+        browsers.push(ws);
+    }
+
+    // 第 9 条：认证通过 → 未注册 → close 4001（reason 表满员而非踢旧）。
+    let mut b9 = connect_ws(&addr, "/ws", None).await;
+    b9.send(Message::text(format!(
+        r#"{{"v":1,"type":"hello","token":"{USER_TOKEN}"}}"#
+    )))
+    .await
+    .unwrap();
+    let frame = expect_close(&mut b9, 4001).await;
+    assert!(
+        frame.reason.to_string().contains("browsers"),
+        "reason={}",
+        frame.reason
+    );
+
+    // 满员拒绝不影响在线 8 条：gateway 广播一帧全部收到。
+    let g = r#"{"v":1,"type":"text","text":"fanout"}"#;
+    gw.send(Message::text(g)).await.unwrap();
+    for (i, ws) in browsers.iter_mut().enumerate() {
+        assert_eq!(next_text(ws).await, g, "第 {} 条应照常收广播", i + 1);
+    }
+
+    handle.shutdown();
+    handle.wait().await;
+}
+
+/// 场景 13（多端并存改造）：单条 browser 断开只清自己——其余照常收
+/// gateway 业务广播与 machine 帧（下线不误伤并存连接）。
+#[tokio::test]
+async fn e2e_browser_disconnect_others_keep_receiving() {
+    let handle = spawn_test_relay().await;
+    let addr = handle.addr;
+
+    let mut b1 = connect_ws(&addr, "/ws", None).await;
+    hello_handshake(&mut b1, USER_TOKEN).await;
+    let _ = next_text(&mut b1).await; // machine false
+    let mut b2 = connect_ws(&addr, "/ws", None).await;
+    hello_handshake(&mut b2, USER_TOKEN).await;
+    let _ = next_text(&mut b2).await; // machine false
+
+    // b1 干净断开 → 服务端只清 b1 自己的条目。
+    b1.close(None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await; // 等服务端 release
+
+    // 网关上线：machine online 广播，b2（仍在线）收到。
+    let mut gw = connect_ws(&addr, "/gateway", Some(GW_TOKEN)).await;
+    let _ = next_text(&mut gw).await;
+    let m = next_text(&mut b2).await;
+    assert!(m.contains(r#""online":true"#), "b2 收上线广播：{m}");
+
+    // gateway 业务帧：b2 仍正常收（b1 退出未影响广播目标）。
+    let g = r#"{"v":1,"type":"text","text":"after-leave"}"#;
+    gw.send(Message::text(g)).await.unwrap();
+    assert_eq!(next_text(&mut b2).await, g);
+
+    // 网关断开：machine offline 广播，b2 收到。
+    gw.close(None).await.unwrap();
+    let m = next_text(&mut b2).await;
+    assert!(m.contains(r#""online":false"#), "b2 收下线广播：{m}");
 
     handle.shutdown();
     handle.wait().await;
