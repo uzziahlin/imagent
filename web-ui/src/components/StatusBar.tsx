@@ -5,6 +5,8 @@ const STATUS_META: Record<ConnStatus, { label: string; dot: string }> = {
   connecting: { label: "连接中", dot: "bg-amber-400 animate-pulse" },
   ready: { label: "已连接", dot: "bg-emerald-400" },
   reconnecting: { label: "重连中", dot: "bg-rose-400 animate-pulse" },
+  // 被同 token 新窗口顶替：醒目但非错误色（violet，区别于 amber 连接中 / rose 重连中）
+  superseded: { label: "已在其它窗口连接", dot: "bg-violet-400" },
 };
 
 /** 顶部状态条：relay 连接态 + Mac 在线态（machine 帧）+ 当前 conv + 退出。 */
@@ -13,11 +15,14 @@ export function StatusBar({
   machineOnline,
   currentConv,
   onLogout,
+  onReconnect,
 }: {
   status: ConnStatus;
   machineOnline: boolean;
   currentConv: string;
   onLogout: () => void;
+  /** superseded 态用户显式重连（新连接会顶替另一窗口，是用户意图）。 */
+  onReconnect: () => void;
 }) {
   const meta = STATUS_META[status];
   return (
@@ -25,6 +30,17 @@ export function StatusBar({
       <div className="flex items-center gap-1.5 text-xs text-slate-300">
         <span className={`h-2 w-2 rounded-full ${meta.dot}`} aria-hidden="true" />
         <span>{meta.label}</span>
+        {status === "superseded" && (
+          <>
+            <span className="text-slate-500">如需在此窗口使用</span>
+            <button
+              onClick={onReconnect}
+              className="rounded-lg border border-violet-500/40 bg-violet-500/10 px-2 py-0.5 text-xs text-violet-300 transition-colors hover:bg-violet-500/20 hover:text-violet-100"
+            >
+              重新连接
+            </button>
+          </>
+        )}
       </div>
       <div className="flex items-center gap-1.5 text-xs">
         <span

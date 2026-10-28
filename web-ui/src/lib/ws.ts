@@ -2,8 +2,10 @@
 // connect → 首帧 hello（token 只在此帧出现，绝不进 URL）→ 等 hello_ack
 // （10s 超时视为失败）→ ready → 立即发 sync（含重连场景）→ 25s 应用层 ping
 // （relay idle 90s 断连）→ 断线指数退避重连 1s→30s（成功重置）→ 收 close 1008
-// 视为 token 无效（onAuthFailed，回登录页清 token，不再重连）→ >60s 无任何
-// 入站帧视为链路僵死，主动断开重连。
+// 视为 token 无效（onAuthFailed，回登录页清 token，不再重连）→ 收 close 4001
+// 视为本连接被同 token 新窗口顶替（进入 superseded 终态：停心跳停重连，否则
+// 两窗口互踢死循环；用户显式 connect() 才重连，反之顶替对方是用户意图）→
+// >60s 无任何入站帧视为链路僵死，主动断开重连。
 
 import {
   encodeFrame,
@@ -13,7 +15,7 @@ import {
   type OutboundFrame,
 } from "./protocol";
 
-export type ConnStatus = "connecting" | "ready" | "reconnecting";
+export type ConnStatus = "connecting" | "ready" | "reconnecting" | "superseded";
 
 /** 事件参数的最小形状（open/error 事件无载荷，message/close 各取所需字段）。 */
 export type WsEvent = { data?: unknown; code?: number };
@@ -54,6 +56,9 @@ export interface WsManagerOptions {
 /** relay 认证失败 close code（crates/relay CLOSE_POLICY = 1008）。 */
 export const CLOSE_AUTH_FAILED = 1008;
 
+/** relay 同 token 新连接顶替旧连接 close code（crates/relay CLOSE_SUPERSEDED = 4001）。 */
+export const CLOSE_SUPERSEDED = 4001;
+
 export class WsManager {
   private readonly url: string;
   private readonly token: string;
@@ -92,7 +97,8 @@ export class WsManager {
     this.maxBackoffMs = opts.maxBackoffMs ?? 30_000;
   }
 
-  /** 建立连接（幂等：重复调用无效果）。 */
+  /** 建立连接（幂等：重复调用无效果）。superseded 终态后可再次调用——
+   *  用户显式重连（新连接会反过来顶替另一窗口，是用户意图）。 */
   connect(): void {
     if (this.socket) {
       return;
@@ -223,6 +229,13 @@ export class WsManager {
       // relay 认证失败：token 无效 → 回登录页，不重连
       this.stopped = true;
       this.onAuthFailed();
+      return;
+    }
+    if (code === CLOSE_SUPERSEDED) {
+      // 本连接被同 token 新窗口顶替：进入终态，不自动重连
+      // （自动重连会顶替回去，两个窗口互踢死循环）；用户显式 connect() 才重连。
+      this.stopped = true;
+      this.setStatus("superseded");
       return;
     }
     this.scheduleReconnect();

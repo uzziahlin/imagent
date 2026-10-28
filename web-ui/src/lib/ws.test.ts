@@ -152,6 +152,42 @@ describe("WsManager", () => {
     expect(FakeWebSocket.created).toHaveLength(1);
   });
 
+  it("close 4001 进入 superseded 终态：不重连、心跳停止、不触发 onAuthFailed", () => {
+    const h = makeManager();
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    // 先让心跳跑起来（25s 一个 ping），确认 close 4001 后心跳真的停了
+    vi.advanceTimersByTime(25_000);
+    expect(sock.sentOfType("ping")).toHaveLength(1);
+    sock.emit("close", { code: 4001 });
+    expect(h.statuses.at(-1)).toBe("superseded");
+    expect(h.authFailed).toBe(0);
+    // 心跳停止：此后 50s（两个 ping 周期）无新 ping
+    vi.advanceTimersByTime(50_000);
+    expect(sock.sentOfType("ping")).toHaveLength(1);
+    // 不自动重连：退避定时器不调度，120s 后仍只有初始一个 socket
+    vi.advanceTimersByTime(120_000);
+    expect(FakeWebSocket.created).toHaveLength(1);
+    expect(h.statuses.at(-1)).toBe("superseded");
+  });
+
+  it("superseded 后 connect() 显式重连：重发 hello 可再 ready（顶替对方）", () => {
+    const h = makeManager();
+    h.mgr.connect();
+    const s1 = readyFlow(h);
+    s1.emit("close", { code: 4001 });
+    expect(h.statuses.at(-1)).toBe("superseded");
+    // 用户点击「重新连接」
+    h.mgr.connect();
+    expect(FakeWebSocket.created).toHaveLength(2);
+    expect(h.statuses.at(-1)).toBe("connecting");
+    const s2 = lastSock();
+    s2.emit("open");
+    expect(s2.sent[0]).toContain('"hello"');
+    s2.serverSend(HELLO_ACK);
+    expect(h.statuses.at(-1)).toBe("ready");
+  });
+
   it("普通 close 指数退避重连：1s 起、翻倍、成功后重置", () => {
     const h = makeManager();
     h.mgr.connect();

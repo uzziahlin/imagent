@@ -101,6 +101,12 @@ export default function App() {
     setToken(null);
   };
 
+  // superseded 态用户显式重连：复用同一 WsManager（connect 会重置终态并新建
+  // 连接），新连接会反过来顶替另一窗口——用户显式意图，允许
+  const reconnect = () => {
+    wsRef.current?.connect();
+  };
+
   const conv = state.convs[currentConv] ?? EMPTY_CONV;
   const allPending = state.convOrder.flatMap((c) => state.convs[c]?.pending ?? []);
 
@@ -111,6 +117,7 @@ export default function App() {
         machineOnline={state.machineOnline}
         currentConv={currentConv}
         onLogout={logout}
+        onReconnect={reconnect}
       />
       <ConvTabs convs={state.convOrder} current={currentConv} onSelect={setCurrentConv} />
       <main className="relative min-h-0 flex-1">
