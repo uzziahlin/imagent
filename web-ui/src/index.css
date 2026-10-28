@@ -1,0 +1,84 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-slate-950 text-slate-100 antialiased;
+}
+
+/* markdown 排版（.md 命名空间；渲染入口统一在 MarkdownText，安全清洗见该组件） */
+@layer components {
+  .md {
+    @apply break-words text-sm leading-relaxed text-slate-200;
+  }
+  .md > :first-child {
+    margin-top: 0;
+  }
+  .md > :last-child {
+    margin-bottom: 0;
+  }
+  .md p {
+    @apply my-1.5 whitespace-pre-wrap;
+  }
+  .md h1,
+  .md h2,
+  .md h3,
+  .md h4 {
+    @apply mb-1 mt-3 font-semibold text-slate-50;
+  }
+  .md h1 {
+    @apply text-base;
+  }
+  .md h2 {
+    @apply text-[15px];
+  }
+  .md h3,
+  .md h4 {
+    @apply text-sm;
+  }
+  .md ul {
+    @apply my-1.5 list-disc pl-5;
+  }
+  .md ol {
+    @apply my-1.5 list-decimal pl-5;
+  }
+  .md li {
+    @apply my-0.5;
+  }
+  .md code {
+    @apply rounded bg-slate-800 px-1 py-0.5 font-mono text-[13px] text-emerald-300;
+  }
+  .md pre {
+    @apply my-2 overflow-x-auto rounded-xl border border-slate-800 bg-slate-950/80 p-3;
+  }
+  /* M3b：代码高亮在此扩展（pre code 覆写为高亮 token 树） */
+  .md pre code {
+    @apply bg-transparent p-0 text-slate-200;
+  }
+  .md blockquote {
+    @apply my-1.5 border-l-2 border-slate-600 pl-3 text-slate-400;
+  }
+  .md hr {
+    @apply my-3 border-slate-800;
+  }
+  .md table {
+    @apply my-2 w-full text-left text-xs;
+  }
+  .md th,
+  .md td {
+    @apply border border-slate-800 px-2 py-1;
+  }
+  .md a {
+    @apply break-all text-sky-400 underline underline-offset-2;
+  }
+}

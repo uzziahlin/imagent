@@ -523,7 +523,15 @@ async fn healthz() -> StatusCode {
 async fn spa_fallback(uri: Uri) -> Response {
     const NO_STORE: &str = "no-store";
     const IMMUTABLE: &str = "public, max-age=31536000, immutable";
-    let path = uri.path().trim_start_matches('/');
+    let raw = uri.path().trim_start_matches('/');
+    // 兼容不经 Caddy 的直连形态（本地开发/验收直开 http://127.0.0.1:3010/）：
+    // SPA 构建产物（Vite base=/imagent/）的资源引用自带 `/imagent/` 前缀，
+    // 公网由 Caddy `handle_path /imagent/*` strip 后转给 relay，但直连时
+    // 浏览器请求的是 /imagent/assets/...——这里剥一次前缀再查内嵌产物，
+    // 带前缀与不带前缀两种 URL 都可用；缓存头按剥前缀后的路径判定
+    //（/imagent/assets/... 同样享 immutable），剥完仍未命中的照旧回落
+    // index.html（含 SPA 客户端路由）。
+    let path = raw.strip_prefix("imagent/").unwrap_or(raw);
     let (file, cache, ctype_of) = if path.is_empty() {
         (Spa::get("index.html"), NO_STORE, "index.html")
     } else if path.starts_with("assets/") {
@@ -822,6 +830,14 @@ pub fn spawn_relay(listener: TcpListener, config: RelayConfig) -> Result<RelayHa
         .route("/gateway", get(gateway_ws))
         .route("/ws", get(browser_ws))
         .route("/healthz", get(healthz))
+        // 前缀路由与静态前缀剥离（spa_fallback）同款理由：兼容不经 Caddy
+        // 的直连形态（本地开发/验收直开 http://127.0.0.1:3010/）——SPA 按
+        // Vite base=/imagent/ 把 WS/探活地址推导为 /imagent/ws 等；公网
+        // Caddy `handle_path /imagent/*` strip 后走上面的原路径。同一
+        // handler，两种形态都可用。
+        .route("/imagent/gateway", get(gateway_ws))
+        .route("/imagent/ws", get(browser_ws))
+        .route("/imagent/healthz", get(healthz))
         .fallback(spa_fallback)
         .with_state(state);
     // graceful shutdown（§4.5）：信号到 → close 两条 WS（1001）→ 连接退出

@@ -1,20 +1,16 @@
 <!doctype html>
-<!-- imagent relay 内嵌 SPA 占位页（M1）。真正的驾驶舱 UI 由 M3 的 Vite 构建
-     产物落入 static/ 后由 rust-embed 挂载（缓存头规则见 lib.rs spa_fallback）。 -->
 <html lang="zh-CN">
   <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#020617" />
+    <link rel="icon" href="/imagent/icon.svg" type="image/svg+xml" />
+    <link rel="manifest" href="/imagent/manifest.json" />
     <title>imagent · Web 驾驶舱</title>
+    <script type="module" crossorigin src="/imagent/assets/index-BLQyPT61.js"></script>
+    <link rel="stylesheet" crossorigin href="/imagent/assets/index-Dc2npbru.css">
   </head>
   <body>
-    <main>
-      <h1>imagent web cockpit</h1>
-      <p>
-        中继已就绪（M1 占位页）。浏览器驾驶舱界面将在 M3 上线：
-        WS 端点 <code>/ws</code>，首帧 hello 携带 USER_TOKEN 认证；
-        网关侧连接 <code>/gateway</code>。
-      </p>
-    </main>
+    <div id="root"></div>
   </body>
 </html>

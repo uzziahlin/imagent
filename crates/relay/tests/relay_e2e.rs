@@ -99,8 +99,8 @@ async fn expect_close(ws: &mut Ws, code: u16) -> CloseFrame {
 }
 
 /// 裸 HTTP GET（loopback 直连不走代理，对齐 webhook 测试注释），返回
-/// (状态码字符串, body)。
-async fn http_get(addr: &SocketAddr, path: &str) -> (String, String) {
+/// (状态码字符串, content-type, body)。
+async fn http_get(addr: &SocketAddr, path: &str) -> (String, String, String) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = TcpStream::connect(addr).await.unwrap();
     stream
@@ -113,7 +113,8 @@ async fn http_get(addr: &SocketAddr, path: &str) -> (String, String) {
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await.unwrap();
     let raw = String::from_utf8_lossy(&buf).to_string();
-    let status = raw
+    let (headers, body) = raw.split_once("\r\n\r\n").unwrap_or(("", ""));
+    let status = headers
         .lines()
         .next()
         .unwrap_or_default()
@@ -121,8 +122,16 @@ async fn http_get(addr: &SocketAddr, path: &str) -> (String, String) {
         .nth(1)
         .unwrap_or_default()
         .to_string();
-    let body = raw.split("\r\n\r\n").nth(1).unwrap_or_default().to_string();
-    (status, body)
+    let ctype = headers
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim()
+                .eq_ignore_ascii_case("content-type")
+                .then(|| v.trim().to_string())
+        })
+        .unwrap_or_default();
+    (status, ctype, body.to_string())
 }
 
 /// 场景 1：双端互通——browser↔gateway 文本帧原样透传（不解析不改写）。
@@ -304,12 +313,99 @@ async fn e2e_static_index_and_healthz() {
     let handle = spawn_test_relay().await;
     let addr = handle.addr;
 
-    let (status, body) = http_get(&addr, "/").await;
+    let (status, _ctype, body) = http_get(&addr, "/").await;
     assert_eq!(status, "200", "GET / 应 200");
     assert!(body.contains("imagent"), "占位文案：{body}");
 
-    let (status, _body) = http_get(&addr, "/healthz").await;
+    let (status, _ctype, _body) = http_get(&addr, "/healthz").await;
     assert_eq!(status, "200", "healthz 应 200");
+
+    handle.shutdown();
+    handle.wait().await;
+}
+
+/// 场景 9（M3 增补）：SPA base 前缀兼容——不经 Caddy 直连 relay（本地
+/// 开发/验收）时，浏览器按 Vite base 配置以 `/imagent/` 前缀请求构建产物，
+/// fallback 需剥一次前缀后命中内嵌产物。产物文件名带 hash 不可硬编码，
+/// 用稳定文件名断言：/imagent/manifest.json → 200 application/json（真实
+/// 文件而非 index.html 回落）；/imagent/ → 200 text/html（剥前缀为空 →
+/// index.html）；不带前缀的原路径（Caddy strip 后形态）不受影响。
+#[tokio::test]
+async fn e2e_spa_base_prefix_and_bare_paths() {
+    let handle = spawn_test_relay().await;
+    let addr = handle.addr;
+
+    // 带前缀：剥掉 imagent/ 后命中真实文件。
+    let (status, ctype, body) = http_get(&addr, "/imagent/manifest.json").await;
+    assert_eq!(status, "200", "带前缀 manifest 应剥前缀命中真实文件");
+    assert!(
+        ctype.starts_with("application/json"),
+        "content-type 应按真实文件判定：{ctype}"
+    );
+    assert!(
+        !body.to_ascii_lowercase().contains("<!doctype"),
+        "应是 manifest 本体而非 index.html 回落：{body}"
+    );
+
+    // 带前缀根路径：剥前缀为空 → index.html。
+    let (status, ctype, body) = http_get(&addr, "/imagent/").await;
+    assert_eq!(status, "200", "/imagent/ 应回落 index.html");
+    assert!(
+        ctype.starts_with("text/html"),
+        "content-type 应为 HTML：{ctype}"
+    );
+    assert!(
+        body.to_ascii_lowercase().contains("<!doctype"),
+        "应拿到 app 入口 HTML：{body}"
+    );
+
+    // 不带前缀原路径（Caddy strip 后形态）不受影响。
+    let (status, ctype, _body) = http_get(&addr, "/manifest.json").await;
+    assert_eq!(status, "200", "原路径 manifest 应 200");
+    assert!(
+        ctype.starts_with("application/json"),
+        "content-type：{ctype}"
+    );
+
+    handle.shutdown();
+    handle.wait().await;
+}
+
+/// 场景 10（M3 增补）：WS/healthz 前缀路由兼容——直连形态下 SPA 按 Vite
+/// base 把 WS 地址推导为 ws://.../imagent/ws，Router 需同时注册带前缀
+/// 路由（公网 Caddy strip 后走原路径 /ws）。断言 /imagent/ws hello 认证
+/// 成功收到 hello_ack；/imagent/gateway Bearer 直通；两端进同一 Hub
+///（browser 收到 machine online:true）；/imagent/healthz 是探活而非
+/// index.html 回落。
+#[tokio::test]
+async fn e2e_prefixed_ws_and_healthz_endpoints() {
+    let handle = spawn_test_relay().await;
+    let addr = handle.addr;
+
+    let (status, _ctype, body) = http_get(&addr, "/imagent/healthz").await;
+    assert_eq!(status, "200", "/imagent/healthz 应 200");
+    assert!(
+        !body.to_ascii_lowercase().contains("<!doctype"),
+        "应是探活空体而非 spa fallback 的 index.html：{body}"
+    );
+
+    let mut br = connect_ws(&addr, "/imagent/ws", None).await;
+    hello_handshake(&mut br, USER_TOKEN).await;
+    // hello_ack 之后紧跟 machine 快照（此时网关未连 → false）。
+    let snap = next_text(&mut br).await;
+    assert!(snap.contains(r#""online":false"#), "{snap}");
+
+    let mut gw = connect_ws(&addr, "/imagent/gateway", Some(GW_TOKEN)).await;
+    let ack = next_text(&mut gw).await;
+    assert!(ack.contains(r#""role":"gateway""#), "{ack}");
+
+    // 前缀端点与原端点共用同一 Hub：gateway 上线后 browser 收 machine
+    // online:true。
+    let online = next_text(&mut br).await;
+    assert!(
+        online.contains(r#""online":true"#),
+        "带前缀两端应进同一 Hub：{online}"
+    );
 
     handle.shutdown();
     handle.wait().await;
