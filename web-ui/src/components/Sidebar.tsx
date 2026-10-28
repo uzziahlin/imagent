@@ -208,6 +208,7 @@ export function Sidebar({
       <div className="border-t border-line p-2">
         {creating ? (
           <form onSubmit={submit} className="space-y-1.5">
+            {/* text-base（16px）：防 iOS Safari 聚焦 <16px 输入框时自动放大页面 */}
             <input
               autoFocus
               value={name}
@@ -215,7 +216,7 @@ export function Sidebar({
               onKeyDown={onKeyDown}
               placeholder="会话名（如 work）"
               aria-label="新会话名称"
-              className="w-full rounded-lg border border-line-strong bg-surface px-2.5 py-1.5 text-sm text-ink outline-none placeholder:text-ghost focus:border-emerald-500"
+              className="w-full rounded-lg border border-line-strong bg-surface px-2.5 py-1.5 text-base text-ink outline-none placeholder:text-ghost focus:border-emerald-500"
             />
             <div className="flex gap-1.5">
               <button

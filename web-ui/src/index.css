@@ -50,7 +50,23 @@
 html,
 body,
 #root {
-  height: 100%;
+  /* 回退：不支持 dvh 的旧浏览器（Safari <15.4 / Chrome <108） */
+  height: 100vh;
+}
+
+/*
+ * 满高容器：100dvh 让布局高度随浏览器工具栏收展平滑变化；--vvh（main.tsx
+ * 用 visualViewport 实高维护）优先级更高 —— 软键盘在 iOS Safari 与 Android
+ * Chrome 默认（interactive-widget=resizes-visual）下只缩小 visualViewport、
+ * 100dvh 并不收缩，聚焦底部输入框时整页被顶起、失焦再弹回。--vvh 使
+ * html/body/#root 与可见区域一致，键盘收展时高度平滑跟随。
+ */
+@supports (height: 100dvh) {
+  html,
+  body,
+  #root {
+    height: var(--vvh, 100dvh);
+  }
 }
 
 body {

@@ -1,7 +1,10 @@
 import { useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
 
-/** 输入区自适应高度上限：6 行（text-sm 行高 20px × 6 + 上下 padding 20px）。 */
-const MAX_TEXTAREA_HEIGHT = 140;
+/**
+ * 输入区自适应高度上限：6 行（text-base 行高 24px × 6 + 上下 padding 20px =
+ * 164px）。text-base（16px）：字号 <16px 时 iOS Safari 聚焦会自动放大整页。
+ */
+const MAX_TEXTAREA_HEIGHT = 164;
 
 /**
  * composer：多行输入，Enter 发送 / Shift+Enter 换行（中文输入法组词中的
@@ -62,7 +65,7 @@ export function Composer({
           rows={1}
           placeholder={disabled ? "连接中…（恢复后可发送）" : "发消息给 Mac…（Enter 发送）"}
           disabled={disabled}
-          className="max-h-[140px] min-h-[2.75rem] flex-1 resize-none overflow-y-auto rounded-xl border border-line-strong bg-surface px-3 py-2.5 text-sm leading-5 text-ink outline-none placeholder:text-ghost focus:border-emerald-500 disabled:opacity-50"
+          className="max-h-[164px] min-h-[2.75rem] flex-1 resize-none overflow-y-auto rounded-xl border border-line-strong bg-surface px-3 py-2.5 text-base leading-6 text-ink outline-none placeholder:text-ghost focus:border-emerald-500 disabled:opacity-50"
         />
         <button
           onClick={submit}

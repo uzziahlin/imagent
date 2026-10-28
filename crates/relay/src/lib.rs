@@ -35,8 +35,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode, Uri};
+use axum::extract::{Request, State};
+use axum::http::header::HeaderName;
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
@@ -726,6 +728,68 @@ fn close_msg(code: u16, reason: &'static str) -> Message {
 // HTTP 路由（§4.1；relay 看到的是 Caddy strip /imagent 后的路径）
 // ---------------------------------------------------------------------------
 
+/// 安全响应头 · CSP（SPA 纵深防御）：浏览器把 user token 存在 localStorage，
+/// XSS 是偷 token 的主通道——CSP 让「即使被注入 HTML，脚本也不执行」。
+/// 逐项理由：
+/// - `default-src 'self'`：未显式列出的加载类 directive 一律收紧到同源；
+/// - `script-src 'self'`：**核心项**，不放行 inline / eval——已核实
+///   `static/index.html` 与 Vite 构建产物无 inline script（唯一
+///   `<script type="module" crossorigin src>` 外链，无 `%VITE%` 注入、无
+///   inline 事件属性），故无需 nonce 方案；注入的内联脚本一律不执行；
+/// - `style-src 'self' 'unsafe-inline'`：React 运行时 `<elem style="...">`
+///   属性注入与 Tailwind 产物所需。风险可接受——CSS 注入改的是样式，
+///   偷不走 token（数据外带走 connect-src，已被 'self' 封死）；
+/// - `img-src 'self' data:`：内联 `data:` URI 图标/占位图所需；
+/// - `connect-src 'self' wss: ws:`：fetch/XHR/WebSocket 只准同源。scheme
+///   双列是部署形态决定的：公网经 Caddy（TLS 终结）是 `wss://`，本地
+///   http 直连调试形态（http://127.0.0.1:3010/）是 `ws://`——都属同源
+///   WebSocket，不是放行外站；
+/// - `font-src 'self'`：字体同源（产物无外链字体）；
+/// - `frame-ancestors 'none'`：任何页面不得嵌入本页（clickjacking）；
+/// - `base-uri 'none'`：禁 `<base>` 注入改写相对 URL 的解析根（绕过
+///   script-src 的相对路径技俩）；
+/// - `form-action 'self'`：表单只准提交同源，堵「注入表单外带凭证」。
+const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' \
+     'unsafe-inline'; img-src 'self' data:; connect-src 'self' wss: ws:; \
+     font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+
+/// 对全部响应（SPA 静态 / healthz / WS upgrade 101）统一注入安全响应头。
+/// 用 `Router::layer`（见 [`spawn_relay`]）盖住所有路由与 fallback。逐项：
+/// - CSP：见 [`CSP`]；
+/// - `X-Content-Type-Options: nosniff`：禁 MIME 嗅探——配 `content_type`
+///   白名单，防 svg/js 被浏览器「猜」成 HTML 执行；
+/// - `Referrer-Policy: no-referrer`：Referer 泄漏面清零（token 本就不进
+///   URL，纵深防御）；
+/// - `X-Frame-Options: DENY`：与 CSP `frame-ancestors` 双保险——旧浏览器
+///   不认 frame-ancestors，两者取严即可；
+/// - `Cross-Origin-Opener-Policy: same-origin`：切断跨源 `window.opener`
+///   句柄（reverse tabnabbing / 钓鱼跳板）。
+async fn security_headers(req: Request, next: Next) -> Response {
+    /// COOP：http crate 未提供标准常量，静态字符串构造（编译期校验合法）。
+    const CROSS_ORIGIN_OPENER_POLICY_NAME: HeaderName =
+        HeaderName::from_static("cross-origin-opener-policy");
+    let mut res = next.run(req).await;
+    let headers = res.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(CSP),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        CROSS_ORIGIN_OPENER_POLICY_NAME,
+        HeaderValue::from_static("same-origin"),
+    );
+    res
+}
+
 /// axum 共享状态（每连接 Clone；Arc 内部共享同一 Hub / 配置）。
 #[derive(Clone)]
 struct RelayState {
@@ -1173,6 +1237,10 @@ pub fn spawn_relay(listener: TcpListener, config: RelayConfig) -> Result<RelayHa
         .route("/imagent/ws", get(browser_ws))
         .route("/imagent/healthz", get(healthz))
         .fallback(spa_fallback)
+        // 安全响应头（SPA 纵深防御）盖住**全部**响应：路由（WS upgrade 101 /
+        // healthz）+ fallback（SPA 静态）。注意 layer 只作用于此前已注册的
+        // 路由与 fallback，故放在 fallback 之后。
+        .layer(middleware::from_fn(security_headers))
         .with_state(state);
     // graceful shutdown（§4.5）：信号到 → close 两条 WS（1001）→ 连接退出
     // → serve drain 完成退出。控制端（RelayHandle）被丢弃同样触发停机：

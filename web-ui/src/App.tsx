@@ -259,8 +259,9 @@ export default function App() {
     />
   );
 
+  // h-full 跟随 #root（index.css：var(--vvh, 100dvh)，键盘收展平滑跟随）
   return (
-    <div className="flex h-dvh bg-surface text-ink">
+    <div className="flex h-full bg-surface text-ink">
       {/* 桌面（≥768px）：左侧固定侧边栏 240px */}
       <aside className="hidden w-60 shrink-0 border-r border-line bg-panel md:block">
         {sidebar(setCurrentConv)}

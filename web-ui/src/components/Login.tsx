@@ -15,8 +15,9 @@ export function Login({ onSave }: { onSave: (token: string) => void }) {
     onSave(token);
   };
 
+  // min-h-full 跟随 #root（键盘弹出时 --vvh 收缩，卡片在可见区居中）
   return (
-    <div className="flex min-h-dvh items-center justify-center px-4">
+    <div className="flex min-h-full items-center justify-center px-4">
       <div className="w-full max-w-sm">
         <div className="mb-8 text-center">
           <div className="mx-auto mb-3 flex h-14 w-14 items-center justify-center rounded-2xl border border-line-strong bg-panel">
@@ -39,6 +40,10 @@ export function Login({ onSave }: { onSave: (token: string) => void }) {
           <label htmlFor="token" className="mb-2 block text-sm font-medium text-ink">
             访问令牌（USER_TOKEN）
           </label>
+          {/*
+           * text-base（16px）：字号 <16px 时 iOS Safari 聚焦会自动放大整页、
+           * 失焦弹回；禁止用 viewport meta 禁缩放（保留双指缩放无障碍）。
+           */}
           <input
             id="token"
             type="password"
@@ -50,7 +55,7 @@ export function Login({ onSave }: { onSave: (token: string) => void }) {
               setError("");
             }}
             placeholder="imagent.userToken"
-            className="w-full rounded-xl border border-line-strong bg-surface px-3 py-2.5 font-mono text-sm text-ink outline-none placeholder:text-ghost focus:border-emerald-500"
+            className="w-full rounded-xl border border-line-strong bg-surface px-3 py-2.5 font-mono text-base text-ink outline-none placeholder:text-ghost focus:border-emerald-500"
           />
           {error && <p className="mt-2 text-xs text-err">{error}</p>}
           <button

@@ -173,9 +173,10 @@ async fn assert_no_frame(ws: &mut Ws, ctx: &str) {
     }
 }
 
-/// 裸 HTTP GET（loopback 直连不走代理，对齐 webhook 测试注释），返回
-/// (状态码字符串, content-type, body)。
-async fn http_get(addr: &SocketAddr, path: &str) -> (String, String, String) {
+/// 裸 HTTP GET（loopback 直连不走代理，对齐 webhook 测试注释），返回完整
+/// 原始响应（状态行 + 头 + 体）——安全响应头断言需要读全部头，不只
+/// content-type。
+async fn http_get_raw(addr: &SocketAddr, path: &str) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = TcpStream::connect(addr).await.unwrap();
     stream
@@ -187,7 +188,13 @@ async fn http_get(addr: &SocketAddr, path: &str) -> (String, String, String) {
         .unwrap();
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await.unwrap();
-    let raw = String::from_utf8_lossy(&buf).to_string();
+    String::from_utf8_lossy(&buf).to_string()
+}
+
+/// 裸 HTTP GET 解析版（`http_get_raw` 便捷封装），返回
+/// (状态码字符串, content-type, body)。
+async fn http_get(addr: &SocketAddr, path: &str) -> (String, String, String) {
+    let raw = http_get_raw(addr, path).await;
     let (headers, body) = raw.split_once("\r\n\r\n").unwrap_or(("", ""));
     let status = headers
         .lines()
@@ -207,6 +214,16 @@ async fn http_get(addr: &SocketAddr, path: &str) -> (String, String, String) {
         })
         .unwrap_or_default();
     (status, ctype, body.to_string())
+}
+
+/// 响应头查找（大小写不敏感的 name 匹配，取首个命中值）。
+fn find_header(headers: &str, name: &str) -> Option<String> {
+    headers.lines().find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        k.trim()
+            .eq_ignore_ascii_case(name)
+            .then(|| v.trim().to_string())
+    })
 }
 
 /// 场景 1：双端互通——browser↔gateway 文本帧原样透传（不解析不改写）。
@@ -897,6 +914,97 @@ async fn e2e_prefixed_ws_and_healthz_endpoints() {
     let online = next_of_type(&mut br, "machine").await;
     assert_eq!(online["online"], true, "带前缀两端应进同一 Hub：{online}");
     consume_machines_event(&mut br, &["default"]).await;
+
+    handle.shutdown();
+    handle.wait().await;
+}
+
+/// 场景 19（安全响应头，SPA 纵深防御）：全部响应——SPA 静态（GET /）、
+/// healthz、WS upgrade 101——统一带 CSP 与四个辅助安全头。CSP 逐 directive
+/// 断言，并反证 script-src 不含 unsafe-inline / unsafe-eval（堵 XSS 偷
+/// localStorage 凭证的主通道；style-src 的 'unsafe-inline' 是 React 内联
+/// 样式豁免，不得外溢到脚本通道）。
+#[tokio::test]
+async fn e2e_security_headers_on_all_responses() {
+    let handle = spawn_test_relay().await;
+    let addr = handle.addr;
+
+    // HTTP 面：/（SPA 入口）与 /healthz 都带头。
+    for path in ["/", "/healthz"] {
+        let raw = http_get_raw(&addr, path).await;
+        let (headers, _body) = raw.split_once("\r\n\r\n").unwrap_or(("", ""));
+
+        let csp = find_header(headers, "content-security-policy").unwrap_or_default();
+        for directive in [
+            "default-src 'self'",
+            "script-src 'self'",
+            "style-src 'self' 'unsafe-inline'",
+            "img-src 'self' data:",
+            "connect-src 'self' wss: ws:",
+            "font-src 'self'",
+            "frame-ancestors 'none'",
+            "base-uri 'none'",
+            "form-action 'self'",
+        ] {
+            assert!(
+                csp.contains(directive),
+                "{path} CSP 应含 `{directive}`：{csp}"
+            );
+        }
+        let script_src = csp
+            .split(';')
+            .find(|d| d.trim().starts_with("script-src"))
+            .unwrap_or_default();
+        assert!(
+            !script_src.contains("unsafe-inline") && !script_src.contains("unsafe-eval"),
+            "{path} script-src 不得放行 unsafe-*：{script_src}"
+        );
+
+        assert_eq!(
+            find_header(headers, "x-content-type-options").as_deref(),
+            Some("nosniff"),
+            "{path} 应带 nosniff"
+        );
+        assert_eq!(
+            find_header(headers, "referrer-policy").as_deref(),
+            Some("no-referrer"),
+            "{path} 应带 no-referrer"
+        );
+        assert_eq!(
+            find_header(headers, "x-frame-options").as_deref(),
+            Some("DENY"),
+            "{path} 应带 X-Frame-Options DENY"
+        );
+        assert_eq!(
+            find_header(headers, "cross-origin-opener-policy").as_deref(),
+            Some("same-origin"),
+            "{path} 应带 COOP same-origin"
+        );
+    }
+
+    // WS upgrade（101 Switching Protocols）响应同样带头：connect_async 返回
+    // 握手 Response，直接读其 headers（握手请求构建与 connect_ws 同款）。
+    use tokio_tungstenite::tungstenite::handshake::client::generate_key;
+    let req = Request::builder()
+        .uri(format!("ws://{addr}/ws"))
+        .header("host", addr.to_string())
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", generate_key())
+        .body(())
+        .unwrap();
+    let (ws, resp) = connect_async(req).await.expect("WS 握手");
+    let h = resp.headers();
+    assert!(
+        h.get("content-security-policy")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("script-src 'self'")),
+        "101 升级响应应带 CSP：{h:?}"
+    );
+    assert_eq!(h.get("x-frame-options").unwrap(), "DENY");
+    assert_eq!(h.get("x-content-type-options").unwrap(), "nosniff");
+    drop(ws); // 未认证即断，服务端按超时/断连清理
 
     handle.shutdown();
     handle.wait().await;
