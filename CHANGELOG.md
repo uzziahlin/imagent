@@ -2,6 +2,86 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.32.0] — 2026-10-22
+
+> **OS 级沙箱批**：把 SECURITY.md 威胁模型的「进程面」约束下沉到内核层。
+> `agent_sandbox`（默认 `auto`，仅 claude-cli 系——主后端 + delegate 的 claude
+> 副后端）经 macOS Seatbelt / Linux bwrap 包装 agent 子进程：状态目录
+> `~/.imagent` 读+写全 deny（例外仅审批 sock/token/每轮 mcp json——审批闭环、
+> 数据面、委托工具不 break），持久化热点（`~/.ssh`、shell rc、LaunchAgents）
+> 写 deny。Bash/任意子进程对 `imagent.db` 的间接读取自 v1.28 的
+> `hide_state_dir_from_agent`（CLI 层、挡不住子进程）起首次被内核层拦下。
+> SBPL 规则序（后规则覆盖前规则）与路径 canonical 形态已真机校准
+> （2026-10-22，darwin 25.6.0）并固化为 `#[ignore]` 回归测试。
+
+### Added
+- **`agent_sandbox` 配置**：`auto`（缺省，Guarded 档——定点 deny 零破坏面，
+  正常开发读写不受影响）/ `strict`（再收敛写面到 workdir/临时目录/
+  `~/.claude`/`agent_sandbox_extra_write`）/ `off`；load 期值域校验 +
+  extra_write 绝对路径过滤；SIGHUP 热改（下一轮 spawn 生效）
+- **core `sandbox` 模块**：Seatbelt profile / bwrap args 生成（纯函数 + 单测）、
+  平台计划解析（Linux 探测 bwrap，缺则降级 off + warn）、`wrap_command`
+  包装器；路径一律字面 + canonicalize 双形态（真机校准：`/var` 系 symlink
+  字面规则会落空）
+- **claude-cli spawn 接线**：每 run 现读计划重建 wrapper 命令（cwd 带走；
+  env/stdio/进程组仍由 `spawn_cli_backend` 统一加——包装进程进组后 `killpg`
+  整组收割，与 B5 守卫的杀进程语义一致）
+- **`/doctor` 安全分组第 ⑦ 项**：沙箱档位展示（seatbelt/bwrap + 档位；无
+  接线后端如实展示裸跑态与原因）
+- **真机校准回归测试 ×2**（`#[ignore]`，本地 `-- --ignored sandbox_real`）：
+  规则优先级/例外/热点写语义 + 真实生成 profile 跑真机负载（git 零影响 +
+  真实 `imagent.db` 读被内核层拦）
+
+### Changed
+- **SECURITY.md 威胁模型升级**：新增「进程面缓解」段（威胁向量 ①③ 与持久化
+  驻留已内核层收敛；残余 ②environ 读取 ④socket 同 uid ⑤keyring 仍靠专用
+  运行用户，如实声明）；加固清单 + 已知限制同步（ACP/codex/gemini 不覆盖
+  原因、`sandbox-exec` 弃用状态与降级路径、Linux strict 实验性）
+- delegate 的 claude 副后端与主后端同注沙箱计划（codex/gemini 副后端不叠
+  加——各自原生沙箱，双层冲突）
+
+### 已知限制
+- 仅 claude-cli 系覆盖（理由见上）；macOS `sandbox-exec` 为系统弃用 API（仍
+  随系统分发且已真机校准生效，移除时降级 `off`）；Linux `strict` 档实验性
+  （ro 基座可能挡 dbus 类 socket 连接，遇阻回 `auto` + extra_write）
+
+## [1.31.0] — 2026-10-22
+
+> **委托编排批**（对齐 Happy v2「多模型 fan-out」方向）：`[[delegate]]` 配置
+> 把命名副后端（codex / gemini / claude-cli）接入两条暴露面——agent 侧
+> `delegate_run` MCP 工具（一轮内自行委托，如 Claude 写完叫 codex 审）与用户
+> 侧 `/delegate` 命令。副轮 one-shot（无会话续接、无 IM 审批闭环）、工具面
+> 缺省只读三件套、预算 agent 只能调低、全局并发闸 4、输出头尾窗截断。socket
+> 第三条 kind 通路（`kind=delegate`），与审批 / ask / bitable 同一握手 token。
+
+### Added
+- **`[[delegate]]` 配置**（可多条）：`name`（唯一）+ `agent`（one-shot 系
+  codex | gemini | claude-cli）+ `allowed_tools`（**缺省只读三件套**
+  Read/Grep/Glob——codex 映射 read-only 沙箱、claude-cli 映射 `--allowedTools`
+  且 Off 档下危险工具被 CLI 直接拒绝）+ `model`（可选）+ `timeout_secs`
+  （缺省 600，上限 3600）；load 期校验（重名 / 非法后端 / 越界拒启）；
+  SIGHUP 热改（整体重建委托表）
+- **`delegate_run` MCP 工具**：仅 claude-cli 主后端挂载（经 `imagent mcp`
+  server 的 `--delegate 1 --delegate-names` 条件参数，与 bitable 工具面同构）；
+  工具描述点名可用委托，名单过期时 socket 侧错误带新名单自愈
+- **`/delegate` 命令**：`/delegate [list]` 列委托（名 / 副后端 / 工具面）；
+  `/delegate <name> <子任务>` one-shot 执行，结果带【委托·name】前缀回传
+  （不占主会话轮次与上下文）；白名单可用（与普通轮次同级）
+- **core `DelegateApi` 契约 + socket `kind=delegate` 路由**：与 BitableApi
+  同构的依赖倒置（main 装配 `MainDelegateRunner` 注入 Dispatcher）；MCP 侧
+  读超时 = 预算 + 120s，主进程侧硬预算 3720s 兜底防连接永挂
+- 安全缺省：副 claude 后端 = Off 档 + legacy `-p` 通道 + 空 RuntimeOpts——
+  无审批接线、不碰共享 permission.sock、**看不到 delegate_run**（防递归委托）
+  与主轮用户 MCP 工具面；生效预算 = min(工具请求, 条目上限)
+- 委托配置了而主后端非 claude-cli 时启动 warn（工具面不挂载，命令仍可用）
+
+### 已知限制（MVP）
+- 副轮用量不计入 `/stats`（RunOutcome.usage 丢弃）；claude 系副轮会在
+  `~/.claude/projects`（codex 在 `~/.codex/sessions`）留下一次性会话，
+  `/resume` 💻 本机段可见（无标记可过滤——CLI 未提供会话打标机制）
+- 委托审批路由（副轮权限请求进 IM 卡片，带【委托】标注）留待下一批
+  （`approval = "im"` 字段位）；ACP 系长驻后端不适配 one-shot 副轮语义
+
 ## [1.30.0] — 2026-10-02
 
 > **还债批**（code-review v14 结构债五件套）：main.rs 拆分、feishu per-card
