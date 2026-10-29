@@ -130,6 +130,8 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
+# join 向导：config.toml 合并写入（toml::Table 反序列化-改-序列化保形）。
+toml = { workspace = true }
 reqwest = { workspace = true }
 # setup 向导 / login wecom 的敏感输入关回显（P3-f，code-review v14）——
 # 终端 termios 由 rpassword 处理；非 TTY（管道）由调用方回退 read_line。

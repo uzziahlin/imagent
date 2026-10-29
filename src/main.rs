@@ -22,6 +22,7 @@ use tracing_subscriber::EnvFilter;
 
 mod backup;
 mod delegate;
+mod join;
 mod ops;
 mod service;
 mod setup;
@@ -81,6 +82,23 @@ enum Cmd {
         /// 直达平台引导：feishu | wecom | ilink（缺省出菜单）。
         #[arg(long)]
         platform: Option<String>,
+    },
+    /// 新 Mac 网关接入向导（Web 驾驶舱多终端，零 token）：交互式/参数式收集
+    /// relay 地址、机器名、工作目录 → 幂等装配网关密钥（ed25519 认证 + E2E，
+    /// 复用既有身份**绝不重建**）→ 合并写 config.toml 四键（platforms =
+    /// ["web","local"] / web_relay_url / web_machine_id / default_workdir，
+    /// 其余键保留）→ 打印 64 hex 公钥 + 指纹 + 网页管理页「添加机器」登记
+    /// 引导。缺参时逐项交互录入；全参数可脚本化零交互。
+    Join {
+        /// relay 网关端点（wss://<ecs>:8443/imagent/gateway；缺省交互录入）。
+        #[arg(long)]
+        relay: Option<String>,
+        /// 机器名（1..=32 [a-zA-Z0-9_-]；缺省 hostname 短名）。
+        #[arg(long)]
+        name: Option<String>,
+        /// agent 工作根目录（绝对路径，须存在；过宽位置拒绝）。
+        #[arg(long, value_name = "DIR")]
+        workdir: Option<PathBuf>,
     },
     /// 服务自管理（P6-6）：安装/卸载/查询 OS 级后台服务（macOS launchd /
     /// Linux systemd 用户单元），注册当前二进制与 --profile。
@@ -1254,6 +1272,14 @@ async fn main() -> Result<()> {
         }
         Cmd::Setup { platform } => {
             setup::run(platform).await?;
+        }
+        Cmd::Join {
+            relay,
+            name,
+            workdir,
+        } => {
+            // 参数接线即全部（逻辑在 join 模块，便于单测）。
+            join::run(relay, name, workdir)?;
         }
         Cmd::Service { action } => {
             // service 定义随 --profile 隔离（com.imagent[.<profile>]）。
