@@ -11,6 +11,7 @@ import {
   parseFrame,
   reducer,
   spaceOf,
+  workspaceNameValid,
   type Action,
   type AppState,
   type InboundFrame,
@@ -1084,5 +1085,186 @@ describe("v1.5 管理帧与配对（出站形状 + 解析 + reducer）", () => {
   it("reducer：pairing_pending 静默忽略（ws 层消费）", () => {
     const s0 = initialState();
     expect(run(s0, { type: "frame", frame: frame('{"v":1,"type":"pairing_pending","code":"1"}') })).toBe(s0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.6 工作空间：出站帧形状 / 入站帧解析 / reducer（快照落表 + 增量合并）
+// ---------------------------------------------------------------------------
+
+describe("v1.6 工作空间帧（出站形状 + 解析 + reducer）", () => {
+  it("出站四帧逐字段（machine 缺省不带字段，undefined 不序列化）", () => {
+    expect(encodeFrame({ v: 1, type: "workspace_list" })).toBe('{"v":1,"type":"workspace_list"}');
+    expect(encodeFrame({ v: 1, type: "workspace_save", name: "code", path: "/u/code" })).toBe(
+      '{"v":1,"type":"workspace_save","name":"code","path":"/u/code"}',
+    );
+    expect(encodeFrame({ v: 1, type: "workspace_remove", name: "code" })).toBe(
+      '{"v":1,"type":"workspace_remove","name":"code"}',
+    );
+    expect(
+      encodeFrame({ v: 1, type: "conv_workdir_set", convId: "web:default", path: "/u/code" }),
+    ).toBe('{"v":1,"type":"conv_workdir_set","convId":"web:default","path":"/u/code"}');
+    // machine 可选路由键（v1.1 约定，同 message 族）
+    expect(encodeFrame({ v: 1, type: "workspace_list", machine: "home-mac" })).toBe(
+      '{"v":1,"type":"workspace_list","machine":"home-mac"}',
+    );
+    expect(
+      encodeFrame({ v: 1, type: "workspace_save", name: "x", path: "/x", machine: undefined }),
+    ).toBe('{"v":1,"type":"workspace_save","name":"x","path":"/x"}');
+    expect(
+      encodeFrame({
+        v: 1,
+        type: "conv_workdir_set",
+        convId: "web:default",
+        path: "/u/code",
+        machine: "home-mac",
+      }),
+    ).toBe(
+      '{"v":1,"type":"conv_workdir_set","convId":"web:default","path":"/u/code","machine":"home-mac"}',
+    );
+  });
+
+  it("workspaceNameValid：1..=32 非空（trim 后）", () => {
+    expect(workspaceNameValid("code")).toBe(true);
+    expect(workspaceNameValid("  code  ")).toBe(true); // trim 后合法
+    expect(workspaceNameValid("")).toBe(false);
+    expect(workspaceNameValid("   ")).toBe(false);
+    expect(workspaceNameValid("x".repeat(32))).toBe(true);
+    expect(workspaceNameValid("x".repeat(33))).toBe(false);
+  });
+
+  it("parseFrame workspaces：合法全形状 / 可选字段（lastUsedAt、machine）；缺字段/错类型拒", () => {
+    const ok = parseFrame(
+      '{"v":1,"type":"workspaces","default":"/d","workspaces":[{"name":"a","path":"/a","lastUsedAt":100},{"name":"b","path":"/b"}],"convs":{"web:default":"/a","local:work":"/t"},"machine":"home-mac"}',
+    );
+    expect(ok).toMatchObject({ type: "workspaces", default: "/d", machine: "home-mac" });
+    // lastUsedAt 缺席合法；convs 空记录合法；machine 缺席（旧网关）合法
+    expect(
+      parseFrame('{"v":1,"type":"workspaces","default":"/d","workspaces":[],"convs":{}}'),
+    ).toMatchObject({ type: "workspaces", workspaces: [], convs: {} });
+    // 缺 default
+    expect(parseFrame('{"v":1,"type":"workspaces","workspaces":[],"convs":{}}')).toBeNull();
+    // workspaces 非数组 / 元素缺 name / lastUsedAt 非数字
+    expect(parseFrame('{"v":1,"type":"workspaces","default":"/d","workspaces":"x","convs":{}}')).toBeNull();
+    expect(
+      parseFrame('{"v":1,"type":"workspaces","default":"/d","workspaces":[{"path":"/a"}],"convs":{}}'),
+    ).toBeNull();
+    expect(
+      parseFrame(
+        '{"v":1,"type":"workspaces","default":"/d","workspaces":[{"name":"a","path":"/a","lastUsedAt":"x"}],"convs":{}}',
+      ),
+    ).toBeNull();
+    // convs 缺席 / 非记录（数组）/ 值非字符串
+    expect(parseFrame('{"v":1,"type":"workspaces","default":"/d","workspaces":[]}')).toBeNull();
+    expect(
+      parseFrame('{"v":1,"type":"workspaces","default":"/d","workspaces":[],"convs":[]}'),
+    ).toBeNull();
+    expect(
+      parseFrame('{"v":1,"type":"workspaces","default":"/d","workspaces":[],"convs":{"web:a":7}}'),
+    ).toBeNull();
+    // machine 非字符串
+    expect(
+      parseFrame('{"v":1,"type":"workspaces","default":"/d","workspaces":[],"convs":{},"machine":1}'),
+    ).toBeNull();
+  });
+
+  it("parseFrame conv_workdir：合法（machine 可选）；缺字段/错类型拒", () => {
+    expect(
+      parseFrame('{"v":1,"type":"conv_workdir","convId":"web:default","workdir":"/d","machine":"home-mac"}'),
+    ).toMatchObject({ type: "conv_workdir", convId: "web:default", workdir: "/d" });
+    expect(parseFrame('{"v":1,"type":"conv_workdir","convId":"web:default","workdir":"/d"}')).toMatchObject({
+      type: "conv_workdir",
+    });
+    expect(parseFrame('{"v":1,"type":"conv_workdir","convId":"web:default"}')).toBeNull();
+    expect(parseFrame('{"v":1,"type":"conv_workdir","workdir":"/d"}')).toBeNull();
+    expect(parseFrame('{"v":1,"type":"conv_workdir","convId":1,"workdir":"/d"}')).toBeNull();
+    expect(
+      parseFrame('{"v":1,"type":"conv_workdir","convId":"web:default","workdir":"/d","machine":[]}'),
+    ).toBeNull();
+  });
+
+  it("reducer：workspaces 快照按 machine 落表（缺席归 DEFAULT_MACHINE），全量覆盖", () => {
+    expect(initialState().workspaces).toEqual({});
+    let s = run(initialState(), {
+      type: "frame",
+      frame: frame(
+        '{"v":1,"type":"workspaces","default":"/d","workspaces":[{"name":"a","path":"/a"}],"convs":{"web:default":"/a"},"machine":"home-mac"}',
+      ),
+    });
+    expect(s.workspaces["home-mac"]).toEqual({
+      default: "/d",
+      items: [{ name: "a", path: "/a" }],
+      convs: { "web:default": "/a" },
+    });
+    // 无 machine（旧网关）→ DEFAULT_MACHINE
+    s = run(s, {
+      type: "frame",
+      frame: frame('{"v":1,"type":"workspaces","default":"/x","workspaces":[],"convs":{}}'),
+    });
+    expect(s.workspaces[DEFAULT_MACHINE]).toEqual({ default: "/x", items: [], convs: {} });
+    // 同机器第二次快照整体覆盖（移除空间后 items 减少）
+    s = run(s, {
+      type: "frame",
+      frame: frame(
+        '{"v":1,"type":"workspaces","default":"/d","workspaces":[],"convs":{},"machine":"home-mac"}',
+      ),
+    });
+    expect(s.workspaces["home-mac"]).toEqual({ default: "/d", items: [], convs: {} });
+    // 两台机器互不干扰
+    expect(s.workspaces[DEFAULT_MACHINE]).toEqual({ default: "/x", items: [], convs: {} });
+  });
+
+  it("reducer：conv_workdir 增量合并进对应机器 convs；无快照机器忽略", () => {
+    let s = run(initialState(), {
+      type: "frame",
+      frame: frame(
+        '{"v":1,"type":"workspaces","default":"/d","workspaces":[],"convs":{"web:default":"/d"},"machine":"home-mac"}',
+      ),
+    });
+    s = run(s, {
+      type: "frame",
+      frame: frame(
+        '{"v":1,"type":"conv_workdir","convId":"web:default","workdir":"/u/code","machine":"home-mac"}',
+      ),
+    });
+    expect(s.workspaces["home-mac"]?.convs["web:default"]).toBe("/u/code");
+    // 增量合并不动 items/default；其它键保留
+    s = run(s, {
+      type: "frame",
+      frame: frame('{"v":1,"type":"conv_workdir","convId":"web:side","workdir":"/u/tmp","machine":"home-mac"}'),
+    });
+    expect(s.workspaces["home-mac"]?.convs).toEqual({
+      "web:default": "/u/code",
+      "web:side": "/u/tmp",
+    });
+    expect(s.workspaces["home-mac"]?.default).toBe("/d");
+    // 机器取帧的 machine 字段：work-mac 无快照 → 忽略（不造残缺条目）
+    const ignored = run(s, {
+      type: "frame",
+      frame: frame('{"v":1,"type":"conv_workdir","convId":"web:default","workdir":"/w","machine":"work-mac"}'),
+    });
+    expect(ignored).toBe(s);
+    // 无 machine（旧网关）→ DEFAULT_MACHINE；其无快照同样忽略
+    expect(
+      run(s, {
+        type: "frame",
+        frame: frame('{"v":1,"type":"conv_workdir","convId":"web:default","workdir":"/w"}'),
+      }),
+    ).toBe(s);
+  });
+
+  it("reducer：error 帧不改快照（失败附 error 且快照不变，SPA 只认回包）", () => {
+    const s = run(initialState(), {
+      type: "frame",
+      frame: frame(
+        '{"v":1,"type":"workspaces","default":"/d","workspaces":[{"name":"a","path":"/a"}],"convs":{},"machine":"home-mac"}',
+      ),
+    });
+    const after = run(s, {
+      type: "frame",
+      frame: frame('{"v":1,"type":"error","code":"workspace_invalid","message":"名称已存在"}'),
+    });
+    expect(after.lastError?.code).toBe("workspace_invalid");
+    expect(after.workspaces).toBe(s.workspaces); // 引用不变 = 快照原样
   });
 });

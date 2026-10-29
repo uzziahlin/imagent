@@ -38,6 +38,7 @@ pub mod render;
 pub mod sandbox;
 pub mod session_scan;
 mod types;
+pub mod workspace;
 
 pub use auth::Auth;
 pub use backend::{Backend, ImPermissionAsk, ImPermissionHook, PermissionCapability};
@@ -66,3 +67,4 @@ pub use types::{
     OutboundCard, ReplyHint, RunOutcome, SessionId, TodoItem, TodoStatus, ToolCall, UsageStats,
     UserId, Workdir, CARD_HANDLE_LOST,
 };
+pub use workspace::{workdir_key, workspace_key, WorkspaceRecord};

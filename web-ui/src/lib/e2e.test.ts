@@ -532,6 +532,34 @@ describe("E2eCoordinator 状态机", () => {
     expect(coord.outbound(undefined, msg)).toBe(JSON.stringify(msg));
   });
 
+  // v1.6：工作空间四帧均为业务帧（BUSINESS_TYPES）——active 机器出站必 enc 包装
+  it("v1.6 工作空间四帧：active 机器出站 enc 包装（网关密钥可解回原帧）；单机恒明文", () => {
+    const gw = makeGateway();
+    const { coord, hellos } = makeCoord();
+    coord.onMachines(["home-mac"]);
+    const hello = JSON.parse(hellos[0]);
+    const ack = gw.ackFor(hello, "home-mac");
+    coord.onAck(ack);
+    coord.resolveTofu("home-mac", true);
+    const gwKey = gw.gatewayKey(hello, ack.n2);
+    const frames = [
+      { v: 1 as const, type: "workspace_list" as const, machine: "home-mac" },
+      { v: 1 as const, type: "workspace_save" as const, name: "code", path: "/u/code", machine: "home-mac" },
+      { v: 1 as const, type: "workspace_remove" as const, name: "code", machine: "home-mac" },
+      { v: 1 as const, type: "conv_workdir_set" as const, convId: "web:default", path: "/u/code", machine: "home-mac" },
+    ];
+    for (const f of frames) {
+      const wire = coord.outbound("home-mac", f);
+      expect(wire).not.toBeNull();
+      const enc = JSON.parse(wire!) as { type: string; box: string };
+      expect(enc.type).toBe("enc");
+      expect(openBox(gwKey, enc.box)).toBe(JSON.stringify(f));
+    }
+    // 单机模式（machine undefined，旧 relay）恒明文直发
+    const plain = { v: 1 as const, type: "workspace_list" as const };
+    expect(coord.outbound(undefined, plain)).toBe(JSON.stringify(plain));
+  });
+
 });
 
 describe("E2eCoordinator sid（定向加密形态）", () => {

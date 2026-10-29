@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { useEffect, useMemo, useReducer, useRef, useState, type FormEvent } from "react";
 import {
   DEFAULT_CONV,
   DEFAULT_MACHINE,
+  convDisplayName,
   deviceSummary,
   initialState,
   reducer,
@@ -10,6 +11,7 @@ import {
   type ConvState,
   type DeviceInfo,
   type MachineNotice,
+  type MachineWorkspaces,
   type PairingRequest,
   type PasskeyInfo,
   type PendingApproval,
@@ -50,6 +52,7 @@ import { AdminPanel, RotatedTokenModal } from "./components/AdminPanel";
 import { PairingWait } from "./components/PairingWait";
 import { PairingRequestCard } from "./components/PairingRequestCard";
 import { E2eConfirm } from "./components/E2eConfirm";
+import { WorkspacePicker, loadLastDir, saveLastDir } from "./components/WorkspacePicker";
 import { useExitMounted } from "./components/useExitMounted";
 import { MessageList } from "./components/MessageList";
 import { ApprovalPanel } from "./components/ApprovalPanel";
@@ -163,6 +166,12 @@ export default function App() {
   const [pairingCodeAt, setPairingCodeAt] = useState<number | null>(null);
   const [status, setStatus] = useState<ConnStatus>("connecting");
   const [drawerOpen, setDrawerOpen] = useState(false);
+  // v1.6 工作空间：新会话弹层（会话名 + 目录选择）与目录条切换弹层
+  const [newConvOpen, setNewConvOpen] = useState(false);
+  const [newConvName, setNewConvName] = useState("");
+  /** 新会话绑定目录（undefined = 未选；打开弹层时预选 lastdir）。 */
+  const [newConvDir, setNewConvDir] = useState<string | undefined>(undefined);
+  const [dirPickerOpen, setDirPickerOpen] = useState(false);
   // v1.4 E2E：pin 表快照（设备管理指纹区）+ UI 态（TOFU 队列/告警/阻断/激活）
   const [e2ePins, setE2ePins] = useState<E2ePin[]>(() => loadPins());
   const [e2eUi, setE2eUi] = useState<E2eUi>(EMPTY_E2E_UI);
@@ -401,6 +410,16 @@ export default function App() {
     }
   }, [state.machinesKnown, state.currentMachine]);
 
+  // v1.6 工作空间快照拉取：连接 ready（含重连成功）与机器维度变化后各发一次
+  // workspace_list（快照落 reducer，SPA 以快照为唯一事实源）。仅多机模式
+  // （machinesKnown——新 relay 恒推 machines 帧）发送：旧 relay 单机模式网关
+  // 不认识该帧，目录条也不渲染，行为与升级前一致。
+  useEffect(() => {
+    if (state.machinesKnown && status === "ready") {
+      wsRef.current?.listWorkspaces(state.currentMachine);
+    }
+  }, [state.machinesKnown, state.currentMachine, status]);
+
   // 侧边栏会话项：当前选中机器会话空间内的全部 conv；刚切到尚未收到帧的 conv
   // （新会话）不在 convOrder 里，前端补一项空预览，避免当前高亮落空。
   // 注意：hook 必须在下方 token 早退之前（hooks 数量不可随登录态变化）。
@@ -508,21 +527,68 @@ export default function App() {
     return ok;
   };
 
+  // v1.6 当前机器工作空间快照（workspaces 帧；null = 无快照（旧网关），目录条
+  // 与目录选择不渲染）。当前 conv 工作目录 = convs[convId] ?? default。
+  const wsSnapshot: MachineWorkspaces | null = state.workspaces[state.currentMachine] ?? null;
+  const convDir = wsSnapshot ? (wsSnapshot.convs[currentConv] ?? wsSnapshot.default) : null;
+
   /** 新会话：/switch <名字> 命令文本走 message 帧（convId 留空落网关默认
-   *  会话），同时本地把当前 conv 切到 web:<名字>；命令回显留在默认会话。 */
-  const createConv = (name: string): boolean => {
+   *  会话），同时本地把当前 conv 切到 web:<名字>；命令回显留在默认会话。
+   *  v1.6：选择了目录（≠default）→ 会话创建后发 setConvWorkdir(新 convId,
+   *  path) 绑定并记录 lastdir 预选；未选/选 default 不发（新会话天然落网关
+   *  默认目录）。 */
+  const createConv = (name: string, dir: string | undefined): boolean => {
     const ok = wsRef.current?.sendMessage(undefined, `/switch ${name}`, outMachine()) ?? false;
-    if (ok) {
-      dispatch({
-        type: "send_echo",
-        convId: DEFAULT_CONV,
-        text: `/switch ${name}`,
-        machine: state.currentMachine,
-      });
-      dispatch({ type: "select_conv", convId: toConvId(name) });
-      setDrawerOpen(false);
+    if (!ok) {
+      return false;
     }
-    return ok;
+    dispatch({
+      type: "send_echo",
+      convId: DEFAULT_CONV,
+      text: `/switch ${name}`,
+      machine: state.currentMachine,
+    });
+    dispatch({ type: "select_conv", convId: toConvId(name) });
+    if (dir !== undefined && dir !== wsSnapshot?.default) {
+      wsRef.current?.setConvWorkdir(toConvId(name), dir, outMachine());
+      saveLastDir(state.currentMachine, dir);
+    }
+    setDrawerOpen(false);
+    return true;
+  };
+
+  /** v1.6 打开新会话弹层：清名 + 预选 lastdir（该机器上次选择的目录）。 */
+  const openNewConv = () => {
+    setNewConvName("");
+    setNewConvDir(loadLastDir(state.currentMachine) ?? undefined);
+    setNewConvOpen(true);
+    setDrawerOpen(false);
+  };
+
+  const submitNewConv = (e: FormEvent) => {
+    e.preventDefault();
+    const n = newConvName.trim();
+    if (!n) {
+      return;
+    }
+    if (createConv(n, newConvDir)) {
+      setNewConvOpen(false);
+    }
+  };
+
+  /** v1.6 目录条切换：选择即 setConvWorkdir(currentConv, path)——选 default
+   *  同样发（语义统一），并记录 lastdir；快照由网关回包刷新（无乐观更新）。 */
+  const switchConvDir = (path: string) => {
+    if (wsRef.current?.setConvWorkdir(currentConv, path, outMachine())) {
+      saveLastDir(state.currentMachine, path);
+    }
+    setDirPickerOpen(false);
+  };
+
+  /** v1.6 保存工作空间（WorkspacePicker 内联入口；网关回 workspaces 快照，
+   *  失败 error 帧 toast）。 */
+  const saveWorkspace = (name: string, path: string) => {
+    wsRef.current?.saveWorkspace(name, path, outMachine());
   };
 
   /** 审批回传带审批来源机器（可能是非当前选中机器的审批）。 */
@@ -759,7 +825,7 @@ export default function App() {
       onOpenAdmin={session ? openAdmin : undefined}
       onSelect={selectConv}
       onSelectMachine={selectMachine}
-      onCreate={createConv}
+      onCreate={openNewConv}
     />
   );
 
@@ -808,6 +874,31 @@ export default function App() {
           onReconnect={reconnect}
           onOpenDrawer={() => setDrawerOpen(true)}
         />
+        {/* v1.6 会话目录常驻条：当前 conv 的工作目录（convs[convId] ?? default），
+            无快照（旧网关）时整条不渲染；点击弹 WorkspacePicker 切换（选择即
+            setConvWorkdir，选 default 同样发——语义统一） */}
+        {wsSnapshot && (
+          <button
+            type="button"
+            onClick={() => setDirPickerOpen(true)}
+            aria-label="切换会话目录"
+            title={convDir ?? "默认目录"}
+            className="press flex w-full shrink-0 items-center gap-1.5 border-b border-line bg-panel px-3 py-1.5 text-left text-xs text-muted transition-colors hover:bg-panel2 hover:text-ink"
+          >
+            <span aria-hidden="true">📂</span>
+            <span className="min-w-0 flex-1 truncate font-mono">{convDir ?? "默认目录"}</span>
+            <svg
+              viewBox="0 0 20 20"
+              className="h-3.5 w-3.5 shrink-0"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.8"
+              aria-hidden="true"
+            >
+              <path d="M5 8l5 5 5-5" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </button>
+        )}
         {/* v1.4 e2e 横幅区：身份变化（红，持久不自动消退）/ 降级告警（黄，
             收到未加密业务帧——链路可能被降级，帧已丢弃）/ 不支持加密（琥珀
             + 显式明文按钮——fail-closed：绝不自动明文降级） */}
@@ -898,6 +989,123 @@ export default function App() {
           }}
         />
       </div>
+
+      {/* v1.6 新会话弹层：会话名 + 工作目录选择（快照缺席时不渲染目录区，
+          创建流程与原侧栏内联表单一致：/switch 命令 + 本地切 conv） */}
+      {newConvOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-black/50"
+          role="dialog"
+          aria-modal="true"
+          aria-label="新会话"
+        >
+          <div className="absolute left-1/2 top-1/2 flex max-h-[85vh] w-[calc(100%-2rem)] max-w-md -translate-x-1/2 -translate-y-1/2 flex-col rounded-2xl border border-line bg-panel shadow-2xl">
+            <div className="flex shrink-0 items-center px-4 pb-2 pt-3.5">
+              <h2 className="text-sm font-semibold text-ink">新会话</h2>
+              <button
+                type="button"
+                onClick={() => setNewConvOpen(false)}
+                aria-label="关闭新会话"
+                className="press ml-auto rounded-lg p-1.5 text-muted transition-colors hover:bg-panel2 hover:text-ink"
+              >
+                <svg viewBox="0 0 20 20" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
+                  <line x1="5" y1="5" x2="15" y2="15" strokeLinecap="round" />
+                  <line x1="15" y1="5" x2="5" y2="15" strokeLinecap="round" />
+                </svg>
+              </button>
+            </div>
+            <form onSubmit={submitNewConv} className="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain px-4 pb-4">
+              {/* text-base（16px）：防 iOS Safari 聚焦 <16px 输入框时自动放大页面 */}
+              <input
+                autoFocus
+                value={newConvName}
+                onChange={(e) => setNewConvName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") {
+                    setNewConvOpen(false);
+                  }
+                }}
+                placeholder="会话名（如 work）"
+                aria-label="新会话名称"
+                className="w-full rounded-lg border border-line-strong bg-surface px-2.5 py-1.5 text-base text-ink outline-none placeholder:text-ghost focus:border-emerald-500"
+              />
+              {wsSnapshot && (
+                <div>
+                  <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-ghost">
+                    工作目录
+                  </div>
+                  <WorkspacePicker
+                    snapshot={wsSnapshot}
+                    selected={newConvDir}
+                    onSelect={setNewConvDir}
+                    onSave={saveWorkspace}
+                  />
+                </div>
+              )}
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setNewConvOpen(false)}
+                  className="press flex-1 rounded-xl border border-line-strong py-2 text-sm text-muted transition-colors hover:text-ink"
+                >
+                  取消
+                </button>
+                <button
+                  type="submit"
+                  disabled={!newConvName.trim()}
+                  className="press flex-1 rounded-xl bg-emerald-600 py-2 text-sm font-semibold text-white transition-colors hover:bg-emerald-500 disabled:opacity-40"
+                >
+                  创建（/switch）
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* v1.6 目录切换弹层（目录条点击弹出）：选择即 setConvWorkdir */}
+      {dirPickerOpen && wsSnapshot && (
+        <div
+          className="fixed inset-0 z-50"
+          role="dialog"
+          aria-modal="true"
+          aria-label="切换会话目录"
+        >
+          <div
+            className="absolute inset-0 bg-black/50"
+            onClick={() => setDirPickerOpen(false)}
+            aria-hidden="true"
+          />
+          <div className="absolute left-1/2 top-1/2 flex max-h-[85vh] w-[calc(100%-2rem)] max-w-md -translate-x-1/2 -translate-y-1/2 flex-col rounded-2xl border border-line bg-panel shadow-2xl">
+            <div className="flex shrink-0 items-center px-4 pb-2 pt-3.5">
+              <h2 className="text-sm font-semibold text-ink">切换会话目录</h2>
+              <button
+                type="button"
+                onClick={() => setDirPickerOpen(false)}
+                aria-label="关闭目录切换"
+                className="press ml-auto rounded-lg p-1.5 text-muted transition-colors hover:bg-panel2 hover:text-ink"
+              >
+                <svg viewBox="0 0 20 20" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
+                  <line x1="5" y1="5" x2="15" y2="15" strokeLinecap="round" />
+                  <line x1="15" y1="5" x2="5" y2="15" strokeLinecap="round" />
+                </svg>
+              </button>
+            </div>
+            <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 pb-4">
+              <p className="mb-2 text-xs text-muted">
+                会话 <span className="font-mono text-ink">{convDisplayName(currentConv)}</span>{" "}
+                的工作目录
+              </p>
+              <WorkspacePicker
+                snapshot={wsSnapshot}
+                selected={convDir ?? undefined}
+                onSelect={switchConvDir}
+                onSave={saveWorkspace}
+              />
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* v1.4 E2E：TOFU 首连指纹确认弹层（队列逐台弹） */}
       {e2eUi.tofu.length > 0 && (

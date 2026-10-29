@@ -1,4 +1,4 @@
-import { useMemo, useState, type FormEvent, type KeyboardEvent } from "react";
+import { useMemo } from "react";
 import { convDisplayName, DEFAULT_MACHINE, normalizeExpiryMs } from "../lib/protocol";
 
 /** 侧边栏会话项数据（App 从 state 派生）：conv 全名 + 最后消息预览/时间 +
@@ -36,8 +36,9 @@ function formatTime(at: number): string {
  * - 点选会话 = 仅切换 SPA 本地当前 conv（不发包）；
  * - 点选机器 = 切换 currentMachine（App 侧把当前 conv 回到该机器默认会话，
  *   并发一次带 machine 的 sync 拉该机器卡片缓存）；
- * - 新会话 = 由上层发 `/switch <名字>` message 命令帧（convId 留空落默认
- *   会话），命令语义由网关解析，SPA 同时把当前 conv 切到 `web:<名字>`。
+ * - 新会话（v1.6）= 打开 App 级弹层（会话名 + 工作目录选择 WorkspacePicker），
+ *   确认后由上层发 `/switch <名字>` message 命令帧（convId 留空落默认会话）
+ *   并按需绑定目录（conv_workdir_set），SPA 同时把当前 conv 切到 `web:<名字>`。
  * - 未收到任何 machines 帧（旧 relay）：不显示机器区，单机行为与升级前一致。
  * - v1.2 会话层：底部「管理」入口（仅会话模式；v1.5 起为管理面板——机器/
  *   令牌/设备/钥匙/指纹）与「会话 N 天后过期」续期横幅（剩余 < 3 天；点击
@@ -78,11 +79,9 @@ export function Sidebar({
   onSelect: (conv: string) => void;
   /** 机器切换器点选（切 currentMachine + 触发该机器 sync）。 */
   onSelectMachine: (machine: string) => void;
-  /** 发 /switch 并切换当前 conv；返回 false（未连接等）则留在输入态。 */
-  onCreate: (name: string) => boolean;
+  /** 打开新会话弹层（v1.6：会话名 + 工作目录选择在 App 级弹层完成）。 */
+  onCreate: () => void;
 }) {
-  const [creating, setCreating] = useState(false);
-  const [name, setName] = useState("");
 
   // v1.2 过期横幅：剩余 < 3 天提示（天数向上取整，至少 1 天）
   const daysLeft = useMemo(() => {
@@ -107,29 +106,6 @@ export function Sidebar({
     }
     return rows;
   }, [machines, machinesKnown, currentMachine]);
-
-  const submit = (e: FormEvent) => {
-    e.preventDefault();
-    const n = name.trim();
-    if (!n) {
-      return;
-    }
-    if (onCreate(n)) {
-      setName("");
-      setCreating(false);
-    }
-  };
-
-  const cancel = () => {
-    setName("");
-    setCreating(false);
-  };
-
-  const onKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Escape") {
-      cancel();
-    }
-  };
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -267,44 +243,14 @@ export function Sidebar({
             管理
           </button>
         )}
-        {creating ? (
-          <form onSubmit={submit} className="space-y-1.5">
-            {/* text-base（16px）：防 iOS Safari 聚焦 <16px 输入框时自动放大页面 */}
-            <input
-              autoFocus
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              onKeyDown={onKeyDown}
-              placeholder="会话名（如 work）"
-              aria-label="新会话名称"
-              className="w-full rounded-lg border border-line-strong bg-surface px-2.5 py-1.5 text-base text-ink outline-none placeholder:text-ghost focus:border-emerald-500"
-            />
-            <div className="flex gap-1.5">
-              <button
-                type="submit"
-                disabled={!name.trim()}
-                className="flex-1 rounded-lg bg-emerald-600 px-2 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-emerald-500 disabled:opacity-40"
-              >
-                创建（/switch）
-              </button>
-              <button
-                type="button"
-                onClick={cancel}
-                className="rounded-lg border border-line-strong px-2.5 py-1.5 text-xs text-muted transition-colors hover:text-ink"
-              >
-                取消
-              </button>
-            </div>
-          </form>
-        ) : (
-          <button
-            type="button"
-            onClick={() => setCreating(true)}
-            className="w-full rounded-lg border border-dashed border-line-strong px-3 py-2 text-sm text-muted transition-colors hover:border-emerald-500/60 hover:text-ink"
-          >
-            + 新会话
-          </button>
-        )}
+        {/* v1.6：新会话入口改为开 App 级弹层（会话名 + 工作目录选择） */}
+        <button
+          type="button"
+          onClick={onCreate}
+          className="w-full rounded-lg border border-dashed border-line-strong px-3 py-2 text-sm text-muted transition-colors hover:border-emerald-500/60 hover:text-ink"
+        >
+          + 新会话
+        </button>
       </div>
     </div>
   );

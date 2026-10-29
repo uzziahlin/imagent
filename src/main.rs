@@ -1627,11 +1627,16 @@ async fn build_platform(
             // M5 多终端：machine 身份 = config 显式值 / 缺省 hostname 短名
             //（imagent_web 内规范化 + 回退 default），hello 自报给 relay。
             let machine_id = imagent_web::resolve_machine_id(config.web_machine_id.as_deref());
+            // v1.6 工作空间：注入 store 句柄 + default_workdir（workspace 泵
+            // 直接读写 workspace:/workdir: KV——与终端 /ws /cd 同源互通，
+            // 快照 default 字段取 default_workdir）。
             Ok(Arc::new(imagent_web::WebPlatform::new(
                 relay_url,
                 credential,
                 default_session,
                 machine_id,
+                store.clone(),
+                config.default_workdir.clone(),
             )))
         }
         "local" => {

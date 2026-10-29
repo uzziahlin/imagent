@@ -11,17 +11,28 @@
 //! - sync 重发（D6 故障语义）：per-conv 缓存最近卡片（send_card / update_card
 //!   更新，上限 32 conv 淘汰最旧），浏览器发 `sync` 时由独立 responder 任务
 //!   全量重发 card 帧。relay 保证单浏览器连接，无定向问题。
+//! - workspace 泵（v1.6 工作空间）：消费 client 转来的
+//!   workspace_list/save/remove/conv_workdir_set 动作，直接读写 store KV
+//!   （`workspace:`/`workdir:` 表，与终端 /ws /cd 同源互通）+
+//!   [`imagent_core::validate_workdir`] 校验（复用 /cd 护栏，不经 dispatch
+//!   命令链），每帧回 workspaces 全量快照（失败前置 error 帧）。构造注入
+//!   store 句柄 + default_workdir（main 装配处传入）。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use imagent_store::Store;
 use tokio::sync::{mpsc, Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use imagent_core::{
+    validate_workdir,
+    workspace::{workdir_key, workspace_key, WorkspaceRecord, WORKDIR_PREFIX, WORKSPACE_PREFIX},
     ConvId, CoreError, InboundMessage, MediaRef, OutboundCard, PermissionReply, Platform,
     PlatformCaps, ReplyHint, Result,
 };
@@ -30,7 +41,8 @@ use crate::client::WebClient;
 use crate::e2e::E2eIdentity;
 use crate::{
     encode_approval_request_frame, encode_approval_resolved_frame, encode_card_frame,
-    encode_text_frame, CardPayload, GatewayCredential, TARGET,
+    encode_conv_workdir_frame, encode_error_frame, encode_text_frame, encode_workspaces_frame,
+    CardPayload, GatewayCredential, InboundAction, WorkspaceEntryFrame, TARGET,
 };
 
 const PLATFORM: &str = "web";
@@ -42,9 +54,16 @@ const OUTBOUND_CHANNEL_CAPACITY: usize = 256;
 const INBOUND_CHANNEL_CAPACITY: usize = 64;
 /// sync 请求 channel 容量。
 const SYNC_CHANNEL_CAPACITY: usize = 8;
+/// workspace 动作 channel 容量（v1.6）：SPA 点按级频率（保存/删除/切目录），
+/// 16 足以吸收突发；打满由 client 侧 1s 有界背压丢弃 + SPA 重发兜底。
+const WORKSPACE_CHANNEL_CAPACITY: usize = 16;
 /// 卡片缓存 conv 上限（§5.4）：超限淘汰最旧（seq 最小），防长寿命进程内存
 /// 无界增长。
 const CARD_CACHE_MAX_CONVS: usize = 32;
+/// v1.6 工作空间错误帧 code（帧契约定案字面量，SPA 据此分支渲染）。
+const WORKSPACE_ERROR_CODE: &str = "workspace_invalid";
+/// workspace_save 的 name 上限（帧契约：trim 后 1..=32 char）。
+const WORKSPACE_NAME_MAX_CHARS: usize = 32;
 
 // ---------------------------------------------------------------------------
 // 卡片缓存（D6 sync 重发）
@@ -136,6 +155,229 @@ async fn serve_sync_requests(
 }
 
 // ---------------------------------------------------------------------------
+// workspace 泵（v1.6 工作空间：store KV 读写 + 校验 + 回帧）
+// ---------------------------------------------------------------------------
+
+/// workspace 泵主循环：消费 client 转来的工作空间动作（store API 是 async，
+/// 在本泵内 await——不阻塞 client 收发循环与 dispatch）。`machine_id` 为
+/// 本机身份（出站帧必带，v1.1 语义；与 serve_sync_requests 同款注入）。
+/// 平台 Drop 时经 shutdown token 连动退出。
+async fn serve_workspace_actions(
+    mut workspace_rx: mpsc::Receiver<InboundAction>,
+    machine_id: String,
+    store: Store,
+    default_workdir: PathBuf,
+    outbound_tx: mpsc::Sender<String>,
+    shutdown: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            act = workspace_rx.recv() => {
+                let Some(act) = act else {
+                    break; // client 退出（platform drop 连动），无后续动作
+                };
+                handle_workspace_action(&machine_id, &store, &default_workdir, act, &outbound_tx).await;
+            }
+        }
+    }
+    debug!(target: TARGET, "workspace 泵退出");
+}
+
+/// 处理一条工作空间动作并回帧。规则（协议 v1.6 语义）：
+/// - **每帧处理完（无论成败）都回一条 workspaces 全量快照**（SPA 单一数据
+///   来源；失败时快照不变 + 前置 error 帧）。
+/// - conv_workdir_set 成功时**额外**推一条 conv_workdir 增量帧。
+/// - workspace_remove 未命中幂等（store delete 对不存在键即 Ok）。
+async fn handle_workspace_action(
+    machine: &str,
+    store: &Store,
+    default_workdir: &Path,
+    act: InboundAction,
+    outbound_tx: &mpsc::Sender<String>,
+) {
+    match act {
+        InboundAction::WorkspaceList => {} // 直接回快照（收尾统一发）
+        InboundAction::WorkspaceSave { name, path } => {
+            if let Err(msg) = validate_workspace_save(&name, &path) {
+                reply_workspace_error(machine, outbound_tx, &msg);
+            } else {
+                // 同名覆盖：写全新记录（lastUsedAt 缺席——刚保存未被用过）。
+                let key = workspace_key(name.trim());
+                let value = WorkspaceRecord::new(&path).encode();
+                if let Err(e) = store.set_config(&key, &value).await {
+                    reply_workspace_error(machine, outbound_tx, &format!("保存失败：{e}"));
+                } else {
+                    info!(target: TARGET, name = %name.trim(), "workspace_save：已保存工作空间");
+                }
+            }
+        }
+        InboundAction::WorkspaceRemove { name } => {
+            // 未命中幂等：delete_config 对不存在键返回 Ok，不报错。
+            if let Err(e) = store.delete_config(&workspace_key(&name)).await {
+                reply_workspace_error(machine, outbound_tx, &format!("删除失败：{e}"));
+            }
+        }
+        InboundAction::ConvWorkdirSet { conv, path } => {
+            if let Err(msg) = validate_workdir_str(&path) {
+                reply_workspace_error(machine, outbound_tx, &msg);
+            } else {
+                // 与 /cd 同键（workdir:<conv>）——终端与网页互通的关键。
+                match store.set_config(&workdir_key(&conv), &path).await {
+                    Err(e) => {
+                        reply_workspace_error(machine, outbound_tx, &format!("保存失败：{e}"))
+                    }
+                    Ok(()) => {
+                        bump_workspace_last_used(store, &path).await;
+                        // 额外增量帧（先增量后快照——快照是 SPA 单一来源，放最后）。
+                        match encode_conv_workdir_frame(machine, &conv, &path) {
+                            Ok(json) => enqueue_best_effort(outbound_tx, json),
+                            Err(e) => warn!(
+                                target: TARGET,
+                                conv = %conv,
+                                error = %e,
+                                "conv_workdir 增量帧序列化失败（快照兜底）"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+        // client 只转发上述四个变体进 workspace channel，其余分支不可达
+        //（防御性忽略，不 panic——通道元素类型复用 InboundAction）。
+        other => {
+            debug!(target: TARGET, act = ?other, "workspace 泵收到非工作空间动作，忽略")
+        }
+    }
+    // 每帧收尾：全量快照（无论成败）。
+    match build_workspaces_frame(machine, store, default_workdir).await {
+        Ok(json) => enqueue_best_effort(outbound_tx, json),
+        Err(e) => warn!(target: TARGET, error = %e, "workspaces 快照帧序列化失败"),
+    }
+}
+
+/// workspaces 全量快照组帧：default = 配置 default_workdir；workspaces =
+/// 全部命名空间（name 稳定序）；convs = 全部已知 conv 的当前 workdir
+///（含 local: 会话）。best-effort：单段 list 失败 → warn + 该段空，快照
+/// 照发（SPA 单一数据来源，宁可缺段不可断流）。
+async fn build_workspaces_frame(
+    machine: &str,
+    store: &Store,
+    default_workdir: &Path,
+) -> Result<String> {
+    let mut entries: Vec<WorkspaceEntryFrame> = Vec::new();
+    match store.list_config(WORKSPACE_PREFIX).await {
+        Ok(rows) => {
+            for (k, v) in rows {
+                let Some(name) = k.strip_prefix(WORKSPACE_PREFIX) else {
+                    continue;
+                };
+                // 旧值（裸路径）与 v1.6 JSON 值统一 decode；损坏值跳过。
+                if let Some(rec) = WorkspaceRecord::decode(&v) {
+                    entries.push(WorkspaceEntryFrame {
+                        name: name.to_string(),
+                        path: rec.path,
+                        last_used_at: rec.last_used_at,
+                    });
+                }
+            }
+        }
+        Err(e) => warn!(target: TARGET, error = %e, "workspaces 快照：列出工作空间失败（段空）"),
+    }
+    let mut convs: BTreeMap<String, String> = BTreeMap::new();
+    match store.list_config(WORKDIR_PREFIX).await {
+        Ok(rows) => {
+            for (k, v) in rows {
+                if let Some(conv) = k.strip_prefix(WORKDIR_PREFIX) {
+                    // workdir KV 值恒为裸路径（/cd 与本泵同形态写入）。
+                    convs.insert(conv.to_string(), v);
+                }
+            }
+        }
+        Err(e) => {
+            warn!(target: TARGET, error = %e, "workspaces 快照：列出 conv workdir 失败（段空）")
+        }
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name)); // 契约：按 name 稳定序
+    encode_workspaces_frame(machine, &default_workdir.to_string_lossy(), entries, convs)
+}
+
+/// conv_workdir_set 的 path 校验链（与 /cd 同链）：绝对路径 + is_dir +
+/// [`validate_workdir`] 过宽目录拒绝——三者由 validate_workdir 一体覆盖
+///（其内部先验绝对/存在再黑名单），错误文案即人话中文。
+fn validate_workdir_str(path: &str) -> std::result::Result<(), String> {
+    validate_workdir(Path::new(path))
+}
+
+/// workspace_save 校验：name trim 后 1..=32 char 非空；path 走
+/// [`validate_workdir_str`] 同链。Err(中文原因) → error 帧 message。
+fn validate_workspace_save(name: &str, path: &str) -> std::result::Result<(), String> {
+    let chars = name.trim().chars().count();
+    if chars == 0 {
+        return Err("名称不能为空（trim 后 1~32 字符）".into());
+    }
+    if chars > WORKSPACE_NAME_MAX_CHARS {
+        return Err(format!(
+            "名称最长 {WORKSPACE_NAME_MAX_CHARS} 字符（当前 {chars}）"
+        ));
+    }
+    validate_workdir_str(path)
+}
+
+/// conv_workdir_set 命中某空间 path 时 bump 其 lastUsedAt（best-effort：
+/// 读写失败仅 warn——时间戳只影响 SPA「最近用过」排序，不影响功能）。
+async fn bump_workspace_last_used(store: &Store, path: &str) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let rows = match store.list_config(WORKSPACE_PREFIX).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!(target: TARGET, error = %e, "bump lastUsedAt：列出工作空间失败（跳过）");
+            return;
+        }
+    };
+    for (k, v) in rows {
+        let Some(name) = k.strip_prefix(WORKSPACE_PREFIX) else {
+            continue;
+        };
+        let Some(rec) = WorkspaceRecord::decode(&v) else {
+            continue;
+        };
+        if rec.path == path {
+            let bumped = WorkspaceRecord {
+                last_used_at: Some(now),
+                ..rec
+            };
+            if let Err(e) = store
+                .set_config(&workspace_key(name), &bumped.encode())
+                .await
+            {
+                warn!(target: TARGET, name, error = %e, "bump lastUsedAt 写回失败（忽略）");
+            }
+        }
+    }
+}
+
+/// 出站帧 best-effort 入队（workspace 路径专用：队列满/通道关闭丢帧 warn——
+/// SPA 重发或下条消息触发的快照兜底，不反压泵）。
+fn enqueue_best_effort(outbound_tx: &mpsc::Sender<String>, json: String) {
+    if let Err(e) = outbound_tx.try_send(json) {
+        warn!(target: TARGET, error = %e, "工作空间出站帧入队失败（队列满/通道关闭），丢弃");
+    }
+}
+
+/// 工作空间 error 帧（code=workspace_invalid，复用既有 error 帧形态；
+/// machine 为本机身份，v1.1 出站帧必带）。
+fn reply_workspace_error(machine: &str, outbound_tx: &mpsc::Sender<String>, message: &str) {
+    match encode_error_frame(machine, WORKSPACE_ERROR_CODE, message) {
+        Ok(json) => enqueue_best_effort(outbound_tx, json),
+        Err(e) => warn!(target: TARGET, error = %e, "workspace error 帧序列化失败"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WebPlatform
 // ---------------------------------------------------------------------------
 
@@ -165,13 +407,15 @@ pub struct WebPlatform {
 
 impl WebPlatform {
     /// 构造并后台 spawn client 任务（建连/认证/心跳/重连/收发）与 sync
-    /// responder 任务。`relay_url` 形如 `wss://…/imagent/gateway`；
+    /// responder / workspace 泵任务。`relay_url` 形如 `wss://…/imagent/gateway`；
     /// `credential` 为网关认证凭证（v1.3：key 优先 token 回退，main 经
     /// [`crate::key::load_gateway_credential`] 装配——密钥文件
     /// `<imagent_home>/web-gateway-key` 缺省自动生成；`IMAGENT_WEB_GATEWAY_TOKEN`
     /// 为兼容回退）；`machine_id` 为本机 machine 身份（v1.1，main 经
     /// [`crate::resolve_machine_id`] 解析：config 显式值 / hostname 短名）；
-    /// `default_session` 为无 convId 浏览器消息的落点（缺省 "default"）。
+    /// `default_session` 为无 convId 浏览器消息的落点（缺省 "default"）；
+    /// `store` / `default_workdir` 为 v1.6 工作空间泵所需（store KV 句柄 +
+    /// 快照 default 字段来源，main 装配处注入）。
     ///
     /// E2E 密钥（v1.4）锚定 `<imagent_home>/web-e2e-key`（main 不感知——
     /// E2E 是内容保密增强，装配失败不阻断网关启动，仅降级明文 + warn；
@@ -181,9 +425,19 @@ impl WebPlatform {
         credential: GatewayCredential,
         default_session: String,
         machine_id: String,
+        store: Store,
+        default_workdir: PathBuf,
     ) -> Self {
         let e2e_key = imagent_core::paths::imagent_home().join("web-e2e-key");
-        Self::new_with_e2e(relay_url, credential, default_session, machine_id, &e2e_key)
+        Self::new_with_e2e(
+            relay_url,
+            credential,
+            default_session,
+            machine_id,
+            &e2e_key,
+            store,
+            default_workdir,
+        )
     }
 
     /// [`Self::new`] 的全参形态（E2E 密钥路径可注入——集成测试用临时目录，
@@ -194,10 +448,14 @@ impl WebPlatform {
         default_session: String,
         machine_id: String,
         e2e_key_path: &std::path::Path,
+        store: Store,
+        default_workdir: PathBuf,
     ) -> Self {
         let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>(INBOUND_CHANNEL_CAPACITY);
         let (outbound_tx, outbound_rx) = mpsc::channel::<String>(OUTBOUND_CHANNEL_CAPACITY);
         let (sync_tx, sync_rx) = mpsc::channel::<()>(SYNC_CHANNEL_CAPACITY);
+        let (workspace_tx, workspace_rx) =
+            mpsc::channel::<InboundAction>(WORKSPACE_CHANNEL_CAPACITY);
 
         // E2E 身份装配（v1.4）：e2e_ack 签名复用 v1.3 认证 ed25519 私钥——
         // 仅 key 凭证形态可用；token 回退形态无签名密钥，E2E 不可用（出站
@@ -241,6 +499,7 @@ impl WebPlatform {
             e2e,
             inbound_tx,
             sync_tx,
+            workspace_tx,
         };
         tokio::spawn(client.run(outbound_rx, reconnect.clone(), shutdown.clone()));
 
@@ -250,6 +509,16 @@ impl WebPlatform {
             sync_rx,
             machine_id.clone(),
             cards.clone(),
+            outbound_tx.clone(),
+            shutdown.clone(),
+        ));
+
+        // workspace 泵（v1.6 工作空间；出站帧带 machine，v1.1 语义）。
+        tokio::spawn(serve_workspace_actions(
+            workspace_rx,
+            machine_id.clone(),
+            store,
+            default_workdir,
             outbound_tx.clone(),
             shutdown.clone(),
         ));
@@ -507,6 +776,31 @@ impl Platform for WebPlatform {
             self.relay_url, self.machine_id
         )]
     }
+
+    /// v1.6 工作空间：终端 `/cd` 成功后实时推 conv_workdir 增量帧（同步
+    /// best-effort——try_send 入队，队列满丢帧 warn，下条消息触发的快照
+    /// 兜底；trait 约定本方法不得 IO/await）。帧带本机 machine（v1.1 出站
+    /// 帧必带——SPA 增量合并按来源机器）。
+    fn on_workdir_changed(&self, conv: &ConvId, path: &str) {
+        match encode_conv_workdir_frame(&self.machine_id, &conv.0, path) {
+            Ok(json) => {
+                if let Err(e) = self.enqueue(json) {
+                    warn!(
+                        target: TARGET,
+                        conv = %conv.0,
+                        error = %e,
+                        "conv_workdir 增量帧入队失败，丢弃（下条快照兜底）"
+                    );
+                }
+            }
+            Err(e) => warn!(
+                target: TARGET,
+                conv = %conv.0,
+                error = %e,
+                "conv_workdir 增量帧序列化失败"
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -517,7 +811,32 @@ mod tests {
     use super::*;
     use imagent_core::{CardPhase, CardTerminal};
 
-    fn offline_platform() -> WebPlatform {
+    /// 工作空间直测的 machine 断言锚点（出站帧必带，v1.1 语义）。
+    const TEST_MACHINE: &str = "test-mac";
+
+    /// 测试用临时 store（真实 sqlite，临时目录——工作空间泵的 KV 读写走
+    /// 与生产同一条路径）。
+    async fn test_store() -> Store {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "imagent-web-platform-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        Store::open(&p).await.expect("open store")
+    }
+
+    /// 通过 validate_workdir 的测试目录（绝对 + is_dir + 非过宽）。
+    fn valid_dir() -> PathBuf {
+        let d = std::env::temp_dir().join(format!("imagent-web-ws-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    async fn offline_platform() -> WebPlatform {
         // Token 凭证 → E2E 身份不装配（无文件 IO），new_with_e2e 的路径仅
         // 满足签名（避免 new 的缺省路径锚定真实 ~/.imagent）。
         let e2e_key = std::env::temp_dir().join("imagent-web-platform-e2e-unused");
@@ -527,13 +846,15 @@ mod tests {
             "default".into(),
             "test-mac".into(),
             &e2e_key,
+            test_store().await,
+            valid_dir(),
         )
     }
 
     /// Drop 平台必须 cancel 停机信号（后台任务连动退出）。
     #[tokio::test]
     async fn drop_platform_cancels_shutdown_token() {
-        let p = offline_platform();
+        let p = offline_platform().await;
         let token = p.shutdown.clone();
         assert!(!token.is_cancelled());
         drop(p);
@@ -543,7 +864,7 @@ mod tests {
     /// B1：caps 声明与覆写清单一致性（钉值防漂移，对照 capabilities() 旁注释）。
     #[tokio::test]
     async fn web_caps_match_overrides() {
-        let p = offline_platform();
+        let p = offline_platform().await;
         assert_eq!(
             p.capabilities(),
             PlatformCaps::CARDS | PlatformCaps::ASK | PlatformCaps::RECONNECT,
@@ -559,7 +880,7 @@ mod tests {
     /// doctor_probes：离线（初始未连接）显示重连中；在线标志翻转后显示在线。
     #[tokio::test]
     async fn doctor_probes_reflect_online_state() {
-        let p = offline_platform();
+        let p = offline_platform().await;
         let probes = p.doctor_probes().await;
         assert_eq!(probes.len(), 1);
         assert!(
@@ -577,7 +898,7 @@ mod tests {
     /// send_media 显式 Err（不谎报 Ok）。
     #[tokio::test]
     async fn send_media_errors_explicitly() {
-        let p = offline_platform();
+        let p = offline_platform().await;
         let e = p
             .send_media(
                 &ConvId("web:x".into()),
@@ -591,6 +912,254 @@ mod tests {
             .unwrap_err();
         assert!(format!("{e}").contains("媒体"), "{e}");
         drop(p);
+    }
+
+    // ---- v1.6 工作空间动作处理（handle_workspace_action 直测：store + 出站
+    // channel 注入，不经网络；端到端路径见 tests/web_loopback.rs——含
+    // on_workdir_changed 的 /cd 通知路径，帧在真实 relay 的浏览器端观测）----
+
+    /// 处理一条动作并取回全部出站帧（解析为 Value 便于断言）。
+    /// machine 固定 TEST_MACHINE（出站帧 machine 断言锚点）。
+    async fn run_action(
+        store: &Store,
+        default: &Path,
+        act: InboundAction,
+    ) -> Vec<serde_json::Value> {
+        let (tx, mut rx) = mpsc::channel::<String>(32);
+        handle_workspace_action(TEST_MACHINE, store, default, act, &tx).await;
+        let mut out = Vec::new();
+        while let Ok(json) = rx.try_recv() {
+            out.push(serde_json::from_str(&json).unwrap());
+        }
+        out
+    }
+
+    /// conv_workdir_set 校验链（任务说明验收项）：非绝对路径 / 目录不存在 /
+    /// 过宽目录（/、home 根）→ error 帧 code=workspace_invalid 且
+    /// `workdir:<conv>` 未写入 + 照常回快照（快照不变）。
+    #[tokio::test]
+    async fn conv_workdir_set_validation_chain_rejects() {
+        let store = test_store().await;
+        let default = valid_dir();
+        let home = std::env::var("HOME").expect("测试环境应有 HOME");
+        for bad in ["relative/x", "/definitely/not/exist/dir", "/", &home] {
+            let frames = run_action(
+                &store,
+                &default,
+                InboundAction::ConvWorkdirSet {
+                    conv: "web:work".into(),
+                    path: bad.to_string(),
+                },
+            )
+            .await;
+            let err = frames
+                .iter()
+                .find(|f| f["type"] == "error")
+                .unwrap_or_else(|| panic!("{bad} 应回 error 帧：{frames:?}"));
+            assert_eq!(err["code"], WORKSPACE_ERROR_CODE, "{bad}：{err}");
+            assert_eq!(
+                err["machine"], TEST_MACHINE,
+                "{bad}：error 帧带本机 machine"
+            );
+            assert!(
+                err["message"].as_str().is_some_and(|m| !m.is_empty()),
+                "message 须为非空人话：{err}"
+            );
+            // 快照照常回（SPA 单一数据来源），但 workdir KV 未写入。
+            assert!(
+                frames.iter().any(|f| f["type"] == "workspaces"),
+                "{bad} 失败也应回快照：{frames:?}"
+            );
+            assert!(
+                store
+                    .get_config(&workdir_key("web:work"))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{bad} 不得写入 workdir:<conv>"
+            );
+            // conv_workdir 增量帧不出现（校验失败）。
+            assert!(
+                !frames.iter().any(|f| f["type"] == "conv_workdir"),
+                "{bad} 校验失败不得推增量帧"
+            );
+        }
+    }
+
+    /// conv_workdir_set 成功链（任务说明验收项）：写 `workdir:<conv>`（与
+    /// /cd 同键）；命中空间 path 时 bump lastUsedAt；额外推 conv_workdir
+    /// 增量帧 + workspaces 快照（快照含 local: conv、含 legacy 裸路径值的
+    /// 兼容读）。
+    #[tokio::test]
+    async fn conv_workdir_set_success_writes_bumps_and_replies() {
+        let store = test_store().await;
+        let default = valid_dir();
+        let dir = valid_dir();
+        // 种子：一个新格式空间（path 命中 dir，无 lastUsedAt）+ 一个旧格式
+        // 裸路径空间（存量部署兼容读）+ 一条 local: conv 的 workdir（/cd 写）。
+        store
+            .set_config(
+                &workspace_key("proj"),
+                &WorkspaceRecord::new(dir.to_string_lossy()).encode(),
+            )
+            .await
+            .unwrap();
+        store
+            .set_config(&workspace_key("legacy"), "/tmp/imagent-legacy-ws")
+            .await
+            .unwrap();
+        store
+            .set_config(&workdir_key("local:work"), "/tmp/imagent-local-ws")
+            .await
+            .unwrap();
+
+        let frames = run_action(
+            &store,
+            &default,
+            InboundAction::ConvWorkdirSet {
+                conv: "local:work".into(),
+                path: dir.to_string_lossy().into_owned(),
+            },
+        )
+        .await;
+
+        // KV：与 /cd 同键写入。
+        assert_eq!(
+            store
+                .get_config(&workdir_key("local:work"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(dir.to_string_lossy().as_ref()),
+            "写 workdir:<conv>（裸路径，与 /cd 同形态）"
+        );
+        // bump：proj 的 lastUsedAt 出现。
+        let bumped = WorkspaceRecord::decode(
+            &store
+                .get_config(&workspace_key("proj"))
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(bumped.last_used_at.is_some(), "命中空间 path 须 bump");
+        // 出站：增量帧 + 快照（均带 machine，v1.1 出站帧必带——SPA 按其
+        // 归属机器）。
+        let delta = frames.iter().find(|f| f["type"] == "conv_workdir").unwrap();
+        assert_eq!(delta["convId"], "local:work");
+        assert_eq!(delta["machine"], TEST_MACHINE, "增量帧带本机 machine");
+        assert_eq!(delta["workdir"], dir.to_string_lossy().as_ref());
+        let snap = frames.iter().find(|f| f["type"] == "workspaces").unwrap();
+        assert_eq!(snap["machine"], TEST_MACHINE, "快照帧带本机 machine");
+        assert_eq!(snap["default"], default.to_string_lossy().as_ref());
+        // 快照 workspaces：name 稳定序 + legacy 兼容读（裸路径 + lastUsedAt 缺席）。
+        let ws = snap["workspaces"].as_array().unwrap();
+        assert_eq!(ws.len(), 2);
+        assert_eq!(ws[0]["name"], "legacy", "name 稳定序（legacy < proj）");
+        assert!(
+            ws[0].get("lastUsedAt").is_none(),
+            "旧值读出 lastUsedAt 缺席"
+        );
+        assert_eq!(ws[0]["path"], "/tmp/imagent-legacy-ws");
+        assert_eq!(ws[1]["name"], "proj");
+        assert!(ws[1]["lastUsedAt"].is_u64(), "bump 后快照携带 lastUsedAt");
+        // 快照 convs：含 local: 会话。
+        assert_eq!(snap["convs"]["local:work"], dir.to_string_lossy().as_ref());
+    }
+
+    /// workspace_save / remove / list：非法 name（空白/超长）与非法 path →
+    /// error 帧；合法保存落库新 JSON 格式；remove 未命中幂等（仅快照，无
+    /// error）；list 仅回快照。每帧必有快照。
+    #[tokio::test]
+    async fn workspace_save_remove_list_flow() {
+        let store = test_store().await;
+        let default = valid_dir();
+        let dir = valid_dir();
+
+        // 非法 name：空白 / 超 32 char。
+        for bad_name in ["   ", &"x".repeat(33)] {
+            let frames = run_action(
+                &store,
+                &default,
+                InboundAction::WorkspaceSave {
+                    name: bad_name.to_string(),
+                    path: dir.to_string_lossy().into_owned(),
+                },
+            )
+            .await;
+            let err = frames.iter().find(|f| f["type"] == "error").unwrap();
+            assert_eq!(err["code"], WORKSPACE_ERROR_CODE);
+            assert!(
+                store
+                    .list_config(WORKSPACE_PREFIX)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "非法 name 不得落库"
+            );
+        }
+
+        // 合法保存（trim 生效：` proj ` → `proj`）。
+        let frames = run_action(
+            &store,
+            &default,
+            InboundAction::WorkspaceSave {
+                name: " proj ".into(),
+                path: dir.to_string_lossy().into_owned(),
+            },
+        )
+        .await;
+        assert!(
+            !frames.iter().any(|f| f["type"] == "error"),
+            "合法保存不应有 error：{frames:?}"
+        );
+        let raw = store
+            .get_config(&workspace_key("proj"))
+            .await
+            .unwrap()
+            .unwrap();
+        let rec = WorkspaceRecord::decode(&raw).unwrap();
+        assert_eq!(rec.path, dir.to_string_lossy().as_ref());
+        assert_eq!(rec.last_used_at, None, "刚保存 lastUsedAt 缺席");
+        assert!(
+            frames.iter().any(|f| f["type"] == "workspaces"),
+            "每帧回快照"
+        );
+
+        // remove：命中删除；再次 remove（未命中）幂等——只回快照无 error。
+        let frames = run_action(
+            &store,
+            &default,
+            InboundAction::WorkspaceRemove {
+                name: "proj".into(),
+            },
+        )
+        .await;
+        assert!(!frames.iter().any(|f| f["type"] == "error"));
+        assert!(store
+            .get_config(&workspace_key("proj"))
+            .await
+            .unwrap()
+            .is_none());
+        let frames = run_action(
+            &store,
+            &default,
+            InboundAction::WorkspaceRemove {
+                name: "proj".into(),
+            },
+        )
+        .await;
+        assert!(
+            !frames.iter().any(|f| f["type"] == "error"),
+            "未命中 remove 幂等：{frames:?}"
+        );
+        assert!(frames.iter().any(|f| f["type"] == "workspaces"));
+
+        // list：空表也回快照（default + 空集合）。
+        let frames = run_action(&store, &default, InboundAction::WorkspaceList).await;
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["type"], "workspaces");
+        assert_eq!(frames[0]["workspaces"].as_array().unwrap().len(), 0);
     }
 
     /// 卡片缓存：上限 32 conv 淘汰最旧；快照按 seq 旧→新排序。

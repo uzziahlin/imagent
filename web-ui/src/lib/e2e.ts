@@ -62,13 +62,19 @@ export const ACK_TIMEOUT_MS = 10_000;
 /** 出站随机数长度（XChaCha20 nonce = 24B）。 */
 const NONCE_LEN = 24;
 
-/** 需要走 e2e 包装的出站业务帧类型（其余管理帧恒明文）。 */
+/** 需要走 e2e 包装的出站业务帧类型（其余管理帧恒明文）。v1.6 工作空间四帧
+ *  （workspace_list/workspace_save/workspace_remove/conv_workdir_set）同为
+ *  网关消费的业务帧，relay 不可见。 */
 const BUSINESS_TYPES: ReadonlySet<string> = new Set([
   "message",
   "approval_response",
   "control",
   "sync",
   "ping",
+  "workspace_list",
+  "workspace_save",
+  "workspace_remove",
+  "conv_workdir_set",
 ]);
 
 // ---------------------------------------------------------------------------

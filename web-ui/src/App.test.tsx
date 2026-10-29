@@ -1406,3 +1406,156 @@ describe("App 配对批准侧（v1.5）", () => {
     expect(screen.getAllByLabelText("配对请求码")).toHaveLength(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// v1.6 工作空间：ready 后拉快照 / 目录条常驻与切换 / 新会话弹层选目录
+// ---------------------------------------------------------------------------
+
+describe("App 工作空间（v1.6）", () => {
+  const WORKSPACES = {
+    v: 1,
+    type: "workspaces",
+    default: "/Users/u/default",
+    workspaces: [
+      { name: "code", path: "/Users/u/code", lastUsedAt: 100 },
+      { name: "docs", path: "/Users/u/docs", lastUsedAt: 200 },
+      { name: "old", path: "/Users/u/old" },
+    ],
+    convs: { "local:work": "/Users/u/tmp" },
+    machine: "home-mac",
+  };
+
+  /** 挂载 + 握手 + 推工作空间快照，返回活跃 socket。 */
+  function mountWorkspaceApp(): FakeWebSocket {
+    const fake = mountApp();
+    handshake(fake, ["home-mac"]);
+    act(() => fake.recv(WORKSPACES));
+    return fake;
+  }
+
+  it("ready 后发 workspace_list（带当前机器）；未收 machines（旧 relay）不发；切机对新机器再发", () => {
+    const fake = mountApp();
+    act(() => {
+      fake.emit("open");
+      fake.recv({ v: 1, type: "hello_ack", role: "user" });
+    });
+    // 旧 relay：无 machines 帧 → 不发（网关不认识该帧）
+    expect(fake.sent.filter((s) => (JSON.parse(s) as { type: string }).type === "workspace_list")).toHaveLength(0);
+    act(() => fake.recv({ v: 1, type: "machines", online: ["home-mac", "work-mac"] }));
+    expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "workspace_list", machine: "home-mac" }));
+    // 切机 → 对新机器再拉
+    fireEvent.click(screen.getByRole("button", { name: /work-mac/ }));
+    expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "workspace_list", machine: "work-mac" }));
+  });
+
+  it("目录条：快照后渲染 default，conv_workdir 增量更新显示；无快照（旧网关）整条不渲染", () => {
+    const fake = mountWorkspaceApp();
+    const bar = screen.getByRole("button", { name: "切换会话目录" });
+    expect(bar.textContent).toContain("/Users/u/default");
+    act(() =>
+      fake.recv({ v: 1, type: "conv_workdir", convId: "web:default", workdir: "/Users/u/code", machine: "home-mac" }),
+    );
+    expect(screen.getByRole("button", { name: "切换会话目录" }).textContent).toContain("/Users/u/code");
+
+    // 无快照：旧 relay 握手（无 machines 帧）→ 整条不渲染（先卸载上一个 App）
+    cleanup();
+    const fake2 = mountApp();
+    act(() => {
+      fake2.emit("open");
+      fake2.recv({ v: 1, type: "hello_ack", role: "user" });
+    });
+    expect(screen.queryByRole("button", { name: "切换会话目录" })).toBeNull();
+  });
+
+  it("目录条点击弹切换器：chips 分区渲染；点选发 conv_workdir_set（convId 完整形态 + machine）并记 lastdir", () => {
+    const fake = mountWorkspaceApp();
+    fireEvent.click(screen.getByRole("button", { name: "切换会话目录" }));
+    const dialog = screen.getByRole("dialog", { name: "切换会话目录" });
+    // 空间 chips 按 lastUsedAt 降序（docs > code > old 无时间殿后）
+    const spaces = within(within(dialog).getByLabelText("工作空间")).getAllByRole("button");
+    expect(spaces.map((b) => b.textContent)).toEqual(["docs", "code", "old"]);
+    // 正在使用（convs 值去重、排除空间 path/default）+ 默认 chip
+    expect(within(within(dialog).getByLabelText("正在使用")).getByRole("button", { name: "tmp" })).toBeTruthy();
+    expect(within(dialog).getByRole("button", { name: "默认" })).toBeTruthy();
+
+    // 点选空间 → setConvWorkdir 帧内容断言 + lastdir 写入 + 弹层关闭
+    fireEvent.click(spaces[0]);
+    expect(fake.sent).toContain(
+      JSON.stringify({
+        v: 1,
+        type: "conv_workdir_set",
+        convId: "web:default",
+        path: "/Users/u/docs",
+        machine: "home-mac",
+      }),
+    );
+    expect(localStorage.getItem("imagent-lastdir:home-mac")).toBe("/Users/u/docs");
+    expect(screen.queryByRole("dialog", { name: "切换会话目录" })).toBeNull();
+  });
+
+  it("切换器选默认：同样发 default 路径的 set（语义统一）", () => {
+    const fake = mountWorkspaceApp();
+    fireEvent.click(screen.getByRole("button", { name: "切换会话目录" }));
+    fireEvent.click(screen.getByRole("button", { name: "默认" }));
+    expect(fake.sent).toContain(
+      JSON.stringify({
+        v: 1,
+        type: "conv_workdir_set",
+        convId: "web:default",
+        path: "/Users/u/default",
+        machine: "home-mac",
+      }),
+    );
+  });
+
+  it("新会话弹层：选空间创建 → /switch + setConvWorkdir(新 convId) + lastdir；重开预选上次选择", () => {
+    const fake = mountWorkspaceApp();
+    fireEvent.click(screen.getByRole("button", { name: "+ 新会话" }));
+    let dialog = screen.getByRole("dialog", { name: "新会话" });
+    fireEvent.change(within(dialog).getByLabelText("新会话名称"), { target: { value: "proj" } });
+    fireEvent.click(within(within(dialog).getByLabelText("工作空间")).getByRole("button", { name: "code" }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "创建（/switch）" }));
+    // /switch 走默认会话（convId 缺省）+ 创建后绑定目录（convId 完整形态）
+    expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "message", text: "/switch proj", machine: "home-mac" }));
+    expect(fake.sent).toContain(
+      JSON.stringify({
+        v: 1,
+        type: "conv_workdir_set",
+        convId: "web:proj",
+        path: "/Users/u/code",
+        machine: "home-mac",
+      }),
+    );
+    expect(localStorage.getItem("imagent-lastdir:home-mac")).toBe("/Users/u/code");
+    // 弹层关闭、当前会话切到 web:proj（StatusBar 会话徽标 + 侧栏项）
+    expect(screen.queryByRole("dialog", { name: "新会话" })).toBeNull();
+    expect(screen.getAllByText("proj").length).toBeGreaterThanOrEqual(1);
+
+    // 重开弹层：预选 lastdir（code chip 高亮）
+    fireEvent.click(screen.getByRole("button", { name: "+ 新会话" }));
+    dialog = screen.getByRole("dialog", { name: "新会话" });
+    const codeChip = within(within(dialog).getByLabelText("工作空间")).getByRole("button", { name: "code" });
+    expect(codeChip.getAttribute("aria-pressed")).toBe("true");
+
+    // 选默认 chip 创建：dir === default → 不发 set（新会话天然落默认目录）
+    fireEvent.change(within(dialog).getByLabelText("新会话名称"), { target: { value: "plain" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "默认" }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "创建（/switch）" }));
+    expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "message", text: "/switch plain", machine: "home-mac" }));
+    expect(fake.sent.filter((s) => (JSON.parse(s) as { type: string }).type === "conv_workdir_set")).toHaveLength(1);
+  });
+
+  it("新会话弹层：无快照（旧网关）不渲染目录区，名称创建流程不回归", () => {
+    const fake = mountApp();
+    act(() => {
+      fake.emit("open");
+      fake.recv({ v: 1, type: "hello_ack", role: "user" });
+    });
+    fireEvent.click(screen.getByRole("button", { name: "+ 新会话" }));
+    const dialog = screen.getByRole("dialog", { name: "新会话" });
+    expect(within(dialog).queryByLabelText("工作空间")).toBeNull();
+    fireEvent.change(within(dialog).getByLabelText("新会话名称"), { target: { value: "legacy" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "创建（/switch）" }));
+    expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "message", text: "/switch legacy" }));
+  });
+});

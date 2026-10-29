@@ -27,6 +27,9 @@
 // hello 无凭证带 pairing:true+device，pairing_pending 清 hello 超时进入等待，
 // 批准后同连接 hello_ack.session 走常规就绪；close 1008 "pairing denied"
 // 分流为 pairing_denied 上抛。
+// v1.6 工作空间：业务帧族新增 workspace_list / workspace_save /
+// workspace_remove / conv_workdir_set（网关消费，经 e2e outbound 判定包装；
+// machine 路由约定同 message 族——多机模式必须带当前机器）。
 
 import {
   DEFAULT_MACHINE,
@@ -306,6 +309,29 @@ export class WsManager {
     return this.send({ v: 1, type: "sync", machine });
   }
 
+  // ---- v1.6 工作空间（网关消费的业务帧；machine 缺省不带字段，多机模式
+  //      必须传当前机器——同 message 族路由约定，经 e2e outbound 判定包装）----
+
+  /** 拉取工作空间全量快照（网关回 workspaces；连接 ready / 切机后调用）。 */
+  listWorkspaces(machine?: string): boolean {
+    return this.send({ v: 1, type: "workspace_list", machine });
+  }
+
+  /** 保存工作空间（成功/失败均回 workspaces 快照，失败附 error 帧）。 */
+  saveWorkspace(name: string, path: string, machine?: string): boolean {
+    return this.send({ v: 1, type: "workspace_save", name, path, machine });
+  }
+
+  /** 移除工作空间（按 name；回 workspaces 快照）。 */
+  removeWorkspace(name: string, machine?: string): boolean {
+    return this.send({ v: 1, type: "workspace_remove", name, machine });
+  }
+
+  /** 绑定会话工作目录（成功回 conv_workdir 增量 + workspaces 快照）。 */
+  setConvWorkdir(convId: string, path: string, machine?: string): boolean {
+    return this.send({ v: 1, type: "conv_workdir_set", convId, path, machine });
+  }
+
   /** v1.2 拉取已登录设备列表（设备面板打开时；仅会话模式对新 relay 使用）。 */
   sendDeviceList(): boolean {
     return this.send({ v: 1, type: "device_list" });
@@ -474,8 +500,13 @@ export class WsManager {
     }
     // v1.4：enc 帧 → 解密后二次分发为原帧，走既有处理路径
     if (frame.type === "enc") {
-      const inner = this.e2e.openEnc(frame as EncFrame);
+      const enc = frame as EncFrame;
+      const inner = this.e2e.openEnc(enc);
       if (inner) {
+        // v1.1：enc 信封 machine 是路由权威来源（relay 按它路由、E2E 会话
+        // 按它索引）；内帧漏带 machine（网关新帧型忘带）时注入兜底，防
+        // reducer 按 DEFAULT_MACHINE 归错机器——内帧已带则不覆盖（自报优先）。
+        (inner as { machine?: string }).machine ??= enc.machine;
         this.onFrame(inner);
       }
       return;

@@ -11,9 +11,11 @@
 //! 封顶 30s，成功建连重置）。每步握手等待 10s 超时（不空转发——对齐
 //! wecom R-5「认证失败必须重连」纪律）。
 //!
-//! 与 [`crate::platform::WebPlatform`] 通过三条 channel 解耦：
+//! 与 [`crate::platform::WebPlatform`] 通过四条 channel 解耦：
 //! - `inbound_tx`：浏览器业务帧映射成的 [`InboundMessage`] → platform.recv；
 //! - `sync_tx`：sync 请求 → platform 的 sync responder（D6 会话恢复）；
+//! - `workspace_tx`：v1.6 工作空间动作（workspace_list/save/remove /
+//!   conv_workdir_set）→ platform 的 workspace 泵（store KV 读写）；
 //! - `outbound_rx`：platform 序列化好的出站帧（JSON 文本）→ relay → 浏览器。
 //!
 //! 协议细节（§4）：relay 对浏览器侧有 90s idle 超时，网关 30s 发协议层
@@ -76,6 +78,9 @@ pub(crate) struct WebClient {
     pub(crate) e2e: Option<E2eIdentity>,
     pub(crate) inbound_tx: mpsc::Sender<InboundMessage>,
     pub(crate) sync_tx: mpsc::Sender<()>,
+    /// v1.6 工作空间动作通道（workspace_list/save/remove/conv_workdir_set
+    /// 四帧）→ platform 的 workspace 泵（store KV 读写 + 校验 + 回快照）。
+    pub(crate) workspace_tx: mpsc::Sender<InboundAction>,
 }
 
 /// hello 首帧构造（token 形态，v1.1/v1.2 兼容路径：token + machine 自报；
@@ -411,9 +416,10 @@ impl WebClient {
     /// 本层自理（machines 只推浏览器，网关侧正常收不到，落到 Ignore 容错）；
     /// E2E 帧（v1.4）：`e2e_hello` → 握手应答（e2e_ack），`enc` → 试解后把
     /// 内层业务帧走既有分发；业务帧（message/approval_response/control/
-    /// sync/ping，均可带 relay 路由用的 machine 字段——网关侧无需消费）经
-    /// [`map_inbound_frame`] 映射。畸形 JSON warn 丢弃（不断连——浏览器/
-    /// 中继偶发杂帧不致网关重连）。
+    /// sync/ping + v1.6 工作空间 workspace_list/workspace_save/
+    /// workspace_remove/conv_workdir_set，均可带 relay 路由用的 machine
+    /// 字段——网关侧无需消费）经 [`map_inbound_frame`] 映射。畸形 JSON warn
+    /// 丢弃（不断连——浏览器/中继偶发杂帧不致网关重连）。
     async fn handle_text(
         &self,
         ws: &mut WsStream,
@@ -519,6 +525,21 @@ impl WebClient {
                     .is_err()
                 {
                     warn!(target: TARGET, "sync channel 持续满 1s，丢弃 sync 请求");
+                }
+            }
+            // v1.6 工作空间动作 → platform 泵（store IO 在泵内 await，client
+            // 收发循环不被 sqlite 阻塞）。同 sync 的 1s 有界背压：泵消费极快
+            //（KV 读写毫秒级），持续满只会在 relay 断连排队时出现——此时帧
+            // 本就发不出去，丢弃后 SPA 重发/下条快照兜底。
+            act @ (InboundAction::WorkspaceList
+            | InboundAction::WorkspaceSave { .. }
+            | InboundAction::WorkspaceRemove { .. }
+            | InboundAction::ConvWorkdirSet { .. }) => {
+                if tokio::time::timeout(Duration::from_secs(1), self.workspace_tx.send(act))
+                    .await
+                    .is_err()
+                {
+                    warn!(target: TARGET, "workspace channel 持续满 1s，丢弃工作空间请求");
                 }
             }
             InboundAction::Ping => {
@@ -710,6 +731,7 @@ mod tests {
     async fn run_returns_promptly_on_cancelled_token() {
         let (inbound_tx, _inbound_rx) = mpsc::channel::<InboundMessage>(8);
         let (sync_tx, _sync_rx) = mpsc::channel::<()>(8);
+        let (workspace_tx, _workspace_rx) = mpsc::channel::<InboundAction>(8);
         let client = WebClient {
             relay_url: "ws://127.0.0.1:1/gateway".into(),
             credential: GatewayCredential::Token("t".into()),
@@ -719,6 +741,7 @@ mod tests {
             e2e: None,
             inbound_tx,
             sync_tx,
+            workspace_tx,
         };
         let (_outbound_tx, outbound_rx) = mpsc::channel::<String>(8);
         let token = CancellationToken::new();

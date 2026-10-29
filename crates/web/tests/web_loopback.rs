@@ -18,12 +18,14 @@
 //! 单独一条回归用例。
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use futures::{SinkExt, StreamExt};
 use imagent_core::{CardPhase, CardTerminal, ConvId, OutboundCard, Platform, ReplyHint};
 use imagent_relay::{spawn_relay, RelayConfig, RelayHandle};
+use imagent_store::Store;
 use imagent_web::{GatewayCredential, WebPlatform};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::handshake::client::generate_key;
@@ -53,6 +55,25 @@ fn e2e_test_key_path(tag: &str) -> std::path::PathBuf {
         "imagent-web-loopback-e2e-{tag}-{}",
         std::process::id()
     ))
+}
+
+/// v1.6 工作空间泵用的测试 store（真实 sqlite，临时目录）。
+async fn loopback_store(tag: &str) -> Store {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let p = std::env::temp_dir().join(format!(
+        "imagent-web-loopback-ws-{tag}-{}-{}.sqlite",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    Store::open(&p).await.expect("open store")
+}
+
+/// 通过 validate_workdir 的测试目录（工作空间帧的合法 path）。
+fn valid_ws_dir() -> PathBuf {
+    let d = std::env::temp_dir().join(format!("imagent-web-loopback-wsdir-{}", std::process::id()));
+    std::fs::create_dir_all(&d).unwrap();
+    d
 }
 
 /// 起 key-only relay（v1.3：KEYS 表绑本机公钥，TOKENS 全空——「只配公钥
@@ -101,6 +122,8 @@ async fn setup() -> (RelayHandle, WebPlatform, Ws) {
         "default".to_string(),
         MACHINE.to_string(),
         &e2e_test_key_path("platform"),
+        loopback_store("setup").await,
+        valid_ws_dir(),
     );
     // 等 platform 连上 relay（client spawn 后异步建连 + 三帧握手认证）。
     eventually(Duration::from_secs(10), || platform.is_online()).await;
@@ -582,6 +605,8 @@ async fn loopback_token_credential_compat() {
         GatewayCredential::Token(GW_TOKEN.to_string()),
         "default".to_string(),
         MACHINE.to_string(),
+        loopback_store("token").await,
+        valid_ws_dir(),
     );
     eventually(Duration::from_secs(10), || p.is_online()).await;
 
@@ -663,6 +688,8 @@ async fn loopback_e2e_encrypted_roundtrip() {
         "default".to_string(),
         MACHINE.to_string(),
         &key_path,
+        loopback_store("e2e").await,
+        valid_ws_dir(),
     );
     eventually(Duration::from_secs(10), || p.is_online()).await;
 
@@ -786,6 +813,217 @@ async fn loopback_e2e_encrypted_roundtrip() {
             .is_err(),
         "enc ping 不应产生入站消息"
     );
+
+    let _ = std::fs::remove_file(&key_path);
+    handle.shutdown();
+    handle.wait().await;
+    drop(p);
+}
+
+/// 场景 10（协议 v1.6 工作空间帧 × E2E）：E2E 会话活跃机器下，工作空间
+/// 帧双向全部走 enc——入站 workspace_save / conv_workdir_set（合法与非法）
+/// 包 enc 投递；出站 workspaces 快照 / conv_workdir 增量 / error 复原帧
+/// 逐 sid 加密回浏览器；/cd 的 on_workdir_changed 通知同样 enc。
+#[tokio::test]
+async fn loopback_workspace_frames_e2e_encrypted() {
+    use base64::Engine as _;
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+    use x25519_dalek::{PublicKey as XPublicKey, StaticSecret as XStaticSecret};
+
+    fn seal(key: &[u8; 32], plaintext: &str) -> String {
+        let nonce = rand::random::<[u8; 24]>();
+        let cipher = XChaCha20Poly1305::new_from_slice(key).unwrap();
+        let ct = cipher
+            .encrypt(XNonce::from_slice(&nonce), plaintext.as_bytes())
+            .unwrap();
+        let mut boxed = Vec::with_capacity(24 + ct.len());
+        boxed.extend_from_slice(&nonce);
+        boxed.extend_from_slice(&ct);
+        base64::engine::general_purpose::STANDARD.encode(boxed)
+    }
+    fn open(key: &[u8; 32], boxed: &str) -> String {
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(boxed)
+            .unwrap();
+        let (nonce, ct) = data.split_at(24);
+        let cipher = XChaCha20Poly1305::new_from_slice(key).unwrap();
+        let pt = cipher.decrypt(XNonce::from_slice(nonce), ct).unwrap();
+        String::from_utf8(pt).unwrap()
+    }
+    /// 读下一条 enc 帧并解密为 JSON（跳过其它帧）。
+    async fn next_enc_json(ws: &mut Ws, k: &[u8; 32]) -> serde_json::Value {
+        loop {
+            let v = next_of_type(ws, "enc").await;
+            if let Some(pt) = v["box"].as_str() {
+                // 解不开（其它会话的 box）→ 继续等；本测试单会话恒可解。
+                return serde_json::from_str(&open(k, pt)).unwrap_or(v);
+            }
+        }
+    }
+
+    let (handle, sk) = spawn_test_relay().await;
+    let addr = handle.addr;
+    let key_path = e2e_test_key_path("ws-e2e");
+    let store = loopback_store("ws-e2e").await;
+    let default_dir = valid_ws_dir();
+    let ws_dir = valid_ws_dir();
+    let p = WebPlatform::new_with_e2e(
+        format!("ws://{addr}/gateway"),
+        GatewayCredential::Key(sk),
+        "default".to_string(),
+        MACHINE.to_string(),
+        &key_path,
+        store.clone(),
+        default_dir.clone(),
+    );
+    eventually(Duration::from_secs(10), || p.is_online()).await;
+
+    // 浏览器登录 + E2E 握手（与场景 9 同构，握手细节断言从简——那边已钉）。
+    let mut br = connect_ws(&addr, "/ws", None).await;
+    br.send(Message::text(format!(
+        r#"{{"v":1,"type":"hello","token":"{USER_TOKEN}"}}"#
+    )))
+    .await
+    .unwrap();
+    let ack: serde_json::Value = serde_json::from_str(&next_text(&mut br).await).unwrap();
+    let sid = ack["session"]["id"].as_str().unwrap().to_string();
+    let _machines = next_of_type(&mut br, "machines").await;
+
+    let browser_secret = XStaticSecret::from(rand::random::<[u8; 32]>());
+    let browser_public = XPublicKey::from(&browser_secret);
+    let n1 = rand::random::<[u8; 32]>();
+    br.send(Message::text(
+        serde_json::json!({
+            "v": 1, "type": "e2e_hello", "machine": MACHINE, "sid": sid,
+            "ek": hex::encode(browser_public.as_bytes()),
+            "n1": hex::encode(n1),
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let e2e_ack = next_of_type(&mut br, "e2e_ack").await;
+    let gk: [u8; 32] = hex::decode(e2e_ack["gk"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let n2: [u8; 32] = hex::decode(e2e_ack["n2"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let k = imagent_web::e2e::derive_session_key(
+        browser_secret
+            .diffie_hellman(&XPublicKey::from(gk))
+            .as_bytes(),
+        &n1,
+        &n2,
+    );
+
+    // ---- 入站 workspace_save（enc 包裹）→ 出站 workspaces 快照（enc 包裹）。
+    br.send(Message::text(
+        serde_json::json!({
+            "v": 1, "type": "enc", "machine": MACHINE,
+            "box": seal(&k, &serde_json::json!({
+                "v": 1, "type": "workspace_save",
+                "name": "proj", "path": ws_dir.to_string_lossy(),
+            }).to_string()),
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let snap = next_enc_json(&mut br, &k).await;
+    assert_eq!(snap["type"], "workspaces", "保存后回快照（enc）：{snap}");
+    assert_eq!(
+        snap["machine"], MACHINE,
+        "快照带本机 machine（v1.1）：{snap}"
+    );
+    assert_eq!(snap["default"], default_dir.to_string_lossy().as_ref());
+    let ws_list = snap["workspaces"].as_array().unwrap();
+    assert_eq!(ws_list.len(), 1);
+    assert_eq!(ws_list[0]["name"], "proj");
+    assert_eq!(ws_list[0]["path"], ws_dir.to_string_lossy().as_ref());
+    assert!(
+        ws_list[0].get("lastUsedAt").is_none(),
+        "刚保存 lastUsedAt 缺席"
+    );
+
+    // ---- 入站 conv_workdir_set（合法，enc）→ 出站 conv_workdir 增量 +
+    // workspaces 快照（均 enc）；KV 与 /cd 同键；命中空间 bump。
+    br.send(Message::text(
+        serde_json::json!({
+            "v": 1, "type": "enc", "machine": MACHINE,
+            "box": seal(&k, &serde_json::json!({
+                "v": 1, "type": "conv_workdir_set",
+                "convId": "web:work", "path": ws_dir.to_string_lossy(),
+            }).to_string()),
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let delta = next_enc_json(&mut br, &k).await;
+    assert_eq!(
+        delta["type"], "conv_workdir",
+        "成功额外推增量帧（enc）：{delta}"
+    );
+    assert_eq!(delta["machine"], MACHINE, "增量帧带本机 machine（v1.1）");
+    assert_eq!(delta["convId"], "web:work");
+    assert_eq!(delta["workdir"], ws_dir.to_string_lossy().as_ref());
+    let snap = next_enc_json(&mut br, &k).await;
+    assert_eq!(snap["type"], "workspaces");
+    assert_eq!(
+        snap["convs"]["web:work"],
+        ws_dir.to_string_lossy().as_ref(),
+        "快照 convs 反映新 workdir"
+    );
+    assert!(
+        snap["workspaces"][0]["lastUsedAt"].is_u64(),
+        "命中空间 path 须 bump lastUsedAt"
+    );
+    assert_eq!(
+        store
+            .get_config("workdir:web:work")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(ws_dir.to_string_lossy().as_ref()),
+        "与 /cd 同键落库"
+    );
+
+    // ---- 入站 conv_workdir_set（非法路径，enc）→ error 帧（enc）+ 快照不变。
+    br.send(Message::text(
+        serde_json::json!({
+            "v": 1, "type": "enc", "machine": MACHINE,
+            "box": seal(&k, r#"{"v":1,"type":"conv_workdir_set","convId":"web:work","path":"/"}"#),
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let err = next_enc_json(&mut br, &k).await;
+    assert_eq!(err["type"], "error", "校验失败回 error 帧（enc）：{err}");
+    assert_eq!(err["code"], "workspace_invalid");
+    assert_eq!(err["machine"], MACHINE, "error 帧带本机 machine（v1.1）");
+    assert!(!err["message"].as_str().unwrap().is_empty());
+    let snap = next_enc_json(&mut br, &k).await;
+    assert_eq!(
+        snap["convs"]["web:work"],
+        ws_dir.to_string_lossy().as_ref(),
+        "失败后快照不变"
+    );
+
+    // ---- /cd 通知路径（on_workdir_changed）→ conv_workdir 增量帧（enc）。
+    p.on_workdir_changed(&ConvId("local:work".into()), "/tmp/imagent-cd-ws");
+    let delta = next_enc_json(&mut br, &k).await;
+    assert_eq!(delta["type"], "conv_workdir");
+    assert_eq!(
+        delta["machine"], MACHINE,
+        "/cd 增量帧带本机 machine（v1.1）"
+    );
+    assert_eq!(delta["convId"], "local:work");
+    assert_eq!(delta["workdir"], "/tmp/imagent-cd-ws");
 
     let _ = std::fs::remove_file(&key_path);
     handle.shutdown();

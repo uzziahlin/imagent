@@ -30,6 +30,12 @@
 //   user_token_rotated，全部带 adminToken，relay 自产自消恒明文）；新设备
 //   配对（hello{pairing} → pairing_pending；已登录侧收 pairing_request →
 //   pairing_approve/pairing_deny{adminToken,code}）。
+// - v1.6 工作空间：工作目录升格为一等公民。出站 workspace_list /
+//   workspace_save / workspace_remove / conv_workdir_set（网关消费的业务
+//   帧，恒 e2e 加密）；入站 workspaces 全量快照（default + items + convs，
+//   网关处理完任一 workspace 帧必回——SPA 以快照为唯一事实源，乐观更新一律
+//   不做）与 conv_workdir 增量（conv_workdir_set 成功后随快照一起回）。
+//   失败复用 error 帧（code="workspace_invalid"）。
 
 export const PROTOCOL_VERSION = 1;
 
@@ -276,6 +282,53 @@ export type PairingDenyFrame = {
 };
 
 // ---------------------------------------------------------------------------
+// v1.6 工作空间帧（浏览器 → 网关，E2E 业务帧）
+// ---------------------------------------------------------------------------
+
+/** 工作空间名约束（网关侧同规）：1..=32 位非空（trim 后）。 */
+export const WORKSPACE_NAME_MAX = 32;
+
+export function workspaceNameValid(name: string): boolean {
+  const n = name.trim();
+  return n.length >= 1 && n.length <= WORKSPACE_NAME_MAX;
+}
+
+/** v1.6 请求工作空间全量快照（网关回 workspaces 帧；连接 ready / 切机后发）。 */
+export type WorkspaceListFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "workspace_list";
+  /** 目标机器（v1.1 路由约定，同 message 族：多机模式必须带）。 */
+  machine?: string;
+};
+
+/** v1.6 保存工作空间（name 1..=32 非空 trim 后；path 绝对路径）。 */
+export type WorkspaceSaveFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "workspace_save";
+  name: string;
+  path: string;
+  machine?: string;
+};
+
+/** v1.6 移除工作空间（按 name；成功/失败均回 workspaces 快照）。 */
+export type WorkspaceRemoveFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "workspace_remove";
+  name: string;
+  machine?: string;
+};
+
+/** v1.6 绑定会话工作目录（convId 恒为完整 conv 形态；path 绝对路径；成功回
+ *  conv_workdir 增量 + workspaces 快照）。 */
+export type ConvWorkdirSetFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "conv_workdir_set";
+  convId: string;
+  path: string;
+  machine?: string;
+};
+
+// ---------------------------------------------------------------------------
 // v1.4 E2E 中继盲化（密码学构造与编码规约见 lib/e2e.ts 头注）
 // ---------------------------------------------------------------------------
 
@@ -319,7 +372,11 @@ export type OutboundFrame =
   | MachineRemoveFrame
   | UserTokenRotateFrame
   | PairingApproveFrame
-  | PairingDenyFrame;
+  | PairingDenyFrame
+  | WorkspaceListFrame
+  | WorkspaceSaveFrame
+  | WorkspaceRemoveFrame
+  | ConvWorkdirSetFrame;
 
 /** 出站帧序列化（undefined 字段不序列化，与网关入站解析兼容）。 */
 export function encodeFrame(frame: OutboundFrame): string {
@@ -466,6 +523,35 @@ export type PairingPendingFrame = {
   code: string;
 };
 
+// ---------------------------------------------------------------------------
+// v1.6 工作空间帧（网关 → 浏览器，E2E 业务帧，经 enc 解密后二次分发进 reducer）
+// ---------------------------------------------------------------------------
+
+/** v1.6 工作空间条目（workspaces 帧 items 元素）。lastUsedAt unix 秒，可选
+ *  （对齐 Rust skip_serializing_if——缺席即未序列化）。 */
+export type WorkspaceInfo = { name: string; path: string; lastUsedAt?: number };
+
+/** v1.6 工作空间全量快照（唯一事实源）：default = 该机器 default_workdir
+ *  绝对路径；convs = convId → workdir 绝对路径（含 local: 前缀会话）。machine
+ *  = 来源机器（旧网关缺席 → 归 DEFAULT_MACHINE）。 */
+export type WorkspacesFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "workspaces";
+  default: string;
+  workspaces: WorkspaceInfo[];
+  convs: Record<string, string>;
+  machine?: string;
+};
+
+/** v1.6 会话工作目录增量（conv_workdir_set 成功后随 workspaces 快照一起回）。 */
+export type ConvWorkdirFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "conv_workdir";
+  convId: string;
+  workdir: string;
+  machine?: string;
+};
+
 /** v1.4 握手第二步（网关 → 浏览器，经 relay 明文透传）：gk = 网关 X25519
  *  公钥（32B hex），n2 = 网关随机数（32B hex），sig = 网关 ed25519 对
  *  bytes(ek)||bytes(gk)||bytes(n1)||bytes(n2) 的签名（64B hex），ik = 网关
@@ -501,7 +587,9 @@ export type InboundFrame =
   | MachinesCfgFrame
   | UserTokenRotatedFrame
   | PairingRequestFrame
-  | PairingPendingFrame;
+  | PairingPendingFrame
+  | WorkspacesFrame
+  | ConvWorkdirFrame;
 
 // ---------------------------------------------------------------------------
 // parseFrame：v/type 校验 + 每类帧关键字段存在性校验，非法返回 null（不抛）
@@ -570,6 +658,28 @@ const machineCfgOk = (m: unknown): boolean => {
   return isStr(r, "name") && isStr(r, "pubkey_fp") && (r.created === undefined || typeof r.created === "number");
 };
 
+/** v1.6 workspaces 帧元素：name/path 字符串；lastUsedAt 可选但出现即须为
+ *  数字（对齐 Rust skip_serializing_if）。 */
+const workspaceOk = (w: unknown): boolean => {
+  if (typeof w !== "object" || w === null) {
+    return false;
+  }
+  const r = w as Record<string, unknown>;
+  return (
+    isStr(r, "name") &&
+    isStr(r, "path") &&
+    (r.lastUsedAt === undefined || typeof r.lastUsedAt === "number")
+  );
+};
+
+/** v1.6 workspaces.convs：记录（convId → workdir 绝对路径字符串）。 */
+const convDirsOk = (c: unknown): boolean => {
+  if (typeof c !== "object" || c === null || Array.isArray(c)) {
+    return false;
+  }
+  return Object.values(c as Record<string, unknown>).every((v) => typeof v === "string");
+};
+
 const RESOLVED_DECISIONS: readonly string[] = ["allow", "deny", "always", "cancelled"];
 
 /** v1.4 e2e_ack 的网关身份公钥字段：ik（规范名）/ id / pk（宽容别名）任一
@@ -609,6 +719,14 @@ const INBOUND_CHECKS: Record<string, FieldCheck> = {
   e2e_ack: (o) =>
     isStr(o, "machine") && isStr(o, "gk") && isStr(o, "n2") && isStr(o, "sig") && ackIdentityOk(o),
   enc: (o) => isStr(o, "machine") && isStr(o, "box"),
+  // v1.6 工作空间帧：逐字段形状校验（machine 可选——旧网关缺席归 DEFAULT_MACHINE）
+  workspaces: (o) =>
+    isStr(o, "default") &&
+    Array.isArray(o.workspaces) &&
+    o.workspaces.every(workspaceOk) &&
+    convDirsOk(o.convs) &&
+    machineOk(o),
+  conv_workdir: (o) => isStr(o, "convId") && isStr(o, "workdir") && machineOk(o),
 };
 
 /** 解析一条入站文本帧：信封 v=1 + 已知 type + 关键字段齐备才放行，否则 null。 */
@@ -718,6 +836,9 @@ export type AppState = {
   /** v1.5 USER_TOKEN 轮换结果（仅显示一次的明文新值；clear_rotated_token
    *  关闭弹层即永失——不落任何存储）。 */
   rotatedToken: string | null;
+  /** v1.6 逐机器工作空间快照（workspaces 帧按来源机器落表；空 = 尚未收到
+   *  快照（旧网关），目录条与目录选择不渲染）。 */
+  workspaces: Record<string, MachineWorkspaces>;
   lastError: { code: string; at: number } | null;
   lastNotice: MachineNotice | null;
 };
@@ -748,6 +869,15 @@ export type PairingRequest = {
   at: number;
 };
 
+/** v1.6 单台机器的工作空间快照（workspaces 帧按 frame.machine 归入）：
+ *  default = 该机器 default_workdir；items = 已存空间；convs = convId →
+ *  当前 workdir。SPA 以快照为唯一事实源（乐观更新一律不做）。 */
+export type MachineWorkspaces = {
+  default: string;
+  items: WorkspaceInfo[];
+  convs: Record<string, string>;
+};
+
 export function initialState(): AppState {
   return {
     seq: 0,
@@ -762,6 +892,7 @@ export function initialState(): AppState {
     machinesCfg: null,
     pairingRequests: [],
     rotatedToken: null,
+    workspaces: {},
     lastError: null,
     lastNotice: null,
   };
@@ -1044,10 +1175,34 @@ function reduceMachines(state: AppState, frame: MachinesFrame): AppState {
 }
 
 /** 入站帧归属机器：带 machine 字段归该机器，缺省归 DEFAULT_MACHINE（旧网关兼容）。 */
-type MachineBearingFrame = TextFrame | CardFrame | ApprovalRequestFrame | ApprovalResolvedFrame;
+type MachineBearingFrame =
+  | TextFrame
+  | CardFrame
+  | ApprovalRequestFrame
+  | ApprovalResolvedFrame
+  | WorkspacesFrame
+  | ConvWorkdirFrame;
 
 function frameMachine(frame: MachineBearingFrame): string {
   return frame.machine ?? DEFAULT_MACHINE;
+}
+
+/** v1.6 conv_workdir 增量：合并进对应机器快照的 convs。该机器尚无快照时忽略
+ *  ——按契约增量帧总与全量快照成对到达，无快照即无从归属（也不造无 default
+ *  的残缺条目：目录条渲染以快照存在为前提）。 */
+function mergeConvWorkdir(state: AppState, frame: ConvWorkdirFrame): AppState {
+  const machine = frameMachine(frame);
+  const cur = state.workspaces[machine];
+  if (!cur) {
+    return state;
+  }
+  return {
+    ...state,
+    workspaces: {
+      ...state.workspaces,
+      [machine]: { ...cur, convs: { ...cur.convs, [frame.convId]: frame.workdir } },
+    },
+  };
 }
 
 function reduceFrame(state: AppState, frame: InboundFrame): AppState {
@@ -1107,6 +1262,23 @@ function reduceFrame(state: AppState, frame: InboundFrame): AppState {
       return addApproval(state, frameMachine(frame), frame);
     case "approval_resolved":
       return resolveApproval(state, frameMachine(frame), frame);
+    case "workspaces":
+      // v1.6 全量快照：按帧来源机器整体落表（唯一事实源；失败回 error 帧且
+      // 不再回快照——SPA 不做乐观更新，失败即维持上一份快照）。
+      return {
+        ...state,
+        workspaces: {
+          ...state.workspaces,
+          [frameMachine(frame)]: {
+            default: frame.default,
+            items: frame.workspaces,
+            convs: frame.convs,
+          },
+        },
+      };
+    case "conv_workdir":
+      // v1.6 增量：合并进对应机器快照 convs（机器取帧的 machine 字段）
+      return mergeConvWorkdir(state, frame);
   }
 }
 

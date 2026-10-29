@@ -548,6 +548,17 @@ impl Platform for MultiPlatform {
         }
     }
 
+    /// v1.6 工作空间钩子：**广播全部子平台**（default no-op——非 web 平台零
+    /// 成本；web 覆写为 conv_workdir 增量帧推送）。不走 [`Self::route_with_mirror`]
+    /// 的归属+镜像模型：web 驾驶舱的 workspaces 快照 `convs` 含**全平台**会话
+    /// 的当前目录，任何平台 conv（feishu:/local:/web:）的 `/cd` 都应让 web 看到
+    /// ——按归属路由会把非 web conv 的目录变更对 SPA 隐身。
+    fn on_workdir_changed(&self, conv: &ConvId, path: &str) {
+        for c in &self.children {
+            c.on_workdir_changed(conv, path);
+        }
+    }
+
     /// 逐子平台探测，每行加 `[<name>] ` 前缀后合并——/doctor 里可分辨哪行
     /// 来自哪个平台。
     async fn doctor_probes(&self) -> Vec<String> {

@@ -5,9 +5,10 @@
 //! relay（ECS）持有网关身份公钥与会话表，能路由/录制全部帧——本批把它从
 //! 「可信内容方」降级为「盲传输」：业务帧（text/card/card_patch/
 //! approval_request/approval_resolved/pong 与 message/approval_response/
-//! control/sync/ping）全部包成 [`enc`](`enc 帧`) 密文，relay 只见
-//! `type/machine/sid` 信封元数据（路由所需）与随机密文。密钥协商在浏览器
-//! 与网关间端到端完成：
+//! control/sync/ping，以及 v1.6 工作空间帧 workspaces/conv_workdir/error 与
+//! workspace_list/workspace_save/workspace_remove/conv_workdir_set）全部包成
+//! [`enc`](`enc 帧`) 密文，relay 只见 `type/machine/sid` 信封元数据（路由
+//! 所需）与随机密文。密钥协商在浏览器与网关间端到端完成：
 //!
 //! ## 握手（session 认证通过后，浏览器逐机器发起；帧经 relay 按 machine
 //! 路由，relay 透传不理解）

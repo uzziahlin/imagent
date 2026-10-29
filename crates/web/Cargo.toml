@@ -9,6 +9,9 @@ publish.workspace = true
 
 [dependencies]
 imagent-core = { path = "../core" }
+# v1.6 工作空间帧：平台泵直接读写 store KV（workspace:/workdir: 表，与
+# 终端 /ws /cd 同源互通），不经 dispatch 命令链。
+imagent-store = { path = "../store" }
 tokio = { workspace = true }
 # P3-g 同款停机通路（对齐 wecom）：平台 drop 即 cancel，后台 client / sync
 # responder 任务感知退出，不再无限重连。

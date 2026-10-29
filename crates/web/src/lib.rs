@@ -33,6 +33,16 @@
 //! `card_patch` / `approval_request` / `approval_resolved` / `pong`，**全部
 //! 带本机 `machine` 字段**（SPA 据此区分多台终端）。
 //!
+//! 工作空间帧 v1.6（字节级契约与 SPA 侧任务说明一致，不得增删改字段名）：
+//! 入站 `workspace_list` / `workspace_save` / `workspace_remove` /
+//! `conv_workdir_set`——不进 recv / dispatch 命令链，由 platform 的
+//! workspace 泵直接读写 store KV（`workspace:`/`workdir:` 表，与终端
+//! /ws /cd 同源互通）。出站 `workspaces`（全量快照，SPA 单一数据来源）/
+//! `conv_workdir`（增量：conv_workdir_set 成功或终端 /cd 通知）。**这两类
+//! 出站帧不带 machine 字段**（v1.6 帧契约如此定义——E2E 活跃时 enc 信封
+//! 本身携带 machine，与 v1.1 帧「帧内携带」并存不冲突）。错误复用
+//! `error` 帧（code=workspace_invalid）。
+//!
 //! **帧内 convId 协议约定：恒为完整 conv 形态（`web:<session>`）**。出站帧
 //! （text / card / approval_request …）写入的即完整 conv，浏览器回执帧
 //! （message / approval_response）**原样回传收到的 convId** 即可，不得剥前
@@ -61,6 +71,7 @@ use imagent_core::{
     TodoStatus, UserId,
 };
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 /// 统一 tracing target（仓库纪律）。
 pub(crate) const TARGET: &str = "imagent::web";
@@ -472,6 +483,118 @@ pub(crate) fn encode_approval_resolved_frame(
 }
 
 // ---------------------------------------------------------------------------
+// 出站工作空间帧（协议 v1.6，字段与 SPA 侧契约逐字一致，不得增删改）
+// ---------------------------------------------------------------------------
+
+/// workspaces 快照帧的单个空间条目。`lastUsedAt` 缺席不序列化（旧值/刚
+/// 保存未被用过）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct WorkspaceEntryFrame {
+    pub(crate) name: String,
+    pub(crate) path: String,
+    #[serde(rename = "lastUsedAt", skip_serializing_if = "Option::is_none")]
+    pub(crate) last_used_at: Option<u64>,
+}
+
+/// workspaces 全量快照帧（SPA 工作空间视图的单一数据来源）：
+/// `default` = 配置 default_workdir；`workspaces` = 全部命名空间（调用方
+/// 按 name 稳定序排好）；`convs` = 该网关全部已知 conv 的当前 workdir
+/// （遍历 `workdir:` KV，**含 local: 会话**——SPA 展示本地终端会话目录
+/// 同样有意义）。`machine` 为本机身份（v1.1 起全部出站业务帧必带——SPA
+/// reducer 按 `frame.machine` 把快照归属到机器；enc 信封的 machine 要经
+/// 解密分发处兜底注入才可达内帧，内帧自带才是权威）。`convs` 用
+/// BTreeMap：键序稳定，SPA 解析与测试断言可复现。
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct WorkspacesFrame {
+    v: u8,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    machine: String,
+    default: String,
+    workspaces: Vec<WorkspaceEntryFrame>,
+    convs: BTreeMap<String, String>,
+}
+
+/// conv_workdir 增量帧：单个 conv 的工作目录已切换（网页 conv_workdir_set
+/// 成功，或终端 /cd 经 [`Platform::on_workdir_changed`] 的通知）。SPA 收到
+/// 后局部更新；下一条 workspaces 快照天然兜底。`machine` 同
+/// [`WorkspacesFrame`]（v1.1 出站帧必带）。
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ConvWorkdirFrame {
+    v: u8,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    machine: String,
+    #[serde(rename = "convId")]
+    conv_id: String,
+    workdir: String,
+}
+
+/// error 帧（工作空间校验失败复用）：code=workspace_invalid + 中文人话
+/// 原因。`machine` 为本机身份（v1.1 出站帧必带；SPA error 渲染不依赖
+/// machine，多余字段宽松兼容）。与 relay 自产的 error 帧同渲染路径
+/// （relay 自产帧无 machine——那是 relay 侧帧，不经网关）。
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ErrorFrame {
+    v: u8,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    machine: String,
+    code: String,
+    message: String,
+}
+
+/// workspaces 快照帧组帧。无截断面（无自由文本大字段；convs 量级 = 会话
+/// 数，远低于帧软限）。
+pub(crate) fn encode_workspaces_frame(
+    machine: &str,
+    default: &str,
+    workspaces: Vec<WorkspaceEntryFrame>,
+    convs: BTreeMap<String, String>,
+) -> Result<String> {
+    let frame = WorkspacesFrame {
+        v: 1,
+        kind: "workspaces",
+        machine: machine.to_string(),
+        default: default.to_string(),
+        workspaces,
+        convs,
+    };
+    serde_json::to_string(&frame)
+        .map_err(|e| CoreError::Platform(TARGET, format!("workspaces 帧序列化失败：{e}")))
+}
+
+/// conv_workdir 增量帧组帧。
+pub(crate) fn encode_conv_workdir_frame(
+    machine: &str,
+    conv_id: &str,
+    workdir: &str,
+) -> Result<String> {
+    let frame = ConvWorkdirFrame {
+        v: 1,
+        kind: "conv_workdir",
+        machine: machine.to_string(),
+        conv_id: conv_id.to_string(),
+        workdir: workdir.to_string(),
+    };
+    serde_json::to_string(&frame)
+        .map_err(|e| CoreError::Platform(TARGET, format!("conv_workdir 帧序列化失败：{e}")))
+}
+
+/// error 帧组帧（工作空间错误复用，code 见 platform 泵）。
+pub(crate) fn encode_error_frame(machine: &str, code: &str, message: &str) -> Result<String> {
+    let frame = ErrorFrame {
+        v: 1,
+        kind: "error",
+        machine: machine.to_string(),
+        code: code.to_string(),
+        message: message.to_string(),
+    };
+    serde_json::to_string(&frame)
+        .map_err(|e| CoreError::Platform(TARGET, format!("error 帧序列化失败：{e}")))
+}
+
+// ---------------------------------------------------------------------------
 // 入站帧（浏览器 → 网关）映射
 // ---------------------------------------------------------------------------
 
@@ -486,6 +609,22 @@ pub(crate) enum InboundAction {
     Sync,
     /// 应用层 ping → client 直接回 pong（不进 recv）。
     Ping,
+    /// v1.6 工作空间（workspace_list / workspace_save / workspace_remove /
+    /// conv_workdir_set）→ platform 的 workspace 泵（store KV 读写 + 校验 +
+    /// 回 workspaces 快照；不进 recv / dispatch 命令链）。`conv` 为经
+    /// [`normalize_conv`] 归一的完整 conv。
+    WorkspaceList,
+    WorkspaceSave {
+        name: String,
+        path: String,
+    },
+    WorkspaceRemove {
+        name: String,
+    },
+    ConvWorkdirSet {
+        conv: String,
+        path: String,
+    },
     /// 未知 type：debug 忽略——前向兼容，M3 SPA 新增帧不致网关断连。
     Ignore,
     /// 协议违规 / 缺必填字段：warn 原因并丢弃（不进 recv）。
@@ -618,6 +757,43 @@ pub(crate) fn map_inbound_frame(v: &serde_json::Value, default_session: &str) ->
         }
         "sync" => InboundAction::Sync,
         "ping" => InboundAction::Ping,
+        // v1.6 工作空间帧：本层只做字段存在性/类型检查（缺失/类型错 → Warn
+        // 丢弃，与 message 同纪律）；**值域校验（空 name / 非法路径）在
+        // platform 泵做**——失败须回 error 帧（workspace_invalid）+ 快照给
+        // SPA 反馈，静默丢弃会让 UI 无响应。
+        "workspace_list" => InboundAction::WorkspaceList,
+        "workspace_save" => {
+            let Some(name) = v.get("name").and_then(|n| n.as_str()) else {
+                return InboundAction::Warn("workspace_save 帧缺 name 字段，丢弃");
+            };
+            let Some(path) = v.get("path").and_then(|p| p.as_str()) else {
+                return InboundAction::Warn("workspace_save 帧缺 path 字段，丢弃");
+            };
+            InboundAction::WorkspaceSave {
+                name: name.to_string(),
+                path: path.to_string(),
+            }
+        }
+        "workspace_remove" => {
+            let Some(name) = v.get("name").and_then(|n| n.as_str()) else {
+                return InboundAction::Warn("workspace_remove 帧缺 name 字段，丢弃");
+            };
+            InboundAction::WorkspaceRemove {
+                name: name.to_string(),
+            }
+        }
+        "conv_workdir_set" => {
+            let Some(conv) = v.get("convId").and_then(|c| c.as_str()) else {
+                return InboundAction::Warn("conv_workdir_set 帧缺 convId，丢弃");
+            };
+            let Some(path) = v.get("path").and_then(|p| p.as_str()) else {
+                return InboundAction::Warn("conv_workdir_set 帧缺 path 字段，丢弃");
+            };
+            InboundAction::ConvWorkdirSet {
+                conv: normalize_conv(Some(conv), default_session),
+                path: path.to_string(),
+            }
+        }
         _ => InboundAction::Ignore,
     }
 }
@@ -847,6 +1023,183 @@ mod tests {
             map_raw_frame("not json", SESSION),
             InboundAction::Ignore
         ));
+    }
+
+    /// v1.6 工作空间入站帧：四帧合法形态解析 + conv_workdir_set 的 convId
+    /// 三形态归一（裸名补前缀 / 完整 conv 原样 / local: 透传——与 message
+    /// 帧同纪律，SPA 侧 local 会话目录同样可设）。
+    #[test]
+    fn map_workspace_frames_valid() {
+        assert!(matches!(
+            map_raw_frame(r#"{"v":1,"type":"workspace_list"}"#, SESSION),
+            InboundAction::WorkspaceList
+        ));
+        let act = map_raw_frame(
+            r#"{"v":1,"type":"workspace_save","name":"proj","path":"/Users/x/proj"}"#,
+            SESSION,
+        );
+        let InboundAction::WorkspaceSave { name, path } = act else {
+            panic!("workspace_save 应映射为 WorkspaceSave：{act:?}")
+        };
+        assert_eq!(name, "proj");
+        assert_eq!(path, "/Users/x/proj");
+        let act = map_raw_frame(
+            r#"{"v":1,"type":"workspace_remove","name":"proj"}"#,
+            SESSION,
+        );
+        let InboundAction::WorkspaceRemove { name } = act else {
+            panic!("workspace_remove 应映射为 WorkspaceRemove：{act:?}")
+        };
+        assert_eq!(name, "proj");
+        for (raw, want) in [
+            (
+                r#"{"v":1,"type":"conv_workdir_set","convId":"work","path":"/w"}"#,
+                "web:work",
+            ),
+            (
+                r#"{"v":1,"type":"conv_workdir_set","convId":"web:work","path":"/w"}"#,
+                "web:work",
+            ),
+            (
+                r#"{"v":1,"type":"conv_workdir_set","convId":"local:work","path":"/w"}"#,
+                "local:work",
+            ),
+        ] {
+            let act = map_raw_frame(raw, SESSION);
+            let InboundAction::ConvWorkdirSet { conv, path } = act else {
+                panic!("{raw} 应映射为 ConvWorkdirSet：{act:?}")
+            };
+            assert_eq!(conv, want, "convId 归一（{raw}）");
+            assert_eq!(path, "/w");
+        }
+    }
+
+    /// v1.6 工作空间入站帧反例：字段缺失 / 类型错 → Warn 丢弃；**空 name
+    /// 仍映射为动作**（值域校验在 platform 泵——失败要回 error 帧 + 快照，
+    /// 静默丢弃会让 SPA 无响应）。
+    #[test]
+    fn map_workspace_frames_missing_or_wrong_fields() {
+        // workspace_save：缺 name / 缺 path / name 非字符串。
+        assert!(matches!(
+            map_raw_frame(r#"{"v":1,"type":"workspace_save","path":"/w"}"#, SESSION),
+            InboundAction::Warn(_)
+        ));
+        assert!(matches!(
+            map_raw_frame(r#"{"v":1,"type":"workspace_save","name":"a"}"#, SESSION),
+            InboundAction::Warn(_)
+        ));
+        assert!(matches!(
+            map_raw_frame(
+                r#"{"v":1,"type":"workspace_save","name":123,"path":"/w"}"#,
+                SESSION
+            ),
+            InboundAction::Warn(_)
+        ));
+        // workspace_remove：缺 name / 类型错。
+        assert!(matches!(
+            map_raw_frame(r#"{"v":1,"type":"workspace_remove"}"#, SESSION),
+            InboundAction::Warn(_)
+        ));
+        assert!(matches!(
+            map_raw_frame(r#"{"v":1,"type":"workspace_remove","name":[]}"#, SESSION),
+            InboundAction::Warn(_)
+        ));
+        // conv_workdir_set：缺 convId / 缺 path / convId 类型错。
+        assert!(matches!(
+            map_raw_frame(r#"{"v":1,"type":"conv_workdir_set","path":"/w"}"#, SESSION),
+            InboundAction::Warn(_)
+        ));
+        assert!(matches!(
+            map_raw_frame(
+                r#"{"v":1,"type":"conv_workdir_set","convId":"work"}"#,
+                SESSION
+            ),
+            InboundAction::Warn(_)
+        ));
+        assert!(matches!(
+            map_raw_frame(
+                r#"{"v":1,"type":"conv_workdir_set","convId":9,"path":"/w"}"#,
+                SESSION
+            ),
+            InboundAction::Warn(_)
+        ));
+        // 空 name / 空白 name：解析层放行（值域校验在泵，回 error 帧）。
+        let act = map_raw_frame(
+            r#"{"v":1,"type":"workspace_save","name":"  ","path":"/w"}"#,
+            SESSION,
+        );
+        assert!(
+            matches!(act, InboundAction::WorkspaceSave { .. }),
+            "空白 name 仍应映射（泵回 error 帧）：{act:?}"
+        );
+    }
+
+    /// v1.6 出站工作空间帧**字节级断言**（与任务契约逐字段一致，SPA 侧并行
+    /// 实现对齐锚点）：字段名/顺序/缺省行为不得漂移；**带 machine**（v1.1
+    /// 出站业务帧必带——SPA reducer 据此归属机器）。
+    #[test]
+    fn workspace_outbound_frames_byte_level() {
+        let mut convs = BTreeMap::new();
+        convs.insert("local:work".to_string(), "/lw".to_string());
+        convs.insert("web:work".to_string(), "/ww".to_string());
+        let json = encode_workspaces_frame(
+            "home-mac",
+            "/def",
+            vec![
+                WorkspaceEntryFrame {
+                    name: "a".into(),
+                    path: "/a".into(),
+                    last_used_at: None,
+                },
+                WorkspaceEntryFrame {
+                    name: "b".into(),
+                    path: "/b".into(),
+                    last_used_at: Some(1_770_000_000),
+                },
+            ],
+            convs,
+        )
+        .unwrap();
+        // 精确字符串（BTreeMap 键序稳定 + serde 按声明序输出）钉住字节形态。
+        assert_eq!(
+            json,
+            r#"{"v":1,"type":"workspaces","machine":"home-mac","default":"/def","workspaces":[{"name":"a","path":"/a"},{"name":"b","path":"/b","lastUsedAt":1770000000}],"convs":{"local:work":"/lw","web:work":"/ww"}}"#
+        );
+        // 逐字段复核（防手拼期望串自身笔误）。
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["v"], 1);
+        assert_eq!(v["type"], "workspaces");
+        assert_eq!(v["machine"], "home-mac", "出站帧带本机 machine");
+        assert_eq!(v["default"], "/def");
+        assert_eq!(v["workspaces"][0]["name"], "a");
+        assert!(
+            v["workspaces"][0].get("lastUsedAt").is_none(),
+            "缺席不序列化"
+        );
+        assert_eq!(v["workspaces"][1]["lastUsedAt"], 1_770_000_000);
+        assert_eq!(v["convs"]["local:work"], "/lw", "含 local: 会话");
+
+        // 空集合形态：workspaces=[] / convs={}。
+        let json =
+            encode_workspaces_frame("home-mac", "/def", Vec::new(), BTreeMap::new()).unwrap();
+        assert_eq!(
+            json,
+            r#"{"v":1,"type":"workspaces","machine":"home-mac","default":"/def","workspaces":[],"convs":{}}"#
+        );
+
+        // conv_workdir 增量帧。
+        let json = encode_conv_workdir_frame("home-mac", "web:work", "/Users/x/proj").unwrap();
+        assert_eq!(
+            json,
+            r#"{"v":1,"type":"conv_workdir","machine":"home-mac","convId":"web:work","workdir":"/Users/x/proj"}"#
+        );
+
+        // error 帧复用（workspace_invalid）。
+        let json = encode_error_frame("home-mac", "workspace_invalid", "名称不能为空").unwrap();
+        assert_eq!(
+            json,
+            r#"{"v":1,"type":"error","machine":"home-mac","code":"workspace_invalid","message":"名称不能为空"}"#
+        );
     }
 
     #[test]

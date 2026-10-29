@@ -750,6 +750,53 @@ describe("WsManager E2E（v1.4）", () => {
     );
   });
 
+  it("enc 解密内帧漏带 machine：注入 enc 信封 machine（归属兜底）；内帧自带不覆盖", () => {
+    const gw = makeGateway();
+    const h = makeE2eManager("home-mac");
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    pushMachines(sock, ["home-mac"]);
+    const hello = JSON.parse(sock.sentOfType("e2e_hello")[0]) as { ek: string; n1: string };
+    const ack = gw.ackFor(hello, "home-mac");
+    sock.serverSend(JSON.stringify(ack));
+    h.mgr.resolveTofu("home-mac", true);
+    expect(h.events).toContainEqual({ kind: "active", machine: "home-mac" });
+    const gwKey = gw.gatewayKey(hello, ack.n2);
+
+    // 内帧无 machine（网关新帧型忘带的形态，如 v1.6 workspaces 初版）→
+    // onFrame 收到的内帧带上 enc 信封的来源 machine（reducer 归属正确）。
+    sock.serverSend(
+      JSON.stringify(
+        sealFrame("home-mac", gwKey, {
+          v: 1,
+          type: "workspaces",
+          default: "/def",
+          workspaces: [],
+          convs: {},
+        }),
+      ),
+    );
+    expect(h.frames).toContainEqual(
+      expect.objectContaining({ type: "workspaces", machine: "home-mac" }),
+    );
+
+    // 内帧自带 machine → 保留自报值，不被信封 machine 覆盖。
+    sock.serverSend(
+      JSON.stringify(
+        sealFrame("home-mac", gwKey, {
+          v: 1,
+          type: "conv_workdir",
+          convId: "web:work",
+          workdir: "/w",
+          machine: "work-mac",
+        }),
+      ),
+    );
+    expect(h.frames).toContainEqual(
+      expect.objectContaining({ type: "conv_workdir", machine: "work-mac" }),
+    );
+  });
+
   it("旧网关 10s 无 ack → unsupported（发送禁用，明文入站照收）；仍以明文连接 → 放行并持久", () => {
     const h = makeE2eManager("home-mac");
     h.mgr.connect();
@@ -1007,5 +1054,63 @@ describe("WsManager 配对与管理（v1.5）", () => {
     // 管理帧不经 e2e 包装（relay 自产自消恒明文）：全部为明文 type 直发
     expect(sock.sentOfType("machine_list")).toHaveLength(1);
     expect(sock.sentOfType("enc")).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.6 工作空间发送器：字节级形状 / machine 路由键 / 入站帧转发
+// ---------------------------------------------------------------------------
+
+describe("WsManager 工作空间（v1.6）", () => {
+  it("四发送器：ready 前返回 false，ready 后字节精确（machine 缺省不带字段）", () => {
+    const h = makeManager();
+    h.mgr.connect();
+    expect(h.mgr.listWorkspaces()).toBe(false);
+    expect(h.mgr.saveWorkspace("code", "/u/code")).toBe(false);
+    expect(h.mgr.removeWorkspace("code")).toBe(false);
+    expect(h.mgr.setConvWorkdir("web:default", "/u/code")).toBe(false);
+    const sock = readyFlow(h);
+    expect(h.mgr.listWorkspaces()).toBe(true);
+    expect(h.mgr.saveWorkspace("code", "/u/code")).toBe(true);
+    expect(h.mgr.removeWorkspace("code")).toBe(true);
+    expect(h.mgr.setConvWorkdir("web:default", "/u/code")).toBe(true);
+    expect(sock.sent).toContain('{"v":1,"type":"workspace_list"}');
+    expect(sock.sent).toContain('{"v":1,"type":"workspace_save","name":"code","path":"/u/code"}');
+    expect(sock.sent).toContain('{"v":1,"type":"workspace_remove","name":"code"}');
+    expect(sock.sent).toContain('{"v":1,"type":"conv_workdir_set","convId":"web:default","path":"/u/code"}');
+  });
+
+  it("四发送器带 machine：帧尾携带（多机路由约定同 message 族）", () => {
+    const h = makeManager();
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    expect(h.mgr.listWorkspaces("home-mac")).toBe(true);
+    expect(h.mgr.saveWorkspace("code", "/u/code", "home-mac")).toBe(true);
+    expect(h.mgr.removeWorkspace("code", "home-mac")).toBe(true);
+    expect(h.mgr.setConvWorkdir("web:default", "/u/code", "home-mac")).toBe(true);
+    expect(sock.sent).toContain('{"v":1,"type":"workspace_list","machine":"home-mac"}');
+    expect(sock.sent).toContain(
+      '{"v":1,"type":"workspace_save","name":"code","path":"/u/code","machine":"home-mac"}',
+    );
+    expect(sock.sent).toContain('{"v":1,"type":"workspace_remove","name":"code","machine":"home-mac"}');
+    expect(sock.sent).toContain(
+      '{"v":1,"type":"conv_workdir_set","convId":"web:default","path":"/u/code","machine":"home-mac"}',
+    );
+  });
+
+  it("入站 workspaces / conv_workdir 明文帧经 onFrame 转发（reducer 消费路径）", () => {
+    const h = makeManager();
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    sock.serverSend(
+      '{"v":1,"type":"workspaces","default":"/d","workspaces":[{"name":"a","path":"/a","lastUsedAt":100}],"convs":{"web:default":"/a","local:work":"/t"},"machine":"home-mac"}',
+    );
+    sock.serverSend('{"v":1,"type":"conv_workdir","convId":"web:default","workdir":"/u/x","machine":"home-mac"}');
+    expect(h.frames).toContainEqual(
+      expect.objectContaining({ type: "workspaces", default: "/d", machine: "home-mac" }),
+    );
+    expect(h.frames).toContainEqual(
+      expect.objectContaining({ type: "conv_workdir", workdir: "/u/x", machine: "home-mac" }),
+    );
   });
 });
