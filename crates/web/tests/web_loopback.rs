@@ -46,6 +46,15 @@ fn gen_signing_key() -> SigningKey {
     SigningKey::from_bytes(&rand::random::<[u8; 32]>())
 }
 
+/// 测试用 E2E 密钥路径（临时目录——`WebPlatform::new` 的缺省路径锚定真实
+/// `~/.imagent`，测试不得触碰）。
+fn e2e_test_key_path(tag: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "imagent-web-loopback-e2e-{tag}-{}",
+        std::process::id()
+    ))
+}
+
 /// 起 key-only relay（v1.3：KEYS 表绑本机公钥，TOKENS 全空——「只配公钥
 /// 表」形态）+ 对应私钥。返回 (handle, 私钥)。
 async fn spawn_test_relay() -> (RelayHandle, SigningKey) {
@@ -78,15 +87,17 @@ async fn spawn_test_relay() -> (RelayHandle, SigningKey) {
 }
 
 /// 起真 relay（key 形态）+ 真平台（三帧握手，等在线）+ 模拟浏览器（hello
-/// 认证 + machines 快照断言）。
+/// 认证 + machines 快照断言）。E2E 密钥走临时路径（new 的缺省路径锚定真实
+/// `~/.imagent`，测试不得触碰）。
 async fn setup() -> (RelayHandle, WebPlatform, Ws) {
     let (handle, sk) = spawn_test_relay().await;
     let addr = handle.addr;
-    let platform = WebPlatform::new(
+    let platform = WebPlatform::new_with_e2e(
         format!("ws://{addr}/gateway"),
         GatewayCredential::Key(sk),
         "default".to_string(),
         MACHINE.to_string(),
+        &e2e_test_key_path("platform"),
     );
     // 等 platform 连上 relay（client spawn 后异步建连 + 三帧握手认证）。
     eventually(Duration::from_secs(10), || platform.is_online()).await;
@@ -596,6 +607,181 @@ async fn loopback_token_credential_compat() {
     let v = next_of_type(&mut br, "text").await;
     assert_eq!(v["text"], "收到");
 
+    handle.shutdown();
+    handle.wait().await;
+    drop(p);
+}
+
+/// 场景 9（协议 v1.4 E2E 中继盲化全流程）：握手（e2e_hello{sid,ek,n1} →
+/// e2e_ack{gk,ik,n2,sig}，浏览器视角以帧内 ik 自洽验签——TOFU 未 pin 路径）
+/// → 会话密钥两侧
+/// 一致 → 双向业务帧 enc 密文（message 入站试解、text/pong 出站逐 sid 定
+/// 向）→ 握手前明文兼容路径回归（无会话时行为不变）。
+#[tokio::test]
+async fn loopback_e2e_encrypted_roundtrip() {
+    use base64::Engine as _;
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+    use ed25519_dalek::Verifier;
+    use x25519_dalek::{PublicKey as XPublicKey, StaticSecret as XStaticSecret};
+
+    /// 浏览器侧单帧密封（与 crates/web/src/e2e.rs seal 同构：nonce24‖ct‖tag）。
+    fn seal(key: &[u8; 32], plaintext: &str) -> String {
+        let nonce = rand::random::<[u8; 24]>();
+        let cipher = XChaCha20Poly1305::new_from_slice(key).unwrap();
+        let ct = cipher
+            .encrypt(XNonce::from_slice(&nonce), plaintext.as_bytes())
+            .unwrap();
+        let mut boxed = Vec::with_capacity(24 + ct.len());
+        boxed.extend_from_slice(&nonce);
+        boxed.extend_from_slice(&ct);
+        base64::engine::general_purpose::STANDARD.encode(boxed)
+    }
+    /// 浏览器侧单帧开启。
+    fn open(key: &[u8; 32], boxed: &str) -> String {
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(boxed)
+            .unwrap();
+        let (nonce, ct) = data.split_at(24);
+        let cipher = XChaCha20Poly1305::new_from_slice(key).unwrap();
+        let pt = cipher.decrypt(XNonce::from_slice(nonce), ct).unwrap();
+        String::from_utf8(pt).unwrap()
+    }
+
+    let (handle, sk) = spawn_test_relay().await;
+    let addr = handle.addr;
+    let key_path = e2e_test_key_path("e2e-flow");
+    let p = WebPlatform::new_with_e2e(
+        format!("ws://{addr}/gateway"),
+        GatewayCredential::Key(sk.clone()),
+        "default".to_string(),
+        MACHINE.to_string(),
+        &key_path,
+    );
+    eventually(Duration::from_secs(10), || p.is_online()).await;
+
+    // 浏览器登录：session id 即 enc 帧定向路由键。
+    let mut br = connect_ws(&addr, "/ws", None).await;
+    br.send(Message::text(format!(
+        r#"{{"v":1,"type":"hello","token":"{USER_TOKEN}"}}"#
+    )))
+    .await
+    .unwrap();
+    let ack: serde_json::Value = serde_json::from_str(&next_text(&mut br).await).unwrap();
+    let sid = ack["session"]["id"].as_str().unwrap().to_string();
+    let _machines = next_of_type(&mut br, "machines").await;
+
+    // ---- 握手前：明文兼容路径回归（无 E2E 会话 → 出站行为不变）----
+    p.send_text(&conv(), "握手前明文", &ReplyHint::None)
+        .await
+        .unwrap();
+    let v = next_of_type(&mut br, "text").await;
+    assert_eq!(v["text"], "握手前明文", "握手前出站应明文：{v}");
+
+    // ---- E2E 握手（浏览器视角：临时密钥 + 验签 + 派生）----
+    let browser_secret = XStaticSecret::from(rand::random::<[u8; 32]>());
+    let browser_public = XPublicKey::from(&browser_secret);
+    let n1 = rand::random::<[u8; 32]>();
+    br.send(Message::text(
+        serde_json::json!({
+            "v": 1, "type": "e2e_hello", "machine": MACHINE, "sid": sid,
+            "ek": hex::encode(browser_public.as_bytes()),
+            "n1": hex::encode(n1),
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let ack = next_of_type(&mut br, "e2e_ack").await;
+    assert_eq!(ack["machine"], MACHINE, "{ack}");
+    // ik：TOFU pin 身份公钥来源，须随 ack 携带且与网关 v1.3 认证公钥一致
+    //（SPA 首连以 ik 自洽验签 + 弹指纹确认层，pin 表存 ik/gk）。
+    assert_eq!(
+        ack["ik"],
+        hex::encode(sk.verifying_key().to_bytes()),
+        "e2e_ack 须携带与认证公钥一致的 ik：{ack}"
+    );
+    let gk = hex::decode(ack["gk"].as_str().unwrap()).unwrap();
+    let gk_arr: [u8; 32] = gk.clone().try_into().unwrap();
+    let n2 = hex::decode(ack["n2"].as_str().unwrap()).unwrap();
+    let n2_arr: [u8; 32] = n2.clone().try_into().unwrap();
+    // 浏览器用 pin 的网关 ed25519 公钥验签（对象 = ek||gk||n1||n2 原始字节）。
+    let mut signed = Vec::with_capacity(128);
+    signed.extend_from_slice(browser_public.as_bytes());
+    signed.extend_from_slice(&gk);
+    signed.extend_from_slice(&n1);
+    signed.extend_from_slice(&n2);
+    let sig = <[u8; 64]>::try_from(hex::decode(ack["sig"].as_str().unwrap()).unwrap()).unwrap();
+    sk.verifying_key()
+        .verify(&signed, &ed25519_dalek::Signature::from_bytes(&sig))
+        .expect("e2e_ack 签名须可用 pin 的网关公钥验证");
+    // 浏览器侧派生（X25519 对称性 → 与网关一致）。
+    let k = imagent_web::e2e::derive_session_key(
+        browser_secret
+            .diffie_hellman(&XPublicKey::from(gk_arr))
+            .as_bytes(),
+        &n1,
+        &n2_arr,
+    );
+
+    // ---- 入站：message 包 enc（无 sid）→ 网关试解 → recv ----
+    br.send(Message::text(
+        serde_json::json!({
+            "v": 1, "type": "enc", "machine": MACHINE,
+            "box": seal(&k, r#"{"v":1,"type":"message","convId":"work","text":"密文消息"}"#),
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let m = tokio::time::timeout(Duration::from_secs(5), p.recv())
+        .await
+        .expect("recv 超时")
+        .expect("recv 正常");
+    assert_eq!(m.conv_id, conv());
+    assert_eq!(m.text.as_deref(), Some("密文消息"));
+
+    // ---- 出站：send_text → enc{sid} 定向帧，浏览器解密得到原 text 帧 ----
+    p.send_text(&conv(), "机密回复", &ReplyHint::None)
+        .await
+        .unwrap();
+    let v = next_of_type(&mut br, "enc").await;
+    assert_eq!(v["v"], 1);
+    assert_eq!(v["machine"], MACHINE);
+    assert_eq!(
+        v["sid"], sid,
+        "出站 enc 帧携带握手 sid（relay 定向投递键）：{v}"
+    );
+    let inner: serde_json::Value = serde_json::from_str(&open(&k, v["box"].as_str().unwrap()))
+        .expect("浏览器侧会话密钥须能解网关 box");
+    assert_eq!(inner["type"], "text");
+    assert_eq!(inner["text"], "机密回复");
+    assert_eq!(inner["convId"], CONV);
+
+    // ---- 应用层 ping 同样走 enc：enc-wrapped ping → enc-wrapped pong ----
+    br.send(Message::text(
+        serde_json::json!({
+            "v": 1, "type": "enc", "machine": MACHINE,
+            "box": seal(&k, r#"{"v":1,"type":"ping"}"#),
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let v = next_of_type(&mut br, "enc").await;
+    let inner: serde_json::Value =
+        serde_json::from_str(&open(&k, v["box"].as_str().unwrap())).expect("pong 也应逐会话加密");
+    assert_eq!(inner["type"], "pong");
+    assert_eq!(inner["machine"], MACHINE);
+    // pong 不进 recv。
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), p.recv())
+            .await
+            .is_err(),
+        "enc ping 不应产生入站消息"
+    );
+
+    let _ = std::fs::remove_file(&key_path);
     handle.shutdown();
     handle.wait().await;
     drop(p);

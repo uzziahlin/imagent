@@ -57,6 +57,13 @@
 //!   `cred_list` / `cred_revoke`（设备管理弹层）。rp_id 缺省按请求 Host
 //!   去端口推导，env `IMAGENT_RELAY_RP_ID` 可覆盖；本地 http IP 直连形态
 //!   不可用 passkey（secure context + rp_id 域名校验），走 USER_TOKEN 路径。
+//! - **E2E 中继盲化（帧协议 v1.4）**：浏览器↔网关业务帧以 `enc{sid,box}`
+//!   包装——内容 XChaCha20-Poly1305 端到端加密（密钥协商经 `e2e_hello` /
+//!   `e2e_ack` 握手帧完成，relay 透传不理解），本中继保持「盲」：唯一新增
+//!   认知是 enc 帧信封的 `sid` 字段（transport 路由键，与 `machine` 同级，
+//!   见 [`frame_sid`]）——非空且匹配在线浏览器会话 → 只投该连接（逐浏览器
+//!   独立密钥的前提）；空/无匹配 → 广播现状。enc 帧不进 sync/ping 歧义
+//!   豁免表（照常 machine 路由）。
 //!
 //! 分层（任务说明 §4.7）：核心状态机全部在本 lib（可单测 + 集成测试直接
 //! [`spawn_relay`] 起真 server），`main.rs` 只做 env / bind / tracing 组装。
@@ -918,12 +925,21 @@ struct Endpoint {
     tx: mpsc::Sender<Outbound>,
 }
 
+/// browser 槽位（v1.4 enc 帧定向路由）：Endpoint + 该连接绑定的**浏览器
+/// 会话 id**（认证产物，每条浏览器连接必有一个）。sid 是 transport 路由键
+/// （与 machine 同级——见 [`frame_sid`]）：网关出站 `enc{sid}` 帧据此只
+/// 投给该会话的连接（逐浏览器独立 E2E 密钥的前提），其余帧广播不受影响。
+struct BrowserSlot {
+    session_id: String,
+    ep: Endpoint,
+}
+
 struct HubState {
     /// 网关多机器并存表（v1.1）：machine id → 连接槽位（上限
     /// [`MAX_GATEWAYS`]；同 machine 重连顶替旧连接——每台机器单连接）。
     gateways: HashMap<String, Endpoint>,
-    /// 浏览器多连接并存表：conn_id → 出站投递口（上限 [`MAX_BROWSERS`]）。
-    browsers: HashMap<u64, Endpoint>,
+    /// 浏览器多连接并存表：conn_id → 连接槽位（上限 [`MAX_BROWSERS`]）。
+    browsers: HashMap<u64, BrowserSlot>,
     buf: OfflineBuffer,
 }
 
@@ -940,7 +956,7 @@ struct Hub {
 /// 锁内取全部在线 browser 的投递口（广播目标：machines/machine 通知 /
 /// 业务帧 fan-out / 停机 close）。
 fn browser_senders(st: &HubState) -> Vec<mpsc::Sender<Outbound>> {
-    st.browsers.values().map(|e| e.tx.clone()).collect()
+    st.browsers.values().map(|b| b.ep.tx.clone()).collect()
 }
 
 /// 锁内取全量在线 machine 列表（有序输出——machines 帧对 SPA 排序不敏感，
@@ -1017,6 +1033,23 @@ fn frame_machine(text: &str) -> Option<String> {
     Some(m.to_string())
 }
 
+/// gateway→browser 帧的可选 `sid` 路由键提取（协议 v1.4，与 [`frame_machine`]
+/// 同级同纪律）：`sid` 是 **transport 层路由键**——enc 帧逐浏览器独立加密
+///（网关对每个已 E2E 握手的浏览器会话各密封一份），relay 据此把帧只投给
+/// 该会话的连接；**box 内容 relay 不理解也不触碰**（盲转语义不变，本函数
+/// 只读信封元数据）。JSON 畸形 / 字段缺失 / 非字符串 / trim 后为空 → None
+///（按「未指定」广播，现状语义）。`type=="enc"` 不参与浏览器→网关方向的
+/// sync/ping 歧义豁免（[`AMBIGUOUS_SILENT_KINDS`]）——enc 帧照常按 machine
+/// 路由，豁免表不含它。
+fn frame_sid(text: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let s = v.get("sid")?.as_str()?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    Some(s.to_string())
+}
+
 /// 缺省路由歧义（未指定 machine 且多台网关在线）时**静默忽略**的帧类型：
 /// `sync` 与 `ping`。理由（bootstrap 时序豁免）：
 /// - SPA 首连在 hello_ack 后立即发 bootstrap sync，此时 machines 列表帧
@@ -1028,6 +1061,9 @@ fn frame_machine(text: &str) -> Option<String> {
 /// 这两类帧若照常回 `ambiguous_machine`，只会让 SPA 每次连接都弹一次
 ///「多台机器在线」toast（4s 噪音）。其余类型（message / approval_response
 /// / control）是真实用户操作，歧义仍回错——见 [`BrowserRoute::Ambiguous`]。
+/// **`enc` 不在豁免表**（协议 v1.4）：enc 帧是真实密文业务帧，缺省路由
+/// 歧义回错是对的（SPA 补 machine 重发）；其 `type` 是信封明文元数据，
+/// [`frame_kind`] 读取不破坏中继盲化。
 const AMBIGUOUS_SILENT_KINDS: [&str; 2] = ["sync", "ping"];
 
 /// browser→gateway 帧的 `type` 提取（仅服务于 [`AMBIGUOUS_SILENT_KINDS`]
@@ -1107,8 +1143,14 @@ impl Hub {
 
     /// browser 注册（多连接并存）：上限未满 → 注册新 conn_id（不踢任何旧
     /// 连接）+ default 机器快照 + 全量 machines 快照；已满 → full=true
-    ///（本连接不注册，调用方 close 4001 自己）。
-    fn register_browser(&self, conn_id: u64, tx: mpsc::Sender<Outbound>) -> BrowserRegistered {
+    ///（本连接不注册，调用方 close 4001 自己）。`sid` 为该连接绑定的浏览
+    /// 器会话 id（v1.4 enc 帧定向投递键，见 [`BrowserSlot`]）。
+    fn register_browser(
+        &self,
+        conn_id: u64,
+        sid: &str,
+        tx: mpsc::Sender<Outbound>,
+    ) -> BrowserRegistered {
         let mut st = self.lock();
         if st.browsers.len() >= MAX_BROWSERS {
             return BrowserRegistered {
@@ -1118,7 +1160,13 @@ impl Hub {
                 browsers: st.browsers.len(),
             };
         }
-        st.browsers.insert(conn_id, Endpoint { conn_id, tx });
+        st.browsers.insert(
+            conn_id,
+            BrowserSlot {
+                session_id: sid.to_string(),
+                ep: Endpoint { conn_id, tx },
+            },
+        );
         BrowserRegistered {
             full: false,
             machine_online: st.gateways.contains_key(DEFAULT_MACHINE),
@@ -1159,14 +1207,29 @@ impl Hub {
         }
     }
 
-    /// gateway→browser 帧路向（§4.3 行为 5，多 browser 广播版）：返回全部
-    /// 在线 browser 的投递口，调用侧逐个 try_send——单个打满/关闭不影响
-    /// 其余（已关闭的条目无需在此清理，release 路径会移除）。空 = 无在线
-    /// browser，帧直接丢弃不缓存——会话恢复走网关侧重发机制，不归 relay
-    /// 管（docs/WEB_DESIGN.md D6）。网关侧出站帧自带 machine 字段（v1.1），
-    /// relay 透传不改、广播全部 browser。
-    fn route_gateway_frame(&self) -> Vec<mpsc::Sender<Outbound>> {
+    /// gateway→browser 帧路向（§4.3 行为 5，多 browser 广播版 + v1.4 sid
+    /// 定向）：帧带非空 `sid` 且匹配在线浏览器会话 → **只投该会话的连接**
+    ///（逐浏览器独立 E2E 密钥——每会话的 enc box 只有本会话能解，广播给
+    /// 他人也只是打不开的随机字节；同会话多连接（多标签）全部投递——
+    /// 只有最近一次握手的连接能解密，其余连接 AEAD 失败由 SPA 自行处理）；
+    /// sid 空 / 无匹配 → 广播全部在线 browser（现状语义——e2e_ack 等握手
+    /// 前帧、明文兼容期帧、SPA 未上线窗口的 enc 帧都靠广播兜底）。返回
+    /// 空 = 无在线 browser，帧直接丢弃不缓存——会话恢复走网关侧重发机制，
+    /// 不归 relay 管（docs/WEB_DESIGN.md D6）。网关侧出站帧自带 machine
+    /// 字段（v1.1），relay 透传不改。
+    fn route_gateway_frame(&self, text: &str) -> Vec<mpsc::Sender<Outbound>> {
         let st = self.lock();
+        if let Some(sid) = frame_sid(text) {
+            let targeted: Vec<mpsc::Sender<Outbound>> = st
+                .browsers
+                .values()
+                .filter(|b| b.session_id == sid)
+                .map(|b| b.ep.tx.clone())
+                .collect();
+            if !targeted.is_empty() {
+                return targeted;
+            }
+        }
         browser_senders(&st)
     }
 
@@ -1750,7 +1813,11 @@ async fn handle_connection(mut socket: WebSocket, st: RelayState, role: Role, he
             tracing::info!(target: TARGET, machine = %machine, gateways = reg.gateways, replayed, "gateway 连接（认证通过）");
         }
         Role::Browser => {
-            let reg = st.hub.register_browser(conn_id, tx.clone());
+            // 会话绑定（v1.2）：失败 = 认证与注册之间会话被吊销（竞态窗口）
+            // ——fail-closed 断开，不留「已吊销会话的幽灵连接」。sid 先于
+            // 注册取出（注册要把它记进 BrowserSlot 作 v1.4 enc 定向路由键）。
+            let session = browser_session.clone().expect("浏览器认证通过后必有会话");
+            let reg = st.hub.register_browser(conn_id, &session.id, tx.clone());
             if reg.full {
                 // 并存数达上限（认证已通过）：本连接 close 4001 让位——复用
                 // superseded 语义，SPA 已有终态处理（不重连），在线连接零影响。
@@ -1760,9 +1827,6 @@ async fn handle_connection(mut socket: WebSocket, st: RelayState, role: Role, he
                     .await;
                 return;
             }
-            // 会话绑定（v1.2）：失败 = 认证与注册之间会话被吊销（竞态窗口）
-            // ——fail-closed 断开，不留「已吊销会话的幽灵连接」。
-            let session = browser_session.clone().expect("浏览器认证通过后必有会话");
             if !st.sessions.bind(&session.id, conn_id, tx.clone()) {
                 tracing::warn!(target: TARGET, session = %session_log_id(&session.id), "会话在注册前被吊销，断开");
                 st.hub.release_browser(conn_id);
@@ -1927,11 +1991,14 @@ async fn handle_connection(mut socket: WebSocket, st: RelayState, role: Role, he
                                     }
                                 },
                                 Role::Gateway => {
-                                    let targets = st.hub.route_gateway_frame();
+                                    // v1.4：enc{sid} 帧按 sid 定向投递（匹配
+                                    // 在线会话 → 只投该连接；空/无匹配 → 广播），
+                                    // 见 Hub::route_gateway_frame。
+                                    let targets = st.hub.route_gateway_frame(text.as_str());
                                     if targets.is_empty() {
                                         tracing::debug!(target: TARGET, bytes = text.len(), "无在线 browser，帧丢弃（不缓存）");
                                     } else {
-                                        tracing::debug!(target: TARGET, bytes = text.len(), browsers = targets.len(), "gateway → browser 广播");
+                                        tracing::debug!(target: TARGET, bytes = text.len(), browsers = targets.len(), "gateway → browser 投递（enc 帧可定向）");
                                         // Utf8Bytes 是 Arc 语义，逐个 clone 广播零拷贝。
                                         let msg = Outbound::Msg(Message::Text(text));
                                         for b in targets {
@@ -2434,6 +2501,112 @@ mod tests {
         );
     }
 
+    /// enc 帧 sid 路由键提取（v1.4）：缺失 / 空串 / 空白 / 非字符串 / 畸形
+    /// JSON → None（广播现状）；enc 信封形状带 box（relay 不触碰其内容）。
+    #[test]
+    fn frame_sid_extraction() {
+        assert_eq!(
+            frame_sid(r#"{"v":1,"type":"enc","machine":"m","sid":"1111-22","box":"AAE"}"#),
+            Some("1111-22".to_string())
+        );
+        assert_eq!(
+            frame_sid(r#"{"v":1,"type":"enc","machine":"m","box":"AAE"}"#),
+            None,
+            "无 sid → 广播（e2e_ack / 明文兼容期形态）"
+        );
+        assert_eq!(
+            frame_sid(r#"{"v":1,"type":"text","machine":"m","text":"hi"}"#),
+            None,
+            "明文业务帧无 sid → 广播"
+        );
+        assert_eq!(
+            frame_sid(r#"{"v":1,"type":"enc","sid":"  s1  ","box":"x"}"#),
+            Some("s1".to_string()),
+            "路由键 trim（与 machine 同款）"
+        );
+        assert_eq!(frame_sid(r#"{"sid":""}"#), None, "空串按未指定");
+        assert_eq!(frame_sid(r#"{"sid":"   "}"#), None, "空白按未指定");
+        assert_eq!(frame_sid(r#"{"sid":42}"#), None, "非字符串按未指定");
+        assert_eq!(frame_sid("not json"), None, "畸形 JSON 按未指定");
+    }
+
+    /// gateway→browser 帧 sid 定向路由（v1.4）：enc{sid} 命中在线会话 → 只投
+    /// 该会话的连接（同会话多连接全投——多标签）；sid 无匹配 / 无 sid /
+    /// 明文帧 → 广播全部（现状语义）。用真实 channel 断言投递归属。
+    #[test]
+    fn hub_gateway_frame_sid_targeting() {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let hub = Hub::new(shutdown_rx);
+
+        // 三个 browser：A 会话两条连接（多标签）+ B 会话一条。
+        let (a1_tx, mut a1_rx) = mpsc::channel(8);
+        let (a2_tx, mut a2_rx) = mpsc::channel(8);
+        let (b_tx, mut b_rx) = mpsc::channel(8);
+        hub.register_browser(1, "sess-a", a1_tx);
+        hub.register_browser(2, "sess-a", a2_tx);
+        hub.register_browser(3, "sess-b", b_tx);
+
+        // enc{sid=sess-a} → 只投 A 的两条连接，B 不收。
+        let targets = hub.route_gateway_frame(
+            r#"{"v":1,"type":"enc","machine":"m","sid":"sess-a","box":"AAE"}"#,
+        );
+        assert_eq!(targets.len(), 2, "同会话多标签全投");
+        for t in &targets {
+            try_send(t, Outbound::Msg(Message::text("enc-a")));
+        }
+        assert_eq!(
+            a1_rx.try_recv().ok().map(|o| text_of(&o)),
+            Some("enc-a".into())
+        );
+        assert_eq!(
+            a2_rx.try_recv().ok().map(|o| text_of(&o)),
+            Some("enc-a".into())
+        );
+        assert!(b_rx.try_recv().is_err(), "B 会话不得收到 A 的定向 enc 帧");
+
+        // enc{sid=unknown} → 无匹配，广播全部（SPA 未上线窗口兜底）。
+        let targets = hub.route_gateway_frame(
+            r#"{"v":1,"type":"enc","machine":"m","sid":"sess-gone","box":"AAE"}"#,
+        );
+        assert_eq!(targets.len(), 3, "无匹配回退广播");
+        for t in &targets {
+            try_send(t, Outbound::Msg(Message::text("fanout")));
+        }
+        for rx in [&mut a1_rx, &mut a2_rx, &mut b_rx] {
+            assert_eq!(
+                rx.try_recv().ok().map(|o| text_of(&o)),
+                Some("fanout".into())
+            );
+        }
+
+        // 无 sid（明文业务帧 / e2e_ack）→ 广播全部（现状语义）。
+        assert_eq!(
+            hub.route_gateway_frame(r#"{"v":1,"type":"text","machine":"m","text":"t"}"#)
+                .len(),
+            3
+        );
+        assert_eq!(
+            hub.route_gateway_frame(r#"{"v":1,"type":"e2e_ack","machine":"m"}"#)
+                .len(),
+            3
+        );
+
+        // A 会话一条连接断开（多标签关一）→ 定向只投剩下那条；B 不受影响。
+        hub.release_browser(1);
+        let targets = hub.route_gateway_frame(
+            r#"{"v":1,"type":"enc","machine":"m","sid":"sess-a","box":"AAE"}"#,
+        );
+        assert_eq!(targets.len(), 1, "同会话剩一条连接 → 只投它");
+    }
+
+    /// Outbound::Msg 文本载荷提取（sid 路由测试断言用）。
+    fn text_of(o: &Outbound) -> String {
+        match o {
+            Outbound::Msg(m) => m.clone().into_text().unwrap().as_str().to_string(),
+            Outbound::Close(..) => panic!("期待 Msg"),
+        }
+    }
+
     /// 帧 type 提取（歧义静默豁免判定用）：常规 / 缺失 / 非字符串 / 畸形。
     #[test]
     fn frame_kind_extraction() {
@@ -2734,7 +2907,7 @@ mod tests {
 
         // browser 注册（多连接并存）：default 机器在线快照 + 全量 machines 快照。
         let (br_tx, mut br_rx) = mpsc::channel(8);
-        let regb = hub.register_browser(3, br_tx);
+        let regb = hub.register_browser(3, "sess-br3", br_tx);
         assert!(regb.machine_online && !regb.full && regb.browsers == 1);
         assert_eq!(regb.machines, vec!["default".to_string()]);
 
@@ -2880,7 +3053,9 @@ mod tests {
 
         // browser 退出只清自己：br（conn_id=3）退出后广播目标清零。
         assert_eq!(hub.release_browser(3), 0);
-        assert!(hub.route_gateway_frame().is_empty());
+        assert!(hub
+            .route_gateway_frame(r#"{"v":1,"type":"text"}"#)
+            .is_empty());
     }
 
     /// 网关机器数上限：第 [`MAX_GATEWAYS`] 台（不同 machine）注册成功，第
@@ -2932,13 +3107,13 @@ mod tests {
 
         for i in 1..=MAX_BROWSERS {
             let (tx, _rx) = mpsc::channel(8);
-            let reg = hub.register_browser(i as u64, tx);
+            let reg = hub.register_browser(i as u64, &format!("sess-{i}"), tx);
             assert!(!reg.full, "第 {i} 条应注册成功");
             assert_eq!(reg.browsers, i);
         }
         // 超上限：full=true 且不注册（该连接随后 close 4001 自己）。
         let (tx, _rx) = mpsc::channel(8);
-        let reg = hub.register_browser(999, tx);
+        let reg = hub.register_browser(999, "sess-999", tx);
         assert!(reg.full);
         assert_eq!(reg.browsers, MAX_BROWSERS, "满员时在线数不变");
 
@@ -2948,7 +3123,7 @@ mod tests {
         // 释放一条 → 槽位立即可复用。
         assert_eq!(hub.release_browser(1), MAX_BROWSERS - 1);
         let (tx, _rx) = mpsc::channel(8);
-        let reg = hub.register_browser(1000, tx);
+        let reg = hub.register_browser(1000, "sess-1000", tx);
         assert!(!reg.full && reg.browsers == MAX_BROWSERS);
     }
 }

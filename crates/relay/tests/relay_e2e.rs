@@ -2502,3 +2502,84 @@ async fn e2e_passkey_begin_rate_limit() {
     handle.shutdown();
     handle.wait().await;
 }
+
+// ---------------------------------------------------------------------------
+// v1.4 E2E 中继盲化：enc 帧 sid 定向投递
+// ---------------------------------------------------------------------------
+
+/// 场景 40（v1.4 enc 帧定向）：网关出站 `enc{sid}` 帧非空且匹配在线浏览器
+/// 会话 → 只投该会话连接；sid 无匹配 / 无 sid（明文帧 / e2e_ack）→ 广播
+/// 全部在线浏览器。relay 对 box 内容零理解（盲转），仅按信封 sid 路由。
+#[tokio::test]
+async fn e2e_enc_frame_sid_targeting() {
+    let handle = spawn_test_relay().await;
+    let addr = handle.addr;
+
+    // 网关上线（v1.2 token 形态即可——路由与认证形态无关）。
+    let mut gw = connect_ws(&addr, "/gateway", None).await;
+    gateway_hello(&mut gw, "home").await;
+
+    // 两个浏览器会话（各自登录换发，sid 互异）。
+    let mut br_a = connect_ws(&addr, "/ws", None).await;
+    let session_a = login_session(&mut br_a, Some("phone")).await;
+    let sid_a = session_a["id"].as_str().unwrap().to_string();
+    let mut br_b = connect_ws(&addr, "/ws", None).await;
+    let _session_b = login_session(&mut br_b, Some("laptop")).await;
+    // 吃掉 machines 快照（上线通知在两浏览器登录前已广播，这里各消化一条
+    // 可能的残留 machine/machines 帧不确定，直接按 type 过滤后续断言）。
+
+    // enc{sid=a} → 只有 A 收到；B 在窗口内不得收到任何 enc 帧。
+    gw.send(Message::text(format!(
+        r#"{{"v":1,"type":"enc","machine":"home","sid":"{sid_a}","box":"QUFB"}}"#
+    )))
+    .await
+    .unwrap();
+    let v = next_of_type(&mut br_a, "enc").await;
+    assert_eq!(v["sid"], sid_a, "A 应收到定向 enc 帧：{v}");
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            next_of_type(&mut br_b, "enc")
+        )
+        .await
+        .is_err(),
+        "B 不应收到 A 的定向 enc 帧"
+    );
+
+    // enc{sid=unknown}（无匹配）→ 广播：A、B 都收到。
+    gw.send(Message::text(
+        r#"{"v":1,"type":"enc","machine":"home","sid":"no-such-session","box":"QkI="}"#,
+    ))
+    .await
+    .unwrap();
+    let v = next_of_type(&mut br_a, "enc").await;
+    assert_eq!(v["sid"], "no-such-session");
+    let v = next_of_type(&mut br_b, "enc").await;
+    assert_eq!(v["sid"], "no-such-session");
+
+    // 无 sid 明文业务帧 → 广播现状（明文兼容路径不受 v1.4 影响）。
+    gw.send(Message::text(
+        r#"{"v":1,"type":"text","machine":"home","convId":"web:work","text":"明文"}"#,
+    ))
+    .await
+    .unwrap();
+    let v = next_of_type(&mut br_a, "text").await;
+    assert_eq!(v["text"], "明文");
+    let v = next_of_type(&mut br_b, "text").await;
+    assert_eq!(v["text"], "明文");
+
+    // 浏览器→网关方向 enc 帧（无 sid，带 machine）照常 machine 路由透传。
+    br_a.send(Message::text(
+        r#"{"v":1,"type":"enc","machine":"home","box":"Q0M="}"#,
+    ))
+    .await
+    .unwrap();
+    let got = next_text(&mut gw).await;
+    assert!(
+        got.contains(r#""type":"enc"#) && got.contains(r#""box":"Q0M=""#),
+        "网关应原样收到浏览器 enc 帧：{got}"
+    );
+
+    handle.shutdown();
+    handle.wait().await;
+}

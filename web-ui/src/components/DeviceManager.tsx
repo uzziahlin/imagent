@@ -1,4 +1,5 @@
 import { normalizeExpiryMs, type DeviceInfo, type PasskeyInfo } from "../lib/protocol";
+import { fingerprint, type E2ePin } from "../lib/e2e";
 import { useExitMounted } from "./useExitMounted";
 
 /** 相对时间（v1.2 设备列表「最后活跃」）：刚刚 / N 分钟前 / N 小时前 / N 天前。
@@ -21,11 +22,13 @@ export function relativeTime(ts: number | undefined, now = Date.now()): string {
 }
 
 /**
- * 已登录设备弹层（v1.2 + v1.3 通行钥匙）：设备列表（设备名 / 在线状态点 /
- * 最后活跃相对时间、每项「吊销」；id === selfId 的项标「本机」，其吊销按钮
- * 为「吊销并退出」——App 侧语义：吊销本机 = 登出）+ 通行钥匙区（passkey
- * 列表 label/created、每项「删除」、「添加通行钥匙」按钮走注册流程，label
- * 用本机设备名）。devices / passkeys 为 null = 已发列表帧待回包。
+ * 已登录设备弹层（v1.2 + v1.3 通行钥匙 + v1.4 机器指纹）：设备列表（设备名 /
+ * 在线状态点 / 最后活跃相对时间、每项「吊销」；id === selfId 的项标「本机」，
+ * 其吊销按钮为「吊销并退出」——App 侧语义：吊销本机 = 登出）+ 通行钥匙区
+ * （passkey 列表 label/created、每项「删除」、「添加通行钥匙」按钮走注册流程，
+ * label 用本机设备名）+ 已信任机器指纹区（v1.4 TOFU pin 表：机器名 / 双指纹
+ * 分组展示 / 信任时间、每项「重置」→ 该机器下次连接重新走指纹确认）。devices
+ * / passkeys 为 null = 已发列表帧待回包。
  *
  * 进出过渡（150ms ease）：open 经 useExitMounted 延迟卸载；遮罩 fade + 面板
  * fade/scale；关闭后 visibility 摘除可聚焦性（transition 离散翻转在动画末尾生效）。
@@ -34,6 +37,7 @@ export function DeviceManager({
   open,
   devices,
   passkeys,
+  pins,
   webauthnAvailable,
   passkeyBusy,
   passkeyMessage,
@@ -41,6 +45,7 @@ export function DeviceManager({
   onRevoke,
   onAddPasskey,
   onRevokePasskey,
+  onResetPin,
   onClose,
 }: {
   /** 弹层开关（App 恒挂载本组件，open 只切显隐）。 */
@@ -49,6 +54,8 @@ export function DeviceManager({
   devices: DeviceInfo[] | null;
   /** null = 加载中（打开面板即发 cred_list，relay 回 creds 帧更新）。 */
   passkeys: PasskeyInfo[] | null;
+  /** v1.4 已信任机器指纹（TOFU pin 表快照；空表 = 尚无信任机器）。 */
+  pins: E2ePin[];
   /** 本机浏览器是否支持 WebAuthn（不支持则通行钥匙区只显示指引）。 */
   webauthnAvailable: boolean;
   /** 注册 ceremony 进行中（「添加通行钥匙」禁用 + 等待系统弹窗）。 */
@@ -61,6 +68,8 @@ export function DeviceManager({
   /** 「添加通行钥匙」：App 侧走 lib/webauthn 注册流程。 */
   onAddPasskey: () => void;
   onRevokePasskey: (passkey: PasskeyInfo) => void;
+  /** v1.4 重置机器 pin（重置后该机器重新走 TOFU 指纹确认）。 */
+  onResetPin: (machine: string) => void;
   onClose: () => void;
 }) {
   const mounted = useExitMounted(open, 150);
@@ -200,6 +209,45 @@ export function DeviceManager({
             </ul>
           )}
           {passkeyMessage && <p className="mt-2 text-[11px] leading-relaxed text-faint">{passkeyMessage}</p>}
+        </div>
+        {/* v1.4 已信任机器指纹（TOFU pin 表）：列表 + 重置（重置后重新走
+            首连指纹确认；身份变化告警的恢复路径）。 */}
+        <div className="mt-4 border-t border-line pt-3">
+          <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-ghost">已信任机器指纹</h3>
+          {pins.length === 0 ? (
+            <p className="py-1 text-[11px] leading-relaxed text-ghost">
+              尚未信任任何机器。首次加密连接时会请求确认机器指纹。
+            </p>
+          ) : (
+            <ul className="max-h-44 space-y-1 overflow-y-auto overscroll-contain" aria-label="已信任机器指纹列表">
+              {pins.map((p) => (
+                <li
+                  key={p.machine}
+                  className="rounded-xl border border-line bg-surface px-3 py-2"
+                >
+                  <div className="flex items-center gap-2">
+                    <svg viewBox="0 0 20 20" className="h-4 w-4 shrink-0 text-emerald-500" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden="true">
+                      <rect x="4.5" y="8.5" width="11" height="7.5" rx="2" />
+                      <path d="M7 8.5V6.5a3 3 0 0 1 6 0v2" strokeLinecap="round" />
+                    </svg>
+                    <span className="min-w-0 flex-1 truncate text-sm text-ink">{p.machine}</span>
+                    <span className="shrink-0 text-[11px] text-ghost">{relativeTime(p.pinnedAt)}</span>
+                    <button
+                      type="button"
+                      onClick={() => onResetPin(p.machine)}
+                      className="press shrink-0 rounded-lg border border-line-strong px-2 py-1 text-xs text-muted transition-colors hover:border-rose-400/60 hover:text-rose-600 dark:hover:border-rose-500/50 dark:hover:text-rose-300"
+                    >
+                      重置
+                    </button>
+                  </div>
+                  <div className="mt-1 space-y-0.5 font-mono text-[11px] tracking-wider text-ghost">
+                    <div aria-label={`${p.machine} 网关密钥指纹`}>X25519 {fingerprint(p.gk)}</div>
+                    <div aria-label={`${p.machine} 身份密钥指纹`}>Ed25519 {fingerprint(p.ik)}</div>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
         <p className="mt-3 text-[11px] leading-relaxed text-faint">
           吊销后该设备需重新输入访问令牌登录；吊销本机将退出当前登录。删除通行钥匙后该设备无法再免令牌登录。

@@ -27,6 +27,7 @@ use imagent_core::{
 };
 
 use crate::client::WebClient;
+use crate::e2e::E2eIdentity;
 use crate::{
     encode_approval_request_frame, encode_approval_resolved_frame, encode_card_frame,
     encode_text_frame, CardPayload, GatewayCredential, TARGET,
@@ -171,15 +172,60 @@ impl WebPlatform {
     /// 为兼容回退）；`machine_id` 为本机 machine 身份（v1.1，main 经
     /// [`crate::resolve_machine_id`] 解析：config 显式值 / hostname 短名）；
     /// `default_session` 为无 convId 浏览器消息的落点（缺省 "default"）。
+    ///
+    /// E2E 密钥（v1.4）锚定 `<imagent_home>/web-e2e-key`（main 不感知——
+    /// E2E 是内容保密增强，装配失败不阻断网关启动，仅降级明文 + warn；
+    /// 测试经 [`Self::new_with_e2e`] 注入临时路径）。
     pub fn new(
         relay_url: String,
         credential: GatewayCredential,
         default_session: String,
         machine_id: String,
     ) -> Self {
+        let e2e_key = imagent_core::paths::imagent_home().join("web-e2e-key");
+        Self::new_with_e2e(relay_url, credential, default_session, machine_id, &e2e_key)
+    }
+
+    /// [`Self::new`] 的全参形态（E2E 密钥路径可注入——集成测试用临时目录，
+    /// 不落真实 `~/.imagent`）。
+    pub fn new_with_e2e(
+        relay_url: String,
+        credential: GatewayCredential,
+        default_session: String,
+        machine_id: String,
+        e2e_key_path: &std::path::Path,
+    ) -> Self {
         let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>(INBOUND_CHANNEL_CAPACITY);
         let (outbound_tx, outbound_rx) = mpsc::channel::<String>(OUTBOUND_CHANNEL_CAPACITY);
         let (sync_tx, sync_rx) = mpsc::channel::<()>(SYNC_CHANNEL_CAPACITY);
+
+        // E2E 身份装配（v1.4）：e2e_ack 签名复用 v1.3 认证 ed25519 私钥——
+        // 仅 key 凭证形态可用；token 回退形态无签名密钥，E2E 不可用（出站
+        // 恒明文 = v1.3 行为，浏览器侧 10s fail-closed 自行提示明文选择）。
+        // 密钥文件损坏同理降级不阻断（认证不受影响——两把密钥独立）。
+        let e2e = match &credential {
+            GatewayCredential::Key(sk) => {
+                match E2eIdentity::load_or_generate(e2e_key_path, sk.clone()) {
+                    Ok(id) => Some(id),
+                    Err(e) => {
+                        warn!(
+                            target: TARGET,
+                            key_path = %e2e_key_path.display(),
+                            error = %e,
+                            "E2E 密钥装配失败，业务帧保持明文中继（网关认证不受影响）"
+                        );
+                        None
+                    }
+                }
+            }
+            GatewayCredential::Token(_) => {
+                debug!(
+                    target: TARGET,
+                    "token 凭证（v1.2 兼容路径）无 ed25519 签名密钥，E2E 加密不可用（明文）"
+                );
+                None
+            }
+        };
 
         let reconnect = Arc::new(Notify::new());
         let online = Arc::new(AtomicBool::new(false));
@@ -192,6 +238,7 @@ impl WebPlatform {
             machine_id: machine_id.clone(),
             default_session,
             online: online.clone(),
+            e2e,
             inbound_tx,
             sync_tx,
         };
@@ -471,11 +518,15 @@ mod tests {
     use imagent_core::{CardPhase, CardTerminal};
 
     fn offline_platform() -> WebPlatform {
-        WebPlatform::new(
+        // Token 凭证 → E2E 身份不装配（无文件 IO），new_with_e2e 的路径仅
+        // 满足签名（避免 new 的缺省路径锚定真实 ~/.imagent）。
+        let e2e_key = std::env::temp_dir().join("imagent-web-platform-e2e-unused");
+        WebPlatform::new_with_e2e(
             "ws://127.0.0.1:1/gateway".into(),
             GatewayCredential::Token("unused-token".into()),
             "default".into(),
             "test-mac".into(),
+            &e2e_key,
         )
     }
 

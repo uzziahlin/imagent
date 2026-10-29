@@ -24,6 +24,12 @@ import {
   type StoredSession,
 } from "./lib/ws";
 import {
+  loadPins,
+  removePin,
+  type E2eEvent,
+  type E2ePin,
+} from "./lib/e2e";
+import {
   PasskeyError,
   passkeyLogin,
   passkeyRegister,
@@ -33,6 +39,7 @@ import { Login } from "./components/Login";
 import { StatusBar } from "./components/StatusBar";
 import { Sidebar, type ConvItem } from "./components/Sidebar";
 import { DeviceManager } from "./components/DeviceManager";
+import { E2eConfirm } from "./components/E2eConfirm";
 import { useExitMounted } from "./components/useExitMounted";
 import { MessageList } from "./components/MessageList";
 import { ApprovalPanel } from "./components/ApprovalPanel";
@@ -92,6 +99,29 @@ function toConvId(name: string): string {
   return name.startsWith("web:") ? name : `web:${name}`;
 }
 
+/** v1.4 e2e UI 态（WsManager onE2e 事件驱动）：tofu = 待确认指纹队列（逐台
+ *  弹层）；alerts = 身份变化机器（红条）；blocked = fail-closed 机器（发送
+ *  停用 + 明文按钮）；active = 加密会话已激活（StatusBar 锁标）；downgrade
+ *  = 收到未加密业务帧的机器（黄条——链路可能被降级）。 */
+type E2eUi = {
+  tofu: { machine: string; gkFp: string; idFp: string }[];
+  alerts: Record<string, string>;
+  blocked: Record<string, true>;
+  active: Record<string, true>;
+  downgrade: Record<string, true>;
+};
+
+const EMPTY_E2E_UI: E2eUi = { tofu: [], alerts: {}, blocked: {}, active: {}, downgrade: {} };
+
+function omitKey<T extends Record<string, unknown>>(rec: T, key: string): T {
+  if (!(key in rec)) {
+    return rec;
+  }
+  const next = { ...rec } as T;
+  delete next[key];
+  return next;
+}
+
 export default function App() {
   const [auth, setAuth] = useState<Cred | null>(loadCred);
   // 会话凭证（v1.2）：hello_ack.session 签发/恢复时置值；驱动过期横幅、设备
@@ -108,6 +138,9 @@ export default function App() {
   const [devicesOpen, setDevicesOpen] = useState(false);
   const [status, setStatus] = useState<ConnStatus>("connecting");
   const [drawerOpen, setDrawerOpen] = useState(false);
+  // v1.4 E2E：pin 表快照（设备管理指纹区）+ UI 态（TOFU 队列/告警/阻断/激活）
+  const [e2ePins, setE2ePins] = useState<E2ePin[]>(() => loadPins());
+  const [e2eUi, setE2eUi] = useState<E2eUi>(EMPTY_E2E_UI);
   const [state, dispatch] = useReducer(reducer, undefined, initialState);
   const wsRef = useRef<WsManager | null>(null);
   // state 的渲染后镜像：WsManager 回调（getMachine）需要读最新 machine 维度，
@@ -182,6 +215,49 @@ export default function App() {
     }
   };
 
+  /** v1.4 e2e 事件 → UI 态（TOFU 队列 / 身份告警 / fail-closed 阻断 / 激活）。 */
+  const onE2eEvent = (ev: E2eEvent) => {
+    setE2eUi((prev) => {
+      switch (ev.kind) {
+        case "tofu":
+          return {
+            ...prev,
+            tofu: [...prev.tofu, { machine: ev.machine, gkFp: ev.gkFp, idFp: ev.idFp }],
+          };
+        case "active":
+          return {
+            tofu: prev.tofu.filter((t) => t.machine !== ev.machine),
+            alerts: omitKey(prev.alerts, ev.machine),
+            blocked: omitKey(prev.blocked, ev.machine),
+            downgrade: omitKey(prev.downgrade, ev.machine),
+            active: { ...prev.active, [ev.machine]: true },
+          };
+        case "unsupported":
+          return {
+            ...prev,
+            tofu: prev.tofu.filter((t) => t.machine !== ev.machine),
+            blocked: { ...prev.blocked, [ev.machine]: true },
+            active: omitKey(prev.active, ev.machine),
+          };
+        case "alert":
+          return {
+            ...prev,
+            tofu: prev.tofu.filter((t) => t.machine !== ev.machine),
+            active: omitKey(prev.active, ev.machine),
+            alerts: { ...prev.alerts, [ev.machine]: ev.reason },
+          };
+        case "plaintext":
+          return { ...prev, blocked: omitKey(prev.blocked, ev.machine) };
+        case "downgrade":
+          return { ...prev, downgrade: { ...prev.downgrade, [ev.machine]: true } };
+      }
+    });
+    if (ev.kind === "active") {
+      // 首连 pin 落库 / 重试恢复 → 刷新设备管理指纹区快照
+      setE2ePins(loadPins());
+    }
+  };
+
   // 凭证变化（登录/退出/认证失败）→ 重建 WS 连接；session 签发不重建（见 Cred）
   useEffect(() => {
     if (!auth) {
@@ -208,6 +284,8 @@ export default function App() {
         const s = stateRef.current;
         return s.machinesKnown ? s.currentMachine : undefined;
       },
+      // v1.4：e2e 握手事件上抛（TOFU 弹层 / 身份告警 / fail-closed 横幅）
+      onE2e: onE2eEvent,
     });
     wsRef.current = mgr;
     mgr.connect();
@@ -440,6 +518,40 @@ export default function App() {
 
   const conv = space.convs[currentConv] ?? EMPTY_CONV;
 
+  // v1.4 横幅派生：只展示仍在线机器的告警/阻断（掉线机器的横幅无意义）；
+  // 单机模式（machinesKnown=false）恒无 e2e 态。
+  const onlineMachines = state.machinesKnown ? state.machines : [];
+  const e2eAlertBanners = Object.entries(e2eUi.alerts).filter(([m]) =>
+    onlineMachines.includes(m),
+  );
+  const e2eDowngradeBanners = Object.keys(e2eUi.downgrade).filter((m) =>
+    onlineMachines.includes(m),
+  );
+  const e2eBlockedBanners = Object.entries(e2eUi.blocked).filter(
+    ([m]) => onlineMachines.includes(m) && !e2eUi.alerts[m],
+  );
+  /** 当前机器发送被阻（confirming 待确认 / fail-closed 未放行 / 身份告警）。 */
+  const e2eBlocked =
+    state.machinesKnown &&
+    (e2eUi.alerts[state.currentMachine] !== undefined ||
+      e2eUi.blocked[state.currentMachine] === true ||
+      e2eUi.tofu.some((t) => t.machine === state.currentMachine));
+  /** 当前机器加密会话已激活（StatusBar 锁标）。 */
+  const e2eSecure = state.machinesKnown && e2eUi.active[state.currentMachine] === true;
+
+  /** v1.4 重置机器 pin：清信任记录 → 重试握手（重新走 TOFU 确认）。 */
+  const resetPin = (machine: string) => {
+    removePin(machine);
+    setE2ePins(loadPins());
+    setE2eUi((prev) => ({
+      ...prev,
+      alerts: omitKey(prev.alerts, machine),
+      blocked: omitKey(prev.blocked, machine),
+      active: omitKey(prev.active, machine),
+    }));
+    wsRef.current?.retryE2e(machine);
+  };
+
   /** 侧栏点选会话：仅切本地当前 conv + 清未读（reducer），移动端同时收抽屉。 */
   const selectConv = (c: string) => {
     dispatch({ type: "select_conv", convId: c });
@@ -503,10 +615,64 @@ export default function App() {
           }
           machineName={state.machinesKnown ? state.currentMachine : undefined}
           currentConv={currentConv}
+          secure={e2eSecure}
           onLogout={logout}
           onReconnect={reconnect}
           onOpenDrawer={() => setDrawerOpen(true)}
         />
+        {/* v1.4 e2e 横幅区：身份变化（红，持久不自动消退）/ 降级告警（黄，
+            收到未加密业务帧——链路可能被降级，帧已丢弃）/ 不支持加密（琥珀
+            + 显式明文按钮——fail-closed：绝不自动明文降级） */}
+        {e2eAlertBanners.length > 0 && (
+          <div
+            role="alert"
+            className="space-y-1 border-b border-rose-500/40 bg-rose-50 px-3 py-2 text-xs leading-relaxed text-rose-800 dark:border-rose-500/30 dark:bg-rose-950/80 dark:text-rose-200"
+          >
+            {e2eAlertBanners.map(([m]) => (
+              <p key={m}>
+                机器 <span className="font-semibold">{m}</span>{" "}
+                身份变化：加密指纹与已信任记录不一致，可能被中间人。已断开与该机器的加密连接并发送；请与终端{" "}
+                <code className="rounded bg-rose-100/70 px-1 dark:bg-rose-900/50">imagent start</code>{" "}
+                日志核对指纹，确认无误后在「已登录设备」中重置该机器指纹。
+              </p>
+            ))}
+          </div>
+        )}
+        {e2eDowngradeBanners.length > 0 && (
+          <div
+            role="alert"
+            className="space-y-1 border-b border-amber-500/50 bg-amber-100 px-3 py-2 text-xs leading-relaxed text-amber-900 dark:border-amber-400/30 dark:bg-amber-900/60 dark:text-amber-100"
+          >
+            {e2eDowngradeBanners.map((m) => (
+              <p key={m}>
+                机器 <span className="font-semibold">{m}</span>{" "}
+                收到未加密业务帧，链路可能被降级（帧已丢弃）。
+              </p>
+            ))}
+          </div>
+        )}
+        {e2eBlockedBanners.length > 0 && (
+          <div
+            role="status"
+            className="space-y-1 border-b border-amber-400/40 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-800 dark:border-amber-500/30 dark:bg-amber-950/70 dark:text-amber-200"
+          >
+            {e2eBlockedBanners.map(([m]) => (
+              <div key={m} className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                <span>
+                  机器 <span className="font-semibold">{m}</span>{" "}
+                  不支持加密连接（旧网关）或指纹未确认，发送已停用。
+                </span>
+                <button
+                  type="button"
+                  onClick={() => wsRef.current?.allowPlaintextE2e(m)}
+                  className="press shrink-0 rounded-lg border border-amber-500/60 bg-amber-500/10 px-2 py-0.5 text-xs text-amber-900 transition-colors hover:bg-amber-500/20 dark:border-amber-400/40 dark:text-amber-100"
+                >
+                  仍以明文连接
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
         <main className="relative min-h-0 flex-1">
           <ApprovalPanel
             pending={allPending}
@@ -520,6 +686,7 @@ export default function App() {
         </main>
         <Composer
           status={status}
+          e2eBlocked={e2eBlocked}
           onSend={sendMessage}
           onStop={() => {
             wsRef.current?.sendControl("stop", undefined, outMachine());
@@ -527,11 +694,24 @@ export default function App() {
         />
       </div>
 
+      {/* v1.4 E2E：TOFU 首连指纹确认弹层（队列逐台弹） */}
+      {e2eUi.tofu.length > 0 && (
+        <E2eConfirm
+          machine={e2eUi.tofu[0].machine}
+          gkFp={e2eUi.tofu[0].gkFp}
+          idFp={e2eUi.tofu[0].idFp}
+          onResolve={(accept) => {
+            wsRef.current?.resolveTofu(e2eUi.tofu[0].machine, accept);
+          }}
+        />
+      )}
+
       {/* v1.2 + v1.3 设备管理弹层（组件自管进出过渡；状态经 devices/creds 帧） */}
       <DeviceManager
         open={devicesOpen}
         devices={state.devices}
         passkeys={state.passkeys}
+        pins={e2ePins}
         webauthnAvailable={waSupported}
         passkeyBusy={passkeyBusy}
         passkeyMessage={passkeyMessage}
@@ -539,6 +719,7 @@ export default function App() {
         onRevoke={revokeDevice}
         onAddPasskey={addPasskey}
         onRevokePasskey={revokePasskey}
+        onResetPin={resetPin}
         onClose={() => setDevicesOpen(false)}
       />
 

@@ -87,6 +87,12 @@ openssl = { version = "0.10", features = ["vendored"] }
 # 签名（私钥 seed 落 ~/.imagent/web-gateway-key，0600）。纯 Rust 实现，无 C 依赖，
 # 不影响 relay 的 openssl vendored 链。
 ed25519-dalek = "2"
+# E2E 中继盲化（协议 v1.4，crates/web）：浏览器↔网关业务帧 XChaCha20-Poly1305，
+# 会话密钥 X25519 + HKDF-SHA256。x25519-dalek 的 StaticSecret（网关静态密钥）
+# 需 static_secrets feature；2.x 与 ed25519-dalek 2.x 共用 curve25519-dalek 4。
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.13"
 
 [package]
 name = "imagent"

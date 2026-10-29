@@ -19,6 +19,11 @@
 // - v1.3 passkey：HTTP 端点 `/webauthn/{register,login}/{begin,complete}`
 //   （lib/webauthn.ts，不走 WS）；凭证管理 `cred_list`/`cred_revoke` ↔
 //   `creds` 帧（transport 管理帧，同 devices 族）。
+// - v1.4 E2E 中继盲化：浏览器 ↔ 网关逐机器握手（e2e_hello/e2e_ack，X25519 +
+//   HKDF-SHA256 + 网关 ed25519 签名，密码学与状态机在 lib/e2e.ts）；握手完成
+//   的机器业务帧（message/approval_response/control/sync/ping）包成 enc 帧
+//   （XChaCha20-Poly1305，box 内含原帧 JSON，无需 sid）。relay 自产管理帧
+//   （hello_ack/machines/machine/devices/creds/error/pong）恒明文。
 
 export const PROTOCOL_VERSION = 1;
 
@@ -198,6 +203,32 @@ export type CredRevokeFrame = {
   credId: string;
 };
 
+// ---------------------------------------------------------------------------
+// v1.4 E2E 中继盲化（密码学构造与编码规约见 lib/e2e.ts 头注）
+// ---------------------------------------------------------------------------
+
+/** 握手第一步（浏览器 → 网关，经 relay 明文透传）：ek = 浏览器临时 X25519
+ *  公钥（32B hex），n1 = 浏览器随机数（32B hex）。sid = 会话 id
+ *  （hello_ack.session.id）：携带即定向加密形态（网关 enc{sid} 帧只投对应
+ *  连接）；缺席 = 广播兼容模式（多浏览器同 token 时最后握手者有效）。 */
+export type E2eHelloFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "e2e_hello";
+  machine: string;
+  ek: string;
+  n1: string;
+  sid?: string;
+};
+
+/** 加密业务帧（双向）：box = base64(nonce24 || XChaCha20-Poly1305(原帧 JSON))，
+ *  machine = 会话所属机器（解密方据此选会话密钥；无需 sid——浏览器单会话）。 */
+export type EncFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "enc";
+  machine: string;
+  box: string;
+};
+
 export type OutboundFrame =
   | HelloFrame
   | MessageFrame
@@ -208,7 +239,9 @@ export type OutboundFrame =
   | DeviceListFrame
   | DeviceRevokeFrame
   | CredListFrame
-  | CredRevokeFrame;
+  | CredRevokeFrame
+  | E2eHelloFrame
+  | EncFrame;
 
 /** 出站帧序列化（undefined 字段不序列化，与网关入站解析兼容）。 */
 export function encodeFrame(frame: OutboundFrame): string {
@@ -313,6 +346,24 @@ export type CredsFrame = {
   credentials: PasskeyInfo[];
 };
 
+/** v1.4 握手第二步（网关 → 浏览器，经 relay 明文透传）：gk = 网关 X25519
+ *  公钥（32B hex），n2 = 网关随机数（32B hex），sig = 网关 ed25519 对
+ *  bytes(ek)||bytes(gk)||bytes(n1)||bytes(n2) 的签名（64B hex），ik = 网关
+ *  ed25519 身份公钥（32B hex——首次连接（未 pin）无信任锚，必须随帧携带供
+ *  TOFU 确认；id/pk 为宽容别名，解析侧兼容）。 */
+export type E2eAckFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "e2e_ack";
+  machine: string;
+  gk: string;
+  n2: string;
+  sig: string;
+  ik?: string;
+  /** 宽容别名（跨实现字段命名差异）：ik/id/pk 任一存在即接受，e2e 层归一。 */
+  id?: string;
+  pk?: string;
+};
+
 export type InboundFrame =
   | HelloAckFrame
   | MachineFrame
@@ -324,7 +375,9 @@ export type InboundFrame =
   | ApprovalResolvedFrame
   | PongFrame
   | DevicesFrame
-  | CredsFrame;
+  | CredsFrame
+  | E2eAckFrame
+  | EncFrame;
 
 // ---------------------------------------------------------------------------
 // parseFrame：v/type 校验 + 每类帧关键字段存在性校验，非法返回 null（不抛）
@@ -385,6 +438,11 @@ const passkeyOk = (p: unknown): boolean => {
 
 const RESOLVED_DECISIONS: readonly string[] = ["allow", "deny", "always", "cancelled"];
 
+/** v1.4 e2e_ack 的网关身份公钥字段：ik（规范名）/ id / pk（宽容别名）任一
+ *  为字符串即可（首次连接必须携带，否则 TOFU 无从展示指纹）。 */
+const ackIdentityOk = (o: Record<string, unknown>): boolean =>
+  isStr(o, "ik") || isStr(o, "id") || isStr(o, "pk");
+
 /** 入站帧类型表：type → 关键字段校验（前向兼容靠“未知 type → null”由调用方忽略）。 */
 const INBOUND_CHECKS: Record<string, FieldCheck> = {
   machine: (o) => typeof o.online === "boolean",
@@ -406,6 +464,10 @@ const INBOUND_CHECKS: Record<string, FieldCheck> = {
   hello_ack: (o) => isStr(o, "role") && sessionOk(o),
   devices: (o) => Array.isArray(o.devices) && o.devices.every(deviceOk),
   creds: (o) => Array.isArray(o.credentials) && o.credentials.every(passkeyOk),
+  // v1.4：字段级形状校验（编码/长度/签名校验在 lib/e2e.ts 深层完成）
+  e2e_ack: (o) =>
+    isStr(o, "machine") && isStr(o, "gk") && isStr(o, "n2") && isStr(o, "sig") && ackIdentityOk(o),
+  enc: (o) => isStr(o, "machine") && isStr(o, "box"),
 };
 
 /** 解析一条入站文本帧：信封 v=1 + 已知 type + 关键字段齐备才放行，否则 null。 */
@@ -826,6 +888,11 @@ function reduceFrame(state: AppState, frame: InboundFrame): AppState {
     case "hello_ack":
     case "pong":
       return state; // 连接管理层（ws.ts）消费，不进消息流
+    case "e2e_ack":
+    case "enc":
+      // v1.4：ws 层 e2e 协调器消费（enc 解密后的内帧才二次分发进来）；
+      // reducer 收到即说明上游漏拦，静默忽略。
+      return state;
     case "machines":
       return reduceMachines(state, frame);
     case "devices":

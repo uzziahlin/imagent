@@ -15,17 +15,27 @@
 // 或 token+device（登录页首次登录）。hello_ack 携带 session 时经 onSession
 // 上抛（App 持久化并删除 USER_TOKEN），此后重连 hello 自动改用 session 形态；
 // hello_ack 无 session（旧 relay）→ 回退现行 token 直连模式（字节级一致）。
+// v1.4 E2E 中继盲化：ready 后收 machines 帧即为每台在线机器发起 e2e 握手
+// （E2eCoordinator，lib/e2e.ts）；出站业务帧（message/approval_response/
+// control/sync/ping）按目标机器选会话——active → 包成 enc 帧，握手窗口/
+// 显式明文机器 → 原帧明文，confirming/超时未放行/身份告警 → 拒发（fail-
+// closed）。入站 enc 帧解密后二次分发为原帧走既有 onFrame；active 机器的
+// 明文业务帧（注入面）丢弃。心跳 ping 同包装但永不阻断（保命线）。
 
 import {
+  DEFAULT_MACHINE,
   encodeFrame,
   normalizeExpiryMs,
   parseFrame,
   type ApprovalDecision,
+  type EncFrame,
+  type E2eAckFrame,
   type HelloAckFrame,
   type InboundFrame,
   type OutboundFrame,
   type SessionInfo,
 } from "./protocol";
+import { E2eCoordinator, type E2eEvent } from "./e2e";
 
 export type ConnStatus = "connecting" | "ready" | "reconnecting" | "superseded";
 
@@ -63,6 +73,9 @@ export interface WsManagerOptions {
   /** hello_ack 携带 session（新 relay 签发）：调用方持久化并删除 USER_TOKEN。
    *  旧 relay 不触发（无 session 字段）——保持 USER_TOKEN 直连模式。 */
   onSession?: (session: SessionInfo) => void;
+  /** v1.4 E2E 事件上抛（TOFU 确认请求 / 身份变化告警 / 不支持加密 / 明文
+   *  放行）。旧 relay 单机模式（无 machines 帧）恒不触发。 */
+  onE2e?: (ev: E2eEvent) => void;
   /** 注入 WebSocket 构造（单测用 fake）；缺省浏览器原生。 */
   wsFactory?: (url: string) => WebSocketLike;
   /** 当前出站机器（v1.1）：内部自动帧（ready 后首帧 sync / 心跳 ping）发送时
@@ -165,6 +178,7 @@ export class WsManager {
   private readonly onStatus: (status: ConnStatus) => void;
   private readonly onAuthFailed: (reason: AuthFailReason) => void;
   private readonly onSession: ((session: SessionInfo) => void) | undefined;
+  private readonly onE2e: ((ev: E2eEvent) => void) | undefined;
   private readonly wsFactory: (url: string) => WebSocketLike;
   private readonly getMachine: (() => string | undefined) | undefined;
   private readonly helloTimeoutMs: number;
@@ -176,6 +190,9 @@ export class WsManager {
   /** 当前会话凭证（构造注入或 hello_ack 签发）：一旦持有，重连 hello 即改用
    *  session 形态（USER_TOKEN 不再出现于任何后续帧）。 */
   private sessionToken: string | undefined;
+  /** v1.4：会话 id（hello_ack.session.id）——e2e_hello 携带以升级定向加密
+   *  形态（enc{sid} 只投本连接；旧 relay 无 session → 缺席走广播兼容）。 */
+  private sessionId: string | undefined;
 
   private socket: WebSocketLike | null = null;
   private status: ConnStatus = "connecting";
@@ -187,6 +204,8 @@ export class WsManager {
   private lastFrameAt = 0;
   private stopped = false; // 手动 close / 认证失败：不再重连
   private disconnectHandled = false; // 单次连接的 close 事件只处理一回
+  /** v1.4 逐机器 e2e 状态机（会话临时密钥绑定当前连接，reset 随连接销毁）。 */
+  private readonly e2e: E2eCoordinator;
 
   constructor(opts: WsManagerOptions) {
     this.url = opts.url;
@@ -197,6 +216,7 @@ export class WsManager {
     this.onStatus = opts.onStatus;
     this.onAuthFailed = opts.onAuthFailed;
     this.onSession = opts.onSession;
+    this.onE2e = opts.onE2e;
     this.wsFactory = opts.wsFactory ?? ((u) => new WebSocket(u) as unknown as WebSocketLike);
     this.getMachine = opts.getMachine;
     this.helloTimeoutMs = opts.helloTimeoutMs ?? 10_000;
@@ -204,6 +224,13 @@ export class WsManager {
     this.deadLinkMs = opts.deadLinkMs ?? 60_000;
     this.minBackoffMs = opts.minBackoffMs ?? 1_000;
     this.maxBackoffMs = opts.maxBackoffMs ?? 30_000;
+    this.e2e = new E2eCoordinator(
+      {
+        sendHello: (hello) => this.rawSend(encodeFrame(hello)),
+        emit: (ev) => this.onE2e?.(ev),
+      },
+      { getSid: () => this.sessionId },
+    );
   }
 
   /** 建立连接（幂等：重复调用无效果）。superseded 终态后可再次调用——
@@ -274,12 +301,44 @@ export class WsManager {
     return this.send({ v: 1, type: "cred_revoke", credId });
   }
 
+  // ---- v1.4 E2E（TOFU 决断 / 明文放行 / pin 重置后重试）----
+
+  /** TOFU 弹层决断：accept = 信任并 pin + 启用加密；false = 拒绝（转
+   *  unsupported，可再显式选择明文）。 */
+  resolveTofu(machine: string, accept: boolean): void {
+    this.e2e.resolveTofu(machine, accept);
+  }
+
+  /** 「仍以明文连接」显式选择：放行该机器发送（明文）并持久记录。 */
+  allowPlaintextE2e(machine: string): void {
+    this.e2e.allowPlaintext(machine);
+  }
+
+  /** 设备管理重置 pin 后重试握手（重新 TOFU 确认）。 */
+  retryE2e(machine: string): void {
+    this.e2e.retry(machine);
+  }
+
   private send(frame: OutboundFrame): boolean {
     if (!this.ready || !this.socket) {
       return false;
     }
-    this.rawSend(encodeFrame(frame));
+    // v1.4：业务帧按目标机器选会话（active → enc；fail-closed 态拒发）
+    const wire = this.e2e.outbound(this.targetMachineOf(frame), frame);
+    if (wire === null) {
+      return false;
+    }
+    this.rawSend(wire);
     return true;
+  }
+
+  /** 出站帧归属机器：显式 machine 字段优先，业务帧缺省时注入当前机器
+   *  （undefined = 单机模式，e2e 层恒明文直发）。 */
+  private targetMachineOf(frame: OutboundFrame): string | undefined {
+    if ("machine" in frame && typeof frame.machine === "string") {
+      return frame.machine;
+    }
+    return this.machineOf();
   }
 
   private rawSend(data: string): void {
@@ -340,6 +399,35 @@ export class WsManager {
       this.onHelloAck(frame);
       return;
     }
+    // v1.4：握手应答由 e2e 协调器消费（不进 onFrame）
+    if (frame.type === "e2e_ack") {
+      this.e2e.onAck(frame as E2eAckFrame);
+      return;
+    }
+    // v1.4：enc 帧 → 解密后二次分发为原帧，走既有处理路径
+    if (frame.type === "enc") {
+      const inner = this.e2e.openEnc(frame as EncFrame);
+      if (inner) {
+        this.onFrame(inner);
+      }
+      return;
+    }
+    // v1.4：machines 快照驱动逐机器握手；加密会话已立（active/alert）的机器
+    // 发来明文业务帧 = 注入面 → 丢弃 + 降级告警（active 时；该降级的唯一
+    // 可观测点）。缺省 machine 归 DEFAULT_MACHINE。
+    if (frame.type === "machines") {
+      this.e2e.onMachines(frame.online);
+    } else if (
+      (frame.type === "text" ||
+        frame.type === "card" ||
+        frame.type === "card_patch" ||
+        frame.type === "approval_request" ||
+        frame.type === "approval_resolved") &&
+      !this.e2e.acceptPlaintextBusiness(frame.machine ?? DEFAULT_MACHINE)
+    ) {
+      this.e2e.notePlaintextDowngrade(frame.machine ?? DEFAULT_MACHINE);
+      return;
+    }
     this.onFrame(frame);
   };
 
@@ -350,6 +438,7 @@ export class WsManager {
     // 保持 token 直连模式（字节级回退现行行为）。
     if (frame.session) {
       this.sessionToken = frame.session.token;
+      this.sessionId = frame.session.id;
       this.onSession?.(frame.session);
     }
     this.ready = true;
@@ -378,12 +467,21 @@ export class WsManager {
         this.scheduleReconnect();
         return;
       }
-      this.rawSend(encodeFrame({ v: 1, type: "ping", machine: this.machineOf() }));
+      // v1.4：当前机器 e2e active → ping 亦密文（其余恒明文，保命线不阻断）
+      this.rawSend(
+        this.e2e.heartbeat(
+          { v: 1, type: "ping", machine: this.machineOf() },
+          this.machineOf(),
+        ),
+      );
     }, this.pingIntervalMs);
   }
 
   private handleClose = (ev: WsEvent): void => {
     this.stopTimers();
+    // v1.4：连接已断——e2e 会话密钥绑定本连接，立即作废（对端 close 事件
+    // 不经 teardownSocket 路径，须在此显式清；重连后 machines 帧重新握手）
+    this.e2e.reset();
     if (this.disconnectHandled) {
       return;
     }
@@ -428,9 +526,11 @@ export class WsManager {
     }, delay);
   }
 
-  /** 摘监听并关 socket（不发 close 事件，重连由调用方决定）。 */
+  /** 摘监听并关 socket（不发 close 事件，重连由调用方决定）。v1.4：同步
+   *  清空 e2e 会话（临时密钥绑定本连接；重连后 machines 帧重新握手）。 */
   private teardownSocket(): void {
     this.stopTimers();
+    this.e2e.reset();
     const sock = this.socket;
     this.socket = null;
     if (!sock) {

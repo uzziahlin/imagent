@@ -1,4 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ed25519, x25519 } from "@noble/curves/ed25519.js";
+import { hkdf } from "@noble/hashes/hkdf.js";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex, hexToBytes, randomBytes, utf8ToBytes } from "@noble/hashes/utils.js";
 import {
   authFailReason,
   clearSession,
@@ -9,6 +13,7 @@ import {
   type WsEvent,
   type WebSocketLike,
 } from "./ws";
+import { openBox, sealFrame, signatureMessage, type E2eEvent } from "./e2e";
 import type { InboundFrame, SessionInfo } from "./protocol";
 
 /** 可控 fake WebSocket：手动 emit 事件、记录出站帧。 */
@@ -101,7 +106,7 @@ function makeManager(token = "tok-1", getMachine?: () => string | undefined): Ha
 }
 
 /** open → hello → hello_ack → ready 的标准就绪流。 */
-function readyFlow(h: Harness): FakeWebSocket {
+function readyFlow(h: Pick<Harness, "mgr" | "statuses">): FakeWebSocket {
   const sock = lastSock();
   sock.emit("open");
   sock.serverSend(HELLO_ACK);
@@ -624,5 +629,275 @@ describe("会话凭证存储（v1.2）", () => {
     saveSession({ token: "st", expiresAt: Date.now() + 86_400_000 });
     clearSession();
     expect(localStorage.getItem("imagent.session")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.4 E2E：machines 帧驱动逐机器握手 / 业务帧 enc 包装 / 入站解密二次分发 /
+// fail-closed（超时禁发 + 显式明文）/ 身份告警 / 断线重连清会话
+// ---------------------------------------------------------------------------
+
+describe("WsManager E2E（v1.4）", () => {
+  /** 测试网关：长期 X25519 + ed25519 身份密钥（与 e2e.test 同构）。 */
+  function makeGateway() {
+    const gkPriv = x25519.utils.randomSecretKey();
+    const gk = bytesToHex(x25519.getPublicKey(gkPriv));
+    const idPriv = ed25519.utils.randomSecretKey();
+    const ik = bytesToHex(ed25519.getPublicKey(idPriv));
+    return {
+      gk,
+      ik,
+      ackFor: (hello: { ek: string; n1: string }, machine: string, opts?: { gk?: string; ik?: string }) => {
+        const gkUsed = opts?.gk ?? gk;
+        const n2 = bytesToHex(randomBytes(32));
+        const sig = bytesToHex(
+          ed25519.sign(signatureMessage(hello.ek, gkUsed, hello.n1, n2), idPriv),
+        );
+        return { v: 1, type: "e2e_ack", machine, gk: gkUsed, n2, sig, ik: opts?.ik ?? ik };
+      },
+      gatewayKey: (hello: { ek: string; n1: string }, n2: string) => {
+        const shared = x25519.getSharedSecret(gkPriv, hexToBytes(hello.ek));
+        const ikm = new Uint8Array(96);
+        ikm.set(shared, 0);
+        ikm.set(hexToBytes(hello.n1), 32);
+        ikm.set(hexToBytes(n2), 64);
+        return hkdf(sha256, ikm, undefined, utf8ToBytes("imagent-e2e-v1"), 32);
+      },
+    };
+  }
+
+  interface E2eHarness {
+    mgr: WsManager;
+    frames: InboundFrame[];
+    events: E2eEvent[];
+    statuses: string[];
+  }
+
+  function makeE2eManager(machine: string): E2eHarness {
+    const frames: InboundFrame[] = [];
+    const events: E2eEvent[] = [];
+    const statuses: string[] = [];
+    const mgr = new WsManager({
+      url: "wss://example.test/imagent/ws",
+      token: "tok-1",
+      onFrame: (f) => frames.push(f),
+      onStatus: (s) => statuses.push(s),
+      onAuthFailed: () => {},
+      onE2e: (e) => events.push(e),
+      wsFactory: (u) => new FakeWebSocket(u),
+      getMachine: () => machine,
+    });
+    return { mgr, frames, events, statuses };
+  }
+
+  /** ready 后推 machines 快照（触发 e2e 握手）。 */
+  function pushMachines(sock: FakeWebSocket, online: string[]): void {
+    sock.serverSend(JSON.stringify({ v: 1, type: "machines", online }));
+  }
+
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it("machines 帧触发逐机器 e2e_hello；TOFU 确认后出站 enc 包装、入站 enc 解密二次分发", () => {
+    const gw = makeGateway();
+    const h = makeE2eManager("home-mac");
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    pushMachines(sock, ["home-mac"]);
+    expect(sock.sentOfType("e2e_hello")).toHaveLength(1);
+    const hello = JSON.parse(sock.sentOfType("e2e_hello")[0]) as { ek: string; n1: string };
+
+    // ack → TOFU 事件；确认 → active
+    const ack = gw.ackFor(hello, "home-mac");
+    sock.serverSend(JSON.stringify(ack));
+    expect(h.events).toContainEqual({
+      kind: "tofu",
+      machine: "home-mac",
+      gkFp: expect.any(String),
+      idFp: expect.any(String),
+    });
+    // confirming 态：待用户决断，发送被阻
+    expect(h.mgr.sendMessage("web:default", "提前发", "home-mac")).toBe(false);
+    h.mgr.resolveTofu("home-mac", true);
+    expect(h.events).toContainEqual({ kind: "active", machine: "home-mac" });
+
+    // 出站：enc 包装，网关密钥可解回原帧
+    expect(h.mgr.sendMessage("web:default", "机密", "home-mac")).toBe(true);
+    const encSent = sock.sentOfType("enc");
+    expect(encSent).toHaveLength(1);
+    const enc = JSON.parse(encSent[0]) as { machine: string; box: string };
+    expect(enc.machine).toBe("home-mac");
+    const gwKey = gw.gatewayKey(hello, ack.n2);
+    expect(openBox(gwKey, enc.box)).toBe(
+      JSON.stringify({ v: 1, type: "message", convId: "web:default", text: "机密", machine: "home-mac" }),
+    );
+
+    // 入站：网关加密的业务帧 → 解密后二次分发为原帧
+    sock.serverSend(
+      JSON.stringify(
+        sealFrame("home-mac", gwKey, {
+          v: 1,
+          type: "text",
+          convId: "web:default",
+          text: "加密回复",
+          machine: "home-mac",
+        }),
+      ),
+    );
+    expect(h.frames).toContainEqual(
+      expect.objectContaining({ type: "text", text: "加密回复", machine: "home-mac" }),
+    );
+  });
+
+  it("旧网关 10s 无 ack → unsupported（发送禁用，明文入站照收）；仍以明文连接 → 放行并持久", () => {
+    const h = makeE2eManager("home-mac");
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    pushMachines(sock, ["home-mac"]);
+    // 窗口期内明文发送照发（v1.1 行为）
+    expect(h.mgr.sendMessage("web:default", "窗口期", "home-mac")).toBe(true);
+    expect(JSON.parse(sock.sent.at(-1) ?? "{}")).toMatchObject({ type: "message", text: "窗口期" });
+
+    vi.advanceTimersByTime(10_000);
+    expect(h.events).toContainEqual({ kind: "unsupported", machine: "home-mac", reason: "timeout" });
+    // fail-closed：不自动明文降级，发送禁用
+    expect(h.mgr.sendMessage("web:default", "x", "home-mac")).toBe(false);
+    // 旧网关的明文业务帧照收（不支持加密 ≠ 拒收）
+    sock.serverSend('{"v":1,"type":"text","convId":"web:default","text":"旧网关回复","machine":"home-mac"}');
+    expect(h.frames).toContainEqual(expect.objectContaining({ text: "旧网关回复" }));
+
+    // 显式按钮放行：明文发送 + 选择持久
+    h.mgr.allowPlaintextE2e("home-mac");
+    expect(h.mgr.sendMessage("web:default", "明文重试", "home-mac")).toBe(true);
+    expect(JSON.parse(sock.sent.at(-1) ?? "{}")).toMatchObject({ type: "message", text: "明文重试" });
+    expect(JSON.parse(localStorage.getItem("imagent.e2ePlaintext") ?? "{}")).toEqual({
+      "home-mac": true,
+    });
+  });
+
+  it("active 机器的明文业务帧丢弃（注入面）；无会话机器的 enc 帧丢弃", () => {
+    const gw = makeGateway();
+    const h = makeE2eManager("home-mac");
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    pushMachines(sock, ["home-mac"]);
+    const hello = JSON.parse(sock.sentOfType("e2e_hello")[0]);
+    const ack = gw.ackFor(hello, "home-mac");
+    sock.serverSend(JSON.stringify(ack));
+    h.mgr.resolveTofu("home-mac", true);
+
+    // 加密会话已立后，同机器的明文业务帧不进消息流，且触发降级告警（一次）
+    sock.serverSend('{"v":1,"type":"text","convId":"web:default","text":"注入","machine":"home-mac"}');
+    expect(h.frames.filter((f) => f.type === "text")).toHaveLength(0);
+    expect(h.events).toContainEqual({ kind: "downgrade", machine: "home-mac" });
+    sock.serverSend('{"v":1,"type":"text","convId":"web:default","text":"再来","machine":"home-mac"}');
+    expect(h.events.filter((e) => e.kind === "downgrade")).toHaveLength(1); // 每连接每机器一次
+    // 无会话机器（work-mac 从未握手）的 enc 帧丢弃（machines 管理帧照常转发）
+    sock.serverSend(
+      JSON.stringify(sealFrame("work-mac", randomBytes(32), { v: 1, type: "ping" })),
+    );
+    expect(h.frames.filter((f) => f.type !== "machines")).toHaveLength(0);
+    // 管理帧照常放行
+    sock.serverSend('{"v":1,"type":"pong"}');
+    expect(h.frames).toContainEqual({ v: 1, type: "pong" });
+  });
+
+  it("身份变化（已 pin 公钥改变）→ alert：发送阻断、事件上抛", () => {
+    const pinned = makeGateway();
+    // 预置 pin（上次会话 TOFU 确认过）
+    localStorage.setItem(
+      "imagent.e2ePins",
+      JSON.stringify({ "home-mac": { ik: pinned.ik, gk: pinned.gk, pinnedAt: 1 } }),
+    );
+    const mitm = makeGateway();
+    const h = makeE2eManager("home-mac");
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    pushMachines(sock, ["home-mac"]);
+    const hello = JSON.parse(sock.sentOfType("e2e_hello")[0]);
+    // 中间人用自己密钥应答、冒充 pin 的身份公钥
+    sock.serverSend(JSON.stringify(mitm.ackFor(hello, "home-mac", { ik: pinned.ik })));
+    expect(h.events).toContainEqual({ kind: "alert", machine: "home-mac", reason: "identity_changed" });
+    expect(h.mgr.sendMessage("web:default", "x", "home-mac")).toBe(false);
+  });
+
+  it("断线重连清空 e2e 会话：machines 帧再次驱动新握手", () => {
+    const gw = makeGateway();
+    const h = makeE2eManager("home-mac");
+    h.mgr.connect();
+    const s1 = readyFlow(h);
+    pushMachines(s1, ["home-mac"]);
+    const hello1 = JSON.parse(s1.sentOfType("e2e_hello")[0]);
+    s1.serverSend(JSON.stringify(gw.ackFor(hello1, "home-mac")));
+    h.mgr.resolveTofu("home-mac", true);
+    // 加密发送可用
+    expect(h.mgr.sendMessage("web:default", "s", "home-mac")).toBe(true);
+    expect(s1.sentOfType("enc")).toHaveLength(1);
+
+    s1.emit("close", { code: 1006 });
+    vi.advanceTimersByTime(1_000); // 退避重连
+    const s2 = lastSock();
+    s2.emit("open");
+    expect(s2.sent[0]).toContain('"hello"');
+    s2.serverSend(HELLO_ACK);
+    // 重连后尚未握手：出站回明文（会话已随连接销毁）
+    expect(h.mgr.sendMessage("web:default", "x", "home-mac")).toBe(true);
+    expect(JSON.parse(s2.sent.at(-1) ?? "{}").type).toBe("message");
+    // machines 帧再次到达 → 新 e2e_hello（第二次握手）
+    pushMachines(s2, ["home-mac"]);
+    expect(s2.sentOfType("e2e_hello")).toHaveLength(1);
+  });
+
+  it("心跳 ping：active 后 25s ping 亦为 enc 帧", () => {
+    const gw = makeGateway();
+    const h = makeE2eManager("home-mac");
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    pushMachines(sock, ["home-mac"]);
+    const hello = JSON.parse(sock.sentOfType("e2e_hello")[0]);
+    const ack = gw.ackFor(hello, "home-mac");
+    sock.serverSend(JSON.stringify(ack));
+    h.mgr.resolveTofu("home-mac", true);
+    vi.advanceTimersByTime(25_000);
+    const ping = sock.sent.at(-1) ?? "{}";
+    expect(JSON.parse(ping).type).toBe("enc");
+    expect(openBox(gw.gatewayKey(hello, ack.n2), JSON.parse(ping).box)).toBe(
+      JSON.stringify({ v: 1, type: "ping", machine: "home-mac" }),
+    );
+  });
+
+  it("旧 relay 单机模式（无 machines 帧）：永不发起握手，出站恒明文", () => {
+    const h = makeE2eManager("home-mac");
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    vi.advanceTimersByTime(60_000);
+    expect(sock.sentOfType("e2e_hello")).toHaveLength(0);
+    expect(h.mgr.sendMessage("web:default", "x", "home-mac")).toBe(true);
+    expect(JSON.parse(sock.sent.at(-1) ?? "{}").type).toBe("message");
+    expect(h.events).toHaveLength(0);
+  });
+
+  it("e2e_hello 携带 sid（hello_ack.session.id）：定向加密形态", () => {
+    const gw = makeGateway();
+    const h = makeE2eManager("home-mac");
+    h.mgr.connect();
+    const sock = lastSock();
+    sock.emit("open");
+    // 会话签发 ack（session.id = sid-1）——e2e_hello 应携带该 sid
+    sock.serverSend(
+      JSON.stringify({
+        v: 1,
+        type: "hello_ack",
+        role: "browser",
+        session: { id: "sid-1", token: "st-1", expiresAt: 1_900_000_000_000 },
+      }),
+    );
+    pushMachines(sock, ["home-mac"]);
+    const hello = JSON.parse(sock.sentOfType("e2e_hello")[0]);
+    expect(hello.sid).toBe("sid-1");
+    // 定向形态下握手照常完成
+    sock.serverSend(JSON.stringify(gw.ackFor(hello, "home-mac")));
+    expect(h.events).toContainEqual({ kind: "tofu", machine: "home-mac", gkFp: expect.any(String), idFp: expect.any(String) });
   });
 });

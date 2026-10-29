@@ -8,7 +8,7 @@ import type { ConnStatus } from "../lib/ws";
 const MAX_TEXTAREA_HEIGHT = 164;
 
 /** 占位文案按连接态分流：ready 可用；connecting 过渡态；reconnecting/superseded
- *  明确告知断线（superseded 引导点上方「重新连接」）。 */
+ *  明确告知断线（superseded 引导点上方「重新连接」）；e2eBlocked 引导看横幅。 */
 const PLACEHOLDER: Record<ConnStatus, string> = {
   ready: "发消息给 Mac…（Enter 发送）",
   connecting: "连接中…（恢复后可发送）",
@@ -16,23 +16,30 @@ const PLACEHOLDER: Record<ConnStatus, string> = {
   superseded: "已在其它窗口连接，重新连接后可发送",
 };
 
+const E2E_BLOCKED_PLACEHOLDER = "加密连接未确认，暂不能发送（见上方提示）";
+
 /**
  * composer：多行输入，Enter 发送 / Shift+Enter 换行（中文输入法组词中的
  * Enter 不发送）；「停止」发 control stop。发送即本地回显（上层 send_echo）。
  * 输入区高度随内容自适应（1-6 行，超出滚动）；底部安全区 padding（刘海屏
  * home bar 场景，移动端优先）。
  * 断线置灰：非 ready 全量禁用（输入/发送/停止）+ 状态化占位文案 + 灰底。
+ * v1.4 e2eBlocked：当前机器处于 fail-closed 态（未确认指纹/不支持加密且
+ * 未放行/身份告警）→ 同样全量禁用，占位引导看上方横幅。
  */
 export function Composer({
   status,
+  e2eBlocked,
   onSend,
   onStop,
 }: {
   status: ConnStatus;
+  /** v1.4：当前机器 e2e 发送被阻（状态化占位 + 全量禁用）。 */
+  e2eBlocked?: boolean;
   onSend: (text: string) => boolean;
   onStop: () => void;
 }) {
-  const disabled = status !== "ready";
+  const disabled = status !== "ready" || e2eBlocked === true;
   const [text, setText] = useState("");
   const taRef = useRef<HTMLTextAreaElement>(null);
 
@@ -75,7 +82,7 @@ export function Composer({
           onChange={(e) => setText(e.target.value)}
           onKeyDown={onKeyDown}
           rows={1}
-          placeholder={PLACEHOLDER[status]}
+          placeholder={e2eBlocked ? E2E_BLOCKED_PLACEHOLDER : PLACEHOLDER[status]}
           disabled={disabled}
           aria-label="消息输入框"
           className="max-h-[164px] min-h-[2.75rem] flex-1 resize-none overflow-y-auto rounded-xl border border-line-strong bg-surface px-3 py-2.5 text-base leading-6 text-ink outline-none transition-colors placeholder:text-ghost focus:border-emerald-500 disabled:cursor-not-allowed disabled:border-line disabled:bg-panel2 disabled:opacity-60"

@@ -867,3 +867,64 @@ describe("encodeFrame", () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// v1.4 E2E 帧：e2e_hello / e2e_ack / enc 的解析与序列化
+// ---------------------------------------------------------------------------
+
+describe("v1.4 E2E 帧", () => {
+  it("e2e_hello 出站序列化字节精确", () => {
+    expect(
+      encodeFrame({
+        v: 1,
+        type: "e2e_hello",
+        machine: "home-mac",
+        ek: "ab".repeat(32),
+        n1: "cd".repeat(32),
+      }),
+    ).toBe(
+      `{"v":1,"type":"e2e_hello","machine":"home-mac","ek":"${"ab".repeat(32)}","n1":"${"cd".repeat(32)}"}`,
+    );
+  });
+
+  it("e2e_ack 解析：全字段齐备通过；身份公钥 ik/id/pk 别名均可", () => {
+    const base = (idField: string) =>
+      `{"v":1,"type":"e2e_ack","machine":"m","gk":"${"11".repeat(32)}","n2":"${"22".repeat(
+        32,
+      )}","sig":"${"33".repeat(64)}","${idField}":"${"44".repeat(32)}"}`;
+    for (const f of ["ik", "id", "pk"]) {
+      const parsed = parseFrame(base(f));
+      expect(parsed?.type).toBe("e2e_ack");
+      const rec = parsed as Record<string, unknown>;
+      expect(rec[f]).toBe("44".repeat(32));
+    }
+  });
+
+  it("e2e_ack 关键字段缺失 / 非法 → null", () => {
+    expect(parseFrame('{"v":1,"type":"e2e_ack","machine":"m","gk":"11","n2":"22","sig":"33"}')).toBeNull(); // 无身份公钥
+    expect(parseFrame('{"v":1,"type":"e2e_ack","machine":"m","n2":"22","sig":"33","ik":"44"}')).toBeNull(); // 缺 gk
+    expect(parseFrame('{"v":1,"type":"e2e_ack","machine":1,"gk":"11","n2":"22","sig":"33","ik":"44"}')).toBeNull(); // machine 非串
+  });
+
+  it("enc 帧解析：machine + box 串即可；缺失 → null", () => {
+    expect(parseFrame('{"v":1,"type":"enc","machine":"m","box":"QUJD"}')?.type).toBe("enc");
+    expect(parseFrame('{"v":1,"type":"enc","machine":"m"}')).toBeNull();
+    expect(parseFrame('{"v":1,"type":"enc","box":"QUJD"}')).toBeNull();
+  });
+
+  it("enc 出站序列化（sealFrame 产物直发形态）", () => {
+    expect(encodeFrame({ v: 1, type: "enc", machine: "m", box: "QUJD" })).toBe(
+      '{"v":1,"type":"enc","machine":"m","box":"QUJD"}',
+    );
+  });
+
+  it("reducer 对 e2e_ack/enc 静默忽略（ws 层消费，不进消息流）", () => {
+    const s0 = initialState();
+    const s1 = run(
+      s0,
+      { type: "frame", frame: frame('{"v":1,"type":"e2e_ack","machine":"m","gk":"11","n2":"22","sig":"33","ik":"44"}') },
+      { type: "frame", frame: frame('{"v":1,"type":"enc","machine":"m","box":"QUJD"}') },
+    );
+    expect(s1).toBe(s0);
+  });
+});

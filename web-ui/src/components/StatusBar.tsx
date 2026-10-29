@@ -17,12 +17,15 @@ const STATUS_META: Record<ConnStatus, { label: string; dot: string }> = {
  * （App 侧换算后传入 machineOnline）；单机模式沿用旧网关 machine 帧
  * （machineName 缺省显示「Mac」）。移动端左上角 ☰ 打开会话抽屉（桌面端侧
  * 边栏常驻，按钮隐藏）。
+ * v1.4 secure：当前机器 e2e 会话已激活 → 锁形标记「已加密」；false/缺省
+ * 不显示（旧网关/未握手机器）。
  */
 export function StatusBar({
   status,
   machineOnline,
   machineName,
   currentConv,
+  secure,
   onLogout,
   onReconnect,
   onOpenDrawer,
@@ -32,6 +35,8 @@ export function StatusBar({
   /** 多机模式 = 当前机器 id；缺省（旧 relay 单机）显示「Mac」。 */
   machineName?: string;
   currentConv: string;
+  /** v1.4：当前机器业务帧走端到端加密（lock 标记）。 */
+  secure?: boolean;
   onLogout: () => void;
   /** superseded 态用户显式重连（新连接会顶替另一窗口，是用户意图）。 */
   onReconnect: () => void;
@@ -78,6 +83,19 @@ export function StatusBar({
         <span className={`max-w-[16vw] truncate ${machineOnline ? "text-muted" : "text-ghost"}`}>
           {machineName ?? "Mac"} {machineOnline ? "在线" : "离线"}
         </span>
+        {secure && (
+          <span
+            className="flex shrink-0 items-center gap-0.5 text-emerald-600 dark:text-emerald-300"
+            title="与该机器的业务帧已端到端加密，中继不可见"
+            aria-label="已加密"
+          >
+            <svg viewBox="0 0 20 20" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
+              <rect x="4.5" y="8.5" width="11" height="7.5" rx="2" />
+              <path d="M7 8.5V6.5a3 3 0 0 1 6 0v2" strokeLinecap="round" />
+            </svg>
+            已加密
+          </span>
+        )}
       </div>
       <div className="ml-auto flex shrink-0 items-center gap-2">
         <span className="max-w-[30vw] truncate rounded-full bg-panel2 px-2.5 py-0.5 font-mono text-xs text-muted">

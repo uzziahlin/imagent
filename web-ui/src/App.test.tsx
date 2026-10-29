@@ -8,7 +8,12 @@
 // reason 分流 / 设备管理 UI / 旧 relay 兼容回退的端到端覆盖。
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ed25519, x25519 } from "@noble/curves/ed25519.js";
+import { hkdf } from "@noble/hashes/hkdf.js";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex, hexToBytes, randomBytes, utf8ToBytes } from "@noble/hashes/utils.js";
 import App from "./App";
+import { fingerprint, openBox } from "./lib/e2e";
 import type { WsEvent } from "./lib/ws";
 
 /** 可控 fake WebSocket：手动 emit 事件、记录出站帧（形状对齐 ws.test.ts）。 */
@@ -697,5 +702,215 @@ describe("App passkey 登录（v1.3）", () => {
     expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "cred_revoke", credId: "cred-1" }));
     act(() => fake.recv({ v: 1, type: "creds", credentials: [] }));
     expect(screen.getByText(/尚未注册通行钥匙/)).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.4 E2E：TOFU 指纹确认弹层 / 身份变化红条 / 明文降级开关 / 设备管理指纹区
+// / 降级告警横幅（真实 @noble 密码学，FakeWebSocket 扮演 relay+网关）
+// ---------------------------------------------------------------------------
+
+describe("App E2E（v1.4）", () => {
+  /** 测试网关：长期 X25519 + ed25519 身份密钥（与 lib/e2e.test 同构）。 */
+  function makeGateway() {
+    const gkPriv = x25519.utils.randomSecretKey();
+    const gk = bytesToHex(x25519.getPublicKey(gkPriv));
+    const idPriv = ed25519.utils.randomSecretKey();
+    const ik = bytesToHex(ed25519.getPublicKey(idPriv));
+    const ackFor = (hello: { ek: string; n1: string }, machine: string, opts?: { ik?: string }) => {
+      const n2 = bytesToHex(randomBytes(32));
+      const msg = new Uint8Array(128);
+      msg.set(hexToBytes(hello.ek), 0);
+      msg.set(hexToBytes(gk), 32);
+      msg.set(hexToBytes(hello.n1), 64);
+      msg.set(hexToBytes(n2), 96);
+      return {
+        v: 1 as const,
+        type: "e2e_ack" as const,
+        machine,
+        gk,
+        n2,
+        sig: bytesToHex(ed25519.sign(msg, idPriv)),
+        ik: opts?.ik ?? ik,
+      };
+    };
+    const gatewayKey = (hello: { ek: string; n1: string }, n2: string) => {
+      const shared = x25519.getSharedSecret(gkPriv, hexToBytes(hello.ek));
+      const ikm = new Uint8Array(96);
+      ikm.set(shared, 0);
+      ikm.set(hexToBytes(hello.n1), 32);
+      ikm.set(hexToBytes(n2), 64);
+      return hkdf(sha256, ikm, undefined, utf8ToBytes("imagent-e2e-v1"), 32);
+    };
+    return { gk, ik, ackFor, gatewayKey };
+  }
+
+  /** 从 fake.sent 里取最近一条 e2e_hello（无则抛）。 */
+  function lastHello(fake: FakeWebSocket): { ek: string; n1: string } {
+    const raw = fake.sent.filter((s) => (JSON.parse(s) as { type: string }).type === "e2e_hello").at(-1);
+    if (!raw) {
+      throw new Error("尚未发出 e2e_hello");
+    }
+    return JSON.parse(raw);
+  }
+
+  /** machines 快照 → 网关 ack（返回 ack 供后续派生网关密钥）。 */
+  function ackHandshake(fake: FakeWebSocket, gw: ReturnType<typeof makeGateway>, machine: string) {
+    act(() => {
+      fake.recv({ v: 1, type: "machines", online: [machine] });
+    });
+    const hello = lastHello(fake);
+    const ack = gw.ackFor(hello, machine);
+    act(() => {
+      fake.recv(ack);
+    });
+    return { hello, ack };
+  }
+
+  it("TOFU 首连：指纹弹层（核对文案 + 分组指纹）→ 信任 → pin 落库 + 锁标 + 出站 enc", () => {
+    const gw = makeGateway();
+    const fake = mountApp();
+    act(() => {
+      fake.emit("open");
+      fake.recv({ v: 1, type: "hello_ack", role: "user" });
+    });
+    const { hello, ack } = ackHandshake(fake, gw, "home-mac");
+
+    // 指纹确认弹层：机器名、核对文案、两枚分组指纹
+    const dialog = screen.getByRole("dialog", { name: "确认机器加密指纹" });
+    expect(within(dialog).getByText("home-mac")).toBeTruthy();
+    expect(within(dialog).getByText(/imagent start/)).toBeTruthy();
+    expect(within(dialog).getByText(fingerprint(gw.gk))).toBeTruthy();
+    expect(within(dialog).getByText(fingerprint(gw.ik))).toBeTruthy();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "信任并启用加密" }));
+    // pin 落库 + StatusBar 锁标 + 弹层关闭
+    expect(JSON.parse(localStorage.getItem("imagent.e2ePins") ?? "{}")).toHaveProperty("home-mac");
+    expect(screen.getByText("已加密")).toBeTruthy();
+    expect(screen.queryByRole("dialog", { name: "确认机器加密指纹" })).toBeNull();
+
+    // 发送：出站为 enc 帧，网关密钥可解回原帧
+    fireEvent.change(screen.getByLabelText("消息输入框"), { target: { value: "机密指令" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    const encRaw = fake.sent.filter((s) => (JSON.parse(s) as { type: string }).type === "enc").at(-1);
+    expect(encRaw).toBeTruthy();
+    const enc = JSON.parse(encRaw!) as { machine: string; box: string };
+    expect(enc.machine).toBe("home-mac");
+    expect(openBox(gw.gatewayKey(hello, ack.n2), enc.box)).toBe(
+      JSON.stringify({ v: 1, type: "message", convId: "web:default", text: "机密指令", machine: "home-mac" }),
+    );
+  });
+
+  it("TOFU 拒绝 → fail-closed 横幅 + composer 禁用；「仍以明文连接」恢复明文发送", () => {
+    const gw = makeGateway();
+    const fake = mountApp();
+    act(() => {
+      fake.emit("open");
+      fake.recv({ v: 1, type: "hello_ack", role: "user" });
+    });
+    ackHandshake(fake, gw, "home-mac");
+    fireEvent.click(screen.getByRole("button", { name: "不信任" }));
+
+    // 不自动明文降级：横幅 + 发送禁用
+    expect(screen.getByText(/不支持加密连接/)).toBeTruthy();
+    const ta = screen.getByPlaceholderText("加密连接未确认，暂不能发送（见上方提示）") as HTMLTextAreaElement;
+    expect(ta.disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "发送" }) as HTMLButtonElement).disabled).toBe(true);
+
+    // 显式按钮：放行并恢复明文
+    fireEvent.click(screen.getByRole("button", { name: "仍以明文连接" }));
+    const restored = screen.getByLabelText("消息输入框") as HTMLTextAreaElement;
+    expect(restored.disabled).toBe(false);
+    fireEvent.change(restored, { target: { value: "明文" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    expect(fake.sent).toContain(
+      JSON.stringify({ v: 1, type: "message", convId: "web:default", text: "明文", machine: "home-mac" }),
+    );
+    // 选择被持久（下次连接不再握手）——检查 localStorage 记录
+    expect(JSON.parse(localStorage.getItem("imagent.e2ePlaintext") ?? "{}")).toEqual({ "home-mac": true });
+  });
+
+  it("身份变化：已 pin 公钥改变 → 红色告警 + 发送禁用", () => {
+    const pinned = makeGateway();
+    localStorage.setItem(
+      "imagent.e2ePins",
+      JSON.stringify({ "home-mac": { ik: pinned.ik, gk: pinned.gk, pinnedAt: 1 } }),
+    );
+    const mitm = makeGateway();
+    const fake = mountApp();
+    act(() => {
+      fake.emit("open");
+      fake.recv({ v: 1, type: "hello_ack", role: "user" });
+    });
+    // 中间人自有密钥应答、冒充 pin 的身份公钥
+    act(() => {
+      fake.recv({ v: 1, type: "machines", online: ["home-mac"] });
+    });
+    const hello = lastHello(fake);
+    act(() => {
+      fake.recv(mitm.ackFor(hello, "home-mac", { ik: pinned.ik }));
+    });
+    expect(screen.getAllByRole("alert").some((el) => el.textContent?.includes("身份变化"))).toBe(true);
+    const ta = screen.getByPlaceholderText("加密连接未确认，暂不能发送（见上方提示）") as HTMLTextAreaElement;
+    expect(ta.disabled).toBe(true);
+  });
+
+  it("设备管理指纹区：pin 列表（双指纹分组）+ 重置 → 清 pin 并重新握手", () => {
+    const gw = makeGateway();
+    // 会话模式（设备管理入口需要 session）
+    localStorage.setItem(
+      "imagent.session",
+      JSON.stringify({ id: "sid-r", token: "st-r", expiresAt: Date.now() + 20 * 86_400_000 }),
+    );
+    render(<App />);
+    const fake = FakeWebSocket.latest as FakeWebSocket;
+    act(() => {
+      fake.emit("open");
+      fake.recv({
+        v: 1,
+        type: "hello_ack",
+        role: "user",
+        session: { id: "sid-r", token: "st-r", expiresAt: Date.now() + 20 * 86_400_000 },
+      });
+    });
+    ackHandshake(fake, gw, "home-mac");
+    fireEvent.click(screen.getByRole("button", { name: "信任并启用加密" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "已登录设备" }));
+    const dialog = screen.getByRole("dialog", { name: "已登录设备" });
+    expect(within(dialog).getByText("已信任机器指纹")).toBeTruthy();
+    expect(within(dialog).getByText("home-mac")).toBeTruthy();
+    expect(within(dialog).getByText(`X25519 ${fingerprint(gw.gk)}`)).toBeTruthy();
+    expect(within(dialog).getByText(`Ed25519 ${fingerprint(gw.ik)}`)).toBeTruthy();
+
+    // 重置：清 pin + 重新发起握手（新 e2e_hello）
+    const hellosBefore = fake.sent.filter((s) => (JSON.parse(s) as { type: string }).type === "e2e_hello").length;
+    fireEvent.click(within(dialog).getByRole("button", { name: "重置" }));
+    expect(JSON.parse(localStorage.getItem("imagent.e2ePins") ?? "{}")).toEqual({});
+    const hellosAfter = fake.sent.filter((s) => (JSON.parse(s) as { type: string }).type === "e2e_hello").length;
+    expect(hellosAfter).toBe(hellosBefore + 1);
+    // 网关再 ack → 重新走 TOFU 弹层
+    const hello = lastHello(fake);
+    act(() => {
+      fake.recv(gw.ackFor(hello, "home-mac"));
+    });
+    expect(screen.getByRole("dialog", { name: "确认机器加密指纹" })).toBeTruthy();
+  });
+
+  it("降级告警：握手完成后收到明文业务帧 → 黄条告警且内容不落消息流", () => {
+    const gw = makeGateway();
+    const fake = mountApp();
+    act(() => {
+      fake.emit("open");
+      fake.recv({ v: 1, type: "hello_ack", role: "user" });
+    });
+    ackHandshake(fake, gw, "home-mac");
+    fireEvent.click(screen.getByRole("button", { name: "信任并启用加密" }));
+    // 网关方向明文 text 帧（半开会话超时回退场景）
+    act(() => {
+      fake.recv({ v: 1, type: "text", convId: "web:default", text: "降级内容", machine: "home-mac" });
+    });
+    expect(screen.getAllByRole("alert").some((el) => el.textContent?.includes("收到未加密业务帧"))).toBe(true);
+    expect(screen.queryByText("降级内容")).toBeNull(); // 帧已丢弃
   });
 });

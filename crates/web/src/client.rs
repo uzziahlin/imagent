@@ -24,7 +24,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ed25519_dalek::Signer;
 use futures::{SinkExt, StreamExt};
@@ -40,6 +40,7 @@ use tracing::{debug, info, warn};
 
 use imagent_core::{CoreError, InboundMessage, Result};
 
+use crate::e2e::{E2eIdentity, E2eSessions};
 use crate::{map_inbound_frame, GatewayCredential, InboundAction, TARGET};
 
 /// 建连后的 WS 流类型（connect_async 的产物）。
@@ -69,6 +70,10 @@ pub(crate) struct WebClient {
     /// 与日志用。relay 的 machine/machines 帧只推浏览器，网关侧标志由连接
     /// 生命周期自维护；分拣到 machine 时也顺带同步（防御性，正常收不到）。
     pub(crate) online: Arc<AtomicBool>,
+    /// E2E 身份（协议 v1.4）：静态 X25519 + v1.3 ed25519 签名密钥。None =
+    /// E2E 不可用（token 凭证无签名密钥 / 密钥文件损坏）——e2e_hello 忽略、
+    /// 出站恒明文（v1.3 行为，兼容旧链路）。
+    pub(crate) e2e: Option<E2eIdentity>,
     pub(crate) inbound_tx: mpsc::Sender<InboundMessage>,
     pub(crate) sync_tx: mpsc::Sender<()>,
 }
@@ -302,6 +307,11 @@ impl WebClient {
         self.online.store(true, Ordering::Relaxed);
         info!(target: TARGET, machine = %self.machine_id, "relay 已连接（hello_ack 确认身份），开始收发");
 
+        // E2E 会话表（协议 v1.4）：per-relay-连接重建——网关重连即清空全部
+        // 会话加密器（「断连清 session 加密器」的网关侧实现：浏览器断连对
+        // 网关不可见，靠浏览器重连重握手覆盖同 sid + 半开清理/容量淘汰兜底）。
+        let mut e2e_sessions = E2eSessions::new();
+
         // 收发循环。interval 首 tick 立即触发，先吃掉避免开局立刻发 ping。
         let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
         heartbeat.tick().await;
@@ -329,10 +339,12 @@ impl WebClient {
                             return Err(CoreError::Platform(TARGET, "ws stream 结束".into()));
                         }
                     };
-                    self.handle_text(&mut ws, &raw).await?;
+                    self.handle_text(&mut ws, &raw, &mut e2e_sessions).await?;
                 }
 
-                // 出站帧：platform 序列化好的 JSON 文本，原样写回 relay。
+                // 出站帧：platform 序列化好的 JSON 文本，经 E2E 会话逐 sid
+                // 加密后写回 relay（无任何会话时明文直发——兼容旧浏览器，
+                // 见 e2e 模块头注释的渐进语义）。
                 // 已知限制：帧已从 channel 取出，ws.send 失败（连接瞬断）即
                 // 丢弃——MVP 无 outbox 持久重试（与 IM 平台不同），本帧不随
                 // 重连重放；浏览器可发 sync 帧重拉卡片终态兜底。
@@ -344,14 +356,13 @@ impl WebClient {
                             return Ok(());
                         }
                     };
-                    ws.send(Message::text(json)).await.map_err(|e| {
-                        CoreError::Platform(TARGET, format!("ws send: {e}"))
-                    })?;
-                    debug!(target: TARGET, "已发出站帧");
+                    self.send_business(&mut ws, json, &mut e2e_sessions).await?;
                 }
 
-                // 心跳：协议层 Ping（relay idle 90s，30s 保活）。
+                // 心跳：协议层 Ping（relay idle 90s，30s 保活）+ 顺带执行 E2E
+                // 半开会话清理（60s TTL，无需独立定时器）。
                 _ = heartbeat.tick() => {
+                    e2e_sessions.prune(Instant::now());
                     if let Err(e) = ws.send(Message::Ping(Vec::new().into())).await {
                         return Err(CoreError::Platform(TARGET, format!("ws send ping: {e}")));
                     }
@@ -361,13 +372,54 @@ impl WebClient {
         }
     }
 
+    /// 出站业务帧发送（v1.4 E2E 包装点）：有活跃会话 → 对每个已握手 sid 各
+    /// 密封一份 enc{sid}（sync 重发帧同样流经此处，天然逐会话加密）；无会话
+    /// → 明文直发（行为与 v1.3 完全一致）。曾加密过的连接回退明文时 warn
+    /// 一次（降级观测点：正常只有「全部浏览器断开且会话清理」才触发，恶意
+    /// 中继丢弃浏览器 enc 帧也会走到这里）。
+    async fn send_business(
+        &self,
+        ws: &mut WsStream,
+        plaintext: String,
+        sessions: &mut E2eSessions,
+    ) -> Result<()> {
+        let frames = sessions.seal_each(&self.machine_id, &plaintext);
+        if sessions.is_empty() {
+            if sessions.take_plaintext_revert() {
+                warn!(
+                    target: TARGET,
+                    "E2E 会话已全部失效，业务帧回退明文中继（若非预期：可能存在\
+                     中继丢帧干扰，或浏览器握手未完成/未续期）"
+                );
+            }
+            ws.send(Message::text(plaintext))
+                .await
+                .map_err(|e| CoreError::Platform(TARGET, format!("ws send: {e}")))?;
+            debug!(target: TARGET, "已发出站帧（明文，无 E2E 会话）");
+        } else {
+            for f in frames {
+                ws.send(Message::text(f))
+                    .await
+                    .map_err(|e| CoreError::Platform(TARGET, format!("ws send: {e}")))?;
+            }
+            debug!(target: TARGET, sessions = sessions.len(), "已发出站 enc 帧（逐会话各一份）");
+        }
+        Ok(())
+    }
+
     /// 单条入站文本帧分拣：relay 自产帧（machine/machines/error/hello_ack）
     /// 本层自理（machines 只推浏览器，网关侧正常收不到，落到 Ignore 容错）；
-    /// 业务帧（message/approval_response/control/sync/ping，均可带 relay
-    /// 路由用的 machine 字段——网关侧无需消费）经 [`map_inbound_frame`]
-    /// 映射。畸形 JSON warn 丢弃（不断连——浏览器/中继偶发杂帧不致网关
-    /// 重连）。
-    async fn handle_text(&self, ws: &mut WsStream, raw: &str) -> Result<()> {
+    /// E2E 帧（v1.4）：`e2e_hello` → 握手应答（e2e_ack），`enc` → 试解后把
+    /// 内层业务帧走既有分发；业务帧（message/approval_response/control/
+    /// sync/ping，均可带 relay 路由用的 machine 字段——网关侧无需消费）经
+    /// [`map_inbound_frame`] 映射。畸形 JSON warn 丢弃（不断连——浏览器/
+    /// 中继偶发杂帧不致网关重连）。
+    async fn handle_text(
+        &self,
+        ws: &mut WsStream,
+        raw: &str,
+        e2e_sessions: &mut E2eSessions,
+    ) -> Result<()> {
         let v: serde_json::Value = match serde_json::from_str(raw) {
             Ok(v) => v,
             Err(e) => {
@@ -391,47 +443,96 @@ impl WebClient {
                 // ack 容错忽略。
                 debug!(target: TARGET, "收到后续 hello_ack，忽略");
             }
-            _ => match map_inbound_frame(&v, &self.default_session) {
-                InboundAction::Message(msg) => {
-                    // 入站 best-effort 推给 platform：1s 有界背压（消费端短暂
-                    // 抖动不丢用户消息；持续满才丢弃，对齐 wecom P5-12）。
-                    match tokio::time::timeout(Duration::from_secs(1), self.inbound_tx.send(*msg))
-                        .await
-                    {
-                        Ok(Ok(())) => {}
-                        Ok(Err(_)) => {
-                            return Err(CoreError::Platform(
-                                TARGET,
-                                "入站 channel 已关闭（platform 退出）".into(),
-                            ));
-                        }
-                        Err(_) => {
-                            warn!(target: TARGET, "入站 channel 持续满 1s，丢弃浏览器消息");
-                        }
+            // E2E 握手（v1.4）：建会话并回 e2e_ack（gk/ik/n2/sig）。E2E 身份
+            // 不可用（token 凭证 / 密钥文件损坏）→ 忽略不回——浏览器 10s
+            // 超时走 SPA 侧 fail-closed 明文选择。
+            "e2e_hello" => match &self.e2e {
+                Some(identity) => {
+                    if let Some(ack) = identity.handle_hello(e2e_sessions, &v, &self.machine_id) {
+                        let _ = ws.send(Message::text(ack)).await;
                     }
                 }
-                InboundAction::Sync => {
-                    if tokio::time::timeout(Duration::from_secs(1), self.sync_tx.send(()))
-                        .await
-                        .is_err()
-                    {
-                        warn!(target: TARGET, "sync channel 持续满 1s，丢弃 sync 请求");
-                    }
-                }
-                InboundAction::Ping => {
-                    // 应用层 ping：本层直接回 pong（§4.1，不进 recv），带本机
-                    // machine（v1.1 全部出站帧约定）。
-                    let _ = ws
-                        .send(Message::text(crate::encode_pong_frame(&self.machine_id)))
-                        .await;
-                }
-                InboundAction::Ignore => {
-                    debug!(target: TARGET, kind, "未知入站帧 type，忽略（前向兼容）");
-                }
-                InboundAction::Warn(reason) => {
-                    warn!(target: TARGET, kind, reason, "入站帧违规，丢弃");
+                None => {
+                    warn!(
+                        target: TARGET,
+                        "e2e_hello 到达但 E2E 身份不可用（token 凭证无 ed25519 签名密钥/密钥文件损坏），忽略"
+                    );
                 }
             },
+            // E2E 密文帧（v1.4）：浏览器→网关方向无 sid，逐活跃会话试解
+            //（≤8 次，见 E2eSessions::open_any）后走既有业务分发。
+            "enc" => {
+                let Some(boxed) = v.get("box").and_then(|b| b.as_str()) else {
+                    warn!(target: TARGET, "enc 帧缺 box 字段，丢弃");
+                    return Ok(());
+                };
+                match e2e_sessions.open_any(boxed) {
+                    Some(inner) => match serde_json::from_str::<serde_json::Value>(&inner) {
+                        Ok(inner_v) => self.dispatch_business(ws, &inner_v, e2e_sessions).await?,
+                        Err(e) => {
+                            warn!(target: TARGET, error = %e, "enc 帧解密后内层 JSON 畸形，丢弃");
+                        }
+                    },
+                    None => {
+                        warn!(
+                            target: TARGET,
+                            "enc 帧无法用任何活跃会话解密（无握手/密钥已轮换/半开已清理），丢弃"
+                        );
+                    }
+                }
+            }
+            _ => self.dispatch_business(ws, &v, e2e_sessions).await?,
+        }
+        Ok(())
+    }
+
+    /// 业务帧分发（明文直收与 enc 解密后共用）：入站映射 + ping 直接回
+    /// （pong 经 [`Self::send_business`]——E2E 会话活跃时 pong 同为业务帧，
+    /// 逐 sid 加密）。
+    async fn dispatch_business(
+        &self,
+        ws: &mut WsStream,
+        v: &serde_json::Value,
+        e2e_sessions: &mut E2eSessions,
+    ) -> Result<()> {
+        match map_inbound_frame(v, &self.default_session) {
+            InboundAction::Message(msg) => {
+                // 入站 best-effort 推给 platform：1s 有界背压（消费端短暂
+                // 抖动不丢用户消息；持续满才丢弃，对齐 wecom P5-12）。
+                match tokio::time::timeout(Duration::from_secs(1), self.inbound_tx.send(*msg)).await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => {
+                        return Err(CoreError::Platform(
+                            TARGET,
+                            "入站 channel 已关闭（platform 退出）".into(),
+                        ));
+                    }
+                    Err(_) => {
+                        warn!(target: TARGET, "入站 channel 持续满 1s，丢弃浏览器消息");
+                    }
+                }
+            }
+            InboundAction::Sync => {
+                if tokio::time::timeout(Duration::from_secs(1), self.sync_tx.send(()))
+                    .await
+                    .is_err()
+                {
+                    warn!(target: TARGET, "sync channel 持续满 1s，丢弃 sync 请求");
+                }
+            }
+            InboundAction::Ping => {
+                // 应用层 ping：本层直接回 pong（§4.1，不进 recv），带本机
+                // machine（v1.1 全部出站帧约定）。
+                let pong = crate::encode_pong_frame(&self.machine_id);
+                self.send_business(ws, pong, e2e_sessions).await?;
+            }
+            InboundAction::Ignore => {
+                debug!(target: TARGET, kind = v.get("type").and_then(|t| t.as_str()).unwrap_or(""), "未知入站帧 type，忽略（前向兼容）");
+            }
+            InboundAction::Warn(reason) => {
+                warn!(target: TARGET, kind = v.get("type").and_then(|t| t.as_str()).unwrap_or(""), reason, "入站帧违规，丢弃");
+            }
         }
         Ok(())
     }
@@ -615,6 +716,7 @@ mod tests {
             machine_id: "test-mac".into(),
             default_session: "default".into(),
             online: Arc::new(AtomicBool::new(false)),
+            e2e: None,
             inbound_tx,
             sync_tx,
         };

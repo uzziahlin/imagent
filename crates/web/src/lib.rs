@@ -19,6 +19,12 @@
 //! `prove{pubkey,signature}`（对 nonce 原文签名）→ `hello_ack`——relay 只
 //! 存公钥，私钥 seed 不出本机。
 //!
+//! E2E 中继盲化（v1.4，见 [`e2e`]）：session 认证后浏览器逐机器发起
+//! `e2e_hello{sid,ek,n1}` → 网关回 `e2e_ack{gk,ik,n2,sig}`（复用 v1.3 ed25519
+//! 密钥签名）→ 双方派生 XChaCha20-Poly1305 会话密钥，业务帧包装为
+//! `enc{sid,box}`——relay 对业务内容全盲，仅按 `machine`/`sid` 信封元数据
+//! 路由。无任何握手会话时出站行为不变（明文，兼容旧浏览器）。
+//!
 //! 帧协议 v1.1（与 relay / SPA 对齐，M5 多终端管理）：JSON 文本帧，信封
 //! `{"v":1,"type":…}`。入站（浏览器→网关）：`message` / `approval_response` /
 //! `control` / `sync` / `ping`（均可带可选 `machine` 路由字段——relay 据此
@@ -43,6 +49,7 @@
 #![deny(unsafe_code)]
 
 pub mod client;
+pub mod e2e;
 pub mod key;
 pub mod platform;
 
@@ -127,9 +134,13 @@ pub fn resolve_machine_id(configured: Option<&str>) -> String {
 // 出站帧（网关 → 浏览器）
 // ---------------------------------------------------------------------------
 
-/// relay 单帧上限 256KB（M1 §4.4）；出站软限取 240KB——预留 JSON 转义膨胀
-/// 余量，超限即截断 text 字段（见 [`encode_text_frame`] / [`encode_card_frame`]）。
-pub(crate) const FRAME_SOFT_LIMIT_BYTES: usize = 240 * 1024;
+/// relay 单帧上限 256KB（M1 §4.4）；出站软限取 180KB——v1.4 E2E 会话活跃
+/// 时业务帧以 `enc` 包装：box = base64(nonce24 || 密文 || tag16)，base64 膨胀
+/// 4/3，180KB 明文 → ~246KB enc 帧 < 256KB（信封字段余量已含）。软限统一下
+/// 调（明文路径一并收紧——无 E2E 部署只在超巨帧边界上略早截断，语义不变），
+/// 避免「按模式选阈值」在 platform（编码方）与 client（加密方）间泄漏模式
+/// 感知。超限即截断 text 字段（见 [`encode_text_frame`] / [`encode_card_frame`]）。
+pub(crate) const FRAME_SOFT_LIMIT_BYTES: usize = 180 * 1024;
 /// 超限截断的头部保窗（char，先例 src/delegate.rs 头尾窗）。
 pub(crate) const TRUNC_HEAD_CHARS: usize = 18_000;
 /// 超限截断的尾部保窗（结论通常在尾部）。

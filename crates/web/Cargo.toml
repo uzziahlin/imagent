@@ -19,15 +19,29 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
-# 网关 ed25519 挑战应答认证（协议 v1.3）：密钥文件加载/生成（rand 出 seed）
-# 与 prove 帧签名；seed/公钥 hex 编解码。
+# 网关 ed25519 挑战应答认证（协议 v1.3）+ E2E 握手签名（协议 v1.4，复用同一
+# 把密钥）：密钥文件加载/生成（rand 出 seed）与 prove/e2e_ack 帧签名；
+# seed/公钥 hex 编解码。
 ed25519-dalek = { workspace = true }
+# E2E 中继盲化（协议 v1.4）：X25519 静态密钥 + HKDF-SHA256 派生 + XChaCha20-
+# Poly1305 业务帧加解密；指纹 SHA-256；box 密文 base64。
+x25519-dalek = { workspace = true }
+chacha20poly1305 = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
 
 [dev-dependencies]
 # 回环集成测试（tests/web_loopback.rs）：起真 relay（随机端口）+ 模拟浏览器。
 imagent-relay = { path = "../relay" }
-# 测试内生成 ed25519 密钥对（relay 的 GATEWAY_KEYS 表 + 平台侧签名凭证）。
+# 测试内生成 ed25519 密钥对（relay 的 GATEWAY_KEYS 表 + 平台侧签名凭证），
+# 以及浏览器侧 E2E 临时密钥/派生/加解密（模拟新 SPA）。
 ed25519-dalek = { workspace = true }
+x25519-dalek = { workspace = true }
+chacha20poly1305 = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
 rand = { workspace = true }
