@@ -1559,3 +1559,74 @@ describe("App 工作空间（v1.6）", () => {
     expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "message", text: "/switch legacy" }));
   });
 });
+
+// ---------------------------------------------------------------------------
+// 会话自动命名：留空名字创建（s-xxxx 自动短 ID，协议帧零改动）+ 显示名由
+// 首条消息派生（convTitle）
+// ---------------------------------------------------------------------------
+
+describe("App 会话自动命名", () => {
+  /** 挂载 + 握手到 ready（单机模式即可），返回活跃 socket。 */
+  function mountReady(): FakeWebSocket {
+    const fake = mountApp();
+    act(() => {
+      fake.emit("open");
+      fake.recv({ v: 1, type: "hello_ack", role: "user" });
+    });
+    return fake;
+  }
+
+  /** 出站 message 帧里的全部 /switch 命令文本。 */
+  const switchCmds = (fake: FakeWebSocket): string[] =>
+    fake.sent
+      .map((s) => JSON.parse(s) as { type?: string; text?: string })
+      .filter((f) => f.type === "message" && f.text?.startsWith("/switch "))
+      .map((f) => f.text as string);
+
+  it("留空名字创建：/switch s-xxxx 短 ID（协议零改动）+ 当前会话切到 web:s-xxxx", () => {
+    const fake = mountReady();
+    fireEvent.click(screen.getByRole("button", { name: "+ 新会话" }));
+    const dialog = screen.getByRole("dialog", { name: "新会话" });
+    // 名字留空直接创建（空值合法，按钮不再禁用）
+    fireEvent.click(within(dialog).getByRole("button", { name: "创建（/switch）" }));
+    const cmds = switchCmds(fake);
+    expect(cmds).toHaveLength(1);
+    expect(cmds[0]).toMatch(/^\/switch s-[0-9a-f]{4}$/);
+    const shortId = cmds[0].slice("/switch ".length);
+    // 弹层关闭；select_conv 落 web:s-xxxx：侧栏项 + 状态条徽标显示短 ID（尚无消息，无 title）
+    expect(screen.queryByRole("dialog", { name: "新会话" })).toBeNull();
+    expect(screen.getAllByText(shortId).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("自动会话发首条消息：message 帧带完整 convId；侧栏/状态条改显首条消息摘要", () => {
+    const fake = mountReady();
+    fireEvent.click(screen.getByRole("button", { name: "+ 新会话" }));
+    const dialog = screen.getByRole("dialog", { name: "新会话" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "创建（/switch）" }));
+    const shortId = switchCmds(fake)[0].slice("/switch ".length);
+    fireEvent.change(screen.getByLabelText("消息输入框"), { target: { value: "帮我写个部署脚本" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    // 发到自动会话（完整 conv 形态）
+    expect(fake.sent).toContain(
+      JSON.stringify({ v: 1, type: "message", convId: `web:${shortId}`, text: "帮我写个部署脚本" }),
+    );
+    // 消息气泡 + 侧栏标题 + 侧栏预览 + 状态条徽标均显示首条消息文本（title 派生）
+    expect(screen.getAllByText("帮我写个部署脚本").length).toBeGreaterThanOrEqual(3);
+    // 短 ID 从显示位消失（显示名已换 title；convId 仅存于协议层）
+    expect(screen.queryByText(shortId)).toBeNull();
+  });
+
+  it("手动名会话：发首条消息后显示名仍为手动名（title 不覆盖）", () => {
+    const fake = mountReady();
+    fireEvent.click(screen.getByRole("button", { name: "+ 新会话" }));
+    const dialog = screen.getByRole("dialog", { name: "新会话" });
+    fireEvent.change(within(dialog).getByLabelText("新会话名称"), { target: { value: "proj" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "创建（/switch）" }));
+    expect(switchCmds(fake)).toEqual(["/switch proj"]);
+    fireEvent.change(screen.getByLabelText("消息输入框"), { target: { value: "手动会话首条消息" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    // 侧栏标题 + 状态条徽标仍显示手动名 proj（title 已派生但显示名不采用）
+    expect(screen.getAllByText("proj").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText("手动会话首条消息").length).toBeGreaterThanOrEqual(1);
+  });
+});

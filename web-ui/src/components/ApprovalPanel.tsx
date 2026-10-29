@@ -1,6 +1,5 @@
 import { useEffect, useRef } from "react";
 import type { ApprovalDecision, PendingApproval } from "../lib/protocol";
-import { convDisplayName } from "../lib/protocol";
 
 /**
  * 审批弹层：任一机器任一 conv 的 pending 非空即置顶显示（置顶 overlay，不挡
@@ -8,6 +7,8 @@ import { convDisplayName } from "../lib/protocol";
  * 序：在线机器在前）；三按钮 → 发 approval_response（convId/requestId 原样
  * 回传、machine = 审批来源机器）→ 本地乐观移除；收到 approval_resolved 在
  * 流里留终态记录。
+ * conv 徽标显示名由 App 注入 convTitleOf（自动会话 web:s-xxxx 显示首条消息
+ * 派生的自动 title，其余 convId 剥前缀）。
  *
  * 微动效：条目 slide-in（150ms）；0→非空出现时移动端触觉提示
  * navigator.vibrate([80,40,80])（桌面/iOS Safari 无该能力自然跳过；全体动画
@@ -16,11 +17,15 @@ import { convDisplayName } from "../lib/protocol";
 export function ApprovalPanel({
   pending,
   showMachine,
+  convTitleOf,
   onRespond,
 }: {
   pending: PendingApproval[];
   /** 多机模式显示机器徽标；单机模式不显示（行为与升级前一致）。 */
   showMachine: boolean;
+  /** conv 显示名解析（App 注入 convTitle；pending 跨机器，须按 machine 取
+   *  该机器空间里的 conv 状态）。 */
+  convTitleOf: (convId: string, machine: string) => string;
   onRespond: (p: PendingApproval, decision: ApprovalDecision) => void;
 }) {
   // 0→非空沿（弹层「出现」时机）触发一次触觉提示；非空→非空（追加新审批）不震
@@ -61,7 +66,7 @@ export function ApprovalPanel({
               </span>
             )}
             <span className="ml-auto shrink-0 rounded-full bg-amber-200/70 px-2 py-0.5 font-mono text-xs font-normal text-amber-800 dark:bg-amber-900/60 dark:text-amber-300/90">
-              {convDisplayName(p.convId)}
+              {convTitleOf(p.convId, p.machine)}
             </span>
           </div>
           <p className="mb-3 max-h-24 overflow-y-auto rounded-lg bg-amber-100/80 px-2.5 py-1.5 font-mono text-xs break-all text-amber-900 dark:bg-black/30 dark:text-amber-100/90">

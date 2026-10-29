@@ -52,6 +52,37 @@ export function convDisplayName(convId: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// 会话自动命名（纯 SPA 侧，协议与后端零改动）：「会话 ID」与「显示名」解耦。
+// 留空名字创建新会话时 SPA 生成短随机 ID（s-xxxx）走既有 /switch 流程；显示名
+// 由 reducer 从该会话首条消息派生（ConvState.title，见 appendEntry）。
+// ---------------------------------------------------------------------------
+
+/** 自动会话完整形态：web:s-<4 位小写 hex>（newAutoConvName + web: 前缀）。 */
+export const AUTO_CONV_RE = /^web:s-[0-9a-f]{4}$/;
+
+/** 是否机器生成的自动会话（web:s-xxxx）。仅此类会话的显示名采用自动 title
+ *  ——手动名是用户输入（convId 即名字），恒不被自动 title 覆盖；default /
+ *  local: 会话同走剥前缀显示。 */
+export function isAutoConv(convId: string): boolean {
+  return AUTO_CONV_RE.test(convId);
+}
+
+/** 生成自动会话短名：s-<4 位小写 hex 随机>。同机重复概率 1/65536 极小，且
+ *  ensureConv 按 convId 幂等（真撞上即并入同一会话，无碍）。 */
+export function newAutoConvName(): string {
+  const b = new Uint8Array(2);
+  crypto.getRandomValues(b);
+  return `s-${Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("")}`;
+}
+
+/** conv 显示名（用户可见，手动名 > 自动 title > 剥前缀兜底）：自动会话
+ *  （web:s-xxxx）优先首条消息派生的 title；其余（手动名 / default / local）
+ *  恒 convDisplayName 剥前缀。title 派生见 ConvState.title。 */
+export function convTitle(conv: ConvState | undefined, convId: string): string {
+  return isAutoConv(convId) && conv?.title ? conv.title : convDisplayName(convId);
+}
+
+// ---------------------------------------------------------------------------
 // 卡片载荷（crates/web/src/lib.rs CardPayload）
 // ---------------------------------------------------------------------------
 
@@ -786,6 +817,11 @@ export type ConvState = {
    *  card 插入）+1，select_conv 点选清零。card_patch 替换与首次物化的 card 插入
    *  （sync 重放 / 新会话首卡）不计——防刷新/重连/切机后全部会话被误点亮。 */
   unread: number;
+  /** 自动显示名（会话自动命名）：该会话首条 user/text 消息的单行摘要（按字符
+   *  截 CONV_TITLE_MAX_CHARS，中文不劈半），一旦写入不再变——首条消息即定调。
+   *  所有会话一律派生，但仅自动形态（web:s-xxxx，见 isAutoConv）的显示名采用
+   *  （convTitle）；手动名 / default / local 会话派生而不用。 */
+  title?: string;
 };
 
 /** 单台机器的会话空间：会话表 + conv 插入序（web:default 恒为首项）。 */
@@ -793,6 +829,9 @@ export type MachineSpace = {
   convs: Record<string, ConvState>;
   convOrder: string[];
 };
+
+/** 自动显示名（title）最大字符数：按 Unicode 码点截断（中文/emoji 不劈半）。 */
+export const CONV_TITLE_MAX_CHARS = 24;
 
 /** 消息条目内存护栏：单 conv 超过上限时丢弃最早的本地用户回显（ephemeral）；
  *  服务端条目（text/card）不丢——卡片终态可由 sync 重发兜底。 */
@@ -968,6 +1007,13 @@ function firstLine(s: string): string {
   return (i === -1 ? s : s.slice(0, i)).trim();
 }
 
+/** 自动命名摘要：首行（firstLine 已去空白）按码点截 CONV_TITLE_MAX_CHARS；
+ *  截后为空串返回 null（不写 title，留待后续消息定调）。 */
+function titleSummary(text: string): string | null {
+  const s = Array.from(firstLine(text)).slice(0, CONV_TITLE_MAX_CHARS).join("");
+  return s.length > 0 ? s : null;
+}
+
 /** 内存护栏：超上限丢最早的 user 回显；无 user 可丢（纯服务端条目）即停。 */
 function trimEntries(entries: StreamEntry[]): StreamEntry[] {
   let trimmed = entries;
@@ -996,7 +1042,12 @@ function appendEntry(
   // 未读：非当前 conv 的服务端条目（text / approval_note）+1；用户回显恒落
   // 当前 conv（send_echo 由 App 发送路径产生），不计。
   const bumpUnread = stamped.kind !== "user" && !(machine === state.currentMachine && convId === state.currentConv);
-  return {
+  // 自动命名：title 未定时由首条 user/text 消息定调（观看端无 user 回显时首条
+  // text 同样派生；card / approval_note 不定调）。一旦写入不再变；空摘要不写。
+  const derivedTitle =
+    conv.title === undefined && (stamped.kind === "user" || stamped.kind === "text")
+      ? titleSummary(stamped.text)
+      : undefined;  return {
     ...state,
     seq: state.seq + 1,
     spaces: {
@@ -1011,6 +1062,7 @@ function appendEntry(
             lastPreview: previewOf(stamped),
             lastAt: Date.now(),
             unread: bumpUnread ? conv.unread + 1 : conv.unread,
+            ...(derivedTitle != null ? { title: derivedTitle } : {}),
           },
         },
       },

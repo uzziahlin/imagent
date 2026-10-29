@@ -2041,6 +2041,7 @@ dependencies = [
  "hkdf 0.13.0",
  "imagent-core",
  "imagent-relay",
+ "imagent-store",
  "rand 0.9.4",
  "serde",
  "serde_json",

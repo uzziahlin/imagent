@@ -2,9 +2,10 @@ import { useEffect, useMemo, useReducer, useRef, useState, type FormEvent } from
 import {
   DEFAULT_CONV,
   DEFAULT_MACHINE,
-  convDisplayName,
+  convTitle,
   deviceSummary,
   initialState,
+  newAutoConvName,
   reducer,
   spaceOf,
   type ApprovalDecision,
@@ -422,18 +423,27 @@ export default function App() {
 
   // 侧边栏会话项：当前选中机器会话空间内的全部 conv；刚切到尚未收到帧的 conv
   // （新会话）不在 convOrder 里，前端补一项空预览，避免当前高亮落空。
+  // title = 会话显示名（convTitle：自动会话 web:s-xxxx 用首条消息派生的自动
+  // title，手动名/default/local 恒 convId 剥前缀）。
   // 注意：hook 必须在下方 token 早退之前（hooks 数量不可随登录态变化）。
   const space = spaceOf(state, state.currentMachine);
   const currentConv = state.currentConv;
   const convItems = useMemo<ConvItem[]>(() => {
     const items = space.convOrder.map((c) => ({
       convId: c,
+      title: convTitle(space.convs[c], c),
       preview: space.convs[c]?.lastPreview ?? "",
       at: space.convs[c]?.lastAt ?? 0,
       unread: space.convs[c]?.unread ?? 0,
     }));
     if (!items.some((i) => i.convId === currentConv)) {
-      items.unshift({ convId: currentConv, preview: "", at: 0, unread: 0 });
+      items.unshift({
+        convId: currentConv,
+        title: convTitle(space.convs[currentConv], currentConv),
+        preview: "",
+        at: 0,
+        unread: 0,
+      });
     }
     return items;
   }, [space, currentConv]);
@@ -534,23 +544,26 @@ export default function App() {
 
   /** 新会话：/switch <名字> 命令文本走 message 帧（convId 留空落网关默认
    *  会话），同时本地把当前 conv 切到 web:<名字>；命令回显留在默认会话。
+   *  名字留空合法：落机器生成短 ID（newAutoConvName，s-xxxx）走同一流程
+   *  （协议零改动），显示名由 reducer 从该会话首条消息派生（convTitle）。
    *  v1.6：选择了目录（≠default）→ 会话创建后发 setConvWorkdir(新 convId,
    *  path) 绑定并记录 lastdir 预选；未选/选 default 不发（新会话天然落网关
    *  默认目录）。 */
   const createConv = (name: string, dir: string | undefined): boolean => {
-    const ok = wsRef.current?.sendMessage(undefined, `/switch ${name}`, outMachine()) ?? false;
+    const convName = name.trim() || newAutoConvName();
+    const ok = wsRef.current?.sendMessage(undefined, `/switch ${convName}`, outMachine()) ?? false;
     if (!ok) {
       return false;
     }
     dispatch({
       type: "send_echo",
       convId: DEFAULT_CONV,
-      text: `/switch ${name}`,
+      text: `/switch ${convName}`,
       machine: state.currentMachine,
     });
-    dispatch({ type: "select_conv", convId: toConvId(name) });
+    dispatch({ type: "select_conv", convId: toConvId(convName) });
     if (dir !== undefined && dir !== wsSnapshot?.default) {
-      wsRef.current?.setConvWorkdir(toConvId(name), dir, outMachine());
+      wsRef.current?.setConvWorkdir(toConvId(convName), dir, outMachine());
       saveLastDir(state.currentMachine, dir);
     }
     setDrawerOpen(false);
@@ -567,11 +580,8 @@ export default function App() {
 
   const submitNewConv = (e: FormEvent) => {
     e.preventDefault();
-    const n = newConvName.trim();
-    if (!n) {
-      return;
-    }
-    if (createConv(n, newConvDir)) {
+    // 名字留空合法（createConv 内落 s-xxxx 自动短 ID）
+    if (createConv(newConvName, newConvDir)) {
       setNewConvOpen(false);
     }
   };
@@ -868,7 +878,7 @@ export default function App() {
               : state.machineOnline
           }
           machineName={state.machinesKnown ? state.currentMachine : undefined}
-          currentConv={currentConv}
+          convLabel={convTitle(conv, currentConv)}
           secure={e2eSecure}
           onLogout={logout}
           onReconnect={reconnect}
@@ -973,6 +983,9 @@ export default function App() {
           <ApprovalPanel
             pending={allPending}
             showMachine={state.machinesKnown}
+            convTitleOf={(convId, machine) =>
+              convTitle(spaceOf(state, machine).convs[convId], convId)
+            }
             onRespond={respondApproval}
           />
           <MessageList
@@ -1025,7 +1038,7 @@ export default function App() {
                     setNewConvOpen(false);
                   }
                 }}
-                placeholder="会话名（如 work）"
+                placeholder="会话名（留空自动按首条消息命名）"
                 aria-label="新会话名称"
                 className="w-full rounded-lg border border-line-strong bg-surface px-2.5 py-1.5 text-base text-ink outline-none placeholder:text-ghost focus:border-emerald-500"
               />
@@ -1052,8 +1065,7 @@ export default function App() {
                 </button>
                 <button
                   type="submit"
-                  disabled={!newConvName.trim()}
-                  className="press flex-1 rounded-xl bg-emerald-600 py-2 text-sm font-semibold text-white transition-colors hover:bg-emerald-500 disabled:opacity-40"
+                  className="press flex-1 rounded-xl bg-emerald-600 py-2 text-sm font-semibold text-white transition-colors hover:bg-emerald-500"
                 >
                   创建（/switch）
                 </button>
@@ -1093,7 +1105,7 @@ export default function App() {
             </div>
             <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 pb-4">
               <p className="mb-2 text-xs text-muted">
-                会话 <span className="font-mono text-ink">{convDisplayName(currentConv)}</span>{" "}
+                会话 <span className="font-mono text-ink">{convTitle(conv, currentConv)}</span>{" "}
                 的工作目录
               </p>
               <WorkspacePicker

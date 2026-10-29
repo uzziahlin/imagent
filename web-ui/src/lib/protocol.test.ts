@@ -1,12 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
+  CONV_TITLE_MAX_CHARS,
   DEFAULT_CONV,
   DEFAULT_MACHINE,
+  convTitle,
   deviceSummary,
   encodeFrame,
   initialState,
+  isAutoConv,
   machineNameValid,
   machinePubkeyValid,
+  newAutoConvName,
   normalizeExpiryMs,
   parseFrame,
   reducer,
@@ -1266,5 +1270,103 @@ describe("v1.6 工作空间帧（出站形状 + 解析 + reducer）", () => {
     });
     expect(after.lastError?.code).toBe("workspace_invalid");
     expect(after.workspaces).toBe(s.workspaces); // 引用不变 = 快照原样
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 会话自动命名：title 派生（reducer）/ 自动短 ID（newAutoConvName）/ convTitle
+// ---------------------------------------------------------------------------
+
+describe("会话自动命名（title 派生 + 自动短 ID + convTitle）", () => {
+  it("newAutoConvName：s-<4 位小写 hex>；多次调用基本不重复", () => {
+    const names = Array.from({ length: 32 }, () => newAutoConvName());
+    for (const n of names) {
+      expect(n).toMatch(/^s-[0-9a-f]{4}$/);
+    }
+    // 65536 空间：32 次抽样允许 ≤2 次碰撞（≥3 次概率 ~1e-6，非脆弱阈值）
+    expect(new Set(names).size).toBeGreaterThanOrEqual(30);
+  });
+
+  it("isAutoConv：web:s-xxxx 命中；手动名 / default / local / 裸短名不命中", () => {
+    expect(isAutoConv("web:s-ab12")).toBe(true);
+    expect(isAutoConv("web:s-0000")).toBe(true);
+    // 手动名形态：前缀相似但非 4 位 hex / 非自动会话
+    expect(isAutoConv("web:s-abc")).toBe(false);
+    expect(isAutoConv("web:s-ABCD")).toBe(false);
+    expect(isAutoConv("web:s-zzzz")).toBe(false);
+    expect(isAutoConv("web:work")).toBe(false);
+    expect(isAutoConv(DEFAULT_CONV)).toBe(false);
+    expect(isAutoConv("local:work")).toBe(false);
+    expect(isAutoConv("s-ab12")).toBe(false); // 裸短名非完整 conv 形态
+  });
+
+  it("首条 user 回显派生 title：多行取首行、中英混排、前后空白剥除", () => {
+    const s = run(
+      initialState(),
+      { type: "send_echo", convId: "web:s-ab12", text: "  帮我 review 这个 PR  \n第二行不入名" },
+    );
+    expect(convsOf(s)["web:s-ab12"].title).toBe("帮我 review 这个 PR");
+  });
+
+  it("title 超长按码点截 24 字符（中文/emoji 不劈半）", () => {
+    const han = run(initialState(), { type: "send_echo", convId: "web:s-ab12", text: "一".repeat(30) });
+    const t1 = convsOf(han)["web:s-ab12"].title;
+    expect(t1).toBe("一".repeat(CONV_TITLE_MAX_CHARS));
+    expect(Array.from(t1 ?? "")).toHaveLength(24);
+    // emoji（代理对）：截 24 个码点而非 UTF-16 单元
+    const emoji = run(initialState(), { type: "send_echo", convId: "web:s-ab12", text: "😀".repeat(30) });
+    const t2 = convsOf(emoji)["web:s-ab12"].title;
+    expect(Array.from(t2 ?? "")).toHaveLength(24);
+    expect((t2 ?? "").length).toBe(48); // 未劈半：24 码点 × 2 UTF-16 单元
+    // 中英混排
+    const mixed = run(initialState(), { type: "send_echo", convId: "web:s-ab12", text: "ab一cd二".repeat(10) });
+    expect(convsOf(mixed)["web:s-ab12"].title).toBe("ab一cd二".repeat(4));
+  });
+
+  it("首条 text 帧同样派生 title（观看端视角：只有响应无 user 回显）", () => {
+    const s = run(
+      initialState(),
+      { type: "frame", frame: frame(TEXT_FRAME("响应首行\\n次行", "web:s-ef56")) },
+    );
+    expect(convsOf(s)["web:s-ef56"].title).toBe("响应首行");
+  });
+
+  it("title 一旦写入不再变：后续 user/text/card 均不改写", () => {
+    let s = run(initialState(), { type: "send_echo", convId: "web:s-ab12", text: "首条定调" });
+    s = run(s, { type: "send_echo", convId: "web:s-ab12", text: "第二条更长的消息不会覆盖" });
+    s = run(s, { type: "frame", frame: frame(TEXT_FRAME("响应也不覆盖", "web:s-ab12")) });
+    s = run(
+      s,
+      { type: "frame", frame: frame(CARD_FRAME({ convId: "web:s-ab12", messageId: "m1", text: "卡片同样不覆盖" })) },
+    );
+    expect(convsOf(s)["web:s-ab12"].title).toBe("首条定调");
+  });
+
+  it("空摘要不写 title：首条去空白后为空 → 保持未定，后续消息仍可定调", () => {
+    let s = run(initialState(), { type: "send_echo", convId: "web:s-ab12", text: "   \n\t " });
+    expect(convsOf(s)["web:s-ab12"].title).toBeUndefined();
+    // text 帧空串同样不定调
+    s = run(s, { type: "frame", frame: frame(TEXT_FRAME("", "web:s-ab12")) });
+    expect(convsOf(s)["web:s-ab12"].title).toBeUndefined();
+    s = run(s, { type: "send_echo", convId: "web:s-ab12", text: "真正首条" });
+    expect(convsOf(s)["web:s-ab12"].title).toBe("真正首条");
+  });
+
+  it("convTitle：自动会话用 title；无 title（尚未有消息）回退剥前缀短 ID", () => {
+    const s = run(initialState(), { type: "select_conv", convId: "web:s-ab12" });
+    expect(convTitle(convsOf(s)["web:s-ab12"], "web:s-ab12")).toBe("s-ab12"); // 未收消息：无 conv 状态亦同
+    expect(convTitle(undefined, "web:s-ab12")).toBe("s-ab12");
+    const withMsg = run(initialState(), { type: "send_echo", convId: "web:s-ab12", text: "自动会话首条" });
+    expect(convTitle(convsOf(withMsg)["web:s-ab12"], "web:s-ab12")).toBe("自动会话首条");
+  });
+
+  it("convTitle：手动名 / default / local 会话即便有 title 也恒剥前缀（不被自动名覆盖）", () => {
+    const manual = run(initialState(), { type: "send_echo", convId: "web:proj", text: "手动名会话首条消息" });
+    expect(convsOf(manual)["web:proj"].title).toBe("手动名会话首条消息"); // 一律派生（state 里有）
+    expect(convTitle(convsOf(manual)["web:proj"], "web:proj")).toBe("proj"); // 但显示名不用
+    const def = run(initialState(), { type: "send_echo", convId: DEFAULT_CONV, text: "默认会话消息" });
+    expect(convTitle(convsOf(def)[DEFAULT_CONV], DEFAULT_CONV)).toBe("default");
+    const local = run(initialState(), { type: "frame", frame: frame(TEXT_FRAME("本地终端", "local:work")) });
+    expect(convTitle(convsOf(local)["local:work"], "local:work")).toBe("local:work"); // 非 web: 前缀原样
   });
 });

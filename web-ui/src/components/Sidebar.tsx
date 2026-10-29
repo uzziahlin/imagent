@@ -1,10 +1,13 @@
 import { useMemo } from "react";
 import { convDisplayName, DEFAULT_MACHINE, normalizeExpiryMs } from "../lib/protocol";
 
-/** 侧边栏会话项数据（App 从 state 派生）：conv 全名 + 最后消息预览/时间 +
- *  未读计数（非当前 conv 收到新消息时 reducer 累加，点选清零）。 */
+/** 侧边栏会话项数据（App 从 state 派生）：conv 全名 + 显示名 + 最后消息
+ *  预览/时间 + 未读计数（非当前 conv 收到新消息时 reducer 累加，点选清零）。 */
 export type ConvItem = {
   convId: string;
+  /** 会话显示名（App 经 convTitle 派生传入：自动会话 web:s-xxxx 用首条消息
+   *  派生的自动 title，手动名/default/local 恒 convId 剥前缀）。 */
+  title?: string;
   preview: string;
   at: number;
   /** 未读条数（0 = 无徽标）。 */
@@ -39,6 +42,8 @@ function formatTime(at: number): string {
  * - 新会话（v1.6）= 打开 App 级弹层（会话名 + 工作目录选择 WorkspacePicker），
  *   确认后由上层发 `/switch <名字>` message 命令帧（convId 留空落默认会话）
  *   并按需绑定目录（conv_workdir_set），SPA 同时把当前 conv 切到 `web:<名字>`。
+ *   名字留空时上层落 s-xxxx 自动短 ID（协议零改动），会话项显示名由首条消息
+ *   派生（title，见 ConvItem）。
  * - 未收到任何 machines 帧（旧 relay）：不显示机器区，单机行为与升级前一致。
  * - v1.2 会话层：底部「管理」入口（仅会话模式；v1.5 起为管理面板——机器/
  *   令牌/设备/钥匙/指纹）与「会话 N 天后过期」续期横幅（剩余 < 3 天；点击
@@ -190,7 +195,7 @@ export function Sidebar({
             >
               <span className="flex items-center gap-2">
                 <span className="min-w-0 flex-1 truncate text-sm font-medium">
-                  {convDisplayName(item.convId)}
+                  {item.title || convDisplayName(item.convId)}
                 </span>
                 {/* 未读徽标优先于当前项小圆点（有未读必非当前项） */}
                 {item.unread && item.unread > 0 ? (

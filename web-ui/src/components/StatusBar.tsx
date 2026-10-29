@@ -1,5 +1,4 @@
 import type { ConnStatus } from "../lib/ws";
-import { convDisplayName } from "../lib/protocol";
 
 const STATUS_META: Record<ConnStatus, { label: string; dot: string }> = {
   // 在线点呼吸（breathe 2.2s 缓慢缩放）：仅 ready 健康 steady 态使用；
@@ -12,11 +11,13 @@ const STATUS_META: Record<ConnStatus, { label: string; dot: string }> = {
 };
 
 /**
- * 顶部状态条：relay 连接态 + 机器在线态 + 当前 conv + 退出。
+ * 顶部状态条：relay 连接态 + 机器在线态 + 当前会话显示名 + 退出。
  * 机器在线态：多机模式（v1.1）显示当前选中机器名 + machines 列表有无该机器
  * （App 侧换算后传入 machineOnline）；单机模式沿用旧网关 machine 帧
  * （machineName 缺省显示「Mac」）。移动端左上角 ☰ 打开会话抽屉（桌面端侧
  * 边栏常驻，按钮隐藏）。
+ * convLabel：当前会话显示名（App 经 convTitle 派生——自动会话 web:s-xxxx 用
+ * 首条消息摘要，其余 convId 剥前缀）。
  * v1.4 secure：当前机器 e2e 会话已激活 → 锁形标记「已加密」；false/缺省
  * 不显示（旧网关/未握手机器）。
  */
@@ -24,7 +25,7 @@ export function StatusBar({
   status,
   machineOnline,
   machineName,
-  currentConv,
+  convLabel,
   secure,
   onLogout,
   onReconnect,
@@ -34,7 +35,8 @@ export function StatusBar({
   machineOnline: boolean;
   /** 多机模式 = 当前机器 id；缺省（旧 relay 单机）显示「Mac」。 */
   machineName?: string;
-  currentConv: string;
+  /** 当前会话显示名（App 传入 convTitle(conv, currentConv)）。 */
+  convLabel: string;
   /** v1.4：当前机器业务帧走端到端加密（lock 标记）。 */
   secure?: boolean;
   onLogout: () => void;
@@ -99,7 +101,7 @@ export function StatusBar({
       </div>
       <div className="ml-auto flex shrink-0 items-center gap-2">
         <span className="max-w-[30vw] truncate rounded-full bg-panel2 px-2.5 py-0.5 font-mono text-xs text-muted">
-          {convDisplayName(currentConv)}
+          {convLabel}
         </span>
         <button
           onClick={onLogout}
