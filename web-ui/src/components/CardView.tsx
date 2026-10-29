@@ -95,16 +95,22 @@ function Spinner() {
 }
 
 /**
- * 执行链时间线（Claude Code 终端式）：运行中项自动展开（spinner + 工具名 +
+ * 执行链时间线（Claude Code 终端式）：流式中运行项自动展开（spinner + 工具名 +
  * summary，高亮当前活动项），完成后自动折叠为单行 ✓（低对比度）——完全由
- * done 标志驱动，无需用户交互。
+ * done 标志驱动，无需用户交互。卡片终态（finished）后整块收起为一行摘要按钮
+ * （全部完成「✓ 执行了 N 个工具」；存在未完成即 error 中断场景用 ⚠️
+ * 「N 个工具调用 · M 个未完成」），点击展开完整时间线、再点收起——终态后
+ * 时间线不再整块占版面；流式期间行为不变。
  */
 const ToolTimeline = memo(
-  function ToolTimeline({ calls }: { calls: ToolCallPayload[] }) {
+  function ToolTimeline({ calls, finished }: { calls: ToolCallPayload[]; finished: boolean }) {
+    // 终态折叠的展开态：卡片流式→终态是同一组件实例翻转（key 不变），useState
+    // 初值 false 恰为默认收起，无需 effect 同步。
+    const [open, setOpen] = useState(false);
     if (calls.length === 0) {
       return null;
     }
-    return (
+    const timeline = (
       <ol className="relative my-2 space-y-0.5 border-l-2 border-line pl-3" aria-label="执行链">
         {calls.map((c, i) =>
           c.done ? (
@@ -143,8 +149,42 @@ const ToolTimeline = memo(
         )}
       </ol>
     );
+    if (!finished) {
+      return timeline;
+    }
+    const unfinished = calls.filter((c) => !c.done).length;
+    return (
+      <div className="my-2">
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          className="flex w-full items-center gap-1.5 rounded-lg px-1.5 py-1 text-xs text-faint transition-colors hover:bg-panel2 hover:text-muted"
+        >
+          {unfinished === 0 ? (
+            <>
+              <span className="shrink-0 text-ok" aria-hidden="true">
+                ✓
+              </span>
+              <span>执行了 {calls.length} 个工具</span>
+            </>
+          ) : (
+            <>
+              <span aria-hidden="true">⚠️</span>
+              <span>
+                {calls.length} 个工具调用 · {unfinished} 个未完成
+              </span>
+            </>
+          )}
+          <span className="ml-auto text-ghost" aria-hidden="true">
+            {open ? "▾" : "▸"}
+          </span>
+        </button>
+        {open && timeline}
+      </div>
+    );
   },
-  (prev, next) => toolCallsEqual(prev.calls, next.calls),
+  (prev, next) => prev.finished === next.finished && toolCallsEqual(prev.calls, next.calls),
 );
 
 /** 思考过程：默认折叠单行（运行时「思考中…」/ 完成后「思考过程（N 条）」），点击展开。 */
@@ -252,11 +292,14 @@ const Footer = memo(function Footer({
 });
 
 /**
- * 工具/任务卡片：头部 phase 徽标 + task_digest（右端整段复制）；正文上方为
- * 执行链时间线（tool_calls）与折叠的思考过程（thoughts）；markdown 正文经
- * MarkdownText 渲染（rehype-sanitize 输出层消毒 + highlight.js 语法高亮），
- * 流式光标在正文末尾；footer 为终态/时长/用量/排队提示。流式更新 =
- * 同 messageId 的 card_patch 整卡替换（上层已归并），子区块 memo 按值比较。
+ * 工具/任务卡片：头部 phase 徽标（仅流式渲染——Rust finalize 终态帧 phase
+ * 保留最后 chunk 状态不重置，对飞书平台有既有语义故不改协议；终态语义由
+ * footer 已完成/出错承载）+ task_digest（右端整段复制，终态保留）；正文上方
+ * 为执行链时间线（流式运行项展开高亮；终态整块折叠为一行摘要按钮，点击
+ * 展开）与折叠的思考过程（thoughts）；markdown 正文经 MarkdownText 渲染
+ * （rehype-sanitize 输出层消毒 + highlight.js 语法高亮），流式光标在正文
+ * 末尾；footer 为终态/时长/用量/排队提示。流式更新 = 同 messageId 的
+ * card_patch 整卡替换（上层已归并），子区块 memo 按值比较。
  */
 export function CardView({ entry }: { entry: CardEntry }) {
   const { card, state } = entry;
@@ -271,9 +314,11 @@ export function CardView({ entry }: { entry: CardEntry }) {
   return (
     <div className={`group rounded-2xl border bg-panel p-3 ${borderCls}`}>
       <div className="mb-2 flex items-center gap-2">
-        <span className={`shrink-0 rounded-full px-2 py-0.5 text-xs font-medium ${phase.cls}`}>
-          {phase.label}
-        </span>
+        {streaming && (
+          <span className={`shrink-0 rounded-full px-2 py-0.5 text-xs font-medium ${phase.cls}`}>
+            {phase.label}
+          </span>
+        )}
         {card.task_digest && (
           <span className="min-w-0 truncate text-xs text-faint">{card.task_digest}</span>
         )}
@@ -289,7 +334,7 @@ export function CardView({ entry }: { entry: CardEntry }) {
         </p>
       )}
 
-      <ToolTimeline calls={card.tool_calls} />
+      <ToolTimeline calls={card.tool_calls} finished={!streaming} />
       <Thoughts thoughts={card.thoughts} active={streaming} />
       <MarkdownBody text={card.text} streaming={streaming} />
       <Todos todos={card.todos} />
