@@ -81,6 +81,9 @@ agent-client-protocol = "2"
 # 飞书 open-lark SDK（package name=openlark，lib name=open_lark，二者不同名是 SDK 设计）
 openlark = { version = "0.20", default-features = false, features = ["auth", "communication", "websocket"] }
 
+# passkey（L3）：webauthn-rs → openssl 传递依赖；vendored = musl 交叉（ECS 部署）时源码编译静态链入，免目标机 libssl。
+openssl = { version = "0.10", features = ["vendored"] }
+
 [package]
 name = "imagent"
 version.workspace = true

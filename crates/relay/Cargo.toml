@@ -27,6 +27,9 @@ hex = { workspace = true }
 # passkey 登录（WebAuthn RP）：注册/断言两阶段验签（凭证落盘经 Passkey 的
 # serde 序列化，无需 danger-* feature）
 webauthn-rs = { workspace = true }
+# 仅用于把 webauthn-rs→openssl 传递依赖统一为 vendored（musl 交叉静态编译）；
+# 本 crate 生产代码不直接调用 openssl。e2e 软认证器（测试内 ES256 签名）也引它。
+openssl = { workspace = true }
 
 [dev-dependencies]
 # 集成测试客户端（连真 server 起双端）
