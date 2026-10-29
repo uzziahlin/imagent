@@ -2,11 +2,16 @@
 //! bind、serve 组装。核心逻辑全部在 lib（任务说明 §4.7 分层），这里只有
 //! 「装配 + 生命周期」。
 //!
-//! env 一览（§4.6 + v1.2）：
+//! env 一览（§4.6 + v1.2 + v1.3）：
+//! - `IMAGENT_RELAY_GATEWAY_KEYS`（v1.3）：网关 machine-公钥绑定表
+//!   （`home-mac=<64 hex ed25519 公钥>,…`，与 GATEWAY_TOKENS 同格式）——
+//!   网关侧 `~/.imagent/web-gateway-key` 首次启动自动生成密钥对并打印
+//!   公钥，把公钥配到对应机器名下即完成接入。与 TOKENS 至少配置其一
+//!   （fail-closed）；双表并存任一命中（迁移期双保险）。
 //! - `IMAGENT_RELAY_GATEWAY_TOKENS`：网关 token-machine 绑定表
 //!   （`home-mac=9a08…,work-mac=7f2b…`，每台 Mac 一个独立 token；旧单
 //!   token env `IMAGENT_RELAY_GATEWAY_TOKEN` 已删除——检测到旧值给迁移
-//!   指引）；与 USER_TOKEN 均未设 → 拒启（fail-closed）。
+//!   指引）。
 //! - `IMAGENT_RELAY_USER_TOKEN`：浏览器登录 token（仅登录换发会话用）。
 //! - `IMAGENT_RELAY_STATE_DIR`：会话状态目录（缺省
 //!   `/var/lib/imagent-relay`，会话表落盘 `<dir>/sessions.json`）；systemd
@@ -23,7 +28,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use imagent_relay::{
-    spawn_relay, validate_bind, GatewayTokens, RelayConfig, DEFAULT_SESSION_TTL_SECS,
+    spawn_relay, validate_bind, GatewayKeys, GatewayTokens, RelayConfig, DEFAULT_SESSION_TTL_SECS,
 };
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
@@ -68,10 +73,14 @@ async fn main() -> ExitCode {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
     // 日志纪律（§4.5）：网关 token 绝不输出（只报 machine 列表——machine
-    // 是路由身份不是秘密）；USER_TOKEN 只露前 4 位。
+    // 是路由身份不是秘密）；公钥是公开材料，只报指纹（前 16 hex）降噪——
+    // 排查握手不匹配时用网关侧启动日志的完整公钥对照；USER_TOKEN 只露
+    // 前 4 位。
     tracing::info!(target: "imagent::relay",
         addr = %bind,
         gateway_machines = ?config.gateway_tokens.machines(),
+        gateway_key_machines = ?config.gateway_keys.machines(),
+        gateway_key_fps = ?config.gateway_keys.fingerprints(),
         user_token = %imagent_relay::mask_token(&config.user_token),
         state_dir = %config.state_dir.display(),
         session_ttl_days = config.session_ttl_secs / 86_400,
@@ -115,29 +124,39 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// 从 env 构造配置（§4.6 汇总表 + v1.2 会话层）。错误信息可读（含生成/
-/// 迁移指引）。
+/// 从 env 构造配置（§4.6 汇总表 + v1.2 会话层 + v1.3 公钥表）。错误信息
+/// 可读（含生成/迁移指引）。
 fn relay_config_from_env() -> Result<RelayConfig, String> {
+    // 网关公钥表（v1.3，key 挑战应答验签用）。未设/空 → 空表（不是错误：
+    // 「KEYS/TOKENS 至少其一」由下方显式判定，只配 TOKENS 的既有部署
+    // 零改动）。
+    let gateway_keys = match std::env::var("IMAGENT_RELAY_GATEWAY_KEYS") {
+        Ok(v) if !v.trim().is_empty() => GatewayKeys::parse(&v)?,
+        _ => GatewayKeys::default(),
+    };
     // 网关 token-machine 绑定表（v1.2）。旧单 token env 已删除：还设着旧
     // 值时给显式迁移指引，而不是一句「未设置」让人摸不着头脑。
     let gateway_tokens = match std::env::var("IMAGENT_RELAY_GATEWAY_TOKENS") {
         Ok(v) if !v.trim().is_empty() => GatewayTokens::parse(&v)?,
-        _ => {
-            let legacy_set = std::env::var("IMAGENT_RELAY_GATEWAY_TOKEN")
-                .map(|v| !v.trim().is_empty())
-                .unwrap_or(false);
-            return Err(if legacy_set {
-                "IMAGENT_RELAY_GATEWAY_TOKEN 已废弃：请改用 IMAGENT_RELAY_GATEWAY_TOKENS\
-                 （machine=token 逗号分隔，每台 Mac 一个独立 token；本机 ~/.imagent/web-relay.env \
-                 的 IMAGENT_WEB_GATEWAY_TOKEN 同步改为本机 machine 对应的 token）"
-                    .into()
-            } else {
-                "环境变量 IMAGENT_RELAY_GATEWAY_TOKENS 未设置或为空（machine=token 逗号分隔，\
-                 每台 Mac 一个独立 token；openssl rand -hex 32 生成；relay 不提供无认证模式）"
-                    .into()
-            });
-        }
+        _ => GatewayTokens::default(),
     };
+    if gateway_tokens.is_empty() && gateway_keys.is_empty() {
+        let legacy_set = std::env::var("IMAGENT_RELAY_GATEWAY_TOKEN")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+        return Err(if legacy_set {
+            "IMAGENT_RELAY_GATEWAY_TOKEN 已废弃：请改用 IMAGENT_RELAY_GATEWAY_TOKENS\
+             （machine=token 逗号分隔，每台 Mac 一个独立 token；本机 ~/.imagent/web-relay.env \
+             的 IMAGENT_WEB_GATEWAY_TOKEN 同步改为本机 machine 对应的 token），\
+             或改用 IMAGENT_RELAY_GATEWAY_KEYS（machine=<64 hex ed25519 公钥>，v1.3 挑战应答）"
+                .into()
+        } else {
+            "环境变量 IMAGENT_RELAY_GATEWAY_KEYS（machine=<64 hex ed25519 公钥> 逗号分隔，\
+             v1.3 挑战应答）与 IMAGENT_RELAY_GATEWAY_TOKENS（machine=token 逗号分隔）\
+             均未设置或为空——至少配置其一；relay 不提供无认证模式"
+                .into()
+        });
+    }
     let user_token = non_empty_env("IMAGENT_RELAY_USER_TOKEN")?;
     // 会话状态目录（v1.2）：main 负责 mkdir（spawn_relay 侧只兜底），启动
     // 期就发现权限问题，而不是首次换发会话时才报。
@@ -161,6 +180,7 @@ fn relay_config_from_env() -> Result<RelayConfig, String> {
         .filter(|v| !v.is_empty());
     let cfg = RelayConfig {
         gateway_tokens,
+        gateway_keys,
         user_token,
         state_dir,
         session_ttl_secs: DEFAULT_SESSION_TTL_SECS,

@@ -29,7 +29,7 @@ use imagent_core::{
 use crate::client::WebClient;
 use crate::{
     encode_approval_request_frame, encode_approval_resolved_frame, encode_card_frame,
-    encode_text_frame, CardPayload, TARGET,
+    encode_text_frame, CardPayload, GatewayCredential, TARGET,
 };
 
 const PLATFORM: &str = "web";
@@ -165,13 +165,15 @@ pub struct WebPlatform {
 impl WebPlatform {
     /// 构造并后台 spawn client 任务（建连/认证/心跳/重连/收发）与 sync
     /// responder 任务。`relay_url` 形如 `wss://…/imagent/gateway`；
-    /// `gateway_token` 走 env `IMAGENT_WEB_GATEWAY_TOKEN`（main 装配）；
-    /// `machine_id` 为本机 machine 身份（v1.1，main 经
+    /// `credential` 为网关认证凭证（v1.3：key 优先 token 回退，main 经
+    /// [`crate::key::load_gateway_credential`] 装配——密钥文件
+    /// `<imagent_home>/web-gateway-key` 缺省自动生成；`IMAGENT_WEB_GATEWAY_TOKEN`
+    /// 为兼容回退）；`machine_id` 为本机 machine 身份（v1.1，main 经
     /// [`crate::resolve_machine_id`] 解析：config 显式值 / hostname 短名）；
     /// `default_session` 为无 convId 浏览器消息的落点（缺省 "default"）。
     pub fn new(
         relay_url: String,
-        gateway_token: String,
+        credential: GatewayCredential,
         default_session: String,
         machine_id: String,
     ) -> Self {
@@ -186,7 +188,7 @@ impl WebPlatform {
         // client 任务：连接立即开始（断线自动重连）。
         let client = WebClient {
             relay_url: relay_url.clone(),
-            gateway_token,
+            credential,
             machine_id: machine_id.clone(),
             default_session,
             online: online.clone(),
@@ -471,7 +473,7 @@ mod tests {
     fn offline_platform() -> WebPlatform {
         WebPlatform::new(
             "ws://127.0.0.1:1/gateway".into(),
-            "unused-token".into(),
+            GatewayCredential::Token("unused-token".into()),
             "default".into(),
             "test-mac".into(),
         )

@@ -1510,10 +1510,12 @@ fn build_backend(
 ///   `app_secret` 取自环境变量 `IMAGENT_FEISHU_APP_SECRET`（keyring bootstrap 为后续 P2），
 ///   默认 `base_url = https://open.feishu.cn`。
 /// - `"web"` → [`imagent_web::WebPlatform`]（Web 驾驶舱 M2/M5）：`web_relay_url` 取自
-///   config；gateway token 取自环境变量 `IMAGENT_WEB_GATEWAY_TOKEN`（敏感不入
-///   config.toml，与飞书先例同款）；`web_default_session` 缺省 "default"；
-///   machine 身份 = `web_machine_id` 显式值 / 缺省 hostname 短名（M5 多终端，
-///   hello 自报给 relay）。
+///   config；gateway 认证凭证 v1.3 起 **key 优先 token 回退**——密钥文件
+///   `<imagent_home>/web-gateway-key`（首次启动自动生成 ed25519 密钥对并打印
+///   公钥指引，0600），env `IMAGENT_WEB_GATEWAY_TOKEN` 为密钥文件损坏时的
+///   回退（v1.2 兼容路径）；`web_default_session` 缺省 "default"；machine
+///   身份 = `web_machine_id` 显式值 / 缺省 hostname 短名（M5 多终端，hello
+///   自报给 relay）。
 /// - `"local"` → [`imagent_localterm::LocalPlatform`]（本地终端，`imagent claude`）：
 ///   **无 config 字段**——socket 锚定 `<imagent_home>/local.sock`，凭证 = 文件
 ///   0600 + accept 侧 peer uid 校验（同 uid = 机器本主），无可配凭据。会话
@@ -1600,15 +1602,24 @@ async fn build_platform(
             )?))
         }
         "web" => {
-            // Web 驾驶舱 M2：relay 地址（非敏感）走 config；gateway token 走
-            // env（敏感不入 config.toml——对齐飞书 IMAGENT_FEISHU_APP_SECRET
-            // 先例）。缺失直接报启动错误（fail-closed，relay 无匿名形态）。
+            // Web 驾驶舱 M2：relay 地址（非敏感）走 config；machine 身份与
+            // 默认会话同既有。gateway 认证凭证（v1.3）**key 优先 token
+            // 回退**：密钥文件锚定 imagent home（与 local.sock 同款注入——
+            // main 计算路径，imagent_web 读/生成，不硬编 home），首次启动
+            // 自动生成 ed25519 密钥对（0600 + warn 打印公钥与 ECS 配置
+            // 指引）；env IMAGENT_WEB_GATEWAY_TOKEN 降级为密钥文件损坏时
+            // 的回退（v1.2 兼容路径）——两者皆不可用才报启动错误
+            //（fail-closed，relay 无匿名形态）。
             let relay_url = config.web_relay_url.clone().ok_or_else(|| {
                 anyhow!("platform=web 需在 config.toml 配置 web_relay_url（如 wss://<ecs>:8443/imagent/gateway）")
             })?;
-            let gateway_token = std::env::var("IMAGENT_WEB_GATEWAY_TOKEN").map_err(|_| {
-                anyhow!("platform=web 需设置环境变量 IMAGENT_WEB_GATEWAY_TOKEN（与 relay 侧 IMAGENT_RELAY_GATEWAY_TOKENS 中本机 machine 绑定的 token 同值——v1.2 起每台 Mac 独立 token）")
-            })?;
+            let gateway_token = std::env::var("IMAGENT_WEB_GATEWAY_TOKEN")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
+            let key_path = imagent_core::paths::imagent_home().join("web-gateway-key");
+            let credential = imagent_web::key::load_gateway_credential(&key_path, gateway_token)
+                .map_err(|e| anyhow!("platform=web 网关认证凭证装配失败：{e}"))?;
             let default_session = config
                 .web_default_session
                 .clone()
@@ -1618,7 +1629,7 @@ async fn build_platform(
             let machine_id = imagent_web::resolve_machine_id(config.web_machine_id.as_deref());
             Ok(Arc::new(imagent_web::WebPlatform::new(
                 relay_url,
-                gateway_token,
+                credential,
                 default_session,
                 machine_id,
             )))

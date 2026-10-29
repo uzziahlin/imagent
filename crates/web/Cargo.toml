@@ -19,7 +19,15 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
+# 网关 ed25519 挑战应答认证（协议 v1.3）：密钥文件加载/生成（rand 出 seed）
+# 与 prove 帧签名；seed/公钥 hex 编解码。
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 # 回环集成测试（tests/web_loopback.rs）：起真 relay（随机端口）+ 模拟浏览器。
 imagent-relay = { path = "../relay" }
+# 测试内生成 ed25519 密钥对（relay 的 GATEWAY_KEYS 表 + 平台侧签名凭证）。
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }

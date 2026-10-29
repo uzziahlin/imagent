@@ -12,15 +12,19 @@
 //! 假 credential id 分布（无签名能力），不适用；真浏览器认证器无法进
 //! CI，软认证器等价覆盖服务端验签路径（challenge/origin/rpIdHash/UP/UV/
 //! 签名/计数器）。
+//! v1.3 网关 ed25519 挑战应答：key 握手全流程（测试内生成密钥对真签名）、
+//! 错私钥/错公钥/未知 machine 拒、nonce 重放拒（同 prove 重发）、双表
+//!（KEYS/TOKENS）并存任一命中——token 路径由既有全量用例回归。
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use ed25519_dalek::{Signer, SigningKey};
 use futures::{SinkExt, StreamExt};
 use imagent_relay::{
-    spawn_relay, GatewayTokens, RelayConfig, RelayHandle, DEFAULT_SESSION_TTL_SECS,
+    spawn_relay, GatewayKeys, GatewayTokens, RelayConfig, RelayHandle, DEFAULT_SESSION_TTL_SECS,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::http::Request;
@@ -65,6 +69,9 @@ fn temp_state_dir() -> PathBuf {
 fn test_config(state_dir: &std::path::Path, session_ttl_secs: u64) -> RelayConfig {
     RelayConfig {
         gateway_tokens: test_gateway_tokens(),
+        // v1.3：默认空公钥表（token-only 形态合法）；key 用例见
+        // `key_only_config` / `dual_table_config`。
+        gateway_keys: GatewayKeys::default(),
         user_token: USER_TOKEN.to_string(),
         state_dir: state_dir.to_path_buf(),
         session_ttl_secs,
@@ -186,6 +193,314 @@ async fn gateway_hello(ws: &mut Ws, machine: &str) {
         ack.contains(r#""type":"hello_ack""#) && ack.contains(&format!(r#""machine":"{machine}""#)),
         "hello_ack 应回显 machine：{ack}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// v1.3 网关 ed25519 挑战应答（key 握手）
+// ---------------------------------------------------------------------------
+
+/// 测试内派生 ed25519 密钥对（seed 固定可复现）。
+fn test_signing_key(seed: u8) -> SigningKey {
+    SigningKey::from_bytes(&[seed; 32])
+}
+
+/// 公钥 hex（GATEWAY_KEYS 表 / prove.pubkey 同一形态）。
+fn pubkey_hex(sk: &SigningKey) -> String {
+    hex::encode(sk.verifying_key().to_bytes())
+}
+
+/// key-only 配置（tokens 全空）：`machine → 密钥对` 列表建公钥表。
+fn key_only_config(
+    state_dir: &std::path::Path,
+    pairs: &[(&'static str, SigningKey)],
+) -> RelayConfig {
+    let spec = pairs
+        .iter()
+        .map(|(m, sk)| format!("{m}={}", pubkey_hex(sk)))
+        .collect::<Vec<_>>()
+        .join(",");
+    RelayConfig {
+        gateway_tokens: GatewayTokens::default(),
+        gateway_keys: GatewayKeys::parse(&spec).expect("测试公钥表合法"),
+        user_token: USER_TOKEN.to_string(),
+        state_dir: state_dir.to_path_buf(),
+        session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
+        webauthn_rp_id: None,
+    }
+}
+
+/// v1.3 key 握手三帧（真签名）：hello（无 token）→ challenge（断言 nonce
+/// 为 64 hex）→ prove（对 nonce 原文签名）→ hello_ack（回显 machine）。
+async fn gateway_key_handshake(ws: &mut Ws, machine: &str, sk: &SigningKey) {
+    ws.send(Message::text(format!(
+        r#"{{"v":1,"type":"hello","machine":"{machine}"}}"#
+    )))
+    .await
+    .unwrap();
+    let challenge = next_of_type(ws, "challenge").await;
+    let nonce = challenge["nonce"].as_str().expect("challenge 带 nonce");
+    assert_eq!(nonce.len(), 64, "nonce 为 32B hex：{challenge}");
+    assert!(nonce.chars().all(|c| c.is_ascii_hexdigit()));
+    let prove = serde_json::json!({
+        "v": 1,
+        "type": "prove",
+        "pubkey": pubkey_hex(sk),
+        "signature": hex::encode(sk.sign(nonce.as_bytes()).to_bytes()),
+    });
+    ws.send(Message::text(prove.to_string())).await.unwrap();
+    let ack = next_text(ws).await;
+    assert!(
+        ack.contains(r#""type":"hello_ack""#) && ack.contains(&format!(r#""machine":"{machine}""#)),
+        "hello_ack 应回显 machine：{ack}"
+    );
+}
+
+/// 发一条 prove（不经握手辅助——重放/篡改用例需要逐字段控制）。
+async fn send_prove(ws: &mut Ws, pubkey: &str, signature: &str) {
+    ws.send(Message::text(
+        serde_json::json!({
+            "v": 1, "type": "prove", "pubkey": pubkey, "signature": signature
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+}
+
+/// 场景 31（v1.3 key 握手）：keys-only relay（tokens 全空——「只配公钥表
+/// 也合法」）下 hello → challenge → prove → hello_ack 全流程；浏览器侧
+/// machines 快照含该机器；业务帧双向透传不受认证形态影响。
+#[tokio::test]
+async fn e2e_gateway_key_handshake_full_flow() {
+    let dir = temp_state_dir();
+    let sk = test_signing_key(1);
+    let handle = spawn_with_config(key_only_config(&dir, &[("home", sk.clone())])).await;
+    let addr = handle.addr;
+
+    let mut gw = connect_ws(&addr, "/gateway", None).await;
+    gateway_key_handshake(&mut gw, "home", &sk).await;
+
+    // 浏览器视角：home 上线（machines 快照）。
+    let mut br = connect_ws(&addr, "/ws", None).await;
+    hello_handshake(&mut br, USER_TOKEN).await;
+    consume_browser_snapshots(&mut br, false, &["home"]).await;
+
+    // 双向透传（认证形态不影响转发语义）。
+    br.send(Message::text(
+        r#"{"v":1,"type":"message","machine":"home","convId":"web:work","text":"hi"}"#,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        next_text(&mut gw).await,
+        r#"{"v":1,"type":"message","machine":"home","convId":"web:work","text":"hi"}"#
+    );
+    let out = r#"{"v":1,"type":"text","machine":"home","convId":"web:work","text":"done"}"#;
+    gw.send(Message::text(out)).await.unwrap();
+    assert_eq!(next_text(&mut br).await, out);
+
+    handle.shutdown();
+    handle.wait().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 场景 32（v1.3 key 握手拒绝面）：错私钥（公钥不匹配 + 签名也错）/
+/// 正确公钥但错私钥签名（验签路径）/ 未知 machine（nonce 照发——防探测，
+/// prove 必拒）/ 畸形 prove / prove 阶段重发 hello，均 1008。
+#[tokio::test]
+async fn e2e_gateway_key_rejections_close_1008() {
+    let dir = temp_state_dir();
+    let bound = test_signing_key(1);
+    let handle = spawn_with_config(key_only_config(&dir, &[("home", bound.clone())])).await;
+    let addr = handle.addr;
+
+    // 读 challenge 取 nonce（async fn 避免闭包 lifetime 纠缠）。
+    async fn nonce_of(ws: &mut Ws) -> String {
+        let c = next_of_type(ws, "challenge").await;
+        c["nonce"].as_str().unwrap().to_string()
+    }
+
+    // 错私钥（prove.pubkey ≠ 绑定公钥，签名也不匹配）。
+    let wrong = test_signing_key(2);
+    {
+        let mut ws = connect_ws(&addr, "/gateway", None).await;
+        ws.send(Message::text(r#"{"v":1,"type":"hello","machine":"home"}"#))
+            .await
+            .unwrap();
+        let nonce = nonce_of(&mut ws).await;
+        let sig = hex::encode(wrong.sign(nonce.as_bytes()).to_bytes());
+        send_prove(&mut ws, &pubkey_hex(&wrong), &sig).await;
+        expect_close(&mut ws, 1008).await;
+    }
+
+    // 正确公钥 + 错私钥签名（公钥比对过，验签拒——两道防线分别覆盖）。
+    {
+        let mut ws = connect_ws(&addr, "/gateway", None).await;
+        ws.send(Message::text(r#"{"v":1,"type":"hello","machine":"home"}"#))
+            .await
+            .unwrap();
+        let nonce = nonce_of(&mut ws).await;
+        let sig = hex::encode(wrong.sign(nonce.as_bytes()).to_bytes());
+        send_prove(&mut ws, &pubkey_hex(&bound), &sig).await;
+        expect_close(&mut ws, 1008).await;
+    }
+
+    // 未知 machine（shape 合法但不在表）：challenge 照发（防探测），
+    // prove 必拒。
+    {
+        let mut ws = connect_ws(&addr, "/gateway", None).await;
+        ws.send(Message::text(r#"{"v":1,"type":"hello","machine":"ghost"}"#))
+            .await
+            .unwrap();
+        let nonce = nonce_of(&mut ws).await;
+        let sig = hex::encode(bound.sign(nonce.as_bytes()).to_bytes());
+        send_prove(&mut ws, &pubkey_hex(&bound), &sig).await;
+        expect_close(&mut ws, 1008).await;
+    }
+
+    // 畸形 prove（非 JSON / 错 type）。
+    {
+        let mut ws = connect_ws(&addr, "/gateway", None).await;
+        ws.send(Message::text(r#"{"v":1,"type":"hello","machine":"home"}"#))
+            .await
+            .unwrap();
+        let _ = nonce_of(&mut ws).await;
+        ws.send(Message::text("not json")).await.unwrap();
+        expect_close(&mut ws, 1008).await;
+    }
+    {
+        let mut ws = connect_ws(&addr, "/gateway", None).await;
+        ws.send(Message::text(r#"{"v":1,"type":"hello","machine":"home"}"#))
+            .await
+            .unwrap();
+        let _ = nonce_of(&mut ws).await;
+        // prove 阶段重发 hello（非 prove 帧）。
+        ws.send(Message::text(r#"{"v":1,"type":"hello","machine":"home"}"#))
+            .await
+            .unwrap();
+        expect_close(&mut ws, 1008).await;
+    }
+
+    handle.shutdown();
+    handle.wait().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 场景 33（v1.3 nonce 防重放）：完整握手消费 nonce 后，**同一条 prove
+/// 帧**在新连接上重发（新 challenge 已下发）→ 1008——nonce 单次消费，
+/// 录制 prove 重放无效。
+#[tokio::test]
+async fn e2e_gateway_key_nonce_replay_rejected() {
+    let dir = temp_state_dir();
+    let sk = test_signing_key(1);
+    let handle = spawn_with_config(key_only_config(&dir, &[("home", sk.clone())])).await;
+    let addr = handle.addr;
+
+    // 第一次：正常握手（nonce 消费掉），录下 prove 原文。
+    let mut a = connect_ws(&addr, "/gateway", None).await;
+    a.send(Message::text(r#"{"v":1,"type":"hello","machine":"home"}"#))
+        .await
+        .unwrap();
+    let nonce = next_of_type(&mut a, "challenge").await["nonce"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let prove = serde_json::json!({
+        "v": 1, "type": "prove",
+        "pubkey": pubkey_hex(&sk),
+        "signature": hex::encode(sk.sign(nonce.as_bytes()).to_bytes()),
+    })
+    .to_string();
+    a.send(Message::text(prove.clone())).await.unwrap();
+    let ack = next_text(&mut a).await;
+    assert!(
+        ack.contains(r#""type":"hello_ack""#),
+        "首次握手应成功：{ack}"
+    );
+
+    // 第二次：新连接拿到**新** challenge，重放旧 prove（旧 nonce 已消费）。
+    let mut b = connect_ws(&addr, "/gateway", None).await;
+    b.send(Message::text(r#"{"v":1,"type":"hello","machine":"home"}"#))
+        .await
+        .unwrap();
+    let new_nonce = next_of_type(&mut b, "challenge").await["nonce"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(new_nonce, nonce, "nonce 一次性，新连接必然不同");
+    b.send(Message::text(prove)).await.unwrap();
+    expect_close(&mut b, 1008).await;
+
+    handle.shutdown();
+    handle.wait().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 场景 34（v1.3 双表并存）：KEYS 与 TOKENS 同时配置——token 机器与 key
+/// 机器**同时在线**（各自走各自认证路径）；同一 machine 两表都绑定时，
+/// token / key 两种 hello 形态均可认证（任一表命中即放行）。
+#[tokio::test]
+async fn e2e_gateway_dual_tables_coexist() {
+    let dir = temp_state_dir();
+    let home_key = test_signing_key(1);
+    let keyed_key = test_signing_key(2);
+    // tokens：既有 TEST_MACHINES 表；keys：home（双表绑定）+ keyed-mac。
+    let keys_spec = format!(
+        "home={},keyed-mac={}",
+        pubkey_hex(&home_key),
+        pubkey_hex(&keyed_key)
+    );
+    let config = RelayConfig {
+        gateway_tokens: test_gateway_tokens(),
+        gateway_keys: GatewayKeys::parse(&keys_spec).unwrap(),
+        user_token: USER_TOKEN.to_string(),
+        state_dir: dir.clone(),
+        session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
+        webauthn_rp_id: None,
+    };
+    let handle = spawn_with_config(config).await;
+    let addr = handle.addr;
+
+    // token 机器（home，走既有一步校验）与 key 机器（keyed-mac）同时在线。
+    let mut gw_token = connect_ws(&addr, "/gateway", None).await;
+    gateway_hello(&mut gw_token, "home").await;
+    let mut gw_key = connect_ws(&addr, "/gateway", None).await;
+    gateway_key_handshake(&mut gw_key, "keyed-mac", &keyed_key).await;
+
+    let mut br = connect_ws(&addr, "/ws", None).await;
+    hello_handshake(&mut br, USER_TOKEN).await;
+    consume_browser_snapshots(&mut br, false, &["home", "keyed-mac"]).await;
+
+    // 同一 machine（home）双表绑定：断开 token 连接后改走 key 形态亦认证
+    // 通过（任一表命中）。注意 home 槽位单连接——先关旧的再连。
+    drop(gw_token);
+    tokio::time::sleep(Duration::from_millis(100)).await; // 等 relay 清槽位
+    let mut gw_home_key = connect_ws(&addr, "/gateway", None).await;
+    gateway_key_handshake(&mut gw_home_key, "home", &home_key).await;
+    // drop 的下线广播与新连接的上线广播次序有竞态（踢旧顶替时甚至只有
+    // 一帧），循环消费 machines 帧直到最终态：home（key 形态）+ keyed-mac。
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let v = next_of_type(&mut br, "machines").await;
+        let mut got: Vec<String> = v["online"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap().to_string())
+            .collect();
+        got.sort();
+        if got == vec!["home".to_string(), "keyed-mac".to_string()] {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "home（key 形态）未恢复在线：{v}"
+        );
+    }
+
+    handle.shutdown();
+    handle.wait().await;
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// 读下一条文本帧（跳过 ping/pong；5s 超时防挂死）。
@@ -1444,6 +1759,7 @@ async fn e2e_gateway_token_machine_binding() {
     let dir = temp_state_dir();
     let handle = spawn_with_config(RelayConfig {
         gateway_tokens,
+        gateway_keys: GatewayKeys::default(),
         user_token: USER_TOKEN.to_string(),
         state_dir: dir.clone(),
         session_ttl_secs: DEFAULT_SESSION_TTL_SECS,

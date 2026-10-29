@@ -4,10 +4,11 @@
 //! 拓扑：`浏览器 WS（多连接并存）⇄ relay ⇄ 网关 WS（单连接）`，连接都是
 //! 客户端模式连到本进程（Mac 网关零入站端口）。本 crate 是中继：
 //! **不理解任何业务语义**，只做认证（fail-closed、网关 token-machine
-//! 绑定、浏览器会话层）、转发（Hub 状态机）、网关离线缓冲（200 帧 /
-//! 1MB）、每连接限流（20 帧 / 10s）。部署形态：ECS systemd 服务绑
-//! 127.0.0.1:3010，公网由 Caddy（8443，TLS 终结）`handle_path /imagent/*`
-//! strip 前缀后反代——relay 看到的路径已是 strip 后的 `/xxx`。
+//! 绑定 + ed25519 挑战应答、浏览器会话层）、转发（Hub 状态机）、网关离线
+//! 缓冲（200 帧 / 1MB）、每连接限流（20 帧 / 10s）。部署形态：ECS systemd
+//! 服务绑 127.0.0.1:3010，公网由 Caddy（8443，TLS 终结）
+//! `handle_path /imagent/*` strip 前缀后反代——relay 看到的路径已是 strip
+//! 后的 `/xxx`。
 //!
 //! 端点语义（真机常态：手机 + 电脑 + 多标签同时在线）：
 //! - **浏览器侧多连接并存 + 广播**：同一 user token 的多条 browser 连接
@@ -29,6 +30,17 @@
 //!   扮演它自己，不能顶替其它机器。旧单 token env
 //!   （`IMAGENT_RELAY_GATEWAY_TOKEN`）已删除；两者都未设拒启
 //!   （fail-closed）。
+//! - **网关 ed25519 挑战应答（帧协议 v1.3，L3 安全加固）**：hello 不带
+//!   token 的网关走公私钥握手——`hello{machine}` → relay 下发一次性
+//!   `challenge{nonce}`（32B hex，60s 过期单次消费，见
+//!   [`ChallengeTable`]）→ 网关回 `prove{pubkey,signature}` → relay 用
+//!   env `IMAGENT_RELAY_GATEWAY_KEYS`（`home-mac=<64 hex 公钥>`，见
+//!   [`GatewayKeys`]）绑定的公钥验签。防的是「ECS 被攻破 = 网关身份
+//!   凭证泄露」：relay 只存公钥，私钥 seed（0600 文件）永不出网关本机；
+//!   一次性 nonce 防录制重放。**token 路径完整保留**（hello 带 token 走
+//!   既有一步校验；KEYS/TOKENS 双表并存，机器在任一表命中即放行——迁移
+//!   期双保险，旧网关/旧 env 零改动；两表均空仍拒启 fail-closed）。
+//!   认证失败不区分原因（统一 1s 延迟 + close 1008，防探测）。
 //! - **浏览器会话层（帧协议 v1.2，L2 安全加固，见 [`sessions`]）**：
 //!   USER_TOKEN 仅登录 hello 一次性换发 30 天会话凭证（sessionToken），
 //!   此后重连用 sessionToken（SPA 不再长期持有 USER_TOKEN）；会话可列表
@@ -66,6 +78,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use futures::StreamExt;
 use serde::Deserialize;
 use tokio::net::TcpListener;
@@ -124,6 +137,14 @@ pub const DEFAULT_SESSION_TTL_SECS: u64 = 30 * 24 * 3600;
 const DEVICE_NAME_MAX_CHARS: usize = 64;
 /// 连接日志里 session id 的展示前缀长度（完整 UUID 不进日志噪音）。
 const SESSION_LOG_PREFIX: usize = 8;
+/// challenge nonce 有效期（协议 v1.3）：60s 内须回 prove，过期作废。
+const CHALLENGE_TTL: Duration = Duration::from_secs(60);
+/// challenge 表容量上限（协议 v1.3 的防滥用护栏）：无凭证 hello 也会触发
+/// challenge 签发（anti-probe：不区分 machine 是否在表），上限防未认证
+/// 连接洪水撑爆内存。签发时先清过期，仍满则逐出**最早过期**（= 最早签发）
+/// 的条目——正常网关握手毫秒级完成，60s 窗口内 1024 个并发未完成握手已
+/// 远超真实部署形态。
+const CHALLENGE_MAX_ENTRIES: usize = 1024;
 
 /// WS close code（RFC 6455 + 私有码，§4.2/§4.3/§4.5）。
 const CLOSE_POLICY: u16 = 1008; // 认证失败 / 协议违规（binary、非 hello 首帧）/ 限流
@@ -234,11 +255,206 @@ impl GatewayTokens {
     }
 }
 
+/// 网关公钥表条目：原始 hex（恒定时间比对用）+ 解析好的验签公钥。
+#[derive(Clone, Debug)]
+struct GatewayKeyEntry {
+    /// 64 hex 公钥原文（prove.pubkey 与之恒定时间比对）。
+    hex: String,
+    /// 解析好的 ed25519 验签公钥（parse 期已校验点合法性）。
+    key: VerifyingKey,
+}
+
+/// 网关 machine-公钥绑定表（协议 v1.3，L3 安全加固）：env
+/// `IMAGENT_RELAY_GATEWAY_KEYS`（逗号分隔的 `machine=<64 hex ed25519 公钥>`
+/// 对，如 `home-mac=9a08…,work-mac=7f2b…`，与 GATEWAY_TOKENS 同格式）。
+/// 防的是「ECS 被攻破 = 网关身份凭证泄露」：relay 只存**公钥**，拿到全表
+/// 也无法扮演任何网关（私钥 seed 永不出网关本机）；一次性 nonce 挑战应答
+/// 防录制重放。与 [`GatewayTokens`] 双表并存：机器在任一表命中即放行
+///（迁移期双保险）；两表均空由 [`RelayConfig::validate`] fail-closed 拒启。
+#[derive(Clone, Debug, Default)]
+pub struct GatewayKeys {
+    /// machine → 公钥（machine 已过与 hello `machine` 同款的合法性校验）。
+    map: HashMap<String, GatewayKeyEntry>,
+}
+
+impl GatewayKeys {
+    /// 解析 `machine=<64 hex 公钥>` 逗号分隔表（纯函数便于单测）。与
+    /// [`GatewayTokens::parse`] 同款表项纪律：缺 `=` / machine 或公钥空 /
+    /// machine 非法 / machine 重复 / 公钥重复绑定（一个公钥只能绑一台
+    /// 机器）→ Err；公钥须为合法 hex 且能解出 ed25519 公钥点。**空表 Ok**
+    ///（不是错误——「KEYS/TOKENS 至少一个非空」的 fail-closed 判定在
+    /// [`RelayConfig::validate`]，只配 TOKENS 的既有部署零改动）。
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let mut map: HashMap<String, GatewayKeyEntry> = HashMap::new();
+        let mut seen_keys: HashMap<String, String> = HashMap::new();
+        for pair in spec.split(',') {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            let (machine, pubkey) = pair.split_once('=').ok_or_else(|| {
+                format!("网关公钥表项 `{pair}` 缺 `=`（格式：machine=<64 hex 公钥> 逗号分隔）")
+            })?;
+            let (machine, pubkey) = (machine.trim(), pubkey.trim());
+            if machine.is_empty() || pubkey.is_empty() {
+                return Err(format!(
+                    "网关公钥表项 `{pair}` 的 machine 或公钥为空（格式：machine=<64 hex 公钥>）"
+                ));
+            }
+            if !valid_machine_id(machine) {
+                return Err(format!(
+                    "网关公钥表项的 machine `{machine}` 非法：≤32 char，仅 ASCII 字母数字与 -_（与 hello machine 同款约束）"
+                ));
+            }
+            let bytes = hex::decode(pubkey).map_err(|_| {
+                format!("网关公钥表项 `{machine}` 的公钥非合法 hex（须为 ed25519 公钥 64 hex，网关侧启动日志打印）")
+            })?;
+            let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+                format!(
+                    "网关公钥表项 `{machine}` 的公钥长度 {:?} 非法（须恰为 64 hex = 32 字节）",
+                    v.len() * 2
+                )
+            })?;
+            let key = VerifyingKey::from_bytes(&arr)
+                .map_err(|_| format!("网关公钥表项 `{machine}` 的公钥不是合法 ed25519 公钥点"))?;
+            if map
+                .insert(
+                    machine.to_string(),
+                    GatewayKeyEntry {
+                        hex: pubkey.to_string(),
+                        key,
+                    },
+                )
+                .is_some()
+            {
+                return Err(format!(
+                    "网关公钥表项的 machine `{machine}` 重复（每台机器一个公钥）"
+                ));
+            }
+            if let Some(first) = seen_keys.insert(pubkey.to_string(), machine.to_string()) {
+                return Err(format!(
+                    "网关公钥 `{}`… 同时绑定 `{first}` 与 `{machine}`：一个公钥只能绑一台机器（绑定语义）",
+                    pubkey.chars().take(4).collect::<String>()
+                ));
+            }
+        }
+        Ok(Self { map })
+    }
+
+    /// prove 验证（协议 v1.3 ①+②）：machine 在表中**且**绑定公钥与
+    /// prove.pubkey 恒定时间一致（公钥虽是公开材料，任务定案要求恒定时间
+    /// 比对，复用 [`constant_time_eq`]）**且** ed25519 验签 nonce 通过。
+    /// `nonce` 为 challenge 下发的 hex 字符串原文（网关对收到的 nonce
+    /// 原样签名，验签对象即其 UTF-8 字节——两侧无解码歧义）。任何一步
+    /// 失败统一 false（调用方不区分原因，防探测）。
+    pub fn verify(&self, machine: &str, pubkey: &str, nonce: &str, signature: &str) -> bool {
+        let Some(entry) = self.map.get(machine) else {
+            return false;
+        };
+        if !constant_time_eq(pubkey, entry.hex.as_str()) {
+            return false;
+        }
+        let Ok(sig) = hex::decode(signature) else {
+            return false;
+        };
+        let Ok(sig) = <[u8; 64]>::try_from(sig) else {
+            return false;
+        };
+        entry
+            .key
+            .verify(nonce.as_bytes(), &Signature::from_bytes(&sig))
+            .is_ok()
+    }
+
+    /// 已绑定的 machine 列表（有序，启动日志用）。
+    pub fn machines(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.map.keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// 公钥指纹表（有序，启动日志用）：`machine=<公钥前 16 hex>`——公钥是
+    /// 公开材料可全量打印，取指纹纯为日志降噪；排查握手不匹配时用网关侧
+    /// 启动日志的完整公钥对照。
+    pub fn fingerprints(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .map
+            .iter()
+            .map(|(m, e)| format!("{m}={}", &e.hex[..16]))
+            .collect();
+        v.sort();
+        v
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+}
+
+/// challenge nonce 表条目：签发时绑定 hello 自报的 machine，60s 过期。
+struct ChallengeEntry {
+    machine: String,
+    expires_at: Instant,
+}
+
+/// 网关 key 握手的 challenge 表（协议 v1.3，内存态、进程重启即清空——
+/// 挑战应答本就要求握手当次完成，无跨重启语义）：`nonce → machine`，
+/// 60s 过期、**单次消费**（consume 即移除，验签失败也不可重试同一 nonce
+/// ——防重放的核心）。容量护栏 [`CHALLENGE_MAX_ENTRIES`] 见其注释。
+/// 时间由调用方注入（单测可拨钟）；std Mutex 纯内存临界区，与 Hub 同款
+/// 「锁内计算不跨 await」纪律。
+#[derive(Default)]
+struct ChallengeTable {
+    map: HashMap<String, ChallengeEntry>,
+}
+
+impl ChallengeTable {
+    /// 签发一次性 nonce（32B 随机 → 64 hex）并绑定 machine。先清过期条目；
+    /// 仍满容量则逐出最早过期（= 最早签发）的条目。
+    fn issue(&mut self, machine: &str, now: Instant) -> String {
+        self.prune(now);
+        if self.map.len() >= CHALLENGE_MAX_ENTRIES {
+            if let Some(oldest) = self
+                .map
+                .iter()
+                .min_by_key(|(_, e)| e.expires_at)
+                .map(|(k, _)| k.clone())
+            {
+                self.map.remove(&oldest);
+            }
+        }
+        let nonce = hex::encode(rand::random::<[u8; 32]>());
+        self.map.insert(
+            nonce.clone(),
+            ChallengeEntry {
+                machine: machine.to_string(),
+                expires_at: now + CHALLENGE_TTL,
+            },
+        );
+        nonce
+    }
+
+    /// 消费 nonce：命中即移除（单次），返回绑定的 machine；未知 / 已消费 /
+    /// 已过期 → None。
+    fn consume(&mut self, nonce: &str, now: Instant) -> Option<String> {
+        let entry = self.map.remove(nonce)?;
+        (now < entry.expires_at).then_some(entry.machine)
+    }
+
+    /// 清除已过期条目（issue/consume 时顺带执行，无需独立定时器）。
+    fn prune(&mut self, now: Instant) {
+        self.map.retain(|_, e| now < e.expires_at);
+    }
+}
+
 /// relay 运行配置。main 从 env 读取；测试直接构造。
 #[derive(Clone)]
 pub struct RelayConfig {
     /// 网关侧 token-machine 绑定表（`IMAGENT_RELAY_GATEWAY_TOKENS`）。
     pub gateway_tokens: GatewayTokens,
+    /// 网关侧 machine-公钥绑定表（`IMAGENT_RELAY_GATEWAY_KEYS`，v1.3 挑战
+    /// 应答验签用）。与 gateway_tokens 双表并存任一命中；两表均空拒启。
+    pub gateway_keys: GatewayKeys,
     /// 浏览器侧登录 token（`IMAGENT_RELAY_USER_TOKEN`，仅登录换发会话用）。
     pub user_token: String,
     /// 会话状态目录（`IMAGENT_RELAY_STATE_DIR`，缺省
@@ -256,14 +472,18 @@ pub struct RelayConfig {
 }
 
 impl RelayConfig {
-    /// fail-closed 校验（§4.2，纯函数便于单测）：token 表/USER_TOKEN 缺失
-    /// 或空 → 拒（不提供无认证模式）；任一网关 token 与 USER_TOKEN 相同
-    /// → 拒（职责分离——拿到一个 token 不能同时扮演网关与浏览器两端）。
+    /// fail-closed 校验（§4.2，纯函数便于单测）：网关认证表（KEYS 与
+    /// TOKENS **至少一个非空**——只配公钥表或只配 token 表均可，全空则无
+    /// 任何网关认证形态可用 → 拒，不提供无认证模式）/ USER_TOKEN 缺失或空
+    /// → 拒；任一网关 token 与 USER_TOKEN 相同 → 拒（职责分离——拿到一个
+    /// token 不能同时扮演网关与浏览器两端。公钥无须此项：公钥是公开材料，
+    /// 持有公钥不构成任何一端的登录能力）。
     pub fn validate(&self) -> Result<(), String> {
-        if self.gateway_tokens.is_empty() {
+        if self.gateway_tokens.is_empty() && self.gateway_keys.is_empty() {
             return Err(
-                "网关 token 表缺失或为空：必填 IMAGENT_RELAY_GATEWAY_TOKENS（machine=token 逗号分隔，\
-                 每台 Mac 一个独立 token；openssl rand -hex 32 生成；relay 不提供无认证模式）"
+                "网关认证表缺失：IMAGENT_RELAY_GATEWAY_KEYS（machine=<64 hex ed25519 公钥> \
+                 逗号分隔，网关侧首次启动自动生成并打印公钥）与 IMAGENT_RELAY_GATEWAY_TOKENS\
+                 （machine=token 逗号分隔）至少配置其一；relay 不提供无认证模式"
                     .into(),
             );
         }
@@ -322,7 +542,9 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 /// hello 首帧反序列化形状（v1.2 会话层后的全量字段）：
 /// `{"v":1,"type":"hello","token":"…","machine":"…","session":"…","device":"…"}`
 /// - 网关侧：`token`（machine 绑定校验）+ 可选 `machine` 自报身份
-///   （v1.1）；网关无会话概念，`session` 字段一律拒绝；
+///   （v1.1）；v1.3 起也接受**不带任何凭证**的 hello（走 key 挑战应答，
+///   见 [`HelloCredential::Challenge`]）；网关无会话概念，`session` 字段
+///   一律拒绝；
 /// - 浏览器侧：`session`（重连）优先，`token`（USER_TOKEN 登录换发）次之，
 ///   可选 `device`（≤64 char，缺省记 UA 摘要）；浏览器无 machine 概念
 ///   （带了也只经校验不消费）。
@@ -341,14 +563,20 @@ struct HelloFrame {
     device: Option<String>,
 }
 
-/// hello 携带的凭证（v1.2）：`session` 字段优先（重连），`token` 次之
-///（登录换发/网关认证）。
+/// hello 携带的凭证（v1.2 + v1.3）：`session` 字段优先（重连），`token`
+/// 次之（登录换发/网关认证）；**两者均缺席**（注意：缺席而非空串）为
+/// [`HelloCredential::Challenge`]（v1.3 网关 key 握手入口，浏览器侧在
+/// 认证层一律拒绝）。
 #[derive(Debug, PartialEq, Eq)]
 enum HelloCredential {
     /// USER_TOKEN（浏览器登录换发路径）/ 网关 token（machine 绑定校验）。
     Bootstrap(String),
     /// 浏览器会话凭证（重连路径）。
     Session(String),
+    /// 无静态凭证（v1.3）：网关 ed25519 挑战应答握手的入口形态——
+    /// `{"v":1,"type":"hello","machine":"home-mac"}`。仅网关侧认证
+    /// 分流消费；浏览器侧无此路径（challenge → "auth failed"）。
+    Challenge,
 }
 
 /// hello 解析产物。
@@ -401,11 +629,11 @@ fn non_empty_field(raw: &Option<String>) -> Option<String> {
     Some(t.to_string())
 }
 
-/// 解析首帧 hello（纯函数便于单测）。凭证分拣（v1.2）：`session` 字段
-/// 优先、`token` 字段次之（换发路径）、两者皆无 Malformed；`session` 带
-/// 值即走会话路径（同时带 token 也一样——session 优先，不回落）。空串
-/// 凭证按 Malformed 拒（空串不可能匹配任何合法凭证，提前拒绝语义更明
-/// 确）。machine 缺省 → `"default"`，带值经 [`validate_machine`] 校验
+/// 解析首帧 hello（纯函数便于单测）。凭证分拣（v1.2 + v1.3）：`session`
+/// 字段优先、`token` 字段次之（换发路径）、**两者均缺席**为
+/// [`HelloCredential::Challenge`]（v1.3 网关 key 握手入口；空串凭证仍按
+/// Malformed 拒——空串不可能是「有意的挑战形态」，提前拒绝语义更明确）。
+/// machine 缺省 → `"default"`，带值经 [`validate_machine`] 校验
 ///（machine 是路由主键，脏值宁可断连也不静默改写）。device ≤64 char
 ///（超限 Malformed），trim 后为空按缺省处理。
 fn parse_hello(text: &str) -> Result<ParsedHello, HelloParseError> {
@@ -416,12 +644,13 @@ fn parse_hello(text: &str) -> Result<ParsedHello, HelloParseError> {
     if h.kind != "hello" {
         return Err(HelloParseError::NotHello);
     }
-    let credential = match non_empty_field(&h.session) {
-        Some(s) => HelloCredential::Session(s),
-        None => match non_empty_field(&h.token) {
-            Some(t) => HelloCredential::Bootstrap(t),
-            None => return Err(HelloParseError::Malformed),
-        },
+    let credential = match (non_empty_field(&h.session), non_empty_field(&h.token)) {
+        (Some(s), _) => HelloCredential::Session(s),
+        (None, Some(t)) => HelloCredential::Bootstrap(t),
+        // 两者均缺席（None 而非空串）→ v1.3 网关 key 握手入口。
+        (None, None) if h.session.is_none() && h.token.is_none() => HelloCredential::Challenge,
+        // 有字段但值为空/空白 → Malformed（空串凭证不构成任何合法形态）。
+        (None, None) => return Err(HelloParseError::Malformed),
     };
     let machine = match h.machine.as_deref() {
         None => DEFAULT_MACHINE.to_string(),
@@ -648,6 +877,28 @@ fn machines_frame(machines: &[String]) -> Message {
 
 fn error_frame(code: &str) -> Message {
     Message::text(serde_json::json!({"v": 1, "type": "error", "code": code}).to_string())
+}
+
+/// challenge 帧（协议 v1.3 key 握手第二帧）：`{"v":1,"type":"challenge",
+/// "nonce":"<32B hex>"}`——nonce 一次性（[`ChallengeTable::consume`] 单次
+/// 消费）且 60s 过期，录制重放无效。
+fn challenge_frame(nonce: &str) -> Message {
+    Message::text(serde_json::json!({"v": 1, "type": "challenge", "nonce": nonce}).to_string())
+}
+
+/// prove 帧反序列化形状（协议 v1.3 key 握手第三帧）：
+/// `{"v":1,"type":"prove","pubkey":"<64 hex>","signature":"<128 hex>"}`。
+/// 签名对象 = challenge nonce 的 **hex 字符串原文的 UTF-8 字节**（网关侧
+/// 对收到的 nonce 原样签名——两侧无 hex 解码歧义；验签见
+/// [`GatewayKeys::verify`]）。畸形/超长由 256KB message 上限与 hex 解码
+/// 兜底，任何失败统一 "auth failed"。
+#[derive(Deserialize)]
+struct ProveFrame {
+    v: i64,
+    #[serde(rename = "type")]
+    kind: String,
+    pubkey: String,
+    signature: String,
 }
 
 /// 出站投递项：业务帧 / 主动 close（code+reason）。
@@ -1087,6 +1338,8 @@ struct RelayState {
     /// passkey 层（凭证表 + challenge 表 + begin 限流）：启动时从
     /// `<state_dir>/credentials.json` 加载。
     webauthn: Arc<webauthn::WebauthnState>,
+    /// 网关 key 握手 challenge 表（v1.3）：内存态，nonce 一次性 60s 过期。
+    challenges: Arc<Mutex<ChallengeTable>>,
 }
 
 /// SPA 静态资源（M1 占位 index.html；M3 构建产物落入 `static/` 后零改动挂载）。
@@ -1249,55 +1502,122 @@ fn issue_session(
     })
 }
 
-/// hello 首帧认证分拣（纯内存操作，锁内微临界区）：
-/// - 网关：Bootstrap 凭证过 [`GatewayTokens::verify`]（token 匹配且
-///   machine 与绑定一致）；session 形态一律拒（网关无会话概念）；
-/// - 浏览器：Session 凭证过 [`SessionStore::verify`]（reason 区分
-///   expired/revoked/auth failed）；Bootstrap 凭证比对 USER_TOKEN → 换发。
-fn auth_hello(
+/// hello 首帧认证分拣（纯内存操作，锁内微临界区）——浏览器侧（v1.2）：
+/// Session 凭证过 [`SessionStore::verify`]（reason 区分 expired/revoked/
+/// auth failed）；Bootstrap 凭证比对 USER_TOKEN → 换发；**Challenge（无
+/// 凭证）一律拒**（浏览器无 key 握手概念）。网关侧见 [`gateway_auth`]
+///（v1.3 起含挑战应答分支，需 socket IO 故独立成 async 函数）。
+fn browser_auth(
     st: &RelayState,
-    role: Role,
     text: &str,
     headers: &HeaderMap,
 ) -> Result<HelloOutcome, &'static str> {
     let parsed = parse_hello(text).map_err(|_| "auth failed")?;
-    match role {
-        Role::Gateway => match parsed.credential {
-            HelloCredential::Session(_) => Err("auth failed"),
-            HelloCredential::Bootstrap(tok) => {
-                if st.config.gateway_tokens.verify(&parsed.machine, &tok) {
-                    Ok(HelloOutcome::Gateway(parsed.machine))
-                } else {
-                    Err("auth failed")
+    match parsed.credential {
+        HelloCredential::Challenge => Err("auth failed"),
+        HelloCredential::Session(tok) => {
+            match st.sessions.verify(&tok, sessions::unix_now()) {
+                SessionLookup::Valid { id, expires_at } => {
+                    Ok(HelloOutcome::Browser(BrowserSession {
+                        id,
+                        // 重连：回显客户端自报的 token。
+                        ack_token: tok,
+                        expires_at,
+                    }))
                 }
+                SessionLookup::Expired => Err("session expired"),
+                SessionLookup::Revoked => Err("session revoked"),
+                SessionLookup::NotFound => Err("auth failed"),
             }
-        },
-        Role::Browser => match parsed.credential {
-            HelloCredential::Session(tok) => {
-                match st.sessions.verify(&tok, sessions::unix_now()) {
-                    SessionLookup::Valid { id, expires_at } => {
-                        Ok(HelloOutcome::Browser(BrowserSession {
-                            id,
-                            // 重连：回显客户端自报的 token。
-                            ack_token: tok,
-                            expires_at,
-                        }))
-                    }
-                    SessionLookup::Expired => Err("session expired"),
-                    SessionLookup::Revoked => Err("session revoked"),
-                    SessionLookup::NotFound => Err("auth failed"),
-                }
+        }
+        HelloCredential::Bootstrap(tok) => {
+            if !constant_time_eq(&tok, &st.config.user_token) {
+                return Err("auth failed");
             }
-            HelloCredential::Bootstrap(tok) => {
-                if !constant_time_eq(&tok, &st.config.user_token) {
-                    return Err("auth failed");
-                }
-                issue_session(st, headers, parsed.device.as_deref())
-                    .map(HelloOutcome::Browser)
-                    .map_err(|_| "too many sessions")
-            }
-        },
+            issue_session(st, headers, parsed.device.as_deref())
+                .map(HelloOutcome::Browser)
+                .map_err(|_| "too many sessions")
+        }
     }
+}
+
+/// 网关侧 hello 认证分流（v1.3）：
+/// - **Bootstrap（hello 带 token，旧形态）**：一步 token-machine 绑定校验
+///   （[`GatewayTokens::verify`]）——迁移期兼容路径，行为与 v1.2 完全一致；
+/// - **Challenge（hello 无凭证）**：ed25519 挑战应答两步——签发一次性
+///   nonce（绑定 hello 自报 machine）下发 challenge 帧 → 等 prove（10s）
+///   → [`GatewayKeys::verify`]（machine 在 KEYS 表且绑定公钥恒定时间一致
+///   + 验签 nonce）；
+/// - **Session**：网关无会话概念，一律拒。
+///
+/// 防探测纪律：所有失败统一 "auth failed"（不区分 machine 是否在表 / 公钥
+/// 不匹配 / 验签失败，由 [`auth_reject`] 加 1s 延迟）；prove 等待超时按
+/// "auth timeout"。challenge 签发对**任何** shape 合法的 machine 一视同仁
+///（未知 machine 也拿到 nonce——不构成存在性 oracle，prove 必然验不过）。
+async fn gateway_auth(
+    socket: &mut WebSocket,
+    st: &RelayState,
+    text: &str,
+) -> Result<HelloOutcome, &'static str> {
+    let parsed = parse_hello(text).map_err(|_| "auth failed")?;
+    match parsed.credential {
+        HelloCredential::Session(_) => Err("auth failed"),
+        HelloCredential::Bootstrap(tok) => {
+            if st.config.gateway_tokens.verify(&parsed.machine, &tok) {
+                Ok(HelloOutcome::Gateway(parsed.machine))
+            } else {
+                Err("auth failed")
+            }
+        }
+        HelloCredential::Challenge => {
+            // KEYS 表全空 → key 握手无任何成功路径，直接失败（不签发
+            // challenge：省一条 challenge 表条目与客户端等待，且不暴露
+            // 「机器在不在表」的配置差异——失败形态与验签失败一致）。
+            if st.config.gateway_keys.is_empty() {
+                return Err("auth failed");
+            }
+            let nonce = {
+                let mut table = st.challenges.lock().unwrap_or_else(|e| e.into_inner());
+                table.issue(&parsed.machine, Instant::now())
+            };
+            if socket.send(challenge_frame(&nonce)).await.is_err() {
+                return Err("auth failed"); // 对端握手途中断开
+            }
+            let prove = match tokio::time::timeout(AUTH_TIMEOUT, socket.next()).await {
+                Ok(Some(Ok(Message::Text(t)))) => t,
+                Ok(Some(Ok(_))) => return Err("auth failed"), // prove 须为文本帧
+                Ok(None) | Ok(Some(Err(_))) => return Err("auth failed"),
+                Err(_) => {
+                    tracing::warn!(target: TARGET, machine = %parsed.machine, "等 prove 超时（10s），关闭");
+                    return Err("auth timeout");
+                }
+            };
+            verify_prove(st, &nonce, prove.as_str()).map(HelloOutcome::Gateway)
+        }
+    }
+}
+
+/// prove 帧验证（v1.3 key 握手收口）：nonce 先**单次消费**（取出即作废——
+/// 验签失败也不可重试同一 nonce，防重放），再过 [`GatewayKeys::verify`]
+///（machine 在表 + 公钥恒定时间一致 + 验签）。失败统一 "auth failed"。
+fn verify_prove(st: &RelayState, nonce: &str, text: &str) -> Result<String, &'static str> {
+    let p: ProveFrame = serde_json::from_str(text).map_err(|_| "auth failed")?;
+    if p.v != 1 || p.kind != "prove" {
+        return Err("auth failed");
+    }
+    let machine = {
+        let mut table = st.challenges.lock().unwrap_or_else(|e| e.into_inner());
+        table.consume(nonce, Instant::now())
+    }
+    .ok_or("auth failed")?;
+    if !st
+        .config
+        .gateway_keys
+        .verify(&machine, &p.pubkey, nonce, &p.signature)
+    {
+        return Err("auth failed");
+    }
+    Ok(machine)
 }
 
 /// 向自身 channel 顺序投递（连接尚未进入消费循环）。容量推导见
@@ -1348,7 +1668,8 @@ async fn handle_connection(mut socket: WebSocket, st: RelayState, role: Role, he
         }
         None => {
             // hello 首帧认证：10s 内必须是 `{"v":1,"type":"hello",…}`（网关
-            // 带 machine 自报 + token；浏览器带 session 重连 / token 登录）。
+            // 带 machine 自报 + token（v1.2 兼容）或无凭证走 key 挑战应答
+            //（v1.3）；浏览器带 session 重连 / token 登录）。
             match tokio::time::timeout(AUTH_TIMEOUT, socket.next()).await {
                 Err(_) => {
                     tracing::warn!(target: TARGET, role = role.name(), "认证超时（10s 无 hello），关闭");
@@ -1358,7 +1679,11 @@ async fn handle_connection(mut socket: WebSocket, st: RelayState, role: Role, he
                 Ok(None) | Ok(Some(Err(_))) => return, // 连接已断 / 协议错误
                 Ok(Some(Ok(msg))) => {
                     let outcome = match msg {
-                        Message::Text(t) => auth_hello(&st, role, t.as_str(), &headers),
+                        Message::Text(t) => match role {
+                            // 网关侧（v1.3）：token 一步 / key 挑战应答两步。
+                            Role::Gateway => gateway_auth(&mut socket, &st, t.as_str()).await,
+                            Role::Browser => browser_auth(&st, t.as_str(), &headers),
+                        },
                         // 首帧必须是文本 hello。
                         _ => Err("auth failed"),
                     };
@@ -1680,6 +2005,7 @@ pub fn spawn_relay(listener: TcpListener, config: RelayConfig) -> Result<RelayHa
         config: Arc::new(config),
         sessions,
         webauthn: webauthn_state,
+        challenges: Arc::new(Mutex::new(ChallengeTable::default())),
     };
     let app = Router::new()
         .route("/gateway", get(gateway_ws))
@@ -1814,10 +2140,11 @@ mod tests {
         assert!(!b.push("y"), "加入后超 1MB → 拒");
     }
 
-    /// hello 帧解析（v1.2 全量）：token 形态（machine 缺省 default / 显式 /
-    /// trim / 合法字符 / 各类非法拒绝）；session 形态（优先级：session 带
-    /// 值即走会话路径，token 同时存在也不回落）；两者皆无拒绝；空串拒绝；
-    /// device（≤64 char / trim 后空按缺省 / 超限拒绝）。
+    /// hello 帧解析（v1.2 全量 + v1.3 挑战形态）：token 形态（machine 缺省
+    /// default / 显式 / trim / 合法字符 / 各类非法拒绝）；session 形态（优先
+    /// 级：session 带值即走会话路径，token 同时存在也不回落）；无凭证形态
+    /// （v1.3 Challenge：两字段均缺席才成立，空串仍拒）；device（≤64 char /
+    /// trim 后空按缺省 / 超限拒绝）。
     #[test]
     fn hello_frame_parsing() {
         let boot = |t: &str| HelloCredential::Bootstrap(t.to_string());
@@ -1912,12 +2239,19 @@ mod tests {
             Err(HelloParseError::Malformed),
             "device 超 64 char 拒绝"
         );
-        // 缺凭证 / 空凭证 / 畸形。
+        // 无凭证形态（v1.3 网关 key 握手入口）：两字段均缺席 → Challenge；
+        // machine 缺省 default / 显式均可。
         assert_eq!(
             parse_hello(r#"{"v":1,"type":"hello"}"#),
-            Err(HelloParseError::Malformed),
-            "token 与 session 皆无 → 拒（不得出现无凭证可用路径）"
+            ok(HelloCredential::Challenge, "default", None),
+            "无凭证 hello → Challenge 形态（v1.3 网关 key 握手；浏览器侧在认证层拒）"
         );
+        assert_eq!(
+            parse_hello(r#"{"v":1,"type":"hello","machine":"home-mac"}"#),
+            ok(HelloCredential::Challenge, "home-mac", None),
+            "v1.3 key 握手 hello：只带 machine，不带任何凭证"
+        );
+        // 空串凭证仍拒（缺席 ≠ 空串；空串不构成任何有意的认证形态）。
         assert_eq!(
             parse_hello(r#"{"v":1,"type":"hello","session":""}"#),
             Err(HelloParseError::Malformed),
@@ -2173,36 +2507,196 @@ mod tests {
         }
     }
 
-    /// fail-closed：网关 token 表缺失 / USER_TOKEN 缺失 / 职责分离（USER_TOKEN
-    /// 与任一网关 token 相同）→ 拒。
+    /// 测试内派生 ed25519 密钥对（seed 固定可复现）。
+    fn test_signing_key(seed: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+    }
+
+    /// 网关公钥表（v1.3）：解析（合法多对 / 尾随逗号容忍 / 空表 Ok /
+    /// 各类畸形拒绝 / 非法公钥点拒绝 / 重复绑定拒绝）+ prove 验证（对/
+    /// 错 machine / 公钥不一致 / 签名错 / 畸形 hex / 签名对象 = nonce 原文）。
+    #[test]
+    fn gateway_keys_parse_and_verify() {
+        use ed25519_dalek::Signer;
+        let pk = |seed: u8| hex::encode(test_signing_key(seed).verifying_key().to_bytes());
+        // 合法多对（trim + 尾随逗号容忍）；machine 列表与指纹有序。
+        let k =
+            GatewayKeys::parse(&format!(" home-mac = {} , work-mac={} ,, ", pk(1), pk(2))).unwrap();
+        assert_eq!(
+            k.machines(),
+            vec!["home-mac".to_string(), "work-mac".to_string()]
+        );
+        let fps = k.fingerprints();
+        assert_eq!(fps.len(), 2);
+        assert!(fps[0].starts_with("home-mac=") && fps[0].len() == "home-mac=".len() + 16);
+
+        // prove 验证：正确私钥签 nonce → 通过。
+        let nonce = "a".repeat(64);
+        let sk = test_signing_key(1);
+        let sig = hex::encode(sk.sign(nonce.as_bytes()).to_bytes());
+        assert!(
+            k.verify("home-mac", &pk(1), &nonce, &sig),
+            "绑定公钥 + 正确签名 → 通过"
+        );
+        // 签名被篡改（首字符翻转）→ 拒。
+        let tampered = format!(
+            "{}{}",
+            if sig.starts_with('a') { 'b' } else { 'a' },
+            &sig[1..]
+        );
+        assert!(
+            !k.verify("home-mac", &pk(1), &nonce, &tampered),
+            "篡改签名 → 拒"
+        );
+        // machine 不在表 → 拒。
+        assert!(!k.verify("ghost", &pk(1), &nonce, &sig), "未知 machine");
+        // 公钥不一致（另一把合法钥）→ 拒（恒定时间比对路径）。
+        assert!(
+            !k.verify("home-mac", &pk(2), &nonce, &sig),
+            "prove 公钥 ≠ 绑定公钥 → 拒"
+        );
+        // 正确公钥但签名来自错私钥 → 拒（验签路径）。
+        let bad_sig = hex::encode(test_signing_key(2).sign(nonce.as_bytes()).to_bytes());
+        assert!(
+            !k.verify("home-mac", &pk(1), &nonce, &bad_sig),
+            "验签失败 → 拒"
+        );
+        // 畸形输入：非 hex 签名 / 签名长度错 / 空。
+        assert!(!k.verify("home-mac", &pk(1), &nonce, "zz"));
+        assert!(!k.verify("home-mac", &pk(1), &nonce, "ab"));
+        assert!(!k.verify("home-mac", &pk(1), &nonce, ""));
+
+        // 空表 Ok（validate 层做「至少其一」判定）。
+        assert!(GatewayKeys::parse("").unwrap().is_empty());
+        assert!(GatewayKeys::parse("  ,, ").unwrap().is_empty());
+        // 找一个确定非法的「曲线点」：随机形态的字节串约半数解不出点，
+        // 逐个递增首字节直到 from_bytes 拒（两三步内必然命中）。
+        let mut bad = [0xffu8; 32];
+        let mut probe = 0u8;
+        while VerifyingKey::from_bytes(&bad).is_ok() {
+            bad[0] = probe;
+            probe = probe.wrapping_add(1);
+        }
+        let not_a_point = hex::encode(bad);
+        // 解析失败：缺 `=` / 空段 / 非法 machine / 非 hex / 长度错 /
+        // machine 重复 / 公钥重复绑定 / 非法曲线点。
+        for (spec, needle) in [
+            ("home-mac", "缺 `=`"),
+            ("home-mac=", "为空"),
+            ("=ab", "为空"),
+            ("home mac=k", "非法"),
+            (r#"home-mac=xyz"#, "非合法 hex"),
+            (&format!("home-mac={}", "ab".repeat(31)), "长度"),
+            (&format!("home-mac={},home-mac={}", pk(1), pk(2)), "重复"),
+            (
+                &format!("home-mac={},work-mac={}", pk(1), pk(1)),
+                "同时绑定",
+            ),
+            (&format!("home-mac={not_a_point}"), "合法 ed25519 公钥点"),
+        ] {
+            let err = GatewayKeys::parse(spec).unwrap_err();
+            assert!(err.contains(needle), "spec=`{spec}` msg={err}");
+        }
+    }
+
+    /// challenge 表（v1.3）：签发绑定 machine / 单次消费（第二次 None）/
+    /// 60s 过期 / 未知 nonce / 容量上限驱逐最旧。
+    #[test]
+    fn challenge_table_lifecycle() {
+        let t0 = Instant::now();
+        let mut t = ChallengeTable::default();
+        let n1 = t.issue("home-mac", t0);
+        let n2 = t.issue("work-mac", t0);
+        assert_ne!(n1, n2, "nonce 互不相同");
+        assert_eq!(n1.len(), 64, "32B hex");
+        assert!(n1.chars().all(|c| c.is_ascii_hexdigit()));
+        // 单次消费：命中返回绑定 machine，再消费 None。
+        assert_eq!(t.consume(&n1, t0).as_deref(), Some("home-mac"));
+        assert!(t.consume(&n1, t0).is_none(), "nonce 已消费（防重放）");
+        // 过期（恰 60s 边界视为过期——prove 须在 TTL 内到达）。
+        assert!(t.consume(&n2, t0 + CHALLENGE_TTL).is_none(), "过期作废");
+        // 未知 nonce。
+        assert!(t.consume(&"f".repeat(64), t0).is_none());
+        // 过期条目在后续签发时被清出（容量不泄漏）。
+        let n3 = t.issue("m3", t0 + CHALLENGE_TTL + Duration::from_secs(1));
+        assert!(!t.map.contains_key(&n2), "过期条目已 prune");
+        assert!(t
+            .consume(&n3, t0 + CHALLENGE_TTL + Duration::from_secs(2))
+            .is_some());
+        // 容量上限：灌满 +1 条，最早的（n3 时刻之后最早签发的）被驱逐，
+        // 表大小不超过上限。
+        let mut t = ChallengeTable::default();
+        let base = Instant::now();
+        let first = t.issue("first", base);
+        for i in 0..CHALLENGE_MAX_ENTRIES {
+            t.issue(&format!("m{i}"), base + Duration::from_millis(i as u64 + 1));
+        }
+        assert!(t.map.len() <= CHALLENGE_MAX_ENTRIES, "容量有界");
+        assert!(!t.map.contains_key(&first), "最早签发的被驱逐（最旧优先）");
+    }
+
+    /// challenge 帧形状（协议对照逐字段）：v/type/nonce。
+    #[test]
+    fn challenge_frame_shape() {
+        let m = challenge_frame("deadbeef");
+        let v: serde_json::Value = serde_json::from_str(m.into_text().unwrap().as_str()).unwrap();
+        assert_eq!(v["v"], 1);
+        assert_eq!(v["type"], "challenge");
+        assert_eq!(v["nonce"], "deadbeef");
+    }
+
+    /// fail-closed：网关认证表（v1.3 起 KEYS/TOKENS 至少其一）/ USER_TOKEN
+    /// 缺失 / 职责分离（USER_TOKEN 与任一网关 token 相同）→ 拒；只配 KEYS
+    ///（tokens 空）或只配 TOKENS（既有形态）均合法。
     #[test]
     fn fail_closed_token_validation() {
-        let cfg = |g: &str, u: &str| RelayConfig {
-            gateway_tokens: GatewayTokens::parse(g).unwrap(),
+        let cfg = |g_tokens: GatewayTokens, g_keys: GatewayKeys, u: &str| RelayConfig {
+            gateway_tokens: g_tokens,
+            gateway_keys: g_keys,
             user_token: u.to_string(),
             state_dir: std::env::temp_dir(),
             session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
             webauthn_rp_id: None,
         };
-        assert!(cfg("default=g-token", "u-token").validate().is_ok());
-        // 直接构造空表（parse 已拒绝空表，这里走 validate 防线）。
-        let bad = RelayConfig {
-            gateway_tokens: GatewayTokens::default(),
-            user_token: "u-token".to_string(),
-            state_dir: std::env::temp_dir(),
-            session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
-            webauthn_rp_id: None,
+        let tokens = GatewayTokens::parse("default=g-token").unwrap();
+        // 真实 ed25519 公钥（随机 32B hex 未必是合法曲线点，from_bytes 会拒）。
+        let keys = {
+            let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+            GatewayKeys::parse(&format!(
+                "home-mac={}",
+                hex::encode(sk.verifying_key().to_bytes())
+            ))
+            .unwrap()
         };
-        let err = bad.validate().unwrap_err();
-        assert!(
-            err.contains("GATEWAY_TOKENS") && err.contains("无认证模式"),
-            "msg={err}"
-        );
-        let err = cfg("default=g-token", "  ").validate().unwrap_err();
-        assert!(err.contains("USER_TOKEN"), "msg={err}");
-        let err = cfg("default=same,home=other", "same")
+        // 只配 TOKENS（既有形态）/ 只配 KEYS（v1.3 新形态）/ 双表并存：均合法。
+        assert!(cfg(tokens.clone(), GatewayKeys::default(), "u-token")
+            .validate()
+            .is_ok());
+        assert!(cfg(GatewayTokens::default(), keys.clone(), "u-token")
+            .validate()
+            .is_ok());
+        assert!(cfg(tokens.clone(), keys.clone(), "u-token")
+            .validate()
+            .is_ok());
+        // 双表均空 → 拒（不提供无认证模式）。
+        let err = cfg(GatewayTokens::default(), GatewayKeys::default(), "u-token")
             .validate()
             .unwrap_err();
+        assert!(
+            err.contains("GATEWAY_KEYS") && err.contains("至少配置其一"),
+            "msg={err}"
+        );
+        let err = cfg(tokens.clone(), GatewayKeys::default(), "  ")
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("USER_TOKEN"), "msg={err}");
+        let err = cfg(
+            GatewayTokens::parse("default=same,home=other").unwrap(),
+            GatewayKeys::default(),
+            "same",
+        )
+        .validate()
+        .unwrap_err();
         assert!(err.contains("不得与任何网关 token 相同"), "msg={err}");
     }
 

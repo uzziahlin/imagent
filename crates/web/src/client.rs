@@ -1,12 +1,15 @@
 //! 网关侧 WS 客户端任务：出站连 relay `/gateway`，帧收发 + 重连/心跳/停机。
 //!
-//! 职责链（参照 wecom client.rs 的成熟模式）：`connect_async` 建连 → 发
-//! hello 首帧认证（v1.1 起 token + **machine 身份**自报——relay 按 machine
-//! 分槽位管理多终端；Bearer 头直通形态仍被 relay 接受但固定为 default
-//! 机器，新网关版本统一走 hello）→ 等 relay 回的 `hello_ack`（回显 machine，
+//! 职责链（参照 wecom client.rs 的成熟模式）：`connect_async` 建连 →
+//! 认证（v1.3 按凭证分流：**key 形态**三帧——hello 自报 machine（不带
+//! token）→ 等 relay 回 `challenge{nonce}` → 发 `prove{pubkey,signature}`
+//!（对 nonce 原文签名）；**token 形态**（v1.2 兼容）一步——hello 带
+//! token + machine。Bearer 头直通形态仍被 relay 接受但固定为 default
+//! 机器，新网关版本不走）→ 等 relay 回的 `hello_ack`（回显 machine，
 //! 校验与自报一致——不一致按认证失败重连）→ 收发帧循环；任意环节断开/
 //! 出错即返回 `Err`，外层 [`WebClient::run`] 按指数退避重连（1s → 2s → …
-//! 封顶 30s，成功建连重置）。
+//! 封顶 30s，成功建连重置）。每步握手等待 10s 超时（不空转发——对齐
+//! wecom R-5「认证失败必须重连」纪律）。
 //!
 //! 与 [`crate::platform::WebPlatform`] 通过三条 channel 解耦：
 //! - `inbound_tx`：浏览器业务帧映射成的 [`InboundMessage`] → platform.recv；
@@ -15,13 +18,15 @@
 //!
 //! 协议细节（§4）：relay 对浏览器侧有 90s idle 超时，网关 30s 发协议层
 //! `Message::Ping` 保活；浏览器应用层 `ping` JSON 帧由本层直接回 `pong`
-//! （不进 recv）；`machine` / `machines` / `error` / `hello_ack` 是 relay
-//! 自产帧，本层分拣自理（在线标志 / warn / debug），不进业务通道。
+//! （不进 recv）；`machine` / `machines` / `error` / `hello_ack` /
+//! `challenge` 是 relay 自产帧，本层分拣自理（在线标志 / warn / debug），
+//! 不进业务通道。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use ed25519_dalek::Signer;
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -35,14 +40,15 @@ use tracing::{debug, info, warn};
 
 use imagent_core::{CoreError, InboundMessage, Result};
 
-use crate::{map_inbound_frame, InboundAction, TARGET};
+use crate::{map_inbound_frame, GatewayCredential, InboundAction, TARGET};
 
 /// 建连后的 WS 流类型（connect_async 的产物）。
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-/// hello_ack 等待上限：hello 发出后 relay 立即回 ack，超时按认证失败
-/// 重连（不空转发——对齐 wecom R-5「认证失败必须重连」纪律）。
-const HELLO_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+/// 认证握手每步等待上限（hello_ack / challenge 各 10s，v1.3 三帧握手逐
+/// 步计时）：relay 立即回帧，超时按认证失败重连（不空转发——对齐 wecom
+/// R-5「认证失败必须重连」纪律）。
+const HANDSHAKE_STEP_TIMEOUT: Duration = Duration::from_secs(10);
 /// 心跳间隔：relay idle 超时 90s，30s 协议层 Ping 保活。
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// 重连退避上限。
@@ -53,7 +59,8 @@ pub(crate) struct WebClient {
     /// relay 网关端点完整地址：`wss://…/imagent/gateway`（公网，Caddy strip
     /// 前缀）或 `ws://127.0.0.1:<port>/gateway`（本地/测试）。
     pub(crate) relay_url: String,
-    pub(crate) gateway_token: String,
+    /// 网关认证凭证（v1.3）：Key → 三帧挑战应答；Token → 一步 hello。
+    pub(crate) credential: GatewayCredential,
     /// 本机 machine 身份（v1.1 多终端管理）：hello 自报 + 出站帧携带。
     pub(crate) machine_id: String,
     /// 无 convId 的浏览器消息落到的默认会话名（映射 message 帧用）。
@@ -66,9 +73,52 @@ pub(crate) struct WebClient {
     pub(crate) sync_tx: mpsc::Sender<()>,
 }
 
-/// hello 首帧构造（v1.1：token + machine 自报；纯函数便于单测）。
+/// hello 首帧构造（token 形态，v1.1/v1.2 兼容路径：token + machine 自报；
+/// 纯函数便于单测）。
 fn hello_frame(token: &str, machine: &str) -> String {
     serde_json::json!({"v": 1, "type": "hello", "token": token, "machine": machine}).to_string()
+}
+
+/// hello 首帧构造（key 形态，v1.3 挑战应答入口：只带 machine，不带任何
+/// 静态凭证——relay 据此走 challenge 分流）。
+fn hello_key_frame(machine: &str) -> String {
+    serde_json::json!({"v": 1, "type": "hello", "machine": machine}).to_string()
+}
+
+/// prove 帧构造（v1.3 第三帧）：公钥 hex + 对 **nonce hex 字符串原文**
+/// 的 ed25519 签名（网关对收到的 nonce 原样签名——relay 侧对同一原文
+/// 验签，无 hex 解码歧义）。
+fn prove_frame(sk: &ed25519_dalek::SigningKey, nonce: &str) -> String {
+    serde_json::json!({
+        "v": 1,
+        "type": "prove",
+        "pubkey": hex::encode(sk.verifying_key().to_bytes()),
+        "signature": hex::encode(sk.sign(nonce.as_bytes()).to_bytes()),
+    })
+    .to_string()
+}
+
+/// challenge 帧解析（v1.3 第二帧）：返回 nonce（hex 字符串原文）。非
+/// challenge / 缺 nonce / 空串 / 畸形 JSON → Err（调用方按认证失败重连；
+/// 错误文案区分「relay 未配本机公钥（未回 challenge 即关闭）」的排查方向）。
+fn parse_challenge(text: &str) -> Result<String> {
+    let v: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| CoreError::Platform(TARGET, format!("challenge 解析失败：{e}")))?;
+    let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    if kind != "challenge" {
+        return Err(CoreError::Platform(
+            TARGET,
+            format!(
+                "认证握手帧异常（type={kind}，期待 challenge）——relay 可能未配本机公钥\
+                 （IMAGENT_RELAY_GATEWAY_KEYS）或为不支持 key 认证的旧版本，按失败重连"
+            ),
+        ));
+    }
+    v.get("nonce")
+        .and_then(|n| n.as_str())
+        .map(str::to_string)
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| CoreError::Platform(TARGET, "challenge 帧缺 nonce 字段".into()))
 }
 
 /// hello_ack 解析（v1.1）：返回回帧的 machine 字段（relay 回显自报身份）。
@@ -155,8 +205,8 @@ impl WebClient {
         }
     }
 
-    /// 一次完整的「建连 → 认证（hello + hello_ack）→ 收发」循环。返回 Err
-    /// 触发外层重连。
+    /// 一次完整的「建连 → 认证（v1.3：key 三帧 / token 一步 + hello_ack）
+    /// → 收发」循环。返回 Err 触发外层重连。
     async fn connect_and_serve(&self, outbound_rx: &mut mpsc::Receiver<String>) -> Result<()> {
         let req = build_request(&self.relay_url)?;
         info!(target: TARGET, url = %self.relay_url, machine = %self.machine_id, "连接 relay 中");
@@ -164,18 +214,54 @@ impl WebClient {
             .await
             .map_err(|e| CoreError::Platform(TARGET, format!("relay connect: {e}")))?;
 
-        // v1.1 认证：首帧 hello 自报 token + machine，等 relay 回 hello_ack
-        //（回显 machine）并校验与自报一致——不一致视为 relay 侧身份错乱
-        //（如 machine 槽位被同名顶替/漂移），warn 并按认证失败重连，绝不
-        // 空转发（对齐 wecom R-5：认证失败不得空转发，否则进程存活但无
-        // 入站，用户消息静默丢失）。
-        ws.send(Message::text(hello_frame(
-            &self.gateway_token,
-            &self.machine_id,
-        )))
-        .await
-        .map_err(|e| CoreError::Platform(TARGET, format!("hello 发送失败：{e}")))?;
-        match tokio::time::timeout(HELLO_ACK_TIMEOUT, ws.next()).await {
+        // v1.3 认证按凭证分流（key 优先，token 兼容——装配决策见
+        // `crate::key::load_gateway_credential`）：
+        // - Key：hello（只带 machine）→ challenge{nonce} → prove{pubkey,
+        //   signature}（对 nonce 原文签名）；
+        // - Token：hello（token + machine）一步校验。
+        match &self.credential {
+            GatewayCredential::Token(tok) => {
+                ws.send(Message::text(hello_frame(tok, &self.machine_id)))
+                    .await
+                    .map_err(|e| CoreError::Platform(TARGET, format!("hello 发送失败：{e}")))?;
+            }
+            GatewayCredential::Key(sk) => {
+                ws.send(Message::text(hello_key_frame(&self.machine_id)))
+                    .await
+                    .map_err(|e| CoreError::Platform(TARGET, format!("hello 发送失败：{e}")))?;
+                // 等 challenge（relay 对无凭证 hello 下发一次性 nonce）。
+                let nonce = match tokio::time::timeout(HANDSHAKE_STEP_TIMEOUT, ws.next()).await {
+                    Ok(Some(Ok(msg))) => parse_challenge(
+                        msg.into_text()
+                            .map_err(|_| CoreError::Platform(TARGET, "challenge 帧非文本".into()))?
+                            .as_str(),
+                    )?,
+                    Ok(Some(Err(e))) => {
+                        return Err(CoreError::Platform(
+                            TARGET,
+                            format!("等 challenge 读失败：{e}"),
+                        ));
+                    }
+                    Ok(None) => {
+                        return Err(CoreError::Platform(TARGET, "等 challenge 时流结束".into()));
+                    }
+                    Err(_) => {
+                        return Err(CoreError::Platform(
+                            TARGET,
+                            "等 challenge 超时（10s）——relay 可能未配本机公钥（IMAGENT_RELAY_GATEWAY_KEYS）".into(),
+                        ));
+                    }
+                };
+                ws.send(Message::text(prove_frame(sk, &nonce)))
+                    .await
+                    .map_err(|e| CoreError::Platform(TARGET, format!("prove 发送失败：{e}")))?;
+            }
+        }
+        // 共同收口：等 hello_ack（回显 machine）并校验与自报一致——不一致
+        // 视为 relay 侧身份错乱（如 machine 槽位被同名顶替/漂移），warn 并按
+        // 认证失败重连，绝不空转发（对齐 wecom R-5：认证失败不得空转发，
+        // 否则进程存活但无入站，用户消息静默丢失）。
+        match tokio::time::timeout(HANDSHAKE_STEP_TIMEOUT, ws.next()).await {
             Ok(Some(Ok(msg))) => {
                 let text = msg
                     .into_text()
@@ -209,7 +295,7 @@ impl WebClient {
             Err(_) => {
                 return Err(CoreError::Platform(
                     TARGET,
-                    "等 hello_ack 超时（10s）——gateway token 可能不匹配".into(),
+                    "等 hello_ack 超时（10s）——gateway 认证可能未通过".into(),
                 ));
             }
         }
@@ -352,9 +438,9 @@ impl WebClient {
 }
 
 /// 自建 WS Upgrade 请求（tungstenite 0.29 对自建 Request 不自动补握手头，
-/// 须自带 Host/Upgrade/Key 等）。认证走 v1.1 hello 首帧（token + machine），
-/// 不再附 Bearer 头——Bearer 直通在 relay 侧固定为 default 机器，带上会让
-/// machine 身份失效。
+/// 须自带 Host/Upgrade/Key 等）。认证走 hello 首帧（v1.3 key 三帧 / v1.2
+/// token 一步），不再附 Bearer 头——Bearer 直通在 relay 侧固定为 default
+/// 机器，带上会让 machine 身份失效。
 fn build_request(relay_url: &str) -> Result<Request<()>> {
     Request::builder()
         .uri(relay_url)
@@ -382,7 +468,7 @@ mod tests {
     fn constants_sane() {
         assert!(HEARTBEAT_INTERVAL.as_secs() > 0);
         assert!(BACKOFF_CAP >= Duration::from_secs(30));
-        assert!(HELLO_ACK_TIMEOUT.as_secs() > 0);
+        assert!(HANDSHAKE_STEP_TIMEOUT.as_secs() > 0);
     }
 
     /// host 提取：带路径 / 不带 / 无 scheme 均不 panic。
@@ -424,6 +510,74 @@ mod tests {
         assert_eq!(v["machine"], "home-mac");
     }
 
+    /// v1.3 key 形态 hello：只带 machine，**不带任何静态凭证**（relay 据
+    /// 此走 challenge 分流）。
+    #[test]
+    fn hello_key_frame_carries_no_credential() {
+        let f = hello_key_frame("home-mac");
+        let v: serde_json::Value = serde_json::from_str(&f).unwrap();
+        assert_eq!(v["v"], 1);
+        assert_eq!(v["type"], "hello");
+        assert_eq!(v["machine"], "home-mac");
+        assert!(v.get("token").is_none(), "key 握手 hello 不带 token");
+        assert!(v.get("session").is_none(), "网关无会话形态");
+    }
+
+    /// v1.3 prove 帧：pubkey 为本机公钥 hex，signature 为对 nonce **原文**
+    /// 的 ed25519 签名（用公钥真实验签钉住签名对象约定——两侧无 hex 解码
+    /// 歧义）。
+    #[test]
+    fn prove_frame_signature_covers_nonce_literal() {
+        use ed25519_dalek::Verifier;
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let nonce = "deadbeef".repeat(8);
+        let f = prove_frame(&sk, &nonce);
+        let v: serde_json::Value = serde_json::from_str(&f).unwrap();
+        assert_eq!(v["v"], 1);
+        assert_eq!(v["type"], "prove");
+        assert_eq!(
+            v["pubkey"].as_str().unwrap(),
+            hex::encode(sk.verifying_key().to_bytes())
+        );
+        let sig =
+            <[u8; 64]>::try_from(hex::decode(v["signature"].as_str().unwrap()).unwrap()).unwrap();
+        sk.verifying_key()
+            .verify(
+                nonce.as_bytes(),
+                &ed25519_dalek::Signature::from_bytes(&sig),
+            )
+            .expect("签名须对 nonce 原文（hex 字符串字节）可验");
+    }
+
+    /// challenge 解析：正常 / 非 challenge（含排查指引文案）/ 缺 nonce /
+    /// 空 nonce / 畸形 JSON。
+    #[test]
+    fn parse_challenge_variants() {
+        assert_eq!(
+            parse_challenge(r#"{"v":1,"type":"challenge","nonce":"abcd"}"#).unwrap(),
+            "abcd"
+        );
+        assert!(
+            parse_challenge(r#"{"v":1,"type":"hello_ack","machine":"m"}"#)
+                .unwrap_err()
+                .to_string()
+                .contains("期待 challenge"),
+            "非 challenge 报错（附排查指引）"
+        );
+        assert!(
+            parse_challenge(r#"{"v":1,"type":"challenge"}"#)
+                .unwrap_err()
+                .to_string()
+                .contains("nonce"),
+            "缺 nonce 报错"
+        );
+        assert!(
+            parse_challenge(r#"{"v":1,"type":"challenge","nonce":""}"#).is_err(),
+            "空 nonce 报错"
+        );
+        assert!(parse_challenge("not json").is_err(), "畸形 JSON 报错");
+    }
+
     /// hello_ack 解析：正常回显 machine / 非 hello_ack / 缺 machine（旧
     /// relay）/ 畸形 JSON 四分支。
     #[test]
@@ -457,7 +611,7 @@ mod tests {
         let (sync_tx, _sync_rx) = mpsc::channel::<()>(8);
         let client = WebClient {
             relay_url: "ws://127.0.0.1:1/gateway".into(),
-            gateway_token: "t".into(),
+            credential: GatewayCredential::Token("t".into()),
             machine_id: "test-mac".into(),
             default_session: "default".into(),
             online: Arc::new(AtomicBool::new(false)),

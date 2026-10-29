@@ -490,10 +490,12 @@ pub struct Config {
     /// Web 驾驶舱（M2，仅 `platform = "web"`）：relay 网关侧 WS 地址，形如
     /// `wss://<ecs>:8443/imagent/gateway`（公网入口由 Caddy TLS 终结并 strip
     /// `/imagent` 前缀；本地测试可 `ws://127.0.0.1:<port>/gateway`）。网关只发
-    /// 出站连接，Mac 零监听端口。gateway token 不入 config（敏感）——走环境
-    /// 变量 `IMAGENT_WEB_GATEWAY_TOKEN`（v1.2 起与 relay 侧
-    /// `IMAGENT_RELAY_GATEWAY_TOKENS` 中**本机 machine** 绑定的 token 同值
-    /// ——每台 Mac 独立 token），对齐飞书 `IMAGENT_FEISHU_APP_SECRET` 先例。
+    /// 出站连接，Mac 零监听端口。gateway 认证凭证（v1.3）**key 优先 token
+    /// 回退**：密钥文件 `<imagent_home>/web-gateway-key` 首次启动自动生成
+    /// ed25519 密钥对（0600，日志打印公钥——配到 relay 侧
+    /// `IMAGENT_RELAY_GATEWAY_KEYS` 的本机 machine 名下）；环境变量
+    /// `IMAGENT_WEB_GATEWAY_TOKEN`（与 relay 侧 `IMAGENT_RELAY_GATEWAY_TOKENS`
+    /// 中本机 machine 绑定的 token 同值）降级为密钥文件损坏时的回退。
     #[serde(default)]
     pub web_relay_url: Option<String>,
     /// Web 驾驶舱：无 convId 的浏览器消息落到的默认会话名（conv 形如
@@ -1410,10 +1412,10 @@ allowed_senders = []        # 留空 = 发现模式（只打日志记录入站 s
 # admin_senders = []          # 可 /allow 等管理命令的管理员 sender；空=无人是管理员(IM 内管理命令不可用，须 CLI/setup 配置)
 # allowed_tools = ["*"]                      # 缺省=全部工具（不收敛）；要白名单显式列（如 ["Read","Edit"]）；执行类建议配 permission_mode="ask"
 agent = "claude-cli"         # claude-cli(默认) | claude-acp(Claude ACP长驻子进程) | acp(任意ACP agent,配acp_command) | codex | gemini
-platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人) | feishu(飞书,配 feishu_app_id + 环境变量 IMAGENT_FEISHU_APP_SECRET) | web(网页驾驶舱,配 web_relay_url + 环境变量 IMAGENT_WEB_GATEWAY_TOKEN) | local(本地终端,零配置)
+platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人) | feishu(飞书,配 feishu_app_id + 环境变量 IMAGENT_FEISHU_APP_SECRET) | web(网页驾驶舱,配 web_relay_url;认证 v1.3 起 key 优先,~/.imagent/web-gateway-key 首启自动生成,IMAGENT_WEB_GATEWAY_TOKEN 为回退) | local(本地终端,零配置)
 # platforms = ["feishu", "web"]   # 多平台并存（非空时覆盖上面的 platform 单值）；IM 做通知兜底 + web 做驾驶舱
 # platforms = ["web", "local"]    # 例：web 驾驶舱 + 本地终端(imagent claude,~/.imagent/local.sock,0600+peer uid 即凭证,sender local:user 自动白名单)
-# web_relay_url = "wss://your-ecs:8443/imagent/gateway"   # 仅 platform="web"：ECS relay 网关端点（Caddy TLS 终结 + strip /imagent 前缀）；gateway token 走环境变量 IMAGENT_WEB_GATEWAY_TOKEN（敏感不入本文件）；web 消息 sender 恒为 web:user，需加入 allowed_senders（或 admin_senders）白名单才会被处理
+# web_relay_url = "wss://your-ecs:8443/imagent/gateway"   # 仅 platform="web"：ECS relay 网关端点（Caddy TLS 终结 + strip /imagent 前缀）；gateway 认证 v1.3 起 ed25519 key 优先（~/.imagent/web-gateway-key 首启自动生成,把日志打印的公钥配到 relay 侧 IMAGENT_RELAY_GATEWAY_KEYS）,IMAGENT_WEB_GATEWAY_TOKEN 为密钥文件损坏时的回退；web 消息 sender 恒为 web:user，需加入 allowed_senders（或 admin_senders）白名单才会被处理
 # web_default_session = "default"   # 仅 platform="web"：无 convId 的浏览器消息落到的默认会话名（conv 形如 web:<name>）
 # web_machine_id = "home-mac"       # 仅 platform="web"：本机 machine 身份（多台 Mac 接同一 relay 时区分终端，浏览器按 machine 切换管理；缺省取 hostname 短名；同 machine 新连接会顶替旧连接）
 # feishu_app_id = "cli_xxx"            # 飞书自建应用 app_id（仅 platform="feishu"；app_secret 走环境变量，keyring 为后续 P2）

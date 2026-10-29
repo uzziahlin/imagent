@@ -83,6 +83,10 @@ openlark = { version = "0.20", default-features = false, features = ["auth", "co
 
 # passkey（L3）：webauthn-rs → openssl 传递依赖；vendored = musl 交叉（ECS 部署）时源码编译静态链入，免目标机 libssl。
 openssl = { version = "0.10", features = ["vendored"] }
+# 网关 ed25519 挑战应答认证（协议 v1.3）：relay 侧验签（只存公钥）+ 网关侧
+# 签名（私钥 seed 落 ~/.imagent/web-gateway-key，0600）。纯 Rust 实现，无 C 依赖，
+# 不影响 relay 的 openssl vendored 链。
+ed25519-dalek = "2"
 
 [package]
 name = "imagent"

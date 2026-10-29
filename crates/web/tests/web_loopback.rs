@@ -1,7 +1,8 @@
-//! 回环集成测试（M2 核心验收 + M5 多终端 v1.1）：真 relay
+//! 回环集成测试（M2 核心验收 + M5 多终端 v1.1 + v1.3 key 认证）：真 relay
 //!（`imagent_relay::spawn_relay` 随机端口）+ 真 `WebPlatform`（出站连
-//! `/gateway`，hello 自报 machine=test-mac）+ tokio-tungstenite 模拟浏览器
-//!（连 `/ws`，hello 认证），覆盖任务说明 §8 场景 1-6：
+//! `/gateway`，v1.3 起走 ed25519 挑战应答——hello 自报 machine=test-mac →
+//! challenge → prove → hello_ack）+ tokio-tungstenite 模拟浏览器（连
+//! `/ws`，hello 认证），覆盖任务说明 §8 场景 1-6：
 //! 1. 建连与在线；
 //! 2. message 帧 → `Platform::recv`；
 //! 3. send_text / send_card / update_card → text / card / card_patch 帧；
@@ -12,14 +13,18 @@
 //!
 //! M5 增补：出站帧全部带 machine 字段；浏览器帧 machine 路由（指定本机 /
 //! 指定离线 machine_offline）。
+//! v1.3 增补：网关凭证默认 key 形态（测试内生成密钥对，relay 的 KEYS 表
+//! 绑定其公钥，平台侧持私钥走三帧握手）；token 形态（v1.2 兼容路径）
+//! 单独一条回归用例。
 
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use ed25519_dalek::SigningKey;
 use futures::{SinkExt, StreamExt};
 use imagent_core::{CardPhase, CardTerminal, ConvId, OutboundCard, Platform, ReplyHint};
 use imagent_relay::{spawn_relay, RelayConfig, RelayHandle};
-use imagent_web::WebPlatform;
+use imagent_web::{GatewayCredential, WebPlatform};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::handshake::client::generate_key;
 use tokio_tungstenite::tungstenite::http::Request;
@@ -29,24 +34,35 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// 测试 token（本地随机端口 + loopback，无真实敏感面；两 token 不同是 relay
-/// fail-closed 校验要求）。
+/// fail-closed 校验要求）。v1.3 起 token 仅用于兼容回归用例。
 const GW_TOKEN: &str = "test-gw-token-0123456789abcdef";
 const USER_TOKEN: &str = "test-user-token-0123456789abc";
 const CONV: &str = "web:work";
 /// 本平台自报的 machine 身份（v1.1 hello + 出站帧携带）。
 const MACHINE: &str = "test-mac";
 
-async fn spawn_test_relay() -> RelayHandle {
-    use imagent_relay::{GatewayTokens, DEFAULT_SESSION_TTL_SECS};
+/// 测试内生成 ed25519 密钥对（随机 seed）。
+fn gen_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&rand::random::<[u8; 32]>())
+}
+
+/// 起 key-only relay（v1.3：KEYS 表绑本机公钥，TOKENS 全空——「只配公钥
+/// 表」形态）+ 对应私钥。返回 (handle, 私钥)。
+async fn spawn_test_relay() -> (RelayHandle, SigningKey) {
+    use imagent_relay::{GatewayKeys, GatewayTokens, DEFAULT_SESSION_TTL_SECS};
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let sk = gen_signing_key();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    // v1.2：网关 token-machine 绑定（平台自报 MACHINE，token 必须绑它）；
-    // 会话状态目录用临时目录（每次唯一，不跨用例共享会话）。
-    spawn_relay(
+    let handle = spawn_relay(
         listener,
         RelayConfig {
-            gateway_tokens: GatewayTokens::parse(&format!("{MACHINE}={GW_TOKEN}")).unwrap(),
+            gateway_tokens: GatewayTokens::default(),
+            gateway_keys: GatewayKeys::parse(&format!(
+                "{MACHINE}={}",
+                hex::encode(sk.verifying_key().to_bytes())
+            ))
+            .unwrap(),
             user_token: USER_TOKEN.to_string(),
             state_dir: std::env::temp_dir().join(format!(
                 "imagent-web-loopback-{}-{}",
@@ -57,21 +73,22 @@ async fn spawn_test_relay() -> RelayHandle {
             webauthn_rp_id: None,
         },
     )
-    .expect("测试配置合法")
+    .expect("测试配置合法");
+    (handle, sk)
 }
 
-/// 起真 relay + 真平台（hello 自报 machine，等在线）+ 模拟浏览器（hello
+/// 起真 relay（key 形态）+ 真平台（三帧握手，等在线）+ 模拟浏览器（hello
 /// 认证 + machines 快照断言）。
 async fn setup() -> (RelayHandle, WebPlatform, Ws) {
-    let handle = spawn_test_relay().await;
+    let (handle, sk) = spawn_test_relay().await;
     let addr = handle.addr;
     let platform = WebPlatform::new(
         format!("ws://{addr}/gateway"),
-        GW_TOKEN.to_string(),
+        GatewayCredential::Key(sk),
         "default".to_string(),
         MACHINE.to_string(),
     );
-    // 等 platform 连上 relay（client spawn 后异步建连 + hello 认证）。
+    // 等 platform 连上 relay（client spawn 后异步建连 + 三帧握手认证）。
     eventually(Duration::from_secs(10), || platform.is_online()).await;
     // 浏览器：hello 认证（浏览器唯一形态是首帧 hello）。
     let mut ws = connect_ws(&addr, "/ws", None).await;
@@ -510,6 +527,74 @@ async fn loopback_browser_machine_field_routing() {
             .is_err(),
         "machine_offline 帧不应进 recv"
     );
+
+    handle.shutdown();
+    handle.wait().await;
+    drop(p);
+}
+
+/// 场景 8（v1.3 token 兼容路径回归）：凭证为 Token 形态（密钥文件损坏时
+/// 的回退路径）时，真 client 走 v1.2 一步 hello（token + machine）照常
+/// 认证上线、双向通路可用——key 升级不破坏既有部署。
+#[tokio::test]
+async fn loopback_token_credential_compat() {
+    use imagent_relay::{GatewayKeys, GatewayTokens, DEFAULT_SESSION_TTL_SECS};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let handle = spawn_relay(
+        listener,
+        RelayConfig {
+            // tokens-only 形态（KEYS 空）。
+            gateway_tokens: GatewayTokens::parse(&format!("{MACHINE}={GW_TOKEN}")).unwrap(),
+            gateway_keys: GatewayKeys::default(),
+            user_token: USER_TOKEN.to_string(),
+            state_dir: std::env::temp_dir().join(format!(
+                "imagent-web-loopback-tok-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            )),
+            session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
+            webauthn_rp_id: None,
+        },
+    )
+    .expect("测试配置合法");
+
+    let p = WebPlatform::new(
+        format!("ws://{}/gateway", handle.addr),
+        GatewayCredential::Token(GW_TOKEN.to_string()),
+        "default".to_string(),
+        MACHINE.to_string(),
+    );
+    eventually(Duration::from_secs(10), || p.is_online()).await;
+
+    // 双向通路：浏览器 message → recv；send_text → text 帧。
+    let addr = handle.addr;
+    let mut br = connect_ws(&addr, "/ws", None).await;
+    br.send(Message::text(format!(
+        r#"{{"v":1,"type":"hello","token":"{USER_TOKEN}"}}"#
+    )))
+    .await
+    .unwrap();
+    let ack = next_text(&mut br).await;
+    assert!(ack.contains(r#""type":"hello_ack""#), "hello_ack：{ack}");
+    let _machines = next_of_type(&mut br, "machines").await;
+
+    br.send(Message::text(
+        r#"{"v":1,"type":"message","convId":"work","text":"token 形态"}"#,
+    ))
+    .await
+    .unwrap();
+    let m = tokio::time::timeout(Duration::from_secs(5), p.recv())
+        .await
+        .expect("recv 超时")
+        .expect("recv 正常");
+    assert_eq!(m.conv_id, conv());
+    p.send_text(&conv(), "收到", &ReplyHint::None)
+        .await
+        .unwrap();
+    let v = next_of_type(&mut br, "text").await;
+    assert_eq!(v["text"], "收到");
 
     handle.shutdown();
     handle.wait().await;

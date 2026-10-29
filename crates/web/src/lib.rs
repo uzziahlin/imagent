@@ -10,6 +10,14 @@
 //!   sync channel，把出站帧写回 relay。
 //! - [`platform`]：`WebPlatform`——`recv`/`send_*` 覆写为帧收发，含审批闭环
 //!   （approval_request / approval_resolved）与 sync 重发（D6 会话恢复）。
+//! - [`key`]：网关认证凭证（v1.3）——ed25519 密钥文件
+//!   （`<imagent_home>/web-gateway-key`，首次自动生成 + 0600 + 公钥指引
+//!   日志）优先，静态 token（v1.2 兼容路径）回退。
+//!
+//! 网关认证（v1.3，见 [`client`] 三帧握手）：token 形态 hello 一步校验
+//!（兼容）；key 形态 `hello{machine}` → relay `challenge{nonce}` →
+//! `prove{pubkey,signature}`（对 nonce 原文签名）→ `hello_ack`——relay 只
+//! 存公钥，私钥 seed 不出本机。
 //!
 //! 帧协议 v1.1（与 relay / SPA 对齐，M5 多终端管理）：JSON 文本帧，信封
 //! `{"v":1,"type":…}`。入站（浏览器→网关）：`message` / `approval_response` /
@@ -35,8 +43,10 @@
 #![deny(unsafe_code)]
 
 pub mod client;
+pub mod key;
 pub mod platform;
 
+pub use key::GatewayCredential;
 pub use platform::WebPlatform;
 
 use imagent_core::{
