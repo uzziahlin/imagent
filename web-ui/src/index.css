@@ -52,6 +52,14 @@ body,
 #root {
   /* 回退：不支持 dvh 的旧浏览器（Safari <15.4 / Chrome <108） */
   height: 100vh;
+  /* 锁 document 滚动：聚焦输入框时 iOS 只能滚内部消息容器，页面壳永不被顶起 */
+  overflow: hidden;
+}
+
+html,
+body {
+  /* 防 iOS 橡皮筋把 document 拖出（内部消息容器已有 overscroll-contain 不受影响） */
+  overscroll-behavior: none;
 }
 
 /*

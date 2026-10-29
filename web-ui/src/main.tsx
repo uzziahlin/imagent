@@ -10,6 +10,8 @@ import "./index.css";
  * 失焦弹回。这里把 visualViewport 实际高度写入 --vvh（index.css 满高容器
  * 消费），键盘收展时布局高度平滑跟随。双指缩放（scale≠1，页面 meta 未禁用
  * 的无障碍能力）时不改布局高度，避免捏合缩放导致容器塌缩。
+ * index.css 已锁 document 滚动（overflow:hidden），这里再在键盘收展瞬间
+ * scrollTo(0,0) 防御性归位：任何原因导致 document 出现 scrollY 残留即清零。
  */
 function trackViewportHeight(): void {
   const vv = window.visualViewport;
@@ -19,6 +21,8 @@ function trackViewportHeight(): void {
   const update = () => {
     if (vv.scale === 1) {
       document.documentElement.style.setProperty("--vvh", `${vv.height}px`);
+      // 防御性归位：任何原因导致 document 出现 scrollY 残留，键盘收展瞬间即清零
+      window.scrollTo(0, 0);
     } else {
       document.documentElement.style.removeProperty("--vvh");
     }
