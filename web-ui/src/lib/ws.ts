@@ -21,6 +21,12 @@
 // 显式明文机器 → 原帧明文，confirming/超时未放行/身份告警 → 拒发（fail-
 // closed）。入站 enc 帧解密后二次分发为原帧走既有 onFrame；active 机器的
 // 明文业务帧（注入面）丢弃。心跳 ping 同包装但永不阻断（保命线）。
+// v1.5 准入与管理：管理帧（machine_list/machine_add/machine_remove/
+// user_token_rotate/pairing_approve/pairing_deny，均带 adminToken）为 relay
+// 自产自消帧，不在 e2e BUSINESS_TYPES 内、恒明文发送；配对模式（opts.pairing）
+// hello 无凭证带 pairing:true+device，pairing_pending 清 hello 超时进入等待，
+// 批准后同连接 hello_ack.session 走常规就绪；close 1008 "pairing denied"
+// 分流为 pairing_denied 上抛。
 
 import {
   DEFAULT_MACHINE,
@@ -65,6 +71,10 @@ export interface WsManagerOptions {
   session?: string;
   /** 首次登录可选设备名（hello 帧 device 字段；旧 relay 忽略未知字段安全）。 */
   device?: string;
+  /** v1.5 新设备配对模式：hello 带 pairing:true + device（无凭证），relay 回
+   *  pairing_pending（连接保持未认证等待态），被批准后 relay 在本连接直接
+   *  换发 hello_ack.session。与 token/session 互斥。 */
+  pairing?: string;
   /** 全部合法入站帧（已过 parseFrame 校验）。 */
   onFrame: (frame: InboundFrame) => void;
   onStatus: (status: ConnStatus) => void;
@@ -73,6 +83,9 @@ export interface WsManagerOptions {
   /** hello_ack 携带 session（新 relay 签发）：调用方持久化并删除 USER_TOKEN。
    *  旧 relay 不触发（无 session 字段）——保持 USER_TOKEN 直连模式。 */
   onSession?: (session: SessionInfo) => void;
+  /** v1.5 配对等待码（pairing_pending 帧，仅 pairing 模式；兼作「握手已应答」
+   *  信号——清 hello 超时定时器，连接可无限期等待批准）。 */
+  onPairingPending?: (code: string) => void;
   /** v1.4 E2E 事件上抛（TOFU 确认请求 / 身份变化告警 / 不支持加密 / 明文
    *  放行）。旧 relay 单机模式（无 machines 帧）恒不触发。 */
   onE2e?: (ev: E2eEvent) => void;
@@ -155,10 +168,15 @@ export function loadSession(): StoredSession | null {
 // close 1008 reason 分流（协议 v1.2）
 // ---------------------------------------------------------------------------
 
-/** 认证失败细分（App 据此给登录页不同提示 / 清不同凭证）。 */
-export type AuthFailReason = "session_expired" | "session_revoked" | "auth_failed";
+/** 认证失败细分（App 据此给登录页不同提示 / 清不同凭证）。v1.5 增
+ * pairing_denied（配对被拒，pending 连接被 relay 关闭）。 */
+export type AuthFailReason =
+  | "session_expired"
+  | "session_revoked"
+  | "pairing_denied"
+  | "auth_failed";
 
-/** close 1008 reason → AuthFailReason：仅识别协议规定的三种字符串，其余
+/** close 1008 reason → AuthFailReason：仅识别协议规定的字符串，其余
  *  （含缺席、旧 relay 的任意 reason）一律 auth_failed。 */
 export function authFailReason(reason: string | undefined): AuthFailReason {
   if (reason === "session expired") {
@@ -167,6 +185,9 @@ export function authFailReason(reason: string | undefined): AuthFailReason {
   if (reason === "session revoked") {
     return "session_revoked";
   }
+  if (reason === "pairing denied") {
+    return "pairing_denied";
+  }
   return "auth_failed";
 }
 
@@ -174,10 +195,12 @@ export class WsManager {
   private readonly url: string;
   private readonly token: string | undefined;
   private readonly device: string | undefined;
+  private readonly pairingDevice: string | undefined;
   private readonly onFrame: (frame: InboundFrame) => void;
   private readonly onStatus: (status: ConnStatus) => void;
   private readonly onAuthFailed: (reason: AuthFailReason) => void;
   private readonly onSession: ((session: SessionInfo) => void) | undefined;
+  private readonly onPairingPending: ((code: string) => void) | undefined;
   private readonly onE2e: ((ev: E2eEvent) => void) | undefined;
   private readonly wsFactory: (url: string) => WebSocketLike;
   private readonly getMachine: (() => string | undefined) | undefined;
@@ -211,11 +234,13 @@ export class WsManager {
     this.url = opts.url;
     this.token = opts.token;
     this.device = opts.device;
+    this.pairingDevice = opts.pairing;
     this.sessionToken = opts.session;
     this.onFrame = opts.onFrame;
     this.onStatus = opts.onStatus;
     this.onAuthFailed = opts.onAuthFailed;
     this.onSession = opts.onSession;
+    this.onPairingPending = opts.onPairingPending;
     this.onE2e = opts.onE2e;
     this.wsFactory = opts.wsFactory ?? ((u) => new WebSocket(u) as unknown as WebSocketLike);
     this.getMachine = opts.getMachine;
@@ -301,6 +326,40 @@ export class WsManager {
     return this.send({ v: 1, type: "cred_revoke", credId });
   }
 
+  // ---- v1.5 管理帧（浏览器 → relay 自产自消；adminToken 由调用方经
+  //      lib/admin 的 ensureAdminToken 取得。管理帧恒明文——e2e 层只包装
+  //      BUSINESS_TYPES 业务帧，管理帧不在其列，原样发送）----
+
+  /** 拉取机器配置列表（relay 回 machines_cfg）。 */
+  sendMachineList(adminToken: string): boolean {
+    return this.send({ v: 1, type: "machine_list", adminToken });
+  }
+
+  /** 添加机器（成功回 machines_cfg；重名/格式错回 error{machine_invalid}）。 */
+  sendMachineAdd(adminToken: string, name: string, pubkey: string): boolean {
+    return this.send({ v: 1, type: "machine_add", adminToken, name, pubkey });
+  }
+
+  /** 移除机器（回 machines_cfg；该机器网关连接被 relay 断开）。 */
+  sendMachineRemove(adminToken: string, name: string): boolean {
+    return this.send({ v: 1, type: "machine_remove", adminToken, name });
+  }
+
+  /** 轮换 USER_TOKEN（回 user_token_rotated，新值仅此一次返回明文）。 */
+  sendUserTokenRotate(adminToken: string): boolean {
+    return this.send({ v: 1, type: "user_token_rotate", adminToken });
+  }
+
+  /** 配对批准（管理级，adminToken 须先经 re-auth 取得）。 */
+  sendPairingApprove(adminToken: string, code: string): boolean {
+    return this.send({ v: 1, type: "pairing_approve", adminToken, code });
+  }
+
+  /** 配对拒绝（管理级，同上）。 */
+  sendPairingDeny(adminToken: string, code: string): boolean {
+    return this.send({ v: 1, type: "pairing_deny", adminToken, code });
+  }
+
   // ---- v1.4 E2E（TOFU 决断 / 明文放行 / pin 重置后重试）----
 
   /** TOFU 弹层决断：accept = 信任并 pin + 启用加密；false = 拒绝（转
@@ -375,15 +434,17 @@ export class WsManager {
     }, this.helloTimeoutMs);
   };
 
-  /** hello 双形态（v1.2）：持有会话凭证 → session 形态；否则 token 形态
-   *  （+可选 device）。undefined 字段不序列化，token 形态无 device 时与
-   *  v1.1 字节级一致（旧 relay 兼容；device 对旧 relay 是被忽略的未知字段）。 */
+  /** hello 三形态（v1.2 + v1.5）：配对模式 → pairing+device（无凭证，relay
+   *  回 pairing_pending，批准后同连接换发 hello_ack.session）；持有会话凭证
+   *  → session 形态；否则 token 形态（+可选 device）。undefined 字段不序列化，
+   *  token 形态无 device 时与 v1.1 字节级一致（旧 relay 兼容）。 */
   private sendHello(): void {
-    this.rawSend(
-      this.sessionToken
-        ? encodeFrame({ v: 1, type: "hello", session: this.sessionToken })
-        : encodeFrame({ v: 1, type: "hello", token: this.token, device: this.device }),
-    );
+    const hello: OutboundFrame = this.pairingDevice
+      ? { v: 1, type: "hello", pairing: true, device: this.pairingDevice }
+      : this.sessionToken
+        ? { v: 1, type: "hello", session: this.sessionToken }
+        : { v: 1, type: "hello", token: this.token, device: this.device };
+    this.rawSend(encodeFrame(hello));
   }
 
   private handleMessage = (ev: WsEvent): void => {
@@ -397,6 +458,13 @@ export class WsManager {
     this.lastFrameAt = Date.now();
     if (frame.type === "hello_ack" && !this.ready) {
       this.onHelloAck(frame);
+      return;
+    }
+    // v1.5：配对等待码由配对模式连接层消费（清 hello 超时，进入无限期等待；
+    // 批准后 relay 在本连接发 hello_ack 走下方常规就绪路径）
+    if (frame.type === "pairing_pending") {
+      this.clearHelloTimer();
+      this.onPairingPending?.(frame.code);
       return;
     }
     // v1.4：握手应答由 e2e 协调器消费（不进 onFrame）

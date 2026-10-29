@@ -64,6 +64,16 @@
 //!   见 [`frame_sid`]）——非空且匹配在线浏览器会话 → 只投该连接（逐浏览器
 //!   独立密钥的前提）；空/无匹配 → 广播现状。enc 帧不进 sync/ping 歧义
 //!   豁免表（照常 machine 路由）。
+//! - **准入与管理面（管理批）**：机器公钥表从 env 静态迁移为
+//!   `<state_dir>/machines.json` 落盘 + 热更新（env `GATEWAY_KEYS` 仅首次
+//!   种子，见 [`machines`]）；USER_TOKEN 哈希化落盘
+//!   （`<state_dir>/user_token_hash`，env 仅首次种子，见
+//!   [`sessions::UserTokenStore`]）。管理操作须 passkey re-auth
+//!   （`POST /webauthn/reauth/{begin,complete}` → 5 分钟 adminToken）：四个
+//!   管理帧 `machine_list` / `machine_add` / `machine_remove` /
+//!   `user_token_rotate` + 配对批准 `pairing_approve` / `pairing_deny`。
+//!   新设备配对流（无凭证 hello `pairing:true` → 6 位码 pending → 广播
+//!   `pairing_request` → 批准换发 session / 拒绝 close 1008）见 [`pairing`]。
 //!
 //! 分层（任务说明 §4.7）：核心状态机全部在本 lib（可单测 + 集成测试直接
 //! [`spawn_relay`] 起真 server），`main.rs` 只做 env / bind / tracing 组装。
@@ -91,10 +101,13 @@ use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 
+mod machines;
+mod pairing;
 mod sessions;
 mod webauthn;
 
-use sessions::{DeviceView, SessionLookup, SessionStore};
+use pairing::PairingSignal;
+use sessions::{DeviceView, SessionLookup, SessionStore, UserTokenStore};
 
 /// 统一 tracing target（仓库纪律）。
 const TARGET: &str = "imagent::relay";
@@ -152,6 +165,10 @@ const CHALLENGE_TTL: Duration = Duration::from_secs(60);
 /// 的条目——正常网关握手毫秒级完成，60s 窗口内 1024 个并发未完成握手已
 /// 远超真实部署形态。
 const CHALLENGE_MAX_ENTRIES: usize = 1024;
+/// 新设备配对 pending 码有效期缺省（管理批）：5 分钟；测试可经
+/// [`RelayConfig::pairing_ttl_secs`] 缩短验证过期路径（单一事实源在
+/// [`pairing::PAIRING_TTL_SECS`]）。
+pub const DEFAULT_PAIRING_TTL_SECS: u64 = pairing::PAIRING_TTL_SECS;
 
 /// WS close code（RFC 6455 + 私有码，§4.2/§4.3/§4.5）。
 const CLOSE_POLICY: u16 = 1008; // 认证失败 / 协议违规（binary、非 hello 首帧）/ 限流
@@ -396,6 +413,12 @@ impl GatewayKeys {
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
+
+    /// machine → 公钥 hex 迭代（[`crate::machines::MachineStore::load`] 首次
+    /// 种子导入用；运行时认证走 MachineStore，本表只在启动期消费一次）。
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.map.iter().map(|(m, e)| (m, &e.hex))
+    }
 }
 
 /// challenge nonce 表条目：签发时绑定 hello 自报的 machine，60s 过期。
@@ -458,20 +481,31 @@ impl ChallengeTable {
 #[derive(Clone)]
 pub struct RelayConfig {
     /// 网关侧 token-machine 绑定表（`IMAGENT_RELAY_GATEWAY_TOKENS`）。
+    /// **env 静态兼容路径**（管理批不管理面化）：迁移期保留，机器切到
+    /// key 握手后可移除。
     pub gateway_tokens: GatewayTokens,
-    /// 网关侧 machine-公钥绑定表（`IMAGENT_RELAY_GATEWAY_KEYS`，v1.3 挑战
-    /// 应答验签用）。与 gateway_tokens 双表并存任一命中；两表均空拒启。
+    /// 网关侧 machine-公钥绑定表（`IMAGENT_RELAY_GATEWAY_KEYS`）——**仅首次
+    /// 种子**（管理批起运行表为 `<state_dir>/machines.json` 落盘 + 热更新，
+    /// 见 [`machines::MachineStore`]）：文件不存在时种子导入，存在则本表
+    /// 被忽略（文件权威）。
     pub gateway_keys: GatewayKeys,
-    /// 浏览器侧登录 token（`IMAGENT_RELAY_USER_TOKEN`，仅登录换发会话用）。
+    /// 浏览器侧登录 token（`IMAGENT_RELAY_USER_TOKEN`）——**仅首次种子**
+    /// （管理批起运行值为 `<state_dir>/user_token_hash` 哈希落盘，见
+    /// [`sessions::UserTokenStore`]）：文件不存在时种子写哈希，存在则本值
+    /// 被忽略（文件权威）。可为空串（迁移后 env 已移除的形态）。
     pub user_token: String,
     /// 会话状态目录（`IMAGENT_RELAY_STATE_DIR`，缺省
     /// `/var/lib/imagent-relay`，main 负责 mkdir）：会话表落盘
-    /// `<dir>/sessions.json`。systemd 部署可用 `StateDirectory=imagent-relay`
-    /// 落到同一路径。
+    /// `<dir>/sessions.json`，机器表 `<dir>/machines.json`，USER_TOKEN 哈希
+    /// `<dir>/user_token_hash`，passkey 凭证 `<dir>/credentials.json`。
+    /// systemd 部署可用 `StateDirectory=imagent-relay` 落到同一路径。
     pub state_dir: PathBuf,
     /// 会话有效期（秒）：缺省 [`DEFAULT_SESSION_TTL_SECS`]（30 天）；测试
     /// 可缩短验证过期路径。
     pub session_ttl_secs: u64,
+    /// 新设备配对 pending 码有效期（秒）：缺省
+    /// [`DEFAULT_PAIRING_TTL_SECS`]（5 分钟）；测试可缩短验证过期路径。
+    pub pairing_ttl_secs: u64,
     /// passkey RP ID 覆盖（`IMAGENT_RELAY_RP_ID`，缺省 None = 按请求 Host
     /// 去端口推导）：固定 rp_id 后换域名/端口不动已注册凭证（WebAuthn
     /// 凭证绑定 rp_id 而非 origin）。
@@ -479,27 +513,14 @@ pub struct RelayConfig {
 }
 
 impl RelayConfig {
-    /// fail-closed 校验（§4.2，纯函数便于单测）：网关认证表（KEYS 与
-    /// TOKENS **至少一个非空**——只配公钥表或只配 token 表均可，全空则无
-    /// 任何网关认证形态可用 → 拒，不提供无认证模式）/ USER_TOKEN 缺失或空
-    /// → 拒；任一网关 token 与 USER_TOKEN 相同 → 拒（职责分离——拿到一个
-    /// token 不能同时扮演网关与浏览器两端。公钥无须此项：公钥是公开材料，
-    /// 持有公钥不构成任何一端的登录能力）。
+    /// 配置期 fail-closed 校验（纯函数便于单测）。运行期校验（落盘权威
+    /// 表的「至少一个非空」/「USER_TOKEN 种子或文件必居其一」）在
+    /// [`spawn_relay`] 组装真实存储后执行——本函数只看得到 env 值。保留：
+    /// 职责分离——env USER_TOKEN 种子与任一网关 token 相同 → 拒（拿到一
+    /// 个 token 不能同时扮演网关与浏览器两端；公钥无须此项：持有公钥不
+    /// 构成任何一端的登录能力）。
     pub fn validate(&self) -> Result<(), String> {
-        if self.gateway_tokens.is_empty() && self.gateway_keys.is_empty() {
-            return Err(
-                "网关认证表缺失：IMAGENT_RELAY_GATEWAY_KEYS（machine=<64 hex ed25519 公钥> \
-                 逗号分隔，网关侧首次启动自动生成并打印公钥）与 IMAGENT_RELAY_GATEWAY_TOKENS\
-                 （machine=token 逗号分隔）至少配置其一；relay 不提供无认证模式"
-                    .into(),
-            );
-        }
-        if self.user_token.trim().is_empty() {
-            return Err("浏览器 token 缺失或为空：必填 IMAGENT_RELAY_USER_TOKEN\
-                 （openssl rand -hex 32 生成）"
-                .into());
-        }
-        if self.gateway_tokens.contains_token(&self.user_token) {
+        if !self.user_token.is_empty() && self.gateway_tokens.contains_token(&self.user_token) {
             return Err(
                 "IMAGENT_RELAY_USER_TOKEN 不得与任何网关 token 相同：职责分离，\
                  防止拿到一个 token 就能扮演网关与浏览器两端"
@@ -529,6 +550,13 @@ pub fn mask_token(token: &str) -> String {
     format!("{}…", token.chars().take(4).collect::<String>())
 }
 
+/// 机器表落盘文件（`<state_dir>/machines.json`）是否已存在（main 的启动
+/// 期 fail-closed 判定用：文件在 = 管理面已接管机器表，env 两网关认证表
+/// 均空不再拒启——「UI 删光机器后重启 brick」不是 fail-closed 想防的）。
+pub fn machines_table_exists(state_dir: &std::path::Path) -> bool {
+    machines::table_file_exists(state_dir)
+}
+
 /// 常数时间比较（防时序侧信道）。写法对齐 `src/webhook.rs`
 /// `verify_webhook_signature` 尾部的 XOR 累计——不引入 subtle 依赖的
 /// 仓库既有先例：长度差异单独进 diff，字节差异逐位 OR 累计。
@@ -546,15 +574,18 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 // hello 首帧解析（§4.2 主认证形态 + v1.2 会话层）
 // ---------------------------------------------------------------------------
 
-/// hello 首帧反序列化形状（v1.2 会话层后的全量字段）：
-/// `{"v":1,"type":"hello","token":"…","machine":"…","session":"…","device":"…"}`
+/// hello 首帧反序列化形状（v1.2 会话层后的全量字段 + 管理批配对入口）：
+/// `{"v":1,"type":"hello","token":"…","machine":"…","session":"…","device":"…","pairing":true}`
 /// - 网关侧：`token`（machine 绑定校验）+ 可选 `machine` 自报身份
 ///   （v1.1）；v1.3 起也接受**不带任何凭证**的 hello（走 key 挑战应答，
 ///   见 [`HelloCredential::Challenge`]）；网关无会话概念，`session` 字段
 ///   一律拒绝；
 /// - 浏览器侧：`session`（重连）优先，`token`（USER_TOKEN 登录换发）次之，
 ///   可选 `device`（≤64 char，缺省记 UA 摘要）；浏览器无 machine 概念
-///   （带了也只经校验不消费）。
+///   （带了也只经校验不消费）；
+/// - 配对入口（管理批）：`pairing:true` 且**无任何凭证**——新设备首配
+///   形态，分拣见 [`PairingHello`]（`pairing:true` 与凭证并存按认证失败
+///   拒绝，不留「带 token 的配对」歧义形态）。
 #[derive(Deserialize)]
 struct HelloFrame {
     v: i64,
@@ -568,6 +599,8 @@ struct HelloFrame {
     session: Option<String>,
     #[serde(default)]
     device: Option<String>,
+    #[serde(default)]
+    pairing: Option<bool>,
 }
 
 /// hello 携带的凭证（v1.2 + v1.3）：`session` 字段优先（重连），`token`
@@ -675,6 +708,45 @@ fn parse_hello(text: &str) -> Result<ParsedHello, HelloParseError> {
         machine,
         device,
     })
+}
+
+/// 浏览器 hello 的配对入口分拣（管理批，纯函数便于单测）：
+/// - `pairing:true` 且**无任何凭证**（token/session 均缺席）→ [`PairingHello::Pairing`]
+///   （新设备首配形态，设备名同款 trim/≤64 约束，超限 Reject）；
+/// - `pairing:true` 与凭证并存 → [`PairingHello::Reject`]（意图矛盾：配对
+///   本就是无凭证设备的入口，带凭证走正常登录——不留歧义形态）；
+/// - 其余（pairing 缺席/false、非 hello、畸形 JSON）→ [`PairingHello::NotPairing`]
+///   （走既有认证分拣，畸形由 parse_hello 统一拒）。
+///
+/// 网关侧不消费本判定（配对是浏览器登录页路径；网关 hello 的 pairing 字段
+/// 被忽略，走既有 v1.2/v1.3 分流）。
+#[derive(Debug, PartialEq, Eq)]
+enum PairingHello {
+    Pairing { device: Option<String> },
+    Reject,
+    NotPairing,
+}
+
+fn classify_pairing_hello(text: &str) -> PairingHello {
+    let Ok(h) = serde_json::from_str::<HelloFrame>(text) else {
+        return PairingHello::NotPairing;
+    };
+    // 信封版本与帧类型先拒（v!=1 / 非 hello → NotPairing，由 parse_hello
+    // 统一按 BadVersion/NotHello 拒——失败形态与正常认证一致）。
+    if h.v != 1 || h.kind != "hello" || h.pairing != Some(true) {
+        return PairingHello::NotPairing;
+    }
+    if h.token.is_some() || h.session.is_some() {
+        return PairingHello::Reject;
+    }
+    let device = non_empty_field(&h.device);
+    if device
+        .as_deref()
+        .is_some_and(|d| d.chars().count() > DEVICE_NAME_MAX_CHARS)
+    {
+        return PairingHello::Reject;
+    }
+    PairingHello::Pairing { device }
 }
 
 // ---------------------------------------------------------------------------
@@ -819,36 +891,95 @@ fn devices_frame(devices: &[DeviceView]) -> Message {
     Message::text(serde_json::json!({"v": 1, "type": "devices", "devices": arr}).to_string())
 }
 
-/// 浏览器侧 transport 管理帧（协议 v1.2 §4 + passkey 扩展）：设备列表 /
-/// 吊销 + 通行钥匙列表 / 删除——浏览器与 relay 自产自消，**不进业务路由**
-///（与 sync/ping 的歧义豁免同级，在 machine 路由之前分拣）。`device_revoke`
+/// 浏览器侧 transport 管理帧（协议 v1.2 §4 + passkey 扩展 + 管理批管理帧
+/// 族）：设备列表 / 吊销 + 通行钥匙列表 / 删除 + 机器表增删查 / USER_TOKEN
+/// 轮换 / 配对批准拒绝——浏览器与 relay 自产自消，**不进业务路由**（与
+/// sync/ping 的歧义豁免同级，在 machine 路由之前分拣）。`device_revoke`
 /// 缺 deviceId / `cred_revoke` 缺 credId / 非字符串 → 按 no-op 处理（回当前
-/// 列表帧），不让畸形管理帧漏进业务路由。
+/// 列表帧），不让畸形管理帧漏进业务路由。管理帧族（machine_* /
+/// user_token_rotate / pairing_*）**全部须 `adminToken` 且有效**（缺失/
+/// 无效 → `admin_auth_required`，见 [`admin_frame_reply`]）；载荷字段缺失
+/// 按空串进入各自校验路径。
 #[derive(Debug)]
 enum ManageFrame {
     DeviceList,
     DeviceRevoke(String),
     CredList,
     CredRevoke(String),
+    /// `machine_list`：`{v,type,adminToken}` → machines_cfg。
+    MachineList {
+        admin_token: Option<String>,
+    },
+    /// `machine_add`：`{v,type,adminToken,name(1..=32 [a-zA-Z0-9_-]),pubkey(64hex)}`。
+    MachineAdd {
+        admin_token: Option<String>,
+        name: String,
+        pubkey: String,
+    },
+    /// `machine_remove`：`{v,type,adminToken,name}`。
+    MachineRemove {
+        admin_token: Option<String>,
+        name: String,
+    },
+    /// `user_token_rotate`：`{v,type,adminToken}` → user_token_rotated
+    ///（新 token 明文仅此一次返回）。
+    UserTokenRotate {
+        admin_token: Option<String>,
+    },
+    /// `pairing_approve` / `pairing_deny`：`{v,type,adminToken,code}`（配对
+    /// 批准属管理级，须 re-auth）。
+    PairingApprove {
+        admin_token: Option<String>,
+        code: String,
+    },
+    PairingDeny {
+        admin_token: Option<String>,
+        code: String,
+    },
 }
 
 fn parse_manage_frame(text: &str) -> Option<ManageFrame> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    // 管理帧族公共字段提取（缺失按 None / 空串，校验在处理侧统一做）。
+    let admin = || {
+        v.get("adminToken")
+            .and_then(|t| t.as_str())
+            .map(str::to_string)
+    };
+    let field = |key: &str| {
+        v.get(key)
+            .and_then(|f| f.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
     match v.get("type")?.as_str()? {
         "device_list" => Some(ManageFrame::DeviceList),
-        "device_revoke" => Some(ManageFrame::DeviceRevoke(
-            v.get("deviceId")
-                .and_then(|d| d.as_str())
-                .unwrap_or("")
-                .to_string(),
-        )),
+        "device_revoke" => Some(ManageFrame::DeviceRevoke(field("deviceId"))),
         "cred_list" => Some(ManageFrame::CredList),
-        "cred_revoke" => Some(ManageFrame::CredRevoke(
-            v.get("credId")
-                .and_then(|d| d.as_str())
-                .unwrap_or("")
-                .to_string(),
-        )),
+        "cred_revoke" => Some(ManageFrame::CredRevoke(field("credId"))),
+        "machine_list" => Some(ManageFrame::MachineList {
+            admin_token: admin(),
+        }),
+        "machine_add" => Some(ManageFrame::MachineAdd {
+            admin_token: admin(),
+            name: field("name"),
+            pubkey: field("pubkey"),
+        }),
+        "machine_remove" => Some(ManageFrame::MachineRemove {
+            admin_token: admin(),
+            name: field("name"),
+        }),
+        "user_token_rotate" => Some(ManageFrame::UserTokenRotate {
+            admin_token: admin(),
+        }),
+        "pairing_approve" => Some(ManageFrame::PairingApprove {
+            admin_token: admin(),
+            code: field("code"),
+        }),
+        "pairing_deny" => Some(ManageFrame::PairingDeny {
+            admin_token: admin(),
+            code: field("code"),
+        }),
         _ => None,
     }
 }
@@ -884,6 +1015,23 @@ fn machines_frame(machines: &[String]) -> Message {
 
 fn error_frame(code: &str) -> Message {
     Message::text(serde_json::json!({"v": 1, "type": "error", "code": code}).to_string())
+}
+
+/// error 帧带 message 变体（管理帧校验失败的可读指引，任务定案
+/// `machine_invalid` 形态）：`{"v":1,"type":"error","code":"…","message":"…"}`。
+fn error_frame_msg(code: &str, message: &str) -> Message {
+    Message::text(
+        serde_json::json!({"v": 1, "type": "error", "code": code, "message": message}).to_string(),
+    )
+}
+
+/// `user_token_rotated` 帧（user_token_rotate 管理帧应答）：
+/// `{"v":1,"type":"user_token_rotated","token":"<64hex>"}`——**新 token
+/// 明文仅此一次返回**（落盘的是哈希），SPA 提示用户立即保存。
+fn user_token_rotated_frame(token: &str) -> Message {
+    Message::text(
+        serde_json::json!({"v": 1, "type": "user_token_rotated", "token": token}).to_string(),
+    )
 }
 
 /// challenge 帧（协议 v1.3 key 握手第二帧）：`{"v":1,"type":"challenge",
@@ -1295,6 +1443,21 @@ impl Hub {
             try_send(&tx, Outbound::Close(code, reason));
         }
     }
+
+    /// 全部**已认证**在线 browser 的投递口（管理批：`pairing_request`
+    /// 广播目标——未认证连接不在 browsers 表，天然收不到）。
+    pub(crate) fn browser_broadcast(&self) -> Vec<mpsc::Sender<Outbound>> {
+        let st = self.lock();
+        browser_senders(&st)
+    }
+
+    /// 指定 machine 网关连接的投递口（machine_remove 断开该机器当前连接
+    /// 用）。**不摘槽位**——Close 经 channel 送达后由该连接自己的退出路径
+    /// release_gateway 清槽 + 广播 machines 更新，语义与自然断开一致。
+    pub(crate) fn gateway_sender(&self, machine: &str) -> Option<mpsc::Sender<Outbound>> {
+        let st = self.lock();
+        st.gateways.get(machine).map(|e| e.tx.clone())
+    }
 }
 
 /// best-effort 投递：channel 打满 / 接收端已撤 = 对端消费停滞，丢弃并记
@@ -1391,18 +1554,26 @@ async fn security_headers(req: Request, next: Next) -> Response {
     res
 }
 
-/// axum 共享状态（每连接 Clone；Arc 内部共享同一 Hub / 配置 / 会话表）。
+/// axum 共享状态（每连接 Clone；Arc 内部共享同一 Hub / 配置 / 各存储）。
 #[derive(Clone)]
 struct RelayState {
     hub: Hub,
     config: Arc<RelayConfig>,
     /// 会话表（v1.2）：启动时从 `<state_dir>/sessions.json` 加载。
     sessions: Arc<SessionStore>,
-    /// passkey 层（凭证表 + challenge 表 + begin 限流）：启动时从
-    /// `<state_dir>/credentials.json` 加载。
+    /// passkey 层（凭证表 + challenge 表 + begin 限流 + admin 令牌表）：
+    /// 启动时从 `<state_dir>/credentials.json` 加载。
     webauthn: Arc<webauthn::WebauthnState>,
     /// 网关 key 握手 challenge 表（v1.3）：内存态，nonce 一次性 60s 过期。
     challenges: Arc<Mutex<ChallengeTable>>,
+    /// 机器公钥表（管理批）：`<state_dir>/machines.json` 落盘 + 热更新，
+    /// env GATEWAY_KEYS 仅首次种子（运行时 prove 验签权威）。
+    machines: Arc<machines::MachineStore>,
+    /// USER_TOKEN 哈希存储（管理批）：`<state_dir>/user_token_hash` 落盘，
+    /// env 仅首次种子；user_token_rotate 热轮换。
+    user_token: Arc<UserTokenStore>,
+    /// 新设备配对 pending 表（管理批）：内存态。
+    pairing: Arc<pairing::PairingStore>,
 }
 
 /// SPA 静态资源（M1 占位 index.html；M3 构建产物落入 `static/` 后零改动挂载）。
@@ -1594,7 +1765,9 @@ fn browser_auth(
             }
         }
         HelloCredential::Bootstrap(tok) => {
-            if !constant_time_eq(&tok, &st.config.user_token) {
+            // USER_TOKEN 验证（管理批迁移）：对提交值 sha256 后与
+            // user_token_hash 存值恒定时间比较（存储权威已落盘，可轮换）。
+            if !st.user_token.verify(&tok) {
                 return Err("auth failed");
             }
             issue_session(st, headers, parsed.device.as_deref())
@@ -1633,10 +1806,11 @@ async fn gateway_auth(
             }
         }
         HelloCredential::Challenge => {
-            // KEYS 表全空 → key 握手无任何成功路径，直接失败（不签发
-            // challenge：省一条 challenge 表条目与客户端等待，且不暴露
-            // 「机器在不在表」的配置差异——失败形态与验签失败一致）。
-            if st.config.gateway_keys.is_empty() {
+            // 机器表（管理批：machines.json 落盘权威 + 热更新）全空 → key
+            // 握手无任何成功路径，直接失败（不签发 challenge：省一条
+            // challenge 表条目与客户端等待，且不暴露「机器在不在表」的
+            // 配置差异——失败形态与验签失败一致）。
+            if st.machines.is_empty() {
                 return Err("auth failed");
             }
             let nonce = {
@@ -1673,11 +1847,7 @@ fn verify_prove(st: &RelayState, nonce: &str, text: &str) -> Result<String, &'st
         table.consume(nonce, Instant::now())
     }
     .ok_or("auth failed")?;
-    if !st
-        .config
-        .gateway_keys
-        .verify(&machine, &p.pubkey, nonce, &p.signature)
-    {
+    if !st.machines.verify(&machine, &p.pubkey, nonce, &p.signature) {
         return Err("auth failed");
     }
     Ok(machine)
@@ -1691,6 +1861,225 @@ async fn send_all(tx: &mpsc::Sender<Outbound>, items: impl IntoIterator<Item = O
             break;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// 新设备配对等待流 + 管理帧处理（管理批）
+// ---------------------------------------------------------------------------
+
+/// 管理帧 adminToken 门槛（管理批）：缺失 / 无效 / 已过期（5 分钟窗）→
+/// false（调用方回 `admin_auth_required` 并丢弃帧——任务定案的统一失败
+/// 形态，不区分原因防探测）。
+fn admin_gate(st: &RelayState, token: &Option<String>) -> bool {
+    token
+        .as_deref()
+        .is_some_and(|t| st.webauthn.admin_tokens.verify(t, sessions::unix_now()))
+}
+
+/// 管理操作审计日志（journalctl）：操作 / 机器名或配对码 / session id 前
+/// 8 位；token 绝不记录（§4.5 日志纪律）。
+fn admin_audit(session_id: &str, op: &str, detail: &str) {
+    tracing::info!(
+        target: TARGET,
+        session = %session_log_id(session_id),
+        op,
+        detail,
+        "管理操作（审计）"
+    );
+}
+
+/// 本连接的会话 id（管理审计标注发起者；浏览器连接必有会话，防御性空串）。
+fn admin_session_id(session: &Option<BrowserSession>) -> String {
+    session.as_ref().map(|s| s.id.clone()).unwrap_or_default()
+}
+
+/// 新设备配对等待流（管理批，`hello{pairing:true}` 入口）：创建 pending
+///（6 位码，`pairing_ttl_secs` 过期，上限 4）→ 回 `pairing_pending` → 向
+/// 全部**已认证**浏览器广播 `pairing_request` → 等待 approve/deny 信号、
+/// 过期或对端断开。
+///
+/// 返回 `Some(会话)` = 批准通过（换发的 session 明文经 approve 信号送达，
+/// 调用方走公共注册路径回 hello_ack——形态与登录换发一致）；`None` = 连接
+/// 已在本流内收口（pending 上限 / 过期 / 拒绝 / 对端断开），调用方直接
+/// 返回。等待期「只允许等待」：入站文本帧一律忽略（含 SPA 保活 ping——
+/// 配对页连接还在等批准，不是业务通道），二进制按协议违规 close。
+async fn run_pairing(
+    socket: &mut WebSocket,
+    st: &RelayState,
+    headers: &HeaderMap,
+    device: Option<&str>,
+) -> Option<BrowserSession> {
+    let name = device_name(device, headers);
+    let (sig_tx, mut sig_rx) = mpsc::channel::<PairingSignal>(1);
+    let Some(pending) = st.pairing.create(
+        &name,
+        sig_tx,
+        sessions::unix_now(),
+        st.config.pairing_ttl_secs,
+    ) else {
+        tracing::warn!(
+            target: TARGET,
+            device = %name,
+            pending = st.pairing.len(sessions::unix_now()),
+            "配对 pending 达上限（4），拒绝新配对"
+        );
+        let _ = socket
+            .send(close_msg(CLOSE_POLICY, "too many pairings"))
+            .await;
+        return None;
+    };
+    // 回 pairing_pending（该连接保持未认证态；发不出去 = 对端已断，清表）。
+    if socket
+        .send(pairing::pairing_pending_frame(&pending.code))
+        .await
+        .is_err()
+    {
+        st.pairing.remove(&pending.code);
+        return None;
+    }
+    // 广播 pairing_request 给全部已认证浏览器会话（逐个 try_send，单个
+    // 打满/关闭不影响其余）。
+    let request = Outbound::Msg(pairing::pairing_request_frame(&pending));
+    let targets = st.hub.browser_broadcast();
+    let notified = targets.len();
+    for tx in targets {
+        try_send(&tx, request.clone());
+    }
+    tracing::info!(
+        target: TARGET,
+        code = %pending.code,
+        device = %name,
+        expires_at = pending.expires_at,
+        notified,
+        "配对 pending 创建（pairing_request 已广播）"
+    );
+
+    loop {
+        // 过期判定在每轮循环顶部（sleep 到点后由此收口）。
+        let Some(remaining) = pending.expires_at.checked_sub(sessions::unix_now()) else {
+            st.pairing.remove(&pending.code);
+            tracing::info!(target: TARGET, code = %pending.code, "配对 pending 过期，关闭");
+            let _ = socket
+                .send(close_msg(CLOSE_POLICY, "pairing expired"))
+                .await;
+            return None;
+        };
+        tokio::select! {
+            // 批准/拒绝信号（来自批准者连接任务的 claim + try_send）。
+            sig = sig_rx.recv() => {
+                match sig {
+                    Some(PairingSignal::Approved(s)) => {
+                        tracing::info!(
+                            target: TARGET,
+                            code = %pending.code,
+                            session = %session_log_id(&s.id),
+                            "配对批准：pending 连接换发会话（走公共注册路径）"
+                        );
+                        return Some(BrowserSession {
+                            id: s.id,
+                            ack_token: s.token,
+                            expires_at: s.expires_at,
+                        });
+                    }
+                    Some(PairingSignal::Denied) | None => {
+                        // None = 信号端被丢弃（批准者任务在投递前退出的防御
+                        // 路径），与拒绝同收口。
+                        st.pairing.remove(&pending.code);
+                        let _ = socket.send(close_msg(CLOSE_POLICY, "pairing denied")).await;
+                        return None;
+                    }
+                }
+            }
+            // pending 设备侧行为：断开 / Close → 清表静默退出；文本帧忽略
+            //（只允许等待）；二进制按协议违规。
+            msg = socket.next() => {
+                match msg {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => {
+                        st.pairing.remove(&pending.code);
+                        return None;
+                    }
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) | Some(Ok(Message::Text(_))) => {}
+                    Some(Ok(Message::Binary(_))) => {
+                        st.pairing.remove(&pending.code);
+                        let _ = socket
+                            .send(close_msg(CLOSE_POLICY, "binary not supported"))
+                            .await;
+                        return None;
+                    }
+                }
+            }
+            // 到点睡醒 → 循环顶部过期分支收口（+1s 下限防 0 秒忙转）。
+            _ = tokio::time::sleep(Duration::from_secs(remaining.clamp(1, 60))) => {}
+        }
+    }
+}
+
+/// `pairing_approve` 处理（须 adminToken）：原子 claim pending → 为 pending
+/// 绑定的设备签发会话 → 经信号通道投递（pending 连接在 run_pairing 等待
+/// 循环里收到后走公共注册路径回 hello_ack）。会话表满 → 信号 Denied 收口，
+/// 批准者收 too_many_sessions error。未知/已消费/已过期码 →
+/// `pairing_not_found`。成功对批准者不回帧（任务定案未定义应答——新设备
+/// 进入 devices 列表 / pending 连接收 hello_ack 即反馈）。
+fn handle_pairing_approve(st: &RelayState, code: &str, session_id: &str) -> Option<Message> {
+    let Some((device, sig)) = st.pairing.claim(code, sessions::unix_now()) else {
+        admin_audit(
+            session_id,
+            "pairing_approve",
+            &format!("code={code} 未命中（未知/已消费/过期）"),
+        );
+        return Some(error_frame("pairing_not_found"));
+    };
+    match st
+        .sessions
+        .issue(&device, sessions::unix_now(), st.config.session_ttl_secs)
+    {
+        Ok(issued) => {
+            let delivered = sig
+                .try_send(PairingSignal::Approved(pairing::PairedSession {
+                    id: issued.id,
+                    token: issued.token,
+                    expires_at: issued.expires_at,
+                }))
+                .is_ok();
+            admin_audit(
+                session_id,
+                "pairing_approve",
+                &format!("code={code} device={device} delivered={delivered}"),
+            );
+            None
+        }
+        Err(()) => {
+            // 会话表满且全在线：pending 无法进入，按拒绝收口。
+            let _ = sig.try_send(PairingSignal::Denied);
+            tracing::warn!(
+                target: TARGET,
+                code,
+                device = %device,
+                "配对批准时会话表满（too many sessions），按拒绝收口"
+            );
+            Some(error_frame("too_many_sessions"))
+        }
+    }
+}
+
+/// `pairing_deny` 处理（须 adminToken）：原子 claim pending → 信号 Denied
+///（pending 连接 close 1008 "pairing denied"）。
+fn handle_pairing_deny(st: &RelayState, code: &str, session_id: &str) -> Option<Message> {
+    let Some((device, sig)) = st.pairing.claim(code, sessions::unix_now()) else {
+        admin_audit(
+            session_id,
+            "pairing_deny",
+            &format!("code={code} 未命中（未知/已消费/过期）"),
+        );
+        return Some(error_frame("pairing_not_found"));
+    };
+    let _ = sig.try_send(PairingSignal::Denied);
+    admin_audit(
+        session_id,
+        "pairing_deny",
+        &format!("code={code} device={device}"),
+    );
+    None
 }
 
 /// 单条 WS 连接完整生命周期：认证（hello / Bearer 直通）→ 注册 Hub →
@@ -1712,7 +2101,8 @@ async fn handle_connection(mut socket: WebSocket, st: RelayState, role: Role, he
                 Role::Gateway => st.config.gateway_tokens.verify(DEFAULT_MACHINE, t),
                 // 浏览器 Bearer = USER_TOKEN 登录形态（curl/脚本便利）→ 换发
                 // 新会话（Bearer 无从携带 sessionToken，重连必须走 hello 帧）。
-                Role::Browser => constant_time_eq(t, &st.config.user_token),
+                // 管理批：验证走 user_token_hash 哈希存储（可轮换）。
+                Role::Browser => st.user_token.verify(t),
             };
             if !ok {
                 auth_reject(&mut socket, role, "auth failed").await;
@@ -1743,9 +2133,28 @@ async fn handle_connection(mut socket: WebSocket, st: RelayState, role: Role, he
                 Ok(Some(Ok(msg))) => {
                     let outcome = match msg {
                         Message::Text(t) => match role {
-                            // 网关侧（v1.3）：token 一步 / key 挑战应答两步。
+                            // 网关侧（v1.3）：token 一步 / key 挑战应答两步
+                            //（网关无配对概念，pairing 字段被忽略）。
                             Role::Gateway => gateway_auth(&mut socket, &st, t.as_str()).await,
-                            Role::Browser => browser_auth(&st, t.as_str(), &headers),
+                            // 浏览器侧：先分拣配对入口（管理批：pairing:true
+                            // 无凭证 → 配对等待流，不走认证），其余走 v1.2
+                            // 会话/token 认证。
+                            Role::Browser => match classify_pairing_hello(t.as_str()) {
+                                PairingHello::Pairing { device } => {
+                                    match run_pairing(&mut socket, &st, &headers, device.as_deref())
+                                        .await
+                                    {
+                                        Some(s) => Ok(HelloOutcome::Browser(s)),
+                                        // 连接已在配对流内收口（上限/过期/
+                                        // 拒绝/断开）。
+                                        None => return,
+                                    }
+                                }
+                                // pairing:true 与凭证并存：意图矛盾，按认证
+                                // 失败拒（不留歧义形态）。
+                                PairingHello::Reject => Err("auth failed"),
+                                PairingHello::NotPairing => browser_auth(&st, t.as_str(), &headers),
+                            },
                         },
                         // 首帧必须是文本 hello。
                         _ => Err("auth failed"),
@@ -1942,6 +2351,123 @@ async fn handle_connection(mut socket: WebSocket, st: RelayState, role: Role, he
                                                     )))
                                                     .await;
                                             }
+                                            // ---- 管理帧族（管理批）：全部须
+                                            // adminToken 有效，缺失/无效统一回
+                                            // admin_auth_required 并丢弃。----
+                                            ManageFrame::MachineList { admin_token } => {
+                                                if !admin_gate(&st, &admin_token) {
+                                                    let _ = socket.send(error_frame("admin_auth_required")).await;
+                                                    continue;
+                                                }
+                                                admin_audit(
+                                                    &admin_session_id(&browser_session),
+                                                    "machine_list",
+                                                    &format!("machines={}", st.machines.list().len()),
+                                                );
+                                                let _ = socket
+                                                    .send(machines::machines_cfg_frame(
+                                                        &st.machines.list(),
+                                                    ))
+                                                    .await;
+                                            }
+                                            ManageFrame::MachineAdd { admin_token, name, pubkey } => {
+                                                if !admin_gate(&st, &admin_token) {
+                                                    let _ = socket.send(error_frame("admin_auth_required")).await;
+                                                    continue;
+                                                }
+                                                match st.machines.add(&name, &pubkey) {
+                                                    Ok(()) => {
+                                                        admin_audit(
+                                                            &admin_session_id(&browser_session),
+                                                            "machine_add",
+                                                            &format!("machine={name}"),
+                                                        );
+                                                        let _ = socket
+                                                            .send(machines::machines_cfg_frame(
+                                                                &st.machines.list(),
+                                                            ))
+                                                            .await;
+                                                    }
+                                                    Err(msg) => {
+                                                        admin_audit(
+                                                            &admin_session_id(&browser_session),
+                                                            "machine_add(拒绝)",
+                                                            &format!("machine={name} 原因={msg}"),
+                                                        );
+                                                        let _ = socket
+                                                            .send(error_frame_msg(
+                                                                "machine_invalid", &msg,
+                                                            ))
+                                                            .await;
+                                                    }
+                                                }
+                                            }
+                                            ManageFrame::MachineRemove { admin_token, name } => {
+                                                if !admin_gate(&st, &admin_token) {
+                                                    let _ = socket.send(error_frame("admin_auth_required")).await;
+                                                    continue;
+                                                }
+                                                let removed = st.machines.remove(&name);
+                                                if removed {
+                                                    // 断开该 machine 当前网关连接
+                                                    //（close 1008 "machine removed"；
+                                                    // 槽位由该连接自己的退出路径清理
+                                                    // 并广播 machines 更新）。
+                                                    if let Some(gw) = st.hub.gateway_sender(&name) {
+                                                        try_send(&gw, Outbound::Close(CLOSE_POLICY, "machine removed"));
+                                                    }
+                                                }
+                                                admin_audit(
+                                                    &admin_session_id(&browser_session),
+                                                    "machine_remove",
+                                                    &format!("machine={name} removed={removed}"),
+                                                );
+                                                let _ = socket
+                                                    .send(machines::machines_cfg_frame(
+                                                        &st.machines.list(),
+                                                    ))
+                                                    .await;
+                                            }
+                                            ManageFrame::UserTokenRotate { admin_token } => {
+                                                if !admin_gate(&st, &admin_token) {
+                                                    let _ = socket.send(error_frame("admin_auth_required")).await;
+                                                    continue;
+                                                }
+                                                let token = st.user_token.rotate();
+                                                admin_audit(
+                                                    &admin_session_id(&browser_session),
+                                                    "user_token_rotate",
+                                                    "token 不记录（新明文仅回执一次）",
+                                                );
+                                                // 明文只此一次返回；旧值即刻失效。
+                                                let _ = socket.send(user_token_rotated_frame(&token)).await;
+                                            }
+                                            ManageFrame::PairingApprove { admin_token, code } => {
+                                                if !admin_gate(&st, &admin_token) {
+                                                    let _ = socket.send(error_frame("admin_auth_required")).await;
+                                                    continue;
+                                                }
+                                                if let Some(reply) = handle_pairing_approve(
+                                                    &st,
+                                                    &code,
+                                                    &admin_session_id(&browser_session),
+                                                ) {
+                                                    let _ = socket.send(reply).await;
+                                                }
+                                            }
+                                            ManageFrame::PairingDeny { admin_token, code } => {
+                                                if !admin_gate(&st, &admin_token) {
+                                                    let _ = socket.send(error_frame("admin_auth_required")).await;
+                                                    continue;
+                                                }
+                                                if let Some(reply) = handle_pairing_deny(
+                                                    &st,
+                                                    &code,
+                                                    &admin_session_id(&browser_session),
+                                                ) {
+                                                    let _ = socket.send(reply).await;
+                                                }
+                                            }
                                             ManageFrame::CredList
                                             | ManageFrame::CredRevoke(_) => {
                                                 // passkey 凭证列表/删除（webauthn
@@ -2057,12 +2583,39 @@ impl RelayHandle {
 /// 起 relay server。必须在 tokio runtime 内调用（内部 tokio::spawn）。
 /// listener 由调用方绑定（校验先行，对齐 `src/webhook.rs` P2-2 先例）；
 /// 配置不合法直接 Err（fail-closed 双保险）。会话表从
-/// `<state_dir>/sessions.json` 加载（v1.2：重启后会话保留）。
+/// `<state_dir>/sessions.json` 加载（v1.2：重启后会话保留）；机器表/
+/// USER_TOKEN 哈希按管理批存储权威迁移加载（env 仅首次种子）。
 pub fn spawn_relay(listener: TcpListener, config: RelayConfig) -> Result<RelayHandle, String> {
     config.validate()?;
     let addr = listener
         .local_addr()
         .map_err(|e| format!("获取监听地址失败：{e}"))?;
+    // 管理批存储权威迁移：
+    // - 机器表：machines.json 不存在 → env GATEWAY_KEYS 种子导入并落盘；
+    //   存在 → 文件权威（env 忽略）。热更新（machine_add/remove）即时生效。
+    // - USER_TOKEN：user_token_hash 不存在 → env USER_TOKEN 种子写哈希；
+    //   存在 → 文件权威。两者皆无 → Err（fail-closed，不提供无认证模式）。
+    let machines = Arc::new(machines::MachineStore::load(
+        &config.state_dir,
+        &config.gateway_keys,
+    ));
+    let user_token = Arc::new(UserTokenStore::load(&config.state_dir, &config.user_token)?);
+    // fail-closed（§4.2 运行期形态）：网关认证形态（env TOKENS 静态表 /
+    // 机器表落盘）至少其一非空。**例外**：machines.json 已存在（= 管理面
+    // 已接管机器表，哪怕是清空后的空表）不拒——「UI 删光机器后重启 brick」
+    // 不是 fail-closed 想防的东西（空表 = 无网关可认证，是锁死不是裸奔）。
+    if config.gateway_tokens.is_empty()
+        && machines.is_empty()
+        && !machines::table_file_exists(&config.state_dir)
+    {
+        return Err(
+            "网关认证表缺失：env IMAGENT_RELAY_GATEWAY_KEYS（首次种子，machine=<64 hex \
+             ed25519 公钥> 逗号分隔）与 IMAGENT_RELAY_GATEWAY_TOKENS（machine=token 逗号\
+             分隔）均未配置或为空，且 state_dir 下无 machines.json——全新部署至少配置\
+             其一（relay 不提供无认证模式）；已落盘机器表的部署重启不受本检查影响"
+                .into(),
+        );
+    }
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let hub = Hub::new(shutdown_rx.clone());
     let sessions = Arc::new(SessionStore::load(&config.state_dir));
@@ -2073,6 +2626,9 @@ pub fn spawn_relay(listener: TcpListener, config: RelayConfig) -> Result<RelayHa
         sessions,
         webauthn: webauthn_state,
         challenges: Arc::new(Mutex::new(ChallengeTable::default())),
+        machines,
+        user_token,
+        pairing: Arc::new(pairing::PairingStore::default()),
     };
     let app = Router::new()
         .route("/gateway", get(gateway_ws))
@@ -2390,6 +2946,170 @@ mod tests {
         assert!(parse_manage_frame(r#"{"v":1,"type":"message","text":"hi"}"#).is_none());
         assert!(parse_manage_frame(r#"{"v":1,"type":"sync"}"#).is_none());
         assert!(parse_manage_frame("not json").is_none());
+    }
+
+    /// 管理帧族解析（管理批）：machine_list / machine_add（含字段载荷）/
+    /// machine_remove / user_token_rotate / pairing_approve / pairing_deny；
+    /// adminToken 缺失 / 非字符串按 None / 空串进入（校验在处理侧统一做）；
+    /// machine_add 缺 name/pubkey 按空串。
+    #[test]
+    fn manage_admin_frame_parsing() {
+        let tok = r#","adminToken":"at-1""#;
+        match parse_manage_frame(&format!(r#"{{"v":1,"type":"machine_list"{tok}}}"#)) {
+            Some(ManageFrame::MachineList { admin_token }) => {
+                assert_eq!(admin_token.as_deref(), Some("at-1"))
+            }
+            other => panic!("machine_list：{other:?}"),
+        }
+        // adminToken 缺失 → None（处理侧回 admin_auth_required）。
+        match parse_manage_frame(r#"{"v":1,"type":"machine_list"}"#) {
+            Some(ManageFrame::MachineList { admin_token }) => assert!(admin_token.is_none()),
+            other => panic!("{other:?}"),
+        }
+        match parse_manage_frame(&format!(
+            r#"{{"v":1,"type":"machine_add"{tok},"name":"home-mac","pubkey":"ab"}}"#
+        )) {
+            Some(ManageFrame::MachineAdd {
+                admin_token,
+                name,
+                pubkey,
+            }) => {
+                assert_eq!(admin_token.as_deref(), Some("at-1"));
+                assert_eq!(name, "home-mac");
+                assert_eq!(pubkey, "ab");
+            }
+            other => panic!("machine_add：{other:?}"),
+        }
+        // machine_add 缺字段 → 空串（machine_invalid 校验路径）。
+        match parse_manage_frame(&format!(r#"{{"v":1,"type":"machine_add"{tok}}}"#)) {
+            Some(ManageFrame::MachineAdd { name, pubkey, .. }) => {
+                assert_eq!(name, "");
+                assert_eq!(pubkey, "");
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse_manage_frame(&format!(
+            r#"{{"v":1,"type":"machine_remove"{tok},"name":"m"}}"#
+        )) {
+            Some(ManageFrame::MachineRemove { admin_token, name }) => {
+                assert_eq!(admin_token.as_deref(), Some("at-1"));
+                assert_eq!(name, "m");
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse_manage_frame(&format!(r#"{{"v":1,"type":"user_token_rotate"{tok}}}"#)) {
+            Some(ManageFrame::UserTokenRotate { admin_token }) => {
+                assert_eq!(admin_token.as_deref(), Some("at-1"))
+            }
+            other => panic!("{other:?}"),
+        }
+        for kind in ["pairing_approve", "pairing_deny"] {
+            match parse_manage_frame(&format!(
+                r#"{{"v":1,"type":"{kind}"{tok},"code":"483920"}}"#
+            )) {
+                Some(ManageFrame::PairingApprove { admin_token, code })
+                | Some(ManageFrame::PairingDeny { admin_token, code }) => {
+                    assert_eq!(admin_token.as_deref(), Some("at-1"));
+                    assert_eq!(code, "483920");
+                }
+                other => panic!("{kind}：{other:?}"),
+            }
+        }
+        // adminToken 非字符串 → None。
+        match parse_manage_frame(r#"{"v":1,"type":"machine_list","adminToken":42}"#) {
+            Some(ManageFrame::MachineList { admin_token }) => assert!(admin_token.is_none()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// 配对 hello 分拣（管理批）：pairing:true 无凭证 → Pairing（device
+    /// trim/缺省）；pairing:true 与凭证并存 → Reject；device 超限 → Reject；
+    /// pairing 缺席/false/非 hello/畸形 → NotPairing。
+    #[test]
+    fn pairing_hello_classification() {
+        let pair = |d: Option<&str>| PairingHello::Pairing {
+            device: d.map(|s| s.to_string()),
+        };
+        assert_eq!(
+            classify_pairing_hello(r#"{"v":1,"type":"hello","pairing":true,"device":"新 Mac"}"#),
+            pair(Some("新 Mac")),
+            "配对入口形态"
+        );
+        assert_eq!(
+            classify_pairing_hello(
+                r#"{"v":1,"type":"hello","pairing":true,"device":"  iPhone  "}"#
+            ),
+            pair(Some("iPhone")),
+            "device trim"
+        );
+        assert_eq!(
+            classify_pairing_hello(r#"{"v":1,"type":"hello","pairing":true}"#),
+            pair(None),
+            "device 缺省（UA 摘要）"
+        );
+        // pairing:true 与凭证并存 → Reject（意图矛盾）。
+        assert_eq!(
+            classify_pairing_hello(
+                r#"{"v":1,"type":"hello","pairing":true,"token":"abc","device":"d"}"#
+            ),
+            PairingHello::Reject
+        );
+        assert_eq!(
+            classify_pairing_hello(r#"{"v":1,"type":"hello","pairing":true,"session":"s"}"#),
+            PairingHello::Reject
+        );
+        // device 超限 → Reject。
+        assert_eq!(
+            classify_pairing_hello(&format!(
+                r#"{{"v":1,"type":"hello","pairing":true,"device":"{}"}}"#,
+                "d".repeat(DEVICE_NAME_MAX_CHARS + 1)
+            )),
+            PairingHello::Reject
+        );
+        // 非 pairing 形态 → NotPairing（走既有认证分拣）。
+        assert_eq!(
+            classify_pairing_hello(r#"{"v":1,"type":"hello","token":"abc"}"#),
+            PairingHello::NotPairing
+        );
+        assert_eq!(
+            classify_pairing_hello(r#"{"v":1,"type":"hello","pairing":false}"#),
+            PairingHello::NotPairing,
+            "pairing:false = 缺席语义"
+        );
+        assert_eq!(
+            classify_pairing_hello(r#"{"v":2,"type":"hello","pairing":true}"#),
+            PairingHello::NotPairing,
+            "v!=1 → NotPairing（parse_hello 统一按 BadVersion 拒，形态一致）"
+        );
+        assert_eq!(
+            classify_pairing_hello(r#"{"v":1,"type":"message","pairing":true}"#),
+            PairingHello::NotPairing,
+            "非 hello"
+        );
+        assert_eq!(classify_pairing_hello("not json"), PairingHello::NotPairing);
+    }
+
+    /// 管理批帧形状（协议对照逐字段）：user_token_rotated / error+message。
+    #[test]
+    fn admin_frames_shape() {
+        let rotated = "ab".repeat(32);
+        let m = user_token_rotated_frame(&rotated);
+        let v: serde_json::Value = serde_json::from_str(m.into_text().unwrap().as_str()).unwrap();
+        assert_eq!(v["v"], 1);
+        assert_eq!(v["type"], "user_token_rotated");
+        assert_eq!(v["token"], rotated);
+
+        let m = error_frame_msg("machine_invalid", "机器名 `x` 非法");
+        let v: serde_json::Value = serde_json::from_str(m.into_text().unwrap().as_str()).unwrap();
+        assert_eq!(v["v"], 1);
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["code"], "machine_invalid");
+        assert_eq!(v["message"], "机器名 `x` 非法");
+
+        let m = error_frame("admin_auth_required");
+        let v: serde_json::Value = serde_json::from_str(m.into_text().unwrap().as_str()).unwrap();
+        assert_eq!(v["code"], "admin_auth_required");
+        assert!(v.get("message").is_none(), "无 message 变体不带该字段");
     }
 
     /// 设备名解析：device 字段优先（trim）/ UA 摘要 / 无 UA 回退。
@@ -2818,54 +3538,36 @@ mod tests {
         assert_eq!(v["nonce"], "deadbeef");
     }
 
-    /// fail-closed：网关认证表（v1.3 起 KEYS/TOKENS 至少其一）/ USER_TOKEN
-    /// 缺失 / 职责分离（USER_TOKEN 与任一网关 token 相同）→ 拒；只配 KEYS
-    ///（tokens 空）或只配 TOKENS（既有形态）均合法。
+    /// 配置期校验（管理批后收敛）：env USER_TOKEN 种子与任一网关 token
+    /// 相同 → 拒（职责分离）；网关表空 / USER_TOKEN 种子空不再由
+    /// [`RelayConfig::validate`] 拒——存储权威迁移后（machines.json /
+    /// user_token_hash 落盘）是否还有可用认证形态是**运行期**问题，由
+    /// [`spawn_relay`] 结合落盘真实状态判定（空表 + 无种子 + 无文件才拒）。
     #[test]
     fn fail_closed_token_validation() {
-        let cfg = |g_tokens: GatewayTokens, g_keys: GatewayKeys, u: &str| RelayConfig {
+        let cfg = |g_tokens: GatewayTokens, u: &str| RelayConfig {
             gateway_tokens: g_tokens,
-            gateway_keys: g_keys,
+            gateway_keys: GatewayKeys::default(),
             user_token: u.to_string(),
             state_dir: std::env::temp_dir(),
             session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
+            pairing_ttl_secs: DEFAULT_PAIRING_TTL_SECS,
             webauthn_rp_id: None,
         };
-        let tokens = GatewayTokens::parse("default=g-token").unwrap();
-        // 真实 ed25519 公钥（随机 32B hex 未必是合法曲线点，from_bytes 会拒）。
-        let keys = {
-            let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-            GatewayKeys::parse(&format!(
-                "home-mac={}",
-                hex::encode(sk.verifying_key().to_bytes())
-            ))
-            .unwrap()
-        };
-        // 只配 TOKENS（既有形态）/ 只配 KEYS（v1.3 新形态）/ 双表并存：均合法。
-        assert!(cfg(tokens.clone(), GatewayKeys::default(), "u-token")
-            .validate()
-            .is_ok());
-        assert!(cfg(GatewayTokens::default(), keys.clone(), "u-token")
-            .validate()
-            .is_ok());
-        assert!(cfg(tokens.clone(), keys.clone(), "u-token")
-            .validate()
-            .is_ok());
-        // 双表均空 → 拒（不提供无认证模式）。
-        let err = cfg(GatewayTokens::default(), GatewayKeys::default(), "u-token")
-            .validate()
-            .unwrap_err();
+        // 迁移后 env 全移除形态（落盘文件权威）：validate 不拒。
         assert!(
-            err.contains("GATEWAY_KEYS") && err.contains("至少配置其一"),
-            "msg={err}"
+            cfg(GatewayTokens::default(), "").validate().is_ok(),
+            "空表 + 空种子：落盘权威形态由 spawn_relay 运行期判定"
         );
-        let err = cfg(tokens.clone(), GatewayKeys::default(), "  ")
-            .validate()
-            .unwrap_err();
-        assert!(err.contains("USER_TOKEN"), "msg={err}");
+        // 正常形态。
+        assert!(
+            cfg(GatewayTokens::parse("default=g-token").unwrap(), "u-token")
+                .validate()
+                .is_ok()
+        );
+        // 职责分离：USER_TOKEN 种子与网关 token 相同 → 拒。
         let err = cfg(
             GatewayTokens::parse("default=same,home=other").unwrap(),
-            GatewayKeys::default(),
             "same",
         )
         .validate()

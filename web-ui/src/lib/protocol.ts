@@ -24,6 +24,12 @@
 //   的机器业务帧（message/approval_response/control/sync/ping）包成 enc 帧
 //   （XChaCha20-Poly1305，box 内含原帧 JSON，无需 sid）。relay 自产管理帧
 //   （hello_ack/machines/machine/devices/creds/error/pong）恒明文。
+// - v1.5 准入与管理：re-auth（HTTP /webauthn/reauth/*，adminToken 5 分钟，
+//   lib/webauthn.ts + lib/admin.ts）；管理帧（machine_list/machine_add/
+//   machine_remove/user_token_rotate ↔ machines_cfg/machine_invalid/
+//   user_token_rotated，全部带 adminToken，relay 自产自消恒明文）；新设备
+//   配对（hello{pairing} → pairing_pending；已登录侧收 pairing_request →
+//   pairing_approve/pairing_deny{adminToken,code}）。
 
 export const PROTOCOL_VERSION = 1;
 
@@ -133,9 +139,9 @@ export function deviceSummary(ua: string): string {
 // 出站帧（浏览器 → 网关/relay）
 // ---------------------------------------------------------------------------
 
-/** hello 双形态（v1.2）：首次登录带 token（+可选 device）；重连带 session
- *  （session 由新 relay 签发，只会发往新 relay；旧 relay 持有 session 场景
- *  不存在——token 缺失直接 1008 回登录页）。 */
+/** hello 双形态（v1.2）+ 配对形态（v1.5）：首次登录带 token（+可选 device）；
+ * 重连带 session（session 由新 relay 签发，只会发往新 relay；旧 relay 持有
+ * session 场景不存在——token 缺失直接 1008 回登录页）。 */
 export type HelloFrame = {
   v: typeof PROTOCOL_VERSION;
   type: "hello";
@@ -145,6 +151,9 @@ export type HelloFrame = {
   session?: string;
   /** 首次登录可选设备名（缺省 deviceSummary(navigator.userAgent)）。 */
   device?: string;
+  /** v1.5 新设备配对：无凭证 hello，relay 创建 pending 并回 pairing_pending；
+   * 该连接保持未认证等待态，被批准后 relay 直接换发 hello_ack.session。 */
+  pairing?: boolean;
 };
 
 export type MessageFrame = {
@@ -204,6 +213,69 @@ export type CredRevokeFrame = {
 };
 
 // ---------------------------------------------------------------------------
+// v1.5 管理帧（浏览器 → relay 自产自消；全部带 adminToken，缺失/无效回
+// error{admin_auth_required}。adminToken 来自 re-auth（lib/webauthn.ts），
+// 5 分钟有效，内存态（lib/admin.ts）。管理帧恒明文（relay 消费，不经网关）。
+// ---------------------------------------------------------------------------
+
+/** 机器名约束（relay 侧同规）：1..=32 位 [a-zA-Z0-9_-]。 */
+export const MACHINE_NAME_RE = /^[a-zA-Z0-9_-]{1,32}$/;
+
+/** 网关 ed25519 公钥约束：64 位 hex（大小写宽容，提交前归一小写）。 */
+export const PUBKEY_HEX_RE = /^[0-9a-fA-F]{64}$/;
+
+export function machineNameValid(name: string): boolean {
+  return MACHINE_NAME_RE.test(name);
+}
+
+export function machinePubkeyValid(pubkey: string): boolean {
+  return PUBKEY_HEX_RE.test(pubkey);
+}
+
+export type MachineListFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "machine_list";
+  adminToken: string;
+};
+
+export type MachineAddFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "machine_add";
+  adminToken: string;
+  name: string;
+  /** 64 hex 网关公钥。 */
+  pubkey: string;
+};
+
+export type MachineRemoveFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "machine_remove";
+  adminToken: string;
+  name: string;
+};
+
+export type UserTokenRotateFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "user_token_rotate";
+  adminToken: string;
+};
+
+/** v1.5 配对批准（管理级，须 re-auth）：code = pairing_request 帧的 6 位码。 */
+export type PairingApproveFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "pairing_approve";
+  adminToken: string;
+  code: string;
+};
+
+export type PairingDenyFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "pairing_deny";
+  adminToken: string;
+  code: string;
+};
+
+// ---------------------------------------------------------------------------
 // v1.4 E2E 中继盲化（密码学构造与编码规约见 lib/e2e.ts 头注）
 // ---------------------------------------------------------------------------
 
@@ -241,7 +313,13 @@ export type OutboundFrame =
   | CredListFrame
   | CredRevokeFrame
   | E2eHelloFrame
-  | EncFrame;
+  | EncFrame
+  | MachineListFrame
+  | MachineAddFrame
+  | MachineRemoveFrame
+  | UserTokenRotateFrame
+  | PairingApproveFrame
+  | PairingDenyFrame;
 
 /** 出站帧序列化（undefined 字段不序列化，与网关入站解析兼容）。 */
 export function encodeFrame(frame: OutboundFrame): string {
@@ -270,7 +348,8 @@ export type MachinesFrame = {
   online: string[];
 };
 
-export type ErrorFrame = { v: typeof PROTOCOL_VERSION; type: "error"; code: string };
+/** v1.5 起可带 message（machine_invalid 等 relay 自产错误的说明文字）。 */
+export type ErrorFrame = { v: typeof PROTOCOL_VERSION; type: "error"; code: string; message?: string };
 
 export type TextFrame = {
   v: typeof PROTOCOL_VERSION;
@@ -346,6 +425,47 @@ export type CredsFrame = {
   credentials: PasskeyInfo[];
 };
 
+// ---------------------------------------------------------------------------
+// v1.5 管理/配对入站帧（relay 自产，恒明文）
+// ---------------------------------------------------------------------------
+
+/** machines_cfg 机器条目：pubkey_fp = 网关公钥 SHA-256 指纹前 16 hex（relay
+ *  侧计算）；created = unix 秒（容错可选，缺席仅影响展示）。 */
+export type MachineCfg = { name: string; pubkey_fp: string; created?: number };
+
+/** v1.5：机器配置列表快照（machine_list 请求 / machine_add / machine_remove
+ *  成功后回；管理页机器区数据源）。 */
+export type MachinesCfgFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "machines_cfg";
+  machines: MachineCfg[];
+};
+
+/** v1.5：USER_TOKEN 轮换结果。token 是新值明文——**仅此一次返回**，SPA 以
+ *  结果弹层展示一次（复制落 ~/.imagent/web-relay.env），不落任何存储。 */
+export type UserTokenRotatedFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "user_token_rotated";
+  token: string;
+};
+
+/** v1.5：relay 向全部已认证会话广播的配对请求（新设备在登录页发起
+ *  hello{pairing} 时产生）。expiresAt unix 秒（容错可选）。 */
+export type PairingRequestFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "pairing_request";
+  code: string;
+  device: string;
+  expiresAt?: number;
+};
+
+/** v1.5：配对等待确认（发往配对连接本身）：6 位数字码，5 分钟有效。 */
+export type PairingPendingFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "pairing_pending";
+  code: string;
+};
+
 /** v1.4 握手第二步（网关 → 浏览器，经 relay 明文透传）：gk = 网关 X25519
  *  公钥（32B hex），n2 = 网关随机数（32B hex），sig = 网关 ed25519 对
  *  bytes(ek)||bytes(gk)||bytes(n1)||bytes(n2) 的签名（64B hex），ik = 网关
@@ -377,7 +497,11 @@ export type InboundFrame =
   | DevicesFrame
   | CredsFrame
   | E2eAckFrame
-  | EncFrame;
+  | EncFrame
+  | MachinesCfgFrame
+  | UserTokenRotatedFrame
+  | PairingRequestFrame
+  | PairingPendingFrame;
 
 // ---------------------------------------------------------------------------
 // parseFrame：v/type 校验 + 每类帧关键字段存在性校验，非法返回 null（不抛）
@@ -436,6 +560,16 @@ const passkeyOk = (p: unknown): boolean => {
   return isStr(r, "id") && isStr(r, "label") && (r.created === undefined || typeof r.created === "number");
 };
 
+/** v1.5 machines_cfg 帧元素：name/pubkey_fp 字符串；created 可选但出现即须
+ *  为数字（容错展示字段）。 */
+const machineCfgOk = (m: unknown): boolean => {
+  if (typeof m !== "object" || m === null) {
+    return false;
+  }
+  const r = m as Record<string, unknown>;
+  return isStr(r, "name") && isStr(r, "pubkey_fp") && (r.created === undefined || typeof r.created === "number");
+};
+
 const RESOLVED_DECISIONS: readonly string[] = ["allow", "deny", "always", "cancelled"];
 
 /** v1.4 e2e_ack 的网关身份公钥字段：ik（规范名）/ id / pk（宽容别名）任一
@@ -448,7 +582,8 @@ const INBOUND_CHECKS: Record<string, FieldCheck> = {
   machine: (o) => typeof o.online === "boolean",
   machines: (o) =>
     Array.isArray(o.online) && o.online.every((m) => typeof m === "string"),
-  error: (o) => isStr(o, "code"),
+  error: (o) =>
+    isStr(o, "code") && (o.message === undefined || typeof o.message === "string"),
   text: (o) => isStr(o, "convId") && isStr(o, "text") && machineOk(o),
   card: (o) => cardShapeOk(o) && machineOk(o),
   card_patch: (o) => cardShapeOk(o) && machineOk(o),
@@ -464,6 +599,12 @@ const INBOUND_CHECKS: Record<string, FieldCheck> = {
   hello_ack: (o) => isStr(o, "role") && sessionOk(o),
   devices: (o) => Array.isArray(o.devices) && o.devices.every(deviceOk),
   creds: (o) => Array.isArray(o.credentials) && o.credentials.every(passkeyOk),
+  // v1.5 管理/配对帧：字段级形状校验
+  machines_cfg: (o) => Array.isArray(o.machines) && o.machines.every(machineCfgOk),
+  user_token_rotated: (o) => isStr(o, "token"),
+  pairing_request: (o) =>
+    isStr(o, "code") && isStr(o, "device") && (o.expiresAt === undefined || typeof o.expiresAt === "number"),
+  pairing_pending: (o) => isStr(o, "code"),
   // v1.4：字段级形状校验（编码/长度/签名校验在 lib/e2e.ts 深层完成）
   e2e_ack: (o) =>
     isStr(o, "machine") && isStr(o, "gk") && isStr(o, "n2") && isStr(o, "sig") && ackIdentityOk(o),
@@ -568,6 +709,15 @@ export type AppState = {
   devices: DeviceInfo[] | null;
   /** v1.3 已注册通行钥匙列表（creds 帧）；null = 尚未拉取。 */
   passkeys: PasskeyInfo[] | null;
+  /** v1.5 机器配置列表（machines_cfg 帧）；null = 尚未拉取（管理页未打开
+   *  或 re-auth 未完成）。 */
+  machinesCfg: MachineCfg[] | null;
+  /** v1.5 待决配对请求（pairing_request 帧按 code 幂等追加；允许/拒绝帧
+   *  发出后经 pairing_resolved 移除）。 */
+  pairingRequests: PairingRequest[];
+  /** v1.5 USER_TOKEN 轮换结果（仅显示一次的明文新值；clear_rotated_token
+   *  关闭弹层即永失——不落任何存储）。 */
+  rotatedToken: string | null;
   lastError: { code: string; at: number } | null;
   lastNotice: MachineNotice | null;
 };
@@ -588,6 +738,16 @@ function newSpace(): MachineSpace {
   };
 }
 
+/** v1.5 待决配对请求条目（pairing_request 帧载荷 + 到达时间）。 */
+export type PairingRequest = {
+  code: string;
+  device: string;
+  /** unix 秒（容错可选；倒计时用）。 */
+  expiresAt?: number;
+  /** 到达时间（ms，UI 展示）。 */
+  at: number;
+};
+
 export function initialState(): AppState {
   return {
     seq: 0,
@@ -599,6 +759,9 @@ export function initialState(): AppState {
     machineOnline: false,
     devices: null,
     passkeys: null,
+    machinesCfg: null,
+    pairingRequests: [],
+    rotatedToken: null,
     lastError: null,
     lastNotice: null,
   };
@@ -612,6 +775,10 @@ export type Action =
   | { type: "select_machine"; machine: string }
   /** 用户点选会话（仅切换 SPA 本地当前 conv，不发包；清该 conv 未读）。 */
   | { type: "select_conv"; convId: string }
+  /** v1.5 关闭轮换结果弹层（一次性明文 token 就此作废）。 */
+  | { type: "clear_rotated_token" }
+  /** v1.5 配对请求已应答（允许/拒绝帧发出后移除对应卡片）。 */
+  | { type: "pairing_resolved"; code: string }
   | { type: "clear_error" }
   | { type: "clear_notice" };
 
@@ -888,6 +1055,9 @@ function reduceFrame(state: AppState, frame: InboundFrame): AppState {
     case "hello_ack":
     case "pong":
       return state; // 连接管理层（ws.ts）消费，不进消息流
+    case "pairing_pending":
+      // v1.5：配对等待码由 ws 层 onPairingPending 消费，不进应用状态
+      return state;
     case "e2e_ack":
     case "enc":
       // v1.4：ws 层 e2e 协调器消费（enc 解密后的内帧才二次分发进来）；
@@ -901,6 +1071,24 @@ function reduceFrame(state: AppState, frame: InboundFrame): AppState {
     case "creds":
       // v1.3 通行钥匙列表快照：全量覆盖（cred_list 请求 / cred_revoke 后回）
       return { ...state, passkeys: frame.credentials };
+    case "machines_cfg":
+      // v1.5 机器配置快照：全量覆盖（machine_list / machine_add / machine_remove 后回）
+      return { ...state, machinesCfg: frame.machines };
+    case "user_token_rotated":
+      // v1.5 轮换结果：一次性明文 token 存 reducer 供弹层展示（关闭即清）
+      return { ...state, rotatedToken: frame.token };
+    case "pairing_request":
+      // v1.5 配对广播：按 code 幂等追加（relay 广播重放/多端同码不重复弹卡）
+      if (state.pairingRequests.some((p) => p.code === frame.code)) {
+        return state;
+      }
+      return {
+        ...state,
+        pairingRequests: [
+          ...state.pairingRequests,
+          { code: frame.code, device: frame.device, expiresAt: frame.expiresAt, at: Date.now() },
+        ],
+      };
     case "machine":
       return { ...state, machineOnline: frame.online };
     case "error":
@@ -974,5 +1162,11 @@ export function reducer(state: AppState, action: Action): AppState {
       return state.lastError ? { ...state, lastError: null } : state;
     case "clear_notice":
       return state.lastNotice ? { ...state, lastNotice: null } : state;
+    case "clear_rotated_token":
+      return state.rotatedToken ? { ...state, rotatedToken: null } : state;
+    case "pairing_resolved": {
+      const left = state.pairingRequests.filter((p) => p.code !== action.code);
+      return left.length === state.pairingRequests.length ? state : { ...state, pairingRequests: left };
+    }
   }
 }

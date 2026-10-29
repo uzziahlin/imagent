@@ -46,6 +46,8 @@ use crate::{constant_time_eq, Outbound, TARGET};
 pub(crate) const MAX_SESSIONS: usize = 32;
 /// 会话表文件名（落在 `state_dir` 下）。
 const SESSIONS_FILE: &str = "sessions.json";
+/// USER_TOKEN 哈希文件名（落在 `state_dir` 下，管理面迁移：env 仅首次种子）。
+const USER_TOKEN_HASH_FILE: &str = "user_token_hash";
 /// 落盘节流窗口：last_seen 这类软变更至多每 60s 写一次盘（结构性变更不受
 /// 节流，立即写）。
 const PERSIST_THROTTLE: Duration = Duration::from_secs(60);
@@ -504,6 +506,127 @@ fn generate_session_token() -> String {
     hex::encode(buf)
 }
 
+// ---------------------------------------------------------------------------
+// USER_TOKEN 存储权威迁移（管理面批：env 仅首次种子 → state_dir 落盘哈希）
+// ---------------------------------------------------------------------------
+
+/// USER_TOKEN 运行时存储：只持有 **sha256 hex 哈希**（`<state_dir>/
+/// user_token_hash`，0600），验证时对提交值哈希后恒定时间比较——磁盘与
+/// 内存都不再出现明文。启动语义（任务定案）：
+/// - 文件**不存在** → env USER_TOKEN（RelayConfig 种子）首次种子：写哈希
+///   文件（env 本身不回写，之后改 env 不生效）；
+/// - 文件**存在** → 文件权威（env 忽略，启动日志说明）；
+/// - 文件损坏 → 按 env 自愈重种；env 也没有 → Err（fail-closed：登录无
+///   任何可用凭证形态，不如拒绝启动）。
+///
+/// [`UserTokenStore::rotate`]（`user_token_rotate` 管理帧）换发新 token：
+/// 明文只此一次回给管理员，落盘的是新哈希，旧值即刻失效（已换发的
+/// sessionToken 不受影响——会话层独立于本表）。
+pub(crate) struct UserTokenStore {
+    /// sha256 hex（64 char）。Mutex 纯内存临界区，rotate 换值用。
+    inner: Mutex<String>,
+    path: PathBuf,
+}
+
+impl UserTokenStore {
+    /// 启动加载（真实时钟）。种子缺失 + 文件缺失/损坏 → Err（调用方拒启）。
+    pub(crate) fn load(state_dir: &Path, seed: &str) -> Result<Self, String> {
+        let path = state_dir.join(USER_TOKEN_HASH_FILE);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let hash = text.trim().to_string();
+                if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                    tracing::info!(
+                        target: TARGET,
+                        path = %path.display(),
+                        "user_token_hash 文件权威（env USER_TOKEN 若仍设置则被忽略；轮换请走 user_token_rotate 管理帧）"
+                    );
+                    Ok(Self {
+                        inner: Mutex::new(hash),
+                        path,
+                    })
+                } else {
+                    // 损坏：warn 后走种子自愈（env 在则覆写重种，不在则 Err）。
+                    tracing::warn!(
+                        target: TARGET,
+                        path = %path.display(),
+                        "user_token_hash 内容非法（须为 64 hex），尝试按 env 种子自愈"
+                    );
+                    Self::seed(&path, seed)
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::seed(&path, seed),
+            Err(e) => {
+                tracing::warn!(
+                    target: TARGET,
+                    path = %path.display(),
+                    error = %e,
+                    "user_token_hash 读取失败，尝试按 env 种子重建"
+                );
+                Self::seed(&path, seed)
+            }
+        }
+    }
+
+    /// 首次种子 / 自愈重种：哈希 env 种子并落盘。种子也空 → Err。
+    fn seed(path: &Path, seed: &str) -> Result<Self, String> {
+        if seed.is_empty() {
+            return Err(format!(
+                "浏览器登录凭证缺失：{} 不存在或损坏，且 env IMAGENT_RELAY_USER_TOKEN\
+                 未设置（首次部署设 env 种子一次即可，openssl rand -hex 32 生成；\
+                 relay 不提供无认证模式）",
+                path.display()
+            ));
+        }
+        let hash = hash_token(seed);
+        if let Err(e) = write_atomic(path, &hash) {
+            // 写盘失败不阻断启动（内存态可用，重启后需重新种子）。
+            tracing::warn!(
+                target: TARGET,
+                path = %path.display(),
+                error = %e,
+                "user_token_hash 种子写盘失败（登录可用，重启后重新种子）"
+            );
+        } else {
+            tracing::info!(
+                target: TARGET,
+                path = %path.display(),
+                "user_token_hash 首次种子（env USER_TOKEN → 哈希落盘；此后 env 仅作留档，改值不生效）"
+            );
+        }
+        Ok(Self {
+            inner: Mutex::new(hash),
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// 登录校验：对提交值 sha256 后与存值**恒定时间**比较。
+    pub(crate) fn verify(&self, token: &str) -> bool {
+        let stored = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        constant_time_eq(&hash_token(token), stored.as_str())
+    }
+
+    /// 轮换（user_token_rotate 管理帧）：新 32B token，落盘新哈希，返回
+    /// 明文（只此一次）。旧值即刻失效。
+    pub(crate) fn rotate(&self) -> String {
+        let token = generate_session_token();
+        let hash = hash_token(&token);
+        {
+            let mut stored = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            *stored = hash.clone();
+        }
+        if let Err(e) = write_atomic(&self.path, &hash) {
+            tracing::warn!(
+                target: TARGET,
+                path = %self.path.display(),
+                error = %e,
+                "user_token_hash 轮换写盘失败（内存已生效，重启后回退旧值）"
+            );
+        }
+        token
+    }
+}
+
 /// 原子写盘（tmp + rename；0600 权限——会话哈希虽非明文凭证，仍按敏感
 /// 数据保护）：fsync 保证重启后会话记录不丢（协议 v1.2 §5 的「重启后会话
 /// 保留」依赖此处的持久性）。credentials.json（webauthn 凭证表）复用同款
@@ -872,6 +995,75 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600, "sessions.json 权限 0600");
         }
         let _ = s;
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// USER_TOKEN 存储迁移：首次种子（写哈希文件）/ verify（恒定时间哈希
+    /// 比较）/ 文件权威（重启后 env 种子被忽略）/ 轮换（新值生效旧值失效，
+    /// 落盘同步）/ 文件缺失且无种子 → Err / 文件损坏按 env 自愈 / 损坏且
+    /// 无种子 → Err。
+    #[test]
+    fn user_token_store_seed_authority_and_rotate() {
+        let dir = temp_dir();
+
+        // 1) 首次种子：文件不存在 → env 种子 → 写 user_token_hash（哈希非明文）。
+        let store = UserTokenStore::load(&dir, "secret-a").unwrap();
+        assert!(store.verify("secret-a"), "种子值可登录");
+        assert!(!store.verify("secret-b"), "其它值拒");
+        assert!(!store.verify(""), "空值拒");
+        let raw = std::fs::read_to_string(dir.join(USER_TOKEN_HASH_FILE)).unwrap();
+        assert_eq!(raw.trim(), hash_token("secret-a"), "落盘为 sha256 hex");
+        assert!(!raw.contains("secret-a"), "落盘不含明文");
+
+        // 2) 文件权威：同目录重启 + env 种子换成别的值 → 旧（文件）值仍有效。
+        let store2 = UserTokenStore::load(&dir, "secret-CHANGED").unwrap();
+        assert!(store2.verify("secret-a"), "文件权威：env 变更被忽略");
+        assert!(!store2.verify("secret-CHANGED"));
+
+        // 3) env 缺席 + 文件在 → 正常（迁移后 env 可移除）。
+        let store3 = UserTokenStore::load(&dir, "").unwrap();
+        assert!(store3.verify("secret-a"));
+
+        // 4) 轮换：新 token 生效、旧值失效、落盘同步、返回明文 64 hex。
+        let rotated = store3.rotate();
+        assert_eq!(rotated.len(), 64);
+        assert!(rotated.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(store3.verify(&rotated), "新 token 可登录");
+        assert!(!store3.verify("secret-a"), "旧值即刻失效");
+        let raw = std::fs::read_to_string(dir.join(USER_TOKEN_HASH_FILE)).unwrap();
+        assert_eq!(raw.trim(), hash_token(&rotated), "轮换落盘新哈希");
+        // 轮换后重启（env 无）：新值保留。
+        assert!(UserTokenStore::load(&dir, "").unwrap().verify(&rotated));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// USER_TOKEN fail-closed / 自愈：全新目录无 env → Err；损坏文件 + env
+    /// → 重种自愈；损坏 + 无 env → Err。
+    #[test]
+    fn user_token_store_missing_and_corrupt() {
+        // 全新目录 + 无种子 → Err（不提供无认证模式）。
+        let dir = temp_dir();
+        let Err(err) = UserTokenStore::load(&dir, "") else {
+            panic!("无文件无种子应 Err");
+        };
+        assert!(err.contains("USER_TOKEN"), "msg={err}");
+        assert!(!dir.join(USER_TOKEN_HASH_FILE).exists(), "失败不落盘");
+
+        // 损坏文件 + env 种子 → 自愈重种。
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(USER_TOKEN_HASH_FILE), "not-hex!").unwrap();
+        let store = UserTokenStore::load(&dir, "seed-heal").unwrap();
+        assert!(store.verify("seed-heal"), "自愈后种子值可用");
+        let raw = std::fs::read_to_string(dir.join(USER_TOKEN_HASH_FILE)).unwrap();
+        assert_eq!(raw.trim(), hash_token("seed-heal"));
+
+        // 损坏文件 + 无种子 → Err。
+        std::fs::write(dir.join(USER_TOKEN_HASH_FILE), "zz").unwrap();
+        let Err(_) = UserTokenStore::load(&dir, "") else {
+            panic!("损坏且无种子应 Err");
+        };
 
         let _ = std::fs::remove_dir_all(&dir);
     }

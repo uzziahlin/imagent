@@ -8,6 +8,7 @@ import {
   PasskeyError,
   fromB64Url,
   passkeyLogin,
+  passkeyReauth,
   passkeyRegister,
   toB64Url,
   webauthnSupported,
@@ -305,5 +306,127 @@ describe("passkeyRegister", () => {
     await expect(
       passkeyRegister("stale", "x", { fetchImpl: stub.fetch, credentials: stub.creds, base: BASE }),
     ).rejects.toBeInstanceOf(PasskeyError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// re-auth（v1.5 管理门槛）
+// ---------------------------------------------------------------------------
+
+describe("passkeyReauth", () => {
+  it("两阶段成功：begin（Bearer + 空 body）→ get → complete（Bearer + beginId/credential）→ {adminToken, expiresAt}", async () => {
+    const stub = makeStub([
+      {
+        match: (u) => u.endsWith("webauthn/reauth/begin"),
+        status: 200,
+        body: {
+          beginId: "re-1",
+          publicKey: { rpId: "localhost", challenge: b64("re-challenge"), allowCredentials: [] },
+        },
+      },
+      {
+        match: (u) => u.endsWith("webauthn/reauth/complete"),
+        status: 200,
+        body: { adminToken: "at".repeat(32), expiresAt: 1_900_000_000 },
+      },
+    ]);
+    const grant = await passkeyReauth("session-tok", {
+      fetchImpl: stub.fetch,
+      credentials: stub.creds,
+      base: BASE,
+    });
+    expect(grant).toEqual({ adminToken: "at".repeat(32), expiresAt: 1_900_000_000 });
+
+    // begin：URL + Bearer sessionToken + 空 JSON body。
+    expect(stub.calls[0]?.url).toBe("/imagent/webauthn/reauth/begin");
+    expect((stub.calls[0]?.init?.headers as Record<string, string>).authorization).toBe(
+      "Bearer session-tok",
+    );
+    expect(stub.calls[0]?.init?.body).toBe("{}");
+
+    // get options：challenge 转 Uint8Array。
+    const opts = stub.getOpts[0] as { publicKey: Record<string, unknown> };
+    expect(Array.from(opts.publicKey.challenge as Uint8Array)).toEqual(
+      Array.from(new TextEncoder().encode("re-challenge")),
+    );
+
+    // complete：URL + Bearer + {beginId, credential}（base64url JSON 形状）。
+    expect(stub.calls[1]?.url).toBe("/imagent/webauthn/reauth/complete");
+    expect((stub.calls[1]?.init?.headers as Record<string, string>).authorization).toBe(
+      "Bearer session-tok",
+    );
+    const complete = JSON.parse(stub.calls[1]!.init!.body as string);
+    expect(complete.beginId).toBe("re-1");
+    expect(complete.credential.id).toBe("cred-1");
+    expect(complete.credential.response.signature).toBe(toB64Url(new TextEncoder().encode("sig")));
+  });
+
+  it("未登录（401 unauthorized）→ 透传，不调认证器", async () => {
+    const stub = makeStub([
+      {
+        match: (u) => u.endsWith("reauth/begin"),
+        status: 401,
+        body: { error: "unauthorized" },
+      },
+    ]);
+    await expect(
+      passkeyReauth("stale", { fetchImpl: stub.fetch, credentials: stub.creds, base: BASE }),
+    ).rejects.toMatchObject({ code: "unauthorized" });
+    expect(stub.getOpts.length).toBe(0);
+  });
+
+  it("complete 401 verification_failed → 透传", async () => {
+    const stub = makeStub([
+      {
+        match: (u) => u.endsWith("reauth/begin"),
+        status: 200,
+        body: { beginId: "b", publicKey: { challenge: b64("c"), allowCredentials: [] } },
+      },
+      {
+        match: (u) => u.endsWith("reauth/complete"),
+        status: 401,
+        body: { error: "verification_failed" },
+      },
+    ]);
+    await expect(
+      passkeyReauth("session-tok", { fetchImpl: stub.fetch, credentials: stub.creds, base: BASE }),
+    ).rejects.toMatchObject({ code: "verification_failed" });
+  });
+
+  it("用户取消 → aborted；响应缺 adminToken → bad_response", async () => {
+    const cancelCreds: CredentialsApi = {
+      get: async () => {
+        throw new DOMException("canceled", "NotAllowedError");
+      },
+      create: async () => {
+        throw new Error("unused");
+      },
+    };
+    const stub = makeStub([
+      {
+        match: (u) => u.endsWith("reauth/begin"),
+        status: 200,
+        body: { beginId: "b", publicKey: { challenge: b64("c"), allowCredentials: [] } },
+      },
+    ]);
+    await expect(
+      passkeyReauth("session-tok", { fetchImpl: stub.fetch, credentials: cancelCreds, base: BASE }),
+    ).rejects.toMatchObject({ code: "aborted" });
+
+    const badStub = makeStub([
+      {
+        match: (u) => u.endsWith("reauth/begin"),
+        status: 200,
+        body: { beginId: "b", publicKey: { challenge: b64("c"), allowCredentials: [] } },
+      },
+      {
+        match: (u) => u.endsWith("reauth/complete"),
+        status: 200,
+        body: { expiresAt: 1 }, // 缺 adminToken
+      },
+    ]);
+    await expect(
+      passkeyReauth("session-tok", { fetchImpl: badStub.fetch, credentials: badStub.creds, base: BASE }),
+    ).rejects.toMatchObject({ code: "bad_response" });
   });
 });

@@ -901,3 +901,111 @@ describe("WsManager E2E（v1.4）", () => {
     expect(h.events).toContainEqual({ kind: "tofu", machine: "home-mac", gkFp: expect.any(String), idFp: expect.any(String) });
   });
 });
+
+// ---------------------------------------------------------------------------
+// v1.5 配对模式 + 管理帧
+// ---------------------------------------------------------------------------
+
+describe("WsManager 配对与管理（v1.5）", () => {
+  it("authFailReason：pairing denied → pairing_denied", () => {
+    expect(authFailReason("pairing denied")).toBe("pairing_denied");
+  });
+
+  it("配对模式：hello 无凭证带 pairing+device（字节级）；pairing_pending 上抛且不再按 hello 超时断开", () => {
+    const codes: string[] = [];
+    const mgr = new WsManager({
+      url: "wss://example.test/ws",
+      pairing: "iPhone/Safari",
+      onFrame: () => {},
+      onStatus: () => {},
+      onAuthFailed: () => {},
+      onPairingPending: (c) => codes.push(c),
+      wsFactory: (u) => new FakeWebSocket(u),
+    });
+    mgr.connect();
+    const sock = lastSock();
+    sock.emit("open");
+    expect(sock.sent[0]).toBe('{"v":1,"type":"hello","pairing":true,"device":"iPhone/Safari"}');
+
+    // 等待码到达：上抛回调 + 清 hello 超时（推进 >10s 不重连不断开）
+    sock.serverSend('{"v":1,"type":"pairing_pending","code":"483920"}');
+    expect(codes).toEqual(["483920"]);
+    vi.advanceTimersByTime(60_000);
+    expect(FakeWebSocket.created).toHaveLength(1);
+    expect(sock.sentOfType("sync")).toHaveLength(0); // 未 ready 不发 sync
+    expect(sock.closedWith).toHaveLength(0);
+    mgr.close();
+  });
+
+  it("配对批准：同连接 hello_ack.session → onSession + ready + sync（新设备进入）", () => {
+    const sessions: SessionInfo[] = [];
+    const statuses: string[] = [];
+    const mgr = new WsManager({
+      url: "wss://example.test/ws",
+      pairing: "iPhone/Safari",
+      onFrame: () => {},
+      onStatus: (s) => statuses.push(s),
+      onAuthFailed: () => {},
+      onSession: (s) => sessions.push(s),
+      onPairingPending: () => {},
+      wsFactory: (u) => new FakeWebSocket(u),
+    });
+    mgr.connect();
+    const sock = lastSock();
+    sock.emit("open");
+    sock.serverSend('{"v":1,"type":"pairing_pending","code":"111111"}');
+    sock.serverSend(
+      '{"v":1,"type":"hello_ack","role":"user","session":{"id":"sid-p","token":"tok-p","expiresAt":1900000000}}',
+    );
+    expect(sessions).toEqual([{ id: "sid-p", token: "tok-p", expiresAt: 1900000000 }]);
+    expect(statuses.at(-1)).toBe("ready");
+    // 批准后就绪：立即发 sync（未收 machines → 不带 machine 字段）
+    expect(sock.sentOfType("sync")).toEqual(['{"v":1,"type":"sync"}']);
+    mgr.close();
+  });
+
+  it("配对被拒：close 1008 pairing denied → pairing_denied 且不重连", () => {
+    let reason: AuthFailReason | null = null;
+    const mgr = new WsManager({
+      url: "wss://example.test/ws",
+      pairing: "iPhone/Safari",
+      onFrame: () => {},
+      onStatus: () => {},
+      onAuthFailed: (r) => {
+        reason = r;
+      },
+      wsFactory: (u) => new FakeWebSocket(u),
+    });
+    mgr.connect();
+    const sock = lastSock();
+    sock.emit("open");
+    sock.emit("close", { code: 1008, reason: "pairing denied" });
+    expect(reason).toBe("pairing_denied");
+    vi.advanceTimersByTime(60_000);
+    expect(FakeWebSocket.created).toHaveLength(1);
+  });
+
+  it("管理帧六发送器：字节级形状（adminToken 携带；多机模式下也恒明文不带 machine）", () => {
+    const h = makeManager("tok-1", () => "home-mac");
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    const at = "at".repeat(32);
+    expect(h.mgr.sendMachineList(at)).toBe(true);
+    expect(h.mgr.sendMachineAdd(at, "mac-mini", "ab".repeat(32))).toBe(true);
+    expect(h.mgr.sendMachineRemove(at, "mac-mini")).toBe(true);
+    expect(h.mgr.sendUserTokenRotate(at)).toBe(true);
+    expect(h.mgr.sendPairingApprove(at, "483920")).toBe(true);
+    expect(h.mgr.sendPairingDeny(at, "483920")).toBe(true);
+    expect(sock.sent).toContain(`{"v":1,"type":"machine_list","adminToken":"${at}"}`);
+    expect(sock.sent).toContain(
+      `{"v":1,"type":"machine_add","adminToken":"${at}","name":"mac-mini","pubkey":"${"ab".repeat(32)}"}`,
+    );
+    expect(sock.sent).toContain(`{"v":1,"type":"machine_remove","adminToken":"${at}","name":"mac-mini"}`);
+    expect(sock.sent).toContain(`{"v":1,"type":"user_token_rotate","adminToken":"${at}"}`);
+    expect(sock.sent).toContain(`{"v":1,"type":"pairing_approve","adminToken":"${at}","code":"483920"}`);
+    expect(sock.sent).toContain(`{"v":1,"type":"pairing_deny","adminToken":"${at}","code":"483920"}`);
+    // 管理帧不经 e2e 包装（relay 自产自消恒明文）：全部为明文 type 直发
+    expect(sock.sentOfType("machine_list")).toHaveLength(1);
+    expect(sock.sentOfType("enc")).toHaveLength(0);
+  });
+});

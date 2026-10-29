@@ -58,7 +58,9 @@ fn e2e_test_key_path(tag: &str) -> std::path::PathBuf {
 /// 起 key-only relay（v1.3：KEYS 表绑本机公钥，TOKENS 全空——「只配公钥
 /// 表」形态）+ 对应私钥。返回 (handle, 私钥)。
 async fn spawn_test_relay() -> (RelayHandle, SigningKey) {
-    use imagent_relay::{GatewayKeys, GatewayTokens, DEFAULT_SESSION_TTL_SECS};
+    use imagent_relay::{
+        GatewayKeys, GatewayTokens, DEFAULT_PAIRING_TTL_SECS, DEFAULT_SESSION_TTL_SECS,
+    };
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let sk = gen_signing_key();
@@ -79,6 +81,7 @@ async fn spawn_test_relay() -> (RelayHandle, SigningKey) {
                 COUNTER.fetch_add(1, Ordering::Relaxed)
             )),
             session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
+            pairing_ttl_secs: DEFAULT_PAIRING_TTL_SECS,
             webauthn_rp_id: None,
         },
     )
@@ -549,7 +552,9 @@ async fn loopback_browser_machine_field_routing() {
 /// 认证上线、双向通路可用——key 升级不破坏既有部署。
 #[tokio::test]
 async fn loopback_token_credential_compat() {
-    use imagent_relay::{GatewayKeys, GatewayTokens, DEFAULT_SESSION_TTL_SECS};
+    use imagent_relay::{
+        GatewayKeys, GatewayTokens, DEFAULT_PAIRING_TTL_SECS, DEFAULT_SESSION_TTL_SECS,
+    };
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -566,6 +571,7 @@ async fn loopback_token_credential_compat() {
                 COUNTER.fetch_add(1, Ordering::Relaxed)
             )),
             session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
+            pairing_ttl_secs: DEFAULT_PAIRING_TTL_SECS,
             webauthn_rp_id: None,
         },
     )

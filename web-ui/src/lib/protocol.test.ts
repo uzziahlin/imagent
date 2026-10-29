@@ -5,6 +5,8 @@ import {
   deviceSummary,
   encodeFrame,
   initialState,
+  machineNameValid,
+  machinePubkeyValid,
   normalizeExpiryMs,
   parseFrame,
   reducer,
@@ -926,5 +928,161 @@ describe("v1.4 E2E 帧", () => {
       { type: "frame", frame: frame('{"v":1,"type":"enc","machine":"m","box":"QUJD"}') },
     );
     expect(s1).toBe(s0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.5 准入与管理：管理帧出站形状 / 新入站帧解析 / reducer / 字段校验器
+// ---------------------------------------------------------------------------
+
+describe("v1.5 管理帧与配对（出站形状 + 解析 + reducer）", () => {
+  it("管理帧出站：六帧逐字段（adminToken 全携带，undefined 不序列化）", () => {
+    expect(encodeFrame({ v: 1, type: "machine_list", adminToken: "at" })).toBe(
+      '{"v":1,"type":"machine_list","adminToken":"at"}',
+    );
+    expect(
+      encodeFrame({ v: 1, type: "machine_add", adminToken: "at", name: "mac-mini", pubkey: "ab" }),
+    ).toBe('{"v":1,"type":"machine_add","adminToken":"at","name":"mac-mini","pubkey":"ab"}');
+    expect(encodeFrame({ v: 1, type: "machine_remove", adminToken: "at", name: "mac-mini" })).toBe(
+      '{"v":1,"type":"machine_remove","adminToken":"at","name":"mac-mini"}',
+    );
+    expect(encodeFrame({ v: 1, type: "user_token_rotate", adminToken: "at" })).toBe(
+      '{"v":1,"type":"user_token_rotate","adminToken":"at"}',
+    );
+    expect(encodeFrame({ v: 1, type: "pairing_approve", adminToken: "at", code: "483920" })).toBe(
+      '{"v":1,"type":"pairing_approve","adminToken":"at","code":"483920"}',
+    );
+    expect(encodeFrame({ v: 1, type: "pairing_deny", adminToken: "at", code: "483920" })).toBe(
+      '{"v":1,"type":"pairing_deny","adminToken":"at","code":"483920"}',
+    );
+  });
+
+  it("hello 配对形态出站（pairing+device，无凭证字段）", () => {
+    expect(encodeFrame({ v: 1, type: "hello", pairing: true, device: "iPhone/Safari" })).toBe(
+      '{"v":1,"type":"hello","pairing":true,"device":"iPhone/Safari"}',
+    );
+  });
+
+  it("机器名/公钥校验器：与 relay 同规（1..=32 [a-zA-Z0-9_-] / 64hex）", () => {
+    expect(machineNameValid("mac-mini_01")).toBe(true);
+    expect(machineNameValid("a")).toBe(true);
+    expect(machineNameValid("A".repeat(32))).toBe(true);
+    expect(machineNameValid("")).toBe(false);
+    expect(machineNameValid("A".repeat(33))).toBe(false);
+    expect(machineNameValid("机器")).toBe(false);
+    expect(machineNameValid("mac mini")).toBe(false);
+    expect(machineNameValid("mac.mini")).toBe(false);
+
+    expect(machinePubkeyValid("ab".repeat(32))).toBe(true);
+    expect(machinePubkeyValid("AB".repeat(32))).toBe(true); // 大小写宽容
+    expect(machinePubkeyValid("ab".repeat(31))).toBe(false);
+    expect(machinePubkeyValid("zz".repeat(32))).toBe(false); // 非 hex
+  });
+
+  it("parseFrame machines_cfg：合法形状放行；元素缺字段/类型错拒绝", () => {
+    const ok = parseFrame(
+      '{"v":1,"type":"machines_cfg","machines":[{"name":"m1","pubkey_fp":"aaaa bbbb cccc dddd","created":1900000000}]}',
+    );
+    expect(ok).toMatchObject({
+      type: "machines_cfg",
+      machines: [{ name: "m1", pubkey_fp: "aaaa bbbb cccc dddd", created: 1900000000 }],
+    });
+    // created 可选（容错展示字段）
+    expect(
+      parseFrame('{"v":1,"type":"machines_cfg","machines":[{"name":"m1","pubkey_fp":"fp"}]}'),
+    ).toMatchObject({ machines: [{ name: "m1", pubkey_fp: "fp" }] });
+    expect(parseFrame('{"v":1,"type":"machines_cfg"}')).toBeNull();
+    expect(parseFrame('{"v":1,"type":"machines_cfg","machines":{}}')).toBeNull();
+    expect(
+      parseFrame('{"v":1,"type":"machines_cfg","machines":[{"name":"m1"}]}'),
+    ).toBeNull();
+    expect(
+      parseFrame('{"v":1,"type":"machines_cfg","machines":[{"name":"m1","pubkey_fp":"fp","created":"x"}]}'),
+    ).toBeNull();
+  });
+
+  it("parseFrame user_token_rotated / pairing_request / pairing_pending / error.message", () => {
+    expect(parseFrame('{"v":1,"type":"user_token_rotated","token":"' + "ab".repeat(32) + '"}')).toMatchObject({
+      type: "user_token_rotated",
+    });
+    expect(parseFrame('{"v":1,"type":"user_token_rotated"}')).toBeNull();
+
+    expect(
+      parseFrame('{"v":1,"type":"pairing_request","code":"483920","device":"iPhone/Safari","expiresAt":1900000000}'),
+    ).toMatchObject({ type: "pairing_request", code: "483920" });
+    // expiresAt 可选（容错）
+    expect(parseFrame('{"v":1,"type":"pairing_request","code":"1","device":"d"}')).not.toBeNull();
+    expect(parseFrame('{"v":1,"type":"pairing_request","code":"1"}')).toBeNull();
+    expect(
+      parseFrame('{"v":1,"type":"pairing_request","code":"1","device":"d","expiresAt":"x"}'),
+    ).toBeNull();
+
+    expect(parseFrame('{"v":1,"type":"pairing_pending","code":"483920"}')).toMatchObject({
+      type: "pairing_pending",
+    });
+    expect(parseFrame('{"v":1,"type":"pairing_pending"}')).toBeNull();
+
+    // v1.5 error 可带 message（字符串才放行）
+    expect(parseFrame('{"v":1,"type":"error","code":"machine_invalid","message":"bad name"}')).toMatchObject({
+      code: "machine_invalid",
+      message: "bad name",
+    });
+    expect(parseFrame('{"v":1,"type":"error","code":"machine_invalid","message":5}')).toBeNull();
+  });
+
+  it("reducer：machines_cfg 全量覆盖；user_token_rotated 一次性 + clear", () => {
+    const s0 = initialState();
+    expect(s0.machinesCfg).toBeNull();
+    expect(s0.pairingRequests).toEqual([]);
+    expect(s0.rotatedToken).toBeNull();
+
+    const s1 = run(s0, {
+      type: "frame",
+      frame: frame('{"v":1,"type":"machines_cfg","machines":[{"name":"m1","pubkey_fp":"fp"}]}'),
+    });
+    expect(s1.machinesCfg).toEqual([{ name: "m1", pubkey_fp: "fp" }]);
+    const s2 = run(s1, {
+      type: "frame",
+      frame: frame('{"v":1,"type":"machines_cfg","machines":[]}'),
+    });
+    expect(s2.machinesCfg).toEqual([]);
+
+    const s3 = run(s0, {
+      type: "frame",
+      frame: frame('{"v":1,"type":"user_token_rotated","token":"newtok"}'),
+    });
+    expect(s3.rotatedToken).toBe("newtok");
+    expect(run(s3, { type: "clear_rotated_token" }).rotatedToken).toBeNull();
+  });
+
+  it("reducer：pairing_request 按 code 幂等追加；pairing_resolved 移除", () => {
+    const s0 = initialState();
+    const s1 = run(s0, {
+      type: "frame",
+      frame: frame('{"v":1,"type":"pairing_request","code":"111111","device":"A","expiresAt":1900000000}'),
+    });
+    expect(s1.pairingRequests).toHaveLength(1);
+    expect(s1.pairingRequests[0]).toMatchObject({ code: "111111", device: "A", expiresAt: 1900000000 });
+    // 同码广播重放不重复
+    const s2 = run(s1, {
+      type: "frame",
+      frame: frame('{"v":1,"type":"pairing_request","code":"111111","device":"A"}'),
+    });
+    expect(s2.pairingRequests).toHaveLength(1);
+    // 第二台新设备 → 两张卡
+    const s3 = run(s2, {
+      type: "frame",
+      frame: frame('{"v":1,"type":"pairing_request","code":"222222","device":"B"}'),
+    });
+    expect(s3.pairingRequests).toHaveLength(2);
+    // 应答其一 → 移除对应卡；未知码 no-op
+    const s4 = run(s3, { type: "pairing_resolved", code: "111111" });
+    expect(s4.pairingRequests.map((p) => p.code)).toEqual(["222222"]);
+    expect(run(s4, { type: "pairing_resolved", code: "999999" })).toBe(s4);
+  });
+
+  it("reducer：pairing_pending 静默忽略（ws 层消费）", () => {
+    const s0 = initialState();
+    expect(run(s0, { type: "frame", frame: frame('{"v":1,"type":"pairing_pending","code":"1"}') })).toBe(s0);
   });
 });

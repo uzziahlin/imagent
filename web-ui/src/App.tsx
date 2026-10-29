@@ -10,6 +10,7 @@ import {
   type ConvState,
   type DeviceInfo,
   type MachineNotice,
+  type PairingRequest,
   type PasskeyInfo,
   type PendingApproval,
 } from "./lib/protocol";
@@ -35,10 +36,19 @@ import {
   passkeyRegister,
   webauthnSupported,
 } from "./lib/webauthn";
+import {
+  adminTokenExpiresAt,
+  clearAdminToken,
+  ensureAdminToken,
+  getAdminToken,
+  reauthErrorText,
+} from "./lib/admin";
 import { Login } from "./components/Login";
 import { StatusBar } from "./components/StatusBar";
 import { Sidebar, type ConvItem } from "./components/Sidebar";
-import { DeviceManager } from "./components/DeviceManager";
+import { AdminPanel, RotatedTokenModal } from "./components/AdminPanel";
+import { PairingWait } from "./components/PairingWait";
+import { PairingRequestCard } from "./components/PairingRequestCard";
 import { E2eConfirm } from "./components/E2eConfirm";
 import { useExitMounted } from "./components/useExitMounted";
 import { MessageList } from "./components/MessageList";
@@ -78,6 +88,10 @@ const ERROR_HINTS: Record<string, string> = {
   rate_limited: "发送过快，已被限流断开",
   ambiguous_machine: "多台机器在线，未指定目标机器",
   machine_offline: "该机器离线，消息未送达",
+  // v1.5 管理面错误（machine_invalid 带 message 时 toast 只显 code，详情在
+  // 管理面板场景由 adminError/表单提示承担）
+  machine_invalid: "机器名或公钥无效，或名称已存在",
+  admin_auth_required: "管理验证缺失或已过期，请重试操作",
 };
 
 /** 机器通知文案：from 为 default 的引导切换并非真实掉线，单独措辞。 */
@@ -135,7 +149,18 @@ export default function App() {
   const [passkeyBusy, setPasskeyBusy] = useState(false);
   const [passkeyError, setPasskeyError] = useState<string | null>(null);
   const [passkeyMessage, setPasskeyMessage] = useState<string | null>(null);
-  const [devicesOpen, setDevicesOpen] = useState(false);
+  // v1.5 管理面板（设备管理弹层升级）：打开即拉 devices/creds，机器列表经
+  // re-auth（requireAdmin）后 machine_list。
+  const [adminOpen, setAdminOpen] = useState(false);
+  // re-auth（passkey 管理验证）进行中 / 失败提示 / adminToken 当前有效
+  const [adminBusy, setAdminBusy] = useState(false);
+  const [adminError, setAdminError] = useState<string | null>(null);
+  const [adminActive, setAdminActive] = useState(false);
+  const adminExpiryTimer = useRef<number>(0);
+  // v1.5 新设备配对（登录页入口）：pairing 非空 → WS 配对模式 + 等待屏
+  const [pairing, setPairing] = useState<{ device: string } | null>(null);
+  const [pairingCode, setPairingCode] = useState<string | null>(null);
+  const [pairingCodeAt, setPairingCodeAt] = useState<number | null>(null);
   const [status, setStatus] = useState<ConnStatus>("connecting");
   const [drawerOpen, setDrawerOpen] = useState(false);
   // v1.4 E2E：pin 表快照（设备管理指纹区）+ UI 态（TOFU 队列/告警/阻断/激活）
@@ -150,8 +175,15 @@ export default function App() {
     stateRef.current = state;
   });
 
-  /** 认证失败分流（close 1008 reason → 清对应凭证 + 登录页提示）。 */
+  /** 认证失败分流（close 1008 reason → 清对应凭证 + 登录页提示）。v1.5：
+   *  adminToken 属会话附属内存态，任何认证失败一并作废。 */
   const authFailed = (reason: AuthFailReason) => {
+    clearAdminToken();
+    setAdminActive(false);
+    setAdminOpen(false);
+    setPairing(null);
+    setPairingCode(null);
+    setPairingCodeAt(null);
     if (reason === "session_expired") {
       clearSession();
       setSession(null);
@@ -160,6 +192,12 @@ export default function App() {
       clearSession();
       setSession(null);
       setAuthNotice("此设备已被吊销");
+    } else if (reason === "pairing_denied") {
+      // v1.5 配对被拒：pending 连接被 relay 关闭，回登录页给明确提示
+      setAuthNotice("配对已被拒绝，可重试或改用访问令牌登录");
+    } else if (pairing) {
+      // 配对中其它认证失败（旧 relay 不识别 pairing hello 等）
+      setAuthNotice("配对未成功（中继可能不支持新设备配对）");
     } else {
       // 其它（token 无效等）：全清、无特殊提示（与 v1.1 行为一致）
       clearSession();
@@ -168,7 +206,6 @@ export default function App() {
       setAuthNotice("");
     }
     setAuth(null);
-    setDevicesOpen(false);
   };
 
   /** v1.3 passkey 登录失败文案（登录页回落提示）。 */
@@ -258,25 +295,46 @@ export default function App() {
     }
   };
 
-  // 凭证变化（登录/退出/认证失败）→ 重建 WS 连接；session 签发不重建（见 Cred）
+  // 凭证变化（登录/退出/认证失败）或配对入口开关 → 重建 WS 连接；session 签发
+  // 不重建（见 Cred）。v1.5：pairing 非空 = 登录页「我是新设备」配对模式
+  // （hello{pairing} 无凭证，等待已登录设备批准；批准后同连接 hello_ack.
+  // session 签发 → 切 auth 会话形态重连进主界面）。
   useEffect(() => {
-    if (!auth) {
+    if (!auth && !pairing) {
       return;
     }
     const mgr = new WsManager({
       url: wsUrl(),
-      token: auth.kind === "user" ? auth.token : undefined,
-      device: auth.kind === "user" ? auth.device : undefined,
-      session: auth.kind === "session" ? auth.token : undefined,
+      token: !pairing && auth?.kind === "user" ? auth.token : undefined,
+      device: pairing
+        ? pairing.device
+        : auth?.kind === "user"
+          ? auth.device
+          : undefined,
+      session: !pairing && auth?.kind === "session" ? auth.token : undefined,
+      pairing: pairing?.device,
       onFrame: (frame) => dispatch({ type: "frame", frame }),
       onStatus: setStatus,
       onAuthFailed: authFailed,
       // v1.2：hello_ack 携带 session（新 relay）→ 持久化会话凭证，USER_TOKEN
       // 一次性用毕即删（不再长期驻留 localStorage）；旧 relay 不触发。
+      // v1.5 配对模式：批准后 relay 在配对连接上换发 session → 存凭证并以
+      // 会话形态重连（配对连接由 effect 依赖变化正常收尾）。
       onSession: (s) => {
         saveSession(s);
         localStorage.removeItem(USER_TOKEN_KEY);
         setSession(s);
+        if (pairing) {
+          setPairing(null);
+          setPairingCode(null);
+          setPairingCodeAt(null);
+          setAuth({ kind: "session", token: s.token });
+        }
+      },
+      // v1.5：配对等待码（大字展示 + 倒计时锚点）
+      onPairingPending: (code) => {
+        setPairingCode(code);
+        setPairingCodeAt(Date.now());
       },
       // v1.1：内部自动帧（ready 后 sync / 心跳 ping）的出站机器。
       // 多机模式恒带当前选中机器；旧 relay 单机模式不带（字节级不变）。
@@ -293,8 +351,8 @@ export default function App() {
       wsRef.current = null;
       mgr.close();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- authFailed 仅用 setState（稳定引用）
-  }, [auth]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- authFailed/onE2eEvent 仅用 setState（稳定引用）
+  }, [auth, pairing]);
 
   // error / notice toast：4s 自动消退
   useEffect(() => {
@@ -312,6 +370,26 @@ export default function App() {
     const t = setTimeout(() => dispatch({ type: "clear_notice" }), 4000);
     return () => clearTimeout(t);
   }, [state.lastNotice]);
+
+  // v1.5：relay 回 admin_auth_required（adminToken 缺失/无效/过期——含本地
+  // 时钟偏移导致的提前失效）→ 作废本地 grant 并引导重试（下一次管理操作
+  // 自动重新 passkey 验证）。
+  useEffect(() => {
+    if (state.lastError?.code === "admin_auth_required") {
+      clearAdminToken();
+      setAdminActive(false);
+      setAdminError("管理验证已过期，请重试操作（将重新验证通行钥匙）");
+    }
+  }, [state.lastError]);
+
+  // 管理面板关闭时的 adminError（配对卡上验证失败等）走底部 toast，4s 消退
+  useEffect(() => {
+    if (!adminError || adminOpen) {
+      return;
+    }
+    const t = setTimeout(() => setAdminError(null), 4000);
+    return () => clearTimeout(t);
+  }, [adminError, adminOpen]);
 
   // 机器维度变化（首收 machines 帧 / 侧栏切换 / 掉线自动切换）→ 发一次带
   // machine 的 sync 拉该机器卡片缓存。未 ready 时 sendSync 静默失败——重连
@@ -367,6 +445,21 @@ export default function App() {
   const drawerContentMounted = useExitMounted(drawerOpen, 150);
 
   if (!auth) {
+    // v1.5 配对模式：登录页「我是新设备」→ 等待屏（码大字 + 倒计时）
+    if (pairing) {
+      return (
+        <PairingWait
+          device={pairing.device}
+          code={pairingCode}
+          codeAt={pairingCodeAt}
+          onCancel={() => {
+            setPairing(null);
+            setPairingCode(null);
+            setPairingCodeAt(null);
+          }}
+        />
+      );
+    }
     return (
       <Login
         notice={authNotice}
@@ -374,6 +467,13 @@ export default function App() {
         passkeyBusy={passkeyBusy}
         passkeyError={passkeyError}
         onPasskeyLogin={handlePasskeyLogin}
+        onPairing={(deviceName) => {
+          setAuthNotice("");
+          setPasskeyError(null);
+          setPairing({ device: deviceName || deviceSummary(navigator.userAgent) });
+          setPairingCode(null);
+          setPairingCodeAt(null);
+        }}
         onSave={(t, deviceName) => {
           // USER_TOKEN 先落 localStorage（relay 暂不可达时刷新仍可重试握手）；
           // hello_ack 签发 session 后由 onSession 删除（一次性）。
@@ -449,24 +549,112 @@ export default function App() {
     }
   };
 
-  /** 登出：清全部本地凭证（会话 + 遗留 USER_TOKEN），回登录页。服务端吊销
-   *  走设备管理的「吊销并退出」（revokeDevice）。不清 authNotice——吊销本机
-   *  的提示由 revokeDevice 先设、logout 随后执行（进入主界面的唯一路径是
-   *  登录提交，彼时已清空，不会出现陈旧提示）。 */
+  /** 登出：清全部本地凭证（会话 + 遗留 USER_TOKEN + 内存态 adminToken），回
+   * 登录页。服务端吊销走管理面板的「吊销并退出」（revokeDevice）。 */
   const logout = () => {
     clearSession();
     localStorage.removeItem(USER_TOKEN_KEY);
+    clearAdminToken();
+    setAdminActive(false);
+    setAdminOpen(false);
     setSession(null);
-    setDevicesOpen(false);
     setAuth(null);
   };
 
-  /** v1.2 + v1.3 设备管理：打开即拉设备列表与通行钥匙列表（relay 回
-   * devices / creds 帧更新 state）。 */
-  const openDevices = () => {
-    setDevicesOpen(true);
+  // ---- v1.5 管理门槛：任何管理操作前保证有效 adminToken（无/过期自动
+  //      passkey re-auth，5 分钟内免再次验证；并发共享同一次 ceremony）----
+
+  /** adminToken 过期时刻驱动的「已验证」态翻转（免验提示随真实过期收回）。 */
+  const markAdminActive = () => {
+    setAdminActive(true);
+    window.clearTimeout(adminExpiryTimer.current);
+    const exp = adminTokenExpiresAt();
+    if (exp !== null) {
+      adminExpiryTimer.current = window.setTimeout(
+        () => setAdminActive(getAdminToken() !== null),
+        Math.max(0, exp - Date.now()),
+      );
+    }
+  };
+
+  /** 取有效 adminToken；必要时自动 re-auth。失败/不支持给 adminError 引导。 */
+  const requireAdmin = async (): Promise<string | null> => {
+    if (!session) {
+      setAdminError("管理操作需会话登录（请重新登录后再试）");
+      return null;
+    }
+    const existing = getAdminToken();
+    if (existing !== null) {
+      return existing;
+    }
+    if (!waSupported) {
+      setAdminError("本浏览器不支持通行钥匙，无法进行管理验证（请先注册通行钥匙或在支持设备上操作）");
+      return null;
+    }
+    setAdminBusy(true);
+    setAdminError(null);
+    try {
+      const token = await ensureAdminToken(session.token);
+      markAdminActive();
+      return token;
+    } catch (e) {
+      setAdminError(reauthErrorText(e));
+      return null;
+    } finally {
+      setAdminBusy(false);
+    }
+  };
+
+  /** 发送管理帧的小封装：未就绪（断线）时给面板反馈。 */
+  const sendAdminFrame = (send: (token: string) => boolean): Promise<void> =>
+    requireAdmin().then((token) => {
+      if (token && !send(token)) {
+        setAdminError("连接未就绪，操作未发送（恢复连接后重试）");
+      }
+    });
+
+  /** v1.5 管理面板：打开即拉设备/通行钥匙列表；机器列表属管理帧（adminToken）
+   *  → 自动 re-auth 后 machine_list。 */
+  const openAdmin = () => {
+    setAdminOpen(true);
+    setAdminError(null);
     wsRef.current?.sendDeviceList();
     wsRef.current?.sendCredList();
+    void sendAdminFrame((t) => wsRef.current?.sendMachineList(t) ?? false);
+  };
+
+  const refreshMachines = () => {
+    void sendAdminFrame((t) => wsRef.current?.sendMachineList(t) ?? false);
+  };
+
+  const addMachine = (name: string, pubkey: string) => {
+    void sendAdminFrame((t) => wsRef.current?.sendMachineAdd(t, name, pubkey) ?? false);
+  };
+
+  const removeMachine = (name: string) => {
+    void sendAdminFrame((t) => wsRef.current?.sendMachineRemove(t, name) ?? false);
+  };
+
+  const rotateToken = () => {
+    void sendAdminFrame((t) => wsRef.current?.sendUserTokenRotate(t) ?? false);
+  };
+
+  /** v1.5 配对应答（允许/拒绝均管理级，须 re-auth）；帧发出即移除请求卡
+   *  （relay 对 pending 的处理对新设备侧生效，无回执帧）。 */
+  const respondPairing = (p: PairingRequest, allow: boolean) => {
+    void requireAdmin().then((token) => {
+      if (!token) {
+        return;
+      }
+      const sent = allow
+        ? wsRef.current?.sendPairingApprove(token, p.code)
+        : wsRef.current?.sendPairingDeny(token, p.code);
+      if (sent) {
+        dispatch({ type: "pairing_resolved", code: p.code });
+      } else {
+        setAdminError("连接未就绪，操作未发送（恢复连接后重试）");
+      }
+    });
   };
 
   /** v1.3 添加通行钥匙：注册 label 用本机设备名（deviceSummary）；完成后
@@ -568,7 +756,7 @@ export default function App() {
       currentMachine={state.currentMachine}
       sessionExpiresAt={session?.expiresAt}
       onRenewSession={logout}
-      onOpenDevices={session ? openDevices : undefined}
+      onOpenAdmin={session ? openAdmin : undefined}
       onSelect={selectConv}
       onSelectMachine={selectMachine}
       onCreate={createConv}
@@ -633,7 +821,7 @@ export default function App() {
                 机器 <span className="font-semibold">{m}</span>{" "}
                 身份变化：加密指纹与已信任记录不一致，可能被中间人。已断开与该机器的加密连接并发送；请与终端{" "}
                 <code className="rounded bg-rose-100/70 px-1 dark:bg-rose-900/50">imagent start</code>{" "}
-                日志核对指纹，确认无误后在「已登录设备」中重置该机器指纹。
+                日志核对指纹，确认无误后在「管理」面板中重置该机器指纹。
               </p>
             ))}
           </div>
@@ -673,6 +861,23 @@ export default function App() {
             ))}
           </div>
         )}
+        {/* v1.5 配对请求卡（pairing_request 广播 → 消息区顶部逐张弹卡；允许/
+            拒绝均管理级 re-auth，帧发出即撤卡） */}
+        {state.pairingRequests.length > 0 && (
+          <div className="shrink-0 space-y-2">
+            {state.pairingRequests.map((p) => (
+              <PairingRequestCard
+                key={p.code}
+                device={p.device}
+                code={p.code}
+                expiresAt={p.expiresAt}
+                busy={adminBusy}
+                onAllow={() => respondPairing(p, true)}
+                onDeny={() => respondPairing(p, false)}
+              />
+            ))}
+          </div>
+        )}
         <main className="relative min-h-0 flex-1">
           <ApprovalPanel
             pending={allPending}
@@ -706,25 +911,49 @@ export default function App() {
         />
       )}
 
-      {/* v1.2 + v1.3 设备管理弹层（组件自管进出过渡；状态经 devices/creds 帧） */}
-      <DeviceManager
-        open={devicesOpen}
+      {/* v1.5 管理面板（设备/钥匙/指纹区并入；机器/令牌管理区经 adminToken） */}
+      <AdminPanel
+        open={adminOpen}
+        machines={state.machinesCfg}
+        adminBusy={adminBusy}
+        adminError={adminError}
+        adminActive={adminActive}
+        webauthnAvailable={waSupported}
+        onRefreshMachines={refreshMachines}
+        onAddMachine={addMachine}
+        onRemoveMachine={removeMachine}
+        onRotateToken={rotateToken}
         devices={state.devices}
         passkeys={state.passkeys}
-        pins={e2ePins}
-        webauthnAvailable={waSupported}
         passkeyBusy={passkeyBusy}
         passkeyMessage={passkeyMessage}
         selfId={session?.id}
         onRevoke={revokeDevice}
         onAddPasskey={addPasskey}
         onRevokePasskey={revokePasskey}
+        pins={e2ePins}
         onResetPin={resetPin}
-        onClose={() => setDevicesOpen(false)}
+        onClose={() => setAdminOpen(false)}
       />
 
-      {(state.lastError || state.lastNotice) && (
+      {/* v1.5 USER_TOKEN 轮换结果：一次性明文弹层（关闭即作废） */}
+      {state.rotatedToken !== null && (
+        <RotatedTokenModal
+          token={state.rotatedToken}
+          onDone={() => dispatch({ type: "clear_rotated_token" })}
+        />
+      )}
+
+      {(state.lastError || state.lastNotice || (adminError && !adminOpen)) && (
         <div className="fixed inset-x-0 bottom-24 z-50 mx-auto flex w-fit max-w-[90vw] flex-col items-center gap-2">
+          {adminError && !adminOpen && (
+            <div
+              role="alert"
+              className="rounded-full border border-rose-400/60 bg-rose-50 px-4 py-2 text-center text-xs text-rose-800 shadow-xl dark:border-rose-500/40 dark:bg-rose-950/95 dark:text-rose-200"
+            >
+              {adminError}
+            </div>
+          )}
           {state.lastNotice && (
             <div
               role="status"

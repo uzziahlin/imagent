@@ -39,8 +39,9 @@ function formatTime(at: number): string {
  * - 新会话 = 由上层发 `/switch <名字>` message 命令帧（convId 留空落默认
  *   会话），命令语义由网关解析，SPA 同时把当前 conv 切到 `web:<名字>`。
  * - 未收到任何 machines 帧（旧 relay）：不显示机器区，单机行为与升级前一致。
- * - v1.2 会话层：底部「已登录设备」入口（仅会话模式）与「会话 N 天后过期」
- *   续期横幅（剩余 < 3 天；点击进入登出流程）。
+ * - v1.2 会话层：底部「管理」入口（仅会话模式；v1.5 起为管理面板——机器/
+ *   令牌/设备/钥匙/指纹）与「会话 N 天后过期」续期横幅（剩余 < 3 天；点击
+ *   进入登出流程）。
  *
  * 已知限制：会话内消息历史仅 SPA 内存保留，页面刷新后仅当前卡片由 sync
  * 重发恢复（text/user 回显不重放）。
@@ -54,7 +55,7 @@ export function Sidebar({
   currentMachine,
   sessionExpiresAt,
   onRenewSession,
-  onOpenDevices,
+  onOpenAdmin,
   onSelect,
   onSelectMachine,
   onCreate,
@@ -72,8 +73,8 @@ export function Sidebar({
   sessionExpiresAt?: number;
   /** 过期横幅点击 → 登出流程（重新登录即续期 30 天）。 */
   onRenewSession?: () => void;
-  /** v1.2 设备管理入口（App 仅会话模式传入；旧 relay 不显示）。 */
-  onOpenDevices?: () => void;
+  /** v1.5 管理面板入口（App 仅会话模式传入；旧 relay 不显示）。 */
+  onOpenAdmin?: () => void;
   onSelect: (conv: string) => void;
   /** 机器切换器点选（切 currentMachine + 触发该机器 sync）。 */
   onSelectMachine: (machine: string) => void;
@@ -256,14 +257,14 @@ export function Sidebar({
             会话 {daysLeft} 天后过期，重新登录可续期
           </button>
         )}
-        {/* v1.2 设备管理入口（仅会话模式——旧 relay 无会话层不显示） */}
-        {onOpenDevices && (
+        {/* v1.5 管理面板入口（仅会话模式——旧 relay 无会话层不显示） */}
+        {onOpenAdmin && (
           <button
             type="button"
-            onClick={onOpenDevices}
+            onClick={onOpenAdmin}
             className="mb-1.5 w-full rounded-lg px-3 py-1.5 text-left text-xs text-muted transition-colors hover:bg-panel2 hover:text-ink"
           >
-            已登录设备
+            管理
           </button>
         )}
         {creating ? (

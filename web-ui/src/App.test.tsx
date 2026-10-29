@@ -13,6 +13,7 @@ import { hkdf } from "@noble/hashes/hkdf.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex, hexToBytes, randomBytes, utf8ToBytes } from "@noble/hashes/utils.js";
 import App from "./App";
+import { __resetAdminToken } from "./lib/admin";
 import { fingerprint, openBox } from "./lib/e2e";
 import type { WsEvent } from "./lib/ws";
 
@@ -21,6 +22,7 @@ class FakeWebSocket {
   static latest: FakeWebSocket | null = null;
   readyState = 0;
   sent: string[] = [];
+  closedWith: number[] = [];
   private listeners = new Map<string, Set<(ev: WsEvent) => void>>();
 
   constructor(public url: string) {
@@ -41,8 +43,9 @@ class FakeWebSocket {
     this.sent.push(data);
   }
 
-  close(): void {
+  close(code?: number): void {
     this.readyState = 3;
+    this.closedWith.push(code ?? 1000);
   }
 
   emit(type: "open" | "close" | "error", ev: WsEvent = {}): void {
@@ -293,7 +296,7 @@ describe("App 会话层（v1.2）", () => {
     expect(localStorage.getItem("imagent.userToken")).toBe("tok-9");
     expect(localStorage.getItem("imagent.session")).toBeNull();
     // 旧 relay 无会话层：设备管理入口与过期横幅均不出现
-    expect(screen.queryByRole("button", { name: /已登录设备/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "管理" })).toBeNull();
     expect(screen.queryByText(/天后过期/)).toBeNull();
   });
 
@@ -301,9 +304,9 @@ describe("App 会话层（v1.2）", () => {
     const fake = mountWithSession();
     act(() => fake.recv(JSON.parse(ackWithSession("sid-r", "st-r", Date.now() + 20 * DAY))));
     // 打开设备面板 → 发 device_list
-    fireEvent.click(screen.getByRole("button", { name: "已登录设备" }));
+    fireEvent.click(screen.getByRole("button", { name: "管理" }));
     expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "device_list" }));
-    expect(screen.getByRole("dialog", { name: "已登录设备" })).toBeTruthy();
+    expect(screen.getByRole("dialog", { name: "管理" })).toBeTruthy();
     expect(screen.getByText("加载中…")).toBeTruthy();
     act(() =>
       fake.recv({
@@ -337,7 +340,7 @@ describe("App 会话层（v1.2）", () => {
   it("吊销本机 = 登出：发 device_revoke 后清凭证回登录页", () => {
     const fake = mountWithSession();
     act(() => fake.recv(JSON.parse(ackWithSession("sid-r", "st-r", Date.now() + 20 * DAY))));
-    fireEvent.click(screen.getByRole("button", { name: "已登录设备" }));
+    fireEvent.click(screen.getByRole("button", { name: "管理" }));
     act(() =>
       fake.recv({
         v: 1,
@@ -368,7 +371,7 @@ describe("App 会话层（v1.2）", () => {
     const fake = mountWithSession(Date.now() + 29 * DAY);
     act(() => fake.recv(JSON.parse(ackWithSession("sid-r", "st-r", Date.now() + 29 * DAY))));
     expect(screen.queryByText(/天后过期/)).toBeNull();
-    expect(screen.getByRole("button", { name: "已登录设备" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "管理" })).toBeTruthy();
   });
 });
 
@@ -682,10 +685,10 @@ describe("App passkey 登录（v1.3）", () => {
       fake.emit("open");
       fake.recv(JSON.parse(ack("sid-r", "st-r", Date.now() + 20 * 86_400_000)));
     });
-    fireEvent.click(screen.getByRole("button", { name: "已登录设备" }));
+    fireEvent.click(screen.getByRole("button", { name: "管理" }));
     // 打开面板：device_list + cred_list 都发出。
     expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "cred_list" }));
-    expect(screen.getByRole("dialog", { name: "已登录设备" })).toBeTruthy();
+    expect(screen.getByRole("dialog", { name: "管理" })).toBeTruthy();
     // 通行钥匙区：待回包态。
     expect(screen.getByText("通行钥匙")).toBeTruthy();
     act(() => {
@@ -876,8 +879,8 @@ describe("App E2E（v1.4）", () => {
     ackHandshake(fake, gw, "home-mac");
     fireEvent.click(screen.getByRole("button", { name: "信任并启用加密" }));
 
-    fireEvent.click(screen.getByRole("button", { name: "已登录设备" }));
-    const dialog = screen.getByRole("dialog", { name: "已登录设备" });
+    fireEvent.click(screen.getByRole("button", { name: "管理" }));
+    const dialog = screen.getByRole("dialog", { name: "管理" });
     expect(within(dialog).getByText("已信任机器指纹")).toBeTruthy();
     expect(within(dialog).getByText("home-mac")).toBeTruthy();
     expect(within(dialog).getByText(`X25519 ${fingerprint(gw.gk)}`)).toBeTruthy();
@@ -912,5 +915,494 @@ describe("App E2E（v1.4）", () => {
     });
     expect(screen.getAllByRole("alert").some((el) => el.textContent?.includes("收到未加密业务帧"))).toBe(true);
     expect(screen.queryByText("降级内容")).toBeNull(); // 帧已丢弃
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.5 准入与管理：管理面板（机器增删/令牌轮换）+ re-auth 通用流程 +
+// adminToken 内存缓存/过期 + 配对两端流（新设备等待 + 已登录侧批准）
+// ---------------------------------------------------------------------------
+
+describe("App 管理面板与 re-auth（v1.5）", () => {
+  const ADMIN_TOK = "at".repeat(32);
+
+  /** 开启 WebAuthn 能力（get 可控——同 passkey describe 的局部实现）。 */
+  function enableWebauthn(get: () => Promise<unknown>): void {
+    vi.stubGlobal("PublicKeyCredential", class PublicKeyCredential {});
+    Object.defineProperty(navigator, "credentials", {
+      value: {
+        get,
+        create: async () => {
+          throw new Error("本用例不触发 create");
+        },
+      },
+      configurable: true,
+    });
+  }
+
+  function fakeAssertion(): unknown {
+    const enc = (s: string) => new TextEncoder().encode(s);
+    return {
+      id: "cred-1",
+      rawId: enc("raw-cred"),
+      type: "public-key",
+      response: {
+        authenticatorData: enc("auth-data"),
+        clientDataJSON: enc("{}"),
+        signature: enc("sig"),
+        userHandle: enc("user"),
+      },
+    };
+  }
+
+  /** reauth begin/complete 的 fetch mock（begin 次数可计数）。 */
+  function reauthFetch(): ReturnType<typeof vi.fn> {
+    return vi.fn(async (url: string | URL | Request) => {
+      const u = typeof url === "string" ? url : url.toString();
+      if (u.includes("webauthn/reauth/begin")) {
+        return new Response(
+          JSON.stringify({
+            beginId: "rb-1",
+            publicKey: { rpId: "localhost", challenge: "Zm9vYmFy", allowCredentials: [] },
+          }),
+          { status: 200 },
+        );
+      }
+      if (u.includes("webauthn/reauth/complete")) {
+        return new Response(
+          JSON.stringify({ adminToken: ADMIN_TOK, expiresAt: Math.floor(Date.now() / 1000) + 300 }),
+          { status: 200 },
+        );
+      }
+      return new Response("{}", { status: 404 });
+    }) as unknown as ReturnType<typeof vi.fn>;
+  }
+
+  /** 会话模式挂载 + hello_ack(session)（管理入口/配对卡都需要 session）。 */
+  function mountSessionApp(): FakeWebSocket {
+    localStorage.setItem(
+      "imagent.session",
+      JSON.stringify({ id: "sid-r", token: "st-r", expiresAt: Date.now() + 20 * 86_400_000 }),
+    );
+    render(<App />);
+    const fake = FakeWebSocket.latest as FakeWebSocket;
+    act(() => {
+      fake.emit("open");
+      fake.recv({
+        v: 1,
+        type: "hello_ack",
+        role: "user",
+        session: { id: "sid-r", token: "st-r", expiresAt: Date.now() + 20 * 86_400_000 },
+      });
+    });
+    return fake;
+  }
+
+  const sentOfType = (fake: FakeWebSocket, t: string) =>
+    fake.sent.filter((s) => (JSON.parse(s) as { type: string }).type === t);
+
+  const beginCalls = (m: ReturnType<typeof vi.fn>) =>
+    m.mock.calls.filter((c) => c[0].toString().includes("reauth/begin"));
+
+  afterEach(() => {
+    __resetAdminToken();
+  });
+
+  it("打开管理面板：device_list/cred_list 即发；自动 re-auth（Bearer sessionToken）后 machine_list 带新 adminToken", async () => {
+    const fetchMock = reauthFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    enableWebauthn(async () => fakeAssertion());
+    const fake = mountSessionApp();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "管理" }));
+    });
+    expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "device_list" }));
+    expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "cred_list" }));
+    // re-auth 完成 → machine_list（adminToken = reauth/complete 返回值）
+    expect(fake.sent).toContain(
+      JSON.stringify({ v: 1, type: "machine_list", adminToken: ADMIN_TOK }),
+    );
+    const begin = beginCalls(fetchMock)[0]!;
+    expect((begin[1]?.headers as Record<string, string>).authorization).toBe("Bearer st-r");
+
+    // machines_cfg 渲染（名称/指纹/添加时间）
+    act(() => {
+      fake.recv({
+        v: 1,
+        type: "machines_cfg",
+        machines: [{ name: "mac-mini", pubkey_fp: "aaaa bbbb cccc dddd", created: Math.floor(Date.now() / 1000) - 30 }],
+      });
+    });
+    expect(screen.getByText("mac-mini")).toBeTruthy();
+    expect(screen.getByText("aaaa bbbb cccc dddd")).toBeTruthy();
+    expect(screen.getByText(/刚刚/)).toBeTruthy();
+    expect(beginCalls(fetchMock)).toHaveLength(1); // 整个过程一次验证
+  });
+
+  it("添加机器：客户端校验拒绝非法输入；合法提交发 machine_add 且 adminToken 复用（不再 re-auth）", async () => {
+    const fetchMock = reauthFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    enableWebauthn(async () => fakeAssertion());
+    const fake = mountSessionApp();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "管理" }));
+    });
+
+    // 非法名称 + 短公钥 → 行内提示，不发帧
+    fireEvent.change(screen.getByLabelText("机器名"), { target: { value: "bad name" } });
+    fireEvent.change(screen.getByLabelText("机器公钥"), { target: { value: "abcd" } });
+    fireEvent.click(screen.getByRole("button", { name: "添加机器" }));
+    expect(screen.getByText(/机器名须为/)).toBeTruthy();
+    expect(sentOfType(fake, "machine_add")).toHaveLength(0);
+
+    // 合法提交（公钥大写 → 归一小写；name 透传）
+    fireEvent.change(screen.getByLabelText("机器名"), { target: { value: "mac-mini" } });
+    fireEvent.change(screen.getByLabelText("机器公钥"), { target: { value: "AB".repeat(32) } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "添加机器" }));
+    });
+    expect(fake.sent).toContain(
+      JSON.stringify({
+        v: 1,
+        type: "machine_add",
+        adminToken: ADMIN_TOK,
+        name: "mac-mini",
+        pubkey: "ab".repeat(32),
+      }),
+    );
+    // adminToken 5 分钟窗：两次操作共享同一次 re-auth
+    expect(beginCalls(fetchMock)).toHaveLength(1);
+  });
+
+  it("移除机器：二次确认（断线提示）后才发 machine_remove", async () => {
+    const fetchMock = reauthFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    enableWebauthn(async () => fakeAssertion());
+    const fake = mountSessionApp();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "管理" }));
+    });
+    act(() => {
+      fake.recv({ v: 1, type: "machines_cfg", machines: [{ name: "mac-mini", pubkey_fp: "fp" }] });
+    });
+    fireEvent.click(screen.getByRole("button", { name: "移除" }));
+    expect(screen.getByText(/网关连接将被立即断开/)).toBeTruthy();
+    expect(sentOfType(fake, "machine_remove")).toHaveLength(0);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "确认移除" }));
+    });
+    expect(fake.sent).toContain(
+      JSON.stringify({ v: 1, type: "machine_remove", adminToken: ADMIN_TOK, name: "mac-mini" }),
+    );
+  });
+
+  it("令牌轮换：确认警告 → user_token_rotate → 结果弹层一次性显示（复制按钮 + env 落点提示）→ 关闭即失", async () => {
+    const fetchMock = reauthFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    enableWebauthn(async () => fakeAssertion());
+    const fake = mountSessionApp();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "管理" }));
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "轮换访问令牌" }));
+    expect(screen.getByText(/旧访问令牌立即失效/)).toBeTruthy(); // 二次确认警告
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "确认轮换" }));
+    });
+    expect(fake.sent).toContain(
+      JSON.stringify({ v: 1, type: "user_token_rotate", adminToken: ADMIN_TOK }),
+    );
+
+    act(() => {
+      fake.recv({ v: 1, type: "user_token_rotated", token: "ff".repeat(32) });
+    });
+    const modal = screen.getByRole("alertdialog", { name: "访问令牌已轮换" });
+    expect(within(modal).getByText(/仅显示这一次/)).toBeTruthy();
+    expect(within(modal).getByText("~/.imagent/web-relay.env")).toBeTruthy();
+    expect(within(modal).getByText("ff".repeat(32))).toBeTruthy();
+    expect(within(modal).getByRole("button", { name: "复制令牌" })).toBeTruthy();
+
+    fireEvent.click(within(modal).getByRole("button", { name: "我已保存，关闭" }));
+    expect(screen.queryByText("ff".repeat(32))).toBeNull(); // 一次性：关闭即失
+  });
+
+  it("admin_auth_required：作废本地 adminToken 引导重试；下一操作自动重新 re-auth", async () => {
+    const fetchMock = reauthFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    enableWebauthn(async () => fakeAssertion());
+    const fake = mountSessionApp();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "管理" }));
+    });
+    expect(beginCalls(fetchMock)).toHaveLength(1);
+
+    act(() => {
+      fake.recv({ v: 1, type: "error", code: "admin_auth_required" });
+    });
+    expect(screen.getByText(/管理验证已过期，请重试操作/)).toBeTruthy();
+
+    // 重试（刷新机器列表）→ 第二次 re-auth
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "刷新" }));
+    });
+    expect(beginCalls(fetchMock)).toHaveLength(2);
+    expect(sentOfType(fake, "machine_list")).toHaveLength(2);
+  });
+
+  it("re-auth 用户取消：adminError 提示、不发管理帧", async () => {
+    const fetchMock = reauthFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    enableWebauthn(async () => {
+      throw new DOMException("canceled", "NotAllowedError");
+    });
+    const fake = mountSessionApp();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "管理" }));
+    });
+    expect(screen.getByText(/已取消管理验证/)).toBeTruthy();
+    expect(sentOfType(fake, "machine_list")).toHaveLength(0);
+  });
+
+  it("无 WebAuthn 能力：面板提示需通行钥匙，machine_list 不发（设备/钥匙列表照常拉取）", () => {
+    const fake = mountSessionApp();
+    fireEvent.click(screen.getByRole("button", { name: "管理" }));
+    expect(screen.getAllByText(/本浏览器不支持通行钥匙/).length).toBeGreaterThan(0);
+    expect(sentOfType(fake, "machine_list")).toHaveLength(0);
+    expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "device_list" }));
+    expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "cred_list" }));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.5 新设备配对：登录页入口（新设备侧）+ 批准侧
+// ---------------------------------------------------------------------------
+
+describe("App 新设备配对流（v1.5）", () => {
+  /** 从登录页发起配对（open 后返回配对连接的 fake）。 */
+  function startPairing(device: string): FakeWebSocket {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: /我是新设备/ }));
+    fireEvent.change(screen.getByLabelText("设备名（可选）"), { target: { value: device } });
+    fireEvent.click(screen.getByRole("button", { name: "开始配对" }));
+    const fake = FakeWebSocket.latest as FakeWebSocket;
+    act(() => fake.emit("open"));
+    return fake;
+  }
+
+  it("hello{pairing} 字节级（无凭证）；pairing_pending → 等待码大字 + 倒计时", () => {
+    const fake = startPairing("新 iPad");
+    expect(fake.sent[0]).toBe(
+      JSON.stringify({ v: 1, type: "hello", pairing: true, device: "新 iPad" }),
+    );
+    expect(screen.getByText("正在连接中继…")).toBeTruthy();
+    act(() => {
+      fake.recv({ v: 1, type: "pairing_pending", code: "483920" });
+    });
+    expect(screen.getByLabelText("配对等待码").textContent).toBe("483920");
+    expect(screen.getByLabelText("配对等待倒计时")).toBeTruthy();
+  });
+
+  it("批准进入：配对连接收 hello_ack.session → 存 session 并以会话形态重连", () => {
+    const fake = startPairing("新 iPad");
+    act(() => {
+      fake.recv({ v: 1, type: "pairing_pending", code: "111111" });
+      fake.recv({
+        v: 1,
+        type: "hello_ack",
+        role: "user",
+        session: { id: "sid-p", token: "tok-p", expiresAt: Date.now() + 30 * 86_400_000 },
+      });
+    });
+    // session 持久化；配对连接被替换为新连接（hello 用 session 形态）
+    expect(JSON.parse(localStorage.getItem("imagent.session") ?? "null")).toMatchObject({
+      id: "sid-p",
+      token: "tok-p",
+    });
+    const next = FakeWebSocket.latest as FakeWebSocket;
+    expect(next).not.toBe(fake);
+    act(() => {
+      next.emit("open");
+      next.recv({
+        v: 1,
+        type: "hello_ack",
+        role: "user",
+        session: { id: "sid-p", token: "tok-p", expiresAt: Date.now() + 30 * 86_400_000 },
+      });
+    });
+    expect(next.sent).toContain(JSON.stringify({ v: 1, type: "hello", session: "tok-p" }));
+    expect(screen.getByText("已连接")).toBeTruthy();
+  });
+
+  it("被拒绝：close 1008 pairing denied → 回登录页并提示", () => {
+    const fake = startPairing("新 iPad");
+    act(() => {
+      fake.emit("close", { code: 1008, reason: "pairing denied" });
+    });
+    expect(screen.getByRole("alert").textContent).toContain("配对已被拒绝");
+    expect(screen.getByLabelText("访问令牌（USER_TOKEN）")).toBeTruthy();
+  });
+
+  it("取消配对：返回登录页并关闭配对连接", () => {
+    const fake = startPairing("新 iPad");
+    act(() => {
+      fake.recv({ v: 1, type: "pairing_pending", code: "111111" });
+    });
+    fireEvent.click(screen.getByRole("button", { name: "取消配对" }));
+    expect(screen.getByLabelText("访问令牌（USER_TOKEN）")).toBeTruthy();
+    expect(fake.closedWith.length).toBeGreaterThan(0);
+  });
+});
+
+describe("App 配对批准侧（v1.5）", () => {
+  const ADMIN_TOK = "at".repeat(32);
+
+  function enableWebauthn(get: () => Promise<unknown>): void {
+    vi.stubGlobal("PublicKeyCredential", class PublicKeyCredential {});
+    Object.defineProperty(navigator, "credentials", {
+      value: {
+        get,
+        create: async () => {
+          throw new Error("本用例不触发 create");
+        },
+      },
+      configurable: true,
+    });
+  }
+
+  function fakeAssertion(): unknown {
+    const enc = (s: string) => new TextEncoder().encode(s);
+    return {
+      id: "cred-1",
+      rawId: enc("raw-cred"),
+      type: "public-key",
+      response: {
+        authenticatorData: enc("auth-data"),
+        clientDataJSON: enc("{}"),
+        signature: enc("sig"),
+        userHandle: enc("user"),
+      },
+    };
+  }
+
+  function reauthFetch(): ReturnType<typeof vi.fn> {
+    return vi.fn(async (url: string | URL | Request) => {
+      const u = typeof url === "string" ? url : url.toString();
+      if (u.includes("webauthn/reauth/begin")) {
+        return new Response(
+          JSON.stringify({
+            beginId: "rb-1",
+            publicKey: { rpId: "localhost", challenge: "Zm9vYmFy", allowCredentials: [] },
+          }),
+          { status: 200 },
+        );
+      }
+      if (u.includes("webauthn/reauth/complete")) {
+        return new Response(
+          JSON.stringify({ adminToken: ADMIN_TOK, expiresAt: Math.floor(Date.now() / 1000) + 300 }),
+          { status: 200 },
+        );
+      }
+      return new Response("{}", { status: 404 });
+    }) as unknown as ReturnType<typeof vi.fn>;
+  }
+
+  function mountSessionApp(): FakeWebSocket {
+    localStorage.setItem(
+      "imagent.session",
+      JSON.stringify({ id: "sid-r", token: "st-r", expiresAt: Date.now() + 20 * 86_400_000 }),
+    );
+    render(<App />);
+    const fake = FakeWebSocket.latest as FakeWebSocket;
+    act(() => {
+      fake.emit("open");
+      fake.recv({
+        v: 1,
+        type: "hello_ack",
+        role: "user",
+        session: { id: "sid-r", token: "st-r", expiresAt: Date.now() + 20 * 86_400_000 },
+      });
+    });
+    return fake;
+  }
+
+  const sentOfType = (fake: FakeWebSocket, t: string) =>
+    fake.sent.filter((s) => (JSON.parse(s) as { type: string }).type === t);
+
+  afterEach(() => {
+    __resetAdminToken();
+  });
+
+  it("pairing_request → 顶部卡（设备名+码）；允许走 re-auth → pairing_approve 帧后卡消失", async () => {
+    const fetchMock = reauthFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    enableWebauthn(async () => fakeAssertion());
+    const fake = mountSessionApp();
+
+    act(() => {
+      fake.recv({
+        v: 1,
+        type: "pairing_request",
+        code: "483920",
+        device: "iPhone/Safari",
+        expiresAt: Math.floor(Date.now() / 1000) + 300,
+      });
+    });
+    const card = screen.getByRole("alertdialog", { name: "新设备配对请求" });
+    expect(within(card).getByText("iPhone/Safari")).toBeTruthy();
+    expect(within(card).getByLabelText("配对请求码").textContent).toBe("483920");
+
+    await act(async () => {
+      fireEvent.click(within(card).getByRole("button", { name: "允许" }));
+    });
+    expect(fake.sent).toContain(
+      JSON.stringify({ v: 1, type: "pairing_approve", adminToken: ADMIN_TOK, code: "483920" }),
+    );
+    expect(screen.queryByRole("alertdialog", { name: "新设备配对请求" })).toBeNull();
+  });
+
+  it("拒绝（同样管理级 re-auth）→ pairing_deny 帧", async () => {
+    const fetchMock = reauthFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    enableWebauthn(async () => fakeAssertion());
+    const fake = mountSessionApp();
+    act(() => {
+      fake.recv({ v: 1, type: "pairing_request", code: "222222", device: "Mac/Chrome" });
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "拒绝" }));
+    });
+    expect(fake.sent).toContain(
+      JSON.stringify({ v: 1, type: "pairing_deny", adminToken: ADMIN_TOK, code: "222222" }),
+    );
+    expect(screen.queryByRole("alertdialog", { name: "新设备配对请求" })).toBeNull();
+  });
+
+  it("re-auth 取消：不发帧、卡片保留并给出提示", async () => {
+    const fetchMock = reauthFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    enableWebauthn(async () => {
+      throw new DOMException("canceled", "NotAllowedError");
+    });
+    const fake = mountSessionApp();
+    act(() => {
+      fake.recv({ v: 1, type: "pairing_request", code: "333333", device: "Mac/Chrome" });
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "允许" }));
+    });
+    expect(sentOfType(fake, "pairing_approve")).toHaveLength(0);
+    expect(screen.getByRole("alertdialog", { name: "新设备配对请求" })).toBeTruthy();
+    expect(screen.getByText(/已取消管理验证/)).toBeTruthy();
+  });
+
+  it("同码广播重放幂等：只弹一张卡", () => {
+    const fake = mountSessionApp();
+    act(() => {
+      fake.recv({ v: 1, type: "pairing_request", code: "444444", device: "A" });
+      fake.recv({ v: 1, type: "pairing_request", code: "444444", device: "A" });
+    });
+    expect(screen.getAllByLabelText("配对请求码")).toHaveLength(1);
   });
 });

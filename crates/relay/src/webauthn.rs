@@ -377,6 +377,13 @@ enum Ceremony {
     Login {
         state: PasskeyAuthentication,
     },
+    /// re-auth（管理门槛）：断言验证通过**不建会话**，只换发 5 分钟
+    /// adminToken（管理帧门槛，见 [`AdminTokenTable`]）。
+    Reauth {
+        state: PasskeyAuthentication,
+        /// 发起 re-auth 的会话 id：complete 必须同一会话。
+        session_id: String,
+    },
 }
 
 struct ChallengeEntry {
@@ -424,6 +431,46 @@ impl ChallengeTable {
 /// 滑出过期条目（进出都顺带清，表不积压）。
 fn purge_expired(st: &mut HashMap<String, ChallengeEntry>, now: Instant) {
     st.retain(|_, e| now < e.expires_at);
+}
+
+// ---------------------------------------------------------------------------
+// admin 令牌表（re-auth 产物，内存态、5 分钟窗）
+// ---------------------------------------------------------------------------
+
+/// re-auth（管理门槛）换发的 adminToken 有效期：5 分钟（任务定案）——
+/// 管理操作（机器增删/令牌轮换/配对批准）须 passkey 二次验证后短时间内
+/// 完成，过期重新 re-auth。
+const ADMIN_TOKEN_TTL_SECS: u64 = 5 * 60;
+
+/// admin 令牌表（内存 `HashMap<token, expires>`，任务定案复用 challenge
+/// 表模式）：token 为 32B hex 明文键（生命周期 ≤5 分钟的内存态，与
+/// challenge 同级，无落盘面）；verify 单次判定（**非**单次消费——管理
+/// 弹层内连续多个操作共享同一 5 分钟窗）。时间注入（单测拨钟）。
+#[derive(Default)]
+pub(crate) struct AdminTokenTable {
+    map: Mutex<HashMap<String, u64>>,
+}
+
+impl AdminTokenTable {
+    /// 换发：32B 随机 → 64 hex，`expires = now + 5min`。先清过期（表有界）。
+    pub(crate) fn issue(&self, now: u64) -> (String, u64) {
+        use rand::RngCore;
+        let mut buf = [0u8; 32];
+        rand::rng().fill_bytes(&mut buf);
+        let token = hex::encode(buf);
+        let expires = now.saturating_add(ADMIN_TOKEN_TTL_SECS);
+        let mut st = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        st.retain(|_, exp| *exp > now);
+        st.insert(token.clone(), expires);
+        (token, expires)
+    }
+
+    /// 管理帧校验：存在且未过期。顺带清过期条目。
+    pub(crate) fn verify(&self, token: &str, now: u64) -> bool {
+        let mut st = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        st.retain(|_, exp| *exp > now);
+        st.contains_key(token)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -534,6 +581,8 @@ pub(crate) struct WebauthnState {
     creds: CredStore,
     challenges: ChallengeTable,
     limiter: BeginRateLimiter,
+    /// re-auth 换发的 adminToken 表（管理帧门槛，5 分钟窗）。
+    pub(crate) admin_tokens: AdminTokenTable,
     /// `IMAGENT_RELAY_RP_ID`（缺省 None = 按 Host 推导）。
     rp_id_override: Option<String>,
 }
@@ -544,6 +593,7 @@ impl WebauthnState {
             creds: CredStore::load(state_dir),
             challenges: ChallengeTable::default(),
             limiter: BeginRateLimiter::default(),
+            admin_tokens: AdminTokenTable::default(),
             rp_id_override,
         }
     }
@@ -912,6 +962,161 @@ pub(crate) async fn login_complete(
         .into_response()
 }
 
+/// POST /webauthn/reauth/begin（管理门槛 re-auth 第一段）：**已登录才能
+/// 发起**（`Authorization: Bearer <sessionToken>`），复用登录的 challenge
+/// 机制（60s 单次消费 + per-IP 限流）。响应与 login/begin 同形
+/// `{"beginId","publicKey":{RequestChallengeResponse}}`（allowCredentials
+/// 恒空——discoverable 形态）。
+pub(crate) async fn reauth_begin(
+    State(st): State<RelayState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let session_id = match auth_session(&st, &headers) {
+        Ok(id) => id,
+        Err(resp) => return *resp, // 未登录 / 会话失效 → 401
+    };
+    if !st
+        .webauthn
+        .limiter
+        .allow(&rate_limit_key(&headers, peer), Instant::now())
+    {
+        return err_json(StatusCode::TOO_MANY_REQUESTS, "rate_limited", None);
+    }
+    if st.webauthn.creds.is_empty() {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "no_credentials",
+            Some("尚未注册任何通行钥匙：re-auth 依赖 passkey，请先用访问令牌登录并注册"),
+        );
+    }
+    let Some((rp_id, origin)) = derive_rp(&headers, st.webauthn.rp_id_override.as_deref()) else {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            Some("缺少 Host，无法推导 RP"),
+        );
+    };
+    let Ok(webauthn) = build_webauthn(&rp_id, &origin) else {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "rp_unsupported",
+            Some("rp_id 非法（IP 直连形态不受支持）：本地 http 直连请改用 localhost 主机名，或设 IMAGENT_RELAY_RP_ID"),
+        );
+    };
+    let passkeys = st.webauthn.creds.passkeys();
+    let (rcr, state) = match webauthn.start_passkey_authentication(&passkeys) {
+        Ok(x) => x,
+        Err(e) => {
+            tracing::warn!(target: TARGET, error = ?e, "webauthn re-auth challenge 生成失败");
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, "server_error", None);
+        }
+    };
+    let begin_id = Uuid::new_v4().to_string();
+    st.webauthn.challenges.insert(
+        begin_id.clone(),
+        Ceremony::Reauth {
+            state,
+            session_id: session_id.clone(),
+        },
+        rp_id,
+        origin,
+        Instant::now(),
+    );
+    // 与 login/begin 同款：allowCredentials 恒空（discoverable）。
+    let mut public_key = match serde_json::to_value(&rcr) {
+        Ok(v) => v
+            .get("publicKey")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        Err(_) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "server_error", None),
+    };
+    public_key["allowCredentials"] = serde_json::json!([]);
+    tracing::info!(target: TARGET, session = %session_id, "passkey re-auth begin");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "beginId": begin_id, "publicKey": public_key })),
+    )
+        .into_response()
+}
+
+/// POST /webauthn/reauth/complete（管理门槛 re-auth 收口）：Bearer 同
+/// begin（须同一会话）+ 断言 → 验签（**不建会话**）→ 换发 5 分钟
+/// adminToken。成功 200 `{"adminToken":"<64hex>","expiresAt":<unix秒>}`
+///（明文只此一次）；计数器/备份标志照常回写（克隆检测不分 ceremony）。
+pub(crate) async fn reauth_complete(
+    State(st): State<RelayState>,
+    headers: HeaderMap,
+    Json(body): Json<CompleteBody>,
+) -> Response {
+    let session_id = match auth_session(&st, &headers) {
+        Ok(id) => id,
+        Err(resp) => return *resp,
+    };
+    let (ceremony, rp_id, origin) =
+        match st.webauthn.challenges.take(&body.begin_id, Instant::now()) {
+            Some(x) => x,
+            None => return err_json(StatusCode::BAD_REQUEST, "challenge_invalid", None),
+        };
+    let Ceremony::Reauth {
+        state,
+        session_id: begin_session,
+    } = ceremony
+    else {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "challenge_invalid",
+            Some("challenge 类型不匹配"),
+        );
+    };
+    if begin_session != session_id {
+        return err_json(StatusCode::UNAUTHORIZED, "unauthorized", None);
+    }
+    let webauthn = match build_webauthn(&rp_id, &origin) {
+        Ok(w) => w,
+        Err(_) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "server_error", None),
+    };
+    let assertion = match serde_json::from_value::<webauthn_rs::prelude::PublicKeyCredential>(
+        body.credential,
+    ) {
+        Ok(a) => a,
+        Err(_) => return err_json(StatusCode::BAD_REQUEST, "invalid_credential", None),
+    };
+    let result = match webauthn.finish_passkey_authentication(&assertion, &state) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::info!(target: TARGET, error = ?e, "passkey re-auth 验签失败");
+            return err_json(StatusCode::UNAUTHORIZED, "verification_failed", None);
+        }
+    };
+    if st
+        .webauthn
+        .creds
+        .label_of(result.cred_id().as_ref())
+        .is_none()
+    {
+        // 与 login_complete 同款：challenge 持有的凭证在 begin 后被删除。
+        tracing::info!(target: TARGET, "passkey re-auth 命中已删除凭证，拒绝");
+        return err_json(StatusCode::UNAUTHORIZED, "verification_failed", None);
+    }
+    st.webauthn.creds.update_credential(&result);
+    let (admin_token, expires_at) = st.webauthn.admin_tokens.issue(unix_now());
+    tracing::info!(
+        target: TARGET,
+        session = %session_id.chars().take(8).collect::<String>(),
+        expires_at,
+        "passkey re-auth 成功（换发 adminToken，5 分钟窗）"
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "adminToken": admin_token,
+            "expiresAt": expires_at,
+        })),
+    )
+        .into_response()
+}
+
 /// cred_list 帧载荷（lib.rs WS 管理帧分拣调用）：`{"v":1,"type":"creds",
 /// "credentials":[{id,label,created}]}`。
 pub(crate) fn creds_frame(creds: &[CredView]) -> String {
@@ -937,13 +1142,16 @@ pub(crate) fn handle_cred_frame(st: &RelayState, kind: &str, cred_id: &str) -> S
 }
 
 /// 组装 WebAuthn HTTP 路由（裸路径 + /imagent 前缀两形态，对齐 WS 端点：
-/// Caddy strip 后走裸路径，本地直连走前缀）。
+/// Caddy strip 后走裸路径，本地直连走前缀）。re-auth（管理门槛）两端点
+/// 与注册/登录同款形态。
 pub(crate) fn routes() -> Router<crate::RelayState> {
     Router::new()
         .route("/webauthn/register/begin", post(register_begin))
         .route("/webauthn/register/complete", post(register_complete))
         .route("/webauthn/login/begin", post(login_begin))
         .route("/webauthn/login/complete", post(login_complete))
+        .route("/webauthn/reauth/begin", post(reauth_begin))
+        .route("/webauthn/reauth/complete", post(reauth_complete))
         .route("/imagent/webauthn/register/begin", post(register_begin))
         .route(
             "/imagent/webauthn/register/complete",
@@ -951,6 +1159,8 @@ pub(crate) fn routes() -> Router<crate::RelayState> {
         )
         .route("/imagent/webauthn/login/begin", post(login_begin))
         .route("/imagent/webauthn/login/complete", post(login_complete))
+        .route("/imagent/webauthn/reauth/begin", post(reauth_begin))
+        .route("/imagent/webauthn/reauth/complete", post(reauth_complete))
 }
 
 /// 进程级 WebAuthn 状态构造（spawn_relay 调用）。
@@ -1137,5 +1347,28 @@ mod tests {
         assert_eq!(user, store.user_uuid(), "user_uuid 一旦生成即稳定");
         assert!(!dir.join(CREDENTIALS_FILE).exists(), "未注册前不写盘");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// admin 令牌表：换发（64 hex + now+300）/ 窗口内多次 verify（非单次
+    /// 消费——管理弹层内连续操作共享同一窗）/ 未知 token 拒 / 5 分钟整点
+    /// 过期 / 过期条目被顺带清理（表有界）。
+    #[test]
+    fn admin_token_table_issue_verify_window() {
+        let table = AdminTokenTable::default();
+        let now = 1_000u64;
+        let (token, expires) = table.issue(now);
+        assert_eq!(token.len(), 64, "32B hex");
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(expires, now + ADMIN_TOKEN_TTL_SECS, "5 分钟窗");
+        assert!(table.verify(&token, now + 60), "窗口内有效");
+        assert!(table.verify(&token, now + 60), "非单次消费（同窗可复用）");
+        assert!(!table.verify("nobody", now), "未知 token 拒");
+        assert!(!table.verify("", now), "空 token 拒");
+        // 边界：expiresAt 时刻已过期（> now 才存活）。
+        assert!(!table.verify(&token, expires), "5 分钟整点过期");
+        // 过期条目被后续 verify/issue 顺带清理。
+        let (token2, _) = table.issue(expires + 1);
+        assert!(table.verify(&token2, expires + 2));
+        assert!(!table.verify(&token, expires + 2), "旧 token 过期即失效");
     }
 }

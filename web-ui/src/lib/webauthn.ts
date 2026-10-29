@@ -1,6 +1,7 @@
 // passkey（WebAuthn）客户端（v1.3）：登录页「使用通行钥匙」入口 + 设备管理
-// 「添加通行钥匙」注册流程。HTTP 端点走同源 fetch（CSP connect-src 'self'
-// 已覆盖），两阶段 ceremony：
+// 「添加通行钥匙」注册流程；v1.5 增管理级再验证 passkeyReauth（/webauthn/
+// reauth/{begin,complete}，产物 adminToken 见 lib/admin.ts）。HTTP 端点走同源
+// fetch（CSP connect-src 'self' 已覆盖），两阶段 ceremony：
 //   begin → navigator.credentials.{get,create} → complete
 // 响应里的 challenge/user.id/allowCredentials id 是 base64url 字符串，
 // 浏览器 credentials API 要 ArrayBuffer——本模块做双向转换（凭证回传的
@@ -263,6 +264,63 @@ export interface RegisteredPasskey {
   id: string;
   label: string;
   created?: number;
+}
+
+/** re-auth 结果（v1.5）：adminToken 5 分钟有效（内存态，绝不落盘）。 */
+export interface AdminGrant {
+  adminToken: string;
+  /** unix 秒（relay 签发口径）。 */
+  expiresAt: number;
+}
+
+/** 管理级再验证（v1.5）：begin（Bearer sessionToken，body 空）→
+ *  credentials.get → complete → {adminToken, expiresAt}。与登录同构但不建
+ *  会话——产物是 5 分钟管理令牌，用于管理帧（machine_list、machine_add、
+ *  machine_remove、user_token_rotate、pairing_approve、pairing_deny）的
+ *  adminToken 字段。 */
+export async function passkeyReauth(
+  sessionToken: string,
+  opts: {
+    fetchImpl?: typeof fetch;
+    credentials?: CredentialsApi;
+    base?: string;
+  } = {},
+): Promise<AdminGrant> {
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const credentials = opts.credentials ?? defaultCredentials();
+  const base = opts.base ?? defaultBase();
+
+  const begin = await postJson(base, "webauthn/reauth/begin", {}, fetchImpl, sessionToken);
+  if (begin.status !== 200) {
+    throw httpError(begin.status, begin.payload);
+  }
+  const { beginId, publicKey } = begin.payload as unknown as BeginResponse;
+
+  let assertion: unknown;
+  try {
+    assertion = await credentials.get(toGetOptions(publicKey));
+  } catch (e) {
+    throw new PasskeyError("aborted", e instanceof Error ? e.message : "认证器调用失败");
+  }
+  if (!assertion) {
+    throw new PasskeyError("no_credential", "未找到可用通行钥匙");
+  }
+
+  const done = await postJson(
+    base,
+    "webauthn/reauth/complete",
+    { beginId, credential: assertionToJson(assertion) },
+    fetchImpl,
+    sessionToken,
+  );
+  if (done.status !== 200) {
+    throw httpError(done.status, done.payload);
+  }
+  const { adminToken, expiresAt } = done.payload as unknown as AdminGrant;
+  if (typeof adminToken !== "string" || adminToken === "" || typeof expiresAt !== "number") {
+    throw new PasskeyError("bad_response", "管理验证响应异常");
+  }
+  return { adminToken, expiresAt };
 }
 
 /** passkey 注册：begin（Bearer sessionToken + label）→ credentials.create →

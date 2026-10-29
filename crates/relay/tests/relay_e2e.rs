@@ -24,7 +24,8 @@ use std::time::Duration;
 use ed25519_dalek::{Signer, SigningKey};
 use futures::{SinkExt, StreamExt};
 use imagent_relay::{
-    spawn_relay, GatewayKeys, GatewayTokens, RelayConfig, RelayHandle, DEFAULT_SESSION_TTL_SECS,
+    spawn_relay, GatewayKeys, GatewayTokens, RelayConfig, RelayHandle, DEFAULT_PAIRING_TTL_SECS,
+    DEFAULT_SESSION_TTL_SECS,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::http::Request;
@@ -75,6 +76,7 @@ fn test_config(state_dir: &std::path::Path, session_ttl_secs: u64) -> RelayConfi
         user_token: USER_TOKEN.to_string(),
         state_dir: state_dir.to_path_buf(),
         session_ttl_secs,
+        pairing_ttl_secs: DEFAULT_PAIRING_TTL_SECS,
         webauthn_rp_id: None, // rp_id 按请求 Host（localhost）推导
     }
 }
@@ -225,6 +227,7 @@ fn key_only_config(
         user_token: USER_TOKEN.to_string(),
         state_dir: state_dir.to_path_buf(),
         session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
+        pairing_ttl_secs: DEFAULT_PAIRING_TTL_SECS,
         webauthn_rp_id: None,
     }
 }
@@ -456,6 +459,7 @@ async fn e2e_gateway_dual_tables_coexist() {
         user_token: USER_TOKEN.to_string(),
         state_dir: dir.clone(),
         session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
+        pairing_ttl_secs: DEFAULT_PAIRING_TTL_SECS,
         webauthn_rp_id: None,
     };
     let handle = spawn_with_config(config).await;
@@ -1763,6 +1767,7 @@ async fn e2e_gateway_token_machine_binding() {
         user_token: USER_TOKEN.to_string(),
         state_dir: dir.clone(),
         session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
+        pairing_ttl_secs: DEFAULT_PAIRING_TTL_SECS,
         webauthn_rp_id: None,
     })
     .await;
@@ -2582,4 +2587,794 @@ async fn e2e_enc_frame_sid_targeting() {
 
     handle.shutdown();
     handle.wait().await;
+}
+
+// ---------------------------------------------------------------------------
+// 管理批：存储权威迁移（machines.json / user_token_hash）+ re-auth +
+// 管理帧 + 新设备配对
+// ---------------------------------------------------------------------------
+
+/// 管理批公共辅助：注册 passkey（已登录会话 + 软认证器真签名）。
+async fn register_passkey(
+    addr: &SocketAddr,
+    session_token: &str,
+    soft: &mut SoftAuthenticator,
+    label: &str,
+) {
+    let (status, begin) = post_json(
+        addr,
+        "/webauthn/register/begin",
+        Some(session_token),
+        &serde_json::json!({ "label": label }),
+    )
+    .await;
+    assert_eq!(status, "200", "{begin}");
+    let credential = soft.register(&begin["publicKey"], "http://localhost");
+    let (status, done) = post_json(
+        addr,
+        "/webauthn/register/complete",
+        Some(session_token),
+        &serde_json::json!({
+            "beginId": begin["beginId"].as_str().unwrap(),
+            "credential": credential
+        }),
+    )
+    .await;
+    assert_eq!(status, "200", "{done}");
+}
+
+/// 管理批公共辅助：re-auth 全流程（begin → 软认证器断言 → complete）→
+/// 返回 (adminToken, expiresAt)。
+async fn reauth_admin_token(
+    addr: &SocketAddr,
+    session_token: &str,
+    soft: &mut SoftAuthenticator,
+) -> (String, u64) {
+    let (status, begin) = post_json(
+        addr,
+        "/webauthn/reauth/begin",
+        Some(session_token),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, "200", "{begin}");
+    assert_eq!(
+        begin["publicKey"]["allowCredentials"]
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "re-auth discoverable（allowCredentials 空）：{begin}"
+    );
+    let assertion = soft.assert_credential(&begin["publicKey"], "http://localhost");
+    let (status, done) = post_json(
+        addr,
+        "/webauthn/reauth/complete",
+        Some(session_token),
+        &serde_json::json!({
+            "beginId": begin["beginId"].as_str().unwrap(),
+            "credential": assertion
+        }),
+    )
+    .await;
+    assert_eq!(status, "200", "{done}");
+    let token = done["adminToken"].as_str().expect("adminToken").to_string();
+    assert_eq!(token.len(), 64, "32B hex：{done}");
+    assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+    let expires = done["expiresAt"].as_u64().expect("expiresAt");
+    (token, expires)
+}
+
+/// 登录并注册 passkey + re-auth 的「管理员就绪」组合（管理帧用例公共前
+/// 置）：返回 (WS, sessionToken, adminToken)。
+async fn admin_browser_ready(
+    addr: &SocketAddr,
+    soft: &mut SoftAuthenticator,
+) -> (Ws, String, String) {
+    let mut ws = connect_ws(addr, "/ws", None).await;
+    let s = login_session(&mut ws, Some("admin-device")).await;
+    let session_token = s["token"].as_str().unwrap().to_string();
+    register_passkey(addr, &session_token, soft, "admin passkey").await;
+    let (admin_token, _) = reauth_admin_token(addr, &session_token, soft).await;
+    (ws, session_token, admin_token)
+}
+
+/// 读下一条 error 帧，断言 code 并返回之。
+async fn expect_error(ws: &mut Ws, code: &str) -> serde_json::Value {
+    let v = next_of_type(ws, "error").await;
+    assert_eq!(v["code"], code, "{v}");
+    v
+}
+
+/// 断言 machines_cfg 帧的机器名集合（排序不敏感）。
+fn assert_machines_cfg(v: &serde_json::Value, want: &[&str]) {
+    let mut got: Vec<String> = v["machines"]
+        .as_array()
+        .unwrap_or_else(|| panic!("machines_cfg 应有 machines 数组：{v}"))
+        .iter()
+        .map(|m| m["name"].as_str().unwrap().to_string())
+        .collect();
+    let mut want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
+    got.sort();
+    want.sort();
+    assert_eq!(got, want, "machines_cfg：{v}");
+}
+
+/// 场景 41（管理批存储迁移）：env KEYS 首次种子导入 machines.json 并落盘；
+/// 重启后**文件权威**（env 换成别的机器被忽略——原机器可握手、env 新机器
+/// 不可）；种子落盘文件形状（顶层数组 + name/pubkey/created）。
+#[tokio::test]
+async fn e2e_machines_seed_import_and_file_authority() {
+    let dir = temp_state_dir();
+    let home = test_signing_key(1);
+
+    // 第一代：KEYS 种子 home → machines.json 落盘 + 种子机器可握手。
+    let handle = spawn_with_config(key_only_config(&dir, &[("home", home.clone())])).await;
+    let addr = handle.addr;
+    let mut gw = connect_ws(&addr, "/gateway", None).await;
+    gateway_key_handshake(&mut gw, "home", &home).await;
+    drop(gw);
+    handle.shutdown();
+    handle.wait().await;
+
+    // 落盘形状：[{"name":"home","pubkey":"<64hex>","created":…}]。
+    let raw = std::fs::read_to_string(dir.join("machines.json")).unwrap();
+    assert!(
+        raw.starts_with('[') && raw.contains(r#""name":"home""#),
+        "顶层数组 + name：{raw}"
+    );
+    assert!(
+        raw.contains(&pubkey_hex(&home)) && raw.contains(r#""created""#),
+        "{raw}"
+    );
+
+    // 第二代：env 换成 ghost 的公钥 → 文件权威（env 忽略）。
+    let ghost = test_signing_key(9);
+    let handle2 = spawn_with_config(key_only_config(&dir, &[("ghost", ghost.clone())])).await;
+    let addr2 = handle2.addr;
+    // home（只在文件）仍可握手。
+    let mut gw2 = connect_ws(&addr2, "/gateway", None).await;
+    gateway_key_handshake(&mut gw2, "home", &home).await;
+    // ghost（只在 env、不在文件）→ challenge 照发（anti-probe）但 prove 必
+    // 然验不过 → 1008。
+    let mut g3 = connect_ws(&addr2, "/gateway", None).await;
+    g3.send(Message::text(r#"{"v":1,"type":"hello","machine":"ghost"}"#))
+        .await
+        .unwrap();
+    let challenge = next_of_type(&mut g3, "challenge").await;
+    let nonce = challenge["nonce"].as_str().unwrap();
+    g3.send(Message::text(
+        serde_json::json!({
+            "v": 1, "type": "prove",
+            "pubkey": pubkey_hex(&ghost),
+            "signature": hex::encode(ghost.sign(nonce.as_bytes()).to_bytes()),
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    expect_close(&mut g3, 1008).await;
+
+    handle2.shutdown();
+    handle2.wait().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 场景 42（管理批 re-auth 全流程）：未登录 401 / begin+complete 真签名 →
+/// adminToken（64 hex + expiresAt≈now+300）/ 会话绑定（他人会话 complete
+/// 401）/ 未注册凭证断言 401 / machine_list 缺失、伪造 adminToken →
+/// admin_auth_required。
+#[tokio::test]
+async fn e2e_reauth_full_ceremony_and_admin_gate() {
+    let dir = temp_state_dir();
+    let handle = spawn_with_config(test_config(&dir, DEFAULT_SESSION_TTL_SECS)).await;
+    let addr = handle.addr;
+
+    // 未登录（无 Bearer / 伪 Bearer）→ 401。
+    let (status, _) = post_json(
+        &addr,
+        "/webauthn/reauth/begin",
+        None,
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, "401", "无 Bearer 不得发起 re-auth");
+    let (status, _) = post_json(
+        &addr,
+        "/webauthn/reauth/begin",
+        Some("not-a-session-token"),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, "401", "伪 sessionToken 401");
+
+    // 登录 + 注册 passkey → re-auth 全流程（软认证器真签名）。
+    let mut soft = SoftAuthenticator::new();
+    let mut ws = connect_ws(&addr, "/ws", None).await;
+    let s = login_session(&mut ws, Some("Mac")).await;
+    let session_token = s["token"].as_str().unwrap().to_string();
+    consume_browser_snapshots(&mut ws, false, &[]).await;
+    register_passkey(&addr, &session_token, &mut soft, "Mac Touch ID").await;
+
+    // 5 分钟窗断言（真实时钟 ±60s 容差）。
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let (admin_token, expires_at) = reauth_admin_token(&addr, &session_token, &mut soft).await;
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(
+        expires_at >= before + 240 && expires_at <= after + 300,
+        "5 分钟窗：expiresAt={expires_at} now∈[{before},{after}]"
+    );
+
+    // 会话绑定：A 会话发起的 beginId，以 B 会话身份 complete → 401（会话
+    // 间不抢 ceremony；断言签名本身有效——错在身份不匹配）。
+    let mut ws_b = connect_ws(&addr, "/ws", None).await;
+    let sb = login_session(&mut ws_b, Some("phone")).await;
+    let st_b = sb["token"].as_str().unwrap().to_string();
+    let (status, begin_a) = post_json(
+        &addr,
+        "/webauthn/reauth/begin",
+        Some(&session_token),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, "200", "{begin_a}");
+    let assertion = soft.assert_credential(&begin_a["publicKey"], "http://localhost");
+    let (status, done) = post_json(
+        &addr,
+        "/webauthn/reauth/complete",
+        Some(&st_b),
+        &serde_json::json!({
+            "beginId": begin_a["beginId"].as_str().unwrap(),
+            "credential": assertion
+        }),
+    )
+    .await;
+    assert_eq!(status, "401", "他人会话 complete 须 401：{done}");
+
+    // 未注册凭证的断言 → 401 verification_failed（表内公钥对不上）。
+    let mut stranger = SoftAuthenticator::new();
+    let (status, begin_c) = post_json(
+        &addr,
+        "/webauthn/reauth/begin",
+        Some(&session_token),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, "200");
+    let bad_assertion = stranger.assert_credential(&begin_c["publicKey"], "http://localhost");
+    let (status, done) = post_json(
+        &addr,
+        "/webauthn/reauth/complete",
+        Some(&session_token),
+        &serde_json::json!({
+            "beginId": begin_c["beginId"].as_str().unwrap(),
+            "credential": bad_assertion
+        }),
+    )
+    .await;
+    assert_eq!(status, "401", "未注册凭证断言 401：{done}");
+    assert_eq!(done["error"], "verification_failed", "{done}");
+
+    // 管理帧门槛：machine_list 缺 / 伪 adminToken → admin_auth_required；
+    // 有效 → machines_cfg。
+    ws.send(Message::text(r#"{"v":1,"type":"machine_list"}"#))
+        .await
+        .unwrap();
+    expect_error(&mut ws, "admin_auth_required").await;
+    ws.send(Message::text(
+        r#"{"v":1,"type":"machine_list","adminToken":"deadbeef"}"#,
+    ))
+    .await
+    .unwrap();
+    expect_error(&mut ws, "admin_auth_required").await;
+    ws.send(Message::text(format!(
+        r#"{{"v":1,"type":"machine_list","adminToken":"{admin_token}"}}"#
+    )))
+    .await
+    .unwrap();
+    let cfg = next_of_type(&mut ws, "machines_cfg").await;
+    assert_machines_cfg(&cfg, &[]);
+
+    handle.shutdown();
+    handle.wait().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 场景 43（管理批机器管理帧 + 热更新断线）：machine_add 正反例（格式/
+/// 重名 → machine_invalid + message）/ 新机器**无需重启**即可 key 握手接入
+/// / machine_remove 即时断开该机器网关（close 1008 "machine removed"）且
+/// 重连被拒 / 未知机器 remove 幂等回 machines_cfg。
+#[tokio::test]
+async fn e2e_machine_admin_frames_hot_update_and_disconnect() {
+    let dir = temp_state_dir();
+    let home = test_signing_key(1);
+    let mac2 = test_signing_key(2);
+    // KEYS 种子 home（tokens 空——key-only）+ 管理员浏览器。
+    let handle = spawn_with_config(key_only_config(&dir, &[("home", home.clone())])).await;
+    let addr = handle.addr;
+
+    let mut soft = SoftAuthenticator::new();
+    let (mut admin, _st, admin_token) = admin_browser_ready(&addr, &mut soft).await;
+    consume_browser_snapshots(&mut admin, false, &[]).await;
+
+    // machine_list：种子机器在列（指纹 = 公钥前 16 hex）。
+    admin
+        .send(Message::text(format!(
+            r#"{{"v":1,"type":"machine_list","adminToken":"{admin_token}"}}"#
+        )))
+        .await
+        .unwrap();
+    let cfg = next_of_type(&mut admin, "machines_cfg").await;
+    assert_machines_cfg(&cfg, &["home"]);
+    let entry = &cfg["machines"][0];
+    assert_eq!(entry["pubkey_fp"], pubkey_hex(&home)[..16], "{cfg}");
+    assert!(entry["created"].as_u64().is_some(), "{cfg}");
+
+    // machine_add 正例：new-mac → machines_cfg 含两台。
+    admin
+        .send(Message::text(format!(
+            r#"{{"v":1,"type":"machine_add","adminToken":"{admin_token}","name":"new-mac","pubkey":"{}"}}"#,
+            pubkey_hex(&mac2)
+        )))
+        .await
+        .unwrap();
+    let cfg = next_of_type(&mut admin, "machines_cfg").await;
+    assert_machines_cfg(&cfg, &["home", "new-mac"]);
+
+    // 反例：重名 / 非法名 / 非法公钥 / 缺字段 → machine_invalid + message。
+    for (frame, needle) in [
+        (
+            format!(
+                r#"{{"v":1,"type":"machine_add","adminToken":"{admin_token}","name":"home","pubkey":"{}"}}"#,
+                pubkey_hex(&test_signing_key(3))
+            ),
+            "已存在",
+        ),
+        (
+            format!(
+                r#"{{"v":1,"type":"machine_add","adminToken":"{admin_token}","name":"bad name!","pubkey":"{}"}}"#,
+                pubkey_hex(&test_signing_key(3))
+            ),
+            "非法",
+        ),
+        (
+            format!(
+                r#"{{"v":1,"type":"machine_add","adminToken":"{admin_token}","name":"m3","pubkey":"xyz"}}"#
+            ),
+            "hex",
+        ),
+        (
+            format!(r#"{{"v":1,"type":"machine_add","adminToken":"{admin_token}"}}"#),
+            "非法",
+        ),
+    ] {
+        admin.send(Message::text(frame)).await.unwrap();
+        let err = expect_error(&mut admin, "machine_invalid").await;
+        assert!(
+            err["message"].as_str().is_some_and(|m| m.contains(needle)),
+            "{err}（应含 {needle}）"
+        );
+    }
+
+    // 热更新生效：new-mac 不重启 relay 即可 key 握手接入。
+    let mut gw = connect_ws(&addr, "/gateway", None).await;
+    gateway_key_handshake(&mut gw, "new-mac", &mac2).await;
+
+    // machine_remove：即时断开 new-mac 的网关连接（1008 machine removed）。
+    admin
+        .send(Message::text(format!(
+            r#"{{"v":1,"type":"machine_remove","adminToken":"{admin_token}","name":"new-mac"}}"#
+        )))
+        .await
+        .unwrap();
+    let close = expect_close(&mut gw, 1008).await;
+    assert!(
+        close.reason.contains("machine removed"),
+        "close reason：{}",
+        close.reason
+    );
+    let cfg = next_of_type(&mut admin, "machines_cfg").await;
+    assert_machines_cfg(&cfg, &["home"]);
+    // 被删机器重连被拒（prove 验不过）。
+    let mut gw2 = connect_ws(&addr, "/gateway", None).await;
+    gw2.send(Message::text(
+        r#"{"v":1,"type":"hello","machine":"new-mac"}"#,
+    ))
+    .await
+    .unwrap();
+    let challenge = next_of_type(&mut gw2, "challenge").await;
+    let nonce = challenge["nonce"].as_str().unwrap();
+    gw2.send(Message::text(
+        serde_json::json!({
+            "v": 1, "type": "prove",
+            "pubkey": pubkey_hex(&mac2),
+            "signature": hex::encode(mac2.sign(nonce.as_bytes()).to_bytes()),
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    expect_close(&mut gw2, 1008).await;
+
+    // 未知机器 remove：幂等回 machines_cfg（不报错）。
+    admin
+        .send(Message::text(format!(
+            r#"{{"v":1,"type":"machine_remove","adminToken":"{admin_token}","name":"nobody"}}"#
+        )))
+        .await
+        .unwrap();
+    let cfg = next_of_type(&mut admin, "machines_cfg").await;
+    assert_machines_cfg(&cfg, &["home"]);
+
+    // machine_remove 缺 adminToken → admin_auth_required。
+    admin
+        .send(Message::text(
+            r#"{"v":1,"type":"machine_remove","name":"home"}"#,
+        ))
+        .await
+        .unwrap();
+    expect_error(&mut admin, "admin_auth_required").await;
+
+    handle.shutdown();
+    handle.wait().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 场景 44（管理批 USER_TOKEN 轮换与哈希权威）：种子写哈希文件（内容 =
+/// sha256）/ user_token_rotate 新 token 明文仅此一次 / 旧 token 即刻失效 /
+/// 既有 sessionToken 不受轮换影响 / 重启后文件权威（env 换值被忽略）。
+#[tokio::test]
+async fn e2e_user_token_rotate_and_hash_authority() {
+    let dir = temp_state_dir();
+    let handle = spawn_with_config(test_config(&dir, DEFAULT_SESSION_TTL_SECS)).await;
+    let addr = handle.addr;
+
+    // 登录（USER_TOKEN 种子）→ user_token_hash 落盘（sha256 hex，非明文）。
+    let mut ws = connect_ws(&addr, "/ws", None).await;
+    let s = login_session(&mut ws, Some("admin")).await;
+    let session_token = s["token"].as_str().unwrap().to_string();
+    consume_browser_snapshots(&mut ws, false, &[]).await;
+    let raw = std::fs::read_to_string(dir.join("user_token_hash")).unwrap();
+    let expected = hex::encode(Sha256::digest(USER_TOKEN.as_bytes()));
+    assert_eq!(raw.trim(), expected, "落盘 = sha256(USER_TOKEN)");
+    assert!(!raw.contains(USER_TOKEN), "不含明文");
+
+    // 轮换：须 adminToken；新 token 明文仅此一次返回（64 hex）。
+    let mut soft = SoftAuthenticator::new();
+    register_passkey(&addr, &session_token, &mut soft, "admin passkey").await;
+    ws.send(Message::text(r#"{"v":1,"type":"user_token_rotate"}"#))
+        .await
+        .unwrap();
+    expect_error(&mut ws, "admin_auth_required").await;
+    let (admin_token, _) = reauth_admin_token(&addr, &session_token, &mut soft).await;
+    ws.send(Message::text(format!(
+        r#"{{"v":1,"type":"user_token_rotate","adminToken":"{admin_token}"}}"#
+    )))
+    .await
+    .unwrap();
+    let rotated = next_of_type(&mut ws, "user_token_rotated").await;
+    let new_token = rotated["token"].as_str().expect("token").to_string();
+    assert_eq!(new_token.len(), 64, "{rotated}");
+    assert!(new_token.chars().all(|c| c.is_ascii_hexdigit()));
+    assert_ne!(new_token, USER_TOKEN);
+    // 落盘换成新哈希。
+    let raw = std::fs::read_to_string(dir.join("user_token_hash")).unwrap();
+    assert_eq!(
+        raw.trim(),
+        hex::encode(Sha256::digest(new_token.as_bytes()))
+    );
+
+    // 旧 USER_TOKEN 登录即刻失效（1008）；新 token 可登录（login_session
+    // 助手硬编码 USER_TOKEN，这里手动发新 token 的 hello）。
+    let mut old_ws = connect_ws(&addr, "/ws", None).await;
+    old_ws
+        .send(Message::text(format!(
+            r#"{{"v":1,"type":"hello","token":"{USER_TOKEN}"}}"#
+        )))
+        .await
+        .unwrap();
+    expect_close(&mut old_ws, 1008).await;
+    let mut fresh_ws = connect_ws(&addr, "/ws", None).await;
+    fresh_ws
+        .send(Message::text(format!(
+            r#"{{"v":1,"type":"hello","token":"{new_token}","device":"after-rotate"}}"#
+        )))
+        .await
+        .unwrap();
+    let ack = next_text(&mut fresh_ws).await;
+    assert!(
+        ack.contains(r#""type":"hello_ack""#),
+        "新 token 可登录：{ack}"
+    );
+
+    // 既有 sessionToken（轮换前签发）不受影响——会话层独立于 USER_TOKEN。
+    let mut resume_ws = connect_ws(&addr, "/ws", None).await;
+    resume_session(&mut resume_ws, &session_token).await;
+
+    // 重启 + env USER_TOKEN 换值 → 文件权威：新（轮换后）token 仍可用，
+    // env 换入的值不可用。
+    handle.shutdown();
+    handle.wait().await;
+    let mut cfg2 = test_config(&dir, DEFAULT_SESSION_TTL_SECS);
+    cfg2.user_token = "changed-env-token-0123456789".to_string();
+    let handle2 = spawn_with_config(cfg2).await;
+    let addr2 = handle2.addr;
+    // 文件权威：轮换后 token 仍可登录（手动 hello——助手用旧 USER_TOKEN）。
+    let mut w = connect_ws(&addr2, "/ws", None).await;
+    w.send(Message::text(format!(
+        r#"{{"v":1,"type":"hello","token":"{new_token}","device":"gen2"}}"#
+    )))
+    .await
+    .unwrap();
+    let ack = next_text(&mut w).await;
+    assert!(
+        ack.contains(r#""type":"hello_ack""#),
+        "轮换后 token 跨重启可用：{ack}"
+    );
+    let mut w2 = connect_ws(&addr2, "/ws", None).await;
+    w2.send(Message::text(
+        r#"{"v":1,"type":"hello","token":"changed-env-token-0123456789"}"#,
+    ))
+    .await
+    .unwrap();
+    expect_close(&mut w2, 1008).await;
+
+    handle2.shutdown();
+    handle2.wait().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 场景 45（管理批配对全流程）：新设备 hello{pairing:true} → pairing_pending
+///（6 位码）→ 已认证浏览器收 pairing_request 广播 → approve 须 adminToken
+///（缺失 → admin_auth_required）/ 错码 → pairing_not_found → 正确批准 →
+/// pending 连接换发 hello_ack.session（与登录换发同形）→ sessionToken 可
+/// 重连 + 进 devices 列表。
+#[tokio::test]
+async fn e2e_pairing_full_flow_approve() {
+    let dir = temp_state_dir();
+    let handle = spawn_with_config(test_config(&dir, DEFAULT_SESSION_TTL_SECS)).await;
+    let addr = handle.addr;
+
+    // 已认证浏览器（管理员）。
+    let mut soft = SoftAuthenticator::new();
+    let (mut admin, session_token, admin_token) = admin_browser_ready(&addr, &mut soft).await;
+    consume_browser_snapshots(&mut admin, false, &[]).await;
+
+    // 新设备：hello{pairing:true}（无凭证）→ pairing_pending（6 位数字码）。
+    let mut dev = connect_ws(&addr, "/ws", None).await;
+    dev.send(Message::text(
+        r#"{"v":1,"type":"hello","pairing":true,"device":"新 iPad"}"#,
+    ))
+    .await
+    .unwrap();
+    let pending = next_of_type(&mut dev, "pairing_pending").await;
+    let code = pending["code"].as_str().expect("code").to_string();
+    assert_eq!(code.len(), 6, "{pending}");
+    assert!(code.chars().all(|c| c.is_ascii_digit()), "{pending}");
+
+    // 广播：已认证浏览器收 pairing_request（code/device/expiresAt）。
+    let req = next_of_type(&mut admin, "pairing_request").await;
+    assert_eq!(req["code"], code, "{req}");
+    assert_eq!(req["device"], "新 iPad", "{req}");
+    assert!(req["expiresAt"].as_u64().is_some_and(|t| t > 0), "{req}");
+
+    // approve 门槛：无 adminToken → admin_auth_required；伪 token 同。
+    admin
+        .send(Message::text(format!(
+            r#"{{"v":1,"type":"pairing_approve","code":"{code}"}}"#
+        )))
+        .await
+        .unwrap();
+    expect_error(&mut admin, "admin_auth_required").await;
+    admin
+        .send(Message::text(format!(
+            r#"{{"v":1,"type":"pairing_approve","adminToken":"bogus","code":"{code}"}}"#
+        )))
+        .await
+        .unwrap();
+    expect_error(&mut admin, "admin_auth_required").await;
+    // 伪 adminToken 的 deny 也拒。
+    admin
+        .send(Message::text(format!(
+            r#"{{"v":1,"type":"pairing_deny","adminToken":"bogus","code":"{code}"}}"#
+        )))
+        .await
+        .unwrap();
+    expect_error(&mut admin, "admin_auth_required").await;
+
+    // 错码 → pairing_not_found（pending 不受影响，dev 仍在等）。错码取
+    // 一个与真码必然不同的值（确定性）。
+    let wrong_code = if code == "000001" { "000002" } else { "000001" };
+    admin
+        .send(Message::text(format!(
+            r#"{{"v":1,"type":"pairing_approve","adminToken":"{admin_token}","code":"{wrong_code}"}}"#
+        )))
+        .await
+        .unwrap();
+    expect_error(&mut admin, "pairing_not_found").await;
+
+    // 正确批准：pending 连接换发 hello_ack.session（形态与登录一致）。
+    admin
+        .send(Message::text(format!(
+            r#"{{"v":1,"type":"pairing_approve","adminToken":"{admin_token}","code":"{code}"}}"#
+        )))
+        .await
+        .unwrap();
+    let ack = next_of_type(&mut dev, "hello_ack").await;
+    assert_eq!(ack["role"], "browser", "{ack}");
+    let session = &ack["session"];
+    assert!(session.is_object(), "{ack}");
+    assert!(
+        session["id"].as_str().is_some_and(|s| s.len() == 36),
+        "UUID：{ack}"
+    );
+    assert!(
+        session["token"].as_str().is_some_and(|t| t.len() == 64),
+        "32B hex：{ack}"
+    );
+    assert!(session["expiresAt"].as_u64().is_some(), "{ack}");
+    let dev_token = session["token"].as_str().unwrap().to_string();
+    consume_browser_snapshots(&mut dev, false, &[]).await;
+
+    // 同码二次 approve → pairing_not_found（单次消费）。
+    admin
+        .send(Message::text(format!(
+            r#"{{"v":1,"type":"pairing_approve","adminToken":"{admin_token}","code":"{code}"}}"#
+        )))
+        .await
+        .unwrap();
+    expect_error(&mut admin, "pairing_not_found").await;
+
+    // 新设备 sessionToken 可重连 + 出现在 devices 列表（设备名 = 配对自报）。
+    let mut dev2 = connect_ws(&addr, "/ws", None).await;
+    resume_session(&mut dev2, &dev_token).await;
+    consume_browser_snapshots(&mut dev2, false, &[]).await;
+    dev2.send(Message::text(r#"{"v":1,"type":"device_list"}"#))
+        .await
+        .unwrap();
+    let devs = next_of_type(&mut dev2, "devices").await;
+    let names: Vec<&str> = devs["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["name"].as_str())
+        .collect();
+    assert!(names.contains(&"新 iPad"), "配对设备在列表：{devs}");
+    assert!(names.contains(&"admin-device"), "原设备仍在列表：{devs}");
+    let _ = session_token;
+
+    handle.shutdown();
+    handle.wait().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 场景 46（管理批配对拒绝/过期/上限）：deny → pending 连接 close 1008
+/// "pairing denied"；pending 过期（短 TTL）→ close 1008 + approve 收
+/// pairing_not_found；并发上限 4 → 第 5 个 pending close 1008。
+#[tokio::test]
+async fn e2e_pairing_deny_expiry_and_cap() {
+    let dir = temp_state_dir();
+    // 短 TTL（1s）验证过期路径。
+    let mut cfg = test_config(&dir, DEFAULT_SESSION_TTL_SECS);
+    cfg.pairing_ttl_secs = 1;
+    let handle = spawn_with_config(cfg).await;
+    let addr = handle.addr;
+
+    let mut soft = SoftAuthenticator::new();
+    let (mut admin, _, admin_token) = admin_browser_ready(&addr, &mut soft).await;
+    consume_browser_snapshots(&mut admin, false, &[]).await;
+
+    // ---- deny：pending → 广播 → deny → 1008 "pairing denied"。----
+    let mut dev = connect_ws(&addr, "/ws", None).await;
+    dev.send(Message::text(
+        r#"{"v":1,"type":"hello","pairing":true,"device":"deny-me"}"#,
+    ))
+    .await
+    .unwrap();
+    let pending = next_of_type(&mut dev, "pairing_pending").await;
+    let code = pending["code"].as_str().unwrap().to_string();
+    let req = next_of_type(&mut admin, "pairing_request").await;
+    assert_eq!(req["code"], code, "{req}");
+    admin
+        .send(Message::text(format!(
+            r#"{{"v":1,"type":"pairing_deny","adminToken":"{admin_token}","code":"{code}"}}"#
+        )))
+        .await
+        .unwrap();
+    let close = expect_close(&mut dev, 1008).await;
+    assert!(
+        close.reason.contains("pairing denied"),
+        "reason：{}",
+        close.reason
+    );
+
+    // ---- 过期（TTL=1s）：pending 创建后静置 → relay 主动 close + 后续
+    // approve 收 pairing_not_found。----
+    let mut dev2 = connect_ws(&addr, "/ws", None).await;
+    dev2.send(Message::text(
+        r#"{"v":1,"type":"hello","pairing":true,"device":"expire-me"}"#,
+    ))
+    .await
+    .unwrap();
+    let pending2 = next_of_type(&mut dev2, "pairing_pending").await;
+    let code2 = pending2["code"].as_str().unwrap().to_string();
+    let close = expect_close(&mut dev2, 1008).await;
+    assert!(
+        close.reason.contains("pairing expired"),
+        "reason：{}",
+        close.reason
+    );
+    admin
+        .send(Message::text(format!(
+            r#"{{"v":1,"type":"pairing_approve","adminToken":"{admin_token}","code":"{code2}"}}"#
+        )))
+        .await
+        .unwrap();
+    expect_error(&mut admin, "pairing_not_found").await;
+
+    // ---- 上限 4：先挂 4 个 pending（默认 TTL——用同一 admin relay？本
+    // relay TTL=1s 会自过期，另起长 TTL relay 验证 cap）。----
+    handle.shutdown();
+    handle.wait().await;
+    let dir2 = temp_state_dir();
+    let handle2 = spawn_with_config(test_config(&dir2, DEFAULT_SESSION_TTL_SECS)).await;
+    let addr2 = handle2.addr;
+    let mut soft2 = SoftAuthenticator::new();
+    let (mut admin2, _, admin_token2) = admin_browser_ready(&addr2, &mut soft2).await;
+    consume_browser_snapshots(&mut admin2, false, &[]).await;
+    let mut devices = Vec::new();
+    for i in 0..4 {
+        let mut d = connect_ws(&addr2, "/ws", None).await;
+        d.send(Message::text(format!(
+            r#"{{"v":1,"type":"hello","pairing":true,"device":"pending-{i}"}}"#
+        )))
+        .await
+        .unwrap();
+        let p = next_of_type(&mut d, "pairing_pending").await;
+        assert_eq!(p["code"].as_str().unwrap().len(), 6);
+        devices.push(d);
+    }
+    // 第 5 个 → 1008 too many pairings。
+    let mut d5 = connect_ws(&addr2, "/ws", None).await;
+    d5.send(Message::text(
+        r#"{"v":1,"type":"hello","pairing":true,"device":"overflow"}"#,
+    ))
+    .await
+    .unwrap();
+    let close = expect_close(&mut d5, 1008).await;
+    assert!(
+        close.reason.contains("too many pairings"),
+        "reason：{}",
+        close.reason
+    );
+    // 拒绝一个腾位后可再入。
+    let first_code = {
+        // 广播帧按创建序到达 admin2，取第一个（pending-0）。
+        let req = next_of_type(&mut admin2, "pairing_request").await;
+        req["code"].as_str().unwrap().to_string()
+    };
+    admin2
+        .send(Message::text(format!(
+            r#"{{"v":1,"type":"pairing_deny","adminToken":"{admin_token2}","code":"{first_code}"}}"#
+        )))
+        .await
+        .unwrap();
+    let mut d6 = connect_ws(&addr2, "/ws", None).await;
+    d6.send(Message::text(
+        r#"{"v":1,"type":"hello","pairing":true,"device":"after-free"}"#,
+    ))
+    .await
+    .unwrap();
+    let p = next_of_type(&mut d6, "pairing_pending").await;
+    assert_eq!(p["code"].as_str().unwrap().len(), 6, "腾位后可再入");
+
+    handle2.shutdown();
+    handle2.wait().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
 }
