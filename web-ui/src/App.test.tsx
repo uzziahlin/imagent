@@ -513,3 +513,189 @@ describe("审批弹层（slide-in + 移动端触觉）", () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// v1.3 passkey 登录（mock WebAuthn API + fetch）：成功存 session 进入 /
+// 失败回落提示 / USER_TOKEN 路径不回归
+// ---------------------------------------------------------------------------
+
+describe("App passkey 登录（v1.3）", () => {
+  /** 开启 WebAuthn 能力（jsdom 默认无）：PublicKeyCredential 全局 +
+   *  navigator.credentials（get/create 由用例给实现）。 */
+  function enableWebauthn(get: () => Promise<unknown>): void {
+    vi.stubGlobal("PublicKeyCredential", class PublicKeyCredential {});
+    Object.defineProperty(navigator, "credentials", {
+      value: {
+        get,
+        create: async () => {
+          throw new Error("本用例不触发 create");
+        },
+      },
+      configurable: true,
+    });
+  }
+
+  /** 伪造浏览器 assertion（字段为 ArrayBuffer/Uint8Array，lib/webauthn 转换）。 */
+  function fakeAssertion(): unknown {
+    const enc = (s: string) => new TextEncoder().encode(s);
+    return {
+      id: "cred-1",
+      rawId: enc("raw-cred"),
+      type: "public-key",
+      response: {
+        authenticatorData: enc("auth-data"),
+        clientDataJSON: enc("{}"),
+        signature: enc("sig"),
+        userHandle: enc("user"),
+      },
+    };
+  }
+
+  /** login begin/complete 的 fetch mock。 */
+  function webauthnFetch(beginStatus = 200, completeStatus = 200): ReturnType<typeof vi.fn> {
+    return vi.fn(async (url: string | URL | Request) => {
+      const u = typeof url === "string" ? url : url.toString();
+      if (u.includes("webauthn/login/begin")) {
+        if (beginStatus !== 200) {
+          return new Response(JSON.stringify({ error: "no_credentials" }), { status: beginStatus });
+        }
+        return new Response(
+          JSON.stringify({
+            beginId: "begin-1",
+            publicKey: {
+              rpId: "localhost",
+              challenge: "Zm9vYmFy", // base64url("foobar")
+              allowCredentials: [],
+            },
+          }),
+          { status: 200 },
+        );
+      }
+      if (u.includes("webauthn/login/complete")) {
+        if (completeStatus !== 200) {
+          return new Response(JSON.stringify({ error: "verification_failed" }), {
+            status: completeStatus,
+          });
+        }
+        return new Response(
+          JSON.stringify({
+            session: { id: "sid-pk", token: "tok-pk", expiresAt: Date.now() / 1000 + 30 * 86_400 },
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response("{}", { status: 404 });
+    }) as unknown as ReturnType<typeof vi.fn>;
+  }
+
+  it("成功：begin → credentials.get → complete 存 session，hello 用 session 形态直连", async () => {
+    const fetchMock = webauthnFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    enableWebauthn(async () => fakeAssertion());
+    render(<App />);
+
+    // 登录页双入口：通行钥匙页签默认高亮，主按钮可用。
+    expect(screen.getByRole("tab", { name: "使用通行钥匙" }).getAttribute("aria-selected")).toBe(
+      "true",
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "使用通行钥匙登录" }));
+    });
+
+    // begin/complete 各一次；session 持久化。
+    expect(fetchMock.mock.calls.filter((c) => c[0].toString().includes("login/begin"))).toHaveLength(1);
+    expect(fetchMock.mock.calls.filter((c) => c[0].toString().includes("login/complete"))).toHaveLength(1);
+    const stored = JSON.parse(localStorage.getItem("imagent.session") ?? "null");
+    expect(stored).toMatchObject({ id: "sid-pk", token: "tok-pk" });
+
+    // WS hello 直接带 sessionToken（与 USER_TOKEN 登录换发后同构）。
+    const fake = FakeWebSocket.latest;
+    expect(fake).toBeTruthy();
+    act(() => fake!.emit("open"));
+    expect(fake!.sent).toContain(JSON.stringify({ v: 1, type: "hello", session: "tok-pk" }));
+  });
+
+  it("失败（no_credentials）：留在登录页并提示回落访问令牌；切换页签可继续 USER_TOKEN 登录", async () => {
+    const fetchMock = webauthnFetch(400);
+    vi.stubGlobal("fetch", fetchMock);
+    enableWebauthn(async () => fakeAssertion());
+    render(<App />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "使用通行钥匙登录" }));
+    });
+    // 失败提示（alert）出现，登录页仍在（token 入口经页签可达）。
+    expect(screen.getByRole("alert").textContent).toContain("尚未注册通行钥匙");
+    expect(screen.getByRole("tab", { name: "使用访问令牌" })).toBeTruthy();
+
+    // 切到访问令牌页签 → 表单出现 → USER_TOKEN 路径照常。
+    fireEvent.click(screen.getByRole("tab", { name: "使用访问令牌" }));
+    fireEvent.change(screen.getByLabelText("访问令牌（USER_TOKEN）"), {
+      target: { value: "tok-9" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "连接" }));
+    const fake = FakeWebSocket.latest;
+    expect(fake).toBeTruthy();
+    act(() => fake!.emit("open"));
+    // 未填设备名 → hello 带缺省 UA 摘要 device；token 字段才是断言重点。
+    const hello = JSON.parse(fake!.sent[0] ?? "{}") as { type?: string; token?: string };
+    expect(hello).toMatchObject({ v: 1, type: "hello", token: "tok-9" });
+  });
+
+  it("验签失败（401）：提示验证失败，不进入主界面", async () => {
+    const fetchMock = webauthnFetch(200, 401);
+    vi.stubGlobal("fetch", fetchMock);
+    enableWebauthn(async () => fakeAssertion());
+    render(<App />);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "使用通行钥匙登录" }));
+    });
+    expect(screen.getByRole("alert").textContent).toContain("通行钥匙验证失败");
+    expect(localStorage.getItem("imagent.session")).toBeNull();
+  });
+
+  it("WebAuthn 不可用（jsdom 默认）：无页签、直接令牌表单（USER_TOKEN 路径不回归）", () => {
+    render(<App />);
+    expect(screen.queryByRole("tablist", { name: "登录方式" })).toBeNull();
+    expect(screen.getByLabelText("访问令牌（USER_TOKEN）")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "连接" })).toBeTruthy();
+  });
+
+  it("设备管理通行钥匙区：打开即发 cred_list；creds 帧渲染列表；删除发 cred_revoke", () => {
+    // 通行钥匙列表仅在 WebAuthn 可用时渲染（不支持时显示指引）——先开启能力。
+    enableWebauthn(async () => fakeAssertion());
+    // 本 describe 内的局部挂载/ack 辅助（v1.2 describe 的同名函数不可跨块用）。
+    const ack = (id: string, token: string, expiresAt: number) =>
+      JSON.stringify({ v: 1, type: "hello_ack", role: "user", session: { id, token, expiresAt } });
+    localStorage.setItem(
+      "imagent.session",
+      JSON.stringify({ id: "sid-r", token: "st-r", expiresAt: Date.now() + 20 * 86_400_000 }),
+    );
+    render(<App />);
+    const fake = FakeWebSocket.latest as FakeWebSocket;
+    act(() => {
+      fake.emit("open");
+      fake.recv(JSON.parse(ack("sid-r", "st-r", Date.now() + 20 * 86_400_000)));
+    });
+    fireEvent.click(screen.getByRole("button", { name: "已登录设备" }));
+    // 打开面板：device_list + cred_list 都发出。
+    expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "cred_list" }));
+    expect(screen.getByRole("dialog", { name: "已登录设备" })).toBeTruthy();
+    // 通行钥匙区：待回包态。
+    expect(screen.getByText("通行钥匙")).toBeTruthy();
+    act(() => {
+      fake.recv({
+        v: 1,
+        type: "creds",
+        credentials: [{ id: "cred-1", label: "iPhone 17", created: Math.floor(Date.now() / 1000) - 120 }],
+      });
+    });
+    expect(screen.getByText("iPhone 17")).toBeTruthy();
+    expect(screen.getByText(/注册于/)).toBeTruthy();
+    // 删除 → cred_revoke → relay 回空列表。
+    fireEvent.click(screen.getByRole("button", { name: "删除" }));
+    expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "cred_revoke", credId: "cred-1" }));
+    act(() => fake.recv({ v: 1, type: "creds", credentials: [] }));
+    expect(screen.getByText(/尚未注册通行钥匙/)).toBeTruthy();
+  });
+});

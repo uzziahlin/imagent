@@ -10,6 +10,7 @@ import {
   type ConvState,
   type DeviceInfo,
   type MachineNotice,
+  type PasskeyInfo,
   type PendingApproval,
 } from "./lib/protocol";
 import {
@@ -22,6 +23,12 @@ import {
   type ConnStatus,
   type StoredSession,
 } from "./lib/ws";
+import {
+  PasskeyError,
+  passkeyLogin,
+  passkeyRegister,
+  webauthnSupported,
+} from "./lib/webauthn";
 import { Login } from "./components/Login";
 import { StatusBar } from "./components/StatusBar";
 import { Sidebar, type ConvItem } from "./components/Sidebar";
@@ -92,6 +99,12 @@ export default function App() {
   const [session, setSession] = useState<StoredSession | null>(() => loadSession());
   // 登录页提示（认证失败分流：会话过期 / 设备被吊销 / 吊销本机登出）
   const [authNotice, setAuthNotice] = useState("");
+  // v1.3 passkey：本机 WebAuthn 能力（常量——会话期间不变化）；登录页双入口
+  // 与设备管理通行钥匙区的显隐。
+  const waSupported = webauthnSupported();
+  const [passkeyBusy, setPasskeyBusy] = useState(false);
+  const [passkeyError, setPasskeyError] = useState<string | null>(null);
+  const [passkeyMessage, setPasskeyMessage] = useState<string | null>(null);
   const [devicesOpen, setDevicesOpen] = useState(false);
   const [status, setStatus] = useState<ConnStatus>("connecting");
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -123,6 +136,50 @@ export default function App() {
     }
     setAuth(null);
     setDevicesOpen(false);
+  };
+
+  /** v1.3 passkey 登录失败文案（登录页回落提示）。 */
+  const passkeyErrorText = (e: unknown): string => {
+    if (e instanceof PasskeyError) {
+      switch (e.code) {
+        case "no_credentials":
+          return "尚未注册通行钥匙";
+        case "no_credential":
+          return "未找到可用通行钥匙";
+        case "aborted":
+          return "已取消或认证器不可用";
+        case "rate_limited":
+          return "尝试过于频繁，请稍后再试";
+        case "network":
+          return "网络错误";
+        case "verification_failed":
+          return "通行钥匙验证失败";
+        default:
+          return `通行钥匙登录失败（${e.code}）`;
+      }
+    }
+    return "通行钥匙登录失败";
+  };
+
+  /** v1.3 passkey 登录：begin → credentials.get → complete → 存 session 直接
+   *  进入（与 USER_TOKEN 登录同构：sessionToken 重连，无需再过 hello 换发）。 */
+  const handlePasskeyLogin = async () => {
+    if (passkeyBusy) {
+      return;
+    }
+    setPasskeyBusy(true);
+    setPasskeyError(null);
+    try {
+      const s = await passkeyLogin();
+      saveSession(s);
+      setSession(s);
+      setAuthNotice("");
+      setAuth({ kind: "session", token: s.token });
+    } catch (e) {
+      setPasskeyError(passkeyErrorText(e));
+    } finally {
+      setPasskeyBusy(false);
+    }
   };
 
   // 凭证变化（登录/退出/认证失败）→ 重建 WS 连接；session 签发不重建（见 Cred）
@@ -235,11 +292,16 @@ export default function App() {
     return (
       <Login
         notice={authNotice}
+        webauthnAvailable={waSupported}
+        passkeyBusy={passkeyBusy}
+        passkeyError={passkeyError}
+        onPasskeyLogin={handlePasskeyLogin}
         onSave={(t, deviceName) => {
           // USER_TOKEN 先落 localStorage（relay 暂不可达时刷新仍可重试握手）；
           // hello_ack 签发 session 后由 onSession 删除（一次性）。
           localStorage.setItem(USER_TOKEN_KEY, t);
           setAuthNotice("");
+          setPasskeyError(null);
           setAuth({
             kind: "user",
             token: t,
@@ -321,10 +383,39 @@ export default function App() {
     setAuth(null);
   };
 
-  /** v1.2 设备管理：打开即拉列表（devices 帧 → reducer 更新 state.devices）。 */
+  /** v1.2 + v1.3 设备管理：打开即拉设备列表与通行钥匙列表（relay 回
+   * devices / creds 帧更新 state）。 */
   const openDevices = () => {
     setDevicesOpen(true);
     wsRef.current?.sendDeviceList();
+    wsRef.current?.sendCredList();
+  };
+
+  /** v1.3 添加通行钥匙：注册 label 用本机设备名（deviceSummary）；完成后
+   *  cred_list 刷新（relay 回 creds 帧）。 */
+  const addPasskey = async () => {
+    if (!session || passkeyBusy) {
+      return;
+    }
+    setPasskeyBusy(true);
+    setPasskeyMessage(null);
+    try {
+      const label = deviceSummary(navigator.userAgent);
+      await passkeyRegister(session.token, label);
+      setPasskeyMessage(`通行钥匙「${label}」已注册`);
+      wsRef.current?.sendCredList();
+    } catch (e) {
+      const text = e instanceof PasskeyError ? passkeyErrorText(e) : "注册失败";
+      setPasskeyMessage(text);
+    } finally {
+      setPasskeyBusy(false);
+    }
+  };
+
+  /** v1.3 删除通行钥匙（relay 回更新后的 creds 帧刷新列表）。 */
+  const revokePasskey = (p: PasskeyInfo) => {
+    wsRef.current?.sendCredRevoke(p.id);
+    setPasskeyMessage(null);
   };
 
   /** 吊销设备：本机（id === session.id）= 服务端吊销 + 登出——先发 revoke
@@ -436,12 +527,18 @@ export default function App() {
         />
       </div>
 
-      {/* v1.2 设备管理弹层（组件自管进出过渡；machinery 状态经 devices 帧） */}
+      {/* v1.2 + v1.3 设备管理弹层（组件自管进出过渡；状态经 devices/creds 帧） */}
       <DeviceManager
         open={devicesOpen}
         devices={state.devices}
+        passkeys={state.passkeys}
+        webauthnAvailable={waSupported}
+        passkeyBusy={passkeyBusy}
+        passkeyMessage={passkeyMessage}
         selfId={session?.id}
         onRevoke={revokeDevice}
+        onAddPasskey={addPasskey}
+        onRevokePasskey={revokePasskey}
         onClose={() => setDevicesOpen(false)}
       />
 

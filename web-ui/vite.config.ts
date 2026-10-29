@@ -26,6 +26,13 @@ export default defineConfig({
         target: "http://127.0.0.1:3010",
         rewrite: (p) => p.replace(/^\/imagent/, ""),
       },
+      // v1.3 passkey HTTP 端点（同源 fetch；本地直连形态 rp_id=localhost
+      // 可用——注意 http://127.0.0.1 形态 WebAuthn 不受支持，开发页请开
+      // http://localhost:5173/imagent/）
+      "/imagent/webauthn": {
+        target: "http://127.0.0.1:3010",
+        rewrite: (p) => p.replace(/^\/imagent/, ""),
+      },
     },
   },
   test: {

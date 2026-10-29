@@ -7,6 +7,11 @@
 //! reason 区分 / 设备列表与吊销断连 / 会话落盘重启保留 / 会话表上限 /
 //! 网关 token-machine 绑定）。close code 断言依赖 tungstenite 把 Close 帧
 //! 投递给应用层，可精确断言，无需退化。
+//! v1.3 passkey：内置**软认证器**（openssl ES256 + 手写最小 CBOR）对
+//! register/login 全流程做**真签名** e2e——webauthn-rs 的 fake 模块只生成
+//! 假 credential id 分布（无签名能力），不适用；真浏览器认证器无法进
+//! CI，软认证器等价覆盖服务端验签路径（challenge/origin/rpIdHash/UP/UV/
+//! 签名/计数器）。
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -63,6 +68,7 @@ fn test_config(state_dir: &std::path::Path, session_ttl_secs: u64) -> RelayConfi
         user_token: USER_TOKEN.to_string(),
         state_dir: state_dir.to_path_buf(),
         session_ttl_secs,
+        webauthn_rp_id: None, // rp_id 按请求 Host（localhost）推导
     }
 }
 
@@ -1274,34 +1280,56 @@ async fn e2e_session_reject_reasons() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 场景 22（v1.2 会话层）：会话表上限 32——32 次登录（逐连接）成功后第
-/// 33 次 close 1008 "too many sessions"（先清理过期/墓碑仍满才拒）。
+/// 场景 22（v1.3 会话表 LRU 改进）：32 次登录（逐连接断开，全员**离线**）
+/// 占满会话表后，第 33 次登录**成功**——LRU 淘汰最旧离线会话腾位，而非
+/// 拒绝。这是修真实发生过的死锁（单用户测试/重登累积占满 32 会话且全部
+/// 设备离线 → 无法登录、无法自助 device_revoke 吊销腾位，只能登 ECS 删
+/// sessions.json）。断言：表仍 32；33 个 token 恰有 1 个失效（被淘汰者，
+/// 其余 31 个 + 新会话全部有效）。「全部在线才拒绝」分支因浏览器并存上限
+/// MAX_BROWSERS=8 < 32 无法经真连接铺满 32 个在线会话，由 sessions 单元
+/// 测试覆盖（session_cap_eviction_and_reject §5）。
 #[tokio::test]
-async fn e2e_session_cap_33rd_login_rejected() {
+async fn e2e_session_cap_lru_evicts_oldest_offline() {
     let handle = spawn_test_relay().await;
     let addr = handle.addr;
 
-    // 32 次登录（每次新连接 = 新会话；连接即断，会话保留）。
-    for i in 0..32 {
+    // 32 次登录（每次新连接 = 新会话；连接即断，会话离线保留）。
+    let mut tokens = Vec::new();
+    for _ in 0..32 {
         let mut ws = connect_ws(&addr, "/ws", None).await;
-        hello_handshake(&mut ws, USER_TOKEN).await;
-        // 收到 ack 即会话已入表；断开不清会话（断开≠吊销）。
-        drop(ws);
-        let _ = i;
+        let s = login_session(&mut ws, None).await;
+        tokens.push(s["token"].as_str().unwrap().to_string());
+        drop(ws); // 断开 ≠ 吊销：会话保留（离线）
     }
-    // 第 33 次：USER_TOKEN 正确但表满 → close 1008 "too many sessions"。
+
+    // 第 33 次：USER_TOKEN 正确且存在离线候选 → 成功（LRU 淘汰腾位）。
     let mut b33 = connect_ws(&addr, "/ws", None).await;
-    b33.send(Message::text(format!(
-        r#"{{"v":1,"type":"hello","token":"{USER_TOKEN}"}}"#
-    )))
-    .await
-    .unwrap();
-    let frame = expect_close(&mut b33, 1008).await;
+    let _s33 = login_session(&mut b33, Some("newcomer")).await;
+    consume_browser_snapshots(&mut b33, false, &[]).await;
+
+    // 表仍 32，含 newcomer。
+    b33.send(Message::text(r#"{"v":1,"type":"device_list"}"#))
+        .await
+        .unwrap();
+    let devs = next_of_type(&mut b33, "devices").await;
+    let arr = devs["devices"].as_array().unwrap();
+    assert_eq!(arr.len(), 32, "淘汰一入一出：{devs}");
     assert!(
-        frame.reason.to_string().contains("too many sessions"),
-        "reason={}",
-        frame.reason
+        arr.iter().any(|d| d["name"] == "newcomer"),
+        "新会话在列表：{devs}"
     );
+
+    // 原 32 个 token 恰 1 个失效（被 LRU 淘汰；同秒批量签发时按 id 决胜，
+    // 不断言具体是谁，断言「恰一个」）。
+    let mut rejected = 0;
+    for t in &tokens {
+        let mut ws = connect_ws(&addr, "/ws", None).await;
+        if !session_still_valid(&mut ws, t).await {
+            rejected += 1;
+        }
+        drop(ws);
+    }
+    assert_eq!(rejected, 1, "32 个旧 token 恰 1 个被淘汰");
 
     handle.shutdown();
     handle.wait().await;
@@ -1419,6 +1447,7 @@ async fn e2e_gateway_token_machine_binding() {
         user_token: USER_TOKEN.to_string(),
         state_dir: dir.clone(),
         session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
+        webauthn_rp_id: None,
     })
     .await;
     let addr = handle.addr;
@@ -1488,6 +1517,671 @@ async fn e2e_browser_bearer_issues_session() {
     // 错误 Bearer → 失败路径（1008）。
     let mut bad = connect_ws(&addr, "/ws", Some("wrong-token")).await;
     expect_close(&mut bad, 1008).await;
+
+    handle.shutdown();
+    handle.wait().await;
+}
+
+// ===========================================================================
+// v1.3 passkey（WebAuthn）e2e：软认证器真签名
+// ===========================================================================
+
+use sha2::{Digest, Sha256};
+
+/// base64url（无 padding）编码（软认证器构造 credential JSON 用；与 relay
+/// 侧 webauthn::b64url_encode 同一约定）。
+fn b64url(bytes: &[u8]) -> String {
+    const TBL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    for c in bytes.chunks(3) {
+        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(TBL[(n >> 18) as usize & 63] as char);
+        out.push(TBL[(n >> 12) as usize & 63] as char);
+        if c.len() > 1 {
+            out.push(TBL[(n >> 6) as usize & 63] as char);
+        }
+        if c.len() > 2 {
+            out.push(TBL[n as usize & 63] as char);
+        }
+    }
+    out
+}
+
+/// 最小 CBOR 编码（仅软认证器需要的固定形状：uint/nint/bstr/tstr/map 头）。
+mod cbor {
+    fn head(major: u8, v: u64, out: &mut Vec<u8>) {
+        let m = major << 5;
+        if v < 24 {
+            out.push(m | v as u8);
+        } else if v <= u8::MAX as u64 {
+            out.extend_from_slice(&[m | 24, v as u8]);
+        } else if v <= u16::MAX as u64 {
+            out.push(m | 25);
+            out.extend_from_slice(&(v as u16).to_be_bytes());
+        } else {
+            out.push(m | 26);
+            out.extend_from_slice(&(v as u32).to_be_bytes());
+        }
+    }
+    /// 无符号整数。
+    pub fn uint(v: u64, out: &mut Vec<u8>) {
+        head(0, v, out);
+    }
+    /// 负整数 -n（n ≥ 1）。
+    pub fn nint(n: u64, out: &mut Vec<u8>) {
+        head(1, n - 1, out);
+    }
+    /// 字节串。
+    pub fn bstr(bytes: &[u8], out: &mut Vec<u8>) {
+        head(2, bytes.len() as u64, out);
+        out.extend_from_slice(bytes);
+    }
+    /// 文本串。
+    pub fn tstr(s: &str, out: &mut Vec<u8>) {
+        head(3, s.len() as u64, out);
+        out.extend_from_slice(s.as_bytes());
+    }
+    /// map 头（键值对数量）。
+    pub fn map(n: usize, out: &mut Vec<u8>) {
+        head(5, n as u64, out);
+    }
+}
+
+/// 软认证器（ES256 / P-256）：模拟真认证器的注册（"none" attestation）与
+/// 登录（断言签名）。计数器单调递增（克隆检测依赖）。
+struct SoftAuthenticator {
+    key: openssl::ec::EcKey<openssl::pkey::Private>,
+    cred_id: Vec<u8>,
+    counter: u32,
+}
+
+impl SoftAuthenticator {
+    fn new() -> Self {
+        use openssl::ec::EcKey;
+        use openssl::nid::Nid;
+        let group = openssl::ec::EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+        let key = EcKey::generate(&group).unwrap();
+        Self {
+            key,
+            cred_id: (0u16..16).map(|i| (i as u8) ^ 0x5a).collect(),
+            counter: 0,
+        }
+    }
+
+    /// 公钥坐标（32 字节大端、左填充）。
+    fn coords(&self) -> (Vec<u8>, Vec<u8>) {
+        use openssl::bn::BigNumContext;
+        let group =
+            openssl::ec::EcGroup::from_curve_name(openssl::nid::Nid::X9_62_PRIME256V1).unwrap();
+        let (mut x, mut y) = (
+            openssl::bn::BigNum::new().unwrap(),
+            openssl::bn::BigNum::new().unwrap(),
+        );
+        let mut ctx = BigNumContext::new().unwrap();
+        self.key
+            .public_key()
+            .affine_coordinates_gfp(&group, &mut x, &mut y, &mut ctx)
+            .unwrap();
+        (x.to_vec_padded(32).unwrap(), y.to_vec_padded(32).unwrap())
+    }
+
+    /// COSE ES256 公钥 CBOR：{1:2, 3:-7, -1:1, -2:x, -3:y}。
+    fn cose_key(&self) -> Vec<u8> {
+        let (x, y) = self.coords();
+        let mut out = Vec::new();
+        cbor::map(5, &mut out);
+        cbor::uint(1, &mut out);
+        cbor::uint(2, &mut out);
+        cbor::uint(3, &mut out);
+        cbor::nint(7, &mut out);
+        cbor::nint(1, &mut out);
+        cbor::uint(1, &mut out);
+        cbor::nint(2, &mut out);
+        cbor::bstr(&x, &mut out);
+        cbor::nint(3, &mut out);
+        cbor::bstr(&y, &mut out);
+        out
+    }
+
+    /// attestedCredentialData（注册）：aaguid(0) || len(2) || credId || COSE。
+    fn attested_credential_data(&self) -> Vec<u8> {
+        let mut out = vec![0u8; 16]; // aaguid（"none" fmt 不校验）
+        out.extend_from_slice(&(self.cred_id.len() as u16).to_be_bytes());
+        out.extend_from_slice(&self.cred_id);
+        out.extend_from_slice(&self.cose_key());
+        out
+    }
+
+    /// 注册响应（RegisterPublicKeyCredential JSON）。`options` = begin 响应
+    /// 的 `publicKey`；`origin` = clientDataJSON origin（与 relay 推导一致）。
+    fn register(&self, options: &serde_json::Value, origin: &str) -> serde_json::Value {
+        let rp_id = options["rp"]["id"].as_str().unwrap_or("localhost");
+        let challenge = options["challenge"].as_str().expect("challenge");
+        let client_data = serde_json::json!({
+            "type": "webauthn.create",
+            "challenge": challenge,
+            "origin": origin,
+        })
+        .to_string();
+        // authData：rpIdHash || flags(UP|UV|AT=0x45) || counter(0) || attested。
+        let mut auth_data = Sha256::digest(rp_id.as_bytes()).to_vec();
+        auth_data.push(0x45);
+        auth_data.extend_from_slice(&0u32.to_be_bytes());
+        auth_data.extend_from_slice(&self.attested_credential_data());
+        // attestationObject（"none" fmt）：{"fmt":"none","attStmt":{},"authData":…}。
+        let mut att_obj = Vec::new();
+        cbor::map(3, &mut att_obj);
+        cbor::tstr("fmt", &mut att_obj);
+        cbor::tstr("none", &mut att_obj);
+        cbor::tstr("attStmt", &mut att_obj);
+        cbor::map(0, &mut att_obj);
+        cbor::tstr("authData", &mut att_obj);
+        cbor::bstr(&auth_data, &mut att_obj);
+        serde_json::json!({
+            "id": b64url(&self.cred_id),
+            "rawId": b64url(&self.cred_id),
+            "type": "public-key",
+            "response": {
+                "attestationObject": b64url(&att_obj),
+                "clientDataJSON": b64url(client_data.as_bytes()),
+                "transports": [],
+            },
+        })
+    }
+
+    /// 断言响应（PublicKeyCredential JSON）。签名 = ES256(DER) over
+    /// authenticatorData || sha256(clientDataJSON)。
+    fn assert_credential(
+        &mut self,
+        options: &serde_json::Value,
+        origin: &str,
+    ) -> serde_json::Value {
+        use openssl::hash::MessageDigest;
+        use openssl::pkey::PKey;
+        use openssl::sign::Signer;
+        let rp_id = options["rpId"].as_str().unwrap_or("localhost");
+        let challenge = options["challenge"].as_str().expect("challenge");
+        let client_data = serde_json::json!({
+            "type": "webauthn.get",
+            "challenge": challenge,
+            "origin": origin,
+        })
+        .to_string();
+        // authData：rpIdHash || flags(UP|UV=0x05) || counter（单调）。
+        self.counter += 1;
+        let mut auth_data = Sha256::digest(rp_id.as_bytes()).to_vec();
+        auth_data.push(0x05);
+        auth_data.extend_from_slice(&self.counter.to_be_bytes());
+        let mut signed = auth_data.clone();
+        signed.extend_from_slice(&Sha256::digest(client_data.as_bytes()));
+        let pkey = PKey::from_ec_key(self.key.clone()).unwrap();
+        let mut signer = Signer::new(MessageDigest::sha256(), &pkey).unwrap();
+        signer.update(&signed).unwrap();
+        let sig = signer.sign_to_vec().unwrap();
+        serde_json::json!({
+            "id": b64url(&self.cred_id),
+            "rawId": b64url(&self.cred_id),
+            "type": "public-key",
+            "response": {
+                "authenticatorData": b64url(&auth_data),
+                "clientDataJSON": b64url(client_data.as_bytes()),
+                "signature": b64url(&sig),
+                "userHandle": b64url(b"soft-authenticator-user"),
+            },
+        })
+    }
+}
+
+/// 裸 HTTP POST（JSON body，可选 Bearer / 自定义 Host）。返回
+/// (状态码字符串, body)。Host 缺省 `localhost`——WebAuthn RP 推导由此
+/// 落到 rp_id=localhost / origin=http://localhost（软认证器 clientDataJSON
+/// 同源）。
+async fn http_post_json(
+    addr: &SocketAddr,
+    path: &str,
+    bearer: Option<&str>,
+    host: &str,
+    body: &str,
+) -> (String, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let auth = bearer
+        .map(|t| format!("authorization: Bearer {t}\r\n"))
+        .unwrap_or_default();
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nhost: {host}\r\ncontent-type: application/json\r\n\
+         content-length: {}\r\nconnection: close\r\n{auth}\r\n{body}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    let raw = String::from_utf8_lossy(&buf).to_string();
+    let (headers, resp_body) = raw.split_once("\r\n\r\n").unwrap_or(("", ""));
+    let status = headers
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_string();
+    (status, resp_body.to_string())
+}
+
+/// 便捷封装：POST + JSON body 解析断言。
+async fn post_json(
+    addr: &SocketAddr,
+    path: &str,
+    bearer: Option<&str>,
+    body: &serde_json::Value,
+) -> (String, serde_json::Value) {
+    let (status, resp) = http_post_json(addr, path, bearer, "localhost", &body.to_string()).await;
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap_or(serde_json::Value::Null);
+    (status, v)
+}
+
+/// 读 hello 的回执：hello_ack（返回 true）或 close 1008（false）。LRU 淘汰
+/// 验证用——逐 token 重连，区分幸存 / 被淘汰。
+async fn session_still_valid(ws: &mut Ws, session_token: &str) -> bool {
+    ws.send(Message::text(format!(
+        r#"{{"v":1,"type":"hello","session":"{session_token}"}}"#
+    )))
+    .await
+    .unwrap();
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("等帧超时")
+            .expect("流未断")
+            .expect("WS 读正常");
+        match msg {
+            Message::Text(t) if t.contains(r#""type":"hello_ack""#) => return true,
+            Message::Text(_) => continue, // machine/machines 快照
+            Message::Close(_) => return false,
+            m => panic!("意外帧：{m:?}"),
+        }
+    }
+}
+
+/// 场景 27（v1.3 passkey 全流程真签名）：USER_TOKEN 登录换发会话 → 注册
+/// passkey（软认证器 "none" attestation）→ credentials.json 落盘 →
+/// cred_list（WS 管理帧）→ passkey 登录（discoverable，allowCredentials 空）
+/// 换发 L2 会话（与 hello 换发同构）→ sessionToken 重连 → 设备名 = passkey
+/// label → sessions.json 落盘含两个会话。
+#[tokio::test]
+async fn e2e_passkey_register_and_login_full_ceremony() {
+    let dir = temp_state_dir();
+    let handle = spawn_with_config(test_config(&dir, DEFAULT_SESSION_TTL_SECS)).await;
+    let addr = handle.addr;
+    let origin = "http://localhost";
+
+    // 1) USER_TOKEN 登录换发会话（注册路径的 Bearer）。
+    let mut ws = connect_ws(&addr, "/ws", None).await;
+    let s = login_session(&mut ws, Some("iPhone")).await;
+    let session_token = s["token"].as_str().unwrap().to_string();
+
+    // 2) 注册 begin：Bearer 认证，响应 beginId + publicKey（challenge/
+    //    user.id 为 base64url）。
+    let (status, begin) = post_json(
+        &addr,
+        "/webauthn/register/begin",
+        Some(&session_token),
+        &serde_json::json!({ "label": "iPhone 17" }),
+    )
+    .await;
+    assert_eq!(status, "200", "{begin}");
+    let begin_id = begin["beginId"].as_str().unwrap().to_string();
+    assert!(
+        begin["publicKey"]["challenge"].is_string() && begin["publicKey"]["user"]["id"].is_string(),
+        "注册 options 形状：{begin}"
+    );
+    assert_eq!(
+        begin["publicKey"]["rp"]["id"], "localhost",
+        "rp_id 按请求 Host 推导"
+    );
+
+    // 3) 软认证器注册（真 ES256 公钥 + "none" attestation）→ complete 200。
+    let mut soft = SoftAuthenticator::new();
+    let credential = soft.register(&begin["publicKey"], origin);
+    let (status, done) = post_json(
+        &addr,
+        "/webauthn/register/complete",
+        Some(&session_token),
+        &serde_json::json!({ "beginId": begin_id, "credential": credential }),
+    )
+    .await;
+    assert_eq!(status, "200", "{done}");
+    assert_eq!(done["credential"]["label"], "iPhone 17", "{done}");
+    assert_eq!(
+        done["credential"]["id"],
+        b64url(&soft.cred_id),
+        "credential id 为 base64url 形态"
+    );
+
+    // 4) credentials.json 落盘。
+    let raw = std::fs::read_to_string(dir.join("credentials.json")).unwrap();
+    assert!(
+        raw.contains("iPhone 17") && raw.contains("\"v\":1"),
+        "{raw}"
+    );
+
+    // 5) cred_list（WS 管理帧）：1 条凭证。
+    consume_browser_snapshots(&mut ws, false, &[]).await;
+    ws.send(Message::text(r#"{"v":1,"type":"cred_list"}"#))
+        .await
+        .unwrap();
+    let creds = next_of_type(&mut ws, "creds").await;
+    let arr = creds["credentials"].as_array().unwrap();
+    assert_eq!(arr.len(), 1, "{creds}");
+    assert_eq!(arr[0]["label"], "iPhone 17", "{creds}");
+    let cred_id = arr[0]["id"].as_str().unwrap().to_string();
+
+    // 6) passkey 登录 begin（无认证，discoverable：allowCredentials 恒空）。
+    let (status, login_begin) =
+        post_json(&addr, "/webauthn/login/begin", None, &serde_json::json!({})).await;
+    assert_eq!(status, "200", "{login_begin}");
+    assert_eq!(
+        login_begin["publicKey"]["allowCredentials"]
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "登录 allowCredentials 空（discoverable，免选用户）：{login_begin}"
+    );
+    let login_begin_id = login_begin["beginId"].as_str().unwrap().to_string();
+
+    // 7) 软认证器断言（真签名）→ complete 200 + L2 会话载荷（与 hello 换发
+    //    同构：id UUID / token 64 hex / expiresAt unix 秒）。
+    let assertion = soft.assert_credential(&login_begin["publicKey"], origin);
+    let (status, login_done) = post_json(
+        &addr,
+        "/webauthn/login/complete",
+        None,
+        &serde_json::json!({ "beginId": login_begin_id, "credential": assertion }),
+    )
+    .await;
+    assert_eq!(status, "200", "{login_done}");
+    let session = &login_done["session"];
+    assert!(session.is_object(), "{login_done}");
+    assert!(
+        session["id"].as_str().is_some_and(|s| s.len() == 36),
+        "{login_done}"
+    );
+    assert!(
+        session["token"].as_str().is_some_and(|t| t.len() == 64),
+        "{login_done}"
+    );
+    assert!(session["expiresAt"].as_u64().is_some(), "{login_done}");
+    let pk_token = session["token"].as_str().unwrap().to_string();
+
+    // 8) sessions.json 落盘两个会话（USER_TOKEN 换发 + passkey 换发）。
+    let raw = std::fs::read_to_string(dir.join("sessions.json")).unwrap();
+    assert_eq!(
+        raw.matches("token_hash").count(),
+        2,
+        "两个会话（hello 换发 + passkey 换发）：{raw}"
+    );
+
+    // 9) sessionToken 重连 + 设备名 = passkey label。
+    let mut ws2 = connect_ws(&addr, "/ws", None).await;
+    resume_session(&mut ws2, &pk_token).await;
+    consume_browser_snapshots(&mut ws2, false, &[]).await;
+    ws2.send(Message::text(r#"{"v":1,"type":"device_list"}"#))
+        .await
+        .unwrap();
+    let devs = next_of_type(&mut ws2, "devices").await;
+    let names: Vec<&str> = devs["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"iPhone 17"),
+        "passkey 登录会话设备名 = label：{devs}"
+    );
+
+    // 10) cred_revoke：删除后列表空、该凭证登录失败。
+    ws2.send(Message::text(format!(
+        r#"{{"v":1,"type":"cred_revoke","credId":"{cred_id}"}}"#
+    )))
+    .await
+    .unwrap();
+    let creds = next_of_type(&mut ws2, "creds").await;
+    assert_eq!(
+        creds["credentials"].as_array().unwrap().len(),
+        0,
+        "删除后列表空：{creds}"
+    );
+    let (status, login_begin2) =
+        post_json(&addr, "/webauthn/login/begin", None, &serde_json::json!({})).await;
+    assert_eq!(status, "400", "无凭证后 login begin 拒绝：{login_begin2}");
+    assert_eq!(login_begin2["error"], "no_credentials", "{login_begin2}");
+
+    handle.shutdown();
+    handle.wait().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 场景 28（v1.3 passkey 持久化）：凭证表跨 relay 重启保留——重启后同一软
+/// 认证器仍可登录（含计数器回写后的单调校验：断言 counter 递增）。
+#[tokio::test]
+async fn e2e_passkey_persist_across_relay_restart() {
+    let dir = temp_state_dir();
+    let origin = "http://localhost";
+    let mut soft = SoftAuthenticator::new();
+
+    // 第一代 relay：登录 + 注册。
+    let handle = spawn_with_config(test_config(&dir, DEFAULT_SESSION_TTL_SECS)).await;
+    let addr = handle.addr;
+    let mut ws = connect_ws(&addr, "/ws", None).await;
+    let s = login_session(&mut ws, Some("iPhone")).await;
+    let st = s["token"].as_str().unwrap().to_string();
+    let (_, begin) = post_json(
+        &addr,
+        "/webauthn/register/begin",
+        Some(&st),
+        &serde_json::json!({ "label": "Mac Touch ID" }),
+    )
+    .await;
+    let credential = soft.register(&begin["publicKey"], origin);
+    let (status, done) = post_json(
+        &addr,
+        "/webauthn/register/complete",
+        Some(&st),
+        &serde_json::json!({
+            "beginId": begin["beginId"].as_str().unwrap(),
+            "credential": credential
+        }),
+    )
+    .await;
+    assert_eq!(status, "200", "{done}");
+    handle.shutdown();
+    handle.wait().await;
+
+    // 第二代 relay（同 state 目录）：登录 begin → 断言 → 成功。
+    let handle2 = spawn_with_config(test_config(&dir, DEFAULT_SESSION_TTL_SECS)).await;
+    let addr2 = handle2.addr;
+    let (status, login_begin) = post_json(
+        &addr2,
+        "/webauthn/login/begin",
+        None,
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, "200", "{login_begin}");
+    let assertion = soft.assert_credential(&login_begin["publicKey"], origin);
+    let (status, login_done) = post_json(
+        &addr2,
+        "/webauthn/login/complete",
+        None,
+        &serde_json::json!({
+            "beginId": login_begin["beginId"].as_str().unwrap(),
+            "credential": assertion
+        }),
+    )
+    .await;
+    assert_eq!(status, "200", "凭证跨重启保留，可继续登录：{login_done}");
+    handle2.shutdown();
+    handle2.wait().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 场景 29（v1.3 passkey 端点行为）：注册 401（无/错 Bearer）；无凭证
+/// login begin 400 no_credentials；未知 beginId complete 400；篡改签名
+/// complete 401；跨会话 complete 注册 401；IP 字面量 Host → 400
+/// rp_unsupported（本地 IP 直连不可用 passkey 的文档化行为）。
+#[tokio::test]
+async fn e2e_passkey_endpoint_failures() {
+    let dir = temp_state_dir();
+    let handle = spawn_with_config(test_config(&dir, DEFAULT_SESSION_TTL_SECS)).await;
+    let addr = handle.addr;
+    let origin = "http://localhost";
+
+    // 注册 begin：无 Bearer / 错 Bearer → 401。
+    let (status, v) = post_json(
+        &addr,
+        "/webauthn/register/begin",
+        None,
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, "401", "{v}");
+    let (status, v) = post_json(
+        &addr,
+        "/webauthn/register/begin",
+        Some("wrong-session-token"),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, "401", "{v}");
+    assert_eq!(v["error"], "unauthorized", "{v}");
+
+    // 无凭证：login begin → 400 no_credentials。
+    let (status, v) = post_json(&addr, "/webauthn/login/begin", None, &serde_json::json!({})).await;
+    assert_eq!(status, "400", "{v}");
+    assert_eq!(v["error"], "no_credentials", "{v}");
+
+    // 正常注册一个 passkey（后续篡改/跨会话用例的基础）。
+    let mut ws = connect_ws(&addr, "/ws", None).await;
+    let s = login_session(&mut ws, Some("iPhone")).await;
+    let st = s["token"].as_str().unwrap().to_string();
+    let (_, begin) = post_json(
+        &addr,
+        "/webauthn/register/begin",
+        Some(&st),
+        &serde_json::json!({ "label": "Key-A" }),
+    )
+    .await;
+    let mut soft = SoftAuthenticator::new();
+    let credential = soft.register(&begin["publicKey"], origin);
+    let (status, done) = post_json(
+        &addr,
+        "/webauthn/register/complete",
+        Some(&st),
+        &serde_json::json!({
+            "beginId": begin["beginId"].as_str().unwrap(),
+            "credential": credential
+        }),
+    )
+    .await;
+    assert_eq!(status, "200", "{done}");
+
+    // 未知 beginId → 400 challenge_invalid（beginId 单次消费，同时验证）。
+    let (status, v) = post_json(
+        &addr,
+        "/webauthn/login/complete",
+        None,
+        &serde_json::json!({ "beginId": "not-a-real-id", "credential": {} }),
+    )
+    .await;
+    assert_eq!(status, "400", "{v}");
+    assert_eq!(v["error"], "challenge_invalid", "{v}");
+    // 已消费的注册 beginId 重复提交 → 400。
+    let (status, v) = post_json(
+        &addr,
+        "/webauthn/register/complete",
+        Some(&st),
+        &serde_json::json!({
+            "beginId": begin["beginId"].as_str().unwrap(),
+            "credential": credential
+        }),
+    )
+    .await;
+    assert_eq!(status, "400", "challenge 单次消费：{v}");
+
+    // 篡改签名（换 challenge 签名内容）：login begin → 断言 → 篡改
+    // authenticatorData 首字节后 complete → 401 verification_failed。
+    let (status, login_begin) =
+        post_json(&addr, "/webauthn/login/begin", None, &serde_json::json!({})).await;
+    assert_eq!(status, "200", "{login_begin}");
+    let mut assertion = soft.assert_credential(&login_begin["publicKey"], origin);
+    assertion["response"]["signature"] = serde_json::Value::String("AAAA".to_string());
+    let (status, v) = post_json(
+        &addr,
+        "/webauthn/login/complete",
+        None,
+        &serde_json::json!({
+            "beginId": login_begin["beginId"].as_str().unwrap(),
+            "credential": assertion
+        }),
+    )
+    .await;
+    assert_eq!(status, "401", "{v}");
+    assert_eq!(v["error"], "verification_failed", "{v}");
+
+    // 跨会话 complete：会话 B 提交会话 A 发起的注册 challenge → 401。
+    let mut ws_b = connect_ws(&addr, "/ws", None).await;
+    let sb = login_session(&mut ws_b, Some("Mac")).await;
+    let st_b = sb["token"].as_str().unwrap().to_string();
+    let (_, begin_a) = post_json(
+        &addr,
+        "/webauthn/register/begin",
+        Some(&st),
+        &serde_json::json!({ "label": "Key-B" }),
+    )
+    .await;
+    let soft_b = SoftAuthenticator::new();
+    let credential_b = soft_b.register(&begin_a["publicKey"], origin);
+    let (status, v) = post_json(
+        &addr,
+        "/webauthn/register/complete",
+        Some(&st_b),
+        &serde_json::json!({
+            "beginId": begin_a["beginId"].as_str().unwrap(),
+            "credential": credential_b
+        }),
+    )
+    .await;
+    assert_eq!(status, "401", "challenge 归属发起会话：{v}");
+
+    // IP 字面量 Host（本地 127.0.0.1 直连形态）→ 400 rp_unsupported。
+    let (status, resp) =
+        http_post_json(&addr, "/webauthn/login/begin", None, "127.0.0.1:3010", "{}").await;
+    assert_eq!(status, "400", "{resp}");
+    assert!(resp.contains("rp_unsupported"), "{resp}");
+
+    handle.shutdown();
+    handle.wait().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 场景 30（v1.3 passkey begin 限流）：每 IP 10 次/分——第 11 次 login
+/// begin 429（200/400 均计数，429 与业务错误可区分）。
+#[tokio::test]
+async fn e2e_passkey_begin_rate_limit() {
+    let handle = spawn_test_relay().await;
+    let addr = handle.addr;
+    // 未注册凭证：前 10 次 400 no_credentials，第 11 次 429。
+    for i in 0..10 {
+        let (status, v) =
+            post_json(&addr, "/webauthn/login/begin", None, &serde_json::json!({})).await;
+        assert_eq!(status, "400", "第 {} 次应为业务错误而非限流：{v}", i + 1);
+    }
+    let (status, v) = post_json(&addr, "/webauthn/login/begin", None, &serde_json::json!({})).await;
+    assert_eq!(status, "429", "{v}");
+    assert_eq!(v["error"], "rate_limited", "{v}");
 
     handle.shutdown();
     handle.wait().await;

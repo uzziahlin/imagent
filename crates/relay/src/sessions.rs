@@ -11,8 +11,13 @@
 //! - **token 落盘只存哈希**（sha256 hex，[`SessionRecord::token_hash`]），
 //!   内存校验用恒定时间比较——即使读到 sessions.json 也伪造不出凭证；
 //! - 会话表 ≤ [`MAX_SESSIONS`]（32）：超限时先惰性清理过期会话、再淘汰
-//!   吊销墓碑（最旧优先），仍满则拒绝换发（调用方 close 1008
-//!   "too many sessions"）；
+//!   吊销墓碑（最旧优先）、**仍满则 LRU 淘汰 last_seen 最旧的离线会话**——
+//!   只有全部 32 个会话都在线时才拒绝换发（调用方 close 1008
+//!   "too many sessions"）。两级淘汰是修死锁的：真实发生过「单用户反复
+//!   测试/重登累积占满 32 个会话、且所有有效会话的设备都不在线（无法
+//!   自助 device_revoke 吊销腾位）→ 新登录全部被拒 → 死锁只能登 ECS 删
+//!   sessions.json」（见运维记录）。淘汰**离线**会话不伤在线设备，被淘汰
+//!   设备下次访问按 session 失效走重新登录即可；
 //! - 吊销留**墓碑**（`revoked=true`——「会话表移除其有效会话资格」）：
 //!   重连可区分 "session revoked" 与 "auth failed"（协议 v1.2 §2 的 reason
 //!   区分要求）；墓碑不进 devices 列表，仅在容量压力下被淘汰；
@@ -35,8 +40,9 @@ use tokio::sync::mpsc;
 use crate::{constant_time_eq, Outbound, TARGET};
 
 /// 会话表上限（协议 v1.2）：表小是为了「按 token 全表恒定时间匹配」的
-/// 扫描成本可控；超限拒绝**新换发**（先清理过期/墓碑腾位，见
-/// [`SessionStore::issue`]）。真机常态 2~5 台设备，32 留足余量。
+/// 扫描成本可控；超限先清理过期/墓碑、仍满则 LRU 淘汰最旧离线会话腾位
+///（见 [`SessionStore::issue`]——全部在线才拒绝）。真机常态 2~5 台设备，
+/// 32 留足余量。
 pub(crate) const MAX_SESSIONS: usize = 32;
 /// 会话表文件名（落在 `state_dir` 下）。
 const SESSIONS_FILE: &str = "sessions.json";
@@ -291,13 +297,22 @@ impl SessionStore {
         })
     }
 
-    /// 换发新会话（USER_TOKEN 验证通过后调用）：先惰性清理过期会话；表仍
-    /// 满 → 淘汰吊销墓碑（last_seen 最旧优先——防「32 个墓碑永久堵死
-    /// 登录」）；仍满 → Err（调用方 close 1008 "too many sessions"）。
+    /// 换发新会话（USER_TOKEN / passkey 登录验证通过后调用），容量满时的
+    /// 三级腾位（修死锁，见模块头注释）：
+    /// 1. 惰性清理过期会话；
+    /// 2. 淘汰吊销墓碑（last_seen 最旧优先——防「32 个墓碑永久堵死登录」）；
+    /// 3. **LRU 淘汰 last_seen 最旧的离线会话**（在线会话有活跃 WS 连接，
+    ///    踢了等于断正在使用的设备）——只有全部 32 个会话都在线才 Err
+    ///    （调用方 close 1008 "too many sessions"；单浏览器并存上限 8 条
+    ///    （[`crate::MAX_BROWSERS`]）< 32，正常运行到不了这个分支，它是
+    ///    防真实滥用的最后防线）。
+    ///
     /// token 明文只在返回值里出现一次（不落盘，落盘的是哈希）。
     pub(crate) fn issue(&self, name: &str, now: u64, ttl_secs: u64) -> Result<IssuedSession, ()> {
         self.with_lock(|st| {
+            // 1) 惰性清理过期。
             st.sessions.retain(|_, r| r.expires_at > now);
+            // 2) 墓碑淘汰（last_seen 最旧优先）。
             if st.sessions.len() >= MAX_SESSIONS {
                 let mut tombstones: Vec<(u64, String)> = st
                     .sessions
@@ -310,6 +325,27 @@ impl SessionStore {
                     st.sessions.remove(&id);
                     if st.sessions.len() < MAX_SESSIONS {
                         break;
+                    }
+                }
+            }
+            // 3) LRU：淘汰 last_seen 最旧的**离线**会话（无活跃 WS 连接）。
+            //    tie-break 按 id 保证同秒批量签发时结果确定（测试可断言）。
+            if st.sessions.len() >= MAX_SESSIONS {
+                let mut offline: Vec<(u64, String)> = st
+                    .sessions
+                    .iter()
+                    .filter(|(_, r)| r.conns.is_empty())
+                    .map(|(id, r)| (r.last_seen, id.clone()))
+                    .collect();
+                offline.sort();
+                if let Some((_, evict)) = offline.into_iter().next() {
+                    if let Some(rec) = st.sessions.remove(&evict) {
+                        tracing::info!(
+                            target: TARGET,
+                            session = %evict,
+                            device = %rec.name,
+                            "会话表满，LRU 淘汰最旧离线会话（设备重新登录即可恢复）"
+                        );
                     }
                 }
             }
@@ -470,8 +506,9 @@ fn generate_session_token() -> String {
 
 /// 原子写盘（tmp + rename；0600 权限——会话哈希虽非明文凭证，仍按敏感
 /// 数据保护）：fsync 保证重启后会话记录不丢（协议 v1.2 §5 的「重启后会话
-/// 保留」依赖此处的持久性）。
-fn write_atomic(path: &Path, json: &str) -> std::io::Result<()> {
+/// 保留」依赖此处的持久性）。credentials.json（webauthn 凭证表）复用同款
+/// 纪律。
+pub(crate) fn write_atomic(path: &Path, json: &str) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -615,49 +652,146 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 32 上限：灌满 → 新换发被拒；过期清理腾位后可再换发；满员时吊销
-    /// 墓碑被淘汰（腾位）而非永久堵死登录。
+    /// 32 上限三级腾位（LRU 改进版）：过期清理腾位；墓碑淘汰腾位；**32 个
+    /// 离线会话占满 → 新换发成功并淘汰 last_seen 最旧的离线会话**（修死锁：
+    /// 全员离线时用户无从自助吊销，只能登服务器删表）；混布场景跳过在线
+    /// 会话只淘汰离线最旧；全部 32 个会话在线（bind 活跃连接）→ 才拒绝。
     #[test]
     fn session_cap_eviction_and_reject() {
+        // ---- 1) LRU：32 离线占满 → 新登录成功，最旧被淘汰 ----
         let dir = temp_dir();
         let store = SessionStore::load_at(&dir, 0);
         let now = 100u64;
-
-        // 3 个短命 + 29 个长期 = 恰好 32。
-        for i in 0..3 {
+        // 32 个长期会话；签发时刻错开使 last_seen 全序可断言（最旧 =
+        // oldest-0，last_seen=100）。全部离线（无 bind）。
+        for i in 0..MAX_SESSIONS {
             store
-                .issue(&format!("short-{i}"), now, 5)
-                .unwrap_or_else(|_| panic!("short-{i} 应成功"));
+                .issue(&format!("oldest-{i}"), now + i as u64, 3_600)
+                .unwrap_or_else(|_| panic!("oldest-{i} 应成功"));
+        }
+        assert_eq!(store.devices(now + 50).len(), MAX_SESSIONS);
+        // 死锁修复主场景：全部离线 → 登录不被拒；最旧（oldest-0）被淘汰。
+        assert!(
+            store.issue("newcomer", now + 50, 3_600).is_ok(),
+            "32 离线占满：LRU 淘汰腾位，登录不被拒"
+        );
+        let names: Vec<String> = store
+            .devices(now + 51)
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(names.len(), MAX_SESSIONS, "淘汰一入一出：总数仍 32");
+        assert!(names.contains(&"newcomer".to_string()), "新登录在列表");
+        assert!(
+            !names.contains(&"oldest-0".to_string()),
+            "最旧 last_seen（oldest-0，t=100）被淘汰：{names:?}"
+        );
+        assert!(
+            names.contains(&"oldest-1".to_string()),
+            "次旧保留（只淘汰一个）：{names:?}"
+        );
+
+        // ---- 2) 过期清理腾位（独立实例，时钟可控）----
+        let dir2 = temp_dir();
+        let store2 = SessionStore::load_at(&dir2, 0);
+        let t = 1_000u64;
+        for i in 0..3 {
+            store2.issue(&format!("doomed-{i}"), t, 5).unwrap();
         }
         for i in 0..(MAX_SESSIONS - 3) {
-            store
-                .issue(&format!("d{i}"), now, 3_600)
-                .unwrap_or_else(|_| panic!("d{i} 应成功"));
+            store2
+                .issue(&format!("live-{i}"), t + 1 + i as u64, 3_600)
+                .unwrap();
         }
         assert!(
-            store.issue("extra", now, 3_600).is_err(),
-            "满员（32 个未过期未吊销）拒绝新换发"
+            store2.issue("after-expiry", t + 10, 3_600).is_ok(),
+            "过期清理（3 个 doomed）腾位后可再换发"
         );
-        assert!(
-            store.issue("ok", now + 6, 3_600).is_ok(),
-            "过期清理腾位后可再换发"
+        let names: Vec<String> = store2.devices(t + 11).into_iter().map(|d| d.name).collect();
+        assert_eq!(
+            names.len(),
+            MAX_SESSIONS - 3 + 1,
+            "过期清理只清 3 个：{names:?}"
         );
+        assert!(!names.iter().any(|n| n.starts_with("doomed")), "{names:?}");
+        assert!(names.contains(&"after-expiry".to_string()), "{names:?}");
 
-        // 灌满后吊销最旧 3 个 → 墓碑淘汰腾位，登录不被墓碑堵死。
-        let mut t0 = now + 10;
-        while store.issue("fill", t0, 3_600).is_ok() {
-            t0 += 1; // 推进时钟让「最旧墓碑」可判定
-        }
-        assert_eq!(store.devices(t0).len(), MAX_SESSIONS);
-        for d in store.devices(t0).iter().take(3) {
-            store.revoke(&d.id, t0);
+        // ---- 3) 墓碑淘汰腾位（优先于 LRU：清完墓碑即腾出，无需动离线活会话）----
+        // 灌回 32（当前 30）：再签 2 个。
+        store2.issue("fill-a", t + 20, 3_600).unwrap();
+        store2.issue("fill-b", t + 21, 3_600).unwrap();
+        assert_eq!(store2.devices(t + 22).len(), MAX_SESSIONS);
+        // 吊销 2 个（t+22 后墓碑 last_seen 最旧）→ 签发走墓碑淘汰。
+        let victims: Vec<String> = store2
+            .devices(t + 22)
+            .into_iter()
+            .take(2)
+            .map(|d| d.id)
+            .collect();
+        for id in &victims {
+            store2.revoke(id, t + 23);
         }
         assert!(
-            store.issue("after-revoke", t0 + 1, 3_600).is_ok(),
+            store2.issue("after-revoke", t + 24, 3_600).is_ok(),
             "墓碑淘汰腾位：吊销不堵死登录"
         );
 
+        // ---- 4) LRU 选择性：在线会话跳过，只淘汰离线最旧 ----
+        let dir3 = temp_dir();
+        let store3 = SessionStore::load_at(&dir3, 0);
+        let first = store3.issue("oldest-but-online", 2_000, 3_600).unwrap();
+        let (tx_keep, _rx_keep) = mpsc::channel(8);
+        assert!(store3.bind(&first.id, 1, tx_keep));
+        store3.verify(&first.token, 2_050); // last_seen = 2050（仍最旧）
+        for i in 1..MAX_SESSIONS {
+            store3
+                .issue(&format!("off-{i}"), 2_100 + i as u64, 3_600)
+                .unwrap();
+        }
+        assert_eq!(store3.devices(3_000).len(), MAX_SESSIONS);
+        assert!(
+            store3.issue("latecomer", 3_000, 3_600).is_ok(),
+            "满员但存在离线候选：LRU 淘汰腾位"
+        );
+        let devices: Vec<(String, bool)> = store3
+            .devices(3_001)
+            .into_iter()
+            .map(|d| (d.name, d.connected))
+            .collect();
+        assert!(
+            devices.iter().any(|(n, c)| n == "oldest-but-online" && *c),
+            "在线最旧会话不被 LRU 淘汰：{devices:?}"
+        );
+        assert!(
+            !devices.iter().any(|(n, _)| n == "off-1"),
+            "离线最旧（off-1，last_seen=2101）被淘汰：{devices:?}"
+        );
+        assert_eq!(devices.len(), MAX_SESSIONS, "淘汰一入一出：总数仍 32");
+
+        // ---- 5) 全在线 → 拒绝（真实滥用形态的最后防线）。bind 不受 WS 并存
+        // 上限约束（e2e 侧 MAX_BROWSERS=8 < 32，无法经真连接铺满 32 个在线
+        // 会话，该分支在单元层覆盖）。当前 32 个中 1 在线 + 31 离线：逐个
+        // 签发并 bind（每次签发淘汰一个离线候选），直到无离线可淘汰。----
+        let mut n = 2u64;
+        let mut clock = 3_100u64;
+        while let Ok(issued) = store3.issue("online-fill", clock, 3_600) {
+            let (tx, _rx) = mpsc::channel(8);
+            assert!(store3.bind(&issued.id, n, tx), "逐个 bind 使全部会话在线");
+            n += 1;
+            clock += 1;
+        }
+        assert!(
+            store3.devices(clock).iter().all(|d| d.connected),
+            "签发被拒时全部会话都在线"
+        );
+        assert!(
+            store3.issue("all-online", clock + 1, 3_600).is_err(),
+            "全部在线（无离线可淘汰）→ 拒绝"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+        let _ = std::fs::remove_dir_all(&dir3);
     }
 
     /// connected 标记与 revoke 断连：bind 后 connected=true；unbind 摘除

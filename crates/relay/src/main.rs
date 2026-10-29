@@ -11,6 +11,11 @@
 //! - `IMAGENT_RELAY_STATE_DIR`：会话状态目录（缺省
 //!   `/var/lib/imagent-relay`，会话表落盘 `<dir>/sessions.json`）；systemd
 //!   部署可配 `StateDirectory=imagent-relay`（落同一路径）。
+//! - `IMAGENT_RELAY_RP_ID`（可选）：passkey（WebAuthn）RP ID 覆盖——缺省
+//!   按请求 Host 去端口推导（公网 `relay.example.com:8443` →
+//!   `relay.example.com`）；固定后换域名/端口不动已注册凭证。注意
+//!   本地 http IP 直连（127.0.0.1）不可用 passkey（rp_id 域名校验 + secure
+//!   context），本地调试走 USER_TOKEN 路径或用 `localhost` 主机名。
 //! - `IMAGENT_RELAY_BIND`：缺省 127.0.0.1:3010（loopback-only）。
 
 use std::net::SocketAddr;
@@ -147,11 +152,19 @@ fn relay_config_from_env() -> Result<RelayConfig, String> {
             state_dir.display()
         ));
     }
+    // passkey RP ID 覆盖（可选；空值按未设处理——缺省推导）。合法性（须为
+    // 请求 Host 的有效域名）在 webauthn begin 端点按 builder 校验兜底，不在
+    // 启动期拒（推导出的 origin 请求期才知道）。
+    let webauthn_rp_id = std::env::var("IMAGENT_RELAY_RP_ID")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
     let cfg = RelayConfig {
         gateway_tokens,
         user_token,
         state_dir,
         session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
+        webauthn_rp_id,
     };
     cfg.validate()?;
     Ok(cfg)

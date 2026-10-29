@@ -1,4 +1,4 @@
-import { normalizeExpiryMs, type DeviceInfo } from "../lib/protocol";
+import { normalizeExpiryMs, type DeviceInfo, type PasskeyInfo } from "../lib/protocol";
 import { useExitMounted } from "./useExitMounted";
 
 /** 相对时间（v1.2 设备列表「最后活跃」）：刚刚 / N 分钟前 / N 小时前 / N 天前。
@@ -21,9 +21,11 @@ export function relativeTime(ts: number | undefined, now = Date.now()): string {
 }
 
 /**
- * 已登录设备弹层（v1.2）：列表（设备名 / 在线状态点 / 最后活跃相对时间）、
- * 每项「吊销」；id === selfId 的项标「本机」，其吊销按钮为「吊销并退出」
- * （App 侧语义：吊销本机 = 登出）。devices 为 null = 已发 device_list 待回包。
+ * 已登录设备弹层（v1.2 + v1.3 通行钥匙）：设备列表（设备名 / 在线状态点 /
+ * 最后活跃相对时间、每项「吊销」；id === selfId 的项标「本机」，其吊销按钮
+ * 为「吊销并退出」——App 侧语义：吊销本机 = 登出）+ 通行钥匙区（passkey
+ * 列表 label/created、每项「删除」、「添加通行钥匙」按钮走注册流程，label
+ * 用本机设备名）。devices / passkeys 为 null = 已发列表帧待回包。
  *
  * 进出过渡（150ms ease）：open 经 useExitMounted 延迟卸载；遮罩 fade + 面板
  * fade/scale；关闭后 visibility 摘除可聚焦性（transition 离散翻转在动画末尾生效）。
@@ -31,17 +33,34 @@ export function relativeTime(ts: number | undefined, now = Date.now()): string {
 export function DeviceManager({
   open,
   devices,
+  passkeys,
+  webauthnAvailable,
+  passkeyBusy,
+  passkeyMessage,
   selfId,
   onRevoke,
+  onAddPasskey,
+  onRevokePasskey,
   onClose,
 }: {
   /** 弹层开关（App 恒挂载本组件，open 只切显隐）。 */
   open: boolean;
   /** null = 加载中（打开面板即发 device_list，relay 回 devices 帧更新）。 */
   devices: DeviceInfo[] | null;
+  /** null = 加载中（打开面板即发 cred_list，relay 回 creds 帧更新）。 */
+  passkeys: PasskeyInfo[] | null;
+  /** 本机浏览器是否支持 WebAuthn（不支持则通行钥匙区只显示指引）。 */
+  webauthnAvailable: boolean;
+  /** 注册 ceremony 进行中（「添加通行钥匙」禁用 + 等待系统弹窗）。 */
+  passkeyBusy: boolean;
+  /** 注册/删除的结果提示（成功/失败一行文案；null 不显示）。 */
+  passkeyMessage: string | null;
   /** 本机会话 id（hello_ack.session.id）；与列表项 id 匹配标「本机」。 */
   selfId?: string;
   onRevoke: (device: DeviceInfo) => void;
+  /** 「添加通行钥匙」：App 侧走 lib/webauthn 注册流程。 */
+  onAddPasskey: () => void;
+  onRevokePasskey: (passkey: PasskeyInfo) => void;
   onClose: () => void;
 }) {
   const mounted = useExitMounted(open, 150);
@@ -129,8 +148,61 @@ export function DeviceManager({
             })}
           </ul>
         )}
+        {/* v1.3 通行钥匙区：列表/删除 + 添加（注册 label 用设备名）。 */}
+        <div className="mt-4 border-t border-line pt-3">
+          <div className="mb-2 flex items-center">
+            <h3 className="text-xs font-semibold uppercase tracking-wider text-ghost">通行钥匙</h3>
+            {webauthnAvailable && (
+              <button
+                type="button"
+                onClick={onAddPasskey}
+                disabled={passkeyBusy}
+                className="press ml-auto rounded-lg border border-line-strong px-2 py-1 text-xs text-muted transition-colors hover:border-emerald-500/60 hover:text-ink disabled:opacity-60"
+              >
+                {passkeyBusy ? "等待系统弹窗…" : "添加通行钥匙"}
+              </button>
+            )}
+          </div>
+          {!webauthnAvailable ? (
+            <p className="py-1 text-[11px] leading-relaxed text-ghost">
+              本浏览器不支持通行钥匙（或非安全上下文），登录请使用访问令牌。
+            </p>
+          ) : passkeys === null ? (
+            <p className="py-1 text-center text-xs text-ghost">加载中…</p>
+          ) : passkeys.length === 0 ? (
+            <p className="py-1 text-[11px] leading-relaxed text-ghost">
+              尚未注册通行钥匙。添加后可在登录页免令牌一步登录。
+            </p>
+          ) : (
+            <ul className="max-h-40 space-y-1 overflow-y-auto overscroll-contain" aria-label="通行钥匙列表">
+              {passkeys.map((p) => (
+                <li
+                  key={p.id}
+                  className="flex items-center gap-2.5 rounded-xl border border-line bg-surface px-3 py-2"
+                >
+                  <svg viewBox="0 0 20 20" className="h-4 w-4 shrink-0 text-emerald-500" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden="true">
+                    <circle cx="7" cy="10" r="3.2" />
+                    <path d="M10.2 10h6.3M14 10v2.2M16.5 10v1.6" strokeLinecap="round" />
+                  </svg>
+                  <div className="min-w-0 flex-1">
+                    <div className="min-w-0 truncate text-sm text-ink">{p.label}</div>
+                    <div className="text-[11px] text-ghost">注册于 {relativeTime(p.created)}</div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => onRevokePasskey(p)}
+                    className="press shrink-0 rounded-lg border border-line-strong px-2 py-1 text-xs text-muted transition-colors hover:border-rose-400/60 hover:text-rose-600 dark:hover:border-rose-500/50 dark:hover:text-rose-300"
+                  >
+                    删除
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          {passkeyMessage && <p className="mt-2 text-[11px] leading-relaxed text-faint">{passkeyMessage}</p>}
+        </div>
         <p className="mt-3 text-[11px] leading-relaxed text-faint">
-          吊销后该设备需重新输入访问令牌登录；吊销本机将退出当前登录。
+          吊销后该设备需重新输入访问令牌登录；吊销本机将退出当前登录。删除通行钥匙后该设备无法再免令牌登录。
         </p>
       </div>
     </div>

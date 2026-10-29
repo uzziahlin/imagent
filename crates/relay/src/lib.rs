@@ -37,6 +37,14 @@
 //!   `/var/lib/imagent-relay`，main 负责 mkdir）——**部署注意**：systemd
 //!   需配 `StateDirectory=imagent-relay`（落于同一路径）或显式设该 env，
 //!   否则写盘失败只会降级为「重启后全员重登」。
+//! - **passkey 登录（帧协议 v1.3，见 [`webauthn`]）**：relay 作为 WebAuthn
+//!   Relying Party——`POST /webauthn/{register,login}/{begin,complete}` 四
+//!   端点（注册经 `Authorization: Bearer <sessionToken>` 认证，登录免认证、
+//!   discoverable credential 免选用户）；登录成功直接换发 L2 会话（响应与
+//!   hello 换发同构）。凭证表落盘 `<state_dir>/credentials.json`，管理帧
+//!   `cred_list` / `cred_revoke`（设备管理弹层）。rp_id 缺省按请求 Host
+//!   去端口推导，env `IMAGENT_RELAY_RP_ID` 可覆盖；本地 http IP 直连形态
+//!   不可用 passkey（secure context + rp_id 域名校验），走 USER_TOKEN 路径。
 //!
 //! 分层（任务说明 §4.7）：核心状态机全部在本 lib（可单测 + 集成测试直接
 //! [`spawn_relay`] 起真 server），`main.rs` 只做 env / bind / tracing 组装。
@@ -64,6 +72,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 
 mod sessions;
+mod webauthn;
 
 use sessions::{DeviceView, SessionLookup, SessionStore};
 
@@ -240,6 +249,10 @@ pub struct RelayConfig {
     /// 会话有效期（秒）：缺省 [`DEFAULT_SESSION_TTL_SECS`]（30 天）；测试
     /// 可缩短验证过期路径。
     pub session_ttl_secs: u64,
+    /// passkey RP ID 覆盖（`IMAGENT_RELAY_RP_ID`，缺省 None = 按请求 Host
+    /// 去端口推导）：固定 rp_id 后换域名/端口不动已注册凭证（WebAuthn
+    /// 凭证绑定 rp_id 而非 origin）。
+    pub webauthn_rp_id: Option<String>,
 }
 
 impl RelayConfig {
@@ -570,22 +583,32 @@ fn devices_frame(devices: &[DeviceView]) -> Message {
     Message::text(serde_json::json!({"v": 1, "type": "devices", "devices": arr}).to_string())
 }
 
-/// 浏览器侧 transport 管理帧（协议 v1.2 §4）：设备列表 / 吊销——浏览器与
-/// relay 自产自消，**不进业务路由**（与 sync/ping 的歧义豁免同级，在
-/// machine 路由之前分拣）。`device_revoke` 缺 deviceId / 非字符串 → 按
-/// no-op 吊销处理（回当前 devices 帧），不让畸形管理帧漏进业务路由。
+/// 浏览器侧 transport 管理帧（协议 v1.2 §4 + passkey 扩展）：设备列表 /
+/// 吊销 + 通行钥匙列表 / 删除——浏览器与 relay 自产自消，**不进业务路由**
+///（与 sync/ping 的歧义豁免同级，在 machine 路由之前分拣）。`device_revoke`
+/// 缺 deviceId / `cred_revoke` 缺 credId / 非字符串 → 按 no-op 处理（回当前
+/// 列表帧），不让畸形管理帧漏进业务路由。
 #[derive(Debug)]
-enum DeviceFrame {
-    List,
-    Revoke(String),
+enum ManageFrame {
+    DeviceList,
+    DeviceRevoke(String),
+    CredList,
+    CredRevoke(String),
 }
 
-fn parse_device_frame(text: &str) -> Option<DeviceFrame> {
+fn parse_manage_frame(text: &str) -> Option<ManageFrame> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
     match v.get("type")?.as_str()? {
-        "device_list" => Some(DeviceFrame::List),
-        "device_revoke" => Some(DeviceFrame::Revoke(
+        "device_list" => Some(ManageFrame::DeviceList),
+        "device_revoke" => Some(ManageFrame::DeviceRevoke(
             v.get("deviceId")
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .to_string(),
+        )),
+        "cred_list" => Some(ManageFrame::CredList),
+        "cred_revoke" => Some(ManageFrame::CredRevoke(
+            v.get("credId")
                 .and_then(|d| d.as_str())
                 .unwrap_or("")
                 .to_string(),
@@ -1061,6 +1084,9 @@ struct RelayState {
     config: Arc<RelayConfig>,
     /// 会话表（v1.2）：启动时从 `<state_dir>/sessions.json` 加载。
     sessions: Arc<SessionStore>,
+    /// passkey 层（凭证表 + challenge 表 + begin 限流）：启动时从
+    /// `<state_dir>/credentials.json` 加载。
+    webauthn: Arc<webauthn::WebauthnState>,
 }
 
 /// SPA 静态资源（M1 占位 index.html；M3 构建产物落入 `static/` 后零改动挂载）。
@@ -1204,9 +1230,9 @@ enum HelloOutcome {
     Browser(BrowserSession),
 }
 
-/// 换发新会话（USER_TOKEN 验证通过后）。会话表满（清理+墓碑淘汰后仍 ≥
-/// [`sessions::MAX_SESSIONS`]）→ Err（调用方 close 1008 "too many
-/// sessions"）。
+/// 换发新会话（USER_TOKEN / passkey 登录验证通过后调用）。会话表满时三级
+/// 腾位（过期 → 墓碑 → LRU 最旧离线，见 [`SessionStore::issue`]）；全部
+/// 32 个会话都在线才 Err（调用方 close 1008 "too many sessions"）。
 fn issue_session(
     st: &RelayState,
     headers: &HeaderMap,
@@ -1499,18 +1525,19 @@ async fn handle_connection(mut socket: WebSocket, st: RelayState, role: Role, he
                             // 互相顶死的环。
                             match role {
                                 Role::Browser => {
-                                    // transport 管理帧（v1.2 设备管理）：relay
-                                    // 自产自消，不进业务路由（先于 machine 分拣）。
-                                    if let Some(df) = parse_device_frame(text.as_str()) {
-                                        match df {
-                                            DeviceFrame::List => {
+                                    // transport 管理帧（v1.2 设备管理 + passkey
+                                    // 凭证管理）：relay 自产自消，不进业务路由
+                                    //（先于 machine 分拣）。
+                                    if let Some(mf) = parse_manage_frame(text.as_str()) {
+                                        match mf {
+                                            ManageFrame::DeviceList => {
                                                 let _ = socket
                                                     .send(devices_frame(&st.sessions.devices(
                                                         sessions::unix_now(),
                                                     )))
                                                     .await;
                                             }
-                                            DeviceFrame::Revoke(device_id) => {
+                                            ManageFrame::DeviceRevoke(device_id) => {
                                                 // 单用户语义（见 SessionStore::revoke
                                                 // 头注释）：任一在线会话可吊销其它。
                                                 // 先摘投递口再回 devices 帧：被吊销
@@ -1524,6 +1551,23 @@ async fn handle_connection(mut socket: WebSocket, st: RelayState, role: Role, he
                                                     .send(devices_frame(&st.sessions.devices(
                                                         sessions::unix_now(),
                                                     )))
+                                                    .await;
+                                            }
+                                            ManageFrame::CredList
+                                            | ManageFrame::CredRevoke(_) => {
+                                                // passkey 凭证列表/删除（webauthn
+                                                // 模块自产 creds 帧；单用户语义同
+                                                // device 族——任一在线会话可删）。
+                                                let (kind, cred_id) = match mf {
+                                                    ManageFrame::CredRevoke(id) => ("cred_revoke", id),
+                                                    _ => ("cred_list", String::new()),
+                                                };
+                                                let _ = socket
+                                                    .send(Message::text(
+                                                        webauthn::handle_cred_frame(
+                                                            &st, kind, &cred_id,
+                                                        ),
+                                                    ))
                                                     .await;
                                             }
                                         }
@@ -1630,15 +1674,20 @@ pub fn spawn_relay(listener: TcpListener, config: RelayConfig) -> Result<RelayHa
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let hub = Hub::new(shutdown_rx.clone());
     let sessions = Arc::new(SessionStore::load(&config.state_dir));
+    let webauthn_state = webauthn::new_state(&config.state_dir, config.webauthn_rp_id.clone());
     let state = RelayState {
         hub: hub.clone(),
         config: Arc::new(config),
         sessions,
+        webauthn: webauthn_state,
     };
     let app = Router::new()
         .route("/gateway", get(gateway_ws))
         .route("/ws", get(browser_ws))
         .route("/healthz", get(healthz))
+        // passkey（WebAuthn）HTTP 端点（注册 begin/complete + 登录 begin/
+        // complete，同源 fetch；裸路径 + /imagent 前缀两形态对齐 WS 端点）。
+        .merge(webauthn::routes())
         // 前缀路由与静态前缀剥离（spa_fallback）同款理由：兼容不经 Caddy
         // 的直连形态（本地开发/验收直开 http://127.0.0.1:3010/）——SPA 按
         // Vite base=/imagent/ 把 WS/探活地址推导为 /imagent/ws 等；公网
@@ -1672,14 +1721,18 @@ pub fn spawn_relay(listener: TcpListener, config: RelayConfig) -> Result<RelayHa
         }
     };
     let task = tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app)
+        // into_make_service_with_connect_info：WebAuthn begin 端点限流需要
+        // 直连对端 IP（公网形态恒为 Caddy 127.0.0.1，真实 IP 走
+        // X-Forwarded-For，见 webauthn::rate_limit_key）。
+        let make_service = app.into_make_service_with_connect_info::<SocketAddr>();
+        if let Err(e) = axum::serve(listener, make_service)
             .with_graceful_shutdown(drain)
             .await
         {
             tracing::warn!(target: TARGET, error = %e, "relay serve 退出（错误）");
         }
     });
-    tracing::info!(target: TARGET, addr = %addr, "relay listening（/gateway /ws /healthz + SPA fallback）");
+    tracing::info!(target: TARGET, addr = %addr, "relay listening（/gateway /ws /healthz /webauthn/* + SPA fallback）");
     Ok(RelayHandle {
         addr,
         shutdown: shutdown_tx,
@@ -1891,32 +1944,51 @@ mod tests {
         );
     }
 
-    /// 设备管理帧分拣（v1.2）：device_list / device_revoke（含缺 deviceId
-    /// 的 no-op 形态）/ 业务帧不误判。
+    /// 管理帧分拣（v1.2 设备族 + passkey 凭证族）：device_list /
+    /// device_revoke（含缺 deviceId 的 no-op 形态）/ cred_list / cred_revoke
+    ///（含缺 credId 的 no-op 形态）/ 业务帧不误判。
     #[test]
-    fn device_frame_parsing() {
+    fn manage_frame_parsing() {
         assert!(matches!(
-            parse_device_frame(r#"{"v":1,"type":"device_list"}"#),
-            Some(DeviceFrame::List)
+            parse_manage_frame(r#"{"v":1,"type":"device_list"}"#),
+            Some(ManageFrame::DeviceList)
         ));
-        match parse_device_frame(r#"{"v":1,"type":"device_revoke","deviceId":"abc"}"#) {
-            Some(DeviceFrame::Revoke(id)) => assert_eq!(id, "abc"),
+        match parse_manage_frame(r#"{"v":1,"type":"device_revoke","deviceId":"abc"}"#) {
+            Some(ManageFrame::DeviceRevoke(id)) => assert_eq!(id, "abc"),
             other => panic!("device_revoke 应解析出 deviceId：{other:?}"),
         }
         // 畸形 device_revoke（缺 deviceId / 非字符串）→ no-op 吊销（回
         // devices 帧），不漏进业务路由。
-        match parse_device_frame(r#"{"v":1,"type":"device_revoke"}"#) {
-            Some(DeviceFrame::Revoke(id)) => assert_eq!(id, ""),
+        match parse_manage_frame(r#"{"v":1,"type":"device_revoke"}"#) {
+            Some(ManageFrame::DeviceRevoke(id)) => assert_eq!(id, ""),
             other => panic!("{other:?}"),
         }
         assert!(matches!(
-            parse_device_frame(r#"{"v":1,"type":"device_revoke","deviceId":42}"#),
-            Some(DeviceFrame::Revoke(ref id)) if id.is_empty()
+            parse_manage_frame(r#"{"v":1,"type":"device_revoke","deviceId":42}"#),
+            Some(ManageFrame::DeviceRevoke(ref id)) if id.is_empty()
+        ));
+        // passkey 凭证族。
+        assert!(matches!(
+            parse_manage_frame(r#"{"v":1,"type":"cred_list"}"#),
+            Some(ManageFrame::CredList)
+        ));
+        match parse_manage_frame(r#"{"v":1,"type":"cred_revoke","credId":"c-1"}"#) {
+            Some(ManageFrame::CredRevoke(id)) => assert_eq!(id, "c-1"),
+            other => panic!("cred_revoke 应解析出 credId：{other:?}"),
+        }
+        // 畸形 cred_revoke（缺 credId / 非字符串）→ no-op 删除。
+        assert!(matches!(
+            parse_manage_frame(r#"{"v":1,"type":"cred_revoke"}"#),
+            Some(ManageFrame::CredRevoke(ref id)) if id.is_empty()
+        ));
+        assert!(matches!(
+            parse_manage_frame(r#"{"v":1,"type":"cred_revoke","credId":true}"#),
+            Some(ManageFrame::CredRevoke(ref id)) if id.is_empty()
         ));
         // 业务帧 / 畸形 JSON → None（走正常路由）。
-        assert!(parse_device_frame(r#"{"v":1,"type":"message","text":"hi"}"#).is_none());
-        assert!(parse_device_frame(r#"{"v":1,"type":"sync"}"#).is_none());
-        assert!(parse_device_frame("not json").is_none());
+        assert!(parse_manage_frame(r#"{"v":1,"type":"message","text":"hi"}"#).is_none());
+        assert!(parse_manage_frame(r#"{"v":1,"type":"sync"}"#).is_none());
+        assert!(parse_manage_frame("not json").is_none());
     }
 
     /// 设备名解析：device 字段优先（trim）/ UA 摘要 / 无 UA 回退。
@@ -2110,6 +2182,7 @@ mod tests {
             user_token: u.to_string(),
             state_dir: std::env::temp_dir(),
             session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
+            webauthn_rp_id: None,
         };
         assert!(cfg("default=g-token", "u-token").validate().is_ok());
         // 直接构造空表（parse 已拒绝空表，这里走 validate 防线）。
@@ -2118,6 +2191,7 @@ mod tests {
             user_token: "u-token".to_string(),
             state_dir: std::env::temp_dir(),
             session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
+            webauthn_rp_id: None,
         };
         let err = bad.validate().unwrap_err();
         assert!(

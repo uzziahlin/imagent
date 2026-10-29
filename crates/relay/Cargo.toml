@@ -24,7 +24,13 @@ uuid = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+# passkey 登录（WebAuthn RP）：注册/断言两阶段验签（凭证落盘经 Passkey 的
+# serde 序列化，无需 danger-* feature）
+webauthn-rs = { workspace = true }
 
 [dev-dependencies]
 # 集成测试客户端（连真 server 起双端）
 tokio-tungstenite = { workspace = true }
+# e2e 软认证器（测试内模拟真认证器的 ES256 注册/断言签名——webauthn-rs 的
+# fake 模块只生成假 credential id 分布，不含签名，故自建最小软认证器）
+openssl = "0.10"

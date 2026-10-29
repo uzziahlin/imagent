@@ -2,19 +2,37 @@ import { useState, type FormEvent } from "react";
 import { deviceSummary } from "../lib/protocol";
 
 /**
- * 登录页（v1.2）：输入 USER_TOKEN（+可选设备名）→ 上层经 hello 换发 30 天
- * 会话凭证（登录成功即从 localStorage 删除 USER_TOKEN；旧 relay 无会话层则
- * 沿用 token 直连模式）。notice = 认证失败分流提示（会话过期/设备被吊销）。
+ * 登录页（v1.3 双入口）：「使用通行钥匙」（passkey，默认高亮）+「使用访问
+ * 令牌」（USER_TOKEN，恢复路径完整保留）。passkey 流程（begin →
+ * credentials.get → complete → 存 session）由上层 App 经 lib/webauthn 驱动，
+ * 本组件只管入口切换与提示（notice = 认证失败分流提示，passkeyError =
+ * 通行钥匙失败回落提示）。WebAuthn 不可用（旧浏览器/私有模式/非安全上下文）
+ * → 隐藏通行钥匙入口、直接令牌形态。
  */
 export function Login({
   notice,
+  webauthnAvailable,
+  passkeyBusy,
+  passkeyError,
+  onPasskeyLogin,
   onSave,
 }: {
   /** 认证失败分流提示（会话已过期 / 此设备已被吊销；空串不显示）。 */
   notice?: string;
+  /** 浏览器是否支持 WebAuthn（false → 隐藏通行钥匙入口）。 */
+  webauthnAvailable: boolean;
+  /** passkey ceremony 进行中（按钮禁用 + 「验证中…」）。 */
+  passkeyBusy: boolean;
+  /** passkey 失败提示（用户取消/无凭证/网络错——引导改用访问令牌）。 */
+  passkeyError: string | null;
+  onPasskeyLogin: () => void;
   /** token = USER_TOKEN；deviceName 可选设备名（空串 → 上层用 UA 摘要缺省）。 */
   onSave: (token: string, deviceName: string) => void;
 }) {
+  // 缺省入口：支持 WebAuthn 时通行钥匙优先（高亮主入口）。
+  const [mode, setMode] = useState<"passkey" | "token">(
+    webauthnAvailable ? "passkey" : "token",
+  );
   const [value, setValue] = useState("");
   const [deviceName, setDeviceName] = useState("");
   const [error, setError] = useState("");
@@ -50,9 +68,9 @@ export function Login({
             </svg>
           </div>
           <h1 className="text-xl font-semibold text-ink">imagent · Web 驾驶舱</h1>
-          <p className="mt-1 text-sm text-muted">输入访问令牌连接你的 Mac 网关</p>
+          <p className="mt-1 text-sm text-muted">连接你的 Mac 网关</p>
         </div>
-        <form onSubmit={submit} className="rounded-2xl border border-line bg-panel p-5 shadow-xl">
+        <div className="rounded-2xl border border-line bg-panel p-5 shadow-xl">
           {notice && (
             <p
               role="alert"
@@ -61,49 +79,113 @@ export function Login({
               {notice}
             </p>
           )}
-          <label htmlFor="token" className="mb-2 block text-sm font-medium text-ink">
-            访问令牌（USER_TOKEN）
-          </label>
-          {/*
-           * text-base（16px）：字号 <16px 时 iOS Safari 聚焦会自动放大整页、
-           * 失焦弹回；禁止用 viewport meta 禁缩放（保留双指缩放无障碍）。
-           */}
-          <input
-            id="token"
-            type="password"
-            autoComplete="current-password"
-            autoFocus
-            value={value}
-            onChange={(e) => {
-              setValue(e.target.value);
-              setError("");
-            }}
-            placeholder="imagent.userToken"
-            className="w-full rounded-xl border border-line-strong bg-surface px-3 py-2.5 font-mono text-base text-ink outline-none placeholder:text-ghost focus:border-emerald-500"
-          />
-          <label htmlFor="device" className="mb-2 mt-4 block text-sm font-medium text-ink">
-            设备名（可选）
-          </label>
-          <input
-            id="device"
-            type="text"
-            value={deviceName}
-            onChange={(e) => setDeviceName(e.target.value)}
-            placeholder={`缺省 ${uaSummary}`}
-            className="w-full rounded-xl border border-line-strong bg-surface px-3 py-2.5 text-base text-ink outline-none placeholder:text-ghost focus:border-emerald-500"
-          />
-          {error && <p className="mt-2 text-xs text-err">{error}</p>}
-          <button
-            type="submit"
-            className="press mt-4 w-full rounded-xl bg-emerald-600 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-emerald-500 active:bg-emerald-700"
-          >
-            连接
-          </button>
-          <p className="mt-3 text-xs leading-relaxed text-faint">
-            令牌仅用于首次换取 30 天会话凭证（成功后即从本机删除）；凭证只经 WS
-            首帧 hello 加密通道发送，绝不进入 URL。认证失败会返回本页。
-          </p>
-        </form>
+          {/* 双入口切换（WebAuthn 可用才有 passkey 页签；当前项高亮） */}
+          {webauthnAvailable && (
+            <div className="mb-4 grid grid-cols-2 gap-1 rounded-xl bg-surface p-1" role="tablist" aria-label="登录方式">
+              {(
+                [
+                  ["passkey", "使用通行钥匙"],
+                  ["token", "使用访问令牌"],
+                ] as const
+              ).map(([m, label]) => (
+                <button
+                  key={m}
+                  type="button"
+                  role="tab"
+                  aria-selected={mode === m}
+                  onClick={() => setMode(m)}
+                  className={
+                    "press rounded-lg px-3 py-1.5 text-xs font-medium transition-colors " +
+                    (mode === m
+                      ? "bg-emerald-600 text-white"
+                      : "text-muted hover:bg-panel2 hover:text-ink")
+                  }
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {mode === "passkey" && webauthnAvailable ? (
+            <div>
+              <p className="mb-4 text-sm leading-relaxed text-muted">
+                使用本机的面容 ID / 指纹 / 安全密钥一步登录，无需输入令牌。
+                通行钥匙需先在「已登录设备」面板注册。
+              </p>
+              <button
+                type="button"
+                onClick={onPasskeyLogin}
+                disabled={passkeyBusy}
+                className="press w-full rounded-xl bg-emerald-600 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-emerald-500 active:bg-emerald-700 disabled:opacity-60"
+              >
+                {passkeyBusy ? "验证中…" : "使用通行钥匙登录"}
+              </button>
+              {passkeyError && (
+                <p role="alert" className="mt-3 text-xs text-err">
+                  {passkeyError}——可改用
+                  <button
+                    type="button"
+                    onClick={() => setMode("token")}
+                    className="mx-0.5 underline underline-offset-2"
+                  >
+                    访问令牌
+                  </button>
+                  登录
+                </p>
+              )}
+              <p className="mt-3 text-xs leading-relaxed text-faint">
+                凭证只存本机（服务器仅存公钥）；登录换取 30 天会话凭证。本地
+                http 直连（非 localhost）不支持通行钥匙，请用访问令牌。
+              </p>
+            </div>
+          ) : (
+            <form onSubmit={submit}>
+              <label htmlFor="token" className="mb-2 block text-sm font-medium text-ink">
+                访问令牌（USER_TOKEN）
+              </label>
+              {/*
+               * text-base（16px）：字号 <16px 时 iOS Safari 聚焦会自动放大整页、
+               * 失焦弹回；禁止用 viewport meta 禁缩放（保留双指缩放无障碍）。
+               */}
+              <input
+                id="token"
+                type="password"
+                autoComplete="current-password"
+                autoFocus
+                value={value}
+                onChange={(e) => {
+                  setValue(e.target.value);
+                  setError("");
+                }}
+                placeholder="imagent.userToken"
+                className="w-full rounded-xl border border-line-strong bg-surface px-3 py-2.5 font-mono text-base text-ink outline-none placeholder:text-ghost focus:border-emerald-500"
+              />
+              <label htmlFor="device" className="mb-2 mt-4 block text-sm font-medium text-ink">
+                设备名（可选）
+              </label>
+              <input
+                id="device"
+                type="text"
+                value={deviceName}
+                onChange={(e) => setDeviceName(e.target.value)}
+                placeholder={`缺省 ${uaSummary}`}
+                className="w-full rounded-xl border border-line-strong bg-surface px-3 py-2.5 text-base text-ink outline-none placeholder:text-ghost focus:border-emerald-500"
+              />
+              {error && <p className="mt-2 text-xs text-err">{error}</p>}
+              <button
+                type="submit"
+                className="press mt-4 w-full rounded-xl bg-emerald-600 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-emerald-500 active:bg-emerald-700"
+              >
+                连接
+              </button>
+              <p className="mt-3 text-xs leading-relaxed text-faint">
+                令牌仅用于首次换取 30 天会话凭证（成功后即从本机删除）；凭证只经
+                WS 首帧 hello 加密通道发送，绝不进入 URL。认证失败会返回本页。
+              </p>
+            </form>
+          )}
+        </div>
       </div>
     </div>
   );

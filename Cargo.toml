@@ -74,6 +74,8 @@ tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
 axum = "0.8"
 # Web 驾驶舱（M1）：crates/relay 内嵌 SPA 静态资源（rust-embed）
 rust-embed = "8"
+# Web 驾驶舱 passkey 登录：relay 作为 WebAuthn RP（crates/relay，注册/断言验签）
+webauthn-rs = "0.5"
 # ACP（Agent Client Protocol）：claude-agent-acp 长驻子进程模式（agent-client-protocol SDK）
 agent-client-protocol = "2"
 # 飞书 open-lark SDK（package name=openlark，lib name=open_lark，二者不同名是 SDK 设计）

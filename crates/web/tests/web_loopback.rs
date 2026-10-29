@@ -54,6 +54,7 @@ async fn spawn_test_relay() -> RelayHandle {
                 COUNTER.fetch_add(1, Ordering::Relaxed)
             )),
             session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
+            webauthn_rp_id: None,
         },
     )
     .expect("测试配置合法")

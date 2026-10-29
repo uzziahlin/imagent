@@ -16,6 +16,9 @@
 //   `session:{id,token,expiresAt}`（USER_TOKEN 一次性，之后重连 hello 带
 //   `session`）；设备管理 `device_list`/`device_revoke` ↔ `devices` 帧。
 //   hello_ack 无 session 字段 = 旧 relay → SPA 回退现行 USER_TOKEN 直连模式。
+// - v1.3 passkey：HTTP 端点 `/webauthn/{register,login}/{begin,complete}`
+//   （lib/webauthn.ts，不走 WS）；凭证管理 `cred_list`/`cred_revoke` ↔
+//   `creds` 帧（transport 管理帧，同 devices 族）。
 
 export const PROTOCOL_VERSION = 1;
 
@@ -185,6 +188,16 @@ export type DeviceRevokeFrame = {
   deviceId: string;
 };
 
+/** v1.3 通行钥匙管理：请求已注册 passkey 列表。 */
+export type CredListFrame = { v: typeof PROTOCOL_VERSION; type: "cred_list" };
+
+/** v1.3 通行钥匙管理：删除（credId = creds 帧里的 id）。 */
+export type CredRevokeFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "cred_revoke";
+  credId: string;
+};
+
 export type OutboundFrame =
   | HelloFrame
   | MessageFrame
@@ -193,7 +206,9 @@ export type OutboundFrame =
   | SyncFrame
   | PingFrame
   | DeviceListFrame
-  | DeviceRevokeFrame;
+  | DeviceRevokeFrame
+  | CredListFrame
+  | CredRevokeFrame;
 
 /** 出站帧序列化（undefined 字段不序列化，与网关入站解析兼容）。 */
 export function encodeFrame(frame: OutboundFrame): string {
@@ -288,6 +303,16 @@ export type DevicesFrame = {
   devices: DeviceInfo[];
 };
 
+/** v1.3 已注册通行钥匙项（creds 帧）。created 为 unix 秒（缺席仅影响展示）。 */
+export type PasskeyInfo = { id: string; label: string; created?: number };
+
+/** v1.3：relay→浏览器通行钥匙列表快照（cred_list 请求 / cred_revoke 后回）。 */
+export type CredsFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "creds";
+  credentials: PasskeyInfo[];
+};
+
 export type InboundFrame =
   | HelloAckFrame
   | MachineFrame
@@ -298,7 +323,8 @@ export type InboundFrame =
   | ApprovalRequestFrame
   | ApprovalResolvedFrame
   | PongFrame
-  | DevicesFrame;
+  | DevicesFrame
+  | CredsFrame;
 
 // ---------------------------------------------------------------------------
 // parseFrame：v/type 校验 + 每类帧关键字段存在性校验，非法返回 null（不抛）
@@ -348,6 +374,15 @@ const deviceOk = (d: unknown): boolean => {
   );
 };
 
+/** v1.3 creds 帧元素：id/label 字符串；created 可选但出现即须为数字。 */
+const passkeyOk = (p: unknown): boolean => {
+  if (typeof p !== "object" || p === null) {
+    return false;
+  }
+  const r = p as Record<string, unknown>;
+  return isStr(r, "id") && isStr(r, "label") && (r.created === undefined || typeof r.created === "number");
+};
+
 const RESOLVED_DECISIONS: readonly string[] = ["allow", "deny", "always", "cancelled"];
 
 /** 入站帧类型表：type → 关键字段校验（前向兼容靠“未知 type → null”由调用方忽略）。 */
@@ -370,6 +405,7 @@ const INBOUND_CHECKS: Record<string, FieldCheck> = {
   pong: () => true,
   hello_ack: (o) => isStr(o, "role") && sessionOk(o),
   devices: (o) => Array.isArray(o.devices) && o.devices.every(deviceOk),
+  creds: (o) => Array.isArray(o.credentials) && o.credentials.every(passkeyOk),
 };
 
 /** 解析一条入站文本帧：信封 v=1 + 已知 type + 关键字段齐备才放行，否则 null。 */
@@ -468,6 +504,8 @@ export type AppState = {
   machineOnline: boolean;
   /** v1.2 已登录设备列表（devices 帧）；null = 尚未拉取（设备面板未打开）。 */
   devices: DeviceInfo[] | null;
+  /** v1.3 已注册通行钥匙列表（creds 帧）；null = 尚未拉取。 */
+  passkeys: PasskeyInfo[] | null;
   lastError: { code: string; at: number } | null;
   lastNotice: MachineNotice | null;
 };
@@ -498,6 +536,7 @@ export function initialState(): AppState {
     currentConv: DEFAULT_CONV,
     machineOnline: false,
     devices: null,
+    passkeys: null,
     lastError: null,
     lastNotice: null,
   };
@@ -792,6 +831,9 @@ function reduceFrame(state: AppState, frame: InboundFrame): AppState {
     case "devices":
       // v1.2 设备列表快照：全量覆盖（device_list 请求 / device_revoke 后回）
       return { ...state, devices: frame.devices };
+    case "creds":
+      // v1.3 通行钥匙列表快照：全量覆盖（cred_list 请求 / cred_revoke 后回）
+      return { ...state, passkeys: frame.credentials };
     case "machine":
       return { ...state, machineOnline: frame.online };
     case "error":

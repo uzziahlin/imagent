@@ -264,6 +264,16 @@ export class WsManager {
     return this.send({ v: 1, type: "device_revoke", deviceId });
   }
 
+  /** v1.3 拉取已注册通行钥匙列表（设备面板打开时）。 */
+  sendCredList(): boolean {
+    return this.send({ v: 1, type: "cred_list" });
+  }
+
+  /** v1.3 删除通行钥匙（relay 回更新后的 creds 帧）。 */
+  sendCredRevoke(credId: string): boolean {
+    return this.send({ v: 1, type: "cred_revoke", credId });
+  }
+
   private send(frame: OutboundFrame): boolean {
     if (!this.ready || !this.socket) {
       return false;
