@@ -1417,17 +1417,16 @@ mod tests {
     const TEST_MACHINE: &str = "test-mac";
 
     /// 测试用临时 store（真实 sqlite，临时目录——工作空间泵的 KV 读写走
-    /// 与生产同一条路径）。
+    /// 与生产同一条路径）。路径唯一性不能依赖 SystemTime 纳秒（实际分辨率
+    /// 约微秒级，并行测试同时构造 store 会碰撞同名 db 文件导致测试间数据
+    /// 互串——曾致 collect_session_entries_* 族 1/5~1/10 偶发失败）；
+    /// pid + 原子计数器 = 进程内绝对唯一。
+    static STORE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     async fn test_store() -> Store {
+        let n = STORE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut p = std::env::temp_dir();
-        p.push(format!(
-            "imagent-web-platform-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        p.push(format!("imagent-web-platform-{}-{n}.sqlite", std::process::id()));
         Store::open(&p).await.expect("open store")
     }
 

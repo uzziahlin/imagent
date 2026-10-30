@@ -1516,10 +1516,16 @@ mod tests {
         }
     }
 
-    /// v1.8 history 条目组装（行 → 契约 JSON）+ history 帧**字节级断言**：
-    /// 顶层字段名/顺序（struct 声明序）、条目字段名逐字（Value 对象键序为
-    /// serde_json 默认字母序——JSON 语义与键序无关，字段名不得漂移）、
-    /// key 前缀 `h:<seq>`、card 的 state 恒 "done"；空集/新会话形态。
+    /// v1.8 history 条目组装（行 → 契约 JSON）+ history 帧**键序无关逐字段
+    /// 断言**：顶层字段名/值（struct 声明序组帧，逐字段钉住）、条目字段名
+    /// 逐字与键数（防多/漏字段）、key 前缀 `h:<seq>`、card 的 state 恒
+    /// "done"；空集/新会话形态。
+    ///
+    /// 不做完整字节串断言：workspace 统一构建/发布形态下 serde_json 的
+    /// `preserve_order` feature 经 agent-client-protocol 依赖链激活，Value
+    /// 对象键序由默认字母序变插入序（entries 为动态 Value，两种构建形态
+    /// 字节串不同），字节串断言依赖构建配置故不可用；键序对协议无语义
+    ///（JSON 对象序，SPA 按字段名解析）。
     #[test]
     fn history_entry_and_frame_byte_level() {
         use imagent_store::OutboundRow;
@@ -1561,15 +1567,22 @@ mod tests {
             "card 行缺 card 字段应跳过"
         );
 
-        // 空集形态（新会话/未落盘）：entries=[] + lastSeq=0 + trimmed=false。
+        // 空集形态（新会话/未落盘）：entries=[] + lastSeq=0 + trimmed=false
+        //（键序无关：解析回 Value 逐字段断言，理由见本测试 doc 注释）。
         let json =
             encode_history_frame("home-mac", "web:work", serde_json::json!([]), 0, false).unwrap();
-        assert_eq!(
-            json,
-            r#"{"v":1,"type":"history","machine":"home-mac","convId":"web:work","entries":[],"lastSeq":0,"trimmed":false}"#
-        );
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v.as_object().map(|m| m.len()), Some(7), "顶层恰好 7 键");
+        assert_eq!(v["v"], 1);
+        assert_eq!(v["type"], "history");
+        assert_eq!(v["machine"], "home-mac", "出站帧带本机 machine");
+        assert_eq!(v["convId"], "web:work", "convId 同请求原样");
+        assert_eq!(v["entries"].as_array().map(Vec::len), Some(0));
+        assert_eq!(v["lastSeq"], 0);
+        assert_eq!(v["trimmed"], false);
 
-        // 非空 + trimmed=true 全量字节级（条目对象键序 = serde_json 字母序）。
+        // 非空 + trimmed=true：键序无关逐字段复核（顶层 7 键 + 条目字段全集
+        // 与键数，防组帧丢改字段）。
         let json = encode_history_frame(
             "home-mac",
             "web:work",
@@ -1578,24 +1591,54 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(
-            json,
-            r#"{"v":1,"type":"history","machine":"home-mac","convId":"web:work","entries":[{"at":1234,"key":"h:1","kind":"text","text":"你好"},{"card":{"terminal":"done","text":"结论"},"key":"h:2","kind":"card","messageId":"web-card-1","state":"done"}],"lastSeq":9,"trimmed":true}"#
-        );
-        // 逐字段复核（防手拼期望串自身笔误）。
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v.as_object().map(|m| m.len()), Some(7), "顶层恰好 7 键");
         assert_eq!(v["v"], 1);
         assert_eq!(v["type"], "history");
         assert_eq!(v["machine"], "home-mac", "出站帧带本机 machine");
         assert_eq!(v["convId"], "web:work", "convId 同请求原样");
         assert_eq!(v["lastSeq"], 9);
         assert_eq!(v["trimmed"], true);
-        assert_eq!(v["entries"].as_array().map(Vec::len), Some(2));
+        let entries = v["entries"].as_array().expect("entries 为数组");
+        assert_eq!(entries.len(), 2);
+        let e0 = &entries[0];
+        assert_eq!(
+            e0.as_object().map(|m| m.len()),
+            Some(4),
+            "text 条目恰好 4 键"
+        );
+        assert_eq!(e0["kind"], "text");
+        assert_eq!(e0["key"], "h:1", "key 前缀 h: 用行 seq");
+        assert_eq!(e0["text"], "你好");
+        assert_eq!(e0["at"], 1234);
+        let e1 = &entries[1];
+        assert_eq!(
+            e1.as_object().map(|m| m.len()),
+            Some(5),
+            "card 条目恰好 5 键"
+        );
+        assert_eq!(e1["kind"], "card");
+        assert_eq!(e1["key"], "h:2");
+        assert_eq!(e1["messageId"], "web-card-1");
+        assert_eq!(e1["card"]["text"], "结论", "card 原样内嵌");
+        assert_eq!(e1["card"]["terminal"], "done");
+        assert_eq!(
+            e1["card"].as_object().map(|m| m.len()),
+            Some(2),
+            "card 恰好 2 键"
+        );
+        assert_eq!(e1["state"], "done", "card 条目 state 恒 done");
     }
 
-    /// v1.6 出站工作空间帧**字节级断言**（与任务契约逐字段一致，SPA 侧并行
-    /// 实现对齐锚点）：字段名/顺序/缺省行为不得漂移；**带 machine**（v1.1
+    /// v1.6 出站工作空间帧**键序无关逐字段断言**（与任务契约逐字段一致，SPA
+    /// 侧并行实现对齐锚点）：字段名/缺省行为不得漂移；**带 machine**（v1.1
     /// 出站业务帧必带——SPA reducer 据此归属机器）。
+    ///
+    /// 不做完整字节串断言：workspace 统一构建下 serde_json `preserve_order`
+    /// 经 agent-client-protocol 依赖链激活会改变 Value 键序——字节串断言会把
+    /// 键序钉进契约且依赖构建配置，而键序对协议无语义（JSON 对象序，SPA 按
+    /// 字段名解析）。本组帧虽为 derive struct 序列化（声明序稳定），仍统一
+    /// 键序无关口径。
     #[test]
     fn workspace_outbound_frames_byte_level() {
         let mut convs = BTreeMap::new();
@@ -1621,26 +1664,33 @@ mod tests {
             None,
         )
         .unwrap();
-        // 精确字符串（BTreeMap 键序稳定 + serde 按声明序输出）钉住字节形态。
-        assert_eq!(
-            json,
-            r#"{"v":1,"type":"workspaces","machine":"home-mac","default":"/def","workspaces":[{"name":"a","path":"/a"},{"name":"b","path":"/b","lastUsedAt":1770000000}],"convs":{"local:work":"/lw","web:work":"/ww"}}"#
-        );
-        // 逐字段复核（防手拼期望串自身笔误）。
+        // 键序无关逐字段复核（convs 为 BTreeMap 键序稳定 + serde 按声明序
+        // 组帧，但键序不纳入契约——理由见本测试 doc 注释）。
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v.as_object().map(|m| m.len()), Some(6), "顶层恰好 6 键");
         assert_eq!(v["v"], 1);
         assert_eq!(v["type"], "workspaces");
         assert_eq!(v["machine"], "home-mac", "出站帧带本机 machine");
         assert_eq!(v["default"], "/def");
-        assert_eq!(v["workspaces"][0]["name"], "a");
-        assert!(
-            v["workspaces"][0].get("lastUsedAt").is_none(),
-            "缺席不序列化"
+        let ws = v["workspaces"].as_array().expect("workspaces 为数组");
+        assert_eq!(ws.len(), 2);
+        assert_eq!(ws[0]["name"], "a");
+        assert_eq!(ws[0]["path"], "/a");
+        assert!(ws[0].get("lastUsedAt").is_none(), "缺席不序列化");
+        assert_eq!(
+            ws[0].as_object().map(|m| m.len()),
+            Some(2),
+            "无 lastUsedAt 条目恰好 2 键"
         );
-        assert_eq!(v["workspaces"][1]["lastUsedAt"], 1_770_000_000);
-        assert_eq!(v["convs"]["local:work"], "/lw", "含 local: 会话");
+        assert_eq!(ws[1]["name"], "b");
+        assert_eq!(ws[1]["path"], "/b");
+        assert_eq!(ws[1]["lastUsedAt"], 1_770_000_000);
+        let convs = v["convs"].as_object().expect("convs 为对象");
+        assert_eq!(convs.len(), 2);
+        assert_eq!(convs["local:work"], "/lw", "含 local: 会话");
+        assert_eq!(convs["web:work"], "/ww");
 
-        // 空集合形态：workspaces=[] / convs={}。
+        // 空集合形态：workspaces=[] / convs={}（sessions/models 整段缺席）。
         let json = encode_workspaces_frame(
             "home-mac",
             "/def",
@@ -1650,30 +1700,40 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(
-            json,
-            r#"{"v":1,"type":"workspaces","machine":"home-mac","default":"/def","workspaces":[],"convs":{}}"#
-        );
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v.as_object().map(|m| m.len()), Some(6), "空集恰好 6 键");
+        assert_eq!(v["workspaces"].as_array().map(Vec::len), Some(0));
+        assert_eq!(v["convs"].as_object().map(|m| m.len()), Some(0));
+        assert!(v.get("sessions").is_none());
+        assert!(v.get("models").is_none());
 
-        // conv_workdir 增量帧。
+        // conv_workdir 增量帧（键序无关逐字段）。
         let json = encode_conv_workdir_frame("home-mac", "web:work", "/Users/x/proj").unwrap();
-        assert_eq!(
-            json,
-            r#"{"v":1,"type":"conv_workdir","machine":"home-mac","convId":"web:work","workdir":"/Users/x/proj"}"#
-        );
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v.as_object().map(|m| m.len()), Some(5), "恰好 5 键");
+        assert_eq!(v["v"], 1);
+        assert_eq!(v["type"], "conv_workdir");
+        assert_eq!(v["machine"], "home-mac");
+        assert_eq!(v["convId"], "web:work");
+        assert_eq!(v["workdir"], "/Users/x/proj");
 
-        // error 帧复用（workspace_invalid）。
+        // error 帧复用（workspace_invalid）（键序无关逐字段）。
         let json = encode_error_frame("home-mac", "workspace_invalid", "名称不能为空").unwrap();
-        assert_eq!(
-            json,
-            r#"{"v":1,"type":"error","machine":"home-mac","code":"workspace_invalid","message":"名称不能为空"}"#
-        );
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v.as_object().map(|m| m.len()), Some(5), "恰好 5 键");
+        assert_eq!(v["v"], 1);
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["machine"], "home-mac");
+        assert_eq!(v["code"], "workspace_invalid");
+        assert_eq!(v["message"], "名称不能为空");
     }
 
-    /// v1.7 workspaces 快照 sessions 段**字节级断言**（契约逐字段一致：段置
-    /// 尾、rename `updatedAt`、条目三字段齐备）；sessions 段存在时旧三段
-    /// （default/workspaces/convs）字节形态不变；空集整段缺席（旧形态字节
-    /// 不变——无 web: 会话的网关快照与 v1.6 逐字节一致）。
+    /// v1.7 workspaces 快照 sessions 段**键序无关逐字段断言**（契约逐字段
+    /// 一致：段置尾、rename `updatedAt`、条目三字段齐备）；sessions 段存在
+    /// 时旧三段（default/workspaces/convs）字段形态不变；空集整段缺席
+    ///（无 web: 会话的网关快照与 v1.6 字段级一致）。不做完整字节串断言
+    ///（preserve_order 经依赖链激活改变 Value 键序、依赖构建配置；键序对
+    /// 协议无语义——JSON 对象序，SPA 按字段名解析）。
     #[test]
     fn workspaces_frame_sessions_byte_level() {
         let json = encode_workspaces_frame(
@@ -1696,21 +1756,32 @@ mod tests {
             None,
         )
         .unwrap();
-        // 精确字符串钉住字节形态（serde 按声明序输出，sessions 在 convs 之后）。
-        assert_eq!(
-            json,
-            r#"{"v":1,"type":"workspaces","machine":"home-mac","default":"/def","workspaces":[],"convs":{},"sessions":[{"id":"web:work","title":"列出目录","updatedAt":1770000002},{"id":"web:default","title":"手动名","updatedAt":1770000001}]}"#
-        );
-        // 旧三段不变（防手拼期望串自身笔误的逐字段复核）。
+        // 键序无关逐字段复核（derive struct 声明序组帧、sessions 段在 convs
+        // 之后，但键序不纳入契约——理由见本测试 doc 注释）。
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            v.as_object().map(|m| m.len()),
+            Some(7),
+            "带 sessions 恰好 7 键"
+        );
         assert_eq!(v["default"], "/def");
         assert_eq!(v["workspaces"].as_array().map(Vec::len), Some(0));
         assert_eq!(v["convs"].as_object().map(|m| m.len()), Some(0));
-        assert_eq!(v["sessions"][0]["id"], "web:work");
-        assert_eq!(v["sessions"][0]["title"], "列出目录");
-        assert_eq!(v["sessions"][0]["updatedAt"], 1_770_000_002);
+        let sessions = v["sessions"].as_array().expect("sessions 为数组");
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0]["id"], "web:work");
+        assert_eq!(sessions[0]["title"], "列出目录");
+        assert_eq!(sessions[0]["updatedAt"], 1_770_000_002);
+        assert_eq!(
+            sessions[0].as_object().map(|m| m.len()),
+            Some(3),
+            "条目恰好 3 键（id/title/updatedAt）"
+        );
+        assert_eq!(sessions[1]["id"], "web:default");
+        assert_eq!(sessions[1]["title"], "手动名");
+        assert_eq!(sessions[1]["updatedAt"], 1_770_000_001);
 
-        // 空集：整段缺席，与 v1.6 字节一致。
+        // 空集：整段缺席（与 v1.6 字段级一致，键序无关口径）。
         let json = encode_workspaces_frame(
             "home-mac",
             "/def",
@@ -1720,17 +1791,17 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(
-            json,
-            r#"{"v":1,"type":"workspaces","machine":"home-mac","default":"/def","workspaces":[],"convs":{}}"#
-        );
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v.as_object().map(|m| m.len()), Some(6), "空集恰好 6 键");
+        assert!(v.get("sessions").is_none(), "sessions 整段缺席");
     }
 
-    /// v1.8 workspaces 快照 models 段**字节级断言**（契约逐字段一致：段置尾
-    /// （sessions 之后）、rename `cliDefault`、current/cliDefault/target 的
-    /// null 形态、options 元素 label 在前 target 在后）；models 段存在时旧
-    /// 三段（default/workspaces/convs）字节形态不变；options 空 / None →
-    /// 整段缺席（旧形态字节不变）。
+    /// v1.8 workspaces 快照 models 段**键序无关逐字段断言**（契约逐字段一致：
+    /// 段置尾（sessions 之后）、rename `cliDefault`、current/cliDefault/target
+    /// 的 null 形态、options 元素恰 label/target 两键）；models 段存在时旧三段
+    ///（default/workspaces/convs）字段形态不变；options 空 / None → 整段缺席。
+    /// 不做完整字节串断言（preserve_order 经依赖链激活改变 Value 键序、依赖
+    /// 构建配置；键序对协议无语义——JSON 对象序，SPA 按字段名解析）。
     #[test]
     fn workspaces_frame_models_byte_level() {
         let json = encode_workspaces_frame(
@@ -1755,19 +1826,33 @@ mod tests {
             }),
         )
         .unwrap();
-        // 精确字符串钉住字节形态（serde 按声明序输出，models 在 sessions
-        // 之后；null 按契约序列化为字面 null，非缺席）。
-        assert_eq!(
-            json,
-            r#"{"v":1,"type":"workspaces","machine":"home-mac","default":"/def","workspaces":[],"convs":{},"models":{"current":null,"cliDefault":"glm-4.6","options":[{"label":"sonnet","target":"glm-4.6"},{"label":"opus","target":null}]}}"#
-        );
-        // 逐字段复核（防手拼期望串自身笔误）。
+        // 键序无关逐字段复核（derive struct 声明序组帧、models 段在 sessions
+        // 之后；null 按契约序列化为字面 null，非缺席——以键数钉住）。
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            v.as_object().map(|m| m.len()),
+            Some(7),
+            "带 models 恰好 7 键"
+        );
+        assert_eq!(
+            v["models"].as_object().map(|m| m.len()),
+            Some(3),
+            "models 恰好 3 键（current/cliDefault/options）"
+        );
         assert_eq!(v["models"]["current"], serde_json::Value::Null);
         assert_eq!(v["models"]["cliDefault"], "glm-4.6");
-        assert_eq!(v["models"]["options"][0]["label"], "sonnet");
-        assert_eq!(v["models"]["options"][0]["target"], "glm-4.6");
-        assert_eq!(v["models"]["options"][1]["target"], serde_json::Value::Null);
+        let options = v["models"]["options"].as_array().expect("options 为数组");
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0]["label"], "sonnet");
+        assert_eq!(options[0]["target"], "glm-4.6");
+        assert_eq!(options[0].as_object().map(|m| m.len()), Some(2));
+        assert_eq!(options[1]["label"], "opus");
+        assert_eq!(
+            options[1]["target"],
+            serde_json::Value::Null,
+            "target null 序列化为字面 null，非缺席"
+        );
+        assert_eq!(options[1].as_object().map(|m| m.len()), Some(2));
 
         // options 空 → 整段缺席（组帧出口统一兜底，与 None 等价）。
         for models in [
@@ -1787,11 +1872,13 @@ mod tests {
                 models,
             )
             .unwrap();
+            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
             assert_eq!(
-                json,
-                r#"{"v":1,"type":"workspaces","machine":"home-mac","default":"/def","workspaces":[],"convs":{}}"#,
+                v.as_object().map(|m| m.len()),
+                Some(6),
                 "空 options / None 整段缺席"
             );
+            assert!(v.get("models").is_none(), "空 options / None 整段缺席");
         }
 
         // 与 sessions 段并存：sessions 在前 models 在尾。
@@ -2114,10 +2201,14 @@ mod tests {
 
     #[test]
     fn pong_frame_shape() {
-        assert_eq!(
-            encode_pong_frame("home-mac"),
-            r#"{"v":1,"type":"pong","machine":"home-mac"}"#
-        );
+        // 键序无关逐字段（pong 为 format! 手拼帧、键序固定，仍统一键序无关
+        // 口径——完整字节串断言不纳入契约，理由见 history 测试 doc 注释）。
+        let json = encode_pong_frame("home-mac");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v.as_object().map(|m| m.len()), Some(3), "恰好 3 键");
+        assert_eq!(v["v"], 1);
+        assert_eq!(v["type"], "pong");
+        assert_eq!(v["machine"], "home-mac");
     }
 
     /// machine id 规范化：合法值原样 / 非法字符替换 / 首尾 `-` 剥离 / 截断
