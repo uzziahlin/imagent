@@ -30,6 +30,8 @@
 // v1.6 工作空间：业务帧族新增 workspace_list / workspace_save /
 // workspace_remove / conv_workdir_set（网关消费，经 e2e outbound 判定包装；
 // machine 路由约定同 message 族——多机模式必须带当前机器）。
+// v1.7 媒体上行：sendMessage 可选 media 参数（{name,mime,b64}，canvas 预压缩
+// 产物）；帧仍在 message 出站路径上，E2E 加密与 machine 路由零变化。
 
 import {
   DEFAULT_MACHINE,
@@ -41,6 +43,7 @@ import {
   type E2eAckFrame,
   type HelloAckFrame,
   type InboundFrame,
+  type MediaPayload,
   type OutboundFrame,
   type SessionInfo,
 } from "./protocol";
@@ -284,9 +287,17 @@ export class WsManager {
   // 多机模式必须传当前选中机器（防 relay 回 ambiguous_machine）。
 
   /** convId 传 undefined 时省略该字段（网关落默认会话）——「+ 新会话」的
-   *  /switch 命令文本走默认会话，由网关解析并切出 web:<名字>。 */
-  sendMessage(convId: string | undefined, text: string, machine?: string): boolean {
-    return this.send({ v: 1, type: "message", convId, text, machine });
+   *  /switch 命令文本走默认会话，由网关解析并切出 web:<名字>。
+   *  v1.7：可选 media 附件（图片经 canvas 压缩，见 lib/imageCompress）；纯图
+   *  消息 text 传 ""（契约 A 段：text 与 media 至少其一非空）。media 随
+   *  message 帧自动走 E2E 加密（message 本就在 BUSINESS_TYPES）。 */
+  sendMessage(
+    convId: string | undefined,
+    text: string,
+    machine?: string,
+    media?: MediaPayload,
+  ): boolean {
+    return this.send({ v: 1, type: "message", convId, text, machine, media });
   }
 
   /** convId / requestId 原样回传 approval_request 帧里的值；machine =

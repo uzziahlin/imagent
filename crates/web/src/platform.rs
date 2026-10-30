@@ -17,12 +17,17 @@
 //!   [`imagent_core::validate_workdir`] 校验（复用 /cd 护栏，不经 dispatch
 //!   命令链），每帧回 workspaces 全量快照（失败前置 error 帧）。构造注入
 //!   store 句柄 + default_workdir（main 装配处传入）。
+//! - 媒体泵（v1.7 媒体上行）：消费 client 转来的 message+media 动作——校验
+//!   （mime 须 image/*、b64 解码 ≤8MB）→ 落盘 `<imagent_home>/media/
+//!   up-<unix_ms>-<安全化name>`（目录 0755、文件 0600）→ 合成
+//!   InboundMessage（text 非空才 Some）投回 inbound channel；任一步失败回
+//!   error 帧（media_too_large / media_invalid）且不投递。
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use imagent_store::Store;
@@ -42,7 +47,8 @@ use crate::e2e::E2eIdentity;
 use crate::{
     encode_approval_request_frame, encode_approval_resolved_frame, encode_card_frame,
     encode_conv_workdir_frame, encode_error_frame, encode_text_frame, encode_workspaces_frame,
-    CardPayload, GatewayCredential, InboundAction, WorkspaceEntryFrame, TARGET,
+    session_title, CardPayload, GatewayCredential, InboundAction, SessionEntryFrame,
+    WorkspaceEntryFrame, TARGET,
 };
 
 const PLATFORM: &str = "web";
@@ -64,6 +70,19 @@ const CARD_CACHE_MAX_CONVS: usize = 32;
 const WORKSPACE_ERROR_CODE: &str = "workspace_invalid";
 /// workspace_save 的 name 上限（帧契约：trim 后 1..=32 char）。
 const WORKSPACE_NAME_MAX_CHARS: usize = 32;
+/// v1.7 媒体上行：解码后大小上限（契约：≤8MB，超限 media_too_large）。
+const MEDIA_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// v1.7 媒体上行：media.name 上限（契约：超长截断，按码点）。
+const MEDIA_NAME_MAX_CHARS: usize = 64;
+/// v1.7 媒体错误帧 code（帧契约定案字面量）：超 8MB 上限。
+const MEDIA_TOO_LARGE_CODE: &str = "media_too_large";
+/// v1.7 媒体错误帧 code：非 image/* mime / base64 畸形 / 落盘失败。
+const MEDIA_INVALID_CODE: &str = "media_invalid";
+/// v1.7 媒体动作 channel 容量：用户点按级频率（单条含 ≤8MB 解码 + 落盘，
+/// 泵毫秒级吞吐），8 足以吸收突发；打满由 client 侧 1s 有界背压丢弃。
+const MEDIA_CHANNEL_CAPACITY: usize = 8;
+/// v1.7 workspaces 快照 sessions 段上限（契约：最近 50 条）。
+const WEB_SESSIONS_MAX: usize = 50;
 
 // ---------------------------------------------------------------------------
 // 卡片缓存（D6 sync 重发）
@@ -258,8 +277,9 @@ async fn handle_workspace_action(
 
 /// workspaces 全量快照组帧：default = 配置 default_workdir；workspaces =
 /// 全部命名空间（name 稳定序）；convs = 全部已知 conv 的当前 workdir
-///（含 local: 会话）。best-effort：单段 list 失败 → warn + 该段空，快照
-/// 照发（SPA 单一数据来源，宁可缺段不可断流）。
+///（含 local: 会话）；sessions = `web:` 会话历史段（v1.7，见
+/// [`collect_session_entries`]）。best-effort：单段 list 失败 → warn + 该段
+/// 空，快照照发（SPA 单一数据来源，宁可缺段不可断流）。
 async fn build_workspaces_frame(
     machine: &str,
     store: &Store,
@@ -299,7 +319,77 @@ async fn build_workspaces_frame(
         }
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name)); // 契约：按 name 稳定序
-    encode_workspaces_frame(machine, &default_workdir.to_string_lossy(), entries, convs)
+    let sessions = collect_session_entries(store).await;
+    encode_workspaces_frame(
+        machine,
+        &default_workdir.to_string_lossy(),
+        entries,
+        convs,
+        sessions,
+    )
+}
+
+/// v1.7 sessions 段数据源（契约 B）：store sessions 表 `web:` 前缀行，按
+/// updated_at 降序，上限 [`WEB_SESSIONS_MAX`]（50）。title：SessionRow.name
+/// （手动名）优先，否则该 conv 最近一条 session_history 的 first_prompt 摘要
+/// ——主表无 first_prompt 列（仅历史副表有，`get_session` 恒 None），故无
+/// 手动名时补查 `list_session_history(conv, 1)` 取最近行。store 无「跨 conv
+/// 列 sessions」现成 API：`list_session_convs` 全枚举 + 逐 conv `get_session`
+/// 后排序截 50（web: 会话数量有限，任务说明许可的路径）。best-effort：读
+/// 失败 → warn + 跳过（或整段空），快照其余部分照发。
+async fn collect_session_entries(store: &Store) -> Vec<SessionEntryFrame> {
+    let convs = match store.list_session_convs().await {
+        Ok(convs) => convs,
+        Err(e) => {
+            warn!(target: TARGET, error = %e, "workspaces 快照：列出会话失败（sessions 段空）");
+            return Vec::new();
+        }
+    };
+    let mut rows = Vec::new();
+    for conv in convs {
+        if !conv.starts_with("web:") {
+            continue; // 仅本平台会话（ilink:/local: 等不进 SPA 驾驶舱列表）
+        }
+        match store.get_session(&conv).await {
+            Ok(Some(row)) => rows.push(row),
+            // list 与 get 之间被 /new 删除（或副表轮转），跳过。
+            Ok(None) => {}
+            Err(e) => warn!(target: TARGET, conv = %conv, error = %e, "读取会话行失败（跳过）"),
+        }
+    }
+    // updated_at 降序；同秒并列按 conv_id 升序钉稳定序（帧字节可复现）。
+    rows.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.conv_id.cmp(&b.conv_id))
+    });
+    rows.truncate(WEB_SESSIONS_MAX);
+    let mut entries = Vec::with_capacity(rows.len());
+    for row in rows {
+        let has_manual_name = row.name.as_deref().is_some_and(|n| !n.trim().is_empty());
+        let first_prompt = if has_manual_name {
+            None // 手动名优先，免查历史副表
+        } else {
+            match store.list_session_history(&row.conv_id, 1).await {
+                Ok(h) => h.into_iter().next().and_then(|r| r.first_prompt),
+                Err(e) => {
+                    warn!(
+                        target: TARGET,
+                        conv = %row.conv_id,
+                        error = %e,
+                        "读取会话 first_prompt 失败（title 回退空串）"
+                    );
+                    None
+                }
+            }
+        };
+        entries.push(SessionEntryFrame {
+            id: row.conv_id.clone(),
+            title: session_title(row.name.as_deref(), first_prompt.as_deref()),
+            updated_at: u64::try_from(row.updated_at).unwrap_or(0),
+        });
+    }
+    entries
 }
 
 /// conv_workdir_set 的 path 校验链（与 /cd 同链）：绝对路径 + is_dir +
@@ -375,6 +465,205 @@ fn reply_workspace_error(machine: &str, outbound_tx: &mpsc::Sender<String>, mess
         Ok(json) => enqueue_best_effort(outbound_tx, json),
         Err(e) => warn!(target: TARGET, error = %e, "workspace error 帧序列化失败"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// 媒体泵（v1.7 媒体上行：message 帧 media 段——校验 + 落盘 + 合成投递）
+// ---------------------------------------------------------------------------
+
+/// 媒体泵主循环：消费 client 转来的 MediaMessage 动作。文件系统 IO（b64
+/// 解码 + 写盘）在本泵内 await——不阻塞 client 收发循环；平台 Drop 时经
+/// shutdown token 连动退出。`media_dir` 生产为 `<imagent_home>/media`（与
+/// ilink 入站媒体同目录，7 天 GC 同源兜底），测试注入临时目录。
+async fn serve_media_messages(
+    mut media_rx: mpsc::Receiver<InboundAction>,
+    machine_id: String,
+    media_dir: PathBuf,
+    inbound_tx: mpsc::Sender<InboundMessage>,
+    outbound_tx: mpsc::Sender<String>,
+    shutdown: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            act = media_rx.recv() => {
+                let Some(act) = act else {
+                    break; // client 退出（platform drop 连动），无后续动作
+                };
+                process_media_message(&machine_id, &media_dir, act, &inbound_tx, &outbound_tx).await;
+            }
+        }
+    }
+    debug!(target: TARGET, "媒体泵退出");
+}
+
+/// 处理一条媒体消息（契约 A 全链）：b64 解码 → 校验（mime 须 image/*、解码
+/// ≤8MB）→ 落盘（路径模板与安全化见 [`persist_up_media`]）→ 合成
+/// InboundMessage（text 非空才 Some，media 引用落盘路径）投 inbound channel。
+/// 任一步失败：回 error 帧（media_too_large / media_invalid）且**不投递消息**
+/// （半途写坏的文件留给媒体目录 7 天 GC）。已知取舍：媒体消息经本泵多一跳，
+/// 与随后到达的纯文本消息可能乱序——dispatch 按 conv 队列消费，影响仅为
+/// 用户主动「先图后文」的展示序，不破坏正确性。
+async fn process_media_message(
+    machine: &str,
+    media_dir: &Path,
+    act: InboundAction,
+    inbound_tx: &mpsc::Sender<InboundMessage>,
+    outbound_tx: &mpsc::Sender<String>,
+) {
+    let InboundAction::MediaMessage { conv, text, media } = act else {
+        debug!(target: TARGET, "媒体泵收到非媒体动作，忽略");
+        return;
+    };
+    // mime 白名单：本批仅图片（契约：其它类型拒绝）。
+    if !media.mime.starts_with("image/") {
+        reply_media_error(
+            machine,
+            outbound_tx,
+            MEDIA_INVALID_CODE,
+            &format!("仅支持图片（image/*），收到 {}", media.mime),
+        );
+        return;
+    }
+    // b64 解码（契约：单行无换行标准 base64，畸形即拒）。
+    let bytes = {
+        use base64::Engine as _;
+        match base64::engine::general_purpose::STANDARD.decode(media.b64.as_bytes()) {
+            Ok(b) => b,
+            Err(e) => {
+                reply_media_error(
+                    machine,
+                    outbound_tx,
+                    MEDIA_INVALID_CODE,
+                    &format!("base64 解码失败：{e}"),
+                );
+                return;
+            }
+        }
+    };
+    if bytes.len() > MEDIA_MAX_BYTES {
+        // message 为契约原文（SPA 据此提示预压缩规避）。
+        reply_media_error(
+            machine,
+            outbound_tx,
+            MEDIA_TOO_LARGE_CODE,
+            "图片超过 8MB 上限",
+        );
+        return;
+    }
+    let path = match persist_up_media(media_dir, &media.name, &bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            reply_media_error(
+                machine,
+                outbound_tx,
+                MEDIA_INVALID_CODE,
+                &format!("媒体落盘失败：{e}"),
+            );
+            return;
+        }
+    };
+    let msg = crate::synth_media_message(
+        conv.clone(),
+        text,
+        vec![MediaRef {
+            // MediaRef 无独立 mime/name 字段（core 契约 kind+url）：kind 载
+            // mime（media_hint_for 展示），name 已并入落盘文件名。
+            kind: media.mime.clone(),
+            url: path.to_string_lossy().into_owned(),
+        }],
+    );
+    info!(
+        target: TARGET,
+        conv = %conv,
+        path = %path.display(),
+        bytes = bytes.len(),
+        "媒体上行：已落盘并投递"
+    );
+    // 与 client 直投同款 1s 有界背压：dispatch 消费抖动不丢消息，持续满才丢弃。
+    match tokio::time::timeout(Duration::from_secs(1), inbound_tx.send(msg)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => warn!(target: TARGET, "入站 channel 已关闭（platform 退出），丢弃媒体消息"),
+        Err(_) => warn!(target: TARGET, "入站 channel 持续满 1s，丢弃媒体消息"),
+    }
+}
+
+/// 媒体 error 帧（复用既有 error 帧形态；code=media_too_large|media_invalid，
+/// machine 为本机身份，v1.1 出站帧必带）。
+fn reply_media_error(machine: &str, outbound_tx: &mpsc::Sender<String>, code: &str, message: &str) {
+    match encode_error_frame(machine, code, message) {
+        Ok(json) => enqueue_best_effort(outbound_tx, json),
+        Err(e) => warn!(target: TARGET, error = %e, "媒体 error 帧序列化失败"),
+    }
+}
+
+/// media.name 安全化（契约：仅保留 [A-Za-z0-9._-]，其余替换 `_`；≤64 字符
+/// 超长截断——按码点，非 ASCII 1 码点 → 1 个 `_`）。路径分隔符 `/` 同被
+/// 替换，穿越片段（`../`）退化为无害平文件名。纯函数便于单测。
+fn sanitize_media_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(MEDIA_NAME_MAX_CHARS)
+        .collect()
+}
+
+/// 媒体落盘（契约路径模板 `<media_dir>/up-<unix_ms>-<安全化name>`）：目录
+/// 不存在则创建（0755）；文件 0600（OpenOptions 带 mode 原子创建——无
+/// 「先 write 后 chmod」的 umask 暴露窗口，ilink persist_media 同款纪律）。
+/// 同毫秒同名重复上传按 truncate 覆盖（模板契约固定，不追加去重后缀）。
+fn persist_up_media(
+    media_dir: &Path,
+    name: &str,
+    bytes: &[u8],
+) -> std::result::Result<PathBuf, String> {
+    let build_dir = || -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut b = std::fs::DirBuilder::new();
+            // recursive：父目录（<imagent_home>）缺失时一并创建；已存在不报错
+            //（mode 只作用于新建目录——不动 ilink 既有目录的权限）。
+            b.recursive(true).mode(0o755);
+            b.create(media_dir)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir_all(media_dir)
+        }
+    };
+    build_dir().map_err(|e| format!("创建媒体目录 {} 失败：{e}", media_dir.display()))?;
+
+    let unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = media_dir.join(format!("up-{unix_ms}-{}", sanitize_media_name(name)));
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| format!("写媒体文件 {} 失败：{e}", path.display()))?;
+        f.write_all(bytes)
+            .map_err(|e| format!("写媒体文件 {} 失败：{e}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, bytes)
+            .map_err(|e| format!("写媒体文件 {} 失败：{e}", path.display()))?;
+    }
+    Ok(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -456,6 +745,7 @@ impl WebPlatform {
         let (sync_tx, sync_rx) = mpsc::channel::<()>(SYNC_CHANNEL_CAPACITY);
         let (workspace_tx, workspace_rx) =
             mpsc::channel::<InboundAction>(WORKSPACE_CHANNEL_CAPACITY);
+        let (media_tx, media_rx) = mpsc::channel::<InboundAction>(MEDIA_CHANNEL_CAPACITY);
 
         // E2E 身份装配（v1.4）：e2e_ack 签名复用 v1.3 认证 ed25519 私钥——
         // 仅 key 凭证形态可用；token 回退形态无签名密钥，E2E 不可用（出站
@@ -497,9 +787,10 @@ impl WebPlatform {
             default_session,
             online: online.clone(),
             e2e,
-            inbound_tx,
+            inbound_tx: inbound_tx.clone(),
             sync_tx,
             workspace_tx,
+            media_tx,
         };
         tokio::spawn(client.run(outbound_rx, reconnect.clone(), shutdown.clone()));
 
@@ -519,6 +810,18 @@ impl WebPlatform {
             machine_id.clone(),
             store,
             default_workdir,
+            outbound_tx.clone(),
+            shutdown.clone(),
+        ));
+
+        // 媒体泵（v1.7 上行图片落盘；落盘目录 <imagent_home>/media 与 ilink
+        // 入站媒体共享，7 天 GC 同源兜底。error 帧带 machine，v1.1 语义）。
+        let media_dir = imagent_core::paths::imagent_home().join("media");
+        tokio::spawn(serve_media_messages(
+            media_rx,
+            machine_id.clone(),
+            media_dir,
+            inbound_tx,
             outbound_tx.clone(),
             shutdown.clone(),
         ));
@@ -1160,6 +1463,283 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0]["type"], "workspaces");
         assert_eq!(frames[0]["workspaces"].as_array().unwrap().len(), 0);
+    }
+
+    // ---- v1.7 媒体上行泵（process_media_message 直测：临时媒体目录 + 双通道
+    // 注入，不经网络；端到端 enc 路径与 message 帧同链无需重复覆盖）----
+
+    use crate::MediaPayload;
+    use imagent_store::SessionRow;
+
+    /// 每测试独立的临时媒体目录（pid+nanos 防并行互踩）。
+    fn media_dir() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "imagent-web-media-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn media_b64(bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    /// 构造一条媒体动作（text 缺省纯图形态）。
+    fn media_act(name: &str, mime: &str, b64: &str) -> InboundAction {
+        InboundAction::MediaMessage {
+            conv: "web:work".into(),
+            text: None,
+            media: MediaPayload {
+                name: name.into(),
+                mime: mime.into(),
+                b64: b64.into(),
+            },
+        }
+    }
+
+    /// 处理一条媒体动作，取回出站帧（解析为 Value）与投递的入站消息。
+    async fn run_media(
+        media_dir: &Path,
+        act: InboundAction,
+    ) -> (Vec<serde_json::Value>, Vec<InboundMessage>) {
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<String>(32);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(8);
+        process_media_message(TEST_MACHINE, media_dir, act, &inbound_tx, &outbound_tx).await;
+        let mut frames = Vec::new();
+        while let Ok(json) = outbound_rx.try_recv() {
+            frames.push(serde_json::from_str(&json).unwrap());
+        }
+        let mut msgs = Vec::new();
+        while let Ok(m) = inbound_rx.try_recv() {
+            msgs.push(m);
+        }
+        (frames, msgs)
+    }
+
+    /// 媒体上行正例（任务验收项）：image/png 合法 → 落盘（路径模板
+    /// `up-<unix_ms>-<安全化name>`、0600、内容一致）+ InboundMessage 断言
+    /// （media 引用落盘路径、kind 载 mime、text 非空才 Some）。无 error 帧。
+    #[tokio::test]
+    async fn media_message_persists_and_delivers() {
+        let dir = media_dir();
+        let bytes = b"\x89PNG\r\n\x1a\nfake-png-body".to_vec();
+        let (frames, msgs) = run_media(
+            &dir,
+            InboundAction::MediaMessage {
+                conv: "web:work".into(),
+                text: Some("看这张图".into()),
+                media: MediaPayload {
+                    name: "shot.png".into(),
+                    mime: "image/png".into(),
+                    b64: media_b64(&bytes),
+                },
+            },
+        )
+        .await;
+        assert!(frames.is_empty(), "成功路径无出站帧：{frames:?}");
+        assert_eq!(msgs.len(), 1);
+        let m = &msgs[0];
+        assert_eq!(m.conv_id, ConvId("web:work".into()));
+        assert_eq!(m.text.as_deref(), Some("看这张图"));
+        assert_eq!(m.media.len(), 1);
+        assert_eq!(m.media[0].kind, "image/png");
+        let path = Path::new(&m.media[0].url);
+        assert!(path.is_file(), "媒体须落盘：{}", path.display());
+        let fname = path.file_name().unwrap().to_str().unwrap();
+        assert!(
+            fname.starts_with("up-") && fname.ends_with("-shot.png"),
+            "路径模板 up-<unix_ms>-<name>：{fname}"
+        );
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            bytes,
+            "落盘内容与解码字节一致"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "媒体文件 0600");
+        }
+
+        // 纯图：text 空串 → None（契约：非空才 Some）。
+        let (frames, msgs) = run_media(
+            &dir,
+            InboundAction::MediaMessage {
+                conv: "web:work".into(),
+                text: Some(String::new()),
+                media: MediaPayload {
+                    name: "shot2.png".into(),
+                    mime: "image/png".into(),
+                    b64: media_b64(&bytes),
+                },
+            },
+        )
+        .await;
+        assert!(frames.is_empty());
+        assert_eq!(msgs[0].text, None, "空串说明归一为 None");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 媒体上行反例（任务验收项）：非 image/* mime / 坏 b64 / 超 8MB → 对应
+    /// error 帧（media_invalid / media_too_large，后者 message 为契约原文），
+    /// 不投递消息、不落盘。边界：恰好 8MB（= 上限）放行。
+    #[tokio::test]
+    async fn media_message_rejects_invalid() {
+        let dir = media_dir();
+        // 非 image/* mime。
+        let (frames, msgs) =
+            run_media(&dir, media_act("clip.mp4", "video/mp4", &media_b64(b"x"))).await;
+        let err = frames
+            .iter()
+            .find(|f| f["type"] == "error")
+            .unwrap_or_else(|| panic!("非 image mime 应回 error 帧：{frames:?}"));
+        assert_eq!(err["code"], MEDIA_INVALID_CODE);
+        assert_eq!(err["machine"], TEST_MACHINE, "error 帧带本机 machine");
+        assert!(msgs.is_empty(), "不投递消息");
+
+        // 坏 b64。
+        let (frames, msgs) =
+            run_media(&dir, media_act("a.png", "image/png", "!!!not-base64!!!")).await;
+        assert_eq!(frames[0]["code"], MEDIA_INVALID_CODE, "{frames:?}");
+        assert!(msgs.is_empty());
+
+        // 超 8MB（上限 +1 字节）：契约原文 message。
+        let oversized = media_b64(&vec![0u8; MEDIA_MAX_BYTES + 1]);
+        let (frames, msgs) = run_media(&dir, media_act("big.png", "image/png", &oversized)).await;
+        let err = frames.iter().find(|f| f["type"] == "error").unwrap();
+        assert_eq!(err["code"], MEDIA_TOO_LARGE_CODE);
+        assert_eq!(err["message"], "图片超过 8MB 上限", "契约原文 message");
+        assert!(msgs.is_empty());
+
+        // 失败路径不落盘任何文件（目录尚未创建）。
+        assert!(
+            std::fs::read_dir(&dir)
+                .map(|mut it| it.next().is_none())
+                .unwrap_or(true),
+            "校验失败不得落盘"
+        );
+
+        // 边界：恰好 8MB（≤ 上限）放行。
+        let exact = media_b64(&vec![0u8; MEDIA_MAX_BYTES]);
+        let (frames, msgs) = run_media(&dir, media_act("exact.png", "image/png", &exact)).await;
+        assert!(frames.is_empty(), "恰 8MB 不超限：{frames:?}");
+        assert_eq!(msgs.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// media.name 安全化：非 [A-Za-z0-9._-] 替换 `_`（`/` 被替换——路径穿越
+    /// 不可达）；≤64 字符按码点截断。
+    #[test]
+    fn sanitize_media_name_rules() {
+        assert_eq!(sanitize_media_name("shot.png"), "shot.png");
+        assert_eq!(sanitize_media_name("截 图 v1★.png"), "____v1_.png");
+        let trav = sanitize_media_name("../../etc/passwd.png");
+        assert!(!trav.contains('/'), "路径分隔符被替换：{trav}");
+        assert_eq!(trav, ".._.._etc_passwd.png");
+        assert_eq!(sanitize_media_name(&"a".repeat(70)), "a".repeat(64));
+        assert_eq!(
+            sanitize_media_name(&"中".repeat(80)),
+            "_".repeat(64),
+            "非 ASCII 按码点 1:1 替换后截 64"
+        );
+    }
+
+    // ---- v1.7 sessions 段数据源（collect_session_entries 直测：真实 store，
+    // upsert_session 同表写入主表+历史副表）----
+
+    /// 种子一条 session 行（主表 + 历史副表同事务写入，updated_at=now）。
+    async fn seed_session(
+        store: &Store,
+        conv: &str,
+        name: Option<&str>,
+        first_prompt: Option<&str>,
+    ) {
+        store
+            .upsert_session(&SessionRow {
+                conv_id: conv.into(),
+                session_id: format!("s-{conv}"),
+                agent_kind: "claude".into(),
+                workdir: "/w".into(),
+                name: name.map(String::from),
+                created_at: 0,
+                updated_at: 0, // upsert 实际落库取 now_secs()，此处不生效
+                first_prompt: first_prompt.map(String::from),
+                task_todos: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// sessions 段数据源（任务验收项）：仅 `web:` 前缀；按 updated_at 降序
+    /// （单调不增）；title 手动名优先 / first_prompt 摘要（历史副表最近行）
+    /// 按码点截 24 / 皆无 → 空串。
+    #[tokio::test]
+    async fn collect_session_entries_filters_sorts_and_titles() {
+        let store = test_store().await;
+        // 非 web 会话：不进段。
+        seed_session(&store, "ilink:u1", None, Some("不该出现")).await;
+        seed_session(&store, "local:work", None, Some("也不该出现")).await;
+        // web 会话：手动名 / 长 first_prompt（>24 中文）/ 两者皆无。
+        seed_session(&store, "web:alpha", Some("手动名"), None).await;
+        seed_session(
+            &store,
+            "web:beta",
+            None,
+            Some("这是一段超过二十四个字符长度的会话首条消息摘要样例文本"),
+        )
+        .await;
+        seed_session(&store, "web:gamma", None, None).await;
+
+        let entries = collect_session_entries(&store).await;
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids.len(), 3, "仅 web: 前缀：{ids:?}");
+        assert!(ids.iter().all(|i| i.starts_with("web:")));
+        // 降序（同秒并列按 conv_id 升序——alpha < beta < gamma）。
+        assert_eq!(ids, vec!["web:alpha", "web:beta", "web:gamma"]);
+        for w in entries.windows(2) {
+            assert!(
+                w[0].updated_at >= w[1].updated_at,
+                "updated_at 降序：{entries:?}"
+            );
+        }
+        let title_of = |id: &str| {
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .unwrap_or_else(|| panic!("{id} 缺席：{entries:?}"))
+                .title
+                .clone()
+        };
+        assert_eq!(title_of("web:alpha"), "手动名", "手动名优先");
+        assert_eq!(
+            title_of("web:beta"),
+            "这是一段超过二十四个字符长度的会话首条消息摘要样",
+            "first_prompt 摘要按码点截 24（中文）"
+        );
+        assert_eq!(title_of("web:gamma"), "", "无手动名无 first_prompt → 空串");
+        assert!(
+            entries.iter().all(|e| e.updated_at > 0),
+            "updatedAt 为 unix 秒"
+        );
+    }
+
+    /// sessions 段上限 50（契约）：种 52 条 web: 会话 → 恰 50 条。
+    #[tokio::test]
+    async fn collect_session_entries_caps_at_50() {
+        let store = test_store().await;
+        for i in 0..(WEB_SESSIONS_MAX + 2) {
+            seed_session(&store, &format!("web:s{i:02}"), None, Some("首条")).await;
+        }
+        let entries = collect_session_entries(&store).await;
+        assert_eq!(entries.len(), WEB_SESSIONS_MAX, "上限 50（52 条种子）");
+        for w in entries.windows(2) {
+            assert!(w[0].updated_at >= w[1].updated_at, "截断前已按降序排");
+        }
     }
 
     /// 卡片缓存：上限 32 conv 淘汰最旧；快照按 seq 旧→新排序。

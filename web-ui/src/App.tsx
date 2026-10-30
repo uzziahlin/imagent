@@ -13,6 +13,7 @@ import {
   type DeviceInfo,
   type MachineNotice,
   type MachineWorkspaces,
+  type MediaPayload,
   type PairingRequest,
   type PasskeyInfo,
   type PendingApproval,
@@ -92,6 +93,9 @@ const ERROR_HINTS: Record<string, string> = {
   rate_limited: "发送过快，已被限流断开",
   ambiguous_machine: "多台机器在线，未指定目标机器",
   machine_offline: "该机器离线，消息未送达",
+  // v1.7 媒体上行（契约 A 段原文文案；经既有 lastError toast 链路可达）
+  media_too_large: "图片超过 8MB 上限",
+  media_invalid: "图片无效（解码或保存失败）",
   // v1.5 管理面错误（machine_invalid 带 message 时 toast 只显 code，详情在
   // 管理面板场景由 adminError/表单提示承担）
   machine_invalid: "机器名或公钥无效，或名称已存在",
@@ -524,13 +528,15 @@ export default function App() {
   const outMachine = (): string | undefined =>
     state.machinesKnown ? state.currentMachine : undefined;
 
-  const sendMessage = (text: string): boolean => {
-    const ok = wsRef.current?.sendMessage(currentConv, text, outMachine()) ?? false;
+  /** v1.7：可选 media（压缩图片）随 message 帧发送；纯图消息（text 空串）
+   *  本地回显用「[图片]」占位（网关侧 text 非空则 Some、空则 None）。 */
+  const sendMessage = (text: string, media?: MediaPayload): boolean => {
+    const ok = wsRef.current?.sendMessage(currentConv, text, outMachine(), media) ?? false;
     if (ok) {
       dispatch({
         type: "send_echo",
         convId: currentConv,
-        text,
+        text: text || "[图片]",
         machine: state.currentMachine,
       });
     }

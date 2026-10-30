@@ -394,7 +394,7 @@ describe("断线 composer 置灰（交互细节）", () => {
     const fake = mountReady();
     const ta = screen.getByLabelText("消息输入框") as HTMLTextAreaElement;
     expect(ta.disabled).toBe(false);
-    expect(ta.placeholder).toBe("发消息给 Mac…（Enter 发送）");
+    expect(ta.placeholder).toBe("发消息给 Mac…（Enter 发送，/ 唤起命令）");
 
     act(() => {
       fake.emit("close", { code: 1006 });

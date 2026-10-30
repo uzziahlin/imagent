@@ -43,6 +43,14 @@
 //! 本身携带 machine，与 v1.1 帧「帧内携带」并存不冲突）。错误复用
 //! `error` 帧（code=workspace_invalid）。
 //!
+//! v1.7 扩展（媒体上行 + 会话持久化，契约同款字节级纪律）：入站 `message`
+//! 帧可带可选 `media{name,mime,b64}`（图片 base64 上行——字段存在性/类型
+//! 检查在本层 [`map_inbound_frame`]，值域校验 + 落盘 + 合成 InboundMessage
+//! 在 platform 媒体泵，失败回 error 帧 code=media_too_large|media_invalid；
+//! 纯图消息 text 可缺省/空串）；出站 `workspaces` 快照帧可带可选 `sessions`
+//! 段（`web:` 会话历史 `{id,title,updatedAt}`——title=手动名优先 /
+//! first_prompt 摘要按码点截 24；空集整段不序列化，旧形态字节不变）。
+//!
 //! **帧内 convId 协议约定：恒为完整 conv 形态（`web:<session>`）**。出站帧
 //! （text / card / approval_request …）写入的即完整 conv，浏览器回执帧
 //! （message / approval_response）**原样回传收到的 convId** 即可，不得剥前
@@ -67,8 +75,8 @@ pub use key::GatewayCredential;
 pub use platform::WebPlatform;
 
 use imagent_core::{
-    CardPhase, CardTerminal, ConvId, CoreError, InboundMessage, OutboundCard, ReplyHint, Result,
-    TodoStatus, UserId,
+    CardPhase, CardTerminal, ConvId, CoreError, InboundMessage, MediaRef, OutboundCard, ReplyHint,
+    Result, TodoStatus, UserId,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -496,6 +504,46 @@ pub(crate) struct WorkspaceEntryFrame {
     pub(crate) last_used_at: Option<u64>,
 }
 
+/// 会话显示名上限（协议 v1.7：按 Unicode 码点截 24，与 SPA
+/// CONV_TITLE_MAX_CHARS 同口径——中文/emoji 均按 1 码点计）。
+pub(crate) const SESSION_TITLE_MAX_CHARS: usize = 24;
+
+/// 会话 title 规则（协议 v1.7 契约 B，纯函数便于单测）：手动名
+/// （SessionRow.name，trim 后非空）优先；否则 first_prompt 单行摘要——空白
+/// 序列（含换行/制表）折叠为单空格后按码点截 [`SESSION_TITLE_MAX_CHARS`]；
+/// 两者皆无 → 空串（网关不编造显示名，SPA 侧空 title 自行兜底渲染）。
+pub(crate) fn session_title(name: Option<&str>, first_prompt: Option<&str>) -> String {
+    if let Some(manual) = name.map(str::trim).filter(|n| !n.is_empty()) {
+        return manual.to_string();
+    }
+    let prompt = first_prompt.unwrap_or_default().trim();
+    let mut collapsed = String::with_capacity(prompt.len());
+    let mut pending_space = false;
+    for ch in prompt.chars() {
+        if ch.is_whitespace() {
+            pending_space = true;
+        } else {
+            if pending_space {
+                collapsed.push(' ');
+                pending_space = false;
+            }
+            collapsed.push(ch);
+        }
+    }
+    collapsed.chars().take(SESSION_TITLE_MAX_CHARS).collect()
+}
+
+/// workspaces 快照帧的单个会话历史条目（协议 v1.7 可选 sessions 段）：该
+/// 网关 `web:` 前缀会话行。`title` 见 [`session_title`]；`updated_at` 为
+/// store sessions 行的 unix 秒（serde rename 对齐契约 `updatedAt`）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct SessionEntryFrame {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    #[serde(rename = "updatedAt")]
+    pub(crate) updated_at: u64,
+}
+
 /// workspaces 全量快照帧（SPA 工作空间视图的单一数据来源）：
 /// `default` = 配置 default_workdir；`workspaces` = 全部命名空间（调用方
 /// 按 name 稳定序排好）；`convs` = 该网关全部已知 conv 的当前 workdir
@@ -503,7 +551,9 @@ pub(crate) struct WorkspaceEntryFrame {
 /// 同样有意义）。`machine` 为本机身份（v1.1 起全部出站业务帧必带——SPA
 /// reducer 按 `frame.machine` 把快照归属到机器；enc 信封的 machine 要经
 /// 解密分发处兜底注入才可达内帧，内帧自带才是权威）。`convs` 用
-/// BTreeMap：键序稳定，SPA 解析与测试断言可复现。
+/// BTreeMap：键序稳定，SPA 解析与测试断言可复现。v1.7 起可带可选
+/// `sessions` 段（`web:` 会话历史，见 [`SessionEntryFrame`]）——空集整段
+/// 不序列化（无 web: 会话的网关快照与 v1.6 逐字节一致，旧端零感知）。
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct WorkspacesFrame {
     v: u8,
@@ -513,6 +563,8 @@ pub(crate) struct WorkspacesFrame {
     default: String,
     workspaces: Vec<WorkspaceEntryFrame>,
     convs: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    sessions: Vec<SessionEntryFrame>,
 }
 
 /// conv_workdir 增量帧：单个 conv 的工作目录已切换（网页 conv_workdir_set
@@ -544,13 +596,15 @@ pub(crate) struct ErrorFrame {
     message: String,
 }
 
-/// workspaces 快照帧组帧。无截断面（无自由文本大字段；convs 量级 = 会话
-/// 数，远低于帧软限）。
+/// workspaces 快照帧组帧。无截断面（无自由文本大字段；convs/sessions 量级
+/// = 会话数，远低于帧软限）。`sessions` 传空 Vec 时整段不序列化（旧形态
+/// 字节不变，协议 v1.7 可选段语义）。
 pub(crate) fn encode_workspaces_frame(
     machine: &str,
     default: &str,
     workspaces: Vec<WorkspaceEntryFrame>,
     convs: BTreeMap<String, String>,
+    sessions: Vec<SessionEntryFrame>,
 ) -> Result<String> {
     let frame = WorkspacesFrame {
         v: 1,
@@ -559,6 +613,7 @@ pub(crate) fn encode_workspaces_frame(
         default: default.to_string(),
         workspaces,
         convs,
+        sessions,
     };
     serde_json::to_string(&frame)
         .map_err(|e| CoreError::Platform(TARGET, format!("workspaces 帧序列化失败：{e}")))
@@ -598,6 +653,31 @@ pub(crate) fn encode_error_frame(machine: &str, code: &str, message: &str) -> Re
 // 入站帧（浏览器 → 网关）映射
 // ---------------------------------------------------------------------------
 
+/// message 帧的可选媒体载荷 DTO（协议 v1.7，契约字段名 `name`/`mime`/`b64`
+/// 不得偏离）：浏览器侧 canvas 压缩后的图片 base64（单行无换行）。本层只做
+/// 字段存在性/类型检查（见 [`parse_media_payload`]）；值域校验（mime 须
+/// image/*、b64 解码 ≤8MB）与落盘在 platform 媒体泵（IO + 失败须回 error 帧，
+/// 不适合纯函数层）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct MediaPayload {
+    pub(crate) name: String,
+    pub(crate) mime: String,
+    pub(crate) b64: String,
+}
+
+/// media 段解析（纯函数）：name/mime/b64 三字段齐备且均为字符串才 Some。
+/// 无 media 段（`v` 为 None）与字段缺失/类型错同样返回 None——调用方以
+/// 「帧内 media 字段是否存在」区分两者（不存在 → 纯文本 message 旧路径；
+/// 存在但解析失败 → Warn 丢弃）。
+fn parse_media_payload(v: Option<&serde_json::Value>) -> Option<MediaPayload> {
+    let m = v?;
+    Some(MediaPayload {
+        name: m.get("name")?.as_str()?.to_string(),
+        mime: m.get("mime")?.as_str()?.to_string(),
+        b64: m.get("b64")?.as_str()?.to_string(),
+    })
+}
+
 /// 浏览器入站帧分拣结果（client 侧消费；纯函数便于单测）。
 #[derive(Debug)]
 pub(crate) enum InboundAction {
@@ -605,6 +685,17 @@ pub(crate) enum InboundAction {
     /// `Platform::recv`。（Box 消除变体间大 size 差——InboundMessage 含多个
     /// Vec，clippy large_enum_variant。）
     Message(Box<InboundMessage>),
+    /// v1.7 媒体上行（message 帧带可选 media 段）→ platform 媒体泵：值域
+    /// 校验（mime 须 image/*、b64 合法、解码 ≤8MB）+ 落盘
+    /// `<imagent_home>/media/up-<unix_ms>-<安全化name>` 后合成 InboundMessage
+    /// 投回 inbound channel；任一步失败回 error 帧
+    /// （media_too_large / media_invalid）且不投递。`conv` 已归一；`text`
+    /// 为可选说明（纯图消息缺省/空串——泵内归一为 text=None）。
+    MediaMessage {
+        conv: String,
+        text: Option<String>,
+        media: MediaPayload,
+    },
     /// sync 请求 → sync responder 重发缓存卡片（不进 recv）。
     Sync,
     /// 应用层 ping → client 直接回 pong（不进 recv）。
@@ -668,7 +759,7 @@ fn normalize_conv(raw: Option<&str>, default_session: &str) -> String {
 /// 示例）。web 用户手打消息走 steering（no_steer=false，与 webhook 合成消息
 /// 相反）。`conv` 为已经 [`normalize_conv`] 归一的完整 conv 字符串
 /// （`web:<session>`），本函数不再加前缀。
-fn synth_message(conv: String, text: String, ask_req: Option<String>) -> InboundMessage {
+pub(crate) fn synth_message(conv: String, text: String, ask_req: Option<String>) -> InboundMessage {
     InboundMessage {
         conv_id: ConvId(conv),
         sender: UserId("web:user".to_string()),
@@ -687,6 +778,22 @@ fn synth_message(conv: String, text: String, ask_req: Option<String>) -> Inbound
     }
 }
 
+/// v1.7 媒体消息合成（platform 媒体泵落盘后调用）：text 非空才 Some
+/// （契约：纯图消息 text=None——空串说明与缺省同归一），media 为已落盘的
+/// 本地路径引用（[`MediaRef`] 无独立 mime/name 字段：kind 载 mime，
+/// name 已并入落盘文件名）。其余字段与 [`synth_message`] 同（用户手打，
+/// steering 生效）。
+pub(crate) fn synth_media_message(
+    conv: String,
+    text: Option<String>,
+    media: Vec<MediaRef>,
+) -> InboundMessage {
+    let mut msg = synth_message(conv, String::new(), None);
+    msg.text = text.filter(|t| !t.is_empty());
+    msg.media = media;
+    msg
+}
+
 /// 入站业务帧映射（§4.1 表；client 已解析为 JSON Value，machine/error 等
 /// relay 自产帧由 client 分拣，不进本函数）。帧内 convId 协议约定为完整
 /// conv（`web:<session>`，出站帧写入的形态）——浏览器原样回传即可；裸
@@ -694,13 +801,35 @@ fn synth_message(conv: String, text: String, ask_req: Option<String>) -> Inbound
 pub(crate) fn map_inbound_frame(v: &serde_json::Value, default_session: &str) -> InboundAction {
     let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
     match kind {
-        // message：convId 缺省 / 空串 → default_session；text 缺失无意义，丢弃。
+        // message：convId 缺省 / 空串 → default_session。v1.7 起可带可选
+        // media 段（图片 base64 上行）——本层只查字段存在性/类型，值域校验 +
+        // 落盘在 platform 媒体泵；纯图消息 text 可缺省/空串，text 与 media
+        // 至少其一。
         "message" => {
-            let Some(text) = v.get("text").and_then(|t| t.as_str()) else {
-                return InboundAction::Warn("message 帧缺 text 字段，丢弃");
-            };
             let conv = normalize_conv(v.get("convId").and_then(|c| c.as_str()), default_session);
-            InboundAction::Message(Box::new(synth_message(conv, text.to_string(), None)))
+            let text = v.get("text").and_then(|t| t.as_str());
+            // media:null（JS 可选字段的 null 序列化形态）按「无 media 段」处理。
+            let media_field = v.get("media").filter(|m| !m.is_null());
+            if media_field.is_some() {
+                match parse_media_payload(media_field) {
+                    Some(media) => InboundAction::MediaMessage {
+                        conv,
+                        text: text.map(str::to_string),
+                        media,
+                    },
+                    None => InboundAction::Warn(
+                        "message 帧 media 字段畸形（须 name/mime/b64 字符串），丢弃",
+                    ),
+                }
+            } else {
+                match text {
+                    // 无 media 时 text 必填（缺失无意义，丢弃——v1.7 前既有纪律）。
+                    Some(t) => {
+                        InboundAction::Message(Box::new(synth_message(conv, t.to_string(), None)))
+                    }
+                    None => InboundAction::Warn("message 帧缺 text 字段，丢弃"),
+                }
+            }
         }
         // approval_response：convId 必填（审批按 conv 路由，缺省无法投递）；
         // 决策词必须精确命中词表。
@@ -1158,6 +1287,7 @@ mod tests {
                 },
             ],
             convs,
+            Vec::new(),
         )
         .unwrap();
         // 精确字符串（BTreeMap 键序稳定 + serde 按声明序输出）钉住字节形态。
@@ -1181,7 +1311,8 @@ mod tests {
 
         // 空集合形态：workspaces=[] / convs={}。
         let json =
-            encode_workspaces_frame("home-mac", "/def", Vec::new(), BTreeMap::new()).unwrap();
+            encode_workspaces_frame("home-mac", "/def", Vec::new(), BTreeMap::new(), Vec::new())
+                .unwrap();
         assert_eq!(
             json,
             r#"{"v":1,"type":"workspaces","machine":"home-mac","default":"/def","workspaces":[],"convs":{}}"#
@@ -1200,6 +1331,170 @@ mod tests {
             json,
             r#"{"v":1,"type":"error","machine":"home-mac","code":"workspace_invalid","message":"名称不能为空"}"#
         );
+    }
+
+    /// v1.7 workspaces 快照 sessions 段**字节级断言**（契约逐字段一致：段置
+    /// 尾、rename `updatedAt`、条目三字段齐备）；sessions 段存在时旧三段
+    /// （default/workspaces/convs）字节形态不变；空集整段缺席（旧形态字节
+    /// 不变——无 web: 会话的网关快照与 v1.6 逐字节一致）。
+    #[test]
+    fn workspaces_frame_sessions_byte_level() {
+        let json = encode_workspaces_frame(
+            "home-mac",
+            "/def",
+            Vec::new(),
+            BTreeMap::new(),
+            vec![
+                SessionEntryFrame {
+                    id: "web:work".into(),
+                    title: "列出目录".into(),
+                    updated_at: 1_770_000_002,
+                },
+                SessionEntryFrame {
+                    id: "web:default".into(),
+                    title: "手动名".into(),
+                    updated_at: 1_770_000_001,
+                },
+            ],
+        )
+        .unwrap();
+        // 精确字符串钉住字节形态（serde 按声明序输出，sessions 在 convs 之后）。
+        assert_eq!(
+            json,
+            r#"{"v":1,"type":"workspaces","machine":"home-mac","default":"/def","workspaces":[],"convs":{},"sessions":[{"id":"web:work","title":"列出目录","updatedAt":1770000002},{"id":"web:default","title":"手动名","updatedAt":1770000001}]}"#
+        );
+        // 旧三段不变（防手拼期望串自身笔误的逐字段复核）。
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["default"], "/def");
+        assert_eq!(v["workspaces"].as_array().map(Vec::len), Some(0));
+        assert_eq!(v["convs"].as_object().map(|m| m.len()), Some(0));
+        assert_eq!(v["sessions"][0]["id"], "web:work");
+        assert_eq!(v["sessions"][0]["title"], "列出目录");
+        assert_eq!(v["sessions"][0]["updatedAt"], 1_770_000_002);
+
+        // 空集：整段缺席，与 v1.6 字节一致。
+        let json =
+            encode_workspaces_frame("home-mac", "/def", Vec::new(), BTreeMap::new(), Vec::new())
+                .unwrap();
+        assert_eq!(
+            json,
+            r#"{"v":1,"type":"workspaces","machine":"home-mac","default":"/def","workspaces":[],"convs":{}}"#
+        );
+    }
+
+    /// v1.7 title 规则（任务验收项）：手动名优先（trim 生效、空白名视为
+    /// 缺席）；first_prompt 单行摘要按码点截 24（中文 1 码点、空白折叠单
+    /// 空格）；两者皆无 → 空串。
+    #[test]
+    fn session_title_manual_first_then_prompt_digest() {
+        assert_eq!(session_title(Some("  手动名  "), Some("第一句")), "手动名");
+        assert_eq!(
+            session_title(Some("   "), Some("第一句")),
+            "第一句",
+            "空白手动名视为缺席"
+        );
+        // 中文按码点截 24（27 字输入 → 恰 24 字）。
+        let long = "这是一段超过二十四个字符长度的会话首条消息摘要样例文本";
+        assert_eq!(long.chars().count(), 27);
+        assert_eq!(
+            session_title(None, Some(long)),
+            "这是一段超过二十四个字符长度的会话首条消息摘要样"
+        );
+        // 空白折叠：换行/制表/连续空格 → 单空格；首尾 trim。
+        assert_eq!(
+            session_title(None, Some("  hello \n world\t\tnext  ")),
+            "hello world next"
+        );
+        // 皆无 → 空串（网关不编造显示名）。
+        assert_eq!(session_title(None, None), "");
+        assert_eq!(session_title(Some(""), None), "");
+    }
+
+    /// v1.7 message 帧媒体段映射：合法形态 → MediaMessage（text 可缺省/空
+    /// 串——纯图消息）；media 字段畸形（缺字段/类型错/非对象）→ Warn 丢弃；
+    /// 无 media 且无 text → Warn（既有纪律不变）。
+    #[test]
+    fn map_message_with_media() {
+        let act = map_raw_frame(
+            r#"{"v":1,"type":"message","convId":"web:work","text":"看图","media":{"name":"shot.png","mime":"image/png","b64":"aGk="}}"#,
+            SESSION,
+        );
+        let InboundAction::MediaMessage { conv, text, media } = act else {
+            panic!("带 media 的 message 应映射为 MediaMessage：{act:?}")
+        };
+        assert_eq!(conv, "web:work");
+        assert_eq!(text.as_deref(), Some("看图"));
+        assert_eq!(media.name, "shot.png");
+        assert_eq!(media.mime, "image/png");
+        assert_eq!(media.b64, "aGk=");
+
+        // 纯图：text 缺省 / 空串（泵内归一 text=None）；裸 session 名补前缀。
+        for raw in [
+            r#"{"v":1,"type":"message","convId":"work","media":{"name":"shot.png","mime":"image/png","b64":"aGk="}}"#,
+            r#"{"v":1,"type":"message","convId":"work","text":"","media":{"name":"shot.png","mime":"image/png","b64":"aGk="}}"#,
+        ] {
+            let act = map_raw_frame(raw, SESSION);
+            let InboundAction::MediaMessage { conv, .. } = act else {
+                panic!("纯图 message 应映射为 MediaMessage：{act:?}")
+            };
+            assert_eq!(conv, "web:work");
+        }
+
+        // media 畸形：缺 b64 / mime 非字符串 / media 非对象 → Warn。
+        for raw in [
+            r#"{"v":1,"type":"message","text":"x","media":{"name":"a.png","mime":"image/png"}}"#,
+            r#"{"v":1,"type":"message","text":"x","media":{"name":"a.png","mime":1,"b64":"aGk="}}"#,
+            r#"{"v":1,"type":"message","text":"x","media":"png"}"#,
+        ] {
+            assert!(
+                matches!(map_raw_frame(raw, SESSION), InboundAction::Warn(_)),
+                "{raw} 应 Warn 丢弃"
+            );
+        }
+        // 无 media 无 text → Warn（v1.7 前既有行为不变）。
+        assert!(matches!(
+            map_raw_frame(r#"{"v":1,"type":"message"}"#, SESSION),
+            InboundAction::Warn(_)
+        ));
+        // media:null（JS 可选字段 null 形态）按无 media 处理：text 在 → 纯文本。
+        let act = map_raw_frame(
+            r#"{"v":1,"type":"message","convId":"work","text":"纯文本","media":null}"#,
+            SESSION,
+        );
+        assert!(
+            matches!(act, InboundAction::Message(_)),
+            "media:null 应走纯文本路径：{act:?}"
+        );
+    }
+
+    /// v1.7 媒体消息合成：text 非空才 Some（空串 → None），media 引用落盘
+    /// 路径（kind 载 mime）。
+    #[test]
+    fn synth_media_message_text_and_media() {
+        let m = synth_media_message(
+            "web:work".into(),
+            Some("看图".into()),
+            vec![MediaRef {
+                kind: "image/png".into(),
+                url: "/m/up-1-a.png".into(),
+            }],
+        );
+        assert_eq!(m.conv_id, ConvId("web:work".into()));
+        assert_eq!(m.text.as_deref(), Some("看图"));
+        assert_eq!(m.media.len(), 1);
+        assert_eq!(m.media[0].kind, "image/png");
+        assert_eq!(m.media[0].url, "/m/up-1-a.png");
+        assert!(!m.no_steer, "用户手打媒体消息走 steering");
+
+        let m = synth_media_message(
+            "web:work".into(),
+            Some(String::new()),
+            vec![MediaRef {
+                kind: "image/jpeg".into(),
+                url: "/m/up-2-b.jpg".into(),
+            }],
+        );
+        assert_eq!(m.text, None, "空串说明归一为 None（纯图消息）");
     }
 
     #[test]

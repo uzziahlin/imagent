@@ -19,6 +19,7 @@ import {
   type Action,
   type AppState,
   type InboundFrame,
+  type WorkspacesFrame,
 } from "./protocol";
 
 function run(state: AppState, ...actions: Action[]): AppState {
@@ -1270,6 +1271,130 @@ describe("v1.6 工作空间帧（出站形状 + 解析 + reducer）", () => {
     });
     expect(after.lastError?.code).toBe("workspace_invalid");
     expect(after.workspaces).toBe(s.workspaces); // 引用不变 = 快照原样
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.7 会话持久化：workspaces 帧可选 sessions 段（契约 B 段）
+// ---------------------------------------------------------------------------
+
+describe("workspaces.sessions（v1.7 会话持久化）", () => {
+  /** 全量快照帧文本（default/workspaces/convs 三段固定形状，尾部 extra 拼接
+   *  sessions / machine 段）。 */
+  const SNAP = (extra = "") =>
+    `{"v":1,"type":"workspaces","default":"/d","workspaces":[],"convs":{}${extra}}`;
+
+  it("parseFrame：sessions 段合法形状放行；元素缺字段/错类型/段非数组拒；旧形态（无 sessions）兼容", () => {
+    const ok = parseFrame(
+      SNAP(',"sessions":[{"id":"web:s-01","title":"部署巡检","updatedAt":1770000000}]'),
+    );
+    expect(ok).toMatchObject({
+      type: "workspaces",
+      sessions: [{ id: "web:s-01", title: "部署巡检", updatedAt: 1770000000 }],
+    });
+    // 旧网关形态：无 sessions 段（既有三段不动）
+    const legacy = parseFrame(SNAP("")) as WorkspacesFrame | null;
+    expect(legacy?.sessions).toBeUndefined();
+    expect(parseFrame(SNAP(',"sessions":[]'))).toMatchObject({ type: "workspaces", sessions: [] });
+    // 元素缺 id / title 非字符串 / updatedAt 非数字 → 整帧拒
+    expect(parseFrame(SNAP(',"sessions":[{"title":"x","updatedAt":1}]'))).toBeNull();
+    expect(parseFrame(SNAP(',"sessions":[{"id":"web:a","title":1,"updatedAt":1}]'))).toBeNull();
+    expect(parseFrame(SNAP(',"sessions":[{"id":"web:a","title":"x","updatedAt":"1"}]'))).toBeNull();
+    expect(parseFrame(SNAP(',"sessions":[{"id":"web:a","title":"x"}]'))).toBeNull();
+    // 段非数组 → 拒
+    expect(parseFrame(SNAP(',"sessions":{}'))).toBeNull();
+    expect(parseFrame(SNAP(',"sessions":"x"'))).toBeNull();
+  });
+
+  it("reducer：本地不存在的 conv 建空壳条目（lastPreview=title、lastAt=updatedAt*1000、unread=0），convOrder 按 updatedAt 降序插到 default 之后", () => {
+    // 乱序到达（升序）也应归一为降序插入；id 恒为完整 conv 形态（web: 前缀）
+    const s = run(initialState(), {
+      type: "frame",
+      frame: frame(
+        SNAP(
+          ',"sessions":[' +
+            '{"id":"web:s-b","title":"任务B","updatedAt":2000},' +
+            '{"id":"web:s-a","title":"任务A","updatedAt":3000},' +
+            '{"id":"web:manual","title":"手动会话","updatedAt":1000}],"machine":"home-mac"',
+        ),
+      ),
+    });
+    const sp = spaceOf(s, "home-mac");
+    expect(sp.convOrder).toEqual(["web:default", "web:s-a", "web:s-b", "web:manual"]); // 3000>2000>1000
+    expect(sp.convs["web:s-a"]).toEqual({
+      entries: [],
+      pending: [],
+      lastPreview: "任务A",
+      lastAt: 3_000_000,
+      unread: 0,
+    });
+    expect(sp.convs["web:manual"]?.lastPreview).toBe("手动会话");
+    expect(sp.convs["web:manual"]?.lastAt).toBe(1_000_000);
+    // 未读不点亮（离线历史不是新消息）
+    expect(sp.convs["web:s-b"]?.unread).toBe(0);
+    // default 会话条目仍在（newSpace 预置）
+    expect(sp.convs["web:default"]).toBeTruthy();
+  });
+
+  it("reducer：已存在（在线期间有消息流）的 conv 不动——本地 title/entries/lastPreview 优先", () => {
+    // 同机器（home-mac）先有消息流
+    let s = run(initialState(), {
+      type: "frame",
+      frame: frame(
+        '{"v":1,"type":"text","convId":"web:s-a","text":"本地首条消息","machine":"home-mac"}',
+      ),
+    });
+    const localTitle = spaceOf(s, "home-mac").convs["web:s-a"].title;
+    expect(localTitle).toBe("本地首条消息");
+    s = run(s, {
+      type: "frame",
+      frame: frame(
+        SNAP(
+          ',"sessions":[{"id":"web:s-a","title":"服务端历史名","updatedAt":9000}],"machine":"home-mac"',
+        ),
+      ),
+    });
+    const conv = spaceOf(s, "home-mac").convs["web:s-a"];
+    expect(conv.title).toBe("本地首条消息"); // 本地派生 title 不被覆盖
+    expect(conv.entries).toHaveLength(1); // 本地消息流保留
+    expect(conv.lastPreview).not.toBe("服务端历史名"); // 本地概要优先
+    // convOrder 位置不动（快照不重排已存在 conv——default 后是既有首位）
+    expect(spaceOf(s, "home-mac").convOrder).toEqual(["web:default", "web:s-a"]);
+  });
+
+  it("reducer：重复快照幂等（第二次不再改动）；无 sessions 段（旧网关）spaces 引用不变", () => {
+    const raw = SNAP(
+      ',"sessions":[{"id":"web:s-a","title":"A","updatedAt":3000},{"id":"web:s-b","title":"B","updatedAt":2000}],"machine":"home-mac"',
+    );
+    const s1 = run(initialState(), { type: "frame", frame: frame(raw) });
+    const s2 = run(s1, { type: "frame", frame: frame(raw) });
+    expect(spaceOf(s2, "home-mac")).toEqual(spaceOf(s1, "home-mac")); // 幂等
+    // 旧形态：无 sessions 段不触发合并（spaces 引用不变）
+    const s3 = run(s2, {
+      type: "frame",
+      frame: frame(SNAP(',"machine":"home-mac"')),
+    });
+    expect(s3.spaces).toBe(s2.spaces);
+    // 机器隔离：另一台机器的快照不动 home-mac 空间
+    const s4 = run(s3, {
+      type: "frame",
+      frame: frame(SNAP(',"sessions":[{"id":"web:s-x","title":"X","updatedAt":1}],"machine":"work-mac"')),
+    });
+    expect(spaceOf(s4, "work-mac").convOrder).toContain("web:s-x");
+    expect(spaceOf(s4, "home-mac").convOrder).not.toContain("web:s-x");
+  });
+
+  it("reducer：本地既有其它 conv 时，sessions 新条目插在 default 之后、既有 conv 之前", () => {
+    // 先有本地会话流（default 之后追加 web:local-1）
+    let s = run(initialState(), {
+      type: "frame",
+      frame: frame(TEXT_FRAME("hi", "web:local-1")),
+    });
+    s = run(s, {
+      type: "frame",
+      frame: frame(SNAP(',"sessions":[{"id":"web:s-a","title":"A","updatedAt":5}]')),
+    });
+    expect(orderOf(s)).toEqual(["web:default", "web:s-a", "web:local-1"]);
   });
 });
 

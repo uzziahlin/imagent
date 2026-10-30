@@ -36,6 +36,10 @@
 //   网关处理完任一 workspace 帧必回——SPA 以快照为唯一事实源，乐观更新一律
 //   不做）与 conv_workdir 增量（conv_workdir_set 成功后随快照一起回）。
 //   失败复用 error 帧（code="workspace_invalid"）。
+// - v1.7 媒体上行 + 会话持久化：message 帧可选 media{name,mime,b64}（随帧
+//   自动加密，网关落盘 media/up-*，超 8MB 回 error{media_too_large}）；入站
+//   workspaces 帧新增可选 sessions[{id,title,updatedAt}] 段（历史会话恢复，
+//   旧端三段不动——见 reducer mergePersistedSessions）。
 
 export const PROTOCOL_VERSION = 1;
 
@@ -193,15 +197,23 @@ export type HelloFrame = {
   pairing?: boolean;
 };
 
+/** v1.7 媒体上行载荷（契约 A 段，字段名与 Rust MediaPayload 逐字一致）：
+ * name ≤64 字符、mime 须 image/*、b64 单行无换行且解码后 ≤8MB（网关超限回
+ * error{media_too_large}；SPA 侧经 canvas 预压缩规避，见 lib/imageCompress）。 */
+export type MediaPayload = { name: string; mime: string; b64: string };
+
 export type MessageFrame = {
   v: typeof PROTOCOL_VERSION;
   type: "message";
   /** 完整 conv（如 web:default）；缺省落网关默认会话。 */
   convId?: string;
+  /** 可选说明（纯图可为空串——text 与 media 至少其一非空）。 */
   text: string;
   /** 目标机器（v1.1）：多机在线时未指定会被 relay 回 ambiguous_machine，
    *  故多机模式下 SPA 必须恒带当前选中机器；单机模式（旧 relay）不带。 */
   machine?: string;
+  /** v1.7 可选图片附件（message 已在 E2E 业务帧集合，media 随帧自动加密）。 */
+  media?: MediaPayload;
 };
 
 export type ApprovalDecision = "allow" | "deny" | "always";
@@ -562,9 +574,15 @@ export type PairingPendingFrame = {
  *  （对齐 Rust skip_serializing_if——缺席即未序列化）。 */
 export type WorkspaceInfo = { name: string; path: string; lastUsedAt?: number };
 
+/** v1.7 会话持久化条目（workspaces 帧可选 sessions 段元素，契约 B 段）：
+ * id = 完整 conv（store sessions 表 web: 前缀行）、title = 显示名（手动名
+ * 优先，否则 first_prompt 按 Unicode 码点截 24 字符）、updatedAt = unix 秒。 */
+export type SessionSummary = { id: string; title: string; updatedAt: number };
+
 /** v1.6 工作空间全量快照（唯一事实源）：default = 该机器 default_workdir
  *  绝对路径；convs = convId → workdir 绝对路径（含 local: 前缀会话）。machine
- *  = 来源机器（旧网关缺席 → 归 DEFAULT_MACHINE）。 */
+ *  = 来源机器（旧网关缺席 → 归 DEFAULT_MACHINE）。v1.7 起可选携带 sessions
+ *  （该机器持久化的历史会话列表，按 updatedAt 降序；旧网关缺席 → 不合并）。 */
 export type WorkspacesFrame = {
   v: typeof PROTOCOL_VERSION;
   type: "workspaces";
@@ -572,6 +590,7 @@ export type WorkspacesFrame = {
   workspaces: WorkspaceInfo[];
   convs: Record<string, string>;
   machine?: string;
+  sessions?: SessionSummary[];
 };
 
 /** v1.6 会话工作目录增量（conv_workdir_set 成功后随 workspaces 快照一起回）。 */
@@ -711,6 +730,16 @@ const convDirsOk = (c: unknown): boolean => {
   return Object.values(c as Record<string, unknown>).every((v) => typeof v === "string");
 };
 
+/** v1.7 workspaces.sessions 元素（可选段）：id/title 字符串、updatedAt 数字；
+ *  段本身缺席（旧网关）合法。 */
+const sessionSummaryOk = (s: unknown): boolean => {
+  if (typeof s !== "object" || s === null) {
+    return false;
+  }
+  const r = s as Record<string, unknown>;
+  return isStr(r, "id") && isStr(r, "title") && typeof r.updatedAt === "number";
+};
+
 const RESOLVED_DECISIONS: readonly string[] = ["allow", "deny", "always", "cancelled"];
 
 /** v1.4 e2e_ack 的网关身份公钥字段：ik（规范名）/ id / pk（宽容别名）任一
@@ -750,12 +779,14 @@ const INBOUND_CHECKS: Record<string, FieldCheck> = {
   e2e_ack: (o) =>
     isStr(o, "machine") && isStr(o, "gk") && isStr(o, "n2") && isStr(o, "sig") && ackIdentityOk(o),
   enc: (o) => isStr(o, "machine") && isStr(o, "box"),
-  // v1.6 工作空间帧：逐字段形状校验（machine 可选——旧网关缺席归 DEFAULT_MACHINE）
+  // v1.6 工作空间帧：逐字段形状校验（machine 可选——旧网关缺席归 DEFAULT_MACHINE）；
+  // v1.7 sessions 可选段：出现即须为全合法元素数组
   workspaces: (o) =>
     isStr(o, "default") &&
     Array.isArray(o.workspaces) &&
     o.workspaces.every(workspaceOk) &&
     convDirsOk(o.convs) &&
+    (o.sessions === undefined || (Array.isArray(o.sessions) && o.sessions.every(sessionSummaryOk))) &&
     machineOk(o),
   conv_workdir: (o) => isStr(o, "convId") && isStr(o, "workdir") && machineOk(o),
 };
@@ -1257,6 +1288,44 @@ function mergeConvWorkdir(state: AppState, frame: ConvWorkdirFrame): AppState {
   };
 }
 
+/** v1.7 会话持久化合并（契约 B 段，workspaces 快照可选 sessions 段）：sessions
+ *  里**尚不存在于本地 spaces** 的 conv 建空壳条目（entries 空、lastPreview =
+ *  title、lastAt = updatedAt*1000、unread 0——离线历史不点亮未读），convOrder
+ *  按 updatedAt 降序插入到 default 之后；已存在（在线期间有消息流）的 conv
+ *  **不动**——本地 title/entries 优先。幂等：重复快照对已合并 conv 无效果。
+ *  机器尚无空间（workspaces 先于任何消息帧到达）时先建默认空间再合并。 */
+function mergePersistedSessions(
+  state: AppState,
+  machine: string,
+  sessions: SessionSummary[],
+): Record<string, MachineSpace> {
+  const hadSpace = state.spaces[machine] !== undefined;
+  const space = hadSpace ? state.spaces[machine] : newSpace();
+  const fresh = sessions
+    .filter((s) => space.convs[s.id] === undefined)
+    .sort((a, b) => b.updatedAt - a.updatedAt);
+  if (fresh.length === 0) {
+    return hadSpace ? state.spaces : { ...state.spaces, [machine]: space };
+  }
+  const convs = { ...space.convs };
+  for (const s of fresh) {
+    convs[s.id] = {
+      entries: [],
+      pending: [],
+      lastPreview: s.title,
+      lastAt: s.updatedAt * 1000,
+      unread: 0,
+    };
+  }
+  const di = space.convOrder.indexOf(DEFAULT_CONV);
+  const convOrder = [
+    ...space.convOrder.slice(0, di + 1),
+    ...fresh.map((s) => s.id),
+    ...space.convOrder.slice(di + 1),
+  ];
+  return { ...state.spaces, [machine]: { convs, convOrder } };
+}
+
 function reduceFrame(state: AppState, frame: InboundFrame): AppState {
   switch (frame.type) {
     case "hello_ack":
@@ -1314,20 +1383,28 @@ function reduceFrame(state: AppState, frame: InboundFrame): AppState {
       return addApproval(state, frameMachine(frame), frame);
     case "approval_resolved":
       return resolveApproval(state, frameMachine(frame), frame);
-    case "workspaces":
+    case "workspaces": {
       // v1.6 全量快照：按帧来源机器整体落表（唯一事实源；失败回 error 帧且
       // 不再回快照——SPA 不做乐观更新，失败即维持上一份快照）。
+      // v1.7：快照可选 sessions 段 → 先合并历史会话（仅补本地不存在的 conv），
+      // 再落快照表。
+      const machine = frameMachine(frame);
+      const spaces = frame.sessions
+        ? mergePersistedSessions(state, machine, frame.sessions)
+        : state.spaces;
       return {
         ...state,
+        spaces,
         workspaces: {
           ...state.workspaces,
-          [frameMachine(frame)]: {
+          [machine]: {
             default: frame.default,
             items: frame.workspaces,
             convs: frame.convs,
           },
         },
       };
+    }
     case "conv_workdir":
       // v1.6 增量：合并进对应机器快照 convs（机器取帧的 machine 字段）
       return mergeConvWorkdir(state, frame);

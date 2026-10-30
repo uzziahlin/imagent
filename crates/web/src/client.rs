@@ -11,11 +11,13 @@
 //! 封顶 30s，成功建连重置）。每步握手等待 10s 超时（不空转发——对齐
 //! wecom R-5「认证失败必须重连」纪律）。
 //!
-//! 与 [`crate::platform::WebPlatform`] 通过四条 channel 解耦：
+//! 与 [`crate::platform::WebPlatform`] 通过五条 channel 解耦：
 //! - `inbound_tx`：浏览器业务帧映射成的 [`InboundMessage`] → platform.recv；
 //! - `sync_tx`：sync 请求 → platform 的 sync responder（D6 会话恢复）；
 //! - `workspace_tx`：v1.6 工作空间动作（workspace_list/save/remove /
 //!   conv_workdir_set）→ platform 的 workspace 泵（store KV 读写）；
+//! - `media_tx`：v1.7 媒体上行（message 帧带 media 段）→ platform 的媒体泵
+//!   （值域校验 + 落盘 + 合成 InboundMessage / 失败回 error 帧）；
 //! - `outbound_rx`：platform 序列化好的出站帧（JSON 文本）→ relay → 浏览器。
 //!
 //! 协议细节（§4）：relay 对浏览器侧有 90s idle 超时，网关 30s 发协议层
@@ -81,6 +83,9 @@ pub(crate) struct WebClient {
     /// v1.6 工作空间动作通道（workspace_list/save/remove/conv_workdir_set
     /// 四帧）→ platform 的 workspace 泵（store KV 读写 + 校验 + 回快照）。
     pub(crate) workspace_tx: mpsc::Sender<InboundAction>,
+    /// v1.7 媒体上行通道（message 帧带 media 段）→ platform 的媒体泵
+    /// （mime/b64/大小校验 + 落盘 + 合成 InboundMessage；失败回 error 帧）。
+    pub(crate) media_tx: mpsc::Sender<InboundAction>,
 }
 
 /// hello 首帧构造（token 形态，v1.1/v1.2 兼容路径：token + machine 自报；
@@ -519,6 +524,18 @@ impl WebClient {
                     }
                 }
             }
+            // v1.7 媒体上行 → platform 媒体泵（b64 解码 + 落盘是文件系统
+            // IO，不占 client 收发循环；失败 error 帧经泵的 outbound 通道回）。
+            // 同 1s 有界背压：泵毫秒级吞吐，持续满只在异常时出现——丢弃由
+            // SPA 无回执感知 + 用户重发兜底。
+            act @ InboundAction::MediaMessage { .. } => {
+                if tokio::time::timeout(Duration::from_secs(1), self.media_tx.send(act))
+                    .await
+                    .is_err()
+                {
+                    warn!(target: TARGET, "media channel 持续满 1s，丢弃媒体消息");
+                }
+            }
             InboundAction::Sync => {
                 if tokio::time::timeout(Duration::from_secs(1), self.sync_tx.send(()))
                     .await
@@ -732,6 +749,7 @@ mod tests {
         let (inbound_tx, _inbound_rx) = mpsc::channel::<InboundMessage>(8);
         let (sync_tx, _sync_rx) = mpsc::channel::<()>(8);
         let (workspace_tx, _workspace_rx) = mpsc::channel::<InboundAction>(8);
+        let (media_tx, _media_rx) = mpsc::channel::<InboundAction>(8);
         let client = WebClient {
             relay_url: "ws://127.0.0.1:1/gateway".into(),
             credential: GatewayCredential::Token("t".into()),
@@ -742,6 +760,7 @@ mod tests {
             inbound_tx,
             sync_tx,
             workspace_tx,
+            media_tx,
         };
         let (_outbound_tx, outbound_rx) = mpsc::channel::<String>(8);
         let token = CancellationToken::new();

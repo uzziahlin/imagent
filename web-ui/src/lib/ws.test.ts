@@ -314,6 +314,29 @@ describe("WsManager", () => {
     expect(sock.sent).toContain('{"v":1,"type":"message","text":"/switch work"}');
   });
 
+  // v1.7 媒体上行（契约 A 段）：media 可选参数经既有 message 出站路径（E2E
+  // BUSINESS_TYPES 已含 message，随帧自动加密），字段名逐字一致。
+  it("sendMessage 可选 media：帧带 media{name,mime,b64}；纯图消息 text 空串；无 media 字节级不变", () => {
+    const h = makeManager();
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    const media = { name: "shot.jpg", mime: "image/jpeg", b64: "AAAA" };
+    expect(h.mgr.sendMessage("web:default", "看图", "home-mac", media)).toBe(true);
+    expect(sock.sent).toContain(
+      '{"v":1,"type":"message","convId":"web:default","text":"看图","machine":"home-mac","media":{"name":"shot.jpg","mime":"image/jpeg","b64":"AAAA"}}',
+    );
+    // 纯图消息：text 传空串（契约：text 与 media 至少其一非空）
+    expect(h.mgr.sendMessage("web:default", "", "home-mac", media)).toBe(true);
+    expect(sock.sent).toContain(
+      '{"v":1,"type":"message","convId":"web:default","text":"","machine":"home-mac","media":{"name":"shot.jpg","mime":"image/jpeg","b64":"AAAA"}}',
+    );
+    // 不带 media：帧与 v1.6 字节级一致（undefined 不序列化）
+    expect(h.mgr.sendMessage("web:default", "hi", "home-mac")).toBe(true);
+    expect(sock.sent).toContain(
+      '{"v":1,"type":"message","convId":"web:default","text":"hi","machine":"home-mac"}',
+    );
+  });
+
   // local:xxx 是网关侧本地终端会话的既有 conv 形态（MultiPlatform 镜像路由把
   // local 会话帧同步给浏览器）。SPA 对 local 会话的干预消息/审批回执必须原样
   // 携带 local: convId——被改写（如强加 web: 前缀）则网关侧路由进幽灵会话，
