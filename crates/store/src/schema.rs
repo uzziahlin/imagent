@@ -3,7 +3,7 @@
 //! 用 `PRAGMA user_version` 做简单线性迁移：v1 = 建 5 张基础表，v2 = 动态白名单 + 审计日志。
 
 /// 当前代码支持的最新 schema 版本（migrate 上限 + user_version 过新拒绝阈值，P2-O）。
-pub const SCHEMA_VERSION: i64 = 17;
+pub const SCHEMA_VERSION: i64 = 18;
 
 /// v1 全部建表语句（`CREATE TABLE IF NOT EXISTS`，可重复执行）。
 pub const SCHEMA_V1: &str = r#"
@@ -227,6 +227,13 @@ pub const SCHEMA_V17: &str = "CREATE TABLE IF NOT EXISTS outbound_log (
 );
 CREATE INDEX IF NOT EXISTS idx_outbound_conv ON outbound_log(conv_id, seq);";
 
+/// v18：sessions 增 title 列（v1.9 会话语义标题）——网关用 headless CLI 为
+/// 无手动名的会话生成的语义标题（≤24 码点，清洗后）。可空：NULL = 未生成
+///（失败/未触发/手动名会话不需要）。展示优先级：手动名（name）> 语义
+/// title > first_prompt 摘要，由 web 侧组装快照时汇聚。`upsert_session`
+/// 不触碰本列（轮末落库不清已生成的标题）。
+pub const SCHEMA_V18: &str = "ALTER TABLE sessions ADD COLUMN title TEXT;";
+
 /// 在已打开的连接上跑线性迁移。幂等：逐版本推进（v1→v2→…），已到目标版本则跳过。
 ///
 /// 迁移竞态（code-review v14 P3-c）：`user_version` 的读取必须在事务**内**——
@@ -321,6 +328,10 @@ pub fn migrate(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
     if current < 17 {
         tx.execute_batch(SCHEMA_V17)?;
         tx.pragma_update(None, "user_version", 17_i64)?;
+    }
+    if current < 18 {
+        tx.execute_batch(SCHEMA_V18)?;
+        tx.pragma_update(None, "user_version", 18_i64)?;
     }
     tx.commit()?;
     Ok(())

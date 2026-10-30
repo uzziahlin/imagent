@@ -770,6 +770,40 @@ impl Store {
         .await
     }
 
+    /// v1.9 会话语义标题：定向写入该 conv 的 title 列（语义标题生成成功后
+    /// 调用）。无行（conv 不存在）no-op。`upsert_session` 的 INSERT/UPDATE
+    /// 均不含本列——轮末落库不清已生成的标题。
+    pub async fn set_session_title(&self, conv_id: &str, title: &str) -> Result<()> {
+        let (conv_id, title) = (conv_id.to_string(), title.to_string());
+        let inner = self.inner.clone();
+        blocking_with_retry(inner, move |conn| {
+            conn.execute(
+                "UPDATE sessions SET title = ?2 WHERE conv_id = ?1",
+                rusqlite::params![conv_id, title],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// v1.9 会话语义标题：读该 conv 的 title 列（None = 未生成/无行）。
+    /// web 快照组装用——`get_session` 的 SessionRow 为 core 共享形状，本列
+    /// 仅 web 消费，独立单查（PK 点查，与 collect 既有逐 conv 查询同量级）。
+    pub async fn get_session_title(&self, conv_id: &str) -> Result<Option<String>> {
+        let conv_id = conv_id.to_string();
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let mut stmt = conn.prepare("SELECT title FROM sessions WHERE conv_id = ?1")?;
+            let mut rows = stmt.query(rusqlite::params![conv_id])?;
+            Ok(rows
+                .next()?
+                .map(|r| r.get::<_, Option<String>>(0))
+                .transpose()?
+                .flatten())
+        })
+        .await
+    }
+
     // —— sync_buf（ilink 长轮询游标）——
 
     pub async fn get_sync_buf(&self, platform: &str, account_id: &str) -> Result<Option<String>> {
@@ -3301,6 +3335,89 @@ mod tests {
 
         // 不存在的 conv：no-op 不报错。
         store.set_session_todos("feishu:none", None).await.unwrap();
+    }
+
+    /// v1.9 会话语义标题（schema v18）：旧库（v1）迁移补 title 列；set/get
+    /// 往返；无行 no-op；轮末 upsert（session_id 变化）不清已写 title。
+    #[tokio::test]
+    async fn session_title_migration_roundtrip_and_upsert_preserves() {
+        // 旧库迁移：手动建仅到 v1 的库（sessions 无 title 列），open 触发
+        // v1→v18 线性迁移。
+        let db = TempDb::new("migrate_v18_title").await;
+        {
+            let conn = rusqlite::Connection::open(&db.path).unwrap();
+            conn.execute_batch(crate::schema::SCHEMA_V1).unwrap();
+            conn.pragma_update(None, "user_version", 1_i64).unwrap();
+        }
+        let store = Store::open(&db.path).await.unwrap();
+        {
+            // user_version 推进到最新；title 列已可写（set 走 UPDATE 不报
+            // no such column 即证明迁移生效）。
+            let conn = rusqlite::Connection::open(&db.path).unwrap();
+            let v: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(v, crate::schema::SCHEMA_VERSION, "迁移应推进到 v18");
+        }
+        store
+            .upsert_session(&SessionRow {
+                first_prompt: None,
+                conv_id: "web:s-a".into(),
+                session_id: "sess-A".into(),
+                agent_kind: "claude-cli".into(),
+                workdir: "/tmp/proj".into(),
+                name: None,
+                created_at: 1,
+                updated_at: 1,
+                task_todos: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_session_title("web:s-a").await.unwrap(),
+            None,
+            "新行 title 为 NULL"
+        );
+
+        // 无行 no-op（不报错）。
+        store.set_session_title("web:none", "孤儿").await.unwrap();
+        assert_eq!(store.get_session_title("web:none").await.unwrap(), None);
+
+        // 写入 + 读回。
+        store
+            .set_session_title("web:s-a", "部署巡检")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_session_title("web:s-a").await.unwrap().as_deref(),
+            Some("部署巡检")
+        );
+
+        // 轮末 upsert（session_id 换新）：title 不被清（INSERT 列集不含本列，
+        // ON CONFLICT 的 SET 也不含）。
+        store
+            .upsert_session(&SessionRow {
+                first_prompt: None,
+                conv_id: "web:s-a".into(),
+                session_id: "sess-B".into(),
+                agent_kind: "claude-cli".into(),
+                workdir: "/tmp/proj".into(),
+                name: None,
+                created_at: 1,
+                updated_at: 2,
+                task_todos: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_session_title("web:s-a").await.unwrap().as_deref(),
+            Some("部署巡检"),
+            "upsert_session 不得清 title"
+        );
+
+        // /new 删行：title 随行消失。
+        store.delete_session("web:s-a").await.unwrap();
+        assert_eq!(store.get_session_title("web:s-a").await.unwrap(), None);
     }
 
     #[tokio::test]

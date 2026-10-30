@@ -50,6 +50,7 @@ use imagent_core::{
 use crate::client::WebClient;
 use crate::e2e::E2eIdentity;
 use crate::models::{resolve_models, CliModels, ModelsContext};
+use crate::titles::{TitleCandidate, TitleGen};
 use crate::{
     encode_approval_request_frame, encode_approval_resolved_frame, encode_card_frame,
     encode_conv_workdir_frame, encode_error_frame, encode_history_frame, encode_text_frame,
@@ -219,14 +220,17 @@ async fn serve_sync_requests(
 /// 在本泵内 await——不阻塞 client 收发循环与 dispatch）。`machine_id` 为
 /// 本机身份（出站帧必带，v1.1 语义；与 serve_sync_requests 同款注入）。
 /// `models` 为 v1.8 模型目录上下文（backend 句柄 + 官方回退列表）——每次
-/// 组快照现读 CLI settings（低频操作可接受，不做缓存）。平台 Drop 时经
-/// shutdown token 连动退出。
+/// 组快照现读 CLI settings（低频操作可接受，不做缓存）。`titles` 为 v1.9
+/// 语义标题生成器（快照组装懒触发的共享防重复集，见 [`crate::titles`]）。
+/// 平台 Drop 时经 shutdown token 连动退出。
+#[allow(clippy::too_many_arguments)] // 参数已达 8——v1.9 注入 titles（先例 new_with_e2e）
 async fn serve_workspace_actions(
     mut workspace_rx: mpsc::Receiver<InboundAction>,
     machine_id: String,
     store: Store,
     default_workdir: PathBuf,
     models: ModelsContext,
+    titles: TitleGen,
     outbound_tx: mpsc::Sender<String>,
     shutdown: CancellationToken,
 ) {
@@ -246,6 +250,7 @@ async fn serve_workspace_actions(
                     &default_workdir,
                     &models,
                     &cli,
+                    &titles,
                     act,
                     &outbound_tx,
                 )
@@ -261,12 +266,14 @@ async fn serve_workspace_actions(
 ///   来源；失败时快照不变 + 前置 error 帧）。
 /// - conv_workdir_set 成功时**额外**推一条 conv_workdir 增量帧。
 /// - workspace_remove 未命中幂等（store delete 对不存在键即 Ok）。
+#[allow(clippy::too_many_arguments)] // 参数已达 8——v1.9 注入 titles（先例 new_with_e2e）
 async fn handle_workspace_action(
     machine: &str,
     store: &Store,
     default_workdir: &Path,
     models: &ModelsContext,
     cli: &CliModels,
+    titles: &TitleGen,
     act: InboundAction,
     outbound_tx: &mpsc::Sender<String>,
 ) {
@@ -324,7 +331,7 @@ async fn handle_workspace_action(
         }
     }
     // 每帧收尾：全量快照（无论成败）。
-    match build_workspaces_frame(machine, store, default_workdir, models, cli).await {
+    match build_workspaces_frame(machine, store, default_workdir, models, cli, titles).await {
         Ok(json) => enqueue_best_effort(outbound_tx, json),
         Err(e) => warn!(target: TARGET, error = %e, "workspaces 快照帧序列化失败"),
     }
@@ -343,6 +350,7 @@ async fn build_workspaces_frame(
     default_workdir: &Path,
     models: &ModelsContext,
     cli: &CliModels,
+    titles: &TitleGen,
 ) -> Result<String> {
     let mut entries: Vec<WorkspaceEntryFrame> = Vec::new();
     match store.list_config(WORKSPACE_PREFIX).await {
@@ -378,7 +386,7 @@ async fn build_workspaces_frame(
         }
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name)); // 契约：按 name 稳定序
-    let sessions = collect_session_entries(store).await;
+    let sessions = collect_session_entries(store, titles).await;
     // v1.8 models 段：CLI 映射（调用方现读注入，见 serve_workspace_actions）
     // + backend.model()（/model 热设值）汇聚；空 options 整段缺席。
     let models_frame = resolve_models(cli, &models.official, models.backend.model());
@@ -392,15 +400,20 @@ async fn build_workspaces_frame(
     )
 }
 
-/// v1.7 sessions 段数据源（契约 B）：store sessions 表 `web:` 前缀行，按
-/// updated_at 降序，上限 [`WEB_SESSIONS_MAX`]（50）。title：SessionRow.name
-/// （手动名）优先，否则该 conv 最近一条 session_history 的 first_prompt 摘要
-/// ——主表无 first_prompt 列（仅历史副表有，`get_session` 恒 None），故无
-/// 手动名时补查 `list_session_history(conv, 1)` 取最近行。store 无「跨 conv
-/// 列 sessions」现成 API：`list_session_convs` 全枚举 + 逐 conv `get_session`
-/// 后排序截 50（web: 会话数量有限，任务说明许可的路径）。best-effort：读
-/// 失败 → warn + 跳过（或整段空），快照其余部分照发。
-async fn collect_session_entries(store: &Store) -> Vec<SessionEntryFrame> {
+/// v1.7 sessions 段数据源（契约 B）+ v1.9 语义标题懒触发点：store sessions
+/// 表 `web:` 前缀行，按 updated_at 降序，上限 [`WEB_SESSIONS_MAX`]（50）。
+/// title 三档：SessionRow.name（手动名）> sessions.title 语义标题（v1.9，
+/// 独列单查——core 共享的 SessionRow 形状不扩散本列）> 该 conv 最近一条
+/// session_history 的 first_prompt 摘要（主表无此列，无语义标题时补查
+/// `list_session_history(conv, 1)`）。store 无「跨 conv 列 sessions」现成
+/// API：`list_session_convs` 全枚举 + 逐 conv `get_session` 后排序截 50。
+/// best-effort：读失败 → warn + 跳过（或整段空），快照其余部分照发。
+///
+/// v1.9 懒触发：组装中对「无手动名、无语义 title 且 first_prompt 非空」的
+/// conv 记为候选（快照序新→旧），收尾交 [`TitleGen::spawn_lazy`]——每快照
+/// 至多 3 个**最旧**候选 spawn headless CLI 生成，成功写库后**下一条**快照
+/// 自然带出新 title（SPA 打开面板/切会话都会拉快照，多次快照逐批收敛）。
+async fn collect_session_entries(store: &Store, titles: &TitleGen) -> Vec<SessionEntryFrame> {
     let convs = match store.list_session_convs().await {
         Ok(convs) => convs,
         Err(e) => {
@@ -428,10 +441,24 @@ async fn collect_session_entries(store: &Store) -> Vec<SessionEntryFrame> {
     });
     rows.truncate(WEB_SESSIONS_MAX);
     let mut entries = Vec::with_capacity(rows.len());
+    let mut candidates: Vec<TitleCandidate> = Vec::new();
     for row in rows {
         let has_manual_name = row.name.as_deref().is_some_and(|n| !n.trim().is_empty());
-        let first_prompt = if has_manual_name {
-            None // 手动名优先，免查历史副表
+        // 语义标题独立单查（手动名会话显示不走此档，免查）。
+        let semantic_title = if has_manual_name {
+            None
+        } else {
+            match store.get_session_title(&row.conv_id).await {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(target: TARGET, conv = %row.conv_id, error = %e, "读取语义标题失败（视为无）");
+                    None
+                }
+            }
+        };
+        // first_prompt 摘要：仅当手动名与语义标题皆无才查（显示兜底 + 生成种子）。
+        let first_prompt = if has_manual_name || semantic_title.is_some() {
+            None
         } else {
             match store.list_session_history(&row.conv_id, 1).await {
                 Ok(h) => h.into_iter().next().and_then(|r| r.first_prompt),
@@ -446,12 +473,28 @@ async fn collect_session_entries(store: &Store) -> Vec<SessionEntryFrame> {
                 }
             }
         };
+        // v1.9 懒触发候选：无语义 title 且 first_prompt 非空（手动名会话
+        // first_prompt 恒 None，天然排除——语义标题对显示无增益）。
+        if semantic_title.is_none() {
+            if let Some(prompt) = first_prompt.as_deref().filter(|p| !p.trim().is_empty()) {
+                candidates.push(TitleCandidate {
+                    conv: row.conv_id.clone(),
+                    first_prompt: prompt.to_string(),
+                    workdir: PathBuf::from(&row.workdir),
+                });
+            }
+        }
         entries.push(SessionEntryFrame {
             id: row.conv_id.clone(),
-            title: session_title(row.name.as_deref(), first_prompt.as_deref()),
+            title: session_title(
+                row.name.as_deref(),
+                semantic_title.as_deref(),
+                first_prompt.as_deref(),
+            ),
             updated_at: u64::try_from(row.updated_at).unwrap_or(0),
         });
     }
+    titles.spawn_lazy(&candidates);
     entries
 }
 
@@ -980,14 +1023,16 @@ impl WebPlatform {
             shutdown.clone(),
         ));
 
-        // workspace 泵（v1.6 工作空间 + v1.8 models 段；出站帧带 machine，
-        // v1.1 语义）。
+        // workspace 泵（v1.6 工作空间 + v1.8 models 段 + v1.9 语义标题懒触发；
+        // 出站帧带 machine，v1.1 语义）。
+        let titles = TitleGen::new(store.clone());
         tokio::spawn(serve_workspace_actions(
             workspace_rx,
             machine_id.clone(),
             store.clone(),
             default_workdir,
             models,
+            titles,
             outbound_tx.clone(),
             shutdown.clone(),
         ));
@@ -1543,12 +1588,36 @@ mod tests {
         act: InboundAction,
     ) -> Vec<serde_json::Value> {
         let (tx, mut rx) = mpsc::channel::<String>(32);
-        handle_workspace_action(TEST_MACHINE, store, default, models, cli, act, &tx).await;
+        handle_workspace_action(
+            TEST_MACHINE,
+            store,
+            default,
+            models,
+            cli,
+            &disabled_titles(store),
+            act,
+            &tx,
+        )
+        .await;
         let mut out = Vec::new();
         while let Ok(json) = rx.try_recv() {
             out.push(serde_json::from_str(&json).unwrap());
         }
         out
+    }
+
+    /// 禁用语义标题的生成器（既有动作测试注入）：假执行器恒失败——懒触发
+    /// 路径走通但零副作用（不依赖运行机器上的 claude，确定性钉住）。
+    fn disabled_titles(store: &Store) -> TitleGen {
+        TitleGen::with_runner(
+            store.clone(),
+            std::sync::Arc::new(|_argv: Vec<String>, _cwd: PathBuf| {
+                let fut: futures::future::BoxFuture<'static, std::result::Result<String, String>> =
+                    Box::pin(async { Err("测试禁用语义标题".into()) });
+                fut
+            }),
+            Duration::from_millis(10),
+        )
     }
 
     /// v1.8 models 段组装（任务验收项）：官方回退（无 CLI 映射 → options =
@@ -2065,6 +2134,7 @@ mod tests {
     #[tokio::test]
     async fn collect_session_entries_filters_sorts_and_titles() {
         let store = test_store().await;
+        let titles = disabled_titles(&store);
         // 非 web 会话：不进段。
         seed_session(&store, "ilink:u1", None, Some("不该出现")).await;
         seed_session(&store, "local:work", None, Some("也不该出现")).await;
@@ -2079,7 +2149,7 @@ mod tests {
         .await;
         seed_session(&store, "web:gamma", None, None).await;
 
-        let entries = collect_session_entries(&store).await;
+        let entries = collect_session_entries(&store, &titles).await;
         let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids.len(), 3, "仅 web: 前缀：{ids:?}");
         assert!(ids.iter().all(|i| i.starts_with("web:")));
@@ -2116,14 +2186,183 @@ mod tests {
     #[tokio::test]
     async fn collect_session_entries_caps_at_50() {
         let store = test_store().await;
+        let titles = disabled_titles(&store);
         for i in 0..(WEB_SESSIONS_MAX + 2) {
             seed_session(&store, &format!("web:s{i:02}"), None, Some("首条")).await;
         }
-        let entries = collect_session_entries(&store).await;
+        let entries = collect_session_entries(&store, &titles).await;
         assert_eq!(entries.len(), WEB_SESSIONS_MAX, "上限 50（52 条种子）");
         for w in entries.windows(2) {
             assert!(w[0].updated_at >= w[1].updated_at, "截断前已按降序排");
         }
+    }
+
+    /// v1.9 title 三档优先级（任务验收项）：手动名 > 语义标题
+    ///（sessions.title 列）> first_prompt 摘要；语义标题已生成后不再查
+    /// first_prompt（显示档位已定）。
+    #[tokio::test]
+    async fn collect_session_entries_title_priority_manual_semantic_prompt() {
+        let store = test_store().await;
+        let titles = disabled_titles(&store);
+        // 手动名 + 语义标题 + first_prompt 三者齐备：手动名胜出。
+        seed_session(&store, "web:p1", Some("手动名"), Some("首条摘要")).await;
+        store.set_session_title("web:p1", "语义标题").await.unwrap();
+        // 语义标题 + first_prompt：语义标题胜出。
+        seed_session(&store, "web:p2", None, Some("首条摘要")).await;
+        store.set_session_title("web:p2", "语义标题").await.unwrap();
+        // 仅 first_prompt：机械摘要兜底（v1.7 行为不变）。
+        seed_session(&store, "web:p3", None, Some("首条摘要")).await;
+
+        let entries = collect_session_entries(&store, &titles).await;
+        let title_of = |id: &str| {
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .unwrap_or_else(|| panic!("{id} 缺席：{entries:?}"))
+                .title
+                .clone()
+        };
+        assert_eq!(title_of("web:p1"), "手动名", "手动名 > 语义标题");
+        assert_eq!(
+            title_of("web:p2"),
+            "语义标题",
+            "语义标题 > first_prompt 摘要"
+        );
+        assert_eq!(title_of("web:p3"), "首条摘要", "first_prompt 摘要兜底");
+    }
+
+    /// v1.9 懒触发集成（任务验收项）：快照组装对「无手动名、无语义 title、
+    /// first_prompt 非空」的 conv 逐批生成——假执行器记录调用，验证每快照
+    /// 至多 3 个（防风暴）、手动名/已有语义标题/无 first_prompt 的 conv 不
+    /// 触发、成功写库后下一条快照 title 升级为语义标题。「最旧优先」的精确
+    /// 排序断言见 titles.rs 单测（此处种子同秒 upsert，秒界跨越会让「最旧」
+    /// 组成抖动，故只钉批大小与收敛性）。
+    #[tokio::test]
+    async fn collect_session_entries_lazy_triggers_title_generation() {
+        let store = test_store().await;
+        // 5 个候选 + 三个不触发样本。
+        for i in 1..=5 {
+            seed_session(
+                &store,
+                &format!("web:t{i}"),
+                None,
+                Some(&format!("任务{i}的首条消息")),
+            )
+            .await;
+        }
+        seed_session(&store, "web:named", Some("手动名"), Some("不该触发的首条")).await; // 手动名：免生成
+        seed_session(&store, "web:done", None, Some("已生成的首条")).await;
+        store
+            .set_session_title("web:done", "已有语义标题")
+            .await
+            .unwrap(); // 已有：免生成
+        seed_session(&store, "web:empty", None, None).await; // 无 first_prompt：免生成
+
+        // 记录型假执行器：按 prompt 末行（first_prompt 原文）回可辨认的标题。
+        let calls: std::sync::Arc<Mutex<Vec<String>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let rec = calls.clone();
+        let runner = std::sync::Arc::new(move |argv: Vec<String>, _cwd: PathBuf| {
+            let rec = rec.clone();
+            let fut: futures::future::BoxFuture<'static, std::result::Result<String, String>> =
+                Box::pin(async move {
+                    let body = argv[2].lines().last().unwrap_or_default().to_string();
+                    rec.lock().unwrap().push(body.clone());
+                    // 从「任务N的…」提取 N 回标题（假「语义标题」）。
+                    let n = body.chars().find_map(|c| c.to_digit(10)).unwrap_or(0);
+                    Ok(format!("语义标题{n}"))
+                });
+            fut
+        });
+        let titles = TitleGen::with_runner(store.clone(), runner, Duration::from_secs(2));
+
+        // 轮询：等待 5 个候选中恰 `want` 个已写语义标题。
+        async fn wait_titled(store: &Store, want: usize) {
+            for _ in 0..250 {
+                let mut n = 0;
+                for i in 1..=5 {
+                    if store
+                        .get_session_title(&format!("web:t{i}"))
+                        .await
+                        .unwrap()
+                        .is_some()
+                    {
+                        n += 1;
+                    }
+                }
+                if n >= want {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("等待 {want} 个语义标题写库超时（5s）");
+        }
+
+        // 第一条快照：5 个候选只 spawn 3 个（防风暴），且不含三个不触发样本。
+        collect_session_entries(&store, &titles).await;
+        wait_titled(&store, 3).await;
+        let prompts = calls.lock().unwrap().clone();
+        assert_eq!(
+            prompts.len(),
+            3,
+            "每快照至多 3 个，手动名/已有语义标题/无首条的不触发：{prompts:?}"
+        );
+        assert!(
+            prompts
+                .iter()
+                .all(|p| p.starts_with("任务") && p.ends_with("的首条消息")),
+            "全部为候选 conv 的 first_prompt：{prompts:?}"
+        );
+
+        // 第二条快照：已生成的 3 个 title 升级为语义标题（网关权威，SPA merge
+        // 靠快照带出），并补齐剩余 2 个候选。先定格库内 title 快照（第二批
+        // spawn 发生在 collect 内，collect 后写入会造成比较竞态）。
+        let mut db_titles: Vec<Option<String>> = Vec::new();
+        for i in 1..=5 {
+            db_titles.push(store.get_session_title(&format!("web:t{i}")).await.unwrap());
+        }
+        let entries = collect_session_entries(&store, &titles).await;
+        let title_of = |entries: &[SessionEntryFrame], id: &str| {
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .unwrap_or_else(|| panic!("{id} 缺席：{entries:?}"))
+                .title
+                .clone()
+        };
+        for (i, expected) in db_titles.iter().enumerate() {
+            let id = format!("web:t{}", i + 1);
+            match expected {
+                Some(t) => assert_eq!(title_of(&entries, &id), *t, "已生成的快照 title = 语义标题"),
+                None => assert_eq!(
+                    title_of(&entries, &id),
+                    format!("任务{}的首条消息", i + 1),
+                    "未及生成的仍是机械摘要"
+                ),
+            }
+        }
+        assert_eq!(
+            title_of(&entries, "web:done"),
+            "已有语义标题",
+            "已有语义标题直读"
+        );
+        assert_eq!(title_of(&entries, "web:named"), "手动名", "手动名不受影响");
+        wait_titled(&store, 5).await;
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            5,
+            "第二条快照补齐剩余 2 个候选"
+        );
+
+        // 第三条快照：全部升级，不再有新 spawn（防重复）。
+        let entries = collect_session_entries(&store, &titles).await;
+        for i in 1..=5 {
+            assert_eq!(
+                title_of(&entries, &format!("web:t{i}")),
+                format!("语义标题{i}"),
+                "全部收敛为语义标题"
+            );
+        }
+        assert_eq!(calls.lock().unwrap().len(), 5, "已生成/已登记的不再触发");
     }
 
     /// 卡片缓存：上限 32 conv 淘汰最旧；快照按 seq 旧→新排序。

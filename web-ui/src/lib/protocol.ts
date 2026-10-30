@@ -607,8 +607,9 @@ export type PairingPendingFrame = {
 export type WorkspaceInfo = { name: string; path: string; lastUsedAt?: number };
 
 /** v1.7 会话持久化条目（workspaces 帧可选 sessions 段元素，契约 B 段）：
- * id = 完整 conv（store sessions 表 web: 前缀行）、title = 显示名（手动名
- * 优先，否则 first_prompt 按 Unicode 码点截 24 字符）、updatedAt = unix 秒。 */
+ * id = 完整 conv（store sessions 表 web: 前缀行）、title = 显示名（v1.9 三
+ * 档：手动名 > 语义标题 > first_prompt 按 Unicode 码点截 24 字符）、
+ * updatedAt = unix 秒。 */
 export type SessionSummary = { id: string; title: string; updatedAt: number };
 
 /** v1.8 模型菜单项（workspaces 帧可选 models 段 options 元素）：label = 菜单
@@ -1507,12 +1508,20 @@ function mergeHistory(state: AppState, frame: HistoryFrame): AppState {
   };
 }
 
-/** v1.7 会话持久化合并（契约 B 段，workspaces 快照可选 sessions 段）：sessions
- *  里**尚不存在于本地 spaces** 的 conv 建空壳条目（entries 空、lastPreview =
- *  title、lastAt = updatedAt*1000、unread 0——离线历史不点亮未读），convOrder
- *  按 updatedAt 降序插入到 default 之后；已存在（在线期间有消息流）的 conv
- *  **不动**——本地 title/entries 优先。幂等：重复快照对已合并 conv 无效果。
- *  机器尚无空间（workspaces 先于任何消息帧到达）时先建默认空间再合并。 */
+/** v1.7 会话持久化合并（契约 B 段，workspaces 快照可选 sessions 段）：
+ *  sessions 里**尚不存在于本地 spaces** 的 conv 建空壳条目（entries 空、
+ *  lastPreview = title、lastAt = updatedAt*1000、unread 0——离线历史不点亮
+ *  未读；v1.9 起非空 title 同时落 ConvState.title），convOrder 按 updatedAt
+ *  降序插入到 default 之后。
+ *
+ *  v1.9 语义标题放宽：本地**已存在**的 conv 不再全不动——快照 title 非空
+ *  且与本地不同时**以快照为准更新 title**（网关权威：机械摘要 → 语义标题
+ *  的升级靠它，快照 title = 手动名 > 语义标题 > 摘要三档汇聚后的结果）；
+ *  本地 entries / 未读 / 概要 / 排序仍不动。空快照 title 不覆盖（网关无
+ *  任何可用名时本地派生 title 更有价值，且避免掐断 appendEntry 的首条
+ *  消息定调）。手动名会话不受影响（其快照 title = 手动名，而 convTitle
+ *  对手动名恒走 convDisplayName，title 字段不参与显示）。convTitle 显示
+ *  规则不变（自动形态 / default 用 title）。幂等：重复相同快照无效果。 */
 function mergePersistedSessions(
   state: AppState,
   machine: string,
@@ -1520,13 +1529,23 @@ function mergePersistedSessions(
 ): Record<string, MachineSpace> {
   const hadSpace = state.spaces[machine] !== undefined;
   const space = hadSpace ? state.spaces[machine] : newSpace();
+  // v1.9：已存在 conv 的 title 升级（快照权威），其余字段不动。
+  let convs = space.convs;
+  let upgraded = false;
+  for (const s of sessions) {
+    const conv = convs[s.id];
+    if (conv !== undefined && s.title !== "" && conv.title !== s.title) {
+      convs = { ...convs, [s.id]: { ...conv, title: s.title } };
+      upgraded = true;
+    }
+  }
   const fresh = sessions
     .filter((s) => space.convs[s.id] === undefined)
     .sort((a, b) => b.updatedAt - a.updatedAt);
-  if (fresh.length === 0) {
+  if (fresh.length === 0 && !upgraded) {
     return hadSpace ? state.spaces : { ...state.spaces, [machine]: space };
   }
-  const convs = { ...space.convs };
+  convs = { ...convs }; // 未发生升级时仍是原 state 对象，填充前须拷贝（不可变纪律）
   for (const s of fresh) {
     convs[s.id] = {
       entries: [],
@@ -1534,6 +1553,9 @@ function mergePersistedSessions(
       lastPreview: s.title,
       lastAt: s.updatedAt * 1000,
       unread: 0,
+      // 与升级循环同语义：快照 title 即权威显示名（空则不置，留待本地
+      // 首条消息派生——appendEntry 只在 title 未定时定调）。
+      ...(s.title !== "" ? { title: s.title } : {}),
     };
   }
   const di = space.convOrder.indexOf(DEFAULT_CONV);

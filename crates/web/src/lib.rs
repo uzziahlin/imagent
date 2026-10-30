@@ -67,6 +67,13 @@
 //! entries, lastSeq, trimmed}` 帧（entries 元素 key 前缀 `h:<seq>` 与实时
 //! 条目区分，card 的 state 恒 "done"）。
 //!
+//! v1.9 扩展（会话语义标题）：CLI 的语义标题不持久化，网关用 headless
+//! CLI（`claude -p`）单次调用自行生成（见 [`titles`]）——快照组装时懒触发
+//!（无手动名且无语义 title 的 conv，每快照至多 3 个最旧），成功写 store
+//! sessions.title（schema v18），下一条快照带出；失败/超时静默降级回
+//! first_prompt 机械摘要。`sessions` 段 title 优先级：手动名 > 语义标题 >
+//! first_prompt 摘要。
+//!
 //! **帧内 convId 协议约定：恒为完整 conv 形态（`web:<session>`）**。出站帧
 //! （text / card / approval_request …）写入的即完整 conv，浏览器回执帧
 //! （message / approval_response）**原样回传收到的 convId** 即可，不得剥前
@@ -87,6 +94,7 @@ pub mod e2e;
 pub mod key;
 pub mod models;
 pub mod platform;
+pub mod titles;
 
 pub use key::GatewayCredential;
 pub use platform::WebPlatform;
@@ -525,13 +533,23 @@ pub(crate) struct WorkspaceEntryFrame {
 /// CONV_TITLE_MAX_CHARS 同口径——中文/emoji 均按 1 码点计）。
 pub(crate) const SESSION_TITLE_MAX_CHARS: usize = 24;
 
-/// 会话 title 规则（协议 v1.7 契约 B，纯函数便于单测）：手动名
-/// （SessionRow.name，trim 后非空）优先；否则 first_prompt 单行摘要——空白
-/// 序列（含换行/制表）折叠为单空格后按码点截 [`SESSION_TITLE_MAX_CHARS`]；
-/// 两者皆无 → 空串（网关不编造显示名，SPA 侧空 title 自行兜底渲染）。
-pub(crate) fn session_title(name: Option<&str>, first_prompt: Option<&str>) -> String {
+/// 会话 title 规则（协议 v1.7 契约 B + v1.9 语义标题扩展，纯函数便于单
+/// 测）：手动名（SessionRow.name，trim 后非空）优先；否则语义标题
+/// （sessions.title 列，headless CLI 生成，trim 后非空，按码点截
+/// [`SESSION_TITLE_MAX_CHARS`]——生成时已清洗截断，此处防御性再截）；
+/// 否则 first_prompt 单行摘要——空白序列（含换行/制表）折叠为单空格后按
+/// 码点截 [`SESSION_TITLE_MAX_CHARS`]；三者皆无 → 空串（网关不编造显示
+/// 名，SPA 侧空 title 自行兜底渲染）。
+pub(crate) fn session_title(
+    name: Option<&str>,
+    title: Option<&str>,
+    first_prompt: Option<&str>,
+) -> String {
     if let Some(manual) = name.map(str::trim).filter(|n| !n.is_empty()) {
         return manual.to_string();
+    }
+    if let Some(semantic) = title.map(str::trim).filter(|t| !t.is_empty()) {
+        return semantic.chars().take(SESSION_TITLE_MAX_CHARS).collect();
     }
     let prompt = first_prompt.unwrap_or_default().trim();
     let mut collapsed = String::with_capacity(prompt.len());
@@ -1805,32 +1823,50 @@ mod tests {
         assert_eq!(v["models"]["current"], "sonnet");
     }
 
-    /// v1.7 title 规则（任务验收项）：手动名优先（trim 生效、空白名视为
-    /// 缺席）；first_prompt 单行摘要按码点截 24（中文 1 码点、空白折叠单
-    /// 空格）；两者皆无 → 空串。
+    /// v1.9 title 规则三档（任务验收项）：手动名优先（trim 生效、空白名
+    /// 视为缺席）> 语义标题（trim 非空 + 防御性按码点截 24）> first_prompt
+    /// 单行摘要（空白折叠单空格 + 按码点截 24）；皆无 → 空串。
     #[test]
-    fn session_title_manual_first_then_prompt_digest() {
-        assert_eq!(session_title(Some("  手动名  "), Some("第一句")), "手动名");
+    fn session_title_manual_semantic_then_prompt_digest() {
+        // 手动名最优先（有语义标题也不抢）。
         assert_eq!(
-            session_title(Some("   "), Some("第一句")),
-            "第一句",
+            session_title(Some("  手动名  "), Some("语义标题"), Some("第一句")),
+            "手动名"
+        );
+        assert_eq!(
+            session_title(Some("   "), Some("语义标题"), Some("第一句")),
+            "语义标题",
             "空白手动名视为缺席"
         );
-        // 中文按码点截 24（27 字输入 → 恰 24 字）。
+        // 语义标题次优：trim 生效 + 防御性截 24（生成侧已截，此处钉住口径）。
+        assert_eq!(session_title(None, Some("  部署巡检 "), None), "部署巡检");
+        assert_eq!(
+            session_title(None, Some("   "), Some("第一句")),
+            "第一句",
+            "空白语义标题视为缺席"
+        );
+        let long_semantic = "语义标题生成器输出了一行超过二十四码点的长标题样例文本甲乙丙";
+        assert_eq!(long_semantic.chars().count(), 30);
+        assert_eq!(
+            session_title(None, Some(long_semantic), None),
+            "语义标题生成器输出了一行超过二十四码点的长标题样"
+        );
+        // first_prompt 摘要兜底（v1.7 原逻辑不变）。
         let long = "这是一段超过二十四个字符长度的会话首条消息摘要样例文本";
         assert_eq!(long.chars().count(), 27);
         assert_eq!(
-            session_title(None, Some(long)),
+            session_title(None, None, Some(long)),
             "这是一段超过二十四个字符长度的会话首条消息摘要样"
         );
         // 空白折叠：换行/制表/连续空格 → 单空格；首尾 trim。
         assert_eq!(
-            session_title(None, Some("  hello \n world\t\tnext  ")),
+            session_title(None, None, Some("  hello \n world\t\tnext  ")),
             "hello world next"
         );
         // 皆无 → 空串（网关不编造显示名）。
-        assert_eq!(session_title(None, None), "");
-        assert_eq!(session_title(Some(""), None), "");
+        assert_eq!(session_title(None, None, None), "");
+        assert_eq!(session_title(Some(""), None, None), "");
+        assert_eq!(session_title(None, Some(""), None), "");
     }
 
     /// v1.7 message 帧媒体段映射：合法形态 → MediaMessage（text 可缺省/空

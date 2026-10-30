@@ -3,6 +3,7 @@ import {
   CONV_TITLE_MAX_CHARS,
   DEFAULT_CONV,
   DEFAULT_MACHINE,
+  convDisplayName,
   convTitle,
   deviceSummary,
   encodeFrame,
@@ -1306,7 +1307,7 @@ describe("workspaces.sessions（v1.7 会话持久化）", () => {
     expect(parseFrame(SNAP(',"sessions":"x"'))).toBeNull();
   });
 
-  it("reducer：本地不存在的 conv 建空壳条目（lastPreview=title、lastAt=updatedAt*1000、unread=0），convOrder 按 updatedAt 降序插到 default 之后", () => {
+  it("reducer：本地不存在的 conv 建空壳条目（lastPreview=title、title=title、lastAt=updatedAt*1000、unread=0），convOrder 按 updatedAt 降序插到 default 之后", () => {
     // 乱序到达（升序）也应归一为降序插入；id 恒为完整 conv 形态（web: 前缀）
     const s = run(initialState(), {
       type: "frame",
@@ -1327,6 +1328,7 @@ describe("workspaces.sessions（v1.7 会话持久化）", () => {
       lastPreview: "任务A",
       lastAt: 3_000_000,
       unread: 0,
+      title: "任务A", // v1.9：快照 title 非空同时落 ConvState.title（网关权威显示名）
     });
     expect(sp.convs["web:manual"]?.lastPreview).toBe("手动会话");
     expect(sp.convs["web:manual"]?.lastAt).toBe(1_000_000);
@@ -1336,33 +1338,95 @@ describe("workspaces.sessions（v1.7 会话持久化）", () => {
     expect(sp.convs["web:default"]).toBeTruthy();
   });
 
-  it("reducer：已存在（在线期间有消息流）的 conv 不动——本地 title/entries/lastPreview 优先", () => {
-    // 同机器（home-mac）先有消息流
+  it("reducer（v1.9）：已存在 conv 的 title 以快照为准升级，entries/概要/未读/排序仍不动", () => {
+    // 自动形态会话（web:s-ab12 匹配 AUTO_CONV_RE——convTitle 用 title 显示）
+    let s = run(initialState(), {
+      type: "frame",
+      frame: frame(
+        '{"v":1,"type":"text","convId":"web:s-ab12","text":"本地首条消息很长很长","machine":"home-mac"}',
+      ),
+    });
+    expect(spaceOf(s, "home-mac").convs["web:s-ab12"].title).toBe("本地首条消息很长很长");
+    const unreadBefore = spaceOf(s, "home-mac").convs["web:s-ab12"].unread; // 非当前会话来信计 1
+    s = run(s, {
+      type: "frame",
+      frame: frame(
+        SNAP(
+          ',"sessions":[{"id":"web:s-ab12","title":"语义标题","updatedAt":9000}],"machine":"home-mac"',
+        ),
+      ),
+    });
+    const conv = spaceOf(s, "home-mac").convs["web:s-ab12"];
+    expect(conv.title).toBe("语义标题"); // v1.9：机械摘要 → 语义标题升级（网关权威）
+    expect(conv.entries).toHaveLength(1); // 本地消息流保留
+    expect(conv.lastPreview).not.toBe("语义标题"); // 本地概要不动
+    expect(conv.unread).toBe(unreadBefore); // 未读不动
+    // convOrder 位置不动（快照不重排已存在 conv——default 后是既有首位）
+    expect(spaceOf(s, "home-mac").convOrder).toEqual(["web:default", "web:s-ab12"]);
+    // convTitle 显示规则不变：自动形态用 title（升级立即可见）
+    expect(convTitle(conv, "web:s-ab12")).toBe("语义标题");
+  });
+
+  it("reducer（v1.9）：空快照 title 不覆盖本地 title；重复相同快照幂等（title 相同即无操作）", () => {
     let s = run(initialState(), {
       type: "frame",
       frame: frame(
         '{"v":1,"type":"text","convId":"web:s-a","text":"本地首条消息","machine":"home-mac"}',
       ),
     });
-    const localTitle = spaceOf(s, "home-mac").convs["web:s-a"].title;
-    expect(localTitle).toBe("本地首条消息");
+    // 网关暂无任何可用名（title 空串）：本地派生 title 保留
+    s = run(s, {
+      type: "frame",
+      frame: frame(
+        SNAP(',"sessions":[{"id":"web:s-a","title":"","updatedAt":9000}],"machine":"home-mac"'),
+      ),
+    });
+    expect(spaceOf(s, "home-mac").convs["web:s-a"].title).toBe("本地首条消息");
+    // 升级后再收相同快照：title 已一致 → 无操作（幂等）
     s = run(s, {
       type: "frame",
       frame: frame(
         SNAP(
-          ',"sessions":[{"id":"web:s-a","title":"服务端历史名","updatedAt":9000}],"machine":"home-mac"',
+          ',"sessions":[{"id":"web:s-a","title":"本地首条消息","updatedAt":9000}],"machine":"home-mac"',
         ),
       ),
     });
-    const conv = spaceOf(s, "home-mac").convs["web:s-a"];
-    expect(conv.title).toBe("本地首条消息"); // 本地派生 title 不被覆盖
-    expect(conv.entries).toHaveLength(1); // 本地消息流保留
-    expect(conv.lastPreview).not.toBe("服务端历史名"); // 本地概要优先
-    // convOrder 位置不动（快照不重排已存在 conv——default 后是既有首位）
-    expect(spaceOf(s, "home-mac").convOrder).toEqual(["web:default", "web:s-a"]);
+    const before = spaceOf(s, "home-mac");
+    s = run(s, {
+      type: "frame",
+      frame: frame(
+        SNAP(
+          ',"sessions":[{"id":"web:s-a","title":"本地首条消息","updatedAt":9000}],"machine":"home-mac"',
+        ),
+      ),
+    });
+    expect(spaceOf(s, "home-mac")).toBe(before); // 引用不变（真无操作）
   });
 
-  it("reducer：本地缓存预填（IndexedDB 恢复）的 conv 同样不被快照覆盖——entries/概要原样保留", () => {
+  it("reducer（v1.9）：手动名会话 title 跟随快照但显示不变（convTitle 恒走 convDisplayName）", () => {
+    // 手动名 conv（非自动形态）：先有消息流，本地 title 已派生
+    let s = run(initialState(), {
+      type: "frame",
+      frame: frame(
+        '{"v":1,"type":"text","convId":"web:manual","text":"随便什么消息","machine":"home-mac"}',
+      ),
+    });
+    // 网关快照 title = 手动名（手动名 > 语义标题 > 摘要）
+    s = run(s, {
+      type: "frame",
+      frame: frame(
+        SNAP(
+          ',"sessions":[{"id":"web:manual","title":"manual","updatedAt":9000}],"machine":"home-mac"',
+        ),
+      ),
+    });
+    const conv = spaceOf(s, "home-mac").convs["web:manual"];
+    expect(conv.title).toBe("manual"); // title 字段被快照归一（网关权威）
+    expect(convTitle(conv, "web:manual")).toBe("manual"); // 显示恒剥前缀，不受 title 影响
+    expect(convTitle(conv, "web:manual")).toBe(convDisplayName("web:manual"));
+  });
+
+  it("reducer：本地缓存预填（IndexedDB 恢复）的 conv 同样只升级 title——entries/概要原样保留", () => {
     // 模拟挂载恢复：conv 带本地缓存 entries + 派生 title（restoreHistory 产物形状）
     let s = initialState();
     s = {
@@ -1385,18 +1449,18 @@ describe("workspaces.sessions（v1.7 会话持久化）", () => {
         },
       },
     };
-    // 网关快照携带同 conv 的 sessions 行（title/updatedAt 不同）→ 本地缓存优先
+    // 网关快照携带同 conv 的语义标题 → 仅 title 升级，其余本地优先
     s = run(s, {
       type: "frame",
       frame: frame(
-        SNAP(',"sessions":[{"id":"web:s-a","title":"服务端摘要","updatedAt":9999}],"machine":"home-mac"'),
+        SNAP(',"sessions":[{"id":"web:s-a","title":"服务端语义标题","updatedAt":9999}],"machine":"home-mac"'),
       ),
     });
     const conv = spaceOf(s, "home-mac").convs["web:s-a"];
     expect(conv.entries).toHaveLength(1);
     expect(conv.entries[0]).toMatchObject({ text: "缓存里的历史消息" });
-    expect(conv.title).toBe("缓存里的历史消息");
-    expect(conv.lastPreview).toBe("缓存里的历史消息");
+    expect(conv.title).toBe("服务端语义标题"); // v1.9：title 以快照为准
+    expect(conv.lastPreview).toBe("缓存里的历史消息"); // 概要不动
     expect(spaceOf(s, "home-mac").convOrder).toEqual([DEFAULT_CONV, "web:s-a"]);
   });
 
