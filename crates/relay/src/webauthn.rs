@@ -1210,10 +1210,7 @@ mod tests {
         assert_eq!(rp, "relay.example.com");
         // 非法 XFF 值忽略（回落缺省推导）。
         let (_, origin) = derive_rp(
-            &headers(&[
-                ("host", "relay.example.com"),
-                ("x-forwarded-proto", "ftp"),
-            ]),
+            &headers(&[("host", "relay.example.com"), ("x-forwarded-proto", "ftp")]),
             None,
         )
         .unwrap();
@@ -1244,8 +1241,7 @@ mod tests {
 
         // 无 Host → None；空覆盖值按缺省推导。
         assert!(derive_rp(&HeaderMap::new(), None).is_none());
-        let (rp, _) =
-            derive_rp(&headers(&[("host", "relay.example.com")]), Some("  ")).unwrap();
+        let (rp, _) = derive_rp(&headers(&[("host", "relay.example.com")]), Some("  ")).unwrap();
         assert_eq!(rp, "relay.example.com");
 
         // IP 字面量 rp_id 过不了 builder 域名校验（本地 127.0.0.1 直连不可用
