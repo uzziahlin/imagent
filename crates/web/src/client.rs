@@ -11,13 +11,15 @@
 //! 封顶 30s，成功建连重置）。每步握手等待 10s 超时（不空转发——对齐
 //! wecom R-5「认证失败必须重连」纪律）。
 //!
-//! 与 [`crate::platform::WebPlatform`] 通过五条 channel 解耦：
+//! 与 [`crate::platform::WebPlatform`] 通过六条 channel 解耦：
 //! - `inbound_tx`：浏览器业务帧映射成的 [`InboundMessage`] → platform.recv；
 //! - `sync_tx`：sync 请求 → platform 的 sync responder（D6 会话恢复）；
 //! - `workspace_tx`：v1.6 工作空间动作（workspace_list/save/remove /
 //!   conv_workdir_set）→ platform 的 workspace 泵（store KV 读写）；
 //! - `media_tx`：v1.7 媒体上行（message 帧带 media 段）→ platform 的媒体泵
 //!   （值域校验 + 落盘 + 合成 InboundMessage / 失败回 error 帧）；
+//! - `history_tx`：v1.8 会话历史重放（history_query 帧）→ platform 的
+//!   history 泵（查 outbound_log + 回 history 帧）；
 //! - `outbound_rx`：platform 序列化好的出站帧（JSON 文本）→ relay → 浏览器。
 //!
 //! 协议细节（§4）：relay 对浏览器侧有 90s idle 超时，网关 30s 发协议层
@@ -86,6 +88,9 @@ pub(crate) struct WebClient {
     /// v1.7 媒体上行通道（message 帧带 media 段）→ platform 的媒体泵
     /// （mime/b64/大小校验 + 落盘 + 合成 InboundMessage；失败回 error 帧）。
     pub(crate) media_tx: mpsc::Sender<InboundAction>,
+    /// v1.8 会话历史重放通道（history_query 帧）→ platform 的 history 泵
+    /// （查 outbound_log + 回 history 帧）。
+    pub(crate) history_tx: mpsc::Sender<InboundAction>,
 }
 
 /// hello 首帧构造（token 形态，v1.1/v1.2 兼容路径：token + machine 自报；
@@ -422,9 +427,9 @@ impl WebClient {
     /// E2E 帧（v1.4）：`e2e_hello` → 握手应答（e2e_ack），`enc` → 试解后把
     /// 内层业务帧走既有分发；业务帧（message/approval_response/control/
     /// sync/ping + v1.6 工作空间 workspace_list/workspace_save/
-    /// workspace_remove/conv_workdir_set，均可带 relay 路由用的 machine
-    /// 字段——网关侧无需消费）经 [`map_inbound_frame`] 映射。畸形 JSON warn
-    /// 丢弃（不断连——浏览器/中继偶发杂帧不致网关重连）。
+    /// workspace_remove/conv_workdir_set + v1.8 history_query，均可带 relay
+    /// 路由用的 machine 字段——网关侧无需消费）经 [`map_inbound_frame`] 映射。
+    /// 畸形 JSON warn 丢弃（不断连——浏览器/中继偶发杂帧不致网关重连）。
     async fn handle_text(
         &self,
         ws: &mut WsStream,
@@ -557,6 +562,17 @@ impl WebClient {
                     .is_err()
                 {
                     warn!(target: TARGET, "workspace channel 持续满 1s，丢弃工作空间请求");
+                }
+            }
+            // v1.8 会话历史重放 → platform history 泵（store IO 在泵内 await，
+            // 同 workspace 泵纪律）。1s 有界背压：丢弃由 SPA 下次切会话/重连
+            // 的 history_query 兜底。
+            act @ InboundAction::HistoryQuery { .. } => {
+                if tokio::time::timeout(Duration::from_secs(1), self.history_tx.send(act))
+                    .await
+                    .is_err()
+                {
+                    warn!(target: TARGET, "history channel 持续满 1s，丢弃 history_query 请求");
                 }
             }
             InboundAction::Ping => {
@@ -750,6 +766,7 @@ mod tests {
         let (sync_tx, _sync_rx) = mpsc::channel::<()>(8);
         let (workspace_tx, _workspace_rx) = mpsc::channel::<InboundAction>(8);
         let (media_tx, _media_rx) = mpsc::channel::<InboundAction>(8);
+        let (history_tx, _history_rx) = mpsc::channel::<InboundAction>(8);
         let client = WebClient {
             relay_url: "ws://127.0.0.1:1/gateway".into(),
             credential: GatewayCredential::Token("t".into()),
@@ -761,6 +778,7 @@ mod tests {
             sync_tx,
             workspace_tx,
             media_tx,
+            history_tx,
         };
         let (_outbound_tx, outbound_rx) = mpsc::channel::<String>(8);
         let token = CancellationToken::new();

@@ -24,6 +24,7 @@ import {
 import {
   historyStore,
   restoreHistory,
+  type RestoredConv,
 } from "./lib/historyStore";
 import {
   clearSession,
@@ -160,8 +161,9 @@ function omitKey<T extends Record<string, unknown>>(rec: T, key: string): T {
 // 包装 reducer——protocol reducer 既有语义不动，恢复预填的归并在本层完成。
 // ---------------------------------------------------------------------------
 
-/** App 扩展 action：挂载恢复（loadAll 输出 → spaces 预填，见 restoreHistory）。 */
-type AppAction = Action | { type: "restore_history"; restored: Record<string, Record<string, StreamEntry[]>> };
+/** App 扩展 action：挂载恢复（loadAll 输出 → spaces 预填，见 restoreHistory）。
+ *  v1.8 起入参为 loadAll 输出形态（每 conv {entries, lastSeq?}）。 */
+type AppAction = Action | { type: "restore_history"; restored: Record<string, Record<string, RestoredConv>> };
 
 function appReducer(state: AppState, action: AppAction): AppState {
   if (action.type === "restore_history") {
@@ -223,10 +225,21 @@ export default function App() {
   // v1.7.x 本地缓存：上次已落盘（或已恢复）的 conv entries 引用——脏检查用
   // （reducer 不可变更新，引用比较即“内容是否变过”）；退出清空后同步重置。
   const savedRefs = useRef<Map<string, StreamEntry[]>>(new Map());
+  // v1.8 会话历史重放高水位（per machine||conv：网关 outbound_log 该 conv 已
+  // 见的最大 seq）：内存缓存——history 帧到达时更新、loadAll 恢复时预填、随
+  // debounce 与 entries 一同落盘（historyStore.saveConv 的 lastSeq 字段）。
+  const lastSeqRef = useRef<Map<string, number>>(new Map());
+  // 上次已落盘写出的水位（脏检查，对齐 savedRefs 语义——空增量 entries 不变
+  // 时仅水位驱动重写）。
+  const savedSeqRefs = useRef<Map<string, number | undefined>>(new Map());
+  // 水位版本号：空增量（entries 引用不变、reducer 无改动）不驱动 spaces 变化，
+  // 用它驱动 debounce flush 重排（水位仍须落盘）。
+  const [historyVersion, setHistoryVersion] = useState(0);
 
   /** 挂载恢复：loadAll → spaces 预填（initialState 之后、WS 帧之前；异步竞态
    *  时恢复条目垫在已到帧之前，见 restoreHistory）。加载完成前渲染空态
-   *  （现状），加载后一次 setState。 */
+   *  （现状），加载后一次 setState。v1.8：顺带预填 lastSeqRef（恢复的水位
+   *  供 ready 后首查增量携带）并把 savedSeqRefs 对齐已存值（免无谓重写）。 */
   useEffect(() => {
     let cancelled = false;
     void historyStore.loadAll().then((restored) => {
@@ -234,10 +247,15 @@ export default function App() {
         return;
       }
       for (const [machine, convs] of Object.entries(restored)) {
-        for (const [convId, entries] of Object.entries(convs)) {
+        for (const [convId, rec] of Object.entries(convs)) {
+          const key = historyKey(machine, convId);
           // 恢复内容近似“已保存”——首次 flush 可能因 restoreHistory 重建
           // entries 数组而多写一次同内容（幂等、无害，且顺带刷新 savedAt）。
-          savedRefs.current.set(historyKey(machine, convId), entries);
+          savedRefs.current.set(key, rec.entries);
+          savedSeqRefs.current.set(key, rec.lastSeq);
+          if (typeof rec.lastSeq === "number") {
+            lastSeqRef.current.set(key, rec.lastSeq);
+          }
         }
       }
       dispatch({ type: "restore_history", restored });
@@ -247,8 +265,8 @@ export default function App() {
     };
   }, []);
 
-  /** 落盘 debounce：spaces 变化 2s 后写“与上次保存相比 entries 引用有变化”
-   *  的 conv（空会话不写）。引用不变（未收到消息的会话）零写入。 */
+  /** 落盘 debounce：spaces / 水位变化 2s 后写“entries 引用或水位有变化”的
+   *  conv（空会话不写）。引用不变（未收到消息且水位未动）零写入。 */
   useEffect(() => {
     const t = setTimeout(() => {
       for (const [machine, space] of Object.entries(stateRef.current.spaces)) {
@@ -257,27 +275,38 @@ export default function App() {
             continue;
           }
           const key = historyKey(machine, convId);
-          if (savedRefs.current.get(key) === conv.entries) {
+          const lastSeq = lastSeqRef.current.get(key);
+          if (
+            savedRefs.current.get(key) === conv.entries &&
+            savedSeqRefs.current.get(key) === lastSeq
+          ) {
             continue;
           }
           savedRefs.current.set(key, conv.entries);
-          void historyStore.saveConv(machine, convId, conv.entries);
+          savedSeqRefs.current.set(key, lastSeq);
+          void historyStore.saveConv(machine, convId, conv.entries, lastSeq);
         }
       }
     }, HISTORY_SAVE_DEBOUNCE_MS);
     return () => clearTimeout(t);
-  }, [state.spaces]);
+  }, [state.spaces, historyVersion]);
 
   /** 退出路径清空缓存后：savedRefs 对齐当前 state 的 entries 引用（否则
-   *  debounce flush 会把内存里仍持有的旧会话条目重新写回已清空的存储）。 */
+   *  debounce flush 会把内存里仍持有的旧会话条目重新写回已清空的存储）；
+   *  水位脏检查记录同步对齐（lastSeqRef 保留——网关侧 seq 跨登录持久，
+   *  内存会话条目未清时水位仍有效）。 */
   const syncSavedRefs = () => {
     const next = new Map<string, StreamEntry[]>();
+    const nextSeq = new Map<string, number | undefined>();
     for (const [machine, space] of Object.entries(stateRef.current.spaces)) {
       for (const [convId, conv] of Object.entries(space.convs)) {
-        next.set(historyKey(machine, convId), conv.entries);
+        const key = historyKey(machine, convId);
+        next.set(key, conv.entries);
+        nextSeq.set(key, lastSeqRef.current.get(key));
       }
     }
     savedRefs.current = next;
+    savedSeqRefs.current = nextSeq;
   };
 
   /** 认证失败分流（close 1008 reason → 清对应凭证 + 登录页提示）。v1.5：
@@ -421,7 +450,18 @@ export default function App() {
           : undefined,
       session: !pairing && auth?.kind === "session" ? auth.token : undefined,
       pairing: pairing?.device,
-      onFrame: (frame) => dispatch({ type: "frame", frame }),
+      onFrame: (frame) => {
+        // v1.8 history 帧：先记水位再进 reducer——空增量（entries=[]）reducer
+        // 无改动，水位仍须更新并随 debounce 落盘（historyVersion 驱动 flush）。
+        if (frame.type === "history") {
+          lastSeqRef.current.set(
+            historyKey(frame.machine ?? DEFAULT_MACHINE, frame.convId),
+            frame.lastSeq,
+          );
+          setHistoryVersion((v) => v + 1);
+        }
+        dispatch({ type: "frame", frame });
+      },
       onStatus: setStatus,
       onAuthFailed: authFailed,
       // v1.2：hello_ack 携带 session（新 relay）→ 持久化会话凭证，USER_TOKEN
@@ -512,6 +552,22 @@ export default function App() {
       wsRef.current?.listWorkspaces(state.currentMachine);
     }
   }, [state.machinesKnown, state.currentMachine, status]);
+
+  // v1.8 会话历史重放：ready / 切机 / 切会话后对当前 conv 按本地高水位增量
+  // 拉取（history_query 业务帧，E2E 加密）。触发维度 = 上方 sync+workspace_list
+  // 的 ready/机器条件 + currentConv——每次切换都查（空增量便宜，网关按 seq
+  // 单调幂等；切机时 reducer 同帧把 currentConv 回默认会话，一次触发覆盖两维）。
+  // 旧 relay 单机模式（machinesKnown=false）不发（网关不认识该帧）。
+  useEffect(() => {
+    if (state.machinesKnown && status === "ready") {
+      const key = historyKey(state.currentMachine, state.currentConv);
+      wsRef.current?.queryHistory(
+        state.currentConv,
+        lastSeqRef.current.get(key) ?? 0,
+        state.currentMachine,
+      );
+    }
+  }, [state.machinesKnown, state.currentMachine, state.currentConv, status]);
 
   // 侧边栏会话项：当前选中机器会话空间内的全部 conv；刚切到尚未收到帧的 conv
   // （新会话）不在 convOrder 里，前端补一项空预览，避免当前高亮落空。

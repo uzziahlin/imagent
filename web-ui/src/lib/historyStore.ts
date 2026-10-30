@@ -7,6 +7,9 @@
 // [a-zA-Z0-9_-]、conv 为 web:/local: 前缀名，拆解安全），value
 // `{entries, savedAt}`。card 存当前最新整卡（含 streaming 中间态，恢复时
 // 显示最后快照即可；重连 sync 按 messageId 覆盖兜底终态）。
+// v1.8 会话历史重放：value 增加可选 `lastSeq`（网关 outbound_log 该 conv 的
+// 本地高水位）——history 帧到达时随 debounce 与 entries 一同落盘；旧记录无
+// 该字段读作 undefined（从头拉取）。
 //
 // 后端注入：jsdom 无 IndexedDB，单测经 setHistoryBackend 注入内存 Map 后端
 // （memoryHistoryBackend）；宿主无 IndexedDB（隐私模式等）自动降级 no-op
@@ -36,8 +39,12 @@ const DB_NAME = "imagent-web";
 const DB_VERSION = 1;
 const STORE = "entries";
 
-/** 每条存储记录：entries（已裁剪至最近 HISTORY_MAX_ENTRIES 条）+ savedAt。 */
-export type StoredConv = { entries: StreamEntry[]; savedAt: number };
+/** 每条存储记录：entries（已裁剪至最近 HISTORY_MAX_ENTRIES 条）+ savedAt +
+ *  v1.8 起可选 lastSeq（该 conv 的历史重放高水位；旧记录无此字段）。 */
+export type StoredConv = { entries: StreamEntry[]; savedAt: number; lastSeq?: number };
+
+/** loadAll 聚合输出的单 conv 记录（savedAt 仅落盘元数据，读出侧不带）。 */
+export type RestoredConv = { entries: StreamEntry[]; lastSeq?: number };
 
 /** 存储后端接口（默认 IndexedDB 实现；单测注入内存 Map；不可用降级 no-op）。 */
 export interface HistoryBackend {
@@ -177,11 +184,12 @@ function convKey(machine: string, convId: string): string {
 
 /** 消息本地缓存门面。全部方法静默容错（存储失败不影响主链路）。 */
 export const historyStore = {
-  /** 全量读取并按 machine/conv 聚合（key 拆解；畸形 key 跳过）。 */
-  async loadAll(): Promise<Record<string, Record<string, StreamEntry[]>>> {
+  /** 全量读取并按 machine/conv 聚合（key 拆解；畸形 key 跳过）。v1.8 起每条
+   *  记录带 lastSeq（旧记录无该字段 → undefined）。 */
+  async loadAll(): Promise<Record<string, Record<string, RestoredConv>>> {
     try {
       const pairs = await backend().getAll();
-      const out: Record<string, Record<string, StreamEntry[]>> = {};
+      const out: Record<string, Record<string, RestoredConv>> = {};
       for (const [key, val] of pairs) {
         const sep = key.indexOf(KEY_SEP);
         const machine = sep > 0 ? key.slice(0, sep) : "";
@@ -189,7 +197,10 @@ export const historyStore = {
         if (!machine || !convId) {
           continue;
         }
-        (out[machine] ??= {})[convId] = val?.entries ?? [];
+        (out[machine] ??= {})[convId] = {
+          entries: val?.entries ?? [],
+          lastSeq: typeof val?.lastSeq === "number" ? val.lastSeq : undefined,
+        };
       }
       return out;
     } catch {
@@ -197,12 +208,20 @@ export const historyStore = {
     }
   },
 
-  /** 保存单 conv（裁剪至最近 HISTORY_MAX_ENTRIES 条；不可变引用不重复写）。 */
-  async saveConv(machine: string, convId: string, entries: StreamEntry[]): Promise<void> {
+  /** 保存单 conv（裁剪至最近 HISTORY_MAX_ENTRIES 条；不可变引用不重复写）。
+   *  v1.8：lastSeq 为该 conv 的历史重放高水位——undefined 不落键（清回旧
+   *  形态），number 落键覆盖。 */
+  async saveConv(
+    machine: string,
+    convId: string,
+    entries: StreamEntry[],
+    lastSeq?: number,
+  ): Promise<void> {
     try {
       await backend().put(convKey(machine, convId), {
         entries: trimEntries(entries),
         savedAt: Date.now(),
+        ...(lastSeq !== undefined ? { lastSeq } : {}),
       });
     } catch {
       // 静默：配额/隐私模式下落盘失败不影响内存消息流
@@ -289,10 +308,12 @@ const withRestoredKey = (entries: StreamEntry[]): StreamEntry[] =>
  *   （更新）为准，title 本地未定时由恢复首条补派生——恢复与 WS 帧竞争到达
  *   时（loadAll 异步完成前 hello 流已进）两端消息都保留；
  * - 未知机器先建默认空间再合并；state 无任何改动时原样返回（引用不变）。
+ * - v1.8：入参为 loadAll 输出形态（每 conv {entries, lastSeq?}），本函数只
+ *   消费 entries——lastSeq 由 App 层读出另行维护（lastSeqRef）。
  */
 export function restoreHistory(
   state: AppState,
-  restored: Record<string, Record<string, StreamEntry[]>>,
+  restored: Record<string, Record<string, RestoredConv>>,
 ): AppState {
   const spaces: Record<string, MachineSpace> = { ...state.spaces };
   let changed = false;
@@ -304,11 +325,11 @@ export function restoreHistory(
     const nextConvs: Record<string, ConvState> = { ...space.convs };
     const fresh: { convId: string; lastAt: number }[] = [];
     let machineChanged = false;
-    for (const [convId, raw] of Object.entries(convs)) {
-      if (raw.length === 0) {
+    for (const [convId, rec] of Object.entries(convs)) {
+      if (rec.entries.length === 0) {
         continue;
       }
-      const entries = withRestoredKey(raw);
+      const entries = withRestoredKey(rec.entries);
       const existing = nextConvs[convId];
       const derivedTitle = titleOfEntries(entries);
       const lastAt = lastAtOfEntries(entries);

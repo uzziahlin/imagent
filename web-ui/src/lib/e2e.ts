@@ -64,7 +64,7 @@ const NONCE_LEN = 24;
 
 /** 需要走 e2e 包装的出站业务帧类型（其余管理帧恒明文）。v1.6 工作空间四帧
  *  （workspace_list/workspace_save/workspace_remove/conv_workdir_set）同为
- *  网关消费的业务帧，relay 不可见。 */
+ *  网关消费的业务帧，relay 不可见；v1.8 会话历史拉取（history_query）同规。 */
 const BUSINESS_TYPES: ReadonlySet<string> = new Set([
   "message",
   "approval_response",
@@ -75,6 +75,7 @@ const BUSINESS_TYPES: ReadonlySet<string> = new Set([
   "workspace_save",
   "workspace_remove",
   "conv_workdir_set",
+  "history_query",
 ]);
 
 // ---------------------------------------------------------------------------

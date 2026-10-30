@@ -45,6 +45,13 @@
 //   env.ANTHROPIC_DEFAULT_* 映射优先，config official_models 官方列表回退；
 //   空 options 整段缺席）。reducer 落 workspaces[machine].models，命令面板
 //   /model chips 与当前模型文本据此渲染（lib/commands modelChips）。
+// - v1.8 会话历史重放：网关为每 conv 落盘出站消息日志（outbound_log，per
+//   conv 单调 seq），浏览器出站 history_query{convId, since, machine}（业务
+//   帧，E2E 加密）按本地高水位增量拉取；网关回 history{machine, convId,
+//   entries, lastSeq, trimmed}——entries 元素与 StreamEntry 对齐（key 前缀
+//   `h:` 与实时条目键空间区分，card 恒 state="done" 终态快照）。合并语义见
+//   mergeHistory：重放不计未读、概要仅空 conv 刷新、card 同 messageId 本地
+//   优先；高水位（lastSeq）由 App 层维护（historyStore 随缓存落盘）。
 
 export const PROTOCOL_VERSION = 1;
 
@@ -381,6 +388,21 @@ export type ConvWorkdirSetFrame = {
 };
 
 // ---------------------------------------------------------------------------
+// v1.8 会话历史重放（浏览器 → 网关，E2E 业务帧）
+// ---------------------------------------------------------------------------
+
+/** v1.8 增量拉取会话出站日志：convId 恒为完整 conv 形态；since = 本地高水位
+ *  （该 conv 已见的最大 seq，0 = 从头拉）；machine 同 message 族路由约定
+ *  （多机模式必须带当前机器）。网关回 history 帧。 */
+export type HistoryQueryFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "history_query";
+  convId: string;
+  since: number;
+  machine?: string;
+};
+
+// ---------------------------------------------------------------------------
 // v1.4 E2E 中继盲化（密码学构造与编码规约见 lib/e2e.ts 头注）
 // ---------------------------------------------------------------------------
 
@@ -428,7 +450,8 @@ export type OutboundFrame =
   | WorkspaceListFrame
   | WorkspaceSaveFrame
   | WorkspaceRemoveFrame
-  | ConvWorkdirSetFrame;
+  | ConvWorkdirSetFrame
+  | HistoryQueryFrame;
 
 /** 出站帧序列化（undefined 字段不序列化，与网关入站解析兼容）。 */
 export function encodeFrame(frame: OutboundFrame): string {
@@ -628,6 +651,32 @@ export type ConvWorkdirFrame = {
   machine?: string;
 };
 
+// ---------------------------------------------------------------------------
+// v1.8 会话历史重放（网关 → 浏览器，E2E 业务帧，经 enc 解密后二次分发进 reducer）
+// ---------------------------------------------------------------------------
+
+/** v1.8 history 帧 entries 元素（与 StreamEntry 对齐的子集）：text 带 at
+ *  （网关出站日志的 unix 毫秒）；card 恒为终态快照（state="done"）。key 前缀
+ *  `h:` + seq（如 "h:42"）——与实时条目（text:N / card:m:c:msg）及本地恢复
+ *  条目（h:text:N）键空间区分。 */
+export type HistoryEntry =
+  | { kind: "text"; key: string; text: string; at: number }
+  | { kind: "card"; key: string; messageId: string; card: CardPayload; state: "done" };
+
+/** v1.8 会话历史重放响应：entries = seq > since 的行（升序，≤500；空数组 =
+ *  无增量，仅更新水位）；lastSeq = 该 conv 当前最大 seq（无任何记录时 0）；
+ *  trimmed = 因 GC 返回集不含 since 之前的完整历史（客户端应丢弃本地该 conv
+ *  缓存、以返回集重建）。machine = 来源机器（缺席归 DEFAULT_MACHINE）。 */
+export type HistoryFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "history";
+  convId: string;
+  entries: HistoryEntry[];
+  lastSeq: number;
+  trimmed: boolean;
+  machine?: string;
+};
+
 /** v1.4 握手第二步（网关 → 浏览器，经 relay 明文透传）：gk = 网关 X25519
  *  公钥（32B hex），n2 = 网关随机数（32B hex），sig = 网关 ed25519 对
  *  bytes(ek)||bytes(gk)||bytes(n1)||bytes(n2) 的签名（64B hex），ik = 网关
@@ -665,7 +714,8 @@ export type InboundFrame =
   | PairingRequestFrame
   | PairingPendingFrame
   | WorkspacesFrame
-  | ConvWorkdirFrame;
+  | ConvWorkdirFrame
+  | HistoryFrame;
 
 // ---------------------------------------------------------------------------
 // parseFrame：v/type 校验 + 每类帧关键字段存在性校验，非法返回 null（不抛）
@@ -791,6 +841,25 @@ const modelsOk = (m: unknown): boolean => {
   );
 };
 
+/** v1.8 history 帧 entries 元素：kind 二选一——text 需 key/text；card 需
+ *  key/messageId + card 对象（载荷完整性由网关保证，card 深层字段不作逐项
+ *  校验——与 StreamEntry 渲染路径一致，畸形载荷不致崩溃）。 */
+const historyEntryOk = (e: unknown): boolean => {
+  if (typeof e !== "object" || e === null) {
+    return false;
+  }
+  const r = e as Record<string, unknown>;
+  if (r.kind === "text") {
+    return isStr(r, "key") && isStr(r, "text");
+  }
+  if (r.kind === "card") {
+    return (
+      isStr(r, "key") && isStr(r, "messageId") && typeof r.card === "object" && r.card !== null
+    );
+  }
+  return false;
+};
+
 const RESOLVED_DECISIONS: readonly string[] = ["allow", "deny", "always", "cancelled"];
 
 /** v1.4 e2e_ack 的网关身份公钥字段：ik（规范名）/ id / pk（宽容别名）任一
@@ -841,6 +910,17 @@ const INBOUND_CHECKS: Record<string, FieldCheck> = {
     (o.models === undefined || modelsOk(o.models)) &&
     machineOk(o),
   conv_workdir: (o) => isStr(o, "convId") && isStr(o, "workdir") && machineOk(o),
+  // v1.8 会话历史重放：entries 逐元素形状 + lastSeq 非负整数 + trimmed 布尔
+  //（machine 可选——旧网关缺席归 DEFAULT_MACHINE）
+  history: (o) =>
+    isStr(o, "convId") &&
+    Array.isArray(o.entries) &&
+    o.entries.every(historyEntryOk) &&
+    typeof o.lastSeq === "number" &&
+    Number.isInteger(o.lastSeq) &&
+    o.lastSeq >= 0 &&
+    typeof o.trimmed === "boolean" &&
+    machineOk(o),
 };
 
 /** 解析一条入站文本帧：信封 v=1 + 已知 type + 关键字段齐备才放行，否则 null。 */
@@ -1319,7 +1399,8 @@ type MachineBearingFrame =
   | ApprovalRequestFrame
   | ApprovalResolvedFrame
   | WorkspacesFrame
-  | ConvWorkdirFrame;
+  | ConvWorkdirFrame
+  | HistoryFrame;
 
 function frameMachine(frame: MachineBearingFrame): string {
   return frame.machine ?? DEFAULT_MACHINE;
@@ -1339,6 +1420,89 @@ function mergeConvWorkdir(state: AppState, frame: ConvWorkdirFrame): AppState {
     workspaces: {
       ...state.workspaces,
       [machine]: { ...cur, convs: { ...cur.convs, [frame.convId]: frame.workdir } },
+    },
+  };
+}
+
+/** 重放集末条时间戳：从尾部找最近带 at 的 text（重放条目无 user、card 无 at），
+ *  全无则 0（与 historyStore lastAtOfEntries 同语义，UI 展示用）。 */
+function lastAtOfHistory(entries: StreamEntry[]): number {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i];
+    if (e.kind === "text" && typeof e.at === "number") {
+      return e.at;
+    }
+  }
+  return 0;
+}
+
+/** v1.8 history 帧（会话历史重放）合并：重放条目**不进** appendEntry 消息流
+ *  ——不计未读、不派生本地序号 key（key 即网关 seq 幂等键）。概要
+ *  （lastPreview/lastAt）与 title 仅在该 conv 以重放集为全部内容时刷新——
+ *  trimmed 整体替换（先清本地即空）或本地空 conv 首次物化；增量合并（本地
+ *  非空）不动概要，本地优先。去重：本地已有同 key 跳过；card 同 messageId
+ *  本地优先（本地可能持有等价/更新终态或流式中间态，重放恒为终态快照，覆盖
+ *  无增益——与既有 sync/快照的本地优先语义一致）。entries 空（仅水位）reducer
+ *  无事可做，高水位由 App 层 lastSeqRef 维护。 */
+function mergeHistory(state: AppState, frame: HistoryFrame): AppState {
+  if (frame.entries.length === 0) {
+    return state;
+  }
+  const machine = frameMachine(frame);
+  const replay: StreamEntry[] = frame.entries;
+  const spaces = ensureConv(state, machine, frame.convId);
+  const space = spaces[machine];
+  const conv = space.convs[frame.convId];
+  // trimmed：丢弃本地该 conv 缓存以重放集重建（契约）；否则本地条目保留在前，
+  // 重放增量按 key / card messageId 去重 append 在后。
+  const local = frame.trimmed ? [] : conv.entries;
+  const seenKeys = new Set(local.map((e) => e.key));
+  const seenCardIds = new Set(
+    local.filter((e): e is CardEntry => e.kind === "card").map((e) => e.messageId),
+  );
+  const merged = local.slice();
+  for (const e of replay) {
+    if (seenKeys.has(e.key)) {
+      continue;
+    }
+    if (e.kind === "card" && seenCardIds.has(e.messageId)) {
+      continue;
+    }
+    merged.push(e);
+    seenKeys.add(e.key);
+    if (e.kind === "card") {
+      seenCardIds.add(e.messageId);
+    }
+  }
+  if (merged.length === local.length) {
+    return state; // 全部命中去重（重复重放/本地已含）——幂等无改动
+  }
+  // 概要刷新仅限「本地为空」：重放集即该 conv 全部内容（与 restoreHistory 对
+  // 新 conv 的概要派生同语义）；title 本地已定不覆盖（一旦写入不变），未定时
+  // 由重放首条 text 补派生。
+  const fresh = local.length === 0;
+  const derivedTitle =
+    fresh && conv.title === undefined
+      ? titleSummary(replay.find((e): e is Extract<StreamEntry, { kind: "text" }> => e.kind === "text")?.text ?? "")
+      : undefined;
+  return {
+    ...state,
+    spaces: {
+      ...spaces,
+      [machine]: {
+        ...space,
+        convs: {
+          ...space.convs,
+          [frame.convId]: {
+            ...conv,
+            entries: trimEntries(merged),
+            ...(fresh
+              ? { lastPreview: previewOf(merged[merged.length - 1]), lastAt: lastAtOfHistory(merged) }
+              : {}),
+            ...(derivedTitle != null ? { title: derivedTitle } : {}),
+          },
+        },
+      },
     },
   };
 }
@@ -1465,6 +1629,9 @@ function reduceFrame(state: AppState, frame: InboundFrame): AppState {
     case "conv_workdir":
       // v1.6 增量：合并进对应机器快照 convs（机器取帧的 machine 字段）
       return mergeConvWorkdir(state, frame);
+    case "history":
+      // v1.8 会话历史重放：重放条目合并不走消息流（不计未读），见 mergeHistory
+      return mergeHistory(state, frame);
   }
 }
 

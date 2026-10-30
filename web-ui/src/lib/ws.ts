@@ -37,6 +37,10 @@
 // machine 路由约定同 message 族——多机模式必须带当前机器）。
 // v1.7 媒体上行：sendMessage 可选 media 参数（{name,mime,b64}，canvas 预压缩
 // 产物）；帧仍在 message 出站路径上，E2E 加密与 machine 路由零变化。
+// v1.8 会话历史重放：queryHistory(convId, since, machine) 出站 history_query
+// 业务帧（E2E 加密），按本地高水位增量拉取网关出站日志；入站 history 帧（enc
+// 内帧 / 旧网关明文）经 onFrame 二次分发——active 机器的明文 history 同属
+// 注入面，与 text/card 族同规丢弃 + 降级告警。
 
 import {
   DEFAULT_MACHINE,
@@ -350,6 +354,15 @@ export class WsManager {
     return this.send({ v: 1, type: "conv_workdir_set", convId, path, machine });
   }
 
+  // ---- v1.8 会话历史重放（网关消费的业务帧；同 message 族路由约定，经 e2e
+  //      outbound 判定包装）----
+
+  /** 增量拉取会话出站日志：since = 本地高水位（0 = 从头）；网关回 history 帧
+   *  （重放条目经 reducer 合并，高水位由 App 层维护）。 */
+  queryHistory(convId: string, since: number, machine?: string): boolean {
+    return this.send({ v: 1, type: "history_query", convId, since, machine });
+  }
+
   /** v1.2 拉取已登录设备列表（设备面板打开时；仅会话模式对新 relay 使用）。 */
   sendDeviceList(): boolean {
     return this.send({ v: 1, type: "device_list" });
@@ -539,7 +552,8 @@ export class WsManager {
         frame.type === "card" ||
         frame.type === "card_patch" ||
         frame.type === "approval_request" ||
-        frame.type === "approval_resolved") &&
+        frame.type === "approval_resolved" ||
+        frame.type === "history") &&
       !this.e2e.acceptPlaintextBusiness(frame.machine ?? DEFAULT_MACHINE)
     ) {
       this.e2e.notePlaintextDowngrade(frame.machine ?? DEFAULT_MACHINE);

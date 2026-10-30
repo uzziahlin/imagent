@@ -55,15 +55,35 @@ describe("historyStore（注入内存后端）", () => {
     setHistoryBackend(null);
   });
 
-  it("saveConv/loadAll 往返：key 按 machine||conv 拆解聚合", async () => {
-    await historyStore.saveConv("home-mac", "web:default", [userOf("你好", 100)]);
+  it("saveConv/loadAll 往返：key 按 machine||conv 拆解聚合（v1.8 起带 lastSeq）", async () => {
+    await historyStore.saveConv("home-mac", "web:default", [userOf("你好", 100)], 7);
     await historyStore.saveConv("home-mac", "web:s-a", [textOf("回复", 200)]);
-    await historyStore.saveConv("work-mac", "web:default", [userOf("工作机", 300)]);
+    await historyStore.saveConv("work-mac", "web:default", [userOf("工作机", 300)], 0);
     const all = await historyStore.loadAll();
     expect(all).toEqual({
-      "home-mac": { "web:default": [userOf("你好", 100)], "web:s-a": [textOf("回复", 200)] },
-      "work-mac": { "web:default": [userOf("工作机", 300)] },
+      "home-mac": {
+        "web:default": { entries: [userOf("你好", 100)], lastSeq: 7 },
+        "web:s-a": { entries: [textOf("回复", 200)] }, // 未带水位 → 无 lastSeq 字段
+      },
+      "work-mac": { "web:default": { entries: [userOf("工作机", 300)], lastSeq: 0 } },
     });
+  });
+
+  it("lastSeq 兼容旧值：旧记录（无字段）读作 undefined；重写带水位落键、缺省不落键", async () => {
+    // 旧版本落盘形态（无 lastSeq 字段）
+    await backend.put("home-mac||web:default", { entries: [userOf("旧消息", 1)], savedAt: 1 });
+    expect(await historyStore.loadAll()).toEqual({
+      "home-mac": { "web:default": { entries: [userOf("旧消息", 1)] } },
+    });
+    // 升级后重写：水位随 entries 一同落盘
+    await historyStore.saveConv("home-mac", "web:default", [userOf("新消息", 2)], 12);
+    expect(await backend.get("home-mac||web:default")).toMatchObject({ lastSeq: 12 });
+    expect(await historyStore.loadAll()).toEqual({
+      "home-mac": { "web:default": { entries: [userOf("新消息", 2)], lastSeq: 12 } },
+    });
+    // 不带水位保存：lastSeq 字段不落（记录回旧形态，非写 undefined 值）
+    await historyStore.saveConv("home-mac", "web:default", [userOf("无水位", 3)]);
+    expect(await backend.get("home-mac||web:default")).not.toHaveProperty("lastSeq");
   });
 
   it("每 conv 只保留最近 120 条（更早的裁掉）", async () => {
@@ -90,7 +110,9 @@ describe("historyStore（注入内存后端）", () => {
     await backend.put("||web:default", { entries: [userOf("x", 1)], savedAt: 1 });
     await backend.put("home-mac||", { entries: [userOf("x", 1)], savedAt: 1 });
     await historyStore.saveConv("home-mac", "web:ok", [userOf("好", 1)]);
-    expect(await historyStore.loadAll()).toEqual({ "home-mac": { "web:ok": [userOf("好", 1)] } });
+    expect(await historyStore.loadAll()).toEqual({
+      "home-mac": { "web:ok": { entries: [userOf("好", 1)] } },
+    });
   });
 
   it("降级 no-op（jsdom 默认后端）：全部 API 静默空操作不抛错", async () => {
@@ -104,12 +126,15 @@ describe("historyStore（注入内存后端）", () => {
 });
 
 describe("restoreHistory（恢复预填映射）", () => {
+  /** 数组夹具 → v1.8 loadAll 输出形态（{entries}）。 */
+  const rec = (entries: StreamEntry[]) => ({ entries });
+
   it("新 conv：entries/preview=末条/lastAt=末条 at/unread=0，convOrder 按 lastAt 降序插 default 之后", () => {
     const s = restoreHistory(initialState(), {
       "home-mac": {
-        "web:s-b": [userOf("任务B首条", 2000), textOf("任务B回复", 2100)],
-        "web:s-a": [userOf("任务A首条", 3000)],
-        "web:manual": [textOf("手动会话的恢复消息", 1000)],
+        "web:s-b": rec([userOf("任务B首条", 2000), textOf("任务B回复", 2100)]),
+        "web:s-a": rec([userOf("任务A首条", 3000)]),
+        "web:manual": rec([textOf("手动会话的恢复消息", 1000)]),
       },
     });
     const sp = spaceOf(s, "home-mac");
@@ -129,7 +154,9 @@ describe("restoreHistory（恢复预填映射）", () => {
 
   it("default 会话（本地空壳）：整体填入并按首条派生 title；convOrder 位置不动", () => {
     const s = restoreHistory(initialState(), {
-      [DEFAULT_MACHINE]: { [DEFAULT_CONV]: [userOf("默认会话首条消息", 900), cardOf("卡片正文")] },
+      [DEFAULT_MACHINE]: {
+        [DEFAULT_CONV]: rec([userOf("默认会话首条消息", 900), cardOf("卡片正文")]),
+      },
     });
     const sp = spaceOf(s, DEFAULT_MACHINE);
     expect(sp.convOrder).toEqual([DEFAULT_CONV]);
@@ -169,7 +196,7 @@ describe("restoreHistory（恢复预填映射）", () => {
       },
     };
     const out = restoreHistory(s, {
-      "home-mac": { "web:s-a": [userOf("更早的首条消息", 1000)] },
+      "home-mac": { "web:s-a": rec([userOf("更早的首条消息", 1000)]) },
     });
     const conv = spaceOf(out, "home-mac").convs["web:s-a"];
     // 恢复（旧）在前、本地（新）在后，两端都保留
@@ -186,7 +213,7 @@ describe("restoreHistory（恢复预填映射）", () => {
     const base = initialState();
     expect(restoreHistory(base, {})).toBe(base);
     // 空记录跳过（不清空、不建壳）
-    expect(restoreHistory(base, { "home-mac": { "web:x": [] } }).spaces).toBe(base.spaces);
+    expect(restoreHistory(base, { "home-mac": { "web:x": rec([]) } }).spaces).toBe(base.spaces);
     // 本地已定 title 不被恢复 title 覆盖（首条定调不可变）
     let s = base;
     s = {
@@ -209,13 +236,13 @@ describe("restoreHistory（恢复预填映射）", () => {
         },
       },
     };
-    const out = restoreHistory(s, { "home-mac": { "web:s-a": [userOf("恢复首条", 1)] } });
+    const out = restoreHistory(s, { "home-mac": { "web:s-a": rec([userOf("恢复首条", 1)]) } });
     expect(spaceOf(out, "home-mac").convs["web:s-a"]?.title).toBe("本地已定");
   });
 
   it("未知机器：先建默认空间（预置 default conv）再合并", () => {
     const s = restoreHistory(initialState(), {
-      "work-mac": { "web:s-x": [userOf("未知机器会话", 42)] },
+      "work-mac": { "web:s-x": rec([userOf("未知机器会话", 42)]) },
     });
     const sp = spaceOf(s, "work-mac");
     expect(sp.convOrder).toEqual([DEFAULT_CONV, "web:s-x"]);

@@ -58,6 +58,15 @@
 //! `official_models` 官方列表回退，汇聚见 [`models`]；空 options 整段
 //! 不序列化，旧形态字节不变。
 //!
+//! v1.8 扩展（会话历史重放，契约同款字节级纪律）：出站 text 帧 / card
+//! 终态帧（state=="done"）经 platform 异步落盘 store `outbound_log`
+//!（per-conv seq 单调 + 滚动 GC 500 条；同 messageId 终态只落一次；
+//! 流式中间帧 / approval_resolved / sync 重发不落）。入站 `history_query
+//! {convId, since}`（经既有业务帧白名单路径，E2E 下自动解密）→ platform
+//! history 泵查 `list_outbound_since` 回出站 `history{machine, convId,
+//! entries, lastSeq, trimmed}` 帧（entries 元素 key 前缀 `h:<seq>` 与实时
+//! 条目区分，card 的 state 恒 "done"）。
+//!
 //! **帧内 convId 协议约定：恒为完整 conv 形态（`web:<session>`）**。出站帧
 //! （text / card / approval_request …）写入的即完整 conv，浏览器回执帧
 //! （message / approval_response）**原样回传收到的 convId** 即可，不得剥前
@@ -690,6 +699,96 @@ pub(crate) fn encode_error_frame(machine: &str, code: &str, message: &str) -> Re
 }
 
 // ---------------------------------------------------------------------------
+// 出站历史帧（协议 v1.8 会话历史重放，字段与 SPA 侧契约逐字一致，不得增删改）
+// ---------------------------------------------------------------------------
+
+/// history 帧的 entries 元素：行记录 → 契约 JSON（纯函数便于单测）。
+/// - text 行：`{"kind":"text","key":"h:<seq>","text","at"}`（key 的 seq 用
+///   行 seq；text/at 取自落盘 payload）；
+/// - card 行：`{"kind":"card","key":"h:<seq>","messageId","card","state":
+///   "done"}`（card 为落盘的 CardPayload 完整 JSON 原样内嵌；state 恒
+///   "done"——只有终态帧落盘）。
+///
+/// payload 畸形 / kind 未知 → None（调用方跳过该行；历史重放 best-effort，
+/// 单行损坏不拖垮整帧）。
+pub(crate) fn history_entry_from_row(
+    row: &imagent_store::OutboundRow,
+) -> Option<serde_json::Value> {
+    let payload: serde_json::Value = serde_json::from_str(&row.payload).ok()?;
+    match row.kind.as_str() {
+        "text" => {
+            let text = payload.get("text").and_then(|t| t.as_str())?;
+            let at = payload.get("at").and_then(|a| a.as_i64())?;
+            Some(serde_json::json!({
+                "kind": "text",
+                "key": format!("h:{}", row.seq),
+                "text": text,
+                "at": at,
+            }))
+        }
+        "card" => {
+            let message_id = payload.get("messageId").and_then(|m| m.as_str())?;
+            let card = payload.get("card")?.clone();
+            Some(serde_json::json!({
+                "kind": "card",
+                "key": format!("h:{}", row.seq),
+                "messageId": message_id,
+                "card": card,
+                "state": "done",
+            }))
+        }
+        other => {
+            tracing::warn!(
+                target: TARGET,
+                kind = other,
+                seq = row.seq,
+                "outbound_log 行 kind 未知，history 条目跳过"
+            );
+            None
+        }
+    }
+}
+
+/// history 回放帧（协议 v1.8）：`entries` 为 [`history_entry_from_row`]
+/// 组好的条目数组（seq 升序，≤500 条）；`lastSeq` 为该 conv 当前最大 seq
+///（无任何记录时 0——浏览器只更新水位）；`trimmed` 见
+/// [`imagent_store::OutboundPage`]。`machine` 为本机身份（v1.1 出站帧必带）。
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct HistoryFrame {
+    v: u8,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    machine: String,
+    #[serde(rename = "convId")]
+    conv_id: String,
+    entries: serde_json::Value,
+    #[serde(rename = "lastSeq")]
+    last_seq: i64,
+    trimmed: bool,
+}
+
+/// history 帧组帧（无截断面：entries 量级由 store GC 封顶 500 条）。
+pub(crate) fn encode_history_frame(
+    machine: &str,
+    conv_id: &str,
+    entries_json: serde_json::Value,
+    last_seq: i64,
+    trimmed: bool,
+) -> Result<String> {
+    let frame = HistoryFrame {
+        v: 1,
+        kind: "history",
+        machine: machine.to_string(),
+        conv_id: conv_id.to_string(),
+        entries: entries_json,
+        last_seq,
+        trimmed,
+    };
+    serde_json::to_string(&frame)
+        .map_err(|e| CoreError::Platform(TARGET, format!("history 帧序列化失败：{e}")))
+}
+
+// ---------------------------------------------------------------------------
 // 入站帧（浏览器 → 网关）映射
 // ---------------------------------------------------------------------------
 
@@ -755,6 +854,14 @@ pub(crate) enum InboundAction {
     ConvWorkdirSet {
         conv: String,
         path: String,
+    },
+    /// v1.8 会话历史重放：history_query{convId, since} → platform 的
+    /// history 泵（查 outbound_log + 回 history 帧；不进 recv / dispatch
+    /// 命令链）。`conv` 为经 [`normalize_conv`] 归一的完整 conv；`since`
+    /// 为浏览器本地高水位 seq（0 = 从头）。
+    HistoryQuery {
+        conv: String,
+        since: i64,
     },
     /// 未知 type：debug 忽略——前向兼容，M3 SPA 新增帧不致网关断连。
     Ignore,
@@ -961,6 +1068,28 @@ pub(crate) fn map_inbound_frame(v: &serde_json::Value, default_session: &str) ->
             InboundAction::ConvWorkdirSet {
                 conv: normalize_conv(Some(conv), default_session),
                 path: path.to_string(),
+            }
+        }
+        // v1.8 会话历史重放：本层只做字段校验（convId 须字符串、since 须非负
+        // 整数；since 缺省按 0=从头），值域/查库/回帧在 platform history 泵。
+        "history_query" => {
+            let Some(conv) = v.get("convId").and_then(|c| c.as_str()) else {
+                return InboundAction::Warn("history_query 帧缺 convId 字段，丢弃");
+            };
+            let since = match v.get("since") {
+                None => 0,
+                Some(s) => match s.as_i64() {
+                    Some(n) if n >= 0 => n,
+                    _ => {
+                        return InboundAction::Warn(
+                            "history_query 帧 since 非法（须非负整数），丢弃",
+                        )
+                    }
+                },
+            };
+            InboundAction::HistoryQuery {
+                conv: normalize_conv(Some(conv), default_session),
+                since,
             }
         }
         _ => InboundAction::Ignore,
@@ -1301,6 +1430,149 @@ mod tests {
             matches!(act, InboundAction::WorkspaceSave { .. }),
             "空白 name 仍应映射（泵回 error 帧）：{act:?}"
         );
+    }
+
+    /// v1.8 history_query 入站帧正例：完整形态（machine 路由字段网关不消费）、
+    /// convId 归一（裸 session 名补前缀 / local: 透传）、since 缺省 0。
+    #[test]
+    fn map_history_query_frames() {
+        let act = map_raw_frame(
+            r#"{"v":1,"type":"history_query","convId":"web:work","since":7,"machine":"m"}"#,
+            SESSION,
+        );
+        let InboundAction::HistoryQuery { conv, since } = act else {
+            panic!("history_query 应映射为 HistoryQuery：{act:?}")
+        };
+        assert_eq!(conv, "web:work");
+        assert_eq!(since, 7);
+        for (raw, want) in [
+            (
+                r#"{"v":1,"type":"history_query","convId":"work","since":0}"#,
+                "web:work",
+            ),
+            (
+                r#"{"v":1,"type":"history_query","convId":"local:x","since":0}"#,
+                "local:x",
+            ),
+            // convId 空串 → 归一到默认会话（normalize_conv 既有三分支纪律；
+            // 完全缺失则 Warn——见反例测试，与 conv_workdir_set 同款）。
+            (
+                r#"{"v":1,"type":"history_query","convId":"","since":0}"#,
+                "web:default",
+            ),
+        ] {
+            let act = map_raw_frame(raw, SESSION);
+            let InboundAction::HistoryQuery { conv, since } = act else {
+                panic!("{raw} 应映射为 HistoryQuery：{act:?}")
+            };
+            assert_eq!(conv, want, "convId 归一（{raw}）");
+            assert_eq!(since, 0);
+        }
+        // since 缺省 = 0（从头）。
+        let act = map_raw_frame(
+            r#"{"v":1,"type":"history_query","convId":"web:work"}"#,
+            SESSION,
+        );
+        let InboundAction::HistoryQuery { since, .. } = act else {
+            panic!("缺省 since 应映射为 HistoryQuery：{act:?}")
+        };
+        assert_eq!(since, 0);
+    }
+
+    /// v1.8 history_query 入站帧反例：convId 缺失/非字符串、since 负数/非整数
+    ///（字符串、数组、浮点）→ Warn 丢弃。
+    #[test]
+    fn map_history_query_frames_missing_or_wrong_fields() {
+        for raw in [
+            r#"{"v":1,"type":"history_query","since":0}"#,
+            r#"{"v":1,"type":"history_query","convId":9,"since":0}"#,
+            r#"{"v":1,"type":"history_query","convId":"web:w","since":-1}"#,
+            r#"{"v":1,"type":"history_query","convId":"web:w","since":"5"}"#,
+            r#"{"v":1,"type":"history_query","convId":"web:w","since":[1]}"#,
+            r#"{"v":1,"type":"history_query","convId":"web:w","since":1.5}"#,
+        ] {
+            assert!(
+                matches!(map_raw_frame(raw, SESSION), InboundAction::Warn(_)),
+                "{raw} 应 Warn 丢弃"
+            );
+        }
+    }
+
+    /// v1.8 history 条目组装（行 → 契约 JSON）+ history 帧**字节级断言**：
+    /// 顶层字段名/顺序（struct 声明序）、条目字段名逐字（Value 对象键序为
+    /// serde_json 默认字母序——JSON 语义与键序无关，字段名不得漂移）、
+    /// key 前缀 `h:<seq>`、card 的 state 恒 "done"；空集/新会话形态。
+    #[test]
+    fn history_entry_and_frame_byte_level() {
+        use imagent_store::OutboundRow;
+
+        let row = |seq: i64, kind: &str, payload: &str| OutboundRow {
+            conv_id: "web:work".into(),
+            seq,
+            ts: 1_000 + seq,
+            kind: kind.into(),
+            payload: payload.into(),
+        };
+        let text_row = row(1, "text", r#"{"text":"你好","at":1234}"#);
+        let card_row = row(
+            2,
+            "card",
+            r#"{"messageId":"web-card-1","card":{"text":"结论","terminal":"done"}}"#,
+        );
+        let t = history_entry_from_row(&text_row).expect("text 行应组装条目");
+        let c = history_entry_from_row(&card_row).expect("card 行应组装条目");
+        assert_eq!(t["kind"], "text");
+        assert_eq!(t["key"], "h:1", "key 前缀 h: 用行 seq");
+        assert_eq!(t["text"], "你好");
+        assert_eq!(t["at"], 1234);
+        assert_eq!(c["kind"], "card");
+        assert_eq!(c["key"], "h:2");
+        assert_eq!(c["messageId"], "web-card-1");
+        assert_eq!(c["card"]["terminal"], "done", "card 原样内嵌");
+        assert_eq!(c["state"], "done", "card 条目 state 恒 done");
+        // 条目字段全集（防多字段/漏字段——恰好 4 键）。
+        assert_eq!(t.as_object().map(|m| m.len()), Some(4));
+        assert_eq!(c.as_object().map(|m| m.len()), Some(5));
+
+        // 畸形 payload / kind 未知 / 必填字段缺失 → None（调用方跳过）。
+        assert!(history_entry_from_row(&row(3, "text", "not json")).is_none());
+        assert!(history_entry_from_row(&row(4, "mystery", "{}")).is_none());
+        assert!(history_entry_from_row(&row(5, "text", r#"{"text":"x"}"#)).is_none());
+        assert!(
+            history_entry_from_row(&row(6, "card", r#"{"messageId":"m"}"#)).is_none(),
+            "card 行缺 card 字段应跳过"
+        );
+
+        // 空集形态（新会话/未落盘）：entries=[] + lastSeq=0 + trimmed=false。
+        let json =
+            encode_history_frame("home-mac", "web:work", serde_json::json!([]), 0, false).unwrap();
+        assert_eq!(
+            json,
+            r#"{"v":1,"type":"history","machine":"home-mac","convId":"web:work","entries":[],"lastSeq":0,"trimmed":false}"#
+        );
+
+        // 非空 + trimmed=true 全量字节级（条目对象键序 = serde_json 字母序）。
+        let json = encode_history_frame(
+            "home-mac",
+            "web:work",
+            serde_json::Value::Array(vec![t, c]),
+            9,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"v":1,"type":"history","machine":"home-mac","convId":"web:work","entries":[{"at":1234,"key":"h:1","kind":"text","text":"你好"},{"card":{"terminal":"done","text":"结论"},"key":"h:2","kind":"card","messageId":"web-card-1","state":"done"}],"lastSeq":9,"trimmed":true}"#
+        );
+        // 逐字段复核（防手拼期望串自身笔误）。
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["v"], 1);
+        assert_eq!(v["type"], "history");
+        assert_eq!(v["machine"], "home-mac", "出站帧带本机 machine");
+        assert_eq!(v["convId"], "web:work", "convId 同请求原样");
+        assert_eq!(v["lastSeq"], 9);
+        assert_eq!(v["trimmed"], true);
+        assert_eq!(v["entries"].as_array().map(Vec::len), Some(2));
     }
 
     /// v1.6 出站工作空间帧**字节级断言**（与任务契约逐字段一致，SPA 侧并行

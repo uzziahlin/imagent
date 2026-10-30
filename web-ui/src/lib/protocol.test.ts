@@ -1631,3 +1631,171 @@ describe("会话自动命名（title 派生 + 自动短 ID + convTitle）", () =
     expect(convTitle(convsOf(def2)[DEFAULT_CONV], DEFAULT_CONV)).toBe("默认会话的第一条消息");
   });
 });
+
+// ---------------------------------------------------------------------------
+// v1.8 会话历史重放：history_query 出站 / history 入站解析 / reducer 合并
+// ---------------------------------------------------------------------------
+
+describe("v1.8 会话历史重放（history 帧）", () => {
+  /** 终态 card 载荷（历史重放恒为 done 快照）。 */
+  const CARD_JSON = (text: string) =>
+    `{"text":"${text}","tool_calls":[],"thoughts":[],"todos":[],"phase":"outputting","run_secs":5,"terminal":"done"}`;
+  /** history 帧文本（convId 固定 web:work，尾部拼 extra 段）。 */
+  const HIST = (extra = "") => `{"v":1,"type":"history","convId":"web:work"${extra}}`;
+  const LAST = `"lastSeq":4,"trimmed":false`;
+
+  it("出站 history_query 逐字段（machine 缺省不带字段，undefined 不序列化）", () => {
+    expect(encodeFrame({ v: 1, type: "history_query", convId: "web:default", since: 0 })).toBe(
+      '{"v":1,"type":"history_query","convId":"web:default","since":0}',
+    );
+    expect(
+      encodeFrame({ v: 1, type: "history_query", convId: "web:default", since: 42, machine: "home-mac" }),
+    ).toBe('{"v":1,"type":"history_query","convId":"web:default","since":42,"machine":"home-mac"}');
+    expect(
+      encodeFrame({ v: 1, type: "history_query", convId: "web:default", since: 0, machine: undefined }),
+    ).toBe('{"v":1,"type":"history_query","convId":"web:default","since":0}');
+  });
+
+  it("parseFrame history：合法形状放行（text/card 条目、machine 可选、空 entries）", () => {
+    const ok = parseFrame(
+      HIST(
+        `,"entries":[` +
+          `{"kind":"text","key":"h:3","text":"你好","at":1000},` +
+          `{"kind":"card","key":"h:4","messageId":"m1","card":${CARD_JSON("终态卡")},"state":"done"}],` +
+        `"lastSeq":4,"trimmed":false,"machine":"home-mac"`,
+      ),
+    );
+    expect(ok).toMatchObject({ type: "history", convId: "web:work", lastSeq: 4, trimmed: false });
+    expect((ok as { entries: unknown[] }).entries).toHaveLength(2);
+    // machine 缺席（旧网关归 DEFAULT_MACHINE）；空 entries + lastSeq 0（新会话）合法
+    expect(parseFrame(HIST(`,"entries":[],"lastSeq":0,"trimmed":false`))).toMatchObject({
+      entries: [],
+      lastSeq: 0,
+      trimmed: false,
+    });
+    // trimmed=true（GC 形态）合法
+    expect(parseFrame(HIST(`,"entries":[],"lastSeq":9,"trimmed":true`))).toMatchObject({
+      trimmed: true,
+    });
+  });
+
+  it("parseFrame history 反例：字段缺失/类型错/条目形状非法 → 整帧 null", () => {
+    // 缺 entries / entries 非数组 / 缺 lastSeq / 缺 trimmed / 缺 convId
+    expect(parseFrame(HIST(`,"lastSeq":0,"trimmed":false`))).toBeNull();
+    expect(parseFrame(HIST(`,"entries":{},"lastSeq":0,"trimmed":false`))).toBeNull();
+    expect(parseFrame(HIST(`,"entries":[],"trimmed":false`))).toBeNull();
+    expect(parseFrame(HIST(`,"entries":[],"lastSeq":0`))).toBeNull();
+    expect(parseFrame(`{"v":1,"type":"history","entries":[],"lastSeq":0,"trimmed":false}`)).toBeNull();
+    // lastSeq：负数 / 非整数 / 非数字
+    expect(parseFrame(HIST(`,"entries":[],"lastSeq":-1,"trimmed":false`))).toBeNull();
+    expect(parseFrame(HIST(`,"entries":[],"lastSeq":1.5,"trimmed":false`))).toBeNull();
+    expect(parseFrame(HIST(`,"entries":[],"lastSeq":"0","trimmed":false`))).toBeNull();
+    // trimmed 非布尔
+    expect(parseFrame(HIST(`,"entries":[],"lastSeq":0,"trimmed":"no"`))).toBeNull();
+    // machine 非字符串
+    expect(parseFrame(HIST(`,"entries":[],"lastSeq":0,"trimmed":false,"machine":7`))).toBeNull();
+    // 条目：kind 非法 / text 缺 key / text 缺 text / card 缺 messageId / card.card 非对象
+    expect(parseFrame(HIST(`,"entries":[{"kind":"user","key":"h:1","text":"x"}],${LAST}`))).toBeNull();
+    expect(parseFrame(HIST(`,"entries":[{"kind":"text","text":"x","at":1}],${LAST}`))).toBeNull();
+    expect(parseFrame(HIST(`,"entries":[{"kind":"text","key":"h:1","at":1}],${LAST}`))).toBeNull();
+    expect(parseFrame(HIST(`,"entries":[{"kind":"card","key":"h:1","card":${CARD_JSON("t")}}],${LAST}`))).toBeNull();
+    expect(
+      parseFrame(HIST(`,"entries":[{"kind":"card","key":"h:1","messageId":"m","card":"x"}],${LAST}`)),
+    ).toBeNull();
+    expect(parseFrame(HIST(`,"entries":["h:1"],${LAST}`))).toBeNull();
+  });
+
+  it("reducer：本地空 conv 首次物化——重放集整体置入 + 概要/title 派生 + 不计未读", () => {
+    const s = run(initialState(), {
+      type: "frame",
+      frame: frame(
+        HIST(
+          `,"entries":[{"kind":"text","key":"h:3","text":"历史首条","at":1000},` +
+            `{"kind":"card","key":"h:4","messageId":"m1","card":${CARD_JSON("历史终态卡")},"state":"done"}],` +
+          `"lastSeq":4,"trimmed":false,"machine":"home-mac"`,
+        ),
+      ),
+    });
+    const conv = spaceOf(s, "home-mac").convs["web:work"];
+    expect(conv?.entries.map((e) => e.key)).toEqual(["h:3", "h:4"]);
+    expect(conv?.lastPreview).toBe("历史终态卡"); // 末条概要
+    expect(conv?.lastAt).toBe(1000); // 末条带 at 的（card 无 at，回取 text）
+    expect(conv?.title).toBe("历史首条"); // 首条 text 派生
+    expect(conv?.unread).toBe(0); // 重放不计未读（非当前 conv 也不点亮）
+    expect(spaceOf(s, "home-mac").convOrder).toEqual([DEFAULT_CONV, "web:work"]);
+  });
+
+  it("reducer：增量合并按 key 去重 append（本地在前），概要不刷、重复重放幂等", () => {
+    let s = run(initialState(), { type: "frame", frame: frame(TEXT_FRAME("实时消息", "web:work")) });
+    s = run(s, {
+      type: "frame",
+      frame: frame(
+        HIST(
+          `,"entries":[{"kind":"text","key":"h:2","text":"更早的重放","at":500},` +
+            `{"kind":"text","key":"h:3","text":"较新重放","at":900}],"lastSeq":3,"trimmed":false`,
+        ),
+      ),
+    });
+    const conv = convsOf(s)["web:work"];
+    expect(conv.entries.map((e) => e.kind)).toEqual(["text", "text", "text"]);
+    expect((conv.entries[1] as { key: string }).key).toBe("h:2"); // 追加在本地条目之后
+    expect(conv.lastPreview).toBe("实时消息"); // 本地非空：概要不刷
+    // 重复重放同 key：全部命中去重 → 原引用返回（幂等）
+    const again = run(s, {
+      type: "frame",
+      frame: frame(HIST(`,"entries":[{"kind":"text","key":"h:3","text":"较新重放","at":900}],"lastSeq":3,"trimmed":false`)),
+    });
+    expect(again).toBe(s);
+  });
+
+  it("reducer：card 同 messageId 本地优先（重放终态不追加不覆盖）", () => {
+    let s = run(initialState(), {
+      type: "frame",
+      frame: frame(CARD_FRAME({ convId: "web:work", messageId: "m1", text: "本地终态", terminal: "done" })),
+    });
+    s = run(s, {
+      type: "frame",
+      frame: frame(
+        HIST(
+          `,"entries":[{"kind":"card","key":"h:4","messageId":"m1","card":${CARD_JSON("重放终态")},"state":"done"},` +
+            `{"kind":"text","key":"h:5","text":"后随文本","at":1}],"lastSeq":5,"trimmed":false`,
+        ),
+      ),
+    });
+    const conv = convsOf(s)["web:work"];
+    expect(conv.entries).toHaveLength(2); // 重放 card 跳过、text 追加
+    expect((conv.entries[0] as { card: { text: string } }).card.text).toBe("本地终态");
+    expect((conv.entries[1] as { key: string }).key).toBe("h:5");
+  });
+
+  it("reducer：trimmed 整体替换——本地缓存丢弃、重放集重建 + 概要刷新", () => {
+    let s = run(initialState(), { type: "frame", frame: frame(TEXT_FRAME("将被丢弃的本地缓存", "web:work")) });
+    s = run(s, {
+      type: "frame",
+      frame: frame(
+        HIST(`,"entries":[{"kind":"text","key":"h:9","text":"GC 后的完整历史","at":9000}],"lastSeq":9,"trimmed":true`),
+      ),
+    });
+    const conv = convsOf(s)["web:work"];
+    expect(conv.entries.map((e) => e.key)).toEqual(["h:9"]); // 本地条目被丢弃
+    expect(conv.lastPreview).toBe("GC 后的完整历史"); // 概要以重放集刷新
+    expect(conv.lastAt).toBe(9000);
+  });
+
+  it("reducer：空增量（entries=[]）仅水位——state 原样返回", () => {
+    const s0 = run(initialState(), { type: "frame", frame: frame(TEXT_FRAME("x")) });
+    expect(run(s0, { type: "frame", frame: frame(HIST(`,"entries":[],"lastSeq":7,"trimmed":false`)) })).toBe(s0);
+  });
+
+  it("reducer：history 按帧 machine 归属机器空间（缺席归 DEFAULT_MACHINE）", () => {
+    const s = run(initialState(), {
+      type: "frame",
+      frame: frame(
+        HIST(`,"entries":[{"kind":"text","key":"h:1","text":"别的机器的历史","at":1}],"lastSeq":1,"trimmed":false,"machine":"work-mac"`),
+      ),
+    });
+    expect(spaceOf(s, "work-mac").convs["web:work"]?.entries).toHaveLength(1);
+    expect(spaceOf(s, "work-mac").convs["web:work"]?.unread).toBe(0);
+    expect(spaceOf(s, DEFAULT_MACHINE).convs["web:work"]).toBeUndefined();
+  });
+});

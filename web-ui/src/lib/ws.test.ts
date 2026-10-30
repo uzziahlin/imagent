@@ -1139,6 +1139,35 @@ describe("WsManager 工作空间（v1.6）", () => {
 });
 
 // ---------------------------------------------------------------------------
+// v1.8 会话历史重放：queryHistory 发送器 + 入站 history 帧转发
+// ---------------------------------------------------------------------------
+
+describe("WsManager 会话历史重放（v1.8）", () => {
+  it("queryHistory：ready 前返回 false；ready 后字节精确（machine 缺省不带字段）", () => {
+    const h = makeManager();
+    h.mgr.connect();
+    expect(h.mgr.queryHistory("web:default", 0, "home-mac")).toBe(false);
+    const sock = readyFlow(h);
+    expect(h.mgr.queryHistory("web:default", 5, "home-mac")).toBe(true);
+    expect(sock.sent.at(-1)).toBe(
+      '{"v":1,"type":"history_query","convId":"web:default","since":5,"machine":"home-mac"}',
+    );
+    expect(h.mgr.queryHistory("web:default", 0)).toBe(true);
+    expect(sock.sent.at(-1)).toBe('{"v":1,"type":"history_query","convId":"web:default","since":0}');
+  });
+
+  it("入站 history 明文帧经 onFrame 转发（单机模式无 e2e 条目放行）", () => {
+    const h = makeManager();
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    sock.serverSend(
+      '{"v":1,"type":"history","convId":"web:default","entries":[{"kind":"text","key":"h:1","text":"重放","at":1}],"lastSeq":1,"trimmed":false}',
+    );
+    expect(h.frames.at(-1)).toMatchObject({ type: "history", lastSeq: 1, trimmed: false });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // v1.7.x 切回前台探活（visibilitychange）：iOS 冻结/掐断后台 WS 的半开问题
 // ---------------------------------------------------------------------------
 

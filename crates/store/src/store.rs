@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -167,6 +168,31 @@ pub struct OutboxRow {
 /// outbox 单条消息的最大重发次数（指数退避 15s→1h，总计约 10h 窗口）。
 pub const OUTBOX_MAX_ATTEMPTS: i64 = 16;
 
+/// outbound_log 每 conv 滚动保留条数（schema v17，v1.8 会话历史重放）：
+/// 写入路径顺带 `DELETE WHERE seq <= 新seq-500`；同时是 history 回放单帧
+/// entries 上限（契约：≤500 条，超过截最近 500 条 + trimmed）。
+pub const OUTBOUND_RETAIN: usize = 500;
+
+/// outbound_log 一行（schema v17）。`payload` 为 JSON：text=`{"text","at"}`、
+/// card=`{"messageId","card"}`（出站侧组帧契约，见 web crate）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OutboundRow {
+    pub conv_id: String,
+    pub seq: i64,
+    pub ts: i64,
+    pub kind: String,
+    pub payload: String,
+}
+
+/// `list_outbound_since` 结果：rows 为 seq 升序（超过 limit 截最近 limit 条，
+/// 反转为升序）；`trimmed` = 因截断丢弃了更早的 `seq > since` 行（契约：
+/// 客户端应丢弃本地该 conv 缓存、以返回集重建）。
+#[derive(Debug, Clone)]
+pub struct OutboundPage {
+    pub rows: Vec<OutboundRow>,
+    pub trimmed: bool,
+}
+
 struct Inner {
     conn: Mutex<rusqlite::Connection>,
 }
@@ -191,6 +217,11 @@ pub struct Store {
     /// 进程内不变（env 注入）、salt 随凭据行固定，命中直接复用。缓存键含
     /// passphrase 本体，`set_passphrase` 换口令后自动失效。
     kdf_cache: Arc<Mutex<crate::crypto::KdfCache>>,
+    /// outbound_log per-conv seq 内存计数器（schema v17）：`conv -> 已分配的
+    /// 最新 seq`。首次用到某 conv 时 `SELECT MAX(seq)` 懒恢复（进程重启后
+    /// 计数器归零，从库中续接，不回绕覆盖）。锁序恒为连接锁 → 本锁（append
+    /// 闭包内先持连接锁再取本锁），无反向路径。
+    outbound_seq: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 impl Store {
@@ -205,6 +236,7 @@ impl Store {
             keyring_scope: Arc::new(parking_lot::RwLock::new(String::new())),
             passphrase: Arc::new(parking_lot::RwLock::new(None)),
             kdf_cache: Arc::new(Mutex::new(crate::crypto::KdfCache::default())),
+            outbound_seq: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -2113,6 +2145,133 @@ impl Store {
         })
         .await
     }
+
+    // —— outbound_log（v1.8 web 会话历史重放；schema v17）——
+
+    /// 追加一条出站消息日志，返回分配的 seq。seq 由进程内存计数器分配
+    ///（per-conv 单调递增；首次用到该 conv 时 `SELECT MAX(seq)` 懒恢复——
+    /// 重启后续接不回绕），INSERT 与滚动 GC（保留最近 [`OUTBOUND_RETAIN`]
+    /// 条：`DELETE WHERE seq <= 新seq-500`）包单事务。`kind`：'text' |
+    /// 'card'；`payload` 为契约 JSON（见 [`OutboundRow`]）。
+    ///
+    /// BUSY 整闭包重放时计数器可能先已前跳——重放取下一个值，产生 seq 空洞
+    ///（单调性不受影响，history 按 seq 升序回放对空洞无感知）。
+    pub async fn append_outbound(
+        &self,
+        conv_id: &str,
+        kind: &str,
+        payload_json: &str,
+    ) -> Result<i64> {
+        let (conv_id, kind, payload_json) = (
+            conv_id.to_string(),
+            kind.to_string(),
+            payload_json.to_string(),
+        );
+        let inner = self.inner.clone();
+        let counters = self.outbound_seq.clone();
+        blocking_with_retry(inner, move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            // seq 分配：内存计数器优先；该 conv 首次写入（或进程重启后）从库中
+            // MAX(seq) 懒恢复。锁序：连接锁（外层 blocking_with 已持有）→ 计数
+            // 器锁，全仓唯一方向。
+            let seq = {
+                let mut map = counters.lock();
+                let next = match map.get(&conv_id) {
+                    Some(&last) => last + 1,
+                    None => {
+                        let max: i64 = tx.query_row(
+                            "SELECT COALESCE(MAX(seq), 0) FROM outbound_log WHERE conv_id = ?1",
+                            rusqlite::params![conv_id],
+                            |r| r.get(0),
+                        )?;
+                        max + 1
+                    }
+                };
+                map.insert(conv_id.clone(), next);
+                next
+            };
+            tx.execute(
+                "INSERT INTO outbound_log (conv_id, seq, ts, kind, payload) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![conv_id, seq, now_millis(), kind, payload_json],
+            )?;
+            // 滚动 GC：保留最近 OUTBOUND_RETAIN 条（含新行），与 INSERT 同事务
+            //（契约：写入路径顺带 DELETE WHERE conv_id=? AND seq<=?-500）。
+            tx.execute(
+                "DELETE FROM outbound_log WHERE conv_id = ?1 AND seq <= ?2",
+                rusqlite::params![conv_id, seq - OUTBOUND_RETAIN as i64],
+            )?;
+            tx.commit()?;
+            Ok(seq)
+        })
+        .await
+    }
+
+    /// 拉取 `seq > since` 的行（seq 升序，上限 `limit`——调用方按契约传
+    /// [`OUTBOUND_RETAIN`]）。超过 limit 时截**最近** limit 条（反转为升序
+    /// 返回）并置 `trimmed=true`（更早的 `seq > since` 行被丢弃，客户端应
+    /// 丢弃本地该 conv 缓存以返回集重建）。`since` 之后无行 → rows 空 +
+    /// trimmed=false（lastSeq 由调用方另查 [`Store::max_outbound_seq`]）。
+    /// COUNT 与 SELECT 包单事务（读快照一致——两条独立语句间并发写入会让
+    /// trimmed 判定与 rows 脱节）。
+    pub async fn list_outbound_since(
+        &self,
+        conv_id: &str,
+        since: i64,
+        limit: usize,
+    ) -> Result<OutboundPage> {
+        let conv_id = conv_id.to_string();
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM outbound_log WHERE conv_id = ?1 AND seq > ?2",
+                rusqlite::params![conv_id, since],
+                |r| r.get(0),
+            )?;
+            // DESC LIMIT 先取最近 limit 条，再反转为升序：count <= limit 时等价于
+            // 全量升序；count > limit 时天然完成「截最近 N 条」。
+            let mut stmt = tx.prepare(
+                "SELECT conv_id, seq, ts, kind, payload FROM outbound_log \
+                 WHERE conv_id = ?1 AND seq > ?2 ORDER BY seq DESC LIMIT ?3",
+            )?;
+            let mut rows = stmt
+                .query_map(rusqlite::params![conv_id, since, limit as i64], |r| {
+                    Ok(OutboundRow {
+                        conv_id: r.get(0)?,
+                        seq: r.get(1)?,
+                        ts: r.get(2)?,
+                        kind: r.get(3)?,
+                        payload: r.get(4)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(stmt); // stmt 借用 tx，commit 前须归还
+            tx.commit()?;
+            rows.reverse();
+            Ok(OutboundPage {
+                rows,
+                trimmed: count > limit as i64,
+            })
+        })
+        .await
+    }
+
+    /// 该 conv 当前最大 seq（无任何记录时 0）——history 帧 lastSeq 字段来源
+    ///（与返回集无关：即使 rows 因 since/limit 截断，lastSeq 仍报全量水位）。
+    pub async fn max_outbound_seq(&self, conv_id: &str) -> Result<i64> {
+        let conv_id = conv_id.to_string();
+        let inner = self.inner.clone();
+        blocking_with(inner, move |conn| {
+            let max: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(seq), 0) FROM outbound_log WHERE conv_id = ?1",
+                rusqlite::params![conv_id],
+                |r| r.get(0),
+            )?;
+            Ok(max)
+        })
+        .await
+    }
 }
 
 // —— spawn_blocking 调度 ——
@@ -2352,6 +2511,14 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// unix 毫秒（outbound_log.ts 契约粒度）。
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2420,6 +2587,8 @@ mod tests {
             "session_history",
             "sessions",
             "sync_buf",
+            // v17（v1.8 会话历史重放）：出站消息日志。
+            "outbound_log",
             // v16（code-review v14 P3-b）：webhook 防重放签名持久层。
             "webhook_seen",
         ] {
@@ -2583,6 +2752,171 @@ mod tests {
         }
         let rows = store.list_run_stats_since(0).await.unwrap();
         assert_eq!(rows.len(), 10_000, "应轮转到 10000 条");
+    }
+
+    // ---------- outbound_log（schema v17，v1.8 web 会话历史重放）----------
+
+    /// seq 单调 + 滚动 GC（510 条后最旧 10 条被清）+ 重启懒恢复（计数器从
+    /// MAX(seq)+1 续接，不回绕覆盖）。
+    #[tokio::test]
+    async fn outbound_log_seq_monotonic_gc_rolls_and_recovers() {
+        let db = TempDb::new("outbound_mono").await;
+        let store = Store::open(&db.path).await.unwrap();
+        for i in 1..=510 {
+            let seq = store
+                .append_outbound("web:a", "text", &format!(r#"{{"text":"m{i}","at":{i}}}"#))
+                .await
+                .unwrap();
+            assert_eq!(seq, i as i64, "seq 应从 1 起 per-conv 单调递增");
+        }
+        let page = store
+            .list_outbound_since("web:a", 0, OUTBOUND_RETAIN)
+            .await
+            .unwrap();
+        assert_eq!(page.rows.len(), 500, "写入 510 条后滚动 GC 保留最近 500 条");
+        assert!(!page.trimmed, "GC 后库内恰好 500 条，未超过查询上限");
+        assert_eq!(
+            page.rows.first().unwrap().seq,
+            11,
+            "最旧 10 条（seq 1..=10）应被 GC"
+        );
+        assert_eq!(page.rows.last().unwrap().seq, 510);
+        // 升序 + ts/payload 原样回读。
+        assert!(
+            page.rows.windows(2).all(|w| w[0].seq < w[1].seq),
+            "seq 升序"
+        );
+        assert_eq!(page.rows[0].payload, r#"{"text":"m11","at":11}"#);
+
+        // 重启（新 Store 实例 = 全新内存计数器）：懒恢复 MAX(seq)+1 续接。
+        drop(store);
+        let store = Store::open(&db.path).await.unwrap();
+        let seq = store
+            .append_outbound("web:a", "text", r#"{"text":"after-restart","at":1}"#)
+            .await
+            .unwrap();
+        assert_eq!(seq, 511, "重启后 seq 从 MAX(seq)+1 续接");
+        assert_eq!(store.max_outbound_seq("web:a").await.unwrap(), 511);
+    }
+
+    /// since 查询边界 + trimmed 判定：count > limit 截最近 limit 条且置
+    /// trimmed；count <= limit 全量升序不 trimmed；无行/空 conv 边界。
+    #[tokio::test]
+    async fn outbound_log_since_boundaries_and_trimmed() {
+        let db = TempDb::new("outbound_since").await;
+        let store = Store::open(&db.path).await.unwrap();
+        assert_eq!(
+            store.max_outbound_seq("web:none").await.unwrap(),
+            0,
+            "空 conv max=0"
+        );
+        let empty = store
+            .list_outbound_since("web:none", 0, OUTBOUND_RETAIN)
+            .await
+            .unwrap();
+        assert!(
+            empty.rows.is_empty() && !empty.trimmed,
+            "空 conv：无行不 trimmed"
+        );
+
+        for i in 1..=6 {
+            store
+                .append_outbound("web:b", "text", &format!(r#"{{"text":"b{i}","at":{i}}}"#))
+                .await
+                .unwrap();
+        }
+        // 全量（since=0，上限充足）。
+        let full = store
+            .list_outbound_since("web:b", 0, OUTBOUND_RETAIN)
+            .await
+            .unwrap();
+        assert_eq!(
+            full.rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6],
+        );
+        assert!(!full.trimmed);
+        // since 边界：只回 seq > since。
+        let inc = store
+            .list_outbound_since("web:b", 3, OUTBOUND_RETAIN)
+            .await
+            .unwrap();
+        assert_eq!(
+            inc.rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![4, 5, 6]
+        );
+        assert!(!inc.trimmed);
+        // since=最新 seq → 空。
+        let none = store
+            .list_outbound_since("web:b", 6, OUTBOUND_RETAIN)
+            .await
+            .unwrap();
+        assert!(none.rows.is_empty() && !none.trimmed);
+        // count > limit：截最近 limit 条（升序返回）+ trimmed=true。
+        let trimmed = store.list_outbound_since("web:b", 0, 3).await.unwrap();
+        assert_eq!(
+            trimmed.rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![4, 5, 6],
+            "超限应返回最近 3 条（且反转为升序）"
+        );
+        assert!(trimmed.trimmed, "更早的 seq>since 行被丢弃应置 trimmed");
+        // count == limit：恰好不 trimmed。
+        let exact = store.list_outbound_since("web:b", 3, 3).await.unwrap();
+        assert_eq!(exact.rows.len(), 3);
+        assert!(!exact.trimmed, "count == limit 恰好装下，不 trimmed");
+        // since 抬高后 count 回落：limit 不变也不再 trimmed。
+        let tail = store.list_outbound_since("web:b", 4, 3).await.unwrap();
+        assert_eq!(
+            tail.rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![5, 6]
+        );
+        assert!(!tail.trimmed);
+    }
+
+    /// 多 conv 隔离：seq 各自独立从 1 起，GC/list 互不影响。
+    #[tokio::test]
+    async fn outbound_log_multi_conv_isolation() {
+        let db = TempDb::new("outbound_multi").await;
+        let store = Store::open(&db.path).await.unwrap();
+        for i in 1..=3 {
+            store
+                .append_outbound("web:a", "text", &format!(r#"{{"text":"a{i}","at":{i}}}"#))
+                .await
+                .unwrap();
+            store
+                .append_outbound(
+                    "web:b",
+                    "card",
+                    &format!(r#"{{"messageId":"c{i}","card":{{}}"}}"#),
+                )
+                .await
+                .unwrap();
+        }
+        let a = store
+            .list_outbound_since("web:a", 0, OUTBOUND_RETAIN)
+            .await
+            .unwrap();
+        let b = store
+            .list_outbound_since("web:b", 0, OUTBOUND_RETAIN)
+            .await
+            .unwrap();
+        assert_eq!(
+            a.rows
+                .iter()
+                .map(|r| (r.seq, r.kind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "text"), (2, "text"), (3, "text")],
+            "conv a 各自从 1 起且 kind 原样"
+        );
+        assert_eq!(
+            b.rows
+                .iter()
+                .map(|r| (r.seq, r.kind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "card"), (2, "card"), (3, "card")],
+            "conv b 独立计数"
+        );
+        assert_eq!(store.max_outbound_seq("web:a").await.unwrap(), 3);
+        assert_eq!(store.max_outbound_seq("web:b").await.unwrap(), 3);
     }
 
     // ---------- P4-5：allowed_chats ----------

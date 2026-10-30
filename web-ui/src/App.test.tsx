@@ -1718,8 +1718,10 @@ describe("App 本地消息缓存（historyStore 集成）", () => {
   it("挂载预填恢复：entries/预览/时间渲染、convOrder 按 lastAt 插 default 后、default 会话 title 生效", async () => {
     vi.spyOn(historyStore, "loadAll").mockResolvedValue({
       "home-mac": {
-        "web:s-ab12": [userEntry("自动会话历史首条", 3000)],
-        "web:default": [userEntry("默认会话历史首条", 1000), textEntry("默认会话历史回复", 1100)],
+        "web:s-ab12": { entries: [userEntry("自动会话历史首条", 3000)] },
+        "web:default": {
+          entries: [userEntry("默认会话历史首条", 1000), textEntry("默认会话历史回复", 1100)],
+        },
       },
     });
     const fake = mountApp();
@@ -1755,6 +1757,7 @@ describe("App 本地消息缓存（historyStore 集成）", () => {
       "home-mac",
       "web:work",
       [expect.objectContaining({ kind: "text", text: "后台消息" })],
+      undefined, // v1.8：无 history 帧时水位缺省（不落 lastSeq 键）
     );
     // 引用不再变化：再推进不再重复写
     act(() => vi.advanceTimersByTime(5_000));
@@ -1799,5 +1802,161 @@ describe("App default 会话自动命名", () => {
     expect(screen.getAllByText("默认会话的第一条").length).toBeGreaterThanOrEqual(3);
     // "default" 字样从显示位消失
     expect(screen.queryByText("default")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.8 会话历史重放：ready/切会话触发 queryHistory（带本地水位）+ 水位随
+// debounce 落盘 + 重放合并渲染（增量 / trimmed 重建）
+// ---------------------------------------------------------------------------
+
+describe("App 会话历史重放（v1.8）", () => {
+  /** 出站的 history_query 帧（解析后对象，全字段断言用）。 */
+  const historyQueries = (fake: FakeWebSocket) =>
+    fake.sent
+      .map((s) => JSON.parse(s) as Record<string, unknown>)
+      .filter((f) => f.type === "history_query");
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it("ready 后对当前 conv 发 history_query（since=0、带当前机器）；旧 relay（无 machines 帧）不发", () => {
+    const fake = mountApp();
+    act(() => {
+      fake.emit("open");
+      fake.recv({ v: 1, type: "hello_ack", role: "user" });
+    });
+    expect(historyQueries(fake)).toHaveLength(0); // 旧 relay 单机模式：网关不识帧
+    act(() => fake.recv({ v: 1, type: "machines", online: ["home-mac"] }));
+    expect(fake.sent).toContain(
+      JSON.stringify({ v: 1, type: "history_query", convId: "web:default", since: 0, machine: "home-mac" }),
+    );
+  });
+
+  it("切会话每次都查；history 到达更新水位 → 切回带最新 lastSeq；空增量水位随 debounce 落盘", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(historyStore, "loadAll").mockResolvedValue({});
+    const saveSpy = vi.spyOn(historyStore, "saveConv").mockResolvedValue();
+    const fake = mountApp();
+    handshake(fake, ["home-mac"]);
+    await act(async () => {}); // loadAll resolve
+    // ready 已查当前 conv（since 0——本地无水位）
+    expect(historyQueries(fake)).toEqual([
+      { v: 1, type: "history_query", convId: "web:default", since: 0, machine: "home-mac" },
+    ]);
+    // 造出第二个会话并切过去：每次切都查（仍 since 0）
+    act(() => {
+      fake.recv({ v: 1, type: "text", convId: "web:work", text: "后台消息", machine: "home-mac" });
+    });
+    fireEvent.click(screen.getByRole("button", { name: /work/ }));
+    expect(historyQueries(fake)).toEqual([
+      { v: 1, type: "history_query", convId: "web:default", since: 0, machine: "home-mac" },
+      { v: 1, type: "history_query", convId: "web:work", since: 0, machine: "home-mac" },
+    ]);
+    // history 到达（空增量，仅水位 7）
+    act(() =>
+      fake.recv({
+        v: 1,
+        type: "history",
+        convId: "web:work",
+        machine: "home-mac",
+        entries: [],
+        lastSeq: 7,
+        trimmed: false,
+      }),
+    );
+    // 切走再切回：since=7（本地水位）
+    fireEvent.click(screen.getByRole("button", { name: /default/ }));
+    fireEvent.click(screen.getByRole("button", { name: /work/ }));
+    expect(historyQueries(fake).at(-1)).toEqual({
+      v: 1,
+      type: "history_query",
+      convId: "web:work",
+      since: 7,
+      machine: "home-mac",
+    });
+    // 空增量也驱动落盘：2s 后 saveConv 带水位（entries 同写）
+    act(() => vi.advanceTimersByTime(1_999));
+    expect(saveSpy).not.toHaveBeenCalled();
+    act(() => vi.advanceTimersByTime(1));
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+    expect(saveSpy).toHaveBeenCalledWith(
+      "home-mac",
+      "web:work",
+      [expect.objectContaining({ kind: "text", text: "后台消息" })],
+      7,
+    );
+  });
+
+  it("history 非空增量：重放条目合并渲染（气泡 + 侧栏概要）；trimmed 丢弃本地重建", async () => {
+    vi.spyOn(historyStore, "loadAll").mockResolvedValue({});
+    const fake = mountApp();
+    handshake(fake, ["home-mac"]);
+    await act(async () => {});
+    act(() =>
+      fake.recv({
+        v: 1,
+        type: "history",
+        convId: "web:default",
+        machine: "home-mac",
+        entries: [
+          { kind: "text", key: "h:1", text: "重放第一条", at: 1000 },
+          {
+            kind: "card",
+            key: "h:2",
+            messageId: "m1",
+            card: {
+              text: "重放终态卡",
+              tool_calls: [],
+              thoughts: [],
+              todos: [],
+              phase: "outputting",
+              run_secs: 5,
+              terminal: "done",
+            },
+            state: "done",
+          },
+        ],
+        lastSeq: 2,
+        trimmed: false,
+      }),
+    );
+    // 本地空 conv 首次物化：气泡渲染 + 末条概要 + 首条 title（default 会话显示名）
+    expect(screen.getAllByText(/重放第一条/).length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText(/重放终态卡/).length).toBeGreaterThanOrEqual(2);
+    // trimmed：本地条目丢弃，以重放集重建（概要换新；title 一旦写入不变）
+    act(() =>
+      fake.recv({
+        v: 1,
+        type: "history",
+        convId: "web:default",
+        machine: "home-mac",
+        entries: [{ kind: "text", key: "h:9", text: "GC 后的完整历史", at: 9000 }],
+        lastSeq: 9,
+        trimmed: true,
+      }),
+    );
+    expect(screen.getAllByText(/GC 后的完整历史/).length).toBeGreaterThanOrEqual(2);
+    expect(screen.queryByText("重放终态卡")).toBeNull(); // 旧条目（气泡+概要）已不在
+  });
+
+  it("本地缓存恢复水位：ready 后首查携带恢复的 lastSeq；恢复条目照常渲染", async () => {
+    vi.spyOn(historyStore, "loadAll").mockResolvedValue({
+      "home-mac": {
+        "web:default": {
+          entries: [{ kind: "user", key: "user:1", text: "缓存消息", at: 1 }],
+          lastSeq: 9,
+        },
+      },
+    });
+    const fake = mountApp();
+    await act(async () => {}); // 恢复先于握手完成
+    handshake(fake, ["home-mac"]);
+    expect(fake.sent).toContain(
+      JSON.stringify({ v: 1, type: "history_query", convId: "web:default", since: 9, machine: "home-mac" }),
+    );
+    expect(screen.getAllByText("缓存消息").length).toBeGreaterThanOrEqual(2);
   });
 });

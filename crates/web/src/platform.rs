@@ -22,15 +22,20 @@
 //!   up-<unix_ms>-<安全化name>`（目录 0755、文件 0600）→ 合成
 //!   InboundMessage（text 非空才 Some）投回 inbound channel；任一步失败回
 //!   error 帧（media_too_large / media_invalid）且不投递。
+//! - 出站落盘 + history 泵（v1.8 会话历史重放）：send_text / card 终态帧
+//!   （state=="done"）出站成功后异步落 store `outbound_log`（spawn 短任务
+//!   不阻塞热路径；同 messageId 终态只落一次；流式中间帧 / sync 重发不落）；
+//!   history_query 动作查 `list_outbound_since` 回 history 帧（增量重放，
+//!   浏览器按本地高水位拉取）。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use imagent_store::Store;
+use imagent_store::{OutboundPage, Store, OUTBOUND_RETAIN};
 use tokio::sync::{mpsc, Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -47,9 +52,9 @@ use crate::e2e::E2eIdentity;
 use crate::models::{resolve_models, CliModels, ModelsContext};
 use crate::{
     encode_approval_request_frame, encode_approval_resolved_frame, encode_card_frame,
-    encode_conv_workdir_frame, encode_error_frame, encode_text_frame, encode_workspaces_frame,
-    session_title, CardPayload, GatewayCredential, InboundAction, SessionEntryFrame,
-    WorkspaceEntryFrame, TARGET,
+    encode_conv_workdir_frame, encode_error_frame, encode_history_frame, encode_text_frame,
+    encode_workspaces_frame, history_entry_from_row, session_title, CardPayload, GatewayCredential,
+    InboundAction, SessionEntryFrame, WorkspaceEntryFrame, TARGET,
 };
 
 const PLATFORM: &str = "web";
@@ -84,6 +89,14 @@ const MEDIA_INVALID_CODE: &str = "media_invalid";
 const MEDIA_CHANNEL_CAPACITY: usize = 8;
 /// v1.7 workspaces 快照 sessions 段上限（契约：最近 50 条）。
 const WEB_SESSIONS_MAX: usize = 50;
+/// v1.8 history 动作 channel 容量：SPA 连接 ready + 每次 select_conv 各一条，
+/// 点按级频率，8 足以吸收突发；打满由 client 侧 1s 有界背压丢弃（下次
+/// 切会话/重连的 history_query 兜底）。
+const HISTORY_CHANNEL_CAPACITY: usize = 8;
+/// v1.8 已落盘终态卡片 messageId 查重集容量上限（per conv）：防长寿命进程
+/// 内存无界增长。契约允许同 messageId 重复行（SPA 幂等替换），超限清空
+/// 整 conv 集合最坏多落一行，无正确性影响。
+const LOGGED_CARDS_PER_CONV: usize = 100;
 
 // ---------------------------------------------------------------------------
 // 卡片缓存（D6 sync 重发）
@@ -130,6 +143,30 @@ impl CardCache {
 
 /// pending 审批记录（cancel_all 逐条收敛用）：`conv -> request_id 列表`。
 type PendingAsks = HashMap<String, Vec<String>>;
+
+/// v1.8 已落盘终态卡片 messageId 查重集：`conv -> 已落盘 messageId`。
+/// 契约语义「同 messageId 终态只落一次」（重复终态 patch / 同 id 复用跳过）；
+/// HashSet 无序，超 [`LOGGED_CARDS_PER_CONV`] 上限时整 conv 清空重建
+///（查重只是省一次重复落盘的优化——契约允许同 messageId 重复行，SPA
+/// 幂等替换）。纯内存临界区用 std Mutex（lock_or_recover 同款纪律）。
+#[derive(Default)]
+struct LoggedCardIds(HashMap<String, HashSet<String>>);
+
+impl LoggedCardIds {
+    /// 登记一个待落盘的终态 messageId：返回 true = 首次（应落盘），
+    /// false = 已登记过（跳过落盘）。
+    fn register(&mut self, conv: &str, message_id: &str) -> bool {
+        let set = self.0.entry(conv.to_string()).or_default();
+        if set.contains(message_id) {
+            return false;
+        }
+        if set.len() >= LOGGED_CARDS_PER_CONV {
+            set.clear(); // 容量满：整 conv 清空（见类型注释的取舍）
+        }
+        set.insert(message_id.to_string());
+        true
+    }
+}
 
 /// 中毒（临界区 panic）时取回数据继续服务：纯内存临界区无 IO 副作用可回滚
 /// （relay Hub / webhook 同款取舍）。
@@ -494,6 +531,106 @@ fn reply_workspace_error(machine: &str, outbound_tx: &mpsc::Sender<String>, mess
 }
 
 // ---------------------------------------------------------------------------
+// history 泵（v1.8 会话历史重放：history_query → outbound_log 增量拉取回帧）
+// ---------------------------------------------------------------------------
+
+/// history 泵主循环：消费 client 转来的 history_query 动作（store IO 在本泵
+/// 内 await，不阻塞 client 收发循环；workspace 泵同款纪律）。平台 Drop 时
+/// 经 shutdown token 连动退出。回帧经 outbound_tx（client 出站路径——E2E
+/// 会话活跃时同被 enc 包装，中继保持盲化）。
+async fn serve_history_queries(
+    mut history_rx: mpsc::Receiver<InboundAction>,
+    machine_id: String,
+    store: Store,
+    outbound_tx: mpsc::Sender<String>,
+    shutdown: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            act = history_rx.recv() => {
+                let Some(act) = act else {
+                    break; // client 退出（platform drop 连动），无后续查询
+                };
+                match act {
+                    InboundAction::HistoryQuery { conv, since } => {
+                        handle_history_query(&machine_id, &store, &conv, since, &outbound_tx).await;
+                    }
+                    // client 只转发 HistoryQuery 进 history channel，其余分支
+                    // 不可达（防御性忽略，不 panic——通道元素类型复用
+                    // InboundAction）。
+                    other => {
+                        debug!(target: TARGET, act = ?other, "history 泵收到非 history_query 动作，忽略")
+                    }
+                }
+            }
+        }
+    }
+    debug!(target: TARGET, "history 泵退出");
+}
+
+/// 处理一条 history_query 并回 history 帧（契约 v1.8 语义）：
+/// - `seq > since` 的行 → entries（升序，≤[`OUTBOUND_RETAIN`] 条；超限截
+///   最近 N 条 + trimmed=true）；行 payload 畸形单条跳过（best-effort）。
+/// - lastSeq = 该 conv 当前最大 seq（无任何记录 0——entries 空时浏览器只
+///   更新水位）。
+/// - 查库/组帧失败仅 warn 不回帧（SPA 下次切会话/重连的 history_query 兜底，
+///   契约未定义 history 错误帧，不复用 workspace_invalid）。
+async fn handle_history_query(
+    machine: &str,
+    store: &Store,
+    conv: &str,
+    since: i64,
+    outbound_tx: &mpsc::Sender<String>,
+) {
+    let OutboundPage { rows, trimmed } = match store
+        .list_outbound_since(conv, since, OUTBOUND_RETAIN)
+        .await
+    {
+        Ok(page) => page,
+        Err(e) => {
+            warn!(target: TARGET, conv = %conv, since, error = %e, "history_query 查库失败，不回帧");
+            return;
+        }
+    };
+    let last_seq = match store.max_outbound_seq(conv).await {
+        Ok(n) => n,
+        Err(e) => {
+            warn!(target: TARGET, conv = %conv, error = %e, "history_query 查 lastSeq 失败，不回帧");
+            return;
+        }
+    };
+    let entries: Vec<serde_json::Value> = rows.iter().filter_map(history_entry_from_row).collect();
+    debug!(
+        target: TARGET,
+        conv = %conv,
+        since,
+        entries = entries.len(),
+        last_seq,
+        trimmed,
+        "history 回放"
+    );
+    match encode_history_frame(
+        machine,
+        conv,
+        serde_json::Value::Array(entries),
+        last_seq,
+        trimmed,
+    ) {
+        Ok(json) => enqueue_best_effort(outbound_tx, json),
+        Err(e) => warn!(target: TARGET, conv = %conv, error = %e, "history 帧序列化失败"),
+    }
+}
+
+/// unix 毫秒（v1.8 出站落盘 payload.at / outbound_log.ts 粒度契约）。
+fn unix_ms_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
 // 媒体泵（v1.7 媒体上行：message 帧 media 段——校验 + 落盘 + 合成投递）
 // ---------------------------------------------------------------------------
 
@@ -712,6 +849,11 @@ pub struct WebPlatform {
     online: Arc<AtomicBool>,
     /// per-conv 最近卡片缓存（sync 重发）。
     cards: Arc<Mutex<CardCache>>,
+    /// v1.8 出站落盘句柄（text / card 终态帧异步写 outbound_log；与
+    /// workspace / history 泵共享同一 store 连接）。
+    store: Store,
+    /// v1.8 已落盘终态卡片 messageId 查重集（同 messageId 终态只落一次）。
+    logged_cards: Arc<Mutex<LoggedCardIds>>,
     /// 合成卡片 id 计数器：`web-card-<n>` 单调递增（§4.2）。
     card_seq: Arc<AtomicU64>,
     /// pending 审批记录（cancel_all 收敛用）。
@@ -778,6 +920,7 @@ impl WebPlatform {
         let (workspace_tx, workspace_rx) =
             mpsc::channel::<InboundAction>(WORKSPACE_CHANNEL_CAPACITY);
         let (media_tx, media_rx) = mpsc::channel::<InboundAction>(MEDIA_CHANNEL_CAPACITY);
+        let (history_tx, history_rx) = mpsc::channel::<InboundAction>(HISTORY_CHANNEL_CAPACITY);
 
         // E2E 身份装配（v1.4）：e2e_ack 签名复用 v1.3 认证 ed25519 私钥——
         // 仅 key 凭证形态可用；token 回退形态无签名密钥，E2E 不可用（出站
@@ -823,6 +966,7 @@ impl WebPlatform {
             sync_tx,
             workspace_tx,
             media_tx,
+            history_tx,
         };
         tokio::spawn(client.run(outbound_rx, reconnect.clone(), shutdown.clone()));
 
@@ -841,9 +985,19 @@ impl WebPlatform {
         tokio::spawn(serve_workspace_actions(
             workspace_rx,
             machine_id.clone(),
-            store,
+            store.clone(),
             default_workdir,
             models,
+            outbound_tx.clone(),
+            shutdown.clone(),
+        ));
+
+        // history 泵（v1.8 会话历史重放）：history_query → outbound_log 增量
+        // 拉取 → history 帧回放（出站帧带 machine，v1.1 语义）。
+        tokio::spawn(serve_history_queries(
+            history_rx,
+            machine_id.clone(),
+            store.clone(),
             outbound_tx.clone(),
             shutdown.clone(),
         ));
@@ -868,6 +1022,8 @@ impl WebPlatform {
             inbound_rx: Arc::new(AsyncMutex::new(inbound_rx)),
             online,
             cards,
+            store,
+            logged_cards: Arc::new(Mutex::new(LoggedCardIds::default())),
             card_seq: Arc::new(AtomicU64::new(0)),
             pending_asks: Arc::new(Mutex::new(PendingAsks::default())),
             shutdown,
@@ -918,6 +1074,54 @@ impl WebPlatform {
             }
         }
     }
+
+    // —— v1.8 出站落盘（outbound_log）：send 成功后异步写库，不阻塞热路径 ——
+
+    /// text 帧出站成功后落盘（契约：kind='text'，payload=`{"text":<原文>,
+    /// "at":<unix_ms>}`——落盘取 encode 截断前的原文）。spawn 短任务写库：
+    /// 出站队列是 try_send 语义，落盘绝不在 dispatch 热路径上 await。
+    fn log_outbound_text(&self, conv: &str, text: &str) {
+        let payload = serde_json::json!({"text": text, "at": unix_ms_now()}).to_string();
+        self.spawn_outbound_log(conv.to_string(), "text", payload);
+    }
+
+    /// card 终态帧（state=="done"）出站成功后落盘（契约：kind='card'，
+    /// payload=`{"messageId","card":<CardPayload 完整 JSON>}`——取 encode
+    /// 截断前的完整 payload）。同 messageId 只落一次（内存查重集，跳过重复
+    /// 终态 / 同 id 复用；sync 重发不经本路径）。查重登记在 spawn 前同步完成
+    /// ——两条同 id 终态连发不会都过闸。
+    fn log_terminal_card(&self, conv: &str, message_id: &str, card: &CardPayload) {
+        if !lock_or_recover(&self.logged_cards).register(conv, message_id) {
+            return;
+        }
+        let card_json = match serde_json::to_value(card) {
+            Ok(v) => v,
+            Err(e) => {
+                // CardPayload 纯数据字段，序列化不可失败；兜底不阻断。
+                warn!(target: TARGET, error = %e, "card payload 序列化失败，跳过落盘");
+                return;
+            }
+        };
+        let payload = serde_json::json!({"messageId": message_id, "card": card_json}).to_string();
+        self.spawn_outbound_log(conv.to_string(), "card", payload);
+    }
+
+    /// 落盘执行体：spawn 短任务写 outbound_log。best-effort——写失败仅 warn
+    /// 不阻断出站（契约纪律），也不重试（下一条出站消息 / SPA 重连重查兜底）。
+    fn spawn_outbound_log(&self, conv: String, kind: &'static str, payload: String) {
+        let store = self.store.clone();
+        tokio::spawn(async move {
+            if let Err(e) = store.append_outbound(&conv, kind, &payload).await {
+                warn!(
+                    target: TARGET,
+                    conv = %conv,
+                    kind,
+                    error = %e,
+                    "outbound_log 落盘失败（best-effort，不影响出站）"
+                );
+            }
+        });
+    }
 }
 
 /// 平台 drop 即 cancel：后台 client / sync responder 任务感知退出，不再无限
@@ -962,7 +1166,10 @@ impl Platform for WebPlatform {
 
     async fn send_text(&self, conv: &ConvId, text: &str, _hint: &ReplyHint) -> Result<()> {
         let json = encode_text_frame(&self.machine_id, &conv.0, text)?;
-        self.enqueue(json)
+        self.enqueue(json)?;
+        // v1.8：出站成功后异步落盘（原文；不阻塞 try_send 热路径）。
+        self.log_outbound_text(&conv.0, text);
+        Ok(())
     }
 
     async fn send_media(&self, _conv: &ConvId, _media: &MediaRef, _hint: &ReplyHint) -> Result<()> {
@@ -990,9 +1197,15 @@ impl Platform for WebPlatform {
             self.card_seq.fetch_add(1, Ordering::Relaxed) + 1
         );
         let payload = CardPayload::from_card(card);
+        // v1.8：终态帧（state=="done"）出站成功后落盘——先留完整 clone
+        //（encode 内截断不影响落盘原文），非终态不 clone 不落盘。
+        let log_card = (payload.state() == "done").then(|| payload.clone());
         let json = encode_card_frame(&self.machine_id, "card", &conv.0, &message_id, &payload)?;
         lock_or_recover(&self.cards).upsert(&conv.0, &message_id, payload);
         self.enqueue(json)?;
+        if let Some(card) = log_card {
+            self.log_terminal_card(&conv.0, &message_id, &card);
+        }
         Ok(Some(message_id))
     }
 
@@ -1004,6 +1217,8 @@ impl Platform for WebPlatform {
         _hint: &ReplyHint,
     ) -> Result<()> {
         let payload = CardPayload::from_card(card);
+        // v1.8：同 send_card——仅终态（state=="done"）落盘，同 messageId 幂等。
+        let log_card = (payload.state() == "done").then(|| payload.clone());
         let json = encode_card_frame(
             &self.machine_id,
             "card_patch",
@@ -1014,7 +1229,11 @@ impl Platform for WebPlatform {
         // 缓存语义是「该 conv 最近卡片」，patch 后直接覆盖（message_id 不匹配
         // 的陈旧 patch 也覆盖为最新——终态以最后一次为准）。
         lock_or_recover(&self.cards).upsert(&conv.0, message_id, payload);
-        self.enqueue(json)
+        self.enqueue(json)?;
+        if let Some(card) = log_card {
+            self.log_terminal_card(&conv.0, message_id, &card);
+        }
+        Ok(())
     }
 
     async fn send_permission_ask(
@@ -1147,6 +1366,7 @@ mod tests {
 
     use super::*;
     use imagent_core::{Backend, CardPhase, CardTerminal};
+    use imagent_store::OutboundRow;
 
     /// 工作空间直测的 machine 断言锚点（出站帧必带，v1.1 语义）。
     const TEST_MACHINE: &str = "test-mac";
@@ -1174,6 +1394,12 @@ mod tests {
     }
 
     async fn offline_platform() -> WebPlatform {
+        offline_platform_with_store(test_store().await).await
+    }
+
+    /// [`offline_platform`] 的 store 注入形态（v1.8 落盘测试用：平台与断言
+    /// 共享同一 store 句柄——落盘是 spawn 出去的异步任务，只能从库侧观测）。
+    async fn offline_platform_with_store(store: Store) -> WebPlatform {
         // Token 凭证 → E2E 身份不装配（无文件 IO），new_with_e2e 的路径仅
         // 满足签名（避免 new 的缺省路径锚定真实 ~/.imagent）。
         let e2e_key = std::env::temp_dir().join("imagent-web-platform-e2e-unused");
@@ -1183,7 +1409,7 @@ mod tests {
             "default".into(),
             "test-mac".into(),
             &e2e_key,
-            test_store().await,
+            store,
             valid_dir(),
             empty_models(),
         )
@@ -1935,5 +2161,216 @@ mod tests {
         cache.upsert("web:c1", "web-card-again", card());
         assert_eq!(cache.entries.len(), CARD_CACHE_MAX_CONVS);
         assert_eq!(cache.entries.get("web:c1").unwrap().1, "web-card-again");
+    }
+
+    // ---- v1.8 出站落盘 + history 泵（outbound_log 读写路径直测：store +
+    // 出站 channel 注入，不经网络；帧映射/组帧字节级见 lib.rs 测试）----
+
+    /// 测试用卡片骨架（phase/terminal 可调）。
+    fn v18_card(text: &str, terminal: CardTerminal) -> OutboundCard {
+        OutboundCard {
+            text: text.into(),
+            tool_calls: vec![],
+            thoughts: vec![],
+            todos: vec![],
+            phase: CardPhase::Outputting,
+            queued_hint: None,
+            run_secs: 1,
+            usage_display: None,
+            task_digest: None,
+            terminal,
+        }
+    }
+
+    /// 等待异步落盘达到目标行数（spawn 的短任务写库，只能轮询观测）。
+    async fn wait_outbound_rows(store: &Store, conv: &str, want: usize) -> Vec<OutboundRow> {
+        for _ in 0..250 {
+            if let Ok(page) = store.list_outbound_since(conv, 0, OUTBOUND_RETAIN).await {
+                if page.rows.len() >= want {
+                    return page.rows;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("等待 outbound_log 落盘 {want} 行超时（5s）");
+    }
+
+    /// 落盘写入点（任务验收项）：text 帧落 kind=text（原文 + at 毫秒）；
+    /// card 流式中间帧（state=streaming）不落；card 终态帧（state=done）落
+    /// kind=card 且同 messageId 幂等（重复终态只落一次）。
+    #[tokio::test]
+    async fn outbound_log_persists_text_and_terminal_card_idempotently() {
+        let store = test_store().await;
+        let p = offline_platform_with_store(store.clone()).await;
+        let conv = ConvId("web:log".into());
+
+        // text 出站成功 → 异步落一行 kind=text（payload 含原文与 at）。
+        p.send_text(&conv, "你好，世界", &ReplyHint::None)
+            .await
+            .unwrap();
+        let rows = wait_outbound_rows(&store, &conv.0, 1).await;
+        assert_eq!(rows[0].kind, "text");
+        let payload: serde_json::Value = serde_json::from_str(&rows[0].payload).unwrap();
+        assert_eq!(payload["text"], "你好，世界", "落盘取 encode 前原文");
+        assert!(
+            payload["at"].as_i64().is_some_and(|a| a > 0),
+            "at 为 unix 毫秒"
+        );
+
+        // 流式中间帧（Running → state=streaming）：不落盘（非终态无 spawn，
+        // 此刻 text 行已确认入库，行数不变即证明）。
+        let msg_id = p
+            .send_card(
+                &conv,
+                &v18_card("流式中", CardTerminal::Running),
+                &ReplyHint::None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .list_outbound_since(&conv.0, 0, OUTBOUND_RETAIN)
+                .await
+                .unwrap()
+                .rows
+                .len(),
+            1,
+            "流式中间帧不应落盘"
+        );
+
+        // 终态 patch（Done → state=done）：落一行 kind=card（messageId + 完整
+        // CardPayload）。
+        p.update_card(
+            &conv,
+            &msg_id,
+            &v18_card("结论", CardTerminal::Done),
+            &ReplyHint::None,
+        )
+        .await
+        .unwrap();
+        let rows = wait_outbound_rows(&store, &conv.0, 2).await;
+        assert_eq!(rows[1].kind, "card");
+        let payload: serde_json::Value = serde_json::from_str(&rows[1].payload).unwrap();
+        assert_eq!(payload["messageId"], msg_id);
+        assert_eq!(payload["card"]["text"], "结论", "CardPayload 完整 JSON");
+        assert_eq!(payload["card"]["terminal"], "done");
+
+        // 同 messageId 重复终态（如 sync 后补 patch）：幂等跳过（register 同步
+        // 拒绝、无 spawn），仍 2 行。
+        p.update_card(
+            &conv,
+            &msg_id,
+            &v18_card("结论2", CardTerminal::Done),
+            &ReplyHint::None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store
+                .list_outbound_since(&conv.0, 0, OUTBOUND_RETAIN)
+                .await
+                .unwrap()
+                .rows
+                .len(),
+            2,
+            "同 messageId 终态只落一次"
+        );
+        drop(p);
+    }
+
+    /// 已落盘终态卡片查重集：重复 register 返回 false；per conv 容量上限
+    /// （超限整 conv 清空重建——契约允许重复行，清空最坏多落一行）。
+    #[test]
+    fn logged_card_ids_register_and_capacity() {
+        let mut ids = LoggedCardIds::default();
+        assert!(ids.register("web:a", "m1"));
+        assert!(!ids.register("web:a", "m1"), "重复 register 拒绝");
+        assert!(ids.register("web:b", "m1"), "跨 conv 互不影响");
+        for i in 0..LOGGED_CARDS_PER_CONV {
+            assert!(ids.register("web:a", &format!("n{i}")));
+        }
+        // 容量满后：老 id 被清掉（可重复 register，语义退化为可能多落一行）、
+        // 新 id 仍正常登记。
+        assert!(
+            ids.register("web:a", "m1"),
+            "清空后旧 id 可再登记（best-effort）"
+        );
+        assert!(ids.register("web:a", "fresh"));
+        assert!(!ids.register("web:a", "fresh"));
+    }
+
+    /// history_query 处理回帧（任务验收项）：全量（since=0）/ 增量（since=
+    /// 水位）/ 空（新会话 entries=[] + lastSeq=0，浏览器只更新水位）。条目
+    /// 形态与帧字段逐字断言（字节级契约）；trimmed 分支在此不可达——查询
+    /// 上限与 GC 保留同为 500 条，`since 之后超过 500 行` 需保留量 > 500，
+    /// 由 store 层（小 limit 参数）与 encode 层（lib.rs）分别钉住。
+    #[tokio::test]
+    async fn history_query_replies_full_incremental_and_empty() {
+        let store = test_store().await;
+        let (tx, mut rx) = mpsc::channel::<String>(32);
+
+        // 种子：text / card / text 三行（与生产同路径 append_outbound）。
+        store
+            .append_outbound("web:h", "text", r#"{"text":"第一条","at":100}"#)
+            .await
+            .unwrap();
+        store
+            .append_outbound(
+                "web:h",
+                "card",
+                r#"{"messageId":"web-card-1","card":{"text":"结论","terminal":"done"}}"#,
+            )
+            .await
+            .unwrap();
+        store
+            .append_outbound("web:h", "text", r#"{"text":"第三条","at":300}"#)
+            .await
+            .unwrap();
+
+        // 全量（since=0）。
+        handle_history_query(TEST_MACHINE, &store, "web:h", 0, &tx).await;
+        let v: serde_json::Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(v["v"], 1);
+        assert_eq!(v["type"], "history");
+        assert_eq!(v["machine"], TEST_MACHINE, "出站帧带本机 machine");
+        assert_eq!(v["convId"], "web:h", "convId 同请求原样");
+        assert_eq!(v["lastSeq"], 3);
+        assert_eq!(v["trimmed"], false);
+        let entries = v["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0]["kind"], "text");
+        assert_eq!(entries[0]["key"], "h:1");
+        assert_eq!(entries[0]["text"], "第一条");
+        assert_eq!(entries[0]["at"], 100);
+        assert_eq!(entries[1]["kind"], "card");
+        assert_eq!(entries[1]["key"], "h:2");
+        assert_eq!(entries[1]["messageId"], "web-card-1");
+        assert_eq!(entries[1]["card"]["terminal"], "done");
+        assert_eq!(entries[1]["state"], "done");
+        assert_eq!(entries[2]["key"], "h:3", "seq 升序");
+
+        // 增量（since=1）：只回 seq>1 的行，lastSeq 仍报全量水位。
+        handle_history_query(TEST_MACHINE, &store, "web:h", 1, &tx).await;
+        let v: serde_json::Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        let entries = v["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["key"], "h:2");
+        assert_eq!(entries[1]["key"], "h:3");
+        assert_eq!(v["lastSeq"], 3);
+
+        // 空增量（since=最大 seq）：entries=[] + lastSeq 照发。
+        handle_history_query(TEST_MACHINE, &store, "web:h", 3, &tx).await;
+        let v: serde_json::Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(v["entries"].as_array().map(Vec::len), Some(0));
+        assert_eq!(v["lastSeq"], 3, "空增量仍报水位");
+        assert_eq!(v["trimmed"], false);
+
+        // 新会话（无任何记录）：entries=[] + lastSeq=0。
+        handle_history_query(TEST_MACHINE, &store, "web:fresh", 0, &tx).await;
+        let v: serde_json::Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(v["entries"].as_array().map(Vec::len), Some(0));
+        assert_eq!(v["lastSeq"], 0);
+        assert_eq!(v["trimmed"], false);
     }
 }
