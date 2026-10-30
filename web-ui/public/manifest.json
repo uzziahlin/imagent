@@ -1,0 +1,19 @@
+{
+  "name": "imagent Web 驾驶舱",
+  "short_name": "imagent",
+  "description": "imagent 的浏览器驾驶舱：消息流、工具卡片与审批。",
+  "start_url": "/imagent/",
+  "scope": "/imagent/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#020617",
+  "theme_color": "#020617",
+  "icons": [
+    {
+      "src": "/imagent/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

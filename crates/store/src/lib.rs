@@ -19,7 +19,8 @@ pub use error::{Result, StoreError};
 pub use schema::SCHEMA_VERSION;
 pub use store::{
     AllowedSenderRow, AuditRow, CredentialForms, CronJobRow, LiveCardRow, NamedSessionRow,
-    OutboxRow, RunStatRow, SessionHistoryRow, SessionRow, Store, OUTBOX_MAX_ATTEMPTS,
+    OutboundPage, OutboundRow, OutboxRow, RunStatRow, SessionHistoryRow, SessionRow, Store,
+    OUTBOUND_RETAIN, OUTBOX_MAX_ATTEMPTS,
 };
 
 /// bundled SQLite 编译期版本（libsqlite3-sys 的 `SQLITE_VERSION` 常量）。

@@ -22,6 +22,7 @@ use tracing_subscriber::EnvFilter;
 
 mod backup;
 mod delegate;
+mod join;
 mod ops;
 mod service;
 mod setup;
@@ -82,6 +83,23 @@ enum Cmd {
         #[arg(long)]
         platform: Option<String>,
     },
+    /// 新 Mac 网关接入向导（Web 驾驶舱多终端，零 token）：交互式/参数式收集
+    /// relay 地址、机器名、工作目录 → 幂等装配网关密钥（ed25519 认证 + E2E，
+    /// 复用既有身份**绝不重建**）→ 合并写 config.toml 四键（platforms =
+    /// ["web","local"] / web_relay_url / web_machine_id / default_workdir，
+    /// 其余键保留）→ 打印 64 hex 公钥 + 指纹 + 网页管理页「添加机器」登记
+    /// 引导。缺参时逐项交互录入；全参数可脚本化零交互。
+    Join {
+        /// relay 网关端点（wss://<ecs>:8443/imagent/gateway；缺省交互录入）。
+        #[arg(long)]
+        relay: Option<String>,
+        /// 机器名（1..=32 [a-zA-Z0-9_-]；缺省 hostname 短名）。
+        #[arg(long)]
+        name: Option<String>,
+        /// agent 工作根目录（绝对路径，须存在；过宽位置拒绝）。
+        #[arg(long, value_name = "DIR")]
+        workdir: Option<PathBuf>,
+    },
     /// 服务自管理（P6-6）：安装/卸载/查询 OS 级后台服务（macOS launchd /
     /// Linux systemd 用户单元），注册当前二进制与 --profile。
     Service {
@@ -138,6 +156,15 @@ enum Cmd {
         /// 路径），然后退出。一键配置用。
         #[arg(long)]
         print_config: bool,
+    },
+    /// 本地终端（完全体）：连接运行中网关的 local 平台（`~/.imagent/local.sock`），
+    /// 会话从网关出生（conv `local:<会话名>`）。**终端只是视图**——Ctrl-C / exit
+    /// 仅退出本视图，会话继续在网关跑（重入续看 / 网页侧接管）。需网关以
+    /// platforms 含 "local" 启动（`imagent start`）；网关未运行时退出码 2。
+    Claude {
+        /// 会话名（缺省 default；conv 形如 local:<名>，与 IM/web 共享同一
+        /// Dispatcher 管线：steering / 审批 / /stop 全可用）。
+        session: Option<String>,
     },
 }
 
@@ -651,47 +678,49 @@ async fn main() -> Result<()> {
             // 凭据（读取对旧的无 profile 键 fallback，存量部署零迁移）。
             store.set_keyring_scope(cli.profile.as_deref().unwrap_or(""));
 
-            // 3. platform —— CLI 显式优先，否则 config.platform（未写 = ilink 默认）。
+            // 3. platform —— CLI 显式优先（单平台），否则 config.platforms 多平台
+            // 列表，最后回退 config.platform 单值（未写 = ilink 默认）。
             // 修复（2026-08-24）：此前 CLI 硬默认 ilink——config 写了 feishu/wecom 的
             // 用户不带 --platform 启动会误走 ilink（service install 的守护进程即中招）。
-            let platform_name = platform
-                .as_deref()
-                .filter(|p| !p.is_empty())
-                .unwrap_or(&config.platform);
-            if platform_name != "ilink" && platform_name != "wecom" && platform_name != "feishu" {
-                return Err(anyhow!(
-                    "未知 platform={platform_name}，支持 ilink | wecom | feishu"
-                ));
-            }
-            let platform = build_platform(platform_name, &config, store.clone()).await?;
-
-            // Wave C（出站可靠性收敛）：未知 kind sweeper——outbox 行的 kind
-            // 不属于当前在跑的 driver（如平台从 config 撤下后的历史积压、kind
-            // 拼写漂移）时推后 + 告警 + 超限回收，防永久滞留撑表（v14 P3o
-            // 防御的泛化形态，见 core::outbox 模块文档）。ilink 无 outbox
-            // kind（不接入的决策同样记档在那里），空名单即清剿全部历史行。
-            {
-                let driven_kinds: Vec<&str> = match platform_name {
-                    "feishu" => vec![imagent_feishu::OUTBOX_KIND],
-                    "wecom" => vec![imagent_wecom::OUTBOX_KIND],
-                    _ => Vec::new(),
+            // M2.5：platforms 列表非空时多平台并存（如 feishu + web——IM 做轻通知
+            // 兜底、web 做驾驶舱），由 core::MultiPlatform 组合器合并为一个
+            // Arc<dyn Platform>，Dispatcher 零改动；CLI --platform 显式给了则忽略
+            // 列表（命令行意图最明确）。
+            let platform_names: Vec<String> =
+                if let Some(p) = platform.as_deref().filter(|p| !p.is_empty()) {
+                    vec![p.to_string()]
+                } else if !config.platforms.is_empty() {
+                    config.platforms.clone()
+                } else {
+                    vec![config.platform.clone()]
                 };
-                imagent_core::outbox::spawn_unknown_kind_sweeper(store.clone(), &driven_kinds);
+            for n in &platform_names {
+                if n != "ilink" && n != "wecom" && n != "feishu" && n != "web" && n != "local" {
+                    return Err(anyhow!(
+                        "未知 platform={n}，支持 ilink | wecom | feishu | web | local"
+                    ));
+                }
             }
+            // 展示名：单平台即名字；多平台并列（+ 连接，仅日志 / /health 展示）。
+            let platform_name = platform_names.join("+");
 
             // T12：Bitable 数据面启用判定（claude 运行参数 --bitable 与
             // Dispatcher 注入共用同一判定）；未启用原因一次性 warn（缺一/非
             // feishu 平台——配置了但无效的场景给用户看得见的反馈）。
-            ops::warn_bitable_disable_reason(&config, platform_name);
-            let bitable_on = config.bitable_enabled_for(platform_name);
-
-            // 孤儿流式卡片关流（P4_ROADMAP 第六批）：上次进程退出时滞留「生成中」的
-            // 卡片按 store 登记逐张 patch 成「已中断」，失败保留登记下次再试。
-            imagent_core::sweep_live_cards(&store, platform.as_ref()).await;
+            // M2.5：bitable 等按平台名特判的判定取任一子平台命中（feishu+web
+            // 时数据面仍应挂上）；名字参数 = 命中名（无命中给并列展示名，仅
+            // 影响未启用原因的提示文案）。
+            let any_feishu = platform_names.iter().any(|n| n == "feishu");
+            let bitable_view: &str = if any_feishu { "feishu" } else { &platform_name };
+            ops::warn_bitable_disable_reason(&config, bitable_view);
+            let bitable_on = config.bitable_enabled_for(bitable_view);
 
             // 6. backend —— permission_mode 用共享句柄，SIGHUP 热重载即时生效。
             // auto（缺省）先按后端解析成具体档：claude-cli → ask（IM 审批闭环），
             // 其余 → off（闭环未接，靠各自 sandbox 兜底）。
+            // v1.8 模型菜单：backend **先于 platform 装配**——web 分支构造
+            // WebPlatform 需注入 backend 句柄（workspaces 快照 models 段的
+            // current = backend.model()，/model 命令热设值）。
             let perm_resolved = ops::resolve_permission_mode(config.permission_mode, &config.agent);
             if config.permission_mode == imagent_core::PermissionMode::Auto {
                 tracing::info!(
@@ -728,6 +757,48 @@ async fn main() -> Result<()> {
                 );
             }
 
+            // platform 装配（v1.8：移到 backend 就绪之后——web 分支注入
+            // backend clone，见上）：CLI 显式优先（单平台），否则
+            // config.platforms 多平台列表，最后回退 config.platform 单值。
+            let platform = if platform_names.len() == 1 {
+                build_platform(&platform_names[0], &config, store.clone(), &backend).await?
+            } else {
+                let mut children = Vec::with_capacity(platform_names.len());
+                for n in &platform_names {
+                    children.push(build_platform(n, &config, store.clone(), &backend).await?);
+                }
+                tracing::info!(
+                    target: "imagent::ops",
+                    platforms = %platform_name,
+                    "多平台并存：MultiPlatform 组合器合并子平台（Dispatcher 零改动）"
+                );
+                Arc::new(imagent_core::MultiPlatform::new(children)?)
+                    as Arc<dyn imagent_core::Platform>
+            };
+
+            // Wave C（出站可靠性收敛）：未知 kind sweeper——outbox 行的 kind
+            // 不属于当前在跑的 driver（如平台从 config 撤下后的历史积压、kind
+            // 拼写漂移）时推后 + 告警 + 超限回收，防永久滞留撑表（v14 P3o
+            // 防御的泛化形态，见 core::outbox 模块文档）。ilink 无 outbox
+            // kind（不接入的决策同样记档在那里），空名单即清剿全部历史行。
+            {
+                // M2.5：多平台下 outbox kind 名单取**全部**子平台的并集——漏列
+                // 会让某个在跑平台的合法积压行被 sweeper 当未知 kind 回收。
+                let driven_kinds: Vec<&str> = platform_names
+                    .iter()
+                    .flat_map(|n| match n.as_str() {
+                        "feishu" => vec![imagent_feishu::OUTBOX_KIND],
+                        "wecom" => vec![imagent_wecom::OUTBOX_KIND],
+                        _ => Vec::new(),
+                    })
+                    .collect();
+                imagent_core::outbox::spawn_unknown_kind_sweeper(store.clone(), &driven_kinds);
+            }
+
+            // 孤儿流式卡片关流（P4_ROADMAP 第六批）：上次进程退出时滞留「生成中」的
+            // 卡片按 store 登记逐张 patch 成「已中断」，失败保留登记下次再试。
+            imagent_core::sweep_live_cards(&store, platform.as_ref()).await;
+
             // B3/T4：能力面矩阵告警统一收敛到 Dispatcher（run 启动 + SIGHUP +
             // /perm 三点位，按 Backend 能力位判定而非后端名硬编码）：
             // - 闭环档位（ask/auto-claude）×非 FullLoop：run() 启动 fail-closed 拒绝；
@@ -736,7 +807,7 @@ async fn main() -> Result<()> {
 
             // 7. auth —— 白名单：config 种子 ∪ store 已有（CLI /allow 或 IM /allow 持久化）；
             //    会话（群）白名单同构（P4-5）。
-            let initial = ops::union_config_store(
+            let mut initial = ops::union_config_store(
                 &config.allowed_senders,
                 store.list_allowed_senders().await.unwrap_or_default(),
             );
@@ -744,14 +815,33 @@ async fn main() -> Result<()> {
                 &config.allowed_chats,
                 store.list_allowed_chats().await.unwrap_or_default(),
             );
+            // local 平台：本地终端 sender（local:user）自动白名单 + 管理员。
+            // 凭证链 = local.sock 0600 + peer uid 校验（LocalPlatform accept 侧）
+            // ——同 uid 即机器本主，与 CLI `imagent allow` 的「本地最高权限」
+            // 同级；不自动放行会让 `imagent claude` 的消息被白名单静默丢弃，
+            // 「终端照常用」不成立。副作用：原本全空白的名单（发现模式）因
+            // local:user 进入而关闭——挂 local 的部署本就默认信任终端操作者，
+            // IM 侧首次授权仍可经私聊陌生人引导（stranger_p2p_hint 默认开）完成。
+            if platform_names.iter().any(|n| n == "local")
+                && !initial.iter().any(|s| s == "local:user")
+            {
+                initial.push("local:user".to_string());
+            }
             let auth = imagent_core::Auth::with_chats(initial, initial_chats);
             let discovery = auth.is_discovery();
 
             // P7-A1：管理员 = config 种子 ∪ store 动态条目（/admin add 持久化）。
-            let initial_admins = ops::union_config_store(
+            let mut initial_admins = ops::union_config_store(
                 &config.admin_senders,
                 store.list_admin_senders().await.unwrap_or_default(),
             );
+            // local:user 同进管理员（同 uid 终端 = 机器本主，/config /admin 等
+            // 管理命令对终端可用；非提权——同 uid 本可直接改 config / 跑 CLI）。
+            if platform_names.iter().any(|n| n == "local")
+                && !initial_admins.iter().any(|s| s == "local:user")
+            {
+                initial_admins.push("local:user".to_string());
+            }
 
             // S2（v7 review）：admin_senders 为空 = 无人可 admin（IM 内管理命令
             // 一律拒绝，提示走 CLI/setup 配置）。群放行时空管理员不再有扩权风险，
@@ -803,7 +893,7 @@ async fn main() -> Result<()> {
             dispatcher.set_approval_tools(config.approval_tools.clone());
             // T12：Bitable 数据面注入（platform=feishu 且 app_token/table_id 齐备
             // → feishu 实现挂进 Dispatcher；socket kind=bitable 请求经它落飞书）。
-            ops::apply_bitable(&dispatcher, &config, platform_name);
+            ops::apply_bitable(&dispatcher, &config, bitable_view);
             // v1.32：OS 级沙箱注入（claude-cli 句柄 + 计划返给 delegate 的
             // claude 副后端；Linux 无 bwrap 降级 off 的 warn 在装配函数内打）。
             let sandbox_plan = ops::apply_agent_sandbox(claude_cli_handle.as_deref(), &config);
@@ -943,7 +1033,8 @@ async fn main() -> Result<()> {
 
             // P3-h（code-review v14）：wecom 的 /health logged_in 预判定——secret
             // 可能在 store（login wecom）也可能在 config，按存在性取并。
-            let wecom_logged_in_hint = if platform_name == "wecom" {
+            // M2.5：多平台时任一子平台为 wecom 即预算 hint。
+            let wecom_logged_in_hint = if platform_names.iter().any(|n| n == "wecom") {
                 let in_store = http_store
                     .first_credential("wecom")
                     .await
@@ -956,11 +1047,20 @@ async fn main() -> Result<()> {
 
             dispatcher.startup_recovery().await;
             if let Some(listener) = metrics_listener {
+                // M2.5：/health 的 logged_in 按平台名判定（feishu→env、
+                // ilink→store 凭据名）——多平台并列名（如 "feishu+web"）会破坏
+                // 这两类判定，取第一个可判定的子平台名（纯 web 组合无凭据面，
+                // 沿用并列名 → store 查无 → false，与单 web 平台现状一致）。
+                let health_platform: String = platform_names
+                    .iter()
+                    .find(|n| matches!(n.as_str(), "feishu" | "wecom" | "ilink"))
+                    .cloned()
+                    .unwrap_or_else(|| platform_name.clone());
                 ops::spawn_metrics_server(
                     listener,
                     http_store.clone(),
                     start_at,
-                    platform_name.to_string(),
+                    health_platform,
                     http_token,
                     wecom_logged_in_hint,
                     webhook_listening,
@@ -985,7 +1085,9 @@ async fn main() -> Result<()> {
                 claude_cli_handle,
                 config_path.clone(),
                 http_store.clone(),
-                platform_name.to_string(),
+                // SIGHUP 侧只用它做 bitable 的 feishu 判定（见 ops.rs
+                // apply_claude_runtime_opts / apply_bitable），多平台给命中名。
+                bitable_view.to_string(),
                 ops::HotReloadSnapshot::of(&config),
             );
             #[cfg(not(unix))]
@@ -1178,6 +1280,14 @@ async fn main() -> Result<()> {
         Cmd::Setup { platform } => {
             setup::run(platform).await?;
         }
+        Cmd::Join {
+            relay,
+            name,
+            workdir,
+        } => {
+            // 参数接线即全部（逻辑在 join 模块，便于单测）。
+            join::run(relay, name, workdir)?;
+        }
         Cmd::Service { action } => {
             // service 定义随 --profile 隔离（com.imagent[.<profile>]）。
             match action {
@@ -1316,6 +1426,16 @@ async fn main() -> Result<()> {
                 tracing::error!(target: "imagent::mcp", error = %e, "MCP ask server 退出");
             }
         }
+        Cmd::Claude { session } => {
+            // 本地终端客户端：连网关 local.sock（local 平台，unix socket）。
+            // 只做视图——本进程不持实例锁、不驱动 agent；Ctrl-C 退出由
+            // term::run 内部处理（不向网关发停止信号）。退出码 2 = 网关未运行。
+            let socket = data_dir.join("local.sock");
+            let code = imagent_localterm::term::run(&socket, session)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
     }
 
     Ok(())
@@ -1414,7 +1534,9 @@ fn build_backend(
 // Platform 选择：按 platform 名选用 ilink 或 wecom。
 // ---------------------------------------------------------------------------
 
-/// 按 platform 名选择 Platform 实例。
+/// 按 platform 名选择 Platform 实例。`backend` 为已装配的 agent 后端句柄
+/// （v1.8：仅 web 分支消费——注入 WebPlatform 作 workspaces 快照 models
+/// 段的 current 数据源 backend.model()；其余分支忽略）。
 ///
 /// - `"wecom"` → [`imagent_wecom::WeComPlatform`]：`bot_id` 取自 config（非敏感）；
 ///   `secret` 优先取 store 凭据（`imagent login wecom`，keyring/加密落盘），
@@ -1422,12 +1544,24 @@ fn build_backend(
 /// - `"feishu"` → [`imagent_feishu::FeishuPlatform`]：`feishu_app_id` 取自 config，
 ///   `app_secret` 取自环境变量 `IMAGENT_FEISHU_APP_SECRET`（keyring bootstrap 为后续 P2），
 ///   默认 `base_url = https://open.feishu.cn`。
+/// - `"web"` → [`imagent_web::WebPlatform`]（Web 驾驶舱 M2/M5）：`web_relay_url` 取自
+///   config；gateway 认证凭证 v1.3 起 **key 优先 token 回退**——密钥文件
+///   `<imagent_home>/web-gateway-key`（首次启动自动生成 ed25519 密钥对并打印
+///   公钥指引，0600），env `IMAGENT_WEB_GATEWAY_TOKEN` 为密钥文件损坏时的
+///   回退（v1.2 兼容路径）；`web_default_session` 缺省 "default"；machine
+///   身份 = `web_machine_id` 显式值 / 缺省 hostname 短名（M5 多终端，hello
+///   自报给 relay）。
+/// - `"local"` → [`imagent_localterm::LocalPlatform`]（本地终端，`imagent claude`）：
+///   **无 config 字段**——socket 锚定 `<imagent_home>/local.sock`，凭证 = 文件
+///   0600 + accept 侧 peer uid 校验（同 uid = 机器本主），无可配凭据。会话
+///   conv 形如 `local:<会话名>`，与 IM/web 并存（MultiPlatform 前缀路由）。
 /// - 其它（含默认 `"ilink"`）→ [`imagent_ilink::ILinkPlatform`]，
 ///   行为与单平台时期完全一致（读 store 的 ilink 凭据 + 扫码登录的 client）。
 async fn build_platform(
     name: &str,
     config: &imagent_core::Config,
     store: imagent_store::Store,
+    backend: &Arc<dyn imagent_core::Backend>,
 ) -> Result<Arc<dyn imagent_core::Platform>> {
     match name {
         "wecom" => {
@@ -1502,6 +1636,60 @@ async fn build_platform(
                 config.feishu_urgent_on_ask,
                 config.feishu_group_context_messages,
             )?))
+        }
+        "web" => {
+            // Web 驾驶舱 M2：relay 地址（非敏感）走 config；machine 身份与
+            // 默认会话同既有。gateway 认证凭证（v1.3）**key 优先 token
+            // 回退**：密钥文件锚定 imagent home（与 local.sock 同款注入——
+            // main 计算路径，imagent_web 读/生成，不硬编 home），首次启动
+            // 自动生成 ed25519 密钥对（0600 + warn 打印公钥与 ECS 配置
+            // 指引）；env IMAGENT_WEB_GATEWAY_TOKEN 降级为密钥文件损坏时
+            // 的回退（v1.2 兼容路径）——两者皆不可用才报启动错误
+            //（fail-closed，relay 无匿名形态）。
+            let relay_url = config.web_relay_url.clone().ok_or_else(|| {
+                anyhow!("platform=web 需在 config.toml 配置 web_relay_url（如 wss://<ecs>:8443/imagent/gateway）")
+            })?;
+            let gateway_token = std::env::var("IMAGENT_WEB_GATEWAY_TOKEN")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
+            let key_path = imagent_core::paths::imagent_home().join("web-gateway-key");
+            let credential = imagent_web::key::load_gateway_credential(&key_path, gateway_token)
+                .map_err(|e| anyhow!("platform=web 网关认证凭证装配失败：{e}"))?;
+            let default_session = config
+                .web_default_session
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
+            // M5 多终端：machine 身份 = config 显式值 / 缺省 hostname 短名
+            //（imagent_web 内规范化 + 回退 default），hello 自报给 relay。
+            let machine_id = imagent_web::resolve_machine_id(config.web_machine_id.as_deref());
+            // v1.6 工作空间：注入 store 句柄 + default_workdir（workspace 泵
+            // 直接读写 workspace:/workdir: KV——与终端 /ws /cd 同源互通，
+            // 快照 default 字段取 default_workdir）。
+            // v1.8 模型目录：注入 backend 句柄（快照 models.current =
+            // backend.model()，/model 命令热设值）+ config official_models
+            // （CLI ~/.claude/settings.json 无 ANTHROPIC_DEFAULT_* 映射时的
+            // 官方回退列表）。
+            Ok(Arc::new(imagent_web::WebPlatform::new(
+                relay_url,
+                credential,
+                default_session,
+                machine_id,
+                store.clone(),
+                config.default_workdir.clone(),
+                imagent_web::models::ModelsContext {
+                    backend: backend.clone(),
+                    official: config.official_models.clone(),
+                },
+            )))
+        }
+        "local" => {
+            // 本地终端平台：socket 锚定 imagent home（与 permission.sock 同目录
+            // 约定；--profile 经 IMAGENT_HOME 自动隔离）。无 config 字段——
+            // 本地 socket 的凭证是 0600 权限 + peer uid，无可配凭据。bind 失败
+            // fail-closed（Err 上抛，启动期暴露）。
+            let socket = imagent_core::paths::imagent_home().join("local.sock");
+            Ok(Arc::new(imagent_localterm::LocalPlatform::new(socket)?))
         }
         _ => {
             // 默认 ilink：保持既有行为。

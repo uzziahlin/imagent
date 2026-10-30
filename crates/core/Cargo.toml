@@ -26,3 +26,8 @@ rand = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# multi_platform 泵退避测试用 start_paused（拨钟跳过退避等待）——test-util
+# 不在 workspace tokio "full" 特性内，仅测试面引入。
+tokio = { workspace = true, features = ["test-util"] }

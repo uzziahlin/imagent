@@ -1,0 +1,263 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * 深浅色跟随系统 prefers-color-scheme（M3b 约定：无手动切换开关）。
+ * 语义变量 → tailwind 语义色（tailwind.config.js）：surface/panel/panel2/code/
+ * line/line-strong/ink/muted/faint/ghost + 语义强调色 ok/warn/err/info/think。
+ * 少量 alpha 叠加的强调色块（如审批弹层）用 dark: 变体（darkMode: "media"）。
+ */
+:root {
+  color-scheme: light dark;
+  --c-bg: #f6f8fb;
+  --c-panel: rgba(255, 255, 255, 0.85);
+  --c-panel2: #e9eef5;
+  --c-code: #eef2f7;
+  --c-line: #e2e8f0;
+  --c-line-strong: #cbd5e1;
+  --c-ink: #0f172a;
+  --c-muted: #475569;
+  --c-faint: #64748b;
+  --c-ghost: #94a3b8;
+  --c-ok: #047857;
+  --c-warn: #b45309;
+  --c-err: #be123c;
+  --c-info: #0369a1;
+  --c-think: #6d28d9;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --c-bg: #020617;
+    --c-panel: rgba(15, 23, 42, 0.72);
+    --c-panel2: #1e293b;
+    --c-code: #0b1220;
+    --c-line: #1e293b;
+    --c-line-strong: #334155;
+    --c-ink: #e2e8f0;
+    --c-muted: #94a3b8;
+    --c-faint: #64748b;
+    --c-ghost: #475569;
+    --c-ok: #34d399;
+    --c-warn: #fbbf24;
+    --c-err: #fb7185;
+    --c-info: #38bdf8;
+    --c-think: #a78bfa;
+  }
+}
+
+html,
+body,
+#root {
+  /* 回退：不支持 dvh 的旧浏览器（Safari <15.4 / Chrome <108） */
+  height: 100vh;
+  /* 锁 document 滚动：聚焦输入框时 iOS 只能滚内部消息容器，页面壳永不被顶起 */
+  overflow: hidden;
+}
+
+html,
+body {
+  /* 防 iOS 橡皮筋把 document 拖出（内部消息容器已有 overscroll-contain 不受影响） */
+  overscroll-behavior: none;
+}
+
+/*
+ * 满高容器：100dvh 让布局高度随浏览器工具栏收展平滑变化；--vvh（main.tsx
+ * 用 visualViewport 实高维护）优先级更高 —— 软键盘在 iOS Safari 与 Android
+ * Chrome 默认（interactive-widget=resizes-visual）下只缩小 visualViewport、
+ * 100dvh 并不收缩，聚焦底部输入框时整页被顶起、失焦再弹回。--vvh 使
+ * html/body/#root 与可见区域一致，键盘收展时高度平滑跟随。
+ */
+@supports (height: 100dvh) {
+  html,
+  body,
+  #root {
+    height: var(--vvh, 100dvh);
+  }
+}
+
+body {
+  @apply bg-surface text-ink antialiased;
+}
+
+/* ---------------------------------------------------------------------------
+ * 微动效系统偏好：用户开启「减弱动态效果」时禁用全部动画/过渡（含 tailwind
+ * keyframes：fade-in / slide-in / breathe / pulse / spin——无限动画同时截断
+ * iteration，呼吸点等彻底静止）。
+ * --------------------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * 细滚动条（桌面 webkit + Firefox thin；移动端原生覆盖式滚动条不受影响）。
+ * 主题色跟随语义变量（浅色 line-strong / 暗色同变量自动切换）。
+ * --------------------------------------------------------------------------- */
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--c-line-strong);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--c-ghost);
+}
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--c-line-strong) transparent;
+}
+
+/* 按钮按压反馈（消息复制/发送/审批等小操作钮；大列表项与输入控件不加） */
+@layer components {
+  .press {
+    @apply transition-[transform,background-color,border-color,color] duration-100 ease-out active:scale-95;
+  }
+}
+
+/* markdown 排版（.md 命名空间；渲染入口统一在 MarkdownText，安全清洗见该组件） */
+@layer components {
+  .md {
+    @apply break-words text-sm leading-relaxed text-ink;
+  }
+  .md > :first-child {
+    margin-top: 0;
+  }
+  .md > :last-child {
+    margin-bottom: 0;
+  }
+  .md p {
+    @apply my-1.5 whitespace-pre-wrap;
+  }
+  .md h1,
+  .md h2,
+  .md h3,
+  .md h4 {
+    @apply mb-1 mt-3 font-semibold text-ink;
+  }
+  .md h1 {
+    @apply text-base;
+  }
+  .md h2 {
+    @apply text-[15px];
+  }
+  .md h3,
+  .md h4 {
+    @apply text-sm;
+  }
+  .md ul {
+    @apply my-1.5 list-disc pl-5;
+  }
+  .md ol {
+    @apply my-1.5 list-decimal pl-5;
+  }
+  .md li {
+    @apply my-0.5;
+  }
+  .md code {
+    @apply rounded bg-code px-1 py-0.5 font-mono text-[13px] text-ok;
+  }
+  .md pre {
+    @apply overflow-x-auto p-3;
+  }
+  /* 代码块外壳（MarkdownText 的 CodeBlock）：头部语言标签/复制条 + 横滚正文。
+   * pre 的圆角/边框/底色上收到外壳（头部条与正文同底同框）。 */
+  .md .code-block pre {
+    @apply my-0;
+  }
+  .md pre code {
+    @apply bg-transparent p-0 text-ink;
+  }
+  .md blockquote {
+    @apply my-1.5 border-l-2 border-line-strong pl-3 text-muted;
+  }
+  .md hr {
+    @apply my-3 border-line;
+  }
+  .md table {
+    @apply my-2 w-full text-left text-xs;
+  }
+  .md th,
+  .md td {
+    @apply border border-line px-2 py-1;
+  }
+  .md a {
+    @apply break-all text-info underline underline-offset-2;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * highlight.js token 主题（rehype-highlight 输出的 .hljs-* class；作用域限定
+ * .md）。颜色直接复用语义变量（think/ok/warn/info/err/faint/muted）——深浅色
+ * 随 prefers-color-scheme 切换变量值，无需两套主题文件，产物零 CSS 依赖。
+ * --------------------------------------------------------------------------- */
+.md .hljs-comment,
+.md .hljs-quote {
+  color: var(--c-faint);
+  font-style: italic;
+}
+.md .hljs-keyword,
+.md .hljs-selector-tag,
+.md .hljs-template-tag,
+.md .hljs-doctag,
+.md .hljs-name,
+.md .hljs-tag {
+  color: var(--c-think);
+}
+.md .hljs-string,
+.md .hljs-regexp,
+.md .hljs-addition {
+  color: var(--c-ok);
+}
+.md .hljs-number,
+.md .hljs-literal,
+.md .hljs-symbol,
+.md .hljs-bullet,
+.md .hljs-link {
+  color: var(--c-warn);
+}
+.md .hljs-title,
+.md .hljs-title.function_,
+.md .hljs-section,
+.md .hljs-built_in,
+.md .hljs-type {
+  color: var(--c-info);
+}
+.md .hljs-attr,
+.md .hljs-attribute,
+.md .hljs-variable.language_,
+.md .hljs-template-variable,
+.md .hljs-selector-attr,
+.md .hljs-selector-class,
+.md .hljs-selector-id {
+  color: var(--c-err);
+}
+.md .hljs-meta,
+.md .hljs-meta .hljs-keyword {
+  color: var(--c-muted);
+}
+.md .hljs-operator,
+.md .hljs-punctuation {
+  color: var(--c-muted);
+}
+.md .hljs-deletion {
+  color: var(--c-err);
+}
+.md .hljs-emphasis {
+  font-style: italic;
+}
+.md .hljs-strong {
+  font-weight: 600;
+}

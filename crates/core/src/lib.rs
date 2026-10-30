@@ -29,6 +29,7 @@ pub mod lineio;
 pub mod mcp;
 mod message;
 pub mod metrics;
+mod multi_platform;
 pub mod outbox;
 pub mod paths;
 mod permission;
@@ -37,6 +38,7 @@ pub mod render;
 pub mod sandbox;
 pub mod session_scan;
 mod types;
+pub mod workspace;
 
 pub use auth::Auth;
 pub use backend::{Backend, ImPermissionAsk, ImPermissionHook, PermissionCapability};
@@ -52,8 +54,10 @@ pub use dispatch::{Dispatcher, TaskBudgets, WebhookExposure};
 pub use error::{CoreError, Result};
 pub use message::split_message;
 pub use metrics::Metrics;
+pub use multi_platform::MultiPlatform;
 pub use permission::{
-    default_sock_path, needs_approval, parse_reply, PermissionReply, PermissionRouter,
+    default_sock_path, is_explicit_reply_word, needs_approval, parse_reply, PermissionReply,
+    PermissionRouter,
 };
 pub use platform::{command_card_fallback_text, Platform, PlatformCaps};
 pub use sandbox::{resolve as resolve_sandbox, SandboxPlan, SandboxSpec, SandboxTier};
@@ -63,3 +67,4 @@ pub use types::{
     OutboundCard, ReplyHint, RunOutcome, SessionId, TodoItem, TodoStatus, ToolCall, UsageStats,
     UserId, Workdir, CARD_HANDLE_LOST,
 };
+pub use workspace::{workdir_key, workspace_key, WorkspaceRecord};

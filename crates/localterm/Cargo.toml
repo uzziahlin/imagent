@@ -1,0 +1,24 @@
+[package]
+name = "imagent-localterm"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+imagent-core = { path = "../core" }
+tokio = { workspace = true }
+# 停机通路（对齐 wecom/web）：平台 drop 即 cancel，accept/连接任务连动退出。
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+# peer uid 校验（SO_PEERCRED / LOCAL_PEERCRED；实现同 core dispatch::socket 先例，
+# core 侧函数是 pub(crate) 不可复用，本 crate 自持一份）。
+libc = "0.2"
+# 终端客户端行编辑/历史（term.rs）。
+rustyline = { workspace = true }

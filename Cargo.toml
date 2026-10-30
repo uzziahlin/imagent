@@ -4,7 +4,7 @@
 [workspace]
 resolver = "2"
 exclude = ["fuzz"]  # cargo-fuzz 独立 crate（需 nightly，E-7）
-members = ["crates/store", "crates/core", "crates/claude", "crates/codex", "crates/gemini", "crates/ilink", "crates/wecom", "crates/feishu"]
+members = ["crates/store", "crates/core", "crates/claude", "crates/codex", "crates/gemini", "crates/ilink", "crates/wecom", "crates/feishu", "crates/relay", "crates/web", "crates/localterm"]
 
 [workspace.package]
 version = "1.32.0"
@@ -54,6 +54,10 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 qrcode = "0.14"        # 扫码登录终端二维码
 rand = "0.9"
+# 本地终端（imagent claude）客户端行编辑/历史（crates/localterm term.rs）。
+# 版本上限受 workspace rust-version=1.88 约束：rustyline 18+ 用到 file_lock
+# （Rust 1.89 起稳定），17.x 为 1.88 可编译的最新线。
+rustyline = "17"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
@@ -68,10 +72,27 @@ rpassword = "7"
 prometheus = { version = "0.13", default-features = false }
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
 axum = "0.8"
+# Web 驾驶舱（M1）：crates/relay 内嵌 SPA 静态资源（rust-embed）
+rust-embed = "8"
+# Web 驾驶舱 passkey 登录：relay 作为 WebAuthn RP（crates/relay，注册/断言验签）
+webauthn-rs = "0.5"
 # ACP（Agent Client Protocol）：claude-agent-acp 长驻子进程模式（agent-client-protocol SDK）
 agent-client-protocol = "2"
 # 飞书 open-lark SDK（package name=openlark，lib name=open_lark，二者不同名是 SDK 设计）
 openlark = { version = "0.20", default-features = false, features = ["auth", "communication", "websocket"] }
+
+# passkey（L3）：webauthn-rs → openssl 传递依赖；vendored = musl 交叉（ECS 部署）时源码编译静态链入，免目标机 libssl。
+openssl = { version = "0.10", features = ["vendored"] }
+# 网关 ed25519 挑战应答认证（协议 v1.3）：relay 侧验签（只存公钥）+ 网关侧
+# 签名（私钥 seed 落 ~/.imagent/web-gateway-key，0600）。纯 Rust 实现，无 C 依赖，
+# 不影响 relay 的 openssl vendored 链。
+ed25519-dalek = "2"
+# E2E 中继盲化（协议 v1.4，crates/web）：浏览器↔网关业务帧 XChaCha20-Poly1305，
+# 会话密钥 X25519 + HKDF-SHA256。x25519-dalek 的 StaticSecret（网关静态密钥）
+# 需 static_secrets feature；2.x 与 ed25519-dalek 2.x 共用 curve25519-dalek 4。
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.13"
 
 [package]
 name = "imagent"
@@ -90,6 +111,10 @@ imagent-claude = { path = "crates/claude" }
 imagent-codex = { path = "crates/codex" }
 imagent-gemini = { path = "crates/gemini" }
 imagent-store = { path = "crates/store" }
+# Web 驾驶舱 M2：网关侧 WebPlatform（出站 WS 客户端连 relay）。
+imagent-web = { path = "crates/web" }
+# 本地终端平台（imagent claude）：网关侧 LocalPlatform（unix socket）+ term 客户端。
+imagent-localterm = { path = "crates/localterm" }
 tokio = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
@@ -105,6 +130,8 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
+# join 向导：config.toml 合并写入（toml::Table 反序列化-改-序列化保形）。
+toml = { workspace = true }
 reqwest = { workspace = true }
 # setup 向导 / login wecom 的敏感输入关回显（P3-f，code-review v14）——
 # 终端 termios 由 rpassword 处理；非 TTY（管道）由调用方回退 read_line。

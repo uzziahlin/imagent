@@ -216,6 +216,9 @@ EOF
 ```bash
 imagent login            # 扫码登录 iLink，凭据落盘 ~/.imagent/imagent.db
 imagent start            # 前台常驻，Ctrl-C 退出
+imagent claude [会话名]   # 本地终端（config 的 platforms 含 "local" 时）：连网关 local.sock，
+                         # 会话在网关出生——Ctrl-C/exit 只退出视图，会话继续跑（重入续看）；
+                         # /命令照常、审批 y/n/always 行内回复、断线自动重连
 ```
 
 用**另一个**微信号给 bot 发私聊：

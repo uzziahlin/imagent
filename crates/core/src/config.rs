@@ -334,6 +334,15 @@ pub struct Config {
     pub agent: String,
     #[serde(default = "default_platform")]
     pub platform: String,
+    /// M2.5 多平台并存列表（如 `["feishu", "web"]`）。**非空时优先于上面的
+    /// `platform` 单值**（装配优先级：CLI `--platform` > 本列表 > 单值；单值
+    /// 字段保留兼容，既有部署零改动）。元素须 ∈ {ilink, wecom, feishu, web,
+    /// local} 且互异；长度 1 合法（等价单值，装配层直接用单平台、不包组合器）。
+    /// 多平台由 [`crate::MultiPlatform`] 组合器合并（conv 前缀路由），Dispatcher
+    /// 零改动。`local` = 本地终端（`imagent claude`，unix socket，零 config）。
+    /// **改动需重启**：平台在启动期装配，SIGHUP 不换平台。
+    #[serde(default)]
+    pub platforms: Vec<String>,
     /// IM 权限审批模式（默认 Auto：按后端自动选档，见 [`PermissionMode::Auto`]）。
     #[serde(default)]
     pub permission_mode: PermissionMode,
@@ -478,6 +487,29 @@ pub struct Config {
     /// 关闭后私聊同样完全静默。**改动需重启**（同 prefs 注入时机）。
     #[serde(default = "default_stranger_p2p_hint")]
     pub stranger_p2p_hint: bool,
+    /// Web 驾驶舱（M2，仅 `platform = "web"`）：relay 网关侧 WS 地址，形如
+    /// `wss://<ecs>:8443/imagent/gateway`（公网入口由 Caddy TLS 终结并 strip
+    /// `/imagent` 前缀；本地测试可 `ws://127.0.0.1:<port>/gateway`）。网关只发
+    /// 出站连接，Mac 零监听端口。gateway 认证凭证（v1.3）**key 优先 token
+    /// 回退**：密钥文件 `<imagent_home>/web-gateway-key` 首次启动自动生成
+    /// ed25519 密钥对（0600，日志打印公钥——配到 relay 侧
+    /// `IMAGENT_RELAY_GATEWAY_KEYS` 的本机 machine 名下）；环境变量
+    /// `IMAGENT_WEB_GATEWAY_TOKEN`（与 relay 侧 `IMAGENT_RELAY_GATEWAY_TOKENS`
+    /// 中本机 machine 绑定的 token 同值）降级为密钥文件损坏时的回退。
+    #[serde(default)]
+    pub web_relay_url: Option<String>,
+    /// Web 驾驶舱：无 convId 的浏览器消息落到的默认会话名（conv 形如
+    /// `web:<name>`）。缺省 "default"。
+    #[serde(default)]
+    pub web_default_session: Option<String>,
+    /// Web 驾驶舱（M5 多终端，仅 platform 含 web 时读取）：本机在 relay 侧的
+    /// machine 身份——多台 Mac 接同一 ECS relay 时区分终端（浏览器按 machine
+    /// 切换管理；同 machine 新网关连接会顶替旧连接，每台机器单连接）。
+    /// 缺省取 hostname 短名；取不到回退 "default"（单机旧形态）。值经
+    /// 网关侧规范化：仅字母数字-_/≤32 char，非法字符替换为 '-'（协议约束，
+    /// 见 `imagent_web::sanitize_machine_id`）。非敏感（列表帧会广播给浏览器）。
+    #[serde(default)]
+    pub web_machine_id: Option<String>,
     /// 回复形态偏好（P7-A4；默认 card）。text = 不建卡走纯文本流（/config 可热改）。
     /// **改动需重启**：启动偏好（prefs）在启动期注入 Dispatcher，SIGHUP 不热载
     ///（/config 的运行时热改不受影响）。
@@ -505,6 +537,13 @@ pub struct Config {
     /// 仅在 `claude_model` 同时设置时附加。
     #[serde(default)]
     pub claude_fallback_model: Option<String>,
+    /// 模型菜单官方回退列表（claude backend 用）：Web 驾驶舱 /model 快捷
+    /// chips 动态化的第②层——CLI（`~/.claude/settings.json` env）无
+    /// `ANTHROPIC_DEFAULT_*` 别名映射（官方直连形态）时，网关随 workspaces
+    /// 快照下发的菜单项即本列表。空列表 = 不下发（SPA 回退第③层内置）。
+    /// 缺省 `["sonnet", "opus", "haiku"]`。
+    #[serde(default = "default_official_models")]
+    pub official_models: Vec<String>,
     /// W1-2：禁用工具清单（claude `--disallowedTools`；与 allowed_tools 独立：
     /// allowed 先收敛、disallowed 再剔除，黑名单优先）。空 = 不附加。
     #[serde(default)]
@@ -694,6 +733,11 @@ fn default_delegate_tools() -> Vec<String> {
 /// 主轮的 1 小时缺省；上限见 load 期校验 DELEGATE_TIMEOUT_MAX_SECS）。
 fn default_delegate_timeout_secs() -> u64 {
     600
+}
+
+/// 模型菜单官方回退列表缺省（claude 官方别名三件套）。
+fn default_official_models() -> Vec<String> {
+    vec!["sonnet".into(), "opus".into(), "haiku".into()]
 }
 
 fn default_feishu_urgent_on_ask() -> bool {
@@ -1204,6 +1248,24 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
+        // M2.5：多平台列表校验——元素须在四平台名单内且互异（重复名 = 组合器
+        // conv 前缀路由歧义，启动期直接拒绝）。长度 1 合法（等价单值路径）。
+        {
+            let mut seen = std::collections::HashSet::new();
+            for p in &cfg.platforms {
+                if !matches!(p.as_str(), "ilink" | "wecom" | "feishu" | "web" | "local") {
+                    return Err(CoreError::Config(format!(
+                        "未知 platform={p}（platforms 列表），支持 ilink | wecom | feishu | web | local"
+                    )));
+                }
+                if !seen.insert(p.as_str()) {
+                    return Err(CoreError::Config(format!(
+                        "platforms 列表出现重复平台 {p}——多平台并存要求名字互异（conv 前缀路由）"
+                    )));
+                }
+            }
+        }
+
         // T7：workdir 落在状态目录（生效 home 或基座 ~/.imagent）内 + deny 开启
         // → agent 对工作区的文件读取会被 --settings deny 逐次拦下，轮次事实性
         // 不可用。warn 不拒启：罕见误配、运行期症状明显，拒启反而挡住「确实要
@@ -1362,7 +1424,12 @@ allowed_senders = []        # 留空 = 发现模式（只打日志记录入站 s
 # admin_senders = []          # 可 /allow 等管理命令的管理员 sender；空=无人是管理员(IM 内管理命令不可用，须 CLI/setup 配置)
 # allowed_tools = ["*"]                      # 缺省=全部工具（不收敛）；要白名单显式列（如 ["Read","Edit"]）；执行类建议配 permission_mode="ask"
 agent = "claude-cli"         # claude-cli(默认) | claude-acp(Claude ACP长驻子进程) | acp(任意ACP agent,配acp_command) | codex | gemini
-platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人) | feishu(飞书,配 feishu_app_id + 环境变量 IMAGENT_FEISHU_APP_SECRET)
+platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人) | feishu(飞书,配 feishu_app_id + 环境变量 IMAGENT_FEISHU_APP_SECRET) | web(网页驾驶舱,配 web_relay_url;认证 v1.3 起 key 优先,~/.imagent/web-gateway-key 首启自动生成,IMAGENT_WEB_GATEWAY_TOKEN 为回退) | local(本地终端,零配置)
+# platforms = ["feishu", "web"]   # 多平台并存（非空时覆盖上面的 platform 单值）；IM 做通知兜底 + web 做驾驶舱
+# platforms = ["web", "local"]    # 例：web 驾驶舱 + 本地终端(imagent claude,~/.imagent/local.sock,0600+peer uid 即凭证,sender local:user 自动白名单)
+# web_relay_url = "wss://your-ecs:8443/imagent/gateway"   # 仅 platform="web"：ECS relay 网关端点（Caddy TLS 终结 + strip /imagent 前缀）；gateway 认证 v1.3 起 ed25519 key 优先（~/.imagent/web-gateway-key 首启自动生成,把日志打印的公钥配到 relay 侧 IMAGENT_RELAY_GATEWAY_KEYS）,IMAGENT_WEB_GATEWAY_TOKEN 为密钥文件损坏时的回退；web 消息 sender 恒为 web:user，需加入 allowed_senders（或 admin_senders）白名单才会被处理
+# web_default_session = "default"   # 仅 platform="web"：无 convId 的浏览器消息落到的默认会话名（conv 形如 web:<name>）
+# web_machine_id = "home-mac"       # 仅 platform="web"：本机 machine 身份（多台 Mac 接同一 relay 时区分终端，浏览器按 machine 切换管理；缺省取 hostname 短名；同 machine 新连接会顶替旧连接）
 # feishu_app_id = "cli_xxx"            # 飞书自建应用 app_id（仅 platform="feishu"；app_secret 走环境变量，keyring 为后续 P2）
 # feishu_base_url = "https://open.feishu.cn"  # 可选，默认 https://open.feishu.cn；Lark 国际版 https://open.larksuite.com（MVP 不覆盖）
 # feishu_require_mention_in_group = true       # 群消息须 @bot 才处理（默认 true：客户端过滤 + 剥离 @bot 占位；false=全收，过滤交给事件订阅 scope）
@@ -1555,6 +1622,86 @@ platform = "ilink"
         assert_eq!(cfg.platform, "ilink");
         // T9：acp_command 缺省 None（claude-acp 装配无新增约束）。
         assert!(cfg.acp_command.is_none());
+        cleanup(&p);
+    }
+
+    /// M2.5：platforms 多平台列表——缺省空（单值路径，既有部署零改动）；
+    /// 合法（含单元素）通过；非法名 / 重复拒绝。
+    #[test]
+    fn platforms_list_parse_and_validate() {
+        // 缺省 = 空。
+        let p = tmp_path("pl_default", r#"default_workdir = "/tmp/ws""#);
+        let cfg = Config::load(&p).expect("parse");
+        assert!(cfg.platforms.is_empty());
+        assert_eq!(cfg.platform, "ilink");
+        cleanup(&p);
+        // 合法列表 + 单元素列表（等价单值，装配层不包组合器）。
+        let p = tmp_path(
+            "pl_ok",
+            r#"default_workdir = "/tmp/ws"
+platforms = ["feishu", "web"]
+"#,
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(cfg.platforms, vec!["feishu".to_string(), "web".to_string()]);
+        cleanup(&p);
+        let p = tmp_path(
+            "pl_single",
+            r#"default_workdir = "/tmp/ws"
+platforms = ["feishu"]
+"#,
+        );
+        assert!(Config::load(&p).is_ok(), "单元素列表合法（等价单值）");
+        cleanup(&p);
+        // local（本地终端，imagent claude）在名单内。
+        let p = tmp_path(
+            "pl_local",
+            r#"default_workdir = "/tmp/ws"
+platforms = ["web", "local"]
+"#,
+        );
+        assert!(Config::load(&p).is_ok(), "local 应在 platforms 名单内");
+        cleanup(&p);
+        // 非法名。
+        let p = tmp_path(
+            "pl_bad_name",
+            r#"default_workdir = "/tmp/ws"
+platforms = ["telegram"]
+"#,
+        );
+        let err = Config::load(&p).unwrap_err().to_string();
+        assert!(err.contains("未知 platform=telegram"), "{err}");
+        cleanup(&p);
+        // 重复名（组合器前缀路由歧义）。
+        let p = tmp_path(
+            "pl_dup",
+            r#"default_workdir = "/tmp/ws"
+platforms = ["feishu", "feishu"]
+"#,
+        );
+        let err = Config::load(&p).unwrap_err().to_string();
+        assert!(err.contains("重复"), "{err}");
+        cleanup(&p);
+    }
+
+    /// M5 多终端：`web_machine_id` 字段解析——缺省 None（装配期回退 hostname
+    /// 短名）；显式配置原样透传（值的协议规范化在网关侧
+    /// `imagent_web::resolve_machine_id`，core 不重复协议知识）。
+    #[test]
+    fn web_machine_id_config_parse() {
+        let p = tmp_path("web_machine_default", r#"default_workdir = "/tmp/ws""#);
+        let cfg = Config::load(&p).expect("parse");
+        assert!(cfg.web_machine_id.is_none(), "缺省不配置");
+        cleanup(&p);
+        let p = tmp_path(
+            "web_machine_set",
+            r#"default_workdir = "/tmp/ws"
+platform = "web"
+web_machine_id = "home-mac"
+"#,
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(cfg.web_machine_id.as_deref(), Some("home-mac"));
         cleanup(&p);
     }
 
@@ -2684,6 +2831,46 @@ agent = "codex"
             vec![PathBuf::from("/tmp")],
             "相对路径被过滤，绝对路径保留"
         );
+        cleanup(&p);
+    }
+
+    /// 模型菜单官方回退列表：缺省三件套 sonnet/opus/haiku；显式配置覆盖；
+    /// 空列表合法（= 不下发 models 段，SPA 回退内置）。
+    #[test]
+    fn official_models_default_and_override() {
+        let p = tmp_path(
+            "cfg_official_models_default",
+            "default_workdir = \"/tmp/ws\"\n",
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(
+            cfg.official_models,
+            vec![
+                "sonnet".to_string(),
+                "opus".to_string(),
+                "haiku".to_string()
+            ],
+            "缺省官方别名三件套"
+        );
+        cleanup(&p);
+
+        let p = tmp_path(
+            "cfg_official_models_override",
+            "default_workdir = \"/tmp/ws\"\nofficial_models = [\"glm-4.6\", \"glm-4.5-air\"]\n",
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(
+            cfg.official_models,
+            vec!["glm-4.6".to_string(), "glm-4.5-air".to_string()]
+        );
+        cleanup(&p);
+
+        let p = tmp_path(
+            "cfg_official_models_empty",
+            "default_workdir = \"/tmp/ws\"\nofficial_models = []\n",
+        );
+        let cfg = Config::load(&p).expect("空列表合法（不下发）");
+        assert!(cfg.official_models.is_empty());
         cleanup(&p);
     }
 }

@@ -648,6 +648,10 @@ impl Dispatcher {
                 // D7：缓存按 (conv, sender) 隔离——本 conv 全部 sender 一并失效
                 //（T18 并入 ConvState 后 = 清空本 conv 字段）。
                 self.with_conv(&conv.0, |cs| cs.resume_cache.clear()).await;
+                // v1.6 工作空间：目录变更通知（web 驾驶舱据此实时推
+                // conv_workdir 增量帧；其它平台 default no-op）。同步
+                // best-effort——实现方只入队出站帧，不阻塞命令路径。
+                self.platform.on_workdir_changed(conv, arg);
                 self.reply(
                     conv,
                     &format!("✅ 工作目录已切到 {arg}（下条消息生效）"),
@@ -669,10 +673,14 @@ impl Dispatcher {
                 Ok(rows) => {
                     // CardKit 视觉改版：/ws 列表改 markdown 表格（| 名称 | 路径 |）；
                     // 飞书卡渲染层按名称配对「使用/删除」双列按钮。
+                    // v1.6：值为 JSON 记录（兼容旧裸路径），展示取 path。
                     let mut table = String::from("| 名称 | 路径 |\n|---|---|\n");
                     for (k, v) in &rows {
                         let name = k.strip_prefix("workspace:").unwrap_or(k);
-                        table.push_str(&format!("| {} | {} |\n", name, v.replace('|', "\\|")));
+                        let path = crate::workspace::WorkspaceRecord::decode(v)
+                            .map(|r| r.path)
+                            .unwrap_or_else(|| v.clone());
+                        table.push_str(&format!("| {} | {} |\n", name, path.replace('|', "\\|")));
                     }
                     // P6-3：每个空间一个「使用」按钮（点击 = /ws use <name>）。
                     // P9-1：每个空间「使用」（primary）+「删除」（danger）两钮，
@@ -706,9 +714,14 @@ impl Dispatcher {
                     return;
                 }
                 let wd = self.resolve_workdir(&conv.0).await;
+                // v1.6：值升级为 JSON 记录（web 驾驶舱同表读取；lastUsedAt 保存
+                // 时缺省，网页 conv_workdir_set 命中同路径时 bump）。回复文案不变。
                 match self
                     .store
-                    .set_config(&workspace_key(arg), &wd.to_string_lossy())
+                    .set_config(
+                        &workspace_key(arg),
+                        &crate::workspace::WorkspaceRecord::new(wd.to_string_lossy()).encode(),
+                    )
                     .await
                 {
                     Ok(_) => {
@@ -728,7 +741,12 @@ impl Dispatcher {
                     return;
                 }
                 match self.store.get_config(&workspace_key(arg)).await {
-                    Ok(Some(path)) => {
+                    // v1.6：值可能为 JSON 记录（新）或裸路径（旧），decode 兼容
+                    // 两者；值损坏时回退原值（后续 is_dir/validate 兜底拦截）。
+                    Ok(Some(raw)) => {
+                        let path = crate::workspace::WorkspaceRecord::decode(&raw)
+                            .map(|r| r.path)
+                            .unwrap_or(raw);
                         let p = std::path::Path::new(&path);
                         if !p.is_dir() {
                             self.reply(conv, &format!("目录不存在：{path}"), hint).await;

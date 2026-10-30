@@ -18,7 +18,8 @@
 //!   [`PlatformCaps`] 能力位（含 `ALL` 表）+ `/doctor` 能力面自动可见（读 `ALL`）。
 //!
 //! 两类方法**没有**能力位：基础收发（`recv`/`send_text`/`send_media`/`name`，
-//! trait 必备项）与协作钩子（`note_round_initiator`/`doctor_probes`，default
+//! trait 必备项）与协作钩子（`note_round_initiator`/`doctor_probes`/
+//! `on_workdir_changed`，default
 //! 天然无害，无需协商）。
 //!
 //! 注意：能力位描述「平台覆写了该族方法的平台语义」，而非「该方法可调」——
@@ -436,6 +437,9 @@ pub trait Platform: Send + Sync {
     //
     // 这两个方法的 default 无副作用、也不对应任何可选特性，第四平台不覆写
     // 零损失，故不设能力位（与「新增交互特性须加位」的约定区分）。
+    //
+    // `on_workdir_changed`（v1.6）同属本组：通知型钩子、default no-op、无能力位
+    //（web 平台的覆写只是推送一条 best-effort 出站帧，无新交互面）。
 
     /// v1.23 说话人归属：dispatch 在每轮首条消息分派前调用——平台可据此
     /// 锚定「本轮发起者」（卡片标注/按钮点击权校验），避免被运行中的插话
@@ -447,6 +451,13 @@ pub trait Platform: Send + Sync {
     async fn doctor_probes(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// v1.6 工作空间：conv 工作目录已变更的通知（`/cd` 成功保存后调用，
+    /// `path` 为新目录）。同步 best-effort 钩子——实现方只做非阻塞动作
+    /// （如入队一条出站帧），**不得做 IO/await**（调用方在命令处理关键路径
+    /// 上）。default no-op（多数平台无驾驶舱视图；web 覆写为 conv_workdir
+    /// 增量帧推送，见 `imagent-web`）。
+    fn on_workdir_changed(&self, _conv: &ConvId, _path: &str) {}
 }
 
 /// 命令卡片的纯文本降级形态（默认 trait 实现与 dispatch 层失败降级共用）：

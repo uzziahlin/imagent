@@ -38,6 +38,7 @@ use crate::types::{
     AgentChunk, CardButton, CardButtonStyle, CardTerminal, ConfigFormField, ConvId, InboundMessage,
     MediaRef, ReplyHint, SessionId, ToolCall,
 };
+use crate::workspace::{workdir_key, workspace_key};
 use imagent_store::{NamedSessionRow, SessionRow, Store};
 use parking_lot::RwLock;
 use tokio::sync::{mpsc, Mutex};
@@ -377,16 +378,6 @@ fn active_name_key(conv_id: &str) -> String {
 fn compact_summary_key(conv_id: &str) -> String {
     format!("compact_summary:{conv_id}")
 }
-/// per-conv 工作目录的 config 键：`workdir:<conv_id>`（由 /cd 设置，覆盖默认 workdir）。
-fn workdir_key(conv_id: &str) -> String {
-    format!("workdir:{conv_id}")
-}
-
-/// 命名工作空间的 config 键：`workspace:<name>`（全局别名，所有 conv 共享）。由 /ws 设置。
-fn workspace_key(name: &str) -> String {
-    format!("workspace:{name}")
-}
-
 /// 错误是否指示 iLink session 过期（需重新 login）。///
 /// 专用 `CoreError::SessionExpired` variant，靠类型判定而非 Display 子串（更鲁棒）。
 fn is_session_expired_err(e: &crate::error::CoreError) -> bool {
