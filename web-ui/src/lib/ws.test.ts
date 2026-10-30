@@ -1137,3 +1137,146 @@ describe("WsManager 工作空间（v1.6）", () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// v1.7.x 切回前台探活（visibilitychange）：iOS 冻结/掐断后台 WS 的半开问题
+// ---------------------------------------------------------------------------
+
+describe("WsManager 前台探活（visibilitychange）", () => {
+  /** jsdom 默认 visibilityState 为 "prerender"——覆写为指定值（用后还原）。 */
+  const setVisibility = (state: string) => {
+    Object.defineProperty(document, "visibilityState", { value: state, configurable: true });
+  };
+  const resetVisibility = () => {
+    delete (document as { visibilityState?: string }).visibilityState;
+  };
+  const goForeground = () => {
+    setVisibility("visible");
+    document.dispatchEvent(new Event("visibilitychange"));
+  };
+
+  /** 本组专属 harness：经自有 wsFactory 只统计**本 manager** 的 socket——
+   *  本文件早期用例遗留的 WsManager（未 close）监听器仍在 document 上，会
+   *  随本组的 visibilitychange 派发与 fake 时钟推进被唤醒产生额外 socket，
+   *  绝对计数会跨用例耦合（生产代码 close() 恒移除监听，纯测试环境现象）。 */
+  interface VisHarness {
+    mgr: WsManager;
+    mine: FakeWebSocket[];
+    statuses: string[];
+  }
+  const visManagers: WsManager[] = [];
+
+  function makeVisManager(): VisHarness {
+    const mine: FakeWebSocket[] = [];
+    const statuses: string[] = [];
+    const mgr = new WsManager({
+      url: "wss://example.test/imagent/ws",
+      token: "tok-1",
+      onFrame: () => {},
+      onStatus: (s) => statuses.push(s),
+      onAuthFailed: () => {},
+      wsFactory: (u) => {
+        const s = new FakeWebSocket(u);
+        mine.push(s);
+        return s;
+      },
+    });
+    visManagers.push(mgr);
+    return { mgr, mine, statuses };
+  }
+
+  afterEach(() => {
+    resetVisibility();
+    for (const m of visManagers.splice(0)) {
+      m.close();
+    }
+  });
+
+  it("visible：socket 为 null 且退避已排 → 清 timer 立即重连（退避计数保留）", () => {
+    const h = makeVisManager();
+    h.mgr.connect();
+    const s1 = h.mine[0];
+    s1.emit("open");
+    s1.serverSend(HELLO_ACK);
+    expect(h.statuses.at(-1)).toBe("ready");
+    s1.emit("close", { code: 1006 });
+    expect(h.statuses.at(-1)).toBe("reconnecting");
+    // 退避 1s 未到点时切回前台 → 立即新建连接（不等剩余退避）
+    vi.advanceTimersByTime(500);
+    goForeground();
+    expect(h.mine).toHaveLength(2);
+    expect(h.statuses.at(-1)).toBe("connecting");
+    // 立即重试不抬退避上限：attempts 计数保留 → 新连接再失败，下一轮退避 2s
+    const s2 = h.mine[1];
+    s2.emit("open");
+    s2.emit("close", { code: 1006 });
+    vi.advanceTimersByTime(1_999);
+    expect(h.mine).toHaveLength(2);
+    vi.advanceTimersByTime(1);
+    expect(h.mine).toHaveLength(3);
+  });
+
+  it("visible：连接 OPEN 但 lastFrameAt 超过 pingIntervalMs → 半开判死：teardown + 立即排重连", () => {
+    const h = makeVisManager();
+    h.mgr.connect();
+    const sock = h.mine[0];
+    sock.emit("open");
+    sock.serverSend(HELLO_ACK);
+    // 26s 无入站（25s tick 只发出站 ping、无 pong）：lastFrameAt 陈旧超 25s
+    vi.advanceTimersByTime(26_000);
+    goForeground();
+    expect(sock.closedWith).toContain(1000); // 主动断开半开连接
+    expect(h.statuses.at(-1)).toBe("reconnecting");
+    vi.advanceTimersByTime(1_000);
+    expect(h.mine).toHaveLength(2); // 退避到点重连
+  });
+
+  it("visible：连接新鲜（< pingIntervalMs）→ 发一次 ping 探活、不断开不重连", () => {
+    const h = makeVisManager();
+    h.mgr.connect();
+    const sock = h.mine[0];
+    sock.emit("open");
+    sock.serverSend(HELLO_ACK);
+    vi.advanceTimersByTime(5_000); // 未到 25s tick：无周期 ping
+    expect(sock.sentOfType("ping")).toHaveLength(0);
+    goForeground();
+    expect(sock.sentOfType("ping")).toHaveLength(1); // 探活 ping 一枚
+    expect(sock.closedWith).toHaveLength(0);
+    expect(h.mine).toHaveLength(1); // 无重连
+  });
+
+  it("hidden 不触发；手动 close 后监听移除（visible 亦不动作）", () => {
+    const h = makeVisManager();
+    h.mgr.connect();
+    const sock = h.mine[0];
+    sock.emit("open");
+    sock.serverSend(HELLO_ACK);
+    setVisibility("hidden");
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(sock.sentOfType("ping")).toHaveLength(0);
+    // 组件卸载/退出登录路径：close() 摘监听
+    h.mgr.close();
+    goForeground();
+    expect(h.mine).toHaveLength(1);
+    expect(sock.sentOfType("ping")).toHaveLength(0);
+  });
+
+  it("superseded / 认证失败终态：监听随终态移除，探活不重连", () => {
+    const h1 = makeVisManager();
+    h1.mgr.connect();
+    h1.mine[0].emit("open");
+    h1.mine[0].serverSend(HELLO_ACK);
+    h1.mine[0].emit("close", { code: 4001 });
+    goForeground();
+    expect(h1.mine).toHaveLength(1); // 终态不自动重连
+
+    const h2 = makeVisManager();
+    h2.mgr.connect();
+    h2.mine[0].emit("open");
+    h2.mine[0].serverSend(HELLO_ACK);
+    h2.mine[0].emit("close", { code: 1008 });
+    goForeground();
+    expect(h2.mine).toHaveLength(1); // 仅初始连接
+    expect(h2.statuses.at(-1)).not.toBe("connecting");
+  });
+});

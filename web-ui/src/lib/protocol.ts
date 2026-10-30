@@ -69,9 +69,9 @@ export function convDisplayName(convId: string): string {
 /** 自动会话完整形态：web:s-<4 位小写 hex>（newAutoConvName + web: 前缀）。 */
 export const AUTO_CONV_RE = /^web:s-[0-9a-f]{4}$/;
 
-/** 是否机器生成的自动会话（web:s-xxxx）。仅此类会话的显示名采用自动 title
- *  ——手动名是用户输入（convId 即名字），恒不被自动 title 覆盖；default /
- *  local: 会话同走剥前缀显示。 */
+/** 是否机器生成的自动会话（web:s-xxxx）。自动会话与 default 会话的显示名
+ *  采用自动 title（见 convTitle）；手动名是用户输入（convId 即名字），恒不
+ *  被自动 title 覆盖；local: 会话走剥前缀显示。 */
 export function isAutoConv(convId: string): boolean {
   return AUTO_CONV_RE.test(convId);
 }
@@ -85,10 +85,14 @@ export function newAutoConvName(): string {
 }
 
 /** conv 显示名（用户可见，手动名 > 自动 title > 剥前缀兜底）：自动会话
- *  （web:s-xxxx）优先首条消息派生的 title；其余（手动名 / default / local）
- *  恒 convDisplayName 剥前缀。title 派生见 ConvState.title。 */
+ *  （web:s-xxxx）与 default 会话优先首条消息派生的 title——default 恒为固定
+ *  入口，未发消息（title 未派生）时回退 convDisplayName 显示 "default"；
+ *  其余（手动名 / local）恒 convDisplayName 剥前缀。title 派生见
+ *  ConvState.title。 */
 export function convTitle(conv: ConvState | undefined, convId: string): string {
-  return isAutoConv(convId) && conv?.title ? conv.title : convDisplayName(convId);
+  return (isAutoConv(convId) || convId === DEFAULT_CONV) && conv?.title
+    ? conv.title
+    : convDisplayName(convId);
 }
 
 // ---------------------------------------------------------------------------
@@ -898,8 +902,8 @@ export type ConvState = {
   unread: number;
   /** 自动显示名（会话自动命名）：该会话首条 user/text 消息的单行摘要（按字符
    *  截 CONV_TITLE_MAX_CHARS，中文不劈半），一旦写入不再变——首条消息即定调。
-   *  所有会话一律派生，但仅自动形态（web:s-xxxx，见 isAutoConv）的显示名采用
-   *  （convTitle）；手动名 / default / local 会话派生而不用。 */
+   *  所有会话一律派生，但仅自动形态（web:s-xxxx，见 isAutoConv）与 default
+   *  会话的显示名采用（convTitle）；手动名 / local 会话派生而不用。 */
   title?: string;
 };
 

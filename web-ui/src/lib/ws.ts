@@ -7,6 +7,11 @@
 // 视为本连接被同 token 新窗口顶替（进入 superseded 终态：停心跳停重连，否则
 // 两窗口互踢死循环；用户显式 connect() 才重连，反之顶替对方是用户意图）→
 // >60s 无任何入站帧视为链路僵死，主动断开重连。
+// v1.7.x 切回前台即时恢复（iOS 冻结/掐断后台 WS 的半开问题）：visibilitychange
+// → visible 时探活——无连接且退避已排则清 timer 立即重连（退避计数保留防
+// 风暴）；连接 OPEN 则立即执行一次心跳体逻辑（lastFrameAt 超过 pingIntervalMs
+// 判半开：teardown + 立即重连；未超则发一次 ping 探活，真正死链由下个 tick
+// 的 deadLink 判定兜底）。监听随 connect 注册、close/终态移除（防泄漏）。
 // v1.1 多终端：业务出站帧（message/approval_response/control/sync/ping）可选带
 // machine 字段——调用方逐帧传入，或经 getMachine 注入（内部自动 sync / 心跳
 // ping 在发送时取值）。machine 未指定时字段不出现，与旧 relay/旧网关字节级
@@ -271,6 +276,7 @@ export class WsManager {
       return;
     }
     this.stopped = false;
+    this.attachVisibility();
     this.setStatus("connecting");
     this.openSocket();
   }
@@ -279,6 +285,7 @@ export class WsManager {
   close(): void {
     this.stopped = true;
     this.clearReconnectTimer();
+    this.detachVisibility();
     this.teardownSocket();
   }
 
@@ -570,22 +577,65 @@ export class WsManager {
 
   private startHeartbeat(): void {
     this.stopHeartbeat();
-    this.pingTimer = setInterval(() => {
-      // 链路僵死检测：> deadLinkMs 未收到任何入站帧 → 主动断开重连
-      if (Date.now() - this.lastFrameAt > this.deadLinkMs) {
-        this.teardownSocket();
-        this.scheduleReconnect();
-        return;
-      }
-      // v1.4：当前机器 e2e active → ping 亦密文（其余恒明文，保命线不阻断）
-      this.rawSend(
-        this.e2e.heartbeat(
-          { v: 1, type: "ping", machine: this.machineOf() },
-          this.machineOf(),
-        ),
-      );
-    }, this.pingIntervalMs);
+    this.pingTimer = setInterval(() => this.probeOnce(this.deadLinkMs), this.pingIntervalMs);
   }
+
+  /** 心跳体逻辑（周期 tick 与切回前台探活共用）：距最后入站帧超过
+   *  thresholdMs 判链路失活 → 主动断开 + 排重连；否则发一次 ping（经 e2e
+   *  按当前机器选路包装，保命线永不阻断）。tick 用 deadLinkMs（僵死判定），
+   *  前台探活用 pingIntervalMs（半开判定——iOS 后台掐链后 readyState 仍
+   *  OPEN，等 deadLink 太迟）。 */
+  private probeOnce(thresholdMs: number): void {
+    if (Date.now() - this.lastFrameAt > thresholdMs) {
+      this.teardownSocket();
+      this.scheduleReconnect();
+      return;
+    }
+    this.rawSend(
+      this.e2e.heartbeat({ v: 1, type: "ping", machine: this.machineOf() }, this.machineOf()),
+    );
+  }
+
+  // ---- v1.7.x 切回前台探活（visibilitychange）----
+
+  /** document 可见性监听（connect 注册 / close 与终态移除；SSR/单测环境无
+   *  document 时静默跳过）。同一函数引用重复 addEventListener 幂等。 */
+  private attachVisibility(): void {
+    if (typeof document === "undefined") {
+      return;
+    }
+    document.addEventListener("visibilitychange", this.handleVisibilityChange);
+  }
+
+  private detachVisibility(): void {
+    if (typeof document === "undefined") {
+      return;
+    }
+    document.removeEventListener("visibilitychange", this.handleVisibilityChange);
+  }
+
+  /** 切回前台即时探活：visible 且未 stopped/superseded 时——
+   *  ① socket 为 null 且退避定时器已排：清 timer 立即重连（attempts 计数
+   *     保留——立即重试一次不抬退避上限，防连续切前后台风暴）；
+   *  ② socket OPEN 且 ready：执行一次心跳体逻辑（pingIntervalMs 阈值判
+   *     半开；新鲜则发 ping 探活）。非 OPEN（连接中/hello 等待）不动——
+   *     hello 超时与 close 事件自会驱动状态机。 */
+  private handleVisibilityChange = (): void => {
+    if (document.visibilityState !== "visible" || this.stopped) {
+      return;
+    }
+    if (this.socket === null) {
+      if (this.reconnectTimer !== null) {
+        this.clearReconnectTimer();
+        this.setStatus("connecting");
+        this.openSocket();
+      }
+      return;
+    }
+    if (this.ready && this.socket.readyState === 1 /* OPEN */) {
+      this.probeOnce(this.pingIntervalMs);
+    }
+  };
 
   private handleClose = (ev: WsEvent): void => {
     this.stopTimers();
@@ -605,6 +655,7 @@ export class WsManager {
       // relay 认证失败：按 close reason 分流（session expired/revoked/其它），
       // 调用方清对应凭证回登录页；不重连
       this.stopped = true;
+      this.detachVisibility();
       this.onAuthFailed(authFailReason(typeof ev.reason === "string" ? ev.reason : undefined));
       return;
     }
@@ -612,6 +663,7 @@ export class WsManager {
       // 本连接被同 token 新窗口顶替：进入终态，不自动重连
       // （自动重连会顶替回去，两个窗口互踢死循环）；用户显式 connect() 才重连。
       this.stopped = true;
+      this.detachVisibility();
       this.setStatus("superseded");
       return;
     }

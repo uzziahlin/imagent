@@ -14,6 +14,7 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex, hexToBytes, randomBytes, utf8ToBytes } from "@noble/hashes/utils.js";
 import App from "./App";
 import { __resetAdminToken } from "./lib/admin";
+import { historyStore } from "./lib/historyStore";
 import { fingerprint, openBox } from "./lib/e2e";
 import type { WsEvent } from "./lib/ws";
 
@@ -434,11 +435,12 @@ describe("未读徽标与空态示例（交互细节）", () => {
     const fake = mountApp();
     handshake(fake, ["home-mac"]);
 
-    // 当前会话（web:default）消息不产生徽标
+    // 当前会话（web:default）消息不产生徽标。v1.7.x 起 default 会话发首条
+    // 消息后显示名改为派生 title——按消息文本定位该会话按钮。
     act(() => {
       fake.recv({ v: 1, type: "text", convId: "web:default", text: "当前会话消息", machine: "home-mac" });
     });
-    const defaultBtn = screen.getByRole("button", { name: /default/ });
+    const defaultBtn = screen.getByRole("button", { name: /当前会话消息/ });
     expect(within(defaultBtn).queryByText(/条未读/)).toBeNull();
 
     // 非当前会话（web:work）消息 → 徽标 1；再来一条 → 2
@@ -475,8 +477,9 @@ describe("未读徽标与空态示例（交互细节）", () => {
         machine: "home-mac",
       }),
     );
-    // 本地用户回显出现：气泡 + 侧栏预览各一处
-    expect(screen.getAllByText("看看这个项目结构").length).toBe(2);
+    // 本地用户回显出现：气泡 + 侧栏预览各一处；default 会话首条消息还会作为
+    // 自动命名 title 出现在侧栏标题/状态条（v1.7.x 起 default 也自动命名）。
+    expect(screen.getAllByText("看看这个项目结构").length).toBeGreaterThanOrEqual(2);
     // 发送后空态消失（有条目）
     expect(screen.queryByRole("button", { name: "帮我写个脚本" })).toBeNull();
   });
@@ -1694,5 +1697,107 @@ describe("/model 命令后延时重拉快照（v1.8）", () => {
     send("/modelsomething"); // 非 /model 命令前缀
     act(() => vi.advanceTimersByTime(3000));
     expect(listCount(fake)).toBe(before);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.7.x 消息本地缓存（IndexedDB 门面 spy 注入）：挂载预填恢复 / 2s debounce
+// 只写脏 conv / 退出登录清空
+// ---------------------------------------------------------------------------
+
+describe("App 本地消息缓存（historyStore 集成）", () => {
+  /** 恢复条目夹具。 */
+  const userEntry = (text: string, at: number) => ({ kind: "user" as const, key: `user:${at}`, text, at });
+  const textEntry = (text: string, at: number) => ({ kind: "text" as const, key: `text:${at}`, text, at });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it("挂载预填恢复：entries/预览/时间渲染、convOrder 按 lastAt 插 default 后、default 会话 title 生效", async () => {
+    vi.spyOn(historyStore, "loadAll").mockResolvedValue({
+      "home-mac": {
+        "web:s-ab12": [userEntry("自动会话历史首条", 3000)],
+        "web:default": [userEntry("默认会话历史首条", 1000), textEntry("默认会话历史回复", 1100)],
+      },
+    });
+    const fake = mountApp();
+    // 空态先渲染，loadAll 完成后一次 setState（微任务 flush）
+    await act(async () => {});
+    handshake(fake, ["home-mac"]);
+    // default 会话：恢复首条派生 title → 侧栏标题 + 状态条徽标改显 title
+    expect(screen.getAllByText("默认会话历史首条").length).toBeGreaterThanOrEqual(2);
+    // 自动会话 web:s-a：title = 首条消息（侧栏标题 + 预览）
+    expect(screen.getAllByText("自动会话历史首条").length).toBeGreaterThanOrEqual(2);
+    // 末条预览：default 会话预览是最后一条 text
+    expect(screen.getAllByText("默认会话历史回复").length).toBeGreaterThanOrEqual(1);
+    // 点进恢复的会话：消息气泡渲染（entries 已预填）
+    fireEvent.click(screen.getByRole("button", { name: /自动会话历史首条/ }));
+    expect(screen.getAllByText("自动会话历史首条").length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("保存 debounce：2s 后只写 entries 有变化的 conv（空会话/未变化不写）", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(historyStore, "loadAll").mockResolvedValue({});
+    const saveSpy = vi.spyOn(historyStore, "saveConv").mockResolvedValue();
+    const fake = mountApp();
+    handshake(fake, ["home-mac"]);
+    await act(async () => {}); // loadAll resolve
+    act(() => {
+      fake.recv({ v: 1, type: "text", convId: "web:work", text: "后台消息", machine: "home-mac" });
+    });
+    act(() => vi.advanceTimersByTime(1_999));
+    expect(saveSpy).not.toHaveBeenCalled(); // 未到 2s 不落盘
+    act(() => vi.advanceTimersByTime(1));
+    expect(saveSpy).toHaveBeenCalledTimes(1); // 只有脏 conv web:work（default 空会话不写）
+    expect(saveSpy).toHaveBeenCalledWith(
+      "home-mac",
+      "web:work",
+      [expect.objectContaining({ kind: "text", text: "后台消息" })],
+    );
+    // 引用不再变化：再推进不再重复写
+    act(() => vi.advanceTimersByTime(5_000));
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("退出登录：清空本地缓存，且清空后不再把内存旧会话回写", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(historyStore, "loadAll").mockResolvedValue({});
+    const saveSpy = vi.spyOn(historyStore, "saveConv").mockResolvedValue();
+    const clearSpy = vi.spyOn(historyStore, "clear").mockResolvedValue();
+    const fake = mountApp();
+    handshake(fake, ["home-mac"]);
+    await act(async () => {});
+    act(() => {
+      fake.recv({ v: 1, type: "text", convId: "web:default", text: "将被清空的消息", machine: "home-mac" });
+    });
+    act(() => vi.advanceTimersByTime(2_000));
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "退出" }));
+    expect(clearSpy).toHaveBeenCalledTimes(1); // 显式退出清本机痕迹
+    // savedRefs 已对齐内存态：后续 flush 不把已清空的会话写回
+    act(() => vi.advanceTimersByTime(5_000));
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+    expect(screen.getByLabelText("访问令牌（USER_TOKEN）")).toBeTruthy(); // 回登录页
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.7.x default 会话自动命名（convTitle 放宽）：固定入口也按首条消息命名
+// ---------------------------------------------------------------------------
+
+describe("App default 会话自动命名", () => {
+  it("未发消息显示 default；发首条消息后侧栏/状态条改显 title", () => {
+    const fake = mountApp();
+    handshake(fake, ["home-mac"]);
+    // 未发消息：侧栏标题 + 状态条会话徽标均显示 default
+    expect(screen.getAllByText("default").length).toBeGreaterThanOrEqual(2);
+    fireEvent.change(screen.getByLabelText("消息输入框"), { target: { value: "默认会话的第一条" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    // 气泡 + 侧栏标题 + 侧栏预览 + 状态条徽标均显示首条消息（title 派生）
+    expect(screen.getAllByText("默认会话的第一条").length).toBeGreaterThanOrEqual(3);
+    // "default" 字样从显示位消失
+    expect(screen.queryByText("default")).toBeNull();
   });
 });

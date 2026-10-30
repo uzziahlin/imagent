@@ -8,7 +8,9 @@ import {
   newAutoConvName,
   reducer,
   spaceOf,
+  type Action,
   type ApprovalDecision,
+  type AppState,
   type ConvState,
   type DeviceInfo,
   type MachineNotice,
@@ -17,7 +19,12 @@ import {
   type PairingRequest,
   type PasskeyInfo,
   type PendingApproval,
+  type StreamEntry,
 } from "./lib/protocol";
+import {
+  historyStore,
+  restoreHistory,
+} from "./lib/historyStore";
 import {
   clearSession,
   loadSession,
@@ -148,6 +155,27 @@ function omitKey<T extends Record<string, unknown>>(rec: T, key: string): T {
   return next;
 }
 
+// ---------------------------------------------------------------------------
+// v1.7.x 消息本地缓存（IndexedDB，lib/historyStore）：App 级扩展 action +
+// 包装 reducer——protocol reducer 既有语义不动，恢复预填的归并在本层完成。
+// ---------------------------------------------------------------------------
+
+/** App 扩展 action：挂载恢复（loadAll 输出 → spaces 预填，见 restoreHistory）。 */
+type AppAction = Action | { type: "restore_history"; restored: Record<string, Record<string, StreamEntry[]>> };
+
+function appReducer(state: AppState, action: AppAction): AppState {
+  if (action.type === "restore_history") {
+    return restoreHistory(state, action.restored);
+  }
+  return reducer(state, action);
+}
+
+/** 本地缓存落盘 debounce（ms）：state 稳定 2s 后写脏 conv（高频流式帧不逐帧落盘）。 */
+const HISTORY_SAVE_DEBOUNCE_MS = 2000;
+
+/** 本地缓存键（与 historyStore 存储键同构：machine||conv）。 */
+const historyKey = (machine: string, convId: string): string => `${machine}||${convId}`;
+
 export default function App() {
   const [auth, setAuth] = useState<Cred | null>(loadCred);
   // 会话凭证（v1.2）：hello_ack.session 签发/恢复时置值；驱动过期横幅、设备
@@ -184,7 +212,7 @@ export default function App() {
   // v1.4 E2E：pin 表快照（设备管理指纹区）+ UI 态（TOFU 队列/告警/阻断/激活）
   const [e2ePins, setE2ePins] = useState<E2ePin[]>(() => loadPins());
   const [e2eUi, setE2eUi] = useState<E2eUi>(EMPTY_E2E_UI);
-  const [state, dispatch] = useReducer(reducer, undefined, initialState);
+  const [state, dispatch] = useReducer(appReducer, undefined, initialState);
   const wsRef = useRef<WsManager | null>(null);
   // state 的渲染后镜像：WsManager 回调（getMachine）需要读最新 machine 维度，
   // 不能闭包进构建时的旧 state。
@@ -192,9 +220,69 @@ export default function App() {
   useEffect(() => {
     stateRef.current = state;
   });
+  // v1.7.x 本地缓存：上次已落盘（或已恢复）的 conv entries 引用——脏检查用
+  // （reducer 不可变更新，引用比较即“内容是否变过”）；退出清空后同步重置。
+  const savedRefs = useRef<Map<string, StreamEntry[]>>(new Map());
+
+  /** 挂载恢复：loadAll → spaces 预填（initialState 之后、WS 帧之前；异步竞态
+   *  时恢复条目垫在已到帧之前，见 restoreHistory）。加载完成前渲染空态
+   *  （现状），加载后一次 setState。 */
+  useEffect(() => {
+    let cancelled = false;
+    void historyStore.loadAll().then((restored) => {
+      if (cancelled || Object.keys(restored).length === 0) {
+        return;
+      }
+      for (const [machine, convs] of Object.entries(restored)) {
+        for (const [convId, entries] of Object.entries(convs)) {
+          // 恢复内容近似“已保存”——首次 flush 可能因 restoreHistory 重建
+          // entries 数组而多写一次同内容（幂等、无害，且顺带刷新 savedAt）。
+          savedRefs.current.set(historyKey(machine, convId), entries);
+        }
+      }
+      dispatch({ type: "restore_history", restored });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /** 落盘 debounce：spaces 变化 2s 后写“与上次保存相比 entries 引用有变化”
+   *  的 conv（空会话不写）。引用不变（未收到消息的会话）零写入。 */
+  useEffect(() => {
+    const t = setTimeout(() => {
+      for (const [machine, space] of Object.entries(stateRef.current.spaces)) {
+        for (const [convId, conv] of Object.entries(space.convs)) {
+          if (conv.entries.length === 0) {
+            continue;
+          }
+          const key = historyKey(machine, convId);
+          if (savedRefs.current.get(key) === conv.entries) {
+            continue;
+          }
+          savedRefs.current.set(key, conv.entries);
+          void historyStore.saveConv(machine, convId, conv.entries);
+        }
+      }
+    }, HISTORY_SAVE_DEBOUNCE_MS);
+    return () => clearTimeout(t);
+  }, [state.spaces]);
+
+  /** 退出路径清空缓存后：savedRefs 对齐当前 state 的 entries 引用（否则
+   *  debounce flush 会把内存里仍持有的旧会话条目重新写回已清空的存储）。 */
+  const syncSavedRefs = () => {
+    const next = new Map<string, StreamEntry[]>();
+    for (const [machine, space] of Object.entries(stateRef.current.spaces)) {
+      for (const [convId, conv] of Object.entries(space.convs)) {
+        next.set(historyKey(machine, convId), conv.entries);
+      }
+    }
+    savedRefs.current = next;
+  };
 
   /** 认证失败分流（close 1008 reason → 清对应凭证 + 登录页提示）。v1.5：
-   *  adminToken 属会话附属内存态，任何认证失败一并作废。 */
+   *  adminToken 属会话附属内存态，任何认证失败一并作废。v1.7.x：凭证失效
+   *  回登录页 = 退出路径，一并清空本地消息缓存（本机痕迹）。 */
   const authFailed = (reason: AuthFailReason) => {
     clearAdminToken();
     setAdminActive(false);
@@ -202,6 +290,8 @@ export default function App() {
     setPairing(null);
     setPairingCode(null);
     setPairingCodeAt(null);
+    void historyStore.clear();
+    syncSavedRefs();
     if (reason === "session_expired") {
       clearSession();
       setSession(null);
@@ -409,30 +499,24 @@ export default function App() {
     return () => clearTimeout(t);
   }, [adminError, adminOpen]);
 
-  // 机器维度变化（首收 machines 帧 / 侧栏切换 / 掉线自动切换）→ 发一次带
-  // machine 的 sync 拉该机器卡片缓存。未 ready 时 sendSync 静默失败——重连
-  // 场景由 ws 层内部 sync（getMachine 已带当前机器）兜底。旧 relay 单机模式
-  // （machinesKnown 恒 false）不触发，行为与升级前完全一致。
-  useEffect(() => {
-    if (state.machinesKnown) {
-      wsRef.current?.sendSync(state.currentMachine);
-    }
-  }, [state.machinesKnown, state.currentMachine]);
-
-  // v1.6 工作空间快照拉取：连接 ready（含重连成功）与机器维度变化后各发一次
-  // workspace_list（快照落 reducer，SPA 以快照为唯一事实源）。仅多机模式
-  // （machinesKnown——新 relay 恒推 machines 帧）发送：旧 relay 单机模式网关
-  // 不认识该帧，目录条也不渲染，行为与升级前一致。
+  // 连接 ready（含重连成功）与机器维度变化（首收 machines 帧 / 侧栏切换 /
+  // 掉线自动切换）后：发一次带 machine 的 sync 拉该机器卡片缓存 + 一次
+  // workspace_list 拉工作空间快照（快照落 reducer，唯一事实源）。重连后的
+  // sync 补发与本地 IndexedDB 缓存构成双保险（网关重发在飞卡片终态）。
+  // 未 ready 时 send 系列静默失败——由 ws 层内部 sync（getMachine 已带当前
+  // 机器）兜底，status 回 ready 后本 effect 再补。仅多机模式（machinesKnown）
+  // 发送：旧 relay 单机模式网关不认识这些帧，行为与升级前完全一致。
   useEffect(() => {
     if (state.machinesKnown && status === "ready") {
+      wsRef.current?.sendSync(state.currentMachine);
       wsRef.current?.listWorkspaces(state.currentMachine);
     }
   }, [state.machinesKnown, state.currentMachine, status]);
 
   // 侧边栏会话项：当前选中机器会话空间内的全部 conv；刚切到尚未收到帧的 conv
   // （新会话）不在 convOrder 里，前端补一项空预览，避免当前高亮落空。
-  // title = 会话显示名（convTitle：自动会话 web:s-xxxx 用首条消息派生的自动
-  // title，手动名/default/local 恒 convId 剥前缀）。
+  // title = 会话显示名（convTitle：自动会话 web:s-xxxx 与 default 会话用首条
+  // 消息派生的自动 title，手动名/local 恒 convId 剥前缀）。
   // 注意：hook 必须在下方 token 早退之前（hooks 数量不可随登录态变化）。
   const space = spaceOf(state, state.currentMachine);
   const currentConv = state.currentConv;
@@ -645,12 +729,15 @@ export default function App() {
     }
   };
 
-  /** 登出：清全部本地凭证（会话 + 遗留 USER_TOKEN + 内存态 adminToken），回
-   * 登录页。服务端吊销走管理面板的「吊销并退出」（revokeDevice）。 */
+  /** 登出：清全部本地凭证（会话 + 遗留 USER_TOKEN + 内存态 adminToken）与
+   *  本地消息缓存（IndexedDB，用户显式退出即清本机痕迹；普通刷新不清），
+   *  回登录页。服务端吊销走管理面板的「吊销并退出」（revokeDevice）。 */
   const logout = () => {
     clearSession();
     localStorage.removeItem(USER_TOKEN_KEY);
     clearAdminToken();
+    void historyStore.clear();
+    syncSavedRefs();
     setAdminActive(false);
     setAdminOpen(false);
     setSession(null);

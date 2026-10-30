@@ -1362,6 +1362,44 @@ describe("workspaces.sessions（v1.7 会话持久化）", () => {
     expect(spaceOf(s, "home-mac").convOrder).toEqual(["web:default", "web:s-a"]);
   });
 
+  it("reducer：本地缓存预填（IndexedDB 恢复）的 conv 同样不被快照覆盖——entries/概要原样保留", () => {
+    // 模拟挂载恢复：conv 带本地缓存 entries + 派生 title（restoreHistory 产物形状）
+    let s = initialState();
+    s = {
+      ...s,
+      spaces: {
+        ...s.spaces,
+        "home-mac": {
+          convs: {
+            [DEFAULT_CONV]: { entries: [], pending: [], lastPreview: "", lastAt: 0, unread: 0 },
+            "web:s-a": {
+              entries: [{ kind: "text", key: "h:text:1", text: "缓存里的历史消息", at: 1234 }],
+              pending: [],
+              lastPreview: "缓存里的历史消息",
+              lastAt: 1234,
+              unread: 0,
+              title: "缓存里的历史消息",
+            },
+          },
+          convOrder: [DEFAULT_CONV, "web:s-a"],
+        },
+      },
+    };
+    // 网关快照携带同 conv 的 sessions 行（title/updatedAt 不同）→ 本地缓存优先
+    s = run(s, {
+      type: "frame",
+      frame: frame(
+        SNAP(',"sessions":[{"id":"web:s-a","title":"服务端摘要","updatedAt":9999}],"machine":"home-mac"'),
+      ),
+    });
+    const conv = spaceOf(s, "home-mac").convs["web:s-a"];
+    expect(conv.entries).toHaveLength(1);
+    expect(conv.entries[0]).toMatchObject({ text: "缓存里的历史消息" });
+    expect(conv.title).toBe("缓存里的历史消息");
+    expect(conv.lastPreview).toBe("缓存里的历史消息");
+    expect(spaceOf(s, "home-mac").convOrder).toEqual([DEFAULT_CONV, "web:s-a"]);
+  });
+
   it("reducer：重复快照幂等（第二次不再改动）；无 sessions 段（旧网关）spaces 引用不变", () => {
     const raw = SNAP(
       ',"sessions":[{"id":"web:s-a","title":"A","updatedAt":3000},{"id":"web:s-b","title":"B","updatedAt":2000}],"machine":"home-mac"',
@@ -1572,13 +1610,24 @@ describe("会话自动命名（title 派生 + 自动短 ID + convTitle）", () =
     expect(convTitle(convsOf(withMsg)["web:s-ab12"], "web:s-ab12")).toBe("自动会话首条");
   });
 
-  it("convTitle：手动名 / default / local 会话即便有 title 也恒剥前缀（不被自动名覆盖）", () => {
+  it("convTitle：手动名 / local 会话即便有 title 也恒剥前缀；default 会话改用 title（未派生仍显 default）", () => {
     const manual = run(initialState(), { type: "send_echo", convId: "web:proj", text: "手动名会话首条消息" });
     expect(convsOf(manual)["web:proj"].title).toBe("手动名会话首条消息"); // 一律派生（state 里有）
     expect(convTitle(convsOf(manual)["web:proj"], "web:proj")).toBe("proj"); // 但显示名不用
-    const def = run(initialState(), { type: "send_echo", convId: DEFAULT_CONV, text: "默认会话消息" });
-    expect(convTitle(convsOf(def)[DEFAULT_CONV], DEFAULT_CONV)).toBe("default");
     const local = run(initialState(), { type: "frame", frame: frame(TEXT_FRAME("本地终端", "local:work")) });
     expect(convTitle(convsOf(local)["local:work"], "local:work")).toBe("local:work"); // 非 web: 前缀原样
+  });
+
+  it("convTitle（v1.7.x 放宽）：default 会话发首条消息后显示 title；未发消息仍显示 default", () => {
+    // 未发消息（无 conv 状态 / 空壳）：回退剥前缀 "default"
+    expect(convTitle(undefined, DEFAULT_CONV)).toBe("default");
+    expect(convTitle(convsOf(initialState())[DEFAULT_CONV], DEFAULT_CONV)).toBe("default");
+    // 发首条消息：title 派生 → 显示名采用（侧栏/状态条同源）
+    const def = run(initialState(), { type: "send_echo", convId: DEFAULT_CONV, text: "默认会话的第一条消息" });
+    expect(convsOf(def)[DEFAULT_CONV].title).toBe("默认会话的第一条消息");
+    expect(convTitle(convsOf(def)[DEFAULT_CONV], DEFAULT_CONV)).toBe("默认会话的第一条消息");
+    // title 定调后不再变：第二条消息不覆盖显示名
+    const def2 = run(def, { type: "send_echo", convId: DEFAULT_CONV, text: "第二条消息" });
+    expect(convTitle(convsOf(def2)[DEFAULT_CONV], DEFAULT_CONV)).toBe("默认会话的第一条消息");
   });
 });
