@@ -1399,6 +1399,93 @@ describe("workspaces.sessions（v1.7 会话持久化）", () => {
 });
 
 // ---------------------------------------------------------------------------
+// v1.8 模型菜单动态化：workspaces 帧可选 models 段
+// ---------------------------------------------------------------------------
+
+describe("workspaces.models（v1.8 模型菜单动态化）", () => {
+  /** 全量快照帧文本（尾部 extra 拼接 models / machine 段）。 */
+  const SNAP = (extra = "") =>
+    `{"v":1,"type":"workspaces","default":"/d","workspaces":[],"convs":{}${extra}}`;
+  const MODELS =
+    ',"models":{"current":null,"cliDefault":"glm-4.6","options":[' +
+    '{"label":"sonnet","target":"glm-4.6"},{"label":"opus","target":null}]}';
+
+  it("parseFrame：models 段合法形状放行（current/cliDefault 可 null、target 可 null）；旧形态（无 models）兼容", () => {
+    const ok = parseFrame(SNAP(MODELS + ',"machine":"home-mac"')) as WorkspacesFrame | null;
+    expect(ok?.models).toEqual({
+      current: null,
+      cliDefault: "glm-4.6",
+      options: [
+        { label: "sonnet", target: "glm-4.6" },
+        { label: "opus", target: null },
+      ],
+    });
+    // current 非字符串 null 形态 + 空 options 同样合法
+    expect(
+      parseFrame(SNAP(',"models":{"current":"sonnet","cliDefault":null,"options":[]}')),
+    ).toMatchObject({ models: { current: "sonnet", cliDefault: null, options: [] } });
+    // 旧网关形态：无 models 段
+    const legacy = parseFrame(SNAP("")) as WorkspacesFrame | null;
+    expect(legacy?.models).toBeUndefined();
+  });
+
+  it("parseFrame 反例：current/cliDefault 非法类型、缺 cliDefault、options 元素畸形 → 整帧拒", () => {
+    // current 数字 / cliDefault 数字 / 缺 cliDefault / 缺 current
+    expect(parseFrame(SNAP(',"models":{"current":1,"cliDefault":null,"options":[]}'))).toBeNull();
+    expect(parseFrame(SNAP(',"models":{"current":null,"cliDefault":2,"options":[]}'))).toBeNull();
+    expect(parseFrame(SNAP(',"models":{"current":null,"options":[]}'))).toBeNull();
+    expect(parseFrame(SNAP(',"models":{"cliDefault":null,"options":[]}'))).toBeNull();
+    // options 非数组 / 元素缺 label / label 非字符串 / target 数字
+    expect(parseFrame(SNAP(',"models":{"current":null,"cliDefault":null,"options":{}}'))).toBeNull();
+    expect(
+      parseFrame(SNAP(',"models":{"current":null,"cliDefault":null,"options":[{"target":"x"}]}')),
+    ).toBeNull();
+    expect(
+      parseFrame(SNAP(',"models":{"current":null,"cliDefault":null,"options":[{"label":1}]}')),
+    ).toBeNull();
+    expect(
+      parseFrame(
+        SNAP(',"models":{"current":null,"cliDefault":null,"options":[{"label":"a","target":9}]}'),
+      ),
+    ).toBeNull();
+    // models 非对象
+    expect(parseFrame(SNAP(',"models":"x"'))).toBeNull();
+  });
+
+  it("reducer：models 随快照落 workspaces[machine].models；下一条无 models 的快照清除（整体覆盖语义）", () => {
+    let s = run(initialState(), {
+      type: "frame",
+      frame: frame(SNAP(MODELS + ',"machine":"home-mac"')),
+    });
+    expect(s.workspaces["home-mac"]?.models).toEqual({
+      current: null,
+      cliDefault: "glm-4.6",
+      options: [
+        { label: "sonnet", target: "glm-4.6" },
+        { label: "opus", target: null },
+      ],
+    });
+    // 网关撤下映射/配空 official 后的快照（无 models 段）→ 清除（chips 回退内置）
+    s = run(s, {
+      type: "frame",
+      frame: frame(SNAP(',"machine":"home-mac"')),
+    });
+    expect(s.workspaces["home-mac"]?.models).toBeUndefined();
+    // 机器隔离：home-mac 的 models 不落 work-mac
+    s = run(s, {
+      type: "frame",
+      frame: frame(SNAP(MODELS + ',"machine":"home-mac"')),
+    });
+    s = run(s, {
+      type: "frame",
+      frame: frame(SNAP(',"machine":"work-mac"')),
+    });
+    expect(s.workspaces["work-mac"]?.models).toBeUndefined();
+    expect(s.workspaces["home-mac"]?.models?.cliDefault).toBe("glm-4.6");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 会话自动命名：title 派生（reducer）/ 自动短 ID（newAutoConvName）/ convTitle
 // ---------------------------------------------------------------------------
 

@@ -537,6 +537,13 @@ pub struct Config {
     /// 仅在 `claude_model` 同时设置时附加。
     #[serde(default)]
     pub claude_fallback_model: Option<String>,
+    /// 模型菜单官方回退列表（claude backend 用）：Web 驾驶舱 /model 快捷
+    /// chips 动态化的第②层——CLI（`~/.claude/settings.json` env）无
+    /// `ANTHROPIC_DEFAULT_*` 别名映射（官方直连形态）时，网关随 workspaces
+    /// 快照下发的菜单项即本列表。空列表 = 不下发（SPA 回退第③层内置）。
+    /// 缺省 `["sonnet", "opus", "haiku"]`。
+    #[serde(default = "default_official_models")]
+    pub official_models: Vec<String>,
     /// W1-2：禁用工具清单（claude `--disallowedTools`；与 allowed_tools 独立：
     /// allowed 先收敛、disallowed 再剔除，黑名单优先）。空 = 不附加。
     #[serde(default)]
@@ -726,6 +733,11 @@ fn default_delegate_tools() -> Vec<String> {
 /// 主轮的 1 小时缺省；上限见 load 期校验 DELEGATE_TIMEOUT_MAX_SECS）。
 fn default_delegate_timeout_secs() -> u64 {
     600
+}
+
+/// 模型菜单官方回退列表缺省（claude 官方别名三件套）。
+fn default_official_models() -> Vec<String> {
+    vec!["sonnet".into(), "opus".into(), "haiku".into()]
 }
 
 fn default_feishu_urgent_on_ask() -> bool {
@@ -2819,6 +2831,46 @@ agent = "codex"
             vec![PathBuf::from("/tmp")],
             "相对路径被过滤，绝对路径保留"
         );
+        cleanup(&p);
+    }
+
+    /// 模型菜单官方回退列表：缺省三件套 sonnet/opus/haiku；显式配置覆盖；
+    /// 空列表合法（= 不下发 models 段，SPA 回退内置）。
+    #[test]
+    fn official_models_default_and_override() {
+        let p = tmp_path(
+            "cfg_official_models_default",
+            "default_workdir = \"/tmp/ws\"\n",
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(
+            cfg.official_models,
+            vec![
+                "sonnet".to_string(),
+                "opus".to_string(),
+                "haiku".to_string()
+            ],
+            "缺省官方别名三件套"
+        );
+        cleanup(&p);
+
+        let p = tmp_path(
+            "cfg_official_models_override",
+            "default_workdir = \"/tmp/ws\"\nofficial_models = [\"glm-4.6\", \"glm-4.5-air\"]\n",
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(
+            cfg.official_models,
+            vec!["glm-4.6".to_string(), "glm-4.5-air".to_string()]
+        );
+        cleanup(&p);
+
+        let p = tmp_path(
+            "cfg_official_models_empty",
+            "default_workdir = \"/tmp/ws\"\nofficial_models = []\n",
+        );
+        let cfg = Config::load(&p).expect("空列表合法（不下发）");
+        assert!(cfg.official_models.is_empty());
         cleanup(&p);
     }
 }

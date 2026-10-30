@@ -51,6 +51,13 @@
 //! 段（`web:` 会话历史 `{id,title,updatedAt}`——title=手动名优先 /
 //! first_prompt 摘要按码点截 24；空集整段不序列化，旧形态字节不变）。
 //!
+//! v1.8 扩展（模型菜单动态化，契约同款字节级纪律）：出站 `workspaces`
+//! 快照帧可带可选 `models` 段 `{current, cliDefault, options[{label,
+//! target}]}`——CLI 配置（`~/.claude/settings.json` env 的
+//! ANTHROPIC_DEFAULT_* 映射，ccswitch 第三方供应商场景）优先，config
+//! `official_models` 官方列表回退，汇聚见 [`models`]；空 options 整段
+//! 不序列化，旧形态字节不变。
+//!
 //! **帧内 convId 协议约定：恒为完整 conv 形态（`web:<session>`）**。出站帧
 //! （text / card / approval_request …）写入的即完整 conv，浏览器回执帧
 //! （message / approval_response）**原样回传收到的 convId** 即可，不得剥前
@@ -69,6 +76,7 @@
 pub mod client;
 pub mod e2e;
 pub mod key;
+pub mod models;
 pub mod platform;
 
 pub use key::GatewayCredential;
@@ -544,6 +552,30 @@ pub(crate) struct SessionEntryFrame {
     pub(crate) updated_at: u64,
 }
 
+/// v1.8 模型菜单单项（models 段 options 元素，字段名按契约不得漂移）：
+/// `label` = 菜单显示名（别名 sonnet/opus/haiku 或官方名）；`target` =
+/// 第三方映射的实际模型 id（**无映射序列化为 null**——契约示例
+/// `{"label":"opus","target":null}`，非缺席）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct ModelOption {
+    pub(crate) label: String,
+    pub(crate) target: Option<String>,
+}
+
+/// v1.8 workspaces 快照帧可选 models 段（CLI 配置优先 + 网关官方列表回退，
+/// 汇聚逻辑见 [`crate::models::resolve_models`]）。`current` = backend.model()
+/// （/model 命令热设值，null = 未设置跟随 CLI 默认）；`cliDefault` =
+/// settings.json env.ANTHROPIC_MODEL（serde rename 对齐契约 `cliDefault`，
+/// 无则 null）；`options` = 菜单项（≥1 才由调用方序列化整段，见
+/// [`encode_workspaces_frame`]）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct ModelsFrame {
+    pub(crate) current: Option<String>,
+    #[serde(rename = "cliDefault")]
+    pub(crate) cli_default: Option<String>,
+    pub(crate) options: Vec<ModelOption>,
+}
+
 /// workspaces 全量快照帧（SPA 工作空间视图的单一数据来源）：
 /// `default` = 配置 default_workdir；`workspaces` = 全部命名空间（调用方
 /// 按 name 稳定序排好）；`convs` = 该网关全部已知 conv 的当前 workdir
@@ -552,8 +584,9 @@ pub(crate) struct SessionEntryFrame {
 /// reducer 按 `frame.machine` 把快照归属到机器；enc 信封的 machine 要经
 /// 解密分发处兜底注入才可达内帧，内帧自带才是权威）。`convs` 用
 /// BTreeMap：键序稳定，SPA 解析与测试断言可复现。v1.7 起可带可选
-/// `sessions` 段（`web:` 会话历史，见 [`SessionEntryFrame`]）——空集整段
-/// 不序列化（无 web: 会话的网关快照与 v1.6 逐字节一致，旧端零感知）。
+/// `sessions` 段（`web:` 会话历史，见 [`SessionEntryFrame`]）；v1.8 起可带
+/// 可选 `models` 段（模型菜单动态化，见 [`ModelsFrame`]）——两段空集整段
+/// 不序列化（无对应数据的网关快照与 v1.6 逐字节一致，旧端零感知）。
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct WorkspacesFrame {
     v: u8,
@@ -565,6 +598,8 @@ pub(crate) struct WorkspacesFrame {
     convs: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     sessions: Vec<SessionEntryFrame>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    models: Option<ModelsFrame>,
 }
 
 /// conv_workdir 增量帧：单个 conv 的工作目录已切换（网页 conv_workdir_set
@@ -598,14 +633,18 @@ pub(crate) struct ErrorFrame {
 
 /// workspaces 快照帧组帧。无截断面（无自由文本大字段；convs/sessions 量级
 /// = 会话数，远低于帧软限）。`sessions` 传空 Vec 时整段不序列化（旧形态
-/// 字节不变，协议 v1.7 可选段语义）。
+/// 字节不变，协议 v1.7 可选段语义）；`models` 传 None 或 options 空的帧时
+/// 整段不序列化（协议 v1.8 同语义——契约「≥1 才序列化整段」）。
 pub(crate) fn encode_workspaces_frame(
     machine: &str,
     default: &str,
     workspaces: Vec<WorkspaceEntryFrame>,
     convs: BTreeMap<String, String>,
     sessions: Vec<SessionEntryFrame>,
+    models: Option<ModelsFrame>,
 ) -> Result<String> {
+    // 契约「options ≥1 才序列化」在组帧出口统一兜底（调用方无需各自判断）。
+    let models = models.filter(|m| !m.options.is_empty());
     let frame = WorkspacesFrame {
         v: 1,
         kind: "workspaces",
@@ -614,6 +653,7 @@ pub(crate) fn encode_workspaces_frame(
         workspaces,
         convs,
         sessions,
+        models,
     };
     serde_json::to_string(&frame)
         .map_err(|e| CoreError::Platform(TARGET, format!("workspaces 帧序列化失败：{e}")))
@@ -1288,6 +1328,7 @@ mod tests {
             ],
             convs,
             Vec::new(),
+            None,
         )
         .unwrap();
         // 精确字符串（BTreeMap 键序稳定 + serde 按声明序输出）钉住字节形态。
@@ -1310,9 +1351,15 @@ mod tests {
         assert_eq!(v["convs"]["local:work"], "/lw", "含 local: 会话");
 
         // 空集合形态：workspaces=[] / convs={}。
-        let json =
-            encode_workspaces_frame("home-mac", "/def", Vec::new(), BTreeMap::new(), Vec::new())
-                .unwrap();
+        let json = encode_workspaces_frame(
+            "home-mac",
+            "/def",
+            Vec::new(),
+            BTreeMap::new(),
+            Vec::new(),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             json,
             r#"{"v":1,"type":"workspaces","machine":"home-mac","default":"/def","workspaces":[],"convs":{}}"#
@@ -1356,6 +1403,7 @@ mod tests {
                     updated_at: 1_770_000_001,
                 },
             ],
+            None,
         )
         .unwrap();
         // 精确字符串钉住字节形态（serde 按声明序输出，sessions 在 convs 之后）。
@@ -1373,13 +1421,116 @@ mod tests {
         assert_eq!(v["sessions"][0]["updatedAt"], 1_770_000_002);
 
         // 空集：整段缺席，与 v1.6 字节一致。
-        let json =
-            encode_workspaces_frame("home-mac", "/def", Vec::new(), BTreeMap::new(), Vec::new())
-                .unwrap();
+        let json = encode_workspaces_frame(
+            "home-mac",
+            "/def",
+            Vec::new(),
+            BTreeMap::new(),
+            Vec::new(),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             json,
             r#"{"v":1,"type":"workspaces","machine":"home-mac","default":"/def","workspaces":[],"convs":{}}"#
         );
+    }
+
+    /// v1.8 workspaces 快照 models 段**字节级断言**（契约逐字段一致：段置尾
+    /// （sessions 之后）、rename `cliDefault`、current/cliDefault/target 的
+    /// null 形态、options 元素 label 在前 target 在后）；models 段存在时旧
+    /// 三段（default/workspaces/convs）字节形态不变；options 空 / None →
+    /// 整段缺席（旧形态字节不变）。
+    #[test]
+    fn workspaces_frame_models_byte_level() {
+        let json = encode_workspaces_frame(
+            "home-mac",
+            "/def",
+            Vec::new(),
+            BTreeMap::new(),
+            Vec::new(),
+            Some(ModelsFrame {
+                current: None,
+                cli_default: Some("glm-4.6".into()),
+                options: vec![
+                    ModelOption {
+                        label: "sonnet".into(),
+                        target: Some("glm-4.6".into()),
+                    },
+                    ModelOption {
+                        label: "opus".into(),
+                        target: None,
+                    },
+                ],
+            }),
+        )
+        .unwrap();
+        // 精确字符串钉住字节形态（serde 按声明序输出，models 在 sessions
+        // 之后；null 按契约序列化为字面 null，非缺席）。
+        assert_eq!(
+            json,
+            r#"{"v":1,"type":"workspaces","machine":"home-mac","default":"/def","workspaces":[],"convs":{},"models":{"current":null,"cliDefault":"glm-4.6","options":[{"label":"sonnet","target":"glm-4.6"},{"label":"opus","target":null}]}}"#
+        );
+        // 逐字段复核（防手拼期望串自身笔误）。
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["models"]["current"], serde_json::Value::Null);
+        assert_eq!(v["models"]["cliDefault"], "glm-4.6");
+        assert_eq!(v["models"]["options"][0]["label"], "sonnet");
+        assert_eq!(v["models"]["options"][0]["target"], "glm-4.6");
+        assert_eq!(v["models"]["options"][1]["target"], serde_json::Value::Null);
+
+        // options 空 → 整段缺席（组帧出口统一兜底，与 None 等价）。
+        for models in [
+            None,
+            Some(ModelsFrame {
+                current: Some("sonnet".into()),
+                cli_default: None,
+                options: Vec::new(),
+            }),
+        ] {
+            let json = encode_workspaces_frame(
+                "home-mac",
+                "/def",
+                Vec::new(),
+                BTreeMap::new(),
+                Vec::new(),
+                models,
+            )
+            .unwrap();
+            assert_eq!(
+                json,
+                r#"{"v":1,"type":"workspaces","machine":"home-mac","default":"/def","workspaces":[],"convs":{}}"#,
+                "空 options / None 整段缺席"
+            );
+        }
+
+        // 与 sessions 段并存：sessions 在前 models 在尾。
+        let json = encode_workspaces_frame(
+            "home-mac",
+            "/def",
+            Vec::new(),
+            BTreeMap::new(),
+            vec![SessionEntryFrame {
+                id: "web:work".into(),
+                title: "标题".into(),
+                updated_at: 1,
+            }],
+            Some(ModelsFrame {
+                current: Some("sonnet".into()),
+                cli_default: None,
+                options: vec![ModelOption {
+                    label: "sonnet".into(),
+                    target: None,
+                }],
+            }),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            json.find(r#""sessions":"#).unwrap() < json.find(r#""models":"#).unwrap(),
+            "sessions 在 models 前：{json}"
+        );
+        assert_eq!(v["models"]["current"], "sonnet");
     }
 
     /// v1.7 title 规则（任务验收项）：手动名优先（trim 生效、空白名视为

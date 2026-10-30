@@ -22,6 +22,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
+# v1.8 模型目录：读 CLI（Claude Code）配置 ~/.claude/settings.json 的 env 模型
+# 映射（ccswitch 第三方供应商场景，ANTHROPIC_MODEL / ANTHROPIC_DEFAULT_*）。
+dirs = { workspace = true }
 # 网关 ed25519 挑战应答认证（协议 v1.3）+ E2E 握手签名（协议 v1.4，复用同一
 # 把密钥）：密钥文件加载/生成（rand 出 seed）与 prove/e2e_ack 帧签名；
 # seed/公钥 hex 编解码。

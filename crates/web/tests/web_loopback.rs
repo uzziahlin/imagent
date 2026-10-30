@@ -18,16 +18,22 @@
 //! 单独一条回归用例。
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
 use futures::{SinkExt, StreamExt};
-use imagent_core::{CardPhase, CardTerminal, ConvId, OutboundCard, Platform, ReplyHint};
+use imagent_core::{
+    AgentChunk, Backend, CardPhase, CardTerminal, ConvId, CoreError, OutboundCard, Platform,
+    ReplyHint, Result, RunOutcome, SessionId, TodoItem,
+};
 use imagent_relay::{spawn_relay, RelayConfig, RelayHandle};
 use imagent_store::Store;
 use imagent_web::{GatewayCredential, WebPlatform};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::handshake::client::generate_key;
 use tokio_tungstenite::tungstenite::http::Request;
 use tokio_tungstenite::tungstenite::Message;
@@ -74,6 +80,42 @@ fn valid_ws_dir() -> PathBuf {
     let d = std::env::temp_dir().join(format!("imagent-web-loopback-wsdir-{}", std::process::id()));
     std::fs::create_dir_all(&d).unwrap();
     d
+}
+
+/// v1.8 模型目录的 mock backend（model 恒 None——本集成测试不断言 models 段
+/// 内容（纯函数与 platform 单测覆盖），run 不可达）。
+struct NopBackend;
+
+#[async_trait]
+impl Backend for NopBackend {
+    #[allow(clippy::too_many_arguments)] // trait 方法固定形状（先例 backend.rs）
+    async fn run(
+        &self,
+        _conv_id: &str,
+        _prompt: &str,
+        _session: Option<&SessionId>,
+        _workdir: &Path,
+        _allowed_tools: &[String],
+        _chunks: mpsc::Sender<AgentChunk>,
+        _initial_todos: &[TodoItem],
+        _steer: mpsc::Receiver<String>,
+    ) -> Result<RunOutcome> {
+        Err(CoreError::Platform("test", "nop backend 不执行 run".into()))
+    }
+
+    fn name(&self) -> &'static str {
+        "nop"
+    }
+}
+
+/// v1.8 模型目录上下文：official 空 + mock backend——无 CLI 映射的机器上
+/// models 段整段缺席（快照与 v1.7 形态一致；映射机器上段出现亦不影响本
+/// 文件的 Value 级断言）。
+fn nop_models() -> imagent_web::models::ModelsContext {
+    imagent_web::models::ModelsContext {
+        backend: Arc::new(NopBackend),
+        official: Vec::new(),
+    }
 }
 
 /// 起 key-only relay（v1.3：KEYS 表绑本机公钥，TOKENS 全空——「只配公钥
@@ -124,6 +166,7 @@ async fn setup() -> (RelayHandle, WebPlatform, Ws) {
         &e2e_test_key_path("platform"),
         loopback_store("setup").await,
         valid_ws_dir(),
+        nop_models(),
     );
     // 等 platform 连上 relay（client spawn 后异步建连 + 三帧握手认证）。
     eventually(Duration::from_secs(10), || platform.is_online()).await;
@@ -607,6 +650,7 @@ async fn loopback_token_credential_compat() {
         MACHINE.to_string(),
         loopback_store("token").await,
         valid_ws_dir(),
+        nop_models(),
     );
     eventually(Duration::from_secs(10), || p.is_online()).await;
 
@@ -690,6 +734,7 @@ async fn loopback_e2e_encrypted_roundtrip() {
         &key_path,
         loopback_store("e2e").await,
         valid_ws_dir(),
+        nop_models(),
     );
     eventually(Duration::from_secs(10), || p.is_online()).await;
 
@@ -876,6 +921,7 @@ async fn loopback_workspace_frames_e2e_encrypted() {
         &key_path,
         store.clone(),
         default_dir.clone(),
+        nop_models(),
     );
     eventually(Duration::from_secs(10), || p.is_online()).await;
 

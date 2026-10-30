@@ -44,6 +44,7 @@ use imagent_core::{
 
 use crate::client::WebClient;
 use crate::e2e::E2eIdentity;
+use crate::models::{resolve_models, CliModels, ModelsContext};
 use crate::{
     encode_approval_request_frame, encode_approval_resolved_frame, encode_card_frame,
     encode_conv_workdir_frame, encode_error_frame, encode_text_frame, encode_workspaces_frame,
@@ -180,12 +181,15 @@ async fn serve_sync_requests(
 /// workspace 泵主循环：消费 client 转来的工作空间动作（store API 是 async，
 /// 在本泵内 await——不阻塞 client 收发循环与 dispatch）。`machine_id` 为
 /// 本机身份（出站帧必带，v1.1 语义；与 serve_sync_requests 同款注入）。
-/// 平台 Drop 时经 shutdown token 连动退出。
+/// `models` 为 v1.8 模型目录上下文（backend 句柄 + 官方回退列表）——每次
+/// 组快照现读 CLI settings（低频操作可接受，不做缓存）。平台 Drop 时经
+/// shutdown token 连动退出。
 async fn serve_workspace_actions(
     mut workspace_rx: mpsc::Receiver<InboundAction>,
     machine_id: String,
     store: Store,
     default_workdir: PathBuf,
+    models: ModelsContext,
     outbound_tx: mpsc::Sender<String>,
     shutdown: CancellationToken,
 ) {
@@ -196,7 +200,19 @@ async fn serve_workspace_actions(
                 let Some(act) = act else {
                     break; // client 退出（platform drop 连动），无后续动作
                 };
-                handle_workspace_action(&machine_id, &store, &default_workdir, act, &outbound_tx).await;
+                // v1.8：每次组装现读 CLI 映射（ccswitch 切供应商后下一条快照
+                // 即生效，无需重启/缓存失效）。
+                let cli = crate::models::read_cli_models();
+                handle_workspace_action(
+                    &machine_id,
+                    &store,
+                    &default_workdir,
+                    &models,
+                    &cli,
+                    act,
+                    &outbound_tx,
+                )
+                .await;
             }
         }
     }
@@ -212,6 +228,8 @@ async fn handle_workspace_action(
     machine: &str,
     store: &Store,
     default_workdir: &Path,
+    models: &ModelsContext,
+    cli: &CliModels,
     act: InboundAction,
     outbound_tx: &mpsc::Sender<String>,
 ) {
@@ -269,7 +287,7 @@ async fn handle_workspace_action(
         }
     }
     // 每帧收尾：全量快照（无论成败）。
-    match build_workspaces_frame(machine, store, default_workdir).await {
+    match build_workspaces_frame(machine, store, default_workdir, models, cli).await {
         Ok(json) => enqueue_best_effort(outbound_tx, json),
         Err(e) => warn!(target: TARGET, error = %e, "workspaces 快照帧序列化失败"),
     }
@@ -278,12 +296,16 @@ async fn handle_workspace_action(
 /// workspaces 全量快照组帧：default = 配置 default_workdir；workspaces =
 /// 全部命名空间（name 稳定序）；convs = 全部已知 conv 的当前 workdir
 ///（含 local: 会话）；sessions = `web:` 会话历史段（v1.7，见
-/// [`collect_session_entries`]）。best-effort：单段 list 失败 → warn + 该段
-/// 空，快照照发（SPA 单一数据来源，宁可缺段不可断流）。
+/// [`collect_session_entries`]）；models = v1.8 模型目录段（CLI 映射优先 +
+/// [`ModelsContext::official`] 回退，current = backend.model()——/model 命令
+/// 热设值；空 options 组帧出口整段缺席）。best-effort：单段 list 失败 →
+/// warn + 该段空，快照照发（SPA 单一数据来源，宁可缺段不可断流）。
 async fn build_workspaces_frame(
     machine: &str,
     store: &Store,
     default_workdir: &Path,
+    models: &ModelsContext,
+    cli: &CliModels,
 ) -> Result<String> {
     let mut entries: Vec<WorkspaceEntryFrame> = Vec::new();
     match store.list_config(WORKSPACE_PREFIX).await {
@@ -320,12 +342,16 @@ async fn build_workspaces_frame(
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name)); // 契约：按 name 稳定序
     let sessions = collect_session_entries(store).await;
+    // v1.8 models 段：CLI 映射（调用方现读注入，见 serve_workspace_actions）
+    // + backend.model()（/model 热设值）汇聚；空 options 整段缺席。
+    let models_frame = resolve_models(cli, &models.official, models.backend.model());
     encode_workspaces_frame(
         machine,
         &default_workdir.to_string_lossy(),
         entries,
         convs,
         sessions,
+        Some(models_frame),
     )
 }
 
@@ -704,7 +730,9 @@ impl WebPlatform {
     /// [`crate::resolve_machine_id`] 解析：config 显式值 / hostname 短名）；
     /// `default_session` 为无 convId 浏览器消息的落点（缺省 "default"）；
     /// `store` / `default_workdir` 为 v1.6 工作空间泵所需（store KV 句柄 +
-    /// 快照 default 字段来源，main 装配处注入）。
+    /// 快照 default 字段来源，main 装配处注入）；`models` 为 v1.8 模型目录
+    /// 上下文（backend 句柄 + config official_models，main 装配处传现有
+    /// backend clone——快照 models.current 取 backend.model()；测试传 mock）。
     ///
     /// E2E 密钥（v1.4）锚定 `<imagent_home>/web-e2e-key`（main 不感知——
     /// E2E 是内容保密增强，装配失败不阻断网关启动，仅降级明文 + warn；
@@ -716,6 +744,7 @@ impl WebPlatform {
         machine_id: String,
         store: Store,
         default_workdir: PathBuf,
+        models: ModelsContext,
     ) -> Self {
         let e2e_key = imagent_core::paths::imagent_home().join("web-e2e-key");
         Self::new_with_e2e(
@@ -726,11 +755,13 @@ impl WebPlatform {
             &e2e_key,
             store,
             default_workdir,
+            models,
         )
     }
 
     /// [`Self::new`] 的全参形态（E2E 密钥路径可注入——集成测试用临时目录，
     /// 不落真实 `~/.imagent`）。
+    #[allow(clippy::too_many_arguments)] // 参数已达 8——历史演化提醒（先例 backend.rs run）
     pub fn new_with_e2e(
         relay_url: String,
         credential: GatewayCredential,
@@ -739,6 +770,7 @@ impl WebPlatform {
         e2e_key_path: &std::path::Path,
         store: Store,
         default_workdir: PathBuf,
+        models: ModelsContext,
     ) -> Self {
         let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>(INBOUND_CHANNEL_CAPACITY);
         let (outbound_tx, outbound_rx) = mpsc::channel::<String>(OUTBOUND_CHANNEL_CAPACITY);
@@ -804,12 +836,14 @@ impl WebPlatform {
             shutdown.clone(),
         ));
 
-        // workspace 泵（v1.6 工作空间；出站帧带 machine，v1.1 语义）。
+        // workspace 泵（v1.6 工作空间 + v1.8 models 段；出站帧带 machine，
+        // v1.1 语义）。
         tokio::spawn(serve_workspace_actions(
             workspace_rx,
             machine_id.clone(),
             store,
             default_workdir,
+            models,
             outbound_tx.clone(),
             shutdown.clone(),
         ));
@@ -1112,7 +1146,7 @@ mod tests {
     //! wecom 同款手法）；端到端行为见 tests/web_loopback.rs。
 
     use super::*;
-    use imagent_core::{CardPhase, CardTerminal};
+    use imagent_core::{Backend, CardPhase, CardTerminal};
 
     /// 工作空间直测的 machine 断言锚点（出站帧必带，v1.1 语义）。
     const TEST_MACHINE: &str = "test-mac";
@@ -1151,6 +1185,7 @@ mod tests {
             &e2e_key,
             test_store().await,
             valid_dir(),
+            empty_models(),
         )
     }
 
@@ -1221,6 +1256,48 @@ mod tests {
     // channel 注入，不经网络；端到端路径见 tests/web_loopback.rs——含
     // on_workdir_changed 的 /cd 通知路径，帧在真实 relay 的浏览器端观测）----
 
+    /// v1.8 mock backend（只读 model()——models.current 数据源；run 不可达）。
+    struct TestBackend(Option<String>);
+
+    #[async_trait]
+    impl Backend for TestBackend {
+        #[allow(clippy::too_many_arguments)] // trait 方法固定形状（先例 backend.rs）
+        async fn run(
+            &self,
+            _conv_id: &str,
+            _prompt: &str,
+            _session: Option<&imagent_core::SessionId>,
+            _workdir: &Path,
+            _allowed_tools: &[String],
+            _chunks: tokio::sync::mpsc::Sender<imagent_core::AgentChunk>,
+            _initial_todos: &[imagent_core::TodoItem],
+            _steer: tokio::sync::mpsc::Receiver<String>,
+        ) -> Result<imagent_core::RunOutcome> {
+            Err(CoreError::Platform(
+                "test",
+                "mock backend 不执行 run".into(),
+            ))
+        }
+
+        fn name(&self) -> &'static str {
+            "test"
+        }
+
+        fn model(&self) -> Option<String> {
+            self.0.clone()
+        }
+    }
+
+    /// 既有动作测试的空模型上下文（official 空 + 无 CLI 映射 → models 段
+    /// 整段缺席，快照字节与 v1.6/v1.7 一致——断言不依赖运行机器的
+    /// ~/.claude 状态，确定性钉住）。
+    fn empty_models() -> ModelsContext {
+        ModelsContext {
+            backend: Arc::new(TestBackend(None)),
+            official: Vec::new(),
+        }
+    }
+
     /// 处理一条动作并取回全部出站帧（解析为 Value 便于断言）。
     /// machine 固定 TEST_MACHINE（出站帧 machine 断言锚点）。
     async fn run_action(
@@ -1228,13 +1305,94 @@ mod tests {
         default: &Path,
         act: InboundAction,
     ) -> Vec<serde_json::Value> {
+        run_action_with(store, default, &empty_models(), &CliModels::default(), act).await
+    }
+
+    /// [`run_action`] 的 v1.8 全参形态（模型上下文 + CLI 映射可注入）。
+    async fn run_action_with(
+        store: &Store,
+        default: &Path,
+        models: &ModelsContext,
+        cli: &CliModels,
+        act: InboundAction,
+    ) -> Vec<serde_json::Value> {
         let (tx, mut rx) = mpsc::channel::<String>(32);
-        handle_workspace_action(TEST_MACHINE, store, default, act, &tx).await;
+        handle_workspace_action(TEST_MACHINE, store, default, models, cli, act, &tx).await;
         let mut out = Vec::new();
         while let Ok(json) = rx.try_recv() {
             out.push(serde_json::from_str(&json).unwrap());
         }
         out
+    }
+
+    /// v1.8 models 段组装（任务验收项）：官方回退（无 CLI 映射 → options =
+    /// official 列表、target null、current = backend.model()）；CLI 映射优先
+    /// （只出有映射的别名、target = 映射值、cliDefault 原样）；空 official
+    /// 且无映射 → 整段缺席（旧形态字节不变）。
+    #[tokio::test]
+    async fn workspace_snapshot_models_section() {
+        let store = test_store().await;
+        let default = valid_dir();
+
+        // 官方回退 + current。
+        let ctx = ModelsContext {
+            backend: Arc::new(TestBackend(Some("glm-4.6".into()))),
+            official: vec!["sonnet".into(), "opus".into(), "haiku".into()],
+        };
+        let frames = run_action_with(
+            &store,
+            &default,
+            &ctx,
+            &CliModels::default(),
+            InboundAction::WorkspaceList,
+        )
+        .await;
+        let snap = frames
+            .iter()
+            .find(|f| f["type"] == "workspaces")
+            .unwrap_or_else(|| panic!("应回快照：{frames:?}"));
+        assert_eq!(snap["machine"], TEST_MACHINE, "快照帧带本机 machine");
+        let models = &snap["models"];
+        assert_eq!(models["current"], "glm-4.6", "current = backend.model()");
+        assert_eq!(models["cliDefault"], serde_json::Value::Null);
+        let opts = models["options"].as_array().unwrap();
+        assert_eq!(opts.len(), 3, "官方回退三件套：{opts:?}");
+        assert_eq!(opts[0]["label"], "sonnet");
+        assert!(
+            opts.iter().all(|o| o["target"].is_null()),
+            "官方回退 target 恒 null：{opts:?}"
+        );
+
+        // CLI 映射优先（2/3 子集；opus 无映射不出）+ cliDefault。
+        let cli = CliModels {
+            cli_default: Some("glm-4.6".into()),
+            aliases: [
+                ("sonnet".to_string(), "glm-4.6".to_string()),
+                ("haiku".to_string(), "glm-4.5-air".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let frames =
+            run_action_with(&store, &default, &ctx, &cli, InboundAction::WorkspaceList).await;
+        let snap = frames.iter().find(|f| f["type"] == "workspaces").unwrap();
+        let opts = snap["models"]["options"].as_array().unwrap();
+        assert_eq!(
+            opts.iter()
+                .map(|o| (o["label"].as_str().unwrap(), o["target"].as_str().unwrap()))
+                .collect::<Vec<_>>(),
+            vec![("sonnet", "glm-4.6"), ("haiku", "glm-4.5-air")],
+            "仅有映射的别名（opus 不出），展示序 sonnet→haiku"
+        );
+        assert_eq!(snap["models"]["cliDefault"], "glm-4.6");
+
+        // 空 official 且无映射 → 整段缺席（旧形态字节不变）。
+        let frames = run_action(&store, &default, InboundAction::WorkspaceList).await;
+        let snap = frames.iter().find(|f| f["type"] == "workspaces").unwrap();
+        assert!(
+            snap.get("models").is_none(),
+            "空 options 整段缺席（契约）：{snap}"
+        );
     }
 
     /// conv_workdir_set 校验链（任务说明验收项）：非绝对路径 / 目录不存在 /

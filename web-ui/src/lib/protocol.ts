@@ -40,6 +40,11 @@
 //   自动加密，网关落盘 media/up-*，超 8MB 回 error{media_too_large}）；入站
 //   workspaces 帧新增可选 sessions[{id,title,updatedAt}] 段（历史会话恢复，
 //   旧端三段不动——见 reducer mergePersistedSessions）。
+// - v1.8 模型菜单动态化：workspaces 帧新增可选 models{current, cliDefault,
+//   options[{label, target}]} 段（网关汇聚：CLI ~/.claude/settings.json 的
+//   env.ANTHROPIC_DEFAULT_* 映射优先，config official_models 官方列表回退；
+//   空 options 整段缺席）。reducer 落 workspaces[machine].models，命令面板
+//   /model chips 与当前模型文本据此渲染（lib/commands modelChips）。
 
 export const PROTOCOL_VERSION = 1;
 
@@ -579,10 +584,26 @@ export type WorkspaceInfo = { name: string; path: string; lastUsedAt?: number };
  * 优先，否则 first_prompt 按 Unicode 码点截 24 字符）、updatedAt = unix 秒。 */
 export type SessionSummary = { id: string; title: string; updatedAt: number };
 
+/** v1.8 模型菜单项（workspaces 帧可选 models 段 options 元素）：label = 菜单
+ *  显示名（别名 sonnet/opus/haiku 或官方模型名）；target = 第三方映射的
+ *  实际模型 id（无映射为 null——网关按可空字符串序列化，非缺席）。 */
+export type ModelOption = { label: string; target: string | null };
+
+/** v1.8 workspaces 帧可选 models 段（模型菜单动态化，网关侧汇聚）：current =
+ *  /model 命令热设值（null = 未设置，跟随 CLI 默认）；cliDefault =
+ *  settings.json env.ANTHROPIC_MODEL（CLI 侧默认模型，无则 null）；
+ *  options = 菜单项（网关侧空 options 整段不下发）。 */
+export type ModelsInfo = {
+  current: string | null;
+  cliDefault: string | null;
+  options: ModelOption[];
+};
+
 /** v1.6 工作空间全量快照（唯一事实源）：default = 该机器 default_workdir
  *  绝对路径；convs = convId → workdir 绝对路径（含 local: 前缀会话）。machine
  *  = 来源机器（旧网关缺席 → 归 DEFAULT_MACHINE）。v1.7 起可选携带 sessions
- *  （该机器持久化的历史会话列表，按 updatedAt 降序；旧网关缺席 → 不合并）。 */
+ *  （该机器持久化的历史会话列表，按 updatedAt 降序；旧网关缺席 → 不合并）；
+ *  v1.8 起可选携带 models（/model 菜单数据，旧网关缺席 → SPA 内置兜底）。 */
 export type WorkspacesFrame = {
   v: typeof PROTOCOL_VERSION;
   type: "workspaces";
@@ -591,6 +612,7 @@ export type WorkspacesFrame = {
   convs: Record<string, string>;
   machine?: string;
   sessions?: SessionSummary[];
+  models?: ModelsInfo;
 };
 
 /** v1.6 会话工作目录增量（conv_workdir_set 成功后随 workspaces 快照一起回）。 */
@@ -740,6 +762,31 @@ const sessionSummaryOk = (s: unknown): boolean => {
   return isStr(r, "id") && isStr(r, "title") && typeof r.updatedAt === "number";
 };
 
+/** v1.8 workspaces.models.options 元素：label 字符串；target 字符串或 null
+ *  （无映射的 null 形态——契约非缺席）。 */
+const modelOptionOk = (o: unknown): boolean => {
+  if (typeof o !== "object" || o === null) {
+    return false;
+  }
+  const r = o as Record<string, unknown>;
+  return isStr(r, "label") && (r.target === null || typeof r.target === "string");
+};
+
+/** v1.8 workspaces.models 段（可选）：current/cliDefault 字符串或 null、
+ *  options 为全合法元素数组；段本身缺席（旧网关）合法。 */
+const modelsOk = (m: unknown): boolean => {
+  if (typeof m !== "object" || m === null) {
+    return false;
+  }
+  const r = m as Record<string, unknown>;
+  return (
+    (r.current === null || typeof r.current === "string") &&
+    (r.cliDefault === null || typeof r.cliDefault === "string") &&
+    Array.isArray(r.options) &&
+    r.options.every(modelOptionOk)
+  );
+};
+
 const RESOLVED_DECISIONS: readonly string[] = ["allow", "deny", "always", "cancelled"];
 
 /** v1.4 e2e_ack 的网关身份公钥字段：ik（规范名）/ id / pk（宽容别名）任一
@@ -780,13 +827,14 @@ const INBOUND_CHECKS: Record<string, FieldCheck> = {
     isStr(o, "machine") && isStr(o, "gk") && isStr(o, "n2") && isStr(o, "sig") && ackIdentityOk(o),
   enc: (o) => isStr(o, "machine") && isStr(o, "box"),
   // v1.6 工作空间帧：逐字段形状校验（machine 可选——旧网关缺席归 DEFAULT_MACHINE）；
-  // v1.7 sessions 可选段：出现即须为全合法元素数组
+  // v1.7 sessions 可选段 / v1.8 models 可选段：出现即须为全合法元素
   workspaces: (o) =>
     isStr(o, "default") &&
     Array.isArray(o.workspaces) &&
     o.workspaces.every(workspaceOk) &&
     convDirsOk(o.convs) &&
     (o.sessions === undefined || (Array.isArray(o.sessions) && o.sessions.every(sessionSummaryOk))) &&
+    (o.models === undefined || modelsOk(o.models)) &&
     machineOk(o),
   conv_workdir: (o) => isStr(o, "convId") && isStr(o, "workdir") && machineOk(o),
 };
@@ -941,11 +989,14 @@ export type PairingRequest = {
 
 /** v1.6 单台机器的工作空间快照（workspaces 帧按 frame.machine 归入）：
  *  default = 该机器 default_workdir；items = 已存空间；convs = convId →
- *  当前 workdir。SPA 以快照为唯一事实源（乐观更新一律不做）。 */
+ *  当前 workdir。SPA 以快照为唯一事实源（乐观更新一律不做）。v1.8 起可含
+ *  models（/model 菜单数据；undefined = 网关未下发——空 options 或旧网关，
+ *  chips 回退内置）。 */
 export type MachineWorkspaces = {
   default: string;
   items: WorkspaceInfo[];
   convs: Record<string, string>;
+  models?: ModelsInfo;
 };
 
 export function initialState(): AppState {
@@ -1387,7 +1438,8 @@ function reduceFrame(state: AppState, frame: InboundFrame): AppState {
       // v1.6 全量快照：按帧来源机器整体落表（唯一事实源；失败回 error 帧且
       // 不再回快照——SPA 不做乐观更新，失败即维持上一份快照）。
       // v1.7：快照可选 sessions 段 → 先合并历史会话（仅补本地不存在的 conv），
-      // 再落快照表。
+      // 再落快照表。v1.8：快照可选 models 段随快照整体覆盖（缺席即清除——
+      // 网关撤下 CLI 映射/配空 official 后下一条快照自然回落内置 chips）。
       const machine = frameMachine(frame);
       const spaces = frame.sessions
         ? mergePersistedSessions(state, machine, frame.sessions)
@@ -1401,6 +1453,7 @@ function reduceFrame(state: AppState, frame: InboundFrame): AppState {
             default: frame.default,
             items: frame.workspaces,
             convs: frame.convs,
+            models: frame.models,
           },
         },
       };

@@ -1,6 +1,11 @@
-// v1.7 命令面板数据（纯 SPA，无协议改动）：内置斜杠命令表 + 过滤。
+// v1.7 命令面板数据（纯 SPA）：内置斜杠命令表 + 过滤。
+// v1.8 模型菜单动态化：/model chips 优先取 workspaces 快照 models 段
+// （lib/protocol ModelsInfo，网关汇聚 CLI 映射/官方列表下发），无快照回退
+// 内置（modelChips 三层兜底）。
 // 命令名与参数以 crates/core/src/dispatch/commands/mod.rs 的命令分派注册表
 // （KNOWN_COMMAND_WORDS）及各命令实现里的用法文案为准核对；描述自拟精炼。
+
+import type { ModelsInfo } from "./protocol";
 
 /** 单条命令条目：name 含 / 前缀（与后端分派臂逐字一致）。 */
 export type SlashCommand = {
@@ -13,8 +18,34 @@ export type SlashCommand = {
   group: string;
 };
 
-/** /model 行附注 + 快捷 chips 的模型名（点击直接填 `/model <名> `）。 */
-export const MODEL_CHIPS: readonly string[] = ["default", "sonnet", "opus", "haiku"];
+/** 模型菜单第③层兜底：无快照 / 网关未下发 options（旧网关或 official 配空）
+ *  时的内置 chips（= 官方别名三件套，与网关 config official_models 缺省同源）。 */
+export const BUILTIN_MODEL_CHIPS: readonly string[] = ["default", "sonnet", "opus", "haiku"];
+
+/**
+ * /model 快捷 chips（v1.8 三层来源）：①快照 models.options 有项 → 取 label
+ * 并前置 "default"（default = 恢复 CLI 默认，恒在首位）；②快照无 models 或
+ * options 空 → ③内置 BUILTIN_MODEL_CHIPS。返回新数组（调用方可安全渲染）。
+ */
+export function modelChips(models?: ModelsInfo): string[] {
+  const labels = models?.options.map((o) => o.label) ?? [];
+  return labels.length > 0 ? ["default", ...labels] : [...BUILTIN_MODEL_CHIPS];
+}
+
+/**
+ * /model 行尾的当前模型文本：current 非空显示 current（/model 热设值）；
+ * 空且 cliDefault 非空显示 `默认 · {cliDefault}`（跟随 CLI 默认，附实际模型
+ * id）；都空显示「默认」。models 未下发（旧网关）同样显示「默认」。
+ */
+export function currentModelText(models?: ModelsInfo): string {
+  if (models?.current) {
+    return models.current;
+  }
+  if (models?.cliDefault) {
+    return `默认 · ${models.cliDefault}`;
+  }
+  return "默认";
+}
 
 /** 内置命令表（按分组排列；填充文本 = `${name} `，光标留参数位）。 */
 export const COMMANDS: readonly SlashCommand[] = [

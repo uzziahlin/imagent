@@ -116,6 +116,10 @@ function noticeText(n: MachineNotice): string {
 
 const EMPTY_CONV: ConvState = { entries: [], pending: [], lastPreview: "", lastAt: 0, unread: 0 };
 
+/** v1.8 /model 命令发出后延时重拉 workspace_list 的间隔（ms）：留出网关
+ *  处理命令 + backend.model() 热设落位的窗口，刷新面板「当前模型」高亮。 */
+const MODEL_REFETCH_DELAY_MS = 800;
+
 /** conv 全名（用户输入的名字统一补 web: 前缀，幂等）。 */
 function toConvId(name: string): string {
   return name.startsWith("web:") ? name : `web:${name}`;
@@ -529,7 +533,11 @@ export default function App() {
     state.machinesKnown ? state.currentMachine : undefined;
 
   /** v1.7：可选 media（压缩图片）随 message 帧发送；纯图消息（text 空串）
-   *  本地回显用「[图片]」占位（网关侧 text 非空则 Some、空则 None）。 */
+   *  本地回显用「[图片]」占位（网关侧 text 非空则 Some、空则 None）。
+   *  v1.8：/model <名> 命令发出后延时重拉一次 workspace_list——网关处理命令
+   *  热设 backend.model() 后回快照，刷新命令面板「当前模型」高亮（/model
+   *  本身不产生消息流回显之外的可观测反馈）。仅 `/model ` 前缀且非仅
+   *  `/model`（无参形态是查看而非切换）。 */
   const sendMessage = (text: string, media?: MediaPayload): boolean => {
     const ok = wsRef.current?.sendMessage(currentConv, text, outMachine(), media) ?? false;
     if (ok) {
@@ -539,6 +547,12 @@ export default function App() {
         text: text || "[图片]",
         machine: state.currentMachine,
       });
+      if (text.startsWith("/model ") && text.trim() !== "/model") {
+        const machine = outMachine();
+        window.setTimeout(() => {
+          wsRef.current?.listWorkspaces(machine);
+        }, MODEL_REFETCH_DELAY_MS);
+      }
     }
     return ok;
   };
@@ -1002,6 +1016,7 @@ export default function App() {
         <Composer
           status={status}
           e2eBlocked={e2eBlocked}
+          models={wsSnapshot?.models}
           onSend={sendMessage}
           onStop={() => {
             wsRef.current?.sendControl("stop", undefined, outMachine());

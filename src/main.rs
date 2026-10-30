@@ -703,40 +703,6 @@ async fn main() -> Result<()> {
             }
             // 展示名：单平台即名字；多平台并列（+ 连接，仅日志 / /health 展示）。
             let platform_name = platform_names.join("+");
-            let platform = if platform_names.len() == 1 {
-                build_platform(&platform_names[0], &config, store.clone()).await?
-            } else {
-                let mut children = Vec::with_capacity(platform_names.len());
-                for n in &platform_names {
-                    children.push(build_platform(n, &config, store.clone()).await?);
-                }
-                tracing::info!(
-                    target: "imagent::ops",
-                    platforms = %platform_name,
-                    "多平台并存：MultiPlatform 组合器合并子平台（Dispatcher 零改动）"
-                );
-                Arc::new(imagent_core::MultiPlatform::new(children)?)
-                    as Arc<dyn imagent_core::Platform>
-            };
-
-            // Wave C（出站可靠性收敛）：未知 kind sweeper——outbox 行的 kind
-            // 不属于当前在跑的 driver（如平台从 config 撤下后的历史积压、kind
-            // 拼写漂移）时推后 + 告警 + 超限回收，防永久滞留撑表（v14 P3o
-            // 防御的泛化形态，见 core::outbox 模块文档）。ilink 无 outbox
-            // kind（不接入的决策同样记档在那里），空名单即清剿全部历史行。
-            {
-                // M2.5：多平台下 outbox kind 名单取**全部**子平台的并集——漏列
-                // 会让某个在跑平台的合法积压行被 sweeper 当未知 kind 回收。
-                let driven_kinds: Vec<&str> = platform_names
-                    .iter()
-                    .flat_map(|n| match n.as_str() {
-                        "feishu" => vec![imagent_feishu::OUTBOX_KIND],
-                        "wecom" => vec![imagent_wecom::OUTBOX_KIND],
-                        _ => Vec::new(),
-                    })
-                    .collect();
-                imagent_core::outbox::spawn_unknown_kind_sweeper(store.clone(), &driven_kinds);
-            }
 
             // T12：Bitable 数据面启用判定（claude 运行参数 --bitable 与
             // Dispatcher 注入共用同一判定）；未启用原因一次性 warn（缺一/非
@@ -749,13 +715,12 @@ async fn main() -> Result<()> {
             ops::warn_bitable_disable_reason(&config, bitable_view);
             let bitable_on = config.bitable_enabled_for(bitable_view);
 
-            // 孤儿流式卡片关流（P4_ROADMAP 第六批）：上次进程退出时滞留「生成中」的
-            // 卡片按 store 登记逐张 patch 成「已中断」，失败保留登记下次再试。
-            imagent_core::sweep_live_cards(&store, platform.as_ref()).await;
-
             // 6. backend —— permission_mode 用共享句柄，SIGHUP 热重载即时生效。
             // auto（缺省）先按后端解析成具体档：claude-cli → ask（IM 审批闭环），
             // 其余 → off（闭环未接，靠各自 sandbox 兜底）。
+            // v1.8 模型菜单：backend **先于 platform 装配**——web 分支构造
+            // WebPlatform 需注入 backend 句柄（workspaces 快照 models 段的
+            // current = backend.model()，/model 命令热设值）。
             let perm_resolved = ops::resolve_permission_mode(config.permission_mode, &config.agent);
             if config.permission_mode == imagent_core::PermissionMode::Auto {
                 tracing::info!(
@@ -791,6 +756,48 @@ async fn main() -> Result<()> {
                     "backend_permission_mode 已配置但该后端不支持原生权限模式透传（忽略）。能力矩阵：claude-cli/claude-acp=IM 审批闭环；gemini=仅原生 --approval-mode（由 allowed_tools 收敛）；codex=无原生 approval 档（exec 模式）"
                 );
             }
+
+            // platform 装配（v1.8：移到 backend 就绪之后——web 分支注入
+            // backend clone，见上）：CLI 显式优先（单平台），否则
+            // config.platforms 多平台列表，最后回退 config.platform 单值。
+            let platform = if platform_names.len() == 1 {
+                build_platform(&platform_names[0], &config, store.clone(), &backend).await?
+            } else {
+                let mut children = Vec::with_capacity(platform_names.len());
+                for n in &platform_names {
+                    children.push(build_platform(n, &config, store.clone(), &backend).await?);
+                }
+                tracing::info!(
+                    target: "imagent::ops",
+                    platforms = %platform_name,
+                    "多平台并存：MultiPlatform 组合器合并子平台（Dispatcher 零改动）"
+                );
+                Arc::new(imagent_core::MultiPlatform::new(children)?)
+                    as Arc<dyn imagent_core::Platform>
+            };
+
+            // Wave C（出站可靠性收敛）：未知 kind sweeper——outbox 行的 kind
+            // 不属于当前在跑的 driver（如平台从 config 撤下后的历史积压、kind
+            // 拼写漂移）时推后 + 告警 + 超限回收，防永久滞留撑表（v14 P3o
+            // 防御的泛化形态，见 core::outbox 模块文档）。ilink 无 outbox
+            // kind（不接入的决策同样记档在那里），空名单即清剿全部历史行。
+            {
+                // M2.5：多平台下 outbox kind 名单取**全部**子平台的并集——漏列
+                // 会让某个在跑平台的合法积压行被 sweeper 当未知 kind 回收。
+                let driven_kinds: Vec<&str> = platform_names
+                    .iter()
+                    .flat_map(|n| match n.as_str() {
+                        "feishu" => vec![imagent_feishu::OUTBOX_KIND],
+                        "wecom" => vec![imagent_wecom::OUTBOX_KIND],
+                        _ => Vec::new(),
+                    })
+                    .collect();
+                imagent_core::outbox::spawn_unknown_kind_sweeper(store.clone(), &driven_kinds);
+            }
+
+            // 孤儿流式卡片关流（P4_ROADMAP 第六批）：上次进程退出时滞留「生成中」的
+            // 卡片按 store 登记逐张 patch 成「已中断」，失败保留登记下次再试。
+            imagent_core::sweep_live_cards(&store, platform.as_ref()).await;
 
             // B3/T4：能力面矩阵告警统一收敛到 Dispatcher（run 启动 + SIGHUP +
             // /perm 三点位，按 Backend 能力位判定而非后端名硬编码）：
@@ -1527,7 +1534,9 @@ fn build_backend(
 // Platform 选择：按 platform 名选用 ilink 或 wecom。
 // ---------------------------------------------------------------------------
 
-/// 按 platform 名选择 Platform 实例。
+/// 按 platform 名选择 Platform 实例。`backend` 为已装配的 agent 后端句柄
+/// （v1.8：仅 web 分支消费——注入 WebPlatform 作 workspaces 快照 models
+/// 段的 current 数据源 backend.model()；其余分支忽略）。
 ///
 /// - `"wecom"` → [`imagent_wecom::WeComPlatform`]：`bot_id` 取自 config（非敏感）；
 ///   `secret` 优先取 store 凭据（`imagent login wecom`，keyring/加密落盘），
@@ -1552,6 +1561,7 @@ async fn build_platform(
     name: &str,
     config: &imagent_core::Config,
     store: imagent_store::Store,
+    backend: &Arc<dyn imagent_core::Backend>,
 ) -> Result<Arc<dyn imagent_core::Platform>> {
     match name {
         "wecom" => {
@@ -1656,6 +1666,10 @@ async fn build_platform(
             // v1.6 工作空间：注入 store 句柄 + default_workdir（workspace 泵
             // 直接读写 workspace:/workdir: KV——与终端 /ws /cd 同源互通，
             // 快照 default 字段取 default_workdir）。
+            // v1.8 模型目录：注入 backend 句柄（快照 models.current =
+            // backend.model()，/model 命令热设值）+ config official_models
+            // （CLI ~/.claude/settings.json 无 ANTHROPIC_DEFAULT_* 映射时的
+            // 官方回退列表）。
             Ok(Arc::new(imagent_web::WebPlatform::new(
                 relay_url,
                 credential,
@@ -1663,6 +1677,10 @@ async fn build_platform(
                 machine_id,
                 store.clone(),
                 config.default_workdir.clone(),
+                imagent_web::models::ModelsContext {
+                    backend: backend.clone(),
+                    official: config.official_models.clone(),
+                },
             )))
         }
         "local" => {

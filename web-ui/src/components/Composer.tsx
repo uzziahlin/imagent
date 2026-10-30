@@ -1,8 +1,8 @@
 import { useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
 import type { ConnStatus } from "../lib/ws";
-import type { MediaPayload } from "../lib/protocol";
+import type { MediaPayload, ModelsInfo } from "../lib/protocol";
 import { compressImage } from "../lib/imageCompress";
-import { MODEL_CHIPS, filterCommands, type SlashCommand } from "../lib/commands";
+import { currentModelText, filterCommands, modelChips, type SlashCommand } from "../lib/commands";
 
 /**
  * 输入区自适应高度上限：6 行（text-base 行高 24px × 6 + 上下 padding 20px =
@@ -35,18 +35,24 @@ const E2E_BLOCKED_PLACEHOLDER = "加密连接未确认，暂不能发送（见�
  * v1.7 命令面板：输入以 / 开头（且未进入参数位——含空白即不弹）→ 输入框
  * 上方浮出命令面板（lib/commands 表按名称前缀/描述过滤）：↑↓ 选中、Tab/
  * Enter 填充（`/name ` 光标留参数位）、点击同效；Esc 或清掉 / 关闭；/model
- * 行附常用模型快捷 chips（default/sonnet/opus/haiku，点击直接填 `/model x `）。
+ * 行附模型快捷 chips（v1.8 动态化：优先当前机器快照 models 段的 options
+ * label 前置 default，无快照回退内置 default/sonnet/opus/haiku）+ 行尾
+ * 当前模型文本（current / 默认 · cliDefault / 默认）+ 有映射 target 的 chip
+ * 加 title 提示。
  * 条目 ≥40px 触控高度、面板 max-h 滚动（移动端友好）。
  */
 export function Composer({
   status,
   e2eBlocked,
+  models,
   onSend,
   onStop,
 }: {
   status: ConnStatus;
   /** v1.4：当前机器 e2e 发送被阻（状态化占位 + 全量禁用）。 */
   e2eBlocked?: boolean;
+  /** v1.8：当前机器快照的模型目录（/model chips 与当前模型文本；缺省内置兜底）。 */
+  models?: ModelsInfo;
   /** v1.7：可选 media 随 message 帧发送；text 空串 + media 合法（纯图消息）。 */
   onSend: (text: string, media?: MediaPayload) => boolean;
   onStop: () => void;
@@ -161,6 +167,7 @@ export function Composer({
                 key={c.name}
                 cmd={c}
                 selected={i === selIdx}
+                models={models}
                 onSelect={() => fill(`${c.name} `)}
                 onChip={(m) => fill(`/model ${m} `)}
               />
@@ -266,16 +273,20 @@ export function Composer({
   );
 }
 
-/** 面板单行：命令名 + 参数提示 + 描述；/model 行额外附常用模型快捷 chips
- *  （点击直接填 `/model <名> `，不占用行本身的选择语义）。 */
+/** 面板单行：命令名 + 参数提示 + 描述；/model 行额外附模型快捷 chips
+ *  （v1.8 动态化：modelChips(models) 三层来源，点击直接填 `/model <名> `，
+ *  不占用行本身的选择语义；有映射 target 的 chip 加 title 提示）+ 行尾
+ *  当前模型文本（currentModelText：current / 默认 · cliDefault / 默认）。 */
 function CommandRow({
   cmd,
   selected,
+  models,
   onSelect,
   onChip,
 }: {
   cmd: SlashCommand;
   selected: boolean;
+  models?: ModelsInfo;
   onSelect: () => void;
   onChip: (model: string) => void;
 }) {
@@ -296,20 +307,27 @@ function CommandRow({
         <span className="min-w-0 flex-1 truncate text-right text-xs text-muted">{cmd.desc}</span>
       </div>
       {cmd.name === "/model" && (
-        <div className="flex flex-wrap gap-1.5 px-3 pb-2">
-          {MODEL_CHIPS.map((m) => (
-            <button
-              key={m}
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                onChip(m);
-              }}
-              className="press rounded-lg border border-line-strong bg-surface px-2 py-1 font-mono text-[11px] text-muted transition-colors hover:border-emerald-500/60 hover:text-ink"
-            >
-              {m}
-            </button>
-          ))}
+        <div className="flex flex-wrap items-center gap-1.5 px-3 pb-2">
+          {modelChips(models).map((m) => {
+            const target = models?.options.find((o) => o.label === m)?.target;
+            return (
+              <button
+                key={m}
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onChip(m);
+                }}
+                title={target ? `映射 → ${target}` : undefined}
+                className="press rounded-lg border border-line-strong bg-surface px-2 py-1 font-mono text-[11px] text-muted transition-colors hover:border-emerald-500/60 hover:text-ink"
+              >
+                {m}
+              </button>
+            );
+          })}
+          <span className="ml-auto shrink-0 text-[11px] text-ghost">
+            当前 {currentModelText(models)}
+          </span>
         </div>
       )}
     </div>

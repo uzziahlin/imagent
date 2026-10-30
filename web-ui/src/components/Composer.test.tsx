@@ -1,10 +1,12 @@
 // v1.7 Composer：命令面板（过滤/键盘/点选/填充/Esc/模型 chips）+ 图片附件
 // （选图→压缩→预览→随发）。canvas 主路径（compressImage）经 vi.mock 替换——
 // jsdom 无 canvas（纯逻辑阈值/文件名在 lib/imageCompress.test.ts 覆盖）。
+// v1.8 模型菜单动态化：/model chips 取快照 models 段（modelChips 三层回退）
+// + 行尾当前模型文本（currentModelText）+ 有映射 target 的 chip title 提示。
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Composer } from "./Composer";
-import type { MediaPayload } from "../lib/protocol";
+import type { MediaPayload, ModelsInfo } from "../lib/protocol";
 
 // 压缩 fake：vi.hoisted 提升到 import 解析前可用（vi.mock 工厂在 Composer
 // 模块加载时即执行）；可注入断言/失败态，默认成功返回固定载荷。
@@ -130,6 +132,63 @@ describe("Composer 命令面板（v1.7）", () => {
     expect(panel()).toBeNull();
     key(ta, "Enter");
     expect(onSend).toHaveBeenCalledWith("/zzz", undefined);
+  });
+});
+
+describe("Composer /model chips 动态化（v1.8）", () => {
+  /** 第三方映射形态：sonnet/opus 有映射（opus target null 属官方回退形态，
+   *  此处混用以覆盖 title 有/无两分支），haiku 未映射。 */
+  const MAPPED: ModelsInfo = {
+    current: "glm-4.6",
+    cliDefault: "glm-4.6",
+    options: [
+      { label: "sonnet", target: "glm-4.6" },
+      { label: "opus", target: null },
+    ],
+  };
+
+  /** 挂载并输入 /mo 弹面板（唯一命中 /model 行）。 */
+  function mountPanel(models?: ModelsInfo) {
+    render(
+      <Composer status="ready" models={models} onSend={vi.fn(() => true)} onStop={vi.fn()} />,
+    );
+    const ta = screen.getByLabelText("消息输入框") as HTMLTextAreaElement;
+    type(ta, "/mo");
+    return panel()!;
+  }
+
+  it("快照 options 渲染动态 chips（default 前置；未映射别名不出）+ 行尾当前模型文本（current）+ title 映射提示", () => {
+    const p = mountPanel(MAPPED);
+    expect(p.getByRole("button", { name: "default" })).toBeTruthy();
+    expect(p.getByRole("button", { name: "sonnet" })).toBeTruthy();
+    expect(p.getByRole("button", { name: "opus" })).toBeTruthy();
+    expect(p.queryByRole("button", { name: "haiku" })).toBeNull();
+    // 行尾当前模型文本：current 非空显示 current。
+    expect(p.getByText("当前 glm-4.6")).toBeTruthy();
+    // 有 target 的 chip 加映射目标提示（title）；target null 无。
+    expect(p.getByRole("button", { name: "sonnet" }).getAttribute("title")).toBe(
+      "映射 → glm-4.6",
+    );
+    expect(p.getByRole("button", { name: "opus" }).getAttribute("title")).toBeNull();
+  });
+
+  it("current 空且 cliDefault 非空 →「当前 默认 · x」；无快照 → 内置 chips +「当前 默认」", () => {
+    let p = mountPanel({ current: null, cliDefault: "glm-4.6", options: MAPPED.options });
+    expect(p.getByText("当前 默认 · glm-4.6")).toBeTruthy();
+    cleanup();
+    p = mountPanel(undefined);
+    for (const m of ["default", "sonnet", "opus", "haiku"]) {
+      expect(p.getByRole("button", { name: m })).toBeTruthy(); // 第③层内置兜底
+    }
+    expect(p.getByText("当前 默认")).toBeTruthy();
+  });
+
+  it("点击动态 chip 直接填 `/model sonnet `（含空白 → 面板关闭）", () => {
+    mountPanel(MAPPED);
+    const ta = screen.getByLabelText("消息输入框") as HTMLTextAreaElement;
+    fireEvent.click(panel()!.getByRole("button", { name: "sonnet" }));
+    expect(ta.value).toBe("/model sonnet ");
+    expect(panel()).toBeNull();
   });
 });
 

@@ -1630,3 +1630,69 @@ describe("App 会话自动命名", () => {
     expect(screen.getAllByText("手动会话首条消息").length).toBeGreaterThanOrEqual(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// v1.8 模型菜单动态化：/model 命令发出后延时 800ms 重拉 workspace_list
+// （刷新快照 models.current 的「当前模型」高亮）
+// ---------------------------------------------------------------------------
+
+describe("/model 命令后延时重拉快照（v1.8）", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** 已出站的 workspace_list 帧数。 */
+  const listCount = (fake: FakeWebSocket): number =>
+    fake.sent.filter((s) => (JSON.parse(s) as { type?: string }).type === "workspace_list").length;
+
+  /** 出站 message 帧的 text 列表。 */
+  const messageTexts = (fake: FakeWebSocket): string[] =>
+    fake.sent
+      .map((s) => JSON.parse(s) as { type?: string; text?: string })
+      .filter((f) => f.type === "message")
+      .map((f) => f.text as string);
+
+  /** 挂载 + 握手到 ready（单机 home-mac 在线）并返回 fake socket。 */
+  function mountReady(): FakeWebSocket {
+    const fake = mountApp();
+    handshake(fake, ["home-mac"]);
+    return fake;
+  }
+
+  /** 输入框打字 + Enter 发送。 */
+  const send = (text: string) => {
+    const ta = screen.getByLabelText("消息输入框");
+    fireEvent.change(ta, { target: { value: text } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+  };
+
+  it("发送 `/model opus`（带参）后 800ms 重发一次 workspace_list（带当前机器）", () => {
+    vi.useFakeTimers();
+    const fake = mountReady();
+    const before = listCount(fake);
+    expect(before).toBe(1); // ready effect 已发一条
+
+    send("/model opus");
+    expect(messageTexts(fake)).toContain("/model opus");
+    // 未到 800ms 不重发；到点恰一条（带当前选中机器）。
+    act(() => vi.advanceTimersByTime(799));
+    expect(listCount(fake)).toBe(before);
+    act(() => vi.advanceTimersByTime(1));
+    expect(listCount(fake)).toBe(before + 1);
+    const lists = fake.sent
+      .map((s) => JSON.parse(s) as { type?: string; machine?: string })
+      .filter((f) => f.type === "workspace_list");
+    expect(lists[lists.length - 1].machine).toBe("home-mac");
+  });
+
+  it("`/model`（无参/仅尾随空格）与普通消息不触发重拉", () => {
+    vi.useFakeTimers();
+    const fake = mountReady();
+    const before = listCount(fake);
+    send("普通消息");
+    send("/model"); // 无参（查看形态）
+    send("/modelsomething"); // 非 /model 命令前缀
+    act(() => vi.advanceTimersByTime(3000));
+    expect(listCount(fake)).toBe(before);
+  });
+});
