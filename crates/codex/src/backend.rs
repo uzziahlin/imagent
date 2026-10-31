@@ -145,6 +145,20 @@ fn codex_parse(line: &str) -> CliEvent {
         ParsedEvent::ThreadStarted { thread_id } => CliEvent::Session(thread_id),
         ParsedEvent::Other { thread_id } => thread_id.map_or(CliEvent::Skip, CliEvent::Session),
         ParsedEvent::AgentMessage { text } => CliEvent::Text(text),
+        // v1.33：reasoning（item.completed 送达，每段一条完整文本快照）→
+        // Thought：手机 💭 思考折叠区，与 claude thinking 块同链路（core 的
+        // spawn_cli_backend：Thought → AgentChunk::Thought；round.rs 侧
+        // CardSession::append_thought，MAX_THOUGHTS/THOUGHT_TRUNC 截断由
+        // CardSession 统一处理，backend 透传即可）。
+        ParsedEvent::Reasoning { text } => CliEvent::Thought(text),
+        // v1.33：item.updated + agent_message——防御性 Skip。实证 codex exec
+        // --json 全版本线（0.48–0.139）从不发出该事件，且按协议惯例 text 为
+        // 累计全文快照而非纯增量（详见 stream.rs parse_item 注释）：无状态
+        // 解析器无法 diff 出新增部分，透传 append 会把快照重复拼进正文，且
+        // completed → CliEvent::Text 按 B9 累积、轮末 Final 覆盖的是同一份
+        // 累积——重复无法自愈。权威正文由 item.completed 的 AgentMessage
+        // （→ Text 累积，本就逐段流式）兜底，此处丢弃不影响现有体验。
+        ParsedEvent::AgentMessageDelta { .. } => CliEvent::Skip,
         ParsedEvent::ToolUse { tool, input } => CliEvent::ToolUse {
             tool,
             input,
@@ -355,5 +369,53 @@ mod tests {
         // codex_parse 把 Other 映射为 Skip）。
         let bad = r#"{"type":"item.completed","item":{"id":"t1","type":"todo_list"}}"#;
         assert!(matches!(codex_parse(bad), CliEvent::Skip));
+    }
+
+    // ---- v1.33：reasoning 上卡 / agent_message updated 防御 Skip ----
+
+    /// reasoning item.completed → CliEvent::Thought（💭 折叠区，claude thinking
+    /// 同链路；截断由 CardSession 统一处理）。
+    #[test]
+    fn reasoning_maps_to_thought() {
+        let line = r#"{"type":"item.completed","item":{"id":"item_3","type":"reasoning","text":"先查分派逻辑，再核对消费链路。"}}"#;
+        match codex_parse(line) {
+            CliEvent::Thought(t) => assert_eq!(t, "先查分派逻辑，再核对消费链路。"),
+            other => panic!("期望 Thought，得到 {other:?}"),
+        }
+    }
+
+    /// item.updated + agent_message → Skip（防御性）：实证全版本线不发出，
+    /// 且 text 为累计全文快照，透传 append 会重复污染正文且无法自愈（见
+    /// stream.rs / codex_parse 注释）。
+    #[test]
+    fn agent_message_delta_maps_to_skip_defensively() {
+        let line = r#"{"type":"item.updated","item":{"id":"item_1","type":"agent_message","text":"正在生成的部分回答"}}"#;
+        assert!(matches!(codex_parse(line), CliEvent::Skip));
+    }
+
+    /// 真机流序列（0.139 形态，脱敏）：思考 → 逐段正文 → 终止 + usage。
+    /// 断言 Thought/Text/Terminal 的既有链路顺序不被新分支打断。
+    #[test]
+    fn reasoning_then_message_then_terminal_sequence() {
+        let lines = [
+            r#"{"type":"thread.started","thread_id":"01a18fd4-0000-7000-8000-000000000000"}"#,
+            r#"{"type":"turn.started"}"#,
+            r#"{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"用户要一句流式测试。"}}"#,
+            r#"{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"流式测试通过。"}}"#,
+            r#"{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":8}}"#,
+        ];
+        let events: Vec<CliEvent> = lines.iter().map(|l| codex_parse(l)).collect();
+        assert!(matches!(events[0], CliEvent::Session(_)), "{:?}", events[0]);
+        assert!(matches!(events[1], CliEvent::Skip), "{:?}", events[1]);
+        assert!(matches!(&events[2], CliEvent::Thought(t) if t == "用户要一句流式测试。"));
+        assert!(matches!(&events[3], CliEvent::Text(t) if t == "流式测试通过。"));
+        match &events[4] {
+            CliEvent::Multi(v) => {
+                assert_eq!(v.len(), 2);
+                assert!(matches!(v[0], CliEvent::Usage(_)));
+                assert!(matches!(v[1], CliEvent::Terminal { .. }));
+            }
+            other => panic!("期望 Multi(Usage, Terminal)，得到 {other:?}"),
+        }
     }
 }

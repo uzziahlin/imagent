@@ -1,9 +1,11 @@
 //! `codex exec --json` 行解析（纯函数，可单测）。
 //!
 //! Codex CLI 在 `--json` 下每行 stdout 输出一个独立 JSON 对象，顶层有 `type`
-//! 字段。MVP 关心：
+//! 字段。关心：
 //! - `thread.started` 的 `thread_id`（session id）；
 //! - `item.completed` 且 `item.type == "agent_message"` 的文本（final）；
+//! - `item.updated|item.completed` 且 `item.type == "reasoning"` 的思考文本
+//!   （💭 折叠区，v1.33；此前归 Other 丢弃）；
 //! - `command_execution` / `mcp_tool_call` 的工具调用与结果；
 //! - `turn.completed`（成功终止）/ `turn.failed`（失败终止）。
 //!
@@ -36,7 +38,18 @@ pub enum ParsedEvent {
     ///（缺失/未知 → Pending）；items 缺失或形态不符退回 Other（宁可无面板
     /// 不可错面板）。
     TodoList { items: Vec<imagent_core::TodoItem> },
-    /// 其余有效 JSON 事件（reasoning / file_change / todo_list / 未识别…），
+    /// v1.33：`item.updated|item.completed` + `item.type == "reasoning"` 且
+    /// `item.text` 非空——一段完整思考（💭 折叠区）。实证（见 [`parse_item`]）
+    /// 每条 reasoning item 携带该段思考的**完整文本快照**，非增量；一轮可能
+    /// 产生多条（每段一条）。空/缺失/非字符串 → Other（fail-open）。
+    Reasoning { text: String },
+    /// v1.33：`item.updated` + `item.type == "agent_message"` 且 `item.text`
+    /// 非空——**防御性解析**。实证 codex exec --json 全版本线（0.48 / 0.75 /
+    /// 0.96 / 0.120 / 0.139，见 [`parse_item`] 注释）从不发出该事件；若未来
+    /// 契约变化发出，text 语义为该 item 的**累计全文快照**（协议惯例）而非
+    /// 纯增量。backend 侧映射见 codex_parse。
+    AgentMessageDelta { text: String },
+    /// 其余有效 JSON 事件（file_change / web_search / 未识别…），
     /// 附带该行中可能出现的 `thread_id`，便于上层尽早捕获。
     Other { thread_id: Option<String> },
     /// 非 JSON（空行 / 噪声），跳过。
@@ -53,6 +66,10 @@ pub enum ParsedEvent {
 /// - `type ∈ {item.started, item.updated, item.completed}`：
 ///     - `item.completed` + `item.type == "agent_message"` →
 ///       [`ParsedEvent::AgentMessage`]（`item.text`）；
+///     - `item.updated` + `item.type == "agent_message"`（text 非空）→
+///       [`ParsedEvent::AgentMessageDelta`]（防御性，见 [`parse_item`]）；
+///     - `item.updated|item.completed` + `item.type == "reasoning"`（text 非空）→
+///       [`ParsedEvent::Reasoning`]（💭 折叠区）；
 ///     - started + `item.type == "command_execution"` →
 ///       [`ParsedEvent::ToolUse`] `{ tool: "shell", input: item.command }`；
 ///     - `item.completed` + `item.type == "command_execution"` →
@@ -173,6 +190,47 @@ fn parse_item(event_type: &str, value: &Value, thread_id: Option<String>) -> Par
         (_, Some("todo_list")) => match parse_todo_items(item) {
             Some(items) => ParsedEvent::TodoList { items },
             None => ParsedEvent::Other { thread_id },
+        },
+        // v1.33：reasoning 思考文本（💭 折叠区）。实证（2026-10，codex-cli
+        // 0.48/0.75/0.96/0.120/0.139 源码核查 + 本机 ~/.codex/sessions rollout
+        // 扫描）：
+        // - exec --json 的 reasoning 只以 item.completed 送达（0.48–0.96 经
+        //   EventMsg::AgentReasoning、0.139 经 ServerNotification::ItemCompleted，
+        //   0.139 的 item.started 对 reasoning 显式抑制不发出）——每段思考一条
+        //   事件，text = 该段**完整文本快照**（0.48 为 AgentReasoningEvent.text，
+        //   0.139 为 reasoning summary 按 \n join），非增量，一轮可多条；
+        // - rollout（TUI 持久化格式，response_item/event_msg）不含 item.* 信封，
+        //   其 event_msg/agent_reasoning 同为逐段完整文本，与上述互证。
+        // 仅 completed/updated 且 text 非空才上卡；started（无文本）与空/缺失/
+        // 非字符串 text 一律 Other（fail-open，绝不 panic）。
+        (et, Some("reasoning")) if et == "item.completed" || et == "item.updated" => {
+            match item.get("text").and_then(Value::as_str) {
+                Some(t) if !t.trim().is_empty() => ParsedEvent::Reasoning {
+                    text: t.to_string(),
+                },
+                _ => ParsedEvent::Other { thread_id },
+            }
+        }
+        // v1.33：item.updated + agent_message——防御性解析。实证 codex exec
+        // --json 全版本线（0.48/0.75/0.96/0.120/0.139 源码核查）**从不发出**
+        // 该事件：中间 delta（AgentMessageDeltaNotification.delta 等）在 CLI
+        // exec 输出层被丢弃（event_processor 落 `_` 兜底臂），上网事件恒为
+        // item 全量快照——协议惯例：ItemUpdatedEvent { item: ThreadItem } 携带
+        // item 完整状态，纯增量在协议里是显式命名的 `delta` 字段且同样被输出
+        // 层丢弃；item.updated 现网仅属于 todo_list（PlanUpdate 全量快照）。
+        // 因此若未来契约变化开始发出，text 语义为「该 item 累计全文（快照）」
+        // 而非纯增量：无状态逐行解析器无法 diff 出新增部分，直接透传 append
+        // 会把快照重复拼进正文——且 codex 的 completed → CliEvent::Text 按 B9
+        // 累积、轮末 AgentChunk::Final 覆盖的正是同一份累积，重复无法自愈。
+        // 故 backend 侧映射为 Skip（宁可无流式不可错正文，对齐 todo_list 的
+        // 「宁可无面板不可错面板」纪律）；权威文本由 item.completed 的
+        // agent_message 兜底——codex 本就以 completed 逐段送达正文（含中间
+        // 叙述段），流式体验不受损。text 空/缺失/非字符串 → Other（fail-open）。
+        ("item.updated", Some("agent_message")) => match item.get("text").and_then(Value::as_str) {
+            Some(t) if !t.trim().is_empty() => ParsedEvent::AgentMessageDelta {
+                text: t.to_string(),
+            },
+            _ => ParsedEvent::Other { thread_id },
         },
         _ => ParsedEvent::Other { thread_id },
     }
@@ -392,10 +450,11 @@ mod tests {
                 thread_id: Some("tid-9".into())
             }
         );
-        // 未识别 item 也落到 Other，并保留 thread_id。
-        let reasoning = r#"{"type":"item.updated","thread_id":"tid-9","item":{"id":"r1","type":"reasoning","text":"..."}}"#;
+        // 未识别 item 也落到 Other，并保留 thread_id（v1.33 起 reasoning/
+        // agent_message updated 已有专属分支，此处改用未知 item 类型）。
+        let web_search = r#"{"type":"item.completed","thread_id":"tid-9","item":{"id":"w1","type":"web_search","query":"rust serde"}}"#;
         assert!(matches!(
-            parse_line(reasoning),
+            parse_line(web_search),
             ParsedEvent::Other { thread_id: Some(_) }
         ));
     }
@@ -409,6 +468,89 @@ mod tests {
             ParsedEvent::ToolUse {
                 tool: "shell".into(),
                 input: "bash -lc pwd".into()
+            }
+        );
+    }
+
+    // ---- v1.33：reasoning 上卡 / agent_message updated 防御解析 ----
+    // fixture 形态对齐 codex-cli 0.139.0 exec --json 线上格式（exec_events.rs：
+    // ThreadItem { id, #[serde(flatten)] details { type, text } }，信封
+    // {"type":"item.completed","item":{...}} 已由本机实跑抓流验证）；文本内容
+    // 取自本机 rollout 真实 reasoning 段脱敏缩写。
+
+    /// reasoning item.completed（0.139 真实送达路径）→ Reasoning。
+    #[test]
+    fn reasoning_completed_maps_to_reasoning() {
+        let line = r#"{"type":"item.completed","item":{"id":"item_3","type":"reasoning","text":"用户在问 MCP 启动失败。先看配置文件。\n再实际运行服务器验证握手。"}}"#;
+        assert_eq!(
+            parse_line(line),
+            ParsedEvent::Reasoning {
+                text: "用户在问 MCP 启动失败。先看配置文件。\n再实际运行服务器验证握手。".into()
+            }
+        );
+    }
+
+    /// reasoning item.updated：0.48–0.139 实证不发出（started 亦被抑制）；
+    /// 若未来发出，按同一条思考的快照语义上卡。
+    #[test]
+    fn reasoning_updated_with_text_maps_to_reasoning() {
+        let line = r#"{"type":"item.updated","item":{"id":"item_3","type":"reasoning","text":"先看配置文件。"}}"#;
+        assert_eq!(
+            parse_line(line),
+            ParsedEvent::Reasoning {
+                text: "先看配置文件。".into()
+            }
+        );
+    }
+
+    /// 空白/缺失 text 与 item.started 一律 Other（fail-open 纪律）。
+    #[test]
+    fn reasoning_without_text_falls_back_to_other() {
+        let started = r#"{"type":"item.started","item":{"id":"item_3","type":"reasoning","text":"will fill later"}}"#;
+        assert!(matches!(parse_line(started), ParsedEvent::Other { .. }));
+        let blank =
+            r#"{"type":"item.completed","item":{"id":"item_3","type":"reasoning","text":"  "}}"#;
+        assert!(matches!(parse_line(blank), ParsedEvent::Other { .. }));
+        let missing = r#"{"type":"item.completed","item":{"id":"item_3","type":"reasoning"}}"#;
+        assert!(matches!(parse_line(missing), ParsedEvent::Other { .. }));
+    }
+
+    /// item.updated + agent_message（text 非空）→ AgentMessageDelta。
+    /// 实证：0.48–0.139 从不发出；若未来发出，text 为累计全文快照（非纯
+    /// 增量，见 parse_item 注释）——backend 侧 Skip，不得当增量 append。
+    #[test]
+    fn agent_message_updated_maps_to_delta_defensively() {
+        let line = r#"{"type":"item.updated","item":{"id":"item_1","type":"agent_message","text":"正在生成的部分回答"}}"#;
+        assert_eq!(
+            parse_line(line),
+            ParsedEvent::AgentMessageDelta {
+                text: "正在生成的部分回答".into()
+            }
+        );
+        // 空 text → Other。
+        let empty =
+            r#"{"type":"item.updated","item":{"id":"item_1","type":"agent_message","text":""}}"#;
+        assert!(matches!(parse_line(empty), ParsedEvent::Other { .. }));
+    }
+
+    /// 关键序列回归：思考 → 正文逐段（completed）→ 终止，既有 completed →
+    /// AgentMessage 行为不变（/resume、幽灵预检、落盘依赖的权威文本路径）。
+    #[test]
+    fn reasoning_then_agent_message_sequence() {
+        let lines = [
+            r#"{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"用户要一句流式测试。"}}"#,
+            r#"{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"流式测试通过。"}}"#,
+        ];
+        assert_eq!(
+            parse_line(lines[0]),
+            ParsedEvent::Reasoning {
+                text: "用户要一句流式测试。".into()
+            }
+        );
+        assert_eq!(
+            parse_line(lines[1]),
+            ParsedEvent::AgentMessage {
+                text: "流式测试通过。".into()
             }
         );
     }
