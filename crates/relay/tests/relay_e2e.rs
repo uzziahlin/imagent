@@ -2933,7 +2933,7 @@ async fn e2e_machine_admin_frames_hot_update_and_disconnect() {
                 r#"{{"v":1,"type":"machine_add","adminToken":"{admin_token}","name":"home","pubkey":"{}"}}"#,
                 pubkey_hex(&test_signing_key(3))
             ),
-            "已存在",
+            "已被占用",
         ),
         (
             format!(
