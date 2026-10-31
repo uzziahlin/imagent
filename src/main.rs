@@ -161,9 +161,24 @@ enum Cmd {
     /// 会话从网关出生（conv `local:<会话名>`）。**终端只是视图**——Ctrl-C / exit
     /// 仅退出本视图，会话继续在网关跑（重入续看 / 网页侧接管）。需网关以
     /// platforms 含 "local" 启动（`imagent start`）；网关未运行时退出码 2。
+    /// 不发引擎声明——跟随网关默认/该会话已有设置（要用 codex-app 引擎请用
+    /// `codex` 子命令）。
     Claude {
         /// 会话名（缺省 default；conv 形如 local:<名>，与 IM/web 共享同一
         /// Dispatcher 管线：steering / 审批 / /stop 全可用）。
+        session: Option<String>,
+    },
+    /// 本机终端视图 + 声明 codex-app 引擎（批 B 薄视图）。
+    ///
+    /// 薄视图：声明本会话用 codex-app 引擎（=Claude auto 同构的审批档，
+    /// FullLoop 审批闭环），Ctrl-C 只退视图。与 `claude` 子命令同一视图实现
+    ///（连接 local.sock、会话继续在网关跑），唯一差异：连接成功后自动代发一条
+    /// `/backend codex-app` 命令文本——与手打等价，复用批 A 命令通道写本会话
+    /// 引擎覆盖（回显「✅ 本会话引擎已切换…」即确认，不进 agent 轮次）；
+    /// 幂等（会话已在该引擎时重复写同值 KV 无副作用）。其余同 `claude`：
+    /// 需网关以 platforms 含 "local" 启动；网关未运行时退出码 2。
+    Codex {
+        /// 会话名（缺省 default；conv 形如 local:<名>，与 claude 视图同一会话池）。
         session: Option<String>,
     },
 }
@@ -304,6 +319,25 @@ fn warn_if_instance_running(home: &Path) {
     if let Some(msg) = instance_running_warning(home) {
         eprintln!("{msg}");
     }
+}
+
+/// 视图子命令（`claude` / `codex`）收敛执行点（批 B 薄视图）：连网关
+/// local.sock（local 平台，unix socket）。`backend_hint` 为引擎声明——None =
+/// `claude` 既有语义（不发声明，跟随网关默认/该会话已有设置）；Some("codex-app")
+/// = `codex` 子命令（连接后自动代发 `/backend codex-app`，复用批 A 命令通道）。
+/// 只做视图——本进程不持实例锁、不驱动 agent；Ctrl-C 退出由 term::run 内部
+/// 处理（不向网关发停止信号）。退出码 2 = 网关未运行（此处转成进程退出码）。
+fn run_term_view(
+    data_dir: &Path,
+    backend_hint: Option<&str>,
+    session: Option<String>,
+) -> Result<()> {
+    let socket = data_dir.join("local.sock");
+    let code = imagent_localterm::term::run(&socket, session, backend_hint)?;
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -1452,14 +1486,14 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Claude { session } => {
-            // 本地终端客户端：连网关 local.sock（local 平台，unix socket）。
-            // 只做视图——本进程不持实例锁、不驱动 agent；Ctrl-C 退出由
-            // term::run 内部处理（不向网关发停止信号）。退出码 2 = 网关未运行。
-            let socket = data_dir.join("local.sock");
-            let code = imagent_localterm::term::run(&socket, session)?;
-            if code != 0 {
-                std::process::exit(code);
-            }
+            // 本地终端视图（不发引擎声明——既有语义：跟随网关默认/该会话已有
+            // 设置）。连网关 local.sock，Ctrl-C 只退视图，退出码 2 = 网关未运行。
+            run_term_view(&data_dir, None, session)?;
+        }
+        Cmd::Codex { session } => {
+            // 本机终端视图 + 声明 codex-app 引擎：连接后自动代发
+            // `/backend codex-app`（复用批 A 命令通道，见 run_term_view）。
+            run_term_view(&data_dir, Some("codex-app"), session)?;
         }
     }
 
@@ -1982,5 +2016,66 @@ mod service_print_cli_tests {
             }
         ));
         assert_eq!(cli.profile.as_deref(), Some("work"));
+    }
+}
+
+/// 批 B（薄视图子命令）CLI 单测：`codex` 子命令存在性 / 会话参数解析 / doc
+/// 点名 codex-app 引擎；`claude` 既有解析形态回归（兼容钉住）。
+#[cfg(test)]
+mod term_view_cli_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// `imagent codex <会话>` 解析为 Codex 变体；缺省会话同样合法（落 default，
+    /// 与 claude 视图同形）。
+    #[test]
+    fn codex_subcommand_parses_with_and_without_session() {
+        let cli = Cli::try_parse_from(["imagent", "codex", "work"]).expect("带会话应可解析");
+        match cli.cmd {
+            Cmd::Codex { session } => assert_eq!(session.as_deref(), Some("work")),
+            _ => panic!("应解析为 Cmd::Codex"),
+        }
+        let cli = Cli::try_parse_from(["imagent", "codex"]).expect("缺省会话应可解析");
+        assert!(
+            matches!(cli.cmd, Cmd::Codex { session: None }),
+            "缺省落 default"
+        );
+    }
+
+    /// 帮助存在性 + doc：codex 子命令在帮助树中可寻址，帮助文案点明
+    /// 「薄视图 + 声明 codex-app 引擎」（clap derive 取 doc 注释首段为 about）。
+    #[test]
+    fn codex_help_doc_declares_codex_app_engine() {
+        let cli_cmd = Cli::command();
+        let cmd = cli_cmd
+            .find_subcommand("codex")
+            .expect("codex 子命令应存在（--help 可见）");
+        let about = cmd
+            .get_long_about()
+            .or_else(|| cmd.get_about())
+            .expect("codex 子命令应有帮助文案")
+            .to_string();
+        assert!(
+            about.contains("codex-app"),
+            "doc 点名引擎 codex-app：{about}"
+        );
+        assert!(about.contains("薄视图"), "doc 点明薄视图语义：{about}");
+        assert!(
+            about.contains("Ctrl-C 只退视图"),
+            "doc 点明视图语义（Ctrl-C 只退视图）：{about}"
+        );
+    }
+
+    /// `imagent claude` 既有解析形态不变（兼容钉住：本批只加子命令，
+    /// claude 语义零改动）。
+    #[test]
+    fn claude_subcommand_parse_shape_unchanged() {
+        let cli = Cli::try_parse_from(["imagent", "claude", "work"]).expect("claude 应可解析");
+        match cli.cmd {
+            Cmd::Claude { session } => assert_eq!(session.as_deref(), Some("work")),
+            _ => panic!("应解析为 Cmd::Claude"),
+        }
+        let cli = Cli::try_parse_from(["imagent", "claude"]).expect("缺省会话应可解析");
+        assert!(matches!(cli.cmd, Cmd::Claude { session: None }));
     }
 }

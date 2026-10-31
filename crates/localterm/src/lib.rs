@@ -1,5 +1,6 @@
-//! `imagent-localterm`：`imagent claude` 本地终端——网关侧
-//! [`LocalPlatform`](platform::LocalPlatform) + 终端客户端 [`term`](term)。
+//! `imagent-localterm`：`imagent claude` / `imagent codex` 本地终端——网关侧
+//! [`LocalPlatform`](platform::LocalPlatform) + 终端客户端 [`term`](term)
+//!（codex 视图与 claude 视图同实现，连接后自动声明 codex-app 引擎，见 term）。
 //!
 //! # 拓扑（定案）
 //!

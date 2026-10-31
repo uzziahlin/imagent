@@ -1,4 +1,6 @@
-//! 终端客户端（`imagent claude` 子命令）：rustyline 行编辑 + socket 帧收发。
+//! 终端客户端（`imagent claude` / `imagent codex` 子命令）：rustyline 行编辑 +
+//! socket 帧收发。两个子命令同一视图实现，差异仅在 [`run`] 的 `backend_hint`：
+//! codex 视图连接后自动声明 codex-app 引擎，claude 视图不声明（既有语义）。
 //!
 //! # 设计基线：TUI 是视图不是宿主
 //!
@@ -13,6 +15,11 @@
 //!
 //! # 交互形态
 //!
+//! - 引擎声明（批 B 薄视图）：`imagent codex <会话>` 在连接成功后、交互前自动
+//!   代发一条 `/backend codex-app` 命令文本（与用户手打等价——dispatcher 命令
+//!   层写 per-conv 引擎覆盖 + 回显确认，不进 agent 轮次；回显「✅ 本会话引擎
+//!   已切换…」经 reader 打印，正是可见反馈）。`imagent claude` 不发声明
+//!   （跟随网关默认/该会话已有设置，语义完全不变）。
 //! - 输入：rustyline（历史/行编辑）；`/` 命令原样透传（message 帧，走与 IM
 //!   手打命令相同的鉴权/分派）；`exit`/`quit` 退出视图。
 //! - 输出（stdout 追加式，ANSI 基础色）：
@@ -197,6 +204,25 @@ fn input_decision(line: &str) -> Option<&'static str> {
 }
 
 // ---------------------------------------------------------------------------
+// 薄视图引擎声明（批 B：`imagent codex` → `/backend codex-app`）
+// ---------------------------------------------------------------------------
+
+/// 引擎声明命令文本：`/backend <name>`。与用户手打完全等价——dispatcher 命令
+/// 层处理（写 `backend:<conv>` KV + 回显确认，不进 agent 轮次；会话已在该
+/// 引擎时重复写同值 KV，幂等无副作用）。
+fn backend_hint_command(hint: &str) -> String {
+    format!("/backend {hint}")
+}
+
+/// 连接成功后、交互前代发引擎声明（`imagent codex` 薄视图）。经既有发送通道
+/// 发 message 文本帧（与手打同形），回显确认由 reader 打印。发送失败（连接
+/// 刚断）静默——重连线程接管即可继续用；只在首连发一次（每次重连都重发会在
+/// 断线循环里重复写 KV，无意义；KV 未写成时用户可手打 `/backend <name>` 补）。
+fn send_backend_hint(shared: &Shared, hint: &str) {
+    shared.send_outgoing(&Outgoing::Message(backend_hint_command(hint)));
+}
+
+// ---------------------------------------------------------------------------
 // 连接 + 握手
 // ---------------------------------------------------------------------------
 
@@ -310,7 +336,8 @@ fn spawn_reader(stream: UnixStream, shared: Arc<Shared>) {
                         println!("{YELLOW}⚠ {msg}{RESET}");
                         println!(
                             "{DIM}终端视图已退出。会话仍在 imagent 网关中运行——\
-                             重入：imagent claude {session}{RESET}",
+                             重入：imagent claude {session}（imagent codex {session} \
+                             可用 codex 引擎接入）{RESET}",
                             session = shared.session
                         );
                         shared.superseded.store(true, Ordering::Relaxed);
@@ -381,7 +408,12 @@ fn spawn_reconnector(socket_path: PathBuf, shared: Arc<Shared>) {
 
 /// 终端客户端主循环。返回进程退出码：0 = 正常退出视图；2 = 网关未运行
 /// （首次连接即失败——提示先 `imagent start`）。
-pub fn run(socket_path: &Path, session: Option<String>) -> Result<i32> {
+///
+/// `backend_hint`（批 B 薄视图）：`Some(hint)` 时在连接成功后、交互前经既有
+/// 发送通道代发一条 `/backend <hint>` 命令文本声明本会话引擎（`imagent codex`
+/// → `"codex-app"`，与用户手打等价）；`None`（`imagent claude`）零行为，既有
+/// 语义完全不变。
+pub fn run(socket_path: &Path, session: Option<String>, backend_hint: Option<&str>) -> Result<i32> {
     let session = match session.as_deref() {
         None => "default".to_string(),
         Some(raw) => sanitize_session_name(raw).ok_or_else(|| {
@@ -394,7 +426,8 @@ pub fn run(socket_path: &Path, session: Option<String>) -> Result<i32> {
             eprintln!(
                 "无法连接 imagent 网关（{}）：{e}\n\
                  请先在 config.toml 配置 platforms 含 \"local\" 并运行 `imagent start`，\n\
-                 然后用 `imagent claude {session}` 接入（--profile 与网关一致）。",
+                 然后用 `imagent claude {session}` 接入（`imagent codex {session}` 可用 \
+                 codex 引擎接入；--profile 与网关一致）。",
                 socket_path.display()
             );
             return Ok(EXIT_GATEWAY_DOWN);
@@ -410,6 +443,13 @@ pub fn run(socket_path: &Path, session: Option<String>) -> Result<i32> {
         shared.clone(),
     );
     spawn_reconnector(socket_path.to_path_buf(), shared.clone());
+
+    // 批 B 薄视图：连接成功后、交互前代发引擎声明（见 run 文档与
+    // send_backend_hint）。经既有发送通道（与手打同形），回显确认经 reader
+    // 打印；None = claude 视图，零行为。
+    if let Some(hint) = backend_hint {
+        send_backend_hint(&shared, hint);
+    }
 
     let mut rl = DefaultEditor::new().context("初始化行编辑器失败")?;
     // 历史（best-effort）：socket 同目录 localterm_history。
@@ -505,7 +545,50 @@ pub fn run(socket_path: &Path, session: Option<String>) -> Result<i32> {
 fn print_exit_hint(shared: &Shared) {
     println!(
         "{DIM}终端视图已退出。会话 local:{session} 仍在 imagent 网关中运行——\n\
-         重入：imagent claude {session}；停止任务：重入后发 /stop。{RESET}",
+         重入：imagent claude {session}（imagent codex {session} 可用 codex 引擎接入）；\n\
+         停止任务：重入后发 /stop。{RESET}",
         session = shared.session
     );
+}
+
+// ---------------------------------------------------------------------------
+// 测试：hint 帧注入（socketpair 最小回环，形态参照 platform.rs peer uid 测试）
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    //! 断言薄视图引擎声明的帧形态：连接后首条为 `/backend codex-app` message
+    //! 文本帧（与用户手打同形——走批 A 命令通道，零协议改动）。
+
+    use super::*;
+
+    /// `imagent codex` 路径：send_backend_hint 经既有发送通道（Shared::send_
+    /// outgoing）发出的帧与手打 message 帧同形，text 恰为 `/backend codex-app`
+    /// （dispatcher 命令层凭 `/` 前缀分派；不带 convId 落 hello 会话）。
+    #[test]
+    fn backend_hint_sends_backend_command_message_frame() {
+        let (client, mut gateway) = UnixStream::pair().expect("socketpair");
+        let shared = Arc::new(Shared::new("work".to_string(), client));
+        send_backend_hint(&shared, "codex-app");
+
+        let mut line = String::new();
+        BufReader::new(&mut gateway)
+            .read_line(&mut line)
+            .expect("读 hint 帧");
+        let v: serde_json::Value = serde_json::from_str(line.trim()).expect("hint 帧应为 JSON 行");
+        assert_eq!(v["v"], 1);
+        assert_eq!(v["type"], "message", "与手打同形：message 文本帧");
+        assert_eq!(v["text"], "/backend codex-app");
+        assert!(
+            v.get("convId").is_none(),
+            "客户端 message 帧不带 convId（落 hello 会话）"
+        );
+    }
+
+    /// 声明文本构造钉住：`/backend <hint>`（命令层按前缀 + 注册表名单精确
+    /// 分派，写法漂移会落「未知引擎」回显）。
+    #[test]
+    fn backend_hint_command_format() {
+        assert_eq!(backend_hint_command("codex-app"), "/backend codex-app");
+    }
 }
