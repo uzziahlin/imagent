@@ -55,6 +55,15 @@ import {
   getAdminToken,
   reauthErrorText,
 } from "./lib/admin";
+import {
+  PUSH_ENABLED_KEY,
+  disablePush,
+  enablePush,
+  initServiceWorker,
+  pushSupported,
+  validConvParam,
+  type PushErrorCode,
+} from "./lib/push";
 import { Login } from "./components/Login";
 import { StatusBar } from "./components/StatusBar";
 import { Sidebar, type ConvItem } from "./components/Sidebar";
@@ -119,6 +128,21 @@ function noticeText(n: MachineNotice): string {
         : `${n.from} 已离线，已切换到 ${n.to}`;
     case "offline":
       return `${n.machine} 已离线（暂无其它在线机器）`;
+  }
+}
+
+/** v1.10 通知开启失败引导文案（按错误码分流）。not_supported 覆盖两类：
+ *  浏览器能力缺失与 iOS 未添加主屏（pushManager 缺失）。 */
+function pushErrorText(code: PushErrorCode): string {
+  switch (code) {
+    case "not_supported":
+      return "此环境不支持通知（iOS 请先将本应用添加到主屏幕）";
+    case "permission_denied":
+      return "通知权限被拒绝，请在浏览器设置中允许后重试";
+    case "network":
+      return "网络错误，通知开启失败";
+    default:
+      return "通知订阅失败，请稍后重试";
   }
 }
 
@@ -222,6 +246,12 @@ export default function App() {
   useEffect(() => {
     stateRef.current = state;
   });
+  // v1.10 通知订阅取当前 sessionToken 的镜像（enablePush getToken 回调 /
+  // togglePush / logout 在异步与事件时刻取最新值）。
+  const sessionRef = useRef(session);
+  useEffect(() => {
+    sessionRef.current = session;
+  });
   // v1.7.x 本地缓存：上次已落盘（或已恢复）的 conv entries 引用——脏检查用
   // （reducer 不可变更新，引用比较即“内容是否变过”）；退出清空后同步重置。
   const savedRefs = useRef<Map<string, StreamEntry[]>>(new Map());
@@ -235,6 +265,16 @@ export default function App() {
   // 水位版本号：空增量（entries 引用不变、reducer 无改动）不驱动 spaces 变化，
   // 用它驱动 debounce flush 重排（水位仍须落盘）。
   const [historyVersion, setHistoryVersion] = useState(0);
+  // v1.10 Web Push：用户开关态（localStorage 标志镜像）/ 开关流程进行中 /
+  // 本地 toast（更新提示 + 通知开关反馈——不进 protocol 的 lastNotice，避免
+  // 机器通知类型污染；渲染复用底部 toast 容器，样式/节奏对齐）。
+  const [pushEnabled, setPushEnabled] = useState(
+    () => localStorage.getItem(PUSH_ENABLED_KEY) === "1",
+  );
+  const [pushBusy, setPushBusy] = useState(false);
+  const [localToast, setLocalToast] = useState<{ text: string; tone: "info" | "error" } | null>(
+    null,
+  );
 
   /** 挂载恢复：loadAll → spaces 预填（initialState 之后、WS 帧之前；异步竞态
    *  时恢复条目垫在已到帧之前，见 restoreHistory）。加载完成前渲染空态
@@ -539,6 +579,59 @@ export default function App() {
     return () => clearTimeout(t);
   }, [adminError, adminOpen]);
 
+  // v1.10 PWA 接线（挂载一次）：SW 注册（仅 https/localhost，含「新版本可用」
+  // 更新提示与通知点击的 open-conv 消息）+ ?conv= 深链会话定位（SW 无窗口时
+  // openWindow 到 /imagent/?conv=...，挂载读参定位；完整 conv 形态校验后才切）。
+  useEffect(() => {
+    const cleanupSw = initServiceWorker({
+      onUpdateAvailable: () =>
+        setLocalToast({ text: "新版本可用，刷新页面生效", tone: "info" }),
+      onOpenConv: (convId) => dispatch({ type: "select_conv", convId }),
+    });
+    const conv = validConvParam(new URLSearchParams(window.location.search).get("conv"));
+    if (conv) {
+      dispatch({ type: "select_conv", convId: conv });
+    }
+    return cleanupSw;
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅挂载执行一次（dispatch 为稳定引用）
+  }, []);
+
+  // v1.10 本地 toast 自动消退（4s，对齐 error/notice 节奏）
+  useEffect(() => {
+    if (!localToast) {
+      return;
+    }
+    const t = setTimeout(() => setLocalToast(null), 4000);
+    return () => clearTimeout(t);
+  }, [localToast]);
+
+  // v1.10 登录 ready 后静默重挂：用户开过通知（localStorage 标志）且拿到
+  // sessionToken 时自动重新登记——sessionToken 换新后服务端订阅需重挂（重复
+  // endpoint 幂等覆盖，token 变化即重试；每 token 只试一次）。失败静默降级：
+  // 关闭开关并 toast 一次（下次开启走手动流程）。
+  const pushRetriedTokenRef = useRef<string | null>(null);
+  useEffect(() => {
+    const token = session?.token;
+    if (!auth || !token) {
+      return;
+    }
+    if (localStorage.getItem(PUSH_ENABLED_KEY) !== "1") {
+      return;
+    }
+    if (pushRetriedTokenRef.current === token) {
+      return;
+    }
+    pushRetriedTokenRef.current = token;
+    void enablePush(() => sessionRef.current?.token).then((r) => {
+      if (!r.ok) {
+        localStorage.removeItem(PUSH_ENABLED_KEY);
+        setPushEnabled(false);
+        setLocalToast({ text: "通知订阅已失效，已自动关闭（可在侧栏重新开启）", tone: "error" });
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- session token 维度触发
+  }, [auth, session?.token]);
+
   // 连接 ready（含重连成功）与机器维度变化（首收 machines 帧 / 侧栏切换 /
   // 掉线自动切换）后：发一次带 machine 的 sync 拉该机器卡片缓存 + 一次
   // workspace_list 拉工作空间快照（快照落 reducer，唯一事实源）。重连后的
@@ -787,8 +880,14 @@ export default function App() {
 
   /** 登出：清全部本地凭证（会话 + 遗留 USER_TOKEN + 内存态 adminToken）与
    *  本地消息缓存（IndexedDB，用户显式退出即清本机痕迹；普通刷新不清），
-   *  回登录页。服务端吊销走管理面板的「吊销并退出」（revokeDevice）。 */
+   *  回登录页。服务端吊销走管理面板的「吊销并退出」（revokeDevice）。
+   *  v1.10：一并通知退订（best-effort，不阻塞登出）+ 清开关标志。 */
   const logout = () => {
+    if (session?.token && localStorage.getItem(PUSH_ENABLED_KEY) === "1") {
+      void disablePush(session.token).catch(() => {});
+    }
+    localStorage.removeItem(PUSH_ENABLED_KEY);
+    setPushEnabled(false);
     clearSession();
     localStorage.removeItem(USER_TOKEN_KEY);
     clearAdminToken();
@@ -798,6 +897,34 @@ export default function App() {
     setAdminOpen(false);
     setSession(null);
     setAuth(null);
+  };
+
+  /** v1.10 通知开关（侧栏底部行，仅会话模式）：未开启 → enablePush 全流程，
+   *  成功置 localStorage 标志（下次登录静默重挂依据）；已开启 → disablePush
+   *  并清标志。结果经 localToast 反馈（失败按错误码给引导文案）。 */
+  const togglePush = async () => {
+    if (pushBusy || !sessionRef.current) {
+      return;
+    }
+    setPushBusy(true);
+    try {
+      if (!pushEnabled) {
+        const r = await enablePush(() => sessionRef.current?.token);
+        if (r.ok) {
+          localStorage.setItem(PUSH_ENABLED_KEY, "1");
+          setPushEnabled(true);
+          setLocalToast({ text: "通知已开启", tone: "info" });
+        } else {
+          setLocalToast({ text: pushErrorText(r.code), tone: "error" });
+        }
+      } else {
+        await disablePush(sessionRef.current.token);
+        localStorage.removeItem(PUSH_ENABLED_KEY);
+        setPushEnabled(false);
+      }
+    } finally {
+      setPushBusy(false);
+    }
   };
 
   // ---- v1.5 管理门槛：任何管理操作前保证有效 adminToken（无/过期自动
@@ -996,6 +1123,10 @@ export default function App() {
       sessionExpiresAt={session?.expiresAt}
       onRenewSession={logout}
       onOpenAdmin={session ? openAdmin : undefined}
+      onTogglePush={session ? togglePush : undefined}
+      pushEnabled={pushEnabled}
+      pushAvailable={pushSupported()}
+      pushBusy={pushBusy}
       onSelect={selectConv}
       onSelectMachine={selectMachine}
       onCreate={openNewConv}
@@ -1328,8 +1459,22 @@ export default function App() {
         />
       )}
 
-      {(state.lastError || state.lastNotice || (adminError && !adminOpen)) && (
+      {(state.lastError || state.lastNotice || localToast || (adminError && !adminOpen)) && (
         <div className="fixed inset-x-0 bottom-24 z-50 mx-auto flex w-fit max-w-[90vw] flex-col items-center gap-2">
+          {/* v1.10 本地 toast（更新提示 / 通知开关反馈）：info 蓝 / error 红，
+              节奏与 error/notice 一致（4s 自动消退） */}
+          {localToast && (
+            <div
+              role="status"
+              className={`rounded-full border px-4 py-2 text-center text-xs shadow-xl ${
+                localToast.tone === "error"
+                  ? "border-rose-400/60 bg-rose-50 text-rose-800 dark:border-rose-500/40 dark:bg-rose-950/95 dark:text-rose-200"
+                  : "border-sky-400/60 bg-sky-50 text-sky-800 dark:border-sky-500/40 dark:bg-sky-950/95 dark:text-sky-200"
+              }`}
+            >
+              {localToast.text}
+            </div>
+          )}
           {adminError && !adminOpen && (
             <div
               role="alert"

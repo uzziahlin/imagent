@@ -62,6 +62,10 @@ export function Sidebar({
   sessionExpiresAt,
   onRenewSession,
   onOpenAdmin,
+  onTogglePush,
+  pushEnabled,
+  pushAvailable,
+  pushBusy,
   onSelect,
   onSelectMachine,
   onCreate,
@@ -81,6 +85,15 @@ export function Sidebar({
   onRenewSession?: () => void;
   /** v1.5 管理面板入口（App 仅会话模式传入；旧 relay 不显示）。 */
   onOpenAdmin?: () => void;
+  /** v1.10 通知开关点击（App 仅会话模式传入；旧 relay 无推送端点不显示）。
+   *  不可用（能力缺失 / iOS 未添加主屏）时点击由 App 给引导提示。 */
+  onTogglePush?: () => void;
+  /** v1.10 通知开关当前态：已开启（订阅生效）/ 未开启。 */
+  pushEnabled: boolean;
+  /** v1.10 通知能力可用（pushSupported）；不可用时状态列显示「不可用」。 */
+  pushAvailable: boolean;
+  /** v1.10 开关流程进行中（enable/disable 请求期间禁点）。 */
+  pushBusy: boolean;
   onSelect: (conv: string) => void;
   /** 机器切换器点选（切 currentMachine + 触发该机器 sync）。 */
   onSelectMachine: (machine: string) => void;
@@ -236,6 +249,22 @@ export function Sidebar({
             className="mb-1.5 w-full rounded-lg border border-amber-400/60 bg-amber-50 px-3 py-1.5 text-left text-xs text-amber-800 transition-colors hover:bg-amber-100 dark:border-amber-500/40 dark:bg-amber-950/60 dark:text-amber-200 dark:hover:bg-amber-900/60"
           >
             会话 {daysLeft} 天后过期，重新登录可续期
+          </button>
+        )}
+        {/* v1.10 Web Push 通知开关（仅会话模式）：右侧状态列显示已开启/
+            未开启/不可用；点击由 App 走 enable/disable 订阅流（不可用时给
+            引导提示，如 iOS「先添加到主屏幕」） */}
+        {onTogglePush && (
+          <button
+            type="button"
+            onClick={onTogglePush}
+            disabled={pushBusy}
+            className="mb-1.5 flex w-full items-center rounded-lg px-3 py-1.5 text-left text-xs text-muted transition-colors hover:bg-panel2 hover:text-ink disabled:cursor-wait disabled:opacity-60"
+          >
+            <span>通知</span>
+            <span className="ml-auto shrink-0 text-[11px] text-ghost">
+              {pushAvailable ? (pushEnabled ? "已开启" : "未开启") : "不可用"}
+            </span>
           </button>
         )}
         {/* v1.5 管理面板入口（仅会话模式——旧 relay 无会话层不显示） */}

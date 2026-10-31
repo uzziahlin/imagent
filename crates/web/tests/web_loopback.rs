@@ -1076,3 +1076,215 @@ async fn loopback_workspace_frames_e2e_encrypted() {
     handle.wait().await;
     drop(p);
 }
+
+// ---------------------------------------------------------------------------
+// v1.10 push_notify 全链路：平台埋点（终态卡）→ client 明文管理帧 → relay
+// → mock push 服务投递（真实 aes128gcm 加密 + VAPID Authorization）
+// ---------------------------------------------------------------------------
+
+/// 真实 P-256 订阅密钥（web-push crate 文档示例密钥——合法曲线点，服务端
+/// 加密可过；本地 mock 只验证投递到达，不解密，无需对应私钥）。
+const PUSH_P256DH: &str =
+    "BLMbF9ffKBiWQLCKvTHb6LO8Nb6dcUh6TItC455vu2kElga6PQvUmaFyCdykxY2nOSSL3yKgfbmFLRTUaGv4yV8";
+const PUSH_AUTH: &str = "xS03Fi5ErfTNH_l9WHE9Ig";
+
+/// 本地 mock push 服务（对齐 relay e2e 同名夹具：收 POST → 按预设状态码
+/// 应答 → 上报 (authorization, content-encoding, body_len)）。
+async fn spawn_mock_push_service(
+    status: u16,
+) -> (SocketAddr, mpsc::UnboundedReceiver<(String, String, usize)>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = Vec::new();
+                let head_end = loop {
+                    let mut chunk = [0u8; 4096];
+                    let n = stream.read(&mut chunk).await.unwrap();
+                    assert!(n > 0, "mock push 服务连接早断");
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                let content_length = headers
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.trim()
+                            .eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                let body_start = head_end + 4;
+                while buf.len() < body_start + content_length {
+                    let mut chunk = [0u8; 4096];
+                    let n = stream.read(&mut chunk).await.unwrap();
+                    assert!(n > 0, "mock push 服务 body 早断");
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let grab = |name: &str| {
+                    headers
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.trim()
+                                .eq_ignore_ascii_case(name)
+                                .then(|| v.trim().to_string())
+                        })
+                        .unwrap_or_default()
+                };
+                let _ = tx.send((
+                    grab("authorization"),
+                    grab("content-encoding"),
+                    content_length,
+                ));
+                let resp = format!(
+                    "HTTP/1.1 {status} TEST\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    (addr, rx)
+}
+
+/// 裸 HTTP POST/GET（带可选 Bearer），返回 (状态码, body)。
+async fn http_json(
+    addr: &SocketAddr,
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+    body: Option<&str>,
+) -> (String, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let auth = bearer
+        .map(|t| format!("authorization: Bearer {t}\r\n"))
+        .unwrap_or_default();
+    let payload = body.unwrap_or("");
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\n\
+         content-length: {}\r\nconnection: close\r\n{auth}\r\n{payload}",
+        payload.len()
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    let raw = String::from_utf8_lossy(&buf).to_string();
+    let (headers, resp_body) = raw.split_once("\r\n\r\n").unwrap_or(("", ""));
+    let status = headers
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_string();
+    (status, resp_body.to_string())
+}
+
+/// 全链路：登录 → HTTP 订阅（loopback mock）→ 断开浏览器（离线）→ 平台
+/// 终态卡 → push_notify 帧 → 中继投递（mock 收到 vapid + aes128gcm POST）。
+#[tokio::test]
+async fn loopback_push_notify_full_chain() {
+    // 本机可能配了系统代理（http_proxy env）——loopback mock 须经 no_proxy
+    // 直连（reqwest 默认读代理 env）。
+    std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
+    std::env::set_var("no_proxy", "127.0.0.1,localhost");
+
+    let (handle, sk) = spawn_test_relay().await;
+    let addr = handle.addr;
+    let platform = WebPlatform::new_with_e2e(
+        format!("ws://{addr}/gateway"),
+        GatewayCredential::Key(sk),
+        "default".to_string(),
+        MACHINE.to_string(),
+        &e2e_test_key_path("push"),
+        loopback_store("push").await,
+        valid_ws_dir(),
+        nop_models(),
+    );
+    eventually(Duration::from_secs(10), || platform.is_online()).await;
+
+    // 浏览器登录拿 sessionToken。
+    let mut ws = connect_ws(&addr, "/ws", None).await;
+    ws.send(Message::text(format!(
+        r#"{{"v":1,"type":"hello","token":"{USER_TOKEN}"}}"#
+    )))
+    .await
+    .unwrap();
+    let ack = next_text(&mut ws).await;
+    let v: serde_json::Value = serde_json::from_str(&ack).unwrap();
+    let token = v["session"]["token"].as_str().unwrap().to_string();
+
+    // HTTP 订阅（端点 = loopback mock push 服务；relay 校验的 loopback http
+    // 豁免面）。此刻会话在线（WS 活跃）——但在线判定在投递时进行。
+    let (push_addr, mut push_rx) = spawn_mock_push_service(200).await;
+    let ep = format!("http://{push_addr}/fcm/send/full-chain");
+    let (status, resp) = http_json(
+        &addr,
+        "POST",
+        "/push/subscribe",
+        Some(&token),
+        Some(
+            &serde_json::json!({
+                "endpoint": ep,
+                "keys": {"p256dh": PUSH_P256DH, "auth": PUSH_AUTH},
+            })
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(status, "200", "{resp}");
+    // status 端点确认订阅生效 + VAPID 公钥下发。
+    let (status, body) = http_json(&addr, "GET", "/push/status", Some(&token), None).await;
+    assert_eq!(status, "200", "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["subscriptions"], 1, "{body}");
+    assert_eq!(
+        v["vapidPublicKey"].as_str().unwrap().len(),
+        87,
+        "VAPID 公钥 65B base64url：{body}"
+    );
+
+    // 断开浏览器 WS → 订阅会话离线（SPA 在线免打扰解除）。
+    drop(ws);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 平台终态卡（Done）→ 埋点 → push_notify 明文管理帧 → relay → 投递。
+    // card 帧本体经 E2E seal 发给（不存在的）浏览器，push_notify 走明文
+    // 管理帧族——两端路径互不干扰。
+    platform
+        .send_card(
+            &conv(),
+            &sample_card("全链路", CardTerminal::Done),
+            &ReplyHint::None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let (authorization, encoding, body_len) =
+        tokio::time::timeout(Duration::from_secs(10), push_rx.recv())
+            .await
+            .expect("离线订阅应收到投递")
+            .expect("channel 开着");
+    assert_eq!(encoding, "aes128gcm", "RFC8188 aes128gcm 内容编码");
+    assert!(
+        authorization.starts_with("vapid t="),
+        "VAPID Authorization 头：{authorization}"
+    );
+    assert!(body_len > 0, "加密载荷非空");
+
+    handle.shutdown();
+    handle.wait().await;
+    drop(platform);
+}

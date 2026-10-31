@@ -600,8 +600,8 @@ impl WebauthnState {
 }
 
 /// JSON 错误响应：`{"error":"<code>"}`（SPA 按 code 分流文案；message 可选
-/// 补充修复指引）。
-fn err_json(status: StatusCode, code: &str, message: Option<&str>) -> Response {
+/// 补充修复指引）。push 端点族（v1.10）同款错误形态，复用本助手。
+pub(crate) fn err_json(status: StatusCode, code: &str, message: Option<&str>) -> Response {
     let mut body = serde_json::json!({ "error": code });
     if let Some(m) = message {
         body["message"] = serde_json::Value::String(m.to_string());
@@ -639,8 +639,9 @@ pub(crate) struct CompleteBody {
 }
 
 /// 注册会话认证（Bearer sessionToken → 有效会话 id）。失败统一 401（不区分
-/// 过期/吊销/伪造，爆破面最小化）。
-fn auth_session(st: &RelayState, headers: &HeaderMap) -> Result<String, Box<Response>> {
+/// 过期/吊销/伪造，爆破面最小化）。push 端点族（v1.10）同款认证语义，复用
+/// 本助手（同一路由族、同一错误形态）。
+pub(crate) fn auth_session(st: &RelayState, headers: &HeaderMap) -> Result<String, Box<Response>> {
     let Some(token) = crate::bearer_token(headers) else {
         return Err(Box::new(err_json(
             StatusCode::UNAUTHORIZED,

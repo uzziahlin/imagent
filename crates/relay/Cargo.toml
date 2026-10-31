@@ -33,6 +33,14 @@ openssl = { workspace = true }
 # 网关 ed25519 挑战应答认证（协议 v1.3）：GATEWAY_KEYS 公钥表验签 prove 帧
 # （只依赖核心 verify API，无需 rand_core feature 的 generate）。
 ed25519-dalek = { workspace = true }
+# Web Push 服务端（协议 v1.10）：VAPID 签名 + aes128gcm 载荷加密构建器
+#（default-features=false 关掉 isahc/hyper 自带 HTTP 客户端——musl 交叉免
+# libcurl/native-tls，投递用下方 reqwest 自转，见 push.rs::ReqwestDeliverer；
+# ece→openssl 链与 webauthn-rs 同源，统一 workspace vendored）。
+web-push = { workspace = true }
+# push 投递 HTTP 客户端（rustls——musl 交叉无 openssl 运行时依赖；workspace
+# 特性集含 json/stream/multipart，本 crate 只用 rustls-tls 面）。
+reqwest = { workspace = true }
 
 [dev-dependencies]
 # 集成测试客户端（连真 server 起双端）

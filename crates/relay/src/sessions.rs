@@ -408,6 +408,16 @@ impl SessionStore {
         })
     }
 
+    /// 会话当前是否有活跃已认证 WS 连接（v1.10 push_notify 在线免打扰判定：
+    /// SPA 在线 = WS 已连接，中继跳过该会话的订阅投递）。会话不存在（过期
+    /// /已被 LRU 淘汰）→ false（照常投递——订阅绑定的设备仍应收到通知）。
+    pub(crate) fn is_online(&self, id: &str) -> bool {
+        self.lock()
+            .sessions
+            .get(id)
+            .is_some_and(|rec| !rec.conns.is_empty())
+    }
+
     /// 吊销（协议 v1.2 §4）：置墓碑 + 摘走该会话全部在线连接的投递口
     /// （调用方锁外逐个 close 1008 "session revoked"）+ 立即落盘。未知 id /
     /// 已吊销 → 空 vec（幂等 no-op）。**单用户语义**：所有浏览器都过同一

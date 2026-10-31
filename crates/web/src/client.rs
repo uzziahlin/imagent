@@ -47,7 +47,7 @@ use tracing::{debug, info, warn};
 use imagent_core::{CoreError, InboundMessage, Result};
 
 use crate::e2e::{E2eIdentity, E2eSessions};
-use crate::{map_inbound_frame, GatewayCredential, InboundAction, TARGET};
+use crate::{map_inbound_frame, GatewayCredential, InboundAction, PushEvent, TARGET};
 
 /// 建连后的 WS 流类型（connect_async 的产物）。
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -172,6 +172,7 @@ impl WebClient {
     pub(crate) async fn run(
         self,
         mut outbound_rx: mpsc::Receiver<String>,
+        mut push_rx: mpsc::Receiver<PushEvent>,
         reconnect: Arc<tokio::sync::Notify>,
         shutdown: CancellationToken,
     ) {
@@ -182,7 +183,7 @@ impl WebClient {
                 return;
             }
             tokio::select! {
-                res = self.connect_and_serve(&mut outbound_rx) => {
+                res = self.connect_and_serve(&mut outbound_rx, &mut push_rx) => {
                     // connect_and_sserve 被 select drop（reconnect/shutdown 分支）
                     // 不会走到这里；正常返回即连接已断，在线标志统一在这里
                     // 熄灭（无论 Ok/Err 路径）。
@@ -227,7 +228,11 @@ impl WebClient {
 
     /// 一次完整的「建连 → 认证（v1.3：key 三帧 / token 一步 + hello_ack）
     /// → 收发」循环。返回 Err 触发外层重连。
-    async fn connect_and_serve(&self, outbound_rx: &mut mpsc::Receiver<String>) -> Result<()> {
+    async fn connect_and_serve(
+        &self,
+        outbound_rx: &mut mpsc::Receiver<String>,
+        push_rx: &mut mpsc::Receiver<PushEvent>,
+    ) -> Result<()> {
         let req = build_request(&self.relay_url)?;
         info!(target: TARGET, url = %self.relay_url, machine = %self.machine_id, "连接 relay 中");
         let (mut ws, _resp) = connect_async(req)
@@ -372,6 +377,24 @@ impl WebClient {
                         }
                     };
                     self.send_business(&mut ws, json, &mut e2e_sessions).await?;
+                }
+
+                // v1.10 push_notify：平台埋点事件 → 明文管理帧直发。**不经
+                // send_business 的 E2E seal**——该帧族与 device_list 等管理帧
+                // 同路（内容无敏感信息，只有 kind/convId/machine 元数据层），
+                // 中继需明文读取做订阅投递与在线免打扰判定。
+                maybe_event = push_rx.recv() => {
+                    let ev = match maybe_event {
+                        Some(ev) => ev,
+                        // 平台退出（push 通道与 outbound 通道同生命周期
+                        // ——都在 WebPlatform 上）→ 与 outbound None 同语义收尾。
+                        None => return Ok(()),
+                    };
+                    let frame = crate::encode_push_notify_frame(&self.machine_id, &ev);
+                    ws.send(Message::text(frame))
+                        .await
+                        .map_err(|e| CoreError::Platform(TARGET, format!("ws send push_notify: {e}")))?;
+                    debug!(target: TARGET, kind = ev.kind.as_str(), conv = %ev.conv_id, "已发 push_notify 帧");
                 }
 
                 // 心跳：协议层 Ping（relay idle 90s，30s 保活）+ 顺带执行 E2E
@@ -781,11 +804,17 @@ mod tests {
             history_tx,
         };
         let (_outbound_tx, outbound_rx) = mpsc::channel::<String>(8);
+        let (_push_tx, push_rx) = mpsc::channel::<PushEvent>(8);
         let token = CancellationToken::new();
         token.cancel();
         let res = tokio::time::timeout(
             Duration::from_secs(2),
-            client.run(outbound_rx, Arc::new(tokio::sync::Notify::new()), token),
+            client.run(
+                outbound_rx,
+                push_rx,
+                Arc::new(tokio::sync::Notify::new()),
+                token,
+            ),
         )
         .await;
         assert!(res.is_ok(), "已取消的 token 应让 run 直接退出");

@@ -103,6 +103,7 @@ use tokio::sync::{mpsc, watch};
 
 mod machines;
 mod pairing;
+mod push;
 mod sessions;
 mod webauthn;
 
@@ -1574,6 +1575,9 @@ struct RelayState {
     user_token: Arc<UserTokenStore>,
     /// 新设备配对 pending 表（管理批）：内存态。
     pairing: Arc<pairing::PairingStore>,
+    /// Web Push 服务端（v1.10）：VAPID 管理 + 订阅表 + 三端点 + push_notify
+    /// 帧处理（`<state_dir>/push_subscriptions.json`、`vapid.json` 落盘）。
+    push: Arc<push::PushState>,
 }
 
 /// SPA 静态资源（M1 占位 index.html；M3 构建产物落入 `static/` 后零改动挂载）。
@@ -2517,6 +2521,18 @@ async fn handle_connection(mut socket: WebSocket, st: RelayState, role: Role, he
                                     }
                                 },
                                 Role::Gateway => {
+                                    // push_notify（v1.10）：网关→中继明文管理帧
+                                    // 族（事件埋点 → Web Push 投递），relay 自产
+                                    // 自消，**不进业务路由**（路由会把该帧广播给
+                                    // 浏览器——SPA 不消费它）。contains 预筛避免
+                                    // 每帧全量 JSON 解析（业务帧最大 240KB）。
+                                    if text.contains("push_notify") {
+                                        if let Some(notify) = push::parse_notify_frame(text.as_str())
+                                        {
+                                            st.push.handle_notify(notify, &st.sessions);
+                                            continue;
+                                        }
+                                    }
                                     // v1.4：enc{sid} 帧按 sid 定向投递（匹配
                                     // 在线会话 → 只投该连接；空/无匹配 → 广播），
                                     // 见 Hub::route_gateway_frame。
@@ -2620,6 +2636,9 @@ pub fn spawn_relay(listener: TcpListener, config: RelayConfig) -> Result<RelayHa
     let hub = Hub::new(shutdown_rx.clone());
     let sessions = Arc::new(SessionStore::load(&config.state_dir));
     let webauthn_state = webauthn::new_state(&config.state_dir, config.webauthn_rp_id.clone());
+    // Web Push 层（v1.10）：VAPID env 优先 → vapid.json → 生成落盘（公钥
+    // 随启动日志输出，SPA 订阅锚点）；订阅表 push_subscriptions.json 加载。
+    let push_state = Arc::new(push::PushState::load(&config.state_dir));
     let state = RelayState {
         hub: hub.clone(),
         config: Arc::new(config),
@@ -2629,6 +2648,7 @@ pub fn spawn_relay(listener: TcpListener, config: RelayConfig) -> Result<RelayHa
         machines,
         user_token,
         pairing: Arc::new(pairing::PairingStore::default()),
+        push: push_state,
     };
     let app = Router::new()
         .route("/gateway", get(gateway_ws))
@@ -2637,6 +2657,9 @@ pub fn spawn_relay(listener: TcpListener, config: RelayConfig) -> Result<RelayHa
         // passkey（WebAuthn）HTTP 端点（注册 begin/complete + 登录 begin/
         // complete，同源 fetch；裸路径 + /imagent 前缀两形态对齐 WS 端点）。
         .merge(webauthn::routes())
+        // Web Push 端点（v1.10）：subscribe / unsubscribe / status（Bearer
+        // sessionToken 认证；裸路径 + /imagent 前缀两形态同上）。
+        .merge(push::routes())
         // 前缀路由与静态前缀剥离（spa_fallback）同款理由：兼容不经 Caddy
         // 的直连形态（本地开发/验收直开 http://127.0.0.1:3010/）——SPA 按
         // Vite base=/imagent/ 把 WS/探活地址推导为 /imagent/ws 等；公网
@@ -2681,7 +2704,7 @@ pub fn spawn_relay(listener: TcpListener, config: RelayConfig) -> Result<RelayHa
             tracing::warn!(target: TARGET, error = %e, "relay serve 退出（错误）");
         }
     });
-    tracing::info!(target: TARGET, addr = %addr, "relay listening（/gateway /ws /healthz /webauthn/* + SPA fallback）");
+    tracing::info!(target: TARGET, addr = %addr, "relay listening（/gateway /ws /healthz /webauthn/* /push/* + SPA fallback）");
     Ok(RelayHandle {
         addr,
         shutdown: shutdown_tx,

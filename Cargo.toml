@@ -93,6 +93,13 @@ ed25519-dalek = "2"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 chacha20poly1305 = "0.10"
 hkdf = "0.13"
+# Web Push 服务端（协议 v1.10，crates/relay）：VAPID ES256 签名 + RFC8291
+# aes128gcm 载荷加密。**musl 交叉纪律**：default-features=false 关掉自带
+# HTTP 客户端（isahc→libcurl C 依赖 / hyper-tls→native-tls），只取加密与
+# 签名构建器，HTTP 投递用本工作区 reqwest（rustls）自转（见 relay push.rs）；
+# 内部链 ece→openssl 与 webauthn-rs 同链，统一走上面 vendored（源码静态编
+# 译），无新增 C 依赖类别。
+web-push = { version = "0.11", default-features = false }
 
 [package]
 name = "imagent"

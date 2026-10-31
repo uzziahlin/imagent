@@ -54,8 +54,9 @@ use crate::titles::{TitleCandidate, TitleGen};
 use crate::{
     encode_approval_request_frame, encode_approval_resolved_frame, encode_card_frame,
     encode_conv_workdir_frame, encode_error_frame, encode_history_frame, encode_text_frame,
-    encode_workspaces_frame, history_entry_from_row, session_title, CardPayload, GatewayCredential,
-    InboundAction, SessionEntryFrame, WorkspaceEntryFrame, TARGET,
+    encode_workspaces_frame, history_entry_from_row, push_notify_title, session_title, CardPayload,
+    GatewayCredential, InboundAction, PushEvent, PushNotifyKind, SessionEntryFrame,
+    WorkspaceEntryFrame, TARGET,
 };
 
 const PLATFORM: &str = "web";
@@ -94,6 +95,11 @@ const WEB_SESSIONS_MAX: usize = 50;
 /// 点按级频率，8 足以吸收突发；打满由 client 侧 1s 有界背压丢弃（下次
 /// 切会话/重连的 history_query 兜底）。
 const HISTORY_CHANNEL_CAPACITY: usize = 8;
+/// v1.10 push_notify 埋点事件 channel 容量（共享契约定案 8）：事件由回合
+/// 终态/审批触发，用户回合级频率，8 足以吸收突发；打满丢帧 warn（通知丢
+/// 一条无正确性影响——下一终态/审批事件天然重试，SPA 侧 tag=convId 亦防
+/// 重）。这是 client select 直消费的「泵」入端，无需背压等待。
+const PUSH_CHANNEL_CAPACITY: usize = 8;
 /// v1.8 已落盘终态卡片 messageId 查重集容量上限（per conv）：防长寿命进程
 /// 内存无界增长。契约允许同 messageId 重复行（SPA 幂等替换），超限清空
 /// 整 conv 集合最坏多落一行，无正确性影响。
@@ -884,6 +890,9 @@ pub struct WebPlatform {
     machine_id: String,
     /// 出站帧通道（发给 client → relay → 浏览器）。
     outbound_tx: mpsc::Sender<String>,
+    /// v1.10 push_notify 埋点事件通道（发给 client → relay，明文管理帧族；
+    /// client select 直消费——不经 outbound 的 E2E seal 路径）。
+    push_tx: mpsc::Sender<PushEvent>,
     /// `/reconnect` 强制重连信号（与 client run task 共享）。
     reconnect: Arc<Notify>,
     /// 入站消息 channel 前端（`recv` 直接 await；AsyncMutex 跨 await 持锁）。
@@ -964,6 +973,7 @@ impl WebPlatform {
             mpsc::channel::<InboundAction>(WORKSPACE_CHANNEL_CAPACITY);
         let (media_tx, media_rx) = mpsc::channel::<InboundAction>(MEDIA_CHANNEL_CAPACITY);
         let (history_tx, history_rx) = mpsc::channel::<InboundAction>(HISTORY_CHANNEL_CAPACITY);
+        let (push_tx, push_rx) = mpsc::channel::<PushEvent>(PUSH_CHANNEL_CAPACITY);
 
         // E2E 身份装配（v1.4）：e2e_ack 签名复用 v1.3 认证 ed25519 私钥——
         // 仅 key 凭证形态可用；token 回退形态无签名密钥，E2E 不可用（出站
@@ -1011,7 +1021,7 @@ impl WebPlatform {
             media_tx,
             history_tx,
         };
-        tokio::spawn(client.run(outbound_rx, reconnect.clone(), shutdown.clone()));
+        tokio::spawn(client.run(outbound_rx, push_rx, reconnect.clone(), shutdown.clone()));
 
         // sync responder（D6 会话恢复）。
         let cards: Arc<Mutex<CardCache>> = Arc::new(Mutex::new(CardCache::default()));
@@ -1063,6 +1073,7 @@ impl WebPlatform {
             relay_url,
             machine_id,
             outbound_tx,
+            push_tx,
             reconnect,
             inbound_rx: Arc::new(AsyncMutex::new(inbound_rx)),
             online,
@@ -1130,15 +1141,24 @@ impl WebPlatform {
         self.spawn_outbound_log(conv.to_string(), "text", payload);
     }
 
-    /// card 终态帧（state=="done"）出站成功后落盘（契约：kind='card'，
-    /// payload=`{"messageId","card":<CardPayload 完整 JSON>}`——取 encode
-    /// 截断前的完整 payload）。同 messageId 只落一次（内存查重集，跳过重复
-    /// 终态 / 同 id 复用；sync 重发不经本路径）。查重登记在 spawn 前同步完成
-    /// ——两条同 id 终态连发不会都过闸。
-    fn log_terminal_card(&self, conv: &str, message_id: &str, card: &CardPayload) {
+    /// card 终态帧（state=="done"，含 done/error 两终态）出站成功后收口
+    ///（v1.8 落盘 + v1.10 push_notify 埋点，**同一查重闸**——同 messageId
+    /// 终态只落一次也只推一次；sync 重发不经本路径）。查重登记在 spawn 前
+    /// 同步完成——两条同 id 终态连发不会都过闸。
+    fn on_terminal_card(&self, conv: &str, message_id: &str, card: &CardPayload) {
         if !lock_or_recover(&self.logged_cards).register(conv, message_id) {
             return;
         }
+        // v1.10 push_notify：终态 → round_done / round_error；title 取
+        // task_digest 优先、正文兜底（≤32 码点摘要，契约帧注）。
+        let kind = if card.terminal == "error" {
+            PushNotifyKind::RoundError
+        } else {
+            PushNotifyKind::RoundDone
+        };
+        let title = push_notify_title(card.task_digest.as_deref().unwrap_or(&card.text));
+        self.spawn_push_notify(kind, conv, title);
+        // v1.8 落盘主体（payload=encode 截断前的完整卡片 JSON）。
         let card_json = match serde_json::to_value(card) {
             Ok(v) => v,
             Err(e) => {
@@ -1149,6 +1169,24 @@ impl WebPlatform {
         };
         let payload = serde_json::json!({"messageId": message_id, "card": card_json}).to_string();
         self.spawn_outbound_log(conv.to_string(), "card", payload);
+    }
+
+    /// v1.10 push_notify 埋点出站（spawn 短任务——对齐 spawn_outbound_log
+    /// 纪律：dispatch 热路径零阻塞、绝不在通知上等待；try_send 打满即丢帧
+    /// warn 不重试——丢一条通知无正确性影响，下一事件天然重试）。
+    fn spawn_push_notify(&self, kind: PushNotifyKind, conv: &str, title: String) {
+        let tx = self.push_tx.clone();
+        let conv = conv.to_string();
+        tokio::spawn(async move {
+            let event = PushEvent {
+                kind,
+                conv_id: conv,
+                title,
+            };
+            if let Err(e) = tx.try_send(event) {
+                warn!(target: TARGET, error = %e, "push_notify 事件入队失败，丢弃");
+            }
+        });
     }
 
     /// 落盘执行体：spawn 短任务写 outbound_log。best-effort——写失败仅 warn
@@ -1249,7 +1287,7 @@ impl Platform for WebPlatform {
         lock_or_recover(&self.cards).upsert(&conv.0, &message_id, payload);
         self.enqueue(json)?;
         if let Some(card) = log_card {
-            self.log_terminal_card(&conv.0, &message_id, &card);
+            self.on_terminal_card(&conv.0, &message_id, &card);
         }
         Ok(Some(message_id))
     }
@@ -1276,7 +1314,7 @@ impl Platform for WebPlatform {
         lock_or_recover(&self.cards).upsert(&conv.0, message_id, payload);
         self.enqueue(json)?;
         if let Some(card) = log_card {
-            self.log_terminal_card(&conv.0, message_id, &card);
+            self.on_terminal_card(&conv.0, message_id, &card);
         }
         Ok(())
     }
@@ -1300,6 +1338,14 @@ impl Platform for WebPlatform {
         )?;
         self.track_ask(&conv.0, request_id);
         self.enqueue(json)?;
+        // v1.10 push_notify：审批请求出站即埋点（title=工具名，≤32 码点）。
+        // 网关无脑发——SPA 在线免打扰判定在中继（订阅 session 有活跃 WS 则
+        // 跳过投递）。
+        self.spawn_push_notify(
+            PushNotifyKind::Approval,
+            &conv.0,
+            push_notify_title(tool_name),
+        );
         // 返回 request_id 作 card_msg_id 锚点：浏览器审批回复带 requestId
         // （ask_req）精确路由，SPA 无「引用回复」形态，锚点即请求 id 本身。
         Ok(Some(request_id.to_string()))
@@ -1426,7 +1472,10 @@ mod tests {
     async fn test_store() -> Store {
         let n = STORE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut p = std::env::temp_dir();
-        p.push(format!("imagent-web-platform-{}-{n}.sqlite", std::process::id()));
+        p.push(format!(
+            "imagent-web-platform-{}-{n}.sqlite",
+            std::process::id()
+        ));
         Store::open(&p).await.expect("open store")
     }
 
@@ -2536,6 +2585,117 @@ mod tests {
         );
         assert!(ids.register("web:a", "fresh"));
         assert!(!ids.register("web:a", "fresh"));
+    }
+
+    // ---- v1.10 push_notify 埋点（mock 观察：替换 push 通道，直测事件触发
+    // 与查重；帧字节级与中继侧解析见 lib.rs / relay push.rs 测试）----
+
+    /// push 通道注入的测试夹具：替换平台的 push_tx（子模块直取私有字段，
+    /// client 持有的原 rx 随假连接空转），事件可从 test rx 观察。
+    async fn offline_platform_with_push_capture() -> (WebPlatform, mpsc::Receiver<PushEvent>) {
+        let mut p = offline_platform().await;
+        let (tx, rx) = mpsc::channel::<PushEvent>(PUSH_CHANNEL_CAPACITY);
+        p.push_tx = tx;
+        (p, rx)
+    }
+
+    /// 埋点触发矩阵（mock 观察）：流式中间帧不触发；终态 done/error 各触发
+    /// round_done/round_error 且 title 取 task_digest；审批触发 approval 且
+    /// title=工具名；同 messageId 重复终态不重复触发（与落盘同查重闸）。
+    #[tokio::test]
+    async fn push_notify_events_on_terminal_and_approval() {
+        let (p, mut rx) = offline_platform_with_push_capture().await;
+        let conv = ConvId("web:push".into());
+
+        // 流式中间帧：不触发。
+        let msg_id = p
+            .send_card(
+                &conv,
+                &v18_card("流式中", CardTerminal::Running),
+                &ReplyHint::None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(rx.try_recv().is_err(), "流式中间帧不应触发 push");
+
+        // 终态 done：round_done + title 取 task_digest 优先。
+        let mut done_card = v18_card("结论文本", CardTerminal::Done);
+        done_card.task_digest = Some("统计 Cargo 依赖".into());
+        p.update_card(&conv, &msg_id, &done_card, &ReplyHint::None)
+            .await
+            .unwrap();
+        let ev = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("终态应触发 push 事件")
+            .expect("通道开着");
+        assert_eq!(ev.kind, PushNotifyKind::RoundDone);
+        assert_eq!(ev.conv_id, "web:push");
+        assert_eq!(ev.title, "统计 Cargo 依赖", "title 取 task_digest");
+
+        // 同 messageId 重复终态：不重复触发（查重闸）。
+        p.update_card(
+            &conv,
+            &msg_id,
+            &v18_card("结论2", CardTerminal::Done),
+            &ReplyHint::None,
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(rx.try_recv().is_err(), "同 messageId 终态只推一次");
+
+        // 终态 error：round_error + title 兜底取正文。
+        p.send_card(
+            &conv,
+            &v18_card("炸了", CardTerminal::Error("boom".into())),
+            &ReplyHint::None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let ev = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("error 终态应触发")
+            .expect("通道开着");
+        assert_eq!(ev.kind, PushNotifyKind::RoundError);
+        assert_eq!(ev.title, "炸了", "无 task_digest 时取正文");
+
+        // 审批请求：approval + title=工具名。
+        p.send_permission_ask(&conv, "req-1", "Bash", "rm -rf /tmp/x", &ReplyHint::None)
+            .await
+            .unwrap();
+        let ev = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("审批应触发")
+            .expect("通道开着");
+        assert_eq!(ev.kind, PushNotifyKind::Approval);
+        assert_eq!(ev.conv_id, "web:push");
+        assert_eq!(ev.title, "Bash");
+        drop(p);
+    }
+
+    /// 埋点 title 规整贯通：审批工具名前后空白被 trim（push_notify_title
+    /// 在埋点路径生效）。
+    #[tokio::test]
+    async fn push_notify_ask_title_is_trimmed() {
+        let (p, mut rx) = offline_platform_with_push_capture().await;
+        p.send_permission_ask(
+            &ConvId("web:t".into()),
+            "req-2",
+            "  WebFetch  ",
+            "https://…",
+            &ReplyHint::None,
+        )
+        .await
+        .unwrap();
+        let ev = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("审批应触发")
+            .expect("通道开着");
+        assert_eq!(ev.title, "WebFetch");
+        drop(p);
     }
 
     /// history_query 处理回帧（任务验收项）：全量（since=0）/ 增量（since=

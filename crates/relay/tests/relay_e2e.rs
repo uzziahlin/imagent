@@ -3378,3 +3378,403 @@ async fn e2e_pairing_deny_expiry_and_cap() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&dir2);
 }
+
+// ---------------------------------------------------------------------------
+// v1.10 Web Push：三端点（Bearer sessionToken）+ push_notify 帧全链路投递
+// ---------------------------------------------------------------------------
+
+/// 真实 P-256 订阅密钥（web-push crate 文档示例密钥——合法曲线点，服务端
+/// 加密可过；本地 mock 只验证投递到达，不解密，无需对应私钥）。
+const TEST_P256DH: &str =
+    "BLMbF9ffKBiWQLCKvTHb6LO8Nb6dcUh6TItC455vu2kElga6PQvUmaFyCdykxY2nOSSL3yKgfbmFLRTUaGv4yV8";
+const TEST_AUTH: &str = "xS03Fi5ErfTNH_l9WHE9Ig";
+
+/// v1.10 push 端点用的本地 mock push 服务：真实监听 loopback，收 POST 后
+/// 按预设状态码应答（connection: close），把 (authorization, content-encoding,
+/// body_len) 上报 channel——端点 URL 用 `http://127.0.0.1:<port>`（relay
+/// 订阅校验的 loopback http 豁免面，真实 push 服务恒为 https）。
+async fn spawn_mock_push_service(
+    status: u16,
+) -> (
+    SocketAddr,
+    tokio::sync::mpsc::UnboundedReceiver<(String, String, usize)>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = Vec::new();
+                // 读到头结束。
+                let head_end = loop {
+                    let mut chunk = [0u8; 4096];
+                    let n = stream.read(&mut chunk).await.unwrap();
+                    assert!(n > 0, "mock push 服务连接早断");
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                let content_length = headers
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.trim()
+                            .eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                let body_start = head_end + 4;
+                while buf.len() < body_start + content_length {
+                    let mut chunk = [0u8; 4096];
+                    let n = stream.read(&mut chunk).await.unwrap();
+                    assert!(n > 0, "mock push 服务 body 早断");
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let authorization = headers
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.trim()
+                            .eq_ignore_ascii_case("authorization")
+                            .then(|| v.trim().to_string())
+                    })
+                    .unwrap_or_default();
+                let encoding = headers
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.trim()
+                            .eq_ignore_ascii_case("content-encoding")
+                            .then(|| v.trim().to_string())
+                    })
+                    .unwrap_or_default();
+                let _ = tx.send((authorization, encoding, content_length));
+                let resp = format!(
+                    "HTTP/1.1 {status} TEST\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    (addr, rx)
+}
+
+/// 带 Bearer 的 GET（/push/status 需会话认证，既有 `http_get` 无认证头）。
+async fn http_get_bearer(addr: &SocketAddr, path: &str, token: &str) -> (String, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "GET {path} HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer {token}\r\n\
+                 connection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    let raw = String::from_utf8_lossy(&buf).to_string();
+    let (headers, body) = raw.split_once("\r\n\r\n").unwrap_or(("", ""));
+    let status = headers
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_string();
+    (status, body.to_string())
+}
+
+/// 本机可能配了系统代理（http_proxy/https_proxy env）——loopback 的 mock
+/// push 服务须经 no_proxy 直连（reqwest 默认读代理 env；生产 relay 无代理
+/// env 时本变量无效果）。
+fn bypass_proxy_for_loopback_push() {
+    std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
+    std::env::set_var("no_proxy", "127.0.0.1,localhost");
+}
+
+/// 三端点认证/值域校验/幂等覆盖/退订/status 形状（任务验收项）。
+#[tokio::test]
+async fn e2e_push_endpoints_auth_validation_idempotent() {
+    bypass_proxy_for_loopback_push();
+    let dir = temp_state_dir();
+    let handle = spawn_with_config(test_config(&dir, DEFAULT_SESSION_TTL_SECS)).await;
+    let addr = handle.addr;
+
+    // 登录拿 sessionToken（WS 换发）。
+    let mut ws = connect_ws(&addr, "/ws", None).await;
+    let session = login_session(&mut ws, Some("push-tester")).await;
+    let token = session["token"].as_str().unwrap().to_string();
+
+    // 无认证：三端点统一 401（不区分原因，爆破面最小化）。
+    let (status, _) = http_get_bearer(&addr, "/push/status", "").await;
+    assert_eq!(status, "401", "status 无 token 拒");
+    let (status, _) = http_post_json(
+        &addr,
+        "/push/subscribe",
+        None,
+        "localhost",
+        r#"{"endpoint":"https://fcm.example/x","keys":{"p256dh":"AA","auth":"BB"}}"#,
+    )
+    .await;
+    assert_eq!(status, "401", "subscribe 无 token 拒");
+    let (status, _) = http_post_json(
+        &addr,
+        "/push/unsubscribe",
+        None,
+        "localhost",
+        r#"{"endpoint":"https://fcm.example/x"}"#,
+    )
+    .await;
+    assert_eq!(status, "401", "unsubscribe 无 token 拒");
+
+    // 值域校验：明文公网 http / keys 非 b64url / 空值 → 400（业务校验）；
+    // 畸形 JSON / 缺字段 → 422（axum Json 提取器默认——两类都拒即可）。
+    for body in [
+        r#"{"endpoint":"http://push.example/x","keys":{"p256dh":"AAAA","auth":"bbbb"}}"#,
+        r#"{"endpoint":"https://push.example/x","keys":{"p256dh":"AA+AA/==","auth":"bbbb"}}"#,
+        r#"{"endpoint":"https://push.example/x","keys":{"p256dh":"","auth":"bbbb"}}"#,
+    ] {
+        let (status, _) =
+            http_post_json(&addr, "/push/subscribe", Some(&token), "localhost", body).await;
+        assert_eq!(status, "400", "非法订阅应 400：{body}");
+    }
+    for body in [
+        r#"{"endpoint":"https://push.example/x","keys":{"p256dh":"AAAA"}}"#,
+        r#"not json"#,
+    ] {
+        let (status, _) =
+            http_post_json(&addr, "/push/subscribe", Some(&token), "localhost", body).await;
+        assert!(
+            status == "400" || status == "422",
+            "畸形/缺字段订阅应被拒（axum Json 提取器 400/422 两类拒绝形态）：{body} → {status}"
+        );
+    }
+
+    // status 形状：supported=true + vapidPublicKey（65B base64url = 87 char）。
+    let (status, body) = http_get_bearer(&addr, "/push/status", &token).await;
+    assert_eq!(status, "200", "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["supported"], true, "{body}");
+    assert_eq!(v["subscriptions"], 0, "{body}");
+    assert_eq!(
+        v["vapidPublicKey"].as_str().unwrap().len(),
+        87,
+        "65B base64url：{body}"
+    );
+
+    // 合法订阅 → 200 {} + subscriptions=1。
+    let (status, body) = http_post_json(
+        &addr,
+        "/push/subscribe",
+        Some(&token),
+        "localhost",
+        r#"{"endpoint":"https://fcm.googleapis.com/fcm/send/test-token","keys":{"p256dh":"BPublicKeyPaddedUrlSafe","auth":"AuthSecret16B"}}"#,
+    )
+    .await;
+    assert_eq!(status, "200", "{body}");
+    assert_eq!(body, "{}", "subscribe 回空对象");
+
+    // /imagent 前缀形态同 handler。
+    let (status, _) = http_get_bearer(&addr, "/imagent/push/status", &token).await;
+    assert_eq!(status, "200", "前缀形态可达");
+    let (_, body) = http_get_bearer(&addr, "/imagent/push/status", &token).await;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["subscriptions"], 1, "{body}");
+
+    // 幂等覆盖：同 endpoint 换会话（二次登录）→ 不新增行。
+    let mut ws2 = connect_ws(&addr, "/ws", None).await;
+    let session2 = login_session(&mut ws2, Some("push-tester-2")).await;
+    let token2 = session2["token"].as_str().unwrap().to_string();
+    let (status, _) = http_post_json(
+        &addr,
+        "/push/subscribe",
+        Some(&token2),
+        "localhost",
+        r#"{"endpoint":"https://fcm.googleapis.com/fcm/send/test-token","keys":{"p256dh":"BPublicKeyPaddedUrlSafe","auth":"AuthSecret16B"}}"#,
+    )
+    .await;
+    assert_eq!(status, "200");
+    let (_, body) = http_get_bearer(&addr, "/push/status", &token2).await;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["subscriptions"], 1, "同 endpoint 幂等覆盖：{body}");
+
+    // 第二条订阅 + 退订 + 幂等退订。
+    let (status, _) = http_post_json(
+        &addr,
+        "/push/subscribe",
+        Some(&token),
+        "localhost",
+        r#"{"endpoint":"https://updates.push.services.mozilla.com/wpush/v2/other","keys":{"p256dh":"BAnotherKey","auth":"AnotherAuth"}}"#,
+    )
+    .await;
+    assert_eq!(status, "200");
+    let (_, body) = http_get_bearer(&addr, "/push/status", &token).await;
+    assert!(body.contains(r#""subscriptions":2"#), "{body}");
+    let (status, body) = http_post_json(
+        &addr,
+        "/push/unsubscribe",
+        Some(&token2),
+        "localhost",
+        r#"{"endpoint":"https://fcm.googleapis.com/fcm/send/test-token"}"#,
+    )
+    .await;
+    assert_eq!(status, "200", "{body}");
+    assert_eq!(body, "{}");
+    let (_, body) = http_get_bearer(&addr, "/push/status", &token).await;
+    assert!(body.contains(r#""subscriptions":1"#), "{body}");
+    // 未知 endpoint 退订：幂等 200。
+    let (status, _) = http_post_json(
+        &addr,
+        "/push/unsubscribe",
+        Some(&token),
+        "localhost",
+        r#"{"endpoint":"https://never-subscribed.example/x"}"#,
+    )
+    .await;
+    assert_eq!(status, "200");
+
+    handle.shutdown();
+    handle.wait().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// push_notify 帧（网关 → 中继明文管理帧）全链路：离线会话的订阅被投递
+/// （mock push 服务收到 aes128gcm POST + VAPID Authorization）→ 端点 410
+/// 后订阅被清理；畸形帧不漏进业务路由（浏览器收不到）。
+#[tokio::test]
+async fn e2e_push_notify_frame_delivers_and_410_cleans() {
+    bypass_proxy_for_loopback_push();
+    let dir = temp_state_dir();
+    let handle = spawn_with_config(test_config(&dir, DEFAULT_SESSION_TTL_SECS)).await;
+    let addr = handle.addr;
+
+    // 1) 浏览器登录 + 订阅（HTTP——无活跃 WS 绑定后即离线：连接保持但
+    //    订阅会话另有其人？不——本用例订阅当前会话并**断开**该 WS）。
+    let mut ws = connect_ws(&addr, "/ws", None).await;
+    let session = login_session(&mut ws, Some("push-offline")).await;
+    let token = session["token"].as_str().unwrap().to_string();
+    let session_id = session["id"].as_str().unwrap().to_string();
+    let (push_addr, mut push_rx) = spawn_mock_push_service(200).await;
+    let ep = format!("http://{push_addr}/fcm/send/offline-test");
+    let body = serde_json::json!({
+        "endpoint": ep,
+        "keys": {"p256dh": TEST_P256DH, "auth": TEST_AUTH},
+    })
+    .to_string();
+    let (status, resp) =
+        http_post_json(&addr, "/push/subscribe", Some(&token), "localhost", &body).await;
+    assert_eq!(status, "200", "{resp}");
+    // 断开浏览器 WS → 会话离线（免打扰解除）。先登录第二个会话保持连接
+    // 不必要——直接 drop。
+    drop(ws);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 2) 网关连入（token 形态）+ 发 push_notify 帧。
+    let mut gw = connect_ws(&addr, "/gateway", None).await;
+    gateway_hello(&mut gw, "home").await;
+    let frame = serde_json::json!({
+        "v": 1, "type": "push_notify", "machine": "home",
+        "kind": "round_done", "convId": "web:s-ab12", "title": "统计完成",
+    });
+    gw.send(Message::text(frame.to_string())).await.unwrap();
+
+    // 3) mock push 服务收到投递：aes128gcm + VAPID Authorization + 非空 body。
+    let (authorization, encoding, body_len) =
+        tokio::time::timeout(Duration::from_secs(5), push_rx.recv())
+            .await
+            .expect("离线订阅应收到投递")
+            .expect("channel 开着");
+    assert_eq!(encoding, "aes128gcm", "RFC8188 aes128gcm 内容编码");
+    assert!(
+        authorization.starts_with("vapid t="),
+        "VAPID Authorization 头：{authorization}"
+    );
+    assert!(body_len > 0, "加密载荷非空");
+
+    // 4) 网关在线帧不广播给浏览器：push_notify 是 relay 自产自消管理帧。
+    //    （无在线浏览器——广播目标为空，帧只进投递路径；本断言经由上面
+    //    唯一收到的事件是 push 服务这一事实成立。）
+
+    // 5) 410 Gone：mock 回 410 → 订阅被清理。
+    let (push_addr2, mut push_rx2) = spawn_mock_push_service(410).await;
+    let ep2 = format!("http://{push_addr2}/fcm/send/gone-test");
+    let body = serde_json::json!({
+        "endpoint": ep2,
+        "keys": {"p256dh": TEST_P256DH, "auth": TEST_AUTH},
+    })
+    .to_string();
+    let (status, _) =
+        http_post_json(&addr, "/push/subscribe", Some(&token), "localhost", &body).await;
+    assert_eq!(status, "200");
+    let (_, status_body) = http_get_bearer(&addr, "/push/status", &token).await;
+    assert!(
+        status_body.contains(r#""subscriptions":2"#),
+        "订阅 2 条（第一条 200 未清）：{status_body}"
+    );
+    let frame2 = serde_json::json!({
+        "v": 1, "type": "push_notify", "machine": "home",
+        "kind": "approval", "convId": "web:s-cd34", "title": "Bash",
+    });
+    gw.send(Message::text(frame2.to_string())).await.unwrap();
+    // 两个订阅都投（离线会话），410 的那个被清。
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, status_body) = http_get_bearer(&addr, "/push/status", &token).await;
+        if status_body.contains(r#""subscriptions":1"#) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "410 订阅应被清理：{status_body}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::timeout(Duration::from_secs(5), push_rx2.recv())
+        .await
+        .expect("410 端点应收到投递")
+        .expect("channel 开着");
+
+    // 6) 畸形 push_notify（kind 越界）→ 静默丢弃（不投递、不进路由、不断连）。
+    let bad = serde_json::json!({
+        "v": 1, "type": "push_notify", "machine": "home",
+        "kind": "bogus", "convId": "c", "title": "t",
+    });
+    gw.send(Message::text(bad.to_string())).await.unwrap();
+    gw.send(Message::text(r#"{"v":1,"type":"ping"}"#.to_string()))
+        .await
+        .unwrap();
+    // ping 会被透传（无浏览器在线 → 丢弃，连接仍活着——下面 200 帧
+    // 正常处理即证明连接未断）。
+    let frame_ok = serde_json::json!({
+        "v": 1, "type": "push_notify", "machine": "home",
+        "kind": "round_error", "convId": "web:s-ef56", "title": "出错",
+    });
+    gw.send(Message::text(frame_ok.to_string())).await.unwrap();
+    // 剩余 1 条订阅（200 端点）再收一次投递。
+    let (authorization2, encoding2, _) =
+        tokio::time::timeout(Duration::from_secs(5), push_rx.recv())
+            .await
+            .expect("存活订阅应再收投递")
+            .expect("channel 开着");
+    assert_eq!(encoding2, "aes128gcm");
+    assert!(authorization2.starts_with("vapid t="));
+    // 畸形帧后 mock2（410 端点）无新增投递（其订阅已清）。
+    assert!(push_rx2.try_recv().is_err(), "已清理订阅不再投递");
+
+    handle.shutdown();
+    handle.wait().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = session_id;
+}

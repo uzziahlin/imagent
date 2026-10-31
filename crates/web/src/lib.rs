@@ -516,6 +516,82 @@ pub(crate) fn encode_approval_resolved_frame(
 }
 
 // ---------------------------------------------------------------------------
+// push_notify 帧出站（协议 v1.10：网关 → 中继，明文管理帧族）
+// ---------------------------------------------------------------------------
+
+/// push_notify 帧的 kind（协议 v1.10 共享契约三值）：回合终态（done/error）
+/// 与审批请求。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushNotifyKind {
+    /// card 终态 done（回合正常结束）。
+    RoundDone,
+    /// card 终态 error（回合出错）。
+    RoundError,
+    /// approval_request 出站。
+    Approval,
+}
+
+impl PushNotifyKind {
+    /// 帧上的字符串形态（共享契约逐字）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PushNotifyKind::RoundDone => "round_done",
+            PushNotifyKind::RoundError => "round_error",
+            PushNotifyKind::Approval => "approval",
+        }
+    }
+}
+
+/// 埋点事件（platform → client 的 push 通道载荷；帧形状见
+/// [`encode_push_notify_frame`]）。SPA 在线时中继会跳过——网关无脑发，
+/// 判定在中继（按订阅 session 的活跃 WS）。
+#[derive(Debug, Clone)]
+pub(crate) struct PushEvent {
+    pub kind: PushNotifyKind,
+    pub conv_id: String,
+    pub title: String,
+}
+
+/// push_notify 帧 title 上限（共享契约：≤32 字摘要——终态卡 task/审批工
+/// 具名）。按 Unicode 码点截（与 SESSION_TITLE_MAX_CHARS 同口径，中文/emoji
+/// 不劈半）。
+pub(crate) const PUSH_TITLE_MAX_CHARS: usize = 32;
+
+/// title 摘要规整（纯函数）：trim 后按码点截 [`PUSH_TITLE_MAX_CHARS`]。
+pub(crate) fn push_notify_title(raw: &str) -> String {
+    raw.trim().chars().take(PUSH_TITLE_MAX_CHARS).collect()
+}
+
+/// push_notify 帧形状（struct 序列化保持声明序——与 lib.rs 其余出站帧同款
+/// 纪律；`json!` 宏默认 BTreeMap 键序会破坏字节级契约）。
+#[derive(Serialize)]
+struct PushNotifyFrame<'a> {
+    v: u8,
+    r#type: &'static str,
+    machine: &'a str,
+    kind: &'static str,
+    #[serde(rename = "convId")]
+    conv_id: &'a str,
+    title: &'a str,
+}
+
+/// push_notify 帧药化（网关 → 中继，明文管理帧族——不经 E2E seal，与
+/// device_list 等管理帧同路：内容无敏感信息，只有「某机器某会话有事件」
+/// 这一层元数据，中继需明文读取做订阅投递）。共享契约字节级：
+/// `{"v":1,"type":"push_notify","machine":…,"kind":…,"convId":…,"title":…}`。
+pub(crate) fn encode_push_notify_frame(machine: &str, ev: &PushEvent) -> String {
+    serde_json::to_string(&PushNotifyFrame {
+        v: 1,
+        r#type: "push_notify",
+        machine,
+        kind: ev.kind.as_str(),
+        conv_id: &ev.conv_id,
+        title: &ev.title,
+    })
+    .expect("push_notify 帧字段均为可序列化标量，序列化不可失败")
+}
+
+// ---------------------------------------------------------------------------
 // 出站工作空间帧（协议 v1.6，字段与 SPA 侧契约逐字一致，不得增删改）
 // ---------------------------------------------------------------------------
 
@@ -2077,6 +2153,53 @@ mod tests {
             task_digest: Some("列出目录".into()),
             terminal,
         }
+    }
+
+    #[test]
+    fn push_notify_frame_byte_level() {
+        // 共享契约字节级：{"v":1,"type":"push_notify","machine","kind",
+        // "convId","title"}——字段名与取值逐字（SPA 侧 push.ts 与中继
+        // parse_notify_frame 双端对齐锚点）。
+        let ev = PushEvent {
+            kind: PushNotifyKind::RoundDone,
+            conv_id: "web:s-ab12".into(),
+            title: "统计依赖数量".into(),
+        };
+        let json = encode_push_notify_frame("home-mac", &ev);
+        assert_eq!(
+            json,
+            r#"{"v":1,"type":"push_notify","machine":"home-mac","kind":"round_done","convId":"web:s-ab12","title":"统计依赖数量"}"#
+        );
+        // 另两 kind 的字符串形态。
+        let ev = PushEvent {
+            kind: PushNotifyKind::RoundError,
+            conv_id: "web:c".into(),
+            title: "t".into(),
+        };
+        assert!(encode_push_notify_frame("m", &ev).contains(r#""kind":"round_error""#));
+        let ev = PushEvent {
+            kind: PushNotifyKind::Approval,
+            conv_id: "web:c".into(),
+            title: "Bash".into(),
+        };
+        assert!(encode_push_notify_frame("m", &ev).contains(r#""kind":"approval""#));
+    }
+
+    #[test]
+    fn push_notify_title_truncates_by_codepoints() {
+        // trim + 按码点截 32（中文不劈半）。
+        assert_eq!(push_notify_title("  hello world  "), "hello world");
+        let cn = "统".repeat(40);
+        let t = push_notify_title(&cn);
+        assert_eq!(t.chars().count(), PUSH_TITLE_MAX_CHARS);
+        assert_eq!(t, "统".repeat(PUSH_TITLE_MAX_CHARS));
+        // 混合码点（emoji 按 1 码点计）。
+        let mixed = format!("{}{}", "🦀".repeat(40), "尾巴");
+        assert_eq!(
+            push_notify_title(&mixed).chars().count(),
+            PUSH_TITLE_MAX_CHARS
+        );
+        assert_eq!(push_notify_title(""), "");
     }
 
     #[test]

@@ -1960,3 +1960,49 @@ describe("App 会话历史重放（v1.8）", () => {
     expect(screen.getAllByText("缓存消息").length).toBeGreaterThanOrEqual(2);
   });
 });
+
+// ---------------------------------------------------------------------------
+// v1.10 ?conv= 深链会话定位（SW notificationclick 无窗口时 openWindow 到
+// /imagent/?conv=...；挂载读参、完整 conv 形态校验后才切）
+// ---------------------------------------------------------------------------
+
+describe("v1.10 ?conv= 深链定位", () => {
+  afterEach(() => {
+    // 恢复 URL，避免污染同文件后续/其它用例
+    window.history.replaceState(null, "", "/");
+  });
+
+  it("完整 conv 形态（web: 前缀）：挂载即切到该会话（侧栏当前项高亮）", () => {
+    window.history.replaceState(null, "", "/?conv=web:abc");
+    const fake = mountApp();
+    handshake(fake, ["home-mac"]);
+    const nav = screen.getByRole("navigation", { name: "会话列表" });
+    const current = nav.querySelector('[aria-current="page"]');
+    expect(current?.textContent).toContain("abc");
+  });
+
+  it("local: 前缀形态同样接受", () => {
+    window.history.replaceState(null, "", "/?conv=local:term-1");
+    const fake = mountApp();
+    handshake(fake, ["home-mac"]);
+    const nav = screen.getByRole("navigation", { name: "会话列表" });
+    expect(nav.querySelector('[aria-current="page"]')?.textContent).toContain("term-1");
+  });
+
+  it("非法形态（裸名字，缺前缀）不切换：保持默认会话", () => {
+    window.history.replaceState(null, "", "/?conv=abc");
+    const fake = mountApp();
+    handshake(fake, ["home-mac"]);
+    const nav = screen.getByRole("navigation", { name: "会话列表" });
+    const current = nav.querySelector('[aria-current="page"]');
+    expect(current?.textContent).toContain("default");
+    expect(current?.textContent).not.toContain("abc");
+  });
+
+  it("无 ?conv= 参数：保持默认会话（回归）", () => {
+    const fake = mountApp();
+    handshake(fake, ["home-mac"]);
+    const nav = screen.getByRole("navigation", { name: "会话列表" });
+    expect(nav.querySelector('[aria-current="page"]')?.textContent).toContain("default");
+  });
+});
