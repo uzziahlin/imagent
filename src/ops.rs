@@ -564,12 +564,17 @@ pub(crate) fn spawn_sighup_handler(
                         resolve_permission_mode(cfg.permission_mode, dispatcher.agent_label());
                     // S-1：热切校验失败（闭环档 × 非 FullLoop 后端 / socket 失败）
                     // 拒绝并保留既有模式——error 级日志便于发现「改了配置没生效」。
-                    if let Err(e) = dispatcher.reload_permission_mode(perm) {
-                        tracing::error!(
-                            target: "imagent::ops",
-                            error = %e,
-                            "SIGHUP 热重载 permission_mode 被拒绝，保留既有运行时模式"
-                        );
+                    // 批 A/2：成功时同步 config 原始档（raw，Auto 不预解析）——
+                    // run 路径按 per-conv 解析出的引擎现算生效档，以 raw 为基准。
+                    match dispatcher.reload_permission_mode(perm) {
+                        Ok(()) => dispatcher.set_raw_permission_mode(cfg.permission_mode),
+                        Err(e) => {
+                            tracing::error!(
+                                target: "imagent::ops",
+                                error = %e,
+                                "SIGHUP 热重载 permission_mode 被拒绝，保留既有运行时模式"
+                            );
+                        }
                     }
                     tracing::info!(target: "imagent::ops", "config reloaded (SIGHUP)");
                 }

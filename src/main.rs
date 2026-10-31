@@ -886,6 +886,16 @@ async fn main() -> Result<()> {
                 config.cot_detail,
                 initial_admins,
             ));
+            // 批 A/2：多引擎注册表注入（claude-cli / codex-app 常驻，与
+            // config.agent 指定的 default 去重）+ config 原始权限档位快照
+            //（Auto 不预解析，run 路径按 per-conv 解析出的引擎现算生效档）。
+            let extras = build_extra_backends(
+                &config.agent,
+                config.permission_mode,
+                std::time::Duration::from_secs(config.permission_ask_timeout_secs),
+            );
+            dispatcher.set_extra_backends(extras);
+            dispatcher.set_raw_permission_mode(config.permission_mode);
             // 快捷命令（v1.17）：config.shortcuts 注入（SIGHUP 热重载同步）。
             dispatcher.set_shortcuts(config.shortcuts.clone());
             // P7-A3/A4：启动偏好（陌生人 @ 提示开关 + 私聊引导开关 + 回复形态），
@@ -1591,6 +1601,43 @@ fn build_backend(
             Ok((b.clone(), Some(b), None))
         }
     }
+}
+
+/// 批 A/2 多引擎注册表装配：default 之外常驻注册 `claude-cli` 与 `codex-app`
+///（三个常用引擎），供 `/backend <name>` 会话级切换。
+///
+/// - 注册是**惰性的**：各 backend 的 `new` 均为纯内存字段初始化（无 spawn、
+///   无 CLI 存在性探测、无任何 IO——批 1 已核实 codex-app，claude-cli/gemini
+///   同理），注册失败面为零，无需 try/warn 分支；
+/// - 与 `default_agent` 同名者跳过（default 已在注册表语义内）；
+/// - gemini / codex(exec) 不常驻——仅当 config.agent 指定（即成为 default）
+///   时存在；
+/// - claude-cli 实例持**独立**的 permission_mode 快照句柄
+///   （`config_mode.resolve("claude-cli")`——auto → AutoClaude）：全局句柄存的是
+///   default 后端的解析结果（如 default=codex-app 时句柄为 Auto），共享会让
+///   该实例把 Auto 当「未接线」静默 headless 化；代价是 /perm 热切与 SIGHUP
+///   不波及此实例（重启恢复 config 基准）。运行参数（模型/沙箱/MCP 运行时
+///   选项）同样仅注入 default 实例——要完整 claude-cli 体验请直接
+///   agent="claude-cli"（default 全量装配）。
+///
+/// 返回按注册顺序的实例表（Dispatcher::set_extra_backends 内再按名去重）。
+fn build_extra_backends(
+    default_agent: &str,
+    config_mode: imagent_core::PermissionMode,
+    ask_timeout: std::time::Duration,
+) -> Vec<Arc<dyn imagent_core::Backend>> {
+    let mut extras: Vec<Arc<dyn imagent_core::Backend>> = Vec::new();
+    if default_agent != "claude-cli" {
+        let claude = Arc::new(imagent_claude::ClaudeBackend::with_permission_mode_shared(
+            Arc::new(parking_lot::RwLock::new(config_mode.resolve("claude-cli"))),
+            ask_timeout,
+        ));
+        extras.push(claude);
+    }
+    if default_agent != "codex-app" {
+        extras.push(Arc::new(imagent_codex::CodexAppBackend::new(None)));
+    }
+    extras
 }
 
 // ---------------------------------------------------------------------------

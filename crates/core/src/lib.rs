@@ -41,7 +41,7 @@ mod types;
 pub mod workspace;
 
 pub use auth::Auth;
-pub use backend::{Backend, ImPermissionAsk, ImPermissionHook, PermissionCapability};
+pub use backend::{backend_key, Backend, ImPermissionAsk, ImPermissionHook, PermissionCapability};
 pub use bitable::{BitableApi, BitableField};
 pub use card_session::sweep_live_cards;
 pub use config::{

@@ -276,6 +276,9 @@ struct MockBackend {
     calls: Arc<TokioMutex<Vec<Option<String>>>>,
     prompts: Arc<TokioMutex<Vec<String>>>,
     order: Arc<AtomicUsize>,
+    /// 批 A/2：引擎名（`name()` 返回值）——多引擎注册表/run 路由测试需要
+    /// 两个不同名的 mock 引擎。缺省 "mock-backend"（既有测试语义不变）。
+    name: &'static str,
     /// 每次 run 前发这些 ToolUse chunk（用于工具摘要测试）。默认空。
     tools_to_emit: Arc<TokioMutex<Vec<(String, String)>>>,
     /// run 直接返 Err（P1-7 失败路径测试用）。
@@ -329,6 +332,7 @@ impl MockBackend {
             calls: calls.clone(),
             prompts: prompts.clone(),
             order: order.clone(),
+            name: "mock-backend",
             tools_to_emit: Arc::new(TokioMutex::new(Vec::new())),
             fail: false,
             steerable: false,
@@ -357,6 +361,14 @@ impl MockBackend {
     ) -> (Self, CallsHandle, PromptsHandle, CounterHandle) {
         let (mut b, calls, prompts, order) = Self::new();
         b.usage = Some(usage);
+        (b, calls, prompts, order)
+    }
+
+    /// 批 A/2：指定引擎名的变体——多引擎注册表 / run 路由 / per-conv capability
+    /// 测试需要两个不同名的 mock 引擎（name() 是 &'static str，用具名变体）。
+    fn new_named(name: &'static str) -> (Self, CallsHandle, PromptsHandle, CounterHandle) {
+        let (mut b, calls, prompts, order) = Self::new();
+        b.name = name;
         (b, calls, prompts, order)
     }
 
@@ -598,7 +610,7 @@ impl Backend for MockBackend {
         })
     }
     fn name(&self) -> &'static str {
-        "mock-backend"
+        self.name
     }
 
     fn supports_steering(&self) -> bool {
@@ -7918,4 +7930,392 @@ async fn conv_state_evict_zero_cap_keeps_exempt() {
     drop(map);
     jh.abort();
     drop_db(ctx.db).await;
+}
+
+// ---------- 批 A/2：多引擎 Dispatcher + 会话级 /backend 切换 ----------
+
+/// 多引擎测试的公共装配：default = 名为 `default_name` 的 mock 引擎 + extras
+/// 注入，返回 dispatcher / inbox / default 观测句柄 / extra 观测句柄 / db 路径。
+struct MultiBackendCtx {
+    disp: Arc<Dispatcher>,
+    inbox: Arc<TokioMutex<Vec<String>>>,
+    default_calls: Arc<TokioMutex<Vec<Option<String>>>>,
+    extra_calls: Arc<TokioMutex<Vec<Option<String>>>>,
+    db: std::path::PathBuf,
+}
+
+async fn build_multi_backend(
+    default_name: &'static str,
+    extra_name: &'static str,
+    mode: PermissionMode,
+    extra_capability: crate::backend::PermissionCapability,
+) -> MultiBackendCtx {
+    let _ = std::fs::create_dir_all("/tmp/imagent-test-ws");
+    // 与 build 助手同口径：白名单 sender u1 兼任 admin（/backend 无 admin 门槛，
+    // 白名单放行即可达）。
+    let whitelist = vec!["u1".into()];
+    let auth = Auth::new(whitelist.clone());
+    let (plat, inbox, _send_count) = MockPlatform::new();
+    let (default_back, default_calls, _prompts, _order) = MockBackend::new_named(default_name);
+    let (mut extra_back, extra_calls, _p2, _o2) = MockBackend::new_named(extra_name);
+    extra_back.capability = extra_capability;
+    let (store, db) = tmp_store().await;
+    let disp = Arc::new(Dispatcher::new(
+        Arc::new(plat),
+        Arc::new(default_back),
+        store,
+        auth,
+        std::path::PathBuf::from("/tmp/imagent-test-ws"),
+        vec!["Read".into()],
+        mode,
+        test_budgets(),
+        CotDetail::Brief,
+        whitelist,
+    ));
+    let registered = disp.set_extra_backends(vec![Arc::new(extra_back)]);
+    assert_eq!(registered, vec![extra_name.to_string()], "extra 应注册成功");
+    MultiBackendCtx {
+        disp,
+        inbox,
+        default_calls,
+        extra_calls,
+        db,
+    }
+}
+
+#[tokio::test]
+async fn resolve_backend_kv_miss_falls_back_to_default() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build_multi_backend(
+        "mock-backend",
+        "b2",
+        PermissionMode::Off,
+        crate::backend::PermissionCapability::Unsupported,
+    )
+    .await;
+    // KV 未设 → default。
+    let resolved = ctx.disp.resolve_backend("c1").await;
+    assert_eq!(resolved.name(), "mock-backend");
+    // 可用名列表：default 在前 + extras 排序。
+    assert_eq!(
+        ctx.disp.available_backend_names(),
+        vec!["mock-backend".to_string(), "b2".to_string()]
+    );
+    drop_db(ctx.db).await;
+}
+
+#[tokio::test]
+async fn resolve_backend_kv_hit_uses_extra_and_invalid_falls_back() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build_multi_backend(
+        "mock-backend",
+        "b2",
+        PermissionMode::Off,
+        crate::backend::PermissionCapability::Unsupported,
+    )
+    .await;
+    // KV 命中且在注册表 → extra 实例。
+    ctx.disp
+        .store
+        .set_config(&crate::backend::backend_key("c1"), "b2")
+        .await
+        .expect("写 KV");
+    let resolved = ctx.disp.resolve_backend("c1").await;
+    assert_eq!(resolved.name(), "b2", "KV 命中应解析到 extra 实例");
+    // KV 命中但名字不在注册表 → 回退 default（历史残留 / 降级部署）。
+    ctx.disp
+        .store
+        .set_config(&crate::backend::backend_key("c2"), "nope")
+        .await
+        .expect("写 KV");
+    let resolved = ctx.disp.resolve_backend("c2").await;
+    assert_eq!(resolved.name(), "mock-backend", "非法名应回退 default");
+    // 空值同样回退。
+    ctx.disp
+        .store
+        .set_config(&crate::backend::backend_key("c3"), "  ")
+        .await
+        .expect("写 KV");
+    assert_eq!(ctx.disp.resolve_backend("c3").await.name(), "mock-backend");
+    drop_db(ctx.db).await;
+}
+
+#[tokio::test]
+async fn set_extra_backends_dedups_against_default_and_self() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build_multi_backend(
+        "mock-backend",
+        "b2",
+        PermissionMode::Off,
+        crate::backend::PermissionCapability::Unsupported,
+    )
+    .await;
+    // 与 default 同名 + 与已注册 extra 同名 → 均跳过/去重。
+    let (dup_default, _c1, _p1, _o1) = MockBackend::new_named("mock-backend");
+    let (dup_b2, _c2, _p2, _o2) = MockBackend::new_named("b2");
+    let registered = ctx
+        .disp
+        .set_extra_backends(vec![Arc::new(dup_default), Arc::new(dup_b2)]);
+    assert!(
+        registered.is_empty(),
+        "同名重复注册应全部跳过: {registered:?}"
+    );
+    assert_eq!(
+        ctx.disp.available_backend_names(),
+        vec!["mock-backend".to_string(), "b2".to_string()],
+        "注册表不应出现重复名"
+    );
+    drop_db(ctx.db).await;
+}
+
+#[tokio::test]
+async fn backend_command_lists_switches_and_rejects_unknown() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build_multi_backend(
+        "mock-backend",
+        "b2",
+        PermissionMode::Off,
+        crate::backend::PermissionCapability::Unsupported,
+    )
+    .await;
+
+    // 无参：回显当前引擎 + 可用列表。
+    ctx.disp.handle(msg("c1", "u1", "/backend")).await;
+    {
+        let inbox = ctx.inbox.lock().await;
+        let shown = inbox
+            .iter()
+            .find(|t| t.contains("当前会话引擎"))
+            .expect("应回显当前引擎");
+        assert!(shown.contains("mock-backend"), "当前引擎: {shown}");
+        assert!(shown.contains("- b2"), "可用列表应含 extra: {shown}");
+        assert!(!shown.contains("✅"), "查看不应误报切换成功: {shown}");
+    }
+
+    // 非法名：回显可用列表，不写 KV、不报成功。
+    ctx.disp.handle(msg("c1", "u1", "/backend nope")).await;
+    {
+        let inbox = ctx.inbox.lock().await;
+        let shown = inbox
+            .iter()
+            .find(|t| t.contains("未知引擎"))
+            .expect("非法名应提示未知");
+        assert!(shown.contains("nope"), "点名非法名: {shown}");
+        assert!(shown.contains("- b2"), "附可用列表: {shown}");
+    }
+    let kv = ctx
+        .disp
+        .store
+        .get_config(&crate::backend::backend_key("c1"))
+        .await
+        .expect("读 KV");
+    assert!(kv.is_none(), "非法名不得写 KV: {kv:?}");
+
+    // 合法切换：写 KV + 固定回显文案。
+    ctx.disp.handle(msg("c1", "u1", "/backend b2")).await;
+    {
+        let inbox = ctx.inbox.lock().await;
+        let shown = inbox
+            .iter()
+            .find(|t| t.contains("本会话引擎已切换为 b2"))
+            .expect("应回显切换成功");
+        assert!(
+            shown.contains("下一条消息生效") && shown.contains("/resume 找回"),
+            "文案应含生效时机与找回指引: {shown}"
+        );
+    }
+    let kv = ctx
+        .disp
+        .store
+        .get_config(&crate::backend::backend_key("c1"))
+        .await
+        .expect("读 KV");
+    assert_eq!(kv.as_deref(), Some("b2"), "切换应写 backend:<conv> KV");
+
+    // 幂等：同名再切，KV 不变、照常回执。
+    ctx.disp.handle(msg("c1", "u1", "/backend b2")).await;
+    let kv = ctx
+        .disp
+        .store
+        .get_config(&crate::backend::backend_key("c1"))
+        .await
+        .expect("读 KV");
+    assert_eq!(kv.as_deref(), Some("b2"), "同名再切 KV 幂等");
+    assert!(
+        ctx.inbox
+            .lock()
+            .await
+            .iter()
+            .filter(|t| t.contains("本会话引擎已切换为 b2"))
+            .count()
+            == 2,
+        "同名再切应再次回执（幂等而非报错）"
+    );
+    drop_db(ctx.db).await;
+}
+
+#[tokio::test]
+async fn run_routes_by_conv_backend_and_persists_agent_kind() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build_multi_backend(
+        "mock-backend",
+        "b2",
+        PermissionMode::Off,
+        crate::backend::PermissionCapability::Unsupported,
+    )
+    .await;
+
+    // conv A 切到 b2 → 下一条消息走 b2，agent_kind 落库 b2。
+    ctx.disp.handle(msg("ca", "u1", "/backend b2")).await;
+    ctx.disp.handle(msg("ca", "u1", "hello a")).await;
+    assert!(
+        !ctx.extra_calls.lock().await.is_empty(),
+        "切换后的 conv 应由 b2 执行"
+    );
+    assert!(
+        ctx.default_calls.lock().await.is_empty(),
+        "切换后的 conv 不应回落 default"
+    );
+    {
+        let row = ctx
+            .disp
+            .store
+            .get_session("ca")
+            .await
+            .expect("get_session")
+            .expect("行应存在");
+        assert_eq!(row.agent_kind, "b2", "session 行 agent_kind 应为解析后引擎");
+    }
+
+    // conv B 不切 → default。
+    ctx.disp.handle(msg("cb", "u1", "hello b")).await;
+    assert!(
+        !ctx.default_calls.lock().await.is_empty(),
+        "未切换 conv 应回落 default"
+    );
+    {
+        let row = ctx
+            .disp
+            .store
+            .get_session("cb")
+            .await
+            .expect("get_session")
+            .expect("行应存在");
+        assert_eq!(
+            row.agent_kind, "mock-backend",
+            "未切换 conv 落库 default 名"
+        );
+    }
+    drop_db(ctx.db).await;
+}
+
+#[tokio::test]
+async fn run_refuses_ask_mode_on_non_fullloop_extra() {
+    let _serial = SERIAL.lock().await;
+    // raw 档 = Ask：capability 门只把关**覆盖引擎**（default 归启动期/热切
+    // fail-closed）；切到非 FullLoop extra 的 conv 在 run 入口被拒。
+    let ctx = build_multi_backend(
+        "mock-backend",
+        "b2",
+        PermissionMode::Ask,
+        crate::backend::PermissionCapability::Unsupported,
+    )
+    .await;
+
+    ctx.disp.handle(msg("c1", "u1", "/backend b2")).await;
+    ctx.disp.handle(msg("c1", "u1", "hello")).await;
+    assert!(
+        ctx.extra_calls.lock().await.is_empty(),
+        "ask 档 × 非 FullLoop extra 应拒绝本轮"
+    );
+    let inbox = ctx.inbox.lock().await;
+    let shown = inbox
+        .iter()
+        .find(|t| t.contains("不支持权限审批闭环"))
+        .expect("应回复可读拒绝文案");
+    assert!(shown.contains("b2"), "文案应点名本轮引擎: {shown}");
+    assert!(shown.contains("/perm"), "文案应给出调档指引: {shown}");
+    drop_db(ctx.db).await;
+}
+
+#[tokio::test]
+async fn run_allows_ask_mode_on_fullloop_extra() {
+    let _serial = SERIAL.lock().await;
+    // 对照组：FullLoop extra × ask 档 → 正常执行（capability 检查按解析结果）。
+    let ctx = build_multi_backend(
+        "mock-backend",
+        "b2",
+        PermissionMode::Ask,
+        crate::backend::PermissionCapability::FullLoop,
+    )
+    .await;
+    ctx.disp.handle(msg("c1", "u1", "/backend b2")).await;
+    ctx.disp.handle(msg("c1", "u1", "hello")).await;
+    assert!(
+        !ctx.extra_calls.lock().await.is_empty(),
+        "ask 档 × FullLoop extra 应放行本轮"
+    );
+    drop_db(ctx.db).await;
+}
+
+#[test]
+fn effective_permission_mode_resolves_per_backend() {
+    // 纯函数级：raw=Auto 按 backend 现算（codex-app 保留 Auto / claude-cli →
+    // AutoClaude / 其余 → Off）；显式档恒等。
+    let auth = Auth::new(vec!["u1".into()]);
+    let admins = auth.snapshot();
+    let (plat, _i, _c) = MockPlatform::new();
+    let (back, _calls, _prompts, _order) = MockBackend::new();
+    let (store, db) = futures_block_on_tmp_store();
+    let disp = Dispatcher::new(
+        Arc::new(plat),
+        Arc::new(back),
+        store,
+        auth,
+        std::path::PathBuf::from("/tmp/imagent-test-ws"),
+        vec!["Read".into()],
+        PermissionMode::Auto,
+        test_budgets(),
+        CotDetail::Brief,
+        admins,
+    );
+    // 构造参初值即 raw（Auto）。
+    assert_eq!(
+        disp.effective_permission_mode("claude-cli"),
+        PermissionMode::AutoClaude
+    );
+    assert_eq!(
+        disp.effective_permission_mode("codex-app"),
+        PermissionMode::Auto
+    );
+    assert_eq!(
+        disp.effective_permission_mode("mock-backend"),
+        PermissionMode::Off
+    );
+    // 注入显式档 → 恒等。
+    disp.set_raw_permission_mode(PermissionMode::Ask);
+    assert_eq!(
+        disp.effective_permission_mode("mock-backend"),
+        PermissionMode::Ask
+    );
+    // Auto 重注入恢复按后端分叉。
+    disp.set_raw_permission_mode(PermissionMode::Auto);
+    assert_eq!(
+        disp.effective_permission_mode("codex-app"),
+        PermissionMode::Auto
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(drop_db(db));
+}
+
+/// effective_permission_mode 测试的临时 store 构造（非 async 上下文直开）。
+fn futures_block_on_tmp_store() -> (Store, std::path::PathBuf) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(tmp_store())
 }

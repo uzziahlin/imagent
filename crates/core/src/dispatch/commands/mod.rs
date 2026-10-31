@@ -33,6 +33,7 @@ const KNOWN_COMMAND_WORDS: &[&str] = &[
     "/again",
     "/allow",
     "/audit",
+    "/backend",
     "/cd",
     "/chat",
     "/compact",
@@ -84,7 +85,15 @@ pub(super) const COMMAND_GROUPS: &[(&str, &[&str])] = &[
     ("📁 目录与文件", &["/cd", "/ws", "/img", "/file"]),
     (
         "🛡️ 权限与运行",
-        &["/perm", "/stop", "/timeout", "/model", "/cron", "/delegate"],
+        &[
+            "/perm",
+            "/backend",
+            "/stop",
+            "/timeout",
+            "/model",
+            "/cron",
+            "/delegate",
+        ],
     ),
     (
         "🧪 状态与诊断",
@@ -382,6 +391,10 @@ impl Dispatcher {
                     }
                     "/perm" => {
                         self.cmd_perm(&conv, &sender, &hint, &parts).await;
+                        return;
+                    }
+                    "/backend" => {
+                        self.cmd_backend(&conv, &hint, &parts).await;
                         return;
                     }
                     "/stop" => {

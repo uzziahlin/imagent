@@ -230,6 +230,42 @@ impl Dispatcher {
         let conv = msg.conv_id.clone();
         let hint = msg.reply_hint.clone();
         let sender_id = msg.sender.0.clone();
+        // 批 A/2 多引擎：per-conv 引擎解析——run 入口 resolve 一次，本轮全程
+        // 使用该实例（agent_kind 校验、derive_task_todos、backend.run、usage
+        // 落库与失败文案的引擎名均取解析结果）。未设置的会话回退 default。
+        let backend = self.resolve_backend(&conv.0).await;
+        // 权限档位按解析结果现算（raw config 档 × 本轮引擎名）：ask 闭环档 ×
+        // 非 FullLoop **覆盖引擎**在本轮拒绝执行——default 引擎的闭环档校验归
+        // 启动期 / 热切路径 fail-closed（生产中 default × 闭环档 × 非 FullLoop
+        // 根本到不了轮次），本门只把关 /backend 切出的会话（auto 档在本轮引擎
+        // 上解析为 Off/Auto/AutoClaude，needs_socket 为假，不触发本门）。
+        let is_default_backend = Arc::ptr_eq(&backend, &self.backend);
+        let effective_mode = self.effective_permission_mode(backend.name());
+        if !is_default_backend
+            && effective_mode.needs_socket()
+            && backend.permission_capability() != crate::backend::PermissionCapability::FullLoop
+        {
+            warn!(
+                target: "imagent::core",
+                conv_id = %conv.0,
+                backend = backend.name(),
+                mode = effective_mode.as_str(),
+                capability = backend.permission_capability().as_str(),
+                "per-conv capability 拒绝：闭环档位 × 非 FullLoop 覆盖引擎"
+            );
+            self.reply(
+                &conv,
+                &format!(
+                    "⚠️ 本会话引擎 {} 不支持权限审批闭环（permission_mode = {}），本轮未执行。\
+                     请 /perm 调低档位（off/allow/deny），或 /backend 切回支持闭环的引擎。",
+                    backend.name(),
+                    effective_mode.as_str()
+                ),
+                &hint,
+            )
+            .await;
+            return None;
+        }
         // v1.23 发起者锚定：本轮首条消息（merge_batch 保序首条）——平台的
         // 卡片发起者标注与按钮点击权锚定到它，不被运行中插话者漂移。
         self.platform.note_round_initiator(&conv, &sender_id).await;
@@ -280,7 +316,9 @@ impl Dispatcher {
         let existing: Option<SessionId> = match self.store.get_session(&conv.0).await {
             Ok(Some(row)) => {
                 // 校验 agent_kind：跨后端切换时不复用旧 session_id（格式不兼容会错乱）。
-                if row.agent_kind == self.backend.name() {
+                // 批 A/2：与**本轮解析出的引擎**比较（per-conv /backend 切换后，
+                // 旧引擎 session 在此自动弃用、按新建开新会话——既有幽灵预检语义）。
+                if row.agent_kind == backend.name() {
                     seed_todos = match &row.task_todos {
                         Some(json) => serde_json::from_str::<crate::types::TaskTodosPayload>(json)
                             .map(|p| p.items)
@@ -290,7 +328,7 @@ impl Dispatcher {
                             let sid_for_replay = row.session_id.clone();
                             // P1（v1.17）：转录回放是同步逐行 IO+解析（大会话可
                             // 达 MB 级），下放 blocking 池防阻塞 async worker。
-                            let backend = self.backend.clone();
+                            let backend_for_replay = backend.clone();
                             // P3-b（code-review v14）：JoinError 与 None 都**跳过
                             // 回写**（保留 NULL，下轮重试）——旧实现的双层
                             // unwrap_or_default 把「推导失败/后端不支持」静默折叠
@@ -298,7 +336,7 @@ impl Dispatcher {
                             // 被空快照顶掉后永远走快路径，转录兜底不再有机会
                             // 重试。只有真实的 Some 才 set_session_todos。
                             let derived = match tokio::task::spawn_blocking(move || {
-                                backend.derive_task_todos(&sid_for_replay, &wd)
+                                backend_for_replay.derive_task_todos(&sid_for_replay, &wd)
                             })
                             .await
                             {
@@ -333,7 +371,7 @@ impl Dispatcher {
                         target: "imagent::core",
                         conv_id = %conv.0,
                         stored = %row.agent_kind,
-                        current = %self.backend.name(),
+                        current = %backend.name(),
                         "session 的 agent_kind 与当前后端不一致，按新建处理"
                     );
                     None
@@ -381,7 +419,8 @@ impl Dispatcher {
         // ask_via_im 的超时可到 86400s，不得放大豁免预算）。
         let perm_asks_at_start = self.router.permission_ask_count(&conv.0).await;
         let (tx, mut rx) = mpsc::channel::<AgentChunk>(32);
-        let backend = self.backend.clone();
+        // 批 A/2：backend 已在 run 入口按 per-conv 解析（resolve_backend），
+        // 此处直接 move 进 spawn——不再取 self.backend（default）。
         let workdir = self.resolve_workdir(&conv.0).await;
         // Wave B-10：workdir 失效前置检查——目录不存在（被删/移动/挂载未就绪）
         // 直接回可读错误、不启动 agent：backend 在坏 cwd 上只会产出难解的
@@ -484,8 +523,11 @@ impl Dispatcher {
                 return None;
             }
         }
+        // 批 A/2：本轮引擎名快照——backend Arc 随 spawn move，失败/落库路径
+        // （失败文案、usage 落库、agent_kind 入库）用 &'static 名字而非
+        // self.backend（default）。
+        let backend_name = backend.name();
         let join = tokio::spawn(async move {
-            let backend_name = backend.name();
             // agent_timeout = 0 = 关闭总超时（默认 3600s=1h 硬上限）：墙钟总预算
             // 会误杀持续输出的超长任务，关闭后防挂死由空闲看门狗（idle_timeout）承担。
             if agent_timeout.is_zero() {
@@ -846,7 +888,8 @@ impl Dispatcher {
             Ok(Err(e)) => {
                 METRICS.backend_errors.inc();
                 // S-7：统一失败文案模板（摘要 + 可续接 + 建议动作），技术细节进日志。
-                let m = backend_failure_reply(self.backend.name());
+                // 批 A/2：引擎名取本轮解析结果（per-conv 可能已切引擎）。
+                let m = backend_failure_reply(backend_name);
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "backend.run 失败");
                 if let Some(c) = card.as_mut() {
                     c.finalize(
@@ -862,9 +905,15 @@ impl Dispatcher {
                 // 但无最终文本被 backend 判 Err）会话本身是好的，落库后下条消息
                 // 续接而非静默开新会话。
                 // 失败/中断路径也记 usage 事件（无 RunOutcome，tokens 记 0）。
-                self.record_run_usage(&conv, None, &sender_id).await;
-                self.persist_learned_session(&conv, existing_sid.as_deref(), &learned_sid)
+                self.record_run_usage(&conv, None, &sender_id, backend_name)
                     .await;
+                self.persist_learned_session(
+                    &conv,
+                    existing_sid.as_deref(),
+                    &learned_sid,
+                    backend_name,
+                )
+                .await;
                 // D1：失败返回路径清理本 conv 的权限 pending（fail-closed deny +
                 // 收敛询问卡），防残留 pending 把后续消息误当审批回复吞掉。
                 self.cancel_pending_on_exit(&conv).await;
@@ -916,9 +965,15 @@ impl Dispatcher {
                 // 语义一致：中断留在原会话，显式 /new 才重开）。会话进度保留后，
                 // 下条消息续接本轮已进行到的部分。
                 // 失败/中断路径也记 usage 事件（无 RunOutcome，tokens 记 0）。
-                self.record_run_usage(&conv, None, &sender_id).await;
-                self.persist_learned_session(&conv, existing_sid.as_deref(), &learned_sid)
+                self.record_run_usage(&conv, None, &sender_id, backend_name)
                     .await;
+                self.persist_learned_session(
+                    &conv,
+                    existing_sid.as_deref(),
+                    &learned_sid,
+                    backend_name,
+                )
+                .await;
                 // D1：中断返回路径同样清理 pending（空闲超时 abort 不经 /stop 的
                 // cancel_all；/stop 已清过则此处为幂等 no-op）。
                 self.cancel_pending_on_exit(&conv).await;
@@ -934,7 +989,7 @@ impl Dispatcher {
                 warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "backend task panic");
                 // P2-5：panic 时若已收到 Final chunk，优先回传它（而非丢弃只报 panic）。
                 // S-7：无 Final 时用统一失败模板（技术细节进日志）。
-                let m = final_text.unwrap_or_else(|| backend_failure_reply(self.backend.name()));
+                let m = final_text.unwrap_or_else(|| backend_failure_reply(backend_name));
                 if let Some(c) = card.as_mut() {
                     c.finalize(
                         Some(m.as_str()),
@@ -946,9 +1001,15 @@ impl Dispatcher {
                     self.reply(&conv, &m, &hint).await;
                 }
                 // 失败/中断路径也记 usage 事件（无 RunOutcome，tokens 记 0）。
-                self.record_run_usage(&conv, None, &sender_id).await;
-                self.persist_learned_session(&conv, existing_sid.as_deref(), &learned_sid)
+                self.record_run_usage(&conv, None, &sender_id, backend_name)
                     .await;
+                self.persist_learned_session(
+                    &conv,
+                    existing_sid.as_deref(),
+                    &learned_sid,
+                    backend_name,
+                )
+                .await;
                 self.cancel_pending_on_exit(&conv).await;
                 self.persist_retry_prompt(&conv, &retry_prompt).await;
                 self.send_failure_quick_actions(&conv, &hint, retry_prompt.is_some())
@@ -962,7 +1023,7 @@ impl Dispatcher {
         self.react_msg(&conv, &react_mids, outcome.terminal).await;
 
         // 成功路径：usage 落库 + 指标（backend 未产出 usage 时记零用量事件行）。
-        self.record_run_usage(&conv, outcome.usage.as_ref(), &sender_id)
+        self.record_run_usage(&conv, outcome.usage.as_ref(), &sender_id, backend_name)
             .await;
 
         // 回传文本优先级：收到过的 Final > outcome.final_text > session_id 提示。
@@ -1181,7 +1242,7 @@ impl Dispatcher {
                 // 会话既有值不覆盖，仅首写/NULL 回填）。
                 first_prompt: Some(first_prompt_digest.clone()),
                 session_id: outcome.session_id.0.clone(),
-                agent_kind: self.backend.name().to_string(),
+                agent_kind: backend_name.to_string(),
                 workdir: workdir_for_row.clone(),
                 name: active_name.clone(),
                 created_at: now,
@@ -1197,7 +1258,7 @@ impl Dispatcher {
                     conv_id: conv.0.clone(),
                     name: name.clone(),
                     session_id: outcome.session_id.0.clone(),
-                    agent_kind: Some(self.backend.name().to_string()),
+                    agent_kind: Some(backend_name.to_string()),
                     workdir: Some(workdir_for_row.clone()),
                     created_at: now,
                     updated_at: now,
@@ -1327,13 +1388,16 @@ impl Dispatcher {
 
     /// 每轮 usage 落库 + 指标：成功路径传 RunOutcome.usage；失败/中断路径拿不到
     /// RunOutcome，传 None（仍记一行零用量事件，保证 /stats 轮次数完整）。
+    /// 批 A/2：`backend_name` 由调用方传本轮解析出的引擎名（per-conv 可能已
+    /// 切引擎，指标与 run_stats 的 backend 维度必须跟实际执行引擎一致）。
     async fn record_run_usage(
         &self,
         conv: &ConvId,
         usage: Option<&crate::types::UsageStats>,
         sender: &str,
+        backend_name: &str,
     ) {
-        let backend = self.backend.name();
+        let backend = backend_name;
         if let Some(u) = usage {
             METRICS
                 .token_usage

@@ -1111,6 +1111,63 @@ impl Dispatcher {
         .await;
     }
 
+    /// /backend [name] —— 会话级引擎切换（批 A/2 多引擎 Dispatcher）。
+    ///
+    /// - 无参：回显当前会话引擎 + 可用引擎列表（注册表：default + extras）；
+    /// - `/backend <name>`：name 在注册表 → 写 `backend:<conv>` KV（与 workdir
+    ///   同一张 store config 表，键名事实源 `backend_key`）→ 回显切换文案
+    ///   （下一条消息生效——run 入口 `resolve_backend` 每轮解析一次）；
+    ///   name 不在注册表 → 回显可用列表（不写 KV）。
+    ///
+    /// 不设 admin 门槛：只影响当前会话的引擎选择（/model 同级，不触及全局
+    /// 配置）；闭环档位 × 非 FullLoop 引擎的拒绝在 run 入口 per-conv 把关，
+    /// 切换本身无需预判能力。任务清单预热缓存不清——task_todos 按会话行存
+    /// 且轮首有 agent_kind 校验，切引擎后旧 session 自动弃用，天然安全。
+    pub(super) async fn cmd_backend(&self, conv: &ConvId, hint: &ReplyHint, parts: &[&str]) {
+        let available = self.available_backend_names();
+        let current = self.resolve_backend(&conv.0).await.name().to_string();
+        let Some(name) = parts.get(1).map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+            let mut text = format!("当前会话引擎：{current}\n可用引擎：");
+            for n in &available {
+                text.push_str(&format!("\n- {n}"));
+            }
+            text.push_str("\n切换：/backend <name>（下一条消息生效）");
+            self.reply(conv, &text, hint).await;
+            return;
+        };
+        if !available.iter().any(|a| a == name) {
+            let mut text = format!("未知引擎「{name}」。可用引擎：");
+            for n in &available {
+                text.push_str(&format!("\n- {n}"));
+            }
+            self.reply(conv, &text, hint).await;
+            return;
+        }
+        match self.store.set_config(&backend_key(&conv.0), name).await {
+            Ok(_) => {
+                self.reply(
+                    conv,
+                    &format!(
+                        "✅ 本会话引擎已切换为 {name}（下一条消息生效）。\
+                         注意：引擎切换后上下文不延续；原引擎会话可用 /resume 找回。"
+                    ),
+                    hint,
+                )
+                .await;
+            }
+            Err(e) => {
+                warn!(
+                    target: "imagent::core",
+                    conv_id = %conv.0,
+                    error = %e,
+                    "per-conv 引擎覆盖写入失败"
+                );
+                self.reply(conv, &format!("⚠️ 引擎切换写入失败：{e}"), hint)
+                    .await;
+            }
+        }
+    }
+
     /// /retry —— 重发本会话**最近一次失败轮**的用户 prompt（W3-3：失败/中断后
     /// 一键续接会话再试）。走与普通消息**完全相同**的 handle 路径（鉴权/批处理/
     /// 轮次语义一致），无需独立执行逻辑。

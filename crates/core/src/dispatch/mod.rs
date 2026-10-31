@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::auth::Auth;
-use crate::backend::Backend;
+use crate::backend::{backend_key, Backend};
 use crate::card_session::CardSession;
 use crate::config::{CotDetail, PermissionMode, ReplyMode};
 use crate::error::Result;
@@ -547,6 +547,13 @@ pub struct WebhookExposure {
 pub struct Dispatcher {
     platform: Arc<dyn Platform>,
     backend: Arc<dyn Backend>,
+    /// 批 A/2 多引擎注册表：除 default（`backend` 字段）外的可用引擎实例
+    ///（name → 实例）。main 启动装配（claude-cli / codex-app 常驻 + config.agent
+    /// 指定者，同名去重；见 bin 的 `build_extra_backends`），启动后不可变——
+    /// SIGHUP 只热载参数不换后端实现。`/backend` 会话级切换的合法名集合由此
+    /// 界定；ImPermissionHook 在 run() 注入**全部**注册实例（hook 为
+    /// dispatcher 级 Arc，Clone 共享安全）。
+    extras: RwLock<HashMap<String, Arc<dyn Backend>>>,
     store: Store,
     auth: Auth,
     default_workdir: PathBuf,
@@ -555,8 +562,15 @@ pub struct Dispatcher {
     conv_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// IM 权限审批路由（Ask 闭环用）。
     router: Arc<PermissionRouter>,
-    /// 权限审批模式。
+    /// 权限审批模式（存 **default 后端启动期解析结果**——backend 经共享句柄
+    /// 直接消费；SIGHUP / `/perm` 热切写此句柄）。
     permission_mode: Arc<RwLock<PermissionMode>>,
+    /// 批 A/2：config **原始**权限档位（Auto 不预解析）。`Auto` 一旦解析成
+    /// AutoClaude/Off 就丢失「按后端再解析」的信息，per-conv 现算必须以 raw
+    /// 为基准（见 [`Self::effective_permission_mode`]）。构造时取
+    /// `permission_mode` 参初值（测试构造传具体档 = 恒等），main 启动 /
+    /// SIGHUP 重载 / `/perm` 热切注入真实 config 值。
+    raw_permission_mode: RwLock<PermissionMode>,
     /// 单次 agent 运行超时。超时则中止该次 run（backend 的 kill_on_drop 杀子进程）。
     agent_timeout: std::time::Duration,
     /// 权限审批（Ask）等待用户回复的超时（S-3：独立预算，不挤占 agent_timeout）。
@@ -933,15 +947,20 @@ impl Dispatcher {
         cot_detail: CotDetail,
         admin_senders: Vec<String>,
     ) -> Self {
+        // 批 A/2：raw 权限档初值 = 构造参（先读后 move——守卫临时值不能活到
+        // 结构体字面量末尾）。
+        let raw_permission_mode = *permission_mode.read();
         let disp = Self {
             platform,
             backend,
+            extras: RwLock::new(HashMap::new()),
             store,
             auth,
             default_workdir,
             allowed_tools,
             conv_locks: Mutex::new(HashMap::new()),
             router: Arc::new(PermissionRouter::new()),
+            raw_permission_mode: RwLock::new(raw_permission_mode),
             permission_mode,
             agent_timeout: budgets.agent_timeout,
             permission_ask_timeout: budgets.permission_ask_timeout,
@@ -1037,6 +1056,96 @@ impl Dispatcher {
     /// v1.31：委托是否已注入（/doctor、命令侧可用性提示用）。
     pub fn delegate_enabled(&self) -> bool {
         self.delegate.read().is_some()
+    }
+
+    /// 批 A/2：多引擎注册表注入（main 启动装配调用一次）。按 backend name
+    /// 去重，与 default（config.agent）同名者跳过；注册是惰性的——实例构造
+    /// 不 spawn 进程、不探测 CLI 存在（见 bin 的 `build_extra_backends`）。
+    /// 返回新注册的引擎名（日志/测试断言用）。
+    pub fn set_extra_backends(&self, extras: Vec<Arc<dyn Backend>>) -> Vec<String> {
+        let default = self.backend.name();
+        let mut map = self.extras.write();
+        let mut registered = Vec::new();
+        for b in extras {
+            let name = b.name();
+            if name == default {
+                debug!(
+                    target: "imagent::core",
+                    backend = name,
+                    "与 default 引擎同名，跳过注册"
+                );
+                continue;
+            }
+            if map.insert(name.to_string(), b).is_some() {
+                debug!(
+                    target: "imagent::core",
+                    backend = name,
+                    "引擎重复注册，以最后一次实例为准"
+                );
+            } else {
+                registered.push(name.to_string());
+            }
+        }
+        drop(map);
+        registered.sort();
+        if !registered.is_empty() {
+            info!(
+                target: "imagent::core",
+                engines = ?registered,
+                "多引擎注册表就绪（/backend <name> 可会话级切换）"
+            );
+        }
+        registered
+    }
+
+    /// 可用引擎名列表（/backend 展示与 `/backend <name>` 合法性校验共用）：
+    /// default 在前，extras 按名排序（展示稳定）。
+    pub(crate) fn available_backend_names(&self) -> Vec<String> {
+        let mut names = vec![self.backend.name().to_string()];
+        let mut extra: Vec<String> = self.extras.read().keys().cloned().collect();
+        extra.sort_unstable();
+        names.extend(extra);
+        names
+    }
+
+    /// per-conv 引擎解析（批 A/2）：`backend:<conv>` KV 命中且名字在注册表 →
+    /// 该实例；KV 未设 / 存取失败 / 名字不在注册表（注册失败引擎的历史残留、
+    /// 或降级部署）→ 回退 default。run 入口调用一次，本轮全程使用解析结果
+    ///（agent_kind 校验、usage 落库与失败文案的 backend 名均取此值）。
+    async fn resolve_backend(&self, conv_id: &str) -> Arc<dyn Backend> {
+        match self.store.get_config(&backend_key(conv_id)).await {
+            Ok(Some(name)) if !name.trim().is_empty() => {
+                let name = name.trim();
+                let hit = self.extras.read().get(name).cloned();
+                if let Some(b) = hit {
+                    return b;
+                }
+                debug!(
+                    target: "imagent::core",
+                    conv_id = conv_id,
+                    backend = name,
+                    "per-conv 引擎覆盖不在注册表，回退 default"
+                );
+                self.backend.clone()
+            }
+            _ => self.backend.clone(),
+        }
+    }
+
+    /// 批 A/2：config 原始权限档位注入（main 启动 / SIGHUP 重载 / `/perm`
+    /// 热切同步更新）。只存 raw——Auto 不在此预解析，per-conv 现算见
+    /// [`Self::effective_permission_mode`]。
+    pub fn set_raw_permission_mode(&self, mode: PermissionMode) {
+        *self.raw_permission_mode.write() = mode;
+    }
+
+    /// 生效权限档位现算（批 A/2）：raw 配置档按 backend 名解析——Auto 遇
+    /// claude-cli → AutoClaude、codex-app → 保留 Auto、其余 → Off；显式档
+    /// 原样。run 路径按**解析出的 per-conv backend** 调用（capability 检查
+    /// 与 auto 档语义随会话引擎走），与启动期「只按 default 解析一次」的
+    /// `permission_mode` 句柄解耦。
+    pub(crate) fn effective_permission_mode(&self, backend_name: &str) -> PermissionMode {
+        self.raw_permission_mode.read().resolve(backend_name)
     }
 
     /// v1.31：`/delegate` 命令的入口句柄（命令分支与 socket 分支同源；crate 内
@@ -1779,12 +1888,14 @@ impl Dispatcher {
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
-        // B3：能力矩阵一行（启动日志，审计/排障用）。
+        // B3：能力矩阵一行（启动日志，审计/排障用）。批 A/2：engines = 全部
+        // 注册实例（default + extras，/backend 可切换的合法名集合）。
         let cap = self.backend.permission_capability();
         let mode = *self.permission_mode.read();
         info!(
             target: "imagent::core",
             backend = self.backend.name(),
+            engines = ?self.available_backend_names(),
             permission_mode = mode.as_str(),
             capability = cap.as_str(),
             native_passthrough = self.backend.supports_native_permission_mode(),
@@ -1818,8 +1929,15 @@ impl Dispatcher {
         let _ = self.capability_surface_warnings();
         // B3：把 IM 审批闭环回调注入 backend（与 claude-cli 的 MCP→socket 闭环
         // 同一条 PermissionRouter 通道；ACP 的 session/request_permission 走此）。
+        // 批 A/2：注入**全部注册实例**——hook 是 dispatcher 级 Arc
+        //（ImPermissionHook = Arc<dyn Fn…>），Clone 共享安全；无闭环能力的
+        // 后端 set_im_permission_hook 为 trait 缺省 no-op。会话级切到
+        // codex-app / claude-cli 的 conv 由此获得同一审批通道。
         let hook = self.build_im_permission_hook();
-        self.backend.set_im_permission_hook(Some(hook));
+        self.backend.set_im_permission_hook(Some(hook.clone()));
+        for b in self.extras.read().values() {
+            b.set_im_permission_hook(Some(hook.clone()));
+        }
         // Ask 模式：spawn unix socket accept task（MCP server 转发的权限请求经此进主进程）。
         // D12：抽到 ensure_permission_socket（热切 /perm ask 复用同一路径）。
         // S-2（fail-closed）：bind 失败（路径不可写 / 平台不支持）时**拒绝启动**——
@@ -1830,9 +1948,17 @@ impl Dispatcher {
         // T12：注入了 Bitable 数据面时同样必须 bind——`kind=bitable` 请求与审批
         // 共用同一 socket（claude-cli 恒 FullLoop 已覆盖，此处兜底未来非 claude
         // 后端接入的场景）。
+        // 批 A/2：任一**注册实例**为 FullLoop 时同样必须 bind——会话级切到该
+        // 引擎的 conv 审批闭环依赖 socket（此前只看 default，/backend 切出的
+        // conv 会得到 fail-closed deny 而非审批卡）。
+        let any_registered_full_loop =
+            self.extras.read().values().any(|b| {
+                b.permission_capability() == crate::backend::PermissionCapability::FullLoop
+            });
         let mode_needs_sock = self.permission_mode.read().needs_socket()
             || self.backend.permission_capability()
                 == crate::backend::PermissionCapability::FullLoop
+            || any_registered_full_loop
             || self.bitable_enabled();
         if mode_needs_sock && !self.ensure_permission_socket() {
             return Err(crate::error::CoreError::Config(
@@ -2940,11 +3066,15 @@ impl Dispatcher {
     /// 或正常完成但无最终文本被 backend 判 Err）——RunOutcome 拿不到，不落库则
     /// 下条消息静默开新会话，用户感知为「agent 失忆」。仅当学到的 id 非空且与本轮
     /// 传入的不同时写（相同 = 续接既有会话，映射未变）；失败仅 log 不影响回复。
+    /// 批 A/2：`backend_name` 由调用方传**本轮解析出的引擎名**（per-conv
+    /// resolve 结果）——落库 agent_kind 必须与实际执行引擎一致，否则下轮
+    /// agent_kind 校验会误判为跨引擎而弃用会话。
     async fn persist_learned_session(
         &self,
         conv: &ConvId,
         existing: Option<&str>,
         learned: &Option<String>,
+        backend_name: &str,
     ) {
         let Some(sid) = learned.as_deref().filter(|s| !s.is_empty()) else {
             return;
@@ -2969,7 +3099,7 @@ impl Dispatcher {
             // 学到的裸 sid 无 prompt 上下文——None（历史行已有值则 COALESCE 保留）。
             first_prompt: None,
             session_id: sid.to_string(),
-            agent_kind: self.backend.name().to_string(),
+            agent_kind: backend_name.to_string(),
             workdir: workdir.clone(),
             name: active_name.clone(),
             created_at: now,
@@ -2986,7 +3116,7 @@ impl Dispatcher {
                 conv_id: conv.0.clone(),
                 name,
                 session_id: sid.to_string(),
-                agent_kind: Some(self.backend.name().to_string()),
+                agent_kind: Some(backend_name.to_string()),
                 workdir: Some(workdir),
                 created_at: now,
                 updated_at: now,

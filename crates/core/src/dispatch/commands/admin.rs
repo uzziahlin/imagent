@@ -893,6 +893,10 @@ impl Dispatcher {
                 // S-1：reload Result 化——能力/socket 失败统一走 Err 回执（模式保持不变）。
                 match self.reload_permission_mode(resolved) {
                     Ok(()) => {
+                        // 批 A/2：raw 同步为 Auto——per-conv 现算（run 路径
+                        // effective_permission_mode）按各会话引擎自行解析，
+                        // 不被 default 的解析结果钉死。
+                        self.set_raw_permission_mode(PermissionMode::Auto);
                         self.reply(
                             conv,
                             &format!(
@@ -938,6 +942,9 @@ impl Dispatcher {
                 // 回执不再要求重启。S-1：reload Result 化（能力/socket 失败回执）。
                 match self.reload_permission_mode(mode) {
                     Ok(()) => {
+                        // 批 A/2：raw 同步（显式档 resolve 恒等，per-conv 现算
+                        // 与全局一致）。
+                        self.set_raw_permission_mode(mode);
                         // T4（P3-3）：切到 allow/deny × 非 FullLoop 后端——回执直接
                         // 带同一提示（用户能立刻看到，不用翻日志；warn 面在
                         // reload_permission_mode 内部的 capability_surface_warnings）。

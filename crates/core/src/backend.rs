@@ -83,6 +83,19 @@ pub struct ImPermissionAsk {
 pub type ImPermissionHook =
     Arc<dyn Fn(ImPermissionAsk) -> futures::future::BoxFuture<'static, bool> + Send + Sync>;
 
+/// per-conv 引擎覆盖键前缀（批 A/2 多引擎 Dispatcher）：`/backend` 命令写入，
+/// [`Dispatcher::resolve_backend`](crate::dispatch::Dispatcher) 在 run 入口解析。
+/// 与 `workdir:<conv>` 同一张 store config KV 表；本模块是键名事实源——
+/// core 命令层与 web 驾驶舱（批 B 视图子命令接入时）都从这里取读写辅助，
+/// 杜绝键名漂移。
+pub const BACKEND_KV_PREFIX: &str = "backend:";
+
+/// per-conv 引擎覆盖的 config 键：`backend:<conv_id>`。值 = 注册表内的引擎名
+///（如 `claude-cli` / `codex-app`）；不存在 = 跟随 config 默认引擎。
+pub fn backend_key(conv_id: &str) -> String {
+    format!("{BACKEND_KV_PREFIX}{conv_id}")
+}
+
 /// agent 后端抽象（无状态执行器）。
 ///
 /// core 传入 `session`（续接）或 `None`（新建），Backend 执行并流式产出
@@ -222,5 +235,19 @@ pub trait Backend: Send + Sync {
     /// status_line）。
     fn sandbox_status(&self) -> Option<String> {
         None
+    }
+}
+
+#[cfg(test)]
+mod backend_key_tests {
+    use super::*;
+
+    /// 键名布局钉住（/backend 命令写入与 run 入口解析的互通契约；web 批 B
+    /// 视图子命令接入时同键复用）。
+    #[test]
+    fn backend_key_layout() {
+        assert_eq!(BACKEND_KV_PREFIX, "backend:");
+        assert_eq!(backend_key("feishu:ou_x"), "backend:feishu:ou_x");
+        assert_eq!(backend_key("local:work"), "backend:local:work");
     }
 }
