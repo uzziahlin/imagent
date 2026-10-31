@@ -202,7 +202,7 @@ fn codex_parse(line: &str) -> CliEvent {
 /// - 否则 → `read-only`。
 ///
 /// **绝不**自动选 `danger-full-access`。
-fn pick_sandbox(allowed_tools: &[String]) -> &'static str {
+pub(crate) fn pick_sandbox(allowed_tools: &[String]) -> &'static str {
     // tools_unrestricted / WRITE_OR_EXEC 见 imagent_core::backend_common。
     let needs_write = imagent_core::backend_common::tools_unrestricted(allowed_tools)
         || allowed_tools

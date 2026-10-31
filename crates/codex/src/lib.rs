@@ -1,17 +1,22 @@
-//! `imagent-codex`：基于 OpenAI Codex CLI（`codex exec --json`）的 agent 后端。
+//! `imagent-codex`：基于 OpenAI Codex CLI 的 agent 后端。
 //!
-//! 实现 [`imagent_core::Backend`]：spawn `codex exec` 子进程，以每行一个 JSON
-//! 对象的输出格式逐行解析，捕获 Codex 分配的 `thread_id`（即 session id），向
-//! 调用方流式推送 [`imagent_core::AgentChunk`]，最终返回
-//! [`imagent_core::RunOutcome`]。
+//! 两条执行线：
+//! - [`CodexBackend`]：`codex exec --json` 单发流（无 IM 审批闭环、无 steering）；
+//! - [`CodexAppBackend`]：`codex app-server` 双工协议（JSON-RPC over stdio，
+//!   审批闭环 FullLoop + steering + 模型目录，批 1——dispatcher 装配接线属批 2）。
 //!
-//! 与 [`imagent_claude::ClaudeBackend`] 同构：spawn + 逐行 JSONL 解析 + session
-//! 捕获，差异仅在 CLI 命令与事件结构。对外只暴露 [`CodexBackend`]。
+//! app-server 协议客户端层在 [`crate::app_server`]（JSON-RPC 信封、请求-响应
+//! 关联、通知/服务端请求双通道分发），双工协议的真机信封样本与 schema 差异点
+//! 见该模块注释。
 
 #![forbid(unsafe_code)]
 
+mod app_backend;
+mod app_server;
 mod backend;
 mod sessions;
 mod stream;
 
+pub use app_backend::CodexAppBackend;
+pub use app_server::{AppServerProcess, IncomingNotification, IncomingRequest, RpcReply};
 pub use backend::CodexBackend;
