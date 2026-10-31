@@ -222,7 +222,9 @@ impl MachineStore {
             let mut st = self.lock();
             if st.iter().any(|e| e.name == name) {
                 return Err(format!(
-                    "机器 `{name}` 已存在（重名拒绝；如需换钥先 remove 再 add）"
+                    "机器名 `{name}` 已被占用。若是新机器：在它上面运行 \
+                     `imagent join --name <新名字>` 换名后重新添加；若是给这台\
+                     机器换钥：先 remove 再 add"
                 ));
             }
             if st.iter().any(|e| e.key == key) {
@@ -427,7 +429,7 @@ mod tests {
         // 校验失败：重名 / 非法名 / 非 hex / 长度错 / 非法点 / 公钥重复绑定。
         let long_name = "m".repeat(33);
         let cases: Vec<(&str, String, &str)> = vec![
-            ("home", pk_hex(3), "已存在"),
+            ("home", pk_hex(3), "已被占用"),
             ("bad name!", pk_hex(3), "非法"),
             ("", pk_hex(3), "非法"),
             (&long_name, pk_hex(3), "非法"),

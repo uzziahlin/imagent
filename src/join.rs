@@ -55,15 +55,15 @@ pub fn run(relay: Option<String>, name: Option<String>, workdir: Option<PathBuf>
         None => prompt_relay()?,
     };
 
-    // 2. 机器名：参数显式 > hostname 短名缺省（读取失败回退提示输入）。
+    // 2. 机器名：参数显式 > 交互（hostname 短名作预填默认，回车接受 / 输入
+    //    覆盖——机器名是手机侧栏天天看的标签，hostname 常为「Xs-MacBook-Pro」
+    //    形态，接入时应给改名机会；且须与手机「添加机器」登记名一字不差，
+    //    relay 按名查公钥验签）。hostname 不可读 → 无默认必填。
     let name = match name {
         Some(n) => normalize_machine_name(&n)?,
-        None => match hostname_short() {
-            Some(h) => normalize_machine_name(&h)?,
-            None => prompt_machine_name()?,
-        },
+        None => prompt_machine_name(hostname_short().as_deref())?,
     };
-    println!("机器名：{name}");
+    println!("机器名：{name}（手机「添加机器」须填完全相同的名字）");
 
     // 3. 工作目录（绝对路径 + is_dir + 过宽拒绝；参数式直接报错，交互重试 ≤3）。
     let workdir = collect_workdir(workdir.as_deref())?;
@@ -188,11 +188,19 @@ fn prompt_relay() -> Result<String> {
 }
 
 /// 交互录入机器名（hostname 不可用时的回退路径）。
-fn prompt_machine_name() -> Result<String> {
-    let raw = setup::prompt(
-        "机器名（hostname 不可用，请手输；ASCII 字母数字 - _，≤32）",
-        "",
-    )?;
+/// 机器名交互：hostname 可用时作预填默认（回车接受，输入覆盖）；不可用则
+/// 无默认必填。规范化在返回前统一做。
+fn prompt_machine_name(default: Option<&str>) -> Result<String> {
+    let raw = match default {
+        Some(h) => setup::prompt(
+            "机器名（ASCII 字母数字 - _，≤32；须与手机「添加机器」登记名一致）",
+            h,
+        )?,
+        None => setup::prompt(
+            "机器名（hostname 不可用，请手输；ASCII 字母数字 - _，≤32）",
+            "",
+        )?,
+    };
     if raw.is_empty() {
         return Err(anyhow!("机器名不能为空，join 退出"));
     }
