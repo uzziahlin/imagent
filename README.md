@@ -58,6 +58,7 @@ trait Platform                        trait Backend
 ├── ilink  (个人微信私聊, 实验性)       ├── claude (CLI + ACP 长驻子进程)
 ├── wecom  (企业微信长连接, 单聊文本)   ├── acp    (任意 ACP agent, 配 acp_command)
 └── feishu (飞书私聊/群/云文档评论)     ├── codex  (codex exec --json)
+                                      ├── codex-app (codex app-server 双工: 审批闭环/steering/model-list)
                                       └── gemini (gemini -p -o stream-json)
         ↕                              ↕
               core: 调度 / 鉴权 / 会话路由 (store 持久化) / 权限审批闭环
@@ -132,10 +133,13 @@ cat > ~/.imagent/config.toml <<'EOF'
 default_workdir = "/absolute/path/to/agent/workspace"  # 必填，agent 的 cwd（OS 级沙箱见 agent_sandbox；靠 allowed_tools + permission_mode 兜底）
 allowed_senders = []        # 留空 = 发现模式（先看日志拿你的 from_user_id）
 # allowed_tools 不写 = 全部工具（不收敛）；要白名单就显式列，如 ["Read","Edit"]；执行类建议配 permission_mode="ask" 过审
-# permission_mode = "auto"  # 缺省=auto：claude-cli=透传 claude 原生 auto 模式(分类器自动放行安全操作,高危进 IM)+审批闭环；其余后端=off；显式 ask=每个提示都进 IM
-# backend_permission_mode = "auto"  # 后端原生权限模式透传(claude→--permission-mode，覆盖 auto 档缺省)：default|acceptEdits|plan|auto|dontAsk|bypassPermissions；codex/gemini 暂不支持(warn 忽略)
+# permission_mode = "auto"  # 缺省=auto：claude-cli=透传 claude 原生 auto 模式(分类器自动放行安全操作,高危进 IM)+审批闭环；codex-app=保留 auto(审批档缺省 on-request,同样分类器筛+高危进 IM)；其余后端=off；显式 ask=每个提示都进 IM
+# backend_permission_mode = "auto"  # 后端原生权限模式透传(claude→--permission-mode，覆盖 auto 档缺省)：default|acceptEdits|plan|auto|dontAsk|bypassPermissions；codex/codex-app/gemini 暂不支持透传(warn 忽略；codex-app 审批档走构造缺省 on-request)
 # approval_tools = ["Bash", "WebFetch", "mcp__*"]  # 审批集：ask 模式下只有这些工具过 IM 审批，其余直接放行；空=全部过审
-# agent = "claude-cli"   # 换 agent 后端：claude-cli(默认) | claude-acp(Claude ACP 长驻子进程) | acp(任意 ACP agent，配 acp_command) | codex | gemini
+# agent = "claude-cli"   # 换 agent 后端：claude-cli(默认) | claude-acp(Claude ACP 长驻子进程) | acp(任意 ACP agent，配 acp_command) | codex(codex exec) | codex-app(app-server 双工，审批闭环/steering 全量可用) | gemini
+# [official_models]  # /model 菜单官方回退列表（per-backend 表；旧单列表 official_models=["a","b"] 仍兼容，映射到 claude）
+# claude = ["sonnet", "opus", "haiku"]             # claude 系最末层回退（缺省=此三件）
+# codex = ["gpt-5-codex", "gpt-5.1-codex-mini"]    # codex-app 最末层回退（缺省=此两件；实时 model/list 与 ~/.codex/config.toml 目录优先）
 # acp_command = "opencode-acp"  # agent="acp" 必填：启动目标 ACP agent 的命令（如 "opencode-acp" / "gemini --experimental-acp"，以目标 agent 的 ACP 接入文档为准；claude-acp 下可选覆盖默认命令，优先级 acp_command > 环境变量 IMAGENT_ACP_COMMAND > claude-agent-acp）
 # allowed_chats = ["feishu:oc_xxx"]  # 会话(群)白名单：群消息 chat 放行 OR sender 放行（/chat 可动态管理）
 # ask_via_im_conv = "feishu:ou_xxx"  # 终端 agent 的 ask_via_im 提问投递会话（配了才启用，见「终端 agent 接入」）

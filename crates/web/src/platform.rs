@@ -49,7 +49,7 @@ use imagent_core::{
 
 use crate::client::WebClient;
 use crate::e2e::E2eIdentity;
-use crate::models::{resolve_models, CliModels, ModelsContext};
+use crate::models::{resolve_models, CliSource, ModelsContext};
 use crate::titles::{TitleCandidate, TitleGen};
 use crate::{
     encode_approval_request_frame, encode_approval_resolved_frame, encode_card_frame,
@@ -247,9 +247,11 @@ async fn serve_workspace_actions(
                 let Some(act) = act else {
                     break; // client 退出（platform drop 连动），无后续动作
                 };
-                // v1.8：每次组装现读 CLI 映射（ccswitch 切供应商后下一条快照
-                // 即生效，无需重启/缓存失效）。
-                let cli = crate::models::read_cli_models();
+                // v1.8：每次组装现读 CLI/codex 配置（ccswitch 切供应商 / 改
+                // ~/.codex/config.toml 后下一条快照即生效，无需重启/缓存失效）。
+                // codex-app 批：按 backend 名分链（claude 系读 settings、
+                // codex-app 读 codex config.toml）。
+                let cli = crate::models::read_cli_for_backend(models.backend.name());
                 handle_workspace_action(
                     &machine_id,
                     &store,
@@ -278,7 +280,7 @@ async fn handle_workspace_action(
     store: &Store,
     default_workdir: &Path,
     models: &ModelsContext,
-    cli: &CliModels,
+    cli: &CliSource,
     titles: &TitleGen,
     act: InboundAction,
     outbound_tx: &mpsc::Sender<String>,
@@ -346,16 +348,20 @@ async fn handle_workspace_action(
 /// workspaces 全量快照组帧：default = 配置 default_workdir；workspaces =
 /// 全部命名空间（name 稳定序）；convs = 全部已知 conv 的当前 workdir
 ///（含 local: 会话）；sessions = `web:` 会话历史段（v1.7，见
-/// [`collect_session_entries`]）；models = v1.8 模型目录段（CLI 映射优先 +
-/// [`ModelsContext::official`] 回退，current = backend.model()——/model 命令
-/// 热设值；空 options 组帧出口整段缺席）。best-effort：单段 list 失败 →
-/// warn + 该段空，快照照发（SPA 单一数据来源，宁可缺段不可断流）。
+/// [`collect_session_entries`]）；models = 模型目录段（**按 backend 分链**：
+/// claude 链 = CLI 映射优先 + [`ModelsContext::official`].claude 回退；codex-app
+/// 链 = 实时 list_models（[`ModelsContext::list_models`]，经 `spawn_blocking`
+/// 调——实现侧自 spawn 临时 app-server，秒级阻塞不占 reactor worker，panic/
+/// 失败回空静默落下层）→ codex config catalog → official.codex。current =
+/// backend.model()——/model 命令热设值；空 options 组帧出口整段缺席）。
+/// best-effort：单段 list 失败 → warn + 该段空，快照照发（SPA 单一数据来源，
+/// 宁可缺段不可断流）。
 async fn build_workspaces_frame(
     machine: &str,
     store: &Store,
     default_workdir: &Path,
     models: &ModelsContext,
-    cli: &CliModels,
+    cli: &CliSource,
     titles: &TitleGen,
 ) -> Result<String> {
     let mut entries: Vec<WorkspaceEntryFrame> = Vec::new();
@@ -393,9 +399,33 @@ async fn build_workspaces_frame(
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name)); // 契约：按 name 稳定序
     let sessions = collect_session_entries(store, titles).await;
-    // v1.8 models 段：CLI 映射（调用方现读注入，见 serve_workspace_actions）
-    // + backend.model()（/model 热设值）汇聚；空 options 整段缺席。
-    let models_frame = resolve_models(cli, &models.official, models.backend.model());
+    // models 段：按 backend 分链汇聚（调用方现读注入，见
+    // serve_workspace_actions）+ backend.model()（/model 热设值）；空 options
+    // 整段缺席。
+    let models_frame = match cli {
+        // claude 链（含 exec codex 行为冻结：旧单列表消费者，不动）。
+        CliSource::Claude(c) => resolve_models(c, &models.official.claude, models.backend.model()),
+        // codex-app 链：实时 list_models（spawn_blocking 隔离秒级 app-server
+        // 往返）→ codex config catalog → official.codex；实时空/panic 回空
+        // 静默落下层。
+        CliSource::Codex(c) => {
+            let live = match &models.list_models {
+                Some(f) => {
+                    let f = f.clone();
+                    tokio::task::spawn_blocking(move || f())
+                        .await
+                        .unwrap_or_default()
+                }
+                None => Vec::new(),
+            };
+            crate::models::resolve_codex_models(
+                &live,
+                c,
+                &models.official.codex,
+                models.backend.model(),
+            )
+        }
+    };
     encode_workspaces_frame(
         machine,
         &default_workdir.to_string_lossy(),
@@ -1456,6 +1486,7 @@ mod tests {
     //! wecom 同款手法）；端到端行为见 tests/web_loopback.rs。
 
     use super::*;
+    use crate::models::CliModels;
     use imagent_core::{Backend, CardPhase, CardTerminal};
     use imagent_store::OutboundRow;
 
@@ -1607,13 +1638,14 @@ mod tests {
         }
     }
 
-    /// 既有动作测试的空模型上下文（official 空 + 无 CLI 映射 → models 段
-    /// 整段缺席，快照字节与 v1.6/v1.7 一致——断言不依赖运行机器的
+    /// 既有动作测试的空模型上下文（official 两后端全空 + 无 CLI 映射 → models
+    /// 段整段缺席，快照字节与 v1.6/v1.7 一致——断言不依赖运行机器的
     /// ~/.claude 状态，确定性钉住）。
     fn empty_models() -> ModelsContext {
         ModelsContext {
             backend: Arc::new(TestBackend(None)),
-            official: Vec::new(),
+            official: imagent_core::OfficialModels::default(),
+            list_models: None,
         }
     }
 
@@ -1624,15 +1656,22 @@ mod tests {
         default: &Path,
         act: InboundAction,
     ) -> Vec<serde_json::Value> {
-        run_action_with(store, default, &empty_models(), &CliModels::default(), act).await
+        run_action_with(
+            store,
+            default,
+            &empty_models(),
+            &CliSource::Claude(CliModels::default()),
+            act,
+        )
+        .await
     }
 
-    /// [`run_action`] 的 v1.8 全参形态（模型上下文 + CLI 映射可注入）。
+    /// [`run_action`] 的 v1.8 全参形态（模型上下文 + CLI/codex 配置快照可注入）。
     async fn run_action_with(
         store: &Store,
         default: &Path,
         models: &ModelsContext,
-        cli: &CliModels,
+        cli: &CliSource,
         act: InboundAction,
     ) -> Vec<serde_json::Value> {
         let (tx, mut rx) = mpsc::channel::<String>(32);
@@ -1669,8 +1708,8 @@ mod tests {
     }
 
     /// v1.8 models 段组装（任务验收项）：官方回退（无 CLI 映射 → options =
-    /// official 列表、target null、current = backend.model()）；CLI 映射优先
-    /// （只出有映射的别名、target = 映射值、cliDefault 原样）；空 official
+    /// official.claude 列表、target null、current = backend.model()）；CLI 映射
+    /// 优先（只出有映射的别名、target = 映射值、cliDefault 原样）；空 official
     /// 且无映射 → 整段缺席（旧形态字节不变）。
     #[tokio::test]
     async fn workspace_snapshot_models_section() {
@@ -1680,13 +1719,17 @@ mod tests {
         // 官方回退 + current。
         let ctx = ModelsContext {
             backend: Arc::new(TestBackend(Some("glm-4.6".into()))),
-            official: vec!["sonnet".into(), "opus".into(), "haiku".into()],
+            official: imagent_core::OfficialModels {
+                claude: vec!["sonnet".into(), "opus".into(), "haiku".into()],
+                codex: vec![],
+            },
+            list_models: None,
         };
         let frames = run_action_with(
             &store,
             &default,
             &ctx,
-            &CliModels::default(),
+            &CliSource::Claude(CliModels::default()),
             InboundAction::WorkspaceList,
         )
         .await;
@@ -1716,8 +1759,14 @@ mod tests {
             .into_iter()
             .collect(),
         };
-        let frames =
-            run_action_with(&store, &default, &ctx, &cli, InboundAction::WorkspaceList).await;
+        let frames = run_action_with(
+            &store,
+            &default,
+            &ctx,
+            &CliSource::Claude(cli),
+            InboundAction::WorkspaceList,
+        )
+        .await;
         let snap = frames.iter().find(|f| f["type"] == "workspaces").unwrap();
         let opts = snap["models"]["options"].as_array().unwrap();
         assert_eq!(
@@ -1735,6 +1784,79 @@ mod tests {
         assert!(
             snap.get("models").is_none(),
             "空 options 整段缺席（契约）：{snap}"
+        );
+    }
+
+    /// codex-app 链 models 段组装（codex-app 批验收项）：实时 list_models 闭包
+    ///（经 build_workspaces_frame 的 spawn_blocking 通路）非空短路——options
+    /// label=target=id；cliDefault 取 codex config 快照（与 options 来源解耦）；
+    /// 实时空 → official.codex 接管（target null）。
+    #[tokio::test]
+    async fn workspace_snapshot_models_section_codex_app() {
+        let store = test_store().await;
+        let default = valid_dir();
+
+        // 第①层：实时闭包非空 → 整表接管（target=Some(id)）。
+        let ctx = ModelsContext {
+            backend: Arc::new(TestBackend(Some("glm-5.1".into()))),
+            official: imagent_core::OfficialModels {
+                claude: vec![],
+                codex: vec!["gpt-5-codex".into()],
+            },
+            list_models: Some(Arc::new(|| vec!["glm-5.1".into(), "gpt-5.3".into()])),
+        };
+        let codex = crate::models::CodexModels {
+            cli_default: Some("gpt-5-codex".into()),
+            catalog: vec!["gpt-5-codex".into()],
+        };
+        let frames = run_action_with(
+            &store,
+            &default,
+            &ctx,
+            &CliSource::Codex(codex.clone()),
+            InboundAction::WorkspaceList,
+        )
+        .await;
+        let snap = frames.iter().find(|f| f["type"] == "workspaces").unwrap();
+        let models = &snap["models"];
+        assert_eq!(models["current"], "glm-5.1", "current = backend.model()");
+        assert_eq!(
+            models["cliDefault"], "gpt-5-codex",
+            "cliDefault 取 codex config"
+        );
+        let opts = models["options"].as_array().unwrap();
+        assert_eq!(
+            opts.iter()
+                .map(|o| (o["label"].as_str().unwrap(), o["target"].as_str().unwrap()))
+                .collect::<Vec<_>>(),
+            vec![("glm-5.1", "glm-5.1"), ("gpt-5.3", "gpt-5.3")],
+            "实时层短路（catalog 不出），label=target=id：{opts:?}"
+        );
+
+        // 第①层空回（失败降级形态）→ official.codex 接管，target null。
+        let ctx_empty = ModelsContext {
+            backend: Arc::new(TestBackend(None)),
+            official: imagent_core::OfficialModels {
+                claude: vec![],
+                codex: vec!["gpt-5-codex".into(), "gpt-5.1-codex-mini".into()],
+            },
+            list_models: Some(Arc::new(Vec::new)),
+        };
+        let codex_empty = crate::models::CodexModels::default();
+        let frames = run_action_with(
+            &store,
+            &default,
+            &ctx_empty,
+            &CliSource::Codex(codex_empty),
+            InboundAction::WorkspaceList,
+        )
+        .await;
+        let snap = frames.iter().find(|f| f["type"] == "workspaces").unwrap();
+        let opts = snap["models"]["options"].as_array().unwrap();
+        assert_eq!(opts.len(), 2, "实时空 → 官方层接管：{opts:?}");
+        assert!(
+            opts.iter().all(|o| o["target"].is_null()),
+            "官方层 target 恒 null：{opts:?}"
         );
     }
 

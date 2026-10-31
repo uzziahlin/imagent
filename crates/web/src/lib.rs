@@ -53,10 +53,12 @@
 //!
 //! v1.8 扩展（模型菜单动态化，契约同款字节级纪律）：出站 `workspaces`
 //! 快照帧可带可选 `models` 段 `{current, cliDefault, options[{label,
-//! target}]}`——CLI 配置（`~/.claude/settings.json` env 的
-//! ANTHROPIC_DEFAULT_* 映射，ccswitch 第三方供应商场景）优先，config
-//! `official_models` 官方列表回退，汇聚见 [`models`]；空 options 整段
-//! 不序列化，旧形态字节不变。
+//! target}]}`——按 backend 分链（codex-app 批）：claude 系 = CLI 配置
+//!（`~/.claude/settings.json` env 的 ANTHROPIC_DEFAULT_* 映射，ccswitch 第三方
+//! 供应商场景）优先、config `official_models.claude` 回退；codex-app = 实时
+//! model/list 闭包 → `~/.codex/config.toml` + catalog →
+//! `official_models.codex`。汇聚见 [`models`]；空 options 整段不序列化，
+//! 旧形态字节不变。
 //!
 //! v1.8 扩展（会话历史重放，契约同款字节级纪律）：出站 text 帧 / card
 //! 终态帧（state=="done"）经 platform 异步落盘 store `outbound_log`

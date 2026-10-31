@@ -114,7 +114,8 @@ impl Backend for NopBackend {
 fn nop_models() -> imagent_web::models::ModelsContext {
     imagent_web::models::ModelsContext {
         backend: Arc::new(NopBackend),
-        official: Vec::new(),
+        official: imagent_core::OfficialModels::default(),
+        list_models: None,
     }
 }
 

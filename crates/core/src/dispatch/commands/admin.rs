@@ -879,7 +879,7 @@ impl Dispatcher {
                     self.reply(
                         conv,
                         &format!(
-                            "⚠️ auto 在后端 {} 解析为 {}（IM 审批闭环），但该后端不支持闭环（{}）；未切换。请改用 off/allow/deny 或换 claude 系后端",
+                            "⚠️ auto 在后端 {} 解析为 {}（IM 审批闭环），但该后端不支持闭环（{}）；未切换。请改用 off/allow/deny 或换支持闭环的后端（claude-cli / claude-acp / codex-app）",
                             self.backend.name(),
                             resolved.as_str(),
                             self.backend.permission_capability().as_str()
@@ -925,7 +925,7 @@ impl Dispatcher {
                     self.reply(
                         conv,
                         &format!(
-                            "⚠️ 后端 {} 不支持 IM 审批闭环（{}），无法切到 {arg}；请改用 off/allow/deny 或换 claude 系后端",
+                            "⚠️ 后端 {} 不支持 IM 审批闭环（{}），无法切到 {arg}；请改用 off/allow/deny 或换支持闭环的后端（claude-cli / claude-acp / codex-app）",
                             self.backend.name(),
                             self.backend.permission_capability().as_str()
                         ),

@@ -10,7 +10,10 @@ pub enum PermissionMode {
     /// 按后端自动选档（2026-08 起为**缺省**）：claude-cli →
     /// [`PermissionMode::AutoClaude`]（透传 claude 原生 `--permission-mode auto`：
     /// CLI 独立分类器逐动作审查 + 危险工具经审批闭环走 IM，即 Claude Code 的
-    /// 「auto 模式」）；其余后端 → [`PermissionMode::Off`]（(code-review v14)
+    /// 「auto 模式」）；codex-app → **保留 `Auto`**（不退 Off，见
+    /// [`PermissionMode::resolve`]：批 1 的 CodexAppBackend 构造缺省
+    /// approval_policy 即 `on-request`，auto=on-request 映射在构造层完成）；
+    /// 其余后端 → [`PermissionMode::Off`]（(code-review v14)
     /// 语义统一为「网关不代答、交 agent 自身权限策略」：codex / gemini 无 IM
     /// 审批闭环，靠各自 sandbox / approval-mode 兜底；claude-acp **已是 FullLoop
     /// 闭环后端**，但 auto 的增值在原生 `--permission-mode auto` 透传，ACP 通道
@@ -59,9 +62,21 @@ impl PermissionMode {
     }
 
     /// `Auto` 按后端解析成具体档（具体档原样返回）。
+    ///
+    /// - `claude-cli` → [`PermissionMode::AutoClaude`]（原生 auto 透传 + 审批闭环）；
+    /// - `codex-app` → **保留 `Auto`**（唯一 resolve 后仍返回 Auto 的路径）：
+    ///   auto=on-request 的映射在批 1 的 `CodexAppBackend::new` 构造缺省完成
+    ///   （approval_policy 缺省 `on-request`——分类器筛 + 危险操作进审批），
+    ///   运行时 IM 审批 hook 由 dispatcher `run()` 无条件注入（FullLoop 后端
+    ///   恒 bind socket），Auto 档不在 reply 侧 force-deny 名单——「auto」
+    ///   原样进运行时即完整 auto 语义，退 Off 反而丢失审批通道声明；
+    /// - 其余（codex / gemini / claude-acp / 未知名）→ [`PermissionMode::Off`]；
+    /// - 显式档（ask / allow / deny / off）原样返回——`Ask` 对 codex-app 合法
+    ///   （FullLoop，走既有 needs_socket × FullLoop 启动校验）。
     pub fn resolve(self, agent: &str) -> Self {
         match self {
             Self::Auto if agent == "claude-cli" => Self::AutoClaude,
+            Self::Auto if agent == "codex-app" => Self::Auto,
             Self::Auto => Self::Off,
             other => other,
         }
@@ -328,7 +343,8 @@ pub struct Config {
     #[serde(default = "default_tools")]
     pub allowed_tools: Vec<String>,
     #[serde(default = "default_agent")]
-    /// agent 后端名（claude-cli / claude-acp / acp / codex / gemini）。**改动需
+    /// agent 后端名（claude-cli / claude-acp / acp / codex / codex-app /
+    /// gemini）。**改动需
     /// 重启**：后端实现与运行参数在启动期装配，SIGHUP 不换后端（只热载参数），
     /// 重载后自动档权限解析仍按启动后端进行。
     pub agent: String,
@@ -537,13 +553,17 @@ pub struct Config {
     /// 仅在 `claude_model` 同时设置时附加。
     #[serde(default)]
     pub claude_fallback_model: Option<String>,
-    /// 模型菜单官方回退列表（claude backend 用）：Web 驾驶舱 /model 快捷
-    /// chips 动态化的第②层——CLI（`~/.claude/settings.json` env）无
-    /// `ANTHROPIC_DEFAULT_*` 别名映射（官方直连形态）时，网关随 workspaces
-    /// 快照下发的菜单项即本列表。空列表 = 不下发（SPA 回退第③层内置）。
-    /// 缺省 `["sonnet", "opus", "haiku"]`。
+    /// 模型菜单官方回退列表（**per-backend**，`[official_models]` 表
+    /// `{claude = [...], codex = [...]}`）：Web 驾驶舱 /model 快捷 chips 动态化
+    /// 的最末层——CLI 配置无映射/无实时目录（claude 系见
+    /// `~/.claude/settings.json` env；codex-app 见 `~/.codex/config.toml` 与
+    /// 实时 list_models）时，网关随 workspaces 快照下发的菜单项即本表对应
+    /// 后端的列表。空列表 = 该后端不下发（SPA 回退内置列表）。serde 兼容旧
+    /// 单列表形态（`official_models = ["a","b"]`，映射到 claude，历史消费面
+    /// 只有 claude 系菜单）；缺省 claude=sonnet/opus/haiku、
+    /// codex=gpt-5-codex/gpt-5.1-codex-mini。见 [`OfficialModels`]。
     #[serde(default = "default_official_models")]
-    pub official_models: Vec<String>,
+    pub official_models: OfficialModels,
     /// W1-2：禁用工具清单（claude `--disallowedTools`；与 allowed_tools 独立：
     /// allowed 先收敛、disallowed 再剔除，黑名单优先）。空 = 不附加。
     #[serde(default)]
@@ -735,9 +755,65 @@ fn default_delegate_timeout_secs() -> u64 {
     600
 }
 
-/// 模型菜单官方回退列表缺省（claude 官方别名三件套）。
-fn default_official_models() -> Vec<String> {
+/// 模型菜单官方回退列表（per-backend）：各 agent 后端的最末层菜单项。
+/// claude 系消费 `claude`、codex-app 消费 `codex`（链路分发在 imagent-web
+/// models 模块，按 `Backend::name()` 选边）。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct OfficialModels {
+    /// claude 系后端（claude-cli / claude-acp / acp 及历史单列表消费者）回退
+    /// 列表。缺省 sonnet/opus/haiku。
+    pub claude: Vec<String>,
+    /// codex-app 后端回退列表（真实模型 id）。缺省 gpt-5-codex /
+    /// gpt-5.1-codex-mini。
+    pub codex: Vec<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for OfficialModels {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        /// 双形态容纳（untagged 按序试解）：新表形态优先——表不会匹配
+        /// Legacy（seq）、数组不会匹配 Map（table），互斥无歧义。
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            /// `[official_models]` 表：缺子键回该后端缺省；显式空列表保留
+            /// 为空（= 该后端不下发，SPA 回退内置）——与旧单列表空数组
+            /// 语义对齐。
+            Map {
+                #[serde(default = "default_claude_models")]
+                claude: Vec<String>,
+                #[serde(default = "default_codex_models")]
+                codex: Vec<String>,
+            },
+            /// 旧单列表形态（存量部署零迁移）：整体映射到 claude——历史
+            /// 消费面只有 claude 系菜单；codex 取缺省。
+            Legacy(Vec<String>),
+        }
+        match Raw::deserialize(d)? {
+            Raw::Map { claude, codex } => Ok(Self { claude, codex }),
+            Raw::Legacy(claude) => Ok(Self {
+                claude,
+                codex: default_codex_models(),
+            }),
+        }
+    }
+}
+
+/// claude 系官方回退列表缺省（官方别名三件套）。
+fn default_claude_models() -> Vec<String> {
     vec!["sonnet".into(), "opus".into(), "haiku".into()]
+}
+
+/// codex-app 官方回退列表缺省（真实模型 id，2026-10 时点官方目录两件）。
+fn default_codex_models() -> Vec<String> {
+    vec!["gpt-5-codex".into(), "gpt-5.1-codex-mini".into()]
+}
+
+/// 模型菜单官方回退列表缺省（两后端各自缺省）。
+fn default_official_models() -> OfficialModels {
+    OfficialModels {
+        claude: default_claude_models(),
+        codex: default_codex_models(),
+    }
 }
 
 fn default_feishu_urgent_on_ask() -> bool {
@@ -1423,7 +1499,7 @@ allowed_senders = []        # 留空 = 发现模式（只打日志记录入站 s
 # allowed_chats = ["feishu:oc_xxx"]   # 会话(群)白名单：群消息 chat 放行 OR sender 放行即过（/chat 可动态管理）
 # admin_senders = []          # 可 /allow 等管理命令的管理员 sender；空=无人是管理员(IM 内管理命令不可用，须 CLI/setup 配置)
 # allowed_tools = ["*"]                      # 缺省=全部工具（不收敛）；要白名单显式列（如 ["Read","Edit"]）；执行类建议配 permission_mode="ask"
-agent = "claude-cli"         # claude-cli(默认) | claude-acp(Claude ACP长驻子进程) | acp(任意ACP agent,配acp_command) | codex | gemini
+agent = "claude-cli"         # claude-cli(默认) | claude-acp(Claude ACP长驻子进程) | acp(任意ACP agent,配acp_command) | codex(codex exec) | codex-app(app-server 双工,审批闭环/steering 全量可用) | gemini
 platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人) | feishu(飞书,配 feishu_app_id + 环境变量 IMAGENT_FEISHU_APP_SECRET) | web(网页驾驶舱,配 web_relay_url;认证 v1.3 起 key 优先,~/.imagent/web-gateway-key 首启自动生成,IMAGENT_WEB_GATEWAY_TOKEN 为回退) | local(本地终端,零配置)
 # platforms = ["feishu", "web"]   # 多平台并存（非空时覆盖上面的 platform 单值）；IM 做通知兜底 + web 做驾驶舱
 # platforms = ["web", "local"]    # 例：web 驾驶舱 + 本地终端(imagent claude,~/.imagent/local.sock,0600+peer uid 即凭证,sender local:user 自动白名单)
@@ -1438,10 +1514,13 @@ platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人)
 # reply_mode = "card"                          # 回复形态：card(默认,流式卡片) | text(纯文本)；/config 可热改
 # quiet_hours = "22:00-08:00"                  # 免打扰时段(本地时区,可跨天)：时段内加急(buzz)提醒降级为普通消息，内容不变；不设=不启用，改动需重启
 # feishu_thread_active_window_secs = 1800      # 话题群免@窗口(秒,仅feishu)：话题内近期有消息则豁免群消息须@bot；默认30分钟，0=关闭，改动需重启
-permission_mode = "auto"    # 缺省=auto：claude-cli=透传 claude 原生 auto 模式(分类器自动放行安全操作,高危进 IM)+审批闭环；其余后端=off；显式 ask=claude 需审批的动作都进 IM(只读工具内建免批,真机校准 2026-08)
+permission_mode = "auto"    # 缺省=auto：claude-cli=透传 claude 原生 auto 模式(分类器自动放行安全操作,高危进 IM)+审批闭环；codex-app=保留 auto(审批档缺省 on-request,同样分类器筛+高危进 IM)；其余后端=off；显式 ask=claude/codex-app 需审批的动作都进 IM(只读工具内建免批,真机校准 2026-08)
 # claude_permission_channel = "control"  # 审批通道：control(缺省)=canUseTool 双工(SDK 现行标准)；mcp=旧 --permission-prompt-tool(回退,真机有问题时切回)；SIGHUP 热切
-# backend_permission_mode = "auto" # 后端原生权限模式透传(claude→--permission-mode；可覆盖 auto 档缺省)：default|acceptEdits|plan|auto|dontAsk|bypassPermissions；codex/gemini 暂不支持(warn 忽略)
+# backend_permission_mode = "auto" # 后端原生权限模式透传(claude→--permission-mode；可覆盖 auto 档缺省)：default|acceptEdits|plan|auto|dontAsk|bypassPermissions；codex/codex-app/gemini 暂不支持透传(warn 忽略；codex-app 审批档走构造缺省 on-request)
 # approval_tools = ["Bash", "WebFetch", "mcp__*"]  # 审批集：ask 模式下只有这些工具过 IM 审批，其余直接放行；空=全部过审
+# [official_models]   # /model 菜单官方回退列表（per-backend 表；旧单列表形态 official_models=["a","b"] 仍兼容,自动映射到 claude）
+# claude = ["sonnet", "opus", "haiku"]            # claude 系无第三方映射时的最末层回退（缺省=此三件）
+# codex = ["gpt-5-codex", "gpt-5.1-codex-mini"]   # codex-app 的最末层回退（缺省=此两件；实时 model/list 与 ~/.codex/config.toml 目录优先）
 # metrics_addr = "127.0.0.1:9100"   # 默认关闭；设为 "ip:port" 开启 /metrics + /health HTTP server
 # message_max_len = 2000              # 单条出站消息字符上限（Unicode char，三平台生效：ilink/feishu/wecom 各与自身协议上限取 min）；不设 = 仅用平台协议上限
 # message_fragment_interval_ms = 400  # 分片间发送间隔（ms）
@@ -1535,11 +1614,18 @@ mod tests {
         );
         let cfg = Config::load(&p).expect("parse");
         // 2026-08 起缺省 auto；resolve 按 backend 选档（claude-cli → AutoClaude：
-        // 原生 acceptEdits + IM 闭环；其余 → Off）。
+        // 原生 acceptEdits + IM 闭环；codex-app → 保留 Auto（auto=on-request，
+        // 构造缺省即此）；其余 → Off）。
         assert_eq!(cfg.permission_mode, PermissionMode::Auto);
         assert_eq!(
             PermissionMode::Auto.resolve("claude-cli"),
             PermissionMode::AutoClaude
+        );
+        // codex-app：Auto 保留（不退 Off）——审批档 on-request 映射在 backend
+        // 构造层完成，运行时 hook 无条件注入，Auto 原样即完整 auto 语义。
+        assert_eq!(
+            PermissionMode::Auto.resolve("codex-app"),
+            PermissionMode::Auto
         );
         assert_eq!(PermissionMode::Auto.resolve("codex"), PermissionMode::Off);
         assert_eq!(PermissionMode::Auto.resolve("gemini"), PermissionMode::Off);
@@ -1547,8 +1633,17 @@ mod tests {
             PermissionMode::Auto.resolve("claude-acp"),
             PermissionMode::Off
         );
-        // 具体档原样透传；未解析的 Auto 按未接线（is_enabled=false）。
+        assert_eq!(
+            PermissionMode::Auto.resolve("unknown-agent"),
+            PermissionMode::Off,
+            "未知 agent 仍回 Off"
+        );
+        // 具体档原样透传；Ask 对 codex-app 合法（FullLoop，走既有启动校验）。
         assert_eq!(PermissionMode::Ask.resolve("codex"), PermissionMode::Ask);
+        assert_eq!(
+            PermissionMode::Ask.resolve("codex-app"),
+            PermissionMode::Ask
+        );
         assert!(!PermissionMode::Auto.is_enabled());
         assert!(PermissionMode::Ask.is_enabled());
         // P8-4：AutoClaude 是运行时档——enabled/needs_socket/as_str/from_str 往返；
@@ -2834,8 +2929,9 @@ agent = "codex"
         cleanup(&p);
     }
 
-    /// 模型菜单官方回退列表：缺省三件套 sonnet/opus/haiku；显式配置覆盖；
-    /// 空列表合法（= 不下发 models 段，SPA 回退内置）。
+    /// 模型菜单官方回退列表（per-backend 化）：缺省两后端各自缺省；新表形态
+    /// 覆盖；**旧单列表形态兼容**（映射到 claude、codex 取缺省）；空列表语义
+    /// （= 该后端不下发 models 段，SPA 回退内置）在新旧形态下均保留。
     #[test]
     fn official_models_default_and_override() {
         let p = tmp_path(
@@ -2845,32 +2941,71 @@ agent = "codex"
         let cfg = Config::load(&p).expect("parse");
         assert_eq!(
             cfg.official_models,
-            vec![
-                "sonnet".to_string(),
-                "opus".to_string(),
-                "haiku".to_string()
-            ],
-            "缺省官方别名三件套"
+            OfficialModels {
+                claude: vec![
+                    "sonnet".to_string(),
+                    "opus".to_string(),
+                    "haiku".to_string()
+                ],
+                codex: vec!["gpt-5-codex".to_string(), "gpt-5.1-codex-mini".to_string()],
+            },
+            "缺省：claude 官方别名三件套 + codex 官方 id 两件"
         );
         cleanup(&p);
 
+        // 新表形态：per-backend 覆盖。
         let p = tmp_path(
             "cfg_official_models_override",
+            "default_workdir = \"/tmp/ws\"\n[official_models]\nclaude = [\"glm-4.6\"]\ncodex = [\"gpt-5.1\"]\n",
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(
+            cfg.official_models,
+            OfficialModels {
+                claude: vec!["glm-4.6".to_string()],
+                codex: vec!["gpt-5.1".to_string()],
+            }
+        );
+        cleanup(&p);
+
+        // 旧单列表形态（存量部署零迁移）：整体映射到 claude，codex 取缺省。
+        let p = tmp_path(
+            "cfg_official_models_legacy",
             "default_workdir = \"/tmp/ws\"\nofficial_models = [\"glm-4.6\", \"glm-4.5-air\"]\n",
         );
         let cfg = Config::load(&p).expect("parse");
         assert_eq!(
             cfg.official_models,
-            vec!["glm-4.6".to_string(), "glm-4.5-air".to_string()]
+            OfficialModels {
+                claude: vec!["glm-4.6".to_string(), "glm-4.5-air".to_string()],
+                codex: default_codex_models(),
+            },
+            "旧单列表映射到 claude（历史消费面只有 claude 系菜单）"
         );
         cleanup(&p);
 
+        // 空列表：旧形态空数组 → claude 空（不下发）+ codex 缺省；
+        // 新形态显式空子键 → 该后端空、另一后端不受影响。
         let p = tmp_path(
             "cfg_official_models_empty",
             "default_workdir = \"/tmp/ws\"\nofficial_models = []\n",
         );
         let cfg = Config::load(&p).expect("空列表合法（不下发）");
-        assert!(cfg.official_models.is_empty());
+        assert!(cfg.official_models.claude.is_empty());
+        assert_eq!(cfg.official_models.codex, default_codex_models());
+        cleanup(&p);
+
+        let p = tmp_path(
+            "cfg_official_models_map_empty_claude",
+            "default_workdir = \"/tmp/ws\"\n[official_models]\nclaude = []\n",
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert!(cfg.official_models.claude.is_empty(), "显式空 = 不下发");
+        assert_eq!(
+            cfg.official_models.codex,
+            default_codex_models(),
+            "缺席子键取缺省"
+        );
         cleanup(&p);
     }
 }

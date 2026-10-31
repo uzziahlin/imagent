@@ -1425,7 +1425,7 @@ impl Dispatcher {
             );
             return Err(crate::error::CoreError::Config(format!(
                 "permission_mode = \"{}\" 需要后端支持 IM 审批闭环，但当前后端 {} 的权限能力为 {}。\
-                 请将 permission_mode 改为 auto/off/allow/deny，或改用支持闭环的 claude 系后端（claude-cli / claude-acp）",
+                 请将 permission_mode 改为 auto/off/allow/deny，或改用支持闭环的后端（claude-cli / claude-acp / codex-app）",
                 mode.as_str(),
                 self.backend.name(),
                 self.backend.permission_capability().as_str()
@@ -1806,7 +1806,7 @@ impl Dispatcher {
         if mode.needs_socket() && cap != crate::backend::PermissionCapability::FullLoop {
             return Err(crate::error::CoreError::Config(format!(
                 "permission_mode = \"{}\" 需要后端支持 IM 审批闭环，但当前后端 {} 的权限能力为 {}。\
-                 请将 permission_mode 改为 auto/off/allow/deny，或改用支持闭环的 claude 系后端（claude-cli / claude-acp）",
+                 请将 permission_mode 改为 auto/off/allow/deny，或改用支持闭环的后端（claude-cli / claude-acp / codex-app）",
                 mode.as_str(),
                 self.backend.name(),
                 cap.as_str()

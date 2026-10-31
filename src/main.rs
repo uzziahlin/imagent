@@ -1,6 +1,6 @@
 //! `imagent` 二进制入口：组装 7 个 crate（store / core / ilink / wecom / claude /
 //! codex / gemini），多平台（iLink 个人微信 / WeCom 企业微信）× 多后端
-//!（Claude CLI/ACP / Codex / Gemini）。
+//!（Claude CLI/ACP / Codex exec / Codex app-server / Gemini）。
 //!
 //! 职责：加载配置 →（iLink 扫码登录 / WeCom 读 config 凭据）→ 前台常驻收私聊 →
 //! 鉴权 → 驱动 agent → 回传。鉴权 / allowedTools 收敛 / 权限审批 / 风控全部在
@@ -731,7 +731,7 @@ async fn main() -> Result<()> {
                 );
             }
             let perm_mode = std::sync::Arc::new(parking_lot::RwLock::new(perm_resolved));
-            let (backend, claude_cli_handle) = build_backend(
+            let (backend, claude_cli_handle, model_list_fn) = build_backend(
                 &config,
                 perm_mode.clone(),
                 std::time::Duration::from_secs(config.permission_ask_timeout_secs),
@@ -748,12 +748,17 @@ async fn main() -> Result<()> {
                 && !backend.supports_native_permission_mode()
             {
                 // B3：升级为带能力矩阵的明确 warn（codex=exec 模式无原生 approval
-                // 参数；gemini=原生档位与该配置键值域不同名，无可靠映射）。
+                // 参数；gemini=原生档位与该配置键值域不同名，无可靠映射；
+                // codex-app 已 FullLoop（审批走 server-request 闭环），**不在
+                // 「无原生 approval」清单**——只是无 backend_permission_mode
+                // 透传点，审批档走构造缺省 on-request）。文案提取为
+                // permission_capability_matrix_line 供单测钉住排除断言。
                 tracing::warn!(
                     target: "imagent::ops",
                     agent = %config.agent,
                     capability = backend.permission_capability().as_str(),
-                    "backend_permission_mode 已配置但该后端不支持原生权限模式透传（忽略）。能力矩阵：claude-cli/claude-acp=IM 审批闭环；gemini=仅原生 --approval-mode（由 allowed_tools 收敛）；codex=无原生 approval 档（exec 模式）"
+                    "backend_permission_mode 已配置但该后端不支持原生权限模式透传（忽略）。{}",
+                    permission_capability_matrix_line()
                 );
             }
 
@@ -761,11 +766,21 @@ async fn main() -> Result<()> {
             // backend clone，见上）：CLI 显式优先（单平台），否则
             // config.platforms 多平台列表，最后回退 config.platform 单值。
             let platform = if platform_names.len() == 1 {
-                build_platform(&platform_names[0], &config, store.clone(), &backend).await?
+                build_platform(
+                    &platform_names[0],
+                    &config,
+                    store.clone(),
+                    &backend,
+                    model_list_fn.clone(),
+                )
+                .await?
             } else {
                 let mut children = Vec::with_capacity(platform_names.len());
                 for n in &platform_names {
-                    children.push(build_platform(n, &config, store.clone(), &backend).await?);
+                    children.push(
+                        build_platform(n, &config, store.clone(), &backend, model_list_fn.clone())
+                            .await?,
+                    );
                 }
                 tracing::info!(
                     target: "imagent::ops",
@@ -1445,9 +1460,23 @@ async fn main() -> Result<()> {
 // Backend 选择：按 config.agent 选用对应 agent 后端。
 // ---------------------------------------------------------------------------
 
+/// B3 能力矩阵 warn 的固定文案（backend_permission_mode 配置于不支持透传的
+/// 后端时随 warn 输出）。提取为函数供单测钉住——**codex-app 是 FullLoop 闭环
+/// 后端，不得进入「无原生 approval」清单**（批 2 起：它有完整的 server-request
+/// 审批闭环，只是无 backend_permission_mode 透传点，审批档走构造缺省
+/// on-request）；exec 版 codex 维持原表述。
+fn permission_capability_matrix_line() -> &'static str {
+    "能力矩阵：claude-cli/claude-acp=IM 审批闭环；gemini=仅原生 --approval-mode（由 allowed_tools 收敛）；codex=无原生 approval 档（exec 模式）；codex-app=FullLoop 闭环（审批档构造缺省 on-request，无 backend_permission_mode 透传点）"
+}
+
 /// 按 `config.agent` 选择 Backend。
 ///
 /// - `"codex"` → [`imagent_codex::CodexBackend`]；
+/// - `"codex-app"` → [`imagent_codex::CodexAppBackend`]（codex app-server 双工
+///   协议：FullLoop 审批闭环 + steering + 实时 model/list；构造缺省
+///   approval_policy=on-request——`permission_mode = "auto"` 在 codex-app 下
+///   保留 Auto 的映射语义就在这里）；附 list_models 闭包（web 驾驶舱模型
+///   菜单三层链的实时层，sync 桥接见函数内注释）；
 /// - `"gemini"` → [`imagent_gemini::GeminiBackend`]；
 /// - `"claude-acp"` → [`imagent_claude::AcpBackend`]（Claude 的 ACP/JSON-RPC 长驻
 ///   子进程模式，默认命令 `claude-agent-acp`、本机存储走 ~/.claude，与 `claude-cli`
@@ -1461,11 +1490,13 @@ async fn main() -> Result<()> {
 /// Err 仅一种来源：`agent = "acp"` 而 `acp_command` 缺失（config 校验已拦，
 /// 此处 fail-closed 兜底，防绕过校验的构造路径静默落到 claude 默认命令）。
 ///
-/// 返回的二元组：泛化 backend 句柄 + claude-cli 专属句柄（SIGHUP 重载运行
-/// 参数用；非 claude-cli 后端为 None）。
+/// 返回的三元组：泛化 backend 句柄 + claude-cli 专属句柄（SIGHUP 重载运行
+/// 参数用；非 claude-cli 后端为 None）+ codex-app 实时模型目录闭包（web
+/// 驾驶舱 ModelsContext 注入用；其余后端为 None）。
 type BuiltBackend = (
     Arc<dyn imagent_core::Backend>,
     Option<Arc<imagent_claude::ClaudeBackend>>,
+    Option<Arc<imagent_web::models::ListModelsFn>>,
 );
 
 fn build_backend(
@@ -1475,8 +1506,38 @@ fn build_backend(
     bitable: bool,
 ) -> Result<BuiltBackend> {
     match config.agent.as_str() {
-        "codex" => Ok((Arc::new(imagent_codex::CodexBackend::new()), None)),
-        "gemini" => Ok((Arc::new(imagent_gemini::GeminiBackend::new()), None)),
+        "codex" => Ok((Arc::new(imagent_codex::CodexBackend::new()), None, None)),
+        "codex-app" => {
+            let app = Arc::new(imagent_codex::CodexAppBackend::new(None));
+            // 批 2 模型三层链第①层（实时 model/list）：sync 闭包桥接批 1 的
+            // async list_models（每次自 spawn 临时 app-server，不要求活跃
+            // thread）。桥接走独立线程 + 临时 current-thread runtime——不依赖
+            // 调用方 runtime 形态（workspace 泵在生产是多线程 runtime worker，
+            // block_in_place 会在别的执行上下文里 panic）；list_models 自身
+            // fail-soft（spawn/协议失败回空），线程 join 失败同样回空——实时层
+            // 只是加速与新鲜度，任何失败静默落回退链（config.toml → official）。
+            // 频率面：仅 web 驾驶舱快照动作触发（低频），每次一线程 + 临时
+            // runtime 的代价可接受。
+            let list_models: Arc<imagent_web::models::ListModelsFn> = {
+                let app = app.clone();
+                Arc::new(move || {
+                    let app = app.clone();
+                    std::thread::scope(|s| {
+                        s.spawn(|| {
+                            tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .map(|rt| rt.block_on(app.list_models()))
+                                .unwrap_or_default()
+                        })
+                        .join()
+                        .unwrap_or_default()
+                    })
+                })
+            };
+            Ok((app, None, Some(list_models)))
+        }
+        "gemini" => Ok((Arc::new(imagent_gemini::GeminiBackend::new()), None, None)),
         "claude-acp" => Ok((
             Arc::new(
                 imagent_claude::AcpBackend::with_permission_mode_shared(perm_mode)
@@ -1486,6 +1547,7 @@ fn build_backend(
                         std::time::Duration::from_secs(config.acp_idle_recycle_secs),
                     ),
             ),
+            None,
             None,
         )),
         "acp" => {
@@ -1508,6 +1570,7 @@ fn build_backend(
                         .with_agent_command(command),
                 ),
                 None,
+                None,
             ))
         }
         _ => {
@@ -1525,7 +1588,7 @@ fn build_backend(
             // claude-cli 之外的分支忽略该参数（bitable 工具面只在 claude-cli
             // 存在——ACP 的 MCP 配置不经 write_mcp_config）。
             ops::apply_claude_runtime_opts(&b, config, bitable);
-            Ok((b.clone(), Some(b)))
+            Ok((b.clone(), Some(b), None))
         }
     }
 }
@@ -1535,8 +1598,10 @@ fn build_backend(
 // ---------------------------------------------------------------------------
 
 /// 按 platform 名选择 Platform 实例。`backend` 为已装配的 agent 后端句柄
-/// （v1.8：仅 web 分支消费——注入 WebPlatform 作 workspaces 快照 models
-/// 段的 current 数据源 backend.model()；其余分支忽略）。
+///（v1.8：web 分支消费——注入 WebPlatform 作 workspaces 快照 models
+/// 段的 current 数据源 backend.model()；其余分支忽略）。`model_list_fn` 为
+/// codex-app 批新增的实时模型目录闭包（同样仅 web 分支消费——ModelsContext
+/// 三层链第①层；其余后端/平台为 None 被忽略）。
 ///
 /// - `"wecom"` → [`imagent_wecom::WeComPlatform`]：`bot_id` 取自 config（非敏感）；
 ///   `secret` 优先取 store 凭据（`imagent login wecom`，keyring/加密落盘），
@@ -1562,6 +1627,7 @@ async fn build_platform(
     config: &imagent_core::Config,
     store: imagent_store::Store,
     backend: &Arc<dyn imagent_core::Backend>,
+    model_list_fn: Option<Arc<imagent_web::models::ListModelsFn>>,
 ) -> Result<Arc<dyn imagent_core::Platform>> {
     match name {
         "wecom" => {
@@ -1668,8 +1734,8 @@ async fn build_platform(
             // 快照 default 字段取 default_workdir）。
             // v1.8 模型目录：注入 backend 句柄（快照 models.current =
             // backend.model()，/model 命令热设值）+ config official_models
-            // （CLI ~/.claude/settings.json 无 ANTHROPIC_DEFAULT_* 映射时的
-            // 官方回退列表）。
+            // （per-backend 官方回退列表）+ codex-app 实时闭包（模型三层链
+            // 第①层；仅 codex-app 装配产生，其余后端 None）。
             Ok(Arc::new(imagent_web::WebPlatform::new(
                 relay_url,
                 credential,
@@ -1680,6 +1746,7 @@ async fn build_platform(
                 imagent_web::models::ModelsContext {
                     backend: backend.clone(),
                     official: config.official_models.clone(),
+                    list_models: model_list_fn,
                 },
             )))
         }
@@ -1749,6 +1816,35 @@ mod instance_warning_tests {
 
         let _ = std::fs::remove_dir_all(&home);
     }
+}
+
+/// B3 能力矩阵 warn 文案（批 2 验收项）：codex-app 已 FullLoop，**排除**在
+/// 「无原生 approval」清单之外（单独表述其闭环与构造缺省档）；exec codex
+/// 维持原表述。
+#[test]
+fn capability_matrix_line_excludes_codex_app_from_no_native_approval() {
+    let line = permission_capability_matrix_line();
+    assert!(
+        line.contains("codex=无原生 approval 档（exec 模式）"),
+        "exec codex 维持原表述: {line}"
+    );
+    assert!(
+        line.contains("codex-app=FullLoop 闭环"),
+        "codex-app 单独表述闭环: {line}"
+    );
+    // 排除断言：「无原生 approval」不得与 codex-app 同段出现。
+    for seg in line.split('；') {
+        if seg.contains("无原生 approval") {
+            assert!(
+                !seg.contains("codex-app"),
+                "codex-app 不得进入无原生 approval 清单段: {seg}"
+            );
+        }
+    }
+    assert!(
+        line.contains("on-request"),
+        "codex-app 段说明构造缺省审批档: {line}"
+    );
 }
 
 /// B2（deploy 合流）CLI 单测：`service print` 参数位解析——缺省可解析（格式

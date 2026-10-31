@@ -10,7 +10,8 @@
 trait Platform（收发 IM）              trait Backend（执行 agent）
 ├── ilink   个人微信私聊（实验性）      ├── claude  CLI 每轮 spawn + ACP 长驻子进程
 ├── wecom   企业微信智能机器人长连接    ├── codex   codex exec --json
-└── feishu  飞书私聊/群/@bot/云文档评论 └── gemini  gemini -p -o stream-json
+└── feishu  飞书私聊/群/@bot/云文档评论 ├── codex-app  codex app-server 双工（JSON-RPC 审批闭环/steering）
+                                        └── gemini  gemini -p -o stream-json
         ↕                                      ↕
               core：调度 / 鉴权 / 会话路由 / 权限审批闭环
               任务控制 / 批处理 / 流式回传（store 持久化）
@@ -45,7 +46,7 @@ crates/
 ├── wecom/   企微 OpenWS 长连接：subscribe 认证 / 心跳 / markdown 回复
 ├── feishu/  open-lark WS 长连接 + 手写 CardKit/评论/媒体/ASR HTTP；429/230020 退避
 ├── claude/  CLI（stream-json 解析）+ ACP（JSON-RPC 长驻）；~/.claude 会话扫描
-├── codex/   codex exec；~/.codex/sessions rollout 扫描（/resume 接管）
+├── codex/   codex exec + app-server 双工客户端（app_server/app_backend）；rollout 扫描（/resume 接管）
 ├── gemini/  gemini CLI（无本机存储概念，/resume 仅 IM 历史）
 └── store/   SQLite（bundled 静态链接）schema v1→v16 线性迁移（见 §5）
 fuzz/        cargo-fuzz targets：ilink 协议解析 / CDN host SSRF / 飞书事件解析

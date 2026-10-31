@@ -45,8 +45,8 @@ pub use backend::{Backend, ImPermissionAsk, ImPermissionHook, PermissionCapabili
 pub use bitable::{BitableApi, BitableField};
 pub use card_session::sweep_live_cards;
 pub use config::{
-    validate_workdir, Config, CotDetail, DelegateEntry, PermissionMode, QuietHours, ReplyMode,
-    WebhookEntry,
+    validate_workdir, Config, CotDetail, DelegateEntry, OfficialModels, PermissionMode, QuietHours,
+    ReplyMode, WebhookEntry,
 };
 pub use dedup::Dedup;
 pub use delegate::{DelegateApi, DelegateDesc, DelegateRequest};
