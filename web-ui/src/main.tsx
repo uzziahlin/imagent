@@ -2,7 +2,15 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
 import { ErrorBoundary } from "./components/ErrorBoundary";
+import { initTheme } from "./lib/theme";
 import "./index.css";
+
+/*
+ * 主题初始化（三态：跟随系统/浅色/深色，lib/theme.ts）：必须在 React 渲染前
+ * 执行——首帧即终态（html[data-theme] 属性 + theme-color meta），深色偏好不
+ * 闪白。缺省 "system" 移除属性，深浅色交还 CSS media 查询实时跟随。
+ */
+initTheme();
 
 /*
  * 移动端键盘高度跟随：iOS Safari / Android Chrome（默认 resizes-visual）下

@@ -1,5 +1,13 @@
 import { useMemo } from "react";
 import { convDisplayName, DEFAULT_MACHINE, normalizeExpiryMs } from "../lib/protocol";
+import type { ThemePref } from "../lib/theme";
+
+/** 主题三态选项（value 对齐 lib/theme 的 ThemePref；展示序即选择序）。 */
+const THEME_OPTIONS: { value: ThemePref; label: string }[] = [
+  { value: "system", label: "跟随系统" },
+  { value: "light", label: "浅色" },
+  { value: "dark", label: "深色" },
+];
 
 /** 侧边栏会话项数据（App 从 state 派生）：conv 全名 + 显示名 + 最后消息
  *  预览/时间 + 未读计数（非当前 conv 收到新消息时 reducer 累加，点选清零）。 */
@@ -48,6 +56,8 @@ function formatTime(at: number): string {
  * - v1.2 会话层：底部「管理」入口（仅会话模式；v1.5 起为管理面板——机器/
  *   令牌/设备/钥匙/指纹）与「会话 N 天后过期」续期横幅（剩余 < 3 天；点击
  *   进入登出流程）。
+ * - 主题三态开关：底部「外观」段选（跟随系统/浅色/深色），偏好由 App 持久
+ *   化并应用到 document（lib/theme.ts），本组件纯展示上抛 onThemeChange。
  *
  * 已知限制：会话内消息历史仅 SPA 内存保留，页面刷新后仅当前卡片由 sync
  * 重发恢复（text/user 回显不重放）。
@@ -66,6 +76,8 @@ export function Sidebar({
   pushEnabled,
   pushAvailable,
   pushBusy,
+  themePref,
+  onThemeChange,
   onSelect,
   onSelectMachine,
   onCreate,
@@ -94,6 +106,10 @@ export function Sidebar({
   pushAvailable: boolean;
   /** v1.10 开关流程进行中（enable/disable 请求期间禁点）。 */
   pushBusy: boolean;
+  /** 主题三态偏好当前值（App 状态镜像；main.tsx 启动时已应用过一次）。 */
+  themePref: ThemePref;
+  /** 「外观」三段选择回调（App 落盘 saveThemePref + applyTheme 应用）。 */
+  onThemeChange?: (pref: ThemePref) => void;
   onSelect: (conv: string) => void;
   /** 机器切换器点选（切 currentMachine + 触发该机器 sync）。 */
   onSelectMachine: (machine: string) => void;
@@ -266,6 +282,39 @@ export function Sidebar({
               {pushAvailable ? (pushEnabled ? "已开启" : "未开启") : "不可用"}
             </span>
           </button>
+        )}
+        {/* 主题三态开关（跟随系统/浅色/深色）：aria-pressed 标当前偏好；
+            点击由 App 落盘并应用到 document（lib/theme）。分段钮 min-h-10
+            保证 ≥40px 触控（对齐 WorkspacePicker chips 的触控约定）。 */}
+        {onThemeChange && (
+          <div
+            role="group"
+            aria-label="外观"
+            className="mb-1.5 flex w-full items-center justify-between rounded-lg px-3 py-1 text-xs text-muted"
+          >
+            <span>外观</span>
+            <div className="flex items-center gap-0.5">
+              {THEME_OPTIONS.map((opt) => {
+                const active = themePref === opt.value;
+                return (
+                  <button
+                    key={opt.value}
+                    type="button"
+                    onClick={() => onThemeChange(opt.value)}
+                    aria-pressed={active}
+                    className={
+                      "press min-h-10 shrink-0 rounded-full px-2.5 text-[11px] transition-colors " +
+                      (active
+                        ? "bg-emerald-600/15 text-ink"
+                        : "text-ghost hover:bg-panel2 hover:text-ink")
+                    }
+                  >
+                    {opt.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
         )}
         {/* v1.5 管理面板入口（仅会话模式——旧 relay 无会话层不显示） */}
         {onOpenAdmin && (

@@ -1,9 +1,11 @@
 /** @type {import('tailwindcss').Config} */
 export default {
   content: ["./index.html", "./src/**/*.{ts,tsx}"],
-  // 深浅色跟随系统（无手动切换开关）；dark: 变体即 prefers-color-scheme。
-  // 语义色（surface/panel/ink/…）走 CSS 变量，定义见 index.css。
-  darkMode: "media",
+  // 深浅色双驱动：html[data-theme] 属性（手动三态开关，lib/theme.ts）缺省
+  // 交还系统——"system" 时移除属性，行为等同旧 media 策略（index.css 深色
+  // 变量块 media 查询接管）。dark: 变体选择器即 html[data-theme="dark"] 下的
+  // 后代；语义色（surface/panel/ink/…）走 CSS 变量，定义见 index.css。
+  darkMode: ["class", '[data-theme="dark"]'],
   theme: {
     extend: {
       colors: {

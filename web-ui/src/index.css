@@ -3,10 +3,11 @@
 @tailwind utilities;
 
 /*
- * 深浅色跟随系统 prefers-color-scheme（M3b 约定：无手动切换开关）。
+ * 深浅色三态（lib/theme.ts）：缺省跟随系统 prefers-color-scheme；手动浅/深经
+ * html[data-theme] 属性驱动（tailwind darkMode 自定义选择器同步改为该属性）。
  * 语义变量 → tailwind 语义色（tailwind.config.js）：surface/panel/panel2/code/
  * line/line-strong/ink/muted/faint/ghost + 语义强调色 ok/warn/err/info/think。
- * 少量 alpha 叠加的强调色块（如审批弹层）用 dark: 变体（darkMode: "media"）。
+ * 少量 alpha 叠加的强调色块（如审批弹层）用 dark: 变体（匹配 data-theme）。
  */
 :root {
   color-scheme: light dark;
@@ -27,8 +28,15 @@
   --c-think: #6d28d9;
 }
 
+/*
+ * 深色变量两处生效（值相同，改色两处同改）：
+ * 1) 跟随系统（无 data-theme 属性，或未强制浅色）→ media 查询接管，
+ *    系统切换由浏览器实时跟随，无需 JS；
+ * 2) 手动深色 → html[data-theme="dark"] 块（选择器同 tailwind dark 变体）。
+ */
 @media (prefers-color-scheme: dark) {
-  :root {
+  html:not([data-theme="light"]) {
+    color-scheme: dark;
     --c-bg: #020617;
     --c-panel: rgba(15, 23, 42, 0.72);
     --c-panel2: #1e293b;
@@ -45,6 +53,31 @@
     --c-info: #38bdf8;
     --c-think: #a78bfa;
   }
+}
+
+/* 手动深色：变量值与上方 media 块保持一致，改色两处同改 */
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --c-bg: #020617;
+  --c-panel: rgba(15, 23, 42, 0.72);
+  --c-panel2: #1e293b;
+  --c-code: #0b1220;
+  --c-line: #1e293b;
+  --c-line-strong: #334155;
+  --c-ink: #e2e8f0;
+  --c-muted: #94a3b8;
+  --c-faint: #64748b;
+  --c-ghost: #475569;
+  --c-ok: #34d399;
+  --c-warn: #fbbf24;
+  --c-err: #fb7185;
+  --c-info: #38bdf8;
+  --c-think: #a78bfa;
+}
+
+/* 手动浅色：系统为深色时显式钉住浅色（原生控件/滚动条随 color-scheme 回浅） */
+html[data-theme="light"] {
+  color-scheme: light;
 }
 
 html,

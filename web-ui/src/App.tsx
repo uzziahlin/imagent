@@ -64,6 +64,7 @@ import {
   validConvParam,
   type PushErrorCode,
 } from "./lib/push";
+import { applyTheme, loadThemePref, saveThemePref, type ThemePref } from "./lib/theme";
 import { Login } from "./components/Login";
 import { StatusBar } from "./components/StatusBar";
 import { Sidebar, type ConvItem } from "./components/Sidebar";
@@ -272,6 +273,9 @@ export default function App() {
     () => localStorage.getItem(PUSH_ENABLED_KEY) === "1",
   );
   const [pushBusy, setPushBusy] = useState(false);
+  // 主题三态偏好（跟随系统/浅色/深色）：localStorage 镜像驱动开关高亮；
+  // 生效应用在 main.tsx 渲染前由 initTheme 完成过一次，切换时再增量应用。
+  const [themePref, setThemePref] = useState<ThemePref>(() => loadThemePref());
   const [localToast, setLocalToast] = useState<{ text: string; tone: "info" | "error" } | null>(
     null,
   );
@@ -927,6 +931,14 @@ export default function App() {
     }
   };
 
+  /** 主题三态切换（侧栏「外观」段选）：落盘偏好 + 应用到 document
+   *  （html[data-theme] 属性 + theme-color meta，lib/theme.ts）。 */
+  const changeTheme = (pref: ThemePref) => {
+    setThemePref(pref);
+    saveThemePref(pref);
+    applyTheme(pref);
+  };
+
   // ---- v1.5 管理门槛：任何管理操作前保证有效 adminToken（无/过期自动
   //      passkey re-auth，5 分钟内免再次验证；并发共享同一次 ceremony）----
 
@@ -1127,6 +1139,8 @@ export default function App() {
       pushEnabled={pushEnabled}
       pushAvailable={pushSupported()}
       pushBusy={pushBusy}
+      themePref={themePref}
+      onThemeChange={changeTheme}
       onSelect={selectConv}
       onSelectMachine={selectMachine}
       onCreate={openNewConv}
