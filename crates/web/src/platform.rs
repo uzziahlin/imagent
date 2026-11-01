@@ -226,16 +226,19 @@ async fn serve_sync_requests(
 /// 在本泵内 await——不阻塞 client 收发循环与 dispatch）。`machine_id` 为
 /// 本机身份（出站帧必带，v1.1 语义；与 serve_sync_requests 同款注入）。
 /// `models` 为 v1.8 模型目录上下文（backend 句柄 + 官方回退列表）——每次
-/// 组快照现读 CLI settings（低频操作可接受，不做缓存）。`titles` 为 v1.9
+/// 组快照现读 CLI settings（低频操作可接受，不做缓存）。`backends` 为
+/// v1.36 引擎名单（default + extras 保序去重，main 装配处注入的纯字符串
+/// 表——快照 backends 段直传，无解析链）。`titles` 为 v1.9
 /// 语义标题生成器（快照组装懒触发的共享防重复集，见 [`crate::titles`]）。
 /// 平台 Drop 时经 shutdown token 连动退出。
-#[allow(clippy::too_many_arguments)] // 参数已达 8——v1.9 注入 titles（先例 new_with_e2e）
+#[allow(clippy::too_many_arguments)] // 参数已达 9——v1.36 注入 backends（先例 new_with_e2e）
 async fn serve_workspace_actions(
     mut workspace_rx: mpsc::Receiver<InboundAction>,
     machine_id: String,
     store: Store,
     default_workdir: PathBuf,
     models: ModelsContext,
+    backends: Vec<String>,
     titles: TitleGen,
     outbound_tx: mpsc::Sender<String>,
     shutdown: CancellationToken,
@@ -257,6 +260,7 @@ async fn serve_workspace_actions(
                     &store,
                     &default_workdir,
                     &models,
+                    &backends,
                     &cli,
                     &titles,
                     act,
@@ -274,12 +278,13 @@ async fn serve_workspace_actions(
 ///   来源；失败时快照不变 + 前置 error 帧）。
 /// - conv_workdir_set 成功时**额外**推一条 conv_workdir 增量帧。
 /// - workspace_remove 未命中幂等（store delete 对不存在键即 Ok）。
-#[allow(clippy::too_many_arguments)] // 参数已达 8——v1.9 注入 titles（先例 new_with_e2e）
+#[allow(clippy::too_many_arguments)] // 参数已达 9——v1.36 注入 backends（先例 new_with_e2e）
 async fn handle_workspace_action(
     machine: &str,
     store: &Store,
     default_workdir: &Path,
     models: &ModelsContext,
+    backends: &[String],
     cli: &CliSource,
     titles: &TitleGen,
     act: InboundAction,
@@ -339,7 +344,17 @@ async fn handle_workspace_action(
         }
     }
     // 每帧收尾：全量快照（无论成败）。
-    match build_workspaces_frame(machine, store, default_workdir, models, cli, titles).await {
+    match build_workspaces_frame(
+        machine,
+        store,
+        default_workdir,
+        models,
+        backends,
+        cli,
+        titles,
+    )
+    .await
+    {
         Ok(json) => enqueue_best_effort(outbound_tx, json),
         Err(e) => warn!(target: TARGET, error = %e, "workspaces 快照帧序列化失败"),
     }
@@ -361,6 +376,7 @@ async fn build_workspaces_frame(
     store: &Store,
     default_workdir: &Path,
     models: &ModelsContext,
+    backends: &[String],
     cli: &CliSource,
     titles: &TitleGen,
 ) -> Result<String> {
@@ -433,6 +449,13 @@ async fn build_workspaces_frame(
         convs,
         sessions,
         Some(models_frame),
+        // v1.36 backends 段：引擎名单直传（无 IO、无解析链——注册表在进程
+        // 生命周期内静态）；current = 首位 default。空名单 → None（整段
+        // 缺席；encode 出口再兜底一次空 options，同 models 段模式）。
+        (!backends.is_empty()).then(|| crate::BackendsFrame {
+            current: backends[0].clone(),
+            options: backends.to_vec(),
+        }),
     )
 }
 
@@ -956,11 +979,15 @@ impl WebPlatform {
     /// `store` / `default_workdir` 为 v1.6 工作空间泵所需（store KV 句柄 +
     /// 快照 default 字段来源，main 装配处注入）；`models` 为 v1.8 模型目录
     /// 上下文（backend 句柄 + config official_models，main 装配处传现有
-    /// backend clone——快照 models.current 取 backend.model()；测试传 mock）。
+    /// backend clone——快照 models.current 取 backend.model()；测试传 mock）；
+    /// `backends` 为 v1.36 引擎名单（default 在首位 + extras 保序去重的纯
+    /// 名单，main 装配处随 ModelsContext 一并注入——快照 backends 段数据源，
+    /// 空名单整段缺席；测试传 `Vec::new()`）。
     ///
     /// E2E 密钥（v1.4）锚定 `<imagent_home>/web-e2e-key`（main 不感知——
     /// E2E 是内容保密增强，装配失败不阻断网关启动，仅降级明文 + warn；
     /// 测试经 [`Self::new_with_e2e`] 注入临时路径）。
+    #[allow(clippy::too_many_arguments)] // 参数已达 8——v1.36 注入 backends（先例 new_with_e2e）
     pub fn new(
         relay_url: String,
         credential: GatewayCredential,
@@ -969,6 +996,7 @@ impl WebPlatform {
         store: Store,
         default_workdir: PathBuf,
         models: ModelsContext,
+        backends: Vec<String>,
     ) -> Self {
         let e2e_key = imagent_core::paths::imagent_home().join("web-e2e-key");
         Self::new_with_e2e(
@@ -980,12 +1008,13 @@ impl WebPlatform {
             store,
             default_workdir,
             models,
+            backends,
         )
     }
 
     /// [`Self::new`] 的全参形态（E2E 密钥路径可注入——集成测试用临时目录，
     /// 不落真实 `~/.imagent`）。
-    #[allow(clippy::too_many_arguments)] // 参数已达 8——历史演化提醒（先例 backend.rs run）
+    #[allow(clippy::too_many_arguments)] // 参数已达 9——v1.36 注入 backends（历史演化提醒）
     pub fn new_with_e2e(
         relay_url: String,
         credential: GatewayCredential,
@@ -995,6 +1024,7 @@ impl WebPlatform {
         store: Store,
         default_workdir: PathBuf,
         models: ModelsContext,
+        backends: Vec<String>,
     ) -> Self {
         let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>(INBOUND_CHANNEL_CAPACITY);
         let (outbound_tx, outbound_rx) = mpsc::channel::<String>(OUTBOUND_CHANNEL_CAPACITY);
@@ -1063,8 +1093,8 @@ impl WebPlatform {
             shutdown.clone(),
         ));
 
-        // workspace 泵（v1.6 工作空间 + v1.8 models 段 + v1.9 语义标题懒触发；
-        // 出站帧带 machine，v1.1 语义）。
+        // workspace 泵（v1.6 工作空间 + v1.8 models 段 + v1.9 语义标题懒触发 +
+        // v1.36 backends 段；出站帧带 machine，v1.1 语义）。
         let titles = TitleGen::new(store.clone());
         tokio::spawn(serve_workspace_actions(
             workspace_rx,
@@ -1072,6 +1102,7 @@ impl WebPlatform {
             store.clone(),
             default_workdir,
             models,
+            backends,
             titles,
             outbound_tx.clone(),
             shutdown.clone(),
@@ -1164,10 +1195,12 @@ impl WebPlatform {
     // —— v1.8 出站落盘（outbound_log）：send 成功后异步写库，不阻塞热路径 ——
 
     /// text 帧出站成功后落盘（契约：kind='text'，payload=`{"text":<原文>,
-    /// "at":<unix_ms>}`——落盘取 encode 截断前的原文）。spawn 短任务写库：
-    /// 出站队列是 try_send 语义，落盘绝不在 dispatch 热路径上 await。
-    fn log_outbound_text(&self, conv: &str, text: &str) {
-        let payload = serde_json::json!({"text": text, "at": unix_ms_now()}).to_string();
+    /// "at":<unix_ms>}`——落盘取 encode 截断前的原文；`at` 由调用方传入，
+    /// 与实时帧同源同值，不再单独取时刻——v1.36 起 SPA 靠它跨帧去重）。
+    /// spawn 短任务写库：出站队列是 try_send 语义，落盘绝不在 dispatch
+    /// 热路径上 await。
+    fn log_outbound_text(&self, conv: &str, text: &str, at: u64) {
+        let payload = serde_json::json!({"text": text, "at": at}).to_string();
         self.spawn_outbound_log(conv.to_string(), "text", payload);
     }
 
@@ -1278,10 +1311,13 @@ impl Platform for WebPlatform {
     }
 
     async fn send_text(&self, conv: &ConvId, text: &str, _hint: &ReplyHint) -> Result<()> {
-        let json = encode_text_frame(&self.machine_id, &conv.0, text)?;
+        // v1.36：一次取值同源——实时 text 帧与落盘行共享同一 at（SPA 按
+        // (text, at) 精确去重防 history 重放重复；unix 毫秒恒非负，u64 契约）。
+        let at = unix_ms_now() as u64;
+        let json = encode_text_frame(&self.machine_id, &conv.0, text, at)?;
         self.enqueue(json)?;
         // v1.8：出站成功后异步落盘（原文；不阻塞 try_send 热路径）。
-        self.log_outbound_text(&conv.0, text);
+        self.log_outbound_text(&conv.0, text, at);
         Ok(())
     }
 
@@ -1536,7 +1572,20 @@ mod tests {
             store,
             valid_dir(),
             empty_models(),
+            Vec::new(), // 空名单 → 快照 backends 段整段缺席（既有测试零感知）
         )
+    }
+
+    /// 出站帧注入的测试夹具（v1.36 at 同源测试用）：替换平台的 outbound_tx
+    ///（子模块直取私有字段，同 offline_platform_with_push_capture 手法；
+    /// client 持有的原 rx 随假连接空转），实时帧可从 test rx 观察。
+    async fn offline_platform_with_outbound_capture(
+        store: Store,
+    ) -> (WebPlatform, mpsc::Receiver<String>) {
+        let mut p = offline_platform_with_store(store).await;
+        let (tx, rx) = mpsc::channel::<String>(OUTBOUND_CHANNEL_CAPACITY);
+        p.outbound_tx = tx;
+        (p, rx)
     }
 
     /// Drop 平台必须 cancel 停机信号（后台任务连动退出）。
@@ -1660,17 +1709,20 @@ mod tests {
             store,
             default,
             &empty_models(),
+            &[],
             &CliSource::Claude(CliModels::default()),
             act,
         )
         .await
     }
 
-    /// [`run_action`] 的 v1.8 全参形态（模型上下文 + CLI/codex 配置快照可注入）。
+    /// [`run_action`] 的 v1.8 全参形态（模型上下文 + CLI/codex 配置快照 +
+    /// v1.36 引擎名单可注入）。
     async fn run_action_with(
         store: &Store,
         default: &Path,
         models: &ModelsContext,
+        backends: &[String],
         cli: &CliSource,
         act: InboundAction,
     ) -> Vec<serde_json::Value> {
@@ -1680,6 +1732,7 @@ mod tests {
             store,
             default,
             models,
+            backends,
             cli,
             &disabled_titles(store),
             act,
@@ -1729,6 +1782,7 @@ mod tests {
             &store,
             &default,
             &ctx,
+            &[],
             &CliSource::Claude(CliModels::default()),
             InboundAction::WorkspaceList,
         )
@@ -1763,6 +1817,7 @@ mod tests {
             &store,
             &default,
             &ctx,
+            &[],
             &CliSource::Claude(cli),
             InboundAction::WorkspaceList,
         )
@@ -1813,6 +1868,7 @@ mod tests {
             &store,
             &default,
             &ctx,
+            &[],
             &CliSource::Codex(codex.clone()),
             InboundAction::WorkspaceList,
         )
@@ -1847,6 +1903,7 @@ mod tests {
             &store,
             &default,
             &ctx_empty,
+            &[],
             &CliSource::Codex(codex_empty),
             InboundAction::WorkspaceList,
         )
@@ -1857,6 +1914,79 @@ mod tests {
         assert!(
             opts.iter().all(|o| o["target"].is_null()),
             "官方层 target 恒 null：{opts:?}"
+        );
+    }
+
+    /// v1.36 backends 段组装（任务验收项）：装配注入引擎名单后快照带
+    /// `backends{current, options[]}`——current 恒 = 首位 default（未设
+    /// `backend:<conv>` KV 的会话实际引擎），options 保序全名单；空名单 →
+    /// 整段缺席（旧形态字节不变）。与 models 段同帧并存互不干扰（两段
+    /// 数据源解耦：models 走 CLI/官方链，backends 纯名单直传）。
+    #[tokio::test]
+    async fn workspace_snapshot_backends_section() {
+        let store = test_store().await;
+        let default = valid_dir();
+
+        // 注入名单：default 在首位 + extras 保序（main 装配形态）。
+        let names = ["claude-cli".to_string(), "codex-app".to_string()];
+        let frames = run_action_with(
+            &store,
+            &default,
+            &empty_models(),
+            &names,
+            &CliSource::Claude(CliModels::default()),
+            InboundAction::WorkspaceList,
+        )
+        .await;
+        let snap = frames
+            .iter()
+            .find(|f| f["type"] == "workspaces")
+            .unwrap_or_else(|| panic!("应回快照：{frames:?}"));
+        assert_eq!(snap["machine"], TEST_MACHINE, "快照帧带本机 machine");
+        let backends = &snap["backends"];
+        assert_eq!(backends["current"], "claude-cli", "current = 首位 default");
+        assert_eq!(
+            backends["options"].as_array().map(Vec::len),
+            Some(2),
+            "options = 全注册表名单"
+        );
+        assert_eq!(backends["options"][0], "claude-cli");
+        assert_eq!(backends["options"][1], "codex-app");
+
+        // 与 models 段并存：两段各自独立成形（官方回退非空 + 名单非空）。
+        let ctx = ModelsContext {
+            backend: Arc::new(TestBackend(Some("glm-4.6".into()))),
+            official: imagent_core::OfficialModels {
+                claude: vec!["sonnet".into()],
+                codex: vec![],
+            },
+            list_models: None,
+        };
+        let frames = run_action_with(
+            &store,
+            &default,
+            &ctx,
+            &names,
+            &CliSource::Claude(CliModels::default()),
+            InboundAction::WorkspaceList,
+        )
+        .await;
+        let snap = frames.iter().find(|f| f["type"] == "workspaces").unwrap();
+        assert_eq!(
+            snap["models"]["current"], "glm-4.6",
+            "models 段不受名单影响"
+        );
+        assert_eq!(
+            snap["backends"]["current"], "claude-cli",
+            "backends 段独立成形"
+        );
+
+        // 空名单 → 整段缺席（未注入名单的装配形态，既有网关零感知）。
+        let frames = run_action(&store, &default, InboundAction::WorkspaceList).await;
+        let snap = frames.iter().find(|f| f["type"] == "workspaces").unwrap();
+        assert!(
+            snap.get("backends").is_none(),
+            "空名单整段缺席（契约）：{snap}"
         );
     }
 
@@ -2684,6 +2814,40 @@ mod tests {
                 .len(),
             2,
             "同 messageId 终态只落一次"
+        );
+        drop(p);
+    }
+
+    /// v1.36 at 同源（本批核心）：send_text 一次取值——实时 text 帧携带
+    /// `at`（number），落盘行 payload 的 `at` 与实时帧**相等**（SPA 跨两路
+    /// 按 (text, at) 精确去重的事实源）。帧侧观察经 outbound capture 夹具，
+    /// 行侧经 wait_outbound_rows 轮询（spawn 落库有异步窗口）。
+    #[tokio::test]
+    async fn text_frame_at_matches_outbound_log_row() {
+        let store = test_store().await;
+        let (p, mut rx) = offline_platform_with_outbound_capture(store.clone()).await;
+        let conv = ConvId("web:at".into());
+
+        p.send_text(&conv, "你好，世界", &ReplyHint::None)
+            .await
+            .unwrap();
+
+        // 实时帧 JSON 含 at（number）。
+        let json = rx.recv().await.expect("实时 text 帧应入出站通道");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "text");
+        let at = v["at"]
+            .as_u64()
+            .expect("实时 text 帧应带 at（unix 毫秒 number）");
+
+        // 落盘行 payload 的 at 与实时帧相等（同源断言）。
+        let rows = wait_outbound_rows(&store, &conv.0, 1).await;
+        assert_eq!(rows[0].kind, "text");
+        let payload: serde_json::Value = serde_json::from_str(&rows[0].payload).unwrap();
+        assert_eq!(
+            payload["at"].as_u64(),
+            Some(at),
+            "落盘行 at 必须等于实时帧 at（一次取值同源）"
         );
         drop(p);
     }

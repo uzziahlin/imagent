@@ -76,6 +76,13 @@
 //! first_prompt 机械摘要。`sessions` 段 title 优先级：手动名 > 语义标题 >
 //! first_prompt 摘要。
 //!
+//! v1.36 扩展（引擎选择，契约同款字节级纪律）：出站 `workspaces` 快照帧
+//! 可带可选 `backends` 段 `{current, options[]}`——网关多引擎注册表名单
+//!（default + extras，main 装配处一次性注入纯名单，无 IO）：`current` =
+//! default 引擎名（未设 `backend:<conv>` KV 的会话实际用的引擎），
+//! `options` = 全注册表名（SPA 新会话弹窗引擎 chips 数据源，per-conv 补发
+//! `/backend <名>` 落在 core 侧）。空 options 整段不序列化，旧形态字节不变。
+//!
 //! **帧内 convId 协议约定：恒为完整 conv 形态（`web:<session>`）**。出站帧
 //! （text / card / approval_request …）写入的即完整 conv，浏览器回执帧
 //! （message / approval_response）**原样回传收到的 convId** 即可，不得剥前
@@ -194,7 +201,10 @@ pub(crate) const TRUNC_TAIL_CHARS: usize = 6_000;
 
 /// 文本帧（send_text 药化）。`machine` 为本机身份（v1.1 起全部出站帧必带，
 /// SPA 据此区分多台终端）；`hint` 为协议预留位（web 无 context token，
-/// 恒 None 不序列化）。
+/// 恒 None 不序列化）；`at` 为该次出站时刻（v1.36 可选字段，unix 毫秒，
+/// 与落盘 outbound_log 行 payload.at 同源同值——SPA 按 (text, at) 精确去重
+/// 防 history 重放重复；编码方每帧必传 Some，缺席仅是字段可选的向后兼容
+/// 语义，见 [`encode_text_frame`]）。
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct TextFrame {
     v: u8,
@@ -204,6 +214,8 @@ pub(crate) struct TextFrame {
     #[serde(rename = "convId")]
     conv_id: String,
     text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<String>,
 }
@@ -431,14 +443,21 @@ where
         .map_err(|e| CoreError::Platform(TARGET, format!("出站帧截断后序列化失败：{e}")))
 }
 
-/// text 帧药化（send_text）。
-pub(crate) fn encode_text_frame(machine: &str, conv_id: &str, text: &str) -> Result<String> {
+/// text 帧药化（send_text）。`at` 为该次 send_text 取的出站时刻（unix 毫秒），
+/// 调用方必传且与落盘行共享同一值（一次取值同源，v1.36 契约）。
+pub(crate) fn encode_text_frame(
+    machine: &str,
+    conv_id: &str,
+    text: &str,
+    at: u64,
+) -> Result<String> {
     let frame = TextFrame {
         v: 1,
         kind: "text",
         machine: machine.to_string(),
         conv_id: conv_id.to_string(),
         text: text.to_string(),
+        at: Some(at),
         hint: None,
     };
     encode_frame(&frame, text, |t| TextFrame {
@@ -681,6 +700,18 @@ pub(crate) struct ModelsFrame {
     pub(crate) options: Vec<ModelOption>,
 }
 
+/// v1.36 引擎选择段（workspaces 快照帧可选 backends 段，新会话弹窗引擎
+/// chips 的数据源）：`current` = 网关默认引擎名（default backend 的
+/// `name()`——未设 `backend:<conv>` KV 的会话实际用的引擎）；`options` =
+/// 全注册表名（default + extras，保序去重，default 在首位）。名单由 main
+/// 装配处一次性注入（纯字符串透传，无 IO）；空 options 整段不序列化（见
+/// [`encode_workspaces_frame`]）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct BackendsFrame {
+    pub(crate) current: String,
+    pub(crate) options: Vec<String>,
+}
+
 /// workspaces 全量快照帧（SPA 工作空间视图的单一数据来源）：
 /// `default` = 配置 default_workdir；`workspaces` = 全部命名空间（调用方
 /// 按 name 稳定序排好）；`convs` = 该网关全部已知 conv 的当前 workdir
@@ -690,7 +721,8 @@ pub(crate) struct ModelsFrame {
 /// 解密分发处兜底注入才可达内帧，内帧自带才是权威）。`convs` 用
 /// BTreeMap：键序稳定，SPA 解析与测试断言可复现。v1.7 起可带可选
 /// `sessions` 段（`web:` 会话历史，见 [`SessionEntryFrame`]）；v1.8 起可带
-/// 可选 `models` 段（模型菜单动态化，见 [`ModelsFrame`]）——两段空集整段
+/// 可选 `models` 段（模型菜单动态化，见 [`ModelsFrame`]）；v1.36 起可带
+/// 可选 `backends` 段（引擎名单，见 [`BackendsFrame`]）——三段空集整段
 /// 不序列化（无对应数据的网关快照与 v1.6 逐字节一致，旧端零感知）。
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct WorkspacesFrame {
@@ -705,6 +737,8 @@ pub(crate) struct WorkspacesFrame {
     sessions: Vec<SessionEntryFrame>,
     #[serde(skip_serializing_if = "Option::is_none")]
     models: Option<ModelsFrame>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backends: Option<BackendsFrame>,
 }
 
 /// conv_workdir 增量帧：单个 conv 的工作目录已切换（网页 conv_workdir_set
@@ -739,7 +773,8 @@ pub(crate) struct ErrorFrame {
 /// workspaces 快照帧组帧。无截断面（无自由文本大字段；convs/sessions 量级
 /// = 会话数，远低于帧软限）。`sessions` 传空 Vec 时整段不序列化（旧形态
 /// 字节不变，协议 v1.7 可选段语义）；`models` 传 None 或 options 空的帧时
-/// 整段不序列化（协议 v1.8 同语义——契约「≥1 才序列化整段」）。
+/// 整段不序列化（协议 v1.8 同语义——契约「≥1 才序列化整段」）；`backends`
+/// 传 None 或 options 空的帧时同整段缺席（协议 v1.36 同语义）。
 pub(crate) fn encode_workspaces_frame(
     machine: &str,
     default: &str,
@@ -747,9 +782,11 @@ pub(crate) fn encode_workspaces_frame(
     convs: BTreeMap<String, String>,
     sessions: Vec<SessionEntryFrame>,
     models: Option<ModelsFrame>,
+    backends: Option<BackendsFrame>,
 ) -> Result<String> {
     // 契约「options ≥1 才序列化」在组帧出口统一兜底（调用方无需各自判断）。
     let models = models.filter(|m| !m.options.is_empty());
+    let backends = backends.filter(|b| !b.options.is_empty());
     let frame = WorkspacesFrame {
         v: 1,
         kind: "workspaces",
@@ -759,6 +796,7 @@ pub(crate) fn encode_workspaces_frame(
         convs,
         sessions,
         models,
+        backends,
     };
     serde_json::to_string(&frame)
         .map_err(|e| CoreError::Platform(TARGET, format!("workspaces 帧序列化失败：{e}")))
@@ -1740,6 +1778,7 @@ mod tests {
             convs,
             Vec::new(),
             None,
+            None,
         )
         .unwrap();
         // 键序无关逐字段复核（convs 为 BTreeMap 键序稳定 + serde 按声明序
@@ -1768,13 +1807,15 @@ mod tests {
         assert_eq!(convs["local:work"], "/lw", "含 local: 会话");
         assert_eq!(convs["web:work"], "/ww");
 
-        // 空集合形态：workspaces=[] / convs={}（sessions/models 整段缺席）。
+        // 空集合形态：workspaces=[] / convs={}（sessions/models/backends
+        // 整段缺席）。
         let json = encode_workspaces_frame(
             "home-mac",
             "/def",
             Vec::new(),
             BTreeMap::new(),
             Vec::new(),
+            None,
             None,
         )
         .unwrap();
@@ -1784,6 +1825,7 @@ mod tests {
         assert_eq!(v["convs"].as_object().map(|m| m.len()), Some(0));
         assert!(v.get("sessions").is_none());
         assert!(v.get("models").is_none());
+        assert!(v.get("backends").is_none());
 
         // conv_workdir 增量帧（键序无关逐字段）。
         let json = encode_conv_workdir_frame("home-mac", "web:work", "/Users/x/proj").unwrap();
@@ -1832,6 +1874,7 @@ mod tests {
                 },
             ],
             None,
+            None,
         )
         .unwrap();
         // 键序无关逐字段复核（derive struct 声明序组帧、sessions 段在 convs
@@ -1866,6 +1909,7 @@ mod tests {
             Vec::new(),
             BTreeMap::new(),
             Vec::new(),
+            None,
             None,
         )
         .unwrap();
@@ -1902,6 +1946,7 @@ mod tests {
                     },
                 ],
             }),
+            None,
         )
         .unwrap();
         // 键序无关逐字段复核（derive struct 声明序组帧、models 段在 sessions
@@ -1948,6 +1993,7 @@ mod tests {
                 BTreeMap::new(),
                 Vec::new(),
                 models,
+                None,
             )
             .unwrap();
             let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1978,6 +2024,10 @@ mod tests {
                     target: None,
                 }],
             }),
+            Some(BackendsFrame {
+                current: "claude-cli".into(),
+                options: vec!["claude-cli".into(), "codex-app".into()],
+            }),
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1985,7 +2035,77 @@ mod tests {
             json.find(r#""sessions":"#).unwrap() < json.find(r#""models":"#).unwrap(),
             "sessions 在 models 前：{json}"
         );
+        assert!(
+            json.find(r#""models":"#).unwrap() < json.find(r#""backends":"#).unwrap(),
+            "models 在 backends 前（backends 段置尾）：{json}"
+        );
         assert_eq!(v["models"]["current"], "sonnet");
+    }
+
+    /// v1.36 workspaces 快照 backends 段**键序无关逐字段断言**（契约逐字段
+    /// 一致：段置尾（models 之后）、current/options 纯字符串、options 元素
+    /// 即引擎名裸串）；backends 段存在时旧各段字段形态不变；options 空 /
+    /// None → 整段缺席（组帧出口统一兜底）。不做完整字节串断言（理由同
+    /// sessions/models 段测试）。
+    #[test]
+    fn workspaces_frame_backends_byte_level() {
+        // 含段：current = 首位 default；options 保序全注册表名。
+        let json = encode_workspaces_frame(
+            "home-mac",
+            "/def",
+            Vec::new(),
+            BTreeMap::new(),
+            Vec::new(),
+            None,
+            Some(BackendsFrame {
+                current: "claude-cli".into(),
+                options: vec!["claude-cli".into(), "codex-app".into()],
+            }),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            v.as_object().map(|m| m.len()),
+            Some(7),
+            "带 backends 恰好 7 键"
+        );
+        assert_eq!(
+            v["backends"].as_object().map(|m| m.len()),
+            Some(2),
+            "backends 恰好 2 键（current/options）"
+        );
+        assert_eq!(v["backends"]["current"], "claude-cli");
+        let options = v["backends"]["options"].as_array().expect("options 为数组");
+        assert_eq!(options.len(), 2, "options = 全注册表名：{options:?}");
+        assert_eq!(options[0], "claude-cli", "保序：default 在首位");
+        assert_eq!(options[1], "codex-app");
+
+        // 缺段两形态：None / options 空 → 旧形态字节不变（键序无关口径）。
+        for backends in [
+            None,
+            Some(BackendsFrame {
+                current: "claude-cli".into(),
+                options: Vec::new(),
+            }),
+        ] {
+            let json = encode_workspaces_frame(
+                "home-mac",
+                "/def",
+                Vec::new(),
+                BTreeMap::new(),
+                Vec::new(),
+                None,
+                backends,
+            )
+            .unwrap();
+            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                v.as_object().map(|m| m.len()),
+                Some(6),
+                "空 options / None 整段缺席"
+            );
+            assert!(v.get("backends").is_none(), "空 options / None 整段缺席");
+        }
     }
 
     /// v1.9 title 规则三档（任务验收项）：手动名优先（trim 生效、空白名
@@ -2123,13 +2243,14 @@ mod tests {
 
     #[test]
     fn text_frame_shape() {
-        let json = encode_text_frame("home-mac", "web:work", "你好").unwrap();
+        let json = encode_text_frame("home-mac", "web:work", "你好", 1_730_000_000_000).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["v"], 1);
         assert_eq!(v["type"], "text");
         assert_eq!(v["machine"], "home-mac", "v1.1 出站帧必带 machine");
         assert_eq!(v["convId"], "web:work");
         assert_eq!(v["text"], "你好");
+        assert_eq!(v["at"], 1_730_000_000_000_u64, "v1.36 实时帧携带出站时刻");
         assert!(v.get("hint").is_none(), "hint 恒 None 不序列化");
     }
 
@@ -2298,12 +2419,12 @@ mod tests {
         assert_eq!(v["machine"], "home-mac", "截断重建不丢 machine 字段");
 
         // text 帧同款截断。
-        let json = encode_text_frame("home-mac", "web:work", &long_text).unwrap();
+        let json = encode_text_frame("home-mac", "web:work", &long_text, 1).unwrap();
         assert!(json.len() <= FRAME_SOFT_LIMIT_BYTES);
         assert!(json.contains("…[已截断]…"));
 
         // 未超限帧原样通过。
-        let small = encode_text_frame("home-mac", "web:work", "short").unwrap();
+        let small = encode_text_frame("home-mac", "web:work", "short", 1).unwrap();
         assert!(small.contains("short"));
     }
 

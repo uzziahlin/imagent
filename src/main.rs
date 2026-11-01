@@ -796,6 +796,28 @@ async fn main() -> Result<()> {
                 );
             }
 
+            // 批 A/2：多引擎注册表装配（claude-cli / codex-app 常驻，与
+            // config.agent 指定的 default 去重）。v1.36 构造点上移到 platform
+            // 装配之前：web 分支要拿全注册表名（default + extras）装配
+            // workspaces 快照 backends 段（SPA 新会话弹窗引擎 chips）。注册
+            // 惰性（Backend::new 纯内存字段初始化，无 IO——见
+            // build_extra_backends doc），提前调用零副作用；实例表只构造
+            // 一次，名字在此借出后原表仍 move 进 set_extra_backends。
+            let extras = build_extra_backends(
+                &config.agent,
+                config.permission_mode,
+                std::time::Duration::from_secs(config.permission_ask_timeout_secs),
+            );
+            // v1.36 引擎名单：default 在首位 + extras 保序去重（与
+            // set_extra_backends 内的注册表按名去重同口径，万一重名快照也
+            // 只出现一次）。
+            let mut backend_names = vec![backend.name().to_string()];
+            for name in extras.iter().map(|b| b.name()) {
+                if !backend_names.iter().any(|n| n == name) {
+                    backend_names.push(name.to_string());
+                }
+            }
+
             // platform 装配（v1.8：移到 backend 就绪之后——web 分支注入
             // backend clone，见上）：CLI 显式优先（单平台），否则
             // config.platforms 多平台列表，最后回退 config.platform 单值。
@@ -806,14 +828,22 @@ async fn main() -> Result<()> {
                     store.clone(),
                     &backend,
                     model_list_fn.clone(),
+                    backend_names.clone(),
                 )
                 .await?
             } else {
                 let mut children = Vec::with_capacity(platform_names.len());
                 for n in &platform_names {
                     children.push(
-                        build_platform(n, &config, store.clone(), &backend, model_list_fn.clone())
-                            .await?,
+                        build_platform(
+                            n,
+                            &config,
+                            store.clone(),
+                            &backend,
+                            model_list_fn.clone(),
+                            backend_names.clone(),
+                        )
+                        .await?,
                     );
                 }
                 tracing::info!(
@@ -920,14 +950,10 @@ async fn main() -> Result<()> {
                 config.cot_detail,
                 initial_admins,
             ));
-            // 批 A/2：多引擎注册表注入（claude-cli / codex-app 常驻，与
-            // config.agent 指定的 default 去重）+ config 原始权限档位快照
-            //（Auto 不预解析，run 路径按 per-conv 解析出的引擎现算生效档）。
-            let extras = build_extra_backends(
-                &config.agent,
-                config.permission_mode,
-                std::time::Duration::from_secs(config.permission_ask_timeout_secs),
-            );
+            // 批 A/2：多引擎注册表注入（claude-cli / codex-app 常驻——实例表
+            // 已在 platform 装配前构造，见上，此处 move 进注册表）+ config
+            // 原始权限档位快照（Auto 不预解析，run 路径按 per-conv 解析出的
+            // 引擎现算生效档）。
             dispatcher.set_extra_backends(extras);
             dispatcher.set_raw_permission_mode(config.permission_mode);
             // 快捷命令（v1.17）：config.shortcuts 注入（SIGHUP 热重载同步）。
@@ -1682,7 +1708,9 @@ fn build_extra_backends(
 ///（v1.8：web 分支消费——注入 WebPlatform 作 workspaces 快照 models
 /// 段的 current 数据源 backend.model()；其余分支忽略）。`model_list_fn` 为
 /// codex-app 批新增的实时模型目录闭包（同样仅 web 分支消费——ModelsContext
-/// 三层链第①层；其余后端/平台为 None 被忽略）。
+/// 三层链第①层；其余后端/平台为 None 被忽略）。`backends` 为 v1.36 引擎
+/// 名单（default 在首位 + extras 保序去重的纯名单——web 分支装配快照
+/// backends 段；其余分支忽略）。
 ///
 /// - `"wecom"` → [`imagent_wecom::WeComPlatform`]：`bot_id` 取自 config（非敏感）；
 ///   `secret` 优先取 store 凭据（`imagent login wecom`，keyring/加密落盘），
@@ -1709,6 +1737,7 @@ async fn build_platform(
     store: imagent_store::Store,
     backend: &Arc<dyn imagent_core::Backend>,
     model_list_fn: Option<Arc<imagent_web::models::ListModelsFn>>,
+    backends: Vec<String>,
 ) -> Result<Arc<dyn imagent_core::Platform>> {
     match name {
         "wecom" => {
@@ -1815,8 +1844,10 @@ async fn build_platform(
             // 快照 default 字段取 default_workdir）。
             // v1.8 模型目录：注入 backend 句柄（快照 models.current =
             // backend.model()，/model 命令热设值）+ config official_models
-            // （per-backend 官方回退列表）+ codex-app 实时闭包（模型三层链
+            //（per-backend 官方回退列表）+ codex-app 实时闭包（模型三层链
             // 第①层；仅 codex-app 装配产生，其余后端 None）。
+            // v1.36 引擎名单：注入全注册表名（快照 backends 段——SPA 新会话
+            // 弹窗引擎 chips 数据源；default 在首位，装配处已保序去重）。
             Ok(Arc::new(imagent_web::WebPlatform::new(
                 relay_url,
                 credential,
@@ -1829,6 +1860,7 @@ async fn build_platform(
                     official: config.official_models.clone(),
                     list_models: model_list_fn,
                 },
+                backends,
             )))
         }
         "local" => {
