@@ -25,6 +25,14 @@ function isAbsolutePath(p: string): boolean {
   return p.startsWith("/");
 }
 
+/** chips 选中态样式（目录/引擎弹窗共用的单一形态）：active 高亮描边、非
+ *  active 灰态（模块级纯函数——新会话弹窗的引擎 chips 复用，v1.36）。 */
+export const chipCls = (active: boolean): string =>
+  "press min-h-10 shrink-0 whitespace-nowrap rounded-full border px-4 py-2 text-sm transition-colors " +
+  (active
+    ? "border-emerald-500 bg-emerald-600/15 text-ink"
+    : "border-line-strong bg-panel text-muted hover:border-emerald-500/60 hover:text-ink");
+
 /**
  * 工作目录选择区（v1.6）：空间 chips（lastUsedAt 降序，无时间者排尾）+
  * 「正在使用」chips（快照 convs 值去重，排除与空间 path 重复项与 default）+
@@ -74,12 +82,6 @@ export function WorkspacePicker({
     }
     return out;
   }, [snapshot]);
-
-  const chipCls = (active: boolean): string =>
-    "press min-h-10 shrink-0 whitespace-nowrap rounded-full border px-4 py-2 text-sm transition-colors " +
-    (active
-      ? "border-emerald-500 bg-emerald-600/15 text-ink"
-      : "border-line-strong bg-panel text-muted hover:border-emerald-500/60 hover:text-ink");
 
   const submitOther = () => {
     const p = otherPath.trim();

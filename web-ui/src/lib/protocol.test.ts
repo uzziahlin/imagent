@@ -1862,4 +1862,169 @@ describe("v1.8 会话历史重放（history 帧）", () => {
     expect(spaceOf(s, "work-mac").convs["web:work"]?.unread).toBe(0);
     expect(spaceOf(s, DEFAULT_MACHINE).convs["web:work"]).toBeUndefined();
   });
+
+  // v1.36 text 重放去重：实时帧自带网关落盘同源 at，重放条目 key（h:<seq>）
+  // 与实时 key（text:N）键空间不相交，(text, at) 精确匹配是唯一可靠对齐凭证。
+
+  it("reducer（v1.36）：实时条目保留帧同源 at；重放 (text,at) 精确匹配 → 跳过（key 不同亦去重）", () => {
+    // 实时帧带 at（新网关）：本地条目 key=text:1、at=帧原值（appendEntry 不盖本地时间）
+    let s = run(initialState(), {
+      type: "frame",
+      frame: frame(`{"v":1,"type":"text","convId":"web:work","text":"查询回显","at":1700000000000}`),
+    });
+    expect(convsOf(s)["web:work"].entries[0]).toEqual({
+      kind: "text",
+      key: "text:1",
+      text: "查询回显",
+      at: 1700000000000,
+    });
+    // 重放同一条消息：key 空间不同（h:9）但 (text, at) 相同 → 跳过不重复
+    s = run(s, {
+      type: "frame",
+      frame: frame(
+        HIST(`,"entries":[{"kind":"text","key":"h:9","text":"查询回显","at":1700000000000}],"lastSeq":9,"trimmed":false`),
+      ),
+    });
+    const conv = convsOf(s)["web:work"];
+    expect(conv.entries).toHaveLength(1); // 无重复
+    expect((conv.entries[0] as { key: string }).key).toBe("text:1"); // 本地条目保留
+  });
+
+  it("reducer（v1.36）：同文本异 at 不算重复——两条都保留（/help 两次回显形态）", () => {
+    let s = run(initialState(), {
+      type: "frame",
+      frame: frame(`{"v":1,"type":"text","convId":"web:work","text":"/help","at":1700000000001}`),
+    });
+    s = run(s, {
+      type: "frame",
+      frame: frame(
+        HIST(
+          `,"entries":[{"kind":"text","key":"h:1","text":"/help","at":1700000000001},` +
+            `{"kind":"text","key":"h:2","text":"/help","at":1700000000002}],"lastSeq":2,"trimmed":false`,
+        ),
+      ),
+    });
+    // 第一条 (text,at) 与本地相同跳过；第二条同文本但 at 不同 → 保留
+    expect(convsOf(s)["web:work"].entries.map((e) => e.key)).toEqual(["text:1", "h:2"]);
+  });
+
+  it("reducer（v1.36）：本地条目无 at（旧缓存形态）+ 重放带 at → 保留（退化重复，升级一次性残留可接受）", () => {
+    // 直接构造本地 text 条目无 at（旧版本缓存/旧网关实时帧盖本地时间的形态
+    // ——实时路径 appendEntry 恒盖 at，无 at 只出现在缓存恢复前的旧数据）。
+    // conv 用 HIST 夹具的 web:work。
+    const base = initialState();
+    const s0: AppState = {
+      ...base,
+      spaces: {
+        [DEFAULT_MACHINE]: {
+          convs: {
+            [DEFAULT_CONV]: { entries: [], pending: [], lastPreview: "", lastAt: 0, unread: 0 },
+            "web:work": { entries: [{ kind: "text", key: "text:1", text: "查询回显" }], pending: [], lastPreview: "", lastAt: 0, unread: 0 },
+          },
+          convOrder: [DEFAULT_CONV, "web:work"],
+        },
+      },
+    };
+    const s = run(s0, {
+      type: "frame",
+      frame: frame(
+        HIST(`,"entries":[{"kind":"text","key":"h:9","text":"查询回显","at":1700000000000}],"lastSeq":9,"trimmed":false`),
+      ),
+    });
+    // 无 at 无法与重放对齐 → 重放条目照常追加（重复一份），不误删任何一条
+    expect(s0 === s).toBe(false);
+    expect(convsOf(s)["web:work"].entries.map((e) => e.key)).toEqual(["text:1", "h:9"]);
+  });
+
+  it("reducer（v1.36）：重放集内部同 (text,at) 重复同样跳过；带 at 新重放照常 append", () => {
+    let s = run(initialState(), {
+      type: "frame",
+      frame: frame(`{"v":1,"type":"text","convId":"web:work","text":"实时消息","at":100}`),
+    });
+    s = run(s, {
+      type: "frame",
+      frame: frame(
+        HIST(
+          `,"entries":[{"kind":"text","key":"h:2","text":"实时消息","at":100},` +
+            `{"kind":"text","key":"h:3","text":"实时消息","at":100},` +
+            `{"kind":"text","key":"h:4","text":"实时消息","at":200}],"lastSeq":4,"trimmed":false`,
+        ),
+      ),
+    });
+    // h:2/h:3 同 (text,at) 均命中（本地 + 重放集内已见）→ 只留 h:4（at=200 异值）
+    expect(convsOf(s)["web:work"].entries.map((e) => e.key)).toEqual(["text:1", "h:4"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.36 text 帧可选 at（网关落盘同源时间戳）：解析校验 + 旧网关（无 at）兼容
+// ---------------------------------------------------------------------------
+
+describe("v1.36 text 帧可选 at（解析校验）", () => {
+  const T = (extra: string) => `{"v":1,"type":"text","convId":"web:work","text":"x"${extra}}`;
+
+  it("at 缺席放行（旧网关）；合法 unix 毫秒整数放行", () => {
+    expect(parseFrame(T(""))).toMatchObject({ type: "text", text: "x" });
+    expect(parseFrame(T(`,"at":1700000000000`))).toMatchObject({ at: 1700000000000 });
+    expect(parseFrame(T(`,"at":0`))).toMatchObject({ at: 0 });
+  });
+
+  it("at 非法拒：负数 / 非整数 / 非数字 / NaN / Infinity", () => {
+    expect(parseFrame(T(`,"at":-1`))).toBeNull();
+    expect(parseFrame(T(`,"at":1.5`))).toBeNull();
+    expect(parseFrame(T(`,"at":"x"`))).toBeNull();
+    expect(parseFrame(T(`,"at":null`))).toBeNull();
+    // null ≠ 缺席（JSON 里显式 null 是畸形，与 models.current 的可空语义不同）
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.36 workspaces.backends 可选段（新会话引擎选择）：合法采纳、畸形整段丢弃
+// 按缺席（不拒帧）、缺席（旧网关）透传 undefined
+// ---------------------------------------------------------------------------
+
+describe("workspaces.backends（v1.36 新会话引擎选择）", () => {
+  const WS = (extra = "") =>
+    `{"v":1,"type":"workspaces","default":"/d","workspaces":[],"convs":{}` +
+    `,"machine":"home-mac"${extra}}`;
+  const BK =
+    `,"backends":{"current":"claude-code","options":["default","claude-code","codex-app"]}`;
+
+  it("reducer：合法 backends 段随快照落表（current + options 保序）", () => {
+    const s = run(initialState(), { type: "frame", frame: frame(WS(BK)) });
+    expect(s.workspaces["home-mac"].backends).toEqual({
+      current: "claude-code",
+      options: ["default", "claude-code", "codex-app"],
+    });
+    // 其余快照段照常落表
+    expect(s.workspaces["home-mac"].default).toBe("/d");
+  });
+
+  it("reducer：畸形 backends 段整段丢弃按缺席（不拒帧——其余快照段照常落表）", () => {
+    const bads = [
+      `,"backends":{"current":"","options":["default"]}`, // current 空串
+      `,"backends":{"current":"claude-code"}`, // options 缺失
+      `,"backends":{"current":"claude-code","options":[]}`, // options 空数组（契约非空）
+      `,"backends":{"current":"claude-code","options":["default",7]}`, // 元素非 string
+      `,"backends":{"current":"claude-code","options":["default",""]}`, // 元素空串
+      `,"backends":{"current":7,"options":["default"]}`, // current 非字符串
+      `,"backends":"claude-code"`, // 段非对象
+    ];
+    for (const bad of bads) {
+      const s = run(initialState(), { type: "frame", frame: frame(WS(bad)) });
+      expect(s.workspaces["home-mac"].backends).toBeUndefined(); // 段丢弃按缺席
+      expect(s.workspaces["home-mac"].default).toBe("/d"); // 帧其余部分照收（未拒）
+    }
+  });
+
+  it("reducer：无 backends 段（旧网关/空注册表）→ backends undefined；重复快照整体覆盖", () => {
+    const s = run(initialState(), { type: "frame", frame: frame(WS("")) });
+    expect(s.workspaces["home-mac"].backends).toBeUndefined();
+    // 下一条快照带段则覆盖（整体覆盖语义同 models）
+    const s2 = run(s, { type: "frame", frame: frame(WS(BK)) });
+    expect(s2.workspaces["home-mac"].backends?.current).toBe("claude-code");
+    // 再来一条无段的快照 → 回落 undefined（缺席即清除）
+    const s3 = run(s2, { type: "frame", frame: frame(WS("")) });
+    expect(s3.workspaces["home-mac"].backends).toBeUndefined();
+  });
 });

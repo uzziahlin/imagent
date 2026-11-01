@@ -52,6 +52,11 @@
 //   `h:` 与实时条目键空间区分，card 恒 state="done" 终态快照）。合并语义见
 //   mergeHistory：重放不计未读、概要仅空 conv 刷新、card 同 messageId 本地
 //   优先；高水位（lastSeq）由 App 层维护（historyStore 随缓存落盘）。
+// - v1.36 重放去重 + 引擎选择：text 帧可选 at（unix 毫秒，与该消息 outbound_log
+//   落盘行同源同值；旧网关缺席）——实时条目保留原值（appendEntry 不盖本地
+//   时间），mergeHistory 按 (text, at) 精确匹配去重重放条目；workspaces 快照
+//   可选 backends{current, options}（网关默认引擎 + 全注册表引擎名，新会话
+//   弹窗引擎 chips，畸形整段丢弃按缺席）。
 
 export const PROTOCOL_VERSION = 1;
 
@@ -492,6 +497,10 @@ export type TextFrame = {
   hint?: string;
   /** 来源机器（v1.1）；旧网关缺席 → 归 DEFAULT_MACHINE。 */
   machine?: string;
+  /** v1.36 网关落盘同源时间戳（unix 毫秒，与该消息 outbound_log 落盘行同值；
+   *  一次取值同源，见网关 send_text/log_outbound_text）。旧网关缺席 → SPA
+   *  回落本地到达时间（appendEntry 盖 Date.now()，重放去重不命中=退化重复）。 */
+  at?: number;
 };
 
 /** card（新建/sync 重发）与 card_patch（更新）同形，仅 type 不同。 */
@@ -627,11 +636,17 @@ export type ModelsInfo = {
   options: ModelOption[];
 };
 
+/** v1.36 workspaces 帧可选 backends 段（新会话引擎选择，网关侧汇聚）：
+ *  current = 网关默认引擎名；options = 全注册表引擎名（内置 default 在首、
+ *  保序）。段缺席 = 旧网关/空注册表。 */
+export type BackendsInfo = { current: string; options: string[] };
+
 /** v1.6 工作空间全量快照（唯一事实源）：default = 该机器 default_workdir
  *  绝对路径；convs = convId → workdir 绝对路径（含 local: 前缀会话）。machine
  *  = 来源机器（旧网关缺席 → 归 DEFAULT_MACHINE）。v1.7 起可选携带 sessions
  *  （该机器持久化的历史会话列表，按 updatedAt 降序；旧网关缺席 → 不合并）；
- *  v1.8 起可选携带 models（/model 菜单数据，旧网关缺席 → SPA 内置兜底）。 */
+ *  v1.8 起可选携带 models（/model 菜单数据，旧网关缺席 → SPA 内置兜底）；
+ *  v1.36 起可选携带 backends（新会话引擎选择，畸形整段丢弃按缺席）。 */
 export type WorkspacesFrame = {
   v: typeof PROTOCOL_VERSION;
   type: "workspaces";
@@ -641,6 +656,7 @@ export type WorkspacesFrame = {
   machine?: string;
   sessions?: SessionSummary[];
   models?: ModelsInfo;
+  backends?: BackendsInfo;
 };
 
 /** v1.6 会话工作目录增量（conv_workdir_set 成功后随 workspaces 快照一起回）。 */
@@ -729,6 +745,12 @@ const isStr = (o: Record<string, unknown>, k: string) => typeof o[k] === "string
 /** v1.1 可选 machine 字段：缺席或字符串才合法。 */
 const machineOk = (o: Record<string, unknown>): boolean =>
   o.machine === undefined || typeof o.machine === "string";
+
+/** v1.36 text 帧可选 at（unix 毫秒，网关落盘同源）：缺席放行（旧网关）；
+ *  存在时须为有限非负整数（Number.isInteger 已排除 NaN/±Infinity，与 history
+ *  lastSeq 的校验形态一致）。 */
+const atOk = (o: Record<string, unknown>): boolean =>
+  o.at === undefined || (typeof o.at === "number" && Number.isInteger(o.at) && o.at >= 0);
 
 const cardShapeOk = (o: Record<string, unknown>): boolean =>
   isStr(o, "convId") &&
@@ -842,6 +864,25 @@ const modelsOk = (m: unknown): boolean => {
   );
 };
 
+/** v1.36 workspaces.backends 段形状（类型谓词，reducer 落表净化用）：current
+ *  非空 string、options 为非空 string 数组（契约：default 在首，空 options 网
+ *  关整段不下发）。与 models 的「畸形整帧拒」不同，本段纯 UI 可选，畸形**整段
+ *  丢弃按缺席**（不拒帧）——parseFrame 不拦，reducer 落表处据此净化（引擎行
+ *  优雅降级不渲染，其余快照段不受牵连）。 */
+const backendsOk = (b: unknown): b is BackendsInfo => {
+  if (typeof b !== "object" || b === null) {
+    return false;
+  }
+  const r = b as Record<string, unknown>;
+  return (
+    typeof r.current === "string" &&
+    r.current.length > 0 &&
+    Array.isArray(r.options) &&
+    r.options.length > 0 &&
+    r.options.every((x) => typeof x === "string" && x.length > 0)
+  );
+};
+
 /** v1.8 history 帧 entries 元素：kind 二选一——text 需 key/text；card 需
  *  key/messageId + card 对象（载荷完整性由网关保证，card 深层字段不作逐项
  *  校验——与 StreamEntry 渲染路径一致，畸形载荷不致崩溃）。 */
@@ -875,7 +916,9 @@ const INBOUND_CHECKS: Record<string, FieldCheck> = {
     Array.isArray(o.online) && o.online.every((m) => typeof m === "string"),
   error: (o) =>
     isStr(o, "code") && (o.message === undefined || typeof o.message === "string"),
-  text: (o) => isStr(o, "convId") && isStr(o, "text") && machineOk(o),
+  // v1.36 text 可选 at（网关落盘同源 unix 毫秒）：缺席放行（旧网关），存在须
+  // 为有限非负整数（atOk）
+  text: (o) => isStr(o, "convId") && isStr(o, "text") && machineOk(o) && atOk(o),
   card: (o) => cardShapeOk(o) && machineOk(o),
   card_patch: (o) => cardShapeOk(o) && machineOk(o),
   approval_request: (o) =>
@@ -901,7 +944,9 @@ const INBOUND_CHECKS: Record<string, FieldCheck> = {
     isStr(o, "machine") && isStr(o, "gk") && isStr(o, "n2") && isStr(o, "sig") && ackIdentityOk(o),
   enc: (o) => isStr(o, "machine") && isStr(o, "box"),
   // v1.6 工作空间帧：逐字段形状校验（machine 可选——旧网关缺席归 DEFAULT_MACHINE）；
-  // v1.7 sessions 可选段 / v1.8 models 可选段：出现即须为全合法元素
+  // v1.7 sessions 可选段 / v1.8 models 可选段：出现即须为全合法元素；
+  // v1.36 backends 可选段不在此校验——纯 UI 段畸形整段丢弃按缺席（不拒帧），
+  // 净化在 reducer 落表处（backendsOk）
   workspaces: (o) =>
     isStr(o, "default") &&
     Array.isArray(o.workspaces) &&
@@ -1082,6 +1127,9 @@ export type MachineWorkspaces = {
   items: WorkspaceInfo[];
   convs: Record<string, string>;
   models?: ModelsInfo;
+  /** v1.36 新会话引擎选择（backends 段落表；undefined = 网关未下发或段畸形
+   *  已按缺席丢弃——弹窗引擎行不渲染）。 */
+  backends?: BackendsInfo;
 };
 
 export function initialState(): AppState {
@@ -1203,9 +1251,14 @@ function appendEntry(
   const spaces = ensureConv(state, machine, convId);
   const space = spaces[machine];
   const conv = space.convs[convId];
-  // user/text 盖到达时间戳（approval_note 不展示时间）
+  // user/text 盖到达时间戳（approval_note 不展示时间）。v1.36：text 帧自带的
+  // 网关落盘同源 at（实时帧与 outbound_log 行同值）必须保留——mergeHistory 的
+  // 重放去重按 (text, at) 精确匹配，此处若盖本地时间会破坏同源事实致去重恒
+  // 不命中；user 回显与旧网关 text（无 at）仍盖本地到达时间。
   const stamped: StreamEntry =
-    entry.kind === "user" || entry.kind === "text" ? { ...entry, at: Date.now() } : entry;
+    entry.kind === "user" || (entry.kind === "text" && entry.at === undefined)
+      ? { ...entry, at: Date.now() }
+      : entry;
   // 未读：非当前 conv 的服务端条目（text / approval_note）+1；用户回显恒落
   // 当前 conv（send_echo 由 App 发送路径产生），不计。
   const bumpUnread = stamped.kind !== "user" && !(machine === state.currentMachine && convId === state.currentConv);
@@ -1437,14 +1490,24 @@ function lastAtOfHistory(entries: StreamEntry[]): number {
   return 0;
 }
 
+/** v1.36 text 重放去重键：(text, at) 精确匹配。同文本不同 at 不算重复（如
+ *  两次 /help 回显内容相同但时刻不同，必须都保留）；text 与 at 间以 \u0000
+ *  分隔防拼接歧义（text="a1"/at=2 与 text="a"/at=12 朴素拼接同串）。 */
+const textAtKey = (text: string, at: number): string => `${text}\u0000${at}`;
+
 /** v1.8 history 帧（会话历史重放）合并：重放条目**不进** appendEntry 消息流
  *  ——不计未读、不派生本地序号 key（key 即网关 seq 幂等键）。概要
  *  （lastPreview/lastAt）与 title 仅在该 conv 以重放集为全部内容时刷新——
  *  trimmed 整体替换（先清本地即空）或本地空 conv 首次物化；增量合并（本地
  *  非空）不动概要，本地优先。去重：本地已有同 key 跳过；card 同 messageId
  *  本地优先（本地可能持有等价/更新终态或流式中间态，重放恒为终态快照，覆盖
- *  无增益——与既有 sync/快照的本地优先语义一致）。entries 空（仅水位）reducer
- *  无事可做，高水位由 App 层 lastSeqRef 维护。 */
+ *  无增益——与既有 sync/快照的本地优先语义一致）；v1.36 起 text 另按
+ *  (text, at) 精确匹配跳过——实时 text 帧自 v1.36 起携带网关落盘同源 at
+ *  （与 outbound_log 行同值），重放条目 key（h:<seq>）与实时条目 key
+ *  （text:N）键空间不相交，同源 at 是唯一可靠对齐凭证；同文本异 at 不算
+ *  重复；无 at 的本地条目（旧网关实时帧盖的本地时间、旧缓存形态）无法按此
+ *  去重——升级一次性残留（重放后重复一份），可接受。entries 空（仅水位）
+ *  reducer 无事可做，高水位由 App 层 lastSeqRef 维护。 */
 function mergeHistory(state: AppState, frame: HistoryFrame): AppState {
   if (frame.entries.length === 0) {
     return state;
@@ -1455,11 +1518,20 @@ function mergeHistory(state: AppState, frame: HistoryFrame): AppState {
   const space = spaces[machine];
   const conv = space.convs[frame.convId];
   // trimmed：丢弃本地该 conv 缓存以重放集重建（契约）；否则本地条目保留在前，
-  // 重放增量按 key / card messageId 去重 append 在后。
+  // 重放增量按 key / card messageId / text (text,at) 去重 append 在后。
   const local = frame.trimmed ? [] : conv.entries;
   const seenKeys = new Set(local.map((e) => e.key));
   const seenCardIds = new Set(
     local.filter((e): e is CardEntry => e.kind === "card").map((e) => e.messageId),
+  );
+  // v1.36：本地已收 text 的 (text, at) 集（仅带 at 条目参与——无 at 无法对齐）
+  const seenTextAt = new Set(
+    local
+      .filter(
+        (e): e is Extract<StreamEntry, { kind: "text" }> & { at: number } =>
+          e.kind === "text" && typeof e.at === "number",
+      )
+      .map((e) => textAtKey(e.text, e.at)),
   );
   const merged = local.slice();
   for (const e of replay) {
@@ -1469,10 +1541,16 @@ function mergeHistory(state: AppState, frame: HistoryFrame): AppState {
     if (e.kind === "card" && seenCardIds.has(e.messageId)) {
       continue;
     }
+    if (e.kind === "text" && typeof e.at === "number" && seenTextAt.has(textAtKey(e.text, e.at))) {
+      continue;
+    }
     merged.push(e);
     seenKeys.add(e.key);
     if (e.kind === "card") {
       seenCardIds.add(e.messageId);
+    }
+    if (e.kind === "text" && typeof e.at === "number") {
+      seenTextAt.add(textAtKey(e.text, e.at));
     }
   }
   if (merged.length === local.length) {
@@ -1611,11 +1689,14 @@ function reduceFrame(state: AppState, frame: InboundFrame): AppState {
     case "error":
       return { ...state, lastError: { code: frame.code, at: Date.now() } };
     case "text":
+      // v1.36：at 为网关落盘同源时间戳（旧网关缺席 → appendEntry 盖本地到达
+      // 时间），原样带进条目供 mergeHistory 按 (text, at) 重放去重。
       return appendEntry(state, frameMachine(frame), frame.convId, {
         kind: "text",
         key: `text:${state.seq + 1}`,
         text: frame.text,
         hint: frame.hint,
+        at: frame.at,
       });
     case "card":
     case "card_patch":
@@ -1630,6 +1711,8 @@ function reduceFrame(state: AppState, frame: InboundFrame): AppState {
       // v1.7：快照可选 sessions 段 → 先合并历史会话（仅补本地不存在的 conv），
       // 再落快照表。v1.8：快照可选 models 段随快照整体覆盖（缺席即清除——
       // 网关撤下 CLI 映射/配空 official 后下一条快照自然回落内置 chips）。
+      // v1.36：可选 backends 段形状合法才采纳，畸形整段丢弃按缺席（纯 UI
+      // 段不拒帧——引擎行降级不渲染，其余快照段不受牵连）。
       const machine = frameMachine(frame);
       const spaces = frame.sessions
         ? mergePersistedSessions(state, machine, frame.sessions)
@@ -1644,6 +1727,7 @@ function reduceFrame(state: AppState, frame: InboundFrame): AppState {
             items: frame.workspaces,
             convs: frame.convs,
             models: frame.models,
+            backends: backendsOk(frame.backends) ? frame.backends : undefined,
           },
         },
       };

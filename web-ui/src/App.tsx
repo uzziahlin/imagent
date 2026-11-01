@@ -72,7 +72,7 @@ import { AdminPanel, RotatedTokenModal } from "./components/AdminPanel";
 import { PairingWait } from "./components/PairingWait";
 import { PairingRequestCard } from "./components/PairingRequestCard";
 import { E2eConfirm } from "./components/E2eConfirm";
-import { WorkspacePicker, loadLastDir, saveLastDir } from "./components/WorkspacePicker";
+import { WorkspacePicker, chipCls, loadLastDir, saveLastDir } from "./components/WorkspacePicker";
 import { useExitMounted } from "./components/useExitMounted";
 import { MessageList } from "./components/MessageList";
 import { ApprovalPanel } from "./components/ApprovalPanel";
@@ -148,6 +148,44 @@ function pushErrorText(code: PushErrorCode): string {
 }
 
 const EMPTY_CONV: ConvState = { entries: [], pending: [], lastPreview: "", lastAt: 0, unread: 0 };
+
+// ---------------------------------------------------------------------------
+// v1.36 上次视图记忆（localStorage）：跨登录记住上次打开的机器+会话。恢复在
+// useReducer lazy initializer 完成（App 本地函数——protocol.initialState 保持
+// 纯函数：protocol.test.ts 在 node 环境跑，无 localStorage）；持久化在渲染后
+// effect。恢复值与既有 machines 帧校正天然配合：恢复的机器在线则保持（校正
+// 逻辑 no-op），不在线由既有逻辑切 online[0]（不新增校正分支）。
+// ---------------------------------------------------------------------------
+
+/** localStorage 键：上次视图（JSON {machine, conv}）。无敏感内容，登出不清除
+ *  （用户诉求即跨登录记住）。 */
+const LAST_VIEW_KEY = "imagent.lastView";
+
+/** 启动视图推导：initialState() 打底；lastView 合法（JSON 解析成功且
+ *  machine/conv 均为非空 string）才覆盖 currentMachine/currentConv。畸形
+ *  （坏 JSON/字段缺失/非 string）或存储不可用回落默认——恢复的机器不在线等
+ *  校正由既有 machines 帧逻辑承担。 */
+function initialView(): AppState {
+  const base = initialState();
+  try {
+    const raw = localStorage.getItem(LAST_VIEW_KEY);
+    if (!raw) {
+      return base;
+    }
+    const v = JSON.parse(raw) as { machine?: unknown; conv?: unknown };
+    if (
+      typeof v.machine === "string" &&
+      v.machine.length > 0 &&
+      typeof v.conv === "string" &&
+      v.conv.length > 0
+    ) {
+      return { ...base, currentMachine: v.machine, currentConv: v.conv };
+    }
+  } catch {
+    // 坏 JSON / localStorage 不可用（隐私模式等）→ 默认视图
+  }
+  return base;
+}
 
 /** v1.8 /model 命令发出后延时重拉 workspace_list 的间隔（ms）：留出网关
  *  处理命令 + backend.model() 热设落位的窗口，刷新面板「当前模型」高亮。 */
@@ -235,11 +273,14 @@ export default function App() {
   const [newConvName, setNewConvName] = useState("");
   /** 新会话绑定目录（undefined = 未选；打开弹层时预选 lastdir）。 */
   const [newConvDir, setNewConvDir] = useState<string | undefined>(undefined);
+  /** v1.36 新会话引擎选择（快照 backends 段；undefined = 默认，跟随网关默认
+   *  引擎不发命令；打开弹层时重置，同 openNewConv 清名/预选目录的模式）。 */
+  const [newConvBackend, setNewConvBackend] = useState<string | undefined>(undefined);
   const [dirPickerOpen, setDirPickerOpen] = useState(false);
   // v1.4 E2E：pin 表快照（设备管理指纹区）+ UI 态（TOFU 队列/告警/阻断/激活）
   const [e2ePins, setE2ePins] = useState<E2ePin[]>(() => loadPins());
   const [e2eUi, setE2eUi] = useState<E2eUi>(EMPTY_E2E_UI);
-  const [state, dispatch] = useReducer(appReducer, undefined, initialState);
+  const [state, dispatch] = useReducer(appReducer, undefined, initialView);
   const wsRef = useRef<WsManager | null>(null);
   // state 的渲染后镜像：WsManager 回调（getMachine）需要读最新 machine 维度，
   // 不能闭包进构建时的旧 state。
@@ -247,6 +288,20 @@ export default function App() {
   useEffect(() => {
     stateRef.current = state;
   });
+  // v1.36 上次视图持久化：机器/会话变化即写（try/catch 吞写失败——隐私模式
+  // 等）。登出不清除（无敏感内容；用户诉求即跨登录记住）。machines 帧校正、
+  // 深链 ?conv= 与 select_conv 的落点同经 currentMachine/currentConv，天然被
+  // 记录，无需各自埋点。
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        LAST_VIEW_KEY,
+        JSON.stringify({ machine: state.currentMachine, conv: state.currentConv }),
+      );
+    } catch {
+      // 写失败（隐私模式配额等）静默：下次启动回落默认视图
+    }
+  }, [state.currentMachine, state.currentConv]);
   // v1.10 通知订阅取当前 sessionToken 的镜像（enablePush getToken 回调 /
   // togglePush / logout 在异步与事件时刻取最新值）。
   const sessionRef = useRef(session);
@@ -805,8 +860,12 @@ export default function App() {
    *  （协议零改动），显示名由 reducer 从该会话首条消息派生（convTitle）。
    *  v1.6：选择了目录（≠default）→ 会话创建后发 setConvWorkdir(新 convId,
    *  path) 绑定并记录 lastdir 预选；未选/选 default 不发（新会话天然落网关
-   *  默认目录）。 */
-  const createConv = (name: string, dir: string | undefined): boolean => {
+   *  默认目录）。v1.36：选择了引擎（backend 非 undefined）→ 发
+   *  `/backend <引擎>` message 帧到新 convId（select_conv 已切，直发不走
+   *  sendMessage——闭包 currentConv 还是旧会话）+ 本地回显同落新会话，命令
+   *  文本与网关「✅ 已切换」回显一起落在新会话首屏（因果透明，与手打等价）；
+   *  undefined = 跟随网关默认引擎，不发命令。 */
+  const createConv = (name: string, dir: string | undefined, backend: string | undefined): boolean => {
     const convName = name.trim() || newAutoConvName();
     const ok = wsRef.current?.sendMessage(undefined, `/switch ${convName}`, outMachine()) ?? false;
     if (!ok) {
@@ -819,6 +878,17 @@ export default function App() {
       machine: state.currentMachine,
     });
     dispatch({ type: "select_conv", convId: toConvId(convName) });
+    if (backend !== undefined) {
+      const newConvId = toConvId(convName);
+      if (wsRef.current?.sendMessage(newConvId, `/backend ${backend}`, outMachine())) {
+        dispatch({
+          type: "send_echo",
+          convId: newConvId,
+          text: `/backend ${backend}`,
+          machine: state.currentMachine,
+        });
+      }
+    }
     if (dir !== undefined && dir !== wsSnapshot?.default) {
       wsRef.current?.setConvWorkdir(toConvId(convName), dir, outMachine());
       saveLastDir(state.currentMachine, dir);
@@ -827,10 +897,12 @@ export default function App() {
     return true;
   };
 
-  /** v1.6 打开新会话弹层：清名 + 预选 lastdir（该机器上次选择的目录）。 */
+  /** v1.6 打开新会话弹层：清名 + 预选 lastdir（该机器上次选择的目录）+ 重置
+   *  引擎选择（v1.36，回默认形态）。 */
   const openNewConv = () => {
     setNewConvName("");
     setNewConvDir(loadLastDir(state.currentMachine) ?? undefined);
+    setNewConvBackend(undefined);
     setNewConvOpen(true);
     setDrawerOpen(false);
   };
@@ -838,7 +910,7 @@ export default function App() {
   const submitNewConv = (e: FormEvent) => {
     e.preventDefault();
     // 名字留空合法（createConv 内落 s-xxxx 自动短 ID）
-    if (createConv(newConvName, newConvDir)) {
+    if (createConv(newConvName, newConvDir, newConvBackend)) {
       setNewConvOpen(false);
     }
   };
@@ -1363,6 +1435,39 @@ export default function App() {
                     onSave={saveWorkspace}
                   />
                 </div>
+              )}
+              {/* v1.36 引擎行：快照带 backends 段才渲染（缺席/畸形整段按缺席
+                  ——优雅降级，同目录区缺席不渲染的既有模式）。「默认」chip =
+                  跟随网关默认引擎（不发 /backend 命令），options 各引擎 chip
+                  选中即创建时显式 /backend 切换。 */}
+              {wsSnapshot?.backends && (
+                <section aria-label="引擎">
+                  <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-ghost">
+                    引擎
+                  </div>
+                  <div className="flex gap-2 overflow-x-auto pb-1">
+                    <button
+                      type="button"
+                      title={`网关默认引擎：${wsSnapshot.backends.current}`}
+                      aria-pressed={newConvBackend === undefined}
+                      onClick={() => setNewConvBackend(undefined)}
+                      className={chipCls(newConvBackend === undefined)}
+                    >
+                      默认（{wsSnapshot.backends.current}）
+                    </button>
+                    {wsSnapshot.backends.options.map((b) => (
+                      <button
+                        key={b}
+                        type="button"
+                        aria-pressed={newConvBackend === b}
+                        onClick={() => setNewConvBackend(b)}
+                        className={chipCls(newConvBackend === b)}
+                      >
+                        {b}
+                      </button>
+                    ))}
+                  </div>
+                </section>
               )}
               <div className="flex gap-2">
                 <button

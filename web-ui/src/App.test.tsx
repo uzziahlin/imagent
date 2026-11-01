@@ -1561,6 +1561,83 @@ describe("App 工作空间（v1.6）", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: "创建（/switch）" }));
     expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "message", text: "/switch legacy" }));
   });
+
+  // v1.36 引擎选择 chips：快照可选 backends 段（网关默认引擎 + 全注册表引擎名）
+
+  /** 快照含 backends 段的挂载（多机握手 + 推快照）。 */
+  function mountBackendsApp(): FakeWebSocket {
+    const fake = mountApp();
+    handshake(fake, ["home-mac"]);
+    act(() =>
+      fake.recv({
+        ...WORKSPACES,
+        backends: { current: "claude-code", options: ["default", "claude-code", "codex-app"] },
+      }),
+    );
+    return fake;
+  }
+
+  it("新会话弹层（v1.36）：快照含 backends → 引擎 chips 默认选中；选 codex-app 创建 → /backend 帧发新 convId + 回显落新会话", () => {
+    const fake = mountBackendsApp();
+    fireEvent.click(screen.getByRole("button", { name: "+ 新会话" }));
+    const dialog = screen.getByRole("dialog", { name: "新会话" });
+    const eng = within(within(dialog).getByLabelText("引擎"));
+    // 「默认（current）」chip 默认选中 + title 提示默认引擎名；options 各 chip 未选
+    const defChip = eng.getByRole("button", { name: "默认（claude-code）" });
+    expect(defChip.getAttribute("aria-pressed")).toBe("true");
+    expect(defChip.getAttribute("title")).toBe("网关默认引擎：claude-code");
+    const codexChip = eng.getByRole("button", { name: "codex-app" });
+    expect(codexChip.getAttribute("aria-pressed")).toBe("false");
+    expect(eng.getByRole("button", { name: "default" })).toBeTruthy();
+    // 选 codex-app → 高亮切换
+    fireEvent.click(codexChip);
+    expect(codexChip.getAttribute("aria-pressed")).toBe("true");
+    expect(defChip.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.change(within(dialog).getByLabelText("新会话名称"), { target: { value: "proj" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "创建（/switch）" }));
+    // /switch 走默认会话（无 convId）；/backend 显式发给新 convId
+    expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "message", text: "/switch proj", machine: "home-mac" }));
+    expect(fake.sent).toContain(
+      JSON.stringify({
+        v: 1,
+        type: "message",
+        convId: "web:proj",
+        text: "/backend codex-app",
+        machine: "home-mac",
+      }),
+    );
+    // 本地回显与新会话首屏同落（当前会话已切 web:proj，user 气泡渲染命令文本）
+    expect(screen.queryByRole("dialog", { name: "新会话" })).toBeNull();
+    expect(screen.getAllByText("/backend codex-app").length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("新会话弹层（v1.36）：选「默认」创建不发 /backend 帧（跟随网关默认引擎）；重开弹层重置回默认", () => {
+    const fake = mountBackendsApp();
+    fireEvent.click(screen.getByRole("button", { name: "+ 新会话" }));
+    let dialog = screen.getByRole("dialog", { name: "新会话" });
+    // 选了 codex-app 但不创建，关闭弹层
+    fireEvent.click(within(within(dialog).getByLabelText("引擎")).getByRole("button", { name: "codex-app" }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "取消" }));
+    // 重开：引擎选择重置回默认（同清名/预选目录的模式）
+    fireEvent.click(screen.getByRole("button", { name: "+ 新会话" }));
+    dialog = screen.getByRole("dialog", { name: "新会话" });
+    const eng = within(within(dialog).getByLabelText("引擎"));
+    expect(eng.getByRole("button", { name: "默认（claude-code）" }).getAttribute("aria-pressed")).toBe("true");
+    expect(eng.getByRole("button", { name: "codex-app" }).getAttribute("aria-pressed")).toBe("false");
+    // 默认态创建：不发任何 /backend 帧
+    fireEvent.change(within(dialog).getByLabelText("新会话名称"), { target: { value: "plain" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "创建（/switch）" }));
+    expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "message", text: "/switch plain", machine: "home-mac" }));
+    expect(fake.sent.filter((s) => (JSON.parse(s) as { text?: string }).text?.startsWith("/backend"))).toHaveLength(0);
+  });
+
+  it("新会话弹层（v1.36）：快照缺席 backends → 无引擎行（优雅降级），目录区照常", () => {
+    mountWorkspaceApp(); // WORKSPACES 无 backends 段
+    fireEvent.click(screen.getByRole("button", { name: "+ 新会话" }));
+    const dialog = screen.getByRole("dialog", { name: "新会话" });
+    expect(within(dialog).queryByLabelText("引擎")).toBeNull();
+    expect(within(dialog).getByLabelText("工作空间")).toBeTruthy();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2004,5 +2081,86 @@ describe("v1.10 ?conv= 深链定位", () => {
     handshake(fake, ["home-mac"]);
     const nav = screen.getByRole("navigation", { name: "会话列表" });
     expect(nav.querySelector('[aria-current="page"]')?.textContent).toContain("default");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.36 上次视图记忆（localStorage "imagent.lastView"）：跨登录记住上次打开
+// 的机器+会话。恢复在 useReducer lazy initializer（畸形回落默认）；持久化在
+// 渲染后 effect（currentMachine/currentConv 变化即写）。恢复的机器在线 →
+// 既有 machines 帧校正逻辑 no-op 保持；不在线 → 校正切 online[0]（不新增分支）。
+// ---------------------------------------------------------------------------
+
+describe("App 上次视图记忆（v1.36 lastView）", () => {
+  it("切机 + 创建会话后：lastView 记录正确的 {machine, conv}", () => {
+    const fake = mountApp();
+    handshake(fake, ["home-mac", "work-mac"]);
+    // 首帧 machines 校正：default 不在线 → 切 home-mac，视图随之落表
+    expect(localStorage.getItem("imagent.lastView")).toBe(
+      JSON.stringify({ machine: "home-mac", conv: "web:default" }),
+    );
+    // 切到 work-mac（reducer 回该机器默认会话）
+    fireEvent.click(screen.getByRole("button", { name: /work-mac/ }));
+    expect(localStorage.getItem("imagent.lastView")).toBe(
+      JSON.stringify({ machine: "work-mac", conv: "web:default" }),
+    );
+    // 创建会话 proj（无快照也可创建；select_conv 切当前 conv 后落表）
+    fireEvent.click(screen.getByRole("button", { name: "+ 新会话" }));
+    const dialog = screen.getByRole("dialog", { name: "新会话" });
+    fireEvent.change(within(dialog).getByLabelText("新会话名称"), { target: { value: "proj" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "创建（/switch）" }));
+    expect(localStorage.getItem("imagent.lastView")).toBe(
+      JSON.stringify({ machine: "work-mac", conv: "web:proj" }),
+    );
+  });
+
+  it("预置合法 lastView：挂载即恢复该机器+会话（机器在线 → 校正逻辑保持不切）", () => {
+    localStorage.setItem(
+      "imagent.lastView",
+      JSON.stringify({ machine: "work-mac", conv: "web:proj" }),
+    );
+    const fake = mountApp();
+    handshake(fake, ["home-mac", "work-mac"]);
+    // 恢复的机器在 machines 列表 → 不自动切 home-mac（无「已连接机器」引导 toast）
+    expect(screen.getByText("work-mac 在线")).toBeTruthy();
+    expect(screen.queryByText("已连接机器 home-mac")).toBeNull();
+    // 当前会话即恢复值（侧栏当前项高亮 web:proj）
+    const nav = screen.getByRole("navigation", { name: "会话列表" });
+    expect(nav.querySelector('[aria-current="page"]')?.textContent).toContain("proj");
+  });
+
+  it("恢复的机器不在线：machines 帧校正切 online[0]（既有逻辑，lastView 跟随落表）", () => {
+    localStorage.setItem(
+      "imagent.lastView",
+      JSON.stringify({ machine: "gone-mac", conv: "web:old" }),
+    );
+    const fake = mountApp();
+    handshake(fake, ["home-mac"]);
+    // 校正通知措辞随恢复来源机器变化（from=gone-mac ≠ default → 离线切换文案）
+    expect(screen.getByText("gone-mac 已离线，已切换到 home-mac")).toBeTruthy();
+    expect(localStorage.getItem("imagent.lastView")).toBe(
+      JSON.stringify({ machine: "home-mac", conv: "web:old" }),
+    );
+  });
+
+  it("预置畸形 lastView（坏 JSON/字段缺失/非 string/空串）：回落默认不炸，且被合法默认覆写", () => {
+    const bads = [
+      "{not-json",
+      JSON.stringify({ machine: "work-mac" }), // 缺 conv
+      JSON.stringify({ machine: 7, conv: "web:proj" }), // 非 string
+      JSON.stringify({ machine: "", conv: "web:proj" }), // 空串
+    ];
+    for (const bad of bads) {
+      localStorage.setItem("imagent.lastView", bad);
+      mountApp();
+      // 渲染不炸、当前会话回落 default
+      const nav = screen.getByRole("navigation", { name: "会话列表" });
+      expect(nav.querySelector('[aria-current="page"]')?.textContent).toContain("default");
+      // 挂载 effect 即把坏值覆写为合法默认（单机未收 machines 帧：default 形态）
+      expect(localStorage.getItem("imagent.lastView")).toBe(
+        JSON.stringify({ machine: "default", conv: "web:default" }),
+      );
+      cleanup();
+    }
   });
 });
