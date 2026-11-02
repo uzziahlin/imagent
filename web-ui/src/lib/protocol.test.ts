@@ -2028,3 +2028,37 @@ describe("workspaces.backends（v1.36 新会话引擎选择）", () => {
     expect(s3.workspaces["home-mac"].backends).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// v1.37 审批倒计时契约：approval_request 帧可选 timeoutSecs（秒，超时预算，
+// 非剩余时间；SPA 以本地收到时刻起倒数，缺席 = 旧网关不渲染倒计时）
+// ---------------------------------------------------------------------------
+
+const APPROVAL_REQ = (extra = "") =>
+  `{"v":1,"type":"approval_request","convId":"web:default","requestId":"r1","tool":"Bash","inputSummary":"ls"${extra}}`;
+
+describe("v1.37 approval_request timeoutSecs", () => {
+  it("带 timeoutSecs 解析保留；reducer pending 条目携带 timeoutSecs + 收到时刻 at", () => {
+    const f = parseFrame(APPROVAL_REQ(',"timeoutSecs":30'));
+    expect(f).toMatchObject({ type: "approval_request", timeoutSecs: 30 });
+    const s = run(initialState(), { type: "frame", frame: f as InboundFrame });
+    const p = convsOf(s)[DEFAULT_CONV].pending[0];
+    expect(p.timeoutSecs).toBe(30);
+    expect(typeof p.at).toBe("number"); // 倒计时锚点（毫秒，本地收到时刻）
+  });
+
+  it("timeoutSecs 缺席（旧网关）：解析合法、pending 不落 timeoutSecs 键", () => {
+    const f = parseFrame(APPROVAL_REQ());
+    expect(f).toMatchObject({ type: "approval_request" });
+    expect(f).not.toHaveProperty("timeoutSecs");
+    const s = run(initialState(), { type: "frame", frame: f as InboundFrame });
+    expect(convsOf(s)[DEFAULT_CONV].pending[0].timeoutSecs).toBeUndefined();
+  });
+
+  it("timeoutSecs 畸形（0/负数/字符串/null/非有限）→ null 拒帧", () => {
+    const bads = [',"timeoutSecs":0', ',"timeoutSecs":-5', ',"timeoutSecs":"30"', ',"timeoutSecs":null', ',"timeoutSecs":1e999'];
+    for (const bad of bads) {
+      expect(parseFrame(APPROVAL_REQ(bad))).toBeNull();
+    }
+  });
+});

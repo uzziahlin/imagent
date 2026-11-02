@@ -100,10 +100,13 @@ self.addEventListener("push", (event) => {
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   const convId = event.notification.data?.convId;
+  // v1.37：深链可携来源机器（推送载荷 machine 存在才用）——App 侧先切机器
+  // 再切会话；缺席保持既有行为（消息不带 machine 键，字节不变）
+  const machine = event.notification.data?.machine;
   event.waitUntil(
     (async () => {
       // 已有应用窗口：聚焦第一个并请 App 内定位会话（open-conv 消息）；
-      // 没有窗口则新开窗口，经 ?conv= 深链直达对应会话
+      // 没有窗口则新开窗口，经 ?conv=（+ ?machine=）深链直达对应会话
       const clientList = await self.clients.matchAll({
         type: "window",
         includeUncontrolled: true,
@@ -111,13 +114,18 @@ self.addEventListener("notificationclick", (event) => {
       for (const client of clientList) {
         await client.focus();
         if (convId) {
-          client.postMessage({ type: "open-conv", convId });
+          client.postMessage(
+            machine ? { type: "open-conv", convId, machine } : { type: "open-conv", convId },
+          );
         }
         return;
       }
-      const target = convId
+      let target = convId
         ? `/imagent/?conv=${encodeURIComponent(convId)}`
         : "/imagent/";
+      if (convId && machine) {
+        target += `&machine=${encodeURIComponent(machine)}`;
+      }
       await self.clients.openWindow(target);
     })(),
   );

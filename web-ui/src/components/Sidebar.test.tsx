@@ -61,3 +61,43 @@ describe("Sidebar 外观三段开关", () => {
     ).toBe("true");
   });
 });
+
+// ---------------------------------------------------------------------------
+// v1.37 会话项「运行中」状态：running 会话项标题行左侧渲染呼吸动画点
+// （emerald + animate-pulse，形态随状态条在线点；title/aria 提示「运行中」）
+// ---------------------------------------------------------------------------
+
+describe("Sidebar 会话项运行态点（v1.37）", () => {
+  const CONVS: ConvItem[] = [
+    { convId: "web:default", preview: "", at: 0, unread: 0 },
+    { convId: "web:busy", title: "跑任务", preview: "生成中…", at: 1, unread: 0, running: true },
+  ];
+
+  it("running 会话渲染运行点（落在该条目内）；非 running 条目不渲染", () => {
+    render(
+      <Sidebar
+        convs={CONVS}
+        current="web:default"
+        machineOnline={true}
+        machines={[]}
+        machinesKnown={false}
+        currentMachine="default"
+        pushEnabled={false}
+        pushAvailable={false}
+        pushBusy={false}
+        themePref="system"
+        onSelect={() => {}}
+        onSelectMachine={() => {}}
+        onCreate={() => {}}
+      />,
+    );
+    // 仅 busy（running: true）条目渲染运行点，且点落在该条目内部；
+    // 非 running 条目（default）不渲染——全树仅一处
+    const dot = screen.getByTitle("运行中");
+    const busyItem = screen.getByRole("button", { name: /跑任务/ });
+    expect(busyItem.contains(dot)).toBe(true);
+    expect(dot.getAttribute("aria-label")).toBe("运行中");
+    const defaultItem = screen.getByRole("button", { name: /default/ });
+    expect(defaultItem.contains(dot)).toBe(false);
+  });
+});

@@ -2164,3 +2164,272 @@ describe("App 上次视图记忆（v1.36 lastView）", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// v1.37 深链 ?machine=：推送通知深链切机器（先 select_machine 再 select_conv
+// ——select_conv 落在该机器会话空间才有效；machine 非法忽略仍按 conv 走；
+// 深链参数优先于 lastView 恢复）
+// ---------------------------------------------------------------------------
+
+describe("v1.37 深链 ?machine= 切机器", () => {
+  afterEach(() => {
+    // 恢复 URL，避免污染同文件后续/其它用例
+    window.history.replaceState(null, "", "/");
+  });
+
+  it("machine+conv 深链：切到该机器并定位会话（不被 machines 帧校正拉回 online[0]）", () => {
+    window.history.replaceState(null, "", "/?conv=web:proj&machine=work-mac");
+    const fake = mountApp();
+    handshake(fake, ["home-mac", "work-mac"]);
+    // 机器选中 work-mac（listbox 唯一 aria-selected）
+    const listbox = screen.getByRole("listbox", { name: "机器列表" });
+    expect(listbox.querySelector('[aria-selected="true"]')?.textContent).toContain("work-mac");
+    // 会话定位 web:proj（侧栏当前项高亮）
+    const nav = screen.getByRole("navigation", { name: "会话列表" });
+    expect(nav.querySelector('[aria-current="page"]')?.textContent).toContain("proj");
+  });
+
+  it("machine 非法：忽略 machine 仍按 conv 走（机器走 machines 帧自动校正 online[0]）", () => {
+    window.history.replaceState(null, "", "/?conv=web:abc&machine=bad%20mac");
+    const fake = mountApp();
+    handshake(fake, ["home-mac", "work-mac"]);
+    const listbox = screen.getByRole("listbox", { name: "机器列表" });
+    expect(listbox.querySelector('[aria-selected="true"]')?.textContent).toContain("home-mac");
+    const nav = screen.getByRole("navigation", { name: "会话列表" });
+    expect(nav.querySelector('[aria-current="page"]')?.textContent).toContain("abc");
+  });
+
+  it("只有 conv（既有行为回归）：机器保持自动校正的 online[0]", () => {
+    window.history.replaceState(null, "", "/?conv=web:abc");
+    const fake = mountApp();
+    handshake(fake, ["home-mac", "work-mac"]);
+    const listbox = screen.getByRole("listbox", { name: "机器列表" });
+    expect(listbox.querySelector('[aria-selected="true"]')?.textContent).toContain("home-mac");
+  });
+
+  it("SW open-conv 消息带 machine：同样先切机器再切会话", () => {
+    // jsdom 无 SW/PushManager/Notification：stub 出最小面使 pushSupported() 为真
+    const listeners = new Map<string, (ev: Event) => void>();
+    Object.defineProperty(navigator, "serviceWorker", {
+      configurable: true,
+      value: {
+        addEventListener: (t: string, l: (ev: Event) => void) => listeners.set(t, l),
+        removeEventListener: (t: string) => listeners.delete(t),
+        // register 恒败（本用例不测注册；initServiceWorker 内 catch 静默）
+        register: () => Promise.reject(new Error("本用例不触发注册")),
+      },
+    });
+    vi.stubGlobal("PushManager", class PushManager {});
+    vi.stubGlobal("Notification", class Notification {});
+    try {
+      const fake = mountApp();
+      handshake(fake, ["home-mac", "work-mac"]);
+      act(() => {
+        listeners.get("message")?.({
+          data: { type: "open-conv", convId: "web:proj", machine: "work-mac" },
+        } as MessageEvent);
+      });
+      const listbox = screen.getByRole("listbox", { name: "机器列表" });
+      expect(listbox.querySelector('[aria-selected="true"]')?.textContent).toContain("work-mac");
+      const nav = screen.getByRole("navigation", { name: "会话列表" });
+      expect(nav.querySelector('[aria-current="page"]')?.textContent).toContain("proj");
+    } finally {
+      delete (navigator as { serviceWorker?: unknown }).serviceWorker;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.37 系统未读徽标（navigator.setAppBadge/clearAppBadge）+ 标签页标题未读数：
+// 总数 = 全部机器全部 conv 的 unread 求和；feature-detect 缺席静默跳过
+// ---------------------------------------------------------------------------
+
+const BASE_TITLE = "imagent · Web 驾驶舱";
+
+describe("v1.37 系统未读徽标 + 标题", () => {
+  /** 注入 badge API spy（jsdom 默认无；configurable 便于 afterEach 清理）。 */
+  function injectBadge() {
+    const setAppBadge = vi.fn().mockResolvedValue(undefined);
+    const clearAppBadge = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "setAppBadge", { value: setAppBadge, configurable: true });
+    Object.defineProperty(navigator, "clearAppBadge", { value: clearAppBadge, configurable: true });
+    return { setAppBadge, clearAppBadge };
+  }
+
+  afterEach(() => {
+    delete (navigator as { setAppBadge?: unknown }).setAppBadge;
+    delete (navigator as { clearAppBadge?: unknown }).clearAppBadge;
+    document.title = BASE_TITLE;
+  });
+
+  it("无 badge API（jsdom）：静默跳过不炸；unread 变化驱动 title 计数/恢复", () => {
+    const fake = mountApp();
+    handshake(fake, ["home-mac"]);
+    expect(document.title).toBe(BASE_TITLE);
+    act(() => {
+      fake.recv({ v: 1, type: "text", convId: "web:work", text: "后台消息", machine: "home-mac" });
+    });
+    expect(document.title).toBe("(1) imagent · Web 驾驶舱");
+    // 切到该会话（select_conv 清未读）→ 标题恢复基准（手动名会话显示名恒剥前缀 work）
+    fireEvent.click(screen.getByRole("button", { name: /^work/ }));
+    expect(document.title).toBe(BASE_TITLE);
+  });
+
+  it("badge API 存在：unread>0 setAppBadge(n) 递增、清零 clearAppBadge；登出再清一次", async () => {
+    const spy = injectBadge();
+    const fake = mountApp();
+    handshake(fake, ["home-mac"]);
+    act(() => {
+      fake.recv({ v: 1, type: "text", convId: "web:work", text: "后台消息", machine: "home-mac" });
+    });
+    expect(spy.setAppBadge).toHaveBeenCalledWith(1);
+    expect(document.title).toBe("(1) imagent · Web 驾驶舱");
+    act(() => {
+      fake.recv({ v: 1, type: "text", convId: "web:work", text: "再来一条", machine: "home-mac" });
+    });
+    expect(spy.setAppBadge).toHaveBeenLastCalledWith(2);
+    // 切会话清未读 → clearAppBadge + 标题基准（挂载时 unread=0 已调过一次，
+    // 用增量断言）
+    const clearsBefore = spy.clearAppBadge.mock.calls.length;
+    fireEvent.click(screen.getByRole("button", { name: /^work/ }));
+    expect(spy.clearAppBadge.mock.calls.length).toBe(clearsBefore + 1);
+    expect(document.title).toBe(BASE_TITLE);
+    // 登出：登出流程再挂一次 clearAppBadge（幂等）+ 标题复位
+    fireEvent.click(screen.getByRole("button", { name: "退出" }));
+    expect(spy.clearAppBadge.mock.calls.length).toBe(clearsBefore + 2);
+    expect(document.title).toBe(BASE_TITLE);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.37 侧栏「运行中」状态：card streaming 条目 → 会话项呼吸点；终态后消失；
+// pending 审批不算运行态
+// ---------------------------------------------------------------------------
+
+describe("v1.37 侧栏运行中状态", () => {
+  const CARD = (opts: { messageId: string; terminal: string; convId?: string }) => ({
+    v: 1,
+    type: "card",
+    convId: opts.convId ?? "web:default",
+    messageId: opts.messageId,
+    machine: "home-mac",
+    state: opts.terminal === "running" ? "streaming" : "done",
+    card: {
+      text: `任务 ${opts.messageId}`,
+      tool_calls: [],
+      thoughts: [],
+      todos: [],
+      phase: "outputting",
+      run_secs: 1,
+      terminal: opts.terminal,
+    },
+  });
+
+  it("card streaming → 该会话项渲染运行点；同卡终态补丁后消失", () => {
+    const fake = mountApp();
+    handshake(fake, ["home-mac"]);
+    act(() => {
+      fake.recv(CARD({ messageId: "m1", terminal: "running" }));
+    });
+    expect(screen.getAllByTitle("运行中").length).toBe(1);
+    act(() => {
+      fake.recv(CARD({ messageId: "m1", terminal: "done" }));
+    });
+    expect(screen.queryByTitle("运行中")).toBeNull();
+  });
+
+  it("非当前会话 streaming 点亮；pending 审批不算运行态", () => {
+    const fake = mountApp();
+    handshake(fake, ["home-mac"]);
+    act(() => {
+      fake.recv(CARD({ messageId: "m2", terminal: "running", convId: "web:work" }));
+      fake.recv({
+        v: 1,
+        type: "approval_request",
+        convId: "web:default",
+        requestId: "r1",
+        tool: "Bash",
+        inputSummary: "ls",
+        machine: "home-mac",
+      });
+    });
+    // 仅 web:work 一处运行点；审批弹层渲染但不产生运行点
+    expect(screen.getAllByTitle("运行中").length).toBe(1);
+    expect(screen.getByRole("alertdialog", { name: "审批请求 Bash" })).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.37 审批卡倒计时（timeoutSecs，本地 1s 倒数、0 封底）+ 「前往会话」跳转
+// （先 select_machine 再 select_conv，弹层不关闭）
+// ---------------------------------------------------------------------------
+
+describe("v1.37 审批倒计时 + 前往会话", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const APPROVAL = (extra: Record<string, unknown> = {}) => ({
+    v: 1,
+    type: "approval_request",
+    convId: "web:default",
+    requestId: "r1",
+    tool: "Bash",
+    inputSummary: "rm -rf /tmp/x",
+    machine: "home-mac",
+    ...extra,
+  });
+
+  it("带 timeoutSecs：渲染剩余秒数随时间递减；到 0 显「即将超时」不再负数", () => {
+    vi.useFakeTimers();
+    const fake = mountApp();
+    handshake(fake, ["home-mac"]);
+    act(() => {
+      fake.recv(APPROVAL({ timeoutSecs: 10 }));
+    });
+    expect(screen.getByText("10s")).toBeTruthy();
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
+    expect(screen.getByText("9s")).toBeTruthy();
+    act(() => {
+      vi.advanceTimersByTime(9_000);
+    });
+    expect(screen.getByText("即将超时")).toBeTruthy();
+    // 继续推进封底不变（不出现负数/其它形态）
+    act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
+    expect(screen.getByText("即将超时")).toBeTruthy();
+    expect(screen.queryByText(/^-/)).toBeNull();
+  });
+
+  it("timeoutSecs 缺席（旧网关）：不渲染倒计时（降级为既有形态）", () => {
+    const fake = mountApp();
+    handshake(fake, ["home-mac"]);
+    act(() => {
+      fake.recv(APPROVAL());
+    });
+    expect(screen.getByRole("alertdialog", { name: "审批请求 Bash" })).toBeTruthy();
+    expect(screen.queryByText(/^\d+s$/)).toBeNull();
+    expect(screen.queryByText("即将超时")).toBeNull();
+  });
+
+  it("「前往会话」：切到审批来源机器+会话；审批条保留（仅视口切换）", () => {
+    const fake = mountApp();
+    handshake(fake, ["home-mac", "work-mac"]);
+    act(() => {
+      fake.recv({ ...APPROVAL(), convId: "web:proj", machine: "work-mac", requestId: "r9" });
+    });
+    // 当前在 home-mac（machines 帧校正），审批来自 work-mac
+    expect(screen.getByText("已连接机器 home-mac")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "前往会话" }));
+    // 视口切到 work-mac + web:proj（侧栏高亮）
+    const listbox = screen.getByRole("listbox", { name: "机器列表" });
+    expect(listbox.querySelector('[aria-selected="true"]')?.textContent).toContain("work-mac");
+    const nav = screen.getByRole("navigation", { name: "会话列表" });
+    expect(nav.querySelector('[aria-current="page"]')?.textContent).toContain("proj");
+    // 审批条仍在（不关闭——回来还能处理）
+    expect(screen.getByRole("alertdialog", { name: "审批请求 Bash" })).toBeTruthy();
+  });
+});

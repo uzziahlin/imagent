@@ -57,6 +57,10 @@
 //   时间），mergeHistory 按 (text, at) 精确匹配去重重放条目；workspaces 快照
 //   可选 backends{current, options}（网关默认引擎 + 全注册表引擎名，新会话
 //   弹窗引擎 chips，畸形整段丢弃按缺席）。
+// - v1.37 审批倒计时：approval_request 帧新增可选 timeoutSecs（number，秒——
+//   该次审批的超时预算，非剩余时间；网关批并行实现，缺席 = 旧网关不渲染
+//   倒计时）。SPA 以本地收到时刻（PendingApproval.at）起倒数，超时自动拒绝
+//   由网关兜底，前端纯提示。
 
 export const PROTOCOL_VERSION = 1;
 
@@ -523,6 +527,9 @@ export type ApprovalRequestFrame = {
   tool: string;
   inputSummary: string;
   machine?: string;
+  /** v1.37 该次审批的超时预算（秒，非剩余时间）：SPA 以本地收到时刻起倒数。
+   *  缺席 = 旧网关，条目不渲染倒计时。 */
+  timeoutSecs?: number;
 };
 
 export type ResolvedDecision = ApprovalDecision | "cancelled";
@@ -752,6 +759,12 @@ const machineOk = (o: Record<string, unknown>): boolean =>
 const atOk = (o: Record<string, unknown>): boolean =>
   o.at === undefined || (typeof o.at === "number" && Number.isInteger(o.at) && o.at >= 0);
 
+/** v1.37 approval_request 可选 timeoutSecs（超时预算秒数）：缺席放行（旧网关）；
+ *  存在时须为有限正数（秒可为非整数，宽容不设整型约束）。 */
+const timeoutSecsOk = (o: Record<string, unknown>): boolean =>
+  o.timeoutSecs === undefined ||
+  (typeof o.timeoutSecs === "number" && Number.isFinite(o.timeoutSecs) && o.timeoutSecs > 0);
+
 const cardShapeOk = (o: Record<string, unknown>): boolean =>
   isStr(o, "convId") &&
   isStr(o, "messageId") &&
@@ -922,7 +935,12 @@ const INBOUND_CHECKS: Record<string, FieldCheck> = {
   card: (o) => cardShapeOk(o) && machineOk(o),
   card_patch: (o) => cardShapeOk(o) && machineOk(o),
   approval_request: (o) =>
-    isStr(o, "convId") && isStr(o, "requestId") && isStr(o, "tool") && isStr(o, "inputSummary") && machineOk(o),
+    isStr(o, "convId") &&
+    isStr(o, "requestId") &&
+    isStr(o, "tool") &&
+    isStr(o, "inputSummary") &&
+    machineOk(o) &&
+    timeoutSecsOk(o),
   approval_resolved: (o) =>
     isStr(o, "convId") &&
     isStr(o, "requestId") &&
@@ -1006,13 +1024,17 @@ export type StreamEntry =
 export type CardEntry = Extract<StreamEntry, { kind: "card" }>;
 
 /** pending 审批（弹层渲染；requestId 为幂等 key）。machine = 审批来源机器，
- *  回传 approval_response 时必须带同一 machine（relay 按机器路由）。 */
+ *  回传 approval_response 时必须带同一 machine（relay 按机器路由）。
+ *  v1.37：at = 本地收到时刻（ms，倒计时锚点）；timeoutSecs = 帧携带的超时
+ *  预算（秒，缺席 = 旧网关不渲染倒计时）。 */
 export type PendingApproval = {
   machine: string;
   convId: string;
   requestId: string;
   tool: string;
   inputSummary: string;
+  at: number;
+  timeoutSecs?: number;
 };
 
 export type ConvState = {
@@ -1381,6 +1403,9 @@ function addApproval(state: AppState, machine: string, frame: ApprovalRequestFra
                 requestId: frame.requestId,
                 tool: frame.tool,
                 inputSummary: frame.inputSummary,
+                // 收到时刻即倒计时锚点（at + timeoutSecs = 截止）；缺席不落键
+                at: Date.now(),
+                ...(frame.timeoutSecs !== undefined ? { timeoutSecs: frame.timeoutSecs } : {}),
               },
             ],
           },

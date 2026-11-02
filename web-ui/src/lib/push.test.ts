@@ -12,6 +12,7 @@ import {
   pushSupported,
   urlB64ToUint8Array,
   validConvParam,
+  validMachineParam,
   enablePush,
   disablePush,
 } from "./push";
@@ -466,5 +467,63 @@ describe("validConvParam", () => {
     expect(validConvParam("web:")).toBeNull();
     expect(validConvParam("web:a b")).toBeNull();
     expect(validConvParam(`web:${"x".repeat(121)}`)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.37 ?machine= 深链参数校验 + open-conv 消息 machine 透传
+// ---------------------------------------------------------------------------
+
+describe("validMachineParam", () => {
+  it("合法机器名（1..=32 位 [A-Za-z0-9_-]，relay 同规）原样返回", () => {
+    expect(validMachineParam("home-mac")).toBe("home-mac");
+    expect(validMachineParam("Work_Mac1")).toBe("Work_Mac1");
+    expect(validMachineParam("a".repeat(32))).toBe("a".repeat(32));
+  });
+
+  it("非法拒绝：null / 空串 / 超长 / 空格 / 中文 / 点号", () => {
+    expect(validMachineParam(null)).toBeNull();
+    expect(validMachineParam("")).toBeNull();
+    expect(validMachineParam("a".repeat(33))).toBeNull();
+    expect(validMachineParam("bad mac")).toBeNull();
+    expect(validMachineParam("机器一")).toBeNull();
+    expect(validMachineParam("home.mac")).toBeNull();
+  });
+});
+
+describe("open-conv 消息 machine 透传（v1.37）", () => {
+  type Listener = (event: Event) => void;
+
+  function makeEmitter() {
+    const listeners = new Map<string, Set<Listener>>();
+    return {
+      addEventListener: (type: string, l: Listener) => {
+        const set = listeners.get(type) ?? new Set<Listener>();
+        set.add(l);
+        listeners.set(type, set);
+      },
+      removeEventListener: (type: string, l: Listener) => {
+        listeners.get(type)?.delete(l);
+      },
+      emit: (data: unknown) => {
+        for (const l of listeners.get("message") ?? []) {
+          l({ data } as unknown as Event);
+        }
+      },
+    };
+  }
+
+  it("machine 随消息透传给回调；machine 非字符串/空串/缺席按未携带（undefined）", () => {
+    const emitter = makeEmitter();
+    const seen: { convId: string; machine?: string }[] = [];
+    listenServiceWorkerMessages(emitter, (c, m) => seen.push({ convId: c, machine: m }));
+
+    emitter.emit({ type: "open-conv", convId: "web:abc", machine: "work-mac" });
+    emitter.emit({ type: "open-conv", convId: "web:abc", machine: "" });
+    emitter.emit({ type: "open-conv", convId: "web:abc", machine: 7 });
+    emitter.emit({ type: "open-conv", convId: "web:abc" });
+
+    expect(seen.map((s) => s.machine)).toEqual(["work-mac", undefined, undefined, undefined]);
+    expect(seen.map((s) => s.convId)).toEqual(["web:abc", "web:abc", "web:abc", "web:abc"]);
   });
 });

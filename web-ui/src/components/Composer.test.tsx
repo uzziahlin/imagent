@@ -265,3 +265,55 @@ describe("Composer 图片附件（v1.7）", () => {
     expect(ta.value).toBe("");
   });
 });
+
+// ---------------------------------------------------------------------------
+// v1.37 粘贴图片直进上行管道：剪贴板含图片文件 → preventDefault + 复用既有
+// 选图压缩管道（pickImage）；非图片/纯文本保持默认粘贴。多文件取第一张
+// （既有 media 单附件能力边界）。jsdom 无 DataTransfer 构造，经 fireEvent
+// eventInit 透传 clipboardData 形状（React 合成事件从 nativeEvent 读取）。
+// ---------------------------------------------------------------------------
+
+describe("Composer 粘贴图片（v1.37）", () => {
+  it("粘贴图片文件 → preventDefault + 进既有压缩管道（预览出现）", async () => {
+    mount();
+    const file = new File(["p"], "clip.png", { type: "image/png" });
+    const pasted = fireEvent.paste(screen.getByLabelText("消息输入框"), {
+      clipboardData: { files: [file] },
+    });
+    expect(pasted).toBe(false); // preventDefault 已调用（不落默认粘贴）
+    expect(compressSpy).toHaveBeenCalledTimes(1);
+    expect(compressSpy).toHaveBeenCalledWith(file);
+    // 预览出现（压缩异步）——文件名走既有 jpgName 换后缀 fake 载荷
+    await waitFor(() => expect(screen.getByLabelText("移除图片")).toBeTruthy());
+  });
+
+  it("多文件粘贴取第一张（既有管道单附件边界）", () => {
+    mount();
+    const a = new File(["1"], "a.png", { type: "image/png" });
+    const b = new File(["2"], "b.png", { type: "image/png" });
+    fireEvent.paste(screen.getByLabelText("消息输入框"), { clipboardData: { files: [a, b] } });
+    expect(compressSpy).toHaveBeenCalledTimes(1);
+    expect(compressSpy).toHaveBeenCalledWith(a);
+  });
+
+  it("纯文本/非图片文件粘贴不受影响：不 preventDefault、不进管道", () => {
+    const { ta } = mount();
+    expect(
+      fireEvent.paste(ta, { clipboardData: { files: [] } }),
+    ).toBe(true); // 未拦截（默认粘贴行为保留）
+    expect(
+      fireEvent.paste(ta, {
+        clipboardData: { files: [new File(["x"], "a.txt", { type: "text/plain" })] },
+      }),
+    ).toBe(true);
+    expect(compressSpy).not.toHaveBeenCalled();
+    expect(screen.queryByLabelText("移除图片")).toBeNull();
+    expect(ta.value).toBe("");
+  });
+
+  it("剪贴板缺席（clipboardData null）不炸", () => {
+    mount();
+    expect(fireEvent.paste(screen.getByLabelText("消息输入框"), {})).toBe(true);
+    expect(compressSpy).not.toHaveBeenCalled();
+  });
+});

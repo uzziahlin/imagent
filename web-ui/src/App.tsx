@@ -62,6 +62,7 @@ import {
   initServiceWorker,
   pushSupported,
   validConvParam,
+  validMachineParam,
   type PushErrorCode,
 } from "./lib/push";
 import { applyTheme, loadThemePref, saveThemePref, type ThemePref } from "./lib/theme";
@@ -148,6 +149,9 @@ function pushErrorText(code: PushErrorCode): string {
 }
 
 const EMPTY_CONV: ConvState = { entries: [], pending: [], lastPreview: "", lastAt: 0, unread: 0 };
+
+/** 页面标题基准（index.html title 原文；未读徽标 effect 恢复此值，改标题两处同改）。 */
+const BASE_TITLE = "imagent · Web 驾驶舱";
 
 // ---------------------------------------------------------------------------
 // v1.36 上次视图记忆（localStorage）：跨登录记住上次打开的机器+会话。恢复在
@@ -641,14 +645,28 @@ export default function App() {
   // v1.10 PWA 接线（挂载一次）：SW 注册（仅 https/localhost，含「新版本可用」
   // 更新提示与通知点击的 open-conv 消息）+ ?conv= 深链会话定位（SW 无窗口时
   // openWindow 到 /imagent/?conv=...，挂载读参定位；完整 conv 形态校验后才切）。
+  // v1.37：深链可携 ?machine=（推送载荷的来源机器）——先 select_machine 再
+  // select_conv（reducer 的 select_conv 落在当前机器会话空间，先切机器才有效；
+  // 连续 dispatch 按序过 reducer）；machine 非法忽略仍按 conv 走；深链参数
+  // 优先于 lastView 恢复（显式用户意图）。SW open-conv 消息同序透传 machine。
   useEffect(() => {
     const cleanupSw = initServiceWorker({
       onUpdateAvailable: () =>
         setLocalToast({ text: "新版本可用，刷新页面生效", tone: "info" }),
-      onOpenConv: (convId) => dispatch({ type: "select_conv", convId }),
+      onOpenConv: (convId, machine) => {
+        if (machine) {
+          dispatch({ type: "select_machine", machine });
+        }
+        dispatch({ type: "select_conv", convId });
+      },
     });
-    const conv = validConvParam(new URLSearchParams(window.location.search).get("conv"));
+    const params = new URLSearchParams(window.location.search);
+    const machine = validMachineParam(params.get("machine"));
+    const conv = validConvParam(params.get("conv"));
     if (conv) {
+      if (machine) {
+        dispatch({ type: "select_machine", machine });
+      }
       dispatch({ type: "select_conv", convId: conv });
     }
     return cleanupSw;
@@ -735,6 +753,11 @@ export default function App() {
       preview: space.convs[c]?.lastPreview ?? "",
       at: space.convs[c]?.lastAt ?? 0,
       unread: space.convs[c]?.unread ?? 0,
+      // v1.37 运行态：该 conv entries 存在流式中的卡片（pending 审批不算；
+      // 只扫本 conv，MAX_STREAM_ENTRIES 200 条护栏内 O(n) 可接受）
+      running:
+        space.convs[c]?.entries.some((e) => e.kind === "card" && e.state === "streaming") ??
+        false,
     }));
     if (!items.some((i) => i.convId === currentConv)) {
       items.unshift({
@@ -743,6 +766,7 @@ export default function App() {
         preview: "",
         at: 0,
         unread: 0,
+        running: false,
       });
     }
     return items;
@@ -768,6 +792,37 @@ export default function App() {
     }
     return out;
   }, [state.machines, state.spaces]);
+
+  // ---------------------------------------------------------------------------
+  // v1.37 系统未读徽标 + 标签页标题未读数：未读总数 = 全部机器全部 conv 的
+  // unread 求和（state.spaces 遍历派生）。总数变化时 navigator.setAppBadge(n)
+  // / clearAppBadge()（iOS 16.4+ 等环境才有，全程 feature-detect + try/catch，
+  // 缺席/失败静默跳过），并同步 document.title（n>0 前缀计数，n=0 恢复基准）。
+  // ---------------------------------------------------------------------------
+  const totalUnread = useMemo(() => {
+    let n = 0;
+    for (const sp of Object.values(state.spaces)) {
+      for (const c of Object.values(sp.convs)) {
+        n += c.unread;
+      }
+    }
+    return n;
+  }, [state.spaces]);
+
+  useEffect(() => {
+    try {
+      if (totalUnread > 0) {
+        if (typeof navigator.setAppBadge === "function") {
+          void navigator.setAppBadge(totalUnread);
+        }
+      } else if (typeof navigator.clearAppBadge === "function") {
+        void navigator.clearAppBadge();
+      }
+    } catch {
+      // 徽标调用失败（权限/环境异常）：静默降级，不影响页内未读显示
+    }
+    document.title = totalUnread > 0 ? `(${totalUnread}) ${BASE_TITLE}` : BASE_TITLE;
+  }, [totalUnread]);
 
   // 抽屉内容延迟卸载：退出动画播完后真正离开 DOM——避免桌面侧栏与抽屉内
   // 两个 Sidebar 常驻导致重复的可访问名/可聚焦元素（hook 须在 auth 早退前）
@@ -957,7 +1012,8 @@ export default function App() {
   /** 登出：清全部本地凭证（会话 + 遗留 USER_TOKEN + 内存态 adminToken）与
    *  本地消息缓存（IndexedDB，用户显式退出即清本机痕迹；普通刷新不清），
    *  回登录页。服务端吊销走管理面板的「吊销并退出」（revokeDevice）。
-   *  v1.10：一并通知退订（best-effort，不阻塞登出）+ 清开关标志。 */
+   *  v1.10：一并通知退订（best-effort，不阻塞登出）+ 清开关标志。
+   *  v1.37：清系统未读徽标与标签页标题（badge API 缺席静默跳过）。 */
   const logout = () => {
     if (session?.token && localStorage.getItem(PUSH_ENABLED_KEY) === "1") {
       void disablePush(session.token).catch(() => {});
@@ -969,6 +1025,14 @@ export default function App() {
     clearAdminToken();
     void historyStore.clear();
     syncSavedRefs();
+    try {
+      if (typeof navigator.clearAppBadge === "function") {
+        void navigator.clearAppBadge();
+      }
+    } catch {
+      // 静默（同 badge effect 降级语义）
+    }
+    document.title = BASE_TITLE;
     setAdminActive(false);
     setAdminOpen(false);
     setSession(null);
@@ -1367,6 +1431,13 @@ export default function App() {
               convTitle(spaceOf(state, machine).convs[convId], convId)
             }
             onRespond={respondApproval}
+            onJump={(p) => {
+              // v1.37 「前往会话」：先切机器再切会话（同深链的顺序依赖——
+              // select_conv 落在当前机器会话空间才有效；同机器 no-op）。
+              // 审批弹层不关闭：仅视口切换，回来审批条仍在。
+              dispatch({ type: "select_machine", machine: p.machine });
+              dispatch({ type: "select_conv", convId: p.convId });
+            }}
           />
           <MessageList
             entries={conv.entries}

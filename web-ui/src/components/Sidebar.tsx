@@ -20,6 +20,9 @@ export type ConvItem = {
   at: number;
   /** 未读条数（0 = 无徽标）。 */
   unread?: number;
+  /** v1.37 运行态（App 派生：该会话存在流式中的卡片）：标题行左侧渲染呼吸
+   *  动画小圆点（风格随状态条在线点）。 */
+  running?: boolean;
 };
 
 /** 会话过期横幅阈值：剩余不足 3 天开始提示。 */
@@ -223,6 +226,15 @@ export function Sidebar({
               }
             >
               <span className="flex items-center gap-2">
+                {/* v1.37 运行态呼吸点（emerald + animate-pulse，形态随状态条
+                    在线点；占位不挤压标题——flex 收缩由 min-w-0 承担） */}
+                {item.running && (
+                  <span
+                    className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-emerald-400"
+                    title="运行中"
+                    aria-label="运行中"
+                  />
+                )}
                 <span className="min-w-0 flex-1 truncate text-sm font-medium">
                   {item.title || convDisplayName(item.convId)}
                 </span>

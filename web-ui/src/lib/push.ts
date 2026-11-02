@@ -8,6 +8,7 @@
 // 依赖注入（fetchImpl / base）可替换；Notification 与 navigator.serviceWorker
 // 由测试以全局 stub 注入（参照 webauthn.test 的 stub 风格）。
 
+import { machineNameValid } from "./protocol";
 import { fromB64Url } from "./webauthn";
 
 /** SW 脚本地址（public/sw.js，base /imagent/ 固定部署路径）。 */
@@ -56,6 +57,13 @@ export function validConvParam(conv: string | null): string | null {
   return conv !== null && /^(?:web|local):\S{1,120}$/.test(conv) ? conv : null;
 }
 
+/** ?machine= 深链参数校验（v1.37）：机器名规则与 relay 一致（1..=32 位
+ *  [A-Za-z0-9_-]，protocol.MACHINE_NAME_RE 同规）。合法返回原值，否则 null
+ *  （调用方忽略 machine 仍按 conv 深链走）。 */
+export function validMachineParam(machine: string | null): string | null {
+  return machine !== null && machineNameValid(machine) ? machine : null;
+}
+
 // ---------------------------------------------------------------------------
 // 能力检测
 // ---------------------------------------------------------------------------
@@ -94,14 +102,16 @@ interface SwMessageContainer {
 }
 
 /** 监听 SW 的 open-conv 消息（notificationclick 聚焦已有窗口时 postMessage
- *  → App 内定位会话）。非 open-conv / 空 convId 忽略。返回取消监听 cleanup。 */
+ *  → App 内定位会话）。非 open-conv / 空 convId 忽略。v1.37：消息可携带
+ *  machine（推送来源机器，App 先切机器再切会话）；machine 缺席/非字符串按
+ *  未携带处理。返回取消监听 cleanup。 */
 export function listenServiceWorkerMessages(
   container: SwMessageContainer,
-  onOpenConv: (convId: string) => void,
+  onOpenConv: (convId: string, machine?: string) => void,
 ): () => void {
   const handler = (event: Event): void => {
     const data = (event as MessageEvent).data as
-      | { type?: unknown; convId?: unknown }
+      | { type?: unknown; convId?: unknown; machine?: unknown }
       | undefined;
     if (
       data &&
@@ -110,7 +120,10 @@ export function listenServiceWorkerMessages(
       typeof data.convId === "string" &&
       data.convId !== ""
     ) {
-      onOpenConv(data.convId);
+      onOpenConv(
+        data.convId,
+        typeof data.machine === "string" && data.machine !== "" ? data.machine : undefined,
+      );
     }
   };
   container.addEventListener("message", handler);
@@ -130,14 +143,14 @@ export function listenServiceWorkerMessages(
 export function initServiceWorker(
   handlers: {
     onUpdateAvailable?: () => void;
-    onOpenConv?: (convId: string) => void;
+    onOpenConv?: (convId: string, machine?: string) => void;
   } = {},
 ): () => void {
   if (!pushSupported() || !secureContextOk()) {
     return () => {};
   }
-  const cleanup = listenServiceWorkerMessages(navigator.serviceWorker, (convId) =>
-    handlers.onOpenConv?.(convId),
+  const cleanup = listenServiceWorkerMessages(navigator.serviceWorker, (convId, machine) =>
+    handlers.onOpenConv?.(convId, machine),
   );
   void navigator.serviceWorker
     .register(SW_URL)

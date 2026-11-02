@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useLayoutEffect, useRef, useState, type ClipboardEvent, type KeyboardEvent } from "react";
 import type { ConnStatus } from "../lib/ws";
 import type { MediaPayload, ModelsInfo } from "../lib/protocol";
 import { compressImage } from "../lib/imageCompress";
@@ -148,6 +148,20 @@ export function Composer({
       .catch(() => setAttachError("图片处理失败，换一张试试"));
   };
 
+  /** v1.37 粘贴图片直进上行管道：剪贴板含图片文件时 preventDefault 并送入
+   *  既有选图管道（pickImage：压缩→预览→随帧上行，不复制逻辑）；非图片
+   *  文件/纯文本忽略（保持默认粘贴行为）。既有管道为单附件（media 单值），
+   *  多文件粘贴取第一张（跟随现有能力边界）。 */
+  const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
+    const files = Array.from(e.clipboardData?.files ?? []);
+    const image = files.find((f) => f.type.startsWith("image/"));
+    if (!image) {
+      return;
+    }
+    e.preventDefault();
+    pickImage(image);
+  };
+
   return (
     <div
       className="border-t border-line bg-panel px-3 pt-2 backdrop-blur"
@@ -246,6 +260,7 @@ export function Composer({
               }
             }}
             onKeyDown={onKeyDown}
+            onPaste={onPaste}
             rows={1}
             placeholder={e2eBlocked ? E2E_BLOCKED_PLACEHOLDER : PLACEHOLDER[status]}
             disabled={disabled}
