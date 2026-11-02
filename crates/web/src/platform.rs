@@ -963,6 +963,10 @@ pub struct WebPlatform {
     card_seq: Arc<AtomicU64>,
     /// pending 审批记录（cancel_all 收敛用）。
     pending_asks: Arc<Mutex<PendingAsks>>,
+    /// v1.37：审批超时预算（秒，= config `permission_ask_timeout_secs`，main
+    /// 装配处注入）——approval_request 帧的 timeoutSecs 数据源（SPA 倒计时；
+    /// web 不经 dispatcher，无法从运行时取该值，构造期注入）。
+    approval_timeout_secs: u64,
     /// 停机信号（Drop 时 cancel，client / sync responder 连动退出）。
     shutdown: CancellationToken,
 }
@@ -982,12 +986,14 @@ impl WebPlatform {
     /// backend clone——快照 models.current 取 backend.model()；测试传 mock）；
     /// `backends` 为 v1.36 引擎名单（default 在首位 + extras 保序去重的纯
     /// 名单，main 装配处随 ModelsContext 一并注入——快照 backends 段数据源，
-    /// 空名单整段缺席；测试传 `Vec::new()`）。
+    /// 空名单整段缺席；测试传 `Vec::new()`）；`approval_timeout_secs` 为
+    /// v1.37 审批超时预算（秒，= config `permission_ask_timeout_secs`——
+    /// approval_request 帧 timeoutSecs 数据源）。
     ///
     /// E2E 密钥（v1.4）锚定 `<imagent_home>/web-e2e-key`（main 不感知——
     /// E2E 是内容保密增强，装配失败不阻断网关启动，仅降级明文 + warn；
     /// 测试经 [`Self::new_with_e2e`] 注入临时路径）。
-    #[allow(clippy::too_many_arguments)] // 参数已达 8——v1.36 注入 backends（先例 new_with_e2e）
+    #[allow(clippy::too_many_arguments)] // 参数已达 9——v1.37 注入审批超时（先例 new_with_e2e）
     pub fn new(
         relay_url: String,
         credential: GatewayCredential,
@@ -997,6 +1003,7 @@ impl WebPlatform {
         default_workdir: PathBuf,
         models: ModelsContext,
         backends: Vec<String>,
+        approval_timeout_secs: u64,
     ) -> Self {
         let e2e_key = imagent_core::paths::imagent_home().join("web-e2e-key");
         Self::new_with_e2e(
@@ -1009,12 +1016,13 @@ impl WebPlatform {
             default_workdir,
             models,
             backends,
+            approval_timeout_secs,
         )
     }
 
     /// [`Self::new`] 的全参形态（E2E 密钥路径可注入——集成测试用临时目录，
     /// 不落真实 `~/.imagent`）。
-    #[allow(clippy::too_many_arguments)] // 参数已达 9——v1.36 注入 backends（历史演化提醒）
+    #[allow(clippy::too_many_arguments)] // 参数已达 10——v1.37 注入审批超时（历史演化提醒）
     pub fn new_with_e2e(
         relay_url: String,
         credential: GatewayCredential,
@@ -1025,6 +1033,7 @@ impl WebPlatform {
         default_workdir: PathBuf,
         models: ModelsContext,
         backends: Vec<String>,
+        approval_timeout_secs: u64,
     ) -> Self {
         let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>(INBOUND_CHANNEL_CAPACITY);
         let (outbound_tx, outbound_rx) = mpsc::channel::<String>(OUTBOUND_CHANNEL_CAPACITY);
@@ -1143,6 +1152,7 @@ impl WebPlatform {
             logged_cards: Arc::new(Mutex::new(LoggedCardIds::default())),
             card_seq: Arc::new(AtomicU64::new(0)),
             pending_asks: Arc::new(Mutex::new(PendingAsks::default())),
+            approval_timeout_secs,
             shutdown,
         }
     }
@@ -1394,6 +1404,7 @@ impl Platform for WebPlatform {
         _hint: &ReplyHint,
     ) -> Result<Option<String>> {
         // inputSummary 压成人可读单行（P8-1，与 feishu 审批卡同源）。
+        // v1.37：timeoutSecs 下发本次审批的超时预算（SPA 倒计时数据源）。
         let summary = imagent_core::render::tool_summary(tool_name, input_summary);
         let json = encode_approval_request_frame(
             &self.machine_id,
@@ -1401,6 +1412,7 @@ impl Platform for WebPlatform {
             request_id,
             tool_name,
             &summary,
+            Some(self.approval_timeout_secs),
         )?;
         self.track_ask(&conv.0, request_id);
         self.enqueue(json)?;
@@ -1573,6 +1585,7 @@ mod tests {
             valid_dir(),
             empty_models(),
             Vec::new(), // 空名单 → 快照 backends 段整段缺席（既有测试零感知）
+            300,        // 审批超时预算（timeoutSecs 断言数据源）
         )
     }
 
@@ -2959,6 +2972,32 @@ mod tests {
         assert_eq!(ev.kind, PushNotifyKind::Approval);
         assert_eq!(ev.conv_id, "web:push");
         assert_eq!(ev.title, "Bash");
+        drop(p);
+    }
+
+    /// v1.37：approval_request 帧下发审批超时预算——platform 直测（构造注入
+    /// 非零值 → send_permission_ask 出站帧含 timeoutSecs，SPA 倒计时数据源；
+    /// 构造参 → 帧字段透传链路钉住。两形态编码断言在 lib.rs
+    /// `approval_frames_shape`）。
+    #[tokio::test]
+    async fn send_permission_ask_frame_carries_timeout_secs() {
+        let (p, mut rx) = offline_platform_with_outbound_capture(test_store().await).await;
+        p.send_permission_ask(
+            &ConvId("web:t".into()),
+            "req-t",
+            "Bash",
+            "rm -rf /tmp/x",
+            &ReplyHint::None,
+        )
+        .await
+        .unwrap();
+        let json = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("帧应出站")
+            .expect("通道开着");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "approval_request");
+        assert_eq!(v["timeoutSecs"], 300, "构造注入的审批超时预算随帧下发");
         drop(p);
     }
 

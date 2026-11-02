@@ -916,6 +916,9 @@ fn test_budgets() -> TaskBudgets {
         sender_daily_cost_limit_usd: None,
         // P2（v13）：既有用例默认不限制并发（护栏用例显式设置上限）。
         max_concurrent_rounds: 0,
+        // v1.37：/stop 有界等待预算收窄——仅 graceful 能力位 backend 的用例
+        // 消费（mock 默认无能力位走立即 abort；graceful 路径用例显式调小）。
+        stop_graceful_wait: Duration::from_millis(200),
     }
 }
 
@@ -2416,6 +2419,46 @@ async fn stop_aborts_running_task() {
     );
     assert_eq!(running_rounds(&ctx.disp).await, 0, "在飞注册应清空");
     assert_eq!(ctx.prompts.lock().await.len(), 1, "恰一轮被中断的执行");
+    drop_db(ctx.db).await;
+}
+
+/// v1.37 能力位分流回归钉：无 graceful 中断能力的 backend（mock 默认，
+/// `supports_graceful_interrupt` 取 default false）的 /stop 走既有**立即
+/// abort**——不消耗有界等待预算（v1.36 语义不变，防 /stop UX 回退）。
+/// 预算故意设 5s 而退出断言只给 1s：若误入「interrupt_run + 有界等待」分支
+/// 会等满预算而超时红。
+#[tokio::test]
+async fn stop_without_graceful_capability_aborts_immediately() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build_slow(
+        Auth::new(vec!["alice".into()]),
+        30_000,
+        TaskBudgets {
+            batch_window: Duration::from_millis(1),
+            stop_graceful_wait: Duration::from_secs(5),
+            ..test_budgets()
+        },
+    )
+    .await;
+    let disp = ctx.disp.clone();
+    let runner = tokio::spawn(async move {
+        disp.handle(msg("c1", "alice", "slow task")).await;
+    });
+    assert!(
+        wait_registered(&ctx, "c1").await,
+        "在飞任务应已注册（join spawn 后）"
+    );
+    ctx.disp.handle(msg("c1", "alice", "/stop")).await;
+    let done = tokio::time::timeout(Duration::from_secs(1), runner).await;
+    assert!(
+        done.is_ok(),
+        "无能力位 backend 的 /stop 应立即 abort（1s 内退出，而非等满预算）"
+    );
+    let inbox = ctx.inbox.lock().await.clone();
+    assert!(
+        inbox.iter().any(|t| t.contains("已中断当前任务")),
+        "应回中断确认（与 v1.36 文案一致）: {inbox:?}"
+    );
     drop_db(ctx.db).await;
 }
 
@@ -5032,6 +5075,7 @@ async fn stop_on_text_platform_marks_interrupted() {
             agent_idle_timeout: Duration::ZERO,
             batch_window: Duration::ZERO,
             max_concurrent_rounds: 0,
+            stop_graceful_wait: Duration::from_millis(200),
         },
     )
     .await;
@@ -6450,6 +6494,7 @@ async fn learned_context_window_recalibrates_threshold() {
             agent_idle_timeout: Duration::ZERO,
             batch_window: Duration::ZERO,
             max_concurrent_rounds: 0,
+            stop_graceful_wait: Duration::from_millis(200),
         },
     )
     .await;
@@ -8318,4 +8363,38 @@ fn futures_block_on_tmp_store() -> (Store, std::path::PathBuf) {
         .build()
         .expect("runtime");
     rt.block_on(tmp_store())
+}
+
+// ---------- v1.37：/stop 优雅中断有界等待 ----------
+
+/// wait_round_finish：等待期内任务自然结束 → true（Completed 路径），不 abort。
+#[tokio::test]
+async fn wait_round_finish_returns_true_on_natural_finish() {
+    let jh = tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    });
+    let finished = super::commands::wait_round_finish(
+        &jh.abort_handle(),
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+    )
+    .await;
+    assert!(finished, "自然结束应返回 true");
+    assert!(jh.await.is_ok(), "自然结束路径不得 abort 任务");
+}
+
+/// wait_round_finish：超时 → abort 并返回 false（Aborted 路径），任务被中止。
+#[tokio::test]
+async fn wait_round_finish_aborts_on_timeout() {
+    let jh = tokio::spawn(async {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    });
+    let finished = super::commands::wait_round_finish(
+        &jh.abort_handle(),
+        Duration::from_millis(100),
+        Duration::from_millis(10),
+    )
+    .await;
+    assert!(!finished, "超时应返回 false");
+    assert!(jh.await.is_err(), "超时路径应已 abort 任务");
 }

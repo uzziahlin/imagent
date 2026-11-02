@@ -39,18 +39,20 @@
 //! 无需映射）。长驻进程池化属批 2 接线范围。
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use async_trait::async_trait;
 use imagent_core::{
-    AgentChunk, Backend, CoreError, ImPermissionAsk, ImPermissionHook, LocalSession,
+    AgentChunk, Backend, ConvId, CoreError, ImPermissionAsk, ImPermissionHook, LocalSession,
     PermissionCapability, Result, RunOutcome, SessionId, TodoItem, TodoStatus, UsageStats,
 };
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, warn};
 
-use crate::app_server::{AppServerProcess, IncomingNotification, IncomingRequest, RpcReply};
+use crate::app_server::{
+    AppServerProcess, IncomingNotification, IncomingRequest, RpcReply, REQUEST_TIMEOUT,
+};
 
 /// codex `AskForApproval` 缺省档位（批 2 前置契约）：auto（自动档）折算为
 /// `on-request`——分类器筛 + 危险操作进审批，与 Claude auto 语义同构；
@@ -70,6 +72,13 @@ pub struct CodexAppBackend {
     /// B3：IM 审批闭环回调（dispatcher `run()` 启动时注入；None = 独立使用，
     /// 审批请求 fail-closed 拒绝）。
     hook: RwLock<Option<ImPermissionHook>>,
+    /// v1.37 优雅中断：conv_id → 在飞 run 的中断信号发送端。run 开始注册、
+    /// 全路径收尾摘除（RAII 守卫）；per-conv 串行锁保证同 conv 单 run，map
+    /// 天然无竞争。`interrupt_run` 命中即发信号（无在飞 run 时 no-op）。
+    interrupts: Mutex<HashMap<String, watch::Sender<()>>>,
+    /// app-server 可执行名（生产恒 "codex"；测试注入 mock 脚本路径——复用
+    /// [`crate::app_server`] 既有 spawn_configured/mock_script 形态）。
+    program: String,
 }
 
 impl CodexAppBackend {
@@ -93,6 +102,8 @@ impl CodexAppBackend {
             approval_policy: policy,
             model: RwLock::new(None),
             hook: RwLock::new(None),
+            interrupts: Mutex::new(HashMap::new()),
+            program: "codex".to_string(),
         }
     }
 
@@ -307,6 +318,24 @@ fn compact_id(id: &Value) -> String {
         Value::Number(n) => n.to_string(),
         Value::String(s) => s.clone(),
         other => other.to_string(),
+    }
+}
+
+/// 在飞中断注册的 RAII 摘除守卫（v1.37）：run 全路径退出（spawn/initialize
+/// 等早退 Err、事件循环连接死亡 return、正常收尾）时摘除本 conv 的中断
+/// sender——表「无在飞即空」，陈旧句柄不滞留；下一 run 的 insert 覆盖同键
+/// 只是防御路径。drop 顺序 = 注册的逆序，无跨字段借用问题。
+struct RunInterruptGuard<'a> {
+    interrupts: &'a Mutex<HashMap<String, watch::Sender<()>>>,
+    conv_id: &'a str,
+}
+
+impl Drop for RunInterruptGuard<'_> {
+    fn drop(&mut self) {
+        self.interrupts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(self.conv_id);
     }
 }
 
@@ -628,6 +657,27 @@ impl Backend for CodexAppBackend {
         true
     }
 
+    /// v1.37 优雅中断：命中在飞注册表即对当前 run 发信号（事件循环消费 →
+    /// `turn/interrupt` → interrupted 终态自然收尾）。无在飞 run = no-op；
+    /// 实际协议请求由 run 循环发出（本方法不持进程句柄，也不等待中断完成）。
+    async fn interrupt_run(&self, conv: &ConvId) {
+        let hit = {
+            let map = self.interrupts.lock().unwrap_or_else(|e| e.into_inner());
+            map.get(&conv.0).map(|tx| tx.send(())).is_some()
+        };
+        if hit {
+            debug!(target: "imagent::codex-app", conv_id = %conv.0, "优雅中断信号已发（在飞 run 将发 turn/interrupt）");
+        } else {
+            debug!(target: "imagent::codex-app", conv_id = %conv.0, "无在飞 run，interrupt_run no-op");
+        }
+    }
+
+    /// v1.37：协议中断有实效（事件循环消费信号发 turn/interrupt）——与
+    /// interrupt_run 配对的能力位声明，/stop 据此走「先中断再有界等待」。
+    fn supports_graceful_interrupt(&self) -> bool {
+        true
+    }
+
     /// v1.21 /model：model 经 thread/start / thread/resume 参数透传。
     fn supports_model_selection(&self) -> bool {
         true
@@ -670,6 +720,18 @@ impl Backend for CodexAppBackend {
             target: "imagent::codex-app",
             conv_id, policy = %self.approval_policy, "codex-app run start"
         );
+        // v1.37 优雅中断：注册本 conv 的中断信号（`interrupt_run` 命中发信号；
+        // watch 保留末值——信号早于事件循环启动也在首轮触发）。全路径收尾由
+        // guard 摘除（spawn/initialize 早退 Err、循环连接死亡 return 均覆盖）。
+        let (interrupt_tx, mut interrupt_rx) = watch::channel(());
+        self.interrupts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(conv_id.to_string(), interrupt_tx);
+        let _interrupt_guard = RunInterruptGuard {
+            interrupts: &self.interrupts,
+            conv_id,
+        };
         // B11 幽灵会话预检（与 exec 版同语义同存储）：thread id 不在本机
         // rollout 存储则弃用续接、按新会话处理（fail-open 放行无法判定时）。
         let session = match session {
@@ -692,7 +754,8 @@ impl Backend for CodexAppBackend {
             }
             None => None,
         };
-        let proc = AppServerProcess::spawn(workdir).await?;
+        let proc =
+            AppServerProcess::spawn_configured(&self.program, workdir, REQUEST_TIMEOUT).await?;
         proc.request(
             "initialize",
             json!({"clientInfo": {"name": "imagent", "version": env!("CARGO_PKG_VERSION")}}),
@@ -732,13 +795,16 @@ impl Backend for CodexAppBackend {
             warn!(target: "imagent::codex-app", thread_id = %thread_id, "turn/start 响应缺 turn.id，steering 退化不可用");
         }
 
-        // 事件循环：通知映射 / 审批闭环 / steering / 连接死亡四源 select。
-        // 审批等待（hook → IM 用户表态）阻塞循环属设计内——codex 侧同样暂停
-        // 等回执，事件在无界通道排队不丢（ACP 同构）。
+        // 事件循环：通知映射 / 审批闭环 / steering / 优雅中断 / 连接死亡五源
+        // select。审批等待（hook → IM 用户表态）阻塞循环属设计内——codex 侧
+        // 同样暂停等回执，事件在无界通道排队不丢（ACP 同构）；/stop 对审批
+        // 等待期的中断经既有 cancel_all（deny 唤醒）→ 循环恢复 → 本分支信号
+        // 消费，两路协作不打断彼此。
         let mut st = LoopState::default();
         let mut notif_open = true;
         let mut req_open = true;
         let mut steer_open = true;
+        let mut interrupt_open = true;
         while !st.done {
             tokio::select! {
                 notif = proc.next_notification(), if notif_open => match notif {
@@ -765,6 +831,36 @@ impl Backend for CodexAppBackend {
                         }
                     },
                     None => steer_open = false,
+                },
+                sig = interrupt_rx.changed(), if interrupt_open => match sig {
+                    // 信号到达（send(()) 只置版本，changed 即信号——无需读值；
+                    // watch 保留版本，信号早于循环启动也在本轮触发）。
+                    Ok(()) => {
+                        // /stop 优雅中断：对当前在飞 turn 发协议中断，然后
+                        // 继续正常读流直到终态（interrupted turn 会回
+                        // turn/completed(status=interrupted)）→ run 自然
+                        // 返回 RunOutcome，已产出文本照常落库。信号一次性
+                        // 消费（turn 已在协议层中断；重复 /stop 由调用方
+                        // 有界等待超时后的 abort 兜底）。turn_interrupt 等
+                        // 响应期间通知在无界通道排队，事件不丢。
+                        interrupt_open = false;
+                        match turn_id.as_deref() {
+                            Some(tid) => match proc.turn_interrupt(&thread_id, tid).await {
+                                Ok(_) => {
+                                    debug!(target: "imagent::codex-app", conv_id, thread_id = %thread_id, turn_id = %tid, "优雅中断：turn/interrupt 已发，继续读流至终态");
+                                }
+                                Err(e) => {
+                                    warn!(target: "imagent::codex-app", conv_id, error = %e, "turn/interrupt 失败，继续读流（/stop 超时 abort 兜底）");
+                                }
+                            },
+                            None => {
+                                warn!(target: "imagent::codex-app", conv_id, "无活跃 turn id，中断信号无法投递（/stop 超时 abort 兜底）");
+                            }
+                        }
+                    }
+                    // sender 被摘除（同 conv 下一 run 覆盖注册的竞态形态）：
+                    // 本 run 已无中断通道，关闭分支，其余照常。
+                    Err(_) => interrupt_open = false,
                 },
                 _ = proc.closed_signal() => {
                     // 终态与连接死亡竞态：终态优先（已 done 则正常收尾）。
@@ -1264,10 +1360,113 @@ mod tests {
         assert_eq!(b.permission_capability(), PermissionCapability::FullLoop);
         assert!(b.supports_steering());
         assert!(b.supports_model_selection());
+        // v1.37：graceful 中断能力位与 interrupt_run 配对声明。
+        assert!(b.supports_graceful_interrupt());
         // v1.21 /model 语义：热设 + 回读。
         b.set_model(Some("gpt-5-codex".into()));
         assert_eq!(b.model(), Some("gpt-5-codex".into()));
         b.set_model(None);
         assert_eq!(b.model(), None);
+    }
+
+    /// v1.37 优雅中断端到端（mock app-server，复用 mock_support 既有形态）：
+    /// turn 在飞后 interrupt_run 发信号 → 事件循环对当前 turn 发
+    /// `turn/interrupt`（出站 JSON-RPC 断言：mock 收帧日志含该请求帧与
+    /// turnId）→ mock 回 interrupted 终态 → run 自然返回 Ok（非 Err），部分
+    /// 文本照常产出（terminal=false 对齐 exec reached_terminal），中断注册表
+    /// 收尾摘空（RAII 守卫全路径摘除）。无注册 conv 的 interrupt_run = no-op。
+    #[tokio::test]
+    async fn interrupt_run_sends_turn_interrupt_and_run_returns_naturally() {
+        let dir = std::env::temp_dir().join(format!(
+            "imagent-codex-app-backend-interrupt-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let (script, log) = crate::app_server::mock_support::mock_script(&dir, "interrupt");
+        let mut backend = CodexAppBackend::new(Some("on-request"));
+        backend.program = script.to_string_lossy().into_owned();
+        let backend = std::sync::Arc::new(backend);
+
+        // 无在飞 run 的 no-op 路径（不 panic、无副作用）。
+        backend.interrupt_run(&ConvId("conv-none".into())).await;
+
+        let (tx, _rx) = mpsc::channel::<AgentChunk>(64);
+        let (_steer_tx, steer_rx) = mpsc::channel::<String>(4);
+        let conv = "conv-1".to_string();
+        let wd = dir.clone();
+        let run_handle = {
+            let backend = backend.clone();
+            tokio::spawn(async move {
+                backend
+                    .run(&conv, "长任务", None, &wd, &[], tx, &[], steer_rx)
+                    .await
+            })
+        };
+        // 等 mock 收到 turn/start（turn 在飞）再发中断信号——与真实 /stop 时
+        // 序一致；即便信号早于事件循环启动，watch 保留版本也会首轮触发。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let logged = std::fs::read_to_string(&log).unwrap_or_default();
+            if logged.contains("\"method\":\"turn/start\"") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "mock 未在预算内收到 turn/start"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        backend.interrupt_run(&ConvId("conv-1".into())).await;
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), run_handle)
+            .await
+            .expect("run 应在预算内自然结束（而非悬挂至超时）")
+            .expect("run task join")
+            .expect("优雅中断后 run 应 Ok 而非 Err");
+        assert!(
+            !outcome.terminal,
+            "interrupted 终态 = 非正常完成（对齐 exec reached_terminal）"
+        );
+        assert_eq!(outcome.session_id.0, "th-1");
+        assert!(
+            outcome.final_text.contains("部分输出"),
+            "已产出文本照常落账：{}",
+            outcome.final_text
+        );
+        // 出站 JSON-RPC 断言：mock 收帧日志含 turn/interrupt 请求帧。
+        let logged = std::fs::read_to_string(&log).expect("读 mock 日志");
+        assert!(
+            logged.contains("\"method\":\"turn/interrupt\""),
+            "出站帧未到达 mock：{logged}"
+        );
+        assert!(logged.contains("\"turnId\":\"turn-1\""), "{logged}");
+        // run 收尾（Ok 路径）注册表摘空。
+        assert!(
+            backend.interrupts.lock().unwrap().is_empty(),
+            "run 收尾应摘除中断注册"
+        );
+    }
+
+    /// v1.37 中断注册的摘除覆盖早退 Err 路径（spawn 失败 → guard 摘除）：
+    /// 不可执行名 spawn 必败，run 返回 Err 后注册表应已摘空。
+    #[tokio::test]
+    async fn interrupt_registration_removed_on_early_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "imagent-codex-app-backend-interrupt-err-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let mut backend = CodexAppBackend::new(None);
+        backend.program = "imagent-nonexistent-codex-mock".to_string();
+        let (tx, _rx) = mpsc::channel::<AgentChunk>(8);
+        let (_steer_tx, steer_rx) = mpsc::channel::<String>(4);
+        let res = backend
+            .run("conv-err", "x", None, &dir, &[], tx, &[], steer_rx)
+            .await;
+        assert!(res.is_err(), "spawn 必败应 Err");
+        assert!(
+            backend.interrupts.lock().unwrap().is_empty(),
+            "早退 Err 路径也应摘除中断注册"
+        );
     }
 }

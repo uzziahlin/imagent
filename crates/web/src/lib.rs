@@ -251,6 +251,11 @@ pub(crate) struct ApprovalRequestFrame {
     tool: String,
     #[serde(rename = "inputSummary")]
     input_summary: String,
+    /// v1.37：本次审批的超时预算（= config `permission_ask_timeout_secs`，秒；
+    /// 非剩余时间——SPA 以本地收到时刻起倒数）。缺席 = 网关未配置/旧网关，
+    /// SPA 不渲染倒计时。
+    #[serde(rename = "timeoutSecs", skip_serializing_if = "Option::is_none")]
+    timeout_secs: Option<u64>,
 }
 
 /// 审批收敛帧（resolve / cancel / cancel_all 覆写）。decision ∈
@@ -495,12 +500,15 @@ pub(crate) fn encode_card_frame(
 
 /// approval_request 帧药化（send_permission_ask）。inputSummary 经
 /// [`imagent_core::render::tool_summary`] 压缩（≤80 char），无超限面。
+/// `timeout_secs` 为本次审批的超时预算（秒；None = 网关未配置/旧网关，
+/// 帧不带该字段）。
 pub(crate) fn encode_approval_request_frame(
     machine: &str,
     conv_id: &str,
     request_id: &str,
     tool: &str,
     input_summary: &str,
+    timeout_secs: Option<u64>,
 ) -> Result<String> {
     let frame = ApprovalRequestFrame {
         v: 1,
@@ -510,6 +518,7 @@ pub(crate) fn encode_approval_request_frame(
         request_id: request_id.to_string(),
         tool: tool.to_string(),
         input_summary: input_summary.to_string(),
+        timeout_secs,
     };
     serde_json::to_string(&frame)
         .map_err(|e| CoreError::Platform(TARGET, format!("approval 帧序列化失败：{e}")))
@@ -2367,9 +2376,17 @@ mod tests {
 
     #[test]
     fn approval_frames_shape() {
-        let json =
-            encode_approval_request_frame("home-mac", "web:c", "req-9", "Bash", "rm -rf /tmp/x")
-                .unwrap();
+        // 带 timeoutSecs（v1.37）：字节级钉住全帧形状（键名 camelCase 契约，
+        // SPA 侧按此对齐——断言不依赖 JSON 键序）。
+        let json = encode_approval_request_frame(
+            "home-mac",
+            "web:c",
+            "req-9",
+            "Bash",
+            "rm -rf /tmp/x",
+            Some(300),
+        )
+        .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "approval_request");
         assert_eq!(v["machine"], "home-mac", "v1.1 出站帧必带 machine");
@@ -2377,6 +2394,29 @@ mod tests {
         assert_eq!(v["requestId"], "req-9");
         assert_eq!(v["tool"], "Bash");
         assert_eq!(v["inputSummary"], "rm -rf /tmp/x");
+        assert_eq!(v["timeoutSecs"], 300, "v1.37 审批超时预算下发");
+        // 字节级精确串（键序 = 结构体声明序，序列化确定性）。
+        assert_eq!(
+            json,
+            r#"{"v":1,"type":"approval_request","machine":"home-mac","convId":"web:c","requestId":"req-9","tool":"Bash","inputSummary":"rm -rf /tmp/x","timeoutSecs":300}"#
+        );
+
+        // 不带（None → 缺席，旧网关/未配置形态——SPA 不渲染倒计时）。
+        let json = encode_approval_request_frame(
+            "home-mac",
+            "web:c",
+            "req-9",
+            "Bash",
+            "rm -rf /tmp/x",
+            None,
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("timeoutSecs").is_none(), "None 不得序列化该字段");
+        assert_eq!(
+            json,
+            r#"{"v":1,"type":"approval_request","machine":"home-mac","convId":"web:c","requestId":"req-9","tool":"Bash","inputSummary":"rm -rf /tmp/x"}"#
+        );
 
         let json = encode_approval_resolved_frame(
             "home-mac",

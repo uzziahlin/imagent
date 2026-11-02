@@ -56,6 +56,12 @@ const PENDING_HINT_DEDUPE: Duration = Duration::from_secs(60);
 /// 陈旧序号在列表变化后错位。
 const RESUME_CACHE_TTL: Duration = Duration::from_secs(600);
 
+/// v1.37：/stop 优雅中断有界等待的缺省预算（[`TaskBudgets::stop_graceful_wait`]
+/// 的 from_config 取值；运行参数非用户旋钮，不设独立 config 项）。仅对声明
+/// graceful 中断能力的 backend 生效（codex-app 协议中断通常秒级收敛）；
+/// 无能力位 backend 走既有立即 abort，不消耗本预算。
+const STOP_GRACEFUL_WAIT: Duration = Duration::from_secs(8);
+
 /// Dispatcher 时长类预算聚合（避免构造参数表随配置项继续膨胀）。
 #[derive(Debug, Clone, Copy)]
 pub struct TaskBudgets {
@@ -88,6 +94,12 @@ pub struct TaskBudgets {
     /// P2（code-review v13）：全局在飞轮数上限（config `max_concurrent_rounds`；
     /// 0 = 不限制）。生存护栏，非配额——见 config 字段文档。
     pub max_concurrent_rounds: usize,
+    /// v1.37：/stop 优雅中断的有界等待预算——先请求 backend 协议层中断，再等
+    /// 在飞轮自然结束的最长时长，超时才 abort 兜底。**仅对声明
+    /// `supports_graceful_interrupt` 能力位的 backend 消费**（无能力位走既有
+    /// 立即 abort，不进入等待）。config 无独立项（运行参数非用户旋钮），
+    /// from_config 取 [`STOP_GRACEFUL_WAIT`]；测试收窄防用例拖慢。
+    pub stop_graceful_wait: Duration,
 }
 
 impl TaskBudgets {
@@ -107,6 +119,7 @@ impl TaskBudgets {
             cron_catchup: c.cron_catchup,
             sender_daily_cost_limit_usd: c.sender_daily_cost_limit_usd,
             max_concurrent_rounds: c.max_concurrent_rounds,
+            stop_graceful_wait: STOP_GRACEFUL_WAIT,
         }
     }
 }
@@ -579,6 +592,9 @@ pub struct Dispatcher {
     ask_via_im_timeout: std::time::Duration,
     /// 优雅退出 drain in-flight task 的宽限期（R-1：原硬编码 30s）。
     shutdown_grace: std::time::Duration,
+    /// v1.37：/stop 优雅中断有界等待预算（协议中断后等在飞轮自然结束，
+    /// 超时 abort 兜底；来源 `TaskBudgets.stop_graceful_wait`，测试收窄）。
+    stop_graceful_wait: std::time::Duration,
     /// 空闲看门狗：agent 连续无输出该时长则终止本轮（零值 = 关闭）。
     /// `/config agent_idle_timeout_secs` 可热改，故共享句柄。
     agent_idle_timeout: Arc<RwLock<Duration>>,
@@ -966,6 +982,7 @@ impl Dispatcher {
             permission_ask_timeout: budgets.permission_ask_timeout,
             ask_via_im_timeout: budgets.ask_via_im_timeout,
             shutdown_grace: budgets.shutdown_grace,
+            stop_graceful_wait: budgets.stop_graceful_wait,
             agent_idle_timeout: Arc::new(RwLock::new(budgets.agent_idle_timeout)),
             batch_window: Arc::new(RwLock::new(budgets.batch_window)),
             auto_compact_threshold: std::sync::atomic::AtomicU64::new(

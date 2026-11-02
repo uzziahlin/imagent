@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 use crate::error::Result;
-use crate::types::{AgentChunk, LocalSession, RunOutcome, SessionId, TodoItem};
+use crate::types::{AgentChunk, ConvId, LocalSession, RunOutcome, SessionId, TodoItem};
 
 /// B3：backend 的权限审批能力档位（能力协商，dispatcher 启动时校验）。
 ///
@@ -136,6 +136,27 @@ pub trait Backend: Send + Sync {
     /// 是否支持运行中转向（v1.17）：dispatcher 据此决定运行中消息是注入当轮
     /// 还是排队下一轮。默认 false；claude-cli（control 通道）覆写 true。
     fn supports_steering(&self) -> bool {
+        false
+    }
+
+    /// 优雅中断在飞 run：引擎级协议中断，超时兜底仍由调用方 abort。
+    ///
+    /// v1.37（P0）：`/stop` 先调本方法请求协议层中断（如 codex-app 对当前
+    /// 在飞 turn 发 `turn/interrupt`，turn 回 interrupted 终态后 run 自然
+    /// 返回，已产出文本照常落库）；调用方对 run 任务做**有界等待**，超时才
+    /// abort（既有硬中断兜底，语义不变）。
+    ///
+    /// 默认 no-op：无协议中断通道的后端（claude-cli 的 ACP cancel 接线留
+    /// 后续）直接走调用方超时 abort 兜底；无在飞 run 时实现应为 no-op。
+    async fn interrupt_run(&self, _conv: &ConvId) {}
+
+    /// v1.37：是否具备**有实效的**优雅中断能力（与 [`Backend::interrupt_run`]
+    /// 配对的能力位）。默认 `false`——interrupt_run 为 no-op 的后端不得声明；
+    /// dispatcher /stop 据此分流：`true` = 先 interrupt_run 再有界等待自然
+    /// 结束（超时才 abort 兜底）；`false` = 保持既有**立即 abort**（无协议
+    /// 中断通道时等待纯属白等，属 /stop UX 回退）。codex-app 覆写 `true`；
+    /// claude-cli 接 ACP cancel 时与 interrupt_run 一并覆写。
+    fn supports_graceful_interrupt(&self) -> bool {
         false
     }
 

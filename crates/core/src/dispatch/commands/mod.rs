@@ -19,6 +19,12 @@ pub(super) use misc::{
     doctor_platform_caps_lines, doctor_shared_workdir_lines, doctor_size_line, doctor_webhook_line,
 };
 
+/// /stop 有界等待（session 实现）——re-export 到 commands 层供
+/// `dispatch::tests` 单测（仅测试构建使用，cfg(test) 门控防非测试构建的
+/// unused-import 告警）。
+#[cfg(test)]
+pub(super) use session::wait_round_finish;
+
 /// P3（v13 遗留「群内斜杠免检噪音」）：命令分派表（[`Dispatcher::handle`] 的
 /// match）的**全部**命令词（小写、含 `/` 前缀）。feishu 平台层的群 mention 门
 /// 用它做「已知命令」豁免判定——只放行真实命令，`/xxx 是什么意思` 一类闲聊

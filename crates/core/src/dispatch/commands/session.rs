@@ -3,6 +3,37 @@
 use super::*;
 use crate::types::UserId;
 
+/// /stop 有界等待的完成轮询间隔（只影响 abort 时点精度，无需事件级精确；
+/// 预算本体在 [`TaskBudgets::stop_graceful_wait`]——测试可收窄）。
+const STOP_GRACEFUL_POLL: Duration = Duration::from_millis(100);
+
+/// /stop 有界等待（v1.37）：轮询在飞任务的完成标志——等待期内自然结束返回
+/// `true`（调用方走既有 Completed 路径）；超时 abort 并返回 `false`（既有
+/// Aborted 路径）。**调用方保证仅在 backend 声明 graceful 中断能力
+///（[`Backend::supports_graceful_interrupt`]）时调用**——无能力位时等待
+/// 纯属白等（interrupt_run 为 no-op）。轮询而非 await join：RoundHandle 只
+/// 持有 AbortHandle（JoinHandle 归 run_agent_round 所有），`is_finished` 对
+/// 任务正常结束与被中止均为 true，与 cmd_stop 既有完成竞态判定同源。等待
+/// 只轮询不取 conv 串行锁（run 在飞持锁，取锁会死等；join 等待本身无锁需求）。
+pub(in crate::dispatch) async fn wait_round_finish(
+    abort: &tokio::task::AbortHandle,
+    wait: Duration,
+    poll: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        if abort.is_finished() {
+            return true;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            abort.abort();
+            return false;
+        }
+        tokio::time::sleep(poll.min(deadline - now)).await;
+    }
+}
+
 impl Dispatcher {
     /// /new —— 重置会话（删活动 session + active_name）。
     pub(super) async fn cmd_new(&self, conv: &ConvId, hint: &ReplyHint) {
@@ -762,10 +793,31 @@ impl Dispatcher {
             if h.abort.is_finished() {
                 (false, true)
             } else {
-                // abort → backend.run future drop → 杀子进程：
-                // CLI 后端 kill_on_drop；ACP 后端 cancel 分支 → 杀连接。
-                h.abort.abort();
-                (true, false)
+                // v1.37 优雅中断按能力位分流（每轮只 resolve 一次复用结果）：
+                // 有实效协议中断的 backend（supports_graceful_interrupt=true，
+                // codex-app）先 interrupt_run（对在飞 turn 发 turn/interrupt，
+                // turn 回 interrupted 终态后 run 自然返回、已产出文本照常落
+                // 库），再对在飞任务有界等待——等待期内自然结束走下方
+                // Completed 路径，超时才 abort 兜底。resolve_backend 与 run
+                // 入口同源，尊重 per-conv /backend KV 覆盖语义。
+                let backend = self.resolve_backend(&conv.0).await;
+                if backend.supports_graceful_interrupt() {
+                    backend.interrupt_run(conv).await;
+                    if wait_round_finish(&h.abort, self.stop_graceful_wait, STOP_GRACEFUL_POLL)
+                        .await
+                    {
+                        (false, true)
+                    } else {
+                        (true, false)
+                    }
+                } else {
+                    // 无协议中断通道（能力位默认 false，claude-cli 等）：保持
+                    // 既有**立即 abort**（等待纯属白等）——v1.36 语义不变。
+                    // abort → backend.run future drop → 杀子进程：CLI 后端
+                    // kill_on_drop；ACP 后端 cancel 分支 → 杀连接。
+                    h.abort.abort();
+                    (true, false)
+                }
             }
         } else {
             // P0-4（v1.17）：批窗口等待 / take_batch→running.insert 注册间隙

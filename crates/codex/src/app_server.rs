@@ -521,17 +521,41 @@ fn dispatch_frame(
     }
 }
 
+/// 测试共享 mock 基建（`mock_script` 场景库）：app_server 与 app_backend 的
+/// 单测复用同一 mock `codex app-server` 形态（场景脚本 + 收帧日志——出站
+/// JSON-RPC 断言数据源）。
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
+pub(crate) mod mock_support {
+    use std::path::{Path, PathBuf};
 
     /// 构造 mock `codex app-server`：一个 sh 脚本按场景吐固定 JSONL，并把收到
     /// 的帧记录到日志文件（审批回执断言数据源）。返回 (脚本路径, 日志路径)。
-    fn mock_script(dir: &Path, scenario: &str) -> (PathBuf, PathBuf) {
+    pub(crate) fn mock_script(dir: &Path, scenario: &str) -> (PathBuf, PathBuf) {
         let script = dir.join(format!("mock-{scenario}.sh"));
         let log = dir.join(format!("mock-{scenario}.log"));
         let body = match scenario {
+            // 场景 E：优雅中断（v1.37）——turn/start 后挂起等客户端
+            // turn/interrupt，收到后回响应 + 吐部分正文与 interrupted 终态。
+            "interrupt" => r#"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$LOG"
+  case "$line" in
+    *'"method":"initialize"'*|*'"thread/start"'*|*'"turn/start"'*|*'"turn/interrupt"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+      case "$line" in
+        *'"method":"initialize"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
+        *'"thread/start"'*) printf '{"id":%s,"result":{"thread":{"id":"th-1"}}}\n' "$id" ;;
+        *'"turn/start"'*) printf '{"id":%s,"result":{"turn":{"id":"turn-1"}}}\n' "$id" ;;
+        *'"turn/interrupt"'*)
+          printf '{"id":%s,"result":{}}\n' "$id"
+          printf '{"method":"item/completed","params":{"threadId":"th-1","turnId":"turn-1","item":{"type":"agentMessage","id":"m1","text":"部分输出"}}}\n'
+          printf '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"turn-1","status":"interrupted","items":[]}}}\n' ;;
+      esac
+      ;;
+  esac
+done
+"#
+            .to_string(),
             // 场景 A：请求-响应关联 + 通知分发 + 垃圾行容错。
             "echo" => r#"
 while IFS= read -r line; do
@@ -609,6 +633,13 @@ exit 0
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         (script, log)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mock_support::mock_script;
+    use super::*;
+    use std::path::PathBuf;
 
     async fn spawn_mock(scenario: &str, timeout: Duration) -> (AppServerProcess, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
