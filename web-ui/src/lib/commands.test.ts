@@ -24,6 +24,7 @@ const REQUIRED = [
   "/cd",
   "/ws",
   "/model",
+  "/effort",
   "/perm",
   "/timeout",
   "/compact",
@@ -46,7 +47,7 @@ describe("命令表完整性", () => {
     }
   });
 
-  it("覆盖任务规定的全部命令（注册表核对过的 16 个）", () => {
+  it("覆盖任务规定的全部命令（注册表核对过的 17 个）", () => {
     const names = COMMANDS.map((c) => c.name);
     for (const name of REQUIRED) {
       expect(names, `缺少命令 ${name}`).toContain(name);
@@ -57,6 +58,14 @@ describe("命令表完整性", () => {
     const model = COMMANDS.find((c) => c.name === "/model");
     expect(model?.desc).toContain("sonnet");
     expect(BUILTIN_MODEL_CHIPS).toEqual(["default", "sonnet", "opus", "haiku"]);
+  });
+
+  it("/effort 词条存在（模型与权限组）：描述含思考深度档位与 default 恢复用法", () => {
+    const effort = COMMANDS.find((c) => c.name === "/effort");
+    expect(effort).toBeDefined();
+    expect(effort?.group).toBe("模型与权限");
+    expect(effort?.desc).toContain("low|medium|high");
+    expect(effort?.desc).toContain("default 恢复");
   });
 });
 

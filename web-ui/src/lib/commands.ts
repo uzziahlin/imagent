@@ -73,6 +73,12 @@ export const COMMANDS: readonly SlashCommand[] = [
     group: "模型与权限",
   },
   {
+    name: "/effort",
+    args: "<low|medium|high|default>",
+    desc: "会话级思考深度：/effort low|medium|high（仅 codex 引擎），/effort default 恢复",
+    group: "模型与权限",
+  },
+  {
     name: "/perm",
     args: "<auto|off|allow|deny|ask>",
     desc: "权限模式热切；list 查看会话授权、revoke 撤销",
