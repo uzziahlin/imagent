@@ -169,6 +169,7 @@ async fn setup() -> (RelayHandle, WebPlatform, Ws) {
         valid_ws_dir(),
         nop_models(),
         Vec::new(), // v1.36 backends 名单：回环测试不驱动引擎选择，空名单整段缺席
+        300,        // v1.37 审批超时预算（approval_request 帧 timeoutSecs）
     );
     // 等 platform 连上 relay（client spawn 后异步建连 + 三帧握手认证）。
     eventually(Duration::from_secs(10), || platform.is_online()).await;
@@ -654,6 +655,7 @@ async fn loopback_token_credential_compat() {
         valid_ws_dir(),
         nop_models(),
         Vec::new(), // v1.36 backends 名单：回环测试不驱动引擎选择，空名单整段缺席
+        300,        // v1.37 审批超时预算（approval_request 帧 timeoutSecs）
     );
     eventually(Duration::from_secs(10), || p.is_online()).await;
 
@@ -739,6 +741,7 @@ async fn loopback_e2e_encrypted_roundtrip() {
         valid_ws_dir(),
         nop_models(),
         Vec::new(), // v1.36 backends 名单：回环测试不驱动引擎选择，空名单整段缺席
+        300,        // v1.37 审批超时预算（approval_request 帧 timeoutSecs）
     );
     eventually(Duration::from_secs(10), || p.is_online()).await;
 
@@ -927,6 +930,7 @@ async fn loopback_workspace_frames_e2e_encrypted() {
         default_dir.clone(),
         nop_models(),
         Vec::new(), // v1.36 backends 名单：回环测试不驱动引擎选择，空名单整段缺席
+        300,        // v1.37 审批超时预算（approval_request 帧 timeoutSecs）
     );
     eventually(Duration::from_secs(10), || p.is_online()).await;
 
@@ -1218,6 +1222,7 @@ async fn loopback_push_notify_full_chain() {
         valid_ws_dir(),
         nop_models(),
         Vec::new(), // v1.36 backends 名单：回环测试不驱动引擎选择，空名单整段缺席
+        300,        // v1.37 审批超时预算（approval_request 帧 timeoutSecs）
     );
     eventually(Duration::from_secs(10), || platform.is_online()).await;
 

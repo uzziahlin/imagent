@@ -1848,6 +1848,8 @@ async fn build_platform(
             // 第①层；仅 codex-app 装配产生，其余后端 None）。
             // v1.36 引擎名单：注入全注册表名（快照 backends 段——SPA 新会话
             // 弹窗引擎 chips 数据源；default 在首位，装配处已保序去重）。
+            // v1.37 审批超时：注入 permission_ask_timeout_secs（approval_request
+            // 帧 timeoutSecs 数据源——SPA 倒计时与网关实际超时同源）。
             Ok(Arc::new(imagent_web::WebPlatform::new(
                 relay_url,
                 credential,
@@ -1861,6 +1863,7 @@ async fn build_platform(
                     list_models: model_list_fn,
                 },
                 backends,
+                config.permission_ask_timeout_secs,
             )))
         }
         "local" => {
