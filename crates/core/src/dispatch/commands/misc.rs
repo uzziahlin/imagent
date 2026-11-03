@@ -1168,6 +1168,147 @@ impl Dispatcher {
         }
     }
 
+    /// /effort [low|medium|high|default] —— 查看/热切**本会话**思考深度
+    /// （v1.38 P1-b：会话级 KV，仿 /model 骨架）。
+    ///
+    /// 仅支持思考深度调节的后端可用（本批仅 codex-app：app-server `turn/start`
+    /// 的 `effort` 参数，0.166 schema 实证）；查看对所有白名单用户开放，
+    /// **切换需 admin**（与 /model 同门槛——思考深度直接影响成本与延迟）。
+    /// 语义：
+    /// - 作用引擎 = `resolve_backend` 解析结果（与 /model 同款修复语义，
+    ///   /backend 切过引擎的会话操作对准解析后引擎）；
+    /// - `/effort` 无参：显示本会话生效档（KV `effort:<conv>` 命中「<值>
+    ///   （本会话覆盖）」否则「默认（跟随引擎/账号配置）」）+ 用法；
+    /// - `/effort <low|medium|high>`：三值白名单校验（非法回显合法值列表）→
+    ///   写会话 KV（键名事实源 `effort_key`），下一条消息 run 入口解析进
+    ///   RoundContext.effort 透传；切换落审计（effort_switch，参照
+    ///   model_switch）；
+    /// - `/effort default`：清 KV（幂等），恢复引擎默认。
+    pub(super) async fn cmd_effort(
+        &self,
+        conv: &ConvId,
+        sender: &str,
+        hint: &ReplyHint,
+        parts: &[&str],
+    ) {
+        // 作用引擎 = per-conv 解析结果（与 cmd_model 同款修复语义）。
+        let backend = self.resolve_backend(&conv.0).await;
+        if !backend.supports_effort() {
+            self.reply(
+                conv,
+                &format!("当前引擎 {} 暂不支持思考深度调节。", backend.name()),
+                hint,
+            )
+            .await;
+            return;
+        }
+        let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+        if arg.is_empty() {
+            // 无参：本会话生效档——KV 命中显示之；否则引擎默认。
+            let kv = self
+                .store
+                .get_config(&effort_key(&conv.0))
+                .await
+                .ok()
+                .flatten()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let cur = match kv {
+                Some(e) => format!("{e}（本会话覆盖）"),
+                None => "默认（跟随引擎/账号配置）".to_string(),
+            };
+            self.reply(
+                conv,
+                &format!(
+                    "当前思考深度：{cur}\n用法：/effort <low|medium|high>（本会话生效，需管理员） · /effort default（恢复引擎默认）"
+                ),
+                hint,
+            )
+            .await;
+            return;
+        }
+        if !self.is_admin(sender) {
+            let msg = if self.admin_senders.read().is_empty() {
+                "切换思考深度需要管理员（admin_senders 为空，IM 内不可用；请在 config.toml 配置 admin_senders 或运行 imagent setup）。".to_string()
+            } else {
+                "切换思考深度需要管理员（查看用 /effort）。".to_string()
+            };
+            self.reply(conv, &msg, hint).await;
+            return;
+        }
+        if arg.eq_ignore_ascii_case("default") {
+            // 清 KV → 恢复引擎默认（run 入口解析 None 即不下发字段）。
+            // delete 对不存在键幂等（SQL DELETE 语义），重复 /effort default 无害。
+            match self.store.delete_config(&effort_key(&conv.0)).await {
+                Ok(_) => {
+                    self.reply(
+                        conv,
+                        "✅ 本会话思考深度已恢复引擎默认（下一条消息生效）。",
+                        hint,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    warn!(
+                        target: "imagent::core",
+                        conv_id = %conv.0,
+                        error = %e,
+                        "会话级思考深度 KV 清除失败"
+                    );
+                    self.reply(conv, &format!("⚠️ 恢复默认失败：{e}"), hint)
+                        .await;
+                }
+            }
+            return;
+        }
+        // 三值白名单（codex `ReasoningEffort` 协议值全小写；输入宽容大小写，
+        // 归一后写 KV）。
+        let effort = arg.to_ascii_lowercase();
+        if !matches!(effort.as_str(), "low" | "medium" | "high") {
+            self.reply(
+                conv,
+                "思考深度仅支持 low / medium / high（恢复引擎默认用 /effort default）。",
+                hint,
+            )
+            .await;
+            return;
+        }
+        match self.store.set_config(&effort_key(&conv.0), &effort).await {
+            Ok(_) => {
+                if let Err(e) = self
+                    .store
+                    .append_audit(
+                        "effort_switch",
+                        Some(sender),
+                        Some(&conv.0),
+                        Some(&format!("effort={effort}")),
+                    )
+                    .await
+                {
+                    tracing::warn!(target: "imagent::core", error = %e, "append_audit(effort_switch) 失败");
+                }
+                self.reply(
+                    conv,
+                    &format!(
+                        "✅ 本会话思考深度已切换为 {effort}（下一条消息生效）。/effort default 恢复。"
+                    ),
+                    hint,
+                )
+                .await;
+            }
+            Err(e) => {
+                warn!(
+                    target: "imagent::core",
+                    conv_id = %conv.0,
+                    error = %e,
+                    "会话级思考深度 KV 写入失败"
+                );
+                self.reply(conv, &format!("⚠️ 思考深度切换写入失败：{e}"), hint)
+                    .await;
+            }
+        }
+    }
+
     /// /backend [name] —— 会话级引擎切换（批 A/2 多引擎 Dispatcher）。
     ///
     /// - 无参：回显当前会话引擎 + 可用引擎列表（注册表：default + extras）；

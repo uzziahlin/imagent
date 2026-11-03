@@ -565,13 +565,16 @@ impl Backend for ClaudeBackend {
         chunks: tokio::sync::mpsc::Sender<AgentChunk>,
     ) -> Result<RunOutcome> {
         // v1.38 P1-a：本轮执行环境自 RoundContext 解构（字段名与原参数一致，
-        // 以下函数体语义零变化）。
+        // 以下函数体语义零变化）。P1-b 的 effort/permission_mode 本后端不消费：
+        // 权限链继续走既有实例句柄/原生档（禁改），thinking 预算透传留后续。
         let RoundContext {
             conv_id,
             workdir,
             allowed_tools,
             initial_todos,
             model: model_override,
+            effort: _,
+            permission_mode: _,
             steer,
         } = ctx;
         // 构造命令（prompt 作为单个 arg，不经 shell；stdin/stdout/stderr/kill_on_drop
@@ -1340,6 +1343,8 @@ mod tests {
                     allowed_tools: &allowed,
                     initial_todos: &[],
                     model: None,
+                    effort: None,
+                    permission_mode: imagent_core::PermissionMode::Off,
                     steer: {
                         let (sx, rx) = tokio::sync::mpsc::channel(1);
                         drop(sx);

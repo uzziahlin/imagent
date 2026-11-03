@@ -44,8 +44,8 @@ use std::sync::{Mutex, RwLock};
 use async_trait::async_trait;
 use imagent_core::{
     AgentChunk, Backend, ConvId, CoreError, ImPermissionAsk, ImPermissionHook, LocalSession,
-    PermissionCapability, Result, RoundContext, RunOutcome, SessionId, TodoItem, TodoStatus,
-    UsageStats,
+    PermissionCapability, PermissionMode, Result, RoundContext, RunOutcome, SessionId, TodoItem,
+    TodoStatus, UsageStats,
 };
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch};
@@ -58,7 +58,37 @@ use crate::app_server::{
 /// codex `AskForApproval` 缺省档位（批 2 前置契约）：auto（自动档）折算为
 /// `on-request`——分类器筛 + 危险操作进审批，与 Claude auto 语义同构；
 /// `untrusted` 对应 ask 档。
+///
+/// v1.38 P1-b：本常量与 [`CodexAppBackend::new`] 的 `approval_policy` 参数
+/// 降级为**构造缺省基准**（直接调用方 / 独立测试用）；生产 run 内审批档以
+/// ctx.permission_mode 映射（[`approval_policy_for`]）为权威。
 pub(crate) const DEFAULT_APPROVAL_POLICY: &str = "on-request";
+
+/// v1.38 P1-b：core 权限档位 → codex `approvalPolicy` 映射（纯函数）。
+///
+/// - `Ask` → `"untrusted"`：除信任白名单外全部进审批——最接近「每步审批」
+///   闭环档（真机实测 untrusted 触发 `item/commandExecution/requestApproval`，
+///   见 app_server 模块注释）；
+/// - `Auto` → `"on-request"`：现行默认（构造缺省同值）——分类器筛 + 危险操作
+///   进审批；`Auto` 对 codex-app 在 `PermissionMode::resolve` 保留（不退
+///   Off），此映射即 auto 的完整语义；
+/// - `Off` → `"never"`：全自动；
+/// - `AutoClaude` / `Allow` / `Deny` → 回退 `"on-request"`：claude 专属档
+///   （原生 `--permission-mode auto` 透传）与 MCP 定答档（allow/deny）不该
+///   出现在 codex 会话（后者由 IM 审批闭环承担定答），防御性回退到三档中
+///   最中性的 on-request。
+///
+/// `/perm` 全局热切生效链：`cmd_perm` 改 raw 档 → 下一条消息 run 入口现算
+/// `ctx.permission_mode` → 本映射进 `thread/start|resume` 的 approvalPolicy
+/// ——codex 会话免重启生效。
+fn approval_policy_for(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Ask => "untrusted",
+        PermissionMode::Auto => "on-request",
+        PermissionMode::Off => "never",
+        PermissionMode::AutoClaude | PermissionMode::Allow | PermissionMode::Deny => "on-request",
+    }
+}
 
 /// 审批摘要截断（与 claude-acp / socket 闭环同口径：2000 字符）。
 const SUMMARY_MAX_CHARS: usize = 2000;
@@ -70,6 +100,8 @@ pub type ListModelsBridge = dyn Fn() -> Vec<String> + Send + Sync;
 /// OpenAI Codex app-server 双工后端。
 pub struct CodexAppBackend {
     /// 审批档位（untrusted/on-request/never；构造缺省 `on-request`）。
+    /// v1.38 P1-b：仅作构造缺省基准（直接调用方/测试）；生产 run 内以
+    /// ctx.permission_mode 映射（[`approval_policy_for`]）为权威。
     approval_policy: String,
     /// v1.21 /model：运行时模型覆盖（thread/start / thread/resume 的 `model`
     /// 参数；None = CLI 默认）。std RwLock——与 exec 版同款（临界区纯读写）。
@@ -98,6 +130,9 @@ impl CodexAppBackend {
     /// 构造。`approval_policy`：`None` / 空 → [`DEFAULT_APPROVAL_POLICY`]
     /// （on-request，auto 语义）；`"untrusted"` 对应 ask 档；`"never"` 全放行。
     /// 未知值原样透传（codex 在 thread/start 处显式报错，fail-open 上抛可见）。
+    /// v1.38 P1-b：该参数为构造缺省基准——挂到 Dispatcher 的生产 run 内
+    /// 审批档由 ctx.permission_mode 逐轮映射（[`Self::run`]），本字段不再
+    /// 直接决定出站 approvalPolicy。
     pub fn new(approval_policy: Option<&str>) -> Self {
         let policy = approval_policy
             .map(str::trim)
@@ -128,6 +163,13 @@ impl CodexAppBackend {
             .list_models_bridge
             .write()
             .unwrap_or_else(|e| e.into_inner()) = f;
+    }
+
+    /// v1.38 P1-b：构造缺省审批档位只读口（[`Self::new`] 的 `approval_policy`
+    /// 参数落点）——直接调用方/测试的缺省基准。生产 run 内出站 approvalPolicy
+    /// 以 ctx.permission_mode 映射（[`approval_policy_for`]）为权威，与本值无关。
+    pub fn configured_approval_policy(&self) -> &str {
+        &self.approval_policy
     }
 
     /// 装配便捷口：为本实例构造并注入「自桥」（线程 + 临时 current-thread
@@ -747,6 +789,12 @@ impl Backend for CodexAppBackend {
         true
     }
 
+    /// v1.38 P1-b：思考深度调节——ctx.effort 经 `turn/start` 的 `effort`
+    /// 参数透传（0.166 schema 实证，见 [`AppServerProcess::turn_start`]）。
+    fn supports_effort(&self) -> bool {
+        true
+    }
+
     fn set_model(&self, model: Option<String>) {
         *self.model.write().unwrap_or_else(|e| e.into_inner()) = model;
     }
@@ -777,19 +825,23 @@ impl Backend for CodexAppBackend {
         chunks: mpsc::Sender<AgentChunk>,
     ) -> Result<RunOutcome> {
         // v1.38 P1-a：本轮执行环境自 RoundContext 解构（任务种子本后端不消费，
-        // 保持原忽略语义）。
+        // 保持原忽略语义）。v1.38 P1-b：effort → turn/start；permission_mode →
+        // approvalPolicy 映射（ctx 权威，见 approval_policy_for）。
         let RoundContext {
             conv_id,
             workdir,
             allowed_tools,
             initial_todos: _,
             model: model_override,
+            effort: effort_override,
+            permission_mode,
             steer,
         } = ctx;
         let mut steer = steer;
+        let approval_policy = approval_policy_for(permission_mode);
         debug!(
             target: "imagent::codex-app",
-            conv_id, policy = %self.approval_policy, "codex-app run start"
+            conv_id, policy = approval_policy, effort = ?effort_override, "codex-app run start"
         );
         // v1.37 优雅中断：注册本 conv 的中断信号（`interrupt_run` 命中发信号；
         // watch 保留末值——信号早于事件循环启动也在首轮触发）。全路径收尾由
@@ -841,19 +893,13 @@ impl Backend for CodexAppBackend {
         let thread_id = match session {
             Some(s) => {
                 let res = proc
-                    .thread_resume(
-                        &s.0,
-                        workdir,
-                        &self.approval_policy,
-                        model.as_deref(),
-                        sandbox,
-                    )
+                    .thread_resume(&s.0, workdir, approval_policy, model.as_deref(), sandbox)
                     .await?;
                 thread_id_of(&res)?
             }
             None => {
                 let res = proc
-                    .thread_start(workdir, &self.approval_policy, model.as_deref(), sandbox)
+                    .thread_start(workdir, approval_policy, model.as_deref(), sandbox)
                     .await?;
                 thread_id_of(&res)?
             }
@@ -861,7 +907,8 @@ impl Backend for CodexAppBackend {
         let _ = chunks
             .send(AgentChunk::SessionStarted(thread_id.clone()))
             .await;
-        let turn_res = proc.turn_start(&thread_id, prompt).await?;
+        // v1.38 P1-b：effort 随 turn/start 透传（ctx.effort=None → 不带字段）。
+        let turn_res = proc.turn_start(&thread_id, prompt, effort_override).await?;
         let turn_id = turn_res
             .pointer("/turn/id")
             .and_then(Value::as_str)
@@ -1418,13 +1465,145 @@ mod tests {
     /// 构造档位契约：None/空 → on-request（auto 缺省）；untrusted 透传。
     #[test]
     fn approval_policy_default_and_passthrough() {
-        assert_eq!(CodexAppBackend::new(None).approval_policy, "on-request");
-        assert_eq!(CodexAppBackend::new(Some("")).approval_policy, "on-request");
         assert_eq!(
-            CodexAppBackend::new(Some("untrusted")).approval_policy,
+            CodexAppBackend::new(None).configured_approval_policy(),
+            "on-request"
+        );
+        assert_eq!(
+            CodexAppBackend::new(Some("")).configured_approval_policy(),
+            "on-request"
+        );
+        assert_eq!(
+            CodexAppBackend::new(Some("untrusted")).configured_approval_policy(),
             "untrusted"
         );
-        assert_eq!(CodexAppBackend::new(Some("never")).approval_policy, "never");
+        assert_eq!(
+            CodexAppBackend::new(Some("never")).configured_approval_policy(),
+            "never"
+        );
+    }
+
+    /// v1.38 P1-b：permission_mode → approvalPolicy 四映射（Ask/Auto/Off/其他）。
+    #[test]
+    fn approval_policy_for_maps_permission_mode() {
+        assert_eq!(approval_policy_for(PermissionMode::Ask), "untrusted");
+        assert_eq!(approval_policy_for(PermissionMode::Auto), "on-request");
+        assert_eq!(approval_policy_for(PermissionMode::Off), "never");
+        // 其他变体（claude 专属 / MCP 定答档）防御性回退 on-request。
+        assert_eq!(
+            approval_policy_for(PermissionMode::AutoClaude),
+            "on-request"
+        );
+        assert_eq!(approval_policy_for(PermissionMode::Allow), "on-request");
+        assert_eq!(approval_policy_for(PermissionMode::Deny), "on-request");
+    }
+
+    /// v1.38 P1-b e2e（mock app-server 场景 "params"，带/不带两形态一条测试
+    /// 顺序跑——减少并行 spawn 压力：mock 子进程 exec 偶发秒级延迟，两形态
+    /// 分测会放大满载下的抖动命中面）：
+    /// - ctx.effort=Some + permission_mode=Ask → thread/start 出站 params 带
+    ///   `"approvalPolicy":"untrusted"`（映射消费），turn/start 出站 params 带
+    ///   `"effort":"high"`（协议载体为 turn/start——0.166 schema 实证，
+    ///   thread/start/resume 无 effort 字段）；
+    /// - ctx.effort=None → turn/start 不带 effort 字段（保持现状字节）；
+    ///   permission_mode=Off → thread/start 带 `"approvalPolicy":"never"`
+    ///   （实例构造缺省被 ctx 权威覆盖）。
+    ///
+    /// 两轮共用同一 mock 场景脚本（幂等响应每轮 initialize/thread/start/
+    /// turn/start），收帧日志顺序累积——第二轮在第一轮 await 完成后才起跑，
+    /// 帧按轮序落同一日志，按下标断言两形态。
+    #[tokio::test]
+    async fn run_carries_and_omits_effort_and_maps_approval_policy() {
+        let dir =
+            std::env::temp_dir().join(format!("imagent-codex-app-params-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let (script, log) = crate::app_server::mock_support::mock_script(&dir, "params");
+        let conv = "conv-1".to_string();
+        let wd = dir.clone();
+
+        // 形态一：effort=Some("high") × Ask。
+        let mut backend = CodexAppBackend::new(Some("on-request"));
+        backend.program = script.to_string_lossy().into_owned();
+        let (tx, _rx) = mpsc::channel::<AgentChunk>(64);
+        let (_steer_tx, steer_rx) = mpsc::channel::<String>(4);
+        let outcome = backend
+            .run(
+                RoundContext {
+                    conv_id: &conv,
+                    workdir: &wd,
+                    allowed_tools: &[],
+                    initial_todos: &[],
+                    model: None,
+                    effort: Some("high"),
+                    permission_mode: PermissionMode::Ask,
+                    steer: steer_rx,
+                },
+                "带 effort 的一轮",
+                None,
+                tx,
+            )
+            .await
+            .expect("run 应 Ok");
+        assert!(outcome.terminal, "mock 立即 completed，应为正常终态");
+
+        // 形态二（对照）：effort=None × Off，构造缺省 untrusted 亦被 ctx 覆盖。
+        let mut backend2 = CodexAppBackend::new(Some("untrusted"));
+        backend2.program = script.to_string_lossy().into_owned();
+        let (tx2, _rx2) = mpsc::channel::<AgentChunk>(64);
+        let (_steer_tx2, steer_rx2) = mpsc::channel::<String>(4);
+        let conv2 = "conv-2".to_string();
+        backend2
+            .run(
+                RoundContext {
+                    conv_id: &conv2,
+                    workdir: &wd,
+                    allowed_tools: &[],
+                    initial_todos: &[],
+                    model: None,
+                    effort: None,
+                    permission_mode: PermissionMode::Off,
+                    steer: steer_rx2,
+                },
+                "无 effort 的一轮",
+                None,
+                tx2,
+            )
+            .await
+            .expect("run 应 Ok");
+
+        // 断言按帧提取（不依赖 JSON 键序）：两轮各一组 thread/start /
+        // turn/start，轮序 = 日志序。
+        let logged = std::fs::read_to_string(&log).expect("读 mock 日志");
+        let ts_lines: Vec<&str> = logged
+            .lines()
+            .filter(|l| l.contains("\"method\":\"thread/start\""))
+            .collect();
+        assert_eq!(ts_lines.len(), 2, "两轮各一条 thread/start: {logged}");
+        assert!(
+            ts_lines[0].contains("\"approvalPolicy\":\"untrusted\""),
+            "Ask 应映射 untrusted: {}",
+            ts_lines[0]
+        );
+        assert!(
+            ts_lines[1].contains("\"approvalPolicy\":\"never\""),
+            "Off 应映射 never（ctx 权威，非构造缺省 untrusted）: {}",
+            ts_lines[1]
+        );
+        let tn_lines: Vec<&str> = logged
+            .lines()
+            .filter(|l| l.contains("\"method\":\"turn/start\""))
+            .collect();
+        assert_eq!(tn_lines.len(), 2, "两轮各一条 turn/start: {logged}");
+        assert!(
+            tn_lines[0].contains("\"effort\":\"high\""),
+            "ctx.effort 应随 turn/start 透传: {}",
+            tn_lines[0]
+        );
+        assert!(
+            !tn_lines[1].contains("\"effort\""),
+            "ctx.effort=None 不得带 effort 字段（保持现状字节）: {}",
+            tn_lines[1]
+        );
     }
 
     /// B3 能力声明与命名。
@@ -1504,6 +1683,8 @@ mod tests {
                             allowed_tools: &[],
                             initial_todos: &[],
                             model: None,
+                            effort: None,
+                            permission_mode: PermissionMode::Off,
                             steer: steer_rx,
                         },
                         "长任务",
@@ -1515,7 +1696,8 @@ mod tests {
         };
         // 等 mock 收到 turn/start（turn 在飞）再发中断信号——与真实 /stop 时
         // 序一致；即便信号早于事件循环启动，watch 保留版本也会首轮触发。
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // （预算放宽到 15s：全量并行下 mock 进程 spawn + 逐行轮询的尾部抖动。）
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         loop {
             let logged = std::fs::read_to_string(&log).unwrap_or_default();
             if logged.contains("\"method\":\"turn/start\"") {
@@ -1529,7 +1711,7 @@ mod tests {
         }
         backend.interrupt_run(&ConvId("conv-1".into())).await;
 
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), run_handle)
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(25), run_handle)
             .await
             .expect("run 应在预算内自然结束（而非悬挂至超时）")
             .expect("run task join")
@@ -1579,6 +1761,8 @@ mod tests {
                     allowed_tools: &[],
                     initial_todos: &[],
                     model: None,
+                    effort: None,
+                    permission_mode: PermissionMode::Off,
                     steer: steer_rx,
                 },
                 "x",

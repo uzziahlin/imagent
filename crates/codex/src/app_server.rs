@@ -342,13 +342,28 @@ impl AppServerProcess {
     }
 
     /// `turn/start`：发起一轮（input 为 UserInput 数组，文本形
-    /// `{"type":"text","text":..}`）。返回 result（含 `turn.id`）。
-    pub async fn turn_start(&self, thread_id: &str, prompt: &str) -> Result<Value> {
-        self.request(
-            "turn/start",
-            json!({"threadId": thread_id, "input": [{"type":"text","text":prompt}]}),
-        )
-        .await
+    /// `{"type":"text","text":..}`）。
+    ///
+    /// v1.38 P1-b：`effort`——思考深度覆盖。**字段名与载体经 0.166 本地
+    /// `codex app-server generate-json-schema` 实证**：`TurnStartParams.effort`
+    /// （`ReasoningEffort`，minLength≥1 自由字符串；描述「Override the
+    /// reasoning effort for this turn and subsequent turns」）——`thread/start`
+    /// 与 `thread/resume` 的 params **均无** effort 字段，协议唯一入口在此。
+    /// None = 不带字段（保持现状字节）。返回 result（含 `turn.id`）。
+    pub async fn turn_start(
+        &self,
+        thread_id: &str,
+        prompt: &str,
+        effort: Option<&str>,
+    ) -> Result<Value> {
+        let mut params = json!({
+            "threadId": thread_id,
+            "input": [{"type":"text","text":prompt}],
+        });
+        if let Some(e) = effort {
+            params["effort"] = json!(e);
+        }
+        self.request("turn/start", params).await
     }
 
     /// `turn/steer`：运行中转向（expectedTurnId 为活跃 turn 前置条件）。
@@ -622,6 +637,27 @@ done
 exit 0
 "#
             .to_string(),
+            // 场景 F：出站参数 e2e（v1.38 P1-b）——记录 thread/start / turn/start
+            // 帧后立即回响应 + completed 终态收尾；测试断言出站 params 里的
+            // approvalPolicy（thread/start）与 effort（turn/start）有无。
+            "params" => r#"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$LOG"
+  case "$line" in
+    *'"method":"initialize"'*|*'"thread/start"'*|*'"turn/start"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+      case "$line" in
+        *'"method":"initialize"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
+        *'"thread/start"'*) printf '{"id":%s,"result":{"thread":{"id":"th-1"}}}\n' "$id" ;;
+        *'"turn/start"'*)
+          printf '{"id":%s,"result":{"turn":{"id":"turn-1"}}}\n' "$id"
+          printf '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"turn-1","status":"completed","items":[]}}}\n' ;;
+      esac
+      ;;
+  esac
+done
+"#
+            .to_string(),
             _ => String::new(),
         };
         std::fs::write(
@@ -658,7 +694,11 @@ mod tests {
 
     #[tokio::test]
     async fn request_response_correlation_and_notifications() {
-        let (mut proc, _log) = spawn_mock("echo", Duration::from_secs(5)).await;
+        // 预算放宽（5s→30s）：断言的是关联/分发逻辑而非时序；mock 子进程
+        // exec 在满载并行下偶发秒级延迟（新建脚本文件首执行扫描），固定 5s
+        // 会把逻辑正确的往返误杀成超时。真正的超时语义由 slow 场景测试
+        // （150ms 专属预算）覆盖，不受此处放宽影响。
+        let (mut proc, _log) = spawn_mock("echo", Duration::from_secs(30)).await;
         let res = proc
             .request(
                 "initialize",
@@ -698,7 +738,9 @@ mod tests {
 
     #[tokio::test]
     async fn approval_round_trip() {
-        let (mut proc, log) = spawn_mock("approval", Duration::from_secs(10)).await;
+        // 预算放宽同 request_response_correlation（exec 抖动容差；审批回执
+        // 语义断言与时序无关）。
+        let (mut proc, log) = spawn_mock("approval", Duration::from_secs(30)).await;
         proc.request(
             "initialize",
             json!({"clientInfo":{"name":"t","version":"0"}}),
@@ -708,7 +750,7 @@ mod tests {
         proc.thread_start(Path::new("/tmp"), "untrusted", None, "read-only")
             .await
             .expect("thread_start");
-        proc.turn_start("th-1", "run command")
+        proc.turn_start("th-1", "run command", None)
             .await
             .expect("turn_start");
         // 服务端审批请求到达 → allow 回执 → mock 记录后继续吐完成流。
@@ -746,8 +788,17 @@ mod tests {
         )
         .await
         .expect("spawn mock");
-        // 等 reader 收尾（EOF 检出）。
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // 等 reader 收尾（EOF 检出）——轮询 is_closed 而非固定 sleep：固定
+        // 300ms 在满载并行下可能抢在 reader task 退出之前，请求会落到超时
+        // 路径而非连接死亡路径（断言语义失真）。
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !proc.is_closed() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "mock die 场景未在预算内检出 EOF"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         let err = proc
             .request(
                 "initialize",

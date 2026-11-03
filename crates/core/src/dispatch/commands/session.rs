@@ -602,16 +602,24 @@ impl Dispatcher {
         let conv_id_compact = conv.0.clone();
         let agent_timeout = self.agent_timeout;
         let sid = sid.clone();
+        // v1.38 P1-b：维护轮权限档位——压缩轮恒走 default 引擎（上方 backend
+        // 快照），按 default 引擎名现算（与主轮 run 入口同源语义）。
+        let perm_mode_compact = self.effective_permission_mode(backend.name());
         let join = tokio::spawn(async move {
             let backend_name = backend.name();
             // v1.38 P1-a：压缩是系统发起的维护轮——ctx 不带会话模型覆盖
             //（model=None = 引擎实例默认），不播种任务面板、无转向。
+            // v1.38 P1-b：思考深度同语义不带（effort=None）；permission_mode
+            // 按 default 引擎现算组装（codex-app 作 default 时映射 approvalPolicy
+            // 与主轮一致，claude 系忽略）。
             let ctx = RoundContext {
                 conv_id: &conv_id_compact,
                 workdir: &workdir,
                 allowed_tools: &tools,
                 initial_todos: &[],
                 model: None,
+                effort: None,
+                permission_mode: perm_mode_compact,
                 steer: {
                     let (s, r) = mpsc::channel(1);
                     drop(s);

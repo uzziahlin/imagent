@@ -57,6 +57,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 allowed_tools: &["Read".to_string()],
                 initial_todos: &[],
                 model: None,
+                effort: None,
+                permission_mode: imagent_core::PermissionMode::Off,
                 steer: {
                     let (sx, rx) = mpsc::channel(1);
                     drop(sx);

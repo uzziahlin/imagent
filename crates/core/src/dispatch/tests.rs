@@ -330,6 +330,15 @@ struct MockBackend {
     /// v1.38 会话级模型：每次 run 收到的 ctx.model（RoundContext.model 透传
     /// 断言——KV 命中/未命中、切引擎后作用于解析引擎）。
     model_seen: Arc<TokioMutex<Vec<Option<String>>>>,
+    /// v1.38 P1-b 会话级思考深度：supports_effort 返回值（/effort 命令测试用；
+    /// 默认 false 保持既有语义）。
+    effort_supported: bool,
+    /// v1.38 P1-b：每次 run 收到的 ctx.effort（RoundContext.effort 透传断言——
+    /// KV 命中/未命中两形态）。
+    effort_seen: Arc<TokioMutex<Vec<Option<String>>>>,
+    /// v1.38 P1-b：每次 run 收到的 ctx.permission_mode（RoundContext 组装断言
+    /// ——run 入口现算的本轮生效档位）。
+    perm_mode_seen: Arc<TokioMutex<Vec<PermissionMode>>>,
     /// v1.38 会话级模型：set_model 调用记录（钉住 cmd_model 不再全局热设——
     /// 防会话间实例污染回归）。std Mutex——set_model 是同步 trait 方法（async
     /// 上下文内禁 blocking_lock）。
@@ -367,6 +376,9 @@ impl MockBackend {
             model_supported: false,
             model_state: None,
             model_seen: Arc::new(TokioMutex::new(Vec::new())),
+            effort_supported: false,
+            effort_seen: Arc::new(TokioMutex::new(Vec::new())),
+            perm_mode_seen: Arc::new(TokioMutex::new(Vec::new())),
             set_model_log: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
         (b, calls, prompts, order)
@@ -501,16 +513,23 @@ impl Backend for MockBackend {
         chunks: mpsc::Sender<AgentChunk>,
     ) -> Result<crate::types::RunOutcome> {
         // v1.38 P1-a：环境参数自 RoundContext 解构（未消费字段保持忽略语义）；
-        // ctx.model 逐轮记录供透传断言。
+        // ctx.model / ctx.effort / ctx.permission_mode 逐轮记录供透传断言。
         let RoundContext {
             conv_id: _,
             workdir: _,
             allowed_tools: _,
             initial_todos: _,
             model,
+            effort,
+            permission_mode,
             steer,
         } = ctx;
         self.model_seen.lock().await.push(model.map(str::to_string));
+        self.effort_seen
+            .lock()
+            .await
+            .push(effort.map(str::to_string));
+        self.perm_mode_seen.lock().await.push(permission_mode);
         // P0-5 测试：prompt 记录先于 fail 判断（失败轮也要捕获收到的 prompt）。
         self.prompts.lock().await.push(prompt.to_string());
         // steering（v1.17）：drain 转向通道并记录（sender drop 即结束）。
@@ -662,6 +681,10 @@ impl Backend for MockBackend {
     }
     fn model(&self) -> Option<String> {
         self.model_state.clone()
+    }
+    /// v1.38 P1-b 会话级思考深度：能力位（cmd_effort 测试用）。
+    fn supports_effort(&self) -> bool {
+        self.effort_supported
     }
     /// P3-b（code-review v14）：按注入行为返回（Err 分支 panic 由 spawn_blocking
     /// 捕获为 JoinError，正是要测的失败形态）。
@@ -8030,6 +8053,9 @@ struct MultiBackendCtx {
     default_models: Arc<TokioMutex<Vec<Option<String>>>>,
     /// v1.38：extra 引擎 run 收到的 ctx.model 序列（逐轮）。
     extra_models: Arc<TokioMutex<Vec<Option<String>>>>,
+    /// v1.38 P1-b：default 引擎 run 收到的 ctx.permission_mode 序列（ctx 组装
+    /// 断言——run 入口现算的本轮生效档位）。
+    default_perm_modes: Arc<TokioMutex<Vec<PermissionMode>>>,
     /// v1.38：default 引擎 set_model 调用记录（钉住 cmd_model 不再全局热设）。
     default_set_model: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     db: std::path::PathBuf,
@@ -8050,6 +8076,7 @@ async fn build_multi_backend(
     let (mut default_back, default_calls, _prompts, _order) = MockBackend::new_named(default_name);
     default_back.model_supported = true;
     let default_models = default_back.model_seen.clone();
+    let default_perm_modes = default_back.perm_mode_seen.clone();
     let default_set_model = default_back.set_model_log.clone();
     let (mut extra_back, extra_calls, _p2, _o2) = MockBackend::new_named(extra_name);
     extra_back.capability = extra_capability;
@@ -8077,6 +8104,7 @@ async fn build_multi_backend(
         extra_calls,
         default_models,
         extra_models,
+        default_perm_modes,
         default_set_model,
         db,
     }
@@ -8616,6 +8644,296 @@ async fn run_entry_model_kv_miss_passes_none() {
         *ctx.default_models.lock().await,
         vec![None],
         "未命中 KV 时 ctx.model 应为 None"
+    );
+    drop_db(ctx.db).await;
+}
+
+// ---------- v1.38 P1-b：会话级思考深度（KV `effort:<conv>` + /effort 会话语义） ----------
+
+/// v1.38 cmd_effort 测试装配：mock 引擎开 `effort_supported`，白名单/管理员
+/// 名单可分（admin 门槛测试用两档组合）。返回 (disp, inbox, run 收到的
+/// ctx.effort 序列, db)。
+async fn build_effort_ctx(
+    whitelist: Vec<&str>,
+    admins: Vec<String>,
+) -> (
+    Arc<Dispatcher>,
+    Arc<TokioMutex<Vec<String>>>,
+    Arc<TokioMutex<Vec<Option<String>>>>,
+    std::path::PathBuf,
+) {
+    let _ = std::fs::create_dir_all("/tmp/imagent-test-ws");
+    let (plat, inbox, _send_count) = MockPlatform::new();
+    let (mut back, _calls, _prompts, _order) = MockBackend::new();
+    back.effort_supported = true;
+    let effort_seen = back.effort_seen.clone();
+    let (store, db) = tmp_store().await;
+    let disp = Arc::new(Dispatcher::new(
+        Arc::new(plat),
+        Arc::new(back),
+        store,
+        Auth::new(whitelist.into_iter().map(String::from).collect()),
+        std::path::PathBuf::from("/tmp/imagent-test-ws"),
+        vec!["Read".into()],
+        PermissionMode::Off,
+        test_budgets(),
+        CotDetail::Brief,
+        admins,
+    ));
+    (disp, inbox, effort_seen, db)
+}
+
+#[tokio::test]
+async fn cmd_effort_reports_unsupported_backend() {
+    let _serial = SERIAL.lock().await;
+    // MockBackend::new() 缺省 effort_supported=false → 明确提示而非静默无效。
+    let ctx = build(Auth::new(vec!["u1".into()])).await;
+    ctx.disp.handle(msg("c1", "u1", "/effort")).await;
+    let inbox = ctx.inbox.lock().await;
+    assert!(
+        inbox
+            .iter()
+            .any(|t| t.contains("暂不支持思考深度调节") && t.contains("mock-backend")),
+        "应点名不支持思考深度的引擎: {inbox:?}"
+    );
+    drop(inbox);
+    drop_db(ctx.db).await;
+}
+
+#[tokio::test]
+async fn cmd_effort_no_arg_shows_default_then_kv_override() {
+    let _serial = SERIAL.lock().await;
+    let (disp, inbox, _efforts, db) = build_effort_ctx(vec!["u1"], vec!["u1".into()]).await;
+    // 无 KV：显示默认 + 会话级用法。
+    disp.handle(msg("c1", "u1", "/effort")).await;
+    {
+        let inbox = inbox.lock().await;
+        assert!(
+            inbox
+                .iter()
+                .any(|t| t.contains("默认（跟随引擎/账号配置）")),
+            "无 KV 显示引擎默认: {inbox:?}"
+        );
+        assert!(
+            inbox
+                .iter()
+                .any(|t| t.contains("/effort <low|medium|high>")),
+            "用法文案含三值与门槛: {inbox:?}"
+        );
+    }
+    // 写 KV 后：显示本会话覆盖。
+    disp.store
+        .set_config(&crate::backend::effort_key("c1"), "high")
+        .await
+        .expect("写 KV");
+    disp.handle(msg("c1", "u1", "/effort")).await;
+    {
+        let inbox = inbox.lock().await;
+        assert!(
+            inbox.iter().any(|t| t.contains("high（本会话覆盖）")),
+            "KV 命中显示本会话覆盖: {inbox:?}"
+        );
+    }
+    drop_db(db).await;
+}
+
+#[tokio::test]
+async fn cmd_effort_switch_writes_kv_audit_and_run_carries() {
+    let _serial = SERIAL.lock().await;
+    let (disp, inbox, efforts, db) = build_effort_ctx(vec!["u1"], vec!["u1".into()]).await;
+    disp.handle(msg("c1", "u1", "/effort high")).await;
+    // KV 写入（会话级）。
+    let kv = disp
+        .store
+        .get_config(&crate::backend::effort_key("c1"))
+        .await
+        .expect("get_config")
+        .expect("KV 应写入");
+    assert_eq!(kv, "high");
+    {
+        let inbox = inbox.lock().await;
+        assert!(
+            inbox
+                .iter()
+                .any(|t| t.contains("本会话思考深度已切换为 high") && t.contains("/effort default")),
+            "回显切换结果与恢复指引: {inbox:?}"
+        );
+    }
+    // 审计落 effort_switch（actor/target/detail 对准本会话）。
+    let rows = disp
+        .store
+        .list_audit_since("effort_switch", 0)
+        .await
+        .expect("list_audit_since");
+    assert_eq!(rows.len(), 1, "应恰有一条 effort_switch 审计: {rows:?}");
+    assert_eq!(rows[0].actor.as_deref(), Some("u1"));
+    assert_eq!(rows[0].target.as_deref(), Some("c1"));
+    assert_eq!(rows[0].detail.as_deref(), Some("effort=high"));
+    // 下一条消息：KV 解析进 RoundContext.effort 透传。
+    disp.handle(msg("c1", "u1", "hello")).await;
+    assert_eq!(
+        *efforts.lock().await,
+        vec![Some("high".to_string())],
+        "会话 KV 应透传 ctx.effort"
+    );
+    drop_db(db).await;
+}
+
+#[tokio::test]
+async fn cmd_effort_invalid_value_lists_valid_values() {
+    let _serial = SERIAL.lock().await;
+    let (disp, inbox, _efforts, db) = build_effort_ctx(vec!["u1"], vec!["u1".into()]).await;
+    disp.handle(msg("c1", "u1", "/effort ultra")).await;
+    {
+        let inbox = inbox.lock().await;
+        assert!(
+            inbox
+                .iter()
+                .any(|t| t.contains("仅支持 low / medium / high")),
+            "非法值回显合法值列表: {inbox:?}"
+        );
+    }
+    // 非法值不写 KV、不落审计。
+    assert!(
+        disp.store
+            .get_config(&crate::backend::effort_key("c1"))
+            .await
+            .expect("get_config")
+            .is_none(),
+        "非法值路径不得写 KV"
+    );
+    let rows = disp
+        .store
+        .list_audit_since("effort_switch", 0)
+        .await
+        .expect("list_audit_since");
+    assert!(rows.is_empty(), "非法值路径不得落审计: {rows:?}");
+    drop_db(db).await;
+}
+
+#[tokio::test]
+async fn cmd_effort_requires_admin() {
+    let _serial = SERIAL.lock().await;
+    // admin_senders 为空：白名单用户也被拒（引导 config.toml 配置）。
+    let (disp, inbox, _efforts, db) = build_effort_ctx(vec!["u1"], vec![]).await;
+    disp.handle(msg("c1", "u1", "/effort low")).await;
+    {
+        let inbox = inbox.lock().await;
+        assert!(
+            inbox
+                .iter()
+                .any(|t| t.contains("切换思考深度需要管理员") && t.contains("admin_senders")),
+            "空管理员名单应给配置引导: {inbox:?}"
+        );
+    }
+    assert!(
+        disp.store
+            .get_config(&crate::backend::effort_key("c1"))
+            .await
+            .expect("get_config")
+            .is_none(),
+        "拒绝路径不得写 KV"
+    );
+    drop_db(db).await;
+
+    // 有管理员名单但本 sender 不在其中：同样拒绝（查看开放）。
+    let (disp, inbox, _efforts, db) = build_effort_ctx(vec!["u1", "u2"], vec!["u1".into()]).await;
+    disp.handle(msg("c1", "u2", "/effort low")).await;
+    let inbox = inbox.lock().await;
+    assert!(
+        inbox
+            .iter()
+            .any(|t| t.contains("切换思考深度需要管理员") && t.contains("查看用 /effort")),
+        "非 admin 应被拒并指引查看: {inbox:?}"
+    );
+    drop(inbox);
+    drop_db(db).await;
+}
+
+#[tokio::test]
+async fn cmd_effort_default_clears_kv_and_run_falls_back() {
+    let _serial = SERIAL.lock().await;
+    let (disp, inbox, efforts, db) = build_effort_ctx(vec!["u1"], vec!["u1".into()]).await;
+    disp.store
+        .set_config(&crate::backend::effort_key("c1"), "medium")
+        .await
+        .expect("写 KV");
+    disp.handle(msg("c1", "u1", "/effort default")).await;
+    assert!(
+        disp.store
+            .get_config(&crate::backend::effort_key("c1"))
+            .await
+            .expect("get_config")
+            .is_none(),
+        "default 应清除会话 KV"
+    );
+    {
+        let inbox = inbox.lock().await;
+        assert!(
+            inbox.iter().any(|t| t.contains("已恢复引擎默认")),
+            "回显恢复默认: {inbox:?}"
+        );
+    }
+    // 幂等：KV 已空时重复 default 不报错。
+    disp.handle(msg("c1", "u1", "/effort default")).await;
+    // 恢复后轮次：ctx.effort = None（引擎默认兜底）。
+    disp.handle(msg("c1", "u1", "hello")).await;
+    assert_eq!(
+        *efforts.lock().await,
+        vec![None],
+        "default 清 KV 后 run 入口应解析 None"
+    );
+    drop_db(db).await;
+}
+
+#[tokio::test]
+async fn run_entry_effort_kv_miss_passes_none() {
+    let _serial = SERIAL.lock().await;
+    // run 入口 KV 未命中 → ctx.effort = None（引擎默认兜底，行为不变）。
+    let (disp, _inbox, efforts, db) = build_effort_ctx(vec!["u1"], vec!["u1".into()]).await;
+    disp.handle(msg("c1", "u1", "hello")).await;
+    assert_eq!(
+        *efforts.lock().await,
+        vec![None],
+        "未命中 KV 时 ctx.effort 应为 None"
+    );
+    drop_db(db).await;
+}
+
+#[tokio::test]
+async fn run_entry_assembles_effective_permission_mode() {
+    let _serial = SERIAL.lock().await;
+    // v1.38 P1-b：ctx.permission_mode = run 入口现算的本轮生效档位
+    //（effective_mode 与 per-conv capability 门同源）。raw=Ask 对 default mock
+    // 引擎恒等；raw=Auto 对 mock（非 claude-cli/codex-app）解析为 Off。
+    let ctx = build_multi_backend(
+        "mock-backend",
+        "b2",
+        PermissionMode::Ask,
+        crate::backend::PermissionCapability::Unsupported,
+    )
+    .await;
+    ctx.disp.handle(msg("c1", "u1", "hello")).await;
+    assert_eq!(
+        *ctx.default_perm_modes.lock().await,
+        vec![PermissionMode::Ask],
+        "raw=Ask 应原样组装进 ctx.permission_mode"
+    );
+    drop_db(ctx.db).await;
+
+    // raw=Auto × mock → Off（resolve 语义）进 ctx。
+    let ctx = build_multi_backend(
+        "mock-backend",
+        "b2",
+        PermissionMode::Auto,
+        crate::backend::PermissionCapability::Unsupported,
+    )
+    .await;
+    ctx.disp.handle(msg("c1", "u1", "hello")).await;
+    assert_eq!(
+        *ctx.default_perm_modes.lock().await,
+        vec![PermissionMode::Off],
+        "raw=Auto × mock 引擎应解析 Off 进 ctx.permission_mode"
     );
     drop_db(ctx.db).await;
 }

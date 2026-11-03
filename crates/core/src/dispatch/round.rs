@@ -250,6 +250,22 @@ impl Dispatcher {
                 None
             }
         };
+        // v1.38 P1-b 会话级思考深度：`/effort` 写入的 per-conv KV（键名事实源
+        // `effort_key`）在此解析进本轮 RoundContext——命中 → ctx.effort 透传；
+        // 未命中 / 空值 → None（引擎默认）。容错与 session_model 同款：store
+        // 错误仅 log 后按未命中处理。
+        let session_effort = match self.store.get_config(&effort_key(&conv.0)).await {
+            Ok(v) => v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+            Err(e) => {
+                warn!(
+                    target: "imagent::core",
+                    conv_id = %conv.0,
+                    error = %e,
+                    "会话级思考深度 KV 读取失败（按未命中处理）"
+                );
+                None
+            }
+        };
         // 权限档位按解析结果现算（raw config 档 × 本轮引擎名）：ask 闭环档 ×
         // 非 FullLoop **覆盖引擎**在本轮拒绝执行——default 引擎的闭环档校验归
         // 启动期 / 热切路径 fail-closed（生产中 default × 闭环档 × 非 FullLoop
@@ -547,13 +563,17 @@ impl Dispatcher {
             // v1.38 P1-a：本轮执行环境收敛为 RoundContext（字段语义见该结构
             // doc）——conv/workdir/工具白名单/任务种子借用本轮 move 进闭包的
             // 快照，model = 会话级 KV 解析结果（None = 引擎实例默认），steer
-            // 随 ctx 进入 backend。
+            // 随 ctx 进入 backend。v1.38 P1-b：effort = 会话级 KV 解析结果
+            //（None = 引擎默认）；permission_mode = 入口现算的本轮生效档位
+            //（与上方 capability 门同源的 effective_mode）。
             let ctx = RoundContext {
                 conv_id: &conv_id_owned,
                 workdir: &workdir,
                 allowed_tools: &tools,
                 initial_todos: &seed_todos,
                 model: session_model.as_deref(),
+                effort: session_effort.as_deref(),
+                permission_mode: effective_mode,
                 steer: steer_rx,
             };
             // agent_timeout = 0 = 关闭总超时（默认 3600s=1h 硬上限）：墙钟总预算

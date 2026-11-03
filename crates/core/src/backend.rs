@@ -6,6 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
+use crate::config::PermissionMode;
 use crate::error::Result;
 use crate::types::{AgentChunk, ConvId, LocalSession, RunOutcome, SessionId, TodoItem};
 
@@ -107,6 +108,17 @@ pub fn model_key(conv_id: &str) -> String {
     format!("{MODEL_KV_PREFIX}{conv_id}")
 }
 
+/// per-conv 会话级思考深度覆盖键前缀（v1.38 P1-b）：`/effort` 命令写入，run
+/// 入口解析进 [`RoundContext::effort`]。与 `model:<conv>` 同一张 store config
+/// KV 表、同风格键名；本模块是键名事实源。值 = 引擎侧思考深度档（codex-app
+/// 为 `low|medium|high`，`/effort` 白名单收敛）；不存在 / 空 = 引擎默认。
+pub const EFFORT_KV_PREFIX: &str = "effort:";
+
+/// per-conv 会话级思考深度覆盖的 config 键：`effort:<conv_id>`。
+pub fn effort_key(conv_id: &str) -> String {
+    format!("{EFFORT_KV_PREFIX}{conv_id}")
+}
+
 /// 单轮 agent 执行上下文（v1.38 P1-a：`Backend::run` 参数收敛）——**本轮定死、
 /// 不随会话漂移**的执行环境参数整体收拢，`run` 本体只留语义核心三参（prompt /
 /// session / chunks，见 [`Backend::run`]）。
@@ -128,6 +140,18 @@ pub struct RoundContext<'a> {
     /// 本轮模型覆盖（会话级 KV `model:<conv>` 的解析结果；None = 引擎实例默认
     /// ——config 基准 / CLI 自身默认）。消费点一律 ctx 优先、None 回退实例默认。
     pub model: Option<&'a str>,
+    /// 本轮思考深度（v1.38 P1-b：会话级 KV `effort:<conv>` 的解析结果；None =
+    /// 引擎默认——跟随引擎/账号配置）。消费点一律 ctx 优先、None 不下发（保持
+    /// 现状字节）；本轮引擎不支持（[`Backend::supports_effort`] = false）时
+    /// dispatcher 侧已被 `/effort` 挡下，backend 侧忽略即可。
+    pub effort: Option<&'a str>,
+    /// 本轮生效权限档位（v1.38 P1-b）= raw config 档 × 本轮引擎名
+    /// （`effective_permission_mode`，run 入口现算——与 per-conv capability 门
+    /// 同源同值，直接复用组装）。自带权限链的后端（claude-cli 的实例句柄 /
+    /// 原生档）忽略本字段、行为零变化；codex-app 据此映射 thread/start|resume
+    /// 的 `approvalPolicy`（`/perm` 全局热切 → raw 档变 → 下一条消息 run 入口
+    /// 现算进 ctx → codex 会话免重启生效）。
+    pub permission_mode: PermissionMode,
     /// 运行中转向通道（v1.17）——dispatcher 把运行中到达的用户消息经此注入
     /// 当轮（CLI 系 backend 转写 stdin user 行；实验校准：CLI 在下个工具边界
     /// 交付）。不支持的 backend 直接 drop（dispatcher 依
@@ -234,6 +258,16 @@ pub trait Backend: Send + Sync {
         false
     }
 
+    /// v1.38 P1-b：是否支持思考深度调节（`/effort` 命令；协议面为 codex
+    /// app-server `turn/start` 的 `effort` 参数——0.166 schema 实证，见
+    /// codex crate 侧注释）。默认 `false`；本批仅 codex-app 覆写 `true`。
+    /// claude 的 thinking 预算透传留后续（headless spawn 参数面另有接线点，
+    /// 不与本能力位共用）；gemini / codex-exec 无对应透传参数，`cmd_effort`
+    /// 已按本能力位挡下、backend 侧无需防御。
+    fn supports_effort(&self) -> bool {
+        false
+    }
+
     /// B3：权限审批能力声明（能力协商）。dispatcher 启动时校验：
     /// `permission_mode = ask/auto-claude`（needs_socket 闭环类档）而本能力非
     /// `FullLoop` 时 fail-closed 拒绝启动。默认 `Unsupported`，各 backend
@@ -306,5 +340,14 @@ mod backend_key_tests {
         assert_eq!(MODEL_KV_PREFIX, "model:");
         assert_eq!(model_key("feishu:ou_x"), "model:feishu:ou_x");
         assert_eq!(model_key("local:work"), "model:local:work");
+    }
+
+    /// 会话级思考深度 KV 键名布局钉住（v1.38 P1-b：/effort 命令写入与 run 入口
+    /// 解析的互通契约；与 model_key 同风格同表）。
+    #[test]
+    fn effort_key_layout() {
+        assert_eq!(EFFORT_KV_PREFIX, "effort:");
+        assert_eq!(effort_key("feishu:ou_x"), "effort:feishu:ou_x");
+        assert_eq!(effort_key("local:work"), "effort:local:work");
     }
 }

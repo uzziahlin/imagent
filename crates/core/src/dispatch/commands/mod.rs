@@ -48,6 +48,7 @@ const KNOWN_COMMAND_WORDS: &[&str] = &[
     "/delegate",
     "/disallow",
     "/doctor",
+    "/effort",
     "/export",
     "/file",
     "/help",
@@ -413,6 +414,10 @@ impl Dispatcher {
                     }
                     "/model" => {
                         self.cmd_model(&conv, &sender.0, &hint, &parts).await;
+                        return;
+                    }
+                    "/effort" => {
+                        self.cmd_effort(&conv, &sender.0, &hint, &parts).await;
                         return;
                     }
                     "/delegate" => {

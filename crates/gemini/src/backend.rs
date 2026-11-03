@@ -103,13 +103,16 @@ impl Backend for GeminiBackend {
         chunks: tokio::sync::mpsc::Sender<AgentChunk>,
     ) -> Result<RunOutcome> {
         // v1.38 P1-a：本轮执行环境自 RoundContext 解构（任务种子/转向通道本后端
-        // 不消费，保持原忽略语义）。
+        // 不消费，保持原忽略语义；P1-b 的 effort/permission_mode 无透传点，忽略
+        // ——gemini 无思考深度参数，权限靠 --approval-mode 原生档）。
         let RoundContext {
             conv_id,
             workdir,
             allowed_tools,
             initial_todos: _,
             model: model_override,
+            effort: _,
+            permission_mode: _,
             steer: _,
         } = ctx;
         debug!(target: "imagent::gemini", conv_id, "gemini run start");
@@ -355,6 +358,8 @@ mod tests {
                     allowed_tools: &[],
                     initial_todos: &[],
                     model: None,
+                    effort: None,
+                    permission_mode: imagent_core::PermissionMode::Off,
                     steer: {
                         let (sx, rx) = tokio::sync::mpsc::channel(1);
                         drop(sx);

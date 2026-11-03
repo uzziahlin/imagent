@@ -215,6 +215,10 @@ impl DelegateApi for MainDelegateRunner {
                 allowed_tools: &target.allowed_tools,
                 initial_todos: &[],
                 model: None,
+                // v1.38 P1-b：effort/permission_mode 与上注同语义——副轮隔离，
+                // Off 档为实况（codex-app 作副后端时映射 never，不挂审批）。
+                effort: None,
+                permission_mode: imagent_core::PermissionMode::Off,
                 steer: steer_rx,
             },
             &req.prompt,
