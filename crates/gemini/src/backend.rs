@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use imagent_core::{
     backend_common::{spawn_cli_backend, CliEvent, WRITE_OR_EXEC},
-    AgentChunk, Backend, PermissionCapability, Result, RunOutcome, SessionId,
+    AgentChunk, Backend, PermissionCapability, Result, RoundContext, RunOutcome, SessionId,
 };
 use tokio::process::Command;
 use tracing::debug;
@@ -19,6 +19,8 @@ use crate::stream::{parse_line, ParsedEvent};
 /// MVP 无状态、不做 IM 权限审批闭环（依赖 approval-mode + workdir 锁定兜底）。
 pub struct GeminiBackend {
     /// v1.21 /model：运行时模型覆盖（`gemini -m <model>`；None = CLI 默认）。
+    /// v1.38：实例默认基准（config 注入/SIGHUP 重置）；会话级覆盖走
+    /// RoundContext.model 优先，本字段只承担未覆盖会话的兜底。
     model: std::sync::RwLock<Option<String>>,
     // 【记录在案的已知限制】幽灵会话预检不做（v13 P3 批定案，非待办）。
     //
@@ -95,15 +97,21 @@ impl Backend for GeminiBackend {
 
     async fn run(
         &self,
-        conv_id: &str,
+        ctx: RoundContext<'_>,
         prompt: &str,
         session: Option<&SessionId>,
-        workdir: &std::path::Path,
-        allowed_tools: &[String],
         chunks: tokio::sync::mpsc::Sender<AgentChunk>,
-        _initial_todos: &[imagent_core::TodoItem],
-        _steer: tokio::sync::mpsc::Receiver<String>,
     ) -> Result<RunOutcome> {
+        // v1.38 P1-a：本轮执行环境自 RoundContext 解构（任务种子/转向通道本后端
+        // 不消费，保持原忽略语义）。
+        let RoundContext {
+            conv_id,
+            workdir,
+            allowed_tools,
+            initial_todos: _,
+            model: model_override,
+            steer: _,
+        } = ctx;
         debug!(target: "imagent::gemini", conv_id, "gemini run start");
         // B13a：ARG_MAX 防护——gemini 的 prompt 只能整条作 `--prompt=<prompt>` 单
         // argv 传入。gemini CLI headless（-p）模式没有从 stdin 读 prompt 的机制
@@ -142,8 +150,12 @@ impl Backend for GeminiBackend {
         }
         // headless 必需：信任当前 workspace，否则 trustedFolders 拒绝。
         cmd.arg("--skip-trust");
-        // v1.21 /model：运行时模型覆盖（None = CLI 默认）。
-        if let Some(m) = self.model.read().unwrap_or_else(|e| e.into_inner()).clone() {
+        // v1.21 /model：运行时模型覆盖。v1.38 会话级模型：ctx.model（KV
+        // `model:<conv>` 命中）优先，None 回退实例默认（config 基准 / CLI 默认）。
+        let model = model_override
+            .map(str::to_string)
+            .or_else(|| self.model.read().unwrap_or_else(|e| e.into_inner()).clone());
+        if let Some(m) = model {
             cmd.arg("-m").arg(m);
         }
         // prompt 绑定到 flag（防止 prompt 以 `-` 开头被误解析）。
@@ -337,18 +349,21 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let err = GeminiBackend::new()
             .run(
-                "c1",
+                RoundContext {
+                    conv_id: "c1",
+                    workdir: std::path::Path::new("/tmp"),
+                    allowed_tools: &[],
+                    initial_todos: &[],
+                    model: None,
+                    steer: {
+                        let (sx, rx) = tokio::sync::mpsc::channel(1);
+                        drop(sx);
+                        rx
+                    },
+                },
                 &long,
                 None,
-                std::path::Path::new("/tmp"),
-                &[],
                 tx,
-                &[],
-                {
-                    let (sx, rx) = tokio::sync::mpsc::channel(1);
-                    drop(sx);
-                    rx
-                },
             )
             .await
             .unwrap_err();

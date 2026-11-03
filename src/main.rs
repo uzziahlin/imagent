@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
+use imagent_core::Backend as _;
 use tracing_subscriber::EnvFilter;
 
 mod backup;
@@ -803,10 +804,14 @@ async fn main() -> Result<()> {
             // 惰性（Backend::new 纯内存字段初始化，无 IO——见
             // build_extra_backends doc），提前调用零副作用；实例表只构造
             // 一次，名字在此借出后原表仍 move 进 set_extra_backends。
-            let extras = build_extra_backends(
+            // v1.38 extras 补全：新依赖（bitable 开关）构造时点在 :750 附近、
+            // 早于本调用——时序核实无需上移；codex-app 桥闭包内联构造（纯
+            // 内存捕获，无 IO）。extra claude 具体句柄随后用于沙箱统一注入。
+            let (extras, extra_claude) = build_extra_backends(
                 &config.agent,
-                config.permission_mode,
+                &config,
                 std::time::Duration::from_secs(config.permission_ask_timeout_secs),
+                bitable_on,
             );
             // v1.36 引擎名单：default 在首位 + extras 保序去重（与
             // set_extra_backends 内的注册表按名去重同口径，万一重名快照也
@@ -982,6 +987,16 @@ async fn main() -> Result<()> {
             // v1.32：OS 级沙箱注入（claude-cli 句柄 + 计划返给 delegate 的
             // claude 副后端；Linux 无 bwrap 降级 off 的 warn 在装配函数内打）。
             let sandbox_plan = ops::apply_agent_sandbox(claude_cli_handle.as_deref(), &config);
+            // v1.38 extras 补全：extra claude-cli 与 default 同注一份沙箱计划
+            //（同源 resolve——Off 时不注入，映射与 apply_agent_sandbox 内单
+            // 句柄分支一致；SIGHUP 热载不波及 extras，重启恢复 config 基准）。
+            if let Some(h) = extra_claude.as_deref() {
+                let effective = match &sandbox_plan {
+                    imagent_core::SandboxPlan::Off => None,
+                    _ => Some(sandbox_plan.clone()),
+                };
+                h.set_sandbox(effective, config.agent_sandbox_extra_write.clone());
+            }
             // v1.31：委托编排注入（[[delegate]] 条目 → 副后端表；socket
             // kind=delegate 请求与 /delegate 命令经它跑副轮）。
             delegate::apply(&dispatcher, &config, &sandbox_plan);
@@ -1581,30 +1596,14 @@ fn build_backend(
             let app = Arc::new(imagent_codex::CodexAppBackend::new(None));
             // 批 2 模型三层链第①层（实时 model/list）：sync 闭包桥接批 1 的
             // async list_models（每次自 spawn 临时 app-server，不要求活跃
-            // thread）。桥接走独立线程 + 临时 current-thread runtime——不依赖
-            // 调用方 runtime 形态（workspace 泵在生产是多线程 runtime worker，
-            // block_in_place 会在别的执行上下文里 panic）；list_models 自身
-            // fail-soft（spawn/协议失败回空），线程 join 失败同样回空——实时层
-            // 只是加速与新鲜度，任何失败静默落回退链（config.toml → official）。
-            // 频率面：仅 web 驾驶舱快照动作触发（低频），每次一线程 + 临时
-            // runtime 的代价可接受。
-            let list_models: Arc<imagent_web::models::ListModelsFn> = {
-                let app = app.clone();
-                Arc::new(move || {
-                    let app = app.clone();
-                    std::thread::scope(|s| {
-                        s.spawn(|| {
-                            tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()
-                                .map(|rt| rt.block_on(app.list_models()))
-                                .unwrap_or_default()
-                        })
-                        .join()
-                        .unwrap_or_default()
-                    })
-                })
-            };
+            // thread）。v1.38 extras 补全：桥接构造上移收口到
+            // `install_list_models_bridge`（实例自含同款桥）——default 路径把
+            // 返回的桥句柄转发给 web ModelsContext（独立线程 + 临时
+            // current-thread runtime，不依赖调用方 runtime 形态；list_models
+            // fail-soft，任何失败静默落回退链 config.toml → official。频率面：
+            // 仅 web 驾驶舱快照动作触发，低频可接受）。
+            let list_models: Arc<imagent_web::models::ListModelsFn> =
+                app.install_list_models_bridge();
             Ok((app, None, Some(list_models)))
         }
         "gemini" => Ok((Arc::new(imagent_gemini::GeminiBackend::new()), None, None)),
@@ -1673,31 +1672,65 @@ fn build_backend(
 /// - gemini / codex(exec) 不常驻——仅当 config.agent 指定（即成为 default）
 ///   时存在；
 /// - claude-cli 实例持**独立**的 permission_mode 快照句柄
-///   （`config_mode.resolve("claude-cli")`——auto → AutoClaude）：全局句柄存的是
-///   default 后端的解析结果（如 default=codex-app 时句柄为 Auto），共享会让
-///   该实例把 Auto 当「未接线」静默 headless 化；代价是 /perm 热切与 SIGHUP
-///   不波及此实例（重启恢复 config 基准）。运行参数（模型/沙箱/MCP 运行时
-///   选项）同样仅注入 default 实例——要完整 claude-cli 体验请直接
-///   agent="claude-cli"（default 全量装配）。
+///   （`config.permission_mode.resolve("claude-cli")`——auto → AutoClaude）：
+///   全局句柄存的是 default 后端的解析结果（如 default=codex-app 时句柄为
+///   Auto），共享会让该实例把 Auto 当「未接线」静默 headless 化；代价是 /perm
+///   热切与 SIGHUP 不波及此实例（重启恢复 config 基准）。运行参数（审批通道/
+///   运行选项/基准模型/原生权限档）v1.38 起与 default 同源全量注入——消除
+///   /backend 切换后的实例断链（沙箱在 main 装配段随 default 同一计划统一
+///   注入，见 `apply_agent_sandbox` 调用处）；
+/// - codex-app 实例 v1.38 起自含实时模型目录桥（`install_list_models_bridge`
+///   与 default 装配同款）——web 消费面装配仍走 default 桥（ModelsContext
+///   单闭包结构本批不动），实例断链在构造面消除。
 ///
-/// 返回按注册顺序的实例表（Dispatcher::set_extra_backends 内再按名去重）。
+/// 返回（按注册顺序的实例表，Dispatcher::set_extra_backends 内再按名去重；
+/// extra claude-cli 的具体类型句柄——沙箱注入用，非 claude-cli default 时为
+/// Some）。实例表只构造一次：句柄是表内 Arc 的 clone，原表仍 move 进
+/// set_extra_backends。
 fn build_extra_backends(
     default_agent: &str,
-    config_mode: imagent_core::PermissionMode,
+    config: &imagent_core::Config,
     ask_timeout: std::time::Duration,
-) -> Vec<Arc<dyn imagent_core::Backend>> {
+    bitable: bool,
+) -> (
+    Vec<Arc<dyn imagent_core::Backend>>,
+    Option<Arc<imagent_claude::ClaudeBackend>>,
+) {
     let mut extras: Vec<Arc<dyn imagent_core::Backend>> = Vec::new();
+    let mut extra_claude: Option<Arc<imagent_claude::ClaudeBackend>> = None;
     if default_agent != "claude-cli" {
         let claude = Arc::new(imagent_claude::ClaudeBackend::with_permission_mode_shared(
-            Arc::new(parking_lot::RwLock::new(config_mode.resolve("claude-cli"))),
+            Arc::new(parking_lot::RwLock::new(
+                config.permission_mode.resolve("claude-cli"),
+            )),
             ask_timeout,
         ));
+        // v1.38 extras 补全：与 default claude-cli（build_backend `_` 分支）
+        // 同源全量注入，逐项对齐——
+        // ①审批传输通道（config `claude_permission_channel`，control/mcp 同键）；
+        // ②运行参数（fallback 模型/禁用工具/附加系统提示/用户 MCP servers/
+        //   hide_state_dir/bitable/delegates——apply_claude_runtime_opts 一体）；
+        // ③基准模型（config `claude_model`——会话无 KV 覆盖与 /model default
+        //   恢复时的实例默认与 default 实例一致，消除 /model 显示与实际行为
+        //   的实例间漂移）；
+        // ④原生权限模式透传（config `backend_permission_mode`，P8-4——claude
+        //   支持该透传，缺注入会让切换后的会话丢 --permission-mode 档位）。
+        claude.set_permission_channel(&config.claude_permission_channel);
+        ops::apply_claude_runtime_opts(&claude, config, bitable);
+        claude.set_model(config.claude_model.clone());
+        claude.set_native_permission_mode(config.backend_permission_mode.clone());
+        extra_claude = Some(claude.clone());
         extras.push(claude);
     }
     if default_agent != "codex-app" {
-        extras.push(Arc::new(imagent_codex::CodexAppBackend::new(None)));
+        let app = Arc::new(imagent_codex::CodexAppBackend::new(None));
+        // v1.38 extras 补全：实时模型目录桥与 default 同款（构造为纯闭包捕获
+        // 本实例 Arc，无 IO，时序不受装配顺序约束；web ModelsContext 消费面
+        // 装配仍走 default 桥——本批不改 models 段结构）。
+        app.install_list_models_bridge();
+        extras.push(app);
     }
-    extras
+    (extras, extra_claude)
 }
 
 // ---------------------------------------------------------------------------
@@ -2112,5 +2145,68 @@ mod term_view_cli_tests {
         }
         let cli = Cli::try_parse_from(["imagent", "claude"]).expect("缺省会话应可解析");
         assert!(matches!(cli.cmd, Cmd::Claude { session: None }));
+    }
+}
+
+/// v1.38 extras 补全：注册表装配与 default 同源对齐（claude extra 全量注入的
+/// 可观测面 + codex-app extra 名单/去重；构造惰性无 IO，同步可测）。
+#[cfg(test)]
+mod extras_assembly_tests {
+    use super::*;
+
+    fn test_config(agent: &str, model: Option<&str>) -> imagent_core::Config {
+        let mut cfg: imagent_core::Config = serde_json::from_str(r#"{"default_workdir": "/tmp"}"#)
+            .expect("最小 config 应可反序列化");
+        cfg.agent = agent.to_string();
+        cfg.claude_model = model.map(String::from);
+        cfg
+    }
+
+    #[test]
+    fn extras_claude_aligns_with_default_baseline() {
+        let config = test_config("gemini", Some("glm-4.7"));
+        let (extras, extra_claude) = build_extra_backends(
+            "gemini",
+            &config,
+            std::time::Duration::from_secs(300),
+            false,
+        );
+        assert_eq!(
+            extras.iter().map(|b| b.name()).collect::<Vec<_>>(),
+            vec!["claude-cli", "codex-app"],
+            "注册表名单（default=gemini 不在表内）"
+        );
+        let claude = extra_claude.expect("非 claude-cli default 应返回 claude extra 句柄");
+        // 基准模型与 default 同源——/model 无参显示与 KV 未命中兜底的实例默认
+        // 两实例一致（实例断链消除的可观测面）。
+        assert_eq!(
+            claude.model().as_deref(),
+            Some("glm-4.7"),
+            "extra claude 基准模型应与 config 同源"
+        );
+        assert!(
+            claude.supports_native_permission_mode(),
+            "原生权限档透传能力位（set_native_permission_mode 注入前提）"
+        );
+    }
+
+    #[test]
+    fn extras_skip_default_names() {
+        let config = test_config("claude-cli", None);
+        let (extras, extra_claude) = build_extra_backends(
+            "claude-cli",
+            &config,
+            std::time::Duration::from_secs(300),
+            false,
+        );
+        assert_eq!(
+            extras.iter().map(|b| b.name()).collect::<Vec<_>>(),
+            vec!["codex-app"],
+            "与 default 同名者跳过（claude-cli 为 default 时只补 codex-app）"
+        );
+        assert!(
+            extra_claude.is_none(),
+            "default 已是 claude-cli：无 extra claude 句柄"
+        );
     }
 }

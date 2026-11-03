@@ -18,7 +18,7 @@
 //! 单独一条回归用例。
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,7 +27,7 @@ use ed25519_dalek::SigningKey;
 use futures::{SinkExt, StreamExt};
 use imagent_core::{
     AgentChunk, Backend, CardPhase, CardTerminal, ConvId, CoreError, OutboundCard, Platform,
-    ReplyHint, Result, RunOutcome, SessionId, TodoItem,
+    ReplyHint, Result, RunOutcome, SessionId,
 };
 use imagent_relay::{spawn_relay, RelayConfig, RelayHandle};
 use imagent_store::Store;
@@ -88,17 +88,12 @@ struct NopBackend;
 
 #[async_trait]
 impl Backend for NopBackend {
-    #[allow(clippy::too_many_arguments)] // trait 方法固定形状（先例 backend.rs）
     async fn run(
         &self,
-        _conv_id: &str,
+        _ctx: imagent_core::RoundContext<'_>,
         _prompt: &str,
         _session: Option<&SessionId>,
-        _workdir: &Path,
-        _allowed_tools: &[String],
         _chunks: mpsc::Sender<AgentChunk>,
-        _initial_todos: &[TodoItem],
-        _steer: mpsc::Receiver<String>,
     ) -> Result<RunOutcome> {
         Err(CoreError::Platform("test", "nop backend 不执行 run".into()))
     }

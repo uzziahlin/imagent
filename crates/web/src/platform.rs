@@ -368,7 +368,8 @@ async fn handle_workspace_action(
 /// 链 = 实时 list_models（[`ModelsContext::list_models`]，经 `spawn_blocking`
 /// 调——实现侧自 spawn 临时 app-server，秒级阻塞不占 reactor worker，panic/
 /// 失败回空静默落下层）→ codex config catalog → official.codex。current =
-/// backend.model()——/model 命令热设值；空 options 组帧出口整段缺席）。
+/// backend.model()——引擎实例默认（v1.38 会话级 /model 覆盖不进此快照，以
+/// IM /model 回显为准）；空 options 组帧出口整段缺席）。
 /// best-effort：单段 list 失败 → warn + 该段空，快照照发（SPA 单一数据来源，
 /// 宁可缺段不可断流）。
 async fn build_workspaces_frame(
@@ -1673,17 +1674,12 @@ mod tests {
 
     #[async_trait]
     impl Backend for TestBackend {
-        #[allow(clippy::too_many_arguments)] // trait 方法固定形状（先例 backend.rs）
         async fn run(
             &self,
-            _conv_id: &str,
+            _ctx: imagent_core::RoundContext<'_>,
             _prompt: &str,
             _session: Option<&imagent_core::SessionId>,
-            _workdir: &Path,
-            _allowed_tools: &[String],
             _chunks: tokio::sync::mpsc::Sender<imagent_core::AgentChunk>,
-            _initial_todos: &[imagent_core::TodoItem],
-            _steer: tokio::sync::mpsc::Receiver<String>,
         ) -> Result<imagent_core::RunOutcome> {
             Err(CoreError::Platform(
                 "test",

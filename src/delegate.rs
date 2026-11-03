@@ -20,7 +20,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use imagent_core::{Backend, Config, DelegateApi, DelegateDesc, DelegateRequest};
+use imagent_core::{Backend, Config, DelegateApi, DelegateDesc, DelegateRequest, RoundContext};
 
 /// 全局并发闸：同时在飞的副轮上限（等待期间不影响其它委托名——按先来先得）。
 const DELEGATE_MAX_CONCURRENT: usize = 4;
@@ -205,16 +205,21 @@ impl DelegateApi for MainDelegateRunner {
         drop(_steer_tx);
 
         let run_fut = target.backend.run(
-            // conv_id 仅用于后端内日志/MCP 标注；副后端 Off 档不挂审批，
-            // 不会经它路由任何 IM 消息（见模块文档的隔离设计）。
-            "delegate",
+            // v1.38 P1-a：环境参数收敛为 RoundContext（任务种子为空、模型覆盖
+            // None = 副后端实例默认、无转向——副轮隔离语义不变）。
+            RoundContext {
+                // conv_id 仅用于后端内日志/MCP 标注；副后端 Off 档不挂审批，
+                // 不会经它路由任何 IM 消息（见模块文档的隔离设计）。
+                conv_id: "delegate",
+                workdir: &self.workdir,
+                allowed_tools: &target.allowed_tools,
+                initial_todos: &[],
+                model: None,
+                steer: steer_rx,
+            },
             &req.prompt,
             None,
-            &self.workdir,
-            &target.allowed_tools,
             chunks_tx,
-            &[],
-            steer_rx,
         );
         let outcome = tokio::time::timeout(budget, run_fut).await;
         // run 结束（或超时被 drop）→ chunks_tx 已释放 → drain 自然收尾。

@@ -64,8 +64,8 @@ use agent_client_protocol::{AcpAgent, Client, ConnectionTo};
 use async_trait::async_trait;
 use imagent_core::{
     AgentChunk, Backend, CoreError, ImPermissionAsk, ImPermissionHook, LocalSession,
-    PermissionCapability, PermissionMode, Result, RunOutcome, SessionId, TodoItem, TodoStatus,
-    UsageStats,
+    PermissionCapability, PermissionMode, Result, RoundContext, RunOutcome, SessionId, TodoItem,
+    TodoStatus, UsageStats,
 };
 use parking_lot::RwLock;
 use tokio::sync::Mutex;
@@ -160,8 +160,11 @@ pub struct AcpBackend {
     /// B3：dispatcher 注入的 IM 审批闭环回调（run() 启动时注入一次；None =
     /// 未注入（独立使用/测试），Ask 档 fail-closed）。
     hook: RwLock<Option<ImPermissionHook>>,
-    /// W2-4：运行时模型（`/model` 热设）——spawn 子进程时以 `ANTHROPIC_MODEL`
+    /// W2-4：运行时模型——spawn 子进程时以 `ANTHROPIC_MODEL`
     /// 前导 env 注入（`AcpAgent::from_str` 支持 NAME=value 前导语法）。
+    /// v1.38：实例默认基准（config 注入/SIGHUP 重置）；会话级 /model 覆盖经
+    /// RoundContext.model 优先（仅作用于新建连接，既有连接不追改），本字段
+    /// 只承担未覆盖会话的兜底。
     model: RwLock<Option<String>>,
     /// B2/P5-14：conv_id → 长驻连接 map（惰性建立；task 退出时自摘除）。
     conns: Arc<Mutex<HashMap<String, Arc<LongLivedAcp>>>>,
@@ -280,7 +283,9 @@ impl AcpBackend {
 
     /// B2/P5-14：取（或启动）该 conv 的长驻连接。存活（prompt_tx 未关闭）则复用；
     /// 僵尸条目顺手清理；新建受 [`MAX_CONCURRENT_CONNS`] 上限约束（超限拒绝）。
-    async fn long_lived(&self, conv: &str) -> Result<Arc<LongLivedAcp>> {
+    /// `model` 为本轮解析的模型（ctx.model 优先 → 实例默认回退，run 入口已并
+    /// 合）；仅作用于**新建**连接的 ANTHROPIC_MODEL env，既有连接不追改。
+    async fn long_lived(&self, conv: &str, model: Option<String>) -> Result<Arc<LongLivedAcp>> {
         let mut g = self.conns.lock().await;
         // 顺手清理僵尸条目（task 已退出的连接），让上限计数只算活连接。
         g.retain(|_, v| !v.prompt_tx.is_closed());
@@ -301,7 +306,7 @@ impl AcpBackend {
         }
         let hook = self.hook.read().clone();
         let idle = self.conn_idle_recycle;
-        let ll = match self.spawn_transport().await? {
+        let ll = match self.spawn_transport(model).await? {
             // 存储适配随 transport 选型：真机用 backend 的 per-agent 存储
             //（claude-acp = ClaudeStorage 扫 ~/.claude；泛化 acp = NoStorage
             // 不预检）；mock 通道的会话语义由测试自定义（sid 不必真实存在），
@@ -359,13 +364,15 @@ impl AcpBackend {
     /// 限制（ACP 非主链路，claude-cli 已有完整上限）。
     /// in-process mock（见 [`Self::with_mock_factory`]）。W2-4：设置了运行时模型时，
     /// 命令串前导注入 `ANTHROPIC_MODEL=<model>` env（`AcpAgent::from_str` 的
-    /// NAME=value 前导语法；子进程内 claude CLI 读取该 env）。
-    async fn spawn_transport(&self) -> Result<Transport> {
+    /// NAME=value 前导语法；子进程内 claude CLI 读取该 env）。v1.38：model 由
+    /// run 入口解析传入（ctx.model 优先 → 实例默认回退——None 时此处再读实例，
+    /// 兼容测试直调 long_lived 的路径）。
+    async fn spawn_transport(&self, model: Option<String>) -> Result<Transport> {
         #[cfg(test)]
         if let Some(f) = &self.mock_factory {
             return Ok(Transport::Mock(f()));
         }
-        let cmd = self.sanitized_agent_command(self.model.read().clone());
+        let cmd = self.sanitized_agent_command(model.or_else(|| self.model.read().clone()));
         let agent = AcpAgent::from_str(&cmd)
             .map_err(|e| CoreError::Backend(self.name, format!("解析 agent 命令失败: {e}")))?;
         Ok(Transport::Real(agent))
@@ -1053,15 +1060,21 @@ impl Backend for AcpBackend {
 
     async fn run(
         &self,
-        conv_id: &str,
+        ctx: RoundContext<'_>,
         prompt: &str,
         session: Option<&SessionId>,
-        workdir: &std::path::Path,
-        allowed_tools: &[String],
         chunks: tokio::sync::mpsc::Sender<AgentChunk>,
-        _initial_todos: &[imagent_core::TodoItem],
-        _steer: tokio::sync::mpsc::Receiver<String>,
     ) -> Result<RunOutcome> {
+        // v1.38 P1-a：本轮执行环境自 RoundContext 解构（任务种子/转向通道本后端
+        // 不消费，保持原忽略语义）。
+        let RoundContext {
+            conv_id,
+            workdir,
+            allowed_tools,
+            initial_todos: _,
+            model: model_override,
+            steer: _,
+        } = ctx;
         // allowed_tools 暂无 ACP 直接映射（session/new 无工具白名单字段），依赖 cwd
         // 锁定 + claude 自身工具策略 + 权限审批收敛。
         if !allowed_tools.is_empty() {
@@ -1073,8 +1086,16 @@ impl Backend for AcpBackend {
             );
         }
 
+        // v1.38 会话级模型：ctx.model（KV `model:<conv>` 命中）优先，None 回退
+        // 实例默认。建连时经 ANTHROPIC_MODEL env 注入——既有连接不追改（子进程
+        // env 已定，下一次建连生效，与旧 /model set_model 语义一致；v1.38 起作用
+        // 域收敛为会话级，实例默认只承担「未覆盖会话」的基准）。
+        let model = model_override
+            .map(str::to_string)
+            .or_else(|| self.model.read().clone());
+
         // B2/P5-14：取（或启动）本 conv 的长驻连接（惰性建立、并发上限）。
-        let mut ll = self.long_lived(conv_id).await?;
+        let mut ll = self.long_lived(conv_id, model.clone()).await?;
         for attempt in 0..2 {
             let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
             // P1-E：cancel_tx 随 run future 生命周期——run 正常完成或被 drop（超时）时
@@ -1104,7 +1125,7 @@ impl Backend for AcpBackend {
                                 "长驻 ACP task 响应前退出（竞态），重建连接重试一次"
                             );
                             self.remove_conn_if_same(conv_id, &ll).await;
-                            ll = self.long_lived(conv_id).await?;
+                            ll = self.long_lived(conv_id, model.clone()).await?;
                         }
                         Err(_) => {
                             return Err(CoreError::Backend(
@@ -1124,7 +1145,7 @@ impl Backend for AcpBackend {
                         "长驻 ACP task 已退出（竞态），重建连接重试一次"
                     );
                     self.remove_conn_if_same(conv_id, &ll).await;
-                    ll = self.long_lived(conv_id).await?;
+                    ll = self.long_lived(conv_id, model.clone()).await?;
                 }
                 Err(_) => {
                     return Err(CoreError::Backend(
@@ -1479,6 +1500,24 @@ mod tests {
     use agent_client_protocol::{Agent, Channel};
     use std::time::Duration;
 
+    /// v1.38 P1-a：测试 ctx 快捷口（默认形态：空工具白名单 / 无模型覆盖；特殊
+    /// 场景内联构造 RoundContext）。steer 传调用方构造的通道（`closed_steer`
+    /// 局部闭包或内联块）。
+    fn run_ctx<'a>(
+        conv: &'a str,
+        wd: &'a std::path::Path,
+        steer: tokio::sync::mpsc::Receiver<String>,
+    ) -> RoundContext<'a> {
+        RoundContext {
+            conv_id: conv,
+            workdir: wd,
+            allowed_tools: &[],
+            initial_todos: &[],
+            model: None,
+            steer,
+        }
+    }
+
     /// P0-2（v1.17）：cost 累计水位 → 本轮增量。首轮=整段；同会话后续=差值；
     /// 会话累计回落（换会话/重置）→ 钳 0；换 session id → 基线不命中重新整段。
     #[tokio::test]
@@ -1589,14 +1628,10 @@ mod tests {
         let (tx1, _rx1) = tokio::sync::mpsc::channel::<AgentChunk>(64);
         let out1 = backend
             .run(
-                "conv-cost",
+                run_ctx("conv-cost", &wd, closed_steer()),
                 "turn1",
                 None,
-                &wd,
-                &[],
                 tx1,
-                &[],
-                closed_steer(),
             )
             .await
             .expect("轮 1 应成功");
@@ -1610,14 +1645,10 @@ mod tests {
         let (tx2, _rx2) = tokio::sync::mpsc::channel::<AgentChunk>(64);
         let out2 = backend
             .run(
-                "conv-cost",
+                run_ctx("conv-cost", &wd, closed_steer()),
                 "turn2",
                 Some(&out1.session_id),
-                &wd,
-                &[],
                 tx2,
-                &[],
-                closed_steer(),
             )
             .await
             .expect("轮 2 应成功");
@@ -1726,11 +1757,16 @@ mod tests {
         let wd = workdir.clone();
         let run_a = tokio::spawn(async move {
             let _ = a
-                .run("lim-a", "slow", None, &wd, &[], tx_a, &[], {
-                    let (sx, rx) = tokio::sync::mpsc::channel(1);
-                    drop(sx);
-                    rx
-                })
+                .run(
+                    run_ctx("lim-a", &wd, {
+                        let (sx, rx) = tokio::sync::mpsc::channel(1);
+                        drop(sx);
+                        rx
+                    }),
+                    "slow",
+                    None,
+                    tx_a,
+                )
                 .await;
         });
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1738,11 +1774,16 @@ mod tests {
         // 上限 1：第二个 conv 被拒，且错误提示可读。
         let (tx_b, _rx_b) = tokio::sync::mpsc::channel::<AgentChunk>(64);
         let err = backend
-            .run("lim-b", "fast", None, &workdir, &[], tx_b, &[], {
-                let (sx, rx) = tokio::sync::mpsc::channel(1);
-                drop(sx);
-                rx
-            })
+            .run(
+                run_ctx("lim-b", &workdir, {
+                    let (sx, rx) = tokio::sync::mpsc::channel(1);
+                    drop(sx);
+                    rx
+                }),
+                "fast",
+                None,
+                tx_b,
+            )
             .await
             .expect_err("上限 1 时第二个 conv 应被拒绝");
         assert!(err.to_string().contains("上限"), "错误应说明上限: {err}");
@@ -2137,11 +2178,16 @@ mod tests {
         let wd = workdir.clone();
         let run_a = tokio::spawn(async move {
             let _ = a
-                .run("conv-a", "slow", None, &wd, &[], tx_a, &[], {
-                    let (sx, rx) = tokio::sync::mpsc::channel(1);
-                    drop(sx);
-                    rx
-                })
+                .run(
+                    run_ctx("conv-a", &wd, {
+                        let (sx, rx) = tokio::sync::mpsc::channel(1);
+                        drop(sx);
+                        rx
+                    }),
+                    "slow",
+                    None,
+                    tx_a,
+                )
                 .await;
         });
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2149,11 +2195,16 @@ mod tests {
         // B 起跑并立即放行其闸门——旧全局单连接串行模型下 B 的 prompt 排在 A
         // 之后，即便闸门开了也拿不到响应；per-conv 模型下 B 应立即完成。
         let (tx_b, _rx_b) = tokio::sync::mpsc::channel::<AgentChunk>(64);
-        let run_b = backend.run("conv-b", "fast", None, &workdir, &[], tx_b, &[], {
-            let (sx, rx) = tokio::sync::mpsc::channel(1);
-            drop(sx);
-            rx
-        });
+        let run_b = backend.run(
+            run_ctx("conv-b", &workdir, {
+                let (sx, rx) = tokio::sync::mpsc::channel(1);
+                drop(sx);
+                rx
+            }),
+            "fast",
+            None,
+            tx_b,
+        );
         let mut run_b = std::pin::pin!(run_b);
         let _ = release_b.send(true);
         let out_b = tokio::time::timeout(Duration::from_secs(5), run_b.as_mut())
@@ -2191,11 +2242,16 @@ mod tests {
         let wd = workdir.clone();
         let run_a = tokio::spawn(async move {
             let _ = a
-                .run("conv-a", "slow", None, &wd, &[], tx_a, &[], {
-                    let (sx, rx) = tokio::sync::mpsc::channel(1);
-                    drop(sx);
-                    rx
-                })
+                .run(
+                    run_ctx("conv-a", &wd, {
+                        let (sx, rx) = tokio::sync::mpsc::channel(1);
+                        drop(sx);
+                        rx
+                    }),
+                    "slow",
+                    None,
+                    tx_a,
+                )
                 .await;
         });
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2214,11 +2270,16 @@ mod tests {
 
         // B 不受影响：照常完成。
         let (tx_b, _rx_b) = tokio::sync::mpsc::channel::<AgentChunk>(64);
-        let run_b = backend_for_a.run("conv-b", "fast", None, &workdir, &[], tx_b, &[], {
-            let (sx, rx) = tokio::sync::mpsc::channel(1);
-            drop(sx);
-            rx
-        });
+        let run_b = backend_for_a.run(
+            run_ctx("conv-b", &workdir, {
+                let (sx, rx) = tokio::sync::mpsc::channel(1);
+                drop(sx);
+                rx
+            }),
+            "fast",
+            None,
+            tx_b,
+        );
         let mut run_b = std::pin::pin!(run_b);
         let _ = release_b.send(true);
         let out_b = tokio::time::timeout(Duration::from_secs(5), run_b.as_mut())
@@ -2340,11 +2401,16 @@ mod tests {
         // 闸门未放行（审批挂着）——run() 必须照常完成（5s 上限，修复前必超时）。
         let out = tokio::time::timeout(
             Duration::from_secs(5),
-            backend.run("conv-perm", "hi", None, &workdir, &[], tx, &[], {
-                let (sx, rx) = tokio::sync::mpsc::channel(1);
-                drop(sx);
-                rx
-            }),
+            backend.run(
+                run_ctx("conv-perm", &workdir, {
+                    let (sx, rx) = tokio::sync::mpsc::channel(1);
+                    drop(sx);
+                    rx
+                }),
+                "hi",
+                None,
+                tx,
+            ),
         )
         .await
         .expect("run() 不应被审批等待阻塞（P2-13：审批已 cx.spawn 出 dispatch loop）")
@@ -2410,7 +2476,7 @@ mod tests {
             }
         }
         // 超限：新 conv 被拒绝；已有 conv 复用不受影响。
-        let err = match backend.long_lived("conv-extra").await {
+        let err = match backend.long_lived("conv-extra", None).await {
             Err(e) => e,
             Ok(_) => panic!("超限的新 conv 应被拒绝"),
         };
@@ -2419,7 +2485,7 @@ mod tests {
             "错误应说明并发上限: {err}"
         );
         assert!(
-            backend.long_lived("conv-0").await.is_ok(),
+            backend.long_lived("conv-0", None).await.is_ok(),
             "已有 conv 应复用连接"
         );
     }
@@ -2462,18 +2528,14 @@ mod tests {
 
         let err = backend
             .run(
-                "conv-load-fail",
-                "hi",
-                Some(&SessionId("old-sid".into())),
-                &workdir,
-                &[],
-                tx,
-                &[],
-                {
+                run_ctx("conv-load-fail", &workdir, {
                     let (sx, rx) = tokio::sync::mpsc::channel(1);
                     drop(sx);
                     rx
-                },
+                }),
+                "hi",
+                Some(&SessionId("old-sid".into())),
+                tx,
             )
             .await
             .expect_err("LoadSession 失败应返回错误");
@@ -2564,18 +2626,14 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentChunk>(64);
         let outcome = backend
             .run(
-                "e2e",
-                "Reply with exactly: hi",
-                None,
-                &workdir,
-                &[],
-                tx,
-                &[],
-                {
+                run_ctx("e2e", &workdir, {
                     let (sx, rx) = tokio::sync::mpsc::channel(1);
                     drop(sx);
                     rx
-                },
+                }),
+                "Reply with exactly: hi",
+                None,
+                tx,
             )
             .await
             .expect("acp run 应成功");
@@ -2719,18 +2777,14 @@ mod tests {
 
         let err = backend
             .run(
-                "conv-generic",
-                "hi",
-                Some(&SessionId("ghost-sid-not-in-claude-dir".into())),
-                &workdir,
-                &[],
-                tx,
-                &[],
-                {
+                run_ctx("conv-generic", &workdir, {
                     let (sx, rx) = tokio::sync::mpsc::channel(1);
                     drop(sx);
                     rx
-                },
+                }),
+                "hi",
+                Some(&SessionId("ghost-sid-not-in-claude-dir".into())),
+                tx,
             )
             .await
             .expect_err("NoStorage 不预检 → LoadSession 直达 mock（无 load 处理器必失败）");

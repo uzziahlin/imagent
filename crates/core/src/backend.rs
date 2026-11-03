@@ -96,6 +96,45 @@ pub fn backend_key(conv_id: &str) -> String {
     format!("{BACKEND_KV_PREFIX}{conv_id}")
 }
 
+/// per-conv 会话级模型覆盖键前缀（v1.38 P1-a）：`/model` 命令写入，run 入口
+/// 解析进 [`RoundContext::model`]。与 `backend:<conv>` 同一张 store config KV
+/// 表、同风格键名；本模块是键名事实源。值 = 模型名（对该引擎非法时直接透传
+/// ——引擎报错走既有失败卡）；不存在 / 空 = 引擎实例默认。
+pub const MODEL_KV_PREFIX: &str = "model:";
+
+/// per-conv 会话级模型覆盖的 config 键：`model:<conv_id>`。
+pub fn model_key(conv_id: &str) -> String {
+    format!("{MODEL_KV_PREFIX}{conv_id}")
+}
+
+/// 单轮 agent 执行上下文（v1.38 P1-a：`Backend::run` 参数收敛）——**本轮定死、
+/// 不随会话漂移**的执行环境参数整体收拢，`run` 本体只留语义核心三参（prompt /
+/// session / chunks，见 [`Backend::run`]）。
+///
+/// 后续会话级执行面配置（如 effort / 审批档）在此追加字段即可，`run` 签名
+/// 不再膨胀。
+pub struct RoundContext<'a> {
+    /// 当前会话标识（backend 用它给 MCP server 子进程标注当前 conv，以便权限
+    /// 审批路由回正确的 IM 会话）。
+    pub conv_id: &'a str,
+    /// agent 工作根目录（cwd，非沙箱）。
+    pub workdir: &'a Path,
+    /// 允许的工具白名单（如 `["Read","Edit"]`）。
+    pub allowed_tools: &'a [String],
+    /// TaskList 预热种子（会话既有任务快照，含真实任务 id）。CLI 系 backend
+    /// 把它作为待办累积器初值（跨轮 TaskUpdate 按 id 匹配 + 开局面板）；不关心
+    /// 的 backend 忽略。
+    pub initial_todos: &'a [TodoItem],
+    /// 本轮模型覆盖（会话级 KV `model:<conv>` 的解析结果；None = 引擎实例默认
+    /// ——config 基准 / CLI 自身默认）。消费点一律 ctx 优先、None 回退实例默认。
+    pub model: Option<&'a str>,
+    /// 运行中转向通道（v1.17）——dispatcher 把运行中到达的用户消息经此注入
+    /// 当轮（CLI 系 backend 转写 stdin user 行；实验校准：CLI 在下个工具边界
+    /// 交付）。不支持的 backend 直接 drop（dispatcher 依
+    /// [`Backend::supports_steering`] 决定是否启用）。
+    pub steer: mpsc::Receiver<String>,
+}
+
 /// agent 后端抽象（无状态执行器）。
 ///
 /// core 传入 `session`（续接）或 `None`（新建），Backend 执行并流式产出
@@ -105,32 +144,20 @@ pub fn backend_key(conv_id: &str) -> String {
 pub trait Backend: Send + Sync {
     /// 执行一次 agent 调用。
     ///
-    /// - `conv_id`：当前会话标识（backend 用它给 MCP server 子进程标注当前 conv，
-    ///   以便权限审批路由回正确的 IM 会话）；
+    /// - `ctx`：本轮执行环境（会话标识 / 工作目录 / 工具白名单 / 任务种子 /
+    ///   模型覆盖 / 转向通道），字段说明见 [`RoundContext`]；
     /// - `prompt`：用户文本；
     /// - `session`：`None` 新建，`Some(id)` 续接已存在会话；
-    /// - `workdir`：agent 工作根目录（cwd，非沙箱）；
-    /// - `allowed_tools`：允许的工具白名单（如 `["Read","Edit"]`）；
-    /// - `chunks`：流式分块通道，core 消费；
-    /// - `initial_todos`：TaskList 预热种子（会话既有任务快照，含真实任务
-    ///   id）。CLI 系 backend 把它作为待办累积器初值（跨轮 TaskUpdate 按 id
-    ///   匹配 + 开局面板）；不关心的 backend 忽略；
-    /// - `steer`：运行中转向通道（v1.17）——dispatcher 把运行中到达的用户
-    ///   消息经此注入当轮（CLI 系 backend 转写 stdin user 行；实验校准：CLI
-    ///   在下个工具边界交付）。不支持的 backend 直接 drop（dispatcher 依
-    ///   [`Backend::supports_steering`] 决定是否启用）。
-    // 参数已达 9 个——再增应收敛为 RoundContext 结构（历史演化提醒）。
-    #[allow(clippy::too_many_arguments)]
+    /// - `chunks`：流式分块通道，core 消费。
+    ///
+    /// v1.38 P1-a：原 8 个环境参数收敛为 [`RoundContext`]（历史演化提醒已
+    /// 落地）；prompt / session / chunks 语义核心保持独立参数。
     async fn run(
         &self,
-        conv_id: &str,
+        ctx: RoundContext<'_>,
         prompt: &str,
         session: Option<&SessionId>,
-        workdir: &Path,
-        allowed_tools: &[String],
         chunks: mpsc::Sender<AgentChunk>,
-        initial_todos: &[TodoItem],
-        steer: mpsc::Receiver<String>,
     ) -> Result<RunOutcome>;
 
     /// 是否支持运行中转向（v1.17）：dispatcher 据此决定运行中消息是注入当轮
@@ -270,5 +297,14 @@ mod backend_key_tests {
         assert_eq!(BACKEND_KV_PREFIX, "backend:");
         assert_eq!(backend_key("feishu:ou_x"), "backend:feishu:ou_x");
         assert_eq!(backend_key("local:work"), "backend:local:work");
+    }
+
+    /// 会话级模型 KV 键名布局钉住（v1.38 P1-a：/model 命令写入与 run 入口
+    /// 解析的互通契约；与 backend_key 同风格同表）。
+    #[test]
+    fn model_key_layout() {
+        assert_eq!(MODEL_KV_PREFIX, "model:");
+        assert_eq!(model_key("feishu:ou_x"), "model:feishu:ou_x");
+        assert_eq!(model_key("local:work"), "model:local:work");
     }
 }

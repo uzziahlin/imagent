@@ -234,6 +234,22 @@ impl Dispatcher {
         // 使用该实例（agent_kind 校验、derive_task_todos、backend.run、usage
         // 落库与失败文案的引擎名均取解析结果）。未设置的会话回退 default。
         let backend = self.resolve_backend(&conv.0).await;
+        // v1.38 P1-a 会话级模型：`/model` 写入的 per-conv KV（键名事实源
+        // `model_key`）在此解析进本轮 RoundContext——命中 → ctx.model 透传（名字
+        // 对该引擎非法时引擎报错走既有失败卡，可 /model default 恢复）；未命中
+        // / 空值 → None（引擎实例默认）。store 错误仅 log 后按未命中处理。
+        let session_model = match self.store.get_config(&model_key(&conv.0)).await {
+            Ok(v) => v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+            Err(e) => {
+                warn!(
+                    target: "imagent::core",
+                    conv_id = %conv.0,
+                    error = %e,
+                    "会话级模型 KV 读取失败（按未命中处理）"
+                );
+                None
+            }
+        };
         // 权限档位按解析结果现算（raw config 档 × 本轮引擎名）：ask 闭环档 ×
         // 非 FullLoop **覆盖引擎**在本轮拒绝执行——default 引擎的闭环档校验归
         // 启动期 / 热切路径 fail-closed（生产中 default × 闭环档 × 非 FullLoop
@@ -528,34 +544,26 @@ impl Dispatcher {
         // self.backend（default）。
         let backend_name = backend.name();
         let join = tokio::spawn(async move {
+            // v1.38 P1-a：本轮执行环境收敛为 RoundContext（字段语义见该结构
+            // doc）——conv/workdir/工具白名单/任务种子借用本轮 move 进闭包的
+            // 快照，model = 会话级 KV 解析结果（None = 引擎实例默认），steer
+            // 随 ctx 进入 backend。
+            let ctx = RoundContext {
+                conv_id: &conv_id_owned,
+                workdir: &workdir,
+                allowed_tools: &tools,
+                initial_todos: &seed_todos,
+                model: session_model.as_deref(),
+                steer: steer_rx,
+            };
             // agent_timeout = 0 = 关闭总超时（默认 3600s=1h 硬上限）：墙钟总预算
             // 会误杀持续输出的超长任务，关闭后防挂死由空闲看门狗（idle_timeout）承担。
             if agent_timeout.is_zero() {
-                return backend
-                    .run(
-                        &conv_id_owned,
-                        &prompt_owned,
-                        existing.as_ref(),
-                        &workdir,
-                        &tools,
-                        tx,
-                        &seed_todos,
-                        steer_rx,
-                    )
-                    .await;
+                return backend.run(ctx, &prompt_owned, existing.as_ref(), tx).await;
             }
             match tokio::time::timeout(
                 agent_timeout,
-                backend.run(
-                    &conv_id_owned,
-                    &prompt_owned,
-                    existing.as_ref(),
-                    &workdir,
-                    &tools,
-                    tx,
-                    &seed_todos,
-                    steer_rx,
-                ),
+                backend.run(ctx, &prompt_owned, existing.as_ref(), tx),
             )
             .await
             {

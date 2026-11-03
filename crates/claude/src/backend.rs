@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use imagent_core::{
     backend_common::{spawn_cli_backend, CliEvent},
     AgentChunk, Backend, CoreError, LocalSession, PermissionCapability, PermissionMode, Result,
-    RunOutcome, SessionId,
+    RoundContext, RunOutcome, SessionId,
 };
 use parking_lot::RwLock;
 use tokio::process::Command;
@@ -28,8 +28,10 @@ pub struct ClaudeBackend {
     /// S-3：MCP server（imagent mcp）socket 读超时，与 dispatcher 的 permission_ask_timeout
     /// 对齐——防 MCP 子进程在用户慢回复时先于 dispatcher 超时返 deny，使 Ask 闭环静默失效。
     ask_timeout: std::time::Duration,
-    /// W1-2：运行时模型（`/model` 热设；main 启动时以 config `claude_model` 为
-    /// 初值注入同一句柄——config 与命令同源，SIGHUP 重设回 config 值）。
+    /// W1-2：运行时模型（main 启动时以 config `claude_model` 为初值注入同一
+    /// 句柄——config 与命令同源，SIGHUP 重设回 config 值）。v1.38：本字段为
+    /// 实例默认基准；会话级 /model 覆盖（KV `model:<conv>`）经 RoundContext
+    /// .model 优先，这里只承担未覆盖会话的兜底。
     model: RwLock<Option<String>>,
     /// W1-2/W1-3/W1-4：config 侧运行参数（SIGHUP 经 [`Self::set_runtime_opts`] 整体替换）。
     runtime: RwLock<RuntimeOpts>,
@@ -557,15 +559,21 @@ impl Backend for ClaudeBackend {
 
     async fn run(
         &self,
-        conv_id: &str,
+        ctx: RoundContext<'_>,
         prompt: &str,
         session: Option<&SessionId>,
-        workdir: &std::path::Path,
-        allowed_tools: &[String],
         chunks: tokio::sync::mpsc::Sender<AgentChunk>,
-        initial_todos: &[imagent_core::TodoItem],
-        steer: tokio::sync::mpsc::Receiver<String>,
     ) -> Result<RunOutcome> {
+        // v1.38 P1-a：本轮执行环境自 RoundContext 解构（字段名与原参数一致，
+        // 以下函数体语义零变化）。
+        let RoundContext {
+            conv_id,
+            workdir,
+            allowed_tools,
+            initial_todos,
+            model: model_override,
+            steer,
+        } = ctx;
         // 构造命令（prompt 作为单个 arg，不经 shell；stdin/stdout/stderr/kill_on_drop
         // 由 spawn_cli_backend 统一加）。
         let mut cmd = Command::new("claude");
@@ -617,8 +625,13 @@ impl Backend for ClaudeBackend {
             cmd.arg("--allowedTools").arg(allowed_tools.join(","));
         }
         // W1-2/W1-4：模型选择 + 禁用工具黑名单 + 附加系统提示（一次锁读全取）。
+        // v1.38 会话级模型：ctx.model（KV `model:<conv>` 命中）优先，None 回退
+        // 实例默认（config `claude_model` 基准 / CLI 自身默认）。
         let opts = self.runtime.read().clone();
-        if let Some(m) = self.model.read().clone() {
+        let model = model_override
+            .map(str::to_string)
+            .or_else(|| self.model.read().clone());
+        if let Some(m) = model {
             cmd.arg("--model").arg(&m);
             if let Some(f) = opts.fallback_model.clone() {
                 cmd.arg("--fallback-model").arg(&f);
@@ -1321,18 +1334,21 @@ mod tests {
 
         let outcome = backend
             .run(
-                "test-conv",
+                RoundContext {
+                    conv_id: "test-conv",
+                    workdir: &workdir,
+                    allowed_tools: &allowed,
+                    initial_todos: &[],
+                    model: None,
+                    steer: {
+                        let (sx, rx) = tokio::sync::mpsc::channel(1);
+                        drop(sx);
+                        rx
+                    },
+                },
                 "reply with the single word: pong",
                 None,
-                &workdir,
-                &allowed,
                 tx,
-                &[],
-                {
-                    let (sx, rx) = tokio::sync::mpsc::channel(1);
-                    drop(sx);
-                    rx
-                },
             )
             .await
             .expect("claude run should succeed");

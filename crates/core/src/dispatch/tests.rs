@@ -321,6 +321,19 @@ struct MockBackend {
     /// （无本地转录概念）；Some(Ok(items)) = 推导出任务清单；Some(Err(())) =
     /// panic（模拟转录回放崩溃 → JoinError 路径）。
     derive_todos: Option<std::result::Result<Vec<crate::types::TodoItem>, ()>>,
+    /// v1.38 会话级模型：supports_model_selection 返回值（/model 命令测试用；
+    /// 默认 false 保持既有语义）。
+    model_supported: bool,
+    /// v1.38 会话级模型：实例默认模型（model() 返回值——/model 无参显示「引擎
+    /// 实例默认」分支测试用）。
+    model_state: Option<String>,
+    /// v1.38 会话级模型：每次 run 收到的 ctx.model（RoundContext.model 透传
+    /// 断言——KV 命中/未命中、切引擎后作用于解析引擎）。
+    model_seen: Arc<TokioMutex<Vec<Option<String>>>>,
+    /// v1.38 会话级模型：set_model 调用记录（钉住 cmd_model 不再全局热设——
+    /// 防会话间实例污染回归）。std Mutex——set_model 是同步 trait 方法（async
+    /// 上下文内禁 blocking_lock）。
+    set_model_log: Arc<std::sync::Mutex<Vec<Option<String>>>>,
 }
 
 impl MockBackend {
@@ -351,6 +364,10 @@ impl MockBackend {
             pre_gate_todos: Vec::new(),
             pre_gate_tools: Vec::new(),
             derive_todos: None,
+            model_supported: false,
+            model_state: None,
+            model_seen: Arc::new(TokioMutex::new(Vec::new())),
+            set_model_log: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
         (b, calls, prompts, order)
     }
@@ -478,15 +495,22 @@ impl MockBackend {
 impl Backend for MockBackend {
     async fn run(
         &self,
-        _conv_id: &str,
+        ctx: RoundContext<'_>,
         prompt: &str,
         session: Option<&SessionId>,
-        _workdir: &std::path::Path,
-        _allowed_tools: &[String],
         chunks: mpsc::Sender<AgentChunk>,
-        _initial_todos: &[crate::types::TodoItem],
-        steer: mpsc::Receiver<String>,
     ) -> Result<crate::types::RunOutcome> {
+        // v1.38 P1-a：环境参数自 RoundContext 解构（未消费字段保持忽略语义）；
+        // ctx.model 逐轮记录供透传断言。
+        let RoundContext {
+            conv_id: _,
+            workdir: _,
+            allowed_tools: _,
+            initial_todos: _,
+            model,
+            steer,
+        } = ctx;
+        self.model_seen.lock().await.push(model.map(str::to_string));
         // P0-5 测试：prompt 记录先于 fail 判断（失败轮也要捕获收到的 prompt）。
         self.prompts.lock().await.push(prompt.to_string());
         // steering（v1.17）：drain 转向通道并记录（sender drop 即结束）。
@@ -624,6 +648,20 @@ impl Backend for MockBackend {
     }
     fn supports_tool_allowlist(&self) -> bool {
         self.allowlist_supported
+    }
+    /// v1.38 会话级模型：能力位与实例默认模型热设记录（cmd_model 测试用——
+    /// 同时钉住 cmd_model 不再调用全局 set_model）。
+    fn supports_model_selection(&self) -> bool {
+        self.model_supported
+    }
+    fn set_model(&self, model: Option<String>) {
+        self.set_model_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(model);
+    }
+    fn model(&self) -> Option<String> {
+        self.model_state.clone()
     }
     /// P3-b（code-review v14）：按注入行为返回（Err 分支 panic 由 spawn_blocking
     /// 捕获为 JoinError，正是要测的失败形态）。
@@ -7981,11 +8019,19 @@ async fn conv_state_evict_zero_cap_keeps_exempt() {
 
 /// 多引擎测试的公共装配：default = 名为 `default_name` 的 mock 引擎 + extras
 /// 注入，返回 dispatcher / inbox / default 观测句柄 / extra 观测句柄 / db 路径。
+/// v1.38 会话级模型：两 mock 均 `supports_model_selection = true`（/model 测试
+/// 共用本装配），并暴露各自 run 收到的 ctx.model / set_model 记录句柄。
 struct MultiBackendCtx {
     disp: Arc<Dispatcher>,
     inbox: Arc<TokioMutex<Vec<String>>>,
     default_calls: Arc<TokioMutex<Vec<Option<String>>>>,
     extra_calls: Arc<TokioMutex<Vec<Option<String>>>>,
+    /// v1.38：default 引擎 run 收到的 ctx.model 序列（逐轮）。
+    default_models: Arc<TokioMutex<Vec<Option<String>>>>,
+    /// v1.38：extra 引擎 run 收到的 ctx.model 序列（逐轮）。
+    extra_models: Arc<TokioMutex<Vec<Option<String>>>>,
+    /// v1.38：default 引擎 set_model 调用记录（钉住 cmd_model 不再全局热设）。
+    default_set_model: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     db: std::path::PathBuf,
 }
 
@@ -8001,9 +8047,14 @@ async fn build_multi_backend(
     let whitelist = vec!["u1".into()];
     let auth = Auth::new(whitelist.clone());
     let (plat, inbox, _send_count) = MockPlatform::new();
-    let (default_back, default_calls, _prompts, _order) = MockBackend::new_named(default_name);
+    let (mut default_back, default_calls, _prompts, _order) = MockBackend::new_named(default_name);
+    default_back.model_supported = true;
+    let default_models = default_back.model_seen.clone();
+    let default_set_model = default_back.set_model_log.clone();
     let (mut extra_back, extra_calls, _p2, _o2) = MockBackend::new_named(extra_name);
     extra_back.capability = extra_capability;
+    extra_back.model_supported = true;
+    let extra_models = extra_back.model_seen.clone();
     let (store, db) = tmp_store().await;
     let disp = Arc::new(Dispatcher::new(
         Arc::new(plat),
@@ -8024,6 +8075,9 @@ async fn build_multi_backend(
         inbox,
         default_calls,
         extra_calls,
+        default_models,
+        extra_models,
+        default_set_model,
         db,
     }
 }
@@ -8299,6 +8353,269 @@ async fn run_allows_ask_mode_on_fullloop_extra() {
     assert!(
         !ctx.extra_calls.lock().await.is_empty(),
         "ask 档 × FullLoop extra 应放行本轮"
+    );
+    drop_db(ctx.db).await;
+}
+
+// ---------- v1.38 P1-a：会话级模型（KV `model:<conv>` + /model 会话语义） ----------
+
+/// v1.38 cmd_model 测试装配：mock 引擎开 `model_supported`，白名单/管理员名单
+/// 可分（admin 门槛测试用两档组合）。返回 (disp, inbox, run 收到的 ctx.model
+/// 序列, db)。
+async fn build_model_ctx(
+    whitelist: Vec<&str>,
+    admins: Vec<String>,
+) -> (
+    Arc<Dispatcher>,
+    Arc<TokioMutex<Vec<String>>>,
+    Arc<TokioMutex<Vec<Option<String>>>>,
+    std::path::PathBuf,
+) {
+    let _ = std::fs::create_dir_all("/tmp/imagent-test-ws");
+    let (plat, inbox, _send_count) = MockPlatform::new();
+    let (mut back, _calls, _prompts, _order) = MockBackend::new();
+    back.model_supported = true;
+    let model_seen = back.model_seen.clone();
+    let (store, db) = tmp_store().await;
+    let disp = Arc::new(Dispatcher::new(
+        Arc::new(plat),
+        Arc::new(back),
+        store,
+        Auth::new(whitelist.into_iter().map(String::from).collect()),
+        std::path::PathBuf::from("/tmp/imagent-test-ws"),
+        vec!["Read".into()],
+        PermissionMode::Off,
+        test_budgets(),
+        CotDetail::Brief,
+        admins,
+    ));
+    (disp, inbox, model_seen, db)
+}
+
+#[tokio::test]
+async fn cmd_model_reports_unsupported_backend() {
+    let _serial = SERIAL.lock().await;
+    // MockBackend::new() 缺省 model_supported=false → 明确提示而非静默无效。
+    let ctx = build(Auth::new(vec!["u1".into()])).await;
+    ctx.disp.handle(msg("c1", "u1", "/model")).await;
+    let inbox = ctx.inbox.lock().await;
+    assert!(
+        inbox
+            .iter()
+            .any(|t| t.contains("暂不支持模型选择") && t.contains("mock-backend")),
+        "应点名不支持模型选择的引擎: {inbox:?}"
+    );
+    drop(inbox);
+    drop_db(ctx.db).await;
+}
+
+#[tokio::test]
+async fn cmd_model_no_arg_shows_effective_model_kv_priority() {
+    let _serial = SERIAL.lock().await;
+    let (disp, inbox, _models, db) = build_model_ctx(vec!["u1"], vec!["u1".into()]).await;
+    // 无 KV：显示引擎实例默认（mock model_state=None → 跟随 CLI 文案）+ 会话级
+    // 用法。
+    disp.handle(msg("c1", "u1", "/model")).await;
+    {
+        let inbox = inbox.lock().await;
+        assert!(
+            inbox.iter().any(|t| t.contains("默认，跟随 CLI/本机配置")),
+            "无 KV 显示引擎实例默认: {inbox:?}"
+        );
+        assert!(
+            inbox.iter().any(|t| t.contains("本会话生效")),
+            "用法文案为会话级语义: {inbox:?}"
+        );
+    }
+    // 写 KV 后：显示本会话覆盖（KV 优先于实例默认显示）。
+    disp.store
+        .set_config(&crate::backend::model_key("c1"), "glm-5")
+        .await
+        .expect("写 KV");
+    disp.handle(msg("c1", "u1", "/model")).await;
+    {
+        let inbox = inbox.lock().await;
+        assert!(
+            inbox.iter().any(|t| t.contains("glm-5（本会话覆盖）")),
+            "KV 命中显示本会话覆盖: {inbox:?}"
+        );
+    }
+    drop_db(db).await;
+}
+
+#[tokio::test]
+async fn cmd_model_switch_writes_session_kv_not_instance() {
+    let _serial = SERIAL.lock().await;
+    let ctx = build_multi_backend(
+        "mock-backend",
+        "b2",
+        PermissionMode::Off,
+        crate::backend::PermissionCapability::Unsupported,
+    )
+    .await;
+    ctx.disp.handle(msg("c1", "u1", "/model glm-5")).await;
+    // KV 写入（会话级而非实例热设）。
+    let kv = ctx
+        .disp
+        .store
+        .get_config(&crate::backend::model_key("c1"))
+        .await
+        .expect("get_config")
+        .expect("KV 应写入");
+    assert_eq!(kv, "glm-5");
+    {
+        let inbox = ctx.inbox.lock().await;
+        assert!(
+            inbox
+                .iter()
+                .any(|t| t.contains("本会话模型已切换为 glm-5") && t.contains("/model default")),
+            "回显切换结果与恢复指引: {inbox:?}"
+        );
+    }
+    // 防污染钉住：cmd_model 不得再调实例级 set_model（旧实现会污染所有会话）。
+    assert!(
+        ctx.default_set_model.lock().unwrap().is_empty(),
+        "cmd_model 不得调用 set_model"
+    );
+    // 下一条消息：KV 解析进 RoundContext.model 透传 default 引擎。
+    ctx.disp.handle(msg("c1", "u1", "hello")).await;
+    assert_eq!(
+        *ctx.default_models.lock().await,
+        vec![Some("glm-5".to_string())],
+        "会话 KV 应透传 ctx.model"
+    );
+    drop_db(ctx.db).await;
+}
+
+#[tokio::test]
+async fn cmd_model_default_clears_kv_and_run_falls_back() {
+    let _serial = SERIAL.lock().await;
+    let (disp, inbox, models, db) = build_model_ctx(vec!["u1"], vec!["u1".into()]).await;
+    disp.store
+        .set_config(&crate::backend::model_key("c1"), "glm-5")
+        .await
+        .expect("写 KV");
+    disp.handle(msg("c1", "u1", "/model default")).await;
+    assert!(
+        disp.store
+            .get_config(&crate::backend::model_key("c1"))
+            .await
+            .expect("get_config")
+            .is_none(),
+        "default 应清除会话 KV"
+    );
+    {
+        let inbox = inbox.lock().await;
+        assert!(
+            inbox.iter().any(|t| t.contains("已恢复引擎默认")),
+            "回显恢复默认: {inbox:?}"
+        );
+    }
+    // 恢复后轮次：ctx.model = None（引擎实例默认兜底）。
+    disp.handle(msg("c1", "u1", "hello")).await;
+    assert_eq!(
+        *models.lock().await,
+        vec![None],
+        "default 清 KV 后 run 入口应解析 None"
+    );
+    drop_db(db).await;
+}
+
+#[tokio::test]
+async fn cmd_model_requires_admin() {
+    let _serial = SERIAL.lock().await;
+    // admin_senders 为空：白名单用户也被拒（引导 config.toml 配置）。
+    let (disp, inbox, _models, db) = build_model_ctx(vec!["u1"], vec![]).await;
+    disp.handle(msg("c1", "u1", "/model glm-5")).await;
+    {
+        let inbox = inbox.lock().await;
+        assert!(
+            inbox
+                .iter()
+                .any(|t| t.contains("切换模型需要管理员") && t.contains("admin_senders")),
+            "空管理员名单应给配置引导: {inbox:?}"
+        );
+    }
+    assert!(
+        disp.store
+            .get_config(&crate::backend::model_key("c1"))
+            .await
+            .expect("get_config")
+            .is_none(),
+        "拒绝路径不得写 KV"
+    );
+    drop_db(db).await;
+
+    // 有管理员名单但本 sender 不在其中：同样拒绝（查看开放）。
+    let (disp, inbox, _models, db) = build_model_ctx(vec!["u1", "u2"], vec!["u1".into()]).await;
+    disp.handle(msg("c1", "u2", "/model glm-5")).await;
+    let inbox = inbox.lock().await;
+    assert!(
+        inbox
+            .iter()
+            .any(|t| t.contains("切换模型需要管理员") && t.contains("查看用 /model")),
+        "非 admin 应被拒并指引查看: {inbox:?}"
+    );
+    drop(inbox);
+    drop_db(db).await;
+}
+
+#[tokio::test]
+async fn cmd_model_after_engine_switch_targets_resolved_backend() {
+    let _serial = SERIAL.lock().await;
+    // 切引擎后的 /model 必须作用于**解析后**引擎（修复：旧实现用 self.backend
+    // default 实例，切过引擎的会话里 /model 操作错误引擎）。
+    let ctx = build_multi_backend(
+        "mock-backend",
+        "b2",
+        PermissionMode::Off,
+        crate::backend::PermissionCapability::Unsupported,
+    )
+    .await;
+    ctx.disp.handle(msg("c1", "u1", "/backend b2")).await;
+    ctx.disp.handle(msg("c1", "u1", "/model glm-9")).await;
+    let kv = ctx
+        .disp
+        .store
+        .get_config(&crate::backend::model_key("c1"))
+        .await
+        .expect("get_config")
+        .expect("KV 应写入");
+    assert_eq!(kv, "glm-9");
+    // 轮次 run 路由到 b2 且 ctx.model 生效；default 引擎零调用。
+    ctx.disp.handle(msg("c1", "u1", "hello")).await;
+    assert_eq!(
+        *ctx.extra_models.lock().await,
+        vec![Some("glm-9".to_string())],
+        "b2 应收到会话级 ctx.model"
+    );
+    assert!(
+        ctx.default_calls.lock().await.is_empty(),
+        "切换后的会话不应再路由 default"
+    );
+    assert!(
+        ctx.default_set_model.lock().unwrap().is_empty(),
+        "default 引擎实例不应被热设"
+    );
+    drop_db(ctx.db).await;
+}
+
+#[tokio::test]
+async fn run_entry_model_kv_miss_passes_none() {
+    let _serial = SERIAL.lock().await;
+    // run 入口 KV 未命中 → ctx.model = None（引擎实例默认兜底，行为不变）。
+    let ctx = build_multi_backend(
+        "mock-backend",
+        "b2",
+        PermissionMode::Off,
+        crate::backend::PermissionCapability::Unsupported,
+    )
+    .await;
+    ctx.disp.handle(msg("c1", "u1", "hello")).await;
+    assert_eq!(
+        *ctx.default_models.lock().await,
+        vec![None],
+        "未命中 KV 时 ctx.model 应为 None"
     );
     drop_db(ctx.db).await;
 }

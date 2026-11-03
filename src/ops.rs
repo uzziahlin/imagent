@@ -532,8 +532,9 @@ pub(crate) fn spawn_sighup_handler(
                     if let Some(b) = &claude_cli {
                         b.set_permission_channel(&cfg.claude_permission_channel);
                     }
-                    // W1-2：模型基准值重设（/model 的运行时热设被 config 值覆盖——
-                    // SIGHUP 语义即「回到配置面」）。
+                    // W1-2：模型基准值重设（v1.38 起 /model 切换写会话 KV、不改
+                    // 实例——此处置回的是「无覆盖会话」的实例默认基准，会话级
+                    // KV 不受 SIGHUP 影响；SIGHUP 语义即「回到配置面」）。
                     backend.set_model(cfg.claude_model.clone());
                     // W1-2/W1-3/W1-4：claude-cli 运行参数整体替换（含用户 MCP
                     // 配置文件的现场重读）。T12：bitable 开关同轮刷新（下一轮

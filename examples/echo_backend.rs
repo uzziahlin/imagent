@@ -5,10 +5,8 @@
 //!
 //! 运行：`cargo run --example echo_backend -- "你好"`
 
-use std::path::Path;
-
 use async_trait::async_trait;
-use imagent_core::{AgentChunk, Backend, Result, RunOutcome, SessionId};
+use imagent_core::{AgentChunk, Backend, Result, RoundContext, RunOutcome, SessionId};
 use tokio::sync::mpsc;
 
 /// 把 prompt 原样回显的最简 `Backend`（无副作用，演示用）。
@@ -18,15 +16,13 @@ pub struct EchoBackend;
 impl Backend for EchoBackend {
     async fn run(
         &self,
-        _conv_id: &str,
+        _ctx: RoundContext<'_>,
         prompt: &str,
         _session: Option<&SessionId>,
-        _workdir: &Path,
-        _allowed_tools: &[String],
         chunks: mpsc::Sender<AgentChunk>,
-        _initial_todos: &[imagent_core::TodoItem],
-        _steer: mpsc::Receiver<String>,
     ) -> Result<RunOutcome> {
+        // v1.38 P1-a：环境参数在 RoundContext（conv/workdir/工具白名单/任务种子/
+        // 模型覆盖/转向通道）；echo 示例不消费。
         // 流式推一个 Final chunk（core 收到后回传 IM）。
         let _ = chunks.send(AgentChunk::Final(prompt.to_string())).await;
         Ok(RunOutcome {
@@ -52,14 +48,25 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let backend = EchoBackend;
     let (tx, mut rx) = mpsc::channel::<AgentChunk>(8);
     let workdir = std::env::current_dir()?;
-    let tools: Vec<String> = vec!["Read".to_string()];
 
     let outcome = backend
-        .run("example-conv", &prompt, None, &workdir, &tools, tx, &[], {
-            let (sx, rx) = mpsc::channel(1);
-            drop(sx);
-            rx
-        })
+        .run(
+            RoundContext {
+                conv_id: "example-conv",
+                workdir: &workdir,
+                allowed_tools: &["Read".to_string()],
+                initial_todos: &[],
+                model: None,
+                steer: {
+                    let (sx, rx) = mpsc::channel(1);
+                    drop(sx);
+                    rx
+                },
+            },
+            &prompt,
+            None,
+            tx,
+        )
         .await?;
 
     println!("session_id: {}", outcome.session_id.0);

@@ -7,7 +7,8 @@
 use async_trait::async_trait;
 use imagent_core::{
     backend_common::{spawn_cli_backend, CliEvent, WRITE_OR_EXEC},
-    AgentChunk, Backend, LocalSession, PermissionCapability, Result, RunOutcome, SessionId,
+    AgentChunk, Backend, LocalSession, PermissionCapability, Result, RoundContext, RunOutcome,
+    SessionId,
 };
 use tokio::process::Command;
 use tracing::{debug, warn};
@@ -19,6 +20,8 @@ use crate::stream::{parse_line, ParsedEvent};
 /// MVP 无状态、不做 IM 权限审批闭环（Codex 自身有沙箱模型兜底）。
 pub struct CodexBackend {
     /// v1.21 /model：运行时模型覆盖（`codex exec -m <model>`；None = CLI 默认）。
+    /// v1.38：实例默认基准（config 注入/SIGHUP 重置）；会话级覆盖走
+    /// RoundContext.model 优先，本字段只承担未覆盖会话的兜底。
     /// std RwLock——临界区纯读写无 await，trait 的 &self 接口下最小改造。
     model: std::sync::RwLock<Option<String>>,
 }
@@ -77,15 +80,21 @@ impl Backend for CodexBackend {
 
     async fn run(
         &self,
-        conv_id: &str,
+        ctx: RoundContext<'_>,
         prompt: &str,
         session: Option<&SessionId>,
-        workdir: &std::path::Path,
-        allowed_tools: &[String],
         chunks: tokio::sync::mpsc::Sender<AgentChunk>,
-        _initial_todos: &[imagent_core::TodoItem],
-        _steer: tokio::sync::mpsc::Receiver<String>,
     ) -> Result<RunOutcome> {
+        // v1.38 P1-a：本轮执行环境自 RoundContext 解构（任务种子/转向通道本后端
+        // 不消费，保持原忽略语义）。
+        let RoundContext {
+            conv_id,
+            workdir,
+            allowed_tools,
+            initial_todos: _,
+            model: model_override,
+            steer: _,
+        } = ctx;
         debug!(target: "imagent::codex", conv_id, "codex run start");
         // B11 幽灵会话预检（参照 claude 的 session_exists 毒化防护）：失败轮次的
         // stream 事件仍可能携带 thread_id，落库后 resume 必然失败且每轮再产新
@@ -118,7 +127,10 @@ impl Backend for CodexBackend {
         // P1-1：-s 必须在 `--` 之前——clap 的 `--` 之后全是 positional，codex exec
         // 用 trailing_var_arg 收集 prompt，原实现把 -s 放在 -- 之后导致 sandbox 模式
         // 被并入 prompt 字符串、从未生效（退到默认 read-only，用户配 Edit/Write 仍写不了）。
-        let model = self.model.read().unwrap_or_else(|e| e.into_inner()).clone();
+        // v1.38 会话级模型：ctx.model（KV `model:<conv>` 命中）优先，None 回退实例默认。
+        let model = model_override
+            .map(str::to_string)
+            .or_else(|| self.model.read().unwrap_or_else(|e| e.into_inner()).clone());
         let args = codex_args(session, sandbox_mode, model.as_deref(), prompt);
         let mut cmd = Command::new("codex");
         cmd.current_dir(workdir);

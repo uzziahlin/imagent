@@ -254,8 +254,10 @@ pub(crate) fn parse_model_catalog(raw: &str) -> Vec<String> {
 /// - 无任何映射 → options = official.claude 列表（{label: 官方名, target: None}）；
 /// - official 为空且无映射 → options 空（整段缺席，SPA 第③层兜底）。
 ///
-/// `current` 为 backend.model()（/model 命令热设值；None = 未设置，跟随 CLI
+/// `current` 为 backend.model()（None = 未设置，跟随 CLI
 /// 默认），原样进帧（serde 按可空字符串序列化，契约 `"current":null` 形态）。
+/// v1.38 会话级模型：/model 切换写 per-conv KV、不再改实例默认——current 恒
+/// 为引擎实例默认（config 基准），会话级覆盖以 IM /model 回显为准，不进此快照。
 pub(crate) fn resolve_models(
     cli: &CliModels,
     official: &[String],

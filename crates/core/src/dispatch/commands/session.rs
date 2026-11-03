@@ -604,42 +604,27 @@ impl Dispatcher {
         let sid = sid.clone();
         let join = tokio::spawn(async move {
             let backend_name = backend.name();
+            // v1.38 P1-a：压缩是系统发起的维护轮——ctx 不带会话模型覆盖
+            //（model=None = 引擎实例默认），不播种任务面板、无转向。
+            let ctx = RoundContext {
+                conv_id: &conv_id_compact,
+                workdir: &workdir,
+                allowed_tools: &tools,
+                initial_todos: &[],
+                model: None,
+                steer: {
+                    let (s, r) = mpsc::channel(1);
+                    drop(s);
+                    r
+                },
+            };
             // agent_timeout = 0（默认）= 关闭总超时；/stop 仍可中断本任务。
             if agent_timeout.is_zero() {
-                return backend
-                    .run(
-                        &conv_id_compact,
-                        COMPACT_PROMPT,
-                        Some(&sid),
-                        &workdir,
-                        &tools,
-                        tx,
-                        // /compact 是系统发起的维护轮，不播种任务面板、无转向。
-                        &[],
-                        {
-                            let (s, r) = mpsc::channel(1);
-                            drop(s);
-                            r
-                        },
-                    )
-                    .await;
+                return backend.run(ctx, COMPACT_PROMPT, Some(&sid), tx).await;
             }
             match tokio::time::timeout(
                 agent_timeout,
-                backend.run(
-                    &conv_id_compact,
-                    COMPACT_PROMPT,
-                    Some(&sid),
-                    &workdir,
-                    &tools,
-                    tx,
-                    &[],
-                    {
-                        let (s, r) = mpsc::channel(1);
-                        drop(s);
-                        r
-                    },
-                ),
+                backend.run(ctx, COMPACT_PROMPT, Some(&sid), tx),
             )
             .await
             {

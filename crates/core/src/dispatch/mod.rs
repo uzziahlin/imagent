@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::auth::Auth;
-use crate::backend::{backend_key, Backend};
+use crate::backend::{backend_key, model_key, Backend, RoundContext};
 use crate::card_session::CardSession;
 use crate::config::{CotDetail, PermissionMode, ReplyMode};
 use crate::error::Result;

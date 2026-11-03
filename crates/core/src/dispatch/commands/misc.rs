@@ -1014,13 +1014,22 @@ impl Dispatcher {
         }
     }
 
-    /// /model [name|default] —— 查看/热切运行时模型（W1-2）。
+    /// /model [name|default] —— 查看/热切**本会话**运行时模型（W1-2；v1.38
+    /// P1-a 起为会话级 KV）。
     ///
     /// 仅支持模型选择的后端可用（claude-cli `--model` / claude-acp env /
     /// codex `-m` / gemini `-m`，v1.21 起全覆盖）；
     /// 查看对所有白名单用户开放，**切换需 admin**——模型影响成本与行为，多人
-    /// 共用网关时不宜任意成员切换。进程内生效，重启/SIGHUP 恢复 config 的
-    /// `claude_model` 基准值；切换落审计。
+    /// 共用网关时不宜任意成员切换。语义（v1.38 P1-a）：
+    /// - 作用引擎 = `resolve_backend` 解析结果（修复：旧实现用 self.backend
+    ///   default 实例，/backend 切过引擎的会话里 /model 显示/切换操作错误引擎）；
+    /// - `/model` 无参：显示本会话生效模型（KV `model:<conv>` 命中显示之；
+    ///   否则引擎实例默认）+ 用法；
+    /// - `/model <名>`：写会话 KV（键名事实源 `model_key`；**不再**调
+    ///   set_model——实例级热设会让 A 会话的选择污染所有未覆盖会话），下一条
+    ///   消息 run 入口解析进 RoundContext.model。KV 值直接透传、不做引擎侧
+    ///   可用模型对照——非法名由引擎报错走既有失败卡，/model default 恢复；
+    /// - `/model default`：清 KV，恢复引擎实例默认。切换落审计。
     pub(super) async fn cmd_model(
         &self,
         conv: &ConvId,
@@ -1028,12 +1037,15 @@ impl Dispatcher {
         hint: &ReplyHint,
         parts: &[&str],
     ) {
-        if !self.backend.supports_model_selection() {
+        // v1.38 修复：解析 per-conv 引擎后再操作——能力判定/显示/回显都对准
+        // 本会话实际生效的引擎实例。
+        let backend = self.resolve_backend(&conv.0).await;
+        if !backend.supports_model_selection() {
             self.reply(
                 conv,
                 &format!(
                     "当前后端 {} 暂不支持模型选择（保持其默认模型）。",
-                    self.backend.name()
+                    backend.name()
                 ),
                 hint,
             )
@@ -1042,14 +1054,25 @@ impl Dispatcher {
         }
         let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
         if arg.is_empty() {
-            let cur = self
-                .backend
-                .model()
-                .unwrap_or_else(|| "（默认，跟随 CLI/本机配置）".to_string());
+            // 无参：本会话生效模型——KV 命中显示之；否则引擎实例默认。
+            let kv = self
+                .store
+                .get_config(&model_key(&conv.0))
+                .await
+                .ok()
+                .flatten()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let cur = match kv {
+                Some(m) => format!("{m}（本会话覆盖）"),
+                None => backend
+                    .model()
+                    .unwrap_or_else(|| "（默认，跟随 CLI/本机配置）".to_string()),
+            };
             self.reply(
                 conv,
                 &format!(
-                    "当前模型：{cur}\n用法：/model <名称>（切换，需管理员） · /model default（恢复默认）"
+                    "当前模型：{cur}\n用法：/model <名称>（本会话生效，需管理员） · /model default（恢复引擎默认）"
                 ),
                 hint,
             )
@@ -1066,9 +1089,28 @@ impl Dispatcher {
             return;
         }
         if arg.eq_ignore_ascii_case("default") {
-            self.backend.set_model(None);
-            self.reply(conv, "✅ 已恢复默认模型（CLI/本机配置）。", hint)
-                .await;
+            // 清 KV → 恢复引擎实例默认（run 入口解析 None 回退实例默认）。
+            // delete 对不存在键幂等（SQL DELETE 语义），重复 /model default 无害。
+            match self.store.delete_config(&model_key(&conv.0)).await {
+                Ok(_) => {
+                    self.reply(
+                        conv,
+                        "✅ 本会话模型已恢复引擎默认（下一条消息生效）。",
+                        hint,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    warn!(
+                        target: "imagent::core",
+                        conv_id = %conv.0,
+                        error = %e,
+                        "会话级模型 KV 清除失败"
+                    );
+                    self.reply(conv, &format!("⚠️ 恢复默认失败：{e}"), hint)
+                        .await;
+                }
+            }
             return;
         }
         // 模型名合理性：单个词 + 长度上限（防把整段文本当模型名传给 CLI）。
@@ -1090,25 +1132,40 @@ impl Dispatcher {
             return;
         }
         let model = arg.to_string();
-        self.backend.set_model(Some(model.clone()));
-        if let Err(e) = self
-            .store
-            .append_audit(
-                "model_switch",
-                Some(sender),
-                Some(&conv.0),
-                Some(&format!("model={model}")),
-            )
-            .await
-        {
-            tracing::warn!(target: "imagent::core", error = %e, "append_audit(model_switch) 失败");
+        match self.store.set_config(&model_key(&conv.0), &model).await {
+            Ok(_) => {
+                if let Err(e) = self
+                    .store
+                    .append_audit(
+                        "model_switch",
+                        Some(sender),
+                        Some(&conv.0),
+                        Some(&format!("model={model}")),
+                    )
+                    .await
+                {
+                    tracing::warn!(target: "imagent::core", error = %e, "append_audit(model_switch) 失败");
+                }
+                self.reply(
+                    conv,
+                    &format!(
+                        "✅ 本会话模型已切换为 {model}（下一条消息生效）。/model default 恢复。"
+                    ),
+                    hint,
+                )
+                .await;
+            }
+            Err(e) => {
+                warn!(
+                    target: "imagent::core",
+                    conv_id = %conv.0,
+                    error = %e,
+                    "会话级模型 KV 写入失败"
+                );
+                self.reply(conv, &format!("⚠️ 模型切换写入失败：{e}"), hint)
+                    .await;
+            }
         }
-        self.reply(
-            conv,
-            &format!("✅ 模型已切换为 {model}（下一轮生效；重启后恢复 config 配置）。"),
-            hint,
-        )
-        .await;
     }
 
     /// /backend [name] —— 会话级引擎切换（批 A/2 多引擎 Dispatcher）。

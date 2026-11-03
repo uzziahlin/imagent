@@ -44,7 +44,8 @@ use std::sync::{Mutex, RwLock};
 use async_trait::async_trait;
 use imagent_core::{
     AgentChunk, Backend, ConvId, CoreError, ImPermissionAsk, ImPermissionHook, LocalSession,
-    PermissionCapability, Result, RunOutcome, SessionId, TodoItem, TodoStatus, UsageStats,
+    PermissionCapability, Result, RoundContext, RunOutcome, SessionId, TodoItem, TodoStatus,
+    UsageStats,
 };
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch};
@@ -62,12 +63,18 @@ pub(crate) const DEFAULT_APPROVAL_POLICY: &str = "on-request";
 /// 审批摘要截断（与 claude-acp / socket 闭环同口径：2000 字符）。
 const SUMMARY_MAX_CHARS: usize = 2000;
 
+/// v1.38 extras 补全：实时模型目录桥闭包类型（与 web 驾驶舱 ModelsContext 的
+/// `ListModelsFn` 同构——bin 装配处直接绑定注入，default/extras 同源）。
+pub type ListModelsBridge = dyn Fn() -> Vec<String> + Send + Sync;
+
 /// OpenAI Codex app-server 双工后端。
 pub struct CodexAppBackend {
     /// 审批档位（untrusted/on-request/never；构造缺省 `on-request`）。
     approval_policy: String,
     /// v1.21 /model：运行时模型覆盖（thread/start / thread/resume 的 `model`
     /// 参数；None = CLI 默认）。std RwLock——与 exec 版同款（临界区纯读写）。
+    /// v1.38：实例默认基准；会话级覆盖走 RoundContext.model 优先，本字段只
+    /// 承担未覆盖会话的兜底。
     model: RwLock<Option<String>>,
     /// B3：IM 审批闭环回调（dispatcher `run()` 启动时注入；None = 独立使用，
     /// 审批请求 fail-closed 拒绝）。
@@ -79,6 +86,12 @@ pub struct CodexAppBackend {
     /// app-server 可执行名（生产恒 "codex"；测试注入 mock 脚本路径——复用
     /// [`crate::app_server`] 既有 spawn_configured/mock_script 形态）。
     program: String,
+    /// v1.38 extras 补全：实时模型目录桥（同步闭包，形态与 web 驾驶舱
+    /// ModelsContext 的 ListModelsFn 同构——bin 侧直接绑定注入）。有桥 = 本
+    /// 实例自含实时目录能力；None = 无桥（`list_models_live` 回空，语义同
+    /// `list_models` 的 fail-soft）。default 与 extras 装配处同源注入，消除
+    /// /backend 切换后的实例断链。
+    list_models_bridge: RwLock<Option<std::sync::Arc<ListModelsBridge>>>,
 }
 
 impl CodexAppBackend {
@@ -104,6 +117,57 @@ impl CodexAppBackend {
             hook: RwLock::new(None),
             interrupts: Mutex::new(HashMap::new()),
             program: "codex".to_string(),
+            list_models_bridge: RwLock::new(None),
+        }
+    }
+
+    /// v1.38 extras 补全：注入实时模型目录桥（同步入口，供 bin 装配 / 测试）。
+    /// None 清除（回退链语义不变）。
+    pub fn set_list_models_bridge(&self, f: Option<std::sync::Arc<ListModelsBridge>>) {
+        *self
+            .list_models_bridge
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = f;
+    }
+
+    /// 装配便捷口：为本实例构造并注入「自桥」（线程 + 临时 current-thread
+    /// runtime 桥接 [`Self::list_models`]——不依赖调用方 runtime 形态，任何
+    /// 失败 fail-soft 回空；原 bin build_backend 的内联实现上移收口于此，
+    /// default 与 extras 装配同源），返回桥句柄（default 路径转发给 web
+    /// ModelsContext 注入；extras 实例注入后自含同款能力）。
+    pub fn install_list_models_bridge(
+        self: &std::sync::Arc<Self>,
+    ) -> std::sync::Arc<ListModelsBridge> {
+        let app = std::sync::Arc::clone(self);
+        let bridge: std::sync::Arc<ListModelsBridge> = std::sync::Arc::new(move || {
+            let app = std::sync::Arc::clone(&app);
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map(|rt| rt.block_on(app.list_models()))
+                        .unwrap_or_default()
+                })
+                .join()
+                .unwrap_or_default()
+            })
+        });
+        self.set_list_models_bridge(Some(std::sync::Arc::clone(&bridge)));
+        bridge
+    }
+
+    /// 同步取实时模型目录：有桥走桥，无桥回空（与 [`Self::list_models`] 的
+    /// fail-soft 同语义）。web 驾驶舱 spawn_blocking 侧 / 实例自含能力共用。
+    pub fn list_models_live(&self) -> Vec<String> {
+        let f = self
+            .list_models_bridge
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match f {
+            Some(f) => f(),
+            None => Vec::new(),
         }
     }
 
@@ -707,15 +771,22 @@ impl Backend for CodexAppBackend {
 
     async fn run(
         &self,
-        conv_id: &str,
+        ctx: RoundContext<'_>,
         prompt: &str,
         session: Option<&SessionId>,
-        workdir: &std::path::Path,
-        allowed_tools: &[String],
         chunks: mpsc::Sender<AgentChunk>,
-        _initial_todos: &[TodoItem],
-        mut steer: mpsc::Receiver<String>,
     ) -> Result<RunOutcome> {
+        // v1.38 P1-a：本轮执行环境自 RoundContext 解构（任务种子本后端不消费，
+        // 保持原忽略语义）。
+        let RoundContext {
+            conv_id,
+            workdir,
+            allowed_tools,
+            initial_todos: _,
+            model: model_override,
+            steer,
+        } = ctx;
+        let mut steer = steer;
         debug!(
             target: "imagent::codex-app",
             conv_id, policy = %self.approval_policy, "codex-app run start"
@@ -762,7 +833,11 @@ impl Backend for CodexAppBackend {
         )
         .await?;
         let sandbox = crate::backend::pick_sandbox(allowed_tools);
-        let model = self.model.read().unwrap_or_else(|e| e.into_inner()).clone();
+        // v1.38 会话级模型：ctx.model（KV `model:<conv>` 命中）优先，None 回退
+        // 实例默认（config 基准 / CLI 默认）。thread/start|resume 的 model 参数。
+        let model = model_override
+            .map(str::to_string)
+            .or_else(|| self.model.read().unwrap_or_else(|e| e.into_inner()).clone());
         let thread_id = match session {
             Some(s) => {
                 let res = proc
@@ -1369,6 +1444,30 @@ mod tests {
         assert_eq!(b.model(), None);
     }
 
+    /// v1.38 extras 补全：实时模型目录桥（同步入口）注入/清除/消费——extras
+    /// 实例与 default 装配同源自含桥（消除 /backend 切换后的实例断链）。
+    #[test]
+    fn list_models_bridge_inject_consume_and_clear() {
+        let b = CodexAppBackend::new(None);
+        // 无桥：回空（fail-soft，与 list_models 的失败语义同向）。
+        assert!(
+            b.list_models_live().is_empty(),
+            "无桥时 list_models_live 应回空"
+        );
+        // 注入测试桥：非空链可消费（任务验收项「codex-app extra list_models
+        // 非空链」）。
+        b.set_list_models_bridge(Some(std::sync::Arc::new(|| {
+            vec!["gpt-5.3".to_string(), "gpt-5.3-codex".to_string()]
+        })));
+        assert_eq!(
+            b.list_models_live(),
+            vec!["gpt-5.3".to_string(), "gpt-5.3-codex".to_string()]
+        );
+        // 清除：回空（回退链接管语义不变）。
+        b.set_list_models_bridge(None);
+        assert!(b.list_models_live().is_empty());
+    }
+
     /// v1.37 优雅中断端到端（mock app-server，复用 mock_support 既有形态）：
     /// turn 在飞后 interrupt_run 发信号 → 事件循环对当前 turn 发
     /// `turn/interrupt`（出站 JSON-RPC 断言：mock 收帧日志含该请求帧与
@@ -1398,7 +1497,19 @@ mod tests {
             let backend = backend.clone();
             tokio::spawn(async move {
                 backend
-                    .run(&conv, "长任务", None, &wd, &[], tx, &[], steer_rx)
+                    .run(
+                        RoundContext {
+                            conv_id: &conv,
+                            workdir: &wd,
+                            allowed_tools: &[],
+                            initial_todos: &[],
+                            model: None,
+                            steer: steer_rx,
+                        },
+                        "长任务",
+                        None,
+                        tx,
+                    )
                     .await
             })
         };
@@ -1461,7 +1572,19 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<AgentChunk>(8);
         let (_steer_tx, steer_rx) = mpsc::channel::<String>(4);
         let res = backend
-            .run("conv-err", "x", None, &dir, &[], tx, &[], steer_rx)
+            .run(
+                RoundContext {
+                    conv_id: "conv-err",
+                    workdir: &dir,
+                    allowed_tools: &[],
+                    initial_todos: &[],
+                    model: None,
+                    steer: steer_rx,
+                },
+                "x",
+                None,
+                tx,
+            )
             .await;
         assert!(res.is_err(), "spawn 必败应 Err");
         assert!(

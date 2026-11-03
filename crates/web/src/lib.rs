@@ -697,7 +697,8 @@ pub(crate) struct ModelOption {
 
 /// v1.8 workspaces 快照帧可选 models 段（CLI 配置优先 + 网关官方列表回退，
 /// 汇聚逻辑见 [`crate::models::resolve_models`]）。`current` = backend.model()
-/// （/model 命令热设值，null = 未设置跟随 CLI 默认）；`cliDefault` =
+/// （引擎实例默认，null = 未设置跟随 CLI 默认；v1.38 会话级 /model 覆盖不进
+/// 此快照——以 IM /model 回显为准）；`cliDefault` =
 /// settings.json env.ANTHROPIC_MODEL（serde rename 对齐契约 `cliDefault`，
 /// 无则 null）；`options` = 菜单项（≥1 才由调用方序列化整段，见
 /// [`encode_workspaces_frame`]）。
