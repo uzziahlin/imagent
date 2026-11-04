@@ -834,15 +834,19 @@ impl Dispatcher {
                     text_buf.flush(self, &conv, &hint, &mut streamed_text).await;
                     // 展示侧摘要按 COT 档截断（卡片/最终摘要用）。
                     let summary = truncate_str(&raw_summary, cot.input_trunc());
+                    // #7 diff 视图：Edit/MultiEdit/Write（claude input 合成）与
+                    // codex fileChange（协议 diff 透传）命中则挂内容，其余 None。
+                    let diff = crate::render::synth_diff_from_tool_input(&tool, &input);
+                    if let Some(c) = card.as_ref() {
+                        c.append_tool(&tool, &summary, id.as_deref(), diff.as_deref());
+                    }
                     tool_calls.push(ToolCall {
                         name: tool.clone(),
                         summary: summary.clone(),
                         done: false,
                         id: id.clone(),
+                        diff,
                     });
-                    if let Some(c) = card.as_ref() {
-                        c.append_tool(&tool, &summary, id.as_deref());
-                    }
                 }
                 AgentChunk::ToolResult { tool, id, .. } => {
                     // P8-1：结果到达 → 翻 ✅（W2-3：优先按 id 精确配对，无 id 回退

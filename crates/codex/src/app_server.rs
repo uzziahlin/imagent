@@ -640,6 +640,9 @@ exit 0
             // 场景 F：出站参数 e2e（v1.38 P1-b）——记录 thread/start / turn/start
             // 帧后立即回响应 + completed 终态收尾；测试断言出站 params 里的
             // approvalPolicy（thread/start）与 effort（turn/start）有无。
+            // #7 追加 fileChange item/completed（diff 的 \n 是 JSON 转义序列，
+            // 走 %s 参数形态防 printf 格式串转义），供映射 e2e 断言 ToolUse +
+            // 紧随 ToolResult。
             "params" => r#"
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$LOG"
@@ -651,6 +654,7 @@ while IFS= read -r line; do
         *'"thread/start"'*) printf '{"id":%s,"result":{"thread":{"id":"th-1"}}}\n' "$id" ;;
         *'"turn/start"'*)
           printf '{"id":%s,"result":{"turn":{"id":"turn-1"}}}\n' "$id"
+          printf '%s\n' '{"method":"item/completed","params":{"threadId":"th-1","turnId":"turn-1","item":{"type":"fileChange","id":"fc-1","status":"completed","changes":[{"kind":{"type":"update"},"path":"src/lib.rs","diff":"--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new"}]}}}'
           printf '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"turn-1","status":"completed","items":[]}}}\n' ;;
       esac
       ;;

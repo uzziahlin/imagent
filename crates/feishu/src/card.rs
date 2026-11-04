@@ -2085,6 +2085,7 @@ mod tests {
             summary: summary.into(),
             done,
             id: None,
+            diff: None,
         }
     }
 
@@ -3848,6 +3849,7 @@ mod tests {
                 summary: format!("{long_summary}#{i}"),
                 done: true,
                 id: None,
+                diff: None,
             })
             .collect();
         let card = OutboundCard {
@@ -4573,6 +4575,7 @@ mod tests {
                 summary: format!("{long_summary}#{i}"),
                 done: true,
                 id: None,
+                diff: None,
             })
             .collect();
         let thoughts: Vec<String> = (0..300)

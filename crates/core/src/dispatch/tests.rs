@@ -4382,6 +4382,114 @@ async fn card_round_consumes_delta_stream_fast() {
     drop_db(ctx.db).await;
 }
 
+/// #7 diff 视图：记录完整 OutboundCard 快照的卡片平台 mock（断言
+/// ToolCall.diff 挂卡链路——CardCapablePlatform 只记 text，不够用）。
+struct CardRecordingPlatform {
+    cards: Arc<TokioMutex<Vec<crate::types::OutboundCard>>>,
+}
+
+#[async_trait]
+impl Platform for CardRecordingPlatform {
+    async fn recv(&self) -> Result<InboundMessage> {
+        // 测试不经 run/recv（直接 handle），永不返回。
+        loop {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+    }
+    async fn send_text(&self, _conv: &ConvId, _text: &str, _hint: &ReplyHint) -> Result<()> {
+        Ok(())
+    }
+    async fn send_media(
+        &self,
+        _conv: &ConvId,
+        _media: &crate::types::MediaRef,
+        _hint: &ReplyHint,
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn name(&self) -> &'static str {
+        "mock-card-rec"
+    }
+    fn supports_streaming_card(&self, _conv: &ConvId) -> bool {
+        true
+    }
+    async fn send_card(
+        &self,
+        _conv: &ConvId,
+        card: &crate::types::OutboundCard,
+        _hint: &ReplyHint,
+    ) -> Result<Option<String>> {
+        self.cards.lock().await.push(card.clone());
+        Ok(Some("card:rec".into()))
+    }
+    async fn update_card(
+        &self,
+        _conv: &ConvId,
+        _message_id: &str,
+        card: &crate::types::OutboundCard,
+        _hint: &ReplyHint,
+    ) -> Result<()> {
+        self.cards.lock().await.push(card.clone());
+        Ok(())
+    }
+}
+
+/// #7 diff 视图：ToolUse 分支构建 ToolCall 挂 diff——claude Edit input 经
+/// synth_diff_from_tool_input 合成进卡片工具记录；非文件修改工具（Bash）
+/// diff 保持 None。round.rs 与 CardSession::append_tool 两条记录同源。
+#[tokio::test]
+async fn tool_call_carries_synth_diff_on_card() {
+    let _serial = SERIAL.lock().await;
+    let cards = Arc::new(TokioMutex::new(Vec::new()));
+    let plat = CardRecordingPlatform {
+        cards: cards.clone(),
+    };
+    let (back, _calls, _prompts, _order) = MockBackend::new_with_tools(vec![
+        (
+            "Edit".to_string(),
+            r#"{"file_path":"/a/b.rs","old_string":"let x = 1;","new_string":"let x = 2;"}"#
+                .to_string(),
+        ),
+        ("Bash".to_string(), r#"{"command":"ls"}"#.to_string()),
+    ])
+    .await;
+    let (store, db) = tmp_store().await;
+    let auth = Auth::new(vec!["alice".into()]);
+    let admins = auth.snapshot();
+    let disp = Arc::new(Dispatcher::new(
+        Arc::new(plat),
+        Arc::new(back),
+        store,
+        auth,
+        std::path::PathBuf::from("/tmp/imagent-test-ws"),
+        vec!["Read".into(), "Edit".into()],
+        PermissionMode::Off,
+        test_budgets(),
+        CotDetail::Brief,
+        admins,
+    ));
+    disp.handle(msg("c1", "alice", "改一下")).await;
+    let cards = cards.lock().await;
+    // 终态卡（最后一张）含两条工具记录：Edit 挂 diff、Bash 无 diff。
+    let final_card = cards
+        .iter()
+        .rev()
+        .find(|c| c.tool_calls.len() == 2)
+        .expect("终态卡应有两条工具记录");
+    assert_eq!(final_card.tool_calls[0].name, "Edit");
+    assert_eq!(
+        final_card.tool_calls[0].diff.as_deref(),
+        Some("- let x = 1;\n+ let x = 2;"),
+        "Edit 应挂合成 diff"
+    );
+    assert_eq!(final_card.tool_calls[1].name, "Bash");
+    assert_eq!(
+        final_card.tool_calls[1].diff, None,
+        "非文件修改工具 diff 应 None"
+    );
+    drop_db(db).await;
+}
+
 /// P2-11：文本平台（无卡）delta 合帧——50 条 delta 只产生少量消息（≤5），
 /// 且每段内容恰好送达一次（合帧只改发送粒度，不改「用户看到完整文本」）。
 #[tokio::test]

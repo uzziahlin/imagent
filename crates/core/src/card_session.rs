@@ -304,13 +304,21 @@ impl CardSession {
 
     /// 累积工具调用（⏳ 执行中）；阶段翻到「调用工具」。
     /// W2-3：`id` 供结果精确配对（None = 后端未提供）。
-    pub(crate) fn append_tool(&self, tool: &str, input_summary: &str, id: Option<&str>) {
+    /// #7：`diff` 文件修改内容随卡透传（None = 无内容）。
+    pub(crate) fn append_tool(
+        &self,
+        tool: &str,
+        input_summary: &str,
+        id: Option<&str>,
+        diff: Option<&str>,
+    ) {
         self.touch(|s| {
             s.tools.push(ToolCall {
                 name: tool.to_string(),
                 summary: input_summary.to_string(),
                 done: false,
                 id: id.map(str::to_string),
+                diff: diff.map(str::to_string),
             });
             s.phase = CardPhase::ToolRunning;
         });

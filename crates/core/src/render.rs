@@ -55,6 +55,101 @@ pub fn tool_summary(name: &str, input_json: &str) -> String {
     .unwrap_or_else(|| truncate_chars(&collapse_ws(input_json), SUMMARY_MAX))
 }
 
+/// diff 文本行数上限（超过 → 截断，见 [`clamp_diff`]）。
+const DIFF_MAX_LINES: usize = 200;
+/// diff 文本字节上限（8KB；与行数上限任一超限即截断）。
+const DIFF_MAX_BYTES: usize = 8 * 1024;
+/// 截断尾行（不加 diff 行前缀——它是提示行，不是内容行）。
+const DIFF_TRUNCATION_MARKER: &str = "…（已截断）";
+
+/// #7 diff 视图：从工具调用 input JSON 合成 unified 风格 diff 文本
+/// （`+`/`-` 前缀行，无 hunk 头要求；SPA 折叠区展示，飞书卡不消费）。
+///
+/// 白名单内且 input JSON 解析出预期字段才返回 Some，否则 None
+/// （**纯函数绝不 Err**：解析失败/字段缺失/类型不符/空内容一律 None）。
+/// 与 [`tool_summary`] 同签名同消费点（round.rs ToolUse 分支构建 ToolCall）。
+///
+/// - claude `Edit` `{file_path, old_string, new_string}`：old 每行 `- ` 前缀 +
+///   new 每行 `+ `；
+/// - claude `MultiEdit` `{file_path, edits: [{old_string, new_string}]}`：逐段
+///   拼接（段内顺序同 Edit）；
+/// - claude `Write` `{file_path, content}`：content 每行 `+ `（空串 = 零行，
+///   清空文件不产假空行）；
+/// - codex `fileChange`：input 由 app_backend 映射为 `{"path", "diff"}`
+///   （diff = 协议 FileUpdateChange.diff 拼接，0.166 schema 实证必带——见
+///   codex map_item_completed 注释），此处透传；
+/// - 其余工具 / 坏 JSON → None。
+pub fn synth_diff_from_tool_input(tool: &str, input: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(input).ok()?;
+    let get_str = |k: &str| v.get(k).and_then(serde_json::Value::as_str);
+    let mut lines: Vec<String> = Vec::new();
+    match tool {
+        "Edit" => {
+            lines.extend(prefixed_lines(get_str("old_string")?, "- "));
+            lines.extend(prefixed_lines(get_str("new_string")?, "+ "));
+        }
+        "MultiEdit" => {
+            let edits = v.get("edits").and_then(serde_json::Value::as_array)?;
+            for e in edits {
+                let old = e.get("old_string").and_then(serde_json::Value::as_str)?;
+                let new = e.get("new_string").and_then(serde_json::Value::as_str)?;
+                lines.extend(prefixed_lines(old, "- "));
+                lines.extend(prefixed_lines(new, "+ "));
+            }
+        }
+        "Write" => {
+            lines.extend(prefixed_lines(get_str("content")?, "+ "));
+        }
+        // codex fileChange：协议自带 unified diff，直接透传（截断在 clamp 统一）。
+        "fileChange" => {
+            let d = get_str("diff")?;
+            if !d.is_empty() {
+                lines.push(d.to_string());
+            }
+        }
+        _ => return None,
+    }
+    let diff = lines.join("\n");
+    (!diff.is_empty()).then(|| clamp_diff(diff))
+}
+
+/// 多行内容逐行加前缀；空串 = 零行（无假空行）。
+fn prefixed_lines(s: &str, prefix: &str) -> Vec<String> {
+    if s.is_empty() {
+        Vec::new()
+    } else {
+        s.split('\n').map(|l| format!("{prefix}{l}")).collect()
+    }
+}
+
+/// diff 超限截断：>200 行先按行截，仍 >8KB 再按 UTF-8 安全边界截字节；
+/// 被截断时追加尾行「…（已截断）」。未超限原样返回。
+fn clamp_diff(diff: String) -> String {
+    let over_lines = diff.lines().count() > DIFF_MAX_LINES;
+    let over_bytes = diff.len() > DIFF_MAX_BYTES;
+    if !over_lines && !over_bytes {
+        return diff;
+    }
+    let mut out = if over_lines {
+        diff.lines()
+            .take(DIFF_MAX_LINES)
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        diff
+    };
+    if out.len() > DIFF_MAX_BYTES {
+        let mut end = DIFF_MAX_BYTES;
+        while !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.truncate(end);
+    }
+    out.push('\n');
+    out.push_str(DIFF_TRUNCATION_MARKER);
+    out
+}
+
 /// 工具状态图标：✅ 已完成 / ⏳ 执行中。
 pub fn tool_status_icon(done: bool) -> &'static str {
     if done {
@@ -201,6 +296,7 @@ mod tests {
             summary: "git status".into(),
             done: true,
             id: None,
+            diff: None,
         };
         assert_eq!(tool_card_line(&t), "✅ ⚡ **Bash** — git status");
         assert_eq!(tool_text_line(&t), "✅ ⚡ Bash — git status");
@@ -209,7 +305,152 @@ mod tests {
             summary: String::new(),
             done: false,
             id: None,
+            diff: None,
         };
         assert_eq!(tool_card_line(&running), "⏳ 📖 **Read**");
+    }
+
+    // ---------- #7 diff 视图：synth_diff_from_tool_input 全态 ----------
+
+    #[test]
+    fn synth_edit_old_minus_new_plus() {
+        let out = synth_diff_from_tool_input(
+            "Edit",
+            r#"{"file_path":"/a/b.rs","old_string":"let x = 1;\nfoo();","new_string":"let x = 2;"}"#,
+        )
+        .expect("Edit 应合成");
+        // 行序：old 段在前（- 前缀）、new 段在后（+ 前缀），无 hunk 头。
+        assert_eq!(out, "- let x = 1;\n- foo();\n+ let x = 2;");
+    }
+
+    #[test]
+    fn synth_multiedit_concatenates_segments() {
+        let out = synth_diff_from_tool_input(
+            "MultiEdit",
+            r#"{"file_path":"/a.rs","edits":[
+                {"old_string":"a","new_string":"b"},
+                {"old_string":"c","new_string":"d\ne"}]}"#,
+        )
+        .expect("MultiEdit 应合成");
+        assert_eq!(out, "- a\n+ b\n- c\n+ d\n+ e");
+    }
+
+    #[test]
+    fn synth_write_all_plus_lines() {
+        let out = synth_diff_from_tool_input(
+            "Write",
+            r#"{"file_path":"/new.rs","content":"first\nsecond"}"#,
+        )
+        .expect("Write 应合成");
+        assert_eq!(out, "+ first\n+ second");
+        // 清空文件（content=""）= 零行 → 无内容 → None（不产假空行）。
+        assert_eq!(
+            synth_diff_from_tool_input("Write", r#"{"file_path":"/f","content":""}"#),
+            None,
+            "空 content 应 None"
+        );
+    }
+
+    #[test]
+    fn synth_filechange_passes_protocol_diff_through() {
+        // codex fileChange 映射 input（app_backend 构造 {"path","diff"}）——
+        // diff 为协议 FileUpdateChange.diff 拼接，直接透传。
+        let out = synth_diff_from_tool_input(
+            "fileChange",
+            r#"{"path":"src/main.rs","diff":"--- a/src/main.rs\n+++ b\n-old\n+new"}"#,
+        )
+        .expect("fileChange 应透传");
+        assert_eq!(out, "--- a/src/main.rs\n+++ b\n-old\n+new");
+    }
+
+    #[test]
+    fn synth_rejects_bad_json_unknown_tool_missing_fields() {
+        // 坏 JSON / 非白名单工具 / 字段缺失 / 类型不符 → None（绝不 Err）。
+        assert_eq!(synth_diff_from_tool_input("Edit", r#"{"file_path":"#), None);
+        assert_eq!(
+            synth_diff_from_tool_input("Bash", r#"{"command":"ls"}"#),
+            None,
+            "非白名单工具应 None"
+        );
+        assert_eq!(
+            synth_diff_from_tool_input("Edit", r#"{"file_path":"/a"}"#),
+            None,
+            "old_string 缺失应 None"
+        );
+        assert_eq!(
+            synth_diff_from_tool_input("Edit", r#"{"old_string":1,"new_string":"x"}"#),
+            None,
+            "old_string 非字符串应 None"
+        );
+        assert_eq!(
+            synth_diff_from_tool_input("MultiEdit", r#"{"edits":"no-array"}"#),
+            None,
+            "edits 非数组应 None"
+        );
+        assert_eq!(
+            synth_diff_from_tool_input("fileChange", r#"{"path":"/a"}"#),
+            None,
+            "fileChange 缺 diff 应 None"
+        );
+        // 空串 input / 空对象同样 None。
+        assert_eq!(synth_diff_from_tool_input("Edit", ""), None);
+        assert_eq!(synth_diff_from_tool_input("Edit", "{}"), None);
+    }
+
+    #[test]
+    fn synth_truncates_over_200_lines() {
+        // join("\\n")：JSON 字符串内的换行转义序列（裸换行非法 JSON）。
+        let old = (0..250)
+            .map(|i| format!("old{i}"))
+            .collect::<Vec<_>>()
+            .join("\\n");
+        let input = format!(r#"{{"file_path":"/a","old_string":"{old}","new_string":"+tail"}}"#);
+        let out = synth_diff_from_tool_input("Edit", &input).expect("超限也应合成");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines.len(),
+            DIFF_MAX_LINES + 1,
+            "200 行内容 + 1 尾行: {out}"
+        );
+        assert_eq!(lines.last().copied(), Some(DIFF_TRUNCATION_MARKER));
+        assert!(lines[0].starts_with("- old0"));
+        assert!(lines[DIFF_MAX_LINES - 1].starts_with("- old199"));
+    }
+
+    #[test]
+    fn synth_truncates_over_8kb_on_utf8_boundary() {
+        // 中文 3 字节/行 × 500 行 × 40 字符（120B/行）≈ 60KB：行数（500>200）
+        // 与字节双超，验证先按行截到 200 行（≈24KB）再按字节截到 UTF-8 边界。
+        let line = "汉".repeat(40);
+        let content = (0..500)
+            .map(|i| format!("{line}{i}"))
+            .collect::<Vec<_>>()
+            .join("\\n");
+        let input = format!(r#"{{"file_path":"/a","content":"{content}"}}"#);
+        let out = synth_diff_from_tool_input("Write", &input).expect("应合成");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.last().copied(), Some(DIFF_TRUNCATION_MARKER));
+        // 尾行之外的主体 ≤ 8KB（UTF-8 边界截断不劈半个字符）。
+        let body = lines[..lines.len() - 1].join("\n");
+        assert!(body.len() <= DIFF_MAX_BYTES, "主体应 ≤8KB: {}", body.len());
+        // 不劈字符：按 char 计数重建字节长度应一致（无部分字符）。
+        assert_eq!(body.chars().collect::<String>().len(), body.len());
+    }
+
+    #[test]
+    fn synth_under_limits_keeps_content_verbatim() {
+        // 199 行（<200 行、<8KB）不截断——内容逐行 `+ ` 前缀原样保留。
+        let content = (0..199)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\\n");
+        let input = format!(r#"{{"file_path":"/a","content":"{content}"}}"#);
+        let out = synth_diff_from_tool_input("Write", &input).expect("应合成");
+        let expected = (0..199)
+            .map(|i| format!("+ l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(out, expected);
+        assert!(!out.contains(DIFF_TRUNCATION_MARKER));
     }
 }

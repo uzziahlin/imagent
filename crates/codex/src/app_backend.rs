@@ -698,6 +698,60 @@ fn map_item_completed(params: &Value, st: &mut LoopState) -> Vec<AgentChunk> {
                 id: item.get("id").and_then(Value::as_str).map(str::to_string),
             }]
         }
+        // 文件修改 item（#7 diff 视图）→ 工具卡 + 紧随 ToolResult（done）——
+        // 与 commandExecution 同款机制，但仅通知场景：item/started 不出卡，
+        // completed 一次性上卡。
+        //
+        // 0.166 schema 实证（`codex app-server generate-json-schema`，与生产
+        // 同版本）：FileChangeThreadItem = {changes: [FileUpdateChange], id,
+        // status: PatchApplyStatus(inProgress|completed|failed|declined), type}
+        // —— FileUpdateChange = {diff: string, kind: PatchChangeKind
+        // (add|delete|update), path: string} 三字段全 required，**有 diff 内容
+        // 字段**（unified diff 文本）。据此映射进 ToolCall.diff：ToolUse input
+        // 构造 `{"path","diff"}`（多文件 changes 拼接），core 侧
+        // synth_diff_from_tool_input("fileChange") 从中提取；summary 走
+        // tool_summary 通用 path 字段回退（= path）。changes 为空（无实际文件
+        // 变更）不出卡。审批侧（item/fileChange/requestApproval → Edit 映射）
+        // 既有链路不变。
+        Some("fileChange") => {
+            let changes = item.get("changes").and_then(Value::as_array);
+            let paths: Vec<&str> = changes
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|c| c.get("path").and_then(Value::as_str))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let diffs: Vec<&str> = changes
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|c| c.get("diff").and_then(Value::as_str))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if paths.is_empty() {
+                Vec::new()
+            } else {
+                let input = json!({
+                    "path": paths.join(", "),
+                    "diff": diffs.join("\n"),
+                })
+                .to_string();
+                let id = item.get("id").and_then(Value::as_str).map(str::to_string);
+                vec![
+                    AgentChunk::ToolUse {
+                        tool: "fileChange".into(),
+                        input,
+                        id,
+                    },
+                    AgentChunk::ToolResult {
+                        tool: "fileChange".into(),
+                        output: String::new(),
+                        id: item.get("id").and_then(Value::as_str).map(str::to_string),
+                    },
+                ]
+            }
+        }
         // plan item 是实验性文本快照（结构化待办走 turn/plan/updated）。
         _ => Vec::new(),
     }
@@ -1165,6 +1219,70 @@ mod tests {
         );
     }
 
+    /// #7：fileChange completed（0.166 schema 信封形态——FileChangeThreadItem =
+    /// {changes:[FileUpdateChange{diff,kind,path}], id, status, type}，全
+    /// required）→ ToolUse{fileChange, input={"path","diff"}} + 紧随 ToolResult
+    /// （done）。多文件 changes 的 path/diff 分别拼接；item/started 无 fileChange
+    /// 分支（仅通知场景，不出卡）。
+    #[test]
+    fn filechange_item_maps_to_tooluse_plus_result() {
+        let mut st = LoopState::default();
+        let chunks = feed(
+            &[
+                (
+                    "item/started",
+                    json!({"item":{"type":"fileChange","id":"fc-1","status":"inProgress",
+                           "changes":[{"kind":{"type":"update"},"path":"a.rs","diff":"-a\n+b"}]},
+                           "threadId":"th","turnId":"t1","startedAtMs":1}),
+                ),
+                (
+                    "item/completed",
+                    json!({"item":{"type":"fileChange","id":"fc-1","status":"completed",
+                           "changes":[
+                             {"kind":{"type":"update"},"path":"a.rs","diff":"-old\n+new"},
+                             {"kind":{"type":"add"},"path":"created.rs","diff":"+fresh"}]},
+                           "threadId":"th","turnId":"t1","completedAtMs":2}),
+                ),
+            ],
+            &mut st,
+        );
+        // started 不出卡；completed 一次性 ToolUse + 紧随 ToolResult。
+        assert_eq!(chunks.len(), 2, "{chunks:?}");
+        let use_input = match &chunks[0] {
+            AgentChunk::ToolUse { tool, input, id } if tool == "fileChange" => {
+                assert_eq!(id.as_deref(), Some("fc-1"));
+                input.clone()
+            }
+            other => panic!("首 chunk 应 ToolUse(fileChange): {other:?}"),
+        };
+        let v: Value = serde_json::from_str(&use_input).expect("input 应为 JSON");
+        assert_eq!(v["path"], "a.rs, created.rs", "多文件 path 逗号拼接");
+        assert_eq!(v["diff"], "-old\n+new\n+fresh", "多文件 diff 换行拼接");
+        assert!(
+            matches!(&chunks[1], AgentChunk::ToolResult { tool, id: Some(id), .. }
+                if tool == "fileChange" && id == "fc-1"),
+            "紧随 ToolResult 翻 done: {chunks:?}"
+        );
+    }
+
+    /// #7：fileChange 无实际文件变更（changes 空/缺席）不出卡。
+    #[test]
+    fn filechange_without_changes_maps_nothing() {
+        let mut st = LoopState::default();
+        for changes in [json!([]), json!(null)] {
+            let mut item = json!({"type":"fileChange","id":"fc-0","status":"completed"});
+            if !changes.is_null() {
+                item["changes"] = changes.clone();
+            }
+            let chunks = map_notification(
+                "item/completed",
+                &json!({"item": item, "threadId":"th","turnId":"t1"}),
+                &mut st,
+            );
+            assert!(chunks.is_empty(), "changes={changes} 应跳过: {chunks:?}");
+        }
+    }
+
     /// turn/plan/updated → TodoList（status 映射）。
     #[test]
     fn plan_update_maps_to_todo_list() {
@@ -1603,6 +1721,73 @@ mod tests {
             !tn_lines[1].contains("\"effort\""),
             "ctx.effort=None 不得带 effort 字段（保持现状字节）: {}",
             tn_lines[1]
+        );
+    }
+
+    /// #7 e2e（mock 场景 "params" 扩展——turn/start 后吐 fileChange
+    /// item/completed）：fileChange item 经映射成 ToolUse + 紧随 ToolResult
+    /// chunk 流出（core 侧再由 synth_diff_from_tool_input("fileChange") 提取
+    /// diff 挂 ToolCall——本测试钉 codex 侧 chunk 序列与 input 形状契约）。
+    #[tokio::test]
+    async fn run_emits_filechange_tooluse_and_result_chunks() {
+        let dir = std::env::temp_dir().join(format!(
+            "imagent-codex-app-filechange-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let (script, _log) = crate::app_server::mock_support::mock_script(&dir, "params");
+        let mut backend = CodexAppBackend::new(Some("on-request"));
+        backend.program = script.to_string_lossy().into_owned();
+        let conv = "conv-fc".to_string();
+        let wd = dir.clone();
+        let (tx, mut rx) = mpsc::channel::<AgentChunk>(64);
+        let (_steer_tx, steer_rx) = mpsc::channel::<String>(4);
+        let outcome = backend
+            .run(
+                RoundContext {
+                    conv_id: &conv,
+                    workdir: &wd,
+                    allowed_tools: &[],
+                    initial_todos: &[],
+                    model: None,
+                    effort: None,
+                    permission_mode: PermissionMode::Auto,
+                    steer: steer_rx,
+                },
+                "fileChange 一轮",
+                None,
+                tx,
+            )
+            .await
+            .expect("run 应 Ok");
+        assert!(outcome.terminal, "mock 立即 completed，应为正常终态");
+        // 收 chunk（run 返回后 sender 已 drop，recv 排空缓冲后返回 None）。
+        let mut chunks = Vec::new();
+        while let Some(c) = rx.recv().await {
+            chunks.push(c);
+        }
+        let fc_use_idx = chunks
+            .iter()
+            .position(|c| matches!(c, AgentChunk::ToolUse { tool, .. } if tool == "fileChange"))
+            .expect("应有 fileChange ToolUse");
+        match (&chunks[fc_use_idx], &chunks[fc_use_idx + 1]) {
+            (
+                AgentChunk::ToolUse { input, id, .. },
+                AgentChunk::ToolResult { tool, id: rid, .. },
+            ) => {
+                assert_eq!(id.as_deref(), Some("fc-1"), "mock 信封 itemId");
+                assert_eq!(tool, "fileChange", "ToolUse 紧随同名 ToolResult");
+                assert_eq!(rid.as_deref(), Some("fc-1"), "id 精确配对翻 done");
+                let v: Value = serde_json::from_str(input).expect("input 应为 JSON");
+                assert_eq!(v["path"], "src/lib.rs");
+                assert!(v["diff"].as_str().unwrap_or("").contains("+new"));
+            }
+            other => panic!("ToolUse 后应紧随 ToolResult: {other:?}"),
+        }
+        // 终态 Final 仍在（chunk 流未被工具映射破坏）。
+        assert!(
+            matches!(chunks.last(), Some(AgentChunk::Final(_))),
+            "末 chunk 应 Final: {chunks:?}"
         );
     }
 

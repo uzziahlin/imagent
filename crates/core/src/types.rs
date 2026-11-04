@@ -324,6 +324,11 @@ pub struct ToolCall {
     /// W2-3：工具调用 id（有则与 ToolResult 精确配对；None = 后端未提供，
     /// 按名配对兜底）。
     pub id: Option<String>,
+    /// #7 diff 视图：文件修改内容——unified 风格纯文本（`+`/`-` 前缀行，
+    /// 无 hunk 头要求；>200 行或 >8KB 尾行「…（已截断）」，见
+    /// [`crate::render::synth_diff_from_tool_input`]）。None = 无内容（非文件
+    /// 修改类工具，或 codex fileChange 仅通知场景下协议未携带 diff）。
+    pub diff: Option<String>,
 }
 
 /// `/config` 表单卡的一个字段（P9-2：平台无关描述，飞书侧渲染成 CardKit

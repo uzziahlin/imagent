@@ -329,6 +329,11 @@ pub struct ToolCallPayload {
     pub done: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// #7 diff 视图：unified 风格 diff 文本（core ToolCall.diff 同源透传；
+    /// 缺失 = 无内容——非文件修改类工具，或 codex fileChange 仅通知场景下
+    /// 协议未携带）。SPA 按字段存在性渲染折叠区。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
 }
 
 /// 任务清单项（[`TodoItem`] 的 DTO）；status: pending | in_progress | completed。
@@ -352,6 +357,7 @@ impl CardPayload {
                     summary: t.summary.clone(),
                     done: t.done,
                     id: t.id.clone(),
+                    diff: t.diff.clone(),
                 })
                 .collect(),
             thoughts: card.thoughts.clone(),
@@ -2272,6 +2278,7 @@ mod tests {
                 summary: "ls -la".into(),
                 done: true,
                 id: Some("t1".into()),
+                diff: None,
             }],
             thoughts: vec!["想一想".into()],
             todos: vec![TodoItem {
@@ -2373,6 +2380,34 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["card"]["terminal"], "error");
         assert_eq!(v["card"]["error"], "boom");
+    }
+
+    /// #7 diff 视图：ToolCallPayload 的 diff 字段带/缺两形态字节级（SPA 折叠区
+    /// 按字段存在性渲染——缺失即不序列化，非 null）。
+    #[test]
+    fn tool_call_diff_payload_bytes() {
+        let mut card = sample_card("改文件", CardTerminal::Done);
+        card.tool_calls[0].name = "Edit".into();
+        card.tool_calls[0].diff = Some("- old\n+ new".into());
+        let payload = CardPayload::from_card(&card);
+        let json =
+            encode_card_frame("home-mac", "card", "web:work", "web-card-1", &payload).unwrap();
+        // 字节级精确串（键序 = 结构体声明序）：diff 紧随 id。
+        assert!(json.contains(
+            r#""tool_calls":[{"name":"Edit","summary":"ls -la","done":true,"id":"t1","diff":"- old\n+ new"}]"#
+        ), "带 diff 应整块精确序列化: {json}");
+
+        // 缺 diff（None → 字段缺席，缺省形态字节与 v1.38 一致）。
+        let card = sample_card("无 diff", CardTerminal::Done);
+        let payload = CardPayload::from_card(&card);
+        let json =
+            encode_card_frame("home-mac", "card", "web:work", "web-card-1", &payload).unwrap();
+        assert!(
+            json.contains(
+                r#""tool_calls":[{"name":"Bash","summary":"ls -la","done":true,"id":"t1"}]"#
+            ),
+            "缺 diff 不应序列化字段（非 null）: {json}"
+        );
     }
 
     #[test]
