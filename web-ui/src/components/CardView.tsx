@@ -57,7 +57,12 @@ function toolCallsEqual(a: ToolCallPayload[], b: ToolCallPayload[]): boolean {
   if (a.length !== b.length) {
     return false;
   }
-  return a.every((x, i) => x.name === b[i].name && x.summary === b[i].summary && x.done === b[i].done);
+  // diff 按值比较（字符串 === 逐字符）：流式补丁下 diff 增量到达时时间线
+  // 必须重渲（徽标统计与展开内容随 diff 更新），仅 name/summary/done 不够。
+  return a.every(
+    (x, i) =>
+      x.name === b[i].name && x.summary === b[i].summary && x.done === b[i].done && x.diff === b[i].diff,
+  );
 }
 
 function thoughtsEqual(a: string[], b: string[]): boolean {
@@ -94,13 +99,108 @@ function Spinner() {
   );
 }
 
+// ---------------------------------------------------------------------------
+// 执行链 diff（v1.39）：文件修改类工具（claude Edit/MultiEdit/Write、codex
+// fileChange）完成条目携带 unified 风格纯文本 diff（每行 +/-/空格 开头）。
+// 条目默认收起一行（右侧 +n/−m 徽标），点击展开 diff 体——与整块折叠
+// （finished 摘要按钮）正交；无 diff 条目渲染零变化。
+// ---------------------------------------------------------------------------
+
+/** 渲染上限：超出行数尾部「…」截断提示（Rust 侧已整体截断，此处为渲染层
+ *  二次上限，保证超大 diff 不拖垮 DOM）。 */
+const DIFF_MAX_LINES = 400;
+
+/** diff 增删统计：+ 开头行数 / - 开头行数（unified 风格；「…（已截断）」等
+ *  非增删行不计入）。 */
+function diffStats(diff: string): { add: number; del: number } {
+  let add = 0;
+  let del = 0;
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("+")) {
+      add += 1;
+    } else if (line.startsWith("-")) {
+      del += 1;
+    }
+  }
+  return { add, del };
+}
+
+/** diff 体：等宽逐行渲染，+ 行 emerald 底 / - 行 rose 底 / 其余素色；长行
+ *  不折行（whitespace-pre）+ 容器横向滚动（iOS 长行可滑）；超 DIFF_MAX_LINES
+ *  行尾部截断提示。memo 按 diff 值比较——单条展开时流式补丁不重渲。 */
+const DiffBody = memo(function DiffBody({ diff }: { diff: string }) {
+  const lines = diff.split("\n");
+  const truncated = lines.length > DIFF_MAX_LINES;
+  const shown = truncated ? lines.slice(0, DIFF_MAX_LINES) : lines;
+  return (
+    <div
+      className="mt-1 overflow-x-auto rounded-lg bg-code/60 py-1 font-mono text-xs leading-5"
+      aria-label="变更内容"
+    >
+      {shown.map((l, i) => (
+        <div
+          key={i}
+          className={l.startsWith("+") ? "bg-emerald-500/15" : l.startsWith("-") ? "bg-rose-500/15" : ""}
+        >
+          <span className="whitespace-pre px-2">{l === "" ? " " : l}</span>
+        </div>
+      ))}
+      {truncated && <div className="px-2 text-faint">…（已截断，共 {lines.length} 行）</div>}
+    </div>
+  );
+});
+
+/** 完成且带 diff 的执行链条目：默认收起一行（✓ 工具名 · summary，右侧
+ *  emerald +n / rose −m 徽标，增删为零的侧不显示），点击展开 diff 体、再点
+ *  收起。自持 open 状态并独立 memo——单条展开/其余条目或正文更新互不重渲。 */
+const DiffCall = memo(
+  function DiffCall({ name, summary, diff }: { name: string; summary: string; diff: string }) {
+    const [open, setOpen] = useState(false);
+    const stats = diffStats(diff);
+    return (
+      <li className="font-mono text-xs">
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          className="flex w-full items-baseline gap-1.5 rounded-md px-1.5 py-0.5 text-left text-faint transition-colors hover:bg-panel2 hover:text-muted"
+        >
+          <span className="shrink-0 text-ok" aria-hidden="true">
+            ✓
+          </span>
+          <span className="shrink-0">{name}</span>
+          {summary && (
+            <>
+              <span className="shrink-0 text-ghost" aria-hidden="true">
+                ·
+              </span>
+              <span className="min-w-0 truncate">{summary}</span>
+            </>
+          )}
+          {(stats.add > 0 || stats.del > 0) && (
+            <span className="ml-auto shrink-0" aria-label="增删行数">
+              {stats.add > 0 && <span className="text-ok">+{stats.add}</span>}
+              {stats.add > 0 && stats.del > 0 && " "}
+              {stats.del > 0 && <span className="text-err">−{stats.del}</span>}
+            </span>
+          )}
+        </button>
+        {open && <DiffBody diff={diff} />}
+      </li>
+    );
+  },
+  (prev, next) => prev.diff === next.diff && prev.name === next.name && prev.summary === next.summary,
+);
+
 /**
  * 执行链时间线（Claude Code 终端式）：流式中运行项自动展开（spinner + 工具名 +
  * summary，高亮当前活动项），完成后自动折叠为单行 ✓（低对比度）——完全由
- * done 标志驱动，无需用户交互。卡片终态（finished）后整块收起为一行摘要按钮
- * （全部完成「✓ 执行了 N 个工具」；存在未完成即 error 中断场景用 ⚠️
- * 「N 个工具调用 · M 个未完成」），点击展开完整时间线、再点收起——终态后
- * 时间线不再整块占版面；流式期间行为不变。
+ * done 标志驱动，无需用户交互。带 diff 的完成条目（v1.39 文件修改类工具）
+ * 另有单条目级折叠：默认收起一行（右侧 +n/−m 增删徽标），点击展开 diff 体。
+ * 卡片终态（finished）后整块收起为一行摘要按钮（全部完成「✓ 执行了 N 个
+ * 工具」；存在未完成即 error 中断场景用 ⚠️「N 个工具调用 · M 个未完成」），
+ * 点击展开完整时间线、再点收起——终态后时间线不再整块占版面；流式期间
+ * 行为不变。无 diff 条目渲染零变化。
  */
 const ToolTimeline = memo(
   function ToolTimeline({ calls, finished }: { calls: ToolCallPayload[]; finished: boolean }) {
@@ -112,8 +212,31 @@ const ToolTimeline = memo(
     }
     const timeline = (
       <ol className="relative my-2 space-y-0.5 border-l-2 border-line pl-3" aria-label="执行链">
-        {calls.map((c, i) =>
-          c.done ? (
+        {calls.map((c, i) => {
+          // 带 diff 的完成条目走单条目折叠（默认收起，点击展开 diff 体）；
+          // 历史 sync 重放等宽松路径可能带非 string diff，按无 diff 渲染。
+          const diff = typeof c.diff === "string" && c.diff.length > 0 ? c.diff : null;
+          if (!c.done) {
+            return (
+              <li
+                key={c.id ?? i}
+                className="rounded-lg bg-sky-500/10 px-2 py-1.5"
+                aria-current="step"
+              >
+                <div className="flex items-center gap-2">
+                  <Spinner />
+                  <span className="font-mono text-xs font-semibold text-ink">{c.name}</span>
+                </div>
+                {c.summary && (
+                  <p className="mt-1 break-all font-mono text-xs leading-5 text-muted">{c.summary}</p>
+                )}
+              </li>
+            );
+          }
+          if (diff !== null) {
+            return <DiffCall key={c.id ?? i} name={c.name} summary={c.summary} diff={diff} />;
+          }
+          return (
             <li
               key={c.id ?? i}
               className="flex items-baseline gap-1.5 rounded-md px-1.5 py-0.5 font-mono text-xs text-faint"
@@ -131,22 +254,8 @@ const ToolTimeline = memo(
                 </>
               )}
             </li>
-          ) : (
-            <li
-              key={c.id ?? i}
-              className="rounded-lg bg-sky-500/10 px-2 py-1.5"
-              aria-current="step"
-            >
-              <div className="flex items-center gap-2">
-                <Spinner />
-                <span className="font-mono text-xs font-semibold text-ink">{c.name}</span>
-              </div>
-              {c.summary && (
-                <p className="mt-1 break-all font-mono text-xs leading-5 text-muted">{c.summary}</p>
-              )}
-            </li>
-          ),
-        )}
+          );
+        })}
       </ol>
     );
     if (!finished) {

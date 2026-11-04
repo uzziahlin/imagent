@@ -109,6 +109,44 @@ describe("parseFrame", () => {
     ).toBeNull();
   });
 
+  it("v1.39 card 执行链条目可选 diff：缺席放行、string 合法（超长容忍）、非 string → null", () => {
+    const frameWithCalls = (calls: string, type = "card") =>
+      `{"v":1,"type":"${type}","convId":"web:default","messageId":"m","state":"streaming","card":{"text":"t","tool_calls":${calls},"thoughts":[],"todos":[],"phase":"outputting","run_secs":5,"terminal":"running"}}`;
+    // 缺席 diff：放行（codex fileChange 仅通知场景条目照旧）
+    expect(parseFrame(frameWithCalls('[{"name":"Edit","summary":"a.ts","done":true}]'))).not.toBeNull();
+    // 字符串 diff（含超长）：放行且原样保留（渲染层截断，校验不拒）
+    const longDiff = "x".repeat(50000);
+    expect(
+      parseFrame(frameWithCalls(`[{"name":"Edit","summary":"a.ts","done":true,"diff":"${longDiff}"}]`)),
+    ).toMatchObject({ card: { tool_calls: [{ diff: longDiff }] } });
+    // 非 string（数字 / 对象 / null / 布尔）→ 整帧拒收
+    expect(parseFrame(frameWithCalls('[{"name":"Edit","summary":"a","done":true,"diff":1}]'))).toBeNull();
+    expect(
+      parseFrame(frameWithCalls('[{"name":"Edit","summary":"a","done":true,"diff":{"lines":1}}]')),
+    ).toBeNull();
+    expect(parseFrame(frameWithCalls('[{"name":"Edit","summary":"a","done":true,"diff":null}]'))).toBeNull();
+    // 混合数组：任一元素 diff 非法即拒
+    expect(
+      parseFrame(
+        frameWithCalls(
+          '[{"name":"a","summary":"s","done":true},{"name":"b","summary":"s","done":true,"diff":true}]',
+        ),
+      ),
+    ).toBeNull();
+    // card_patch 同样校验
+    expect(
+      parseFrame(frameWithCalls('[{"name":"Edit","summary":"a","done":true,"diff":3}]', "card_patch")),
+    ).toBeNull();
+  });
+
+  it("v1.39 history 深层校验沿用宽松策略：diff 非法不拒整帧（渲染层防御非 string）", () => {
+    expect(
+      parseFrame(
+        '{"v":1,"type":"history","convId":"web:work","entries":[{"kind":"card","key":"h:4","messageId":"m1","card":{"text":"t","tool_calls":[{"name":"Edit","summary":"a","done":true,"diff":1}],"thoughts":[],"todos":[],"phase":"outputting","run_secs":5,"terminal":"done"},"state":"done"}],"lastSeq":4,"trimmed":false}',
+      ),
+    ).not.toBeNull();
+  });
+
   it("v1.1 machines 帧解析：字符串数组合法，空数组亦合法", () => {
     expect(
       parseFrame('{"v":1,"type":"machines","online":["home-mac","work-mac"]}'),

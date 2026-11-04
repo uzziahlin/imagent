@@ -124,3 +124,112 @@ describe("CardView 终态收敛", () => {
     expect(screen.queryByText(/个工具/)).toBeNull();
   });
 });
+
+// 执行链 diff 渲染（v1.39）：文件修改类工具（claude Edit/MultiEdit/Write、
+// codex fileChange）完成条目带 unified 纯文本 diff——徽标 +n/−m、单条目默认
+// 收起、展开着色渲染、超 400 行截断；无 diff 条目渲染零变化。
+describe("CardView 执行链 diff 渲染", () => {
+  const DIFF = [" context", "+added one", "-removed one", "+added two"].join("\n");
+
+  it("终态：徽标统计正确（+2 −1）、默认收起；展开后 + 行 emerald 底、- 行 rose 底、其余素色，再点收起", () => {
+    const { container } = render(
+      <CardView
+        entry={makeEntry(
+          makeCard({ tool_calls: [{ name: "Edit", summary: "src/a.ts", done: true, diff: DIFF }] }),
+          "done",
+        )}
+      />,
+    );
+    // 整块折叠语义不变：先展开块再见条目
+    fireEvent.click(screen.getByText("执行了 1 个工具"));
+    // 徽标数字正确；默认收起 diff 体不可见
+    expect(screen.getByText("+2")).toBeTruthy();
+    expect(screen.getByText("−1")).toBeTruthy();
+    expect(screen.queryByText("+added one")).toBeNull();
+    // 展开：+ 行 emerald 底、- 行 rose 底、context 行素色
+    fireEvent.click(screen.getByText("Edit"));
+    expect(screen.getByText("+added one")).toBeTruthy();
+    expect(screen.getByText("-removed one")).toBeTruthy();
+    const body = container.querySelector('[aria-label="变更内容"]') as HTMLElement;
+    const lines = Array.from(body.children) as HTMLElement[];
+    expect(lines).toHaveLength(4);
+    expect(lines[0].className).not.toContain("bg-emerald-500/15");
+    expect(lines[0].className).not.toContain("bg-rose-500/15");
+    expect(lines[1].className).toContain("bg-emerald-500/15");
+    expect(lines[2].className).toContain("bg-rose-500/15");
+    expect(lines[3].className).toContain("bg-emerald-500/15");
+    // 再点收起
+    fireEvent.click(screen.getByText("Edit"));
+    expect(screen.queryByText("+added one")).toBeNull();
+    expect(container.querySelector('[aria-label="变更内容"]')).toBeNull();
+  });
+
+  it("混合条目：无 diff 条目零变化（原单行、无徽标、非按钮），带 diff 条目可展开", () => {
+    const { container } = render(
+      <CardView
+        entry={makeEntry(
+          makeCard({
+            tool_calls: [
+              { name: "read_file", summary: "读取配置", done: true },
+              { name: "Edit", summary: "src/a.ts", done: true, diff: "+one\n-one" },
+            ],
+          }),
+          "done",
+        )}
+      />,
+    );
+    fireEvent.click(screen.getByText("执行了 2 个工具"));
+    expect(screen.getByText("read_file")).toBeTruthy();
+    expect(screen.getByText("Edit")).toBeTruthy();
+    expect(screen.getByText("+1")).toBeTruthy();
+    expect(screen.getByText("−1")).toBeTruthy();
+    // 默认收起：diff 行不可见
+    expect(screen.queryByText("+one")).toBeNull();
+    // 仅带 diff 条目有单条目折叠按钮（无 diff 条目仍是原单行 li）
+    expect(container.querySelectorAll('[aria-label="执行链"] button[aria-expanded]')).toHaveLength(1);
+    fireEvent.click(screen.getByText("Edit"));
+    expect(screen.getByText("+one")).toBeTruthy();
+    expect(screen.getByText("-one")).toBeTruthy();
+  });
+
+  it("超 400 行：徽标按全量统计（+405），展开仅渲染 400 行并显示尾部截断提示", () => {
+    const diff = Array.from({ length: 405 }, (_, i) => `+line ${i}`).join("\n");
+    const { container } = render(
+      <CardView
+        entry={makeEntry(
+          makeCard({ tool_calls: [{ name: "Write", summary: "big.txt", done: true, diff }] }),
+          "done",
+        )}
+      />,
+    );
+    fireEvent.click(screen.getByText("执行了 1 个工具"));
+    // 徽标统计全量行数；无删除行不渲染 −m 侧
+    expect(screen.getByText("+405")).toBeTruthy();
+    expect(screen.queryByText(/−\d+/)).toBeNull();
+    fireEvent.click(screen.getByText("Write"));
+    expect(screen.getByText("…（已截断，共 405 行）")).toBeTruthy();
+    const body = container.querySelector('[aria-label="变更内容"]') as HTMLElement;
+    const lines = Array.from(body.children) as HTMLElement[];
+    expect(lines).toHaveLength(401); // 400 行 + 1 截断提示
+    expect(lines.filter((d) => d.className.includes("bg-emerald-500/15"))).toHaveLength(400);
+  });
+
+  it("流式：带 diff 完成条目徽标直接可见（时间线未整块折叠），点击展开 diff 体", () => {
+    render(
+      <CardView
+        entry={makeEntry(
+          makeCard({
+            phase: "tool_running",
+            tool_calls: [{ name: "Edit", summary: "a.ts", done: true, diff: "+新行\n-旧行" }],
+          }),
+          "streaming",
+        )}
+      />,
+    );
+    expect(screen.getByText("+1")).toBeTruthy();
+    expect(screen.getByText("−1")).toBeTruthy();
+    fireEvent.click(screen.getByText("Edit"));
+    expect(screen.getByText("+新行")).toBeTruthy();
+    expect(screen.getByText("-旧行")).toBeTruthy();
+  });
+});

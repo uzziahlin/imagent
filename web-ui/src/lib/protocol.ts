@@ -61,6 +61,13 @@
 //   该次审批的超时预算，非剩余时间；网关批并行实现，缺席 = 旧网关不渲染
 //   倒计时）。SPA 以本地收到时刻（PendingApproval.at）起倒数，超时自动拒绝
 //   由网关兜底，前端纯提示。
+// - v1.39 执行链 diff：ToolCallPayload 新增可选 diff（unified 风格纯文本，
+//   每行以 +/-/空格 开头，末行可能为「…（已截断）」——Rust 侧超长截断）；
+//   claude Edit/MultiEdit/Write 与 codex fileChange（tool 名 fileChange，
+//   summary=path）完成条目携带。缺席 = 无 diff 内容（codex fileChange 仅
+//   通知场景，条目照旧渲染）。card/card_patch 帧校验：diff 缺席放行，存在
+//   须为 string（超长容忍——渲染层截断 400 行，校验不拒）；history 深层
+//   校验沿用宽松策略（整帧快照不因深层字段丢弃），渲染层对非 string 防御。
 
 export const PROTOCOL_VERSION = 1;
 
@@ -130,6 +137,10 @@ export type ToolCallPayload = {
   summary: string;
   done: boolean;
   id?: string;
+  /** v1.39 可选 unified diff（纯文本，每行以 +/-/空格 开头；末行可能为
+   *  「…（已截断）」）：文件修改类工具（claude Edit/MultiEdit/Write、codex
+   *  fileChange）完成条目携带；缺席 = 无 diff 内容（条目照旧渲染）。 */
+  diff?: string;
 };
 
 export type CardPhase = "thinking" | "tool_running" | "outputting" | "waiting_approval";
@@ -765,12 +776,31 @@ const timeoutSecsOk = (o: Record<string, unknown>): boolean =>
   o.timeoutSecs === undefined ||
   (typeof o.timeoutSecs === "number" && Number.isFinite(o.timeoutSecs) && o.timeoutSecs > 0);
 
+/** v1.39 执行链条目可选 diff（ToolCallPayload.diff）：缺席放行（旧网关/仅
+ *  通知场景）；存在须为 string（超长容忍——渲染层截断 400 行，校验不拒）。
+ *  只对新增可选字段做形状兜底：tool_calls 其余深层字段沿用「载荷完整性由
+ *  网关保证」的既有宽松策略（非数组/畸形元素不在此拒，渲染层防御）。 */
+const toolCallDiffOk = (card: Record<string, unknown>): boolean => {
+  const calls = card.tool_calls;
+  if (!Array.isArray(calls)) {
+    return true;
+  }
+  return calls.every((c) => {
+    if (typeof c !== "object" || c === null) {
+      return true;
+    }
+    const d = (c as Record<string, unknown>).diff;
+    return d === undefined || typeof d === "string";
+  });
+};
+
 const cardShapeOk = (o: Record<string, unknown>): boolean =>
   isStr(o, "convId") &&
   isStr(o, "messageId") &&
   typeof o.card === "object" &&
   o.card !== null &&
-  isStr(o.card as Record<string, unknown>, "text");
+  isStr(o.card as Record<string, unknown>, "text") &&
+  toolCallDiffOk(o.card as Record<string, unknown>);
 
 /** v1.2 hello_ack.session：缺席（旧 relay）或 {id,token,expiresAt} 形状齐备。 */
 const sessionOk = (o: Record<string, unknown>): boolean => {
