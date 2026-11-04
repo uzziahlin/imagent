@@ -136,8 +136,10 @@ export function listenServiceWorkerMessages(
  *  - 仅 https / localhost 且浏览器支持时注册 /imagent/sw.js（幂等——已注册
  *    同 scope 脚本时复用既有 registration；失败静默，SW 只影响离线与推送）；
  *  - updatefound → 新 worker 进入 installed 且当前已有 controller 接管（即
- *    更新而非首装）→ onUpdateAvailable（App 顶部「新版本可用」提示，不自动
- *    刷新——刷新后等待中的新 SW 随旧页面卸载自然激活）；
+ *    更新而非首装）→ 置位更新标记 + onUpdateAvailable（App 顶部「新版本已
+ *    就绪，点击刷新」可点提示，v1.39）；
+ *  - controllerchange → 新 SW 接管控制器（更新标记已置位时）→ reload 一次
+ *    （v1.39 双保险自动腿，与 toast 点击重载并存，守卫见内注释）；
  *  - open-conv 消息 → onOpenConv（通知点击定位会话）。
  *  返回消息监听的 cleanup（注册部分幂等，无需清理）。 */
 export function initServiceWorker(
@@ -149,9 +151,31 @@ export function initServiceWorker(
   if (!pushSupported() || !secureContextOk()) {
     return () => {};
   }
-  const cleanup = listenServiceWorkerMessages(navigator.serviceWorker, (convId, machine) =>
+  // init 时捕获容器引用：cleanup 一律用捕获引用解绑（卸载时重读全局——测试
+  // 环境删 expando / 极端场景容器被换——会炸，捕获引用幂等且与时序无关）。
+  const container = navigator.serviceWorker;
+  const cleanupMsg = listenServiceWorkerMessages(container, (convId, machine) =>
     handlers.onOpenConv?.(convId, machine),
   );
+
+  // v1.39 更新接管即自动重载（双保险之一）：守卫 updateSeen 只在「更新接管」
+  // 检测时置位（下方 statechange：installing→installed 且页面已有旧 controller，
+  // 与 onUpdateAvailable 同条件、同批先后）。页面加载本身触发的首次
+  // controllerchange（首装 activate 里 clients.claim() 接管尚无 controller 的
+  // 页面）与点击重载落地的新页面被新 SW claim 的 controllerchange 均无检测
+  // 置位 → 不重载：跳过非更新路径，防首装误刷、防重载落地页连环重载。
+  // reloading 一次性守卫：本页面生命周期内最多重载一次。
+  let updateSeen = false;
+  let reloading = false;
+  const onControllerChange = (): void => {
+    if (!updateSeen || reloading) {
+      return;
+    }
+    reloading = true;
+    window.location.reload();
+  };
+  container.addEventListener("controllerchange", onControllerChange);
+
   void navigator.serviceWorker
     .register(SW_URL)
     .then((reg) => {
@@ -162,7 +186,8 @@ export function initServiceWorker(
         }
         installing.addEventListener("statechange", () => {
           // controller 非空 = 页面此前已被旧 SW 接管，此刻 installed 是更新
-          if (installing.state === "installed" && navigator.serviceWorker.controller) {
+          if (installing.state === "installed" && container.controller) {
+            updateSeen = true;
             handlers.onUpdateAvailable?.();
           }
         });
@@ -171,7 +196,10 @@ export function initServiceWorker(
     .catch(() => {
       // 注册失败（无 SW 权限 / 反代异常等）：静默——主功能不受影响
     });
-  return cleanup;
+  return () => {
+    cleanupMsg();
+    container.removeEventListener("controllerchange", onControllerChange);
+  };
 }
 
 // ---------------------------------------------------------------------------

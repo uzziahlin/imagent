@@ -335,9 +335,13 @@ export default function App() {
   // 主题三态偏好（跟随系统/浅色/深色）：localStorage 镜像驱动开关高亮；
   // 生效应用在 main.tsx 渲染前由 initTheme 完成过一次，切换时再增量应用。
   const [themePref, setThemePref] = useState<ThemePref>(() => loadThemePref());
-  const [localToast, setLocalToast] = useState<{ text: string; tone: "info" | "error" } | null>(
-    null,
-  );
+  // v1.39：onClick 可选——可点形态（SW 更新提示「点击刷新」，点击立即重载）；
+  // 缺席为既有纯展示形态。渲染见底部 toast 容器。
+  const [localToast, setLocalToast] = useState<{
+    text: string;
+    tone: "info" | "error";
+    onClick?: () => void;
+  } | null>(null);
 
   /** 挂载恢复：loadAll → spaces 预填（initialState 之后、WS 帧之前；异步竞态
    *  时恢复条目垫在已到帧之前，见 restoreHistory）。加载完成前渲染空态
@@ -642,17 +646,26 @@ export default function App() {
     return () => clearTimeout(t);
   }, [adminError, adminOpen]);
 
-  // v1.10 PWA 接线（挂载一次）：SW 注册（仅 https/localhost，含「新版本可用」
-  // 更新提示与通知点击的 open-conv 消息）+ ?conv= 深链会话定位（SW 无窗口时
-  // openWindow 到 /imagent/?conv=...，挂载读参定位；完整 conv 形态校验后才切）。
+  // v1.10 PWA 接线（挂载一次）：SW 注册（仅 https/localhost，含「新版本已就绪，
+  // 点击刷新」更新提示与通知点击的 open-conv 消息）+ ?conv= 深链会话定位
+  // （SW 无窗口时 openWindow 到 /imagent/?conv=...，挂载读参定位；完整 conv
+  // 形态校验后才切）。
   // v1.37：深链可携 ?machine=（推送载荷的来源机器）——先 select_machine 再
   // select_conv（reducer 的 select_conv 落在当前机器会话空间，先切机器才有效；
   // 连续 dispatch 按序过 reducer）；machine 非法忽略仍按 conv 走；深链参数
   // 优先于 lastView 恢复（显式用户意图）。SW open-conv 消息同序透传 machine。
   useEffect(() => {
     const cleanupSw = initServiceWorker({
+      // v1.39：更新提示改可点形态——PWA standalone 无下拉刷新手段（iOS），
+      // 点击立即重载。新 SW install 已把新 shell 覆写进 SHELL_CACHE（sw.js
+      // install handler cache.addAll），普通 reload 经旧 SW cache-first 命中的
+      // 即是新 HTML → 一步到位拿新版本；controllerchange 自动重载为双保险。
       onUpdateAvailable: () =>
-        setLocalToast({ text: "新版本可用，刷新页面生效", tone: "info" }),
+        setLocalToast({
+          text: "新版本已就绪，点击刷新",
+          tone: "info",
+          onClick: () => window.location.reload(),
+        }),
       onOpenConv: (convId, machine) => {
         if (machine) {
           dispatch({ type: "select_machine", machine });
@@ -1652,7 +1665,9 @@ export default function App() {
       {(state.lastError || state.lastNotice || localToast || (adminError && !adminOpen)) && (
         <div className="fixed inset-x-0 bottom-24 z-50 mx-auto flex w-fit max-w-[90vw] flex-col items-center gap-2">
           {/* v1.10 本地 toast（更新提示 / 通知开关反馈）：info 蓝 / error 红，
-              节奏与 error/notice 一致（4s 自动消退） */}
+              节奏与 error/notice 一致（4s 自动消退）。v1.39：带 onClick 的
+              更新提示渲染为可点 button（下划线示意可点，样式随既有 pill），
+              点击立即重载；其余仍为纯文本。 */}
           {localToast && (
             <div
               role="status"
@@ -1662,7 +1677,17 @@ export default function App() {
                   : "border-sky-400/60 bg-sky-50 text-sky-800 dark:border-sky-500/40 dark:bg-sky-950/95 dark:text-sky-200"
               }`}
             >
-              {localToast.text}
+              {localToast.onClick ? (
+                <button
+                  type="button"
+                  onClick={localToast.onClick}
+                  className="cursor-pointer underline underline-offset-2"
+                >
+                  {localToast.text}
+                </button>
+              ) : (
+                localToast.text
+              )}
             </div>
           )}
           {adminError && !adminOpen && (

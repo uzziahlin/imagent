@@ -4,7 +4,8 @@
 // urlB64ToUint8Array 标准样例往返、enablePush 成功/各失败码（浏览器不支持 /
 // iOS 未添加主屏 / 权限拒绝 / 订阅失败 / 服务端拒绝 / 网络错误 / 无会话）、
 // disablePush（有订阅/无订阅/服务端失败仍本地退订）、open-conv 消息监听、
-// ?conv= 深链参数校验。
+// ?conv= 深链参数校验、initServiceWorker（v1.39 更新接管 controllerchange
+// 自动重载 + 首装守卫 + cleanup 解绑）。
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   listenServiceWorkerMessages,
@@ -15,6 +16,7 @@ import {
   validMachineParam,
   enablePush,
   disablePush,
+  initServiceWorker,
 } from "./push";
 import { toB64Url } from "./webauthn";
 
@@ -525,5 +527,142 @@ describe("open-conv 消息 machine 透传（v1.37）", () => {
 
     expect(seen.map((s) => s.machine)).toEqual(["work-mac", undefined, undefined, undefined]);
     expect(seen.map((s) => s.convId)).toEqual(["web:abc", "web:abc", "web:abc", "web:abc"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// initServiceWorker：更新接管 controllerchange 自动重载（v1.39 双保险之一）。
+// 驱动方式：registration stub 的 addEventListener 是 vi.fn——从 mock.calls 取
+// 捕获到的 updatefound 处理器，手工喂 installing worker 的 statechange；再从
+// 容器上取捕获的 controllerchange 处理器模拟新 SW 接管。reload 为 jsdom 不可
+// 改写属性——经 vi.stubGlobal("location", {...原值, reload}) 整体替换。
+// ---------------------------------------------------------------------------
+
+describe("initServiceWorker 更新接管自动重载（v1.39）", () => {
+  type InstallingWorker = { state: string; addEventListener: ReturnType<typeof vi.fn> };
+  type UpdateStub = {
+    registration: {
+      pushManager: PushManagerStub;
+      installing: InstallingWorker | null;
+      addEventListener: ReturnType<typeof vi.fn>;
+    };
+    container: {
+      register: ReturnType<typeof vi.fn>;
+      getRegistration: ReturnType<typeof vi.fn>;
+      addEventListener: ReturnType<typeof vi.fn>;
+      removeEventListener: ReturnType<typeof vi.fn>;
+      controller: unknown;
+    };
+  };
+
+  /** 可变 controller/installing 的 registration stub（基座面向 enablePush
+   *  场景恒 null，就地放宽类型）。controller 非空 = 页面已被旧 SW 接管。 */
+  function makeUpdateStub(controller: unknown): UpdateStub {
+    const sw = makeServiceWorkerStub();
+    const registration = sw.registration as unknown as UpdateStub["registration"];
+    const container = sw.container as unknown as UpdateStub["container"];
+    container.controller = controller;
+    return { registration, container };
+  }
+
+  /** 挂接线 + 微任务冲刷（register().then 后 updatefound 监听才挂上），
+   *  返回提示回调与捕获的 updatefound 处理器。 */
+  async function initAndGetUpdatefound(sw: UpdateStub) {
+    const onUpdateAvailable = vi.fn();
+    initServiceWorker({ onUpdateAvailable });
+    await new Promise((r) => setTimeout(r, 0));
+    const updatefound = sw.registration.addEventListener.mock.calls.find(
+      ([type]) => type === "updatefound",
+    )?.[1] as (ev: Event) => void | undefined;
+    expect(updatefound).toBeDefined();
+    return { onUpdateAvailable, updatefound: updatefound as (ev: Event) => void };
+  }
+
+  /** 模拟新 worker 安装完成：updatefound → installing → installed。
+   *  返回捕获的 statechange 处理器（供后续直接驱动状态）。 */
+  function installWorker(
+    sw: UpdateStub,
+    updatefound: (ev: Event) => void,
+  ): { installing: InstallingWorker; statechange: (ev: Event) => void } {
+    const installing: InstallingWorker = { state: "installing", addEventListener: vi.fn() };
+    sw.registration.installing = installing;
+    updatefound(new Event("updatefound"));
+    const statechange = installing.addEventListener.mock.calls.find(
+      ([type]) => type === "statechange",
+    )?.[1] as (ev: Event) => void | undefined;
+    expect(statechange).toBeDefined();
+    return { installing, statechange: statechange as (ev: Event) => void };
+  }
+
+  function controllerchangeHandler(sw: UpdateStub): (ev: Event) => void {
+    const handler = sw.container.addEventListener.mock.calls.find(
+      ([type]) => type === "controllerchange",
+    )?.[1] as (ev: Event) => void | undefined;
+    expect(handler).toBeDefined();
+    return handler as (ev: Event) => void;
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("更新接管（installed 且有旧 controller）后 controllerchange 触发 reload，重复事件仅一次", async () => {
+    const sw = makeUpdateStub({ scriptURL: "/imagent/sw.js" }); // 旧 SW 在管 = 更新场景
+    stubPushGlobals(sw.container);
+    const reload = vi.fn();
+    vi.stubGlobal("location", { ...window.location, reload });
+
+    const { onUpdateAvailable, updatefound } = await initAndGetUpdatefound(sw);
+    const { installing, statechange } = installWorker(sw, updatefound);
+    installing.state = "installed";
+    statechange(new Event("statechange"));
+    expect(onUpdateAvailable).toHaveBeenCalledTimes(1); // 提示弹出（toast 的推送源）
+
+    const controllerchange = controllerchangeHandler(sw);
+    controllerchange(new Event("controllerchange")); // 新 SW 接管（skip-waiting 等路径）
+    controllerchange(new Event("controllerchange")); // 连环事件：一次性守卫只重载一次
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("首装激活（页面加载本身触发的首次 controllerchange，controller 缺席）不重载", async () => {
+    const sw = makeUpdateStub(null); // 页面尚无 controller = 首装场景
+    stubPushGlobals(sw.container);
+    const reload = vi.fn();
+    vi.stubGlobal("location", { ...window.location, reload });
+
+    const { onUpdateAvailable, updatefound } = await initAndGetUpdatefound(sw);
+    const { installing, statechange } = installWorker(sw, updatefound);
+    installing.state = "installed";
+    statechange(new Event("statechange"));
+    expect(onUpdateAvailable).not.toHaveBeenCalled(); // 无旧 controller = 非更新，不提示
+
+    // 首装 activate → clients.claim() 接管本页 → 页面加载本身的首次
+    // controllerchange：守卫未置位，不得重载（防首装误刷）
+    controllerchangeHandler(sw)(new Event("controllerchange"));
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it("重载落地的新页面被 claim 触发的 controllerchange 同样不重载（无检测置位）", async () => {
+    const sw = makeUpdateStub(null);
+    stubPushGlobals(sw.container);
+    const reload = vi.fn();
+    vi.stubGlobal("location", { ...window.location, reload });
+
+    // 点击重载后的新页面：任何 controllerchange 先于更新检测发生
+    await initAndGetUpdatefound(sw);
+    controllerchangeHandler(sw)(new Event("controllerchange"));
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it("cleanup 解绑 controllerchange 监听（挂载效应卸载后不再响应）", async () => {
+    const sw = makeUpdateStub(null);
+    stubPushGlobals(sw.container);
+    const cleanup = initServiceWorker({});
+    await new Promise((r) => setTimeout(r, 0));
+    cleanup();
+    expect(sw.container.removeEventListener).toHaveBeenCalledWith(
+      "controllerchange",
+      expect.any(Function),
+    );
   });
 });

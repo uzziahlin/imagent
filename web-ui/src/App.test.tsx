@@ -2240,6 +2240,69 @@ describe("v1.37 深链 ?machine= 切机器", () => {
 });
 
 // ---------------------------------------------------------------------------
+// v1.39 SW 更新提示可点击：检测到新版本（installing→installed 且已有旧
+// controller）→ 可点 toast「新版本已就绪，点击刷新」，点击立即 reload。
+// （controllerchange 自动重载为双保险——容器监听器语义由 push.test 单测驱动）
+// ---------------------------------------------------------------------------
+
+describe("v1.39 SW 更新提示可点击", () => {
+  it("更新检测弹出可点 toast，点击调用 location.reload 一次", async () => {
+    // jsdom 无 SW：stub 最小面使 pushSupported() 为真；registration 可控驱动
+    const registration: {
+      addEventListener: ReturnType<typeof vi.fn>;
+      installing: { state: string; addEventListener: ReturnType<typeof vi.fn> } | null;
+    } = { addEventListener: vi.fn(), installing: null };
+    const listeners = new Map<string, (ev: Event) => void>();
+    Object.defineProperty(navigator, "serviceWorker", {
+      configurable: true,
+      value: {
+        addEventListener: (t: string, l: (ev: Event) => void) => listeners.set(t, l),
+        removeEventListener: (t: string) => listeners.delete(t),
+        // 页面已被旧 SW 接管：installed 时 controller 非空 = 更新而非首装
+        controller: { scriptURL: "/imagent/sw.js" },
+        register: async () => registration,
+      },
+    });
+    vi.stubGlobal("PushManager", class PushManager {});
+    vi.stubGlobal("Notification", class Notification {});
+    // jsdom 的 location.reload 不可改写（own 非配置属性）——整体替换 location
+    const reload = vi.fn();
+    vi.stubGlobal("location", { ...window.location, reload });
+    try {
+      const fake = mountApp();
+      handshake(fake, ["home-mac"]);
+
+      // register().then 微任务挂上 updatefound 监听后，驱动一次完整安装流
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 0));
+        const updatefound = registration.addEventListener.mock.calls.find(
+          ([type]) => type === "updatefound",
+        )?.[1] as (ev: Event) => void;
+        const installing = { state: "installing", addEventListener: vi.fn() };
+        registration.installing = installing;
+        updatefound(new Event("updatefound"));
+        const statechange = installing.addEventListener.mock.calls.find(
+          ([type]) => type === "statechange",
+        )?.[1] as (ev: Event) => void;
+        installing.state = "installed";
+        statechange(new Event("statechange"));
+      });
+
+      // 可点形态 toast（button 可访问名 = 提示文案；点击立即重载）
+      const btn = screen.getByRole("button", { name: "新版本已就绪，点击刷新" });
+      expect(btn).toBeTruthy();
+      await act(async () => {
+        btn.click();
+      });
+      expect(reload).toHaveBeenCalledTimes(1);
+    } finally {
+      delete (navigator as { serviceWorker?: unknown }).serviceWorker;
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // v1.37 系统未读徽标（navigator.setAppBadge/clearAppBadge）+ 标签页标题未读数：
 // 总数 = 全部机器全部 conv 的 unread 求和；feature-detect 缺席静默跳过
 // ---------------------------------------------------------------------------
