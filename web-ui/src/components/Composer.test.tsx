@@ -3,7 +3,7 @@
 // jsdom 无 canvas（纯逻辑阈值/文件名在 lib/imageCompress.test.ts 覆盖）。
 // v1.8 模型菜单动态化：/model chips 取快照 models 段（modelChips 三层回退）
 // + 行尾当前模型文本（currentModelText）+ 有映射 target 的 chip title 提示。
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Composer } from "./Composer";
 import type { MediaPayload, ModelsInfo } from "../lib/protocol";
@@ -315,5 +315,186 @@ describe("Composer 粘贴图片（v1.37）", () => {
     mount();
     expect(fireEvent.paste(screen.getByLabelText("消息输入框"), {})).toBe(true);
     expect(compressSpy).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.39 语音输入（P1.5）：Web Speech API，能力探测决定入口渲染 + 逻辑在
+// useSpeechRecognition（hook 状态机细节在 useSpeechRecognition.test.ts）。
+// jsdom 无 SpeechRecognition——Object.defineProperty(window, ...) 注入 stub
+// 类并持有实例引用，直驱 result/error/end 事件；不支持环境用例不注入。
+// ---------------------------------------------------------------------------
+
+describe("Composer 语音输入（v1.39 P1.5）", () => {
+  const MIC = "开始语音输入";
+  let instances: StubRecognition[] = [];
+
+  /** 最小 Web Speech stub：字段/方法形状对齐 hook 的 SpeechRecognitionLike。 */
+  class StubRecognition {
+    lang = "";
+    continuous = false;
+    interimResults = false;
+    onresult: any = null;
+    onerror: any = null;
+    onend: any = null;
+    start = vi.fn();
+    stop = vi.fn();
+    abort = vi.fn();
+    constructor() {
+      instances.push(this);
+    }
+  }
+
+  const injectSpeech = () => {
+    instances = [];
+    Object.defineProperty(window, "SpeechRecognition", {
+      value: StubRecognition,
+      configurable: true,
+      writable: true,
+    });
+  };
+
+  afterEach(() => {
+    delete (window as { SpeechRecognition?: unknown }).SpeechRecognition;
+  });
+
+  /** 直驱 result 事件（resultIndex 起的增量段；results 为类数组形状）。 */
+  const emitResult = (
+    rec: StubRecognition,
+    resultIndex: number,
+    parts: Array<[string, boolean]>,
+  ) => {
+    const results: any = { length: resultIndex + parts.length };
+    parts.forEach(([t, isFinal], i) => {
+      results[resultIndex + i] = { isFinal, length: 1, 0: { transcript: t } };
+    });
+    act(() => rec.onresult?.({ resultIndex, results }));
+  };
+  const emitError = (rec: StubRecognition, code: string) =>
+    act(() => rec.onerror?.({ error: code }));
+  const emitEnd = (rec: StubRecognition) => act(() => rec.onend?.());
+
+  it("不支持环境（Firefox/旧 iOS）：不渲染麦克风按钮", () => {
+    mount();
+    expect(screen.queryByRole("button", { name: MIC })).toBeNull();
+    expect(screen.queryByRole("button", { name: "停止语音输入" })).toBeNull();
+  });
+
+  it("点击开始：zh-CN/interim/单句配置 + 录音态；final 前置空格追加，不自动发送", () => {
+    const onSend = vi.fn(() => true);
+    injectSpeech();
+    const { ta } = mount(onSend);
+    type(ta, "已输入");
+    fireEvent.click(screen.getByRole("button", { name: MIC }));
+    const rec = instances[0];
+    expect(rec).toBeTruthy();
+    expect(rec.lang).toBe("zh-CN");
+    expect(rec.interimResults).toBe(true);
+    expect(rec.continuous).toBe(false);
+    expect(rec.start).toHaveBeenCalledTimes(1);
+    // 录音态：按钮 aria 切停止
+    expect(screen.getByRole("button", { name: "停止语音输入" })).toBeTruthy();
+
+    emitResult(rec, 0, [["识别文本", true]]);
+    expect(ta.value).toBe("已输入 识别文本"); // 前置空格拼接，保留已输入内容
+    expect(onSend).not.toHaveBeenCalled(); // 只填入框，绝不自动发送
+    expect(document.activeElement).toBe(ta); // 焦点回输入框便于确认
+  });
+
+  it("interim 只进预览（小字灰色，不进输入框）；final 追加并清预览；静音自动断归位", () => {
+    injectSpeech();
+    const { ta } = mount();
+    fireEvent.click(screen.getByRole("button", { name: MIC }));
+    const rec = instances[0];
+    emitResult(rec, 0, [["正在说的", false]]);
+    const preview = screen.getByText(/正在说的/);
+    expect(preview.className).toContain("text-ghost"); // 小字灰色暂显
+    expect(ta.value).toBe(""); // 不进输入框
+
+    emitResult(rec, 0, [["完整的话", true]]);
+    expect(screen.queryByText(/正在说的/)).toBeNull(); // 预览清除
+    expect(ta.value).toBe("完整的话");
+
+    // 单句模式：静音自动断（end 无 error）→ 归位可再点
+    emitEnd(rec);
+    expect(screen.getByRole("button", { name: MIC })).toBeTruthy();
+  });
+
+  it("onerror 人话提示 + 状态复位 + 预览清除", () => {
+    injectSpeech();
+    mount();
+    fireEvent.click(screen.getByRole("button", { name: MIC }));
+    const rec = instances[0];
+    emitResult(rec, 0, [["说到一半", false]]);
+    emitError(rec, "not-allowed");
+    expect(screen.getByRole("alert").textContent).toContain("麦克风权限被拒，请在系统设置允许");
+    expect(screen.queryByText(/说到一半/)).toBeNull(); // 预览清除
+    expect(screen.getByRole("button", { name: MIC })).toBeTruthy(); // 复位
+
+    emitError(rec, "no-speech");
+    expect(screen.getByRole("alert").textContent).toContain("没有听到说话");
+    emitError(rec, "network");
+    expect(screen.getByRole("alert").textContent).toContain("网络异常");
+    emitError(rec, "banana");
+    expect(screen.getByRole("alert").textContent).toContain("语音识别出错");
+  });
+
+  it("错误提示 4s 自动消退（对齐既有 toast 节奏）", () => {
+    vi.useFakeTimers();
+    try {
+      injectSpeech();
+      mount();
+      fireEvent.click(screen.getByRole("button", { name: MIC }));
+      emitError(instances[0], "no-speech");
+      expect(screen.getByRole("alert").textContent).toContain("没有听到说话");
+      act(() => {
+        vi.advanceTimersByTime(4000);
+      });
+      expect(screen.queryByRole("alert")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("再点停止：stop() 优雅收尾（非 abort，保留收尾 final），end 归位后可再开", () => {
+    injectSpeech();
+    mount();
+    fireEvent.click(screen.getByRole("button", { name: MIC }));
+    const rec = instances[0];
+    emitResult(rec, 0, [["说到一半", false]]);
+    fireEvent.click(screen.getByRole("button", { name: "停止语音输入" }));
+    expect(rec.stop).toHaveBeenCalledTimes(1);
+    expect(rec.abort).not.toHaveBeenCalled();
+    // stop 后收尾 final 保留（实例未解绑）+ end 归位
+    emitResult(rec, 1, [["最后一句", true]]);
+    emitEnd(rec);
+    expect(screen.getByRole("button", { name: MIC })).toBeTruthy();
+    expect(instances[0].onresult).toBeNull(); // end 已解绑
+    // 归位后可再开一轮（新实例）
+    fireEvent.click(screen.getByRole("button", { name: MIC }));
+    expect(instances.length).toBe(2);
+  });
+
+  it("unmount 清理：abort + 三事件解绑", () => {
+    injectSpeech();
+    const { unmount } = render(
+      <Composer status="ready" onSend={vi.fn(() => true)} onStop={vi.fn()} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: MIC }));
+    const rec = instances[0];
+    unmount();
+    expect(rec.abort).toHaveBeenCalledTimes(1);
+    expect(rec.onresult).toBeNull();
+    expect(rec.onerror).toBeNull();
+    expect(rec.onend).toBeNull();
+  });
+
+  it("断线/e2eBlocked 与输入框同规则禁用", () => {
+    injectSpeech();
+    render(<Composer status="reconnecting" onSend={vi.fn(() => true)} onStop={vi.fn()} />);
+    expect((screen.getByRole("button", { name: MIC }) as HTMLButtonElement).disabled).toBe(true);
+    cleanup();
+    render(<Composer status="ready" e2eBlocked onSend={vi.fn(() => true)} onStop={vi.fn()} />);
+    expect((screen.getByRole("button", { name: MIC }) as HTMLButtonElement).disabled).toBe(true);
   });
 });

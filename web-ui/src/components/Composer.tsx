@@ -1,8 +1,13 @@
-import { useLayoutEffect, useRef, useState, type ClipboardEvent, type KeyboardEvent } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ClipboardEvent, type KeyboardEvent } from "react";
 import type { ConnStatus } from "../lib/ws";
 import type { MediaPayload, ModelsInfo } from "../lib/protocol";
 import { compressImage } from "../lib/imageCompress";
 import { currentModelText, filterCommands, modelChips, type SlashCommand } from "../lib/commands";
+import {
+  getSpeechRecognitionCtor,
+  useSpeechRecognition,
+  type SpeechErrorKind,
+} from "./useSpeechRecognition";
 
 /**
  * 输入区自适应高度上限：6 行（text-base 行高 24px × 6 + 上下 padding 20px =
@@ -20,6 +25,18 @@ const PLACEHOLDER: Record<ConnStatus, string> = {
 };
 
 const E2E_BLOCKED_PLACEHOLDER = "加密连接未确认，暂不能发送（见上方提示）";
+
+/** v1.39 语音错误码 → 人话文案（行内 alert 展示；aborted 属主动终止语义，
+ *  hook 层静默不回调，此表仅占位全键）。 */
+const SPEECH_ERROR_TEXT: Record<SpeechErrorKind, string> = {
+  "not-allowed": "麦克风权限被拒，请在系统设置允许后重试",
+  "service-not-allowed": "麦克风权限被拒，请在系统设置允许后重试",
+  "no-speech": "没有听到说话，请再试一次",
+  network: "语音服务网络异常，请检查网络后重试",
+  "audio-capture": "未检测到麦克风设备",
+  aborted: "",
+  unknown: "语音识别出错，请重试",
+};
 
 /**
  * composer：多行输入，Enter 发送 / Shift+Enter 换行（中文输入法组词中的
@@ -40,6 +57,13 @@ const E2E_BLOCKED_PLACEHOLDER = "加密连接未确认，暂不能发送（见�
  * 当前模型文本（current / 默认 · cliDefault / 默认）+ 有映射 target 的 chip
  * 加 title 提示。
  * 条目 ≥40px 触控高度、面板 max-h 滚动（移动端友好）。
+ * v1.39 语音转文字（P1.5）：Web Speech API（原生，零服务端改动）。支持环境
+ * （Chrome / iOS Safari 16.4+）在 📷 旁渲染 🎤 入口，点击开始（zh-CN 单句
+ * 模式）：interim 实时小字灰色预览（不进输入框），final 前置空格追加到当前
+ * 输入内容——只填入框绝不自动发送；再点停止（stop 优雅收尾保留最后一段）或
+ * 静音自动断。错误（权限/没说话/网络）行内 alert 人话提示 + 4s 消退 + 状态
+ * 复位。不支持环境（Firefox/旧 iOS）不渲染按钮。逻辑在 useSpeechRecognition
+ * （构造器注入，可测）。
  */
 export function Composer({
   status,
@@ -69,6 +93,32 @@ export function Composer({
   const [sel, setSel] = useState(0);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+
+  // ---- v1.39 语音转文字（P1.5）：Web Speech API，能力探测决定入口渲染 ----
+  /** 构造器惰性探测一次（mount 期间环境不变；测试经 window 注入 stub）。 */
+  const [speechCtor] = useState(getSpeechRecognitionCtor);
+  /** 语音错误提示（人话文案；4s 自动消退，对齐 App toast 节奏）。 */
+  const [speechError, setSpeechError] = useState<string | null>(null);
+  const speech = useSpeechRecognition({
+    ctor: speechCtor,
+    // final 只追加输入框（前置空格拼接，保留已输入内容）——绝不自动发送，
+    // 由用户确认后手动发；追加后焦点回输入框便于确认/修改（同 fill 先例）。
+    onFinal: (t) => {
+      setText((prev) => (prev ? `${prev} ${t}` : t));
+      setSel(0);
+      setDismissed(false);
+      taRef.current?.focus();
+    },
+    onError: (kind) => setSpeechError(SPEECH_ERROR_TEXT[kind] || SPEECH_ERROR_TEXT.unknown),
+  });
+  // 语音错误 4s 自动消退（对齐 error/notice toast 节奏）
+  useEffect(() => {
+    if (!speechError) {
+      return;
+    }
+    const t = setTimeout(() => setSpeechError(null), 4000);
+    return () => clearTimeout(t);
+  }, [speechError]);
 
   // 面板查询串：以 / 开头且不含空白（含空白 = 已在参数输入态，不弹）
   const query = text.startsWith("/") && !/\s/.test(text) ? text : null;
@@ -247,6 +297,30 @@ export function Composer({
           >
             📷
           </button>
+          {/* v1.39 语音输入入口：仅 Web Speech API 可用环境渲染（Firefox/旧
+              iOS 无按钮）；断线/e2eBlocked 与输入框同规则禁用；录音态切呼吸
+              点（与侧栏运行中同款视觉语汇）+ 强调色 */}
+          {speech.supported && (
+            <button
+              type="button"
+              onClick={speech.toggle}
+              disabled={disabled}
+              title={speech.status === "listening" ? "停止语音输入" : "语音输入（说完自动停）"}
+              aria-label={speech.status === "listening" ? "停止语音输入" : "开始语音输入"}
+              aria-pressed={speech.status === "listening"}
+              className="press relative h-11 shrink-0 rounded-xl border border-line-strong px-3 text-lg leading-none transition-colors hover:border-emerald-500/60 disabled:opacity-40 dark:border-slate-700"
+            >
+              <span aria-hidden="true" className={speech.status === "listening" ? "text-emerald-600 dark:text-emerald-400" : undefined}>
+                🎤
+              </span>
+              {speech.status === "listening" && (
+                <span
+                  aria-hidden="true"
+                  className="absolute right-1 top-1 h-2 w-2 rounded-full bg-emerald-400 animate-pulse"
+                />
+              )}
+            </button>
+          )}
           <textarea
             ref={taRef}
             value={text}
@@ -283,6 +357,19 @@ export function Composer({
             停止
           </button>
         </div>
+        {/* v1.39 语音 interim 预览：小字灰色暂显（不进输入框，final 追加后
+            清除）；错误行内 alert（人话文案，4s 消退）——两者互斥（错误
+            复位时 interim 已清），独立渲染互不纠缠 */}
+        {speech.interim && (
+          <p className="mt-1.5 truncate px-1 text-xs text-ghost" aria-live="polite">
+            🎙 {speech.interim}…
+          </p>
+        )}
+        {speechError && (
+          <p role="alert" className="mt-1.5 px-1 text-xs text-err">
+            {speechError}
+          </p>
+        )}
       </div>
     </div>
   );
