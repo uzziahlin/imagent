@@ -5,6 +5,7 @@
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  isIosStandalone,
   useSpeechRecognition,
   type SpeechRecognitionErrorEventLike,
   type SpeechRecognitionLike,
@@ -212,5 +213,80 @@ describe("useSpeechRecognition", () => {
       result.current.toggle();
     });
     expect(result.current.status).toBe("idle");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.39 收尾：isIosStandalone 检测纯函数（Composer 🎤 入口平台拦截用）。
+// jsdom 无 matchMedia（typeof 为 undefined）——默认即「无标准信号」；标准
+// display-mode 路径经 window.matchMedia stub 驱动，Safari 专有路径经
+// navigator.standalone 注入；UA 经 navigator 实例 defineProperty 覆盖
+// （delete 后还原 prototype getter）。
+// ---------------------------------------------------------------------------
+
+describe("isIosStandalone（v1.39 收尾）", () => {
+  const IOS_UA =
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1";
+  const ANDROID_UA =
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36";
+  const MAC_UA =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15";
+
+  const setUA = (ua: string) =>
+    Object.defineProperty(window.navigator, "userAgent", { value: ua, configurable: true });
+
+  /** matchMedia stub：仅 standalone 查询可配命中（jsdom 无此 API）。 */
+  const stubMatchMedia = (standalone: boolean) => {
+    Object.defineProperty(window, "matchMedia", {
+      value: (query: string) => ({
+        matches: standalone && query.includes("standalone"),
+        media: query,
+        onchange: null,
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+      }),
+      configurable: true,
+      writable: true,
+    });
+  };
+
+  afterEach(() => {
+    delete (window.navigator as { userAgent?: string }).userAgent;
+    delete (window.navigator as { standalone?: boolean }).standalone;
+    delete (window as { matchMedia?: unknown }).matchMedia;
+  });
+
+  it("iOS Safari 浏览器内（两 standalone 信号皆无）：false", () => {
+    setUA(IOS_UA);
+    expect(isIosStandalone()).toBe(false);
+  });
+
+  it("iOS 主屏（navigator.standalone，Safari 专有信号）：true；matchMedia 缺席不炸", () => {
+    setUA(IOS_UA);
+    Object.defineProperty(window.navigator, "standalone", { value: true, configurable: true });
+    // jsdom 无 matchMedia——专有字段路径独立命中（typeof 防御分支有效）
+    expect(isIosStandalone()).toBe(true);
+  });
+
+  it("iOS 主屏（display-mode: standalone，标准信号）：true", () => {
+    setUA(IOS_UA);
+    stubMatchMedia(true);
+    expect(isIosStandalone()).toBe(true);
+  });
+
+  it("Android UA：standalone 双信号全命中也不误报（iOS 判定不满足）", () => {
+    setUA(ANDROID_UA);
+    Object.defineProperty(window.navigator, "standalone", { value: true, configurable: true });
+    stubMatchMedia(true);
+    expect(isIosStandalone()).toBe(false);
+  });
+
+  it("iPadOS 13+ 桌面 UA（Macintosh）角落情况：不命中（按桌面处理，注释约定）", () => {
+    setUA(MAC_UA);
+    Object.defineProperty(window.navigator, "standalone", { value: true, configurable: true });
+    expect(isIosStandalone()).toBe(false);
   });
 });

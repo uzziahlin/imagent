@@ -498,3 +498,119 @@ describe("Composer 语音输入（v1.39 P1.5）", () => {
     expect((screen.getByRole("button", { name: MIC }) as HTMLButtonElement).disabled).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// v1.39 收尾：iOS 主屏（standalone）平台限制提示——Web Speech API 在 iOS
+// PWA standalone 下静默失败（WebKit 限制），点 🎤 不发起识别、行内 alert
+// 引导换 Safari（按钮保留可点、title 同步）；iOS Safari / Android standalone
+// 正常发起，其余环境零变化。环境注入：UA 经 navigator 实例 defineProperty
+// 覆盖（delete 还原 prototype getter）；standalone 信号 iOS 用专有
+// navigator.standalone、Android 用 matchMedia stub（jsdom 无此 API，delete
+// 还原「缺席」）；不支持环境/正常用例不动任何全局（检测函数对 matchMedia
+// 缺席有 typeof 防御）。
+// ---------------------------------------------------------------------------
+
+describe("Composer 语音 iOS 主屏模式提示（v1.39 收尾）", () => {
+  const MIC = "开始语音输入";
+  const HINT = "iOS 主屏模式下系统不支持语音识别，请在 Safari 中打开驾驶舱使用";
+  const IOS_UA =
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1";
+  const ANDROID_UA =
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36";
+  let instances: StubRecognition[] = [];
+
+  /** 最小 Web Speech stub（同上组）：构造即持引用，断言「未发起」用。 */
+  class StubRecognition {
+    lang = "";
+    continuous = false;
+    interimResults = false;
+    onresult: any = null;
+    onerror: any = null;
+    onend: any = null;
+    start = vi.fn();
+    stop = vi.fn();
+    abort = vi.fn();
+    constructor() {
+      instances.push(this);
+    }
+  }
+
+  const injectSpeech = () => {
+    instances = [];
+    Object.defineProperty(window, "SpeechRecognition", {
+      value: StubRecognition,
+      configurable: true,
+      writable: true,
+    });
+  };
+
+  const setUA = (ua: string) =>
+    Object.defineProperty(window.navigator, "userAgent", { value: ua, configurable: true });
+
+  /** matchMedia stub：standalone 查询命中（Android Chrome 主屏形态）。 */
+  const stubMatchMedia = () => {
+    Object.defineProperty(window, "matchMedia", {
+      value: (query: string) => ({
+        matches: query.includes("standalone"),
+        media: query,
+        onchange: null,
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+      }),
+      configurable: true,
+      writable: true,
+    });
+  };
+
+  afterEach(() => {
+    delete (window as { SpeechRecognition?: unknown }).SpeechRecognition;
+    delete (window.navigator as { userAgent?: string }).userAgent;
+    delete (window.navigator as { standalone?: boolean }).standalone;
+    delete (window as { matchMedia?: unknown }).matchMedia;
+  });
+
+  it("iOS 主屏（standalone）：点 🎤 不发起识别，行内 alert 精确文案 + title 同步；按钮保留可点", () => {
+    setUA(IOS_UA);
+    Object.defineProperty(window.navigator, "standalone", { value: true, configurable: true });
+    injectSpeech();
+    const onSend = vi.fn(() => true);
+    const { ta } = mount(onSend);
+    const mic = screen.getByRole("button", { name: MIC }) as HTMLButtonElement;
+    expect(mic.title).toBe(HINT); // title 同步提示（按钮不隐藏）
+    fireEvent.click(mic);
+    expect(screen.getByRole("alert").textContent).toBe(HINT); // 行内 alert（4s 消退复用既有管道）
+    expect(instances).toHaveLength(0); // 不发起识别（stub 构造器未被触发）
+    expect(onSend).not.toHaveBeenCalled();
+    expect(mic.disabled).toBe(false); // 保持可点——换 Safari 后回来仍可用
+    // 再点仍提示（状态未被破坏、无悬挂的 listening）
+    fireEvent.click(mic);
+    expect(screen.getByRole("alert").textContent).toBe(HINT);
+    expect(instances).toHaveLength(0);
+    expect(ta.value).toBe("");
+  });
+
+  it("iOS Safari 浏览器内：正常发起识别（无提示）", () => {
+    setUA(IOS_UA); // 不注入 standalone——jsdom 无 matchMedia，两信号皆否
+    injectSpeech();
+    mount();
+    fireEvent.click(screen.getByRole("button", { name: MIC }));
+    expect(instances).toHaveLength(1);
+    expect(instances[0].start).toHaveBeenCalledTimes(1);
+    expect(instances[0].lang).toBe("zh-CN");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("Android standalone（display-mode: standalone 命中）：正常发起识别（限制仅 iOS）", () => {
+    setUA(ANDROID_UA);
+    stubMatchMedia();
+    injectSpeech();
+    mount();
+    fireEvent.click(screen.getByRole("button", { name: MIC }));
+    expect(instances).toHaveLength(1);
+    expect(instances[0].start).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+});

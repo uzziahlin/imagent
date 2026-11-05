@@ -71,6 +71,31 @@ export function getSpeechRecognitionCtor(): SpeechRecognitionCtor | null {
   return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null;
 }
 
+/**
+ * v1.39 收尾：iOS 主屏（standalone）模式检测——真机实证 Web Speech API 在
+ * iOS PWA standalone 下不工作（WebKit 限制：识别服务起不来，start 后静默
+ * 失败——无 error、无 result 即 end），Safari 浏览器内可用。命中时由调用方
+ * 在 🎤 入口拦截（不发起识别 + 可见提示）。两条件与：
+ * - iOS：UA 含 iPhone/iPad/iPod。iPadOS 13+ 默认桌面 UA（Macintosh）的
+ *   角落情况不追求——该形态按桌面环境处理（不提示），粒度与「不支持环境
+ *   不渲染」一致；
+ * - standalone：标准 display-mode: standalone（matchMedia）或 Safari 专有
+ *   navigator.standalone === true（iOS 无 display-mode 支持时的唯一信号）
+ *   ——两判或。
+ * matchMedia 缺席（旧环境/jsdom）按 false 计不抛错——本函数在每次 Composer
+ * 挂载时无条件求值，先于任何能力探测。
+ */
+export function isIosStandalone(): boolean {
+  if (!/iP(hone|ad|od)/.test(window.navigator.userAgent)) {
+    return false;
+  }
+  const standalone =
+    (typeof window.matchMedia === "function" &&
+      window.matchMedia("(display-mode: standalone)").matches) ||
+    (window.navigator as Navigator & { standalone?: boolean }).standalone === true;
+  return standalone;
+}
+
 export type SpeechStatus = "idle" | "listening";
 
 /** error 码归一后的错误类（未知码并入 unknown；aborted = 主动终止语义）。 */
@@ -179,6 +204,10 @@ export function useSpeechRecognition({
       setStatus("idle");
       setInterim(null);
     };
+    // end 静默失败（listening 期间无 result 无 error 即结束，iOS standalone
+    // 的 WebKit 特征）不在 hook 层报错：iOS standalone 已由调用方在入口拦
+    // 截（isIosStandalone 分支，根本不发起）；其余环境静默结束归位即可——
+    // 真实无语音场景走 no-speech error 路径提示，此处不误报。
     rec.onend = () => teardown();
     recRef.current = rec;
     setInterim(null);

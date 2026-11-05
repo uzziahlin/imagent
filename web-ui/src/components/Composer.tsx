@@ -5,6 +5,7 @@ import { compressImage } from "../lib/imageCompress";
 import { currentModelText, filterCommands, modelChips, type SlashCommand } from "../lib/commands";
 import {
   getSpeechRecognitionCtor,
+  isIosStandalone,
   useSpeechRecognition,
   type SpeechErrorKind,
 } from "./useSpeechRecognition";
@@ -38,6 +39,12 @@ const SPEECH_ERROR_TEXT: Record<SpeechErrorKind, string> = {
   unknown: "语音识别出错，请重试",
 };
 
+/** v1.39 收尾：iOS 主屏（standalone）模式平台限制提示——WebKit 限制识别
+ *  服务起不来（start 后静默失败，真机实证「没反应」），Safari 内可用。点
+ *  🎤 不发起识别，行内 alert 引导换 Safari（复用既有错误行 + 4s 消退）；
+ *  按钮保持可点不隐藏（换浏览器回来仍可用），title 同步提示。 */
+const IOS_STANDALONE_HINT = "iOS 主屏模式下系统不支持语音识别，请在 Safari 中打开驾驶舱使用";
+
 /**
  * composer：多行输入，Enter 发送 / Shift+Enter 换行（中文输入法组词中的
  * Enter 不发送）；「停止」发 control stop。发送即本地回显（上层 send_echo）。
@@ -62,8 +69,10 @@ const SPEECH_ERROR_TEXT: Record<SpeechErrorKind, string> = {
  * 模式）：interim 实时小字灰色预览（不进输入框），final 前置空格追加到当前
  * 输入内容——只填入框绝不自动发送；再点停止（stop 优雅收尾保留最后一段）或
  * 静音自动断。错误（权限/没说话/网络）行内 alert 人话提示 + 4s 消退 + 状态
- * 复位。不支持环境（Firefox/旧 iOS）不渲染按钮。逻辑在 useSpeechRecognition
- * （构造器注入，可测）。
+ * 复位。不支持环境（Firefox/旧 iOS）不渲染按钮。iOS 主屏（standalone）模式
+ * WebKit 限制识别服务不可用：点 🎤 不发起识别，行内 alert 引导换 Safari
+ * （按钮保留、title 同步；isIosStandalone 检测，其余环境零变化）。逻辑在
+ * useSpeechRecognition（构造器注入，可测）。
  */
 export function Composer({
   status,
@@ -97,6 +106,10 @@ export function Composer({
   // ---- v1.39 语音转文字（P1.5）：Web Speech API，能力探测决定入口渲染 ----
   /** 构造器惰性探测一次（mount 期间环境不变；测试经 window 注入 stub）。 */
   const [speechCtor] = useState(getSpeechRecognitionCtor);
+  /** iOS 主屏（standalone）平台限制：mount 时探测一次（环境运行期不变；
+   *  测试经 matchMedia/navigator.standalone/UA 注入）。命中时点 🎤 不发起
+   *  识别（起不来的静默失败），其余环境零变化。 */
+  const [iosStandalone] = useState(isIosStandalone);
   /** 语音错误提示（人话文案；4s 自动消退，对齐 App toast 节奏）。 */
   const [speechError, setSpeechError] = useState<string | null>(null);
   const speech = useSpeechRecognition({
@@ -303,9 +316,23 @@ export function Composer({
           {speech.supported && (
             <button
               type="button"
-              onClick={speech.toggle}
+              onClick={() => {
+                if (iosStandalone) {
+                  // 平台限制：不发起识别，行内提示引导换 Safari（按钮保留
+                  // 可点——换浏览器后回来仍可用，避免「按钮消失」的困惑）
+                  setSpeechError(IOS_STANDALONE_HINT);
+                  return;
+                }
+                speech.toggle();
+              }}
               disabled={disabled}
-              title={speech.status === "listening" ? "停止语音输入" : "语音输入（说完自动停）"}
+              title={
+                iosStandalone
+                  ? IOS_STANDALONE_HINT
+                  : speech.status === "listening"
+                    ? "停止语音输入"
+                    : "语音输入（说完自动停）"
+              }
               aria-label={speech.status === "listening" ? "停止语音输入" : "开始语音输入"}
               aria-pressed={speech.status === "listening"}
               className="press relative h-11 shrink-0 rounded-xl border border-line-strong px-3 text-lg leading-none transition-colors hover:border-emerald-500/60 disabled:opacity-40 dark:border-slate-700"
