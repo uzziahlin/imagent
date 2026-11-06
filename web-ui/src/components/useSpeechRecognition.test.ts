@@ -1,7 +1,8 @@
 // v1.39 useSpeechRecognition 状态机单测：构造器注入 stub，直驱
 // result/error/end 事件。Composer 集成侧（追加输入框/预览/文案/入口渲染）
 // 在 Composer.test.tsx，此处专注 hook 内部行为：增量语义、聚合回调、
-// stop vs abort 语义、aborted 静默、清理幂等。
+// stop vs abort 语义、aborted 静默、清理幂等、静默失败自动重试（v1.39.1，
+// fake timers 直驱定时器）。
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -199,20 +200,172 @@ describe("useSpeechRecognition", () => {
     expect(rec.onend).toBeNull();
   });
 
-  it("start 同步抛错：复位 idle（不悬挂 listening）", () => {
-    const { result } = renderHook(() =>
-      useSpeechRecognition({
-        ctor: class extends StubRecognition {
-          start = vi.fn(() => {
-            throw new DOMException("InvalidStateError", "InvalidStateError");
-          });
-        } as unknown as new () => SpeechRecognitionLike,
-      }),
-    );
-    act(() => {
-      result.current.toggle();
-    });
+  it("start 同步抛错：teardown 归位 idle + onError(\"unknown\") 反馈一次（v1.39.1 消灭无反馈形态）", () => {
+    // startListening 助手内部已完成 toggle（抛错实例不入 instances）
+    const { result, onError } = startListening({ throwOnStart: true });
     expect(result.current.status).toBe("idle");
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError).toHaveBeenCalledWith("unknown");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.39.1 静默失败自动重试（WebKit 确认 bug：iOS Safari 同页后续会话 start
+// 静默失败——无 error 无 result 即 end）。fake timers 直驱 end/定时器，验证
+// 重试状态机：三条件与（非手动 stop + 无 result + 无 error）+ 本轮额度未用
+// → 400ms 后换新实例重试一次；窗口竞态（unmount/停止点击）定时器必须清除。
+// ---------------------------------------------------------------------------
+
+describe("useSpeechRecognition 静默失败自动重试（v1.39.1）", () => {
+  it("静默 end（无 result 无 error）：期间 status 保持 listening，400ms 后新实例自动重试一次", () => {
+    vi.useFakeTimers();
+    try {
+      const { result, instances, onError } = startListening();
+      emitEnd(instances[0]); // WebKit 静默失败特征：无 error 无 result 即 end
+      // 重试延迟窗口：呼吸点不断（UI 无感），且不误报错误
+      expect(result.current.status).toBe("listening");
+      expect(onError).not.toHaveBeenCalled();
+      expect(instances.length).toBe(1);
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      // 换新实例重试一次（start 全量逻辑：zh-CN 配置齐全）
+      expect(instances.length).toBe(2);
+      expect(instances[1].start).toHaveBeenCalledTimes(1);
+      expect(instances[1].lang).toBe("zh-CN");
+      expect(result.current.status).toBe("listening");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("重试会话再静默 end：无第二次重试，归位 idle（防循环）", () => {
+    vi.useFakeTimers();
+    try {
+      const { result, instances } = startListening();
+      emitEnd(instances[0]);
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      expect(instances.length).toBe(2);
+      emitEnd(instances[1]); // 重试会话再静默失败
+      expect(result.current.status).toBe("idle");
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+      expect(instances.length).toBe(2); // 不再重试
+      expect(result.current.status).toBe("idle");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("手动 stop（未说话）不重试；end 后 manualStop 清除——再开的新会话静默失败仍可重试", () => {
+    vi.useFakeTimers();
+    try {
+      const { result, instances } = startListening();
+      act(() => {
+        result.current.stop(); // 还没说话就停
+      });
+      emitEnd(instances[0]);
+      expect(result.current.status).toBe("idle");
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+      expect(instances.length).toBe(1); // 主动停止绝不自动重启
+      // manualStop 已随 end 清除：下一轮用户点击是全新意图，重试额度恢复
+      act(() => {
+        result.current.toggle();
+      });
+      expect(instances.length).toBe(2);
+      emitEnd(instances[1]);
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      expect(instances.length).toBe(3); // 新会话静默失败 → 正常重试
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("有 result 后 end：正常会话结束，不重试", () => {
+    vi.useFakeTimers();
+    try {
+      const { result, instances, onFinal } = startListening();
+      emitResult(instances[0], 0, [["说过话", true]]);
+      expect(onFinal).toHaveBeenCalledTimes(1);
+      emitEnd(instances[0]); // 单句静音自动断（说过话的 end）
+      expect(result.current.status).toBe("idle");
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+      expect(instances.length).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("error 会话 end：不重试（错误自有文案，不叠加重试；aborted 同样命中）", () => {
+    vi.useFakeTimers();
+    try {
+      const { result, instances, onError } = startListening();
+      emitError(instances[0], "no-speech");
+      expect(onError).toHaveBeenCalledWith("no-speech");
+      emitEnd(instances[0]); // 规范 error 后必跟 end
+      expect(result.current.status).toBe("idle");
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+      expect(instances.length).toBe(1);
+      // aborted 同样置 errored（OS 中断等场景不自动重启，静默不回调）
+      act(() => {
+        result.current.toggle();
+      });
+      emitError(instances[1], "aborted");
+      expect(onError).not.toHaveBeenCalledWith("aborted");
+      emitEnd(instances[1]);
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      expect(instances.length).toBe(2);
+      expect(result.current.status).toBe("idle");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("重试延迟窗口内 unmount：定时器清除，无迟到 start", () => {
+    vi.useFakeTimers();
+    try {
+      const { instances } = startListening();
+      emitEnd(instances[0]); // 进入重试窗口
+      cleanup(); // 窗口内卸载
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      expect(instances.length).toBe(1); // 定时器已清，无重试 start
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("重试延迟窗口内点击（UI 仍录音态）= 停止意图：取消重试归位 idle", () => {
+    vi.useFakeTimers();
+    try {
+      const { result, instances } = startListening();
+      emitEnd(instances[0]);
+      expect(result.current.status).toBe("listening"); // 窗口内仍是录音态
+      act(() => {
+        result.current.toggle(); // 用户点停止
+      });
+      expect(result.current.status).toBe("idle");
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      expect(instances.length).toBe(1); // 待发重试已取消
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

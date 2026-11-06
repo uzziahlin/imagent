@@ -415,7 +415,8 @@ describe("Composer 语音输入（v1.39 P1.5）", () => {
     expect(screen.queryByText(/正在说的/)).toBeNull(); // 预览清除
     expect(ta.value).toBe("完整的话");
 
-    // 单句模式：静音自动断（end 无 error）→ 归位可再点
+    // 说过话的 end（单句静音自动断）→ 正常归位可再点；不触发 v1.39.1 重试
+    // （重试只针对无 result 的静默失败）
     emitEnd(rec);
     expect(screen.getByRole("button", { name: MIC })).toBeTruthy();
   });
@@ -451,6 +452,33 @@ describe("Composer 语音输入（v1.39 P1.5）", () => {
         vi.advanceTimersByTime(4000);
       });
       expect(screen.queryByRole("alert")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("静默失败自动重试（v1.39.1）：end 后保持录音态，400ms 换新实例；重试再静默归位", () => {
+    vi.useFakeTimers();
+    try {
+      injectSpeech();
+      mount();
+      fireEvent.click(screen.getByRole("button", { name: MIC }));
+      expect(instances.length).toBe(1);
+      emitEnd(instances[0]); // WebKit 静默失败：无 result 无 error 即 end
+      // 重试延迟窗口：录音态保持（呼吸点不断，按钮仍为停止态，用户无感）
+      expect(screen.getByRole("button", { name: "停止语音输入" })).toBeTruthy();
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      expect(instances.length).toBe(2); // 自动重试：新实例已 start
+      expect(instances[1].start).toHaveBeenCalledTimes(1);
+      // 重试会话再静默失败：不循环重试，归位可再点
+      emitEnd(instances[1]);
+      expect(screen.getByRole("button", { name: MIC })).toBeTruthy();
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      expect(instances.length).toBe(2);
     } finally {
       vi.useRealTimers();
     }

@@ -11,7 +11,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
  *   去向（任务钉死：只填输入框，绝不自动发送）；
  * - 错误经 onError 抛归一化 kind，人话文案/提示形态由调用方映射（aborted
  *   属主动终止语义，静默不回调）；
- * - unmount 清理：abort + 事件解绑（teardown 幂等，StrictMode 双挂载安全）。
+ * - unmount 清理：abort + 事件解绑（teardown 幂等，StrictMode 双挂载安全）；
+ * - v1.39.1 静默失败自动重试：会话 end 时若非手动 stop 且本会话无 result
+ *   无 error（WebKit 静默失败特征），400ms 后换新实例自动重试一次——期间
+ *   保持 listening，UI 无感；重试会话再静默失败不循环，归位 idle（每轮用户
+ *   点击至多 1 次自动重试）。start 同步抛错经 onError("unknown") 显式反馈。
  */
 
 // ---------------------------------------------------------------------------
@@ -144,8 +148,29 @@ export function useSpeechRecognition({
   const cbsRef = useRef({ onFinal, onError });
   cbsRef.current = { onFinal, onError };
 
-  /** 收尾：事件解绑 + abort + UI 态复位（幂等；end/error 复位/unmount 共用）。 */
+  // ---- v1.39.1 静默失败自动重试（WebKit 确认 bug：旧音频会话未完全释放，
+  // 紧接的 start 静默失败——无 error 无 result 即 end；社区解法 end 后延迟
+  // 重启 + 失败重试一次）----
+  /** 重试延迟定时器（400ms）：teardown/unmount 与窗口内停止点击均清除，防
+   *  迟到 start 竞态。 */
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 会话级标志（每次 start 新会话重置）：
+  /** 本会话是否收到过任何 result 事件（onresult 一到即 true）。 */
+  const gotResultRef = useRef(false);
+  /** 本会话是否发生过 error（含 aborted——错误会话一律不自动重试）。 */
+  const erroredRef = useRef(false);
+  /** 用户本会话是否手动 stop（end 处理后清除——主动停止绝不自动重启）。 */
+  const manualStopRef = useRef(false);
+  /** 本轮用户意图内已用掉的自动重试（至多 1 次防循环；toggle 新点击重置）。 */
+  const retriedRef = useRef(false);
+
+  /** 收尾：重试定时器清除 + 事件解绑 + abort + UI 态复位（幂等；end/error
+   *  复位/unmount 共用）。 */
   const teardown = useCallback(() => {
+    if (retryTimerRef.current !== null) {
+      clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
     const rec = recRef.current;
     recRef.current = null;
     if (rec) {
@@ -170,11 +195,23 @@ export function useSpeechRecognition({
     if (!ctor || recRef.current) {
       return;
     }
+    // 防御清除残留重试定时器（现路径 toggle 窗口分支已兜住；防未来新增
+    // start 调用点把「窗口内迟到 start」变成双会话竞态）
+    if (retryTimerRef.current !== null) {
+      clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
+    // 新会话重置会话级标志（retried 例外：属用户意图级，仅在 toggle 新点击
+    // 重置——重试经 start 直入，靠它记住「本轮已重试过」防无限循环）
+    gotResultRef.current = false;
+    erroredRef.current = false;
+    manualStopRef.current = false;
     const rec = new ctor();
     rec.lang = lang;
     rec.interimResults = true;
     rec.continuous = false; // 单句：静音自动断（end 自然归位）
     rec.onresult = (ev) => {
+      gotResultRef.current = true; // 任何 result 事件即证明本会话有效（重试判定用）
       let finalBuf = "";
       let interimBuf = "";
       // 增量遍历（resultIndex 起）；alternative 是互斥候选，只取第 0 候选
@@ -195,6 +232,7 @@ export function useSpeechRecognition({
       setInterim(it || null);
     };
     rec.onerror = (ev) => {
+      erroredRef.current = true; // 错误会话一律不自动重试（含 aborted，错误自有文案）
       const kind = normalizeErrorKind(ev.error);
       if (kind !== "aborted") {
         cbsRef.current.onError?.(kind);
@@ -204,29 +242,51 @@ export function useSpeechRecognition({
       setStatus("idle");
       setInterim(null);
     };
-    // end 静默失败（listening 期间无 result 无 error 即结束，iOS standalone
-    // 的 WebKit 特征）不在 hook 层报错：iOS standalone 已由调用方在入口拦
-    // 截（isIosStandalone 分支，根本不发起）；其余环境静默结束归位即可——
-    // 真实无语音场景走 no-speech error 路径提示，此处不误报。
-    rec.onend = () => teardown();
+    // v1.39.1 end 判定（重试状态机）：三条件与=静默失败特征——非手动 stop +
+    // 无 result + 无 error；叠加本轮重试额度未用（重试会话再静默失败不再重
+    // 试，避免循环——用户再点一次 🎤 即新一轮）。静默失败不回调 onError（不
+    // 误报：iOS standalone 已由调用方在入口拦截根本不发起，真实无语音场景走
+    // no-speech error 路径提示）。
+    rec.onend = () => {
+      const silentFail =
+        !manualStopRef.current && !gotResultRef.current && !erroredRef.current;
+      const allowRetry = silentFail && !retriedRef.current;
+      manualStopRef.current = false; // end 处理后清除，不残留到下轮会话
+      teardown(); // recRef 置空 → 重试直接走 start 新实例逻辑
+      if (allowRetry) {
+        retriedRef.current = true;
+        // 重试延迟窗口 UI 无感：归位后立即拉回 listening（同一事件内 React
+        // 批处理，无闪烁），呼吸点不断；窗口内用户点击/卸载经 toggle/
+        // teardown 清定时器，防迟到 start 抢跑用户意图
+        setStatus("listening");
+        retryTimerRef.current = setTimeout(() => {
+          retryTimerRef.current = null;
+          start(); // 自引用安全：ctor/lang/teardown 每挂载稳定，触发时即最新实现
+        }, 400);
+      }
+    };
     recRef.current = rec;
     setInterim(null);
     setStatus("listening");
     try {
       rec.start();
     } catch {
-      // start 同步抛（如 InvalidStateError）——复位回 idle
+      // start 同步抛（如 InvalidStateError）——复位回 idle + onError("unknown")
+      // 显式反馈（调用方映射「语音识别出错，请重试」，消灭同步失败的无反馈形态）
       teardown();
+      cbsRef.current.onError?.("unknown");
     }
   }, [ctor, lang, teardown]);
 
   /** 用户主动停止：stop() 优雅结束（实现会再派最后一段 final result + end），
-   *  不立即 teardown 以免丢收尾识别结果。 */
+   *  不立即 teardown 以免丢收尾识别结果。manualStop 标记供 end 判定——主动
+   *  停止（尤其还没说话就停）绝不自动重试。 */
   const stop = useCallback(() => {
     const rec = recRef.current;
     if (!rec) {
       return;
     }
+    manualStopRef.current = true;
     try {
       rec.stop();
     } catch {
@@ -235,14 +295,19 @@ export function useSpeechRecognition({
   }, [teardown]);
 
   /** 点击切换：listening → stop（再点停止）；idle → start。以 ref 判定（比
-   *  status state 更即时，error 复位与 end 收尾间的窗口期也安全）。 */
+   *  status state 更即时，error 复位与 end 收尾间的窗口期也安全）。重试延迟
+   *  窗口（recRef 已空、status 仍 listening）内点击按停止意图处理：teardown
+   *  取消待发重试并归位，防迟到 start 抢跑。新开会的点击重置本轮重试额度。 */
   const toggle = useCallback(() => {
     if (recRef.current) {
       stop();
+    } else if (retryTimerRef.current !== null) {
+      teardown(); // 清重试定时器 + 归位 idle
     } else {
+      retriedRef.current = false;
       start();
     }
-  }, [start, stop]);
+  }, [start, stop, teardown]);
 
   return { status, interim, supported: ctor !== null, toggle, stop };
 }
