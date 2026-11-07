@@ -128,8 +128,23 @@ const RATE_MAX_FRAMES: usize = 20;
 /// 网关离线缓冲上限（§4.3）：帧数 / 字节数先到为准。
 const BUF_MAX_FRAMES: usize = 200;
 const BUF_MAX_BYTES: usize = 1024 * 1024;
-/// 单 WS message / 单 frame 上限 256KB（§4.4）：超限 axum 自会以 1009 断开。
-const MAX_WS_MESSAGE_BYTES: usize = 256 * 1024;
+/// 单 WS message / 单 frame 上限 8MB（§4.4，v1.40 由 256KB 放宽）：超限
+/// axum 自会以 1009 断开。放宽依据：v1.40 ASR 契约 60s 录音 b64≈2.5MB
+///（E2E seal 后≈3.4MB）必撞 256KB（真机实测 300KB 文本帧即断连）；v1.7
+/// media 的 8MB 解码上限实际一直被压到 <192KB——8MB 与网关侧 media 解码
+/// 上限（MEDIA_MAX_BYTES）同量级，ASR 需 3.4MB，media 顺带解放到
+/// ~5.9MB 解码。
+///
+/// 安全评估（放宽时定稿）：
+///
+/// - 能发帧的两端都是认证主体：浏览器 = passkey 会话、网关 = ed25519
+///   机器表，无匿名发送面（单用户系统）；
+/// - 频率限制独立生效（10s 滑窗 ≤ [`RATE_MAX_FRAMES`] 帧）：8MB × 20 =
+///   160MB/10s 的最坏内存压力理论存在但主体可信，且 tokio ws 读帧瞬时
+///   驻留、读完即转发不驻留；
+/// - 256KB 的原始动机是协议卫生（误发大帧早断），不是对抗性防线——8MB
+///   保留同等卫生语义（远超正常帧型，仍能拦截失控大循环）。
+const MAX_WS_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 /// 每连接出站 channel 容量。上限推导：网关侧 hello_ack + 离线缓冲全量
 /// 重放（≤200 帧）、浏览器侧 hello_ack + machine/machines 双快照，必须在
 /// **进入消费循环之前**一次性入队也不阻塞，故 ≥202；取 512 留余量。业务
@@ -1046,7 +1061,7 @@ fn challenge_frame(nonce: &str) -> Message {
 /// `{"v":1,"type":"prove","pubkey":"<64 hex>","signature":"<128 hex>"}`。
 /// 签名对象 = challenge nonce 的 **hex 字符串原文的 UTF-8 字节**（网关侧
 /// 对收到的 nonce 原样签名——两侧无 hex 解码歧义；验签见
-/// [`GatewayKeys::verify`]）。畸形/超长由 256KB message 上限与 hex 解码
+/// [`GatewayKeys::verify`]）。畸形/超长由 8MB message 上限与 hex 解码
 /// 兜底，任何失败统一 "auth failed"。
 #[derive(Deserialize)]
 struct ProveFrame {
@@ -1603,7 +1618,7 @@ async fn browser_ws(
     ws_endpoint(st, Role::Browser, headers, ws).await
 }
 
-/// 两端点公共入口：套上 256KB message/frame 上限（§4.4）后升级。
+/// 两端点公共入口：套上 8MB message/frame 上限（§4.4）后升级。
 async fn ws_endpoint(
     st: RelayState,
     role: Role,

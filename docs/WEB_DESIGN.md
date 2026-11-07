@@ -111,7 +111,7 @@ Mac：imagent gateway
 - `GET /imagent/gateway`（Upgrade）：gateway WS；首帧 `hello` 校验 `GATEWAY_TOKEN`（失败 401 关闭 + 1s 延迟防爆破）
 - `GET /imagent/ws`（Upgrade）：browser WS；同上校验 `USER_TOKEN`
 - `GET /imagent/`（及静态路径）：`rust-embed` 吐 SPA（`Cache-Control: no-store` 对 index，hash 资源长缓存）
-- 中继逻辑：两端各一条 mpsc；按帧类型定向转发；限流（每连接 20 帧/10s，超限 429 关闭）、单帧上限 256KB、连接数上限（每 token 1 条，重复连接踢旧）
+- 中继逻辑：两端各一条 mpsc；按帧类型定向转发；限流（每连接 20 帧/10s，超限 429 关闭）、单帧上限 8MB（v1.40 由 256KB 放宽，容纳 ASR 3.4MB E2E 帧与 media 大图，见 relay `MAX_WS_MESSAGE_BYTES` doc 的安全评估）、连接数上限（每 token 1 条，重复连接踢旧）
 - 加固：仅绑 127.0.0.1；systemd `ProtectSystem=strict` + `PrivateTmp` + `NoNewPrivileges`；日志只记连接/断开/字节数，**不落帧内容**
 - 部署：`cargo build --release`（Mac 交叉 `--target x86_64-unknown-linux-gnu` 或 ECS 本地构建）→ workbench 上传 → systemd；Caddy 现有 8443 site 增加 `handle_path /imagent/*` 反代 3010（不动 happy 路由）
 
