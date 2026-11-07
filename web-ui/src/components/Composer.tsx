@@ -1,6 +1,6 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ClipboardEvent, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ClipboardEvent, type KeyboardEvent } from "react";
 import type { ConnStatus } from "../lib/ws";
-import type { MediaPayload, ModelsInfo } from "../lib/protocol";
+import type { AsrUiEvent, MediaPayload, ModelsInfo } from "../lib/protocol";
 import { compressImage } from "../lib/imageCompress";
 import { currentModelText, filterCommands, modelChips, type SlashCommand } from "../lib/commands";
 import {
@@ -9,6 +9,7 @@ import {
   useSpeechRecognition,
   type SpeechErrorKind,
 } from "./useSpeechRecognition";
+import { useVoiceRecorder } from "./useVoiceRecorder";
 
 /**
  * 输入区自适应高度上限：6 行（text-base 行高 24px × 6 + 上下 padding 20px =
@@ -47,6 +48,22 @@ const SPEECH_ERROR_TEXT: Record<SpeechErrorKind, string> = {
  *  改「受限」。未命中环境静默耗尽不提示（真实无语音不误报）。 */
 const IOS_STANDALONE_HINT = "主屏模式下语音受 iOS 系统限制可能不稳定，建议用 Safari 打开使用";
 
+/** v1.40 语音转写（whisper 主路径）error 帧 code → 人话文案（行内 alert，复用
+ *  既有 speechError 管道；未列 code 兜底 ASR_UNKNOWN_TEXT）。文案与 App 层
+ *  ERROR_HINTS 同款（toast 兜底 + 行内贴近操作位置双显示）。 */
+const ASR_ERROR_TEXT: Record<string, string> = {
+  asr_unconfigured: "网关未启用语音转写",
+  asr_failed: "语音转写失败，请重试",
+  asr_too_large: "录音超过大小上限，请缩短后重试",
+  asr_invalid: "录音数据无效，请重试",
+};
+const ASR_UNKNOWN_TEXT = "语音转写出错，请重试";
+/** asr_request 发出后 asr_result 无回包的超时（契约同族上限 60s：录音 60s +
+ *  转写预算——旧网关无此帧也在此收敛，不给「识别中」死等）。 */
+const ASR_TIMEOUT_MS = 60_000;
+const ASR_TIMEOUT_TEXT = "语音识别超时，请重试";
+const ASR_SEND_FAIL_TEXT = "语音识别请求发送失败，请重试";
+
 /**
  * composer：多行输入，Enter 发送 / Shift+Enter 换行（中文输入法组词中的
  * Enter 不发送）；「停止」发 control stop。发送即本地回显（上层 send_echo）。
@@ -76,11 +93,24 @@ const IOS_STANDALONE_HINT = "主屏模式下语音受 iOS 系统限制可能不�
  * 拦截）——静默失败由 v1.39.1 自动重试兜底，重试耗尽（WebKit 连续会话 bug
  * 仍无果）经 onSilentFailExhausted 呈现受限提示（仅 iOS 主屏命中，其余环境
  * 静默不误报；title 同步）。逻辑在 useSpeechRecognition（构造器注入，可测）。
+ * v1.40 语音转写 whisper 主路径：快照 asr===true（网关能力通告）时 🎤 分流
+ * 录音模式——useVoiceRecorder（Web Audio 采 PCM → 16k/mono/16bit WAV 纯前端
+ * 编码，不走 MediaRecorder；iOS 主屏 PWA 可用是核心卖点）：点 🎤 开始录音
+ * （呼吸点同款），再点停止 → 编码 → onAsr 发 asr_request → 🎤 转「识别中」
+ * （disabled + ⏳）→ asr_result（经 App asrEvent prop 路由，不进消息流）文本
+ * 前置空格追加输入框（与 Web Speech 既有行为一致，不自动发送）→ 归位；
+ * error 帧 asr_* code 行内 alert 人话映射（复用 speechError 管道）；60s 无
+ * 回包超时提示重试。快照无 asr（缺席/false = 旧网关/未配置）→ Web Speech
+ * 既有路径零变化（iOS 主屏 WebKit 连续会话 bug 场景由网关通告 asr 后自然
+ * 迁移到 whisper，fallback 代码原样保留）。
  */
 export function Composer({
   status,
   e2eBlocked,
   models,
+  asr,
+  asrEvent,
+  onAsr,
   onSend,
   onStop,
 }: {
@@ -89,6 +119,17 @@ export function Composer({
   e2eBlocked?: boolean;
   /** v1.8：当前机器快照的模型目录（/model chips 与当前模型文本；缺省内置兜底）。 */
   models?: ModelsInfo;
+  /** v1.40：当前机器快照 asr 能力通告（true = 网关 whisper 可用，🎤 走录音
+   *  上行模式；缺席/false = 旧网关/未配置 → Web Speech 既有路径零变化）。 */
+  asr?: boolean;
+  /** v1.40：语音转写 UI 事件流（asr_result 回包 / error 帧 asr_* code，App
+   *  层经 ws onAsrResult 回调 + onFrame 旁路转发；每次事件新对象，引用变化
+   *  驱动本组件 effect）。 */
+  asrEvent?: AsrUiEvent | null;
+  /** v1.40：发送 asr_request（App 层转 wsRef.sendAsrRequest + outMachine()，
+   *  Composer 不直接持 WsManager——同 onSend 的回调形态）；false = 未发出
+   *  （连接未就绪等），Composer 就地归位 + 行内提示。 */
+  onAsr?: (audioB64: string, durationMs: number) => boolean;
   /** v1.7：可选 media 随 message 帧发送；text 空串 + media 合法（纯图消息）。 */
   onSend: (text: string, media?: MediaPayload) => boolean;
   onStop: () => void;
@@ -142,6 +183,86 @@ export function Composer({
     const t = setTimeout(() => setSpeechError(null), 4000);
     return () => clearTimeout(t);
   }, [speechError]);
+
+  // ---- v1.40 语音转写（whisper 主路径）：快照 asr 能力分流 🎤 模式 ----
+  /** true = 网关通告 asr 能力（快照 asr===true 严格判定，缺席/false = Web
+   *  Speech 既有路径零变化）。 */
+  const asrWhisper = asr === true;
+  /** asr_request 发出后的无回包超时定时器（60s；asrEvent 到达/超时/unmount 清）。 */
+  const asrTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clearAsrTimeout = useCallback(() => {
+    if (asrTimeoutRef.current !== null) {
+      clearTimeout(asrTimeoutRef.current);
+      asrTimeoutRef.current = null;
+    }
+  }, []);
+  // 录音 hook（无条件调用——React hook 规则；非 whisper 模式不 start，零开销）。
+  // onRecorded 闭包引用下方 voice 变量属前向引用：回调仅在录音停止后异步触发，
+  // 求值时 voice/voiceReset 已初始化（同 speechCtor 惰性探测模式）。
+  const voice = useVoiceRecorder({
+    // 停止 → 编码完成：上行 asr_request。发出成功 → 「识别中」+ 启动 60s 无
+    // 回包超时；未发出（连接未就绪等）→ 就地归位 + 行内提示。
+    onRecorded: ({ audioB64, durationMs }) => {
+      const ok = onAsr ? onAsr(audioB64, durationMs) : false;
+      if (!ok) {
+        voice.reset();
+        setSpeechError(ASR_SEND_FAIL_TEXT);
+        return;
+      }
+      clearAsrTimeout();
+      asrTimeoutRef.current = setTimeout(() => {
+        asrTimeoutRef.current = null;
+        voice.reset();
+        setSpeechError(ASR_TIMEOUT_TEXT);
+      }, ASR_TIMEOUT_MS);
+    },
+    // 录音侧错误归一人话（与 SPEECH_ERROR_TEXT 同措辞复用语义）。
+    onError: (kind) => {
+      setSpeechError(
+        kind === "mic-denied"
+          ? "麦克风权限被拒，请在系统设置允许后重试"
+          : kind === "no-device"
+            ? "未检测到麦克风设备"
+            : "录音失败，请重试",
+      );
+    },
+  });
+  const { status: voiceStatus, reset: voiceReset } = voice;
+  // asr_result / asr_* error 事件（App 经 asrEvent prop 转发，每次事件新对象
+  // 引用变化驱动）：回包 → 文本前置空格追加输入框（与 Web Speech final 既有
+  // 行为一致，不自动发送）+ 焦点回输入框；error → 行内人话映射；两者都清
+  // 超时 + hook 归位（transcribing → idle）。
+  useEffect(() => {
+    if (!asrEvent) {
+      return;
+    }
+    clearAsrTimeout();
+    voiceReset();
+    if (asrEvent.kind === "result") {
+      setText((prev) => (prev ? `${prev} ${asrEvent.text}` : asrEvent.text));
+      setSel(0);
+      setDismissed(false);
+      taRef.current?.focus();
+    } else {
+      setSpeechError(ASR_ERROR_TEXT[asrEvent.code] ?? ASR_UNKNOWN_TEXT);
+    }
+  }, [asrEvent, voiceReset, clearAsrTimeout]);
+  // unmount 清超时定时器（录音资源由 hook 自清理）
+  useEffect(() => () => clearAsrTimeout(), [clearAsrTimeout]);
+
+  /** 🎤 点击分流：whisper 模式录音态点击 = 停止（编码 + 上行），其余 = 开始；
+   *  Web Speech 模式走既有 toggle（零变化）。 */
+  const micClick = () => {
+    if (asrWhisper) {
+      if (voiceStatus === "recording") {
+        voice.stop();
+      } else {
+        voice.start();
+      }
+      return;
+    }
+    speech.toggle();
+  };
 
   // 面板查询串：以 / 开头且不含空白（含空白 = 已在参数输入态，不弹）
   const query = text.startsWith("/") && !/\s/.test(text) ? text : null;
@@ -320,29 +441,57 @@ export function Composer({
           >
             📷
           </button>
-          {/* v1.39 语音输入入口：仅 Web Speech API 可用环境渲染（Firefox/旧
-              iOS 无按钮）；断线/e2eBlocked 与输入框同规则禁用；录音态切呼吸
+          {/* v1.39 语音输入入口（v1.40 分流）：快照 asr=true → whisper 录音
+              模式（点开始呼吸点 → 再点停止编码上行 →「识别中」disabled +
+              ⏳ → asr_result 回填归位）；无 asr → Web Speech 既有路径零变化
+              （title/aria 三元原样，仅 Web Speech 可用环境渲染的旧 gating 改
+              为两模式或）。断线/e2eBlocked 与输入框同规则禁用；录音态切呼吸
               点（与侧栏运行中同款视觉语汇）+ 强调色 */}
-          {speech.supported && (
+          {(asrWhisper || speech.supported) && (
             <button
               type="button"
-              onClick={() => speech.toggle()}
-              disabled={disabled}
+              onClick={micClick}
+              disabled={disabled || (asrWhisper && voiceStatus === "transcribing")}
               title={
-                iosStandalone
-                  ? IOS_STANDALONE_HINT
+                asrWhisper
+                  ? voiceStatus === "recording"
+                    ? "停止录音"
+                    : voiceStatus === "transcribing"
+                      ? "语音识别中…"
+                      : "语音输入（说完点此停止）"
+                  : iosStandalone
+                    ? IOS_STANDALONE_HINT
+                    : speech.status === "listening"
+                      ? "停止语音输入"
+                      : "语音输入（说完自动停）"
+              }
+              aria-label={
+                asrWhisper
+                  ? voiceStatus === "recording"
+                    ? "停止录音"
+                    : voiceStatus === "transcribing"
+                      ? "语音识别中"
+                      : "开始语音输入"
                   : speech.status === "listening"
                     ? "停止语音输入"
-                    : "语音输入（说完自动停）"
+                    : "开始语音输入"
               }
-              aria-label={speech.status === "listening" ? "停止语音输入" : "开始语音输入"}
-              aria-pressed={speech.status === "listening"}
+              aria-pressed={
+                asrWhisper ? voiceStatus === "recording" : speech.status === "listening"
+              }
               className="press relative h-11 shrink-0 rounded-xl border border-line-strong px-3 text-lg leading-none transition-colors hover:border-emerald-500/60 disabled:opacity-40 dark:border-slate-700"
             >
-              <span aria-hidden="true" className={speech.status === "listening" ? "text-emerald-600 dark:text-emerald-400" : undefined}>
-                🎤
+              <span
+                aria-hidden="true"
+                className={
+                  (asrWhisper ? voiceStatus === "recording" : speech.status === "listening")
+                    ? "text-emerald-600 dark:text-emerald-400"
+                    : undefined
+                }
+              >
+                {asrWhisper && voiceStatus === "transcribing" ? "⏳" : "🎤"}
               </span>
-              {speech.status === "listening" && (
+              {(asrWhisper ? voiceStatus === "recording" : speech.status === "listening") && (
                 <span
                   aria-hidden="true"
                   className="absolute right-1 top-1 h-2 w-2 rounded-full bg-emerald-400 animate-pulse"

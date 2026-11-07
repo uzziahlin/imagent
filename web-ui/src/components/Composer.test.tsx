@@ -690,3 +690,287 @@ describe("Composer 语音 iOS 主屏模式（v1.39.2 撤拦 + 耗尽兜底）", 
     expect(screen.queryByRole("alert")).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// v1.40 语音转写 whisper 主路径（Composer 分流层）：快照 asr=true → 🎤 走
+// useVoiceRecorder 录音模式（Web Audio 采 PCM → WAV b64 → onAsr 上行）；
+// hook 状态机细节在 useVoiceRecorder.test.ts。jsdom 无 Web Audio——全局注入
+// fake AudioContext / AudioWorkletNode / navigator.mediaDevices / URL.create-
+// ObjectURL（Composer 内 hook 默认工厂探测取用；用后 delete 还原）。
+// ---------------------------------------------------------------------------
+
+describe("Composer 语音转写 whisper（v1.40）", () => {
+  const MIC = "开始语音输入";
+  const STOP = "停止录音";
+  const BUSY = "语音识别中";
+  let contexts: FakeAsrCtx[] = [];
+  let workletNodes: FakeAsrWorkletNode[] = [];
+  let gum: ReturnType<typeof vi.fn>;
+
+  /** fake AudioContext（默认工厂 new AudioContext({sampleRate:16000}) 探测
+   *  命中；sampleRate 取构造 options）。 */
+  class FakeAsrCtx {
+    sampleRate: number;
+    state = "running";
+    destination = { connect: vi.fn(), disconnect: vi.fn() };
+    audioWorklet = { addModule: vi.fn(async () => {}) };
+    resume = vi.fn(async () => {});
+    close = vi.fn(async () => {});
+    createMediaStreamSource = vi.fn(() => ({ connect: vi.fn(), disconnect: vi.fn() }));
+    constructor(opts?: { sampleRate?: number }) {
+      this.sampleRate = opts?.sampleRate ?? 48000;
+      contexts.push(this);
+    }
+  }
+
+  /** fake AudioWorkletNode：port.onmessage 由 hook 设置，测试经它投 PCM 块。 */
+  class FakeAsrWorkletNode {
+    port = { postMessage: vi.fn(), onmessage: null as ((ev: { data: Float32Array }) => void) | null };
+    connect = vi.fn();
+    disconnect = vi.fn();
+    constructor(_ctx: unknown, _name: string) {
+      workletNodes.push(this);
+    }
+  }
+
+  const injectRecorderEnv = () => {
+    contexts = [];
+    workletNodes = [];
+    gum = vi.fn(async () => {
+      const track = { stop: vi.fn() };
+      return { getTracks: () => [track] } as unknown as MediaStream;
+    });
+    Object.defineProperty(window, "AudioContext", {
+      value: FakeAsrCtx,
+      configurable: true,
+      writable: true,
+    });
+    Object.defineProperty(window, "AudioWorkletNode", {
+      value: FakeAsrWorkletNode,
+      configurable: true,
+      writable: true,
+    });
+    Object.defineProperty(window.navigator, "mediaDevices", {
+      value: { getUserMedia: gum },
+      configurable: true,
+    });
+    // worklet 模块 Blob URL 加载（jsdom 无此 API）
+    Object.defineProperty(URL, "createObjectURL", {
+      value: () => "blob:fake",
+      configurable: true,
+      writable: true,
+    });
+    Object.defineProperty(URL, "revokeObjectURL", {
+      value: () => {},
+      configurable: true,
+      writable: true,
+    });
+  };
+
+  afterEach(() => {
+    delete (window as { AudioContext?: unknown }).AudioContext;
+    delete (window as { AudioWorkletNode?: unknown }).AudioWorkletNode;
+    delete (window.navigator as { mediaDevices?: unknown }).mediaDevices;
+  });
+
+  function mountAsr(onAsr: ReturnType<typeof vi.fn> = vi.fn(() => true)) {
+    const view = render(
+      <Composer status="ready" asr asrEvent={null} onAsr={onAsr} onSend={vi.fn(() => true)} onStop={vi.fn()} />,
+    );
+    const ta = screen.getByLabelText("消息输入框") as HTMLTextAreaElement;
+    return { view, ta, onAsr };
+  }
+
+  /** flush start() 异步链（gum/addModule 立即 resolve，无真实 timer 参与）。 */
+  const flush = () => act(async () => {});
+
+  it("asr=true 点 🎤 录音（getUserMedia）→ 再点停止 → onAsr 上行（b64/durationMs）→「识别中」disabled", async () => {
+    injectRecorderEnv();
+    const { ta, onAsr } = mountAsr();
+    type(ta, "已输入");
+    fireEvent.click(screen.getByRole("button", { name: MIC }));
+    await flush();
+    expect(gum).toHaveBeenCalledTimes(1);
+    // 录音态：aria 切停止 + 呼吸点语义（aria-pressed）
+    const stopBtn = screen.getByRole("button", { name: STOP }) as HTMLButtonElement;
+    expect(stopBtn.getAttribute("aria-pressed")).toBe("true");
+    // 投 1600 采样（16k 下 100ms）→ 停止 → 编码上行
+    act(() => workletNodes[0].port.onmessage?.({ data: new Float32Array(1600).fill(0.1) }));
+    fireEvent.click(screen.getByRole("button", { name: STOP }));
+    expect(onAsr).toHaveBeenCalledTimes(1);
+    const [audioB64, durationMs] = onAsr.mock.calls[0];
+    expect(typeof audioB64).toBe("string");
+    expect((audioB64 as string).startsWith("UklGR")).toBe(true); // "RIFF" 的 b64 前缀
+    expect(durationMs).toBe(100);
+    // 「识别中」：disabled + aria 切换（emoji ⏳）
+    const busy = screen.getByRole("button", { name: BUSY }) as HTMLButtonElement;
+    expect(busy.disabled).toBe(true);
+  });
+
+  it("asr_result 回包（asrEvent result）→ 文本前置空格追加输入框 + 焦点回框 + 归位可再点；不自动发送", async () => {
+    injectRecorderEnv();
+    const onSend = vi.fn(() => true);
+    const view = render(
+      <Composer status="ready" asr asrEvent={null} onAsr={vi.fn(() => true)} onSend={onSend} onStop={vi.fn()} />,
+    );
+    const ta = screen.getByLabelText("消息输入框") as HTMLTextAreaElement;
+    type(ta, "已输入");
+    fireEvent.click(screen.getByRole("button", { name: MIC }));
+    await flush();
+    act(() => workletNodes[0].port.onmessage?.({ data: new Float32Array(1600).fill(0.1) }));
+    fireEvent.click(screen.getByRole("button", { name: STOP }));
+    expect(screen.getByRole("button", { name: BUSY })).toBeTruthy();
+    // 回包 → 追加（前置空格拼接）+ 归位
+    view.rerender(
+      <Composer
+        status="ready"
+        asr
+        asrEvent={{ kind: "result", text: "识别文本", durationMs: 100 }}
+        onAsr={vi.fn(() => true)}
+        onSend={onSend}
+        onStop={vi.fn()}
+      />,
+    );
+    expect(ta.value).toBe("已输入 识别文本");
+    expect(onSend).not.toHaveBeenCalled(); // 只填入框，绝不自动发送
+    expect(document.activeElement).toBe(ta); // 焦点回输入框
+    const mic = screen.getByRole("button", { name: MIC }) as HTMLButtonElement;
+    expect(mic.disabled).toBe(false);
+    expect(mic.getAttribute("aria-pressed")).toBe("false");
+  });
+
+  it("error 帧 asr_* code → 行内 alert 人话映射（asr_unconfigured 等；未知码兜底）", async () => {
+    vi.useFakeTimers();
+    try {
+      injectRecorderEnv();
+      const { view } = mountAsr();
+      fireEvent.click(screen.getByRole("button", { name: MIC }));
+      await flush();
+      act(() => workletNodes[0].port.onmessage?.({ data: new Float32Array(1600).fill(0.1) }));
+      fireEvent.click(screen.getByRole("button", { name: STOP }));
+      view.rerender(
+        <Composer
+          status="ready"
+          asr
+          asrEvent={{ kind: "error", code: "asr_unconfigured" }}
+          onAsr={vi.fn(() => true)}
+          onSend={vi.fn(() => true)}
+          onStop={vi.fn()}
+        />,
+      );
+      expect(screen.getByRole("alert").textContent).toBe("网关未启用语音转写");
+      expect(screen.getByRole("button", { name: MIC })).toBeTruthy(); // error 即归位
+      // 未列 code 兜底文案
+      view.rerender(
+        <Composer
+          status="ready"
+          asr
+          asrEvent={{ kind: "error", code: "asr_future" }}
+          onAsr={vi.fn(() => true)}
+          onSend={vi.fn(() => true)}
+          onStop={vi.fn()}
+        />,
+      );
+      expect(screen.getByRole("alert").textContent).toBe("语音转写出错，请重试");
+      // 4s 自动消退（复用既有 speechError 管道）
+      view.rerender(
+        <Composer
+          status="ready"
+          asr
+          asrEvent={{ kind: "error", code: "asr_failed" }}
+          onAsr={vi.fn(() => true)}
+          onSend={vi.fn(() => true)}
+          onStop={vi.fn()}
+        />,
+      );
+      expect(screen.getByRole("alert").textContent).toBe("语音转写失败，请重试");
+      act(() => {
+        vi.advanceTimersByTime(4000);
+      });
+      expect(screen.queryByRole("alert")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("60s 无回包超时：行内提示 + 归位可再点（旧网关无 asr_result 的收敛路径）", async () => {
+    vi.useFakeTimers();
+    try {
+      injectRecorderEnv();
+      mountAsr();
+      fireEvent.click(screen.getByRole("button", { name: MIC }));
+      await flush();
+      act(() => workletNodes[0].port.onmessage?.({ data: new Float32Array(1600).fill(0.1) }));
+      fireEvent.click(screen.getByRole("button", { name: STOP }));
+      expect(screen.getByRole("button", { name: BUSY })).toBeTruthy();
+      act(() => {
+        vi.advanceTimersByTime(60_000);
+      });
+      expect(screen.getByRole("alert").textContent).toBe("语音识别超时，请重试");
+      const mic = screen.getByRole("button", { name: MIC }) as HTMLButtonElement;
+      expect(mic.disabled).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("onAsr 返回 false（未发出）→ 行内提示 + 就地归位可再点", async () => {
+    injectRecorderEnv();
+    const onAsr = vi.fn(() => false);
+    mountAsr(onAsr);
+    fireEvent.click(screen.getByRole("button", { name: MIC }));
+    await flush();
+    act(() => workletNodes[0].port.onmessage?.({ data: new Float32Array(1600).fill(0.1) }));
+    fireEvent.click(screen.getByRole("button", { name: STOP }));
+    expect(onAsr).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("alert").textContent).toBe("语音识别请求发送失败，请重试");
+    expect(screen.getByRole("button", { name: MIC })).toBeTruthy();
+  });
+
+  it("asr=true 但环境无 getUserMedia（极旧浏览器）：点 🎤 行内错误反馈，不发起录音", () => {
+    // 注入 AudioContext 但不注入 mediaDevices（默认工厂探测缺席）
+    Object.defineProperty(window, "AudioContext", {
+      value: FakeAsrCtx,
+      configurable: true,
+      writable: true,
+    });
+    const onAsr = vi.fn(() => true);
+    render(
+      <Composer status="ready" asr asrEvent={null} onAsr={onAsr} onSend={vi.fn(() => true)} onStop={vi.fn()} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: MIC }));
+    expect(screen.getByRole("alert").textContent).toBe("录音失败，请重试");
+    expect(onAsr).not.toHaveBeenCalled();
+  });
+
+  it("快照无 asr：🎤 走 Web Speech 既有路径零变化（SpeechRecognition 发起，getUserMedia 不被调用）", () => {
+    injectRecorderEnv();
+    // 同时注入 Web Speech stub：asr 缺席时 🎤 应走它
+    class StubRecognition {
+      lang = "";
+      continuous = false;
+      interimResults = false;
+      onresult: unknown = null;
+      onerror: unknown = null;
+      onend: unknown = null;
+      start = vi.fn();
+      stop = vi.fn();
+      abort = vi.fn();
+    }
+    Object.defineProperty(window, "SpeechRecognition", {
+      value: StubRecognition,
+      configurable: true,
+      writable: true,
+    });
+    try {
+      mount();
+      fireEvent.click(screen.getByRole("button", { name: MIC }));
+      expect(gum).not.toHaveBeenCalled(); // 录音管道未被触达
+      // Web Speech 实例已发起（stub 构造即持引用——经全局 instances 不可得，
+      // 这里以 🎤 切换到「停止语音输入」aria 断言 listening 态）
+      expect(screen.getByRole("button", { name: "停止语音输入" })).toBeTruthy();
+    } finally {
+      delete (window as { SpeechRecognition?: unknown }).SpeechRecognition;
+    }
+  });
+});

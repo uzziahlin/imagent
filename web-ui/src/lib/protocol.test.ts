@@ -2100,3 +2100,87 @@ describe("v1.37 approval_request timeoutSecs", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// v1.40 语音转写 whisper 主路径：asr_result 回包（校验 + reducer 防御）与
+// workspaces 快照 asr 能力通告
+// ---------------------------------------------------------------------------
+
+describe("asr_result（v1.40 语音转写回包）", () => {
+  it("parseFrame 合法帧：text/durationMs/machine 齐备放行；machine 缺席（单机）放行；durationMs 小数宽容", () => {
+    expect(
+      parseFrame(
+        '{"v":1,"type":"asr_result","text":"识别文本","durationMs":1234,"machine":"home-mac"}',
+      ),
+    ).toMatchObject({ type: "asr_result", text: "识别文本", durationMs: 1234, machine: "home-mac" });
+    expect(parseFrame('{"v":1,"type":"asr_result","text":"","durationMs":0}')).toMatchObject({
+      type: "asr_result",
+      durationMs: 0,
+    });
+    // durationMs 非整数宽容（重采样边界可产生小数毫秒）
+    expect(parseFrame('{"v":1,"type":"asr_result","text":"x","durationMs":12.5}')).toBeTruthy();
+  });
+
+  it("parseFrame 反例：text 缺失/非串、durationMs 缺失/非数/负数/非有限、machine 非串 → 拒帧", () => {
+    const bads = [
+      '{"v":1,"type":"asr_result","durationMs":1}',
+      '{"v":1,"type":"asr_result","text":3,"durationMs":1}',
+      '{"v":1,"type":"asr_result","text":"x"}',
+      '{"v":1,"type":"asr_result","text":"x","durationMs":"1"}',
+      '{"v":1,"type":"asr_result","text":"x","durationMs":-1}',
+      '{"v":1,"type":"asr_result","text":"x","durationMs":1e999}',
+      '{"v":1,"type":"asr_result","text":"x","durationMs":1,"machine":7}',
+    ];
+    for (const bad of bads) {
+      expect(parseFrame(bad)).toBeNull();
+    }
+  });
+
+  it("reducer 防御：asr_result 不进消息流（不落 entries/概要）——ws 连接层拦截路径的上游漏拦兜底", () => {
+    const base = initialState();
+    const s = run(base, {
+      type: "frame",
+      frame: frame('{"v":1,"type":"asr_result","text":"迟到回包","durationMs":100}'),
+    });
+    expect(convsOf(s)[DEFAULT_CONV].entries).toHaveLength(0);
+    expect(s).toBe(base); // 静默忽略（state 原样）
+  });
+
+  it("encodeFrame：asr_request 出站字段形状（契约字段名不得偏离；单机模式不带 machine）", () => {
+    const wire = JSON.parse(
+      encodeFrame({ v: 1, type: "asr_request", audio: "QUJD", mime: "audio/wav", durationMs: 1234 }),
+    ) as Record<string, unknown>;
+    expect(wire).toMatchObject({
+      v: 1,
+      type: "asr_request",
+      audio: "QUJD",
+      mime: "audio/wav",
+      durationMs: 1234,
+    });
+    expect(wire).not.toHaveProperty("machine");
+  });
+});
+
+describe("workspaces.asr（v1.40 语音转写能力通告）", () => {
+  const SNAP = (extra = "") =>
+    `{"v":1,"type":"workspaces","default":"/d","workspaces":[],"convs":{}${extra}}`;
+
+  it("parseFrame：asr true/false 合法、缺席放行（旧网关同义 false）；非 boolean 拒帧", () => {
+    expect(parseFrame(SNAP(',"asr":true,"machine":"home-mac"'))).toMatchObject({ asr: true });
+    expect(parseFrame(SNAP(',"asr":false'))).toMatchObject({ asr: false });
+    expect(parseFrame(SNAP())).not.toHaveProperty("asr");
+    expect(parseFrame(SNAP(',"asr":1'))).toBeNull();
+    expect(parseFrame(SNAP(',"asr":"true"'))).toBeNull();
+    expect(parseFrame(SNAP(',"asr":null'))).toBeNull();
+  });
+
+  it("reducer：asr 随快照落表（true = whisper 可用）；下一条无 asr 的快照清除（整体覆盖语义）", () => {
+    let s = run(initialState(), {
+      type: "frame",
+      frame: frame(SNAP(',"asr":true,"machine":"home-mac"')),
+    });
+    expect(s.workspaces["home-mac"]?.asr).toBe(true);
+    s = run(s, { type: "frame", frame: frame(SNAP(',"machine":"home-mac"')) });
+    expect(s.workspaces["home-mac"]?.asr).toBeUndefined();
+  });
+});

@@ -1309,3 +1309,108 @@ describe("WsManager 前台探活（visibilitychange）", () => {
     expect(h2.statuses.at(-1)).not.toBe("connecting");
   });
 });
+
+// ---------------------------------------------------------------------------
+// v1.40 语音转写 whisper 主路径：sendAsrRequest 发送器 + asr_result 连接层
+// 拦截路由（onAsrResult 上抛，不进 onFrame/消息流）+ 注入面同规
+// ---------------------------------------------------------------------------
+
+describe("WsManager 语音转写（v1.40）", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it("sendAsrRequest：ready 前返回 false；ready 后字节精确（mime 恒 audio/wav，machine 缺省不带字段）", () => {
+    const h = makeManager();
+    h.mgr.connect();
+    expect(h.mgr.sendAsrRequest("QUJD", 100)).toBe(false);
+    const sock = readyFlow(h);
+    expect(h.mgr.sendAsrRequest("QUJD", 100)).toBe(true);
+    expect(sock.sent.at(-1)).toBe(
+      '{"v":1,"type":"asr_request","audio":"QUJD","mime":"audio/wav","durationMs":100}',
+    );
+    expect(h.mgr.sendAsrRequest("QUJD", 100, "home-mac")).toBe(true);
+    expect(sock.sent.at(-1)).toBe(
+      '{"v":1,"type":"asr_request","audio":"QUJD","mime":"audio/wav","durationMs":100,"machine":"home-mac"}',
+    );
+  });
+
+  it("入站 asr_result：连接层拦截经 onAsrResult 上抛，不进 onFrame（不进消息流）", () => {
+    const results: Array<{ text: string; durationMs: number }> = [];
+    const frames: InboundFrame[] = [];
+    const statuses: string[] = [];
+    const mgr = new WsManager({
+      url: "wss://example.test/imagent/ws",
+      token: "tok-1",
+      onFrame: (f) => frames.push(f),
+      onStatus: (s) => statuses.push(s),
+      onAuthFailed: () => {},
+      onAsrResult: (f) => results.push({ text: f.text, durationMs: f.durationMs }),
+      wsFactory: (u) => new FakeWebSocket(u),
+    });
+    mgr.connect();
+    const sock = readyFlow({ mgr, statuses });
+    sock.serverSend(
+      '{"v":1,"type":"asr_result","text":"识别文本","durationMs":1234,"machine":"home-mac"}',
+    );
+    expect(results).toEqual([{ text: "识别文本", durationMs: 1234 }]);
+    expect(frames).toHaveLength(0); // 连接层已拦截，不进消息流
+  });
+
+  it("asr_result 畸形帧（parseFrame 拒）静默丢弃：onAsrResult 不触发", () => {
+    const results: unknown[] = [];
+    const statuses: string[] = [];
+    const mgr = new WsManager({
+      url: "wss://example.test/imagent/ws",
+      token: "tok-1",
+      onFrame: () => {},
+      onStatus: (s) => statuses.push(s),
+      onAuthFailed: () => {},
+      onAsrResult: (f) => results.push(f),
+      wsFactory: (u) => new FakeWebSocket(u),
+    });
+    mgr.connect();
+    const sock = readyFlow({ mgr, statuses });
+    sock.serverSend('{"v":1,"type":"asr_result","text":"x"}'); // 缺 durationMs
+    sock.serverSend('{"v":1,"type":"asr_result","text":"x","durationMs":-1}');
+    expect(results).toHaveLength(0);
+  });
+
+  it("active 机器的明文 asr_result 属注入面：丢弃（onAsrResult 不触发）+ 降级告警（与 text/card 族同规）", () => {
+    const gkPriv = x25519.utils.randomSecretKey();
+    const gk = bytesToHex(x25519.getPublicKey(gkPriv));
+    const idPriv = ed25519.utils.randomSecretKey();
+    const ik = bytesToHex(ed25519.getPublicKey(idPriv));
+    const events: E2eEvent[] = [];
+    const statuses: string[] = [];
+    const asrResults: unknown[] = [];
+    const mgr = new WsManager({
+      url: "wss://example.test/imagent/ws",
+      token: "tok-1",
+      onFrame: () => {},
+      onStatus: (s) => statuses.push(s),
+      onAuthFailed: () => {},
+      onE2e: (e) => events.push(e),
+      onAsrResult: (f) => asrResults.push(f),
+      wsFactory: (u) => new FakeWebSocket(u),
+      getMachine: () => "home-mac",
+    });
+    mgr.connect();
+    const sock = readyFlow({ mgr, statuses });
+    sock.serverSend(JSON.stringify({ v: 1, type: "machines", online: ["home-mac"] }));
+    const hello = JSON.parse(sock.sentOfType("e2e_hello")[0]) as { ek: string; n1: string };
+    // ack（TOFU）→ 确认 → active
+    const n2 = bytesToHex(randomBytes(32));
+    const sig = bytesToHex(ed25519.sign(signatureMessage(hello.ek, gk, hello.n1, n2), idPriv));
+    sock.serverSend(
+      JSON.stringify({ v: 1, type: "e2e_ack", machine: "home-mac", gk, n2, sig, ik }),
+    );
+    mgr.resolveTofu("home-mac", true);
+    expect(events).toContainEqual({ kind: "active", machine: "home-mac" });
+    sock.serverSend(
+      '{"v":1,"type":"asr_result","text":"注入","durationMs":1,"machine":"home-mac"}',
+    );
+    expect(asrResults).toHaveLength(0); // 明文回包丢弃（网关回包恒 E2E 加密）
+    expect(events).toContainEqual({ kind: "downgrade", machine: "home-mac" });
+  });
+});

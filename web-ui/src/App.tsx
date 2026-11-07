@@ -11,6 +11,7 @@ import {
   type Action,
   type ApprovalDecision,
   type AppState,
+  type AsrUiEvent,
   type ConvState,
   type DeviceInfo,
   type MachineNotice,
@@ -115,6 +116,12 @@ const ERROR_HINTS: Record<string, string> = {
   // v1.7 媒体上行（契约 A 段原文文案；经既有 lastError toast 链路可达）
   media_too_large: "图片超过 8MB 上限",
   media_invalid: "图片无效（解码或保存失败）",
+  // v1.40 语音转写（whisper 主路径；文案与 Composer 行内 ASR_ERROR_TEXT 同款
+  // ——toast 全局兜底 + 行内贴近操作位置双显示）
+  asr_unconfigured: "网关未启用语音转写",
+  asr_failed: "语音转写失败，请重试",
+  asr_too_large: "录音超过大小上限，请缩短后重试",
+  asr_invalid: "录音数据无效，请重试",
   // v1.5 管理面错误（machine_invalid 带 message 时 toast 只显 code，详情在
   // 管理面板场景由 adminError/表单提示承担）
   machine_invalid: "机器名或公钥无效，或名称已存在",
@@ -342,6 +349,12 @@ export default function App() {
     tone: "info" | "error";
     onClick?: () => void;
   } | null>(null);
+  // v1.40 语音转写 UI 事件（asr_result 回包 / error 帧 asr_* code → AsrUiEvent
+  // 归一）：asr_result 由 ws 连接层拦截后经 onAsrResult 回调直达（不进消息流，
+  // 不落 entries——reducer 只防御性忽略）；asr_* error 在 onFrame 旁路转发
+  // （error 帧本体照常进 reducer 走 lastError 全局 toast）。两者转发 Composer
+  // （文本回填输入框 / 行内 alert），每次事件新对象引用变化驱动其 effect。
+  const [asrEvent, setAsrEvent] = useState<AsrUiEvent | null>(null);
 
   /** 挂载恢复：loadAll → spaces 预填（initialState 之后、WS 帧之前；异步竞态
    *  时恢复条目垫在已到帧之前，见 restoreHistory）。加载完成前渲染空态
@@ -567,7 +580,17 @@ export default function App() {
           );
           setHistoryVersion((v) => v + 1);
         }
+        // v1.40 asr_* error 旁路通知 Composer（行内 alert；error 帧本体照常
+        // 进 reducer——lastError 全局 toast 管道不变，双显示）
+        if (frame.type === "error" && frame.code.startsWith("asr_")) {
+          setAsrEvent({ kind: "error", code: frame.code });
+        }
         dispatch({ type: "frame", frame });
+      },
+      // v1.40 语音转写回包（ws 连接层已拦截 asr_result，不进 onFrame/消息流）
+      // → Composer 回填输入框；旧网关无此帧（Composer 60s 无回包超时兜底）。
+      onAsrResult: (frame) => {
+        setAsrEvent({ kind: "result", text: frame.text, durationMs: frame.durationMs });
       },
       onStatus: setStatus,
       onAuthFailed: authFailed,
@@ -1461,6 +1484,11 @@ export default function App() {
           status={status}
           e2eBlocked={e2eBlocked}
           models={wsSnapshot?.models}
+          asr={wsSnapshot?.asr === true}
+          asrEvent={asrEvent}
+          onAsr={(audioB64, durationMs) =>
+            wsRef.current?.sendAsrRequest(audioB64, durationMs, outMachine()) ?? false
+          }
           onSend={sendMessage}
           onStop={() => {
             wsRef.current?.sendControl("stop", undefined, outMachine());

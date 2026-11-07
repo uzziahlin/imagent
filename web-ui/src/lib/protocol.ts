@@ -68,6 +68,16 @@
 //   通知场景，条目照旧渲染）。card/card_patch 帧校验：diff 缺席放行，存在
 //   须为 string（超长容忍——渲染层截断 400 行，校验不拒）；history 深层
 //   校验沿用宽松策略（整帧快照不因深层字段丢弃），渲染层对非 string 防御。
+// - v1.40 语音转写 whisper 主路径（网关批并行，字段名契约不得偏离）：出站
+//   asr_request{audio:<b64>, mime:"audio/wav", durationMs}（SPA Web Audio 录
+//   16k/mono/16bit WAV 纯前端编码，解码后 ≤8MB、录音上限 60s 截停）；入站
+//   asr_result{text, durationMs}——它是 Composer UI 服务的回包，**不进消息
+//   流**（不落 entries）：ws 连接层拦截后经 onAsrResult 回调直达 App→Composer
+//   （同 pairing_pending 的非消息帧模式），reducer 侧仅防御性忽略（上游漏拦
+//   时静默丢弃）。失败复用既有 error 帧 code：asr_unconfigured/asr_failed/
+//   asr_too_large/asr_invalid（走 lastError 既有管道）。能力通告：workspaces
+//   快照新增可选 asr: boolean（缺席=false=旧网关/未配置 → 🎤 走 Web Speech
+//   既有路径）。
 
 export const PROTOCOL_VERSION = 1;
 
@@ -423,6 +433,25 @@ export type HistoryQueryFrame = {
 };
 
 // ---------------------------------------------------------------------------
+// v1.40 语音转写 whisper 主路径（浏览器 → 网关，E2E 业务帧；契约见头注）
+// ---------------------------------------------------------------------------
+
+/** v1.40 录音上行（字段名与网关契约逐字一致，不得偏离）：audio = 16kHz 单声
+ *  道 16-bit PCM WAV 的 base64（SPA 纯前端编码，不走 MediaRecorder——免网关
+ *  侧解码依赖；解码后 ≤8MB，录音上限 60s 截停，60s@16k16bit ≈ 1.92MB 恒在
+ *  限内）；mime 恒 "audio/wav"；durationMs = 实际录音时长（毫秒）。machine
+ *  同 message 族路由约定（业务帧，经 e2e outbound 判定包装）。网关回
+ *  asr_result（新网关）或 error{asr_*}。 */
+export type AsrRequestFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "asr_request";
+  audio: string;
+  mime: "audio/wav";
+  durationMs: number;
+  machine?: string;
+};
+
+// ---------------------------------------------------------------------------
 // v1.4 E2E 中继盲化（密码学构造与编码规约见 lib/e2e.ts 头注）
 // ---------------------------------------------------------------------------
 
@@ -471,7 +500,8 @@ export type OutboundFrame =
   | WorkspaceSaveFrame
   | WorkspaceRemoveFrame
   | ConvWorkdirSetFrame
-  | HistoryQueryFrame;
+  | HistoryQueryFrame
+  | AsrRequestFrame;
 
 /** 出站帧序列化（undefined 字段不序列化，与网关入站解析兼容）。 */
 export function encodeFrame(frame: OutboundFrame): string {
@@ -664,7 +694,8 @@ export type BackendsInfo = { current: string; options: string[] };
  *  = 来源机器（旧网关缺席 → 归 DEFAULT_MACHINE）。v1.7 起可选携带 sessions
  *  （该机器持久化的历史会话列表，按 updatedAt 降序；旧网关缺席 → 不合并）；
  *  v1.8 起可选携带 models（/model 菜单数据，旧网关缺席 → SPA 内置兜底）；
- *  v1.36 起可选携带 backends（新会话引擎选择，畸形整段丢弃按缺席）。 */
+ *  v1.36 起可选携带 backends（新会话引擎选择，畸形整段丢弃按缺席）；
+ *  v1.40 起可选携带 asr（语音转写能力通告，缺席/false = 旧网关或未配置）。 */
 export type WorkspacesFrame = {
   v: typeof PROTOCOL_VERSION;
   type: "workspaces";
@@ -675,6 +706,7 @@ export type WorkspacesFrame = {
   sessions?: SessionSummary[];
   models?: ModelsInfo;
   backends?: BackendsInfo;
+  asr?: boolean;
 };
 
 /** v1.6 会话工作目录增量（conv_workdir_set 成功后随 workspaces 快照一起回）。 */
@@ -711,6 +743,31 @@ export type HistoryFrame = {
   trimmed: boolean;
   machine?: string;
 };
+
+// ---------------------------------------------------------------------------
+// v1.40 语音转写（网关 → 浏览器，E2E 业务帧，经 enc 解密后由 ws 连接层拦截）
+// ---------------------------------------------------------------------------
+
+/** v1.40 转写回包（字段名与网关契约逐字一致）：text = whisper 转写文本；
+ *  durationMs = 音频时长（毫秒，回显用，网关批并行实现——旧网关无此帧，SPA
+ *  按无响应超时处理）。**不进消息流**：ws 连接层在 onFrame 分发前拦截，经
+ *  onAsrResult 回调直达 App → Composer（回填输入框）；reducer 侧仅防御性
+ *  忽略（见 reduceFrame case 注释）。machine 同族（注入面判定取它）。 */
+export type AsrResultFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "asr_result";
+  text: string;
+  durationMs: number;
+  machine?: string;
+};
+
+/** v1.40 App → Composer 的语音转写 UI 事件（回包与 error 归一为一个事件
+ *  流，prop 引用变化驱动 Composer effect）：result = asr_result 回包（文本
+ *  追加输入框）；error = error 帧 asr_* code（行内 alert 人话映射）。每次
+ *  事件构造新对象（同文本的连续回包也保证触发）。 */
+export type AsrUiEvent =
+  | { kind: "result"; text: string; durationMs: number }
+  | { kind: "error"; code: string };
 
 /** v1.4 握手第二步（网关 → 浏览器，经 relay 明文透传）：gk = 网关 X25519
  *  公钥（32B hex），n2 = 网关随机数（32B hex），sig = 网关 ed25519 对
@@ -750,7 +807,8 @@ export type InboundFrame =
   | PairingPendingFrame
   | WorkspacesFrame
   | ConvWorkdirFrame
-  | HistoryFrame;
+  | HistoryFrame
+  | AsrResultFrame;
 
 // ---------------------------------------------------------------------------
 // parseFrame：v/type 校验 + 每类帧关键字段存在性校验，非法返回 null（不抛）
@@ -775,6 +833,16 @@ const atOk = (o: Record<string, unknown>): boolean =>
 const timeoutSecsOk = (o: Record<string, unknown>): boolean =>
   o.timeoutSecs === undefined ||
   (typeof o.timeoutSecs === "number" && Number.isFinite(o.timeoutSecs) && o.timeoutSecs > 0);
+
+/** v1.40 asr_result 必带 durationMs（音频时长毫秒）：须为有限非负数（契约
+ *  number≥0；非整数宽容——重采样边界可产生小数毫秒）。 */
+const durationMsOk = (v: unknown): boolean =>
+  typeof v === "number" && Number.isFinite(v) && v >= 0;
+
+/** v1.40 workspaces 快照可选 asr（语音转写能力通告）：缺席放行（旧网关/
+ *  未配置同义 false）；存在须为 boolean。 */
+const asrOk = (o: Record<string, unknown>): boolean =>
+  o.asr === undefined || typeof o.asr === "boolean";
 
 /** v1.39 执行链条目可选 diff（ToolCallPayload.diff）：缺席放行（旧网关/仅
  *  通知场景）；存在须为 string（超长容忍——渲染层截断 400 行，校验不拒）。
@@ -994,7 +1062,7 @@ const INBOUND_CHECKS: Record<string, FieldCheck> = {
   // v1.6 工作空间帧：逐字段形状校验（machine 可选——旧网关缺席归 DEFAULT_MACHINE）；
   // v1.7 sessions 可选段 / v1.8 models 可选段：出现即须为全合法元素；
   // v1.36 backends 可选段不在此校验——纯 UI 段畸形整段丢弃按缺席（不拒帧），
-  // 净化在 reducer 落表处（backendsOk）
+  // 净化在 reducer 落表处（backendsOk）；v1.40 asr 可选（缺席放行，存在须 boolean）
   workspaces: (o) =>
     isStr(o, "default") &&
     Array.isArray(o.workspaces) &&
@@ -1002,6 +1070,7 @@ const INBOUND_CHECKS: Record<string, FieldCheck> = {
     convDirsOk(o.convs) &&
     (o.sessions === undefined || (Array.isArray(o.sessions) && o.sessions.every(sessionSummaryOk))) &&
     (o.models === undefined || modelsOk(o.models)) &&
+    asrOk(o) &&
     machineOk(o),
   conv_workdir: (o) => isStr(o, "convId") && isStr(o, "workdir") && machineOk(o),
   // v1.8 会话历史重放：entries 逐元素形状 + lastSeq 非负整数 + trimmed 布尔
@@ -1015,6 +1084,10 @@ const INBOUND_CHECKS: Record<string, FieldCheck> = {
     o.lastSeq >= 0 &&
     typeof o.trimmed === "boolean" &&
     machineOk(o),
+  // v1.40 语音转写回包：text 必 string、durationMs 必有限非负数（machine 同族
+  // 可选）。校验在此放行的帧由 ws 连接层拦截消费（onAsrResult），不进 reducer
+  // 消息流——见 reduceFrame case "asr_result"。
+  asr_result: (o) => isStr(o, "text") && durationMsOk(o.durationMs) && machineOk(o),
 };
 
 /** 解析一条入站文本帧：信封 v=1 + 已知 type + 关键字段齐备才放行，否则 null。 */
@@ -1182,6 +1255,9 @@ export type MachineWorkspaces = {
   /** v1.36 新会话引擎选择（backends 段落表；undefined = 网关未下发或段畸形
    *  已按缺席丢弃——弹窗引擎行不渲染）。 */
   backends?: BackendsInfo;
+  /** v1.40 语音转写能力通告（快照 asr 字段落表；true = 网关 whisper 可用，
+   *  缺席/false = 旧网关或未配置——Composer 🎤 回退 Web Speech 既有路径）。 */
+  asr?: boolean;
 };
 
 export function initialState(): AppState {
@@ -1768,6 +1844,8 @@ function reduceFrame(state: AppState, frame: InboundFrame): AppState {
       // 网关撤下 CLI 映射/配空 official 后下一条快照自然回落内置 chips）。
       // v1.36：可选 backends 段形状合法才采纳，畸形整段丢弃按缺席（纯 UI
       // 段不拒帧——引擎行降级不渲染，其余快照段不受牵连）。
+      // v1.40：可选 asr 能力通告随快照整体覆盖（缺席即清除——网关撤下转写
+      // 配置后下一条快照自然把 🎤 降回 Web Speech 老路）。
       const machine = frameMachine(frame);
       const spaces = frame.sessions
         ? mergePersistedSessions(state, machine, frame.sessions)
@@ -1783,6 +1861,7 @@ function reduceFrame(state: AppState, frame: InboundFrame): AppState {
             convs: frame.convs,
             models: frame.models,
             backends: backendsOk(frame.backends) ? frame.backends : undefined,
+            asr: frame.asr,
           },
         },
       };
@@ -1793,6 +1872,12 @@ function reduceFrame(state: AppState, frame: InboundFrame): AppState {
     case "history":
       // v1.8 会话历史重放：重放条目合并不走消息流（不计未读），见 mergeHistory
       return mergeHistory(state, frame);
+    case "asr_result":
+      // v1.40 转写回包是 Composer UI 服务的回包，**不进消息流**：ws 连接层
+      // 在 onFrame 分发前已拦截（经 onAsrResult 回调直达 App → Composer，同
+      // pairing_pending 的非消息帧模式）。reducer 收到即说明上游漏拦，静默
+      // 忽略（不落 entries、不派生概要/未读）。
+      return state;
   }
 }
 

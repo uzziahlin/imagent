@@ -41,6 +41,11 @@
 // 业务帧（E2E 加密），按本地高水位增量拉取网关出站日志；入站 history 帧（enc
 // 内帧 / 旧网关明文）经 onFrame 二次分发——active 机器的明文 history 同属
 // 注入面，与 text/card 族同规丢弃 + 降级告警。
+// v1.40 语音转写 whisper 主路径：sendAsrRequest(audioB64, durationMs, machine)
+// 出站 asr_request 业务帧（E2E 加密，同 message 族路由）；入站 asr_result 为
+// Composer UI 服务的回包，**不进消息流**——连接层在 onFrame 分发前拦截（同
+// pairing_pending 的非消息帧模式），经 onAsrResult 回调直达 App → Composer；
+// active 机器的明文 asr_result 同属注入面，与 text/card 族同规丢弃 + 降级告警。
 
 import {
   DEFAULT_MACHINE,
@@ -48,6 +53,7 @@ import {
   normalizeExpiryMs,
   parseFrame,
   type ApprovalDecision,
+  type AsrResultFrame,
   type EncFrame,
   type E2eAckFrame,
   type HelloAckFrame,
@@ -104,6 +110,9 @@ export interface WsManagerOptions {
   /** v1.4 E2E 事件上抛（TOFU 确认请求 / 身份变化告警 / 不支持加密 / 明文
    *  放行）。旧 relay 单机模式（无 machines 帧）恒不触发。 */
   onE2e?: (ev: E2eEvent) => void;
+  /** v1.40 语音转写回包（asr_result 帧，连接层已拦截——不进 onFrame/消息
+   *  流）。App 层转发给 Composer 回填输入框；旧网关无此帧（按无响应超时）。 */
+  onAsrResult?: (frame: AsrResultFrame) => void;
   /** 注入 WebSocket 构造（单测用 fake）；缺省浏览器原生。 */
   wsFactory?: (url: string) => WebSocketLike;
   /** 当前出站机器（v1.1）：内部自动帧（ready 后首帧 sync / 心跳 ping）发送时
@@ -217,6 +226,7 @@ export class WsManager {
   private readonly onSession: ((session: SessionInfo) => void) | undefined;
   private readonly onPairingPending: ((code: string) => void) | undefined;
   private readonly onE2e: ((ev: E2eEvent) => void) | undefined;
+  private readonly onAsrResult: ((frame: AsrResultFrame) => void) | undefined;
   private readonly wsFactory: (url: string) => WebSocketLike;
   private readonly getMachine: (() => string | undefined) | undefined;
   private readonly helloTimeoutMs: number;
@@ -257,6 +267,7 @@ export class WsManager {
     this.onSession = opts.onSession;
     this.onPairingPending = opts.onPairingPending;
     this.onE2e = opts.onE2e;
+    this.onAsrResult = opts.onAsrResult;
     this.wsFactory = opts.wsFactory ?? ((u) => new WebSocket(u) as unknown as WebSocketLike);
     this.getMachine = opts.getMachine;
     this.helloTimeoutMs = opts.helloTimeoutMs ?? 10_000;
@@ -361,6 +372,17 @@ export class WsManager {
    *  （重放条目经 reducer 合并，高水位由 App 层维护）。 */
   queryHistory(convId: string, since: number, machine?: string): boolean {
     return this.send({ v: 1, type: "history_query", convId, since, machine });
+  }
+
+  // ---- v1.40 语音转写（网关消费的业务帧；同 message 族路由约定，经 e2e
+  //      outbound 判定包装；回包 asr_result 由连接层 onAsrResult 上抛）----
+
+  /** 录音上行（网关 whisper 转写）：audio = 16kHz 单声道 16-bit WAV 的
+   *  base64（SPA 纯前端编码，解码后 ≤8MB / 录音上限 60s 截停）；durationMs =
+   *  实际录音时长。网关回 asr_result（新网关）或 error{asr_*}；旧网关无此
+   *  帧——调用方按无响应超时处理。 */
+  sendAsrRequest(audio: string, durationMs: number, machine?: string): boolean {
+    return this.send({ v: 1, type: "asr_request", audio, mime: "audio/wav", durationMs, machine });
   }
 
   /** v1.2 拉取已登录设备列表（设备面板打开时；仅会话模式对新 relay 使用）。 */
@@ -527,6 +549,18 @@ export class WsManager {
     // v1.4：握手应答由 e2e 协调器消费（不进 onFrame）
     if (frame.type === "e2e_ack") {
       this.e2e.onAck(frame as E2eAckFrame);
+      return;
+    }
+    // v1.40：语音转写回包是 Composer UI 服务的回包，不进消息流（不落
+    // entries/概要/未读）——连接层直接回调消费（同 pairing_pending 的非消息
+    // 帧模式）；active 机器的明文 asr_result 同属注入面（网关回包恒 E2E 加
+    // 密），与 text/card 族同规丢弃 + 降级告警。
+    if (frame.type === "asr_result") {
+      if (!this.e2e.acceptPlaintextBusiness(frame.machine ?? DEFAULT_MACHINE)) {
+        this.e2e.notePlaintextDowngrade(frame.machine ?? DEFAULT_MACHINE);
+        return;
+      }
+      this.onAsrResult?.(frame as AsrResultFrame);
       return;
     }
     // v1.4：enc 帧 → 解密后二次分发为原帧，走既有处理路径
