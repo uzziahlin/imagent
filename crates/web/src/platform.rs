@@ -27,6 +27,13 @@
 //!   不阻塞热路径；同 messageId 终态只落一次；流式中间帧 / sync 重发不落）；
 //!   history_query 动作查 `list_outbound_since` 回 history 帧（增量重放，
 //!   浏览器按本地高水位拉取）。
+//! - ASR 泵（v1.40 语音转写 whisper 方案网关侧）：消费 asr_request 动作——
+//!   b64 解码（坏 → asr_invalid；解码后 >8MB 复用 media 上限 →
+//!   asr_too_large）→ 写 `<imagent_home>/tmp/asr-<unix_ms>.wav` 临时文件 →
+//!   spawn `whisper-cli`（30s 超时 kill，逐次拉起用完即退不常驻）→ stdout
+//!   多行合并单行空格拼接 → 回 asr_result 帧（空文本也算成功）；失败回
+//!   error 帧（asr_unconfigured / asr_failed）。泵单消费者逐条 await 天然
+//!   串行（单用户语音，重入排队即可），临时文件 finally 删除。
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -52,11 +59,11 @@ use crate::e2e::E2eIdentity;
 use crate::models::{resolve_models, CliSource, ModelsContext};
 use crate::titles::{TitleCandidate, TitleGen};
 use crate::{
-    encode_approval_request_frame, encode_approval_resolved_frame, encode_card_frame,
-    encode_conv_workdir_frame, encode_error_frame, encode_history_frame, encode_text_frame,
-    encode_workspaces_frame, history_entry_from_row, push_notify_title, session_title, CardPayload,
-    GatewayCredential, InboundAction, PushEvent, PushNotifyKind, SessionEntryFrame,
-    WorkspaceEntryFrame, TARGET,
+    encode_approval_request_frame, encode_approval_resolved_frame, encode_asr_result_frame,
+    encode_card_frame, encode_conv_workdir_frame, encode_error_frame, encode_history_frame,
+    encode_text_frame, encode_workspaces_frame, history_entry_from_row, push_notify_title,
+    session_title, CardPayload, GatewayCredential, InboundAction, PushEvent, PushNotifyKind,
+    SessionEntryFrame, WorkspaceEntryFrame, TARGET,
 };
 
 const PLATFORM: &str = "web";
@@ -104,6 +111,43 @@ const PUSH_CHANNEL_CAPACITY: usize = 8;
 /// 内存无界增长。契约允许同 messageId 重复行（SPA 幂等替换），超限清空
 /// 整 conv 集合最坏多落一行，无正确性影响。
 const LOGGED_CARDS_PER_CONV: usize = 100;
+/// v1.40 ASR 动作 channel 容量：单用户语音、泵串行消费（一条 30s 封顶），
+/// 4 足以吸收重入排队（连发第 5 条起排队失败）；打满由 client 侧 1s 有界
+/// 背压丢弃（SPA 无回执感知 + 重录重发兜底）。
+const ASR_CHANNEL_CAPACITY: usize = 4;
+/// v1.40 ASR：whisper-cli 单次转写超时（秒）。medium 模型 60s 音频常温秒级
+/// ~数十秒；30s 封顶防呆（模型卡死/磁盘慢）——超时 kill 进程回 asr_failed。
+const ASR_TIMEOUT: Duration = Duration::from_secs(30);
+/// v1.40 ASR 错误帧 code（帧契约定案字面量）：转写失败/超时/二进制不存在。
+const ASR_FAILED_CODE: &str = "asr_failed";
+/// v1.40 ASR 错误帧 code：解码后 >8MB（复用 media 上限）。
+const ASR_TOO_LARGE_CODE: &str = "asr_too_large";
+/// v1.40 ASR 错误帧 code：base64 畸形。
+const ASR_INVALID_CODE: &str = "asr_invalid";
+/// v1.40 ASR 错误帧 code：whisper_bin / whisper_model 任一未配置。
+const ASR_UNCONFIGURED_CODE: &str = "asr_unconfigured";
+
+/// v1.40 语音转写上下文（main 装配处注入——config `whisper_bin` /
+/// `whisper_model` 原样透传）。两者皆 Some 才启用 ASR（快照 `asr` 能力位
+/// 与泵 spawn 同以此为准；未配置时泵回 asr_unconfigured，不出进程）。构造
+/// 型参参照 `ModelsContext` 先例（main 组装、WebPlatform 透传给泵）。
+#[derive(Debug, Clone, Default)]
+pub struct AsrContext {
+    /// whisper-cli 可执行文件路径（如 `/opt/homebrew/bin/whisper-cli` 或
+    /// PATH 里的 `whisper-cli`）。
+    pub bin: Option<String>,
+    /// whisper ggml 模型文件路径（如 `~/.imagent/models/ggml-medium.bin`）。
+    pub model: Option<String>,
+}
+
+impl AsrContext {
+    /// 是否已配置齐（bin 与 model 皆有非空白值——配置层不校验路径，空白串
+    /// 视为未配置，与「缺省 None 不启用」同语义）。
+    pub fn enabled(&self) -> bool {
+        self.bin.as_deref().is_some_and(|s| !s.trim().is_empty())
+            && self.model.as_deref().is_some_and(|s| !s.trim().is_empty())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // 卡片缓存（D6 sync 重发）
@@ -230,8 +274,10 @@ async fn serve_sync_requests(
 /// v1.36 引擎名单（default + extras 保序去重，main 装配处注入的纯字符串
 /// 表——快照 backends 段直传，无解析链）。`titles` 为 v1.9
 /// 语义标题生成器（快照组装懒触发的共享防重复集，见 [`crate::titles`]）。
-/// 平台 Drop 时经 shutdown token 连动退出。
-#[allow(clippy::too_many_arguments)] // 参数已达 9——v1.36 注入 backends（先例 new_with_e2e）
+/// `asr_enabled` 为 v1.40 语音转写能力位（[`AsrContext::enabled`]——快照
+/// `asr` 段数据源，main 装配处注入的纯 bool，无解析链）。平台 Drop 时经
+/// shutdown token 连动退出。
+#[allow(clippy::too_many_arguments)] // 参数已达 10——v1.40 注入 asr_enabled（先例 new_with_e2e）
 async fn serve_workspace_actions(
     mut workspace_rx: mpsc::Receiver<InboundAction>,
     machine_id: String,
@@ -240,6 +286,7 @@ async fn serve_workspace_actions(
     models: ModelsContext,
     backends: Vec<String>,
     titles: TitleGen,
+    asr_enabled: bool,
     outbound_tx: mpsc::Sender<String>,
     shutdown: CancellationToken,
 ) {
@@ -263,6 +310,7 @@ async fn serve_workspace_actions(
                     &backends,
                     &cli,
                     &titles,
+                    asr_enabled,
                     act,
                     &outbound_tx,
                 )
@@ -278,7 +326,7 @@ async fn serve_workspace_actions(
 ///   来源；失败时快照不变 + 前置 error 帧）。
 /// - conv_workdir_set 成功时**额外**推一条 conv_workdir 增量帧。
 /// - workspace_remove 未命中幂等（store delete 对不存在键即 Ok）。
-#[allow(clippy::too_many_arguments)] // 参数已达 9——v1.36 注入 backends（先例 new_with_e2e）
+#[allow(clippy::too_many_arguments)] // 参数已达 10——v1.40 注入 asr_enabled（先例 new_with_e2e）
 async fn handle_workspace_action(
     machine: &str,
     store: &Store,
@@ -287,6 +335,7 @@ async fn handle_workspace_action(
     backends: &[String],
     cli: &CliSource,
     titles: &TitleGen,
+    asr_enabled: bool,
     act: InboundAction,
     outbound_tx: &mpsc::Sender<String>,
 ) {
@@ -352,6 +401,7 @@ async fn handle_workspace_action(
         backends,
         cli,
         titles,
+        asr_enabled,
     )
     .await
     {
@@ -369,9 +419,11 @@ async fn handle_workspace_action(
 /// 调——实现侧自 spawn 临时 app-server，秒级阻塞不占 reactor worker，panic/
 /// 失败回空静默落下层）→ codex config catalog → official.codex。current =
 /// backend.model()——引擎实例默认（v1.38 会话级 /model 覆盖不进此快照，以
-/// IM /model 回显为准）；空 options 组帧出口整段缺席）。
+/// IM /model 回显为准）；空 options 组帧出口整段缺席）；asr = v1.40 语音
+/// 转写能力位（true 序列化字面 `"asr":true`，false 整段缺席）。
 /// best-effort：单段 list 失败 → warn + 该段空，快照照发（SPA 单一数据来源，
 /// 宁可缺段不可断流）。
+#[allow(clippy::too_many_arguments)] // 参数已达 8——v1.40 注入 asr_enabled（先例 new_with_e2e）
 async fn build_workspaces_frame(
     machine: &str,
     store: &Store,
@@ -380,6 +432,7 @@ async fn build_workspaces_frame(
     backends: &[String],
     cli: &CliSource,
     titles: &TitleGen,
+    asr_enabled: bool,
 ) -> Result<String> {
     let mut entries: Vec<WorkspaceEntryFrame> = Vec::new();
     match store.list_config(WORKSPACE_PREFIX).await {
@@ -457,6 +510,9 @@ async fn build_workspaces_frame(
             current: backends[0].clone(),
             options: backends.to_vec(),
         }),
+        // v1.40 asr 段：能力位直传（构造期 AsrContext::enabled() 的纯 bool，
+        // 无 IO）——true 序列化字面 "asr":true，false 整段缺席。
+        asr_enabled,
     )
 }
 
@@ -933,6 +989,273 @@ fn persist_up_media(
 }
 
 // ---------------------------------------------------------------------------
+// ASR 泵（v1.40 语音转写 whisper 方案网关侧：b64 解码 + 临时 WAV + spawn
+// whisper-cli + asr_result 回帧）
+// ---------------------------------------------------------------------------
+
+/// ASR 泵主循环：消费 client 转来的 asr_request 动作。解码/写盘/转写（秒级
+/// 进程 IO）在本泵内 await——不阻塞 client 收发循环；平台 Drop 时经 shutdown
+/// token 连动退出。**串行语义**：mpsc 单消费者逐条 await 处理（转写完成才
+/// 收下一条）即天然串行排队，无需 Mutex/semaphore——单用户语音重入在
+/// channel（容量 4）与 client 背压处分档消化。`asr` 为转写配置（未配置时
+/// 每条请求回 asr_unconfigured，不出进程）；`tmp_dir` 生产为
+/// `<imagent_home>/tmp`，测试注入临时目录。
+async fn serve_asr_requests(
+    mut asr_rx: mpsc::Receiver<InboundAction>,
+    machine_id: String,
+    asr: AsrContext,
+    tmp_dir: PathBuf,
+    outbound_tx: mpsc::Sender<String>,
+    shutdown: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            act = asr_rx.recv() => {
+                let Some(act) = act else {
+                    break; // client 退出（platform drop 连动），无后续动作
+                };
+                process_asr_request(&machine_id, &asr, &tmp_dir, act, &outbound_tx).await;
+            }
+        }
+    }
+    debug!(target: TARGET, "ASR 泵退出");
+}
+
+/// 处理一条语音转写请求（契约 v1.40 全链）：配置检查（未配置 →
+/// asr_unconfigured，不出进程）→ b64 解码（坏 → asr_invalid）→ 大小检查
+///（解码后 >8MB 复用 media 上限 → asr_too_large）→ 写临时 WAV（
+/// `<tmp_dir>/asr-<unix_ms>.wav`，0600）→ spawn whisper-cli（30s 超时 kill，
+/// stdout 捕获）→ 多行合并单行空格拼接 → 回 asr_result 帧（空文本也算成功，
+/// SPA 端提示「没听清」）；任一步失败回对应 error 帧且不出结果帧。临时文件
+/// 无论成败 finally 删除（此处串行逐条处理，删除点即处理收尾——含超时/失败
+/// 各 return 路径，统一经内部 future 完成后执行）。
+async fn process_asr_request(
+    machine: &str,
+    asr: &AsrContext,
+    tmp_dir: &Path,
+    act: InboundAction,
+    outbound_tx: &mpsc::Sender<String>,
+) {
+    let InboundAction::AsrRequest { audio, duration_ms } = act else {
+        debug!(target: TARGET, "ASR 泵收到非转写动作，忽略");
+        return;
+    };
+    // duration_ms 为 SPA 上报的录音时长（网关仅日志用——转写限制在字节数
+    // 不在时长，60s 截断是 SPA 侧职责）；转写耗时另行计（elapsed_ms）。
+    debug!(target: TARGET, reported_ms = duration_ms, "收到语音转写请求");
+    // 配置检查（enabled 含空白串防御——config 层不校验路径，空白与 None 同
+    // 归「未配置」）：不出进程。
+    if !asr.enabled() {
+        reply_asr_error(
+            machine,
+            outbound_tx,
+            ASR_UNCONFIGURED_CODE,
+            "语音转写未配置（whisper_bin / whisper_model 须同时设置）",
+        );
+        return;
+    }
+    let bin = asr.bin.as_deref().unwrap_or_default().trim();
+    let model = asr.model.as_deref().unwrap_or_default().trim();
+    // b64 解码（契约：单行无换行标准 base64，畸形即拒——media 泵同款纪律；
+    // 字符集粗校验即解码本身，解码失败已涵盖坏字符/长度问题）。
+    let bytes = {
+        use base64::Engine as _;
+        match base64::engine::general_purpose::STANDARD.decode(audio.as_bytes()) {
+            Ok(b) => b,
+            Err(e) => {
+                reply_asr_error(
+                    machine,
+                    outbound_tx,
+                    ASR_INVALID_CODE,
+                    &format!("录音 base64 解码失败：{e}"),
+                );
+                return;
+            }
+        }
+    };
+    if bytes.len() > MEDIA_MAX_BYTES {
+        // 复用 media 上限常量（契约：≤8MB）。60s 录音 b64 ≈2.5MB，正常路径
+        // 不会触顶——恶意/异常帧防御位。
+        reply_asr_error(
+            machine,
+            outbound_tx,
+            ASR_TOO_LARGE_CODE,
+            "录音超过 8MB 上限",
+        );
+        return;
+    }
+    // 写临时 WAV（目录不存在先建；0600 同 media 落盘纪律）。
+    let wav = match persist_asr_tmp(tmp_dir, &bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            reply_asr_error(
+                machine,
+                outbound_tx,
+                ASR_FAILED_CODE,
+                &format!("录音临时文件写入失败：{e}"),
+            );
+            return;
+        }
+    };
+    let started = unix_ms_now();
+    // 转写体独立 future——完成后（无论成败）先删临时文件再回帧（finally 语义
+    // 覆盖超时/失败/成功全部路径）。
+    let outcome = run_whisper(bin, model, &wav).await;
+    let elapsed_ms = u64::try_from(unix_ms_now().saturating_sub(started)).unwrap_or(0);
+    if let Err(e) = std::fs::remove_file(&wav) {
+        // best-effort：删除失败仅 warn（tmp 目录无 GC，残留一份 ≤2.5MB 文件
+        // 不构成积累面——转写请求频率低；保守记录便于人工排查）。
+        warn!(target: TARGET, path = %wav.display(), error = %e, "ASR 临时文件删除失败（残留）");
+    }
+    match outcome {
+        Ok(text) => {
+            // 契约：stdout trim 后多行合并为单行空格拼接（whisper 分段换行）；
+            // split_whitespace 同时折叠段内多余空白与空段。空文本也算成功。
+            let merged = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            info!(
+                target: TARGET,
+                chars = merged.chars().count(),
+                elapsed_ms,
+                bytes = bytes.len(),
+                "语音转写完成"
+            );
+            match encode_asr_result_frame(machine, &merged, elapsed_ms) {
+                Ok(json) => enqueue_best_effort(outbound_tx, json),
+                Err(e) => warn!(target: TARGET, error = %e, "asr_result 帧序列化失败"),
+            }
+        }
+        Err(reason) => {
+            warn!(
+                target: TARGET,
+                bin,
+                elapsed_ms,
+                reason = %reason,
+                "语音转写失败"
+            );
+            reply_asr_error(machine, outbound_tx, ASR_FAILED_CODE, &reason);
+        }
+    }
+}
+
+/// spawn whisper-cli 转写一个 WAV（契约旗标，上游 whisper.cpp
+/// examples/cli/cli.cpp 逐字核实：`-m/--model`、`-l/--language`、
+/// `-nt/--no-timestamps`、`-np/--no-prints`、`-f/--file`）。**本机核实结论
+/// （2026-11）：未装 brew whisper-cli（`which whisper-cli` 落空），无法
+/// `--help` 实测；旗标拼写以上游 cli.cpp 源码为准（与任务说明一致），后续
+/// 真机若旗标漂移以 `whisper-cli --help` 校准**。stdout 全量捕获（识别文本），
+/// stderr 捕获丢弃（whisper 进度/日志——stderr 不消费会撑爆管道挂死子进程）；
+/// 30s 超时 kill（kill_on_drop 兜底超时路径的进程回收）；语言定 zh（本方案
+/// 面向中文语音，契约如此）。成功 = 退出码 0，text = stdout 原文（多行合并
+/// 在调用方做——单测可直接断言本层原文）；失败 = 人话中文原因（回帧 message）。
+async fn run_whisper(bin: &str, model: &str, wav: &Path) -> std::result::Result<String, String> {
+    use std::process::Stdio;
+    // output() future 在 timeout 内 await——30s 未完成即整体超时（future 被
+    // drop，kill_on_drop 兜底终止子进程，不留孤儿 whisper）。
+    let fut = tokio::process::Command::new(bin)
+        .args(["-m", model])
+        .args(["-l", "zh"])
+        .args(["-nt", "--no-prints"])
+        .arg("-f")
+        .arg(wav)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output();
+    match tokio::time::timeout(ASR_TIMEOUT, fut).await {
+        Err(_) => Err(format!(
+            "语音转写超时（{}s），进程已终止",
+            ASR_TIMEOUT.as_secs()
+        )),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "whisper-cli 不存在（{bin}）：请 `brew install whisper-cpp` 并配置 whisper_bin"
+        )),
+        Ok(Err(e)) => Err(format!("拉起 whisper-cli 失败：{e}")),
+        Ok(Ok(out)) if out.status.success() => {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        }
+        Ok(Ok(out)) => {
+            // 失败原因取 stderr 尾部（whisper 报错在尾；全量回帧会淹没 UI）。
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let tail: String = {
+                let chars: Vec<char> = stderr.chars().collect();
+                let start = chars.len().saturating_sub(200);
+                chars[start..].iter().collect()
+            };
+            Err(format!(
+                "whisper-cli 退出码 {}：{}",
+                out.status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".into()),
+                tail.trim()
+            ))
+        }
+    }
+}
+
+/// 录音临时文件落盘（契约路径模板 `<tmp_dir>/asr-<unix_ms>.wav`）：目录不
+/// 存在先建（0755 recursive，media 泵同款 cfg(unix) 纪律）；文件 0600
+///（OpenOptions 带 mode 原子创建——无 umask 暴露窗口）。同毫秒重复请求不会
+/// 并发（ASR 泵串行消费），且处理收尾即删文件，撞名窗口可忽略；万一同毫秒
+/// 重复（手动并发调用），truncate 覆盖无害。
+fn persist_asr_tmp(tmp_dir: &Path, bytes: &[u8]) -> std::result::Result<PathBuf, String> {
+    let build_dir = || -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut b = std::fs::DirBuilder::new();
+            // recursive：父目录（<imagent_home>）缺失时一并创建；已存在不报错
+            //（mode 只作用于新建目录）。
+            b.recursive(true).mode(0o755);
+            b.create(tmp_dir)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir_all(tmp_dir)
+        }
+    };
+    build_dir().map_err(|e| format!("创建临时目录 {} 失败：{e}", tmp_dir.display()))?;
+
+    let unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = tmp_dir.join(format!("asr-{unix_ms}.wav"));
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| format!("写录音临时文件 {} 失败：{e}", path.display()))?;
+        f.write_all(bytes)
+            .map_err(|e| format!("写录音临时文件 {} 失败：{e}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, bytes)
+            .map_err(|e| format!("写录音临时文件 {} 失败：{e}", path.display()))?;
+    }
+    Ok(path)
+}
+
+/// ASR error 帧（复用既有 error 帧形态；code = asr_unconfigured |
+/// asr_failed | asr_too_large | asr_invalid，machine 为本机身份，v1.1 出站
+/// 帧必带）。
+fn reply_asr_error(machine: &str, outbound_tx: &mpsc::Sender<String>, code: &str, message: &str) {
+    match encode_error_frame(machine, code, message) {
+        Ok(json) => enqueue_best_effort(outbound_tx, json),
+        Err(e) => warn!(target: TARGET, error = %e, "ASR error 帧序列化失败"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WebPlatform
 // ---------------------------------------------------------------------------
 
@@ -987,14 +1310,17 @@ impl WebPlatform {
     /// backend clone——快照 models.current 取 backend.model()；测试传 mock）；
     /// `backends` 为 v1.36 引擎名单（default 在首位 + extras 保序去重的纯
     /// 名单，main 装配处随 ModelsContext 一并注入——快照 backends 段数据源，
-    /// 空名单整段缺席；测试传 `Vec::new()`）；`approval_timeout_secs` 为
-    /// v1.37 审批超时预算（秒，= config `permission_ask_timeout_secs`——
-    /// approval_request 帧 timeoutSecs 数据源）。
+    /// 空名单整段缺席；测试传 `Vec::new()`）；`asr` 为 v1.40 语音转写上下文
+    ///（config `whisper_bin` / `whisper_model` 原样透传，main 装配处构造——
+    /// 两者皆配置才启用：快照 asr 能力位 + ASR 泵 spawn whisper-cli，未配置
+    /// 时泵回 asr_unconfigured；测试传 `AsrContext::default()`）；
+    /// `approval_timeout_secs` 为 v1.37 审批超时预算（秒，= config
+    /// `permission_ask_timeout_secs`——approval_request 帧 timeoutSecs 数据源）。
     ///
     /// E2E 密钥（v1.4）锚定 `<imagent_home>/web-e2e-key`（main 不感知——
     /// E2E 是内容保密增强，装配失败不阻断网关启动，仅降级明文 + warn；
     /// 测试经 [`Self::new_with_e2e`] 注入临时路径）。
-    #[allow(clippy::too_many_arguments)] // 参数已达 9——v1.37 注入审批超时（先例 new_with_e2e）
+    #[allow(clippy::too_many_arguments)] // 参数已达 10——v1.40 注入 asr（先例 new_with_e2e）
     pub fn new(
         relay_url: String,
         credential: GatewayCredential,
@@ -1004,6 +1330,7 @@ impl WebPlatform {
         default_workdir: PathBuf,
         models: ModelsContext,
         backends: Vec<String>,
+        asr: AsrContext,
         approval_timeout_secs: u64,
     ) -> Self {
         let e2e_key = imagent_core::paths::imagent_home().join("web-e2e-key");
@@ -1017,13 +1344,14 @@ impl WebPlatform {
             default_workdir,
             models,
             backends,
+            asr,
             approval_timeout_secs,
         )
     }
 
     /// [`Self::new`] 的全参形态（E2E 密钥路径可注入——集成测试用临时目录，
     /// 不落真实 `~/.imagent`）。
-    #[allow(clippy::too_many_arguments)] // 参数已达 10——v1.37 注入审批超时（历史演化提醒）
+    #[allow(clippy::too_many_arguments)] // 参数已达 11——v1.40 注入 asr（历史演化提醒）
     pub fn new_with_e2e(
         relay_url: String,
         credential: GatewayCredential,
@@ -1034,6 +1362,7 @@ impl WebPlatform {
         default_workdir: PathBuf,
         models: ModelsContext,
         backends: Vec<String>,
+        asr: AsrContext,
         approval_timeout_secs: u64,
     ) -> Self {
         let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>(INBOUND_CHANNEL_CAPACITY);
@@ -1043,6 +1372,7 @@ impl WebPlatform {
             mpsc::channel::<InboundAction>(WORKSPACE_CHANNEL_CAPACITY);
         let (media_tx, media_rx) = mpsc::channel::<InboundAction>(MEDIA_CHANNEL_CAPACITY);
         let (history_tx, history_rx) = mpsc::channel::<InboundAction>(HISTORY_CHANNEL_CAPACITY);
+        let (asr_tx, asr_rx) = mpsc::channel::<InboundAction>(ASR_CHANNEL_CAPACITY);
         let (push_tx, push_rx) = mpsc::channel::<PushEvent>(PUSH_CHANNEL_CAPACITY);
 
         // E2E 身份装配（v1.4）：e2e_ack 签名复用 v1.3 认证 ed25519 私钥——
@@ -1090,6 +1420,7 @@ impl WebPlatform {
             workspace_tx,
             media_tx,
             history_tx,
+            asr_tx,
         };
         tokio::spawn(client.run(outbound_rx, push_rx, reconnect.clone(), shutdown.clone()));
 
@@ -1104,8 +1435,9 @@ impl WebPlatform {
         ));
 
         // workspace 泵（v1.6 工作空间 + v1.8 models 段 + v1.9 语义标题懒触发 +
-        // v1.36 backends 段；出站帧带 machine，v1.1 语义）。
+        // v1.36 backends 段 + v1.40 asr 能力位；出站帧带 machine，v1.1 语义）。
         let titles = TitleGen::new(store.clone());
+        let asr_enabled = asr.enabled();
         tokio::spawn(serve_workspace_actions(
             workspace_rx,
             machine_id.clone(),
@@ -1114,6 +1446,7 @@ impl WebPlatform {
             models,
             backends,
             titles,
+            asr_enabled,
             outbound_tx.clone(),
             shutdown.clone(),
         ));
@@ -1136,6 +1469,19 @@ impl WebPlatform {
             machine_id.clone(),
             media_dir,
             inbound_tx,
+            outbound_tx.clone(),
+            shutdown.clone(),
+        ));
+
+        // ASR 泵（v1.40 语音转写：b64 解码 + 临时 WAV（<imagent_home>/tmp，
+        // 处理完即删）+ spawn whisper-cli 30s 超时；未配置时逐条回
+        // asr_unconfigured。error/asr_result 帧带 machine，v1.1 语义）。
+        let asr_tmp_dir = imagent_core::paths::imagent_home().join("tmp");
+        tokio::spawn(serve_asr_requests(
+            asr_rx,
+            machine_id.clone(),
+            asr,
+            asr_tmp_dir,
             outbound_tx.clone(),
             shutdown.clone(),
         ));
@@ -1585,8 +1931,9 @@ mod tests {
             store,
             valid_dir(),
             empty_models(),
-            Vec::new(), // 空名单 → 快照 backends 段整段缺席（既有测试零感知）
-            300,        // 审批超时预算（timeoutSecs 断言数据源）
+            Vec::new(),            // 空名单 → 快照 backends 段整段缺席（既有测试零感知）
+            AsrContext::default(), // 未配置 → 快照 asr 段整段缺席（既有测试零感知）
+            300,                   // 审批超时预算（timeoutSecs 断言数据源）
         )
     }
 
@@ -1744,6 +2091,7 @@ mod tests {
             backends,
             cli,
             &disabled_titles(store),
+            false, // v1.40 asr 能力位：既有动作测试缺省关闭（快照字节与 v1.36 一致）
             act,
             &tx,
         )
@@ -2408,6 +2756,365 @@ mod tests {
             sanitize_media_name(&"中".repeat(80)),
             "_".repeat(64),
             "非 ASCII 按码点 1:1 替换后截 64"
+        );
+    }
+
+    // ---- v1.40 ASR 泵（process_asr_request 直测：mock whisper 可执行脚本
+    // 注入 + 临时目录观察落盘/清理，不经网络；端到端路径见
+    // tests/web_loopback.rs 的 asr e2e 回环用例）----
+
+    /// ASR 测试的临时目录（唯一路径：pid + 计数器，STORE_SEQ 同款纪律）。
+    fn asr_tmp_dir() -> PathBuf {
+        let n = STORE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d =
+            std::env::temp_dir().join(format!("imagent-web-asr-tmp-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 写一个可执行 mock 脚本（chmod +x）返回路径——whisper_bin 注入点。
+    /// POSIX sh：`for last` 取最后一个位置参数（= `-f <wav>` 的 wav 路径，
+    /// 泵把 `-f` 放最后）。
+    fn write_mock_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    /// 处理一条 ASR 动作并取回全部出站帧（解析为 Value 便于断言）。
+    async fn run_asr(
+        tmp_dir: &Path,
+        asr: &AsrContext,
+        act: InboundAction,
+    ) -> Vec<serde_json::Value> {
+        let (tx, mut rx) = mpsc::channel::<String>(32);
+        process_asr_request(TEST_MACHINE, asr, tmp_dir, act, &tx).await;
+        let mut out = Vec::new();
+        while let Ok(json) = rx.try_recv() {
+            out.push(serde_json::from_str(&json).unwrap());
+        }
+        out
+    }
+
+    /// 目录是否无临时 WAV（临时文件清理断言用——只看 asr-*.wav，mock 脚本
+    /// 同目录共存不计）。
+    fn dir_is_empty(dir: &Path) -> bool {
+        std::fs::read_dir(dir)
+            .map(|mut it| {
+                it.all(|e| {
+                    let n = e.unwrap().file_name().to_string_lossy().into_owned();
+                    !(n.starts_with("asr-") && n.ends_with(".wav"))
+                })
+            })
+            .unwrap_or(true)
+    }
+
+    /// mock whisper 全链（任务验收项）：帧入 → b64 解码 → 写临时 WAV（mock
+    /// 脚本校验文件存在非空）→ spawn → asr_result 出——断言多行合并单行
+    /// 空格拼接、durationMs>0、带 machine、恰 5 键；临时文件 finally 删除
+    ///（目录空）。
+    #[tokio::test]
+    async fn asr_request_full_chain_with_mock_whisper() {
+        let dir = asr_tmp_dir();
+        let bin = write_mock_script(
+            &dir,
+            "whisper-ok",
+            "# 校验 -f 的 wav 存在且非空（最后位置参数）\nfor last; do :; done\ntest -s \"$last\" || exit 3\nprintf '你好 世界\\n第二行\\n'\n",
+        );
+        let asr = AsrContext {
+            bin: Some(bin.to_string_lossy().into_owned()),
+            model: Some("/fake/ggml-medium.bin".into()),
+        };
+        let act = InboundAction::AsrRequest {
+            audio: media_b64(b"RIFF....WAVEfmt fake-bytes"),
+            duration_ms: 3210,
+        };
+        let frames = run_asr(&dir, &asr, act).await;
+        let result = frames
+            .iter()
+            .find(|f| f["type"] == "asr_result")
+            .unwrap_or_else(|| panic!("应回 asr_result 帧：{frames:?}"));
+        assert_eq!(result["machine"], TEST_MACHINE, "出站帧带本机 machine");
+        assert_eq!(
+            result["text"], "你好 世界 第二行",
+            "stdout 多行合并单行空格拼接（whisper 分段换行）"
+        );
+        let ms = result["durationMs"].as_u64().unwrap();
+        assert!(ms > 0, "durationMs > 0（spawn+读 stdout 至少毫秒级）：{ms}");
+        assert_eq!(
+            result.as_object().map(|m| m.len()),
+            Some(5),
+            "恰好 5 键（v/type/machine/text/durationMs）"
+        );
+        // 临时文件 finally 删除（目录只剩 mock 脚本？——脚本也在同目录会被
+        // 误判。脚本写在 dir 下但非 asr-*.wav；用条目名断言更准）。
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("asr-") && n.ends_with(".wav"))
+            .collect();
+        assert!(leftovers.is_empty(), "临时 WAV 已删除：{leftovers:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 未配置（bin/model 任一 None 或空白串）→ asr_unconfigured，不出进程
+    ///（mock 脚本不被执行——若执行会 exit 0 产生 asr_result，断言可区分）。
+    #[tokio::test]
+    async fn asr_request_unconfigured_replies_error() {
+        let dir = asr_tmp_dir();
+        let bin = write_mock_script(&dir, "whisper-should-not-run", "printf 'SHOULD NOT RUN'\n");
+        let bin_s = bin.to_string_lossy().into_owned();
+        for asr in [
+            AsrContext::default(),
+            AsrContext {
+                bin: Some(bin_s.clone()),
+                model: None,
+            },
+            AsrContext {
+                bin: None,
+                model: Some("/fake/model.bin".into()),
+            },
+            AsrContext {
+                bin: Some("  ".into()),
+                model: Some("/fake/model.bin".into()),
+            },
+        ] {
+            let frames = run_asr(
+                &dir,
+                &asr,
+                InboundAction::AsrRequest {
+                    audio: media_b64(b"x"),
+                    duration_ms: 0,
+                },
+            )
+            .await;
+            let err = frames
+                .iter()
+                .find(|f| f["type"] == "error")
+                .unwrap_or_else(|| panic!("未配置应回 error 帧：{frames:?}"));
+            assert_eq!(err["code"], ASR_UNCONFIGURED_CODE, "{frames:?}");
+            assert_eq!(err["machine"], TEST_MACHINE);
+            assert!(frames.len() == 1, "只回 error 不回结果帧：{frames:?}");
+        }
+        assert!(dir_is_empty(&dir), "未配置不出进程不落盘");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 坏 b64 → asr_invalid；解码后 >8MB（复用 media 上限）→ asr_too_large
+    ///（契约原文 message）；两者均不写临时文件不 spawn。
+    #[tokio::test]
+    async fn asr_request_bad_b64_and_oversized() {
+        let dir = asr_tmp_dir();
+        let asr = AsrContext {
+            bin: Some("/nonexistent/whisper-cli".into()),
+            model: Some("/fake/model.bin".into()),
+        };
+        // 坏 b64（非法字符集）。
+        let frames = run_asr(
+            &dir,
+            &asr,
+            InboundAction::AsrRequest {
+                audio: "!!!not-base64!!!".into(),
+                duration_ms: 0,
+            },
+        )
+        .await;
+        let err = frames.iter().find(|f| f["type"] == "error").unwrap();
+        assert_eq!(err["code"], ASR_INVALID_CODE, "{frames:?}");
+        assert!(frames.len() == 1);
+        // 超 8MB（上限 +1 字节）：契约原文 message。
+        let oversized = media_b64(&vec![0u8; MEDIA_MAX_BYTES + 1]);
+        let frames = run_asr(
+            &dir,
+            &asr,
+            InboundAction::AsrRequest {
+                audio: oversized,
+                duration_ms: 0,
+            },
+        )
+        .await;
+        let err = frames.iter().find(|f| f["type"] == "error").unwrap();
+        assert_eq!(err["code"], ASR_TOO_LARGE_CODE, "{frames:?}");
+        assert_eq!(err["message"], "录音超过 8MB 上限", "契约原文 message");
+        assert!(frames.len() == 1);
+        assert!(dir_is_empty(&dir), "校验失败不落盘");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// whisper 失败（退出码非 0 / 二进制不存在）→ asr_failed 带人话原因；
+    /// 空文本也算成功（契约：text=""，SPA 端提示「没听清」）；失败路径同样
+    /// 删临时文件。
+    #[tokio::test]
+    async fn asr_request_whisper_failure_and_empty_text() {
+        let dir = asr_tmp_dir();
+        // 退出码 1：stderr 尾部进 message。
+        let bin = write_mock_script(
+            &dir,
+            "whisper-fail",
+            "echo 'model load failed' >&2\nexit 1\n",
+        );
+        let asr = AsrContext {
+            bin: Some(bin.to_string_lossy().into_owned()),
+            model: Some("/fake/model.bin".into()),
+        };
+        let frames = run_asr(
+            &dir,
+            &asr,
+            InboundAction::AsrRequest {
+                audio: media_b64(b"RIFF...."),
+                duration_ms: 0,
+            },
+        )
+        .await;
+        let err = frames
+            .iter()
+            .find(|f| f["type"] == "error")
+            .unwrap_or_else(|| panic!("非零退出应回 error 帧：{frames:?}"));
+        assert_eq!(err["code"], ASR_FAILED_CODE, "{frames:?}");
+        assert!(
+            err["message"].as_str().unwrap().contains("退出码 1"),
+            "message 带退出码：{}",
+            err["message"]
+        );
+        assert!(
+            err["message"]
+                .as_str()
+                .unwrap()
+                .contains("model load failed"),
+            "message 带 stderr 尾部：{}",
+            err["message"]
+        );
+        assert!(frames.len() == 1, "失败不回 asr_result：{frames:?}");
+
+        // 二进制不存在 → asr_failed（提示配置 whisper_bin）。
+        let asr = AsrContext {
+            bin: Some("/nonexistent/whisper-cli-xyz".into()),
+            model: Some("/fake/model.bin".into()),
+        };
+        let frames = run_asr(
+            &dir,
+            &asr,
+            InboundAction::AsrRequest {
+                audio: media_b64(b"RIFF...."),
+                duration_ms: 0,
+            },
+        )
+        .await;
+        let err = frames.iter().find(|f| f["type"] == "error").unwrap();
+        assert_eq!(err["code"], ASR_FAILED_CODE, "{frames:?}");
+        assert!(
+            err["message"]
+                .as_str()
+                .unwrap()
+                .contains("whisper-cli 不存在"),
+            "message 提示可操作方向：{}",
+            err["message"]
+        );
+
+        // 退出码 0 + 空 stdout → 成功帧 text=""。
+        let bin = write_mock_script(&dir, "whisper-silent", "true\n");
+        let asr = AsrContext {
+            bin: Some(bin.to_string_lossy().into_owned()),
+            model: Some("/fake/model.bin".into()),
+        };
+        let frames = run_asr(
+            &dir,
+            &asr,
+            InboundAction::AsrRequest {
+                audio: media_b64(b"RIFF...."),
+                duration_ms: 0,
+            },
+        )
+        .await;
+        let result = frames
+            .iter()
+            .find(|f| f["type"] == "asr_result")
+            .unwrap_or_else(|| panic!("空文本也算成功：{frames:?}"));
+        assert_eq!(result["text"], "", "空文本 = 成功帧（SPA 提示没听清）");
+        assert!(result["durationMs"].as_u64().is_some_and(|n| n > 0));
+
+        assert!(dir_is_empty(&dir), "成功/失败路径临时文件均已删除");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 快照 asr 能力位（任务验收项）：AsrContext 可用（bin+model 皆配置）→
+    /// 快照带 `"asr":true`；未配置 → 整段缺席（既有快照形态字节不变）。
+    #[tokio::test]
+    async fn workspace_snapshot_asr_flag() {
+        let store = test_store().await;
+        let default = valid_dir();
+        let run = |asr_enabled: bool| {
+            let store = store.clone();
+            let default = default.clone();
+            async move {
+                let (tx, mut rx) = mpsc::channel::<String>(32);
+                handle_workspace_action(
+                    TEST_MACHINE,
+                    &store,
+                    &default,
+                    &empty_models(),
+                    &[],
+                    &CliSource::Claude(CliModels::default()),
+                    &disabled_titles(&store),
+                    asr_enabled,
+                    InboundAction::WorkspaceList,
+                    &tx,
+                )
+                .await;
+                let mut out = Vec::new();
+                while let Ok(json) = rx.try_recv() {
+                    out.push(serde_json::from_str::<serde_json::Value>(&json).unwrap());
+                }
+                out
+            }
+        };
+        // 已配置：快照带 asr:true。
+        let frames = run(true).await;
+        let snap = frames
+            .iter()
+            .find(|f| f["type"] == "workspaces")
+            .unwrap_or_else(|| panic!("应回快照：{frames:?}"));
+        assert_eq!(snap["asr"], true, "已配置 → asr:true：{snap}");
+
+        // 未配置：整段缺席（既有形态）。
+        let frames = run(false).await;
+        let snap = frames
+            .iter()
+            .find(|f| f["type"] == "workspaces")
+            .unwrap_or_else(|| panic!("应回快照：{frames:?}"));
+        assert!(snap.get("asr").is_none(), "未配置 → asr 整段缺席：{snap}");
+    }
+
+    /// AsrContext::enabled() 语义：bin/model 皆非空白才 true（空白串视为
+    /// 未配置——config 层不校验路径，空白与 None 同归「关闭」）。
+    #[test]
+    fn asr_context_enabled_semantics() {
+        assert!(!AsrContext::default().enabled(), "全 None = 关闭");
+        assert!(
+            !AsrContext {
+                bin: Some("/opt/homebrew/bin/whisper-cli".into()),
+                model: None,
+            }
+            .enabled(),
+            "缺 model = 关闭"
+        );
+        assert!(
+            !AsrContext {
+                bin: Some("  ".into()),
+                model: Some("/m.bin".into()),
+            }
+            .enabled(),
+            "空白 bin = 关闭"
+        );
+        assert!(
+            AsrContext {
+                bin: Some("whisper-cli".into()),
+                model: Some("/m.bin".into()),
+            }
+            .enabled(),
+            "皆配置 = 启用"
         );
     }
 

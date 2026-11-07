@@ -1881,6 +1881,9 @@ async fn build_platform(
             // 第①层；仅 codex-app 装配产生，其余后端 None）。
             // v1.36 引擎名单：注入全注册表名（快照 backends 段——SPA 新会话
             // 弹窗引擎 chips 数据源；default 在首位，装配处已保序去重）。
+            // v1.40 语音转写：注入 AsrContext（config whisper_bin/whisper_model
+            // 原样透传——两者皆配置才启用：快照 asr 能力位 + ASR 泵 spawn
+            // whisper-cli；任一未配置 = ASR 关闭，快照不带 asr 段）。
             // v1.37 审批超时：注入 permission_ask_timeout_secs（approval_request
             // 帧 timeoutSecs 数据源——SPA 倒计时与网关实际超时同源）。
             Ok(Arc::new(imagent_web::WebPlatform::new(
@@ -1896,6 +1899,10 @@ async fn build_platform(
                     list_models: model_list_fn,
                 },
                 backends,
+                imagent_web::platform::AsrContext {
+                    bin: config.whisper_bin.clone(),
+                    model: config.whisper_model.clone(),
+                },
                 config.permission_ask_timeout_secs,
             )))
         }

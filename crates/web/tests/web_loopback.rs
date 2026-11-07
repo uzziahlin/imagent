@@ -164,6 +164,7 @@ async fn setup() -> (RelayHandle, WebPlatform, Ws) {
         valid_ws_dir(),
         nop_models(),
         Vec::new(), // v1.36 backends 名单：回环测试不驱动引擎选择，空名单整段缺席
+        imagent_web::AsrContext::default(), // v1.40 未配置 → 快照 asr 段缺席
         300,        // v1.37 审批超时预算（approval_request 帧 timeoutSecs）
     );
     // 等 platform 连上 relay（client spawn 后异步建连 + 三帧握手认证）。
@@ -650,6 +651,7 @@ async fn loopback_token_credential_compat() {
         valid_ws_dir(),
         nop_models(),
         Vec::new(), // v1.36 backends 名单：回环测试不驱动引擎选择，空名单整段缺席
+        imagent_web::AsrContext::default(), // v1.40 未配置 → 快照 asr 段缺席
         300,        // v1.37 审批超时预算（approval_request 帧 timeoutSecs）
     );
     eventually(Duration::from_secs(10), || p.is_online()).await;
@@ -736,6 +738,7 @@ async fn loopback_e2e_encrypted_roundtrip() {
         valid_ws_dir(),
         nop_models(),
         Vec::new(), // v1.36 backends 名单：回环测试不驱动引擎选择，空名单整段缺席
+        imagent_web::AsrContext::default(), // v1.40 未配置 → 快照 asr 段缺席
         300,        // v1.37 审批超时预算（approval_request 帧 timeoutSecs）
     );
     eventually(Duration::from_secs(10), || p.is_online()).await;
@@ -925,6 +928,7 @@ async fn loopback_workspace_frames_e2e_encrypted() {
         default_dir.clone(),
         nop_models(),
         Vec::new(), // v1.36 backends 名单：回环测试不驱动引擎选择，空名单整段缺席
+        imagent_web::AsrContext::default(), // v1.40 未配置 → 快照 asr 段缺席
         300,        // v1.37 审批超时预算（approval_request 帧 timeoutSecs）
     );
     eventually(Duration::from_secs(10), || p.is_online()).await;
@@ -1081,6 +1085,195 @@ async fn loopback_workspace_frames_e2e_encrypted() {
     drop(p);
 }
 
+/// 场景 11（协议 v1.40 语音转写 × E2E）：E2E 会话活跃机器下，ASR 全链路
+/// 走 enc——入站 asr_request（enc 包裹，b64 音频）→ 网关 spawn mock
+/// whisper（真进程：校验临时 WAV 存在非空 + printf 两行识别文本）→ 出站
+/// asr_result（enc 包裹：text 多行合并、durationMs>0、带 machine）；快照
+/// 能力位随配置点亮（workspace_list → workspaces 帧 asr:true）。
+#[tokio::test]
+async fn loopback_asr_request_result_e2e_encrypted() {
+    use base64::Engine as _;
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+    use x25519_dalek::{PublicKey as XPublicKey, StaticSecret as XStaticSecret};
+
+    fn seal(key: &[u8; 32], plaintext: &str) -> String {
+        let nonce = rand::random::<[u8; 24]>();
+        let cipher = XChaCha20Poly1305::new_from_slice(key).unwrap();
+        let ct = cipher
+            .encrypt(XNonce::from_slice(&nonce), plaintext.as_bytes())
+            .unwrap();
+        let mut boxed = Vec::with_capacity(24 + ct.len());
+        boxed.extend_from_slice(&nonce);
+        boxed.extend_from_slice(&ct);
+        base64::engine::general_purpose::STANDARD.encode(boxed)
+    }
+    fn open(key: &[u8; 32], boxed: &str) -> String {
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(boxed)
+            .unwrap();
+        let (nonce, ct) = data.split_at(24);
+        let cipher = XChaCha20Poly1305::new_from_slice(key).unwrap();
+        let pt = cipher.decrypt(XNonce::from_slice(nonce), ct).unwrap();
+        String::from_utf8(pt).unwrap()
+    }
+    /// 读下一条 enc 帧并解密为 JSON（跳过其它帧；解开非 JSON 的继续等）。
+    async fn next_enc_json(ws: &mut Ws, k: &[u8; 32]) -> serde_json::Value {
+        loop {
+            let v = next_of_type(ws, "enc").await;
+            if let Some(pt) = v["box"].as_str() {
+                return serde_json::from_str(&open(k, pt)).unwrap_or(v);
+            }
+        }
+    }
+
+    // mock whisper：校验 `-f` 的临时 WAV 存在且非空（泵把 -f 放最后），输出
+    // 两行识别文本（验证网关多行合并）。
+    let asr_dir = std::env::temp_dir().join(format!(
+        "imagent-web-loopback-asr-{}-{}",
+        std::process::id(),
+        rand::random::<u32>()
+    ));
+    std::fs::create_dir_all(&asr_dir).unwrap();
+    let bin = asr_dir.join("whisper-mock");
+    std::fs::write(
+        &bin,
+        "#!/bin/sh\nfor last; do :; done\ntest -s \"$last\" || exit 3\nprintf '你好 世界\\n第二行\\n'\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let asr = imagent_web::AsrContext {
+        bin: Some(bin.to_string_lossy().into_owned()),
+        model: Some("/fake/ggml-medium.bin".into()),
+    };
+
+    let (handle, sk) = spawn_test_relay().await;
+    let addr = handle.addr;
+    let key_path = e2e_test_key_path("asr-e2e");
+    let p = WebPlatform::new_with_e2e(
+        format!("ws://{addr}/gateway"),
+        GatewayCredential::Key(sk),
+        "default".to_string(),
+        MACHINE.to_string(),
+        &key_path,
+        loopback_store("asr-e2e").await,
+        valid_ws_dir(),
+        nop_models(),
+        Vec::new(),
+        asr, // v1.40 mock whisper 注入：快照 asr 段点亮 + 泵 spawn 本脚本
+        300,
+    );
+    eventually(Duration::from_secs(10), || p.is_online()).await;
+
+    // 浏览器登录 + E2E 握手（与场景 10 同构，细节断言从简）。
+    let mut br = connect_ws(&addr, "/ws", None).await;
+    br.send(Message::text(format!(
+        r#"{{"v":1,"type":"hello","token":"{USER_TOKEN}"}}"#
+    )))
+    .await
+    .unwrap();
+    let ack: serde_json::Value = serde_json::from_str(&next_text(&mut br).await).unwrap();
+    let sid = ack["session"]["id"].as_str().unwrap().to_string();
+    let _machines = next_of_type(&mut br, "machines").await;
+
+    let browser_secret = XStaticSecret::from(rand::random::<[u8; 32]>());
+    let browser_public = XPublicKey::from(&browser_secret);
+    let n1 = rand::random::<[u8; 32]>();
+    br.send(Message::text(
+        serde_json::json!({
+            "v": 1, "type": "e2e_hello", "machine": MACHINE, "sid": sid,
+            "ek": hex::encode(browser_public.as_bytes()),
+            "n1": hex::encode(n1),
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let e2e_ack = next_of_type(&mut br, "e2e_ack").await;
+    let gk: [u8; 32] = hex::decode(e2e_ack["gk"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let n2: [u8; 32] = hex::decode(e2e_ack["n2"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let k = imagent_web::e2e::derive_session_key(
+        browser_secret
+            .diffie_hellman(&XPublicKey::from(gk))
+            .as_bytes(),
+        &n1,
+        &n2,
+    );
+
+    // ---- 入站 asr_request（enc）→ 出站 asr_result（enc）。
+    br.send(Message::text(
+        serde_json::json!({
+            "v": 1, "type": "enc", "machine": MACHINE,
+            "box": seal(&k, &serde_json::json!({
+                "v": 1, "type": "asr_request",
+                "audio": base64::engine::general_purpose::STANDARD.encode(b"RIFF....WAVE"),
+                "durationMs": 2500,
+            }).to_string()),
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let result = next_enc_json(&mut br, &k).await;
+    assert_eq!(
+        result["type"], "asr_result",
+        "mock whisper 全链回帧（enc 解出）：{result}"
+    );
+    assert_eq!(
+        result["machine"], MACHINE,
+        "asr_result 带本机 machine（v1.1）"
+    );
+    assert_eq!(
+        result["text"], "你好 世界 第二行",
+        "stdout 多行合并单行空格拼接"
+    );
+    assert!(
+        result["durationMs"].as_u64().is_some_and(|n| n > 0),
+        "durationMs > 0：{result}"
+    );
+
+    // ---- workspace_list（enc）→ 快照（enc）：能力位随 mock 配置点亮。
+    br.send(Message::text(
+        serde_json::json!({
+            "v": 1, "type": "enc", "machine": MACHINE,
+            "box": seal(&k, r#"{"v":1,"type":"workspace_list"}"#),
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let snap = next_enc_json(&mut br, &k).await;
+    assert_eq!(snap["type"], "workspaces", "{snap}");
+    assert_eq!(
+        snap["asr"], true,
+        "已配置 mock whisper → 快照 asr:true：{snap}"
+    );
+
+    // 临时文件生命周期：泵处理收尾即删（目录只剩 mock 脚本）。
+    let leftovers: Vec<String> = std::fs::read_dir(&asr_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("asr-") && n.ends_with(".wav"))
+        .collect();
+    assert!(leftovers.is_empty(), "临时 WAV 已删除：{leftovers:?}");
+
+    let _ = std::fs::remove_file(&key_path);
+    std::fs::remove_dir_all(&asr_dir).ok();
+    handle.shutdown();
+    handle.wait().await;
+    drop(p);
+}
+
 // ---------------------------------------------------------------------------
 // v1.10 push_notify 全链路：平台埋点（终态卡）→ client 明文管理帧 → relay
 // → mock push 服务投递（真实 aes128gcm 加密 + VAPID Authorization）
@@ -1217,6 +1410,7 @@ async fn loopback_push_notify_full_chain() {
         valid_ws_dir(),
         nop_models(),
         Vec::new(), // v1.36 backends 名单：回环测试不驱动引擎选择，空名单整段缺席
+        imagent_web::AsrContext::default(), // v1.40 未配置 → 快照 asr 段缺席
         300,        // v1.37 审批超时预算（approval_request 帧 timeoutSecs）
     );
     eventually(Duration::from_secs(10), || platform.is_online()).await;

@@ -526,6 +526,24 @@ pub struct Config {
     /// 见 `imagent_web::sanitize_machine_id`）。非敏感（列表帧会广播给浏览器）。
     #[serde(default)]
     pub web_machine_id: Option<String>,
+    /// Web 驾驶舱语音转写（v1.40 ASR）：whisper-cli 可执行文件路径。brew 装
+    /// 法 `brew install whisper-cpp`（可执行名 `whisper-cli`，如
+    /// `/opt/homebrew/bin/whisper-cli`；PATH 已含 brew bin 时直接写
+    /// `whisper-cli`）。与 `whisper_model` **同时配置**才启用：SPA 录音经
+    /// `asr_request` 业务帧上行，网关 spawn whisper-cli 转写回 `asr_result`
+    /// 帧，workspaces 快照随带 `asr: true`（SPA 据此显示语音入口）。任一
+    /// 未配置 = ASR 关闭（快照不带 asr 段，SPA 隐藏入口）。按次拉起进程
+    /// 用完即退（不常驻）。非敏感（路径）。**改动需重启**。
+    #[serde(default)]
+    pub whisper_bin: Option<String>,
+    /// Web 驾驶舱语音转写：whisper ggml 模型文件路径（medium 下法：
+    /// `brew install whisper-cpp` 后
+    /// `whisper-cli --download-ggml-model medium` 下载到当前目录，或手动取
+    /// whisper.cpp models/download-ggml-model.sh 拉取的 `ggml-medium.bin`）。
+    /// 中文识别建议 medium 及以上（small 中文可用但错字率高）。与
+    /// `whisper_bin` 同时配置才启用（语义见上）。**改动需重启**。
+    #[serde(default)]
+    pub whisper_model: Option<String>,
     /// 回复形态偏好（P7-A4；默认 card）。text = 不建卡走纯文本流（/config 可热改）。
     /// **改动需重启**：启动偏好（prefs）在启动期注入 Dispatcher，SIGHUP 不热载
     ///（/config 的运行时热改不受影响）。
@@ -1506,6 +1524,8 @@ platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人)
 # web_relay_url = "wss://your-ecs:8443/imagent/gateway"   # 仅 platform="web"：ECS relay 网关端点（Caddy TLS 终结 + strip /imagent 前缀）；gateway 认证 v1.3 起 ed25519 key 优先（~/.imagent/web-gateway-key 首启自动生成,把日志打印的公钥配到 relay 侧 IMAGENT_RELAY_GATEWAY_KEYS）,IMAGENT_WEB_GATEWAY_TOKEN 为密钥文件损坏时的回退；web 消息 sender 恒为 web:user，需加入 allowed_senders（或 admin_senders）白名单才会被处理
 # web_default_session = "default"   # 仅 platform="web"：无 convId 的浏览器消息落到的默认会话名（conv 形如 web:<name>）
 # web_machine_id = "home-mac"       # 仅 platform="web"：本机 machine 身份（多台 Mac 接同一 relay 时区分终端，浏览器按 machine 切换管理；缺省取 hostname 短名；同 machine 新连接会顶替旧连接）
+# whisper_bin = "/opt/homebrew/bin/whisper-cli"  # 仅 platform="web"：语音转写 whisper-cli 可执行路径（brew install whisper-cpp；与 whisper_model 同时配置才启用——workspaces 快照带 asr:true，SPA 显示语音入口）
+# whisper_model = "~/.imagent/models/ggml-medium.bin"  # 语音转写 ggml 模型路径（whisper-cli --download-ggml-model medium 下载；中文建议 medium 及以上）
 # feishu_app_id = "cli_xxx"            # 飞书自建应用 app_id（仅 platform="feishu"；app_secret 走环境变量，keyring 为后续 P2）
 # feishu_base_url = "https://open.feishu.cn"  # 可选，默认 https://open.feishu.cn；Lark 国际版 https://open.larksuite.com（MVP 不覆盖）
 # feishu_require_mention_in_group = true       # 群消息须 @bot 才处理（默认 true：客户端过滤 + 剥离 @bot 占位；false=全收，过滤交给事件订阅 scope）
@@ -1797,6 +1817,35 @@ web_machine_id = "home-mac"
         );
         let cfg = Config::load(&p).expect("parse");
         assert_eq!(cfg.web_machine_id.as_deref(), Some("home-mac"));
+        cleanup(&p);
+    }
+
+    /// v1.40 ASR：`whisper_bin` / `whisper_model` 字段解析——缺省双 None
+    ///（ASR 关闭）；显式配置原样透传（路径存在性/可执行性不在 config 层
+    /// 校验——泵 spawn 失败回 asr_failed，与「装了却写错路径」同归运行期
+    /// 反馈，启动期不阻断）。
+    #[test]
+    fn whisper_config_parse() {
+        let p = tmp_path("whisper_default", r#"default_workdir = "/tmp/ws""#);
+        let cfg = Config::load(&p).expect("parse");
+        assert!(
+            cfg.whisper_bin.is_none() && cfg.whisper_model.is_none(),
+            "缺省双 None"
+        );
+        cleanup(&p);
+        let p = tmp_path(
+            "whisper_set",
+            r#"default_workdir = "/tmp/ws"
+whisper_bin = "whisper-cli"
+whisper_model = "/opt/models/ggml-medium.bin"
+"#,
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(cfg.whisper_bin.as_deref(), Some("whisper-cli"));
+        assert_eq!(
+            cfg.whisper_model.as_deref(),
+            Some("/opt/models/ggml-medium.bin")
+        );
         cleanup(&p);
     }
 

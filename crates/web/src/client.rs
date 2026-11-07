@@ -20,6 +20,8 @@
 //!   （值域校验 + 落盘 + 合成 InboundMessage / 失败回 error 帧）；
 //! - `history_tx`：v1.8 会话历史重放（history_query 帧）→ platform 的
 //!   history 泵（查 outbound_log + 回 history 帧）；
+//! - `asr_tx`：v1.40 语音转写（asr_request 帧）→ platform 的 ASR 泵
+//!   （b64 解码 + 写临时 WAV + spawn whisper-cli + 回 asr_result 帧）；
 //! - `outbound_rx`：platform 序列化好的出站帧（JSON 文本）→ relay → 浏览器。
 //!
 //! 协议细节（§4）：relay 对浏览器侧有 90s idle 超时，网关 30s 发协议层
@@ -91,6 +93,9 @@ pub(crate) struct WebClient {
     /// v1.8 会话历史重放通道（history_query 帧）→ platform 的 history 泵
     /// （查 outbound_log + 回 history 帧）。
     pub(crate) history_tx: mpsc::Sender<InboundAction>,
+    /// v1.40 语音转写通道（asr_request 帧）→ platform 的 ASR 泵（b64 解码
+    /// + 写临时 WAV + spawn whisper-cli；失败回 error 帧）。
+    pub(crate) asr_tx: mpsc::Sender<InboundAction>,
 }
 
 /// hello 首帧构造（token 形态，v1.1/v1.2 兼容路径：token + machine 自报；
@@ -598,6 +603,18 @@ impl WebClient {
                     warn!(target: TARGET, "history channel 持续满 1s，丢弃 history_query 请求");
                 }
             }
+            // v1.40 语音转写 → platform ASR 泵（b64 解码 + spawn whisper-cli
+            // 是秒级 IO，不占 client 收发循环；失败 error 帧经泵的 outbound
+            // 通道回）。同 1s 有界背压：转写泵串行消费（一条 30s 封顶），连发
+            // 排队到容量 4；打满丢弃由 SPA 无回执感知 + 重录重发兜底。
+            act @ InboundAction::AsrRequest { .. } => {
+                if tokio::time::timeout(Duration::from_secs(1), self.asr_tx.send(act))
+                    .await
+                    .is_err()
+                {
+                    warn!(target: TARGET, "asr channel 持续满 1s，丢弃 asr_request 请求");
+                }
+            }
             InboundAction::Ping => {
                 // 应用层 ping：本层直接回 pong（§4.1，不进 recv），带本机
                 // machine（v1.1 全部出站帧约定）。
@@ -790,6 +807,7 @@ mod tests {
         let (workspace_tx, _workspace_rx) = mpsc::channel::<InboundAction>(8);
         let (media_tx, _media_rx) = mpsc::channel::<InboundAction>(8);
         let (history_tx, _history_rx) = mpsc::channel::<InboundAction>(8);
+        let (asr_tx, _asr_rx) = mpsc::channel::<InboundAction>(8);
         let client = WebClient {
             relay_url: "ws://127.0.0.1:1/gateway".into(),
             credential: GatewayCredential::Token("t".into()),
@@ -802,6 +820,7 @@ mod tests {
             workspace_tx,
             media_tx,
             history_tx,
+            asr_tx,
         };
         let (_outbound_tx, outbound_rx) = mpsc::channel::<String>(8);
         let (_push_tx, push_rx) = mpsc::channel::<PushEvent>(8);

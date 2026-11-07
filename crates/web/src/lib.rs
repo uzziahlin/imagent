@@ -83,6 +83,21 @@
 //! `options` = 全注册表名（SPA 新会话弹窗引擎 chips 数据源，per-conv 补发
 //! `/backend <名>` 落在 core 侧）。空 options 整段不序列化，旧形态字节不变。
 //!
+//! v1.40 扩展（语音转写 whisper 方案网关侧，契约同款字节级纪律）：入站
+//! `asr_request {audio, durationMs}`（SPA 录 16k/mono/16-bit WAV 的 base64
+//! 上行，mime 恒 `audio/wav` 契约定死不传）→ platform 的 ASR 泵：b64 解码
+//!（坏 → `asr_invalid`；解码后 >8MB 复用 media 上限 → `asr_too_large`）→
+//! 写 `<imagent_home>/tmp/asr-<unix_ms>.wav` 临时文件 → spawn `whisper-cli`
+//!（30s 超时 kill，逐次拉起用完即退不常驻，泵串行消费天然排队）→ stdout
+//! 多行合并单行空格拼接 → 出站 `asr_result {text, durationMs}`（text = 识别
+//! 文本，空也算成功由 SPA 提示「没听清」；durationMs = 转写耗时）。失败走
+//! 既有 error 帧：`asr_unconfigured`（未配 whisper_bin/whisper_model）/
+//! `asr_failed`（转写失败/超时/二进制不存在）/ `asr_too_large` /
+//! `asr_invalid`。能力通告：`workspaces` 快照帧可带可选 `"asr": true`
+//!（whisper_bin 与 whisper_model 均已配置才序列化；缺省/false 不序列化，
+//! 旧形态字节不变）。WAV 规格由 SPA 保证（16k/mono/16-bit），网关不校验
+//! WAV 头细节（坏文件 whisper 自身报错 → asr_failed）。
+//!
 //! **帧内 convId 协议约定：恒为完整 conv 形态（`web:<session>`）**。出站帧
 //! （text / card / approval_request …）写入的即完整 conv，浏览器回执帧
 //! （message / approval_response）**原样回传收到的 convId** 即可，不得剥前
@@ -106,7 +121,7 @@ pub mod platform;
 pub mod titles;
 
 pub use key::GatewayCredential;
-pub use platform::WebPlatform;
+pub use platform::{AsrContext, WebPlatform};
 
 use imagent_core::{
     CardPhase, CardTerminal, ConvId, CoreError, InboundMessage, MediaRef, OutboundCard, ReplyHint,
@@ -731,15 +746,16 @@ pub(crate) struct BackendsFrame {
 /// workspaces 全量快照帧（SPA 工作空间视图的单一数据来源）：
 /// `default` = 配置 default_workdir；`workspaces` = 全部命名空间（调用方
 /// 按 name 稳定序排好）；`convs` = 该网关全部已知 conv 的当前 workdir
-/// （遍历 `workdir:` KV，**含 local: 会话**——SPA 展示本地终端会话目录
+///（遍历 `workdir:` KV，**含 local: 会话**——SPA 展示本地终端会话目录
 /// 同样有意义）。`machine` 为本机身份（v1.1 起全部出站业务帧必带——SPA
 /// reducer 按 `frame.machine` 把快照归属到机器；enc 信封的 machine 要经
 /// 解密分发处兜底注入才可达内帧，内帧自带才是权威）。`convs` 用
 /// BTreeMap：键序稳定，SPA 解析与测试断言可复现。v1.7 起可带可选
 /// `sessions` 段（`web:` 会话历史，见 [`SessionEntryFrame`]）；v1.8 起可带
 /// 可选 `models` 段（模型菜单动态化，见 [`ModelsFrame`]）；v1.36 起可带
-/// 可选 `backends` 段（引擎名单，见 [`BackendsFrame`]）——三段空集整段
-/// 不序列化（无对应数据的网关快照与 v1.6 逐字节一致，旧端零感知）。
+/// 可选 `backends` 段（引擎名单，见 [`BackendsFrame`]）；v1.40 起可带可选
+/// `asr` 布尔能力位（语音转写已配置，字面 `true` 非对象段）——各段空值
+/// 整段不序列化（无对应数据的网关快照与 v1.6 逐字节一致，旧端零感知）。
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct WorkspacesFrame {
     v: u8,
@@ -755,6 +771,12 @@ pub(crate) struct WorkspacesFrame {
     models: Option<ModelsFrame>,
     #[serde(skip_serializing_if = "Option::is_none")]
     backends: Option<BackendsFrame>,
+    /// v1.40 语音转写能力位：whisper_bin 与 whisper_model 均已配置 = true。
+    /// bool 的 skip 用 `std::ops::Not::not`（false 不序列化——契约「缺省/
+    /// false 不序列化，旧形态字节不变」；仓库内首个 bool 段，无既有惯例
+    /// 可循，以此形态落地）。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    asr: bool,
 }
 
 /// conv_workdir 增量帧：单个 conv 的工作目录已切换（网页 conv_workdir_set
@@ -790,7 +812,9 @@ pub(crate) struct ErrorFrame {
 /// = 会话数，远低于帧软限）。`sessions` 传空 Vec 时整段不序列化（旧形态
 /// 字节不变，协议 v1.7 可选段语义）；`models` 传 None 或 options 空的帧时
 /// 整段不序列化（协议 v1.8 同语义——契约「≥1 才序列化整段」）；`backends`
-/// 传 None 或 options 空的帧时同整段缺席（协议 v1.36 同语义）。
+/// 传 None 或 options 空的帧时同整段缺席（协议 v1.36 同语义）；`asr` 传
+/// false 整段缺席（协议 v1.40 同语义——true 序列化为字面 `"asr":true`）。
+#[allow(clippy::too_many_arguments)] // 参数已达 8——v1.40 注入 asr 能力位（先例 new_with_e2e）
 pub(crate) fn encode_workspaces_frame(
     machine: &str,
     default: &str,
@@ -799,6 +823,7 @@ pub(crate) fn encode_workspaces_frame(
     sessions: Vec<SessionEntryFrame>,
     models: Option<ModelsFrame>,
     backends: Option<BackendsFrame>,
+    asr: bool,
 ) -> Result<String> {
     // 契约「options ≥1 才序列化」在组帧出口统一兜底（调用方无需各自判断）。
     let models = models.filter(|m| !m.options.is_empty());
@@ -813,6 +838,7 @@ pub(crate) fn encode_workspaces_frame(
         sessions,
         models,
         backends,
+        asr,
     };
     serde_json::to_string(&frame)
         .map_err(|e| CoreError::Platform(TARGET, format!("workspaces 帧序列化失败：{e}")))
@@ -939,6 +965,44 @@ pub(crate) fn encode_history_frame(
 }
 
 // ---------------------------------------------------------------------------
+// 出站语音转写帧（协议 v1.40 whisper 方案网关侧，字段与 SPA 侧契约逐字一致，不得增删改）
+// ---------------------------------------------------------------------------
+
+/// asr_result 帧（v1.40 语音转写成功回帧）：`text` = whisper stdout 多行
+/// 合并单行空格拼接后的识别文本（**空串也算成功**——静音/没听清由 SPA
+/// 端提示）；`durationMs` = 转写耗时（unix 墙钟差，毫秒，>0——mock 场景
+/// 也为正，spawn+读 stdout 至少毫秒级）。`machine` 为本机身份（v1.1 出站
+/// 业务帧必带）。入站请求的 `durationMs`（录音时长）与出站的同名不同义，
+/// 不回传（契约如此——SPA 本地自有录音时长）。
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct AsrResultFrame {
+    v: u8,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    machine: String,
+    text: String,
+    #[serde(rename = "durationMs")]
+    duration_ms: u64,
+}
+
+/// asr_result 帧组帧（无截断面：whisper 文本量级 ≤ 录音时长，远低于帧软限）。
+pub(crate) fn encode_asr_result_frame(
+    machine: &str,
+    text: &str,
+    duration_ms: u64,
+) -> Result<String> {
+    let frame = AsrResultFrame {
+        v: 1,
+        kind: "asr_result",
+        machine: machine.to_string(),
+        text: text.to_string(),
+        duration_ms,
+    };
+    serde_json::to_string(&frame)
+        .map_err(|e| CoreError::Platform(TARGET, format!("asr_result 帧序列化失败：{e}")))
+}
+
+// ---------------------------------------------------------------------------
 // 入站帧（浏览器 → 网关）映射
 // ---------------------------------------------------------------------------
 
@@ -1012,6 +1076,17 @@ pub(crate) enum InboundAction {
     HistoryQuery {
         conv: String,
         since: i64,
+    },
+    /// v1.40 语音转写：asr_request{audio, durationMs} → platform 的 ASR 泵
+    /// （b64 解码 + 写临时 WAV + spawn whisper-cli + 回 asr_result 帧；不进
+    /// recv / dispatch 命令链）。`audio` 为 base64 音频（mime 恒
+    /// audio/wav——契约定死不传，WAV 规格由 SPA 保证）；`duration_ms` 为
+    /// SPA 上报的录音时长（可选字段，缺省 0；网关仅日志用——转写限制在
+    /// 字节数不在时长，60s 截断是 SPA 侧职责）。本层只做字段存在性/类型
+    /// 检查；值域校验（b64 合法性、解码 ≤8MB）在泵——失败回对应 error 帧。
+    AsrRequest {
+        audio: String,
+        duration_ms: u64,
     },
     /// 未知 type：debug 忽略——前向兼容，M3 SPA 新增帧不致网关断连。
     Ignore,
@@ -1240,6 +1315,30 @@ pub(crate) fn map_inbound_frame(v: &serde_json::Value, default_session: &str) ->
             InboundAction::HistoryQuery {
                 conv: normalize_conv(Some(conv), default_session),
                 since,
+            }
+        }
+        // v1.40 语音转写：本层只做字段校验（audio 须字符串、durationMs 可选
+        // 须非负整数缺省 0），值域校验（b64 合法性、解码 ≤8MB）与 spawn 在
+        // platform ASR 泵——失败回 error 帧（asr_invalid / asr_too_large），
+        // 静默丢弃会让 SPA 语音弹层无响应。
+        "asr_request" => {
+            let Some(audio) = v.get("audio").and_then(|a| a.as_str()) else {
+                return InboundAction::Warn("asr_request 帧缺 audio 字段（b64），丢弃");
+            };
+            let duration_ms = match v.get("durationMs") {
+                None => 0,
+                Some(d) => match d.as_u64() {
+                    Some(n) => n,
+                    None => {
+                        return InboundAction::Warn(
+                            "asr_request 帧 durationMs 非法（须非负整数），丢弃",
+                        )
+                    }
+                },
+            };
+            InboundAction::AsrRequest {
+                audio: audio.to_string(),
+                duration_ms,
             }
         }
         _ => InboundAction::Ignore,
@@ -1648,6 +1747,57 @@ mod tests {
         }
     }
 
+    /// v1.40 asr_request 入站帧正例：完整形态（machine 路由字段网关不消费、
+    /// mime 契约定死不传）、durationMs 可选（缺省 0）、audio 原样透传
+    ///（b64 合法性/大小校验留泵——解析层不做值域检查）。
+    #[test]
+    fn map_asr_request_frames() {
+        let act = map_raw_frame(
+            r#"{"v":1,"type":"asr_request","audio":"aGVsbG8=","durationMs":3000,"machine":"m"}"#,
+            SESSION,
+        );
+        let InboundAction::AsrRequest { audio, duration_ms } = act else {
+            panic!("asr_request 应映射为 AsrRequest：{act:?}")
+        };
+        assert_eq!(audio, "aGVsbG8=");
+        assert_eq!(duration_ms, 3000);
+        // durationMs 缺省 0。
+        let act = map_raw_frame(
+            r#"{"v":1,"type":"asr_request","audio":"aGVsbG8="}"#,
+            SESSION,
+        );
+        let InboundAction::AsrRequest { duration_ms, .. } = act else {
+            panic!("缺 durationMs 应映射为 AsrRequest（缺省 0）")
+        };
+        assert_eq!(duration_ms, 0);
+        // 值域校验留泵：坏 b64 字符集同样放行到泵（泵解码失败回 asr_invalid）。
+        assert!(matches!(
+            map_raw_frame(
+                r#"{"v":1,"type":"asr_request","audio":"not*b64!","durationMs":0}"#,
+                SESSION
+            ),
+            InboundAction::AsrRequest { .. }
+        ));
+    }
+
+    /// v1.40 asr_request 入站帧反例：audio 缺失/非字符串、durationMs 负数/
+    /// 浮点/字符串 → Warn 丢弃。
+    #[test]
+    fn map_asr_request_frames_missing_or_wrong_fields() {
+        for raw in [
+            r#"{"v":1,"type":"asr_request","durationMs":0}"#,
+            r#"{"v":1,"type":"asr_request","audio":123,"durationMs":0}"#,
+            r#"{"v":1,"type":"asr_request","audio":"aGk=","durationMs":-1}"#,
+            r#"{"v":1,"type":"asr_request","audio":"aGk=","durationMs":1.5}"#,
+            r#"{"v":1,"type":"asr_request","audio":"aGk=","durationMs":"3000"}"#,
+        ] {
+            assert!(
+                matches!(map_raw_frame(raw, SESSION), InboundAction::Warn(_)),
+                "{raw} 应 Warn 丢弃"
+            );
+        }
+    }
+
     /// v1.8 history 条目组装（行 → 契约 JSON）+ history 帧**键序无关逐字段
     /// 断言**：顶层字段名/值（struct 声明序组帧，逐字段钉住）、条目字段名
     /// 逐字与键数（防多/漏字段）、key 前缀 `h:<seq>`、card 的 state 恒
@@ -1795,6 +1945,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            false, // v1.40 asr 能力位：缺省 false 整段缺席（旧形态字节不变）
         )
         .unwrap();
         // 键序无关逐字段复核（convs 为 BTreeMap 键序稳定 + serde 按声明序
@@ -1833,6 +1984,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            false, // v1.40 asr 能力位：缺省 false 整段缺席（旧形态字节不变）
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1891,6 +2043,7 @@ mod tests {
             ],
             None,
             None,
+            false, // v1.40 asr 能力位：缺省 false 整段缺席（旧形态字节不变）
         )
         .unwrap();
         // 键序无关逐字段复核（derive struct 声明序组帧、sessions 段在 convs
@@ -1927,6 +2080,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            false, // v1.40 asr 能力位：缺省 false 整段缺席（旧形态字节不变）
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1963,6 +2117,7 @@ mod tests {
                 ],
             }),
             None,
+            false, // v1.40 asr 能力位：缺省 false 整段缺席（旧形态字节不变）
         )
         .unwrap();
         // 键序无关逐字段复核（derive struct 声明序组帧、models 段在 sessions
@@ -2010,6 +2165,7 @@ mod tests {
                 Vec::new(),
                 models,
                 None,
+                false, // v1.40 asr 能力位：缺省 false 整段缺席（旧形态字节不变）
             )
             .unwrap();
             let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2044,6 +2200,7 @@ mod tests {
                 current: "claude-cli".into(),
                 options: vec!["claude-cli".into(), "codex-app".into()],
             }),
+            false, // v1.40 asr 能力位：缺省 false 整段缺席（旧形态字节不变）
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2077,6 +2234,7 @@ mod tests {
                 current: "claude-cli".into(),
                 options: vec!["claude-cli".into(), "codex-app".into()],
             }),
+            false, // v1.40 asr 能力位：缺省 false 整段缺席（旧形态字节不变）
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2112,6 +2270,7 @@ mod tests {
                 Vec::new(),
                 None,
                 backends,
+                false, // v1.40 asr 能力位：缺省 false 整段缺席（旧形态字节不变）
             )
             .unwrap();
             let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2122,6 +2281,107 @@ mod tests {
             );
             assert!(v.get("backends").is_none(), "空 options / None 整段缺席");
         }
+    }
+
+    /// v1.40 workspaces 快照 asr 能力位**键序无关逐字段断言**（契约逐字段
+    /// 一致：字面布尔 `true` 非对象段、置尾）；asr=false 整段缺席（旧形态
+    /// 字节不变）；与既有各段并存时键数正确。不做完整字节串断言（理由同
+    /// sessions/models 段测试）。
+    #[test]
+    fn workspaces_frame_asr_flag_byte_level() {
+        // true：顶层 8 键（基线 7 + asr），字面 true。
+        let json = encode_workspaces_frame(
+            "home-mac",
+            "/def",
+            Vec::new(),
+            BTreeMap::new(),
+            Vec::new(),
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            v.as_object().map(|m| m.len()),
+            Some(7),
+            "带 asr 恰好 7 键（v1.36 基线 6 + asr）：{json}"
+        );
+        assert_eq!(v["asr"], true, "asr = 字面 true");
+        assert!(json.contains(r#""asr":true"#), "字面 true 非对象段：{json}");
+
+        // false：整段缺席（6 键 = v1.36 基线，旧形态字节不变）。
+        let json = encode_workspaces_frame(
+            "home-mac",
+            "/def",
+            Vec::new(),
+            BTreeMap::new(),
+            Vec::new(),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            v.as_object().map(|m| m.len()),
+            Some(6),
+            "false 整段缺席（v1.36 基线键数）"
+        );
+        assert!(v.get("asr").is_none(), "false 整段缺席");
+
+        // 与 backends 段并存：7 键，asr 在 backends 之后（struct 声明序）。
+        let json = encode_workspaces_frame(
+            "home-mac",
+            "/def",
+            Vec::new(),
+            BTreeMap::new(),
+            Vec::new(),
+            None,
+            Some(BackendsFrame {
+                current: "claude-cli".into(),
+                options: vec!["claude-cli".into()],
+            }),
+            true,
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            v.as_object().map(|m| m.len()),
+            Some(8),
+            "backends + asr 并存恰好 8 键（基线 7 + asr）"
+        );
+        assert_eq!(v["asr"], true);
+        assert!(
+            json.find(r#""backends":"#).unwrap() < json.find(r#""asr":true"#).unwrap(),
+            "asr 段置尾（backends 之后）：{json}"
+        );
+    }
+
+    /// v1.40 asr_result 帧**键序无关逐字段断言 + 字节级精确串**（契约逐字段
+    /// 一致：v/type/machine/text/durationMs 恰 5 键、rename `durationMs`、
+    /// 带本机 machine；derive struct 声明序稳定——完整字节串断言钉住组帧
+    /// 形态，SPA 并行批对齐锚点；若未来声明序变化需同步更新 SPA 侧预期）。
+    #[test]
+    fn asr_result_frame_byte_level() {
+        let json = encode_asr_result_frame("home-mac", "你好 世界", 1234).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v.as_object().map(|m| m.len()), Some(5), "恰好 5 键");
+        assert_eq!(v["v"], 1);
+        assert_eq!(v["type"], "asr_result");
+        assert_eq!(v["machine"], "home-mac", "出站帧带本机 machine");
+        assert_eq!(v["text"], "你好 世界");
+        assert_eq!(v["durationMs"], 1234, "rename durationMs");
+        // 字节级精确串（键序 = 结构体声明序，序列化确定性）。
+        assert_eq!(
+            json,
+            r#"{"v":1,"type":"asr_result","machine":"home-mac","text":"你好 世界","durationMs":1234}"#
+        );
+        // 空文本也是合法成功帧（契约：没听清由 SPA 提示）。
+        let json = encode_asr_result_frame("home-mac", "", 1).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["text"], "");
+        assert!(v["durationMs"].as_u64().is_some_and(|n| n > 0));
     }
 
     /// v1.9 title 规则三档（任务验收项）：手动名优先（trim 生效、空白名
