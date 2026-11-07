@@ -2,7 +2,7 @@
 // result/error/end 事件。Composer 集成侧（追加输入框/预览/文案/入口渲染）
 // 在 Composer.test.tsx，此处专注 hook 内部行为：增量语义、聚合回调、
 // stop vs abort 语义、aborted 静默、清理幂等、静默失败自动重试（v1.39.1，
-// fake timers 直驱定时器）。
+// fake timers 直驱定时器）、静默重试耗尽兜底回调（v1.39.2）。
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -54,7 +54,11 @@ const emitEnd = (rec: StubRecognition) =>
   });
 
 /** 挂载并启动一轮识别（返回 hook result 与首实例）。 */
-function startListening(opts?: { lang?: string; throwOnStart?: boolean }) {
+function startListening(opts?: {
+  lang?: string;
+  throwOnStart?: boolean;
+  onSilentFailExhausted?: () => void;
+}) {
   const onFinal = vi.fn();
   const onError = vi.fn();
   const instances: StubRecognition[] = [];
@@ -73,6 +77,7 @@ function startListening(opts?: { lang?: string; throwOnStart?: boolean }) {
       lang: opts?.lang,
       onFinal,
       onError,
+      onSilentFailExhausted: opts?.onSilentFailExhausted,
     }),
   );
   act(() => {
@@ -370,7 +375,90 @@ describe("useSpeechRecognition 静默失败自动重试（v1.39.1）", () => {
 });
 
 // ---------------------------------------------------------------------------
-// v1.39 收尾：isIosStandalone 检测纯函数（Composer 🎤 入口平台拦截用）。
+// v1.39.2 静默重试耗尽兜底回调 onSilentFailExhausted：重试会话仍静默 end
+// （retried 已置位的 silentFail 路径，直接归位 idle）时恰回调一次——是否
+// 可见提示由调用方决定。非静默路径（有 result / 有 error / 手动 stop）不
+// 回调，真实无语音/错误场景不误报。
+// ---------------------------------------------------------------------------
+
+describe("useSpeechRecognition onSilentFailExhausted 耗尽兜底（v1.39.2）", () => {
+  it("重试会话仍静默 end：回调恰一次，状态归位 idle；首会话静默失败（未耗尽）不回调", () => {
+    vi.useFakeTimers();
+    try {
+      const onSilentFailExhausted = vi.fn();
+      const { result, instances } = startListening({ onSilentFailExhausted });
+      emitEnd(instances[0]); // 首会话静默失败 → 进入重试窗口（未耗尽）
+      expect(result.current.status).toBe("listening");
+      expect(onSilentFailExhausted).not.toHaveBeenCalled();
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      expect(instances.length).toBe(2);
+      emitEnd(instances[1]); // 重试会话仍静默失败 → 耗尽
+      expect(result.current.status).toBe("idle");
+      expect(onSilentFailExhausted).toHaveBeenCalledTimes(1);
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+      expect(instances.length).toBe(2); // 不再重试
+      expect(onSilentFailExhausted).toHaveBeenCalledTimes(1); // 无后续误触
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("非静默路径不回调：有 result / 有 error / 手动 stop / 耗尽会话内 error 均不触发", () => {
+    vi.useFakeTimers();
+    try {
+      const onSilentFailExhausted = vi.fn();
+      const { result, instances } = startListening({ onSilentFailExhausted });
+
+      // 有 result 的正常 end（单句静音自动断）
+      emitResult(instances[0], 0, [["说过话", true]]);
+      emitEnd(instances[0]);
+      expect(result.current.status).toBe("idle");
+      expect(onSilentFailExhausted).not.toHaveBeenCalled();
+
+      // error 后 end（错误自有文案，不叠加耗尽兜底）
+      act(() => {
+        result.current.toggle();
+      });
+      emitError(instances[1], "no-speech");
+      emitEnd(instances[1]);
+      expect(onSilentFailExhausted).not.toHaveBeenCalled();
+
+      // 手动 stop 的 end（未说话即停）
+      act(() => {
+        result.current.toggle();
+      });
+      act(() => {
+        result.current.stop();
+      });
+      emitEnd(instances[2]);
+      expect(onSilentFailExhausted).not.toHaveBeenCalled();
+
+      // 已进重试（额度用尽）的会话内发生 error：走非静默路径，同样不回调
+      act(() => {
+        result.current.toggle();
+      });
+      emitEnd(instances[3]); // 首会话静默失败 → 自动重试
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      expect(instances.length).toBe(5);
+      emitError(instances[4], "network");
+      emitEnd(instances[4]);
+      expect(result.current.status).toBe("idle");
+      expect(onSilentFailExhausted).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.39 收尾引入、v1.39.2 语义修正：isIosStandalone 检测纯函数（不再拦 🎤
+// 入口——真机实证主屏模式首次可用；仅作静默重试耗尽后兜底提示的条件）。
 // jsdom 无 matchMedia（typeof 为 undefined）——默认即「无标准信号」；标准
 // display-mode 路径经 window.matchMedia stub 驱动，Safari 专有路径经
 // navigator.standalone 注入；UA 经 navigator 实例 defineProperty 覆盖

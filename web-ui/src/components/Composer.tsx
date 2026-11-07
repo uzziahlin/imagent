@@ -39,11 +39,13 @@ const SPEECH_ERROR_TEXT: Record<SpeechErrorKind, string> = {
   unknown: "语音识别出错，请重试",
 };
 
-/** v1.39 收尾：iOS 主屏（standalone）模式平台限制提示——WebKit 限制识别
- *  服务起不来（start 后静默失败，真机实证「没反应」），Safari 内可用。点
- *  🎤 不发起识别，行内 alert 引导换 Safari（复用既有错误行 + 4s 消退）；
- *  按钮保持可点不隐藏（换浏览器回来仍可用），title 同步提示。 */
-const IOS_STANDALONE_HINT = "iOS 主屏模式下系统不支持语音识别，请在 Safari 中打开驾驶舱使用";
+/** v1.39.2：iOS 主屏（standalone）语音受限提示——真机实证主屏模式并非绝对
+ *  不支持（首次识别可用，授权后出字），后续会话因 WebKit 连续会话 bug 静默
+ *  失败。v1.39 的入口抢先拦截已撤（实证推翻前提）：点 🎤 照常发起识别，仅
+ *  静默重试耗尽（v1.39.1 自动重试仍无果）后经 onSilentFailExhausted 呈现
+ *  行内 alert（复用既有错误行 + 4s 消退）；title 同步提示。措辞从「不支持」
+ *  改「受限」。未命中环境静默耗尽不提示（真实无语音不误报）。 */
+const IOS_STANDALONE_HINT = "主屏模式下语音受 iOS 系统限制可能不稳定，建议用 Safari 打开使用";
 
 /**
  * composer：多行输入，Enter 发送 / Shift+Enter 换行（中文输入法组词中的
@@ -70,9 +72,10 @@ const IOS_STANDALONE_HINT = "iOS 主屏模式下系统不支持语音识别，�
  * 输入内容——只填入框绝不自动发送；再点停止（stop 优雅收尾保留最后一段）或
  * 静音自动断。错误（权限/没说话/网络）行内 alert 人话提示 + 4s 消退 + 状态
  * 复位。不支持环境（Firefox/旧 iOS）不渲染按钮。iOS 主屏（standalone）模式
- * WebKit 限制识别服务不可用：点 🎤 不发起识别，行内 alert 引导换 Safari
- * （按钮保留、title 同步；isIosStandalone 检测，其余环境零变化）。逻辑在
- * useSpeechRecognition（构造器注入，可测）。
+ * 照常发起识别（v1.39.2 事实修正：真机实证并非绝对不支持，撤除 v1.39 抢先
+ * 拦截）——静默失败由 v1.39.1 自动重试兜底，重试耗尽（WebKit 连续会话 bug
+ * 仍无果）经 onSilentFailExhausted 呈现受限提示（仅 iOS 主屏命中，其余环境
+ * 静默不误报；title 同步）。逻辑在 useSpeechRecognition（构造器注入，可测）。
  */
 export function Composer({
   status,
@@ -106,9 +109,9 @@ export function Composer({
   // ---- v1.39 语音转文字（P1.5）：Web Speech API，能力探测决定入口渲染 ----
   /** 构造器惰性探测一次（mount 期间环境不变；测试经 window 注入 stub）。 */
   const [speechCtor] = useState(getSpeechRecognitionCtor);
-  /** iOS 主屏（standalone）平台限制：mount 时探测一次（环境运行期不变；
-   *  测试经 matchMedia/navigator.standalone/UA 注入）。命中时点 🎤 不发起
-   *  识别（起不来的静默失败），其余环境零变化。 */
+  /** iOS 主屏（standalone）检测：mount 时探测一次（环境运行期不变；测试经
+   *  matchMedia/navigator.standalone/UA 注入）。v1.39.2 不再拦入口——仅作
+   *  静默重试耗尽后兜底提示的条件（title 同步受限提示）。 */
   const [iosStandalone] = useState(isIosStandalone);
   /** 语音错误提示（人话文案；4s 自动消退，对齐 App toast 节奏）。 */
   const [speechError, setSpeechError] = useState<string | null>(null);
@@ -123,6 +126,13 @@ export function Composer({
       taRef.current?.focus();
     },
     onError: (kind) => setSpeechError(SPEECH_ERROR_TEXT[kind] || SPEECH_ERROR_TEXT.unknown),
+    // v1.39.2 静默重试耗尽兜底：iOS 主屏命中 → 受限提示（复用行内 alert +
+    // 4s 消退管道）；未命中环境静默——真实无语音等场景不误报。
+    onSilentFailExhausted: () => {
+      if (iosStandalone) {
+        setSpeechError(IOS_STANDALONE_HINT);
+      }
+    },
   });
   // 语音错误 4s 自动消退（对齐 error/notice toast 节奏）
   useEffect(() => {
@@ -316,15 +326,7 @@ export function Composer({
           {speech.supported && (
             <button
               type="button"
-              onClick={() => {
-                if (iosStandalone) {
-                  // 平台限制：不发起识别，行内提示引导换 Safari（按钮保留
-                  // 可点——换浏览器后回来仍可用，避免「按钮消失」的困惑）
-                  setSpeechError(IOS_STANDALONE_HINT);
-                  return;
-                }
-                speech.toggle();
-              }}
+              onClick={() => speech.toggle()}
               disabled={disabled}
               title={
                 iosStandalone

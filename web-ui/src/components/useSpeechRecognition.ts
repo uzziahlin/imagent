@@ -16,6 +16,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
  *   无 error（WebKit 静默失败特征），400ms 后换新实例自动重试一次——期间
  *   保持 listening，UI 无感；重试会话再静默失败不循环，归位 idle（每轮用户
  *   点击至多 1 次自动重试）。start 同步抛错经 onError("unknown") 显式反馈。
+ * - v1.39.2 静默重试耗尽兜底回调 onSilentFailExhausted：重试会话仍静默 end
+ *   （retried 已置位的 silentFail 路径，直接归位 idle）时回调一次——是否
+ *   可见提示由调用方决定；非静默路径（有 result / 有 error / 手动 stop）
+ *   不回调。真机实证 iOS 主屏并非绝对不支持（首次识别可用），入口不拦、
+ *   失败后兜底。
  */
 
 // ---------------------------------------------------------------------------
@@ -76,10 +81,11 @@ export function getSpeechRecognitionCtor(): SpeechRecognitionCtor | null {
 }
 
 /**
- * v1.39 收尾：iOS 主屏（standalone）模式检测——真机实证 Web Speech API 在
- * iOS PWA standalone 下不工作（WebKit 限制：识别服务起不来，start 后静默
- * 失败——无 error、无 result 即 end），Safari 浏览器内可用。命中时由调用方
- * 在 🎤 入口拦截（不发起识别 + 可见提示）。两条件与：
+ * iOS 主屏（standalone）模式检测——v1.39.2 事实修正（用户真机实证推翻 v1.39
+ * 抢先拦截的前提）：主屏模式并非绝对不支持，首次识别可用（授权后出字），
+ * 后续会话才静默失败（WebKit 连续会话 bug，由重试机制处理）。检测保留但不
+ * 再拦入口：仅作静默重试耗尽后兜底提示的条件（命中 → 提示受 iOS 系统限制，
+ * 未命中 → 静默，真实无语音不误报）。两条件与：
  * - iOS：UA 含 iPhone/iPad/iPod。iPadOS 13+ 默认桌面 UA（Macintosh）的
  *   角落情况不追求——该形态按桌面环境处理（不提示），粒度与「不支持环境
  *   不渲染」一致；
@@ -131,6 +137,10 @@ export interface UseSpeechRecognitionOptions {
   onFinal?: (text: string) => void;
   /** 错误回调（aborted 静默不回调——主动终止/清理语义，不算故障）。 */
   onError?: (kind: SpeechErrorKind) => void;
+  /** v1.39.2 静默重试耗尽兜底：重试会话仍静默 end（无 result 无 error，归
+   *  位 idle）时回调一次；非静默路径（有 result / 有 error / 手动 stop）
+   *  不回调。可见与否由调用方决定（Composer 仅 iOS 主屏命中时提示）。 */
+  onSilentFailExhausted?: () => void;
 }
 
 export function useSpeechRecognition({
@@ -138,6 +148,7 @@ export function useSpeechRecognition({
   lang = "zh-CN",
   onFinal,
   onError,
+  onSilentFailExhausted,
 }: UseSpeechRecognitionOptions) {
   const [status, setStatus] = useState<SpeechStatus>("idle");
   /** interim 预览文本（null = 无预览；final 到达或结束时清空）。 */
@@ -145,8 +156,8 @@ export function useSpeechRecognition({
   const recRef = useRef<SpeechRecognitionLike | null>(null);
   // 回调经 ref 转发：事件监听器闭包固定引用最新回调（实例生命周期内调用方
   // 传入的函数身份变化不触发重绑，无陈旧闭包）。
-  const cbsRef = useRef({ onFinal, onError });
-  cbsRef.current = { onFinal, onError };
+  const cbsRef = useRef({ onFinal, onError, onSilentFailExhausted });
+  cbsRef.current = { onFinal, onError, onSilentFailExhausted };
 
   // ---- v1.39.1 静默失败自动重试（WebKit 确认 bug：旧音频会话未完全释放，
   // 紧接的 start 静默失败——无 error 无 result 即 end；社区解法 end 后延迟
@@ -245,8 +256,8 @@ export function useSpeechRecognition({
     // v1.39.1 end 判定（重试状态机）：三条件与=静默失败特征——非手动 stop +
     // 无 result + 无 error；叠加本轮重试额度未用（重试会话再静默失败不再重
     // 试，避免循环——用户再点一次 🎤 即新一轮）。静默失败不回调 onError（不
-    // 误报：iOS standalone 已由调用方在入口拦截根本不发起，真实无语音场景走
-    // no-speech error 路径提示）。
+    // 误报：真实无语音等静默场景交给下方耗尽兜底回调，明确错误走 no-speech
+    // 等文案路径）。
     rec.onend = () => {
       const silentFail =
         !manualStopRef.current && !gotResultRef.current && !erroredRef.current;
@@ -263,6 +274,11 @@ export function useSpeechRecognition({
           retryTimerRef.current = null;
           start(); // 自引用安全：ctor/lang/teardown 每挂载稳定，触发时即最新实现
         }, 400);
+      } else if (silentFail) {
+        // v1.39.2 耗尽兜底挂点：retried 已置位的静默失败路径（重试会话仍
+        // 静默 end，现直接归位 idle）——通知调用方；是否可见提示由调用方
+        // 决定。有 result / 有 error / 手动 stop 的非静默路径不进此分支。
+        cbsRef.current.onSilentFailExhausted?.();
       }
     };
     recRef.current = rec;

@@ -528,26 +528,27 @@ describe("Composer 语音输入（v1.39 P1.5）", () => {
 });
 
 // ---------------------------------------------------------------------------
-// v1.39 收尾：iOS 主屏（standalone）平台限制提示——Web Speech API 在 iOS
-// PWA standalone 下静默失败（WebKit 限制），点 🎤 不发起识别、行内 alert
-// 引导换 Safari（按钮保留可点、title 同步）；iOS Safari / Android standalone
-// 正常发起，其余环境零变化。环境注入：UA 经 navigator 实例 defineProperty
-// 覆盖（delete 还原 prototype getter）；standalone 信号 iOS 用专有
-// navigator.standalone、Android 用 matchMedia stub（jsdom 无此 API，delete
-// 还原「缺席」）；不支持环境/正常用例不动任何全局（检测函数对 matchMedia
-// 缺席有 typeof 防御）。
+// v1.39.2：iOS 主屏（standalone）撤除抢先拦截——用户真机实证主屏模式并非
+// 绝对不支持（首次识别可用，授权后出字），后续才静默失败（WebKit 连续会话
+// bug，v1.39.1 重试机制兜底）。点 🎤 照常真实发起识别；静默重试耗尽后经
+// onSilentFailExhausted 呈现行内 alert 受限提示（仅 iOS 主屏命中；iOS Safari
+// / Android standalone 等未命中环境静默耗尽不提示，不误报）。环境注入：UA
+// 经 navigator 实例 defineProperty 覆盖（delete 还原 prototype getter）；
+// standalone 信号 iOS 用专有 navigator.standalone、Android 用 matchMedia
+// stub（jsdom 无此 API，delete 还原「缺席」）；不支持环境/正常用例不动任何
+// 全局（检测函数对 matchMedia 缺席有 typeof 防御）。
 // ---------------------------------------------------------------------------
 
-describe("Composer 语音 iOS 主屏模式提示（v1.39 收尾）", () => {
+describe("Composer 语音 iOS 主屏模式（v1.39.2 撤拦 + 耗尽兜底）", () => {
   const MIC = "开始语音输入";
-  const HINT = "iOS 主屏模式下系统不支持语音识别，请在 Safari 中打开驾驶舱使用";
+  const HINT = "主屏模式下语音受 iOS 系统限制可能不稳定，建议用 Safari 打开使用";
   const IOS_UA =
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1";
   const ANDROID_UA =
     "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36";
   let instances: StubRecognition[] = [];
 
-  /** 最小 Web Speech stub（同上组）：构造即持引用，断言「未发起」用。 */
+  /** 最小 Web Speech stub（同上组）：构造即持引用，直驱事件断言。 */
   class StubRecognition {
     lang = "";
     continuous = false;
@@ -593,6 +594,9 @@ describe("Composer 语音 iOS 主屏模式提示（v1.39 收尾）", () => {
     });
   };
 
+  /** 直驱静默失败 end（WebKit 连续会话 bug 特征：无 result 无 error 即 end）。 */
+  const emitEnd = (rec: StubRecognition) => act(() => rec.onend?.());
+
   afterEach(() => {
     delete (window as { SpeechRecognition?: unknown }).SpeechRecognition;
     delete (window.navigator as { userAgent?: string }).userAgent;
@@ -600,24 +604,68 @@ describe("Composer 语音 iOS 主屏模式提示（v1.39 收尾）", () => {
     delete (window as { matchMedia?: unknown }).matchMedia;
   });
 
-  it("iOS 主屏（standalone）：点 🎤 不发起识别，行内 alert 精确文案 + title 同步；按钮保留可点", () => {
+  it("iOS 主屏（standalone）：点 🎤 真实发起识别（撤除抢先拦截，无 alert；title 同步受限提示）", () => {
     setUA(IOS_UA);
     Object.defineProperty(window.navigator, "standalone", { value: true, configurable: true });
     injectSpeech();
     const onSend = vi.fn(() => true);
     const { ta } = mount(onSend);
     const mic = screen.getByRole("button", { name: MIC }) as HTMLButtonElement;
-    expect(mic.title).toBe(HINT); // title 同步提示（按钮不隐藏）
+    expect(mic.title).toBe(HINT); // title 同步（措辞已从「不支持」改「受限」）
     fireEvent.click(mic);
-    expect(screen.getByRole("alert").textContent).toBe(HINT); // 行内 alert（4s 消退复用既有管道）
-    expect(instances).toHaveLength(0); // 不发起识别（stub 构造器未被触发）
+    expect(instances).toHaveLength(1); // 真实发起（不再拦截，stub 构造器已触发）
+    expect(instances[0].start).toHaveBeenCalledTimes(1);
+    expect(instances[0].lang).toBe("zh-CN");
+    expect(screen.queryByRole("alert")).toBeNull(); // 提前拦截提示已撤
+    expect(mic.disabled).toBe(false);
     expect(onSend).not.toHaveBeenCalled();
-    expect(mic.disabled).toBe(false); // 保持可点——换 Safari 后回来仍可用
-    // 再点仍提示（状态未被破坏、无悬挂的 listening）
-    fireEvent.click(mic);
-    expect(screen.getByRole("alert").textContent).toBe(HINT);
-    expect(instances).toHaveLength(0);
     expect(ta.value).toBe("");
+  });
+
+  it("iOS standalone 静默重试耗尽：行内 alert 显示受限文案（仅耗尽时；4s 消退复用既有管道）", () => {
+    vi.useFakeTimers();
+    try {
+      setUA(IOS_UA);
+      Object.defineProperty(window.navigator, "standalone", { value: true, configurable: true });
+      injectSpeech();
+      mount();
+      fireEvent.click(screen.getByRole("button", { name: MIC }));
+      emitEnd(instances[0]); // 首会话静默失败 → 重试窗口（尚未耗尽，不提示）
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(screen.getByRole("button", { name: "停止语音输入" })).toBeTruthy();
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      expect(instances).toHaveLength(2); // v1.39.1 自动重试换新实例
+      emitEnd(instances[1]); // 重试会话仍静默失败 → 耗尽 → 兜底提示
+      expect(screen.getByRole("alert").textContent).toBe(HINT);
+      act(() => {
+        vi.advanceTimersByTime(4000);
+      });
+      expect(screen.queryByRole("alert")).toBeNull(); // 4s 自动消退
+      expect(screen.getByRole("button", { name: MIC })).toBeTruthy(); // 归位可再点
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("非 standalone 静默重试耗尽：无 alert（真实无语音等场景不误报）", () => {
+    vi.useFakeTimers();
+    try {
+      injectSpeech(); // 不注入 UA/standalone——桌面环境（iosStandalone 未命中）
+      mount();
+      fireEvent.click(screen.getByRole("button", { name: MIC }));
+      emitEnd(instances[0]);
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      emitEnd(instances[1]); // 同样耗尽，但未命中 iOS 主屏
+      expect(instances).toHaveLength(2);
+      expect(screen.queryByRole("alert")).toBeNull(); // 静默，不误报
+      expect(screen.getByRole("button", { name: MIC })).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("iOS Safari 浏览器内：正常发起识别（无提示）", () => {
