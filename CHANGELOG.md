@@ -2,6 +2,183 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.40.0] — 2026-11-07
+
+> **语音转写 whisper 方案**：iOS Web Speech 三版修复未根治（standalone 限制→重试→撤拦），
+> 拍板切 **Mac 本地 whisper**——手机只录音，识别计算放 Mac（imagent「手机驾驶舱 /
+> Mac 算力舱」定位同构）。SPA Web Audio 录 16k mono 16-bit WAV → `asr_request` 业务帧
+> （b64 ≤ 8MB，E2E seal）→ 网关第 7 条 channel 泵 spawn `whisper-cli` 转写 →
+> `asr_result` 回帧填输入框。不常驻、按次拉起，临时 WAV finally 全路径删除（0600 原子建）。
+
+### Added
+- **网关 ASR 链路**（crates/web）：`whisper_bin` + `whisper_model` **双配置才启用**——
+  workspaces 快照随带 `asr: true`（SPA 据此显示 🎤 入口）；任一未配置 = ASR 关闭
+  （快照不带 asr 段，SPA 隐藏入口，Web Speech 老路零变化）。错误帧四码
+  `asr_unconfigured` / `failed` / `too_large` / `invalid`；改动需重启
+- **SPA 录音主路径**（web-ui）：Web Audio 录 16k mono 16-bit WAV（纯前端编码，不走
+  MediaRecorder 免网关解码依赖；AudioWorklet 主路径 + ScriptProcessor 兜底）→
+  `asr_request` → 结果回填输入框；**Web Speech 降级为桌面 fallback**（快照无 asr
+  段时走老路零变化）
+- **relay 单帧上限 256KB → 8MB**（`MAX_WS_MESSAGE_BYTES`）：60s 录音 E2E 后 ~3.4MB
+  必断连的前置。安全评估随行：两端皆认证主体无匿名面 + 每连接限流（20 帧/10s）独立
+  兜底 + 协议卫生语义保留；media 解码上限顺带从实际 192KB 解放至 ~5.9MB
+
+### 已知限制
+- iOS 后台切换打断录音流无恢复（表现 = 错误可重试）；whisper 对静音 / 非语音会幻觉
+  出词（Whisper 典型行为，真实语音不影响）
+
+## [1.39.2] — 2026-11-07
+
+### Changed
+- 撤除 iOS 主屏模式语音**抢先拦截**（v1.39 收尾批的入口拦截改为不阻断：保持可点、
+  识别发起后失败再提示）+ 重试耗尽兜底提示（Web Speech 路径）
+
+## [1.39.1] — 2026-11-07
+
+### Fixed
+- 语音连续会话静默失败自动重试：WebKit 音频会话释放 bug——首次录音后后续会话无声，
+  检测零结果自动重试一轮
+- iOS 主屏模式语音提示：standalone（添加到主屏）下系统不支持语音识别，静默失败
+  用户可见化（Composer 🎤 行内提示改用 Safari 打开）
+
+## [1.39.0] — 2026-11-05
+
+> **diff 视图 + 语音输入 + 更新即点即刷**：agent 改了哪些文件第一次真正可见。
+
+### Added
+- **执行链 diff 视图**（双引擎）：claude-cli（Edit/Write 工具结果）与 codex-app
+  （file-change 事件）的文件修改渲染为增删行着色 + `+n/−m` 徽标——执行链时间线里
+  文件级改动直接可见，不用翻终端
+- **语音输入（Web Speech API）**：Composer 麦克风入口（zh-CN），移动端快捷说话
+- SW 新版本提示**可点击立即刷新**：toast 带按钮 + controllerchange 自动重载
+  （updateSeen / reloading 双守卫防连环重载）
+
+## [1.38.0] — 2026-11-04
+
+> **会话级模型 / 思考深度 + codex-app 审批档映射**（P1-a+b）：`/model` `/effort`
+> 从「全局切」收敛到「本会话切」，多引擎并行不再互相牵动。
+
+### Added
+- **`/effort` 会话级思考深度**：查看/设置本会话档（`default` = 清覆盖回引擎默认档）；
+  仅受支持引擎（codex-app）生效、其余如实报错；管理员门槛；web-ui 命令词条 +
+  REQUIRED 覆盖扩 17 条
+- **`/model` 会话级覆盖**：模型选择落 per-conv KV（RoundContext 收敛承载），引擎
+  解析与官方回退表按会话生效
+- **codex-app 审批档按会话映射**：`/perm` 会话级权限档对 codex-app 生效（approval
+  档随会话引擎现算），能力矩阵文案同步
+
+### Changed
+- core `RoundContext` 收敛 + extras 实例补全（会话级 KV 的统一载体）
+
+## [1.37.0] — 2026-11-03
+
+> **P0 体验批**：/stop 从「杀进程」升级为「优雅中断」，驾驶舱补齐运行态感知五件套。
+
+### Added
+- **`/stop` 优雅中断**：`Backend` trait 增 `interrupt_run` + `supports_graceful_interrupt`
+  能力位配对；codex-app 覆写（per-conv watch 信号 → `turn/interrupt` → interrupted
+  终态自然返回）；无能力位引擎（claude-cli 等）保持立即 abort 语义不变（回归钉住）——
+  能力位分流防 8s 白等
+- **审批帧可选 `timeoutSecs`**（= `permission_ask_timeout_secs`），SPA 倒计时事实源
+- **驾驶舱五项**：侧栏运行中呼吸点（streaming 卡派生）、推送深链携 machine（先切
+  机器再切会话）、系统未读徽标（App badge + 标题计数，feature-detect）、审批卡
+  「前往会话」+ 本地倒计时（0 封底「即将超时」）、粘贴图（复用选图压缩管道）
+
+## [1.36.0] — 2026-11-01
+
+### Fixed
+- **文本消息历史重放重复**（v1.8 缺口）：网关侧 text 帧与落盘行**同源取 at**；
+  SPA 侧 `mergeHistory` 按 `(text, at)` 精确匹配去重（`\u0000` 分隔防拼接歧义；
+  同文本异 at 不算重复——两次 /help 都保留；无 at 旧条目退化放行）
+
+### Added
+- **上次视图记忆**：localStorage 记住 machine + conv，重开驾驶舱不再落回默认视图；
+  恢复视图指向离线机器时沿用既有校正逻辑切首个在线机器
+- **新会话引擎选择**：快照 backends 段（`{current, options}`）→ 新会话弹窗引擎
+  chips（「默认（current）」+ 可选引擎），创建即补发 `/backend` 到新会话
+
+## [1.35.0] — 2026-10-31
+
+> **多引擎 Dispatcher**：同一网关同时注册多个 agent 引擎，按会话切换。
+
+### Added
+- **会话级 `/backend` 切换**：per-conv 覆盖 KV（`backend:<conv>`）；`/backend` 无参
+  查看当前引擎与可用名单，`/backend <name>` 下一条消息生效（切换后上下文不延续，
+  原引擎会话 `/resume` 找回）；权限档位按会话引擎现算
+- **`imagent codex <会话>`**：终端视图子命令薄包装——与 `imagent claude` 同一视图
+  实现，连接后自动代发 `/backend codex-app`（仅首连一次，幂等）
+
+### Fixed
+- `imagent join`：机器名交互预填 hostname 可改；重名拒绝文案给出解法
+
+## [1.34.0] — 2026-10-31
+
+> **codex 平级批**：codex-app 从「exec 一次性调用」升级为 app-server **双工协议**
+> 平级后端；PWA 推送 + 主题上线。
+
+### Added
+- **codex-app 后端**（批 1/2）：`codex app-server` 双工协议客户端 + Backend 骨架 →
+  装配接线（`agent = "codex-app"`）；**auto 档保留**（审批档缺省 on-request，分类器
+  筛 + 高危进 IM——唯一 resolve 后仍返 Auto 的路径）；**模型三层链**（live
+  model/list → `~/.codex/config.toml` catalog → `official_models.codex` 回退表）；
+  reasoning 上卡（💭 思考折叠区对齐 claude）
+- **PWA + Web Push**：添加到主屏 + service worker；任务完成 / 审批到达推送手机
+  （VAPID，推送深链直达会话）
+- **主题三态开关**：跟随系统 / 浅色 / 深色，默认跟随系统
+
+### Changed
+- 开源前基础设施指纹脱敏：真实域名 / 实例信息 → 通用示例值（docs 与配置示例）
+
+## [1.33.0] — 2026-10-30
+
+> **Web 驾驶舱平台全量批**（M1–M4 + 十一批迭代，帧协议 v1.1 → v1.9）：第四/五平台
+> **web**（浏览器驾驶舱）与 **local**（本地终端薄视图）上线。设计见
+> [docs/WEB_DESIGN.md](docs/WEB_DESIGN.md)。
+
+### Added
+- **crates/relay**（M1）：ECS 侧无状态 WS 帧中继（axum，绑 127.0.0.1:3010，Caddy
+  TLS 终结反代；SPA 静态产物内嵌；healthz）——不理解业务语义，只做认证 / 转发 /
+  离线缓冲（200 帧 / 1MB）/ 每连接限流（20 帧/10s）
+- **crates/web**（M2）：网关侧 WebPlatform——出站 WS 客户端（Mac **零入站端口**）
+  + `impl Platform` 全量接线
+- **MultiPlatform 组合器**（M2.5）：`platforms = ["feishu", "web"]` 多平台并存
+  （conv 前缀路由，Dispatcher 零改动；非空时优先于 `platform` 单值）
+- **web-ui SPA**（M3a/M3b）：Vite + React + Tailwind——执行链时间线、流式渲染、
+  消息气泡 / 代码高亮、响应式布局、会话侧栏、命令面板（斜杠菜单）
+- **安全四层**（帧协议 v1.1–v1.4）：
+  ① v1.1 **多终端管理**——多台 Mac 网关接同一 relay，machine 槽位（每机单连接，
+  同机重连顶替旧连接；被顶替 close 4001 不自动重连，防互踢死循环）；浏览器侧多
+  连接并存 + 广播（上限 8）
+  ② v1.2 **L2 会话凭证层**——USER_TOKEN 仅登录一次性换发 30 天 sessionToken
+  （浏览器不长持）；设备列表 / 吊销；token-machine 绑定（每机独立 token，泄露只能
+  扮演本机）
+  ③ v1.3 **passkey（WebAuthn）登录** + **网关 ed25519 挑战应答**（一次性 nonce，
+  relay 只存公钥——ECS 被攻破不泄露网关身份；token 路径保留为回退）
+  ④ v1.4 **E2E 中继盲化**——业务帧对 relay 全密文（`enc{sid,box}`），内容层信任
+  链闭环
+- **管理面**（帧协议 v1.5）：网页管理页（机器登记 / 用户管理）+ re-auth + 新设备
+  配对
+- **Workspace**（帧协议 v1.6）：新会话选目录、会话目录常驻可见、与终端 `/ws` `/cd`
+  同源互通（store KV 共享，MultiPlatform 广播 workdir 变更）
+- **媒体上行 + 会话持久化**（帧协议 v1.7）：手机发图给 agent（≤ 8MB，mime 白名单，
+  落盘 0600）；workspaces 快照 sessions 段（手动名优先 / 首条消息摘要 24 码点）
+- **会话历史网关落盘**（帧协议 v1.8）：打开会话增量重放——刷新 / 掉线窗口消息不丢
+- **会话语义标题**（帧协议 v1.9）：headless CLI 懒生成，机械摘要自动升级
+- **模型菜单动态化**：CLI 配置映射优先（ccswitch 第三方供应商场景）+ 网关官方列表
+  回退 + 快照下发
+- **crates/localterm**：`imagent claude <会话>` 本地终端**薄视图**——会话从网关
+  出生（conv `local:<名>`），Ctrl-C / exit 只退视图、会话继续跑（重入续看 / 网页侧
+  实时镜像 + 完全干预）；peer uid 校验
+- **`imagent join` 接入向导**：新 Mac 零 token 接入——幂等装配 ed25519 身份（复用
+  既有身份绝不重建）→ 合并写 config 四键 → 打印公钥 + 指纹供管理页登记；全参数
+  可脚本化零交互
+- **消息本地缓存 + iOS 前台探活**：刷新 / 切回内容不再丢
+- CSP 安全响应头全量覆盖
+
+### Changed
+- 部署事实：ECS relay 经 systemd（DynamicUser 加固）常驻；SPA 产物经 rust-embed
+  内嵌 relay 二进制（升级 relay 即升级前端）
+
 ## [1.32.0] — 2026-10-22
 
 > **OS 级沙箱批**：把 SECURITY.md 威胁模型的「进程面」约束下沉到内核层。
