@@ -1,59 +1,126 @@
 # imagent
 
-> **Instant messaging, meet your agent.**
+> **Instant messaging, meet your agent.** — 把自主 agent 关进你批准的笼子，再把笼子装进口袋。
 
-一个用 Rust 写的、把自主 agent 接进你随身终端的网关。**任何 IM**（个人微信 iLink / 企业微信 WeCom / 飞书）+ **Web 驾驶舱**（手机 PWA / 桌面浏览器）+ **本地终端** ↔ **任何 agent**（Claude Code / Codex / Gemini）。
+任何 IM（个人微信 iLink / 企业微信 WeCom / 飞书）+ **Web 驾驶舱**（手机 PWA / 桌面浏览器）+ 本地终端 ↔ 任何 agent（Claude Code / Codex / Gemini / 任意 ACP）。Rust 单二进制。
 
 ![Rust](https://img.shields.io/badge/Rust-edition%202021-orange) ![License: MIT](https://img.shields.io/badge/License-MIT-blue) ![CI](https://github.com/uzziahlin/imagent/actions/workflows/ci.yml/badge.svg) ![GitHub release](https://img.shields.io/github/v/release/uzziahlin/imagent) ![Docs](https://img.shields.io/badge/docs-mdBook-blueviolet)
 
-> 🌐 **English TL;DR** — `imagent` is a Rust gateway that connects autonomous agents (**Claude Code** / Codex / Gemini / anything ACP) to the terminal you actually carry: IM platforms (WeChat **iLink** / **WeCom** / **Feishu**), a browser **Web cockpit** (mobile PWA / desktop, via a self-hosted relay with **end-to-end encryption** and zero inbound ports on your machine), and the local terminal. It turns any of them into an **approval-gated** agent cockpit: the agent runs real tasks (read/write files, run commands, edit code) but must ask for your `y/n` (or a tap on an approval card) before any dangerous tool. Session-level engine switching (`/backend`), model hot-swap (`/model`), thinking depth (`/effort`), local voice transcription (whisper on your own machine), OS-level agent sandbox, pluggable on both sides (`Platform` / `Backend` traits), single binary, SQLite-backed sessions, crash-safe message queue, scheduled prompts (`/cron`), batched messages, graceful `/stop` and an idle watchdog.
-> **Unofficial — not affiliated with Tencent or Anthropic.** iLink is a third-party Rust re-implementation of Tencent's OpenClaw Weixin protocol; compliance and account risk are solely yours.
-> The documentation below is in Chinese (the project targets the WeChat ecosystem).
+> 🌐 **English TL;DR** — A Rust gateway that puts autonomous agents behind your approval: any IM (WeChat **iLink** / **WeCom** / **Feishu**), a browser **cockpit** (mobile PWA / desktop — self-hosted relay, E2E-encrypted, zero inbound ports), or your local terminal drives **Claude Code / Codex / Gemini**. Dangerous tool calls require your explicit y/n — a tap on an approval card in IM or web — with an OS-level sandbox underneath.
+> **Unofficial — not affiliated with Tencent or Anthropic.** iLink is a third-party Rust re-implementation of Tencent's OpenClaw Weixin protocol; the docs below are in Chinese (the project targets the WeChat ecosystem).
 
----
+## 用起来长这样
+
+```
+你（手机飞书）    把 ~/data/results.csv 画成趋势图，发到「数据组」群
+
+🤖 agent          需要执行 Bash(python ~/plot.py ~/data/results.csv)
+                  🔐 权限审批卡 →  [✅ 允许]  [⛔ 拒绝]  [始终允许]
+
+你                （手机上点「允许」）
+
+🤖 agent          ✅ 已完成 → 📊 chart.png 已发到「数据组」群
+                  ⚙️ Bash · 1.2s    📎 Read ~/plot.py → Write ~/out/chart.png
+```
+
+三个杀手锏：
+
+- 🔐 **审批闭环** — agent 每个危险操作（`Bash` / 外发 / 强推…）先向你请示：飞书按钮卡片、Web 审批卡、或文本 y/n；「始终允许」记住你的选择。OS 级沙箱（macOS Seatbelt / Linux bwrap）在内核层兜底。
+- 🖥️ **Web 驾驶舱** — 手机 PWA / 桌面浏览器远程驾驶**多台 Mac** 上的 agent：markdown 流式渲染、审批、`/stop`、系统推送、语音转写。自建中继：Mac **零入站端口**、业务帧**端到端加密**、relay 只存公钥不碰私钥。
+- 🌉 **5 入口 × 6 引擎** — 微信 / 企微 / 飞书 / Web / 终端 ↔ Claude Code / Codex(app) / Gemini / 任意 ACP。`Platform` / `Backend` 双 trait 解耦，多平台同进程并存（`platforms = ["feishu", "web"]`），会话级 `/backend` 热切引擎。
 
 ## ⚠️ 免责声明
 
-imagent 是**非官方**第三方开源项目，**不隶属于腾讯或 Anthropic**。
+imagent 是**非官方**第三方开源项目，**不隶属于腾讯或 Anthropic**。iLink 接入基于腾讯官方 [OpenClaw Weixin channel 协议](https://github.com/Tencent/openclaw-weixin)的第三方实现（非逆向方案）；使用可能违反微信/腾讯服务条款，**账号风险自负**（建议绑定小号）。仅做**服从式退避**（被限流就退避等待），**绝不实现**绕过频率/风控的功能。仅供学习研究。详见 [`docs/RESEARCH.md`](docs/RESEARCH.md) §2。
 
-- iLink（智联 / ClawBot）接入定位为「[OpenClaw Weixin channel 协议](https://github.com/Tencent/openclaw-weixin)的 Rust 实现」——基于腾讯官方对外协议，**非** iPad 协议 / PC-hook 等逆向方案。使用者**自负合规责任**：使用可能违反微信/腾讯服务条款，账号风险（封号等）由使用者承担。
-- 仅做**服从式退避**（被限流就退避等待），**绝不实现**绕过频率/风控的功能（ClawBot 条款 §4.6 红线）。
-- 仅供学习研究。商用/生产使用前请咨询法律意见。建议绑定**小号**。
+## 快速开始
 
-详见 [`docs/RESEARCH.md`](docs/RESEARCH.md) §2。
+### ① 安装
 
-## 是什么
+**一键脚本（推荐）**：装二进制（含 sha256 校验）→ 首次生成 config → 自动挂载 MCP。已有 config 绝不覆盖，可重复运行：
 
-imagent 是一个常驻网关进程：监听你的任意入口（IM 私聊 / 群聊、Web 驾驶舱、本地终端）→ 鉴权 → 驱动 agent（默认 Claude Code）执行真实任务（读写文件 / 跑命令 / 改代码）→ 把结果流式回传。
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/uzziahlin/imagent/main/install.sh)
+```
 
-**杀手锏**：agent 遇危险操作（如 `Bash`）时，向你 approve/deny（飞书按钮卡片 / Web 审批卡 / 文本 y/n）——把 agent 的执行权关进用户审批的笼子。
+**预编译二进制**（每个 release 附 `sha256`）：从 [Releases](https://github.com/uzziahlin/imagent/releases) 下载 `imagent-darwin-arm64` / `imagent-darwin-x86_64` / `imagent-linux-x86_64`，`chmod +x` 后放到 `PATH`。
 
-## 特性
+**源码构建**（Rust 1.88+；飞书平台需额外 `protoc`：`brew install protobuf`）：
 
-- 🌉 **平台 / 后端双抽象 + 多平台并存**：换入口只加 adapter，换 agent 只加 impl；`platforms = ["feishu", "web"]` 一进程多平台并存（MultiPlatform 组合器按 conv 前缀路由，Dispatcher 零改动）。
-- 🖥️ **Web 驾驶舱**（v1.33+）：手机 PWA / 桌面浏览器远程驾驶多台 Mac 上的 agent——markdown 流式渲染（代码高亮 / 工具卡折叠 / 执行链 diff 视图）、审批卡（倒计时 / 始终允许）、优雅 `/stop`、运行态呼吸点、PWA 推送 + 未读徽标 + 深链、粘贴图、亮暗主题、视图记忆。自建 ECS relay 中继：Mac 网关**零入站端口**、业务帧**端到端加密**（中继盲化）、ed25519 挑战应答 + passkey 登录（见[Web 驾驶舱](#web-驾驶舱)）。
-- ⌨️ **本地终端薄视图**：`imagent claude <会话>` / `imagent codex <会话>`——会话在网关出生、终端只是视图（Ctrl-C 只退视图，会话继续跑：重入续看 / 网页侧接管）；/命令照常、审批行内回复、断线自动重连。
-- 🧭 **多引擎会话级切换**：`/backend` 按会话切引擎、`/model` 热切模型、`/effort` 会话级思考深度；codex-app 升为**平级后端**（审批闭环 / steering / model-list 全量可用）。
-- 🎙️ **语音转写（whisper 本地）**：驾驶舱录音（Web Audio 16k WAV）→ 网关 spawn `whisper-cli` **本机转写**回填输入框——识别计算在 Mac、不上传云端；桌面浏览器在未配置 whisper 时回退 Web Speech API。
-- 🔐 **安全第一**：发送者白名单 + 会话（群）白名单 + `allowed_tools` 收敛 + workdir 锁定 + **IM 内权限审批闭环**（按钮卡片 / 文本 y/n——按钮卡片仅飞书）+ **OS 级 agent 沙箱**（v1.32 默认开，仅 claude-cli：内核层 deny 状态目录 `~/.imagent`（审批 sock/token/mcp json 例外）与持久化热点写（`~/.ssh`、shell rc、LaunchAgents）——Bash/子进程间接读取同被拦；`strict` 档再把写收敛到 workdir/临时目录；macOS Seatbelt / Linux bwrap，`/doctor` 可见档位）。
-- 💬 **会话连续**：per-chat session 持久化（SQLite），重启可续；`--resume`；`/switch` 多命名会话；`/resume` 统一列表无感接管历史/电脑端 Claude Code 会话。
-- ⏰ **定时任务（/cron）**：5 字段 cron 表达式（本地时区含 DST）+ store 持久化，到期消息走与手打完全相同的鉴权/审批管线——日报、巡检、定时批处理一句话建好；停机补跑策略 `cron_catchup = one|off|all`（逐周期补跑上限 3 条 / 陈旧跳过 / 触发一次）。
-- 📡 **Webhook 入站**：`POST /hook/<token>` 把 CI 失败、监控告警等外部事件注入指定会话——与手打消息同权走鉴权/审批管线（token 路径鉴权 + HMAC 验签 + 两层防重放 + 会话白名单，无旁路；非 loopback 绑定未配 secret 拒绝启动），agent 接事件自动排障、审批卡上放行修复。
-- 🛑 **任务控制（steering）**：`/stop` 中断在飞任务（codex-app 走 **turn/interrupt 优雅中断**有界等待，其余引擎立即杀子进程），**排队消息保留并自动转入下一轮**（对齐 Claude Code 的 Esc + 队列注入语义——运行中发补充/纠正不再丢，注入条数上卡片 footer 可见）；空闲看门狗自动终止无输出的僵死任务；失败后一键 `/retry` 续接。
-- 🛟 **崩溃不丢消息**：排队消息实时落库（schema v12），进程崩溃 / `kill -9` / 断电后重启自动重放——批处理与 steering 队列不再随进程消失；**执行中的轮次**同样留痕（轮首落 inflight 标记），重启后通知会话可 `/retry` 一键续跑。
-- 🔁 **消息批处理**：运行中到达的消息排队，与连发消息合并为一轮执行（不重复跑轮、不烧 token；批窗口静默判停自适应）；`/queue list|drop` 队列可视化管理。
-- 📊 **用量护栏**：`/stats` 成本统计 + 自动 compact（**比例档：水位达模型上下文窗口 80% 触发**；ACP 路径经 `UsageUpdate.size` **自动学习真实窗口**——200k 模型零配置防溢出）+ per-sender 成本上限（滚动 24h）；压缩通知/摘要走命令卡。
-- 💭 **thinking / 任务清单**：思考过程与正文分离透出（卡片折叠区展示，cot 档位控制）；Claude Code 的 Task* / ACP Plan 渲染成卡片 checklist 进度。
-- 🎤 **语音输入（飞书）**：语音条自动转文字进 prompt（speech_to_text，需后台申请语音识别权限）。
-- 🛠️ **IM 内运维**：`/status` `/doctor` `/reconnect` `/config`（COT 三档展示 off/brief/detailed 等热改；SIGHUP 热载工具白名单/审批集/管理员名单/压缩阈值）。
-- 📄 **飞书生态**（一等公民）：CardKit 真流式卡片（分阶段 footer + 工具 ⏳/✅ 实时行 + ⏹ 终止按钮）、审批/问题/命令标题卡（按钮 primary/danger + flow 自适应布局）、`/config` 下拉表单卡、邮箱掩码防租户审计拦截、云文档评论 @bot 触发（同评论线程回复）、合并转发聊天记录自动转录、**群聊上下文注入**（群消息触发轮次自动拉本群最近 N 条消息作前置上下文——Slack 线程上下文的飞书等价物，`feishu_group_context_messages`，默认 10、0=关闭）、**群里回复 bot 消息发图/文件 = 显式定向**（豁免 @，手机端纯图片可达）、**多维表格数据面**（agent 经 `bitable_list_fields` / `bitable_append_row` 工具把任务清单、巡检结果、成本台账等结构化产出直接写进飞书 Bitable——Slack 生态无等价物，见[多维表格数据面](#多维表格数据面agent-的结构化产出)）。
-- 💻 **终端 agent 反向接入（ask_via_im）**：电脑终端上任意 agent 需要你决策时，把问题转发到飞书——人不在电脑前也能在手机上点按钮作答；多 agent 并发按 request_id 精确分发（见[终端 agent 接入](#终端-agent-接入ask_via-im人不在电脑前也能问你)）。
-- 🔀 **委托编排（[[delegate]] + /delegate）**：把命名副后端（codex / gemini / claude-cli）配成「子任务执行器」——agent 在一轮内经 `delegate_run` 工具自行 fan-out（如 Claude 写完代码自动叫 codex 审查），用户也可 `/delegate <name> <子任务>` 显式派活。副轮 one-shot、不占主会话上下文；工具面**缺省只读三件套**（Read/Grep/Glob——codex 映射 read-only 沙箱、claude-cli 映射 `--allowedTools` 且危险工具被拒）、预算 agent 只能调低、全局并发闸 4、输出头尾窗截断；SIGHUP 热改（见 CHANGELOG v1.31.0 已知限制：副轮用量暂不计入 /stats、claude 副轮会话在本机 /resume 列表可见）。
-- 🧩 **Profile 多实例**：`--profile` 一部署多 bot 身份（config/db/socket/媒体全隔离）。
-- 🛡️ **限流熔断**：`sendmessage` 服从式退避（防封号，不绕风控）。
-- 🎨 **媒体收发**：图片 / 文件（AES-128-ECB + CDN，协议强制；仅 iLink——飞书走 OpenAPI 上传，wecom 暂不支持媒体发送）；下载/转码全程超时与大小上限，媒体目录 7 天自动 GC。
-- ⚡ **流式反馈**：工具调用摘要（`Bash — git status` 人可读单行 + 执行状态图标）、typing 指示、中间事件推流；媒体处理与消息收发解耦——飞书已完全解耦（文本先投递、媒体异步后补），iLink 为批内并发下载（4 并发限流）+ 单条消息 60s 总预算限界，大文件不再无限期阻塞收发。
-- 📦 **单二进制**、低占用，适合常驻 NAS / 小服务器 / 笔记本；`service install` 一键装成 launchd/systemd 服务（异常退出自动拉起）。
+```bash
+git clone https://github.com/uzziahlin/imagent && cd imagent
+cargo build --release    # 二进制：target/release/imagent
+```
+
+### ② 最小配置（飞书 · 5 分钟）
+
+```bash
+mkdir -p ~/.imagent
+cat > ~/.imagent/config.toml <<'EOF'
+default_workdir = "/absolute/path/to/agent/workspace"   # 必填：agent 的工作目录
+platform = "feishu"
+feishu_app_id = "cli_xxx"     # 开放平台「凭证与基础信息」页拿
+allowed_senders = []          # 空 = 发现模式：首启日志里拿你的 open_id
+EOF
+export IMAGENT_FEISHU_APP_SECRET="你的 App Secret"   # secret 不落 config
+```
+
+> 飞书应用的创建 / 事件订阅 / 权限开通 / 发布，见下文[飞书（完整流程）](#飞书完整流程)四步表。其它平台（WeCom / iLink / Web）见[接入平台](#接入平台)。
+
+### ③ 跑起来
+
+```bash
+imagent start                # 前台常驻；日志看到 connected to wss://msg-frontier.feishu.cn 即成功
+# 在飞书里给 bot 发一条消息 → 日志打出你的 ou_xxx open_id →
+imagent allow ou_xxx         # 授权自己
+# 再发消息：agent 执行 → 结果流式回传。权限审批见上方示意图。
+```
+
+> ⚠️ **macOS 撞名**：`imagent` 也是 macOS 系统输入法进程。**不要 `pkill imagent`**——会杀掉系统输入法。停止本程序用前台 `Ctrl-C` 或全路径 `kill $(pgrep -f /usr/local/bin/imagent)`。
+
+更多命令（`/switch` `/cron` `/model` …）见 [docs/COMMANDS.md](docs/COMMANDS.md)；逐键配置参考见 [docs/CONFIG.md](docs/CONFIG.md)。
+
+## 你属于哪种场景？
+
+| 你想… | 去哪 |
+|---|---|
+| 在飞书 / 微信 / 企微里使唤 agent，审批全走手机 | [接入平台](#接入平台) |
+| 浏览器/手机 PWA 远程驾驶电脑上的 agent | [Web 驾驶舱](#web-驾驶舱) |
+| CI 失败、监控告警自动触发 agent 排障 | [Webhook 事件入站](#webhook-事件入站) |
+| 定时巡检 / 日报，agent 每天自己跑 | `/cron`（[命令参考](docs/COMMANDS.md#定时任务)） |
+| agent 把结构化产出写进飞书多维表格 | [多维表格数据面](#多维表格数据面bitable) |
+| 终端上的 agent 有事在手机上问你 | [ask_via_im](#终端-agent-反向接入ask_via_im) |
+| 多 agent 协作（Claude 写完叫 Codex 审） | [委托编排](#委托编排delegate) |
+| 换 agent 引擎 / 接任意 ACP agent | [agent 与引擎](docs/CONFIG.md#agent-与引擎) |
+
+## 核心特性
+
+- 🔐 **安全闭环**：sender + 会话双白名单、`allowed_tools` 工具收敛、workdir 锁定、**IM 内权限审批闭环**、**OS 级 agent 沙箱**（默认 auto：状态目录与持久化热点内核层 deny，Bash 子进程间接读取同被拦）。
+- 🖥️ **Web 驾驶舱**：PWA / 桌面，多机器管理、流式渲染、执行链 diff 视图、审批卡（倒计时）、推送深链、未读徽标、粘贴图、语音转写（whisper 本地）。
+- 🌉 **多平台并存**：`platforms = ["feishu","web"]` 一进程多平台，conv 前缀路由，Dispatcher 零改动。
+- 🧭 **多引擎会话级切换**：`/backend` 切引擎、`/model` 热切模型、`/effort` 思考深度；codex-app 平级后端（审批闭环 / steering 全量可用）。
+- 💬 **会话连续**：per-chat session 落 SQLite（bundled 静态链接），重启可续（`--resume`）；排队消息实时落库——**崩溃不丢**（`kill -9` / 断电后自动重放）；`/resume` 统一接管 IM + 电脑端 Claude Code 会话。
+- 🛑 **任务控制**：`/stop` 优雅中断（codex-app turn/interrupt 有界等待，排队消息自动转入下一轮）；连发消息批处理合并一轮；空闲看门狗；`/retry` 一键续接。
+- ⏰ **自动化**：`/cron` 定时任务（停机补跑策略）、Webhook 事件入站（HMAC 验签 + 双层防重放）、委托编排 fan-out、Bitable 数据面。
+- 📦 **低负担运维**：单二进制、`service install` 一键装 launchd/systemd（崩溃自动拉起）、`imagent backup` 一致性快照、`/doctor` 自检、Profile 多实例。
+
+<details>
+<summary><b>全部特性（细节展开）</b></summary>
+
+- 🛡️ **限流熔断**：`sendmessage` 服从式退避（防封号，不绕风控）；iLink 媒体批内 4 并发限流 + 60s 总预算。
+- 💭 **thinking / 任务清单**：思考过程与正文分离透出（cot 三档控制）；Task* / ACP Plan 渲染成 checklist 进度卡。
+- 📊 **用量护栏**：`/stats` 成本统计 + 自动 compact（比例档：窗口 × 80%，默认关闭显式开启）+ per-sender 成本上限；ACP 自动学习真实窗口。
+- 📡 **Webhook 入站**：`POST /hook/<token>` 注入 CI/告警——与手打消息同权走鉴权/审批管线，无旁路。
+- 🎨 **媒体收发**：图片 / 文件（iLink 协议强制 AES-128-ECB + CDN；飞书走 OpenAPI；媒体目录 7 天 GC）。
+- ⚡ **流式反馈**：工具调用摘要单行 + 状态图标、typing 指示；飞书文本先投递、媒体异步后补（收发解耦）。
+- 📄 **飞书生态**：CardKit 真流式卡片、审批/问题/命令按钮卡、`/config` 表单卡、云文档评论 @bot、合并转发转录、群聊上下文注入、表情回应快速审批（👍/👎）、自定义菜单回 /help。
+- 🔀 **委托编排**：`[[delegate]]` 副后端 one-shot fan-out，缺省只读三件套、预算只降不升、全局并发闸 4。
+- 🎙️ **飞书语音输入**：语音条自动转文字（speech_to_text）。
+- 🧩 **Profile 多实例**：一机多 bot 身份（config/db/socket/媒体全隔离）+ `profile export/import` 跨机迁移。
+- 🛟 **崩溃轮次恢复**：执行中轮次留痕，重启后 `/retry` 续跑。
+- 📁 **命名工作空间**：`/ws` `/cd` 与 Web 驾驶舱同源互通。
+
+</details>
 
 ## 架构
 
@@ -70,475 +137,106 @@ trait Platform                            trait Backend
                     会话白名单 / 统一 resume / 多引擎 Dispatcher(会话级 /backend)
 ```
 
-**平台能力边界**：五平台体验并不对等——卡片交互（流式卡/审批按钮卡/命令卡/表单卡）**仅飞书**支持，wecom 与 ilink 自动降级为纯文本 + y/n 审批；**wecom** 为单聊文本通道，暂不支持群聊与媒体发送（`/img` `/file` 会明确报错而非谎报成功）；**ilink** 仅私聊可靠工作（普通微信群基本不可用，见 RESEARCH.md），整体标记为实验性；**web** 驾驶舱自带完整卡片交互（SPA 自渲染，不依赖平台卡片体系），消息 sender 恒为 `web:user`（须加白名单）；**local** 零配置（`platforms` 加 `"local"` 即可）。
+三层 + 双抽象：core 只认 `Platform` / `Backend` 两个 trait，平台与后端各自独立可换、多平台经 MultiPlatform 组合器并存；session 生命周期收到 core（store 持久化），Backend 退化为无状态执行器——支持重启续接。
 
-三层 + 双抽象：core 持有 `Platform` 与 `Backend` trait，平台与后端各自独立可换；多平台经 MultiPlatform 组合器并存（conv 前缀路由）。session 生命周期提到 core（store 持久化），Backend 退化为无状态执行器——比把 session 塞进 Backend 内存更干净，支持重启续接。
+**平台能力边界**：五平台体验不对等——卡片交互**仅飞书**（wecom/ilink 降级纯文本 + y/n 审批）；**wecom** 单聊文本、暂不支持群聊与媒体发送（明确报错不谎报成功）；**ilink** 仅私聊可靠（实验性，见 RESEARCH.md）；**web** 自带完整卡片交互（SPA 自渲染）；**local** 零配置。
 
-## 设计取舍
+## 接入平台
 
-imagent 的几个关键取舍（解释「为什么这么设计」，而非与某个项目比高低）：
+### 飞书（完整流程）
 
-- **发送者白名单是硬约束，不是可选**：iLink bot 任何人都能加好友，没有白名单 = 任意人都能驱动你的 agent 执行命令。
-- **session 持久化到 SQLite**：进程重启可续（`--resume`），崩溃不丢上下文；排队消息同样落库（schema v12）——重启重放。SQLite 经 `rusqlite` 的 `bundled` feature **静态链接进二进制**，运行时无需宿主安装 SQLite。
-- **IM 内权限审批闭环**（核心特性）：危险工具（如 `Bash`）执行前，先在 IM 向你 approve/deny——把 agent 的执行权关进用户审批的笼子。
-- **Web 平台「中继 + 零入站 + 盲化」**：Mac 网关不开任何入站端口（客户端模式外连自建 ECS relay）；relay 不理解业务语义、只做认证与转发，且业务帧**端到端加密**——ECS 被攻破只见密文，私钥永不出网关本机。
-- **自动压缩可选、默认关闭**：上下文水位（input + cache_read）达「模型窗口 × 比例」才压缩；v1.27.0 起默认不启用（网关 token 口径与 CLI 估算存在偏差，误压缩丢上下文细节的代价高于收益），显式声明 `model_context_window_tokens`（比例档）或 `auto_compact_threshold_tokens`（绝对值档）开启；200k 窗口的 Claude 系模型声明 200000 即可，双档并存。
-- **限流服从式退避**：被限流就退避等待，**绝不绕过风控**（合规红线）。
-- **单二进制 + 低运行时依赖**：除 Linux 下凭据可选经 `libdbus`（Secret Service；无该环境则自动回退，见 [安全](#安全)）外，不依赖宿主环境。
+走**企业自建应用 + 长连接**：免公网 IP / 域名 / 证书。全程约 10 分钟（`imagent setup --platform feishu` 可交互走一遍并校验连通性）：
 
-## 快速开始
+**① 创建应用**：[open.feishu.cn/app](https://open.feishu.cn/app) →「创建企业自建应用」→「添加应用能力」→ 启用**机器人**。
 
-### 安装
-
-**前置**：macOS 或 Linux（Windows 暂不支持——IM 权限审批闭环与配置热重载依赖 Unix domain socket / SIGHUP）；默认 agent 后端 Claude Code CLI（`npm i -g @anthropic-ai/claude-code`）。
-
-**方式零 · 一键脚本（推荐）**：安装二进制（含 sha256 校验）→ 首次生成 `~/.imagent/config.toml`（可交互填飞书凭据）→ 自动挂载 MCP（有 `claude` CLI 直接 `claude mcp add`，否则打印可贴的 JSON）。已有 config 绝不覆盖，可重复运行：
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/uzziahlin/imagent/main/install.sh)
-# 等价参数式：--workdir <path> --app-id <cli_xxx> --secret <s> --yes --mcp-only
-#            （--version <tag> / --bin <dir> 指定版本与安装目录；详见脚本头注释）
-```
-
-> 最新 release 尚未包含 `mcp-ask` 子命令（ask_via_im 需 v1.3.0+）时，脚本检测到后会用本机 cargo 自动源码构建兜底。
-
-**方式一 · 下载预编译二进制（免装 Rust）**：从 [GitHub Releases](https://github.com/uzziahlin/imagent/releases) 取对应平台文件（每个 release 附 `sha256` 校验）：
-
-| 平台 | 文件 |
-|---|---|
-| macOS · Apple Silicon | `imagent-darwin-arm64` |
-| macOS · Intel | `imagent-darwin-x86_64` |
-| Linux · x86_64 | `imagent-linux-x86_64` |
-
-```bash
-# 示例：macOS Apple Silicon
-curl -L -o imagent https://github.com/uzziahlin/imagent/releases/latest/download/imagent-darwin-arm64
-chmod +x imagent && sudo mv imagent /usr/local/bin/
-# 可选：校验完整性
-curl -L -o /tmp/imagent.sha256 https://github.com/uzziahlin/imagent/releases/latest/download/imagent-darwin-arm64.sha256
-(cd /tmp && shasum -a 256 -c imagent.sha256)
-```
-
-**方式二 · 源码构建（需 Rust 1.88+；启用飞书平台需额外 `protoc`）**：
-
-> 飞书平台经 `open-lark` 的 websocket feature 编译，其 build script 需要系统 `protoc`（Protocol Buffers 编译器）：macOS `brew install protobuf`，Ubuntu `sudo apt-get install -y protobuf-compiler`。**仅构建时需要，运行时不需要**。
-
-```bash
-git clone https://github.com/uzziahlin/imagent
-cd imagent
-cargo build --release
-# 二进制：target/release/imagent
-```
-
-### 配置
-
-```bash
-mkdir -p ~/.imagent
-cat > ~/.imagent/config.toml <<'EOF'
-default_workdir = "/absolute/path/to/agent/workspace"  # 必填，agent 的 cwd（OS 级沙箱见 agent_sandbox；靠 allowed_tools + permission_mode 兜底）
-allowed_senders = []        # 留空 = 发现模式（先看日志拿你的 from_user_id）
-# allowed_tools 不写 = 全部工具（不收敛）；要白名单就显式列，如 ["Read","Edit"]；执行类建议配 permission_mode="ask" 过审
-# permission_mode = "auto"  # 缺省=auto：claude-cli=透传 claude 原生 auto 模式(分类器自动放行安全操作,高危进 IM)+审批闭环；codex-app=保留 auto(审批档缺省 on-request,同样分类器筛+高危进 IM)；其余后端=off；显式 ask=每个提示都进 IM
-# backend_permission_mode = "auto"  # 后端原生权限模式透传(claude→--permission-mode，覆盖 auto 档缺省)：default|acceptEdits|plan|auto|dontAsk|bypassPermissions；codex/codex-app/gemini 暂不支持透传(warn 忽略；codex-app 审批档走构造缺省 on-request)
-# approval_tools = ["Bash", "WebFetch", "mcp__*"]  # 审批集：ask 模式下只有这些工具过 IM 审批，其余直接放行；空=全部过审
-# agent = "claude-cli"   # 换 agent 后端：claude-cli(默认) | claude-acp(Claude ACP 长驻子进程) | acp(任意 ACP agent，配 acp_command) | codex(codex exec) | codex-app(app-server 双工，审批闭环/steering 全量可用) | gemini
-# [official_models]  # /model 菜单官方回退列表（per-backend 表；旧单列表 official_models=["a","b"] 仍兼容，映射到 claude）
-# claude = ["sonnet", "opus", "haiku"]             # claude 系最末层回退（缺省=此三件）
-# codex = ["gpt-5-codex", "gpt-5.1-codex-mini"]    # codex-app 最末层回退（缺省=此两件；实时 model/list 与 ~/.codex/config.toml 目录优先）
-# acp_command = "opencode-acp"  # agent="acp" 必填：启动目标 ACP agent 的命令（如 "opencode-acp" / "gemini --experimental-acp"，以目标 agent 的 ACP 接入文档为准；claude-acp 下可选覆盖默认命令，优先级 acp_command > 环境变量 IMAGENT_ACP_COMMAND > claude-agent-acp）
-# allowed_chats = ["feishu:oc_xxx"]  # 会话(群)白名单：群消息 chat 放行 OR sender 放行（/chat 可动态管理）
-# ask_via_im_conv = "feishu:ou_xxx"  # 终端 agent 的 ask_via_im 提问投递会话（配了才启用，见「终端 agent 接入」）
-# agent_timeout_secs = 3600          # 单次运行总超时(秒)；默认 1 小时，0=关闭(防挂死全靠空闲看门狗)
-# agent_idle_timeout_secs = 1200     # 空闲看门狗：连续无输出 N 秒自动终止；默认 20 分钟（0=关；/timeout 可按会话覆盖）
-# batch_window_ms = 1500             # 连发消息合并为一轮 prompt 的窗口（0=关）
-# cot_detail = "brief"               # 工具过程展示 off / brief / detailed（/config 可热改；/config cot 为 per-conv 覆盖）
-# quiet_hours = "22:00-08:00"        # 免打扰时段(本地时区,可跨天)：时段内加急(buzz)提醒降级普通消息，内容不变；不设=不启用
-# feishu_thread_active_window_secs = 1800  # 话题群免@窗口(秒)：话题内近期有消息则豁免群消息须@bot；默认30分钟，0=关闭
-# feishu_bitable_app_token = "bascnXXX"    # 多维表格数据面（仅 feishu + claude-cli）：app_token + table_id 齐备才启用，
-# feishu_bitable_table_id  = "tblXXX"      #   agent 获得 bitable_list_fields/bitable_append_row 工具可向该表写行（建议专用表）
-# ===== OS 级 agent 沙箱（v1.32，仅 claude-cli；默认 auto）=====
-# auto  = 内核层 deny：状态目录 ~/.imagent（读+写；例外审批 sock/token/每轮 mcp json）
-#         + 持久化热点写（~/.ssh、shell rc、LaunchAgents；读保留）——正常开发零影响；
-# strict = 再把写收敛到 workdir/临时目录/~/.claude/agent_sandbox_extra_write（包管理器
-#          缓存 ~/.npm、~/.cargo 等需显式加清单）；off = 关闭。
-# macOS = sandbox-exec（Seatbelt）；Linux = bwrap（未安装降级 off+warn）。SIGHUP 热改。
-# agent_sandbox = "auto"
-# agent_sandbox_extra_write = []   # strict 档额外可写目录（绝对路径）
-# 委托编排（v1.31）：配置后 claude-cli agent 获得 delegate_run 工具、/delegate 命令可用——
-# 把子任务 fan-out 给副后端（如 Claude 写完叫 codex 审）。副轮缺省只读（Read/Grep/Glob）、
-# 无 IM 审批、无会话续接；SIGHUP 热改生效。
-# [[delegate]]
-# name = "review"              # 委托名（唯一；delegate_run / /delegate 按名调用）
-# agent = "codex"              # 副后端：codex | gemini | claude-cli（one-shot 系）
-# allowed_tools = ["Read", "Grep", "Glob"]   # 缺省只读三件套；要放宽显式列（风险自负）
-# model = "gpt-5-codex"        # 可选模型
-# timeout_secs = 600           # 单次预算（秒，缺省 600，上限 3600；工具只能调低）
-# platform = "feishu"                # wecom/feishu 经 config 凭据接入（见下）
-# platforms = ["feishu", "web"]      # 多平台并存（非空时优先于 platform 单值，conv 前缀路由；改动需重启）：
-#                                    #   元素 ∈ ilink|wecom|feishu|web|local；local=本地终端（零配置）
-
-# ===== Web 驾驶舱（platforms 含 "web" 时；完整说明见「Web 驾驶舱」章节）=====
-# web_relay_url = "wss://your-ecs:8443/imagent/gateway"  # ECS relay 端点（Caddy TLS 终结 /imagent/*）
-# web_machine_id = "home-mac"        # 本机在 relay 侧的 machine 身份（多台 Mac 接同一 relay 时区分；缺省 hostname 短名）
-# whisper_bin = "/opt/homebrew/bin/whisper-cli"          # 语音转写 whisper-cli（brew install whisper-cpp）
-# whisper_model = "~/.imagent/models/ggml-medium.bin"    # ggml 模型（中文建议 medium 及以上）；与 whisper_bin 同时配置才启用
-
-# ===== 事件入站（v1.20 webhook；v1.21 防护套件 + GitHub 原生事件；v1.24 防重放）=====
-# webhook_addr = "127.0.0.1:18443"   # POST /hook/<token>；非 loopback 绑定且任一条目未配 secret → 拒绝启动（fail-closed）
-# [[webhook]]                         # token → 会话（须 /chat allow 放行才会驱动 agent）
-# token = "0123456789abcdef0123456789abcdef"
-# conv  = "feishu:oc_xxx"
-# name  = "ci"                        # 注入消息带【ci】来源前缀
-# secret = "github-webhook-secret"    # 可选 HMAC-SHA256 验签（GitHub webhook secret 同款：
-#                                     #   X-Hub-Signature-256: sha256=<hex>；公网/隧道部署强烈建议）
-# rps = 10                            # 可选限速（请求/秒，缺省 10；0 = 不限）
-# replay_window_secs = 300            # v1.24 防重放·第 2 层（opt-in，须配 secret）：请求须带
-#                                     #   X-Imagent-Timestamp: <unix秒>，验签串改为 "{ts}.{body}"，
-#                                     #   |now-ts| > 窗口 → 401。自建发送端建议开启，示例：
-#                                     #   ts=$(date +%s); body='{"text":"CI failed"}'
-#                                     #   sig=$(printf '%s.%s' "$ts" "$body" | openssl dgst -sha256 -hmac "$SECRET" | sed 's/^.* //')
-#                                     #   curl -H "X-Imagent-Timestamp: $ts" -H "X-Hub-Signature-256: sha256=$sig" \
-#                                     #        -d "$body" http://127.0.0.1:18443/hook/<token>
-#                                     #   GitHub 原生签名不含时间戳、无法配合本协议——公网 + GitHub 场景
-#                                     #   靠第 1 层去重 + HTTPS。两层防重放：① 验签通过后按 (token,签名)
-#                                     #   去重（默认启用，10 分钟内同签名重发 409——重放字节必相同即被拦；
-#                                     #   代价：合法的同字节重发也被拦，等 10 分钟后重发即可）；② 本协议。
-#                                     #   ① 的去重记录同时持久化到 SQLite（配置 replay_window_secs 的条目，
-#                                     #   重启不失效）。
-# feishu_urgent_on_ask = true         # 审批/问题卡到达即应用内加急弹通知（缺省开；免打扰时段自动跳过）
-# GitHub 原生事件：带 X-GitHub-Event 头的请求自动解析为可读摘要注入
-#（workflow_run 终态/push/issues/评论/PR/ping；未识别事件确认但不注入）；
-# 其它来源请 POST JSON {"text":"..."} 或纯文本。
-# cron_catchup = "one"                # /cron 停机补跑：one(缺省)|off(陈旧跳过)|all(逐周期补跑,上限3)
-
-# ===== 用量护栏（v1.19 比例档）=====
-# 自动压缩：**默认关闭**（v1.27.0 起——不自动压缩、不主动提醒；需要者显式开启）。
-# 开启比例档：上下文水位达 模型窗口 × ratio 触发（摘要+重置+下轮注入【前情摘要】）。
-# model_context_window_tokens = 1000000   # 模型上下文窗口（设 >0 即开启比例档；200k 窗口的 Claude 系模型写 200000；缺省 0 = 关闭）
-# auto_compact_window_ratio = 0.8         # 触发比例（缺省 0.8；两项均支持 SIGHUP 热改）
-# auto_compact_threshold_tokens = 120000  # 绝对值档：仅窗口设 0 且本值 >0 时生效
-EOF
-```
-
-> **`allowed_tools` 要不要写？** 不必填——**缺省即全部工具**（`["*"]` 语义：不附加 claude 的 `--allowedTools`，CLI 自身默认全量；codex 收敛到 `workspace-write`、gemini 收敛到 `auto_edit`，均不进各自最高危档）。要收敛 agent 的能力边界就显式列白名单：清单外的工具 agent 根本用不了。注意**全量 ≠ 免审**——缺省 `permission_mode = "auto"`（claude-cli 即透传 Claude Code 2026 新出的 **auto 权限模式**：独立分类器逐动作审查，安全操作自动放行，只有高危动作——`curl|bash`、外发敏感数据、强推、`git reset --hard` 等——拦下经 IM 审批）下，危险操作执行前仍会在 IM 向你审批；显式写 `[]` 与 `["*"]` 同义（不限制）。嫌全审太吵？配 **`approval_tools` 审批集**（如 `["Bash", "mcp__*"]`）：只有清单内工具过 IM 审批，其余权限请求直接放行（支持尾部 `*` 前缀匹配；空 = 全部过审）。
-
-> **飞书**：`platform = "feishu"` + `feishu_app_id` + 环境变量 `IMAGENT_FEISHU_APP_SECRET`——完整开通步骤见[接入飞书](#接入飞书完整流程)。**WeCom**：`wecom_bot_id` + `wecom_secret`。两者都免公网（长连接收，HTTP 发）。
-
-> **Web 驾驶舱**：`platforms` 含 `"web"` + `web_relay_url`——网关首启自动生成 ed25519 身份（`~/.imagent/web-gateway-key`，0600），把日志打印的公钥登记到 relay 侧即可；Web 消息 sender 恒为 `web:user`，须加入 `allowed_senders`（或 `admin_senders`）。详见[Web 驾驶舱](#web-驾驶舱)。
-
-> **接入任意 ACP agent**：ACP（Agent Client Protocol）是协议不是单 agent——`agent = "acp"` + `acp_command = "<启动命令>"` 即可把任何说 ACP 协议的 agent 接进来（opencode / gemini-cli / cursor 等均有（或有）ACP 适配器），例如 `acp_command = "opencode-acp"` 或 `acp_command = "gemini --experimental-acp"`（具体命令以目标 agent 的 ACP 接入文档为准）。IM 审批闭环（`permission_mode = "ask"`：危险操作发审批卡等你 y/n）随协议自动覆盖这些后端。注意两点：`allowed_tools` 逐工具白名单在 ACP 系后端不生效（协议无等价机制，见 [SECURITY.md](SECURITY.md) 已知限制）；泛化装配无 Claude 本机会话存储概念，`/resume` 退化为纯 IM 历史、`/export` 不可用。
-
-### 登录 + 运行
-
-> ⚠️ **macOS 撞名**：`imagent` 也是 macOS 系统输入法进程（Input Method Agent）。**不要用 `pkill imagent`**——会杀掉系统输入法。停止本程序请用前台 `Ctrl-C` 或全路径 `kill $(pgrep -f /usr/local/bin/imagent)`（详见 [部署](deploy/README.md)）。
-
-```bash
-imagent login            # 扫码登录 iLink，凭据落盘 ~/.imagent/imagent.db
-imagent start            # 前台常驻，Ctrl-C 退出
-imagent claude [会话名]   # 本地终端薄视图（config 的 platforms 含 "local" 时）：连网关 local.sock，
-                         # 会话在网关出生——Ctrl-C/exit 只退出视图，会话继续跑（重入续看 / 网页侧接管）；
-                         # /命令照常、审批 y/n/always 行内回复、断线自动重连
-imagent codex [会话名]    # 同一视图实现 + 声明本会话用 codex-app 引擎（≈进会话打 /backend codex-app）
-imagent join             # 新 Mac 接入 Web 驾驶舱向导：幂等装配 ed25519 身份（绝不重建）、
-                         # 合并写 config 四键（platforms=["web","local"]/web_relay_url/web_machine_id/default_workdir）、
-                         # 打印公钥指纹供 relay 管理页「添加机器」登记
-                         # 参数式：--relay <wss端点> --name <机器名> --workdir <目录>（缺参交互录入）
-```
-
-用**另一个**微信号给 bot 发私聊：
-1. 第一次用发现模式（`allowed_senders = []`），日志里看到你的 `from_user_id`。
-2. `imagent allow <from_user_id>` 授权（或填进 config 重启）。
-3. 之后发消息 → agent 执行 → 结果回传 IM。
-
-**多实例（Profile）**：`imagent profile create work` → `imagent --profile work start`——config/db/socket/媒体全隔离，一机多 bot 身份。
-
-## 接入飞书（完整流程）
-
-飞书走**企业自建应用 + 长连接**：不需要公网 IP / 域名 / 证书，imagent 主动连飞书 WS 收事件、走 OpenAPI 发消息，适合家宽 / NAS 部署。全程约 10 分钟（`imagent setup` 向导可交互走一遍同样流程并校验凭据连通性；`--platform feishu|wecom|ilink` 直达对应平台引导）：
-
-**① 创建应用**：打开 [open.feishu.cn/app](https://open.feishu.cn/app) →「创建企业自建应用」→「添加应用能力」→ 启用**机器人**。
-
-**② 事件订阅（长连接）**：「开发配置」→「事件与回调」→ 订阅方式选**使用长连接接收事件**，然后添加事件：
+**② 事件订阅**：「事件与回调」→ 选**使用长连接接收事件**，添加：
 
 | 事件 | 用途 | 必须 |
 |---|---|---|
 | `im.message.receive_v1` | 收私聊 / 群 @ 消息 | ✅ |
-| `card.action.trigger` | 卡片按钮回调（审批 / 问题 / 命令按钮卡） | ✅ |
+| `card.action.trigger` | 卡片按钮回调（审批 / 问题 / 命令卡） | ✅ |
 | `drive.file.comment.created_v1` | 云文档评论 @bot 触发 | 可选 |
-| `im.message.recalled_v1` | 消息撤回：移出未处理的排队消息（任务已开始则提示可 /stop，不自动中断） | 可选 |
-| `im.chat.member.bot.deleted_v1` | bot 被移出群：自动从会话白名单移除并私聊通知管理员 | 可选 |
-| `im.chat.member.bot.added_v1` | bot 被加入群：回欢迎语（含 /chat allow 放行指引） | 可选 |
-| `im.message.reaction.created_v1` | 表情回应快速审批：审批卡上回 👍=允许 / 👎=拒绝 | 可选 |
-| `application.url.menu_v6` | 自定义菜单跳转：点击菜单即回 /help 使用说明（后台可配自定义菜单） | 可选 |
+| `im.message.recalled_v1` | 撤回：移出排队消息 | 可选 |
+| `im.chat.member.bot.deleted_v1` / `added_v1` | bot 进出群：白名单维护 / 欢迎语 | 可选 |
+| `im.message.reaction.created_v1` | 表情回应快速审批（👍/👎） | 可选 |
+| `application.url.menu_v6` | 自定义菜单点击回 /help | 可选 |
 
-> **自定义菜单（可选）**：订阅 `application.url.menu_v6` 后，可在飞书后台「应用能力 → 机器人 → 自定义菜单」配置菜单项——点击菜单 bot 会直接回 `/help` 使用说明（新手引导入口）。
-
-**③ 开通权限**：「权限管理」开通并**发布**：
-
-- `im:message`（读取与发送单聊、群聊消息）——必须。合并转发聊天记录转录（自动拉子消息转成文本给 agent 阅读）与群聊上下文注入（拉本群最近 N 条消息作前置上下文，`feishu_group_context_messages`）**复用同一读权限**（分别调「查询合并转发消息列表」「获取会话历史消息」接口，拉不到自动跳过不阻塞轮次）——真机确认：若拉取报权限错误，需在后台补开对应的 im:message 读权限并发布版本；
-- `im:message.group_at_msg`（仅收 @机器人 的群消息；要全收群消息改用 `group_msg` 并把 config 的 `feishu_require_mention_in_group` 设为 `false`）；
-- `cardkit:card:write`（CardKit 流式卡片）——可选，缺省自动降级整卡刷新；
-- `drive:comment`（云文档评论）——可选，配合上表评论事件；
-- `bitable:app`（多维表格读写）——可选，仅启用[多维表格数据面](#多维表格数据面agent-的结构化产出)时需要。
+**③ 开通权限并发布**：`im:message`（必须——合并转发转录与群上下文注入复用同一读权限）、`im:message.group_at_msg`（群 @ 消息；全收改 `group_msg`）、可选 `cardkit:card:write`（流式卡，缺省降级整卡刷新）、`drive:comment`、`bitable:app`。
 
 **④ 发布生效**：「版本管理与发布」→ 创建版本并发布——**权限与事件订阅都要发布后才生效**，新手最常漏这步。
 
-**⑤ 配置凭据**：开放平台「凭证与基础信息」页拿 App ID / App Secret：
+**⑤ 配置凭据 + 启动**：见上文[快速开始](#②-最小配置飞书--5-分钟)。
 
-```toml
-# ~/.imagent/config.toml
-platform = "feishu"
-feishu_app_id = "cli_xxx"
-```
-```bash
-export IMAGENT_FEISHU_APP_SECRET="你的 App Secret"   # 建议写进 ~/.zshrc；secret 不落 config
-```
+### WeCom / iLink
 
-**⑥ 启动 + 授权自己**：
+- **WeCom**：config 填 `wecom_bot_id` + `wecom_secret`，同样免公网（长连接收，HTTP 发）。
+- **iLink（个人微信，实验性）**：`imagent login` 扫码 → 私聊 bot。合规与账号风险见文首免责声明，仅私聊可靠工作。
 
-```bash
-imagent start               # 缺省读 config 的 platform（feishu）；显式可 --platform feishu
-                            # 日志看到 connected to wss://msg-frontier.feishu.cn 即接入成功
-```
+### Web 驾驶舱
 
-在飞书里搜到机器人，给它发一条消息（此时白名单为空，日志会打出你的 `ou_xxx` open_id）→ 授权：
-
-```bash
-imagent allow ou_xxx        # 或 config 里填 allowed_senders = ["ou_xxx"]
-```
-
-之后发消息 agent 即执行并回传；要启用终端 agent 提问转发（ask_via_im），再在 config 设 `ask_via_im_conv = "feishu:ou_xxx"`（见[终端 agent 接入](#终端-agent-接入ask_via-im人不在电脑前也能问你)）。
-
-## Web 驾驶舱
-
-浏览器（手机 PWA / 桌面）远程驾驶家里 / 公司 Mac 上的 agent——发消息、看流式输出、点审批按钮、`/stop`，人不在电脑前也能干活。与 IM 平台同权走 core 的鉴权 / 审批 / steering 管线，且可与飞书等平台**同进程并存**（`platforms = ["feishu", "web"]`）。
-
-### 拓扑：中继 + 零入站 + 中继盲化
+浏览器（手机 PWA / 桌面）远程驾驶家里 / 公司 Mac 上的 agent，与 IM 平台同权走鉴权 / 审批 / steering 管线，可同进程并存：
 
 ```
-浏览器 ×N（手机 PWA / 桌面，多标签并存，同 user 会话广播）
+浏览器 ×N（PWA / 桌面，多标签并存）
     │ WSS（Caddy 8443 TLS 终结，/imagent/* 反代 relay）
 ECS relay（imagent-relay：只做认证 + 转发 + 离线缓冲，不理解业务语义）
     ▲ 网关以客户端模式外连（Mac 零入站端口）
-Mac 网关（platforms 含 "web"）→ 驱动 agent（claude-cli / codex-app / …）
+Mac 网关（platforms 含 "web"）→ 驱动 agent
 ```
 
-- relay 是独立小服务 `imagent-relay`（axum + tokio-tungstenite，绑 `127.0.0.1:3010`，SPA 静态产物内嵌，`healthz` 健康检查）。
-- 业务帧**端到端加密**（帧协议 v1.4「中继盲化」`enc{sid,box}`）：relay 只见密文，ECS 被攻破也不泄露会话内容。
-- 容量边界：网关离线缓冲 200 帧 / 1MB；每连接限流 20 帧/10s；多机器槽位 4、浏览器连接 8；业务单帧上限 8MB（语音转写录音的载体）。
+**安全分层**（帧协议 v1.1 → v1.4，逐层收口）：
 
-### 安全分层（帧协议 v1.1 → v1.4）
+| 层 | 机制 |
+|---|---|
+| v1.1 | machine 槽位：多台 Mac 并存，每机单连接，同机重连顶替旧连接 |
+| v1.2 | token-machine 绑定（泄露 token 只能扮演本机）+ 浏览器会话层（30 天 sessionToken，可吊销） |
+| v1.3 | 网关 ed25519 挑战应答（一次性 nonce，**relay 只存公钥**）+ passkey（WebAuthn）登录 |
+| v1.4 | E2E 中继盲化：业务帧对 relay 全密文（`enc{sid,box}`） |
 
-| 层 | 机制 | 防的是什么 |
-|---|---|---|
-| v1.1 | machine 槽位（每台机器单连接，同机重连顶替旧连接） | 多台 Mac 并存管理 |
-| v1.2 | token-machine 绑定 + 浏览器会话层（USER_TOKEN 仅登录时换发 30 天 sessionToken，可列表/吊销） | 一台 Mac 的 token 泄露只能扮演它自己；USER_TOKEN 不长驻浏览器 |
-| v1.3 | 网关 ed25519 挑战应答（一次性 nonce，60s 过期单次消费；relay 只存公钥）+ **passkey 登录**（WebAuthn RP） | ECS 被攻破 = 凭证泄露；私钥永不出网关本机 |
-| v1.4 | E2E 中继盲化（业务帧 `enc{sid,box}`） | 中继 / 链路窥探业务内容 |
-
-认证失败统一 1s 延迟 + close 1008（防探测）。
-
-### 网关侧接入
+**接入**（3 步）：
 
 ```toml
 # ~/.imagent/config.toml
-platforms = ["feishu", "web"]        # 与既有 IM 平台并存；纯 Web 用 platform = "web"
+platforms = ["feishu", "web"]                 # 与既有 IM 平台并存
 web_relay_url = "wss://your-ecs:8443/imagent/gateway"
-web_machine_id = "home-mac"          # 缺省取 hostname 短名；同机重连顶替旧连接
+web_machine_id = "home-mac"                   # 缺省取 hostname 短名
 ```
 
-```bash
-imagent start
-# 首启自动生成 ~/.imagent/web-gateway-key（ed25519，0600），日志打印 64 hex 公钥
-```
+1. `imagent start`——首启自动生成 ed25519 身份（`~/.imagent/web-gateway-key`，0600），日志打印公钥；
+2. 公钥登记到 relay 侧 env `IMAGENT_RELAY_GATEWAY_KEYS`（或回退用双端 token）；
+3. Web 消息 sender 恒为 `web:user`，加入 `allowed_senders`。
 
-- **认证（推荐 key 路径）**：把网关公钥登记到 relay 侧 env `IMAGENT_RELAY_GATEWAY_KEYS`（`home-mac=<64 hex>`）。回退路径：双端 token（网关 env `IMAGENT_WEB_GATEWAY_TOKEN` = relay env `IMAGENT_RELAY_GATEWAY_TOKENS` 中本机 machine 绑定项）。
-- **白名单**：Web 消息 sender 恒为 `web:user`——加入 `allowed_senders`（或 `admin_senders`）才会被处理。
-- **多终端向导**：新 Mac 一键接入——`imagent join --relay wss://… --name work-mac --workdir /path`（幂等：已配置重复运行零破坏）。
-- **语音转写（可选）**：`whisper_bin` + `whisper_model` 双键齐备才启用（`brew install whisper-cpp`；模型建议 `ggml-medium` 起步，中文更稳）——启用后 SPA 显示 🎤 录音入口，录音经 `asr_request` 帧上行、Mac 本机 `whisper-cli` 按次拉起转写、结果回填输入框；未启用时桌面浏览器回退 Web Speech API。已知边界：iOS 主屏（standalone）模式系统不支持语音识别（入口会提示改用 Safari 打开）；后台切换打断录音需重按重试。
+新 Mac 一键接入：`imagent join --relay wss://… --name work-mac --workdir /path`（幂等，全参数可脚本化）。relay 部署（musl 静态编译 / systemd / Caddy / passkey 开通）见 [docs/WEB_DESIGN.md](docs/WEB_DESIGN.md)。
 
-### relay 部署（ECS / 任意小服务器）
+**语音转写（可选）**：config 配 `whisper_bin` + `whisper_model` 双键（`brew install whisper-cpp`，中文建议 medium 模型起）——SPA 显示 🎤，录音经 `asr_request` 帧到 Mac 本机 `whisper-cli` 转写回填（识别不上云）；未配置时桌面浏览器回退 Web Speech API。已知边界：iOS 主屏（standalone）模式不支持语音识别（入口会提示）；后台切换打断录音需重按。
 
-```bash
-# 交叉静态编译（musl，约 3MB）：
-cargo zigbuild --release -p imagent-relay --target x86_64-unknown-linux-musl
-# systemd（DynamicUser 全套加固）绑 127.0.0.1:3010；Caddy 8443 TLS 终结 handle_path /imagent/* 反代
-# relay env：
-#   IMAGENT_RELAY_GATEWAY_KEYS    # machine=公钥（推荐，v1.3 ed25519 路径）
-#   IMAGENT_RELAY_GATEWAY_TOKENS  # machine=token（回退/迁移期并存，两者均空拒启 fail-closed）
-#   IMAGENT_RELAY_STATE_DIR       # 会话/凭证落盘目录（systemd 配 StateDirectory=imagent-relay）
-```
+## 进阶
 
-完整步骤（Caddy 配置 / systemd 单元 / 多机器登记 / passkey 开通 / 版本升级）见 [docs/WEB_DESIGN.md](docs/WEB_DESIGN.md)。
+### 权限审批闭环
 
-### 驾驶舱能力（SPA：React + Vite + Tailwind）
+`permission_mode = "ask"`（或缺省 auto 档拦下的高危动作）时，agent 调危险工具前向你请示（文本 y/n / 飞书按钮卡 / Web 审批卡），「始终允许」记入会话级 allow-set（`/stop all` 或 `/new` 清空）。**支持闭环的后端**：claude-cli（control 双工通道）、claude-acp（ACP permission 协议）、codex-app（app-server FullLoop）。
 
-- **流式渲染**：markdown + 代码高亮、工具调用卡折叠、**执行链 diff 视图**（文件修改增删行着色 + `+n/−m` 徽标，claude-cli / codex-app 双引擎）、思考过程折叠区。
-- **审批**：approve / deny / 始终允许、超时倒计时（秒数由网关下发）、「前往会话」深链跳转、推送通知点开直达。
-- **多机器**：侧栏按 machine 切换管理多台 Mac；运行中呼吸点、未读徽标（App badge + 标题计数）、上次视图记忆、新会话弹窗选引擎。
-- **任务控制**：优雅 `/stop`、排队消息、粘贴图（复用媒体压缩管道）、图片上行。
-- **PWA**：Web Push 推送、亮暗主题、service worker 新版本「点击即刷」。
-- **会话**：与 IM / 终端共享同一会话池与 `/switch` `/resume` `/ws` `/cd` 语义（workspaces 快照同源互通）。
+审批粒度（claude-cli，由松到紧叠加）：缺省 `auto`（透传 Claude Code 原生 auto 模式——分类器自动放行安全操作，高危进 IM）→ `backend_permission_mode` 改透传值 → `ask`（每个提示都进 IM）→ `approval_tools` 审批集（清单外直接放行）。`/perm` 可热切。等审批期间 `/stop` 仍可用（自动回 deny 中止）。
 
-## 多维表格（Bitable）数据面：agent 的结构化产出
+### /cron 定时任务
 
-任务清单、巡检结果、成本台账这类**结构化**产出，此前只能刷屏卡片或落文件。开启 Bitable 数据面后，agent（claude-cli）直接把结果写进飞书多维表格——与 `/cron` 定时巡检天然咬合（每轮结果一行，表格即台账）；Slack 生态没有等价物。
+`/cron add */10 * * * * 检查构建`——5 字段 cron（本地时区含 DST），到期消息走与手打完全相同的鉴权/审批管线；停机补跑 `cron_catchup = one|off|all`。与 [Bitable 数据面](#多维表格数据面bitable)咬合可做每日巡检台账。
 
-```toml
-# ~/.imagent/config.toml（platform = "feishu" 且 agent = "claude-cli" 时生效）
-feishu_bitable_app_token = "bascnXXX"   # 多维表格 URL .../base/<这段>
-feishu_bitable_table_id  = "tblXXX"     # 同 URL .../table/<这段>
-```
+### Webhook 事件入站
 
-两项**齐备才启用**（缺一整组不生效，启动时 warn 提示）；SIGHUP 热改生效。启用后 agent 的 MCP 工具面多出两个工具（复用 `imagent mcp` 审批 server 挂载，不新起子进程）：
+`POST /hook/<token>` 把 CI 失败、监控告警注入指定会话——与手打消息同权走鉴权/审批，无旁路；token 路径鉴权 + HMAC 验签 + 双层防重放 + 会话白名单。GitHub 原生事件自动解析为可读摘要。逐字段配置见 [docs/CONFIG.md](docs/CONFIG.md#定时与事件入站)。
 
-- `bitable_list_fields`——列出该表全部列（列名 + 类型），写行前先调它对齐列名；
-- `bitable_append_row`——追加一行（`fields` 键=列名、值=标量），返回 record_id。列名写错会被飞书拒绝，错误信息含原因（agent 可自行修正重试）。
+### 委托编排（delegate）
 
-**安全注意**：
+`[[delegate]]` 把命名副后端（codex / gemini / claude-cli）配成「子任务执行器」：agent 经 `delegate_run` 工具自行 fan-out（Claude 写完自动叫 Codex 审），或用户 `/delegate <name> <子任务>` 显式派活。副轮 one-shot、缺省只读（Read/Grep/Glob）、预算只能调低、全局并发闸 4、结果带【委托·name】前缀不占主会话上下文。TOML 见 [docs/CONFIG.md](docs/CONFIG.md#委托编排)。
 
-- 启用 = agent 可向该表**追加任意行**（MVP 无删改面）。**建议用专用表**（如 `imagent-巡检台账`），不要指向生产台账；
-- 写入需过 IM 审批的用户，把 `mcp__imagent__bitable_append_row` 加进 `approval_tools`（ask 类档位下该工具每次写入都会进审批卡）；
-- 应用需开通 `bitable:app` 读写权限（见[接入飞书](#接入飞书完整流程)③）；
-- 仅 claude-cli 后端支持（ACP 的 MCP 配置不经 write_mcp_config）；仅 `platform = "feishu"` 生效，其它平台配置了会 warn 并忽略。
+### 多维表格数据面（Bitable）
 
-链路：`claude（MCP stdio）→ imagent mcp server（bitable_* 工具）→ permission socket（kind=bitable）→ core BitableApi → 飞书 OpenAPI（走既有 429 退避）`。
+config 配 `feishu_bitable_app_token` + `feishu_bitable_table_id`（双键齐备才启用，建议专用表）后，agent（claude-cli）把任务清单 / 巡检结果 / 成本台账等结构化产出直接写进飞书多维表格——与 `/cron` 天然咬合（每轮结果一行，表格即台账）。TOML 与安全注意见 [docs/CONFIG.md](docs/CONFIG.md#多维表格数据面bitable)。
 
+### 终端 agent 反向接入（ask_via_im）
 
-## 后台常驻（imagent service）
-
-前台 `start` 验证可用后，装成 OS 级后台服务（需 ≥ v1.5.1：早前版本生成的服务定义
-缺 `--platform`，飞书用户守护进程会误走 ilink）：
-
-```bash
-# ① secret 必须在当前 shell 里 export——install 会把它「快照」进服务定义
-#    （守护进程起不来交互 shell，这是唯一注入点；缺失会直接报错提示）
-export IMAGENT_FEISHU_APP_SECRET="你的 App Secret"
-
-# ② 安装并启动（注册当前二进制路径 + config 里的 platform；崩溃自动拉起、开机自启）
-imagent service install
-```
-
-> 二进制先放到稳定路径（如 `/usr/local/bin/imagent`）再 install——注册的是
-> `current_exe`，别用下载目录 / 临时构建产物。
-> v1.19.0 起：服务定义文件 0600（内嵌 secret 不再按 umask 可读）、load/enable
-> 失败如实报错、异常退出码非 0（systemd `Restart=on-failure` 真正生效）。
-
-```bash
-imagent service status     # 运行状态
-imagent service uninstall  # 停止并卸载
-imagent service print      # 预览将写入的服务定义（--format launchd|systemd、--exe/--platform/--log-path 覆盖；不安装、不写文件、不需 root）
-```
-
-> `deploy/` 下的静态 launchd/systemd 模板即 `service print` 的输出（单一事实源，
-> 勿手改；刷新方法见 `deploy/README.md` 顶部）。
-
-| | macOS（launchd 用户代理） | Linux（systemd 用户单元） |
-|---|---|---|
-| 服务名 | `com.imagent[.<profile>]` | `imagent[-<profile>]` |
-| 定义 | `~/Library/LaunchAgents/*.plist` | `~/.config/systemd/user/*.service` |
-| 日志 | `~/.imagent/logs/daemon.log` | `journalctl --user -u imagent -f` |
-| 无人登录也运行 | 天然支持（登录即启） | 需一次 `loginctl enable-linger $USER`（服务器场景） |
-
-secret 轮换 / 环境变量变化后：重新 `export` + `imagent service install`（先卸旧再装新，等效更新）。多实例：`imagent --profile work service install` → 独立服务与状态目录。
-
-**日志轮转**：macOS 守护日志 `~/.imagent/logs/daemon.log` 由进程内置 size 轮转——超过 50MB 触发（copytruncate，保留最近 5 份）；阈值用 `IMAGENT_LOG_MAX_MB` 调整（单位 MB，`0` = 不限，改后 `export` + 重装服务生效）。Linux 日志走 journal，轮转/限额由 journald 自身配置（如 `SystemMaxUse=`）管理。
-
-## 备份与恢复（imagent backup）
-
-升级 / 换机 / 误删 profile 前，一条命令拿到一致性快照：
-
-```bash
-imagent backup                    # 默认 <imagent_home>/backups/（profile 感知）
-imagent backup --out /mnt/nas/    # 自定义输出根目录
-imagent --profile work backup     # 备份 work profile（落 profile 目录下 backups/）
-```
-
-每份备份是单个目录（`imagent-backup-<profile>-<UTC时间戳>/`），内含三件：
-
-| 产物 | 内容 |
-|---|---|
-| `imagent.db.snapshot` | SQLite `VACUUM INTO` 一致性快照（全部会话/白名单/凭据密文/审计/定时任务等） |
-| `config.toml` | 配置副本（备份时无 config 则跳过，MANIFEST 如实记录） |
-| `MANIFEST.txt` | imagent 版本、schema 版本、各文件 sha256、恢复步骤与限制说明 |
-
-要点：
-
-- **运行中可备份**（不持实例锁、无需先停机）：`VACUUM INTO` 对运行中的 WAL 库生成读一致快照，包含备份开始前已提交的全部事务（含 WAL 中尚未 checkpoint 的已提交数据）；快照开始后新提交的数据不在内——不停机备份的固有语义，恢复后以快照点为准继续。要拿到「绝对完整」的停机点快照，先停服务再 backup 也完全可以。
-- **keyring 凭据不在快照内**：iLink 登录态存在 OS 钥匙串（机器绑定），换机/重装后需重录——iLink 重新 `imagent login` 扫码；WeCom 重配 `wecom_secret`；飞书重设 `IMAGENT_FEISHU_APP_SECRET`。
-- **媒体目录不进快照**（`<imagent_home>/media` 为入站缓存，体积不可控且可重新获取）。
-- **保留策略**：备份根目录自动保留最近 10 份，超出清最旧（按目录名排序）。
-- 备份产物统一 0600、目录 0700（快照含 credentials 表，config 副本可能含 secret）。
-
-**恢复步骤**（README 与每份 MANIFEST.txt 内同款）：
-
-```bash
-# 1. 停止 imagent（start 终端 Ctrl-C / `imagent service uninstall` / kill）
-# 2. 用快照替换主库（旧库的 -wal/-shm 残留一并删掉，避免旧 WAL 混入新库）
-cp imagent-backup-default-YYYYMMDD-HHMMSS/imagent.db.snapshot ~/.imagent/imagent.db
-rm -f ~/.imagent/imagent.db-wal ~/.imagent/imagent.db-shm
-# 3. 如有 config 副本，一并放回
-cp imagent-backup-default-YYYYMMDD-HHMMSS/config.toml ~/.imagent/config.toml
-# 4. 重录凭据（见上：login / wecom_secret / 飞书 secret）
-# 5. 重新启动——schema 迁移自动向前
-imagent start
-```
-
-> **降级不可恢复**：恢复只能「旧快照 + 相同或更新的 imagent 二进制」（启动时 schema 自动向前迁移）；**schema 更新的快照不能被旧版 imagent 打开**（启动会拒绝比代码新的 `user_version`）。升级出问题想回退二进制时，请用升级**前**生成的备份，不要用升级后新产生的备份配旧二进制。
-
-## 命令（IM 内）
-
-| 命令 | 作用 |
-|---|---|
-| `/new` | 重置会话（开新上下文） |
-| `/switch <name>` | 切到 / 新建命名会话（多任务并行上下文） |
-| `/sessions` | 列命名会话（`*` 标当前） |
-| `/resume [n]` | 统一恢复列表：📱 IM 会话 ∪ 💻 电脑端 Claude Code 会话（摘要+时间辨认，按序号接管，无需会话 id） |
-| `/export [n]` | 导出当前（或 /resume 序号）会话为 Markdown 文件（claude 系后端） |
-| `/again` | 再跑最近一次成功指令（与 /retry 的失败轮重试对称） |
-| `/compact` | 软压缩上下文（摘要 + 重置 + 延续）；自动触发**默认关闭**，开启方式见[用量护栏](#设计取舍)：水位（input+缓存）达 模型窗口 × `auto_compact_window_ratio`（缺省 80%） |
-| `/retry` | 重发最近一轮指令（失败/中断后一键续接） |
-| `/model [名称\|default]` | 查看/热切模型（切换需管理员；claude 系 / codex `-m` / gemini `-m` 全支持） |
-| `/backend [名]` | 查看/切换**本会话** agent 引擎（如 `/backend codex-app`；下一条消息生效——切换后上下文不延续，原引擎会话可 /resume 找回） |
-| `/effort [档\|default]` | 查看/设置**本会话**思考深度（仅受支持引擎如 codex-app，其余如实报错；管理员；`default`=清覆盖回引擎默认档） |
-| `/delegate [list\|<name> <子任务>]` | 委托编排：列出已配置副后端 / 把子任务 one-shot 交给命名副 agent（结果带【委托·name】前缀，不占主会话上下文；需 config `[[delegate]]`） |
-| `/cd [path]` | 切工作目录（`/resume` 本机会话列表随之变化） |
-| `/ws list\|save\|use\|remove` | 命名工作空间 |
-| `/img <path>` `/file <path>` | 发 workdir 内图片 / 任意文件到 IM |
-| `/timeout [N\|off\|default]` | 会话级空闲看门狗（分钟） |
-| `/perm <auto\|off\|allow\|deny\|ask>` | 权限模式热切（auto=按后端自动选档） |
-| `/perm list` / `/perm revoke <工具>` | 查看/单项撤销本会话「始终允许」清单 |
-| `/mcp list · add <名> <url> · rm <名>` | agent 的 MCP servers 热管理（管理员；下一轮生效，重启不丢；与 config `mcp_config_path` 文件源合并） |
-| `/stop [all]` | 中断在飞任务（**排队消息保留并自动转入下一轮**——对齐 Claude Code 的 Esc+队列注入语义；`/stop all` 硬停清空排队；任务恰在收尾时如实回「已完成」不谎报中断） |
-| `/queue list\|drop <n>` | 查看当前会话排队消息 / 丢弃指定序号（自己的或管理员） |
-| `/cron add <分 时 日 月 周> <指令>` | 定时任务（本地时区含 DST；`*`/`*/n`/范围/列表，`/cron add */10 * * * * 检查构建`） |
-| `/cron list` `/cron rm <id>` | 列出（含已停用）/ 删除定时任务（限创建者或管理员；每会话上限 20 条） |
-| `/config [k v]` | 查看 / 热改配置（cot_detail / batch_window_ms / agent_idle_timeout_secs / require_mention / reply_mode，管理员）；`/config cot <off\|brief\|detailed\|default>` 为**本会话** COT 偏好（白名单可用，免 admin） |
-| `/status` `/doctor` `/reconnect` | 运行状态（含上下文水位与阈值距离）/ 自检（平台权限 + 安全维度：凭据明文形态、webhook 暴露面、共享工作区、权限×能力错配、护栏水位、DB/媒体体积）/ 强制平台重连 |
-| `/tasks` | 本会话在飞轮次的实时进度（checklist + 工具统计）——纯文本平台/不想翻卡片场景的进度入口 |
-| `/allow <id\|@名字>` `/disallow` | 授权 / 撤销 sender（飞书群内可直接 @ 对方，管理员门槛） |
-| `/admin [list\|add\|remove]` | 管理员动态管理（首位设立自动带操作者，防自锁；SIGHUP 同步 config 变更） |
-| `/chat allow\|deny\|allow-all\|list` | 会话（群）白名单；`allow-all` 批量放行 bot 已加入的全部群 |
-| `/list` `/whoami` | 查白名单 / 查自己的 sender 与会话 id |
-
-群消息默认须 `@机器人`（`feishu_require_mention_in_group`，正文 @ 占位自动清洗）；话题群内近期（`feishu_thread_active_window_secs`，默认 30 分钟，0=关闭）有过消息则免 @ 追问。`/config reply_mode text` 可切纯文本回复（无卡片权限或偏好简洁时）。群 conv 的回复与流式卡会**引用发起消息**（reply API）并标注发起者；加急提醒（审批过半催办、长任务完成通知）受 `quiet_hours = "22:00-08:00"`（本地时区，可跨天）约束——时段内降级为普通消息（内容不变）。
-
-## 权限审批闭环（杀手锏）
-
-`permission_mode = "ask"` + `allowed_tools = ["Read","Edit","Bash"]` 时，agent 调 `Bash` 前会在 IM 询问：
-
-```
-🔐 Claude 请求执行 Bash({"command":"..."})
-回复 y 允许，其它拒绝。
-```
-
-回复 `y` → 执行；其它 → 拒绝。**支持闭环的后端**：claude-cli（基于 `--permission-prompt-tool` MCP 回调 / control 双工通道）、claude-acp（ACP permission 协议）、codex-app（app-server FullLoop，构造缺省 on-request——分类器筛 + 高危进 IM）。**飞书**下询问是「✅ 允许 / ⛔ 拒绝 / 始终允许」按钮卡片——点一下即回，无需打字；Web 驾驶舱为审批卡（同语义 + 倒计时）；「始终允许」记入会话级 allow-set（同工具不再问，`/stop all` 或 `/new` 清空）。等审批期间 `/stop` 仍可用（自动回 deny 中止）。超长输出的终态卡自动截断（头尾窗）并**补发全文文本**——结论不因卡片大小限制丢失。
-
-审批粒度（claude-cli，由松到紧叠加）：`permission_mode = "auto"`（缺省：透传 Claude Code 原生 **auto 模式** `--permission-mode auto`——分类器自动放行安全操作，高危提示进 IM）→ `backend_permission_mode` 改透传值（`default`/`acceptEdits`/`plan`/`auto`/`dontAsk`/`bypassPermissions`）→ `ask`（claude 的每个权限提示都进 IM）→ `approval_tools` 审批集（清单外提示直接放行，可与任意档叠加）。`/perm` 可热切（Ask 闭环类需重启生效）；`backend_permission_mode` 支持 SIGHUP 热重载。群聊多人协作时消息带【名字】归属标注（飞书经 contact API 懒解析展示名，需 `contact:user.base:readonly` 权限——缺权限回退 open_id 短版）；审批等待期流式卡显示「⏳ 等待审批中」并持续心跳（不再冻结成卡死假象）。旧版 claude CLI（<2.1.228）不认 auto 会静默回退 default（≈全量进 IM，降级安全）。
-
-## 终端 agent 接入：ask_via_im（人不在电脑前也能问你）
-
-反向场景：你电脑终端上跑的 **任意 agent**（Claude Code / ZCode / Codex…）需要你决策时，把问题转发到你的飞书——你在手机上点选项或回文字，答案直接回到终端的 agent。适合挂个长任务离开工位。
+反向场景：电脑终端上跑的**任意 agent**（Claude Code / ZCode / Codex…）需要你决策时，把问题转发到飞书——手机上点按钮作答，答案回到终端。适合挂长任务离开工位。
 
 ```
 终端 agent ──MCP(stdio)──► imagent mcp-ask ──unix socket──► imagent 主进程
@@ -546,92 +244,88 @@ imagent start
 终端 agent ◄──用户回复原文────────────────────────────────────────┘
 ```
 
-### 1. 主进程配置（一次）
-
-```toml
-# ~/.imagent/config.toml（platform = "feishu" 时）
-ask_via_im_conv = "feishu:ou_xxx"     # 你和 bot 的私聊（/whoami 可查）
-# ask_via_im_timeout_secs = 1800      # 等待超时，默认 30 分钟
-```
-
-`imagent start feishu` 保持运行即可（socket/token 鉴权与审批闭环共用）。
-
-### 2. 挂到终端 agent（一键）
-
 ```bash
-# 生成 mcpServers 配置（command 自动填当前二进制的绝对路径）：
+# 主进程 config 配 ask_via_im_conv = "feishu:ou_xxx" 后，把 MCP 挂到终端 agent：
 imagent mcp-ask --print-config
 # {"mcpServers":{"imagent":{"command":"/usr/local/bin/imagent","args":["mcp-ask"]}}}
+# Claude Code：claude mcp add imagent -- /usr/local/bin/imagent mcp-ask
 ```
 
-- **Claude Code**：`claude mcp add imagent -- /usr/local/bin/imagent mcp-ask`
-- **其它 MCP client（ZCode / Cursor 等）**：把上面 `--print-config` 的 JSON 并入 MCP 配置即可。
-- **懒人路径**：`bash <(curl -fsSL .../install.sh)` 的安装脚本最后一步会自动完成上述挂载（见[安装](#安装)）。
+多 agent 并发互不干扰（点按钮=精确回答那张卡；打字=答最新一张）；超时返回错误（非 deny）。`imagent install.sh` 一键脚本会自动完成挂载。同 server 还暴露 `notify_via_im(message)`：单向通知立即返回——长任务跑完「叫一声」用。
 
-再在 agent 的指令文件（`CLAUDE.md` / `AGENTS.md`）里加一句：
+## 运维
 
-> 需要我决策/确认且我可能不在终端前时，调用 `ask_via_im` 工具提问（`source` 传项目名），不要只在本地等待。
+### 后台常驻（service）
 
-### 3. 使用语义
+前台验证可用后，装成 OS 级后台服务（崩溃自动拉起、开机自启）：
 
-- 工具参数：`question`（多行 markdown 可写补充说明）、`options`（≤8 个选项按钮）、`source`（提问方标记，多 agent 并发时区分「谁在问」）、`timeout_secs`。
-- 多 agent 并发提问互不干扰（`conv + request_id` 多 pending 路由）：**点按钮=精确回答那张卡**；直接打字=回答**最新**一张；引用回复=回答被引用的卡。
-- 超时返回错误（非 deny），agent 可自行决定重试。
-- 同一 MCP server 还暴露 `notify_via_im(message, source?)`：向该会话发一条**单向通知**后立即返回（不等回复、不占审批槽）——适合长任务跑完「叫一声」、阶段性进度汇报；需要用户回答/决策时仍用 `ask_via_im`。
+```bash
+export IMAGENT_FEISHU_APP_SECRET="..."   # secret 在当前 shell export——install 快照进服务定义（唯一注入点）
+imagent service install                  # 二进制先放稳定路径（如 /usr/local/bin）再装
+imagent service status / uninstall / print
+```
+
+| | macOS（launchd） | Linux（systemd user） |
+|---|---|---|
+| 日志 | `~/.imagent/logs/daemon.log`（50MB 内置轮转） | `journalctl --user -u imagent -f` |
+| 无人登录也运行 | 天然支持 | 需 `loginctl enable-linger $USER` |
+
+### 备份与恢复（backup）
+
+```bash
+imagent backup                    # 默认 <imagent_home>/backups/，自动保留最近 10 份
+imagent --profile work backup     # profile 感知
+```
+
+每份备份含 SQLite 一致性快照（`VACUUM INTO`，**运行中可备份**）+ config 副本 + MANIFEST.txt；统一 0600。keyring 凭据不在快照内（换机后重新 login / export secret）。
+
+**恢复**：
+
+```bash
+# 1. 停止 imagent；2. 快照替换主库（旧 -wal/-shm 一并删）；3. config 副本放回；4. 重录凭据；5. 启动（schema 自动向前迁移）
+cp imagent-backup-*/imagent.db.snapshot ~/.imagent/imagent.db
+rm -f ~/.imagent/imagent.db-wal ~/.imagent/imagent.db-shm && imagent start
+```
+
+> **降级不可恢复**：schema 更新的快照不能被旧版二进制打开；回退二进制请用升级**前**的备份。
+
+### 多实例（Profile）
+
+`imagent profile create work` → `imagent --profile work start`——config/db/socket/媒体全隔离；`profile export/import` 跨机迁移。
 
 ## 安全
 
-- **白名单鉴权**：sender 白名单 + 会话（群）白名单，非授权丢弃（iLink bot 任何人可加好友，这步不可省；Web 驾驶舱 sender 恒为 `web:user`，同样须白名单）。
-- **工具收敛**：`allowed_tools` 可选（缺省 = 全部工具，`[]`/`["*"]` 同义不限制；显式清单 = 白名单）；workdir 用 `current_dir` 锁定，危险操作靠 `permission_mode = "ask"` IM 审批兜底。
-- **状态目录隔离**：`hide_state_dir_from_agent`（默认开，仅 claude-cli）每轮注入 `--settings` deny 规则把 `~/.imagent`（含 profile）挡在 agent 读视野外，防提示注入后直读 `imagent.db`；Bash/子进程间接读取仍属同 uid 进程边界（见 [SECURITY.md 威胁模型](SECURITY.md#威胁模型与边界必读)）。
-- **权限审批**：危险操作 IM approve/deny（文本 / 按钮卡片）；卡片 markdown 层 `<at>` 注入面全路径转义（bot 不可被借以 @ 任意租户用户）。
-- **OS 级沙箱（v1.32 `agent_sandbox`，默认 `auto`，仅 claude-cli）**：macOS Seatbelt / Linux bwrap 包装 agent 子进程——状态目录读+写内核级 deny（例外仅审批 sock/token/每轮 mcp json，审批闭环不 break）、持久化热点（`~/.ssh`、shell rc、LaunchAgents）写 deny（读保留）；`strict` 档把写收敛到 workdir/临时目录/`~/.claude`/`agent_sandbox_extra_write`。杀进程语义兼容（进程组整组收割）。Linux 无 bwrap 降级 off + warn；`/doctor` 安全分组展示档位。
-- **Web 驾驶舱纵深（v1.33+）**：网关 ed25519 挑战应答（relay 只存公钥、一次性 nonce 防录制重放）、token-machine 绑定（泄露 token 只能扮演本机）、浏览器会话 30 天可列表/吊销、passkey（WebAuthn）免口令、业务帧端到端加密（中继盲化）、认证失败统一延迟防探测、每连接限流 + 离线缓冲上限。
-- **store 加固**：文件 0600 / 目录 0700；CDN 下载 SSRF 白名单；服务定义（内嵌 secret）0600。
-- **威胁模型**：审批闭环约束「agent 发起的工具调用」，不约束「同 uid 进程的读写能力」——agent 子进程与 imagent 同用户运行，提示注入场景下仍有残留攻击面。**多人群白名单部署前务必读 [SECURITY.md「威胁模型与边界」](SECURITY.md#威胁模型与边界必读)**。
-- 详见 [`SECURITY.md`](SECURITY.md)。
-
-## 路线
-
-| 阶段 | 状态 | 交付 |
-|---|---|---|
-| P0 | ✅ | 调研（iLink 协议/合规、Claude CLI/ACP、竞品） |
-| P1 | ✅ | MVP 闭环：扫码 → 私聊 → `claude -p` → 回传 → `--resume` |
-| P2 | ✅ | 限流熔断 / 动态白名单 / 多命名会话 / 软 compact / 推流 / typing / **权限审批** / 媒体 |
-| P3 | ✅ | 开源化（MIT/CI/凭据加密/mdBook）+ WeCom + ACP + 多 agent（Codex/Gemini）+ 运维（指标/热重载/daemon）+ 长消息分片 |
-| P4 | ✅ | 任务控制（`/stop`/批处理/看门狗）+ 飞书平台（CardKit 流式卡/审批按钮/云文档评论）+ 会话白名单 + COT 三档 `/config` + IM 诊断命令 + 统一 `/resume` + Profile 多实例 |
-| P6 | ✅ | mention 基础设施 + 命令交互卡片 + 话题群隔离 + `setup`/`service` 自管理 + 出站文件 + `/cd` 校验 + 会话级 `/timeout` |
-| P7 | ✅ | `/admin` 动态管理 + `/chat allow-all` + 陌生人提示开关 + `/config reply_mode` + `profile export/import` |
-| v1.8–v1.10 | ✅ | 四轮深度 code review（60+ 项修复：env 消毒/超时纪律/审批 fail-closed/转发代批防护）；AUQ 自由输入；steering；上下文水位含缓存 |
-| v1.18 | ✅ | `/cron` 定时任务（头牌）+ 群媒体「回复即定向」+ 转向回执上卡 |
-| v1.20 | ✅ | **Webhook 入站**（事件驱动：CI/告警→会话→审批）+ ACP 窗口自学习 + 崩溃轮次恢复（/retry 续跑）+ compact 卡片化 + /cron 停机补跑 |
-| v1.19 | ✅ | 深度 review 双批修复（42 项）+ 事件 intake 与媒体 IO 解耦 + **排队消息持久化（崩溃不丢）** + update_card 状态机化 / ConvState 收敛 + **自动压缩比例档（窗口 80%）** + housekeeping（媒体 GC） |
-| v1.31 | ✅ | **委托编排批**：`[[delegate]]` + `delegate_run` MCP 工具 + `/delegate` 命令——多 agent fan-out（Claude 写 / codex 审）、副轮缺省只读、预算只降不升、socket `kind=delegate` 第三通路 |
-| v1.32 | ✅ | **OS 级沙箱批**：`agent_sandbox`（auto/strict/off，默认 auto）——状态目录 + 持久化热点内核级 deny（Seatbelt/bwrap，真机校准）、strict 写收敛、`/doctor` 档位、SECURITY.md 威胁模型升级 |
-| v1.33 | ✅ | **Web 驾驶舱平台全量批**：ECS relay（认证/转发/离线缓冲/SPA 内嵌）+ `web` Platform（E2E 中继盲化）+ React SPA（流式渲染/审批/多机器）+ `imagent join` 接入向导 |
-| v1.34 | ✅ | **codex 平级批**：codex-app FullLoop 审批闭环 / steering / model-list + PWA Web Push + 亮暗主题 |
-| v1.35 | ✅ | **多引擎 Dispatcher**：会话级 `/backend` 引擎切换 + `imagent codex` 终端薄视图 |
-| v1.36 | ✅ | 驾驶舱上次视图记忆 + 历史重放 `(text,at)` 去重 + 新会话引擎选择 |
-| v1.37 | ✅ | **/stop 优雅中断**（能力位分流：codex-app turn/interrupt 有界等待，超时 abort 兜底）+ 审批倒计时/运行态呼吸点/推送深链/未读徽标/粘贴图 |
-| v1.38 | ✅ | 会话级 `/effort` 思考深度 + codex-app 审批档会话映射 + `/model` 模型三层链（live→codex config→official，per-backend 回退表） |
-| v1.39 | ✅ | **执行链 diff 视图**（双引擎文件修改增删行着色）+ 语音输入（Web Speech）+ SW 新版本即点即刷 + iOS 主屏语音提示 |
-| v1.40 | ✅ | **whisper 本地语音转写**：Web Audio 录音（16k WAV）→ `asr_request` → Mac `whisper-cli` 按次转写 → 回填输入框；relay 单帧上限 256KB→8MB |
-
-> **当前状态**：[CHANGELOG.md](CHANGELOG.md) 记至 v1.32；v1.33 起的 Web 驾驶舱批次设计见 [docs/WEB_DESIGN.md](docs/WEB_DESIGN.md)，版本明细见 [GitHub Releases](https://github.com/uzziahlin/imagent/releases) 与 git tag（历史复审记录 `docs/CODE_REVIEW_*.md`，最新 [`docs/CODE_REVIEW_v13.md`](docs/CODE_REVIEW_v13.md)）。质量基线：`cargo test --workspace` 全绿、clippy 零警告、CI 双平台 + audit/deny + `web-ui` vitest 全绿。
-
-详见 [`docs/`](docs/)（[ARCHITECTURE](docs/ARCHITECTURE.md) / [DESIGN](docs/DESIGN.md) / [FEISHU_DESIGN](docs/FEISHU_DESIGN.md) / [WEB_DESIGN](docs/WEB_DESIGN.md) / [RESEARCH](docs/RESEARCH.md) / [CODE_REVIEW_v10](docs/CODE_REVIEW_v10.md)）。
+- **白名单鉴权**：sender + 会话（群）双白名单，非授权丢弃（Web 消息 sender 恒为 `web:user`，同样须白名单）。
+- **工具收敛**：`allowed_tools` 白名单（缺省全量但**全量 ≠ 免审**）；workdir 锁定；危险操作审批兜底。
+- **状态目录隔离 + 沙箱**：`~/.imagent` 对 agent 读视野隐藏（CLI 层）+ `agent_sandbox`（内核层 deny，默认 auto）。
+- **Web 驾驶舱纵深**：ed25519 挑战应答（relay 只存公钥）、token-machine 绑定、会话可吊销、passkey、E2E 中继盲化、限流与离线缓冲上限。
+- **store 加固**：文件 0600 / 目录 0700；CDN SSRF 白名单；服务定义（内嵌 secret）0600。
+- **威胁模型**：审批闭环约束「agent 发起的工具调用」，不约束「同 uid 进程的读写能力」——提示注入场景下仍有残留攻击面，**多人群白名单部署前务必读 [SECURITY.md](SECURITY.md)**。
 
 ## 开发
 
 ```bash
-cargo test --workspace                              # 全通过（详情见 CI）
+cargo test --workspace                              # 全通过（CI 详情见 .github/workflows/）
 cargo clippy --workspace --all-targets -- -D warnings   # 0 warning
 cargo fmt --all --check
 (cd web-ui && npm test)                             # SPA 单测（vitest）
-(cd web-ui && npx tsc --noEmit)                     # SPA 类型检查
 ```
 
-crate：`core`（调度/鉴权/session/权限/任务控制/cron/多引擎/多平台组合器）+ `ilink`（iLink 协议）+ `wecom`（企业微信长连接）+ `feishu`（飞书长连接 + CardKit + 云文档评论）+ `claude`（CLI/ACP backend）+ `codex`（exec + app-server）+ `gemini` + `store`（SQLite，schema v16 线性迁移）+ `relay`（ECS 中继，独立二进制 `imagent-relay`）+ `web`（网关侧 Web 平台 Platform）+ `localterm`（本地终端薄视图）；SPA 前端在 `web-ui/`（Vite + React + Tailwind，构建产物内嵌 relay）。
+crate：`core`（调度/鉴权/session/权限/任务控制/cron/多引擎/多平台组合器）+ `ilink` + `wecom` + `feishu` + `claude`（CLI/ACP）+ `codex`（exec + app-server）+ `gemini` + `store`（SQLite，schema v18 线性迁移）+ `relay`（ECS 中继，独立二进制）+ `web`（网关侧 Web 平台）+ `localterm`（本地终端薄视图）；SPA 在 `web-ui/`（Vite + React + Tailwind，构建产物内嵌 relay）。
+
+## 文档地图
+
+| 文档 | 内容 |
+|---|---|
+| [docs/CONFIG.md](docs/CONFIG.md) | 全量配置参考（逐键语义 + 环境变量 + `[[webhook]]` / `[[delegate]]`） |
+| [docs/COMMANDS.md](docs/COMMANDS.md) | IM 命令全量参考（分组 + 群消息行为） |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 现状架构（as-built） |
+| [docs/WEB_DESIGN.md](docs/WEB_DESIGN.md) | Web 驾驶舱设计（ECS 中继 / 帧协议 / 部署） |
+| [docs/FEISHU_DESIGN.md](docs/FEISHU_DESIGN.md) | 飞书平台设计 |
+| [docs/RESEARCH.md](docs/RESEARCH.md) | iLink 协议 / 合规调研 |
+| [SECURITY.md](SECURITY.md) | 安全与威胁模型 |
+| [CHANGELOG.md](CHANGELOG.md) | 版本变更记录 |
+| [docs/CODE_REVIEW_v13.md](docs/CODE_REVIEW_v13.md) | 最新一轮代码复审（更早轮次见 docs/） |
 
 ## License
 

@@ -3,6 +3,9 @@
 > 面向用户的文档。
 
 - [现状架构（as-built）](./ARCHITECTURE.md)
+- [配置参考](./CONFIG.md)
+- [IM 命令参考](./COMMANDS.md)
+- [Web 平台设计（ECS 中继 + 浏览器驾驶舱）](./WEB_DESIGN.md)
 - [调研归档（iLink 协议/合规/竞品）](./RESEARCH.md)
 - [平台扩展设计：飞书接入](./FEISHU_DESIGN.md)
 - [初始设计快照（P1，历史）](./DESIGN.md)

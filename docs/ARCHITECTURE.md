@@ -48,7 +48,7 @@ crates/
 ├── claude/  CLI（stream-json 解析）+ ACP（JSON-RPC 长驻）；~/.claude 会话扫描
 ├── codex/   codex exec + app-server 双工客户端（app_server/app_backend）；rollout 扫描（/resume 接管）
 ├── gemini/  gemini CLI（无本机存储概念，/resume 仅 IM 历史）
-└── store/   SQLite（bundled 静态链接）schema v1→v16 线性迁移（见 §5）
+└── store/   SQLite（bundled 静态链接）schema v1→v18 线性迁移（见 §5）
 fuzz/        cargo-fuzz targets：ilink 协议解析 / CDN host SSRF / 飞书事件解析
 src/main.rs  组装：CLI（clap）、单实例锁、信号、/health + /metrics、孤儿卡片扫描
 ```
@@ -97,7 +97,7 @@ Platform::recv ─→ 鉴权门（sender ∪ 会话白名单；空白名单=发�
 中断后**排队消息保留**、runner 自动取批续跑 = steering 语义，`/stop all` 才硬停
 清队列）；**审批等待暂停看门狗**（审批有独立超时预算）。
 
-## 5. 存储（schema v16）
+## 5. 存储（schema v18）
 
 | 表 | 用途 |
 |---|---|
