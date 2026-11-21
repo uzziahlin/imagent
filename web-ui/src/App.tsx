@@ -299,6 +299,12 @@ export default function App() {
   useEffect(() => {
     stateRef.current = state;
   });
+  // v1.40.1 status 的渲染后镜像：visible 兜底补拉 / queryHistory 重试在事件
+  // 与定时器时刻读最新连接态（不能闭包进构建时的旧值）——对齐 stateRef 模式。
+  const statusRef = useRef(status);
+  useEffect(() => {
+    statusRef.current = status;
+  });
   // v1.36 上次视图持久化：机器/会话变化即写（try/catch 吞写失败——隐私模式
   // 等）。登出不清除（无敏感内容；用户诉求即跨登录记住）。machines 帧校正、
   // 深链 ?conv= 与 select_conv 的落点同经 currentMachine/currentConv，天然被
@@ -764,16 +770,69 @@ export default function App() {
   // 的 ready/机器条件 + currentConv——每次切换都查（空增量便宜，网关按 seq
   // 单调幂等；切机时 reducer 同帧把 currentConv 回默认会话，一次触发覆盖两维）。
   // 旧 relay 单机模式（machinesKnown=false）不发（网关不认识该帧）。
+  // v1.40.1：重连 ready 若落在 E2E 握手窗口（confirming → active 数百 ms），
+  // queryHistory 会被 fail-closed 拒发（静默 false）且 effect 依赖不再变化、
+  // 永不重试 → 重连成功但文本消息永不补齐。改为指数退避重试至多 3 次（覆盖
+  // e2e_ack 回来的握手窗口；成功或不再 ready 即停）。sendSync 不重试——ws 层
+  // onHelloAck 的内置 sync 已是明文直发兜底，App 层这份丢一次无害（machines
+  // 帧后 App 本会再发一次带 machine 的 sync）。
   useEffect(() => {
     if (state.machinesKnown && status === "ready") {
       const key = historyKey(state.currentMachine, state.currentConv);
-      wsRef.current?.queryHistory(
-        state.currentConv,
-        lastSeqRef.current.get(key) ?? 0,
-        state.currentMachine,
-      );
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      let attempt = 0;
+      const send = (): void => {
+        const ok =
+          wsRef.current?.queryHistory(
+            state.currentConv,
+            lastSeqRef.current.get(key) ?? 0,
+            state.currentMachine,
+          ) ?? false;
+        // E2E fail-closed 拒发（握手窗口）→ 静默 false：退避重试至多 3 次
+        if (!ok && attempt < 3 && statusRef.current === "ready") {
+          attempt += 1;
+          timer = setTimeout(send, 800 * attempt);
+        }
+      };
+      send();
+      return () => {
+        if (timer !== null) {
+          clearTimeout(timer);
+        }
+      };
     }
   }, [state.machinesKnown, state.currentMachine, state.currentConv, status]);
+
+  // v1.40.1 切回前台兜底补拉：ws 层 visible 探活只保连接活性，错过消息的
+  // 数据面恢复在此兜底——visible 且 ready 时对当前会话补拉一次卡片快照
+  // （sync）+ 文本增量（queryHistory 按本地高水位，空增量便宜幂等），与
+  // ws 层探活独立、双保险。仅补当前会话（切会话/切机由上方既有 effect
+  // 各自触发）；状态读 ref 最新值（事件时刻不闭包旧 state/status）。
+  useEffect(() => {
+    if (typeof document === "undefined") {
+      return; // SSR/测试环境无 document 安全跳过
+    }
+    const onVisible = (): void => {
+      if (document.visibilityState !== "visible") {
+        return;
+      }
+      const s = stateRef.current;
+      if (!s.machinesKnown || statusRef.current !== "ready") {
+        return;
+      }
+      wsRef.current?.sendSync(s.currentMachine);
+      wsRef.current?.queryHistory(
+        s.currentConv,
+        lastSeqRef.current.get(historyKey(s.currentMachine, s.currentConv)) ?? 0,
+        s.currentMachine,
+      );
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅挂载注册一次（读 stateRef/statusRef/lastSeqRef 最新值）
+  }, []);
 
   // 侧边栏会话项：当前选中机器会话空间内的全部 conv；刚切到尚未收到帧的 conv
   // （新会话）不在 convOrder 里，前端补一项空预览，避免当前高亮落空。

@@ -2496,3 +2496,162 @@ describe("v1.37 审批倒计时 + 前往会话", () => {
     expect(screen.getByRole("alertdialog", { name: "审批请求 Bash" })).toBeTruthy();
   });
 });
+
+// ---------------------------------------------------------------------------
+// v1.40.1 前后台切换消息恢复（App 层）：① visible 兜底补拉——当前会话补一对
+// sync + history_query（与 ws 层探活独立双保险）；③ queryHistory 在 E2E
+// confirming（fail-closed）窗口拒发 → 指数退避重试，信任激活后重试成功。
+// ---------------------------------------------------------------------------
+
+describe("App 切回前台兜底补拉 + queryHistory 拒发重试（v1.40.1）", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    // 还原被用例覆写的 visibilityState（实例级 shadow，同 ws.test.ts 模式）
+    delete (document as { visibilityState?: string }).visibilityState;
+  });
+
+  /** 测试网关（与「App E2E（v1.4）」describe 内同名助手同构——该助手为
+   *  describe 局部，此处复制一份；长期 X25519 + ed25519 身份密钥）。 */
+  function makeGateway() {
+    const gkPriv = x25519.utils.randomSecretKey();
+    const gk = bytesToHex(x25519.getPublicKey(gkPriv));
+    const idPriv = ed25519.utils.randomSecretKey();
+    const ik = bytesToHex(ed25519.getPublicKey(idPriv));
+    const ackFor = (hello: { ek: string; n1: string }, machine: string) => {
+      const n2 = bytesToHex(randomBytes(32));
+      const msg = new Uint8Array(128);
+      msg.set(hexToBytes(hello.ek), 0);
+      msg.set(hexToBytes(gk), 32);
+      msg.set(hexToBytes(hello.n1), 64);
+      msg.set(hexToBytes(n2), 96);
+      return {
+        v: 1 as const,
+        type: "e2e_ack" as const,
+        machine,
+        gk,
+        n2,
+        sig: bytesToHex(ed25519.sign(msg, idPriv)),
+        ik,
+      };
+    };
+    const gatewayKey = (hello: { ek: string; n1: string }, n2: string) => {
+      const shared = x25519.getSharedSecret(gkPriv, hexToBytes(hello.ek));
+      const ikm = new Uint8Array(96);
+      ikm.set(shared, 0);
+      ikm.set(hexToBytes(hello.n1), 32);
+      ikm.set(hexToBytes(n2), 64);
+      return hkdf(sha256, ikm, undefined, utf8ToBytes("imagent-e2e-v1"), 32);
+    };
+    return { gk, ik, ackFor, gatewayKey };
+  }
+
+  const setVisibility = (state: string): void => {
+    Object.defineProperty(document, "visibilityState", { value: state, configurable: true });
+  };
+  const goVisible = (): void => {
+    setVisibility("visible");
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+  };
+  const sentCount = (fake: FakeWebSocket, frame: unknown): number =>
+    fake.sent.filter((s) => s === JSON.stringify(frame)).length;
+
+  it("visible 且 ready：当前会话补发一对 sync + history_query（幂等兜底）", () => {
+    const fake = mountApp();
+    handshake(fake, ["home-mac"]);
+    const sync = { v: 1, type: "sync", machine: "home-mac" };
+    const query = { v: 1, type: "history_query", convId: "web:default", since: 0, machine: "home-mac" };
+    // 锚点：ready 时机既有 effect 已各发一次（e2e pending 窗口明文直发）
+    expect(sentCount(fake, sync)).toBe(1);
+    expect(sentCount(fake, query)).toBe(1);
+    goVisible();
+    // visible 兜底：再补一对（空增量便宜，网关按 seq 幂等）
+    expect(sentCount(fake, sync)).toBe(2);
+    expect(sentCount(fake, query)).toBe(2);
+  });
+
+  it("未 ready 或 hidden：visible 派发不动作", () => {
+    const fake = mountApp();
+    // 未 ready（连接中）：visible 派发不补拉
+    act(() => {
+      fake.emit("open");
+    });
+    goVisible();
+    expect(fake.sent.some((s) => s.includes('"history_query"'))).toBe(false);
+    // hidden：ready 后派发也不动作
+    handshake(fake, ["home-mac"]);
+    const sync = { v: 1, type: "sync", machine: "home-mac" };
+    expect(sentCount(fake, sync)).toBe(1); // 仅既有 effect 的那次
+    setVisibility("hidden");
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect(sentCount(fake, sync)).toBe(1); // 不变
+  });
+
+  it("queryHistory fail-closed 拒发 → 退避重试；E2E 激活后重试成功（enc 直发）", () => {
+    vi.useFakeTimers();
+    const gw = makeGateway();
+    const fake = mountApp();
+    act(() => {
+      fake.emit("open");
+      fake.recv({ v: 1, type: "hello_ack", role: "user" });
+    });
+    // 两台机器同帧上线 → 各自握手（pending 窗口明文直发）
+    act(() => {
+      fake.recv({ v: 1, type: "machines", online: ["home-mac", "work-mac"] });
+    });
+    const hellos = fake.sent
+      .filter((s) => (JSON.parse(s) as { type: string }).type === "e2e_hello")
+      .map((s) => JSON.parse(s) as { ek: string; n1: string });
+    expect(hellos).toHaveLength(2);
+    const ackHome = gw.ackFor(hellos[0], "home-mac");
+    const ackWork = gw.ackFor(hellos[1], "work-mac");
+    act(() => {
+      fake.recv(ackHome);
+      fake.recv(ackWork);
+    });
+    // 两台均 confirming（TOFU 弹层，首台展示）→ fail-closed：业务帧拒发
+    expect(screen.getByRole("dialog", { name: "确认机器加密指纹" })).toBeTruthy();
+
+    // 切到 work-mac：history effect 触发 queryHistory → 拒发（静默 false）
+    fireEvent.click(screen.getByRole("button", { name: /work-mac/ }));
+    const queryWork = {
+      v: 1,
+      type: "history_query",
+      convId: "web:default",
+      since: 0,
+      machine: "work-mac",
+    };
+    expect(sentCount(fake, queryWork)).toBe(0); // fail-closed 未发任何明文
+    act(() => {
+      vi.advanceTimersByTime(800); // 重试 1：仍 confirming → 拒发
+    });
+    act(() => {
+      vi.advanceTimersByTime(1600); // 重试 2：仍 confirming → 拒发
+    });
+    // 逐台信任 → 两台 active
+    fireEvent.click(
+      within(screen.getByRole("dialog", { name: "确认机器加密指纹" })).getByRole("button", {
+        name: "信任并启用加密",
+      }),
+    );
+    fireEvent.click(
+      within(screen.getByRole("dialog", { name: "确认机器加密指纹" })).getByRole("button", {
+        name: "信任并启用加密",
+      }),
+    );
+    act(() => {
+      vi.advanceTimersByTime(2400); // 重试 3：已 active → enc 直发成功，重试停止
+    });
+    // fail-closed 全程未破：从无明文 history_query；激活后恰好一枚 enc 内帧
+    expect(sentCount(fake, queryWork)).toBe(0);
+    const encs = fake.sent.filter((s) => (JSON.parse(s) as { type: string }).type === "enc");
+    const inner = encs
+      .map((s) => JSON.parse(s) as { machine: string; box: string })
+      .map((enc) => JSON.parse(openBox(gw.gatewayKey(hellos[1], ackWork.n2), enc.box) ?? "null"))
+      .find((f) => f?.type === "history_query") as Record<string, unknown> | undefined;
+    expect(inner).toEqual({ v: 1, type: "history_query", convId: "web:default", since: 0, machine: "work-mac" });
+  });
+});

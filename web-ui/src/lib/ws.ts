@@ -46,6 +46,11 @@
 // Composer UI 服务的回包，**不进消息流**——连接层在 onFrame 分发前拦截（同
 // pairing_pending 的非消息帧模式），经 onAsrResult 回调直达 App → Composer；
 // active 机器的明文 asr_result 同属注入面，与 text/card 族同规丢弃 + 降级告警。
+// v1.40.1 前后台切换消息恢复：visible 探活 ping 发出后 visibleProbeMs（默认
+// 3s）内无任何入站帧 → 判死链路（半开）立即重连——不再等下个心跳 tick 的
+// 僵死判定（25s 间隔 + 60s 阈值），消除 iOS 挂起恢复后最坏 25~60s「收不到
+// 消息」窗口；探活定时器随 stopTimers 一并清理（对齐 helloTimer/pingTimer
+// 的清理纪律）。
 
 import {
   DEFAULT_MACHINE,
@@ -118,10 +123,14 @@ export interface WsManagerOptions {
   /** 当前出站机器（v1.1）：内部自动帧（ready 后首帧 sync / 心跳 ping）发送时
    *  调用取值；返回 undefined = 单机模式（不带 machine 字段，旧 relay 兼容）。 */
   getMachine?: () => string | undefined;
-  /** 间隔常量可注入（默认即生产值：hello 10s / ping 25s / 僵死 60s / 退避 1s→30s）。 */
+  /** 间隔常量可注入（默认即生产值：hello 10s / ping 25s / 僵死 60s /
+   *  visible 探活判死 3s / 退避 1s→30s）。 */
   helloTimeoutMs?: number;
   pingIntervalMs?: number;
   deadLinkMs?: number;
+  /** v1.40.1 visible 探活判死时限：探活 ping 发出后此时间内无任何入站帧
+   *  → 判死链路立即重连（单测注入小值加速）。 */
+  visibleProbeMs?: number;
   minBackoffMs?: number;
   maxBackoffMs?: number;
 }
@@ -232,6 +241,7 @@ export class WsManager {
   private readonly helloTimeoutMs: number;
   private readonly pingIntervalMs: number;
   private readonly deadLinkMs: number;
+  private readonly visibleProbeMs: number;
   private readonly minBackoffMs: number;
   private readonly maxBackoffMs: number;
 
@@ -249,6 +259,9 @@ export class WsManager {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private helloTimer: ReturnType<typeof setTimeout> | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
+  /** v1.40.1 visible 探活判死定时器（一次性）：探活 ping 发出后无入站帧
+   *  到点判死重连；随 stopTimers 清理（对齐 helloTimer/pingTimer 纪律）。 */
+  private visibleProbeTimer: ReturnType<typeof setTimeout> | null = null;
   private lastFrameAt = 0;
   private stopped = false; // 手动 close / 认证失败：不再重连
   private disconnectHandled = false; // 单次连接的 close 事件只处理一回
@@ -273,6 +286,7 @@ export class WsManager {
     this.helloTimeoutMs = opts.helloTimeoutMs ?? 10_000;
     this.pingIntervalMs = opts.pingIntervalMs ?? 25_000;
     this.deadLinkMs = opts.deadLinkMs ?? 60_000;
+    this.visibleProbeMs = opts.visibleProbeMs ?? 3_000;
     this.minBackoffMs = opts.minBackoffMs ?? 1_000;
     this.maxBackoffMs = opts.maxBackoffMs ?? 30_000;
     this.e2e = new E2eCoordinator(
@@ -666,8 +680,10 @@ export class WsManager {
    *  ① socket 为 null 且退避定时器已排：清 timer 立即重连（attempts 计数
    *     保留——立即重试一次不抬退避上限，防连续切前后台风暴）；
    *  ② socket OPEN 且 ready：执行一次心跳体逻辑（pingIntervalMs 阈值判
-   *     半开；新鲜则发 ping 探活）。非 OPEN（连接中/hello 等待）不动——
-   *     hello 超时与 close 事件自会驱动状态机。 */
+   *     半开；新鲜则发 ping 探活，并设 visibleProbeMs 一次性定时器——ping
+   *     发出后无任何入站帧即判死重连，v1.40.1 不再等下个 tick 的僵死判定，
+   *     消除 iOS 挂起恢复后的长「收不到消息」窗口）。非 OPEN（连接中/hello
+   *     等待）不动——hello 超时与 close 事件自会驱动状态机。 */
   private handleVisibilityChange = (): void => {
     if (document.visibilityState !== "visible" || this.stopped) {
       return;
@@ -682,6 +698,23 @@ export class WsManager {
     }
     if (this.ready && this.socket.readyState === 1 /* OPEN */) {
       this.probeOnce(this.pingIntervalMs);
+      // probeOnce 内部判半开（>pingIntervalMs 陈旧）已 teardown + 排重连，
+      // 此时 socket 为 null——不再设探活定时器（重连已由退避路径接管）。
+      if (this.socket === null) {
+        return;
+      }
+      const sentAt = Date.now();
+      this.clearVisibleProbeTimer();
+      this.visibleProbeTimer = setTimeout(() => {
+        this.visibleProbeTimer = null;
+        // ping 发出后 visibleProbeMs 内无任何入站帧 → 链路已死（半开），
+        // 立即重连；probeOnce 已判死 teardown（socket 变 null）或已非 ready
+        // 则不动，由既有状态机接管。
+        if (this.socket !== null && this.ready && this.lastFrameAt < sentAt) {
+          this.teardownSocket();
+          this.scheduleReconnect();
+        }
+      }, this.visibleProbeMs);
     }
   };
 
@@ -757,15 +790,26 @@ export class WsManager {
     }
   }
 
+  /** 连接终止路径（handleClose / teardownSocket→close()）统一清理：hello
+   *  超时、心跳、visible 探活判死定时器（v1.40.1——4001/1008 分流同样先过
+   *  此处，终态不漏清）。 */
   private stopTimers(): void {
     this.clearHelloTimer();
     this.stopHeartbeat();
+    this.clearVisibleProbeTimer();
   }
 
   private clearHelloTimer(): void {
     if (this.helloTimer !== null) {
       clearTimeout(this.helloTimer);
       this.helloTimer = null;
+    }
+  }
+
+  private clearVisibleProbeTimer(): void {
+    if (this.visibleProbeTimer !== null) {
+      clearTimeout(this.visibleProbeTimer);
+      this.visibleProbeTimer = null;
     }
   }
 

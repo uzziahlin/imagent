@@ -1195,7 +1195,7 @@ describe("WsManager 前台探活（visibilitychange）", () => {
   }
   const visManagers: WsManager[] = [];
 
-  function makeVisManager(): VisHarness {
+  function makeVisManager(extra?: { visibleProbeMs?: number }): VisHarness {
     const mine: FakeWebSocket[] = [];
     const statuses: string[] = [];
     const mgr = new WsManager({
@@ -1204,6 +1204,7 @@ describe("WsManager 前台探活（visibilitychange）", () => {
       onFrame: () => {},
       onStatus: (s) => statuses.push(s),
       onAuthFailed: () => {},
+      visibleProbeMs: extra?.visibleProbeMs,
       wsFactory: (u) => {
         const s = new FakeWebSocket(u);
         mine.push(s);
@@ -1307,6 +1308,41 @@ describe("WsManager 前台探活（visibilitychange）", () => {
     goForeground();
     expect(h2.mine).toHaveLength(1); // 仅初始连接
     expect(h2.statuses.at(-1)).not.toBe("connecting");
+  });
+
+  // v1.40.1：探活 ping 发出后 visibleProbeMs 内无任何入站帧 → 判死立即重连
+  //（不再等下个心跳 tick 的 25s 间隔 + 60s 僵死阈值——iOS 挂起恢复后窗口过长）。
+  it("v1.40.1：visible 探活后 visibleProbeMs 内有回应（pong）→ 不判死不重连", () => {
+    const h = makeVisManager({ visibleProbeMs: 50 });
+    h.mgr.connect();
+    const sock = h.mine[0];
+    sock.emit("open");
+    sock.serverSend(HELLO_ACK);
+    vi.advanceTimersByTime(5_000); // 未到 25s tick：探活 ping 一枚（lastFrameAt 新鲜）
+    goForeground();
+    expect(sock.sentOfType("ping")).toHaveLength(1);
+    vi.advanceTimersByTime(10);
+    sock.serverSend('{"v":1,"type":"pong"}'); // 探活回应：lastFrameAt 刷到 sentAt 之后
+    vi.advanceTimersByTime(40); // 探活定时器到点：lastFrameAt >= sentAt → 链路健康
+    expect(sock.closedWith).toHaveLength(0);
+    expect(h.mine).toHaveLength(1); // 无重连
+    expect(h.statuses.at(-1)).toBe("ready");
+  });
+
+  it("v1.40.1：visible 探活后 visibleProbeMs 内无任何入站帧 → 判死：teardown + 立即排重连", () => {
+    const h = makeVisManager({ visibleProbeMs: 50 });
+    h.mgr.connect();
+    const sock = h.mine[0];
+    sock.emit("open");
+    sock.serverSend(HELLO_ACK);
+    vi.advanceTimersByTime(5_000);
+    goForeground();
+    expect(sock.sentOfType("ping")).toHaveLength(1);
+    vi.advanceTimersByTime(50); // 探活窗口内无任何回应 → 判死链路（半开）
+    expect(sock.closedWith).toContain(1000); // 主动断开半开连接
+    expect(h.statuses.at(-1)).toBe("reconnecting");
+    vi.advanceTimersByTime(1_000); // 退避到点重连
+    expect(h.mine).toHaveLength(2);
   });
 });
 
