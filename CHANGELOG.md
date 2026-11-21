@@ -2,6 +2,28 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.40.1] — 2026-11-21
+
+> **前后台切换消息恢复**：iOS 挂起把 WS 掐成半开（UI 显示已连接、数据通道已死），
+> 切回前台最长 25~60s「收不到消息」；且切回前台只探活不补数据、重连后补齐可能撞
+> E2E 握手窗口被 fail-closed 静默拒发且永不重试。三修复全在前端，协议零变化。
+
+### Fixed
+- **visible 兜底补拉**（web-ui App）：切回前台且 ready 时对当前会话补一对
+  `sync`（卡片终态）+ `queryHistory`（文本增量，按本地高水位幂等）——与 ws 层
+  探活独立双保险，连接「看着健康」时错过的帧也有数据面兜底
+- **探活 3s 快速判死**（web-ui ws）：visible 探活 ping 发出后 3s 内无任何入站帧
+  → 判死链路立即重连（`visibleProbeMs` 可注入），不再等下个心跳 tick（25s 间隔
+  + 60s 僵死阈值）的慢恢复；探活定时器随 `stopTimers` 统一清理
+- **queryHistory 失败退避重试**（web-ui App）：重连 ready 落在 E2E 握手窗口
+  （confirming → active）时补拉被 fail-closed 拒发（静默 false）且 effect 依赖
+  不再变化永不重试 → 指数退避（800ms·n）至多 3 次，覆盖 e2e_ack 窗口
+
+### Fixed（遗留批，随版补提交）
+- **machine id 规范化**（crates/web）：截断后补一轮剥尾——截断点恰落在中间连
+  字符上时产出会重新以 `-` 结尾（超长 runner hostname 场景）
+- **deny.toml**：BSL-1.0 豁免（clipboard-win/error-code Windows 剪贴板链传递依赖）
+
 ## [1.40.0] — 2026-11-07
 
 > **语音转写 whisper 方案**：iOS Web Speech 三版修复未根治（standalone 限制→重试→撤拦），
