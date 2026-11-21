@@ -50,6 +50,10 @@ hmac = { version = "0.13", default-features = false }
 # bundled SQLite 的 CVE 不进 cargo-audit（audit 只看 RUSTSEC，bundled 的 C 代码
 # 无 advisory 源）；升级本依赖 = 升级内嵌 SQLite，需定期（每季度）手动检查
 # libsqlite3-sys 版本（T16 供应链，见 CODE_REVIEW_v13 P3）。运行时版本见 /doctor。
+# 2026-11-21 注：advisory-db 已开始收录 bundled SQLite 的 advisory
+# （RUSTSEC-2026-0459，修复需 rusqlite ≥0.41 → libsqlite3-sys ≥0.39，但
+# rusqlite 0.41 线声明 MSRV 1.89 > workspace 1.88）——该条现于 CI audit
+# --ignore 放行，随未来 MSRV 升级一并处理（见 ci.yml audit job 注释）。
 rusqlite = { version = "0.40", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 qrcode = "0.14"        # 扫码登录终端二维码

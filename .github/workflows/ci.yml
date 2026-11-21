@@ -88,7 +88,20 @@ jobs:
         # crate 已从 Cargo.lock 依赖树移除，该 advisory 不再触发，--ignore 已删
         # （2026-10 本地 cargo audit 验证 exit 0 且无此条）。若未来重开
         # prometheus 默认 feature 或引入新的 protobuf 传递依赖，需重新评估。
+        # 2026-11-21 三条 --ignore（advisory-db 新收录，均为上游无兼容修复、
+        # 定期复查）：
+        # - RUSTSEC-2026-0459（libsqlite3-sys bundled SQLite CVE）：修复需
+        #   rusqlite ≥0.41 → 其 0.41 线声明 MSRV 1.89 > workspace 1.88；随
+        #   未来 MSRV 升级解除（Cargo.toml rusqlite 注释同步记录）。
+        # - RUSTSEC-2023-0071（rsa Marvin Attack）：链源 web-push 0.11 的
+        #   jwt-simple→superboring 垫片，web-push 无新版（crates.io 仍 0.11.0）；
+        #   VAPID 实际用 ES256，rsa 路径为兼容垫片暴露极小。上游出新版即升。
+        # - RUSTSEC-2026-0387（crypto-bigint timing）：同 rsa 链（rsa 0.9 锁
+        #   crypto-bigint 0.5），随上游链出新版解除。
         run: cargo audit
+          --ignore RUSTSEC-2026-0459
+          --ignore RUSTSEC-2023-0071
+          --ignore RUSTSEC-2026-0387
 
   deny:
     # cargo-deny（E-4）：license / source / ban 检查（advisory 由上方 audit 覆盖）。
