@@ -145,9 +145,12 @@ pub const MACHINE_ID_MAX_CHARS: usize = 32;
 pub const DEFAULT_MACHINE_ID: &str = "default";
 
 /// machine id 规范化（纯函数便于单测）：非法字符替换为 `-`、截断到
-/// [`MACHINE_ID_MAX_CHARS`] char、剥首尾 `-`；规范化后为空（如输入全是
-/// 标点/空白）→ None。网关 hello 必须携带 relay 可接受的 machine（非法值
-/// 会被 relay 1008 拒绝进入重连死循环），所以装配期先过本函数。
+/// [`MACHINE_ID_MAX_CHARS`] char、剥首尾 `-`。剥尾在截断**之后**收口
+/// （首轮 trim + 截断后补一轮 trim）：截断发生在字符流中间，截断点可能
+/// 恰好落在中间连字符上（如超长 runner hostname 的第 32 个 char 恰为
+/// `-`），只在截断前剥尾会让产出重新以 `-` 结尾。规范化后为空（如输入
+/// 全是标点/空白）→ None。网关 hello 必须携带 relay 可接受的 machine
+/// （非法值会被 relay 1008 拒绝进入重连死循环），所以装配期先过本函数。
 pub fn sanitize_machine_id(raw: &str) -> Option<String> {
     let mapped: String = raw
         .chars()
@@ -163,7 +166,19 @@ pub fn sanitize_machine_id(raw: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    Some(trimmed.chars().take(MACHINE_ID_MAX_CHARS).collect())
+    // 截断后补一轮剥尾：截断点可能恰好落在中间连字符上，截断结果会重新
+    // 以 `-` 结尾。二次 trim 不可能引入新的空值分支——首轮 trim 后首字符
+    // 必非 `-`，截断取前缀不改变首字符，故二次 trim 至多剥掉尾部、结果
+    // 非空；此处空检查纯防御，与首轮空分支同构。
+    let truncated = trimmed
+        .chars()
+        .take(MACHINE_ID_MAX_CHARS)
+        .collect::<String>();
+    let canonical = truncated.trim_matches('-');
+    if canonical.is_empty() {
+        return None;
+    }
+    Some(canonical.to_string())
 }
 
 /// 缺省 machine id：hostname 短名（第一个 `.` 前的标签，如
@@ -2817,6 +2832,54 @@ mod tests {
         assert_eq!(sanitize_machine_id("   "), None, "空白 → None");
         assert_eq!(sanitize_machine_id(""), None, "空串 → None");
         assert_eq!(sanitize_machine_id("家"), None, "非 ASCII → None");
+    }
+
+    /// 回归：超长输入的截断点恰好落在中间连字符上时（GitHub Actions
+    /// runner hostname 形态），截断后必须再次剥尾——产出不以 `-` 结尾，
+    /// 且自身已是规范形态（sanitize 幂等）。这钉住
+    /// `resolve_machine_id_prefers_configured` 在 CI runner 上不退化。
+    #[test]
+    fn machine_id_truncation_at_hyphen_strips_trailing_hyphen() {
+        // 35 char，第 MACHINE_ID_MAX_CHARS(=32) 个 char 恰为 `-`。
+        let raw = "iad20-gt1023-4ce47d8d-f80c-4519-xyz";
+        assert_eq!(raw.chars().count(), MACHINE_ID_MAX_CHARS + 3);
+        assert_eq!(
+            raw.chars().nth(MACHINE_ID_MAX_CHARS - 1),
+            Some('-'),
+            "前提：截断点落在中间连字符上"
+        );
+
+        let out = sanitize_machine_id(raw).expect("字符集合法，不应为 None");
+        // 截断产出以 `-` 结尾，剥尾后长度必为 31（< 上限但 != 上限）。
+        assert_eq!(
+            out.chars().count(),
+            MACHINE_ID_MAX_CHARS - 1,
+            "尾部截断连字符被剥掉：{out}"
+        );
+        assert!(
+            out.chars().count() <= MACHINE_ID_MAX_CHARS,
+            "协议上限仍须满足"
+        );
+        assert!(
+            !out.starts_with('-') && !out.ends_with('-'),
+            "产出不得以 - 开头/结尾：{out}"
+        );
+        assert_eq!(
+            sanitize_machine_id(&out).as_deref(),
+            Some(out.as_str()),
+            "产出自身已是规范形态（幂等）：{out}"
+        );
+    }
+
+    /// 回归：≤[`MACHINE_ID_MAX_CHARS`] 的普通输入，首尾 `-` 剥离仍生效
+    /// （补丁不得回归未触发截断路径的既有语义）。
+    #[test]
+    fn machine_id_short_input_still_trims_edges() {
+        assert_eq!(
+            sanitize_machine_id("-short-name-"),
+            Some("short-name".to_string()),
+            "未触发截断时首尾 - 照常剥离"
+        );
     }
 
     /// 装配期 machine id 解析：显式配置优先（trim + 规范化）；显式但坏值

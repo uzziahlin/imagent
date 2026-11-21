@@ -27,6 +27,9 @@ allow = [
     # webpki-roots（rustls 根证书 bundle，经 reqwest/tungstenite rustls-tls 引入）：
     # 证书数据用 CDLA-Permissive-2.0（Community Data License，标准 permissive）。
     "CDLA-Permissive-2.0",
+    # clipboard-win / error-code（Windows 剪贴板链路传递依赖，lock 含全平台
+    # 依赖故每台 CI 都会被检查到）：Boost Software License 1.0（标准 permissive）。
+    "BSL-1.0",
 ]
 confidence-threshold = 0.93
 
