@@ -30,3 +30,4 @@ fuzz/target/
 /fuzz/corpus
 /fuzz/artifacts
 HANDOFF.md
+.claude/

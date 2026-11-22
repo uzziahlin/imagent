@@ -46,6 +46,10 @@
 // Composer UI 服务的回包，**不进消息流**——连接层在 onFrame 分发前拦截（同
 // pairing_pending 的非消息帧模式），经 onAsrResult 回调直达 App → Composer；
 // active 机器的明文 asr_result 同属注入面，与 text/card 族同规丢弃 + 降级告警。
+// v1.41.3 会话删除：sendConvDelete(convId, machine) 出站 conv_delete 业务帧
+// （E2E 加密，同 message 族路由）——侧边栏长按删除确认后调用；网关回
+// workspaces 快照（权威收敛）+ 回执 text 帧（落 DEFAULT_CONV），有进行中的
+// 轮次回 error{conv_busy}（SPA 本地先行移除的条目由快照带回归位）。
 // v1.40.1 前后台切换消息恢复：visible 探活 ping 发出后 visibleProbeMs（默认
 // 3s）内无任何入站帧 → 判死链路（半开）立即重连——不再等下个心跳 tick 的
 // 僵死判定（25s 间隔 + 60s 阈值），消除 iOS 挂起恢复后最坏 25~60s「收不到
@@ -397,6 +401,18 @@ export class WsManager {
    *  帧——调用方按无响应超时处理。 */
   sendAsrRequest(audio: string, durationMs: number, machine?: string): boolean {
     return this.send({ v: 1, type: "asr_request", audio, mime: "audio/wav", durationMs, machine });
+  }
+
+  // ---- v1.41.3 会话删除（网关消费的业务帧；同 message 族路由约定，经 e2e
+  //      outbound 判定包装）----
+
+  /** 删除会话（侧边栏长按确认后调用）：convId 恒完整 conv 形态。网关删
+   *  sessions/outbound_log/卡片缓存三处后回 workspaces 快照 + 回执文本帧
+   *  （落 DEFAULT_CONV）；有进行中的轮次回 error{conv_busy} 拒删（快照照回
+   *  ——调用方的本地先行移除由快照带回归位）。旧网关忽略未知帧 type，删除
+   *  仅本地生效（调用方按帧返回值决定是否本地先行）。 */
+  sendConvDelete(convId: string, machine?: string): boolean {
+    return this.send({ v: 1, type: "conv_delete", convId, machine });
   }
 
   /** v1.2 拉取已登录设备列表（设备面板打开时；仅会话模式对新 relay 使用）。 */

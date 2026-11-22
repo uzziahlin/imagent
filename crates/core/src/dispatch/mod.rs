@@ -2404,6 +2404,16 @@ impl Dispatcher {
         self.acquire_conv_lock(conv).await
     }
 
+    /// v1.41.3 会话删除的活跃轮探测（main 装配处经 `WebPlatform::set_round_probe`
+    /// 注入 web 平台的 conv_delete 泵——SPA 删除请求先查此探针，该 conv 有进行
+    /// 中的轮次则拒绝）。判定与 [`Self::acquire_conv_lock_with_ack`] 的排队提示
+    /// 同源（`running.is_some()`），单一事实源无漂移；判定与删除间存在天然竞态
+    /// 窗口（探测后轮次才起跑）——由调用方的删除语义兜底（见 /rm 实现注释）。
+    pub async fn round_active(&self, conv: &str) -> bool {
+        self.peek_conv(conv, |cs| cs.is_some_and(|c| c.running.is_some()))
+            .await
+    }
+
     /// 回收 conv 串行锁（P1-7：失败/正常路径统一调用，防 conv_locks HashMap 项
     /// 在 backend 失败/panic 的 return 路径永久泄漏）。调用方需先 drop guard 再传 lock。
     /// strong_count==1 表示只剩 HashMap 那份，安全移除；竞态最坏漏清（下轮再来）。

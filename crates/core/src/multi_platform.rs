@@ -579,6 +579,16 @@ impl Platform for MultiPlatform {
         }
     }
 
+    /// v1.41.3 会话删除钩子：**广播全部子平台**（default no-op——非 web 平台
+    /// 零成本；web 覆写为卡片缓存移除 + workspaces 快照推送）。与
+    /// on_workdir_changed 同款广播语义：删除的是数据面的 conv 记录，与平台
+    /// 归属无关，web 驾驶舱必须感知。
+    fn on_conv_deleted(&self, conv: &ConvId) {
+        for c in &self.children {
+            c.on_conv_deleted(conv);
+        }
+    }
+
     /// v1.41：网关侧错误码 error 帧按 conv 归属路由（peer: conv 经 child_for
     /// 特判主路由 web——toast 送达驾驶舱；IM 平台 default no-op）。无返回值，
     /// 无命中前缀静默跳过（对齐 note_round_initiator 的钩子语义）。

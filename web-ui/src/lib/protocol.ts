@@ -78,6 +78,13 @@
 //   asr_too_large/asr_invalid（走 lastError 既有管道）。能力通告：workspaces
 //   快照新增可选 asr: boolean（缺席=false=旧网关/未配置 → 🎤 走 Web Speech
 //   既有路径）。
+// - v1.41.3 会话删除：出站 conv_delete{convId, machine}（业务帧，E2E 加密，
+//   machine 同 message 族路由）——侧边栏长按删除（本地先行移除 + 快照权威
+//   收敛双保险）；网关删 sessions/outbound_log/卡片缓存三处后回 workspaces
+//   快照 + 回执 text 帧「已删除会话 <conv>」（恒落 DEFAULT_CONV——落回被删
+//   会话会被 text 帧处理复活成幽灵条目）。该 conv 有进行中的轮次时网关拒删
+//   回 error{code:"conv_busy"}（SPA toast 引导先 /stop），快照照回把本地先行
+//   移除的条目带回归位。旧网关忽略未知帧 type（前向兼容），删除仅本地生效。
 
 export const PROTOCOL_VERSION = 1;
 
@@ -460,6 +467,22 @@ export type AsrRequestFrame = {
 };
 
 // ---------------------------------------------------------------------------
+// v1.41.3 会话删除（浏览器 → 网关，E2E 业务帧；契约见头注）
+// ---------------------------------------------------------------------------
+
+/** v1.41.3 删除会话：convId 恒为完整 conv 形态（`web:`/`peer:`/`local:`，
+ *  与收到帧的回传纪律一致）；machine 同 message 族路由约定（多机模式必须带
+ *  当前机器）。网关三处删除（sessions/outbound_log/卡片缓存）后回 workspaces
+ *  快照 + 回执 text 帧（恒落 DEFAULT_CONV）；有进行中的轮次回
+ *  error{code:"conv_busy"} 拒删（快照照回——SPA 本地先行移除的条目归位）。 */
+export type ConvDeleteFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "conv_delete";
+  convId: string;
+  machine?: string;
+};
+
+// ---------------------------------------------------------------------------
 // v1.4 E2E 中继盲化（密码学构造与编码规约见 lib/e2e.ts 头注）
 // ---------------------------------------------------------------------------
 
@@ -509,7 +532,8 @@ export type OutboundFrame =
   | WorkspaceRemoveFrame
   | ConvWorkdirSetFrame
   | HistoryQueryFrame
-  | AsrRequestFrame;
+  | AsrRequestFrame
+  | ConvDeleteFrame;
 
 /** 出站帧序列化（undefined 字段不序列化，与网关入站解析兼容）。 */
 export function encodeFrame(frame: OutboundFrame): string {
@@ -1296,6 +1320,10 @@ export type Action =
   | { type: "select_machine"; machine: string }
   /** 用户点选会话（仅切换 SPA 本地当前 conv，不发包；清该 conv 未读）。 */
   | { type: "select_conv"; convId: string }
+  /** v1.41.3 删除会话（侧边栏长按确认后）：本地先行移除（convOrder/convs/
+   *  未读随条目清），若删除的是当前 conv 切回 DEFAULT_CONV；网关权威状态由
+   *  随后的 workspaces 快照收敛（快照 sessions 段不含已删会话，不回填）。 */
+  | { type: "delete_conv"; convId: string; machine?: string }
   /** v1.5 关闭轮换结果弹层（一次性明文 token 就此作废）。 */
   | { type: "clear_rotated_token" }
   /** v1.5 配对请求已应答（允许/拒绝帧发出后移除对应卡片）。 */
@@ -1489,6 +1517,28 @@ function clearUnread(state: AppState, machine: string, convId: string): AppState
         convs: { ...space.convs, [convId]: { ...conv, unread: 0 } },
       },
     },
+  };
+}
+
+/** v1.41.3 会话删除（本地先行移除）：convOrder 去掉 + convs 条目删除（entries/
+ *  未读随条目整体清——不动其它 conv）；删除的是当前 conv 切回 DEFAULT_CONV。
+ *  条目不存在（重复删除 / 他机空间）幂等原样。DEFAULT_CONV 自身不可删（恒存
+ *  在的兜底会话——调用方入口不提供，此处防御性幂等）。 */
+function deleteConv(state: AppState, machine: string, convId: string): AppState {
+  const space = state.spaces[machine];
+  if (!space || !space.convs[convId] || convId === DEFAULT_CONV) {
+    return state;
+  }
+  const convs = { ...space.convs };
+  delete convs[convId];
+  const convOrder = space.convOrder.filter((c) => c !== convId);
+  return {
+    ...state,
+    currentConv:
+      state.currentMachine === machine && state.currentConv === convId
+        ? DEFAULT_CONV
+        : state.currentConv,
+    spaces: { ...state.spaces, [machine]: { convs, convOrder } },
   };
 }
 
@@ -1937,6 +1987,11 @@ export function reducer(state: AppState, action: Action): AppState {
       const changed = clearUnread(state, state.currentMachine, action.convId);
       return changed.currentConv === action.convId ? changed : { ...changed, currentConv: action.convId };
     }
+    case "delete_conv":
+      // v1.41.3 会话删除（本地先行移除，网关快照随后权威收敛）：条目不存在
+      // 幂等原样；删除的是当前 conv 切回 DEFAULT_CONV（被删条目已不存在，
+      // clearUnread 类清零路径无需再走）。
+      return deleteConv(state, action.machine ?? DEFAULT_MACHINE, action.convId);
     case "clear_error":
       return state.lastError ? { ...state, lastError: null } : state;
     case "clear_notice":

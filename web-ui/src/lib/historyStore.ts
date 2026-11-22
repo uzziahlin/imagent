@@ -52,6 +52,8 @@ export interface HistoryBackend {
   put(key: string, value: StoredConv): Promise<void>;
   getAll(): Promise<[string, StoredConv][]>;
   clear(): Promise<void>;
+  /** v1.41.3 删除单条记录（未命中幂等——侧边栏删除会话后清本地缓存）。 */
+  remove(key: string): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -74,6 +76,9 @@ export function memoryHistoryBackend(): HistoryBackend {
     async clear() {
       map.clear();
     },
+    async remove(key) {
+      map.delete(key);
+    },
   };
 }
 
@@ -88,6 +93,7 @@ function noopBackend(): HistoryBackend {
       return [];
     },
     async clear() {},
+    async remove() {},
   };
 }
 
@@ -143,6 +149,12 @@ function idbBackend(): HistoryBackend {
     clear: async () => {
       await withStore("readwrite", (s) => {
         s.clear();
+        return undefined;
+      });
+    },
+    remove: async (key) => {
+      await withStore("readwrite", (s) => {
+        s.delete(key);
         return undefined;
       });
     },
@@ -234,6 +246,17 @@ export const historyStore = {
       await backend().clear();
     } catch {
       // 静默
+    }
+  },
+
+  /** v1.41.3 删除单 conv 本地缓存（侧边栏删除会话后调用——不清则刷新后
+   *  restoreHistory 会把已删会话的条目带回来，侧栏幽灵条目复活）。幂等：
+   *  无记录同样返回成功。失败静默（存储不可用不影响内存删除）。 */
+  async removeConv(machine: string, convId: string): Promise<void> {
+    try {
+      await backend().remove(convKey(machine, convId));
+    } catch {
+      // 静默：配额/隐私模式下删除失败不影响内存消息流
     }
   },
 };

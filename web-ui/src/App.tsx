@@ -74,6 +74,7 @@ import { AdminPanel, RotatedTokenModal } from "./components/AdminPanel";
 import { PairingWait } from "./components/PairingWait";
 import { PairingRequestCard } from "./components/PairingRequestCard";
 import { E2eConfirm } from "./components/E2eConfirm";
+import { ConvDeleteConfirm } from "./components/ConvDeleteConfirm";
 import { WorkspacePicker, chipCls, loadLastDir, saveLastDir } from "./components/WorkspacePicker";
 import { useExitMounted } from "./components/useExitMounted";
 import { MessageList } from "./components/MessageList";
@@ -128,6 +129,11 @@ const ERROR_HINTS: Record<string, string> = {
   admin_auth_required: "管理验证缺失或已过期，请重试操作",
   // v1.41 peer 通道（网关伪装 Claude Code peer）：peer: 会话文本投递失败
   peer_unreachable: "窗口不在线或已退出，消息未送达（/peers 查看在线窗口）",
+  // v1.41.3 会话删除：删除目标有进行中的轮次被网关拒删（快照照回，本地先行
+  // 移除的条目归位）
+  conv_busy: "该会话有进行中的任务，请先 /stop",
+  // v1.41.3 会话删除：网关侧落库失败（重试即可）
+  conv_delete_failed: "会话删除失败，请重试",
 };
 
 /** 机器通知文案：from 为 default 的引导切换并非真实掉线，单独措辞。 */
@@ -294,6 +300,10 @@ export default function App() {
   const [e2ePins, setE2ePins] = useState<E2ePin[]>(() => loadPins());
   const [e2eUi, setE2eUi] = useState<E2eUi>(EMPTY_E2E_UI);
   const [state, dispatch] = useReducer(appReducer, undefined, initialView);
+  // v1.41.3 会话删除：侧边栏长按目标（非空 = 确认弹层开启）+ 发帧进行中。
+  // hook 与其余 useState 同区（App 有登录页早退分支，hook 不得落在其后）。
+  const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
   const wsRef = useRef<WsManager | null>(null);
   // state 的渲染后镜像：WsManager 回调（getMachine）需要读最新 machine 维度，
   // 不能闭包进构建时的旧 state。
@@ -1357,6 +1367,30 @@ export default function App() {
     setDrawerOpen(false);
   };
 
+  /** 删除确认：发 conv_delete 帧（成功才本地先行移除——未连接时帧发不出去，
+   *  本地删除会被下一次 sync 的卡片重发顶回，弹层留驻可重试）+ reducer 移除 +
+   *  本地缓存清理（不清则刷新后 restoreHistory 复活已删会话）。网关权威状态
+   *  由回包的 workspaces 快照收敛（busy 拒绝时快照把条目带回归位 + toast）。 */
+  const confirmDeleteConv = () => {
+    const target = deleteTarget;
+    if (!target || deleteBusy) {
+      return;
+    }
+    if (!(wsRef.current?.sendConvDelete(target, outMachine()) ?? false)) {
+      return;
+    }
+    setDeleteBusy(true);
+    const machine = state.currentMachine;
+    dispatch({ type: "delete_conv", convId: target, machine });
+    const key = historyKey(machine, target);
+    void historyStore.removeConv(machine, target);
+    savedRefs.current.delete(key);
+    lastSeqRef.current.delete(key);
+    savedSeqRefs.current.delete(key);
+    setDeleteBusy(false);
+    setDeleteTarget(null);
+  };
+
   const sidebar = (
     <Sidebar
       convs={convItems}
@@ -1377,6 +1411,7 @@ export default function App() {
       onSelect={selectConv}
       onSelectMachine={selectMachine}
       onCreate={openNewConv}
+      onConvDelete={setDeleteTarget}
     />
   );
 
@@ -1715,6 +1750,16 @@ export default function App() {
           onResolve={(accept) => {
             wsRef.current?.resolveTofu(e2eUi.tofu[0].machine, accept);
           }}
+        />
+      )}
+
+      {/* v1.41.3 会话删除确认弹层（侧边栏长按 500ms 触发） */}
+      {deleteTarget !== null && (
+        <ConvDeleteConfirm
+          convTitle={convTitle(state.spaces[state.currentMachine]?.convs[deleteTarget], deleteTarget)}
+          busy={deleteBusy}
+          onConfirm={confirmDeleteConv}
+          onCancel={() => setDeleteTarget(null)}
         />
       )}
 

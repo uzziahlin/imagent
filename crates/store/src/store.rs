@@ -2306,6 +2306,30 @@ impl Store {
         })
         .await
     }
+
+    /// 删除该 conv 的**全部** outbound_log 行（v1.41.3 会话删除：/rm 命令与
+    /// SPA conv_delete 帧共用——历史重放日志不清，下次同名校验/恢复时旧消息
+    /// 会被 history_query 带回，删除语义即不完整）。同闭包内顺带移除该 conv
+    /// 的内存 seq 计数器条目：conv 删除后重建（同名新会话）从空表 MAX(seq)
+    /// 懒恢复，seq 从 1 重新分配（计数器残留会让新会话从旧高位续接——单调性
+    /// 无碍但历史水位虚高，一并清干净）。锁序：连接锁 → 计数器锁，与
+    /// [`Store::append_outbound`] 同向。conv 无行时幂等（DELETE 0 行即 Ok）。
+    pub async fn delete_outbound_conv(&self, conv_id: &str) -> Result<()> {
+        let conv_id = conv_id.to_string();
+        let inner = self.inner.clone();
+        let counters = self.outbound_seq.clone();
+        blocking_with_retry(inner, move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "DELETE FROM outbound_log WHERE conv_id = ?1",
+                rusqlite::params![conv_id],
+            )?;
+            tx.commit()?; // 计数器锁须在事务结束后取得（锁序：连接锁 → 计数器锁）
+            counters.lock().remove(&conv_id);
+            Ok(())
+        })
+        .await
+    }
 }
 
 // —— spawn_blocking 调度 ——
@@ -2951,6 +2975,46 @@ mod tests {
         );
         assert_eq!(store.max_outbound_seq("web:a").await.unwrap(), 3);
         assert_eq!(store.max_outbound_seq("web:b").await.unwrap(), 3);
+    }
+
+    /// v1.41.3 会话删除：delete_outbound_conv 清空该 conv 全部行 + 内存 seq
+    /// 计数器条目——其它 conv 不受牵连；同名校验删除后重建 seq 从 1 重新分配
+    ///（计数器残留会让新会话从旧高位续接，历史水位虚高）。
+    #[tokio::test]
+    async fn outbound_log_delete_conv_clears_rows_and_seq_counter() {
+        let db = TempDb::new("outbound_delete").await;
+        let store = Store::open(&db.path).await.unwrap();
+        for i in 1..=3 {
+            store
+                .append_outbound("web:a", "text", &format!(r#"{{"text":"a{i}","at":{i}}}"#))
+                .await
+                .unwrap();
+            store
+                .append_outbound("web:b", "text", &format!(r#"{{"text":"b{i}","at":{i}}}"#))
+                .await
+                .unwrap();
+        }
+        // 无关 conv 幂等：无行的 conv 删除不报错。
+        store.delete_outbound_conv("web:ghost").await.unwrap();
+        // 删 web:a：行清空、水位归零；web:b 完整保留。
+        store.delete_outbound_conv("web:a").await.unwrap();
+        let a = store
+            .list_outbound_since("web:a", 0, OUTBOUND_RETAIN)
+            .await
+            .unwrap();
+        assert!(a.rows.is_empty(), "web:a 行应全删");
+        assert_eq!(store.max_outbound_seq("web:a").await.unwrap(), 0);
+        let b = store
+            .list_outbound_since("web:b", 0, OUTBOUND_RETAIN)
+            .await
+            .unwrap();
+        assert_eq!(b.rows.len(), 3, "web:b 不受牵连");
+        // 同名重建：计数器条目已随删除移除 → seq 从空表 MAX+1 = 1 重新分配。
+        let seq = store
+            .append_outbound("web:a", "text", r#"{"text":"new","at":9}"#)
+            .await
+            .unwrap();
+        assert_eq!(seq, 1, "删除后重建应从 1 重新计数（计数器已清）");
     }
 
     // ---------- P4-5：allowed_chats ----------

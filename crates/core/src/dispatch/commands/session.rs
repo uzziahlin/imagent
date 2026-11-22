@@ -58,6 +58,82 @@ impl Dispatcher {
         .await;
     }
 
+    /// /rm <conv> —— 删除会话（v1.41.3，真机需求：peer 误触发的幽灵会话无法
+    /// 清理）。删除三处：sessions 行（[`Store::delete_session`]）、outbound_log
+    /// 全部行（[`Store::delete_outbound_conv`]，防 history_query 把旧消息带回）、
+    /// 平台侧缓存（[`Platform::on_conv_deleted`] 钩子——web 清卡片缓存并推
+    /// workspaces 快照，SPA 侧栏以快照收敛）。例外语义：`peer:` 前缀会话同样
+    /// 可删，**只删驾驶舱视图与网关记录，不影响窗口侧 claude 实例**（单向删除
+    /// ——窗口再次 SendMessage 会以同名会话重新出现，属新会话语义）。
+    /// 参数省略 `web:` 前缀自动补全（`/rm s-aa94` = `/rm web:s-aa94`）；
+    /// `peer:` / `local:` 前缀透传（与 web 网关 normalize_conv 同规则）。
+    /// 该 conv 有进行中的轮次时拒绝（判定同 [`Dispatcher::round_active`]，
+    /// 与 /stop 的在飞句柄同源），先 /stop 再删。**不取 conv 串行锁**（与 /stop
+    /// 同款纪律：取锁会等轮次自然结束，busy 拒绝就失去意义）。
+    pub(super) async fn cmd_rm(&self, conv: &ConvId, hint: &ReplyHint, parts: &[&str]) {
+        let Some(raw) = parts.get(1).map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+            self.reply(
+                conv,
+                "用法：/rm <会话名>（删除指定会话；省略 web: 前缀自动补全，\
+                 如 /rm s-aa94；peer:/local: 前缀会话直接写全名）",
+                hint,
+            )
+            .await;
+            return;
+        };
+        let target =
+            if raw.starts_with("web:") || raw.starts_with("peer:") || raw.starts_with("local:") {
+                raw.to_string()
+            } else {
+                format!("web:{raw}")
+            };
+        // 活跃轮拒绝：有在飞轮次时删除会与轮末落库竞争（upsert_session 把行
+        // 写回来，删除语义失效）——回错误文案 + conv_busy error 帧（web 网关
+        // 转 toast，IM 平台 default no-op 由上方文本覆盖）。
+        if self.round_active(&target).await {
+            self.platform
+                .send_error_note(
+                    conv,
+                    super::CONV_BUSY_CODE,
+                    "该会话有进行中的任务，请先 /stop",
+                )
+                .await;
+            self.reply(
+                conv,
+                &format!("⚠️ 会话 {target} 有进行中的任务，请先 /stop 再删除。"),
+                hint,
+            )
+            .await;
+            return;
+        }
+        // 三处删除的网关侧两处（平台侧缓存在钩子内）。失败不半途而废：
+        // sessions 行删除失败直接回错（视图收敛依赖它）；outbound 清理失败
+        // 仅 warn（历史重放残留，下次删除可再清，不影响本次视图收敛）。
+        if let Err(e) = self.store.delete_session(&target).await {
+            warn!(target: "imagent::core", conv = %target, error = %e, "cmd_rm: delete_session 失败");
+            self.reply(conv, &format!("⚠️ 删除会话 {target} 失败：{e}"), hint)
+                .await;
+            return;
+        }
+        if let Err(e) = self.store.delete_outbound_conv(&target).await {
+            warn!(target: "imagent::core", conv = %target, error = %e, "cmd_rm: delete_outbound_conv 失败");
+        }
+        // 平台侧收尾（web：卡片缓存移除 + 快照推送——SPA 侧栏权威收敛）。
+        self.platform.on_conv_deleted(&ConvId(target.clone()));
+        // 回执落发起会话；删除目标=发起会话本身时改落 web:default（SPA 常驻
+        // 会话，协议头注 DEFAULT_CONV 同源）——落回被删会话会被 SPA text 帧
+        // 处理复活成幽灵条目，删除即失效。非 SPA 可见 conv（feishu: 等 IM
+        // 会话）自删时回执仍落原会话（IM 无复活问题，静默才是 UX 缺陷）。
+        let reply_conv =
+            if target == conv.0 && (target.starts_with("web:") || target.starts_with("peer:")) {
+                ConvId(super::WEB_DEFAULT_CONV.to_string())
+            } else {
+                conv.clone()
+            };
+        self.reply(&reply_conv, &format!("已删除会话 {target}"), hint)
+            .await;
+    }
+
     /// /resume [n|id] —— 统一恢复列表（IM 历史 ∪ 本机同项目）+ 接管。
     /// D7：序号缓存按 (conv, sender) 隔离——群聊多用户共用 conv，仅按 conv
     /// 缓存会互相覆盖导致错选；并带 10 分钟过期（RESUME_CACHE_TTL）。

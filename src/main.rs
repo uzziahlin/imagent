@@ -826,6 +826,8 @@ async fn main() -> Result<()> {
             // platform 装配（v1.8：移到 backend 就绪之后——web 分支注入
             // backend clone，见上）：CLI 显式优先（单平台），否则
             // config.platforms 多平台列表，最后回退 config.platform 单值。
+            // v1.41.3：web 具名句柄出参（探针后填，见 dispatcher 装配后）。
+            let mut web_platform: Option<Arc<imagent_web::WebPlatform>> = None;
             let platform = if platform_names.len() == 1 {
                 build_platform(
                     &platform_names[0],
@@ -834,6 +836,7 @@ async fn main() -> Result<()> {
                     &backend,
                     model_list_fn.clone(),
                     backend_names.clone(),
+                    &mut web_platform,
                 )
                 .await?
             } else {
@@ -847,6 +850,7 @@ async fn main() -> Result<()> {
                             &backend,
                             model_list_fn.clone(),
                             backend_names.clone(),
+                            &mut web_platform,
                         )
                         .await?,
                     );
@@ -960,6 +964,16 @@ async fn main() -> Result<()> {
             // 原始权限档位快照（Auto 不预解析，run 路径按 per-conv 解析出的
             // 引擎现算生效档）。
             dispatcher.set_extra_backends(extras);
+            // v1.41.3：web 平台的 conv_delete 活跃轮探测（平台构造早于
+            // dispatcher，此处后填——闭包持 dispatcher 句柄查在飞轮；未装
+            // web 平台时无此步，conv_delete 泵 fail-open 放行删除）。
+            if let Some(web) = web_platform.as_ref() {
+                let d = dispatcher.clone();
+                web.set_round_probe(Arc::new(move |conv: String| {
+                    let d = d.clone();
+                    Box::pin(async move { d.round_active(&conv).await })
+                }));
+            }
             dispatcher.set_raw_permission_mode(config.permission_mode);
             // 快捷命令（v1.17）：config.shortcuts 注入（SIGHUP 热重载同步）。
             dispatcher.set_shortcuts(config.shortcuts.clone());
@@ -1848,6 +1862,11 @@ async fn build_platform(
     backend: &Arc<dyn imagent_core::Backend>,
     model_list_fn: Option<Arc<imagent_web::models::ListModelsFn>>,
     backends: Vec<String>,
+    // v1.41.3：web 平台的具名句柄出参（None = 本次未装配 web）——平台构造早于
+    // dispatcher，而 SPA conv_delete 的活跃轮探测须持 dispatcher 句柄，装配后
+    // 经 `WebPlatform::set_round_probe` 后填（trait 对象无法 downcast，故在
+    // 构造点借出具名 Arc；MultiPlatform 分支多子平台共用同一出参，web 至多一个）。
+    web_platform_out: &mut Option<Arc<imagent_web::WebPlatform>>,
 ) -> Result<Arc<dyn imagent_core::Platform>> {
     match name {
         "wecom" => {
@@ -1963,7 +1982,7 @@ async fn build_platform(
             // whisper-cli；任一未配置 = ASR 关闭，快照不带 asr 段）。
             // v1.37 审批超时：注入 permission_ask_timeout_secs（approval_request
             // 帧 timeoutSecs 数据源——SPA 倒计时与网关实际超时同源）。
-            Ok(Arc::new(imagent_web::WebPlatform::new(
+            let web = Arc::new(imagent_web::WebPlatform::new(
                 relay_url,
                 credential,
                 default_session,
@@ -1981,7 +2000,9 @@ async fn build_platform(
                     model: config.whisper_model.clone(),
                 },
                 config.permission_ask_timeout_secs,
-            )))
+            ));
+            *web_platform_out = Some(web.clone());
+            Ok(web as Arc<dyn imagent_core::Platform>)
         }
         "local" => {
             // 本地终端平台：socket 锚定 imagent home（与 permission.sock 同目录

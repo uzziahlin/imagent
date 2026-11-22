@@ -126,6 +126,26 @@ const ASR_TOO_LARGE_CODE: &str = "asr_too_large";
 const ASR_INVALID_CODE: &str = "asr_invalid";
 /// v1.40 ASR 错误帧 code：whisper_bin / whisper_model 任一未配置。
 const ASR_UNCONFIGURED_CODE: &str = "asr_unconfigured";
+/// v1.41.3 会话删除错误帧 code（帧契约定案字面量，SPA ERROR_HINTS 按码渲染
+/// toast）：删除目标 conv 有进行中的轮次（判定源 = dispatcher 在飞轮，经
+/// [`RoundProbe`] 探测）。
+const CONV_BUSY_CODE: &str = "conv_busy";
+/// v1.41.3 会话删除错误帧 code：网关侧落库失败（sessions / outbound_log）。
+const CONV_DELETE_FAILED_CODE: &str = "conv_delete_failed";
+/// v1.41.3 会话删除回执落点（SPA 常驻会话，web-ui 协议头注 DEFAULT_CONV 同源
+/// 硬编码）：conv_delete 帧不带发起者信息，回执落回被删会话会被 SPA 的 text
+/// 帧处理复活成幽灵条目——恒落 web:default 兜底（/rm 命令侧有发起者信息，
+/// 回执规则见 dispatch cmd_rm，两侧同一常量语义）。
+const WEB_DEFAULT_CONV: &str = "web:default";
+
+/// v1.41.3 活跃轮探测回调（main 装配处后填——平台构造早于 dispatcher，经
+/// [`WebPlatform::set_round_probe`] 注入槽位；闭包持 `Dispatcher::round_active`）。
+/// 异步闭包形态：判定读 dispatcher 的 conv_states（tokio Mutex 须 await）。
+pub(crate) type RoundProbe = Arc<
+    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// v1.40 语音转写上下文（main 装配处注入——config `whisper_bin` /
 /// `whisper_model` 原样透传）。两者皆 Some 才启用 ASR（快照 `asr` 能力位
@@ -189,6 +209,13 @@ impl CardCache {
             .collect();
         v.sort_by_key(|(s, _, _, _)| *s);
         v.into_iter().map(|(_, k, mid, c)| (k, mid, c)).collect()
+    }
+
+    /// v1.41.3 会话删除：按 conv 移除缓存条目（未命中幂等）。不清除的话
+    /// sync 重发会把已删会话的卡片推回浏览器，SPA 侧栏幽灵条目即复活——
+    /// 与 sessions/outbound_log 同为删除语义的三处之一。
+    fn remove(&mut self, conv: &str) {
+        self.entries.remove(conv);
     }
 }
 
@@ -275,9 +302,10 @@ async fn serve_sync_requests(
 /// 表——快照 backends 段直传，无解析链）。`titles` 为 v1.9
 /// 语义标题生成器（快照组装懒触发的共享防重复集，见 [`crate::titles`]）。
 /// `asr_enabled` 为 v1.40 语音转写能力位（[`AsrContext::enabled`]——快照
-/// `asr` 段数据源，main 装配处注入的纯 bool，无解析链）。平台 Drop 时经
-/// shutdown token 连动退出。
-#[allow(clippy::too_many_arguments)] // 参数已达 10——v1.40 注入 asr_enabled（先例 new_with_e2e）
+/// `asr` 段数据源，main 装配处注入的纯 bool，无解析链）。`cards` / `probe`
+/// 为 v1.41.3 会话删除所需（卡片缓存按 conv 移除 + 活跃轮探测槽位，与
+/// WebPlatform 主体共享同一 Arc）。平台 Drop 时经 shutdown token 连动退出。
+#[allow(clippy::too_many_arguments)] // 参数已达 12——v1.41.3 注入 cards/probe（先例 new_with_e2e）
 async fn serve_workspace_actions(
     mut workspace_rx: mpsc::Receiver<InboundAction>,
     machine_id: String,
@@ -287,6 +315,8 @@ async fn serve_workspace_actions(
     backends: Vec<String>,
     titles: TitleGen,
     asr_enabled: bool,
+    cards: Arc<Mutex<CardCache>>,
+    probe: Arc<Mutex<Option<RoundProbe>>>,
     outbound_tx: mpsc::Sender<String>,
     shutdown: CancellationToken,
 ) {
@@ -311,6 +341,8 @@ async fn serve_workspace_actions(
                     &cli,
                     &titles,
                     asr_enabled,
+                    &cards,
+                    &probe,
                     act,
                     &outbound_tx,
                 )
@@ -326,7 +358,9 @@ async fn serve_workspace_actions(
 ///   来源；失败时快照不变 + 前置 error 帧）。
 /// - conv_workdir_set 成功时**额外**推一条 conv_workdir 增量帧。
 /// - workspace_remove 未命中幂等（store delete 对不存在键即 Ok）。
-#[allow(clippy::too_many_arguments)] // 参数已达 10——v1.40 注入 asr_enabled（先例 new_with_e2e）
+/// - v1.41.3 conv_delete：活跃轮探测拒绝（conv_busy）或三处删除 + 回执文本
+///   （见 [`handle_conv_delete`]），快照收尾两情形共用。
+#[allow(clippy::too_many_arguments)] // 参数已达 12——v1.41.3 注入 cards/probe（先例 new_with_e2e）
 async fn handle_workspace_action(
     machine: &str,
     store: &Store,
@@ -336,6 +370,8 @@ async fn handle_workspace_action(
     cli: &CliSource,
     titles: &TitleGen,
     asr_enabled: bool,
+    cards: &Arc<Mutex<CardCache>>,
+    probe: &Arc<Mutex<Option<RoundProbe>>>,
     act: InboundAction,
     outbound_tx: &mpsc::Sender<String>,
 ) {
@@ -386,7 +422,10 @@ async fn handle_workspace_action(
                 }
             }
         }
-        // client 只转发上述四个变体进 workspace channel，其余分支不可达
+        InboundAction::ConvDelete { conv } => {
+            handle_conv_delete(machine, store, cards, probe, &conv, outbound_tx).await
+        }
+        // client 只转发上述五个变体进 workspace channel，其余分支不可达
         //（防御性忽略，不 panic——通道元素类型复用 InboundAction）。
         other => {
             debug!(target: TARGET, act = ?other, "workspace 泵收到非工作空间动作，忽略")
@@ -683,9 +722,94 @@ fn enqueue_best_effort(outbound_tx: &mpsc::Sender<String>, json: String) {
 /// 工作空间 error 帧（code=workspace_invalid，复用既有 error 帧形态；
 /// machine 为本机身份，v1.1 出站帧必带）。
 fn reply_workspace_error(machine: &str, outbound_tx: &mpsc::Sender<String>, message: &str) {
-    match encode_error_frame(machine, WORKSPACE_ERROR_CODE, message) {
+    reply_error_frame(machine, outbound_tx, WORKSPACE_ERROR_CODE, message);
+}
+
+/// 泵系 error 帧通用形态（code 由调用方定：workspace_invalid / conv_busy /
+/// conv_delete_failed——SPA ERROR_HINTS 按码渲染；machine 为本机身份，v1.1
+/// 出站帧必带）。
+fn reply_error_frame(machine: &str, outbound_tx: &mpsc::Sender<String>, code: &str, message: &str) {
+    match encode_error_frame(machine, code, message) {
         Ok(json) => enqueue_best_effort(outbound_tx, json),
-        Err(e) => warn!(target: TARGET, error = %e, "workspace error 帧序列化失败"),
+        Err(e) => warn!(target: TARGET, code, error = %e, "error 帧序列化失败"),
+    }
+}
+
+/// v1.41.3 conv_delete 处理（workspace 泵分支）：会话三处删除的网关编排。
+/// - **活跃轮拒绝**：经 [`RoundProbe`] 查 dispatcher 在飞轮（`running` 表，
+///   单一事实源），有轮 → 回 error 帧（code=conv_busy，SPA toast 引导先
+///   /stop）；probe 缺席（测试/装配窗口）= 无法核实，fail-open 放行删除。
+///   探测与删除间存在天然竞态窗口（探测后轮次才起跑）——轮末 upsert_session
+///   会把 sessions 行写回（罕见；对已删会话再删一次即清，视作已知边界）。
+/// - **三处删除**：store 面 `delete_session`（失败即回
+///   conv_delete_failed，视图收敛依赖它）+ `delete_outbound_conv`（失败仅
+///   warn——历史重放残留，不影响本次视图收敛）+ 卡片缓存 `remove`（sync
+///   重发不再复活已删会话）。`peer:` 会话同样可删：只删驾驶舱视图与网关
+///   记录，**不影响窗口侧 claude 实例**（单向删除——窗口再次 SendMessage
+///   以同名会话重新出现，属新会话语义）。
+/// - **回执**：文本帧「已删除会话 <conv>」落 [`WEB_DEFAULT_CONV`]（帧不带
+///   发起者信息，落回被删会话会被 SPA text 帧复活；/rm 命令侧有发起者，
+///   回执规则见 dispatch cmd_rm）+ 同步落 outbound_log（history 重放可见，
+///   与 dispatch 回执同语义）。
+/// - 快照由 [`handle_workspace_action`] 收尾统一回（busy 拒绝时快照原样——
+///   SPA 本地先行删除的条目由快照带回归位，conv_busy toast 解释原因）。
+async fn handle_conv_delete(
+    machine: &str,
+    store: &Store,
+    cards: &Arc<Mutex<CardCache>>,
+    probe: &Arc<Mutex<Option<RoundProbe>>>,
+    conv: &str,
+    outbound_tx: &mpsc::Sender<String>,
+) {
+    // 活跃轮探测（异步回调槽位读取——std Mutex 临界区仅 clone 并立刻放锁，
+    // guard 不跨 await——tokio::spawn 的 Send 约束）。
+    let probe_fn = lock_or_recover(probe).clone();
+    let busy = match probe_fn {
+        Some(p) => p(conv.to_string()).await,
+        None => {
+            debug!(target: TARGET, conv = %conv, "conv_delete：活跃轮探针未装配，放行删除");
+            false
+        }
+    };
+    if busy {
+        warn!(target: TARGET, conv = %conv, "conv_delete：该会话有进行中的轮次，拒绝");
+        reply_error_frame(
+            machine,
+            outbound_tx,
+            CONV_BUSY_CODE,
+            "该会话有进行中的任务，请先 /stop",
+        );
+        return;
+    }
+    if let Err(e) = store.delete_session(conv).await {
+        warn!(target: TARGET, conv = %conv, error = %e, "conv_delete：delete_session 失败");
+        reply_error_frame(
+            machine,
+            outbound_tx,
+            CONV_DELETE_FAILED_CODE,
+            &format!("删除会话失败：{e}"),
+        );
+        return;
+    }
+    if let Err(e) = store.delete_outbound_conv(conv).await {
+        warn!(target: TARGET, conv = %conv, error = %e, "conv_delete：delete_outbound_conv 失败（历史重放残留，不影响视图收敛）");
+    }
+    lock_or_recover(cards).remove(conv);
+    info!(target: TARGET, conv = %conv, "conv_delete：已删除会话（sessions + outbound_log + 卡片缓存）");
+    // 回执文本帧 + 落盘（encode_text_frame 内截断不影响落盘原文契约——落盘
+    // 走原文，与 send_text 同形；best-effort 失败不影响删除本体）。
+    let at = unix_ms_now() as u64;
+    let text = format!("已删除会话 {conv}");
+    match encode_text_frame(machine, WEB_DEFAULT_CONV, &text, at) {
+        Ok(json) => enqueue_best_effort(outbound_tx, json),
+        Err(e) => warn!(target: TARGET, error = %e, "conv_delete 回执帧序列化失败"),
+    }
+    let payload = serde_json::json!({"text": text, "at": at}).to_string();
+    if let Err(e) = store
+        .append_outbound(WEB_DEFAULT_CONV, "text", &payload)
+        .await
+    {
+        warn!(target: TARGET, error = %e, "conv_delete 回执落盘失败（不影响删除）");
     }
 }
 
@@ -1267,6 +1391,9 @@ pub struct WebPlatform {
     machine_id: String,
     /// 出站帧通道（发给 client → relay → 浏览器）。
     outbound_tx: mpsc::Sender<String>,
+    /// workspace 动作通道前端（v1.41.3 会话删除钩子复用：`on_conv_deleted`
+    /// 经它触发一次 WorkspaceList——泵回全量快照，SPA 侧栏权威收敛）。
+    workspace_tx: mpsc::Sender<InboundAction>,
     /// v1.10 push_notify 埋点事件通道（发给 client → relay，明文管理帧族；
     /// client select 直消费——不经 outbound 的 E2E seal 路径）。
     push_tx: mpsc::Sender<PushEvent>,
@@ -1291,6 +1418,11 @@ pub struct WebPlatform {
     /// 装配处注入）——approval_request 帧的 timeoutSecs 数据源（SPA 倒计时；
     /// web 不经 dispatcher，无法从运行时取该值，构造期注入）。
     approval_timeout_secs: u64,
+    /// v1.41.3 活跃轮探测槽位（main 在 dispatcher 建立后经
+    /// [`WebPlatform::set_round_probe`] 后填——平台构造早于 dispatcher，无法
+    /// 构造期注入；缺席 = 无法核实，conv_delete fail-open 放行删除）。
+    /// 与 workspace 泵共享同一 Arc（泵的删除分支读）。
+    round_probe: Arc<Mutex<Option<RoundProbe>>>,
     /// 停机信号（Drop 时 cancel，client / sync responder 连动退出）。
     shutdown: CancellationToken,
 }
@@ -1407,7 +1539,8 @@ impl WebPlatform {
         let online = Arc::new(AtomicBool::new(false));
         let shutdown = CancellationToken::new();
 
-        // client 任务：连接立即开始（断线自动重连）。
+        // client 任务：连接立即开始（断线自动重连）。workspace_tx 留一份
+        // clone 给平台主体（v1.41.3 on_conv_deleted 快照触发用）。
         let client = WebClient {
             relay_url: relay_url.clone(),
             credential,
@@ -1417,7 +1550,7 @@ impl WebPlatform {
             e2e,
             inbound_tx: inbound_tx.clone(),
             sync_tx,
-            workspace_tx,
+            workspace_tx: workspace_tx.clone(),
             media_tx,
             history_tx,
             asr_tx,
@@ -1435,9 +1568,12 @@ impl WebPlatform {
         ));
 
         // workspace 泵（v1.6 工作空间 + v1.8 models 段 + v1.9 语义标题懒触发 +
-        // v1.36 backends 段 + v1.40 asr 能力位；出站帧带 machine，v1.1 语义）。
+        // v1.36 backends 段 + v1.40 asr 能力位 + v1.41.3 会话删除；出站帧带
+        // machine，v1.1 语义）。cards / probe 与平台主体共享同一 Arc——sync
+        // 重发（responder）与删除钩子（on_conv_deleted）看到同一份缓存状态。
         let titles = TitleGen::new(store.clone());
         let asr_enabled = asr.enabled();
+        let round_probe: Arc<Mutex<Option<RoundProbe>>> = Arc::new(Mutex::new(None));
         tokio::spawn(serve_workspace_actions(
             workspace_rx,
             machine_id.clone(),
@@ -1447,6 +1583,8 @@ impl WebPlatform {
             backends,
             titles,
             asr_enabled,
+            cards.clone(),
+            round_probe.clone(),
             outbound_tx.clone(),
             shutdown.clone(),
         ));
@@ -1490,6 +1628,7 @@ impl WebPlatform {
             relay_url,
             machine_id,
             outbound_tx,
+            workspace_tx,
             push_tx,
             reconnect,
             inbound_rx: Arc::new(AsyncMutex::new(inbound_rx)),
@@ -1500,6 +1639,7 @@ impl WebPlatform {
             card_seq: Arc::new(AtomicU64::new(0)),
             pending_asks: Arc::new(Mutex::new(PendingAsks::default())),
             approval_timeout_secs,
+            round_probe,
             shutdown,
         }
     }
@@ -1512,6 +1652,14 @@ impl WebPlatform {
     /// 本机 machine 身份（测试用）。
     pub fn machine_id(&self) -> &str {
         &self.machine_id
+    }
+
+    /// v1.41.3 注入活跃轮探测（main 装配处：dispatcher 建立后调用——平台
+    /// 构造早于 dispatcher，无法构造期注入）。注入后 conv_delete 帧的删除
+    /// 前置检查经 [`RoundProbe`] 查 dispatcher 在飞轮；未注入（测试/装配
+    /// 窗口）时 fail-open 放行删除（见 [`handle_conv_delete`]）。
+    pub fn set_round_probe(&self, probe: RoundProbe) {
+        *lock_or_recover(&self.round_probe) = Some(probe);
     }
 
     /// 出站帧入队（§5.1 断线语义）：try_send——断线期帧排队（Ok），队列满 /
@@ -1695,6 +1843,23 @@ impl Platform for WebPlatform {
                 }
             }
             Err(e) => warn!(target: TARGET, error = %e, "error 帧序列化失败"),
+        }
+    }
+
+    /// v1.41.3 会话删除钩子（/rm 命令收尾——dispatch 已删完 store 两处）：
+    /// 卡片缓存按 conv 移除（sync 重发不再复活已删会话）+ 触发一次
+    /// workspaces 快照（经 workspace 通道让泵回全量快照，SPA 侧栏权威收敛）。
+    /// 同步 best-effort（非阻塞——try_send 打满即丢 warn，下一条快照兜底），
+    /// 钩子纪律同 on_workdir_changed（不得 IO/await）。
+    fn on_conv_deleted(&self, conv: &ConvId) {
+        lock_or_recover(&self.cards).remove(&conv.0);
+        if let Err(e) = self.workspace_tx.try_send(InboundAction::WorkspaceList) {
+            warn!(
+                target: TARGET,
+                conv = %conv.0,
+                error = %e,
+                "conv_delete 快照触发入队失败（丢弃，下一条快照兜底）"
+            );
         }
     }
 
@@ -2093,7 +2258,8 @@ mod tests {
     }
 
     /// [`run_action`] 的 v1.8 全参形态（模型上下文 + CLI/codex 配置快照 +
-    /// v1.36 引擎名单可注入）。
+    /// v1.36 引擎名单可注入）。v1.41.3 conv_delete 测试经
+    /// [`run_action_with_probe`]（注入活跃轮探针）。
     async fn run_action_with(
         store: &Store,
         default: &Path,
@@ -2101,6 +2267,32 @@ mod tests {
         backends: &[String],
         cli: &CliSource,
         act: InboundAction,
+    ) -> Vec<serde_json::Value> {
+        run_action_with_probe(
+            store,
+            default,
+            models,
+            backends,
+            cli,
+            act,
+            Arc::new(Mutex::new(CardCache::default())),
+            Arc::new(Mutex::new(None)),
+        )
+        .await
+    }
+
+    /// [`run_action_with`] 的 v1.41.3 全参形态（卡片缓存 + 活跃轮探针槽位
+    /// 可注入——conv_delete 三处删除/busy 拒绝断言用）。
+    #[allow(clippy::too_many_arguments)] // 测试夹具透传生产参数表
+    async fn run_action_with_probe(
+        store: &Store,
+        default: &Path,
+        models: &ModelsContext,
+        backends: &[String],
+        cli: &CliSource,
+        act: InboundAction,
+        cards: Arc<Mutex<CardCache>>,
+        probe: Arc<Mutex<Option<RoundProbe>>>,
     ) -> Vec<serde_json::Value> {
         let (tx, mut rx) = mpsc::channel::<String>(32);
         handle_workspace_action(
@@ -2112,6 +2304,8 @@ mod tests {
             cli,
             &disabled_titles(store),
             false, // v1.40 asr 能力位：既有动作测试缺省关闭（快照字节与 v1.36 一致）
+            &cards,
+            &probe,
             act,
             &tx,
         )
@@ -2593,6 +2787,181 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0]["type"], "workspaces");
         assert_eq!(frames[0]["workspaces"].as_array().unwrap().len(), 0);
+    }
+
+    // ---- v1.41.3 conv_delete（workspace 泵分支直测：三处删除 + busy 拒绝；
+    // store 层 delete_outbound_conv 单测见 imagent-store，/rm 命令见 dispatch
+    // tests，SPA 侧 reducer/长按交互见 web-ui vitest）----
+
+    /// conv_delete 测试夹具：种子 web:gone（sessions 行 + 2 条 outbound +
+    /// 卡片缓存）与无关 conv web:keep（同样三处），返回 (cards, probe 槽)。
+    async fn seed_conv_delete_fixture(
+        store: &Store,
+    ) -> (Arc<Mutex<CardCache>>, Arc<Mutex<Option<RoundProbe>>>) {
+        seed_session(store, "web:gone", None, Some("幽灵会话")).await;
+        store
+            .append_outbound("web:gone", "text", r#"{"text":"旧消息","at":1}"#)
+            .await
+            .unwrap();
+        store
+            .append_outbound("web:gone", "text", r#"{"text":"旧消息2","at":2}"#)
+            .await
+            .unwrap();
+        seed_session(store, "web:keep", None, Some("无关会话")).await;
+        store
+            .append_outbound("web:keep", "text", r#"{"text":"保留","at":3}"#)
+            .await
+            .unwrap();
+        let cards = Arc::new(Mutex::new(CardCache::default()));
+        {
+            let mut cache = lock_or_recover(&cards);
+            cache.upsert(
+                "web:gone",
+                "web-card-1",
+                CardPayload::from_card(&v18_card("旧卡", CardTerminal::Done)),
+            );
+            cache.upsert(
+                "web:keep",
+                "web-card-2",
+                CardPayload::from_card(&v18_card("保留卡", CardTerminal::Done)),
+            );
+        }
+        let probe: Arc<Mutex<Option<RoundProbe>>> = Arc::new(Mutex::new(None));
+        (cards, probe)
+    }
+
+    /// conv_delete 成功路径（任务验收项）：三处全清 + 回执文本帧（落
+    /// web:default）+ 快照；无关 conv 三处不受牵连。
+    #[tokio::test]
+    async fn conv_delete_removes_three_stores_and_replies() {
+        let store = test_store().await;
+        let default = valid_dir();
+        let (cards, probe) = seed_conv_delete_fixture(&store).await;
+
+        let frames = run_action_with_probe(
+            &store,
+            &default,
+            &empty_models(),
+            &[],
+            &CliSource::Claude(CliModels::default()),
+            InboundAction::ConvDelete {
+                conv: "web:gone".into(),
+            },
+            cards.clone(),
+            probe,
+        )
+        .await;
+
+        // 无 error 帧；回执文本帧落 web:default + workspaces 快照收尾。
+        assert!(
+            !frames.iter().any(|f| f["type"] == "error"),
+            "成功删除不应有 error：{frames:?}"
+        );
+        let receipt = frames
+            .iter()
+            .find(|f| f["type"] == "text")
+            .expect("应回执文本帧");
+        assert_eq!(receipt["convId"], WEB_DEFAULT_CONV);
+        assert_eq!(receipt["text"], "已删除会话 web:gone");
+        assert_eq!(receipt["machine"], TEST_MACHINE);
+        assert!(
+            frames.iter().any(|f| f["type"] == "workspaces"),
+            "每帧回快照"
+        );
+
+        // 三处删除断言（store 两处 + 卡片缓存）。
+        assert!(
+            store.get_session("web:gone").await.unwrap().is_none(),
+            "sessions 行应删除"
+        );
+        let gone = store
+            .list_outbound_since("web:gone", 0, OUTBOUND_RETAIN)
+            .await
+            .unwrap();
+        assert!(gone.rows.is_empty(), "outbound_log web:gone 应全删");
+        let keep = store
+            .list_outbound_since("web:keep", 0, OUTBOUND_RETAIN)
+            .await
+            .unwrap();
+        assert_eq!(keep.rows.len(), 1, "无关 conv outbound 不受牵连");
+        assert!(
+            store.get_session("web:keep").await.unwrap().is_some(),
+            "无关 conv sessions 行不动"
+        );
+        // 卡片缓存断言（临界区即取即放——guard 不得跨下方 await）。
+        {
+            let cache = lock_or_recover(&cards);
+            assert!(!cache.entries.contains_key("web:gone"), "卡片缓存应移除");
+            assert!(cache.entries.contains_key("web:keep"), "无关 conv 卡片不动");
+        }
+
+        // 回执落盘（history 重放可见）：web:default 新增一条 text 行。
+        let receipt_rows = store
+            .list_outbound_since(WEB_DEFAULT_CONV, 0, OUTBOUND_RETAIN)
+            .await
+            .unwrap();
+        assert!(
+            receipt_rows
+                .rows
+                .iter()
+                .any(|r| r.kind == "text" && r.payload.contains("已删除会话 web:gone")),
+            "回执应落 outbound_log（history 重放可见）"
+        );
+    }
+
+    /// conv_delete busy 拒绝（任务验收项）：探针报活跃轮 → conv_busy error
+    /// 帧 + 三处原样（不删）+ 快照照回（SPA 本地先行删除由快照带回归位）。
+    #[tokio::test]
+    async fn conv_delete_busy_rejected_with_error_frame() {
+        let store = test_store().await;
+        let default = valid_dir();
+        let (cards, probe_slot) = seed_conv_delete_fixture(&store).await;
+        // 探针：恒报「有在飞轮」。
+        let busy_probe: RoundProbe = Arc::new(|conv: String| {
+            Box::pin(async move {
+                let _ = conv;
+                true
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        });
+        *lock_or_recover(&probe_slot) = Some(busy_probe);
+
+        let frames = run_action_with_probe(
+            &store,
+            &default,
+            &empty_models(),
+            &[],
+            &CliSource::Claude(CliModels::default()),
+            InboundAction::ConvDelete {
+                conv: "web:gone".into(),
+            },
+            cards.clone(),
+            probe_slot,
+        )
+        .await;
+
+        let err = frames
+            .iter()
+            .find(|f| f["type"] == "error")
+            .expect("busy 应回 error 帧");
+        assert_eq!(err["code"], CONV_BUSY_CODE);
+        assert_eq!(err["message"], "该会话有进行中的任务，请先 /stop");
+        assert!(
+            !frames.iter().any(|f| f["type"] == "text"),
+            "拒绝不回执文本"
+        );
+        assert!(
+            frames.iter().any(|f| f["type"] == "workspaces"),
+            "快照照回（SPA 收敛）"
+        );
+
+        // 三处原样。
+        assert!(store.get_session("web:gone").await.unwrap().is_some());
+        let gone = store
+            .list_outbound_since("web:gone", 0, OUTBOUND_RETAIN)
+            .await
+            .unwrap();
+        assert_eq!(gone.rows.len(), 2);
+        assert!(lock_or_recover(&cards).entries.contains_key("web:gone"));
     }
 
     // ---- v1.7 媒体上行泵（process_media_message 直测：临时媒体目录 + 双通道
@@ -3079,6 +3448,9 @@ mod tests {
                     &CliSource::Claude(CliModels::default()),
                     &disabled_titles(&store),
                     asr_enabled,
+                    // v1.41.3：asr 位测试不涉删除——空缓存 + 无探针槽位。
+                    &Arc::new(Mutex::new(CardCache::default())),
+                    &Arc::new(Mutex::new(None)),
                     InboundAction::WorkspaceList,
                     &tx,
                 )

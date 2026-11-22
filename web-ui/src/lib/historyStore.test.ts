@@ -98,6 +98,16 @@ describe("historyStore（注入内存后端）", () => {
     expect((await backend.get("home-mac||web:work"))?.entries).toHaveLength(5);
   });
 
+  it("removeConv 删除单 conv 记录（未命中幂等；其它 conv 不受牵连）——v1.41.3 侧栏删除清缓存", async () => {
+    await historyStore.saveConv("home-mac", "web:a", [userOf("a1", 1)]);
+    await historyStore.saveConv("home-mac", "web:b", [userOf("b1", 2)]);
+    await historyStore.removeConv("home-mac", "web:a");
+    await historyStore.removeConv("home-mac", "web:ghost"); // 未命中幂等
+    const all = await historyStore.loadAll();
+    expect(all["home-mac"]["web:a"]).toBeUndefined();
+    expect(all["home-mac"]["web:b"]).toBeDefined();
+  });
+
   it("clear 清空全部；get 不存在的 key 返回 undefined", async () => {
     await historyStore.saveConv("home-mac", "web:default", [userOf("x", 1)]);
     await historyStore.clear();

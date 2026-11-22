@@ -2192,3 +2192,59 @@ describe("workspaces.asr（v1.40 语音转写能力通告）", () => {
     expect(s.workspaces["home-mac"]?.asr).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// v1.41.3 会话删除（delete_conv reducer：本地先行移除 + 快照权威收敛的前半环）
+// ---------------------------------------------------------------------------
+
+describe("reducer delete_conv（v1.41.3）", () => {
+  /** 种子：default + web:side（各一条消息）+ web:other；返回已构造状态。 */
+  function seeded(): AppState {
+    let s = run(initialState(), { type: "frame", frame: frame(TEXT_FRAME("首页")) });
+    s = run(s, { type: "frame", frame: frame(TEXT_FRAME("侧栏", "web:side")) });
+    s = run(s, { type: "frame", frame: frame(TEXT_FRAME("其它", "web:other")) });
+    return s;
+  }
+
+  it("删除条目：convs 移除 + convOrder 摘除（entries/未读随条目清），其它会话不动", () => {
+    const s = run(seeded(), { type: "delete_conv", convId: "web:side" });
+    expect(s.spaces[DEFAULT_MACHINE].convs["web:side"]).toBeUndefined();
+    expect(orderOf(s)).toEqual([DEFAULT_CONV, "web:other"]);
+    expect(convsOf(s)["web:other"].entries).toHaveLength(1);
+  });
+
+  it("删除当前会话：currentConv 切回 DEFAULT_CONV（被删条目不再可达）", () => {
+    let s = run(seeded(), { type: "select_conv", convId: "web:side" });
+    expect(s.currentConv).toBe("web:side");
+    s = run(s, { type: "delete_conv", convId: "web:side" });
+    expect(s.currentConv).toBe(DEFAULT_CONV);
+  });
+
+  it("删除非当前会话：currentConv 不动", () => {
+    const s = run(seeded(), { type: "delete_conv", convId: "web:side" });
+    expect(s.currentConv).toBe(DEFAULT_CONV);
+  });
+
+  it("幂等：条目不存在原样返回；DEFAULT_CONV 恒存在不可删（防御性）", () => {
+    const s = seeded();
+    expect(run(s, { type: "delete_conv", convId: "web:ghost" })).toBe(s);
+    const after = run(s, { type: "delete_conv", convId: DEFAULT_CONV });
+    expect(orderOf(after)).toContain(DEFAULT_CONV);
+    expect(convsOf(after)[DEFAULT_CONV]).toBeDefined();
+  });
+
+  it("机器维度：删除落指定机器空间，其它机器不受牵连", () => {
+    let s = run(initialState(), {
+      type: "frame",
+      frame: frame(
+        '{"v":1,"type":"text","convId":"web:home-only","text":"家里消息","machine":"home-mac"}',
+      ),
+    });
+    s = run(s, { type: "frame", frame: frame(TEXT_FRAME("默认机消息")) });
+    expect(s.spaces["home-mac"].convs["web:home-only"]).toBeDefined();
+    s = run(s, { type: "delete_conv", convId: "web:home-only", machine: "home-mac" });
+    expect(s.spaces["home-mac"].convs["web:home-only"]).toBeUndefined();
+    expect(orderOf(s)).toContain(DEFAULT_CONV);
+    expect(convsOf(s)[DEFAULT_CONV].entries).toHaveLength(1);
+  });
+});

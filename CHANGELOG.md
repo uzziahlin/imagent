@@ -2,7 +2,36 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
-## [1.41.2] — 2026-11-22
+## [1.41.3] — 2026-11-23
+
+> 驾驶舱会话删除（真机需求）：peer 通道联调误触发的幽灵会话（`web:s-aa94` /
+> `web:peer:xxx`）此前无法清理——网关不清（sessions / outbound_log / 卡片缓存）
+> SPA 删了下次 sync 又被快照带回来。本版打通「网关三处删除 + SPA 长按删除 +
+> /rm 命令」全链路。
+
+### Added
+- **协议帧 `conv_delete`**（SPA → 网关，业务帧族：E2E 加密 + machine 路由同
+  message 族）：网关 workspace 泵处理——活跃轮探测拒绝（新 error code
+  `conv_busy`，SPA toast 引导先 /stop；判定源 = dispatcher 在飞轮，经
+  `WebPlatform::set_round_probe` 装配回调注入）；放行则三处删除（sessions 行 +
+  outbound_log 全部行 + 卡片缓存条目）后回 workspaces 快照（SPA 侧栏权威收敛）
+  + 回执文本「已删除会话 <conv>」（恒落 `web:default`——落回被删会话会被 text
+  帧处理复活成幽灵条目）。`peer:` 会话同样可删：只删驾驶舱视图与网关记录，
+  **不影响窗口侧 claude 实例**
+- **`/rm <conv>` 命令**（飞书/终端可用，同批）：同上删除语义；省略 `web:` 前缀
+  自动补全（`/rm s-aa94`），`peer:`/`local:` 透传；有进行中的轮次拒绝（判定同
+  /stop 在飞句柄）+ conv_busy error 帧（web）；删除后经新协作钩子
+  `Platform::on_conv_deleted`（default no-op，web 覆写）清平台侧缓存并推快照；
+  删除目标=发起会话时回执改落 `web:default`（防 SPA 复活）
+- **SPA 侧边栏长按删除**：会话项长按 500ms 弹确认（滚动手势/提前松手取消；
+  触发后吞 click 不切会话）；确认后发 `conv_delete` + 本地先行移除（reducer
+  `delete_conv`：条目/未读清、当前会话删除切回 default、IndexedDB 缓存同步清）
+  ——本地体验 + 快照权威收敛双保险；命令面板补 `/rm` 词条
+
+### Changed
+- store 新增 `delete_outbound_conv`（清 outbound_log 该 conv 全部行 + 内存 seq
+  计数器条目——同名校验删除后重建 seq 从 1 重新分配）
+
 
 > 真机 bug 修复：驾驶舱 `peer:` 会话里发消息被拼成 `web:peer:xxx` 绕过 peer 拦截臂
 > 直进 agent（误触发轮次 + 落 card 裂出幽灵会话）。

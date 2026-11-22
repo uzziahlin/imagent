@@ -35,6 +35,18 @@ pub(super) use session::wait_round_finish;
 /// （含 /mcp、/export、/queue 等未入 help 分组的命令），二者不要求互相覆盖。
 /// config `shortcuts` 的自定义 `/name` 不在此清单（平台解析层无 config 视野，
 /// 群内使用需 @bot）。
+/// v1.41.3 会话删除的回执兜底落点（SPA 驾驶舱常驻会话，web-ui 协议头注
+/// DEFAULT_CONV 同源）：/rm 的删除目标=发起会话本身时回执改落此处——落回被
+/// 删会话会被 SPA 的 text 帧处理复活成幽灵条目，删除语义即失效。硬编码与
+/// SPA 常量对齐（网关 web_default_session 可配，但 SPA 侧栏兜底会话恒为
+/// web:default，回执以 SPA 可渲染为准）。
+pub(super) const WEB_DEFAULT_CONV: &str = "web:default";
+
+/// v1.41.3 会话删除的「进行中」错误码（web 网关 error 帧契约字面量，SPA
+/// ERROR_HINTS 按码渲染 toast；网关侧 conv_delete 泵同码——字面量在
+/// imagent-web 平台.rs 另有一份协议定义，与 workspace_invalid 同款纪律）。
+pub(super) const CONV_BUSY_CODE: &str = "conv_busy";
+
 const KNOWN_COMMAND_WORDS: &[&str] = &[
     "/admin",
     "/again",
@@ -65,6 +77,7 @@ const KNOWN_COMMAND_WORDS: &[&str] = &[
     "/reconnect",
     "/resume",
     "/retry",
+    "/rm",
     "/sessions",
     "/stats",
     "/status",
@@ -91,6 +104,7 @@ pub(super) const COMMAND_GROUPS: &[(&str, &[&str])] = &[
             "/again",
             "/last",
             "/peers",
+            "/rm",
             "/to",
         ],
     ),
@@ -288,6 +302,10 @@ impl Dispatcher {
                 match cmd.as_str() {
                     "/new" => {
                         self.cmd_new(&conv, &hint).await;
+                        return;
+                    }
+                    "/rm" => {
+                        self.cmd_rm(&conv, &hint, &parts).await;
                         return;
                     }
                     "/allow" => {

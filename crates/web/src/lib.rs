@@ -1103,6 +1103,14 @@ pub(crate) enum InboundAction {
         audio: String,
         duration_ms: u64,
     },
+    /// v1.41.3 会话删除：conv_delete{convId} → platform 的 workspace 泵（活跃
+    /// 轮探测 + sessions/outbound_log/卡片缓存三处删除 + 回执文本 + workspaces
+    /// 快照；不进 recv / dispatch 命令链——删除走网关数据面，不经 agent）。
+    /// `conv` 为经 [`normalize_conv`] 归一的完整 conv（`peer:`/`local:` 前缀
+    /// 原样透传——peer 会话同样可删，见 /rm 的例外语义）。
+    ConvDelete {
+        conv: String,
+    },
     /// 未知 type：debug 忽略——前向兼容，M3 SPA 新增帧不致网关断连。
     Ignore,
     /// 协议违规 / 缺必填字段：warn 原因并丢弃（不进 recv）。
@@ -1361,6 +1369,18 @@ pub(crate) fn map_inbound_frame(v: &serde_json::Value, default_session: &str) ->
             InboundAction::AsrRequest {
                 audio: audio.to_string(),
                 duration_ms,
+            }
+        }
+        // v1.41.3 会话删除：本层只做字段校验（convId 须字符串，缺失/类型错 →
+        // Warn 丢弃），值域校验（活跃轮拒绝）与三处删除在 platform workspace
+        // 泵——失败须回 error 帧（conv_busy）+ 快照给 SPA 反馈，静默丢弃会让
+        // 删除确认弹层无响应。
+        "conv_delete" => {
+            let Some(conv) = v.get("convId").and_then(|c| c.as_str()) else {
+                return InboundAction::Warn("conv_delete 帧缺 convId 字段，丢弃");
+            };
+            InboundAction::ConvDelete {
+                conv: normalize_conv(Some(conv), default_session),
             }
         }
         _ => InboundAction::Ignore,
@@ -1767,6 +1787,52 @@ mod tests {
             r#"{"v":1,"type":"history_query","convId":"web:w","since":"5"}"#,
             r#"{"v":1,"type":"history_query","convId":"web:w","since":[1]}"#,
             r#"{"v":1,"type":"history_query","convId":"web:w","since":1.5}"#,
+        ] {
+            assert!(
+                matches!(map_raw_frame(raw, SESSION), InboundAction::Warn(_)),
+                "{raw} 应 Warn 丢弃"
+            );
+        }
+    }
+
+    /// v1.41.3 conv_delete 入站帧正例：convId 完整形态原样；裸名补 web: 前缀；
+    /// peer: / local: 前缀透传（peer 会话同样可删——例外语义见 /rm 注释）。
+    #[test]
+    fn map_conv_delete_frames() {
+        for (raw, want) in [
+            (
+                r#"{"v":1,"type":"conv_delete","convId":"web:s-aa94","machine":"m"}"#,
+                "web:s-aa94",
+            ),
+            // 裸名兼容输入（SPA 帧契约恒完整形态，此处同 history_query 纪律）。
+            (
+                r#"{"v":1,"type":"conv_delete","convId":"s-aa94"}"#,
+                "web:s-aa94",
+            ),
+            (
+                r#"{"v":1,"type":"conv_delete","convId":"peer:imagent-bc"}"#,
+                "peer:imagent-bc",
+            ),
+            (
+                r#"{"v":1,"type":"conv_delete","convId":"local:work"}"#,
+                "local:work",
+            ),
+        ] {
+            let act = map_raw_frame(raw, SESSION);
+            let InboundAction::ConvDelete { conv } = act else {
+                panic!("{raw} 应映射为 ConvDelete：{act:?}")
+            };
+            assert_eq!(conv, want, "convId 归一（{raw}）");
+        }
+    }
+
+    /// v1.41.3 conv_delete 入站帧反例：convId 缺失/非字符串 → Warn 丢弃。
+    #[test]
+    fn map_conv_delete_frames_missing_or_wrong_fields() {
+        for raw in [
+            r#"{"v":1,"type":"conv_delete"}"#,
+            r#"{"v":1,"type":"conv_delete","convId":42}"#,
+            r#"{"v":1,"type":"conv_delete","convId":null}"#,
         ] {
             assert!(
                 matches!(map_raw_frame(raw, SESSION), InboundAction::Warn(_)),

@@ -20,6 +20,7 @@ const REQUIRED = [
   "/retry",
   "/peers",
   "/to",
+  "/rm",
   "/queue",
   "/status",
   "/export",
@@ -54,6 +55,15 @@ describe("命令表完整性", () => {
     for (const name of REQUIRED) {
       expect(names, `缺少命令 ${name}`).toContain(name);
     }
+  });
+
+  it("/rm 词条存在（会话与任务组）：desc 说明删除语义与前缀补全（v1.41.3）", () => {
+    const rm = COMMANDS.find((c) => c.name === "/rm");
+    expect(rm).toBeDefined();
+    expect(rm?.group).toBe("会话与任务");
+    expect(rm?.args).toBe("<会话名>");
+    expect(rm?.desc).toContain("删除");
+    expect(rm?.desc).toContain("web: 前缀");
   });
 
   it("/model 描述附常用模型；内置兜底 chips 与契约一致（default/sonnet/opus/haiku）", () => {

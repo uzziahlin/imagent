@@ -1450,3 +1450,51 @@ describe("WsManager 语音转写（v1.40）", () => {
     expect(events).toContainEqual({ kind: "downgrade", machine: "home-mac" });
   });
 });
+
+// ---------------------------------------------------------------------------
+// v1.41.3 会话删除：sendConvDelete 发送器 + enc 包装（业务帧族，同 message
+// 族路由；快照/回执为网关回包，连接层无需拦截）
+// ---------------------------------------------------------------------------
+
+describe("WsManager 会话删除（v1.41.3）", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it("sendConvDelete：ready 前返回 false；ready 后字节精确（machine 缺省不带字段）", () => {
+    const h = makeManager();
+    h.mgr.connect();
+    expect(h.mgr.sendConvDelete("web:s-aa94")).toBe(false);
+    const sock = readyFlow(h);
+    expect(h.mgr.sendConvDelete("web:s-aa94")).toBe(true);
+    expect(sock.sent.at(-1)).toBe('{"v":1,"type":"conv_delete","convId":"web:s-aa94"}');
+    expect(h.mgr.sendConvDelete("peer:win-a", "home-mac")).toBe(true);
+    expect(sock.sent.at(-1)).toBe(
+      '{"v":1,"type":"conv_delete","convId":"peer:win-a","machine":"home-mac"}',
+    );
+  });
+
+  it("conv_delete 在 BUSINESS_TYPES 内：e2e active 机器出站包成 enc 帧（relay 盲化）", () => {
+    const h = makeManager();
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    // 走 e2e 握手至 active（同语音转写测试的 ack 流程）。
+    const gkPriv = x25519.utils.randomSecretKey();
+    const gk = bytesToHex(x25519.getPublicKey(gkPriv));
+    const idPriv = ed25519.utils.randomSecretKey();
+    const ik = bytesToHex(ed25519.getPublicKey(idPriv));
+    sock.serverSend(JSON.stringify({ v: 1, type: "machines", online: ["home-mac"] }));
+    const hello = JSON.parse(sock.sentOfType("e2e_hello")[0]) as { ek: string; n1: string };
+    const n2 = bytesToHex(randomBytes(32));
+    const sig = bytesToHex(ed25519.sign(signatureMessage(hello.ek, gk, hello.n1, n2), idPriv));
+    sock.serverSend(
+      JSON.stringify({ v: 1, type: "e2e_ack", machine: "home-mac", gk, n2, sig, ik }),
+    );
+    h.mgr.resolveTofu("home-mac", true);
+    expect(h.mgr.sendConvDelete("web:s-aa94", "home-mac")).toBe(true);
+    // 出站最外层是 enc 帧（原帧已加密，relay 不可见）。
+    const wire = JSON.parse(sock.sent.at(-1) ?? "{}") as { type: string; machine: string };
+    expect(wire.type).toBe("enc");
+    expect(wire.machine).toBe("home-mac");
+  });
+});

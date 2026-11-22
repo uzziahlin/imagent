@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useRef } from "react";
 import { convDisplayName, DEFAULT_MACHINE, normalizeExpiryMs } from "../lib/protocol";
 import type { ThemePref } from "../lib/theme";
 
@@ -8,6 +8,14 @@ const THEME_OPTIONS: { value: ThemePref; label: string }[] = [
   { value: "light", label: "浅色" },
   { value: "dark", label: "深色" },
 ];
+
+/** v1.41.3 长按删除的触发时长（ms）：手机长按惯例 500ms——短了易与点选误触，
+ *  长了等待感明显。 */
+const LONG_PRESS_DELETE_MS = 500;
+
+/** 长按位移容忍（px）：按下后移动超过该距离视为滚动手势，取消长按计时
+ * （触屏滚动必然伴随 pointermove，不取消会边滚边弹删除确认）。 */
+const LONG_PRESS_MOVE_TOLERANCE = 8;
 
 /** 侧边栏会话项数据（App 从 state 派生）：conv 全名 + 显示名 + 最后消息
  *  预览/时间 + 未读计数（非当前 conv 收到新消息时 reducer 累加，点选清零）。 */
@@ -48,6 +56,9 @@ function formatTime(at: number): string {
  *
  * 交互语义：
  * - 点选会话 = 仅切换 SPA 本地当前 conv（不发包）；
+ * - 长按会话 500ms（v1.41.3）= 弹删除确认（App 级弹层二次确认后发 conv_delete
+ *   业务帧，网关删三处 + 快照收敛）；长按后吞掉紧随的 click（不切会话）；
+ *   传入 onConvDelete 才启用（缺席 = 旧入口不显示行为变化）；
  * - 点选机器 = 切换 currentMachine（App 侧把当前 conv 回到该机器默认会话，
  *   并发一次带 machine 的 sync 拉该机器卡片缓存）；
  * - 新会话（v1.6）= 打开 App 级弹层（会话名 + 工作目录选择 WorkspacePicker），
@@ -84,6 +95,7 @@ export function Sidebar({
   onSelect,
   onSelectMachine,
   onCreate,
+  onConvDelete,
 }: {
   convs: ConvItem[];
   current: string;
@@ -118,7 +130,38 @@ export function Sidebar({
   onSelectMachine: (machine: string) => void;
   /** 打开新会话弹层（v1.6：会话名 + 工作目录选择在 App 级弹层完成）。 */
   onCreate: () => void;
+  /** v1.41.3 长按删除入口（App 级确认弹层由此打开；缺席 = 未启用长按）。 */
+  onConvDelete?: (conv: string) => void;
 }) {
+  // v1.41.3 长按删除计时（按下起 500ms；期间移动超容差/抬起/取消/离项即清）。
+  // firedRef 吞掉长按触发后紧随的 click（pointerup 后浏览器仍派发 click——
+  // 不吞会长按完又把会话切走）。纯内存计时用 useRef（组件实例级，无渲染依赖）。
+  const pressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pressStart = useRef<{ x: number; y: number } | null>(null);
+  const longPressFired = useRef(false);
+
+  const clearPressTimer = () => {
+    if (pressTimer.current !== null) {
+      clearTimeout(pressTimer.current);
+      pressTimer.current = null;
+    }
+    pressStart.current = null;
+  };
+
+  const startPressTimer = (convId: string, x: number, y: number) => {
+    if (!onConvDelete) {
+      return;
+    }
+    clearPressTimer();
+    longPressFired.current = false;
+    pressStart.current = { x, y };
+    pressTimer.current = setTimeout(() => {
+      pressTimer.current = null;
+      pressStart.current = null;
+      longPressFired.current = true;
+      onConvDelete(convId);
+    }, LONG_PRESS_DELETE_MS);
+  };
 
   // v1.2 过期横幅：剩余 < 3 天提示（天数向上取整，至少 1 天）
   const daysLeft = useMemo(() => {
@@ -216,14 +259,50 @@ export function Sidebar({
             <button
               key={item.convId}
               type="button"
-              onClick={() => onSelect(item.convId)}
+              onClick={() => {
+                // v1.41.3：长按刚触发过（确认弹层已开）→ 吞本次 click（不切会话）。
+                if (longPressFired.current) {
+                  longPressFired.current = false;
+                  return;
+                }
+                onSelect(item.convId);
+              }}
+              onPointerDown={(e) => {
+                // 鼠标仅主键触发（右键语义不同）；触屏任一指针均可长按。
+                if (e.pointerType === "mouse" && e.button !== 0) {
+                  return;
+                }
+                startPressTimer(item.convId, e.clientX, e.clientY);
+              }}
+              onPointerMove={(e) => {
+                // 位移超出容差 = 滚动手势，取消长按（误触保护）。坐标缺失
+                //（如 jsdom 事件兜底形态）按「无法确认在容差内」处理——取消。
+                const start = pressStart.current;
+                const dist = start
+                  ? Math.hypot(e.clientX - start.x, e.clientY - start.y)
+                  : Number.POSITIVE_INFINITY;
+                if (!(dist <= LONG_PRESS_MOVE_TOLERANCE)) {
+                  clearPressTimer();
+                }
+              }}
+              onPointerUp={clearPressTimer}
+              onPointerLeave={clearPressTimer}
+              onPointerCancel={clearPressTimer}
+              onContextMenu={(e) => {
+                // 触屏长按的系统菜单（iOS 预览/callout）与删除手势冲突，屏蔽；
+                // 长按语义由本组件接管。桌面右键同理不给系统菜单。
+                e.preventDefault();
+                clearPressTimer();
+              }}
               aria-current={active ? "page" : undefined}
+              title={onConvDelete ? `${convDisplayName(item.convId)}（长按删除）` : undefined}
               className={
-                "block w-full rounded-xl px-3 py-2 text-left transition-colors " +
+                "block w-full select-none rounded-xl px-3 py-2 text-left transition-colors " +
                 (active
                   ? "bg-emerald-600/15 text-ink"
                   : "text-muted hover:bg-panel2 hover:text-ink")
               }
+              style={{ WebkitTouchCallout: "none" }}
             >
               <span className="flex items-center gap-2">
                 {/* v1.37 运行态呼吸点（emerald + animate-pulse，形态随状态条

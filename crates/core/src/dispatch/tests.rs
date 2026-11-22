@@ -9634,3 +9634,255 @@ async fn peer_inbound_replies_direct_to_peer_conv() {
     );
     assert!(ctx.calls.lock().await.is_empty(), "入站直投不驱动 agent");
 }
+
+// ---------- v1.41.3 /rm（会话删除命令）----------
+
+/// /rm 测试夹具：带 sent（(conv, text) 全记录——回执落点断言）与 errors
+///（(code, message)——conv_busy error 帧断言）观测句柄 + db 路径（store 两处
+/// 删除断言用）。auth 放行 u1；workdir 同既有助手约定。
+struct RmCtx {
+    disp: Arc<Dispatcher>,
+    sent: SentHandle,
+    errors: ErrorsHandle,
+    db: std::path::PathBuf,
+}
+
+impl RmCtx {
+    /// 断言用新 Store 连接（同一 db 文件——Store 未 impl Clone，rusqlite WAL
+    /// 支持多连接，对齐 [`Ctx::check`]）。
+    async fn check(&self) -> Store {
+        Store::open(&self.db).await.expect("reopen store")
+    }
+}
+
+async fn build_rm_ctx() -> RmCtx {
+    let _ = std::fs::create_dir_all("/tmp/imagent-test-ws");
+    let (plat, _inbox, _send_count, errors, sent) = MockPlatform::new_with_errors();
+    let (back, _calls, _prompts, _order) = MockBackend::new();
+    // /rm 用例并行起跑，tmp_store 的纳秒文件名在 macOS（~1μs 时钟分辨率）会
+    // 撞名（platform 测试同款已知问题）——pid + 原子序号 = 进程内绝对唯一。
+    static RM_SEQ: AtomicUsize = AtomicUsize::new(0);
+    let seq = RM_SEQ.fetch_add(1, Ordering::SeqCst);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let mut db_path = std::env::temp_dir();
+    db_path.push(format!(
+        "imagent_core_rm_{}_{}_{}.sqlite",
+        std::process::id(),
+        nanos,
+        seq
+    ));
+    let store = Store::open(&db_path).await.expect("open rm store");
+    let db = db_path;
+    let auth = Auth::new(vec!["u1".into()]);
+    let admins = auth.snapshot();
+    let disp = Arc::new(Dispatcher::new(
+        Arc::new(plat),
+        Arc::new(back),
+        store,
+        auth,
+        std::path::PathBuf::from("/tmp/imagent-test-ws"),
+        vec!["Read".into()],
+        PermissionMode::Off,
+        test_budgets(),
+        CotDetail::Brief,
+        admins,
+    ));
+    RmCtx {
+        disp,
+        sent,
+        errors,
+        db,
+    }
+}
+
+/// /rm 断言用种子：sessions 行（主表 + 历史副表，upsert_session 既有通路）。
+async fn rm_seed_session(store: &Store, conv: &str) {
+    store
+        .upsert_session(&imagent_store::SessionRow {
+            conv_id: conv.into(),
+            session_id: format!("s-{conv}"),
+            agent_kind: "claude".into(),
+            workdir: "/tmp/imagent-test-ws".into(),
+            name: None,
+            created_at: 0,
+            updated_at: 0,
+            first_prompt: Some("首条消息".into()),
+            task_todos: None,
+        })
+        .await
+        .unwrap();
+}
+
+/// /rm 断言用种子：outbound_log 两行（web 历史重放数据源）。
+async fn rm_seed_outbound(store: &Store, conv: &str) {
+    store
+        .append_outbound(conv, "text", r#"{"text":"旧消息","at":1}"#)
+        .await
+        .unwrap();
+    store
+        .append_outbound(conv, "card", r#"{"messageId":"m1","card":{}}"#)
+        .await
+        .unwrap();
+}
+
+/// /rm 删除语义（任务验收项）：省略 web: 前缀自动补全；sessions 行 +
+/// outbound_log 两处全删；无关 conv 不受牵连；回执「已删除会话 <conv>」落
+/// 发起会话；不驱动 agent。
+#[tokio::test]
+async fn rm_deletes_session_and_outbound_and_replies() {
+    let ctx = build_rm_ctx().await;
+    {
+        let store = ctx.check().await;
+        rm_seed_session(&store, "web:s-aa94").await;
+        rm_seed_outbound(&store, "web:s-aa94").await;
+        rm_seed_session(&store, "web:keep").await;
+        rm_seed_outbound(&store, "web:keep").await;
+    }
+    ctx.disp
+        .handle(msg("web:default", "u1", "/rm s-aa94"))
+        .await;
+    // 回执落发起会话（发起≠目标）。
+    assert!(
+        ctx.sent
+            .lock()
+            .await
+            .iter()
+            .any(|(c, t)| c == "web:default" && t == "已删除会话 web:s-aa94"),
+        "回执应落发起会话 web:default：{:?}",
+        *ctx.sent.lock().await
+    );
+    // store 两处全删；无关 conv 完整。
+    let store = ctx.check().await;
+    assert!(
+        store.get_session("web:s-aa94").await.unwrap().is_none(),
+        "sessions 行应删除"
+    );
+    let gone = store
+        .list_outbound_since("web:s-aa94", 0, 500)
+        .await
+        .unwrap();
+    assert!(gone.rows.is_empty(), "outbound_log web:s-aa94 应全删");
+    assert!(store.get_session("web:keep").await.unwrap().is_some());
+    let keep = store.list_outbound_since("web:keep", 0, 500).await.unwrap();
+    assert_eq!(keep.rows.len(), 2, "无关 conv outbound 不受牵连");
+}
+
+/// /rm 活跃轮拒绝（任务验收项，照 /stop 的在飞句柄判断）：conv_busy error
+/// 帧 + 警告文本回执 + 三处原样（不删）。
+#[tokio::test]
+async fn rm_rejects_busy_conv() {
+    let ctx = build_rm_ctx().await;
+    {
+        let store = ctx.check().await;
+        rm_seed_session(&store, "web:busy").await;
+        rm_seed_outbound(&store, "web:busy").await;
+    }
+    // 伪造在飞句柄（abort handle 挂在长睡任务上，同 evict 测试手法）。
+    let jh = tokio::spawn(async {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    });
+    ctx.disp
+        .with_conv("web:busy", |cs| {
+            cs.running = Some(RoundHandle {
+                abort: jh.abort_handle(),
+                steer: None,
+                started: std::time::Instant::now(),
+                digest: None,
+                snapshot: Arc::new(std::sync::Mutex::new(RoundSnapshot::default())),
+            });
+        })
+        .await;
+    ctx.disp.handle(msg("web:default", "u1", "/rm busy")).await;
+    // conv_busy error 帧（web 网关转 toast；IM 平台文本覆盖）。
+    assert!(
+        ctx.errors
+            .lock()
+            .await
+            .iter()
+            .any(|(c, m)| c == "conv_busy" && m == "该会话有进行中的任务，请先 /stop"),
+        "应记 conv_busy error 帧：{:?}",
+        *ctx.errors.lock().await
+    );
+    assert!(
+        ctx.sent
+            .lock()
+            .await
+            .iter()
+            .any(|(c, t)| c == "web:default" && t.contains("/stop")),
+        "警告文本应含 /stop 指引：{:?}",
+        *ctx.sent.lock().await
+    );
+    // 三处原样（含 dispatcher 在飞句柄仍在——删除被拒绝）。
+    let store = ctx.check().await;
+    assert!(store.get_session("web:busy").await.unwrap().is_some());
+    let rows = store.list_outbound_since("web:busy", 0, 500).await.unwrap();
+    assert_eq!(rows.rows.len(), 2);
+    assert!(
+        ctx.disp
+            .peek_conv("web:busy", |cs| cs.is_some_and(|c| c.running.is_some()))
+            .await,
+        "在飞句柄不应被误清"
+    );
+}
+
+/// /rm 自删回执落点：删除目标=发起会话本身（web: conv）→ 回执改落
+/// web:default——落回被删会话会被 SPA text 帧处理复活成幽灵条目。
+#[tokio::test]
+async fn rm_self_delete_replies_to_web_default() {
+    let ctx = build_rm_ctx().await;
+    {
+        let store = ctx.check().await;
+        rm_seed_session(&store, "web:target").await;
+        rm_seed_outbound(&store, "web:target").await;
+    }
+    ctx.disp
+        .handle(msg("web:target", "u1", "/rm web:target"))
+        .await;
+    let sent = ctx.sent.lock().await;
+    assert!(
+        sent.iter()
+            .any(|(c, t)| c == "web:default" && t == "已删除会话 web:target"),
+        "自删回执应改落 web:default：{sent:?}"
+    );
+    assert!(
+        !sent.iter().any(|(c, _)| c == "web:target"),
+        "不得向被删会话回执（复活风险）：{sent:?}"
+    );
+    let store = ctx.check().await;
+    assert!(store.get_session("web:target").await.unwrap().is_none());
+}
+
+/// /rm peer: 会话删除（例外语义）：只删驾驶舱视图与网关记录，不影响窗口侧
+/// claude 实例（本测试断言网关侧两处删除 + 回执 + 不驱动 agent——窗口无感知
+/// 由 peer 协议保证，无消息发往窗口）。
+#[tokio::test]
+async fn rm_peer_conv_deletes_without_agent() {
+    let ctx = build_rm_ctx().await;
+    {
+        let store = ctx.check().await;
+        rm_seed_session(&store, "peer:win-a").await;
+        rm_seed_outbound(&store, "peer:win-a").await;
+    }
+    ctx.disp
+        .handle(msg("web:default", "u1", "/rm peer:win-a"))
+        .await;
+    assert!(
+        ctx.sent
+            .lock()
+            .await
+            .iter()
+            .any(|(c, t)| c == "web:default" && t == "已删除会话 peer:win-a"),
+        "peer: 会话回执应落发起会话：{:?}",
+        *ctx.sent.lock().await
+    );
+    let store = ctx.check().await;
+    assert!(store.get_session("peer:win-a").await.unwrap().is_none());
+    let rows = store
+        .list_outbound_since("peer:win-a", 0, 500)
+        .await
+        .unwrap();
+    assert!(rows.rows.is_empty(), "peer: conv outbound 应全删");
+}

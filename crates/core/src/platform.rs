@@ -459,6 +459,13 @@ pub trait Platform: Send + Sync {
     /// 增量帧推送，见 `imagent-web`）。
     fn on_workdir_changed(&self, _conv: &ConvId, _path: &str) {}
 
+    /// v1.41.3 会话删除：conv 已在网关侧删除（sessions 行 + outbound_log 清空
+    /// 落库后调用——`/rm` 命令的收尾钩子）。同步 best-effort 钩子，语义同
+    /// [`Platform::on_workdir_changed`]（非阻塞、不做 IO/await）：default
+    /// no-op（IM 平台无驾驶舱视图；web 覆写为卡片缓存按 conv 移除 +
+    /// workspaces 快照推送——SPA 侧栏以快照收敛，见 `imagent-web`）。
+    fn on_conv_deleted(&self, _conv: &ConvId) {}
+
     /// v1.41：网关侧错误码 error 帧推送（web 驾驶舱 lastError toast，如
     /// `peer_unreachable`——peer 出站投递失败）。default no-op：IM 平台无
     /// error 帧概念（错误反馈走 reply 文本链路），仅 web 覆写（复用

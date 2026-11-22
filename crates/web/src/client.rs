@@ -580,11 +580,13 @@ impl WebClient {
             // v1.6 工作空间动作 → platform 泵（store IO 在泵内 await，client
             // 收发循环不被 sqlite 阻塞）。同 sync 的 1s 有界背压：泵消费极快
             //（KV 读写毫秒级），持续满只会在 relay 断连排队时出现——此时帧
-            // 本就发不出去，丢弃后 SPA 重发/下条快照兜底。
+            // 本就发不出去，丢弃后 SPA 重发/下条快照兜底。v1.41.3 conv_delete
+            // 同泵同通道（活跃轮探测 + 三处删除 + 快照回，见 platform 泵注释）。
             act @ (InboundAction::WorkspaceList
             | InboundAction::WorkspaceSave { .. }
             | InboundAction::WorkspaceRemove { .. }
-            | InboundAction::ConvWorkdirSet { .. }) => {
+            | InboundAction::ConvWorkdirSet { .. }
+            | InboundAction::ConvDelete { .. }) => {
                 if tokio::time::timeout(Duration::from_secs(1), self.workspace_tx.send(act))
                     .await
                     .is_err()
