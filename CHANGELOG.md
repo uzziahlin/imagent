@@ -2,6 +2,51 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.41.0] — 2026-11-22
+
+> **网关伪装 Claude Code peer（驾驶舱⇄本地窗口双向通道）**：网关伪装成 Claude Code
+> 实例注册为本机 peer（`~/.claude/sessions/<pid>.json` + cc-socks socket），本地
+> claude 窗口可用原生 `SendMessage` 语义给网关发消息（推驾驶舱），用户在驾驶舱
+> 回复（网关投回窗口，空闲自动开新轮——claude 原生行为）。出门用驾驶舱看进展/
+> 派活，无需改动任何本地窗口。协议对 Claude Code 2.1.310 双向实测验证（wire
+> protocol 为逆向 port，参考 pi-claude-link；claude 升级若变格式由薄适配层跟进）。
+> **缺省关闭**（`peer_enabled = false`）——零痕迹，不改既有部署行为。
+
+### Added
+- **peer 协议层**（crates/core/src/peer）：注册表扫描/探活/注册注销/孤儿清理
+  （只动 `entrypoint=="imagent"` 家族）、UDS server（JSON 行帧 1MiB 上限、收帧
+  回 `peer_message_status` receipt、对端半关闭跟随关闭——claude 发送方 5s 预算）、
+  envelope 构造/剥离/转义纯函数、出站 `PeerSender`（按窗口名解析，唯一前缀匹配，
+  失败文案附在线名单）。注册表与 socket 路径全注入（测试 tempdir，不硬编码
+  `$HOME`）；socket 目录 0700 + sock 0600（本机同 uid 即凭证）
+- **dispatch 路由**：`peer:<窗口名>` 会话文本**不进 agent backend**——先经既有
+  send_text 链路落 outbound_log（历史重放/未读/推送复用），再按窗口名投递窗口；
+  投递失败回 SPA error 帧（新 code `peer_unreachable`）。窗口→网关入站帧经
+  回调直投 `peer:<窗口名>` 会话（正文即 envelope 剥离结果，不走鉴权管线——
+  本机 socket 即凭证）
+- **`/peers` 命令**：列出在线窗口（名字 + kind + status，探活过滤，排除网关
+  自身），附「进入 peer:<名字> 会话回复」提示
+- **`/to` 命令**：`/to <窗口名> <文本…>` 跨平台派活入口（飞书/终端用户经
+  /peers + /to 完成全部 peer 交互）；成功回执落当前会话 + 派活正文镜像进
+  `peer:<窗口名>` 会话（驾驶舱历史完整）；失败回执附在线名单
+- **配置**：`peer_enabled`（缺省 false）/ `peer_name`（缺省 "imagent"），EXAMPLE
+  模板顶层键区同步
+- **装配**（src/main.rs）：peer_enabled 时启动 PeerServer（孤儿清理 → 注册 →
+  listen → accept 循环），优雅停机注销（删注册条目 + unlink socket，先于
+  process::exit）；平台列表不含 web 时装配期 warn（peer: 会话出站主路由需要
+  web 平台）
+
+### Changed
+- **MultiPlatform**：`peer:` 前缀 conv 的出站投递主路由 web 子平台（驾驶舱是
+  peer 会话的实时主视图；不镜像 feishu 防刷屏，对齐 local: 的既有判断；web 不
+  在 children 时维持 Err）；模块文档补 peer: 路由说明
+- **Platform trait**：新增 `send_error_note`（default no-op，web 覆写为 error
+  帧推送——复用既有 encode_error_frame 出站形态，SPA lastError toast 展示）
+- **未知命令模糊建议 tie-break**：距离并列时优先更长（更具体）的命令名——
+  `/to` 加入后 `/sto` 对 `/stop` 与 `/to` 距离同为 1，长度倒序裁决并列
+- **SPA**：命令面板补 `/peers` `/to` 词条；`peer:` 会话标题剥前缀直接显示窗口名；
+  ERROR_HINTS 补 `peer_unreachable` 词条
+
 ## [1.40.1] — 2026-11-21
 
 > **前后台切换消息恢复**：iOS 挂起把 WS 掐成半开（UI 显示已连接、数据通道已死），
