@@ -1132,10 +1132,17 @@ fn decision_word(decision: &str) -> Option<&'static str> {
 ///   MultiPlatform 镜像路由把 local 会话的出站帧同步给 web 平台，SPA 可直接
 ///   寻址 local 会话干预；回执若被强加 `web:` 前缀会造出无人消费的
 ///   `web:local:xxx` 幽灵会话，干预/审批闭环断裂。
+/// - raw 以 `peer:` 开头 → **原样透传**：`peer:` 是网关伪装 Claude Code peer
+///   的会话前缀（crates/core/src/peer，网关注册为本机 peer，本地 claude 窗口
+///   经原生 SendMessage 与驾驶舱 `peer:<窗口名>` 会话双向互通）；dispatch 有
+///   专门的 `peer:` 拦截臂（dispatch_peer_message，消息不进 agent backend）——
+///   强加 `web:` 前缀会让用户消息绕过拦截直进 agent（误触发 agent 轮、落
+///   outbound_log card），并造出 `web:peer:xxx` 幽灵会话。
 /// - 其它（裸 session 名）→ `web:<raw>`
 fn normalize_conv(raw: Option<&str>, default_session: &str) -> String {
     match raw {
         Some(c) if c.starts_with("local:") => c.to_string(),
+        Some(c) if c.starts_with("peer:") => c.to_string(),
         Some(c) if !c.is_empty() && c.starts_with("web:") => c.to_string(),
         Some(c) if !c.is_empty() => format!("web:{c}"),
         _ => format!("web:{default_session}"),
@@ -1406,9 +1413,10 @@ mod tests {
         assert_eq!(m.conv_id, ConvId("web:work".into()));
     }
 
-    /// convId 归一四分支：None / 空串 → 默认会话；完整 web conv 原样（SPA
+    /// convId 归一五分支：None / 空串 → 默认会话；完整 web conv 原样（SPA
     /// 原样回传出站帧 convId 的正常路径）；裸 session 名补前缀（兼容形态）；
-    /// `local:` 前缀原样透传（本地终端会话，见 normalize_conv 注释）。
+    /// `local:` 前缀原样透传（本地终端会话）；`peer:` 前缀原样透传（网关伪装
+    /// Claude Code peer 会话，均见 normalize_conv 注释）。
     #[test]
     fn normalize_conv_three_forms() {
         assert_eq!(normalize_conv(None, "default"), "web:default");
@@ -1419,6 +1427,11 @@ mod tests {
         assert_eq!(normalize_conv(Some("local:work"), "default"), "local:work");
         // 恰好名为 local 的裸 session 名仍走 web: 前缀（无冒号非 local: 前缀）。
         assert_eq!(normalize_conv(Some("local"), "default"), "web:local");
+        // peer: 透传（dispatch 有 peer: 拦截臂不进 agent；不双前缀成
+        // web:peer:xxx 幽灵会话）。
+        assert_eq!(normalize_conv(Some("peer:win"), "default"), "peer:win");
+        // 恰好名为 peer 的裸 session 名仍走 web: 前缀（无冒号非 peer: 前缀）。
+        assert_eq!(normalize_conv(Some("peer"), "default"), "web:peer");
     }
 
     /// local 会话干预闭环（镜像路由配套，必修回归钉）：MultiPlatform 把 local

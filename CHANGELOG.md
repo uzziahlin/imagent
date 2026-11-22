@@ -2,6 +2,16 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.41.2] — 2026-11-22
+
+> 真机 bug 修复：驾驶舱 `peer:` 会话里发消息被拼成 `web:peer:xxx` 绕过 peer 拦截臂
+> 直进 agent（误触发轮次 + 落 card 裂出幽灵会话）。
+
+### Fixed
+- **normalize_conv 透传 `peer:` 前缀**（crates/web）：SPA 消息 convId 的归一白名单
+  （`local:` / `web:`）补上 `peer:` 原样透传——dispatch 的 peer: 拦截臂恢复生效，
+  peer 会话文本正确投递本地窗口；裸名 `peer` 仍补 `web:` 前缀（防误透传）
+
 ## [1.41.1] — 2026-11-22
 
 > peer 通道真机首验后的 UX 修复：`/peers` 提示的「进入 peer:<名字> 会话」在首次使用前
