@@ -39,6 +39,19 @@
 //!   是协作钩子且 web 平台未覆写（镜像恒为 no-op）。
 //! - 配置化锚点：未来若需更多「平台 A 的会话镜像到平台 B」的规则，把这条
 //!   (源前缀 → 目标平台) 硬编码规则升级为 config 驱动的 mirror 规则表。
+//!
+//! ## peer: 前缀的主路由特判（v1.41，叠加在 A 类归属路由之上）
+//!
+//! `peer:<窗口名>` 会话（网关伪装 Claude Code peer，见 [`crate::peer`]）**不
+//! 对应任何子平台名**（`peer` 不是平台），按 A 类规则会「无对应平台」报错。
+//! 特判：`peer:` conv 的出站投递**主路由到 web 子平台**（若在 children）——
+//! 驾驶舱是 peer 会话的实时主视图（窗口→网关入站经 reply 落同一 conv，出站
+//! 文本镜像回显也落同一 conv，两端都依赖 web 承载）。理由与边界：
+//! - 不镜像 feishu 等 IM（防刷屏，对齐 local: 不镜像 IM 的既有判断）——飞书
+//!   用户经 `/peers`（查看）+ `/to`（派活）完成全部 peer 交互，回执落当前会话；
+//! - web 不在 children 时维持 Err（与未知前缀同语义：配置撤下 web 后 peer
+//!   会话的残存调用可见报错，不静默丢弃）；
+//! - 配置化锚点同上（mirror 规则表），本特判暂不并入。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -206,10 +219,17 @@ impl MultiPlatform {
     }
 
     /// 按 conv 前缀（首个 `:` 之前，如 `feishu:oc_x` → `feishu`）定位子平台。
-    /// 无命中 → Err（配置撤下平台后残存会话/历史 conv 的调用会走到这里，报错
-    /// 比静默丢弃可见性好）。
+    /// `peer:` 前缀特判主路由到 web（驾驶舱是 peer 会话的实时主视图，理由与
+    /// 边界见模块文档「peer: 前缀的主路由特判」节）。无命中 → Err（配置撤下
+    /// 平台后残存会话/历史 conv 的调用会走到这里，报错比静默丢弃可见性好）。
     fn child_for(&self, conv: &ConvId) -> std::result::Result<&Arc<dyn Platform>, CoreError> {
         let prefix = conv.0.split(':').next().unwrap_or("");
+        // peer: 无归属平台 → 主路由 web（仅当 web 在 children；否则维持 Err）。
+        let prefix = if prefix == "peer" && self.children.iter().any(|c| c.name() == "web") {
+            "web"
+        } else {
+            prefix
+        };
         self.children
             .iter()
             .find(|c| c.name() == prefix)
@@ -559,6 +579,15 @@ impl Platform for MultiPlatform {
         }
     }
 
+    /// v1.41：网关侧错误码 error 帧按 conv 归属路由（peer: conv 经 child_for
+    /// 特判主路由 web——toast 送达驾驶舱；IM 平台 default no-op）。无返回值，
+    /// 无命中前缀静默跳过（对齐 note_round_initiator 的钩子语义）。
+    async fn send_error_note(&self, conv: &ConvId, code: &str, message: &str) {
+        if let Ok(child) = self.child_for(conv) {
+            child.send_error_note(conv, code, message).await;
+        }
+    }
+
     /// 逐子平台探测，每行加 `[<name>] ` 前缀后合并——/doctor 里可分辨哪行
     /// 来自哪个平台。
     async fn doctor_probes(&self) -> Vec<String> {
@@ -597,6 +626,8 @@ mod tests {
         streaming: bool,
         /// false = send_text 恒 Err（镜像投递失败不影响主投递的测试用）。
         send_text_ok: bool,
+        /// v1.41：send_error_note 记录（(code, message)）——peer: 路由特判测试用。
+        errors: Arc<TokioMutex<Vec<(String, String)>>>,
     }
 
     /// 构造全参数 mock（mock / mock_opt 的公共实现）。
@@ -622,6 +653,7 @@ mod tests {
             reconnect_ok,
             streaming,
             send_text_ok,
+            errors: Arc::new(TokioMutex::new(Vec::new())),
         });
         (p, tx, sent)
     }
@@ -725,6 +757,13 @@ mod tests {
                 .await
                 .push((conv.0.clone(), text.to_string()));
             Ok(())
+        }
+        /// v1.41：error 帧记录（peer: 路由特判测试断言用）。
+        async fn send_error_note(&self, _conv: &ConvId, code: &str, message: &str) {
+            self.errors
+                .lock()
+                .await
+                .push((code.to_string(), message.to_string()));
         }
         async fn send_media(
             &self,
@@ -843,6 +882,51 @@ mod tests {
 
         // 能力查询不镜像：按前缀单查 local（false），不取 web 的 true。
         assert!(!m.supports_streaming_card(&ConvId("local:work".into())));
+    }
+
+    /// 用例 N（v1.41）：peer: conv 的主路由特判——send_text / send_error_note
+    /// 主路由 web 子平台（驾驶舱是 peer 会话的实时主视图，见模块文档
+    /// 「peer: 前缀的主路由特判」节）；feishu 不镜像（防刷屏）；无 web 子平台
+    /// 时维持 Err（与未知前缀同语义，不静默丢）。
+    #[tokio::test]
+    async fn peer_conv_routes_to_web_child() {
+        let (w, _wtx, w_sent) = mock_opt("web", true, true);
+        let (f, _ftx, f_sent) = mock_opt("feishu", false, true);
+        let m = MultiPlatform::new(vec![w.clone(), f.clone()]).expect("合并 web+feishu");
+
+        m.send_text(&ConvId("peer:win-a".into()), "hi", &ReplyHint::None)
+            .await
+            .unwrap();
+        assert_eq!(
+            w_sent.lock().await.as_slice(),
+            &[("peer:win-a".to_string(), "hi".to_string())],
+            "peer: 主路由 web 子平台"
+        );
+        assert!(
+            f_sent.lock().await.is_empty(),
+            "feishu 不镜像 peer:（防刷屏）"
+        );
+
+        // error 帧同路由（peer_unreachable toast 送达驾驶舱）。
+        m.send_error_note(&ConvId("peer:win-a".into()), "peer_unreachable", "offline")
+            .await;
+        assert_eq!(
+            w.errors.lock().await.as_slice(),
+            &[("peer_unreachable".to_string(), "offline".to_string())],
+            "error 帧主路由 web"
+        );
+        assert!(f.errors.lock().await.is_empty(), "feishu 不收 error 帧");
+
+        // web 不在 children：维持 Err（不静默）。
+        let (a, _atx, _asent) = mock_opt("a", false, true);
+        let (b, _btx, _bsent) = mock_opt("b", false, true);
+        let m2 = MultiPlatform::new(vec![a, b]).expect("合并 a+b");
+        let err = m2
+            .send_text(&ConvId("peer:x".into()), "hi", &ReplyHint::None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("无对应平台"), "{err}");
+        assert!(!m2.supports_streaming_card(&ConvId("peer:x".into())));
     }
 
     /// 用例 9：镜像投递失败（web 平台 Err）不影响主投递——local conv 的

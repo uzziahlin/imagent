@@ -126,6 +126,8 @@ const ERROR_HINTS: Record<string, string> = {
   // 管理面板场景由 adminError/表单提示承担）
   machine_invalid: "机器名或公钥无效，或名称已存在",
   admin_auth_required: "管理验证缺失或已过期，请重试操作",
+  // v1.41 peer 通道（网关伪装 Claude Code peer）：peer: 会话文本投递失败
+  peer_unreachable: "窗口不在线或已退出，消息未送达（/peers 查看在线窗口）",
 };
 
 /** 机器通知文案：from 为 default 的引导切换并非真实掉线，单独措辞。 */

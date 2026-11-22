@@ -1001,6 +1001,76 @@ async fn main() -> Result<()> {
             // kind=delegate 请求与 /delegate 命令经它跑副轮）。
             delegate::apply(&dispatcher, &config, &sandbox_plan);
 
+            // v1.41：网关伪装 Claude Code peer（config.peer_enabled，缺省 false
+            // ——新功能不改既有部署行为；关闭零痕迹）。启动 = 孤儿清理 → 在
+            // ~/.claude/sessions 注册（<pid>.json）→ cc-socks 目录 bind socket
+            // → accept 循环；入站窗口消息经回调直投驾驶舱 peer:<窗口名> 会话，
+            // 出站 PeerSender 注入 Dispatcher（peer: 会话文本拦截 + /to /peers
+            // 命令消费）。路径发现/注入在 peer 模块内完成（main 只给注册表
+            // 默认根，不硬编码 $HOME——测试面全注入）。bind/注册失败 fail-open：
+            // warn 后不注入 sender（peer 通道不可用不影响网关主链路）。
+            let mut peer_server: Option<imagent_core::peer::PeerServer> = None;
+            if config.peer_enabled {
+                match imagent_core::peer::default_registry_dir() {
+                    Some(registry_dir) => {
+                        let on_user: imagent_core::peer::PeerInboundCallback = {
+                            let d = dispatcher.clone();
+                            Arc::new(move |window: String, body: String| {
+                                let d = d.clone();
+                                Box::pin(async move { d.handle_peer_inbound(&window, &body).await })
+                            })
+                        };
+                        match imagent_core::peer::PeerServer::start(
+                            imagent_core::peer::PeerServerConfig {
+                                registry_dir,
+                                name: config.peer_name.clone(),
+                                cwd: config.default_workdir.clone(),
+                                shutdown: dispatcher.shutdown_token(),
+                                on_user,
+                            },
+                        )
+                        .await
+                        {
+                            Ok(server) => {
+                                // peer 会话出站主路由需要 web 平台（MultiPlatform 的
+                                // peer:→web 特判 / 单平台直投）：只配 IM 平台时
+                                // 飞书/终端侧 /peers+/to 仍可用（回执落当前会话），
+                                // 但 peer: 会话文本无法投递——装配期 warn 明示边界。
+                                if !platform_names.iter().any(|n| n == "web") {
+                                    tracing::warn!(
+                                        target: "imagent::ops",
+                                        platforms = %platform_name,
+                                        "peer_enabled 已启用但平台列表不含 web：peer:<窗口名> \
+                                         会话文本将无法投递（IM 侧仍可用 /peers 与 /to）；\
+                                         驾驶舱场景请在 platforms 配置加入 web"
+                                    );
+                                }
+                                dispatcher.set_peer_sender(Some(server.sender()));
+                                peer_server = Some(server);
+                                tracing::info!(
+                                    target: "imagent::ops",
+                                    name = %config.peer_name,
+                                    "peer 通道已启用（本地窗口可 SendMessage 到网关；/peers 查看、/to 派活）"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "imagent::ops",
+                                    error = %e,
+                                    "peer server 启动失败，peer 通道本次运行不可用（不影响其余功能）"
+                                );
+                            }
+                        }
+                    }
+                    None => {
+                        tracing::warn!(
+                            target: "imagent::ops",
+                            "peer_enabled = true 但 home 目录不可解析，peer 通道不可用"
+                        );
+                    }
+                }
+            }
+
             // 9. 运维 HTTP server（/metrics + /health）。metrics_addr 为 None 或空串则关闭。
             // P2-2（code-review v14）：bind 提前到 spawn 之前——旧实现先 spawn 再
             // 在 task 里 bind，失败只 warn/error 后 server 静默消失，配置了
@@ -1273,6 +1343,13 @@ async fn main() -> Result<()> {
             // per-conv 连接并 kill ACP 子进程；其余后端默认 no-op）——此前只靠
             // Drop 兜底，Arc 泄漏/延迟 drop 场景下子进程会活到 OS 清理。
             backend.shutdown().await;
+            // v1.41：peer 注册注销（删 ~/.claude/sessions/<pid>.json + unlink
+            // socket）——幂等（accept 循环已随 dispatcher token 在 drain 窗口
+            // 内退出并自注销时此处 no-op）。必须在任何 process::exit 之前
+            // （同 permission.sock 清理的理由：exit(1)/exit(2) 跳过后续语句）。
+            if let Some(peer) = peer_server.as_ref() {
+                peer.shutdown().await;
+            }
             // R-3：清理 permission.sock（P1-5 计划 ③，原未落地）；P5-9b：握手
             // token 文件一并清理。
             // P3-a（code-review v14）：清理必须先于 std::process::exit——exit(1)/

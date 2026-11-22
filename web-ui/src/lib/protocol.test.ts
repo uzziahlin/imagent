@@ -1732,6 +1732,14 @@ describe("会话自动命名（title 派生 + 自动短 ID + convTitle）", () =
     const def2 = run(def, { type: "send_echo", convId: DEFAULT_CONV, text: "第二条消息" });
     expect(convTitle(convsOf(def2)[DEFAULT_CONV], DEFAULT_CONV)).toBe("默认会话的第一条消息");
   });
+
+  it("convTitle（v1.41）：peer: 会话剥前缀直接显示窗口名（conv 即窗口标识，不加前缀）", () => {
+    expect(convDisplayName("peer:窗口A")).toBe("窗口A");
+    expect(convDisplayName("local:work")).toBe("local:work"); // 既有非 web:/peer: 前缀不受影响
+    // 收到窗口入站文本（text 帧落 peer: conv）后，convTitle 显示剥前缀窗口名。
+    const s = run(initialState(), { type: "frame", frame: frame(TEXT_FRAME("窗口消息正文", "peer:窗口A")) });
+    expect(convTitle(convsOf(s)["peer:窗口A"], "peer:窗口A")).toBe("窗口A");
+  });
 });
 
 // ---------------------------------------------------------------------------

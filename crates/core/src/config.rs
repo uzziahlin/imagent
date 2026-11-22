@@ -739,11 +739,33 @@ pub struct Config {
     /// strict 档的额外可写目录（绝对路径；SIGHUP 热改）。
     #[serde(default)]
     pub agent_sandbox_extra_write: Vec<PathBuf>,
+    /// v1.41 网关伪装 Claude Code peer（驾驶舱⇄本地窗口双向通道）：启用后网关
+    /// 启动时在 `~/.claude/sessions` 注册为 peer（写 `<pid>.json` + 在 cc-socks
+    /// 目录 bind socket 0600），本地 claude 窗口可用原生 SendMessage 语义给网关
+    /// 发消息（推驾驶舱 `peer:<窗口名>` 会话），驾驶舱回复经网关投回窗口（窗口
+    /// 空闲时自动开新轮处理——claude 原生行为）。关闭（**缺省 false**，新功能
+    /// 不改既有部署行为）零痕迹：不写注册表、不 bind socket。出站投递按窗口名
+    /// 解析注册表 `messagingSocketPath`；窗口不在线回 SPA error 帧
+    /// （`peer_unreachable`）。**仅 web 驾驶舱场景完整可用**（MultiPlatform 下
+    /// `peer:` 会话出站主路由 web 子平台；只配 IM 平台时装配期 warn——IM 用户
+    /// 仍可用 `/peers` + `/to` 查看/派活）。**改动需重启**。
+    #[serde(default)]
+    pub peer_enabled: bool,
+    /// v1.41：网关注册为 peer 时对本地窗口显示的名字（驾驶舱 `peer:<名字>`
+    /// 会话后缀、出站 envelope from-name、投递回执 from、`/peers` 里网关自身
+    /// 同名）。缺省 "imagent"。改动需重启。
+    #[serde(default = "default_peer_name")]
+    pub peer_name: String,
 }
 
 /// v1.32 沙箱缺省 auto（安全缺省——Guarded 档零破坏面；要关须显式 `"off"`）。
 fn default_agent_sandbox() -> String {
     "auto".to_string()
+}
+
+/// v1.41 peer 显示名缺省（驾驶舱/窗口侧看到的网关 peer 名）。
+fn default_peer_name() -> String {
+    "imagent".to_string()
 }
 
 fn default_feishu_send_rps() -> f64 {
@@ -1463,6 +1485,15 @@ impl Config {
             }
         }
 
+        // v1.41：peer 显示名归一（trim；空白视为未设置→回退缺省——空串会把
+        // envelope from-name / 回执 from 写成空，注册表 name 也不可有空白语义）。
+        let peer_name = std::mem::take(&mut cfg.peer_name);
+        cfg.peer_name = if peer_name.trim().is_empty() {
+            default_peer_name()
+        } else {
+            peer_name.trim().to_string()
+        };
+
         Ok(cfg)
     }
 
@@ -1572,6 +1603,8 @@ permission_mode = "auto"    # 缺省=auto：claude-cli=透传 claude 原生 auto
 # feishu_bitable_table_id = "tblXXX"     # 同上（缺省关闭；SIGHUP 热改生效）
 # sender_daily_cost_limit_usd = 5.0  # per-sender 成本上限（美元，滚动 24h 窗口；不设 = 不限）
 # hide_state_dir_from_agent = true   # 状态目录 deny（默认开，仅 claude-cli）：每轮注入 --settings deny 把 ~/.imagent 挡在 agent 读视野外（Read/Edit/Write/Glob/Grep）；false=关闭（调试用）
+# peer_enabled = true   # 网关注册为 Claude Code peer（驾驶舱⇄本地窗口双向通道）：本地 claude 窗口原生 SendMessage 给网关推驾驶舱 peer:<窗口名> 会话，驾驶舱回复投回窗口（空闲自动开新轮）；关闭零痕迹（缺省 false；出站需 web 平台；改动需重启）
+# peer_name = "imagent" # 网关在窗口侧显示的 peer 名（peer:<名字> 会话后缀 / envelope from-name / 回执 from；缺省 imagent）
 # 委托编排（v1.31）：配置后 agent（claude-cli）获得 delegate_run 工具、用户可用 /delegate 命令，
 # 把子任务 fan-out 给副后端（如 Claude 写完叫 codex 审）。副轮缺省只读（Read/Grep/Glob）、
 # 无 IM 审批、无会话续接，输出截断回传；要放宽显式列 allowed_tools（风险自负）。
@@ -2262,6 +2295,33 @@ message_fragment_interval_ms = 250
         let cfg = Config::load(&p).expect("parse");
         assert_eq!(cfg.agent_idle_timeout_secs, 1200);
         assert_eq!(cfg.batch_window_ms, 1500);
+        cleanup(&p);
+    }
+
+    /// v1.41 peer 配置：缺省关闭零痕迹 + 名字缺省；显式空串/空白回退缺省。
+    #[test]
+    fn peer_fields_default_and_normalize() {
+        // 缺省：关闭 + imagent（新功能不改既有部署行为）。
+        let p = tmp_path("peer_def", r#"default_workdir = "/tmp/ws""#);
+        let cfg = Config::load(&p).expect("parse");
+        assert!(!cfg.peer_enabled, "缺省关闭");
+        assert_eq!(cfg.peer_name, "imagent");
+        cleanup(&p);
+        // 显式开启 + 名字归一（trim）；空白名字回退缺省。
+        let p = tmp_path(
+            "peer_custom",
+            "default_workdir = \"/tmp/ws\"\npeer_enabled = true\npeer_name = \" my-gw \"\n",
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert!(cfg.peer_enabled);
+        assert_eq!(cfg.peer_name, "my-gw");
+        cleanup(&p);
+        let p = tmp_path(
+            "peer_blank",
+            "default_workdir = \"/tmp/ws\"\npeer_name = \"   \"\n",
+        );
+        let cfg = Config::load(&p).expect("parse");
+        assert_eq!(cfg.peer_name, "imagent", "空白名字回退缺省");
         cleanup(&p);
     }
 

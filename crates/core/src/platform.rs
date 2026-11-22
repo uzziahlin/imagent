@@ -458,6 +458,12 @@ pub trait Platform: Send + Sync {
     /// 上）。default no-op（多数平台无驾驶舱视图；web 覆写为 conv_workdir
     /// 增量帧推送，见 `imagent-web`）。
     fn on_workdir_changed(&self, _conv: &ConvId, _path: &str) {}
+
+    /// v1.41：网关侧错误码 error 帧推送（web 驾驶舱 lastError toast，如
+    /// `peer_unreachable`——peer 出站投递失败）。default no-op：IM 平台无
+    /// error 帧概念（错误反馈走 reply 文本链路），仅 web 覆写（复用
+    /// `encode_error_frame` 出站形态，见 `imagent-web`）。
+    async fn send_error_note(&self, _conv: &ConvId, _code: &str, _message: &str) {}
 }
 
 /// 命令卡片的纯文本降级形态（默认 trait 实现与 dispatch 层失败降级共用）：

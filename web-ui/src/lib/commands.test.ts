@@ -12,12 +12,14 @@ import {
 } from "./commands";
 
 /** 任务清单要求的最小命令集（对齐 crates/core/src/dispatch/commands/mod.rs
- *  注册表核对过的命令名）。 */
+ *  注册表核对过的命令名）。v1.41 补 /peers /to（peer 通道：查看窗口 / 派活）。 */
 const REQUIRED = [
   "/stop",
   "/tasks",
   "/resume",
   "/retry",
+  "/peers",
+  "/to",
   "/queue",
   "/status",
   "/export",
@@ -47,7 +49,7 @@ describe("命令表完整性", () => {
     }
   });
 
-  it("覆盖任务规定的全部命令（注册表核对过的 17 个）", () => {
+  it("覆盖任务规定的全部命令（注册表核对过的 19 个）", () => {
     const names = COMMANDS.map((c) => c.name);
     for (const name of REQUIRED) {
       expect(names, `缺少命令 ${name}`).toContain(name);
@@ -135,9 +137,9 @@ describe("filterCommands 过滤", () => {
     expect(filterCommands("/")).toEqual([...COMMANDS]);
   });
 
-  it("名称前缀匹配：/mo → /model；/t → /tasks /timeout", () => {
+  it("名称前缀匹配：/mo → /model；/t → /tasks /to /timeout（v1.41 补 /to）", () => {
     expect(filterCommands("/mo").map((c) => c.name)).toEqual(["/model"]);
-    expect(filterCommands("/t").map((c) => c.name)).toEqual(["/tasks", "/timeout"]);
+    expect(filterCommands("/t").map((c) => c.name)).toEqual(["/tasks", "/to", "/timeout"]);
   });
 
   it("描述关键词匹配（剥 / 后中文包含）：模型 → /model", () => {

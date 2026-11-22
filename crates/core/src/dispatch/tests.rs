@@ -73,6 +73,8 @@ fn is_session_expired_err_classifies() {
 }
 
 type InboxHandle = Arc<TokioMutex<Vec<String>>>;
+/// v1.41：error 帧记录句柄（(code, message)）——MockPlatform::new_with_errors。
+type ErrorsHandle = Arc<TokioMutex<Vec<(String, String)>>>;
 type CounterHandle = Arc<AtomicUsize>;
 type CallsHandle = Arc<TokioMutex<Vec<Option<String>>>>;
 type PromptsHandle = Arc<TokioMutex<Vec<String>>>;
@@ -99,6 +101,9 @@ struct MockPlatform {
     /// 先记 [resolve-enter] 标记再挂起等 notify——验证 recv 循环不被慢收敛
     /// 卡死（spawn 化回归）。
     resolve_gate: Option<Arc<tokio::sync::Notify>>,
+    /// v1.41：send_error_note 记录（(code, message)）——peer 出站投递失败的
+    /// error 帧路径断言用。
+    errors: Arc<TokioMutex<Vec<(String, String)>>>,
 }
 
 impl MockPlatform {
@@ -113,8 +118,17 @@ impl MockPlatform {
             reactions: Arc::new(TokioMutex::new(Vec::new())),
             typing_gate: None,
             resolve_gate: None,
+            errors: Arc::new(TokioMutex::new(Vec::new())),
         };
         (p, inbox, send_count)
+    }
+
+    /// v1.41：peer 测试变体——额外返回 error 帧记录句柄（struct move 进
+    /// Arc<dyn Platform> 前取走）。
+    fn new_with_errors() -> (Self, InboxHandle, CounterHandle, ErrorsHandle) {
+        let (p, inbox, count) = Self::new();
+        let errors = p.errors.clone();
+        (p, inbox, count, errors)
     }
 
     /// Wave B-2：支持加急的变体（supports_urgent_text = true）。
@@ -267,6 +281,13 @@ impl Platform for MockPlatform {
             let _ = tokio::time::timeout(Duration::from_secs(30), g.notified()).await;
         }
         Ok(())
+    }
+    /// v1.41：error 帧记录（(code, message)）——peer_unreachable 路径断言用。
+    async fn send_error_note(&self, _conv: &ConvId, code: &str, message: &str) {
+        self.errors
+            .lock()
+            .await
+            .push((code.to_string(), message.to_string()));
     }
 }
 
@@ -9140,4 +9161,375 @@ async fn wait_round_finish_aborts_on_timeout() {
     .await;
     assert!(!finished, "超时应返回 false");
     assert!(jh.await.is_err(), "超时路径应已 abort 任务");
+}
+
+// ---------- v1.41 peer 通道（网关伪装 Claude Code peer）----------
+//
+// mock 本地窗口（bind socket + 注册条目 + 收帧回执）+ 出站路由 / /to / /peers /
+// 入站直投 / 未启用提示 / error 帧六组用例。路径用 /tmp 短根（Unix socket 有
+// SUN_LEN ≈104 字节上限，macOS 默认 temp_dir 前缀过长）；dispatcher 自建
+//（PeerSender 注入 + MockPlatform error 记录句柄，不动既有 Ctx 基建）。
+
+use crate::peer::{build_receipt_json, strip_envelope, PeerSender, CONV_PREFIX};
+
+/// peer 测试观测句柄组（dispatcher 自建——Ctx 不含 error 帧记录）。
+struct PeerCtx {
+    disp: Arc<Dispatcher>,
+    inbox: Arc<TokioMutex<Vec<String>>>,
+    calls: Arc<TokioMutex<Vec<Option<String>>>>,
+    errors: Arc<TokioMutex<Vec<(String, String)>>>,
+}
+
+/// 自建带观测句柄的 dispatcher（MockPlatform::new_with_errors 供 error 帧
+/// 记录；store 用临时库，SERIAL 由各用例持有）。
+async fn build_peer_ctx() -> PeerCtx {
+    let _ = std::fs::create_dir_all("/tmp/imagent-test-ws");
+    let (plat, inbox, _send_count, errors) = MockPlatform::new_with_errors();
+    let (back, calls, _prompts, _order) = MockBackend::new();
+    let (store, _db) = tmp_store().await;
+    let auth = Auth::new(vec!["u1".into()]);
+    let admins = auth.snapshot();
+    let disp = Arc::new(Dispatcher::new(
+        Arc::new(plat),
+        Arc::new(back),
+        store,
+        auth,
+        std::path::PathBuf::from("/tmp/imagent-test-ws"),
+        vec!["Read".into()],
+        PermissionMode::Off,
+        test_budgets(),
+        CotDetail::Brief,
+        admins,
+    ));
+    PeerCtx {
+        disp,
+        inbox,
+        calls,
+        errors,
+    }
+}
+
+/// mock 窗口 socket 基目录唯一序号（同进程并行测试防撞）。
+static PEER_TMP_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+struct PeerMockWindow {
+    registry_dir: PathBuf,
+    base: PathBuf,
+    frames: Arc<TokioMutex<Vec<String>>>,
+    _task: tokio::task::JoinHandle<()>,
+}
+
+/// 起 mock 窗口：写注册条目（entrypoint=claude）+ bind socket + accept 循环
+/// （收一帧记一行 → 回 receipt → 关闭——网关 send_frame 读到对端关闭才返回）。
+async fn peer_mock_window(name: &str) -> PeerMockWindow {
+    let seq = PEER_TMP_SEQ.fetch_add(1, Ordering::SeqCst);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let base = PathBuf::from("/tmp").join(format!("ipd{}_{}_{}", std::process::id(), nanos, seq));
+    let registry_dir = base.join("r");
+    let sock_dir = base.join("s");
+    tokio::fs::create_dir_all(&registry_dir).await.unwrap();
+    tokio::fs::create_dir_all(&sock_dir).await.unwrap();
+    let sock = sock_dir.join(format!("{}.sock", 9100 + seq));
+    let _ = tokio::fs::remove_file(&sock).await;
+    let listener = tokio::net::UnixListener::bind(&sock).expect("mock window bind");
+    // 注册条目（与真实 claude 窗口条目同构；messagingSocketPath 指向 mock sock）。
+    let entry = serde_json::json!({
+        "pid": 9100 + u32::try_from(seq).unwrap_or(0),
+        "sessionId": uuid::Uuid::new_v4().to_string(),
+        "cwd": "/tmp",
+        "startedAt": 1_700_000_000_000i64,
+        "version": "claude",
+        "peerProtocol": 1,
+        "kind": "interactive",
+        "entrypoint": "claude",
+        "messagingSocketPath": sock.to_string_lossy(),
+        "name": name,
+        "nameSource": "derived",
+        "status": "idle",
+    });
+    tokio::fs::write(
+        registry_dir.join(format!("{}.json", 9100 + seq)),
+        entry.to_string(),
+    )
+    .await
+    .unwrap();
+    let frames: Arc<TokioMutex<Vec<String>>> = Arc::new(TokioMutex::new(Vec::new()));
+    let fh = frames.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((conn, _)) = listener.accept().await else {
+                break;
+            };
+            let fh = fh.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut line = String::new();
+                let mut buf = vec![0u8; 65536];
+                let (mut r, mut w) = conn.into_split();
+                loop {
+                    match r.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            line.push_str(&String::from_utf8_lossy(&buf[..n]));
+                            if line.contains('\n') {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let line = line.trim().to_string();
+                if line.is_empty() {
+                    return;
+                }
+                fh.lock().await.push(line.clone());
+                // 回 receipt 再关（对端 send_frame 在 read_to_end 等关闭）。
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if v["type"] == "user" {
+                        let receipt =
+                            build_receipt_json("mock-window", v["msg_id"].as_str().unwrap_or("x"));
+                        let _ = w.write_all(format!("{receipt}\n").as_bytes()).await;
+                        let _ = w.flush().await;
+                    }
+                }
+                let _ = w.shutdown().await;
+            });
+        }
+    });
+    PeerMockWindow {
+        registry_dir,
+        base,
+        frames,
+        _task: task,
+    }
+}
+
+impl PeerMockWindow {
+    async fn wait_frame(&self) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(f) = self.frames.lock().await.first().cloned() {
+                return f;
+            }
+            assert!(std::time::Instant::now() < deadline, "窗口未在预算内收到帧");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+/// peer: 会话文本：出站投递到窗口（envelope 正确）+ 不进 agent + send_text
+/// 链路回显落 conv。
+#[tokio::test]
+async fn peer_conv_text_routes_to_window_without_agent() {
+    let _g = SERIAL.lock().await;
+    let ctx = build_peer_ctx().await;
+    let win = peer_mock_window("win-a").await;
+    ctx.disp.set_peer_sender(Some(Arc::new(PeerSender::new(
+        win.registry_dir.clone(),
+        win.base.join("own.sock"),
+        "im-agent".to_string(),
+    ))));
+
+    ctx.disp
+        .handle(msg("peer:win-a", "u1", "帮我跑下构建"))
+        .await;
+
+    // 不进 agent backend。
+    assert!(
+        ctx.calls.lock().await.is_empty(),
+        "peer: 文本不得进 agent（calls={:?}）",
+        *ctx.calls.lock().await
+    );
+    // 窗口收到帧：type user + envelope from-name=网关名 + 正文剥离正确。
+    let line = win.wait_frame().await;
+    let v: serde_json::Value = serde_json::from_str(&line).expect("frame json");
+    assert_eq!(v["type"], "user");
+    assert_eq!(v["priority"], "next");
+    let stripped = strip_envelope(v["message"]["content"].as_str().unwrap());
+    assert_eq!(stripped.body, "帮我跑下构建");
+    assert_eq!(stripped.from_name.as_deref(), Some("im-agent"));
+    // send_text 链路回显（落 outbound_log 的驾驶舱侧副本）。
+    assert!(
+        ctx.inbox.lock().await.iter().any(|t| t == "帮我跑下构建"),
+        "inbox 应含 peer conv 回显：{:?}",
+        *ctx.inbox.lock().await
+    );
+    let _ = std::fs::remove_dir_all(&win.base);
+}
+
+/// peer: 会话指向不在线窗口：agent 不进、error 帧回 SPA（peer_unreachable）、
+/// 回显照常落 conv。
+#[tokio::test]
+async fn peer_conv_unreachable_returns_error_note() {
+    let _g = SERIAL.lock().await;
+    let ctx = build_peer_ctx().await;
+    // 空 registry（无窗口）。
+    let base = PathBuf::from("/tmp").join(format!("ipdnone_{}_0", std::process::id()));
+    tokio::fs::create_dir_all(base.join("r")).await.unwrap();
+    ctx.disp.set_peer_sender(Some(Arc::new(PeerSender::new(
+        base.join("r"),
+        base.join("own.sock"),
+        "im-agent".to_string(),
+    ))));
+
+    ctx.disp.handle(msg("peer:ghost", "u1", "你好")).await;
+
+    assert!(ctx.calls.lock().await.is_empty(), "不得进 agent");
+    let errors = ctx.errors.lock().await;
+    assert_eq!(errors.len(), 1, "恰一帧 error：{errors:?}");
+    assert_eq!(errors[0].0, "peer_unreachable");
+    assert!(
+        errors[0].1.contains("ghost"),
+        "message 应含窗口名：{errors:?}"
+    );
+    assert!(
+        ctx.inbox.lock().await.iter().any(|t| t == "你好"),
+        "回显照常落 conv（历史记录语义）"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// sender 未注入（peer_enabled=false 或启动失败）：peer: 文本回提示，不静默。
+#[tokio::test]
+async fn peer_conv_without_sender_hints() {
+    let _g = SERIAL.lock().await;
+    let ctx = build_peer_ctx().await;
+    ctx.disp.handle(msg("peer:x", "u1", "hi")).await;
+    assert!(ctx.calls.lock().await.is_empty());
+    assert!(
+        ctx.inbox
+            .lock()
+            .await
+            .iter()
+            .any(|t| t.contains("peer 通道未启用")),
+        "应有未启用提示：{:?}",
+        *ctx.inbox.lock().await
+    );
+    assert!(ctx.errors.lock().await.is_empty());
+}
+
+/// /to 端到端：IM conv 发 /to → 窗口收到帧 + 当前会话回执 + peer conv 镜像
+/// （outbound_log 链路）。
+#[tokio::test]
+async fn to_command_delivers_and_reports() {
+    let _g = SERIAL.lock().await;
+    let ctx = build_peer_ctx().await;
+    let win = peer_mock_window("win-b").await;
+    ctx.disp.set_peer_sender(Some(Arc::new(PeerSender::new(
+        win.registry_dir.clone(),
+        win.base.join("own.sock"),
+        "im-agent".to_string(),
+    ))));
+
+    ctx.disp
+        .handle(msg("feishu:ou_x", "u1", "/to win-b 查一下测试结果"))
+        .await;
+
+    let line = win.wait_frame().await;
+    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+    let stripped = strip_envelope(v["message"]["content"].as_str().unwrap());
+    assert_eq!(stripped.body, "查一下测试结果");
+    assert!(
+        stripped.from.as_deref().unwrap_or("").starts_with("uds:"),
+        "from 带 uds: 前缀"
+    );
+    let inbox = ctx.inbox.lock().await;
+    assert!(
+        inbox.iter().any(|t| t.contains("已投递至 win-b")),
+        "当前会话应收回执：{inbox:?}"
+    );
+    assert!(
+        inbox.iter().any(|t| t == "查一下测试结果"),
+        "peer conv 应镜像派活正文（outbound_log 链路）：{inbox:?}"
+    );
+    let _ = std::fs::remove_dir_all(&win.base);
+}
+
+/// /to 未知窗口：错误回执含在线名单（可行动），不投递不镜像。
+#[tokio::test]
+async fn to_command_unknown_window_lists_candidates() {
+    let _g = SERIAL.lock().await;
+    let ctx = build_peer_ctx().await;
+    let win = peer_mock_window("win-c").await;
+    ctx.disp.set_peer_sender(Some(Arc::new(PeerSender::new(
+        win.registry_dir.clone(),
+        win.base.join("own.sock"),
+        "im-agent".to_string(),
+    ))));
+
+    ctx.disp
+        .handle(msg("feishu:ou_x", "u1", "/to ghost hi"))
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(win.frames.lock().await.is_empty(), "不得误投");
+    let inbox = ctx.inbox.lock().await;
+    let reply = inbox
+        .iter()
+        .find(|t| t.contains("投递失败"))
+        .expect("应有失败回执");
+    assert!(reply.contains("win-c"), "错误应列在线名单：{reply}");
+    let _ = std::fs::remove_dir_all(&win.base);
+}
+
+/// /peers：列出在线窗口（名字 + kind + status + 用法提示）；未启用给提示。
+#[tokio::test]
+async fn peers_command_lists_live_windows() {
+    let _g = SERIAL.lock().await;
+    let ctx = build_peer_ctx().await;
+
+    // 未启用。
+    ctx.disp.handle(msg("feishu:ou_x", "u1", "/peers")).await;
+    assert!(
+        ctx.inbox
+            .lock()
+            .await
+            .iter()
+            .any(|t| t.contains("peer 通道未启用")),
+        "未启用提示：{:?}",
+        *ctx.inbox.lock().await
+    );
+
+    // 有一个在线窗口。
+    let win = peer_mock_window("win-d").await;
+    ctx.disp.set_peer_sender(Some(Arc::new(PeerSender::new(
+        win.registry_dir.clone(),
+        win.base.join("own.sock"),
+        "im-agent".to_string(),
+    ))));
+    ctx.disp.handle(msg("feishu:ou_x", "u1", "/peers")).await;
+    let inbox = ctx.inbox.lock().await;
+    let reply = inbox.last().expect("应有 /peers 回复");
+    assert!(reply.contains("win-d"), "应列窗口名：{reply}");
+    assert!(reply.contains("interactive"), "应含 kind：{reply}");
+    assert!(reply.contains("idle"), "应含 status：{reply}");
+    assert!(
+        reply.contains(CONV_PREFIX),
+        "应含 peer: 会话用法提示：{reply}"
+    );
+    drop(inbox);
+    let _ = std::fs::remove_dir_all(&win.base);
+}
+
+/// 入站直投（PeerServer 回调）：窗口名 → peer:<名> 会话 reply（不进 agent、
+/// 不经 handle 鉴权管线——非白名单 sender 亦可，本机 socket 即凭证）。
+#[tokio::test]
+async fn peer_inbound_replies_direct_to_peer_conv() {
+    let _g = SERIAL.lock().await;
+    let ctx = build_peer_ctx().await;
+    ctx.disp
+        .handle_peer_inbound("win-e", "窗口里的回复正文")
+        .await;
+    assert!(
+        ctx.inbox
+            .lock()
+            .await
+            .iter()
+            .any(|t| t == "窗口里的回复正文"),
+        "驾驶舱应收到窗口正文：{:?}",
+        *ctx.inbox.lock().await
+    );
+    assert!(ctx.calls.lock().await.is_empty(), "入站直投不驱动 agent");
 }

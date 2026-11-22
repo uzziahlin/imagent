@@ -13,6 +13,7 @@
 //! 权限审批 Unix socket；`tests` 集中全部单测。
 
 mod commands;
+mod peer;
 mod round;
 mod socket;
 
@@ -693,9 +694,15 @@ pub struct Dispatcher {
     bitable: Arc<RwLock<Option<Arc<dyn crate::bitable::BitableApi>>>>,
     /// v1.31 委托编排句柄（main 装配的 `DelegateApi` 实现）。None = 未启用
     ///（config 无 `[[delegate]]` 条目）。main 启动注入 + SIGHUP 热改（见
-    /// [`Self::set_delegate`]）；socket accept task 共享读取（`kind=delegate`
+    /// [`Self::set_delegate`]）；socket accept task 经 Arc clone 共享读取（`kind=delegate`
     /// 请求路由到它），`/delegate` 命令同读此句柄。
     delegate: DelegateHandle,
+    /// v1.41 peer 出站句柄（网关伪装 Claude Code peer）。None = 未启用
+    ///（config `peer_enabled = false` 或 PeerServer 启动失败）。main 启动注入
+    ///（[`Self::set_peer_sender`]，无热改——PeerServer 随进程生命周期）；消费方：
+    /// `peer:` 会话文本出站拦截（[`Self::dispatch_peer_message`]）、`/to`、
+    /// `/peers` 命令。`parking_lot` RwLock：临界区只做 clone，无 await。
+    peer: parking_lot::RwLock<Option<Arc<crate::peer::PeerSender>>>,
 }
 
 /// P2（code-review v13）：全局在飞轮数闸门。`limit` = 配置上限（0 = 不限制，
@@ -1023,6 +1030,7 @@ impl Dispatcher {
             webhook_exposure: parking_lot::RwLock::new(WebhookExposure::default()),
             bitable: Arc::new(RwLock::new(None)),
             delegate: Arc::new(RwLock::new(None)),
+            peer: parking_lot::RwLock::new(None),
         };
         // S2：admin_senders 为空 = 无人是管理员，IM 内管理命令全部不可用——
         // 构造即显著提示（防用户以为白名单用户仍可 /allow）。
@@ -1073,6 +1081,13 @@ impl Dispatcher {
     /// v1.31：委托是否已注入（/doctor、命令侧可用性提示用）。
     pub fn delegate_enabled(&self) -> bool {
         self.delegate.read().is_some()
+    }
+
+    /// v1.41：peer 出站句柄注入（main 启动 `PeerServer::start` 成功后调用；
+    /// None = 未启用）。无 SIGHUP 热改路径——PeerServer 随进程生命周期，
+    /// 改 `peer_enabled` 需重启。
+    pub fn set_peer_sender(&self, sender: Option<Arc<crate::peer::PeerSender>>) {
+        *self.peer.write() = sender;
     }
 
     /// 批 A/2：多引擎注册表注入（main 启动装配调用一次）。按 backend name

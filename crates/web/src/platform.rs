@@ -1678,6 +1678,26 @@ impl Platform for WebPlatform {
         Ok(())
     }
 
+    /// v1.41：网关侧错误码 error 帧（peer_unreachable——peer 出站投递失败等）。
+    /// 形态与 ASR error 帧同源（encode_error_frame）；SPA 侧走 lastError 全局
+    /// toast（ERROR_HINTS 有 peer_unreachable 词条）。与 send_text 不同：error
+    /// 帧不落 outbound_log（瞬时事件非会话消息，重放无意义）。
+    async fn send_error_note(&self, _conv: &ConvId, code: &str, message: &str) {
+        match encode_error_frame(&self.machine_id, code, message) {
+            Ok(json) => {
+                if let Err(e) = self.enqueue(json) {
+                    warn!(
+                        target: TARGET,
+                        code,
+                        error = %e,
+                        "error 帧发送失败（驾驶舱不可达）"
+                    );
+                }
+            }
+            Err(e) => warn!(target: TARGET, error = %e, "error 帧序列化失败"),
+        }
+    }
+
     async fn send_media(&self, _conv: &ConvId, _media: &MediaRef, _hint: &ReplyHint) -> Result<()> {
         // MVP 无媒体上行通道（relay 帧协议 v1 只有文本帧）。显式报错而非谎报
         // Ok——core 命令层（/img /file）会把文案回给用户。

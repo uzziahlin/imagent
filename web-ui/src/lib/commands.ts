@@ -54,6 +54,8 @@ export const COMMANDS: readonly SlashCommand[] = [
   { name: "/tasks", desc: "查看任务清单（待办与执行状态）", group: "会话与任务" },
   { name: "/resume", args: "[序号]", desc: "列出并恢复历史会话（按序号选择）", group: "会话与任务" },
   { name: "/retry", desc: "重试上一条指令", group: "会话与任务" },
+  { name: "/peers", desc: "列出在线的 Claude Code 窗口（本地窗口通道）", group: "会话与任务" },
+  { name: "/to", args: "<窗口名> <文本…>", desc: "派活给本地 Claude Code 窗口（回执落当前会话）", group: "会话与任务" },
   { name: "/queue", args: "[drop <序号>]", desc: "查看排队消息；drop 按序号丢弃", group: "会话与任务" },
   { name: "/status", desc: "查看会话状态与上下文水位", group: "会话与任务" },
   { name: "/export", args: "[序号]", desc: "导出会话记录（序号同 /resume 列表）", group: "会话与任务" },

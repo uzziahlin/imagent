@@ -32,6 +32,7 @@ pub mod metrics;
 mod multi_platform;
 pub mod outbox;
 pub mod paths;
+pub mod peer;
 mod permission;
 mod platform;
 pub mod render;

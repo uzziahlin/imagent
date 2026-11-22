@@ -6,6 +6,7 @@
 mod admin;
 mod cron;
 mod misc;
+mod peer;
 mod session;
 
 use super::*;
@@ -59,6 +60,7 @@ const KNOWN_COMMAND_WORDS: &[&str] = &[
     "/model",
     "/new",
     "/perm",
+    "/peers",
     "/queue",
     "/reconnect",
     "/resume",
@@ -70,6 +72,7 @@ const KNOWN_COMMAND_WORDS: &[&str] = &[
     "/switch",
     "/tasks",
     "/timeout",
+    "/to",
     "/whoami",
     "/ws",
 ];
@@ -87,6 +90,8 @@ pub(super) const COMMAND_GROUPS: &[(&str, &[&str])] = &[
             "/retry",
             "/again",
             "/last",
+            "/peers",
+            "/to",
         ],
     ),
     ("📁 目录与文件", &["/cd", "/ws", "/img", "/file"]),
@@ -140,12 +145,16 @@ fn edit_distance(a: &str, b: &str) -> usize {
 }
 
 /// S-12：未知命令 → 编辑距离 ≤2 的最相近已知命令（无则 None）。
+/// v1.41 tie-break：距离并列时优先**更长**（更具体）的命令名——`/to` 这类
+/// 短词加入后，`/sto` 对 `/stop`（插 1 个字符）与 `/to`（删 1 个字符）距离
+/// 同为 1，按分组序会命中 `/to`；用户打错长命令名的意图几乎总是长命令
+/// （短泛用词更像噪声），故长度倒序裁决并列。
 pub(super) fn suggest_command(cmd: &str) -> Option<&'static str> {
     COMMAND_GROUPS
         .iter()
         .flat_map(|(_, cs)| cs.iter())
         .filter(|c| **c != cmd)
-        .min_by_key(|c| edit_distance(cmd, c))
+        .min_by_key(|c| (edit_distance(cmd, c), std::cmp::Reverse(c.chars().count())))
         .filter(|c| edit_distance(cmd, c) <= 2)
         .copied()
 }
@@ -352,6 +361,14 @@ impl Dispatcher {
                         self.cmd_sessions(&conv, &hint).await;
                         return;
                     }
+                    "/peers" => {
+                        self.cmd_peers(&conv, &hint).await;
+                        return;
+                    }
+                    "/to" => {
+                        self.cmd_to(&conv, &hint, &parts).await;
+                        return;
+                    }
                     "/compact" => {
                         self.cmd_compact(&conv, &hint).await;
                         return;
@@ -477,6 +494,13 @@ impl Dispatcher {
                     }
                 }
             }
+        }
+
+        // 3.5 v1.41：peer 会话（conv 前缀 `peer:`）——文本出站投递给本地窗口
+        //     （驾驶舱⇄窗口双向通道），**不进 agent backend**（dispatch/peer.rs）。
+        if conv.0.starts_with(crate::peer::CONV_PREFIX) {
+            self.dispatch_peer_message(msg).await;
+            return;
         }
 
         // 4. 普通消息。

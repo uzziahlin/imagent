@@ -88,9 +88,17 @@ export const DEFAULT_CONV = "web:default";
  *  帧（旧 relay）单机模式下 currentMachine 的初值。 */
 export const DEFAULT_MACHINE = "default";
 
-/** conv 显示名：剥 `web:` 前缀（仅展示用，协议回传仍用完整 conv）。 */
+/** conv 显示名：剥 `web:` / `peer:` 前缀（仅展示用，协议回传仍用完整 conv）。
+ *  v1.41：`peer:<窗口名>` 会话（网关伪装 Claude Code peer）剥前缀直接显示
+ *  窗口名——conv 本身已标识窗口，标题就是窗口名。 */
 export function convDisplayName(convId: string): string {
-  return convId.startsWith("web:") ? convId.slice("web:".length) : convId;
+  if (convId.startsWith("web:")) {
+    return convId.slice("web:".length);
+  }
+  if (convId.startsWith("peer:")) {
+    return convId.slice("peer:".length);
+  }
+  return convId;
 }
 
 // ---------------------------------------------------------------------------
