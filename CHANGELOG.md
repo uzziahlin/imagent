@@ -2,6 +2,17 @@
 
 记录 imagent 所有显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/)，版本遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.41.1] — 2026-11-22
+
+> peer 通道真机首验后的 UX 修复：`/peers` 提示的「进入 peer:<名字> 会话」在首次使用前
+> 无处可进（会话列表只显示有过消息的 conv），真机用户无处下手。
+
+### Changed
+- **`/to <窗口名>`（无正文）= 仅建立会话**：向 `peer:<窗口名>` 落一条系统欢迎文本
+  （含窗口名与 cwd），会话即出现在驾驶舱侧边栏，之后直接对话；带正文行为不变
+  （投递 + 镜像 + 回执）。`/peers` 尾部提示同步改为可执行路径
+- peer 按名解析提取 `resolve_window()`（`/to` 无正文路径只解析不投递复用）
+
 ## [1.41.0] — 2026-11-22
 
 > **网关伪装 Claude Code peer（驾驶舱⇄本地窗口双向通道）**：网关伪装成 Claude Code
