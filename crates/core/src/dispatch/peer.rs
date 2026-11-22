@@ -72,6 +72,50 @@ impl Dispatcher {
         self.reply(&conv, body, &ReplyHint::None).await;
     }
 
+    /// `/to <窗口名>`（无正文）= 仅建立会话：按窗口名解析（复用 sender 的
+    /// `resolve_window` 解析路径，只解析不投递正文），成功则向
+    /// `peer:<窗口名>` conv send_text 一条系统欢迎文本（走既有 send_text
+    /// 链路落 outbound_log——侧边栏即出现该会话，用户可直接进入对话）；解析
+    /// 失败沿用 `/to` 既有失败文案（含在线名单，可行动）。
+    pub(super) async fn peer_establish_session(&self, conv: &ConvId, hint: &ReplyHint, name: &str) {
+        let Some(peer) = self.peer.read().clone() else {
+            self.reply(
+                conv,
+                "peer 通道未启用（config peer_enabled = false）。",
+                hint,
+            )
+            .await;
+            return;
+        };
+        match peer.resolve_window(name).await {
+            Ok(entry) => {
+                // conv 用解析后的规范名（前缀匹配也归一到条目全名，与后续
+                // 对话同会话）。
+                let peer_conv = ConvId(format!("{CONV_PREFIX}{}", entry.name));
+                self.reply(
+                    &peer_conv,
+                    &format!(
+                        "已建立与窗口「{}」的会话（cwd: {}）。直接输入文本即可派活，\
+                         窗口空闲时会自动开始处理。",
+                        entry.name, entry.cwd
+                    ),
+                    hint,
+                )
+                .await;
+            }
+            Err(e) => {
+                warn!(
+                    target: "imagent::core",
+                    conv_id = %conv.0,
+                    window = name,
+                    error = %e,
+                    "/to 建立会话失败"
+                );
+                self.reply(conv, &format!("❌ 投递失败：{e}"), hint).await;
+            }
+        }
+    }
+
     /// `/to <窗口名> <文本…>` 投递核心（命令与复用路径共享）：投递成功 →
     /// 派活正文镜像进 `peer:<窗口名>` 会话（落 outbound_log，驾驶舱历史完整）
     /// + 当前会话回执；失败 → 当前会话回错误（含在线名单，可行动）。

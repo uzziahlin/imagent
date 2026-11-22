@@ -75,6 +75,9 @@ fn is_session_expired_err_classifies() {
 type InboxHandle = Arc<TokioMutex<Vec<String>>>;
 /// v1.41：error 帧记录句柄（(code, message)）——MockPlatform::new_with_errors。
 type ErrorsHandle = Arc<TokioMutex<Vec<(String, String)>>>;
+/// v1.41.1：send_text 的 (conv, text) 记录句柄——peer 建立会话欢迎文本落
+/// `peer:` conv 的归属断言用。
+type SentHandle = Arc<TokioMutex<Vec<(String, String)>>>;
 type CounterHandle = Arc<AtomicUsize>;
 type CallsHandle = Arc<TokioMutex<Vec<Option<String>>>>;
 type PromptsHandle = Arc<TokioMutex<Vec<String>>>;
@@ -104,6 +107,8 @@ struct MockPlatform {
     /// v1.41：send_error_note 记录（(code, message)）——peer 出站投递失败的
     /// error 帧路径断言用。
     errors: Arc<TokioMutex<Vec<(String, String)>>>,
+    /// v1.41.1：send_text 的 (conv, text) 全记录（inbox 只记文本不记 conv）。
+    sent: Arc<TokioMutex<Vec<(String, String)>>>,
 }
 
 impl MockPlatform {
@@ -119,16 +124,18 @@ impl MockPlatform {
             typing_gate: None,
             resolve_gate: None,
             errors: Arc::new(TokioMutex::new(Vec::new())),
+            sent: Arc::new(TokioMutex::new(Vec::new())),
         };
         (p, inbox, send_count)
     }
 
-    /// v1.41：peer 测试变体——额外返回 error 帧记录句柄（struct move 进
-    /// Arc<dyn Platform> 前取走）。
-    fn new_with_errors() -> (Self, InboxHandle, CounterHandle, ErrorsHandle) {
+    /// v1.41：peer 测试变体——额外返回 error 帧与 send_text (conv, text)
+    /// 记录句柄（struct move 进 Arc<dyn Platform> 前取走）。
+    fn new_with_errors() -> (Self, InboxHandle, CounterHandle, ErrorsHandle, SentHandle) {
         let (p, inbox, count) = Self::new();
         let errors = p.errors.clone();
-        (p, inbox, count, errors)
+        let sent = p.sent.clone();
+        (p, inbox, count, errors, sent)
     }
 
     /// Wave B-2：支持加急的变体（supports_urgent_text = true）。
@@ -218,7 +225,11 @@ impl Platform for MockPlatform {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
-    async fn send_text(&self, _conv: &ConvId, text: &str, _hint: &ReplyHint) -> Result<()> {
+    async fn send_text(&self, conv: &ConvId, text: &str, _hint: &ReplyHint) -> Result<()> {
+        self.sent
+            .lock()
+            .await
+            .push((conv.0.clone(), text.to_string()));
         self.inbox.lock().await.push(text.to_string());
         self.send_count.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -9165,8 +9176,9 @@ async fn wait_round_finish_aborts_on_timeout() {
 
 // ---------- v1.41 peer 通道（网关伪装 Claude Code peer）----------
 //
-// mock 本地窗口（bind socket + 注册条目 + 收帧回执）+ 出站路由 / /to / /peers /
-// 入站直投 / 未启用提示 / error 帧六组用例。路径用 /tmp 短根（Unix socket 有
+// mock 本地窗口（bind socket + 注册条目 + 收帧回执）+ 出站路由 / /to（含
+// v1.41.1 无正文建立会话）/ /peers / 入站直投 / 未启用提示 / error 帧等用例。
+// 路径用 /tmp 短根（Unix socket 有
 // SUN_LEN ≈104 字节上限，macOS 默认 temp_dir 前缀过长）；dispatcher 自建
 //（PeerSender 注入 + MockPlatform error 记录句柄，不动既有 Ctx 基建）。
 
@@ -9178,13 +9190,15 @@ struct PeerCtx {
     inbox: Arc<TokioMutex<Vec<String>>>,
     calls: Arc<TokioMutex<Vec<Option<String>>>>,
     errors: Arc<TokioMutex<Vec<(String, String)>>>,
+    /// send_text 的 (conv, text) 全记录（欢迎文本落 peer: conv 的归属断言）。
+    sent: SentHandle,
 }
 
 /// 自建带观测句柄的 dispatcher（MockPlatform::new_with_errors 供 error 帧
 /// 记录；store 用临时库，SERIAL 由各用例持有）。
 async fn build_peer_ctx() -> PeerCtx {
     let _ = std::fs::create_dir_all("/tmp/imagent-test-ws");
-    let (plat, inbox, _send_count, errors) = MockPlatform::new_with_errors();
+    let (plat, inbox, _send_count, errors, sent) = MockPlatform::new_with_errors();
     let (back, calls, _prompts, _order) = MockBackend::new();
     let (store, _db) = tmp_store().await;
     let auth = Auth::new(vec!["u1".into()]);
@@ -9206,6 +9220,7 @@ async fn build_peer_ctx() -> PeerCtx {
         inbox,
         calls,
         errors,
+        sent,
     }
 }
 
@@ -9474,6 +9489,92 @@ async fn to_command_unknown_window_lists_candidates() {
     let _ = std::fs::remove_dir_all(&win.base);
 }
 
+/// /to 无正文 = 仅建立会话：只解析窗口名不投递（窗口零帧），系统欢迎文本
+/// （含窗口名与 cwd）落 `peer:<名字>` conv（send_text 链路 → 侧边栏出现
+/// 会话），当前会话无投递类回执。
+#[tokio::test]
+async fn to_command_no_body_establishes_session() {
+    let _g = SERIAL.lock().await;
+    let ctx = build_peer_ctx().await;
+    let win = peer_mock_window("win-e").await;
+    ctx.disp.set_peer_sender(Some(Arc::new(PeerSender::new(
+        win.registry_dir.clone(),
+        win.base.join("own.sock"),
+        "im-agent".to_string(),
+    ))));
+
+    ctx.disp.handle(msg("feishu:ou_x", "u1", "/to win-e")).await;
+
+    // 只解析不投递：窗口不得收到任何帧。
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(win.frames.lock().await.is_empty(), "无正文不得投递窗口");
+    // 欢迎文本落 peer:win-e conv，含窗口名与条目 cwd（mock 条目 cwd=/tmp）。
+    let sent = ctx.sent.lock().await;
+    let welcome = sent
+        .iter()
+        .find(|(_, t)| t.contains("已建立与窗口"))
+        .expect("应有建立会话欢迎文本");
+    assert_eq!(
+        welcome.0,
+        format!("{CONV_PREFIX}win-e"),
+        "欢迎文本应落 peer: conv：{sent:?}"
+    );
+    assert!(welcome.1.contains("win-e"), "应含窗口名：{}", welcome.1);
+    assert!(
+        welcome.1.contains("cwd: /tmp"),
+        "应含条目 cwd：{}",
+        welcome.1
+    );
+    drop(sent);
+    // 当前会话不打扰（无投递/失败回执）。
+    assert!(
+        !ctx.inbox
+            .lock()
+            .await
+            .iter()
+            .any(|t| t.contains("已投递") || t.contains("投递失败")),
+        "当前会话不应有投递类回执：{:?}",
+        *ctx.inbox.lock().await
+    );
+    let _ = std::fs::remove_dir_all(&win.base);
+}
+
+/// /to 无正文 + 未知窗口：失败文案不变（含窗口名与在线名单），不投递、
+/// 不落 peer: conv。
+#[tokio::test]
+async fn to_command_no_body_unknown_window_lists_candidates() {
+    let _g = SERIAL.lock().await;
+    let ctx = build_peer_ctx().await;
+    let win = peer_mock_window("win-f").await;
+    ctx.disp.set_peer_sender(Some(Arc::new(PeerSender::new(
+        win.registry_dir.clone(),
+        win.base.join("own.sock"),
+        "im-agent".to_string(),
+    ))));
+
+    ctx.disp.handle(msg("feishu:ou_x", "u1", "/to ghost")).await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(win.frames.lock().await.is_empty(), "不得误投");
+    assert!(
+        !ctx.sent
+            .lock()
+            .await
+            .iter()
+            .any(|(c, _)| c.starts_with(CONV_PREFIX)),
+        "不得落 peer: conv：{:?}",
+        *ctx.sent.lock().await
+    );
+    let inbox = ctx.inbox.lock().await;
+    let reply = inbox
+        .iter()
+        .find(|t| t.contains("投递失败"))
+        .expect("应有失败回执");
+    assert!(reply.contains("ghost"), "错误应含窗口名：{reply}");
+    assert!(reply.contains("win-f"), "错误应列在线名单：{reply}");
+    let _ = std::fs::remove_dir_all(&win.base);
+}
+
 /// /peers：列出在线窗口（名字 + kind + status + 用法提示）；未启用给提示。
 #[tokio::test]
 async fn peers_command_lists_live_windows() {
@@ -9506,8 +9607,8 @@ async fn peers_command_lists_live_windows() {
     assert!(reply.contains("interactive"), "应含 kind：{reply}");
     assert!(reply.contains("idle"), "应含 status：{reply}");
     assert!(
-        reply.contains(CONV_PREFIX),
-        "应含 peer: 会话用法提示：{reply}"
+        reply.contains("/to <名字> [文本]") && reply.contains("仅建立会话"),
+        "应含建立会话用法提示（v1.41.1 新文案）：{reply}"
     );
     drop(inbox);
     let _ = std::fs::remove_dir_all(&win.base);

@@ -35,17 +35,19 @@ impl Dispatcher {
                 r.status
             ));
         }
-        text.push_str("回复请进入对应 peer:<名字> 会话发送文本（或 /to <名字> <文本> 直接派活）。");
+        text.push_str("首次回复某窗口请先 /to <名字> [文本]（无文本 = 仅建立会话），该窗口会话即出现在侧边栏，之后直接对话。");
         self.reply(conv, &text, hint).await;
     }
 
-    /// `/to <窗口名> <文本…>` —— 跨平台派活入口：按窗口名投递到本地窗口，
-    /// 回执落当前会话（驾驶舱用户建议直接进 peer: 会话；飞书/终端用户用 /to）。
+    /// `/to <窗口名> [文本…]` —— 跨平台派活入口：带正文按窗口名投递到本地
+    /// 窗口，回执落当前会话；**无正文 = 仅建立会话**（只解析窗口名不投递，
+    /// 向 `peer:<窗口名>` 会话落一条系统欢迎文本——侧边栏即出现该会话）。
+    /// （驾驶舱用户建议直接进 peer: 会话；飞书/终端用户用 /to。）
     pub(super) async fn cmd_to(&self, conv: &ConvId, hint: &ReplyHint, parts: &[&str]) {
         let Some(name) = parts.get(1).map(|s| s.trim()).filter(|s| !s.is_empty()) else {
             self.reply(
                 conv,
-                "用法：/to <窗口名> <文本…>（/peers 查看在线窗口）",
+                "用法：/to <窗口名> [文本…]（无文本 = 仅建立会话；/peers 查看在线窗口）",
                 hint,
             )
             .await;
@@ -53,8 +55,9 @@ impl Dispatcher {
         };
         let text = parts[2..].join(" ");
         if text.trim().is_empty() {
-            self.reply(conv, "用法：/to <窗口名> <文本…>（正文不能为空）", hint)
-                .await;
+            // 无正文：建立会话语义（peer 会话在首次使用前不在侧边栏，用户无处
+            // 「进入」——显式给一条 send_text 让会话落 outbound_log 出现）。
+            self.peer_establish_session(conv, hint, name).await;
             return;
         }
         self.peer_deliver_and_report(conv, hint, name, &text).await;

@@ -710,10 +710,11 @@ impl PeerSender {
             .collect()
     }
 
-    /// 按窗口名投递（精确名优先；唯一前缀次之——对齐参考实现 resolveTarget
-    /// 的解析序）。失败给**可行动**错误文案（含当前在线名单，`/to` 回执直接
+    /// 按窗口名解析在线条目（精确名优先；唯一前缀次之——对齐参考实现
+    /// resolveTarget 的解析序），**只解析不投递**（`/to` 无正文的建立会话
+    /// 语义复用）。失败给**可行动**错误文案（含当前在线名单，`/to` 回执直接
     /// 展示）。
-    pub async fn send_to_window(&self, name: &str, body: &str) -> Result<(), CoreError> {
+    pub async fn resolve_window(&self, name: &str) -> Result<PeerEntry, CoreError> {
         let live = self.list_windows().await;
         let target = if let Some(hit) = live.iter().find(|e| e.name == name) {
             Some(hit.clone())
@@ -750,6 +751,12 @@ impl PeerSender {
             };
             return Err(CoreError::Platform(ERR_PLATFORM, hint));
         };
+        Ok(entry)
+    }
+
+    /// 按窗口名投递（解析复用 [`Self::resolve_window`]）→ envelope user 帧投递。
+    pub async fn send_to_window(&self, name: &str, body: &str) -> Result<(), CoreError> {
+        let entry = self.resolve_window(name).await?;
         let own = self.own_sock.to_string_lossy().into_owned();
         let content = build_envelope(&format!("uds:{own}"), &self.own_name, body);
         send_frame(&entry.sock, &build_user_frame_json(&own, &content)).await
