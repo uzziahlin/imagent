@@ -2241,8 +2241,8 @@ describe("v1.37 深链 ?machine= 切机器", () => {
 
 // ---------------------------------------------------------------------------
 // v1.39 SW 更新提示可点击：检测到新版本（installing→installed 且已有旧
-// controller）→ 可点 toast「新版本 v${__APP_VERSION__} 已就绪，点击刷新」，
-// 点击立即 reload。
+// controller）→ 可点 toast「新版本已就绪，点击刷新」，点击立即 reload。
+// （文案不带版本号：页面只知道自己正在跑的旧版本号，见 App.tsx 该处注释）
 // （controllerchange 自动重载为双保险——容器监听器语义由 push.test 单测驱动）
 // ---------------------------------------------------------------------------
 
@@ -2290,11 +2290,7 @@ describe("v1.39 SW 更新提示可点击", () => {
       });
 
       // 可点形态 toast（button 可访问名 = 提示文案；点击立即重载）。
-      // 文案引用 vite test.define 注入的 __APP_VERSION__：注入缺失时串里为
-      // "undefined"，本用例即红——兼作构建期版本注入的轻量断言。
-      const btn = screen.getByRole("button", {
-        name: `新版本 v${__APP_VERSION__} 已就绪，点击刷新`,
-      });
+      const btn = screen.getByRole("button", { name: "新版本已就绪，点击刷新" });
       expect(btn).toBeTruthy();
       await act(async () => {
         btn.click();
@@ -2304,6 +2300,113 @@ describe("v1.39 SW 更新提示可点击", () => {
       delete (navigator as { serviceWorker?: unknown }).serviceWorker;
       vi.unstubAllGlobals();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.41.7 SW 更新提示常驻（localToast.sticky）：自动消退 effect 对 sticky 形态
+// 不起定时器——更新提示过 4s（及更久）仍在，点击照常 reload；普通本地 toast
+// （通知开关失败反馈，非 sticky）仍 4s 消退。驱动方式同 v1.39 用例（register
+// stub + 微任务冲刷 + updatefound/statechange 手工触发），定时用 fake timers
+// （须在挂载前开启——冲刷用的 advanceTimersByTimeAsync 依赖假时钟）。
+// ---------------------------------------------------------------------------
+
+describe("v1.41.7 SW 更新提示常驻", () => {
+  const UPDATE_TEXT = "新版本已就绪，点击刷新";
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** stub 最小 SW 容器（页面已被旧 SW 接管）并驱动一次完整安装流，使更新提示
+   *  弹出；返回 location.reload 桩。调用方负责在 finally 里还原全局。 */
+  async function mountWithUpdateToast(): Promise<ReturnType<typeof vi.fn>> {
+    const registration: {
+      addEventListener: ReturnType<typeof vi.fn>;
+      installing: { state: string; addEventListener: ReturnType<typeof vi.fn> } | null;
+    } = { addEventListener: vi.fn(), installing: null };
+    const listeners = new Map<string, (ev: Event) => void>();
+    Object.defineProperty(navigator, "serviceWorker", {
+      configurable: true,
+      value: {
+        addEventListener: (t: string, l: (ev: Event) => void) => listeners.set(t, l),
+        removeEventListener: (t: string) => listeners.delete(t),
+        controller: { scriptURL: "/imagent/sw.js" },
+        register: async () => registration,
+      },
+    });
+    vi.stubGlobal("PushManager", class PushManager {});
+    vi.stubGlobal("Notification", class Notification {});
+    // jsdom 的 location.reload 不可改写（own 非配置属性）——整体替换 location
+    const reload = vi.fn();
+    vi.stubGlobal("location", { ...window.location, reload });
+
+    const fake = mountApp();
+    handshake(fake, ["home-mac"]);
+    // register().then 微任务挂上 updatefound 监听后，驱动一次完整安装流
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+      const updatefound = registration.addEventListener.mock.calls.find(
+        ([type]) => type === "updatefound",
+      )?.[1] as (ev: Event) => void;
+      const installing = { state: "installing", addEventListener: vi.fn() };
+      registration.installing = installing;
+      updatefound(new Event("updatefound"));
+      const statechange = installing.addEventListener.mock.calls.find(
+        ([type]) => type === "statechange",
+      )?.[1] as (ev: Event) => void;
+      installing.state = "installed";
+      statechange(new Event("statechange"));
+    });
+    return reload;
+  }
+
+  it("更新提示过 4s 仍存在（再过 1 分钟也还在），点击仍 reload 一次", async () => {
+    vi.useFakeTimers();
+    try {
+      const reload = await mountWithUpdateToast();
+      const btn = screen.getByRole("button", { name: UPDATE_TEXT });
+      expect(btn).toBeTruthy();
+
+      // 4s 到点（非 sticky 本地 toast 的消退时刻）：提示仍在
+      act(() => vi.advanceTimersByTime(4000));
+      expect(screen.getByRole("button", { name: UPDATE_TEXT })).toBeTruthy();
+      act(() => vi.advanceTimersByTime(60_000));
+      expect(screen.getByRole("button", { name: UPDATE_TEXT })).toBeTruthy();
+
+      // 点击行为不变：立即重载一次
+      await act(async () => {
+        btn.click();
+      });
+      expect(reload).toHaveBeenCalledTimes(1);
+    } finally {
+      delete (navigator as { serviceWorker?: unknown }).serviceWorker;
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("普通本地 toast 仍 4s 消退（通知开关失败提示，非 sticky）", async () => {
+    vi.useFakeTimers();
+    // 预置会话（刷新恢复路径）：侧栏「通知」开关仅会话模式渲染
+    localStorage.setItem(
+      "imagent.session",
+      JSON.stringify({ id: "sid-r", token: "st-r", expiresAt: Date.now() + 20 * 86_400_000 }),
+    );
+    mountApp();
+    handshake(FakeWebSocket.latest as FakeWebSocket, ["home-mac"]);
+
+    // jsdom 无 PushManager → enablePush 返回 not_supported → 本地 error toast
+    // （与更新提示共用 localToast 管道，但不带 sticky）
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "通知 不可用" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const TEXT = "此环境不支持通知（iOS 请先将本应用添加到主屏幕）";
+    expect(screen.getByText(TEXT)).toBeTruthy();
+    act(() => vi.advanceTimersByTime(3999));
+    expect(screen.getByText(TEXT)).toBeTruthy();
+    act(() => vi.advanceTimersByTime(1));
+    expect(screen.queryByText(TEXT)).toBeNull();
   });
 });
 

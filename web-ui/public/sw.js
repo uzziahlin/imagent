@@ -1,15 +1,39 @@
 /*
  * imagent Service Worker（v1.10 Web Push + shell 缓存）。手写原生 SW——public/
- * 下的文件不参与 Vite 构建处理，原样随构建拷贝到站点根。
+ * 下的源文件不参与 Vite 模块打包，随构建拷贝到站点根（唯一例外：本文件的
+ * BUILD 构建戳占位符由 vite.config.ts 插件在**构建产物**上替换，见下）。
  *
- * 缓存策略（契约）：只缓存静态 shell（/imagent/ 文档 + /imagent/icon.svg）
- * ——asset hash 文件交给浏览器 HTTP 缓存（relay 对 /assets/ 发 immutable 长
- * 缓存），业务 WS 流量与 API 绝不缓存（fetch handler 前缀黑名单直通网络）。
+ * 构建戳契约（v1.41.7）：浏览器只在 SW 脚本逐字节不同时才安装新 SW。本文件
+ * 的 BUILD 常量在源码里是占位符，由 vite.config.ts 的 stampServiceWorker 插件
+ * 在**构建产物**上替换为 index.html 的 sha256 前 16 位 hex——app shell 变 →
+ * 戳变 → sw.js 字节变 → 新 SW 被安装（此前 sw.js 字节恒不变，新 SW 永不安装，
+ * 首页文档被下面的缓存策略永久冻结）。戳只进 BUILD，不进 cache 名（见
+ * SHELL_CACHE）。
+ *
+ * 缓存策略（契约）：只缓存静态 shell（/imagent/ 文档 + /imagent/icon.svg）：
+ * - 文档（导航请求）network-first——在线必取最新文档并回填缓存，网络失败或
+ *   非 2xx 回退缓存（离线可用）；
+ * - icon.svg cache-first（未命中回源、不回填）；
+ * - asset hash 文件交给浏览器 HTTP 缓存（relay 对 /assets/ 发 immutable 长
+ *   缓存），不进 Cache Storage；
+ * - 业务 WS 流量与 API 绝不缓存（fetch handler 前缀黑名单直通网络）。
  *
  * 通知文案映射（notificationCopy）与 web-ui/src/lib/push.ts 保持一致——SW
  * 无法 import TS 模块，此处为同步副本；改文案请两处同改。
  */
 
+// 构建戳：vite.config.ts 的 stampServiceWorker 插件在构建产物上替换为
+// index.html 的 sha256 前 16 位 hex（见该插件注释——SW 脚本字节必须随 app shell
+// 变化，否则浏览器永不安装新 SW）。**不要把本常量拼进 SHELL_CACHE 名**（理由见下）。
+const BUILD = "__SW_BUILD__";
+
+// cache 名固定、不含构建戳（迁移理由，v1.41.7）：线上已部署的旧 SW 是
+// cache-first 且 cache 名同为 imagent-shell-v1。新 SW 的 install 把新文档写进
+// **同一个** cache——用户点「点击刷新」时导航仍由旧 SW 处理，其 cache-first
+// 命中的才已是新文档，一步到位拿新版本。若把戳拼进 cache 名，旧 SW 会继续
+// 吐旧 cache 里的旧文档，迁移失败（文档层的 network-first 要等新 SW 接管、
+// 即用户刷新之后才生效，救不了这一步）。历史 cache 的淘汰仍靠 activate 的
+// 「非本名即删」。
 const SHELL_CACHE = "imagent-shell-v1";
 // install 预缓存的 shell（只此两项）
 const SHELL_URLS = ["/imagent/", "/imagent/icon.svg"];
@@ -56,6 +80,35 @@ self.addEventListener("activate", (event) => {
   );
 });
 
+/** 首页文档 network-first（v1.41.7）：
+ *  - fetch 成功且 2xx → 回填缓存并返回网络响应。缓存键固定 "/imagent/"、不带
+ *    query——深链 /?conv=... 也回填到同一条目，与 install 预缓存及下面两处
+ *    回退查找的键一致；
+ *  - fetch 抛错（离线）→ 回退缓存文档；缓存也没有 → 重新抛出原错误；
+ *  - fetch 成功但非 2xx（5xx 等）→ 有缓存返回缓存，无缓存返回该响应。 */
+async function networkFirstDocument(request) {
+  let resp;
+  try {
+    resp = await fetch(request);
+  } catch (err) {
+    const cached = await caches.match("/imagent/");
+    if (cached) {
+      return cached;
+    }
+    throw err;
+  }
+  if (!resp.ok) {
+    return (await caches.match("/imagent/")) ?? resp;
+  }
+  try {
+    const cache = await caches.open(SHELL_CACHE);
+    await cache.put("/imagent/", resp.clone());
+  } catch {
+    // 回填失败（配额满等）不拖垮本次导航：网络响应照常返回，下次在线导航再回填
+  }
+  return resp;
+}
+
 self.addEventListener("fetch", (event) => {
   // 非 GET（WS 升级、POST API）直接 pass
   if (event.request.method !== "GET") {
@@ -70,7 +123,16 @@ self.addEventListener("fetch", (event) => {
   if (PASS_THROUGH_PREFIXES.some((p) => url.pathname.startsWith(p))) {
     return;
   }
-  // /imagent/ 静态资源：cache-first（未命中回源且不回填——缓存内容恒为
+  // 导航请求（首页文档本身，v1.41.7）network-first：在线必取最新文档并回填
+  // 缓存；网络失败或非 2xx 回退缓存（离线可用）。只认路径恰为 /imagent/ 的
+  // 导航（深链带 query 不改路径）：其余路径（assets/*、icon.svg、manifest.json
+  // 等）即使用户直接在地址栏打开也走下面的 cache-first、不走文档回填——否则
+  // 会把 JS/JSON 响应写进 /imagent/ 这个 shell 条目，之后被当成首页文档吐出来。
+  if (event.request.mode === "navigate" && url.pathname === "/imagent/") {
+    event.respondWith(networkFirstDocument(event.request));
+    return;
+  }
+  // 其余 /imagent/ 静态资源：cache-first（未命中回源且不回填——缓存内容恒为
   // install 时的 shell 两项；asset hash 文件实际由 HTTP 缓存承担）
   event.respondWith(
     caches.match(event.request).then((hit) => hit ?? fetch(event.request)),

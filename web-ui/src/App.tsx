@@ -362,10 +362,13 @@ export default function App() {
   const [themePref, setThemePref] = useState<ThemePref>(() => loadThemePref());
   // v1.39：onClick 可选——可点形态（SW 更新提示「点击刷新」，点击立即重载）；
   // 缺席为既有纯展示形态。渲染见底部 toast 容器。
+  // v1.41.7：sticky 可选——常驻形态，不参与 4s 自动消退（SW 更新提示用：
+  // 真机上提示闪 4 秒就没了极易错过，新版本一直在等待态却没人点刷新）。
   const [localToast, setLocalToast] = useState<{
     text: string;
     tone: "info" | "error";
     onClick?: () => void;
+    sticky?: boolean;
   } | null>(null);
   // v1.40 语音转写 UI 事件（asr_result 回包 / error 帧 asr_* code → AsrUiEvent
   // 归一）：asr_result 由 ws 连接层拦截后经 onAsrResult 回调直达（不进消息流，
@@ -687,9 +690,8 @@ export default function App() {
     return () => clearTimeout(t);
   }, [adminError, adminOpen]);
 
-  // v1.10 PWA 接线（挂载一次）：SW 注册（仅 https/localhost，含「新版本 vX.Y.Z
-  // 已就绪，点击刷新」更新提示（版本号为构建期 __APP_VERSION__ 注入）与通知点击
-  // 的 open-conv 消息）+ ?conv= 深链会话定位
+  // v1.10 PWA 接线（挂载一次）：SW 注册（仅 https/localhost，含「新版本已就绪，
+  // 点击刷新」更新提示与通知点击的 open-conv 消息）+ ?conv= 深链会话定位
   // （SW 无窗口时 openWindow 到 /imagent/?conv=...，挂载读参定位；完整 conv
   // 形态校验后才切）。
   // v1.37：深链可携 ?machine=（推送载荷的来源机器）——先 select_machine 再
@@ -702,11 +704,18 @@ export default function App() {
       // 点击立即重载。新 SW install 已把新 shell 覆写进 SHELL_CACHE（sw.js
       // install handler cache.addAll），普通 reload 经旧 SW cache-first 命中的
       // 即是新 HTML → 一步到位拿新版本；controllerchange 自动重载为双保险。
+      // v1.41.7：提示常驻（sticky）——此前随 4s 自动消退，真机上闪一下就没。
+      // 覆写之所以成立，前提是 sw.js 的 SHELL_CACHE 名不随构建变（新旧 SW
+      // 写同一个 cache，见 sw.js 该常量的迁移注释）。
+      // 文案不带版本号：页面只知道自己正在跑的 __APP_VERSION__（即**旧**版本），
+      // 新版本号在刷新落地前无从得知——写上去等于报错版本。当前实际在跑的
+      // 版本看侧栏底部版本行。
       onUpdateAvailable: () =>
         setLocalToast({
-          text: `新版本 v${__APP_VERSION__} 已就绪，点击刷新`,
+          text: "新版本已就绪，点击刷新",
           tone: "info",
           onClick: () => window.location.reload(),
+          sticky: true,
         }),
       onOpenConv: (convId, machine) => {
         if (machine) {
@@ -728,9 +737,10 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅挂载执行一次（dispatch 为稳定引用）
   }, []);
 
-  // v1.10 本地 toast 自动消退（4s，对齐 error/notice 节奏）
+  // v1.10 本地 toast 自动消退（4s，对齐 error/notice 节奏）；v1.41.7：sticky
+  // 形态不起定时器（常驻到被点击或被后续 toast 顶替）
   useEffect(() => {
-    if (!localToast) {
+    if (!localToast || localToast.sticky) {
       return;
     }
     const t = setTimeout(() => setLocalToast(null), 4000);
@@ -1800,9 +1810,10 @@ export default function App() {
       {(state.lastError || state.lastNotice || localToast || (adminError && !adminOpen)) && (
         <div className="fixed inset-x-0 bottom-24 z-50 mx-auto flex w-fit max-w-[90vw] flex-col items-center gap-2">
           {/* v1.10 本地 toast（更新提示 / 通知开关反馈）：info 蓝 / error 红，
-              节奏与 error/notice 一致（4s 自动消退）。v1.39：带 onClick 的
-              更新提示渲染为可点 button（下划线示意可点，样式随既有 pill），
-              点击立即重载；其余仍为纯文本。 */}
+              节奏与 error/notice 一致（4s 自动消退；v1.41.7 sticky 形态例外，
+              常驻不消退）。v1.39：带 onClick 的更新提示渲染为可点 button
+              （下划线示意可点，样式随既有 pill），点击立即重载；其余仍为
+              纯文本。 */}
           {localToast && (
             <div
               role="status"

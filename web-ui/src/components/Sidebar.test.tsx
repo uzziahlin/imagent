@@ -252,3 +252,18 @@ describe("Sidebar 会话项左滑删除（v1.41.4）", () => {
     expect(onSelect).toHaveBeenCalledTimes(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// v1.41.7 侧栏底部运行版本号：`v{__APP_VERSION__}`（构建期 vite define 注入，
+// vitest 经 test.define 同样注入——注入缺失时文本为 "vundefined"，本用例即红）。
+// 纯展示：非按钮、无交互。
+// ---------------------------------------------------------------------------
+
+describe("Sidebar 运行版本号（v1.41.7）", () => {
+  it("底部显示 v{__APP_VERSION__}（纯展示，全树仅一处）", () => {
+    mountSidebar();
+    const version = screen.getByText(`v${__APP_VERSION__}`);
+    expect(version.tagName).toBe("DIV");
+    expect(screen.getAllByText(/^v\d+\.\d+\.\d+$/)).toEqual([version]);
+  });
+});

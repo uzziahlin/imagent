@@ -80,6 +80,8 @@ function formatTime(at: number): string {
  *   进入登出流程）。
  * - 主题三态开关：底部「外观」段选（跟随系统/浅色/深色），偏好由 App 持久
  *   化并应用到 document（lib/theme.ts），本组件纯展示上抛 onThemeChange。
+ * - v1.41.7：底部末行小号弱色显示当前运行版本 `v{__APP_VERSION__}`（构建期
+ *   注入，纯展示——排查「发版后没更新」时确认实际在跑的版本）。
  *
  * 已知限制：会话内消息历史仅 SPA 内存保留，页面刷新后仅当前卡片由 sync
  * 重发恢复（text/user 回显不重放）。
@@ -569,6 +571,12 @@ export function Sidebar({
         >
           + 新会话
         </button>
+        {/* v1.41.7：当前运行版本号（构建期 __APP_VERSION__ 注入，vite define）。
+            真机排查「发版后驾驶舱没更新」时一眼确认跑的是哪一版——被旧 SW
+            冻结的旧版本在此直接暴露。纯展示，小号弱色不抢眼。 */}
+        <div className="mt-1.5 select-none text-center text-[10px] leading-4 text-ghost">
+          v{__APP_VERSION__}
+        </div>
       </div>
     </div>
   );
