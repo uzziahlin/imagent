@@ -5,7 +5,8 @@
 // iOS 未添加主屏 / 权限拒绝 / 订阅失败 / 服务端拒绝 / 网络错误 / 无会话）、
 // disablePush（有订阅/无订阅/服务端失败仍本地退订）、open-conv 消息监听、
 // ?conv= 深链参数校验、initServiceWorker（v1.39 更新接管 controllerchange
-// 自动重载 + 首装守卫 + cleanup 解绑）。
+// 自动重载 + 首装守卫 + cleanup 解绑；v1.41.5 运行中更新检查——定时 +
+// visibilitychange 两个触发源、cleanup 回收、update reject 静默、卸载竞态）。
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   listenServiceWorkerMessages,
@@ -74,7 +75,12 @@ function makeServiceWorkerStub(opts: { pushManager?: unknown } = {}) {
           getSubscription: vi.fn(async () => subscription),
         }
   ) as PushManagerStub;
-  const registration = { pushManager, installing: null, addEventListener: vi.fn() };
+  const registration = {
+    pushManager,
+    installing: null,
+    addEventListener: vi.fn(),
+    update: vi.fn(async () => undefined),
+  };
   const container = {
     register: vi.fn(async () => registration),
     getRegistration: vi.fn(async () => registration),
@@ -664,5 +670,119 @@ describe("initServiceWorker 更新接管自动重载（v1.39）", () => {
       "controllerchange",
       expect.any(Function),
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// initServiceWorker 运行中更新检查（v1.41.5）：页面长开时浏览器只在页面加载
+// 时自动检查 SW 更新——两个运行中触发源（SW_UPDATE_INTERVAL_MS = 10 分钟定时
+// + visibilitychange 切回前台）主动 reg.update()，让既有 updatefound→提示→
+// controllerchange 自动重载链路接管。驱动方式同上（register stub + 微任务
+// 冲刷）；定时用 fake timers，可见性直接往 document 派发 visibilitychange
+// （jsdom 默认 visibilityState 为 "visible"，hidden 场景经实例属性覆盖）。
+// ---------------------------------------------------------------------------
+
+describe("initServiceWorker 运行中更新检查（v1.41.5）", () => {
+  /** 间隔参数（10 分钟，毫秒）——与 push.ts 的 SW_UPDATE_INTERVAL_MS 钉死。 */
+  const INTERVAL_MS = 10 * 60 * 1000;
+  type RegWithUpdate = { update: ReturnType<typeof vi.fn> };
+
+  afterEach(() => {
+    vi.useRealTimers();
+    delete (document as unknown as { visibilityState?: unknown }).visibilityState;
+  });
+
+  it("定时触发：每 10 分钟调一次 reg.update()", async () => {
+    vi.useFakeTimers();
+    const sw = makeServiceWorkerStub();
+    stubPushGlobals(sw.container);
+    initServiceWorker({});
+    await vi.advanceTimersByTimeAsync(0); // 冲刷 register().then（updatefound/触发源挂上）
+    const registration = sw.registration as unknown as RegWithUpdate;
+
+    expect(registration.update).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(INTERVAL_MS);
+    expect(registration.update).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(INTERVAL_MS);
+    expect(registration.update).toHaveBeenCalledTimes(2);
+  });
+
+  it("切回前台（visibilitychange 且 visible）触发 update；hidden 不触发", async () => {
+    const sw = makeServiceWorkerStub();
+    stubPushGlobals(sw.container);
+    initServiceWorker({});
+    await new Promise((r) => setTimeout(r, 0));
+    const registration = sw.registration as unknown as RegWithUpdate;
+
+    // jsdom 默认 visibilityState = "visible"
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(registration.update).toHaveBeenCalledTimes(1);
+
+    // hidden：事件照常派发但不触发检查
+    Object.defineProperty(document, "visibilityState", {
+      value: "hidden",
+      configurable: true,
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(registration.update).toHaveBeenCalledTimes(1);
+
+    // 恢复 visible 再触发
+    Object.defineProperty(document, "visibilityState", {
+      value: "visible",
+      configurable: true,
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(registration.update).toHaveBeenCalledTimes(2);
+  });
+
+  it("cleanup 清理定时与 visibilitychange 监听：之后不再触发 update", async () => {
+    vi.useFakeTimers();
+    const sw = makeServiceWorkerStub();
+    stubPushGlobals(sw.container);
+    const cleanup = initServiceWorker({});
+    await vi.advanceTimersByTimeAsync(0);
+    const registration = sw.registration as unknown as RegWithUpdate;
+    const removeSpy = vi.spyOn(document, "removeEventListener");
+
+    await vi.advanceTimersByTimeAsync(INTERVAL_MS);
+    expect(registration.update).toHaveBeenCalledTimes(1); // cleanup 前定时照常
+
+    cleanup();
+    expect(removeSpy).toHaveBeenCalledWith("visibilitychange", expect.any(Function));
+
+    await vi.advanceTimersByTimeAsync(INTERVAL_MS * 2);
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(registration.update).toHaveBeenCalledTimes(1); // cleanup 后两源均不再触发
+  });
+
+  it("reg.update() reject 静默（离线/反代异常：无未处理 rejection）", async () => {
+    vi.useFakeTimers();
+    const sw = makeServiceWorkerStub();
+    sw.registration.update = vi.fn(async () => {
+      throw new Error("network down");
+    });
+    stubPushGlobals(sw.container);
+    initServiceWorker({});
+    await vi.advanceTimersByTimeAsync(0);
+    const registration = sw.registration as unknown as RegWithUpdate;
+
+    // 两个触发源都打在 reject 的 update 上——catch 吞掉（若有未处理 rejection
+    // vitest 会判本用例失败）
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(INTERVAL_MS);
+    expect(registration.update).toHaveBeenCalledTimes(2);
+  });
+
+  it("cleanup 先于 register 完成时不挂接触发源（StrictMode 卸载竞态防泄漏）", async () => {
+    vi.useFakeTimers();
+    const sw = makeServiceWorkerStub();
+    stubPushGlobals(sw.container);
+    const cleanup = initServiceWorker({});
+    cleanup(); // register 尚未 resolve
+    await vi.advanceTimersByTimeAsync(INTERVAL_MS * 3);
+    const registration = sw.registration as unknown as RegWithUpdate;
+    expect(registration.update).not.toHaveBeenCalled();
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(registration.update).not.toHaveBeenCalled();
   });
 });

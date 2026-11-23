@@ -14,6 +14,12 @@ import { fromB64Url } from "./webauthn";
 /** SW 脚本地址（public/sw.js，base /imagent/ 固定部署路径）。 */
 const SW_URL = "/imagent/sw.js";
 
+/** 运行中 SW 更新检查间隔（v1.41.5）：浏览器只在页面加载时自动检查 SW 更新，
+ *  页面长开（PWA 常驻）场景部署新版后 updatefound 永不触发——需运行中主动
+ *  reg.update()。10 分钟折中「及时感知」与「检查频率」；切回前台另有即时
+ *  触发（见 initServiceWorker）。 */
+const SW_UPDATE_INTERVAL_MS = 10 * 60 * 1000;
+
 /** localStorage 标志键：用户显式开启过通知（登录后静默重挂 / 登出清理的
  *  依据）。 */
 export const PUSH_ENABLED_KEY = "imagent-push-enabled";
@@ -140,8 +146,11 @@ export function listenServiceWorkerMessages(
  *    就绪，点击刷新」可点提示，v1.39）；
  *  - controllerchange → 新 SW 接管控制器（更新标记已置位时）→ reload 一次
  *    （v1.39 双保险自动腿，与 toast 点击重载并存，守卫见内注释）；
+ *  - 运行中主动更新检查（v1.41.5）：定时（SW_UPDATE_INTERVAL_MS）+ 切回前台
+ *    （visibilitychange → visible）触发 reg.update()，新 SW install 落入上方
+ *    既有 updatefound 链路；update() 失败静默；
  *  - open-conv 消息 → onOpenConv（通知点击定位会话）。
- *  返回消息监听的 cleanup（注册部分幂等，无需清理）。 */
+ *  返回 cleanup：解绑消息监听 / controllerchange / 运行中检查两触发源。 */
 export function initServiceWorker(
   handlers: {
     onUpdateAvailable?: () => void;
@@ -176,6 +185,16 @@ export function initServiceWorker(
   };
   container.addEventListener("controllerchange", onControllerChange);
 
+  // v1.41.5 运行中更新检查（定时 + 切回前台两个触发源）：定时器 id 与监听器
+  // 引用在注册完成后才产生——提前声明，cleanup 按需回收。卸载先于注册完成
+  // （StrictMode dev 双挂载 / 快速切换）时置位 disposed，注册落地后不再挂接，
+  // 防 interval 泄漏到已卸载页面对旧 handlers 继续触发。
+  let disposed = false;
+  let updateTimer: ReturnType<typeof setInterval> | undefined;
+  let onVisibilityChange: (() => void) | undefined;
+  // 捕获引用：挂接与解绑同源（对齐 container 的捕获纪律）
+  const doc = document;
+
   void navigator.serviceWorker
     .register(SW_URL)
     .then((reg) => {
@@ -192,11 +211,36 @@ export function initServiceWorker(
           }
         });
       });
+      if (disposed) {
+        return;
+      }
+      // v1.41.5 运行中主动触发 SW 更新检查：update() 让浏览器重新拉取 sw.js，
+      // 新 SW install 后由上方既有 updatefound 链路接管（提示 + controllerchange
+      // 自动重载，此处零改动）。两个触发源的 update() 失败一律静默（离线 /
+      // 反代异常——主功能不受影响）。
+      updateTimer = setInterval(() => {
+        void reg.update().catch(() => {});
+      }, SW_UPDATE_INTERVAL_MS);
+      onVisibilityChange = () => {
+        if (doc.visibilityState === "visible") {
+          void reg.update().catch(() => {});
+        }
+      };
+      doc.addEventListener("visibilitychange", onVisibilityChange);
     })
     .catch(() => {
       // 注册失败（无 SW 权限 / 反代异常等）：静默——主功能不受影响
     });
   return () => {
+    disposed = true;
+    if (updateTimer !== undefined) {
+      clearInterval(updateTimer);
+      updateTimer = undefined;
+    }
+    if (onVisibilityChange !== undefined) {
+      doc.removeEventListener("visibilitychange", onVisibilityChange);
+      onVisibilityChange = undefined;
+    }
     cleanupMsg();
     container.removeEventListener("controllerchange", onControllerChange);
   };
