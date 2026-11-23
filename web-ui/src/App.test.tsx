@@ -447,17 +447,17 @@ describe("未读徽标与空态示例（交互细节）", () => {
     act(() => {
       fake.recv({ v: 1, type: "text", convId: "web:work", text: "后台第一条", machine: "home-mac" });
     });
-    let workBtn = screen.getByRole("button", { name: /work/ });
+    let workBtn = screen.getByRole("button", { name: /^work/ });
     expect(within(workBtn).getByText("1")).toBeTruthy();
     act(() => {
       fake.recv({ v: 1, type: "text", convId: "web:work", text: "后台第二条", machine: "home-mac" });
     });
-    workBtn = screen.getByRole("button", { name: /work/ });
+    workBtn = screen.getByRole("button", { name: /^work/ });
     expect(within(workBtn).getByText("2")).toBeTruthy();
 
     // 点选 → 清零并切到该会话（aria-current 标记选中）
     fireEvent.click(workBtn);
-    workBtn = screen.getByRole("button", { name: /work/ });
+    workBtn = screen.getByRole("button", { name: /^work/ });
     expect(within(workBtn).queryByText("1")).toBeNull();
     expect(within(workBtn).queryByText("2")).toBeNull();
     expect(workBtn.getAttribute("aria-current")).toBe("page");
@@ -1927,7 +1927,7 @@ describe("App 会话历史重放（v1.8）", () => {
     act(() => {
       fake.recv({ v: 1, type: "text", convId: "web:work", text: "后台消息", machine: "home-mac" });
     });
-    fireEvent.click(screen.getByRole("button", { name: /work/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^work/ }));
     expect(historyQueries(fake)).toEqual([
       { v: 1, type: "history_query", convId: "web:default", since: 0, machine: "home-mac" },
       { v: 1, type: "history_query", convId: "web:work", since: 0, machine: "home-mac" },
@@ -1946,7 +1946,7 @@ describe("App 会话历史重放（v1.8）", () => {
     );
     // 切走再切回：since=7（本地水位）
     fireEvent.click(screen.getByRole("button", { name: /default/ }));
-    fireEvent.click(screen.getByRole("button", { name: /work/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^work/ }));
     expect(historyQueries(fake).at(-1)).toEqual({
       v: 1,
       type: "history_query",

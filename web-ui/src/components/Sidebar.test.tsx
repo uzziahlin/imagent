@@ -103,28 +103,46 @@ describe("Sidebar 会话项运行态点（v1.37）", () => {
 });
 
 // ---------------------------------------------------------------------------
-// v1.41.3 长按删除：会话项长按 500ms 触发 onConvDelete（滚动手势/提前松手
-// 取消；触发后吞掉紧随的 click 不切会话；未传 onConvDelete 不启用）
+// v1.41.4 左滑删除：会话项左滑（横向位移占优且超方向判定阈值）跟手露出删除
+// 按钮，点击按钮触发 onConvDelete（App 级确认弹层入口）；松手过吸附阈值吸附
+// 打开、否则回弹关闭并吞 click；纵向占优放行滚动（click 照常点选）；打开态
+// 点本体仅收起；一次只开一项；桌面 hover 小图标兜底；未传 onConvDelete 不启用
 // ---------------------------------------------------------------------------
 
-describe("Sidebar 会话项长按删除（v1.41.3）", () => {
+describe("Sidebar 会话项左滑删除（v1.41.4）", () => {
   const CONVS: ConvItem[] = [
     { convId: "web:default", preview: "", at: 0, unread: 0 },
     { convId: "web:ghost", title: "幽灵会话", preview: "误触发的会话", at: 1, unread: 0 },
   ];
 
-  /** jsdom 的 PointerEvent 不带 pointerType/clientX——fireEvent.pointerDown
-   *  走 init 对象补齐（handler 读 pointerType/clientX/clientY）。 */
-  function press(item: HTMLElement, opts: { x?: number; y?: number } = {}) {
-    fireEvent.pointerDown(item, {
-      pointerType: "touch",
-      button: 0,
-      clientX: opts.x ?? 10,
-      clientY: opts.y ?? 10,
-    });
+  /** jsdom 无 PointerEvent 构造器（fireEvent 的 init 对象不会落到事件上）——
+   *  手搓 Event 并 Object.assign 补齐 pointerType/clientX/clientY，对齐真实
+   *  浏览器事件形态。y 缺省 20（纵向不动）。 */
+  function pointer(
+    type: "pointerdown" | "pointermove" | "pointerup",
+    x: number,
+    y: number,
+  ) {
+    const ev = new Event(type, { bubbles: true, cancelable: true, composed: true });
+    Object.assign(ev, { pointerType: "touch", button: 0, clientX: x, clientY: y });
+    return ev;
+  }
+  const down = (el: HTMLElement, x: number, y = 20) =>
+    fireEvent(el, pointer("pointerdown", x, y));
+  const move = (el: HTMLElement, x: number, y = 20) =>
+    fireEvent(el, pointer("pointermove", x, y));
+  const up = (el: HTMLElement, x: number, y = 20) =>
+    fireEvent(el, pointer("pointerup", x, y));
+
+  /** 左滑序列：按下 → 半程（触发方向判定）→ 终点 → 松手（对齐真机事件流）。 */
+  function swipe(item: HTMLElement, fromX: number, toX: number, y = 20) {
+    down(item, fromX, y);
+    move(item, (fromX + toX) / 2, y);
+    move(item, toX, y);
+    up(item, toX, y);
   }
 
-  function mount(onConvDelete: (conv: string) => void, onSelect: (conv: string) => void) {
+  function mount(onDelete?: (conv: string) => void, onSelect: (conv: string) => void = () => {}) {
     render(
       <Sidebar
         convs={CONVS}
@@ -140,93 +158,97 @@ describe("Sidebar 会话项长按删除（v1.41.3）", () => {
         onSelect={onSelect}
         onSelectMachine={() => {}}
         onCreate={() => {}}
-        onConvDelete={onConvDelete}
+        onConvDelete={onDelete}
       />,
     );
     return screen.getByRole("button", { name: /幽灵会话/ });
   }
 
-  it("长按 500ms 触发 onConvDelete（带 convId）；触发后吞 click（不切会话）", () => {
-    vi.useFakeTimers();
-    try {
-      const onDelete = vi.fn();
-      const onSelect = vi.fn();
-      const item = mount(onDelete, onSelect);
-      press(item);
-      fireEvent.click(item); // 500ms 内的 click 不受影响（正常点选）
-      expect(onSelect).toHaveBeenCalledTimes(1);
-      vi.advanceTimersByTime(500);
-      expect(onDelete).toHaveBeenCalledTimes(1);
-      expect(onDelete).toHaveBeenCalledWith("web:ghost");
-      // 长按触发后浏览器仍派发 click——必须被吞（不切会话）
-      fireEvent.click(item);
-      expect(onSelect).toHaveBeenCalledTimes(1);
-    } finally {
-      vi.useRealTimers();
-    }
+  it("左滑超吸附阈值露出删除按钮；点击删除按钮触发 onConvDelete（带 convId）并收起", () => {
+    const onDelete = vi.fn();
+    const onSelect = vi.fn();
+    const item = mount(onDelete, onSelect);
+    expect(screen.queryByRole("button", { name: "删除" })).toBeNull();
+    swipe(item, 200, 140); // dx = -60 < -40 → 吸附打开
+    fireEvent.click(screen.getByRole("button", { name: "删除" }));
+    expect(onDelete).toHaveBeenCalledTimes(1);
+    expect(onDelete).toHaveBeenCalledWith("web:ghost");
+    // 删除入口触发后收起（露出按钮卸载），且不切会话
+    expect(screen.queryByRole("button", { name: "删除" })).toBeNull();
+    expect(onSelect).not.toHaveBeenCalled();
   });
 
-  it("提前松手 / 位移超容差 / pointer 离项：不触发（滚动手势与点选保护）", () => {
-    vi.useFakeTimers();
-    try {
-      const onDelete = vi.fn();
-      const onSelect = vi.fn();
-      const item = mount(onDelete, onSelect);
-
-      // 提前松手（<500ms）
-      press(item);
-      vi.advanceTimersByTime(200);
-      fireEvent.pointerUp(item);
-      vi.advanceTimersByTime(500);
-      expect(onDelete).not.toHaveBeenCalled();
-
-      // 滚动手势（按下后移动 >8px）
-      press(item, { x: 10, y: 10 });
-      fireEvent.pointerMove(item, { clientX: 30, clientY: 40 });
-      vi.advanceTimersByTime(500);
-      expect(onDelete).not.toHaveBeenCalled();
-      fireEvent.pointerUp(item);
-      fireEvent.click(item);
-      expect(onSelect).toHaveBeenCalledTimes(1); // 滚动后的 click 照常点选
-
-      // 指针离项（滑出条目）
-      press(item);
-      fireEvent.pointerLeave(item);
-      vi.advanceTimersByTime(500);
-      expect(onDelete).not.toHaveBeenCalled();
-    } finally {
-      vi.useRealTimers();
-    }
+  it("位移不足吸附阈值：回弹关闭且吞 click（不切会话）；微小抖动后点选照常", () => {
+    const onDelete = vi.fn();
+    const onSelect = vi.fn();
+    const item = mount(onDelete, onSelect);
+    // 左滑但不过半（dx = -15 ≥ -40）→ 回弹关闭，滑动语义吞 click
+    swipe(item, 200, 185);
+    expect(screen.queryByRole("button", { name: "删除" })).toBeNull();
+    fireEvent.click(item);
+    expect(onSelect).not.toHaveBeenCalled();
+    // 按下 + 微小抖动（未超方向判定阈值）+ 抬起 → 正常点选
+    down(item, 200);
+    move(item, 196); // |dx| = 4 < 10
+    up(item, 196);
+    fireEvent.click(item);
+    expect(onSelect).toHaveBeenCalledTimes(1);
   });
 
-  it("未传 onConvDelete：长按不触发（旧入口行为不变）", () => {
-    vi.useFakeTimers();
-    try {
-      const onSelect = vi.fn();
-      render(
-        <Sidebar
-          convs={CONVS}
-          current="web:default"
-          machineOnline={true}
-          machines={[]}
-          machinesKnown={false}
-          currentMachine="default"
-          pushEnabled={false}
-          pushAvailable={false}
-          pushBusy={false}
-          themePref="system"
-          onSelect={onSelect}
-          onSelectMachine={() => {}}
-          onCreate={() => {}}
-        />,
-      );
-      const item = screen.getByRole("button", { name: /幽灵会话/ });
-      press(item);
-      vi.advanceTimersByTime(500);
-      fireEvent.click(item);
-      expect(onSelect).toHaveBeenCalledTimes(1); // 长按无效果，click 照常
-    } finally {
-      vi.useRealTimers();
-    }
+  it("纵向占优位移放行垂直滚动：不认领手势，click 照常点选", () => {
+    const onDelete = vi.fn();
+    const onSelect = vi.fn();
+    const item = mount(onDelete, onSelect);
+    down(item, 200);
+    move(item, 202, 40); // |dx| = 2 < |dy| = 20 → 纵向占优，放弃手势
+    up(item, 202, 40);
+    fireEvent.click(item);
+    expect(onDelete).not.toHaveBeenCalled();
+    expect(onSelect).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: "删除" })).toBeNull();
+  });
+
+  it("打开态点项本体仅收起（不切换）；一次只开一项（开新项自动收旧项）", () => {
+    const onDelete = vi.fn();
+    const onSelect = vi.fn();
+    const ghost = mount(onDelete, onSelect);
+    swipe(ghost, 200, 140);
+    expect(screen.getAllByRole("button", { name: "删除" })).toHaveLength(1);
+    // 真实事件流：点本体前先 down/up（down 重置吞 click 标记）→ click 收起
+    down(ghost, 200);
+    up(ghost, 200);
+    fireEvent.click(ghost);
+    expect(screen.queryByRole("button", { name: "删除" })).toBeNull();
+    expect(onSelect).not.toHaveBeenCalled();
+    // ghost 再开 → 左滑 default：ghost 自动收起，同时仅一项开着
+    swipe(ghost, 200, 140);
+    const def = screen.getByRole("button", { name: /default/ });
+    swipe(def, 200, 140);
+    expect(screen.getAllByRole("button", { name: "删除" })).toHaveLength(1);
+  });
+
+  it("桌面 hover 删除图标兜底：点击触发 onConvDelete；打开态不渲染（与露出按钮互斥）", () => {
+    const onDelete = vi.fn();
+    const ghost = mount(onDelete);
+    // 图标挂在所属条目的手势容器内，按容器定位（jsdom 无法断言 md:/opacity
+    // CSS 的显隐，渲染存在性与互斥可测）
+    const ghostBox = within(ghost.parentElement as HTMLElement);
+    fireEvent.click(ghostBox.getByRole("button", { name: "删除会话" }));
+    expect(onDelete).toHaveBeenCalledTimes(1);
+    expect(onDelete).toHaveBeenCalledWith("web:ghost");
+    // 打开态不渲染本条目图标（与露出的删除按钮互斥）
+    swipe(ghost, 200, 140);
+    expect(ghostBox.queryByRole("button", { name: "删除会话" })).toBeNull();
+    expect(screen.getByRole("button", { name: "删除" })).toBeTruthy();
+  });
+
+  it("未传 onConvDelete：左滑无效（无删除入口），click 照常点选", () => {
+    const onSelect = vi.fn();
+    const item = mount(undefined, onSelect);
+    swipe(item, 200, 100);
+    expect(screen.queryByRole("button", { name: "删除" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "删除会话" })).toBeNull();
+    fireEvent.click(item);
+    expect(onSelect).toHaveBeenCalledTimes(1);
   });
 });
