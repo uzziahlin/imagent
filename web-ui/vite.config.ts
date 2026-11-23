@@ -1,6 +1,15 @@
 /// <reference types="vitest/config" />
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+
+// 构建期读取版本号（package.json 随批发版更新），经 define 注入全局常量
+// __APP_VERSION__（类型声明在 src/vite-env.d.ts）——SW 更新提示文案携带版本。
+const pkg = JSON.parse(
+  readFileSync(fileURLToPath(new URL("./package.json", import.meta.url)), "utf-8"),
+) as { version: string };
+const APP_VERSION_DEFINE = { __APP_VERSION__: JSON.stringify(pkg.version) };
 
 // 公网路径：Caddy `handle_path /imagent/*` strip 前缀后转 relay，
 // 故 base 固定 /imagent/，产物布局保持 Vite 默认（index.html + assets/*.hash）
@@ -8,6 +17,7 @@ import react from "@vitejs/plugin-react";
 export default defineConfig({
   base: "/imagent/",
   plugins: [react()],
+  define: APP_VERSION_DEFINE,
   build: {
     // 产物直接落 relay rust-embed 内嵌目录（提交进仓库，CI 不装 node）。
     // emptyOutDir 覆盖 M1 占位 index.html，属预期行为。
@@ -38,5 +48,7 @@ export default defineConfig({
   test: {
     environment: "jsdom",
     include: ["src/**/*.test.{ts,tsx}"],
+    // 测试里同样注入 __APP_VERSION__（文案断言引用该常量，注入缺失即红）
+    define: APP_VERSION_DEFINE,
   },
 });

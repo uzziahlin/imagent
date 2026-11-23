@@ -2241,7 +2241,8 @@ describe("v1.37 深链 ?machine= 切机器", () => {
 
 // ---------------------------------------------------------------------------
 // v1.39 SW 更新提示可点击：检测到新版本（installing→installed 且已有旧
-// controller）→ 可点 toast「新版本已就绪，点击刷新」，点击立即 reload。
+// controller）→ 可点 toast「新版本 v${__APP_VERSION__} 已就绪，点击刷新」，
+// 点击立即 reload。
 // （controllerchange 自动重载为双保险——容器监听器语义由 push.test 单测驱动）
 // ---------------------------------------------------------------------------
 
@@ -2288,8 +2289,12 @@ describe("v1.39 SW 更新提示可点击", () => {
         statechange(new Event("statechange"));
       });
 
-      // 可点形态 toast（button 可访问名 = 提示文案；点击立即重载）
-      const btn = screen.getByRole("button", { name: "新版本已就绪，点击刷新" });
+      // 可点形态 toast（button 可访问名 = 提示文案；点击立即重载）。
+      // 文案引用 vite test.define 注入的 __APP_VERSION__：注入缺失时串里为
+      // "undefined"，本用例即红——兼作构建期版本注入的轻量断言。
+      const btn = screen.getByRole("button", {
+        name: `新版本 v${__APP_VERSION__} 已就绪，点击刷新`,
+      });
       expect(btn).toBeTruthy();
       await act(async () => {
         btn.click();

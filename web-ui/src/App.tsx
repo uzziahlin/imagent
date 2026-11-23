@@ -687,8 +687,9 @@ export default function App() {
     return () => clearTimeout(t);
   }, [adminError, adminOpen]);
 
-  // v1.10 PWA 接线（挂载一次）：SW 注册（仅 https/localhost，含「新版本已就绪，
-  // 点击刷新」更新提示与通知点击的 open-conv 消息）+ ?conv= 深链会话定位
+  // v1.10 PWA 接线（挂载一次）：SW 注册（仅 https/localhost，含「新版本 vX.Y.Z
+  // 已就绪，点击刷新」更新提示（版本号为构建期 __APP_VERSION__ 注入）与通知点击
+  // 的 open-conv 消息）+ ?conv= 深链会话定位
   // （SW 无窗口时 openWindow 到 /imagent/?conv=...，挂载读参定位；完整 conv
   // 形态校验后才切）。
   // v1.37：深链可携 ?machine=（推送载荷的来源机器）——先 select_machine 再
@@ -703,7 +704,7 @@ export default function App() {
       // 即是新 HTML → 一步到位拿新版本；controllerchange 自动重载为双保险。
       onUpdateAvailable: () =>
         setLocalToast({
-          text: "新版本已就绪，点击刷新",
+          text: `新版本 v${__APP_VERSION__} 已就绪，点击刷新`,
           tone: "info",
           onClick: () => window.location.reload(),
         }),
