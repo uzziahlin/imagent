@@ -1,12 +1,15 @@
 //! peer 会话路由（v1.41 网关伪装 Claude Code peer）：
 //! - 出站（驾驶舱 → 窗口）：conv 前缀 `peer:` 的文本**不进 agent backend**，
-//!   按窗口名解析注册表 → envelope user 帧投递；先经既有 `send_text` 链路
+//!   按窗口名解析注册表 → envelope user 帧投递；先经既有出站链路
 //!   落 outbound_log（历史重放/未读/推送全复用），投递失败回 SPA error 帧
-//!   （`peer_unreachable`）；
+//!   （`peer_unreachable`）。落盘走 [`Platform::send_user_text`]（v1.41.8）
+//!   ——这是**用户自己发出的文本**，驾驶舱按用户气泡渲染并与发送端本机
+//!   回显去重（此前走 `send_text` 发普通 text 帧，被渲染成 agent 气泡：
+//!   「网关复读」与「双显」）；
 //! - 入站（窗口 → 驾驶舱）：[`PeerServer`](crate::peer::PeerServer) 收帧回调
-//!   直投 `peer:<窗口名>` 会话（同样走 `send_text` 链路；**不进** `handle()`
-//!   鉴权管线——socket 目录 0700 + sock 0600 即本机凭证，与 `local` 平台同
-//!   信任边界）。
+//!   直投 `peer:<窗口名>` 会话（走 `send_text` 链路——窗口 claude 的回复是
+//!   agent 文本；**不进** `handle()` 鉴权管线——socket 目录 0700 + sock 0600
+//!   即本机凭证，与 `local` 平台同信任边界）。
 
 use super::*;
 use crate::peer::{CONV_PREFIX, ERR_UNREACHABLE};
@@ -41,9 +44,11 @@ impl Dispatcher {
             .await;
             return;
         };
-        // ① 既有 send_text 链路：广播驾驶舱 + 落 outbound_log（历史重放/未读/
-        //    推送全复用；发送端本就有本地回显，此处是落库与其他设备可见）。
-        self.reply(&conv, text, &hint).await;
+        // ① 既有出站链路：广播驾驶舱 + 落 outbound_log（历史重放/未读/推送
+        //    全复用）。v1.41.8：走 send_user_text——这是用户自己发出的文本，
+        //    驾驶舱按用户气泡渲染并与发送端本机回显去重（落库与其他设备
+        //    可见不变）。
+        self.reply_user_text(&conv, text, &hint).await;
         // ② peer 出站投递；失败回 SPA error 帧（peer_unreachable toast）。
         if let Err(e) = peer.send_to_window(name, text).await {
             warn!(
@@ -75,7 +80,8 @@ impl Dispatcher {
     /// `/to <窗口名>`（无正文）= 仅建立会话：按窗口名解析（复用 sender 的
     /// `resolve_window` 解析路径，只解析不投递正文），成功则向
     /// `peer:<窗口名>` conv send_text 一条系统欢迎文本（走既有 send_text
-    /// 链路落 outbound_log——侧边栏即出现该会话，用户可直接进入对话）；解析
+    /// 链路落 outbound_log——侧边栏即出现该会话，用户可直接进入对话；欢迎
+    /// 文本是系统提示而非用户自发文本，**不得**改走 send_user_text）；解析
     /// 失败沿用 `/to` 既有失败文案（含在线名单，可行动）。
     pub(super) async fn peer_establish_session(&self, conv: &ConvId, hint: &ReplyHint, name: &str) {
         let Some(peer) = self.peer.read().clone() else {
@@ -117,8 +123,9 @@ impl Dispatcher {
     }
 
     /// `/to <窗口名> <文本…>` 投递核心（命令与复用路径共享）：投递成功 →
-    /// 派活正文镜像进 `peer:<窗口名>` 会话（落 outbound_log，驾驶舱历史完整）
-    /// + 当前会话回执；失败 → 当前会话回错误（含在线名单，可行动）。
+    /// 派活正文镜像进 `peer:<窗口名>` 会话（`send_user_text` 落 outbound_log，
+    /// 驾驶舱历史完整且显示为用户自己的气泡）+ 当前会话回执（`send_text`，
+    /// 系统提示）；失败 → 当前会话回错误（含在线名单，可行动）。
     pub(super) async fn peer_deliver_and_report(
         &self,
         conv: &ConvId,
@@ -137,10 +144,14 @@ impl Dispatcher {
         };
         match peer.send_to_window(name, text).await {
             Ok(()) => {
-                // 派活记录进 peer 会话（send_text 链路落 outbound_log——飞书/
-                // 终端等非驾驶舱入口发出的派活，驾驶舱侧同样可见因果）。
+                // 派活记录进 peer 会话（落 outbound_log——飞书/终端等非驾驶舱
+                // 入口发出的派活，驾驶舱侧同样可见因果）。v1.41.8：走
+                // send_user_text——正文是用户自己说的，驾驶舱按用户气泡渲染
+                // （此前 send_text 把它显示成 imagent 的发言，像网关复读却
+                // 没回答）。
                 let peer_conv = ConvId(format!("{CONV_PREFIX}{name}"));
-                self.reply(&peer_conv, text, hint).await;
+                self.reply_user_text(&peer_conv, text, hint).await;
+                // 投递回执是系统提示，恒走 send_text（agent 样式）。
                 self.reply(conv, &format!("✅ 已投递至 {name}。"), hint)
                     .await;
             }

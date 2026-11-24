@@ -52,6 +52,10 @@
 //! - web 不在 children 时维持 Err（与未知前缀同语义：配置撤下 web 后 peer
 //!   会话的残存调用可见报错，不静默丢弃）；
 //! - 配置化锚点同上（mirror 规则表），本特判暂不并入。
+//! - v1.41.8：`peer:` 会话的**用户自发文本镜像**（[`Platform::send_user_text`]
+//!   ——驾驶舱直接打字的出站文本、`/to` 派活正文）同经本特判主路由 web，且
+//!   必须以 `send_user_text` 身份转发（web 据此发带 `self` 标记的 text 帧，
+//!   SPA 按用户气泡渲染——落成普通 `send_text` 即被渲染成 agent 气泡）。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -313,6 +317,19 @@ impl Platform for MultiPlatform {
     async fn send_text(&self, conv: &ConvId, text: &str, hint: &ReplyHint) -> Result<()> {
         self.route_with_mirror(conv, |p| async move { p.send_text(conv, text, hint).await })
             .await
+    }
+
+    /// v1.41.8 用户自发文本镜像：与 [`Self::send_text`] 同款归属 + 镜像路由，
+    /// 但经**子平台的 `send_user_text`** 转发。必须覆写——否则 trait default
+    /// 会回调组合器自身的 `send_text`，用户镜像退化成普通 agent 文本（web 子
+    /// 平台据此发带 `self` 标记的帧，见 trait 文档）。`peer:` conv 经
+    /// [`Self::child_for`] 特判落到 web。
+    async fn send_user_text(&self, conv: &ConvId, text: &str, hint: &ReplyHint) -> Result<()> {
+        self.route_with_mirror(
+            conv,
+            |p| async move { p.send_user_text(conv, text, hint).await },
+        )
+        .await
     }
 
     async fn send_media(&self, conv: &ConvId, media: &MediaRef, hint: &ReplyHint) -> Result<()> {
@@ -638,6 +655,10 @@ mod tests {
         send_text_ok: bool,
         /// v1.41：send_error_note 记录（(code, message)）——peer: 路由特判测试用。
         errors: Arc<TokioMutex<Vec<(String, String)>>>,
+        /// v1.41.8：send_user_text 的 (conv, text) 记录（**不进 `sent`**）——
+        /// 组合器必须以 send_user_text 身份转发给子平台（web 据此发带 self
+        /// 标记的帧）；若误落成 send_text 则 sent 有、本表无，断言可辨。
+        user_sent: Arc<TokioMutex<Vec<(String, String)>>>,
     }
 
     /// 构造全参数 mock（mock / mock_opt 的公共实现）。
@@ -664,6 +685,7 @@ mod tests {
             streaming,
             send_text_ok,
             errors: Arc::new(TokioMutex::new(Vec::new())),
+            user_sent: Arc::new(TokioMutex::new(Vec::new())),
         });
         (p, tx, sent)
     }
@@ -774,6 +796,14 @@ mod tests {
                 .lock()
                 .await
                 .push((code.to_string(), message.to_string()));
+        }
+        /// v1.41.8：用户自发文本镜像单独记录（不进 sent——与 send_text 可辨）。
+        async fn send_user_text(&self, conv: &ConvId, text: &str, _hint: &ReplyHint) -> Result<()> {
+            self.user_sent
+                .lock()
+                .await
+                .push((conv.0.clone(), text.to_string()));
+            Ok(())
         }
         async fn send_media(
             &self,
@@ -927,6 +957,27 @@ mod tests {
         );
         assert!(f.errors.lock().await.is_empty(), "feishu 不收 error 帧");
 
+        // v1.41.8：send_user_text（peer 会话的用户自发文本镜像）同路由，且必须
+        // 以 send_user_text 身份到达 web 子平台（web 据此发带 self 标记的帧；
+        // 退化成 send_text 会被 SPA 渲染成 agent 气泡）。
+        m.send_user_text(&ConvId("peer:win-a".into()), "我打的字", &ReplyHint::None)
+            .await
+            .unwrap();
+        assert_eq!(
+            w.user_sent.lock().await.as_slice(),
+            &[("peer:win-a".to_string(), "我打的字".to_string())],
+            "peer: 的用户自发文本镜像主路由 web 子平台的 send_user_text"
+        );
+        assert_eq!(
+            w_sent.lock().await.len(),
+            1,
+            "用户镜像不得退化成子平台 send_text"
+        );
+        assert!(
+            f_sent.lock().await.is_empty() && f.user_sent.lock().await.is_empty(),
+            "feishu 不镜像 peer: 的用户自发文本"
+        );
+
         // web 不在 children：维持 Err（不静默）。
         let (a, _atx, _asent) = mock_opt("a", false, true);
         let (b, _btx, _bsent) = mock_opt("b", false, true);
@@ -936,7 +987,49 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("无对应平台"), "{err}");
+        let err = m2
+            .send_user_text(&ConvId("peer:x".into()), "hi", &ReplyHint::None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("无对应平台"),
+            "send_user_text 无 web 子平台同样不静默：{err}"
+        );
         assert!(!m2.supports_streaming_card(&ConvId("peer:x".into())));
+    }
+
+    /// 用例（v1.41.8）：send_user_text 同走 route_with_mirror 的镜像规则——
+    /// local conv 归属 local + 镜像 web 驾驶舱，两端均以 send_user_text 身份
+    /// 送达（不退化成 send_text）；feishu 不镜像。
+    #[tokio::test]
+    async fn user_text_follows_mirror_routing() {
+        let (l, _ltx, l_sent) = mock_opt("local", false, true);
+        let (w, _wtx, w_sent) = mock_opt("web", true, true);
+        let (f, _ftx, f_sent) = mock_opt("feishu", false, true);
+        let m = MultiPlatform::new(vec![l.clone(), w.clone(), f.clone()])
+            .expect("合并 local+web+feishu");
+
+        m.send_user_text(&ConvId("local:work".into()), "hi", &ReplyHint::None)
+            .await
+            .unwrap();
+        assert_eq!(
+            l.user_sent.lock().await.as_slice(),
+            &[("local:work".to_string(), "hi".to_string())],
+            "归属平台照常收到"
+        );
+        assert_eq!(
+            w.user_sent.lock().await.as_slice(),
+            &[("local:work".to_string(), "hi".to_string())],
+            "web 驾驶舱镜像收到（同为 send_user_text）"
+        );
+        assert!(
+            f_sent.lock().await.is_empty() && f.user_sent.lock().await.is_empty(),
+            "feishu 通知渠道不镜像"
+        );
+        assert!(
+            l_sent.lock().await.is_empty() && w_sent.lock().await.is_empty(),
+            "两端均不得退化成 send_text"
+        );
     }
 
     /// 用例 9：镜像投递失败（web 平台 Err）不影响主投递——local conv 的

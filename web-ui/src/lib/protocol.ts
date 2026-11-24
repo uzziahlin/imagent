@@ -85,6 +85,13 @@
 //   会话会被 text 帧处理复活成幽灵条目）。该 conv 有进行中的轮次时网关拒删
 //   回 error{code:"conv_busy"}（SPA toast 引导先 /stop），快照照回把本地先行
 //   移除的条目带回归位。旧网关忽略未知帧 type（前向兼容），删除仅本地生效。
+// - v1.41.8 用户自发文本镜像：text 帧可选 self（boolean）——true = 该文本是
+//   **本用户自己发出**的消息镜像而非 agent 回复（网关把驾驶舱发给本地窗口
+//   的文本回投 `peer:<窗口名>` 会话：驾驶舱在该会话直接打的字、`/to` 的派活
+//   正文）。reducer 按 user 条目入会话（右侧气泡、不计未读），与本机回显同文
+//   则丢弃（消除双显）；缺席/false/非布尔 = 既有 agent 文本语义（旧网关不发
+//   该键、旧 SPA 忽略未知键，双向兼容）。history 条目同名可选 self（落盘
+//   payload 透传）：重放补回为 user 条目，与本机回显按文本计数吸收。
 
 export const PROTOCOL_VERSION = 1;
 
@@ -578,6 +585,11 @@ export type TextFrame = {
    *  一次取值同源，见网关 send_text/log_outbound_text）。旧网关缺席 → SPA
    *  回落本地到达时间（appendEntry 盖 Date.now()，重放去重不命中=退化重复）。 */
   at?: number;
+  /** v1.41.8 可选：true = 该文本是**本用户自己发出**的消息镜像（网关回投
+   *  peer 会话的驾驶舱出站文本），reducer 按 user 条目入会话并与本机回显
+   *  去重。缺席/false/非布尔 = 既有语义（agent 文本）——校验不因该字段拒帧，
+   *  消费侧只认严格的布尔 true。旧网关不发该键。 */
+  self?: boolean;
 };
 
 /** card（新建/sync 重发）与 card_patch（更新）同形，仅 type 不同。 */
@@ -757,9 +769,10 @@ export type ConvWorkdirFrame = {
 /** v1.8 history 帧 entries 元素（与 StreamEntry 对齐的子集）：text 带 at
  *  （网关出站日志的 unix 毫秒）；card 恒为终态快照（state="done"）。key 前缀
  *  `h:` + seq（如 "h:42"）——与实时条目（text:N / card:m:c:msg）及本地恢复
- *  条目（h:text:N）键空间区分。 */
+ *  条目（h:text:N）键空间区分。v1.41.8：text 条目可选 self（落盘 payload
+ *  透传，语义同 TextFrame.self——重放时转 user 条目；非布尔按缺席）。 */
 export type HistoryEntry =
-  | { kind: "text"; key: string; text: string; at: number }
+  | { kind: "text"; key: string; text: string; at: number; self?: boolean }
   | { kind: "card"; key: string; messageId: string; card: CardPayload; state: "done" };
 
 /** v1.8 会话历史重放响应：entries = seq > since 的行（升序，≤500；空数组 =
@@ -1151,7 +1164,16 @@ export function parseFrame(raw: string): InboundFrame | null {
 /** 消息流条目：按到达顺序渲染，三类 + 审批终态记录。user/text 带 at（到达
  *  时间戳，ms epoch，UI 显示 HH:MM；reducer 追加时统一盖戳）。 */
 export type StreamEntry =
-  | { kind: "user"; key: string; text: string; at?: number }
+  | {
+      kind: "user";
+      key: string;
+      text: string;
+      at?: number;
+      /** v1.41.8：true = 该 user 条目由网关的 self 镜像补回（实时帧 / history
+       *  重放），**不是本机回显**——实时去重只认本机回显（send_echo，无此
+       *  标记），否则观看端连续两条同文镜像会被误吞一条。渲染无差异。 */
+      self?: boolean;
+    }
   | { kind: "text"; key: string; text: string; hint?: string; at?: number }
   | { kind: "card"; key: string; messageId: string; card: CardPayload; state: CardFrameState }
   | { kind: "approval_note"; key: string; text: string; message?: string };
@@ -1200,7 +1222,8 @@ export type MachineSpace = {
 export const CONV_TITLE_MAX_CHARS = 24;
 
 /** 消息条目内存护栏：单 conv 超过上限时丢弃最早的本地用户回显（ephemeral）；
- *  服务端条目（text/card）不丢——卡片终态可由 sync 重发兜底。 */
+ *  服务端条目（text/card，及 v1.41.8 镜像补回的带 self 标记 user 条目）不丢
+ *  ——卡片终态可由 sync 重发兜底。 */
 export const MAX_STREAM_ENTRIES = 200;
 
 /** 一次性通知（机器自动切换等）：reducer 产出结构化事件，App 映射文案渲染
@@ -1393,11 +1416,13 @@ function titleSummary(text: string): string | null {
   return s.length > 0 ? s : null;
 }
 
-/** 内存护栏：超上限丢最早的 user 回显；无 user 可丢（纯服务端条目）即停。 */
+/** 内存护栏：超上限丢最早的 user 回显；无 user 可丢（纯服务端条目）即停。
+ *  v1.41.8：镜像补回的 user 条目（带 self 标记）等同服务端条目（网关
+ *  outbound_log 有底，此前即为不丢的 text 条目）——只丢本机回显。 */
 function trimEntries(entries: StreamEntry[]): StreamEntry[] {
   let trimmed = entries;
   while (trimmed.length > MAX_STREAM_ENTRIES) {
-    const i = trimmed.findIndex((e) => e.kind === "user");
+    const i = trimmed.findIndex((e) => e.kind === "user" && e.self !== true);
     if (i === -1) {
       break;
     }
@@ -1667,12 +1692,13 @@ function mergeConvWorkdir(state: AppState, frame: ConvWorkdirFrame): AppState {
   };
 }
 
-/** 重放集末条时间戳：从尾部找最近带 at 的 text（重放条目无 user、card 无 at），
- *  全无则 0（与 historyStore lastAtOfEntries 同语义，UI 展示用）。 */
+/** 重放集末条时间戳：从尾部找最近带 at 的 user/text（card 无 at），全无则 0
+ *  （与 historyStore lastAtOfEntries 同语义，UI 展示用）。v1.41.8 起 self
+ *  条目重放为 user 条目、同样带网关 at，一并参与。 */
 function lastAtOfHistory(entries: StreamEntry[]): number {
   for (let i = entries.length - 1; i >= 0; i--) {
     const e = entries[i];
-    if (e.kind === "text" && typeof e.at === "number") {
+    if ((e.kind === "text" || e.kind === "user") && typeof e.at === "number") {
       return e.at;
     }
   }
@@ -1683,6 +1709,40 @@ function lastAtOfHistory(entries: StreamEntry[]): number {
  *  两次 /help 回显内容相同但时刻不同，必须都保留）；text 与 at 间以 \u0000
  *  分隔防拼接歧义（text="a1"/at=2 与 text="a"/at=12 朴素拼接同串）。 */
 const textAtKey = (text: string, at: number): string => `${text}\u0000${at}`;
+
+// ---- v1.41.8 用户自发文本镜像（text 帧 / history 条目可选 self，见文件头注）----
+
+/** 镜像去重的文本对齐键：网关 dispatch 对出站文本先 trim 再镜像
+ *  （dispatch_peer_message 取 `text.trim()`），本机回显保留用户原样输入——
+ *  首尾带空白/换行的消息两边文本不同源，须按 trim 后对齐。 */
+const mirrorKey = (text: string): string => text.trim();
+
+/** 实时镜像帧的去重窗口（条数）：镜像帧到达时，本机回显就在会话末尾附近
+ *  （发送 → 网关回投，中间至多夹进窗口对上一条的回复）。只看末尾若干条
+ *  而非全量——避免别处的同文旧回显误吞本条（跨设备同文场景）。 */
+const SELF_MIRROR_DEDUPE_TAIL = 5;
+
+/** v1.41.8 self 文本帧 → 用户条目：会话末尾 [`SELF_MIRROR_DEDUPE_TAIL`] 条内
+ *  已有同文的**本机回显**（send_echo，无 self 标记的 user 条目）→ 丢弃这条
+ *  镜像（原 state 返回，消除「peer 会话直接打字双显」）；否则按 user 条目入
+ *  会话（带 self 标记）——与 send_echo 走同一条 appendEntry 路径（盖本地
+ *  时间戳、不计未读、概要/title 照常），即「/to 派活后进入会话看到的是自己
+ *  的气泡」「别的设备可见因果」。镜像补回的条目不算回显：观看端连续两条
+ *  同文镜像各是一条消息，都要保留。 */
+function appendSelfText(state: AppState, machine: string, frame: TextFrame): AppState {
+  const key = mirrorKey(frame.text);
+  const tail =
+    state.spaces[machine]?.convs[frame.convId]?.entries.slice(-SELF_MIRROR_DEDUPE_TAIL) ?? [];
+  if (tail.some((e) => e.kind === "user" && e.self !== true && mirrorKey(e.text) === key)) {
+    return state;
+  }
+  return appendEntry(state, machine, frame.convId, {
+    kind: "user",
+    key: `user:${state.seq + 1}`,
+    text: frame.text,
+    self: true,
+  });
+}
 
 /** v1.8 history 帧（会话历史重放）合并：重放条目**不进** appendEntry 消息流
  *  ——不计未读、不派生本地序号 key（key 即网关 seq 幂等键）。概要
@@ -1696,7 +1756,14 @@ const textAtKey = (text: string, at: number): string => `${text}\u0000${at}`;
  *  （text:N）键空间不相交，同源 at 是唯一可靠对齐凭证；同文本异 at 不算
  *  重复；无 at 的本地条目（旧网关实时帧盖的本地时间、旧缓存形态）无法按此
  *  去重——升级一次性残留（重放后重复一份），可接受。entries 空（仅水位）
- *  reducer 无事可做，高水位由 App 层 lastSeqRef 维护。 */
+ *  reducer 无事可做，高水位由 App 层 lastSeqRef 维护。
+ *
+ *  v1.41.8 self 条目（用户自发文本镜像的落盘行）：重放为 **user 条目**（键
+ *  仍 h:<seq>、时间戳取网关 at），本地每条同文 user 条目（本机回显 / 实时
+ *  收到的镜像）至多吸收一条——回显盖的是本地时间，与网关 at 不同源，
+ *  (text, at) 对齐不了，改按文本计数：计数而非「存在即吸收」，本机 2 条
+ *  回显 + 重放 4 行同文（另 2 行是别的设备发的）须补回 2 条；计数只认合并
+ *  前的本地条目——重放集内的同文行是各自独立的消息，互不吸收。 */
 function mergeHistory(state: AppState, frame: HistoryFrame): AppState {
   if (frame.entries.length === 0) {
     return state;
@@ -1707,7 +1774,7 @@ function mergeHistory(state: AppState, frame: HistoryFrame): AppState {
   const space = spaces[machine];
   const conv = space.convs[frame.convId];
   // trimmed：丢弃本地该 conv 缓存以重放集重建（契约）；否则本地条目保留在前，
-  // 重放增量按 key / card messageId / text (text,at) 去重 append 在后。
+  // 重放增量按 key / card messageId / text (text,at) / self 文本计数 去重 append 在后。
   const local = frame.trimmed ? [] : conv.entries;
   const seenKeys = new Set(local.map((e) => e.key));
   const seenCardIds = new Set(
@@ -1722,12 +1789,37 @@ function mergeHistory(state: AppState, frame: HistoryFrame): AppState {
       )
       .map((e) => textAtKey(e.text, e.at)),
   );
+  // v1.41.8：本地 user 条目按镜像对齐键计数（每条至多吸收一条同文 self 重放；
+  // 只统计合并前的本地条目——重放过程中补回的条目不回填，见循环内注释）。
+  const localUserTexts = new Map<string, number>();
+  for (const e of local) {
+    if (e.kind === "user") {
+      const k = mirrorKey(e.text);
+      localUserTexts.set(k, (localUserTexts.get(k) ?? 0) + 1);
+    }
+  }
   const merged = local.slice();
-  for (const e of replay) {
+  for (const e of frame.entries) {
     if (seenKeys.has(e.key)) {
       continue;
     }
     if (e.kind === "card" && seenCardIds.has(e.messageId)) {
+      continue;
+    }
+    if (e.kind === "text" && e.self === true) {
+      // v1.41.8：本地同文 user 条目每条至多吸收一条；被吸收的不入 merged。
+      const k = mirrorKey(e.text);
+      const n = localUserTexts.get(k) ?? 0;
+      if (n > 0) {
+        localUserTexts.set(k, n - 1);
+        continue;
+      }
+      // 补回为 user 条目（别的设备发的 / 本地缓存已裁剪）：键仍是网关 seq
+      // 幂等键，带 self 标记（非本机回显）。**不**回填计数——同一重放集里
+      // 的后续同文行是另一条消息，须各自补回；补回的条目到下次重放时已是
+      // 本地 user 条目，天然幂等。
+      merged.push({ kind: "user", key: e.key, text: e.text, at: e.at, self: true });
+      seenKeys.add(e.key);
       continue;
     }
     if (e.kind === "text" && typeof e.at === "number" && seenTextAt.has(textAtKey(e.text, e.at))) {
@@ -1878,6 +1970,12 @@ function reduceFrame(state: AppState, frame: InboundFrame): AppState {
     case "error":
       return { ...state, lastError: { code: frame.code, at: Date.now() } };
     case "text":
+      // v1.41.8：self:true = 用户自己发出的消息镜像（peer 通道）→ user 条目 +
+      // 与本机回显去重（见 appendSelfText）；只有严格的布尔 true 才算，
+      // false / 非布尔按缺席走既有 agent text 路径。
+      if (frame.self === true) {
+        return appendSelfText(state, frameMachine(frame), frame);
+      }
       // v1.36：at 为网关落盘同源时间戳（旧网关缺席 → appendEntry 盖本地到达
       // 时间），原样带进条目供 mergeHistory 按 (text, at) 重放去重。
       return appendEntry(state, frameMachine(frame), frame.convId, {

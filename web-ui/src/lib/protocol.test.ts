@@ -3,6 +3,7 @@ import {
   CONV_TITLE_MAX_CHARS,
   DEFAULT_CONV,
   DEFAULT_MACHINE,
+  MAX_STREAM_ENTRIES,
   convDisplayName,
   convTitle,
   deviceSummary,
@@ -2021,6 +2022,323 @@ describe("v1.36 text 帧可选 at（解析校验）", () => {
     expect(parseFrame(T(`,"at":"x"`))).toBeNull();
     expect(parseFrame(T(`,"at":null`))).toBeNull();
     // null ≠ 缺席（JSON 里显式 null 是畸形，与 models.current 的可空语义不同）
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.41.8 text 帧可选 self（用户自发文本镜像，peer 通道）：解析校验 + reducer
+// 用户气泡 / 与本机回显去重 / history 重放补回。背景：网关把用户发给本地
+// 窗口的文本镜像回 `peer:<窗口名>` 会话，此前是普通 text 帧——SPA 渲染成
+// imagent 的发言（「网关复读却没回答」），在 peer 会话直接打字则与本机
+// 回显双显。
+// ---------------------------------------------------------------------------
+
+describe("text 帧可选 self（v1.41.8 用户自发文本镜像）", () => {
+  const PEER = "peer:win-a";
+  /** 网关回投的用户自发文本镜像帧（不带 machine → 归 DEFAULT_MACHINE）。 */
+  const SELF = (text: string, convId = PEER) =>
+    `{"v":1,"type":"text","convId":"${convId}","text":"${text}","at":1700000000000,"self":true}`;
+  const hist = (convId: string, entries: string, lastSeq: number): Action => ({
+    type: "frame",
+    frame: frame(
+      `{"v":1,"type":"history","convId":"${convId}","entries":[${entries}],"lastSeq":${lastSeq},"trimmed":false}`,
+    ),
+  });
+  const selfRow = (seq: number, text: string, at: number) =>
+    `{"kind":"text","key":"h:${seq}","text":"${text}","at":${at},"self":true}`;
+  const textRow = (seq: number, text: string, at: number) =>
+    `{"kind":"text","key":"h:${seq}","text":"${text}","at":${at}}`;
+  /** 会话条目的 [kind, key] 序列（顺序与形态一眼可辨）。 */
+  const shape = (s: AppState, convId = PEER): (string | undefined)[][] =>
+    (convsOf(s)[convId]?.entries ?? []).map((e) => [e.kind, e.key]);
+
+  it("parseFrame：self 为 true / false / 缺席均放行；非 boolean 不拒帧（帧校验不因该字段变化）", () => {
+    expect(parseFrame(SELF("x"))).toMatchObject({ type: "text", self: true });
+    expect(parseFrame(SELF("x").replace(',"self":true', ""))).toMatchObject({ type: "text" });
+    expect(parseFrame(SELF("x").replace('"self":true', '"self":false'))).toMatchObject({
+      type: "text",
+      self: false,
+    });
+    for (const bad of ['"self":"true"', '"self":1', '"self":null', '"self":{}']) {
+      expect(parseFrame(SELF("x").replace('"self":true', bad))).toMatchObject({ type: "text", text: "x" });
+    }
+    // self 不能顶替必填字段：缺 text / convId 照旧拒帧。
+    expect(parseFrame('{"v":1,"type":"text","convId":"peer:win-a","self":true}')).toBeNull();
+  });
+
+  it("reducer：self 文本入为 user 条目（与本地回显同形态、盖本地时间戳、不计未读、概要照常更新）；同帧无 self 仍是 agent text", () => {
+    let s = run(initialState(), { type: "frame", frame: frame(SELF("你目前的待办项有哪些？")) });
+    const conv = convsOf(s)[PEER];
+    expect(shape(s)).toEqual([["user", "user:1"]]);
+    const e = conv?.entries[0];
+    expect(e).toMatchObject({ kind: "user", text: "你目前的待办项有哪些？" });
+    // 本地回显同款盖戳（到达时间，ms epoch）
+    expect(e?.kind === "user" && typeof e.at === "number" && e.at > 0).toBe(true);
+    expect(conv?.unread).toBe(0); // 非当前会话收到用户自发文本不计未读
+    expect(conv?.lastPreview).toBe("你目前的待办项有哪些？");
+    expect(conv?.lastAt).toBeGreaterThan(0);
+    expect(orderOf(s)).toEqual([DEFAULT_CONV, PEER]); // 会话照常收集进侧栏
+
+    // 对照：同一帧去掉 self → 既有 agent text（帧自带 at 原样保留、计未读）。
+    s = run(initialState(), {
+      type: "frame",
+      frame: frame(SELF("你目前的待办项有哪些？").replace(',"self":true', "")),
+    });
+    expect(shape(s)).toEqual([["text", "text:1"]]);
+    expect(convsOf(s)[PEER]?.entries[0]).toMatchObject({ at: 1700000000000 });
+    expect(convsOf(s)[PEER]?.unread).toBe(1);
+  });
+
+  it("reducer：与末尾 5 条内的本机回显同文 → 丢弃镜像帧（peer 会话直接打字不再双显）", () => {
+    // 真机时序：进入 peer 会话打字 → 本机回显（右侧）→ 网关把同一句镜像回来。
+    let s = run(
+      initialState(),
+      { type: "frame", frame: frame(TEXT_FRAME("已建立与窗口「win-a」的会话", PEER)) },
+      { type: "select_conv", convId: PEER },
+      { type: "send_echo", convId: PEER, text: "帮我跑下构建" },
+    );
+    const before = s;
+    s = run(s, { type: "frame", frame: frame(SELF("帮我跑下构建")) });
+    expect(s).toBe(before); // 原引用返回：无新条目、概要/未读/序号均不动
+    expect(shape(s)).toEqual([["text", "text:1"], ["user", "user:2"]]);
+
+    // 连发多条同文：每条镜像都被自己的回显吸收。
+    s = run(s, { type: "send_echo", convId: PEER, text: "继续" }, { type: "send_echo", convId: PEER, text: "继续" });
+    s = run(s, { type: "frame", frame: frame(SELF("继续")) }, { type: "frame", frame: frame(SELF("继续")) });
+    expect(shape(s)).toEqual([["text", "text:1"], ["user", "user:2"], ["user", "user:3"], ["user", "user:4"]]);
+
+    // 非当前会话同样去重，且不点亮未读。
+    let bg = run(initialState(), { type: "send_echo", convId: PEER, text: "后台那句" });
+    const bgBefore = bg;
+    bg = run(bg, { type: "frame", frame: frame(SELF("后台那句")) });
+    expect(bg).toBe(bgBefore);
+    expect(convsOf(bg)[PEER]?.unread).toBe(0);
+  });
+
+  it("reducer：网关镜像的是 trim 后的文本——回显带首尾空白/换行同样去重", () => {
+    // dispatch_peer_message 取 text.trim() 再镜像；本机回显保留用户原样输入。
+    let s = run(initialState(), { type: "send_echo", convId: PEER, text: "  帮我跑下构建\n" });
+    const before = s;
+    s = run(s, { type: "frame", frame: frame(SELF("帮我跑下构建")) });
+    expect(s).toBe(before);
+    expect(convsOf(s)[PEER]?.entries).toHaveLength(1);
+  });
+
+  it("reducer：同文回执已被挤出末尾 5 条 → 不再算本条的回显，镜像照常补回（去重窗口语义）", () => {
+    let s = run(initialState(), { type: "send_echo", convId: PEER, text: "旧的那句" });
+    // 其后挤进 5 条窗口回复（text），回显落到第 6 位之外。
+    for (let i = 1; i <= 5; i++) {
+      s = run(s, { type: "frame", frame: frame(TEXT_FRAME(`回复${i}`, PEER)) });
+    }
+    s = run(s, { type: "frame", frame: frame(SELF("旧的那句")) });
+    expect(shape(s)).toEqual([
+      ["user", "user:1"],
+      ["text", "text:2"],
+      ["text", "text:3"],
+      ["text", "text:4"],
+      ["text", "text:5"],
+      ["text", "text:6"],
+      ["user", "user:7"], // 回显不在窗口内 → 镜像补回
+    ]);
+    // 恰在窗口边界（回显是倒数第 5 条）仍去重。
+    let edge = run(initialState(), { type: "send_echo", convId: PEER, text: "边界" });
+    for (let i = 1; i <= 4; i++) {
+      edge = run(edge, { type: "frame", frame: frame(TEXT_FRAME(`回复${i}`, PEER)) });
+    }
+    const edgeBefore = edge;
+    edge = run(edge, { type: "frame", frame: frame(SELF("边界")) });
+    expect(edge).toBe(edgeBefore);
+  });
+
+  it("reducer：只认 user 条目的同文——窗口回复（agent text）与同文不等价，不影响去重判定", () => {
+    // 会话末尾是窗口的回复「继续」（agent text），没有本机回显：镜像照常入 user 条目。
+    let s = run(initialState(), { type: "frame", frame: frame(TEXT_FRAME("继续", PEER)) });
+    s = run(s, { type: "frame", frame: frame(SELF("继续")) });
+    expect(shape(s)).toEqual([["text", "text:1"], ["user", "user:2"]]);
+  });
+
+  it("reducer：去重只认本机回显——镜像补回的 user 条目（带 self 标记）不吸收后续同文镜像（观看端连发同文不丢）", () => {
+    // 本机回显（send_echo）不带 self 标记。
+    const echo = convsOf(run(initialState(), { type: "send_echo", convId: PEER, text: "继续" }))[PEER]?.entries[0];
+    expect(echo).toMatchObject({ kind: "user", text: "继续" });
+    expect(echo).not.toHaveProperty("self");
+
+    // 观看端（另一台设备）没有本机回显：对端连发两次「继续」，两条镜像各是一条消息。
+    let s = run(
+      initialState(),
+      { type: "frame", frame: frame(SELF("继续")) },
+      { type: "frame", frame: frame(SELF("继续")) },
+    );
+    expect(shape(s)).toEqual([["user", "user:1"], ["user", "user:2"]]);
+    expect(convsOf(s)[PEER]?.entries.every((e) => e.kind === "user" && e.self === true)).toBe(true);
+
+    // 重放补回的条目同理：补回后再到一条同文实时镜像，照常入会话。
+    let r = run(initialState(), hist(PEER, selfRow(1, "继续", 1), 1));
+    r = run(r, { type: "frame", frame: frame(SELF("继续")) });
+    expect(shape(r)).toEqual([["user", "h:1"], ["user", "user:1"]]);
+    expect(convsOf(r)[PEER]?.entries[0]).toMatchObject({ self: true });
+  });
+
+  it("内存护栏：只丢本机回显——镜像补回的 user 条目（self 标记）等同服务端条目，不丢", () => {
+    // 此前镜像是不丢的 text 条目；改成 user 条目后不得因此变成可丢弃对象。
+    const replies: Action[] = Array.from({ length: MAX_STREAM_ENTRIES }, (_, i) => ({
+      type: "frame" as const,
+      frame: frame(TEXT_FRAME(`回复${i}`, PEER)),
+    }));
+    let s = run(
+      initialState(),
+      { type: "frame", frame: frame(SELF("镜像补回的那句")) },
+      { type: "send_echo", convId: PEER, text: "本机回显" },
+      ...replies,
+    );
+    // 共追加 202 条（镜像 1 + 回显 1 + 回复 200）→ 超限丢掉的只能是最早的本机
+    // 回显（镜像保留）：恰丢 1 条，余 201。
+    const after = convsOf(s)[PEER]?.entries ?? [];
+    expect(after).toHaveLength(MAX_STREAM_ENTRIES + 1);
+    expect(after[0]).toMatchObject({ kind: "user", text: "镜像补回的那句", self: true });
+    expect(after.some((e) => e.kind === "user" && e.text === "本机回显")).toBe(false);
+    // 已无本机回显可丢：再进一条不强截断（与纯服务端条目同语义）。
+    s = run(s, { type: "frame", frame: frame(SELF("再来一句")) });
+    const entries = convsOf(s)[PEER]?.entries ?? [];
+    expect(entries).toHaveLength(MAX_STREAM_ENTRIES + 2);
+    expect(entries[entries.length - 1]).toMatchObject({ kind: "user", text: "再来一句", self: true });
+  });
+
+  it("reducer：self 非布尔按缺席 → agent text（既有行为不变）", () => {
+    for (const bad of ['"self":"true"', '"self":1']) {
+      const s = run(initialState(), {
+        type: "frame",
+        frame: frame(SELF("x").replace('"self":true', bad)),
+      });
+      expect(shape(s)).toEqual([["text", "text:1"]]);
+    }
+    const off = run(initialState(), {
+      type: "frame",
+      frame: frame(SELF("x").replace('"self":true', '"self":false')),
+    });
+    expect(shape(off)).toEqual([["text", "text:1"]]);
+  });
+
+  it("reducer：self 帧按 machine 归属机器空间；去重只看同一机器空间内的回显", () => {
+    /** 带 machine=home-mac 的镜像帧（多机模式网关出站帧恒带 machine）。 */
+    const selfOnHomeMac = (text: string) => `${SELF(text).slice(0, -1)},"machine":"home-mac"}`;
+    // 同机器空间：home-mac 上的回显吸收 home-mac 的镜像。
+    const before = run(
+      initialState(),
+      { type: "send_echo", convId: PEER, text: "同一句", machine: "home-mac" },
+    );
+    const same = run(before, { type: "frame", frame: frame(selfOnHomeMac("同一句")) });
+    expect(same).toBe(before);
+    // 跨机器空间：default 机器上的同文回显不吸收 home-mac 机器的镜像。
+    const cross = run(
+      initialState(),
+      { type: "send_echo", convId: PEER, text: "同一句" },
+      { type: "frame", frame: frame(selfOnHomeMac("同一句")) },
+    );
+    expect(shape(cross)).toEqual([["user", "user:1"]]); // default 空间：仅本机回显
+    expect(spaceOf(cross, "home-mac").convs[PEER]?.entries).toMatchObject([
+      { kind: "user", key: "user:2", text: "同一句" },
+    ]);
+    expect(spaceOf(cross, "home-mac").convs[PEER]?.unread).toBe(0);
+  });
+
+  // ---- history 重放（落盘 payload 带 self → history 条目透传 → 刷新/跨设备补回）----
+
+  it("parseFrame history：self 条目布尔 / 缺席 / 非布尔均放行；非布尔按缺席重放为 agent text", () => {
+    const ok = parseFrame(
+      `{"v":1,"type":"history","convId":"${PEER}","entries":[${selfRow(1, "a", 1)},${textRow(2, "b", 2)},{"kind":"text","key":"h:3","text":"c","at":3,"self":"yes"}],"lastSeq":3,"trimmed":false}`,
+    );
+    expect(ok).toMatchObject({ type: "history", lastSeq: 3 });
+    expect((ok as { entries: { self?: unknown }[] }).entries.map((e) => e.self)).toEqual([true, undefined, "yes"]);
+    const s = run(initialState(), {
+      type: "frame",
+      frame: ok as InboundFrame,
+    });
+    expect(shape(s)).toEqual([["user", "h:1"], ["text", "h:2"], ["text", "h:3"]]);
+  });
+
+  it("reducer：history 重放的 self 条目补回为 user 条目（键保 h:<seq>、时间戳取网关 at、不计未读）", () => {
+    const s = run(
+      initialState(),
+      hist(PEER, [selfRow(1, "你目前的待办项有哪些？", 1000), textRow(2, "待办有三项…", 2000), selfRow(3, "继续", 3000)].join(","), 3),
+    );
+    const conv = convsOf(s)[PEER];
+    expect(shape(s)).toEqual([["user", "h:1"], ["text", "h:2"], ["user", "h:3"]]);
+    expect(conv?.entries[0]).toMatchObject({ kind: "user", text: "你目前的待办项有哪些？", at: 1000 });
+    expect(conv?.entries[2]).toMatchObject({ kind: "user", text: "继续", at: 3000 });
+    expect(conv?.unread).toBe(0); // 重放不计未读
+    expect(conv?.lastPreview).toBe("继续"); // 末条概要
+    expect(conv?.lastAt).toBe(3000); // 末条是 self（user）条目：概要时间取其网关 at
+    expect(conv?.title).toBe("你目前的待办项有哪些？"); // 首条（self）定调，与 appendEntry 的 user/text 口径一致
+    expect(spaceOf(s, DEFAULT_MACHINE).convOrder).toEqual([DEFAULT_CONV, PEER]);
+  });
+
+  it("reducer：重放的 self 条目与本地回显同文 → 吸收不重复（回显盖本地时间，与网关 at 不同源）；重复重放幂等", () => {
+    // 场景：peer 会话打字后切走/重连 → history_query 把这条消息的落盘行重放
+    // 回来。本机已有回显，不能再冒出第二个气泡。
+    let s = run(initialState(), { type: "send_echo", convId: PEER, text: "帮我跑下构建" });
+    const before = s;
+    s = run(s, hist(PEER, selfRow(5, "帮我跑下构建", 1700000000000), 5));
+    expect(s).toBe(before); // 原引用返回
+    expect(run(s, hist(PEER, selfRow(5, "帮我跑下构建", 1700000000000), 5))).toBe(s);
+  });
+
+  it("reducer：按文本计数吸收——每条本机回显至多吸收一条同文重放，多出的补回（跨设备同文不丢）", () => {
+    // 本机发过 2 次「继续」，另一台设备也发过 2 次 → 落盘 4 行。
+    let s = run(
+      initialState(),
+      { type: "send_echo", convId: PEER, text: "继续" },
+      { type: "send_echo", convId: PEER, text: "继续" },
+    );
+    s = run(
+      s,
+      hist(PEER, [selfRow(1, "继续", 1), selfRow(2, "继续", 2), selfRow(3, "继续", 3), selfRow(4, "继续", 4)].join(","), 4),
+    );
+    expect(shape(s)).toEqual([["user", "user:1"], ["user", "user:2"], ["user", "h:3"], ["user", "h:4"]]);
+  });
+
+  it("reducer：混合重放——本机回显吸收自己的 self 行、窗口回复按 (text,at) 去重、他机发出的 self 行补回为 user", () => {
+    // 本机时序：回显 → 网关镜像帧（已被去重）→ 窗口回复（实时 text）。
+    let s = run(
+      initialState(),
+      { type: "send_echo", convId: PEER, text: "帮我跑下构建" },
+      { type: "frame", frame: frame(SELF("帮我跑下构建")) },
+      { type: "frame", frame: frame(`{"v":1,"type":"text","convId":"${PEER}","text":"已跑完，构建通过","at":1700000005000}`) },
+    );
+    expect(shape(s)).toEqual([["user", "user:1"], ["text", "text:2"]]);
+    // 重放三行：自己的（吸收）+ 回复（(text,at) 命中）+ 别的设备发的（补回）。
+    s = run(
+      s,
+      hist(
+        PEER,
+        [
+          selfRow(1, "帮我跑下构建", 1700000000000),
+          textRow(2, "已跑完，构建通过", 1700000005000),
+          selfRow(3, "再跑一次测试", 1700000009000),
+        ].join(","),
+        3,
+      ),
+    );
+    expect(shape(s)).toEqual([["user", "user:1"], ["text", "text:2"], ["user", "h:3"]]);
+    // 本地非空：概要不刷（既有语义）。
+    expect(convsOf(s)[PEER]?.lastPreview).toBe("已跑完，构建通过");
+  });
+
+  it("reducer：trimmed 整体替换——本地缓存丢弃，self 条目重建为 user 条目、普通行为 text", () => {
+    const s = run(
+      initialState(),
+      { type: "send_echo", convId: PEER, text: "将被丢弃的本地回显" },
+      {
+        type: "frame",
+        frame: frame(
+          `{"v":1,"type":"history","convId":"${PEER}","entries":[${selfRow(9, "GC 后的历史", 9000)},${textRow(10, "回复", 9500)}],"lastSeq":10,"trimmed":true}`,
+        ),
+      },
+    );
+    expect(shape(s)).toEqual([["user", "h:9"], ["text", "h:10"]]);
+    const conv = convsOf(s)[PEER];
+    expect(conv?.lastPreview).toBe("回复");
+    expect(conv?.lastAt).toBe(9500);
   });
 });
 

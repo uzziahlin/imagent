@@ -9,11 +9,16 @@
 //! 需跟进本模块薄适配。
 //!
 //! 模块分四块（均在本文件）：
-//! - 帧纯函数（envelope 构造/剥离/转义、user 帧/receipt 组帧、注册条目 JSON）；
+//! - 帧纯函数（envelope 构造/剥离/转义、user 帧组帧、注册条目 JSON）；
 //! - [`PeerRegistry`]：注册表扫描 / socket 探活 / 注册注销 / 孤儿清理；
 //! - [`PeerSender`]：出站句柄（dispatch 持有——`peer:` 会话文本与 `/to` 命令
 //!   按窗口名投递）；
-//! - [`PeerServer`]：UDS server（收帧 → 回 receipt → 回调 dispatch 直投驾驶舱）。
+//! - [`PeerServer`]：UDS server（收帧 → 回调 dispatch 直投驾驶舱）。
+//!
+//! 入站握手纪律（v1.41.8，硬约束——**不要补回执**）：[`PeerServer`] 收到 user 帧
+//! 后**不向入站连接写任何字节**，读到对端 EOF 才关闭连接。在入站连接上回写
+//! 数据会让 Claude Code 发送方把这次 SendMessage 判为失败；实证与「不反连
+//! 回执」的理由见 [`handle_conn`]。
 //!
 //! 路径纪律（硬要求）：注册表目录与 socket 路径**一律注入**（[`PeerServerConfig`]
 //! / [`PeerSender::new`] 入参），生产由 main 经 [`default_registry_dir`] +
@@ -103,6 +108,10 @@ pub fn default_registry_dir() -> Option<PathBuf> {
 /// `messagingSocketPath` 取 dirname（claude 自家 socket 所在目录——co-locate
 /// 才能收到 claude 的投递回执；网关注册条目的 socket 也放这里）；无条目回退
 /// `$XDG_RUNTIME_DIR/cc-socks`，再回退 `/tmp/cc-socks`。
+///
+/// 这里的「回执」指 claude 对**网关出站投递**的送达/暂存回执：按参考实现，
+/// 它是 claude 反向连接网关 socket 送来的 control 帧（[`handle_conn`] 忽略
+/// 之）——与「入站连接不回写」是两个方向，不矛盾。
 async fn discover_socks_dir(registry_dir: &Path) -> PathBuf {
     for entry in PeerRegistry::new(registry_dir.to_path_buf()).scan() {
         if entry.sock.ends_with(".sock") {
@@ -311,23 +320,6 @@ pub fn build_user_frame_json(from_sock: &str, content: &str) -> String {
     .to_string()
 }
 
-/// 投递回执组帧（收 user 帧后**必须**回写同一连接——claude 发送方 5s 预算内
-/// 等回执；`from` = 本网关 peer 名）：
-/// `{"msgV":1,…,"type":"control","action":"peer_message_status",
-///   "status":"delivered","from":<名>,"orig_msg_id":<原 msg_id>}`。
-pub fn build_receipt_json(from_name: &str, orig_msg_id: &str) -> String {
-    serde_json::json!({
-        "msgV": 1,
-        "msg_id": uuid::Uuid::new_v4().to_string(),
-        "type": "control",
-        "action": "peer_message_status",
-        "status": "delivered",
-        "from": from_name,
-        "orig_msg_id": orig_msg_id,
-    })
-    .to_string()
-}
-
 /// 网关注册条目 JSON（字段与 claude 契约同名同形态；`procStart` 取自
 /// `ps -o lstart=`，取不到则缺席——JSON.stringify undefined 同语义）。
 fn registry_entry_json(
@@ -442,7 +434,7 @@ pub async fn socket_live(sock: &str) -> bool {
 }
 
 /// 出站单帧投递：connect 目标 socket → 写 JSON 行 → 半关闭写 → 读到对端关闭
-/// （对端回 receipt 后关闭即完成握手；回执内容不解析——信息性）。
+/// （对端写来的字节一律丢弃、不解析——握手的完成信号只是「对端关闭」）。
 /// 总预算 [`SEND_TIMEOUT`]（对齐 claude 发送方等待对端关闭的 5s 超时）。
 pub async fn send_frame(sock_path: &str, line: &str) -> Result<(), CoreError> {
     #[cfg(unix)]
@@ -469,7 +461,8 @@ pub async fn send_frame(sock_path: &str, line: &str) -> Result<(), CoreError> {
             conn.write_all(b"\n").await?;
             conn.flush().await?;
             // 半关闭写（claude 窗口按「写完即 shutdown-write」语义收帧）；随后
-            // 消费回执到对端关闭——对端不关（异常实现）由外层超时兜底。
+            // 读到对端关闭——对端写来的字节丢弃不解析；对端不关（异常实现）
+            // 由外层超时兜底。
             conn.shutdown().await?;
             let mut sink = Vec::new();
             let _ = conn.read_to_end(&mut sink).await;
@@ -777,7 +770,8 @@ pub type PeerInboundCallback =
 pub struct PeerServerConfig {
     /// 注册表目录（`~/.claude/sessions`；测试注入 tempdir）。
     pub registry_dir: PathBuf,
-    /// 本网关 peer 名（窗口侧看到的对端名 / 驾驶舱回执 from）。
+    /// 本网关 peer 名（注册条目 `name`——窗口侧看到的对端名；出站帧 envelope
+    /// 的 from-name 同用它）。
     pub name: String,
     /// 注册条目 cwd（config.default_workdir）。
     pub cwd: PathBuf,
@@ -873,7 +867,6 @@ impl PeerServer {
         });
         let task_cleanup = cleanup.clone();
         let task_registry = registry.clone();
-        let task_name = config.name.clone();
         let on_user = config.on_user.clone();
         let shutdown = config.shutdown.clone();
         let task = tokio::spawn(async move {
@@ -883,7 +876,7 @@ impl PeerServer {
                     _ = shutdown.cancelled() => break,
                     accepted = listener.accept() => match accepted {
                         Ok((conn, _addr)) => {
-                            handle_conn(conn, task_registry.clone(), task_name.clone(), on_user.clone());
+                            handle_conn(conn, task_registry.clone(), on_user.clone());
                         }
                         Err(e) => {
                             warn!(target: "imagent::core", error = %e, "peer socket accept 失败（退避后继续）");
@@ -947,21 +940,41 @@ impl PeerServer {
     }
 }
 
-/// 单连接处理：JSON 行循环（1MiB 行上限，超限跳行）→ user 帧回 receipt +
-/// spawn 回调；对端半关闭（EOF）后 drop 连接（跟随关闭——claude 发送方等
-/// 对端全关闭才 resolve，参考实现 bindSocket 的 allowHalfOpen:false 语义）。
+/// 单连接处理：JSON 行循环（1MiB 行上限，超限跳行）→ user 帧解析窗口名 →
+/// spawn 回调；读到对端 EOF 后 drop 连接（跟随关闭——claude 发送方等对端全
+/// 关闭才 resolve，参考实现 bindSocket 的 allowHalfOpen:false 语义）。
+///
+/// **全程不向入站连接写任何字节**。这是协议硬约束而非省略，不要「补回执」：
+///
+/// Claude Code 的发送方（2.1.310 实测）写完帧、半关闭后，只等对端**不回任何
+/// 数据并关闭连接**；对端只要回了数据，发送方就判失败
+/// （`{"success":false,"message":"Failed to send to <网关名>."}`）。
+/// v1.41.0–v1.41.7 在这里回写一行 receipt（`type:control` /
+/// `action:peer_message_status` / `status:delivered`）：网关每条都收到，窗口侧
+/// SendMessage 却每次报 Failed → 窗口的 claude 以为没送到而重发（真机上同一
+/// 问题出现连续两条回复），进而认定回程链路不通、改在自己终端里答题。
+///
+/// 对照实验（2026-11-24，真实 `claude --bg` 会话作发送方，同一时刻、只变
+/// 接收方一个条件）：
+/// - 接收方在入站连接上写一行 receipt 再关闭 →
+///   `{"success":false,"message":"Failed to send to exp-sameack."}`
+/// - 接收方什么都不写、直接关闭 → `{"success":true,…,"msg_id":…}`
+///
+/// 也不做「反连回执」（反过来连接发送方 socket 送 `peer_message_status`）：
+/// 实测发送方会因此多出一条「[Cross-session delivery notice] approved and
+/// released」并**多跑一轮**。网关不回执即成功，也不给窗口会话添多余的轮次。
+///
+/// 「不回任何字节」对入站的每种帧都成立：control 等非 user 帧一律忽略，同样
+/// 不回写。发送方发帧前还会先开一条连接、不写数据、立刻关闭（探活）——
+/// 「无数据即 EOF」的连接走同一条路直接退出。回归钉：
+/// `server_inbound_silent_close_matches_real_sender`。
 #[cfg(unix)]
-fn handle_conn(
-    conn: tokio::net::UnixStream,
-    registry: PeerRegistry,
-    own_name: String,
-    on_user: PeerInboundCallback,
-) {
+fn handle_conn(conn: tokio::net::UnixStream, registry: PeerRegistry, on_user: PeerInboundCallback) {
     tokio::spawn(async move {
         use crate::lineio::read_line_capped;
-        use tokio::io::{AsyncWriteExt, BufReader};
-        let (reader, mut writer) = tokio::io::split(conn);
-        let mut lines = BufReader::new(reader);
+        use tokio::io::BufReader;
+        // 只有读端、没有写端——本连接上永不写数据（见函数注释）。
+        let mut lines = BufReader::new(conn);
         loop {
             match read_line_capped(&mut lines, MAX_LINE_BYTES).await {
                 Ok(Some(raw)) => {
@@ -977,14 +990,6 @@ fn handle_conn(
                     else {
                         continue; // control 等其它类型忽略
                     };
-                    // 回执先行（对端 5s 预算）——写失败即断开。
-                    let receipt = build_receipt_json(&own_name, &msg_id);
-                    if writer.write_all(receipt.as_bytes()).await.is_err()
-                        || writer.write_all(b"\n").await.is_err()
-                        || writer.flush().await.is_err()
-                    {
-                        break;
-                    }
                     // 剥 envelope → 正文；窗口名三级解析：注册表 sock 反查 →
                     // envelope from-name → sock 文件名（再兜底 "unknown"）。
                     let stripped = strip_envelope(&content);
@@ -998,8 +1003,9 @@ fn handle_conn(
                     debug!(
                         target: "imagent::core",
                         window = %window,
+                        msg_id = %msg_id,
                         bytes = stripped.body.len(),
-                        "peer 入站 user 帧（已回 receipt）"
+                        "peer 入站 user 帧（不回写；对端 EOF 后关闭）"
                     );
                     let cb = on_user.clone();
                     let body = stripped.body;
@@ -1007,7 +1013,7 @@ fn handle_conn(
                     // 连接读循环（多帧连接不被单回调拖住）。
                     tokio::spawn(async move { cb(window, body).await });
                 }
-                Ok(None) => break, // 对端半关闭：跳出后 drop 两半 → 全关闭
+                Ok(None) => break, // 对端 EOF（半关闭）：跳出后 drop 连接 → 全关闭
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
                     continue; // 超长行已整体丢弃（1MiB 上限），下一行干净恢复
                 }
@@ -1167,18 +1173,6 @@ mod tests {
     }
 
     #[test]
-    fn receipt_json_shape() {
-        let line = build_receipt_json("im-agent", "orig-1");
-        let v: serde_json::Value = serde_json::from_str(&line).expect("valid json");
-        assert_eq!(v["msgV"], 1);
-        assert_eq!(v["type"], "control");
-        assert_eq!(v["action"], "peer_message_status");
-        assert_eq!(v["status"], "delivered");
-        assert_eq!(v["from"], "im-agent");
-        assert_eq!(v["orig_msg_id"], "orig-1");
-    }
-
-    #[test]
     fn registry_entry_json_fields() {
         let line = registry_entry_json(
             42,
@@ -1272,19 +1266,17 @@ mod tests {
             let fh = frames.clone();
             let task = tokio::spawn(async move {
                 loop {
-                    let Ok((conn, _)) = listener.accept().await else {
+                    let Ok((mut conn, _)) = listener.accept().await else {
                         break;
                     };
                     let fh = fh.clone();
                     tokio::spawn(async move {
+                        use tokio::io::AsyncReadExt;
                         let mut line = String::new();
-                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                        let (mut r, mut w) = conn.into_split();
-                        // 收一行帧（窗口侧实现按行读；回执不消费——测试只看帧）。
                         let mut buf = vec![0u8; 65536];
-                        // 循环读到出现 \n（单帧即可）。
+                        // 循环读到出现 \n（单帧即可；窗口侧实现按行读）。
                         loop {
-                            match r.read(&mut buf).await {
+                            match conn.read(&mut buf).await {
                                 Ok(0) | Err(_) => break,
                                 Ok(n) => {
                                     line.push_str(&String::from_utf8_lossy(&buf[..n]));
@@ -1297,19 +1289,9 @@ mod tests {
                         if !line.trim().is_empty() {
                             fh.lock().unwrap().push(line.trim().to_string());
                         }
-                        // 按协议回 receipt 再关闭（跟随半关闭）。
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
-                            if v["type"] == "user" {
-                                let receipt = serde_json::json!({
-                                    "msgV": 1, "msg_id": "r1", "type": "control",
-                                    "action": "peer_message_status", "status": "delivered",
-                                    "orig_msg_id": v["msg_id"],
-                                });
-                                let _ = w.write_all(format!("{receipt}\n").as_bytes()).await;
-                                let _ = w.flush().await;
-                            }
-                        }
-                        let _ = w.shutdown().await;
+                        // 真实窗口的行为（v1.41.8 实证）：收帧后不回写任何字节，
+                        // 直接关闭——conn 随作用域结束 drop，对端（网关
+                        // send_frame）读到 EOF 即送达。见 handle_conn 注释。
                     });
                 }
             });
@@ -1357,7 +1339,7 @@ mod tests {
         .expect("server start");
         let gw_sock = server.sender().own_sock().to_string_lossy().into_owned();
 
-        // ---- 窗口 → 网关：发一帧，断言 receipt + 回调 conv 名与正文 ----
+        // ---- 窗口 → 网关：发一帧 → 半关闭，断言「0 字节 + EOF」+ 回调窗口名与正文 ----
         // 帧的 from 字段须指向窗口真实 sock（注册表反查依据）——直接用窗口
         // sock 路径组帧（build_user_frame_json 的 from 参即 sock 路径）。
         let content = build_envelope("uds:mock-window", "窗口A", "帮我看看构建");
@@ -1369,20 +1351,18 @@ mod tests {
         conn.write_all(frame.as_bytes()).await.unwrap();
         conn.write_all(b"\n").await.unwrap();
         conn.shutdown().await.unwrap();
-        // 读到 EOF（网关回 receipt 后跟随关闭——协议硬约束）。
+        // 读到 EOF：网关**不回写任何字节**、对端半关闭后跟随关闭（协议硬约束
+        // ——回写数据会让 Claude Code 发送方判失败，见 handle_conn）。
         let mut resp = Vec::new();
-        let _ = tokio::time::timeout(Duration::from_secs(5), conn.read_to_end(&mut resp))
+        let n = tokio::time::timeout(Duration::from_secs(5), conn.read_to_end(&mut resp))
             .await
-            .expect("receipt within budget");
-        let resp = String::from_utf8_lossy(&resp);
-        let receipt_line = resp.lines().next().expect("receipt line");
-        let rv: serde_json::Value = serde_json::from_str(receipt_line).expect("receipt json");
-        assert_eq!(rv["type"], "control");
-        assert_eq!(rv["action"], "peer_message_status");
-        assert_eq!(rv["status"], "delivered");
-        assert_eq!(rv["from"], "im-agent");
-        let frame_v: serde_json::Value = serde_json::from_str(&frame).unwrap();
-        assert_eq!(rv["orig_msg_id"], frame_v["msg_id"]);
+            .expect("网关应在发送方 5s 预算内关闭连接")
+            .expect("read_to_end");
+        assert!(
+            n == 0 && resp.is_empty(),
+            "网关不得在入站连接上回写任何字节：{:?}",
+            String::from_utf8_lossy(&resp)
+        );
         // 回调：窗口名按注册表反查（messagingSocketPath == frame.from 剥 uds:），
         // 正文为剥 envelope 后原文。
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -1435,6 +1415,138 @@ mod tests {
             "网关注册条目已删"
         );
         assert!(!Path::new(&gw_sock).exists(), "网关 socket 已 unlink");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 回归钉（v1.41.8）：按真实 Claude Code 发送方（2.1.310 实测）的时序走一遍
+    /// SendMessage——① 先开一条连接、不写数据、立刻关闭（探活）；② 另开一条
+    /// 连接写 user 帧、半关闭。网关必须：回调恰好一次、两条连接上都不回任何
+    /// 字节、都在对端半关闭后及时关闭（发送方只认「0 字节 + 对端关闭」为送达
+    /// ——见 [`handle_conn`]。v1.41.0–v1.41.7 在入站连接回写 receipt，窗口侧
+    /// SendMessage 每次被判 Failed 并重发）。
+    #[tokio::test]
+    async fn server_inbound_silent_close_matches_real_sender() {
+        let tmp = tmp_dir("silent");
+        let registry_dir = tmp.join("r");
+        let sock_dir = tmp.join("s");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        std::fs::create_dir_all(&sock_dir).unwrap();
+        // 发送方窗口的注册条目（真实发送方的 from 指向它自己已注册的 sock）。
+        // sock 落在本用例自己的目录：server 的 socket 目录发现取「既有条目 sock
+        // 的 dirname」——空注册表会回退到 /tmp/cc-socks/<pid>.sock，与同进程里
+        // 其它走回退的用例绑到同一路径而互踩。
+        let sender_sock = sock_dir.join("9001.sock");
+        write_entry(&registry_dir, 9001, "probe-window", &sender_sock, "claude");
+        let got: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(Vec::new()));
+        let got_cb = got.clone();
+        let server = PeerServer::start(PeerServerConfig {
+            registry_dir: registry_dir.clone(),
+            name: "im-agent".to_string(),
+            cwd: tmp.clone(),
+            shutdown: CancellationToken::new(),
+            on_user: Arc::new(move |w, b| {
+                let g = got_cb.clone();
+                Box::pin(async move { g.lock().unwrap().push((w, b)) })
+            }),
+        })
+        .await
+        .expect("server start");
+        let gw_sock = server.sender().own_sock().to_string_lossy().into_owned();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // ① 探活：连上、不写任何数据就关闭。真实发送方是直接 close；这里用半
+        //    关闭写端代替——网关读侧看到的同样是「无数据即 EOF」，而测试端因此
+        //    还能读到网关有没有回写。
+        let mut probe = tokio::net::UnixStream::connect(&gw_sock)
+            .await
+            .expect("connect gw (probe)");
+        probe.shutdown().await.expect("probe shutdown");
+
+        // ② 发帧连接：不等探活连接收尾就开（真实发送方也不等），写 user 帧后
+        //    半关闭。窗口名走注册表反查（envelope 的 from-name 故意写成别的
+        //    名字——反查命中优先）。
+        let sender = sender_sock.to_string_lossy().into_owned();
+        let content = build_envelope(&format!("uds:{sender}"), "alias-name", "回程正文");
+        let frame = build_user_frame_json(&sender, &content);
+        let mut conn = tokio::net::UnixStream::connect(&gw_sock)
+            .await
+            .expect("connect gw (frame)");
+        conn.write_all(frame.as_bytes()).await.unwrap();
+        conn.write_all(b"\n").await.unwrap();
+        conn.shutdown().await.expect("frame conn shutdown");
+
+        // 两条连接都读到 EOF 且 0 字节；预算 = 发送方的 5s（超了发送方即报
+        // Failed to send）。
+        let (mut probe_sink, mut conn_sink) = (Vec::new(), Vec::new());
+        let probe_n = tokio::time::timeout(SEND_TIMEOUT, probe.read_to_end(&mut probe_sink))
+            .await
+            .expect("探活连接：网关应在发送方预算内关闭")
+            .expect("probe read_to_end");
+        assert!(
+            probe_n == 0 && probe_sink.is_empty(),
+            "探活连接不得收到任何字节：{:?}",
+            String::from_utf8_lossy(&probe_sink)
+        );
+        let conn_n = tokio::time::timeout(SEND_TIMEOUT, conn.read_to_end(&mut conn_sink))
+            .await
+            .expect("发帧连接：网关应在发送方预算内关闭")
+            .expect("conn read_to_end");
+        assert!(
+            conn_n == 0 && conn_sink.is_empty(),
+            "发帧连接不得收到任何字节：{:?}",
+            String::from_utf8_lossy(&conn_sink)
+        );
+
+        // 回调恰好一次：窗口名（注册表反查，优先于 envelope from-name）+ 剥
+        // envelope 正文。
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while got.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // 再留一小段静默期：探活连接与连接收尾都不得补出第二次回调。
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        {
+            let got_all = got.lock().unwrap();
+            assert_eq!(
+                got_all.as_slice(),
+                &[("probe-window".to_string(), "回程正文".to_string())],
+                "回调恰好一次，且 (窗口名, 正文) 正确"
+            );
+        } // guard 块内结束——不跨 shutdown await（await_holding_lock）
+        server.shutdown().await;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 出站方向的握手只看「对端是否关闭」：对端在关闭前回了数据，`send_frame`
+    /// 照样成功（对端字节丢弃、不解析）。与入站纪律（永不回写）是两回事——
+    /// 这里网关是发送方；「对端回数据即失败」是 Claude Code 发送方的规则。
+    #[tokio::test]
+    async fn send_frame_tolerates_bytes_written_by_peer() {
+        let tmp = tmp_dir("tolerate");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let sock = tmp.join("1.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).expect("peer bind");
+        let peer = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut c, _) = listener.accept().await.unwrap();
+            let mut frame = Vec::new();
+            c.read_to_end(&mut frame).await.unwrap();
+            // 关闭前回写一行数据（会回写的对端实现）。
+            c.write_all(b"{\"type\":\"control\"}\n").await.unwrap();
+            c.shutdown().await.unwrap();
+            frame
+        });
+        let line = build_user_frame_json("/tmp/cc-socks/9.sock", "hi");
+        tokio::time::timeout(SEND_TIMEOUT, send_frame(&sock.to_string_lossy(), &line))
+            .await
+            .expect("within budget")
+            .expect("对端回写数据不应使出站投递失败");
+        let frame = peer.await.unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&frame),
+            format!("{line}\n"),
+            "对端收到完整帧"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

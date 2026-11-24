@@ -78,6 +78,10 @@ type ErrorsHandle = Arc<TokioMutex<Vec<(String, String)>>>;
 /// v1.41.1：send_text 的 (conv, text) 记录句柄——peer 建立会话欢迎文本落
 /// `peer:` conv 的归属断言用。
 type SentHandle = Arc<TokioMutex<Vec<(String, String)>>>;
+/// v1.41.8：send_user_text 的 (conv, text) 记录句柄——peer 通道用户自发文本
+/// 镜像的路径断言用（与 `SentHandle` 分表：镜像必须走 send_user_text 而非
+/// send_text，系统提示 / 窗口回复则相反）。
+type UserSentHandle = Arc<TokioMutex<Vec<(String, String)>>>;
 type CounterHandle = Arc<AtomicUsize>;
 type CallsHandle = Arc<TokioMutex<Vec<Option<String>>>>;
 type PromptsHandle = Arc<TokioMutex<Vec<String>>>;
@@ -109,6 +113,10 @@ struct MockPlatform {
     errors: Arc<TokioMutex<Vec<(String, String)>>>,
     /// v1.41.1：send_text 的 (conv, text) 全记录（inbox 只记文本不记 conv）。
     sent: Arc<TokioMutex<Vec<(String, String)>>>,
+    /// v1.41.8：send_user_text 的 (conv, text) 全记录（**不进 `sent`**——
+    /// 与 send_text 可辨；文本照记 inbox，send_count 照加，与 trait default
+    /// 委托 send_text 的 IM 平台观感一致）。
+    user_sent: Arc<TokioMutex<Vec<(String, String)>>>,
 }
 
 impl MockPlatform {
@@ -125,17 +133,27 @@ impl MockPlatform {
             resolve_gate: None,
             errors: Arc::new(TokioMutex::new(Vec::new())),
             sent: Arc::new(TokioMutex::new(Vec::new())),
+            user_sent: Arc::new(TokioMutex::new(Vec::new())),
         };
         (p, inbox, send_count)
     }
 
     /// v1.41：peer 测试变体——额外返回 error 帧与 send_text (conv, text)
-    /// 记录句柄（struct move 进 Arc<dyn Platform> 前取走）。
-    fn new_with_errors() -> (Self, InboxHandle, CounterHandle, ErrorsHandle, SentHandle) {
+    /// 记录句柄（struct move 进 Arc<dyn Platform> 前取走）。v1.41.8 追加
+    /// send_user_text 记录句柄。
+    fn new_with_errors() -> (
+        Self,
+        InboxHandle,
+        CounterHandle,
+        ErrorsHandle,
+        SentHandle,
+        UserSentHandle,
+    ) {
         let (p, inbox, count) = Self::new();
         let errors = p.errors.clone();
         let sent = p.sent.clone();
-        (p, inbox, count, errors, sent)
+        let user_sent = p.user_sent.clone();
+        (p, inbox, count, errors, sent, user_sent)
     }
 
     /// Wave B-2：支持加急的变体（supports_urgent_text = true）。
@@ -227,6 +245,17 @@ impl Platform for MockPlatform {
     }
     async fn send_text(&self, conv: &ConvId, text: &str, _hint: &ReplyHint) -> Result<()> {
         self.sent
+            .lock()
+            .await
+            .push((conv.0.clone(), text.to_string()));
+        self.inbox.lock().await.push(text.to_string());
+        self.send_count.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    /// v1.41.8：用户自发文本镜像单独记录（不进 `sent`——路径断言据此区分
+    /// send_user_text 与 send_text；inbox / send_count 副作用与 send_text 同）。
+    async fn send_user_text(&self, conv: &ConvId, text: &str, _hint: &ReplyHint) -> Result<()> {
+        self.user_sent
             .lock()
             .await
             .push((conv.0.clone(), text.to_string()));
@@ -9176,13 +9205,13 @@ async fn wait_round_finish_aborts_on_timeout() {
 
 // ---------- v1.41 peer 通道（网关伪装 Claude Code peer）----------
 //
-// mock 本地窗口（bind socket + 注册条目 + 收帧回执）+ 出站路由 / /to（含
+// mock 本地窗口（bind socket + 注册条目 + 收帧即关、不回写）+ 出站路由 / /to（含
 // v1.41.1 无正文建立会话）/ /peers / 入站直投 / 未启用提示 / error 帧等用例。
 // 路径用 /tmp 短根（Unix socket 有
 // SUN_LEN ≈104 字节上限，macOS 默认 temp_dir 前缀过长）；dispatcher 自建
 //（PeerSender 注入 + MockPlatform error 记录句柄，不动既有 Ctx 基建）。
 
-use crate::peer::{build_receipt_json, strip_envelope, PeerSender, CONV_PREFIX};
+use crate::peer::{strip_envelope, PeerSender, CONV_PREFIX};
 
 /// peer 测试观测句柄组（dispatcher 自建——Ctx 不含 error 帧记录）。
 struct PeerCtx {
@@ -9192,13 +9221,16 @@ struct PeerCtx {
     errors: Arc<TokioMutex<Vec<(String, String)>>>,
     /// send_text 的 (conv, text) 全记录（欢迎文本落 peer: conv 的归属断言）。
     sent: SentHandle,
+    /// v1.41.8：send_user_text 的 (conv, text) 全记录（用户自发文本镜像的
+    /// 路径断言——与 `sent` 分表）。
+    user_sent: UserSentHandle,
 }
 
 /// 自建带观测句柄的 dispatcher（MockPlatform::new_with_errors 供 error 帧
 /// 记录；store 用临时库，SERIAL 由各用例持有）。
 async fn build_peer_ctx() -> PeerCtx {
     let _ = std::fs::create_dir_all("/tmp/imagent-test-ws");
-    let (plat, inbox, _send_count, errors, sent) = MockPlatform::new_with_errors();
+    let (plat, inbox, _send_count, errors, sent, user_sent) = MockPlatform::new_with_errors();
     let (back, calls, _prompts, _order) = MockBackend::new();
     let (store, _db) = tmp_store().await;
     let auth = Auth::new(vec!["u1".into()]);
@@ -9221,6 +9253,7 @@ async fn build_peer_ctx() -> PeerCtx {
         calls,
         errors,
         sent,
+        user_sent,
     }
 }
 
@@ -9235,7 +9268,8 @@ struct PeerMockWindow {
 }
 
 /// 起 mock 窗口：写注册条目（entrypoint=claude）+ bind socket + accept 循环
-/// （收一帧记一行 → 回 receipt → 关闭——网关 send_frame 读到对端关闭才返回）。
+/// （收一帧记一行 → 不回写任何字节、直接关闭——网关 send_frame 读到对端关闭
+/// 才返回，「关闭」本身即送达信号）。
 async fn peer_mock_window(name: &str) -> PeerMockWindow {
     let seq = PEER_TMP_SEQ.fetch_add(1, Ordering::SeqCst);
     let nanos = std::time::SystemTime::now()
@@ -9275,17 +9309,16 @@ async fn peer_mock_window(name: &str) -> PeerMockWindow {
     let fh = frames.clone();
     let task = tokio::spawn(async move {
         loop {
-            let Ok((conn, _)) = listener.accept().await else {
+            let Ok((mut conn, _)) = listener.accept().await else {
                 break;
             };
             let fh = fh.clone();
             tokio::spawn(async move {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                use tokio::io::AsyncReadExt;
                 let mut line = String::new();
                 let mut buf = vec![0u8; 65536];
-                let (mut r, mut w) = conn.into_split();
                 loop {
-                    match r.read(&mut buf).await {
+                    match conn.read(&mut buf).await {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
                             line.push_str(&String::from_utf8_lossy(&buf[..n]));
@@ -9299,17 +9332,11 @@ async fn peer_mock_window(name: &str) -> PeerMockWindow {
                 if line.is_empty() {
                     return;
                 }
-                fh.lock().await.push(line.clone());
-                // 回 receipt 再关（对端 send_frame 在 read_to_end 等关闭）。
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                    if v["type"] == "user" {
-                        let receipt =
-                            build_receipt_json("mock-window", v["msg_id"].as_str().unwrap_or("x"));
-                        let _ = w.write_all(format!("{receipt}\n").as_bytes()).await;
-                        let _ = w.flush().await;
-                    }
-                }
-                let _ = w.shutdown().await;
+                fh.lock().await.push(line);
+                // 真实窗口的行为（v1.41.8 实证）：收帧后**不回写任何字节**，直接
+                // 关闭——conn 随作用域结束 drop，网关 send_frame 读到 EOF 即送达。
+                // 在入站连接上回写数据会让 Claude Code 发送方判失败（见
+                // peer::handle_conn 注释），mock 不得示范这种写法。
             });
         }
     });
@@ -9334,8 +9361,9 @@ impl PeerMockWindow {
     }
 }
 
-/// peer: 会话文本：出站投递到窗口（envelope 正确）+ 不进 agent + send_text
-/// 链路回显落 conv。
+/// peer: 会话文本：出站投递到窗口（envelope 正确）+ 不进 agent + 镜像经
+/// **send_user_text** 落 peer conv（v1.41.8：用户自发文本，SPA 按用户气泡
+/// 渲染并与本机回显去重——不得走 send_text）。
 #[tokio::test]
 async fn peer_conv_text_routes_to_window_without_agent() {
     let _g = SERIAL.lock().await;
@@ -9365,17 +9393,27 @@ async fn peer_conv_text_routes_to_window_without_agent() {
     let stripped = strip_envelope(v["message"]["content"].as_str().unwrap());
     assert_eq!(stripped.body, "帮我跑下构建");
     assert_eq!(stripped.from_name.as_deref(), Some("im-agent"));
-    // send_text 链路回显（落 outbound_log 的驾驶舱侧副本）。
+    // v1.41.8：镜像经 send_user_text 落 peer: conv（outbound_log 的驾驶舱侧
+    // 副本仍是用户自己的话）；send_text 不得出现 peer: conv 的落点。
+    assert_eq!(
+        ctx.user_sent.lock().await.as_slice(),
+        &[("peer:win-a".to_string(), "帮我跑下构建".to_string())],
+        "peer 会话文本的镜像应经 send_user_text 落 peer: conv"
+    );
     assert!(
-        ctx.inbox.lock().await.iter().any(|t| t == "帮我跑下构建"),
-        "inbox 应含 peer conv 回显：{:?}",
-        *ctx.inbox.lock().await
+        !ctx.sent
+            .lock()
+            .await
+            .iter()
+            .any(|(c, _)| c.starts_with(CONV_PREFIX)),
+        "镜像不得走 send_text（会被渲染成 agent 气泡）：{:?}",
+        *ctx.sent.lock().await
     );
     let _ = std::fs::remove_dir_all(&win.base);
 }
 
 /// peer: 会话指向不在线窗口：agent 不进、error 帧回 SPA（peer_unreachable）、
-/// 回显照常落 conv。
+/// 镜像照常经 send_user_text 落 conv。
 #[tokio::test]
 async fn peer_conv_unreachable_returns_error_note() {
     let _g = SERIAL.lock().await;
@@ -9399,9 +9437,17 @@ async fn peer_conv_unreachable_returns_error_note() {
         errors[0].1.contains("ghost"),
         "message 应含窗口名：{errors:?}"
     );
+    drop(errors);
+    // 窗口不可达不影响镜像落库（历史记录语义），同样走 send_user_text。
+    assert_eq!(
+        ctx.user_sent.lock().await.as_slice(),
+        &[("peer:ghost".to_string(), "你好".to_string())],
+        "镜像照常落 conv"
+    );
     assert!(
-        ctx.inbox.lock().await.iter().any(|t| t == "你好"),
-        "回显照常落 conv（历史记录语义）"
+        ctx.sent.lock().await.is_empty(),
+        "不可达路径不得有 send_text：{:?}",
+        *ctx.sent.lock().await
     );
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -9425,8 +9471,9 @@ async fn peer_conv_without_sender_hints() {
     assert!(ctx.errors.lock().await.is_empty());
 }
 
-/// /to 端到端：IM conv 发 /to → 窗口收到帧 + 当前会话回执 + peer conv 镜像
-/// （outbound_log 链路）。
+/// /to 端到端：IM conv 发 /to → 窗口收到帧 + 当前会话回执（send_text）+ peer
+/// conv 镜像派活正文（**send_user_text**，v1.41.8：进入该会话看到的是用户
+/// 自己的气泡，而非 imagent 的发言）。
 #[tokio::test]
 async fn to_command_delivers_and_reports() {
     let _g = SERIAL.lock().await;
@@ -9457,7 +9504,20 @@ async fn to_command_delivers_and_reports() {
     );
     assert!(
         inbox.iter().any(|t| t == "查一下测试结果"),
-        "peer conv 应镜像派活正文（outbound_log 链路）：{inbox:?}"
+        "peer conv 应镜像派活正文：{inbox:?}"
+    );
+    drop(inbox);
+    // v1.41.8 路径分野：派活正文镜像走 send_user_text（落 peer:win-b conv）；
+    // 回执是系统提示走 send_text（落发起会话）——send_text 不得夹带正文镜像。
+    assert_eq!(
+        ctx.user_sent.lock().await.as_slice(),
+        &[("peer:win-b".to_string(), "查一下测试结果".to_string())],
+        "派活正文镜像应经 send_user_text 落 peer: conv"
+    );
+    assert_eq!(
+        ctx.sent.lock().await.as_slice(),
+        &[("feishu:ou_x".to_string(), "✅ 已投递至 win-b。".to_string())],
+        "send_text 恰为回执一条（落发起会话）"
     );
     let _ = std::fs::remove_dir_all(&win.base);
 }
@@ -9526,6 +9586,13 @@ async fn to_command_no_body_establishes_session() {
         welcome.1
     );
     drop(sent);
+    // v1.41.8：欢迎文本是系统提示——走 send_text（上方 sent 断言），不得标成
+    // 用户自发文本。
+    assert!(
+        ctx.user_sent.lock().await.is_empty(),
+        "欢迎文本不得走 send_user_text：{:?}",
+        *ctx.user_sent.lock().await
+    );
     // 当前会话不打扰（无投递/失败回执）。
     assert!(
         !ctx.inbox
@@ -9615,7 +9682,8 @@ async fn peers_command_lists_live_windows() {
 }
 
 /// 入站直投（PeerServer 回调）：窗口名 → peer:<名> 会话 reply（不进 agent、
-/// 不经 handle 鉴权管线——非白名单 sender 亦可，本机 socket 即凭证）。
+/// 不经 handle 鉴权管线——非白名单 sender 亦可，本机 socket 即凭证）。窗口
+/// claude 的回复是 agent 文本：走 send_text，**不得**标成用户自发文本。
 #[tokio::test]
 async fn peer_inbound_replies_direct_to_peer_conv() {
     let _g = SERIAL.lock().await;
@@ -9633,6 +9701,17 @@ async fn peer_inbound_replies_direct_to_peer_conv() {
         *ctx.inbox.lock().await
     );
     assert!(ctx.calls.lock().await.is_empty(), "入站直投不驱动 agent");
+    // v1.41.8：入站回复经 send_text 落 peer:win-e（agent 气泡）。
+    assert_eq!(
+        ctx.sent.lock().await.as_slice(),
+        &[("peer:win-e".to_string(), "窗口里的回复正文".to_string())],
+        "窗口回复应走 send_text 落 peer: conv"
+    );
+    assert!(
+        ctx.user_sent.lock().await.is_empty(),
+        "窗口回复不得标成用户自发文本：{:?}",
+        *ctx.user_sent.lock().await
+    );
 }
 
 // ---------- v1.41.3 /rm（会话删除命令）----------
@@ -9657,7 +9736,7 @@ impl RmCtx {
 
 async fn build_rm_ctx() -> RmCtx {
     let _ = std::fs::create_dir_all("/tmp/imagent-test-ws");
-    let (plat, _inbox, _send_count, errors, sent) = MockPlatform::new_with_errors();
+    let (plat, _inbox, _send_count, errors, sent, _user_sent) = MockPlatform::new_with_errors();
     let (back, _calls, _prompts, _order) = MockBackend::new();
     // /rm 用例并行起跑，tmp_store 的纳秒文件名在 macOS（~1μs 时钟分辨率）会
     // 撞名（platform 测试同款已知问题）——pid + 原子序号 = 进程内绝对唯一。

@@ -26,7 +26,9 @@
 //!   （state=="done"）出站成功后异步落 store `outbound_log`（spawn 短任务
 //!   不阻塞热路径；同 messageId 终态只落一次；流式中间帧 / sync 重发不落）；
 //!   history_query 动作查 `list_outbound_since` 回 history 帧（增量重放，
-//!   浏览器按本地高水位拉取）。
+//!   浏览器按本地高水位拉取）。v1.41.8：`send_user_text`（用户自发文本
+//!   镜像，peer 通道）出站带 `"self":true` 的 text 帧，落盘 payload 同带
+//!   标记——history 重放条目仍是用户气泡。
 //! - ASR 泵（v1.40 语音转写 whisper 方案网关侧）：消费 asr_request 动作——
 //!   b64 解码（坏 → asr_invalid；解码后 >8MB 复用 media 上限 →
 //!   asr_too_large）→ 写 `<imagent_home>/tmp/asr-<unix_ms>.wav` 临时文件 →
@@ -61,9 +63,9 @@ use crate::titles::{TitleCandidate, TitleGen};
 use crate::{
     encode_approval_request_frame, encode_approval_resolved_frame, encode_asr_result_frame,
     encode_card_frame, encode_conv_workdir_frame, encode_error_frame, encode_history_frame,
-    encode_text_frame, encode_workspaces_frame, history_entry_from_row, push_notify_title,
-    session_title, CardPayload, GatewayCredential, InboundAction, PushEvent, PushNotifyKind,
-    SessionEntryFrame, WorkspaceEntryFrame, TARGET,
+    encode_text_frame, encode_user_text_frame, encode_workspaces_frame, history_entry_from_row,
+    push_notify_title, session_title, CardPayload, GatewayCredential, InboundAction, PushEvent,
+    PushNotifyKind, SessionEntryFrame, WorkspaceEntryFrame, TARGET,
 };
 
 const PLATFORM: &str = "web";
@@ -1709,6 +1711,15 @@ impl WebPlatform {
         self.spawn_outbound_log(conv.to_string(), "text", payload);
     }
 
+    /// v1.41.8 用户自发文本镜像帧出站成功后落盘（契约：kind='text'，payload
+    /// = `{"text":<原文>,"at":<unix_ms>,"self":true}`——与 [`Self::log_outbound_text`]
+    /// 同形、仅多 `self` 标记；[`history_entry_from_row`] 透传该键，重放条目
+    /// 仍按用户气泡渲染）。
+    fn log_outbound_user_text(&self, conv: &str, text: &str, at: u64) {
+        let payload = serde_json::json!({"text": text, "at": at, "self": true}).to_string();
+        self.spawn_outbound_log(conv.to_string(), "text", payload);
+    }
+
     /// card 终态帧（state=="done"，含 done/error 两终态）出站成功后收口
     ///（v1.8 落盘 + v1.10 push_notify 埋点，**同一查重闸**——同 messageId
     /// 终态只落一次也只推一次；sync 重发不经本路径）。查重登记在 spawn 前
@@ -1823,6 +1834,20 @@ impl Platform for WebPlatform {
         self.enqueue(json)?;
         // v1.8：出站成功后异步落盘（原文；不阻塞 try_send 热路径）。
         self.log_outbound_text(&conv.0, text, at);
+        Ok(())
+    }
+
+    /// v1.41.8 用户自发文本镜像（peer 通道两处镜像调用，语义见 trait 文档）：
+    /// 出站 `self: true` 的 text 帧 + 落盘 payload 同带 `"self":true`（history
+    /// 重放后仍是用户气泡）。与 [`Self::send_text`] 同款：`at` 一次取值同源
+    /// （实时帧与落盘行共享）、落盘取截断前原文、try_send 热路径不阻塞。
+    /// 走同一出站 channel——E2E 会话活跃时随 `send_business` 逐 sid 加密，
+    /// 中继盲化不受新字段影响。
+    async fn send_user_text(&self, conv: &ConvId, text: &str, _hint: &ReplyHint) -> Result<()> {
+        let at = unix_ms_now() as u64;
+        let json = encode_user_text_frame(&self.machine_id, &conv.0, text, at)?;
+        self.enqueue(json)?;
+        self.log_outbound_user_text(&conv.0, text, at);
         Ok(())
     }
 
@@ -3956,6 +3981,64 @@ mod tests {
             payload["at"].as_u64(),
             Some(at),
             "落盘行 at 必须等于实时帧 at（一次取值同源）"
+        );
+        drop(p);
+    }
+
+    /// v1.41.8 用户自发文本镜像：`send_user_text` 出站帧带 `"self":true`，落盘
+    /// 行 payload 同带 `"self":true` 且 `at` 与实时帧相等（同源，history 重放
+    /// 条目据此仍是用户气泡）；同 conv 的普通 `send_text` 帧与落盘行均**不含**
+    /// self 键（旧形态不变的回归钉）。落盘行按 payload 正文定位——两条落盘
+    /// 是各自 spawn 的短任务，入库先后不保证。
+    #[tokio::test]
+    async fn user_text_frame_and_outbound_log_row_carry_self() {
+        let store = test_store().await;
+        let (p, mut rx) = offline_platform_with_outbound_capture(store.clone()).await;
+        let conv = ConvId("peer:win-a".into());
+
+        p.send_user_text(&conv, "帮我跑下构建", &ReplyHint::None)
+            .await
+            .unwrap();
+        let json = rx.recv().await.expect("用户镜像 text 帧应入出站通道");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "text");
+        assert_eq!(v["self"], true, "用户自发文本镜像帧带 self:true：{v}");
+        assert_eq!(v["convId"], "peer:win-a");
+        assert_eq!(v["text"], "帮我跑下构建");
+        let at = v["at"].as_u64().expect("实时帧应带 at（unix 毫秒 number）");
+
+        // 同 conv 紧随其后的普通文本（窗口回复形态）：帧不带 self 键。
+        p.send_text(&conv, "窗口的回复", &ReplyHint::None)
+            .await
+            .unwrap();
+        let json = rx.recv().await.expect("普通 text 帧应入出站通道");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("self").is_none(), "普通 text 帧不得带 self 键：{v}");
+
+        let rows = wait_outbound_rows(&store, &conv.0, 2).await;
+        let payload_of = |text: &str| -> serde_json::Value {
+            let row = rows
+                .iter()
+                .find(|r| r.payload.contains(text))
+                .unwrap_or_else(|| panic!("outbound_log 应含「{text}」行：{rows:?}"));
+            assert_eq!(row.kind, "text");
+            serde_json::from_str(&row.payload).unwrap()
+        };
+        let mirror = payload_of("帮我跑下构建");
+        assert_eq!(
+            mirror["self"], true,
+            "落盘 payload 带 self（history 重放仍为用户气泡）"
+        );
+        assert_eq!(mirror["text"], "帮我跑下构建", "落盘取 encode 前原文");
+        assert_eq!(
+            mirror["at"].as_u64(),
+            Some(at),
+            "落盘行 at 必须等于实时帧 at（一次取值同源）"
+        );
+        let plain = payload_of("窗口的回复");
+        assert!(
+            plain.get("self").is_none(),
+            "普通文本落盘行不得带 self 键：{plain}"
         );
         drop(p);
     }

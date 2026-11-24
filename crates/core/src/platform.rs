@@ -471,6 +471,23 @@ pub trait Platform: Send + Sync {
     /// error 帧概念（错误反馈走 reply 文本链路），仅 web 覆写（复用
     /// `encode_error_frame` 出站形态，见 `imagent-web`）。
     async fn send_error_note(&self, _conv: &ConvId, _code: &str, _message: &str) {}
+
+    /// v1.41.8 用户自发文本镜像（协作方法，无能力位——default 即安全降级）：
+    /// 发送**本用户自己发出的消息**的镜像。与 [`Platform::send_text`] 的区别
+    /// 只在语义标记：`send_text` 的文本一律是 agent / 系统对用户说的话；本
+    /// 方法的文本是用户自己说的（网关把它回投进某个会话，供其他设备与历史
+    /// 重放看到完整因果）。web 覆写为带 `"self":true` 的 text 帧（SPA 按用户
+    /// 气泡渲染并与本机回显去重；落盘 outbound_log 同带标记，见
+    /// `imagent-web`）；IM 平台不区分发言方向，缺省委托 `send_text`（行为
+    /// 与直接调 `send_text` 完全一致，IM 侧无感）。
+    ///
+    /// 调用方仅 dispatch/peer.rs 的两处 peer 通道镜像：`peer:` 会话直接打字
+    /// 的出站文本、`/to <窗口> <文本>` 的派活正文。**不要**用于窗口 → 网关
+    /// 的入站回复（那是窗口 claude 的话）、`/to` 回执与建立会话的欢迎文本
+    /// （系统提示）——这些必须保持 `send_text`。
+    async fn send_user_text(&self, conv: &ConvId, text: &str, hint: &ReplyHint) -> Result<()> {
+        self.send_text(conv, text, hint).await
+    }
 }
 
 /// 命令卡片的纯文本降级形态（默认 trait 实现与 dispatch 层失败降级共用）：
@@ -572,6 +589,60 @@ mod tests {
                 .map(|(_, s, _)| *s)
                 .collect::<Vec<_>>()
                 .join("+")
+        );
+    }
+
+    /// v1.41.8：`send_user_text` 的 trait default 委托 `send_text`——IM 平台
+    /// 不区分发言方向，未覆写的平台调它等价于直接调 `send_text`（conv / text
+    /// 原样透传）。钉住 default：若改成 no-op，IM 平台的 peer 镜像会静默消失。
+    #[tokio::test]
+    async fn send_user_text_default_delegates_to_send_text() {
+        use tokio::sync::Mutex as TokioMutex;
+
+        /// 只实现必备项的最小平台（其余全走 trait default）。
+        struct BarePlatform {
+            sent: TokioMutex<Vec<(String, String)>>,
+        }
+
+        #[async_trait]
+        impl Platform for BarePlatform {
+            async fn recv(&self) -> Result<InboundMessage> {
+                Err(crate::error::CoreError::Platform("bare", "unused".into()))
+            }
+            async fn send_text(&self, conv: &ConvId, text: &str, _hint: &ReplyHint) -> Result<()> {
+                self.sent
+                    .lock()
+                    .await
+                    .push((conv.0.clone(), text.to_string()));
+                Ok(())
+            }
+            async fn send_media(
+                &self,
+                _conv: &ConvId,
+                _media: &MediaRef,
+                _hint: &ReplyHint,
+            ) -> Result<()> {
+                Ok(())
+            }
+            fn name(&self) -> &'static str {
+                "bare"
+            }
+        }
+
+        let p = BarePlatform {
+            sent: TokioMutex::new(Vec::new()),
+        };
+        p.send_user_text(
+            &ConvId("feishu:ou_x".into()),
+            "帮我跑下构建",
+            &ReplyHint::None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            p.sent.lock().await.as_slice(),
+            &[("feishu:ou_x".to_string(), "帮我跑下构建".to_string())],
+            "default 须原样委托 send_text"
         );
     }
 }

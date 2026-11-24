@@ -3209,13 +3209,44 @@ impl Dispatcher {
     /// 回传文本，返回是否成功送达。P5-第五批：流式前缀累积据此只记成功送达
     /// 的部分——失败段落留给最终全量兜底，而非两处皆失。session 过期升级为
     /// error（用户侧已收不到回复）。
+    async fn reply_ok(&self, conv: &ConvId, text: &str, hint: &ReplyHint) -> bool {
+        self.reply_ok_via(conv, text, hint, false).await
+    }
+
+    /// v1.41.8 回传**用户自发文本的镜像**（[`Platform::send_user_text`]——
+    /// 发送失败仅 log）。与 [`Self::reply`] 的区别只在语义标记：文本是用户
+    /// 自己说的，驾驶舱按用户气泡渲染并与本机回显去重。仅 dispatch/peer.rs
+    /// 的两处 peer 通道镜像调用；agent / 系统文本一律走 `reply`。
+    async fn reply_user_text(&self, conv: &ConvId, text: &str, hint: &ReplyHint) {
+        let _ = self.reply_ok_via(conv, text, hint, true).await;
+    }
+
+    /// [`Self::reply_ok`] / [`Self::reply_user_text`] 的公共送达循环
+    /// （`user_text` 选择走 `send_user_text` 还是 `send_text`——重试、指标与
+    /// 失败日志两种文本完全一致）。
     ///
     /// S-9：失败至少重试一次（短暂退避，瞬时网络抖动可自愈）；仍失败时记
     /// error 日志并附目标文本前 200 字符（排障定位「哪条消息没送出去」）。
-    async fn reply_ok(&self, conv: &ConvId, text: &str, hint: &ReplyHint) -> bool {
+    async fn reply_ok_via(
+        &self,
+        conv: &ConvId,
+        text: &str,
+        hint: &ReplyHint,
+        user_text: bool,
+    ) -> bool {
+        let method = if user_text {
+            "send_user_text"
+        } else {
+            "send_text"
+        };
         let mut attempt = 0;
         loop {
-            match self.platform.send_text(conv, text, hint).await {
+            let sent = if user_text {
+                self.platform.send_user_text(conv, text, hint).await
+            } else {
+                self.platform.send_text(conv, text, hint).await
+            };
+            match sent {
                 Ok(()) => {
                     METRICS.messages_out.inc();
                     return true;
@@ -3227,6 +3258,7 @@ impl Dispatcher {
                             target: "imagent::core",
                             conv_id = %conv.0,
                             error = %e,
+                            method,
                             "send_text session 过期（用户侧已收不到）"
                         );
                         return false;
@@ -3241,6 +3273,7 @@ impl Dispatcher {
                         conv_id = %conv.0,
                         error = %e,
                         retries = attempt,
+                        method,
                         text_head = %truncate_str(text, 200),
                         "send_text 重试后仍失败（附目标文本前 200 字符）"
                     );

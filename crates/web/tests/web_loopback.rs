@@ -16,6 +16,9 @@
 //! v1.3 增补：网关凭证默认 key 形态（测试内生成密钥对，relay 的 KEYS 表
 //! 绑定其公钥，平台侧持私钥走三帧握手）；token 形态（v1.2 兼容路径）
 //! 单独一条回归用例。
+//! v1.41.8 增补：`send_user_text`（用户自发文本镜像，peer 通道）出站帧
+//! `"self":true` + outbound_log payload 同标记 + history 重放透传；该帧在
+//! E2E 活跃时同被 enc 包装（见 `loopback_e2e_encrypted_roundtrip`）。
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -152,15 +155,23 @@ async fn spawn_test_relay() -> (RelayHandle, SigningKey) {
 /// 认证 + machines 快照断言）。E2E 密钥走临时路径（new 的缺省路径锚定真实
 /// `~/.imagent`，测试不得触碰）。
 async fn setup() -> (RelayHandle, WebPlatform, Ws) {
+    let (handle, platform, ws, _store) = setup_with_store().await;
+    (handle, platform, ws)
+}
+
+/// [`setup`] 的 store 外露形态（v1.41.8：outbound_log 落盘行只能从库侧直接
+/// 断言——store 在 setup 内创建，经此把同一库的句柄交给用例）。
+async fn setup_with_store() -> (RelayHandle, WebPlatform, Ws, Store) {
     let (handle, sk) = spawn_test_relay().await;
     let addr = handle.addr;
+    let store = loopback_store("setup").await;
     let platform = WebPlatform::new_with_e2e(
         format!("ws://{addr}/gateway"),
         GatewayCredential::Key(sk),
         "default".to_string(),
         MACHINE.to_string(),
         &e2e_test_key_path("platform"),
-        loopback_store("setup").await,
+        store.clone(),
         valid_ws_dir(),
         nop_models(),
         Vec::new(), // v1.36 backends 名单：回环测试不驱动引擎选择，空名单整段缺席
@@ -188,7 +199,7 @@ async fn setup() -> (RelayHandle, WebPlatform, Ws) {
         .map(|x| x.as_str().unwrap())
         .collect();
     assert_eq!(list, vec![MACHINE], "machines 快照应含本机：{machines}");
-    (handle, platform, ws)
+    (handle, platform, ws, store)
 }
 
 /// WS 握手（对齐 relay e2e 测试：tungstenite 0.29 自建 Request 须自带头）。
@@ -249,6 +260,27 @@ async fn eventually(timeout: Duration, mut pred: impl FnMut() -> bool) {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// 等 outbound_log 某 conv 落盘达到 `want` 行，返回全部行（seq 升序）。落盘
+/// 是平台 spawn 的异步短任务，只能从库侧轮询观测（5s 超时防挂死）。
+async fn wait_outbound_rows(
+    store: &Store,
+    conv: &str,
+    want: usize,
+) -> Vec<imagent_store::OutboundRow> {
+    for _ in 0..250 {
+        if let Ok(page) = store
+            .list_outbound_since(conv, 0, imagent_store::OUTBOUND_RETAIN)
+            .await
+        {
+            if page.rows.len() >= want {
+                return page.rows;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("等待 outbound_log 落盘 {want} 行超时（5s）");
 }
 
 /// 测试用卡片（Running / 终态两形态）。
@@ -364,6 +396,82 @@ async fn loopback_message_and_outbound_frames() {
     let v = next_of_type(&mut br, "pong").await;
     assert_eq!(v["type"], "pong");
     assert_eq!(v["machine"], MACHINE, "pong 帧带本机 machine");
+
+    handle.shutdown();
+    handle.wait().await;
+    drop(p);
+}
+
+/// v1.41.8 用户自发文本镜像（`Platform::send_user_text`，peer 通道）：出站
+/// text 帧带 `"self":true`（convId 原样、machine 照带）；普通 `send_text` 帧
+/// 不带 self 键（旧 SPA 字节兼容）；outbound_log 落盘 payload 同带
+/// `"self":true`；浏览器 `history_query` 重放出的条目仍带 `self`（刷新 / 跨
+/// 设备后仍是用户气泡）。
+#[tokio::test]
+async fn loopback_send_user_text_self_flag_and_history_replay() {
+    let (handle, p, mut br, store) = setup_with_store().await;
+    let peer_conv = ConvId("peer:win-a".into());
+
+    // 用户自发文本镜像帧：self:true。
+    p.send_user_text(&peer_conv, "帮我跑下构建", &ReplyHint::None)
+        .await
+        .unwrap();
+    let v = next_of_type(&mut br, "text").await;
+    assert_eq!(v["machine"], MACHINE, "出站帧带本机 machine");
+    assert_eq!(v["convId"], "peer:win-a", "peer: conv 原样出站");
+    assert_eq!(v["text"], "帮我跑下构建");
+    assert_eq!(v["self"], true, "用户自发文本镜像帧带 self:true：{v}");
+    let frame_at = v["at"].as_u64().expect("镜像帧带 at（unix 毫秒）");
+
+    // 等镜像行落盘再发下一条（落盘是 spawn 的异步任务，两条连发时入库先后
+    // 不保证——逐条等齐才能按序断言重放条目）。
+    let rows = wait_outbound_rows(&store, "peer:win-a", 1).await;
+    assert_eq!(rows[0].kind, "text");
+    let payload: serde_json::Value = serde_json::from_str(&rows[0].payload).unwrap();
+    assert_eq!(payload["self"], true, "落盘 payload 带 self：{payload}");
+    assert_eq!(payload["text"], "帮我跑下构建");
+    assert_eq!(
+        payload["at"].as_u64(),
+        Some(frame_at),
+        "落盘行 at 与实时帧同源"
+    );
+
+    // 紧随其后的普通文本（窗口回复形态）：帧与落盘行均不带 self 键。
+    p.send_text(&peer_conv, "窗口的回复", &ReplyHint::None)
+        .await
+        .unwrap();
+    let v = next_of_type(&mut br, "text").await;
+    assert_eq!(v["text"], "窗口的回复");
+    assert!(v.get("self").is_none(), "普通 text 帧不得带 self 键：{v}");
+    let rows = wait_outbound_rows(&store, "peer:win-a", 2).await;
+    let plain: serde_json::Value = serde_json::from_str(&rows[1].payload).unwrap();
+    assert!(
+        plain.get("self").is_none(),
+        "普通文本落盘行不得带 self 键：{plain}"
+    );
+
+    // 重放：浏览器 history_query（多机模式带 machine 路由）→ history 条目
+    // 透传 self（key 前缀 h:<seq>，镜像行在前、普通行在后）。
+    br.send(Message::text(
+        r#"{"v":1,"type":"history_query","convId":"peer:win-a","since":0,"machine":"test-mac"}"#,
+    ))
+    .await
+    .unwrap();
+    let h = next_of_type(&mut br, "history").await;
+    assert_eq!(h["convId"], "peer:win-a");
+    assert_eq!(h["lastSeq"], 2);
+    let entries = h["entries"].as_array().expect("entries 为数组");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["kind"], "text");
+    assert_eq!(entries[0]["key"], "h:1");
+    assert_eq!(entries[0]["text"], "帮我跑下构建");
+    assert_eq!(
+        entries[0]["self"], true,
+        "重放条目带 self（刷新后仍是用户气泡）"
+    );
+    assert_eq!(entries[1]["key"], "h:2");
+    assert_eq!(entries[1]["text"], "窗口的回复");
+    assert!(entries[1].get("self").is_none(), "普通重放条目不带 self 键");
 
     handle.shutdown();
     handle.wait().await;
@@ -840,6 +948,28 @@ async fn loopback_e2e_encrypted_roundtrip() {
     assert_eq!(inner["type"], "text");
     assert_eq!(inner["text"], "机密回复");
     assert_eq!(inner["convId"], CONV);
+
+    // ---- v1.41.8：send_user_text 的 self 标记帧同走 enc（中继盲化不因新
+    // 字段破口）——中继可见帧体不含正文与 self 标记，解密后内帧带 self ----
+    p.send_user_text(
+        &ConvId("peer:win-a".into()),
+        "帮我跑下构建",
+        &ReplyHint::None,
+    )
+    .await
+    .unwrap();
+    let v = next_of_type(&mut br, "enc").await;
+    let raw = v.to_string();
+    assert!(
+        !raw.contains("帮我跑下构建") && !raw.contains(r#""self""#) && !raw.contains(r#""text""#),
+        "中继可见的 enc 帧体不得泄露正文 / self 标记 / 内帧类型：{raw}"
+    );
+    let inner: serde_json::Value = serde_json::from_str(&open(&k, v["box"].as_str().unwrap()))
+        .expect("self 标记帧须能被会话密钥解密");
+    assert_eq!(inner["type"], "text");
+    assert_eq!(inner["self"], true, "解密后内帧带 self:true：{inner}");
+    assert_eq!(inner["convId"], "peer:win-a");
+    assert_eq!(inner["text"], "帮我跑下构建");
 
     // ---- 应用层 ping 同样走 enc：enc-wrapped ping → enc-wrapped pong ----
     br.send(Message::text(

@@ -98,6 +98,15 @@
 //! 旧形态字节不变）。WAV 规格由 SPA 保证（16k/mono/16-bit），网关不校验
 //! WAV 头细节（坏文件 whisper 自身报错 → asr_failed）。
 //!
+//! v1.41.8 扩展（用户自发文本镜像标记，契约同款字节级纪律）：出站 `text`
+//! 帧可带可选布尔字段 `"self":true`——该文本是**本用户自己发出**的消息镜像
+//! 而非 agent 回复（`Platform::send_user_text`，现仅 peer 通道的两处镜像：
+//! 驾驶舱在 `peer:<窗口名>` 会话直接打的字、`/to` 的派活正文）。SPA 据此
+//! 按用户气泡渲染并与本机回显去重；落盘 outbound_log 的 payload 同带
+//! `"self":true`，[`history_entry_from_row`] 原样透传进 history 条目（重放
+//! 后仍是用户气泡）。缺席 = 既有语义（agent 文本）——`send_text` 的帧与
+//! 落盘 payload 字节不变（旧网关不发该键；旧 SPA 忽略未知键）。
+//!
 //! **帧内 convId 协议约定：恒为完整 conv 形态（`web:<session>`）**。出站帧
 //! （text / card / approval_request …）写入的即完整 conv，浏览器回执帧
 //! （message / approval_response）**原样回传收到的 convId** 即可，不得剥前
@@ -235,6 +244,12 @@ pub(crate) const TRUNC_TAIL_CHARS: usize = 6_000;
 /// 与落盘 outbound_log 行 payload.at 同源同值——SPA 按 (text, at) 精确去重
 /// 防 history 重放重复；编码方每帧必传 Some，缺席仅是字段可选的向后兼容
 /// 语义，见 [`encode_text_frame`]）。
+///
+/// `self_flag`（v1.41.8 可选字段，序列化键 `self`——`self` 是 Rust 关键字，
+/// 字段名加 `_flag` 后缀、serde rename 对齐契约键）：`true` = 该文本是**本
+/// 用户自己发出**的消息镜像（[`encode_user_text_frame`]），SPA 按用户气泡
+/// 渲染；`false` = 既有语义（agent 文本），不序列化——普通 text 帧字节与
+/// v1.41.7 及之前完全一致。
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct TextFrame {
     v: u8,
@@ -248,6 +263,8 @@ pub(crate) struct TextFrame {
     at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<String>,
+    #[serde(rename = "self", skip_serializing_if = "std::ops::Not::not")]
+    self_flag: bool,
 }
 
 /// 卡片帧（send_card → `card` / update_card → `card_patch`；sync 重发用 `card`）。
@@ -492,6 +509,30 @@ pub(crate) fn encode_text_frame(
     text: &str,
     at: u64,
 ) -> Result<String> {
+    encode_text_frame_inner(machine, conv_id, text, at, false)
+}
+
+/// v1.41.8 用户自发文本镜像帧药化（`Platform::send_user_text`）：与
+/// [`encode_text_frame`] 仅 `self_flag` 不同（帧多一个 `"self":true` 键），
+/// `at` 同源契约与超限截断完全一致。
+pub(crate) fn encode_user_text_frame(
+    machine: &str,
+    conv_id: &str,
+    text: &str,
+    at: u64,
+) -> Result<String> {
+    encode_text_frame_inner(machine, conv_id, text, at, true)
+}
+
+/// text 帧药化公共实现（普通 / 用户镜像两形态共用——帧形、`at` 同源、超限
+/// 截断后重建不丢 `self` 标记，只在组帧出口一处维护）。
+fn encode_text_frame_inner(
+    machine: &str,
+    conv_id: &str,
+    text: &str,
+    at: u64,
+    self_flag: bool,
+) -> Result<String> {
     let frame = TextFrame {
         v: 1,
         kind: "text",
@@ -500,6 +541,7 @@ pub(crate) fn encode_text_frame(
         text: text.to_string(),
         at: Some(at),
         hint: None,
+        self_flag,
     };
     encode_frame(&frame, text, |t| TextFrame {
         text: t.to_string(),
@@ -895,7 +937,9 @@ pub(crate) fn encode_error_frame(machine: &str, code: &str, message: &str) -> Re
 
 /// history 帧的 entries 元素：行记录 → 契约 JSON（纯函数便于单测）。
 /// - text 行：`{"kind":"text","key":"h:<seq>","text","at"}`（key 的 seq 用
-///   行 seq；text/at 取自落盘 payload）；
+///   行 seq；text/at 取自落盘 payload）；payload 带 `"self":true`（v1.41.8
+///   用户自发文本镜像的落盘行，见 [`encode_user_text_frame`]）时条目追加
+///   同名键 `"self":true`——缺席 / false / 非布尔不输出键（旧行形态不变）；
 /// - card 行：`{"kind":"card","key":"h:<seq>","messageId","card","state":
 ///   "done"}`（card 为落盘的 CardPayload 完整 JSON 原样内嵌；state 恒
 ///   "done"——只有终态帧落盘）。
@@ -910,12 +954,17 @@ pub(crate) fn history_entry_from_row(
         "text" => {
             let text = payload.get("text").and_then(|t| t.as_str())?;
             let at = payload.get("at").and_then(|a| a.as_i64())?;
-            Some(serde_json::json!({
+            let mut entry = serde_json::json!({
                 "kind": "text",
                 "key": format!("h:{}", row.seq),
                 "text": text,
                 "at": at,
-            }))
+            });
+            // v1.41.8：仅布尔 true 透传（false / 非布尔按缺席——不输出键）。
+            if payload.get("self").and_then(|s| s.as_bool()) == Some(true) {
+                entry["self"] = serde_json::Value::Bool(true);
+            }
+            Some(entry)
         }
         "card" => {
             let message_id = payload.get("messageId").and_then(|m| m.as_str())?;
@@ -2622,6 +2671,109 @@ mod tests {
         assert_eq!(v["text"], "你好");
         assert_eq!(v["at"], 1_730_000_000_000_u64, "v1.36 实时帧携带出站时刻");
         assert!(v.get("hint").is_none(), "hint 恒 None 不序列化");
+        assert!(v.get("self").is_none(), "普通 text 帧不带 self 键");
+    }
+
+    /// v1.41.8 用户自发文本镜像帧（`send_user_text`）：恰比普通 text 帧多一个
+    /// `"self":true` 键（其余字段同值）；超限截断重建后标记不丢。
+    #[test]
+    fn user_text_frame_carries_self_flag() {
+        let json = encode_user_text_frame(
+            "home-mac",
+            "peer:imagent-a7",
+            "帮我跑下构建",
+            1_795_528_250_098,
+        )
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"v":1,"type":"text","machine":"home-mac","convId":"peer:imagent-a7","text":"帮我跑下构建","at":1795528250098,"self":true}"#,
+        );
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["self"], true);
+        assert_eq!(v.as_object().map(|m| m.len()), Some(7), "恰好 7 键");
+        // 除 self 外与普通帧逐字段同值（同参对照）。
+        let plain: serde_json::Value = serde_json::from_str(
+            &encode_text_frame(
+                "home-mac",
+                "peer:imagent-a7",
+                "帮我跑下构建",
+                1_795_528_250_098,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut expect = plain.clone();
+        expect["self"] = serde_json::Value::Bool(true);
+        assert_eq!(v, expect);
+
+        // 超限截断：截断重建的帧仍带 self（标记不因 rebuild 丢失）。
+        let long_text = "长".repeat(100_000); // 300_000 字节 > 帧软限
+        let json = encode_user_text_frame("home-mac", "peer:win", &long_text, 1).unwrap();
+        assert!(json.len() <= FRAME_SOFT_LIMIT_BYTES);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v["text"].as_str().unwrap().contains("…[已截断]…"));
+        assert_eq!(v["self"], true, "截断重建不丢 self 标记");
+        assert_eq!(v["machine"], "home-mac", "截断重建不丢 machine 字段");
+    }
+
+    /// v1.41.8 history 条目透传 `self`：payload 带 `"self":true` → 条目带同名
+    /// 键（恰好 5 键）；缺席 / false / 非布尔 → 不输出键（旧行形态恰 4 键，
+    /// 与 history_entry_and_frame_byte_level 的键数断言同一口径）。
+    #[test]
+    fn history_entry_passes_through_self_flag() {
+        use imagent_store::OutboundRow;
+        let row = |payload: &str| OutboundRow {
+            conv_id: "peer:win".into(),
+            seq: 7,
+            ts: 1_007,
+            kind: "text".into(),
+            payload: payload.into(),
+        };
+        let with_self =
+            history_entry_from_row(&row(r#"{"text":"帮我跑下构建","at":1234,"self":true}"#))
+                .expect("self 行应组装条目");
+        assert_eq!(with_self["self"], true);
+        assert_eq!(
+            with_self.as_object().map(|m| m.len()),
+            Some(5),
+            "self 条目恰好 5 键"
+        );
+        assert_eq!(with_self["kind"], "text");
+        assert_eq!(with_self["key"], "h:7");
+        assert_eq!(with_self["text"], "帮我跑下构建");
+        assert_eq!(with_self["at"], 1234);
+
+        for legacy in [
+            r#"{"text":"你好","at":1234}"#,
+            r#"{"text":"你好","at":1234,"self":false}"#,
+            r#"{"text":"你好","at":1234,"self":"true"}"#,
+        ] {
+            let e = history_entry_from_row(&row(legacy)).expect("行应组装条目");
+            assert!(
+                e.get("self").is_none(),
+                "非 true 不得输出 self 键：{legacy}"
+            );
+            assert_eq!(
+                e.as_object().map(|m| m.len()),
+                Some(4),
+                "旧形态恰好 4 键：{legacy}"
+            );
+        }
+    }
+
+    /// v1.41.8 回归钉：普通 text 帧（`send_text`）**逐字节**与加 `self` 字段
+    /// 之前一致——`self=false` 不序列化。本串是 derive struct 按声明序序列化
+    /// 的产物（不受 serde_json `preserve_order` 构建形态影响——与 `json!`
+    /// 动态 Value 组帧不同，见 history_entry_and_frame_byte_level 注释），故
+    /// 字节断言跨构建形态稳定。旧网关 / 旧 SPA 兼容与 E2E 密文内容均以此为
+    /// 前提。
+    #[test]
+    fn text_frame_bytes_unchanged_without_self() {
+        assert_eq!(
+            encode_text_frame("home-mac", "web:work", "你好", 1_730_000_000_000).unwrap(),
+            r#"{"v":1,"type":"text","machine":"home-mac","convId":"web:work","text":"你好","at":1730000000000}"#,
+        );
     }
 
     fn sample_card(text: &str, terminal: CardTerminal) -> OutboundCard {

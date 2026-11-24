@@ -2763,3 +2763,89 @@ describe("App 切回前台兜底补拉 + queryHistory 拒发重试（v1.40.1）"
     expect(inner).toEqual({ v: 1, type: "history_query", convId: "web:default", since: 0, machine: "work-mac" });
   });
 });
+
+// ---------------------------------------------------------------------------
+// v1.41.8 peer 会话用户自发文本：真机两种表现的端到端回归——网关把用户发给
+// 本地窗口的文本镜像回 `peer:<窗口名>` 会话时带 `self`（此前是普通 text 帧，
+// 被渲染成 imagent 的发言）。
+// ---------------------------------------------------------------------------
+
+describe("peer 会话用户自发文本（v1.41.8）", () => {
+  const M = "home-mac";
+
+  /** 当前会话消息流（<main>）里某正文所在气泡的归属（按出现顺序）：user =
+   *  右侧用户气泡（emerald 底），agent = 左侧 agent 气泡。侧栏预览与状态条
+   *  标题在 main 之外，不计。 */
+  function bubbleKinds(text: string): ("user" | "agent")[] {
+    return within(screen.getByRole("main"))
+      .getAllByText(text)
+      .map((el) => (el.closest(".bg-emerald-600") ? "user" : "agent"));
+  }
+
+  /** 网关出站 text 帧归当前机器空间（多机模式帧恒带 machine）。 */
+  const gwText = (fake: FakeWebSocket, convId: string, text: string, extra: Record<string, unknown> = {}) => {
+    act(() => {
+      fake.recv({ v: 1, type: "text", convId, text, at: 1795528250098, machine: M, ...extra });
+    });
+  };
+
+  /** 输入框打字 + 点「发送」（命令文本会唤起命令面板，Enter 被面板接管，故点按钮）。 */
+  const send = (text: string) => {
+    fireEvent.change(screen.getByLabelText("消息输入框"), { target: { value: text } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+  };
+
+  it("peer 会话直接打字：本机回显 + 网关镜像（self）只出一个用户气泡，不再双显；窗口回复仍是 agent 气泡", () => {
+    const fake = mountApp();
+    handshake(fake, [M]);
+    // 建立会话的欢迎文本是系统提示（普通 text → agent 气泡），让会话出现在侧栏。
+    gwText(fake, "peer:win-a", "已建立与窗口「win-a」的会话。");
+    fireEvent.click(screen.getByRole("button", { name: /^win-a/ }));
+
+    send("帮我跑下构建");
+    expect(fake.sent).toContain(
+      JSON.stringify({ v: 1, type: "message", convId: "peer:win-a", text: "帮我跑下构建", machine: M }),
+    );
+    expect(bubbleKinds("帮我跑下构建")).toEqual(["user"]); // 本机回显
+    expect(bubbleKinds("已建立与窗口「win-a」的会话。")).toEqual(["agent"]);
+
+    // 网关把同一句镜像回来（v1.41.8 带 self）→ 与回显去重，不冒出第二个气泡。
+    gwText(fake, "peer:win-a", "帮我跑下构建", { self: true });
+    expect(bubbleKinds("帮我跑下构建")).toEqual(["user"]);
+
+    // 窗口的回复（普通 text，无 self）照旧是 agent 气泡。
+    gwText(fake, "peer:win-a", "构建通过，无告警。");
+    expect(bubbleKinds("构建通过，无告警。")).toEqual(["agent"]);
+    expect(bubbleKinds("帮我跑下构建")).toEqual(["user"]);
+  });
+
+  it("/to 派活：进入 peer 会话看到的是自己的用户气泡（不是 imagent 的发言）；回执仍落原会话为 agent 文本", () => {
+    const fake = mountApp();
+    handshake(fake, [M]);
+    const cmd = "/to win-a 你目前的待办项有哪些？";
+    send(cmd);
+    expect(fake.sent).toContain(
+      JSON.stringify({ v: 1, type: "message", convId: "web:default", text: cmd, machine: M }),
+    );
+
+    // 网关：派活正文镜像进 peer:win-a（self）+ 当前会话回执（普通 text）。
+    gwText(fake, "peer:win-a", "你目前的待办项有哪些？", { self: true });
+    gwText(fake, "web:default", "✅ 已投递至 win-a。");
+    // 原会话：命令回显（user）+ 回执（agent）。
+    expect(bubbleKinds(cmd)).toEqual(["user"]);
+    expect(bubbleKinds("✅ 已投递至 win-a。")).toEqual(["agent"]);
+
+    // 进入 peer 会话（侧栏按窗口名显示）。
+    fireEvent.click(screen.getByRole("button", { name: /^win-a/ }));
+    expect(bubbleKinds("你目前的待办项有哪些？")).toEqual(["user"]);
+  });
+
+  it("旧网关兼容：镜像帧不带 self 仍按 agent 文本渲染（既有行为不变）", () => {
+    const fake = mountApp();
+    handshake(fake, [M]);
+    gwText(fake, "peer:win-a", "已建立与窗口「win-a」的会话。");
+    fireEvent.click(screen.getByRole("button", { name: /^win-a/ }));
+    gwText(fake, "peer:win-a", "帮我跑下构建");
+    expect(bubbleKinds("帮我跑下构建")).toEqual(["agent"]);
+  });
+});

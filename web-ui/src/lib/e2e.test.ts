@@ -160,8 +160,10 @@ describe("E2E 会话加解密", () => {
   it("box 篡改 / 密钥不符 → null（AEAD 认证失败）", () => {
     const key = randomBytes(32);
     const enc = sealFrame("home-mac", key, inner);
-    // 翻转密文区一个字符
-    const tampered = enc.box.slice(0, -4) + (enc.box.endsWith("A") ? "B" : "A") + enc.box.slice(-3);
+    // 翻转密文区一个字符（替换的是倒数第 4 位——替换值须与**该位**原值比较；
+    // 早先按末位判断，该位恰为 "A" 时等于没篡改，用例偶发转红）
+    const at = enc.box[enc.box.length - 4];
+    const tampered = enc.box.slice(0, -4) + (at === "A" ? "B" : "A") + enc.box.slice(-3);
     expect(openBox(key, tampered)).toBeNull();
     expect(openBox(randomBytes(32), enc.box)).toBeNull();
     expect(openBox(key, "not-base64!!")).toBeNull();
