@@ -90,6 +90,22 @@ function makeGateway() {
   };
 }
 
+/** TOFU 确认并走完 v1.41.9 的重新握手：resolveTofu(accept) → 取最新一条
+ *  e2e_hello（确认后以 pin 身份新发的那帧）→ 喂第二帧 ack。返回第二帧握手的
+ *  hello/ack——此后的会话密钥由它派生（弹层期间那把已丢弃）。 */
+function acceptTofu(
+  coord: E2eCoordinator,
+  gw: ReturnType<typeof makeGateway>,
+  hellos: string[],
+  machine: string,
+): { hello: { ek: string; n1: string }; ack: E2eAckFrame } {
+  coord.resolveTofu(machine, true);
+  const hello = JSON.parse(hellos.at(-1) ?? "null") as { ek: string; n1: string };
+  const ack = gw.ackFor(hello, machine);
+  coord.onAck(ack);
+  return { hello, ack };
+}
+
 beforeEach(() => {
   localStorage.clear();
 });
@@ -381,20 +397,128 @@ describe("E2eCoordinator 状态机", () => {
     expect(coord.statusOf("home-mac")).toBe("pending");
   });
 
-  it("未 pin ack → tofu 事件；确认 → active + pin 落库", () => {
+  it("未 pin ack → tofu 事件；确认 → pin 落库 + 以 pin 身份重新握手；第二帧 ack → active（出站换新密钥）", () => {
     const gw = makeGateway();
     const { coord, events, hellos } = makeCoord();
     coord.onMachines(["home-mac"]);
-    const hello = JSON.parse(hellos[0]);
-    coord.onAck(gw.ackFor(hello, "home-mac"));
+    const hello1 = JSON.parse(hellos[0]);
+    const ack1 = gw.ackFor(hello1, "home-mac");
+    coord.onAck(ack1);
     expect(coord.statusOf("home-mac")).toBe("confirming");
     expect(events).toContainEqual({ kind: "tofu", machine: "home-mac", gkFp: fingerprint(gw.gk), idFp: fingerprint(gw.ik) });
     // confirming 期间出站阻断（待用户决断）
     expect(coord.outbound("home-mac", { v: 1, type: "message", text: "x" })).toBeNull();
+
+    // v1.41.9：确认 = 落 pin + 丢弃弹层期间密钥 + 重新握手——不立即 active
     coord.resolveTofu("home-mac", true);
+    expect(loadPins().map((p) => p.machine)).toEqual(["home-mac"]);
+    expect(coord.statusOf("home-mac")).toBe("pending");
+    expect(events.filter((e) => e.kind === "active")).toHaveLength(0);
+    expect(hellos).toHaveLength(2);
+    const hello2 = JSON.parse(hellos[1]);
+    expect(hello2).toMatchObject({ v: 1, type: "e2e_hello", machine: "home-mac" });
+    expect(hello2.ek).not.toBe(hello1.ek);
+    expect(hello2.n1).not.toBe(hello1.n1);
+    // 重新握手在途：出站业务帧阻断（fail-closed，不走普通 pending 的明文
+    // 直发）；心跳是保命线，仍明文放行
+    expect(coord.outbound("home-mac", { v: 1, type: "message", text: "x" })).toBeNull();
+    const ping = { v: 1 as const, type: "ping" as const, machine: "home-mac" };
+    expect(coord.heartbeat(ping, "home-mac")).toBe(JSON.stringify(ping));
+
+    // 第二帧 ack（以 pin 的 ik 验签 + 核对 gk/ik）→ active
+    const ack2 = gw.ackFor(hello2, "home-mac");
+    coord.onAck(ack2);
     expect(coord.statusOf("home-mac")).toBe("active");
     expect(events).toContainEqual({ kind: "active", machine: "home-mac" });
+    expect(events.filter((e) => e.kind === "tofu")).toHaveLength(1); // 已 pin，不再弹层
+
+    // 出站恢复 enc 包装，密钥是新握手的：网关侧用第二帧握手的密钥可解回
+    // 原帧，用弹层期间的旧密钥解不开
+    const frame = {
+      v: 1 as const,
+      type: "message" as const,
+      convId: "web:default",
+      text: "机密",
+      machine: "home-mac",
+    };
+    const wire = coord.outbound("home-mac", frame);
+    expect(wire).not.toBeNull();
+    const enc = JSON.parse(wire!) as { type: string; machine: string; box: string };
+    expect(enc).toMatchObject({ type: "enc", machine: "home-mac" });
+    expect(openBox(gw.gatewayKey(hello2, ack2.n2), enc.box)).toBe(JSON.stringify(frame));
+    expect(openBox(gw.gatewayKey(hello1, ack1.n2), enc.box)).toBeNull();
+  });
+
+  it("v1.41.9 确认后重新握手：第二帧 ack 的身份公钥与刚 pin 的不一致 → alert（identity_changed）", () => {
+    const gw = makeGateway();
+    const other = makeGateway();
+    const { coord, events, hellos } = makeCoord();
+    coord.onMachines(["home-mac"]);
+    coord.onAck(gw.ackFor(JSON.parse(hellos[0]), "home-mac"));
+    coord.resolveTofu("home-mac", true); // pin 的是 gw 的 ik/gk
+    // 第二帧 ack 换了一把身份公钥（弹层期间的会话被顶替 / 中间人换钥）
+    coord.onAck(gw.ackFor(JSON.parse(hellos[1]), "home-mac", { ik: other.ik }));
+    expect(coord.statusOf("home-mac")).toBe("alert");
+    expect(events).toContainEqual({ kind: "alert", machine: "home-mac", reason: "identity_changed" });
+    expect(events.filter((e) => e.kind === "active")).toHaveLength(0);
+    expect(coord.outbound("home-mac", { v: 1, type: "message", text: "x" })).toBeNull();
+  });
+
+  it("v1.41.9 确认后重新握手 10s 无 ack → unsupported（timeout）；pin 已落库但出站不明文降级", () => {
+    const gw = makeGateway();
+    const { coord, events, hellos } = makeCoord();
+    coord.onMachines(["home-mac"]);
+    coord.onAck(gw.ackFor(JSON.parse(hellos[0]), "home-mac"));
+    coord.resolveTofu("home-mac", true);
+    vi.advanceTimersByTime(ACK_TIMEOUT_MS - 1);
+    expect(coord.statusOf("home-mac")).toBe("pending");
+    vi.advanceTimersByTime(1);
+    expect(coord.statusOf("home-mac")).toBe("unsupported");
+    expect(events).toContainEqual({ kind: "unsupported", machine: "home-mac", reason: "timeout" });
+    expect(events.filter((e) => e.kind === "active")).toHaveLength(0);
+    // 用户确已核对 → pin 留存；会话未立 → fail-closed（显式按钮才放行）
     expect(loadPins().map((p) => p.machine)).toEqual(["home-mac"]);
+    expect(coord.outbound("home-mac", { v: 1, type: "message", text: "x" })).toBeNull();
+  });
+
+  it("v1.41.9 activeMachines：仅含 active 条目，按 Map 插入序（顺序稳定）", () => {
+    const gw = makeGateway();
+    const { coord, hellos } = makeCoord();
+    expect(coord.activeMachines()).toEqual([]);
+    coord.onMachines(["c-mac", "a-mac", "b-mac", "d-mac"]);
+    const helloOf = (m: string): { ek: string; n1: string } =>
+      JSON.parse(hellos.find((s) => (JSON.parse(s) as { machine: string }).machine === m)!);
+    expect(coord.activeMachines()).toEqual([]); // 全部 pending：不含
+    // b → a 依次走到 active。确认后的重新握手会重插条目，故序是「b 先于 a」
+    // 的插入序，而非首连快照里的 a、b 顺序
+    for (const m of ["b-mac", "a-mac"]) {
+      coord.onAck(gw.ackFor(helloOf(m), m));
+      acceptTofu(coord, gw, hellos, m);
+    }
+    expect(coord.activeMachines()).toEqual(["b-mac", "a-mac"]);
+    // d 停在 confirming、c 超时转 unsupported：均不含；重复调用顺序不变
+    coord.onAck(gw.ackFor(helloOf("d-mac"), "d-mac"));
+    vi.advanceTimersByTime(ACK_TIMEOUT_MS);
+    expect(coord.statusOf("c-mac")).toBe("unsupported");
+    expect(coord.statusOf("d-mac")).toBe("confirming");
+    expect(coord.activeMachines()).toEqual(["b-mac", "a-mac"]);
+    expect(coord.activeMachines()).toEqual(["b-mac", "a-mac"]);
+    // 连接断开：随条目清空
+    coord.reset();
+    expect(coord.activeMachines()).toEqual([]);
+  });
+
+  it("回归钉（v1.41.9）：普通握手的 pending 仍明文直发——fail-closed 只属于确认后的重新握手", () => {
+    const { coord, hellos } = makeCoord();
+    const frame = { v: 1 as const, type: "message" as const, text: "x", machine: "home-mac" };
+    coord.onMachines(["home-mac"]);
+    expect(coord.statusOf("home-mac")).toBe("pending");
+    expect(coord.outbound("home-mac", frame)).toBe(JSON.stringify(frame));
+    // pin 重置后的重试（retry）同为普通 pending
+    coord.retry("home-mac");
+    expect(hellos).toHaveLength(2);
+    expect(coord.statusOf("home-mac")).toBe("pending");
+    expect(coord.outbound("home-mac", frame)).toBe(JSON.stringify(frame));
   });
 
   it("已 pin 重连：ack 直接 active（无 tofu）", () => {
@@ -427,7 +551,7 @@ describe("E2eCoordinator 状态机", () => {
     expect(coord.statusOf("home-mac")).toBe("none");
   });
 
-  it("TOFU 拒绝 → unsupported（declined）；仍可显式选择明文", () => {
+  it("TOFU 拒绝 → unsupported（declined）；仍可显式选择明文（v1.41.9 行为不变）", () => {
     const gw = makeGateway();
     const { coord, events, hellos } = makeCoord();
     coord.onMachines(["home-mac"]);
@@ -436,6 +560,13 @@ describe("E2eCoordinator 状态机", () => {
     expect(coord.statusOf("home-mac")).toBe("unsupported");
     expect(events).toContainEqual({ kind: "unsupported", machine: "home-mac", reason: "declined" });
     expect(loadPins()).toEqual([]);
+    // 拒绝不重新握手、不落 active：出站保持阻断，直到用户显式选择明文
+    expect(hellos).toHaveLength(1);
+    expect(events.filter((e) => e.kind === "active")).toHaveLength(0);
+    const frame = { v: 1 as const, type: "message" as const, text: "x", machine: "home-mac" };
+    expect(coord.outbound("home-mac", frame)).toBeNull();
+    coord.allowPlaintext("home-mac");
+    expect(coord.outbound("home-mac", frame)).toBe(JSON.stringify(frame));
   });
 
   it("身份变化 → alert：出站/入站全阻断", () => {
@@ -458,10 +589,8 @@ describe("E2eCoordinator 状态机", () => {
     const gw = makeGateway();
     const { coord, hellos } = makeCoord();
     coord.onMachines(["home-mac"]);
-    const hello = JSON.parse(hellos[0]);
-    const ack = gw.ackFor(hello, "home-mac");
-    coord.onAck(ack);
-    coord.resolveTofu("home-mac", true);
+    coord.onAck(gw.ackFor(JSON.parse(hellos[0]), "home-mac"));
+    const { hello, ack } = acceptTofu(coord, gw, hellos, "home-mac");
     expect(coord.statusOf("home-mac")).toBe("active");
 
     // 出站：enc 包装且可被网关密钥解开
@@ -521,7 +650,8 @@ describe("E2eCoordinator 状态机", () => {
     removePin("home-mac");
     coord.retry("home-mac");
     expect(coord.statusOf("home-mac")).toBe("pending");
-    coord.onAck(gw.ackFor(JSON.parse(hellos[1]), "home-mac"));
+    // v1.41.9：retry 丢弃的是确认后那帧 fail-closed 握手，应答它的最新一帧
+    coord.onAck(gw.ackFor(JSON.parse(hellos.at(-1)!), "home-mac"));
     expect(events.filter((e) => e.kind === "tofu")).toHaveLength(2);
   });
 
@@ -539,10 +669,8 @@ describe("E2eCoordinator 状态机", () => {
     const gw = makeGateway();
     const { coord, hellos } = makeCoord();
     coord.onMachines(["home-mac"]);
-    const hello = JSON.parse(hellos[0]);
-    const ack = gw.ackFor(hello, "home-mac");
-    coord.onAck(ack);
-    coord.resolveTofu("home-mac", true);
+    coord.onAck(gw.ackFor(JSON.parse(hellos[0]), "home-mac"));
+    const { hello, ack } = acceptTofu(coord, gw, hellos, "home-mac");
     const gwKey = gw.gatewayKey(hello, ack.n2);
     const frames = [
       { v: 1 as const, type: "workspace_list" as const, machine: "home-mac" },
@@ -567,10 +695,8 @@ describe("E2eCoordinator 状态机", () => {
     const gw = makeGateway();
     const { coord, hellos } = makeCoord();
     coord.onMachines(["home-mac"]);
-    const hello = JSON.parse(hellos[0]);
-    const ack = gw.ackFor(hello, "home-mac");
-    coord.onAck(ack);
-    coord.resolveTofu("home-mac", true);
+    coord.onAck(gw.ackFor(JSON.parse(hellos[0]), "home-mac"));
+    const { hello, ack } = acceptTofu(coord, gw, hellos, "home-mac");
     const gwKey = gw.gatewayKey(hello, ack.n2);
     const f = {
       v: 1 as const,
@@ -625,7 +751,8 @@ describe("E2eCoordinator sid（定向加密形态）", () => {
     expect(events.filter((e) => e.kind === "downgrade")).toHaveLength(0);
     const hello = JSON.parse(hellos[0]);
     coord.onAck(gw.ackFor(hello, "home-mac"));
-    coord.resolveTofu("home-mac", true);
+    // v1.41.9：确认 → 重新握手 → 第二帧 ack 才 active
+    acceptTofu(coord, gw, hellos, "home-mac");
     // active 后：告警一次，重复帧不重复告警
     coord.notePlaintextDowngrade("home-mac");
     coord.notePlaintextDowngrade("home-mac");

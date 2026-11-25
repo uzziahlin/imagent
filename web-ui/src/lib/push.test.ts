@@ -6,11 +6,14 @@
 // disablePush（有订阅/无订阅/服务端失败仍本地退订）、open-conv 消息监听、
 // ?conv= 深链参数校验、initServiceWorker（v1.39 更新接管 controllerchange
 // 自动重载 + 首装守卫 + cleanup 解绑；v1.41.5 运行中更新检查——定时 +
-// visibilitychange 两个触发源、cleanup 回收、update reject 静默、卸载竞态）。
+// visibilitychange 两个触发源、cleanup 回收、update reject 静默、卸载竞态；
+// v1.41.9 多余更新提示的抑制——pageIsCurrentShell 判定的各形态、页面已是新
+// 构建时不提示也不驱动接管、无法判定 / 旧构建照常提示）。
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   listenServiceWorkerMessages,
   notificationCopy,
+  pageIsCurrentShell,
   pushSupported,
   urlB64ToUint8Array,
   validConvParam,
@@ -18,6 +21,7 @@ import {
   enablePush,
   disablePush,
   initServiceWorker,
+  type ShellCacheStorage,
 } from "./push";
 import { toB64Url } from "./webauthn";
 
@@ -537,77 +541,105 @@ describe("open-conv 消息 machine 透传（v1.37）", () => {
 });
 
 // ---------------------------------------------------------------------------
-// initServiceWorker：更新接管 controllerchange 自动重载（v1.39 双保险之一）。
+// initServiceWorker 更新流驱动夹具（v1.39 自动重载 / v1.41.9 提示抑制共用）。
 // 驱动方式：registration stub 的 addEventListener 是 vi.fn——从 mock.calls 取
 // 捕获到的 updatefound 处理器，手工喂 installing worker 的 statechange；再从
 // 容器上取捕获的 controllerchange 处理器模拟新 SW 接管。reload 为 jsdom 不可
-// 改写属性——经 vi.stubGlobal("location", {...原值, reload}) 整体替换。
+// 改写属性——经 vi.stubGlobal("location", {...原值, reload}) 整体替换（用到的
+// describe 自己 afterEach vi.unstubAllGlobals）。
 // ---------------------------------------------------------------------------
 
-describe("initServiceWorker 更新接管自动重载（v1.39）", () => {
-  type InstallingWorker = { state: string; addEventListener: ReturnType<typeof vi.fn> };
-  type UpdateStub = {
-    registration: {
-      pushManager: PushManagerStub;
-      installing: InstallingWorker | null;
-      addEventListener: ReturnType<typeof vi.fn>;
-    };
-    container: {
-      register: ReturnType<typeof vi.fn>;
-      getRegistration: ReturnType<typeof vi.fn>;
-      addEventListener: ReturnType<typeof vi.fn>;
-      removeEventListener: ReturnType<typeof vi.fn>;
-      controller: unknown;
-    };
+/** installing worker stub：state 可变（驱动 installing → installed）；
+ *  postMessage 记录页面发往 SW 的消息（钉住 v1.41.9 起更新链路不驱动 SW）。 */
+type InstallingWorker = {
+  state: string;
+  addEventListener: ReturnType<typeof vi.fn>;
+  postMessage: ReturnType<typeof vi.fn>;
+};
+type UpdateStub = {
+  registration: {
+    pushManager: PushManagerStub;
+    installing: InstallingWorker | null;
+    addEventListener: ReturnType<typeof vi.fn>;
   };
+  container: {
+    register: ReturnType<typeof vi.fn>;
+    getRegistration: ReturnType<typeof vi.fn>;
+    addEventListener: ReturnType<typeof vi.fn>;
+    removeEventListener: ReturnType<typeof vi.fn>;
+    controller: unknown;
+  };
+};
 
-  /** 可变 controller/installing 的 registration stub（基座面向 enablePush
-   *  场景恒 null，就地放宽类型）。controller 非空 = 页面已被旧 SW 接管。 */
-  function makeUpdateStub(controller: unknown): UpdateStub {
-    const sw = makeServiceWorkerStub();
-    const registration = sw.registration as unknown as UpdateStub["registration"];
-    const container = sw.container as unknown as UpdateStub["container"];
-    container.controller = controller;
-    return { registration, container };
-  }
+/** initServiceWorker 的依赖注入参数（v1.41.9：assetRefs / cacheStorage）。 */
+type InitOpts = Parameters<typeof initServiceWorker>[1];
 
-  /** 挂接线 + 微任务冲刷（register().then 后 updatefound 监听才挂上），
-   *  返回提示回调与捕获的 updatefound 处理器。 */
-  async function initAndGetUpdatefound(sw: UpdateStub) {
-    const onUpdateAvailable = vi.fn();
-    initServiceWorker({ onUpdateAvailable });
-    await new Promise((r) => setTimeout(r, 0));
-    const updatefound = sw.registration.addEventListener.mock.calls.find(
-      ([type]) => type === "updatefound",
-    )?.[1] as (ev: Event) => void | undefined;
-    expect(updatefound).toBeDefined();
-    return { onUpdateAvailable, updatefound: updatefound as (ev: Event) => void };
-  }
+/** 可变 controller/installing 的 registration stub（基座面向 enablePush
+ *  场景恒 null，就地放宽类型）。controller 非空 = 页面已被旧 SW 接管。 */
+function makeUpdateStub(controller: unknown): UpdateStub {
+  const sw = makeServiceWorkerStub();
+  const registration = sw.registration as unknown as UpdateStub["registration"];
+  const container = sw.container as unknown as UpdateStub["container"];
+  container.controller = controller;
+  return { registration, container };
+}
 
-  /** 模拟新 worker 安装完成：updatefound → installing → installed。
-   *  返回捕获的 statechange 处理器（供后续直接驱动状态）。 */
-  function installWorker(
-    sw: UpdateStub,
-    updatefound: (ev: Event) => void,
-  ): { installing: InstallingWorker; statechange: (ev: Event) => void } {
-    const installing: InstallingWorker = { state: "installing", addEventListener: vi.fn() };
-    sw.registration.installing = installing;
-    updatefound(new Event("updatefound"));
-    const statechange = installing.addEventListener.mock.calls.find(
-      ([type]) => type === "statechange",
-    )?.[1] as (ev: Event) => void | undefined;
-    expect(statechange).toBeDefined();
-    return { installing, statechange: statechange as (ev: Event) => void };
-  }
+/** 挂接线 + 微任务冲刷（register().then 后 updatefound 监听才挂上），
+ *  返回提示回调、捕获的 updatefound 处理器与 cleanup。init 缺省为文件顶部
+ *  import 的 initServiceWorker；换成 push 模块重求值后的实例，可测「模块
+ *  加载时采集资源引用」的缺省路径（见 v1.41.9 缺省采集用例）。 */
+async function initAndGetUpdatefound(
+  sw: UpdateStub,
+  opts: InitOpts = {},
+  init: typeof initServiceWorker = initServiceWorker,
+) {
+  const onUpdateAvailable = vi.fn();
+  const cleanup = init({ onUpdateAvailable }, opts);
+  await new Promise((r) => setTimeout(r, 0));
+  const updatefound = sw.registration.addEventListener.mock.calls.find(
+    ([type]) => type === "updatefound",
+  )?.[1] as (ev: Event) => void | undefined;
+  expect(updatefound).toBeDefined();
+  return {
+    onUpdateAvailable,
+    updatefound: updatefound as (ev: Event) => void,
+    cleanup,
+  };
+}
 
-  function controllerchangeHandler(sw: UpdateStub): (ev: Event) => void {
-    const handler = sw.container.addEventListener.mock.calls.find(
-      ([type]) => type === "controllerchange",
-    )?.[1] as (ev: Event) => void | undefined;
-    expect(handler).toBeDefined();
-    return handler as (ev: Event) => void;
-  }
+/** 模拟新 worker 安装完成：updatefound → installing → installed。
+ *  返回捕获的 statechange 处理器（供后续直接驱动状态）。 */
+function installWorker(
+  sw: UpdateStub,
+  updatefound: (ev: Event) => void,
+): { installing: InstallingWorker; statechange: (ev: Event) => void } {
+  const installing: InstallingWorker = {
+    state: "installing",
+    addEventListener: vi.fn(),
+    postMessage: vi.fn(),
+  };
+  sw.registration.installing = installing;
+  updatefound(new Event("updatefound"));
+  const statechange = installing.addEventListener.mock.calls.find(
+    ([type]) => type === "statechange",
+  )?.[1] as (ev: Event) => void | undefined;
+  expect(statechange).toBeDefined();
+  return { installing, statechange: statechange as (ev: Event) => void };
+}
 
+function controllerchangeHandler(sw: UpdateStub): (ev: Event) => void {
+  const handler = sw.container.addEventListener.mock.calls.find(
+    ([type]) => type === "controllerchange",
+  )?.[1] as (ev: Event) => void | undefined;
+  expect(handler).toBeDefined();
+  return handler as (ev: Event) => void;
+}
+
+/** 冲刷全部微任务（宏任务边界）：v1.41.9 起更新提示前多一步异步判定，
+ *  statechange 之后要等判定 promise 链（match → text → then）走完才能断言。 */
+const flushAsync = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+
+describe("initServiceWorker 更新接管自动重载（v1.39）", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
   });
@@ -622,10 +654,13 @@ describe("initServiceWorker 更新接管自动重载（v1.39）", () => {
     const { installing, statechange } = installWorker(sw, updatefound);
     installing.state = "installed";
     statechange(new Event("statechange"));
+    // v1.41.9 起提示前多一步异步判定（jsdom 无 caches、无 module script →
+    // 无法判定 → 照常提示）：冲刷后再断言，断言含义不变
+    await flushAsync();
     expect(onUpdateAvailable).toHaveBeenCalledTimes(1); // 提示弹出（toast 的推送源）
 
     const controllerchange = controllerchangeHandler(sw);
-    controllerchange(new Event("controllerchange")); // 新 SW 接管（skip-waiting 等路径）
+    controllerchange(new Event("controllerchange")); // 模拟新 SW 接管（他处触发的 controllerchange）
     controllerchange(new Event("controllerchange")); // 连环事件：一次性守卫只重载一次
     expect(reload).toHaveBeenCalledTimes(1);
   });
@@ -640,6 +675,9 @@ describe("initServiceWorker 更新接管自动重载（v1.39）", () => {
     const { installing, statechange } = installWorker(sw, updatefound);
     installing.state = "installed";
     statechange(new Event("statechange"));
+    // v1.41.9 起提示回调是异步的（判定之后才发生）：必须冲刷后再断言——
+    // 否则「不提示」成了空断言，守卫回归（首装也进提示路径）时抓不到
+    await flushAsync();
     expect(onUpdateAvailable).not.toHaveBeenCalled(); // 无旧 controller = 非更新，不提示
 
     // 首装 activate → clients.claim() 接管本页 → 页面加载本身的首次
@@ -784,5 +822,356 @@ describe("initServiceWorker 运行中更新检查（v1.41.5）", () => {
     expect(registration.update).not.toHaveBeenCalled();
     document.dispatchEvent(new Event("visibilitychange"));
     expect(registration.update).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.41.9 pageIsCurrentShell：本页面是否已是「等待中新 SW 所属构建」的 app
+// shell——把页面实际加载的脚本 / 样式表引用（index.html 属性原文）逐项与缓存
+// 里的首页文档做子串比对。假 cacheStorage 只需 match（返回真 Response，
+// text() 即 Promise<string>）。无法判定的每一种形态都必须是 false（调用方照常
+// 提示），且不向上抛。
+// ---------------------------------------------------------------------------
+
+const NEW_JS = "/imagent/assets/index-new111.js";
+const NEW_CSS = "/imagent/assets/index-new222.css";
+/** 页面属「新构建」时，模块加载时从 index.html 采集到的资源引用。 */
+const NEW_SHELL_REFS: readonly string[] = [NEW_JS, NEW_CSS];
+
+/** 首页文档样本：形态对齐 Vite 产物 index.html（module script + 样式表 link，
+ *  内容哈希文件名）。 */
+const shellHtml = (js: string, css: string): string =>
+  '<!doctype html>\n<html lang="zh-CN">\n  <head>\n' +
+  `    <script type="module" crossorigin src="${js}"></script>\n` +
+  `    <link rel="stylesheet" crossorigin href="${css}">\n` +
+  '  </head>\n  <body><div id="root"></div></body>\n</html>\n';
+
+/** 假 Cache Storage：match 对任意键返回给定的首页文档（match 可断言）。 */
+function makeShellCache(html: string): ShellCacheStorage & {
+  match: ReturnType<typeof vi.fn>;
+} {
+  const match = vi.fn(async () => new Response(html));
+  return { match };
+}
+
+/** 手动落定的 deferred（让判定停在途中，驱动 cleanup 竞态）。 */
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+describe("pageIsCurrentShell（v1.41.9）", () => {
+  it("缓存文档含全部引用（脚本 + 样式表）→ true", async () => {
+    const cacheStorage = makeShellCache(shellHtml(NEW_JS, NEW_CSS));
+    await expect(
+      pageIsCurrentShell({ assetRefs: NEW_SHELL_REFS, cacheStorage }),
+    ).resolves.toBe(true);
+  });
+
+  it("缓存文档的入口脚本哈希不同（页面是旧构建）→ false", async () => {
+    const cacheStorage = makeShellCache(shellHtml("/imagent/assets/index-old333.js", NEW_CSS));
+    await expect(
+      pageIsCurrentShell({ assetRefs: NEW_SHELL_REFS, cacheStorage }),
+    ).resolves.toBe(false);
+  });
+
+  it("样式表哈希不同、脚本相同（仅样式变化的发版也要提示）→ false", async () => {
+    const cacheStorage = makeShellCache(shellHtml(NEW_JS, "/imagent/assets/index-old444.css"));
+    await expect(
+      pageIsCurrentShell({ assetRefs: NEW_SHELL_REFS, cacheStorage }),
+    ).resolves.toBe(false);
+  });
+
+  it("assetRefs 为空 → false（无法判定），且不读缓存", async () => {
+    const cacheStorage = makeShellCache(shellHtml(NEW_JS, NEW_CSS));
+    await expect(pageIsCurrentShell({ assetRefs: [], cacheStorage })).resolves.toBe(false);
+    expect(cacheStorage.match).not.toHaveBeenCalled();
+  });
+
+  it("cacheStorage 缺省且全局无 caches（jsdom）→ false（无法判定）", async () => {
+    expect(typeof caches).toBe("undefined"); // 前提：jsdom 没有 Cache Storage
+    await expect(pageIsCurrentShell({ assetRefs: NEW_SHELL_REFS })).resolves.toBe(false);
+  });
+
+  it("match 同步抛错 / 异步 reject / 未命中（undefined）→ false，不向上抛", async () => {
+    const syncThrow: ShellCacheStorage = {
+      match: () => {
+        throw new Error("TypeError: bad url");
+      },
+    };
+    const asyncThrow: ShellCacheStorage = {
+      match: async () => {
+        throw new Error("QuotaExceededError");
+      },
+    };
+    const missing: ShellCacheStorage = { match: async () => undefined };
+    for (const cacheStorage of [syncThrow, asyncThrow, missing]) {
+      await expect(
+        pageIsCurrentShell({ assetRefs: NEW_SHELL_REFS, cacheStorage }),
+      ).resolves.toBe(false);
+    }
+  });
+
+  it("缓存文档 text() 抛错 → false，不向上抛", async () => {
+    const unreadable: ShellCacheStorage = {
+      match: async () => ({ text: async () => { throw new Error("boom"); } }) as unknown as Response,
+    };
+    await expect(
+      pageIsCurrentShell({ assetRefs: NEW_SHELL_REFS, cacheStorage: unreadable }),
+    ).resolves.toBe(false);
+  });
+
+  it('docUrl 缺省 → match 收到 "/imagent/"；显式传入时原样使用', async () => {
+    const cacheStorage = makeShellCache(shellHtml(NEW_JS, NEW_CSS));
+    await pageIsCurrentShell({ assetRefs: NEW_SHELL_REFS, cacheStorage });
+    expect(cacheStorage.match).toHaveBeenCalledTimes(1);
+    expect(cacheStorage.match).toHaveBeenCalledWith("/imagent/");
+    // 带 query 的键：证明是不改写地透传
+    await pageIsCurrentShell({ assetRefs: NEW_SHELL_REFS, docUrl: "/imagent/?v=2", cacheStorage });
+    expect(cacheStorage.match).toHaveBeenLastCalledWith("/imagent/?v=2");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// initServiceWorker 多余更新提示的抑制（v1.41.9）：updatefound →
+// statechange(installed) 且页面已有旧 controller 时，先判本页面是否已是该新
+// SW 所属构建——
+// 是 → 不提示，也不驱动接管（不 postMessage）：页面继续由旧 SW 服务，等待中
+//   的 SW 到下次冷启动自然激活，同一浏览器的其它标签页不受牵连；且因不置位
+//   updateSeen，之后即便发生 controllerchange 也不 reload；
+// 否（确属旧构建 / 无法判定）→ 既有提示 + controllerchange 自动重载腿原样
+//   保留，同样不 postMessage（换不换 SW 由用户点提示刷新决定）。
+// 驱动方式同 v1.39（共用上方夹具）；判定是异步的，statechange 后须冲刷。
+// ---------------------------------------------------------------------------
+
+describe("initServiceWorker 页面已是新构建时不提示（v1.41.9）", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /** 挂接线（页面已被旧 SW 接管 = 更新场景而非首装）并驱动新 worker 的
+   *  statechange：返回提示回调、installing worker（含 postMessage）、reload
+   *  桩与 cleanup。此刻判定已在途、尚未冲刷（由调用方 await flushAsync）。
+   *  state 缺省 "installed"；传 "installing" 模拟尚未装完的状态变化。 */
+  async function mountInstalled(opts: InitOpts, state: "installed" | "installing" = "installed") {
+    const sw = makeUpdateStub({ scriptURL: "/imagent/sw.js" });
+    stubPushGlobals(sw.container);
+    const reload = vi.fn();
+    vi.stubGlobal("location", { ...window.location, reload });
+    const { onUpdateAvailable, updatefound, cleanup } = await initAndGetUpdatefound(sw, opts);
+    const { installing, statechange } = installWorker(sw, updatefound);
+    installing.state = state;
+    statechange(new Event("statechange"));
+    return { sw, onUpdateAvailable, installing, reload, cleanup };
+  }
+
+  it("statechange 时 state 尚未到 installed → 不判定（不读缓存）、不提示、不 postMessage", async () => {
+    // 「installed 时 install 的预缓存已落位」是判定的前提：没到 installed
+    // 就去读缓存，读到的可能是上一个构建的文档
+    const cacheStorage = makeShellCache(shellHtml(NEW_JS, NEW_CSS));
+    const { onUpdateAvailable, installing } = await mountInstalled(
+      { assetRefs: NEW_SHELL_REFS, cacheStorage },
+      "installing",
+    );
+    await flushAsync();
+
+    expect(cacheStorage.match).not.toHaveBeenCalled();
+    expect(onUpdateAvailable).not.toHaveBeenCalled();
+    expect(installing.postMessage).not.toHaveBeenCalled();
+  });
+
+  it("页面已是新版（缓存文档含本页面的全部资源引用）：不提示、不 postMessage（不驱动接管）；之后 controllerchange 也不 reload", async () => {
+    const cacheStorage = makeShellCache(shellHtml(NEW_JS, NEW_CSS));
+    const { sw, onUpdateAvailable, installing, reload } = await mountInstalled({
+      assetRefs: NEW_SHELL_REFS,
+      cacheStorage,
+    });
+    await flushAsync();
+
+    // 读的是首页文档条目（缓存键缺省 "/imagent/"）
+    expect(cacheStorage.match).toHaveBeenCalledWith("/imagent/");
+    expect(onUpdateAvailable).not.toHaveBeenCalled();
+    expect(installing.postMessage).not.toHaveBeenCalled(); // 不驱动接管
+
+    // updateSeen 未置位：之后若发生 controllerchange（如别处触发接管）也不重载
+    controllerchangeHandler(sw)(new Event("controllerchange"));
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it("页面是旧构建（缓存文档的入口脚本哈希不同）：提示恰好一次、不 postMessage；接管 reload 恰好一次", async () => {
+    const cacheStorage = makeShellCache(shellHtml("/imagent/assets/index-old333.js", NEW_CSS));
+    const { sw, onUpdateAvailable, installing, reload } = await mountInstalled({
+      assetRefs: NEW_SHELL_REFS,
+      cacheStorage,
+    });
+    await flushAsync();
+
+    expect(onUpdateAvailable).toHaveBeenCalledTimes(1);
+    expect(installing.postMessage).not.toHaveBeenCalled();
+
+    // 既有自动重载腿保持：他处触发接管 → 本页重载
+    controllerchangeHandler(sw)(new Event("controllerchange"));
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("无法判定（不注入 cacheStorage，jsdom 无 caches）：照常提示恰好一次，不 postMessage", async () => {
+    expect(typeof caches).toBe("undefined"); // 前提：jsdom 没有 Cache Storage
+    const { onUpdateAvailable, installing } = await mountInstalled({
+      assetRefs: NEW_SHELL_REFS,
+    });
+    await flushAsync();
+
+    expect(onUpdateAvailable).toHaveBeenCalledTimes(1); // 宁可多提示，不能漏提示
+    expect(installing.postMessage).not.toHaveBeenCalled();
+  });
+
+  // 缓存文档取旧构建——无 disposed 守卫时这条会弹提示。（新构建结局下 current
+  // 分支本就没有副作用，守卫与否看不出差别，不作为用例。）
+  it("判定完成前已 cleanup：不提示", async () => {
+    const pending = deferred<Response | undefined>();
+    const sw = makeUpdateStub({ scriptURL: "/imagent/sw.js" });
+    stubPushGlobals(sw.container);
+    const { onUpdateAvailable, updatefound, cleanup } = await initAndGetUpdatefound(sw, {
+      assetRefs: NEW_SHELL_REFS,
+      cacheStorage: { match: () => pending.promise },
+    });
+    const { installing, statechange } = installWorker(sw, updatefound);
+    installing.state = "installed";
+    statechange(new Event("statechange"));
+    expect(sw.container.removeEventListener).not.toHaveBeenCalled(); // 判定在途
+
+    cleanup(); // 判定完成前组件卸载
+    pending.resolve(new Response(shellHtml("/imagent/assets/index-old333.js", NEW_CSS)));
+    await flushAsync();
+
+    expect(onUpdateAvailable).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.41.9 缺省路径——页面资源引用在**模块加载时**从 index.html 采集一次
+// （readShellAssetRefs / SHELL_ASSET_REFS 均不导出）。上方用例都显式注入
+// assetRefs，而 jsdom 的 DOM 为空（缺省值恒为 []，走不到判定），故这里经
+// vi.resetModules() 让 push 模块带着预置的 DOM 重新求值，再走不注入 assetRefs
+// 的 initServiceWorker 端到端验证。钉两点：
+//  ① 采集到的是 index.html 写死的 module script（src）与样式表 link（href）；
+//  ② 模块加载之后才出现的元素（Vite 动态 import 运行期注入的样式表）不算
+//     ——否则缺省判定会与「页面已是当前构建」脱钩。
+// ---------------------------------------------------------------------------
+
+describe("initServiceWorker 缺省采集页面资源引用（v1.41.9）", () => {
+  const SCRIPT_SRC = "/imagent/assets/index-aaa111.js";
+  const CSS_HREF = "/imagent/assets/index-bbb222.css";
+  const added: Element[] = [];
+
+  /** 往 document.head 放一个 index.html 形态的静态元素（afterEach 移除）。 */
+  function addShellElement(tag: "script" | "link", attrs: Record<string, string>): void {
+    const el = document.createElement(tag);
+    for (const [name, value] of Object.entries(attrs)) {
+      el.setAttribute(name, value);
+    }
+    document.head.appendChild(el);
+    added.push(el);
+  }
+
+  /** push 模块重求值：此刻的 DOM 就是模块加载时看到的。 */
+  async function importFreshPush(): Promise<typeof import("./push")> {
+    vi.resetModules();
+    return import("./push");
+  }
+
+  /** 驱动到新 worker installed（页面已被旧 SW 接管）：init 用给定的模块
+   *  实例，不注入 assetRefs（走模块加载时采集的缺省值）。 */
+  async function mountFresh(mod: typeof import("./push"), opts: InitOpts) {
+    const sw = makeUpdateStub({ scriptURL: "/imagent/sw.js" });
+    stubPushGlobals(sw.container);
+    const { onUpdateAvailable, updatefound } = await initAndGetUpdatefound(
+      sw,
+      opts,
+      mod.initServiceWorker,
+    );
+    const { installing, statechange } = installWorker(sw, updatefound);
+    installing.state = "installed";
+    statechange(new Event("statechange"));
+    return { onUpdateAvailable, installing };
+  }
+
+  afterEach(() => {
+    for (const el of added.splice(0)) {
+      el.remove();
+    }
+    vi.unstubAllGlobals();
+  });
+
+  it("模块加载时 index.html 的静态 script / link 已在 DOM → 缺省采集到，判定为「已是新构建」：不提示、不 postMessage", async () => {
+    addShellElement("script", { type: "module", src: SCRIPT_SRC });
+    addShellElement("link", { rel: "stylesheet", href: CSS_HREF });
+    const cacheStorage = makeShellCache(shellHtml(SCRIPT_SRC, CSS_HREF));
+    const { onUpdateAvailable, installing } = await mountFresh(await importFreshPush(), {
+      cacheStorage,
+    });
+    await flushAsync();
+
+    expect(onUpdateAvailable).not.toHaveBeenCalled();
+    expect(installing.postMessage).not.toHaveBeenCalled();
+  });
+
+  it("缺省采集到的引用确实参与比对：缓存文档的入口脚本哈希不同 → 提示", async () => {
+    addShellElement("script", { type: "module", src: SCRIPT_SRC });
+    addShellElement("link", { rel: "stylesheet", href: CSS_HREF });
+    const cacheStorage = makeShellCache(shellHtml("/imagent/assets/index-old333.js", CSS_HREF));
+    const { onUpdateAvailable, installing } = await mountFresh(await importFreshPush(), {
+      cacheStorage,
+    });
+    await flushAsync();
+
+    expect(onUpdateAvailable).toHaveBeenCalledTimes(1);
+    expect(installing.postMessage).not.toHaveBeenCalled();
+  });
+
+  it("样式表 link 同样采集并参与比对：缓存文档仅样式表哈希不同 → 提示", async () => {
+    addShellElement("script", { type: "module", src: SCRIPT_SRC });
+    addShellElement("link", { rel: "stylesheet", href: CSS_HREF });
+    const cacheStorage = makeShellCache(shellHtml(SCRIPT_SRC, "/imagent/assets/index-old444.css"));
+    const { onUpdateAvailable, installing } = await mountFresh(await importFreshPush(), {
+      cacheStorage,
+    });
+    await flushAsync();
+
+    expect(onUpdateAvailable).toHaveBeenCalledTimes(1);
+    expect(installing.postMessage).not.toHaveBeenCalled();
+  });
+
+  it("非 module 的 script 与 icon link 不算 shell 引用：只有它们时引用为空、不读缓存、照常提示", async () => {
+    // index.html 里另有 <link rel="icon" href=...>；普通脚本同理——都不是内容
+    // 哈希的入口资源，混进来会让判定永远对不上
+    addShellElement("script", { src: "/imagent/legacy.js" });
+    addShellElement("link", { rel: "icon", href: "/imagent/icon.svg" });
+    const cacheStorage = makeShellCache(
+      shellHtml("/imagent/assets/index-old333.js", "/imagent/assets/index-old444.css"),
+    );
+    const { onUpdateAvailable, installing } = await mountFresh(await importFreshPush(), {
+      cacheStorage,
+    });
+    await flushAsync();
+
+    expect(cacheStorage.match).not.toHaveBeenCalled(); // 引用为空 = 无法判定
+    expect(onUpdateAvailable).toHaveBeenCalledTimes(1);
+    expect(installing.postMessage).not.toHaveBeenCalled();
+  });
+
+  it("模块加载之后才注入的样式表 link 不算（运行期动态 import 形态）→ 引用为空，照常提示", async () => {
+    const fresh = await importFreshPush(); // 模块求值时 head 为空
+    addShellElement("link", { rel: "stylesheet", href: CSS_HREF });
+    const cacheStorage = makeShellCache(shellHtml(SCRIPT_SRC, CSS_HREF)); // 文档含它
+    const { onUpdateAvailable, installing } = await mountFresh(fresh, { cacheStorage });
+    await flushAsync();
+
+    expect(cacheStorage.match).not.toHaveBeenCalled();
+    expect(onUpdateAvailable).toHaveBeenCalledTimes(1);
+    expect(installing.postMessage).not.toHaveBeenCalled();
   });
 });

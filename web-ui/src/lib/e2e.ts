@@ -27,6 +27,15 @@
 // 红色告警（机器身份变化，可能被中间人）+ 断开该机器加密（fail-closed）。
 // 未 pin（每机器首次）：指纹确认弹层（SHA-256 前 16 hex 分组展示），用户与
 // 终端日志核对后 pin。
+// 确认 = pin 身份，不是追认弹层期间那把临时密钥（v1.41.9）：「信任」决定的是
+// pin；confirming 期间浏览器不出 enc 帧（心跳明文、业务帧阻断），网关半开
+// 会话 60s 内（crates/web/src/e2e.rs HALF_OPEN_TTL）等不到首笔可解密入站帧
+// 即被清理——新设备核对指纹超 60s 是常态，沿用旧密钥 = 界面「已加密」而
+// 网关全帧解不开（只 WARN 丢弃，静默丢消息）。故 accept 时落 pin + 丢弃弹层
+// 期间密钥 + 以 pin 身份重新握手：新 e2e_ack 走既有 onAck（pin 验签 + 核对
+// gk/ik）才 emit active / alert。重新握手在途期间出站业务帧阻断（fail-closed
+// 握手——用户刚点了「信任并启用加密」，不留可被中继拉长的明文窗口；普通
+// 握手的 pending 窗口仍是 v1.1 明文直发）。
 //
 // fail-closed：握手发起 10s 无 e2e_ack（旧网关）→ 「此机器不支持加密连接」
 // 横幅，发送禁用（不自动明文降级）；「仍以明文连接」显式按钮记录选择
@@ -440,6 +449,10 @@ interface E2eEntry {
   plaintext?: boolean;
   /** 降级告警已上抛（每连接每机器一次，防事件风暴）。 */
   downgradeWarned?: boolean;
+  /** v1.41.9 fail-closed 握手在途标记（仅 pending 态被读取）：出站业务帧
+   *  阻断，不走普通 pending 的明文直发——TOFU 确认后的重新握手用；onAck
+   *  离开 pending 时清除。 */
+  failClosed?: boolean;
   timer?: ReturnType<typeof setTimeout>;
 }
 
@@ -455,8 +468,14 @@ export interface CoordinatorHooks {
  * - onMachines：relay 机器快照 → 为无条目的在线机器发起握手（用户已显式
  *   选择明文的机器跳过）。
  * - onAck：pending 态收到 ack → active / tofu(confirming) / alert。
- * - 出站：outbound() 给出线上的帧（active → enc 包装；pending/无条目/明文
- *   选择 → 原帧明文；confirming/unsupported 未选择/alert → null 阻断）。
+ * - resolveTofu：accept → 落 pin + 丢弃弹层期间密钥 + 以 pin 身份 fail-closed
+ *   重新握手（v1.41.9；active 由新握手的 ack 经 onAck 触发，不在此处 emit）；
+ *   decline → unsupported。
+ * - activeMachines()：active 会话所属机器（v1.41.9）——ws 层心跳据此对每台
+ *   机器各发一帧 enc-ping，持续向网关证明持钥（否则被半开清理）。
+ * - 出站：outbound() 给出线上的帧（active → enc 包装；普通 pending/无条目/
+ *   明文选择 → 原帧明文；confirming/fail-closed 握手中的 pending/unsupported
+ *   未选择/alert → null 阻断）。
  * - 入站：openEnc() 解密二次分发；acceptPlaintext() 判定明文业务帧放行
  *   （active/alert 态收明文业务帧 = 注入面，丢弃）。
  * - reset()：连接断开清空全部条目（临时密钥绑定本连接；pin/明文选择持久）。
@@ -482,6 +501,19 @@ export class E2eCoordinator {
     return this.entries.get(machine)?.status ?? "none";
   }
 
+  /** 已加密（active）会话所属机器，Map 插入序（顺序稳定）。v1.41.9：ws 层
+   *  心跳据此对每台机器各发一帧 enc-ping——网关半开清理只豁免「收到过可
+   *  解密入站帧」的会话，非当前机器的会话须持续证明持钥才不会被清。 */
+  activeMachines(): string[] {
+    const out: string[] = [];
+    for (const [machine, e] of this.entries) {
+      if (e.status === "active") {
+        out.push(machine);
+      }
+    }
+    return out;
+  }
+
   /** 出站帧线上形态：null = 阻断（该机器处于 fail-closed 态且用户未放行）。 */
   outbound(machine: string | undefined, frame: OutboundFrame): string | null {
     if (!BUSINESS_TYPES.has(frame.type)) {
@@ -491,14 +523,16 @@ export class E2eCoordinator {
       return encodeFrame(frame); // 旧 relay 单机模式（无 machines 帧，条目恒空）
     }
     const e = this.entries.get(machine);
-    if (!e || e.status === "pending" || e.plaintext) {
+    if (!e || (e.status === "pending" && !e.failClosed) || e.plaintext) {
       // 未握手/握手中的短暂窗口（v1.1 行为）/用户显式选择明文的机器
       return encodeFrame(frame);
     }
     if (e.status === "active" && e.key) {
       return encodeFrame(sealFrame(machine, e.key, frame, this.rng));
     }
-    return null; // confirming（待用户确认指纹）/ unsupported 未放行 / alert
+    // confirming（待用户确认指纹）/ fail-closed 握手中的 pending（v1.41.9）/
+    // unsupported 未放行 / alert
+    return null;
   }
 
   /** 内部保活 ping 的线上形态：active → enc，其余恒明文（保命线不得阻断）。 */
@@ -571,6 +605,7 @@ export class E2eCoordinator {
     clearTimeout(e.timer);
     delete e.timer;
     delete e.secret;
+    delete e.failClosed; // 已离开 pending：阻断标记随之作废
     if (outcome.kind === "alert") {
       e.status = "alert";
       this.hooks.emit({ kind: "alert", machine: ack.machine, reason: outcome.reason });
@@ -582,8 +617,9 @@ export class E2eCoordinator {
       this.hooks.emit({ kind: "active", machine: ack.machine });
       return;
     }
-    // tofu：密钥先行持有（网关 ack 后立即加密出站，confirming 态可解），
-    // 指纹确认后才 pin + 激活。
+    // tofu：密钥先行持有（网关 ack 后立即加密出站，confirming 态可解），指纹
+    // 确认后才 pin——pin 后不复用这把密钥，而是以 pin 身份重新握手（见
+    // resolveTofu）。
     e.status = "confirming";
     e.key = outcome.key;
     e.ik = outcome.ik;
@@ -593,16 +629,20 @@ export class E2eCoordinator {
     this.hooks.emit({ kind: "tofu", machine: ack.machine, gkFp: outcome.gkFp, idFp: outcome.idFp });
   }
 
-  /** TOFU 弹层决断：accept → pin + 激活；decline → unsupported（可显式明文）。 */
+  /** TOFU 弹层决断（v1.41.9）：accept → 落 pin + 丢弃弹层期间的密钥 + 以
+   *  pin 身份 fail-closed 重新握手——**不在此处 emit active**：弹层期间网关
+   *  侧的会话可能已被半开清理，沿用其密钥 = 出站全帧网关解不开而浏览器
+   *  无感；新握手的 ack 经 onAck 验签并核对 gk/ik 与刚 pin 的一致后才
+   *  active / alert。decline → unsupported（可显式明文）。 */
   resolveTofu(machine: string, accept: boolean): void {
     const e = this.entries.get(machine);
     if (!e || e.status !== "confirming" || !e.ik || !e.gk || !e.key) {
       return;
     }
     if (accept) {
-      pinMachine(machine, e.ik, e.gk);
-      e.status = "active";
-      this.hooks.emit({ kind: "active", machine });
+      pinMachine(machine, e.ik, e.gk); // 先落 pin：用户刚核对过的身份公钥
+      this.dropEntry(machine);
+      this.beginHandshake(machine, { failClosed: true });
       return;
     }
     delete e.key;
@@ -645,9 +685,15 @@ export class E2eCoordinator {
     this.entries.clear();
   }
 
-  private beginHandshake(machine: string): void {
+  /** 发起握手（条目转 pending + ack 超时计时）。opts.failClosed（v1.41.9）=
+   *  在途期间出站业务帧阻断（TOFU 确认后的重新握手）；缺省为普通 pending
+   *  （onMachines / retry——握手中的短暂窗口明文直发，v1.1 行为不变）。 */
+  private beginHandshake(machine: string, opts?: { failClosed?: boolean }): void {
     const { secret, hello } = startHandshake(machine, { sid: this.getSid?.(), rng: this.rng });
     const entry: E2eEntry = { status: "pending", secret };
+    if (opts?.failClosed) {
+      entry.failClosed = true;
+    }
     entry.timer = setTimeout(() => {
       const cur = this.entries.get(machine);
       if (cur !== entry || cur.status !== "pending") {

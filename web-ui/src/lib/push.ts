@@ -138,24 +138,104 @@ export function listenServiceWorkerMessages(
   };
 }
 
+/** Cache Storage 的最小读取面（窗口全局 caches 的子集；测试注入用）。 */
+export interface ShellCacheStorage {
+  match(request: string): Promise<Response | undefined>;
+}
+
+/** 本页面是否已是「等待中新 SW 所属构建」的 app shell（v1.41.9）。
+ *  判定依据：带构建戳的 sw.js 在 install 时把当时线上的首页文档（与它同
+ *  一次部署产出）写进固定名字的 cache（imagent-shell-v1 的 "/imagent/" 条目，
+ *  见 sw.js 的 SHELL_CACHE 注释），且 worker 走到 installed 时 install 必已
+ *  完成——缓存里的这份文档就是「新 SW 所属构建首页」的权威样本。index.html
+ *  引用的脚本 / 样式表都是内容哈希文件名，应用代码或样式任何变化都会反映
+ *  到这些引用上：页面实际加载的引用（assetRefs）逐项都是缓存文档的子串 →
+ *  页面与该构建是同一版。逐字 includes 比对属性原文，不做 URL 解析（页面侧
+ *  读的与文档里写的是同一份 index.html 的同一属性）。
+ *  无法判定一律 false（调用方照常提示——宁可多提示，不能漏提示）：assetRefs
+ *  为空、全局 caches 缺失（jsdom 等）、match 抛错 / 未命中、text() 抛错；
+ *  整体不向上抛。 */
+export async function pageIsCurrentShell(opts: {
+  /** 本页面实际加载的静态资源引用（index.html 里写死的属性原文）。 */
+  assetRefs: readonly string[];
+  /** 首页文档缓存键，缺省 import.meta.env.BASE_URL（= "/imagent/"）。 */
+  docUrl?: string;
+  /** 缺省取全局 caches；不存在（jsdom 等）→ 无法判定。 */
+  cacheStorage?: ShellCacheStorage;
+}): Promise<boolean> {
+  if (opts.assetRefs.length === 0) {
+    return false;
+  }
+  try {
+    const storage: ShellCacheStorage | undefined =
+      opts.cacheStorage ?? (typeof caches === "undefined" ? undefined : caches);
+    if (!storage) {
+      return false;
+    }
+    // 不带 cache 名 = 查全部 cache（与 sw.js 离线回退的 caches.match 同一写法）
+    const cached = await storage.match(opts.docUrl ?? import.meta.env.BASE_URL);
+    if (!cached) {
+      return false;
+    }
+    const html = await cached.text();
+    // 每一项都必须在：任一引用（脚本或样式表）对不上即不是同一构建
+    return opts.assetRefs.every((ref) => html.includes(ref));
+  } catch {
+    return false;
+  }
+}
+
+/** 页面静态资源引用采集（v1.41.9）：index.html 写死的入口脚本（module script
+ *  的 src）与样式表（link[rel=stylesheet] 的 href）的属性原文。
+ *  必须在**模块加载时**读一次：此刻应用代码尚未运行，DOM 里只有 index.html
+ *  的静态元素；Vite 动态 import 会在运行期注入 <link rel="stylesheet">，
+ *  之后再读会混入——它们不是 shell 的组成，却会让 pageIsCurrentShell 判为
+ *  「不是当前构建」（v1.41.9 的「已是新版则不提示」失效、退回多提示一次）。
+ *  无 DOM → 空数组（= 无法判定）。 */
+function readShellAssetRefs(): string[] {
+  if (typeof document === "undefined") {
+    return [];
+  }
+  const refs: string[] = [];
+  for (const script of document.querySelectorAll('script[type="module"][src]')) {
+    const src = script.getAttribute("src");
+    if (src) {
+      refs.push(src);
+    }
+  }
+  for (const link of document.querySelectorAll('link[rel="stylesheet"][href]')) {
+    const href = link.getAttribute("href");
+    if (href) {
+      refs.push(href);
+    }
+  }
+  return refs;
+}
+const SHELL_ASSET_REFS: readonly string[] = readShellAssetRefs();
+
 /** SW 注册与接线（App 挂载时调用一次）：
  *  - 仅 https / localhost 且浏览器支持时注册 /imagent/sw.js（幂等——已注册
  *    同 scope 脚本时复用既有 registration；失败静默，SW 只影响离线与推送）；
  *  - updatefound → 新 worker 进入 installed 且当前已有 controller 接管（即
- *    更新而非首装）→ 置位更新标记 + onUpdateAvailable（App 顶部「新版本已
- *    就绪，点击刷新」可点提示，v1.39）；
+ *    更新而非首装）→ v1.41.9 先判本页面是否已是该 SW 所属构建
+ *    （pageIsCurrentShell）：是 → 不提示，也不驱动接管（等待中的 SW 到下次
+ *    冷启动自然激活）；否则（确属旧构建 / 无法判定）→ 置位更新标记 +
+ *    onUpdateAvailable（App 顶部「新版本已就绪，点击刷新」可点提示，v1.39）；
  *  - controllerchange → 新 SW 接管控制器（更新标记已置位时）→ reload 一次
  *    （v1.39 双保险自动腿，与 toast 点击重载并存，守卫见内注释）；
  *  - 运行中主动更新检查（v1.41.5）：定时（SW_UPDATE_INTERVAL_MS）+ 切回前台
  *    （visibilitychange → visible）触发 reg.update()，新 SW install 落入上方
  *    既有 updatefound 链路；update() 失败静默；
  *  - open-conv 消息 → onOpenConv（通知点击定位会话）。
+ *  v1.41.9：页面资源引用 / Cache Storage 经 opts 注入（缺省取模块加载时
+ *  采集的 SHELL_ASSET_REFS 与全局 caches；测试用）。
  *  返回 cleanup：解绑消息监听 / controllerchange / 运行中检查两触发源。 */
 export function initServiceWorker(
   handlers: {
     onUpdateAvailable?: () => void;
     onOpenConv?: (convId: string, machine?: string) => void;
   } = {},
+  opts: { assetRefs?: readonly string[]; cacheStorage?: ShellCacheStorage } = {},
 ): () => void {
   if (!pushSupported() || !secureContextOk()) {
     return () => {};
@@ -204,20 +284,56 @@ export function initServiceWorker(
           return;
         }
         installing.addEventListener("statechange", () => {
-          // controller 非空 = 页面此前已被旧 SW 接管，此刻 installed 是更新
-          if (installing.state === "installed" && container.controller) {
+          // controller 非空 = 页面此前已被旧 SW 接管，此刻 installed 是更新。
+          // 这里刻意用 `=== null`、不用「逻辑非 + 变量名」的简写：tailwind 的
+          // content 会扫描 src 下全部 .ts（注释里的字面量也算），叹号紧贴
+          // container 会被当成 container 工具类的 important 变体，给产物 CSS
+          // 多塞几条没人用的规则（v1.41.9 踩过——本注释也别把那个写法原样
+          // 抄回来）。
+          if (installing.state !== "installed" || container.controller === null) {
+            return;
+          }
+          // v1.41.9——提示之前先判「本页面是不是已经是该新 SW 所属的构建」。
+          // 背景：首页文档 network-first（v1.41.7）之后，发版后第一次冷启动的
+          // 导航由旧 SW 处理、取到的已是新首页——页面跑的已是新版；紧接着
+          // 浏览器因 sw.js 构建戳变化装上新 SW，落到这里无条件弹「新版本已
+          // 就绪」，而点了刷新也不会有任何变化（页面与缓存里的文档同一版）。
+          // 判定为真（依据见 pageIsCurrentShell）→ 不提示，也不驱动接管：
+          //  - 不提示：页面与等待中新 SW 所属的构建是同一版，这次提示是多余的；
+          //  - 不驱动接管（不发 skip-waiting）：①接管不是必需的——本页已是
+          //    新版，旧 SW 继续在管不影响行为（v1.41.7 起带戳 SW 的缓存策略
+          //    一致），等待中的 SW 会在全部窗口关闭后的下一次冷启动自然激活；
+          //    ②skip-waiting 一发，同一浏览器的所有标签页同时换 controller，
+          //    其中旧构建的长开标签页已走过下面的提示分支（updateSeen 已
+          //    置位），接管一发生就会被自动重载、未发送的草稿丢失（真实
+          //    Chromium 冒烟实证）。
+          // 判定为假 / 无法判定 → 既有提示路径原样保留（置位 updateSeen +
+          // onUpdateAvailable，controllerchange 自动重载腿随之保持）：宁可
+          // 多提示一次，不能漏提示。
+          void pageIsCurrentShell({
+            assetRefs: opts.assetRefs ?? SHELL_ASSET_REFS,
+            cacheStorage: opts.cacheStorage,
+          }).then((current) => {
+            if (disposed) {
+              return; // 组件已卸载：不再回调
+            }
+            if (current) {
+              // 本页面已是该 SW 所属构建：不提示，也不驱动接管（取舍见上）。
+              // 不置位 updateSeen → 上方 onControllerChange 的守卫不会 reload。
+              return;
+            }
             updateSeen = true;
             handlers.onUpdateAvailable?.();
-          }
+          });
         });
       });
       if (disposed) {
         return;
       }
       // v1.41.5 运行中主动触发 SW 更新检查：update() 让浏览器重新拉取 sw.js，
-      // 新 SW install 后由上方既有 updatefound 链路接管（提示 + controllerchange
-      // 自动重载，此处零改动）。两个触发源的 update() 失败一律静默（离线 /
-      // 反代异常——主功能不受影响）。
+      // 新 SW install 后由上方既有 updatefound 链路接管（页面确属旧构建时
+      // 提示 + controllerchange 自动重载；v1.41.9 起先判定，见上）。两个触发
+      // 源的 update() 失败一律静默（离线 / 反代异常——主功能不受影响）。
       updateTimer = setInterval(() => {
         void reg.update().catch(() => {});
       }, SW_UPDATE_INTERVAL_MS);

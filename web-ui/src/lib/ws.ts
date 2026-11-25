@@ -1,7 +1,8 @@
 // WS 连接管理（无 UI 依赖、可单测）：
 // connect → 首帧 hello（凭证只在此帧出现，绝不进 URL）→ 等 hello_ack
 // （10s 超时视为失败）→ ready → 立即发 sync（含重连场景）→ 25s 应用层 ping
-// （relay idle 90s 断连）→ 断线指数退避重连 1s→30s（成功重置）→ 收 close 1008
+// （relay idle 90s 断连；v1.41.9 起发给全部在线的已加密机器，见文末）→ 断线
+// 指数退避重连 1s→30s（成功重置）→ 收 close 1008
 // 按 reason 分流（session expired/revoked/auth failed，onAuthFailed 带
 // AuthFailReason，调用方清对应凭证回登录页，不再重连）→ 收 close 4001
 // 视为本连接被同 token 新窗口顶替（进入 superseded 终态：停心跳停重连，否则
@@ -55,6 +56,21 @@
 // 僵死判定（25s 间隔 + 60s 阈值），消除 iOS 挂起恢复后最坏 25~60s「收不到
 // 消息」窗口；探活定时器随 stopTimers 一并清理（对齐 helloTimer/pingTimer
 // 的清理纪律）。
+// v1.41.9 E2E 会话探活：网关侧会话表随「网关 ↔ 中继」连接重建（网关重启/
+// 重连即清空），浏览器自己的 WS 却可能还活着（桌面长开页面；同机重连顶替
+// 时中继甚至不发下线快照）→ 此后浏览器拿作废密钥一直发，网关只 WARN 丢弃，
+// 用户消息静默丢失到下一次 WS 重连。machines 快照后对已加密（active）的
+// 机器各发一帧 enc-ping（网关每次连上中继必广播一帧快照）：sessionProbeMs
+//（默认 3s）内收到该机器可解密的 pong = 网关仍持有我的会话密钥；未收到 =
+// 会话已失效 → 立即重连（成熟的恢复路径：清 e2e 条目 → hello_ack → 明文
+// sync → machines 帧重新握手，App 层随 status 变化补拉数据）。设计取舍与
+// 防环论证见 probeSessions。
+// v1.41.9 心跳逐机器：25s 应用层 ping 与切回前台探活不再只发当前机器，而是
+// 对全部**在线**的已加密（active）机器各发一帧 enc-ping（当前机器不在其中
+// 时照旧发它那一帧；每台每 tick 恰一帧）——网关半开清理只豁免收到过可解密
+// 入站帧的会话，非当前机器的会话否则从未向网关证明持钥、60s 必被清，切过去
+// sync / history_query 全部解不开而界面无感。理由与「只发在线机器」的取舍
+// 见 probeOnce。
 
 import {
   DEFAULT_MACHINE,
@@ -128,13 +144,17 @@ export interface WsManagerOptions {
    *  调用取值；返回 undefined = 单机模式（不带 machine 字段，旧 relay 兼容）。 */
   getMachine?: () => string | undefined;
   /** 间隔常量可注入（默认即生产值：hello 10s / ping 25s / 僵死 60s /
-   *  visible 探活判死 3s / 退避 1s→30s）。 */
+   *  visible 探活判死 3s / E2E 会话探活 3s / 退避 1s→30s）。 */
   helloTimeoutMs?: number;
   pingIntervalMs?: number;
   deadLinkMs?: number;
   /** v1.40.1 visible 探活判死时限：探活 ping 发出后此时间内无任何入站帧
    *  → 判死链路立即重连（单测注入小值加速）。 */
   visibleProbeMs?: number;
+  /** v1.41.9 E2E 会话探活时限：machines 快照后对已加密（active）机器发出
+   *  enc-ping，此时间内未收到该机器可解密的 pong → 判会话在网关侧已失效，
+   *  立即重连（单测注入小值加速）。 */
+  sessionProbeMs?: number;
   minBackoffMs?: number;
   maxBackoffMs?: number;
 }
@@ -228,6 +248,15 @@ export function authFailReason(reason: string | undefined): AuthFailReason {
   return "auth_failed";
 }
 
+/** v1.41.9 在途 E2E 会话探活（machines 快照后发起，见 WsManager.probeSessions）：
+ *  socket = 发起时的连接（到点时不符即连接已换代，不动）；pending = 尚未
+ *  收到可解密 pong 的机器；timer = 判失效定时器（随 stopTimers 清理）。 */
+interface SessionProbe {
+  socket: WebSocketLike;
+  pending: Set<string>;
+  timer: ReturnType<typeof setTimeout>;
+}
+
 export class WsManager {
   private readonly url: string;
   private readonly token: string | undefined;
@@ -246,6 +275,7 @@ export class WsManager {
   private readonly pingIntervalMs: number;
   private readonly deadLinkMs: number;
   private readonly visibleProbeMs: number;
+  private readonly sessionProbeMs: number;
   private readonly minBackoffMs: number;
   private readonly maxBackoffMs: number;
 
@@ -266,6 +296,12 @@ export class WsManager {
   /** v1.40.1 visible 探活判死定时器（一次性）：探活 ping 发出后无入站帧
    *  到点判死重连；随 stopTimers 清理（对齐 helloTimer/pingTimer 纪律）。 */
   private visibleProbeTimer: ReturnType<typeof setTimeout> | null = null;
+  /** v1.41.9 在途 E2E 会话探活（null = 无在途探活；见 SessionProbe）。 */
+  private sessionProbe: SessionProbe | null = null;
+  /** v1.41.9 最近一帧 machines 快照的在线机器集：心跳只对**在线**的 active
+   *  机器发 enc-ping（见 probeOnce）。无需随连接重置——e2e 条目随连接销毁
+   *  清空，且只由 machines 快照之后的握手产生，故本集合恒不旧于条目。 */
+  private onlineMachines: ReadonlySet<string> = new Set();
   private lastFrameAt = 0;
   private stopped = false; // 手动 close / 认证失败：不再重连
   private disconnectHandled = false; // 单次连接的 close 事件只处理一回
@@ -291,6 +327,7 @@ export class WsManager {
     this.pingIntervalMs = opts.pingIntervalMs ?? 25_000;
     this.deadLinkMs = opts.deadLinkMs ?? 60_000;
     this.visibleProbeMs = opts.visibleProbeMs ?? 3_000;
+    this.sessionProbeMs = opts.sessionProbeMs ?? 3_000;
     this.minBackoffMs = opts.minBackoffMs ?? 1_000;
     this.maxBackoffMs = opts.maxBackoffMs ?? 30_000;
     this.e2e = new E2eCoordinator(
@@ -471,8 +508,9 @@ export class WsManager {
 
   // ---- v1.4 E2E（TOFU 决断 / 明文放行 / pin 重置后重试）----
 
-  /** TOFU 弹层决断：accept = 信任并 pin + 启用加密；false = 拒绝（转
-   *  unsupported，可再显式选择明文）。 */
+  /** TOFU 弹层决断：accept = 信任并 pin，随后以 pin 身份重新握手（v1.41.9：
+   *  active 由新握手的 e2e_ack 触发，在途期间出站业务帧阻断）；false = 拒绝
+   *  （转 unsupported，可再显式选择明文）。 */
   resolveTofu(machine: string, accept: boolean): void {
     this.e2e.resolveTofu(machine, accept);
   }
@@ -598,6 +636,12 @@ export class WsManager {
       const enc = frame as EncFrame;
       const inner = this.e2e.openEnc(enc);
       if (inner) {
+        // v1.41.9：会话探活应答在此判定（见 probeSessions）——只认可解密的
+        // pong；解不开的 enc 帧（含网关按别的密钥密封的 pong）在 openEnc
+        // 已返回 null，不算应答。
+        if (inner.type === "pong") {
+          this.noteSessionPong(enc.machine);
+        }
         // v1.1：enc 信封 machine 是路由权威来源（relay 按它路由、E2E 会话
         // 按它索引）；内帧漏带 machine（网关新帧型忘带）时注入兜底，防
         // reducer 按 DEFAULT_MACHINE 归错机器——内帧已带则不覆盖（自报优先）。
@@ -610,7 +654,12 @@ export class WsManager {
     // 发来明文业务帧 = 注入面 → 丢弃 + 降级告警（active 时；该降级的唯一
     // 可观测点）。缺省 machine 归 DEFAULT_MACHINE。
     if (frame.type === "machines") {
+      // v1.41.9：记下在线机器集（心跳只对在线的 active 机器发 enc-ping，见
+      // probeOnce）→ 让新出现的机器进入握手 → 对已加密会话探活（此刻新机器
+      // 是 pending，不会被探——防环）。
+      this.onlineMachines = new Set(frame.online);
       this.e2e.onMachines(frame.online);
+      this.probeSessions(frame.online);
     } else if (
       (frame.type === "text" ||
         frame.type === "card" ||
@@ -659,19 +708,41 @@ export class WsManager {
   }
 
   /** 心跳体逻辑（周期 tick 与切回前台探活共用）：距最后入站帧超过
-   *  thresholdMs 判链路失活 → 主动断开 + 排重连；否则发一次 ping（经 e2e
-   *  按当前机器选路包装，保命线永不阻断）。tick 用 deadLinkMs（僵死判定），
+   *  thresholdMs 判链路失活 → 主动断开 + 排重连；否则发 ping（经 e2e
+   *  按机器选路包装，保命线永不阻断）。tick 用 deadLinkMs（僵死判定），
    *  前台探活用 pingIntervalMs（半开判定——iOS 后台掐链后 readyState 仍
-   *  OPEN，等 deadLink 太迟）。 */
+   *  OPEN，等 deadLink 太迟）。
+   *
+   *  v1.41.9 ping 发给**全部在线的已加密（active）机器**，不再只发当前机器
+   *  （勿改回）：网关半开清理（crates/web/src/e2e.rs HALF_OPEN_TTL）只豁免
+   *  「收到过可解密入站帧」的会话——非当前机器的会话此前从未向网关证明
+   *  持钥，60s 后必被清，切过去 sync / history_query 全部解不开而界面无感
+   *  （静默失效到下一次 machines 快照或 WS 重连）。每个 active 会话持续
+   *  enc-ping 即持续确认，属预防而非事后恢复。
+   *  - 只发在线机器（当前机器除外）：e2e 条目不随机器掉线清除，而中继对
+   *    「显式带 machine 且该机器不在线」的帧一律回 machine_offline error
+   *    （enc 信封也带 machine，不豁免；App 渲染为红色 toast）——不过滤就是
+   *    每 tick（25s）弹一次「该机器离线，消息未送达」。
+   *  - 当前机器不在上述集合（无条目 / pending / confirming / unsupported /
+   *    明文选择 / 单机模式 / 全部掉线）仍照旧发它那一帧：保命线恒放行，
+   *    与 v1.41.8 逐字节一致；已在集合里则不重复发（每台每 tick 恰一帧）。 */
   private probeOnce(thresholdMs: number): void {
     if (Date.now() - this.lastFrameAt > thresholdMs) {
       this.teardownSocket();
       this.scheduleReconnect();
       return;
     }
-    this.rawSend(
-      this.e2e.heartbeat({ v: 1, type: "ping", machine: this.machineOf() }, this.machineOf()),
-    );
+    const active = this.e2e.activeMachines();
+    const current = this.machineOf();
+    for (const m of active) {
+      if (m !== current && !this.onlineMachines.has(m)) {
+        continue; // 机器已掉线（条目未清）：不发，免得中继回 machine_offline
+      }
+      this.rawSend(this.e2e.heartbeat({ v: 1, type: "ping", machine: m }, m));
+    }
+    if (current === undefined || !active.includes(current)) {
+      this.rawSend(this.e2e.heartbeat({ v: 1, type: "ping", machine: current }, current));
+    }
   }
 
   // ---- v1.7.x 切回前台探活（visibilitychange）----
@@ -733,6 +804,75 @@ export class WsManager {
       }, this.visibleProbeMs);
     }
   };
+
+  // ---- v1.41.9 E2E 会话探活（machines 快照后）----
+
+  /** machines 快照后对已加密会话逐机器探活——判定「网关侧是否还持有我的
+   *  会话密钥」的权威探针：网关对应用层 ping 回 pong（经其 send_business
+   *  逐 sid 加密），持有则浏览器能解开，不持有则什么都收不到。只探 active
+   *  （pending/confirming/unsupported/alert 的会话未立或已阻断，无「失效」
+   *  可言）。设计取舍（勿改回）：
+   *  - 为什么探活而不直接重握手：探活健康时零副作用；重握手则每帧快照都让
+   *    全部机器的密钥换代（退回 pending 等 ack），而快照因任一网关上下线
+   *    就会到来，与「我的会话是否失效」无关。
+   *  - 为什么不做协议帧（网关会话失效时通知浏览器）：同一会话（同 sid）多
+   *    标签页并存时网关只保留最后一次握手的密钥（「最后握手者有效」是既有
+   *    约定），通知被顶替的一方 = 引入多标签互踢机制。
+   *  - 为什么只认 pong：pong 只在网关成功解密我的 ping 之后才回；会话表为
+   *    空时网关的 pong 回的是明文（解不开 → 不算应答，正是失效形态）；
+   *    其它可解密帧（如重启前在途的 text）证明不了网关此刻持有密钥。
+   *  防环：探活失败的处理是重连而不是再探活；重连后首帧 machines 到达时
+   *  条目都是 pending（握手刚开始），不会被探。 */
+  private probeSessions(online: string[]): void {
+    // 新快照到达：在途探活作废，按新快照重新发起（避免多次快照叠加）
+    this.clearSessionProbe();
+    const pending = new Set<string>();
+    for (const m of online) {
+      if (this.e2e.statusOf(m) !== "active") {
+        continue;
+      }
+      this.rawSend(this.e2e.heartbeat({ v: 1, type: "ping", machine: m }, m));
+      pending.add(m);
+    }
+    const sock = this.socket;
+    if (pending.size === 0 || sock === null) {
+      return;
+    }
+    this.sessionProbe = {
+      socket: sock,
+      pending,
+      timer: setTimeout(() => {
+        this.sessionProbe = null;
+        // 连接已换代（期间重连/关闭——定时器虽随 stopTimers 清理，仍按发起
+        // 时连接核对）：不动，由既有状态机接管。
+        if (this.socket !== sock || !this.ready) {
+          return;
+        }
+        // 仍有机器未应答：其会话在网关侧已失效 → 立即重连（不走退避）。
+        // teardownSocket 已清空 e2e 条目：新连接 machines 帧重新握手，App 层
+        // 随 status 变化补拉 sync / workspace_list / history_query。
+        this.teardownSocket();
+        this.setStatus("reconnecting");
+        this.openSocket();
+      }, this.sessionProbeMs),
+    };
+  }
+
+  /** 会话探活应答（v1.41.9）：收到 pending 中某机器可解密的 pong → 移出；
+   *  pending 清空即清定时器（网关仍持有全部在探会话的密钥，连接不动）。 */
+  private noteSessionPong(machine: string): void {
+    const probe = this.sessionProbe;
+    if (probe !== null && probe.pending.delete(machine) && probe.pending.size === 0) {
+      this.clearSessionProbe();
+    }
+  }
+
+  private clearSessionProbe(): void {
+    if (this.sessionProbe !== null) {
+      clearTimeout(this.sessionProbe.timer);
+      this.sessionProbe = null;
+    }
+  }
 
   private handleClose = (ev: WsEvent): void => {
     this.stopTimers();
@@ -808,11 +948,13 @@ export class WsManager {
 
   /** 连接终止路径（handleClose / teardownSocket→close()）统一清理：hello
    *  超时、心跳、visible 探活判死定时器（v1.40.1——4001/1008 分流同样先过
-   *  此处，终态不漏清）。 */
+   *  此处，终态不漏清）、E2E 会话探活定时器（v1.41.9——会话随连接作废，
+   *  探活结论对新连接无意义）。 */
   private stopTimers(): void {
     this.clearHelloTimer();
     this.stopHeartbeat();
     this.clearVisibleProbeTimer();
+    this.clearSessionProbe();
   }
 
   private clearHelloTimer(): void {

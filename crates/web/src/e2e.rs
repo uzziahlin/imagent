@@ -77,6 +77,10 @@ pub(crate) const MAX_SESSIONS: usize = 8;
 /// 握手半开清理窗口：e2e_ack 发出后 60s 内无一笔成功入站解密（浏览器
 /// 握手后周期 enc-ping，正常秒级确认）即视为半开残留，清理（防探测
 /// 洪水占满会话表）。已确认会话不按此清理（见 [`E2eSessions::prune`]）。
+/// 浏览器在 TOFU 指纹确认弹层期间不发 enc 帧（心跳明文、业务帧阻断），
+/// 停留超过本窗口的握手会被清理——这是预期行为：SPA 在用户确认后以
+/// pin 身份重新握手（v1.41.9），不复用弹层期间的密钥，故本清理不影响
+/// 首连。
 const HALF_OPEN_TTL: Duration = Duration::from_secs(60);
 /// XChaCha20-Poly1305 nonce 长度（box 前缀）。
 const NONCE_LEN: usize = 24;

@@ -790,21 +790,34 @@ describe("App E2E（v1.4）", () => {
     expect(within(dialog).getByText(fingerprint(gw.ik))).toBeTruthy();
 
     fireEvent.click(within(dialog).getByRole("button", { name: "信任并启用加密" }));
-    // pin 落库 + StatusBar 锁标 + 弹层关闭
+    // v1.41.9：信任 = 落 pin + 以 pin 身份重新握手（弹层期间网关侧的会话可能
+    // 已被半开清理，不沿用其密钥）——新握手的 ack 到达前不算激活：无锁标、
+    // 弹层仍驻（App 逻辑未改，靠 active 事件关弹层）
     expect(JSON.parse(localStorage.getItem("imagent.e2ePins") ?? "{}")).toHaveProperty("home-mac");
+    expect(screen.queryByText("已加密")).toBeNull();
+    expect(screen.getByRole("dialog", { name: "确认机器加密指纹" })).toBeTruthy();
+
+    // 网关应答重新握手的 e2e_hello → StatusBar 锁标 + 弹层关闭
+    const redone = lastHello(fake);
+    const reack = gw.ackFor(redone, "home-mac");
+    act(() => {
+      fake.recv(reack);
+    });
     expect(screen.getByText("已加密")).toBeTruthy();
     expect(screen.queryByRole("dialog", { name: "确认机器加密指纹" })).toBeNull();
 
-    // 发送：出站为 enc 帧，网关密钥可解回原帧
+    // 发送：出站为 enc 帧，网关用**重新握手**的密钥可解回原帧（弹层期间的
+    // 旧密钥解不开——密钥已换代）
     fireEvent.change(screen.getByLabelText("消息输入框"), { target: { value: "机密指令" } });
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
     const encRaw = fake.sent.filter((s) => (JSON.parse(s) as { type: string }).type === "enc").at(-1);
     expect(encRaw).toBeTruthy();
     const enc = JSON.parse(encRaw!) as { machine: string; box: string };
     expect(enc.machine).toBe("home-mac");
-    expect(openBox(gw.gatewayKey(hello, ack.n2), enc.box)).toBe(
+    expect(openBox(gw.gatewayKey(redone, reack.n2), enc.box)).toBe(
       JSON.stringify({ v: 1, type: "message", convId: "web:default", text: "机密指令", machine: "home-mac" }),
     );
+    expect(openBox(gw.gatewayKey(hello, ack.n2), enc.box)).toBeNull();
   });
 
   it("TOFU 拒绝 → fail-closed 横幅 + composer 禁用；「仍以明文连接」恢复明文发送", () => {
@@ -881,6 +894,11 @@ describe("App E2E（v1.4）", () => {
     });
     ackHandshake(fake, gw, "home-mac");
     fireEvent.click(screen.getByRole("button", { name: "信任并启用加密" }));
+    // v1.41.9：信任后以 pin 身份重新握手，网关应答才激活（指纹区快照随
+    // active 事件刷新）
+    act(() => {
+      fake.recv(gw.ackFor(lastHello(fake), "home-mac"));
+    });
 
     fireEvent.click(screen.getByRole("button", { name: "管理" }));
     const dialog = screen.getByRole("dialog", { name: "管理" });
@@ -912,6 +930,10 @@ describe("App E2E（v1.4）", () => {
     });
     ackHandshake(fake, gw, "home-mac");
     fireEvent.click(screen.getByRole("button", { name: "信任并启用加密" }));
+    // v1.41.9：信任后以 pin 身份重新握手，网关应答才 active（握手完成）
+    act(() => {
+      fake.recv(gw.ackFor(lastHello(fake), "home-mac"));
+    });
     // 网关方向明文 text 帧（半开会话超时回退场景）
     act(() => {
       fake.recv({ v: 1, type: "text", convId: "web:default", text: "降级内容", machine: "home-mac" });
@@ -2739,17 +2761,24 @@ describe("App 切回前台兜底补拉 + queryHistory 拒发重试（v1.40.1）"
     act(() => {
       vi.advanceTimersByTime(1600); // 重试 2：仍 confirming → 拒发
     });
-    // 逐台信任 → 两台 active
-    fireEvent.click(
-      within(screen.getByRole("dialog", { name: "确认机器加密指纹" })).getByRole("button", {
-        name: "信任并启用加密",
-      }),
-    );
-    fireEvent.click(
-      within(screen.getByRole("dialog", { name: "确认机器加密指纹" })).getByRole("button", {
-        name: "信任并启用加密",
-      }),
-    );
+    // 逐台信任 → 两台 active。v1.41.9：每次信任后该机器以 pin 身份重新握手，
+    // 网关应答新握手才激活、弹层才切到下一台（在途期间 history_query 仍被拒）
+    const trust = (machine: string) => {
+      fireEvent.click(
+        within(screen.getByRole("dialog", { name: "确认机器加密指纹" })).getByRole("button", {
+          name: "信任并启用加密",
+        }),
+      );
+      const raw = fake.sent.filter((s) => (JSON.parse(s) as { type: string }).type === "e2e_hello").at(-1);
+      const hello = JSON.parse(raw ?? "null") as { ek: string; n1: string };
+      const ack = gw.ackFor(hello, machine);
+      act(() => {
+        fake.recv(ack);
+      });
+      return { hello, ack };
+    };
+    trust("home-mac");
+    const redoneWork = trust("work-mac");
     act(() => {
       vi.advanceTimersByTime(2400); // 重试 3：已 active → enc 直发成功，重试停止
     });
@@ -2758,7 +2787,9 @@ describe("App 切回前台兜底补拉 + queryHistory 拒发重试（v1.40.1）"
     const encs = fake.sent.filter((s) => (JSON.parse(s) as { type: string }).type === "enc");
     const inner = encs
       .map((s) => JSON.parse(s) as { machine: string; box: string })
-      .map((enc) => JSON.parse(openBox(gw.gatewayKey(hellos[1], ackWork.n2), enc.box) ?? "null"))
+      .map((enc) =>
+        JSON.parse(openBox(gw.gatewayKey(redoneWork.hello, redoneWork.ack.n2), enc.box) ?? "null"),
+      )
       .find((f) => f?.type === "history_query") as Record<string, unknown> | undefined;
     expect(inner).toEqual({ v: 1, type: "history_query", convId: "web:default", since: 0, machine: "work-mac" });
   });
