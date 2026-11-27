@@ -1881,8 +1881,10 @@ mod tests {
         };
         // 等 mock 收到 turn/start（turn 在飞）再发中断信号——与真实 /stop 时
         // 序一致；即便信号早于事件循环启动，watch 保留版本也会首轮触发。
-        // （预算放宽到 15s：全量并行下 mock 进程 spawn + 逐行轮询的尾部抖动。）
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        // （预算 30s，与 app_server 同类用例一致：断言的是中断时序逻辑而非快慢，
+        // 预算只防悬挂。15s 在 CI 的 2 核 runner 上全量并行时偶发不够——v1.42.1
+        // 的 Release 流程就栽在这里。）
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             let logged = std::fs::read_to_string(&log).unwrap_or_default();
             if logged.contains("\"method\":\"turn/start\"") {

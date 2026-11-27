@@ -618,7 +618,7 @@ pub(crate) async fn shutdown_signal() {
                 tracing::info!(target: "imagent::ops", "received SIGTERM, shutting down");
                 // v1.18 review（agent-2 #11）：与 SIGINT 同款二次信号强退——
                 // systemd stop 后 drain 挂死时操作员只能 kill -9 的出口。
-                tracing::info!(target: "imagent::ops", "再次收到 SIGTERM 立即强制退出");
+                tracing::info!(target: "imagent::ops", "再次收到 SIGTERM 将立即强制退出");
                 tokio::spawn(async move {
                     term.recv().await;
                     eprintln!("收到第二次 SIGTERM，立即强制退出");
