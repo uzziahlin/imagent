@@ -25,7 +25,7 @@
 // 构建戳：vite.config.ts 的 stampServiceWorker 插件在构建产物上替换为
 // index.html 的 sha256 前 16 位 hex（见该插件注释——SW 脚本字节必须随 app shell
 // 变化，否则浏览器永不安装新 SW）。**不要把本常量拼进 SHELL_CACHE 名**（理由见下）。
-const BUILD = "f91b3d33e8f5a685";
+const BUILD = "48e78e5d195cb76d";
 
 // cache 名固定、不含构建戳（迁移理由，v1.41.7）：线上已部署的旧 SW 是
 // cache-first 且 cache 名同为 imagent-shell-v1。新 SW 的 install 把新文档写进

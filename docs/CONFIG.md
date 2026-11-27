@@ -67,7 +67,7 @@ allowed_senders = []        # 空 = 发现模式：首启日志拿你的 open_id
 |---|---|---|
 | `cot_detail` | `brief` | 工具过程展示：`off` / `brief` / `detailed`。`/config` 可热改，`/config cot` 按会话覆盖 |
 | `reply_mode` | `card` | 回复形态偏好：`card`（卡片）/ `text`（纯文本流，无卡片权限或偏好简洁时）。改动需重启（IM 内 `/config reply_mode` 热改不受限） |
-| `quiet_hours` | — | 免打扰时段（本地时区，可跨天，如 `"22:00-08:00"`）：时段内加急（buzz）提醒降级普通消息，内容不变 |
+| `quiet_hours` | — | 免打扰时段（本地时区，可跨天，如 `"22:00-08:00"`）：时段内审批催办、纯文本会话的完成提醒降级为不加急的普通消息（内容不变），卡片会话的完成提醒不对卡片加急 |
 | `feishu_require_mention_in_group` | 开 | 群消息默认须 `@机器人`；全收群消息设 `false`（配 `im:message.group_msg` 权限） |
 | `feishu_thread_active_window_secs` | `1800` | 话题群免 @ 窗口：话题内近期有过消息则豁免群消息须 @bot；`0` = 关 |
 | `feishu_urgent_on_ask` | 开 | 审批/问题卡到达即应用内加急弹通知（免打扰时段自动跳过） |

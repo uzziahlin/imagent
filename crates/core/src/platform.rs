@@ -482,6 +482,26 @@ pub trait Platform: Send + Sync {
     /// 自己的话，不是窗口的回信。
     async fn on_peer_reply(&self, _conv: &ConvId, _body: &str) {}
 
+    /// v1.42.1 长任务完成提醒（通知型钩子，default no-op、无返回值、无能力位）：
+    /// 一轮长任务 / 含审批询问的轮次结束、用户不在场时，把「任务完成了」推到
+    /// 用户眼前。**只由 dispatch/round.rs 的完成强提醒一处调用**——调用点已先
+    /// 查 `URGENT_TEXT` 能力位（单 web 等不声明该位的平台照旧不过门）。
+    ///
+    /// 为什么不复用 [`Platform::send_urgent_text`]：两者对「平台不能振铃」的
+    /// 期望相反。审批催办要文本必须送达（不支持振铃的平台靠 trait default
+    /// 降级成普通文本，纯文本平台的催办就是那条文本）；完成提醒则要整体静默
+    /// ——普通回复 / 终态卡片已含全部信息（驾驶舱终态卡页脚就有时长与成本），
+    /// 再发一条普通文本只是重复噪音。单平台时调用点查能力位足以区分；多平台
+    /// 组合器（`MultiPlatform`）的能力位取并集、`supports_urgent_text` 取 any，
+    /// 区分不了「这个会话的归属平台能不能振铃」——此前 web 会话的完成提醒
+    /// 因此漏成驾驶舱的一条普通文本。
+    ///
+    /// 实现方只有能加急振铃的平台（飞书：对会话最新卡片发应用内加急）；其余
+    /// 平台不覆写即正确行为。无返回值：实现方 best-effort，失败自己记日志。
+    /// **不要**用于审批催办——那条路径必须继续走 `send_urgent_text`，行为
+    /// 保持不变。
+    async fn notify_task_done(&self, _conv: &ConvId, _text: &str, _hint: &ReplyHint) {}
+
     /// v1.41.8 用户自发文本镜像（协作方法，无能力位——default 即安全降级）：
     /// 发送**本用户自己发出的消息**的镜像。与 [`Platform::send_text`] 的区别
     /// 只在语义标记：`send_text` 的文本一律是 agent / 系统对用户说的话；本
@@ -698,6 +718,60 @@ mod tests {
         };
         p.on_peer_reply(&ConvId("peer:win-a".into()), "窗口的回复")
             .await;
+        assert!(
+            p.sent.lock().await.is_empty(),
+            "default no-op：不得产生任何出站文本：{:?}",
+            *p.sent.lock().await
+        );
+    }
+
+    /// v1.42.1：`notify_task_done` 的 trait default 是 no-op——未覆写的平台（驾驶
+    /// 舱 / 终端 / 纯文本 IM）对长任务完成提醒无动作：不产生任何出站文本（钉住
+    /// default 不是「委托 send_text / send_urgent_text」之类的降级——那会让终态
+    /// 卡页脚已含时长与成本的驾驶舱多出一条重复的「✅ 任务完成」）。
+    #[tokio::test]
+    async fn notify_task_done_default_is_noop() {
+        use tokio::sync::Mutex as TokioMutex;
+
+        /// 只实现必备项的最小平台（其余全走 trait default）。
+        struct BarePlatform {
+            sent: TokioMutex<Vec<(String, String)>>,
+        }
+
+        #[async_trait]
+        impl Platform for BarePlatform {
+            async fn recv(&self) -> Result<InboundMessage> {
+                Err(crate::error::CoreError::Platform("bare", "unused".into()))
+            }
+            async fn send_text(&self, conv: &ConvId, text: &str, _hint: &ReplyHint) -> Result<()> {
+                self.sent
+                    .lock()
+                    .await
+                    .push((conv.0.clone(), text.to_string()));
+                Ok(())
+            }
+            async fn send_media(
+                &self,
+                _conv: &ConvId,
+                _media: &MediaRef,
+                _hint: &ReplyHint,
+            ) -> Result<()> {
+                Ok(())
+            }
+            fn name(&self) -> &'static str {
+                "bare"
+            }
+        }
+
+        let p = BarePlatform {
+            sent: TokioMutex::new(Vec::new()),
+        };
+        p.notify_task_done(
+            &ConvId("web:s-abc".into()),
+            "✅ 任务完成 · 33m32s · $2.0008",
+            &ReplyHint::None,
+        )
+        .await;
         assert!(
             p.sent.lock().await.is_empty(),
             "default no-op：不得产生任何出站文本：{:?}",

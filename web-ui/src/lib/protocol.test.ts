@@ -635,6 +635,102 @@ describe("reducer 未读计数（侧栏徽标数据源）", () => {
     expect(s.currentConv).toBe(DEFAULT_CONV);
     expect(convsOf(s, "work-mac")[DEFAULT_CONV].unread).toBe(0);
   });
+
+  describe("v1.42.1 终态卡片点亮未读（替代驾驶舱已不再收到的「✅ 任务完成」文本）", () => {
+    const CONV = "web:long";
+    const unreadOf = (s: AppState) => convsOf(s)[CONV].unread;
+    const streamingCard = () => frame(CARD_FRAME({ convId: CONV, messageId: "m1", text: "任务卡" }));
+    const donePatch = () =>
+      frame(CARD_FRAME({ type: "card_patch", convId: CONV, messageId: "m1", text: "完成", terminal: "done" }));
+    /** 用户进入会话并发起任务：本机回显物化会话（不计未读），之后仍停在该会话。 */
+    const enterAndAsk = (s: AppState) =>
+      run(s, { type: "select_conv", convId: CONV }, { type: "send_echo", convId: CONV, text: "跑个长任务" });
+    /** history 重放帧：一张本地没有的终态卡（重放恒为终态快照）。 */
+    const HISTORY_DONE_CARD =
+      `{"v":1,"type":"history","convId":"${CONV}","entries":[` +
+      `{"kind":"card","key":"h:7","messageId":"m2","card":{"text":"历史里的终态卡","tool_calls":[],"thoughts":[],"todos":[],"phase":"outputting","run_secs":5,"terminal":"done"},"state":"done"}],` +
+      `"lastSeq":7,"trimmed":false}`;
+
+    it("非当前会话：流式卡片插入计 1 → select_conv 清零 → 再切走 → 收到终态 card_patch → unread 为 1", () => {
+      let s = run(initialState(), { type: "frame", frame: frame(TEXT_FRAME("开场", CONV)) });
+      s = run(s, { type: "frame", frame: streamingCard() });
+      expect(unreadOf(s)).toBe(2); // text + 流式卡片插入
+      s = run(s, { type: "select_conv", convId: CONV });
+      expect(unreadOf(s)).toBe(0);
+      s = run(s, { type: "select_conv", convId: DEFAULT_CONV });
+      s = run(s, { type: "frame", frame: donePatch() });
+      expect(unreadOf(s)).toBe(1);
+    });
+
+    it("非当前会话且 unread 已为 2 → 终态补丁后仍为 2（未读是「有多少东西要看」，不是事件计数）", () => {
+      let s = enterAndAsk(initialState());
+      s = run(s, { type: "frame", frame: streamingCard() });
+      // 切走后，任务期间的文本输出已经点亮了未读
+      s = run(
+        s,
+        { type: "select_conv", convId: DEFAULT_CONV },
+        { type: "frame", frame: frame(TEXT_FRAME("中途输出 1", CONV)) },
+        { type: "frame", frame: frame(TEXT_FRAME("中途输出 2", CONV)) },
+      );
+      expect(unreadOf(s)).toBe(2);
+      s = run(s, { type: "frame", frame: donePatch() });
+      expect(unreadOf(s)).toBe(2);
+    });
+
+    it("当前会话：流式 → 终态，unread 恒 0", () => {
+      let s = enterAndAsk(initialState());
+      s = run(s, { type: "frame", frame: streamingCard() });
+      expect(unreadOf(s)).toBe(0);
+      s = run(s, { type: "frame", frame: donePatch() });
+      expect(s.currentConv).toBe(CONV);
+      expect(unreadOf(s)).toBe(0);
+    });
+
+    it("终态卡片再收到同态帧（sync 重发 / 重复终态补丁 / history 重放）→ 不计", () => {
+      let s = enterAndAsk(initialState());
+      s = run(
+        s,
+        { type: "frame", frame: streamingCard() },
+        { type: "select_conv", convId: DEFAULT_CONV },
+      );
+      s = run(s, { type: "frame", frame: donePatch() });
+      expect(unreadOf(s)).toBe(1); // 状态转换的那一帧
+      // 用户看过（清零）再切走：关于这张卡的任何同态帧都不再点亮
+      s = run(s, { type: "select_conv", convId: CONV }, { type: "select_conv", convId: DEFAULT_CONV });
+      expect(unreadOf(s)).toBe(0);
+      s = run(
+        s,
+        // 重连 sync 重发（card 类型、同 messageId）
+        { type: "frame", frame: frame(CARD_FRAME({ convId: CONV, messageId: "m1", text: "完成", terminal: "done" })) },
+        // 重复终态补丁
+        { type: "frame", frame: donePatch() },
+      );
+      expect(unreadOf(s)).toBe(0);
+      // history 重放恒为终态快照、不经消息流：本地没有的终态卡补进来也不点亮
+      s = run(s, { type: "frame", frame: frame(HISTORY_DONE_CARD) });
+      expect(unreadOf(s)).toBe(0);
+      expect(
+        convsOf(s)[CONV].entries.map((e) => (e.kind === "card" ? e.messageId : e.kind)),
+      ).toEqual(["user", "m1", "m2"]);
+    });
+
+    it("streaming → streaming 的补丁 → 不计（随后的终态补丁才计）", () => {
+      let s = enterAndAsk(initialState());
+      s = run(
+        s,
+        { type: "frame", frame: streamingCard() },
+        { type: "select_conv", convId: DEFAULT_CONV },
+      );
+      s = run(
+        s,
+        { type: "frame", frame: frame(CARD_FRAME({ type: "card_patch", convId: CONV, messageId: "m1", text: "仍在运行" })) },
+      );
+      expect(unreadOf(s)).toBe(0);
+      // 对照：同一会话同一张卡，终态补丁计 1——上面的 0 只因为卡片状态没变
+      s = run(s, { type: "frame", frame: donePatch() });
+      expect(unreadOf(s)).toBe(1);
+    });
+  });
 });
 
 describe("reducer 多机（v1.1）", () => {

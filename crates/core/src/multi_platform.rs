@@ -59,6 +59,16 @@
 //! - v1.42：窗口回信通知钩子 [`Platform::on_peer_reply`]（dispatch 的
 //!   `handle_peer_inbound` 在回复落 `peer:<窗口名>` 会话后调用）同经本特判
 //!   路由到 web——推送埋点在 web 子平台（push_notify kind=peer_reply）。
+//!
+//! ## 完成提醒只按归属路由、不镜像（v1.42.1，叠加在 A 类归属路由之上）
+//!
+//! 长任务完成提醒 [`Platform::notify_task_done`] 走 A 类归属路由（`peer:`
+//! 同特判落 web），但**不进 local → web 的镜像**：它只对能加急振铃的平台有
+//! 意义（真平台只有飞书覆写），驾驶舱终态卡页脚已含时长 / 成本，镜像过去
+//! 只是一条多余文本。此前它复用 `send_urgent_text`——能力门（any）过了门，
+//! 再经子平台的 default 降级，web 会话的强提醒因此漏成驾驶舱的一条普通
+//! 文本。审批催办仍走 `send_urgent_text` 的归属 + 镜像路由（依赖 default
+//! 降级把文本送到纯文本平台），两者语义不同，不合并。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -628,6 +638,24 @@ impl Platform for MultiPlatform {
         }
     }
 
+    /// v1.42.1 长任务完成提醒：按 conv 归属路由（`peer:` conv 经 [`Self::child_for`]
+    /// 特判落 web——同样无事发生），**不镜像**。不走 [`Self::route_with_mirror`]：
+    /// 完成提醒只对能加急振铃的平台有意义——驾驶舱终态卡页脚已含时长 / 成本，
+    /// local 会话的强提醒镜像给 web 只会多出一条普通文本（此前 web 会话的强
+    /// 提醒正是这样漏进驾驶舱的：能力门取 any 过了门，再经子平台的
+    /// `send_urgent_text` default 降级成文本）。web / local 子平台未覆写本方法
+    /// （trait default no-op），落过去即无事发生；只有飞书覆写为应用内加急。
+    /// 无命中静默跳过（对齐 [`Self::on_peer_reply`] 的钩子语义：无返回值，无处
+    /// 报错）。
+    ///
+    /// 审批催办**不**走这里——它继续经 [`Self::send_urgent_text`] 的归属 + 镜像
+    /// 路由与子平台的 default 降级，把文本送到纯文本平台（行为不变）。
+    async fn notify_task_done(&self, conv: &ConvId, text: &str, hint: &ReplyHint) {
+        if let Ok(child) = self.child_for(conv) {
+            child.notify_task_done(conv, text, hint).await;
+        }
+    }
+
     /// 逐子平台探测，每行加 `[<name>] ` 前缀后合并——/doctor 里可分辨哪行
     /// 来自哪个平台。
     async fn doctor_probes(&self) -> Vec<String> {
@@ -859,6 +887,56 @@ mod tests {
     /// mock 的 recv 注入端。
     type InjectTx = mpsc::Sender<Result<InboundMessage>>;
 
+    /// v1.42.1：实现了 `notify_task_done` 的最小平台——只实现必备项，完成提醒记到
+    /// 共享 Vec。它是路由测试的**探针**：记录的只是「组合器把调用派给了哪个子
+    /// 平台」，与子平台拿到之后怎么加急无关（真平台只有飞书覆写；`MockPlat` 不
+    /// 覆写，代表 web / local 的真实形态）。
+    struct DoneProbe {
+        name: &'static str,
+        done: SentLog,
+    }
+
+    /// 构造探针：返回（平台句柄、完成提醒记录端）。
+    fn done_probe(name: &'static str) -> (Arc<DoneProbe>, SentLog) {
+        let done = Arc::new(TokioMutex::new(Vec::new()));
+        (
+            Arc::new(DoneProbe {
+                name,
+                done: done.clone(),
+            }),
+            done,
+        )
+    }
+
+    #[async_trait]
+    impl Platform for DoneProbe {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        /// 探针不注入入站：泵任务挂起即可（组合器 drop 时 abort）。
+        async fn recv(&self) -> Result<InboundMessage> {
+            std::future::pending().await
+        }
+        /// 完成提醒不得退化成出站文本——落到这里说明路由错了。
+        async fn send_text(&self, _conv: &ConvId, _text: &str, _hint: &ReplyHint) -> Result<()> {
+            Err(CoreError::Platform(self.name, "探针不应发出站文本".into()))
+        }
+        async fn send_media(
+            &self,
+            _conv: &ConvId,
+            _media: &MediaRef,
+            _hint: &ReplyHint,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn notify_task_done(&self, conv: &ConvId, text: &str, _hint: &ReplyHint) {
+            self.done
+                .lock()
+                .await
+                .push((conv.0.clone(), text.to_string()));
+        }
+    }
+
     fn two_children() -> (MultiPlatform, InjectTx, InjectTx, SentLog, SentLog) {
         let (a, atx, a_sent) = mock("a", PlatformCaps::empty(), false, Vec::new(), false);
         let (b, btx, b_sent) = mock("b", PlatformCaps::empty(), false, Vec::new(), false);
@@ -1070,6 +1148,113 @@ mod tests {
         assert!(
             a.peer_replies.lock().await.is_empty() && b.peer_replies.lock().await.is_empty(),
             "无 web 子平台时窗口回信通知静默跳过"
+        );
+    }
+
+    /// 用例（v1.42.1）：长任务完成提醒 notify_task_done 按 conv 归属路由且**不
+    /// 镜像**——feishu 会话只派给 feishu 子平台（web 不收）；local 会话只派给
+    /// local（不镜像给 web 驾驶舱）；peer: 会话经 child_for 特判落 web；无归属
+    /// 平台的 conv 静默跳过。全部用探针：断言的是「调用到了哪个子平台」，
+    /// 只有归属方有记录。
+    #[tokio::test]
+    async fn notify_task_done_routes_to_owning_child_without_mirror() {
+        let (f, f_done) = done_probe("feishu");
+        let (l, l_done) = done_probe("local");
+        let (w, w_done) = done_probe("web");
+        let m = MultiPlatform::new(vec![f, l, w]).expect("合并 feishu+local+web");
+
+        m.notify_task_done(
+            &ConvId("feishu:oc_x".into()),
+            "✅ 任务完成",
+            &ReplyHint::None,
+        )
+        .await;
+        assert_eq!(
+            f_done.lock().await.as_slice(),
+            &[("feishu:oc_x".to_string(), "✅ 任务完成".to_string())],
+            "conv / text 原样透传给归属子平台"
+        );
+        assert!(
+            l_done.lock().await.is_empty() && w_done.lock().await.is_empty(),
+            "非归属子平台不收（不广播）"
+        );
+
+        m.notify_task_done(
+            &ConvId("local:work".into()),
+            "✅ 任务完成",
+            &ReplyHint::None,
+        )
+        .await;
+        assert_eq!(l_done.lock().await.len(), 1, "local 会话派给 local 子平台");
+        assert!(
+            w_done.lock().await.is_empty(),
+            "local 会话的完成提醒不镜像给 web 驾驶舱"
+        );
+
+        m.notify_task_done(
+            &ConvId("peer:win-a".into()),
+            "✅ 任务完成",
+            &ReplyHint::None,
+        )
+        .await;
+        assert_eq!(w_done.lock().await.len(), 1, "peer: 会话主路由 web 子平台");
+        assert_eq!(
+            f_done.lock().await.len(),
+            1,
+            "feishu 不收其它平台 conv 的完成提醒"
+        );
+
+        // 无归属平台的 conv：静默跳过（不 panic、不落任何子平台）。
+        m.notify_task_done(&ConvId("zzz:x".into()), "✅ 任务完成", &ReplyHint::None)
+            .await;
+        assert!(
+            f_done.lock().await.len() == 1
+                && l_done.lock().await.len() == 1
+                && w_done.lock().await.len() == 1,
+            "无归属平台的 conv 静默跳过"
+        );
+    }
+
+    /// 用例（v1.42.1）：不覆写 notify_task_done 的子平台（`MockPlat`——web / local
+    /// 的真实形态）落到 trait default，无任何可见副作用（不退化成文本）；完成
+    /// 提醒的能力门仍取 any（feishu 会话不丢提醒）。同一用例钉住**审批催办
+    /// 路径未动**：催办继续走 send_urgent_text 的归属 + 镜像路由与子平台 default
+    /// 降级——多平台下 web 会话照旧收到降级文本、local 会话照旧镜像给 web。
+    #[tokio::test]
+    async fn notify_task_done_silent_for_plain_children_and_urgent_text_unchanged() {
+        // feishu-like（声明支持加急）/ web / local：均未覆写 notify_task_done。
+        let (f, _ftx, f_sent) = mock("feishu", PlatformCaps::empty(), true, Vec::new(), false);
+        let (w, _wtx, w_sent) = mock("web", PlatformCaps::empty(), false, Vec::new(), false);
+        let (l, _ltx, l_sent) = mock("local", PlatformCaps::empty(), false, Vec::new(), false);
+        let m = MultiPlatform::new(vec![f, w, l]).expect("合并 feishu+web+local");
+        assert!(
+            m.supports_urgent_text(),
+            "能力门仍取 any：feishu 会话不丢提醒"
+        );
+
+        for conv in ["feishu:oc_x", "web:s-1", "local:work", "peer:win-a"] {
+            m.notify_task_done(&ConvId(conv.into()), "✅ 任务完成", &ReplyHint::None)
+                .await;
+        }
+        assert!(
+            f_sent.lock().await.is_empty()
+                && w_sent.lock().await.is_empty()
+                && l_sent.lock().await.is_empty(),
+            "未覆写的子平台走 trait default：不产生任何出站文本"
+        );
+
+        // 对照——审批催办（send_urgent_text）行为未动：归属 + 镜像 + default 降级。
+        for conv in ["feishu:oc_x", "web:s-1", "local:work"] {
+            m.send_urgent_text(&ConvId(conv.into()), "催办", &ReplyHint::None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(f_sent.lock().await.len(), 1, "feishu 会话的催办派给 feishu");
+        assert_eq!(l_sent.lock().await.len(), 1, "local 会话的催办派给 local");
+        assert_eq!(
+            w_sent.lock().await.len(),
+            2,
+            "web 会话的催办照旧送达，local 会话的催办照旧镜像给 web"
         );
     }
 

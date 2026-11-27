@@ -1288,8 +1288,9 @@ export type ConvState = {
   /** 最后一条消息到达时间（Date.now() 毫秒，仅 UI 展示用）。 */
   lastAt: number;
   /** 未读计数（侧栏徽标）：非当前 conv 收到新消息（text 追加 / 已存在 conv 的新
-   *  card 插入）+1，select_conv 点选清零。card_patch 替换与首次物化的 card 插入
-   *  （sync 重放 / 新会话首卡）不计——防刷新/重连/切机后全部会话被误点亮。 */
+   *  card 插入 / 已存在 conv 的卡片由运行中变终态且当前未读为 0）+1，select_conv
+   *  点选清零。其余 card_patch 替换与首次物化的 card 插入（sync 重放 / 新会话
+   *  首卡）不计——防刷新/重连/切机后全部会话被误点亮。 */
   unread: number;
   /** 自动显示名（会话自动命名）：该会话首条 user/text 消息的单行摘要（按字符
    *  截 CONV_TITLE_MAX_CHARS，中文不劈半），一旦写入不再变——首条消息即定调。
@@ -1567,8 +1568,9 @@ function appendEntry(
 
 /** card / card_patch：同机器同 conv 内同 messageId 整卡替换（保留原位），否则追加。
  *  概要（lastPreview/lastAt）仅在卡片是会话最新条目时更新——补丁旧卡片不动概要。
- *  未读：仅「已存在的 conv」的新卡片插入计数（非当前 conv）；替换（card_patch /
- *  sync 重放同 messageId）与 conv 首次物化（刷新/切机后的 sync 恢复、新会话首卡）
+ *  未读（均限非当前 conv）：「已存在的 conv」的新卡片插入计数；v1.42.1 起同 messageId
+ *  替换里「运行中 → 终态」的状态转换那一帧也计（见函数内注释）；其余替换（运行中
+ *  补丁、终态同态重发）与 conv 首次物化（刷新/切机后的 sync 恢复、新会话首卡）
  *  不计——刷新重连后不会把全部会话误点亮。 */
 function upsertCard(state: AppState, machine: string, frame: CardFrame): AppState {
   const convExisted = state.spaces[machine]?.convs[frame.convId] !== undefined;
@@ -1594,8 +1596,24 @@ function upsertCard(state: AppState, machine: string, frame: CardFrame): AppStat
   }
   entries = trimEntries(entries);
   const isLatest = idx === -1 || idx === conv.entries.length - 1;
+  // 未读表示「有多少东西要去看」，不是事件计数。计入的两类：
+  // ① 新卡片插入已存在的 conv（convExisted：首次物化是刷新 / 切机后的 sync
+  //    恢复或新会话首卡，计了会把全部会话点亮）；
+  // ② v1.42.1：卡片由运行中变为终态的那一帧——任务在别的会话里跑完了 / 出错了 /
+  //    被中断。此前侧栏靠网关随后补发的一条「✅ 任务完成」文本点亮，驾驶舱已
+  //    不再收到那条文本（终态卡页脚本就含时长 / 成本），改由状态转换本身计。
+  //    - 只认状态转换：已是终态的卡再收到同态帧（sync 重发、重复终态补丁）不计；
+  //    - 该会话已有未读（用户连任务开始都没看过）时不再叠加——点进去自然会看到
+  //      终态，叠加只会让数字虚高。
+  const prev = idx >= 0 ? conv.entries[idx] : undefined;
+  const finishedNow =
+    prev !== undefined &&
+    prev.kind === "card" &&
+    prev.state === "streaming" &&
+    frame.state !== "streaming";
+  const notCurrent = !(machine === state.currentMachine && frame.convId === state.currentConv);
   const bumpUnread =
-    idx === -1 && convExisted && !(machine === state.currentMachine && frame.convId === state.currentConv);
+    convExisted && notCurrent && (idx === -1 || (finishedNow && conv.unread === 0));
   const nextConv: ConvState = {
     ...conv,
     entries,

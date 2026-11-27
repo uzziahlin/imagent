@@ -154,9 +154,8 @@ impl CotDetail {
 
 /// Wave B-4：免打扰时段（`quiet_hours = "22:00-08:00"`，**本地时区**）。
 ///
-/// 窗口可跨天（22:00 → 次日 08:00）。只影响 **buzz 类加急提醒**（审批过半催办、
-/// 长任务完成强提醒）：时段内降级为普通消息（不加 buzz 字段）——**不影响消息
-/// 内容、不影响普通消息的发送**，仅去掉加急振铃。`None`（缺省）= 不启用。
+/// 窗口可跨天（22:00 → 次日 08:00）。只影响 **加急提醒**：审批过半催办在时段内
+/// 降级为普通消息（不加 buzz 字段）；长任务完成强提醒在时段内不对卡片加急、纯文本会话同样降级为不加急的普通文本——**不影响消息内容、不影响普通消息的发送**。`None`（缺省）= 不启用。
 /// start == end 表示空窗口（无任何效果）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuietHours {
@@ -550,7 +549,8 @@ pub struct Config {
     #[serde(default)]
     pub reply_mode: ReplyMode,
     /// Wave B-4：免打扰时段（`"22:00-08:00"`，本地时区，可跨天；None = 不启用）。
-    /// 只影响 buzz 类加急提醒：时段内降级为普通消息（不加 buzz 字段），内容不变。
+    /// 只影响加急提醒：时段内审批过半催办、纯文本会话的完成提醒降级为普通消息（不加 buzz 字段），内容不变；
+    /// 卡片会话的完成提醒不对卡片加急。
     /// 改动需重启（提醒发送在各平台实现侧，无热改句柄）。
     #[serde(default)]
     pub quiet_hours: Option<String>,
@@ -1563,7 +1563,7 @@ platform = "ilink"   # ilink(默认,扫码登录) | wecom(企业微信机器人)
 # stranger_mention_hint = false                # 未放行群里被 @ 时回一句引导（默认 false 完全静默防探测；私聊始终静默）
 # stranger_p2p_hint = true                     # 未放行用户的私聊回引导（默认 true：私聊是主动来找 bot 的，无探测面；含 sender id 与 /allow 指引）
 # reply_mode = "card"                          # 回复形态：card(默认,流式卡片) | text(纯文本)；/config 可热改
-# quiet_hours = "22:00-08:00"                  # 免打扰时段(本地时区,可跨天)：时段内加急(buzz)提醒降级为普通消息，内容不变；不设=不启用，改动需重启
+# quiet_hours = "22:00-08:00"                  # 免打扰时段(本地时区,可跨天)：时段内审批催办降级为普通消息、完成提醒不加急卡片；不设=不启用，改动需重启
 # feishu_thread_active_window_secs = 1800      # 话题群免@窗口(秒,仅feishu)：话题内近期有消息则豁免群消息须@bot；默认30分钟，0=关闭，改动需重启
 permission_mode = "auto"    # 缺省=auto：claude-cli=透传 claude 原生 auto 模式(分类器自动放行安全操作,高危进 IM)+审批闭环；codex-app=保留 auto(审批档缺省 on-request,同样分类器筛+高危进 IM)；其余后端=off；显式 ask=claude/codex-app 需审批的动作都进 IM(只读工具内建免批,真机校准 2026-08)
 # claude_permission_channel = "control"  # 审批通道：control(缺省)=canUseTool 双工(SDK 现行标准)；mcp=旧 --permission-prompt-tool(回退,真机有问题时切回)；SIGHUP 热切

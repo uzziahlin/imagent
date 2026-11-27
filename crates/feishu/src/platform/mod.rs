@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::sync::{mpsc, Mutex, RwLock};
-use tracing::warn;
+use tracing::{info, warn};
 
 use imagent_core::{
     command_card_fallback_text, split_message, CardButton, CardTerminal, ConvId, CoreError, Dedup,
@@ -109,8 +109,9 @@ pub struct FeishuPlatform {
     /// 评论回复分片上限：`min(config.message_max_len, FEISHU_COMMENT_TEXT_MAX)`。
     comment_split_max: usize,
     /// Wave B-4：免打扰时段（config `quiet_hours` 解析产物；None = 不启用）——
-    /// buzz 类加急提醒（send_urgent_text）在窗口内降级为普通消息（不加 buzz
-    /// 字段），只影响加急不影响内容。本地时区判定（chrono Local）。
+    /// 审批催办（send_urgent_text）在窗口内降级为普通消息；v1.42.1：长任务完成
+    /// 提醒（notify_task_done）在窗口内不对卡片加急（纯文本会话降级为普通
+    /// 文本）。只影响加急不影响内容。本地时区判定（chrono Local）。
     quiet_hours: Option<imagent_core::QuietHours>,
     /// v1.21 per-conv 发送令牌桶速率（消息创建/秒；0 = 关闭）。主动预算出站
     /// 频率——把「挨 429 再被动退避」翻转为「不触发 429」。
@@ -205,8 +206,8 @@ impl FeishuPlatform {
     ///   平台协议上限）；send_text 各分片阈值与它取 min（见 `text_split_max`）。
     /// - `ask_timeout_secs`：config `permission_ask_timeout_secs`——审批/问题卡
     ///   倒计时 note 的真实值（与 core 的实际超时预算同源）。
-    /// - `quiet_hours`（Wave B-4）：config `quiet_hours` 解析产物——buzz 加急
-    ///   提醒的免打扰降级窗口。
+    /// - `quiet_hours`（Wave B-4）：config `quiet_hours` 解析产物——加急提醒的
+    ///   免打扰窗口（催办降级普通消息 / 完成提醒不对卡片加急，见字段注释）。
     /// - `thread_active_window_secs`（Wave B-8）：话题免 @ 窗口（0 = 关闭）。
     /// - `asr_enabled`（W3-1）：语音转文字开关（config `feishu_asr_enabled`。
     ///   关闭时语音消息回退为提示，不调 speech_to_text）。
@@ -1259,6 +1260,42 @@ pub(crate) async fn fetch_cached_token(
     }
 }
 
+/// v1.42.1 长任务完成提醒的投递路由（[`task_done_route`] 的产物，
+/// `notify_task_done` 只按它做 IO 分发）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskDoneRoute {
+    /// 对会话最新卡片发应用内加急（不产生新消息）。
+    Card,
+    /// 发一条完成文本；`buzz` = 是否带加急振铃（免打扰时段不带）。
+    Text { buzz: bool },
+    /// 不发（原因见 [`task_done_route`]）。
+    Skip,
+}
+
+/// v1.42.1：长任务完成提醒发到哪里。取舍与审批催办（`send_urgent_text`，那条
+/// 路径保留失败回退文本）不同——卡片会话里，完成提醒的信息（已完成 / 时长 /
+/// 成本）终态卡片页脚里都有，它要的只是「把用户叫回来看卡」：
+/// - 没有卡片（`reply_mode = text` 的纯文本会话，或本轮卡片发送失败过）：发
+///   完成文本。纯文本会话没有卡片页脚，这条文本是完成状态唯一的落点；免打扰
+///   时段去掉的是振铃不是信息——降级为不加 buzz 的普通文本（与催办同时段的
+///   处理一致，也不比深夜照常到达的最终回复更打扰）。
+/// - 有卡片：只对卡片发应用内加急。加急接口失败（权限缺失、卡片已删等）与
+///   确定不了接收人（群会话里发起者不明）都**不退回文本**——后者在群里等于
+///   替所有人 ping 一遍；原因由调用方记日志。
+/// - 有卡片 + 免打扰时段：不加急也不发。卡片页脚已有完成状态；此前降级成一
+///   条不振铃的普通文本，正是它与卡片流割裂的来源。
+fn task_done_route(has_card: bool, has_sender: bool, quiet: bool) -> TaskDoneRoute {
+    if !has_card {
+        TaskDoneRoute::Text { buzz: !quiet }
+    } else if quiet {
+        TaskDoneRoute::Skip
+    } else if has_sender {
+        TaskDoneRoute::Card
+    } else {
+        TaskDoneRoute::Skip
+    }
+}
+
 #[async_trait]
 impl Platform for FeishuPlatform {
     /// B1 能力声明：飞书全亮（`PlatformCaps::ALL` 全位）。与覆写方法清单对齐，
@@ -1274,7 +1311,8 @@ impl Platform for FeishuPlatform {
     /// - URGENT_TEXT：send_urgent_text / supports_urgent_text（buzz 字段）
     /// - RECONNECT：reconnect（WS 断开重连）
     /// - GROUP_CHATS：require_mention_in_group / set_… / list_joined_chats
-    /// （doctor_probes / note_round_initiator 为协作钩子，无能力位。）
+    /// （doctor_probes / note_round_initiator / notify_task_done 为协作钩子，
+    /// 无能力位。）
     /// 一致性测试 `feishu_caps_match_overrides` 钉住本值。
     fn capabilities(&self) -> PlatformCaps {
         PlatformCaps::ALL
@@ -1454,6 +1492,58 @@ impl Platform for FeishuPlatform {
     /// 完成强提醒是否发送。
     fn supports_urgent_text(&self) -> bool {
         true
+    }
+
+    /// v1.42.1 长任务完成提醒（trait 语义见 `Platform::notify_task_done`；调用方
+    /// 只有 dispatch 的完成强提醒——审批催办仍走 [`Self::send_urgent_text`]，那条
+    /// 路径的免打扰降级 / 失败回退文本保持不变）。有卡片就只对卡片发应用内
+    /// 加急，发到哪里见 [`task_done_route`]；best-effort 无返回值——不发的每种
+    /// 原因都记日志（不输出接收人 id）。
+    async fn notify_task_done(&self, conv: &ConvId, text: &str, hint: &ReplyHint) {
+        let tail = self
+            .conv_states
+            .lock()
+            .await
+            .get(&conv.0)
+            .and_then(|s| s.card_tail.clone());
+        let sender = self.last_sender(&conv.0).await;
+        let quiet = self.in_quiet_hours();
+        match task_done_route(tail.is_some(), !sender.is_empty(), quiet) {
+            // 会话没有卡片可加急（纯文本会话 / 本轮卡片发送失败过）：完成文本，
+            // 免打扰时段不带 buzz。
+            TaskDoneRoute::Text { buzz } => {
+                if let Err(e) = self.send_text_opts(conv, text, hint, buzz).await {
+                    warn!(target: "feishu", conv_id = %conv.0, error = %e, "长任务完成提醒文本发送失败");
+                }
+            }
+            TaskDoneRoute::Card => {
+                // 路由为 Card 时 tail 必为 Some（has_card 即由它而来）。
+                if let Some(mid) = tail {
+                    if let Err(e) = self
+                        .with_token(|t| {
+                            let mid = mid.clone();
+                            let sender = sender.clone();
+                            async move {
+                                crate::client::urgent_app_buzz(&self.core_config, &t, &mid, &sender)
+                                    .await
+                            }
+                        })
+                        .await
+                    {
+                        warn!(target: "feishu", conv_id = %conv.0, error = %e, "应用内加急失败，长任务完成提醒不发送（不退回文本）");
+                    }
+                }
+            }
+            // Skip 只有两种来由：有卡 + 免打扰（不加急也不发），或有卡但确定
+            // 不了接收人——后者必不在免打扰时段（路由先判免打扰）。
+            TaskDoneRoute::Skip => {
+                if quiet {
+                    info!(target: "feishu", conv_id = %conv.0, "免打扰时段，长任务完成提醒不对卡片加急");
+                } else {
+                    info!(target: "feishu", conv_id = %conv.0, "确定不了接收人，长任务完成提醒不发送（群里发文本等于提醒所有人）");
+                }
+            }
+        }
     }
 
     async fn send_media(&self, conv: &ConvId, media: &MediaRef, _hint: &ReplyHint) -> Result<()> {
@@ -2190,7 +2280,7 @@ impl Platform for FeishuPlatform {
         let sender_opt = (!sender.is_empty()).then_some(sender);
         if let Some((_chat, root_id)) = thread_target_from_conv(conv) {
             let card_json = render_card(card, &conv.0, sender_opt.as_deref());
-            return self
+            let mid = self
                 .with_token(|t| {
                     let root_id = root_id.clone();
                     let card_json = card_json.clone();
@@ -2206,8 +2296,14 @@ impl Platform for FeishuPlatform {
                         .await
                     }
                 })
-                .await
-                .map(|mid| mid.map(|m| format!("msg:{m}")));
+                .await;
+            // v1.42.1：话题里的卡同样是会话最新卡片，登记为强提醒的加急对象
+            //（与 send_interactive_anchored 两条路一致）——此前本分支直接返回
+            // 不登记，话题群的完成提醒只能退回一条与卡片流割裂的 buzz 文本。
+            if let Ok(Some(m)) = &mid {
+                self.note_card_tail(&conv.0, m).await;
+            }
+            return mid.map(|mid| mid.map(|m| format!("msg:{m}")));
         }
         let (receive_id, kind) = receive_target_from_conv(conv)
             .ok_or_else(|| CoreError::Platform(PLATFORM, format!("非法 conv_id: {}", conv.0)))?;
@@ -2462,6 +2558,289 @@ mod tests {
             p.supports_urgent_text()
         );
         assert!(p.supports_urgent_text());
+    }
+
+    /// v1.42.1：长任务完成提醒的路由真值表（8 种组合）——分支选择是产品取舍，
+    /// 逐格钉住：没有卡片才发文本（纯文本会话没有卡片页脚，这条文本是完成状态
+    /// 唯一的落点），免打扰时段只是不带 buzz；有卡片只加急——确定不了接收人
+    /// 不发（群里发文本等于提醒所有人），免打扰时段不加急也不发。
+    #[test]
+    fn task_done_route_truth_table() {
+        use super::TaskDoneRoute::{Card, Skip, Text};
+        // (has_card, has_sender, quiet) → 期望路由
+        let cases: [(bool, bool, bool, super::TaskDoneRoute); 8] = [
+            (false, false, false, Text { buzz: true }), // 纯文本会话：buzz 文本
+            (false, true, false, Text { buzz: true }),
+            (true, false, false, Skip), // 有卡无接收人：不发
+            (true, true, false, Card),  // 应用内加急
+            // 免打扰 + 无卡：普通文本（去掉的是振铃，不是信息）
+            (false, false, true, Text { buzz: false }),
+            (false, true, true, Text { buzz: false }),
+            (true, false, true, Skip), // 免打扰 + 有卡：不加急也不发
+            (true, true, true, Skip),
+        ];
+        for (has_card, has_sender, quiet, want) in cases {
+            assert_eq!(
+                super::task_done_route(has_card, has_sender, quiet),
+                want,
+                "has_card={has_card} has_sender={has_sender} quiet={quiet}"
+            );
+        }
+    }
+
+    /// v1.42.1 notify_task_done / 话题群 send_card 用例的 mock 回环请求记录：
+    /// (path?query, body)。
+    type ReqLog = Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+    /// 起本地回环 mock + 指向它的 platform（token 预填，不打真端点）。只记录
+    /// 业务 API（`/open-apis/`）——平台构造即拉起的 WS 收事件任务会反复握手
+    /// 同一个 mock，那些请求与被测的投递无关。`urgent_ok=false` 让加急接口
+    /// 回「无权限」形态的 code != 0。
+    async fn mock_api_fixture(
+        quiet_hours: Option<imagent_core::QuietHours>,
+        urgent_ok: bool,
+    ) -> (FeishuPlatform, ReqLog) {
+        let hits: ReqLog = Arc::default();
+        let hits_c = hits.clone();
+        let base = spawn_mock_feishu_req(Arc::new(move |path: &str, body: &str| {
+            if path.starts_with("/open-apis/") {
+                hits_c
+                    .lock()
+                    .unwrap()
+                    .push((path.to_string(), body.to_string()));
+            }
+            let code = if path.contains("/urgent_app") && !urgent_ok {
+                99991672
+            } else {
+                0
+            };
+            (
+                200u16,
+                format!(r#"{{"code":{code},"msg":"success","data":{{"message_id":"om_new"}}}}"#),
+            )
+        }))
+        .await;
+        let p = FeishuPlatform::new(
+            "cli_test".into(),
+            "secret_test".into(),
+            base,
+            true,
+            None,
+            300,
+            quiet_hours,
+            1800,
+            true,
+            None,
+            0.0,
+            false,
+            0,
+        )
+        .expect("构造");
+        *p.token.write().await = Some(("t_mock".to_string(), Instant::now()));
+        (p, hits)
+    }
+
+    /// 预置会话状态：card_tail（会话最新卡片）与 sender（轮次发起者）。
+    async fn seed_conv(p: &FeishuPlatform, conv: &str, with_card: bool, with_sender: bool) {
+        let mut m = p.conv_states.lock().await;
+        let st = m.entry(conv.to_string()).or_default();
+        st.card_tail = with_card.then(|| "om_card".to_string());
+        st.sender = with_sender.then(|| "ou_initiator".to_string());
+    }
+
+    /// v1.42.1：话题群里发的流式卡登记为会话最新卡片（card_tail，强提醒的加急
+    /// 对象）——此前该分支发完直接返回不登记，话题群的完成提醒 / 审批催办找不到
+    /// 卡片，只能退回一条与卡片流割裂的 buzz 文本。句柄仍是 `msg:<回执 id>`。
+    #[tokio::test]
+    async fn send_card_in_thread_notes_card_tail() {
+        let (p, hits) = mock_api_fixture(None, true).await;
+        let conv = ConvId("feishu:oc_grp:om_root".into());
+        p.conv_states
+            .lock()
+            .await
+            .entry(conv.0.clone())
+            .or_default()
+            .sender = Some("ou_initiator".into());
+        let handle = p
+            .send_card(&conv, &done_card("话题里的卡"), &ReplyHint::None)
+            .await
+            .expect("话题群发卡成功");
+        assert_eq!(
+            handle.as_deref(),
+            Some("msg:om_new"),
+            "句柄仍是 msg:<回执消息 id>"
+        );
+        let hits = hits.lock().unwrap().clone();
+        assert_eq!(hits.len(), 1, "只发一条 reply: {hits:?}");
+        assert_eq!(
+            hits[0].0, "/open-apis/im/v1/messages/om_root/reply",
+            "reply 进原话题"
+        );
+        assert_eq!(
+            p.conv_states.lock().await[&conv.0].card_tail.as_deref(),
+            Some("om_new"),
+            "话题里的卡登记为会话最新卡片（强提醒的加急对象）"
+        );
+    }
+
+    /// v1.42.1：有卡片 → 只对卡片发应用内加急（接收人 = 轮次发起者），不产生
+    /// 任何文本消息。
+    #[tokio::test]
+    async fn notify_task_done_urgents_latest_card() {
+        let (p, hits) = mock_api_fixture(None, true).await;
+        seed_conv(&p, "feishu:oc_grp", true, true).await;
+        p.notify_task_done(
+            &ConvId("feishu:oc_grp".into()),
+            "✅ 任务完成 · 33m32s",
+            &ReplyHint::None,
+        )
+        .await;
+        assert_eq!(
+            hits.lock().unwrap().as_slice(),
+            &[(
+                "/open-apis/im/v1/messages/om_card/urgent_app?user_id_type=open_id".to_string(),
+                r#"{"user_id_list":["ou_initiator"]}"#.to_string(),
+            )],
+            "只发一次应用内加急，不产生文本"
+        );
+    }
+
+    /// v1.42.1：有卡但确定不了接收人 → 什么都不发；加急接口失败 → 只有那一次
+    /// 加急请求，**不退回文本**（此前回退一条 buzz 文本，与卡片流割裂）。
+    #[tokio::test]
+    async fn notify_task_done_skips_without_sender_or_on_urgent_failure() {
+        let (p, hits) = mock_api_fixture(None, true).await;
+        seed_conv(&p, "feishu:oc_grp", true, false).await;
+        p.notify_task_done(
+            &ConvId("feishu:oc_grp".into()),
+            "✅ 任务完成 · 33m32s",
+            &ReplyHint::None,
+        )
+        .await;
+        assert!(
+            hits.lock().unwrap().is_empty(),
+            "无接收人：不加急也不发文本（群里发文本等于提醒所有人）"
+        );
+
+        let (p, hits) = mock_api_fixture(None, false).await;
+        seed_conv(&p, "feishu:oc_grp", true, true).await;
+        p.notify_task_done(
+            &ConvId("feishu:oc_grp".into()),
+            "✅ 任务完成 · 33m32s",
+            &ReplyHint::None,
+        )
+        .await;
+        let hits = hits.lock().unwrap().clone();
+        assert_eq!(hits.len(), 1, "接口失败后不退回文本: {hits:?}");
+        assert!(
+            hits[0].0.contains("/om_card/urgent_app"),
+            "唯一一次请求就是加急: {}",
+            hits[0].0
+        );
+    }
+
+    /// v1.42.1：会话没有卡片可加急（`reply_mode = text` 的纯文本会话 / 本轮卡片
+    /// 发送失败过）→ 这条文本是完成状态唯一的落点，带 buzz 发送。
+    #[tokio::test]
+    async fn notify_task_done_falls_back_to_buzz_text_without_card() {
+        let (p, hits) = mock_api_fixture(None, true).await;
+        seed_conv(&p, "feishu:ou_x", false, true).await;
+        p.notify_task_done(
+            &ConvId("feishu:ou_x".into()),
+            "✅ 任务完成 · 33m32s",
+            &ReplyHint::None,
+        )
+        .await;
+        let hits = hits.lock().unwrap().clone();
+        assert_eq!(hits.len(), 1, "无卡会话发一条 buzz 文本: {hits:?}");
+        let (path, body) = &hits[0];
+        assert!(
+            path.starts_with("/open-apis/im/v1/messages?receive_id_type=open_id"),
+            "走 create 到会话: {path}"
+        );
+        // content 是字符串化 JSON（SDK create 消息体形态），剥一层再断言。
+        let outer: serde_json::Value = serde_json::from_str(body).expect("消息体是 JSON");
+        let content: serde_json::Value =
+            serde_json::from_str(outer["content"].as_str().expect("content 字段"))
+                .expect("content 是字符串化 JSON");
+        assert_eq!(content["buzz"], serde_json::json!(true), "buzz 字段生效");
+        assert!(
+            content["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("任务完成"),
+            "文本原样送达: {content}"
+        );
+    }
+
+    /// v1.42.1：免打扰时段去掉的是振铃不是信息——有卡片：不对卡片加急也不发
+    ///（页脚已有完成状态）；没有卡片：发一条**不带 buzz** 的普通文本（纯文本
+    /// 会话没有卡片页脚，这条文本是完成状态唯一的落点）。
+    #[tokio::test]
+    async fn notify_task_done_quiet_hours_skips_card_and_unbuzzes_text() {
+        use chrono::Timelike;
+        // 覆盖当前时刻的免打扰窗口：前后各留 2 分钟，免得夹具与被测代码两次
+        // 读时钟跨过分钟边界（跨午夜的写法由 QuietHours 的跨天语义兜住）。
+        let now = chrono::Local::now();
+        let (from, to) = (
+            now - chrono::TimeDelta::minutes(2),
+            now + chrono::TimeDelta::minutes(2),
+        );
+        let quiet = imagent_core::QuietHours::parse(&format!(
+            "{}:{}-{}:{}",
+            from.hour(),
+            from.minute(),
+            to.hour(),
+            to.minute()
+        ))
+        .expect("合法窗口");
+        assert!(
+            quiet.contains(now.hour() * 60 + now.minute()),
+            "夹具：当前时刻须落在窗口内"
+        );
+        let (p, hits) = mock_api_fixture(Some(quiet), true).await;
+        seed_conv(&p, "feishu:oc_grp", true, true).await;
+        seed_conv(&p, "feishu:ou_x", false, true).await;
+        for conv in ["feishu:oc_grp", "feishu:ou_x"] {
+            p.notify_task_done(
+                &ConvId(conv.into()),
+                "✅ 任务完成 · 33m32s",
+                &ReplyHint::None,
+            )
+            .await;
+        }
+        let hits = hits.lock().unwrap().clone();
+        assert_eq!(
+            hits.len(),
+            1,
+            "免打扰：有卡不加急、无卡会话发一条普通文本: {hits:?}"
+        );
+        let (path, body) = &hits[0];
+        assert!(
+            path.starts_with("/open-apis/im/v1/messages?receive_id_type=open_id"),
+            "唯一一条是发往无卡会话的文本: {path}"
+        );
+        let outer: serde_json::Value = serde_json::from_str(body).expect("消息体是 JSON");
+        assert_eq!(
+            outer["receive_id"],
+            serde_json::json!("ou_x"),
+            "发给无卡会话，不是有卡会话"
+        );
+        let content: serde_json::Value =
+            serde_json::from_str(outer["content"].as_str().expect("content 字段"))
+                .expect("content 是字符串化 JSON");
+        assert_eq!(
+            content.get("buzz"),
+            None,
+            "免打扰时段的完成文本不带 buzz 字段: {content}"
+        );
+        assert!(
+            content["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("任务完成"),
+            "文本原样送达: {content}"
+        );
     }
 
     /// P6 遗留补齐：require_mention 热切换——共享句柄 get/set 往返（drain task

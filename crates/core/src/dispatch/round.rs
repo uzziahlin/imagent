@@ -1189,9 +1189,17 @@ impl Dispatcher {
         }
 
         // Wave B-2：长任务/含询问轮次的完成强提醒——运行超 5 分钟或本轮发生过
-        // 审批/询问时，终态额外发一条 buzz 短文本（移动端推送只露首行，短文本让
-        // 「完成了」一眼可见）。仅支持 buzz 的平台发送（supports_urgent_text）——
+        // 审批/询问时，终态额外发一条强提醒（移动端推送只露首行，短提示让
+        // 「完成了」一眼可见）。仅支持加急的平台发送（URGENT_TEXT 能力位）——
         // 其余平台普通回复已含全部信息，再发一条只是重复噪音。best-effort。
+        // v1.42.1：投递走专用的 notify_task_done（不是 send_urgent_text）——两者
+        // 对「平台不能振铃」的期望相反：审批催办靠 send_urgent_text 的 trait
+        // default 把文本送到纯文本平台，完成提醒则要整体静默。能力位在多平台
+        // 组合器上取并集 / any，区分不了会话归属平台能否振铃：沿用
+        // send_urgent_text 时 web 会话的强提醒会经 default 降级漏成驾驶舱的
+        // 一条普通文本（终态卡页脚已有同样的时长 / 成本）。notify_task_done
+        // 由组合器按归属路由、不镜像，未覆写的平台 default no-op；无返回值，
+        // 失败由平台侧记日志。
         let elapsed = run_started.elapsed();
         let asks_delta = self
             .router
@@ -1216,9 +1224,7 @@ impl Dispatcher {
                 elapsed,
                 outcome.usage.as_ref().map(|u| u.display()).as_deref(),
             );
-            if let Err(e) = self.platform.send_urgent_text(&conv, &text, &hint).await {
-                warn!(target: "imagent::core", conv_id = %conv.0, error = %e, "任务完成强提醒发送失败（不影响主流程）");
-            }
+            self.platform.notify_task_done(&conv, &text, &hint).await;
         }
 
         // agent 产图回传：run 结束文件已写完；存在才发，单个失败仅 warn 不影响其余。
