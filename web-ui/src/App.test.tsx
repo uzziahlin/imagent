@@ -16,7 +16,7 @@ import App from "./App";
 import { __resetAdminToken } from "./lib/admin";
 import { historyStore } from "./lib/historyStore";
 import { fingerprint, openBox } from "./lib/e2e";
-import type { WsEvent } from "./lib/ws";
+import { WsManager, type WsEvent } from "./lib/ws";
 
 /** 可控 fake WebSocket：手动 emit 事件、记录出站帧（形状对齐 ws.test.ts）。 */
 class FakeWebSocket {
@@ -2878,5 +2878,955 @@ describe("peer 会话用户自发文本（v1.41.8）", () => {
     fireEvent.click(screen.getByRole("button", { name: /^win-a/ }));
     gwText(fake, "peer:win-a", "帮我跑下构建");
     expect(bubbleKinds("帮我跑下构建")).toEqual(["agent"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.42 驾驶舱核心交互修复批（App 层）：停止按钮落到当前会话 / 待审批快照 /
+// 中继瞬态关闭不再登出 / 草稿按「机器 + 会话」隔离。
+// ---------------------------------------------------------------------------
+
+describe("v1.42 停止按钮落到当前会话（control 帧 convId）", () => {
+  const stopFrame = (convId: string) =>
+    JSON.stringify({ v: 1, type: "control", cmd: "stop", convId, machine: "home-mac" });
+
+  /** 挂载并让 web:work 出现在侧栏（非默认会话），返回活跃 socket。 */
+  function mountWithWorkConv(): FakeWebSocket {
+    const fake = mountApp();
+    handshake(fake, ["home-mac"]);
+    act(() => {
+      fake.recv({ v: 1, type: "text", convId: "web:work", text: "后台会话消息", machine: "home-mac" });
+    });
+    return fake;
+  }
+
+  it("非默认会话点「停止」→ control 帧 convId 是当前会话（不是默认会话）", () => {
+    const fake = mountWithWorkConv();
+    fireEvent.click(screen.getByRole("button", { name: /^work/ }));
+    fireEvent.click(screen.getByRole("button", { name: "停止" }));
+    expect(fake.sent).toContain(stopFrame("web:work"));
+    expect(fake.sent).not.toContain(stopFrame("web:default"));
+  });
+
+  it("默认会话点「停止」→ convId 为默认会话 web:default", () => {
+    const fake = mountApp();
+    handshake(fake, ["home-mac"]);
+    fireEvent.click(screen.getByRole("button", { name: "停止" }));
+    expect(fake.sent).toContain(stopFrame("web:default"));
+    // 只发了这一条 control 帧
+    expect(fake.sent.filter((s) => (JSON.parse(s) as { type: string }).type === "control")).toEqual([
+      stopFrame("web:default"),
+    ]);
+  });
+
+  it("切会话后 convId 跟随当前会话（work → default → work）", () => {
+    const fake = mountWithWorkConv();
+    fireEvent.click(screen.getByRole("button", { name: /^work/ }));
+    fireEvent.click(screen.getByRole("button", { name: "停止" }));
+    // default 会话发过首条消息后按消息文本定位（既有约定）；此处 default 尚无消息
+    fireEvent.click(screen.getByRole("button", { name: /^default/ }));
+    fireEvent.click(screen.getByRole("button", { name: "停止" }));
+    fireEvent.click(screen.getByRole("button", { name: /^work/ }));
+    fireEvent.click(screen.getByRole("button", { name: "停止" }));
+    const stops = fake.sent
+      .filter((s) => (JSON.parse(s) as { type: string }).type === "control")
+      .map((s) => (JSON.parse(s) as { convId?: string }).convId);
+    expect(stops).toEqual(["web:work", "web:default", "web:work"]);
+  });
+
+  it("自动会话（web:s-xxxx）点「停止」→ convId 为该会话完整形态", () => {
+    const fake = mountApp();
+    handshake(fake, ["home-mac"]);
+    act(() => {
+      fake.recv({ v: 1, type: "text", convId: "web:s-ab12", text: "自动会话历史首条", machine: "home-mac" });
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^自动会话历史首条/ }));
+    fireEvent.click(screen.getByRole("button", { name: "停止" }));
+    expect(fake.sent).toContain(stopFrame("web:s-ab12"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.42 中继瞬态关闭不再登出：close 1008 "rate limited" 走自动重连（凭证仍在、
+// 留在主界面）；新 reason（too many sessions / pairing expired / too many
+// pairings）在登录页给出可操作的提示，会话数超限不清本地凭证。
+// ---------------------------------------------------------------------------
+
+describe("v1.42 中继瞬态关闭不再登出", () => {
+  const DAY = 86_400_000;
+  /** 会话凭证形态（刷新恢复路径）。 */
+  const sessionJson = () =>
+    JSON.stringify({ id: "sid-r", token: "st-r", expiresAt: Date.now() + 20 * DAY });
+  const sessionAck = () => ({
+    v: 1,
+    type: "hello_ack",
+    role: "user",
+    session: { id: "sid-r", token: "st-r", expiresAt: Date.now() + 20 * DAY },
+  });
+  /** 登录页是否在显示（USER_TOKEN 输入框在场 = 已回到登录页）。 */
+  const onLoginPage = (): boolean => screen.queryByLabelText("访问令牌（USER_TOKEN）") !== null;
+  /** 本地会话凭证是否仍在（按 id + token 判定——expiresAt 会被每次 hello_ack
+   *  携带的 session 刷新，是既有行为，不能拿整串字节比「未被改动」）。 */
+  const sessionKept = (): boolean =>
+    JSON.parse(localStorage.getItem("imagent.session") ?? "null")?.token === "st-r";
+
+  /** 会话形态挂载并握手到 ready，返回活跃 socket。 */
+  function mountSessionReady(): FakeWebSocket {
+    localStorage.setItem("imagent.session", sessionJson());
+    render(<App />);
+    const fake = FakeWebSocket.latest as FakeWebSocket;
+    act(() => {
+      fake.emit("open");
+      fake.recv(sessionAck());
+    });
+    return fake;
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("close 1008 rate limited → 自动重连、仍在主界面、会话凭证未被清除", () => {
+    // 重连退避是 1s 定时器：挂载前切假时钟（WsManager 的定时器须落在假时钟上）
+    vi.useFakeTimers();
+    const fake = mountSessionReady();
+    expect(screen.getByText("已连接")).toBeTruthy();
+    expect(sessionKept()).toBe(true);
+
+    // 真机帧序：限流前中继先发 error{rate_limited}，随后 close 1008
+    act(() => {
+      fake.recv({ v: 1, type: "error", code: "rate_limited" });
+      fake.emit("close", { code: 1008, reason: "rate limited" });
+    });
+    // error 帧仍走既有 toast 文案
+    expect(screen.getByText("发送过快，已被限流断开")).toBeTruthy();
+    expect(screen.getByText("重连中")).toBeTruthy();
+    expect(onLoginPage()).toBe(false);
+    expect(sessionKept()).toBe(true);
+
+    // 退避等待期间：冲刷定时器后仍是「未登出」（负向断言不早于被测路径）
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
+    expect(onLoginPage()).toBe(false);
+    expect(FakeWebSocket.latest).toBe(fake);
+
+    // 退避到点 → 新连接（hello 用 session 形态）→ hello_ack → 恢复已连接
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
+    const next = FakeWebSocket.latest as FakeWebSocket;
+    expect(next).not.toBe(fake);
+    act(() => {
+      next.emit("open"); // hello 在连接 open 后才发出
+    });
+    // 重连 hello 用 session 形态（凭证仍在 → 不需要用户重新登录）
+    expect(next.sent[0]).toBe(JSON.stringify({ v: 1, type: "hello", session: "st-r" }));
+    act(() => {
+      next.recv(sessionAck());
+    });
+    expect(screen.getByText("已连接")).toBeTruthy();
+    expect(screen.queryByText("重连中")).toBeNull();
+    // 恢复后再冲刷 5s（toast 消退 / 缓存落盘等定时器）：仍无登录页、凭证原样
+    act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
+    expect(onLoginPage()).toBe(false);
+    expect(sessionKept()).toBe(true);
+    expect(screen.queryByRole("alert")).toBeNull(); // 没有任何认证失败提示
+  });
+
+  it("对照：同一挂载方式下 close 1008 auth failed → 仍回登录页并清凭证（既有行为不变）", () => {
+    const fake = mountSessionReady();
+    act(() => {
+      fake.emit("close", { code: 1008, reason: "auth failed" });
+    });
+    expect(onLoginPage()).toBe(true);
+    expect(localStorage.getItem("imagent.session")).toBeNull();
+  });
+
+  it("close 1008 too many sessions → 登录页出现引导提示；本地会话凭证未被清", () => {
+    const fake = mountSessionReady();
+    act(() => {
+      fake.emit("close", { code: 1008, reason: "too many sessions" });
+    });
+    expect(onLoginPage()).toBe(true);
+    expect(screen.getByRole("alert").textContent).toBe(
+      "登录会话数已达上限，请先在已登录设备的「管理 → 已登录设备」里吊销不用的会话，再重新登录",
+    );
+    expect(sessionKept()).toBe(true);
+  });
+
+  it("USER_TOKEN 首登被拒（too many sessions）→ 令牌保留，腾出名额后可直接重试", () => {
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("访问令牌（USER_TOKEN）"), { target: { value: "tok-9" } });
+    fireEvent.click(screen.getByRole("button", { name: "连接" }));
+    const fake = FakeWebSocket.latest as FakeWebSocket;
+    act(() => {
+      fake.emit("open");
+      fake.emit("close", { code: 1008, reason: "too many sessions" });
+    });
+    expect(onLoginPage()).toBe(true);
+    expect(screen.getByRole("alert").textContent).toContain("登录会话数已达上限");
+    expect(localStorage.getItem("imagent.userToken")).toBe("tok-9");
+  });
+
+  /** 给当前会话留一条已落盘的文字草稿（防抖 500ms 用假时钟冲掉），返回
+   *  localStorage 里的原文。调用方须已切假时钟。 */
+  const seedDraft = (text: string): string | null => {
+    const input = () => screen.getByLabelText("消息输入框");
+    fireEvent.change(input(), { target: { value: text } });
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
+    const raw = localStorage.getItem("imagent.drafts");
+    // 正向锚点：草稿确实落了盘（否则下面的「仍在 / 已清」没有判别力）
+    expect(raw).toContain(text);
+    return raw;
+  };
+
+  it("too many sessions 不清本机数据：已落盘的草稿原样保留、historyStore.clear 未被调用、凭证仍在；没来得及落盘的最后几句也保住", () => {
+    vi.useFakeTimers();
+    const clearSpy = vi.spyOn(historyStore, "clear").mockResolvedValue();
+    try {
+      const fake = mountApp();
+      handshake(fake, ["home-mac"]);
+      const draft = seedDraft("吊销会话期间不能丢的草稿");
+      // 再输入一句、不冲防抖：此刻它只在内存 store 里，尚未落盘
+      fireEvent.change(screen.getByLabelText("消息输入框"), {
+        target: { value: "吊销会话期间不能丢的草稿 最后几句" },
+      });
+      act(() => {
+        fake.emit("close", { code: 1008, reason: "too many sessions" });
+      });
+      expect(onLoginPage()).toBe(true);
+      expect(localStorage.getItem("imagent.drafts")).toBe(draft); // 落了盘的那份原样
+      expect(clearSpy).not.toHaveBeenCalled();
+      expect(localStorage.getItem("imagent.userToken")).toBe("test-token");
+      // 冲刷 5s：内存里的草稿没有被清，排着的防抖照常把它落盘（最后几句也在）
+      act(() => {
+        vi.advanceTimersByTime(5_000);
+      });
+      expect(Object.values(JSON.parse(localStorage.getItem("imagent.drafts") ?? "null"))).toEqual([
+        "吊销会话期间不能丢的草稿 最后几句",
+      ]);
+      expect(clearSpy).not.toHaveBeenCalled();
+    } finally {
+      clearSpy.mockRestore();
+    }
+  });
+
+  it.each(["auth failed", "session expired", "session revoked"])(
+    "回归·close 1008 %s → 草稿与本地消息缓存照旧被清（凭证不可用 = 退出路径）",
+    (reason) => {
+      vi.useFakeTimers();
+      const clearSpy = vi.spyOn(historyStore, "clear").mockResolvedValue();
+      try {
+        const fake = mountSessionReady();
+        handshake(fake, ["home-mac"]);
+        seedDraft("凭证失效后应随之清掉的草稿");
+        // 再输入一句、不冲防抖：排着的落盘定时器也应随清空一并取消
+        fireEvent.change(screen.getByLabelText("消息输入框"), {
+          target: { value: "凭证失效后应随之清掉的草稿 最后几句" },
+        });
+        act(() => {
+          fake.emit("close", { code: 1008, reason });
+        });
+        expect(onLoginPage()).toBe(true);
+        expect(localStorage.getItem("imagent.drafts")).toBeNull(); // 内存与 storage 一并清
+        expect(clearSpy).toHaveBeenCalledTimes(1);
+        expect(sessionKept()).toBe(false);
+        // 冲刷：迟到的防抖不会把草稿写回
+        act(() => {
+          vi.advanceTimersByTime(5_000);
+        });
+        expect(localStorage.getItem("imagent.drafts")).toBeNull();
+      } finally {
+        clearSpy.mockRestore();
+      }
+    },
+  );
+
+  it.each([
+    ["pairing expired", "配对码已过期，请重新发起配对"],
+    ["too many pairings", "同时进行的配对请求过多，请稍后再试"],
+  ])("配对中 close 1008 %s → 登录页提示「%s」（不再落入泛化的「配对未成功」）", (reason, notice) => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: /我是新设备/ }));
+    fireEvent.click(screen.getByRole("button", { name: "开始配对" }));
+    const fake = FakeWebSocket.latest as FakeWebSocket;
+    act(() => {
+      fake.emit("open");
+      fake.emit("close", { code: 1008, reason });
+    });
+    expect(onLoginPage()).toBe(true);
+    expect(screen.getByRole("alert").textContent).toBe(notice);
+  });
+
+  it.each([
+    ["pairing expired", "配对码已过期，请重新发起配对"],
+    ["too many pairings", "同时进行的配对请求过多，请稍后再试"],
+  ])("非配对连接 close 1008 %s → 同样给出「%s」", (reason, notice) => {
+    const fake = mountSessionReady();
+    act(() => {
+      fake.emit("close", { code: 1008, reason });
+    });
+    expect(screen.getByRole("alert").textContent).toBe(notice);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.42 待审批快照（App 层）：ready 后对全部在线机器各查一次（E1）+ 该机器加密
+// 会话建立后再查一次（E2）；approvals 帧在 onFrame 拦截转 approvals_snapshot。
+// 修复：离线期间到达的审批重连后无按钮；离开期间已超时 / 已解决的审批挂到刷新。
+// ---------------------------------------------------------------------------
+
+describe("v1.42 待审批快照", () => {
+  const M = "home-mac";
+  /** 契约示例里的快照条目 / approvals 帧。 */
+  const item = (extra: Record<string, unknown> = {}) => ({
+    convId: "web:s-192d",
+    requestId: "req-1",
+    tool: "Bash",
+    inputSummary: "npm test",
+    timeoutSecs: 731,
+    ...extra,
+  });
+  const APPROVALS = (machine: string, items: unknown[]) => ({ v: 1, type: "approvals", machine, items });
+  const APPROVAL_REQ = (requestId: string, convId = "web:default") => ({
+    v: 1,
+    type: "approval_request",
+    convId,
+    requestId,
+    tool: "Bash",
+    inputSummary: "rm -rf /tmp/x",
+    machine: M,
+  });
+  /** 出站 approvals_query（明文形态）的目标机器序列。 */
+  const approvalQueries = (fake: FakeWebSocket): string[] =>
+    fake.sent
+      .filter((s) => (JSON.parse(s) as { type: string }).type === "approvals_query")
+      .map((s) => (JSON.parse(s) as { machine?: string }).machine ?? "");
+  const dialog = (tool = "Bash") => screen.queryByRole("alertdialog", { name: `审批请求 ${tool}` });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("① ready + 收到 machines 帧 → 对**全部**在线机器各发一条 approvals_query（不只是当前机器）", () => {
+    const fake = mountApp();
+    act(() => {
+      fake.emit("open");
+      fake.recv({ v: 1, type: "hello_ack", role: "user" });
+    });
+    // hello_ack 后尚未收到 machines 帧：不发（单机模式旧网关不认识该帧）
+    expect(approvalQueries(fake)).toEqual([]);
+    act(() => {
+      fake.recv({ v: 1, type: "machine", online: false });
+      fake.recv({ v: 1, type: "machines", online: [M, "work-mac", "office-mac"] });
+    });
+    // 当前机器是 home-mac（自动选中首台）；三台各一条
+    expect(approvalQueries(fake)).toEqual([M, "work-mac", "office-mac"]);
+    // 帧形状即契约原文
+    expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "approvals_query", machine: "work-mac" }));
+  });
+
+  it("①b 切换当前机器 / machines 帧重排不重发：待审批集合不随「当前看哪台机器」变化", () => {
+    const fake = mountApp();
+    handshake(fake, [M, "work-mac"]);
+    expect(approvalQueries(fake)).toEqual([M, "work-mac"]);
+    fireEvent.click(screen.getByRole("button", { name: /work-mac/ }));
+    expect(approvalQueries(fake)).toEqual([M, "work-mac"]); // 切机不触发
+    // machines 帧重排（任一网关上下线都会再推）：同样不触发
+    act(() => {
+      fake.recv({ v: 1, type: "machines", online: ["work-mac", M] });
+    });
+    expect(approvalQueries(fake)).toEqual([M, "work-mac"]);
+  });
+
+  it("①c 单机模式（旧 relay，无 machines 帧）不发 approvals_query", () => {
+    const fake = mountApp();
+    act(() => {
+      fake.emit("open");
+      fake.recv({ v: 1, type: "hello_ack", role: "user" });
+      fake.recv({ v: 1, type: "machine", online: true });
+    });
+    expect(screen.getByText("已连接")).toBeTruthy();
+    expect(approvalQueries(fake)).toEqual([]);
+  });
+
+  it("② 收到 approvals 帧 → 审批面板出现对应条目（按钮 / 机器徽标 / 会话 / 倒计时取剩余秒数）；拒绝原样回传", () => {
+    const fake = mountApp();
+    handshake(fake, [M]);
+    act(() => {
+      fake.recv(APPROVALS(M, [item()]));
+    });
+    const box = dialog();
+    expect(box).toBeTruthy();
+    expect(within(box!).getByText(M)).toBeTruthy();
+    expect(within(box!).getByText("s-192d")).toBeTruthy(); // 会话徽标（自动会话显示短名）
+    expect(within(box!).getByText("npm test")).toBeTruthy();
+    expect(within(box!).getByText("731s")).toBeTruthy(); // 剩余秒数，不是 900s 预算
+    fireEvent.click(within(box!).getByRole("button", { name: "拒绝" }));
+    expect(fake.sent).toContain(
+      JSON.stringify({ v: 1, type: "approval_response", convId: "web:s-192d", requestId: "req-1", decision: "deny", machine: M }),
+    );
+    expect(dialog()).toBeNull(); // 本地乐观移除
+  });
+
+  it("②b 快照引用的会话此前不存在 → 出现在侧栏（物化），可点「前往会话」切过去", () => {
+    const fake = mountApp();
+    handshake(fake, [M]);
+    act(() => {
+      fake.recv(APPROVALS(M, [item({ convId: "web:proj", requestId: "r9" })]));
+    });
+    const nav = screen.getByRole("navigation", { name: "会话列表" });
+    expect(within(nav).getByRole("button", { name: /^proj/ })).toBeTruthy();
+    fireEvent.click(within(dialog()!).getByRole("button", { name: "前往会话" }));
+    expect(nav.querySelector('[aria-current="page"]')?.textContent).toContain("proj");
+  });
+
+  it("③ 离线期间错过 approval_request：断线重连后由 approvals 快照恢复审批面板（无需手打 y/n）", () => {
+    // 重连退避 1s 是定时器：挂载前切假时钟
+    vi.useFakeTimers();
+    const fake = mountApp();
+    handshake(fake, [M]);
+    expect(approvalQueries(fake)).toEqual([M]);
+    expect(dialog()).toBeNull();
+    // 断线（iOS 挂起 / 网络切换）；离线期间网关发起了审批——approval_request 本连接收不到
+    act(() => {
+      fake.emit("close", { code: 1006 });
+    });
+    expect(screen.getByText("重连中")).toBeTruthy();
+    expect(dialog()).toBeNull();
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
+    const next = FakeWebSocket.latest as FakeWebSocket;
+    expect(next).not.toBe(fake);
+    handshake(next, [M]);
+    expect(screen.getByText("已连接")).toBeTruthy();
+    // 重连 ready → 再查一次（此刻时间晚于断线前）
+    expect(approvalQueries(next)).toEqual([M]);
+    // 网关回快照：离线期间到达的那条审批在网关侧仍待处理
+    act(() => {
+      next.recv(APPROVALS(M, [item({ requestId: "missed-1", convId: "web:default" })]));
+    });
+    expect(dialog()).toBeTruthy();
+    expect(within(dialog()!).getByText("npm test")).toBeTruthy();
+    fireEvent.click(within(dialog()!).getByRole("button", { name: "允许" }));
+    expect(next.sent).toContain(
+      JSON.stringify({ v: 1, type: "approval_response", convId: "web:default", requestId: "missed-1", decision: "allow", machine: M }),
+    );
+  });
+
+  it("④ 离开期间已超时 / 已解决的审批：重连后空快照把陈旧 pending 清出面板", () => {
+    vi.useFakeTimers();
+    const fake = mountApp();
+    handshake(fake, [M]);
+    // 离线前：面板上挂着两条审批（两条同名，按 alertdialog 全量计数）
+    expect(screen.queryAllByRole("alertdialog")).toHaveLength(0);
+    act(() => {
+      fake.recv(APPROVAL_REQ("stale-1"));
+      fake.recv(APPROVAL_REQ("stale-2", "web:other"));
+    });
+    expect(screen.queryAllByRole("alertdialog")).toHaveLength(2);
+    // 断开 → 退避 → 新连接 ready（此刻的查询晚于两条旧审批的到达）
+    act(() => {
+      fake.emit("close", { code: 1006 });
+      vi.advanceTimersByTime(1000);
+    });
+    const next = FakeWebSocket.latest as FakeWebSocket;
+    handshake(next, [M]);
+    expect(approvalQueries(next)).toEqual([M]);
+    // 离开期间两条都已超时：网关回空集合 → 面板清空
+    act(() => {
+      next.recv(APPROVALS(M, []));
+    });
+    expect(screen.queryAllByRole("alertdialog")).toHaveLength(0);
+    // 不编造终态记录：消息流里没有「已批准 / 已拒绝 / 已取消」之类的审批记录
+    expect(screen.queryByText(/已(批准|拒绝|取消)/)).toBeNull();
+    expect(screen.getByLabelText("消息输入框")).toBeTruthy();
+  });
+
+  it("④b 查询之后才到达的实时审批不被（更早那次查询的）快照误删", () => {
+    // 「查询之后到达」的判定是 at > queriedAt（毫秒）：测试里查询发出与实时帧
+    // 到达若在同一同步段会落进同一毫秒——真实链路上二者之间隔着一次完整
+    // 往返，这里用假时钟把这段间隔显式造出来。
+    vi.useFakeTimers();
+    const fake = mountApp();
+    handshake(fake, [M]);
+    expect(approvalQueries(fake)).toEqual([M]); // E1 发出
+    act(() => {
+      vi.advanceTimersByTime(5); // 网络往返
+    });
+    // 查询发出之后网关才发起的审批：实时帧到达（此刻晚于查询）
+    act(() => {
+      fake.recv(APPROVAL_REQ("fresh-1"));
+    });
+    expect(dialog()).toBeTruthy();
+    // 对应那次（更早）查询的应答到达：快照生成时 fresh-1 还不存在 → 空集合。
+    // 它是查询之后到达的实时条目，必须保留（否则面板上的按钮凭空消失）。
+    act(() => {
+      vi.advanceTimersByTime(5);
+      fake.recv(APPROVALS(M, []));
+    });
+    expect(dialog()).toBeTruthy();
+    expect(within(dialog()!).getByText("rm -rf /tmp/x")).toBeTruthy();
+    // 用户仍可正常处理它
+    fireEvent.click(within(dialog()!).getByRole("button", { name: "拒绝" }));
+    expect(fake.sent).toContain(
+      JSON.stringify({ v: 1, type: "approval_response", convId: "web:default", requestId: "fresh-1", decision: "deny", machine: M }),
+    );
+    expect(dialog()).toBeNull();
+  });
+
+  /** 测试网关（与「App E2E（v1.4）」describe 内同名助手同构——该助手为
+   *  describe 局部，此处复制一份；长期 X25519 + ed25519 身份密钥）。 */
+  function makeGateway() {
+    const gkPriv = x25519.utils.randomSecretKey();
+    const gk = bytesToHex(x25519.getPublicKey(gkPriv));
+    const idPriv = ed25519.utils.randomSecretKey();
+    const ik = bytesToHex(ed25519.getPublicKey(idPriv));
+    const ackFor = (hello: { ek: string; n1: string }, machine: string) => {
+      const n2 = bytesToHex(randomBytes(32));
+      const msg = new Uint8Array(128);
+      msg.set(hexToBytes(hello.ek), 0);
+      msg.set(hexToBytes(gk), 32);
+      msg.set(hexToBytes(hello.n1), 64);
+      msg.set(hexToBytes(n2), 96);
+      return {
+        v: 1 as const,
+        type: "e2e_ack" as const,
+        machine,
+        gk,
+        n2,
+        sig: bytesToHex(ed25519.sign(msg, idPriv)),
+        ik,
+      };
+    };
+    const gatewayKey = (hello: { ek: string; n1: string }, n2: string) => {
+      const shared = x25519.getSharedSecret(gkPriv, hexToBytes(hello.ek));
+      const ikm = new Uint8Array(96);
+      ikm.set(shared, 0);
+      ikm.set(hexToBytes(hello.n1), 32);
+      ikm.set(hexToBytes(n2), 64);
+      return hkdf(sha256, ikm, undefined, utf8ToBytes("imagent-e2e-v1"), 32);
+    };
+    return { gk, ik, ackFor, gatewayKey };
+  }
+
+  /** 从 fake.sent 里取最近一条 e2e_hello（无则抛）。 */
+  function lastHelloFor(fake: FakeWebSocket): { ek: string; n1: string } {
+    const raw = fake.sent.filter((s) => (JSON.parse(s) as { type: string }).type === "e2e_hello").at(-1);
+    if (!raw) {
+      throw new Error("尚未发出 e2e_hello");
+    }
+    return JSON.parse(raw);
+  }
+
+  it("⑤ 该机器加密会话建立（E2E active）后再查一次：握手完成后的查询走密文（enc 内 approvals_query）", () => {
+    const gw = makeGateway();
+    const fake = mountApp();
+    act(() => {
+      fake.emit("open");
+      fake.recv({ v: 1, type: "hello_ack", role: "user" });
+      fake.recv({ v: 1, type: "machines", online: [M] });
+    });
+    // E1：ready + machines 后已发一条明文查询（握手窗口）
+    expect(approvalQueries(fake)).toEqual([M]);
+    // 网关 ack → confirming（TOFU 弹层）：fail-closed 期间不发第二条（明文 / 密文都没有）
+    const firstHello = lastHelloFor(fake);
+    const firstAck = gw.ackFor(firstHello, M);
+    act(() => {
+      fake.recv(firstAck);
+    });
+    expect(screen.getByRole("dialog", { name: "确认机器加密指纹" })).toBeTruthy();
+    expect(approvalQueries(fake)).toEqual([M]);
+    expect(fake.sent.filter((s) => (JSON.parse(s) as { type: string }).type === "enc")).toHaveLength(0);
+    // 信任 → 以 pin 身份重新握手 → 新 ack → active
+    fireEvent.click(screen.getByRole("button", { name: "信任并启用加密" }));
+    const redone = lastHelloFor(fake);
+    const secondAck = gw.ackFor(redone, M);
+    act(() => {
+      fake.recv(secondAck);
+    });
+    expect(screen.getByText("已加密")).toBeTruthy();
+    // E2：active 后的第二次查询走密文——明文仍只有 E1 那一条；enc 帧恰一条，
+    // 用**重新握手**的网关密钥可解回 approvals_query（握手窗口那把密钥解不开）
+    expect(approvalQueries(fake)).toEqual([M]);
+    const encs = fake.sent
+      .filter((s) => (JSON.parse(s) as { type: string }).type === "enc")
+      .map((s) => JSON.parse(s) as { machine: string; box: string });
+    expect(encs).toHaveLength(1);
+    expect(encs[0].machine).toBe(M);
+    expect(openBox(gw.gatewayKey(redone, secondAck.n2), encs[0].box)).toBe(
+      JSON.stringify({ v: 1, type: "approvals_query", machine: M }),
+    );
+    expect(openBox(gw.gatewayKey(firstHello, firstAck.n2), encs[0].box)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.42 输入草稿按「机器 + 会话」保存：草稿键 = draftKey(当前机器, 当前会话)；
+// 文字草稿经 DraftStore 防抖落盘 localStorage（键 imagent.drafts）；登出 /
+// 认证失败 / 删除会话时清理；页面隐藏与 pagehide 时立即落盘。
+// Composer 与 store 的协作细节（图片隔离、压缩中切换会话等）在
+// Composer.test.tsx，存储本身在 lib/drafts.test.ts。
+// ---------------------------------------------------------------------------
+
+describe("v1.42 输入草稿按「机器 + 会话」保存", () => {
+  const DRAFTS = "imagent.drafts";
+  const M = "home-mac";
+  /** 让 web:work 出现在侧栏。 */
+  const workConv = (fake: FakeWebSocket): void => {
+    act(() => {
+      fake.recv({ v: 1, type: "text", convId: "web:work", text: "后台会话消息", machine: M });
+    });
+  };
+  const box = (): HTMLTextAreaElement => screen.getByLabelText("消息输入框") as HTMLTextAreaElement;
+  const type = (value: string): void => {
+    fireEvent.change(box(), { target: { value } });
+  };
+  /** 落盘的草稿集合（null = 存储里没有草稿键）。 */
+  const saved = (): Record<string, string> | null => {
+    const raw = localStorage.getItem(DRAFTS);
+    return raw === null ? null : (JSON.parse(raw) as Record<string, string>);
+  };
+  /** 冲刷防抖（500ms）及其后的定时器。 */
+  const settle = (ms = 500): void => {
+    act(() => {
+      vi.advanceTimersByTime(ms);
+    });
+  };
+
+  afterEach(() => {
+    vi.useRealTimers();
+    delete (document as { visibilityState?: string }).visibilityState;
+  });
+
+  it("① 草稿键跟随当前机器 + 会话：`<machine>||<convId>`；换会话 / 换机器即另一个键", () => {
+    vi.useFakeTimers();
+    const fake = mountApp();
+    handshake(fake, [M, "work-mac"]);
+    type("默认会话的草稿");
+    settle();
+    expect(saved()).toEqual({ "home-mac||web:default": "默认会话的草稿" });
+
+    // 切到 work 会话：另一个键，前一个保留
+    workConv(fake);
+    fireEvent.click(screen.getByRole("button", { name: /^work(?!-mac)/ }));
+    expect(box().value).toBe("");
+    type("work 会话的草稿");
+    settle();
+    expect(saved()).toEqual({
+      "home-mac||web:default": "默认会话的草稿",
+      "home-mac||web:work": "work 会话的草稿",
+    });
+
+    // 切机器：另一台机器上的同名默认会话是第三个键（与 home-mac 的 default 互不相干）
+    fireEvent.click(screen.getByRole("button", { name: /work-mac/ }));
+    expect(box().value).toBe("");
+    type("另一台机器的草稿");
+    settle();
+    expect(saved()).toEqual({
+      "home-mac||web:default": "默认会话的草稿",
+      "home-mac||web:work": "work 会话的草稿",
+      "work-mac||web:default": "另一台机器的草稿",
+    });
+
+    // 切回 home-mac：回到它自己的默认会话草稿
+    fireEvent.click(screen.getByRole("button", { name: new RegExp(`^${M}`) }));
+    expect(box().value).toBe("默认会话的草稿");
+  });
+
+  it("② 两个会话间切换，输入框内容各自独立（不再把草稿带到别的会话）", () => {
+    const fake = mountApp();
+    handshake(fake, [M]);
+    type("写给 default 的");
+    workConv(fake);
+    fireEvent.click(screen.getByRole("button", { name: /^work(?!-mac)/ }));
+    expect(box().value).toBe(""); // 没有跟过来
+    type("写给 work 的");
+    fireEvent.click(screen.getByRole("button", { name: /^default/ }));
+    expect(box().value).toBe("写给 default 的");
+    fireEvent.click(screen.getByRole("button", { name: /^work(?!-mac)/ }));
+    expect(box().value).toBe("写给 work 的");
+  });
+
+  it("③ 登出清空草稿：localStorage 的 imagent.drafts 被删，且不会有迟到的防抖写入把它写回", () => {
+    vi.useFakeTimers();
+    const fake = mountApp();
+    handshake(fake, [M]);
+    type("登出前的草稿");
+    settle();
+    // 正向锚点：草稿确实落了盘（否则下面的「为 null」没有判别力）
+    expect(saved()).toEqual({ "home-mac||web:default": "登出前的草稿" });
+    type("还没落盘的最后几句"); // 防抖重新计时，尚未写盘
+    fireEvent.click(screen.getByRole("button", { name: "退出" }));
+    expect(screen.getByLabelText("访问令牌（USER_TOKEN）")).toBeTruthy();
+    expect(localStorage.getItem(DRAFTS)).toBeNull();
+    // 冲刷：登出时排着的防抖（500ms 后写）已随 clearAll 取消，不会把草稿写回
+    settle(5_000);
+    expect(localStorage.getItem(DRAFTS)).toBeNull();
+  });
+
+  it("④ 预置 localStorage 草稿 → 首次进入对应会话时输入框恢复（刷新 / 杀进程后不丢）", () => {
+    localStorage.setItem(DRAFTS, JSON.stringify({ "home-mac||web:work": "刷新前没发完的" }));
+    const fake = mountApp();
+    handshake(fake, [M]);
+    expect(box().value).toBe(""); // 当前在 default，没有它的草稿
+    workConv(fake);
+    fireEvent.click(screen.getByRole("button", { name: /^work(?!-mac)/ }));
+    expect(box().value).toBe("刷新前没发完的");
+    // 恢复出来的草稿可以正常继续编辑并发送
+    type("刷新前没发完的，补一句");
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    expect(fake.sent).toContain(
+      JSON.stringify({ v: 1, type: "message", convId: "web:work", text: "刷新前没发完的，补一句", machine: M }),
+    );
+    expect(box().value).toBe("");
+  });
+
+  it("⑤ 认证失败回登录页同样清空草稿（与消息缓存同为本机痕迹）", () => {
+    vi.useFakeTimers();
+    const fake = mountApp();
+    handshake(fake, [M]);
+    type("认证失败前的草稿");
+    settle();
+    expect(saved()).not.toBeNull();
+    act(() => {
+      fake.emit("close", { code: 1008, reason: "auth failed" });
+    });
+    expect(screen.getByLabelText("访问令牌（USER_TOKEN）")).toBeTruthy();
+    expect(localStorage.getItem(DRAFTS)).toBeNull();
+    settle(5_000);
+    expect(localStorage.getItem(DRAFTS)).toBeNull();
+  });
+
+  it("⑤b 被限流（瞬态关闭，不登出）时草稿不受影响：留在主界面，草稿原样", () => {
+    vi.useFakeTimers();
+    const fake = mountApp();
+    handshake(fake, [M]);
+    type("限流时正在写的");
+    act(() => {
+      fake.emit("close", { code: 1008, reason: "rate limited" });
+    });
+    settle(1_000); // 退避到点，重连
+    const next = FakeWebSocket.latest as FakeWebSocket;
+    act(() => {
+      next.emit("open");
+      next.recv({ v: 1, type: "hello_ack", role: "user" });
+    });
+    expect(screen.queryByLabelText("访问令牌（USER_TOKEN）")).toBeNull(); // 没回登录页
+    expect(box().value).toBe("限流时正在写的");
+  });
+
+  it("⑥ 页面隐藏 / 卸载前落盘：防抖还没到点时转入后台或触发 pagehide，草稿立即写盘", () => {
+    vi.useFakeTimers();
+    const fake = mountApp();
+    handshake(fake, [M]);
+    type("刚打的字");
+    expect(localStorage.getItem(DRAFTS)).toBeNull(); // 防抖 500ms 未到
+    // 转入不可见（iOS 把后台应用挂起前的最后一个时机）
+    Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect(saved()).toEqual({ "home-mac||web:default": "刚打的字" });
+    // 回到前台继续输入 → pagehide（页面卸载）同步落盘
+    Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    type("又打了几个字");
+    expect(saved()).toEqual({ "home-mac||web:default": "刚打的字" }); // 仍在防抖里
+    act(() => {
+      window.dispatchEvent(new Event("pagehide"));
+    });
+    expect(saved()).toEqual({ "home-mac||web:default": "又打了几个字" });
+  });
+
+  it("⑥b 页面可见时的 visibilitychange 不落盘（只有不可见 / pagehide 才立即写）", () => {
+    vi.useFakeTimers();
+    const fake = mountApp();
+    handshake(fake, [M]);
+    type("可见时的输入");
+    Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect(localStorage.getItem(DRAFTS)).toBeNull(); // 仍等防抖
+    settle();
+    expect(saved()).toEqual({ "home-mac||web:default": "可见时的输入" });
+  });
+
+  it("⑦ 删除会话 → 该会话的草稿一并清掉（同名会话重建时旧草稿不再冒出）；别的会话草稿保留", () => {
+    vi.useFakeTimers();
+    const fake = mountApp();
+    handshake(fake, [M]);
+    type("default 的草稿留着");
+    workConv(fake);
+    const workItem = (): HTMLElement => screen.getByRole("button", { name: /^work(?!-mac)/ });
+    fireEvent.click(workItem());
+    type("要随会话一起删掉的草稿");
+    settle();
+    expect(saved()).toEqual({
+      "home-mac||web:default": "default 的草稿留着",
+      "home-mac||web:work": "要随会话一起删掉的草稿",
+    });
+    // 侧栏左滑露出删除 → 点删除 → 确认（pointer 事件须手搓：jsdom 无 PointerEvent 构造器）
+    const pointer = (kind: "pointerdown" | "pointermove" | "pointerup", x: number) => {
+      const ev = new Event(kind, { bubbles: true, cancelable: true, composed: true });
+      Object.assign(ev, { pointerType: "touch", button: 0, clientX: x, clientY: 20 });
+      return ev;
+    };
+    const item = workItem();
+    fireEvent(item, pointer("pointerdown", 200));
+    fireEvent(item, pointer("pointermove", 170));
+    fireEvent(item, pointer("pointermove", 140));
+    fireEvent(item, pointer("pointerup", 140));
+    fireEvent.click(screen.getByRole("button", { name: "删除" }));
+    fireEvent.click(
+      within(screen.getByRole("dialog", { name: "确认删除会话" })).getByRole("button", { name: "删除" }),
+    );
+    expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "conv_delete", convId: "web:work", machine: M }));
+    settle();
+    expect(saved()).toEqual({ "home-mac||web:default": "default 的草稿留着" });
+    // 当前会话已切回 default；输入框不是被删会话的草稿
+    expect(box().value).toBe("default 的草稿留着");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.42 重新登录后的连接就绪：App 的连接态（status）只由 WsManager 的 onStatus
+// 驱动，而登出 / 认证失败不会把它从 ready 拉回来；新 WsManager 的内部初值就是
+// connecting，connect() 里那次同值 setStatus 不通知。结果是重新登录后 status
+// 一直停在 ready，新连接 hello_ack 带来的 ready 被当作「没有变化」——所有依赖
+// status 的 effect（sync + workspace_list、history_query、待审批查询）在新连接
+// 上一次都不触发。修复：WS effect 每建立一个新的连接实例，先显式拉回 connecting。
+// ---------------------------------------------------------------------------
+
+describe("v1.42 重新登录后连接就绪 effect 照常触发", () => {
+  const M = "home-mac";
+  const DAY = 86_400_000;
+  const frameTypes = (fake: FakeWebSocket): string[] =>
+    fake.sent.map((s) => (JSON.parse(s) as { type: string }).type);
+  const TOKEN_INPUT = "访问令牌（USER_TOKEN）";
+  /** 登录页输入令牌并连接，返回新 socket（已 open）。 */
+  function loginAgain(token: string): FakeWebSocket {
+    fireEvent.change(screen.getByLabelText(TOKEN_INPUT), { target: { value: token } });
+    fireEvent.click(screen.getByRole("button", { name: "连接" }));
+    const next = FakeWebSocket.latest as FakeWebSocket;
+    act(() => next.emit("open"));
+    return next;
+  }
+  /** 新连接就绪后「与首连一致」的出站：ws 内置 sync + App 的 sync、workspace_list、
+   *  history_query 各一条 + 每台在线机器一条 approvals_query。 */
+  const expectReadyBurst = (fake: FakeWebSocket): void => {
+    const types = frameTypes(fake);
+    expect(types.filter((t) => t === "sync"), "sync").toHaveLength(2);
+    for (const t of ["workspace_list", "history_query", "approvals_query"]) {
+      expect(types.filter((x) => x === t), t).toHaveLength(1);
+    }
+  };
+
+  it("对照·首连（页面加载）ready 后的出站：sync×2 + workspace_list + history_query + approvals_query", () => {
+    const fake = mountApp();
+    handshake(fake, [M]);
+    expectReadyBurst(fake);
+  });
+
+  it("退出后重新登录（不经刷新）：新连接 ready 时同样补发，不再因 status 停在 ready 而全部缺席", () => {
+    const first = mountApp();
+    handshake(first, [M]);
+    expectReadyBurst(first);
+    // 退出：state（machinesKnown / machines）保留，连接态此前也一直保留在 ready
+    fireEvent.click(screen.getByRole("button", { name: "退出" }));
+    expect(screen.getByLabelText(TOKEN_INPUT)).toBeTruthy();
+    const second = loginAgain("tok-2");
+    expect(second).not.toBe(first);
+    expect(frameTypes(second)).toEqual(["hello"]); // 尚未 ready：只有 hello
+    handshake(second, [M]);
+    expect(screen.getByText("已连接")).toBeTruthy();
+    expectReadyBurst(second);
+    expect(second.sent).toContain(JSON.stringify({ v: 1, type: "approvals_query", machine: M }));
+  });
+
+  it("认证失败（凭证失效回登录页）后重新登录：新连接 ready 时同样补发", () => {
+    const first = mountApp();
+    handshake(first, [M]);
+    act(() => {
+      first.emit("close", { code: 1008, reason: "auth failed" });
+    });
+    expect(screen.getByLabelText(TOKEN_INPUT)).toBeTruthy();
+    const second = loginAgain("tok-2");
+    handshake(second, [M]);
+    expect(screen.getByText("已连接")).toBeTruthy();
+    expectReadyBurst(second);
+  });
+
+  it("曾登录 → 退出 → 新设备配对获批：交接瞬间不对未就绪的新连接发出查询（也不落在配对连接上）；新连接 ready 后发出", () => {
+    const first = mountApp();
+    handshake(first, [M]);
+    expectReadyBurst(first);
+    fireEvent.click(screen.getByRole("button", { name: "退出" }));
+    // 新设备配对
+    fireEvent.click(screen.getByRole("button", { name: /我是新设备/ }));
+    fireEvent.click(screen.getByRole("button", { name: "开始配对" }));
+    const pair = FakeWebSocket.latest as FakeWebSocket;
+    // 交接瞬间的发送发生在 WsManager 上：记录每次 sendApprovalsQuery 的返回值
+    const sendSpy = vi.spyOn(WsManager.prototype, "sendApprovalsQuery");
+    try {
+      act(() => pair.emit("open"));
+      act(() => pair.recv({ v: 1, type: "pairing_pending", code: "123456" }));
+      // 已登录侧批准：配对连接上直接换发 hello_ack.session → App 以会话形态重连
+      act(() => {
+        pair.recv({
+          v: 1,
+          type: "hello_ack",
+          role: "user",
+          session: { id: "sid-p", token: "st-p", expiresAt: Date.now() + 20 * DAY },
+        });
+      });
+      const next = FakeWebSocket.latest as FakeWebSocket;
+      expect(next).not.toBe(pair);
+      // 交接瞬间：连接态的这次变化让待审批 effect 触发了一次，但新连接尚未就绪
+      // ——查询被拒发（返回 false，不发帧），配对连接上也没有任何业务帧
+      expect(sendSpy.mock.results.map((r) => r.value)).toEqual([false]);
+      // 配对连接上只有 ws 层内置的 hello 与 hello_ack 后的 sync（既有行为），
+      // 没有任何 App 层 effect 发的帧（待审批查询 / workspace_list / history_query）
+      expect(frameTypes(pair)).toEqual(["hello", "sync"]);
+      expect(pair.sent.filter((s) => s.includes("approvals_query"))).toHaveLength(0);
+      // 新连接就绪 → 查询真正发出
+      act(() => next.emit("open"));
+      act(() => {
+        next.recv({
+          v: 1,
+          type: "hello_ack",
+          role: "user",
+          session: { id: "sid-p", token: "st-p", expiresAt: Date.now() + 20 * DAY },
+        });
+      });
+      expect(sendSpy.mock.results.map((r) => r.value)).toEqual([false, true]);
+      act(() => {
+        next.recv({ v: 1, type: "machine", online: false });
+        next.recv({ v: 1, type: "machines", online: [M] });
+      });
+      expectReadyBurst(next);
+    } finally {
+      sendSpy.mockRestore();
+    }
+  });
+
+  it("首次挂载不因显式拉回连接态而多出状态往返：首连就绪前后出站帧序不变", () => {
+    const fake = mountApp();
+    // 挂载后尚未连接：无业务帧
+    expect(frameTypes(fake)).toEqual([]);
+    act(() => {
+      fake.emit("open");
+      fake.recv({ v: 1, type: "hello_ack", role: "user" });
+    });
+    expect(frameTypes(fake)).toEqual(["hello", "sync"]);
   });
 });

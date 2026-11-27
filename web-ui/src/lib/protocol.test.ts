@@ -1,9 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CONV_TITLE_MAX_CHARS,
   DEFAULT_CONV,
   DEFAULT_MACHINE,
   MAX_STREAM_ENTRIES,
+  applyApprovalsSnapshot,
   convDisplayName,
   convTitle,
   deviceSummary,
@@ -19,8 +20,10 @@ import {
   spaceOf,
   workspaceNameValid,
   type Action,
+  type ApprovalSnapshotItem,
   type AppState,
   type InboundFrame,
+  type PendingApproval,
   type WorkspacesFrame,
 } from "./protocol";
 
@@ -2564,5 +2567,404 @@ describe("reducer delete_conv（v1.41.3）", () => {
     expect(s.spaces["home-mac"].convs["web:home-only"]).toBeUndefined();
     expect(orderOf(s)).toContain(DEFAULT_CONV);
     expect(convsOf(s)[DEFAULT_CONV].entries).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.42 待审批快照：approvals_query / approvals 帧契约（出站形状 + 入站逐字段
+// 校验）与 reducer 防御；applyApprovalsSnapshot 是快照套用到会话空间的纯归约
+// ---------------------------------------------------------------------------
+
+describe("approvals 帧（v1.42 待审批快照）", () => {
+  /** 契约示例里的条目。 */
+  const item = (extra: Record<string, unknown> = {}) => ({
+    convId: "web:s-192d",
+    requestId: "req-1",
+    tool: "Bash",
+    inputSummary: "npm test",
+    timeoutSecs: 731,
+    ...extra,
+  });
+  const approvalsFrame = (items: unknown, head = '"machine":"home-mac",') =>
+    `{"v":1,"type":"approvals",${head}"items":${JSON.stringify(items)}}`;
+  const APPROVAL_REQ = (requestId: string, convId = DEFAULT_CONV, machine?: string) =>
+    `{"v":1,"type":"approval_request","convId":"${convId}","requestId":"${requestId}","tool":"Bash","inputSummary":"ls"${
+      machine === undefined ? "" : `,"machine":"${machine}"`
+    }}`;
+
+  it("parseFrame 合法帧：契约示例逐字段保留；items 可为空数组", () => {
+    // 任务书契约示例原文
+    const f = parseFrame(
+      '{"v":1,"type":"approvals","machine":"home-mac","items":[{"convId":"web:s-192d","requestId":"<id>","tool":"Bash","inputSummary":"npm test","timeoutSecs":731}]}',
+    );
+    expect(f).toEqual({
+      v: 1,
+      type: "approvals",
+      machine: "home-mac",
+      items: [{ convId: "web:s-192d", requestId: "<id>", tool: "Bash", inputSummary: "npm test", timeoutSecs: 731 }],
+    });
+    // 空集合 = 该机器没有待审批（合法且有意义：会让面板清空）
+    expect(parseFrame(approvalsFrame([]))).toEqual({ v: 1, type: "approvals", machine: "home-mac", items: [] });
+    // inputSummary 可为空串；timeoutSecs 为 1 是合法的最后一秒
+    expect(parseFrame(approvalsFrame([item({ inputSummary: "", timeoutSecs: 1 })]))).toBeTruthy();
+  });
+
+  it("parseFrame 拒帧：machine 缺失 / 空串 / 非字符串；items 缺失 / 非数组", () => {
+    expect(parseFrame(approvalsFrame([item()], ""))).toBeNull(); // machine 缺失
+    expect(parseFrame(approvalsFrame([item()], '"machine":"",'))).toBeNull();
+    expect(parseFrame(approvalsFrame([item()], '"machine":7,'))).toBeNull();
+    expect(parseFrame(approvalsFrame([item()], '"machine":null,'))).toBeNull();
+    expect(parseFrame('{"v":1,"type":"approvals","machine":"home-mac"}')).toBeNull(); // items 缺失
+    expect(parseFrame('{"v":1,"type":"approvals","machine":"home-mac","items":{}}')).toBeNull();
+    expect(parseFrame('{"v":1,"type":"approvals","machine":"home-mac","items":null}')).toBeNull();
+    expect(parseFrame('{"v":1,"type":"approvals","machine":"home-mac","items":"x"}')).toBeNull();
+  });
+
+  it("parseFrame 拒帧：任一条目畸形即整帧拒收（缺字段 / 空串 / 类型不符 / 非对象）", () => {
+    const badItems: unknown[] = [
+      "req-1", // 元素不是对象
+      null,
+      [],
+      item({ convId: undefined }), // JSON 序列化会丢键 → 缺字段
+      item({ convId: "" }),
+      item({ convId: 7 }),
+      item({ requestId: undefined }),
+      item({ requestId: "" }),
+      item({ tool: undefined }),
+      item({ tool: "" }),
+      item({ inputSummary: undefined }),
+      item({ inputSummary: null }),
+      item({ inputSummary: 3 }),
+    ];
+    for (const bad of badItems) {
+      expect(parseFrame(approvalsFrame([item(), bad])), JSON.stringify(bad)).toBeNull(); // 好条目救不了坏条目
+    }
+  });
+
+  it("parseFrame 拒帧：timeoutSecs 须为正整数（0 / 负 / 小数 / 字符串 / 缺失 / 非有限）", () => {
+    for (const timeoutSecs of [0, -1, 0.5, 731.25, "731", null, undefined, 1e999, Number.NaN]) {
+      expect(
+        parseFrame(approvalsFrame([item({ timeoutSecs })])),
+        `timeoutSecs=${String(timeoutSecs)}`,
+      ).toBeNull();
+    }
+  });
+
+  it("encodeFrame：approvals_query 出站字段形状（契约字段名不得偏离；machine 缺省不带）", () => {
+    expect(encodeFrame({ v: 1, type: "approvals_query", machine: "home-mac" })).toBe(
+      '{"v":1,"type":"approvals_query","machine":"home-mac"}',
+    );
+    expect(JSON.parse(encodeFrame({ v: 1, type: "approvals_query" }))).toEqual({
+      v: 1,
+      type: "approvals_query",
+    });
+  });
+
+  it("reducer 防御：原始 approvals 帧不进帧归约（上游漏拦兜底）——pending / entries 原样", () => {
+    const base = run(
+      initialState(),
+      { type: "frame", frame: frame(APPROVAL_REQ("r-old")) },
+    );
+    const s = run(base, { type: "frame", frame: frame(approvalsFrame([])) });
+    expect(s).toBe(base); // 没有 queriedAt 就套用 = 按完全权威清掉实时审批，故必须忽略
+  });
+});
+describe("applyApprovalsSnapshot（v1.42 待审批快照对齐）", () => {
+  const M = "home-mac";
+  /** 可控时钟：实时条目的 at、快照条目的 at、queriedAt 全取 Date.now()，
+   *  用 spy 固定它，让「查询之后 / 之前到达」成为可精确构造的条件（真实时钟下
+   *  连续两帧常落在同一毫秒，无法区分）。 */
+  let now = 0;
+  beforeEach(() => {
+    now = 1_795_000_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+  const advance = (ms: number): void => {
+    now += ms;
+  };
+
+  const snap = (requestId: string, extra: Partial<ApprovalSnapshotItem> = {}): ApprovalSnapshotItem => ({
+    convId: DEFAULT_CONV,
+    requestId,
+    tool: "Bash",
+    inputSummary: `cmd ${requestId}`,
+    timeoutSecs: 731,
+    ...extra,
+  });
+  /** 实时 approval_request 帧（带 900s 超时预算，at = 此刻时钟）。 */
+  const realtimeReq = (requestId: string, convId = DEFAULT_CONV, machine = M) =>
+    frame(
+      `{"v":1,"type":"approval_request","convId":"${convId}","requestId":"${requestId}","tool":"Edit","inputSummary":"实时 ${requestId}","timeoutSecs":900,"machine":"${machine}"}`,
+    );
+  const resolvedFrame = (requestId: string, decision = "allow") =>
+    frame(
+      `{"v":1,"type":"approval_resolved","convId":"${DEFAULT_CONV}","requestId":"${requestId}","decision":"${decision}","machine":"${M}"}`,
+    );
+  const pendingOf = (s: AppState, convId = DEFAULT_CONV, machine = M): PendingApproval[] =>
+    spaceOf(s, machine).convs[convId]?.pending ?? [];
+  const ids = (list: PendingApproval[]): string[] => list.map((p) => p.requestId);
+  /** 侧栏 / 审批面板的派生方式（App.allPending 同构）：按机器空间 convOrder 遍历。 */
+  const listPending = (s: AppState, machine: string): string[] => {
+    const sp = spaceOf(s, machine);
+    const out: string[] = [];
+    for (const c of sp.convOrder) {
+      out.push(...(sp.convs[c]?.pending ?? []).map((p) => p.requestId));
+    }
+    return out;
+  };
+
+  it("① 空快照清掉旧 pending（离开期间已超时 / 已解决的审批不再挂到刷新）", () => {
+    let s = run(initialState(), { type: "frame", frame: realtimeReq("r1") });
+    advance(10);
+    s = run(s, { type: "frame", frame: realtimeReq("r2") });
+    expect(ids(pendingOf(s))).toEqual(["r1", "r2"]);
+    advance(60_000);
+    const queriedAt = now;
+    advance(100);
+    const after = applyApprovalsSnapshot(s, M, [], queriedAt);
+    expect(pendingOf(after)).toEqual([]);
+    expect(after).not.toBe(s);
+  });
+
+  it("② 快照条目替换旧 pending：timeoutSecs 取快照的剩余值、at 等于套用时刻、其余字段照搬", () => {
+    let s = run(initialState(), { type: "frame", frame: realtimeReq("r1") });
+    // 实时条目：timeoutSecs 是 900s 超时预算
+    expect(pendingOf(s)[0]).toMatchObject({ requestId: "r1", tool: "Edit", timeoutSecs: 900, at: now });
+    const queriedAt = now;
+    advance(169_000); // 已过 169s：剩余 731s
+    const after = applyApprovalsSnapshot(
+      s,
+      M,
+      [snap("r1", { tool: "Bash", inputSummary: "npm test", timeoutSecs: 731 })],
+      queriedAt,
+    );
+    // 形状与 addApproval 写入的一致（七个字段，无多无少）
+    expect(pendingOf(after)[0]).toEqual({
+      machine: M,
+      convId: DEFAULT_CONV,
+      requestId: "r1",
+      tool: "Bash",
+      inputSummary: "npm test",
+      at: now,
+      timeoutSecs: 731,
+    });
+    // 倒计时语义：截止时刻 = 套用时刻 + 剩余秒数（与实时条目的 收到时刻 + 900s 一致）
+    expect(pendingOf(after)[0].at + 731_000).toBe(queriedAt + 900_000);
+  });
+
+  it("③ 查询之后到达的实时条目被保留（at > queriedAt）；与快照 requestId 重复时以快照为准、不重复", () => {
+    let s = run(initialState(), { type: "frame", frame: realtimeReq("r-old") });
+    advance(10);
+    const queriedAt = now; // 查询发出：此刻 r-old 已在网关侧，r-new 还没有
+    advance(10);
+    s = run(s, { type: "frame", frame: realtimeReq("r-new") }); // 查询之后才到达
+
+    // 快照（生成于 queriedAt）不含 r-new：必须保留，不能被「不在快照里」误删
+    const keep = applyApprovalsSnapshot(s, M, [snap("r-old")], queriedAt);
+    expect(ids(pendingOf(keep))).toEqual(["r-old", "r-new"]); // 快照条目在前，保留的实时条目在后
+    expect(pendingOf(keep)[0].at).toBe(now); // 快照条目：锚点换成套用时刻
+    expect(pendingOf(keep)[1]).toBe(pendingOf(s)[1]); // 保留的是原条目对象（锚点 / 预算不动）
+    expect(pendingOf(keep)[1]).toMatchObject({ at: queriedAt + 10, timeoutSecs: 900, tool: "Edit" });
+
+    // 更晚的一次查询，快照也含 r-new：以快照为准，不重复
+    const dedup = applyApprovalsSnapshot(
+      s,
+      M,
+      [snap("r-old"), snap("r-new", { timeoutSecs: 890 })],
+      queriedAt,
+    );
+    expect(ids(pendingOf(dedup))).toEqual(["r-old", "r-new"]);
+    expect(pendingOf(dedup)[1]).toMatchObject({ timeoutSecs: 890, tool: "Bash" }); // 快照的剩余值，不是实时的预算
+
+    // 边界：at 恰等于 queriedAt 不算「查询之后」（严格大于）
+    expect(ids(pendingOf(applyApprovalsSnapshot(s, M, [], queriedAt + 10)))).toEqual([]);
+    expect(ids(pendingOf(applyApprovalsSnapshot(s, M, [], queriedAt + 9)))).toEqual(["r-new"]);
+  });
+
+  it("④ 快照引用了尚不存在的 conv → 物化空会话（entries 空、无未读），审批派生能列出来", () => {
+    // home-mac 空间此前完全不存在（从未收到该机器任何帧）
+    expect(initialState().spaces[M]).toBeUndefined();
+    const s = applyApprovalsSnapshot(
+      initialState(),
+      M,
+      [snap("r1", { convId: "web:s-192d" }), snap("r2", { convId: "peer:win-a" })],
+      now,
+    );
+    expect(orderOf(s, M)).toEqual([DEFAULT_CONV, "web:s-192d", "peer:win-a"]); // 物化追加在末尾，default 恒居首
+    expect(spaceOf(s, M).convs["web:s-192d"]).toEqual({
+      entries: [],
+      lastPreview: "",
+      lastAt: 0,
+      unread: 0,
+      pending: [
+        {
+          machine: M,
+          convId: "web:s-192d",
+          requestId: "r1",
+          tool: "Bash",
+          inputSummary: "cmd r1",
+          at: now,
+          timeoutSecs: 731,
+        },
+      ],
+    });
+    expect(listPending(s, M)).toEqual(["r1", "r2"]);
+    // 条目的 machine / convId 归属正确（回传 approval_response 时原样带回）
+    expect(pendingOf(s, "peer:win-a")[0]).toMatchObject({ machine: M, convId: "peer:win-a" });
+    // 已存在的 conv 不重复物化、顺序不变
+    expect(orderOf(s, M).filter((c) => c === DEFAULT_CONV)).toHaveLength(1);
+  });
+
+  it("⑤ queriedAt 为 undefined → 完全权威：原有 pending 全部替换（查询后才到的也不留）", () => {
+    let s = run(initialState(), { type: "frame", frame: realtimeReq("r1") });
+    advance(10);
+    s = run(s, { type: "frame", frame: realtimeReq("r2") });
+    expect(ids(pendingOf(s))).toEqual(["r1", "r2"]);
+    expect(ids(pendingOf(applyApprovalsSnapshot(s, M, [], undefined)))).toEqual([]);
+    expect(ids(pendingOf(applyApprovalsSnapshot(s, M, [snap("s1")], undefined)))).toEqual(["s1"]);
+    // 物化新 conv 的快照在 undefined 下同样只含快照条目
+    const fresh = applyApprovalsSnapshot(s, M, [snap("s2", { convId: "web:new" })], undefined);
+    expect(listPending(fresh, M)).toEqual(["s2"]);
+  });
+
+  it("⑥ 快照内容与现有完全相同 → 返回同一引用（两个触发点各来一份同样的快照不白渲染）", () => {
+    const base = initialState();
+    const first = applyApprovalsSnapshot(base, M, [snap("r1")], now);
+    expect(first).not.toBe(base);
+    const firstPending = pendingOf(first);
+    // 紧接着的第二份同内容快照（E1 与 E2 的应答）：原引用，pending 数组与条目对象都不换
+    advance(50);
+    const second = applyApprovalsSnapshot(first, M, [snap("r1")], now);
+    expect(second).toBe(first);
+    expect(pendingOf(second)).toBe(firstPending);
+    // 空快照 + 本来就空：原引用
+    expect(applyApprovalsSnapshot(base, M, [], now)).toBe(base);
+    // 该机器空间不存在 + 空快照：不凭空物化机器空间
+    expect(applyApprovalsSnapshot(base, "never-seen", [], now)).toBe(base);
+    // 含「查询后到达」的保留条目且快照相同：同样原引用
+    let s = run(initialState(), { type: "frame", frame: realtimeReq("r-old") });
+    const queriedAt = now;
+    advance(10);
+    s = run(s, { type: "frame", frame: realtimeReq("r-new") });
+    const once = applyApprovalsSnapshot(s, M, [snap("r-old")], queriedAt);
+    expect(applyApprovalsSnapshot(once, M, [snap("r-old")], queriedAt)).toBe(once);
+  });
+
+  it("⑥b 内容有变化才换引用：只动受影响的 conv，其余 conv 对象与别的字段保持不变", () => {
+    let s = applyApprovalsSnapshot(
+      initialState(),
+      M,
+      [snap("r1"), snap("r2", { convId: "web:other" })],
+      now,
+    );
+    const defaultConv = spaceOf(s, M).convs[DEFAULT_CONV];
+    const otherConv = spaceOf(s, M).convs["web:other"];
+    expect(ids(otherConv.pending)).toEqual(["r2"]);
+    // 只移除 web:other 的 r2：default conv 对象不变，web:other 换新
+    advance(10);
+    const next = applyApprovalsSnapshot(s, M, [snap("r1")], now);
+    expect(spaceOf(next, M).convs[DEFAULT_CONV]).toBe(defaultConv);
+    expect(spaceOf(next, M).convs["web:other"]).not.toBe(otherConv);
+    expect(pendingOf(next, "web:other")).toEqual([]);
+    // 条目字段值不同（如剩余秒数变小）也算变化
+    const tick = applyApprovalsSnapshot(
+      s,
+      M,
+      [snap("r1", { timeoutSecs: 730 }), snap("r2", { convId: "web:other" })],
+      now,
+    );
+    expect(tick).not.toBe(s);
+    expect(pendingOf(tick)[0].timeoutSecs).toBe(730);
+    // 别的机器空间对象不动
+    expect(next.spaces[DEFAULT_MACHINE]).toBe(s.spaces[DEFAULT_MACHINE]);
+  });
+
+  it("⑦ 不产生 approval_note：被快照移除的审批不留终态记录（真实结局不可知，不编造）", () => {
+    let s = run(initialState(), { type: "frame", frame: realtimeReq("r1") });
+    expect(spaceOf(s, M).convs[DEFAULT_CONV].entries).toHaveLength(0); // 实时到达本身不产生条目
+    advance(10);
+    const queriedAt = now;
+    const removed = applyApprovalsSnapshot(s, M, [], queriedAt);
+    expect(spaceOf(removed, M).convs[DEFAULT_CONV].entries).toHaveLength(0);
+    expect(removed.seq).toBe(s.seq);
+    // 套用 / 替换 / 物化同样不写消息流；未读不动
+    const replaced = applyApprovalsSnapshot(
+      s,
+      M,
+      [snap("r1"), snap("r2", { convId: "web:new" })],
+      queriedAt,
+    );
+    expect(spaceOf(replaced, M).convs[DEFAULT_CONV].entries).toHaveLength(0);
+    expect(spaceOf(replaced, M).convs["web:new"].entries).toHaveLength(0);
+    expect(spaceOf(replaced, M).convs[DEFAULT_CONV].unread).toBe(0);
+    // 既有终态记录路径不变：approval_resolved 照旧移出 pending 并留记录
+    const resolved = run(replaced, { type: "frame", frame: resolvedFrame("r1") });
+    expect(spaceOf(resolved, M).convs[DEFAULT_CONV].entries.map((e) => e.kind)).toEqual(["approval_note"]);
+    expect(ids(pendingOf(resolved))).toEqual([]);
+  });
+
+  it("⑧ 只影响目标机器的空间：别的机器的 pending 与会话空间对象完全不动", () => {
+    let s = run(initialState(), { type: "frame", frame: realtimeReq("r-home") });
+    // 同名 requestId 落在另一台机器（审批按机器空间隔离）
+    s = run(s, { type: "frame", frame: realtimeReq("r-home", DEFAULT_CONV, "office-mac") });
+    s = run(s, { type: "frame", frame: realtimeReq("r-office", DEFAULT_CONV, "office-mac") });
+    advance(10);
+    const officeSpace = s.spaces["office-mac"];
+    const officePending = pendingOf(s, DEFAULT_CONV, "office-mac");
+    const defaultSpace = s.spaces[DEFAULT_MACHINE];
+    expect(ids(officePending)).toEqual(["r-home", "r-office"]);
+    const after = applyApprovalsSnapshot(s, M, [snap("r-home", { timeoutSecs: 5 })], now);
+    expect(after.spaces["office-mac"]).toBe(officeSpace); // 原空间对象
+    expect(pendingOf(after, DEFAULT_CONV, "office-mac")).toBe(officePending); // 原 pending 数组
+    expect(after.spaces[DEFAULT_MACHINE]).toBe(defaultSpace);
+    expect(pendingOf(after)[0].timeoutSecs).toBe(5);
+    // 其它 state 字段原样
+    expect(after.seq).toBe(s.seq);
+    expect(after.currentConv).toBe(s.currentConv);
+    expect(after.workspaces).toBe(s.workspaces);
+  });
+
+  it("快照内重复 requestId（同 conv）只留首条；跨 conv 的不同条目各自保留", () => {
+    const s = applyApprovalsSnapshot(
+      initialState(),
+      M,
+      [snap("r1", { inputSummary: "first" }), snap("r1", { inputSummary: "second" }), snap("r2", { convId: "web:other" })],
+      now,
+    );
+    expect(pendingOf(s)).toEqual([expect.objectContaining({ requestId: "r1", inputSummary: "first" })]);
+    expect(ids(pendingOf(s, "web:other"))).toEqual(["r2"]);
+  });
+
+  it("该机器尚无会话空间时收到非空快照：连同 default 会话一并物化（ensureConv 语义）；default 机器空间不受影响", () => {
+    const base = initialState();
+    expect(base.spaces["work-mac"]).toBeUndefined();
+    const s = applyApprovalsSnapshot(base, "work-mac", [snap("r1", { convId: "web:side" })], now);
+    expect(orderOf(s, "work-mac")).toEqual([DEFAULT_CONV, "web:side"]);
+    expect(pendingOf(s, DEFAULT_CONV, "work-mac")).toEqual([]);
+    expect(pendingOf(s, "web:side", "work-mac")).toEqual([
+      expect.objectContaining({ requestId: "r1", machine: "work-mac", convId: "web:side" }),
+    ]);
+    // default 机器空间是原对象（未动）；currentMachine 等不因物化而改变
+    expect(s.spaces[DEFAULT_MACHINE]).toBe(base.spaces[DEFAULT_MACHINE]);
+    expect(s.currentMachine).toBe(DEFAULT_MACHINE);
+    expect(s.machinesKnown).toBe(false);
+  });
+
+  it("用户已点「允许」（approval_sent 本地移除）后迟到的旧快照会让条目回栏，随后的 approval_resolved 照旧移除（最终一致）", () => {
+    let s = run(initialState(), { type: "frame", frame: realtimeReq("r1") });
+    const queriedAt = now; // 查询早于用户操作：那份快照仍含 r1
+    s = run(s, { type: "approval_sent", convId: DEFAULT_CONV, requestId: "r1", machine: M });
+    expect(pendingOf(s)).toEqual([]);
+    const late = applyApprovalsSnapshot(s, M, [snap("r1")], queriedAt);
+    expect(ids(pendingOf(late))).toEqual(["r1"]); // 短暂回栏（快照是它生成时刻的权威）
+    const resolved = run(late, { type: "frame", frame: resolvedFrame("r1") });
+    expect(pendingOf(resolved)).toEqual([]);
+    expect(spaceOf(resolved, M).convs[DEFAULT_CONV].entries.map((e) => e.kind)).toEqual(["approval_note"]);
+    // 再来一份更新（已不含 r1）的快照也不会把这条终态记录抹掉
+    const fresh = applyApprovalsSnapshot(resolved, M, [], now);
+    expect(spaceOf(fresh, M).convs[DEFAULT_CONV].entries.map((e) => e.kind)).toEqual(["approval_note"]);
   });
 });

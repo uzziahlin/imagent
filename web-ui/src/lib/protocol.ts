@@ -92,6 +92,17 @@
 //   则丢弃（消除双显）；缺席/false/非布尔 = 既有 agent 文本语义（旧网关不发
 //   该键、旧 SPA 忽略未知键，双向兼容）。history 条目同名可选 self（落盘
 //   payload 透传）：重放补回为 user 条目，与本机回显按文本计数吸收。
+// - v1.42 停止按钮落到当前会话：control 帧新增可选 convId（完整 conv 形态）。
+//   此前 stop 不带会话号、网关落默认会话——在 web:s-xxxx 里点停止停不掉当前
+//   任务。缺省 = 网关落默认会话（旧 SPA 字节不变）；旧网关忽略该字段。
+// - v1.42 待审批快照：approval_request 只在网关发起审批那一刻发一帧，浏览器
+//   离线期间到达的审批错过即无按钮；离开期间已超时 / 已解决的审批因错过
+//   approval_resolved 一直挂到刷新。出站 approvals_query{machine}（业务帧，
+//   E2E 加密）→ 网关回 approvals{machine, items}（业务帧）：items 是该机器
+//   **全部**待审批的权威集合（可空），timeoutSecs 为**剩余**秒数（正整数，
+//   区别于 approval_request 的超时预算）。旧网关不认识该查询、不回任何帧；
+//   旧 SPA 对 approvals 因未知类型被 parseFrame 丢弃——双向兼容。SPA 侧按
+//   「查询发出时刻」对齐，见 applyApprovalsSnapshot。
 
 export const PROTOCOL_VERSION = 1;
 
@@ -304,6 +315,10 @@ export type ControlFrame = {
   cmd: "stop" | "resume" | "switch";
   args?: string;
   machine?: string;
+  /** v1.42 可选目标会话（完整 conv 形态，如 web:s-ab12）：stop 必须带上当前
+   *  会话——缺省时网关落默认会话，非默认会话里点停止停不掉当前任务。旧网关
+   *  忽略该字段（未知键）；缺席时帧字节与升级前一致。 */
+  convId?: string;
 };
 
 export type SyncFrame = { v: typeof PROTOCOL_VERSION; type: "sync"; machine?: string };
@@ -490,6 +505,18 @@ export type ConvDeleteFrame = {
 };
 
 // ---------------------------------------------------------------------------
+// v1.42 待审批快照（浏览器 → 网关，业务帧，E2E 加密；契约见头注）
+// ---------------------------------------------------------------------------
+
+/** v1.42 查询某机器当前全部待审批：网关回 approvals 帧。machine 同 message
+ *  族路由约定（多机模式必须带）。旧网关不认识该帧 type、不回任何帧。 */
+export type ApprovalsQueryFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "approvals_query";
+  machine?: string;
+};
+
+// ---------------------------------------------------------------------------
 // v1.4 E2E 中继盲化（密码学构造与编码规约见 lib/e2e.ts 头注）
 // ---------------------------------------------------------------------------
 
@@ -540,7 +567,8 @@ export type OutboundFrame =
   | ConvWorkdirSetFrame
   | HistoryQueryFrame
   | AsrRequestFrame
-  | ConvDeleteFrame;
+  | ConvDeleteFrame
+  | ApprovalsQueryFrame;
 
 /** 出站帧序列化（undefined 字段不序列化，与网关入站解析兼容）。 */
 export function encodeFrame(frame: OutboundFrame): string {
@@ -814,6 +842,32 @@ export type AsrUiEvent =
   | { kind: "result"; text: string; durationMs: number }
   | { kind: "error"; code: string };
 
+/** v1.42 待审批快照条目（approvals 帧 items 元素，字段名与网关契约逐字一致）。 */
+export type ApprovalSnapshotItem = {
+  /** 完整 conv 形态。 */
+  convId: string;
+  requestId: string;
+  tool: string;
+  /** 可为空串。 */
+  inputSummary: string;
+  /** **剩余**秒数（正整数）——区别于 approval_request.timeoutSecs（超时预算）。
+   *  两者落同一个 PendingApproval.timeoutSecs 字段，但锚点 at 不同：实时条目
+   *  的 at 是收到预算的时刻，快照条目的 at 是套用快照的时刻，截止时刻一致。 */
+  timeoutSecs: number;
+};
+
+/** v1.42 待审批快照（网关 → 浏览器，E2E 业务帧）：items = 该机器当前**全部**
+ *  待审批的权威集合（空数组 = 该机器没有待审批）。它是 approvals_query 的
+ *  应答；SPA 在 App 层 onFrame 拦截并转成 approvals_snapshot（见
+ *  applyApprovalsSnapshot）——对齐需要「查询发出时刻」这个只有 App 层持有的
+ *  上下文，故不进 protocol reducer 的帧路径。 */
+export type ApprovalsFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "approvals";
+  machine: string;
+  items: ApprovalSnapshotItem[];
+};
+
 /** v1.4 握手第二步（网关 → 浏览器，经 relay 明文透传）：gk = 网关 X25519
  *  公钥（32B hex），n2 = 网关随机数（32B hex），sig = 网关 ed25519 对
  *  bytes(ek)||bytes(gk)||bytes(n1)||bytes(n2) 的签名（64B hex），ik = 网关
@@ -853,7 +907,8 @@ export type InboundFrame =
   | WorkspacesFrame
   | ConvWorkdirFrame
   | HistoryFrame
-  | AsrResultFrame;
+  | AsrResultFrame
+  | ApprovalsFrame;
 
 // ---------------------------------------------------------------------------
 // parseFrame：v/type 校验 + 每类帧关键字段存在性校验，非法返回 null（不抛）
@@ -862,6 +917,11 @@ export type InboundFrame =
 type FieldCheck = (o: Record<string, unknown>) => boolean;
 
 const isStr = (o: Record<string, unknown>, k: string) => typeof o[k] === "string";
+
+/** v1.42 非空字符串字段：approvals 帧的 machine 与快照条目的 convId /
+ *  requestId / tool 必须有值（空串会让快照无处归属 / 条目无法幂等与回传）。 */
+const isNonEmptyStr = (o: Record<string, unknown>, k: string): boolean =>
+  typeof o[k] === "string" && o[k] !== "";
 
 /** v1.1 可选 machine 字段：缺席或字符串才合法。 */
 const machineOk = (o: Record<string, unknown>): boolean =>
@@ -1058,6 +1118,27 @@ const historyEntryOk = (e: unknown): boolean => {
   return false;
 };
 
+/** v1.42 approvals.items 元素形状：convId / requestId / tool 非空字符串、
+ *  inputSummary 字符串（可空）、timeoutSecs **剩余**秒数须为正整数（0 = 已
+ *  过期，网关不应下发；小数 / 负数 / 非数字一律畸形）。任一项畸形整帧拒收
+ *  （见 INBOUND_CHECKS.approvals）。 */
+const approvalItemOk = (it: unknown): boolean => {
+  if (typeof it !== "object" || it === null) {
+    return false;
+  }
+  const r = it as Record<string, unknown>;
+  const t = r.timeoutSecs;
+  return (
+    isNonEmptyStr(r, "convId") &&
+    isNonEmptyStr(r, "requestId") &&
+    isNonEmptyStr(r, "tool") &&
+    typeof r.inputSummary === "string" &&
+    typeof t === "number" &&
+    Number.isInteger(t) &&
+    t > 0
+  );
+};
+
 const RESOLVED_DECISIONS: readonly string[] = ["allow", "deny", "always", "cancelled"];
 
 /** v1.4 e2e_ack 的网关身份公钥字段：ik（规范名）/ id / pk（宽容别名）任一
@@ -1133,6 +1214,11 @@ const INBOUND_CHECKS: Record<string, FieldCheck> = {
   // 可选）。校验在此放行的帧由 ws 连接层拦截消费（onAsrResult），不进 reducer
   // 消息流——见 reduceFrame case "asr_result"。
   asr_result: (o) => isStr(o, "text") && durationMsOk(o.durationMs) && machineOk(o),
+  // v1.42 待审批快照：machine 必填非空；items 每项逐字段校验（approvalItemOk），
+  // 任一项畸形整帧拒收——快照会**替换**面板上的待审批集合，宁可不更新也不拿
+  // 半份可疑数据覆盖。
+  approvals: (o) =>
+    isNonEmptyStr(o, "machine") && Array.isArray(o.items) && o.items.every(approvalItemOk),
 };
 
 /** 解析一条入站文本帧：信封 v=1 + 已知 type + 关键字段齐备才放行，否则 null。 */
@@ -1636,6 +1722,112 @@ function resolveApproval(
   });
 }
 
+/** 两份 pending 列表的条目值是否完全相同（machine / convId / requestId / tool /
+ *  inputSummary / timeoutSecs 逐项同序相等）。at 不参与：快照条目的 at 是套用
+ *  快照的时刻，让它参与会让「内容相同」永不成立、每次快照都白渲染一遍。 */
+function samePending(a: readonly PendingApproval[], b: readonly PendingApproval[]): boolean {
+  return (
+    a.length === b.length &&
+    a.every((p, i) => {
+      const q = b[i];
+      return (
+        p.machine === q.machine &&
+        p.convId === q.convId &&
+        p.requestId === q.requestId &&
+        p.tool === q.tool &&
+        p.inputSummary === q.inputSummary &&
+        p.timeoutSecs === q.timeoutSecs
+      );
+    })
+  );
+}
+
+/** v1.42 待审批快照对齐：把网关回的「该机器当前全部待审批」权威集合套到该
+ *  机器的会话空间上（重连 / 刷新 / 加密会话建立后调用，修复两类问题：离线
+ *  期间到达的审批错过 approval_request 后再无按钮；离开期间已超时 / 已解决
+ *  的审批错过 approval_resolved 后一直挂到刷新）。
+ *
+ *  对该机器空间的**每个** conv：
+ *  - 新 pending = 快照中属于该 conv 的条目（at = 套用时刻，timeoutSecs 取快照
+ *    的剩余秒数，其余字段照搬——与 addApproval 写入的形状一致）+ 原有 pending
+ *    里 **at > queriedAt** 的条目。后者是查询发出之后才到达的实时
+ *    approval_request：它晚于快照生成，快照对它不具权威性，不能误删；其
+ *    requestId 若已出现在快照里则以快照为准（不重复）。
+ *  - 不在快照里、也不是查询后才到达的旧条目 → 移除（网关侧已经没有它了）。
+ *  - queriedAt 为 undefined = 完全权威：原有 pending 全部替换。
+ *  快照引用了尚不存在的 conv → 用 ensureConv 物化空会话（同 addApproval），
+ *  审批面板按 convOrder 遍历才能列出来。
+ *
+ *  **不**往消息流写 approval_note 之类的终态记录：被快照移除的审批真实结局
+ *  不可知（允许 / 拒绝 / 超时 / 被中断），不编造；resolveApproval 行为不变。
+ *  不可变更新；条目值与现状完全相同时返回原 state 引用（免无谓渲染）。 */
+export function applyApprovalsSnapshot(
+  state: AppState,
+  machine: string,
+  items: readonly ApprovalSnapshotItem[],
+  queriedAt?: number,
+): AppState {
+  // 快照按 conv 分组。同一 conv 内同 requestId 只留首条：pending 以 requestId
+  // 为幂等键，网关集合本不应重复，此处防御。
+  const at = Date.now();
+  const byConv = new Map<string, PendingApproval[]>();
+  const snapIds = new Set<string>();
+  for (const it of items) {
+    const list = byConv.get(it.convId);
+    if (list !== undefined && list.some((p) => p.requestId === it.requestId)) {
+      continue;
+    }
+    snapIds.add(it.requestId);
+    const entry: PendingApproval = {
+      machine,
+      convId: it.convId,
+      requestId: it.requestId,
+      tool: it.tool,
+      inputSummary: it.inputSummary,
+      // 套用时刻即倒计时锚点（at + timeoutSecs = 截止；timeoutSecs 是剩余量）
+      at,
+      timeoutSecs: it.timeoutSecs,
+    };
+    if (list) {
+      list.push(entry);
+    } else {
+      byConv.set(it.convId, [entry]);
+    }
+  }
+  let spaces = state.spaces;
+  for (const convId of byConv.keys()) {
+    if (spaces[machine]?.convs[convId] === undefined) {
+      spaces = ensureConv({ ...state, spaces }, machine, convId);
+    }
+  }
+  const space = spaces[machine];
+  if (space === undefined) {
+    return state; // 该机器尚无会话空间且快照为空：无事可做
+  }
+  const convIds = new Set([...space.convOrder, ...Object.keys(space.convs)]);
+  const convs: Record<string, ConvState> = {};
+  let changed = false;
+  for (const convId of convIds) {
+    const prev =
+      space.convs[convId] ?? { entries: [], pending: [], lastPreview: "", lastAt: 0, unread: 0 };
+    const snapshot = byConv.get(convId) ?? [];
+    const kept = prev.pending.filter(
+      (p) => queriedAt !== undefined && p.at > queriedAt && !snapIds.has(p.requestId),
+    );
+    const pending = [...snapshot, ...kept];
+    if (samePending(prev.pending, pending)) {
+      convs[convId] = prev;
+    } else {
+      convs[convId] = { ...prev, pending };
+      changed = true;
+    }
+  }
+  if (!changed) {
+    return state;
+  }
+  return { ...state, spaces: { ...spaces, [machine]: { ...space, convs } } };
+}
+
 /** machines 帧：全量覆盖在线列表；当前机器不在列表时自动切第一台在线并出
  *  notice（多台网关掉线重排时保证 SPA 仍指向一台在线机器，出站帧不致
  *  machine_offline）。全部离线无可切时保持当前机器并出 offline notice。 */
@@ -2033,6 +2225,12 @@ function reduceFrame(state: AppState, frame: InboundFrame): AppState {
       // 在 onFrame 分发前已拦截（经 onAsrResult 回调直达 App → Composer，同
       // pairing_pending 的非消息帧模式）。reducer 收到即说明上游漏拦，静默
       // 忽略（不落 entries、不派生概要/未读）。
+      return state;
+    case "approvals":
+      // v1.42 待审批快照由 App 层 onFrame 拦截并转成 approvals_snapshot（对齐
+      // 需要「查询发出时刻」，只有 App 层持有，见 applyApprovalsSnapshot）。
+      // reducer 收到原始帧即说明上游漏拦：静默忽略——没有 queriedAt 就套用
+      // 等于按「完全权威」清掉查询后才到的实时审批。
       return state;
   }
 }

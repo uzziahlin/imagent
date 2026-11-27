@@ -107,6 +107,26 @@
 //! 后仍是用户气泡）。缺席 = 既有语义（agent 文本）——`send_text` 的帧与
 //! 落盘 payload 字节不变（旧网关不发该键；旧 SPA 忽略未知键）。
 //!
+//! v1.42 扩展（驾驶舱核心交互修复，契约同款字节级纪律）：
+//! - 入站 `control` 帧可带可选 `convId`：合成的命令文本落该会话（经
+//!   [`normalize_conv`] 归一）；缺席 / 空串 / 非字符串维持旧行为落默认会话。
+//!   `/stop` 等命令**按会话**生效（cmd_stop 只中断该 conv 的在飞轮），SPA
+//!   停止按钮必须指明目标会话——恒落默认会话时，非默认会话里点停止停不掉
+//!   当前任务，默认会话反而多出一条「当前没有运行中的任务」。
+//! - 待审批快照（浏览器请求 → 网关回权威快照，参照 `workspace_list` →
+//!   `workspaces`）：入站 `approvals_query`（无必填字段，不进 recv / dispatch
+//!   命令链，由 platform 的 sync 泵处理）→ 出站 `approvals{machine,
+//!   items[{convId, requestId, tool, inputSummary, timeoutSecs}]}`。`items`
+//!   为该网关**当前全部待审批**（跨会话、不分平台前缀；可为空数组 `[]`，
+//!   键不省略），`timeoutSecs` 为**剩余**秒数（整数 ≥1；SPA 倒计时锚点 =
+//!   收到时刻 + timeoutSecs），已到期的条目不进快照，输出序确定（convId
+//!   升序，同 conv 按请求先后）。离线期间到达的审批重连后经此恢复按钮；
+//!   离开期间已超时 / 已解决的审批经此收敛。旧网关对 `approvals_query`
+//!   走未知 type 忽略（前向兼容）。
+//! - `push_notify` 帧的 kind 新增 `peer_reply`（窗口回信推送：本地 Claude
+//!   窗口经 peer 通道回给驾驶舱的文本，convId = `peer:<窗口名>`，见
+//!   [`PushNotifyKind`]）。
+//!
 //! **帧内 convId 协议约定：恒为完整 conv 形态（`web:<session>`）**。出站帧
 //! （text / card / approval_request …）写入的即完整 conv，浏览器回执帧
 //! （message / approval_response）**原样回传收到的 convId** 即可，不得剥前
@@ -132,6 +152,7 @@ pub mod titles;
 pub use key::GatewayCredential;
 pub use platform::{AsrContext, WebPlatform};
 
+use crate::platform::ApprovalSnapshotItem;
 use imagent_core::{
     CardPhase, CardTerminal, ConvId, CoreError, InboundMessage, MediaRef, OutboundCard, ReplyHint,
     Result, TodoStatus, UserId,
@@ -624,11 +645,73 @@ pub(crate) fn encode_approval_resolved_frame(
 }
 
 // ---------------------------------------------------------------------------
+// approvals 快照帧出站（协议 v1.42：浏览器 approvals_query 的应答）
+// ---------------------------------------------------------------------------
+
+/// approvals 快照帧的单个条目（数据来源
+/// [`crate::platform::ApprovalSnapshotItem`]；字段名逐字对齐 SPA 契约）。
+#[derive(Serialize)]
+struct ApprovalItemFrame<'a> {
+    #[serde(rename = "convId")]
+    conv_id: &'a str,
+    #[serde(rename = "requestId")]
+    request_id: &'a str,
+    tool: &'a str,
+    #[serde(rename = "inputSummary")]
+    input_summary: &'a str,
+    /// 剩余秒数（整数 ≥1）。与 approval_request 帧的 timeoutSecs 同名不同义：
+    /// 那边是超时预算，这边是剩余时限——SPA 以「收到时刻 + timeoutSecs」恢复
+    /// 倒计时。
+    #[serde(rename = "timeoutSecs")]
+    timeout_secs: u64,
+}
+
+/// approvals 快照帧（struct 序列化保持声明序——本文件既有纪律）。`items`
+/// 为空时输出 `"items":[]`，**不省略键**：空数组即「当前没有待审批」的权威
+/// 结论，SPA 据此清空面板里离开期间已超时 / 已解决的审批。
+#[derive(Serialize)]
+struct ApprovalsFrame<'a> {
+    v: u8,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    machine: &'a str,
+    items: Vec<ApprovalItemFrame<'a>>,
+}
+
+/// approvals 快照帧药化（platform 的 sync 泵处理 approvals_query 后调用）。
+/// 共享契约字节级：`{"v":1,"type":"approvals","machine":…,"items":[…]}`
+/// （条目字段 convId / requestId / tool / inputSummary / timeoutSecs）。
+pub(crate) fn encode_approvals_frame(
+    machine: &str,
+    items: &[ApprovalSnapshotItem],
+) -> Result<String> {
+    let frame = ApprovalsFrame {
+        v: 1,
+        kind: "approvals",
+        machine,
+        items: items
+            .iter()
+            .map(|i| ApprovalItemFrame {
+                conv_id: &i.conv_id,
+                request_id: &i.request_id,
+                tool: &i.tool_name,
+                input_summary: &i.summary,
+                timeout_secs: i.timeout_secs,
+            })
+            .collect(),
+    };
+    serde_json::to_string(&frame)
+        .map_err(|e| CoreError::Platform(TARGET, format!("approvals 帧序列化失败：{e}")))
+}
+
+// ---------------------------------------------------------------------------
 // push_notify 帧出站（协议 v1.10：网关 → 中继，明文管理帧族）
 // ---------------------------------------------------------------------------
 
-/// push_notify 帧的 kind（协议 v1.10 共享契约三值）：回合终态（done/error）
-/// 与审批请求。
+/// push_notify 帧的 kind（协议 v1.10 共享契约三值 + v1.42 第四值）：回合终态
+/// （done/error）、审批请求，以及窗口回信（v1.42 `peer_reply`——本地 Claude
+/// 窗口经 peer 通道回给驾驶舱的文本，此前纯文本帧无卡片终态，从不推送）。
+/// 字面量与中继 `parse_notify_frame` 白名单、SPA 通知文案三端逐字对齐。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PushNotifyKind {
     /// card 终态 done（回合正常结束）。
@@ -637,6 +720,9 @@ pub enum PushNotifyKind {
     RoundError,
     /// approval_request 出站。
     Approval,
+    /// v1.42 peer 入站回复已落 `peer:<窗口名>` 会话（`Platform::on_peer_reply`
+    /// 钩子；conv_id 即该 peer 会话的完整 conv，title = 回信正文摘要）。
+    PeerReply,
 }
 
 impl PushNotifyKind {
@@ -646,6 +732,7 @@ impl PushNotifyKind {
             PushNotifyKind::RoundDone => "round_done",
             PushNotifyKind::RoundError => "round_error",
             PushNotifyKind::Approval => "approval",
+            PushNotifyKind::PeerReply => "peer_reply",
         }
     }
 }
@@ -661,8 +748,8 @@ pub(crate) struct PushEvent {
 }
 
 /// push_notify 帧 title 上限（共享契约：≤32 字摘要——终态卡 task/审批工
-/// 具名）。按 Unicode 码点截（与 SESSION_TITLE_MAX_CHARS 同口径，中文/emoji
-/// 不劈半）。
+/// 具名/v1.42 窗口回信正文开头）。按 Unicode 码点截（与
+/// SESSION_TITLE_MAX_CHARS 同口径，中文/emoji 不劈半）。
 pub(crate) const PUSH_TITLE_MAX_CHARS: usize = 32;
 
 /// title 摘要规整（纯函数）：trim 后按码点截 [`PUSH_TITLE_MAX_CHARS`]。
@@ -684,8 +771,11 @@ struct PushNotifyFrame<'a> {
 }
 
 /// push_notify 帧药化（网关 → 中继，明文管理帧族——不经 E2E seal，与
-/// device_list 等管理帧同路：内容无敏感信息，只有「某机器某会话有事件」
-/// 这一层元数据，中继需明文读取做订阅投递）。共享契约字节级：
+/// device_list 等管理帧同路：中继需明文读取 kind/machine/convId 做订阅投递
+/// 与在线免打扰判定）。**title 是明文经中继的**：契约取 ≤32 码点摘要
+/// （终态卡 task / 审批工具名 / v1.42 起窗口回信正文的开头）——业务正文
+/// 本体仍受 E2E 保护，但这截摘要不在中继盲化范围内，属既有设计的已知
+/// 取舍（见 relay push.rs 模块头）。共享契约字节级：
 /// `{"v":1,"type":"push_notify","machine":…,"kind":…,"convId":…,"title":…}`。
 pub(crate) fn encode_push_notify_frame(machine: &str, ev: &PushEvent) -> String {
     serde_json::to_string(&PushNotifyFrame {
@@ -1115,6 +1205,11 @@ pub(crate) enum InboundAction {
     },
     /// sync 请求 → sync responder 重发缓存卡片（不进 recv）。
     Sync,
+    /// v1.42 待审批快照请求（approvals_query 帧）→ sync responder 按
+    /// [`crate::platform::PendingAsks`] 回 `approvals` 权威快照（不进 recv /
+    /// dispatch 命令链；与 `Sync` 共用通道与泵）。无必填字段——`machine` 由
+    /// relay 路由用，网关不消费。
+    ApprovalsQuery,
     /// 应用层 ping → client 直接回 pong（不进 recv）。
     Ping,
     /// v1.6 工作空间（workspace_list / workspace_save / workspace_remove /
@@ -1308,8 +1403,13 @@ pub(crate) fn map_inbound_frame(v: &serde_json::Value, default_session: &str) ->
             }
         }
         // control：平台侧转命令文本（与 IM 按钮点击同机制——走既有鉴权/分派，
-        // 见 platform.rs send_command_card 文档注释的既定惯例）。conv 落默认
-        // 会话（SPA 按钮是全局操作，不带 conv 概念）。
+        // 见 platform.rs send_command_card 文档注释的既定惯例）。v1.42 起可带
+        // 可选 convId：合成命令**按会话**生效（/stop 只中断该 conv 的在飞
+        // 轮，/resume / /switch 的回执也落该会话），SPA 须指明目标会话——
+        // 恒落默认会话时，非默认会话里点停止停不掉当前任务。convId 缺席 /
+        // 空串 / 非字符串 → 默认会话（旧 SPA 行为不变）；存在 → 经
+        // normalize_conv 归一（web:/local:/peer: 前缀透传，裸名补 web:）。
+        // 三种 cmd 统一适用，不区分。
         "control" => {
             let cmd = v.get("cmd").and_then(|c| c.as_str()).unwrap_or("");
             let args = v.get("args").and_then(|a| a.as_str()).unwrap_or("");
@@ -1330,12 +1430,16 @@ pub(crate) fn map_inbound_frame(v: &serde_json::Value, default_session: &str) ->
                 }
             };
             InboundAction::Message(Box::new(synth_message(
-                normalize_conv(None, default_session),
+                normalize_conv(v.get("convId").and_then(|c| c.as_str()), default_session),
                 text,
                 None,
             )))
         }
         "sync" => InboundAction::Sync,
+        // v1.42 待审批快照：浏览器请求 → 网关回权威快照（参照 workspace_list →
+        // workspaces）。无字段校验面（无必填字段），组装与回帧在 platform
+        // 的 sync 泵。
+        "approvals_query" => InboundAction::ApprovalsQuery,
         "ping" => InboundAction::Ping,
         // v1.6 工作空间帧：本层只做字段存在性/类型检查（缺失/类型错 → Warn
         // 丢弃，与 message 同纪律）；**值域校验（空 name / 非法路径）在
@@ -1648,6 +1752,58 @@ mod tests {
         ));
     }
 
+    /// v1.42 control 帧可选 convId（必修回归钉）：合成命令落指定会话——
+    /// `/stop` 按会话中断，恒落默认会话时非默认会话里点停止停不掉当前任务。
+    /// 六种形态：完整 web conv / 缺席 / 空串 / 裸名补前缀 / `local:` `peer:`
+    /// 透传 / 非字符串按缺席处理（不 panic）。
+    #[test]
+    fn map_control_conv_id_routes_command_to_session() {
+        let mapped = |raw: &str| match map_raw_frame(raw, SESSION) {
+            InboundAction::Message(m) => (m.conv_id, m.text.unwrap()),
+            other => panic!("{raw} 应映射为 Message：{other:?}"),
+        };
+
+        // 完整 conv（SPA 正常路径：原样回传当前会话的 convId）。
+        let (conv, text) = mapped(
+            r#"{"v":1,"type":"control","cmd":"stop","machine":"home-mac","convId":"web:s-ab12"}"#,
+        );
+        assert_eq!(conv, ConvId("web:s-ab12".into()));
+        assert_eq!(text, "/stop");
+
+        // 缺席 / 空串 / null / 非字符串（数字、数组）→ 默认会话（旧行为），
+        // 命令文本不受影响，非字符串不 panic。
+        for raw in [
+            r#"{"v":1,"type":"control","cmd":"stop"}"#,
+            r#"{"v":1,"type":"control","cmd":"stop","convId":""}"#,
+            r#"{"v":1,"type":"control","cmd":"stop","convId":null}"#,
+            r#"{"v":1,"type":"control","cmd":"stop","convId":42}"#,
+            r#"{"v":1,"type":"control","cmd":"stop","convId":["web:s-ab12"]}"#,
+        ] {
+            let (conv, text) = mapped(raw);
+            assert_eq!(conv, ConvId("web:default".into()), "{raw}");
+            assert_eq!(text, "/stop", "{raw}");
+        }
+
+        // 裸名补 web: 前缀；local: / peer: 前缀原样透传（不双前缀）。
+        let (conv, _) = mapped(r#"{"v":1,"type":"control","cmd":"stop","convId":"s-ab12"}"#);
+        assert_eq!(conv, ConvId("web:s-ab12".into()));
+        let (conv, _) = mapped(r#"{"v":1,"type":"control","cmd":"stop","convId":"peer:foo"}"#);
+        assert_eq!(conv, ConvId("peer:foo".into()));
+        let (conv, _) = mapped(r#"{"v":1,"type":"control","cmd":"stop","convId":"local:bar"}"#);
+        assert_eq!(conv, ConvId("local:bar".into()));
+
+        // resume / switch 同样落到该会话（三种 cmd 统一适用）。
+        let (conv, text) =
+            mapped(r#"{"v":1,"type":"control","cmd":"resume","convId":"web:s-ab12"}"#);
+        assert_eq!(conv, ConvId("web:s-ab12".into()));
+        assert_eq!(text, "/resume");
+        let (conv, text) = mapped(
+            r#"{"v":1,"type":"control","cmd":"switch","args":"proj-b","convId":"web:s-ab12"}"#,
+        );
+        assert_eq!(conv, ConvId("web:s-ab12".into()));
+        assert_eq!(text, "/switch proj-b");
+    }
+
     #[test]
     fn map_sync_ping_and_unknown() {
         assert!(matches!(
@@ -1667,6 +1823,52 @@ mod tests {
             map_raw_frame("not json", SESSION),
             InboundAction::Ignore
         ));
+    }
+
+    /// v1.42 approvals_query 入站映射：无必填字段（`machine` 由 relay 路由用，
+    /// 网关不消费）→ [`InboundAction::ApprovalsQuery`]，不进 recv / dispatch
+    /// 命令链。
+    #[test]
+    fn map_approvals_query() {
+        for raw in [
+            r#"{"v":1,"type":"approvals_query","machine":"home-mac"}"#,
+            r#"{"v":1,"type":"approvals_query"}"#,
+        ] {
+            assert!(
+                matches!(map_raw_frame(raw, SESSION), InboundAction::ApprovalsQuery),
+                "{raw}"
+            );
+        }
+    }
+
+    /// v1.42 approvals 快照帧字节级（共享契约）：键名驼峰、声明序（v / type /
+    /// machine / items；条目 convId / requestId / tool / inputSummary /
+    /// timeoutSecs）、`items` 空时输出 `[]` 不省略键。
+    #[test]
+    fn approvals_frame_byte_level() {
+        // 空表：items 为空数组，键不省略。
+        assert_eq!(
+            encode_approvals_frame("home-mac", &[]).unwrap(),
+            r#"{"v":1,"type":"approvals","machine":"home-mac","items":[]}"#
+        );
+
+        // 非空：两条（跨会话 / 跨平台前缀），逐字节。
+        let item =
+            |conv: &str, req: &str, tool: &str, summary: &str, secs: u64| ApprovalSnapshotItem {
+                conv_id: conv.into(),
+                request_id: req.into(),
+                tool_name: tool.into(),
+                summary: summary.into(),
+                timeout_secs: secs,
+            };
+        let items = vec![
+            item("web:s-192d", "req-1", "Bash", "npm test", 731),
+            item("local:work", "req-2", "Write", "/tmp/a", 12),
+        ];
+        assert_eq!(
+            encode_approvals_frame("home-mac", &items).unwrap(),
+            r#"{"v":1,"type":"approvals","machine":"home-mac","items":[{"convId":"web:s-192d","requestId":"req-1","tool":"Bash","inputSummary":"npm test","timeoutSecs":731},{"convId":"local:work","requestId":"req-2","tool":"Write","inputSummary":"/tmp/a","timeoutSecs":12}]}"#
+        );
     }
 
     /// v1.6 工作空间入站帧：四帧合法形态解析 + conv_workdir_set 的 convId
@@ -2829,6 +3031,29 @@ mod tests {
             title: "Bash".into(),
         };
         assert!(encode_push_notify_frame("m", &ev).contains(r#""kind":"approval""#));
+
+        // v1.42 peer_reply：字符串形态 + 字节级（convId = peer:<窗口名> 完整
+        // conv，title = 回信正文摘要）。
+        assert_eq!(PushNotifyKind::PeerReply.as_str(), "peer_reply");
+        let ev = PushEvent {
+            kind: PushNotifyKind::PeerReply,
+            conv_id: "peer:win-a".into(),
+            title: push_notify_title("  已修好构建  "),
+        };
+        assert_eq!(
+            encode_push_notify_frame("home-mac", &ev),
+            r#"{"v":1,"type":"push_notify","machine":"home-mac","kind":"peer_reply","convId":"peer:win-a","title":"已修好构建"}"#
+        );
+        // 空白正文 → title 空串（契约：前端有兜底文案），键不省略。
+        let ev = PushEvent {
+            kind: PushNotifyKind::PeerReply,
+            conv_id: "peer:win-a".into(),
+            title: push_notify_title(" \n "),
+        };
+        assert_eq!(
+            encode_push_notify_frame("home-mac", &ev),
+            r#"{"v":1,"type":"push_notify","machine":"home-mac","kind":"peer_reply","convId":"peer:win-a","title":""}"#
+        );
     }
 
     #[test]

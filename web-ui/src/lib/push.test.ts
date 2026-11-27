@@ -8,7 +8,8 @@
 // 自动重载 + 首装守卫 + cleanup 解绑；v1.41.5 运行中更新检查——定时 +
 // visibilitychange 两个触发源、cleanup 回收、update reject 静默、卸载竞态；
 // v1.41.9 多余更新提示的抑制——pageIsCurrentShell 判定的各形态、页面已是新
-// 构建时不提示也不驱动接管、无法判定 / 旧构建照常提示）。
+// 构建时不提示也不驱动接管、无法判定 / 旧构建照常提示；v1.42 窗口回信推送
+// （peer_reply 文案 + peer: 深链参数）。
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   listenServiceWorkerMessages,
@@ -176,6 +177,27 @@ describe("notificationCopy", () => {
     expect(notificationCopy(null, null)).toEqual({
       title: "imagent 通知",
       body: "有新事件，点击查看",
+    });
+  });
+
+  // v1.42：本地窗口（peer 通道）回信推送
+  it("peer_reply：标题「💬 窗口回复」，正文取回信摘要；空白摘要用兜底文案", () => {
+    expect(notificationCopy("peer_reply", "已修好")).toEqual({
+      title: "💬 窗口回复",
+      body: "已修好",
+    });
+    // 契约：title 是回信正文前 32 码点，可为空串
+    expect(notificationCopy("peer_reply", "")).toEqual({
+      title: "💬 窗口回复",
+      body: "本地窗口有了新回复",
+    });
+    expect(notificationCopy("peer_reply", "  \n")).toEqual({
+      title: "💬 窗口回复",
+      body: "本地窗口有了新回复",
+    });
+    expect(notificationCopy("peer_reply", undefined)).toEqual({
+      title: "💬 窗口回复",
+      body: "本地窗口有了新回复",
     });
   });
 });
@@ -472,6 +494,12 @@ describe("validConvParam", () => {
     expect(validConvParam("local:terminal-1")).toBe("local:terminal-1");
   });
 
+  // v1.42：窗口回信推送（peer_reply）的 convId 是 peer:<窗口名>——深链须能定位
+  it("peer:<窗口名> 接受并原样返回（v1.42 窗口回信推送深链）", () => {
+    expect(validConvParam("peer:imagent-bc")).toBe("peer:imagent-bc");
+    expect(validConvParam("peer:my-window_01")).toBe("peer:my-window_01");
+  });
+
   it("非法形态拒绝：null / 空串 / 裸名字 / 冒号后空 / 含空白 / 超长", () => {
     expect(validConvParam(null)).toBeNull();
     expect(validConvParam("")).toBeNull();
@@ -479,6 +507,15 @@ describe("validConvParam", () => {
     expect(validConvParam("web:")).toBeNull();
     expect(validConvParam("web:a b")).toBeNull();
     expect(validConvParam(`web:${"x".repeat(121)}`)).toBeNull();
+  });
+
+  it("peer 形态同受约束：裸窗口名 / 冒号后空 / 含空白 / 未知前缀仍拒绝", () => {
+    expect(validConvParam("imagent-bc")).toBeNull(); // 裸名（无前缀）
+    expect(validConvParam("peer")).toBeNull();
+    expect(validConvParam("peer:")).toBeNull();
+    expect(validConvParam("peer:a b")).toBeNull();
+    expect(validConvParam("peers:win")).toBeNull(); // 前缀须整词匹配
+    expect(validConvParam(`peer:${"x".repeat(121)}`)).toBeNull();
   });
 });
 

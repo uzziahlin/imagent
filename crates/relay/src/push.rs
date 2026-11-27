@@ -3,9 +3,11 @@
 //!
 //! 架构位置（共享设计 /tmp/contract_v110_push.md）：网关（事件生产者，埋点
 //! 在 crates/web platform 层）→ `push_notify` WS 帧 → 本模块（聚合 + 投递）
-//! → 系统 Web Push 服务（浏览器/OS 层）。**载荷只含元数据**（kind/title/
-//! convId/machine，无消息内容）——维持中继盲化：即使本层读到了推送载荷，
-//! 也只有「某机器有事件」这一信息。
+//! → 系统 Web Push 服务（浏览器/OS 层）。载荷字段为元数据（kind/convId/
+//! machine）+ `title`——**title 是网关按契约截的 ≤32 码点摘要，明文经中继**
+//! （终态卡 task / 审批工具名；v1.42 起含窗口回信正文的开头，kind=
+//! `peer_reply`）。业务正文本体仍由 E2E 加密、中继不可见，但这截摘要不在
+//! 盲化范围内——既有设计的已知取舍，不是「无消息内容」。
 //!
 //! 路由语义（任务定案的简化且正确形态）：订阅按 session 绑定，中继不知
 //! conv↔session 归属——**广播给全部有订阅的 session**（单用户多设备场景，
@@ -69,10 +71,10 @@ const TITLE_HARD_MAX_CODEPOINTS: usize = 32;
 const DELIVER_TIMEOUT: Duration = Duration::from_secs(15);
 
 // ---------------------------------------------------------------------------
-// push_notify 管理帧（网关 → 中继，明文——内容无敏感信息）
+// push_notify 管理帧（网关 → 中继，明文——title 的盲化边界见模块头）
 // ---------------------------------------------------------------------------
 
-/// 帧的 kind（共享契约三值）。
+/// 帧的 kind（共享契约：v1.10 三值 + v1.42 `peer_reply`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NotifyKind {
     /// 回合终态（card terminal done）。
@@ -81,6 +83,9 @@ pub(crate) enum NotifyKind {
     RoundError,
     /// 审批请求（approval_request 出站）。
     Approval,
+    /// v1.42 窗口回信（peer 入站回复已落 `peer:<窗口名>` 会话；convId 为该
+    /// peer 会话，title 为回信正文开头 ≤32 码点）。
+    PeerReply,
 }
 
 impl NotifyKind {
@@ -89,6 +94,7 @@ impl NotifyKind {
             NotifyKind::RoundDone => "round_done",
             NotifyKind::RoundError => "round_error",
             NotifyKind::Approval => "approval",
+            NotifyKind::PeerReply => "peer_reply",
         }
     }
 }
@@ -103,8 +109,8 @@ pub(crate) struct PushNotify {
 }
 
 /// 解析 push_notify 管理帧：`{"v":1,"type":"push_notify","machine":…,
-/// "kind":"round_done|round_error|approval","convId":…,"title":…}`。字段
-/// 缺失/非字符串、kind 越界、type 不符、畸形 JSON → None（调用方静默丢弃
+/// "kind":"round_done|round_error|approval|peer_reply","convId":…,"title":…}`。
+/// 字段缺失/非字符串、kind 越界、type 不符、畸形 JSON → None（调用方静默丢弃
 /// ——管理帧族同纪律，不让畸形帧漏进业务路由）。
 pub(crate) fn parse_notify_frame(text: &str) -> Option<PushNotify> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
@@ -115,6 +121,7 @@ pub(crate) fn parse_notify_frame(text: &str) -> Option<PushNotify> {
         "round_done" => NotifyKind::RoundDone,
         "round_error" => NotifyKind::RoundError,
         "approval" => NotifyKind::Approval,
+        "peer_reply" => NotifyKind::PeerReply,
         _ => return None,
     };
     Some(PushNotify {
@@ -948,11 +955,12 @@ mod tests {
     // ---- 帧解析 ----
 
     #[test]
-    fn parse_notify_frame_accepts_three_kinds() {
+    fn parse_notify_frame_accepts_all_kinds() {
         for (kind_text, expect) in [
             ("round_done", NotifyKind::RoundDone),
             ("round_error", NotifyKind::RoundError),
             ("approval", NotifyKind::Approval),
+            ("peer_reply", NotifyKind::PeerReply),
         ] {
             let f = serde_json::json!({
                 "v": 1, "type": "push_notify", "machine": "home-mac",
@@ -965,16 +973,44 @@ mod tests {
             assert_eq!(nf.conv_id, "web:s-ab12");
             assert_eq!(nf.title, "摘要");
         }
+
+        // v1.42 peer_reply 的真实帧形态（网关 WebPlatform::on_peer_reply 出帧）：
+        // convId = peer:<窗口名> 完整 conv；kind 字面量与 as_str 同源（加密载荷
+        // 里原样透传的前提——SPA 据此选通知文案）。
+        let f = serde_json::json!({
+            "v": 1, "type": "push_notify", "machine": "home-mac",
+            "kind": "peer_reply", "convId": "peer:win-a", "title": "已修好构建",
+        })
+        .to_string();
+        let nf = parse_notify_frame(&f).expect("peer_reply 帧应解析");
+        assert_eq!(nf.kind, NotifyKind::PeerReply);
+        assert_eq!(nf.kind.as_str(), "peer_reply");
+        assert_eq!(nf.conv_id, "peer:win-a");
+        assert_eq!(nf.title, "已修好构建");
+        // 空白正文 → 空串 title 同样合法（契约：前端有兜底文案）。
+        let f = serde_json::json!({
+            "v": 1, "type": "push_notify", "machine": "home-mac",
+            "kind": "peer_reply", "convId": "peer:win-a", "title": "",
+        })
+        .to_string();
+        assert_eq!(
+            parse_notify_frame(&f).map(|nf| nf.title),
+            Some(String::new())
+        );
     }
 
     #[test]
     fn parse_notify_frame_rejects_malformed() {
-        // 缺字段 / 非字符串 / kind 越界 / type 不符 / 畸形 JSON。
+        // 缺字段 / 非字符串 / kind 越界（含 peer_reply 的近似错拼——字面量须
+        // 逐字命中）/ type 不符 / 畸形 JSON。
         let cases = [
             r#"{"v":1,"type":"push_notify","kind":"round_done","convId":"c","title":"t"}"#,
             r#"{"v":1,"type":"push_notify","machine":"m","kind":"round_done","convId":"c"}"#,
             r#"{"v":1,"type":"push_notify","machine":42,"kind":"round_done","convId":"c","title":"t"}"#,
             r#"{"v":1,"type":"push_notify","machine":"m","kind":"bogus","convId":"c","title":"t"}"#,
+            r#"{"v":1,"type":"push_notify","machine":"m","kind":"peer-reply","convId":"c","title":"t"}"#,
+            r#"{"v":1,"type":"push_notify","machine":"m","kind":"PeerReply","convId":"c","title":"t"}"#,
+            r#"{"v":1,"type":"push_notify","machine":"m","kind":"peer_reply ","convId":"c","title":"t"}"#,
             r#"{"v":1,"type":"push_notify","machine":"m","kind":7,"convId":"c","title":"t"}"#,
             r#"{"v":1,"type":"message","text":"push_notify 假帧"}"#,
             r#"{"v":1,"type":"push_notify"}"#,
@@ -1005,6 +1041,23 @@ mod tests {
         assert!(p.len() <= PAYLOAD_MAX_BYTES, "len={}", p.len());
         assert!(p.contains("\"kind\":\"approval\""), "kind 恒在：{p}");
         assert!(p.contains("\"machine\":\"home-mac\""), "machine 恒在：{p}");
+    }
+
+    /// v1.42：peer_reply 的加密载荷 JSON——kind 字符串原样透传（SPA 据此选
+    /// 通知文案），字段序与其余 kind 一致（kind / title / convId / machine）。
+    #[test]
+    fn payload_json_peer_reply_kind_passthrough() {
+        let p = payload_json(&PushNotify {
+            kind: NotifyKind::PeerReply,
+            machine: "home-mac".into(),
+            conv_id: "peer:win-a".into(),
+            title: "已修好构建".into(),
+        });
+        assert_eq!(
+            p,
+            r#"{"kind":"peer_reply","title":"已修好构建","convId":"peer:win-a","machine":"home-mac"}"#
+        );
+        assert!(p.len() <= PAYLOAD_MAX_BYTES);
     }
 
     // ---- 订阅表 ----

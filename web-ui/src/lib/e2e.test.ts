@@ -715,6 +715,28 @@ describe("E2eCoordinator 状态机", () => {
     expect(coord.outbound(undefined, plain)).toBe(JSON.stringify(plain));
   });
 
+  // v1.42：approvals_query 同为业务帧（BUSINESS_TYPES）——active 机器出站必 enc
+  // 包装（应答 approvals 载有待审批的工具与命令摘要，查询不能让 relay 看见）
+  it("v1.42 approvals_query：active 机器出站 enc 包装（网关密钥可解回原帧）；confirming 期拒发；单机恒明文", () => {
+    const gw = makeGateway();
+    const { coord, hellos } = makeCoord();
+    coord.onMachines(["home-mac"]);
+    coord.onAck(gw.ackFor(JSON.parse(hellos[0]), "home-mac"));
+    const f = { v: 1 as const, type: "approvals_query" as const, machine: "home-mac" };
+    // confirming（待用户确认指纹）= fail-closed：业务帧拒发（不出明文）
+    expect(coord.outbound("home-mac", f)).toBeNull();
+    const { hello, ack } = acceptTofu(coord, gw, hellos, "home-mac");
+    const gwKey = gw.gatewayKey(hello, ack.n2);
+    const wire = coord.outbound("home-mac", f);
+    expect(wire).not.toBeNull();
+    const enc = JSON.parse(wire!) as { type: string; box: string };
+    expect(enc.type).toBe("enc");
+    expect(openBox(gwKey, enc.box)).toBe(JSON.stringify(f));
+    // 单机模式（machine undefined，旧 relay）恒明文直发
+    const plain = { v: 1 as const, type: "approvals_query" as const };
+    expect(coord.outbound(undefined, plain)).toBe(JSON.stringify(plain));
+  });
+
 });
 
 describe("E2eCoordinator sid（定向加密形态）", () => {

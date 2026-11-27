@@ -165,6 +165,14 @@ body {
   .md {
     @apply break-words text-sm leading-relaxed text-ink;
   }
+  /* 表格外层横滚容器（MarkdownText 的 table 组件映射）：窄屏下宽表格在容器内
+   * 横向滚动，不撑宽页面。外边距放在容器上而非表格上——容器因 overflow 成为
+   * BFC，内部表格的 margin 不再与外部折叠。本规则须定义在下方首末子元素
+   * 归零规则之前：二者特异性相同，靠源码顺序让归零胜出。 */
+  .md .md-table-wrap {
+    @apply my-2 overflow-x-auto;
+    -webkit-overflow-scrolling: touch;
+  }
   .md > :first-child {
     margin-top: 0;
   }
@@ -199,6 +207,16 @@ body {
   .md li {
     @apply my-0.5;
   }
+  /* 任务列表项（GFM）：圆点让位给复选框。按结构判定（li 直下含 checkbox），
+   * 不依赖插件给的 task-list-item class 是否还在消毒白名单里；:has() 不支持
+   * 的环境只是多一个圆点，无害。 */
+  .md li:has(> input[type="checkbox"]) {
+    list-style: none;
+  }
+  /* 任务列表项结构固定为「复选框 + 文本」：与文字垂直居中并留出间距 */
+  .md input[type="checkbox"] {
+    @apply mr-1 align-middle;
+  }
   .md code {
     @apply rounded bg-code px-1 py-0.5 font-mono text-[13px] text-ok;
   }
@@ -219,15 +237,33 @@ body {
   .md hr {
     @apply my-3 border-line;
   }
+  /* 表格自身不带外边距（已上收到 .md-table-wrap） */
   .md table {
-    @apply my-2 w-full text-left text-xs;
+    @apply w-full text-left text-xs;
   }
   .md th,
   .md td {
-    @apply border border-line px-2 py-1;
+    /* 用 line-strong 而非 line：深色下 line 与 panel2 同值，文本气泡（panel2 底）
+     * 里的表格会完全没有网格线 */
+    @apply border border-line-strong px-2 py-1 align-top;
+  }
+  /* 表头：加粗之外再给一层底色；浏览器默认把 th 居中，拉回与单元格一致。GFM
+   * 的对齐标记由渲染层转成 th / td 的内联 text-align，优先级更高，照常生效。
+   * 底色取文字色的半透明叠加（浅色下变暗、深色下变亮），不绑定某个面板色——
+   * 表格既出现在文本气泡（panel2 底）也出现在卡片（panel 底），固定色总有一处
+   * 与底色相同而不可见。不支持 color-mix 的环境回退到 panel2。 */
+  .md th {
+    @apply text-left;
+    background-color: var(--c-panel2);
+    background-color: color-mix(in srgb, currentColor 8%, transparent);
   }
   .md a {
     @apply break-all text-info underline underline-offset-2;
+  }
+  /* GFM 脚注区标题：插件靠 tailwind 的 sr-only 类做视觉隐藏，但该类名只在运行时
+   * 出现、不在 content 扫描范围（不会生成对应规则）——此处按其本意隐藏。 */
+  .md .footnotes > h2 {
+    @apply sr-only;
   }
 }
 

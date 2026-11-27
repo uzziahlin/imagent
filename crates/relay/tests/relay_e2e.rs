@@ -1438,9 +1438,12 @@ async fn e2e_security_headers_on_all_responses() {
     handle.wait().await;
 }
 
-/// 场景 8：限流——认证后连发 21 帧，收到 rate_limited error 后 close 1008。
+/// 场景 8（v1.42 改写：限流按角色分档）：**浏览器连接** 60 帧 / 10s。
+/// 25 帧（≈ 12 次切换会话的量——旧上限 20 下第 21 帧即被 close 1008）不被
+/// 关闭；满 60 帧仍放行；第 61 帧 → rate_limited error + close 1008
+/// "rate limited"（回归：洪泛闸仍在，只是档位上调）。
 #[tokio::test]
-async fn e2e_rate_limit_21st_frame() {
+async fn e2e_rate_limit_browser_61st_frame() {
     let handle = spawn_test_relay().await;
     let addr = handle.addr;
 
@@ -1448,19 +1451,85 @@ async fn e2e_rate_limit_21st_frame() {
     hello_handshake(&mut br, USER_TOKEN).await;
     consume_browser_snapshots(&mut br, false, &[]).await; // 网关未连
 
-    for i in 0..21 {
-        br.send(Message::text(format!(
-            r#"{{"v":1,"type":"message","text":"{i}"}}"#
-        )))
-        .await
-        .unwrap();
+    let frame = |i: usize| Message::text(format!(r#"{{"v":1,"type":"message","text":"{i}"}}"#));
+
+    // 25 帧：连接保持（旧上限下第 21 帧即被关）。
+    for i in 0..25 {
+        br.send(frame(i)).await.unwrap();
     }
+    assert_no_frame(&mut br, "浏览器 25 帧不得触发限流").await;
+
+    // 发到满 60 帧（档位内）：仍放行。
+    for i in 25..60 {
+        br.send(frame(i)).await.unwrap();
+    }
+    assert_no_frame(&mut br, "浏览器 60 帧（档位内）不得触发限流").await;
+
+    // 第 61 帧：error + close 1008 "rate limited"。
+    br.send(frame(60)).await.unwrap();
     let err = next_text(&mut br).await;
     assert!(
         err.contains(r#""type":"error""#) && err.contains("rate_limited"),
         "{err}"
     );
-    expect_close(&mut br, 1008).await;
+    let close = expect_close(&mut br, 1008).await;
+    assert_eq!(close.reason.to_string(), "rate limited");
+
+    handle.shutdown();
+    handle.wait().await;
+}
+
+/// 场景 8b（v1.42：限流按角色分档）：**网关连接** 400 帧 / 10s。
+/// 网关连接上是全部会话的聚合出站流量——旧版与浏览器共用 20 帧 / 10s，
+/// 真实环境两台设备在线 + 任一任务流式输出（≈ 40 帧 / 10s）时网关连接在
+/// 任务开始后 3–8 秒被掐断。25 帧（旧上限下第 21 帧即被关）不被关闭；满
+/// 400 帧仍放行；第 401 帧 → close 1008 "rate limited"。
+#[tokio::test]
+async fn e2e_rate_limit_gateway_401st_frame() {
+    let handle = spawn_test_relay().await;
+    let addr = handle.addr;
+
+    let mut gw = connect_ws(&addr, "/gateway", None).await;
+    gateway_hello(&mut gw, "home").await;
+
+    // 网关 → 浏览器业务帧：无浏览器在线，relay 丢弃不缓存——但仍计入本连接
+    // 的限流窗口（限流在角色分拣之前）。
+    let frame = |i: usize| {
+        Message::text(format!(
+            r#"{{"v":1,"type":"text","convId":"web:x","text":"{i}"}}"#
+        ))
+    };
+
+    // 25 帧：连接保持（旧上限下第 21 帧即被关——本条即真实故障的回归钉）。
+    let started = std::time::Instant::now();
+    for i in 0..25 {
+        gw.send(frame(i)).await.unwrap();
+    }
+    assert_no_frame(&mut gw, "网关 25 帧不得触发限流").await;
+
+    // 发到满 400 帧（档位内）：仍放行。
+    for i in 25..400 {
+        gw.send(frame(i)).await.unwrap();
+    }
+    assert_no_frame(&mut gw, "网关 400 帧（档位内）不得触发限流").await;
+
+    // 限流是 10s 滑动窗口：前 400 帧必须都还在窗内，下面的边界断言才成立。
+    // loopback 上 401 个小帧毫秒级发完，留一半窗口作保守余量。
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "测试机过慢：401 帧发送耗时 {:?}，超过限流窗口一半，边界结论不可信",
+        started.elapsed()
+    );
+
+    // 第 401 帧：error + close 1008 "rate limited"。
+    gw.send(frame(400)).await.unwrap();
+    let err = next_text(&mut gw).await;
+    assert!(
+        err.contains(r#""type":"error""#) && err.contains("rate_limited"),
+        "{err}"
+    );
+    let close = expect_close(&mut gw, 1008).await;
+    assert_eq!(close.reason.to_string(), "rate limited");
 
     handle.shutdown();
     handle.wait().await;

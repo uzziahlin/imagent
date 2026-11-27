@@ -13,7 +13,9 @@
 //!
 //! 与 [`crate::platform::WebPlatform`] 通过六条 channel 解耦：
 //! - `inbound_tx`：浏览器业务帧映射成的 [`InboundMessage`] → platform.recv；
-//! - `sync_tx`：sync 请求 → platform 的 sync responder（D6 会话恢复）；
+//! - `sync_tx`：sync 通道请求（[`SyncRequest`]：`sync` 请求 → platform 的
+//!   sync responder 重发卡片缓存，D6 会话恢复；v1.42 `approvals_query` →
+//!   同一 responder 回待审批快照）；
 //! - `workspace_tx`：v1.6 工作空间动作（workspace_list/save/remove /
 //!   conv_workdir_set）→ platform 的 workspace 泵（store KV 读写）；
 //! - `media_tx`：v1.7 媒体上行（message 帧带 media 段）→ platform 的媒体泵
@@ -49,6 +51,7 @@ use tracing::{debug, info, warn};
 use imagent_core::{CoreError, InboundMessage, Result};
 
 use crate::e2e::{E2eIdentity, E2eSessions};
+use crate::platform::SyncRequest;
 use crate::{map_inbound_frame, GatewayCredential, InboundAction, PushEvent, TARGET};
 
 /// 建连后的 WS 流类型（connect_async 的产物）。
@@ -83,7 +86,9 @@ pub(crate) struct WebClient {
     /// 出站恒明文（v1.3 行为，兼容旧链路）。
     pub(crate) e2e: Option<E2eIdentity>,
     pub(crate) inbound_tx: mpsc::Sender<InboundMessage>,
-    pub(crate) sync_tx: mpsc::Sender<()>,
+    /// sync 通道（v1.42 起载荷为 [`SyncRequest`]：`sync` / `approvals_query`
+    /// 两帧共用）→ platform 的 sync responder。
+    pub(crate) sync_tx: mpsc::Sender<SyncRequest>,
     /// v1.6 工作空间动作通道（workspace_list/save/remove/conv_workdir_set
     /// 四帧）→ platform 的 workspace 泵（store KV 读写 + 校验 + 回快照）。
     pub(crate) workspace_tx: mpsc::Sender<InboundAction>,
@@ -386,8 +391,10 @@ impl WebClient {
 
                 // v1.10 push_notify：平台埋点事件 → 明文管理帧直发。**不经
                 // send_business 的 E2E seal**——该帧族与 device_list 等管理帧
-                // 同路（内容无敏感信息，只有 kind/convId/machine 元数据层），
-                // 中继需明文读取做订阅投递与在线免打扰判定。
+                // 同路（中继需明文读取 kind/convId/machine 做订阅投递与在线
+                // 免打扰判定；title 是契约约定的 ≤32 码点摘要，同样明文——
+                // 见 lib.rs encode_push_notify_frame 文档）。v1.42 新增
+                // kind=peer_reply（窗口回信推送）。
                 maybe_event = push_rx.recv() => {
                     let ev = match maybe_event {
                         Some(ev) => ev,
@@ -455,8 +462,9 @@ impl WebClient {
     /// E2E 帧（v1.4）：`e2e_hello` → 握手应答（e2e_ack），`enc` → 试解后把
     /// 内层业务帧走既有分发；业务帧（message/approval_response/control/
     /// sync/ping + v1.6 工作空间 workspace_list/workspace_save/
-    /// workspace_remove/conv_workdir_set + v1.8 history_query，均可带 relay
-    /// 路由用的 machine 字段——网关侧无需消费）经 [`map_inbound_frame`] 映射。
+    /// workspace_remove/conv_workdir_set + v1.8 history_query + v1.42
+    /// approvals_query，均可带 relay 路由用的 machine 字段——网关侧无需
+    /// 消费）经 [`map_inbound_frame`] 映射。
     /// 畸形 JSON warn 丢弃（不断连——浏览器/中继偶发杂帧不致网关重连）。
     async fn handle_text(
         &self,
@@ -570,11 +578,28 @@ impl WebClient {
                 }
             }
             InboundAction::Sync => {
-                if tokio::time::timeout(Duration::from_secs(1), self.sync_tx.send(()))
-                    .await
-                    .is_err()
+                if tokio::time::timeout(
+                    Duration::from_secs(1),
+                    self.sync_tx.send(SyncRequest::Sync),
+                )
+                .await
+                .is_err()
                 {
                     warn!(target: TARGET, "sync channel 持续满 1s，丢弃 sync 请求");
+                }
+            }
+            // v1.42 待审批快照 → 同一 sync responder（按 pending 登记表回
+            // approvals 帧）。同 1s 有界背压；丢弃由 SPA 重发 approvals_query
+            // 兜底（重连 / 切会话时都会发）。
+            InboundAction::ApprovalsQuery => {
+                if tokio::time::timeout(
+                    Duration::from_secs(1),
+                    self.sync_tx.send(SyncRequest::ApprovalsQuery),
+                )
+                .await
+                .is_err()
+                {
+                    warn!(target: TARGET, "sync channel 持续满 1s，丢弃 approvals_query 请求");
                 }
             }
             // v1.6 工作空间动作 → platform 泵（store IO 在泵内 await，client
@@ -805,7 +830,7 @@ mod tests {
     #[tokio::test]
     async fn run_returns_promptly_on_cancelled_token() {
         let (inbound_tx, _inbound_rx) = mpsc::channel::<InboundMessage>(8);
-        let (sync_tx, _sync_rx) = mpsc::channel::<()>(8);
+        let (sync_tx, _sync_rx) = mpsc::channel::<SyncRequest>(8);
         let (workspace_tx, _workspace_rx) = mpsc::channel::<InboundAction>(8);
         let (media_tx, _media_rx) = mpsc::channel::<InboundAction>(8);
         let (history_tx, _history_rx) = mpsc::channel::<InboundAction>(8);

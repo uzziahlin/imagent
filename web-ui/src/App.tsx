@@ -2,6 +2,7 @@ import { useEffect, useMemo, useReducer, useRef, useState, type FormEvent } from
 import {
   DEFAULT_CONV,
   DEFAULT_MACHINE,
+  applyApprovalsSnapshot,
   convTitle,
   deviceSummary,
   initialState,
@@ -10,6 +11,7 @@ import {
   spaceOf,
   type Action,
   type ApprovalDecision,
+  type ApprovalSnapshotItem,
   type AppState,
   type AsrUiEvent,
   type ConvState,
@@ -27,6 +29,7 @@ import {
   restoreHistory,
   type RestoredConv,
 } from "./lib/historyStore";
+import { createDraftStore, draftKey } from "./lib/drafts";
 import {
   clearSession,
   loadSession,
@@ -244,12 +247,28 @@ function omitKey<T extends Record<string, unknown>>(rec: T, key: string): T {
 // ---------------------------------------------------------------------------
 
 /** App 扩展 action：挂载恢复（loadAll 输出 → spaces 预填，见 restoreHistory）。
- *  v1.8 起入参为 loadAll 输出形态（每 conv {entries, lastSeq?}）。 */
-type AppAction = Action | { type: "restore_history"; restored: Record<string, Record<string, RestoredConv>> };
+ *  v1.8 起入参为 loadAll 输出形态（每 conv {entries, lastSeq?}）。
+ *  v1.42 approvals_snapshot：待审批快照（approvals 帧在 onFrame 拦截后转入，
+ *  见 applyApprovalsSnapshot）——对齐需要「查询发出时刻」这个 App 层才有的
+ *  上下文，故与 restore_history 一样留在 App 级、不进 protocol reducer。 */
+type AppAction =
+  | Action
+  | { type: "restore_history"; restored: Record<string, Record<string, RestoredConv>> }
+  | {
+      type: "approvals_snapshot";
+      machine: string;
+      items: ApprovalSnapshotItem[];
+      /** 该机器最近一次成功发出 approvals_query 的时刻；undefined = 完全权威
+       *  （从未发出过查询就收到了应答——只剩防御意义）。 */
+      queriedAt: number | undefined;
+    };
 
 function appReducer(state: AppState, action: AppAction): AppState {
   if (action.type === "restore_history") {
     return restoreHistory(state, action.restored);
+  }
+  if (action.type === "approvals_snapshot") {
+    return applyApprovalsSnapshot(state, action.machine, action.items, action.queriedAt);
   }
   return reducer(state, action);
 }
@@ -347,6 +366,9 @@ export default function App() {
   // 上次已落盘写出的水位（脏检查，对齐 savedRefs 语义——空增量 entries 不变
   // 时仅水位驱动重写）。
   const savedSeqRefs = useRef<Map<string, number | undefined>>(new Map());
+  // v1.42 输入草稿存储（按「机器 + 会话」隔离，lib/drafts）。useMemo 保持整棵
+  // 树同一份实例。hook 必须在下方登录态早退之前（hook 顺序不随登录态变化）。
+  const drafts = useMemo(() => createDraftStore(), []);
   // 水位版本号：空增量（entries 引用不变、reducer 无改动）不驱动 spaces 变化，
   // 用它驱动 debounce flush 重排（水位仍须落盘）。
   const [historyVersion, setHistoryVersion] = useState(0);
@@ -452,7 +474,8 @@ export default function App() {
 
   /** 认证失败分流（close 1008 reason → 清对应凭证 + 登录页提示）。v1.5：
    *  adminToken 属会话附属内存态，任何认证失败一并作废。v1.7.x：凭证失效
-   *  回登录页 = 退出路径，一并清空本地消息缓存（本机痕迹）。 */
+   *  回登录页 = 退出路径，一并清空本地消息缓存（本机痕迹）。v1.42：草稿同属
+   *  本机痕迹，与消息缓存并排清空；唯独登录会话数达上限不清本机数据（见内）。 */
   const authFailed = (reason: AuthFailReason) => {
     clearAdminToken();
     setAdminActive(false);
@@ -460,8 +483,19 @@ export default function App() {
     setPairing(null);
     setPairingCode(null);
     setPairingCodeAt(null);
-    void historyStore.clear();
-    syncSavedRefs();
+    // 凭证已不可用的认证失败，回登录页等同退出：清空本地消息缓存（IndexedDB）
+    // 与输入草稿（内存 + localStorage），并把落盘脏检查记录对齐当前内存态
+    // （防 debounce 把已清空的会话回写）。
+    // 例外——登录会话数达上限：这条路径不清凭证（凭证并没有失效，只是签发
+    // 被拒），用户要去别的设备吊销一个会话再回来重试；这期间草稿是不可恢复
+    // 的用户输入、消息缓存是离线期间的消息，清掉就白丢——三步一并跳过，本机
+    // 数据原样保留，重试成功后草稿与缓存仍在。缓存没清，脏检查记录也就不必
+    // 重置。
+    if (reason !== "too_many_sessions") {
+      void historyStore.clear();
+      drafts.clearAll();
+      syncSavedRefs();
+    }
     if (reason === "session_expired") {
       clearSession();
       setSession(null);
@@ -473,6 +507,16 @@ export default function App() {
     } else if (reason === "pairing_denied") {
       // v1.5 配对被拒：pending 连接被 relay 关闭，回登录页给明确提示
       setAuthNotice("配对已被拒绝，可重试或改用访问令牌登录");
+    } else if (reason === "too_many_sessions") {
+      // v1.42 会话表满、签发被拒：凭证本身仍有效——**不清**本地凭证（腾出
+      // 名额后刷新页面即以原凭证自动重试），只给可操作的提示
+      setAuthNotice("登录会话数已达上限，请先在已登录设备的「管理 → 已登录设备」里吊销不用的会话，再重新登录");
+    } else if (reason === "pairing_expired") {
+      // v1.42 配对码 5 分钟过期（等待批准期间超时）：重新发起即可
+      setAuthNotice("配对码已过期，请重新发起配对");
+    } else if (reason === "pairing_busy") {
+      // v1.42 同时进行的配对请求达上限：稍后重试
+      setAuthNotice("同时进行的配对请求过多，请稍后再试");
     } else if (pairing) {
       // 配对中其它认证失败（旧 relay 不识别 pairing hello 等）
       setAuthNotice("配对未成功（中继可能不支持新设备配对）");
@@ -484,6 +528,20 @@ export default function App() {
       setAuthNotice("");
     }
     setAuth(null);
+  };
+
+  // v1.42 待审批快照：每台机器「最近一次成功发出 approvals_query 的时刻」。
+  // 快照对齐以它区分「查询之后才到达的实时审批」（快照不具权威性，须保留）
+  // 与「查询之前就在、快照里已没有的旧审批」（移除）。只有 App 层持有这个
+  // 上下文，所以 approvals 帧在 onFrame 拦截、不进 protocol reducer。
+  const approvalsQueriedRef = useRef<Map<string, number>>(new Map());
+  /** 对某机器发一次待审批查询；发出成功才记录时刻（被 E2E fail-closed 拒发
+   *  等返回 false 时不记——没有查询就不会有权威应答，留着旧时刻反而会让
+   *  之后的快照误判哪些实时条目该保留）。 */
+  const queryApprovals = (machine: string): void => {
+    if (wsRef.current?.sendApprovalsQuery(machine)) {
+      approvalsQueriedRef.current.set(machine, Date.now());
+    }
   };
 
   /** v1.3 passkey 登录失败文案（登录页回落提示）。 */
@@ -570,6 +628,11 @@ export default function App() {
     if (ev.kind === "active") {
       // 首连 pin 落库 / 重试恢复 → 刷新设备管理指纹区快照
       setE2ePins(loadPins());
+      // v1.42 待审批快照的第二个触发点：该机器的加密会话已建立，再查一次。
+      // ready 时发的那次多半落在握手窗口里，应答可能按已作废的密钥加密而被
+      // 丢弃；握手完成后的这次查询走密文、往返确定，是最终对齐。TOFU 确认后
+      // 的重新握手同样会走到 active，多查一次无害（幂等）。
+      queryApprovals(ev.machine);
     }
   };
 
@@ -592,6 +655,18 @@ export default function App() {
       session: !pairing && auth?.kind === "session" ? auth.token : undefined,
       pairing: pairing?.device,
       onFrame: (frame) => {
+        // v1.42 待审批快照：转成 approvals_snapshot（带上该机器最近一次查询
+        // 的发出时刻），不进帧归约——reducer 侧收到原始帧只会防御性忽略。
+        if (frame.type === "approvals") {
+          const machine = frame.machine;
+          dispatch({
+            type: "approvals_snapshot",
+            machine,
+            items: frame.items,
+            queriedAt: approvalsQueriedRef.current.get(machine),
+          });
+          return;
+        }
         // v1.8 history 帧：先记水位再进 reducer——空增量（entries=[]）reducer
         // 无改动，水位仍须更新并随 debounce 落盘（historyVersion 驱动 flush）。
         if (frame.type === "history") {
@@ -645,6 +720,16 @@ export default function App() {
       onE2e: onE2eEvent,
     });
     wsRef.current = mgr;
+    // v1.42：每建立一个新的连接实例，App 的连接态先显式回到「连接中」。
+    // status 平时只由 WsManager 的 onStatus 驱动，而登出 / 认证失败不会把它
+    // 从 ready 拉回来；新 WsManager 的内部初值就是 connecting，connect() 里
+    // 那次同值 setStatus 不会通知——于是重新登录后 App 的 status 一直停在
+    // ready，新连接 hello_ack 带来的 ready 被当作「没有变化」：所有依赖
+    // status 的 effect（sync + workspace_list、history_query、待审批查询）在
+    // 新连接上一次都不触发，离线期间的消息与审批补不回来。这里显式拉回，
+    // 让新连接的 ready 必然表现为一次状态变化。首次挂载时值本就是
+    // connecting，React 对同值更新不重渲染。
+    setStatus("connecting");
     mgr.connect();
     return () => {
       wsRef.current = null;
@@ -793,6 +878,31 @@ export default function App() {
     }
   }, [state.machinesKnown, state.currentMachine, status]);
 
+  // v1.42 待审批快照（第一个触发点）：连接 ready 且多机模式时，对**全部在线
+  // 机器**各查一次待审批——审批面板是跨机器的，离线期间到达的审批可能在任何
+  // 一台机器上，只查当前机器会让别处的审批按钮恢复不出来。重连后同样走到
+  // 这里：离线期间到达的审批由此补回，离开期间已超时 / 已解决的审批由快照
+  // （不再包含它们）自动移除。单机模式（旧 relay）不发，与 sync + workspace_list
+  // 同一纪律：旧网关不认识该帧。
+  //
+  // 依赖刻意只有 machinesKnown 与 status——不跟 currentMachine / machines：
+  // 待审批集合不随「当前看哪台机器」变化，切机器时对全部在线机器重发纯属
+  // 浪费；machines 帧每变一次（任一网关上下线）都重查，则重连后的出站突发
+  // （内置 sync + sync + workspace_list + history_query + 每台 e2e_hello +
+  // 每台本查询 × 2 个触发点）还要再叠一层，白占中继给**浏览器连接**的限流
+  // 额度（滑动窗口按角色分档，浏览器档位远低于网关档位；在线机器越多这笔
+  // 突发越大，再叠上用户随后的切换操作就更容易被限流断连）。窗口与帧数的
+  // 具体档位以中继侧为准，此处不写死数字。新上线机器的审批由它握手完成时
+  // 的第二个触发点（onE2eEvent 的 active）覆盖。
+  useEffect(() => {
+    if (state.machinesKnown && status === "ready") {
+      for (const machine of state.machines) {
+        queryApprovals(machine);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- queryApprovals 仅读 wsRef / ref；依赖刻意不含 machines 与 currentMachine（理由见上）
+  }, [state.machinesKnown, status]);
+
   // v1.8 会话历史重放：ready / 切机 / 切会话后对当前 conv 按本地高水位增量
   // 拉取（history_query 业务帧，E2E 加密）。触发维度 = 上方 sync+workspace_list
   // 的 ready/机器条件 + currentConv——每次切换都查（空增量便宜，网关按 seq
@@ -861,6 +971,26 @@ export default function App() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅挂载注册一次（读 stateRef/statusRef/lastSeqRef 最新值）
   }, []);
+
+  // v1.42 草稿落盘兜底：草稿平时防抖 500ms 才写 localStorage，页面在这 500ms
+  // 内被收走（iOS 把后台 PWA 挂起 / 杀进程、桌面直接关标签页）最后几句就没
+  // 了。pagehide（卸载路径上最后的可靠时机）与 visibilitychange 转入不可见时
+  // 各同步落盘一次；flush 幂等，没有待写内容时不会产生存储写入。
+  useEffect(() => {
+    const flushDrafts = (): void => drafts.flush();
+    const onVisibilityChange = (): void => {
+      // 非 visible 即落盘（含 prerender 等过渡态）：多写一次无害，少写一次丢字
+      if (document.visibilityState !== "visible") {
+        drafts.flush();
+      }
+    };
+    window.addEventListener("pagehide", flushDrafts);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      window.removeEventListener("pagehide", flushDrafts);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [drafts]);
 
   // 侧边栏会话项：当前选中机器会话空间内的全部 conv；刚切到尚未收到帧的 conv
   // （新会话）不在 convOrder 里，前端补一项空预览，避免当前高亮落空。
@@ -1136,7 +1266,8 @@ export default function App() {
    *  本地消息缓存（IndexedDB，用户显式退出即清本机痕迹；普通刷新不清），
    *  回登录页。服务端吊销走管理面板的「吊销并退出」（revokeDevice）。
    *  v1.10：一并通知退订（best-effort，不阻塞登出）+ 清开关标志。
-   *  v1.37：清系统未读徽标与标签页标题（badge API 缺席静默跳过）。 */
+   *  v1.37：清系统未读徽标与标签页标题（badge API 缺席静默跳过）。
+   *  v1.42：输入草稿同属本机痕迹，一并清空（内存 + localStorage）。 */
   const logout = () => {
     if (session?.token && localStorage.getItem(PUSH_ENABLED_KEY) === "1") {
       void disablePush(session.token).catch(() => {});
@@ -1147,6 +1278,7 @@ export default function App() {
     localStorage.removeItem(USER_TOKEN_KEY);
     clearAdminToken();
     void historyStore.clear();
+    drafts.clearAll();
     syncSavedRefs();
     try {
       if (typeof navigator.clearAppBadge === "function") {
@@ -1403,6 +1535,8 @@ export default function App() {
     savedRefs.current.delete(key);
     lastSeqRef.current.delete(key);
     savedSeqRefs.current.delete(key);
+    // v1.42：该会话的输入草稿一并清（否则同名会话重建时旧草稿会冒出来）
+    drafts.clear(draftKey(machine, target));
     setDeleteBusy(false);
     setDeleteTarget(null);
   };
@@ -1598,12 +1732,16 @@ export default function App() {
           models={wsSnapshot?.models}
           asr={wsSnapshot?.asr === true}
           asrEvent={asrEvent}
+          drafts={drafts}
+          draftKey={draftKey(state.currentMachine, currentConv)}
           onAsr={(audioB64, durationMs) =>
             wsRef.current?.sendAsrRequest(audioB64, durationMs, outMachine()) ?? false
           }
           onSend={sendMessage}
           onStop={() => {
-            wsRef.current?.sendControl("stop", undefined, outMachine());
+            // v1.42：stop 必须带当前会话——不带时网关落默认会话，在
+            // web:s-xxxx 里点停止停不掉当前任务（旧网关忽略该字段）。
+            wsRef.current?.sendControl("stop", undefined, outMachine(), currentConv);
           }}
         />
       </div>

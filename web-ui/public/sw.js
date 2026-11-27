@@ -56,6 +56,9 @@ function notificationCopy(kind, title) {
       return { title: "⚠️ 任务出错", body: digest || "任务执行出错，请查看详情" };
     case "approval":
       return { title: "🔐 等待审批", body: digest || "有操作等待你的审批" };
+    // v1.42：本地 Claude 窗口（peer 通道）回信；title 可为空串 → 兜底文案
+    case "peer_reply":
+      return { title: "💬 窗口回复", body: digest || "本地窗口有了新回复" };
     default:
       return { title: "imagent 通知", body: digest || "有新事件，点击查看" };
   }

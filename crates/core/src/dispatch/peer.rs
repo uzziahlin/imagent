@@ -9,7 +9,10 @@
 //! - 入站（窗口 → 驾驶舱）：[`PeerServer`](crate::peer::PeerServer) 收帧回调
 //!   直投 `peer:<窗口名>` 会话（走 `send_text` 链路——窗口 claude 的回复是
 //!   agent 文本；**不进** `handle()` 鉴权管线——socket 目录 0700 + sock 0600
-//!   即本机凭证，与 `local` 平台同信任边界）。
+//!   即本机凭证，与 `local` 平台同信任边界）。投递后调
+//!   [`Platform::on_peer_reply`](crate::Platform::on_peer_reply) 通知钩子
+//!   （v1.42：web 覆写为 push_notify kind=peer_reply——纯文本帧无卡片终态，
+//!   不加钩子窗口回信永远不会推送，出门等回信手机不响）。
 
 use super::*;
 use crate::peer::{CONV_PREFIX, ERR_UNREACHABLE};
@@ -72,9 +75,15 @@ impl Dispatcher {
     /// `peer:<窗口名>` 会话。正文即 envelope 剥离结果（conv 本身已标识窗口，
     /// 不加前缀——任务口径）。窗口名已由 server 三级解析（注册表反查 →
     /// envelope from-name → sock 文件名）。
+    ///
+    /// v1.42：投递后调 [`Platform::on_peer_reply`]（**唯一调用点**）——通知型
+    /// 钩子，IM 平台 default no-op，web 覆写为 push_notify kind=peer_reply。
+    /// `/to` 回执 / 建立会话欢迎文本 / 用户自发文本镜像都不触发（不是窗口
+    /// 的回信）。`body` 原样透传（title 截断在平台侧）。
     pub async fn handle_peer_inbound(&self, window: &str, body: &str) {
         let conv = ConvId(format!("{CONV_PREFIX}{window}"));
         self.reply(&conv, body, &ReplyHint::None).await;
+        self.platform.on_peer_reply(&conv, body).await;
     }
 
     /// `/to <窗口名>`（无正文）= 仅建立会话：按窗口名解析（复用 sender 的

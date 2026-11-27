@@ -75,7 +75,8 @@ const NONCE_LEN = 24;
  *  （workspace_list/workspace_save/workspace_remove/conv_workdir_set）同为
  *  网关消费的业务帧，relay 不可见；v1.8 会话历史拉取（history_query）同规；
  *  v1.40 语音转写录音上行（asr_request，含 b64 音频载荷——relay 不可见）同规；
- *  v1.41.3 会话删除（conv_delete）同规。 */
+ *  v1.41.3 会话删除（conv_delete）同规；v1.42 待审批查询（approvals_query）
+ *  同规——应答 approvals 帧载有待审批工具与命令摘要，relay 不可见。 */
 const BUSINESS_TYPES: ReadonlySet<string> = new Set([
   "message",
   "approval_response",
@@ -89,6 +90,7 @@ const BUSINESS_TYPES: ReadonlySet<string> = new Set([
   "history_query",
   "asr_request",
   "conv_delete",
+  "approvals_query",
 ]);
 
 // ---------------------------------------------------------------------------

@@ -3,10 +3,14 @@
 // jsdom 无 canvas（纯逻辑阈值/文件名在 lib/imageCompress.test.ts 覆盖）。
 // v1.8 模型菜单动态化：/model chips 取快照 models 段（modelChips 三层回退）
 // + 行尾当前模型文本（currentModelText）+ 有映射 target 的 chip title 提示。
+// v1.42 草稿按会话隔离：Composer 必填 drafts / draftKey 两个 props——既有用例
+// 统一经 mount / mountAsr / mountPanel 注入一个不落盘的 store（storage: null，
+// 用例间不经 localStorage 串草稿）；带 rerender 的用例须复用同一个 store 实例。
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Composer } from "./Composer";
-import type { MediaPayload, ModelsInfo } from "../lib/protocol";
+import type { AsrUiEvent, MediaPayload, ModelsInfo } from "../lib/protocol";
+import { createDraftStore, draftKey } from "../lib/drafts";
 
 // 压缩 fake：vi.hoisted 提升到 import 解析前可用（vi.mock 工厂在 Composer
 // 模块加载时即执行）；可注入断言/失败态，默认成功返回固定载荷。
@@ -24,10 +28,18 @@ afterEach(() => {
   compressSpy.mockClear();
 });
 
-function mount(onSend = vi.fn(() => true)) {
-  render(<Composer status="ready" onSend={onSend} onStop={vi.fn()} />);
+/** v1.42 草稿夹具：每个用例一个新的 store（storage: null = 不落盘）；默认挂在
+ *  会话 A 的键上。需要跨 rerender 复用同一 store 的用例自己传入。 */
+const KEY_A = draftKey("home-mac", "web:a");
+const KEY_B = draftKey("home-mac", "web:b");
+const newDrafts = () => createDraftStore({ storage: null });
+
+function mount(onSend = vi.fn(() => true), drafts = newDrafts()) {
+  render(
+    <Composer status="ready" onSend={onSend} onStop={vi.fn()} drafts={drafts} draftKey={KEY_A} />,
+  );
   const ta = screen.getByLabelText("消息输入框") as HTMLTextAreaElement;
-  return { ta, onSend };
+  return { ta, onSend, drafts };
 }
 
 const type = (ta: HTMLTextAreaElement, v: string) => fireEvent.change(ta, { target: { value: v } });
@@ -150,7 +162,14 @@ describe("Composer /model chips 动态化（v1.8）", () => {
   /** 挂载并输入 /mo 弹面板（唯一命中 /model 行）。 */
   function mountPanel(models?: ModelsInfo) {
     render(
-      <Composer status="ready" models={models} onSend={vi.fn(() => true)} onStop={vi.fn()} />,
+      <Composer
+        status="ready"
+        models={models}
+        onSend={vi.fn(() => true)}
+        onStop={vi.fn()}
+        drafts={newDrafts()}
+        draftKey={KEY_A}
+      />,
     );
     const ta = screen.getByLabelText("消息输入框") as HTMLTextAreaElement;
     type(ta, "/mo");
@@ -506,7 +525,13 @@ describe("Composer 语音输入（v1.39 P1.5）", () => {
   it("unmount 清理：abort + 三事件解绑", () => {
     injectSpeech();
     const { unmount } = render(
-      <Composer status="ready" onSend={vi.fn(() => true)} onStop={vi.fn()} />,
+      <Composer
+        status="ready"
+        onSend={vi.fn(() => true)}
+        onStop={vi.fn()}
+        drafts={newDrafts()}
+        draftKey={KEY_A}
+      />,
     );
     fireEvent.click(screen.getByRole("button", { name: MIC }));
     const rec = instances[0];
@@ -519,11 +544,68 @@ describe("Composer 语音输入（v1.39 P1.5）", () => {
 
   it("断线/e2eBlocked 与输入框同规则禁用", () => {
     injectSpeech();
-    render(<Composer status="reconnecting" onSend={vi.fn(() => true)} onStop={vi.fn()} />);
+    render(
+      <Composer
+        status="reconnecting"
+        onSend={vi.fn(() => true)}
+        onStop={vi.fn()}
+        drafts={newDrafts()}
+        draftKey={KEY_A}
+      />,
+    );
     expect((screen.getByRole("button", { name: MIC }) as HTMLButtonElement).disabled).toBe(true);
     cleanup();
-    render(<Composer status="ready" e2eBlocked onSend={vi.fn(() => true)} onStop={vi.fn()} />);
+    render(
+      <Composer
+        status="ready"
+        e2eBlocked
+        onSend={vi.fn(() => true)}
+        onStop={vi.fn()}
+        drafts={newDrafts()}
+        draftKey={KEY_A}
+      />,
+    );
     expect((screen.getByRole("button", { name: MIC }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  // v1.42：识别结果追加到**当前**会话的草稿（写入时取 keyRef）
+  it("v1.42 final 追加到当前会话的草稿：识别进行中切到会话 B，结果落在 B；A 的草稿不被改写", () => {
+    injectSpeech();
+    const drafts = newDrafts();
+    const onSend = vi.fn(() => true);
+    const el = (key: string) => (
+      <Composer status="ready" onSend={onSend} onStop={vi.fn()} drafts={drafts} draftKey={key} />
+    );
+    const view = render(el(KEY_A));
+    const ta = screen.getByLabelText("消息输入框") as HTMLTextAreaElement;
+    type(ta, "A 已输入");
+    fireEvent.click(screen.getByRole("button", { name: MIC }));
+    const rec = instances[0];
+    // 识别进行中切换会话
+    view.rerender(el(KEY_B));
+    emitResult(rec, 0, [["识别文本", true]]);
+    const taB = screen.getByLabelText("消息输入框") as HTMLTextAreaElement;
+    expect(taB.value).toBe("识别文本"); // 落在当前（B）
+    expect(drafts.text(KEY_B)).toBe("识别文本");
+    expect(drafts.text(KEY_A)).toBe("A 已输入"); // A 不被迟到的识别结果改写
+    expect(onSend).not.toHaveBeenCalled(); // 仍然只填入框、不自动发送
+  });
+
+  // v1.42：追加以 **store 里的当前值**为准，而不是回调闭包里的组件 state——
+  // 同一渲染批次内连续两段 final 时，第二个回调拿到的闭包还是旧的（第一次的
+  // setState 尚未渲染），若以它为基准会覆盖掉第一段。
+  it("v1.42 同一批次内连续两段 final：第二段接在第一段之后，不丢第一段", () => {
+    injectSpeech();
+    const { ta, drafts } = mount();
+    fireEvent.click(screen.getByRole("button", { name: MIC }));
+    const rec = instances[0];
+    const final = (t: string) => ({ resultIndex: 0, results: { length: 1, 0: { isFinal: true, length: 1, 0: { transcript: t } } } });
+    act(() => {
+      rec.onresult?.(final("第一段"));
+      rec.onresult?.(final("第二段"));
+    });
+    expect(ta.value).toBe("第一段 第二段");
+    expect(drafts.text(KEY_A)).toBe("第一段 第二段");
   });
 });
 
@@ -773,12 +855,21 @@ describe("Composer 语音转写 whisper（v1.40）", () => {
     delete (window.navigator as { mediaDevices?: unknown }).mediaDevices;
   });
 
-  function mountAsr(onAsr: ReturnType<typeof vi.fn> = vi.fn(() => true)) {
+  function mountAsr(onAsr: ReturnType<typeof vi.fn> = vi.fn(() => true), drafts = newDrafts()) {
     const view = render(
-      <Composer status="ready" asr asrEvent={null} onAsr={onAsr} onSend={vi.fn(() => true)} onStop={vi.fn()} />,
+      <Composer
+        status="ready"
+        asr
+        asrEvent={null}
+        onAsr={onAsr}
+        onSend={vi.fn(() => true)}
+        onStop={vi.fn()}
+        drafts={drafts}
+        draftKey={KEY_A}
+      />,
     );
     const ta = screen.getByLabelText("消息输入框") as HTMLTextAreaElement;
-    return { view, ta, onAsr };
+    return { view, ta, onAsr, drafts };
   }
 
   /** flush start() 异步链（gum/addModule 立即 resolve，无真实 timer 参与）。 */
@@ -810,8 +901,18 @@ describe("Composer 语音转写 whisper（v1.40）", () => {
   it("asr_result 回包（asrEvent result）→ 文本前置空格追加输入框 + 焦点回框 + 归位可再点；不自动发送", async () => {
     injectRecorderEnv();
     const onSend = vi.fn(() => true);
+    const drafts = newDrafts(); // rerender 须复用同一 store，否则切换即丢草稿
     const view = render(
-      <Composer status="ready" asr asrEvent={null} onAsr={vi.fn(() => true)} onSend={onSend} onStop={vi.fn()} />,
+      <Composer
+        status="ready"
+        asr
+        asrEvent={null}
+        onAsr={vi.fn(() => true)}
+        onSend={onSend}
+        onStop={vi.fn()}
+        drafts={drafts}
+        draftKey={KEY_A}
+      />,
     );
     const ta = screen.getByLabelText("消息输入框") as HTMLTextAreaElement;
     type(ta, "已输入");
@@ -829,6 +930,8 @@ describe("Composer 语音转写 whisper（v1.40）", () => {
         onAsr={vi.fn(() => true)}
         onSend={onSend}
         onStop={vi.fn()}
+        drafts={drafts}
+        draftKey={KEY_A}
       />,
     );
     expect(ta.value).toBe("已输入 识别文本");
@@ -843,7 +946,7 @@ describe("Composer 语音转写 whisper（v1.40）", () => {
     vi.useFakeTimers();
     try {
       injectRecorderEnv();
-      const { view } = mountAsr();
+      const { view, drafts } = mountAsr(); // 三次 rerender 复用同一 store
       fireEvent.click(screen.getByRole("button", { name: MIC }));
       await flush();
       act(() => workletNodes[0].port.onmessage?.({ data: new Float32Array(1600).fill(0.1) }));
@@ -856,6 +959,8 @@ describe("Composer 语音转写 whisper（v1.40）", () => {
           onAsr={vi.fn(() => true)}
           onSend={vi.fn(() => true)}
           onStop={vi.fn()}
+          drafts={drafts}
+          draftKey={KEY_A}
         />,
       );
       expect(screen.getByRole("alert").textContent).toBe("网关未启用语音转写");
@@ -869,6 +974,8 @@ describe("Composer 语音转写 whisper（v1.40）", () => {
           onAsr={vi.fn(() => true)}
           onSend={vi.fn(() => true)}
           onStop={vi.fn()}
+          drafts={drafts}
+          draftKey={KEY_A}
         />,
       );
       expect(screen.getByRole("alert").textContent).toBe("语音转写出错，请重试");
@@ -881,6 +988,8 @@ describe("Composer 语音转写 whisper（v1.40）", () => {
           onAsr={vi.fn(() => true)}
           onSend={vi.fn(() => true)}
           onStop={vi.fn()}
+          drafts={drafts}
+          draftKey={KEY_A}
         />,
       );
       expect(screen.getByRole("alert").textContent).toBe("语音转写失败，请重试");
@@ -936,7 +1045,16 @@ describe("Composer 语音转写 whisper（v1.40）", () => {
     });
     const onAsr = vi.fn(() => true);
     render(
-      <Composer status="ready" asr asrEvent={null} onAsr={onAsr} onSend={vi.fn(() => true)} onStop={vi.fn()} />,
+      <Composer
+        status="ready"
+        asr
+        asrEvent={null}
+        onAsr={onAsr}
+        onSend={vi.fn(() => true)}
+        onStop={vi.fn()}
+        drafts={newDrafts()}
+        draftKey={KEY_A}
+      />,
     );
     fireEvent.click(screen.getByRole("button", { name: MIC }));
     expect(screen.getByRole("alert").textContent).toBe("录音失败，请重试");
@@ -973,4 +1091,231 @@ describe("Composer 语音转写 whisper（v1.40）", () => {
       delete (window as { SpeechRecognition?: unknown }).SpeechRecognition;
     }
   });
+
+  // v1.42：asr 回填与语音 final 同规——追加到当前会话的草稿
+  it("v1.42 asr_result 回填追加到当前会话的草稿：识别进行中切到会话 B，文本落在 B；A 的草稿不被改写", async () => {
+    injectRecorderEnv();
+    const onSend = vi.fn(() => true);
+    const drafts = newDrafts();
+    const el = (key: string, asrEvent: AsrUiEvent | null) => (
+      <Composer
+        status="ready"
+        asr
+        asrEvent={asrEvent}
+        onAsr={vi.fn(() => true)}
+        onSend={onSend}
+        onStop={vi.fn()}
+        drafts={drafts}
+        draftKey={key}
+      />
+    );
+    const view = render(el(KEY_A, null));
+    const ta = screen.getByLabelText("消息输入框") as HTMLTextAreaElement;
+    type(ta, "A 已输入");
+    fireEvent.click(screen.getByRole("button", { name: MIC }));
+    await flush();
+    act(() => workletNodes[0].port.onmessage?.({ data: new Float32Array(1600).fill(0.1) }));
+    fireEvent.click(screen.getByRole("button", { name: STOP }));
+    expect(screen.getByRole("button", { name: BUSY })).toBeTruthy();
+    // 「识别中」切换会话：B 的输入框是空的（A 的草稿没跟过来）
+    view.rerender(el(KEY_B, null));
+    const taB = screen.getByLabelText("消息输入框") as HTMLTextAreaElement;
+    expect(taB.value).toBe("");
+    // 回包到达：文本追加到当前会话（B）
+    view.rerender(el(KEY_B, { kind: "result", text: "识别文本", durationMs: 100 }));
+    expect(taB.value).toBe("识别文本");
+    expect(drafts.text(KEY_B)).toBe("识别文本");
+    expect(drafts.text(KEY_A)).toBe("A 已输入"); // A 不被改写
+    expect(onSend).not.toHaveBeenCalled();
+    // 切回 A：仍是自己的草稿
+    view.rerender(el(KEY_A, null));
+    expect(ta.value).toBe("A 已输入");
+  });
 });
+
+// ---------------------------------------------------------------------------
+// v1.42 草稿按「机器 + 会话」隔离：输入框文本与待发图片归属 draftKey；draftKey
+// 变化即载入该会话的草稿。store 注入 storage: null（落盘在 lib/drafts.test.ts
+// 覆盖；这里只验组件与 store 的协作）。
+// ---------------------------------------------------------------------------
+
+describe("Composer 草稿按会话隔离（v1.42）", () => {
+  const FILE_INPUT = "选择图片";
+  const MEDIA_A = { name: "shot.jpg", mime: "image/jpeg", b64: "QUJD" };
+  const MEDIA_B = { name: "other.jpg", mime: "image/jpeg", b64: "QkNE" };
+  const png = (name: string) => new File(["x"], name, { type: "image/png" });
+  const pick = (file: File) =>
+    fireEvent.change(screen.getByLabelText(FILE_INPUT), { target: { files: [file] } });
+  const box = () => screen.getByLabelText("消息输入框") as HTMLTextAreaElement;
+
+  /** 挂载在会话 A；switchTo 用**同一个 store** 切到指定键，返回切换后的输入框。 */
+  function mountAtA(onSend = vi.fn(() => true)) {
+    const drafts = createDraftStore({ storage: null });
+    const el = (key: string) => (
+      <Composer status="ready" onSend={onSend} onStop={vi.fn()} drafts={drafts} draftKey={key} />
+    );
+    const view = render(el(KEY_A));
+    const ta = screen.getByLabelText("消息输入框") as HTMLTextAreaElement;
+    const switchTo = (key: string): HTMLTextAreaElement => {
+      view.rerender(el(key));
+      return box();
+    };
+    return { drafts, onSend, ta, switchTo };
+  }
+
+  it("① 会话 A 输入 → 切到 B 输入框为空；切回 A 恢复", () => {
+    const { ta, switchTo, drafts } = mountAtA();
+    type(ta, "A 的草稿");
+    // 每次写入即落 store（store 是事实源）
+    expect(drafts.text(KEY_A)).toBe("A 的草稿");
+    expect(switchTo(KEY_B).value).toBe("");
+    expect(drafts.text(KEY_A)).toBe("A 的草稿");
+    expect(switchTo(KEY_A).value).toBe("A 的草稿");
+  });
+
+  it("② B 里输入不影响 A；两个会话各自独立", () => {
+    const { ta, switchTo, drafts } = mountAtA();
+    type(ta, "A 的草稿");
+    type(switchTo(KEY_B), "B 的草稿");
+    expect(drafts.text(KEY_A)).toBe("A 的草稿");
+    expect(drafts.text(KEY_B)).toBe("B 的草稿");
+    type(switchTo(KEY_A), "A 的草稿 追加");
+    expect(switchTo(KEY_B).value).toBe("B 的草稿");
+    expect(drafts.text(KEY_A)).toBe("A 的草稿 追加");
+    expect(drafts.text(KEY_B)).toBe("B 的草稿");
+  });
+
+  it("③ A 选了图片 → 切到 B 不显示、切回 A 仍显示；各自可挂各自的图片，移除互不影响", async () => {
+    const { switchTo, drafts } = mountAtA();
+    pick(png("a.png"));
+    await waitFor(() => expect(screen.getByLabelText("移除图片")).toBeTruthy());
+    expect(drafts.media(KEY_A)).toEqual(MEDIA_A);
+    expect(switchTo(KEY_B).value).toBe("");
+    expect(screen.queryByLabelText("移除图片")).toBeNull();
+    switchTo(KEY_A);
+    expect(screen.getByAltText("shot.jpg")).toBeTruthy();
+    // B 里另选一张
+    compressSpy.mockResolvedValueOnce(MEDIA_B);
+    switchTo(KEY_B);
+    pick(png("b.png"));
+    await waitFor(() => expect(screen.getByAltText("other.jpg")).toBeTruthy());
+    expect(drafts.media(KEY_A)).toEqual(MEDIA_A);
+    expect(drafts.media(KEY_B)).toEqual(MEDIA_B);
+    // 移除 B 的图片不影响 A 的
+    fireEvent.click(screen.getByLabelText("移除图片"));
+    expect(drafts.media(KEY_B)).toBeNull();
+    expect(drafts.media(KEY_A)).toEqual(MEDIA_A);
+    switchTo(KEY_A);
+    expect(screen.getByAltText("shot.jpg")).toBeTruthy();
+  });
+
+  it("④ 发送成功后该会话草稿清空（文字 + 图片）；切走再切回仍为空；别的会话不受影响", async () => {
+    const { ta, onSend, switchTo, drafts } = mountAtA();
+    type(ta, "要发的");
+    pick(png("a.png"));
+    await waitFor(() => expect(screen.getByLabelText("移除图片")).toBeTruthy());
+    type(switchTo(KEY_B), "B 的草稿");
+    switchTo(KEY_A);
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    expect(onSend).toHaveBeenLastCalledWith("要发的", MEDIA_A);
+    expect(box().value).toBe("");
+    expect(screen.queryByLabelText("移除图片")).toBeNull();
+    expect(drafts.text(KEY_A)).toBe("");
+    expect(drafts.media(KEY_A)).toBeNull();
+    expect(switchTo(KEY_B).value).toBe("B 的草稿");
+    expect(switchTo(KEY_A).value).toBe("");
+  });
+
+  it("⑤ 发送失败（onSend false）：草稿留在 store，切走再切回仍在（文字与图片）", async () => {
+    const { ta, switchTo, drafts } = mountAtA(vi.fn(() => false));
+    type(ta, "没发出去的");
+    pick(png("a.png"));
+    await waitFor(() => expect(screen.getByLabelText("移除图片")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    expect(drafts.text(KEY_A)).toBe("没发出去的");
+    expect(drafts.media(KEY_A)).toEqual(MEDIA_A);
+    switchTo(KEY_B);
+    switchTo(KEY_A);
+    expect(box().value).toBe("没发出去的");
+    expect(screen.getByAltText("shot.jpg")).toBeTruthy();
+  });
+
+  it("⑥ 挂载时即恢复 store 里该会话的既有草稿（刷新恢复路径：文字 + 图片）", () => {
+    const drafts = createDraftStore({ storage: null });
+    drafts.setText(KEY_A, "刷新前没发完的");
+    drafts.setMedia(KEY_A, MEDIA_A);
+    render(
+      <Composer status="ready" onSend={vi.fn(() => true)} onStop={vi.fn()} drafts={drafts} draftKey={KEY_A} />,
+    );
+    expect(box().value).toBe("刷新前没发完的");
+    expect(screen.getByAltText("shot.jpg")).toBeTruthy();
+  });
+
+  it("⑦ 切换会话时命令面板状态复位：Esc 关闭态不带到别的会话，切回时面板随草稿重新弹出", () => {
+    const { ta, switchTo } = mountAtA();
+    type(ta, "/");
+    expect(panel()).toBeTruthy();
+    key(ta, "Escape");
+    expect(panel()).toBeNull(); // A：Esc 关闭
+    switchTo(KEY_B);
+    type(box(), "/");
+    expect(panel()).toBeTruthy(); // B：A 的关闭态不跟过来
+    key(box(), "Escape");
+    expect(panel()).toBeNull();
+    switchTo(KEY_A);
+    expect(box().value).toBe("/");
+    expect(panel()).toBeTruthy(); // 切回 A：关闭态已复位，面板随草稿弹出
+    // 选中序号归零：首项选中
+    const options = panel()!.getAllByRole("option");
+    expect(options[0].getAttribute("aria-selected")).toBe("true");
+  });
+
+  it("⑧ 选图压缩完成前切换会话：图片归属发起选图的会话（不落到当前会话），切回时仍在", async () => {
+    let finish: (m: MediaPayload) => void = () => {};
+    compressSpy.mockImplementationOnce(
+      () =>
+        new Promise<MediaPayload>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const { switchTo, drafts } = mountAtA();
+    pick(png("a.png"));
+    expect(compressSpy).toHaveBeenCalledTimes(1);
+    switchTo(KEY_B); // 压缩还在进行
+    await act(async () => {
+      finish(MEDIA_A);
+    });
+    // B 的输入框不受影响；图片在 A 的草稿里
+    expect(screen.queryByLabelText("移除图片")).toBeNull();
+    expect(drafts.media(KEY_B)).toBeNull();
+    expect(drafts.media(KEY_A)).toEqual(MEDIA_A);
+    switchTo(KEY_A);
+    expect(screen.getByAltText("shot.jpg")).toBeTruthy();
+  });
+
+  it("⑧b 压缩失败的提示同样只落在发起选图的会话（切走后到达不污染当前会话）", async () => {
+    let fail: (e: Error) => void = () => {};
+    compressSpy.mockImplementationOnce(
+      () =>
+        new Promise<MediaPayload>((_resolve, reject) => {
+          fail = reject;
+        }),
+    );
+    const { switchTo } = mountAtA();
+    pick(png("bad.png"));
+    switchTo(KEY_B);
+    await act(async () => {
+      fail(new Error("decode"));
+    });
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("⑨ 清空输入 = 删除该会话草稿：全部删光后 store 里没有该键（不是空串占位）", () => {
+    const { ta, drafts } = mountAtA();
+    type(ta, "写一点");
+    expect(drafts.text(KEY_A)).toBe("写一点");
+    type(ta, "");
+    expect(drafts.text(KEY_A)).toBe("");
+  });
+});
+

@@ -6,6 +6,7 @@ import { bytesToHex, hexToBytes, randomBytes, utf8ToBytes } from "@noble/hashes/
 import {
   authFailReason,
   clearSession,
+  isTransientCloseReason,
   loadSession,
   saveSession,
   WsManager,
@@ -442,6 +443,44 @@ describe("WsManager 多机（v1.1）", () => {
     machine = "work-mac"; // machines 帧到达 → App 更新当前机器
     vi.advanceTimersByTime(25_000);
     expect(sock.sent).toContain('{"v":1,"type":"ping","machine":"work-mac"}');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.42 停止按钮落到当前会话：control 帧可选 convId（完整 conv 形态；非空才带）
+// ---------------------------------------------------------------------------
+
+describe("WsManager control 帧 convId（v1.42）", () => {
+  it("sendControl 传 convId：帧带该字段（字节与契约示例一致）", () => {
+    const h = makeManager();
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    expect(h.mgr.sendControl("stop", undefined, "home-mac", "web:s-ab12")).toBe(true);
+    expect(sock.sent.at(-1)).toBe(
+      '{"v":1,"type":"control","cmd":"stop","convId":"web:s-ab12","machine":"home-mac"}',
+    );
+  });
+
+  it("sendControl 不传 / 传空串 convId：帧里没有该键（字节与升级前一致）", () => {
+    const h = makeManager();
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    expect(h.mgr.sendControl("stop", undefined, "home-mac")).toBe(true);
+    expect(sock.sent.at(-1)).toBe('{"v":1,"type":"control","cmd":"stop","machine":"home-mac"}');
+    expect(h.mgr.sendControl("stop", undefined, "home-mac", "")).toBe(true);
+    expect(sock.sent.at(-1)).toBe('{"v":1,"type":"control","cmd":"stop","machine":"home-mac"}');
+    // 单机模式（不带 machine）同样不出现 convId 键
+    expect(h.mgr.sendControl("stop")).toBe(true);
+    expect(sock.sent.at(-1)).toBe('{"v":1,"type":"control","cmd":"stop"}');
+    expect(JSON.parse(sock.sent.at(-1)!)).not.toHaveProperty("convId");
+  });
+
+  it("convId 为 peer:/local: 会话时原样出站（完整 conv 形态不改写）", () => {
+    const h = makeManager();
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    expect(h.mgr.sendControl("stop", undefined, "home-mac", "peer:win-a")).toBe(true);
+    expect(sock.sent.at(-1)).toBe('{"v":1,"type":"control","cmd":"stop","convId":"peer:win-a","machine":"home-mac"}');
   });
 });
 
@@ -957,6 +996,138 @@ describe("WsManager E2E（v1.4）", () => {
     // 管理帧照常放行
     sock.serverSend('{"v":1,"type":"pong"}');
     expect(h.frames).toContainEqual({ v: 1, type: "pong" });
+  });
+
+  // v1.42：带 convId 的 control 帧仍是业务帧——active 机器上整帧 enc 包装
+  //（relay 看不到目标会话），网关密钥可解回含 convId 的原帧。
+  it("带 convId 的 control 帧：active 机器出站 enc 包装，内帧含 convId（relay 盲化）", () => {
+    const gw = makeGateway();
+    const h = makeE2eManager("home-mac");
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    pushMachines(sock, ["home-mac"]);
+    const key = toActive(sock, gw, h, "home-mac");
+    expect(h.mgr.sendControl("stop", undefined, "home-mac", "web:s-ab12")).toBe(true);
+    const wire = JSON.parse(sock.sent.at(-1) ?? "{}") as { type: string; machine: string; box: string };
+    expect(wire.type).toBe("enc");
+    expect(wire.machine).toBe("home-mac");
+    expect(openBox(key, wire.box)).toBe(
+      '{"v":1,"type":"control","cmd":"stop","convId":"web:s-ab12","machine":"home-mac"}',
+    );
+  });
+
+  // ---- v1.42 待审批快照（连接层）：查询出站按机器选路 / 应答入站注入面 ----
+
+  it("v1.42 approvals_query 握手窗口（pending）明文直发——ready 后首查的形态；active 后再查走 enc", () => {
+    const gw = makeGateway();
+    const h = makeE2eManager("home-mac");
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    // ready 时尚未收到 machines 帧（无 e2e 条目）：单机形态明文
+    expect(h.mgr.sendApprovalsQuery("home-mac")).toBe(true);
+    expect(sock.sent.at(-1)).toBe('{"v":1,"type":"approvals_query","machine":"home-mac"}');
+    // machines 帧后条目为 pending（握手中）：仍是明文直发（v1.1 既有窗口行为）
+    pushMachines(sock, ["home-mac"]);
+    expect(h.mgr.sendApprovalsQuery("home-mac")).toBe(true);
+    expect(sock.sent.at(-1)).toBe('{"v":1,"type":"approvals_query","machine":"home-mac"}');
+    // 握手完成（active）后：同一次查询走密文，网关密钥可解回原帧
+    const key = toActive(sock, gw, h, "home-mac");
+    expect(h.mgr.sendApprovalsQuery("home-mac")).toBe(true);
+    const wire = JSON.parse(sock.sent.at(-1) ?? "{}") as { type: string; machine: string; box: string };
+    expect(wire.type).toBe("enc");
+    expect(wire.machine).toBe("home-mac");
+    expect(openBox(key, wire.box)).toBe('{"v":1,"type":"approvals_query","machine":"home-mac"}');
+  });
+
+  it("v1.42 approvals_query 在 confirming（待确认指纹，fail-closed）期被拒发：返回 false、不出明文", () => {
+    const gw = makeGateway();
+    const h = makeE2eManager("home-mac");
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    pushMachines(sock, ["home-mac"]);
+    ackLatest(sock, gw, "home-mac"); // → confirming（TOFU 弹层）
+    const before = sock.sent.length;
+    expect(h.mgr.sendApprovalsQuery("home-mac")).toBe(false);
+    expect(sock.sent).toHaveLength(before);
+    expect(sock.sent.some((s) => s.includes('"approvals_query"'))).toBe(false);
+  });
+
+  it("v1.42 网关应答 approvals（enc 内帧）经 onFrame 上抛；内帧漏带 machine 时注入信封 machine", () => {
+    const gw = makeGateway();
+    const h = makeE2eManager("home-mac");
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    pushMachines(sock, ["home-mac"]);
+    const key = toActive(sock, gw, h, "home-mac");
+    const items = [
+      { convId: "web:s-192d", requestId: "req-1", tool: "Bash", inputSummary: "npm test", timeoutSecs: 731 },
+    ];
+    // 网关经 send_business 加密应答（内帧自带 machine）
+    sock.serverSend(
+      JSON.stringify(sealFrame("home-mac", key, { v: 1, type: "approvals", machine: "home-mac", items })),
+    );
+    expect(h.frames.at(-1)).toEqual({ v: 1, type: "approvals", machine: "home-mac", items });
+    // 网关新帧型漏带 machine：enc 信封 machine 是路由权威来源，注入兜底。
+    // （类型上 approvals.machine 必填——这里就是要模拟契约外的畸形内帧，故断言）
+    const machineLess = { v: 1, type: "approvals", items } as unknown as InboundFrame;
+    sock.serverSend(JSON.stringify(sealFrame("home-mac", key, machineLess)));
+    expect(h.frames.at(-1)).toEqual({ v: 1, type: "approvals", machine: "home-mac", items });
+  });
+
+  it("v1.42 active 机器发来的明文 approvals 属注入面：丢弃（onFrame 不触发）+ 降级告警（与 text/card 族同规）", () => {
+    const gw = makeGateway();
+    const h = makeE2eManager("home-mac");
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    pushMachines(sock, ["home-mac"]);
+    const key = toActive(sock, gw, h, "home-mac");
+    const items = [
+      { convId: "web:s-192d", requestId: "req-1", tool: "Bash", inputSummary: "npm test", timeoutSecs: 731 },
+    ];
+    // 明文快照（伪造 / 降级）：会让面板上的待审批被整体替换——必须封住
+    sock.serverSend(JSON.stringify({ v: 1, type: "approvals", machine: "home-mac", items }));
+    expect(h.frames.filter((f) => f.type === "approvals")).toHaveLength(0);
+    expect(h.events).toContainEqual({ kind: "downgrade", machine: "home-mac" });
+    // 同机器再来一条明文 approvals：仍丢弃，告警不重复（每连接每机器一次）
+    sock.serverSend(JSON.stringify({ v: 1, type: "approvals", machine: "home-mac", items: [] }));
+    expect(h.frames.filter((f) => f.type === "approvals")).toHaveLength(0);
+    expect(h.events.filter((e) => e.kind === "downgrade")).toHaveLength(1);
+    // 加密形态的应答（真网关经 send_business）照常放行——被挡住的只是明文
+    sock.serverSend(
+      JSON.stringify(sealFrame("home-mac", key, { v: 1, type: "approvals", machine: "home-mac", items })),
+    );
+    expect(h.frames.at(-1)).toEqual({ v: 1, type: "approvals", machine: "home-mac", items });
+  });
+
+  it("v1.42 无会话 / 握手窗口机器的明文 approvals 照常经 onFrame 上抛（旧网关 / 握手窗口兼容）", () => {
+    const h = makeE2eManager("home-mac");
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    // 尚无 e2e 条目（machines 帧未到）：明文放行
+    sock.serverSend('{"v":1,"type":"approvals","machine":"home-mac","items":[]}');
+    expect(h.frames.at(-1)).toEqual({ v: 1, type: "approvals", machine: "home-mac", items: [] });
+    // 握手窗口（pending）同样放行：ready 后首查的应答可能就是明文
+    pushMachines(sock, ["home-mac"]);
+    sock.serverSend('{"v":1,"type":"approvals","machine":"home-mac","items":[]}');
+    expect(h.frames.filter((f) => f.type === "approvals")).toHaveLength(2);
+    expect(h.events.filter((e) => e.kind === "downgrade")).toHaveLength(0);
+  });
+
+  it("v1.42 approvals 畸形帧（parseFrame 拒）静默丢弃：onFrame 不触发", () => {
+    const h = makeE2eManager("home-mac");
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    for (const bad of [
+      '{"v":1,"type":"approvals","items":[]}', // 缺 machine
+      '{"v":1,"type":"approvals","machine":"home-mac"}', // 缺 items
+      '{"v":1,"type":"approvals","machine":"home-mac","items":{}}',
+      '{"v":1,"type":"approvals","machine":"home-mac","items":[{"convId":"web:a","requestId":"r","tool":"Bash","inputSummary":"x","timeoutSecs":0}]}',
+      '{"v":1,"type":"approvals","machine":"home-mac","items":[{"convId":"web:a","requestId":"r","tool":"Bash","inputSummary":"x","timeoutSecs":1.5}]}',
+      '{"v":1,"type":"approvals","machine":"home-mac","items":[{"convId":"web:a","requestId":"r","inputSummary":"x","timeoutSecs":5}]}',
+    ]) {
+      sock.serverSend(bad);
+    }
+    expect(h.frames.filter((f) => f.type === "approvals")).toHaveLength(0);
   });
 
   it("身份变化（已 pin 公钥改变）→ alert：发送阻断、事件上抛", () => {
@@ -1970,5 +2141,249 @@ describe("WsManager 会话删除（v1.41.3）", () => {
     const wire = JSON.parse(sock.sent.at(-1) ?? "{}") as { type: string; machine: string };
     expect(wire.type).toBe("enc");
     expect(wire.machine).toBe("home-mac");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.42 中继瞬态关闭：close 1008 的 reason 属瞬态白名单（rate limited / auth
+// timeout / binary not supported）→ 凭证仍有效，走指数退避重连而非认证失败
+// （此前被限流即静默登出）。白名单外的 reason 行为完全不变。
+// ---------------------------------------------------------------------------
+
+describe("WsManager 中继瞬态关闭走重连（v1.42）", () => {
+  const TRANSIENT = ["rate limited", "auth timeout", "binary not supported"] as const;
+  /** 白名单外：中继现行全部认证类 reason + 未知（未来新增）reason。 */
+  const AUTH = [
+    "auth failed",
+    "session expired",
+    "session revoked",
+    "too many sessions",
+    "pairing expired",
+    "too many pairings",
+    "pairing denied",
+    "some future reason",
+  ] as const;
+
+  interface AuthHarness {
+    mgr: WsManager;
+    statuses: string[];
+    reasons: AuthFailReason[];
+  }
+
+  function makeAuthManager(): AuthHarness {
+    const statuses: string[] = [];
+    const reasons: AuthFailReason[] = [];
+    const mgr = new WsManager({
+      url: "wss://example.test/imagent/ws",
+      token: "tok-1",
+      onFrame: () => {},
+      onStatus: (s) => statuses.push(s),
+      onAuthFailed: (r) => reasons.push(r),
+      wsFactory: (u) => new FakeWebSocket(u),
+    });
+    return { mgr, statuses, reasons };
+  }
+
+  it.each(TRANSIENT)(
+    "close 1008 + %s → 不调 onAuthFailed、进入重连；退避到点后重连成功 → ready",
+    (reason) => {
+      const h = makeAuthManager();
+      h.mgr.connect();
+      const s1 = readyFlow(h);
+      s1.emit("close", { code: 1008, reason });
+      expect(h.reasons).toEqual([]);
+      expect(h.statuses.at(-1)).toBe("reconnecting");
+      // 退避 1s：到点前不建新连接
+      vi.advanceTimersByTime(999);
+      expect(FakeWebSocket.created).toHaveLength(1);
+      vi.advanceTimersByTime(1);
+      expect(FakeWebSocket.created).toHaveLength(2);
+      // 新连接重新 hello → hello_ack → ready（与普通断线重连同一恢复路径）
+      const s2 = lastSock();
+      s2.emit("open");
+      expect(s2.sent[0]).toContain('"hello"');
+      s2.serverSend(HELLO_ACK);
+      expect(h.statuses.at(-1)).toBe("ready");
+      expect(h.reasons).toEqual([]);
+      // 恢复后收发正常
+      expect(h.mgr.sendMessage("web:default", "hi")).toBe(true);
+      s2.serverSend('{"v":1,"type":"text","convId":"web:default","text":"回包"}');
+    },
+  );
+
+  it("瞬态关闭同样计入退避：重连后未 ready 又被瞬态关闭 → 下一次退避翻倍（2s）", () => {
+    const h = makeAuthManager();
+    h.mgr.connect();
+    readyFlow(h).emit("close", { code: 1008, reason: "rate limited" });
+    vi.advanceTimersByTime(1_000);
+    expect(FakeWebSocket.created).toHaveLength(2);
+    // 新连接刚 open（尚未 hello_ack）又被限流关闭 → 退避 2s，而非又从 1s 起
+    const s2 = lastSock();
+    s2.emit("open");
+    s2.emit("close", { code: 1008, reason: "rate limited" });
+    vi.advanceTimersByTime(1_999);
+    expect(FakeWebSocket.created).toHaveLength(2);
+    vi.advanceTimersByTime(1);
+    expect(FakeWebSocket.created).toHaveLength(3);
+    expect(h.reasons).toEqual([]);
+  });
+
+  it("瞬态关闭：旧连接的心跳定时器随之清理（其后 25s 的 tick 不再在旧 socket 上发 ping）", () => {
+    const h = makeAuthManager();
+    h.mgr.connect();
+    const s1 = readyFlow(h);
+    s1.emit("close", { code: 1008, reason: "rate limited" });
+    vi.advanceTimersByTime(25_000);
+    // 旧连接的心跳 interval 已随 close 清理：25s tick 不在其上再发 ping
+    expect(s1.sentOfType("ping")).toHaveLength(0);
+  });
+
+  it("瞬态关闭后 visibility 监听保留：退避等待中切回前台 → 清退避定时器立即重连（认证失败终态才会摘监听）", () => {
+    const h = makeAuthManager();
+    h.mgr.connect();
+    readyFlow(h).emit("close", { code: 1008, reason: "rate limited" });
+    expect(h.statuses.at(-1)).toBe("reconnecting");
+    try {
+      Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+      // 退避 1s 尚未到点：此刻切回前台
+      vi.advanceTimersByTime(500);
+      document.dispatchEvent(new Event("visibilitychange"));
+      expect(FakeWebSocket.created).toHaveLength(2);
+      expect(h.statuses.at(-1)).toBe("connecting");
+      // 退避定时器已清：过原定到点时刻不再重复建连
+      vi.advanceTimersByTime(1_000);
+      expect(FakeWebSocket.created).toHaveLength(2);
+    } finally {
+      delete (document as { visibilityState?: string }).visibilityState;
+    }
+  });
+
+  it("限流前中继先发的 error{rate_limited} 照常经 onFrame 转发（toast 文案归 App 层）", () => {
+    const frames: InboundFrame[] = [];
+    const statuses: string[] = [];
+    const mgr = new WsManager({
+      url: "wss://example.test/imagent/ws",
+      token: "tok-1",
+      onFrame: (f) => frames.push(f),
+      onStatus: (s) => statuses.push(s),
+      onAuthFailed: () => {
+        throw new Error("限流不应触发 onAuthFailed");
+      },
+      wsFactory: (u) => new FakeWebSocket(u),
+    });
+    mgr.connect();
+    const sock = readyFlow({ mgr, statuses });
+    // 真机帧序：先 error 帧，随后 close 1008 "rate limited"
+    sock.serverSend('{"v":1,"type":"error","code":"rate_limited"}');
+    expect(frames).toEqual([{ v: 1, type: "error", code: "rate_limited" }]);
+    sock.emit("close", { code: 1008, reason: "rate limited" });
+    expect(statuses.at(-1)).toBe("reconnecting");
+  });
+
+  it.each(AUTH)("close 1008 + %s → 仍认证失败（白名单外）、不重连", (reason) => {
+    const h = makeAuthManager();
+    h.mgr.connect();
+    readyFlow(h).emit("close", { code: 1008, reason });
+    expect(h.reasons).toEqual([authFailReason(reason)]);
+    vi.advanceTimersByTime(120_000);
+    expect(FakeWebSocket.created).toHaveLength(1);
+  });
+
+  it("reason 缺失 / 空串 / 非字符串 → 认证失败（回归：瞬态判定必须精确命中）", () => {
+    for (const ev of [{ code: 1008 }, { code: 1008, reason: "" }, { code: 1008, reason: 7 }] as WsEvent[]) {
+      const h = makeAuthManager();
+      h.mgr.connect();
+      readyFlow(h).emit("close", ev);
+      expect(h.reasons, JSON.stringify(ev)).toEqual(["auth_failed"]);
+    }
+  });
+
+  it("isTransientCloseReason：三个瞬态 reason 为真；大小写 / 首尾空白 / 相近文案不为真", () => {
+    for (const reason of TRANSIENT) {
+      expect(isTransientCloseReason(reason), reason).toBe(true);
+    }
+    for (const reason of [
+      undefined,
+      "",
+      "Rate limited",
+      "rate limited ",
+      " rate limited",
+      "rate-limited",
+      "rate_limited",
+      "auth timeout ",
+      "auth failed",
+      "auth timed out",
+      "binary",
+      "session expired",
+    ] as const) {
+      expect(isTransientCloseReason(reason), String(reason)).toBe(false);
+    }
+  });
+
+  it("authFailReason 纯函数：v1.42 新增三项精确映射（大小写敏感），其余归 auth_failed", () => {
+    expect(authFailReason("too many sessions")).toBe("too_many_sessions");
+    expect(authFailReason("pairing expired")).toBe("pairing_expired");
+    expect(authFailReason("too many pairings")).toBe("pairing_busy");
+    expect(authFailReason("Too Many Sessions")).toBe("auth_failed");
+    expect(authFailReason("too many pairing")).toBe("auth_failed");
+    // 既有映射不变
+    expect(authFailReason("session expired")).toBe("session_expired");
+    expect(authFailReason("session revoked")).toBe("session_revoked");
+    expect(authFailReason("pairing denied")).toBe("pairing_denied");
+    expect(authFailReason("auth failed")).toBe("auth_failed");
+    expect(authFailReason(undefined)).toBe("auth_failed");
+    // 瞬态 reason 不是认证失败类别（它们根本不该走到 authFailReason）
+    expect(authFailReason("rate limited")).toBe("auth_failed");
+  });
+
+  it("close 1008 新 reason 分流上抛对应 AuthFailReason", () => {
+    const cases: Array<[string, AuthFailReason]> = [
+      ["too many sessions", "too_many_sessions"],
+      ["pairing expired", "pairing_expired"],
+      ["too many pairings", "pairing_busy"],
+    ];
+    for (const [reason, expected] of cases) {
+      const h = makeAuthManager();
+      h.mgr.connect();
+      readyFlow(h).emit("close", { code: 1008, reason });
+      expect(h.reasons, reason).toEqual([expected]);
+      expect(h.statuses).not.toContain("reconnecting");
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.42 待审批快照：sendApprovalsQuery 发送器 + 入站 approvals 帧转发（连接层
+// 不做对齐，App 层 onFrame 拦截；E2E 选路 / 注入面用例见上方 E2E 组）
+// ---------------------------------------------------------------------------
+
+describe("WsManager 待审批快照（v1.42）", () => {
+  it("sendApprovalsQuery：ready 前返回 false；ready 后字节精确（machine 缺省不带字段）", () => {
+    const h = makeManager();
+    h.mgr.connect();
+    expect(h.mgr.sendApprovalsQuery("home-mac")).toBe(false);
+    const sock = readyFlow(h);
+    expect(h.mgr.sendApprovalsQuery("home-mac")).toBe(true);
+    expect(sock.sent.at(-1)).toBe('{"v":1,"type":"approvals_query","machine":"home-mac"}');
+    // 契约示例原文
+    expect(sock.sent.at(-1)).toBe(JSON.stringify({ v: 1, type: "approvals_query", machine: "home-mac" }));
+    expect(h.mgr.sendApprovalsQuery()).toBe(true);
+    expect(sock.sent.at(-1)).toBe('{"v":1,"type":"approvals_query"}');
+    expect(JSON.parse(sock.sent.at(-1)!)).not.toHaveProperty("machine");
+  });
+
+  it("入站 approvals 明文帧经 onFrame 转发（单机模式无 e2e 条目放行）", () => {
+    const h = makeManager();
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    sock.serverSend(
+      '{"v":1,"type":"approvals","machine":"home-mac","items":[{"convId":"web:s-192d","requestId":"<id>","tool":"Bash","inputSummary":"npm test","timeoutSecs":731}]}',
+    );
+    expect(h.frames.at(-1)).toEqual({
+      v: 1,
+      type: "approvals",
+      machine: "home-mac",
+      items: [{ convId: "web:s-192d", requestId: "<id>", tool: "Bash", inputSummary: "npm test", timeoutSecs: 731 }],
+    });
   });
 });

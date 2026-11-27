@@ -71,6 +71,15 @@
 // 入站帧的会话，非当前机器的会话否则从未向网关证明持钥、60s 必被清，切过去
 // sync / history_query 全部解不开而界面无感。理由与「只发在线机器」的取舍
 // 见 probeOnce。
+// v1.42 停止按钮落到当前会话：sendControl 增可选 convId（control 帧 convId 字段，
+// 缺席帧字节不变）——此前 stop 不带会话号被网关落默认会话。
+// v1.42 待审批快照：sendApprovalsQuery(machine) 出站 approvals_query 业务帧
+// （E2E 加密，同 message 族路由）；入站 approvals 帧（网关回的该机器全部待
+// 审批权威集合）经 onFrame 上抛由 App 层转 approvals_snapshot——active 机器的
+// 明文 approvals 同属注入面，与 text/card 族同规丢弃 + 降级告警。
+// v1.42 中继瞬态关闭不再当认证失败：close 1008 的 reason 若属瞬态白名单
+// （rate limited / auth timeout / binary not supported）→ 走指数退避重连而非
+// onAuthFailed（此前被限流即静默登出；见 TRANSIENT_CLOSE_REASONS）。
 
 import {
   DEFAULT_MACHINE,
@@ -226,11 +235,16 @@ export function loadSession(): StoredSession | null {
 // ---------------------------------------------------------------------------
 
 /** 认证失败细分（App 据此给登录页不同提示 / 清不同凭证）。v1.5 增
- * pairing_denied（配对被拒，pending 连接被 relay 关闭）。 */
+ *  pairing_denied（配对被拒，pending 连接被 relay 关闭）。v1.42 增三项：
+ *  too_many_sessions（会话表满，签发被拒——本地凭证仍有效）/ pairing_expired
+ *  （配对码过期）/ pairing_busy（同时进行的配对过多）。 */
 export type AuthFailReason =
   | "session_expired"
   | "session_revoked"
   | "pairing_denied"
+  | "too_many_sessions"
+  | "pairing_expired"
+  | "pairing_busy"
   | "auth_failed";
 
 /** close 1008 reason → AuthFailReason：仅识别协议规定的字符串，其余
@@ -245,7 +259,41 @@ export function authFailReason(reason: string | undefined): AuthFailReason {
   if (reason === "pairing denied") {
     return "pairing_denied";
   }
+  if (reason === "too many sessions") {
+    return "too_many_sessions";
+  }
+  if (reason === "pairing expired") {
+    return "pairing_expired";
+  }
+  if (reason === "too many pairings") {
+    return "pairing_busy";
+  }
   return "auth_failed";
+}
+
+/** 中继 close 1008 里属于**瞬态**的 reason 白名单（v1.42）。字面量来源：中继
+ *  crates/relay/src/lib.rs 各处 close_msg(CLOSE_POLICY, …) 的原文，须逐字一致：
+ *  - "rate limited"：该连接入站业务帧超过中继的滑动窗口限流档位——中继按
+ *    角色分档，浏览器连接单独一档、远低于网关连接。快速切换会话 / 多机重连
+ *    后的补拉突发就可能触到，与凭证无关（窗口长度与帧数上限以中继侧常量
+ *    为准，此处不写死数字，免得两侧调参后注释失真）；
+ *  - "auth timeout"：中继没在时限内收到 hello（网络抖动），下次连接重来即可；
+ *  - "binary not supported"：连接上出现二进制帧——浏览器侧只发文本帧，属对端
+ *    / 链路异常，换一条连接即恢复。
+ *  这些原因下凭证并没有失效：此前一律按认证失败处理，App 清凭证回登录页且
+ *  无提示——用户被限流即「静默登出」。改为走指数退避重连。
+ *  **白名单而非黑名单**：没列出的 reason（含未来新增的）仍按认证失败处理——
+ *  可见的失败优于对真实凭证问题的静默重连循环。 */
+const TRANSIENT_CLOSE_REASONS: ReadonlySet<string> = new Set([
+  "rate limited",
+  "auth timeout",
+  "binary not supported",
+]);
+
+/** close reason 是否属于瞬态（应重连而非认证失败）。精确匹配、大小写敏感
+ *  （中继字面量固定；宽松匹配会把未知 reason 误归为瞬态）。 */
+export function isTransientCloseReason(reason: string | undefined): boolean {
+  return reason !== undefined && TRANSIENT_CLOSE_REASONS.has(reason);
 }
 
 /** v1.41.9 在途 E2E 会话探活（machines 快照后发起，见 WsManager.probeSessions）：
@@ -388,8 +436,16 @@ export class WsManager {
     return this.send({ v: 1, type: "approval_response", convId, requestId, decision, machine });
   }
 
-  sendControl(cmd: "stop" | "resume" | "switch", args?: string, machine?: string): boolean {
-    return this.send({ v: 1, type: "control", cmd, args, machine });
+  /** v1.42：convId 为目标会话（完整 conv 形态）。非空字符串才带上字段——
+   *  缺席 / 空串时帧字节与升级前完全一致（缺省 = 网关落默认会话；旧网关
+   *  忽略该字段）。停止按钮必须传当前会话，否则停的是默认会话的任务。 */
+  sendControl(
+    cmd: "stop" | "resume" | "switch",
+    args?: string,
+    machine?: string,
+    convId?: string,
+  ): boolean {
+    return this.send({ v: 1, type: "control", cmd, args, ...(convId ? { convId } : {}), machine });
   }
 
   /** 机器切换后拉该机器卡片缓存（App 层调用；machine 缺省不带字段）。 */
@@ -450,6 +506,17 @@ export class WsManager {
    *  仅本地生效（调用方按帧返回值决定是否本地先行）。 */
   sendConvDelete(convId: string, machine?: string): boolean {
     return this.send({ v: 1, type: "conv_delete", convId, machine });
+  }
+
+  // ---- v1.42 待审批快照（网关消费的业务帧；同 message 族路由约定，经 e2e
+  //      outbound 判定包装；应答 approvals 帧经 onFrame 上抛，由 App 层对齐）----
+
+  /** 查询某机器当前全部待审批：网关回 approvals{machine, items}（权威集合，
+   *  可空）。ready 后 / 该机器加密会话建立后各发一次（App 层）；旧网关不
+   *  认识该帧、不回任何帧。返回 false = 未发出（未 ready / E2E fail-closed
+   *  拒发）——调用方据此不记录查询时刻（没有查询就不会有权威应答）。 */
+  sendApprovalsQuery(machine?: string): boolean {
+    return this.send({ v: 1, type: "approvals_query", machine });
   }
 
   /** v1.2 拉取已登录设备列表（设备面板打开时；仅会话模式对新 relay 使用）。 */
@@ -653,6 +720,9 @@ export class WsManager {
     // v1.4：machines 快照驱动逐机器握手；加密会话已立（active/alert）的机器
     // 发来明文业务帧 = 注入面 → 丢弃 + 降级告警（active 时；该降级的唯一
     // 可观测点）。缺省 machine 归 DEFAULT_MACHINE。
+    // v1.42：approvals（待审批快照）同列——它会让面板上的待审批集合被整体
+    // 替换，伪造一帧就能凭空塞进 / 抹掉审批按钮，注入面必须与 text/card 族
+    // 同规封住（网关应答恒经 send_business 加密，active 后到明文即降级）。
     if (frame.type === "machines") {
       // v1.41.9：记下在线机器集（心跳只对在线的 active 机器发 enc-ping，见
       // probeOnce）→ 让新出现的机器进入握手 → 对已加密会话探活（此刻新机器
@@ -666,7 +736,8 @@ export class WsManager {
         frame.type === "card_patch" ||
         frame.type === "approval_request" ||
         frame.type === "approval_resolved" ||
-        frame.type === "history") &&
+        frame.type === "history" ||
+        frame.type === "approvals") &&
       !this.e2e.acceptPlaintextBusiness(frame.machine ?? DEFAULT_MACHINE)
     ) {
       this.e2e.notePlaintextDowngrade(frame.machine ?? DEFAULT_MACHINE);
@@ -888,12 +959,15 @@ export class WsManager {
       return;
     }
     const code = typeof ev.code === "number" ? ev.code : 1006;
-    if (code === CLOSE_AUTH_FAILED) {
+    const reason = typeof ev.reason === "string" ? ev.reason : undefined;
+    // v1.42：1008 但属瞬态原因（限流等）→ 凭证仍有效，不按认证失败处理，
+    // 落到下方常规重连（reconnecting + 指数退避；既有状态机语义不变）。
+    if (code === CLOSE_AUTH_FAILED && !isTransientCloseReason(reason)) {
       // relay 认证失败：按 close reason 分流（session expired/revoked/其它），
       // 调用方清对应凭证回登录页；不重连
       this.stopped = true;
       this.detachVisibility();
-      this.onAuthFailed(authFailReason(typeof ev.reason === "string" ? ev.reason : undefined));
+      this.onAuthFailed(authFailReason(reason));
       return;
     }
     if (code === CLOSE_SUPERSEDED) {

@@ -1,6 +1,13 @@
 /** @type {import('tailwindcss').Config} */
 export default {
-  content: ["./index.html", "./src/**/*.{ts,tsx}"],
+  content: [
+    "./index.html",
+    "./src/**/*.{ts,tsx}",
+    // 测试文件不进扫描范围：Tailwind 按原始文本扫描，测试里的字符串 / 选择器
+    // （如查询表格的标签名）会被当成工具类生成无用 CSS。生产 DOM 只由非测试
+    // 代码渲染，排除测试不会漏掉任何真实使用的类。
+    "!./src/**/*.test.{ts,tsx}",
+  ],
   // 深浅色双驱动：html[data-theme] 属性（手动三态开关，lib/theme.ts）缺省
   // 交还系统——"system" 时移除属性，行为等同旧 media 策略（index.css 深色
   // 变量块 media 查询接管）。dark: 变体选择器即 html[data-theme="dark"] 下的

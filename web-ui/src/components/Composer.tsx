@@ -3,6 +3,7 @@ import type { ConnStatus } from "../lib/ws";
 import type { AsrUiEvent, MediaPayload, ModelsInfo } from "../lib/protocol";
 import { compressImage } from "../lib/imageCompress";
 import { currentModelText, filterCommands, modelChips, type SlashCommand } from "../lib/commands";
+import type { DraftStore } from "../lib/drafts";
 import {
   getSpeechRecognitionCtor,
   isIosStandalone,
@@ -103,6 +104,11 @@ const ASR_SEND_FAIL_TEXT = "语音识别请求发送失败，请重试";
  * 回包超时提示重试。快照无 asr（缺席/false = 旧网关/未配置）→ Web Speech
  * 既有路径零变化（iOS 主屏 WebKit 连续会话 bug 场景由网关通告 asr 后自然
  * 迁移到 whisper，fallback 代码原样保留）。
+ * v1.42 草稿按「机器 + 会话」保存：输入框文本与待发图片仍留在本组件（输入不
+ * 卡 App），但所有写入一律经 writeText / writeMedia 落到 DraftStore（lib/
+ * drafts，App 层创建、整棵树共用）——store 恒为当前会话的最新值。draftKey 变化
+ * （切会话 / 切机器）即从 store 载入该会话的草稿；文字草稿由 store 防抖落盘
+ * localStorage，刷新 / iOS 杀进程后可恢复，切换会话不再把草稿带到别的会话。
  */
 export function Composer({
   status,
@@ -110,6 +116,8 @@ export function Composer({
   models,
   asr,
   asrEvent,
+  drafts,
+  draftKey,
   onAsr,
   onSend,
   onStop,
@@ -126,6 +134,11 @@ export function Composer({
    *  层经 ws onAsrResult 回调 + onFrame 旁路转发；每次事件新对象，引用变化
    *  驱动本组件 effect）。 */
   asrEvent?: AsrUiEvent | null;
+  /** v1.42：草稿存储（App 层 useMemo 创建、全组件树共用一份）。 */
+  drafts: DraftStore;
+  /** v1.42：当前草稿归属键（机器 + 会话，lib/drafts 的 draftKey）。变化即
+   *  切换到该会话的草稿——本组件不自己推导键，由 App 按当前机器 + 会话给出。 */
+  draftKey: string;
   /** v1.40：发送 asr_request（App 层转 wsRef.sendAsrRequest + outMachine()，
    *  Composer 不直接持 WsManager——同 onSend 的回调形态）；false = 未发出
    *  （连接未就绪等），Composer 就地归位 + 行内提示。 */
@@ -135,9 +148,14 @@ export function Composer({
   onStop: () => void;
 }) {
   const disabled = status !== "ready" || e2eBlocked === true;
-  const [text, setText] = useState("");
-  /** 待发图片（压缩产物；null = 无附件）。 */
-  const [media, setMedia] = useState<MediaPayload | null>(null);
+  /** 输入框文本（v1.42：初值即当前会话的草稿）。 */
+  const [text, setTextState] = useState(() => drafts.text(draftKey));
+  /** 待发图片（压缩产物；null = 无附件）。v1.42：初值即当前会话的图片，仅内存。 */
+  const [media, setMediaState] = useState<MediaPayload | null>(() => drafts.media(draftKey));
+  /** v1.42 当前 state 对应的草稿键。draftKey 变化的那次渲染里它仍是旧键——
+   *  与仍显示旧内容的 state 一致，这期间的写入不会串到新会话；它随下方
+   *  effect 与 state 一同切换。 */
+  const keyRef = useRef(draftKey);
   /** 附件处理失败提示（选下一张/发送后清除）。 */
   const [attachError, setAttachError] = useState<string | null>(null);
   /** 命令面板：Esc 显式关闭标记（清掉 / 或重新到空输入时复位）。 */
@@ -146,6 +164,42 @@ export function Composer({
   const [sel, setSel] = useState(0);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+
+  // ---- v1.42 草稿：文本 / 图片写入的唯一入口 ----
+  /** 写文字草稿：先落 store（不变量：store 恒为当前会话最新值），再同步本地
+   *  state。next 为函数时以 **store 里的当前值**为基准做函数式追加——语音识别
+   *  结果等异步回调的闭包里拿不到最新 state，直接拼会覆盖掉期间手动输入的内容。 */
+  const writeText = useCallback(
+    (next: string | ((prev: string) => string)): void => {
+      if (typeof next === "function") {
+        drafts.appendText(keyRef.current, next);
+      } else {
+        drafts.setText(keyRef.current, next);
+      }
+      setTextState(drafts.text(keyRef.current));
+    },
+    [drafts],
+  );
+  /** 写待发图片（仅内存，按会话隔离）。 */
+  const writeMedia = useCallback(
+    (next: MediaPayload | null): void => {
+      drafts.setMedia(keyRef.current, next);
+      setMediaState(next);
+    },
+    [drafts],
+  );
+
+  // v1.42 切换会话 / 机器：换键 → 载入该会话的草稿 → 复位命令面板相关状态。
+  // 不需要「先把旧的存回去」：旧会话的内容每次写入时已在 store 里。
+  // 键与 state 在同一个 effect 里切换，二者不会错位。
+  useEffect(() => {
+    keyRef.current = draftKey;
+    setTextState(drafts.text(draftKey));
+    setMediaState(drafts.media(draftKey));
+    setDismissed(false);
+    setSel(0);
+    setAttachError(null);
+  }, [draftKey, drafts]);
 
   // ---- v1.39 语音转文字（P1.5）：Web Speech API，能力探测决定入口渲染 ----
   /** 构造器惰性探测一次（mount 期间环境不变；测试经 window 注入 stub）。 */
@@ -160,8 +214,11 @@ export function Composer({
     ctor: speechCtor,
     // final 只追加输入框（前置空格拼接，保留已输入内容）——绝不自动发送，
     // 由用户确认后手动发；追加后焦点回输入框便于确认/修改（同 fill 先例）。
+    // v1.42：追加到**当前**会话的草稿（写入时取 keyRef）。识别进行中切换了
+    // 会话，识别结果落在用户此刻看着的输入框——保持这个行为：原会话的草稿
+    // 原样保留，不会被迟到的识别结果改写。
     onFinal: (t) => {
-      setText((prev) => (prev ? `${prev} ${t}` : t));
+      writeText((prev) => (prev ? `${prev} ${t}` : t));
       setSel(0);
       setDismissed(false);
       taRef.current?.focus();
@@ -239,14 +296,15 @@ export function Composer({
     clearAsrTimeout();
     voiceReset();
     if (asrEvent.kind === "result") {
-      setText((prev) => (prev ? `${prev} ${asrEvent.text}` : asrEvent.text));
+      // v1.42：与语音 final 同规——追加到当前会话的草稿
+      writeText((prev) => (prev ? `${prev} ${asrEvent.text}` : asrEvent.text));
       setSel(0);
       setDismissed(false);
       taRef.current?.focus();
     } else {
       setSpeechError(ASR_ERROR_TEXT[asrEvent.code] ?? ASR_UNKNOWN_TEXT);
     }
-  }, [asrEvent, voiceReset, clearAsrTimeout]);
+  }, [asrEvent, voiceReset, clearAsrTimeout, writeText]);
   // unmount 清超时定时器（录音资源由 hook 自清理）
   useEffect(() => () => clearAsrTimeout(), [clearAsrTimeout]);
 
@@ -270,7 +328,8 @@ export function Composer({
   const paletteOpen = matches.length > 0;
   const selIdx = Math.min(sel, matches.length - 1);
 
-  // 内容变化即重算高度（发送清空后回缩到 1 行）
+  // 内容变化即重算高度（发送清空后回缩到 1 行）。v1.42：切换会话后载入的
+  // 草稿同样改变 text，高度随之重算（两段草稿恰好同文时无需重算）。
   useLayoutEffect(() => {
     const el = taRef.current;
     if (!el) {
@@ -286,8 +345,10 @@ export function Composer({
       return;
     }
     if (onSend(t, media ?? undefined)) {
-      setText("");
-      setMedia(null);
+      // v1.42：发送成功 → 该会话的草稿清空（文字与图片随这两次写入自然完成，
+      // 等价于 drafts.clear(key)）
+      writeText("");
+      writeMedia(null);
       setAttachError(null);
       setDismissed(false);
       setSel(0);
@@ -296,7 +357,7 @@ export function Composer({
 
   /** 填充命令（`/name ` 尾随空格留参数位）/ 模型 chip（`/model <名> `）。 */
   const fill = (filled: string) => {
-    setText(filled);
+    writeText(filled);
     setDismissed(false);
     setSel(0);
     taRef.current?.focus();
@@ -327,19 +388,33 @@ export function Composer({
     }
   };
 
-  /** 选图 → 压缩 → 待发预览；失败给行内提示（不动既有输入内容）。 */
+  /** 选图 → 压缩 → 待发预览；失败给行内提示（不动既有输入内容）。
+   *  v1.42：图片归属**发起选图时**所在的会话（压缩是异步的——完成前用户可能
+   *  已切走）。完成后若已不在该会话：只落 store、不动当前输入框（图片属于
+   *  原会话的草稿，切回去时仍在；落到当前会话会让用户在没选过图的会话里
+   *  突然看到一张图，正是「发错会话」的一种）。 */
   const pickImage = (file: File | undefined) => {
     if (!file) {
       return;
     }
+    const key = keyRef.current;
     setAttachError(null);
     if (!file.type.startsWith("image/")) {
       setAttachError("仅支持图片文件");
       return;
     }
     compressImage(file)
-      .then((m) => setMedia(m))
-      .catch(() => setAttachError("图片处理失败，换一张试试"));
+      .then((m) => {
+        drafts.setMedia(key, m);
+        if (keyRef.current === key) {
+          setMediaState(m);
+        }
+      })
+      .catch(() => {
+        if (keyRef.current === key) {
+          setAttachError("图片处理失败，换一张试试");
+        }
+      });
   };
 
   /** v1.37 粘贴图片直进上行管道：剪贴板含图片文件时 preventDefault 并送入
@@ -399,7 +474,7 @@ export function Composer({
                 </div>
                 <button
                   type="button"
-                  onClick={() => setMedia(null)}
+                  onClick={() => writeMedia(null)}
                   aria-label="移除图片"
                   className="press shrink-0 rounded-lg p-1.5 text-muted transition-colors hover:bg-panel2 hover:text-err"
                 >
@@ -504,7 +579,7 @@ export function Composer({
             value={text}
             onChange={(e) => {
               const v = e.target.value;
-              setText(v);
+              writeText(v);
               setSel(0);
               // 清掉 / 前缀（或清空输入）即解除 Esc 关闭态，下次输入 / 重新弹
               if (!v.startsWith("/")) {

@@ -4,9 +4,12 @@
 // 手工驱动 fetch / install 事件。响应用真 Response（ok / clone 即浏览器语义）。
 // 覆盖：导航 network-first（成功回填 / 深 query 同键 / 离线回退 / 非 ok 回退 /
 // 回填失败不拖垮导航）、非导航 cache-first、pass-through 与非 GET 不拦截、
-// install 预缓存且 cache 名不含构建戳（迁移约束）。
+// install 预缓存且 cache 名不含构建戳（迁移约束）；v1.42 push 事件的通知文案
+// （sw.js 内的 notificationCopy 与 src/lib/push.ts 是手工同步副本——逐 kind
+// 比对两边输出）与 notificationclick 的 peer: 会话深链。
 import { describe, expect, it, vi } from "vitest";
 import swSource from "../../public/sw.js?raw";
+import { notificationCopy, validConvParam, validMachineParam } from "./push";
 
 const ORIGIN = "https://imagent.example";
 /** 首页文档地址（shell 缓存键 = 其路径 "/imagent/"）。 */
@@ -25,12 +28,21 @@ interface FetchEvent {
 interface InstallEvent {
   waitUntil: ReturnType<typeof vi.fn<(p: Promise<unknown>) => void>>;
 }
+/** push 事件最小形状：data.json() 取载荷；data 为 null = 无载荷推送。 */
+interface PushEvent {
+  data: { json: () => unknown } | null;
+  waitUntil: ReturnType<typeof vi.fn<(p: Promise<unknown>) => void>>;
+}
+/** showNotification 的选项对象（title/body/tag/data 等）。 */
+type NotifyOptions = { body?: string; tag?: string; data?: unknown; [k: string]: unknown };
 type FetchImpl = (req: FakeRequest) => Promise<Response>;
 
 /** 假环境装载 sw.js。cached = Cache Storage 预置条目（键按 ORIGIN 解析成绝对
  *  URL——对齐浏览器把字符串键 "/imagent/" 解析为站点绝对地址）；fetchImpl 缺省
  *  一调用即抛（「命中缓存时不得发网络请求」类断言的硬失败形态）。open 返回的
- *  cache 记录 addAll / put 调用，put 同时真写入条目（后续 match 可见）。 */
+ *  cache 记录 addAll / put 调用，put 同时真写入条目（后续 match 可见）。
+ *  self.registration.showNotification / clients.matchAll / openWindow 记录调用
+ *  （push 与 notificationclick handler 用）。 */
 function loadSw(opts: { cached?: Record<string, Response>; fetchImpl?: FetchImpl } = {}) {
   const entries = new Map<string, Response>(
     Object.entries(opts.cached ?? {}).map(([k, v]) => [new URL(k, ORIGIN).href, v]),
@@ -58,9 +70,18 @@ function loadSw(opts: { cached?: Record<string, Response>; fetchImpl?: FetchImpl
     delete: vi.fn(async (_key: string) => false),
   };
   const handlers = new Map<string, (event: object) => void>();
+  const registration = {
+    showNotification: vi.fn(async (_title: string, _opts: NotifyOptions) => undefined),
+  };
+  const clients = {
+    claim: vi.fn(async () => undefined),
+    matchAll: vi.fn(async () => [] as unknown[]),
+    openWindow: vi.fn(async (_url: string) => undefined),
+  };
   const self = {
     location: { origin: ORIGIN },
-    clients: { claim: vi.fn(async () => undefined) },
+    clients,
+    registration,
     addEventListener: (type: string, fn: (event: object) => void) => {
       handlers.set(type, fn);
     },
@@ -82,8 +103,14 @@ function loadSw(opts: { cached?: Record<string, Response>; fetchImpl?: FetchImpl
   return {
     install: handler<InstallEvent>("install"),
     fetch: handler<FetchEvent>("fetch"),
+    push: handler<PushEvent>("push"),
+    notificationclick: handler<{ notification: { close: () => void; data?: unknown } }>(
+      "notificationclick",
+    ),
     cache,
     caches,
+    registration,
+    clients,
   };
 }
 type Sw = ReturnType<typeof loadSw>;
@@ -300,5 +327,139 @@ describe("sw.js install 预缓存", () => {
     expect(code.match(/\bBUILD\b/g)).toEqual(["BUILD"]);
     expect(code).not.toContain("${BUILD}");
     expect(code).toMatch(/^const SHELL_CACHE = "imagent-shell-v1";$/m);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.42 push / notificationclick：sw.js 内的通知文案是 src/lib/push.ts 的手工
+// 同步副本（SW 无法 import TS 模块）——逐 kind 比对两边输出，防两份改岔；
+// peer_reply 的字面文案另钉一份（只有一致性比对的话，两份一起写错仍是绿的）。
+// ---------------------------------------------------------------------------
+
+/** 驱动 push handler（载荷经 data.json() 交给 SW，同真实 PushEvent），返回
+ *  **本次** showNotification 收到的 [title, options]（同一假环境可连推多条）；
+ *  未调用 → undefined。 */
+function shownNotification(sw: Sw, data: unknown): [string, NotifyOptions] | undefined {
+  const event: PushEvent = { data: { json: () => data }, waitUntil: vi.fn() };
+  sw.push(event);
+  expect(event.waitUntil).toHaveBeenCalledTimes(1);
+  return sw.registration.showNotification.mock.calls.at(-1) as [string, NotifyOptions] | undefined;
+}
+
+describe("sw.js 通知文案与 push.ts 同步（notificationCopy 两份副本一致）", () => {
+  /** (kind, title) 样本：全部已知 kind + 未知 kind，各取「有摘要 / 空摘要」两形态。 */
+  const samples: Array<[string | undefined | null, string | undefined | null]> = [
+    ["round_done", "跑测试套件"],
+    ["round_done", undefined],
+    ["round_error", "npm install 失败"],
+    ["round_error", "   "],
+    ["approval", "bash"],
+    ["approval", ""],
+    ["peer_reply", "已修好"],
+    ["peer_reply", ""],
+    ["peer_reply", undefined],
+    ["peer_reply", " \n "],
+    ["peer_reply", "窗口回信的摘要可以很长很长很长很长很长很长很长很长很长很长"],
+    ["unknown_kind", "摘要"],
+    [undefined, undefined],
+    [null, null],
+  ];
+
+  it.each(samples)("kind=%j title=%j：SW 侧 showNotification 的标题/正文与 push.ts 一致", (kind, title) => {
+    const sw = loadSw();
+    const shown = shownNotification(sw, { kind, title, convId: "web:default", machine: "home-mac" });
+    expect(shown).toBeDefined();
+    const expected = notificationCopy(kind, title);
+    expect(shown![0]).toBe(expected.title);
+    expect(shown![1].body).toBe(expected.body);
+  });
+
+  it("peer_reply 字面文案：标题「💬 窗口回复」、正文取回信摘要；空摘要走兜底", () => {
+    const sw = loadSw();
+    expect(shownNotification(sw, { kind: "peer_reply", title: "已修好" })![0]).toBe("💬 窗口回复");
+    expect(shownNotification(sw, { kind: "peer_reply", title: "已修好" })![1].body).toBe("已修好");
+    sw.registration.showNotification.mockClear();
+    const fallback = shownNotification(sw, { kind: "peer_reply", title: "", convId: "peer:imagent-bc" });
+    expect(fallback).toEqual([
+      "💬 窗口回复",
+      expect.objectContaining({ body: "本地窗口有了新回复" }),
+    ]);
+  });
+
+  it("通知选项：tag = convId（同会话连发只留最新；无 convId 归全局 tag），data 原样进通知供点击深链", () => {
+    const sw = loadSw();
+    const payload = { kind: "peer_reply", title: "已修好", convId: "peer:imagent-bc", machine: "home-mac" };
+    const [, opts] = shownNotification(sw, payload)!;
+    expect(opts).toMatchObject({ tag: "peer:imagent-bc", data: payload, icon: "/imagent/icon.svg", renotify: true });
+    const [, noConv] = shownNotification(sw, { kind: "round_done", title: "完成" })!;
+    expect(noConv.tag).toBe("imagent");
+  });
+
+  it("无载荷 / 载荷损坏（非 JSON）：兜底文案不炸", () => {
+    const sw = loadSw();
+    const none: PushEvent = { data: null, waitUntil: vi.fn() };
+    sw.push(none);
+    expect(sw.registration.showNotification.mock.calls[0][0]).toBe("imagent 通知");
+    const broken: PushEvent = {
+      data: {
+        json: () => {
+          throw new SyntaxError("Unexpected token");
+        },
+      },
+      waitUntil: vi.fn(),
+    };
+    sw.push(broken);
+    expect(sw.registration.showNotification.mock.calls[1][1]).toMatchObject({
+      body: "有新事件，点击查看",
+    });
+  });
+});
+
+describe("sw.js notificationclick 深链（v1.42 接受 peer: 会话）", () => {
+  /** 驱动 notificationclick；返回 waitUntil 接到的 promise（openWindow 在其中）。 */
+  function click(sw: Sw, data: unknown): Promise<unknown> {
+    const close = vi.fn();
+    const event = { notification: { close, data }, waitUntil: vi.fn() };
+    sw.notificationclick(event);
+    expect(close).toHaveBeenCalledTimes(1);
+    const p = event.waitUntil.mock.calls[0][0] as Promise<unknown>;
+    return p;
+  }
+
+  it("无已开窗口 + peer 会话推送 → openWindow 深链带 conv（URL 编码）与 machine；该 conv 过得了 push.ts 的深链校验", async () => {
+    const sw = loadSw();
+    sw.clients.matchAll.mockResolvedValue([]);
+    await click(sw, { kind: "peer_reply", title: "已修好", convId: "peer:imagent-bc", machine: "home-mac" });
+    expect(sw.clients.openWindow).toHaveBeenCalledTimes(1);
+    const target = sw.clients.openWindow.mock.calls[0][0] as string;
+    // 冒号经 encodeURIComponent 编码（query 里的裸冒号虽合法，编码形态才是稳定契约）
+    expect(target).toBe("/imagent/?conv=peer%3Aimagent-bc&machine=home-mac");
+    // 深链落地的 App 侧用 push.ts validConvParam 校验 ?conv=——v1.42 起接受 peer 前缀
+    const params = new URL(target, ORIGIN).searchParams;
+    expect(validConvParam(params.get("conv"))).toBe("peer:imagent-bc");
+    expect(validMachineParam(params.get("machine"))).toBe("home-mac");
+  });
+
+  it("已有应用窗口：聚焦并向其 postMessage open-conv（convId / machine 透传），不开新窗口", async () => {
+    const sw = loadSw();
+    const client = { focus: vi.fn(async () => undefined), postMessage: vi.fn() };
+    sw.clients.matchAll.mockResolvedValue([client]);
+    await click(sw, { kind: "peer_reply", title: "已修好", convId: "peer:imagent-bc", machine: "home-mac" });
+    expect(client.focus).toHaveBeenCalledTimes(1);
+    expect(client.postMessage).toHaveBeenCalledWith({
+      type: "open-conv",
+      convId: "peer:imagent-bc",
+      machine: "home-mac",
+    });
+    expect(sw.clients.openWindow).not.toHaveBeenCalled();
+  });
+
+  it("回归：无 machine 的推送深链不带 machine 参数；无 convId 回首页", async () => {
+    const sw = loadSw();
+    sw.clients.matchAll.mockResolvedValue([]);
+    await click(sw, { kind: "round_done", title: "完成", convId: "web:default" });
+    expect(sw.clients.openWindow.mock.calls[0][0]).toBe("/imagent/?conv=web%3Adefault");
+    await click(sw, null);
+    expect(sw.clients.openWindow.mock.calls[1][0]).toBe("/imagent/");
   });
 });

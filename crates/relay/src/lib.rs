@@ -5,7 +5,8 @@
 //! 客户端模式连到本进程（Mac 网关零入站端口）。本 crate 是中继：
 //! **不理解任何业务语义**，只做认证（fail-closed、网关 token-machine
 //! 绑定 + ed25519 挑战应答、浏览器会话层）、转发（Hub 状态机）、网关离线
-//! 缓冲（200 帧 / 1MB）、每连接限流（20 帧 / 10s）。部署形态：ECS systemd
+//! 缓冲（200 帧 / 1MB）、每连接限流（按角色分档，v1.42：浏览器 60 帧 / 10s、
+//! 网关 400 帧 / 10s）。部署形态：ECS systemd
 //! 服务绑 127.0.0.1:3010，公网由 Caddy（8443，TLS 终结）
 //! `handle_path /imagent/*` strip 前缀后反代——relay 看到的路径已是 strip
 //! 后的 `/xxx`。
@@ -122,9 +123,35 @@ const AUTH_FAIL_DELAY: Duration = Duration::from_secs(1);
 /// 保活 ping 由客户端负责（网关 30s ping，浏览器发 ping 文本帧——端到端
 /// 语义，relay 透传，自己不做应用层应答）。
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
-/// 限流窗口（§4.4）：任意 10s 滑动窗口内 ≤ [`RATE_MAX_FRAMES`] 帧。
+/// 限流窗口（§4.4）：任意 10s 滑动窗口内的入站文本帧数按连接角色分档——
+/// 浏览器 [`RATE_MAX_FRAMES`]、网关 [`GATEWAY_RATE_MAX_FRAMES`]（选择逻辑见
+/// [`rate_limit_for_role`]）。
 const RATE_WINDOW: Duration = Duration::from_secs(10);
-const RATE_MAX_FRAMES: usize = 20;
+
+/// 浏览器连接档：任意 [`RATE_WINDOW`] 内 ≤ 60 帧（v1.42 由 20 上调）。
+///
+/// 推导：浏览器入站是用户操作驱动的低频帧（message / approval_response /
+/// control / sync / history_query / approvals_query …），正常使用离 60 很远；
+/// 但有两类合法突发——①切换会话：每切一次约发 2 帧（history_query +
+/// approvals_query），旧上限 20 下实测快速切换 12 次（约 2.4 秒）即被
+/// close 1008「rate limited」；②重连首秒的握手与同步突发约 6 + 3 × 在线
+/// 机器数 帧。60 ≈ 30 次切换 / 10s 的余量，仍是均值 6 帧/s 的洪泛闸（能发
+/// 帧的都是 passkey / 会话认证主体，限流防的是失控客户端而非对抗者）。
+const RATE_MAX_FRAMES: usize = 60;
+
+/// 网关连接档：任意 [`RATE_WINDOW`] 内 ≤ 400 帧（v1.42 新增——此前与浏览器
+/// 共用 20 帧 / 10s）。
+///
+/// 推导：网关连接上跑的是**全部会话的聚合出站流量**，量级由在线浏览器会话
+/// 数决定而非用户操作——①流式卡片补丁：core 的 `CARD_THROTTLE` 500ms 一帧
+/// = 每个在线浏览器会话 20 帧 / 10s，E2E 下网关对每个在线浏览器会话各发
+/// 一份 enc 帧（web client 的 `seal_each`），浏览器会话上限 [`MAX_BROWSERS`]
+/// = 8 → 160 帧 / 10s；②再加文本 / 审批 / history / sync 重发等帧。真实
+/// 环境实测（旧上限 20）：两台设备同时在线 + 任一任务流式输出 ≈ 40 帧 /
+/// 10s，网关连接在任务开始后 3–8 秒被掐断（连续三次复现）；连锁是网关
+/// 重连 → 全部浏览器 E2E 会话作废 → 浏览器重连突发再撞浏览器档。160 的
+/// 基数 + 其它帧 + 2 倍余量 → 400。
+const GATEWAY_RATE_MAX_FRAMES: usize = 400;
 /// 网关离线缓冲上限（§4.3）：帧数 / 字节数先到为准。
 const BUF_MAX_FRAMES: usize = 200;
 const BUF_MAX_BYTES: usize = 1024 * 1024;
@@ -139,9 +166,13 @@ const BUF_MAX_BYTES: usize = 1024 * 1024;
 ///
 /// - 能发帧的两端都是认证主体：浏览器 = passkey 会话、网关 = ed25519
 ///   机器表，无匿名发送面（单用户系统）；
-/// - 频率限制独立生效（10s 滑窗 ≤ [`RATE_MAX_FRAMES`] 帧）：8MB × 20 =
-///   160MB/10s 的最坏内存压力理论存在但主体可信，且 tokio ws 读帧瞬时
-///   驻留、读完即转发不驻留；
+/// - 频率限制独立生效（10s 滑窗，按角色分档：浏览器 ≤ [`RATE_MAX_FRAMES`]
+///   帧、网关 ≤ [`GATEWAY_RATE_MAX_FRAMES`] 帧，推导见两常量）：8MB × 60 =
+///   480MB/10s（浏览器）/ 8MB × 400 = 3.2GB/10s（网关）的最坏入站吞吐
+///   理论存在，但主体可信（网关 = ed25519 机器表；单条网关连接聚合全部
+///   会话的出站流量，档位必须容纳它），且 tokio ws 逐帧读、读完即转发
+///   不驻留——排队内存的上界是各出站 channel 容量（[`CHANNEL_CAPACITY`]），
+///   与限流档位无关；
 /// - 256KB 的原始动机是协议卫生（误发大帧早断），不是对抗性防线——8MB
 ///   保留同等卫生语义（远超正常帧型，仍能拦截失控大循环）。
 const MAX_WS_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
@@ -769,15 +800,25 @@ fn classify_pairing_hello(text: &str) -> PairingHello {
 // 滑动窗口限流（§4.4，纯函数可拨钟）
 // ---------------------------------------------------------------------------
 
-/// 每连接滑动窗口限流：任意 [`RATE_WINDOW`] 内 ≤ [`RATE_MAX_FRAMES`] 帧。
-/// 时间由调用方注入（单测可拨钟）；被拒的帧不记录——拒绝即断连，且不应
-/// 延长窗口记忆。
-#[derive(Default)]
+/// 每连接滑动窗口限流：任意 [`RATE_WINDOW`] 内 ≤ `max_frames` 帧。档位由
+/// 调用方按连接角色**显式选择**（[`rate_limit_for_role`]）——有意不提供
+/// `Default`：上一版正是「两种角色共用一个常量」，才让网关的聚合流量被
+/// 浏览器档掐断（v1.42）。时间由调用方注入（单测可拨钟）；被拒的帧不记录
+/// ——拒绝即断连，且不应延长窗口记忆。
 struct RateWindow {
     events: VecDeque<Instant>,
+    max_frames: usize,
 }
 
 impl RateWindow {
+    /// 按档位构造：`max_frames` = 窗口内放行的帧数上限（第 N+1 帧拒）。
+    fn new(max_frames: usize) -> Self {
+        Self {
+            events: VecDeque::new(),
+            max_frames,
+        }
+    }
+
     /// 记录一帧并判定放行：先滑出窗口外（elapsed ≥ 窗口长）的旧事件再计数。
     fn check_and_record(&mut self, now: Instant) -> bool {
         while let Some(&oldest) = self.events.front() {
@@ -786,11 +827,21 @@ impl RateWindow {
             }
             self.events.pop_front();
         }
-        if self.events.len() >= RATE_MAX_FRAMES {
+        if self.events.len() >= self.max_frames {
             return false;
         }
         self.events.push_back(now);
         true
+    }
+}
+
+/// 按连接角色选限流档位（每连接入站文本帧的窗口上限，v1.42）：网关连接
+/// 聚合了全部浏览器会话的出站流量，量级远高于用户操作驱动的浏览器连接
+/// （数值推导见 [`RATE_MAX_FRAMES`] / [`GATEWAY_RATE_MAX_FRAMES`]）。
+fn rate_limit_for_role(role: Role) -> usize {
+    match role {
+        Role::Gateway => GATEWAY_RATE_MAX_FRAMES,
+        Role::Browser => RATE_MAX_FRAMES,
     }
 }
 
@@ -2280,9 +2331,12 @@ async fn handle_connection(mut socket: WebSocket, st: RelayState, role: Role, he
     }
 
     // ---- 转发主循环 ----
-    // 限流只计本连接**入站**业务帧（hello_ack 之前不算；relay 自产帧是出站
-    // 的，天然不计入任何一端的限流——§4.4）。
-    let mut rate = RateWindow::default();
+    // 限流只计本连接**入站**文本帧（hello_ack 之前不算；relay 自产帧是出站
+    // 的，天然不计入任何一端的限流——§4.4）。档位按角色分（v1.42）：网关
+    // 连接是全部会话的聚合流量，套浏览器档会在多设备在线 + 流式输出时被
+    // 掐断（见 GATEWAY_RATE_MAX_FRAMES 推导）。
+    let rate_limit = rate_limit_for_role(role);
+    let mut rate = RateWindow::new(rate_limit);
     let mut last_rx = Instant::now();
     loop {
         // idle 剩余时间每轮从 last_rx 重算：出站流量不重置 idle 时钟，
@@ -2330,9 +2384,16 @@ async fn handle_connection(mut socket: WebSocket, st: RelayState, role: Role, he
                             break;
                         }
                         Message::Text(text) => {
-                            // 限流（§4.4）：窗口内第 21 帧 → error + close 1008。
+                            // 限流（§4.4）：窗口内超过本角色档位的帧 → error +
+                            // close 1008（日志按实际档位输出，不写死数值）。
                             if !rate.check_and_record(Instant::now()) {
-                                tracing::warn!(target: TARGET, role = role.name(), "限流触发（10s 内超过 20 帧），close 1008");
+                                tracing::warn!(
+                                    target: TARGET,
+                                    role = role.name(),
+                                    limit = rate_limit,
+                                    "限流触发（10s 内超过 {} 帧），close 1008",
+                                    rate_limit
+                                );
                                 let _ = socket.send(error_frame("rate_limited")).await;
                                 let _ = socket.send(close_msg(CLOSE_POLICY, "rate limited")).await;
                                 break;
@@ -2749,28 +2810,85 @@ mod tests {
         assert!(constant_time_eq("", ""));
     }
 
-    /// 滑动窗口限流：20 帧内放行、第 21 帧拒、窗口滑出后恢复。
+    /// 分档选择（v1.42）：网关连接取网关档、浏览器连接取浏览器档；两档数值
+    /// 钉死（改动须同步常量推导注释与 docs/WEB_DESIGN.md；网关聚合流量，档位
+    /// 须高于浏览器档——两条数值钉同时守住这一点）。
     #[test]
-    fn sliding_window_rate_limit() {
-        let mut w = RateWindow::default();
+    fn rate_limit_tier_per_role() {
+        assert_eq!(rate_limit_for_role(Role::Gateway), GATEWAY_RATE_MAX_FRAMES);
+        assert_eq!(rate_limit_for_role(Role::Browser), RATE_MAX_FRAMES);
+        assert_eq!(RATE_MAX_FRAMES, 60, "浏览器档");
+        assert_eq!(GATEWAY_RATE_MAX_FRAMES, 400, "网关档");
+    }
+
+    /// 滑动窗口限流语义在两个档位下一致（v1.42 分档）：窗口内前 N 帧放行、
+    /// 第 N+1 帧拒；9s 时旧帧仍在窗内仍拒；10s 整点滑出后恢复；被拒帧不
+    /// 记录——否则 t0+9s 的那次拒绝会被记进窗口，让 10s 整点之后放不满 N 帧。
+    #[test]
+    fn sliding_window_rate_limit_both_tiers() {
+        for (tier, max) in [
+            ("browser", RATE_MAX_FRAMES),
+            ("gateway", GATEWAY_RATE_MAX_FRAMES),
+        ] {
+            let mut w = RateWindow::new(max);
+            let t0 = Instant::now();
+            for i in 0..max {
+                assert!(
+                    w.check_and_record(t0),
+                    "{tier}：前 {max} 帧放行（第 {} 帧被拒）",
+                    i + 1
+                );
+            }
+            assert!(!w.check_and_record(t0), "{tier}：窗口内第 {} 帧拒", max + 1);
+            assert!(
+                !w.check_and_record(t0 + Duration::from_secs(9)),
+                "{tier}：9s 时旧帧仍在窗内，仍拒"
+            );
+            // 10s 整点：旧帧全部滑出（含被拒帧——它们没被记录），恰能再放行
+            // N 帧；第 N+1 帧再次被拒。
+            for i in 0..max {
+                assert!(
+                    w.check_and_record(t0 + RATE_WINDOW),
+                    "{tier}：滑出后恢复放行（恢复后第 {} 帧被拒——被拒帧不得记录）",
+                    i + 1
+                );
+            }
+            assert!(
+                !w.check_and_record(t0 + RATE_WINDOW),
+                "{tier}：恢复后第 {} 帧再拒",
+                max + 1
+            );
+            // 部分滑出：窗口里是 t0+10s 的 N 帧，t0+15s 时全部仍在窗内 → 拒；
+            // t0+20s 整点再全部滑出 → 恢复。
+            assert!(
+                !w.check_and_record(t0 + Duration::from_secs(15)),
+                "{tier}：窗口未滑出仍拒"
+            );
+            assert!(
+                w.check_and_record(t0 + Duration::from_secs(20)),
+                "{tier}：再次滑出后恢复"
+            );
+        }
+    }
+
+    /// 小限额注入：档位数值只是常量，分档选择与窗口逻辑对任意 N 成立——
+    /// 用 N=3 验证边界（第 3 帧放行、第 4 帧拒），以及「部分滑出只腾出对应
+    /// 名额」（三帧分布在 t0 / t0+1s / t0+2s：t0+10s 时只有 t0 那帧滑出）。
+    #[test]
+    fn sliding_window_rate_limit_small_limit_boundary() {
+        let mut w = RateWindow::new(3);
         let t0 = Instant::now();
-        for _ in 0..RATE_MAX_FRAMES {
-            assert!(w.check_and_record(t0), "前 20 帧放行");
-        }
-        assert!(!w.check_and_record(t0), "窗口内第 21 帧拒");
+        let s = Duration::from_secs(1);
+        assert!(w.check_and_record(t0));
+        assert!(w.check_and_record(t0 + s));
+        assert!(w.check_and_record(t0 + s + s), "第 N 帧放行");
+        assert!(!w.check_and_record(t0 + s + s), "第 N+1 帧拒");
+        // t0+10s：只有最早一帧（t0）滑出，恰好腾出一个名额。
+        assert!(w.check_and_record(t0 + RATE_WINDOW));
         assert!(
-            !w.check_and_record(t0 + Duration::from_secs(9)),
-            "9s 时旧帧仍在窗内，仍拒"
+            !w.check_and_record(t0 + RATE_WINDOW),
+            "只腾出一个名额：t0+1s / t0+2s 两帧仍在窗内"
         );
-        assert!(
-            w.check_and_record(t0 + RATE_WINDOW),
-            "10s 整点旧帧滑出窗口，恢复放行"
-        );
-        // 恢复后窗口内只有 1 帧：再来 19 帧仍放行，第 21 帧拒。
-        for _ in 0..RATE_MAX_FRAMES - 1 {
-            assert!(w.check_and_record(t0 + RATE_WINDOW));
-        }
-        assert!(!w.check_and_record(t0 + RATE_WINDOW));
     }
 
     /// 离线缓冲：FIFO 序、200 帧上限、1MB 字节上限、溢出拒新、drain 清零。

@@ -10,7 +10,10 @@
 //!   发出）；队列满（relay 长时间不可达）→ Err 上抛。
 //! - sync 重发（D6 故障语义）：per-conv 缓存最近卡片（send_card / update_card
 //!   更新，上限 32 conv 淘汰最旧），浏览器发 `sync` 时由独立 responder 任务
-//!   全量重发 card 帧。relay 保证单浏览器连接，无定向问题。
+//!   全量重发 card 帧。relay 保证单浏览器连接，无定向问题。v1.42：该 responder
+//!   同时消费 `approvals_query`（[`SyncRequest::ApprovalsQuery`]）——按
+//!   [`PendingAsks`] 登记表回 `approvals` 待审批快照（离线期间到达的审批
+//!   重连后可批 / 离开期间已超时的审批收敛）。
 //! - workspace 泵（v1.6 工作空间）：消费 client 转来的
 //!   workspace_list/save/remove/conv_workdir_set 动作，直接读写 store KV
 //!   （`workspace:`/`workdir:` 表，与终端 /ws /cd 同源互通）+
@@ -41,7 +44,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use imagent_store::{OutboundPage, Store, OUTBOUND_RETAIN};
@@ -61,11 +64,11 @@ use crate::e2e::E2eIdentity;
 use crate::models::{resolve_models, CliSource, ModelsContext};
 use crate::titles::{TitleCandidate, TitleGen};
 use crate::{
-    encode_approval_request_frame, encode_approval_resolved_frame, encode_asr_result_frame,
-    encode_card_frame, encode_conv_workdir_frame, encode_error_frame, encode_history_frame,
-    encode_text_frame, encode_user_text_frame, encode_workspaces_frame, history_entry_from_row,
-    push_notify_title, session_title, CardPayload, GatewayCredential, InboundAction, PushEvent,
-    PushNotifyKind, SessionEntryFrame, WorkspaceEntryFrame, TARGET,
+    encode_approval_request_frame, encode_approval_resolved_frame, encode_approvals_frame,
+    encode_asr_result_frame, encode_card_frame, encode_conv_workdir_frame, encode_error_frame,
+    encode_history_frame, encode_text_frame, encode_user_text_frame, encode_workspaces_frame,
+    history_entry_from_row, push_notify_title, session_title, CardPayload, GatewayCredential,
+    InboundAction, PushEvent, PushNotifyKind, SessionEntryFrame, WorkspaceEntryFrame, TARGET,
 };
 
 const PLATFORM: &str = "web";
@@ -221,8 +224,96 @@ impl CardCache {
     }
 }
 
-/// pending 审批记录（cancel_all 逐条收敛用）：`conv -> request_id 列表`。
-type PendingAsks = HashMap<String, Vec<String>>;
+/// 待审批记录（v1.42：快照重放需要完整字段；此前只存 request_id）。
+#[derive(Debug, Clone)]
+pub(crate) struct PendingAsk {
+    pub request_id: String,
+    /// 原始工具名（approval_request 帧的 tool 原文）。
+    pub tool_name: String,
+    /// 已渲染的单行摘要（approval_request 帧的 inputSummary 原文）。
+    pub summary: String,
+    /// 请求发出时刻（算剩余时限的基准）。
+    pub created_at: Instant,
+}
+
+/// pending 审批记录：`conv -> 该会话的待审批列表`（按请求先后追加）。
+/// cancel_all 逐条收敛用；v1.42 起同时是 approvals 快照的数据源——表内有的
+/// = 浏览器确实收到过 approval_request 帧的请求（登记在出站成功之后，见
+/// [`WebPlatform::send_permission_ask`]）。
+type PendingAsks = HashMap<String, Vec<PendingAsk>>;
+
+/// sync 通道载荷（client → sync 泵）：`sync` 帧与 v1.42 `approvals_query` 帧
+/// 共用同一通道与同一泵——两者都是「浏览器请求 → 网关回权威快照」的只读
+/// 查询，都不改变网关状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncRequest {
+    /// `sync` 帧：重发卡片缓存（D6 会话恢复）。
+    Sync,
+    /// `approvals_query` 帧：回待审批快照（v1.42）。
+    ApprovalsQuery,
+}
+
+/// approvals 快照帧的单个条目（协议 v1.42；帧编码见
+/// [`crate::encode_approvals_frame`]，字段名逐字对齐 SPA 契约）。`conv_id`
+/// 为审批请求发出时的完整 conv（`web:` / `local:` 等前缀原样）；`timeout_secs`
+/// 为**剩余**秒数（整数 ≥1）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ApprovalSnapshotItem {
+    pub conv_id: String,
+    pub request_id: String,
+    pub tool_name: String,
+    pub summary: String,
+    pub timeout_secs: u64,
+}
+
+/// 待审批快照（协议 v1.42，纯函数便于单测）：该网关**当前全部待审批**的
+/// 权威集合——跨会话、不分平台前缀。
+/// - `timeout_secs` = 预算 − 已过整秒（elapsed 向下取整，等价于对剩余时间
+///   向上取整——未到期的条目恒 ≥1；SPA 倒计时锚点 = 收到时刻 + timeoutSecs，
+///   发剩余值即可让恢复出来的倒计时正确）。
+/// - 已到期（已过整秒 ≥ 预算）的条目**跳过**：core 的超时路径随即 cancel
+///   （撤卡 + untrack），把临界条目发给 SPA 只会立刻渲染成超时。
+/// - 输出序确定（HashMap 迭代序随机，而帧字节可复现是本 crate 的既有
+///   纪律）：`conv_id` 升序；同 conv 内按请求先后（`created_at` 升序，同刻
+///   再按 request_id 升序兜底）。
+///
+/// 预算取 WebPlatform 构造注入的 `approval_timeout_secs`（= config
+/// `permission_ask_timeout_secs`，与 approval_request 帧 timeoutSecs 同源）。
+pub(crate) fn approvals_snapshot(
+    pending: &PendingAsks,
+    budget_secs: u64,
+    now: Instant,
+) -> Vec<ApprovalSnapshotItem> {
+    let mut items = Vec::new();
+    // 先按 conv 排序（HashMap 迭代序随机），再排同 conv 内的请求先后。
+    let mut convs: Vec<(&String, &Vec<PendingAsk>)> = pending.iter().collect();
+    convs.sort_by(|(a, _), (b, _)| a.cmp(b));
+    for (conv_id, asks) in convs {
+        let mut asks: Vec<&PendingAsk> = asks.iter().collect();
+        asks.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.request_id.cmp(&b.request_id))
+        });
+        for ask in asks {
+            // 已过整秒 ≥ 预算 ⇔ now ≥ created_at + 预算（等价比较，且不做
+            // Instant + Duration 加法——超大预算下加法会溢出 panic）。now 早于
+            // created_at（不可能，防御）时 elapsed 饱和为 0。
+            let elapsed_secs = now.saturating_duration_since(ask.created_at).as_secs();
+            if elapsed_secs >= budget_secs {
+                continue;
+            }
+            items.push(ApprovalSnapshotItem {
+                conv_id: conv_id.clone(),
+                request_id: ask.request_id.clone(),
+                tool_name: ask.tool_name.clone(),
+                summary: ask.summary.clone(),
+                timeout_secs: budget_secs - elapsed_secs,
+            });
+        }
+    }
+    items
+}
 
 /// v1.8 已落盘终态卡片 messageId 查重集：`conv -> 已落盘 messageId`。
 /// 契约语义「同 messageId 终态只落一次」（重复终态 patch / 同 id 复用跳过）；
@@ -254,14 +345,18 @@ fn lock_or_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// sync responder：消费 client 转来的 sync 请求，把卡片缓存全量重发（card
-/// 帧，state 依 terminal，v1.1 起带本机 machine 字段——与首发帧同形）。
-/// best-effort——出站队列满即丢弃该轮重发并 warn（浏览器可再发 sync 刷新，
-/// 不值得反压阻塞 client 的 sync channel）。
+/// sync responder：消费 client 转来的 sync 通道请求——`sync` 重发卡片缓存
+/// （card 帧，state 依 terminal，v1.1 起带本机 machine 字段——与首发帧同
+/// 形）；v1.42 `approvals_query` 回待审批快照（approvals 帧）。best-effort
+/// ——出站队列满即丢弃并 warn（浏览器可再发请求刷新，不值得反压阻塞
+/// client 的 sync channel）。`cards` / `pending_asks` 与平台主体共享同一
+/// Arc（见 [`handle_sync_request`]）。
 async fn serve_sync_requests(
-    mut sync_rx: mpsc::Receiver<()>,
+    mut sync_rx: mpsc::Receiver<SyncRequest>,
     machine_id: String,
     cards: Arc<Mutex<CardCache>>,
+    pending_asks: Arc<Mutex<PendingAsks>>,
+    approval_timeout_secs: u64,
     outbound_tx: mpsc::Sender<String>,
     shutdown: CancellationToken,
 ) {
@@ -269,26 +364,76 @@ async fn serve_sync_requests(
         tokio::select! {
             _ = shutdown.cancelled() => break,
             req = sync_rx.recv() => {
-                if req.is_none() {
-                    break; // client 退出（platform drop 连动），无后续 sync
-                }
-                let snapshot = lock_or_recover(&cards).snapshot();
-                debug!(target: TARGET, convs = snapshot.len(), "sync：重发缓存卡片");
-                for (conv, message_id, card) in snapshot {
-                    match encode_card_frame(&machine_id, "card", &conv, &message_id, &card) {
-                        Ok(json) => {
-                            if outbound_tx.try_send(json).is_err() {
-                                warn!(target: TARGET, conv = %conv, "sync 重发出站队列满，丢弃该轮重发");
-                                break;
-                            }
-                        }
-                        Err(e) => warn!(target: TARGET, error = %e, conv = %conv, "sync 重发帧序列化失败"),
-                    }
-                }
+                let Some(req) = req else {
+                    break; // client 退出（platform drop 连动），无后续请求
+                };
+                handle_sync_request(
+                    req,
+                    &machine_id,
+                    &cards,
+                    &pending_asks,
+                    approval_timeout_secs,
+                    &outbound_tx,
+                );
             }
         }
     }
     debug!(target: TARGET, "sync responder 退出");
+}
+
+/// 处理一条 sync 通道请求并回帧（同步、无 await：回帧一律 try_send——
+/// 泵内直接调用；单测经平台私有字段直测，不必连真实 relay）。
+fn handle_sync_request(
+    req: SyncRequest,
+    machine_id: &str,
+    cards: &Mutex<CardCache>,
+    pending_asks: &Mutex<PendingAsks>,
+    approval_timeout_secs: u64,
+    outbound_tx: &mpsc::Sender<String>,
+) {
+    match req {
+        // `sync` 帧：卡片缓存全量重发（原行为不变）。
+        SyncRequest::Sync => {
+            let snapshot = lock_or_recover(cards).snapshot();
+            debug!(target: TARGET, convs = snapshot.len(), "sync：重发缓存卡片");
+            for (conv, message_id, card) in snapshot {
+                match encode_card_frame(machine_id, "card", &conv, &message_id, &card) {
+                    Ok(json) => {
+                        if outbound_tx.try_send(json).is_err() {
+                            warn!(target: TARGET, conv = %conv, "sync 重发出站队列满，丢弃该轮重发");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(target: TARGET, error = %e, conv = %conv, "sync 重发帧序列化失败")
+                    }
+                }
+            }
+        }
+        // `approvals_query` 帧：待审批快照（v1.42）。出站走既有 outbound
+        // channel——E2E 会话活跃时随 client 的 send_business 逐 sid 加密
+        // （inputSummary 是工具输入摘要，属业务内容，中继不可见）。
+        SyncRequest::ApprovalsQuery => {
+            let items = approvals_snapshot(
+                &lock_or_recover(pending_asks),
+                approval_timeout_secs,
+                Instant::now(),
+            );
+            debug!(target: TARGET, items = items.len(), "approvals 快照");
+            match encode_approvals_frame(machine_id, &items) {
+                Ok(json) => {
+                    if let Err(e) = outbound_tx.try_send(json) {
+                        warn!(
+                            target: TARGET,
+                            error = %e,
+                            "approvals 快照出站队列满/通道关闭，丢弃（浏览器可重发 approvals_query）"
+                        );
+                    }
+                }
+                Err(e) => warn!(target: TARGET, error = %e, "approvals 快照帧序列化失败"),
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1414,11 +1559,13 @@ pub struct WebPlatform {
     logged_cards: Arc<Mutex<LoggedCardIds>>,
     /// 合成卡片 id 计数器：`web-card-<n>` 单调递增（§4.2）。
     card_seq: Arc<AtomicU64>,
-    /// pending 审批记录（cancel_all 收敛用）。
+    /// pending 审批记录（cancel_all 收敛用；v1.42 起同时是 approvals 快照的
+    /// 数据源，与 sync responder 共享同一 Arc）。
     pending_asks: Arc<Mutex<PendingAsks>>,
     /// v1.37：审批超时预算（秒，= config `permission_ask_timeout_secs`，main
     /// 装配处注入）——approval_request 帧的 timeoutSecs 数据源（SPA 倒计时；
-    /// web 不经 dispatcher，无法从运行时取该值，构造期注入）。
+    /// web 不经 dispatcher，无法从运行时取该值，构造期注入）。v1.42 起同时是
+    /// approvals 快照里各条剩余时限的预算（见 [`approvals_snapshot`]）。
     approval_timeout_secs: u64,
     /// v1.41.3 活跃轮探测槽位（main 在 dispatcher 建立后经
     /// [`WebPlatform::set_round_probe`] 后填——平台构造早于 dispatcher，无法
@@ -1501,7 +1648,7 @@ impl WebPlatform {
     ) -> Self {
         let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>(INBOUND_CHANNEL_CAPACITY);
         let (outbound_tx, outbound_rx) = mpsc::channel::<String>(OUTBOUND_CHANNEL_CAPACITY);
-        let (sync_tx, sync_rx) = mpsc::channel::<()>(SYNC_CHANNEL_CAPACITY);
+        let (sync_tx, sync_rx) = mpsc::channel::<SyncRequest>(SYNC_CHANNEL_CAPACITY);
         let (workspace_tx, workspace_rx) =
             mpsc::channel::<InboundAction>(WORKSPACE_CHANNEL_CAPACITY);
         let (media_tx, media_rx) = mpsc::channel::<InboundAction>(MEDIA_CHANNEL_CAPACITY);
@@ -1559,12 +1706,18 @@ impl WebPlatform {
         };
         tokio::spawn(client.run(outbound_rx, push_rx, reconnect.clone(), shutdown.clone()));
 
-        // sync responder（D6 会话恢复）。
+        // sync responder（D6 会话恢复 + v1.42 approvals 快照）。cards /
+        // pending_asks 与平台主体共享同一 Arc——sync 重发看到的卡片缓存与
+        // approvals 快照看到的待审批表，都是 send_card / send_permission_ask
+        // 写入的同一份状态。
         let cards: Arc<Mutex<CardCache>> = Arc::new(Mutex::new(CardCache::default()));
+        let pending_asks: Arc<Mutex<PendingAsks>> = Arc::new(Mutex::new(PendingAsks::default()));
         tokio::spawn(serve_sync_requests(
             sync_rx,
             machine_id.clone(),
             cards.clone(),
+            pending_asks.clone(),
+            approval_timeout_secs,
             outbound_tx.clone(),
             shutdown.clone(),
         ));
@@ -1639,7 +1792,7 @@ impl WebPlatform {
             store,
             logged_cards: Arc::new(Mutex::new(LoggedCardIds::default())),
             card_seq: Arc::new(AtomicU64::new(0)),
-            pending_asks: Arc::new(Mutex::new(PendingAsks::default())),
+            pending_asks,
             approval_timeout_secs,
             round_probe,
             shutdown,
@@ -1680,19 +1833,21 @@ impl WebPlatform {
         }
     }
 
-    /// 登记一条 pending 审批（cancel_all 逐条收敛用）。
-    fn track_ask(&self, conv: &str, request_id: &str) {
+    /// 登记一条 pending 审批（cancel_all 逐条收敛 + v1.42 approvals 快照数据
+    /// 源）。调用点唯一：[`Self::send_permission_ask`]，且在出站成功之后——
+    /// 表里有的必须是浏览器确实收到过请求帧的审批。
+    fn track_ask(&self, conv: &str, ask: PendingAsk) {
         lock_or_recover(&self.pending_asks)
             .entry(conv.to_string())
             .or_default()
-            .push(request_id.to_string());
+            .push(ask);
     }
 
     /// 移除 pending 记录（已 resolve / 已 cancel）。
     fn untrack_ask(&self, conv: &str, request_id: &str) {
         let mut map = lock_or_recover(&self.pending_asks);
         if let Some(list) = map.get_mut(conv) {
-            list.retain(|r| r != request_id);
+            list.retain(|a| a.request_id != request_id);
             if list.is_empty() {
                 map.remove(conv);
             }
@@ -1871,6 +2026,18 @@ impl Platform for WebPlatform {
         }
     }
 
+    /// v1.42 peer 入站回复通知（trait 语义见 `Platform::on_peer_reply`）：窗口
+    /// 回信已落 `peer:<窗口名>` 会话 → push_notify kind=peer_reply，把「窗口
+    /// 回信了」推到离线设备——窗口回信是纯文本帧、没有卡片终态，不经此钩子
+    /// 永远不推送（出门等窗口回信手机不响）。convId = 该 peer 会话（完整
+    /// conv，SPA 据此深链回会话）；title = 回信正文 trim 后前 32 码点（空白
+    /// 正文 → 空串，前端有兜底文案）。经既有 push 通道 → client 明文管理帧
+    /// （见 [`Self::spawn_push_notify`]：spawn 短任务 + try_send 打满即丢，
+    /// 不在通知上等待）。
+    async fn on_peer_reply(&self, conv: &ConvId, body: &str) {
+        self.spawn_push_notify(PushNotifyKind::PeerReply, &conv.0, push_notify_title(body));
+    }
+
     /// v1.41.3 会话删除钩子（/rm 命令收尾——dispatch 已删完 store 两处）：
     /// 卡片缓存按 conv 移除（sync 重发不再复活已删会话）+ 触发一次
     /// workspaces 快照（经 workspace 通道让泵回全量快照，SPA 侧栏权威收敛）。
@@ -1971,8 +2138,23 @@ impl Platform for WebPlatform {
             &summary,
             Some(self.approval_timeout_secs),
         )?;
-        self.track_ask(&conv.0, request_id);
+        // v1.42：**先出站成功、后登记**。待审批表是 approvals 快照的权威数据
+        // 源——登记一条没发出去的请求，重连后的 SPA 会看到一个点开即 route
+        // miss 的幽灵审批（回执字面 y/n 被当普通 prompt 跑一轮 agent）。出站
+        // 失败时 core 直接撤 router 占位，不会再回调 cancel_permission_ask，
+        // 此处留下的记录将无人清除。enqueue 与登记之间没有 await，不存在
+        // 「帧已发出、登记未落」的窗口（与 core 侧「先 register 占位再发卡」
+        // 不矛盾：那边防的是网络往返级的极速回调）。
         self.enqueue(json)?;
+        self.track_ask(
+            &conv.0,
+            PendingAsk {
+                request_id: request_id.to_string(),
+                tool_name: tool_name.to_string(),
+                summary,
+                created_at: Instant::now(),
+            },
+        );
         // v1.10 push_notify：审批请求出站即埋点（title=工具名，≤32 码点）。
         // 网关无脑发——SPA 在线免打扰判定在中继（订阅 session 有活跃 WS 则
         // 跳过投递）。
@@ -2023,15 +2205,16 @@ impl Platform for WebPlatform {
     }
 
     async fn cancel_all_permission_asks(&self, conv: &ConvId) -> Result<()> {
-        // 该 conv 记录中的全部 pending 逐条发 approval_resolved(cancelled)。
+        // 该 conv 记录中的全部 pending 逐条发 approval_resolved(cancelled)
+        // （按请求先后；v1.42 记录升级为完整 PendingAsk，request_id 取字段）。
         let drained = lock_or_recover(&self.pending_asks)
             .remove(&conv.0)
             .unwrap_or_default();
-        for request_id in drained {
+        for ask in drained {
             let json = encode_approval_resolved_frame(
                 &self.machine_id,
                 &conv.0,
-                &request_id,
+                &ask.request_id,
                 "cancelled",
                 Some("审批已取消（任务被 /stop 中断）"),
             )?;
@@ -4199,6 +4382,437 @@ mod tests {
             .expect("通道开着");
         assert_eq!(ev.title, "WebFetch");
         drop(p);
+    }
+
+    /// v1.42 窗口回信推送：on_peer_reply → PushEvent{kind: PeerReply, conv_id =
+    /// `peer:<窗口名>`（完整 conv）, title = 回信正文 trim 后的前 32 码点}；
+    /// 每次钩子恰一条事件；超长正文截到 32 码点（中文不劈半）；空白正文 →
+    /// title 空串（契约：前端有兜底文案）。
+    #[tokio::test]
+    async fn peer_reply_pushes_peer_reply_notify() {
+        /// 读下一条推送事件（钩子经 spawn 短任务入队，2s 内必到）。
+        async fn recv_event(rx: &mut mpsc::Receiver<PushEvent>) -> PushEvent {
+            tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("on_peer_reply 应触发推送事件")
+                .expect("通道开着")
+        }
+
+        let (p, mut rx) = offline_platform_with_push_capture().await;
+
+        // 常规回信：kind / convId / title（trim 后）。
+        p.on_peer_reply(&ConvId("peer:x".into()), "  已修好，测试全绿  ")
+            .await;
+        let ev = recv_event(&mut rx).await;
+        assert_eq!(ev.kind, PushNotifyKind::PeerReply);
+        assert_eq!(ev.conv_id, "peer:x", "convId = peer:<窗口名> 完整 conv");
+        assert_eq!(ev.title, "已修好，测试全绿", "回信正文 trim 后的摘要");
+        // 恰一条（钩子不重复推送）。
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "on_peer_reply 恰推一条"
+        );
+
+        // 超长正文：title 截到 32 码点。
+        let long = format!("{}尾巴", "修".repeat(40));
+        p.on_peer_reply(&ConvId("peer:y".into()), &long).await;
+        let ev = recv_event(&mut rx).await;
+        assert_eq!(ev.kind, PushNotifyKind::PeerReply);
+        assert_eq!(ev.conv_id, "peer:y");
+        assert_eq!(
+            ev.title.chars().count(),
+            crate::PUSH_TITLE_MAX_CHARS,
+            "超长回信截到 32 码点"
+        );
+        assert_eq!(ev.title, "修".repeat(32));
+
+        // 空白正文：title 空串（契约）。
+        p.on_peer_reply(&ConvId("peer:z".into()), " \n\t ").await;
+        let ev = recv_event(&mut rx).await;
+        assert_eq!(ev.kind, PushNotifyKind::PeerReply);
+        assert_eq!(ev.conv_id, "peer:z");
+        assert_eq!(ev.title, "", "空白正文的 title 为空串");
+        drop(p);
+    }
+
+    // ---- v1.42 待审批快照（approvals_query → approvals 帧）----
+    // 帧字节级在 lib.rs `approvals_frame_byte_level`，真实 WS 回环在
+    // tests/web_loopback.rs；此处钉快照纯函数与平台登记表的生命周期。
+
+    /// 测试用 pending 记录（`created_at` 由调用方给定——快照纯函数的时间
+    /// 基准可注入）。
+    fn pending_at(request_id: &str, tool: &str, created_at: Instant) -> PendingAsk {
+        PendingAsk {
+            request_id: request_id.to_string(),
+            tool_name: tool.to_string(),
+            summary: format!("{tool} 摘要"),
+            created_at,
+        }
+    }
+
+    fn snapshot_ids(items: &[ApprovalSnapshotItem]) -> Vec<&str> {
+        items.iter().map(|i| i.request_id.as_str()).collect()
+    }
+
+    /// 快照纯函数：空表 → 空；未到期条目 `timeout_secs` = 预算 − 已过整秒
+    /// （elapsed 向下取整 = 剩余向上取整，未到期恒 ≥1）；字段原样取自记录。
+    #[test]
+    fn approvals_snapshot_remaining_secs_and_empty() {
+        // 时刻一律用加法表达（t0 + 偏移）：Instant 减法在刚开机的机器上
+        // （单调时钟 < 被减秒数）会下溢 panic。
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+
+        assert!(
+            approvals_snapshot(&PendingAsks::default(), 300, at(0)).is_empty(),
+            "空表 → 空快照"
+        );
+
+        let mut pending = PendingAsks::default();
+        pending
+            .entry("web:t".to_string())
+            .or_default()
+            .push(pending_at("req-1", "Bash", at(5)));
+        let items = approvals_snapshot(&pending, 300, at(10));
+        assert_eq!(
+            items,
+            vec![ApprovalSnapshotItem {
+                conv_id: "web:t".into(),
+                request_id: "req-1".into(),
+                tool_name: "Bash".into(),
+                summary: "Bash 摘要".into(),
+                timeout_secs: 295,
+            }]
+        );
+
+        // 向上取整语义：已过 0.4s → 仍是整预算（不虚报超时）；已过 120s 整
+        // → 180；已过 299.4s → 剩余 1（未到期的最后一秒仍是 1 而非 0）。
+        let now = at(1000);
+        let mut pending = PendingAsks::default();
+        {
+            let list = pending.entry("web:t".to_string()).or_default();
+            list.push(pending_at(
+                "fresh",
+                "Bash",
+                now - Duration::from_millis(400),
+            ));
+            list.push(pending_at("exact", "Bash", now - Duration::from_secs(120)));
+            list.push(pending_at(
+                "edge",
+                "Bash",
+                now - Duration::from_secs(299) - Duration::from_millis(400),
+            ));
+        }
+        let items = approvals_snapshot(&pending, 300, now);
+        assert_eq!(
+            items
+                .iter()
+                .map(|i| (i.request_id.as_str(), i.timeout_secs))
+                .collect::<Vec<_>>(),
+            [("edge", 1), ("exact", 180), ("fresh", 300)],
+            "同 conv 内按请求先后（最早发出的在前）"
+        );
+    }
+
+    /// 快照纯函数：已到期条目（已过整秒 ≥ 预算，含恰好等于预算）不进快照；
+    /// 全部到期 → 空数组；预算 0 防御性全跳过（不下溢 panic）；now 早于
+    /// created_at（不可能）elapsed 饱和为 0。
+    #[test]
+    fn approvals_snapshot_skips_expired_entries() {
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let now = at(1000);
+
+        let mut pending = PendingAsks::default();
+        {
+            let list = pending.entry("web:t".to_string()).or_default();
+            list.push(pending_at("over-budget", "Bash", at(699))); // 已过 301s
+            list.push(pending_at("eq-budget", "Bash", at(700))); // 已过 300s = 预算
+            list.push(pending_at("still-alive", "Bash", at(701))); // 已过 299s
+        }
+        let items = approvals_snapshot(&pending, 300, now);
+        assert_eq!(snapshot_ids(&items), ["still-alive"], "到期条目不进快照");
+        assert_eq!(items[0].timeout_secs, 1);
+
+        // 全部到期 → 空数组（SPA 据此清空面板里离开期间已超时的审批）。
+        pending
+            .get_mut("web:t")
+            .unwrap()
+            .retain(|a| a.request_id != "still-alive");
+        assert!(approvals_snapshot(&pending, 300, now).is_empty());
+
+        // 预算 0：config 校验 ≥1，但纯函数不得因此下溢 panic。
+        assert!(
+            approvals_snapshot(&pending, 0, now).is_empty(),
+            "预算 0 → 全部视为到期"
+        );
+
+        // now 早于 created_at：elapsed 饱和为 0，剩余 = 整预算，不 panic。
+        let items = approvals_snapshot(&pending, 300, at(0));
+        assert_eq!(snapshot_ids(&items), ["over-budget", "eq-budget"]);
+        assert!(items.iter().all(|i| i.timeout_secs == 300), "{items:?}");
+    }
+
+    /// 快照纯函数：输出序确定（HashMap 迭代序随机，帧字节须可复现）——
+    /// conv_id 升序（含跨平台前缀）；同 conv 内按请求先后，插入序 ≠ 先后
+    /// 也要排对，同刻按 request_id 升序兜底。
+    #[test]
+    fn approvals_snapshot_order_is_deterministic() {
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let now = at(150);
+
+        let mut pending = PendingAsks::default();
+        // 10 个 conv 乱序插入：多 conv 让随机迭代序「碰巧有序」的概率可忽略。
+        for i in [7u64, 2, 9, 0, 5, 1, 8, 3, 6, 4] {
+            pending
+                .entry(format!("web:c{i}"))
+                .or_default()
+                .push(pending_at(&format!("r{i}"), "Bash", at(100 + i)));
+        }
+        {
+            let list = pending.entry("local:work".to_string()).or_default();
+            list.push(pending_at("l-late", "Bash", at(140))); // 先插入但最新
+            list.push(pending_at("l-tie-b", "Read", at(120)));
+            list.push(pending_at("l-tie-a", "Read", at(120))); // 与上一条同刻
+        }
+        let items = approvals_snapshot(&pending, 300, now);
+        let mut want: Vec<(String, String, u64)> = vec![
+            ("local:work".into(), "l-tie-a".into(), 270),
+            ("local:work".into(), "l-tie-b".into(), 270),
+            ("local:work".into(), "l-late".into(), 290),
+        ];
+        for i in 0..10u64 {
+            want.push((format!("web:c{i}"), format!("r{i}"), 250 + i));
+        }
+        assert_eq!(
+            items
+                .iter()
+                .map(|i| (i.conv_id.clone(), i.request_id.clone(), i.timeout_secs))
+                .collect::<Vec<_>>(),
+            want
+        );
+    }
+
+    /// 经 sync 泵的请求处理函数发一次 approvals_query，返回解析后的帧（每次
+    /// 查询恰回一帧 approvals）。
+    fn query_approvals(
+        p: &WebPlatform,
+        tx: &mpsc::Sender<String>,
+        rx: &mut mpsc::Receiver<String>,
+    ) -> serde_json::Value {
+        handle_sync_request(
+            SyncRequest::ApprovalsQuery,
+            TEST_MACHINE,
+            &p.cards,
+            &p.pending_asks,
+            p.approval_timeout_secs,
+            tx,
+        );
+        let json = rx.try_recv().expect("每次 approvals_query 恰回一帧");
+        assert!(rx.try_recv().is_err(), "一次查询只回一帧");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "approvals", "{v}");
+        assert_eq!(v["machine"], TEST_MACHINE, "出站帧带本机 machine");
+        v
+    }
+
+    /// 任务验收项：send_permission_ask 产生 pending → 查询出正确的 approvals
+    /// 帧（跨会话 + 跨平台前缀，convId 升序；timeoutSecs 为剩余秒数）；
+    /// resolve / cancel / cancel_all 之后再查 → 不再出现。空表时 items:[]。
+    #[tokio::test]
+    async fn approvals_query_tracks_pending_lifecycle() {
+        let p = offline_platform().await;
+        let (tx, mut rx) = mpsc::channel::<String>(32);
+
+        // 空表：items 为空数组。
+        let v = query_approvals(&p, &tx, &mut rx);
+        assert_eq!(v["items"], serde_json::json!([]), "{v}");
+
+        // 两条 pending（跨会话 + 跨平台前缀）。
+        let web_t = ConvId("web:t".into());
+        let local = ConvId("local:work".into());
+        p.send_permission_ask(
+            &web_t,
+            "req-1",
+            "Bash",
+            r#"{"command":"npm test"}"#,
+            &ReplyHint::None,
+        )
+        .await
+        .unwrap();
+        p.send_permission_ask(
+            &local,
+            "req-2",
+            "Write",
+            r#"{"file_path":"/tmp/a"}"#,
+            &ReplyHint::None,
+        )
+        .await
+        .unwrap();
+        let v = query_approvals(&p, &tx, &mut rx);
+        let items = v["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2, "{v}");
+        assert_eq!(items[0]["convId"], "local:work", "convId 升序：{v}");
+        assert_eq!(items[0]["requestId"], "req-2");
+        assert_eq!(items[0]["tool"], "Write");
+        assert_eq!(
+            items[0]["inputSummary"], "/tmp/a",
+            "已渲染摘要（tool_summary）"
+        );
+        assert_eq!(items[1]["convId"], "web:t");
+        assert_eq!(items[1]["requestId"], "req-1");
+        assert_eq!(items[1]["tool"], "Bash");
+        assert_eq!(items[1]["inputSummary"], "npm test");
+        // timeoutSecs = 预算 300 − 已过整秒（本段毫秒级完成，留 10s 余量防慢机器）。
+        for it in items {
+            let t = it["timeoutSecs"].as_u64().unwrap();
+            assert!((290..=300).contains(&t), "剩余秒数：{it}");
+        }
+
+        // resolve（用户决定）→ 不再出现。
+        p.resolve_permission_ask(
+            &web_t,
+            "req-1",
+            &PermissionReply {
+                allow: true,
+                always: false,
+                message: None,
+                raw_text: None,
+                cancelled: false,
+            },
+        )
+        .await
+        .unwrap();
+        let v = query_approvals(&p, &tx, &mut rx);
+        assert_eq!(v["items"].as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(v["items"][0]["requestId"], "req-2");
+
+        // cancel（超时 / 中断）→ 不再出现。
+        p.cancel_permission_ask(&local, "req-2").await.unwrap();
+        let v = query_approvals(&p, &tx, &mut rx);
+        assert_eq!(v["items"], serde_json::json!([]), "{v}");
+
+        // cancel_all：同 conv 两条 pending 一次清空。
+        p.send_permission_ask(&web_t, "req-3", "Bash", "ls", &ReplyHint::None)
+            .await
+            .unwrap();
+        p.send_permission_ask(
+            &web_t,
+            "req-4",
+            "Read",
+            r#"{"file_path":"/tmp/b"}"#,
+            &ReplyHint::None,
+        )
+        .await
+        .unwrap();
+        let v = query_approvals(&p, &tx, &mut rx);
+        assert_eq!(v["items"].as_array().unwrap().len(), 2, "{v}");
+        p.cancel_all_permission_asks(&web_t).await.unwrap();
+        let v = query_approvals(&p, &tx, &mut rx);
+        assert_eq!(v["items"], serde_json::json!([]), "{v}");
+        drop(p);
+    }
+
+    /// v1.42 登记纪律：出站失败的审批请求**不得**进待审批表——表是 approvals
+    /// 快照的权威数据源，幽灵条目会让重连的 SPA 看到一个点开即 route miss 的
+    /// 审批。容量 1 的出站通道预先塞满（无接收方消费 → try_send 恒 Full）
+    /// 制造入队失败（tokio 有界 channel 不允许容量 0）。
+    #[tokio::test]
+    async fn send_permission_ask_enqueue_failure_not_tracked() {
+        let mut p = offline_platform().await;
+        let (tx, rx_hold) = mpsc::channel::<String>(1);
+        tx.try_send("占位帧".to_string()).unwrap();
+        p.outbound_tx = tx;
+        let err = p
+            .send_permission_ask(
+                &ConvId("web:t".into()),
+                "req-x",
+                "Bash",
+                "ls",
+                &ReplyHint::None,
+            )
+            .await
+            .expect_err("出站队列满应上抛 Err");
+        assert!(format!("{err}").contains("出站队列满"), "{err}");
+        assert!(
+            lock_or_recover(&p.pending_asks).is_empty(),
+            "入队失败的审批不得登记"
+        );
+        drop(rx_hold);
+        drop(p);
+    }
+
+    /// sync 原行为回归（v1.42 泵扩展后）：驱动真实泵 [`serve_sync_requests`]——
+    /// `SyncRequest::Sync` 仍重发卡片缓存且**不夹带** approvals 帧（即便有待
+    /// 审批）；`ApprovalsQuery` 只回 approvals 帧、不重发卡片。
+    #[tokio::test]
+    async fn sync_resends_cards_and_approvals_query_only_snapshots() {
+        let (sync_tx, sync_rx) = mpsc::channel::<SyncRequest>(4);
+        let (tx, mut rx) = mpsc::channel::<String>(32);
+        let cards: Arc<Mutex<CardCache>> = Arc::new(Mutex::new(CardCache::default()));
+        lock_or_recover(&cards).upsert(
+            "web:c",
+            "web-card-1",
+            CardPayload::from_card(&v18_card("卡片正文", CardTerminal::Done)),
+        );
+        let pending_asks: Arc<Mutex<PendingAsks>> = Arc::new(Mutex::new(PendingAsks::default()));
+        lock_or_recover(&pending_asks)
+            .entry("web:t".to_string())
+            .or_default()
+            .push(pending_at("req-1", "Bash", Instant::now()));
+        let shutdown = CancellationToken::new();
+        let pump = tokio::spawn(serve_sync_requests(
+            sync_rx,
+            TEST_MACHINE.to_string(),
+            cards,
+            pending_asks,
+            300,
+            tx.clone(),
+            shutdown.clone(),
+        ));
+
+        // Sync：恰一帧 card（原 messageId / machine），无 approvals。
+        sync_tx.send(SyncRequest::Sync).await.unwrap();
+        let json = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("sync 应回卡片帧")
+            .expect("通道开着");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "card", "{v}");
+        assert_eq!(v["messageId"], "web-card-1");
+        assert_eq!(v["machine"], TEST_MACHINE);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "sync 不得夹带 approvals 帧"
+        );
+
+        // ApprovalsQuery：恰一帧 approvals（带待审批条目），不重发卡片。
+        sync_tx.send(SyncRequest::ApprovalsQuery).await.unwrap();
+        let json = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("approvals_query 应回快照帧")
+            .expect("通道开着");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "approvals", "{v}");
+        assert_eq!(v["items"].as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(v["items"][0]["requestId"], "req-1");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "approvals_query 不得重发卡片"
+        );
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("停机信号应让泵退出")
+            .unwrap();
     }
 
     /// history_query 处理回帧（任务验收项）：全量（since=0）/ 增量（since=

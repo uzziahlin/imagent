@@ -19,6 +19,8 @@
 //! v1.41.8 增补：`send_user_text`（用户自发文本镜像，peer 通道）出站帧
 //! `"self":true` + outbound_log payload 同标记 + history 重放透传；该帧在
 //! E2E 活跃时同被 enc 包装（见 `loopback_e2e_encrypted_roundtrip`）。
+//! v1.42 增补：待审批快照 `approvals_query` → `approvals`（空表字节级
+//! `items:[]`；E2E 活跃时双向 enc 包装，见 `loopback_approvals_query_snapshot`）。
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -243,6 +245,18 @@ async fn next_of_type(ws: &mut Ws, want: &str) -> serde_json::Value {
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         if v["type"].as_str() == Some(want) {
             return v;
+        }
+    }
+}
+
+/// 读下一条 `type` 匹配的 JSON 帧**原文**（v1.42 字节级契约断言用；跳过
+/// machine / pong 等噪声帧）。
+async fn next_raw_of_type(ws: &mut Ws, want: &str) -> String {
+    loop {
+        let text = next_text(ws).await;
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        if v["type"].as_str() == Some(want) {
+            return text;
         }
     }
 }
@@ -626,6 +640,240 @@ async fn loopback_sync_resends_cached_card() {
         "sync 不应产生入站消息"
     );
 
+    handle.shutdown();
+    handle.wait().await;
+    drop(p);
+}
+
+// ---------------------------------------------------------------------------
+// v1.42 待审批快照（approvals_query → approvals）：真实 WS 回环
+// ---------------------------------------------------------------------------
+
+/// 浏览器侧单帧密封（与场景 9 / 10 内联实现同构；提为文件级助手供 v1.42
+/// 用例复用，既有用例保持各自的内联实现不动）。
+fn e2e_seal(key: &[u8; 32], plaintext: &str) -> String {
+    use base64::Engine as _;
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+
+    let nonce = rand::random::<[u8; 24]>();
+    let cipher = XChaCha20Poly1305::new_from_slice(key).unwrap();
+    let ct = cipher
+        .encrypt(XNonce::from_slice(&nonce), plaintext.as_bytes())
+        .unwrap();
+    let mut boxed = Vec::with_capacity(24 + ct.len());
+    boxed.extend_from_slice(&nonce);
+    boxed.extend_from_slice(&ct);
+    base64::engine::general_purpose::STANDARD.encode(boxed)
+}
+
+/// 浏览器侧单帧开启（解密出内层业务帧 JSON 原文）。
+fn e2e_open(key: &[u8; 32], boxed: &str) -> String {
+    use base64::Engine as _;
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(boxed)
+        .unwrap();
+    let (nonce, ct) = data.split_at(24);
+    let cipher = XChaCha20Poly1305::new_from_slice(key).unwrap();
+    let pt = cipher.decrypt(XNonce::from_slice(nonce), ct).unwrap();
+    String::from_utf8(pt).unwrap()
+}
+
+/// 浏览器 E2E 握手：发 `e2e_hello{sid,ek,n1}` → 收 `e2e_ack{gk,n2}` → 派生
+/// 会话密钥（握手细节断言见场景 9，此处只取密钥）。`sid` = hello_ack 的
+/// session id（enc 帧定向路由键）。
+async fn e2e_handshake(br: &mut Ws, sid: &str) -> [u8; 32] {
+    use x25519_dalek::{PublicKey as XPublicKey, StaticSecret as XStaticSecret};
+
+    let browser_secret = XStaticSecret::from(rand::random::<[u8; 32]>());
+    let browser_public = XPublicKey::from(&browser_secret);
+    let n1 = rand::random::<[u8; 32]>();
+    br.send(Message::text(
+        serde_json::json!({
+            "v": 1, "type": "e2e_hello", "machine": MACHINE, "sid": sid,
+            "ek": hex::encode(browser_public.as_bytes()),
+            "n1": hex::encode(n1),
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let ack = next_of_type(br, "e2e_ack").await;
+    let gk: [u8; 32] = hex::decode(ack["gk"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let n2: [u8; 32] = hex::decode(ack["n2"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    imagent_web::e2e::derive_session_key(
+        browser_secret
+            .diffie_hellman(&XPublicKey::from(gk))
+            .as_bytes(),
+        &n1,
+        &n2,
+    )
+}
+
+/// v1.42 待审批快照全链路（真实 WS 回环）：
+/// - 明文期空表：`approvals_query` → `approvals` 帧**字节级** `items:[]`（键
+///   不省略）；
+/// - E2E 会话活跃后（生产形态）：enc 包裹的 `approvals_query` 进、enc 包裹的
+///   `approvals` 出——快照含跨会话 / 跨平台前缀的待审批（convId 升序、字段
+///   逐项、timeoutSecs 为剩余秒数）；中继可见的 enc 帧体不泄露摘要与内帧
+///   类型（E2E 中继盲化不因新帧破口）；
+/// - resolve / cancel_all 之后再查 → 收敛为空数组。
+#[tokio::test]
+async fn loopback_approvals_query_snapshot() {
+    /// 发一条 approvals_query（enc 包裹），读到 approvals 内帧为止（先到的
+    /// 其它 enc 帧——如 approval_request——解密识别后跳过；单会话恒可解），
+    /// 返回 approvals 内帧原文。
+    async fn query_enc(br: &mut Ws, k: &[u8; 32]) -> String {
+        br.send(Message::text(
+            serde_json::json!({
+                "v": 1, "type": "enc", "machine": MACHINE,
+                "box": e2e_seal(k, r#"{"v":1,"type":"approvals_query"}"#),
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+        loop {
+            let envelope = next_raw_of_type(br, "enc").await;
+            let boxed = serde_json::from_str::<serde_json::Value>(&envelope).unwrap()["box"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let inner = e2e_open(k, &boxed);
+            let is_approvals =
+                serde_json::from_str::<serde_json::Value>(&inner).unwrap()["type"] == "approvals";
+            if is_approvals {
+                assert!(
+                    !envelope.contains(r#""type":"approvals""#)
+                        && !envelope.contains("npm test")
+                        && !envelope.contains("/tmp/a"),
+                    "中继可见的 enc 帧体不得泄露内帧类型 / 待审批摘要：{envelope}"
+                );
+                return inner;
+            }
+        }
+    }
+
+    let (handle, sk) = spawn_test_relay().await;
+    let addr = handle.addr;
+    let key_path = e2e_test_key_path("approvals");
+    let p = WebPlatform::new_with_e2e(
+        format!("ws://{addr}/gateway"),
+        GatewayCredential::Key(sk),
+        "default".to_string(),
+        MACHINE.to_string(),
+        &key_path,
+        loopback_store("approvals").await,
+        valid_ws_dir(),
+        nop_models(),
+        Vec::new(), // v1.36 backends 名单：回环测试不驱动引擎选择，空名单整段缺席
+        imagent_web::AsrContext::default(), // v1.40 未配置 → 快照 asr 段缺席
+        300,        // v1.37 审批超时预算（approval_request 帧 timeoutSecs）
+    );
+    eventually(Duration::from_secs(10), || p.is_online()).await;
+
+    // 浏览器登录（session id 稍后供 E2E 握手用）。
+    let mut br = connect_ws(&addr, "/ws", None).await;
+    br.send(Message::text(format!(
+        r#"{{"v":1,"type":"hello","token":"{USER_TOKEN}"}}"#
+    )))
+    .await
+    .unwrap();
+    let ack: serde_json::Value = serde_json::from_str(&next_text(&mut br).await).unwrap();
+    let sid = ack["session"]["id"].as_str().unwrap().to_string();
+    let _machines = next_of_type(&mut br, "machines").await;
+
+    // ---- 明文期空表：字节级契约（空数组，键不省略）----
+    br.send(Message::text(format!(
+        r#"{{"v":1,"type":"approvals_query","machine":"{MACHINE}"}}"#
+    )))
+    .await
+    .unwrap();
+    let raw = next_raw_of_type(&mut br, "approvals").await;
+    let empty_snapshot =
+        format!(r#"{{"v":1,"type":"approvals","machine":"{MACHINE}","items":[]}}"#);
+    assert_eq!(raw, empty_snapshot, "空表快照须逐字节一致");
+
+    // ---- E2E 握手：此后业务帧双向 enc 包裹（生产形态）----
+    let k = e2e_handshake(&mut br, &sid).await;
+
+    // 空表（enc）：解密后仍是字节级空数组。
+    assert_eq!(query_enc(&mut br, &k).await, empty_snapshot);
+
+    // 两条待审批：跨会话 + 跨平台前缀。
+    p.send_permission_ask(
+        &ConvId("web:s-ab12".into()),
+        "req-1",
+        "Bash",
+        r#"{"command":"npm test"}"#,
+        &ReplyHint::None,
+    )
+    .await
+    .unwrap();
+    p.send_permission_ask(
+        &ConvId("local:work".into()),
+        "req-2",
+        "Write",
+        r#"{"file_path":"/tmp/a"}"#,
+        &ReplyHint::None,
+    )
+    .await
+    .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&query_enc(&mut br, &k).await).unwrap();
+    assert_eq!(v["v"], 1);
+    assert_eq!(v["machine"], MACHINE, "快照带本机 machine");
+    let items = v["items"].as_array().expect("items 为数组");
+    assert_eq!(items.len(), 2, "{v}");
+    // convId 升序（local:work < web:s-ab12）。
+    assert_eq!(items[0]["convId"], "local:work");
+    assert_eq!(items[0]["requestId"], "req-2");
+    assert_eq!(items[0]["tool"], "Write");
+    assert_eq!(items[0]["inputSummary"], "/tmp/a", "已渲染摘要");
+    assert_eq!(items[1]["convId"], "web:s-ab12");
+    assert_eq!(items[1]["requestId"], "req-1");
+    assert_eq!(items[1]["tool"], "Bash");
+    assert_eq!(items[1]["inputSummary"], "npm test");
+    // timeoutSecs = 剩余秒数（预算 300 − 已过整秒；留 10s 余量防慢机器）。
+    for it in items {
+        let t = it["timeoutSecs"].as_u64().unwrap();
+        assert!((290..=300).contains(&t), "剩余秒数：{it}");
+    }
+
+    // resolve（用户决定）一条 → 只剩另一条。
+    p.resolve_permission_ask(
+        &ConvId("web:s-ab12".into()),
+        "req-1",
+        &imagent_core::PermissionReply {
+            allow: true,
+            always: false,
+            message: None,
+            raw_text: None,
+            cancelled: false,
+        },
+    )
+    .await
+    .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&query_enc(&mut br, &k).await).unwrap();
+    let items = v["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{v}");
+    assert_eq!(items[0]["requestId"], "req-2");
+
+    // cancel_all 另一会话 → 收敛为空数组。
+    p.cancel_all_permission_asks(&ConvId("local:work".into()))
+        .await
+        .unwrap();
+    assert_eq!(query_enc(&mut br, &k).await, empty_snapshot);
+
+    let _ = std::fs::remove_file(&key_path);
     handle.shutdown();
     handle.wait().await;
     drop(p);
@@ -1613,6 +1861,94 @@ async fn loopback_push_notify_full_chain() {
         "VAPID Authorization 头：{authorization}"
     );
     assert!(body_len > 0, "加密载荷非空");
+
+    handle.shutdown();
+    handle.wait().await;
+    drop(platform);
+}
+
+/// v1.42 窗口回信推送全链路：登录 → HTTP 订阅 → 断开浏览器（离线）→ 平台
+/// `on_peer_reply`（dispatch 的 `handle_peer_inbound` 在窗口回信落 `peer:`
+/// 会话后调用）→ `push_notify{kind=peer_reply, convId=peer:<窗口名>}` 明文
+/// 管理帧 → **真实 relay 接受新 kind** 并投递（mock push 服务收到 vapid +
+/// aes128gcm POST）。钉的是跨 crate 契约：网关侧 `PushNotifyKind::as_str`
+/// 与中继侧白名单逐字一致——任一侧漂移，本用例是唯一会在真实链路上转红的。
+#[tokio::test]
+async fn loopback_peer_reply_push_notify_full_chain() {
+    std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
+    std::env::set_var("no_proxy", "127.0.0.1,localhost");
+
+    let (handle, sk) = spawn_test_relay().await;
+    let addr = handle.addr;
+    let platform = WebPlatform::new_with_e2e(
+        format!("ws://{addr}/gateway"),
+        GatewayCredential::Key(sk),
+        "default".to_string(),
+        MACHINE.to_string(),
+        &e2e_test_key_path("peer-reply-push"),
+        loopback_store("peer-reply-push").await,
+        valid_ws_dir(),
+        nop_models(),
+        Vec::new(), // v1.36 backends 名单：回环测试不驱动引擎选择，空名单整段缺席
+        imagent_web::AsrContext::default(), // v1.40 未配置 → 快照 asr 段缺席
+        300,        // v1.37 审批超时预算（approval_request 帧 timeoutSecs）
+    );
+    eventually(Duration::from_secs(10), || platform.is_online()).await;
+
+    // 浏览器登录拿 sessionToken + 订阅（端点 = loopback mock push 服务）。
+    let mut ws = connect_ws(&addr, "/ws", None).await;
+    ws.send(Message::text(format!(
+        r#"{{"v":1,"type":"hello","token":"{USER_TOKEN}"}}"#
+    )))
+    .await
+    .unwrap();
+    let ack = next_text(&mut ws).await;
+    let v: serde_json::Value = serde_json::from_str(&ack).unwrap();
+    let token = v["session"]["token"].as_str().unwrap().to_string();
+    let (push_addr, mut push_rx) = spawn_mock_push_service(200).await;
+    let ep = format!("http://{push_addr}/fcm/send/peer-reply");
+    let (status, resp) = http_json(
+        &addr,
+        "POST",
+        "/push/subscribe",
+        Some(&token),
+        Some(
+            &serde_json::json!({
+                "endpoint": ep,
+                "keys": {"p256dh": PUSH_P256DH, "auth": PUSH_AUTH},
+            })
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(status, "200", "{resp}");
+
+    // 断开浏览器 WS → 订阅会话离线（SPA 在线免打扰解除）。
+    drop(ws);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 窗口回信：钩子 → push_notify(kind=peer_reply) 明文管理帧 → relay 投递。
+    platform
+        .on_peer_reply(&ConvId("peer:win-a".into()), "窗口的回复")
+        .await;
+    let (authorization, encoding, body_len) =
+        tokio::time::timeout(Duration::from_secs(10), push_rx.recv())
+            .await
+            .expect("离线订阅应收到窗口回信推送（relay 须接受 kind=peer_reply）")
+            .expect("channel 开着");
+    assert_eq!(encoding, "aes128gcm", "RFC8188 aes128gcm 内容编码");
+    assert!(
+        authorization.starts_with("vapid t="),
+        "VAPID Authorization 头：{authorization}"
+    );
+    assert!(body_len > 0, "加密载荷非空");
+    // 恰一次投递（钩子每次回信只推一条）。
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), push_rx.recv())
+            .await
+            .is_err(),
+        "on_peer_reply 恰投递一次"
+    );
 
     handle.shutdown();
     handle.wait().await;

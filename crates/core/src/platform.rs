@@ -435,11 +435,12 @@ pub trait Platform: Send + Sync {
 
     // ===== 协作钩子（安全 default，无能力位——无需协商）=====
     //
-    // 这两个方法的 default 无副作用、也不对应任何可选特性，第四平台不覆写
+    // 这组方法的 default 无副作用、也不对应任何可选特性，第四平台不覆写
     // 零损失，故不设能力位（与「新增交互特性须加位」的约定区分）。
     //
-    // `on_workdir_changed`（v1.6）同属本组：通知型钩子、default no-op、无能力位
-    //（web 平台的覆写只是推送一条 best-effort 出站帧，无新交互面）。
+    // `on_workdir_changed`（v1.6）/ `on_peer_reply`（v1.42）同属本组：通知型
+    // 钩子、default no-op、无能力位（web 平台的覆写只是推送一条 best-effort
+    // 出站帧 / 一条 push_notify 埋点，无新交互面）。
 
     /// v1.23 说话人归属：dispatch 在每轮首条消息分派前调用——平台可据此
     /// 锚定「本轮发起者」（卡片标注/按钮点击权校验），避免被运行中的插话
@@ -471,6 +472,15 @@ pub trait Platform: Send + Sync {
     /// error 帧概念（错误反馈走 reply 文本链路），仅 web 覆写（复用
     /// `encode_error_frame` 出站形态，见 `imagent-web`）。
     async fn send_error_note(&self, _conv: &ConvId, _code: &str, _message: &str) {}
+
+    /// v1.42 peer 入站回复通知钩子：窗口 → 网关的回复已投递 `peer:<窗口名>` 会话
+    /// 后调用（`body` 即投递的正文）。通知型、default no-op——IM 平台无需感知；
+    /// web 覆写为 push_notify（kind = peer_reply），把「窗口回信了」推到离线设备。
+    ///
+    /// 调用点唯一：dispatch/peer.rs 的 `handle_peer_inbound`。**不要**在 `/to`
+    /// 回执、建立会话的欢迎文本、用户自发文本镜像上触发——那些是网关 / 用户
+    /// 自己的话，不是窗口的回信。
+    async fn on_peer_reply(&self, _conv: &ConvId, _body: &str) {}
 
     /// v1.41.8 用户自发文本镜像（协作方法，无能力位——default 即安全降级）：
     /// 发送**本用户自己发出的消息**的镜像。与 [`Platform::send_text`] 的区别
@@ -643,6 +653,55 @@ mod tests {
             p.sent.lock().await.as_slice(),
             &[("feishu:ou_x".to_string(), "帮我跑下构建".to_string())],
             "default 须原样委托 send_text"
+        );
+    }
+
+    /// v1.42：`on_peer_reply` 的 trait default 是 no-op——未覆写的平台（IM）
+    /// 对窗口回信通知无感：不产生任何出站文本（钉住 default 不是「委托
+    /// send_text」之类的降级——那会让每条窗口回信在 IM 平台重复落一条）。
+    #[tokio::test]
+    async fn on_peer_reply_default_is_noop() {
+        use tokio::sync::Mutex as TokioMutex;
+
+        /// 只实现必备项的最小平台（其余全走 trait default）。
+        struct BarePlatform {
+            sent: TokioMutex<Vec<(String, String)>>,
+        }
+
+        #[async_trait]
+        impl Platform for BarePlatform {
+            async fn recv(&self) -> Result<InboundMessage> {
+                Err(crate::error::CoreError::Platform("bare", "unused".into()))
+            }
+            async fn send_text(&self, conv: &ConvId, text: &str, _hint: &ReplyHint) -> Result<()> {
+                self.sent
+                    .lock()
+                    .await
+                    .push((conv.0.clone(), text.to_string()));
+                Ok(())
+            }
+            async fn send_media(
+                &self,
+                _conv: &ConvId,
+                _media: &MediaRef,
+                _hint: &ReplyHint,
+            ) -> Result<()> {
+                Ok(())
+            }
+            fn name(&self) -> &'static str {
+                "bare"
+            }
+        }
+
+        let p = BarePlatform {
+            sent: TokioMutex::new(Vec::new()),
+        };
+        p.on_peer_reply(&ConvId("peer:win-a".into()), "窗口的回复")
+            .await;
+        assert!(
+            p.sent.lock().await.is_empty(),
+            "default no-op：不得产生任何出站文本：{:?}",
+            *p.sent.lock().await
         );
     }
 }

@@ -25,7 +25,7 @@
 // 构建戳：vite.config.ts 的 stampServiceWorker 插件在构建产物上替换为
 // index.html 的 sha256 前 16 位 hex（见该插件注释——SW 脚本字节必须随 app shell
 // 变化，否则浏览器永不安装新 SW）。**不要把本常量拼进 SHELL_CACHE 名**（理由见下）。
-const BUILD = "fec71e9c094410c7";
+const BUILD = "f91b3d33e8f5a685";
 
 // cache 名固定、不含构建戳（迁移理由，v1.41.7）：线上已部署的旧 SW 是
 // cache-first 且 cache 名同为 imagent-shell-v1。新 SW 的 install 把新文档写进
@@ -56,6 +56,9 @@ function notificationCopy(kind, title) {
       return { title: "⚠️ 任务出错", body: digest || "任务执行出错，请查看详情" };
     case "approval":
       return { title: "🔐 等待审批", body: digest || "有操作等待你的审批" };
+    // v1.42：本地 Claude 窗口（peer 通道）回信；title 可为空串 → 兜底文案
+    case "peer_reply":
+      return { title: "💬 窗口回复", body: digest || "本地窗口有了新回复" };
     default:
       return { title: "imagent 通知", body: digest || "有新事件，点击查看" };
   }

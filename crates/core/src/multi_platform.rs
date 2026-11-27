@@ -56,6 +56,9 @@
 //!   ——驾驶舱直接打字的出站文本、`/to` 派活正文）同经本特判主路由 web，且
 //!   必须以 `send_user_text` 身份转发（web 据此发带 `self` 标记的 text 帧，
 //!   SPA 按用户气泡渲染——落成普通 `send_text` 即被渲染成 agent 气泡）。
+//! - v1.42：窗口回信通知钩子 [`Platform::on_peer_reply`]（dispatch 的
+//!   `handle_peer_inbound` 在回复落 `peer:<窗口名>` 会话后调用）同经本特判
+//!   路由到 web——推送埋点在 web 子平台（push_notify kind=peer_reply）。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -615,6 +618,16 @@ impl Platform for MultiPlatform {
         }
     }
 
+    /// v1.42 窗口回信通知钩子：按 conv 归属路由（peer: conv 经 child_for
+    /// 特判主路由 web——推送埋点在 web 子平台；IM 平台 default no-op）。
+    /// 无返回值，无命中前缀静默跳过（对齐 send_error_note 的钩子语义：web
+    /// 不在 children 时无处可推）。
+    async fn on_peer_reply(&self, conv: &ConvId, body: &str) {
+        if let Ok(child) = self.child_for(conv) {
+            child.on_peer_reply(conv, body).await;
+        }
+    }
+
     /// 逐子平台探测，每行加 `[<name>] ` 前缀后合并——/doctor 里可分辨哪行
     /// 来自哪个平台。
     async fn doctor_probes(&self) -> Vec<String> {
@@ -659,6 +672,10 @@ mod tests {
         /// 组合器必须以 send_user_text 身份转发给子平台（web 据此发带 self
         /// 标记的帧）；若误落成 send_text 则 sent 有、本表无，断言可辨。
         user_sent: Arc<TokioMutex<Vec<(String, String)>>>,
+        /// v1.42：on_peer_reply 的 (conv, body) 记录——窗口回信通知钩子的路由
+        /// 测试用（conv / body 须原样透传给子平台，web 据此取 `peer:<窗口名>`
+        /// 作 push_notify 的 convId）。
+        peer_replies: Arc<TokioMutex<Vec<(String, String)>>>,
     }
 
     /// 构造全参数 mock（mock / mock_opt 的公共实现）。
@@ -686,6 +703,7 @@ mod tests {
             send_text_ok,
             errors: Arc::new(TokioMutex::new(Vec::new())),
             user_sent: Arc::new(TokioMutex::new(Vec::new())),
+            peer_replies: Arc::new(TokioMutex::new(Vec::new())),
         });
         (p, tx, sent)
     }
@@ -804,6 +822,13 @@ mod tests {
                 .await
                 .push((conv.0.clone(), text.to_string()));
             Ok(())
+        }
+        /// v1.42：窗口回信通知钩子记录（(conv, body)——不进 sent，纯通知）。
+        async fn on_peer_reply(&self, conv: &ConvId, body: &str) {
+            self.peer_replies
+                .lock()
+                .await
+                .push((conv.0.clone(), body.to_string()));
         }
         async fn send_media(
             &self,
@@ -996,6 +1021,56 @@ mod tests {
             "send_user_text 无 web 子平台同样不静默：{err}"
         );
         assert!(!m2.supports_streaming_card(&ConvId("peer:x".into())));
+    }
+
+    /// 用例（v1.42）：窗口回信通知钩子 on_peer_reply 按 conv 归属路由——peer:
+    /// conv 主路由 web 子平台（驾驶舱是 peer 会话的实时主视图，推送埋点在
+    /// web），conv / body 原样透传；feishu 不收；非 peer conv 按前缀归属
+    /// （web 不误收）；web 不在 children 时静默跳过（无处可推，不 panic）。
+    #[tokio::test]
+    async fn peer_reply_hook_routes_to_web_child() {
+        let (w, _wtx, w_sent) = mock_opt("web", true, true);
+        let (f, _ftx, _f_sent) = mock_opt("feishu", false, true);
+        let m = MultiPlatform::new(vec![w.clone(), f.clone()]).expect("合并 web+feishu");
+
+        m.on_peer_reply(&ConvId("peer:win-a".into()), "窗口的回复")
+            .await;
+        assert_eq!(
+            w.peer_replies.lock().await.as_slice(),
+            &[("peer:win-a".to_string(), "窗口的回复".to_string())],
+            "peer: 的窗口回信通知主路由 web 子平台，conv / body 原样透传"
+        );
+        assert!(
+            f.peer_replies.lock().await.is_empty(),
+            "feishu 不收窗口回信通知"
+        );
+        // 通知钩子不得退化成出站文本（send_text / send_user_text 均零次）。
+        assert!(
+            w_sent.lock().await.is_empty() && w.user_sent.lock().await.is_empty(),
+            "通知钩子不得产生出站文本"
+        );
+        // 非 peer conv：按前缀归属（feishu 收，web 不误收）。
+        m.on_peer_reply(&ConvId("feishu:ou_x".into()), "x").await;
+        assert_eq!(
+            f.peer_replies.lock().await.as_slice(),
+            &[("feishu:ou_x".to_string(), "x".to_string())],
+            "非 peer conv 按前缀归属路由"
+        );
+        assert_eq!(
+            w.peer_replies.lock().await.len(),
+            1,
+            "web 不收其它平台 conv 的通知"
+        );
+
+        // web 不在 children：peer: conv 无归属，静默跳过（不 panic、不落任何子平台）。
+        let (a, _atx, _a_sent) = mock_opt("a", false, true);
+        let (b, _btx, _b_sent) = mock_opt("b", false, true);
+        let m2 = MultiPlatform::new(vec![a.clone(), b.clone()]).expect("合并 a+b");
+        m2.on_peer_reply(&ConvId("peer:x".into()), "回信").await;
+        assert!(
+            a.peer_replies.lock().await.is_empty() && b.peer_replies.lock().await.is_empty(),
+            "无 web 子平台时窗口回信通知静默跳过"
+        );
     }
 
     /// 用例（v1.41.8）：send_user_text 同走 route_with_mirror 的镜像规则——

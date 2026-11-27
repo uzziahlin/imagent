@@ -47,6 +47,10 @@ export function notificationCopy(
       return { title: "⚠️ 任务出错", body: digest || "任务执行出错，请查看详情" };
     case "approval":
       return { title: "🔐 等待审批", body: digest || "有操作等待你的审批" };
+    // v1.42：本地 Claude 窗口（peer 通道）回信。title = 回信正文前 32 码点，
+    // 可为空串（窗口只回了空白等）→ 走兜底文案。
+    case "peer_reply":
+      return { title: "💬 窗口回复", body: digest || "本地窗口有了新回复" };
     default:
       return { title: "imagent 通知", body: digest || "有新事件，点击查看" };
   }
@@ -57,10 +61,13 @@ export function notificationCopy(
  *  由 enablePush 的 try 归并到 subscribe_failed）。 */
 export const urlB64ToUint8Array = fromB64Url;
 
-/** ?conv= 深链参数校验：仅接受完整 conv 形态（`web:<名>` / `local:<名>`，
- *  对齐 protocol 的 conv 形态约定；裸名字不合法）。合法返回原值，否则 null。 */
+/** ?conv= 深链参数校验：仅接受完整 conv 形态（`web:<名>` / `local:<名>` /
+ *  `peer:<窗口名>`，对齐 protocol 的 conv 形态约定；裸名字不合法）。合法返回
+ *  原值，否则 null。v1.42 加入 peer 前缀：窗口回信推送（kind=peer_reply）的
+ *  convId 是 `peer:<窗口名>`，此前深链校验把它拒掉——无窗口时点通知只能落到
+ *  默认会话，定位不到窗口会话。 */
 export function validConvParam(conv: string | null): string | null {
-  return conv !== null && /^(?:web|local):\S{1,120}$/.test(conv) ? conv : null;
+  return conv !== null && /^(?:web|local|peer):\S{1,120}$/.test(conv) ? conv : null;
 }
 
 /** ?machine= 深链参数校验（v1.37）：机器名规则与 relay 一致（1..=32 位

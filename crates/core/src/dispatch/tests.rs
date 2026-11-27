@@ -117,6 +117,9 @@ struct MockPlatform {
     /// 与 send_text 可辨；文本照记 inbox，send_count 照加，与 trait default
     /// 委托 send_text 的 IM 平台观感一致）。
     user_sent: Arc<TokioMutex<Vec<(String, String)>>>,
+    /// v1.42：on_peer_reply 的 (conv, body) 全记录——窗口回信通知钩子的调用
+    /// 点断言用（handle_peer_inbound 恰一次；其余 peer 路径零次）。
+    peer_replies: Arc<TokioMutex<Vec<(String, String)>>>,
 }
 
 impl MockPlatform {
@@ -134,6 +137,7 @@ impl MockPlatform {
             errors: Arc::new(TokioMutex::new(Vec::new())),
             sent: Arc::new(TokioMutex::new(Vec::new())),
             user_sent: Arc::new(TokioMutex::new(Vec::new())),
+            peer_replies: Arc::new(TokioMutex::new(Vec::new())),
         };
         (p, inbox, send_count)
     }
@@ -328,6 +332,14 @@ impl Platform for MockPlatform {
             .lock()
             .await
             .push((code.to_string(), message.to_string()));
+    }
+    /// v1.42：窗口回信通知钩子记录（(conv, body)，不进 sent / inbox——纯通知，
+    /// 不得产生出站文本）。
+    async fn on_peer_reply(&self, conv: &ConvId, body: &str) {
+        self.peer_replies
+            .lock()
+            .await
+            .push((conv.0.clone(), body.to_string()));
     }
 }
 
@@ -9224,6 +9236,9 @@ struct PeerCtx {
     /// v1.41.8：send_user_text 的 (conv, text) 全记录（用户自发文本镜像的
     /// 路径断言——与 `sent` 分表）。
     user_sent: UserSentHandle,
+    /// v1.42：on_peer_reply 的 (conv, body) 全记录（窗口回信通知钩子——只有
+    /// handle_peer_inbound 触发，其余 peer 路径必须为空）。
+    peer_replies: SentHandle,
 }
 
 /// 自建带观测句柄的 dispatcher（MockPlatform::new_with_errors 供 error 帧
@@ -9231,6 +9246,7 @@ struct PeerCtx {
 async fn build_peer_ctx() -> PeerCtx {
     let _ = std::fs::create_dir_all("/tmp/imagent-test-ws");
     let (plat, inbox, _send_count, errors, sent, user_sent) = MockPlatform::new_with_errors();
+    let peer_replies = plat.peer_replies.clone();
     let (back, calls, _prompts, _order) = MockBackend::new();
     let (store, _db) = tmp_store().await;
     let auth = Auth::new(vec!["u1".into()]);
@@ -9254,6 +9270,7 @@ async fn build_peer_ctx() -> PeerCtx {
         errors,
         sent,
         user_sent,
+        peer_replies,
     }
 }
 
@@ -9409,6 +9426,12 @@ async fn peer_conv_text_routes_to_window_without_agent() {
         "镜像不得走 send_text（会被渲染成 agent 气泡）：{:?}",
         *ctx.sent.lock().await
     );
+    // v1.42：用户自发文本镜像不是窗口回信——通知钩子零次。
+    assert!(
+        ctx.peer_replies.lock().await.is_empty(),
+        "用户自发文本镜像不得触发窗口回信通知：{:?}",
+        *ctx.peer_replies.lock().await
+    );
     let _ = std::fs::remove_dir_all(&win.base);
 }
 
@@ -9519,6 +9542,12 @@ async fn to_command_delivers_and_reports() {
         &[("feishu:ou_x".to_string(), "✅ 已投递至 win-b。".to_string())],
         "send_text 恰为回执一条（落发起会话）"
     );
+    // v1.42：/to 回执与派活正文镜像都不是窗口回信——通知钩子零次。
+    assert!(
+        ctx.peer_replies.lock().await.is_empty(),
+        "/to 回执与派活镜像不得触发窗口回信通知：{:?}",
+        *ctx.peer_replies.lock().await
+    );
     let _ = std::fs::remove_dir_all(&win.base);
 }
 
@@ -9592,6 +9621,12 @@ async fn to_command_no_body_establishes_session() {
         ctx.user_sent.lock().await.is_empty(),
         "欢迎文本不得走 send_user_text：{:?}",
         *ctx.user_sent.lock().await
+    );
+    // v1.42：欢迎文本是系统提示，不是窗口回信——通知钩子零次。
+    assert!(
+        ctx.peer_replies.lock().await.is_empty(),
+        "建立会话的欢迎文本不得触发窗口回信通知：{:?}",
+        *ctx.peer_replies.lock().await
     );
     // 当前会话不打扰（无投递/失败回执）。
     assert!(
@@ -9684,6 +9719,9 @@ async fn peers_command_lists_live_windows() {
 /// 入站直投（PeerServer 回调）：窗口名 → peer:<名> 会话 reply（不进 agent、
 /// 不经 handle 鉴权管线——非白名单 sender 亦可，本机 socket 即凭证）。窗口
 /// claude 的回复是 agent 文本：走 send_text，**不得**标成用户自发文本。
+/// v1.42：投递后窗口回信通知钩子 on_peer_reply **恰被调用一次**，入参
+/// conv = `peer:<窗口名>`、body = 原文（web 据此发 push_notify kind=peer_reply
+/// ——不推送则出门等窗口回信手机不响）。
 #[tokio::test]
 async fn peer_inbound_replies_direct_to_peer_conv() {
     let _g = SERIAL.lock().await;
@@ -9711,6 +9749,32 @@ async fn peer_inbound_replies_direct_to_peer_conv() {
         ctx.user_sent.lock().await.is_empty(),
         "窗口回复不得标成用户自发文本：{:?}",
         *ctx.user_sent.lock().await
+    );
+    // v1.42：通知钩子恰一次，conv / body 原样（不 trim、不改写）。
+    assert_eq!(
+        ctx.peer_replies.lock().await.as_slice(),
+        &[("peer:win-e".to_string(), "窗口里的回复正文".to_string())],
+        "窗口回信通知钩子应恰被调用一次，入参 conv = peer:<窗口名>、body = 原文"
+    );
+    // 通知钩子不得产生出站文本（纯通知，不重复落一条消息）。
+    assert_eq!(
+        ctx.sent.lock().await.len(),
+        1,
+        "通知钩子不得在 send_text 之外再多发文本：{:?}",
+        *ctx.sent.lock().await
+    );
+
+    // 再来一条（另一窗口 / 含首尾空白的正文）：钩子逐条触发，conv 随窗口名。
+    ctx.disp
+        .handle_peer_inbound("win-f", "  第二封回信\n")
+        .await;
+    assert_eq!(
+        ctx.peer_replies.lock().await.as_slice(),
+        &[
+            ("peer:win-e".to_string(), "窗口里的回复正文".to_string()),
+            ("peer:win-f".to_string(), "  第二封回信\n".to_string()),
+        ],
+        "每条入站回复各触发一次，body 原样透传"
     );
 }
 
