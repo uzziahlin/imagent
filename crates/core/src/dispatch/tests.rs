@@ -7755,8 +7755,19 @@ async fn max_concurrent_rounds_hot_reload_rebuilds_gate() {
     tokio::time::sleep(Duration::from_millis(100)).await; // A 注册到完成闸门。
                                                           // B：热改**前**起跑 → snapshot 旧信号量 → 在旧闸排队。
     let d2 = ctx.disp.clone();
+    let queue_depth_before = crate::metrics::METRICS.round_queue_depth.get();
     let h2 = tokio::spawn(async move { d2.handle(msg("c2", "alice", "two")).await });
-    tokio::time::sleep(Duration::from_millis(100)).await; // 确保 B 已在旧 sem 等待。
+    // 等 B 真正在旧闸上排队：排队深度 gauge 在快照旧闸之后、acquire 之前 +1
+    // （见 acquire_round_permit）。不能用固定 sleep——CI 满载时 B 可能 100ms 内
+    // 还没走到 acquire，随后热改会让 B 拿到新闸立即起跑，下面「在飞 = A + C」
+    // 的断言就不成立（v1.43.0 的 Release 流程栽在这里）。
+    assert!(
+        wait_until(&ctx, move |_c| Box::pin(async move {
+            crate::metrics::METRICS.round_queue_depth.get() == queue_depth_before + 1
+        }))
+        .await,
+        "B 应已快照旧闸并在其上排队"
+    );
     assert_eq!(ctx.calls.lock().await.len(), 1, "B 应在旧闸排队，不得起跑");
     // 热改放宽到 4：C 的新 acquire 走新闸，不等 A/B。
     ctx.disp.reload_max_concurrent_rounds(4);
