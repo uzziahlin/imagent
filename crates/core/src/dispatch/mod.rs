@@ -37,7 +37,7 @@ use crate::permission::{
 use crate::platform::{Platform, PlatformCaps};
 use crate::types::{
     AgentChunk, CardButton, CardButtonStyle, CardTerminal, ConfigFormField, ConvId, InboundMessage,
-    MediaRef, ReplyHint, SessionId, ToolCall,
+    MediaRef, MessageRejectReason, ReplyHint, SessionId, ToolCall,
 };
 use crate::workspace::{workdir_key, workspace_key};
 use imagent_store::{NamedSessionRow, SessionRow, Store};
@@ -2549,6 +2549,16 @@ impl Dispatcher {
                     cap = PENDING_QUEUE_CAP,
                     "排队消息超上限，丢弃本条"
                 );
+                // v1.44：带送达回执关联 id 的消息（驾驶舱）在明确的丢弃点上报
+                // ——否则界面与发送成功无法区分（入站时的 received 已发）。
+                // `msg` 在本分支未被移入队列，直接读。
+                if let Some(client_id) = msg.client_id.as_deref() {
+                    self.platform.on_message_rejected(
+                        &ConvId(conv.to_string()),
+                        client_id,
+                        MessageRejectReason::QueueFull,
+                    );
+                }
                 // v1.21 review：告警按 conv 时间窗去重（同 budget_notice_last
                 // 手法）——洪泛源（泄漏的 token / CI 重试风暴）下逐条回发
                 // 会刷屏并可能触发平台频控。丢弃本身照常。

@@ -86,6 +86,15 @@
 // 快照变化时下发）经 onFrame 进 protocol reducer——active 机器的明文 windows
 // 同属注入面（伪造一帧就能在看板上塞出「等你确认」的假窗口并顶掉状态条提示），
 // 与 approvals 同规丢弃 + 降级告警。
+// v1.44 送达回执 / 网关版本 / 标签页关闭：sendMessage 末尾可选 clientId（App
+// 每次发送生成，网关据此回 ack）；sendGatewayInfoQuery(machine) 出站
+// gateway_info_query 业务帧（E2E 加密，同 message 族路由）；入站 ack /
+// gateway_info 经 onFrame 进 protocol reducer——active 机器的明文 ack /
+// gateway_info 同属注入面（伪造一帧 ack{received} 就能把没送达的消息标成已
+// 送达，凭空的 rejected 能诱导用户重发），与 windows 同规丢弃 + 降级告警。
+// pagehide 时对每台已加密（active）的机器各发一帧密文 e2e_close，通知网关
+// 回收本标签页的会话密钥（best-effort；崩溃 / 被杀的标签页发不出，由网关的
+// 空闲回收兜底）。监听随 connect 注册、close 与终态移除（与 visibility 同纪律）。
 
 import {
   DEFAULT_MACHINE,
@@ -401,6 +410,7 @@ export class WsManager {
     }
     this.stopped = false;
     this.attachVisibility();
+    this.attachPageHide();
     this.setStatus("connecting");
     this.openSocket();
   }
@@ -410,6 +420,7 @@ export class WsManager {
     this.stopped = true;
     this.clearReconnectTimer();
     this.detachVisibility();
+    this.detachPageHide();
     this.teardownSocket();
   }
 
@@ -421,14 +432,26 @@ export class WsManager {
    *  /switch 命令文本走默认会话，由网关解析并切出 web:<名字>。
    *  v1.7：可选 media 附件（图片经 canvas 压缩，见 lib/imageCompress）；纯图
    *  消息 text 传 ""（契约 A 段：text 与 media 至少其一非空）。media 随
-   *  message 帧自动走 E2E 加密（message 本就在 BUSINESS_TYPES）。 */
+   *  message 帧自动走 E2E 加密（message 本就在 BUSINESS_TYPES）。
+   *  v1.44：可选 clientId（送达回执的关联 id，App 每次发送用 newClientId 生
+   *  成）——非空字符串才带上该键，缺席时帧字节与升级前完全一致（旧网关忽略
+   *  该键）。键序照契约示例：clientId 在 machine 之后。 */
   sendMessage(
     convId: string | undefined,
     text: string,
     machine?: string,
     media?: MediaPayload,
+    clientId?: string,
   ): boolean {
-    return this.send({ v: 1, type: "message", convId, text, machine, media });
+    return this.send({
+      v: 1,
+      type: "message",
+      convId,
+      text,
+      machine,
+      media,
+      ...(clientId ? { clientId } : {}),
+    });
   }
 
   /** convId / requestId 原样回传 approval_request 帧里的值；machine =
@@ -542,6 +565,17 @@ export class WsManager {
    *  键序照契约示例：v / type / machine / name / watch。 */
   sendWindowWatch(name: string, watch: boolean, machine?: string): boolean {
     return this.send({ v: 1, type: "window_watch", machine, name, watch });
+  }
+
+  // ---- v1.44 送达回执 / 网关版本（网关消费的业务帧；同 message 族路由约定，
+  //      经 e2e outbound 判定包装；应答 gateway_info / ack 帧经 onFrame 进 reducer）----
+
+  /** 查询某机器网关的版本与可选能力：网关回 gateway_info{machine, version,
+   *  caps}（新网关）；旧网关不认识该帧、不回任何帧——调用方以「有没有收到过
+   *  该机器的应答」判定它是否支持送达回执。ready 后 / 该机器加密会话建立后各
+   *  发一次（App 层）。返回 false = 未发出（未 ready / E2E fail-closed 拒发）。 */
+  sendGatewayInfoQuery(machine?: string): boolean {
+    return this.send({ v: 1, type: "gateway_info_query", machine });
   }
 
   /** v1.2 拉取已登录设备列表（设备面板打开时；仅会话模式对新 relay 使用）。 */
@@ -750,6 +784,9 @@ export class WsManager {
     // 同规封住（网关应答恒经 send_business 加密，active 后到明文即降级）。
     // v1.43：windows（本地窗口快照）同理——它会被整块渲染成侧栏看板，并决定
     // 状态条出不出「窗口在等你」；伪造一帧就能诱导用户点进一个不存在的会话。
+    // v1.44：ack（送达回执）与 gateway_info（网关版本 / 能力）同理——伪造一帧
+    // ack{received} 就能把没送达的消息标成已送达，凭空的 rejected 会诱导用户
+    // 重发；gateway_info 则决定该机器的消息显不显示送达状态。
     if (frame.type === "machines") {
       // v1.41.9：记下在线机器集（心跳只对在线的 active 机器发 enc-ping，见
       // probeOnce）→ 让新出现的机器进入握手 → 对已加密会话探活（此刻新机器
@@ -765,7 +802,9 @@ export class WsManager {
         frame.type === "approval_resolved" ||
         frame.type === "history" ||
         frame.type === "approvals" ||
-        frame.type === "windows") &&
+        frame.type === "windows" ||
+        frame.type === "ack" ||
+        frame.type === "gateway_info") &&
       !this.e2e.acceptPlaintextBusiness(frame.machine ?? DEFAULT_MACHINE)
     ) {
       this.e2e.notePlaintextDowngrade(frame.machine ?? DEFAULT_MACHINE);
@@ -861,6 +900,55 @@ export class WsManager {
     }
     document.removeEventListener("visibilitychange", this.handleVisibilityChange);
   }
+
+  // ---- v1.44 标签页关闭通知（pagehide → 密文 e2e_close，通知网关回收会话密钥）----
+
+  /** pagehide 监听（connect 注册 / close 与终态移除；无 window 的环境静默跳过）。
+   *  同一函数引用重复 addEventListener 幂等。 */
+  private attachPageHide(): void {
+    if (typeof window === "undefined") {
+      return;
+    }
+    window.addEventListener("pagehide", this.handlePageHide);
+  }
+
+  private detachPageHide(): void {
+    if (typeof window === "undefined") {
+      return;
+    }
+    window.removeEventListener("pagehide", this.handlePageHide);
+  }
+
+  /** 卸载路径上最后的可靠时机（关标签页 / 导航离开）：对每台已加密
+   *  （active）的机器，用**它自己的**会话密钥密封契约原文
+   *  `{"v":1,"type":"e2e_close"}` 并同步 send——网关解开后删除的正是解开它的那
+   *  把密钥，此后每个出站帧不必再为本标签页多加密一份。走 outbound 而非
+   *  heartbeat：后者会把 machine 一并封进内帧，与契约字面不一致（路由靠 enc
+   *  信封的 machine）。best-effort：密封被拒 / send 抛错一律静默，发不出去的
+   *  由网关的空闲回收兜底。未加密的机器没有可回收的密钥，不发。
+   *  persisted = 页面进往返缓存而非卸载：它可能原样复活并继续用这把密钥，
+   *  此时告知网关删除 = 复活后整条加密会话静默失效（要到下一次 machines 快照
+   *  的会话探活才重连），故不发。 */
+  private handlePageHide = (ev: { persisted?: boolean }): void => {
+    if (ev.persisted) {
+      return;
+    }
+    const sock = this.socket;
+    if (sock === null) {
+      return;
+    }
+    for (const machine of this.e2e.activeMachines()) {
+      const wire = this.e2e.outbound(machine, { v: 1, type: "e2e_close" });
+      if (wire === null) {
+        continue;
+      }
+      try {
+        sock.send(wire);
+      } catch {
+        // best-effort：页面正在卸载，任何异常都不再有意义
+      }
+    }
+  };
 
   /** 切回前台即时探活：visible 且未 stopped/superseded 时——
    *  ① socket 为 null 且退避定时器已排：清 timer 立即重连（attempts 计数
@@ -995,6 +1083,7 @@ export class WsManager {
       // 调用方清对应凭证回登录页；不重连
       this.stopped = true;
       this.detachVisibility();
+      this.detachPageHide();
       this.onAuthFailed(authFailReason(reason));
       return;
     }
@@ -1003,6 +1092,7 @@ export class WsManager {
       // （自动重连会顶替回去，两个窗口互踢死循环）；用户显式 connect() 才重连。
       this.stopped = true;
       this.detachVisibility();
+      this.detachPageHide();
       this.setStatus("superseded");
       return;
     }

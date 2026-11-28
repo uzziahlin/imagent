@@ -663,6 +663,7 @@ async fn webhook_handler(
         // v1.21 review：合成消息不走 steering（独立轮次 + 持久化兜底）。
         no_steer: true,
         reply_hint: imagent_core::ReplyHint::None,
+        client_id: None,
     };
     tracing::info!(target: "imagent::ops", conv = %route.conv, name = %route.name, "webhook 命中，注入 dispatcher");
     match st.dispatcher.inject(msg).await {

@@ -78,6 +78,19 @@
 //! 事件 [`Platform::on_window_event`] 带 `peer:<窗口名>` 会话，走 A 类归属路由
 //! ——`peer:` 经 [`MultiPlatform::child_for`] 的特判落 web（推送埋点在 web 子
 //! 平台，同 `on_peer_reply`）。
+//!
+//! ## 消息拒绝回执：恒回驾驶舱，不按 conv 归属（v1.44）
+//!
+//! 消息被 Dispatcher 明确拒绝的通知 [`Platform::on_message_rejected`] 是「某条
+//! **来自驾驶舱**的消息的回执」，去向由**来源**决定而不是由 conv 归属决定：
+//! 带回执关联 id（`InboundMessage::client_id`）的入站消息只可能来自 web 子
+//! 平台（SPA；其它平台恒 None，钩子不会被调），而 SPA 可以对任意会话发言——
+//! 包括 `local:<会话名>`（本地终端会话镜像到驾驶舱后的干预消息）。按 A 类
+//! 归属路由，`local:` 会话的回执会派给未覆写本钩子的 local 平台而丢失，用户
+//! 在驾驶舱里看到的是「未确认送达」而不是真实原因。故本钩子恒投 web 子平台
+//! （若在 children），也**不是广播**——IM / 终端子平台不收。与
+//! [`Platform::notify_task_done`]（按归属）的区别在语义：那是「会话的事件」，
+//! 归属即语义；这是「某条消息的回执」。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -686,6 +699,30 @@ impl Platform for MultiPlatform {
         }
     }
 
+    /// v1.44 消息拒绝回执：**恒投 web 子平台**（若在 children），不按 conv 归属
+    /// 路由、不广播——理由见模块文档「消息拒绝回执」节（带关联 id 的入站消息
+    /// 只可能来自驾驶舱；SPA 可对 `local:` 会话发言，按归属路由会把回执派给
+    /// 未覆写的 local 平台而丢失）。`conv` / `client_id` / `reason` 原样透传
+    /// （web 据此组 `ack` 帧，SPA 在该 conv 里按 clientId 对回自己发出的消息）。
+    /// web 不在 children 时无处可投，静默跳过（此时也不可能有带关联 id 的
+    /// 消息进来）。不走 [`Self::route_with_mirror`]：镜像规则只覆盖 local →
+    /// web，且会对归属平台也调一次。
+    ///
+    /// 前提：`InboundMessage::client_id` 只由 web 平台写入（`crates/web` 的
+    /// `synth_message` / `synth_media_message`；其它平台与 cron / webhook / 命令
+    /// 合成的消息恒 None）——本方法据此刻意硬编码 web。若将来别的平台也要
+    /// 送达回执，需给入站消息引入来源标识并重新设计这里的路由，不能沿用。
+    fn on_message_rejected(
+        &self,
+        conv: &ConvId,
+        client_id: &str,
+        reason: crate::types::MessageRejectReason,
+    ) {
+        if let Some(web) = self.children.iter().find(|c| c.name() == "web") {
+            web.on_message_rejected(conv, client_id, reason);
+        }
+    }
+
     /// 逐子平台探测，每行加 `[<name>] ` 前缀后合并——/doctor 里可分辨哪行
     /// 来自哪个平台。
     async fn doctor_probes(&self) -> Vec<String> {
@@ -706,7 +743,7 @@ mod tests {
     //! 耦合——那边面向 dispatcher 集成，字段面完全不同）。
 
     use super::*;
-    use crate::types::{CardPhase, CardTerminal, OutboundCard, UserId};
+    use crate::types::{CardPhase, CardTerminal, MessageRejectReason, OutboundCard, UserId};
 
     /// 极简 mock 平台：name/caps/urgent/probes 可配；recv 从 mpsc 取（测试
     /// 注入 Ok/Err）；send_text 记录到共享 Vec（send_text_ok=false 时恒 Err，
@@ -821,6 +858,7 @@ mod tests {
             control: None,
             no_steer: false,
             reply_hint: ReplyHint::None,
+            client_id: None,
         }
     }
 
@@ -1437,6 +1475,114 @@ mod tests {
             w_sent.lock().await.len(),
             2,
             "web 会话的催办照旧送达，local 会话的催办照旧镜像给 web"
+        );
+    }
+
+    /// v1.44：拒绝回执探针的记录端类型（(conv, client_id, reason) 列表）。
+    type RejectLog = Arc<std::sync::Mutex<Vec<(String, String, MessageRejectReason)>>>;
+
+    /// v1.44：实现了 `on_message_rejected` 的最小平台——路由测试的探针，记录
+    /// (conv, client_id, reason)。同步钩子里不能 await，用 std Mutex。
+    struct RejectProbe {
+        name: &'static str,
+        rejected: RejectLog,
+    }
+
+    /// 构造拒绝回执探针：返回（平台句柄、记录端）。
+    fn reject_probe(name: &'static str) -> (Arc<RejectProbe>, RejectLog) {
+        let rejected = Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            Arc::new(RejectProbe {
+                name,
+                rejected: rejected.clone(),
+            }),
+            rejected,
+        )
+    }
+
+    #[async_trait]
+    impl Platform for RejectProbe {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        /// 探针不注入入站：泵任务挂起即可（组合器 drop 时 abort）。
+        async fn recv(&self) -> Result<InboundMessage> {
+            std::future::pending().await
+        }
+        /// 拒绝回执不得退化成出站文本——落到这里说明路由错了。
+        async fn send_text(&self, _conv: &ConvId, _text: &str, _hint: &ReplyHint) -> Result<()> {
+            Err(CoreError::Platform(self.name, "探针不应发出站文本".into()))
+        }
+        async fn send_media(
+            &self,
+            _conv: &ConvId,
+            _media: &MediaRef,
+            _hint: &ReplyHint,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn on_message_rejected(&self, conv: &ConvId, client_id: &str, reason: MessageRejectReason) {
+            self.rejected
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((conv.0.clone(), client_id.to_string(), reason));
+        }
+    }
+
+    /// 用例（v1.44）：消息拒绝回执 on_message_rejected **恒投 web 子平台**，与
+    /// conv 归属无关且**不广播**——带关联 id 的入站消息只可能来自驾驶舱（SPA），
+    /// 而 SPA 可对 `local:` 会话发言：`local:work` 的回执若按归属路由会派给未
+    /// 覆写的 local 平台而丢失。web 子平台收到全部三条且 conv / client_id /
+    /// reason 原样透传；feishu / local 子平台零条（不广播）。
+    #[tokio::test]
+    async fn on_message_rejected_goes_to_web_regardless_of_conv_owner() {
+        use MessageRejectReason::{NotAllowed, PeerUnreachable, QueueFull};
+        let (f, f_rej) = reject_probe("feishu");
+        let (l, l_rej) = reject_probe("local");
+        let (w, w_rej) = reject_probe("web");
+        let m = MultiPlatform::new(vec![f, l, w]).expect("合并 feishu+local+web");
+
+        m.on_message_rejected(&ConvId("web:s-1".into()), "m_web", NotAllowed);
+        m.on_message_rejected(&ConvId("peer:win-a".into()), "m_peer", PeerUnreachable);
+        m.on_message_rejected(&ConvId("local:work".into()), "m_local", QueueFull);
+
+        let got = w_rej.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(
+            got,
+            vec![
+                ("web:s-1".to_string(), "m_web".to_string(), NotAllowed),
+                (
+                    "peer:win-a".to_string(),
+                    "m_peer".to_string(),
+                    PeerUnreachable
+                ),
+                ("local:work".to_string(), "m_local".to_string(), QueueFull),
+            ],
+            "web 子平台收到全部三条（含 local: 会话——来源是驾驶舱），参数原样透传"
+        );
+        assert!(
+            f_rej.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+                && l_rej.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "不广播：IM / 终端子平台不收（local: 会话的回执也不派给 local）"
+        );
+    }
+
+    /// 用例（v1.44）：children 不含 web 时 on_message_rejected 无处可投——静默
+    /// 跳过（不 panic、不落任何子平台）。此时也不可能有带关联 id 的消息进来。
+    #[tokio::test]
+    async fn on_message_rejected_silent_without_web_child() {
+        let (f, f_rej) = reject_probe("feishu");
+        let (l, l_rej) = reject_probe("local");
+        let m = MultiPlatform::new(vec![f, l]).expect("合并 feishu+local");
+        m.on_message_rejected(
+            &ConvId("local:work".into()),
+            "m_local",
+            MessageRejectReason::NotAllowed,
+        );
+        assert!(
+            f_rej.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+                && l_rej.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "无 web 子平台：不落任何子平台"
         );
     }
 

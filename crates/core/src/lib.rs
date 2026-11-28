@@ -67,8 +67,8 @@ pub use platform::{command_card_fallback_text, Platform, PlatformCaps};
 pub use sandbox::{resolve as resolve_sandbox, SandboxPlan, SandboxSpec, SandboxTier};
 pub use types::{
     AgentChunk, CardButton, CardButtonStyle, CardPhase, CardTerminal, ConfigFormField, ConvId,
-    InboundControl, InboundMessage, JoinedChat, LocalSession, MediaRef, Mention, MsgReaction,
-    OutboundCard, ReplyHint, RunOutcome, SessionId, TodoItem, TodoStatus, ToolCall, UsageStats,
-    UserId, Workdir, CARD_HANDLE_LOST,
+    InboundControl, InboundMessage, JoinedChat, LocalSession, MediaRef, Mention,
+    MessageRejectReason, MsgReaction, OutboundCard, ReplyHint, RunOutcome, SessionId, TodoItem,
+    TodoStatus, ToolCall, UsageStats, UserId, Workdir, CARD_HANDLE_LOST,
 };
 pub use workspace::{workdir_key, workspace_key, WorkspaceRecord};

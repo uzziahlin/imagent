@@ -78,7 +78,11 @@ const NONCE_LEN = 24;
  *  v1.41.3 会话删除（conv_delete）同规；v1.42 待审批查询（approvals_query）
  *  同规——应答 approvals 帧载有待审批工具与命令摘要，relay 不可见；v1.43 本地
  *  窗口的查询与关注（windows_query / window_watch）同规——本机有哪些 Claude
- *  Code 窗口、用户盯着哪一个，同样是不该经 relay 明文暴露的本机信息。 */
+ *  Code 窗口、用户盯着哪一个，同样是不该经 relay 明文暴露的本机信息；
+ *  v1.44 网关能力查询（gateway_info_query）同规——应答 gateway_info 载有网关
+ *  版本号（机器上跑的是什么软件，同样不该经 relay 明文暴露）；e2e_close 同规
+ *  ——契约规定它封在 enc 里发出：由本标签页自己的密钥密封，网关删除的正是
+ *  「解开它的那把」密钥，明文发就没有这个绑定。 */
 const BUSINESS_TYPES: ReadonlySet<string> = new Set([
   "message",
   "approval_response",
@@ -95,6 +99,8 @@ const BUSINESS_TYPES: ReadonlySet<string> = new Set([
   "approvals_query",
   "windows_query",
   "window_watch",
+  "gateway_info_query",
+  "e2e_close",
 ]);
 
 // ---------------------------------------------------------------------------

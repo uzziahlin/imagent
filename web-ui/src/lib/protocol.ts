@@ -114,6 +114,18 @@
 //   重启保留：SPA 只发 window_watch 并按快照显示，不保存名单、不对账——各设备
 //   各存一份名单时，「A 设备取消关注」会被 B 设备的对账逻辑立刻补发回来，等于
 //   取消不了。
+// - v1.44 送达回执 + 网关版本 + 标签页关闭：message 帧可选 clientId（本机每次
+//   发送生成一个，见 newClientId）——网关回 ack{machine, clientId, convId,
+//   status, reason?, message?}（业务帧）：received = 已进入网关入站队列，
+//   rejected = Dispatcher 明确拒绝（reason 四值 + 中文 message）。SPA 侧只有
+//   **支持回执的机器**（gateway_info 的 caps 含 "acks"）的本机回显带 ack 状态
+//   （pending → sent / failed / unconfirmed）；不支持的（旧网关）条目不带 ack
+//   字段，界面与此前完全一致。出站 gateway_info_query{machine}（ready 后与该
+//   机器加密会话建立后各查一次）→ 网关回 gateway_info{machine, version, caps}
+//   （旧网关不回 = 不支持）；管理页机器行据此显示「网关 v{version}」。
+//   e2e_close（封在 enc 里的 `{"v":1,"type":"e2e_close"}`）在 pagehide 时对每台
+//   已加密机器各发一帧，通知网关回收本标签页的会话密钥（多标签页并存的修复
+//   在网关侧：每个登录会话保留多把密钥；SPA 不选主）。
 
 export const PROTOCOL_VERSION = 1;
 
@@ -159,6 +171,23 @@ export function newAutoConvName(): string {
   const b = new Uint8Array(2);
   crypto.getRandomValues(b);
   return `s-${Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("")}`;
+}
+
+/** v1.44 客户端消息 id：message 帧可选 clientId，送达回执（ack 帧）按它关联回
+ *  本机回显。形状 `m_` + 时间戳 36 进制 + `_` + 8 位随机十六进制（契约：1..64
+ *  位 [A-Za-z0-9_-]）：时间戳保证跨标签页 / 跨设备不撞，随机位保证同一毫秒内
+ *  连发多条也不撞。crypto 不可用（极老的运行环境）退回 Math.random——这里要的
+ *  只是不重复，不是不可预测。 */
+export function newClientId(): string {
+  const b = new Uint8Array(4);
+  if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+    crypto.getRandomValues(b);
+  } else {
+    for (let i = 0; i < b.length; i++) {
+      b[i] = Math.floor(Math.random() * 256);
+    }
+  }
+  return `m_${Date.now().toString(36)}_${Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("")}`;
 }
 
 /** conv 显示名（用户可见，手动名 > 自动 title > 剥前缀兜底）：自动会话
@@ -304,6 +333,9 @@ export type MessageFrame = {
   machine?: string;
   /** v1.7 可选图片附件（message 已在 E2E 业务帧集合，media 随帧自动加密）。 */
   media?: MediaPayload;
+  /** v1.44 可选客户端消息 id（newClientId）：网关据此回 ack 送达回执。形状不
+   *  合规网关一律当缺席（照旧处理消息）；旧网关忽略该键。SPA 每次发送都带。 */
+  clientId?: string;
 };
 
 export type ApprovalDecision = "allow" | "deny" | "always";
@@ -551,6 +583,27 @@ export type WindowWatchFrame = {
 };
 
 // ---------------------------------------------------------------------------
+// v1.44 送达回执 + 网关版本 + 标签页关闭（浏览器 → 网关，业务帧，E2E 加密；
+// 契约见头注）
+// ---------------------------------------------------------------------------
+
+/** v1.44 查询某机器网关的版本与可选能力：网关回 gateway_info{machine, version,
+ *  caps}。machine 同 message 族路由约定（多机模式必须带；契约里没有 `name`
+ *  之类的其它必填字段）。peer 通道是否启用无关，新网关都回；旧网关不认识该
+ *  帧、不回任何帧——SPA 以「有没有回帧」判定是否支持回执。 */
+export type GatewayInfoQueryFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "gateway_info_query";
+  machine?: string;
+};
+
+/** v1.44 标签页关闭通知：封在 enc 里的业务帧，字面即契约原文
+ *  `{"v":1,"type":"e2e_close"}`——**不带 machine**（中继按 enc 信封的 machine
+ *  路由）。网关解开后删除解开它的那把会话密钥，不回任何帧；旧网关解开后按
+ *  未知类型忽略。SPA 只在 pagehide 时发（WsManager）。 */
+export type E2eCloseFrame = { v: typeof PROTOCOL_VERSION; type: "e2e_close" };
+
+// ---------------------------------------------------------------------------
 // v1.4 E2E 中继盲化（密码学构造与编码规约见 lib/e2e.ts 头注）
 // ---------------------------------------------------------------------------
 
@@ -604,7 +657,9 @@ export type OutboundFrame =
   | ConvDeleteFrame
   | ApprovalsQueryFrame
   | WindowsQueryFrame
-  | WindowWatchFrame;
+  | WindowWatchFrame
+  | GatewayInfoQueryFrame
+  | E2eCloseFrame;
 
 /** 出站帧序列化（undefined 字段不序列化，与网关入站解析兼容）。 */
 export function encodeFrame(frame: OutboundFrame): string {
@@ -948,6 +1003,53 @@ export type WindowsFrame = {
   items: WindowInfo[];
 };
 
+// ---------------------------------------------------------------------------
+// v1.44 送达回执 + 网关版本（网关 → 浏览器，E2E 业务帧，经 enc 解密后进 reducer）
+// ---------------------------------------------------------------------------
+
+/** ack 帧的两种状态：received = 网关已收到并接下这条消息（进入入站队列后立即
+ *  发出；证明的是「到达了网关」）；rejected = Dispatcher 在明确的丢弃点拒绝。 */
+export type AckStatus = "received" | "rejected";
+
+/** ack{rejected} 的原因码（契约四值；message 是对应的中文人话）。 */
+export type AckReason = "not_allowed" | "queue_full" | "peer_unreachable" | "malformed";
+
+/** 本机回显（user 条目）的送达状态（仅支持回执的机器才有，见 StreamEntry.user）：
+ *  pending = 已发出、等回执；sent = 网关已收到（received）；failed = 网关明确
+ *  拒绝（rejected）；unconfirmed = 等不到回执（超时 / 断线 / 进程重启后无从
+ *  得知）——迟到的 received 仍会把它翻回 sent。 */
+export type AckState = "pending" | "sent" | "failed" | "unconfirmed";
+
+/** v1.44 送达回执：按 clientId 关联回本机回显（字段名与键序照契约：v / type /
+ *  machine / clientId / convId / status / reason / message，后两者缺席省略）。
+ *  同一 clientId 至多一条 received 和一条 rejected，received 恒先到。只有带
+ *  合规 clientId 的 message 帧才会收到回执；别的设备发的消息在本机找不到对应
+ *  条目，忽略。 */
+export type AckFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "ack";
+  machine: string;
+  clientId: string;
+  convId: string;
+  status: AckStatus;
+  reason?: AckReason;
+  message?: string;
+};
+
+/** v1.44 网关版本与可选能力（gateway_info_query 的应答；键序照契约：v / type /
+ *  machine / version / caps）。version = 网关 CARGO_PKG_VERSION；caps = 可选
+ *  能力字面量数组，目前只有 "acks"（支持送达回执）。旧网关不回这个帧。 */
+export type GatewayInfoFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "gateway_info";
+  machine: string;
+  version: string;
+  caps: string[];
+};
+
+/** gateway_info 落表后的条目形态（AppState.gatewayInfo 的值）。 */
+export type GatewayInfo = { version: string; caps: string[] };
+
 /** 窗口名 → 它的会话 id（v1.41 起 `peer:<窗口名>` 会话已存在：本地 select_conv
  *  即可打开，发文本即投递该窗口，窗口回信落同一会话）。 */
 export function peerConvOf(name: string): string {
@@ -1052,7 +1154,9 @@ export type InboundFrame =
   | HistoryFrame
   | AsrResultFrame
   | ApprovalsFrame
-  | WindowsFrame;
+  | WindowsFrame
+  | AckFrame
+  | GatewayInfoFrame;
 
 // ---------------------------------------------------------------------------
 // parseFrame：v/type 校验 + 每类帧关键字段存在性校验，非法返回 null（不抛）
@@ -1315,6 +1419,30 @@ const RESOLVED_DECISIONS: readonly string[] = ["allow", "deny", "always", "cance
 const ackIdentityOk = (o: Record<string, unknown>): boolean =>
   isStr(o, "ik") || isStr(o, "id") || isStr(o, "pk");
 
+const ACK_STATUSES: readonly string[] = ["received", "rejected"];
+const ACK_REASONS: readonly string[] = ["not_allowed", "queue_full", "peer_unreachable", "malformed"];
+
+/** v1.44 ack 帧形状：machine / clientId / convId 非空字符串；status 两值之一；
+ *  rejected 必须带 reason（四值之一）与 message（字符串），received 不得带这
+ *  两个键。任一不符整帧拒收——回执会把用户消息标成「未送达」或翻回「已送达」，
+ *  半份可疑数据不能拿去改写界面（与 approvals / windows 同纪律）。 */
+const ackOk = (o: Record<string, unknown>): boolean =>
+  isNonEmptyStr(o, "machine") &&
+  isNonEmptyStr(o, "clientId") &&
+  isNonEmptyStr(o, "convId") &&
+  typeof o.status === "string" &&
+  ACK_STATUSES.includes(o.status) &&
+  (o.status === "rejected"
+    ? typeof o.reason === "string" && ACK_REASONS.includes(o.reason) && isStr(o, "message")
+    : o.reason === undefined && o.message === undefined);
+
+/** v1.44 gateway_info 帧：machine / version 非空字符串，caps 为字符串数组。 */
+const gatewayInfoOk = (o: Record<string, unknown>): boolean =>
+  isNonEmptyStr(o, "machine") &&
+  isNonEmptyStr(o, "version") &&
+  Array.isArray(o.caps) &&
+  o.caps.every((c) => typeof c === "string");
+
 /** 入站帧类型表：type → 关键字段校验（前向兼容靠“未知 type → null”由调用方忽略）。 */
 const INBOUND_CHECKS: Record<string, FieldCheck> = {
   machine: (o) => typeof o.online === "boolean",
@@ -1396,6 +1524,13 @@ const INBOUND_CHECKS: Record<string, FieldCheck> = {
     typeof o.hookInstalled === "boolean" &&
     Array.isArray(o.items) &&
     o.items.every(windowOk),
+  // v1.44 送达回执：machine / clientId / convId 非空；status 与 rejected 的
+  // reason 限定在契约字面量内，received / rejected 各自的必带与禁带键逐项核对
+  // （ackOk），不符整帧拒收。
+  ack: ackOk,
+  // v1.44 网关版本与能力：machine / version 非空、caps 为字符串数组
+  // （gatewayInfoOk）。它决定该机器的消息显不显示送达状态，畸形帧不采纳。
+  gateway_info: gatewayInfoOk,
 };
 
 /** 解析一条入站文本帧：信封 v=1 + 已知 type + 关键字段齐备才放行，否则 null。 */
@@ -1436,6 +1571,18 @@ export type StreamEntry =
        *  重放），**不是本机回显**——实时去重只认本机回显（send_echo，无此
        *  标记），否则观看端连续两条同文镜像会被误吞一条。渲染无差异。 */
       self?: boolean;
+      /** v1.44：本机回显的客户端消息 id（send_echo 落条目时带入；镜像补回的
+       *  条目没有）。键 user:<clientId> 即由它派生——回执按这个字段（不是键）
+       *  关联，IndexedDB 恢复加 h: 前缀后照样找得到。 */
+      clientId?: string;
+      /** v1.44 送达状态（AckState）：仅**发出时该机器支持回执**的回显才带；
+       *  不支持回执的机器（旧网关）与所有镜像条目不带该字段，界面与此前一致。 */
+      ack?: AckState;
+      /** ack === "failed" 时网关给的中文原因（ack 帧 rejected 的 message）。 */
+      ackReason?: string;
+      /** v1.44：true = 这条消息带图（纯图时 text 是占位「[图片]」）。图片本体发送
+       *  后即丢弃，回显里没有它——这样的消息无法原样重发，界面不给「重发」。 */
+      image?: boolean;
     }
   | { kind: "text"; key: string; text: string; hint?: string; at?: number }
   | { kind: "card"; key: string; messageId: string; card: CardPayload; state: CardFrameState }
@@ -1535,6 +1682,11 @@ export type AppState = {
    *  机器的键 = 从未收到过它的快照（旧网关 / 未启用 peer 通道）——侧栏不显示
    *  「本地窗口」区块。 */
   windows: Record<string, MachineWindows>;
+  /** v1.44 逐机器网关版本与能力（gateway_info 帧按来源机器落表，整体替换）。
+   *  没有某机器的键 = 这个加密会话里没收到过它的应答（旧网关 / 尚未回）——
+   *  即「不支持回执」，该机器的本机回显不带 ack 状态。加密会话换代
+   *  （gateway_info_forget）时清掉：上一代会话里问到的能力对新进程不算数。 */
+  gatewayInfo: Record<string, GatewayInfo>;
   lastError: { code: string; at: number } | null;
   lastNotice: MachineNotice | null;
 };
@@ -1599,6 +1751,7 @@ export function initialState(): AppState {
     rotatedToken: null,
     workspaces: {},
     windows: {},
+    gatewayInfo: {},
     lastError: null,
     lastNotice: null,
   };
@@ -1606,7 +1759,16 @@ export function initialState(): AppState {
 
 export type Action =
   | { type: "frame"; frame: InboundFrame }
-  | { type: "send_echo"; convId: string; text: string; machine?: string }
+  /** v1.44：clientId 由调用方（App）生成并传入——reducer 保持纯函数，条目键
+   *  user:<clientId>；该机器支持回执时条目带 ack:"pending"。image = 这条消息
+   *  带图（条目带上 image 标记，界面不给重发）。 */
+  | { type: "send_echo"; convId: string; text: string; clientId: string; machine?: string; image?: boolean }
+  /** v1.44 送达回执超时：把该机器该会话里仍是 pending 的那条回显置为
+   *  unconfirmed（App 的定时 effect 按 timedOutAcks 的结果派发）。 */
+  | { type: "ack_timeout"; machine: string; convId: string; clientId: string }
+  /** v1.44 该机器的加密会话已换代（E2E active）：作废上一代会话里问到的网关
+   *  能力并重查（App 层随即发 gateway_info_query）。 */
+  | { type: "gateway_info_forget"; machine: string }
   | { type: "approval_sent"; convId: string; requestId: string; machine?: string }
   /** 用户在机器切换器点选机器（currentConv 同时回到该机器默认会话）。 */
   | { type: "select_machine"; machine: string }
@@ -1716,7 +1878,8 @@ function appendEntry(
   // user/text 盖到达时间戳（approval_note 不展示时间）。v1.36：text 帧自带的
   // 网关落盘同源 at（实时帧与 outbound_log 行同值）必须保留——mergeHistory 的
   // 重放去重按 (text, at) 精确匹配，此处若盖本地时间会破坏同源事实致去重恒
-  // 不命中；user 回显与旧网关 text（无 at）仍盖本地到达时间。
+  // 不命中；user 回显与旧网关 text（无 at）仍盖本地到达时间。v1.44：user 回显
+  // 的这个时间戳即「发出时刻」，送达回执的超时判定（timedOutAcks）以它计时。
   const stamped: StreamEntry =
     entry.kind === "user" || (entry.kind === "text" && entry.at === undefined)
       ? { ...entry, at: Date.now() }
@@ -2344,6 +2507,139 @@ function sameWindows(a: readonly WindowInfo[], b: readonly WindowInfo[]): boolea
   );
 }
 
+// ---- v1.44 送达回执：本机回显的 ack 状态（见文件头注）----
+
+/** 本机回显条目（StreamEntry 的 user 变体）。 */
+type UserEntry = Extract<StreamEntry, { kind: "user" }>;
+
+/** 发出后等回执的上限（ms）：超过即按 unconfirmed 处理。 */
+export const ACK_TIMEOUT_MS = 15_000;
+/** WS 不在 ready 时等回执的上限（ms）：连接断了回执就到不了，不必干等 15 秒。 */
+export const ACK_OFFLINE_TIMEOUT_MS = 2_000;
+/** 超时判定的巡检间隔（ms，App 的定时 effect）。 */
+export const ACK_TIMEOUT_TICK_MS = 2_000;
+
+/** ack_timeout 动作的载荷：一条待收敛的回执的定位。 */
+export type AckRef = { machine: string; convId: string; clientId: string };
+
+/** 该机器当前是否支持送达回执（gateway_info 的 caps 含 "acks"）。没有该机器的
+ *  能力记录 = 不支持（旧网关不回 gateway_info）。 */
+export function machineSupportsAcks(state: AppState, machine: string): boolean {
+  return state.gatewayInfo[machine]?.caps.includes("acks") ?? false;
+}
+
+/** 送达回执超时判定（App 的定时 effect 每轮调用；纯函数，now 由调用方传入）：
+ *  列出该转为 unconfirmed 的回显。只看**支持回执的机器**上仍 pending 的条目
+ *  ——不支持回执的机器永远不会回 ack，对它计时等于把旧网关上的消息都标成
+ *  「未确认送达」。两条规则满足其一即超时：发出已满 ACK_TIMEOUT_MS；或 WS
+ *  不在 ready 且发出已满 ACK_OFFLINE_TIMEOUT_MS。 */
+export function timedOutAcks(state: AppState, now: number, wsReady: boolean): AckRef[] {
+  const out: AckRef[] = [];
+  for (const [machine, space] of Object.entries(state.spaces)) {
+    if (!machineSupportsAcks(state, machine)) {
+      continue;
+    }
+    for (const [convId, conv] of Object.entries(space.convs)) {
+      for (const e of conv.entries) {
+        if (e.kind !== "user" || e.ack !== "pending" || e.clientId === undefined) {
+          continue;
+        }
+        const age = now - (e.at ?? now);
+        if (age >= ACK_TIMEOUT_MS || (!wsReady && age >= ACK_OFFLINE_TIMEOUT_MS)) {
+          out.push({ machine, convId, clientId: e.clientId });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/** 定位并改写某机器某会话里指定 clientId 的本机回显。找不到（别的设备发的
+ *  消息 / 条目已被内存护栏裁掉）或改写后与原条目相同 → 原 state（免无谓渲染）。 */
+function patchEcho(
+  state: AppState,
+  machine: string,
+  convId: string,
+  clientId: string,
+  patch: (entry: UserEntry) => UserEntry,
+): AppState {
+  const space = spaceOf(state, machine);
+  const conv = space.convs[convId];
+  if (!conv) {
+    return state;
+  }
+  const idx = conv.entries.findIndex((e) => e.kind === "user" && e.clientId === clientId);
+  const cur = idx === -1 ? undefined : conv.entries[idx];
+  if (!cur || cur.kind !== "user") {
+    return state;
+  }
+  const next = patch(cur);
+  if (next === cur) {
+    return state;
+  }
+  const entries = conv.entries.slice();
+  entries[idx] = next;
+  return {
+    ...state,
+    spaces: {
+      ...state.spaces,
+      [machine]: { ...space, convs: { ...space.convs, [convId]: { ...conv, entries } } },
+    },
+  };
+}
+
+/** v1.44 ack 帧 → 同 clientId 的本机回显：received → sent 并清掉原因（迟到的
+ *  received 把 unconfirmed 翻回 sent；已是 sent 再收到不变）；rejected → failed
+ *  并记下网关给的中文原因（ackReason）。回执先于本机回显到达、或属于别的设备
+ *  发的消息时找不到条目——忽略。 */
+function applyAck(state: AppState, frame: AckFrame): AppState {
+  if (frame.status === "received") {
+    return patchEcho(state, frame.machine, frame.convId, frame.clientId, (e) => {
+      if (e.ack === "sent" && e.ackReason === undefined) {
+        return e;
+      }
+      // 原因随失败态一起消失：键整个摘掉（留下 ackReason: undefined 的空键会让
+      // 「有没有原因」在 IndexedDB 恢复后仍然为真）。
+      const { ackReason: _dropped, ...rest } = e;
+      return { ...rest, ack: "sent" };
+    });
+  }
+  return patchEcho(state, frame.machine, frame.convId, frame.clientId, (e) =>
+    e.ack === "failed" && e.ackReason === frame.message ? e : { ...e, ack: "failed", ackReason: frame.message },
+  );
+}
+
+/** 某机器失去回执能力时（加密会话换代 / 网关改报不支持），把它名下还在等回执的
+ *  回显按 unconfirmed 收敛：上一代会话的回执不会再补发，留着 pending 就是一直
+ *  「发送中」。迟到的 received 照常能把它们翻回 sent。无此类条目返回原 state。 */
+function settlePendingAcks(state: AppState, machine: string): AppState {
+  const space = spaceOf(state, machine);
+  let convs = space.convs;
+  let changed = false;
+  for (const [convId, conv] of Object.entries(space.convs)) {
+    let entries = conv.entries;
+    for (let i = 0; i < conv.entries.length; i++) {
+      const e = conv.entries[i];
+      if (e.kind === "user" && e.ack === "pending") {
+        if (entries === conv.entries) {
+          entries = conv.entries.slice();
+        }
+        entries[i] = { ...e, ack: "unconfirmed" };
+      }
+    }
+    if (entries !== conv.entries) {
+      convs = { ...convs, [convId]: { ...conv, entries } };
+      changed = true;
+    }
+  }
+  return changed ? { ...state, spaces: { ...state.spaces, [machine]: { ...space, convs } } } : state;
+}
+
+/** 两个字符串数组是否逐项相同（同序）。 */
+function sameStrings(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((x, i) => x === b[i]);
+}
+
 function reduceFrame(state: AppState, frame: InboundFrame): AppState {
   switch (frame.type) {
     case "hello_ack":
@@ -2474,6 +2770,24 @@ function reduceFrame(state: AppState, frame: InboundFrame): AppState {
         },
       };
     }
+    case "ack":
+      // v1.44 送达回执：按 clientId 改写本机回显的 ack 状态（见 applyAck）
+      return applyAck(state, frame);
+    case "gateway_info": {
+      // v1.44 网关版本与能力：按来源机器整体替换；内容相同时返回原 state
+      // （重连后的重复应答不该让管理页重渲染）。
+      const machine = frame.machine;
+      const cur = state.gatewayInfo[machine];
+      if (cur && cur.version === frame.version && sameStrings(cur.caps, frame.caps)) {
+        return state;
+      }
+      const next: AppState = {
+        ...state,
+        gatewayInfo: { ...state.gatewayInfo, [machine]: { version: frame.version, caps: frame.caps } },
+      };
+      // 网关改报不支持回执（换成了旧二进制）：它名下还在等回执的回显无从确认。
+      return machineSupportsAcks(next, machine) ? next : settlePendingAcks(next, machine);
+    }
   }
 }
 
@@ -2481,13 +2795,43 @@ export function reducer(state: AppState, action: Action): AppState {
   switch (action.type) {
     case "frame":
       return reduceFrame(state, action.frame);
-    case "send_echo":
+    case "send_echo": {
       // machine 缺省落 default 空间（既有单机测试路径兼容）
-      return appendEntry(state, action.machine ?? DEFAULT_MACHINE, action.convId, {
+      const machine = action.machine ?? DEFAULT_MACHINE;
+      // v1.44：键取 user:<clientId>（每次发送全局唯一，刷新后 seq 归零也不会
+      // 与恢复条目撞键）；回显恒带 clientId 供迟到的回执关联。ack:"pending"
+      // 只在**发出时该机器支持回执**才带——不支持的机器永远不会回 ack，带上
+      // 就是一直「发送中」，刷新后还会被当成未确认送达。
+      const acked = machineSupportsAcks(state, machine);
+      return appendEntry(state, machine, action.convId, {
         kind: "user",
-        key: `user:${state.seq + 1}`,
+        key: `user:${action.clientId}`,
         text: action.text,
+        clientId: action.clientId,
+        ...(acked ? { ack: "pending" } : {}),
+        ...(action.image ? { image: true } : {}),
       });
+    }
+    case "ack_timeout":
+      // v1.44 超时收敛：只动仍是 pending 的那条（其间已收到回执 / 已被会话换代
+      // 收敛的不碰）
+      return patchEcho(state, action.machine, action.convId, action.clientId, (e) =>
+        e.ack === "pending" ? { ...e, ack: "unconfirmed" } : e,
+      );
+    case "gateway_info_forget": {
+      // v1.44 加密会话换代：上一代会话里问到的能力作废——网关可能已换进程 /
+      // 换成旧二进制，而「不回帧」才等于不支持，留着旧记录就再也判不出来
+      // （旧记录下每条新消息都会 pending → 超时 →「未确认送达」+ 诱导重发）。
+      // 仍在等回执的回显随之收敛；App 层随后重查，新网关很快把记录补回来。
+      const machine = action.machine;
+      const settled = settlePendingAcks(state, machine);
+      if (state.gatewayInfo[machine] === undefined) {
+        return settled;
+      }
+      const gatewayInfo = { ...state.gatewayInfo };
+      delete gatewayInfo[machine];
+      return { ...settled, gatewayInfo };
+    }
     case "approval_sent": {
       const machine = action.machine ?? DEFAULT_MACHINE;
       const space = state.spaces[machine];

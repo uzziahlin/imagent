@@ -27,7 +27,10 @@
 //!   （mime 须 image/*、b64 解码 ≤8MB）→ 落盘 `<imagent_home>/media/
 //!   up-<unix_ms>-<安全化name>`（目录 0755、文件 0600）→ 合成
 //!   InboundMessage（text 非空才 Some）投回 inbound channel；任一步失败回
-//!   error 帧（media_too_large / media_invalid）且不投递。
+//!   error 帧（media_too_large / media_invalid）且不投递。v1.44：帧带合规
+//!   `clientId` 时，合成消息进入 inbound channel 成功后回一帧 `ack{received}`
+//!   （纯文本消息的同一回执由 client 层发——`Platform::on_message_rejected`
+//!   的 `ack{rejected}` 在本平台覆写里出站）。
 //! - 出站落盘 + history 泵（v1.8 会话历史重放）：send_text / card 终态帧
 //!   （state=="done"）出站成功后异步落 store `outbound_log`（spawn 短任务
 //!   不阻塞热路径；同 messageId 终态只落一次；流式中间帧 / sync 重发不落）；
@@ -59,8 +62,8 @@ use imagent_core::peer::{PeerState, WindowEvent, WindowEventKind, WindowInfo};
 use imagent_core::{
     validate_workdir,
     workspace::{workdir_key, workspace_key, WorkspaceRecord, WORKDIR_PREFIX, WORKSPACE_PREFIX},
-    ConvId, CoreError, InboundMessage, MediaRef, OutboundCard, PermissionReply, Platform,
-    PlatformCaps, ReplyHint, Result,
+    ConvId, CoreError, InboundMessage, MediaRef, MessageRejectReason, OutboundCard,
+    PermissionReply, Platform, PlatformCaps, ReplyHint, Result,
 };
 
 use crate::client::WebClient;
@@ -68,12 +71,12 @@ use crate::e2e::E2eIdentity;
 use crate::models::{resolve_models, CliSource, ModelsContext};
 use crate::titles::{TitleCandidate, TitleGen};
 use crate::{
-    encode_approval_request_frame, encode_approval_resolved_frame, encode_approvals_frame,
-    encode_asr_result_frame, encode_card_frame, encode_conv_workdir_frame, encode_error_frame,
-    encode_history_frame, encode_text_frame, encode_user_text_frame, encode_windows_frame,
-    encode_workspaces_frame, history_entry_from_row, push_notify_title, session_title, CardPayload,
-    GatewayCredential, InboundAction, PushEvent, PushNotifyKind, SessionEntryFrame,
-    WorkspaceEntryFrame, TARGET,
+    encode_ack_frame, encode_approval_request_frame, encode_approval_resolved_frame,
+    encode_approvals_frame, encode_asr_result_frame, encode_card_frame, encode_conv_workdir_frame,
+    encode_error_frame, encode_history_frame, encode_text_frame, encode_user_text_frame,
+    encode_windows_frame, encode_workspaces_frame, history_entry_from_row, push_notify_title,
+    session_title, AckStatus, CardPayload, GatewayCredential, InboundAction, PushEvent,
+    PushNotifyKind, SessionEntryFrame, WorkspaceEntryFrame, TARGET,
 };
 
 const PLATFORM: &str = "web";
@@ -1135,6 +1138,11 @@ async fn serve_media_messages(
 /// （半途写坏的文件留给媒体目录 7 天 GC）。已知取舍：媒体消息经本泵多一跳，
 /// 与随后到达的纯文本消息可能乱序——dispatch 按 conv 队列消费，影响仅为
 /// 用户主动「先图后文」的展示序，不破坏正确性。
+///
+/// v1.44：帧带合规 `clientId` 时，合成消息**进入 inbound channel 成功之后**
+/// 回一帧 `ack{received}`（与 client 层对纯文本消息的回执同一语义、同一时刻
+/// 定义；媒体消息多这一跳，「已接下」的时刻在泵里而不是 client 层）。解码 /
+/// 校验 / 落盘失败走 error 帧（toast），不发任何回执。
 async fn process_media_message(
     machine: &str,
     media_dir: &Path,
@@ -1142,7 +1150,13 @@ async fn process_media_message(
     inbound_tx: &mpsc::Sender<InboundMessage>,
     outbound_tx: &mpsc::Sender<String>,
 ) {
-    let InboundAction::MediaMessage { conv, text, media } = act else {
+    let InboundAction::MediaMessage {
+        conv,
+        text,
+        media,
+        client_id,
+    } = act
+    else {
         debug!(target: TARGET, "媒体泵收到非媒体动作，忽略");
         return;
     };
@@ -1194,6 +1208,10 @@ async fn process_media_message(
             return;
         }
     };
+    // 回执要素在 client_id 被 move 进合成消息之前取出。
+    let receipt = client_id
+        .as_ref()
+        .map(|client_id| (conv.clone(), client_id.clone()));
     let msg = crate::synth_media_message(
         conv.clone(),
         text,
@@ -1203,6 +1221,7 @@ async fn process_media_message(
             kind: media.mime.clone(),
             url: path.to_string_lossy().into_owned(),
         }],
+        client_id,
     );
     info!(
         target: TARGET,
@@ -1212,10 +1231,32 @@ async fn process_media_message(
         "媒体上行：已落盘并投递"
     );
     // 与 client 直投同款 1s 有界背压：dispatch 消费抖动不丢消息，持续满才丢弃。
+    let mut delivered = false;
     match tokio::time::timeout(Duration::from_secs(1), inbound_tx.send(msg)).await {
-        Ok(Ok(())) => {}
+        Ok(Ok(())) => delivered = true,
         Ok(Err(_)) => warn!(target: TARGET, "入站 channel 已关闭（platform 退出），丢弃媒体消息"),
         Err(_) => warn!(target: TARGET, "入站 channel 持续满 1s，丢弃媒体消息"),
+    }
+    // v1.44：只有真正进了入站 channel 才算「网关已收到」。
+    if let Some((conv, client_id)) = receipt.filter(|_| delivered) {
+        match encode_ack_frame(machine, &client_id, &conv, AckStatus::Received) {
+            Ok(json) => enqueue_ack_best_effort(outbound_tx, json),
+            Err(e) => warn!(target: TARGET, error = %e, "ack 帧序列化失败"),
+        }
+    }
+}
+
+/// v1.44 `ack` 帧入队（best-effort）：出站队列满 / 通道关闭只 debug、不重试
+/// ——回执丢一条的后果只是浏览器把那条消息判成「未确认送达」，用户可重发。
+/// 与 [`enqueue_best_effort`]（warn：快照 / error 帧）分级不同，日志文案也
+/// 不带「工作空间」。
+fn enqueue_ack_best_effort(outbound_tx: &mpsc::Sender<String>, json: String) {
+    if let Err(e) = outbound_tx.try_send(json) {
+        debug!(
+            target: TARGET,
+            error = %e,
+            "ack 帧入队失败（队列满 / 通道关闭），丢弃（浏览器超时判定兜底）"
+        );
     }
 }
 
@@ -1737,7 +1778,8 @@ impl WebPlatform {
         let peer_state: Arc<Mutex<Option<Arc<PeerState>>>> = Arc::new(Mutex::new(None));
 
         // client 任务：连接立即开始（断线自动重连）。workspace_tx 留一份
-        // clone 给平台主体（v1.41.3 on_conv_deleted 快照触发用）。
+        // clone 给平台主体（v1.41.3 on_conv_deleted 快照触发用）；outbound_tx
+        // 也留一份给 client（v1.44：ack / gateway_info 自发帧入队）。
         let client = WebClient {
             relay_url: relay_url.clone(),
             credential,
@@ -1746,6 +1788,7 @@ impl WebPlatform {
             online: online.clone(),
             e2e,
             inbound_tx: inbound_tx.clone(),
+            outbound_tx: outbound_tx.clone(),
             sync_tx,
             workspace_tx: workspace_tx.clone(),
             media_tx,
@@ -2137,6 +2180,29 @@ impl Platform for WebPlatform {
         self.spawn_push_notify(kind, &conv.0, push_notify_title(window));
     }
 
+    /// v1.44 消息拒绝回执（trait 语义见 `Platform::on_message_rejected`）：入队
+    /// 一帧 `ack{rejected, reason, message}`，SPA 在该 conv 里按 clientId 把
+    /// 用户那条消息标成「未送达：<原因>」+ 重发按钮。字面量取 core 的
+    /// `MessageRejectReason`（单一事实源）。同步钩子：只做一次 `try_send`，
+    /// best-effort——出站队列满只 debug（浏览器超时判定兜底）。与既有的
+    /// `peer_unreachable` error 帧 / 白名单引导文案 / 排队告警文本**并存**：
+    /// 那些不带关联 id，回执只是多一条能落到具体消息上的信号。
+    fn on_message_rejected(&self, conv: &ConvId, client_id: &str, reason: MessageRejectReason) {
+        let frame = encode_ack_frame(
+            &self.machine_id,
+            client_id,
+            &conv.0,
+            AckStatus::Rejected {
+                reason: reason.code(),
+                message: reason.text(),
+            },
+        );
+        match frame {
+            Ok(json) => enqueue_ack_best_effort(&self.outbound_tx, json),
+            Err(e) => warn!(target: TARGET, error = %e, "ack 帧序列化失败"),
+        }
+    }
+
     /// v1.41.3 会话删除钩子（/rm 命令收尾——dispatch 已删完 store 两处）：
     /// 卡片缓存按 conv 移除（sync 重发不再复活已删会话）+ 触发一次
     /// workspaces 快照（经 workspace 通道让泵回全量快照，SPA 侧栏权威收敛）。
@@ -2440,6 +2506,35 @@ mod tests {
         let (tx, rx) = mpsc::channel::<String>(OUTBOUND_CHANNEL_CAPACITY);
         p.outbound_tx = tx;
         (p, rx)
+    }
+
+    /// v1.44 `on_message_rejected`：三种原因各入队恰一帧 `ack{rejected}`
+    /// （字节级；reason / message 取 core 的 `MessageRejectReason` 字面量），
+    /// machine 为本机身份，不带任何其它出站帧。
+    #[tokio::test]
+    async fn on_message_rejected_enqueues_rejected_ack() {
+        use imagent_core::MessageRejectReason::{NotAllowed, PeerUnreachable, QueueFull};
+        let (p, mut rx) = offline_platform_with_outbound_capture(test_store().await).await;
+        for (reason, code, text) in [
+            (NotAllowed, "not_allowed", "发送者未获授权，消息未被处理"),
+            (QueueFull, "queue_full", "排队消息过多，这条被丢弃"),
+            (
+                PeerUnreachable,
+                "peer_unreachable",
+                "窗口不在线或已退出，消息未送达",
+            ),
+        ] {
+            p.on_message_rejected(&ConvId("web:s-1".into()), "m_1a2b3c4d", reason);
+            let frame = rx.try_recv().expect("应恰有一帧 ack 入队");
+            assert_eq!(
+                frame,
+                format!(
+                    r#"{{"v":1,"type":"ack","machine":"test-mac","clientId":"m_1a2b3c4d","convId":"web:s-1","status":"rejected","reason":"{code}","message":"{text}"}}"#
+                )
+            );
+        }
+        assert!(rx.try_recv().is_err(), "恰三帧，无多余出站帧");
+        drop(p);
     }
 
     /// Drop 平台必须 cancel 停机信号（后台任务连动退出）。
@@ -3305,6 +3400,7 @@ mod tests {
                 mime: mime.into(),
                 b64: b64.into(),
             },
+            client_id: None,
         }
     }
 
@@ -3344,6 +3440,7 @@ mod tests {
                     mime: "image/png".into(),
                     b64: media_b64(&bytes),
                 },
+                client_id: None,
             },
         )
         .await;
@@ -3351,6 +3448,7 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         let m = &msgs[0];
         assert_eq!(m.conv_id, ConvId("web:work".into()));
+        assert_eq!(m.client_id, None, "帧无 clientId → None");
         assert_eq!(m.text.as_deref(), Some("看这张图"));
         assert_eq!(m.media.len(), 1);
         assert_eq!(m.media[0].kind, "image/png");
@@ -3384,11 +3482,101 @@ mod tests {
                     mime: "image/png".into(),
                     b64: media_b64(&bytes),
                 },
+                client_id: None,
             },
         )
         .await;
         assert!(frames.is_empty());
         assert_eq!(msgs[0].text, None, "空串说明归一为 None");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// v1.44 媒体消息的 `received` 回执：带 clientId 的动作在合成消息进入
+    /// inbound channel 之后，出站恰一帧 ack（字节级），且 client_id 随
+    /// InboundMessage 带入；不带 clientId 的动作无任何出站帧（旧 SPA 如旧）。
+    #[tokio::test]
+    async fn media_message_received_ack_after_inbound_enqueue() {
+        let dir = media_dir();
+        let bytes = b"\x89PNG\r\n\x1a\nfake-png-body".to_vec();
+        let (frames, msgs) = run_media(
+            &dir,
+            InboundAction::MediaMessage {
+                conv: "web:s-1".into(),
+                text: Some("看图".into()),
+                media: MediaPayload {
+                    name: "shot.png".into(),
+                    mime: "image/png".into(),
+                    b64: media_b64(&bytes),
+                },
+                client_id: Some("m_img00001".into()),
+            },
+        )
+        .await;
+        assert_eq!(msgs.len(), 1, "合成消息进入入站 channel");
+        assert_eq!(msgs[0].client_id.as_deref(), Some("m_img00001"));
+        assert_eq!(frames.len(), 1, "恰一帧 received ack：{frames:?}");
+        assert_eq!(frames[0]["type"], "ack");
+        assert_eq!(frames[0]["clientId"], "m_img00001");
+        assert_eq!(frames[0]["convId"], "web:s-1");
+        assert_eq!(frames[0]["status"], "received");
+        assert_eq!(frames[0]["machine"], TEST_MACHINE);
+        assert!(
+            frames[0].get("reason").is_none() && frames[0].get("message").is_none(),
+            "received 不带 reason / message"
+        );
+
+        // 不带 clientId：无出站帧。
+        let (frames, msgs) =
+            run_media(&dir, media_act("b.png", "image/png", &media_b64(&bytes))).await;
+        assert!(frames.is_empty(), "无 clientId 不发回执：{frames:?}");
+        assert_eq!(msgs[0].client_id, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// v1.44 入站 channel 打满：媒体落盘后合成消息等 1s 被丢弃，**不得发
+    /// received**（与 client 层纯文本消息同一纪律——回执只在真正进入 channel
+    /// 之后发）。1s 是被测代码的有界背压常量。
+    #[tokio::test]
+    async fn media_message_no_received_ack_when_inbound_full() {
+        let dir = media_dir();
+        let bytes = b"\x89PNG\r\n\x1a\nfake-png-body".to_vec();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<String>(32);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(1);
+        // 占满唯一的槽位。
+        inbound_tx
+            .send(crate::synth_message(
+                "web:x".into(),
+                "占位".into(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let act = InboundAction::MediaMessage {
+            conv: "web:s-1".into(),
+            text: None,
+            media: MediaPayload {
+                name: "shot.png".into(),
+                mime: "image/png".into(),
+                b64: media_b64(&bytes),
+            },
+            client_id: Some("m_img00002".into()),
+        };
+        process_media_message(TEST_MACHINE, &dir, act, &inbound_tx, &outbound_tx).await;
+        let mut frames = Vec::new();
+        while let Ok(json) = outbound_rx.try_recv() {
+            frames.push(serde_json::from_str::<serde_json::Value>(&json).unwrap());
+        }
+        assert!(
+            frames.is_empty(),
+            "没进 channel：不得发 received：{frames:?}"
+        );
+        let m = inbound_rx.try_recv().expect("占位消息仍在");
+        assert_eq!(m.text.as_deref(), Some("占位"));
+        assert!(
+            inbound_rx.try_recv().is_err(),
+            "被丢弃的合成消息不在 channel"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

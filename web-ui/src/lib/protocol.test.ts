@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  ACK_OFFLINE_TIMEOUT_MS,
+  ACK_TIMEOUT_MS,
   CONV_TITLE_MAX_CHARS,
   DEFAULT_CONV,
   DEFAULT_MACHINE,
@@ -13,22 +15,28 @@ import {
   isAutoConv,
   machineNameValid,
   machinePubkeyValid,
+  machineSupportsAcks,
   newAutoConvName,
+  newClientId,
   normalizeExpiryMs,
   parseFrame,
   peerConvOf,
   relativeTime,
   reducer,
   spaceOf,
+  timedOutAcks,
   waitingForText,
   windowStatusText,
   workspaceNameValid,
   type Action,
+  type AckFrame,
   type ApprovalSnapshotItem,
   type AppState,
+  type GatewayInfoFrame,
   type InboundFrame,
   type MachineWindows,
   type PendingApproval,
+  type StreamEntry,
   type WindowInfo,
   type WindowStatus,
   type WorkspacesFrame,
@@ -465,14 +473,14 @@ describe("reducer", () => {
       text: "终端输出",
     });
     // 点选后干预：用户回显追加到同一 local conv（convId 不被加 web: 前缀）。
-    const after = run(s, { type: "send_echo", convId: "local:work", text: "继续" });
+    const after = run(s, { type: "send_echo", clientId: "c1", convId: "local:work", text: "继续" });
     const entries = convsOf(after)["local:work"].entries;
     expect(entries).toHaveLength(2);
     expect(entries[1]).toMatchObject({ kind: "user", text: "继续" });
   });
 
   it("send_echo 追加用户回显到指定 conv", () => {
-    const s = run(initialState(), { type: "send_echo", convId: "web:work", text: "列出目录" });
+    const s = run(initialState(), { type: "send_echo", clientId: "c2", convId: "web:work", text: "列出目录" });
     expect(orderOf(s)).toContain("web:work");
     expect(convsOf(s)["web:work"].entries).toHaveLength(1);
     expect(convsOf(s)["web:work"].entries[0]).toMatchObject({ kind: "user", text: "列出目录" });
@@ -487,7 +495,7 @@ describe("reducer", () => {
     expect(convsOf(s)[DEFAULT_CONV].lastPreview).toBe("你好");
     expect(convsOf(s)[DEFAULT_CONV].lastAt).toBeGreaterThan(0);
     // user 回显覆盖概要
-    s = run(s, { type: "send_echo", convId: DEFAULT_CONV, text: "用户提问" });
+    s = run(s, { type: "send_echo", clientId: "c3", convId: DEFAULT_CONV, text: "用户提问" });
     expect(convsOf(s)[DEFAULT_CONV].lastPreview).toBe("用户提问");
     // card：正文首行（夹具为 JSON 原文，换行需转义）
     s = run(s, {
@@ -532,6 +540,7 @@ describe("reducer", () => {
     let s = run(initialState(), { type: "frame", frame: frame(TEXT_FRAME("服务端消息")) });
     const echoes: Action[] = Array.from({ length: 205 }, (_, i) => ({
       type: "send_echo",
+      clientId: `c${i}`,
       convId: DEFAULT_CONV,
       text: `msg${i}`,
     }));
@@ -567,7 +576,7 @@ describe("reducer 未读计数（侧栏徽标数据源）", () => {
     s = run(s, { type: "frame", frame: frame(TEXT_FRAME("后台消息", "web:side")) });
     expect(convsOf(s)["web:side"].unread).toBe(1);
     // 用户回显（即使落非当前 conv——现实中不会发生）也不计
-    s = run(s, { type: "send_echo", convId: "web:side", text: "用户回显不计数" });
+    s = run(s, { type: "send_echo", clientId: "c5", convId: "web:side", text: "用户回显不计数" });
     expect(convsOf(s)["web:side"].unread).toBe(1);
     s = run(s, { type: "frame", frame: frame(TEXT_FRAME("又一条", "web:side")) });
     expect(convsOf(s)["web:side"].unread).toBe(2);
@@ -651,7 +660,7 @@ describe("reducer 未读计数（侧栏徽标数据源）", () => {
       frame(CARD_FRAME({ type: "card_patch", convId: CONV, messageId: "m1", text: "完成", terminal: "done" }));
     /** 用户进入会话并发起任务：本机回显物化会话（不计未读），之后仍停在该会话。 */
     const enterAndAsk = (s: AppState) =>
-      run(s, { type: "select_conv", convId: CONV }, { type: "send_echo", convId: CONV, text: "跑个长任务" });
+      run(s, { type: "select_conv", convId: CONV }, { type: "send_echo", clientId: "c6", convId: CONV, text: "跑个长任务" });
     /** history 重放帧：一张本地没有的终态卡（重放恒为终态快照）。 */
     const HISTORY_DONE_CARD =
       `{"v":1,"type":"history","convId":"${CONV}","entries":[` +
@@ -835,7 +844,7 @@ describe("reducer 多机（v1.1）", () => {
       initialState(),
       { type: "frame", frame: frame(TEXT_ON("home-mac", "home 消息", "web:work")) },
       { type: "frame", frame: frame(TEXT_ON("work-mac", "work 消息", "web:work")) },
-      { type: "send_echo", convId: "web:work", text: "home 回显", machine: "home-mac" },
+      { type: "send_echo", clientId: "c7", convId: "web:work", text: "home 回显", machine: "home-mac" },
     );
     const home = spaceOf(s, "home-mac").convs["web:work"];
     const work = spaceOf(s, "work-mac").convs["web:work"];
@@ -923,7 +932,7 @@ describe("reducer 多机（v1.1）", () => {
       { type: "frame", frame: frame('{"v":1,"type":"machine","online":true}') },
       { type: "frame", frame: frame(TEXT_FRAME("你好")) },
       { type: "frame", frame: frame(CARD_FRAME({ messageId: "m1", text: "卡片" })) },
-      { type: "send_echo", convId: DEFAULT_CONV, text: "用户提问" },
+      { type: "send_echo", clientId: "c8", convId: DEFAULT_CONV, text: "用户提问" },
       {
         type: "frame",
         frame: frame(
@@ -1762,23 +1771,23 @@ describe("会话自动命名（title 派生 + 自动短 ID + convTitle）", () =
   it("首条 user 回显派生 title：多行取首行、中英混排、前后空白剥除", () => {
     const s = run(
       initialState(),
-      { type: "send_echo", convId: "web:s-ab12", text: "  帮我 review 这个 PR  \n第二行不入名" },
+      { type: "send_echo", clientId: "c9", convId: "web:s-ab12", text: "  帮我 review 这个 PR  \n第二行不入名" },
     );
     expect(convsOf(s)["web:s-ab12"].title).toBe("帮我 review 这个 PR");
   });
 
   it("title 超长按码点截 24 字符（中文/emoji 不劈半）", () => {
-    const han = run(initialState(), { type: "send_echo", convId: "web:s-ab12", text: "一".repeat(30) });
+    const han = run(initialState(), { type: "send_echo", clientId: "c10", convId: "web:s-ab12", text: "一".repeat(30) });
     const t1 = convsOf(han)["web:s-ab12"].title;
     expect(t1).toBe("一".repeat(CONV_TITLE_MAX_CHARS));
     expect(Array.from(t1 ?? "")).toHaveLength(24);
     // emoji（代理对）：截 24 个码点而非 UTF-16 单元
-    const emoji = run(initialState(), { type: "send_echo", convId: "web:s-ab12", text: "😀".repeat(30) });
+    const emoji = run(initialState(), { type: "send_echo", clientId: "c11", convId: "web:s-ab12", text: "😀".repeat(30) });
     const t2 = convsOf(emoji)["web:s-ab12"].title;
     expect(Array.from(t2 ?? "")).toHaveLength(24);
     expect((t2 ?? "").length).toBe(48); // 未劈半：24 码点 × 2 UTF-16 单元
     // 中英混排
-    const mixed = run(initialState(), { type: "send_echo", convId: "web:s-ab12", text: "ab一cd二".repeat(10) });
+    const mixed = run(initialState(), { type: "send_echo", clientId: "c12", convId: "web:s-ab12", text: "ab一cd二".repeat(10) });
     expect(convsOf(mixed)["web:s-ab12"].title).toBe("ab一cd二".repeat(4));
   });
 
@@ -1791,8 +1800,8 @@ describe("会话自动命名（title 派生 + 自动短 ID + convTitle）", () =
   });
 
   it("title 一旦写入不再变：后续 user/text/card 均不改写", () => {
-    let s = run(initialState(), { type: "send_echo", convId: "web:s-ab12", text: "首条定调" });
-    s = run(s, { type: "send_echo", convId: "web:s-ab12", text: "第二条更长的消息不会覆盖" });
+    let s = run(initialState(), { type: "send_echo", clientId: "c13", convId: "web:s-ab12", text: "首条定调" });
+    s = run(s, { type: "send_echo", clientId: "c14", convId: "web:s-ab12", text: "第二条更长的消息不会覆盖" });
     s = run(s, { type: "frame", frame: frame(TEXT_FRAME("响应也不覆盖", "web:s-ab12")) });
     s = run(
       s,
@@ -1802,12 +1811,12 @@ describe("会话自动命名（title 派生 + 自动短 ID + convTitle）", () =
   });
 
   it("空摘要不写 title：首条去空白后为空 → 保持未定，后续消息仍可定调", () => {
-    let s = run(initialState(), { type: "send_echo", convId: "web:s-ab12", text: "   \n\t " });
+    let s = run(initialState(), { type: "send_echo", clientId: "c15", convId: "web:s-ab12", text: "   \n\t " });
     expect(convsOf(s)["web:s-ab12"].title).toBeUndefined();
     // text 帧空串同样不定调
     s = run(s, { type: "frame", frame: frame(TEXT_FRAME("", "web:s-ab12")) });
     expect(convsOf(s)["web:s-ab12"].title).toBeUndefined();
-    s = run(s, { type: "send_echo", convId: "web:s-ab12", text: "真正首条" });
+    s = run(s, { type: "send_echo", clientId: "c16", convId: "web:s-ab12", text: "真正首条" });
     expect(convsOf(s)["web:s-ab12"].title).toBe("真正首条");
   });
 
@@ -1815,12 +1824,12 @@ describe("会话自动命名（title 派生 + 自动短 ID + convTitle）", () =
     const s = run(initialState(), { type: "select_conv", convId: "web:s-ab12" });
     expect(convTitle(convsOf(s)["web:s-ab12"], "web:s-ab12")).toBe("s-ab12"); // 未收消息：无 conv 状态亦同
     expect(convTitle(undefined, "web:s-ab12")).toBe("s-ab12");
-    const withMsg = run(initialState(), { type: "send_echo", convId: "web:s-ab12", text: "自动会话首条" });
+    const withMsg = run(initialState(), { type: "send_echo", clientId: "c17", convId: "web:s-ab12", text: "自动会话首条" });
     expect(convTitle(convsOf(withMsg)["web:s-ab12"], "web:s-ab12")).toBe("自动会话首条");
   });
 
   it("convTitle：手动名 / local 会话即便有 title 也恒剥前缀；default 会话改用 title（未派生仍显 default）", () => {
-    const manual = run(initialState(), { type: "send_echo", convId: "web:proj", text: "手动名会话首条消息" });
+    const manual = run(initialState(), { type: "send_echo", clientId: "c18", convId: "web:proj", text: "手动名会话首条消息" });
     expect(convsOf(manual)["web:proj"].title).toBe("手动名会话首条消息"); // 一律派生（state 里有）
     expect(convTitle(convsOf(manual)["web:proj"], "web:proj")).toBe("proj"); // 但显示名不用
     const local = run(initialState(), { type: "frame", frame: frame(TEXT_FRAME("本地终端", "local:work")) });
@@ -1832,11 +1841,11 @@ describe("会话自动命名（title 派生 + 自动短 ID + convTitle）", () =
     expect(convTitle(undefined, DEFAULT_CONV)).toBe("default");
     expect(convTitle(convsOf(initialState())[DEFAULT_CONV], DEFAULT_CONV)).toBe("default");
     // 发首条消息：title 派生 → 显示名采用（侧栏/状态条同源）
-    const def = run(initialState(), { type: "send_echo", convId: DEFAULT_CONV, text: "默认会话的第一条消息" });
+    const def = run(initialState(), { type: "send_echo", clientId: "c19", convId: DEFAULT_CONV, text: "默认会话的第一条消息" });
     expect(convsOf(def)[DEFAULT_CONV].title).toBe("默认会话的第一条消息");
     expect(convTitle(convsOf(def)[DEFAULT_CONV], DEFAULT_CONV)).toBe("默认会话的第一条消息");
     // title 定调后不再变：第二条消息不覆盖显示名
-    const def2 = run(def, { type: "send_echo", convId: DEFAULT_CONV, text: "第二条消息" });
+    const def2 = run(def, { type: "send_echo", clientId: "c20", convId: DEFAULT_CONV, text: "第二条消息" });
     expect(convTitle(convsOf(def2)[DEFAULT_CONV], DEFAULT_CONV)).toBe("默认会话的第一条消息");
   });
 
@@ -2201,20 +2210,26 @@ describe("text 帧可选 self（v1.41.8 用户自发文本镜像）", () => {
       initialState(),
       { type: "frame", frame: frame(TEXT_FRAME("已建立与窗口「win-a」的会话", PEER)) },
       { type: "select_conv", convId: PEER },
-      { type: "send_echo", convId: PEER, text: "帮我跑下构建" },
+      { type: "send_echo", clientId: "c21", convId: PEER, text: "帮我跑下构建" },
     );
     const before = s;
     s = run(s, { type: "frame", frame: frame(SELF("帮我跑下构建")) });
     expect(s).toBe(before); // 原引用返回：无新条目、概要/未读/序号均不动
-    expect(shape(s)).toEqual([["text", "text:1"], ["user", "user:2"]]);
+    // v1.44：本机回显的键是 user:<clientId>（不再是序号）；镜像补回的仍是序号键
+    expect(shape(s)).toEqual([["text", "text:1"], ["user", "user:c21"]]);
 
     // 连发多条同文：每条镜像都被自己的回显吸收。
-    s = run(s, { type: "send_echo", convId: PEER, text: "继续" }, { type: "send_echo", convId: PEER, text: "继续" });
+    s = run(s, { type: "send_echo", clientId: "c22", convId: PEER, text: "继续" }, { type: "send_echo", clientId: "c23", convId: PEER, text: "继续" });
     s = run(s, { type: "frame", frame: frame(SELF("继续")) }, { type: "frame", frame: frame(SELF("继续")) });
-    expect(shape(s)).toEqual([["text", "text:1"], ["user", "user:2"], ["user", "user:3"], ["user", "user:4"]]);
+    expect(shape(s)).toEqual([
+      ["text", "text:1"],
+      ["user", "user:c21"],
+      ["user", "user:c22"],
+      ["user", "user:c23"],
+    ]);
 
     // 非当前会话同样去重，且不点亮未读。
-    let bg = run(initialState(), { type: "send_echo", convId: PEER, text: "后台那句" });
+    let bg = run(initialState(), { type: "send_echo", clientId: "c24", convId: PEER, text: "后台那句" });
     const bgBefore = bg;
     bg = run(bg, { type: "frame", frame: frame(SELF("后台那句")) });
     expect(bg).toBe(bgBefore);
@@ -2223,7 +2238,7 @@ describe("text 帧可选 self（v1.41.8 用户自发文本镜像）", () => {
 
   it("reducer：网关镜像的是 trim 后的文本——回显带首尾空白/换行同样去重", () => {
     // dispatch_peer_message 取 text.trim() 再镜像；本机回显保留用户原样输入。
-    let s = run(initialState(), { type: "send_echo", convId: PEER, text: "  帮我跑下构建\n" });
+    let s = run(initialState(), { type: "send_echo", clientId: "c25", convId: PEER, text: "  帮我跑下构建\n" });
     const before = s;
     s = run(s, { type: "frame", frame: frame(SELF("帮我跑下构建")) });
     expect(s).toBe(before);
@@ -2231,14 +2246,14 @@ describe("text 帧可选 self（v1.41.8 用户自发文本镜像）", () => {
   });
 
   it("reducer：同文回执已被挤出末尾 5 条 → 不再算本条的回显，镜像照常补回（去重窗口语义）", () => {
-    let s = run(initialState(), { type: "send_echo", convId: PEER, text: "旧的那句" });
+    let s = run(initialState(), { type: "send_echo", clientId: "c26", convId: PEER, text: "旧的那句" });
     // 其后挤进 5 条窗口回复（text），回显落到第 6 位之外。
     for (let i = 1; i <= 5; i++) {
       s = run(s, { type: "frame", frame: frame(TEXT_FRAME(`回复${i}`, PEER)) });
     }
     s = run(s, { type: "frame", frame: frame(SELF("旧的那句")) });
     expect(shape(s)).toEqual([
-      ["user", "user:1"],
+      ["user", "user:c26"],
       ["text", "text:2"],
       ["text", "text:3"],
       ["text", "text:4"],
@@ -2247,7 +2262,7 @@ describe("text 帧可选 self（v1.41.8 用户自发文本镜像）", () => {
       ["user", "user:7"], // 回显不在窗口内 → 镜像补回
     ]);
     // 恰在窗口边界（回显是倒数第 5 条）仍去重。
-    let edge = run(initialState(), { type: "send_echo", convId: PEER, text: "边界" });
+    let edge = run(initialState(), { type: "send_echo", clientId: "c27", convId: PEER, text: "边界" });
     for (let i = 1; i <= 4; i++) {
       edge = run(edge, { type: "frame", frame: frame(TEXT_FRAME(`回复${i}`, PEER)) });
     }
@@ -2265,7 +2280,7 @@ describe("text 帧可选 self（v1.41.8 用户自发文本镜像）", () => {
 
   it("reducer：去重只认本机回显——镜像补回的 user 条目（带 self 标记）不吸收后续同文镜像（观看端连发同文不丢）", () => {
     // 本机回显（send_echo）不带 self 标记。
-    const echo = convsOf(run(initialState(), { type: "send_echo", convId: PEER, text: "继续" }))[PEER]?.entries[0];
+    const echo = convsOf(run(initialState(), { type: "send_echo", clientId: "c28", convId: PEER, text: "继续" }))[PEER]?.entries[0];
     expect(echo).toMatchObject({ kind: "user", text: "继续" });
     expect(echo).not.toHaveProperty("self");
 
@@ -2294,7 +2309,7 @@ describe("text 帧可选 self（v1.41.8 用户自发文本镜像）", () => {
     let s = run(
       initialState(),
       { type: "frame", frame: frame(SELF("镜像补回的那句")) },
-      { type: "send_echo", convId: PEER, text: "本机回显" },
+      { type: "send_echo", clientId: "c29", convId: PEER, text: "本机回显" },
       ...replies,
     );
     // 共追加 202 条（镜像 1 + 回显 1 + 回复 200）→ 超限丢掉的只能是最早的本机
@@ -2331,17 +2346,17 @@ describe("text 帧可选 self（v1.41.8 用户自发文本镜像）", () => {
     // 同机器空间：home-mac 上的回显吸收 home-mac 的镜像。
     const before = run(
       initialState(),
-      { type: "send_echo", convId: PEER, text: "同一句", machine: "home-mac" },
+      { type: "send_echo", clientId: "c30", convId: PEER, text: "同一句", machine: "home-mac" },
     );
     const same = run(before, { type: "frame", frame: frame(selfOnHomeMac("同一句")) });
     expect(same).toBe(before);
     // 跨机器空间：default 机器上的同文回显不吸收 home-mac 机器的镜像。
     const cross = run(
       initialState(),
-      { type: "send_echo", convId: PEER, text: "同一句" },
+      { type: "send_echo", clientId: "c31", convId: PEER, text: "同一句" },
       { type: "frame", frame: frame(selfOnHomeMac("同一句")) },
     );
-    expect(shape(cross)).toEqual([["user", "user:1"]]); // default 空间：仅本机回显
+    expect(shape(cross)).toEqual([["user", "user:c31"]]); // default 空间：仅本机回显
     expect(spaceOf(cross, "home-mac").convs[PEER]?.entries).toMatchObject([
       { kind: "user", key: "user:2", text: "同一句" },
     ]);
@@ -2382,7 +2397,7 @@ describe("text 帧可选 self（v1.41.8 用户自发文本镜像）", () => {
   it("reducer：重放的 self 条目与本地回显同文 → 吸收不重复（回显盖本地时间，与网关 at 不同源）；重复重放幂等", () => {
     // 场景：peer 会话打字后切走/重连 → history_query 把这条消息的落盘行重放
     // 回来。本机已有回显，不能再冒出第二个气泡。
-    let s = run(initialState(), { type: "send_echo", convId: PEER, text: "帮我跑下构建" });
+    let s = run(initialState(), { type: "send_echo", clientId: "c32", convId: PEER, text: "帮我跑下构建" });
     const before = s;
     s = run(s, hist(PEER, selfRow(5, "帮我跑下构建", 1700000000000), 5));
     expect(s).toBe(before); // 原引用返回
@@ -2393,25 +2408,30 @@ describe("text 帧可选 self（v1.41.8 用户自发文本镜像）", () => {
     // 本机发过 2 次「继续」，另一台设备也发过 2 次 → 落盘 4 行。
     let s = run(
       initialState(),
-      { type: "send_echo", convId: PEER, text: "继续" },
-      { type: "send_echo", convId: PEER, text: "继续" },
+      { type: "send_echo", clientId: "c33", convId: PEER, text: "继续" },
+      { type: "send_echo", clientId: "c34", convId: PEER, text: "继续" },
     );
     s = run(
       s,
       hist(PEER, [selfRow(1, "继续", 1), selfRow(2, "继续", 2), selfRow(3, "继续", 3), selfRow(4, "继续", 4)].join(","), 4),
     );
-    expect(shape(s)).toEqual([["user", "user:1"], ["user", "user:2"], ["user", "h:3"], ["user", "h:4"]]);
+    expect(shape(s)).toEqual([
+      ["user", "user:c33"],
+      ["user", "user:c34"],
+      ["user", "h:3"],
+      ["user", "h:4"],
+    ]);
   });
 
   it("reducer：混合重放——本机回显吸收自己的 self 行、窗口回复按 (text,at) 去重、他机发出的 self 行补回为 user", () => {
     // 本机时序：回显 → 网关镜像帧（已被去重）→ 窗口回复（实时 text）。
     let s = run(
       initialState(),
-      { type: "send_echo", convId: PEER, text: "帮我跑下构建" },
+      { type: "send_echo", clientId: "c35", convId: PEER, text: "帮我跑下构建" },
       { type: "frame", frame: frame(SELF("帮我跑下构建")) },
       { type: "frame", frame: frame(`{"v":1,"type":"text","convId":"${PEER}","text":"已跑完，构建通过","at":1700000005000}`) },
     );
-    expect(shape(s)).toEqual([["user", "user:1"], ["text", "text:2"]]);
+    expect(shape(s)).toEqual([["user", "user:c35"], ["text", "text:2"]]);
     // 重放三行：自己的（吸收）+ 回复（(text,at) 命中）+ 别的设备发的（补回）。
     s = run(
       s,
@@ -2425,7 +2445,7 @@ describe("text 帧可选 self（v1.41.8 用户自发文本镜像）", () => {
         3,
       ),
     );
-    expect(shape(s)).toEqual([["user", "user:1"], ["text", "text:2"], ["user", "h:3"]]);
+    expect(shape(s)).toEqual([["user", "user:c35"], ["text", "text:2"], ["user", "h:3"]]);
     // 本地非空：概要不刷（既有语义）。
     expect(convsOf(s)[PEER]?.lastPreview).toBe("已跑完，构建通过");
   });
@@ -2433,7 +2453,7 @@ describe("text 帧可选 self（v1.41.8 用户自发文本镜像）", () => {
   it("reducer：trimmed 整体替换——本地缓存丢弃，self 条目重建为 user 条目、普通行为 text", () => {
     const s = run(
       initialState(),
-      { type: "send_echo", convId: PEER, text: "将被丢弃的本地回显" },
+      { type: "send_echo", clientId: "c36", convId: PEER, text: "将被丢弃的本地回显" },
       {
         type: "frame",
         frame: frame(
@@ -3399,5 +3419,604 @@ describe("v1.43 本地窗口纯函数（界面文案）", () => {
     // 同一个 at，now 推进一小时后文案随之变化
     expect(relativeTime(now - 60_000, now)).toBe("1 分钟前");
     expect(relativeTime(now - 60_000, now + 3_600_000)).toBe("1 小时前");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.44 送达回执 + 网关版本：出站帧形状 / ack 与 gateway_info 解析校验 /
+// newClientId；reducer（send_echo 的键与 ack、ack、ack_timeout、gateway_info 及
+// 其作废）；超时判定纯函数 timedOutAcks
+// ---------------------------------------------------------------------------
+
+describe("v1.44 送达回执 + 网关版本：出站形状 + 解析校验 + newClientId", () => {
+  /** 契约 §2 示例原文（两种状态）。 */
+  const ACK_RECEIVED =
+    '{"v":1,"type":"ack","machine":"home-mac","clientId":"m_1a2b3c4d","convId":"web:s-1","status":"received"}';
+  const ACK_REJECTED =
+    '{"v":1,"type":"ack","machine":"home-mac","clientId":"m_1a2b3c4d","convId":"web:s-1","status":"rejected","reason":"not_allowed","message":"发送者未获授权，消息未被处理"}';
+  const INFO = '{"v":1,"type":"gateway_info","machine":"home-mac","version":"1.44.0","caps":["acks"]}';
+  /** gateway_info 帧：caps 段整体定制（含前导逗号；空串 = 缺该键）。 */
+  const infoRaw = (caps: string) =>
+    `{"v":1,"type":"gateway_info","machine":"home-mac","version":"1.44.0"${caps}}`;
+  /** ack 帧：tail 接在 status 之后（reason / message 的各种组合）。 */
+  const ackRaw = (status: string, tail = "") =>
+    `{"v":1,"type":"ack","machine":"m","clientId":"c","convId":"web:default","status":"${status}"${tail}}`;
+
+  it("parseFrame：ack 两种合法形态（契约示例原文）逐字段还原", () => {
+    expect(parseFrame(ACK_RECEIVED)).toEqual({
+      v: 1,
+      type: "ack",
+      machine: "home-mac",
+      clientId: "m_1a2b3c4d",
+      convId: "web:s-1",
+      status: "received",
+    });
+    expect(parseFrame(ACK_REJECTED)).toEqual({
+      v: 1,
+      type: "ack",
+      machine: "home-mac",
+      clientId: "m_1a2b3c4d",
+      convId: "web:s-1",
+      status: "rejected",
+      reason: "not_allowed",
+      message: "发送者未获授权，消息未被处理",
+    });
+  });
+
+  it("parseFrame：rejected 的 reason 四值均合法", () => {
+    for (const reason of ["not_allowed", "queue_full", "peer_unreachable", "malformed"]) {
+      const raw = ackRaw("rejected", `,"reason":"${reason}","message":"x"`);
+      expect(parseFrame(raw), reason).toMatchObject({ type: "ack", status: "rejected", reason });
+    }
+  });
+
+  it("parseFrame：rejected 缺 reason / 缺 message / reason 越界 / 类型不符 → 整帧拒收", () => {
+    for (const bad of [
+      ackRaw("rejected"), // 两个都缺
+      ackRaw("rejected", ',"message":"x"'), // 缺 reason
+      ackRaw("rejected", ',"reason":"queue_full"'), // 缺 message
+      ackRaw("rejected", ',"reason":"unknown_reason","message":"x"'), // reason 越界
+      ackRaw("rejected", ',"reason":"NotAllowed","message":"x"'), // 大小写敏感
+      ackRaw("rejected", ',"reason":"queue_full","message":1'), // message 非字符串
+      ackRaw("rejected", ',"reason":1,"message":"x"'), // reason 非字符串
+    ]) {
+      expect(parseFrame(bad), bad).toBeNull();
+    }
+  });
+
+  it("parseFrame：received 不得带 reason / message；status 越界或缺席 → 拒收", () => {
+    for (const bad of [
+      ackRaw("received", ',"reason":"not_allowed","message":"x"'),
+      ackRaw("received", ',"message":"x"'),
+      ackRaw("received", ',"reason":"not_allowed"'),
+      ackRaw("sent"),
+      ackRaw("pending"),
+      ackRaw("Received"),
+      ackRaw(""),
+      '{"v":1,"type":"ack","machine":"m","clientId":"c","convId":"web:default"}', // 缺 status
+      '{"v":1,"type":"ack","machine":"m","clientId":"c","convId":"web:default","status":1}',
+    ]) {
+      expect(parseFrame(bad), bad).toBeNull();
+    }
+  });
+
+  it("parseFrame：ack 的 machine / clientId / convId 须为非空字符串（缺席 / 空串 / 非字符串均拒收）", () => {
+    const good = JSON.parse(ACK_RECEIVED) as Record<string, unknown>;
+    for (const key of ["machine", "clientId", "convId"]) {
+      expect(parseFrame(JSON.stringify({ ...good, [key]: "" })), `${key} 空串`).toBeNull();
+      expect(parseFrame(JSON.stringify({ ...good, [key]: undefined })), `${key} 缺席`).toBeNull();
+      expect(parseFrame(JSON.stringify({ ...good, [key]: 1 })), `${key} 非字符串`).toBeNull();
+    }
+    expect(parseFrame(JSON.stringify(good))).toMatchObject({ type: "ack" }); // 对照：原样合法
+  });
+
+  it("parseFrame：gateway_info 合法（契约示例原文；空 caps 亦合法）；caps 非数组 / 含非字符串 / 缺键 / machine 或 version 为空 → 拒收", () => {
+    expect(parseFrame(INFO)).toEqual({ v: 1, type: "gateway_info", machine: "home-mac", version: "1.44.0", caps: ["acks"] });
+    // 空数组 = 该网关没有任何可选能力（合法，只是不支持回执）
+    expect(parseFrame(infoRaw(',"caps":[]'))).toMatchObject({ type: "gateway_info", caps: [] });
+    for (const bad of [
+      infoRaw(""), // 缺 caps
+      infoRaw(',"caps":"acks"'), // 非数组
+      infoRaw(',"caps":{}'),
+      infoRaw(',"caps":["acks",1]'), // 含非字符串
+      infoRaw(',"caps":[null]'),
+      '{"v":1,"type":"gateway_info","machine":"","version":"1.44.0","caps":[]}',
+      '{"v":1,"type":"gateway_info","machine":"home-mac","version":"","caps":[]}',
+      '{"v":1,"type":"gateway_info","machine":"home-mac","caps":[]}', // 缺 version
+    ]) {
+      expect(parseFrame(bad), bad).toBeNull();
+    }
+  });
+
+  it("encodeFrame：gateway_info_query / e2e_close / 带 clientId 的 message 与契约示例逐字节一致（键序）", () => {
+    expect(encodeFrame({ v: 1, type: "gateway_info_query", machine: "home-mac" })).toBe(
+      '{"v":1,"type":"gateway_info_query","machine":"home-mac"}',
+    );
+    // e2e_close 内帧不带 machine（路由靠 enc 信封）
+    expect(encodeFrame({ v: 1, type: "e2e_close" })).toBe('{"v":1,"type":"e2e_close"}');
+    expect(
+      encodeFrame({ v: 1, type: "message", convId: "web:s-1", text: "你好", machine: "home-mac", clientId: "m_1a2b3c4d" }),
+    ).toBe('{"v":1,"type":"message","convId":"web:s-1","text":"你好","machine":"home-mac","clientId":"m_1a2b3c4d"}');
+    // 带图：clientId 排在 media 之后；不带 clientId 时该键不出现（与升级前字节一致）
+    const media = { name: "a.png", mime: "image/png", b64: "AA==" };
+    expect(encodeFrame({ v: 1, type: "message", convId: "web:s-1", text: "你好", machine: "home-mac", media, clientId: "m_1a2b3c4d" })).toBe(
+      '{"v":1,"type":"message","convId":"web:s-1","text":"你好","machine":"home-mac","media":{"name":"a.png","mime":"image/png","b64":"AA=="},"clientId":"m_1a2b3c4d"}',
+    );
+    expect(encodeFrame({ v: 1, type: "message", convId: "web:s-1", text: "你好", machine: "home-mac" })).toBe(
+      '{"v":1,"type":"message","convId":"web:s-1","text":"你好","machine":"home-mac"}',
+    );
+  });
+
+  it("newClientId：形状 ^m_[0-9a-z]+_[0-9a-f]{8}$、长度 ≤64、字符集合规；连生成 200 个互不相同", () => {
+    const ids = Array.from({ length: 200 }, () => newClientId());
+    for (const id of ids) {
+      expect(id).toMatch(/^m_[0-9a-z]+_[0-9a-f]{8}$/);
+      expect(id.length).toBeLessThanOrEqual(64);
+      expect(id).toMatch(/^[A-Za-z0-9_-]+$/);
+    }
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it("newClientId：同一毫秒内连发也不撞（时间戳段取 36 进制）；crypto 不可用时退回 Math.random，形状不变", () => {
+    let now = 1_795_000_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      const ids = Array.from({ length: 50 }, () => newClientId());
+      expect(new Set(ids).size).toBe(50);
+      const stamp = now.toString(36);
+      for (const id of ids) {
+        expect(id.startsWith(`m_${stamp}_`)).toBe(true);
+      }
+      vi.stubGlobal("crypto", {}); // 没有 getRandomValues 的环境
+      for (let i = 0; i < 50; i++) {
+        expect(newClientId()).toMatch(/^m_[0-9a-z]+_[0-9a-f]{8}$/);
+      }
+    } finally {
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+    }
+  });
+});
+
+describe("v1.44 送达回执 + 网关版本：reducer", () => {
+  const M = "home-mac";
+  const OTHER = "work-mac";
+  const CONV = DEFAULT_CONV;
+  const PEER = "peer:win-a";
+  type UserEntry = Extract<StreamEntry, { kind: "user" }>;
+  const infoF = (machine: string, version = "1.44.0", caps: string[] = ["acks"]): GatewayInfoFrame => ({
+    v: 1,
+    type: "gateway_info",
+    machine,
+    version,
+    caps,
+  });
+  type AckExtra = Partial<Pick<AckFrame, "machine" | "convId" | "reason" | "message">>;
+  const ackF = (clientId: string, status: "received" | "rejected", extra: AckExtra = {}): AckFrame => ({
+    v: 1,
+    type: "ack",
+    machine: M,
+    clientId,
+    convId: CONV,
+    status,
+    ...extra,
+  });
+  const REJECT_QUEUE_FULL: AckExtra = { reason: "queue_full", message: "排队消息过多，这条被丢弃" };
+  const echo = (clientId: string, text = "你好", convId = CONV, machine = M): Action => ({
+    type: "send_echo",
+    convId,
+    text,
+    clientId,
+    machine,
+  });
+  const timeout = (clientId: string, convId = CONV, machine = M): Action => ({
+    type: "ack_timeout",
+    machine,
+    convId,
+    clientId,
+  });
+  const echoOf = (s: AppState, clientId: string, convId = CONV, machine = M): UserEntry | undefined =>
+    spaceOf(s, machine).convs[convId]?.entries.find(
+      (e): e is UserEntry => e.kind === "user" && e.clientId === clientId,
+    );
+  /** 机器 M 已报告支持回执的初始状态。 */
+  const acked = (): AppState => run(initialState(), { type: "frame", frame: infoF(M) });
+
+  // ---- send_echo：键与 ack 字段 ----
+
+  it("send_echo：条目键 user:<clientId>、恒带 clientId；机器支持回执时带 ack:\"pending\"，不支持时不带 ack 字段", () => {
+    const plain = run(initialState(), echo("c1"));
+    const e = echoOf(plain, "c1");
+    expect(e).toMatchObject({ kind: "user", key: "user:c1", text: "你好", clientId: "c1" });
+    expect(typeof e?.at).toBe("number");
+    expect(e).not.toHaveProperty("ack");
+    expect(e).not.toHaveProperty("self");
+    const withAck = run(acked(), echo("c2"));
+    expect(echoOf(withAck, "c2")).toMatchObject({ key: "user:c2", clientId: "c2", ack: "pending" });
+  });
+
+  it("send_echo：回执能力按机器判定——只有 caps 含 acks 的机器才 pending；caps 不含 acks 等同不支持", () => {
+    const s = run(
+      initialState(),
+      { type: "frame", frame: infoF(M) },
+      { type: "frame", frame: infoF(OTHER, "1.43.0", []) },
+      echo("c1", "你好", CONV, M),
+      echo("c2", "你好", CONV, OTHER),
+      echo("c3", "你好", CONV, "no-such-machine"),
+    );
+    expect(echoOf(s, "c1", CONV, M)?.ack).toBe("pending");
+    expect(echoOf(s, "c2", CONV, OTHER)).toBeDefined();
+    expect(echoOf(s, "c2", CONV, OTHER)).not.toHaveProperty("ack");
+    expect(echoOf(s, "c3", CONV, "no-such-machine")).toBeDefined();
+    expect(echoOf(s, "c3", CONV, "no-such-machine")).not.toHaveProperty("ack");
+    expect(machineSupportsAcks(s, M)).toBe(true);
+    expect(machineSupportsAcks(s, OTHER)).toBe(false);
+    expect(machineSupportsAcks(s, "no-such-machine")).toBe(false);
+  });
+
+  it("send_echo 带 image：条目落 image:true；缺省不落键", () => {
+    const s = run(
+      acked(),
+      { type: "send_echo", convId: CONV, text: "[图片]", clientId: "c1", machine: M, image: true },
+      echo("c2"),
+    );
+    expect(echoOf(s, "c1")).toMatchObject({ key: "user:c1", image: true, ack: "pending" });
+    expect(echoOf(s, "c2")).not.toHaveProperty("image");
+  });
+
+  it("键形态变化不动 text 条目的序号键：send_echo 照常推进 seq", () => {
+    // 文本帧带 machine 落到同一机器空间（多机模式网关出站帧恒带）
+    const reply = frame(`{"v":1,"type":"text","convId":"${CONV}","text":"回复","machine":"${M}"}`);
+    const s = run(initialState(), echo("c1"), { type: "frame", frame: reply }, echo("c2"));
+    expect(spaceOf(s, M).convs[CONV].entries.map((e) => e.key)).toEqual(["user:c1", "text:2", "user:c2"]);
+  });
+
+  // ---- ack 帧 ----
+
+  it("ack received：pending → sent，不带 ackReason", () => {
+    const s = run(acked(), echo("c1"), { type: "frame", frame: ackF("c1", "received") });
+    expect(echoOf(s, "c1")).toMatchObject({ ack: "sent" });
+    expect(echoOf(s, "c1")).not.toHaveProperty("ackReason");
+  });
+
+  it("ack rejected：→ failed，ackReason = 网关给的中文 message（不是原因码）", () => {
+    const s = run(acked(), echo("c1"), { type: "frame", frame: ackF("c1", "rejected", REJECT_QUEUE_FULL) });
+    expect(echoOf(s, "c1")).toMatchObject({ ack: "failed", ackReason: "排队消息过多，这条被丢弃" });
+  });
+
+  it("ack 完整往返：received（→ sent）之后 rejected 到达 → failed，原因取 message", () => {
+    const s = run(
+      acked(),
+      echo("c1"),
+      { type: "frame", frame: ackF("c1", "received") },
+      { type: "frame", frame: ackF("c1", "rejected", { reason: "not_allowed", message: "发送者未获授权，消息未被处理" }) },
+    );
+    expect(echoOf(s, "c1")).toMatchObject({ ack: "failed", ackReason: "发送者未获授权，消息未被处理" });
+  });
+
+  it("迟到的 received 把 unconfirmed 翻回 sent（超时判定不是终局）", () => {
+    const s = run(
+      acked(),
+      echo("c1"),
+      timeout("c1"),
+      { type: "frame", frame: ackF("c1", "received") },
+    );
+    expect(echoOf(s, "c1")?.ack).toBe("sent");
+  });
+
+  it("未知 clientId / 别的会话 / 别的机器的回执 → 原 state 引用（别的设备发的消息本机没有条目）", () => {
+    const s = run(acked(), echo("c1"));
+    expect(run(s, { type: "frame", frame: ackF("nope", "received") })).toBe(s);
+    expect(run(s, { type: "frame", frame: ackF("c1", "received", { convId: "web:other" }) })).toBe(s);
+    expect(run(s, { type: "frame", frame: ackF("c1", "received", { machine: OTHER }) })).toBe(s);
+    // 该机器根本没有这个会话
+    expect(run(s, { type: "frame", frame: ackF("c1", "rejected", REJECT_QUEUE_FULL) })).not.toBe(s);
+  });
+
+  it("已是 sent 再收到 received → 不变（原引用）；内容相同的重复 rejected → 原引用", () => {
+    const sent = run(acked(), echo("c1"), { type: "frame", frame: ackF("c1", "received") });
+    expect(run(sent, { type: "frame", frame: ackF("c1", "received") })).toBe(sent);
+    const failed = run(acked(), echo("c1"), { type: "frame", frame: ackF("c1", "rejected", REJECT_QUEUE_FULL) });
+    expect(run(failed, { type: "frame", frame: ackF("c1", "rejected", REJECT_QUEUE_FULL) })).toBe(failed);
+  });
+
+  it("只认本机回显：网关镜像补回的 user 条目（无 clientId）不受任何回执影响", () => {
+    const s = run(
+      acked(),
+      {
+        type: "frame",
+        frame: frame(`{"v":1,"type":"text","convId":"${CONV}","text":"镜像的那句","at":1,"self":true,"machine":"${M}"}`),
+      },
+    );
+    expect(spaceOf(s, M).convs[CONV].entries[0]).toMatchObject({ kind: "user", self: true });
+    expect(run(s, { type: "frame", frame: ackF("nope", "received") })).toBe(s);
+  });
+
+  it("IndexedDB 恢复的条目（键带 h: 前缀）照样按 clientId 关联：迟到的 received 落到它身上", () => {
+    const live = run(acked(), echo("c1"));
+    const entry = echoOf(live, "c1");
+    if (!entry) {
+      throw new Error("夹具：未找到回显");
+    }
+    const space = spaceOf(live, M);
+    const restored: AppState = {
+      ...live,
+      spaces: {
+        ...live.spaces,
+        [M]: {
+          ...space,
+          convs: {
+            ...space.convs,
+            [CONV]: {
+              ...space.convs[CONV],
+              entries: [{ ...entry, key: `h:${entry.key}`, ack: "unconfirmed" }],
+            },
+          },
+        },
+      },
+    };
+    const s = run(restored, { type: "frame", frame: ackF("c1", "received") });
+    expect(spaceOf(s, M).convs[CONV].entries).toHaveLength(1);
+    expect(spaceOf(s, M).convs[CONV].entries[0]).toMatchObject({ key: "h:user:c1", ack: "sent" });
+  });
+
+  it("发出时能力尚不可知（条目无 ack）的回显：回执到了照常落状态——received → sent、rejected → failed", () => {
+    const s = run(
+      initialState(),
+      echo("c1"),
+      echo("c2"),
+      { type: "frame", frame: ackF("c1", "received") },
+      { type: "frame", frame: ackF("c2", "rejected", REJECT_QUEUE_FULL) },
+    );
+    expect(echoOf(s, "c1")).toMatchObject({ ack: "sent" });
+    expect(echoOf(s, "c2")).toMatchObject({ ack: "failed", ackReason: "排队消息过多，这条被丢弃" });
+  });
+
+  it("ack / ack_timeout 只改那一条回显的 ack 字段：未读、概要、title、seq 与改写前的条目对象均不动", () => {
+    const base = run(acked(), echo("c1", "第一条"), echo("c2", "第二条"));
+    const before = convsOf(base)[CONV];
+    const first = echoOf(base, "c1");
+    const s = run(base, { type: "frame", frame: ackF("c1", "received") }, timeout("c2"));
+    const conv = convsOf(s)[CONV];
+    expect(echoOf(s, "c1")?.ack).toBe("sent");
+    expect(echoOf(s, "c2")?.ack).toBe("unconfirmed");
+    expect(conv?.unread).toBe(before?.unread);
+    expect(conv?.lastPreview).toBe(before?.lastPreview);
+    expect(conv?.lastAt).toBe(before?.lastAt);
+    expect(conv?.title).toBe(before?.title);
+    expect(s.seq).toBe(base.seq);
+    expect(first).toMatchObject({ clientId: "c1", ack: "pending" }); // 旧条目对象未被改写
+    expect(echoOf(s, "c1")).not.toBe(first);
+  });
+
+  // ---- ack_timeout ----
+
+  it("ack_timeout：pending → unconfirmed；只动 pending——sent / failed / unconfirmed / 无 ack 的回显原 state 引用", () => {
+    let s = run(initialState(), echo("c5")); // 能力未知时发出：无 ack
+    s = run(
+      s,
+      { type: "frame", frame: infoF(M) },
+      echo("c1"),
+      echo("c2"),
+      echo("c3"),
+      echo("c4"),
+      { type: "frame", frame: ackF("c1", "received") },
+      { type: "frame", frame: ackF("c2", "rejected", REJECT_QUEUE_FULL) },
+      timeout("c3"),
+    );
+    expect(echoOf(s, "c1")?.ack).toBe("sent");
+    expect(echoOf(s, "c2")?.ack).toBe("failed");
+    expect(echoOf(s, "c3")?.ack).toBe("unconfirmed");
+    expect(echoOf(s, "c4")?.ack).toBe("pending");
+    expect(echoOf(s, "c5")).not.toHaveProperty("ack");
+    for (const id of ["c1", "c2", "c3", "c5"]) {
+      expect(run(s, timeout(id)), id).toBe(s);
+    }
+    const after = run(s, timeout("c4"));
+    expect(echoOf(after, "c4")?.ack).toBe("unconfirmed");
+    expect(after).not.toBe(s);
+    // 再超时一次：已是 unconfirmed，原引用
+    expect(run(after, timeout("c4"))).toBe(after);
+  });
+
+  it("ack_timeout：未知 clientId / 别的会话 / 别的机器 → 原 state 引用", () => {
+    const s = run(acked(), echo("c1"));
+    expect(run(s, timeout("nope"))).toBe(s);
+    expect(run(s, timeout("c1", "web:other"))).toBe(s);
+    expect(run(s, timeout("c1", CONV, OTHER))).toBe(s);
+  });
+
+  // ---- gateway_info 与能力作废 ----
+
+  it("gateway_info：按机器整体替换；内容相同（哪怕 caps 是另一个数组实例）返回原引用；各机器条目互不牵连", () => {
+    const s1 = run(initialState(), { type: "frame", frame: infoF(M) });
+    expect(s1.gatewayInfo).toEqual({ [M]: { version: "1.44.0", caps: ["acks"] } });
+    expect(run(s1, { type: "frame", frame: infoF(M) })).toBe(s1);
+    const s2 = run(s1, { type: "frame", frame: infoF(M, "1.44.1") });
+    expect(s2.gatewayInfo).toEqual({ [M]: { version: "1.44.1", caps: ["acks"] } });
+    const s3 = run(s2, { type: "frame", frame: infoF(M, "1.44.1", []) });
+    expect(s3.gatewayInfo).toEqual({ [M]: { version: "1.44.1", caps: [] } });
+    expect(run(s3, { type: "frame", frame: infoF(M, "1.44.1", []) })).toBe(s3);
+    const home = s3.gatewayInfo[M];
+    const s4 = run(s3, { type: "frame", frame: infoF(OTHER) });
+    expect(Object.keys(s4.gatewayInfo).sort()).toEqual([M, OTHER]);
+    expect(s4.gatewayInfo[M]).toBe(home);
+    // 不可变：先前 state 的记录原样
+    expect(s1.gatewayInfo[M]).toEqual({ version: "1.44.0", caps: ["acks"] });
+  });
+
+  it("gateway_info_forget：作废该机器的能力记录；本就没有记录时原引用；其它机器的记录不动", () => {
+    const init = initialState();
+    expect(run(init, { type: "gateway_info_forget", machine: M })).toBe(init);
+    const s = run(init, { type: "frame", frame: infoF(M) }, { type: "frame", frame: infoF(OTHER) });
+    const other = s.gatewayInfo[OTHER];
+    const f = run(s, { type: "gateway_info_forget", machine: M });
+    expect(Object.keys(f.gatewayInfo)).toEqual([OTHER]);
+    expect(f.gatewayInfo[OTHER]).toBe(other);
+    expect(run(f, { type: "gateway_info_forget", machine: M })).toBe(f);
+    expect(s.gatewayInfo[M]).toBeDefined(); // 不可变
+  });
+
+  it("能力丢失（加密会话换代 / 网关改报不支持）：仍 pending 的回显收敛为 unconfirmed；sent / failed / unconfirmed / 无 ack 的不动", () => {
+    let s = run(initialState(), echo("c5")); // 能力未知时发出：无 ack
+    s = run(
+      s,
+      { type: "frame", frame: infoF(M) },
+      echo("c1"),
+      echo("c2"),
+      echo("c3"),
+      echo("c4"),
+      { type: "frame", frame: ackF("c1", "received") },
+      { type: "frame", frame: ackF("c2", "rejected", REJECT_QUEUE_FULL) },
+      timeout("c3"),
+    );
+    const losses: [string, AppState][] = [
+      ["gateway_info_forget", run(s, { type: "gateway_info_forget", machine: M })],
+      ["gateway_info caps 为空", run(s, { type: "frame", frame: infoF(M, "1.43.0", []) })],
+      ["gateway_info caps 不含 acks", run(s, { type: "frame", frame: infoF(M, "1.44.0", ["something_else"]) })],
+    ];
+    for (const [how, lost] of losses) {
+      expect(echoOf(lost, "c4")?.ack, how).toBe("unconfirmed");
+      expect(echoOf(lost, "c1")?.ack, how).toBe("sent");
+      expect(echoOf(lost, "c2"), how).toMatchObject({ ack: "failed", ackReason: "排队消息过多，这条被丢弃" });
+      expect(echoOf(lost, "c3")?.ack, how).toBe("unconfirmed");
+      expect(echoOf(lost, "c5"), how).not.toHaveProperty("ack");
+      expect(machineSupportsAcks(lost, M), how).toBe(false);
+    }
+    // 没有待确认的回显时，作废只动能力记录：条目一根没碰（spaces 同一引用）
+    const none = run(s, timeout("c4"));
+    const forgotten = run(none, { type: "gateway_info_forget", machine: M });
+    expect(forgotten.gatewayInfo).toEqual({});
+    expect(forgotten.spaces).toBe(none.spaces);
+  });
+
+  it("作废之后：新发的回显不再带 ack（旧网关的行为）；网关应答回来后恢复跟踪，先前那条不回头补", () => {
+    let s = run(acked(), { type: "gateway_info_forget", machine: M });
+    s = run(s, echo("c1"));
+    expect(echoOf(s, "c1")).not.toHaveProperty("ack");
+    s = run(s, { type: "frame", frame: infoF(M) }, echo("c2"));
+    expect(echoOf(s, "c1")).not.toHaveProperty("ack");
+    expect(echoOf(s, "c2")?.ack).toBe("pending");
+  });
+
+  // ---- 与 v1.41.8 用户自发文本镜像的协作（键形态变化的回归）----
+
+  it("带 clientId 的本机回显 + 同文本 self 帧：实时镜像被去重（原 state 引用）、history 的同文 self 行被吸收；回执仍落到这条回显上", () => {
+    let s = run(acked(), echo("c1", "帮我跑下构建", PEER));
+    const before = s;
+    expect(echoOf(s, "c1", PEER)).toMatchObject({ key: "user:c1", ack: "pending" });
+    s = run(s, {
+      type: "frame",
+      frame: frame(`{"v":1,"type":"text","convId":"${PEER}","text":"帮我跑下构建","at":1700000000000,"self":true,"machine":"${M}"}`),
+    });
+    expect(s).toBe(before);
+    s = run(s, {
+      type: "frame",
+      frame: frame(
+        `{"v":1,"type":"history","convId":"${PEER}","entries":[{"kind":"text","key":"h:5","text":"帮我跑下构建","at":1700000000000,"self":true}],"lastSeq":5,"trimmed":false,"machine":"${M}"}`,
+      ),
+    });
+    expect(s).toBe(before);
+    s = run(s, { type: "frame", frame: ackF("c1", "received", { convId: PEER }) });
+    const entries = spaceOf(s, M).convs[PEER].entries;
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ kind: "user", key: "user:c1", ack: "sent" });
+    expect(entries[0]).not.toHaveProperty("self");
+  });
+});
+
+describe("timedOutAcks（v1.44 送达回执超时判定，纯函数）", () => {
+  const M = "home-mac";
+  const OTHER = "work-mac";
+  const CONV = DEFAULT_CONV;
+  const T0 = 1_795_000_000_000;
+  /** 可控时钟：回显的 at 取 Date.now()（与 applyApprovalsSnapshot 组同手法）。 */
+  let now = 0;
+  beforeEach(() => {
+    now = T0;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+  const infoF = (machine: string): GatewayInfoFrame => ({
+    v: 1,
+    type: "gateway_info",
+    machine,
+    version: "1.44.0",
+    caps: ["acks"],
+  });
+  const echo = (clientId: string, convId = CONV, machine = M): Action => ({
+    type: "send_echo",
+    convId,
+    text: "x",
+    clientId,
+    machine,
+  });
+  const ackF = (clientId: string): AckFrame => ({
+    v: 1,
+    type: "ack",
+    machine: M,
+    clientId,
+    convId: CONV,
+    status: "received",
+  });
+
+  it("支持回执的机器：发出满 15 秒才列出（差 1ms 不列）", () => {
+    const s = run(initialState(), { type: "frame", frame: infoF(M) }, echo("c1"));
+    expect(timedOutAcks(s, T0 + ACK_TIMEOUT_MS - 1, true)).toEqual([]);
+    expect(timedOutAcks(s, T0 + ACK_TIMEOUT_MS, true)).toEqual([{ machine: M, convId: CONV, clientId: "c1" }]);
+    expect(timedOutAcks(s, T0 + 10 * ACK_TIMEOUT_MS, true)).toHaveLength(1);
+  });
+
+  it("WS 不在 ready：发出满 2 秒即列出（不必等 15 秒）；未满 2 秒不列出", () => {
+    const s = run(initialState(), { type: "frame", frame: infoF(M) }, echo("c1"));
+    expect(timedOutAcks(s, T0 + ACK_OFFLINE_TIMEOUT_MS - 1, false)).toEqual([]);
+    expect(timedOutAcks(s, T0 + ACK_OFFLINE_TIMEOUT_MS, false)).toEqual([
+      { machine: M, convId: CONV, clientId: "c1" },
+    ]);
+    // 对照：同一时刻 WS 是 ready → 不列
+    expect(timedOutAcks(s, T0 + ACK_OFFLINE_TIMEOUT_MS, true)).toEqual([]);
+  });
+
+  it("机器不支持回执（没有能力记录）时不计时——哪怕条目还挂着 pending（旧网关永不回 ack）", () => {
+    const s = run(initialState(), { type: "frame", frame: infoF(M) }, echo("c1"));
+    const lost: AppState = { ...s, gatewayInfo: {} };
+    expect(timedOutAcks(lost, T0 + 10 * ACK_TIMEOUT_MS, true)).toEqual([]);
+    expect(timedOutAcks(lost, T0 + 10 * ACK_TIMEOUT_MS, false)).toEqual([]);
+    // 对照：能力记录还在 → 同一时刻列出
+    expect(timedOutAcks(s, T0 + 10 * ACK_TIMEOUT_MS, true)).toHaveLength(1);
+  });
+
+  it("只列 pending：sent / failed / unconfirmed / 无 ack 的回显永不列出", () => {
+    let s = run(initialState(), echo("c5")); // 能力未知时发出：无 ack
+    s = run(
+      s,
+      { type: "frame", frame: infoF(M) },
+      echo("c1"),
+      echo("c2"),
+      echo("c3"),
+      echo("c4"),
+      { type: "frame", frame: ackF("c1") },
+      { type: "frame", frame: { ...ackF("c2"), status: "rejected", reason: "malformed", message: "消息格式无效" } },
+      { type: "ack_timeout", machine: M, convId: CONV, clientId: "c3" },
+    );
+    expect(timedOutAcks(s, T0 + 10 * ACK_TIMEOUT_MS, true)).toEqual([{ machine: M, convId: CONV, clientId: "c4" }]);
+  });
+
+  it("逐机器逐会话扫描：其它机器、其它会话里的待确认回显各自列出（非当前会话同样计时）", () => {
+    const s = run(
+      initialState(),
+      { type: "frame", frame: infoF(M) },
+      { type: "frame", frame: infoF(OTHER) },
+      echo("c1"),
+      echo("c2", "web:work"),
+      echo("c3", "web:work", OTHER),
+    );
+    expect(timedOutAcks(s, T0 + ACK_TIMEOUT_MS, true)).toEqual([
+      { machine: M, convId: CONV, clientId: "c1" },
+      { machine: M, convId: "web:work", clientId: "c2" },
+      { machine: OTHER, convId: "web:work", clientId: "c3" },
+    ]);
   });
 });

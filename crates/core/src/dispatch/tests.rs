@@ -86,6 +86,10 @@ type UserSentHandle = Arc<TokioMutex<Vec<(String, String)>>>;
 /// 点断言用。
 type WindowEventsHandle = Arc<TokioMutex<Vec<(String, crate::peer::WindowEvent)>>>;
 type CounterHandle = Arc<AtomicUsize>;
+/// v1.44：on_message_rejected 的 (conv, client_id, reason) 记录句柄——消息被
+/// Dispatcher 明确拒绝时的上报断言用（送达回执的三个丢弃点）。
+type RejectsHandle =
+    Arc<std::sync::Mutex<Vec<(String, String, crate::types::MessageRejectReason)>>>;
 type CallsHandle = Arc<TokioMutex<Vec<Option<String>>>>;
 type PromptsHandle = Arc<TokioMutex<Vec<String>>>;
 /// P2（v13）：MockPlatform 入站队列句柄（编程 run() 的 recv 流用）。
@@ -129,6 +133,10 @@ struct MockPlatform {
     /// v1.43：on_windows_changed 的快照全记录（同步钩子——临界区只有一次
     /// push，用 std Mutex）。
     windows_changed: Arc<std::sync::Mutex<Vec<Vec<crate::peer::WindowInfo>>>>,
+    /// v1.44：on_message_rejected 的 (conv, client_id, reason) 全记录——只有
+    /// 带回执关联 id 的消息在三个明确丢弃点被丢弃时才有条目。同步钩子，用
+    /// std Mutex。
+    rejected: RejectsHandle,
 }
 
 impl MockPlatform {
@@ -149,6 +157,7 @@ impl MockPlatform {
             peer_replies: Arc::new(TokioMutex::new(Vec::new())),
             window_events: Arc::new(TokioMutex::new(Vec::new())),
             windows_changed: Arc::new(std::sync::Mutex::new(Vec::new())),
+            rejected: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
         (p, inbox, send_count)
     }
@@ -365,6 +374,18 @@ impl Platform for MockPlatform {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(windows.to_vec());
+    }
+    /// v1.44：消息拒绝回执记录（同步钩子——纯通知，不进 sent / inbox）。
+    fn on_message_rejected(
+        &self,
+        conv: &ConvId,
+        client_id: &str,
+        reason: crate::types::MessageRejectReason,
+    ) {
+        self.rejected
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((conv.0.clone(), client_id.to_string(), reason));
     }
 }
 
@@ -817,6 +838,7 @@ fn msg(conv: &str, sender: &str, text: &str) -> InboundMessage {
         control: None,
         no_steer: false,
         reply_hint: ReplyHint::None,
+        client_id: None,
     }
 }
 
@@ -1545,6 +1567,7 @@ async fn pure_media_all_failed_replies_error() {
         control: None,
         no_steer: false,
         reply_hint: ReplyHint::None,
+        client_id: None,
     };
     feed_and_wait(&ctx, vec![m], 0).await;
 
@@ -3171,6 +3194,254 @@ async fn pending_queue_cap_warns_and_drops() {
         1,
         "只应有首轮（已 /stop all 硬停）: {prompts:?}"
     );
+    drop_db(ctx.db).await;
+}
+
+// ---------- v1.44 送达回执：Dispatcher 明确丢弃点 → on_message_rejected ----------
+
+/// 带拒绝回执观测句柄的构造（backend / budgets 可配——排队上限用例要慢后端 +
+/// 短批窗口）。与 [`build_slow`] 同构，只是把 MockPlatform 的 `rejected` 记录
+/// 端在 move 进 Arc 之前取出来。
+async fn build_with_rejects(
+    auth: Auth,
+    back: MockBackend,
+    budgets: TaskBudgets,
+) -> (Ctx, RejectsHandle) {
+    let _ = std::fs::create_dir_all("/tmp/imagent-test-ws");
+    let (plat, inbox, send_count) = MockPlatform::new();
+    let rejected = plat.rejected.clone();
+    let (calls, prompts, order) = (back.calls.clone(), back.prompts.clone(), back.order.clone());
+    let (store, db) = tmp_store().await;
+    let admins = auth.snapshot();
+    let disp = Arc::new(Dispatcher::new(
+        Arc::new(plat),
+        Arc::new(back),
+        store,
+        auth,
+        std::path::PathBuf::from("/tmp/imagent-test-ws"),
+        vec!["Read".into(), "Edit".into()],
+        PermissionMode::Off,
+        budgets,
+        CotDetail::Brief,
+        admins,
+    ));
+    (
+        Ctx {
+            disp,
+            inbox,
+            send_count,
+            calls,
+            prompts,
+            order,
+            db,
+        },
+        rejected,
+    )
+}
+
+/// 带 v1.44 回执关联 id 的消息（其余同 [`msg`]）。
+fn msg_with_client_id(conv: &str, sender: &str, text: &str, client_id: &str) -> InboundMessage {
+    let mut m = msg(conv, sender, text);
+    m.client_id = Some(client_id.into());
+    m
+}
+
+/// 白名单门（commands/mod.rs）：带回执关联 id 的入站消息被拒 → 上报
+/// (conv, client_id, NotAllowed) 恰一次；不带关联 id 的消息零次（IM 平台的
+/// 既有形态，行为不变）。同时钉住既有引导 / 静默行为未变：web 会话不是 p2p、
+/// 也不 @ bot，被拒时**完全静默**（无 send_text）——这正是回执要补的洞；p2p
+/// conv（feishu:ou_）的未授权用户照旧收到私聊引导文案，且上报不替代它。
+#[tokio::test]
+async fn reject_hook_reports_allowlist_drop_only_with_client_id() {
+    use crate::types::MessageRejectReason::NotAllowed;
+    let _serial = SERIAL.lock().await;
+    let (ctx, rejected) = build_with_rejects(
+        Auth::new(vec!["alice".into()]),
+        MockBackend::new().0,
+        test_budgets(),
+    )
+    .await;
+    let rejects = || rejected.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+    // ① 不带关联 id：静默丢弃，不上报（IM 平台消息的真实形态）。
+    ctx.disp.handle(msg("web:c1", "web:user", "hi")).await;
+    assert!(
+        rejects().is_empty(),
+        "无关联 id 的消息不上报：{:?}",
+        rejects()
+    );
+
+    // ② 带关联 id：恰一次，conv / client_id / reason 原样。
+    ctx.disp
+        .handle(msg_with_client_id(
+            "web:s-1",
+            "web:user",
+            "hi",
+            "m_1a2b3c4d",
+        ))
+        .await;
+    assert_eq!(
+        rejects(),
+        vec![("web:s-1".to_string(), "m_1a2b3c4d".to_string(), NotAllowed)]
+    );
+    // web 会话被拒时无任何出站文本（既有静默行为未变）。
+    assert!(
+        ctx.inbox.lock().await.is_empty(),
+        "web 会话被拒保持静默：{:?}",
+        *ctx.inbox.lock().await
+    );
+    assert_eq!(ctx.order.load(Ordering::SeqCst), 0, "被拒消息不进 backend");
+
+    // ③ p2p conv 的未授权用户：私聊引导文案照旧（上报与之并存，不替代）。
+    ctx.disp
+        .handle(msg_with_client_id(
+            "feishu:ou_stranger",
+            "stranger",
+            "hi",
+            "m_p2p0001",
+        ))
+        .await;
+    let inbox = ctx.inbox.lock().await.clone();
+    assert_eq!(inbox.len(), 1, "私聊引导恰一条：{inbox:?}");
+    assert!(
+        inbox[0].contains("尚未对你开放使用权限") && inbox[0].contains("/allow stranger"),
+        "引导文案未变：{inbox:?}"
+    );
+    assert_eq!(
+        rejects(),
+        vec![
+            ("web:s-1".to_string(), "m_1a2b3c4d".to_string(), NotAllowed),
+            (
+                "feishu:ou_stranger".to_string(),
+                "m_p2p0001".to_string(),
+                NotAllowed
+            ),
+        ],
+        "p2p 引导路径同样上报"
+    );
+
+    // ④ 已授权 sender 带关联 id：正常处理（进 backend），不上报。
+    ctx.disp
+        .handle(msg_with_client_id("web:s-1", "alice", "hello", "m_ok00001"))
+        .await;
+    for _ in 0..2000 {
+        if ctx.order.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(ctx.order.load(Ordering::SeqCst), 1, "已授权消息进 backend");
+    assert_eq!(rejects().len(), 2, "已授权消息不被上报：{:?}", rejects());
+    drop_db(ctx.db).await;
+}
+
+/// 发现态（commands/mod.rs 第 1 步，两个白名单都为空）：带关联 id 的入站消息
+/// 被丢弃时同样上报 (conv, client_id, NotAllowed)——语义上它就是「未授权且
+/// 消息未被处理」；既有的引导文案照旧回（两者并存）。不带关联 id 的消息零次
+/// （IM 平台的既有形态：只回引导，行为不变）。全程不进 backend。
+#[tokio::test]
+async fn reject_hook_reports_discovery_mode_drop_only_with_client_id() {
+    use crate::types::MessageRejectReason::NotAllowed;
+    let _serial = SERIAL.lock().await;
+    let (ctx, rejected) =
+        build_with_rejects(Auth::new(vec![]), MockBackend::new().0, test_budgets()).await;
+    let rejects = || rejected.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+    // ① 不带关联 id：只回引导，不上报。
+    ctx.disp.handle(msg("web:c1", "web:user", "hi")).await;
+    assert!(
+        rejects().is_empty(),
+        "无关联 id 的消息不上报：{:?}",
+        rejects()
+    );
+    let inbox = ctx.inbox.lock().await.clone();
+    assert_eq!(inbox.len(), 1, "引导文案照旧恰一条：{inbox:?}");
+    assert!(
+        inbox[0].contains("发现模式：当前白名单为空") && inbox[0].contains("web:user"),
+        "引导文案未变：{:?}",
+        inbox[0]
+    );
+
+    // ② 带关联 id：上报恰一次，引导文案照旧（并存）。
+    ctx.disp
+        .handle(msg_with_client_id(
+            "web:s-1",
+            "web:user",
+            "hi",
+            "m_1a2b3c4d",
+        ))
+        .await;
+    assert_eq!(
+        rejects(),
+        vec![("web:s-1".to_string(), "m_1a2b3c4d".to_string(), NotAllowed)]
+    );
+    let inbox = ctx.inbox.lock().await.clone();
+    assert_eq!(inbox.len(), 2, "带关联 id 的那条同样回引导：{inbox:?}");
+    assert!(
+        inbox[1].contains("发现模式：当前白名单为空") && inbox[1].contains("web:s-1"),
+        "引导文案未变：{:?}",
+        inbox[1]
+    );
+
+    assert_eq!(ctx.order.load(Ordering::SeqCst), 0, "发现态不驱动 agent");
+    drop_db(ctx.db).await;
+}
+
+/// 排队上限丢弃（dispatch/mod.rs 的 QueueFull 分支）：队列已满时带关联 id 的
+/// 消息被丢弃 → 上报 (conv, client_id, QueueFull)；不带关联 id 的超限消息零次
+/// （既有「告警按 conv 去重」行为不变）。队列是否已满用队列长度这一可观察
+/// 状态判定，不用 sleep。
+#[tokio::test]
+async fn reject_hook_reports_queue_cap_drop() {
+    use crate::types::MessageRejectReason::QueueFull;
+    let _serial = SERIAL.lock().await;
+    let (ctx, rejected) = build_with_rejects(
+        Auth::new(vec!["alice".into()]),
+        MockBackend::new_slow(30_000).0,
+        TaskBudgets {
+            batch_window: Duration::from_millis(1),
+            ..test_budgets()
+        },
+    )
+    .await;
+    let rejects = || rejected.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let disp = ctx.disp.clone();
+    let runner = tokio::spawn(async move {
+        disp.handle(msg("c1", "alice", "long first round")).await;
+    });
+    assert!(wait_registered(&ctx, "c1").await, "在飞任务应已注册");
+
+    // 填满队列：PENDING_QUEUE_CAP 条不带关联 id 的消息逐条入队（handle
+    // 返回即已入队）。
+    for i in 0..PENDING_QUEUE_CAP {
+        ctx.disp
+            .handle(msg("c1", "alice", &format!("fill {i}")))
+            .await;
+    }
+    assert_eq!(
+        conv_queued_len(&ctx.disp, "c1").await,
+        PENDING_QUEUE_CAP,
+        "队列应恰好满"
+    );
+    assert!(rejects().is_empty(), "排队入队不是丢弃，不上报");
+
+    // 超限且不带关联 id：丢弃（既有告警路径），不上报。
+    ctx.disp.handle(msg("c1", "alice", "overflow-anon")).await;
+    assert!(rejects().is_empty(), "无关联 id 的超限消息不上报");
+
+    // 超限且带关联 id：上报恰一次。
+    ctx.disp
+        .handle(msg_with_client_id("c1", "alice", "overflow", "m_over001"))
+        .await;
+    assert_eq!(
+        rejects(),
+        vec![("c1".to_string(), "m_over001".to_string(), QueueFull)]
+    );
+    // 队列长度不变（被丢弃的消息没有入队）。
+    assert_eq!(conv_queued_len(&ctx.disp, "c1").await, PENDING_QUEUE_CAP);
+
+    ctx.disp.handle(msg("c1", "alice", "/stop all")).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), runner).await;
     drop_db(ctx.db).await;
 }
 
@@ -5461,6 +5732,7 @@ fn recall_msg(conv: &str, msg_id: &str, notify: Option<&str>, probes: &[&str]) -
         }),
         no_steer: false,
         reply_hint: ReplyHint::None,
+        client_id: None,
     }
 }
 
@@ -5624,6 +5896,7 @@ async fn bot_removed_from_chat_revokes_and_notifies_admin() {
         control: Some(crate::types::InboundControl::BotRemovedFromChat),
         no_steer: false,
         reply_hint: ReplyHint::None,
+        client_id: None,
     };
     ctx.disp.handle(removed).await;
     // 内存：群白名单已收回。
@@ -5659,6 +5932,7 @@ async fn bot_removed_from_chat_revokes_and_notifies_admin() {
         control: Some(crate::types::InboundControl::BotRemovedFromChat),
         no_steer: false,
         reply_hint: ReplyHint::None,
+        client_id: None,
     };
     ctx.disp.handle(removed).await;
     let inbox = ctx.inbox.lock().await.clone();
@@ -9280,6 +9554,9 @@ struct PeerCtx {
     window_events: WindowEventsHandle,
     /// v1.43：on_windows_changed 的快照全记录（peer 轮询回调的转发落点）。
     windows_changed: Arc<std::sync::Mutex<Vec<Vec<crate::peer::WindowInfo>>>>,
+    /// v1.44：on_message_rejected 的 (conv, client_id, reason) 全记录——peer
+    /// 出站投递失败的上报断言用。
+    rejected: RejectsHandle,
 }
 
 /// 自建带观测句柄的 dispatcher（MockPlatform::new_with_errors 供 error 帧
@@ -9290,6 +9567,7 @@ async fn build_peer_ctx() -> PeerCtx {
     let peer_replies = plat.peer_replies.clone();
     let window_events = plat.window_events.clone();
     let windows_changed = plat.windows_changed.clone();
+    let rejected = plat.rejected.clone();
     let (back, calls, _prompts, _order) = MockBackend::new();
     let (store, _db) = tmp_store().await;
     let auth = Auth::new(vec!["u1".into()]);
@@ -9316,6 +9594,7 @@ async fn build_peer_ctx() -> PeerCtx {
         peer_replies,
         window_events,
         windows_changed,
+        rejected,
     }
 }
 
@@ -9571,6 +9850,88 @@ async fn peer_conv_unreachable_returns_error_note() {
         *ctx.sent.lock().await
     );
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// v1.44 peer 出站投递失败（dispatch/peer.rs）：带关联 id 的消息上报
+/// (conv, client_id, PeerUnreachable) 恰一次，且与既有 `peer_unreachable`
+/// error 帧**并存**（toast 无关联 id，回执才能标到那条具体的消息上）；不带
+/// 关联 id 时零次（既有行为不变）。对照：窗口可达时投递成功，带关联 id 也
+/// 不上报——钩子只在失败路径触发，不是「peer 会话的消息都上报」。
+#[tokio::test]
+async fn peer_conv_unreachable_reports_reject_only_with_client_id() {
+    use crate::types::MessageRejectReason::PeerUnreachable;
+    let _g = SERIAL.lock().await;
+    // ---- 不可达：空 registry ----
+    let ctx = build_peer_ctx().await;
+    let base = PathBuf::from("/tmp").join(format!("ipdnone_{}_1", std::process::id()));
+    tokio::fs::create_dir_all(base.join("r")).await.unwrap();
+    ctx.disp.set_peer_sender(Some(Arc::new(PeerSender::new(
+        base.join("r"),
+        base.join("own.sock"),
+        "im-agent".to_string(),
+    ))));
+    let rejects = || {
+        ctx.rejected
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    };
+
+    // 不带关联 id：error 帧照旧，钩子零次。
+    ctx.disp.handle(msg("peer:ghost", "u1", "你好")).await;
+    assert_eq!(ctx.errors.lock().await.len(), 1, "既有 error 帧不变");
+    assert!(rejects().is_empty(), "无关联 id 不上报：{:?}", rejects());
+
+    // 带关联 id：钩子恰一次 + error 帧仍恰一帧（并存）。
+    ctx.disp
+        .handle(msg_with_client_id("peer:ghost", "u1", "你好", "m_peer0001"))
+        .await;
+    assert_eq!(
+        rejects(),
+        vec![(
+            "peer:ghost".to_string(),
+            "m_peer0001".to_string(),
+            PeerUnreachable
+        )]
+    );
+    assert_eq!(
+        ctx.errors.lock().await.len(),
+        2,
+        "error 帧与回执并存（带关联 id 的那次也回）"
+    );
+    assert!(ctx.calls.lock().await.is_empty(), "不可达路径不进 agent");
+    let _ = std::fs::remove_dir_all(&base);
+
+    // ---- 可达对照：mock 窗口在线 → 投递成功 → 不上报 ----
+    let ctx = build_peer_ctx().await;
+    let win = peer_mock_window("win-ok").await;
+    ctx.disp.set_peer_sender(Some(Arc::new(PeerSender::new(
+        win.registry_dir.clone(),
+        win.base.join("own.sock"),
+        "im-agent".to_string(),
+    ))));
+    ctx.disp
+        .handle(msg_with_client_id(
+            "peer:win-ok",
+            "u1",
+            "帮我跑下构建",
+            "m_peer0002",
+        ))
+        .await;
+    let line = win.wait_frame().await;
+    assert!(
+        line.contains("帮我跑下构建"),
+        "窗口应收到帧（投递成功）：{line}"
+    );
+    assert!(
+        ctx.rejected
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty(),
+        "投递成功不上报"
+    );
+    assert!(ctx.errors.lock().await.is_empty(), "投递成功无 error 帧");
+    let _ = std::fs::remove_dir_all(&win.base);
 }
 
 /// sender 未注入（peer_enabled=false 或启动失败）：peer: 文本回提示，不静默。

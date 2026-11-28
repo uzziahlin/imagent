@@ -41,6 +41,7 @@ impl Platform for ConsolePlatform {
             control: None,
             no_steer: false,
             reply_hint: ReplyHint::None,
+            client_id: None,
         })
     }
 

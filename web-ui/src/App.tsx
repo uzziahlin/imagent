@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useReducer, useRef, useState, type FormEvent } from "react";
 import {
+  ACK_TIMEOUT_TICK_MS,
   DEFAULT_CONV,
   DEFAULT_MACHINE,
   applyApprovalsSnapshot,
@@ -8,9 +9,11 @@ import {
   deviceSummary,
   initialState,
   newAutoConvName,
+  newClientId,
   peerConvOf,
   reducer,
   spaceOf,
+  timedOutAcks,
   type Action,
   type ApprovalDecision,
   type ApprovalSnapshotItem,
@@ -400,6 +403,10 @@ export default function App() {
   // （error 帧本体照常进 reducer 走 lastError 全局 toast）。两者转发 Composer
   // （文本回填输入框 / 行内 alert），每次事件新对象引用变化驱动其 effect。
   const [asrEvent, setAsrEvent] = useState<AsrUiEvent | null>(null);
+  // v1.44 草稿重读信号：重发时连接未就绪，文字被放回当前会话的输入框（经草稿
+  // store）后递增；Composer 平时只在切换会话时读 store，靠它得知 store 被本层
+  // 改过而重新载入。
+  const [draftReload, setDraftReload] = useState(0);
 
   /** 挂载恢复：loadAll → spaces 预填（initialState 之后、WS 帧之前；异步竞态
    *  时恢复条目垫在已到帧之前，见 restoreHistory）。加载完成前渲染空态
@@ -640,6 +647,15 @@ export default function App() {
       // 一次，才是看板数据的确定来源。新上线的机器也只经这里补查（machines
       // 帧重排不触发第一个触发点）。
       wsRef.current?.sendWindowsQuery(ev.machine);
+      // v1.44 送达回执 / 网关版本，同一时刻的第三个动作：先作废上一代加密会话里
+      // 问到的网关能力，再重查。加密会话每次换代（WS 重连 / 网关重启后重新握手）
+      // 都必经这里，而网关可能已换成旧二进制——旧网关不回 gateway_info，留着
+      // 旧记录就判不出来：该机器的每条新消息都会「发送中」→ 超时 →「未确认送达」
+      // 并诱导重发。作废的那一瞬到新应答之间发出的消息不带送达状态，随后到达
+      // 的回执照常能把它们标成 sent / failed。TOFU 确认后的重新握手同样走到
+      // active，多查一次无害（幂等）。
+      dispatch({ type: "gateway_info_forget", machine: ev.machine });
+      wsRef.current?.sendGatewayInfoQuery(ev.machine);
     }
   };
 
@@ -926,6 +942,46 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅读 wsRef；依赖刻意不含 machines 与 currentMachine（理由见上）
   }, [state.machinesKnown, status]);
 
+  // v1.44 送达回执 / 网关版本（第一个触发点）：与上方两个查询同一纪律——ready 且
+  // 多机模式时，对**全部在线机器**各查一次网关版本与能力。旧网关不回，没有回帧
+  // 就没有 state.gatewayInfo[machine]，等于「不支持回执」：该机器的本机回显不
+  // 带送达状态，管理页也不显示版本。依赖同样刻意只有 machinesKnown 与 status
+  // （理由见上，不再叠一层重连后的出站突发）；新上线机器由它握手完成时的第二
+  // 个触发点（onE2eEvent 的 active）覆盖。
+  useEffect(() => {
+    if (state.machinesKnown && status === "ready") {
+      for (const machine of state.machines) {
+        wsRef.current?.sendGatewayInfoQuery(machine);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅读 wsRef；依赖刻意不含 machines 与 currentMachine（理由见上）
+  }, [state.machinesKnown, status]);
+
+  // v1.44 送达回执超时：发出后一直等不到回执的回显，每 2 秒巡检一次，按
+  // timedOutAcks（纯函数，protocol.ts）的结论派发 ack_timeout——满 15 秒，或 WS
+  // 不在 ready 且满 2 秒（连接断了回执就到不了）。只对支持回执的机器生效
+  // （判定在纯函数里）。没有任何待确认的回显时不起定时器（空闲零唤醒）；定时器
+  // 存活期间读 ref 取最新状态与连接态，不随渲染重排，也不额外触发渲染。
+  const hasPendingAck = useMemo(
+    () =>
+      Object.values(state.spaces).some((sp) =>
+        Object.values(sp.convs).some((c) => c.entries.some((e) => e.kind === "user" && e.ack === "pending")),
+      ),
+    [state.spaces],
+  );
+  useEffect(() => {
+    if (!hasPendingAck) {
+      return;
+    }
+    const timer = setInterval(() => {
+      const s = stateRef.current;
+      for (const t of timedOutAcks(s, Date.now(), statusRef.current === "ready")) {
+        dispatch({ type: "ack_timeout", ...t });
+      }
+    }, ACK_TIMEOUT_TICK_MS);
+    return () => clearInterval(timer);
+  }, [hasPendingAck]);
+
   // v1.8 会话历史重放：ready / 切机 / 切会话后对当前 conv 按本地高水位增量
   // 拉取（history_query 业务帧，E2E 加密）。触发维度 = 上方 sync+workspace_list
   // 的 ready/机器条件 + currentConv——每次切换都查（空增量便宜，网关按 seq
@@ -1162,13 +1218,19 @@ export default function App() {
    *  本身不产生消息流回显之外的可观测反馈）。仅 `/model ` 前缀且非仅
    *  `/model`（无参形态是查看而非切换）。 */
   const sendMessage = (text: string, media?: MediaPayload): boolean => {
-    const ok = wsRef.current?.sendMessage(currentConv, text, outMachine(), media) ?? false;
+    // v1.44：每次发送生成新的 clientId——message 帧带上它，网关据此回送达回执；
+    // 本地回显的键与关联字段取同一个值（一帧对应一条回显）。
+    const clientId = newClientId();
+    const ok = wsRef.current?.sendMessage(currentConv, text, outMachine(), media, clientId) ?? false;
     if (ok) {
       dispatch({
         type: "send_echo",
         convId: currentConv,
         text: text || "[图片]",
         machine: state.currentMachine,
+        clientId,
+        // 带图的消息：回显里没有图片本体，标记出来让界面不给「重发」
+        ...(media ? { image: true } : {}),
       });
       if (text.startsWith("/model ") && text.trim() !== "/model") {
         const machine = outMachine();
@@ -1178,6 +1240,25 @@ export default function App() {
       }
     }
     return ok;
+  };
+
+  /** v1.44 重发：把一条没送达 / 未确认送达的消息的文字当**新消息**再发一次
+   *  （走同一条 sendMessage 路径：新的 clientId、新的回显；原条目保持原样——
+   *  它的结局确实是那样，重发是另发一条）。没发出去（连接未就绪 / 握手
+   *  fail-closed 拒发）时文字放回**当前**会话的输入框并提示：「重发」按钮只在
+   *  当前会话的消息列表里，上抛的就是当前会话的条目。以 sendMessage 的返回值
+   *  而不是连接态判断——status 为 ready 但握手待确认时帧同样发不出去，只看
+   *  连接态会让点击没有任何反应。追加而不是覆盖：用户可能正在输入别的；
+   *  连接恢复后发不发由用户决定。 */
+  const resend = (text: string): void => {
+    if (sendMessage(text)) {
+      return;
+    }
+    drafts.appendText(draftKey(state.currentMachine, currentConv), (prev) =>
+      prev ? `${prev}\n${text}` : text,
+    );
+    setDraftReload((n) => n + 1);
+    setLocalToast({ text: "连接未就绪，已放回输入框", tone: "error" });
   };
 
   // v1.6 当前机器工作空间快照（workspaces 帧；null = 无快照（旧网关），目录条
@@ -1198,7 +1279,11 @@ export default function App() {
    *  undefined = 跟随网关默认引擎，不发命令。 */
   const createConv = (name: string, dir: string | undefined, backend: string | undefined): boolean => {
     const convName = name.trim() || newAutoConvName();
-    const ok = wsRef.current?.sendMessage(undefined, `/switch ${convName}`, outMachine()) ?? false;
+    // v1.44：/switch 与 /backend 也是 message 帧——同样带 clientId、回显按它关联
+    //（网关的送达回执 / 拒绝原因照常落到这两条回显上）。
+    const switchId = newClientId();
+    const ok =
+      wsRef.current?.sendMessage(undefined, `/switch ${convName}`, outMachine(), undefined, switchId) ?? false;
     if (!ok) {
       return false;
     }
@@ -1207,16 +1292,19 @@ export default function App() {
       convId: DEFAULT_CONV,
       text: `/switch ${convName}`,
       machine: state.currentMachine,
+      clientId: switchId,
     });
     dispatch({ type: "select_conv", convId: toConvId(convName) });
     if (backend !== undefined) {
       const newConvId = toConvId(convName);
-      if (wsRef.current?.sendMessage(newConvId, `/backend ${backend}`, outMachine())) {
+      const backendId = newClientId();
+      if (wsRef.current?.sendMessage(newConvId, `/backend ${backend}`, outMachine(), undefined, backendId)) {
         dispatch({
           type: "send_echo",
           convId: newConvId,
           text: `/backend ${backend}`,
           machine: state.currentMachine,
+          clientId: backendId,
         });
       }
     }
@@ -1792,6 +1880,7 @@ export default function App() {
             entries={conv.entries}
             onSample={status === "ready" ? (t) => sendMessage(t) : undefined}
             emptyHint={peerEmptyHint}
+            onResend={resend}
           />
         </main>
         <Composer
@@ -1802,6 +1891,7 @@ export default function App() {
           asrEvent={asrEvent}
           drafts={drafts}
           draftKey={draftKey(state.currentMachine, currentConv)}
+          draftReload={draftReload}
           onAsr={(audioB64, durationMs) =>
             wsRef.current?.sendAsrRequest(audioB64, durationMs, outMachine()) ?? false
           }
@@ -2007,6 +2097,7 @@ export default function App() {
         onRevokePasskey={revokePasskey}
         pins={e2ePins}
         onResetPin={resetPin}
+        gatewayInfo={state.gatewayInfo}
         onClose={() => setAdminOpen(false)}
       />
 

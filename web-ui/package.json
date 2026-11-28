@@ -1,7 +1,7 @@
 {
   "name": "imagent-web-ui",
   "private": true,
-  "version": "1.43.0",
+  "version": "1.44.0",
   "type": "module",
   "description": "imagent Web 驾驶舱 SPA 基座（M3a）：登录 / WS 连接管理 / 消息流 / 审批 / composer",
   "scripts": {

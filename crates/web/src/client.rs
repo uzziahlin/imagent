@@ -26,6 +26,19 @@
 //! - `asr_tx`：v1.40 语音转写（asr_request 帧）→ platform 的 ASR 泵
 //!   （b64 解码 + 写临时 WAV + spawn whisper-cli + 回 asr_result 帧）；
 //! - `outbound_rx`：platform 序列化好的出站帧（JSON 文本）→ relay → 浏览器。
+//! - `outbound_tx`（v1.44）：同一条出站通道的**发送端**——client 自发的帧
+//!   （`ack{received}` / `ack{rejected,malformed}` / `gateway_info`）经它入队，
+//!   与 platform 的帧走同一条 `send_business` 路径（E2E 活跃时逐把密钥加密）。
+//!   best-effort：`try_send`，队列满只 debug。
+//!
+//! client 自发起的 v1.44 帧（详见各分支注释）：
+//! - `received` 回执：带合规 `clientId` 的 `message` 帧**进入平台入站 channel
+//!   之后**才发（纯文本在本层 `deliver_inbound`，带图在 platform 媒体泵）——
+//!   它证明的是「到达了网关」，发早了会把一条实际被丢弃的消息报成已送达；
+//! - `malformed` 回执：`map_inbound_frame` 判 `Warn` 且帧里能读出合规
+//!   `clientId` 时回（消息格式无效）；
+//! - `gateway_info`：`gateway_info_query` 的应答（无状态，直接在本层出站）。
+//! - `e2e_close`（入站，封在 enc 里）：解开后删除解开它的那把密钥，不回帧。
 //!
 //! 协议细节（§4）：relay 对浏览器侧有 90s idle 超时，网关 30s 发协议层
 //! `Message::Ping` 保活；浏览器应用层 `ping` JSON 帧由本层直接回 `pong`
@@ -54,7 +67,10 @@ use imagent_core::{CoreError, InboundMessage, Result};
 
 use crate::e2e::{E2eIdentity, E2eSessions};
 use crate::platform::SyncRequest;
-use crate::{map_inbound_frame, GatewayCredential, InboundAction, PushEvent, TARGET};
+use crate::{
+    map_inbound_frame, normalize_conv, parse_client_id, AckStatus, GatewayCredential,
+    InboundAction, PushEvent, TARGET,
+};
 
 /// 建连后的 WS 流类型（connect_async 的产物）。
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -108,6 +124,13 @@ pub(crate) struct WebClient {
     /// 经 `WebPlatform::set_peer_state` 后填；`None` = peer 通道未启用，
     /// `windows_query` / `window_watch` 一律忽略）。
     pub(crate) peer_state: Arc<std::sync::Mutex<Option<Arc<PeerState>>>>,
+    /// v1.44 出站通道的发送端（与 `outbound_rx` 同一条 channel；platform 与
+    /// 各泵各持一份）。client 自发的 `ack` / `gateway_info` 帧经它入队，随
+    /// platform 的帧一起走 `send_business`（E2E 活跃时逐把密钥加密）。
+    /// 副作用：本任务因此永远持有一个 sender，`outbound_rx.recv()` 不会再
+    /// 返回 None——停机完全由 `shutdown` token 承担（平台 Drop 即 cancel，
+    /// 见 [`WebClient::run`]），与此前行为一致。
+    pub(crate) outbound_tx: mpsc::Sender<String>,
 }
 
 impl WebClient {
@@ -352,8 +375,10 @@ impl WebClient {
         info!(target: TARGET, machine = %self.machine_id, "relay 已连接（hello_ack 确认身份），开始收发");
 
         // E2E 会话表（协议 v1.4）：per-relay-连接重建——网关重连即清空全部
-        // 会话加密器（「断连清 session 加密器」的网关侧实现：浏览器断连对
-        // 网关不可见，靠浏览器重连重握手覆盖同 sid + 半开清理/容量淘汰兜底）。
+        // 会话密钥（「断连清 session 加密器」的网关侧实现）。v1.44 起表是
+        // 「每个登录会话多把密钥」：同 sid 的多个标签页各自握手、互不顶替；
+        // 浏览器断连对网关不可见，密钥靠 e2e_close / 空闲回收 / 容量淘汰
+        // 退场（见 e2e 模块头「多标签页」）。
         let mut e2e_sessions = E2eSessions::new();
 
         // 收发循环。interval 首 tick 立即触发，先吃掉避免开局立刻发 ping。
@@ -396,7 +421,9 @@ impl WebClient {
                     let json = match maybe_json {
                         Some(j) => j,
                         None => {
-                            // platform 端 sender 全部 drop（平台退出），正常收尾。
+                            // 类型完备分支，实际不可达：v1.44 起本任务自己持有
+                            // 一个 outbound sender（见 WebClient::outbound_tx），
+                            // channel 不会关闭。停机由 shutdown token 承担。
                             return Ok(());
                         }
                     };
@@ -424,7 +451,8 @@ impl WebClient {
                 }
 
                 // 心跳：协议层 Ping（relay idle 90s，30s 保活）+ 顺带执行 E2E
-                // 半开会话清理（60s TTL，无需独立定时器）。
+                // 密钥清理（半开 60s TTL + v1.44 已确认密钥空闲 600s 回收，
+                // 无需独立定时器）。
                 _ = heartbeat.tick() => {
                     e2e_sessions.prune(Instant::now());
                     if let Err(e) = ws.send(Message::Ping(Vec::new().into())).await {
@@ -436,11 +464,12 @@ impl WebClient {
         }
     }
 
-    /// 出站业务帧发送（v1.4 E2E 包装点）：有活跃会话 → 对每个已握手 sid 各
-    /// 密封一份 enc{sid}（sync 重发帧同样流经此处，天然逐会话加密）；无会话
-    /// → 明文直发（行为与 v1.3 完全一致）。曾加密过的连接回退明文时 warn
-    /// 一次（降级观测点：正常只有「全部浏览器断开且会话清理」才触发，恶意
-    /// 中继丢弃浏览器 enc 帧也会走到这里）。
+    /// 出站业务帧发送（v1.4 E2E 包装点）：表里有密钥 → **每把密钥**各密封
+    /// 一份 enc{sid}（同会话的每个标签页一份；sync 重发帧、client 自发的
+    /// ack / gateway_info 同样流经此处，天然逐密钥加密）；无密钥 → 明文直发
+    /// （行为与 v1.3 完全一致）。曾加密过的连接回退明文时 warn 一次（降级
+    /// 观测点：正常只有「全部浏览器断开且密钥被回收」才触发，恶意中继丢弃
+    /// 浏览器 enc 帧也会走到这里）。
     async fn send_business(
         &self,
         ws: &mut WsStream,
@@ -466,7 +495,7 @@ impl WebClient {
                     .await
                     .map_err(|e| CoreError::Platform(TARGET, format!("ws send: {e}")))?;
             }
-            debug!(target: TARGET, sessions = sessions.len(), "已发出站 enc 帧（逐会话各一份）");
+            debug!(target: TARGET, keys = sessions.len(), "已发出站 enc 帧（逐密钥各一份）");
         }
         Ok(())
     }
@@ -474,10 +503,12 @@ impl WebClient {
     /// 单条入站文本帧分拣：relay 自产帧（machine/machines/error/hello_ack）
     /// 本层自理（machines 只推浏览器，网关侧正常收不到，落到 Ignore 容错）；
     /// E2E 帧（v1.4）：`e2e_hello` → 握手应答（e2e_ack），`enc` → 试解后把
-    /// 内层业务帧走既有分发；业务帧（message/approval_response/control/
+    /// 内层业务帧走既有分发（v1.44：内层是 `e2e_close` 则摘掉解开它的那把
+    /// 密钥、不进分发）；业务帧（message/approval_response/control/
     /// sync/ping + v1.6 工作空间 workspace_list/workspace_save/
     /// workspace_remove/conv_workdir_set + v1.8 history_query + v1.42
-    /// approvals_query + v1.43 windows_query/window_watch，均可带 relay 路由用的
+    /// approvals_query + v1.43 windows_query/window_watch + v1.44
+    /// gateway_info_query，均可带 relay 路由用的
     /// machine 字段——网关侧无需消费）经 [`map_inbound_frame`] 映射。
     /// 畸形 JSON warn 丢弃（不断连——浏览器/中继偶发杂帧不致网关重连）。
     async fn handle_text(
@@ -525,24 +556,46 @@ impl WebClient {
                     );
                 }
             },
-            // E2E 密文帧（v1.4）：浏览器→网关方向无 sid，逐活跃会话试解
-            //（≤8 次，见 E2eSessions::open_any）后走既有业务分发。
+            // E2E 密文帧（v1.4）：浏览器→网关方向无 sid，逐把密钥试解
+            //（≤ [`E2eSessions::MAX_KEYS_TOTAL`] 次，见 E2eSessions::open_any）
+            // 后走既有业务分发。
             "enc" => {
                 let Some(boxed) = v.get("box").and_then(|b| b.as_str()) else {
                     warn!(target: TARGET, "enc 帧缺 box 字段，丢弃");
                     return Ok(());
                 };
-                match e2e_sessions.open_any(boxed) {
-                    Some(inner) => match serde_json::from_str::<serde_json::Value>(&inner) {
-                        Ok(inner_v) => self.dispatch_business(ws, &inner_v, e2e_sessions).await?,
-                        Err(e) => {
-                            warn!(target: TARGET, error = %e, "enc 帧解密后内层 JSON 畸形，丢弃");
+                match e2e_sessions.open_any(boxed, Instant::now()) {
+                    Some(opened) => {
+                        let inner_v: serde_json::Value = match serde_json::from_str(
+                            &opened.plaintext,
+                        ) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                warn!(target: TARGET, error = %e, "enc 帧解密后内层 JSON 畸形，丢弃");
+                                return Ok(());
+                            }
+                        };
+                        // v1.44 e2e_close：标签页关闭时发的「注销本密钥」——删除
+                        // **解开这帧的那把**密钥（同会话其它标签页不受影响），
+                        // 不回任何帧、不进业务分发。崩溃 / 被 kill 的标签页发
+                        // 不出，靠 prune 的空闲回收兜底。旧网关解开后按未知
+                        // type 忽略，无副作用。
+                        if inner_v.get("type").and_then(|t| t.as_str()) == Some("e2e_close") {
+                            e2e_sessions.remove(&opened.sid, &opened.key);
+                            debug!(
+                                target: TARGET,
+                                sid = %crate::e2e::short_sid(&opened.sid),
+                                remaining_keys = e2e_sessions.len(),
+                                "e2e_close：已移除该标签页的会话密钥，不回帧"
+                            );
+                            return Ok(());
                         }
-                    },
+                        self.dispatch_business(ws, &inner_v, e2e_sessions).await?
+                    }
                     None => {
                         warn!(
                             target: TARGET,
-                            "enc 帧无法用任何活跃会话解密（无握手/密钥已轮换/半开已清理），丢弃"
+                            "enc 帧无法用任何活跃密钥解密（无握手/密钥已 e2e_close 或回收），丢弃"
                         );
                     }
                 }
@@ -552,37 +605,37 @@ impl WebClient {
         Ok(())
     }
 
-    /// 业务帧分发（明文直收与 enc 解密后共用）：入站映射 + ping 直接回
-    /// （pong 经 [`Self::send_business`]——E2E 会话活跃时 pong 同为业务帧，
-    /// 逐 sid 加密）。
+    /// 业务帧分发（明文直收与 enc 解密后共用）。ping 是唯一要写 ws 的动作
+    /// （pong 经 [`Self::send_business`]——E2E 密钥活跃时同为业务帧，逐把密钥
+    /// 加密）；其余动作都不碰 ws，落在可单测的 [`Self::dispatch_action`]。
     async fn dispatch_business(
         &self,
         ws: &mut WsStream,
         v: &serde_json::Value,
         e2e_sessions: &mut E2eSessions,
     ) -> Result<()> {
-        match map_inbound_frame(v, &self.default_session) {
-            InboundAction::Message(msg) => {
-                // 入站 best-effort 推给 platform：1s 有界背压（消费端短暂
-                // 抖动不丢用户消息；持续满才丢弃，对齐 wecom P5-12）。
-                match tokio::time::timeout(Duration::from_secs(1), self.inbound_tx.send(*msg)).await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(_)) => {
-                        return Err(CoreError::Platform(
-                            TARGET,
-                            "入站 channel 已关闭（platform 退出）".into(),
-                        ));
-                    }
-                    Err(_) => {
-                        warn!(target: TARGET, "入站 channel 持续满 1s，丢弃浏览器消息");
-                    }
-                }
-            }
+        let act = map_inbound_frame(v, &self.default_session);
+        if matches!(act, InboundAction::Ping) {
+            // 应用层 ping：本层直接回 pong（§4.1，不进 recv），带本机
+            // machine（v1.1 全部出站帧约定）。
+            let pong = crate::encode_pong_frame(&self.machine_id);
+            return self.send_business(ws, pong, e2e_sessions).await;
+        }
+        self.dispatch_action(v, act).await
+    }
+
+    /// 不碰 ws 的业务动作分发（client 单测直接驱动，不必连 relay）。`v` 是
+    /// 原始帧——`Warn` 分支要回头读 `clientId` / `convId` 组 malformed 回执
+    /// （[`InboundAction::Warn`] 只带原因文本）。
+    async fn dispatch_action(&self, v: &serde_json::Value, act: InboundAction) -> Result<()> {
+        match act {
+            InboundAction::Message(msg) => self.deliver_inbound(msg).await?,
             // v1.7 媒体上行 → platform 媒体泵（b64 解码 + 落盘是文件系统
             // IO，不占 client 收发循环；失败 error 帧经泵的 outbound 通道回）。
             // 同 1s 有界背压：泵毫秒级吞吐，持续满只在异常时出现——丢弃由
-            // SPA 无回执感知 + 用户重发兜底。
+            // SPA 无回执感知 + 用户重发兜底。v1.44：`received` 回执由泵在
+            // 合成消息**进入入站 channel 之后**发（clientId 随动作带过去），
+            // 本层只经 media channel，不算「已接下」。
             act @ InboundAction::MediaMessage { .. } => {
                 if tokio::time::timeout(Duration::from_secs(1), self.media_tx.send(act))
                     .await
@@ -692,20 +745,112 @@ impl WebClient {
                     warn!(target: TARGET, "asr channel 持续满 1s，丢弃 asr_request 请求");
                 }
             }
-            InboundAction::Ping => {
-                // 应用层 ping：本层直接回 pong（§4.1，不进 recv），带本机
-                // machine（v1.1 全部出站帧约定）。
-                let pong = crate::encode_pong_frame(&self.machine_id);
-                self.send_business(ws, pong, e2e_sessions).await?;
+            // v1.44 网关信息查询：无状态应答（版本 + 能力字面量都是编译期
+            // 常量），本层直接出站，不必绕 sync 泵。best-effort：丢弃由 SPA
+            // 重发兜底（重连 / 加密会话建立后各发一次）。
+            InboundAction::GatewayInfoQuery => {
+                debug!(target: TARGET, "gateway_info_query：回 gateway_info");
+                self.enqueue_client_frame(
+                    crate::encode_gateway_info_frame(&self.machine_id),
+                    "gateway_info",
+                );
             }
+            // ping 已在 dispatch_business 处理（唯一要写 ws 的动作）。
+            InboundAction::Ping => {}
             InboundAction::Ignore => {
                 debug!(target: TARGET, kind = v.get("type").and_then(|t| t.as_str()).unwrap_or(""), "未知入站帧 type，忽略（前向兼容）");
             }
             InboundAction::Warn(reason) => {
                 warn!(target: TARGET, kind = v.get("type").and_then(|t| t.as_str()).unwrap_or(""), reason, "入站帧违规，丢弃");
+                // v1.44：违规帧若带合规 clientId，回 `rejected{malformed}`——
+                // 发送方据此把那条消息标成「未送达：消息格式无效」，而不是
+                // 等到超时变「未确认送达」。convId 按 message 帧既有规则归一
+                //（缺席 / 非字符串 → 默认会话）：发送方没写会话时回执落默认
+                // 会话，正是它那条消息被归到的会话。
+                if let Some(client_id) = parse_client_id(v.get("clientId")) {
+                    let conv = normalize_conv(
+                        v.get("convId").and_then(|c| c.as_str()),
+                        &self.default_session,
+                    );
+                    self.enqueue_client_frame(
+                        crate::encode_ack_frame(
+                            &self.machine_id,
+                            &client_id,
+                            &conv,
+                            AckStatus::Rejected {
+                                reason: crate::ACK_MALFORMED_REASON,
+                                message: crate::ACK_MALFORMED_MESSAGE,
+                            },
+                        ),
+                        "ack(malformed)",
+                    );
+                }
             }
         }
         Ok(())
+    }
+
+    /// 业务消息投进入站 channel（→ platform.recv）。v1.44：消息带合规
+    /// `client_id` 且**投递成功之后**才出站 `ack{received}`——回执证明的是
+    /// 「到达了网关」，发早了会把一条实际被丢弃的消息报成已送达。入站
+    /// channel 持续满 1s 被丢弃时不发回执（浏览器超时判定为「未确认送达」）。
+    async fn deliver_inbound(&self, msg: Box<InboundMessage>) -> Result<()> {
+        // 投递之前先取出回执要素（msg 随 send 被 move 走）。
+        let receipt = msg
+            .client_id
+            .as_ref()
+            .map(|client_id| (msg.conv_id.0.clone(), client_id.clone()));
+        // 入站 best-effort 推给 platform：1s 有界背压（消费端短暂抖动不丢
+        // 用户消息；持续满才丢弃，对齐 wecom P5-12）。
+        match tokio::time::timeout(Duration::from_secs(1), self.inbound_tx.send(*msg)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                return Err(CoreError::Platform(
+                    TARGET,
+                    "入站 channel 已关闭（platform 退出）".into(),
+                ));
+            }
+            Err(_) => {
+                warn!(target: TARGET, "入站 channel 持续满 1s，丢弃浏览器消息");
+                return Ok(());
+            }
+        }
+        // 走到这里 = 消息已在入站 channel 里。
+        if let Some((conv, client_id)) = receipt {
+            self.ack(&client_id, &conv, AckStatus::Received);
+        }
+        Ok(())
+    }
+
+    /// v1.44 送达回执出站（best-effort，见 [`Self::enqueue_client_frame`]）。
+    fn ack(&self, client_id: &str, conv: &str, status: AckStatus) {
+        self.enqueue_client_frame(
+            crate::encode_ack_frame(&self.machine_id, client_id, conv, status),
+            "ack",
+        );
+    }
+
+    /// client 自发帧入队（v1.44：`ack` / `gateway_info`）——走与 platform 的
+    /// 出站帧同一条通道，由本任务的 select 循环取出发送（E2E 密钥活跃时
+    /// 逐把加密）。best-effort：队列满 / 通道关闭只 debug、不重试——回执
+    /// 丢一条的后果只是浏览器把那条消息判成「未确认送达」，用户可重发；
+    /// `gateway_info` 丢了对 SPA 只是暂时判定「不支持回执」、不显示状态。
+    fn enqueue_client_frame(&self, frame: Result<String>, what: &'static str) {
+        match frame {
+            Ok(json) => {
+                if let Err(e) = self.outbound_tx.try_send(json) {
+                    debug!(
+                        target: TARGET,
+                        error = %e,
+                        frame = what,
+                        "client 自发出站帧入队失败（队列满 / 通道关闭），丢弃"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(target: TARGET, error = %e, frame = what, "client 自发出站帧序列化失败");
+            }
+        }
     }
 }
 
@@ -885,6 +1030,7 @@ mod tests {
         let (media_tx, _media_rx) = mpsc::channel::<InboundAction>(8);
         let (history_tx, _history_rx) = mpsc::channel::<InboundAction>(8);
         let (asr_tx, _asr_rx) = mpsc::channel::<InboundAction>(8);
+        let (_outbound_tx_for_client, outbound_rx) = mpsc::channel::<String>(8);
         let client = WebClient {
             relay_url: "ws://127.0.0.1:1/gateway".into(),
             credential: GatewayCredential::Token("t".into()),
@@ -899,8 +1045,8 @@ mod tests {
             history_tx,
             asr_tx,
             peer_state: Arc::new(std::sync::Mutex::new(None)),
+            outbound_tx: _outbound_tx_for_client,
         };
-        let (_outbound_tx, outbound_rx) = mpsc::channel::<String>(8);
         let (_push_tx, push_rx) = mpsc::channel::<PushEvent>(8);
         let token = CancellationToken::new();
         token.cancel();
@@ -915,5 +1061,271 @@ mod tests {
         )
         .await;
         assert!(res.is_ok(), "已取消的 token 应让 run 直接退出");
+    }
+
+    // ---- v1.44 送达回执 / 网关信息（dispatch_action 直测：不连 relay；
+    // 真实中继全链路见 tests/web_loopback.rs）----
+
+    /// 不连 relay 的 WebClient + 各通道接收端。入站 / 出站通道容量可配
+    /// （「入站打满不发回执」「出站打满不 panic」两条用例各要一个容量）。
+    struct ClientRig {
+        client: WebClient,
+        inbound_rx: mpsc::Receiver<InboundMessage>,
+        outbound_rx: mpsc::Receiver<String>,
+        media_rx: mpsc::Receiver<InboundAction>,
+        /// 保活：其余泵通道的接收端（drop 即视为泵退出，client 侧会 warn）。
+        _other_rx: (
+            mpsc::Receiver<SyncRequest>,
+            mpsc::Receiver<InboundAction>,
+            mpsc::Receiver<InboundAction>,
+            mpsc::Receiver<InboundAction>,
+        ),
+    }
+
+    fn rig(inbound_cap: usize, outbound_cap: usize) -> ClientRig {
+        let (inbound_tx, inbound_rx) = mpsc::channel(inbound_cap);
+        let (outbound_tx, outbound_rx) = mpsc::channel(outbound_cap);
+        let (sync_tx, sync_rx) = mpsc::channel(8);
+        let (workspace_tx, workspace_rx) = mpsc::channel(8);
+        let (media_tx, media_rx) = mpsc::channel(8);
+        let (history_tx, history_rx) = mpsc::channel(8);
+        let (asr_tx, asr_rx) = mpsc::channel(8);
+        ClientRig {
+            client: WebClient {
+                relay_url: "ws://127.0.0.1:1/gateway".into(),
+                credential: GatewayCredential::Token("t".into()),
+                machine_id: "test-mac".into(),
+                default_session: "default".into(),
+                online: Arc::new(AtomicBool::new(false)),
+                e2e: None,
+                inbound_tx,
+                outbound_tx,
+                sync_tx,
+                workspace_tx,
+                media_tx,
+                history_tx,
+                asr_tx,
+                peer_state: Arc::new(std::sync::Mutex::new(None)),
+            },
+            inbound_rx,
+            outbound_rx,
+            media_rx,
+            _other_rx: (sync_rx, workspace_rx, history_rx, asr_rx),
+        }
+    }
+
+    impl ClientRig {
+        /// 把一条原始入站帧经与生产相同的路径分发（映射 + dispatch_action）。
+        async fn dispatch(&self, raw: &str) {
+            let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+            let act = map_inbound_frame(&v, &self.client.default_session);
+            self.client.dispatch_action(&v, act).await.unwrap();
+        }
+    }
+
+    /// 取出 outbound 通道里现有的全部帧。不等待：入队是同步 `try_send`，
+    /// `dispatch` 返回时帧已在通道里。
+    fn drained(rx: &mut mpsc::Receiver<String>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(json) = rx.try_recv() {
+            out.push(json);
+        }
+        out
+    }
+
+    const RECEIVED_ACK: &str = r#"{"v":1,"type":"ack","machine":"test-mac","clientId":"m_1a2b3c4d","convId":"web:s-1","status":"received"}"#;
+    const MALFORMED_ACK: &str = r#"{"v":1,"type":"ack","machine":"test-mac","clientId":"m_1a2b3c4d","convId":"web:s-1","status":"rejected","reason":"malformed","message":"消息格式无效"}"#;
+    const MESSAGE_WITH_CLIENT_ID: &str = r#"{"v":1,"type":"message","convId":"web:s-1","text":"列出目录","machine":"home-mac","clientId":"m_1a2b3c4d"}"#;
+
+    /// v1.44 `received` 回执：带合规 clientId 的 message 进入入站 channel 后，
+    /// 出站恰一帧 ack（字节级），消息的 client_id 随 InboundMessage 带入。
+    #[tokio::test]
+    async fn received_ack_sent_after_inbound_enqueue() {
+        let mut r = rig(8, 8);
+        r.dispatch(MESSAGE_WITH_CLIENT_ID).await;
+        let m = r.inbound_rx.try_recv().expect("消息应已进入入站 channel");
+        assert_eq!(m.conv_id.0, "web:s-1");
+        assert_eq!(m.text.as_deref(), Some("列出目录"));
+        assert_eq!(m.client_id.as_deref(), Some("m_1a2b3c4d"));
+        assert_eq!(
+            drained(&mut r.outbound_rx),
+            vec![RECEIVED_ACK.to_string()],
+            "恰一帧 received ack"
+        );
+    }
+
+    /// v1.44 不带 / 不合规 clientId 的消息照旧处理、**不发任何回执**（旧 SPA
+    /// 一切如旧）；带图的 message 经 media channel 转发时 clientId 随动作带到
+    /// 泵——`received` 由泵在合成消息进入入站 channel 之后发，本层不发。
+    #[tokio::test]
+    async fn no_received_ack_without_valid_client_id() {
+        let mut r = rig(8, 8);
+        let over = "m".repeat(65);
+        for raw in [
+            r#"{"v":1,"type":"message","convId":"web:s-1","text":"旧 SPA"}"#.to_string(),
+            format!(
+                r#"{{"v":1,"type":"message","convId":"web:s-1","text":"超长","clientId":"{over}"}}"#
+            ),
+            r#"{"v":1,"type":"message","convId":"web:s-1","text":"非法字符","clientId":"a.b"}"#
+                .to_string(),
+            r#"{"v":1,"type":"message","convId":"web:s-1","text":"非字符串","clientId":42}"#
+                .to_string(),
+        ] {
+            r.dispatch(&raw).await;
+        }
+        let mut delivered = 0;
+        while let Ok(m) = r.inbound_rx.try_recv() {
+            assert_eq!(m.client_id, None, "不合规 clientId 当缺席");
+            delivered += 1;
+        }
+        assert_eq!(delivered, 4, "消息照旧进入入站 channel");
+        assert!(
+            drained(&mut r.outbound_rx).is_empty(),
+            "无合规 clientId 不发回执"
+        );
+
+        // 媒体消息：clientId 随动作到泵，本层不发 received。
+        r.dispatch(
+            r#"{"v":1,"type":"message","convId":"web:s-1","text":"看图","clientId":"m_img00001","media":{"name":"a.png","mime":"image/png","b64":"aGk="}}"#,
+        )
+        .await;
+        match r.media_rx.try_recv().expect("媒体动作应转发到泵") {
+            InboundAction::MediaMessage {
+                conv, client_id, ..
+            } => {
+                assert_eq!(conv, "web:s-1");
+                assert_eq!(client_id.as_deref(), Some("m_img00001"));
+            }
+            other => panic!("应为 MediaMessage：{other:?}"),
+        }
+        assert!(
+            drained(&mut r.outbound_rx).is_empty(),
+            "媒体消息此刻还没进入入站 channel：不得发 received"
+        );
+    }
+
+    /// v1.44 入站 channel 打满：消息等 1s 后被丢弃，**不得发 received**——回执
+    /// 只在消息真正进入 channel 之后发，否则会把一条被丢弃的消息报成已送达
+    /// （浏览器据超时判定为「未确认送达」）。1s 是被测代码的有界背压常量，
+    /// 不是用 sleep 表达时序。
+    #[tokio::test]
+    async fn no_received_ack_when_inbound_channel_full() {
+        let mut r = rig(1, 8);
+        // 占满唯一的槽位（无人消费）。
+        r.client
+            .inbound_tx
+            .send(crate::synth_message(
+                "web:x".into(),
+                "占位".into(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        r.dispatch(MESSAGE_WITH_CLIENT_ID).await;
+        assert!(
+            drained(&mut r.outbound_rx).is_empty(),
+            "消息没进 channel：不得发 received"
+        );
+        let m = r.inbound_rx.try_recv().expect("占位消息仍在");
+        assert_eq!(m.text.as_deref(), Some("占位"));
+        assert!(
+            r.inbound_rx.try_recv().is_err(),
+            "被丢弃的消息不在 channel 里"
+        );
+    }
+
+    /// v1.44 出站通道打满：`received` 回执 best-effort 丢弃——不 panic、不
+    /// 返回 Err，消息照常投递（回执丢一条只是浏览器判成「未确认送达」）。
+    /// tokio 的 mpsc 容量必须 > 0，用容量 1 + 预占一帧造「满」。
+    #[tokio::test]
+    async fn received_ack_dropped_without_panic_when_outbound_full() {
+        let mut r = rig(8, 1);
+        r.client
+            .outbound_tx
+            .try_send(r#"{"v":1,"type":"占位"}"#.to_string())
+            .expect("预占出站通道");
+        r.dispatch(MESSAGE_WITH_CLIENT_ID).await;
+        assert!(r.inbound_rx.try_recv().is_ok(), "消息照常进入入站 channel");
+        assert_eq!(
+            drained(&mut r.outbound_rx),
+            vec![r#"{"v":1,"type":"占位"}"#.to_string()],
+            "只有预占的那一帧：回执被丢弃，通道里没有新帧"
+        );
+    }
+
+    /// v1.44 `malformed` 回执：帧校验失败（Warn）且带合规 clientId → 出站
+    /// `ack{rejected, malformed}`（字节级）；convId 按 message 帧既有规则归一
+    /// （缺席 → 默认会话、裸名补前缀）；Warn 但无合规 clientId 不回（旧 SPA
+    /// 形态）。被拒的消息不进入入站 channel。
+    #[tokio::test]
+    async fn malformed_ack_for_warn_frame_with_client_id() {
+        let mut r = rig(8, 8);
+        // 缺 text。
+        r.dispatch(r#"{"v":1,"type":"message","convId":"web:s-1","machine":"home-mac","clientId":"m_1a2b3c4d"}"#)
+            .await;
+        assert_eq!(
+            drained(&mut r.outbound_rx),
+            vec![MALFORMED_ACK.to_string()],
+            "缺 text 的 message → malformed 回执"
+        );
+        // 缺 convId → 默认会话；裸 session 名 → 补 web: 前缀。
+        r.dispatch(r#"{"v":1,"type":"message","clientId":"m_nocode01"}"#)
+            .await;
+        r.dispatch(r#"{"v":1,"type":"message","convId":"s-2","clientId":"m_bare001"}"#)
+            .await;
+        // media 段畸形 + 合规 clientId。
+        r.dispatch(
+            r#"{"v":1,"type":"message","convId":"web:s-1","text":"x","media":"png","clientId":"m_med00001"}"#,
+        )
+        .await;
+        let frames = drained(&mut r.outbound_rx);
+        assert_eq!(frames.len(), 3, "{frames:?}");
+        assert_eq!(
+            frames[0],
+            r#"{"v":1,"type":"ack","machine":"test-mac","clientId":"m_nocode01","convId":"web:default","status":"rejected","reason":"malformed","message":"消息格式无效"}"#
+        );
+        assert_eq!(
+            frames[1],
+            r#"{"v":1,"type":"ack","machine":"test-mac","clientId":"m_bare001","convId":"web:s-2","status":"rejected","reason":"malformed","message":"消息格式无效"}"#
+        );
+        assert_eq!(
+            frames[2],
+            r#"{"v":1,"type":"ack","machine":"test-mac","clientId":"m_med00001","convId":"web:s-1","status":"rejected","reason":"malformed","message":"消息格式无效"}"#
+        );
+
+        // Warn 但无合规 clientId：不回（旧 SPA 的违规帧一切如旧）。
+        r.dispatch(r#"{"v":1,"type":"message"}"#).await;
+        r.dispatch(r#"{"v":1,"type":"message","clientId":"bad.id"}"#)
+            .await;
+        r.dispatch(r#"{"v":1,"type":"approval_response","convId":"web:s-1","requestId":"r"}"#)
+            .await;
+        assert!(
+            drained(&mut r.outbound_rx).is_empty(),
+            "无合规 clientId 不回"
+        );
+        assert!(
+            r.inbound_rx.try_recv().is_err(),
+            "被拒 / 违规的消息都不进入入站 channel"
+        );
+    }
+
+    /// v1.44 `gateway_info_query` → `gateway_info`（字节级，version = 本 crate
+    /// 版本）；任何机器名 / 是否带 machine 字段都回。
+    #[tokio::test]
+    async fn gateway_info_query_replies_byte_level() {
+        let mut r = rig(8, 8);
+        for raw in [
+            r#"{"v":1,"type":"gateway_info_query","machine":"home-mac"}"#,
+            r#"{"v":1,"type":"gateway_info_query"}"#,
+        ] {
+            r.dispatch(raw).await;
+        }
+        let want = format!(
+            r#"{{"v":1,"type":"gateway_info","machine":"test-mac","version":"{}","caps":["acks"]}}"#,
+            env!("CARGO_PKG_VERSION")
+        );
+        assert_eq!(drained(&mut r.outbound_rx), vec![want.clone(), want]);
+        assert!(r.inbound_rx.try_recv().is_err(), "查询不进入入站 channel");
     }
 }

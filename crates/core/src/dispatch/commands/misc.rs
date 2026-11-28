@@ -1413,6 +1413,7 @@ impl Dispatcher {
             // /retry 是用户显式动作，保留 steering 语义（运行中注入当轮追问）。
             no_steer: false,
             reply_hint: hint.clone(),
+            client_id: None,
         };
         self.dispatch_agent_message(msg).await;
     }
@@ -1463,6 +1464,7 @@ impl Dispatcher {
             control: None,
             no_steer: false,
             reply_hint: hint.clone(),
+            client_id: None,
         };
         self.reply(conv, &format!("🔁 再跑一次：{digest}"), hint)
             .await;

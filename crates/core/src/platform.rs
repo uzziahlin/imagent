@@ -439,9 +439,9 @@ pub trait Platform: Send + Sync {
     // 零损失，故不设能力位（与「新增交互特性须加位」的约定区分）。
     //
     // `on_workdir_changed`（v1.6）/ `on_peer_reply`（v1.42）/ `on_windows_changed` /
-    // `on_window_event`（v1.43）同属本组：通知型钩子、default no-op、无能力位
-    // （web 平台的覆写只是推送一条 best-effort 出站帧 / 一条 push_notify 埋点，
-    // 无新交互面）。
+    // `on_window_event`（v1.43）/ `on_message_rejected`（v1.44）同属本组：通知型
+    // 钩子、default no-op、无能力位（web 平台的覆写只是推送一条 best-effort
+    // 出站帧 / 一条 push_notify 埋点，无新交互面）。
 
     /// v1.23 说话人归属：dispatch 在每轮首条消息分派前调用——平台可据此
     /// 锚定「本轮发起者」（卡片标注/按钮点击权校验），避免被运行中的插话
@@ -536,6 +536,32 @@ pub trait Platform: Send + Sync {
     /// **不要**用于审批催办——那条路径必须继续走 `send_urgent_text`，行为
     /// 保持不变。
     async fn notify_task_done(&self, _conv: &ConvId, _text: &str, _hint: &ReplyHint) {}
+
+    /// v1.44 消息被 Dispatcher 明确拒绝的通知（通知型：同步、default no-op、无
+    /// 能力位）。驾驶舱发给网关的每条带 `client_id` 的消息，在**明确的丢弃点**
+    /// 被丢弃时调用——浏览器据此把该条消息从「发送中」翻成「未送达 + 原因」
+    /// （此前这些丢弃只记日志，界面与发送成功无法区分）。
+    ///
+    /// 调用点四处，都在 Dispatcher，且**只在入站消息带 `client_id` 时调用**
+    /// （`InboundMessage::client_id`——其它平台恒 None，IM 平台零感知）：
+    /// `commands/mod.rs` 的发现态分支（白名单为空；在回引导文案之前调用，
+    /// 两者并存）与白名单门（都是 `NotAllowed`）、`dispatch/mod.rs` 的单会话
+    /// 排队超上限丢弃（`QueueFull`）、`dispatch/peer.rs` 的窗口投递失败
+    /// （`PeerUnreachable`）。
+    ///
+    /// 为什么是同步钩子：调用点都在消息处理路径上，实现方只做非阻塞动作
+    /// （web 覆写为入队一条 `ack` 帧，队列满即丢——浏览器有超时判定兜底）。
+    /// **不要**在这些丢弃点之外调它：消息「到达网关」的确认（`received`）由
+    /// web 平台 client 层在消息进入入站 channel 后自己发，不经本钩子；中途
+    /// 静默丢失（入站 channel 打满、解密失败）没有可关联的拒绝时刻，靠浏览器
+    /// 超时判定为「未确认送达」。实现方 best-effort，失败自己记日志。
+    fn on_message_rejected(
+        &self,
+        _conv: &ConvId,
+        _client_id: &str,
+        _reason: crate::types::MessageRejectReason,
+    ) {
+    }
 
     /// v1.41.8 用户自发文本镜像（协作方法，无能力位——default 即安全降级）：
     /// 发送**本用户自己发出的消息**的镜像。与 [`Platform::send_text`] 的区别
@@ -807,6 +833,63 @@ mod tests {
             &ReplyHint::None,
         )
         .await;
+        assert!(
+            p.sent.lock().await.is_empty(),
+            "default no-op：不得产生任何出站文本：{:?}",
+            *p.sent.lock().await
+        );
+    }
+
+    /// v1.44：`on_message_rejected` 的 trait default 是 no-op——未覆写的平台
+    /// （IM / 终端）对消息拒绝通知无动作：不产生任何出站文本（钉住 default 不是
+    /// 「委托 send_text」之类的降级——那会让每条被拒的消息在 IM 平台多出一条
+    /// 回复；IM 平台的消息本就不带 client_id，钩子根本不会被调）。同步钩子，
+    /// 三种原因都调一遍。
+    #[tokio::test]
+    async fn on_message_rejected_default_is_noop() {
+        use crate::types::MessageRejectReason;
+        use tokio::sync::Mutex as TokioMutex;
+
+        /// 只实现必备项的最小平台（其余全走 trait default）。
+        struct BarePlatform {
+            sent: TokioMutex<Vec<(String, String)>>,
+        }
+
+        #[async_trait]
+        impl Platform for BarePlatform {
+            async fn recv(&self) -> Result<InboundMessage> {
+                Err(crate::error::CoreError::Platform("bare", "unused".into()))
+            }
+            async fn send_text(&self, conv: &ConvId, text: &str, _hint: &ReplyHint) -> Result<()> {
+                self.sent
+                    .lock()
+                    .await
+                    .push((conv.0.clone(), text.to_string()));
+                Ok(())
+            }
+            async fn send_media(
+                &self,
+                _conv: &ConvId,
+                _media: &MediaRef,
+                _hint: &ReplyHint,
+            ) -> Result<()> {
+                Ok(())
+            }
+            fn name(&self) -> &'static str {
+                "bare"
+            }
+        }
+
+        let p = BarePlatform {
+            sent: TokioMutex::new(Vec::new()),
+        };
+        for reason in [
+            MessageRejectReason::NotAllowed,
+            MessageRejectReason::QueueFull,
+            MessageRejectReason::PeerUnreachable,
+        ] {
+            p.on_message_rejected(&ConvId("web:s-abc".into()), "m_1a2b3c4d", reason);
+        }
         assert!(
             p.sent.lock().await.is_empty(),
             "default no-op：不得产生任何出站文本：{:?}",

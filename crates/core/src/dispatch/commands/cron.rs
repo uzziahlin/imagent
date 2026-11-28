@@ -609,6 +609,7 @@ impl Dispatcher {
                     // v1.21 review：合成消息不走 steering（独立轮次 + 持久化兜底）。
                     no_steer: true,
                     reply_hint: ReplyHint::None,
+                    client_id: None,
                 };
                 // 调度器只分发不执行：handle 对空闲 conv 会内联跑完整轮 agent
                 //（分钟级），tick 循环里 await 会队头阻塞 + 饿死 shutdown。与

@@ -88,6 +88,14 @@ v1.43 追加的本地窗口帧（仅 `peer_enabled` 的网关应答；旧网关�
 `crates/core/src/peer/mod.rs` 的 `PeerState` 与 `crates/web/src/lib.rs` 的
 `encode_windows_frame`，都有字节级单测钉住。
 
+v1.44 追加（帧契约见 `crates/web/src/lib.rs` 的帧清单注释）：`message` 帧可带客户端生成的
+`clientId`，网关回 `ack{clientId, convId, status: received | rejected}`——`received` 证明到达了
+网关，`rejected` 带明确原因（未授权 / 排队溢出 / 目标窗口不在线 / 帧无效）；`gateway_info_query`
+→ `gateway_info{version, caps}` 用于能力协商（旧网关不回）与版本透出；封在密文里的
+`e2e_close` 让网关在标签页关闭时回收那把会话密钥。端到端会话模型自此是「每个登录会话多把
+密钥」（同一浏览器的每个标签页一把），同会话上限 8 把、10 分钟不活跃回收——此前每个会话只留
+最后一次握手的密钥，后开的标签页会把先开的顶成静默失效。
+
 协议演进位：`v` 字段 + `type` 枚举留扩展；phase2 若做 E2E，仅把 `body` 字段换成密文信封（NaCl box，浏览器与网关互持密钥），中继与帧路由完全不用改。
 
 ### D5 认证（双 token，无 cookie → 无 CSRF 面）

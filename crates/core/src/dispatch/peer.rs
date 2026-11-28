@@ -72,6 +72,16 @@ impl Dispatcher {
                 error = %e,
                 "peer 出站投递失败"
             );
+            // v1.44：带送达回执关联 id 的消息（驾驶舱在 peer 会话里直接打字）
+            // 上报明确的丢弃——与下面的 error 帧（toast）并存：toast 无关联
+            // id，ack 才能把「未送达」标到那条具体的消息上。
+            if let Some(client_id) = msg.client_id.as_deref() {
+                self.platform.on_message_rejected(
+                    &conv,
+                    client_id,
+                    MessageRejectReason::PeerUnreachable,
+                );
+            }
             self.platform
                 .send_error_note(
                     &conv,

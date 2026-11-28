@@ -1256,6 +1256,249 @@ describe("WsManager E2E（v1.4）", () => {
     expect(h.frames.filter((f) => f.type === "windows")).toHaveLength(0);
   });
 
+  // ---- v1.44 送达回执 / 网关版本 / 标签页关闭（连接层）：能力查询出站按机器选路 /
+  //      回执入站注入面 / pagehide 密文 e2e_close ----
+
+  it("v1.44 gateway_info_query 在业务帧集合内：握手窗口（pending）明文直发——ready 后首查的形态；confirming 期拒发；active 后走 enc（网关密钥可解回契约原文）", () => {
+    const gw = makeGateway();
+    const h = makeE2eManager("home-mac");
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    const QUERY = '{"v":1,"type":"gateway_info_query","machine":"home-mac"}';
+    // ready 时尚未收到 machines 帧（无 e2e 条目）：单机形态明文
+    expect(h.mgr.sendGatewayInfoQuery("home-mac")).toBe(true);
+    expect(sock.sent.at(-1)).toBe(QUERY);
+    pushMachines(sock, ["home-mac"]);
+    // 握手窗口（pending）：仍是明文直发（v1.1 既有窗口行为）——ready 后首查的形态
+    expect(h.mgr.sendGatewayInfoQuery("home-mac")).toBe(true);
+    expect(sock.sent.at(-1)).toBe(QUERY);
+    // confirming（待确认指纹，fail-closed）：业务帧拒发（不出明文）
+    ackLatest(sock, gw, "home-mac");
+    const before = sock.sent.length;
+    expect(h.mgr.sendGatewayInfoQuery("home-mac")).toBe(false);
+    expect(sock.sent).toHaveLength(before);
+    // active 后：走密文，网关密钥可解回原帧
+    const key = acceptTofu(sock, gw, h, "home-mac").key;
+    expect(h.mgr.sendGatewayInfoQuery("home-mac")).toBe(true);
+    const wire = JSON.parse(sock.sent.at(-1) ?? "{}") as { type: string; machine: string; box: string };
+    expect(wire.type).toBe("enc");
+    expect(wire.machine).toBe("home-mac");
+    expect(openBox(key, wire.box)).toBe(QUERY);
+    // 明文查询自始至终只有握手窗口那两条
+    expect(sock.sent.filter((s) => s === QUERY)).toHaveLength(2);
+  });
+
+  it("v1.44 网关应答 gateway_info / ack（enc 内帧）经 onFrame 上抛；内帧漏带 machine 时注入信封 machine", () => {
+    const gw = makeGateway();
+    const h = makeE2eManager("home-mac");
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    pushMachines(sock, ["home-mac"]);
+    const key = toActive(sock, gw, h, "home-mac");
+    const info = { v: 1 as const, type: "gateway_info" as const, machine: "home-mac", version: "1.44.0", caps: ["acks"] };
+    const ack = {
+      v: 1 as const,
+      type: "ack" as const,
+      machine: "home-mac",
+      clientId: "m_1a2b3c4d",
+      convId: "web:s-1",
+      status: "received" as const,
+    };
+    // 网关经 send_business 加密下发（内帧自带 machine）
+    sock.serverSend(JSON.stringify(sealFrame("home-mac", key, info)));
+    expect(h.frames.at(-1)).toEqual(info);
+    sock.serverSend(JSON.stringify(sealFrame("home-mac", key, ack)));
+    expect(h.frames.at(-1)).toEqual(ack);
+    // 网关新帧型漏带 machine：enc 信封 machine 是路由权威来源，注入兜底。
+    // （类型上 ack.machine 必填——这里就是要模拟契约外的畸形内帧，故断言）
+    const machineLessAck = { v: 1, type: "ack", clientId: "m_1a2b3c4d", convId: "web:s-1", status: "received" } as unknown as InboundFrame;
+    sock.serverSend(JSON.stringify(sealFrame("home-mac", key, machineLessAck)));
+    expect(h.frames.at(-1)).toEqual(ack);
+  });
+
+  it("v1.44 active 机器发来的明文 ack / gateway_info 属注入面：丢弃（onFrame 不触发）+ 降级告警（与 windows 同规）；加密形态照常放行", () => {
+    const gw = makeGateway();
+    const h = makeE2eManager("home-mac");
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    pushMachines(sock, ["home-mac"]);
+    const key = toActive(sock, gw, h, "home-mac");
+    const before = h.frames.length;
+    // 明文回执（伪造 / 降级）：能把没送达的消息标成已送达、凭空的 rejected 能诱导重发——必须封住
+    sock.serverSend(
+      '{"v":1,"type":"ack","machine":"home-mac","clientId":"m_1a2b3c4d","convId":"web:default","status":"received"}',
+    );
+    sock.serverSend('{"v":1,"type":"gateway_info","machine":"home-mac","version":"9.9.9","caps":["acks"]}');
+    expect(h.frames).toHaveLength(before);
+    expect(h.events).toContainEqual({ kind: "downgrade", machine: "home-mac" });
+    // 同机器再来一条明文 gateway_info：仍丢弃，告警不重复（每连接每机器一次）
+    sock.serverSend('{"v":1,"type":"gateway_info","machine":"home-mac","version":"9.9.9","caps":[]}');
+    expect(h.frames).toHaveLength(before);
+    expect(h.events.filter((e) => e.kind === "downgrade")).toHaveLength(1);
+    // 加密形态的下发（真网关经 send_business）照常放行——被挡住的只是明文
+    const ack = {
+      v: 1 as const,
+      type: "ack" as const,
+      machine: "home-mac",
+      clientId: "m_1a2b3c4d",
+      convId: "web:default",
+      status: "received" as const,
+    };
+    const info = { v: 1 as const, type: "gateway_info" as const, machine: "home-mac", version: "1.44.0", caps: ["acks"] };
+    sock.serverSend(JSON.stringify(sealFrame("home-mac", key, ack)));
+    expect(h.frames.at(-1)).toEqual(ack);
+    sock.serverSend(JSON.stringify(sealFrame("home-mac", key, info)));
+    expect(h.frames.at(-1)).toEqual(info);
+  });
+
+  it("v1.44 无会话 / 握手窗口机器的明文 ack / gateway_info 照常经 onFrame 上抛（旧网关 / 握手窗口兼容），不告警", () => {
+    const h = makeE2eManager("home-mac");
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    const ACK = '{"v":1,"type":"ack","machine":"home-mac","clientId":"m_1a2b3c4d","convId":"web:default","status":"received"}';
+    const INFO = '{"v":1,"type":"gateway_info","machine":"home-mac","version":"1.44.0","caps":["acks"]}';
+    // 尚无 e2e 条目（machines 帧未到）：明文放行
+    sock.serverSend(ACK);
+    sock.serverSend(INFO);
+    expect(h.frames.map((f) => f.type)).toEqual(["ack", "gateway_info"]);
+    // 握手窗口（pending）同样放行：ready 后首查的应答可能就是明文
+    pushMachines(sock, ["home-mac"]);
+    sock.serverSend(ACK);
+    sock.serverSend(INFO);
+    expect(h.frames.filter((f) => f.type === "ack")).toHaveLength(2);
+    expect(h.frames.filter((f) => f.type === "gateway_info")).toHaveLength(2);
+    expect(h.events.filter((e) => e.kind === "downgrade")).toHaveLength(0);
+  });
+
+  it("v1.44 ack / gateway_info 畸形帧（parseFrame 拒）静默丢弃：onFrame 不触发", () => {
+    const h = makeE2eManager("home-mac");
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    for (const bad of [
+      '{"v":1,"type":"ack","machine":"home-mac","clientId":"c","convId":"web:default","status":"sent"}', // status 越界
+      '{"v":1,"type":"ack","machine":"home-mac","clientId":"c","convId":"web:default","status":"rejected","reason":"queue_full"}', // 缺 message
+      '{"v":1,"type":"ack","machine":"home-mac","clientId":"c","convId":"web:default","status":"received","reason":"not_allowed"}', // received 带 reason
+      '{"v":1,"type":"ack","machine":"home-mac","convId":"web:default","status":"received"}', // 缺 clientId
+      '{"v":1,"type":"gateway_info","machine":"home-mac","version":"1.44.0","caps":"acks"}', // caps 非数组
+      '{"v":1,"type":"gateway_info","machine":"home-mac","version":"1.44.0"}', // 缺 caps
+      '{"v":1,"type":"gateway_info","machine":"","version":"1.44.0","caps":[]}', // machine 空串
+    ]) {
+      sock.serverSend(bad);
+    }
+    expect(h.frames.filter((f) => f.type === "ack" || f.type === "gateway_info")).toHaveLength(0);
+  });
+
+  /** 触发 pagehide（persisted = true 模拟页面进往返缓存而非卸载）。 */
+  const firePageHide = (persisted = false): void => {
+    const ev = new Event("pagehide");
+    Object.assign(ev, { persisted });
+    window.dispatchEvent(ev);
+  };
+  /** sock 上出站的 e2e_close 密文：{ machine → [内帧 JSON] }（各机器用自己的网关密钥解）。 */
+  const closeFrames = (sock: FakeWebSocket, keys: Record<string, Uint8Array>): Record<string, string[]> => {
+    const out: Record<string, string[]> = {};
+    for (const raw of sock.sentOfType("enc")) {
+      const enc = JSON.parse(raw) as { machine: string; box: string };
+      const plain = keys[enc.machine] ? openBox(keys[enc.machine], enc.box) : null;
+      if (plain !== null && (JSON.parse(plain) as { type: string }).type === "e2e_close") {
+        (out[enc.machine] ??= []).push(plain);
+      }
+    }
+    return out;
+  };
+
+  it("v1.44 pagehide：对每台已加密（active）的机器各发一帧密文 e2e_close（内帧即契约原文，用**各自机器**的密钥密封）；未加密的机器不发；连接本身不受影响", () => {
+    const gw = makeGateway();
+    const h = makeE2eManager("home-mac");
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    // home-mac / work-mac 加密会话 active；office-mac 停在握手窗口（网关未应答）
+    pushMachines(sock, ["home-mac", "work-mac", "office-mac"]);
+    const keys = toActiveAll(sock, gw, h, ["home-mac", "work-mac"]);
+    const before = sock.sent.length;
+    const statusesBefore = [...h.statuses];
+    expect(closeFrames(sock, keys)).toEqual({}); // pagehide 之前没有任何 e2e_close
+    firePageHide();
+    expect(closeFrames(sock, keys)).toEqual({
+      "home-mac": ['{"v":1,"type":"e2e_close"}'],
+      "work-mac": ['{"v":1,"type":"e2e_close"}'],
+    });
+    // 恰两帧出站，都是 enc 信封（没有明文 e2e_close，也没有多余的帧）
+    const added = sock.sent.slice(before).map((s) => JSON.parse(s) as { type: string; machine: string; box: string });
+    expect(added.map((f) => [f.type, f.machine])).toEqual([
+      ["enc", "home-mac"],
+      ["enc", "work-mac"],
+    ]);
+    // 各用各的密钥：拿 work-mac 的密钥解 home-mac 的那帧解不开
+    expect(openBox(keys["work-mac"], added[0].box)).toBeNull();
+    expect(openBox(keys["home-mac"], added[1].box)).toBeNull();
+    // 连接受影响与否：状态序列不变，仍可正常发送
+    expect(h.statuses).toEqual(statusesBefore);
+    expect(h.mgr.sendGatewayInfoQuery("home-mac")).toBe(true);
+    const after = JSON.parse(sock.sent.at(-1) ?? "{}") as { type: string; box: string };
+    expect(after.type).toBe("enc");
+    expect(openBox(keys["home-mac"], after.box)).toBe('{"v":1,"type":"gateway_info_query","machine":"home-mac"}');
+    h.mgr.close();
+  });
+
+  it("v1.44 pagehide：confirming（待确认指纹）/ unsupported / 握手窗口（pending）的机器没有可回收的密钥，不发；页面进往返缓存（persisted）时整个不发", () => {
+    const gw = makeGateway();
+    const h = makeE2eManager("home-mac");
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    pushMachines(sock, ["home-mac", "work-mac", "office-mac", "lab-mac"]);
+    const key = toActive(sock, gw, h, "home-mac");
+    ackLatest(sock, gw, "work-mac"); // confirming：网关已应答，用户尚未确认指纹
+    // lab-mac：10s 无 ack → unsupported（office-mac 停在握手窗口，其超时定时器也到点）
+    vi.advanceTimersByTime(10_000);
+    expect(h.events).toContainEqual({ kind: "unsupported", machine: "lab-mac", reason: "timeout" });
+    const before = sock.sent.length;
+    // 进往返缓存：页面可能原样复活并继续用这把密钥，此刻不能让网关把它删掉
+    firePageHide(true);
+    expect(sock.sent).toHaveLength(before);
+    firePageHide();
+    // 只有 active 的 home-mac 一帧
+    expect(closeFrames(sock, { "home-mac": key })).toEqual({ "home-mac": ['{"v":1,"type":"e2e_close"}'] });
+    expect(sock.sent).toHaveLength(before + 1);
+    h.mgr.close();
+  });
+
+  it("v1.44 pagehide 监听的生命周期：close() 后不再发；显式重连后监听重新注册、再次加密后照发；尚无连接 / superseded 终态时触发不抛不发", () => {
+    const gw = makeGateway();
+    const h = makeE2eManager("home-mac");
+    // 尚未 connect：没有 socket，触发 pagehide 不抛
+    expect(() => firePageHide()).not.toThrow();
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    pushMachines(sock, ["home-mac"]);
+    const key1 = toActive(sock, gw, h, "home-mac");
+    firePageHide();
+    expect(closeFrames(sock, { "home-mac": key1 })).toEqual({ "home-mac": ['{"v":1,"type":"e2e_close"}'] });
+    // 手动关闭：监听随之移除
+    h.mgr.close();
+    let before = sock.sent.length;
+    firePageHide();
+    expect(sock.sent).toHaveLength(before);
+    // 显式重连（同 machines 下的 v1.41.9 行为）：监听重新注册；已 pin → 握手直接 active
+    h.mgr.connect();
+    const sock2 = readyFlow(h);
+    pushMachines(sock2, ["home-mac"]);
+    const key2 = ackLatest(sock2, gw, "home-mac").key;
+    expect(h.events.filter((e) => e.kind === "active")).toHaveLength(2);
+    before = sock2.sent.length;
+    firePageHide();
+    const added = sock2.sent.slice(before).map((s) => JSON.parse(s) as { box: string });
+    expect(added).toHaveLength(1);
+    expect(openBox(key2, added[0].box)).toBe('{"v":1,"type":"e2e_close"}');
+    expect(openBox(key1, added[0].box)).toBeNull(); // 新会话的密钥，旧密钥解不开
+    // superseded 终态：监听随终态移除
+    sock2.emit("close", { code: 4001 });
+    before = sock2.sent.length;
+    expect(() => firePageHide()).not.toThrow();
+    expect(sock2.sent).toHaveLength(before);
+    h.mgr.close();
+  });
+
   it("身份变化（已 pin 公钥改变）→ alert：发送阻断、事件上抛", () => {
     const pinned = makeGateway();
     // 预置 pin（上次会话 TOFU 确认过）
@@ -2566,5 +2809,88 @@ describe("WsManager 本地窗口（v1.43）", () => {
     });
     sock.serverSend('{"v":1,"type":"windows","machine":"home-mac","hookInstalled":false,"items":[]}');
     expect(h.frames.at(-1)).toEqual({ v: 1, type: "windows", machine: "home-mac", hookInstalled: false, items: [] });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.44 送达回执 + 网关版本：sendMessage 的 clientId / sendGatewayInfoQuery 发送器 +
+// 入站 ack / gateway_info 明文帧转发（连接层只负责发送与转发；E2E 选路 / 注入面 /
+// pagehide 用例见上方 E2E 组）
+// ---------------------------------------------------------------------------
+
+describe("WsManager 送达回执 + 网关版本（v1.44）", () => {
+  const CLIENT_ID = "m_1a2b3c4d";
+
+  it("sendMessage 带 clientId：帧携带该键（契约示例键序：clientId 在 machine 之后）；不带 / 空串时无该键（与升级前字节一致）", () => {
+    const h = makeManager();
+    h.mgr.connect();
+    expect(h.mgr.sendMessage("web:default", "hi", "home-mac", undefined, CLIENT_ID)).toBe(false); // 未 ready
+    const sock = readyFlow(h);
+    expect(h.mgr.sendMessage("web:default", "hi", "home-mac", undefined, CLIENT_ID)).toBe(true);
+    expect(sock.sent.at(-1)).toBe(
+      '{"v":1,"type":"message","convId":"web:default","text":"hi","machine":"home-mac","clientId":"m_1a2b3c4d"}',
+    );
+    // 带图：clientId 排在 media 之后
+    const media = { name: "a.png", mime: "image/png", b64: "AA==" };
+    expect(h.mgr.sendMessage("web:default", "", "home-mac", media, CLIENT_ID)).toBe(true);
+    expect(sock.sent.at(-1)).toBe(
+      '{"v":1,"type":"message","convId":"web:default","text":"","machine":"home-mac","media":{"name":"a.png","mime":"image/png","b64":"AA=="},"clientId":"m_1a2b3c4d"}',
+    );
+    // 不带 / 空串：没有该键
+    expect(h.mgr.sendMessage("web:default", "hi", "home-mac")).toBe(true);
+    expect(sock.sent.at(-1)).toBe('{"v":1,"type":"message","convId":"web:default","text":"hi","machine":"home-mac"}');
+    expect(h.mgr.sendMessage("web:default", "hi", "home-mac", undefined, "")).toBe(true);
+    expect(sock.sent.at(-1)).toBe('{"v":1,"type":"message","convId":"web:default","text":"hi","machine":"home-mac"}');
+    expect(JSON.parse(sock.sent.at(-1)!)).not.toHaveProperty("clientId");
+  });
+
+  it("sendGatewayInfoQuery：ready 前返回 false；ready 后字节精确（契约示例原文；machine 缺省不带字段）", () => {
+    const h = makeManager();
+    h.mgr.connect();
+    expect(h.mgr.sendGatewayInfoQuery("home-mac")).toBe(false);
+    const sock = readyFlow(h);
+    expect(h.mgr.sendGatewayInfoQuery("home-mac")).toBe(true);
+    expect(sock.sent.at(-1)).toBe('{"v":1,"type":"gateway_info_query","machine":"home-mac"}');
+    expect(h.mgr.sendGatewayInfoQuery()).toBe(true);
+    expect(sock.sent.at(-1)).toBe('{"v":1,"type":"gateway_info_query"}');
+    expect(JSON.parse(sock.sent.at(-1)!)).not.toHaveProperty("machine");
+  });
+
+  it("入站 ack / gateway_info 明文帧经 onFrame 转发（单机模式无 e2e 条目放行），两种 ack 形态字段原样", () => {
+    const h = makeManager();
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    sock.serverSend(
+      '{"v":1,"type":"ack","machine":"home-mac","clientId":"m_1a2b3c4d","convId":"web:s-1","status":"received"}',
+    );
+    expect(h.frames.at(-1)).toEqual({
+      v: 1,
+      type: "ack",
+      machine: "home-mac",
+      clientId: "m_1a2b3c4d",
+      convId: "web:s-1",
+      status: "received",
+    });
+    sock.serverSend(
+      '{"v":1,"type":"ack","machine":"home-mac","clientId":"m_1a2b3c4d","convId":"web:s-1","status":"rejected","reason":"not_allowed","message":"发送者未获授权，消息未被处理"}',
+    );
+    expect(h.frames.at(-1)).toEqual({
+      v: 1,
+      type: "ack",
+      machine: "home-mac",
+      clientId: "m_1a2b3c4d",
+      convId: "web:s-1",
+      status: "rejected",
+      reason: "not_allowed",
+      message: "发送者未获授权，消息未被处理",
+    });
+    sock.serverSend('{"v":1,"type":"gateway_info","machine":"home-mac","version":"1.44.0","caps":["acks"]}');
+    expect(h.frames.at(-1)).toEqual({
+      v: 1,
+      type: "gateway_info",
+      machine: "home-mac",
+      version: "1.44.0",
+      caps: ["acks"],
+    });
   });
 });

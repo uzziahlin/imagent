@@ -164,6 +164,7 @@ fn synth_message(conv: String, text: String, ask_req: Option<String>) -> Inagent
         control: None,
         no_steer: false,
         reply_hint: imagent_core::ReplyHint::None,
+        client_id: None,
     }
 }
 

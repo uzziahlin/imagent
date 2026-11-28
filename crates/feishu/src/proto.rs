@@ -642,6 +642,7 @@ pub fn parse_card_action_event(payload: &[u8]) -> Option<(String, InboundMessage
             control: None,
             no_steer: false,
             reply_hint: ReplyHint::None,
+            client_id: None,
         },
         None,
     ))
@@ -689,6 +690,7 @@ fn dummy_card_action_msg(evt: &CardActionEvent, conv: &str) -> InboundMessage {
         control: None,
         no_steer: false,
         reply_hint: ReplyHint::None,
+        client_id: None,
     }
 }
 
@@ -1092,6 +1094,7 @@ pub fn parse_comment_event(
             control: None,
             no_steer: false,
             reply_hint: ReplyHint::None,
+            client_id: None,
         },
     ))
 }
@@ -1178,6 +1181,7 @@ pub fn parse_menu_event(payload: &[u8]) -> Option<(String, InboundMessage)> {
             control: None,
             no_steer: false,
             reply_hint: ReplyHint::None,
+            client_id: None,
         },
     ))
 }
@@ -1277,6 +1281,7 @@ pub fn parse_recall_event(payload: &[u8]) -> Option<(String, InboundMessage)> {
             }),
             no_steer: false,
             reply_hint: ReplyHint::None,
+            client_id: None,
         },
     ))
 }
@@ -1333,6 +1338,7 @@ pub fn parse_bot_removed_event(payload: &[u8]) -> Option<(String, InboundMessage
             control: Some(imagent_core::InboundControl::BotRemovedFromChat),
             no_steer: false,
             reply_hint: ReplyHint::None,
+            client_id: None,
         },
     ))
 }
@@ -1547,6 +1553,7 @@ fn assemble_event_message(
         control: None,
         no_steer: false,
         reply_hint: ReplyHint::None,
+        client_id: None,
     };
     Some((dedup_key, msg))
 }

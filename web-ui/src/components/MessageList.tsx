@@ -53,21 +53,66 @@ function CopyReveal({ children }: { children: ReactNode }) {
 }
 
 /** 单条消息：memo 按条目引用比较——card_patch 只换对应 card 条目的引用，
- *  其余条目（text/user/approval_note，reducer 不可变更新保留引用）跳过重渲。 */
-const EntryView = memo(function EntryView({ entry }: { entry: StreamEntry }) {
+ *  其余条目（text/user/approval_note，reducer 不可变更新保留引用）跳过重渲。
+ *  v1.44：user 条目多一个可选的 onResend（「重发」按钮），只在需要重发的条目
+ *  上传入（见 MessageList），其余条目该 prop 恒为 undefined，memo 照常生效。 */
+const EntryView = memo(function EntryView({
+  entry,
+  onResend,
+}: {
+  entry: StreamEntry;
+  /** v1.44 「重发」：把这条消息的文字当新消息再发一次（App 层）。 */
+  onResend?: (text: string) => void;
+}) {
   switch (entry.kind) {
-    case "user":
-      // 用户消息：右对齐主题色气泡 + 上方浅色时间戳
+    case "user": {
+      // 用户消息：右对齐主题色气泡 + 上方浅色时间戳。
+      // v1.44 送达状态（契约 §2.4，只有支持回执的机器上的本机回显带 ack）：
+      // pending = 气泡 70% 不透明 + 右下「发送中」；unconfirmed / failed = 气泡
+      // 下一行小字 +「重发」；sent 与不带 ack（旧网关 / 镜像补回的条目）不加
+      // 任何标记——绝大多数消息都是这一态，加标记只是噪音，DOM 与此前逐字节
+      // 一致。状态行在气泡之外、限宽同气泡（80%），窄屏下长原因换行而不撑破
+      // 气泡。带图的消息（image）状态照常显示、但不给重发按钮：回显里只有占位
+      // 文本，图片本体早已不在，「重发」发出去的不会是原来那条消息。
+      const unsettled = entry.ack === "unconfirmed" || entry.ack === "failed";
       return (
         <div className="flex flex-col items-end">
           {entry.at ? (
             <span className="mb-0.5 pr-1 text-[11px] leading-4 text-ghost">{fmtTime(entry.at)}</span>
           ) : null}
-          <div className="max-w-[80%] rounded-2xl rounded-br-md bg-emerald-600 px-3 py-2 text-sm text-white shadow-sm">
+          <div
+            className={`max-w-[80%] rounded-2xl rounded-br-md bg-emerald-600 px-3 py-2 text-sm text-white shadow-sm${
+              entry.ack === "pending" ? " opacity-70" : ""
+            }`}
+          >
             <p className="whitespace-pre-wrap break-words">{entry.text}</p>
           </div>
+          {entry.ack === "pending" ? (
+            <span className="mt-0.5 pr-1 text-[11px] leading-4 text-faint">发送中</span>
+          ) : unsettled ? (
+            <div
+              className={`mt-0.5 flex max-w-[80%] items-center gap-2 pr-1 text-[11px] leading-4 ${
+                entry.ack === "failed" ? "text-err" : "text-warn"
+              }`}
+            >
+              <span className="min-w-0 break-words">
+                {entry.ack === "failed" ? `未送达：${entry.ackReason ?? ""}` : "未确认送达"}
+              </span>
+              {onResend && entry.image !== true && (
+                <button
+                  type="button"
+                  onClick={() => onResend(entry.text)}
+                  aria-label="重发这条消息"
+                  className="press shrink-0 font-medium underline underline-offset-2"
+                >
+                  重发
+                </button>
+              )}
+            </div>
+          ) : null}
         </div>
       );
+    }
     case "text":
       // agent 纯文本：左对齐 + 头像/名称/时间标识行（与用户消息明确分层），
       // 右上角整段复制（桌面 hover / 移动常显可长按）
@@ -111,11 +156,15 @@ const EntryView = memo(function EntryView({ entry }: { entry: StreamEntry }) {
  * 空态（onSample 传入时）：3 个可点示例 prompt，点击即发送。v1.43：传入
  * emptyHint 时空态改显示这段说明、不出示例 prompt（示例是通用任务，发给一个
  * 本地窗口会话没有意义）。
+ * v1.44：用户气泡的送达状态（pending / sent / failed / unconfirmed，见
+ * EntryView）；onResend = 点「重发」——消息列表只渲染当前会话的条目，重发的
+ * 目标会话就是当前会话，故只上抛文字，由 App 层绑定会话。
  */
 export function MessageList({
   entries,
   onSample,
   emptyHint,
+  onResend,
 }: {
   entries: StreamEntry[];
   /** 空态示例 prompt 点击发送（App 仅连接 ready 时传入）。 */
@@ -124,6 +173,9 @@ export function MessageList({
    *  提供）——窗口会话（peer:）首次打开、还没有任何消息时，告诉用户这里能
    *  直接派活、回信会出现在哪。 */
   emptyHint?: string;
+  /** v1.44 「重发」按钮点击：把该条消息的文字当新消息再发一次（新 clientId），
+   *  原条目不动。未提供时状态行只显示文字、不出按钮。 */
+  onResend?: (text: string) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   // 跟随态双份：ref 供 scroll/effect 免重渲读取，state 驱动按钮显隐
@@ -194,7 +246,19 @@ export function MessageList({
             </div>
           )}
           {entries.map((entry) => (
-            <EntryView key={entry.key} entry={entry} />
+            <EntryView
+              key={entry.key}
+              entry={entry}
+              // 回调只挂在未确认 / 未送达的条目上：App 每次渲染都给出新的闭包，传给
+              // 全部条目会让 memo 失效（整列随 App 重渲）；需要重发的条目本来就少，
+              // 它们跟着 App 重渲无妨。带图的消息出不出按钮由 EntryView 自己判断
+              // （「带图不可重发」只写在那一处，这里不重复）。
+              onResend={
+                onResend && entry.kind === "user" && (entry.ack === "unconfirmed" || entry.ack === "failed")
+                  ? onResend
+                  : undefined
+              }
+            />
           ))}
         </div>
       </div>

@@ -221,6 +221,7 @@ pub fn msg_to_inbound(msg: &Msg) -> InboundMessage {
         reply_hint: ReplyHint::ContextToken {
             context_token: msg.context_token.clone().unwrap_or_default(),
         },
+        client_id: None,
     }
 }
 

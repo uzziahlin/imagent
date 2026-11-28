@@ -768,6 +768,40 @@ describe("E2eCoordinator 状态机", () => {
     expect(coord.outbound(undefined, plainWatch)).toBe(JSON.stringify(plainWatch));
   });
 
+  // v1.44：网关能力查询与标签页关闭通知同为业务帧（BUSINESS_TYPES）——active 机器
+  // 出站必 enc 包装（gateway_info 载有网关版本；e2e_close 须由本标签页自己的密钥
+  // 密封，网关删除的正是「解开它的那把」）
+  it("v1.44 gateway_info_query / e2e_close：active 机器出站 enc 包装（网关密钥可解回契约原文；e2e_close 内帧不带 machine）；confirming 期拒发；单机恒明文", () => {
+    const gw = makeGateway();
+    const { coord, hellos } = makeCoord();
+    coord.onMachines(["home-mac"]);
+    const query = { v: 1 as const, type: "gateway_info_query" as const, machine: "home-mac" };
+    const close = { v: 1 as const, type: "e2e_close" as const };
+    // confirming（待用户确认指纹）= fail-closed：业务帧拒发（不出明文）
+    coord.onAck(gw.ackFor(JSON.parse(hellos[0]), "home-mac"));
+    for (const f of [query, close]) {
+      expect(coord.outbound("home-mac", f), f.type).toBeNull();
+    }
+    const { hello, ack } = acceptTofu(coord, gw, hellos, "home-mac");
+    const gwKey = gw.gatewayKey(hello, ack.n2);
+    const expected: [typeof query | typeof close, string][] = [
+      [query, '{"v":1,"type":"gateway_info_query","machine":"home-mac"}'],
+      [close, '{"v":1,"type":"e2e_close"}'], // 路由靠 enc 信封的 machine，内帧不带
+    ];
+    for (const [f, plain] of expected) {
+      const wire = coord.outbound("home-mac", f);
+      expect(wire, f.type).not.toBeNull();
+      const enc = JSON.parse(wire!) as { type: string; machine: string; box: string };
+      expect(enc.type).toBe("enc");
+      expect(enc.machine).toBe("home-mac");
+      expect(openBox(gwKey, enc.box)).toBe(plain);
+    }
+    // 单机模式（machine undefined，旧 relay）恒明文直发
+    expect(coord.outbound(undefined, close)).toBe('{"v":1,"type":"e2e_close"}');
+    expect(coord.outbound(undefined, { v: 1, type: "gateway_info_query" })).toBe(
+      '{"v":1,"type":"gateway_info_query"}',
+    );
+  });
 });
 
 describe("E2eCoordinator sid（定向加密形态）", () => {

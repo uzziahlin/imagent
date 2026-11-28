@@ -10,7 +10,14 @@ import {
   setHistoryBackend,
   type HistoryBackend,
 } from "./historyStore";
-import { DEFAULT_CONV, DEFAULT_MACHINE, initialState, spaceOf, type StreamEntry } from "./protocol";
+import {
+  DEFAULT_CONV,
+  DEFAULT_MACHINE,
+  initialState,
+  spaceOf,
+  type AckState,
+  type StreamEntry,
+} from "./protocol";
 
 /** 最小 card 载荷（preview 派生只读 text/task_digest）。 */
 const cardOf = (text: string): StreamEntry => ({
@@ -258,5 +265,81 @@ describe("restoreHistory（恢复预填映射）", () => {
     expect(sp.convOrder).toEqual([DEFAULT_CONV, "web:s-x"]);
     expect(sp.convs[DEFAULT_CONV]).toBeTruthy(); // 新空间预置 default
     expect(sp.convs["web:s-x"]?.lastAt).toBe(42);
+  });
+});
+
+describe("v1.44 恢复时送达状态收敛（loadAll：pending → unconfirmed）", () => {
+  let backend: HistoryBackend;
+
+  beforeEach(() => {
+    backend = memoryHistoryBackend();
+    setHistoryBackend(backend);
+  });
+
+  afterEach(() => {
+    setHistoryBackend(null);
+  });
+
+  /** 带送达状态的本机回显夹具（键即 v1.44 的 user:<clientId>）。 */
+  const echoWith = (clientId: string, ack?: AckState): Extract<StreamEntry, { kind: "user" }> => ({
+    kind: "user",
+    key: `user:${clientId}`,
+    text: `消息 ${clientId}`,
+    at: 100,
+    clientId,
+    ...(ack ? { ack } : {}),
+  });
+  /** 条目的送达状态（非回显条目恒为 false，便于逐位比较）。 */
+  const acksOf = (entries: StreamEntry[]): (false | undefined | string)[] =>
+    entries.map((e) => (e.kind === "user" ? e.ack : false));
+
+  it("载入时 pending → unconfirmed；sent / failed（带原因）/ unconfirmed / 无 ack 的条目与镜像、text 条目原样（同一对象引用）", async () => {
+    const pending = echoWith("c1", "pending");
+    const sent = echoWith("c2", "sent");
+    const failed: StreamEntry = { ...echoWith("c3", "failed"), ackReason: "排队消息过多，这条被丢弃" };
+    const unconfirmed = echoWith("c4", "unconfirmed");
+    const noAck = echoWith("c5");
+    const mirror: StreamEntry = { kind: "user", key: "user:9", text: "镜像补回的那句", at: 5, self: true };
+    const reply = textOf("回复", 6);
+    await backend.put("home-mac||web:default", {
+      entries: [pending, sent, failed, unconfirmed, noAck, mirror, reply],
+      savedAt: 1,
+    });
+    const entries = (await historyStore.loadAll())["home-mac"]["web:default"].entries;
+    expect(entries).toHaveLength(7);
+    expect(entries[0]).toEqual({ ...pending, ack: "unconfirmed" });
+    expect(entries[0]).not.toBe(pending);
+    expect(entries[1]).toBe(sent);
+    expect(entries[2]).toBe(failed);
+    expect(entries[3]).toBe(unconfirmed);
+    expect(entries[4]).toBe(noAck);
+    expect(entries[5]).toBe(mirror);
+    expect(entries[6]).toBe(reply);
+    // 落盘的内容未被改写（收敛只发生在读出侧）
+    expect(acksOf((await backend.get("home-mac||web:default"))?.entries ?? [])).toEqual([
+      "pending",
+      "sent",
+      "failed",
+      "unconfirmed",
+      undefined,
+      undefined,
+      false,
+    ]);
+  });
+
+  it("写盘不改状态、每次载入都收敛（幂等）；恢复预填后键带 h: 前缀、clientId 保留（回执仍可关联）", async () => {
+    await historyStore.saveConv("home-mac", "web:default", [echoWith("c1", "pending"), echoWith("c2", "pending")]);
+    expect(acksOf((await backend.get("home-mac||web:default"))?.entries ?? [])).toEqual(["pending", "pending"]);
+    const first = await historyStore.loadAll();
+    const second = await historyStore.loadAll();
+    for (const loaded of [first, second]) {
+      expect(acksOf(loaded["home-mac"]["web:default"].entries)).toEqual(["unconfirmed", "unconfirmed"]);
+    }
+    // App 挂载时的恢复预填（restoreHistory）
+    const s = restoreHistory(initialState(), second);
+    const entries = spaceOf(s, "home-mac").convs[DEFAULT_CONV].entries;
+    expect(entries.map((e) => e.key)).toEqual(["h:user:c1", "h:user:c2"]);
+    expect(acksOf(entries)).toEqual(["unconfirmed", "unconfirmed"]);
+    expect(entries.map((e) => (e.kind === "user" ? e.clientId : false))).toEqual(["c1", "c2"]);
   });
 });

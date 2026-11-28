@@ -21,6 +21,11 @@
 //! E2E 活跃时同被 enc 包装（见 `loopback_e2e_encrypted_roundtrip`）。
 //! v1.42 增补：待审批快照 `approvals_query` → `approvals`（空表字节级
 //! `items:[]`；E2E 活跃时双向 enc 包装，见 `loopback_approvals_query_snapshot`）。
+//! v1.44 增补：同浏览器多标签页——同一登录会话两条连接各自握手，网关保留
+//! 两把密钥、各自可收发、`e2e_close` 摘钥（见
+//! `loopback_multi_tab_same_session_two_keys_and_e2e_close`）；送达回执 `ack`
+//! 与网关信息 `gateway_info`（明文期字节级 + E2E 活跃时 enc 包装，见
+//! `loopback_ack_and_gateway_info_frames`）。
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -2336,4 +2341,649 @@ async fn loopback_window_events_push_notify_full_chain() {
     handle.shutdown();
     handle.wait().await;
     drop(platform);
+}
+
+// ---------------------------------------------------------------------------
+// v1.44 同浏览器多标签页（每个登录会话多把密钥）+ 送达回执 / 网关信息
+// ---------------------------------------------------------------------------
+
+/// 浏览器侧「尝试开启」：解不开返回 None。多密钥下同一条连接会收到同会话
+/// 其它标签页那份、自己解不开的 enc 帧——[`e2e_open`] 解不开会 panic。
+fn e2e_try_open(key: &[u8; 32], boxed: &str) -> Option<String> {
+    use base64::Engine as _;
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(boxed)
+        .ok()?;
+    let (nonce, ct) = data.split_at(24);
+    let cipher = XChaCha20Poly1305::new_from_slice(key).ok()?;
+    let pt = cipher.decrypt(XNonce::from_slice(nonce), ct).ok()?;
+    String::from_utf8(pt).ok()
+}
+
+/// 从 enc 信封原文取 box 字段。
+fn enc_box_of(envelope: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(envelope).unwrap();
+    v["box"].as_str().unwrap().to_string()
+}
+
+/// 内层业务帧 JSON 原文的 type。
+fn inner_type(inner: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(inner).unwrap();
+    v["type"].as_str().unwrap_or("").to_string()
+}
+
+/// 浏览器侧发一个 enc 包裹的业务帧（浏览器→网关方向无 sid）。
+async fn send_enc(ws: &mut Ws, key: &[u8; 32], inner: &str) {
+    let envelope = serde_json::json!({
+        "v": 1, "type": "enc", "machine": MACHINE,
+        "box": e2e_seal(key, inner),
+    })
+    .to_string();
+    ws.send(Message::text(envelope)).await.unwrap();
+}
+
+/// 哨兵发送：发一个 enc 包裹的应用层 ping。网关对表里**每把密钥**各回一份
+/// enc 包裹的 pong——出站份数即该时刻表里的密钥数，是「某把密钥还在不在
+/// 表里」的可观察信号。
+async fn send_enc_ping(ws: &mut Ws, key: &[u8; 32]) {
+    send_enc(ws, key, r#"{"v":1,"type":"ping"}"#).await;
+}
+
+/// 哨兵接收（只收 enc 帧）：读 enc 帧直到用 `key` 解出 pong 的那一帧（含），
+/// 返回期间收到的全部 enc 信封原文，明文帧跳过。用于出站份数 / 回执内容的
+/// 断言——连接上有握手阶段广播来的明文 e2e_ack 残留，不能算进出站份数。
+/// 出站按「sid 字典序、同会话内 created 升序」，用该会话里 created 最晚的
+/// 密钥做 `key` 即可收齐全部份数。
+async fn collect_enc_until_pong(ws: &mut Ws, key: &[u8; 32]) -> Vec<String> {
+    let mut got = Vec::new();
+    loop {
+        let envelope = next_raw_of_type(ws, "enc").await;
+        let is_pong = e2e_try_open(key, &enc_box_of(&envelope))
+            .is_some_and(|inner| inner_type(&inner) == "pong");
+        got.push(envelope);
+        if is_pong {
+            return got;
+        }
+    }
+}
+
+/// 哨兵接收（收**全部**应用帧）：读应用帧直到用 `key` 解出 pong 的那一帧
+/// enc（含），返回期间收到的全部帧原文，明文帧也收——「某操作不回任何帧」
+/// 的断言必须把明文回应算进去（只收 enc 帧会让一个错误的明文回应被静默
+/// 跳过：首版「e2e_close 不回帧」用 ping 做屏障且只看第一帧，「e2e_close 后
+/// 回一帧 pong」的变异因此存活）。
+async fn collect_all_until_pong(ws: &mut Ws, key: &[u8; 32]) -> Vec<String> {
+    let mut got = Vec::new();
+    loop {
+        let raw = next_text(ws).await;
+        let is_pong = type_of(&raw) == "enc"
+            && e2e_try_open(key, &enc_box_of(&raw))
+                .is_some_and(|inner| inner_type(&inner) == "pong");
+        got.push(raw);
+        if is_pong {
+            return got;
+        }
+    }
+}
+
+/// 应用帧（明文或 enc 信封）的 type。
+fn type_of(raw: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+    v["type"].as_str().unwrap_or("").to_string()
+}
+
+/// 读应用帧直到遇到明文 `type == want` 的那一帧（含），返回期间收到的全部
+/// 应用帧原文。enc 帧的外层 type 是 `enc`，不会被当成屏障。
+async fn read_app_frames_until(ws: &mut Ws, want: &str) -> Vec<String> {
+    let mut got = Vec::new();
+    loop {
+        let raw = next_text(ws).await;
+        got.push(raw);
+        if type_of(got.last().unwrap()) == want {
+            return got;
+        }
+    }
+}
+
+/// 读下一条用 `key` 解开后内层类型为 `want` 的 enc 帧，返回 (信封原文,
+/// 内层 JSON 原文)；不发送任何帧（观测网关主动出站用）。中间解不开的
+/// enc 帧（同会话其它标签页的回执副本）跳过。
+async fn next_enc_raw_inner(ws: &mut Ws, key: &[u8; 32], want: &str) -> (String, String) {
+    loop {
+        let envelope = next_raw_of_type(ws, "enc").await;
+        if let Some(inner) = e2e_try_open(key, &enc_box_of(&envelope)) {
+            if inner_type(&inner) == want {
+                return (envelope, inner);
+            }
+        }
+    }
+}
+
+/// 多标签页专用握手：发 `e2e_hello` 后，读到**对自己这次握手签名**的
+/// `e2e_ack` 为止。同会话另一标签页握手的 ack 是明文广播帧，也会到达本
+/// 连接——靠验签区分，不靠排空缓冲（那要猜「缓冲里还剩几帧」）。返回会话
+/// 密钥。`sk` = 网关认证私钥（e2e_ack 的签名密钥，测试内生成）。
+async fn handshake_verified(ws: &mut Ws, sid: &str, sk: &SigningKey) -> [u8; 32] {
+    use ed25519_dalek::Verifier;
+    use x25519_dalek::{PublicKey as XPublicKey, StaticSecret as XStaticSecret};
+
+    let browser_secret = XStaticSecret::from(rand::random::<[u8; 32]>());
+    let browser_public = XPublicKey::from(&browser_secret);
+    let n1 = rand::random::<[u8; 32]>();
+    ws.send(Message::text(
+        serde_json::json!({
+            "v": 1, "type": "e2e_hello", "machine": MACHINE, "sid": sid,
+            "ek": hex::encode(browser_public.as_bytes()),
+            "n1": hex::encode(n1),
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    loop {
+        let ack = next_of_type(ws, "e2e_ack").await;
+        let take = |field: &str| -> [u8; 32] {
+            hex::decode(ack[field].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap()
+        };
+        let (gk, n2) = (take("gk"), take("n2"));
+        let mut signed = Vec::with_capacity(128);
+        signed.extend_from_slice(browser_public.as_bytes());
+        signed.extend_from_slice(&gk);
+        signed.extend_from_slice(&n1);
+        signed.extend_from_slice(&n2);
+        let sig = <[u8; 64]>::try_from(hex::decode(ack["sig"].as_str().unwrap()).unwrap()).unwrap();
+        let verified = sk
+            .verifying_key()
+            .verify(&signed, &ed25519_dalek::Signature::from_bytes(&sig))
+            .is_ok();
+        if verified {
+            return imagent_web::e2e::derive_session_key(
+                browser_secret
+                    .diffie_hellman(&XPublicKey::from(gk))
+                    .as_bytes(),
+                &n1,
+                &n2,
+            );
+        }
+    }
+}
+
+/// v1.44 同浏览器多标签页全链路（真实 relay）。同一个登录会话的两条浏览器
+/// 连接（两个标签页共用 session）各自 E2E 握手，网关保留两把密钥：
+/// - 出站：两条连接各收到两份 enc（每把密钥一份），各自只解得开自己那份；
+/// - 入站：两个标签页都能发，`Platform::recv` 都收到（`client_id` 带上）；
+/// - `received` 回执经真实中继回到浏览器：每个 ack 对每把密钥各一份，标签页
+///   能解出自己发的与对方发的那条（字节级）；
+/// - `e2e_close`：标签页 A 注销自己的密钥后，出站只剩一份、A 的旧密文入站被
+///   丢弃、B 照常收发；B 再注销最后一把后连接上不回任何字节。
+/// 时序全部用可观察状态，不用 sleep 表达：「某把密钥是否已被摘除」= 哨兵 pong
+/// 的份数（2 → 1），轮询期间逐帧判定「除哨兵 pong 外没有任何帧」；最后一条
+/// `e2e_close`「不回帧」= 表空后明文 `gateway_info_query` 回**明文**
+/// `gateway_info` 这一正向屏障，读到它为止收到的应用帧必须恰好这一帧（任何
+/// 类型的回应帧都会排在它前面；屏障不选 pong——它是错误回应最可能撞上的类型）。
+#[tokio::test]
+async fn loopback_multi_tab_same_session_two_keys_and_e2e_close() {
+    let (handle, sk) = spawn_test_relay().await;
+    let addr = handle.addr;
+    let key_path = e2e_test_key_path("multi-tab");
+    let p = WebPlatform::new_with_e2e(
+        format!("ws://{addr}/gateway"),
+        GatewayCredential::Key(sk.clone()),
+        "default".to_string(),
+        MACHINE.to_string(),
+        &key_path,
+        loopback_store("multi-tab").await,
+        valid_ws_dir(),
+        nop_models(),
+        Vec::new(), // v1.36 backends 名单：回环测试不驱动引擎选择，空名单整段缺席
+        imagent_web::AsrContext::default(), // v1.40 未配置 → 快照 asr 段缺席
+        300,        // v1.37 审批超时预算（approval_request 帧 timeoutSecs）
+    );
+    eventually(Duration::from_secs(10), || p.is_online()).await;
+
+    // 标签页 A：登录（hello_ack 携带会话凭证载荷）。
+    let mut tab_a = connect_ws(&addr, "/ws", None).await;
+    tab_a
+        .send(Message::text(format!(
+            r#"{{"v":1,"type":"hello","token":"{USER_TOKEN}"}}"#
+        )))
+        .await
+        .unwrap();
+    let login: serde_json::Value = serde_json::from_str(&next_text(&mut tab_a).await).unwrap();
+    assert_eq!(login["type"], "hello_ack", "{login}");
+    let sid = login["session"]["id"].as_str().unwrap().to_string();
+    let session_token = login["session"]["token"].as_str().unwrap().to_string();
+    let _ = next_of_type(&mut tab_a, "machines").await;
+
+    // 标签页 B：复用同一登录会话（session token）→ 同一个 sid。
+    let mut tab_b = connect_ws(&addr, "/ws", None).await;
+    tab_b
+        .send(Message::text(format!(
+            r#"{{"v":1,"type":"hello","session":"{session_token}"}}"#
+        )))
+        .await
+        .unwrap();
+    let relogin: serde_json::Value = serde_json::from_str(&next_text(&mut tab_b).await).unwrap();
+    assert_eq!(
+        relogin["type"], "hello_ack",
+        "同一会话重连应通过：{relogin}"
+    );
+    assert_eq!(
+        relogin["session"]["id"].as_str(),
+        Some(sid.as_str()),
+        "同一登录会话 → 同一 sid"
+    );
+    let _ = next_of_type(&mut tab_b, "machines").await;
+
+    // 各自握手（同一 sid、各自临时密钥）。先 A 后 B：B 的连接上会先到达 A
+    // 握手的 ack（明文广播），handshake_verified 靠验签跳过它。
+    let ka = handshake_verified(&mut tab_a, &sid, &sk).await;
+    let kb = handshake_verified(&mut tab_b, &sid, &sk).await;
+    assert_ne!(ka, kb, "两个标签页各自一把不同的会话密钥");
+
+    // ---- 出站：每把密钥一份，各标签页只解得开自己那份 ----
+    p.send_text(&conv(), "两个标签页都能看到", &ReplyHint::None)
+        .await
+        .unwrap();
+    send_enc_ping(&mut tab_b, &kb).await;
+    // B（kb 最晚 → 它的 pong 排在最后）：text×2 + pong×2 共 4 帧，kb 解得开
+    // 第 2、4 帧。
+    let b_frames = collect_enc_until_pong(&mut tab_b, &kb).await;
+    assert_eq!(b_frames.len(), 4, "{b_frames:?}");
+    assert!(
+        e2e_try_open(&kb, &enc_box_of(&b_frames[0])).is_none(),
+        "ka 那份 B 解不开"
+    );
+    assert!(
+        e2e_open(&kb, &enc_box_of(&b_frames[1])).contains("两个标签页都能看到"),
+        "B 解得出自己那份"
+    );
+    assert!(e2e_try_open(&kb, &enc_box_of(&b_frames[2])).is_none());
+    assert_eq!(
+        inner_type(&e2e_open(&kb, &enc_box_of(&b_frames[3]))),
+        "pong"
+    );
+    // A（ka 较早 → 读到自己的 pong 为止）：text×2 + pong(ka) 共 3 帧，ka 解
+    // 得开第 1、3 帧。
+    let a_frames = collect_enc_until_pong(&mut tab_a, &ka).await;
+    assert_eq!(a_frames.len(), 3, "{a_frames:?}");
+    assert!(
+        e2e_open(&ka, &enc_box_of(&a_frames[0])).contains("两个标签页都能看到"),
+        "A 解得出自己那份"
+    );
+    assert!(
+        e2e_try_open(&ka, &enc_box_of(&a_frames[1])).is_none(),
+        "kb 那份 A 解不开"
+    );
+    assert_eq!(
+        inner_type(&e2e_open(&ka, &enc_box_of(&a_frames[2]))),
+        "pong"
+    );
+    // A 的队列里还剩 kb 那份 pong：读掉（A 解不开），队列归零。
+    let leftover = next_raw_of_type(&mut tab_a, "enc").await;
+    assert!(e2e_try_open(&ka, &enc_box_of(&leftover)).is_none());
+
+    // ---- 入站：两个标签页都能发；received 回执经真实中继回到浏览器 ----
+    let message = |text: &str, client_id: &str| {
+        format!(
+            r#"{{"v":1,"type":"message","convId":"{CONV}","text":"{text}","machine":"{MACHINE}","clientId":"{client_id}"}}"#
+        )
+    };
+    let ack = |client_id: &str| {
+        format!(
+            r#"{{"v":1,"type":"ack","machine":"{MACHINE}","clientId":"{client_id}","convId":"{CONV}","status":"received"}}"#
+        )
+    };
+    // 每条消息发出后先等 recv：确认网关已处理它（回执已入队）再发下一条，
+    // 两条 ack 的先后由此确定，不依赖两条连接的到达顺序。
+    send_enc(&mut tab_a, &ka, &message("来自标签页 A", "m_tabA001")).await;
+    let m = tokio::time::timeout(Duration::from_secs(5), p.recv())
+        .await
+        .expect("A 的消息到达 recv")
+        .expect("recv 正常");
+    assert_eq!(
+        (m.conv_id.clone(), m.text.clone(), m.client_id.clone()),
+        (
+            conv(),
+            Some("来自标签页 A".to_string()),
+            Some("m_tabA001".to_string()),
+        ),
+        "标签页 A 的入站被业务分发，client_id 带上"
+    );
+    send_enc(&mut tab_b, &kb, &message("来自标签页 B", "m_tabB001")).await;
+    let m = tokio::time::timeout(Duration::from_secs(5), p.recv())
+        .await
+        .expect("B 的消息到达 recv")
+        .expect("recv 正常");
+    assert_eq!(
+        (m.text.clone(), m.client_id.clone()),
+        (
+            Some("来自标签页 B".to_string()),
+            Some("m_tabB001".to_string())
+        ),
+        "标签页 B 的入站被业务分发"
+    );
+
+    // 回执：每个 ack 两份（每把密钥一份）。A 读到自己的 pong 为止共 5 帧，
+    // ka 解得开其中两条 ack + pong；B 共 6 帧，kb 解得开两条 ack + 末帧 pong。
+    send_enc_ping(&mut tab_a, &ka).await;
+    let a_frames = collect_enc_until_pong(&mut tab_a, &ka).await;
+    assert_eq!(a_frames.len(), 5, "{a_frames:?}");
+    let a_decoded: Vec<String> = a_frames[..4]
+        .iter()
+        .filter_map(|f| e2e_try_open(&ka, &enc_box_of(f)))
+        .collect();
+    assert_eq!(
+        a_decoded,
+        vec![ack("m_tabA001"), ack("m_tabB001")],
+        "A 解得出两条回执（自己发的 + 标签页 B 发的），字节级"
+    );
+    assert_eq!(
+        inner_type(&e2e_open(&ka, &enc_box_of(&a_frames[4]))),
+        "pong"
+    );
+    let leftover = next_raw_of_type(&mut tab_a, "enc").await;
+    assert!(e2e_try_open(&ka, &enc_box_of(&leftover)).is_none());
+    let b_frames = collect_enc_until_pong(&mut tab_b, &kb).await;
+    assert_eq!(b_frames.len(), 6, "{b_frames:?}");
+    let b_decoded: Vec<String> = b_frames[..5]
+        .iter()
+        .filter_map(|f| e2e_try_open(&kb, &enc_box_of(f)))
+        .collect();
+    assert_eq!(b_decoded, vec![ack("m_tabA001"), ack("m_tabB001")]);
+    assert_eq!(
+        inner_type(&e2e_open(&kb, &enc_box_of(&b_frames[5]))),
+        "pong"
+    );
+
+    // ---- e2e_close：标签页 A 注销自己的密钥 ----
+    send_enc(&mut tab_a, &ka, r#"{"v":1,"type":"e2e_close"}"#).await;
+    // 等「ka 已被摘除」：哨兵 pong 的份数从 2 变 1。每轮一个哨兵，读到份数
+    // 变化即停——用可观察状态等，不猜时序。同时钉住「不回任何帧」：每轮
+    // 收到的必须只有哨兵 pong（逐帧用 ka / kb 解密判定；ka 摘除前 2 份、之后
+    // 1 份）。e2e_close 的任何回应——明文或密文——都排在「ka 被摘除」之前
+    // 入队，必然落在某一轮的收集范围里；只看帧数不够（1 份密文回应与
+    // 「pong×2」同为长度 2）。
+    let decrypt = |f: &str| {
+        [ka, kb]
+            .iter()
+            .find_map(|k| e2e_try_open(k, &enc_box_of(f)))
+    };
+    let mut rounds = 0usize;
+    loop {
+        rounds += 1;
+        assert!(rounds <= 25, "e2e_close 后 ka 应在若干哨兵内被摘除");
+        send_enc_ping(&mut tab_b, &kb).await;
+        let frames = collect_all_until_pong(&mut tab_b, &kb).await;
+        assert!(
+            frames.len() <= 2
+                && frames.iter().all(|f| {
+                    type_of(f) == "enc"
+                        && decrypt(f).is_some_and(|inner| inner_type(&inner) == "pong")
+                }),
+            "e2e_close 不得回任何帧（明文或密文）：每轮只应有哨兵 pong：{frames:?}"
+        );
+        if frames.len() == 1 {
+            assert_eq!(inner_type(&e2e_open(&kb, &enc_box_of(&frames[0]))), "pong");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // A 的旧密文入站被丢弃：A、B 各发一条，recv 拿到的必须是 B 的，且之后
+    // 也没有 A 的（ka 不在表里，A 的帧永远到不了 recv——与到达顺序无关）。
+    send_enc(&mut tab_a, &ka, &message("A-密钥已注销", "m_tabA002")).await;
+    send_enc(&mut tab_b, &kb, &message("B-仍然可用", "m_tabB002")).await;
+    let m = tokio::time::timeout(Duration::from_secs(5), p.recv())
+        .await
+        .expect("B 的消息到达 recv")
+        .expect("recv 正常");
+    assert_eq!(
+        (m.text.clone(), m.client_id.clone()),
+        (
+            Some("B-仍然可用".to_string()),
+            Some("m_tabB002".to_string())
+        ),
+        "A 的旧密文被丢弃，B 照常可用"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), p.recv())
+            .await
+            .is_err(),
+        "A 的消息没有到达"
+    );
+    // B 注销前仍收得到自己那条的回执；读掉它让 B 的队列归零。
+    let (_, ack_inner) = next_enc_raw_inner(&mut tab_b, &kb, "ack").await;
+    assert_eq!(
+        ack_inner,
+        ack("m_tabB002"),
+        "B 仍能解出回执（ka 已不在表里，只有 kb 一份）"
+    );
+
+    // ---- B 注销最后一把密钥：e2e_close 不回任何帧 ----
+    send_enc(&mut tab_b, &kb, r#"{"v":1,"type":"e2e_close"}"#).await;
+    // 正向屏障：表空后**明文** gateway_info_query 回**明文** gateway_info。读到
+    // 这帧应答为止，B 收到的应用帧必须**恰好这一帧**（字节级）——e2e_close 的
+    // 任何回应帧，无论什么类型，都会排在它前面。屏障刻意选 gateway_info 而
+    // 不是 pong：pong 是「错误地回了一帧」时最可能撞上的类型，首版用 ping 做
+    // 屏障且只看第一帧，「e2e_close 后回一帧 pong」的变异因此存活。kb 若没被
+    // 摘除，应答仍是 enc 包裹的（外层 type 是 enc），读不到明文 gateway_info。
+    tab_b
+        .send(Message::text(format!(
+            r#"{{"v":1,"type":"gateway_info_query","machine":"{MACHINE}"}}"#
+        )))
+        .await
+        .unwrap();
+    let gateway_info = format!(
+        r#"{{"v":1,"type":"gateway_info","machine":"{MACHINE}","version":"{}","caps":["acks"]}}"#,
+        env!("CARGO_PKG_VERSION")
+    );
+    let frames = read_app_frames_until(&mut tab_b, "gateway_info").await;
+    assert_eq!(
+        frames,
+        vec![gateway_info.clone()],
+        "e2e_close 不回帧：B 在屏障应答之前不得收到任何帧；表空后应答为明文"
+    );
+    // A 同样收到这条明文 gateway_info（轮询期间积压的 enc 帧被跳过）。
+    let a_info = next_raw_of_type(&mut tab_a, "gateway_info").await;
+    assert_eq!(a_info, gateway_info, "{a_info}");
+
+    let _ = std::fs::remove_file(&key_path);
+    handle.shutdown();
+    handle.wait().await;
+    drop(p);
+}
+
+/// v1.44 送达回执与网关信息全链路（真实 relay）。
+/// 明文期（无 E2E 会话——出站明文直发）：
+/// - `gateway_info_query` → `gateway_info` 帧**字节级**（version = 本 crate 版本，
+///   caps = ["acks"]）；
+/// - `message{clientId}` → `ack{received}` 帧字节级，消息进 `recv` 且带上
+///   `client_id`；
+/// - 不带 / 不合规 clientId 的消息照旧到达，但**不回 ack**——以紧随其后的
+///   `gateway_info` 应答为界（同一连接按序到达网关），之前不得出现 ack 帧；
+/// - 违规帧（缺 text）带合规 clientId → `ack{rejected, malformed}` 字节级。
+/// E2E 会话活跃后（生产形态）：`gateway_info_query` / `message{clientId}` /
+/// 平台钩子 `on_message_rejected` 的应答全部 enc 包裹，解密后与明文期逐字节
+/// 相同；中继可见的帧体不泄露内帧类型与 clientId。
+#[tokio::test]
+async fn loopback_ack_and_gateway_info_frames() {
+    let (handle, sk) = spawn_test_relay().await;
+    let addr = handle.addr;
+    let key_path = e2e_test_key_path("ack-info");
+    let p = WebPlatform::new_with_e2e(
+        format!("ws://{addr}/gateway"),
+        GatewayCredential::Key(sk),
+        "default".to_string(),
+        MACHINE.to_string(),
+        &key_path,
+        loopback_store("ack-info").await,
+        valid_ws_dir(),
+        nop_models(),
+        Vec::new(), // v1.36 backends 名单：回环测试不驱动引擎选择，空名单整段缺席
+        imagent_web::AsrContext::default(), // v1.40 未配置 → 快照 asr 段缺席
+        300,        // v1.37 审批超时预算（approval_request 帧 timeoutSecs）
+    );
+    eventually(Duration::from_secs(10), || p.is_online()).await;
+    let mut br = connect_ws(&addr, "/ws", None).await;
+    br.send(Message::text(format!(
+        r#"{{"v":1,"type":"hello","token":"{USER_TOKEN}"}}"#
+    )))
+    .await
+    .unwrap();
+    let login: serde_json::Value = serde_json::from_str(&next_text(&mut br).await).unwrap();
+    let sid = login["session"]["id"].as_str().unwrap().to_string();
+    let _ = next_of_type(&mut br, "machines").await;
+
+    let gateway_info = format!(
+        r#"{{"v":1,"type":"gateway_info","machine":"{MACHINE}","version":"{}","caps":["acks"]}}"#,
+        env!("CARGO_PKG_VERSION")
+    );
+    let message = |client_id_part: &str| {
+        format!(
+            r#"{{"v":1,"type":"message","convId":"{CONV}","text":"带回执","machine":"{MACHINE}"{client_id_part}}}"#
+        )
+    };
+
+    // ---- 明文期 ----
+    br.send(Message::text(format!(
+        r#"{{"v":1,"type":"gateway_info_query","machine":"{MACHINE}"}}"#
+    )))
+    .await
+    .unwrap();
+    assert_eq!(
+        next_raw_of_type(&mut br, "gateway_info").await,
+        gateway_info,
+        "gateway_info 帧须逐字节一致"
+    );
+
+    br.send(Message::text(message(r#","clientId":"m_1a2b3c4d""#)))
+        .await
+        .unwrap();
+    assert_eq!(
+        next_raw_of_type(&mut br, "ack").await,
+        r#"{"v":1,"type":"ack","machine":"test-mac","clientId":"m_1a2b3c4d","convId":"web:work","status":"received"}"#,
+        "received 回执须逐字节一致"
+    );
+    let m = tokio::time::timeout(Duration::from_secs(5), p.recv())
+        .await
+        .expect("消息到达 recv")
+        .expect("recv 正常");
+    assert_eq!(
+        (m.conv_id.clone(), m.client_id.clone()),
+        (conv(), Some("m_1a2b3c4d".to_string())),
+        "消息进入入站 channel，client_id 带上"
+    );
+
+    // 不带 / 不合规 clientId：消息照旧到达，但不回 ack。
+    let over = "m".repeat(65);
+    for (raw, why) in [
+        (message(""), "无 clientId"),
+        (
+            message(&format!(r#","clientId":"{over}""#)),
+            "超长 clientId",
+        ),
+        (message(r#","clientId":"a.b""#), "非法字符 clientId"),
+        (message(r#","clientId":42"#), "非字符串 clientId"),
+    ] {
+        br.send(Message::text(raw)).await.unwrap();
+        br.send(Message::text(format!(
+            r#"{{"v":1,"type":"gateway_info_query","machine":"{MACHINE}"}}"#
+        )))
+        .await
+        .unwrap();
+        let m = tokio::time::timeout(Duration::from_secs(5), p.recv())
+            .await
+            .expect("消息到达 recv")
+            .expect("recv 正常");
+        assert_eq!(m.client_id, None, "{why}：clientId 当缺席");
+        // 读到 gateway_info 应答为止：其间出现的任何 ack 帧都是违约。
+        loop {
+            let text = next_text(&mut br).await;
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_ne!(v["type"], "ack", "{why}：不得回 ack：{text}");
+            if v["type"] == "gateway_info" {
+                assert_eq!(text, gateway_info);
+                break;
+            }
+        }
+    }
+
+    // 违规帧（缺 text）带合规 clientId → malformed 回执（字节级）。
+    br.send(Message::text(format!(
+        r#"{{"v":1,"type":"message","convId":"{CONV}","machine":"{MACHINE}","clientId":"m_bad0001"}}"#
+    )))
+    .await
+    .unwrap();
+    assert_eq!(
+        next_raw_of_type(&mut br, "ack").await,
+        r#"{"v":1,"type":"ack","machine":"test-mac","clientId":"m_bad0001","convId":"web:work","status":"rejected","reason":"malformed","message":"消息格式无效"}"#,
+        "malformed 回执须逐字节一致"
+    );
+
+    // ---- E2E 会话活跃后：全部 enc 包裹，解密后与明文期逐字节相同 ----
+    let k = e2e_handshake(&mut br, &sid).await;
+    let assert_blind = |envelope: &str, needle: &str| {
+        assert!(
+            !envelope.contains(needle),
+            "中继可见的 enc 帧体不得泄露 {needle:?}：{envelope}"
+        );
+    };
+
+    send_enc(
+        &mut br,
+        &k,
+        r#"{"v":1,"type":"gateway_info_query","machine":"test-mac"}"#,
+    )
+    .await;
+    let (envelope, inner) = next_enc_raw_inner(&mut br, &k, "gateway_info").await;
+    assert_eq!(inner, gateway_info, "enc 内层与明文期逐字节一致");
+    assert_blind(&envelope, "gateway_info");
+    assert_blind(&envelope, "acks");
+
+    send_enc(
+        &mut br,
+        &k,
+        r#"{"v":1,"type":"message","convId":"web:work","text":"密文消息","clientId":"m_enc00001"}"#,
+    )
+    .await;
+    let (envelope, inner) = next_enc_raw_inner(&mut br, &k, "ack").await;
+    assert_eq!(
+        inner,
+        r#"{"v":1,"type":"ack","machine":"test-mac","clientId":"m_enc00001","convId":"web:work","status":"received"}"#
+    );
+    assert_blind(&envelope, r#""type":"ack""#);
+    assert_blind(&envelope, "m_enc00001");
+    assert_blind(&envelope, "密文消息");
+    let m = tokio::time::timeout(Duration::from_secs(5), p.recv())
+        .await
+        .expect("消息到达 recv")
+        .expect("recv 正常");
+    assert_eq!(
+        (m.text.clone(), m.client_id.clone()),
+        (Some("密文消息".to_string()), Some("m_enc00001".to_string()))
+    );
+
+    // Dispatcher 的明确丢弃点 → 平台钩子 → enc 包裹的 rejected 回执。三个
+    // 丢弃点调用钩子由 core 单测钉住，这里直接调平台钩子验证出站链路与字节。
+    p.on_message_rejected(
+        &conv(),
+        "m_enc00002",
+        imagent_core::MessageRejectReason::NotAllowed,
+    );
+    let (_, inner) = next_enc_raw_inner(&mut br, &k, "ack").await;
+    assert_eq!(
+        inner,
+        r#"{"v":1,"type":"ack","machine":"test-mac","clientId":"m_enc00002","convId":"web:work","status":"rejected","reason":"not_allowed","message":"发送者未获授权，消息未被处理"}"#
+    );
+
+    let _ = std::fs::remove_file(&key_path);
+    handle.shutdown();
+    handle.wait().await;
+    drop(p);
 }

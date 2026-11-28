@@ -671,6 +671,7 @@ pub(super) async fn run(ctx: DrainContext) {
                             control: None,
                             no_steer: false,
                             reply_hint: ReplyHint::None,
+                            client_id: None,
                         };
                         if inbound_tx.send(reaction_msg).await.is_err() {
                             break;
@@ -1848,6 +1849,7 @@ mod tests {
             control: None,
             no_steer: false,
             reply_hint: ReplyHint::None,
+            client_id: None,
         };
         let slow = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(120)).await;
@@ -1985,6 +1987,7 @@ mod tests {
             control: None,
             no_steer: false,
             reply_hint: ReplyHint::None,
+            client_id: None,
         }
     }
 

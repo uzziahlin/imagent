@@ -112,6 +112,9 @@ const ASR_SEND_FAIL_TEXT = "语音识别请求发送失败，请重试";
  * drafts，App 层创建、整棵树共用）——store 恒为当前会话的最新值。draftKey 变化
  * （切会话 / 切机器）即从 store 载入该会话的草稿；文字草稿由 store 防抖落盘
  * localStorage，刷新 / iOS 杀进程后可恢复，切换会话不再把草稿带到别的会话。
+ * v1.44 draftReload：App 在 Composer 之外改了当前会话的草稿（重发时连接未就绪，
+ * 把文字放回输入框）后递增它，本组件据此从 store 重读——store 恒为最新值，
+ * 输入框只是它的镜像。
  */
 export function Composer({
   status,
@@ -121,6 +124,7 @@ export function Composer({
   asrEvent,
   drafts,
   draftKey,
+  draftReload,
   onAsr,
   onSend,
   onStop,
@@ -142,6 +146,10 @@ export function Composer({
   /** v1.42：当前草稿归属键（机器 + 会话，lib/drafts 的 draftKey）。变化即
    *  切换到该会话的草稿——本组件不自己推导键，由 App 按当前机器 + 会话给出。 */
   draftKey: string;
+  /** v1.44 草稿重读信号：变化即从 store 重新载入**当前**会话的草稿（App 在
+   *  Composer 之外写了当前会话的草稿时递增——重发时连接未就绪，文字被放回
+   *  输入框）。缺省 / 不变化时行为与此前完全一致。 */
+  draftReload?: number;
   /** v1.40：发送 asr_request（App 层转 wsRef.sendAsrRequest + outMachine()，
    *  Composer 不直接持 WsManager——同 onSend 的回调形态）；false = 未发出
    *  （连接未就绪等），Composer 就地归位 + 行内提示。 */
@@ -195,6 +203,7 @@ export function Composer({
   // v1.42 切换会话 / 机器：换键 → 载入该会话的草稿 → 复位命令面板相关状态。
   // 不需要「先把旧的存回去」：旧会话的内容每次写入时已在 store 里。
   // 键与 state 在同一个 effect 里切换，二者不会错位。
+  // v1.44：draftReload 变化同样走这里——store 已被 App 改过，输入框重新对齐它。
   useEffect(() => {
     keyRef.current = draftKey;
     setTextState(drafts.text(draftKey));
@@ -202,7 +211,7 @@ export function Composer({
     setDismissed(false);
     setSel(0);
     setAttachError(null);
-  }, [draftKey, drafts]);
+  }, [draftKey, drafts, draftReload]);
 
   // ---- v1.39 语音转文字（P1.5）：Web Speech API，能力探测决定入口渲染 ----
   /** 构造器惰性探测一次（mount 期间环境不变；测试经 window 注入 stub）。 */

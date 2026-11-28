@@ -239,6 +239,18 @@ impl Dispatcher {
                  授权整个会话（群）后重启 imagent。\n{admin_note}",
                 sender.0, conv.0, sender.0, conv.0
             );
+            // v1.44：发现态在语义上同样是「未授权且消息未被处理」——带回执关联
+            // id 的消息（驾驶舱）在此上报，与下面的引导文案**并存**：引导不带
+            // 关联 id，回执才能把「未送达」标到那条具体的消息上（否则界面要等
+            // 15s 超时才标成「未确认送达」）。先于 reply：回执先入队，浏览器先
+            // 看到「未送达：未获授权」再看到引导。
+            if let Some(client_id) = msg.client_id.as_deref() {
+                self.platform.on_message_rejected(
+                    &conv,
+                    client_id,
+                    MessageRejectReason::NotAllowed,
+                );
+            }
             self.reply(&conv, &guide, &hint).await;
             return;
         }
@@ -252,6 +264,17 @@ impl Dispatcher {
                 sender = %sender.0,
                 "非白名单 sender 且会话未授权，丢弃"
             );
+            // v1.44：带送达回执关联 id 的消息（驾驶舱）在明确的丢弃点上报。
+            // web 会话不是 p2p、也不 @ bot，下面两条引导对它都不生效——此前
+            // 驾驶舱用户被拒时完全静默，界面与发送成功无法区分。放在两条
+            // return 之前：两种丢弃路径都上报，且恰一次。
+            if let Some(client_id) = msg.client_id.as_deref() {
+                self.platform.on_message_rejected(
+                    &conv,
+                    client_id,
+                    MessageRejectReason::NotAllowed,
+                );
+            }
             // 私聊陌生人引导（默认开）：未放行用户的私聊回一句引导——私聊是
             // 用户主动找 bot，无探测面（与群内默认静默的 stranger_mention_hint
             // 相反，见 config 注释）；含 sender id 与 /allow 指引，首次使用者

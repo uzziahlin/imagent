@@ -4,6 +4,7 @@ import {
   machinePubkeyValid,
   normalizeExpiryMs,
   type DeviceInfo,
+  type GatewayInfo,
   type MachineCfg,
   type PasskeyInfo,
 } from "../lib/protocol";
@@ -41,6 +42,9 @@ export function relativeTime(ts: number | undefined, now = Date.now()): string {
  * 3. 已登录设备（v1.2 原设备区整块并入）。
  * 4. 通行钥匙（v1.3 原钥匙区并入）。
  * 5. 已信任机器指纹（v1.4 TOFU pin 区并入）。
+ * v1.44：机器行在收到过该机器 gateway_info 应答时多一行「网关 v{版本}」——
+ * 此前网关版本任何帧都不透出，排查「发版后没更新」只能上机器看。没有该机器
+ * 的记录（旧网关 / 本次登录后没在线过）就什么都不显示。
  *
  * adminBusy = re-auth ceremony 进行中（管理操作入口统一禁用）；adminError =
  * re-auth 失败/过期引导文案；adminActive = adminToken 当前有效（提示免验剩余
@@ -67,6 +71,7 @@ export function AdminPanel({
   onRevokePasskey,
   pins,
   onResetPin,
+  gatewayInfo,
   onClose,
 }: {  /** 弹层开关（App 恒挂载本组件，open 只切显隐）。 */
   open: boolean;
@@ -106,6 +111,10 @@ export function AdminPanel({
   pins: E2ePin[];
   /** v1.4 重置机器 pin（重置后该机器重新走 TOFU 指纹确认）。 */
   onResetPin: (machine: string) => void;
+  /** v1.44 逐机器网关版本与能力（protocol reducer 的 state.gatewayInfo）：
+   *  机器名 → { version, caps }。没有某机器的键 = 没收到过它的 gateway_info
+   *  应答，该行不显示版本。 */
+  gatewayInfo: Record<string, GatewayInfo>;
   onClose: () => void;
 }) {
   const mounted = useExitMounted(open, 150);
@@ -263,6 +272,10 @@ export function AdminPanel({
                     <div className="mt-1 font-mono text-[11px] tracking-wider text-ghost" aria-label={`${m.name} 公钥指纹`}>
                       {m.pubkey_fp}
                     </div>
+                    {/* v1.44 网关版本：小号弱色，纯展示。 */}
+                    {gatewayInfo[m.name] && (
+                      <div className="mt-0.5 text-[11px] text-faint">网关 v{gatewayInfo[m.name].version}</div>
+                    )}
                     {removing === m.name && (
                       <p className="mt-1 text-[11px] leading-relaxed text-amber-700 dark:text-amber-300">
                         移除后该机器的网关连接将被立即断开，且无法再接入（可重新添加）。

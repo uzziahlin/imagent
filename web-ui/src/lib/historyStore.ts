@@ -31,8 +31,9 @@ export const HISTORY_MAX_ENTRIES = 120;
 /** 存储键分隔符（machine 与 convId 均不含该序列，拆解无歧义）。 */
 const KEY_SEP = "||";
 
-/** 恢复条目的 React key 前缀：恢复条目与新到条目（user:N/text:N 序号键）
- *  的 key 空间隔离，避免恢复后 seq 归零导致键冲突。 */
+/** 恢复条目的 React key 前缀：恢复条目与新到条目（text:N 序号键；v1.44 起本机
+ *  回显是 user:<clientId>）的 key 空间隔离，避免恢复后 seq 归零导致键冲突
+ *  （clientId 键本身全局唯一，加前缀只为与其它条目同一纪律）。 */
 const RESTORED_KEY_PREFIX = "h:";
 
 const DB_NAME = "imagent-web";
@@ -194,10 +195,19 @@ function convKey(machine: string, convId: string): string {
   return `${machine}${KEY_SEP}${convId}`;
 }
 
+/** v1.44 恢复时送达状态的收敛：落盘时还在「等回执」（pending）的本机回显一律
+ *  改为 unconfirmed——进程重启后发出它的那次连接早已不在，等不到的回执不会再
+ *  补发，留着 pending 就是一直「发送中」。迟到的 received 仍能把它翻回 sent
+ *  （reducer 按 clientId 关联，不看 key 的 h: 前缀）。其它状态（sent / failed /
+ *  unconfirmed / 无 ack）原样：条目对象引用不变。 */
+const settleRestoredAcks = (entries: StreamEntry[]): StreamEntry[] =>
+  entries.map((e): StreamEntry => (e.kind === "user" && e.ack === "pending" ? { ...e, ack: "unconfirmed" } : e));
+
 /** 消息本地缓存门面。全部方法静默容错（存储失败不影响主链路）。 */
 export const historyStore = {
   /** 全量读取并按 machine/conv 聚合（key 拆解；畸形 key 跳过）。v1.8 起每条
-   *  记录带 lastSeq（旧记录无该字段 → undefined）。 */
+   *  记录带 lastSeq（旧记录无该字段 → undefined）。v1.44 起载入时把仍 pending
+   *  的回显按 unconfirmed 处理（settleRestoredAcks）。 */
   async loadAll(): Promise<Record<string, Record<string, RestoredConv>>> {
     try {
       const pairs = await backend().getAll();
@@ -210,7 +220,7 @@ export const historyStore = {
           continue;
         }
         (out[machine] ??= {})[convId] = {
-          entries: val?.entries ?? [],
+          entries: settleRestoredAcks(val?.entries ?? []),
           lastSeq: typeof val?.lastSeq === "number" ? val.lastSeq : undefined,
         };
       }

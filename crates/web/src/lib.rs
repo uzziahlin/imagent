@@ -145,6 +145,23 @@
 //! - `push_notify` 帧的 kind 新增 `window_turn_end` / `window_waiting`（convId =
 //!   `peer:<窗口名>`，title = 窗口名截 32 码点）。
 //!
+//! v1.44 扩展（同浏览器多标签页 + 消息送达回执，契约同款字节级纪律）：
+//! - 多标签页是**纯网关侧修复**：E2E 会话表改为每个登录会话保留多把密钥
+//!   （每个标签页一把，见 [`e2e`]），出站逐密钥各密封一份——中继本来就按会话
+//!   广播，每个标签页只解得开自己那份。新增入站 `e2e_close`（封在 enc 里，
+//!   标签页关闭时发，网关删除解开它的那把密钥、不回帧）；空闲密钥由网关按时
+//!   回收。旧 SPA 不用改也不再被顶掉。
+//! - 入站 `message` 帧可带可选 `clientId`（字符串，1..=64，`[A-Za-z0-9_-]`；
+//!   不合规当缺席）。出站 `ack{machine, clientId, convId, status, reason?,
+//!   message?}`：`received`（网关已收到并接下——client 层 / 媒体泵在消息进入
+//!   入站 channel 之后发）或 `rejected`（明确的丢弃点：`malformed` 由本层
+//!   帧校验产生，`not_allowed` / `queue_full` / `peer_unreachable` 由 Dispatcher
+//!   经 [`imagent_core::Platform::on_message_rejected`] 上报）。同一 clientId
+//!   至多一条 received、一条 rejected，received 恒先。
+//! - 入站 `gateway_info_query`（无必填字段）→ 出站 `gateway_info{machine,
+//!   version, caps}`：`caps` 含 `"acks"` 即支持回执；旧网关按未知 type 忽略，
+//!   SPA 据此判定不支持、不显示任何状态。
+//!
 //! **帧内 convId 协议约定：恒为完整 conv 形态（`web:<session>`）**。出站帧
 //! （text / card / approval_request …）写入的即完整 conv，浏览器回执帧
 //! （message / approval_response）**原样回传收到的 convId** 即可，不得剥前
@@ -1263,6 +1280,124 @@ pub(crate) fn encode_asr_result_frame(
 }
 
 // ---------------------------------------------------------------------------
+// 出站送达回执 / 网关信息帧（协议 v1.44，字段与 SPA 侧契约逐字一致，不得增删改）
+// ---------------------------------------------------------------------------
+
+/// 本网关支持的可选能力字面量（`gateway_info` 帧 `caps` 数组的全部取值，
+/// 排序稳定）。目前只有 `acks`（支持送达回执）——SPA 据此决定是否给用户
+/// 消息显示「发送中 / 未送达」状态；旧网关不回 `gateway_info` → 视为不支持。
+const GATEWAY_CAPS: &[&str] = &["acks"];
+
+/// `malformed` 回执的 reason / message 字面量（契约 §2.2 第四行）。其余三种
+/// reason（`not_allowed` / `queue_full` / `peer_unreachable`）由 Dispatcher 的
+/// 丢弃点上报，字面量在 core 的 `MessageRejectReason`（单一事实源）；
+/// `malformed` 是 web client 层自己产生的，字面量留在本 crate。
+pub(crate) const ACK_MALFORMED_REASON: &str = "malformed";
+pub(crate) const ACK_MALFORMED_MESSAGE: &str = "消息格式无效";
+
+/// ack 帧的状态（协议 v1.44）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AckStatus {
+    /// 网关已收到并接下这条消息（消息进入平台入站 channel 之后由 client 层
+    /// / 媒体泵发出）。证明的是「到达了网关」，不带 `reason` / `message`。
+    Received,
+    /// Dispatcher / client 层在明确的丢弃点拒绝。
+    Rejected {
+        /// 拒绝原因字面量（`reason` 键）。
+        reason: &'static str,
+        /// 中文人话（`message` 键）。
+        message: &'static str,
+    },
+}
+
+impl AckStatus {
+    /// `status` 键的字面量。
+    fn status_str(&self) -> &'static str {
+        match self {
+            AckStatus::Received => "received",
+            AckStatus::Rejected { .. } => "rejected",
+        }
+    }
+}
+
+/// ack 帧（struct 序列化保持声明序：`v`、`type`、`machine`、`clientId`、
+/// `convId`、`status`、`reason`、`message`）。`reason` / `message` 只在
+/// `rejected` 时出现（`received` 省略这两个键——契约键序固定）。
+#[derive(Serialize)]
+struct AckFrame<'a> {
+    v: u8,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    machine: &'a str,
+    #[serde(rename = "clientId")]
+    client_id: &'a str,
+    #[serde(rename = "convId")]
+    conv_id: &'a str,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<&'static str>,
+}
+
+/// ack 帧药化（送达回执）。`machine` 为本机身份；`conv` 为完整 conv（帧内
+/// convId 协议约定）。随其它出站业务帧逐会话加密（经 outbound channel →
+/// client 的 send_business），所有在线标签页 / 设备都会收到，各自按 clientId
+/// 对回自己发出的消息、对不上的忽略。
+pub(crate) fn encode_ack_frame(
+    machine: &str,
+    client_id: &str,
+    conv: &str,
+    status: AckStatus,
+) -> Result<String> {
+    let (status_str, reason, message) = match status {
+        AckStatus::Received => (status.status_str(), None, None),
+        AckStatus::Rejected { reason, message } => {
+            (status.status_str(), Some(reason), Some(message))
+        }
+    };
+    let frame = AckFrame {
+        v: 1,
+        kind: "ack",
+        machine,
+        client_id,
+        conv_id: conv,
+        status: status_str,
+        reason,
+        message,
+    };
+    serde_json::to_string(&frame)
+        .map_err(|e| CoreError::Platform(TARGET, format!("ack 帧序列化失败：{e}")))
+}
+
+/// gateway_info 帧（struct 序列化保持声明序：`v`、`type`、`machine`、
+/// `version`、`caps`）。`gateway_info_query` 的应答。
+#[derive(Serialize)]
+struct GatewayInfoFrame<'a> {
+    v: u8,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    machine: &'a str,
+    version: &'static str,
+    caps: &'static [&'static str],
+}
+
+/// gateway_info 帧药化（`gateway_info_query` 的应答）。`version` = 本 crate
+/// 版本（workspace 统一版本号 = 网关版本）；管理页据此显示「网关 v{version}」
+/// ——此前网关版本任何帧都不透出，排查「发版后没更新」只能上机器看。
+pub(crate) fn encode_gateway_info_frame(machine: &str) -> Result<String> {
+    let frame = GatewayInfoFrame {
+        v: 1,
+        kind: "gateway_info",
+        machine,
+        version: env!("CARGO_PKG_VERSION"),
+        caps: GATEWAY_CAPS,
+    };
+    serde_json::to_string(&frame)
+        .map_err(|e| CoreError::Platform(TARGET, format!("gateway_info 帧序列化失败：{e}")))
+}
+
+// ---------------------------------------------------------------------------
 // 入站帧（浏览器 → 网关）映射
 // ---------------------------------------------------------------------------
 
@@ -1303,11 +1438,15 @@ pub(crate) enum InboundAction {
     /// `<imagent_home>/media/up-<unix_ms>-<安全化name>` 后合成 InboundMessage
     /// 投回 inbound channel；任一步失败回 error 帧
     /// （media_too_large / media_invalid）且不投递。`conv` 已归一；`text`
-    /// 为可选说明（纯图消息缺省/空串——泵内归一为 text=None）。
+    /// 为可选说明（纯图消息缺省/空串——泵内归一为 text=None）。`client_id`
+    /// （v1.44 送达回执关联 id，经 [`parse_client_id`]）随动作带到媒体泵——
+    /// 回执要在合成消息**进入入站 channel 之后**才发，泵是唯一知道这一时刻
+    /// 的地方。
     MediaMessage {
         conv: String,
         text: Option<String>,
         media: MediaPayload,
+        client_id: Option<String>,
     },
     /// sync 请求 → sync responder 重发缓存卡片（不进 recv）。
     Sync,
@@ -1321,6 +1460,11 @@ pub(crate) enum InboundAction {
     /// `ApprovalsQuery` 共用通道与泵）。无必填字段——`machine` 由 relay 路由
     /// 用，网关不消费。peer 通道未启用的网关不回帧。
     WindowsQuery,
+    /// v1.44 网关信息查询（gateway_info_query 帧）：client 层直接回
+    /// `gateway_info{machine, version, caps}`（无必填字段、不依赖任何共享态，
+    /// 不进 recv / dispatch 命令链，也不必绕 sync 泵）。SPA 据应答里的 `caps`
+    /// 判定该网关是否支持送达回执；旧网关按未知 type 忽略 → SPA 判定不支持。
+    GatewayInfoQuery,
     /// v1.43 关注 / 取消关注一个本地窗口（window_watch{name, watch} 帧）：
     /// client 层直接改 peer 共享态的关注名单（跨设备的全局状态，由网关持久化
     /// 在 store `config` 表——前端不存名单、不对账），再经 sync 泵重发一帧
@@ -1411,7 +1555,10 @@ fn decision_word(decision: &str) -> Option<&'static str> {
 ///   强加 `web:` 前缀会让用户消息绕过拦截直进 agent（误触发 agent 轮、落
 ///   outbound_log card），并造出 `web:peer:xxx` 幽灵会话。
 /// - 其它（裸 session 名）→ `web:<raw>`
-fn normalize_conv(raw: Option<&str>, default_session: &str) -> String {
+///
+/// `pub(crate)`：client 层组 `malformed` 回执时对违规帧的 convId 做同一套
+/// 归一（v1.44）。
+pub(crate) fn normalize_conv(raw: Option<&str>, default_session: &str) -> String {
     match raw {
         Some(c) if c.starts_with("local:") => c.to_string(),
         Some(c) if c.starts_with("peer:") => c.to_string(),
@@ -1424,8 +1571,16 @@ fn normalize_conv(raw: Option<&str>, default_session: &str) -> String {
 /// 合成 InboundMessage 公共骨架（§5.2；字段全集对照 src/webhook.rs:650 构造
 /// 示例）。web 用户手打消息走 steering（no_steer=false，与 webhook 合成消息
 /// 相反）。`conv` 为已经 [`normalize_conv`] 归一的完整 conv 字符串
-/// （`web:<session>`），本函数不再加前缀。
-pub(crate) fn synth_message(conv: String, text: String, ask_req: Option<String>) -> InboundMessage {
+/// （`web:<session>`），本函数不再加前缀。`client_id` 为 v1.44 送达回执的
+/// 关联 id（只有 `message` 帧经 [`parse_client_id`] 解析后可能为 Some；
+/// approval_response / control 等合成消息传 None——契约只给 message 帧定义
+/// 了 `clientId`）。
+pub(crate) fn synth_message(
+    conv: String,
+    text: String,
+    ask_req: Option<String>,
+    client_id: Option<String>,
+) -> InboundMessage {
     InboundMessage {
         conv_id: ConvId(conv),
         sender: UserId("web:user".to_string()),
@@ -1441,6 +1596,7 @@ pub(crate) fn synth_message(conv: String, text: String, ask_req: Option<String>)
         control: None,
         no_steer: false,
         reply_hint: ReplyHint::None,
+        client_id,
     }
 }
 
@@ -1448,16 +1604,37 @@ pub(crate) fn synth_message(conv: String, text: String, ask_req: Option<String>)
 /// （契约：纯图消息 text=None——空串说明与缺省同归一），media 为已落盘的
 /// 本地路径引用（[`MediaRef`] 无独立 mime/name 字段：kind 载 mime，
 /// name 已并入落盘文件名）。其余字段与 [`synth_message`] 同（用户手打，
-/// steering 生效）。
+/// steering 生效）。`client_id`（v1.44）随媒体动作从 client 层一路带到泵。
 pub(crate) fn synth_media_message(
     conv: String,
     text: Option<String>,
     media: Vec<MediaRef>,
+    client_id: Option<String>,
 ) -> InboundMessage {
-    let mut msg = synth_message(conv, String::new(), None);
+    let mut msg = synth_message(conv, String::new(), None, client_id);
     msg.text = text.filter(|t| !t.is_empty());
     msg.media = media;
     msg
+}
+
+/// `clientId` 长度上限（契约 §2.1：1..=64，字符集 `[A-Za-z0-9_-]`）。SPA 的
+/// 生成形态是 `m_` + 时间戳 36 进制 + 8 位随机十六进制，远在上限内；上限只
+/// 为挡畸形帧（超长 id 会原样进 ack 帧、日志与排队行）。
+pub(crate) const CLIENT_ID_MAX_CHARS: usize = 64;
+
+/// 入站 `clientId` 形状校验（契约 §2.1，纯函数）：字符串、长度 1..=64、仅
+/// `[A-Za-z0-9_-]`。**不合规一律当缺席**（返回 None——照旧处理消息，只是
+/// 不发回执；不因一个可选字段丢掉用户消息）。字符集限定 ASCII，故按字节
+/// 计长即按字符计长。client 层对 `Warn` 帧也用它判断能否回 `malformed`
+/// 回执（同一规则，单一事实源）。
+pub(crate) fn parse_client_id(v: Option<&serde_json::Value>) -> Option<String> {
+    let s = v?.as_str()?;
+    if s.is_empty() || s.len() > CLIENT_ID_MAX_CHARS {
+        return None;
+    }
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+        .then(|| s.to_string())
 }
 
 /// 入站业务帧映射（§4.1 表；client 已解析为 JSON Value，machine/error 等
@@ -1470,10 +1647,12 @@ pub(crate) fn map_inbound_frame(v: &serde_json::Value, default_session: &str) ->
         // message：convId 缺省 / 空串 → default_session。v1.7 起可带可选
         // media 段（图片 base64 上行）——本层只查字段存在性/类型，值域校验 +
         // 落盘在 platform 媒体泵；纯图消息 text 可缺省/空串，text 与 media
-        // 至少其一。
+        // 至少其一。v1.44 起可带可选 `clientId`（送达回执关联 id，形状不合规
+        // 当缺席——消息照旧处理，只是不发回执）。
         "message" => {
             let conv = normalize_conv(v.get("convId").and_then(|c| c.as_str()), default_session);
             let text = v.get("text").and_then(|t| t.as_str());
+            let client_id = parse_client_id(v.get("clientId"));
             // media:null（JS 可选字段的 null 序列化形态）按「无 media 段」处理。
             let media_field = v.get("media").filter(|m| !m.is_null());
             if media_field.is_some() {
@@ -1482,6 +1661,7 @@ pub(crate) fn map_inbound_frame(v: &serde_json::Value, default_session: &str) ->
                         conv,
                         text: text.map(str::to_string),
                         media,
+                        client_id,
                     },
                     None => InboundAction::Warn(
                         "message 帧 media 字段畸形（须 name/mime/b64 字符串），丢弃",
@@ -1490,9 +1670,12 @@ pub(crate) fn map_inbound_frame(v: &serde_json::Value, default_session: &str) ->
             } else {
                 match text {
                     // 无 media 时 text 必填（缺失无意义，丢弃——v1.7 前既有纪律）。
-                    Some(t) => {
-                        InboundAction::Message(Box::new(synth_message(conv, t.to_string(), None)))
-                    }
+                    Some(t) => InboundAction::Message(Box::new(synth_message(
+                        conv,
+                        t.to_string(),
+                        None,
+                        client_id,
+                    ))),
                     None => InboundAction::Warn("message 帧缺 text 字段，丢弃"),
                 }
             }
@@ -1516,6 +1699,7 @@ pub(crate) fn map_inbound_frame(v: &serde_json::Value, default_session: &str) ->
                     normalize_conv(Some(conv), default_session),
                     word.to_string(),
                     Some(request_id.to_string()),
+                    None,
                 ))),
                 None => InboundAction::Warn(
                     "approval_response 帧 decision 非法（须 allow|deny|always），丢弃",
@@ -1553,6 +1737,7 @@ pub(crate) fn map_inbound_frame(v: &serde_json::Value, default_session: &str) ->
                 normalize_conv(v.get("convId").and_then(|c| c.as_str()), default_session),
                 text,
                 None,
+                None,
             )))
         }
         "sync" => InboundAction::Sync,
@@ -1563,6 +1748,10 @@ pub(crate) fn map_inbound_frame(v: &serde_json::Value, default_session: &str) ->
         // v1.43 本地窗口快照：浏览器请求 → 网关回权威快照（同 approvals_query）。
         // 无字段校验面，组装与回帧在 platform 的 sync 泵。
         "windows_query" => InboundAction::WindowsQuery,
+        // v1.44 网关信息查询：无字段校验面，应答帧由 client 层直接出站
+        // （`encode_gateway_info_frame`）——任何网关都回，旧网关按未知 type
+        // 忽略。
+        "gateway_info_query" => InboundAction::GatewayInfoQuery,
         // v1.43 关注 / 取消关注窗口：本层只做字段校验（`name` 须非空字符串且
         // ≤ 上限，`watch` 须布尔；缺失 / 类型错 / 超长 → Warn 丢弃——契约：
         // 畸形 window_watch 一律丢弃，不改关注名单）。名字原样使用、不 trim：
@@ -3059,7 +3248,13 @@ mod tests {
             r#"{"v":1,"type":"message","convId":"web:work","text":"看图","media":{"name":"shot.png","mime":"image/png","b64":"aGk="}}"#,
             SESSION,
         );
-        let InboundAction::MediaMessage { conv, text, media } = act else {
+        let InboundAction::MediaMessage {
+            conv,
+            text,
+            media,
+            client_id,
+        } = act
+        else {
             panic!("带 media 的 message 应映射为 MediaMessage：{act:?}")
         };
         assert_eq!(conv, "web:work");
@@ -3067,6 +3262,7 @@ mod tests {
         assert_eq!(media.name, "shot.png");
         assert_eq!(media.mime, "image/png");
         assert_eq!(media.b64, "aGk=");
+        assert_eq!(client_id, None, "帧无 clientId → None");
 
         // 纯图：text 缺省 / 空串（泵内归一 text=None）；裸 session 名补前缀。
         for raw in [
@@ -3118,6 +3314,7 @@ mod tests {
                 kind: "image/png".into(),
                 url: "/m/up-1-a.png".into(),
             }],
+            Some("m_img00001".into()),
         );
         assert_eq!(m.conv_id, ConvId("web:work".into()));
         assert_eq!(m.text.as_deref(), Some("看图"));
@@ -3125,6 +3322,11 @@ mod tests {
         assert_eq!(m.media[0].kind, "image/png");
         assert_eq!(m.media[0].url, "/m/up-1-a.png");
         assert!(!m.no_steer, "用户手打媒体消息走 steering");
+        assert_eq!(
+            m.client_id.as_deref(),
+            Some("m_img00001"),
+            "v1.44：关联 id 随合成消息写入 InboundMessage"
+        );
 
         let m = synth_media_message(
             "web:work".into(),
@@ -3133,8 +3335,192 @@ mod tests {
                 kind: "image/jpeg".into(),
                 url: "/m/up-2-b.jpg".into(),
             }],
+            None,
         );
         assert_eq!(m.text, None, "空串说明归一为 None（纯图消息）");
+        assert_eq!(m.client_id, None);
+    }
+
+    /// v1.44 `clientId` 形状校验（契约 §2.1）：字符串、1..=64、仅
+    /// `[A-Za-z0-9_-]`；边界（恰 64 / 65、单字符）与非法形态（空串、空白、
+    /// 标点、非 ASCII、非字符串、缺席）一律当缺席。
+    #[test]
+    fn parse_client_id_shapes() {
+        let ok = |raw: &str| parse_client_id(Some(&serde_json::json!(raw)));
+        assert_eq!(ok("m_1a2b3c4d").as_deref(), Some("m_1a2b3c4d"));
+        assert_eq!(ok("A").as_deref(), Some("A"), "单字符合法");
+        assert_eq!(ok("a-b_C9").as_deref(), Some("a-b_C9"), "字符集全集");
+        let max = "m".repeat(CLIENT_ID_MAX_CHARS);
+        assert_eq!(ok(&max).as_deref(), Some(max.as_str()), "恰 64 合法");
+        let over = "m".repeat(CLIENT_ID_MAX_CHARS + 1);
+        assert_eq!(ok(&over), None, "65 字符超长 → 当缺席");
+
+        for bad in ["", " ", "a b", "a.b", "a:b", "a/b", "中文", "a+b", "m_1\n"] {
+            assert_eq!(ok(bad), None, "非法字符 / 空串应判缺席：{bad:?}");
+        }
+        // 缺席与任何非字符串形态。
+        assert_eq!(parse_client_id(None), None);
+        for v in [
+            serde_json::json!(42),
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!(["m_1"]),
+            serde_json::json!({ "id": "m_1" }),
+        ] {
+            assert_eq!(parse_client_id(Some(&v)), None, "非字符串：{v}");
+        }
+    }
+
+    /// v1.44 message 帧的 `clientId` 透传（纯文本与媒体两条路径）；不合规时
+    /// 当缺席且**消息照旧处理**；契约只给 message 帧定义了 `clientId`，
+    /// approval_response / control 帧即使带了也不透传。
+    #[test]
+    fn map_message_client_id_passthrough() {
+        let client_id_of = |raw: &str| match map_raw_frame(raw, SESSION) {
+            InboundAction::Message(m) => (m.conv_id.0.clone(), m.text.clone(), m.client_id),
+            other => panic!("{raw} 应映射为 Message：{other:?}"),
+        };
+        // 合规：原样写入 InboundMessage.client_id，其余字段不受影响。
+        let (conv, text, client_id) = client_id_of(
+            r#"{"v":1,"type":"message","convId":"web:s-1","text":"列出目录","machine":"home-mac","clientId":"m_1a2b3c4d"}"#,
+        );
+        assert_eq!(conv, "web:s-1");
+        assert_eq!(text.as_deref(), Some("列出目录"));
+        assert_eq!(client_id.as_deref(), Some("m_1a2b3c4d"));
+
+        // 不合规一律当缺席，消息照旧映射（不因可选字段丢掉用户消息）。
+        let over = "m".repeat(CLIENT_ID_MAX_CHARS + 1);
+        for raw in [
+            format!(
+                r#"{{"v":1,"type":"message","convId":"web:s-1","text":"hi","clientId":"{over}"}}"#
+            ),
+            r#"{"v":1,"type":"message","convId":"web:s-1","text":"hi","clientId":"m_1a.2b"}"#
+                .to_string(),
+            r#"{"v":1,"type":"message","convId":"web:s-1","text":"hi","clientId":42}"#.to_string(),
+            r#"{"v":1,"type":"message","convId":"web:s-1","text":"hi","clientId":""}"#.to_string(),
+            r#"{"v":1,"type":"message","convId":"web:s-1","text":"hi"}"#.to_string(),
+        ] {
+            let (conv, text, client_id) = client_id_of(&raw);
+            assert_eq!(conv, "web:s-1", "{raw}");
+            assert_eq!(text.as_deref(), Some("hi"), "{raw}");
+            assert_eq!(client_id, None, "不合规 / 缺席 → None：{raw}");
+        }
+
+        // 媒体路径：透传到 MediaMessage.client_id。
+        let act = map_raw_frame(
+            r#"{"v":1,"type":"message","convId":"web:s-1","text":"看图","clientId":"m_img00001","media":{"name":"a.png","mime":"image/png","b64":"aGk="}}"#,
+            SESSION,
+        );
+        let InboundAction::MediaMessage {
+            conv, client_id, ..
+        } = act
+        else {
+            panic!("带 media 的 message 应映射为 MediaMessage：{act:?}")
+        };
+        assert_eq!(conv, "web:s-1");
+        assert_eq!(client_id.as_deref(), Some("m_img00001"));
+
+        // 其它帧类型带了 clientId 也不透传（契约只定义在 message 帧上）。
+        let (.., client_id) = client_id_of(
+            r#"{"v":1,"type":"approval_response","convId":"web:s-1","requestId":"r1","decision":"allow","clientId":"m_no00001"}"#,
+        );
+        assert_eq!(client_id, None, "approval_response 不透传 clientId");
+        let (.., client_id) = client_id_of(
+            r#"{"v":1,"type":"control","cmd":"stop","convId":"web:s-1","clientId":"m_no00002"}"#,
+        );
+        assert_eq!(client_id, None, "control 不透传 clientId");
+    }
+
+    /// v1.44 gateway_info_query 入站映射：无必填字段（`machine` 由 relay 路由
+    /// 用）→ [`InboundAction::GatewayInfoQuery`]，不进 recv / dispatch 命令链。
+    #[test]
+    fn map_gateway_info_query() {
+        for raw in [
+            r#"{"v":1,"type":"gateway_info_query","machine":"home-mac"}"#,
+            r#"{"v":1,"type":"gateway_info_query"}"#,
+        ] {
+            assert!(
+                matches!(map_raw_frame(raw, SESSION), InboundAction::GatewayInfoQuery),
+                "{raw}"
+            );
+        }
+    }
+
+    /// v1.44 ack 帧字节级（契约 §2.2 的两条示例逐字）：`received` 恰 6 键、
+    /// **不带** `reason` / `message`；`rejected` 恰 8 键，键序固定
+    /// `v,type,machine,clientId,convId,status,reason,message`。rejected 示例的
+    /// reason / message 取自 core 的 `MessageRejectReason`（单一事实源）——
+    /// 本用例同时钉住 core 字面量与 web 契约示例跨 crate 逐字一致。
+    #[test]
+    fn ack_frame_byte_level() {
+        use imagent_core::MessageRejectReason;
+        let received =
+            encode_ack_frame("home-mac", "m_1a2b3c4d", "web:s-1", AckStatus::Received).unwrap();
+        assert_eq!(
+            received,
+            r#"{"v":1,"type":"ack","machine":"home-mac","clientId":"m_1a2b3c4d","convId":"web:s-1","status":"received"}"#
+        );
+        let v: serde_json::Value = serde_json::from_str(&received).unwrap();
+        assert_eq!(v.as_object().map(|m| m.len()), Some(6), "received 恰 6 键");
+        assert!(
+            v.get("reason").is_none() && v.get("message").is_none(),
+            "received 不带 reason / message 键：{received}"
+        );
+
+        let rejected = encode_ack_frame(
+            "home-mac",
+            "m_1a2b3c4d",
+            "web:s-1",
+            AckStatus::Rejected {
+                reason: MessageRejectReason::NotAllowed.code(),
+                message: MessageRejectReason::NotAllowed.text(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            rejected,
+            r#"{"v":1,"type":"ack","machine":"home-mac","clientId":"m_1a2b3c4d","convId":"web:s-1","status":"rejected","reason":"not_allowed","message":"发送者未获授权，消息未被处理"}"#
+        );
+        let v: serde_json::Value = serde_json::from_str(&rejected).unwrap();
+        assert_eq!(v.as_object().map(|m| m.len()), Some(8), "rejected 恰 8 键");
+
+        // client 层自产的 malformed（字面量在本 crate）。
+        let malformed = encode_ack_frame(
+            "home-mac",
+            "m_bad0001",
+            "web:s-1",
+            AckStatus::Rejected {
+                reason: ACK_MALFORMED_REASON,
+                message: ACK_MALFORMED_MESSAGE,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            malformed,
+            r#"{"v":1,"type":"ack","machine":"home-mac","clientId":"m_bad0001","convId":"web:s-1","status":"rejected","reason":"malformed","message":"消息格式无效"}"#
+        );
+    }
+
+    /// v1.44 gateway_info 帧字节级（契约 §2.2 示例逐字；version 取本 crate
+    /// 版本 = 网关版本）：恰 5 键，`caps` 为数组 `["acks"]`。
+    #[test]
+    fn gateway_info_frame_byte_level() {
+        let json = encode_gateway_info_frame("home-mac").unwrap();
+        assert_eq!(
+            json,
+            format!(
+                r#"{{"v":1,"type":"gateway_info","machine":"home-mac","version":"{}","caps":["acks"]}}"#,
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v.as_object().map(|m| m.len()), Some(5), "恰 5 键");
+        assert_eq!(v["caps"], serde_json::json!(["acks"]), "caps 含 acks");
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        // machine 原样（任何网关都回）。
+        assert!(encode_gateway_info_frame("office-mac")
+            .unwrap()
+            .starts_with(r#"{"v":1,"type":"gateway_info","machine":"office-mac","version":"#));
     }
 
     #[test]

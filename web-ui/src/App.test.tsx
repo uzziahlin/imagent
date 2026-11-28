@@ -14,9 +14,9 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex, hexToBytes, randomBytes, utf8ToBytes } from "@noble/hashes/utils.js";
 import App from "./App";
 import { __resetAdminToken } from "./lib/admin";
-import { historyStore } from "./lib/historyStore";
+import { historyStore, memoryHistoryBackend, setHistoryBackend } from "./lib/historyStore";
 import { fingerprint, openBox, sealFrame } from "./lib/e2e";
-import type { WindowInfo } from "./lib/protocol";
+import { ACK_TIMEOUT_MS, ACK_TIMEOUT_TICK_MS, type InboundFrame, type WindowInfo } from "./lib/protocol";
 import { WsManager, type WsEvent } from "./lib/ws";
 
 /** 可控 fake WebSocket：手动 emit 事件、记录出站帧（形状对齐 ws.test.ts）。 */
@@ -90,6 +90,16 @@ function handshake(fake: FakeWebSocket, machines: string[]): void {
     fake.recv({ v: 1, type: "hello_ack", role: "user" });
     fake.recv({ v: 1, type: "machine", online: false });
     fake.recv({ v: 1, type: "machines", online: machines });
+  });
+}
+
+/** 明文 message 帧断言（v1.44 起每帧带本机新生成的 clientId，逐帧不同）：出站
+ *  帧里有一帧去掉 clientId 后与 expected 逐字节相等，且 clientId 是非空字符串
+ *  （clientId 的形状由 v1.44 用例单独钉）。 */
+function sentMessage(fake: FakeWebSocket, expected: Record<string, unknown>): boolean {
+  return fake.sent.some((raw) => {
+    const { clientId, ...rest } = JSON.parse(raw) as Record<string, unknown>;
+    return typeof clientId === "string" && clientId !== "" && JSON.stringify(rest) === JSON.stringify(expected);
   });
 }
 
@@ -469,15 +479,15 @@ describe("未读徽标与空态示例（交互细节）", () => {
     handshake(fake, ["home-mac"]);
     const sample = screen.getByRole("button", { name: "看看这个项目结构" });
     fireEvent.click(sample);
-    expect(fake.sent).toContain(
-      JSON.stringify({
+    expect(
+      sentMessage(fake, {
         v: 1,
         type: "message",
         convId: "web:default",
         text: "看看这个项目结构",
         machine: "home-mac",
       }),
-    );
+    ).toBe(true);
     // 本地用户回显出现：气泡 + 侧栏预览各一处；default 会话首条消息还会作为
     // 自动命名 title 出现在侧栏标题/状态条（v1.7.x 起 default 也自动命名）。
     expect(screen.getAllByText("看看这个项目结构").length).toBeGreaterThanOrEqual(2);
@@ -815,9 +825,11 @@ describe("App E2E（v1.4）", () => {
     expect(encRaw).toBeTruthy();
     const enc = JSON.parse(encRaw!) as { machine: string; box: string };
     expect(enc.machine).toBe("home-mac");
-    expect(openBox(gw.gatewayKey(redone, reack.n2), enc.box)).toBe(
-      JSON.stringify({ v: 1, type: "message", convId: "web:default", text: "机密指令", machine: "home-mac" }),
-    );
+    // v1.44：内帧带本机生成的 clientId（送达回执的关联 id，形状同 newClientId）
+    const inner = JSON.parse(openBox(gw.gatewayKey(redone, reack.n2), enc.box) ?? "null") as Record<string, unknown>;
+    expect(inner).toMatchObject({ v: 1, type: "message", convId: "web:default", text: "机密指令", machine: "home-mac" });
+    expect(inner.clientId).toMatch(/^m_[0-9a-z]+_[0-9a-f]{8}$/);
+    // 弹层期间的旧密钥解不开
     expect(openBox(gw.gatewayKey(hello, ack.n2), enc.box)).toBeNull();
   });
 
@@ -843,9 +855,7 @@ describe("App E2E（v1.4）", () => {
     expect(restored.disabled).toBe(false);
     fireEvent.change(restored, { target: { value: "明文" } });
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
-    expect(fake.sent).toContain(
-      JSON.stringify({ v: 1, type: "message", convId: "web:default", text: "明文", machine: "home-mac" }),
-    );
+    expect(sentMessage(fake, { v: 1, type: "message", convId: "web:default", text: "明文", machine: "home-mac" })).toBe(true);
     // 选择被持久（下次连接不再握手）——检查 localStorage 记录
     expect(JSON.parse(localStorage.getItem("imagent.e2ePlaintext") ?? "{}")).toEqual({ "home-mac": true });
   });
@@ -1542,7 +1552,7 @@ describe("App 工作空间（v1.6）", () => {
     fireEvent.click(within(within(dialog).getByLabelText("工作空间")).getByRole("button", { name: "code" }));
     fireEvent.click(within(dialog).getByRole("button", { name: "创建（/switch）" }));
     // /switch 走默认会话（convId 缺省）+ 创建后绑定目录（convId 完整形态）
-    expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "message", text: "/switch proj", machine: "home-mac" }));
+    expect(sentMessage(fake, { v: 1, type: "message", text: "/switch proj", machine: "home-mac" })).toBe(true);
     expect(fake.sent).toContain(
       JSON.stringify({
         v: 1,
@@ -1567,7 +1577,7 @@ describe("App 工作空间（v1.6）", () => {
     fireEvent.change(within(dialog).getByLabelText("新会话名称"), { target: { value: "plain" } });
     fireEvent.click(within(dialog).getByRole("button", { name: "默认" }));
     fireEvent.click(within(dialog).getByRole("button", { name: "创建（/switch）" }));
-    expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "message", text: "/switch plain", machine: "home-mac" }));
+    expect(sentMessage(fake, { v: 1, type: "message", text: "/switch plain", machine: "home-mac" })).toBe(true);
     expect(fake.sent.filter((s) => (JSON.parse(s) as { type: string }).type === "conv_workdir_set")).toHaveLength(1);
   });
 
@@ -1582,7 +1592,7 @@ describe("App 工作空间（v1.6）", () => {
     expect(within(dialog).queryByLabelText("工作空间")).toBeNull();
     fireEvent.change(within(dialog).getByLabelText("新会话名称"), { target: { value: "legacy" } });
     fireEvent.click(within(dialog).getByRole("button", { name: "创建（/switch）" }));
-    expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "message", text: "/switch legacy" }));
+    expect(sentMessage(fake, { v: 1, type: "message", text: "/switch legacy" })).toBe(true);
   });
 
   // v1.36 引擎选择 chips：快照可选 backends 段（网关默认引擎 + 全注册表引擎名）
@@ -1619,16 +1629,16 @@ describe("App 工作空间（v1.6）", () => {
     fireEvent.change(within(dialog).getByLabelText("新会话名称"), { target: { value: "proj" } });
     fireEvent.click(within(dialog).getByRole("button", { name: "创建（/switch）" }));
     // /switch 走默认会话（无 convId）；/backend 显式发给新 convId
-    expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "message", text: "/switch proj", machine: "home-mac" }));
-    expect(fake.sent).toContain(
-      JSON.stringify({
+    expect(sentMessage(fake, { v: 1, type: "message", text: "/switch proj", machine: "home-mac" })).toBe(true);
+    expect(
+      sentMessage(fake, {
         v: 1,
         type: "message",
         convId: "web:proj",
         text: "/backend codex-app",
         machine: "home-mac",
       }),
-    );
+    ).toBe(true);
     // 本地回显与新会话首屏同落（当前会话已切 web:proj，user 气泡渲染命令文本）
     expect(screen.queryByRole("dialog", { name: "新会话" })).toBeNull();
     expect(screen.getAllByText("/backend codex-app").length).toBeGreaterThanOrEqual(1);
@@ -1650,7 +1660,7 @@ describe("App 工作空间（v1.6）", () => {
     // 默认态创建：不发任何 /backend 帧
     fireEvent.change(within(dialog).getByLabelText("新会话名称"), { target: { value: "plain" } });
     fireEvent.click(within(dialog).getByRole("button", { name: "创建（/switch）" }));
-    expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "message", text: "/switch plain", machine: "home-mac" }));
+    expect(sentMessage(fake, { v: 1, type: "message", text: "/switch plain", machine: "home-mac" })).toBe(true);
     expect(fake.sent.filter((s) => (JSON.parse(s) as { text?: string }).text?.startsWith("/backend"))).toHaveLength(0);
   });
 
@@ -1710,9 +1720,9 @@ describe("App 会话自动命名", () => {
     fireEvent.change(screen.getByLabelText("消息输入框"), { target: { value: "帮我写个部署脚本" } });
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
     // 发到自动会话（完整 conv 形态）
-    expect(fake.sent).toContain(
-      JSON.stringify({ v: 1, type: "message", convId: `web:${shortId}`, text: "帮我写个部署脚本" }),
-    );
+    expect(
+      sentMessage(fake, { v: 1, type: "message", convId: `web:${shortId}`, text: "帮我写个部署脚本" }),
+    ).toBe(true);
     // 消息气泡 + 侧栏标题 + 侧栏预览 + 状态条徽标均显示首条消息文本（title 派生）
     expect(screen.getAllByText("帮我写个部署脚本").length).toBeGreaterThanOrEqual(3);
     // 短 ID 从显示位消失（显示名已换 title；convId 仅存于协议层）
@@ -2835,9 +2845,9 @@ describe("peer 会话用户自发文本（v1.41.8）", () => {
     fireEvent.click(screen.getByRole("button", { name: /^win-a/ }));
 
     send("帮我跑下构建");
-    expect(fake.sent).toContain(
-      JSON.stringify({ v: 1, type: "message", convId: "peer:win-a", text: "帮我跑下构建", machine: M }),
-    );
+    expect(
+      sentMessage(fake, { v: 1, type: "message", convId: "peer:win-a", text: "帮我跑下构建", machine: M }),
+    ).toBe(true);
     expect(bubbleKinds("帮我跑下构建")).toEqual(["user"]); // 本机回显
     expect(bubbleKinds("已建立与窗口「win-a」的会话。")).toEqual(["agent"]);
 
@@ -2856,9 +2866,7 @@ describe("peer 会话用户自发文本（v1.41.8）", () => {
     handshake(fake, [M]);
     const cmd = "/to win-a 你目前的待办项有哪些？";
     send(cmd);
-    expect(fake.sent).toContain(
-      JSON.stringify({ v: 1, type: "message", convId: "web:default", text: cmd, machine: M }),
-    );
+    expect(sentMessage(fake, { v: 1, type: "message", convId: "web:default", text: cmd, machine: M })).toBe(true);
 
     // 网关：派活正文镜像进 peer:win-a（self）+ 当前会话回执（普通 text）。
     gwText(fake, "peer:win-a", "你目前的待办项有哪些？", { self: true });
@@ -3585,9 +3593,9 @@ describe("v1.42 输入草稿按「机器 + 会话」保存", () => {
     // 恢复出来的草稿可以正常继续编辑并发送
     type("刷新前没发完的，补一句");
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
-    expect(fake.sent).toContain(
-      JSON.stringify({ v: 1, type: "message", convId: "web:work", text: "刷新前没发完的，补一句", machine: M }),
-    );
+    expect(
+      sentMessage(fake, { v: 1, type: "message", convId: "web:work", text: "刷新前没发完的，补一句", machine: M }),
+    ).toBe(true);
     expect(box().value).toBe("");
   });
 
@@ -4121,9 +4129,9 @@ describe("v1.43 本地窗口看板", () => {
     // 在该会话发消息 → message 帧 convId 是 peer:<窗口名>
     fireEvent.change(screen.getByLabelText("消息输入框"), { target: { value: "帮我跑下构建" } });
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
-    expect(fake.sent).toContain(
-      JSON.stringify({ v: 1, type: "message", convId: "peer:jormungandr-f8", text: "帮我跑下构建", machine: M }),
-    );
+    expect(
+      sentMessage(fake, { v: 1, type: "message", convId: "peer:jormungandr-f8", text: "帮我跑下构建", machine: M }),
+    ).toBe(true);
   });
 
   it("⑥ 旧网关（收不到任何 windows 帧）→ 侧栏没有「本地窗口」区块、状态条没有待确认提示，其余功能不变", () => {
@@ -4136,9 +4144,9 @@ describe("v1.43 本地窗口看板", () => {
     expect(screen.getByRole("navigation", { name: "会话列表" })).toBeTruthy();
     expect(screen.getByRole("listbox", { name: "机器列表" })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "看看这个项目结构" }));
-    expect(fake.sent).toContain(
-      JSON.stringify({ v: 1, type: "message", convId: "web:default", text: "看看这个项目结构", machine: M }),
-    );
+    expect(
+      sentMessage(fake, { v: 1, type: "message", convId: "web:default", text: "看看这个项目结构", machine: M }),
+    ).toBe(true);
     expect(sections()).toHaveLength(0);
   });
 
@@ -4328,5 +4336,536 @@ describe("v1.43 本地窗口看板", () => {
     // 密文快照（网关经 send_business 加密下发）照常渲染
     act(() => fake.recv(sealFrame(M, key, WINDOWS([IDLE]))));
     expect(within(section()).getByRole("button", { name: "窗口 jormungandr-f8：空闲" })).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.44 送达回执 + 网关版本（App 层）：ready 后对全部在线机器各查一次网关能力
+// （E1）+ 该机器加密会话建立后再查一次（E2，先作废上一代会话问到的能力）；
+// gateway_info 决定该机器的本机回显带不带送达状态；ack 帧改写回显状态；超时
+// 判定每 2 秒巡检；重发。回执路径按真实形态走密文（测试网关的会话密钥封 / 解）。
+// ---------------------------------------------------------------------------
+
+describe("v1.44 送达回执 + 网关版本", () => {
+  const M = "home-mac";
+  const DAY = 86_400_000;
+  type Frame = Record<string, unknown>;
+  /** 契约 §2 示例形态的 gateway_info 帧（默认：支持回执）。 */
+  const INFO = (machine = M, version = "1.44.0", caps: string[] = ["acks"]): Frame => ({
+    v: 1,
+    type: "gateway_info",
+    machine,
+    version,
+    caps,
+  });
+  const ACK_RECV = (clientId: string, convId = "web:default"): Frame => ({
+    v: 1,
+    type: "ack",
+    machine: M,
+    clientId,
+    convId,
+    status: "received",
+  });
+  const ACK_REJECT = (clientId: string, convId = "web:default"): Frame => ({
+    v: 1,
+    type: "ack",
+    machine: M,
+    clientId,
+    convId,
+    status: "rejected",
+    reason: "not_allowed",
+    message: "发送者未获授权，消息未被处理",
+  });
+  /** 出站帧解析：明文帧原样；enc 帧用网关侧密钥解出内帧（解不开 / 没给密钥 → null）。 */
+  const outbound = (fake: FakeWebSocket, key?: Uint8Array): (Frame | null)[] =>
+    fake.sent.map((raw) => {
+      const f = JSON.parse(raw) as Frame;
+      if (f.type !== "enc") {
+        return f;
+      }
+      const plain = key ? openBox(key, f.box as string) : null;
+      return plain === null ? null : (JSON.parse(plain) as Frame);
+    });
+  /** 出站 gateway_info_query 的目标机器序列（明文 + 密文内帧）。 */
+  const infoQueries = (fake: FakeWebSocket, key?: Uint8Array): string[] =>
+    outbound(fake, key)
+      .filter((f): f is Frame => f !== null && f.type === "gateway_info_query")
+      .map((f) => (f.machine as string | undefined) ?? "");
+  type SentMessage = { frame: Frame; clientId: string };
+  /** 出站 message 帧（明文 + 密文内帧）：去掉 clientId 的帧体 + clientId。 */
+  const messages = (fake: FakeWebSocket, key?: Uint8Array): SentMessage[] =>
+    outbound(fake, key).flatMap((f) => {
+      if (f === null || f.type !== "message") {
+        return [];
+      }
+      const { clientId, ...rest } = f;
+      return [{ frame: rest, clientId: clientId as string }];
+    });
+  const box = (): HTMLTextAreaElement => screen.getByLabelText("消息输入框") as HTMLTextAreaElement;
+  /** 输入框打字 + 点「发送」（命令文本会唤起命令面板，Enter 被面板接管，故点按钮）。 */
+  const send = (text: string): void => {
+    fireEvent.change(box(), { target: { value: text } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+  };
+  /** 当前会话消息区里，正文为 text 的全部用户气泡外层节点（按出现顺序）。 */
+  const userWraps = (text: string): HTMLElement[] =>
+    within(screen.getByRole("main"))
+      .getAllByText(text)
+      .map((el) => el.closest(".bg-emerald-600")!.parentElement as HTMLElement);
+  const userWrap = (text: string): HTMLElement => userWraps(text)[0];
+  /** 某条用户气泡的各级子节点类名（时间戳 / 气泡 / 状态行）。 */
+  const childClasses = (wrap: HTMLElement): string[] => Array.from(wrap.children).map((c) => c.className);
+  /** 「重发」按钮（全局恰一个时可这样取）。 */
+  const resendButton = (): HTMLElement => screen.getByRole("button", { name: "重发这条消息" });
+
+  /** 测试网关（与其它 describe 内同名助手同构——该助手为 describe 局部，此处复制
+   *  一份；长期 X25519 + ed25519 身份密钥）。 */
+  function makeGateway() {
+    const gkPriv = x25519.utils.randomSecretKey();
+    const gk = bytesToHex(x25519.getPublicKey(gkPriv));
+    const idPriv = ed25519.utils.randomSecretKey();
+    const ik = bytesToHex(ed25519.getPublicKey(idPriv));
+    const ackFor = (hello: { ek: string; n1: string }, machine: string) => {
+      const n2 = bytesToHex(randomBytes(32));
+      const msg = new Uint8Array(128);
+      msg.set(hexToBytes(hello.ek), 0);
+      msg.set(hexToBytes(gk), 32);
+      msg.set(hexToBytes(hello.n1), 64);
+      msg.set(hexToBytes(n2), 96);
+      return {
+        v: 1 as const,
+        type: "e2e_ack" as const,
+        machine,
+        gk,
+        n2,
+        sig: bytesToHex(ed25519.sign(msg, idPriv)),
+        ik,
+      };
+    };
+    const gatewayKey = (hello: { ek: string; n1: string }, n2: string) => {
+      const shared = x25519.getSharedSecret(gkPriv, hexToBytes(hello.ek));
+      const ikm = new Uint8Array(96);
+      ikm.set(shared, 0);
+      ikm.set(hexToBytes(hello.n1), 32);
+      ikm.set(hexToBytes(n2), 64);
+      return hkdf(sha256, ikm, undefined, utf8ToBytes("imagent-e2e-v1"), 32);
+    };
+    return { gk, ik, ackFor, gatewayKey };
+  }
+
+  /** 从 fake.sent 里取最近一条 e2e_hello（无则抛）。 */
+  function lastHelloFor(fake: FakeWebSocket): { ek: string; n1: string } {
+    const raw = fake.sent.filter((s) => (JSON.parse(s) as { type: string }).type === "e2e_hello").at(-1);
+    if (!raw) {
+      throw new Error("尚未发出 e2e_hello");
+    }
+    return JSON.parse(raw);
+  }
+
+  /** 挂载并把机器 M 的加密会话带到 active（预置 pin → 握手直接 active，无 TOFU）。
+   *  返回活跃 socket、测试网关与网关侧会话密钥（出站 enc 用它解、入站业务帧用它封）。
+   *  假时钟须在调用前装好（退避等定时器在挂载时创建）。 */
+  function mountEncrypted(): { fake: FakeWebSocket; gw: ReturnType<typeof makeGateway>; key: Uint8Array } {
+    const gw = makeGateway();
+    localStorage.setItem("imagent.e2ePins", JSON.stringify({ [M]: { ik: gw.ik, gk: gw.gk, pinnedAt: 1 } }));
+    const fake = mountApp();
+    act(() => {
+      fake.emit("open");
+      fake.recv({ v: 1, type: "hello_ack", role: "user" });
+      fake.recv({ v: 1, type: "machine", online: false });
+      fake.recv({ v: 1, type: "machines", online: [M] });
+    });
+    const hello = lastHelloFor(fake);
+    const ack = gw.ackFor(hello, M);
+    act(() => {
+      fake.recv(ack);
+    });
+    expect(screen.getByText("已加密")).toBeTruthy();
+    return { fake, gw, key: gw.gatewayKey(hello, ack.n2) };
+  }
+
+  /** 网关经 send_business 加密下发一帧业务帧。 */
+  const gwSend = (fake: FakeWebSocket, key: Uint8Array, frame: Frame): void => {
+    act(() => {
+      fake.recv(sealFrame(M, key, frame as unknown as InboundFrame));
+    });
+  };
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it("① ready + 收到 machines 帧 → 对**全部**在线机器各发一条 gateway_info_query（帧形状即契约原文）；切机 / machines 重排不重发；单机模式不发", () => {
+    const fake = mountApp();
+    act(() => {
+      fake.emit("open");
+      fake.recv({ v: 1, type: "hello_ack", role: "user" });
+    });
+    // hello_ack 后尚未收到 machines 帧：不发（单机模式旧网关不认识该帧）
+    expect(infoQueries(fake)).toEqual([]);
+    act(() => {
+      fake.recv({ v: 1, type: "machine", online: false });
+      fake.recv({ v: 1, type: "machines", online: [M, "work-mac", "office-mac"] });
+    });
+    // 当前机器是 home-mac（自动选中首台）；三台各一条
+    expect(infoQueries(fake)).toEqual([M, "work-mac", "office-mac"]);
+    expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "gateway_info_query", machine: "work-mac" }));
+    fireEvent.click(screen.getByRole("button", { name: /work-mac/ }));
+    act(() => {
+      fake.recv({ v: 1, type: "machines", online: ["work-mac", M] });
+    });
+    expect(infoQueries(fake)).toEqual([M, "work-mac", "office-mac"]);
+    cleanup();
+    const single = mountApp();
+    act(() => {
+      single.emit("open");
+      single.recv({ v: 1, type: "hello_ack", role: "user" });
+      single.recv({ v: 1, type: "machine", online: true });
+    });
+    expect(screen.getByText("已连接")).toBeTruthy();
+    expect(infoQueries(single)).toEqual([]);
+  });
+
+  it("①b 该机器加密会话建立（E2E active）后再查一次，走密文；同时作废上一代会话里问到的能力——新应答回来之前发出的消息不跟踪送达，应答到达后恢复", () => {
+    const gw = makeGateway();
+    const fake = mountApp();
+    act(() => {
+      fake.emit("open");
+      fake.recv({ v: 1, type: "hello_ack", role: "user" });
+      fake.recv({ v: 1, type: "machines", online: [M] });
+    });
+    // E1：ready + machines 后已发一条明文查询（握手窗口）
+    expect(infoQueries(fake)).toEqual([M]);
+    // 握手窗口里网关的应答到达（此时机器尚未加密，明文放行）：能力已记录
+    act(() => {
+      fake.recv(INFO());
+    });
+    send("握手窗口里的消息");
+    expect(screen.getByText("发送中")).toBeTruthy();
+    // 网关 ack → confirming（TOFU 弹层）：fail-closed 期间不发第二条（明文 / 密文都没有）
+    const firstHello = lastHelloFor(fake);
+    const firstAck = gw.ackFor(firstHello, M);
+    act(() => {
+      fake.recv(firstAck);
+    });
+    expect(screen.getByRole("dialog", { name: "确认机器加密指纹" })).toBeTruthy();
+    expect(infoQueries(fake)).toEqual([M]);
+    expect(fake.sent.filter((s) => (JSON.parse(s) as { type: string }).type === "enc")).toHaveLength(0);
+    // 信任 → 以 pin 身份重新握手 → 新 ack → active
+    fireEvent.click(screen.getByRole("button", { name: "信任并启用加密" }));
+    const redone = lastHelloFor(fake);
+    const secondAck = gw.ackFor(redone, M);
+    act(() => {
+      fake.recv(secondAck);
+    });
+    const key = gw.gatewayKey(redone, secondAck.n2);
+    // E2：active 后的第二次查询走密文——明文仍只有 E1 那一条；密文里恰一条、机器对
+    expect(infoQueries(fake, key)).toEqual([M, M]);
+    expect(infoQueries(fake)).toEqual([M]);
+    // 加密会话换代：上一代会话里问到的能力作废——握手窗口那条「发送中」收敛为
+    // 「未确认送达」，此刻发出的新消息不带送达状态（能力暂时未知，按旧网关处理）
+    expect(screen.queryByText("发送中")).toBeNull();
+    expect(screen.getByText("未确认送达")).toBeTruthy();
+    send("能力待定窗口里的消息");
+    expect(screen.queryByText("发送中")).toBeNull();
+    expect(screen.getAllByText("未确认送达")).toHaveLength(1);
+    // 新网关的密文应答到达 → 能力确认 → 之后的消息恢复跟踪（先前那条不回头补）
+    gwSend(fake, key, INFO());
+    send("能力确认后的消息");
+    expect(screen.getByText("发送中")).toBeTruthy();
+    expect(userWraps("能力待定窗口里的消息")[0].children).toHaveLength(2);
+  });
+
+  it("② 发送 → 回显带 clientId 与 pending（「发送中」）→ 收 ack{received} → sent：状态行消失，气泡各级类名与不支持回执时逐项一致；message 帧的 clientId 即回执关联的 id", () => {
+    const { fake, key } = mountEncrypted();
+    // 对照：能力未知时发出的回显（旧网关的形态）——时间戳 + 气泡，没有状态行
+    send("能力到来之前");
+    const plain = userWrap("能力到来之前");
+    expect(plain.children).toHaveLength(2);
+    expect(screen.queryByText("发送中")).toBeNull();
+    gwSend(fake, key, INFO());
+    send("帮我跑下构建");
+    const frames = messages(fake, key);
+    expect(frames.at(-1)!.frame).toEqual({
+      v: 1,
+      type: "message",
+      convId: "web:default",
+      text: "帮我跑下构建",
+      machine: M,
+    });
+    expect(frames.at(-1)!.clientId).toMatch(/^m_[0-9a-z]+_[0-9a-f]{8}$/);
+    expect(frames[0].clientId).not.toBe(frames.at(-1)!.clientId); // 每次发送都是新的
+    const pending = userWrap("帮我跑下构建");
+    expect(childClasses(pending)).toHaveLength(3); // 时间戳 + 气泡 + 「发送中」
+    expect(pending.querySelector(".bg-emerald-600")!.className).toContain("opacity-70");
+    expect(within(pending).getByText("发送中")).toBeTruthy();
+    // 别的设备发的消息的回执（本机没有对应条目）：忽略，不影响这条
+    gwSend(fake, key, ACK_RECV("m_other0_00000000"));
+    expect(screen.getByText("发送中")).toBeTruthy();
+    // 网关回执（密文）：按 clientId 关联 → sent
+    gwSend(fake, key, ACK_RECV(frames.at(-1)!.clientId));
+    const sent = userWrap("帮我跑下构建");
+    expect(childClasses(sent)).toEqual(childClasses(plain));
+    expect(sent.querySelector(".bg-emerald-600")!.className).not.toContain("opacity-70");
+    expect(sent.textContent!.endsWith("帮我跑下构建")).toBe(true); // 气泡之后没有任何状态文字
+    expect(screen.queryByText("发送中")).toBeNull();
+    expect(screen.queryByRole("button", { name: "重发这条消息" })).toBeNull();
+  });
+
+  it("③ 收 ack{rejected} → 气泡下出现原因与「重发」；点重发 → 发出新帧（新 clientId、同一段文字）且原条目不变；输入框不被填回", () => {
+    const { fake, key } = mountEncrypted();
+    gwSend(fake, key, INFO());
+    send("rm -rf /tmp/x");
+    const id1 = messages(fake, key).at(-1)!.clientId;
+    expect(screen.queryByText(/未送达/)).toBeNull();
+    gwSend(fake, key, ACK_REJECT(id1));
+    const wrap = userWrap("rm -rf /tmp/x");
+    expect(within(wrap).getByText("未送达：发送者未获授权，消息未被处理")).toBeTruthy();
+    expect(resendButton().textContent).toBe("重发");
+    expect(wrap.querySelector(".bg-emerald-600")!.className).not.toContain("opacity-70");
+    const originalHtml = wrap.innerHTML;
+    const sentBefore = messages(fake, key).length;
+    fireEvent.click(resendButton());
+    // 新帧：同一段文字、新的 clientId；原条目原样，另起一条 pending 的回显
+    const frames = messages(fake, key);
+    expect(frames).toHaveLength(sentBefore + 1);
+    expect(frames.at(-1)!.frame).toEqual({ v: 1, type: "message", convId: "web:default", text: "rm -rf /tmp/x", machine: M });
+    expect(frames.at(-1)!.clientId).not.toBe(id1);
+    expect(frames.at(-1)!.clientId).toMatch(/^m_[0-9a-z]+_[0-9a-f]{8}$/);
+    const wraps = userWraps("rm -rf /tmp/x");
+    expect(wraps).toHaveLength(2);
+    expect(wraps[0].innerHTML).toBe(originalHtml);
+    expect(childClasses(wraps[1])).toHaveLength(3);
+    expect(within(wraps[1]).getByText("发送中")).toBeTruthy();
+    expect(box().value).toBe("");
+  });
+
+  it("④ 机器不支持回执（没有 gateway_info）→ 15 秒后仍不出现「未确认送达」；支持回执 → 推进 15 秒出现（差一点不出现）", () => {
+    vi.useFakeTimers();
+    const { fake, key } = mountEncrypted();
+    // 旧网关：对 gateway_info_query 不回任何帧
+    send("旧网关上的消息");
+    expect(screen.queryByText("发送中")).toBeNull();
+    act(() => vi.advanceTimersByTime(ACK_TIMEOUT_MS + ACK_TIMEOUT_TICK_MS));
+    expect(screen.queryByText("未确认送达")).toBeNull();
+    expect(screen.queryByRole("button", { name: "重发这条消息" })).toBeNull();
+    // 新网关的应答到达 → 支持回执
+    gwSend(fake, key, INFO());
+    send("新网关上的消息");
+    expect(screen.getByText("发送中")).toBeTruthy();
+    act(() => vi.advanceTimersByTime(ACK_TIMEOUT_MS - 1));
+    expect(screen.queryByText("未确认送达")).toBeNull();
+    act(() => vi.advanceTimersByTime(ACK_TIMEOUT_TICK_MS));
+    expect(screen.getByText("未确认送达")).toBeTruthy();
+    expect(screen.queryByText("发送中")).toBeNull();
+    expect(within(userWrap("新网关上的消息")).getByRole("button", { name: "重发这条消息" })).toBeTruthy();
+  });
+
+  it("⑤ ws 掉线（非 ready）：发出满 2 秒的 pending 回显 → 未确认送达（不必等 15 秒）；未满 2 秒不动", () => {
+    vi.useFakeTimers();
+    const { fake, key } = mountEncrypted();
+    gwSend(fake, key, INFO());
+    send("断线前发出的");
+    expect(screen.getByText("发送中")).toBeTruthy();
+    act(() => {
+      fake.emit("close", { code: 1006 });
+    });
+    expect(screen.getByText("重连中")).toBeTruthy();
+    act(() => vi.advanceTimersByTime(1000)); // 退避到点：新连接已建但尚未就绪
+    expect(screen.getByText("发送中")).toBeTruthy(); // 发出刚满 1 秒：还不算
+    act(() => vi.advanceTimersByTime(1100));
+    expect(screen.getByText("未确认送达")).toBeTruthy();
+    expect(screen.queryByText("发送中")).toBeNull();
+  });
+
+  it("⑥ 迟到的 ack{received} 把「未确认送达」翻回已送达：状态行与「重发」按钮消失", () => {
+    vi.useFakeTimers();
+    const { fake, key } = mountEncrypted();
+    gwSend(fake, key, INFO());
+    send("迟到回执的那条");
+    const id = messages(fake, key).at(-1)!.clientId;
+    act(() => vi.advanceTimersByTime(ACK_TIMEOUT_MS + ACK_TIMEOUT_TICK_MS));
+    expect(screen.getByText("未确认送达")).toBeTruthy();
+    gwSend(fake, key, ACK_RECV(id));
+    expect(screen.queryByText("未确认送达")).toBeNull();
+    expect(screen.queryByRole("button", { name: "重发这条消息" })).toBeNull();
+    expect(screen.queryByText("发送中")).toBeNull();
+    expect(userWrap("迟到回执的那条").children).toHaveLength(2);
+  });
+
+  it("⑦ ws 未 ready 时点重发：不出帧，文字回到输入框（接在已有草稿之后）+ toast「连接未就绪，已放回输入框」；原条目不变", () => {
+    vi.useFakeTimers();
+    const { fake, key } = mountEncrypted();
+    gwSend(fake, key, INFO());
+    send("要重发的消息");
+    gwSend(fake, key, ACK_REJECT(messages(fake, key).at(-1)!.clientId));
+    expect(screen.getByText("未送达：发送者未获授权，消息未被处理")).toBeTruthy();
+    fireEvent.change(box(), { target: { value: "正在写的" } });
+    act(() => {
+      fake.emit("close", { code: 1006 });
+    });
+    expect(screen.getByText("重连中")).toBeTruthy();
+    const sentBefore = fake.sent.length;
+    fireEvent.click(resendButton());
+    expect(fake.sent).toHaveLength(sentBefore);
+    expect(box().value).toBe("正在写的\n要重发的消息");
+    expect(screen.getByText("连接未就绪，已放回输入框")).toBeTruthy();
+    expect(screen.getByText("未送达：发送者未获授权，消息未被处理")).toBeTruthy();
+    expect(messages(fake, key)).toHaveLength(1);
+  });
+
+  it("⑦b 连接态是 ready 但发送被拒（重新握手后网关 10 秒不应答 → 加密会话不可用、未放行明文）：点重发同样放回输入框 + toast，不出帧", () => {
+    vi.useFakeTimers();
+    const { fake, key } = mountEncrypted();
+    gwSend(fake, key, INFO());
+    send("握手超时前被拒的那条");
+    gwSend(fake, key, ACK_REJECT(messages(fake, key).at(-1)!.clientId));
+    expect(resendButton()).toBeTruthy();
+    // 掉线 → 退避 → 新连接就绪、机器快照到达 → 重新发起握手，但网关这次不应答
+    act(() => {
+      fake.emit("close", { code: 1006 });
+    });
+    act(() => vi.advanceTimersByTime(1000));
+    const next = FakeWebSocket.latest as FakeWebSocket;
+    act(() => {
+      next.emit("open");
+      next.recv({ v: 1, type: "hello_ack", role: "user" });
+      next.recv({ v: 1, type: "machine", online: false });
+      next.recv({ v: 1, type: "machines", online: [M] });
+    });
+    act(() => vi.advanceTimersByTime(10_000));
+    // 连接态 ready，但该机器发送被阻（横幅 + 输入框禁用）
+    expect(screen.getByText(/不支持加密连接/)).toBeTruthy();
+    expect((screen.getByRole("button", { name: "发送" }) as HTMLButtonElement).disabled).toBe(true);
+    const sentBefore = next.sent.length;
+    fireEvent.click(resendButton());
+    expect(next.sent).toHaveLength(sentBefore);
+    expect(box().value).toBe("握手超时前被拒的那条");
+    expect(screen.getByText("连接未就绪，已放回输入框")).toBeTruthy();
+    expect(screen.getByText("未送达：发送者未获授权，消息未被处理")).toBeTruthy();
+  });
+
+  it("⑧ 管理页：有 gateway_info 的机器行显示「网关 v1.44.0」，没有的不显示（旧网关 / 本次没在线过）；版本随网关应答更新", async () => {
+    // 机器列表只在本浏览器支持 WebAuthn 时渲染（同其它管理面板用例的最小桩）；
+    // re-auth 的 fetch 一律 404——机器列表由下面直接喂 machines_cfg 帧
+    vi.stubGlobal("PublicKeyCredential", class PublicKeyCredential {});
+    Object.defineProperty(navigator, "credentials", {
+      value: {
+        get: async () => {
+          throw new Error("本用例不触发 re-auth");
+        },
+        create: async () => {
+          throw new Error("本用例不触发 create");
+        },
+      },
+      configurable: true,
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status: 404 })));
+    localStorage.setItem(
+      "imagent.session",
+      JSON.stringify({ id: "sid-r", token: "st-r", expiresAt: Date.now() + 20 * DAY }),
+    );
+    const fake = mountApp();
+    handshake(fake, [M, "work-mac"]);
+    // 只有 home-mac 应答了能力查询
+    act(() => {
+      fake.recv(INFO());
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "管理" }));
+    });
+    const dialog = screen.getByRole("dialog", { name: "管理" });
+    expect(within(dialog).queryByText(/网关 v/)).toBeNull(); // 机器列表还没回来
+    act(() => {
+      fake.recv({
+        v: 1,
+        type: "machines_cfg",
+        machines: [
+          { name: M, pubkey_fp: "aaaa bbbb cccc dddd", created: Math.floor(Date.now() / 1000) - 30 },
+          { name: "work-mac", pubkey_fp: "aaaa bbbb cccc dddd", created: Math.floor(Date.now() / 1000) - 60 },
+          { name: "office-mac", pubkey_fp: "aaaa bbbb cccc dddd", created: Math.floor(Date.now() / 1000) - 90 },
+        ],
+      });
+    });
+    expect(within(dialog).getByText("网关 v1.44.0")).toBeTruthy();
+    const list = within(dialog).getByRole("list", { name: "机器配置列表" });
+    const rows = within(list).getAllByRole("listitem");
+    expect(rows.map((r) => r.textContent?.includes("网关 v") ?? false)).toEqual([true, false, false]);
+    expect(rows[0].textContent).toContain(M);
+    expect(rows[0].textContent).toContain("网关 v1.44.0");
+    // 网关升级后重新应答：版本跟随
+    act(() => {
+      fake.recv(INFO(M, "1.44.1"));
+    });
+    expect(within(dialog).getByText("网关 v1.44.1")).toBeTruthy();
+    expect(within(dialog).queryByText("网关 v1.44.0")).toBeNull();
+  });
+
+  it("⑨ 加密会话换代（重连后重新握手）时作废旧能力：网关此后不再应答（换成了旧二进制）→ 之前「发送中」的收敛为「未确认送达」，新消息不再跟踪", () => {
+    vi.useFakeTimers();
+    const { fake, gw, key } = mountEncrypted();
+    gwSend(fake, key, INFO());
+    send("换代前还在等回执");
+    expect(screen.getByText("发送中")).toBeTruthy();
+    // 掉线 → 退避 → 新连接 → 机器快照 → 重新握手（已 pin，网关应答即 active）
+    act(() => {
+      fake.emit("close", { code: 1006 });
+    });
+    act(() => vi.advanceTimersByTime(1000));
+    const next = FakeWebSocket.latest as FakeWebSocket;
+    expect(next).not.toBe(fake);
+    act(() => {
+      next.emit("open");
+      next.recv({ v: 1, type: "hello_ack", role: "user" });
+      next.recv({ v: 1, type: "machine", online: false });
+      next.recv({ v: 1, type: "machines", online: [M] });
+    });
+    const hello = lastHelloFor(next);
+    const ack = gw.ackFor(hello, M);
+    act(() => {
+      next.recv(ack);
+    });
+    const key2 = gw.gatewayKey(hello, ack.n2);
+    expect(screen.getByText("已加密")).toBeTruthy();
+    // 重查确实发出（握手窗口一条明文 + active 后一条密文）；旧网关不回 → 能力保持作废
+    expect(infoQueries(next, key2)).toEqual([M, M]);
+    // 此刻才过 1 秒出头（2 秒的断线规则还没到点）：收敛只能来自会话换代的作废
+    expect(screen.queryByText("发送中")).toBeNull();
+    expect(screen.getByText("未确认送达")).toBeTruthy();
+    send("换代后的新消息");
+    expect(screen.queryByText("发送中")).toBeNull();
+    act(() => vi.advanceTimersByTime(ACK_TIMEOUT_MS + ACK_TIMEOUT_TICK_MS));
+    expect(screen.getAllByText("未确认送达")).toHaveLength(1);
+    expect(messages(next, key2).map((m) => m.frame.text)).toEqual(["换代后的新消息"]);
+    // 新网关的应答到达 → 恢复跟踪
+    act(() => {
+      next.recv(sealFrame(M, key2, INFO() as unknown as InboundFrame));
+    });
+    send("能力重新确认后");
+    expect(screen.getByText("发送中")).toBeTruthy();
+  });
+
+  it("⑩ 刷新恢复：落盘时还在等回执的回显按「未确认送达」恢复（不再「发送中」），已拒绝的原样；迟到的回执照常把它翻回已送达", async () => {
+    setHistoryBackend(memoryHistoryBackend());
+    await historyStore.saveConv(M, "web:default", [
+      { kind: "user", key: "user:m_abc000_00000001", text: "刷新前没等到回执", at: Date.now() - 60_000, clientId: "m_abc000_00000001", ack: "pending" },
+      { kind: "user", key: "user:m_abc000_00000002", text: "刷新前已被拒绝", at: Date.now() - 50_000, clientId: "m_abc000_00000002", ack: "failed", ackReason: "排队消息过多，这条被丢弃" },
+    ]);
+    try {
+      const { fake, key } = mountEncrypted();
+      await act(async () => {}); // loadAll 的微任务
+      expect(screen.queryByText("发送中")).toBeNull();
+      expect(screen.getByText("未确认送达")).toBeTruthy();
+      expect(screen.getByText("未送达：排队消息过多，这条被丢弃")).toBeTruthy();
+      expect(screen.getAllByRole("button", { name: "重发这条消息" })).toHaveLength(2);
+      // 迟到的回执：恢复条目的键带 h: 前缀，照样按 clientId 关联
+      gwSend(fake, key, ACK_RECV("m_abc000_00000001"));
+      expect(screen.queryByText("未确认送达")).toBeNull();
+      expect(screen.getByText("未送达：排队消息过多，这条被丢弃")).toBeTruthy();
+      expect(screen.getAllByRole("button", { name: "重发这条消息" })).toHaveLength(1);
+    } finally {
+      setHistoryBackend(null);
+    }
   });
 });

@@ -152,6 +152,49 @@ pub struct InboundMessage {
     #[serde(default)]
     pub no_steer: bool,
     pub reply_hint: ReplyHint,
+    /// v1.44 驾驶舱送达回执的关联 id（浏览器 `message` 帧可选 `clientId`，
+    /// 形状合规才透传到这里；网关据此回 `ack` 帧，SPA 把回执对回自己发出的
+    /// 那条消息）。**其它平台恒 None**——`Platform::on_message_rejected` 只在
+    /// 本字段为 Some 时调用，IM 平台零感知。排在末尾：既有字段的序列化顺序
+    /// 不变。serde default：旧排队行（`queued_messages`）无此列，读回补 None。
+    #[serde(default)]
+    pub client_id: Option<String>,
+}
+
+/// 消息被 Dispatcher 明确拒绝的原因（v1.44 送达回执）。带 `client_id` 的
+/// 入站消息在明确的丢弃点被丢弃时，经
+/// [`Platform::on_message_rejected`](crate::Platform::on_message_rejected)
+/// 上报，驾驶舱据此把该条消息从「发送中」翻成「未送达 + 原因」。字面量的
+/// 单一事实源在此（[`Self::code`] 进 ack 帧 `reason` 键、[`Self::text`] 进
+/// `message` 键），网关 web 平台与 SPA 契约逐字对齐。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageRejectReason {
+    /// 白名单门：sender 与会话都未授权。
+    NotAllowed,
+    /// 单会话排队消息超过上限被丢弃。
+    QueueFull,
+    /// `peer:` 会话投递窗口失败。
+    PeerUnreachable,
+}
+
+impl MessageRejectReason {
+    /// ack 帧 `reason` 键的字面量（契约逐字）。
+    pub fn code(&self) -> &'static str {
+        match self {
+            MessageRejectReason::NotAllowed => "not_allowed",
+            MessageRejectReason::QueueFull => "queue_full",
+            MessageRejectReason::PeerUnreachable => "peer_unreachable",
+        }
+    }
+
+    /// ack 帧 `message` 键的中文人话（契约逐字）。
+    pub fn text(&self) -> &'static str {
+        match self {
+            MessageRejectReason::NotAllowed => "发送者未获授权，消息未被处理",
+            MessageRejectReason::QueueFull => "排队消息过多，这条被丢弃",
+            MessageRejectReason::PeerUnreachable => "窗口不在线或已退出，消息未送达",
+        }
+    }
 }
 
 /// bot 已加入的群（P7-A2：`/chat allow-all` 批量放行用）。
@@ -446,5 +489,79 @@ mod tests {
     fn usage_display_prefers_cost() {
         assert_eq!(u(3, 4, None, Some(0.0123)).display(), "$0.0123");
         assert_eq!(u(3, 4, None, None).display(), "in 3 / out 4 tokens");
+    }
+
+    /// v1.44：拒绝原因的 code / text 与 SPA 契约逐字一致（ack 帧的 `reason` /
+    /// `message` 键——三值互异，两端各取其一拼用例）。
+    #[test]
+    fn message_reject_reason_literals() {
+        use super::MessageRejectReason::{NotAllowed, PeerUnreachable, QueueFull};
+        let all = [
+            (NotAllowed, "not_allowed", "发送者未获授权，消息未被处理"),
+            (QueueFull, "queue_full", "排队消息过多，这条被丢弃"),
+            (
+                PeerUnreachable,
+                "peer_unreachable",
+                "窗口不在线或已退出，消息未送达",
+            ),
+        ];
+        for (r, code, text) in all {
+            assert_eq!(r.code(), code);
+            assert_eq!(r.text(), text);
+        }
+        // 三值互异（SPA 按 reason 分支；重复即有一类拒绝被误标）。
+        let codes: std::collections::HashSet<&str> = all.iter().map(|(r, _, _)| r.code()).collect();
+        assert_eq!(codes.len(), all.len());
+    }
+
+    /// v1.44：`client_id` 随排队消息持久化往返不丢；旧排队行（无此列）读回
+    /// None；序列化时它排在既有字段之后（旧行的字节前缀不变）。
+    #[test]
+    fn inbound_message_client_id_roundtrip_and_legacy_row() {
+        use super::{InboundMessage, ReplyHint, UserId};
+        let mk = || InboundMessage {
+            conv_id: super::ConvId("web:work".into()),
+            sender: UserId("web:user".into()),
+            sender_name: None,
+            text: Some("hi".into()),
+            media: Vec::new(),
+            media_errors: Vec::new(),
+            mentions: Vec::new(),
+            mentioned_bot: false,
+            ask_req: None,
+            reply_to: None,
+            source_msg_id: None,
+            control: None,
+            no_steer: false,
+            reply_hint: ReplyHint::None,
+            client_id: Some("m_1a2b3c4d".into()),
+        };
+        let row = serde_json::to_string(&mk()).unwrap();
+        let back: InboundMessage = serde_json::from_str(&row).unwrap();
+        assert_eq!(
+            back.client_id.as_deref(),
+            Some("m_1a2b3c4d"),
+            "排队往返不丢"
+        );
+
+        // 旧行：去掉 client_id 键（v1.44 之前落盘的形态）→ 读回 None。
+        let mut legacy: serde_json::Value = serde_json::from_str(&row).unwrap();
+        legacy.as_object_mut().unwrap().remove("client_id").unwrap();
+        let back: InboundMessage = serde_json::from_value(legacy).unwrap();
+        assert_eq!(back.client_id, None, "旧排队行无此列，读回 None");
+
+        // 键序：client_id 是最后一个键（既有字段的相对顺序不变，旧行的字节
+        // 前缀不变）。必须看序列化产物本身——`serde_json::Value` 未开
+        // `preserve_order`，解析后键被重排成字母序，从 Value 取不到声明序。
+        assert_eq!(
+            row.rfind(',').map(|i| &row[i..]),
+            Some(r#","client_id":"m_1a2b3c4d"}"#),
+            "client_id 应是最后一个键：{row}"
+        );
+        let reply_hint_at = row.find(r#""reply_hint":"None""#).expect("含 reply_hint");
+        assert!(
+            reply_hint_at < row.find(r#""client_id""#).unwrap(),
+            "client_id 排在既有字段之后：{row}"
+        );
     }
 }
