@@ -34,6 +34,14 @@
 4. **权限 socket**：同 uid 通过 SO_PEERCRED，配合 token 文件可伪造 ask 注入
    （**不能**伪造 approve——闭环本身没破）。
 5. Linux Secret Service 下 keyring 凭据对同会话任意进程可读。
+6. **peer 通道的本机 socket（`peer_enabled`，v1.41）**：网关在 `/tmp/cc-socks/<pid>.sock`
+   上接收本机进程发来的 JSON 行帧，不过 IM 白名单鉴权——这是 Claude Code 跨会话
+   消息机制的形态。`user` 帧的文本会落进驾驶舱的 `peer:<窗口名>` 会话；v1.43 起
+   `hook` 帧会把一段文本以「📋 本轮结束（自动同步）」注入对应窗口的会话（只认注册
+   表里终端交互窗口的 session id）。能连上这个 socket 的只有同 uid 的本机进程
+   （socket 0600），边界与上文 ④ 相同；它注入的是**给人看的文本**，不能借此触发
+   agent 执行。`imagent peer hook install` 会改写 `~/.claude/settings.json`
+   （改写前备份为 `.imagent-bak`）——这是你亲手执行的命令，不在 agent 的能力面内。
 
 **部署风险分级**：
 

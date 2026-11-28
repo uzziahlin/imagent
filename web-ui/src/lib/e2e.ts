@@ -76,7 +76,9 @@ const NONCE_LEN = 24;
  *  网关消费的业务帧，relay 不可见；v1.8 会话历史拉取（history_query）同规；
  *  v1.40 语音转写录音上行（asr_request，含 b64 音频载荷——relay 不可见）同规；
  *  v1.41.3 会话删除（conv_delete）同规；v1.42 待审批查询（approvals_query）
- *  同规——应答 approvals 帧载有待审批工具与命令摘要，relay 不可见。 */
+ *  同规——应答 approvals 帧载有待审批工具与命令摘要，relay 不可见；v1.43 本地
+ *  窗口的查询与关注（windows_query / window_watch）同规——本机有哪些 Claude
+ *  Code 窗口、用户盯着哪一个，同样是不该经 relay 明文暴露的本机信息。 */
 const BUSINESS_TYPES: ReadonlySet<string> = new Set([
   "message",
   "approval_response",
@@ -91,6 +93,8 @@ const BUSINESS_TYPES: ReadonlySet<string> = new Set([
   "asr_request",
   "conv_delete",
   "approvals_query",
+  "windows_query",
+  "window_watch",
 ]);
 
 // ---------------------------------------------------------------------------

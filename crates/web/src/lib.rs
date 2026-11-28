@@ -127,6 +127,24 @@
 //!   窗口经 peer 通道回给驾驶舱的文本，convId = `peer:<窗口名>`，见
 //!   [`PushNotifyKind`]）。
 //!
+//! v1.43 扩展（本地窗口看板 + 窗口事件推送，契约同款字节级纪律）：
+//! - 入站 `windows_query`（无必填字段，由 platform 的 sync 泵回快照）→ 出站
+//!   `windows{machine, hookInstalled, items[{name, status, waitingFor?, cwd,
+//!   startedAt?, statusUpdatedAt?, watched}]}`：本机**不归网关管**的 Claude Code
+//!   窗口清单（数据源是网关对注册表的轮询，见 `imagent-core` peer 模块；
+//!   `?` 字段为 None 时省略键；`items` 可为空数组，键不省略）。peer 通道未启用
+//!   的网关不回任何帧（SPA 据此不显示看板）；旧网关按未知 type 忽略。
+//! - 入站 `window_watch{name, watch}`：关注 / 取消关注一个窗口（决定「跑完
+//!   一轮」是否推送）；处理完重发一帧 `windows` 让所有设备的 `watched` 收敛。
+//!   **关注集合是跨设备的全局状态，归网关所有**：持久化在网关 store `config`
+//!   表（`imagent_core::peer::WATCH_CONFIG_KEY`），重启后保留；前端只发
+//!   `window_watch`、不保存名单、不做对账重发（各存一份名单时，A 设备取消关注
+//!   会被 B 设备的对账立刻补发回来，等于取消不了）。
+//! - 网关侧变化（轮询发现快照变化 / 事件）经 [`crate::platform::WebPlatform`] 的
+//!   `on_windows_changed` 钩子主动推 `windows` 帧（best-effort）。
+//! - `push_notify` 帧的 kind 新增 `window_turn_end` / `window_waiting`（convId =
+//!   `peer:<窗口名>`，title = 窗口名截 32 码点）。
+//!
 //! **帧内 convId 协议约定：恒为完整 conv 形态（`web:<session>`）**。出站帧
 //! （text / card / approval_request …）写入的即完整 conv，浏览器回执帧
 //! （message / approval_response）**原样回传收到的 convId** 即可，不得剥前
@@ -153,6 +171,7 @@ pub use key::GatewayCredential;
 pub use platform::{AsrContext, WebPlatform};
 
 use crate::platform::ApprovalSnapshotItem;
+use imagent_core::peer::{WindowInfo, WindowStatus};
 use imagent_core::{
     CardPhase, CardTerminal, ConvId, CoreError, InboundMessage, MediaRef, OutboundCard, ReplyHint,
     Result, TodoStatus, UserId,
@@ -705,12 +724,92 @@ pub(crate) fn encode_approvals_frame(
 }
 
 // ---------------------------------------------------------------------------
+// windows 快照帧出站（协议 v1.43：本地窗口看板）
+// ---------------------------------------------------------------------------
+
+/// `window_watch` 帧的 `name` 长度上限（字符）。窗口名是注册表里的短标识
+/// （如 `imagent-a7`），上限只为挡畸形帧。
+pub(crate) const WINDOW_NAME_MAX_CHARS: usize = 256;
+
+/// windows 快照帧的单个窗口条目（字段名逐字对齐 SPA 契约；`?` 字段为 None
+/// 时省略键）。
+#[derive(Serialize)]
+struct WindowItemFrame<'a> {
+    name: &'a str,
+    status: &'static str,
+    #[serde(rename = "waitingFor", skip_serializing_if = "Option::is_none")]
+    waiting_for: Option<&'a str>,
+    cwd: &'a str,
+    #[serde(rename = "startedAt", skip_serializing_if = "Option::is_none")]
+    started_at: Option<i64>,
+    #[serde(rename = "statusUpdatedAt", skip_serializing_if = "Option::is_none")]
+    status_updated_at: Option<i64>,
+    watched: bool,
+}
+
+/// windows 快照帧（struct 序列化保持声明序：`v`、`type`、`machine`、
+/// `hookInstalled`、`items`）。`items` 为空时输出 `"items":[]`，**不省略键**
+/// ——空数组即「peer 通道已启用但当前没有在线窗口」的权威结论。
+#[derive(Serialize)]
+struct WindowsFrame<'a> {
+    v: u8,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    machine: &'a str,
+    #[serde(rename = "hookInstalled")]
+    hook_installed: bool,
+    items: Vec<WindowItemFrame<'a>>,
+}
+
+/// `status` 的帧字面量（与注册表取值同名；`WindowStatus::Unknown` →
+/// `"unknown"`——注册表里的值不是 busy / idle / waiting 三者之一或缺失）。
+fn window_status_str(status: &WindowStatus) -> &'static str {
+    match status {
+        WindowStatus::Busy => "busy",
+        WindowStatus::Idle => "idle",
+        WindowStatus::Waiting => "waiting",
+        WindowStatus::Unknown => "unknown",
+    }
+}
+
+/// windows 快照帧药化（`windows_query` 的应答、`window_watch` 后的重发、轮询
+/// 发现变化时的主动推送共用）。`windows` 须已按 core `sort_windows` 排好
+/// （`PeerState::windows()` 的产出即是）——帧字节可复现。
+pub(crate) fn encode_windows_frame(
+    machine: &str,
+    hook_installed: bool,
+    windows: &[WindowInfo],
+) -> Result<String> {
+    let frame = WindowsFrame {
+        v: 1,
+        kind: "windows",
+        machine,
+        hook_installed,
+        items: windows
+            .iter()
+            .map(|w| WindowItemFrame {
+                name: &w.name,
+                status: window_status_str(&w.status),
+                waiting_for: w.waiting_for.as_deref(),
+                cwd: &w.cwd,
+                started_at: w.started_at,
+                status_updated_at: w.status_updated_at,
+                watched: w.watched,
+            })
+            .collect(),
+    };
+    serde_json::to_string(&frame)
+        .map_err(|e| CoreError::Platform(TARGET, format!("windows 帧序列化失败：{e}")))
+}
+
+// ---------------------------------------------------------------------------
 // push_notify 帧出站（协议 v1.10：网关 → 中继，明文管理帧族）
 // ---------------------------------------------------------------------------
 
-/// push_notify 帧的 kind（协议 v1.10 共享契约三值 + v1.42 第四值）：回合终态
-/// （done/error）、审批请求，以及窗口回信（v1.42 `peer_reply`——本地 Claude
-/// 窗口经 peer 通道回给驾驶舱的文本，此前纯文本帧无卡片终态，从不推送）。
+/// push_notify 帧的 kind（协议 v1.10 共享契约三值 + v1.42 第四值 + v1.43 两个
+/// 窗口事件）：回合终态（done/error）、审批请求、窗口回信（v1.42 `peer_reply`
+/// ——本地 Claude Code 窗口经 peer 通道回给驾驶舱的文本，此前纯文本帧无卡片
+/// 终态，从不推送），以及本地窗口「跑完一轮」/「进入 waiting」（v1.43）。
 /// 字面量与中继 `parse_notify_frame` 白名单、SPA 通知文案三端逐字对齐。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PushNotifyKind {
@@ -723,6 +822,11 @@ pub enum PushNotifyKind {
     /// v1.42 peer 入站回复已落 `peer:<窗口名>` 会话（`Platform::on_peer_reply`
     /// 钩子；conv_id 即该 peer 会话的完整 conv，title = 回信正文摘要）。
     PeerReply,
+    /// v1.43 本地窗口跑完一轮（被关注或本次运行里驾驶舱给它发过消息的窗口；
+    /// conv_id = `peer:<窗口名>`，title = 窗口名）。
+    WindowTurnEnd,
+    /// v1.43 本地窗口进入 waiting——卡住等人（所有窗口都推；conv_id / title 同上）。
+    WindowWaiting,
 }
 
 impl PushNotifyKind {
@@ -733,6 +837,8 @@ impl PushNotifyKind {
             PushNotifyKind::RoundError => "round_error",
             PushNotifyKind::Approval => "approval",
             PushNotifyKind::PeerReply => "peer_reply",
+            PushNotifyKind::WindowTurnEnd => "window_turn_end",
+            PushNotifyKind::WindowWaiting => "window_waiting",
         }
     }
 }
@@ -1210,6 +1316,20 @@ pub(crate) enum InboundAction {
     /// dispatch 命令链；与 `Sync` 共用通道与泵）。无必填字段——`machine` 由
     /// relay 路由用，网关不消费。
     ApprovalsQuery,
+    /// v1.43 本地窗口快照请求（windows_query 帧）→ sync responder 按 peer 共享态
+    /// 回 `windows` 权威快照（不进 recv / dispatch 命令链；与 `Sync` /
+    /// `ApprovalsQuery` 共用通道与泵）。无必填字段——`machine` 由 relay 路由
+    /// 用，网关不消费。peer 通道未启用的网关不回帧。
+    WindowsQuery,
+    /// v1.43 关注 / 取消关注一个本地窗口（window_watch{name, watch} 帧）：
+    /// client 层直接改 peer 共享态的关注名单（跨设备的全局状态，由网关持久化
+    /// 在 store `config` 表——前端不存名单、不对账），再经 sync 泵重发一帧
+    /// `windows` 让所有设备的 `watched` 收敛（不进 recv / dispatch 命令链）。
+    /// `name` 非空字符串 ≤ [`WINDOW_NAME_MAX_CHARS`]，`watch` 布尔。
+    WindowWatch {
+        name: String,
+        watch: bool,
+    },
     /// 应用层 ping → client 直接回 pong（不进 recv）。
     Ping,
     /// v1.6 工作空间（workspace_list / workspace_save / workspace_remove /
@@ -1440,6 +1560,28 @@ pub(crate) fn map_inbound_frame(v: &serde_json::Value, default_session: &str) ->
         // workspaces）。无字段校验面（无必填字段），组装与回帧在 platform
         // 的 sync 泵。
         "approvals_query" => InboundAction::ApprovalsQuery,
+        // v1.43 本地窗口快照：浏览器请求 → 网关回权威快照（同 approvals_query）。
+        // 无字段校验面，组装与回帧在 platform 的 sync 泵。
+        "windows_query" => InboundAction::WindowsQuery,
+        // v1.43 关注 / 取消关注窗口：本层只做字段校验（`name` 须非空字符串且
+        // ≤ 上限，`watch` 须布尔；缺失 / 类型错 / 超长 → Warn 丢弃——契约：
+        // 畸形 window_watch 一律丢弃，不改关注名单）。名字原样使用、不 trim：
+        // 它是 `windows` 帧里 `name` 的原样回传，与注册表条目名逐字相等才匹配。
+        "window_watch" => {
+            let Some(name) = v.get("name").and_then(|n| n.as_str()) else {
+                return InboundAction::Warn("window_watch 帧缺 name 字段（或非字符串），丢弃");
+            };
+            let Some(watch) = v.get("watch").and_then(|w| w.as_bool()) else {
+                return InboundAction::Warn("window_watch 帧缺 watch 字段（或非布尔），丢弃");
+            };
+            if name.is_empty() || name.chars().count() > WINDOW_NAME_MAX_CHARS {
+                return InboundAction::Warn("window_watch 帧 name 为空或超长，丢弃");
+            }
+            InboundAction::WindowWatch {
+                name: name.to_string(),
+                watch,
+            }
+        }
         "ping" => InboundAction::Ping,
         // v1.6 工作空间帧：本层只做字段存在性/类型检查（缺失/类型错 → Warn
         // 丢弃，与 message 同纪律）；**值域校验（空 name / 非法路径）在
@@ -1837,6 +1979,139 @@ mod tests {
             assert!(
                 matches!(map_raw_frame(raw, SESSION), InboundAction::ApprovalsQuery),
                 "{raw}"
+            );
+        }
+    }
+
+    /// v1.43 windows_query 入站映射：无必填字段（`machine` 由 relay 路由用）
+    /// → [`InboundAction::WindowsQuery`]，不进 recv / dispatch 命令链。
+    #[test]
+    fn map_windows_query() {
+        for raw in [
+            r#"{"v":1,"type":"windows_query","machine":"home-mac"}"#,
+            r#"{"v":1,"type":"windows_query"}"#,
+        ] {
+            assert!(
+                matches!(map_raw_frame(raw, SESSION), InboundAction::WindowsQuery),
+                "{raw}"
+            );
+        }
+    }
+
+    /// v1.43 window_watch 入站映射（契约 §1 形状规则）：`name` 须为非空字符串
+    /// ≤ 256 字符（原样使用、不 trim），`watch` 须为布尔；缺失 / 类型错 / 空 /
+    /// 超长 → Warn 丢弃（不改关注名单）。
+    #[test]
+    fn map_window_watch_shapes() {
+        let watch_of = |raw: &str| match map_raw_frame(raw, SESSION) {
+            InboundAction::WindowWatch { name, watch } => Some((name, watch)),
+            InboundAction::Warn(reason) => panic!("合法帧被拒：{raw}（{reason}）"),
+            other => panic!("{raw} 应映射为 WindowWatch：{other:?}"),
+        };
+        assert_eq!(
+            watch_of(
+                r#"{"v":1,"type":"window_watch","machine":"home-mac","name":"jormungandr-f8","watch":true}"#
+            ),
+            Some(("jormungandr-f8".to_string(), true))
+        );
+        assert_eq!(
+            watch_of(r#"{"v":1,"type":"window_watch","name":"win-a","watch":false}"#),
+            Some(("win-a".to_string(), false))
+        );
+        // 恰到上限的名字放行（256 字符）；名字原样（不 trim）。
+        let at_limit = "w".repeat(WINDOW_NAME_MAX_CHARS);
+        assert_eq!(
+            watch_of(&format!(
+                r#"{{"v":1,"type":"window_watch","name":"{at_limit}","watch":true}}"#
+            ))
+            .map(|(n, _)| n.len()),
+            Some(WINDOW_NAME_MAX_CHARS)
+        );
+        assert_eq!(
+            watch_of(r#"{"v":1,"type":"window_watch","name":" win-a ","watch":true}"#),
+            Some((" win-a ".to_string(), true)),
+            "名字原样使用"
+        );
+        // 反例。
+        let too_long = "w".repeat(WINDOW_NAME_MAX_CHARS + 1);
+        for raw in [
+            r#"{"v":1,"type":"window_watch","watch":true}"#.to_string(),
+            r#"{"v":1,"type":"window_watch","name":"win-a"}"#.to_string(),
+            r#"{"v":1,"type":"window_watch","name":"","watch":true}"#.to_string(),
+            r#"{"v":1,"type":"window_watch","name":42,"watch":true}"#.to_string(),
+            r#"{"v":1,"type":"window_watch","name":"win-a","watch":"true"}"#.to_string(),
+            r#"{"v":1,"type":"window_watch","name":"win-a","watch":1}"#.to_string(),
+            r#"{"v":1,"type":"window_watch","name":"win-a","watch":null}"#.to_string(),
+            format!(r#"{{"v":1,"type":"window_watch","name":"{too_long}","watch":true}}"#),
+        ] {
+            assert!(
+                matches!(map_raw_frame(&raw, SESSION), InboundAction::Warn(_)),
+                "畸形 window_watch 应 Warn 丢弃：{raw}"
+            );
+        }
+    }
+
+    /// v1.43 windows 快照帧字节级（共享契约 §2）：顶层键序 `v / type / machine /
+    /// hookInstalled / items`；条目键序 `name / status / waitingFor / cwd /
+    /// startedAt / statusUpdatedAt / watched`，三个可选字段为 None 时**省略键**；
+    /// `items` 空时输出 `[]` 不省略键；`status` 四值字面量。
+    #[test]
+    fn windows_frame_byte_level() {
+        // 空清单（peer 通道已启用但没有在线窗口）：键不省略。
+        assert_eq!(
+            encode_windows_frame("home-mac", true, &[]).unwrap(),
+            r#"{"v":1,"type":"windows","machine":"home-mac","hookInstalled":true,"items":[]}"#
+        );
+        assert_eq!(
+            encode_windows_frame("home-mac", false, &[]).unwrap(),
+            r#"{"v":1,"type":"windows","machine":"home-mac","hookInstalled":false,"items":[]}"#
+        );
+        let win = |name: &str, status: WindowStatus| WindowInfo {
+            name: name.into(),
+            status,
+            waiting_for: None,
+            cwd: "/Users/demo/work/api".into(),
+            started_at: Some(1_795_114_000_000),
+            status_updated_at: Some(1_795_351_568_790),
+            watched: false,
+        };
+        // 契约 §2 的示例帧逐字节（两个条目：无 waitingFor / 有 waitingFor）。
+        let mut idle = win("jormungandr-f8", WindowStatus::Idle);
+        idle.cwd = "/Users/demo/work/api".into();
+        let mut waiting = win("imagent-a7", WindowStatus::Waiting);
+        waiting.waiting_for = Some("dialog open".into());
+        waiting.cwd = "/Users/demo/work/b".into();
+        waiting.started_at = Some(1_795_115_000_000);
+        waiting.status_updated_at = Some(1_795_352_000_000);
+        waiting.watched = true;
+        assert_eq!(
+            encode_windows_frame("home-mac", true, &[idle, waiting]).unwrap(),
+            r#"{"v":1,"type":"windows","machine":"home-mac","hookInstalled":true,"items":[{"name":"jormungandr-f8","status":"idle","cwd":"/Users/demo/work/api","startedAt":1795114000000,"statusUpdatedAt":1795351568790,"watched":false},{"name":"imagent-a7","status":"waiting","waitingFor":"dialog open","cwd":"/Users/demo/work/b","startedAt":1795115000000,"statusUpdatedAt":1795352000000,"watched":true}]}"#
+        );
+        // 可选字段为 None → 省略键；status 其余取值字面量。
+        let bare = WindowInfo {
+            name: "w".into(),
+            status: WindowStatus::Busy,
+            waiting_for: None,
+            cwd: "/c".into(),
+            started_at: None,
+            status_updated_at: None,
+            watched: false,
+        };
+        assert_eq!(
+            encode_windows_frame("m", false, &[bare]).unwrap(),
+            r#"{"v":1,"type":"windows","machine":"m","hookInstalled":false,"items":[{"name":"w","status":"busy","cwd":"/c","watched":false}]}"#
+        );
+        for (status, literal) in [
+            (WindowStatus::Busy, "busy"),
+            (WindowStatus::Idle, "idle"),
+            (WindowStatus::Waiting, "waiting"),
+            (WindowStatus::Unknown, "unknown"),
+        ] {
+            let json = encode_windows_frame("m", false, &[win("w", status)]).unwrap();
+            assert!(
+                json.contains(&format!(r#""status":"{literal}""#)),
+                "{literal}：{json}"
             );
         }
     }
@@ -3053,6 +3328,30 @@ mod tests {
         assert_eq!(
             encode_push_notify_frame("home-mac", &ev),
             r#"{"v":1,"type":"push_notify","machine":"home-mac","kind":"peer_reply","convId":"peer:win-a","title":""}"#
+        );
+
+        // v1.43 两个窗口事件 kind：字符串形态逐字 + 字节级（convId =
+        // peer:<窗口名>，title = 窗口名——与中继 parse_notify_frame 白名单、SPA
+        // notificationCopy 三端对齐锚点）。
+        assert_eq!(PushNotifyKind::WindowTurnEnd.as_str(), "window_turn_end");
+        assert_eq!(PushNotifyKind::WindowWaiting.as_str(), "window_waiting");
+        let ev = PushEvent {
+            kind: PushNotifyKind::WindowTurnEnd,
+            conv_id: "peer:win-a".into(),
+            title: "win-a".into(),
+        };
+        assert_eq!(
+            encode_push_notify_frame("home-mac", &ev),
+            r#"{"v":1,"type":"push_notify","machine":"home-mac","kind":"window_turn_end","convId":"peer:win-a","title":"win-a"}"#
+        );
+        let ev = PushEvent {
+            kind: PushNotifyKind::WindowWaiting,
+            conv_id: "peer:win-a".into(),
+            title: "win-a".into(),
+        };
+        assert_eq!(
+            encode_push_notify_frame("home-mac", &ev),
+            r#"{"v":1,"type":"push_notify","machine":"home-mac","kind":"window_waiting","convId":"peer:win-a","title":"win-a"}"#
         );
     }
 

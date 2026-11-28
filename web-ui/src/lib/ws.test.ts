@@ -15,7 +15,7 @@ import {
   type WebSocketLike,
 } from "./ws";
 import { openBox, sealFrame, signatureMessage, type E2eEvent } from "./e2e";
-import type { InboundFrame, SessionInfo } from "./protocol";
+import type { InboundFrame, SessionInfo, WindowInfo } from "./protocol";
 
 /** 可控 fake WebSocket：手动 emit 事件、记录出站帧。 */
 class FakeWebSocket implements WebSocketLike {
@@ -1128,6 +1128,132 @@ describe("WsManager E2E（v1.4）", () => {
       sock.serverSend(bad);
     }
     expect(h.frames.filter((f) => f.type === "approvals")).toHaveLength(0);
+  });
+
+  // ---- v1.43 本地窗口（连接层）：查询 / 关注出站按机器选路 / 快照入站注入面 ----
+
+  it("v1.43 windows_query / window_watch 在业务帧集合内：握手窗口（pending）明文直发；confirming 期拒发；active 后走 enc（网关密钥可解回原帧）", () => {
+    const gw = makeGateway();
+    const h = makeE2eManager("home-mac");
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    const QUERY = '{"v":1,"type":"windows_query","machine":"home-mac"}';
+    const WATCH_ON = '{"v":1,"type":"window_watch","machine":"home-mac","name":"jormungandr-f8","watch":true}';
+    // ready 时尚未收到 machines 帧（无 e2e 条目）：单机形态明文
+    expect(h.mgr.sendWindowsQuery("home-mac")).toBe(true);
+    expect(sock.sent.at(-1)).toBe(QUERY);
+    pushMachines(sock, ["home-mac"]);
+    // 握手窗口（pending）：仍是明文直发（v1.1 既有窗口行为）——ready 后首查的形态
+    expect(h.mgr.sendWindowsQuery("home-mac")).toBe(true);
+    expect(sock.sent.at(-1)).toBe(QUERY);
+    expect(h.mgr.sendWindowWatch("jormungandr-f8", true, "home-mac")).toBe(true);
+    expect(sock.sent.at(-1)).toBe(WATCH_ON);
+    // confirming（待确认指纹，fail-closed）：业务帧拒发（不出明文）
+    ackLatest(sock, gw, "home-mac");
+    const before = sock.sent.length;
+    expect(h.mgr.sendWindowsQuery("home-mac")).toBe(false);
+    expect(h.mgr.sendWindowWatch("jormungandr-f8", true, "home-mac")).toBe(false);
+    expect(sock.sent).toHaveLength(before);
+    // active 后：走密文，网关密钥可解回原帧（窗口清单与关注的是哪个窗口，relay 不可见）
+    const key = acceptTofu(sock, gw, h, "home-mac").key;
+    expect(h.mgr.sendWindowsQuery("home-mac")).toBe(true);
+    let wire = JSON.parse(sock.sent.at(-1) ?? "{}") as { type: string; machine: string; box: string };
+    expect(wire.type).toBe("enc");
+    expect(wire.machine).toBe("home-mac");
+    expect(openBox(key, wire.box)).toBe(QUERY);
+    expect(h.mgr.sendWindowWatch("jormungandr-f8", false, "home-mac")).toBe(true);
+    wire = JSON.parse(sock.sent.at(-1) ?? "{}") as typeof wire;
+    expect(wire.type).toBe("enc");
+    expect(openBox(key, wire.box)).toBe(
+      '{"v":1,"type":"window_watch","machine":"home-mac","name":"jormungandr-f8","watch":false}',
+    );
+  });
+
+  it("v1.43 网关应答 windows（enc 内帧）经 onFrame 上抛；内帧漏带 machine 时注入信封 machine", () => {
+    const gw = makeGateway();
+    const h = makeE2eManager("home-mac");
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    pushMachines(sock, ["home-mac"]);
+    const key = toActive(sock, gw, h, "home-mac");
+    const items: WindowInfo[] = [
+      { name: "jormungandr-f8", status: "idle", cwd: "/Users/demo/work/api", watched: false },
+    ];
+    // 网关经 send_business 加密下发（内帧自带 machine）
+    sock.serverSend(
+      JSON.stringify(
+        sealFrame("home-mac", key, { v: 1, type: "windows", machine: "home-mac", hookInstalled: true, items }),
+      ),
+    );
+    expect(h.frames.at(-1)).toEqual({ v: 1, type: "windows", machine: "home-mac", hookInstalled: true, items });
+    // 网关新帧型漏带 machine：enc 信封 machine 是路由权威来源，注入兜底。
+    // （类型上 windows.machine 必填——这里就是要模拟契约外的畸形内帧，故断言）
+    const machineLess = { v: 1, type: "windows", hookInstalled: true, items } as unknown as InboundFrame;
+    sock.serverSend(JSON.stringify(sealFrame("home-mac", key, machineLess)));
+    expect(h.frames.at(-1)).toEqual({ v: 1, type: "windows", machine: "home-mac", hookInstalled: true, items });
+  });
+
+  it("v1.43 active 机器发来的明文 windows 属注入面：丢弃（onFrame 不触发）+ 降级告警（与 approvals 同规）；加密形态照常放行", () => {
+    const gw = makeGateway();
+    const h = makeE2eManager("home-mac");
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    pushMachines(sock, ["home-mac"]);
+    const key = toActive(sock, gw, h, "home-mac");
+    const items: WindowInfo[] = [
+      {
+        name: "jormungandr-f8",
+        status: "waiting",
+        waitingFor: "dialog open",
+        cwd: "/Users/demo/work/api",
+        watched: true,
+      },
+    ];
+    // 明文快照（伪造 / 降级）：能凭空在看板上塞出一个「等你确认」的假窗口并顶掉状态条提示——必须封住
+    sock.serverSend(JSON.stringify({ v: 1, type: "windows", machine: "home-mac", hookInstalled: true, items }));
+    expect(h.frames.filter((f) => f.type === "windows")).toHaveLength(0);
+    expect(h.events).toContainEqual({ kind: "downgrade", machine: "home-mac" });
+    // 同机器再来一条明文 windows：仍丢弃，告警不重复（每连接每机器一次）
+    sock.serverSend(JSON.stringify({ v: 1, type: "windows", machine: "home-mac", hookInstalled: false, items: [] }));
+    expect(h.frames.filter((f) => f.type === "windows")).toHaveLength(0);
+    expect(h.events.filter((e) => e.kind === "downgrade")).toHaveLength(1);
+    // 加密形态的下发（真网关经 send_business）照常放行——被挡住的只是明文
+    sock.serverSend(
+      JSON.stringify(sealFrame("home-mac", key, { v: 1, type: "windows", machine: "home-mac", hookInstalled: true, items })),
+    );
+    expect(h.frames.at(-1)).toEqual({ v: 1, type: "windows", machine: "home-mac", hookInstalled: true, items });
+  });
+
+  it("v1.43 无会话 / 握手窗口机器的明文 windows 照常经 onFrame 上抛（旧网关 / 握手窗口兼容），不告警", () => {
+    const h = makeE2eManager("home-mac");
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    // 尚无 e2e 条目（machines 帧未到）：明文放行
+    sock.serverSend('{"v":1,"type":"windows","machine":"home-mac","hookInstalled":true,"items":[]}');
+    expect(h.frames.at(-1)).toEqual({ v: 1, type: "windows", machine: "home-mac", hookInstalled: true, items: [] });
+    // 握手窗口（pending）同样放行：ready 后首查的应答可能就是明文
+    pushMachines(sock, ["home-mac"]);
+    sock.serverSend('{"v":1,"type":"windows","machine":"home-mac","hookInstalled":true,"items":[]}');
+    expect(h.frames.filter((f) => f.type === "windows")).toHaveLength(2);
+    expect(h.events.filter((e) => e.kind === "downgrade")).toHaveLength(0);
+  });
+
+  it("v1.43 windows 畸形帧（parseFrame 拒）静默丢弃：onFrame 不触发", () => {
+    const h = makeE2eManager("home-mac");
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    for (const bad of [
+      '{"v":1,"type":"windows","hookInstalled":true,"items":[]}', // 缺 machine
+      '{"v":1,"type":"windows","machine":"home-mac","items":[]}', // 缺 hookInstalled
+      '{"v":1,"type":"windows","machine":"home-mac","hookInstalled":true}', // 缺 items
+      '{"v":1,"type":"windows","machine":"home-mac","hookInstalled":true,"items":{}}',
+      '{"v":1,"type":"windows","machine":"home-mac","hookInstalled":true,"items":[{"name":"w","status":"running","cwd":"/x","watched":false}]}', // status 越界
+      '{"v":1,"type":"windows","machine":"home-mac","hookInstalled":true,"items":[{"name":"w","status":"idle","cwd":"/x","watched":"false"}]}', // watched 非布尔
+      '{"v":1,"type":"windows","machine":"home-mac","hookInstalled":true,"items":[{"status":"idle","cwd":"/x","watched":false}]}', // 条目缺 name
+    ]) {
+      sock.serverSend(bad);
+    }
+    expect(h.frames.filter((f) => f.type === "windows")).toHaveLength(0);
   });
 
   it("身份变化（已 pin 公钥改变）→ alert：发送阻断、事件上抛", () => {
@@ -2385,5 +2511,60 @@ describe("WsManager 待审批快照（v1.42）", () => {
       machine: "home-mac",
       items: [{ convId: "web:s-192d", requestId: "<id>", tool: "Bash", inputSummary: "npm test", timeoutSecs: 731 }],
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.43 本地窗口：sendWindowsQuery / sendWindowWatch 发送器 + 入站 windows 明文帧
+// 转发（连接层只负责发送与转发；E2E 选路 / 注入面用例见上方 E2E 组）
+// ---------------------------------------------------------------------------
+
+describe("WsManager 本地窗口（v1.43）", () => {
+  const ITEMS = [{ name: "jormungandr-f8", status: "idle", cwd: "/Users/demo/work/api", watched: false }];
+
+  it("sendWindowsQuery：ready 前返回 false；ready 后字节精确（machine 缺省不带字段）", () => {
+    const h = makeManager();
+    h.mgr.connect();
+    expect(h.mgr.sendWindowsQuery("home-mac")).toBe(false);
+    const sock = readyFlow(h);
+    expect(h.mgr.sendWindowsQuery("home-mac")).toBe(true);
+    expect(sock.sent.at(-1)).toBe('{"v":1,"type":"windows_query","machine":"home-mac"}');
+    // 契约示例原文
+    expect(sock.sent.at(-1)).toBe(JSON.stringify({ v: 1, type: "windows_query", machine: "home-mac" }));
+    expect(h.mgr.sendWindowsQuery()).toBe(true);
+    expect(sock.sent.at(-1)).toBe('{"v":1,"type":"windows_query"}');
+    expect(JSON.parse(sock.sent.at(-1)!)).not.toHaveProperty("machine");
+  });
+
+  it("sendWindowWatch：ready 前返回 false；ready 后字节精确（契约键序 v/type/machine/name/watch；machine 缺省不带字段）", () => {
+    const h = makeManager();
+    h.mgr.connect();
+    expect(h.mgr.sendWindowWatch("jormungandr-f8", true, "home-mac")).toBe(false);
+    const sock = readyFlow(h);
+    expect(h.mgr.sendWindowWatch("jormungandr-f8", true, "home-mac")).toBe(true);
+    expect(sock.sent.at(-1)).toBe(
+      '{"v":1,"type":"window_watch","machine":"home-mac","name":"jormungandr-f8","watch":true}',
+    );
+    expect(h.mgr.sendWindowWatch("imagent-a7", false)).toBe(true);
+    expect(sock.sent.at(-1)).toBe('{"v":1,"type":"window_watch","name":"imagent-a7","watch":false}');
+    expect(JSON.parse(sock.sent.at(-1)!)).not.toHaveProperty("machine");
+  });
+
+  it("入站 windows 明文帧经 onFrame 转发（单机模式无 e2e 条目放行）；空 items 照常上抛", () => {
+    const h = makeManager();
+    h.mgr.connect();
+    const sock = readyFlow(h);
+    sock.serverSend(
+      '{"v":1,"type":"windows","machine":"home-mac","hookInstalled":true,"items":' + JSON.stringify(ITEMS) + "}",
+    );
+    expect(h.frames.at(-1)).toEqual({
+      v: 1,
+      type: "windows",
+      machine: "home-mac",
+      hookInstalled: true,
+      items: ITEMS,
+    });
+    sock.serverSend('{"v":1,"type":"windows","machine":"home-mac","hookInstalled":false,"items":[]}');
+    expect(h.frames.at(-1)).toEqual({ v: 1, type: "windows", machine: "home-mac", hookInstalled: false, items: [] });
   });
 });

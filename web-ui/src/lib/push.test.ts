@@ -200,6 +200,43 @@ describe("notificationCopy", () => {
       body: "本地窗口有了新回复",
     });
   });
+
+  // v1.43：本地窗口状态变化推送（契约 §3）。title = 窗口名（经 push_notify_title
+  // 截 32 码点，可为空 → 走兜底文案）
+  it("window_turn_end：标题「🏁 窗口完成一轮」，正文取窗口名；空白 / 缺失摘要用兜底文案", () => {
+    expect(notificationCopy("window_turn_end", "jormungandr-f8")).toEqual({
+      title: "🏁 窗口完成一轮",
+      body: "jormungandr-f8",
+    });
+    for (const blank of ["", "  \n", undefined, null]) {
+      expect(notificationCopy("window_turn_end", blank), String(blank)).toEqual({
+        title: "🏁 窗口完成一轮",
+        body: "你关注的窗口跑完了",
+      });
+    }
+  });
+
+  it("window_waiting：标题「⏸ 窗口在等你」，正文取窗口名；空白 / 缺失摘要用兜底文案", () => {
+    expect(notificationCopy("window_waiting", "imagent-a7")).toEqual({
+      title: "⏸ 窗口在等你",
+      body: "imagent-a7",
+    });
+    for (const blank of ["", " \n ", undefined, null]) {
+      expect(notificationCopy("window_waiting", blank), String(blank)).toEqual({
+        title: "⏸ 窗口在等你",
+        body: "有个本地窗口卡住了",
+      });
+    }
+  });
+
+  it("两个窗口 kind 互不串台；字面量须精确匹配（连字符 / 尾随空白的近似 kind 仍走兜底）", () => {
+    expect(notificationCopy("window_turn_end", "w")).not.toEqual(notificationCopy("window_waiting", "w"));
+    expect(notificationCopy("window_turn_end", "w")).not.toEqual(notificationCopy("peer_reply", "w"));
+    expect(notificationCopy("window_waiting", "w")).not.toEqual(notificationCopy("approval", "w"));
+    expect(notificationCopy("window-turn-end", "w")).toEqual({ title: "imagent 通知", body: "w" });
+    expect(notificationCopy("window_turn_end ", "w")).toEqual({ title: "imagent 通知", body: "w" });
+    expect(notificationCopy("window_wait", "w")).toEqual({ title: "imagent 通知", body: "w" });
+  });
 });
 
 // ---------------------------------------------------------------------------

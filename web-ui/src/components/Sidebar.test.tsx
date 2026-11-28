@@ -1,10 +1,11 @@
 // Sidebar「外观」三段主题开关：三选项渲染（跟随系统/浅色/深色）、当前偏好
 // 高亮（aria-pressed）、点击回调按选项回传 ThemePref。其余区块（会话列表/
 // 机器切换器等）由 App.test 端到端覆盖，此处仅挂最小 props。
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Sidebar, type ConvItem } from "./Sidebar";
 import type { ThemePref } from "../lib/theme";
+import type { MachineWindows, WindowInfo, WindowStatus } from "../lib/protocol";
 
 afterEach(cleanup);
 
@@ -265,5 +266,208 @@ describe("Sidebar 运行版本号（v1.41.7）", () => {
     const version = screen.getByText(`v${__APP_VERSION__}`);
     expect(version.tagName).toBe("DIV");
     expect(screen.getAllByText(/^v\d+\.\d+\.\d+$/)).toEqual([version]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.43「本地窗口」区块：机器切换器之下、会话列表之上。windows 为 undefined
+// （旧网关 / 未启用 peer 通道）整块不渲染；items 为空显示灰字；每行 = 状态点 +
+// 窗口名 + 第二行状态文字；星标是独立的按钮（aria-pressed），点星标不触发行点击。
+// ---------------------------------------------------------------------------
+
+describe("Sidebar 本地窗口区块（v1.43）", () => {
+  const NOW = 1_795_000_000_000;
+  const MIN = 60_000;
+  const mk = (name: string, status: WindowStatus, extra: Partial<WindowInfo> = {}): WindowInfo => ({
+    name,
+    status,
+    cwd: `/Users/demo/work/${name}`,
+    watched: false,
+    statusUpdatedAt: NOW - 3 * MIN,
+    ...extra,
+  });
+  const IDLE = mk("jormungandr-f8", "idle");
+  const WAITING = mk("imagent-a7", "waiting", {
+    waitingFor: "dialog open",
+    watched: true,
+    statusUpdatedAt: NOW - 2 * MIN,
+  });
+  const BUSY = mk("runner", "busy", { statusUpdatedAt: undefined });
+
+  /** 挂载侧栏（多机模式，便于断言区块位置）。时钟取假时钟 NOW：相对时间文案
+   *  不随真实时间漂移。 */
+  function mount(windows?: MachineWindows) {
+    const handlers = { onSelectWindow: vi.fn(), onToggleWindowWatch: vi.fn() };
+    render(
+      <Sidebar
+        convs={NO_CONVS}
+        current="web:default"
+        machineOnline={true}
+        machines={["home-mac"]}
+        machinesKnown={true}
+        currentMachine="home-mac"
+        pushEnabled={false}
+        pushAvailable={false}
+        pushBusy={false}
+        themePref="system"
+        onThemeChange={() => {}}
+        onSelect={() => {}}
+        onSelectMachine={() => {}}
+        onCreate={() => {}}
+        windows={windows}
+        onSelectWindow={handlers.onSelectWindow}
+        onToggleWindowWatch={handlers.onToggleWindowWatch}
+      />,
+    );
+    return handlers;
+  }
+  const section = (): HTMLElement | null => screen.queryByRole("region", { name: "本地窗口" });
+  const rowOf = (name: string): HTMLElement =>
+    within(section()!).getByRole("button", { name: new RegExp(`^窗口 ${name}：`) }) as HTMLElement;
+  const starOf = (name: string): HTMLElement =>
+    within(section()!).getByRole("button", { name: new RegExp(`^(?:取消)?关注窗口 ${name}$`) }) as HTMLElement;
+  /** 行内状态点（圆点，aria-hidden）。 */
+  const dotOf = (row: HTMLElement): string => (row.querySelector(".rounded-full") as HTMLElement).className;
+  /** 行内第二行状态文字：状态文字（waiting 带括号里的原因）+「 · 」+ 相对时间。 */
+  const lineOf = (row: HTMLElement): string => (row.querySelector(".text-faint") as HTMLElement).textContent ?? "";
+  /** 区块头的汇总（「N 待确认」/「N 运行中」，都没有 → null）。按文案定位：
+   *  行内状态文字是「运行中」或「运行中 · N 分钟前」，不以数字开头，不会撞上。 */
+  const summary = (): { text: string; className: string } | null => {
+    const sec = section();
+    const el = sec
+      ? Array.from(sec.querySelectorAll("span")).find((s) => /^\d+ (?:待确认|运行中)$/.test(s.textContent ?? ""))
+      : undefined;
+    return el ? { text: el.textContent ?? "", className: el.className } : null;
+  };
+  const follows = (a: Node, b: Node): boolean =>
+    (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("windows 缺省（旧网关 / 未启用 peer 通道）→ 整块不渲染：没有名为「本地窗口」的 region，也没有钩子状态行", () => {
+    mount();
+    expect(section()).toBeNull();
+    expect(screen.queryByText(/结论自动上报/)).toBeNull();
+  });
+
+  it("位置：机器列表之后、会话列表之前；空快照 → 一行灰字「没有在线的本地窗口」，区块头无汇总", () => {
+    mount({ hookInstalled: true, items: [] });
+    const sec = section();
+    expect(sec).toBeTruthy();
+    expect(follows(screen.getByRole("listbox", { name: "机器列表" }), sec!)).toBe(true);
+    expect(follows(sec!, screen.getByRole("navigation", { name: "会话列表" }))).toBe(true);
+    expect(within(sec!).getByText("没有在线的本地窗口")).toBeTruthy();
+    expect(summary()).toBeNull();
+  });
+
+  it("状态点与状态文字：busy 运行中（唯一的呼吸点）/ waiting 等待确认（括号里是原因）/ idle 空闲 / unknown 未知；相对时间跟在状态后", () => {
+    mount({ hookInstalled: true, items: [IDLE, WAITING, BUSY, mk("ghost", "unknown", { statusUpdatedAt: undefined })] });
+    const idle = rowOf("jormungandr-f8");
+    expect(lineOf(idle)).toBe("空闲 · 3 分钟前");
+    expect(dotOf(idle)).toContain("bg-slate-500");
+    expect(dotOf(idle)).not.toContain("animate-pulse");
+    const waiting = rowOf("imagent-a7");
+    // 分隔符恒为「 · 」（括号已自带留白也不例外——任务书正文公式的写法）
+    expect(lineOf(waiting)).toBe("等待确认（等你确认） · 2 分钟前");
+    expect(dotOf(waiting)).toContain("bg-amber-400");
+    const busy = rowOf("runner");
+    // 没有 statusUpdatedAt → 不出相对时间，也不留悬空的「 · 」
+    expect(lineOf(busy)).toBe("运行中");
+    expect(dotOf(busy)).toContain("bg-emerald-400");
+    expect(dotOf(busy)).toContain("animate-pulse");
+    const unknown = rowOf("ghost");
+    expect(lineOf(unknown)).toBe("未知");
+    expect(dotOf(unknown)).toContain("bg-slate-600");
+    expect(section()!.querySelectorAll(".animate-pulse")).toHaveLength(1);
+    // 行的可访问名 =「窗口 <名>：<状态文字>」，waiting 追加「，<原因>」
+    expect(idle.getAttribute("aria-label")).toBe("窗口 jormungandr-f8：空闲");
+    expect(waiting.getAttribute("aria-label")).toBe("窗口 imagent-a7：等待确认，等你确认");
+    expect(busy.getAttribute("aria-label")).toBe("窗口 runner：运行中");
+  });
+
+  it("waiting 的原因文案：四种已知原因 → 人话；没见过的原因原样显示；没有原因时不出现括号", () => {
+    mount({
+      hookInstalled: true,
+      items: [
+        mk("w1", "waiting", { waitingFor: "dialog open" }),
+        mk("w2", "waiting", { waitingFor: "input needed" }),
+        mk("w3", "waiting", { waitingFor: "sandbox request" }),
+        mk("w4", "waiting", { waitingFor: "goal proposal" }),
+        mk("w5", "waiting", { waitingFor: "mcp reauth" }),
+        mk("w6", "waiting"),
+        mk("w7", "waiting", { waitingFor: "" }),
+      ],
+    });
+    expect(lineOf(rowOf("w1"))).toContain("等待确认（等你确认）");
+    expect(lineOf(rowOf("w2"))).toContain("等待确认（等你输入）");
+    expect(lineOf(rowOf("w3"))).toContain("等待确认（等沙箱授权）");
+    expect(lineOf(rowOf("w4"))).toContain("等待确认（等你定目标）");
+    expect(lineOf(rowOf("w5"))).toContain("等待确认（mcp reauth）");
+    expect(lineOf(rowOf("w6"))).toBe("等待确认 · 3 分钟前");
+    expect(lineOf(rowOf("w7"))).toBe("等待确认 · 3 分钟前");
+    expect(rowOf("w1").getAttribute("aria-label")).toBe("窗口 w1：等待确认，等你确认");
+    expect(rowOf("w6").getAttribute("aria-label")).toBe("窗口 w6：等待确认");
+  });
+
+  it("星标：aria-label「关注窗口 X」/「取消关注窗口 X」与 aria-pressed 跟随 watched；点击星标只触发 onToggleWindowWatch(name)，不触发行点击", () => {
+    const h = mount({ hookInstalled: true, items: [IDLE, WAITING] });
+    expect(starOf("jormungandr-f8").getAttribute("aria-label")).toBe("关注窗口 jormungandr-f8");
+    expect(starOf("jormungandr-f8").getAttribute("aria-pressed")).toBe("false");
+    expect(starOf("imagent-a7").getAttribute("aria-label")).toBe("取消关注窗口 imagent-a7");
+    expect(starOf("imagent-a7").getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(starOf("jormungandr-f8"));
+    fireEvent.click(starOf("imagent-a7"));
+    expect(h.onToggleWindowWatch.mock.calls).toEqual([["jormungandr-f8"], ["imagent-a7"]]);
+    expect(h.onSelectWindow).not.toHaveBeenCalled();
+  });
+
+  it("点击行本体 → onSelectWindow(窗口名)；不触发关注切换；行的 title 是工作目录（名字不含路径，靠它区分窗口）", () => {
+    const h = mount({ hookInstalled: true, items: [IDLE] });
+    const row = rowOf("jormungandr-f8");
+    expect(row.getAttribute("title")).toBe("/Users/demo/work/jormungandr-f8");
+    fireEvent.click(row);
+    expect(h.onSelectWindow).toHaveBeenCalledWith("jormungandr-f8");
+    expect(h.onToggleWindowWatch).not.toHaveBeenCalled();
+  });
+
+  it("区块头汇总：有 waiting 显示「N 待确认」（优先级最高，同时有 busy 也不显示运行中）；只有 busy 显示「N 运行中」；都没有不显示", () => {
+    const b2 = mk("runner-2", "busy");
+    mount({ hookInstalled: true, items: [WAITING, BUSY, b2] });
+    expect(summary()!.text).toBe("1 待确认");
+    expect(summary()!.className).toContain("text-amber");
+    cleanup();
+    mount({ hookInstalled: true, items: [BUSY, b2, IDLE] });
+    expect(summary()!.text).toBe("2 运行中");
+    expect(summary()!.className).toContain("text-emerald");
+    cleanup();
+    mount({ hookInstalled: true, items: [IDLE] });
+    expect(summary()).toBeNull();
+  });
+
+  it("钩子状态行：hookInstalled true →「结论自动上报：已开启」/ false →「结论自动上报：未安装」；title 给出安装命令的提示", () => {
+    mount({ hookInstalled: true, items: [] });
+    expect(within(section()!).getByText("结论自动上报：已开启")).toBeTruthy();
+    cleanup();
+    mount({ hookInstalled: false, items: [] });
+    const line = within(section()!).getByText("结论自动上报：未安装");
+    expect(line.getAttribute("title")).toBe(
+      "在电脑上运行 imagent peer hook install 后，每个窗口每一轮的结论会自动同步到对话里",
+    );
+  });
+
+  it("相对时间按分钟刷新：1 分钟后（useNow 的 tick）文案从「刚刚」变为「1 分钟前」", () => {
+    mount({ hookInstalled: true, items: [mk("fresh", "idle", { statusUpdatedAt: NOW })] });
+    expect(lineOf(rowOf("fresh"))).toBe("空闲 · 刚刚");
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+    expect(lineOf(rowOf("fresh"))).toBe("空闲 · 1 分钟前");
   });
 });

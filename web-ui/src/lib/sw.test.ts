@@ -360,6 +360,12 @@ describe("sw.js 通知文案与 push.ts 同步（notificationCopy 两份副本�
     ["peer_reply", undefined],
     ["peer_reply", " \n "],
     ["peer_reply", "窗口回信的摘要可以很长很长很长很长很长很长很长很长很长很长"],
+    ["window_turn_end", "jormungandr-f8"],
+    ["window_turn_end", ""],
+    ["window_turn_end", undefined],
+    ["window_waiting", "imagent-a7"],
+    ["window_waiting", " \n "],
+    ["window_waiting", null],
     ["unknown_kind", "摘要"],
     [undefined, undefined],
     [null, null],
@@ -383,6 +389,29 @@ describe("sw.js 通知文案与 push.ts 同步（notificationCopy 两份副本�
     expect(fallback).toEqual([
       "💬 窗口回复",
       expect.objectContaining({ body: "本地窗口有了新回复" }),
+    ]);
+  });
+
+  // v1.43：两个窗口推送 kind 的字面文案各钉一份（只有一致性比对的话，两份一起
+  // 写错仍是绿的）
+  it("v1.43 窗口推送字面文案：window_turn_end「🏁 窗口完成一轮」/ window_waiting「⏸ 窗口在等你」；空摘要走各自兜底", () => {
+    const sw = loadSw();
+    expect(
+      shownNotification(sw, { kind: "window_turn_end", title: "jormungandr-f8", convId: "peer:jormungandr-f8" }),
+    ).toEqual([
+      "🏁 窗口完成一轮",
+      expect.objectContaining({ body: "jormungandr-f8", tag: "peer:jormungandr-f8" }),
+    ]);
+    expect(shownNotification(sw, { kind: "window_turn_end", title: "" })).toEqual([
+      "🏁 窗口完成一轮",
+      expect.objectContaining({ body: "你关注的窗口跑完了" }),
+    ]);
+    expect(
+      shownNotification(sw, { kind: "window_waiting", title: "imagent-a7", convId: "peer:imagent-a7" }),
+    ).toEqual(["⏸ 窗口在等你", expect.objectContaining({ body: "imagent-a7", tag: "peer:imagent-a7" })]);
+    expect(shownNotification(sw, { kind: "window_waiting", title: "  " })).toEqual([
+      "⏸ 窗口在等你",
+      expect.objectContaining({ body: "有个本地窗口卡住了" }),
     ]);
   });
 

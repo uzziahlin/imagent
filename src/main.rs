@@ -8,7 +8,8 @@
 //!
 //! 模块拆分（批 A1）：`webhook`（入站驱动面）/ `backup`（快照备份）/ `ops`
 //! （metrics/SIGHUP/优雅退出 + 启动与热载共用装配段）各成模块；本文件只留
-//! CLI 定义、子命令分发与 Start 装配序列。
+//! CLI 定义、子命令分发与 Start 装配序列。v1.43 增 `peer_hook`（Claude Code
+//! Stop 钩子的客户端与安装管理）。
 
 #![forbid(unsafe_code)]
 
@@ -25,6 +26,7 @@ mod backup;
 mod delegate;
 mod join;
 mod ops;
+mod peer_hook;
 mod service;
 mod setup;
 mod webhook;
@@ -145,6 +147,26 @@ enum Cmd {
         #[arg(long, default_value = "")]
         delegate_names: String,
     },
+    /// 内部子命令：Claude Code 的 Stop 钩子客户端（v1.43）——由钩子
+    /// `"<imagent> peer-hook --to <网关 peer 名>"` 在每轮结束时调用，把本轮结论
+    /// 上报给本机网关，**不直接手动使用**。任何失败都静默、退出码恒为 0
+    /// （非零会打断 Claude 的收尾）；排查用环境变量
+    /// `IMAGENT_PEER_HOOK_DEBUG=1` 让它向 stderr 打印原因。
+    #[command(hide = true)]
+    PeerHook {
+        /// 目标网关的 peer 名（注册表条目 `name`，= 网关 config 的 peer_name；
+        /// 缺省 imagent。注册表里只有一个网关条目时名字对不上也会用它）。
+        #[arg(long)]
+        to: Option<String>,
+    },
+    /// 本地 Claude Code 窗口的 Stop 钩子管理（v1.43）：安装后，本机每个交互窗口
+    /// 跑完一轮，结论自动同步进驾驶舱的「peer:<窗口名>」会话。
+    /// 安装 / 卸载只改 Claude Code 配置里的本网关条目（改写前备份
+    /// `<配置>.imagent-bak`），不碰其它配置。
+    Peer {
+        #[command(subcommand)]
+        cmd: PeerCmd,
+    },
     /// 内部子命令：面向终端 agent 的「问人」MCP server（stdio JSON-RPC），暴露
     /// `ask_via_im` 工具。挂在任意终端 agent 的 MCP 配置里（command=imagent，
     /// args=["mcp-ask"]）；需 config 配置 `ask_via_im_conv` 且主进程已运行。
@@ -217,6 +239,47 @@ enum ProfileAction {
         name: Option<String>,
         #[arg(long)]
         yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum PeerCmd {
+    /// 管理 Claude Code 的 Stop 钩子条目（把每个本地窗口每轮的结论自动上报网关）。
+    Hook {
+        #[command(subcommand)]
+        cmd: HookCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookCmd {
+    /// 向 Claude Code 配置写入本网关的 Stop 钩子（幂等：已有等价条目则不重复写）。
+    Install {
+        /// 网关的 peer 名（须与网关 config 的 peer_name 一致；缺省 imagent）。
+        #[arg(long, default_value = peer_hook::DEFAULT_PEER_NAME)]
+        to: String,
+        /// 写入范围：user = ~/.claude/settings.json（对本机全部会话生效）；
+        /// project = <当前目录>/.claude/settings.json（只对该项目生效）。
+        #[arg(long, value_enum, default_value_t = peer_hook::HookScope::User)]
+        scope: peer_hook::HookScope,
+    },
+    /// 移除本网关的 Stop 钩子条目（别的钩子保留；文件不存在或未安装时提示后成功退出）。
+    Uninstall {
+        /// 网关的 peer 名（与安装时一致；缺省 imagent）。
+        #[arg(long, default_value = peer_hook::DEFAULT_PEER_NAME)]
+        to: String,
+        /// 读取范围：user（缺省）| project。
+        #[arg(long, value_enum, default_value_t = peer_hook::HookScope::User)]
+        scope: peer_hook::HookScope,
+    },
+    /// 只读查看：配置文件路径 + 已安装（命令原文）或未安装。
+    Status {
+        /// 网关的 peer 名（与安装时一致；缺省 imagent）。
+        #[arg(long, default_value = peer_hook::DEFAULT_PEER_NAME)]
+        to: String,
+        /// 读取范围：user（缺省）| project。
+        #[arg(long, value_enum, default_value_t = peer_hook::HookScope::User)]
+        scope: peer_hook::HookScope,
     },
 }
 
@@ -354,6 +417,17 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // v1.43 peer-hook 客户端（Claude Code 的 Stop 钩子调用）最先分派并直接返回，
+    // 不走下面的数据目录创建 / 权限收紧：它不依赖 `~/.imagent`（只读注册表 +
+    // 写一帧 socket），而钩子对本机**所有** Claude Code 会话的每一轮收尾都
+    // 触发——不该在收尾路径上顺手创建 / chmod 用户的 `~/.imagent`，也不该被
+    // 那一步的失败拖成非零退出。客户端体内不 panic（无 unwrap）；spawn 隔离
+    // 是兜底——即便将来某处 panic，tokio 把它收成 JoinError，退出码仍是 0。
+    if let Cmd::PeerHook { to } = &cli.cmd {
+        let _ = tokio::spawn(peer_hook::run_client(to.clone())).await;
+        return Ok(());
+    }
 
     // P4-10：`--profile <name>` → 进程内把状态根目录切到 profile 目录
     // （config / db / sock / 媒体 / MCP 子进程 env 全部随之隔离）。
@@ -1023,6 +1097,12 @@ async fn main() -> Result<()> {
             // 命令消费）。路径发现/注入在 peer 模块内完成（main 只给注册表
             // 默认根，不硬编码 $HOME——测试面全注入）。bind/注册失败 fail-open：
             // warn 后不注入 sender（peer 通道不可用不影响网关主链路）。
+            //
+            // v1.43 本地窗口看板（同一开关）：peer server 内的轮询任务每 3 秒读
+            // 注册表，快照变化 / 窗口事件经下面的 on_windows 回调转给平台钩子
+            // （Dispatcher 转发）；Stop 钩子上报经 on_report 回调进
+            // handle_peer_report；共享态 PeerState 后填进 web 平台（照
+            // set_round_probe 的先例）——windows_query / window_watch 才有数据源。
             let mut peer_server: Option<imagent_core::peer::PeerServer> = None;
             if config.peer_enabled {
                 match imagent_core::peer::default_registry_dir() {
@@ -1034,13 +1114,48 @@ async fn main() -> Result<()> {
                                 Box::pin(async move { d.handle_peer_inbound(&window, &body).await })
                             })
                         };
+                        // v1.43 Stop 钩子上报（handle_conn 收到 hook 帧）：按 session
+                        // 反查窗口 → 去重 → 注入 peer: 会话 → 推送闸门。
+                        let on_report: imagent_core::peer::PeerReportCallback = {
+                            let d = dispatcher.clone();
+                            Arc::new(move |session_id: String, message: String| {
+                                let d = d.clone();
+                                Box::pin(async move {
+                                    d.handle_peer_report(&session_id, &message).await
+                                })
+                            })
+                        };
+                        // v1.43 窗口快照回调（同步——轮询任务里不能 await）：快照
+                        // 走同步钩子 on_windows_changed；事件逐个 spawn 转给
+                        // async 钩子（是否推送由 Dispatcher 按事件自己的 push 位判定）。
+                        let on_windows: imagent_core::peer::PeerWindowsCallback = {
+                            let d = dispatcher.clone();
+                            Arc::new(move |windows, events| {
+                                d.publish_windows_changed(&windows);
+                                for event in events {
+                                    let d = d.clone();
+                                    tokio::spawn(
+                                        async move { d.publish_window_event(event).await },
+                                    );
+                                }
+                            })
+                        };
                         match imagent_core::peer::PeerServer::start(
                             imagent_core::peer::PeerServerConfig {
                                 registry_dir,
                                 name: config.peer_name.clone(),
                                 cwd: config.default_workdir.clone(),
+                                // 只读探测 Stop 钩子是否已装（windows 帧的 hookInstalled）；
+                                // home 不可解析 = 不探测（恒 false），不影响 peer 通道。
+                                settings_path: imagent_core::peer::default_claude_settings_path(),
+                                watch_interval: Some(std::time::Duration::from_secs(3)),
+                                // v1.43 关注名单（跨设备全局状态）的持久化落点：
+                                // 启动时先加载再开轮询，之后一变就落盘。
+                                watch_store: Some(Arc::new(store.clone())),
                                 shutdown: dispatcher.shutdown_token(),
                                 on_user,
+                                on_report,
+                                on_windows,
                             },
                         )
                         .await
@@ -1059,12 +1174,20 @@ async fn main() -> Result<()> {
                                          驾驶舱场景请在 platforms 配置加入 web"
                                     );
                                 }
+                                // v1.43：窗口看板共享态后填进 web 平台（与
+                                // set_round_probe 同款的后填——共享态在
+                                // PeerServer::start 里才创建，晚于平台构造）。
+                                // 未装 web 平台时无此步：windows_query 不回帧。
+                                if let Some(web) = web_platform.as_ref() {
+                                    web.set_peer_state(server.state());
+                                }
                                 dispatcher.set_peer_sender(Some(server.sender()));
                                 peer_server = Some(server);
                                 tracing::info!(
                                     target: "imagent::ops",
                                     name = %config.peer_name,
-                                    "peer 通道已启用（本地窗口可 SendMessage 到网关；/peers 查看、/to 派活）"
+                                    "peer 通道已启用（本地窗口可 SendMessage 到网关；/peers 查看、/to 派活；\
+                                     窗口看板每 3 秒轮询）"
                                 );
                             }
                             Err(e) => {
@@ -1627,6 +1750,20 @@ async fn main() -> Result<()> {
             // `/backend codex-app`（复用批 A 命令通道，见 run_term_view）。
             run_term_view(&data_dir, Some("codex-app"), session)?;
         }
+        // v1.43 本地窗口 Stop 钩子管理：参数接线即全部（逻辑在 peer_hook 模块，
+        // 便于单测——纯函数路径全注入，测试不碰真实 ~/.claude）。
+        Cmd::Peer {
+            cmd: PeerCmd::Hook { cmd },
+        } => match cmd {
+            HookCmd::Install { to, scope } => peer_hook::install(&to, scope)?,
+            HookCmd::Uninstall { to, scope } => peer_hook::uninstall(&to, scope)?,
+            HookCmd::Status { to, scope } => peer_hook::status(&to, scope)?,
+        },
+        // 已在 main 入口最先分派并返回（见 `let cli = Cli::parse()` 之后），正常
+        // 不可达。兜底同样静默成功而不是 unreachable!：这个子命令的契约是「退出
+        // 码恒为 0」，即便将来入口分派被改动，也不能让一次 panic（101）打断
+        // Claude 的收尾。
+        Cmd::PeerHook { .. } => return Ok(()),
     }
 
     Ok(())
@@ -2313,5 +2450,101 @@ mod extras_assembly_tests {
             extra_claude.is_none(),
             "default 已是 claude-cli：无 extra claude 句柄"
         );
+    }
+}
+
+/// v1.43 Stop 钩子相关 CLI 单测：`peer-hook` 内部子命令与 `peer hook
+/// <install|uninstall|status>` 的参数位解析（缺省值 / 全 flag / 非法值拒绝 /
+/// 顶层 `--profile` 贯通）。安装 / 卸载 / 状态的逻辑断言见 `peer_hook.rs`。
+#[cfg(test)]
+mod peer_hook_cli_tests {
+    use super::*;
+
+    fn hook_cmd(cli: Cli) -> HookCmd {
+        match cli.cmd {
+            Cmd::Peer {
+                cmd: PeerCmd::Hook { cmd },
+            } => cmd,
+            _ => panic!("应解析为 Cmd::Peer"),
+        }
+    }
+
+    #[test]
+    fn peer_hook_client_parses_with_and_without_to() {
+        let cli = Cli::try_parse_from(["imagent", "peer-hook", "--to", "gw-home"])
+            .expect("内部子命令应可解析");
+        match cli.cmd {
+            Cmd::PeerHook { to } => assert_eq!(to.as_deref(), Some("gw-home")),
+            _ => panic!("应解析为 Cmd::PeerHook"),
+        }
+        assert!(matches!(
+            Cli::try_parse_from(["imagent", "peer-hook"])
+                .expect("缺省形态")
+                .cmd,
+            Cmd::PeerHook { to: None }
+        ));
+    }
+
+    #[test]
+    fn peer_hook_management_parses_with_defaults() {
+        // install：--to 缺省 imagent、--scope 缺省 user。
+        match hook_cmd(Cli::try_parse_from(["imagent", "peer", "hook", "install"]).unwrap()) {
+            HookCmd::Install { to, scope } => {
+                assert_eq!(to, "imagent");
+                assert_eq!(scope, peer_hook::HookScope::User);
+            }
+            _ => panic!("应解析为 HookCmd::Install"),
+        }
+        match hook_cmd(Cli::try_parse_from(["imagent", "peer", "hook", "uninstall"]).unwrap()) {
+            HookCmd::Uninstall { to, scope } => {
+                assert_eq!(to, "imagent");
+                assert_eq!(scope, peer_hook::HookScope::User);
+            }
+            _ => panic!("应解析为 HookCmd::Uninstall"),
+        }
+        match hook_cmd(Cli::try_parse_from(["imagent", "peer", "hook", "status"]).unwrap()) {
+            HookCmd::Status { to, scope } => {
+                assert_eq!(to, "imagent");
+                assert_eq!(scope, peer_hook::HookScope::User);
+            }
+            _ => panic!("应解析为 HookCmd::Status"),
+        }
+    }
+
+    #[test]
+    fn peer_hook_management_parses_all_flags_and_global_profile() {
+        for words in ["install", "uninstall", "status"] {
+            let cli = Cli::try_parse_from([
+                "imagent",
+                "--profile",
+                "exp",
+                "peer",
+                "hook",
+                words,
+                "--to",
+                "gw-2",
+                "--scope",
+                "project",
+            ])
+            .expect("全 flag 形态应可解析");
+            assert_eq!(cli.profile.as_deref(), Some("exp"), "顶层 --profile 贯通");
+            let (to, scope) = match hook_cmd(cli) {
+                HookCmd::Install { to, scope } => (to, scope),
+                HookCmd::Uninstall { to, scope } => (to, scope),
+                HookCmd::Status { to, scope } => (to, scope),
+            };
+            assert_eq!(to, "gw-2");
+            assert_eq!(scope, peer_hook::HookScope::Project, "{words}");
+        }
+    }
+
+    #[test]
+    fn peer_hook_management_rejects_bad_scope_and_bare_peer() {
+        assert!(
+            Cli::try_parse_from(["imagent", "peer", "hook", "install", "--scope", "team"]).is_err()
+        );
+        // `peer` 是分组：不带子命令不可用。
+        assert!(Cli::try_parse_from(["imagent", "peer"]).is_err());
+        assert!(Cli::try_parse_from(["imagent", "peer", "hook"]).is_err());
     }
 }

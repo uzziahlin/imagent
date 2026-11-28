@@ -30,7 +30,7 @@ allowed_senders = []        # 空 = 发现模式：首启日志拿你的 open_id
 | `web_machine_id` | hostname 短名 | Web 驾驶舱：本机在 relay 侧的 machine 身份（多台 Mac 接同一 relay 时区分；同机重连顶替旧连接） |
 | `web_default_session` | `default` | Web 驾驶舱：无 convId 的浏览器消息落到的默认会话名（conv `web:<名>`） |
 | `whisper_bin` / `whisper_model` | — | Web 驾驶舱语音转写：`whisper-cli` 路径 + ggml 模型路径，**双键齐备才启用**（`brew install whisper-cpp`；中文建议 medium 及以上）。改动需重启 |
-| `peer_enabled` | `false` | peer 通道：网关注册为本机 Claude Code 的同行实例，驾驶舱与本地**已经开着**的 Claude Code 窗口互通——驾驶舱里 `/peers` 查看在线窗口、`/to <窗口名>` 派活（无正文 = 只建立会话，之后直接对话）；窗口里用 `SendMessage` 把进展发回驾驶舱（v1.42 起同时推送到手机）。需 `platforms` 含 `web` 才完整可用；只配 IM 平台时 `/peers`、`/to` 仍可查看与派活，但 `peer:` 会话收不到窗口回信。关闭时零痕迹（不写注册表、不监听套接字）。改动需重启 |
+| `peer_enabled` | `false` | peer 通道：网关注册为本机 Claude Code 的同行实例，驾驶舱与本地**已经开着**的 Claude Code 窗口互通——驾驶舱里 `/peers` 查看在线窗口、`/to <窗口名>` 派活（无正文 = 只建立会话，之后直接对话）；窗口里用 `SendMessage` 把进展发回驾驶舱（v1.42 起同时推送到手机）。v1.43 起驾驶舱侧栏多一块「本地窗口」：每个在线窗口一行（运行中 / 空闲 / 等待确认及原因，网关每隔 3 秒读一次 Claude Code 的会话注册表），点一行进入对话，星标关注；关注的窗口跑完一轮、任何窗口开始等人时推送到手机。可选：电脑上执行 `imagent peer hook install` 给 Claude Code 装官方 Stop 钩子，之后每个窗口每轮的结论自动同步进驾驶舱里对应的对话。只有终端里的交互窗口算「窗口」——网关自己跑的无头会话、后台作业不列出。需 `platforms` 含 `web` 才完整可用；只配 IM 平台时 `/peers`、`/to` 仍可查看与派活，但 `peer:` 会话收不到窗口回信。关闭时零痕迹（不写注册表、不监听套接字、不读注册表）。改动需重启 |
 | `peer_name` | `"imagent"` | peer 通道：网关在本地窗口里显示的名字（窗口 `SendMessage` 的目标名，也是驾驶舱 `peer:<名字>` 会话后缀）。同一台电脑上不能与已有窗口重名。改动需重启 |
 
 ## agent 与引擎

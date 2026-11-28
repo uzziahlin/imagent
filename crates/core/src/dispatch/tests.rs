@@ -82,6 +82,9 @@ type SentHandle = Arc<TokioMutex<Vec<(String, String)>>>;
 /// 镜像的路径断言用（与 `SentHandle` 分表：镜像必须走 send_user_text 而非
 /// send_text，系统提示 / 窗口回复则相反）。
 type UserSentHandle = Arc<TokioMutex<Vec<(String, String)>>>;
+/// v1.43：on_window_event 的 (conv, event) 记录句柄——窗口事件推送钩子的调用
+/// 点断言用。
+type WindowEventsHandle = Arc<TokioMutex<Vec<(String, crate::peer::WindowEvent)>>>;
 type CounterHandle = Arc<AtomicUsize>;
 type CallsHandle = Arc<TokioMutex<Vec<Option<String>>>>;
 type PromptsHandle = Arc<TokioMutex<Vec<String>>>;
@@ -120,6 +123,12 @@ struct MockPlatform {
     /// v1.42：on_peer_reply 的 (conv, body) 全记录——窗口回信通知钩子的调用
     /// 点断言用（handle_peer_inbound 恰一次；其余 peer 路径零次）。
     peer_replies: Arc<TokioMutex<Vec<(String, String)>>>,
+    /// v1.43：on_window_event 的 (conv, event) 全记录——窗口事件推送钩子的调用
+    /// 点断言用（只有 handle_peer_report / publish_window_event 触发）。
+    window_events: Arc<TokioMutex<Vec<(String, crate::peer::WindowEvent)>>>,
+    /// v1.43：on_windows_changed 的快照全记录（同步钩子——临界区只有一次
+    /// push，用 std Mutex）。
+    windows_changed: Arc<std::sync::Mutex<Vec<Vec<crate::peer::WindowInfo>>>>,
 }
 
 impl MockPlatform {
@@ -138,6 +147,8 @@ impl MockPlatform {
             sent: Arc::new(TokioMutex::new(Vec::new())),
             user_sent: Arc::new(TokioMutex::new(Vec::new())),
             peer_replies: Arc::new(TokioMutex::new(Vec::new())),
+            window_events: Arc::new(TokioMutex::new(Vec::new())),
+            windows_changed: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
         (p, inbox, send_count)
     }
@@ -340,6 +351,20 @@ impl Platform for MockPlatform {
             .lock()
             .await
             .push((conv.0.clone(), body.to_string()));
+    }
+    /// v1.43：窗口事件推送钩子记录（(conv, event)，不进 sent / inbox）。
+    async fn on_window_event(&self, conv: &ConvId, event: &crate::peer::WindowEvent) {
+        self.window_events
+            .lock()
+            .await
+            .push((conv.0.clone(), event.clone()));
+    }
+    /// v1.43：窗口快照变更通知记录（同步钩子）。
+    fn on_windows_changed(&self, windows: &[crate::peer::WindowInfo]) {
+        self.windows_changed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(windows.to_vec());
     }
 }
 
@@ -9239,6 +9264,11 @@ struct PeerCtx {
     /// v1.42：on_peer_reply 的 (conv, body) 全记录（窗口回信通知钩子——只有
     /// handle_peer_inbound 触发，其余 peer 路径必须为空）。
     peer_replies: SentHandle,
+    /// v1.43：on_window_event 的 (conv, event) 全记录（窗口事件推送钩子——只有
+    /// 过了推送闸门的 handle_peer_report / publish_window_event 触发）。
+    window_events: WindowEventsHandle,
+    /// v1.43：on_windows_changed 的快照全记录（peer 轮询回调的转发落点）。
+    windows_changed: Arc<std::sync::Mutex<Vec<Vec<crate::peer::WindowInfo>>>>,
 }
 
 /// 自建带观测句柄的 dispatcher（MockPlatform::new_with_errors 供 error 帧
@@ -9247,6 +9277,8 @@ async fn build_peer_ctx() -> PeerCtx {
     let _ = std::fs::create_dir_all("/tmp/imagent-test-ws");
     let (plat, inbox, _send_count, errors, sent, user_sent) = MockPlatform::new_with_errors();
     let peer_replies = plat.peer_replies.clone();
+    let window_events = plat.window_events.clone();
+    let windows_changed = plat.windows_changed.clone();
     let (back, calls, _prompts, _order) = MockBackend::new();
     let (store, _db) = tmp_store().await;
     let auth = Auth::new(vec!["u1".into()]);
@@ -9271,7 +9303,52 @@ async fn build_peer_ctx() -> PeerCtx {
         sent,
         user_sent,
         peer_replies,
+        window_events,
+        windows_changed,
     }
+}
+
+/// v1.43 钩子上报用例的底座：起一个 mock 交互窗口 + 注入带共享态的出站句柄
+/// （返回窗口句柄——用例持有它的 sessionId）。
+async fn peer_ctx_with_window(name: &str) -> (PeerCtx, PeerMockWindow, Arc<PeerSender>) {
+    let ctx = build_peer_ctx().await;
+    let win = peer_mock_window(name).await;
+    let sender = Arc::new(PeerSender::new(
+        win.registry_dir.clone(),
+        win.base.join("own.sock"),
+        "im-agent".to_string(),
+    ));
+    ctx.disp.set_peer_sender(Some(sender.clone()));
+    (ctx, win, sender)
+}
+
+/// 追加一条注册表条目（v1.43 上报反查的排除项：无头会话 / 后台作业 / 已退出
+/// 的窗口——条目字段可控，socket 是否为活由调用方决定）。
+fn peer_write_entry(
+    registry_dir: &std::path::Path,
+    pid: u32,
+    name: &str,
+    sock: &std::path::Path,
+    session_id: &str,
+    entrypoint: &str,
+    kind: &str,
+) {
+    let entry = serde_json::json!({
+        "pid": pid,
+        "sessionId": session_id,
+        "cwd": "/tmp",
+        "startedAt": 1_700_000_000_000i64,
+        "version": "claude",
+        "peerProtocol": 1,
+        "kind": kind,
+        "entrypoint": entrypoint,
+        "messagingSocketPath": sock.to_string_lossy(),
+        "name": name,
+        "nameSource": "derived",
+        "status": "busy",
+    });
+    std::fs::write(registry_dir.join(format!("{pid}.json")), entry.to_string())
+        .expect("write entry");
 }
 
 /// mock 窗口 socket 基目录唯一序号（同进程并行测试防撞）。
@@ -9280,14 +9357,23 @@ static PEER_TMP_SEQ: AtomicUsize = AtomicUsize::new(0);
 struct PeerMockWindow {
     registry_dir: PathBuf,
     base: PathBuf,
+    /// 条目的 sessionId（v1.43 钩子上报用例按它反查窗口）。
+    session_id: String,
     frames: Arc<TokioMutex<Vec<String>>>,
     _task: tokio::task::JoinHandle<()>,
 }
 
-/// 起 mock 窗口：写注册条目（entrypoint=claude）+ bind socket + accept 循环
-/// （收一帧记一行 → 不回写任何字节、直接关闭——网关 send_frame 读到对端关闭
-/// 才返回，「关闭」本身即送达信号）。
+/// 起 mock 窗口：写注册条目（entrypoint=cli——真实交互窗口的取值；窗口认定
+/// 是白名单 `PeerEntry::is_window`，夹具不能写别的值）+ bind socket + accept
+/// 循环（收一帧记一行 → 不回写任何字节、直接关闭——网关 send_frame 读到对端
+/// 关闭才返回，「关闭」本身即送达信号）。
 async fn peer_mock_window(name: &str) -> PeerMockWindow {
+    peer_mock_window_as(name, &uuid::Uuid::new_v4().to_string()).await
+}
+
+/// [`peer_mock_window`] 的 sessionId 指定形态（v1.43 钩子上报按 sessionId 反查
+/// 窗口，用例须持有该 id）。
+async fn peer_mock_window_as(name: &str, session_id: &str) -> PeerMockWindow {
     let seq = PEER_TMP_SEQ.fetch_add(1, Ordering::SeqCst);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -9304,13 +9390,13 @@ async fn peer_mock_window(name: &str) -> PeerMockWindow {
     // 注册条目（与真实 claude 窗口条目同构；messagingSocketPath 指向 mock sock）。
     let entry = serde_json::json!({
         "pid": 9100 + u32::try_from(seq).unwrap_or(0),
-        "sessionId": uuid::Uuid::new_v4().to_string(),
+        "sessionId": session_id,
         "cwd": "/tmp",
         "startedAt": 1_700_000_000_000i64,
         "version": "claude",
         "peerProtocol": 1,
         "kind": "interactive",
-        "entrypoint": "claude",
+        "entrypoint": "cli",
         "messagingSocketPath": sock.to_string_lossy(),
         "name": name,
         "nameSource": "derived",
@@ -9360,6 +9446,7 @@ async fn peer_mock_window(name: &str) -> PeerMockWindow {
     PeerMockWindow {
         registry_dir,
         base,
+        session_id: session_id.to_string(),
         frames,
         _task: task,
     }
@@ -9776,6 +9863,367 @@ async fn peer_inbound_replies_direct_to_peer_conv() {
         ],
         "每条入站回复各触发一次，body 原样透传"
     );
+}
+
+// ---------- v1.43 Stop 钩子上报 + 窗口看板转发（peer 通道）----------
+//
+// 钩子对本机所有 Claude Code 会话的每一轮收尾触发，网关侧必须按注册表过滤、
+// 去重后才注入 peer:<窗口名> 会话；推送另走 on_window_event（不复用
+// on_peer_reply——那是「窗口回信了」）。
+
+use crate::peer::{
+    WindowEvent, WindowEventKind, WindowInfo, WindowStatus, HOOK_MESSAGE_MAX_CHARS,
+    HOOK_TRUNCATED_MARK,
+};
+
+/// 注入文本的固定抬头（契约钉死）。
+const REPORT_HEADER: &str = "📋 本轮结束（自动同步）\n\n";
+
+/// 注册表里有该 sessionId 的活窗口 → 结论注入 `peer:<窗口名>` 会话（走普通
+/// reply：send_text 链路、不驱动 agent、不标成用户文本）；`on_peer_reply`
+/// **零次**（上报不是窗口回信——走它会再发一条 peer_reply 推送）；窗口零帧
+/// （上报是单向的，绝不回发）。正文只 trim 首尾、**保留内部换行**（它是窗口
+/// claude 的最终回复，驾驶舱按 markdown 渲染）。
+#[tokio::test]
+async fn peer_report_injects_turn_summary_without_peer_reply_hook() {
+    let _g = SERIAL.lock().await;
+    let (ctx, win, _sender) = peer_ctx_with_window("win-r").await;
+    ctx.disp
+        .handle_peer_report(&win.session_id, "  已修好构建。\n\n改动两处：\n- a\n- b  ")
+        .await;
+    assert!(
+        ctx.calls.lock().await.is_empty(),
+        "上报不驱动 agent：{:?}",
+        *ctx.calls.lock().await
+    );
+    assert_eq!(
+        ctx.sent.lock().await.as_slice(),
+        &[(
+            "peer:win-r".to_string(),
+            format!("{REPORT_HEADER}已修好构建。\n\n改动两处：\n- a\n- b")
+        )],
+        "恰一条 send_text 落 peer:win-r，正文保留换行"
+    );
+    assert!(
+        ctx.user_sent.lock().await.is_empty(),
+        "上报是窗口 claude 的话，不得标成用户自发文本"
+    );
+    assert!(
+        ctx.peer_replies.lock().await.is_empty(),
+        "上报不得触发 on_peer_reply（会再发一条 peer_reply 推送）：{:?}",
+        *ctx.peer_replies.lock().await
+    );
+    assert!(
+        ctx.window_events.lock().await.is_empty(),
+        "未关注、未对话过的窗口：注入但不推送"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        win.frames.lock().await.is_empty(),
+        "上报绝不向窗口回发任何消息"
+    );
+    let _ = std::fs::remove_dir_all(&win.base);
+}
+
+/// 注册表反查是安全闸：sessionId 没登记、登记的不是窗口（网关自己的无头
+/// 会话 `sdk-cli`——带活套接字；后台作业 `bg`；网关自身条目）、或窗口已退出
+/// （死套接字）→ 什么都不做。否则网关自己每一轮的结论都会被当成窗口结论
+/// 注入驾驶舱。
+#[tokio::test]
+async fn peer_report_ignores_sessions_that_are_not_live_windows() {
+    let _g = SERIAL.lock().await;
+    let (ctx, win, _sender) = peer_ctx_with_window("win-s").await;
+    let sock_dir = win.base.join("s");
+    // 网关用 claude-cli 引擎跑的一轮：无头会话，带活套接字（同进程监听即活）。
+    let headless_sock = sock_dir.join("9191.sock");
+    let _headless_listener = tokio::net::UnixListener::bind(&headless_sock).unwrap();
+    peer_write_entry(
+        &win.registry_dir,
+        9191,
+        "imagent-34",
+        &headless_sock,
+        "s-headless",
+        "sdk-cli",
+        "interactive",
+    );
+    // 后台作业（活套接字）、网关自身条目（活套接字）、已退出的窗口（死套接字）。
+    let bg_sock = sock_dir.join("9192.sock");
+    let _bg_listener = tokio::net::UnixListener::bind(&bg_sock).unwrap();
+    peer_write_entry(
+        &win.registry_dir,
+        9192,
+        "bg-job",
+        &bg_sock,
+        "s-bg",
+        "cli",
+        "bg",
+    );
+    let gw_sock = sock_dir.join("9193.sock");
+    let _gw_listener = tokio::net::UnixListener::bind(&gw_sock).unwrap();
+    peer_write_entry(
+        &win.registry_dir,
+        9193,
+        "imagent",
+        &gw_sock,
+        "s-gw",
+        "imagent",
+        "interactive",
+    );
+    peer_write_entry(
+        &win.registry_dir,
+        9194,
+        "gone",
+        &sock_dir.join("dead.sock"),
+        "s-dead",
+        "cli",
+        "interactive",
+    );
+
+    for sid in ["not-registered", "s-headless", "s-bg", "s-gw", "s-dead", ""] {
+        ctx.disp.handle_peer_report(sid, "这一轮的结论").await;
+    }
+    assert!(ctx.calls.lock().await.is_empty());
+    assert!(
+        ctx.sent.lock().await.is_empty(),
+        "非交互窗口的上报不得落任何文本：{:?}",
+        *ctx.sent.lock().await
+    );
+    assert!(ctx.inbox.lock().await.is_empty());
+    assert!(ctx.peer_replies.lock().await.is_empty());
+    assert!(ctx.window_events.lock().await.is_empty());
+    let _ = std::fs::remove_dir_all(&win.base);
+}
+
+/// 去重之一：正文归一化（trim、空白折叠）后为空 → 不注入；推送仍按闸门
+/// （关注的窗口确实跑完了一轮，结论为空也是新信息）。
+#[tokio::test]
+async fn peer_report_blank_body_not_injected() {
+    let _g = SERIAL.lock().await;
+    let (ctx, win, sender) = peer_ctx_with_window("win-b").await;
+    ctx.disp.handle_peer_report(&win.session_id, " \n\t ").await;
+    assert!(ctx.sent.lock().await.is_empty(), "空白正文不注入");
+    assert!(
+        ctx.window_events.lock().await.is_empty(),
+        "未关注的窗口：空白正文连推送也没有"
+    );
+    // 关注后：仍不注入，但走推送闸门。
+    sender.state().set_watched("win-b", true);
+    ctx.disp.handle_peer_report(&win.session_id, "\n").await;
+    assert!(ctx.sent.lock().await.is_empty(), "空白正文始终不注入");
+    assert_eq!(
+        ctx.window_events.lock().await.as_slice(),
+        &[(
+            "peer:win-b".to_string(),
+            WindowEvent {
+                name: "win-b".into(),
+                kind: WindowEventKind::TurnEnd,
+                waiting_for: None,
+                push: true,
+            }
+        )],
+        "关注过的窗口跑完一轮（哪怕结论为空）→ 推送"
+    );
+    let _ = std::fs::remove_dir_all(&win.base);
+}
+
+/// 去重之二：窗口刚经 peer 通道回过同一段话（驾驶舱已收到、`peer_reply`
+/// 推送已发）→ 钩子上报既不注入也不推送；内容不同的上报照常注入 + 推送。
+#[tokio::test]
+async fn peer_report_duplicate_of_recent_inbound_skips_inject_and_push() {
+    let _g = SERIAL.lock().await;
+    let (ctx, win, sender) = peer_ctx_with_window("win-d").await;
+    sender.state().set_watched("win-d", true);
+    // 窗口回信：空白形态与钩子正文不同，归一化后互为前缀（窗口只发了结论段）。
+    ctx.disp
+        .handle_peer_inbound("win-d", "  已修好构建，\n测试全绿  ")
+        .await;
+    ctx.disp
+        .handle_peer_report(&win.session_id, "已修好构建， 测试全绿。详见 diff")
+        .await;
+    assert_eq!(
+        ctx.sent.lock().await.len(),
+        1,
+        "只有窗口自己那条回信，上报不再注入：{:?}",
+        *ctx.sent.lock().await
+    );
+    assert_eq!(
+        ctx.peer_replies.lock().await.len(),
+        1,
+        "peer_reply 推送只来自窗口回信本身"
+    );
+    assert!(
+        ctx.window_events.lock().await.is_empty(),
+        "重复的上报不推送（peer_reply 推送已发）"
+    );
+    // 内容不同的上报：注入（回信后首次）+ 推送。
+    ctx.disp
+        .handle_peer_report(&win.session_id, "又跑了一轮：文档也更新了")
+        .await;
+    assert_eq!(ctx.sent.lock().await.len(), 2, "不重复的上报照常注入");
+    assert_eq!(
+        ctx.peer_replies.lock().await.len(),
+        1,
+        "上报仍不触发 on_peer_reply"
+    );
+    assert_eq!(
+        ctx.window_events.lock().await.len(),
+        1,
+        "不重复的上报照常推送"
+    );
+    let _ = std::fs::remove_dir_all(&win.base);
+}
+
+/// 推送闸门：未关注、未对话过 → 只注入不推送；关注后推送；驾驶舱给它发过
+/// 消息（`send_to_window` 成功即登记 contacted）→ 推送；投递失败不登记。
+#[tokio::test]
+async fn peer_report_pushes_only_for_watched_or_contacted() {
+    let _g = SERIAL.lock().await;
+    // ① 未关注、未对话过。
+    let (ctx, win, sender) = peer_ctx_with_window("win-p").await;
+    ctx.disp
+        .handle_peer_report(&win.session_id, "第一轮结论")
+        .await;
+    assert_eq!(ctx.sent.lock().await.len(), 1, "照常注入");
+    assert!(ctx.window_events.lock().await.is_empty(), "不推送");
+    // ② 关注后（第二轮在 20 秒注入节流内：不注入，只走推送）。
+    sender.state().set_watched("win-p", true);
+    ctx.disp
+        .handle_peer_report(&win.session_id, "第二轮结论")
+        .await;
+    assert_eq!(ctx.sent.lock().await.len(), 1, "20 秒注入节流内不重复注入");
+    assert_eq!(
+        ctx.window_events.lock().await.as_slice(),
+        &[(
+            "peer:win-p".to_string(),
+            WindowEvent {
+                name: "win-p".into(),
+                kind: WindowEventKind::TurnEnd,
+                waiting_for: None,
+                push: true,
+            }
+        )],
+        "关注过的窗口跑完一轮 → on_window_event(TurnEnd, push)"
+    );
+    let _ = std::fs::remove_dir_all(&win.base);
+
+    // ③ 驾驶舱给它发过消息 → contacted（无需关注）。
+    let (ctx, win, sender) = peer_ctx_with_window("win-q").await;
+    // 投递失败（窗口不存在）不登记。
+    assert!(sender.send_to_window("ghost-window", "hi").await.is_err());
+    assert!(
+        !sender
+            .state()
+            .should_push_turn_end("ghost-window", std::time::Instant::now()),
+        "投递失败不算对话过"
+    );
+    sender
+        .send_to_window("win-q", "帮我看下构建")
+        .await
+        .unwrap();
+    assert!(
+        win.wait_frame().await.contains("帮我看下构建"),
+        "投递成功后才登记 contacted"
+    );
+    ctx.disp
+        .handle_peer_report(&win.session_id, "构建已通过")
+        .await;
+    assert_eq!(
+        ctx.window_events.lock().await.len(),
+        1,
+        "对话过的窗口跑完一轮 → 推送"
+    );
+    let _ = std::fs::remove_dir_all(&win.base);
+}
+
+/// 注入节流：同一窗口 20 秒内的后续上报只走推送闸门、不再往会话里注入。
+#[tokio::test]
+async fn peer_report_inject_throttled_per_window() {
+    let _g = SERIAL.lock().await;
+    let (ctx, win, _sender) = peer_ctx_with_window("win-t").await;
+    ctx.disp
+        .handle_peer_report(&win.session_id, "第一轮结论")
+        .await;
+    ctx.disp
+        .handle_peer_report(&win.session_id, "第二轮结论")
+        .await;
+    ctx.disp
+        .handle_peer_report(&win.session_id, "第三轮结论")
+        .await;
+    assert_eq!(
+        ctx.sent.lock().await.as_slice(),
+        &[(
+            "peer:win-t".to_string(),
+            format!("{REPORT_HEADER}第一轮结论")
+        )],
+        "20 秒内只注入一次"
+    );
+    let _ = std::fs::remove_dir_all(&win.base);
+}
+
+/// 超长正文：按字符截到上限并追加截断标记（不劈半个字符）。
+#[tokio::test]
+async fn peer_report_clips_overlong_body() {
+    let _g = SERIAL.lock().await;
+    let (ctx, win, _sender) = peer_ctx_with_window("win-l").await;
+    let body: String = "长".repeat(HOOK_MESSAGE_MAX_CHARS + 5);
+    ctx.disp.handle_peer_report(&win.session_id, &body).await;
+    let sent = ctx.sent.lock().await;
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].0, "peer:win-l");
+    let text = &sent[0].1;
+    let head: String = text.chars().take(40).collect();
+    assert!(text.starts_with(REPORT_HEADER), "开头：{head}");
+    let clipped = text.strip_prefix(REPORT_HEADER).expect("带抬头");
+    assert_eq!(
+        clipped.chars().count(),
+        HOOK_MESSAGE_MAX_CHARS + HOOK_TRUNCATED_MARK.chars().count(),
+        "上限 + 标记"
+    );
+    assert!(clipped.ends_with(HOOK_TRUNCATED_MARK));
+    assert!(clipped.starts_with(&"长".repeat(100)));
+    let _ = std::fs::remove_dir_all(&win.base);
+}
+
+/// 轮询回调的转发落点：快照 → `on_windows_changed`（原样）；事件 →
+/// `on_window_event`（组 `peer:<窗口名>` 会话；`push == false` 的事件不转——
+/// 是否推送由这里判定，main 的闭包只管 spawn）。
+#[tokio::test]
+async fn publish_windows_forwards_snapshots_and_pushable_events() {
+    let ctx = build_peer_ctx().await;
+    let windows = vec![WindowInfo {
+        name: "win-x".to_string(),
+        status: WindowStatus::Waiting,
+        waiting_for: Some("dialog open".into()),
+        cwd: "/tmp".into(),
+        started_at: Some(1),
+        status_updated_at: Some(2),
+        watched: true,
+    }];
+    ctx.disp.publish_windows_changed(&windows);
+    assert_eq!(
+        ctx.windows_changed.lock().unwrap().as_slice(),
+        &[windows.clone()],
+        "快照原样转给平台钩子"
+    );
+    let event = |push| WindowEvent {
+        name: "win-x".into(),
+        kind: WindowEventKind::Waiting,
+        waiting_for: Some("dialog open".into()),
+        push,
+    };
+    ctx.disp.publish_window_event(event(true)).await;
+    assert_eq!(
+        ctx.window_events.lock().await.as_slice(),
+        &[("peer:win-x".to_string(), event(true))],
+        "可推送事件转给平台钩子，会话 = peer:<窗口名>"
+    );
+    ctx.disp.publish_window_event(event(false)).await;
+    assert_eq!(
+        ctx.window_events.lock().await.len(),
+        1,
+        "push == false 的事件不转给平台"
+    );
+    assert!(ctx.sent.lock().await.is_empty(), "通知钩子不得产生出站文本");
 }
 
 // ---------- v1.41.3 /rm（会话删除命令）----------

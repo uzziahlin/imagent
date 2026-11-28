@@ -69,6 +69,15 @@
 //! 再经子平台的 default 降级，web 会话的强提醒因此漏成驾驶舱的一条普通
 //! 文本。审批催办仍走 `send_urgent_text` 的归属 + 镜像路由（依赖 default
 //! 降级把文本送到纯文本平台），两者语义不同，不合并。
+//!
+//! ## 窗口看板通知：快照广播、事件按归属路由（v1.43）
+//!
+//! 本地窗口快照 [`Platform::on_windows_changed`] 是**机器级**数据（本机有哪些
+//! Claude Code 窗口、各自什么状态），不属于任何会话——走 B 类**广播全部子
+//! 平台**（与 `on_workdir_changed` 同款；default no-op 的 IM 平台零成本）。窗口
+//! 事件 [`Platform::on_window_event`] 带 `peer:<窗口名>` 会话，走 A 类归属路由
+//! ——`peer:` 经 [`MultiPlatform::child_for`] 的特判落 web（推送埋点在 web 子
+//! 平台，同 `on_peer_reply`）。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -638,6 +647,27 @@ impl Platform for MultiPlatform {
         }
     }
 
+    /// v1.43 本地窗口快照变更：**广播全部子平台**（default no-op——IM 平台零
+    /// 成本；web 覆写为 `windows` 帧推送）。窗口清单是机器级数据、不属于任何
+    /// 会话，没有「归属平台」可路由——按归属路由会让看板在多平台装配下整个
+    /// 消失（`peer:` 之外的窗口事件同样无归属）。语义同
+    /// [`Self::on_workdir_changed`]。
+    fn on_windows_changed(&self, windows: &[crate::peer::WindowInfo]) {
+        for c in &self.children {
+            c.on_windows_changed(windows);
+        }
+    }
+
+    /// v1.43 窗口事件推送（跑完一轮 / 进入 waiting）：按 conv 归属路由（`peer:`
+    /// conv 经 [`Self::child_for`] 特判主路由 web——推送埋点在 web 子平台；IM
+    /// 平台 default no-op）。无返回值，无命中前缀静默跳过（对齐
+    /// [`Self::on_peer_reply`] 的钩子语义：web 不在 children 时无处可推）。
+    async fn on_window_event(&self, conv: &ConvId, event: &crate::peer::WindowEvent) {
+        if let Ok(child) = self.child_for(conv) {
+            child.on_window_event(conv, event).await;
+        }
+    }
+
     /// v1.42.1 长任务完成提醒：按 conv 归属路由（`peer:` conv 经 [`Self::child_for`]
     /// 特判落 web——同样无事发生），**不镜像**。不走 [`Self::route_with_mirror`]：
     /// 完成提醒只对能加急振铃的平台有意义——驾驶舱终态卡页脚已含时长 / 成本，
@@ -704,6 +734,13 @@ mod tests {
         /// 测试用（conv / body 须原样透传给子平台，web 据此取 `peer:<窗口名>`
         /// 作 push_notify 的 convId）。
         peer_replies: Arc<TokioMutex<Vec<(String, String)>>>,
+        /// v1.43：on_windows_changed 的快照记录（每次调用存一份全量快照）——
+        /// 「机器级数据广播全部子平台」的断言用。同步钩子里不能 await，用 std
+        /// Mutex（临界区只有一次 push）。
+        windows_changed: Arc<std::sync::Mutex<Vec<Vec<crate::peer::WindowInfo>>>>,
+        /// v1.43：on_window_event 的 (conv, event) 记录——按 conv 归属路由的断言
+        /// 用（web 据此取 `peer:<窗口名>` 作 push_notify 的 convId）。
+        window_events: Arc<TokioMutex<Vec<(String, crate::peer::WindowEvent)>>>,
     }
 
     /// 构造全参数 mock（mock / mock_opt 的公共实现）。
@@ -732,6 +769,8 @@ mod tests {
             errors: Arc::new(TokioMutex::new(Vec::new())),
             user_sent: Arc::new(TokioMutex::new(Vec::new())),
             peer_replies: Arc::new(TokioMutex::new(Vec::new())),
+            windows_changed: Arc::new(std::sync::Mutex::new(Vec::new())),
+            window_events: Arc::new(TokioMutex::new(Vec::new())),
         });
         (p, tx, sent)
     }
@@ -857,6 +896,20 @@ mod tests {
                 .lock()
                 .await
                 .push((conv.0.clone(), body.to_string()));
+        }
+        /// v1.43：窗口快照通知记录（纯通知——不进 sent，不产生出站文本）。
+        fn on_windows_changed(&self, windows: &[crate::peer::WindowInfo]) {
+            self.windows_changed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(windows.to_vec());
+        }
+        /// v1.43：窗口事件通知记录（纯通知——不进 sent）。
+        async fn on_window_event(&self, conv: &ConvId, event: &crate::peer::WindowEvent) {
+            self.window_events
+                .lock()
+                .await
+                .push((conv.0.clone(), event.clone()));
         }
         async fn send_media(
             &self,
@@ -1148,6 +1201,135 @@ mod tests {
         assert!(
             a.peer_replies.lock().await.is_empty() && b.peer_replies.lock().await.is_empty(),
             "无 web 子平台时窗口回信通知静默跳过"
+        );
+    }
+
+    /// 窗口快照 / 事件夹具（v1.43 两条用例共用）。
+    fn sample_windows() -> Vec<crate::peer::WindowInfo> {
+        use crate::peer::{WindowInfo, WindowStatus};
+        vec![
+            WindowInfo {
+                name: "win-a".into(),
+                status: WindowStatus::Busy,
+                waiting_for: None,
+                cwd: "/tmp/a".into(),
+                started_at: Some(20),
+                status_updated_at: Some(200),
+                watched: true,
+            },
+            WindowInfo {
+                name: "win-b".into(),
+                status: WindowStatus::Waiting,
+                waiting_for: Some("dialog open".into()),
+                cwd: "/tmp/b".into(),
+                started_at: Some(10),
+                status_updated_at: Some(100),
+                watched: false,
+            },
+        ]
+    }
+
+    /// 用例（v1.43）：窗口快照通知 on_windows_changed **广播到全部子平台**——窗口
+    /// 清单是机器级数据，不属于任何会话；只投 web 的话，未装配 web 的组合
+    /// （或将来另一个有驾驶舱视图的平台）就看不到它。快照原样透传；通知钩子
+    /// 不产生任何出站文本。
+    #[tokio::test]
+    async fn windows_changed_broadcasts_to_all_children() {
+        let (w, _wtx, w_sent) = mock_opt("web", true, true);
+        let (f, _ftx, f_sent) = mock_opt("feishu", false, true);
+        let (l, _ltx, l_sent) = mock_opt("local", false, true);
+        let m = MultiPlatform::new(vec![w.clone(), f.clone(), l.clone()])
+            .expect("合并 web+feishu+local");
+
+        let windows = sample_windows();
+        m.on_windows_changed(&windows);
+        for child in [&w, &f, &l] {
+            let seen = child
+                .windows_changed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                seen.as_slice(),
+                &[windows.clone()],
+                "每个子平台都收到同一份完整快照（{}）",
+                child.name
+            );
+        }
+        assert!(
+            w_sent.lock().await.is_empty()
+                && f_sent.lock().await.is_empty()
+                && l_sent.lock().await.is_empty(),
+            "窗口快照通知不得产生出站文本"
+        );
+
+        // 单平台退化形态（children 里没有 web）照样送达：不依赖任何平台名特判。
+        let (a, _atx, _a_sent) = mock_opt("a", false, true);
+        let (b, _btx, _b_sent) = mock_opt("b", false, true);
+        let m2 = MultiPlatform::new(vec![a.clone(), b.clone()]).expect("合并 a+b");
+        m2.on_windows_changed(&windows);
+        assert_eq!(
+            a.windows_changed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            1,
+            "无 web 子平台的组合同样广播"
+        );
+    }
+
+    /// 用例（v1.43）：窗口事件 on_window_event 按 conv 归属路由——`peer:` conv
+    /// 主路由 web 子平台（推送埋点在 web），conv / event 原样透传；feishu 不收；
+    /// 非 peer conv 按前缀归属（web 不误收）；web 不在 children 时静默跳过。
+    #[tokio::test]
+    async fn window_event_routes_to_web_child() {
+        use crate::peer::{WindowEvent, WindowEventKind};
+        let (w, _wtx, w_sent) = mock_opt("web", true, true);
+        let (f, _ftx, _f_sent) = mock_opt("feishu", false, true);
+        let m = MultiPlatform::new(vec![w.clone(), f.clone()]).expect("合并 web+feishu");
+
+        let ev = WindowEvent {
+            name: "win-a".into(),
+            kind: WindowEventKind::TurnEnd,
+            waiting_for: None,
+            push: true,
+        };
+        m.on_window_event(&ConvId("peer:win-a".into()), &ev).await;
+        assert_eq!(
+            w.window_events.lock().await.as_slice(),
+            &[("peer:win-a".to_string(), ev.clone())],
+            "peer: 的窗口事件主路由 web 子平台，conv / event 原样透传"
+        );
+        assert!(
+            f.window_events.lock().await.is_empty(),
+            "feishu 不收窗口事件"
+        );
+        // 通知钩子不得退化成出站文本（send_text / send_user_text 均零次）。
+        assert!(
+            w_sent.lock().await.is_empty() && w.user_sent.lock().await.is_empty(),
+            "窗口事件通知不得产生出站文本"
+        );
+
+        // 非 peer conv：按前缀归属（feishu 收，web 不误收）。
+        m.on_window_event(&ConvId("feishu:ou_x".into()), &ev).await;
+        assert_eq!(
+            f.window_events.lock().await.as_slice(),
+            &[("feishu:ou_x".to_string(), ev.clone())],
+            "非 peer conv 按前缀归属路由"
+        );
+        assert_eq!(
+            w.window_events.lock().await.len(),
+            1,
+            "web 不收其它平台 conv 的窗口事件"
+        );
+
+        // web 不在 children：peer: conv 无归属，静默跳过（不 panic、不落任何子平台）。
+        let (a, _atx, _a_sent) = mock_opt("a", false, true);
+        let (b, _btx, _b_sent) = mock_opt("b", false, true);
+        let m2 = MultiPlatform::new(vec![a.clone(), b.clone()]).expect("合并 a+b");
+        m2.on_window_event(&ConvId("peer:win-a".into()), &ev).await;
+        assert!(
+            a.window_events.lock().await.is_empty() && b.window_events.lock().await.is_empty(),
+            "无 web 子平台时窗口事件静默跳过"
         );
     }
 

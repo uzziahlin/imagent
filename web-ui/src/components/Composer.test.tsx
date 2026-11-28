@@ -6,11 +6,14 @@
 // v1.42 草稿按会话隔离：Composer 必填 drafts / draftKey 两个 props——既有用例
 // 统一经 mount / mountAsr / mountPanel 注入一个不落盘的 store（storage: null，
 // 用例间不经 localStorage 串草稿）；带 rerender 的用例须复用同一个 store 实例。
+// v1.43 完整命令名回车直接发送：面板打开时命令名已敲全（恰为高亮那条）的回车走
+// 发送而不是补全；前缀 / 高亮换条目 / Tab 的补全行为不变。
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Composer } from "./Composer";
 import type { AsrUiEvent, MediaPayload, ModelsInfo } from "../lib/protocol";
 import { createDraftStore, draftKey } from "../lib/drafts";
+import { filterCommands } from "../lib/commands";
 
 // 压缩 fake：vi.hoisted 提升到 import 解析前可用（vi.mock 工厂在 Composer
 // 模块加载时即执行）；可注入断言/失败态，默认成功返回固定载荷。
@@ -144,6 +147,90 @@ describe("Composer 命令面板（v1.7）", () => {
     expect(panel()).toBeNull();
     key(ta, "Enter");
     expect(onSend).toHaveBeenCalledWith("/zzz", undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.43 完整命令名 + Enter 直接发送：命令面板打开时 Enter 原先一律走补全（补一个
+// 空格），把命令名完整敲出来再回车（/stop、/peers、/tasks …）什么都没发，要按
+// 两次。现在「去首尾空白后恰好等于高亮那条命令名」时不补全，落到发送分支；只敲了
+// 前缀 / 高亮换了条目 / 按 Tab 的照旧补全。
+// ---------------------------------------------------------------------------
+
+describe("Composer 命令面板：完整命令名回车直接发送（v1.43）", () => {
+  it("① 完整命令名 + Enter → 一次回车直接发送，输入框清空", () => {
+    const onSend = vi.fn(() => true);
+    const { ta } = mount(onSend);
+    for (const cmd of ["/stop", "/peers", "/tasks", "/status", "/help"]) {
+      type(ta, cmd);
+      expect(panel(), cmd).toBeTruthy(); // 面板开着：命令名是自己那条候选的前缀
+      key(ta, "Enter");
+      expect(ta.value, cmd).toBe("");
+      expect(onSend).toHaveBeenLastCalledWith(cmd, undefined);
+      expect(panel(), cmd).toBeNull();
+    }
+    expect(onSend).toHaveBeenCalledTimes(5);
+  });
+
+  it("② 只敲前缀 + Enter → 仍然补全（`/pe` → `/peers `），不发送", () => {
+    const onSend = vi.fn(() => true);
+    const { ta } = mount(onSend);
+    type(ta, "/pe");
+    key(ta, "Enter");
+    expect(ta.value).toBe("/peers ");
+    expect(onSend).not.toHaveBeenCalled();
+    // 补全后是参数输入态（含空白）：面板关闭，此时的回车才是发送
+    expect(panel()).toBeNull();
+  });
+
+  it("③ 完整命令名 + Tab → 仍然只补全（`/stop` → `/stop `），不发送", () => {
+    const onSend = vi.fn(() => true);
+    const { ta } = mount(onSend);
+    type(ta, "/stop");
+    key(ta, "Tab");
+    expect(ta.value).toBe("/stop ");
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("④ 完整命令名但用 ↓ 把高亮移到别的条目 + Enter → 补全的是高亮那条，不发送", () => {
+    const onSend = vi.fn(() => true);
+    const { ta } = mount(onSend);
+    type(ta, "/stop");
+    // /stop 的候选里还有描述含「stop」的条目（首候选是 /stop 本身）
+    const names = filterCommands("/stop").map((c) => c.name);
+    expect(names[0]).toBe("/stop");
+    expect(names.length).toBeGreaterThan(1);
+    key(ta, "ArrowDown");
+    key(ta, "Enter");
+    expect(ta.value).toBe(`${names[1]} `);
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("⑤ 完整命令名 + Enter 但未发出（onSend 返回 false）：输入保留、面板仍在；再按回车仍是发送而不是补全", () => {
+    const onSend = vi.fn().mockReturnValueOnce(false).mockReturnValue(true);
+    const { ta } = mount(onSend);
+    type(ta, "/stop");
+    key(ta, "Enter");
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend).toHaveBeenLastCalledWith("/stop", undefined);
+    expect(ta.value).toBe("/stop");
+    expect(panel()).toBeTruthy();
+    key(ta, "Enter");
+    expect(onSend).toHaveBeenCalledTimes(2);
+    expect(ta.value).toBe("");
+  });
+
+  it("Shift+Enter 不受影响：完整命令名上既不发送也不补全（换行交给输入框默认行为，jsdom 不模拟插入）", () => {
+    const onSend = vi.fn(() => true);
+    const { ta } = mount(onSend);
+    type(ta, "/stop");
+    fireEvent.keyDown(ta, { key: "Enter", shiftKey: true });
+    expect(ta.value).toBe("/stop"); // 没被补成 "/stop "
+    expect(onSend).not.toHaveBeenCalled();
+    // 面板仍开着：随后松开 Shift 的回车才是发送
+    expect(panel()).toBeTruthy();
+    key(ta, "Enter");
+    expect(onSend).toHaveBeenCalledWith("/stop", undefined);
   });
 });
 

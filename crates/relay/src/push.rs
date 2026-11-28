@@ -6,8 +6,10 @@
 //! → 系统 Web Push 服务（浏览器/OS 层）。载荷字段为元数据（kind/convId/
 //! machine）+ `title`——**title 是网关按契约截的 ≤32 码点摘要，明文经中继**
 //! （终态卡 task / 审批工具名；v1.42 起含窗口回信正文的开头，kind=
-//! `peer_reply`）。业务正文本体仍由 E2E 加密、中继不可见，但这截摘要不在
-//! 盲化范围内——既有设计的已知取舍，不是「无消息内容」。
+//! `peer_reply`；v1.43 起两个窗口事件的 title 是窗口名本身，kind=
+//! `window_turn_end` / `window_waiting`——不涉正文）。业务正文本体仍由 E2E
+//! 加密、中继不可见，但这截摘要不在盲化范围内——既有设计的已知取舍，不是
+//! 「无消息内容」。
 //!
 //! 路由语义（任务定案的简化且正确形态）：订阅按 session 绑定，中继不知
 //! conv↔session 归属——**广播给全部有订阅的 session**（单用户多设备场景，
@@ -74,7 +76,7 @@ const DELIVER_TIMEOUT: Duration = Duration::from_secs(15);
 // push_notify 管理帧（网关 → 中继，明文——title 的盲化边界见模块头）
 // ---------------------------------------------------------------------------
 
-/// 帧的 kind（共享契约：v1.10 三值 + v1.42 `peer_reply`）。
+/// 帧的 kind（共享契约：v1.10 三值 + v1.42 `peer_reply` + v1.43 两个窗口事件）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NotifyKind {
     /// 回合终态（card terminal done）。
@@ -86,6 +88,12 @@ pub(crate) enum NotifyKind {
     /// v1.42 窗口回信（peer 入站回复已落 `peer:<窗口名>` 会话；convId 为该
     /// peer 会话，title 为回信正文开头 ≤32 码点）。
     PeerReply,
+    /// v1.43 本地窗口跑完一轮（被关注或对话过的窗口；convId 为 `peer:<窗口名>`，
+    /// title 为窗口名）。
+    WindowTurnEnd,
+    /// v1.43 本地窗口进入 waiting——卡住等人（所有窗口都推；convId / title
+    /// 同上）。
+    WindowWaiting,
 }
 
 impl NotifyKind {
@@ -95,6 +103,8 @@ impl NotifyKind {
             NotifyKind::RoundError => "round_error",
             NotifyKind::Approval => "approval",
             NotifyKind::PeerReply => "peer_reply",
+            NotifyKind::WindowTurnEnd => "window_turn_end",
+            NotifyKind::WindowWaiting => "window_waiting",
         }
     }
 }
@@ -109,7 +119,8 @@ pub(crate) struct PushNotify {
 }
 
 /// 解析 push_notify 管理帧：`{"v":1,"type":"push_notify","machine":…,
-/// "kind":"round_done|round_error|approval|peer_reply","convId":…,"title":…}`。
+/// "kind":"round_done|round_error|approval|peer_reply|window_turn_end|
+/// window_waiting","convId":…,"title":…}`。
 /// 字段缺失/非字符串、kind 越界、type 不符、畸形 JSON → None（调用方静默丢弃
 /// ——管理帧族同纪律，不让畸形帧漏进业务路由）。
 pub(crate) fn parse_notify_frame(text: &str) -> Option<PushNotify> {
@@ -122,6 +133,8 @@ pub(crate) fn parse_notify_frame(text: &str) -> Option<PushNotify> {
         "round_error" => NotifyKind::RoundError,
         "approval" => NotifyKind::Approval,
         "peer_reply" => NotifyKind::PeerReply,
+        "window_turn_end" => NotifyKind::WindowTurnEnd,
+        "window_waiting" => NotifyKind::WindowWaiting,
         _ => return None,
     };
     Some(PushNotify {
@@ -999,6 +1012,28 @@ mod tests {
         );
     }
 
+    /// v1.43 两个窗口事件 kind：白名单接受（真实帧形态——网关
+    /// `WebPlatform::on_window_event` 出帧，convId = `peer:<窗口名>`、title =
+    /// 窗口名），`as_str` 与帧字面量同源（加密载荷里原样透传的前提）。
+    #[test]
+    fn parse_notify_frame_accepts_window_kinds() {
+        for (kind_text, expect) in [
+            ("window_turn_end", NotifyKind::WindowTurnEnd),
+            ("window_waiting", NotifyKind::WindowWaiting),
+        ] {
+            let f = serde_json::json!({
+                "v": 1, "type": "push_notify", "machine": "home-mac",
+                "kind": kind_text, "convId": "peer:jormungandr-f8", "title": "jormungandr-f8",
+            })
+            .to_string();
+            let nf = parse_notify_frame(&f).expect("窗口事件 kind 应被白名单接受");
+            assert_eq!(nf.kind, expect);
+            assert_eq!(nf.kind.as_str(), kind_text);
+            assert_eq!(nf.conv_id, "peer:jormungandr-f8");
+            assert_eq!(nf.title, "jormungandr-f8");
+        }
+    }
+
     #[test]
     fn parse_notify_frame_rejects_malformed() {
         // 缺字段 / 非字符串 / kind 越界（含 peer_reply 的近似错拼——字面量须
@@ -1011,6 +1046,10 @@ mod tests {
             r#"{"v":1,"type":"push_notify","machine":"m","kind":"peer-reply","convId":"c","title":"t"}"#,
             r#"{"v":1,"type":"push_notify","machine":"m","kind":"PeerReply","convId":"c","title":"t"}"#,
             r#"{"v":1,"type":"push_notify","machine":"m","kind":"peer_reply ","convId":"c","title":"t"}"#,
+            // v1.43 窗口事件 kind 的近似错拼——字面量须逐字命中。
+            r#"{"v":1,"type":"push_notify","machine":"m","kind":"window-turn-end","convId":"c","title":"t"}"#,
+            r#"{"v":1,"type":"push_notify","machine":"m","kind":"WindowWaiting","convId":"c","title":"t"}"#,
+            r#"{"v":1,"type":"push_notify","machine":"m","kind":"window_waiting ","convId":"c","title":"t"}"#,
             r#"{"v":1,"type":"push_notify","machine":"m","kind":7,"convId":"c","title":"t"}"#,
             r#"{"v":1,"type":"message","text":"push_notify 假帧"}"#,
             r#"{"v":1,"type":"push_notify"}"#,
@@ -1056,6 +1095,33 @@ mod tests {
         assert_eq!(
             p,
             r#"{"kind":"peer_reply","title":"已修好构建","convId":"peer:win-a","machine":"home-mac"}"#
+        );
+        assert!(p.len() <= PAYLOAD_MAX_BYTES);
+    }
+
+    /// v1.43：两个窗口事件 kind 的加密载荷 JSON——kind 字符串原样透传（SPA
+    /// 据此选「窗口完成一轮 / 窗口在等你」文案），字段序与其余 kind 一致。
+    #[test]
+    fn payload_json_window_kinds_passthrough() {
+        let p = payload_json(&PushNotify {
+            kind: NotifyKind::WindowTurnEnd,
+            machine: "home-mac".into(),
+            conv_id: "peer:win-a".into(),
+            title: "win-a".into(),
+        });
+        assert_eq!(
+            p,
+            r#"{"kind":"window_turn_end","title":"win-a","convId":"peer:win-a","machine":"home-mac"}"#
+        );
+        let p = payload_json(&PushNotify {
+            kind: NotifyKind::WindowWaiting,
+            machine: "home-mac".into(),
+            conv_id: "peer:win-a".into(),
+            title: "win-a".into(),
+        });
+        assert_eq!(
+            p,
+            r#"{"kind":"window_waiting","title":"win-a","convId":"peer:win-a","machine":"home-mac"}"#
         );
         assert!(p.len() <= PAYLOAD_MAX_BYTES);
     }

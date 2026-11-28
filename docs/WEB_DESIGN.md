@@ -81,6 +81,13 @@ Mac：imagent gateway
 | `machine` | `{online, version, sandboxProfile}` | 网关能力/状态卡 |
 | `pong` / `error` | — | 心跳应答 / 错误码 |
 
+v1.43 追加的本地窗口帧（仅 `peer_enabled` 的网关应答；旧网关按未知类型忽略）：
+浏览器 → 网关 `windows_query`、`window_watch {name, watch}`；网关 → 浏览器
+`windows {hookInstalled, items[]}`——网关每隔 3 秒读一次 Claude Code 的会话注册表，
+快照有变化就推一帧。字段与判定规则的唯一依据是帧契约，落在
+`crates/core/src/peer/mod.rs` 的 `PeerState` 与 `crates/web/src/lib.rs` 的
+`encode_windows_frame`，都有字节级单测钉住。
+
 协议演进位：`v` 字段 + `type` 枚举留扩展；phase2 若做 E2E，仅把 `body` 字段换成密文信封（NaCl box，浏览器与网关互持密钥），中继与帧路由完全不用改。
 
 ### D5 认证（双 token，无 cookie → 无 CSRF 面）

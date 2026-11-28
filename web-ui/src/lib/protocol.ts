@@ -103,6 +103,17 @@
 //   区别于 approval_request 的超时预算）。旧网关不认识该查询、不回任何帧；
 //   旧 SPA 对 approvals 因未知类型被 parseFrame 丢弃——双向兼容。SPA 侧按
 //   「查询发出时刻」对齐，见 applyApprovalsSnapshot。
+// - v1.43 本地窗口看板：出站 windows_query{machine} / window_watch{machine,
+//   name, watch}（业务帧，E2E 加密）→ 网关回 / 推 windows{machine,
+//   hookInstalled, items[{name, status, waitingFor?, cwd, startedAt?,
+//   statusUpdatedAt?, watched}]}（业务帧）：该机器全部在线本地 Claude Code
+//   窗口的权威快照（网关轮询注册表，可空）。peer 通道未启用的网关不回查询、
+//   不推快照——SPA 侧「某机器没有键」即不显示看板；旧网关按未知 type 忽略两帧，
+//   旧 SPA 对 windows 因未知类型被 parseFrame 丢弃——双向兼容。快照进 protocol
+//   reducer（按机器整体替换）。关注（watched）是跨设备的全局状态，由网关持久化、
+//   重启保留：SPA 只发 window_watch 并按快照显示，不保存名单、不对账——各设备
+//   各存一份名单时，「A 设备取消关注」会被 B 设备的对账逻辑立刻补发回来，等于
+//   取消不了。
 
 export const PROTOCOL_VERSION = 1;
 
@@ -517,6 +528,29 @@ export type ApprovalsQueryFrame = {
 };
 
 // ---------------------------------------------------------------------------
+// v1.43 本地窗口看板（浏览器 → 网关，业务帧，E2E 加密；契约见头注）
+// ---------------------------------------------------------------------------
+
+/** v1.43 请求某机器当前在线的本地窗口快照：网关回一帧 windows（peer 通道未启用
+ *  时不回任何帧）。machine 同 message 族路由约定（多机模式必须带）。 */
+export type WindowsQueryFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "windows_query";
+  machine?: string;
+};
+
+/** v1.43 关注 / 取消关注一个本地窗口（决定它跑完一轮是否推送）：网关处理完重发
+ *  一帧 windows，让各设备的 watched 收敛。键序照契约示例
+ *  （v / type / machine / name / watch）。 */
+export type WindowWatchFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "window_watch";
+  machine?: string;
+  name: string;
+  watch: boolean;
+};
+
+// ---------------------------------------------------------------------------
 // v1.4 E2E 中继盲化（密码学构造与编码规约见 lib/e2e.ts 头注）
 // ---------------------------------------------------------------------------
 
@@ -568,7 +602,9 @@ export type OutboundFrame =
   | HistoryQueryFrame
   | AsrRequestFrame
   | ConvDeleteFrame
-  | ApprovalsQueryFrame;
+  | ApprovalsQueryFrame
+  | WindowsQueryFrame
+  | WindowWatchFrame;
 
 /** 出站帧序列化（undefined 字段不序列化，与网关入站解析兼容）。 */
 export function encodeFrame(frame: OutboundFrame): string {
@@ -868,6 +904,113 @@ export type ApprovalsFrame = {
   items: ApprovalSnapshotItem[];
 };
 
+// ---------------------------------------------------------------------------
+// v1.43 本地窗口快照（网关 → 浏览器，E2E 业务帧，经 enc 解密后进 reducer）
+// ---------------------------------------------------------------------------
+
+/** v1.43 本地窗口状态：注册表里的 busy / idle / waiting，以及「不是前三者或
+ *  缺失」时的 unknown（网关侧归一）。 */
+export type WindowStatus = "busy" | "idle" | "waiting" | "unknown";
+
+/** v1.43 本地窗口条目（windows 帧 items 元素，字段名与网关契约逐字一致）。 */
+export type WindowInfo = {
+  name: string;
+  status: WindowStatus;
+  /** 等待原因（status 为 waiting 时才有；网关为 None 时不带该键）。 */
+  waitingFor?: string;
+  cwd: string;
+  /** 窗口启动时刻（unix 毫秒；网关缺失时不带该键）。 */
+  startedAt?: number;
+  /** 最近一次写状态的时刻（unix 毫秒；网关缺失时不带该键）——界面上「空闲 ·
+   *  N 分钟前」的时间取自它。 */
+  statusUpdatedAt?: number;
+  /** 当前是否被关注：跨设备的全局状态，由网关持久化（任一设备点星标即全局
+   *  生效，重启保留）。SPA 不保存关注名单，界面上只认这个值。 */
+  watched: boolean;
+};
+
+/** v1.43 某机器的窗口快照内容（AppState.windows 的值 / Sidebar 的数据源）：
+ *  hookInstalled = 该机器 Claude Code 用户级配置里是否装了指向本网关的 Stop
+ *  钩子；items = 在线窗口（网关已按 startedAt 降序、同值按 name 升序排好）。 */
+export type MachineWindows = {
+  hookInstalled: boolean;
+  items: WindowInfo[];
+};
+
+/** v1.43 本地窗口快照：应答 windows_query、window_watch 处理完、以及网关轮询
+ *  发现快照变化时都会发同一形态的帧。items 可为空数组（peer 通道已启用但没有
+ *  在线窗口）。它是机器级数据（不是会话级），不随当前会话变化。 */
+export type WindowsFrame = {
+  v: typeof PROTOCOL_VERSION;
+  type: "windows";
+  machine: string;
+  hookInstalled: boolean;
+  items: WindowInfo[];
+};
+
+/** 窗口名 → 它的会话 id（v1.41 起 `peer:<窗口名>` 会话已存在：本地 select_conv
+ *  即可打开，发文本即投递该窗口，窗口回信落同一会话）。 */
+export function peerConvOf(name: string): string {
+  return `peer:${name}`;
+}
+
+/** 窗口状态 → 界面文字。 */
+export function windowStatusText(status: WindowStatus): string {
+  switch (status) {
+    case "busy":
+      return "运行中";
+    case "idle":
+      return "空闲";
+    case "waiting":
+      return "等待确认";
+    case "unknown":
+      return "未知";
+  }
+}
+
+/** 注册表里已观察到的 waitingFor 取值 → 人话；没见过的原因原样返回（网关侧
+ *  以后出现新原因时界面按原文显示，不至于留白）。 */
+export function waitingForText(reason: string): string {
+  switch (reason) {
+    case "dialog open":
+      return "等你确认";
+    case "input needed":
+      return "等你输入";
+    case "sandbox request":
+      return "等沙箱授权";
+    case "goal proposal":
+      return "等你定目标";
+    default:
+      return reason;
+  }
+}
+
+const MINUTE_MS = 60_000;
+const HOUR_MS = 3_600_000;
+const DAY_MS = 86_400_000;
+
+/** 相对时间（窗口行「N 分钟前」）：缺失返回空串（调用方据此省掉分隔符）；
+ *  不足 60 秒「刚刚」、不足 60 分钟「N 分钟前」、不足 24 小时「N 小时前」、
+ *  否则「N 天前」。now 由调用方传入（纯函数，便于单测；界面用 useNow 驱动
+ *  分钟级刷新）。快照时间可能略晚于本机时钟（两台机器的时钟偏差）——差值为负
+ *  落在「刚刚」，不必另设分支。 */
+export function relativeTime(at: number | undefined, now: number): string {
+  if (at === undefined) {
+    return "";
+  }
+  const diff = now - at;
+  if (diff < MINUTE_MS) {
+    return "刚刚";
+  }
+  if (diff < HOUR_MS) {
+    return `${Math.floor(diff / MINUTE_MS)} 分钟前`;
+  }
+  if (diff < DAY_MS) {
+    return `${Math.floor(diff / HOUR_MS)} 小时前`;
+  }
+  return `${Math.floor(diff / DAY_MS)} 天前`;
+}
+
 /** v1.4 握手第二步（网关 → 浏览器，经 relay 明文透传）：gk = 网关 X25519
  *  公钥（32B hex），n2 = 网关随机数（32B hex），sig = 网关 ed25519 对
  *  bytes(ek)||bytes(gk)||bytes(n1)||bytes(n2) 的签名（64B hex），ik = 网关
@@ -908,7 +1051,8 @@ export type InboundFrame =
   | ConvWorkdirFrame
   | HistoryFrame
   | AsrResultFrame
-  | ApprovalsFrame;
+  | ApprovalsFrame
+  | WindowsFrame;
 
 // ---------------------------------------------------------------------------
 // parseFrame：v/type 校验 + 每类帧关键字段存在性校验，非法返回 null（不抛）
@@ -1139,6 +1283,31 @@ const approvalItemOk = (it: unknown): boolean => {
   );
 };
 
+const WINDOW_STATUSES: readonly string[] = ["busy", "idle", "waiting", "unknown"];
+
+/** v1.43 windows.items 元素形状：name 非空字符串（空串没法建 peer: 会话，也没法
+ *  作为 window_watch 的 name）、status 四值之一、waitingFor 缺席或字符串、cwd
+ *  字符串、
+ *  startedAt / statusUpdatedAt 缺席或有限数字（契约里两者为 None 时省略键，
+ *  非 null）、watched 布尔。任一项畸形整帧拒收（见 INBOUND_CHECKS.windows）。 */
+const windowOk = (w: unknown): boolean => {
+  if (typeof w !== "object" || w === null) {
+    return false;
+  }
+  const r = w as Record<string, unknown>;
+  return (
+    isNonEmptyStr(r, "name") &&
+    typeof r.status === "string" &&
+    WINDOW_STATUSES.includes(r.status) &&
+    (r.waitingFor === undefined || typeof r.waitingFor === "string") &&
+    isStr(r, "cwd") &&
+    (r.startedAt === undefined || (typeof r.startedAt === "number" && Number.isFinite(r.startedAt))) &&
+    (r.statusUpdatedAt === undefined ||
+      (typeof r.statusUpdatedAt === "number" && Number.isFinite(r.statusUpdatedAt))) &&
+    typeof r.watched === "boolean"
+  );
+};
+
 const RESOLVED_DECISIONS: readonly string[] = ["allow", "deny", "always", "cancelled"];
 
 /** v1.4 e2e_ack 的网关身份公钥字段：ik（规范名）/ id / pk（宽容别名）任一
@@ -1219,6 +1388,14 @@ const INBOUND_CHECKS: Record<string, FieldCheck> = {
   // 半份可疑数据覆盖。
   approvals: (o) =>
     isNonEmptyStr(o, "machine") && Array.isArray(o.items) && o.items.every(approvalItemOk),
+  // v1.43 本地窗口快照：machine 必填非空、hookInstalled 布尔、items 每项逐字段
+  // 校验（windowOk），任一项畸形整帧拒收——这份快照驱动一整块侧栏界面与状态条
+  // 的「窗口在等你」提示，宁可不更新也不拿半份可疑数据渲染（与 approvals 同纪律）。
+  windows: (o) =>
+    isNonEmptyStr(o, "machine") &&
+    typeof o.hookInstalled === "boolean" &&
+    Array.isArray(o.items) &&
+    o.items.every(windowOk),
 };
 
 /** 解析一条入站文本帧：信封 v=1 + 已知 type + 关键字段齐备才放行，否则 null。 */
@@ -1354,6 +1531,10 @@ export type AppState = {
   /** v1.6 逐机器工作空间快照（workspaces 帧按来源机器落表；空 = 尚未收到
    *  快照（旧网关），目录条与目录选择不渲染）。 */
   workspaces: Record<string, MachineWorkspaces>;
+  /** v1.43 逐机器本地窗口快照（windows 帧按来源机器落表，整体替换）。没有某
+   *  机器的键 = 从未收到过它的快照（旧网关 / 未启用 peer 通道）——侧栏不显示
+   *  「本地窗口」区块。 */
+  windows: Record<string, MachineWindows>;
   lastError: { code: string; at: number } | null;
   lastNotice: MachineNotice | null;
 };
@@ -1417,6 +1598,7 @@ export function initialState(): AppState {
     pairingRequests: [],
     rotatedToken: null,
     workspaces: {},
+    windows: {},
     lastError: null,
     lastNotice: null,
   };
@@ -1430,6 +1612,10 @@ export type Action =
   | { type: "select_machine"; machine: string }
   /** 用户点选会话（仅切换 SPA 本地当前 conv，不发包；清该 conv 未读）。 */
   | { type: "select_conv"; convId: string }
+  /** v1.43 关注 / 取消关注一个本地窗口：翻转该机器快照里该窗口的 watched（乐观
+   *  更新；App 层在 window_watch 帧被接受后才 dispatch）。机器或窗口不在快照里
+   *  → 原 state。 */
+  | { type: "toggle_window_watch"; machine: string; name: string }
   /** v1.41.3 删除会话（侧边栏长按确认后）：本地先行移除（convOrder/convs/
    *  未读随条目清），若删除的是当前 conv 切回 DEFAULT_CONV；网关权威状态由
    *  随后的 workspaces 快照收敛（快照 sessions 段不含已删会话，不回填）。 */
@@ -2136,6 +2322,28 @@ function mergePersistedSessions(
   return { ...state.spaces, [machine]: { convs, convOrder } };
 }
 
+/** 两份窗口清单是否逐项相同（同序，每个条目的七个字段逐一相等）。网关输出序
+ *  确定（startedAt 降序、同值按 name 升序），故按序比较即可。内容相同即没有
+ *  新信息，调用方据此保持原 state 引用——网关应答查询与主动推送常带来同一份
+ *  快照，不该每次都重渲染整块侧栏。 */
+function sameWindows(a: readonly WindowInfo[], b: readonly WindowInfo[]): boolean {
+  return (
+    a.length === b.length &&
+    a.every((p, i) => {
+      const q = b[i];
+      return (
+        p.name === q.name &&
+        p.status === q.status &&
+        p.waitingFor === q.waitingFor &&
+        p.cwd === q.cwd &&
+        p.startedAt === q.startedAt &&
+        p.statusUpdatedAt === q.statusUpdatedAt &&
+        p.watched === q.watched
+      );
+    })
+  );
+}
+
 function reduceFrame(state: AppState, frame: InboundFrame): AppState {
   switch (frame.type) {
     case "hello_ack":
@@ -2250,6 +2458,22 @@ function reduceFrame(state: AppState, frame: InboundFrame): AppState {
       // reducer 收到原始帧即说明上游漏拦：静默忽略——没有 queriedAt 就套用
       // 等于按「完全权威」清掉查询后才到的实时审批。
       return state;
+    case "windows": {
+      // v1.43 本地窗口快照：按来源机器整体落表（网关每次给的都是该机器全部
+      // 在线窗口，不与旧条目合并）。与现有内容逐项相等时返回原 state。
+      const machine = frame.machine;
+      const cur = state.windows[machine];
+      if (cur && cur.hookInstalled === frame.hookInstalled && sameWindows(cur.items, frame.items)) {
+        return state;
+      }
+      return {
+        ...state,
+        windows: {
+          ...state.windows,
+          [machine]: { hookInstalled: frame.hookInstalled, items: frame.items },
+        },
+      };
+    }
   }
 }
 
@@ -2300,6 +2524,22 @@ export function reducer(state: AppState, action: Action): AppState {
       // 点选会话：切当前 conv 并清未读；同 conv 重复点选仅承担清零
       const changed = clearUnread(state, state.currentMachine, action.convId);
       return changed.currentConv === action.convId ? changed : { ...changed, currentConv: action.convId };
+    }
+    case "toggle_window_watch": {
+      // v1.43 星标的乐观翻转：只换快照里那一个条目的 watched（新数组 + 新条目，
+      // 其余条目保持引用）；机器或窗口不在快照里则无事可做。Array.isArray 兜住
+      // 「键存在但不是快照」的病态情形（如机器名恰为原型属性名）。
+      const snap = state.windows[action.machine];
+      if (!snap || !Array.isArray(snap.items)) {
+        return state;
+      }
+      const idx = snap.items.findIndex((w) => w.name === action.name);
+      if (idx < 0) {
+        return state;
+      }
+      const items = snap.items.slice();
+      items[idx] = { ...items[idx], watched: !items[idx].watched };
+      return { ...state, windows: { ...state.windows, [action.machine]: { ...snap, items } } };
     }
     case "delete_conv":
       // v1.41.3 会话删除（本地先行移除，网关快照随后权威收敛）：条目不存在

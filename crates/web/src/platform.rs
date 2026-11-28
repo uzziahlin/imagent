@@ -13,7 +13,10 @@
 //!   全量重发 card 帧。relay 保证单浏览器连接，无定向问题。v1.42：该 responder
 //!   同时消费 `approvals_query`（[`SyncRequest::ApprovalsQuery`]）——按
 //!   [`PendingAsks`] 登记表回 `approvals` 待审批快照（离线期间到达的审批
-//!   重连后可批 / 离开期间已超时的审批收敛）。
+//!   重连后可批 / 离开期间已超时的审批收敛）。v1.43：同一 responder 再消费
+//!   `windows_query`（[`SyncRequest::Windows`]）——按 peer 共享态
+//!   （`PeerState`，main 经 [`WebPlatform::set_peer_state`] 后填）回 `windows`
+//!   本地窗口快照；peer 通道未启用时不回帧。
 //! - workspace 泵（v1.6 工作空间）：消费 client 转来的
 //!   workspace_list/save/remove/conv_workdir_set 动作，直接读写 store KV
 //!   （`workspace:`/`workdir:` 表，与终端 /ws /cd 同源互通）+
@@ -52,6 +55,7 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use imagent_core::peer::{PeerState, WindowEvent, WindowEventKind, WindowInfo};
 use imagent_core::{
     validate_workdir,
     workspace::{workdir_key, workspace_key, WorkspaceRecord, WORKDIR_PREFIX, WORKSPACE_PREFIX},
@@ -66,9 +70,10 @@ use crate::titles::{TitleCandidate, TitleGen};
 use crate::{
     encode_approval_request_frame, encode_approval_resolved_frame, encode_approvals_frame,
     encode_asr_result_frame, encode_card_frame, encode_conv_workdir_frame, encode_error_frame,
-    encode_history_frame, encode_text_frame, encode_user_text_frame, encode_workspaces_frame,
-    history_entry_from_row, push_notify_title, session_title, CardPayload, GatewayCredential,
-    InboundAction, PushEvent, PushNotifyKind, SessionEntryFrame, WorkspaceEntryFrame, TARGET,
+    encode_history_frame, encode_text_frame, encode_user_text_frame, encode_windows_frame,
+    encode_workspaces_frame, history_entry_from_row, push_notify_title, session_title, CardPayload,
+    GatewayCredential, InboundAction, PushEvent, PushNotifyKind, SessionEntryFrame,
+    WorkspaceEntryFrame, TARGET,
 };
 
 const PLATFORM: &str = "web";
@@ -242,15 +247,18 @@ pub(crate) struct PendingAsk {
 /// [`WebPlatform::send_permission_ask`]）。
 type PendingAsks = HashMap<String, Vec<PendingAsk>>;
 
-/// sync 通道载荷（client → sync 泵）：`sync` 帧与 v1.42 `approvals_query` 帧
-/// 共用同一通道与同一泵——两者都是「浏览器请求 → 网关回权威快照」的只读
-/// 查询，都不改变网关状态。
+/// sync 通道载荷（client → sync 泵）：`sync` 帧、v1.42 `approvals_query` 帧、
+/// v1.43 `windows_query` 帧共用同一通道与同一泵——三者都是「浏览器请求 → 网关
+/// 回权威快照」的只读查询，都不改变网关状态（`window_watch` 改关注名单是在
+/// client 层做的，随后借 `Windows` 重发快照）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SyncRequest {
     /// `sync` 帧：重发卡片缓存（D6 会话恢复）。
     Sync,
     /// `approvals_query` 帧：回待审批快照（v1.42）。
     ApprovalsQuery,
+    /// `windows_query` 帧 / `window_watch` 之后：回本地窗口快照（v1.43）。
+    Windows,
 }
 
 /// approvals 快照帧的单个条目（协议 v1.42；帧编码见
@@ -340,23 +348,27 @@ impl LoggedCardIds {
 }
 
 /// 中毒（临界区 panic）时取回数据继续服务：纯内存临界区无 IO 副作用可回滚
-/// （relay Hub / webhook 同款取舍）。
-fn lock_or_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+/// （relay Hub / webhook 同款取舍）。client 读 peer 共享态槽位同用它
+/// （`pub(crate)`——同步临界区只有一次 clone，不跨 await）。
+pub(crate) fn lock_or_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// sync responder：消费 client 转来的 sync 通道请求——`sync` 重发卡片缓存
 /// （card 帧，state 依 terminal，v1.1 起带本机 machine 字段——与首发帧同
-/// 形）；v1.42 `approvals_query` 回待审批快照（approvals 帧）。best-effort
-/// ——出站队列满即丢弃并 warn（浏览器可再发请求刷新，不值得反压阻塞
-/// client 的 sync channel）。`cards` / `pending_asks` 与平台主体共享同一
-/// Arc（见 [`handle_sync_request`]）。
+/// 形）；v1.42 `approvals_query` 回待审批快照（approvals 帧）；v1.43
+/// `windows_query` 回本地窗口快照（windows 帧）。best-effort——出站队列满即
+/// 丢弃并 warn（浏览器可再发请求刷新，不值得反压阻塞 client 的 sync
+/// channel）。`cards` / `pending_asks` / `peer_state` 与平台主体共享同一 Arc
+/// （见 [`handle_sync_request`]）。
+#[allow(clippy::too_many_arguments)] // sync 泵随帧族演进逐个注入共享句柄（8 个）
 async fn serve_sync_requests(
     mut sync_rx: mpsc::Receiver<SyncRequest>,
     machine_id: String,
     cards: Arc<Mutex<CardCache>>,
     pending_asks: Arc<Mutex<PendingAsks>>,
     approval_timeout_secs: u64,
+    peer_state: Arc<Mutex<Option<Arc<PeerState>>>>,
     outbound_tx: mpsc::Sender<String>,
     shutdown: CancellationToken,
 ) {
@@ -373,6 +385,7 @@ async fn serve_sync_requests(
                     &cards,
                     &pending_asks,
                     approval_timeout_secs,
+                    &peer_state,
                     &outbound_tx,
                 );
             }
@@ -389,6 +402,7 @@ fn handle_sync_request(
     cards: &Mutex<CardCache>,
     pending_asks: &Mutex<PendingAsks>,
     approval_timeout_secs: u64,
+    peer_state: &Mutex<Option<Arc<PeerState>>>,
     outbound_tx: &mpsc::Sender<String>,
 ) {
     match req {
@@ -408,6 +422,30 @@ fn handle_sync_request(
                         warn!(target: TARGET, error = %e, conv = %conv, "sync 重发帧序列化失败")
                     }
                 }
+            }
+        }
+        // `windows_query` 帧（v1.43）/ `window_watch` 后的重发：本地窗口快照。
+        // peer 通道未启用（槽位为 None）→ **不回帧**——契约：前端收不到 windows
+        // 帧即不显示看板。出站走既有 outbound channel（E2E 会话活跃时逐 sid
+        // 加密——窗口名 / cwd 是本机路径信息，属业务内容）。
+        SyncRequest::Windows => {
+            let state = lock_or_recover(peer_state).clone();
+            let Some(state) = state else {
+                debug!(target: TARGET, "windows 快照请求：peer 通道未启用，不回帧");
+                return;
+            };
+            let windows = state.windows();
+            match encode_windows_frame(machine_id, state.hook_installed(), &windows) {
+                Ok(json) => {
+                    if let Err(e) = outbound_tx.try_send(json) {
+                        warn!(
+                            target: TARGET,
+                            error = %e,
+                            "windows 快照出站队列满/通道关闭，丢弃（浏览器可重发 windows_query）"
+                        );
+                    }
+                }
+                Err(e) => warn!(target: TARGET, error = %e, "windows 快照帧序列化失败"),
             }
         }
         // `approvals_query` 帧：待审批快照（v1.42）。出站走既有 outbound
@@ -1572,6 +1610,13 @@ pub struct WebPlatform {
     /// 构造期注入；缺席 = 无法核实，conv_delete fail-open 放行删除）。
     /// 与 workspace 泵共享同一 Arc（泵的删除分支读）。
     round_probe: Arc<Mutex<Option<RoundProbe>>>,
+    /// v1.43 本地窗口看板的 peer 共享态槽位（[`PeerState`]：最近快照 / 关注
+    /// 名单 / 钩子安装态）。与 client、sync 泵共享同一 Arc；平台构造早于
+    /// `PeerServer::start`（共享态在那里才创建），故 main 在 peer server 起来
+    /// 后经 [`WebPlatform::set_peer_state`] 后填。`None` = peer 通道未启用
+    /// （`windows_query` 不回帧、`window_watch` 忽略）——同 `round_probe`
+    /// 的后填理由。
+    peer_state: Arc<Mutex<Option<Arc<PeerState>>>>,
     /// 停机信号（Drop 时 cancel，client / sync responder 连动退出）。
     shutdown: CancellationToken,
 }
@@ -1687,6 +1732,9 @@ impl WebPlatform {
         let reconnect = Arc::new(Notify::new());
         let online = Arc::new(AtomicBool::new(false));
         let shutdown = CancellationToken::new();
+        // v1.43：peer 共享态槽位——client（window_watch 改关注名单）、sync 泵
+        // （windows_query 回帧）、平台主体（on_windows_changed 推帧）三方共享。
+        let peer_state: Arc<Mutex<Option<Arc<PeerState>>>> = Arc::new(Mutex::new(None));
 
         // client 任务：连接立即开始（断线自动重连）。workspace_tx 留一份
         // clone 给平台主体（v1.41.3 on_conv_deleted 快照触发用）。
@@ -1703,13 +1751,14 @@ impl WebPlatform {
             media_tx,
             history_tx,
             asr_tx,
+            peer_state: peer_state.clone(),
         };
         tokio::spawn(client.run(outbound_rx, push_rx, reconnect.clone(), shutdown.clone()));
 
-        // sync responder（D6 会话恢复 + v1.42 approvals 快照）。cards /
-        // pending_asks 与平台主体共享同一 Arc——sync 重发看到的卡片缓存与
-        // approvals 快照看到的待审批表，都是 send_card / send_permission_ask
-        // 写入的同一份状态。
+        // sync responder（D6 会话恢复 + v1.42 approvals 快照 + v1.43 windows
+        // 快照）。cards / pending_asks / peer_state 与平台主体共享同一 Arc——
+        // sync 重发看到的卡片缓存、approvals 快照看到的待审批表、windows 快照
+        // 看到的窗口清单，都是同一份状态。
         let cards: Arc<Mutex<CardCache>> = Arc::new(Mutex::new(CardCache::default()));
         let pending_asks: Arc<Mutex<PendingAsks>> = Arc::new(Mutex::new(PendingAsks::default()));
         tokio::spawn(serve_sync_requests(
@@ -1718,6 +1767,7 @@ impl WebPlatform {
             cards.clone(),
             pending_asks.clone(),
             approval_timeout_secs,
+            peer_state.clone(),
             outbound_tx.clone(),
             shutdown.clone(),
         ));
@@ -1795,6 +1845,7 @@ impl WebPlatform {
             pending_asks,
             approval_timeout_secs,
             round_probe,
+            peer_state,
             shutdown,
         }
     }
@@ -1815,6 +1866,15 @@ impl WebPlatform {
     /// 窗口）时 fail-open 放行删除（见 [`handle_conv_delete`]）。
     pub fn set_round_probe(&self, probe: RoundProbe) {
         *lock_or_recover(&self.round_probe) = Some(probe);
+    }
+
+    /// v1.43 注入本地窗口看板的 peer 共享态（main 装配处：`PeerServer::start`
+    /// 成功后调用——共享态在那里才创建，晚于平台构造；未装 web 平台时无此
+    /// 步）。注入后 `windows_query` 才会回帧、`window_watch` 才生效、轮询变化
+    /// 才能推 `windows` 帧；未注入 = peer 通道未启用，前端收不到任何 windows
+    /// 帧（看板不显示，契约的兼容语义）。
+    pub fn set_peer_state(&self, state: Arc<PeerState>) {
+        *lock_or_recover(&self.peer_state) = Some(state);
     }
 
     /// 出站帧入队（§5.1 断线语义）：try_send——断线期帧排队（Ok），队列满 /
@@ -2036,6 +2096,45 @@ impl Platform for WebPlatform {
     /// 不在通知上等待）。
     async fn on_peer_reply(&self, conv: &ConvId, body: &str) {
         self.spawn_push_notify(PushNotifyKind::PeerReply, &conv.0, push_notify_title(body));
+    }
+
+    /// v1.43 本地窗口快照变更（trait 语义见 `Platform::on_windows_changed`）：
+    /// 编成 `windows` 帧入队。同步 best-effort（try_send 入队，队列满丢帧
+    /// warn——前端有 `windows_query` 兜底；trait 约定本方法不得 IO/await）。
+    /// `hookInstalled` 取共享态当前值（peer 通道未启用时槽位为空 → false，
+    /// 但此时也不存在轮询任务，本钩子无人调）。帧带本机 machine（v1.1 出站
+    /// 业务帧约定），E2E 会话活跃时随 `send_business` 逐 sid 加密。
+    fn on_windows_changed(&self, windows: &[WindowInfo]) {
+        let hook_installed = lock_or_recover(&self.peer_state)
+            .as_ref()
+            .is_some_and(|state| state.hook_installed());
+        match encode_windows_frame(&self.machine_id, hook_installed, windows) {
+            Ok(json) => {
+                if let Err(e) = self.enqueue(json) {
+                    warn!(
+                        target: TARGET,
+                        error = %e,
+                        "windows 快照帧入队失败，丢弃（前端有 windows_query 兜底）"
+                    );
+                }
+            }
+            Err(e) => warn!(target: TARGET, error = %e, "windows 快照帧序列化失败"),
+        }
+    }
+
+    /// v1.43 窗口事件推送（trait 语义见 `Platform::on_window_event`）：跑完
+    /// 一轮 → push_notify kind=window_turn_end，进入 waiting → kind=
+    /// window_waiting。convId = 该窗口的 `peer:<窗口名>` 会话（SPA 据此深链回
+    /// 会话）；title = 窗口名（conv 剥 `peer:` 前缀，trim 后截 32 码点）——两个
+    /// kind 的正文都不涉窗口输出，手机通知栏只露窗口名。经既有 push 通道 →
+    /// client 明文管理帧（见 [`Self::spawn_push_notify`]）。
+    async fn on_window_event(&self, conv: &ConvId, event: &WindowEvent) {
+        let kind = match event.kind {
+            WindowEventKind::TurnEnd => PushNotifyKind::WindowTurnEnd,
+            WindowEventKind::Waiting => PushNotifyKind::WindowWaiting,
+        };
+        let window = conv.0.strip_prefix("peer:").unwrap_or(&conv.0);
+        self.spawn_push_notify(kind, &conv.0, push_notify_title(window));
     }
 
     /// v1.41.3 会话删除钩子（/rm 命令收尾——dispatch 已删完 store 两处）：
@@ -2275,6 +2374,7 @@ mod tests {
 
     use super::*;
     use crate::models::CliModels;
+    use imagent_core::peer::{WindowEvent, WindowEventKind, WindowStatus};
     use imagent_core::{Backend, CardPhase, CardTerminal};
     use imagent_store::OutboundRow;
 
@@ -4609,6 +4709,7 @@ mod tests {
             &p.cards,
             &p.pending_asks,
             p.approval_timeout_secs,
+            &p.peer_state,
             tx,
         );
         let json = rx.try_recv().expect("每次 approvals_query 恰回一帧");
@@ -4770,6 +4871,7 @@ mod tests {
             cards,
             pending_asks,
             300,
+            Arc::new(Mutex::new(None)), // v1.43 peer 共享态：本用例不涉及 windows 快照
             tx.clone(),
             shutdown.clone(),
         ));
@@ -4813,6 +4915,182 @@ mod tests {
             .await
             .expect("停机信号应让泵退出")
             .unwrap();
+    }
+
+    // ---- v1.43 本地窗口快照（windows_query / window_watch → windows 帧）+ 窗口事件推送 ----
+    // 真实 WS 回环（E2E enc 包裹、window_watch 经 client 层）见 tests/web_loopback.rs；
+    // 此处直测 sync 泵的 Windows 分支与两个平台钩子。
+
+    /// 测试用 peer 共享态：已建基线的两窗口快照（win-a idle / win-b busy）+ 钩子已装。
+    fn windows_test_state() -> Arc<PeerState> {
+        let state = Arc::new(PeerState::new());
+        let w = |name: &str, status: WindowStatus, started: i64| WindowInfo {
+            name: name.into(),
+            status,
+            waiting_for: None,
+            cwd: format!("/tmp/{name}"),
+            started_at: Some(started),
+            status_updated_at: Some(1_000),
+            watched: false,
+        };
+        let _ = state.apply_snapshot(
+            &[
+                w("win-a", WindowStatus::Idle, 200),
+                w("win-b", WindowStatus::Busy, 100),
+            ],
+            Instant::now(),
+        );
+        state.set_hook_installed(true);
+        state
+    }
+
+    /// `windows_test_state` 对应的 windows 帧（machine = test-mac）；`watched_b`
+    /// = win-b 的关注态，`hook_installed` = 帧里的 hookInstalled。
+    fn windows_frame_json(watched_b: bool, hook_installed: bool) -> String {
+        format!(
+            r#"{{"v":1,"type":"windows","machine":"{TEST_MACHINE}","hookInstalled":{hook_installed},"items":[{{"name":"win-a","status":"idle","cwd":"/tmp/win-a","startedAt":200,"statusUpdatedAt":1000,"watched":false}},{{"name":"win-b","status":"busy","cwd":"/tmp/win-b","startedAt":100,"statusUpdatedAt":1000,"watched":{watched_b}}}]}}"#
+        )
+    }
+
+    /// v1.43 `windows_query`：peer 通道未启用（共享态槽位为 None）→ **不回帧**
+    /// （前端据此不显示看板）；注入共享态后每次查询恰回一帧 `windows`，
+    /// 数据取自共享态（已排序 + hookInstalled）；关注态改了，重发的快照里
+    /// `watched` 跟着变（`window_watch` 在 client 层改共享态后借本分支重发）。
+    #[tokio::test]
+    async fn windows_query_replies_only_with_peer_state() {
+        let mut p = offline_platform().await;
+        let (tx, mut rx) = mpsc::channel::<String>(32);
+        p.outbound_tx = tx.clone();
+        {
+            let query = || {
+                handle_sync_request(
+                    SyncRequest::Windows,
+                    TEST_MACHINE,
+                    &p.cards,
+                    &p.pending_asks,
+                    300,
+                    &p.peer_state,
+                    &tx,
+                )
+            };
+            query();
+            assert!(
+                rx.try_recv().is_err(),
+                "peer 未启用：windows_query 不回任何帧"
+            );
+
+            p.set_peer_state(windows_test_state());
+            query();
+            assert_eq!(rx.try_recv().unwrap(), windows_frame_json(false, true));
+            assert!(rx.try_recv().is_err(), "一次查询只回一帧");
+
+            // 关注 / 取消关注：快照实时回填。
+            let state = lock_or_recover(&p.peer_state).clone().expect("已注入");
+            state.set_watched("win-b", true);
+            query();
+            assert_eq!(rx.try_recv().unwrap(), windows_frame_json(true, true));
+            state.set_watched("win-b", false);
+            query();
+            assert_eq!(rx.try_recv().unwrap(), windows_frame_json(false, true));
+
+            // hookInstalled 取共享态当前值。
+            state.set_hook_installed(false);
+            query();
+            assert_eq!(rx.try_recv().unwrap(), windows_frame_json(false, false));
+        }
+        drop(p);
+    }
+
+    /// v1.43 `on_windows_changed`（轮询发现快照变化时的主动推送）：编成同一
+    /// 形态的 `windows` 帧入队，hookInstalled 取共享态当前值。
+    #[tokio::test]
+    async fn on_windows_changed_enqueues_windows_frame() {
+        let (p, mut rx) = offline_platform_with_outbound_capture(test_store().await).await;
+        let state = windows_test_state();
+        p.set_peer_state(state.clone());
+        p.on_windows_changed(&state.windows());
+        let json = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("应出一帧 windows")
+            .expect("通道开着");
+        assert_eq!(json, windows_frame_json(false, true));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "一次通知恰一帧"
+        );
+        // 空快照（窗口全部下线）：items 为空数组，键不省略。
+        p.on_windows_changed(&[]);
+        let json = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("空快照照常出帧")
+            .expect("通道开着");
+        assert_eq!(
+            json,
+            format!(
+                r#"{{"v":1,"type":"windows","machine":"{TEST_MACHINE}","hookInstalled":true,"items":[]}}"#
+            )
+        );
+        drop(p);
+    }
+
+    /// v1.43 `on_window_event`：跑完一轮 → push_notify kind=window_turn_end，
+    /// 进入 waiting → kind=window_waiting；convId = `peer:<窗口名>` 完整 conv；
+    /// title = conv 剥 `peer:` 前缀后的窗口名（截 32 码点）。每次钩子恰一条事件。
+    #[tokio::test]
+    async fn on_window_event_pushes_window_kinds() {
+        async fn recv_event(rx: &mut mpsc::Receiver<PushEvent>) -> PushEvent {
+            tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("on_window_event 应触发推送事件")
+                .expect("通道开着")
+        }
+        let (p, mut rx) = offline_platform_with_push_capture().await;
+        let event = |kind: WindowEventKind| WindowEvent {
+            name: "win-a".into(),
+            kind,
+            waiting_for: None,
+            push: true,
+        };
+
+        p.on_window_event(
+            &ConvId("peer:win-a".into()),
+            &event(WindowEventKind::TurnEnd),
+        )
+        .await;
+        let ev = recv_event(&mut rx).await;
+        assert_eq!(ev.kind, PushNotifyKind::WindowTurnEnd);
+        assert_eq!(ev.conv_id, "peer:win-a", "convId = peer:<窗口名> 完整 conv");
+        assert_eq!(ev.title, "win-a", "title = conv 剥 peer: 前缀");
+
+        p.on_window_event(
+            &ConvId("peer:win-b".into()),
+            &event(WindowEventKind::Waiting),
+        )
+        .await;
+        let ev = recv_event(&mut rx).await;
+        assert_eq!(ev.kind, PushNotifyKind::WindowWaiting);
+        assert_eq!(ev.conv_id, "peer:win-b");
+        assert_eq!(ev.title, "win-b");
+
+        // 超长窗口名截到 32 码点；恰一条。
+        let long = "窗".repeat(40);
+        p.on_window_event(
+            &ConvId(format!("peer:{long}")),
+            &event(WindowEventKind::TurnEnd),
+        )
+        .await;
+        let ev = recv_event(&mut rx).await;
+        assert_eq!(ev.title, "窗".repeat(crate::PUSH_TITLE_MAX_CHARS));
+        assert_eq!(ev.kind, PushNotifyKind::WindowTurnEnd);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "on_window_event 恰推一条"
+        );
+        drop(p);
     }
 
     /// history_query 处理回帧（任务验收项）：全量（since=0）/ 增量（since=

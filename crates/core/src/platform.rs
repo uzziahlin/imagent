@@ -438,9 +438,10 @@ pub trait Platform: Send + Sync {
     // 这组方法的 default 无副作用、也不对应任何可选特性，第四平台不覆写
     // 零损失，故不设能力位（与「新增交互特性须加位」的约定区分）。
     //
-    // `on_workdir_changed`（v1.6）/ `on_peer_reply`（v1.42）同属本组：通知型
-    // 钩子、default no-op、无能力位（web 平台的覆写只是推送一条 best-effort
-    // 出站帧 / 一条 push_notify 埋点，无新交互面）。
+    // `on_workdir_changed`（v1.6）/ `on_peer_reply`（v1.42）/ `on_windows_changed` /
+    // `on_window_event`（v1.43）同属本组：通知型钩子、default no-op、无能力位
+    // （web 平台的覆写只是推送一条 best-effort 出站帧 / 一条 push_notify 埋点，
+    // 无新交互面）。
 
     /// v1.23 说话人归属：dispatch 在每轮首条消息分派前调用——平台可据此
     /// 锚定「本轮发起者」（卡片标注/按钮点击权校验），避免被运行中的插话
@@ -481,6 +482,40 @@ pub trait Platform: Send + Sync {
     /// 回执、建立会话的欢迎文本、用户自发文本镜像上触发——那些是网关 / 用户
     /// 自己的话，不是窗口的回信。
     async fn on_peer_reply(&self, _conv: &ConvId, _body: &str) {}
+
+    /// v1.43 本地窗口快照变更通知（同步钩子）：网关轮询本机 Claude Code 注册表
+    /// 得到的窗口清单有变化（或首次建基线）时调用——`windows` 即当前全量快照
+    /// （已按 `startedAt` 倒序排好）。通知型、default no-op：IM 平台无驾驶舱
+    /// 视图；web 覆写为 `windows` 帧推送（本地窗口看板的数据源）。
+    ///
+    /// 调用点唯一：main 装配的轮询回调 → [`crate::Dispatcher::publish_windows_changed`]
+    /// → [`crate::MultiPlatform`] **广播全部子平台**（窗口清单是机器级数据，
+    /// 不是会话级——与 `peer:` 会话按归属路由的钩子不同）。
+    ///
+    /// 为什么是同步钩子：调用方是 peer 模块的轮询任务，回调里不得 await / IO
+    /// （见 `crate::peer::PeerWindowsCallback`），实现方只做非阻塞动作（入队
+    /// 一条出站帧，队列满即丢——前端有 `windows_query` 兜底）。**不要**在
+    /// `window_watch` / `windows_query` 的应答路径上调它——那两条是请求-应答，
+    /// 回帧走 web 平台自己的 sync 泵。
+    fn on_windows_changed(&self, _windows: &[crate::peer::WindowInfo]) {}
+
+    /// v1.43 窗口事件推送钩子：某个本地窗口「跑完一轮」或「进入 waiting」且
+    /// 通过推送闸门时调用（`event.push` 恒 true——`PeerState` 已按关注名单 /
+    /// 对话记录 / 节流判过，平台侧不再二次判断）。`conv` 即该窗口的
+    /// `peer:<窗口名>` 会话；通知型、default no-op，web 覆写为 push_notify
+    /// （kind = `window_turn_end` / `window_waiting`），把「关注的窗口跑完了 /
+    /// 有窗口在等你」推到离线设备。
+    ///
+    /// 调用点两处，都在 Dispatcher：轮询事件的转发
+    /// （[`crate::Dispatcher::publish_window_event`]）与 Stop 钩子上报
+    /// （`handle_peer_report`）。[`crate::MultiPlatform`] 按 conv 归属路由
+    /// （`peer:` → web，同 `on_peer_reply`）。
+    ///
+    /// **不要**在这两处之外调它：`waiting → idle`、进入 busy、窗口下线都不是
+    /// 可推送事件（`PeerState` 不产出）；也**不要**拿它替代 `on_peer_reply`
+    /// ——那是「窗口回信了」，这是「窗口跑完 / 卡住了」，各自的推送文案与
+    /// 节流闸门不同，混用会让同一段结论推两次。
+    async fn on_window_event(&self, _conv: &ConvId, _event: &crate::peer::WindowEvent) {}
 
     /// v1.42.1 长任务完成提醒（通知型钩子，default no-op、无返回值、无能力位）：
     /// 一轮长任务 / 含审批询问的轮次结束、用户不在场时，把「任务完成了」推到

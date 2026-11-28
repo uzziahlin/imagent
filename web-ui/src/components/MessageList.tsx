@@ -108,15 +108,22 @@ const EntryView = memo(function EntryView({ entry }: { entry: StreamEntry }) {
  * 当前 conv 的消息流：按到达顺序渲染（用户回显 / text / card / 审批记录）。
  * 滚动跟随：用户在底部附近（距底 <120px）时新内容自动滚到底；上滚查看历史
  * 即停止跟随，右下角浮出「回到最新」按钮（点击回底并恢复跟随）。
- * 空态（onSample 传入时）：3 个可点示例 prompt，点击即发送。
+ * 空态（onSample 传入时）：3 个可点示例 prompt，点击即发送。v1.43：传入
+ * emptyHint 时空态改显示这段说明、不出示例 prompt（示例是通用任务，发给一个
+ * 本地窗口会话没有意义）。
  */
 export function MessageList({
   entries,
   onSample,
+  emptyHint,
 }: {
   entries: StreamEntry[];
   /** 空态示例 prompt 点击发送（App 仅连接 ready 时传入）。 */
   onSample?: (text: string) => void;
+  /** v1.43 空会话的说明文字：提供时用它替代示例 prompt 列表（哪怕 onSample 已
+   *  提供）——窗口会话（peer:）首次打开、还没有任何消息时，告诉用户这里能
+   *  直接派活、回信会出现在哪。 */
+  emptyHint?: string;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   // 跟随态双份：ref 供 scroll/effect 免重渲读取，state 驱动按钮显隐
@@ -164,19 +171,25 @@ export function MessageList({
             <div className="pt-16 text-center text-sm text-ghost">
               <p>向你的 Mac 发送第一条消息</p>
               <p className="mt-1 text-xs">Enter 发送 · Shift+Enter 换行</p>
-              {onSample && (
-                <div className="mx-auto mt-6 flex max-w-xs flex-col gap-2">
-                  {SAMPLE_PROMPTS.map((p) => (
-                    <button
-                      key={p}
-                      type="button"
-                      onClick={() => onSample(p)}
-                      className="press rounded-full border border-line-strong bg-panel px-4 py-2 text-sm text-muted transition-colors hover:border-emerald-500/60 hover:text-ink"
-                    >
-                      {p}
-                    </button>
-                  ))}
-                </div>
+              {emptyHint !== undefined ? (
+                <p className="mx-auto mt-6 max-w-xs whitespace-pre-wrap break-words leading-relaxed">
+                  {emptyHint}
+                </p>
+              ) : (
+                onSample && (
+                  <div className="mx-auto mt-6 flex max-w-xs flex-col gap-2">
+                    {SAMPLE_PROMPTS.map((p) => (
+                      <button
+                        key={p}
+                        type="button"
+                        onClick={() => onSample(p)}
+                        className="press rounded-full border border-line-strong bg-panel px-4 py-2 text-sm text-muted transition-colors hover:border-emerald-500/60 hover:text-ink"
+                      >
+                        {p}
+                      </button>
+                    ))}
+                  </div>
+                )
               )}
             </div>
           )}

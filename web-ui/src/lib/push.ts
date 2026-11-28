@@ -51,6 +51,12 @@ export function notificationCopy(
     // 可为空串（窗口只回了空白等）→ 走兜底文案。
     case "peer_reply":
       return { title: "💬 窗口回复", body: digest || "本地窗口有了新回复" };
+    // v1.43：本地窗口状态变化（关注过的窗口跑完一轮 / 任一窗口卡住等人）。
+    // title = 窗口名（网关截 32 码点），可为空串 → 走兜底文案。
+    case "window_turn_end":
+      return { title: "🏁 窗口完成一轮", body: digest || "你关注的窗口跑完了" };
+    case "window_waiting":
+      return { title: "⏸ 窗口在等你", body: digest || "有个本地窗口卡住了" };
     default:
       return { title: "imagent 通知", body: digest || "有新事件，点击查看" };
   }

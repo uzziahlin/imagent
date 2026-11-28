@@ -20,6 +20,11 @@ const STATUS_META: Record<ConnStatus, { label: string; dot: string }> = {
  * 首条消息摘要，其余 convId 剥前缀）。
  * v1.4 secure：当前机器 e2e 会话已激活 → 锁形标记「已加密」；false/缺省
  * 不显示（旧网关/未握手机器）。
+ * v1.43 windowsWaiting：当前机器快照里卡在 waiting 的本地窗口数。与
+ * onOpenWindows 都提供且 > 0 时，在会话名 pill 之前出一个 amber 按钮
+ * 「⏸ N 个窗口待确认」，点击打开侧栏（移动端即会话抽屉，看板在抽屉里）。
+ * 只在「有窗口在等人」时出现——紧急且低频；「运行中」的数量放侧栏区块头，
+ * 不占状态条。桌面端侧栏常驻，点击没有可见变化（窗口行本就在眼前）。
  */
 export function StatusBar({
   status,
@@ -30,6 +35,8 @@ export function StatusBar({
   onLogout,
   onReconnect,
   onOpenDrawer,
+  windowsWaiting,
+  onOpenWindows,
 }: {
   status: ConnStatus;
   machineOnline: boolean;
@@ -44,8 +51,14 @@ export function StatusBar({
   onReconnect: () => void;
   /** 打开移动端会话抽屉（<768px 显示）。 */
   onOpenDrawer: () => void;
+  /** v1.43 当前机器处于 waiting 的本地窗口数（未提供 = 没有看板 / 不提示）。 */
+  windowsWaiting?: number;
+  /** v1.43 点击「窗口待确认」提示 → 打开侧栏（看板所在处）。缺省 = 无处可去，
+  *  不渲染提示。 */
+  onOpenWindows?: () => void;
 }) {
   const meta = STATUS_META[status];
+  const showWaiting = windowsWaiting !== undefined && windowsWaiting > 0 && onOpenWindows !== undefined;
   return (
     <header className="flex items-center gap-2 border-b border-line bg-panel px-2 py-2 backdrop-blur md:gap-3 md:px-3">
       <button
@@ -100,7 +113,24 @@ export function StatusBar({
         )}
       </div>
       <div className="ml-auto flex shrink-0 items-center gap-2">
-        <span className="max-w-[30vw] truncate rounded-full bg-panel2 px-2.5 py-0.5 font-mono text-xs text-muted">
+        {showWaiting && (
+          <button
+            type="button"
+            onClick={onOpenWindows}
+            aria-label={`有 ${windowsWaiting} 个本地窗口在等你确认，打开会话列表`}
+            className="press max-w-[40vw] shrink-0 truncate rounded-full border border-amber-500/60 bg-amber-500/10 px-2 py-0.5 text-xs text-amber-800 transition-colors hover:bg-amber-500/20 dark:border-amber-400/40 dark:text-amber-100"
+          >
+            ⏸ {windowsWaiting} 个窗口待确认
+          </button>
+        )}
+        {/* 提示出现时会话名让出宽度（30vw → 20vw）：390px 下 ☰ / 连接态 / 提示
+            （约 120px）/ 会话名 / 退出 的固定部分约 170px，pill 若仍可取到 30vw
+            （117px）整行 405px 放不下；20vw 时短名（如 s-192d）仍完整可见 */}
+        <span
+          className={`truncate rounded-full bg-panel2 px-2.5 py-0.5 font-mono text-xs text-muted ${
+            showWaiting ? "max-w-[20vw]" : "max-w-[30vw]"
+          }`}
+        >
           {convLabel}
         </span>
         <button

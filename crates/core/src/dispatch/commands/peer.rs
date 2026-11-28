@@ -6,9 +6,10 @@ use super::*;
 use crate::peer::PeerEntry;
 
 impl Dispatcher {
-    /// `/peers` —— 列出在线的 Claude Code 窗口（socket 探活过滤，排除网关
-    /// 自身条目；`startedAt` 倒序）。一行一个：名字 + kind + status，尾附
-    /// 用法提示。未启用 / 无窗口给可读文案，不报错。
+    /// `/peers` —— 列出在线的 Claude Code 窗口（socket 探活过滤 + 只认交互窗口
+    /// 条目 `PeerEntry::is_window`——网关自身与无头会话都不在内，v1.43 起；
+    /// `startedAt` 倒序）。一行一个：名字 + kind + status，尾附用法提示。
+    /// 未启用 / 无窗口给可读文案，不报错。
     pub(super) async fn cmd_peers(&self, conv: &ConvId, hint: &ReplyHint) {
         let Some(peer) = self.peer.read().clone() else {
             self.reply(

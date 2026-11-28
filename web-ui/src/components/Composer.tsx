@@ -83,6 +83,9 @@ const ASR_SEND_FAIL_TEXT = "语音识别请求发送失败，请重试";
  * label 前置 default，无快照回退内置 default/sonnet/opus/haiku）+ 行尾
  * 当前模型文本（current / 默认 · cliDefault / 默认）+ 有映射 target 的 chip
  * 加 title 提示。
+ * v1.43 完整命令名直接发送：命令名已完整敲出（去首尾空白后恰为高亮那条）时
+ * 回车不再补全而是直接发送（见 onKeyDown）；Tab 与只敲了前缀 / 高亮换了条目
+ * 的回车照旧补全。
  * 条目 ≥40px 触控高度、面板 max-h 滚动（移动端友好）。
  * v1.39 语音转文字（P1.5）：Web Speech API（原生，零服务端改动）。支持环境
  * （Chrome / iOS Safari 16.4+）在 📷 旁渲染 🎤 入口，点击开始（zh-CN 单句
@@ -371,7 +374,15 @@ export function Composer({
         setSel(e.key === "ArrowDown" ? (selIdx + 1) % n : (selIdx - 1 + n) % n);
         return;
       }
-      if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing)) {
+      // v1.43：命令名已经完整敲出来（去首尾空白后恰为高亮那条）时，回车不再补全，
+      // 而是落到下方的发送分支。此前面板打开时回车一律补一个空格：/stop、/peers、
+      // /tasks 这类无参命令把名字敲全再回车，什么都没发出去，得按两次——对「停止」
+      // 这种命令尤其误导。只敲了前缀、或用 ↑↓ 把高亮移到了别的条目，照旧补全；
+      // 需要参数的命令（/to、/model）想要「补全 + 空格」：敲一个空格或按 Tab
+      // （Tab 恒只补全）。
+      const enter = e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing;
+      const typedExact = query !== null && query.trim() === matches[selIdx].name;
+      if (e.key === "Tab" || (enter && !typedExact)) {
         e.preventDefault();
         fill(`${matches[selIdx].name} `);
         return;

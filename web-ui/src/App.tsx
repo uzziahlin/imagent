@@ -3,10 +3,12 @@ import {
   DEFAULT_CONV,
   DEFAULT_MACHINE,
   applyApprovalsSnapshot,
+  convDisplayName,
   convTitle,
   deviceSummary,
   initialState,
   newAutoConvName,
+  peerConvOf,
   reducer,
   spaceOf,
   type Action,
@@ -633,6 +635,11 @@ export default function App() {
       // 丢弃；握手完成后的这次查询走密文、往返确定，是最终对齐。TOFU 确认后
       // 的重新握手同样会走到 active，多查一次无害（幂等）。
       queryApprovals(ev.machine);
+      // v1.43 本地窗口看板的第二个触发点，理由相同：ready 时那次多半落在握手
+      // 窗口里，而 active 之后网关下发的快照恒为密文——握手完成后以密文再查
+      // 一次，才是看板数据的确定来源。新上线的机器也只经这里补查（machines
+      // 帧重排不触发第一个触发点）。
+      wsRef.current?.sendWindowsQuery(ev.machine);
     }
   };
 
@@ -901,6 +908,22 @@ export default function App() {
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- queryApprovals 仅读 wsRef / ref；依赖刻意不含 machines 与 currentMachine（理由见上）
+  }, [state.machinesKnown, status]);
+
+  // v1.43 本地窗口看板（第一个触发点）：与上方待审批查询同一纪律——ready 且多机
+  // 模式时，对**全部在线机器**各请求一次窗口快照。侧栏只显示当前机器的看板，
+  // 但切机不重发（见下），用户切过去时不该对着一块空白看板。依赖同样刻意只有
+  // machinesKnown 与 status：切机 / machines 帧重排不重发——重连后的出站突发不再
+  // 叠一层，不白占浏览器连接的限流额度。单机模式（旧 relay）不发：旧网关不认识
+  // 该帧。没有快照回来时 state.windows 里就没有该机器的键，侧栏不显示看板
+  // （旧网关 / 未启用 peer 通道）。
+  useEffect(() => {
+    if (state.machinesKnown && status === "ready") {
+      for (const machine of state.machines) {
+        wsRef.current?.sendWindowsQuery(machine);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅读 wsRef；依赖刻意不含 machines 与 currentMachine（理由见上）
   }, [state.machinesKnown, status]);
 
   // v1.8 会话历史重放：ready / 切机 / 切会话后对当前 conv 按本地高水位增量
@@ -1475,6 +1498,18 @@ export default function App() {
 
   const conv = space.convs[currentConv] ?? EMPTY_CONV;
 
+  /** v1.43 当前机器卡在 waiting 的本地窗口数（状态条「窗口待确认」提示只看当前
+   *  机器——提示点开的是当前机器的看板）。没有快照 = 0。 */
+  const windowsWaiting =
+    state.windows[state.currentMachine]?.items.filter((w) => w.status === "waiting").length ?? 0;
+  /** v1.43 窗口会话的空态说明：当前会话是 peer:<窗口名> 且还没有任何消息时，给
+   *  一句怎么用的说明（通用示例 prompt 是给 agent 会话的，发给一个本地窗口没有
+   *  意义）；会话一旦有内容（窗口回信 / 历史重放 / 用户发出的第一条）即不再显示。 */
+  const peerEmptyHint =
+    currentConv.startsWith("peer:") && conv.entries.length === 0
+      ? `这是与本地 Claude Code 窗口「${convDisplayName(currentConv)}」的对话。直接输入文字即可派活，窗口空闲时会自动开始处理；窗口的回信会出现在这里。`
+      : undefined;
+
   // v1.4 横幅派生：只展示仍在线机器的告警/阻断（掉线机器的横幅无意义）；
   // 单机模式（machinesKnown=false）恒无 e2e 态。
   const onlineMachines = state.machinesKnown ? state.machines : [];
@@ -1512,6 +1547,31 @@ export default function App() {
   /** 侧栏点选会话：仅切本地当前 conv + 清未读（reducer），移动端同时收抽屉。 */
   const selectConv = (c: string) => {
     dispatch({ type: "select_conv", convId: c });
+    setDrawerOpen(false);
+  };
+
+  /** v1.43 关注 / 取消关注一个本地窗口。新值取自用户看到并点下的那个快照标志
+   *  ——关注是跨设备的全局状态（归网关所有、由网关持久化，重启保留），快照是它
+   *  在界面上的唯一来源，本机不保存任何名单。帧被接受（sendWindowWatch 返回
+   *  true）才做乐观翻转；被拒发（未 ready / 握手 fail-closed）时不改状态——
+   *  否则断线时点一下，界面会一直说「已关注」，直到下一帧快照才被拨回来。
+   *  （不要在前端另存关注名单并对账补发：各设备各存一份时，「A 设备取消关注」
+   *  会被 B 设备的对账逻辑立刻补发回来，等于取消不了。） */
+  const toggleWindowWatch = (machine: string, name: string) => {
+    const current =
+      stateRef.current.windows[machine]?.items?.find((w) => w.name === name)?.watched ?? false;
+    if (wsRef.current?.sendWindowWatch(name, !current, machine)) {
+      dispatch({ type: "toggle_window_watch", machine, name });
+    }
+  };
+
+  /** v1.43 点窗口行：进入该窗口的会话（peer:<窗口名>——v1.41 起本地 select_conv
+   *  即可打开尚不存在的会话，由侧栏占位项兜底）。先切机器再切会话（同深链 /
+   *  审批「前往会话」的顺序依赖：select_conv 落在当前机器的会话空间；同机器时
+   *  reducer 无事可做）；移动端收抽屉。 */
+  const openWindow = (machine: string, name: string) => {
+    dispatch({ type: "select_machine", machine });
+    dispatch({ type: "select_conv", convId: peerConvOf(name) });
     setDrawerOpen(false);
   };
 
@@ -1562,6 +1622,11 @@ export default function App() {
       onSelectMachine={selectMachine}
       onCreate={openNewConv}
       onConvDelete={setDeleteTarget}
+      // v1.43：看板显示当前机器的快照；没有该机器的键（从未收到过）时 Sidebar
+      // 整块不渲染。两个回调按窗口名上抛，机器维度由这里绑定（快照即当前机器的）。
+      windows={state.windows[state.currentMachine]}
+      onSelectWindow={(name) => openWindow(state.currentMachine, name)}
+      onToggleWindowWatch={(name) => toggleWindowWatch(state.currentMachine, name)}
     />
   );
 
@@ -1609,6 +1674,8 @@ export default function App() {
           onLogout={logout}
           onReconnect={reconnect}
           onOpenDrawer={() => setDrawerOpen(true)}
+          windowsWaiting={windowsWaiting}
+          onOpenWindows={() => setDrawerOpen(true)}
         />
         {/* v1.6 会话目录常驻条：当前 conv 的工作目录（convs[convId] ?? default），
             无快照（旧网关）时整条不渲染；点击弹 WorkspacePicker 切换（选择即
@@ -1724,6 +1791,7 @@ export default function App() {
           <MessageList
             entries={conv.entries}
             onSample={status === "ready" ? (t) => sendMessage(t) : undefined}
+            emptyHint={peerEmptyHint}
           />
         </main>
         <Composer

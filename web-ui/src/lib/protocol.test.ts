@@ -16,14 +16,21 @@ import {
   newAutoConvName,
   normalizeExpiryMs,
   parseFrame,
+  peerConvOf,
+  relativeTime,
   reducer,
   spaceOf,
+  waitingForText,
+  windowStatusText,
   workspaceNameValid,
   type Action,
   type ApprovalSnapshotItem,
   type AppState,
   type InboundFrame,
+  type MachineWindows,
   type PendingApproval,
+  type WindowInfo,
+  type WindowStatus,
   type WorkspacesFrame,
 } from "./protocol";
 
@@ -3062,5 +3069,335 @@ describe("applyApprovalsSnapshot（v1.42 待审批快照对齐）", () => {
     // 再来一份更新（已不含 r1）的快照也不会把这条终态记录抹掉
     const fresh = applyApprovalsSnapshot(resolved, M, [], now);
     expect(spaceOf(fresh, M).convs[DEFAULT_CONV].entries.map((e) => e.kind)).toEqual(["approval_note"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.43 本地窗口看板：windows_query / window_watch 出站形状（契约键序）、windows
+// 快照帧入站逐字段校验（任一条目畸形整帧拒收）、reducer 整体替换 + 内容相同
+// 保持引用、toggle_window_watch 乐观翻转，以及界面文案纯函数。
+// ---------------------------------------------------------------------------
+
+describe("v1.43 本地窗口：出站帧形状 + windows 帧解析校验", () => {
+  /** 契约 §2 示例里的条目（可选键齐备的完整形态）。 */
+  const win = (extra: Record<string, unknown> = {}) => ({
+    name: "jormungandr-f8",
+    status: "idle",
+    cwd: "/Users/demo/work/api",
+    startedAt: 1795114000000,
+    statusUpdatedAt: 1795351568790,
+    watched: false,
+    ...extra,
+  });
+  const windowsFrame = (items: unknown, head = '"machine":"home-mac","hookInstalled":true,') =>
+    `{"v":1,"type":"windows",${head}"items":${JSON.stringify(items)}}`;
+
+  it("parseFrame 合法帧：契约示例原文逐字段保留（waitingFor 缺席即无键）；items 可为空数组", () => {
+    const f = parseFrame(
+      '{"v":1,"type":"windows","machine":"home-mac","hookInstalled":true,"items":[' +
+        '{"name":"jormungandr-f8","status":"idle","cwd":"/Users/demo/work/api","startedAt":1795114000000,"statusUpdatedAt":1795351568790,"watched":false},' +
+        '{"name":"imagent-a7","status":"waiting","waitingFor":"dialog open","cwd":"/Users/demo/work/b","startedAt":1795115000000,"statusUpdatedAt":1795352000000,"watched":true}]}',
+    );
+    expect(f).toEqual({
+      v: 1,
+      type: "windows",
+      machine: "home-mac",
+      hookInstalled: true,
+      items: [
+        {
+          name: "jormungandr-f8",
+          status: "idle",
+          cwd: "/Users/demo/work/api",
+          startedAt: 1795114000000,
+          statusUpdatedAt: 1795351568790,
+          watched: false,
+        },
+        {
+          name: "imagent-a7",
+          status: "waiting",
+          waitingFor: "dialog open",
+          cwd: "/Users/demo/work/b",
+          startedAt: 1795115000000,
+          statusUpdatedAt: 1795352000000,
+          watched: true,
+        },
+      ],
+    });
+    // 空数组 = peer 通道已启用但当前没有在线窗口（合法且有意义：键不省略）
+    expect(parseFrame(windowsFrame([]))).toEqual({
+      v: 1,
+      type: "windows",
+      machine: "home-mac",
+      hookInstalled: true,
+      items: [],
+    });
+    expect(parseFrame(windowsFrame([win()], '"machine":"home-mac","hookInstalled":false,'))).toEqual({
+      v: 1,
+      type: "windows",
+      machine: "home-mac",
+      hookInstalled: false,
+      items: [win()],
+    });
+  });
+
+  it("parseFrame 可选键缺席放行：waitingFor / startedAt / statusUpdatedAt 不带键的条目合法；四种 status 均合法；cwd 可为空串", () => {
+    for (const status of ["busy", "idle", "waiting", "unknown"]) {
+      expect(parseFrame(windowsFrame([{ name: "w", status, cwd: "", watched: true }])), status).toEqual({
+        v: 1,
+        type: "windows",
+        machine: "home-mac",
+        hookInstalled: true,
+        items: [{ name: "w", status, cwd: "", watched: true }],
+      });
+    }
+    // waiting 的 waitingFor 也可缺席（契约：为 None 时省略键）
+    expect(parseFrame(windowsFrame([{ name: "w", status: "waiting", cwd: "/x", watched: false }]))).toBeTruthy();
+    // waitingFor 可以是任意字符串（没见过的原因原样放行，界面按原文显示）
+    expect(parseFrame(windowsFrame([win({ status: "waiting", waitingFor: "something new" })]))).toBeTruthy();
+  });
+
+  it("parseFrame 拒帧：status 越界（非四值 / 缺失 / 空串 / 非字符串）——好条目救不了坏条目", () => {
+    for (const status of ["running", "Idle", "", undefined, 1, null, true]) {
+      expect(parseFrame(windowsFrame([win(), win({ name: "bad", status })])), String(status)).toBeNull();
+    }
+  });
+
+  it("parseFrame 拒帧：machine 缺失 / 空串 / 非字符串；hookInstalled 缺失 / 非布尔；items 缺失 / 非数组", () => {
+    expect(parseFrame(windowsFrame([win()], '"hookInstalled":true,'))).toBeNull();
+    expect(parseFrame(windowsFrame([win()], '"machine":"","hookInstalled":true,'))).toBeNull();
+    expect(parseFrame(windowsFrame([win()], '"machine":7,"hookInstalled":true,'))).toBeNull();
+    expect(parseFrame(windowsFrame([win()], '"machine":null,"hookInstalled":true,'))).toBeNull();
+    expect(parseFrame(windowsFrame([win()], '"machine":"home-mac",'))).toBeNull();
+    expect(parseFrame(windowsFrame([win()], '"machine":"home-mac","hookInstalled":"true",'))).toBeNull();
+    expect(parseFrame(windowsFrame([win()], '"machine":"home-mac","hookInstalled":1,'))).toBeNull();
+    expect(parseFrame(windowsFrame([win()], '"machine":"home-mac","hookInstalled":null,'))).toBeNull();
+    expect(parseFrame('{"v":1,"type":"windows","machine":"home-mac","hookInstalled":true}')).toBeNull();
+    expect(parseFrame('{"v":1,"type":"windows","machine":"home-mac","hookInstalled":true,"items":{}}')).toBeNull();
+    expect(parseFrame('{"v":1,"type":"windows","machine":"home-mac","hookInstalled":true,"items":null}')).toBeNull();
+    expect(parseFrame('{"v":1,"type":"windows","machine":"home-mac","hookInstalled":true,"items":"w"}')).toBeNull();
+  });
+
+  it("parseFrame 拒帧：任一条目畸形即整帧拒收（缺字段 / 类型不符 / 非对象）", () => {
+    const badItems: unknown[] = [
+      "jormungandr-f8",
+      null,
+      [],
+      win({ name: undefined }),
+      win({ name: "" }),
+      win({ name: 7 }),
+      win({ waitingFor: 3 }),
+      win({ waitingFor: null }),
+      win({ cwd: undefined }),
+      win({ cwd: null }),
+      win({ cwd: 5 }),
+      win({ startedAt: "1795114000000" }),
+      win({ startedAt: null }),
+      win({ statusUpdatedAt: "1795351568790" }),
+      win({ statusUpdatedAt: null }),
+      win({ watched: undefined }),
+      win({ watched: "false" }),
+      win({ watched: 0 }),
+      win({ watched: null }),
+    ];
+    for (const bad of badItems) {
+      expect(parseFrame(windowsFrame([win(), bad])), JSON.stringify(bad)).toBeNull();
+    }
+  });
+
+  it("parseFrame 拒帧：startedAt / statusUpdatedAt 须为有限数字（1e999 解析成 Infinity）；有限值（含 0 与小数）放行", () => {
+    const item = (patch: string) =>
+      `{"v":1,"type":"windows","machine":"home-mac","hookInstalled":true,"items":[{"name":"w","status":"idle","cwd":"/x"${patch},"watched":false}]}`;
+    expect(parseFrame(item(',"startedAt":1e999'))).toBeNull();
+    expect(parseFrame(item(',"statusUpdatedAt":1e999'))).toBeNull();
+    expect(parseFrame(item(',"startedAt":0,"statusUpdatedAt":1.5'))).toBeTruthy();
+  });
+});
+
+describe("v1.43 本地窗口：reducer（windows 整体替换 + 内容相同保持引用；toggle_window_watch）", () => {
+  const M = "home-mac";
+  const IDLE: WindowInfo = {
+    name: "jormungandr-f8",
+    status: "idle",
+    cwd: "/Users/demo/work/api",
+    startedAt: 1795114000000,
+    statusUpdatedAt: 1795351568790,
+    watched: false,
+  };
+  const WAIT: WindowInfo = {
+    name: "imagent-a7",
+    status: "waiting",
+    waitingFor: "dialog open",
+    cwd: "/Users/demo/work/b",
+    startedAt: 1795115000000,
+    statusUpdatedAt: 1795352000000,
+    watched: true,
+  };
+  const BUSY: WindowInfo = { name: "runner", status: "busy", cwd: "/tmp", watched: false };
+  /** 入站 windows 帧（经 parseFrame，与真实路径一致）。 */
+  const windowsF = (items: unknown[], machine = M, hookInstalled = true): InboundFrame =>
+    frame(
+      `{"v":1,"type":"windows","machine":"${machine}","hookInstalled":${hookInstalled},"items":${JSON.stringify(items)}}`,
+    );
+  const snapOf = (s: AppState, machine = M): MachineWindows | undefined => s.windows[machine];
+  const watchedOf = (s: AppState, name: string, machine = M): boolean | undefined =>
+    snapOf(s, machine)?.items.find((w) => w.name === name)?.watched;
+
+  it("initialState.windows 为 {}：没有某机器的键 = 从未收到过它的快照（旧网关 / 未启用 peer 通道）", () => {
+    expect(initialState().windows).toEqual({});
+  });
+
+  it("整体替换：后一帧的条目与 hookInstalled 以最新一帧为准（不与旧条目合并）", () => {
+    const s1 = run(initialState(), { type: "frame", frame: windowsF([IDLE, WAIT]) });
+    expect(snapOf(s1)).toEqual({ hookInstalled: true, items: [IDLE, WAIT] });
+    const s2 = run(s1, { type: "frame", frame: windowsF([BUSY], M, false) });
+    expect(snapOf(s2)).toEqual({ hookInstalled: false, items: [BUSY] });
+    // 清空 = 该机器此刻已没有在线窗口（键仍在，items 为空数组）
+    const s3 = run(s2, { type: "frame", frame: windowsF([]) });
+    expect(snapOf(s3)).toEqual({ hookInstalled: true, items: [] });
+  });
+
+  it("内容相同返回原 state 引用：应答查询与主动推送给来同一份快照时不触发重渲染", () => {
+    const s1 = run(initialState(), { type: "frame", frame: windowsF([IDLE, WAIT]) });
+    // 再解析一次得到的是「新对象、同内容」的帧
+    expect(run(s1, { type: "frame", frame: windowsF([IDLE, WAIT]) })).toBe(s1);
+    const s2 = run(s1, { type: "frame", frame: windowsF([IDLE, WAIT], M, false) });
+    expect(run(s2, { type: "frame", frame: windowsF([IDLE, WAIT], M, false) })).toBe(s2);
+    // 可选键缺席的条目同样按内容比较
+    const s3 = run(s2, { type: "frame", frame: windowsF([BUSY]) });
+    expect(run(s3, { type: "frame", frame: windowsF([BUSY]) })).toBe(s3);
+    // 空快照重复到达亦幂等
+    const s4 = run(s3, { type: "frame", frame: windowsF([]) });
+    expect(run(s4, { type: "frame", frame: windowsF([]) })).toBe(s4);
+  });
+
+  it("任一字段不同即新引用：逐字段探测七个条目字段 + hookInstalled + 条目数 / 顺序 / 可选键有无", () => {
+    const base = run(initialState(), { type: "frame", frame: windowsF([IDLE, WAIT]) });
+    const variants: unknown[][] = [
+      [{ ...IDLE, name: "other" }, WAIT],
+      [{ ...IDLE, status: "busy" }, WAIT],
+      [{ ...IDLE, status: "waiting", waitingFor: "dialog open" }, WAIT],
+      [IDLE, { ...WAIT, waitingFor: "input needed" }],
+      [{ ...IDLE, cwd: "/elsewhere" }, WAIT],
+      [{ ...IDLE, startedAt: 1 }, WAIT],
+      [{ ...IDLE, statusUpdatedAt: 1795351568791 }, WAIT],
+      [{ ...IDLE, watched: true }, WAIT],
+      [WAIT, IDLE],
+      [IDLE],
+      [IDLE, WAIT, BUSY],
+    ];
+    for (const items of variants) {
+      expect(run(base, { type: "frame", frame: windowsF(items) }), JSON.stringify(items)).not.toBe(base);
+    }
+    // 可选键「有 → 无」也是变化（等待原因被清掉）：单独构造，免得 undefined 被 JSON 序列化吞掉
+    const noReason: WindowInfo = {
+      name: WAIT.name,
+      status: WAIT.status,
+      cwd: WAIT.cwd,
+      watched: WAIT.watched,
+    };
+    const withReason = run(initialState(), { type: "frame", frame: windowsF([WAIT]) });
+    expect(run(withReason, { type: "frame", frame: windowsF([noReason]) })).not.toBe(withReason);
+    // hookInstalled 单独变化
+    expect(run(base, { type: "frame", frame: windowsF([IDLE, WAIT], M, false) })).not.toBe(base);
+  });
+
+  it("两台机器互不影响：各自的快照独立落表，一台的后续快照不动另一台的条目对象", () => {
+    let s = run(initialState(), { type: "frame", frame: windowsF([IDLE], M) });
+    s = run(s, { type: "frame", frame: windowsF([BUSY], "work-mac", false) });
+    expect(snapOf(s, M)).toEqual({ hookInstalled: true, items: [IDLE] });
+    expect(snapOf(s, "work-mac")).toEqual({ hookInstalled: false, items: [BUSY] });
+    const homeBefore = snapOf(s, M);
+    s = run(s, { type: "frame", frame: windowsF([], "work-mac", false) });
+    expect(snapOf(s, M)).toBe(homeBefore);
+    expect(snapOf(s, "work-mac")?.items).toEqual([]);
+  });
+
+  it("toggle_window_watch：翻转该机器快照里该窗口的 watched，其余条目与 hookInstalled 不动", () => {
+    const s0 = run(initialState(), { type: "frame", frame: windowsF([IDLE, WAIT], M, false) });
+    const s1 = run(s0, { type: "toggle_window_watch", machine: M, name: IDLE.name });
+    expect(watchedOf(s1, IDLE.name)).toBe(true);
+    expect(snapOf(s1, M)).toEqual({ hookInstalled: false, items: [{ ...IDLE, watched: true }, WAIT] });
+    const s2 = run(s1, { type: "toggle_window_watch", machine: M, name: WAIT.name });
+    expect(watchedOf(s2, WAIT.name)).toBe(false);
+    // 每个条目各翻两次（假 → 真 → 假 / 真 → 假 → 真）：内容回到原样
+    const s3 = run(s2, { type: "toggle_window_watch", machine: M, name: IDLE.name });
+    expect(watchedOf(s3, IDLE.name)).toBe(false);
+    expect(watchedOf(s3, WAIT.name)).toBe(false); // WAIT 只翻了一次，此刻仍是假
+    const s4 = run(s3, { type: "toggle_window_watch", machine: M, name: WAIT.name });
+    expect(snapOf(s4, M)).toEqual(snapOf(s0, M));
+  });
+
+  it("toggle_window_watch：未知窗口 / 未知机器 no-op（返回原 state 引用）", () => {
+    const s0 = run(initialState(), { type: "frame", frame: windowsF([IDLE]) });
+    expect(run(s0, { type: "toggle_window_watch", machine: M, name: "no-such-window" })).toBe(s0);
+    expect(run(s0, { type: "toggle_window_watch", machine: "work-mac", name: IDLE.name })).toBe(s0);
+  });
+
+  it("toggle_window_watch：不可变——原 state 及其条目对象未被改写（冻结对象上执行，任何写入即抛错）", () => {
+    // 运行时冻结、类型上仍按可变声明（双重断言）：reducer 若改写入参，严格模式下
+    // 直接抛错；而类型检查照常覆盖 reducer 的签名。
+    const frozenItems = Object.freeze([Object.freeze(IDLE), Object.freeze(WAIT)]) as unknown as WindowInfo[];
+    const frozenSnap: MachineWindows = Object.freeze({ hookInstalled: true, items: frozenItems });
+    const s0: AppState = {
+      ...initialState(),
+      windows: Object.freeze({ [M]: frozenSnap }),
+    };
+    const s1 = run(s0, { type: "toggle_window_watch", machine: M, name: IDLE.name });
+    expect(watchedOf(s0, IDLE.name)).toBe(false);
+    expect(watchedOf(s1, IDLE.name)).toBe(true);
+    expect(snapOf(s1, M)).not.toBe(snapOf(s0, M));
+    expect(snapOf(s1, M)?.items).not.toBe(snapOf(s0, M)?.items);
+    // 没被点的那一行保持同一引用（不白建对象）
+    expect(snapOf(s1, M)?.items[1]).toBe(WAIT);
+  });
+});
+
+describe("v1.43 本地窗口纯函数（界面文案）", () => {
+  it("peerConvOf：窗口名 → `peer:<窗口名>`（v1.41 既有会话形态；convDisplayName 可剥回窗口名）", () => {
+    expect(peerConvOf("jormungandr-f8")).toBe("peer:jormungandr-f8");
+    expect(convDisplayName(peerConvOf("imagent-a7"))).toBe("imagent-a7");
+  });
+
+  it("windowStatusText：四值映射（Record 类型穷举——漏一个值即类型错误）", () => {
+    const all: Record<WindowStatus, string> = {
+      busy: windowStatusText("busy"),
+      idle: windowStatusText("idle"),
+      waiting: windowStatusText("waiting"),
+      unknown: windowStatusText("unknown"),
+    };
+    expect(all).toEqual({ busy: "运行中", idle: "空闲", waiting: "等待确认", unknown: "未知" });
+  });
+
+  it("waitingForText：已观察到的四种等待原因 → 人话；没见过的原因原样返回", () => {
+    expect(waitingForText("dialog open")).toBe("等你确认");
+    expect(waitingForText("input needed")).toBe("等你输入");
+    expect(waitingForText("sandbox request")).toBe("等沙箱授权");
+    expect(waitingForText("goal proposal")).toBe("等你定目标");
+    expect(waitingForText("mcp auth")).toBe("mcp auth");
+    expect(waitingForText("")).toBe("");
+  });
+
+  it("relativeTime：边界——59 秒 / 60 秒 / 59 分 / 60 分 / 23 小时 / 24 小时", () => {
+    const now = 1_795_000_000_000;
+    const ago = (ms: number): string => relativeTime(now - ms, now);
+    expect(ago(0)).toBe("刚刚");
+    expect(ago(59_000)).toBe("刚刚");
+    expect(ago(60_000)).toBe("1 分钟前");
+    expect(ago(119_999)).toBe("1 分钟前");
+    expect(ago(3_540_000)).toBe("59 分钟前");
+    expect(ago(3_600_000)).toBe("1 小时前");
+    expect(ago(23 * 3_600_000)).toBe("23 小时前");
+    expect(ago(86_399_999)).toBe("23 小时前");
+    expect(ago(86_400_000)).toBe("1 天前");
+    expect(ago(3 * 86_400_000)).toBe("3 天前");
+  });
+
+  it("relativeTime：缺失返回空串；时间基准取自参数（不偷读系统时钟）；时钟偏差下的未来时间戳按「刚刚」", () => {
+    const now = 1_795_000_000_000;
+    expect(relativeTime(undefined, now)).toBe("");
+    expect(relativeTime(now + 5_000, now)).toBe("刚刚");
+    // 同一个 at，now 推进一小时后文案随之变化
+    expect(relativeTime(now - 60_000, now)).toBe("1 分钟前");
+    expect(relativeTime(now - 60_000, now + 3_600_000)).toBe("1 小时前");
   });
 });

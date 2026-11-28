@@ -59,6 +59,11 @@ function notificationCopy(kind, title) {
     // v1.42：本地 Claude 窗口（peer 通道）回信；title 可为空串 → 兜底文案
     case "peer_reply":
       return { title: "💬 窗口回复", body: digest || "本地窗口有了新回复" };
+    // v1.43：本地窗口状态变化；title = 窗口名，可为空串 → 兜底文案
+    case "window_turn_end":
+      return { title: "🏁 窗口完成一轮", body: digest || "你关注的窗口跑完了" };
+    case "window_waiting":
+      return { title: "⏸ 窗口在等你", body: digest || "有个本地窗口卡住了" };
     default:
       return { title: "imagent 通知", body: digest || "有新事件，点击查看" };
   }

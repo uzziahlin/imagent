@@ -1954,3 +1954,386 @@ async fn loopback_peer_reply_push_notify_full_chain() {
     handle.wait().await;
     drop(platform);
 }
+
+// ---------------------------------------------------------------------------
+// v1.43 本地窗口看板（windows_query / window_watch → windows）+ 窗口事件推送
+// ---------------------------------------------------------------------------
+
+/// v1.43 测试用 peer 共享态：已建基线的两窗口快照（startedAt 倒序：win-a 在
+/// 前）+ 钩子已装（生产由 PeerServer 的轮询任务写入，形态相同）。
+fn windows_state() -> Arc<imagent_core::peer::PeerState> {
+    use imagent_core::peer::{PeerState, WindowInfo, WindowStatus};
+    let state = Arc::new(PeerState::new());
+    let w = |name: &str, status: WindowStatus, started: i64| WindowInfo {
+        name: name.into(),
+        status,
+        waiting_for: None,
+        cwd: format!("/tmp/{name}"),
+        started_at: Some(started),
+        status_updated_at: Some(1_000),
+        watched: false,
+    };
+    let _ = state.apply_snapshot(
+        &[
+            w("win-a", WindowStatus::Idle, 200),
+            w("win-b", WindowStatus::Busy, 100),
+        ],
+        std::time::Instant::now(),
+    );
+    state.set_hook_installed(true);
+    state
+}
+
+/// `windows_state()` 对应的 windows 帧（machine = 本平台自报的 test-mac）。
+const WINDOWS_FRAME: &str = r#"{"v":1,"type":"windows","machine":"test-mac","hookInstalled":true,"items":[{"name":"win-a","status":"idle","cwd":"/tmp/win-a","startedAt":200,"statusUpdatedAt":1000,"watched":false},{"name":"win-b","status":"busy","cwd":"/tmp/win-b","startedAt":100,"statusUpdatedAt":1000,"watched":false}]}"#;
+
+/// v1.43：发一条 enc 包裹的业务帧，读到内层类型为 `want` 的 enc 帧为止，返回
+/// 内层 JSON 原文；断言中继可见的 enc 信封不泄露内帧类型 / 窗口名 / cwd
+/// （E2E 中继盲化不因新帧破口）。
+async fn send_enc_until_inner(br: &mut Ws, k: &[u8; 32], frame: &str, want: &str) -> String {
+    br.send(Message::text(
+        serde_json::json!({
+            "v": 1, "type": "enc", "machine": MACHINE,
+            "box": e2e_seal(k, frame),
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    loop {
+        let envelope = next_raw_of_type(br, "enc").await;
+        let boxed = serde_json::from_str::<serde_json::Value>(&envelope).unwrap()["box"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let inner = e2e_open(k, &boxed);
+        let is_want = serde_json::from_str::<serde_json::Value>(&inner).unwrap()["type"] == want;
+        if is_want {
+            assert!(
+                !envelope.contains(r#""type":"windows""#)
+                    && !envelope.contains("win-a")
+                    && !envelope.contains("/tmp/win-"),
+                "中继可见的 enc 帧体不得泄露内帧类型 / 窗口名 / cwd：{envelope}"
+            );
+            return inner;
+        }
+    }
+}
+
+/// v1.43 本地窗口看板全链路（真实 WS 回环）：
+/// - peer 通道未启用（web 平台未注入共享态）：`windows_query` **不回任何帧**
+///   ——前端据此不显示看板；
+/// - 注入共享态后，明文期 `windows_query` → `windows` 帧**字节级**（machine =
+///   本机、hookInstalled、items 已排序）；
+/// - E2E 会话活跃后（生产形态）：enc 包裹的 `windows_query` 进、enc 包裹的
+///   `windows` 出，中继只见密文；
+/// - `window_watch` 经 client 层改共享态并重发快照：回帧里 `watched` 收敛为
+///   true / false（所有在线设备以网关为准）；关注变化经共享态的变化回调送达
+///   持久化方（名单归网关所有、跨设备全局——前端不存名单、不对账）；畸形
+///   `window_watch` 不改状态、不回帧、不触发持久化。
+#[tokio::test]
+async fn loopback_windows_query_and_watch_e2e_encrypted() {
+    let (handle, sk) = spawn_test_relay().await;
+    let addr = handle.addr;
+    let key_path = e2e_test_key_path("windows");
+    let p = WebPlatform::new_with_e2e(
+        format!("ws://{addr}/gateway"),
+        GatewayCredential::Key(sk),
+        "default".to_string(),
+        MACHINE.to_string(),
+        &key_path,
+        loopback_store("windows").await,
+        valid_ws_dir(),
+        nop_models(),
+        Vec::new(), // v1.36 backends 名单：回环测试不驱动引擎选择，空名单整段缺席
+        imagent_web::AsrContext::default(), // v1.40 未配置 → 快照 asr 段缺席
+        300,        // v1.37 审批超时预算（approval_request 帧 timeoutSecs）
+    );
+    eventually(Duration::from_secs(10), || p.is_online()).await;
+
+    // 浏览器登录（session id 稍后供 E2E 握手用）。
+    let mut br = connect_ws(&addr, "/ws", None).await;
+    br.send(Message::text(format!(
+        r#"{{"v":1,"type":"hello","token":"{USER_TOKEN}"}}"#
+    )))
+    .await
+    .unwrap();
+    let ack: serde_json::Value = serde_json::from_str(&next_text(&mut br).await).unwrap();
+    let sid = ack["session"]["id"].as_str().unwrap().to_string();
+    let _machines = next_of_type(&mut br, "machines").await;
+
+    // ---- peer 通道未启用：不回任何帧（前端收不到 windows 即不显示看板）----
+    br.send(Message::text(format!(
+        r#"{{"v":1,"type":"windows_query","machine":"{MACHINE}"}}"#
+    )))
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), next_of_type(&mut br, "windows"))
+            .await
+            .is_err(),
+        "peer 未启用的网关不得回 windows 帧"
+    );
+
+    // ---- 注入共享态（生产：PeerServer::start 成功后 main 后填）----
+    // 关注名单由网关持久化（跨设备全局状态）：window_watch 经真实 client 路径改
+    // 共享态后，变化回调（生产装配为落盘泵）必须收到排序后的完整名单。
+    let state = windows_state();
+    let persisted: Arc<std::sync::Mutex<Vec<Vec<String>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let persisted_cb = persisted.clone();
+    state.set_watch_changed_callback(Some(Arc::new(move |names: Vec<String>| {
+        persisted_cb.lock().unwrap().push(names);
+    })));
+    p.set_peer_state(state.clone());
+
+    // ---- 明文期：字节级契约 ----
+    br.send(Message::text(format!(
+        r#"{{"v":1,"type":"windows_query","machine":"{MACHINE}"}}"#
+    )))
+    .await
+    .unwrap();
+    assert_eq!(
+        next_raw_of_type(&mut br, "windows").await,
+        WINDOWS_FRAME,
+        "windows_query 应答须与契约逐字节一致"
+    );
+
+    // ---- E2E 握手：此后业务帧双向 enc 包裹（生产形态）----
+    let k = e2e_handshake(&mut br, &sid).await;
+    assert_eq!(
+        send_enc_until_inner(&mut br, &k, r#"{"v":1,"type":"windows_query"}"#, "windows").await,
+        WINDOWS_FRAME,
+        "enc 包裹的 windows_query 进、enc 包裹的 windows 出"
+    );
+
+    // ---- window_watch：关注 → 重发的快照里 watched 收敛为 true ----
+    let inner = send_enc_until_inner(
+        &mut br,
+        &k,
+        r#"{"v":1,"type":"window_watch","machine":"test-mac","name":"win-b","watch":true}"#,
+        "windows",
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&inner).unwrap();
+    assert!(state.is_watched("win-b"), "关注名单写进共享态");
+    assert_eq!(
+        *persisted.lock().unwrap(),
+        vec![vec!["win-b".to_string()]],
+        "关注变化经回调送达持久化方（入参 = 排序后的完整名单）"
+    );
+    let items = v["items"].as_array().expect("items 为数组");
+    assert_eq!(items.len(), 2, "{v}");
+    assert_eq!(items[0]["name"], "win-a");
+    assert_eq!(items[0]["watched"], false, "未关注的窗口不受影响：{v}");
+    assert_eq!(items[1]["name"], "win-b");
+    assert_eq!(
+        items[1]["watched"], true,
+        "window_watch 后回的快照 watched:true：{v}"
+    );
+    // 主动推送（轮询发现变化）同样是 enc 包裹的 windows 帧。
+    let pushed = state.windows();
+    p.on_windows_changed(&pushed);
+    let inner = next_enc_inner(&mut br, &k, "windows").await;
+    assert_eq!(
+        inner,
+        WINDOWS_FRAME.replace(
+            r#""name":"win-b","status":"busy","cwd":"/tmp/win-b","startedAt":100,"statusUpdatedAt":1000,"watched":false"#,
+            r#""name":"win-b","status":"busy","cwd":"/tmp/win-b","startedAt":100,"statusUpdatedAt":1000,"watched":true"#
+        ),
+        "主动推送（轮询发现变化）同样 enc 包裹、同一帧形态、watched 已收敛"
+    );
+
+    // ---- 取消关注 → false ----
+    let inner = send_enc_until_inner(
+        &mut br,
+        &k,
+        r#"{"v":1,"type":"window_watch","name":"win-b","watch":false}"#,
+        "windows",
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&inner).unwrap();
+    assert!(!state.is_watched("win-b"));
+    assert_eq!(v["items"][1]["watched"], false, "{v}");
+    assert_eq!(
+        *persisted.lock().unwrap(),
+        vec![vec!["win-b".to_string()], vec![]],
+        "取消关注同样落盘（空名单也是一次变化）"
+    );
+
+    // ---- 畸形 window_watch（缺 watch）：Warn 丢弃——不改状态、不回帧 ----
+    br.send(Message::text(
+        serde_json::json!({
+            "v": 1, "type": "enc", "machine": MACHINE,
+            "box": e2e_seal(&k, r#"{"v":1,"type":"window_watch","name":"win-a"}"#),
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), next_raw_of_type(&mut br, "enc"))
+            .await
+            .is_err(),
+        "畸形 window_watch 不回帧"
+    );
+    assert!(!state.is_watched("win-a"), "畸形 window_watch 不改关注名单");
+    assert_eq!(
+        persisted.lock().unwrap().len(),
+        2,
+        "畸形 window_watch 不触发持久化"
+    );
+
+    // windows_query / window_watch 不进 recv（不驱动 agent）。
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), p.recv())
+            .await
+            .is_err(),
+        "窗口帧不应产生入站消息"
+    );
+
+    let _ = std::fs::remove_file(&key_path);
+    handle.shutdown();
+    handle.wait().await;
+    drop(p);
+}
+
+/// 读下一条能解出内层类型 `want` 的 enc 帧，返回内层 JSON 原文（不发送任何
+/// 帧——观测网关主动推送用）。
+async fn next_enc_inner(br: &mut Ws, k: &[u8; 32], want: &str) -> String {
+    loop {
+        let envelope = next_raw_of_type(br, "enc").await;
+        let boxed = serde_json::from_str::<serde_json::Value>(&envelope).unwrap()["box"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let inner = e2e_open(k, &boxed);
+        if serde_json::from_str::<serde_json::Value>(&inner).unwrap()["type"] == want {
+            return inner;
+        }
+    }
+}
+
+/// v1.43 窗口事件推送全链路：登录 → HTTP 订阅 → 断开浏览器（离线）→ 平台
+/// `on_window_event`（dispatch 在窗口跑完一轮 / 进入 waiting 且过推送闸门时
+/// 调用）→ `push_notify{kind=window_turn_end | window_waiting, convId=
+/// peer:<窗口名>}` 明文管理帧 → **真实 relay 接受两个新 kind** 并投递（mock
+/// push 服务收到 vapid + aes128gcm POST）。钉的是跨 crate 契约：网关侧
+/// `PushNotifyKind::as_str` 与中继侧白名单逐字一致——任一侧漂移（或白名单漏了
+/// 一个 kind），对应的投递就不会发生（下方两次 `recv_delivery` 各自 10s 超时
+/// 即失败）。载荷里 kind 字面量的原样透传由 relay push.rs 的单测钉住
+/// （`payload_json_window_kinds_passthrough`）——密文经 aes128gcm 记录填充，
+/// 这里不凭长度反推。
+#[tokio::test]
+async fn loopback_window_events_push_notify_full_chain() {
+    use imagent_core::peer::{WindowEvent, WindowEventKind};
+    std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
+    std::env::set_var("no_proxy", "127.0.0.1,localhost");
+
+    let (handle, sk) = spawn_test_relay().await;
+    let addr = handle.addr;
+    let platform = WebPlatform::new_with_e2e(
+        format!("ws://{addr}/gateway"),
+        GatewayCredential::Key(sk),
+        "default".to_string(),
+        MACHINE.to_string(),
+        &e2e_test_key_path("window-events-push"),
+        loopback_store("window-events-push").await,
+        valid_ws_dir(),
+        nop_models(),
+        Vec::new(), // v1.36 backends 名单：回环测试不驱动引擎选择，空名单整段缺席
+        imagent_web::AsrContext::default(), // v1.40 未配置 → 快照 asr 段缺席
+        300,        // v1.37 审批超时预算（approval_request 帧 timeoutSecs）
+    );
+    eventually(Duration::from_secs(10), || platform.is_online()).await;
+
+    // 浏览器登录拿 sessionToken + 订阅（端点 = loopback mock push 服务）。
+    let mut ws = connect_ws(&addr, "/ws", None).await;
+    ws.send(Message::text(format!(
+        r#"{{"v":1,"type":"hello","token":"{USER_TOKEN}"}}"#
+    )))
+    .await
+    .unwrap();
+    let ack = next_text(&mut ws).await;
+    let v: serde_json::Value = serde_json::from_str(&ack).unwrap();
+    let token = v["session"]["token"].as_str().unwrap().to_string();
+    let (push_addr, mut push_rx) = spawn_mock_push_service(200).await;
+    let ep = format!("http://{push_addr}/fcm/send/window-events");
+    let (status, resp) = http_json(
+        &addr,
+        "POST",
+        "/push/subscribe",
+        Some(&token),
+        Some(
+            &serde_json::json!({
+                "endpoint": ep,
+                "keys": {"p256dh": PUSH_P256DH, "auth": PUSH_AUTH},
+            })
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(status, "200", "{resp}");
+
+    // 断开浏览器 WS → 订阅会话离线（SPA 在线免打扰解除）。
+    drop(ws);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    /// 收一次投递（10s 内），返回 (authorization, encoding, body_len)。
+    async fn recv_delivery(
+        rx: &mut mpsc::UnboundedReceiver<(String, String, usize)>,
+    ) -> (String, String, usize) {
+        tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("离线订阅应收到窗口事件推送（relay 须接受该 kind）")
+            .expect("channel 开着")
+    }
+    let event = |kind: WindowEventKind| WindowEvent {
+        name: "win-a".into(),
+        kind,
+        waiting_for: None,
+        push: true,
+    };
+
+    // 跑完一轮：kind=window_turn_end。
+    platform
+        .on_window_event(
+            &ConvId("peer:win-a".into()),
+            &event(WindowEventKind::TurnEnd),
+        )
+        .await;
+    let (authorization, encoding, body_len) = recv_delivery(&mut push_rx).await;
+    assert_eq!(encoding, "aes128gcm", "RFC8188 aes128gcm 内容编码");
+    assert!(
+        authorization.starts_with("vapid t="),
+        "VAPID Authorization 头：{authorization}"
+    );
+    assert!(body_len > 0, "加密载荷非空");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), push_rx.recv())
+            .await
+            .is_err(),
+        "on_window_event 恰投递一次"
+    );
+
+    // 进入 waiting：kind=window_waiting（独立投递——白名单漏掉它则收不到）。
+    platform
+        .on_window_event(
+            &ConvId("peer:win-a".into()),
+            &event(WindowEventKind::Waiting),
+        )
+        .await;
+    let (_, encoding, body_len) = recv_delivery(&mut push_rx).await;
+    assert_eq!(encoding, "aes128gcm");
+    assert!(body_len > 0, "加密载荷非空");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), push_rx.recv())
+            .await
+            .is_err(),
+        "on_window_event 恰投递一次"
+    );
+
+    handle.shutdown();
+    handle.wait().await;
+    drop(platform);
+}

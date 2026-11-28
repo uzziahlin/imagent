@@ -80,6 +80,12 @@
 // v1.42 中继瞬态关闭不再当认证失败：close 1008 的 reason 若属瞬态白名单
 // （rate limited / auth timeout / binary not supported）→ 走指数退避重连而非
 // onAuthFailed（此前被限流即静默登出；见 TRANSIENT_CLOSE_REASONS）。
+// v1.43 本地窗口看板：sendWindowsQuery(machine) 出站 windows_query 业务帧、
+// sendWindowWatch(name, watch, machine) 出站 window_watch 业务帧（均 E2E 加密，
+// 同 message 族路由）；入站 windows 帧（网关应答查询 / 处理完关注 / 轮询发现
+// 快照变化时下发）经 onFrame 进 protocol reducer——active 机器的明文 windows
+// 同属注入面（伪造一帧就能在看板上塞出「等你确认」的假窗口并顶掉状态条提示），
+// 与 approvals 同规丢弃 + 降级告警。
 
 import {
   DEFAULT_MACHINE,
@@ -519,6 +525,25 @@ export class WsManager {
     return this.send({ v: 1, type: "approvals_query", machine });
   }
 
+  // ---- v1.43 本地窗口看板（网关消费的业务帧；同 message 族路由约定，经 e2e
+  //      outbound 判定包装；应答 windows 帧经 onFrame 进 reducer）----
+
+  /** 请求某机器当前在线的本地窗口快照：网关回 windows{machine, hookInstalled,
+   *  items}。ready 后 / 该机器加密会话建立后各发一次（App 层）；peer 通道未启用
+   *  或旧网关不回任何帧——调用方以「有没有收到过快照」决定显不显示看板。 */
+  sendWindowsQuery(machine?: string): boolean {
+    return this.send({ v: 1, type: "windows_query", machine });
+  }
+
+  /** 关注 / 取消关注一个本地窗口（name = 快照条目的窗口名）。关注归网关所有并
+   *  由网关持久化；网关处理完会重发一帧 windows 让所有设备的 watched 收敛。
+   *  返回 false = 未发出（未 ready / E2E fail-closed 拒发）——调用方此时不做乐观
+   *  更新：前端没有名单兜底，界面若抢先说「已关注」，要到下一帧快照才会被拨回。
+   *  键序照契约示例：v / type / machine / name / watch。 */
+  sendWindowWatch(name: string, watch: boolean, machine?: string): boolean {
+    return this.send({ v: 1, type: "window_watch", machine, name, watch });
+  }
+
   /** v1.2 拉取已登录设备列表（设备面板打开时；仅会话模式对新 relay 使用）。 */
   sendDeviceList(): boolean {
     return this.send({ v: 1, type: "device_list" });
@@ -723,6 +748,8 @@ export class WsManager {
     // v1.42：approvals（待审批快照）同列——它会让面板上的待审批集合被整体
     // 替换，伪造一帧就能凭空塞进 / 抹掉审批按钮，注入面必须与 text/card 族
     // 同规封住（网关应答恒经 send_business 加密，active 后到明文即降级）。
+    // v1.43：windows（本地窗口快照）同理——它会被整块渲染成侧栏看板，并决定
+    // 状态条出不出「窗口在等你」；伪造一帧就能诱导用户点进一个不存在的会话。
     if (frame.type === "machines") {
       // v1.41.9：记下在线机器集（心跳只对在线的 active 机器发 enc-ping，见
       // probeOnce）→ 让新出现的机器进入握手 → 对已加密会话探活（此刻新机器
@@ -737,7 +764,8 @@ export class WsManager {
         frame.type === "approval_request" ||
         frame.type === "approval_resolved" ||
         frame.type === "history" ||
-        frame.type === "approvals") &&
+        frame.type === "approvals" ||
+        frame.type === "windows") &&
       !this.e2e.acceptPlaintextBusiness(frame.machine ?? DEFAULT_MACHINE)
     ) {
       this.e2e.notePlaintextDowngrade(frame.machine ?? DEFAULT_MACHINE);

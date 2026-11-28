@@ -1,6 +1,17 @@
 import { useMemo, useRef, useState } from "react";
-import { convDisplayName, DEFAULT_MACHINE, normalizeExpiryMs } from "../lib/protocol";
+import {
+  convDisplayName,
+  DEFAULT_MACHINE,
+  normalizeExpiryMs,
+  relativeTime,
+  waitingForText,
+  windowStatusText,
+  type MachineWindows,
+  type WindowInfo,
+  type WindowStatus,
+} from "../lib/protocol";
 import type { ThemePref } from "../lib/theme";
+import { useNow } from "./useNow";
 
 /** 主题三态选项（value 对齐 lib/theme 的 ThemePref；展示序即选择序）。 */
 const THEME_OPTIONS: { value: ThemePref; label: string }[] = [
@@ -54,6 +65,137 @@ function formatTime(at: number): string {
   return `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
 }
 
+/** v1.43 窗口状态点的配色：运行中 emerald + 呼吸动画（沿用会话项「运行中」小
+ *  圆点的写法，仅 busy 呼吸）；等待确认 amber；空闲 slate；未知更暗的 slate。 */
+const WINDOW_DOT: Record<WindowStatus, string> = {
+  busy: "bg-emerald-400 animate-pulse",
+  waiting: "bg-amber-400",
+  idle: "bg-slate-500",
+  unknown: "bg-slate-600",
+};
+
+/** v1.43 钩子状态行的提示：未安装时告诉用户怎么开（已开启时同样挂着，说明这行
+ *  在讲什么）。 */
+const HOOK_HINT =
+  "在电脑上运行 imagent peer hook install 后，每个窗口每一轮的结论会自动同步到对话里";
+
+/** v1.43 单个窗口行：整行是进入该窗口会话的按钮（状态点 + 窗口名 + 第二行状态
+ *  文字）；星标是行按钮的**同级兄弟**，盖在行的右端，行内容右侧留出星标的位置。
+ *  不把星标嵌进行按钮内部：<button> 的内容模型禁止交互型后代，嵌套属无效 HTML
+ *  （辅助技术与 HTML 校验都会报嵌套交互控件）。同级之间没有冒泡路径，点星标
+ *  天然不会触发行点击（会话项的桌面删除图标同一模式）。 */
+function WindowRow({
+  item,
+  now,
+  onSelect,
+  onToggle,
+}: {
+  item: WindowInfo;
+  /** 相对时间的基准（useNow 驱动，分钟级刷新）。 */
+  now: number;
+  onSelect?: (name: string) => void;
+  onToggle?: (name: string) => void;
+}) {
+  // 等待原因只在 waiting 且网关给了 waitingFor 时出现；没给原因不出空括号。
+  const reason = item.status === "waiting" && item.waitingFor ? waitingForText(item.waitingFor) : "";
+  // 第二行：「状态文字（原因）· 相对时间」；没有时间戳时省掉分隔符。
+  const line = [
+    windowStatusText(item.status) + (reason ? `（${reason}）` : ""),
+    relativeTime(item.statusUpdatedAt, now),
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  const starLabel = `${item.watched ? "取消关注" : "关注"}窗口 ${item.name}`;
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        onClick={() => onSelect?.(item.name)}
+        aria-label={`窗口 ${item.name}：${windowStatusText(item.status)}${reason ? `，${reason}` : ""}`}
+        // 窗口名按工作目录派生（如 imagent-a7），本身不含路径——悬停显示工作目录
+        title={item.cwd}
+        className="block w-full select-none rounded-xl py-2 pl-3 pr-10 text-left text-muted transition-colors hover:bg-panel2 hover:text-ink"
+      >
+        <span className="flex items-center gap-2">
+          <span
+            className={`h-2 w-2 shrink-0 rounded-full ${WINDOW_DOT[item.status]}`}
+            aria-hidden="true"
+          />
+          <span className="min-w-0 flex-1 truncate font-mono text-xs font-medium">{item.name}</span>
+        </span>
+        <span className="mt-0.5 block truncate pl-4 text-xs text-faint">{line}</span>
+      </button>
+      <button
+        type="button"
+        onClick={() => onToggle?.(item.name)}
+        aria-label={starLabel}
+        aria-pressed={item.watched}
+        title={starLabel}
+        className={`press absolute right-1 top-1/2 flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-lg text-base transition-colors hover:bg-panel2 ${
+          item.watched ? "text-emerald-600 dark:text-emerald-400" : "text-ghost hover:text-ink"
+        }`}
+      >
+        <span aria-hidden="true">{item.watched ? "★" : "☆"}</span>
+      </button>
+    </div>
+  );
+}
+
+/** v1.43「本地窗口」区块（机器切换器之下、会话列表之上）：当前机器在线的本地
+ *  Claude Code 窗口，每行一个。windows 为 undefined（从未收到过快照：旧网关 /
+ *  未启用 peer 通道）时由调用方整块不渲染。相对时间用 useNow 按分钟刷新——
+ *  tick 只重渲染本区块，不带动整个侧栏（会话列表）。 */
+function WindowsSection({
+  windows,
+  onSelectWindow,
+  onToggleWindowWatch,
+}: {
+  windows: MachineWindows;
+  onSelectWindow?: (name: string) => void;
+  onToggleWindowWatch?: (name: string) => void;
+}) {
+  const now = useNow(60_000);
+  const waiting = windows.items.filter((w) => w.status === "waiting").length;
+  const busy = windows.items.filter((w) => w.status === "busy").length;
+  return (
+    <section aria-label="本地窗口" className="border-b border-line p-2">
+      <div className="flex items-center gap-2 px-2 pb-1">
+        <span className="text-[11px] font-medium uppercase tracking-wider text-ghost">本地窗口</span>
+        {/* 区块头汇总：有窗口等人时只显示「N 待确认」（紧急，优先级最高）；否则有
+            运行中才显示「N 运行中」；都没有不显示（不占位置） */}
+        {waiting > 0 ? (
+          <span className="ml-auto shrink-0 text-[11px] font-medium text-amber-600 dark:text-amber-300">
+            {waiting} 待确认
+          </span>
+        ) : busy > 0 ? (
+          <span className="ml-auto shrink-0 text-[11px] font-medium text-emerald-600 dark:text-emerald-300">
+            {busy} 运行中
+          </span>
+        ) : null}
+      </div>
+      {windows.items.length === 0 ? (
+        <div className="px-2.5 py-1.5 text-xs text-ghost">没有在线的本地窗口</div>
+      ) : (
+        // 窗口多时区块内部滚动（上限 16rem），不把会话列表挤出视口
+        <div className="max-h-64 space-y-0.5 overflow-y-auto overscroll-contain">
+          {windows.items.map((w) => (
+            <WindowRow
+              key={w.name}
+              item={w}
+              now={now}
+              onSelect={onSelectWindow}
+              onToggle={onToggleWindowWatch}
+            />
+          ))}
+        </div>
+      )}
+      <div title={HOOK_HINT} className="px-2 pt-1 text-[11px] leading-4 text-ghost">
+        结论自动上报：{windows.hookInstalled ? "已开启" : "未安装"}
+      </div>
+    </section>
+  );
+}
+
 /**
  * 会话侧边栏（桌面常驻 / 移动抽屉共用）：标题 + Mac 在线状态点、机器切换器
  * （v1.1 多机模式）、会话列表（当前选中机器的会话池，当前项高亮，每项含
@@ -82,6 +224,10 @@ function formatTime(at: number): string {
  *   化并应用到 document（lib/theme.ts），本组件纯展示上抛 onThemeChange。
  * - v1.41.7：底部末行小号弱色显示当前运行版本 `v{__APP_VERSION__}`（构建期
  *   注入，纯展示——排查「发版后没更新」时确认实际在跑的版本）。
+ * - v1.43 本地窗口看板：机器切换器之下、会话列表之上的「本地窗口」区块
+ *   （WindowsSection）——当前机器在线的本地 Claude Code 窗口，每行状态点 /
+ *   窗口名 / 状态文字与关注星标；点行进入该窗口的会话，点星标关注或取消关注
+ *   （两者都上抛给 App）。未收到过快照（windows 缺省）整块不渲染。
  *
  * 已知限制：会话内消息历史仅 SPA 内存保留，页面刷新后仅当前卡片由 sync
  * 重发恢复（text/user 回显不重放）。
@@ -106,6 +252,9 @@ export function Sidebar({
   onSelectMachine,
   onCreate,
   onConvDelete,
+  windows,
+  onSelectWindow,
+  onToggleWindowWatch,
 }: {
   convs: ConvItem[];
   current: string;
@@ -143,6 +292,14 @@ export function Sidebar({
   /** v1.41.4 左滑删除入口（露出删除按钮 / 桌面 hover 小图标点击后由 App 级
    *  确认弹层接手；缺席 = 不启用手势与删除入口）。 */
   onConvDelete?: (conv: string) => void;
+  /** v1.43 当前机器的本地窗口快照（App 传 state.windows[currentMachine]）；
+   *  undefined = 从未收到过（旧网关 / 未启用 peer 通道）→「本地窗口」整块不渲染。 */
+  windows?: MachineWindows;
+  /** v1.43 点窗口行 → 进入该窗口的会话（App 侧切到 peer:<窗口名>）。 */
+  onSelectWindow?: (name: string) => void;
+  /** v1.43 点星标 → 关注 / 取消关注（App 侧发 window_watch 帧，被接受后才乐观
+   *  翻转；关注归网关所有，本机不存名单）。 */
+  onToggleWindowWatch?: (name: string) => void;
 }) {
   // v1.41.4 左滑删除手势状态：swipeOpenId = 当前吸附打开（露出删除按钮）的
   // 会话项，一次只开一项（认领新滑动即收旧项）；drag = 进行中的跟手位移
@@ -253,6 +410,16 @@ export function Sidebar({
             })}
           </div>
         </div>
+      )}
+
+      {/* v1.43 本地窗口看板：只在收到过当前机器的快照时渲染（旧网关 / 未启用
+          peer 通道时没有快照，整块不出现） */}
+      {windows !== undefined && (
+        <WindowsSection
+          windows={windows}
+          onSelectWindow={onSelectWindow}
+          onToggleWindowWatch={onToggleWindowWatch}
+        />
       )}
 
       <nav className="min-h-0 flex-1 space-y-1 overflow-y-auto overscroll-contain p-2" aria-label="会话列表">

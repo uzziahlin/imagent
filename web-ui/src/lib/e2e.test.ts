@@ -737,6 +737,37 @@ describe("E2eCoordinator 状态机", () => {
     expect(coord.outbound(undefined, plain)).toBe(JSON.stringify(plain));
   });
 
+  // v1.43：本地窗口的查询与关注同为业务帧（BUSINESS_TYPES）——active 机器出站必
+  // enc 包装（有哪些本地窗口、关注的是哪一个，relay 不可见）
+  it("v1.43 windows_query / window_watch：active 机器出站 enc 包装（网关密钥可解回原帧）；confirming 期拒发；单机恒明文", () => {
+    const gw = makeGateway();
+    const { coord, hellos } = makeCoord();
+    coord.onMachines(["home-mac"]);
+    const frames = [
+      { v: 1 as const, type: "windows_query" as const, machine: "home-mac" },
+      { v: 1 as const, type: "window_watch" as const, machine: "home-mac", name: "jormungandr-f8", watch: true },
+    ];
+    // confirming（待用户确认指纹）= fail-closed：业务帧拒发（不出明文）
+    coord.onAck(gw.ackFor(JSON.parse(hellos[0]), "home-mac"));
+    for (const f of frames) {
+      expect(coord.outbound("home-mac", f), f.type).toBeNull();
+    }
+    const { hello, ack } = acceptTofu(coord, gw, hellos, "home-mac");
+    const gwKey = gw.gatewayKey(hello, ack.n2);
+    for (const f of frames) {
+      const wire = coord.outbound("home-mac", f);
+      expect(wire, f.type).not.toBeNull();
+      const enc = JSON.parse(wire!) as { type: string; box: string };
+      expect(enc.type).toBe("enc");
+      expect(openBox(gwKey, enc.box)).toBe(JSON.stringify(f));
+    }
+    // 单机模式（machine undefined，旧 relay）恒明文直发
+    const plainQuery = { v: 1 as const, type: "windows_query" as const };
+    expect(coord.outbound(undefined, plainQuery)).toBe(JSON.stringify(plainQuery));
+    const plainWatch = { v: 1 as const, type: "window_watch" as const, name: "imagent-a7", watch: false };
+    expect(coord.outbound(undefined, plainWatch)).toBe(JSON.stringify(plainWatch));
+  });
+
 });
 
 describe("E2eCoordinator sid（定向加密形态）", () => {

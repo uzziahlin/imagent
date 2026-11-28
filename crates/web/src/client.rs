@@ -15,7 +15,8 @@
 //! - `inbound_tx`：浏览器业务帧映射成的 [`InboundMessage`] → platform.recv；
 //! - `sync_tx`：sync 通道请求（[`SyncRequest`]：`sync` 请求 → platform 的
 //!   sync responder 重发卡片缓存，D6 会话恢复；v1.42 `approvals_query` →
-//!   同一 responder 回待审批快照）；
+//!   同一 responder 回待审批快照；v1.43 `windows_query` → 同一 responder 回
+//!   本地窗口快照）；
 //! - `workspace_tx`：v1.6 工作空间动作（workspace_list/save/remove /
 //!   conv_workdir_set）→ platform 的 workspace 泵（store KV 读写）；
 //! - `media_tx`：v1.7 媒体上行（message 帧带 media 段）→ platform 的媒体泵
@@ -48,6 +49,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use imagent_core::peer::PeerState;
 use imagent_core::{CoreError, InboundMessage, Result};
 
 use crate::e2e::{E2eIdentity, E2eSessions};
@@ -101,6 +103,18 @@ pub(crate) struct WebClient {
     /// v1.40 语音转写通道（asr_request 帧）→ platform 的 ASR 泵（b64 解码
     /// + 写临时 WAV + spawn whisper-cli；失败回 error 帧）。
     pub(crate) asr_tx: mpsc::Sender<InboundAction>,
+    /// v1.43 本地窗口看板的 peer 共享态槽位（与 platform 同一个 `Arc`——
+    /// `PeerState` 在 `PeerServer::start` 里才创建，晚于 client 构造，由 main
+    /// 经 `WebPlatform::set_peer_state` 后填；`None` = peer 通道未启用，
+    /// `windows_query` / `window_watch` 一律忽略）。
+    pub(crate) peer_state: Arc<std::sync::Mutex<Option<Arc<PeerState>>>>,
+}
+
+impl WebClient {
+    /// peer 共享态的当前值（None = peer 通道未启用）。临界区只做一次 clone。
+    fn peer_state(&self) -> Option<Arc<PeerState>> {
+        crate::platform::lock_or_recover(&self.peer_state).clone()
+    }
 }
 
 /// hello 首帧构造（token 形态，v1.1/v1.2 兼容路径：token + machine 自报；
@@ -463,8 +477,8 @@ impl WebClient {
     /// 内层业务帧走既有分发；业务帧（message/approval_response/control/
     /// sync/ping + v1.6 工作空间 workspace_list/workspace_save/
     /// workspace_remove/conv_workdir_set + v1.8 history_query + v1.42
-    /// approvals_query，均可带 relay 路由用的 machine 字段——网关侧无需
-    /// 消费）经 [`map_inbound_frame`] 映射。
+    /// approvals_query + v1.43 windows_query/window_watch，均可带 relay 路由用的
+    /// machine 字段——网关侧无需消费）经 [`map_inbound_frame`] 映射。
     /// 畸形 JSON warn 丢弃（不断连——浏览器/中继偶发杂帧不致网关重连）。
     async fn handle_text(
         &self,
@@ -600,6 +614,42 @@ impl WebClient {
                 .is_err()
                 {
                     warn!(target: TARGET, "sync channel 持续满 1s，丢弃 approvals_query 请求");
+                }
+            }
+            // v1.43 本地窗口快照 → 同一 sync responder（按 peer 共享态回 windows
+            // 帧）。peer 通道未启用时**不进泵、不回帧**——契约：前端收不到
+            // windows 帧即不显示看板。同 1s 有界背压；丢弃由 SPA 重发
+            // windows_query 兜底（重连 / 切会话时都会发）。
+            InboundAction::WindowsQuery => {
+                if self.peer_state().is_none() {
+                    debug!(target: TARGET, "windows_query：peer 通道未启用，不回帧");
+                    return Ok(());
+                }
+                if tokio::time::timeout(
+                    Duration::from_secs(1),
+                    self.sync_tx.send(SyncRequest::Windows),
+                )
+                .await
+                .is_err()
+                {
+                    warn!(target: TARGET, "sync channel 持续满 1s，丢弃 windows_query 请求");
+                }
+            }
+            // v1.43 关注 / 取消关注窗口：client 层直接改共享态（不经泵），再让
+            // sync 泵重发一帧 windows——所有在线设备的 `watched` 以网关为准
+            // 收敛。peer 通道未启用时静默忽略（看板本就不显示，无处可点）。
+            InboundAction::WindowWatch { name, watch } => {
+                if let Some(state) = self.peer_state() {
+                    state.set_watched(&name, watch);
+                    if tokio::time::timeout(
+                        Duration::from_secs(1),
+                        self.sync_tx.send(SyncRequest::Windows),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        warn!(target: TARGET, "sync channel 持续满 1s，window_watch 后的快照重发被丢弃（下条快照兜底）");
+                    }
                 }
             }
             // v1.6 工作空间动作 → platform 泵（store IO 在泵内 await，client
@@ -848,6 +898,7 @@ mod tests {
             media_tx,
             history_tx,
             asr_tx,
+            peer_state: Arc::new(std::sync::Mutex::new(None)),
         };
         let (_outbound_tx, outbound_rx) = mpsc::channel::<String>(8);
         let (_push_tx, push_rx) = mpsc::channel::<PushEvent>(8);

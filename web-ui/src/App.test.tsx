@@ -15,7 +15,8 @@ import { bytesToHex, hexToBytes, randomBytes, utf8ToBytes } from "@noble/hashes/
 import App from "./App";
 import { __resetAdminToken } from "./lib/admin";
 import { historyStore } from "./lib/historyStore";
-import { fingerprint, openBox } from "./lib/e2e";
+import { fingerprint, openBox, sealFrame } from "./lib/e2e";
+import type { WindowInfo } from "./lib/protocol";
 import { WsManager, type WsEvent } from "./lib/ws";
 
 /** 可控 fake WebSocket：手动 emit 事件、记录出站帧（形状对齐 ws.test.ts）。 */
@@ -3452,18 +3453,20 @@ describe("v1.42 待审批快照", () => {
       fake.recv(secondAck);
     });
     expect(screen.getByText("已加密")).toBeTruthy();
-    // E2：active 后的第二次查询走密文——明文仍只有 E1 那一条；enc 帧恰一条，
-    // 用**重新握手**的网关密钥可解回 approvals_query（握手窗口那把密钥解不开）
+    // E2：active 后的第二次查询走密文——明文仍只有 E1 那一条。enc 帧里取内帧为
+    // approvals_query 的那些（v1.43 起同一触发点还会再发一条 windows_query 的密文，
+    // enc 帧不再恰一条）：恰一条、机器对、用**重新握手**的网关密钥可解回原帧
+    // （握手窗口那把密钥解不开）
     expect(approvalQueries(fake)).toEqual([M]);
     const encs = fake.sent
       .filter((s) => (JSON.parse(s) as { type: string }).type === "enc")
       .map((s) => JSON.parse(s) as { machine: string; box: string });
-    expect(encs).toHaveLength(1);
-    expect(encs[0].machine).toBe(M);
-    expect(openBox(gw.gatewayKey(redone, secondAck.n2), encs[0].box)).toBe(
-      JSON.stringify({ v: 1, type: "approvals_query", machine: M }),
-    );
-    expect(openBox(gw.gatewayKey(firstHello, firstAck.n2), encs[0].box)).toBeNull();
+    const APPROVAL_QUERY = JSON.stringify({ v: 1, type: "approvals_query", machine: M });
+    const redoneKey = gw.gatewayKey(redone, secondAck.n2);
+    const approvalEncs = encs.filter((_enc, i) => openBox(redoneKey, encs[i].box) === APPROVAL_QUERY);
+    expect(approvalEncs).toHaveLength(1);
+    expect(approvalEncs[0].machine).toBe(M);
+    expect(openBox(gw.gatewayKey(firstHello, firstAck.n2), approvalEncs[0].box)).toBeNull();
   });
 });
 
@@ -3828,5 +3831,502 @@ describe("v1.42 重新登录后连接就绪 effect 照常触发", () => {
       fake.recv({ v: 1, type: "hello_ack", role: "user" });
     });
     expect(frameTypes(fake)).toEqual(["hello", "sync"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v1.43 本地窗口看板（App 层）：ready 后对全部在线机器各查一次（E1）+ 该机器加密
+// 会话建立后再查一次（E2）；windows 帧进 reducer 驱动侧栏区块与状态条提示；
+// 星标 = 发 window_watch 帧，帧被接受后才乐观翻转。关注归网关所有（由网关持久化），
+// 前端不保存名单、不对账。
+// ---------------------------------------------------------------------------
+
+describe("v1.43 本地窗口看板", () => {
+  const M = "home-mac";
+  /** 契约 §2 示例形态的窗口条目（可选时间戳省略）。 */
+  const win = (extra: Partial<WindowInfo> = {}): WindowInfo => ({
+    name: "jormungandr-f8",
+    status: "idle",
+    cwd: "/Users/demo/work/api",
+    watched: false,
+    ...extra,
+  });
+  const IDLE = win();
+  const WAITING = win({ name: "imagent-a7", status: "waiting", waitingFor: "dialog open" });
+  const BUSY = win({ name: "runner", status: "busy" });
+  const WINDOWS = (items: WindowInfo[], machine = M, hookInstalled = true) => ({
+    v: 1 as const,
+    type: "windows" as const,
+    machine,
+    hookInstalled,
+    items,
+  });
+  const parsed = (fake: FakeWebSocket): Record<string, unknown>[] =>
+    fake.sent.map((s) => JSON.parse(s) as Record<string, unknown>);
+  /** 出站 windows_query（明文形态）的目标机器序列。 */
+  const windowsQueries = (fake: FakeWebSocket): string[] =>
+    parsed(fake)
+      .filter((f) => f.type === "windows_query")
+      .map((f) => (f.machine as string | undefined) ?? "");
+  /** 出站 window_watch（明文形态）帧。 */
+  const watchFrames = (fake: FakeWebSocket): Record<string, unknown>[] =>
+    parsed(fake).filter((f) => f.type === "window_watch");
+  const recvWindows = (fake: FakeWebSocket, items: WindowInfo[], machine = M, hookInstalled = true): void => {
+    act(() => fake.recv(WINDOWS(items, machine, hookInstalled)));
+  };
+  /** 侧栏「本地窗口」区块（DOM 序：桌面侧栏在前、移动抽屉在后）。 */
+  const sections = (): HTMLElement[] => screen.queryAllByRole("region", { name: "本地窗口" });
+  const section = (i = 0): HTMLElement => sections()[i];
+  const row = (label: string, scope: HTMLElement = section()): HTMLElement =>
+    within(scope).getByRole("button", { name: label }) as HTMLElement;
+  const waitingChip = (): HTMLElement | null =>
+    screen.queryByRole("button", { name: /个本地窗口在等你确认/ });
+  /** 状态条里当前会话名 pill 的文本（convTitle：peer 会话显示窗口名）。 */
+  const convLabel = (): string | null =>
+    screen.getByRole("banner").querySelector("span.font-mono")?.textContent ?? null;
+  /** 移动端抽屉壳层的 aria-hidden 值：jsdom 无布局（md:hidden 不生效），壳层是否
+   *  「打开」以它为准——关闭态 "true"，打开后 "false"。 */
+  const drawerHidden = (): string | null =>
+    document.querySelector(".z-50.md\\:hidden")?.getAttribute("aria-hidden") ?? null;
+
+  afterEach(() => {
+    vi.useRealTimers();
+    // 恢复 URL，避免污染同文件后续/其它用例
+    window.history.replaceState(null, "", "/");
+  });
+
+  it("① ready + 收到 machines 帧 → 对**全部**在线机器各发一条 windows_query（帧形状即契约原文）", () => {
+    const fake = mountApp();
+    act(() => {
+      fake.emit("open");
+      fake.recv({ v: 1, type: "hello_ack", role: "user" });
+    });
+    // hello_ack 后尚未收到 machines 帧：不发（单机模式旧网关不认识该帧）
+    expect(windowsQueries(fake)).toEqual([]);
+    act(() => {
+      fake.recv({ v: 1, type: "machine", online: false });
+      fake.recv({ v: 1, type: "machines", online: [M, "work-mac", "office-mac"] });
+    });
+    // 当前机器是 home-mac（自动选中首台）；三台各一条
+    expect(windowsQueries(fake)).toEqual([M, "work-mac", "office-mac"]);
+    expect(fake.sent).toContain(JSON.stringify({ v: 1, type: "windows_query", machine: "work-mac" }));
+  });
+
+  it("①b 切换当前机器 / machines 帧重排不重发；单机模式（旧 relay，无 machines 帧）不发", () => {
+    const fake = mountApp();
+    handshake(fake, [M, "work-mac"]);
+    expect(windowsQueries(fake)).toEqual([M, "work-mac"]);
+    fireEvent.click(screen.getByRole("button", { name: /work-mac/ }));
+    expect(windowsQueries(fake)).toEqual([M, "work-mac"]); // 切机不触发
+    // machines 帧重排（任一网关上下线都会再推）：同样不触发
+    act(() => {
+      fake.recv({ v: 1, type: "machines", online: ["work-mac", M] });
+    });
+    expect(windowsQueries(fake)).toEqual([M, "work-mac"]);
+    cleanup();
+    const single = mountApp();
+    act(() => {
+      single.emit("open");
+      single.recv({ v: 1, type: "hello_ack", role: "user" });
+      single.recv({ v: 1, type: "machine", online: true });
+    });
+    expect(screen.getByText("已连接")).toBeTruthy();
+    expect(windowsQueries(single)).toEqual([]);
+  });
+
+  it("② 收到 windows 帧 → 侧栏出现「本地窗口」区块与窗口行（状态文字 / 状态点 / 相对时间 / 汇总 / 钩子状态行）", () => {
+    const fake = mountApp();
+    handshake(fake, [M]);
+    // 还没有快照：区块不出现（旧网关 / 未启用 peer 通道的形态）
+    expect(sections()).toHaveLength(0);
+    recvWindows(fake, [win({ statusUpdatedAt: Date.now() - 3 * 60_000 }), WAITING, BUSY]);
+    const sec = section();
+    expect(sec).toBeTruthy();
+    // 窗口名与第二行状态文字（相对时间取自 statusUpdatedAt）
+    const idleRow = row("窗口 jormungandr-f8：空闲");
+    expect(within(idleRow).getByText("jormungandr-f8")).toBeTruthy();
+    expect(within(idleRow).getByText("空闲 · 3 分钟前")).toBeTruthy();
+    expect(idleRow.querySelector(".rounded-full")?.className).toContain("bg-slate-500");
+    const waitRow = row("窗口 imagent-a7：等待确认，等你确认");
+    expect(within(waitRow).getByText("等待确认（等你确认）")).toBeTruthy();
+    expect(waitRow.querySelector(".rounded-full")?.className).toContain("bg-amber-400");
+    const busyRow = row("窗口 runner：运行中");
+    expect(within(busyRow).getByText("运行中")).toBeTruthy();
+    expect(busyRow.querySelector(".rounded-full")?.className).toContain("animate-pulse");
+    // 呼吸动画只给运行中（待确认 / 空闲的点静止）
+    expect(sec!.querySelectorAll(".animate-pulse")).toHaveLength(1);
+    // 区块头汇总：待确认优先于运行中（同时有 busy 也不显示「N 运行中」）
+    expect(within(sec!).getByText("1 待确认")).toBeTruthy();
+    expect(within(sec!).queryByText(/\d+ 运行中/)).toBeNull();
+    expect(within(sec!).getByText("结论自动上报：已开启")).toBeTruthy();
+    // 还没关注任何窗口：三个星标都是空心
+    expect(within(sec!).getAllByRole("button", { name: /^关注窗口 / })).toHaveLength(3);
+  });
+
+  it("③ 点星标 → 发出 window_watch{watch:true}、星标即变实心（帧被接受后的乐观更新）；再点 → {watch:false}；关注不落 localStorage", () => {
+    const fake = mountApp();
+    handshake(fake, [M]);
+    recvWindows(fake, [IDLE]);
+    // 关注归网关所有（由网关持久化）：前端不保存名单——点星标不得产生任何本地存储写入
+    const keysBefore = Object.keys(localStorage);
+    const star = (): HTMLElement =>
+      within(section()).getByRole("button", { name: /^(?:取消)?关注窗口 jormungandr-f8$/ }) as HTMLElement;
+    expect(star().getAttribute("aria-label")).toBe("关注窗口 jormungandr-f8");
+    expect(star().getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(star());
+    // 乐观更新：帧一发出（不必等网关回包）星标即变实心
+    expect(star().getAttribute("aria-label")).toBe("取消关注窗口 jormungandr-f8");
+    expect(star().getAttribute("aria-pressed")).toBe("true");
+    expect(watchFrames(fake)).toEqual([
+      { v: 1, type: "window_watch", machine: M, name: "jormungandr-f8", watch: true },
+    ]);
+    // 再点：取消关注
+    fireEvent.click(star());
+    expect(star().getAttribute("aria-pressed")).toBe("false");
+    expect(watchFrames(fake)).toEqual([
+      { v: 1, type: "window_watch", machine: M, name: "jormungandr-f8", watch: true },
+      { v: 1, type: "window_watch", machine: M, name: "jormungandr-f8", watch: false },
+    ]);
+    expect(Object.keys(localStorage)).toEqual(keysBefore);
+  });
+
+  it("③b 关注另一个窗口不动第一个；网关回报已关注的快照到达后保持实心，且不重复发帧", () => {
+    const fake = mountApp();
+    handshake(fake, [M]);
+    recvWindows(fake, [IDLE, WAITING]);
+    fireEvent.click(within(section()).getByRole("button", { name: "关注窗口 jormungandr-f8" }));
+    expect(
+      within(section()).getByRole("button", { name: "关注窗口 imagent-a7" }).getAttribute("aria-pressed"),
+    ).toBe("false");
+    // 网关处理完 window_watch 后重发快照（watched:true；内容与乐观更新后的一致）
+    recvWindows(fake, [{ ...IDLE, watched: true }, WAITING]);
+    expect(
+      within(section()).getByRole("button", { name: "取消关注窗口 jormungandr-f8" }).getAttribute("aria-pressed"),
+    ).toBe("true");
+    expect(watchFrames(fake)).toHaveLength(1);
+  });
+
+  it("③c 网关报已关注的窗口（可以是别的设备关注的）：本机点实心星即取消关注——发 window_watch{watch:false}、星标变空心；网关回报后保持", () => {
+    const fake = mountApp();
+    handshake(fake, [M]);
+    // 关注是跨设备的全局状态：别的设备关注过，本机快照里它已是实心
+    recvWindows(fake, [{ ...WAITING, watched: true }]);
+    expect(watchFrames(fake)).toEqual([]);
+    fireEvent.click(within(section()).getByRole("button", { name: "取消关注窗口 imagent-a7" }));
+    expect(watchFrames(fake)).toEqual([
+      { v: 1, type: "window_watch", machine: M, name: "imagent-a7", watch: false },
+    ]);
+    expect(
+      within(section()).getByRole("button", { name: "关注窗口 imagent-a7" }).getAttribute("aria-pressed"),
+    ).toBe("false");
+    // 网关处理完重发快照（watched:false，与乐观更新后一致）：保持空心，不重复发帧
+    recvWindows(fake, [WAITING]);
+    expect(within(section()).getByRole("button", { name: "关注窗口 imagent-a7" })).toBeTruthy();
+    expect(watchFrames(fake)).toHaveLength(1);
+  });
+
+  it("④ 发送被拒（未 ready）时点星标：不出帧、状态不变、不留任何痕迹；连接恢复后再点才生效", () => {
+    // 重连退避 1s 是定时器：挂载前切假时钟
+    vi.useFakeTimers();
+    const fake = mountApp();
+    handshake(fake, [M]);
+    recvWindows(fake, [IDLE]);
+    act(() => {
+      fake.emit("close", { code: 1006 });
+    });
+    expect(screen.getByText("重连中")).toBeTruthy();
+    const before = section()!.innerHTML;
+    const keysBefore = Object.keys(localStorage);
+    fireEvent.click(within(section()).getByRole("button", { name: "关注窗口 jormungandr-f8" }));
+    // 帧发不出去（未 ready）→ 不做乐观更新：星标仍是空心，界面不抢先说「已关注」
+    expect(section()!.innerHTML).toBe(before);
+    expect(watchFrames(fake)).toEqual([]);
+    expect(Object.keys(localStorage)).toEqual(keysBefore);
+    // 连接恢复 → 再查一次 → 网关快照照旧报未关注（它从没收到过那帧）→ 星标仍是空心
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
+    const next = FakeWebSocket.latest as FakeWebSocket;
+    expect(next).not.toBe(fake);
+    handshake(next, [M]);
+    expect(windowsQueries(next)).toEqual([M]);
+    recvWindows(next, [IDLE]);
+    expect(
+      within(section()).getByRole("button", { name: "关注窗口 jormungandr-f8" }).getAttribute("aria-pressed"),
+    ).toBe("false");
+    expect(watchFrames(next)).toEqual([]);
+    // 恢复后再点：帧发出，星标随即变实心
+    fireEvent.click(within(section()).getByRole("button", { name: "关注窗口 jormungandr-f8" }));
+    expect(watchFrames(next)).toEqual([
+      { v: 1, type: "window_watch", machine: M, name: "jormungandr-f8", watch: true },
+    ]);
+    expect(
+      within(section()).getByRole("button", { name: "取消关注窗口 jormungandr-f8" }).getAttribute("aria-pressed"),
+    ).toBe("true");
+  });
+
+  it("④b 发送被拒（握手待确认指纹，E2E fail-closed）时点星标：不出帧、状态不变；确认加密后再点才生效（走密文）", () => {
+    const gw = makeGateway();
+    const fake = mountApp();
+    handshake(fake, [M]);
+    // 网关 ack → confirming（TOFU 弹层）：出站业务帧 fail-closed 拒发；入站明文仍放行，看板照常显示
+    act(() => {
+      fake.recv(gw.ackFor(lastHelloFor(fake), M));
+    });
+    expect(screen.getByRole("dialog", { name: "确认机器加密指纹" })).toBeTruthy();
+    recvWindows(fake, [IDLE]);
+    const before = section()!.innerHTML;
+    fireEvent.click(within(section()).getByRole("button", { name: "关注窗口 jormungandr-f8" }));
+    expect(section()!.innerHTML).toBe(before);
+    expect(watchFrames(fake)).toEqual([]);
+    // 明文 / 密文都没有（此时连 enc 帧都还没发过）
+    expect(parsed(fake).filter((f) => f.type === "enc")).toHaveLength(0);
+    // 信任 → 以 pin 身份重新握手 → active
+    fireEvent.click(screen.getByRole("button", { name: "信任并启用加密" }));
+    const redone = lastHelloFor(fake);
+    const secondAck = gw.ackFor(redone, M);
+    act(() => {
+      fake.recv(secondAck);
+    });
+    fireEvent.click(within(section()).getByRole("button", { name: "关注窗口 jormungandr-f8" }));
+    // active 后出站走密文：用**重新握手**的网关密钥可解回 window_watch
+    const key = gw.gatewayKey(redone, secondAck.n2);
+    const inner = parsed(fake)
+      .filter((f) => f.type === "enc")
+      .map((enc) => openBox(key, enc.box as string))
+      .filter((plain): plain is string => plain !== null)
+      .map((plain) => JSON.parse(plain) as Record<string, unknown>);
+    expect(inner.filter((f) => f.type === "window_watch")).toEqual([
+      { v: 1, type: "window_watch", machine: M, name: "jormungandr-f8", watch: true },
+    ]);
+    expect(within(section()).getByRole("button", { name: "取消关注窗口 jormungandr-f8" })).toBeTruthy();
+  });
+
+  it("⑤ 点窗口行 → 当前会话变为 peer:<窗口名>（状态条标题 / 会话列表当前项），之后发消息落该会话；在移动端抽屉里点则同时关抽屉", () => {
+    const fake = mountApp();
+    handshake(fake, [M]);
+    recvWindows(fake, [IDLE]);
+    expect(drawerHidden()).toBe("true");
+    // 打开移动端抽屉（壳层 aria-hidden 变 false，抽屉内出现第二份侧栏）
+    fireEvent.click(screen.getByRole("button", { name: "打开会话列表" }));
+    expect(drawerHidden()).toBe("false");
+    expect(sections()).toHaveLength(2);
+    fireEvent.click(row("窗口 jormungandr-f8：空闲", section(1)));
+    // 抽屉关闭（内容延迟 150ms 卸载，但对可访问性树已隐藏）；后续断言落在桌面侧栏那一份
+    expect(drawerHidden()).toBe("true");
+    expect(sections()).toHaveLength(1);
+    expect(convLabel()).toBe("jormungandr-f8");
+    const nav = screen.getAllByRole("navigation", { name: "会话列表" })[0];
+    expect(nav.querySelector('[aria-current="page"]')?.textContent).toContain("jormungandr-f8");
+    // 在该会话发消息 → message 帧 convId 是 peer:<窗口名>
+    fireEvent.change(screen.getByLabelText("消息输入框"), { target: { value: "帮我跑下构建" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    expect(fake.sent).toContain(
+      JSON.stringify({ v: 1, type: "message", convId: "peer:jormungandr-f8", text: "帮我跑下构建", machine: M }),
+    );
+  });
+
+  it("⑥ 旧网关（收不到任何 windows 帧）→ 侧栏没有「本地窗口」区块、状态条没有待确认提示，其余功能不变", () => {
+    const fake = mountApp();
+    handshake(fake, [M]);
+    expect(sections()).toHaveLength(0);
+    expect(screen.queryByText(/结论自动上报/)).toBeNull();
+    expect(waitingChip()).toBeNull();
+    // 会话列表 / 机器切换器 / 空态示例 prompt 照常
+    expect(screen.getByRole("navigation", { name: "会话列表" })).toBeTruthy();
+    expect(screen.getByRole("listbox", { name: "机器列表" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "看看这个项目结构" }));
+    expect(fake.sent).toContain(
+      JSON.stringify({ v: 1, type: "message", convId: "web:default", text: "看看这个项目结构", machine: M }),
+    );
+    expect(sections()).toHaveLength(0);
+  });
+
+  it("⑥b 畸形 windows 帧被拒收：不出现区块（不拿半份可疑数据渲染整块侧栏界面）", () => {
+    const fake = mountApp();
+    handshake(fake, [M]);
+    for (const bad of [
+      // 条目缺 name
+      { v: 1, type: "windows", machine: M, hookInstalled: true, items: [{ status: "idle", cwd: "/x", watched: false }] },
+      // status 越界
+      { v: 1, type: "windows", machine: M, hookInstalled: true, items: [{ name: "w", status: "running", cwd: "/x", watched: false }] },
+      // watched 非布尔
+      { v: 1, type: "windows", machine: M, hookInstalled: true, items: [{ name: "w", status: "idle", cwd: "/x", watched: "false" }] },
+      // 缺 hookInstalled
+      { v: 1, type: "windows", machine: M, items: [] },
+      // machine 空串
+      { v: 1, type: "windows", machine: "", hookInstalled: true, items: [] },
+      // items 非数组
+      { v: 1, type: "windows", machine: M, hookInstalled: true, items: {} },
+    ]) {
+      act(() => fake.recv(bad));
+    }
+    expect(sections()).toHaveLength(0);
+    expect(waitingChip()).toBeNull();
+  });
+
+  it("⑦ 状态条：快照里有 1 个 waiting → 出现「⏸ 1 个窗口待确认」，点击打开抽屉；没有 waiting → 不出现；waiting 清零后消失", () => {
+    const fake = mountApp();
+    handshake(fake, [M]);
+    expect(waitingChip()).toBeNull();
+    // 只有运行中：「运行中」的数量在侧栏区块头，不占状态条
+    recvWindows(fake, [IDLE, BUSY]);
+    expect(waitingChip()).toBeNull();
+    recvWindows(fake, [IDLE, WAITING]);
+    const chip = waitingChip();
+    expect(chip!.textContent).toBe("⏸ 1 个窗口待确认");
+    expect(chip!.getAttribute("aria-label")).toBe("有 1 个本地窗口在等你确认，打开会话列表");
+    expect(drawerHidden()).toBe("true");
+    fireEvent.click(chip!);
+    expect(drawerHidden()).toBe("false");
+    // 窗口不再等待（对话框处理掉了）→ 提示消失
+    recvWindows(fake, [IDLE, { ...WAITING, status: "idle" }]);
+    expect(waitingChip()).toBeNull();
+  });
+
+  it("⑦b 状态条只统计**当前机器**的 waiting：另一台机器的快照里有 waiting 也不提示，切过去才提示", () => {
+    const fake = mountApp();
+    handshake(fake, [M, "work-mac"]);
+    recvWindows(fake, [WAITING], "work-mac");
+    expect(waitingChip()).toBeNull();
+    // 当前机器 home-mac 的侧栏也不显示 work-mac 的窗口
+    expect(sections()).toHaveLength(0);
+    fireEvent.click(screen.getByRole("button", { name: /work-mac/ }));
+    expect(waitingChip()!.textContent).toBe("⏸ 1 个窗口待确认");
+    expect(within(section()).getByRole("button", { name: "窗口 imagent-a7：等待确认，等你确认" })).toBeTruthy();
+  });
+
+  it("⑧ 窗口会话空态：进入 peer: 会话且无条目 → 显示说明文字、没有示例 prompt；默认会话仍有示例 prompt；发出第一条消息后说明消失", () => {
+    const fake = mountApp();
+    handshake(fake, [M]);
+    recvWindows(fake, [IDLE]);
+    // 对照：默认会话是通用空态（示例 prompt 在，没有说明）
+    expect(screen.getByRole("button", { name: "看看这个项目结构" })).toBeTruthy();
+    expect(screen.queryByText(/这是与本地 Claude Code 窗口/)).toBeNull();
+    fireEvent.click(row("窗口 jormungandr-f8：空闲"));
+    const main = within(screen.getByRole("main"));
+    expect(
+      main.getByText(
+        "这是与本地 Claude Code 窗口「jormungandr-f8」的对话。直接输入文字即可派活，窗口空闲时会自动开始处理；窗口的回信会出现在这里。",
+      ),
+    ).toBeTruthy();
+    for (const sample of ["看看这个项目结构", "帮我写个脚本", "解释一下最近的改动"]) {
+      expect(screen.queryByRole("button", { name: sample }), sample).toBeNull();
+    }
+    // 发出第一条消息后会话不再为空：说明消失（示例 prompt 也不回来——会话已有内容）
+    fireEvent.change(screen.getByLabelText("消息输入框"), { target: { value: "帮我跑下构建" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    expect(screen.queryByText(/这是与本地 Claude Code 窗口/)).toBeNull();
+    expect(main.getByText("帮我跑下构建")).toBeTruthy();
+  });
+
+  it("⑧b 深链进入 peer: 会话（?conv=peer:<窗口名>）同样显示说明（不依赖快照是否到达）", () => {
+    window.history.replaceState(null, "", "/?conv=peer:win-a");
+    handshake(mountApp(), [M]);
+    expect(screen.queryByText(/这是与本地 Claude Code 窗口「win-a」的对话/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "看看这个项目结构" })).toBeNull();
+  });
+
+  it("⑧c 会话已有消息（窗口回信落进 peer 会话）→ 不显示说明", () => {
+    const fake = mountApp();
+    handshake(fake, [M]);
+    recvWindows(fake, [IDLE]);
+    act(() => {
+      fake.recv({ v: 1, type: "text", convId: "peer:jormungandr-f8", text: "构建通过，无告警。", machine: M });
+    });
+    fireEvent.click(row("窗口 jormungandr-f8：空闲"));
+    expect(screen.queryByText(/这是与本地 Claude Code 窗口/)).toBeNull();
+    expect(within(screen.getByRole("main")).getByText("构建通过，无告警。")).toBeTruthy();
+  });
+
+  /** 测试网关（与「v1.42 待审批快照」describe 内同名助手同构——该助手为
+   *  describe 局部，此处复制一份；长期 X25519 + ed25519 身份密钥）。 */
+  function makeGateway() {
+    const gkPriv = x25519.utils.randomSecretKey();
+    const gk = bytesToHex(x25519.getPublicKey(gkPriv));
+    const idPriv = ed25519.utils.randomSecretKey();
+    const ik = bytesToHex(ed25519.getPublicKey(idPriv));
+    const ackFor = (hello: { ek: string; n1: string }, machine: string) => {
+      const n2 = bytesToHex(randomBytes(32));
+      const msg = new Uint8Array(128);
+      msg.set(hexToBytes(hello.ek), 0);
+      msg.set(hexToBytes(gk), 32);
+      msg.set(hexToBytes(hello.n1), 64);
+      msg.set(hexToBytes(n2), 96);
+      return {
+        v: 1 as const,
+        type: "e2e_ack" as const,
+        machine,
+        gk,
+        n2,
+        sig: bytesToHex(ed25519.sign(msg, idPriv)),
+        ik,
+      };
+    };
+    const gatewayKey = (hello: { ek: string; n1: string }, n2: string) => {
+      const shared = x25519.getSharedSecret(gkPriv, hexToBytes(hello.ek));
+      const ikm = new Uint8Array(96);
+      ikm.set(shared, 0);
+      ikm.set(hexToBytes(hello.n1), 32);
+      ikm.set(hexToBytes(n2), 64);
+      return hkdf(sha256, ikm, undefined, utf8ToBytes("imagent-e2e-v1"), 32);
+    };
+    return { gk, ik, ackFor, gatewayKey };
+  }
+
+  /** 从 fake.sent 里取最近一条 e2e_hello（无则抛）。 */
+  function lastHelloFor(fake: FakeWebSocket): { ek: string; n1: string } {
+    const raw = fake.sent.filter((s) => (JSON.parse(s) as { type: string }).type === "e2e_hello").at(-1);
+    if (!raw) {
+      throw new Error("尚未发出 e2e_hello");
+    }
+    return JSON.parse(raw);
+  }
+
+  it("⑨ 该机器加密会话建立（E2E active）后再查一次：握手完成后的查询走密文（enc 内 windows_query）；此后快照必须是密文才被采纳", () => {
+    const gw = makeGateway();
+    const fake = mountApp();
+    act(() => {
+      fake.emit("open");
+      fake.recv({ v: 1, type: "hello_ack", role: "user" });
+      fake.recv({ v: 1, type: "machines", online: [M] });
+    });
+    // E1：ready + machines 后已发一条明文查询（握手窗口）
+    expect(windowsQueries(fake)).toEqual([M]);
+    // 网关 ack → confirming（TOFU 弹层）：fail-closed 期间不发第二条（明文 / 密文都没有）
+    const firstHello = lastHelloFor(fake);
+    const firstAck = gw.ackFor(firstHello, M);
+    act(() => {
+      fake.recv(firstAck);
+    });
+    expect(screen.getByRole("dialog", { name: "确认机器加密指纹" })).toBeTruthy();
+    expect(windowsQueries(fake)).toEqual([M]);
+    expect(parsed(fake).filter((f) => f.type === "enc")).toHaveLength(0);
+    // 信任 → 以 pin 身份重新握手 → 新 ack → active
+    fireEvent.click(screen.getByRole("button", { name: "信任并启用加密" }));
+    const redone = lastHelloFor(fake);
+    const secondAck = gw.ackFor(redone, M);
+    act(() => {
+      fake.recv(secondAck);
+    });
+    expect(screen.getByText("已加密")).toBeTruthy();
+    // E2：active 后的第二次查询走密文——明文仍只有 E1 那一条；用**重新握手**的网关
+    // 密钥可解回 windows_query
+    const key = gw.gatewayKey(redone, secondAck.n2);
+    const inner = parsed(fake)
+      .filter((f) => f.type === "enc")
+      .map((enc) => openBox(key, enc.box as string))
+      .filter((plain): plain is string => plain !== null)
+      .map((plain) => JSON.parse(plain) as Record<string, unknown>);
+    expect(inner.filter((f) => f.type === "windows_query")).toEqual([
+      { v: 1, type: "windows_query", machine: M },
+    ]);
+    expect(windowsQueries(fake)).toEqual([M]);
+    // active 之后：明文快照是注入面，被丢弃（看板不出现）
+    recvWindows(fake, [IDLE]);
+    expect(sections()).toHaveLength(0);
+    // 密文快照（网关经 send_business 加密下发）照常渲染
+    act(() => fake.recv(sealFrame(M, key, WINDOWS([IDLE]))));
+    expect(within(section()).getByRole("button", { name: "窗口 jormungandr-f8：空闲" })).toBeTruthy();
   });
 });

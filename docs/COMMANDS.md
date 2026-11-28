@@ -37,6 +37,17 @@ IM / Web 驾驶舱 / 本地终端里可直接发的斜杠命令。白名单用�
 | `/perm list` / `/perm revoke <工具>` | 查看/单项撤销本会话「始终允许」清单 |
 | `/tasks` | 本会话在飞轮次的实时进度（checklist + 工具统计） |
 
+## 本地窗口（peer 通道）
+
+需要 `peer_enabled = true`（见[配置参考](./CONFIG.md)）。这里只算**终端里的交互窗口**：网关自己跑的无头会话、Claude Code 的后台作业不是窗口，不列出也不能派活。驾驶舱侧栏的「本地窗口」区块是同一份名单。
+
+| 命令 | 作用 |
+|---|---|
+| `/peers` | 列出当前在线的本地 Claude Code 窗口 |
+| `/to <窗口名>` | 进入和该窗口的对话（窗口名可用唯一前缀；不带正文 = 只建立会话，之后直接打字；窗口空闲时会自动开始处理） |
+
+可选：在电脑上执行 `imagent peer hook install`，给 Claude Code 装官方 Stop 钩子，之后每个窗口每一轮的结论自动同步进驾驶舱里对应的对话（以「📋 本轮结束（自动同步）」开头）。`imagent peer hook status` 查看是否已装，`imagent peer hook uninstall` 撤掉；加 `--scope project` 装到当前目录的项目级配置而不是用户级。
+
 ## 定时任务
 
 | 命令 | 作用 |
